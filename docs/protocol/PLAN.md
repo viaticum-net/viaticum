@@ -35,7 +35,7 @@ Key derivation, device registration, синхронизация metadata меж�
 
 ## Статус
 
-- [ ] 1. Транспорт
+- [x] 1. Транспорт → ADR-001 (iroh)
 - [ ] 2. Identity и аутентификация
 - [ ] 3. Формат сообщений
 - [ ] 4. Каталог сообщений
@@ -44,3 +44,5 @@ Key derivation, device registration, синхронизация metadata меж�
 - [ ] 7. Операции с шардами
 - [ ] 8. Proof-of-Storage flow
 - [ ] 9. Personal Cluster
+
+## Build plan → ADR-002
