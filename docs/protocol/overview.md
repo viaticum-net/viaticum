@@ -1,6 +1,6 @@
 # SyncBack: описание протокола
 
-*Март 2026 · v0.1 draft*
+*Март 2026 · v0.2 draft*
 
 ---
 
@@ -9,6 +9,61 @@
 Децентрализованная P2P система холодного бекапа. Участники сети хранят зашифрованные фрагменты данных друг друга. Нет сервера, нет токенов, нет блокчейна.
 
 "Холодный бекап" означает: временная константа = 1 неделя. Restore за дни, не секунды. Это радикально упрощает все инженерные проблемы: churn, repair storm, NAT traversal, bandwidth.
+
+---
+
+## 0. Technology stack
+
+SyncBack — тонкая обёртка над существующими технологиями. Единственная оригинальная часть — протокол доверия.
+
+### Архитектура: ядро + сменный транспорт
+
+```
+┌──────────────────────────────┐
+│  SyncBack core               │  ← наше: identity, trust, escrow,
+│  (identity + reputation +    │     PoS, placement
+│   shard management)          │
+├──────────────────────────────┤
+│  Transport abstraction       │  ← trait: send_message,
+│                              │     transfer_blob, sync_mailbox
+├──────────┬───────────────────┤
+│  iroh    │  (другие адаптеры │  ← реализации
+│  adapter │   в будущем)      │
+└──────────┴───────────────────┘
+```
+
+Протокол НЕ привязан к конкретному транспорту. Ядро SyncBack (identity, trust state, PoS logic) переносимо на любой P2P стек. Transport adapter — сменный модуль.
+
+### Reference implementation: iroh
+
+[iroh](https://iroh.computer) (Rust, n0-computer) — P2P networking stack:
+
+- **iroh core** — QUIC соединения, NAT traversal (hole punching), relay через WSS:443
+- **iroh-blobs** — content-addressed передача данных (BLAKE3 verified streaming)
+- **iroh-docs** — replicated key-value documents (range-based set reconciliation)
+
+Приоритет транспортов:
+1. **QUIC/UDP direct** — где работает (большинство мира)
+2. **iroh relay (WebSocket/TLS:443)** — где UDP заблокирован (выглядит как HTTPS)
+3. **Self-hosted relay** — где зарубежный трафик режут
+
+**Важно:** `identity_pub` (Ed25519, наш) ≠ `iroh NodeId` (их). Identity — "кто ты". NodeId — "как подключиться". Маппинг хранится локально. При смене транспорта identity и trust сохраняются.
+
+### Шифрование данных: ChaCha20-Poly1305
+
+Файлы шифруются до erasure coding. Ключ шифрования деривируется из identity. Holder не может прочитать содержимое шарда.
+
+### Erasure coding: Reed-Solomon
+
+Файл разбивается на k частей, кодируется в n шардов. Для восстановления достаточно любых k из n.
+
+### Что пишем сами
+
+- Trust protocol (P, I, S — локальная оценка партнёров)
+- Escrow logic (право holder'а на отказ в выдаче)
+- Shard placement strategy (weighted, adaptive n)
+- Proof-of-Storage challenge-response logic
+- Gossip relay rules (что копировать, TTL, rate limits)
 
 ---
 
@@ -21,14 +76,15 @@
 - Каждый участник = пара ключей (Ed25519): `identity_pub`, `identity_priv`
 - Identity создаётся из seed phrase (BIP39 или аналог)
 - Все сообщения подписаны `identity_priv`
-- Personal Cluster: несколько устройств с derived device keys от одного master key. Протокол видит кластер как одну identity.
+- Personal Cluster (experimental): несколько устройств с derived device keys от одного master key. Протокол видит кластер как одну identity.
 
 ### 1.2. Erasure coding
 
 - Файл шифруется (ChaCha20-Poly1305, ключ из identity), разбивается на k частей, кодируется в n шардов (Reed-Solomon)
 - Для восстановления достаточно любых k из n шардов
 - Параметры k и n — решение владельца файла, не протокола
-- Каждый шард имеет: `shard_id`, `file_id`, `shard_index`, `merkle_root`, `owner_pub`
+- Каждый шард = iroh blob (идентифицируется BLAKE3 hash)
+- Метаданные шарда: `shard_id` (BLAKE3), `file_id`, `shard_index`, `merkle_root`, `owner_pub`
 
 ### 1.3. Proof-of-Storage (challenge-response)
 
@@ -48,7 +104,7 @@
    - ответ получен в пределах TTL (7 дней)
 ```
 
-- Доставка через gossip (см. 1.5), не требует одновременного online
+- Доставка через gossip relay (см. 1.5), не требует одновременного online
 - Расписание проверок — решение challenger'а, не протокола
 - Результат проверки (pass/fail) — локальное знание challenger'а
 
@@ -63,16 +119,41 @@
 
 ### 1.5. Gossip relay (доставка сообщений)
 
-- Нет dedicated relay server. Каждая нода хранит "почту" для соседей
-- Сообщение: `{from, to, payload, ttl, hop_count, sig_from}`
-- TTL = 7 дней. Hop limit = 7. Rate limit: 1 msg/peer/week на PoS
-- Нода при встрече с другой нодой передаёт накопленную почту для неё
-- Подпись sender'а — нода-relay не может подделать содержимое
-- **Identity allowlist:** нода принимает сообщения только от известных identities (партнёры + соседи до 2 hops). Неизвестный identity → drop без проверки payload.
-- Outbox cap: ~8 МБ. При переполнении → drop oldest.
-- Хранение на ноду: ~5-8 МБ (20-30 соседей × 257 КБ)
+Реализовано поверх **iroh-docs**: каждая нода хранит replicated document (свой "почтовый ящик"), партнёры синхронизируют его при подключении.
 
-### 1.6. Escrow (правила restore)
+**Механизм:**
+
+- Каждая нода имеет свой iroh-docs namespace (outbox)
+- Сообщение = запись в документе: `key = "{to}/{message_id}"`, value = подписанный payload
+- При синхронизации с партнёром нода получает все новые записи
+- **Полу-эпидемик:** нода копирует к себе сообщения для соседей (relay). A→B→C: A пишет msg для C, B при синке видит и копирует к себе, C синкает с B и получает.
+
+**Правила relay:**
+
+- Нода копирует только сообщения для известных identities (партнёры + соседи до 2 hops)
+- TTL = 7 дней. Записи старше TTL удаляются.
+- Hop limit = 7. Каждый relay увеличивает hop_count; при hop_count ≥ 7 — не копировать.
+- Rate limit: не более 1 msg/peer/week на PoS
+- Outbox cap: ~8 МБ. При переполнении → drop oldest.
+- Подпись sender'а в payload — relay-нода не может подделать содержимое
+
+**Почему iroh-docs:** range-based set reconciliation эффективно синхронизирует только новые записи. Store-and-forward — бесплатно (данные персистятся на диске). Дедупликация — по ключу.
+
+**Identity allowlist:** нода принимает/копирует сообщения только от известных identities. Неизвестный identity → drop без проверки payload.
+
+### 1.6. Shard transfer
+
+Реализовано через **iroh-blobs**:
+
+- Шард = blob, идентифицируется BLAKE3 hash
+- BLAKE3 verified streaming — целостность проверяется при передаче
+- Range requests — можно запросить часть шарда
+- `Observe` API — проверить какие chunks уже есть у партнёра (полезно для repair)
+
+Upload: owner шифрует файл → erasure coding → отправляет шарды как blobs партнёрам.
+Download (restore): owner запрашивает k шардов у holder'ов → Reed-Solomon декодирование → расшифровка.
+
+### 1.7. Escrow (правила restore)
 
 Протокол определяет механизм, параметры — решение реализации:
 
@@ -145,19 +226,19 @@ Holder может отдать шард кому угодно и когда уг
   Seed phrase → identity keypair → готов к работе
 
 BOOTSTRAP (неделя 1-4)
-  → Seed nodes (hardcoded) → первые контакты → gossip → находит партнёров
+  → Seed nodes (hardcoded) → первые контакты → iroh-docs sync → находит партнёров
   → Начинает хранить чужие шарды (сразу полезен)
-  → Свои данные: шифрование → erasure coding → размещение на партнёров
+  → Свои данные: шифрование → erasure coding → размещение на партнёров (iroh-blobs)
   → Escrow: restore первого 1 ГБ бесплатно
 
 НОРМАЛЬНАЯ РАБОТА
-  → Еженедельно: PoS challenge-response через gossip
-  → Партнёры уходят → repair (перераспределение шардов)
+  → Еженедельно: PoS challenge-response через iroh-docs gossip
+  → Партнёры уходят → repair (перераспределение шардов через iroh-blobs)
   → Новые партнёры появляются → постепенное расширение
   → Всё автоматически, невидимо для пользователя
 
 RESTORE
-  → Запрос k шардов у живых holder'ов
+  → Запрос k шардов у живых holder'ов (iroh-blobs download)
   → Reed-Solomon декодирование → расшифровка → исходный файл
   → Холодный: часы-дни, не секунды
 ```
@@ -210,18 +291,18 @@ RESTORE
 **Почему Sybil + flood не работает:**
 
 Атакующий создаёт 1000 identities и шлёт сообщения. Но:
-- Identity allowlist: жертва принимает сообщения только от партнёров (~15 нод) и их соседей (~200 нод). 1000 sybil-identities не попадут в этот круг, если не стали партнёрами.
+- Identity allowlist: жертва принимает сообщения только от партнёров и их соседей. 1000 sybil-identities не попадут в этот круг, если не стали партнёрами.
 - Чтобы стать партнёром → нужно время (I-score растёт неделями). Hit-and-run flood невозможен.
 - Subnet rate-limit: 1000 нод из одной /24 → жертва видит их как 1 источник.
 
-**Остаточный риск:** атакующий с доступом к множеству реальных подсетей (botnet), который становится легитимным партнёром и через недели начинает flood. Ущерб: повышенная нагрузка на CPU жертвы (~15 партнёров × 1 challenge/week = 15 проверок подписей/week — пренебрежимо). Атака экономически бессмысленна.
+**Остаточный риск:** атакующий с доступом к множеству реальных подсетей (botnet), который становится легитимным партнёром и через недели начинает flood. Ущерб: повышенная нагрузка на CPU жертвы (~50 партнёров × 1 challenge/week = 50 проверок подписей/week — пренебрежимо). Атака экономически бессмысленна.
 
 ---
 
 ## 5. Что НЕ входит в v1
 
-- Gossip relay: конкретный wire format (bloom filter для outbox, etc.)
-- Bootstrap: протокол обнаружения seed nodes
-- Personal Cluster: синхронизация metadata между устройствами
+- Personal Cluster: синхронизация между устройствами (experimental, через iroh-docs или iroh-willow)
+- Bootstrap: протокол обнаружения seed nodes (hardcoded list на старте)
 - Версионирование файлов (append/update vs full replace)
 - Bandwidth throttling / QoS
+- Pluggable transports (Tor, BLE — когда iroh добавит)
