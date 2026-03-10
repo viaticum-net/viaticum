@@ -1,4 +1,4 @@
-# Plan: Experiments 04-14
+# Plan: Experiments 04-19
 
 ## Experiment 04: Sybil Attack ✅
 **Question:** How many fake nodes needed to compromise a target's files with PID reputation + rate limiting?
@@ -43,3 +43,126 @@
 ## Experiment 14: Individual Node Perspective ✅
 **Question:** What does the system look like from one node's point of view?
 **Result:** Three scenarios. (1) Flaky partners: 15/15 shards maintained, 100% restore, ~0.8 repairs/month, D-warnings 91% false positive rate. (2) Vacation 14d: trust drops 15.1%, recovers to 95.1% in 30 days, data 100% safe. (3) Disk pressure: automatic eviction of low-trust partners (30→13 over 18mo), own data untouched, trust stable. UX: system is invisible in normal operation. See experiment-14-node-perspective.md.
+
+---
+
+# Серия 2: Исправленная модель PI+S
+
+Формула доверия обновлена на основе выводов серии 1:
+```
+trust = kp × P_weekly + ki × I + ks × S
+
+P_weekly = скользящее окно 4 недели (бинарно: прошёл ≥1 проверку за неделю?)
+I = кумулятивная средняя всех недельных оценок (без decay)
+S = GB_stored_for_others / GB_stored_by_others, clamp [0, 2]
+
+Лучшие параметры (Exp 15): kp=0.3, ki=1.5, ks=0.3
+```
+
+## Experiment 15: PI+S Convergence ✅
+**Question:** Сходится ли расширенная формула PI+S к правильному ранжированию архетипов?
+**Result:** Kendall's tau = 0.97 (vs 0.0 для PI-only) к месяцу 12. Все 6 архетипов ранжированы корректно. Hoarder упал с #2 на #5, Weekend поднялся с #5 на #2. Система робастна: любой ks > 0 даёт tau ≥ 0.83. Лучшая конфигурация: kp=0.3, ki=1.5, ks=0.3. See experiment-15-pis-convergence.md.
+
+## Experiment 16: PI+S Under Threats
+**Question:** Не ломает ли S-term существующие защиты от Sybil, free-rider, spite?
+- Scenario A: Sybil с реальным vs фейковым storage (S=1.0 vs S=0.1)
+- Scenario B: Free-rider с PI+S gate — блокирует ли S тех, кого PI пропускал?
+- Scenario C: Spite — меняет ли S динамику целенаправленной атаки?
+
+## Experiment 17: Long-term Mixed Network ✅
+**Question:** Стабильна ли сеть из 6 архетипов с PI+S (попарный S) за 10 лет?
+**Result:** tau=0.667 (хуже Exp 15 из-за Hoarder/Nomad инверсии). Hoarder (rank 4, expected 5) > Nomad (rank 6, expected 4) — 90% uptime перевешивает S-penalty при additive формуле. Кластеры смешанные (не по архетипам): 17 communities, Q=0.290, 59.5% cross-cluster edges, 0 чистых hoarder-кластеров. Trust from honest-only = тот же rank (tau_honest=0.733). Вывод: проблема в формуле (additive S), не в кластеризации. See cluster_probe.py results.
+- **Попарный S:** S_AB = GB_B_stores_for_A / GB_A_stores_for_B (не глобальный)
+- **Кластеризация:** Hoarder/Freeloader НЕ образуют отдельные кластеры, равномерно размазаны (13-17% в каждом)
+
+## Experiment 18: Corrected UX (Node Perspective with PI+S)
+**Question:** Улучшается ли UX с PI+S + weekly checks + D-hysteresis?
+- Scenario 1: flaky partners — D-warning FP rate (было 91%)
+- Scenario 2: vacation — trust drop с weekly P (должно быть меньше)
+- Scenario 3: disk pressure — S падает при eviction, видно ли в trust?
+
+## Experiment 19: Trust Referral (Verifiable Evidence Sharing)
+**Question:** Ускоряет ли обмен подписанными proof-of-storage логами bootstrap?
+- Новичок получает от друга подписанные challenge-response логи работы с N пирами
+- Новичок проверяет подписи и вычисляет trust из чужих наблюдений (со скидкой)
+- Вопрос 1: насколько ускоряется bootstrap (время до первого restore)?
+- Вопрос 2: какой discount (0.3x? 0.5x? 0.7x?) нужен чтобы не открыть Sybil-вектор?
+- Вопрос 3: может ли A скрыть негативные записи? Как B это детектирует?
+- Связь с Personal Cluster: внутри кластера — полное разделение (discount=1.0)
+
+## Experiment 20: Gossip Relay & Message Loss
+**Question:** Как задержка доставки и потеря сообщений в gossip-relay влияют на точность trust?
+- Dedicated relay заменяется gossip: каждая нода хранит "почту" для соседей (~2-4 МБ), пересылает при встрече
+- Параметры:
+  - Частота PoS проверок: 1/день, 3/нед, 2/нед, 1/нед
+  - Message loss rate: 0%, 5%, 10%, 20%
+  - Gossip hop limit: 3, 5, 7
+  - Сетевая связность: средний uptime 4h/день, 8h/день, 16h/день
+- Метрики:
+  - Trust accuracy (Kendall's tau vs ground truth)
+  - False negative rate (честный пир наказан из-за потери сообщения)
+  - Delivery latency distribution (сколько hops, сколько дней)
+  - Время обнаружения лжеца (vs мгновенная доставка)
+  - Суммарный bandwidth и storage overhead на сеть
+- Ключевой insight: ежедневные проверки + недельная агрегация (≥1 OK → 1) делают систему устойчивой к потерям (p_loss=10% → P(miss week) = 0.1^7 ≈ 0). Но 1 проверка/неделю при 10% потерь → 10% ложных штрафов.
+- Связь: если gossip работает — dedicated relay не нужен, убирается точка централизации
+
+---
+
+# Серия 3: Адаптивная избыточность
+
+Смена парадигмы: от "фильтруй плохих" к "используй всех, управляй риском".
+Низкий trust ≠ бесполезен. Низкий trust = ненадёжен → компенсируем избыточностью (больше шардов).
+Ключевой вопрос: какие механизмы фильтрации (gate, eviction, escrow) остаются нужными, а какие заменяются адаптивным n?
+
+## Experiment 21: Adaptive Shard Count (trust → n)
+**Question:** Обеспечивает ли адаптивный n (количество шардов на основе trust партнёров) целевую reliability без acceptance gate?
+- Базовая модель: n = ceil(k × safety_margin(avg_partner_trust))
+- Safety margin: монотонно убывающая функция trust → overhead
+- Сравнение: fixed n=15 vs adaptive n∈[10, 30] при одинаковом target reliability
+- Сценарии:
+  - Все reliable → n снижается → меньше overhead
+  - Микс с newcomers → n растёт → newcomers хранят "дешёвые" копии
+  - Много ненадёжных → n высокий → overhead выше, но files safe
+- Метрики: file survival rate, storage overhead, bootstrap time (newcomer → first useful contribution)
+- Без acceptance gate: любой пир получает шарды сразу
+
+## Experiment 22: Multiplicative vs Additive S
+**Question:** Какая формула S даёт лучший tau в living network?
+- Три варианта:
+  - A: additive — trust = kp×P + ki×I + ks×S (текущий, tau=0.667)
+  - B: multiplicative — trust = (kp×P + ki×I) × clamp(S, 0.1, 1.0) (ожидание: tau→1.0)
+  - C: гибрид — trust = (kp×P + ki×I) × S_mult + ks_bonus×max(S-1, 0)
+- Для каждого варианта: sweep параметров, 10 seeds, 10 лет, 10K нод
+- Метрики: Kendall's tau, trust distribution, Hoarder vs Nomad ranking
+- С адаптивным n (Exp 21) и без — влияет ли формула когда n адаптивный?
+
+## Experiment 23: Eviction Strategies
+**Question:** Нужен ли eviction, и если да — какой?
+- Три стратегии:
+  - A: без eviction (партнёрства только через churn)
+  - B: soft eviction (при disk pressure: выгнать min trust×importance)
+  - C: hard eviction (trust < threshold → разрыв каждые K недель)
+- Для каждой: file survival, partner turnover rate, newcomer integration time
+- С адаптивным n — eviction менее критичен? Ненадёжный партнёр остаётся как "дешёвая" копия
+- Метрика: "trapped honest node" — попадают ли honest ноды в плохое окружение без выхода?
+
+## Experiment 24: Escrow as Credit System
+**Question:** Escrow как кредитование — bootstrap speed и free-rider resistance
+- Escrow ON vs OFF при адаптивном n:
+  - Без escrow + adaptive n: newcomer сразу полезен, restore когда?
+  - С escrow + adaptive n: newcomer полезен сразу, restore по I-score
+- Сценарии:
+  - Честный newcomer: сколько ждёт до restore документов / фото / видео?
+  - Hit-and-run: загрузил → вытянул → ушёл. Что потеряла сеть?
+  - Авансовый кредит (1 ГБ free): ускоряет ли retention?
+- Метрики: bootstrap time to first restore, network cost of hit-and-run, user retention proxy
+
+## Experiment 25: Full Model Integration
+**Question:** Работает ли полная модель (adaptive n + best S formula + best eviction + escrow)?
+- Берём лучшие варианты из Exp 21-24
+- Living network 10 лет, все 6 архетипов, 25% churn
+- Все атаки из серии 1 (sybil, free-rider, spite, mass departure)
+- Сравнение: full model vs series 2 best (additive S + fixed n + gate)
+- Метрики: file survival, tau, overhead, bootstrap time, attack resistance
+- Это финальный "acceptance test" перед reference implementation
