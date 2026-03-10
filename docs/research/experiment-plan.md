@@ -61,19 +61,15 @@ S = GB_stored_for_others / GB_stored_by_others, clamp [0, 2]
 
 ## Experiment 15: PI+S Convergence ✅
 **Question:** Сходится ли расширенная формула PI+S к правильному ранжированию архетипов?
-**Result:** Kendall's tau = 0.97 (vs 0.0 для PI-only) к месяцу 12. Все 6 архетипов ранжированы корректно. Hoarder упал с #2 на #5, Weekend поднялся с #5 на #2. Система робастна: любой ks > 0 даёт tau ≥ 0.83. Лучшая конфигурация: kp=0.3, ki=1.5, ks=0.3. See experiment-15-pis-convergence.md.
+**Result:** Kendall's tau = 0.97 (vs 0.0 для PI-only) к месяцу 12. Все 6 архетипов ранжированы корректно. Hoarder упал с #2 на #5, Weekend поднялся с #5 на #2. Система робастна: любой ks > 0 даёт tau ≥ 0.83. Лучшая конфигурация: kp=0.3, ki=1.5, ks=0.3. **Важно:** использовался глобальный S. See experiment-15-pis-convergence.md.
 
-## Experiment 16: PI+S Under Threats
+## Experiment 16: PI+S Under Threats ✅
 **Question:** Не ломает ли S-term существующие защиты от Sybil, free-rider, spite?
-- Scenario A: Sybil с реальным vs фейковым storage (S=1.0 vs S=0.1)
-- Scenario B: Free-rider с PI+S gate — блокирует ли S тех, кого PI пропускал?
-- Scenario C: Spite — меняет ли S динамику целенаправленной атаки?
+**Result:** S-term НЕ ломает существующие защиты. Sybil: фейковый S снижает denial на 0.04-1.98pp (subnet-limit остаётся главной защитой). Free-rider: 100% survival во всех 54 конфигурациях (5-of-15 неуязвим). Spite: 0% denial (subnet diversity защищает). S полезен для ранжирования (Exp 15, 22), не для безопасности. Примечание: использовался глобальный additive S. See experiment-16-pis-threats.md.
 
 ## Experiment 17: Long-term Mixed Network ✅
 **Question:** Стабильна ли сеть из 6 архетипов с PI+S (попарный S) за 10 лет?
-**Result:** tau=0.667 (хуже Exp 15 из-за Hoarder/Nomad инверсии). Hoarder (rank 4, expected 5) > Nomad (rank 6, expected 4) — 90% uptime перевешивает S-penalty при additive формуле. Кластеры смешанные (не по архетипам): 17 communities, Q=0.290, 59.5% cross-cluster edges, 0 чистых hoarder-кластеров. Trust from honest-only = тот же rank (tau_honest=0.733). Вывод: проблема в формуле (additive S), не в кластеризации. See cluster_probe.py results.
-- **Попарный S:** S_AB = GB_B_stores_for_A / GB_A_stores_for_B (не глобальный)
-- **Кластеризация:** Hoarder/Freeloader НЕ образуют отдельные кластеры, равномерно размазаны (13-17% в каждом)
+**Result:** tau=0.667 (хуже Exp 15 из-за Hoarder/Nomad инверсии). Hoarder (rank 4, expected 5) > Nomad (rank 6, expected 4) — 90% uptime перевешивает S-penalty при additive формуле. Кластеры смешанные (не по архетипам): 17 communities, Q=0.290, 59.5% cross-cluster edges, 0 чистых hoarder-кластеров. Trust from honest-only = тот же rank (tau_honest=0.733). Вывод: проблема в формуле (additive S), не в кластеризации. See experiment-17-longterm-mixed.md.
 
 ## Experiment 18: Corrected UX (Node Perspective with PI+S)
 **Question:** Улучшается ли UX с PI+S + weekly checks + D-hysteresis?
@@ -115,48 +111,21 @@ S = GB_stored_for_others / GB_stored_by_others, clamp [0, 2]
 Низкий trust ≠ бесполезен. Низкий trust = ненадёжен → компенсируем избыточностью (больше шардов).
 Ключевой вопрос: какие механизмы фильтрации (gate, eviction, escrow) остаются нужными, а какие заменяются адаптивным n?
 
-## Experiment 21: Adaptive Shard Count (trust → n)
+## Experiment 21: Adaptive Shard Count (trust → n) ✅
 **Question:** Обеспечивает ли адаптивный n (количество шардов на основе trust партнёров) целевую reliability без acceptance gate?
-- Базовая модель: n = ceil(k × safety_margin(avg_partner_trust))
-- Safety margin: монотонно убывающая функция trust → overhead
-- Сравнение: fixed n=15 vs adaptive n∈[10, 30] при одинаковом target reliability
-- Сценарии:
-  - Все reliable → n снижается → меньше overhead
-  - Микс с newcomers → n растёт → newcomers хранят "дешёвые" копии
-  - Много ненадёжных → n высокий → overhead выше, но files safe
-- Метрики: file survival rate, storage overhead, bootstrap time (newcomer → first useful contribution)
-- Без acceptance gate: любой пир получает шарды сразу
+**Result:** Gate ВРЕДЕН: без gate survival выше (99.0% vs 97.9%). Adaptive n экономит ~13% overhead (2.55x vs 2.92x) ценой -2pp survival. ~40% шардов теряются на churn независимо от стратегии. Bootstrap ~1 неделя во всех сценариях. See experiment-21-adaptive-n.md.
 
-## Experiment 22: Multiplicative vs Additive S
+## Experiment 22: Multiplicative vs Additive S ✅
 **Question:** Какая формула S даёт лучший tau в living network?
-- Три варианта:
-  - A: additive — trust = kp×P + ki×I + ks×S (текущий, tau=0.667)
-  - B: multiplicative — trust = (kp×P + ki×I) × clamp(S, 0.1, 1.0) (ожидание: tau→1.0)
-  - C: гибрид — trust = (kp×P + ki×I) × S_mult + ks_bonus×max(S-1, 0)
-- Для каждого варианта: sweep параметров, 10 seeds, 10 лет, 10K нод
-- Метрики: Kendall's tau, trust distribution, Hoarder vs Nomad ranking
-- С адаптивным n (Exp 21) и без — влияет ли формула когда n адаптивный?
+**Result:** Multiplicative S — однозначный победитель. tau=1.000 во ВСЕХ 4 конфигурациях (параметры не влияют). Additive: max tau=0.933 (только при ks=2.0). Hybrid: max tau=0.960 (лишняя сложность). Hoarder/Nomad инверсия исправлена: Nomad(0.904) > Hoarder(0.809). Финальная формула: trust = (kp×P + ki×I) × clamp(S, 0.1, 1.0). See experiment-22-s-formula.md.
 
-## Experiment 23: Eviction Strategies
+## Experiment 23: Eviction Strategies ✅
 **Question:** Нужен ли eviction, и если да — какой?
-- Три стратегии:
-  - A: без eviction (партнёрства только через churn)
-  - B: soft eviction (при disk pressure: выгнать min trust×importance)
-  - C: hard eviction (trust < threshold → разрыв каждые K недель)
-- Для каждой: file survival, partner turnover rate, newcomer integration time
-- С адаптивным n — eviction менее критичен? Ненадёжный партнёр остаётся как "дешёвая" копия
-- Метрика: "trapped honest node" — попадают ли honest ноды в плохое окружение без выхода?
+**Result:** Eviction НЕ нужен. Multiplicative S сама даёт tau≈1.0 без eviction (Strategy A). Hard eviction ВРЕДЕН: создаёт гетто (97% same-arch при threshold=1.5), trust Hoarder/Freeloader раздувается, tau падает до 0.43. Soft eviction = no-op (disk pressure не срабатывает). Вывод: НЕ реализовывать eviction. See experiment-23-eviction.md.
 
-## Experiment 24: Escrow as Credit System
-**Question:** Escrow как кредитование — bootstrap speed и free-rider resistance
-- Escrow ON vs OFF при адаптивном n:
-  - Без escrow + adaptive n: newcomer сразу полезен, restore когда?
-  - С escrow + adaptive n: newcomer полезен сразу, restore по I-score
-- Сценарии:
-  - Честный newcomer: сколько ждёт до restore документов / фото / видео?
-  - Hit-and-run: загрузил → вытянул → ушёл. Что потеряла сеть?
-  - Авансовый кредит (1 ГБ free): ускоряет ли retention?
-- Метрики: bootstrap time to first restore, network cost of hit-and-run, user retention proxy
+## Experiment 24: Escrow as Credit System ✅
+**Question:** Escrow как кредитование — bootstrap speed и free-rider resistance при адаптивном n?
+**Result:** Escrow блокирует 100% hit-and-run (100%→0%). Adaptive n экономит 29% overhead (3.00x→2.13x). Bootstrap: Tier1=4нед, Tier2=13нед, Tier3=26нед. Лучшая комбинация: escrow + adaptive n (Config D). File survival 100% во всех конфигурациях. See experiment-24-escrow.md.
 
 ## Experiment 25: Full Model Integration
 **Question:** Работает ли полная модель (adaptive n + best S formula + best eviction + escrow)?
