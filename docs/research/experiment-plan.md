@@ -127,11 +127,10 @@ S = GB_stored_for_others / GB_stored_by_others, clamp [0, 2]
 **Question:** Escrow как кредитование — bootstrap speed и free-rider resistance при адаптивном n?
 **Result:** Escrow блокирует 100% hit-and-run (100%→0%). Adaptive n экономит 29% overhead (3.00x→2.13x). Bootstrap: Tier1=4нед, Tier2=13нед, Tier3=26нед. Лучшая комбинация: escrow + adaptive n (Config D). File survival 100% во всех конфигурациях. See experiment-24-escrow.md.
 
-## Experiment 25: Full Model Integration
+## Experiment 25: Full Model Integration ✅
 **Question:** Работает ли полная модель (adaptive n + best S formula + best eviction + escrow)?
-- Берём лучшие варианты из Exp 21-24
-- Living network 10 лет, все 6 архетипов, 25% churn
-- Все атаки из серии 1 (sybil, free-rider, spite, mass departure)
-- Сравнение: full model vs series 2 best (additive S + fixed n + gate)
-- Метрики: file survival, tau, overhead, bootstrap time, attack resistance
-- Это финальный "acceptance test" перед reference implementation
+**Result:** FULL model tau=1.000 в 4/5 сценариев, но survival ниже S2 (96.1% vs 97.6%). Причина: равномерное размещение шардов — ненадёжные партнёры получают шарды наравне с надёжными, adaptive n компенсирует количеством но overhead растёт (3.16x vs 2.93x). Escrow блокирует 100% HAR в обоих моделях. Scenario D (40% free-rider flood) — проблемный: survival=91.7%, tau=0.600. See experiment-25-integration.md.
+
+## Experiment 26: Weighted Shard Placement ✅
+**Question:** Решает ли взвешенное размещение шардов (core + insurance) проблему survival из Exp 25?
+**Result:** ДА. Baseline: WEIGHTED survival=98.06% > S2 97.69% при tau=1.000. Honest survival в free-rider flood: WEIGHTED 99.40% > S2 97.60%. Overhead 3.62x (выше S2 2.93x — оптимизируется Poisson binomial). Концентрация шардов (Gini=0.12, max 6/partner) защищает честных нод. See experiment-26-weighted-placement.md.
