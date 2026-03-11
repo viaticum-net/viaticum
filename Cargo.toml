@@ -20,7 +20,7 @@ ciborium = "0.2"
 blake3 = "1"
 chacha20poly1305 = "0.5"
 ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
-x25519-dalek = { version = "2", features = ["serde"] }
+x25519-dalek = { version = "2", features = ["serde", "static_secrets"] }
 hkdf = "0.12"
 sha2 = "0.10"
 
@@ -39,6 +39,9 @@ thiserror = "2"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Random number generation
+rand = "0.8"
 
 # Testing
 tempfile = "3"
