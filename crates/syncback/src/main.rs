@@ -51,15 +51,8 @@ fn run_daemon(_args: &[String]) -> anyhow::Result<()> {
         let config = Config::load(default_syncback_dir())?;
         let handle = DaemonHandle::start(config).await?;
 
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("received Ctrl+C, shutting down");
-                handle.shutdown().await?;
-            }
-            r = handle.join() => {
-                r?;
-            }
-        }
+        // Drive until Ctrl+C or a task exits.
+        handle.join().await?;
         Ok(())
     })
 }

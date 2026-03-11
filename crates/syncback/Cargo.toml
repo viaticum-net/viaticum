@@ -16,6 +16,8 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 redb = { workspace = true }
 anyhow = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
 
 # P2P networking
 iroh = { workspace = true }
@@ -28,4 +30,3 @@ iroh-gossip = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-rand = { workspace = true }

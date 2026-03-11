@@ -4065,11 +4065,14 @@ dependencies = [
 name = "syncback"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "ed25519-dalek 2.2.0",
  "iroh",
  "iroh-blobs",
  "iroh-docs",
  "iroh-gossip",
  "rand 0.8.5",
+ "redb",
  "serde",
  "syncback-core",
  "tempfile",

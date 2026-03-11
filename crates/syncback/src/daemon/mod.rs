@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 const PROCESSOR_CHANNEL_CAPACITY: usize = 256;
 const DIRTY_CHANNEL_CAPACITY: usize = 1024;
 const NET_EVENT_CHANNEL_CAPACITY: usize = 256;
-const NET_CMD_CHANNEL_CAPACITY: usize = 256;
+const NET_CMD_CHANNEL_CAPACITY: usize = 64;
 
 // ============================================================
 // Config
@@ -150,72 +150,39 @@ pub enum DirtyKind {
     Deleted,
 }
 
+/// Events emitted by NetworkTask to Processor.
 #[derive(Debug)]
 pub enum NetEvent {
+    /// Handshake completed successfully on an incoming connection.
     PeerConnected {
-        peer: syncback_core::types::IdentityPub,
-        node_addr: String,
+        peer_identity: syncback_core::types::IdentityPub,
+        peer_node_id: syncback_core::types::NodeId,
     },
-    PeerDisconnected {
-        peer: syncback_core::types::IdentityPub,
-    },
-    BoardMessage {
+    /// A DirectMessage was received from an authenticated peer.
+    MessageReceived {
         from: syncback_core::types::IdentityPub,
-        msg_type: String,
-        payload: Vec<u8>,
+        message: syncback_core::messages::DirectMessage,
     },
-    DirectMessage {
-        from: syncback_core::types::IdentityPub,
-        payload: Vec<u8>,
+    /// Handshake failed (log and ignore).
+    HandshakeFailed {
+        reason: String,
     },
-    PosResponse {
-        from: syncback_core::types::IdentityPub,
-        shard_id: syncback_core::types::ShardId,
-        block_index: u32,
-        hash: [u8; 32],
-        merkle_proof: Vec<[u8; 32]>,
-    },
-    ShardUploaded {
-        shard_id: syncback_core::types::ShardId,
-        holder: syncback_core::types::IdentityPub,
-        bytes: u64,
-    },
-    ShardDownloaded {
-        shard_id: syncback_core::types::ShardId,
-        owner: syncback_core::types::IdentityPub,
-        bytes: u64,
-    },
-    FatalError(String),
 }
 
+/// Commands from Processor to NetworkTask.
 #[derive(Debug)]
 pub enum NetCommand {
+    /// Open an outgoing connection to a peer and send a DirectMessage.
     Connect {
-        node_addr: String,
+        peer_addr: iroh::EndpointAddr,
+        peer_identity: syncback_core::types::IdentityPub,
+        message: syncback_core::messages::DirectMessage,
     },
-    PublishBoard {
-        msg_type: String,
-        payload: Vec<u8>,
-        directed_to: Option<syncback_core::types::IdentityPub>,
-    },
-    SendDirect {
-        peer: syncback_core::types::IdentityPub,
-        payload: Vec<u8>,
-    },
-    UploadShard {
-        shard_id: syncback_core::types::ShardId,
-        holder: syncback_core::types::IdentityPub,
-        data: Vec<u8>,
-    },
-    SendPosChallenge {
-        holder: syncback_core::types::IdentityPub,
-        shard_id: syncback_core::types::ShardId,
-        block_index: u32,
-        nonce: [u8; 32],
-    },
-    RequestShard {
-        holder: syncback_core::types::IdentityPub,
-        shard_id: syncback_core::types::ShardId,
+    /// Send a DirectMessage to a peer, opening a connection if needed.
+    SendMessage {
+        peer_identity: syncback_core::types::IdentityPub,
+        peer_addr: iroh::EndpointAddr,
+        message: syncback_core::messages::DirectMessage,
     },
 }
 
@@ -250,6 +217,9 @@ pub enum DaemonError {
 
     #[error("config error: {0}")]
     Config(String),
+
+    #[error("network error: {0}")]
+    Network(#[from] network::NetworkError),
 }
 
 // ============================================================
@@ -266,7 +236,6 @@ pub struct DaemonHandle {
 
     // Keep senders alive so receivers don't close prematurely.
     _dirty_tx: mpsc::Sender<DirtyEvent>,
-    _net_cmd_tx: mpsc::Sender<NetCommand>,
     _processor_tx: mpsc::Sender<ProcessorMsg>,
 
     started_at: std::time::Instant,
@@ -284,12 +253,39 @@ impl DaemonHandle {
         let (processor_tx, processor_rx) = mpsc::channel::<ProcessorMsg>(PROCESSOR_CHANNEL_CAPACITY);
         let (dirty_tx, dirty_rx) = mpsc::channel::<DirtyEvent>(DIRTY_CHANNEL_CAPACITY);
         let (net_event_tx, net_event_rx) = mpsc::channel::<NetEvent>(NET_EVENT_CHANNEL_CAPACITY);
-        let (net_cmd_tx, net_cmd_rx) = mpsc::channel::<NetCommand>(NET_CMD_CHANNEL_CAPACITY);
 
         let cli_socket_path = syncback_dir.join("syncback.sock");
         if cli_socket_path.exists() {
             std::fs::remove_file(&cli_socket_path)?;
         }
+
+        // Generate ephemeral keys for this daemon instance.
+        // In production these would be derived from the seed phrase.
+        let iroh_secret_key = {
+            use rand::RngCore;
+            let mut bytes = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut bytes);
+            iroh::SecretKey::from_bytes(&bytes)
+        };
+        let identity_signing_key = {
+            use rand::RngCore;
+            let mut bytes = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut bytes);
+            ed25519_dalek::SigningKey::from_bytes(&bytes)
+        };
+        let identity_pub_bytes: [u8; 32] = identity_signing_key.verifying_key().to_bytes();
+        let identity_pub = syncback_core::types::IdentityPub(identity_pub_bytes);
+
+        let (net_task, net_handle) = network::NetworkTask::new(
+            iroh_secret_key,
+            identity_signing_key,
+            identity_pub,
+            cancel.clone(),
+            iroh::endpoint::RelayMode::Disabled,
+        )
+        .await?;
+
+        let net_cmd_tx = net_handle.cmd_tx.clone();
 
         let processor_handle = tokio::spawn(processor::run(
             db,
@@ -297,15 +293,15 @@ impl DaemonHandle {
             processor_rx,
             dirty_rx,
             net_event_rx,
-            net_cmd_tx.clone(),
+            net_cmd_tx,
         ));
 
-        let network_handle = tokio::spawn(network::run(
-            cancel.clone(),
-            net_cmd_rx,
-            net_event_tx,
-            processor_tx.clone(),
-        ));
+        let network_handle = tokio::spawn({
+            let net_event_tx = net_event_tx;
+            async move {
+                net_task.run(net_event_tx).await;
+            }
+        });
 
         let scheduler_handle = tokio::spawn(scheduler::run(
             cancel.clone(),
@@ -329,7 +325,6 @@ impl DaemonHandle {
             scheduler_handle,
             cli_server_handle,
             _dirty_tx: dirty_tx,
-            _net_cmd_tx: net_cmd_tx,
             _processor_tx: processor_tx,
             started_at: std::time::Instant::now(),
         })
