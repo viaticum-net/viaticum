@@ -1,7 +1,10 @@
 mod cli_server;
+pub(crate) mod merkle;
 mod network;
 mod processor;
 mod scheduler;
+pub(crate) mod shard_manager;
+pub mod storage;
 mod watcher;
 
 #[cfg(test)]
@@ -183,6 +186,20 @@ pub enum NetCommand {
         peer_identity: syncback_core::types::IdentityPub,
         peer_addr: iroh::EndpointAddr,
         message: syncback_core::messages::DirectMessage,
+    },
+    /// Publish a message to our iroh-docs board.
+    /// msg_type is used as the board key prefix (e.g. "shard_offer").
+    /// directed_to: if Some, the message is targeted at a specific peer.
+    PublishBoard {
+        msg_type: String,
+        payload: Vec<u8>,
+        directed_to: Option<syncback_core::types::IdentityPub>,
+    },
+    /// Upload a shard blob to a holder peer via iroh-blobs.
+    UploadShard {
+        shard_id: syncback_core::types::ShardId,
+        holder: syncback_core::types::IdentityPub,
+        data: Vec<u8>,
     },
 }
 

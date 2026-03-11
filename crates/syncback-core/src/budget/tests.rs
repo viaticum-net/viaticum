@@ -100,6 +100,7 @@ fn make_shard_record(
         last_verified: None,
         offered_at: Timestamp(0),
         stored_at: None,
+        merkle_root: [0u8; 32],
     }
 }
 

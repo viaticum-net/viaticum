@@ -339,6 +339,10 @@ pub struct ShardRecord {
     pub offered_at: Timestamp,
     /// When shard_stored was received.
     pub stored_at: Option<Timestamp>,
+    /// BLAKE3 Merkle root over 64 KB blocks of the shard blob.
+    /// Used by the owner to verify PoS responses from the holder.
+    #[serde(default)]
+    pub merkle_root: [u8; 32],
 }
 
 /// Stored in the `peers` table. Key: IdentityPub (32 bytes).

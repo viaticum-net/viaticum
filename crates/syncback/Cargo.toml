@@ -18,6 +18,12 @@ redb = { workspace = true }
 anyhow = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
+rand_core = { version = "0.6", features = ["getrandom"] }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+blake3 = { workspace = true }
+reed-solomon-erasure = { workspace = true }
 
 # P2P networking
 iroh = { workspace = true }
@@ -30,3 +36,4 @@ iroh-gossip = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+syncback-core = { workspace = true, features = ["testutil"] }

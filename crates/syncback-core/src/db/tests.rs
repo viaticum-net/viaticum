@@ -53,6 +53,7 @@ fn make_shard_record(
         last_verified,
         offered_at: Timestamp(500),
         stored_at: None,
+        merkle_root: [0u8; 32],
     }
 }
 

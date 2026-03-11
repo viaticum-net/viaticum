@@ -345,6 +345,10 @@ async fn handle_command(
             )
             .await;
         }
+        NetCommand::PublishBoard { .. } | NetCommand::UploadShard { .. } => {
+            // TODO Phase 2: iroh-docs board publish and blob upload.
+            tracing::debug!("network: board/shard command not yet implemented");
+        }
     }
 }
 
