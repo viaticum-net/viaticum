@@ -78,13 +78,35 @@ SyncBack — тонкая обёртка над существующими те�
 - Все сообщения подписаны `identity_priv`
 - Personal Cluster (experimental): несколько устройств с derived device keys от одного master key. Протокол видит кластер как одну identity.
 
-### 1.2. Erasure coding
+### 1.2. Units и erasure coding
 
-- Файл шифруется (ChaCha20-Poly1305, ключ из identity), разбивается на k частей, кодируется в n шардов (Reed-Solomon)
+**Два правила обработки файлов:**
+
+```
+Unit size = U (default 256 МБ, конфигурируемо)
+
+Файл < U  → pack с другими мелкими в unit размером ~U
+Файл ≥ U  → split на chunks по U, каждый chunk = отдельный unit
+```
+
+Каждый unit → шифрование (ChaCha20-Poly1305, ключ из identity) → erasure coding (Reed-Solomon, k-of-n) → n шардов.
+
 - Для восстановления достаточно любых k из n шардов
 - Параметры k и n — решение владельца файла, не протокола
 - Каждый шард = iroh blob (идентифицируется BLAKE3 hash)
-- Метаданные шарда: `shard_id` (BLAKE3), `file_id`, `shard_index`, `merkle_root`, `owner_pub`
+- Метаданные шарда: `shard_id` (BLAKE3), `unit_id`, `shard_index`, `merkle_root`, `owner_pub`
+
+**Pack:** несколько мелких файлов объединяются в один unit с индексом (offset + size каждого файла). Один файл изменился → перепаковать unit.
+
+**Chunks:** большой файл разбивается на units. Один chunk изменился → пересоздать только его шарды.
+
+**Объёмы (типичный пользователь, 500 ГБ):**
+
+```
+500 ГБ / 256 МБ ≈ 2,000 units × 15 шардов = 30,000 шардов
+Размер шарда: ~51 МБ (256 МБ / 5)
+Метаданные: ~6 МБ
+```
 
 ### 1.3. Proof-of-Storage (challenge-response)
 
@@ -92,7 +114,7 @@ SyncBack — тонкая обёртка над существующими те�
 
 ```
 1. Challenger → Holder:
-   {challenge_id, file_id, shard_index, block_range, nonce, timestamp, sig_challenger}
+   {challenge_id, unit_id, shard_index, block_range, nonce, timestamp, sig_challenger}
 
 2. Holder → Challenger:
    {challenge_id, block_data_hash, merkle_proof, timestamp, sig_holder}
@@ -105,8 +127,42 @@ SyncBack — тонкая обёртка над существующими те�
 ```
 
 - Доставка через gossip relay (см. 1.5), не требует одновременного online
-- Расписание проверок — решение challenger'а, не протокола
 - Результат проверки (pass/fail) — локальное знание challenger'а
+
+**Sampling PoS:** при большом количестве шардов проверять все каждую неделю нереально. Вместо этого — случайная выборка N шардов на партнёра в неделю (рекомендация: 5). Нам важна надёжность партнёра, а не статус конкретного шарда.
+
+```
+50 партнёров × 5 challenges/week = 250 сообщений/week ≈ 50 КБ
+```
+
+**Вероятность обнаружения мухлежа** (5 проверок/week, 4 недели):
+- Удалил 1% шардов → 18% обнаружение
+- Удалил 10% → 88%
+- Удалил 50% → 99.9999%
+
+**Реакция на failed challenge:**
+
+| Ситуация | Интерпретация | Действие |
+|---|---|---|
+| 1 fail на 1 шарде | Bit rot / случайность | Repair этого шарда, повторная проверка + `storage_warning` |
+| 2+ fails на разных шардах | Враждебное поведение | Trust → 0, убрать ВСЕ шарды с партнёра, repair |
+| Нет ответа (timeout 7d) | Партнёр офлайн | P снижается, но не наказание |
+
+**Наказание за мухлёж: потеря всех отношений.** Пойман на одном — теряет все shard relationships с этим owner'ом. Если партнёр хранит 1000 наших шардов → теряет 1000 holders для своих данных. EV мухлежа глубоко отрицательный.
+
+**Storage warning (уведомление "проверь диск"):**
+
+```
+Challenger → Holder:
+  {type: "storage_warning", shard_id, details, timestamp, sig_challenger}
+```
+
+При 1 failed challenge — challenger отправляет holder'у предупреждение: "шард повреждён, возможно bit rot, проверь диск". Holder может:
+- Запустить selfcheck всех хранимых шардов
+- Проверить SMART-состояние диска
+- Уведомить пользователя
+
+Это не наказание, а помощь: bit rot — общая проблема, и партнёр может не знать о ней.
 
 ### 1.4. Subnet rate-limiting
 
