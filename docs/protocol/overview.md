@@ -224,6 +224,8 @@ ShardDescriptor {
     k:            минимум шардов для восстановления
     n:            общее количество шардов
     merkle_root:  корень BLAKE3 merkle tree (для PoS)
+                  Размер блока для Merkle tree: 64 КБ.
+                  Шард ~17 МБ → ~260 листьев в дереве.
     owner_pub:    Ed25519 public key владельца
     importance:   0.0–1.0 (приоритет хранения)
     file_type:    "user" | "system" (для system state backup, см. §1.9)
@@ -271,6 +273,7 @@ Holder ОБЯЗАН проверить при получении шарда:
 
 - Доставка через gossip relay (см. 1.5), не требует одновременного online
 - Результат проверки (pass/fail) — локальное знание challenger'а
+- **TTL записи на доске (7 дней) = естественный deadline для PoS response.** Если за 7 дней response не появился на доске holder'а — fail.
 
 **Sampling PoS:** при большом количестве шардов проверять все каждую неделю нереально. Вместо этого — случайная выборка N шардов на партнёра в неделю (рекомендация: 5). Нам важна надёжность партнёра, а не статус конкретного шарда.
 
@@ -421,12 +424,14 @@ hop 2: ~1500 записей/week (с пересечениями)
 **Bootstrap (первый запуск):**
 
 ```
-Новая нода → connect к seed nodes (hardcoded)
-  → handshake: "я identity X, вот подпись"
-  → seed node пишет peer_announce записи: "вот тебе 10 нод"
-  → новая нода синкает доску seed node → видит рекомендации
-  → подключается к рекомендованным → обмен doc tickets → партнёры
+1. syncback init → подключение к seed nodes (обычные ноды с высоким uptime)
+2. Seed node видит нового peer → пишет peer_announce на свою доску
+3. Другие ноды видят announce → подписываются на доску новичка
+4. Новичок начинает получать shard_offer'ы
+5. Новичок принимает шарды → начинает хранить → S растёт
 ```
+
+Seed node — обычная нода без специальной роли. Единственная особенность: высокий uptime и принимает handshake от незнакомых identity. Hardcoded список seed nodes встроен в бинарник.
 
 **Рост (нормальная работа):**
 
@@ -449,8 +454,6 @@ Seed phrase → derive identity keypair + iroh keypair (детерминиров
   → connect к seed nodes → партнёры узнают нас по identity_pub
   → system state recovery → полный restore
 ```
-
-Seed node — обычная нода с высоким uptime. Единственная особенность: принимает handshake от незнакомцев и даёт рекомендации.
 
 ### 1.7. Shard placement и transfer
 
@@ -748,7 +751,10 @@ soft_threshold (< 15% от storage_quota свободно):
 
 hard_threshold (< 5% от storage_quota свободно):
   → Фаза 1 (экстренная): немедленно удалить шарды с наименьшим
-    eviction_priority, пока свободное место не вернётся к safe level
+    eviction_priority до тех пор, пока свободное место в рамках квоты
+    не вернётся к soft threshold (15%). Holder запрашивает trust_of_owner через
+    Processor (TrustEngine) при каждом eviction. Trust не кешируется
+    в holding-таблице — eviction редкая операция.
     → отправить shard_dropped каждому owner'у (directed, хороший тон)
     → без cooldown — это право holder'а на свой диск
 

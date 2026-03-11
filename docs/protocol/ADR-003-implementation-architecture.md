@@ -89,6 +89,8 @@ Network ◄──(NetCommand)── Processor
 
 **Важно:** все записи в DB — только из Processor task. Network и CLI Server только читают. Watcher отправляет dirty-события через канал в Processor — Processor пишет в DB. Никаких исключений.
 
+**Storage при eviction:** модуль `storage.rs` запрашивает `trust_of_owner` через канал у Processor (TrustEngine). Trust не кешируется в holding-таблице — eviction редкая операция, overhead обращения к Processor пренебрежим.
+
 ## Scheduler: внутренний timer loop
 
 Вместо cron — tokio task с таймером. Timestamps последнего запуска хранятся в redb, переживают рестарт.
@@ -121,7 +123,50 @@ loop {
 
 Единственная директория. Всё в одном месте — проще backup, проще удалить.
 
+## Конфигурация
+
+Пример `~/.syncback/config.toml`:
+
+```toml
+[backup]
+include = [
+  { path = "~/Documents", importance = 1.0 },
+  { path = "~/Photos/Favorites", importance = 0.9 },
+  { path = "~/Photos", importance = 0.5 },
+  { path = "~/Videos", importance = 0.2 },
+]
+exclude = ["*.tmp", "node_modules", ".git"]
+
+[storage]
+quota_gb = 100
+
+[network]
+seed_nodes = []             # default: hardcoded
+bandwidth_limit_mbps = 0    # 0 = unlimited
+
+[schedule]
+sync = "weekly"
+vacuum = "monthly"
+```
+
+Паттерны `include`/`exclude` — glob (семантика как .gitignore). `importance` задаётся per-folder (0.0–1.0). Если папки пересекаются — более специфичный путь имеет приоритет.
+
 `XDG_DATA_HOME` и прочие freedesktop-конвенции — потом. Для альфы `~/.syncback/` достаточно.
+
+## Инициализация (syncback init)
+
+```
+1. Генерация BIP39 seed phrase (24 слова)
+2. Показать пользователю:
+   "Запишите на бумагу. Это единственный способ восстановить данные."
+3. Подтверждение: ввести 3 случайных слова из фразы (по позиции)
+4. Derive identity keypair + iroh keypair (HKDF-SHA256 из seed)
+5. Создать ~/.syncback/ (config.toml, identity.key, syncback.redb)
+6. Подключиться к seed nodes
+7. Готово: "syncback daemon" для запуска
+```
+
+Seed phrase — единственный секрет пользователя. Без неё восстановление невозможно. Identity, NodeId, ключи шифрования — всё деривируется детерминированно.
 
 ## Key derivation
 
