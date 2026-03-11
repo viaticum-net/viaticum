@@ -9,11 +9,21 @@ rust-version.workspace = true
 [dependencies]
 syncback-core = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 
-# TODO Phase 2: uncomment when integrating iroh
-# iroh = "0.96"
+# P2P networking
+iroh = { workspace = true }
+iroh-blobs = { workspace = true }
+iroh-docs = { workspace = true }
+iroh-gossip = { workspace = true }
+
+# TODO Phase 3: uncomment when integrating file watching
 # notify = "7"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rand = { workspace = true }

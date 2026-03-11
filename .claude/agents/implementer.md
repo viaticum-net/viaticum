@@ -29,3 +29,4 @@ You implement Rust modules from detailed task specifications.
 - Do NOT add features beyond the spec
 - Do NOT add comments explaining obvious code
 - Do NOT add traits "for the future"
+- Prefer short files (~300 lines). If a module grows beyond that, split into submodules (e.g. `messages/types.rs`, `messages/signing.rs`, `messages/mod.rs`). Not a hard rule — don't split artificially, but do split when there are natural seams.

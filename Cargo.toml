@@ -32,6 +32,13 @@ redb = "2"
 
 # Async
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+
+# P2P networking (iroh ecosystem)
+iroh = "0.96"
+iroh-blobs = "0.98"
+iroh-docs = "0.96"
+iroh-gossip = "0.96"
 
 # Error handling
 thiserror = "2"
