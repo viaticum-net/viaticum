@@ -173,31 +173,100 @@ Challenger → Holder:
 
 Это anti-Sybil мера. Каждая нода применяет это правило самостоятельно при размещении СВОИХ шардов. Нода не может заставить другие ноды следовать этому правилу.
 
-### 1.5. Gossip relay (доставка сообщений)
+### 1.5. Доска объявлений (gossip relay)
 
-Реализовано поверх **iroh-docs**: каждая нода хранит replicated document (свой "почтовый ящик"), партнёры синхронизируют его при подключении.
+Каждая нода = одна iroh-doc = открытая доска.
 
-**Механизм:**
+**Модель:**
 
-- Каждая нода имеет свой iroh-docs namespace (outbox)
-- Сообщение = запись в документе: `key = "{to}/{message_id}"`, value = подписанный payload
-- При синхронизации с партнёром нода получает все новые записи
-- **Полу-эпидемик:** нода копирует к себе сообщения для соседей (relay). A→B→C: A пишет msg для C, B при синке видит и копирует к себе, C синкает с B и получает.
+- Запись: только хозяин доски (у него write key)
+- Чтение: любой партнёр (subscribe по read-only ticket)
+- Без адресации: все записи публичны, партнёры видят всё
 
-**Правила relay:**
+**Типы записей:**
 
-- Нода копирует только сообщения для известных identities (партнёры + соседи до 2 hops)
+```
+pos_challenge/{msg_id}    → {shard_id, block_range, nonce, ts, sig}
+pos_response/{msg_id}     → {challenge_id, hash, merkle_proof, ts, sig}
+peer_announce/{msg_id}    → {identity_pub, node_addr, ts, sig}
+shard_offer/{msg_id}      → {unit_id, shard_index, size, ts, sig}
+delete/{msg_id}           → {file_id, ts, sig}
+storage_warning/{msg_id}  → {shard_id, details, ts, sig}
+relay/{author}/{msg_id}   → скопированная запись от другой ноды
+```
+
+**Relay (полу-эпидемик):**
+
+Нода читает доски партнёров, копирует записи к себе → её партнёры видят их при синке:
+
+```
+hop 0: мои записи (я автор)
+hop 1: записи моих партнёров (копирую из их досок)
+hop 2: записи партнёров моих партнёров
+hop 3+: не копирую
+```
+
+Dedup по msg_id (уже есть → не копировать). Каждая запись подписана оригинальным автором — relay не может подделать.
+
+**Ограничения доски:**
+
 - TTL = 7 дней. Записи старше TTL удаляются.
-- Hop limit = 7. Каждый relay увеличивает hop_count; при hop_count ≥ 7 — не копировать.
-- Rate limit: не более 1 msg/peer/week на PoS
-- Outbox cap: ~8 МБ. При переполнении → drop oldest.
-- Подпись sender'а в payload — relay-нода не может подделать содержимое
+- Max entries: ~2000 записей на доску
+- Max size: 8 МБ на доску
+- При переполнении → drop oldest
 
-**Почему iroh-docs:** range-based set reconciliation эффективно синхронизирует только новые записи. Store-and-forward — бесплатно (данные персистятся на диске). Дедупликация — по ключу.
+**Объём трафика (50 партнёров):**
 
-**Identity allowlist:** нода принимает/копирует сообщения только от известных identities. Неизвестный identity → drop без проверки payload.
+```
+hop 0: ~20 записей/week (мои PoS challenges + announces)
+hop 1: ~1000 записей/week (50 партнёров × 20)
+hop 2: ~1500 записей/week (с пересечениями)
+Итого: ~2000 записей × 200 байт ≈ 400 КБ/week
+```
 
-### 1.6. Shard transfer
+**Почему iroh-docs:** range-based set reconciliation эффективно синхронизирует только новые записи. Store-and-forward бесплатно (данные на диске). Dedup по ключу.
+
+**Минимальные требования к подключению:** нода принимает subscribe запросы только от пиров с минимальным trust. Seed nodes принимают от всех (роль bootstrap).
+
+### 1.6. Peer discovery
+
+Обнаружение партнёров — через те же доски объявлений.
+
+**Bootstrap (первый запуск):**
+
+```
+Новая нода → connect к seed nodes (hardcoded)
+  → handshake: "я identity X, вот подпись"
+  → seed node пишет peer_announce записи: "вот тебе 10 нод"
+  → новая нода синкает доску seed node → видит рекомендации
+  → подключается к рекомендованным → обмен doc tickets → партнёры
+```
+
+**Рост (нормальная работа):**
+
+```
+Партнёр A пишет peer_announce в свою доску: "рекомендую пира C"
+  → мы синкаем доску A → видим рекомендацию → подключаемся к C
+```
+
+**Reconnect (после перерыва):**
+
+```
+NodeId партнёров в DB → iroh DNS/DHT discovery → найти текущий IP/relay → connect
+```
+
+**Disaster recovery:**
+
+```
+Seed phrase → derive identity keypair + iroh keypair (детерминированно)
+  → NodeId восстановлен → iroh discovery работает
+  → connect к seed nodes → партнёры узнают нас по identity_pub
+  → system state recovery → полный restore
+```
+
+Seed node — обычная нода с высоким uptime. Единственная особенность: принимает handshake от незнакомцев и даёт рекомендации.
+
+### 1.7. Shard transfer
 
 Реализовано через **iroh-blobs**:
 
@@ -209,7 +278,7 @@ Challenger → Holder:
 Upload: owner шифрует файл → erasure coding → отправляет шарды как blobs партнёрам.
 Download (restore): owner запрашивает k шардов у holder'ов → Reed-Solomon декодирование → расшифровка.
 
-### 1.7. Shard lifecycle messages
+### 1.8. Shard lifecycle messages
 
 Протокол определяет два сообщения управления шардами:
 
@@ -239,7 +308,7 @@ Owner отменяет ранее отправленный delete. Если cool
 
 **Silent ≠ delete.** Молчание owner'а означает "что-то случилось" (потеря устройства, болезнь, тюрьма), а не "удали мои данные". Owner с высоким I-score (годы в сети) → holder хранит шарды пока может. Owner с низким I-score → holder дропает при нехватке места.
 
-### 1.8. System state backup
+### 1.9. System state backup
 
 Зашифрованный снимок состояния ноды, который сам бекапится в сеть как обычный файл. Необходим для disaster recovery.
 
@@ -265,7 +334,7 @@ Owner отменяет ранее отправленный delete. Если cool
 
 Метаданные шарда содержат `file_type: "system"` (подписано owner'ом). Holder видит тип, но не содержимое.
 
-### 1.9. Escrow (правила restore)
+### 1.10. Escrow (правила restore)
 
 Протокол определяет механизм, параметры — решение реализации:
 
