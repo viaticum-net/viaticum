@@ -1,0 +1,19 @@
+[package]
+name = "syncback"
+description = "SyncBack daemon and CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+syncback-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+# TODO Phase 2: uncomment when integrating iroh
+# iroh = "0.96"
+# notify = "7"

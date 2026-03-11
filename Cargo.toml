@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/syncback-core",
+    "crates/syncback",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+
+# Crypto
+blake3 = "1"
+chacha20poly1305 = "0.5"
+ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
+x25519-dalek = { version = "2", features = ["serde"] }
+hkdf = "0.12"
+sha2 = "0.10"
+
+# Erasure coding
+reed-solomon-erasure = "6"
+
+# Database
+redb = "2"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Error handling
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Testing
+tempfile = "3"
+
+# Internal
+syncback-core = { path = "crates/syncback-core" }
