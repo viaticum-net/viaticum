@@ -29,8 +29,8 @@
 
 - Мониторит настроенные папки (notify: inotify/FSEvents)
 - Детектит изменения: new/modified/deleted
-- Записывает в DB: `{path, new_hash, timestamp, dirty=true}`
-- **Не запускает backup сразу.** Только помечает файлы как dirty.
+- Отправляет DirtyEvent в Processor через канал; Processor записывает в DB
+- **Не запускает backup сразу.** Только сигнализирует об изменениях.
 
 ## Packer (роль: owner)
 
@@ -231,6 +231,8 @@ Event-driven:
 ```
 
 ## Local DB (redb)
+
+> Актуальная схема с индексными таблицами — см. ADR-003.
 
 ```
 files:    file_id   → {path, hash, size, importance, dirty, current_unit_id,

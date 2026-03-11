@@ -43,7 +43,7 @@ syncback/
           cli_server.rs    # Unix socket, обслуживает CLI
 ```
 
-**syncback-core** — ноль сетевых зависимостей. Только redb, blake3, reed-solomon, chacha20, serde, ciborium. Тестируется без сети и без tokio.
+**syncback-core** — ноль сетевых зависимостей. Только redb, blake3, `reed-solomon-erasure` (выбран: проще, стабильнее, скорость не критична для cold backup), chacha20, serde, ciborium. Тестируется без сети и без tokio.
 
 **`Db`** — newtype-обёртка над `Arc<redb::Database>`, передаётся по clone между модулями.
 
@@ -57,7 +57,7 @@ syncback/
 
 | Task | Event loop | Что делает |
 |---|---|---|
-| Watcher | `notify_rx.recv()` | Помечает файлы dirty в DB |
+| Watcher | `notify_rx.recv()` | Отправляет DirtyEvent в Processor |
 | Scheduler | `tokio::time::sleep()` | Отправляет команды по таймеру |
 | Network | `endpoint.accept()` | iroh соединения, gossip |
 | Processor | `cmd_rx.recv()` + `net_rx.recv()` | Оркестрирует всю логику |
@@ -65,16 +65,16 @@ syncback/
 
 Trust Engine, Shard Manager, Budget Planner, Escrow, Packer — **не отдельные tasks**, а модули (struct с методами). Вызываются из Processor как `trust_engine.update(&event)`. Делать их tasks = ненужная сложность с каналами.
 
-**Processor** — центральный task. Держит все модули, принимает команды от Scheduler и CLI, события от Network. Единственный writer в DB (redb: один WriteTransaction за раз). Watcher пишет только в `dirty_files`, но не уведомляет Processor напрямую — Scheduler запрашивает dirty файлы из DB по таймеру (WeeklySync).
+**Processor** — центральный task. Держит все модули, принимает команды от Scheduler и CLI, события от Network и Watcher. Единственный writer в DB (redb: один WriteTransaction за раз). Watcher отправляет DirtyEvent через канал в Processor — Processor записывает в DB. Scheduler опрашивает dirty файлы из DB по таймеру (WeeklySync).
 
 ## Коммуникация между tasks
 
 ```
-Watcher ──(пишет dirty в DB)───────────────────
-                                                │
-Scheduler ──(Command)──► Processor              │
-                            │                   │
-CLI ────────(Command)──►    │  ◄── читает DB ───┘
+Watcher ──(DirtyEvent)──► Processor
+                            │
+Scheduler ──(Command)──►    │
+                            │
+CLI ────────(Command)──►    │  ──► пишет в DB
                             │
                             ├──► trust_engine.update()
                             ├──► packer.pack_dirty()
@@ -87,7 +87,7 @@ Network ◄──(NetCommand)── Processor
 
 `tokio::mpsc` каналы. Никаких внешних очередей.
 
-**Важно:** все записи в DB — только из Processor task. Network и CLI Server только читают. Watcher — исключение: пишет в `dirty_files` (отдельная таблица, не пересекается с Processor).
+**Важно:** все записи в DB — только из Processor task. Network и CLI Server только читают. Watcher отправляет dirty-события через канал в Processor — Processor пишет в DB. Никаких исключений.
 
 ## Scheduler: внутренний timer loop
 
@@ -122,6 +122,21 @@ loop {
 Единственная директория. Всё в одном месте — проще backup, проще удалить.
 
 `XDG_DATA_HOME` и прочие freedesktop-конвенции — потом. Для альфы `~/.syncback/` достаточно.
+
+## Key derivation
+
+```
+BIP39 (24 слова) → 64-byte seed
+
+HKDF-SHA256(seed, info="syncback-identity-ed25519") → Ed25519 identity keypair
+HKDF-SHA256(seed, info="syncback-iroh-ed25519")     → Ed25519 iroh keypair
+
+Шифрование файлов:
+HKDF-SHA256(identity_priv, salt=unit_id, info="syncback-file-encryption")
+  → 256-bit ключ → ChaCha20-Poly1305
+```
+
+Все ключи деривируются детерминированно из seed phrase. Identity и NodeId — разные ключи, разные роли. При смене транспорта или восстановлении устройства identity и trust сохраняются.
 
 ## Graceful shutdown
 

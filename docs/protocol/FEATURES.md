@@ -66,3 +66,9 @@ Tor, BLE, mesh networking — когда iroh добавит поддержку 
 ## File versioning
 
 При изменении файла — хранить N предыдущих версий (не только текущую). Cooldown на delete старых версий (ransomware protection).
+
+---
+
+## Hop-based allowlist
+
+Принимать сообщения только от identity в пределах hop ≤ 2 от своих партнёров. Сейчас allowlist строится по списку партнёров и их соседей вручную; в post-MVP — автоматическая фильтрация на основе hop-поля relay-записей.

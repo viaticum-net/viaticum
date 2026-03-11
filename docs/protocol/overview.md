@@ -366,9 +366,15 @@ DIRECTED (зашифрованы для получателя):
   storage_warning/{msg_id}  → target: holder   | {shard_id, details, ts}
   shard_dropped/{msg_id}    → target: owner    | {shard_id, ts}
   shard_drop_notice/{msg_id}   → target: owner    | {shard_id, deadline (absolute unix ts), ts}
+  restore_denied/{msg_id}   → target: owner    | {shard_id, reason, required_weeks, current_weeks}
 
 RELAY (копия чужой записи, формат сохраняется):
-  relay/{author}/{msg_id}   → копия, kind/target/payload/sig не меняются
+  relay/{author}/{msg_id}   → копия, kind/target/payload/sig не меняются, hop увеличивается
+
+Поле hop: u8 присутствует в каждой relay-записи:
+  Оригинальная запись на доске автора: hop = 0
+  При копировании чужой записи к себе: hop = original.hop + 1
+  Если hop >= 2 → не копировать далее
 ```
 
 **Почему шифруем:** без шифрования shard_offer виден всем партнёрам (shard_id, importance, кто куда кладёт). Атаки: спам-accepts на чужие offers, нецелевой pull blob'ов, корреляция трафика. С шифрованием наблюдатель видит только `A → B: [encrypted]`.
@@ -481,7 +487,7 @@ Seed node — обычная нода с высоким uptime. Единстве
 
 6. Holder проверяет полученный blob:
      blake3(blob) == shard_id из ShardDescriptor     ← защита от подмены
-     Если не совпадает → удалить blob, отозвать accept.
+     Если не совпадает → удалить blob, отправить shard_reject { shard_id, reason: hash_mismatch }.
 
 7. Holder ПОВТОРНО оценивает место (lazy reservation):
      - Место ещё есть → сохранить
@@ -500,7 +506,7 @@ Seed node — обычная нода с высоким uptime. Единстве
 - Blob download не завершён за 24ч connected time → abort, удалить partial
 - Accept без blob за 7 дней → аннулирован
 
-**Пакетные offers:** owner отправляет shard_offer нескольким партнёрам параллельно. Первые n shard_stored → размещение завершено. Оставшиеся accepts → ignore.
+**Пакетные offers:** owner отправляет shard_offer нескольким партнёрам параллельно. Первые n shard_stored → размещение завершено. Оставшиеся accepts → ignore. Winner-takes-all: проигравшие holders не уведомляются. Accept автоматически аннулируется по TTL (7 дней).
 
 **Restore flow (устройство живо, нужен файл):**
 
@@ -517,9 +523,11 @@ Restore — прямое соединение через iroh, не через �
    Owner → iroh connect → запрос blob по shard_id
    Holder проверяет:
      a) ShardDescriptor.owner_pub == запрашивающий identity?
-     b) Escrow: I-score owner'а достаточен для tier?
+     b) Escrow: weeks_in_network owner'а достаточно для tier?
      c) Шард в состоянии active?
-   → отдаёт blob
+   → отдаёт blob, или отправляет restore_denied если escrow не пройден:
+       restore_denied { shard_id, reason, required_weeks, current_weeks }
+   Owner показывает пользователю "restore доступен через ~N недель" вместо retry
 
 4. Holder офлайн → пропустить, следующий
    Набрали k → достаточно
@@ -543,7 +551,7 @@ Restore — прямое соединение через iroh, не через �
 
 Фаза 3 — System state (минуты):
   → system state шарды хранятся с max redundancy (5-of-25), max priority, TTL 5 лет
-  → escrow проходит: I-score кумулятивный, не обнуляется при потере устройства
+  → escrow проходит: weeks_in_network кумулятивный, не обнуляется при потере устройства
   → скачать k шардов system state → RS decode → расшифровка
   → получаем: file manifest, shard map, trust state, peer directory
   → нода знает ВСЁ
@@ -558,7 +566,7 @@ Restore — прямое соединение через iroh, не через �
   → нода полностью функциональна
 ```
 
-**Escrow при disaster:** holder видит знакомый identity_pub, но P=0. Escrow работает по I-score (кумулятивный). Пользователь с годами в сети → I-score высокий → проходит. Новичок → только demo credit (1 ГБ).
+**Escrow при disaster:** holder видит знакомый identity_pub, но P=0. Escrow проходит по `weeks_in_network` — этот счётчик кумулятивный и не обнуляется при потере устройства (identity сохраняется из seed phrase). Пользователь с годами в сети → weeks_in_network >> 26 → tier 3 проходит. Новичок → только demo credit (1 ГБ).
 
 **Repair flow:**
 
@@ -626,7 +634,7 @@ Owner отменяет ранее отправленный delete. Если cool
 - Обновляется при каждом существенном изменении (новый файл, новый партнёр, weekly trust update).
 - Максимальная redundancy (напр. 5-of-25).
 - **Максимальный приоритет хранения.** Holder дропает system state shards последними (после всех пользовательских файлов). TTL = 5 лет с момента последнего обновления.
-- Holder хранит текущую + предыдущую версию.
+- Holder хранит только текущую версию (MVP).
 - При disaster recovery: восстанавливается первым. После этого нода знает всё: файлы, партнёров, шарды, trust.
 
 **Как holder отличает system state от обычного файла:**
@@ -641,7 +649,7 @@ Owner отменяет ранее отправленный delete. Если cool
 - **Restore:** holder шарда МОЖЕТ отказать в выдаче, если owner не соответствует локальным критериям holder'а.
 - Протокол гарантирует: holder не может прочитать содержимое шарда (зашифровано ключом owner'а). Holder может только хранить или удалить.
 
-Escrow — это не запрет на уровне протокола. Это ПРАВО holder'а не отдавать шард. Каждый holder решает сам, по каким критериям отдавать. Рекомендуемая реализация: по I-score (см. раздел 2).
+Escrow — это не запрет на уровне протокола. Это ПРАВО holder'а не отдавать шард. Каждый holder решает сам, по каким критериям отдавать. Рекомендуемая реализация: по `weeks_in_network` owner'а — сколько недель он в сети (см. §2.5). I-score (кумулятивные GB·days) — отдельная метрика для disaster recovery, не для escrow порогов.
 
 ---
 
@@ -667,7 +675,15 @@ trust_AB = (kp × P_B + ki × I_B) × clamp(S_AB, 0.1, 1.0)
 
 ### 2.2. Параметры erasure coding
 
-Рекомендуемый default: 5-of-15 для критичных данных.
+Рекомендуемые defaults зависят от importance:
+
+| importance | схема | overhead |
+|---|---|---|
+| ≥ 0.8 (критичные данные) | 5-of-15 | ×3.0 |
+| ≥ 0.4 | 5-of-10 | ×2.0 |
+| ≥ 0.1 | 5-of-7 | ×1.4 |
+
+Поверх базовых параметров — adaptive n: `n_actual = n_base + extra(avg_trust)` для компенсации ненадёжных партнёров (см. §2.7).
 
 Нода может выбрать 3-of-5 (меньше overhead, ниже надёжность) или 7-of-21 (больше overhead, выше надёжность). Это её данные, её решение.
 
@@ -719,18 +735,18 @@ age_bonus = min(weeks_stored / 26, 0.3)   // до +30% за полгода хр�
 3. System state shards (file_type=system)  → max priority, TTL 5 лет
 ```
 
-**Cooldown на delete:** holder получает delete request от owner'а → ждёт 4 недели перед удалением. Если за это время придёт cancel_delete — шард сохраняется. Защита от ransomware. **Cooldown применяется только к owner-requested delete, не к holder-initiated eviction.**
+**Cooldown на delete (двойной барьер):** owner ждёт 4 недели после обнаружения удаления файла, прежде чем отправить delete сообщение. После получения delete holder ждёт ещё 4 недели перед фактическим удалением шарда. Итого: 8 недель от момента локального удаления до физического уничтожения шарда. Если за это время придёт cancel_delete — шард сохраняется. Два независимых барьера защищают от ransomware. **Cooldown применяется только к owner-requested delete, не к holder-initiated eviction.**
 
 **Disk pressure management (holder-initiated eviction):**
 
-Пользователь может в любой момент занять место на диске (скачать файл, установить программу). Daemon мониторит свободное место и управляет шардами:
+Пользователь может в любой момент занять место на диске (скачать файл, установить программу). Daemon мониторит свободное место в рамках `storage_quota` — объёма, который пользователь выделил под чужие шарды в конфигурации. "Свободно" считается относительно storage_quota, не всего диска.
 
 ```
-soft_threshold (< 15% свободно):
+soft_threshold (< 15% от storage_quota свободно):
   → прекратить принимать новые shard_offer (shard_reject: "full")
-  → уведомить пользователя: "диск заполняется, шарды под угрозой"
+  → уведомить пользователя: "квота заполняется, шарды под угрозой"
 
-hard_threshold (< 5% свободно):
+hard_threshold (< 5% от storage_quota свободно):
   → Фаза 1 (экстренная): немедленно удалить шарды с наименьшим
     eviction_priority, пока свободное место не вернётся к safe level
     → отправить shard_dropped каждому owner'у (directed, хороший тон)
