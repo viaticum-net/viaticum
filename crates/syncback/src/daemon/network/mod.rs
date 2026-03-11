@@ -349,6 +349,18 @@ async fn handle_command(
             // TODO Phase 2: iroh-docs board publish and blob upload.
             tracing::debug!("network: board/shard command not yet implemented");
         }
+        NetCommand::SendPosChallenge { holder, shard_id, .. } => {
+            // TODO Phase 2: send PoS challenge via board.
+            tracing::debug!(holder = %holder, shard = %shard_id, "network: SendPosChallenge not yet implemented");
+        }
+        NetCommand::SendDirect { peer, .. } => {
+            // TODO Phase 2: send direct message to peer.
+            tracing::debug!(peer = %peer, "network: SendDirect not yet implemented");
+        }
+        NetCommand::ConnectAddr { node_addr } => {
+            // TODO Phase 2: connect to peer by address string.
+            tracing::debug!(addr = %node_addr, "network: ConnectAddr not yet implemented");
+        }
     }
 }
 

@@ -1,0 +1,1391 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use syncback_core::budget::BudgetPlanner;
+use syncback_core::constants::SECS_PER_WEEK;
+use syncback_core::db::Db;
+use syncback_core::escrow::EscrowChecker;
+use syncback_core::messages::{
+    from_cbor, to_cbor, CancelDeleteMsg, DeleteMsg, DenyReason, DirectBody, MsgId,
+    PeerAnnounceMsg, PosChallengeMsg, PosResponseMsg, RejectReason, RestoreDeniedMsg,
+    RestoreRequestMsg, ShardAcceptMsg, ShardDropNoticeMsg, ShardDroppedMsg, ShardOfferMsg,
+    ShardRejectMsg, ShardStoredMsg, StorageWarningMsg,
+};
+use syncback_core::placement::PlacementEngine;
+use syncback_core::trust::{TransferEvent, TrustEngine};
+use syncback_core::types::{FileId, FileRecord, IdentityPub, ScheduleRecord, ShardStatus, Timestamp};
+
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use crate::daemon::shard_manager::{PosResponse, PosResult, ShardManager, ShardManagerError};
+use crate::daemon::storage::{OfferDecision, Storage, StorageError};
+use crate::daemon::{
+    CliCmd, Config, DirtyEvent, DirtyKind, IncludeEntry, NetCommand, NetEvent, ProcessorMsg,
+    ScheduledCmd, StatusReply,
+};
+
+#[cfg(test)]
+mod tests;
+
+// ============================================================
+// Internal state for pending PoS challenges
+// ============================================================
+
+#[derive(Clone)]
+struct PendingPosChallenge {
+    shard_id: syncback_core::types::ShardId,
+    block_index: u32,
+    nonce: [u8; 32],
+    sent_at: Timestamp,
+}
+
+// ============================================================
+// Processor struct
+// ============================================================
+
+struct Processor {
+    db: Db,
+    config: Config,
+    cancel: CancellationToken,
+
+    processor_rx: mpsc::Receiver<ProcessorMsg>,
+    dirty_rx: mpsc::Receiver<DirtyEvent>,
+    net_event_rx: mpsc::Receiver<NetEvent>,
+    net_cmd_tx: mpsc::Sender<NetCommand>,
+
+    trust: TrustEngine,
+    #[allow(dead_code)]
+    escrow: EscrowChecker,
+    #[allow(dead_code)]
+    placement: PlacementEngine,
+    budget: BudgetPlanner,
+    shard_manager: ShardManager,
+    storage: Storage,
+
+    started_at: std::time::Instant,
+    pending_pos_challenges: HashMap<[u8; 32], PendingPosChallenge>,
+}
+
+// ============================================================
+// Public entry point
+// ============================================================
+
+/// Run the processor task until `cancel` is signalled or a channel closes.
+/// Owns all logic modules. Sole DB writer.
+pub async fn run(
+    db: Db,
+    cancel: CancellationToken,
+    processor_rx: mpsc::Receiver<ProcessorMsg>,
+    dirty_rx: mpsc::Receiver<DirtyEvent>,
+    net_event_rx: mpsc::Receiver<NetEvent>,
+    net_cmd_tx: mpsc::Sender<NetCommand>,
+    config: Config,
+    identity_key: ed25519_dalek::SigningKey,
+    identity_pub: IdentityPub,
+) {
+    let trust = TrustEngine::new(db.clone());
+    let escrow = EscrowChecker::new(db.clone());
+    let placement = PlacementEngine::new(db.clone(), TrustEngine::new(db.clone()));
+    let budget = BudgetPlanner::new(db.clone(), TrustEngine::new(db.clone()));
+
+    let shards_dir = config.syncback_dir.join("shards");
+    let storage = Storage::new(
+        db.clone(),
+        shards_dir,
+        config.storage.quota_gb as f64,
+        TrustEngine::new(db.clone()),
+    )
+    .expect("storage init: shards dir creation failed");
+
+    // Clone identity key for ShardManager (ed25519_dalek::SigningKey may not impl Clone).
+    let sm_key = ed25519_dalek::SigningKey::from_bytes(&identity_key.to_bytes());
+
+    let shard_manager = ShardManager::new(
+        db.clone(),
+        PlacementEngine::new(db.clone(), TrustEngine::new(db.clone())),
+        BudgetPlanner::new(db.clone(), TrustEngine::new(db.clone())),
+        sm_key,
+        identity_pub,
+        net_cmd_tx.clone(),
+    );
+
+    let mut proc = Processor {
+        db,
+        config,
+        cancel,
+        processor_rx,
+        dirty_rx,
+        net_event_rx,
+        net_cmd_tx,
+        trust,
+        escrow,
+        placement,
+        budget,
+        shard_manager,
+        storage,
+        started_at: std::time::Instant::now(),
+        pending_pos_challenges: HashMap::new(),
+    };
+
+    tracing::info!("processor: started");
+    proc.run_loop().await;
+    tracing::info!("processor: stopped");
+}
+
+// ============================================================
+// Main event loop
+// ============================================================
+
+impl Processor {
+    async fn run_loop(&mut self) {
+        loop {
+            tokio::select! {
+                _ = self.cancel.cancelled() => {
+                    tracing::debug!("processor: cancelled");
+                    break;
+                }
+
+                msg = self.processor_rx.recv() => {
+                    match msg {
+                        Some(ProcessorMsg::Scheduled(cmd)) => self.handle_scheduled(cmd).await,
+                        Some(ProcessorMsg::Cli(cmd)) => self.handle_cli(cmd).await,
+                        None => {
+                            tracing::debug!("processor: processor_rx closed");
+                            break;
+                        }
+                    }
+                }
+
+                event = self.dirty_rx.recv() => {
+                    match event {
+                        Some(ev) => self.handle_dirty(ev).await,
+                        None => {
+                            tracing::debug!("processor: dirty_rx closed");
+                            break;
+                        }
+                    }
+                }
+
+                event = self.net_event_rx.recv() => {
+                    match event {
+                        Some(ev) => self.handle_net_event(ev).await,
+                        None => {
+                            tracing::debug!("processor: net_event_rx closed");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// Scheduled command handlers
+// ============================================================
+
+impl Processor {
+    async fn handle_scheduled(&mut self, cmd: ScheduledCmd) {
+        match cmd {
+            ScheduledCmd::WeeklySync => self.run_weekly_sync().await,
+            ScheduledCmd::PosRound => self.run_pos_round().await,
+            ScheduledCmd::Vacuum => self.run_vacuum().await,
+            ScheduledCmd::RepairCheck => self.run_repair_check().await,
+        }
+    }
+
+    async fn run_weekly_sync(&mut self) {
+        let now = Timestamp::now();
+        tracing::info!("weekly sync: starting");
+
+        // 1. Estimate budget.
+        let estimate = self
+            .budget
+            .estimate_budget()
+            .expect("budget estimation: db error is fatal");
+        let budget_gb = estimate.total_gb;
+
+        // 2. Select dirty files to back up.
+        let batch = self
+            .budget
+            .select_backup_batch(budget_gb)
+            .expect("backup batch selection: db error is fatal");
+        tracing::info!(
+            files = batch.candidates.len(),
+            deferred = batch.deferred_count,
+            total_gb = batch.total_required_gb,
+            "weekly sync: backup batch selected"
+        );
+
+        // 3. For each candidate: Phase 2 stub — log only.
+        for candidate in &batch.candidates {
+            tracing::debug!(
+                path = candidate.path,
+                importance = candidate.importance,
+                "weekly sync: would back up (packer not implemented in Phase 2)"
+            );
+        }
+
+        // 4. Trust update: recalculate trust for all peers.
+        let current_week = (now.0 / SECS_PER_WEEK) as u32;
+        let count = self
+            .trust
+            .recalculate_all(now, current_week)
+            .expect("trust recalculation: db error is fatal");
+        tracing::info!(peers = count, "weekly sync: trust recalculated");
+
+        // 5. Update weeks_in_network for all known peers.
+        let peers = self
+            .db
+            .list_all_peers()
+            .expect("list_all_peers: db error is fatal");
+        for peer in &peers {
+            self.db
+                .increment_peer_weeks(&peer.identity)
+                .expect("increment_peer_weeks: db error is fatal");
+        }
+
+        // 6. Process expired cooldowns (holder side).
+        let deleted = self
+            .storage
+            .process_expired_cooldowns(now)
+            .expect("process_expired_cooldowns: db error is fatal");
+        if !deleted.is_empty() {
+            tracing::info!(
+                count = deleted.len(),
+                "weekly sync: expired cooldowns processed"
+            );
+        }
+
+        // 7. Process expired drop notices (holder side).
+        let dropped = self
+            .storage
+            .process_expired_drop_notices(now)
+            .expect("process_expired_drop_notices: db error is fatal");
+        for shard_id in &dropped {
+            tracing::debug!(shard = %shard_id, "drop notice expired: shard deleted");
+        }
+
+        // 8. Check disk pressure.
+        self.check_disk_pressure(now).await;
+
+        // 9. Clean up stale pending PoS challenges (older than 7 days).
+        let cutoff = now.0.saturating_sub(7 * 86_400);
+        self.pending_pos_challenges
+            .retain(|_, v| v.sent_at.0 >= cutoff);
+
+        // 10. Update schedule record.
+        self.db
+            .set_schedule(&ScheduleRecord {
+                task_name: "weekly_sync".to_string(),
+                last_run: Some(now),
+                next_run: Timestamp(now.0 + 7 * 604_800),
+            })
+            .expect("set_schedule failed");
+
+        tracing::info!("weekly sync: complete");
+    }
+
+    async fn run_pos_round(&mut self) {
+        let now = Timestamp::now();
+
+        let challenges = self
+            .shard_manager
+            .sample_pos_challenges(now)
+            .expect("sample_pos_challenges: db error is fatal");
+        tracing::info!(count = challenges.len(), "pos round: sending challenges");
+
+        for challenge in &challenges {
+            let challenge_id = compute_challenge_id(challenge);
+
+            self.net_cmd_tx
+                .send(NetCommand::SendPosChallenge {
+                    holder: challenge.holder,
+                    shard_id: challenge.shard_id,
+                    block_index: challenge.block_index,
+                    nonce: challenge.nonce,
+                    challenge_id,
+                })
+                .await
+                .expect("net channel closed");
+
+            self.pending_pos_challenges.insert(
+                challenge_id,
+                PendingPosChallenge {
+                    shard_id: challenge.shard_id,
+                    block_index: challenge.block_index,
+                    nonce: challenge.nonce,
+                    sent_at: now,
+                },
+            );
+        }
+
+        self.db
+            .set_schedule(&ScheduleRecord {
+                task_name: "pos_round".to_string(),
+                last_run: Some(now),
+                next_run: Timestamp(now.0 + 7 * 604_800),
+            })
+            .expect("set_schedule failed");
+
+        tracing::info!(sent = challenges.len(), "pos round: complete");
+    }
+
+    async fn run_vacuum(&mut self) {
+        let now = Timestamp::now();
+        tracing::info!("vacuum: running (stub — full vacuum in Phase 3)");
+
+        let stale_units = self
+            .db
+            .list_stale_units()
+            .expect("list_stale_units failed");
+        tracing::info!(stale = stale_units.len(), "vacuum: found stale units");
+
+        let units = self
+            .db
+            .list_units_by_status(syncback_core::types::UnitStatus::Deleting)
+            .expect("list units failed");
+        for unit in units {
+            tracing::debug!(unit = %unit.unit_id, "vacuum: deleting unit (stub)");
+        }
+
+        self.db
+            .set_schedule(&ScheduleRecord {
+                task_name: "vacuum".to_string(),
+                last_run: Some(now),
+                next_run: Timestamp(now.0 + 30 * 86_400),
+            })
+            .expect("set_schedule failed");
+    }
+
+    async fn run_repair_check(&mut self) {
+        let now = Timestamp::now();
+
+        let under_replicated = self
+            .shard_manager
+            .find_under_replicated_units()
+            .expect("find_under_replicated_units failed");
+        tracing::info!(
+            count = under_replicated.len(),
+            "repair check: under-replicated units"
+        );
+
+        for unit_id in under_replicated {
+            match self
+                .shard_manager
+                .repair_unit(unit_id, None, now)
+                .await
+            {
+                Ok(n) => tracing::info!(unit = %unit_id, shards = n, "repair: repaired unit"),
+                Err(ShardManagerError::PlaintextNotAvailable) => {
+                    tracing::info!(
+                        unit = %unit_id,
+                        "repair: need restore flow (Phase 3)"
+                    );
+                }
+                Err(ShardManagerError::NotEnoughPeers { need, have }) => {
+                    tracing::info!(
+                        unit = %unit_id,
+                        need,
+                        have,
+                        "repair: not enough peers, retry next week"
+                    );
+                }
+                Err(e) => panic!("repair_unit unexpected error: {e}"),
+            }
+        }
+
+        self.db
+            .set_schedule(&ScheduleRecord {
+                task_name: "repair_check".to_string(),
+                last_run: Some(now),
+                next_run: Timestamp(now.0 + 7 * 604_800),
+            })
+            .expect("set_schedule failed");
+    }
+}
+
+// ============================================================
+// CLI command handlers
+// ============================================================
+
+impl Processor {
+    async fn handle_cli(&mut self, cmd: CliCmd) {
+        match cmd {
+            CliCmd::Status { reply } => self.handle_cli_status(reply).await,
+            CliCmd::BackupNow { reply } => self.handle_cli_backup_now(reply).await,
+            CliCmd::RestoreFile { path, dest, reply } => {
+                self.handle_cli_restore(path, dest, reply).await;
+            }
+            CliCmd::Shutdown => {
+                tracing::info!("processor: shutdown requested via CLI");
+                self.cancel.cancel();
+            }
+        }
+    }
+
+    async fn handle_cli_status(&self, reply: tokio::sync::oneshot::Sender<StatusReply>) {
+        let peers = self
+            .db
+            .list_all_peers()
+            .expect("list_all_peers failed");
+        let shards_held = self
+            .db
+            .list_all_holding()
+            .expect("list_all_holding failed")
+            .len();
+        let shards_placed = self
+            .db
+            .list_all_shards()
+            .expect("list_all_shards failed")
+            .iter()
+            .filter(|s| s.status == ShardStatus::Stored)
+            .count();
+        let budget_record = self.db.get_budget().expect("get_budget failed");
+        let budget_gb = budget_record.map(|b| b.estimated_gb).unwrap_or(0.0);
+        let dirty_files = self
+            .db
+            .list_dirty_files()
+            .expect("list_dirty_files failed")
+            .len();
+
+        let reply_value = StatusReply {
+            uptime_secs: self.started_at.elapsed().as_secs(),
+            peer_count: peers.len(),
+            shards_held,
+            shards_placed,
+            budget_gb,
+            dirty_files,
+        };
+
+        let _ = reply.send(reply_value);
+    }
+
+    async fn handle_cli_backup_now(
+        &mut self,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        tracing::info!("backup now: triggered by CLI");
+        self.run_weekly_sync().await;
+        let _ = reply.send(Ok(()));
+    }
+
+    async fn handle_cli_restore(
+        &self,
+        path: PathBuf,
+        dest: PathBuf,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        tracing::info!(?path, ?dest, "restore: requested (stub — Phase 3)");
+        let _ = reply.send(Err(
+            "restore not yet implemented (Phase 3)".to_string(),
+        ));
+    }
+}
+
+// ============================================================
+// DirtyEvent handler
+// ============================================================
+
+impl Processor {
+    async fn handle_dirty(&self, event: DirtyEvent) {
+        tracing::debug!(path = ?event.path, kind = ?event.kind, "dirty event");
+        let path_str = event.path.to_string_lossy().to_string();
+        let now = Timestamp(event.detected_at);
+
+        match event.kind {
+            DirtyKind::Created | DirtyKind::Modified => {
+                match self
+                    .db
+                    .get_file(&path_str)
+                    .expect("get_file failed")
+                {
+                    Some(_) => {
+                        self.db
+                            .mark_file_dirty(&path_str, now)
+                            .expect("mark_file_dirty failed");
+                    }
+                    None => {
+                        let importance = self.config_importance_for_path(&event.path);
+                        if importance < 0.1 {
+                            tracing::debug!(
+                                path = ?event.path,
+                                "dirty: importance too low, skipping"
+                            );
+                            return;
+                        }
+                        let file_id = self.next_file_id();
+                        let record = FileRecord {
+                            file_id,
+                            path: path_str.clone(),
+                            content_hash: [0u8; 32],
+                            size_bytes: 0,
+                            importance,
+                            dirty: true,
+                            current_unit_id: None,
+                            last_backed_up: None,
+                            backed_up: false,
+                            first_seen: now,
+                        };
+                        self.db.upsert_file(&record).expect("upsert_file failed");
+                    }
+                }
+            }
+            DirtyKind::Deleted => {
+                tracing::debug!(
+                    path = ?event.path,
+                    "dirty: file deleted (delete flow in Phase 3)"
+                );
+            }
+        }
+    }
+
+    /// Return the importance for a path based on config include patterns.
+    /// Prefix match, longest match wins. Returns 0.0 if no match or excluded.
+    fn config_importance_for_path(&self, path: &Path) -> f64 {
+        let path_str = path.to_string_lossy();
+
+        // Check exclude patterns first (simple prefix match for Phase 2).
+        for exclude in &self.config.backup.exclude {
+            if path_str.starts_with(exclude.as_str()) {
+                return 0.0;
+            }
+        }
+
+        // Find best (longest) include prefix match.
+        let mut best: Option<&IncludeEntry> = None;
+        for entry in &self.config.backup.include {
+            let entry_str = entry.path.to_string_lossy();
+            if path_str.starts_with(entry_str.as_ref()) {
+                match best {
+                    None => best = Some(entry),
+                    Some(prev) => {
+                        if entry.path.as_os_str().len() > prev.path.as_os_str().len() {
+                            best = Some(entry);
+                        }
+                    }
+                }
+            }
+        }
+
+        best.map(|e| e.importance).unwrap_or(0.0)
+    }
+
+    /// Read-then-increment FileId counter from config table.
+    fn next_file_id(&self) -> FileId {
+        let current: u64 = self
+            .db
+            .get_config("next_file_id")
+            .expect("get_config failed")
+            .unwrap_or(0u64);
+        let next = current + 1;
+        self.db
+            .set_config("next_file_id", &next)
+            .expect("set_config failed");
+        FileId(next)
+    }
+}
+
+// ============================================================
+// NetEvent handlers
+// ============================================================
+
+impl Processor {
+    async fn handle_net_event(&mut self, event: NetEvent) {
+        match event {
+            NetEvent::PeerConnected {
+                peer_identity,
+                peer_node_id: _,
+            } => {
+                self.handle_peer_connected(peer_identity).await;
+            }
+            NetEvent::MessageReceived { from, message } => {
+                self.handle_direct_message(from, message).await;
+            }
+            NetEvent::BoardMessage {
+                from,
+                msg_type,
+                payload,
+            } => {
+                self.handle_board_message(from, msg_type, payload).await;
+            }
+            NetEvent::ShardUploaded {
+                shard_id,
+                holder,
+                bytes,
+            } => {
+                self.handle_shard_uploaded(shard_id, holder, bytes).await;
+            }
+            NetEvent::ShardDownloaded {
+                shard_id,
+                peer,
+                bytes,
+            } => {
+                self.handle_shard_downloaded(shard_id, peer, bytes).await;
+            }
+            NetEvent::FatalError(msg) => {
+                tracing::error!("network fatal error: {msg}");
+                self.cancel.cancel();
+            }
+            NetEvent::HandshakeFailed { reason } => {
+                tracing::debug!("handshake failed: {reason}");
+            }
+        }
+    }
+
+    async fn handle_peer_connected(&self, peer: IdentityPub) {
+        tracing::info!(peer = %peer, "peer connected");
+        let now = Timestamp::now();
+        match self.db.get_peer(&peer).expect("get_peer failed") {
+            Some(mut record) => {
+                record.last_seen = now;
+                self.db.upsert_peer(&record).expect("upsert_peer failed");
+            }
+            None => {
+                self.trust
+                    .upsert_peer(&peer, now)
+                    .expect("upsert_peer failed");
+            }
+        }
+    }
+
+    async fn handle_direct_message(&mut self, from: IdentityPub, message: syncback_core::messages::DirectMessage) {
+        let now = Timestamp::now();
+        match message.body {
+            DirectBody::Handshake(_) => {
+                tracing::debug!(peer = %from, "direct: unexpected handshake in processor");
+            }
+            DirectBody::RestoreRequest(req) => {
+                self.handle_restore_request(from, req, now).await;
+            }
+            DirectBody::RestoreDenied(denied) => {
+                tracing::info!(
+                    peer = %from,
+                    shard = %denied.shard_id,
+                    required_weeks = denied.required_weeks,
+                    current_weeks = denied.current_weeks,
+                    "restore denied by holder (escrow)"
+                );
+            }
+            DirectBody::BlobReady(ready) => {
+                tracing::debug!(
+                    peer = %from,
+                    shard = %ready.shard_id,
+                    "blob ready from holder (pull in Phase 3)"
+                );
+            }
+        }
+    }
+
+    async fn handle_board_message(
+        &mut self,
+        from: IdentityPub,
+        msg_type: String,
+        payload: Vec<u8>,
+    ) {
+        tracing::debug!(peer = %from, msg_type = %msg_type, "board message received");
+
+        // Only process from known peers.
+        if self.db.get_peer(&from).expect("get_peer failed").is_none() {
+            tracing::debug!(peer = %from, "board message from unknown peer, dropping");
+            return;
+        }
+
+        let now = Timestamp::now();
+
+        match msg_type.as_str() {
+            "shard_offer" => {
+                let msg: ShardOfferMsg = match from_cbor(&payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!(peer = %from, error = %e, "shard_offer: parse error");
+                        return;
+                    }
+                };
+                self.handle_shard_offer(from, msg, now).await;
+            }
+            "shard_accept" => {
+                let msg: ShardAcceptMsg = match from_cbor(&payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!(peer = %from, error = %e, "shard_accept: parse error");
+                        return;
+                    }
+                };
+                self.handle_shard_accept(from, msg, now).await;
+            }
+            "shard_stored" => {
+                let msg: ShardStoredMsg = match from_cbor(&payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!("shard_stored: parse error: {e}");
+                        return;
+                    }
+                };
+                self.shard_manager
+                    .handle_shard_stored(msg.shard_id, now)
+                    .expect("handle_shard_stored failed");
+                tracing::info!(shard = %msg.shard_id, holder = %from, "shard stored confirmed");
+            }
+            "shard_reject" => {
+                let msg: ShardRejectMsg = match from_cbor(&payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!("shard_reject: parse error: {e}");
+                        return;
+                    }
+                };
+                self.shard_manager
+                    .handle_shard_reject(msg.shard_id, now)
+                    .unwrap_or_else(|e| {
+                        tracing::debug!(error = %e, "shard_reject: shard not found (ok)");
+                    });
+            }
+            "shard_dropped" => {
+                let msg: ShardDroppedMsg = match from_cbor(&payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!("shard_dropped: parse error: {e}");
+                        return;
+                    }
+                };
+                self.shard_manager
+                    .handle_shard_dropped(msg.shard_id, now)
+                    .unwrap_or_else(|e| {
+                        tracing::debug!(error = %e, "shard_dropped: shard not found (ok)");
+                    });
+                tracing::info!(shard = %msg.shard_id, holder = %from, "shard dropped by holder");
+            }
+            "shard_drop_notice" => {
+                let msg: ShardDropNoticeMsg = match from_cbor(&payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!("shard_drop_notice: parse error: {e}");
+                        return;
+                    }
+                };
+                tracing::info!(
+                    shard = %msg.shard_id,
+                    deadline = msg.deadline,
+                    "shard drop notice from holder (repair in Phase 3)"
+                );
+            }
+            "pos_challenge" => {
+                let msg: PosChallengeMsg = match from_cbor(&payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!("pos_challenge: parse error: {e}");
+                        return;
+                    }
+                };
+                self.handle_pos_challenge_incoming(from, msg, now).await;
+            }
+            "pos_response" => {
+                let msg: PosResponseMsg = match from_cbor(&payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!("pos_response: parse error: {e}");
+                        return;
+                    }
+                };
+                self.handle_pos_response_incoming(from, msg, now).await;
+            }
+            "delete" => {
+                let msg: DeleteMsg = match from_cbor(&payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!("delete: parse error: {e}");
+                        return;
+                    }
+                };
+                match self.storage.handle_delete_request(msg.shard_id, &from, now) {
+                    Ok(()) => {
+                        tracing::debug!(shard = %msg.shard_id, "delete request recorded");
+                    }
+                    Err(StorageError::ShardNotFound(_)) => {
+                        tracing::debug!(
+                            shard = %msg.shard_id,
+                            "delete for unknown shard, ignoring"
+                        );
+                    }
+                    Err(e) => panic!("handle_delete_request unexpected error: {e}"),
+                }
+            }
+            "cancel_delete" => {
+                let msg: CancelDeleteMsg = match from_cbor(&payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!("cancel_delete: parse error: {e}");
+                        return;
+                    }
+                };
+                match self.storage.handle_cancel_delete(msg.shard_id, &from) {
+                    Ok(()) => {
+                        tracing::debug!(shard = %msg.shard_id, "cancel_delete processed");
+                    }
+                    Err(StorageError::ShardNotFound(_)) => {
+                        tracing::debug!(
+                            shard = %msg.shard_id,
+                            "cancel_delete for unknown shard, ignoring"
+                        );
+                    }
+                    Err(e) => panic!("handle_cancel_delete unexpected error: {e}"),
+                }
+            }
+            "storage_warning" => {
+                let msg: StorageWarningMsg = match from_cbor(&payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!("storage_warning: parse error: {e}");
+                        return;
+                    }
+                };
+                match self.storage.handle_storage_warning(msg.shard_id) {
+                    Ok(true) => {
+                        tracing::debug!(shard = %msg.shard_id, "storage warning: shard intact");
+                    }
+                    Ok(false) => {
+                        tracing::error!(
+                            shard = %msg.shard_id,
+                            "storage warning: shard CORRUPTED"
+                        );
+                    }
+                    Err(StorageError::ShardNotFound(_)) => {
+                        tracing::debug!(
+                            shard = %msg.shard_id,
+                            "storage warning for shard we don't hold"
+                        );
+                    }
+                    Err(e) => panic!("handle_storage_warning unexpected error: {e}"),
+                }
+            }
+            "peer_announce" => {
+                let msg: PeerAnnounceMsg = match from_cbor(&payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!("peer_announce: parse error: {e}");
+                        return;
+                    }
+                };
+                self.handle_peer_announce(from, msg, now).await;
+            }
+            _ => {
+                tracing::debug!(
+                    peer = %from,
+                    msg_type = %msg_type,
+                    "unknown board message type, ignoring"
+                );
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Shard offer flow (we are the holder)
+    // ----------------------------------------------------------------
+
+    async fn handle_shard_offer(
+        &mut self,
+        from: IdentityPub,
+        msg: ShardOfferMsg,
+        now: Timestamp,
+    ) {
+        let descriptor = &msg.descriptor;
+        tracing::debug!(shard = %descriptor.shard_id, owner = %from, "shard offer received");
+
+        if let Err(e) = descriptor.verify_sig() {
+            tracing::debug!(shard = %descriptor.shard_id, error = %e, "shard offer: invalid sig");
+            return;
+        }
+
+        if descriptor.owner_pub != from {
+            tracing::debug!(
+                shard = %descriptor.shard_id,
+                "shard offer: owner_pub mismatch"
+            );
+            return;
+        }
+
+        match self
+            .storage
+            .should_accept_offer(descriptor)
+            .expect("should_accept_offer failed")
+        {
+            OfferDecision::Accept => {
+                tracing::debug!(shard = %descriptor.shard_id, "shard offer: accepting");
+                let accept_msg = ShardAcceptMsg {
+                    v: 1,
+                    shard_id: descriptor.shard_id,
+                    offer_msg_id: MsgId::derive(&descriptor.shard_id.0, now.0),
+                    ts: now.0,
+                };
+                let accept_payload = to_cbor(&accept_msg).expect("cbor failed");
+                self.net_cmd_tx
+                    .send(NetCommand::PublishBoard {
+                        msg_type: "shard_accept".to_string(),
+                        payload: accept_payload,
+                        directed_to: Some(from),
+                    })
+                    .await
+                    .expect("net channel closed");
+            }
+            OfferDecision::RejectFull => {
+                tracing::debug!(shard = %descriptor.shard_id, "shard offer: rejecting (full)");
+                self.send_shard_reject(from, descriptor.shard_id, RejectReason::Full, now)
+                    .await;
+            }
+            OfferDecision::RejectUnknown | OfferDecision::RejectNotAllowed => {
+                tracing::debug!(
+                    shard = %descriptor.shard_id,
+                    "shard offer: rejecting (not allowed)"
+                );
+                self.send_shard_reject(
+                    from,
+                    descriptor.shard_id,
+                    RejectReason::NotAllowed,
+                    now,
+                )
+                .await;
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Shard accept flow (we are the owner, holder accepted our offer)
+    // ----------------------------------------------------------------
+
+    async fn handle_shard_accept(
+        &mut self,
+        from: IdentityPub,
+        msg: ShardAcceptMsg,
+        now: Timestamp,
+    ) {
+        tracing::debug!(shard = %msg.shard_id, holder = %from, "shard accept received");
+        match self
+            .shard_manager
+            .handle_shard_accept(msg.shard_id, from, msg.offer_msg_id, now)
+            .await
+        {
+            Ok(()) => {}
+            Err(ShardManagerError::ShardNotFound(_)) => {
+                tracing::debug!(
+                    shard = %msg.shard_id,
+                    "shard accept for unknown shard (TTL expired?)"
+                );
+            }
+            Err(e) => panic!("handle_shard_accept unexpected error: {e}"),
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // PoS challenge (we are the holder)
+    // ----------------------------------------------------------------
+
+    async fn handle_pos_challenge_incoming(
+        &self,
+        from: IdentityPub,
+        msg: PosChallengeMsg,
+        now: Timestamp,
+    ) {
+        tracing::debug!(shard = %msg.shard_id, challenger = %from, "pos challenge received");
+
+        match self
+            .storage
+            .answer_pos_challenge(msg.shard_id, msg.block_range.0, &msg.nonce)
+        {
+            Ok(answer) => {
+                let response = PosResponseMsg {
+                    v: 1,
+                    challenge_id: msg.challenge_id,
+                    block_data_hash: answer.block_data_hash,
+                    merkle_proof: answer.merkle_proof,
+                    ts: now.0,
+                };
+                let payload = to_cbor(&response).expect("cbor failed");
+                self.net_cmd_tx
+                    .send(NetCommand::PublishBoard {
+                        msg_type: "pos_response".to_string(),
+                        payload,
+                        directed_to: Some(from),
+                    })
+                    .await
+                    .expect("net channel closed");
+                tracing::debug!(shard = %msg.shard_id, "pos challenge: response sent");
+            }
+            Err(StorageError::ShardNotFound(_)) => {
+                tracing::debug!(
+                    shard = %msg.shard_id,
+                    "pos challenge: shard not held, no response"
+                );
+            }
+            Err(StorageError::BlobMissing(path)) => {
+                tracing::error!(
+                    shard = %msg.shard_id,
+                    ?path,
+                    "pos challenge: blob missing on disk"
+                );
+            }
+            Err(e) => panic!("answer_pos_challenge unexpected error: {e}"),
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // PoS response (we are the challenger/owner)
+    // ----------------------------------------------------------------
+
+    async fn handle_pos_response_incoming(
+        &mut self,
+        from: IdentityPub,
+        msg: PosResponseMsg,
+        now: Timestamp,
+    ) {
+        tracing::debug!(
+            peer = %from,
+            challenge = ?msg.challenge_id,
+            "pos response received"
+        );
+
+        let challenge_info = match self.pending_pos_challenges.get(&msg.challenge_id) {
+            Some(info) => info.clone(),
+            None => {
+                tracing::debug!("pos response for unknown challenge_id, ignoring");
+                return;
+            }
+        };
+
+        let current_week = (now.0 / SECS_PER_WEEK) as u32;
+
+        let pos_response = PosResponse {
+            from,
+            shard_id: challenge_info.shard_id,
+            block_index: challenge_info.block_index,
+            block_data_hash: msg.block_data_hash,
+            merkle_proof: msg.merkle_proof,
+            nonce: challenge_info.nonce,
+        };
+
+        let result = self
+            .shard_manager
+            .handle_pos_response(pos_response, now, current_week)
+            .expect("handle_pos_response: unexpected error");
+
+        match result {
+            PosResult::Pass => {
+                tracing::debug!(
+                    peer = %from,
+                    shard = %challenge_info.shard_id,
+                    "pos: PASS"
+                );
+                // Record PoS pass in trust.
+                let outcome = syncback_core::trust::PosOutcome {
+                    week_number: current_week,
+                    challenged: 1,
+                    passed: 1,
+                };
+                self.trust
+                    .record_pos_result(&from, outcome)
+                    .unwrap_or_else(|e| {
+                        tracing::debug!(error = %e, "trust record_pos_result error");
+                    });
+            }
+            PosResult::Fail => {
+                tracing::info!(
+                    peer = %from,
+                    shard = %challenge_info.shard_id,
+                    "pos: FAIL"
+                );
+                // Record PoS fail in trust.
+                let outcome = syncback_core::trust::PosOutcome {
+                    week_number: current_week,
+                    challenged: 1,
+                    passed: 0,
+                };
+                self.trust
+                    .record_pos_result(&from, outcome)
+                    .unwrap_or_else(|e| {
+                        tracing::debug!(error = %e, "trust record_pos_result error");
+                    });
+
+                // Send storage_warning to holder.
+                let warning = StorageWarningMsg {
+                    v: 1,
+                    shard_id: challenge_info.shard_id,
+                    details: "PoS verification failed".to_string(),
+                    ts: now.0,
+                };
+                let payload = to_cbor(&warning).expect("cbor failed");
+                self.net_cmd_tx
+                    .send(NetCommand::PublishBoard {
+                        msg_type: "storage_warning".to_string(),
+                        payload,
+                        directed_to: Some(from),
+                    })
+                    .await
+                    .expect("net channel closed");
+            }
+        }
+
+        self.pending_pos_challenges.remove(&msg.challenge_id);
+    }
+
+    // ----------------------------------------------------------------
+    // Peer announce (bootstrap/discovery)
+    // ----------------------------------------------------------------
+
+    async fn handle_peer_announce(
+        &self,
+        from: IdentityPub,
+        msg: PeerAnnounceMsg,
+        now: Timestamp,
+    ) {
+        tracing::debug!(
+            announced = %msg.identity_pub,
+            from = %from,
+            "peer announce"
+        );
+        self.trust
+            .upsert_peer(&msg.identity_pub, now)
+            .expect("upsert_peer failed");
+
+        let node_addr = String::from_utf8_lossy(&msg.node_addr).to_string();
+        self.net_cmd_tx
+            .send(NetCommand::ConnectAddr { node_addr })
+            .await
+            .expect("net channel closed");
+    }
+
+    // ----------------------------------------------------------------
+    // Restore request (we are the holder)
+    // ----------------------------------------------------------------
+
+    async fn handle_restore_request(
+        &self,
+        from: IdentityPub,
+        req: RestoreRequestMsg,
+        now: Timestamp,
+    ) {
+        tracing::debug!(shard = %req.shard_id, owner = %from, "restore request");
+
+        match self.storage.read_shard_for_restore(req.shard_id, &from, now) {
+            Ok(blob) => {
+                self.net_cmd_tx
+                    .send(NetCommand::UploadShard {
+                        shard_id: req.shard_id,
+                        holder: from,
+                        data: blob,
+                    })
+                    .await
+                    .expect("net channel closed");
+                tracing::info!(shard = %req.shard_id, owner = %from, "restore: blob sent");
+            }
+            Err(StorageError::EscrowDenied(denial)) => {
+                tracing::info!(
+                    shard = %req.shard_id,
+                    owner = %from,
+                    required_weeks = denial.required_weeks,
+                    current_weeks = denial.current_weeks,
+                    "restore: denied by escrow"
+                );
+                let denied_msg = RestoreDeniedMsg {
+                    v: 1,
+                    shard_id: req.shard_id,
+                    reason: DenyReason::EscrowNotMet,
+                    required_weeks: denial.required_weeks,
+                    current_weeks: denial.current_weeks,
+                    ts: now.0,
+                };
+                let payload = to_cbor(&denied_msg).expect("cbor failed");
+                self.net_cmd_tx
+                    .send(NetCommand::SendDirect { peer: from, payload })
+                    .await
+                    .expect("net channel closed");
+            }
+            Err(StorageError::ShardNotFound(_)) => {
+                tracing::debug!(shard = %req.shard_id, "restore: shard not held");
+                let denied_msg = RestoreDeniedMsg {
+                    v: 1,
+                    shard_id: req.shard_id,
+                    reason: DenyReason::NotFound,
+                    required_weeks: 0,
+                    current_weeks: 0,
+                    ts: now.0,
+                };
+                let payload = to_cbor(&denied_msg).expect("cbor failed");
+                self.net_cmd_tx
+                    .send(NetCommand::SendDirect { peer: from, payload })
+                    .await
+                    .expect("net channel closed");
+            }
+            Err(e) => panic!("read_shard_for_restore unexpected error: {e}"),
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Transfer events
+    // ----------------------------------------------------------------
+
+    async fn handle_shard_uploaded(
+        &self,
+        shard_id: syncback_core::types::ShardId,
+        holder: IdentityPub,
+        bytes: u64,
+    ) {
+        tracing::debug!(shard = %shard_id, holder = %holder, bytes, "shard uploaded to holder");
+        let now = Timestamp::now();
+        let event = TransferEvent {
+            peer: holder,
+            bytes_sent_to_peer: bytes,
+            bytes_received_from_peer: 0,
+        };
+        self.trust
+            .record_transfer(&event, now)
+            .unwrap_or_else(|e| {
+                tracing::debug!(error = %e, "trust update for unknown peer (uploaded)");
+            });
+    }
+
+    async fn handle_shard_downloaded(
+        &self,
+        shard_id: syncback_core::types::ShardId,
+        peer: IdentityPub,
+        bytes: u64,
+    ) {
+        tracing::debug!(shard = %shard_id, peer = %peer, bytes, "shard downloaded/served");
+        let now = Timestamp::now();
+        let event = TransferEvent {
+            peer,
+            bytes_sent_to_peer: bytes,
+            bytes_received_from_peer: 0,
+        };
+        self.trust
+            .record_transfer(&event, now)
+            .unwrap_or_else(|e| {
+                tracing::debug!(error = %e, "trust update for unknown peer (downloaded)");
+            });
+    }
+}
+
+// ============================================================
+// Disk pressure helper
+// ============================================================
+
+impl Processor {
+    async fn check_disk_pressure(&mut self, now: Timestamp) {
+        use syncback_core::budget::DiskPressure;
+
+        let result = self
+            .storage
+            .check_pressure(now)
+            .expect("check_pressure failed");
+
+        match result.pressure {
+            DiskPressure::Normal => {}
+            DiskPressure::Soft => {
+                tracing::info!("disk pressure: SOFT — rejecting new shard offers");
+            }
+            DiskPressure::Hard => {
+                tracing::info!(
+                    evictions = result.immediate_evictions.len(),
+                    drop_notices = result.drop_notices.len(),
+                    freed_gb = result.freed_gb,
+                    "disk pressure: HARD — evicting shards"
+                );
+
+                // Phase 1: immediate evictions.
+                for target in &result.immediate_evictions {
+                    match self.storage.evict_shard(target.shard_id, now) {
+                        Ok(owner_pub) => {
+                            let msg = syncback_core::messages::ShardDroppedMsg {
+                                v: 1,
+                                shard_id: target.shard_id,
+                                ts: now.0,
+                            };
+                            let payload = to_cbor(&msg).expect("cbor failed");
+                            self.net_cmd_tx
+                                .send(NetCommand::PublishBoard {
+                                    msg_type: "shard_dropped".to_string(),
+                                    payload,
+                                    directed_to: Some(owner_pub),
+                                })
+                                .await
+                                .expect("net channel closed");
+                        }
+                        Err(StorageError::ShardNotFound(_)) => {} // already gone
+                        Err(e) => panic!("evict_shard unexpected error: {e}"),
+                    }
+                }
+
+                // Phase 2: drop notices.
+                for notice in &result.drop_notices {
+                    self.storage
+                        .record_drop_notice(notice.shard_id, now)
+                        .unwrap_or_else(|e| {
+                            tracing::debug!(error = %e, "record_drop_notice: shard not found");
+                        });
+
+                    let msg = syncback_core::messages::ShardDropNoticeMsg {
+                        v: 1,
+                        shard_id: notice.shard_id,
+                        deadline: notice.deadline,
+                        ts: now.0,
+                    };
+                    let payload = to_cbor(&msg).expect("cbor failed");
+
+                    if let Ok(Some(record)) = self.db.get_holding(&notice.shard_id) {
+                        self.net_cmd_tx
+                            .send(NetCommand::PublishBoard {
+                                msg_type: "shard_drop_notice".to_string(),
+                                payload,
+                                directed_to: Some(record.owner_pub),
+                            })
+                            .await
+                            .expect("net channel closed");
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// Helper: send_shard_reject
+// ============================================================
+
+impl Processor {
+    async fn send_shard_reject(
+        &self,
+        to: IdentityPub,
+        shard_id: syncback_core::types::ShardId,
+        reason: RejectReason,
+        now: Timestamp,
+    ) {
+        let msg = ShardRejectMsg {
+            v: 1,
+            shard_id,
+            offer_msg_id: MsgId::derive(&shard_id.0, now.0),
+            reason,
+            ts: now.0,
+        };
+        let payload = to_cbor(&msg).expect("cbor failed");
+        self.net_cmd_tx
+            .send(NetCommand::PublishBoard {
+                msg_type: "shard_reject".to_string(),
+                payload,
+                directed_to: Some(to),
+            })
+            .await
+            .expect("net channel closed");
+    }
+}
+
+// ============================================================
+// Helper: challenge_id derivation
+// ============================================================
+
+fn compute_challenge_id(c: &crate::daemon::shard_manager::PosChallenge) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&c.shard_id.0);
+    hasher.update(&c.block_index.to_be_bytes());
+    hasher.update(&c.nonce);
+    *hasher.finalize().as_bytes()
+}

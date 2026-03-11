@@ -166,6 +166,26 @@ pub enum NetEvent {
         from: syncback_core::types::IdentityPub,
         message: syncback_core::messages::DirectMessage,
     },
+    /// A board-style message received (gossip/board sync).
+    BoardMessage {
+        from: syncback_core::types::IdentityPub,
+        msg_type: String,
+        payload: Vec<u8>,
+    },
+    /// Shard blob successfully uploaded to a holder.
+    ShardUploaded {
+        shard_id: syncback_core::types::ShardId,
+        holder: syncback_core::types::IdentityPub,
+        bytes: u64,
+    },
+    /// Shard blob successfully downloaded/served to a requester.
+    ShardDownloaded {
+        shard_id: syncback_core::types::ShardId,
+        peer: syncback_core::types::IdentityPub,
+        bytes: u64,
+    },
+    /// Network task encountered a fatal, unrecoverable error.
+    FatalError(String),
     /// Handshake failed (log and ignore).
     HandshakeFailed {
         reason: String,
@@ -200,6 +220,24 @@ pub enum NetCommand {
         shard_id: syncback_core::types::ShardId,
         holder: syncback_core::types::IdentityPub,
         data: Vec<u8>,
+    },
+    /// Send a PoS challenge to a holder via board message.
+    SendPosChallenge {
+        holder: syncback_core::types::IdentityPub,
+        shard_id: syncback_core::types::ShardId,
+        block_index: u32,
+        nonce: [u8; 32],
+        challenge_id: [u8; 32],
+    },
+    /// Send a direct (non-board) message payload to a peer.
+    /// Payload is already CBOR-encoded DirectMessage.
+    SendDirect {
+        peer: syncback_core::types::IdentityPub,
+        payload: Vec<u8>,
+    },
+    /// Connect to a peer by node address string (discovery/bootstrap).
+    ConnectAddr {
+        node_addr: String,
     },
 }
 
@@ -293,9 +331,14 @@ impl DaemonHandle {
         let identity_pub_bytes: [u8; 32] = identity_signing_key.verifying_key().to_bytes();
         let identity_pub = syncback_core::types::IdentityPub(identity_pub_bytes);
 
+        // Clone identity key so both NetworkTask and Processor can own a copy.
+        // ed25519_dalek::SigningKey doesn't impl Clone — use from_bytes.
+        let net_identity_key =
+            ed25519_dalek::SigningKey::from_bytes(&identity_signing_key.to_bytes());
+
         let (net_task, net_handle) = network::NetworkTask::new(
             iroh_secret_key,
-            identity_signing_key,
+            net_identity_key,
             identity_pub,
             cancel.clone(),
             iroh::endpoint::RelayMode::Disabled,
@@ -311,6 +354,9 @@ impl DaemonHandle {
             dirty_rx,
             net_event_rx,
             net_cmd_tx,
+            config.clone(),
+            identity_signing_key,
+            identity_pub,
         ));
 
         let network_handle = tokio::spawn({
