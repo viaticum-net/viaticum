@@ -34,7 +34,7 @@ SyncBack — тонкая обёртка. Единственная оригин�
 | Trust engine | ~500 | P (4-week rolling window), I (cumulative mean), S (pairwise ratio). Формула: (kp×P + ki×I) × clamp(S, 0.1, 1.0). Persist в локальную DB. |
 | Escrow | ~200 | Право holder'а отказать в restore. Тиры по I-score: <5GB/4wk, <50GB/13wk, >50GB/26wk. Первый 1GB бесплатно. |
 | Placement | ~300 | Weighted: w_i = trust^α, cap per partner. Adaptive n: больше шардов при низком trust. |
-| Mailbox relay rules | ~400 | Формат сообщений в iroh-docs. Relay: копировать для соседей. TTL=7d, hop_limit=7, identity allowlist, rate limit, outbox cap 8MB. |
+| Mailbox relay rules | ~400 | Формат сообщений в iroh-docs. Relay: копировать для соседей. TTL=7d, hop ≤ 2, identity allowlist, rate limit, outbox cap 8MB. |
 | Peer management | ~300 | Bootstrap от seed nodes, peer exchange, subnet tracking (/24, ASN). |
 
 **Итого уникального кода: ~1700 строк.**
@@ -43,7 +43,7 @@ SyncBack — тонкая обёртка. Единственная оригин�
 
 | Модуль | ~Строк | Описание |
 |---|---|---|
-| PoS scheduler + verification | ~300 | Генерация challenges, верификация responses, расписание 2-3/week. BLAKE3 merkle proof из iroh-blobs. |
+| PoS scheduler + verification | ~300 | Генерация challenges, верификация responses, расписание 5/week на партнёра (см. overview.md §1.3). BLAKE3 merkle proof из iroh-blobs. |
 | File catalog | ~500 | Конфиг папок, change detection (notify), file index (path→hash→file_id), dedup. |
 | Shard manager | ~400 | Encrypt → erasure code → upload blobs. Repair: detect lost shards → re-place. Shard registry: file_id → shards → holders. |
 | Node daemon | ~500 | Запуск iroh endpoint, регистрация протоколов, periodic tasks (PoS, repair, cleanup). |

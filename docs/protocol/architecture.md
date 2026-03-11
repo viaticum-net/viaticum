@@ -5,19 +5,22 @@
 ## Общая схема
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    syncback daemon                   │
-├──────────┬──────────┬──────────┬────────────────────┤
-│  Watcher │ Packer   │ Network  │    Scheduler       │
-│  (files) │ (units)  │ (peers)  │    (cron)          │
-├──────────┴──────────┼──────────┤                    │
-│  Shard Manager      │ Storage  │                    │
-│  (encrypt+erasure)  │ (holder) │                    │
-├─────────────────────┴──────────┴────────────────────┤
-│                   Local DB (redb)                    │
-├─────────────────────────────────────────────────────┤
-│              Transport (iroh adapter)                │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                    syncback daemon                    │
+├──────────┬──────────┬───────────┬────────────────────┤
+│  Watcher │ Packer   │ Network   │    Scheduler       │
+│  (files) │ (units)  │ (peers)   │    (cron)          │
+├──────────┴──────────┼───────────┤                    │
+│  Budget Planner     │ Storage   │                    │
+│  (importance+budget)│ (holder)  │                    │
+├─────────────────────┤           │                    │
+│  Shard Manager      │           │                    │
+│  (encrypt+erasure)  │           │                    │
+├─────────────────────┴───────────┴────────────────────┤
+│                   Local DB (redb)                     │
+├──────────────────────────────────────────────────────┤
+│              Transport (iroh adapter)                 │
+└──────────────────────────────────────────────────────┘
 ```
 
 ## Watcher (роль: owner)
@@ -47,11 +50,13 @@ Unit size = U (default 256 МБ)
   файл изменился → dirty=true в DB
   Всё. Никаких сетевых операций.
 
-WEEKLY SYNC (Scheduler → Packer → Shard Manager)
-  → собрать все dirty файлы
-  → мелкие: создать delta packs (только изменённые файлы)
+WEEKLY SYNC (Scheduler → Budget Planner → Packer → Shard Manager)
+  → Budget Planner: оценить budget_gb
+  → собрать все dirty файлы, отсортировать по importance
+  → отсечь по бюджету: dirty файлы ниже порога → остаются dirty (в следующий раз)
+  → мелкие: создать delta packs (только изменённые файлы в рамках бюджета)
   → крупные: пересоздать только изменённые chunks
-  → encrypt → erasure → upload
+  → encrypt → erasure (n зависит от importance) → upload
   → dirty=false, обновить current_unit_id
   → старые units с изменёнными файлами → status=stale
 
@@ -99,7 +104,7 @@ Stale packs не нужны для restore (только для cooldown ransomw
 Отвечает за отношения с партнёрами.
 
 - Mailbox sync: при подключении к партнёру — sync iroh-docs, получить/отправить сообщения
-- Relay: копировать сообщения для соседей (semi-epidemic, hop < 7, identity allowlist)
+- Relay: копировать сообщения для соседей (semi-epidemic, hop ≤ 2, identity allowlist)
 - Trust engine: P (rolling 4wk), I (cumulative), S (pairwise GB ratio)
 - PoS challenger: генерировать challenges для holder'ов своих шардов
 - Peer management: bootstrap, peer exchange, allowlist (partners + 2 hops)
@@ -109,10 +114,90 @@ Stale packs не нужны для restore (только для cooldown ransomw
 Превращает units в шарды и управляет их lifecycle.
 
 - Encrypt unit (ChaCha20-Poly1305, ключ из identity)
-- Erasure code (Reed-Solomon, k-of-n)
+- Erasure code (Reed-Solomon, k-of-n, где n зависит от importance)
 - Placement: выбрать n партнёров (weighted by trust)
 - Upload: шарды стримятся партнёрам через iroh-blobs, не хранятся локально
 - Repair: обнаружить потерянные шарды → пересоздать → разместить на новых партнёрах
+- **Budget estimation:** оценка доступного бюджета сети (см. Budget Planner)
+
+## Budget Planner (роль: owner)
+
+Нода не может бекапить больше, чем сеть готова хранить. Budget Planner оценивает доступный бюджет и определяет, какие файлы бекапить в первую очередь.
+
+### Оценка бюджета
+
+```
+Для каждого партнёра i:
+  capacity_i = сколько он реально хранит наших шардов (из shard registry)
+  headroom_i = оценка свободного места (из последнего PoS/handshake)
+  willingness_i = trust_i × history_factor  (принимал ли раньше?)
+
+budget_gb = Σ capacity_i + Σ min(headroom_i, expected_acceptance_i)
+```
+
+Точного бюджета не знаем (партнёры не обязаны сообщать), но есть сигналы:
+- Сколько уже хранят (факт)
+- Принимали ли новые шарды на прошлой неделе (тренд)
+- Отказывали ли в placement (перегружены)
+
+### Importance scoring
+
+Каждый файл получает importance (0.0–1.0):
+
+```
+Конфигурация пользователя (папки → importance):
+  ~/Documents/**          → 1.0
+  ~/Photos/Favorites/**   → 0.9
+  ~/Photos/**             → 0.5  (MVP: случайная выборка в рамках бюджета)
+  ~/Videos/**             → 0.2
+  ~/Downloads/**          → 0.1
+
+Эвристики (v1, без ML):
+  + favorited (EXIF rating, macOS favorites)  → +0.2
+  + has faces (EXIF face regions)             → +0.1
+  + rare moment (< 5 фото в этот день)       → +0.1
+  + старое фото (> 3 лет)                    → +0.1
+  + высокое разрешение                        → +0.05
+  clamp(0.0, 1.0)
+```
+
+### Budget-aware backup strategy
+
+```
+1. Оценить budget_gb
+2. Рассчитать required_gb для каждого файла:
+     required_gb = file_size × (n/k)  где n зависит от importance
+     importance ≥ 0.8 → 5-of-15 (×3.0 overhead)
+     importance ≥ 0.4 → 5-of-10 (×2.0)
+     importance ≥ 0.1 → 5-of-7  (×1.4)
+     importance < 0.1 → не бекапить
+3. Отсортировать файлы по importance (desc)
+4. Включить в backup пока Σ required_gb ≤ budget_gb
+5. Файлы ниже бюджета → не бекапятся, пока бюджет не вырастет
+```
+
+### Рост бюджета
+
+По мере роста trust → партнёры охотнее принимают наши шарды → бюджет растёт → больше файлов попадает в backup. Пользователь видит прогресс:
+
+```
+Backup coverage:
+  Documents:   100%  (5 GB, 15 replicas)
+  Photos:       12%  (24 GB of 200 GB, top by importance)
+  Video:         3%  (9 GB of 300 GB)
+  Trust growing. Full backup estimated in ~4 months.
+```
+
+### Eviction priority (на стороне holder'а)
+
+Когда holder'у не хватает места, он решает что удалить:
+
+```
+eviction_priority = importance × trust_of_owner × (1 + age_bonus)
+age_bonus = min(weeks_stored / 26, 0.3)  // до +30% за полгода
+```
+
+Lowest priority → evict first. Hysteresis: evict только если new_priority > existing × (1 + H). Конкретный механизм hysteresis — определить экспериментально (Exp #27).
 
 ## Storage (роль: holder)
 
@@ -130,7 +215,8 @@ Stale packs не нужны для restore (только для cooldown ransomw
 
 ```
 Еженедельно:
-  → Weekly sync: Packer собирает dirty файлы → Shard Manager → upload
+  → Budget estimation: оценить budget_gb, обновить importance scoring
+  → Weekly sync: Budget Planner → Packer → Shard Manager → upload
   → PoS sampling: для каждого партнёра → 5 случайных шардов → challenge
   → Trust update: агрегация P за неделю
   → Repair check: есть ли units с < n живых шардов?
@@ -147,13 +233,16 @@ Event-driven:
 ## Local DB (redb)
 
 ```
-files:    file_id   → {path, hash, size, dirty, current_unit_id, last_backed_up}
+files:    file_id   → {path, hash, size, importance, dirty, current_unit_id,
+                       last_backed_up, backed_up (bool)}
 units:    unit_id   → {type(pack|chunk), status(active|stale|deleted),
                        member_files[], parent_file_id, chunk_index,
-                       size, hash, created_at}
+                       size, hash, created_at, importance_avg}
 shards:   shard_id  → {unit_id, shard_index, holder_id, status, last_verified}
 peers:    identity  → {node_id, trust_P, trust_I, trust_S, first_seen, last_seen, subnet}
-holding:  shard_id  → {owner_pub, size, state, received_at, delete_requested_at}
+holding:  shard_id  → {owner_pub, importance, size, state, received_at,
+                       delete_requested_at}
+budget:   singleton → {estimated_gb, last_calculated, placement_success_rate}
 config:   key       → value
 ```
 
@@ -172,11 +261,11 @@ Scheduler: repair check
 
 ## System state backup
 
-Зашифрованный снимок состояния ноды (~8-24 МБ), сам бекапится в сеть с максимальной redundancy. Обновляется еженедельно (или при существенных изменениях).
+Зашифрованный снимок состояния ноды (размер зависит от количества файлов, см. overview.md §1.9), сам бекапится в сеть с максимальной redundancy. Обновляется еженедельно (или при существенных изменениях).
 
 Содержимое: file manifest, shard map, trust state, peer directory.
 
-Подробности: overview.md §1.8.
+Подробности: overview.md §1.9.
 
 ## Поток данных: disaster recovery
 
@@ -189,7 +278,7 @@ Scheduler: repair check
 День 1: System state recovery
   → seed nodes находят партнёров, знающих наш identity_pub
   → партнёры: "у меня system state shards для identity X"
-  → скачать k шардов system state (~8 МБ = минуты)
+  → скачать k шардов system state (минуты-часы в зависимости от размера архива)
   → расшифровать → file manifest + shard map + trust state + peer directory
   → нода знает ВСЁ: файлы, где шарды, кто партнёры, trust
 

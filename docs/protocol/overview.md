@@ -47,7 +47,7 @@ SyncBack — тонкая обёртка над существующими те�
 2. **iroh relay (WebSocket/TLS:443)** — где UDP заблокирован (выглядит как HTTPS)
 3. **Self-hosted relay** — где зарубежный трафик режут
 
-**Важно:** `identity_pub` (Ed25519, наш) ≠ `iroh NodeId` (их). Identity — "кто ты". NodeId — "как подключиться". Маппинг хранится локально. При смене транспорта identity и trust сохраняются.
+**Важно:** `identity_pub` (Ed25519, наш) ≠ `iroh NodeId` (их). Identity — "кто ты". NodeId — "как подключиться". Оба деривируются из seed phrase детерминированно. Маппинг публикуется через peer_announce. При смене транспорта identity и trust сохраняются.
 
 ### Шифрование данных: ChaCha20-Poly1305
 
@@ -67,6 +67,80 @@ SyncBack — тонкая обёртка над существующими те�
 
 ---
 
+## 0.1. Wire format
+
+### Сериализация: CBOR (RFC 8949)
+
+Все сообщения протокола сериализуются в CBOR — компактный самоописывающийся бинарный формат. Rust: `ciborium` (serde-совместимый).
+
+Почему CBOR:
+- Самоописывающийся — можно инспектировать без схемы (отладка)
+- RFC стандарт, не привязан к компании или языку
+- Компактный бинарный формат (~110 байт на handshake, ~200 байт на shard_offer)
+- Версионирование бесплатно: новые поля игнорируются старыми нодами
+
+### Framing
+
+**Прямое соединение (ALPN `"syncback/1"`):**
+
+```
+[u32 BE длина][CBOR payload][u32 BE длина][CBOR payload]...
+```
+
+Каждое сообщение = 4 байта длины (big-endian) + CBOR bytes. Максимальный размер одного сообщения: 64 КБ (защита от DoS). Стрим открывается поверх QUIC-соединения iroh.
+
+**Записи на доске (iroh-docs):**
+
+```
+key:   "{type}/{msg_id}"        (UTF-8 строка)
+value: CBOR bytes               (opaque для iroh, интерпретируется SyncBack)
+```
+
+iroh-docs хранит и синхронизирует записи. SyncBack читает value и десериализует из CBOR.
+
+### Версионирование протокола
+
+```
+Уровень 1 — транспорт (мажорная версия):
+  ALPN: "syncback/1"
+  При ломающих изменениях → "syncback/2"
+  Нода может поддерживать несколько ALPN одновременно
+
+Уровень 2 — сообщение (минорные изменения):
+  Каждое CBOR-сообщение содержит поле "v": 1
+  Новые optional поля — старые ноды игнорируют неизвестное
+  Убрать обязательное поле — только при смене ALPN
+```
+
+### Пример: HandshakeMsg
+
+```cbor
+{
+  "type": "handshake",
+  "v": 1,
+  "identity_pub": h'<32 bytes>',
+  "timestamp": 1741689600,
+  "sig_author": h'<64 bytes>'
+}
+→ ~110 байт
+```
+
+### Пример: directed запись на доске
+
+```cbor
+{
+  "type": "shard_offer",
+  "v": 1,
+  "kind": "directed",
+  "target_pub": h'<32 bytes>',
+  "payload": h'<encrypted CBOR>',
+  "sig_author": h'<64 bytes>'
+}
+→ ~250 байт (зависит от ShardDescriptor)
+```
+
+---
+
 ## 1. Что определяет протокол (enforceable)
 
 Протокол определяет **формат сообщений** и **правила верификации** — то, что каждая нода может проверить у других. Протокол НЕ определяет, как нода принимает решения внутри себя.
@@ -76,7 +150,51 @@ SyncBack — тонкая обёртка над существующими те�
 - Каждый участник = пара ключей (Ed25519): `identity_pub`, `identity_priv`
 - Identity создаётся из seed phrase (BIP39 или аналог)
 - Все сообщения подписаны `identity_priv`
+- `identity_pub` ≠ iroh `NodeId`. Identity — "кто ты". NodeId — "как подключиться". Маппинг публикуется через `peer_announce` (подписан identity).
 - Personal Cluster (experimental): несколько устройств с derived device keys от одного master key. Протокол видит кластер как одну identity.
+
+**Аутентификация (handshake):**
+
+Handshake нужен при прямом соединении через iroh (передача blob'ов: restore, shard upload). Для досок handshake не нужен — записи аутентифицируются подписями.
+
+```
+A                                    B
+|                                    |
+|--- iroh connect(B_NodeId) -------->|   QUIC + TLS, канал зашифрован
+|                                    |   iroh гарантирует NodeId обеих сторон
+|                                    |
+|--- stream ALPN "syncback/1" ----->|   открываем SyncBack протокол
+|                                    |   поверх QUIC соединения
+|                                    |
+|--- HandshakeMsg --------------->|   первое сообщение:
+|    { identity_pub_A,               |   { identity_pub, timestamp,
+|      timestamp,                    |     sig(identity_priv, "handshake"
+|      sig_A }                       |         + identity_pub + timestamp) }
+|                                    |
+|                                    |   B проверяет: sig валидна?
+|                                    |   B ищет: identity_pub_A в peer directory?
+|                                    |
+|<--- HandshakeMsg ------------------|   второе сообщение (аналогичное)
+|    { identity_pub_B,               |
+|      timestamp,                    |
+|      sig_B }                       |
+|                                    |
+|   A проверяет sig_B                |
+|                                    |
+|======= AUTHENTICATED =============|
+|                                    |
+|--- blob requests, commands ------->|   теперь B знает кто просит
+|<--- blob data ---------------------|   и может проверить escrow
+```
+
+Проверки при получении HandshakeMsg:
+1. `sig` валидна для заявленного `identity_pub`
+2. `timestamp` свежий (±5 минут) — защита от replay
+3. `identity_pub` известен (есть в peer directory или allowlist)
+
+Seed nodes принимают handshake от любых identity (роль bootstrap). Обычные ноды — только от известных.
+
+Handshake — ~100 байт в каждую сторону, один раз при подключении. После аутентификации стрим используется для команд и blob transfer.
 
 ### 1.2. Units и erasure coding
 
@@ -94,7 +212,32 @@ Unit size = U (default 256 МБ, конфигурируемо)
 - Для восстановления достаточно любых k из n шардов
 - Параметры k и n — решение владельца файла, не протокола
 - Каждый шард = iroh blob (идентифицируется BLAKE3 hash)
-- Метаданные шарда: `shard_id` (BLAKE3), `unit_id`, `shard_index`, `merkle_root`, `owner_pub`
+- Метаданные шарда описываются подписанной структурой **ShardDescriptor**
+
+**ShardDescriptor (подписан owner'ом):**
+
+```
+ShardDescriptor {
+    shard_id:     BLAKE3 hash содержимого шарда
+    unit_id:      ID unit'а (encryption scope)
+    shard_index:  номер шарда в RS-наборе (0..n-1)
+    k:            минимум шардов для восстановления
+    n:            общее количество шардов
+    merkle_root:  корень BLAKE3 merkle tree (для PoS)
+    owner_pub:    Ed25519 public key владельца
+    importance:   0.0–1.0 (приоритет хранения)
+    file_type:    "user" | "system" (для system state backup, см. §1.9)
+    created_at:   timestamp создания
+    sig_owner:    Ed25519 подпись всех полей выше
+}
+```
+
+Holder ОБЯЗАН проверить при получении шарда:
+1. `sig_owner` валидна для `owner_pub`
+2. `blake3(blob_content) == shard_id`
+3. `owner_pub` в allowlist (партнёр или сосед партнёра)
+
+Без валидного ShardDescriptor шард отклоняется. Это защита от подброса чужих шардов: атакующий не может создать валидный descriptor для чужого `owner_pub`.
 
 **Pack:** несколько мелких файлов объединяются в один unit с индексом (offset + size каждого файла). Один файл изменился → перепаковать unit.
 
@@ -153,8 +296,8 @@ Unit size = U (default 256 МБ, конфигурируемо)
 **Storage warning (уведомление "проверь диск"):**
 
 ```
-Challenger → Holder:
-  {type: "storage_warning", shard_id, details, timestamp, sig_challenger}
+Challenger → Holder (directed, зашифровано):
+  storage_warning { shard_id, details, ts }
 ```
 
 При 1 failed challenge — challenger отправляет holder'у предупреждение: "шард повреждён, возможно bit rot, проверь диск". Holder может:
@@ -181,19 +324,54 @@ Challenger → Holder:
 
 - Запись: только хозяин доски (у него write key)
 - Чтение: любой партнёр (subscribe по read-only ticket)
-- Без адресации: все записи публичны, партнёры видят всё
+- Два типа записей: **broadcast** (видны всем) и **directed** (зашифрованы для конкретного получателя)
+
+**Шифрование directed-записей:**
+
+Если у записи есть конкретный получатель — payload шифруется ECDH:
+
+```
+shared_key = X25519(sender_priv, receiver_pub)
+encrypted_payload = ChaCha20-Poly1305(payload, shared_key, nonce)
+```
+
+Только получатель может расшифровать. Relay-ноды копируют не читая.
+
+**Единый формат записи:**
+
+```
+{type}/{msg_id} → {
+    kind:          "broadcast" | "directed"
+    target_pub:    Ed25519 pub получателя (только для directed)
+    payload:       открытый (broadcast) или зашифрованный (directed)
+    sig_author:    Ed25519 подпись (type + msg_id + kind + target_pub + payload)
+}
+```
 
 **Типы записей:**
 
 ```
-pos_challenge/{msg_id}    → {shard_id, block_range, nonce, ts, sig}
-pos_response/{msg_id}     → {challenge_id, hash, merkle_proof, ts, sig}
-peer_announce/{msg_id}    → {identity_pub, node_addr, ts, sig}
-shard_offer/{msg_id}      → {unit_id, shard_index, size, ts, sig}
-delete/{msg_id}           → {file_id, ts, sig}
-storage_warning/{msg_id}  → {shard_id, details, ts, sig}
-relay/{author}/{msg_id}   → скопированная запись от другой ноды
+BROADCAST (видны всем):
+  peer_announce/{msg_id}    → {identity_pub, node_addr, ts}
+
+DIRECTED (зашифрованы для получателя):
+  pos_challenge/{msg_id}    → target: holder   | {shard_id, block_range, nonce, ts}
+  pos_response/{msg_id}     → target: challenger | {challenge_id, hash, merkle_proof, ts}
+  shard_offer/{msg_id}      → target: holder   | {ShardDescriptor, ts}
+  shard_accept/{msg_id}     → target: owner    | {shard_id, offer_msg_id, ts}
+  shard_reject/{msg_id}     → target: owner    | {shard_id, offer_msg_id, reason, ts}
+  shard_stored/{msg_id}     → target: owner    | {shard_id, ts}
+  delete/{msg_id}           → target: holder   | {shard_id, ts}
+  cancel_delete/{msg_id}    → target: holder   | {shard_id, ts}
+  storage_warning/{msg_id}  → target: holder   | {shard_id, details, ts}
+  shard_dropped/{msg_id}    → target: owner    | {shard_id, ts}
+  shard_drop_notice/{msg_id}   → target: owner    | {shard_id, deadline (absolute unix ts), ts}
+
+RELAY (копия чужой записи, формат сохраняется):
+  relay/{author}/{msg_id}   → копия, kind/target/payload/sig не меняются
 ```
+
+**Почему шифруем:** без шифрования shard_offer виден всем партнёрам (shard_id, importance, кто куда кладёт). Атаки: спам-accepts на чужие offers, нецелевой pull blob'ов, корреляция трафика. С шифрованием наблюдатель видит только `A → B: [encrypted]`.
 
 **Relay (полу-эпидемик):**
 
@@ -206,7 +384,9 @@ hop 2: записи партнёров моих партнёров
 hop 3+: не копирую
 ```
 
-Dedup по msg_id (уже есть → не копировать). Каждая запись подписана оригинальным автором — relay не может подделать.
+Dedup по msg_id (уже есть → не копировать). Каждая запись подписана оригинальным автором — relay не может подделать. Relay-нода не может прочитать directed payload, но может его скопировать.
+
+**Как считаются hops:** нода знает, из чьей доски пришла запись. Если author == доска, то hop 0 (оригинал). Если запись пришла из чужой доски, а author != владелец доски, то это relay (hop +1). Нода копирует записи только от прямых партнёров (hop 0→1) и из relay-секций их досок (hop 1→2). Записи из `relay/` с автором, который находится на hop ≥ 2 от нас, не копируются.
 
 **Ограничения доски:**
 
@@ -218,10 +398,10 @@ Dedup по msg_id (уже есть → не копировать). Каждая 
 **Объём трафика (50 партнёров):**
 
 ```
-hop 0: ~20 записей/week (мои PoS challenges + announces)
+hop 0: ~20 записей/week (мои PoS challenges + announces + offers)
 hop 1: ~1000 записей/week (50 партнёров × 20)
 hop 2: ~1500 записей/week (с пересечениями)
-Итого: ~2000 записей × 200 байт ≈ 400 КБ/week
+Итого: ~2000 записей × 300 байт ≈ 600 КБ/week
 ```
 
 **Почему iroh-docs:** range-based set reconciliation эффективно синхронизирует только новые записи. Store-and-forward бесплатно (данные на диске). Dedup по ключу.
@@ -266,34 +446,146 @@ Seed phrase → derive identity keypair + iroh keypair (детерминиров
 
 Seed node — обычная нода с высоким uptime. Единственная особенность: принимает handshake от незнакомцев и даёт рекомендации.
 
-### 1.7. Shard transfer
+### 1.7. Shard placement и transfer
 
-Реализовано через **iroh-blobs**:
+Передача данных — через **iroh-blobs** (content-addressed, BLAKE3 verified streaming). Размещение шардов использует **ask-then-push**: owner спрашивает через доску, holder скачивает blob после accept.
 
-- Шард = blob, идентифицируется BLAKE3 hash
-- BLAKE3 verified streaming — целостность проверяется при передаче
-- Range requests — можно запросить часть шарда
-- `Observe` API — проверить какие chunks уже есть у партнёра (полезно для repair)
+Все сообщения placement flow — directed (зашифрованы для получателя, см. §1.5). Сторонний наблюдатель не видит shard_id, importance, кто куда кладёт.
 
-Upload: owner шифрует файл → erasure coding → отправляет шарды как blobs партнёрам.
-Download (restore): owner запрашивает k шардов у holder'ов → Reed-Solomon декодирование → расшифровка.
+**Upload flow (ask-then-push):**
+
+```
+1. Owner выбирает n партнёров (weighted by trust)
+   Budget Planner оценивает: хватит ли бюджета? (см. architecture.md)
+   Если < K партнёров примут → skip, retry позже.
+
+2. Owner → Holder (directed, зашифровано для holder'а):
+     shard_offer { ShardDescriptor, ts }
+     ShardDescriptor содержит shard_id (BLAKE3 hash blob'а)
+
+3. Holder расшифровывает, проверяет:
+     a) sig_owner в ShardDescriptor валидна          ← защита от подброса
+     b) owner_pub в allowlist                        ← знаю ли owner'а?
+     c) Оценка eviction_priority:
+        - Есть место? → accept
+        - Нет места, но priority нового > min? → accept (eviction при получении)
+        - Не проходит? → reject
+
+4. Holder → Owner (directed, зашифровано для owner'а):
+     shard_accept { shard_id, offer_msg_id, ts }
+     или
+     shard_reject { shard_id, offer_msg_id, reason, ts }
+
+5. При accept: Holder делает iroh-blobs pull(shard_id) от Owner'а.
+   Оба должны быть онлайн (iroh relay помогает с NAT).
+
+6. Holder проверяет полученный blob:
+     blake3(blob) == shard_id из ShardDescriptor     ← защита от подмены
+     Если не совпадает → удалить blob, отозвать accept.
+
+7. Holder ПОВТОРНО оценивает место (lazy reservation):
+     - Место ещё есть → сохранить
+     - Нет места, но eviction priority позволяет → вытеснить и сохранить
+     - За время ожидания пришли более приоритетные данные → отклонить blob
+
+8. Holder → Owner (directed):
+     shard_stored { shard_id, ts }
+     Owner видит при следующем sync → шард размещён ✓
+```
+
+**Lazy reservation:** accept — мягкое намерение, не жёсткое бронирование. Holder НЕ вытесняет данные при accept. Eviction только в момент получения blob'а (шаг 7). Если owner не пришёл — ничего не потеряно.
+
+**Таймауты:**
+- Offer без ответа за 7 дней (TTL доски) → считается reject
+- Blob download не завершён за 24ч connected time → abort, удалить partial
+- Accept без blob за 7 дней → аннулирован
+
+**Пакетные offers:** owner отправляет shard_offer нескольким партнёрам параллельно. Первые n shard_stored → размещение завершено. Оставшиеся accepts → ignore.
+
+**Restore flow (устройство живо, нужен файл):**
+
+Restore — прямое соединение через iroh, не через доски. Скорость важна.
+
+```
+1. Local DB: file_id → current_unit_id → shard map → [(shard_id, holder_id), ...]
+   Нужно k=5 из n шардов
+
+2. Owner сортирует holders по trust (надёжные первые)
+   Подключается напрямую через iroh (NAT traversal / relay)
+
+3. Для каждого holder'а:
+   Owner → iroh connect → запрос blob по shard_id
+   Holder проверяет:
+     a) ShardDescriptor.owner_pub == запрашивающий identity?
+     b) Escrow: I-score owner'а достаточен для tier?
+     c) Шард в состоянии active?
+   → отдаёт blob
+
+4. Holder офлайн → пропустить, следующий
+   Набрали k → достаточно
+   Набрали < k за сутки → подождать, попробовать позже
+
+5. k шардов → Reed-Solomon decode → расшифровка (ChaCha20) → файл
+```
+
+**Disaster recovery (устройство потеряно, есть только seed phrase):**
+
+```
+Фаза 1 — Identity (минуты):
+  seed phrase → deterministic key derivation:
+    → identity keypair (Ed25519)
+    → iroh keypair (NodeId)
+
+Фаза 2 — Найти партнёров (минуты-часы):
+  → connect к seed nodes (hardcoded)
+  → seed nodes опрашивают сеть: "кто знает identity_pub X?"
+  → owner получает список партнёров
+
+Фаза 3 — System state (минуты):
+  → system state шарды хранятся с max redundancy (5-of-25), max priority, TTL 5 лет
+  → escrow проходит: I-score кумулятивный, не обнуляется при потере устройства
+  → скачать k шардов system state → RS decode → расшифровка
+  → получаем: file manifest, shard map, trust state, peer directory
+  → нода знает ВСЁ
+
+Фаза 4 — Файлы (дни):
+  → обычный restore flow, приоритет по importance (документы → фото → видео)
+  → ~30-50 ГБ/день → 500 ГБ за 10-14 дней
+
+Фаза 5 — Полная функциональность (недели):
+  → P восстановится за 4 недели (rolling window)
+  → начинаем хранить чужие шарды → S-score растёт
+  → нода полностью функциональна
+```
+
+**Escrow при disaster:** holder видит знакомый identity_pub, но P=0. Escrow работает по I-score (кумулятивный). Пользователь с годами в сети → I-score высокий → проходит. Новичок → только demo credit (1 ГБ).
+
+**Repair flow:**
+
+```
+1. PoS обнаружил: unit X имеет < n живых шардов (или shard_dropped от holder'а)
+2. Owner скачивает k шардов от живых holders → восстанавливает unit
+3. Пересоздаёт недостающие шарды → shard_offer новым партнёрам
+```
 
 ### 1.8. Shard lifecycle messages
 
-Протокол определяет два сообщения управления шардами:
+Протокол определяет два сообщения управления шардами. Оба — directed (зашифрованы для конкретного holder'а, см. §1.5).
 
 **Delete request:**
 ```
-Owner → Holder:
-  {type: "delete", file_id, timestamp, sig_owner}
+Owner → Holder (directed):
+  delete { shard_id, ts }
 ```
 
-Owner сообщает holder'у что шард больше не нужен. Holder SHOULD удалить шард, но НЕ сразу — рекомендуется cooldown (см. 2.8). Это защита от ransomware: вирус может удалить файлы локально, но не может заставить holders немедленно удалить шарды.
+Owner сообщает holder'у что конкретный шард больше не нужен. Holder SHOULD удалить шард, но НЕ сразу — рекомендуется cooldown (см. 2.8). Это защита от ransomware: вирус может удалить файлы локально, но не может заставить holders немедленно удалить шарды.
+
+При удалении файла owner отправляет delete для каждого шарда этого файла (все shard_id из unit'ов файла).
 
 **Cancel delete:**
 ```
-Owner → Holder:
-  {type: "cancel_delete", file_id, timestamp, sig_owner}
+Owner → Holder (directed):
+  cancel_delete { shard_id, ts }
 ```
 
 Owner отменяет ранее отправленный delete. Если cooldown ещё не истёк — шард сохраняется. Сценарий: пользователь обнаружил ransomware, восстановил identity из seed phrase, отменил удаление.
@@ -314,21 +606,28 @@ Owner отменяет ранее отправленный delete. Если cool
 
 **Содержимое:**
 
-| Данные | ~Размер | Зачем |
+| Данные | ~Размер (формула) | Зачем |
 |---|---|---|
-| File manifest | ~10 КБ | Какие файлы забекаплены: path, hash, k/n, encryption nonce |
-| Shard map | ~20 КБ | file_id → shard_id → holder_id (где что лежит) |
-| Trust state | ~5 КБ | P/I/S на каждого партнёра |
-| Peer directory | ~5 КБ | identity → last known node_id, subnet, last_seen |
+| File manifest | files × ~100 Б | Какие файлы забекаплены: path, hash, k/n, encryption nonce |
+| Shard map | shards × ~100 Б | shard_id → unit_id → holder_id (где что лежит) |
+| Trust state | peers × ~100 Б | P/I/S на каждого партнёра |
+| Peer directory | peers × ~100 Б | identity → last known node_id, subnet, last_seen |
+
+```
+Примеры:
+  1K файлов, 50 партнёров:   ~100 КБ + 10 КБ ≈ 110 КБ
+  100K файлов, 50 партнёров:  ~10 МБ + 10 КБ ≈ 10 МБ
+  500K файлов, 50 партнёров:  ~50 МБ + 10 КБ ≈ 50 МБ
+```
 
 **Правила:**
 
 - Зашифрован ключом из identity (как любой файл). Holder не может прочитать.
 - Обновляется при каждом существенном изменении (новый файл, новый партнёр, weekly trust update).
-- Максимальная redundancy: n может быть выше стандартного (напр. 5-of-25) — размер пренебрежим (~40 КБ).
+- Максимальная redundancy (напр. 5-of-25).
 - **Максимальный приоритет хранения.** Holder дропает system state shards последними (после всех пользовательских файлов). TTL = 5 лет с момента последнего обновления.
 - Holder хранит текущую + предыдущую версию.
-- При disaster recovery: восстанавливается первым (40 КБ = секунды). После этого нода знает всё: файлы, партнёров, шарды, trust.
+- При disaster recovery: восстанавливается первым. После этого нода знает всё: файлы, партнёров, шарды, trust.
 
 **Как holder отличает system state от обычного файла:**
 
@@ -374,7 +673,7 @@ trust_AB = (kp × P_B + ki × I_B) × clamp(S_AB, 0.1, 1.0)
 
 ### 2.3. Частота proof-of-storage
 
-Рекомендация: 2-3 проверки в неделю с недельной агрегацией. Нода может проверять ежедневно или ежемесячно — это влияет только на скорость обнаружения проблем.
+Рекомендация: 5 случайных шардов на партнёра в неделю (см. §1.3). Нода может проверять реже (2-3) или чаще — это влияет только на скорость обнаружения проблем.
 
 ### 2.4. Выбор партнёров
 
@@ -400,19 +699,64 @@ Holder может отдать шард кому угодно и когда уг
 
 ### 2.8. Holder storage policy
 
-Рекомендация по приоритетам хранения чужих шардов (при нехватке места — дропать сверху вниз):
+**Eviction priority** — единая формула для принятия решений о хранении:
+
+```
+eviction_priority = importance × trust_of_owner × (1 + age_bonus)
+age_bonus = min(weeks_stored / 26, 0.3)   // до +30% за полгода хранения
+```
+
+- `importance` (0.0–1.0) — задаётся owner'ом, прикреплена к шарду (подписана)
+- `trust_of_owner` — holder считает локально
+- `age_bonus` — бонус за длительное хранение (гистерезис, защита от thrashing)
+- **Hysteresis:** combined strategy (Exp 27). Threshold H=0.2 (новый шард должен быть на 20% приоритетнее) + time bonus +30% (старые шарды труднее вытеснить). Снижает evictions на 34%, data loss на 13%.
+
+**Особые случаи (до формулы):**
 
 ```
 1. Marked-for-delete + cooldown истёк     → удалить (owner сам попросил)
-2. Low-trust owner + silent (нет PoS > 8w) → вероятно ушёл навсегда
-3. Low-trust owner + active               → фрилоадер, мало ценен
-4. High-trust owner + silent              → "в тюрьме", хранить пока есть место
-5. High-trust owner + active              → не дропать
+2. Silent + low I-score (< 4 weeks)       → вероятно ушёл навсегда, priority → 0
+3. System state shards (file_type=system)  → max priority, TTL 5 лет
 ```
 
-**Cooldown на delete:** holder получает delete request → ждёт 4 недели перед удалением. Если за это время придёт cancel_delete — шард сохраняется. Защита от ransomware.
+**Cooldown на delete:** holder получает delete request от owner'а → ждёт 4 недели перед удалением. Если за это время придёт cancel_delete — шард сохраняется. Защита от ransomware. **Cooldown применяется только к owner-requested delete, не к holder-initiated eviction.**
 
-**Trusted identities (whitelist):** holder может вручную пометить identities как trusted — их шарды не дропаются и не подлежат escrow. Use case: NAS помогает другу с бекапом.
+**Disk pressure management (holder-initiated eviction):**
+
+Пользователь может в любой момент занять место на диске (скачать файл, установить программу). Daemon мониторит свободное место и управляет шардами:
+
+```
+soft_threshold (< 15% свободно):
+  → прекратить принимать новые shard_offer (shard_reject: "full")
+  → уведомить пользователя: "диск заполняется, шарды под угрозой"
+
+hard_threshold (< 5% свободно):
+  → Фаза 1 (экстренная): немедленно удалить шарды с наименьшим
+    eviction_priority, пока свободное место не вернётся к safe level
+    → отправить shard_dropped каждому owner'у (directed, хороший тон)
+    → без cooldown — это право holder'а на свой диск
+
+  → Фаза 2 (плавная): пометить дополнительные шарды на удаление
+    через 7 дней, чтобы создать буфер свободного места
+    → отправить shard_drop_notice каждому owner'у (directed):
+      "заберите в течение недели, потом удалю"
+    → owner имеет время переразместить шард у другого партнёра
+    → через 7 дней: удалить независимо от того, забрал owner или нет
+    → результат: у holder'а снова есть буфер для следующей подобной ситуации
+```
+
+Пример: диск 600 ГБ, 500 ГБ шарды, 50 ГБ свои файлы, 50 ГБ свободно. Пользователь качает 90 ГБ:
+1. Свободное место падает ниже hard_threshold
+2. Фаза 1: немедленно удалить ~40 ГБ наименее ценных шардов → shard_dropped
+3. Фаза 2: пометить ещё ~50 ГБ → shard_drop_notice (7 дней) → буфер
+4. Owners получают уведомления, запускают repair/re-place
+5. Через неделю: 540 ГБ занято, 60 ГБ свободно, буфер восстановлен
+
+**Shard_dropped и shard_drop_notice — не требование протокола, а рекомендация.** Owner всё равно обнаружит потерю при следующем PoS (1-7 дней). Уведомление — хороший тон, ускоряет repair.
+
+**Гейминг importance:** owner может завысить importance на всех файлах. Но это самонаказание: higher importance → higher n → больше RS overhead → больше хранилища потребляет → S-score падает → trust падает → priority падает.
+
+**Trusted identities (allowlist):** holder может вручную пометить identities как trusted — их шарды не дропаются и не подлежат escrow. Use case: NAS помогает другу с бекапом.
 
 ### 2.9. File versioning
 

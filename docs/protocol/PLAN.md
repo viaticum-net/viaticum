@@ -36,13 +36,13 @@ Key derivation, device registration, синхронизация metadata меж�
 ## Статус
 
 - [x] 1. Транспорт → ADR-001 (iroh)
-- [ ] 2. Identity и аутентификация
-- [ ] 3. Формат сообщений
-- [ ] 4. Каталог сообщений
-- [ ] 5. Peer discovery и bootstrap
-- [ ] 6. Gossip relay
-- [ ] 7. Операции с шардами
-- [ ] 8. Proof-of-Storage flow
+- [x] 2. Identity и аутентификация → overview.md §1.1 (handshake over ALPN "syncback/1")
+- [x] 3. Формат сообщений → overview.md §0.1 (CBOR, u32 framing, ALPN versioning)
+- [x] 4. Каталог сообщений → overview.md §1.5 (типы записей), §1.2 (ShardDescriptor)
+- [x] 5. Peer discovery и bootstrap → overview.md §1.6
+- [x] 6. Gossip relay → overview.md §1.5
+- [x] 7. Операции с шардами → overview.md §1.7 (ask-then-push), §1.8 (lifecycle), §2.8 (eviction)
+- [x] 8. Proof-of-Storage flow → overview.md §1.3
 - [ ] 9. Personal Cluster
 
 ## Build plan → ADR-002

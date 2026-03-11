@@ -78,5 +78,5 @@ QUIC-based P2P stack. iroh-blobs (BLAKE3 verified streaming), iroh-docs (replica
 - Reference implementation пишется на Rust с iroh 0.96+ (или 0.35 для production blobs)
 - Ядро SyncBack (trust, escrow, PoS, placement) изолировано от iroh через transport trait
 - `identity_pub` (Ed25519) — первичный идентификатор; `iroh::NodeId` — транспортный адрес
-- Маппинг `identity_pub ↔ NodeId` хранится локально и не является частью протокола
+- `iroh keypair` (NodeId) деривируется из seed phrase детерминированно (как и identity keypair). Маппинг `identity_pub ↔ NodeId` публикуется через peer_announce
 - При необходимости миграции: пишем новый адаптер, ядро не трогаем

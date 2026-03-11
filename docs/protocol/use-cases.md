@@ -21,7 +21,7 @@
 **Решение:** специальный механизм не нужен.
 
 1. NAS присоединяется к сети, хранит для всех, получает trust
-2. NAS добавляет friend's identity в whitelist (`trusted_identities` в конфиге)
+2. NAS добавляет friend's identity в allowlist (`trusted_identities` в конфиге)
 3. Друг добавляет NAS как партнёра
 4. Weighted placement: NAS надёжен → друг кладёт максимум шардов на NAS (до cap=6)
 
@@ -46,7 +46,7 @@
 
 **Демон (owner side):**
 - Файл удалён локально → демон помечает "pending delete" в локальной БД
-- Cooldown 4-8 недель: PoS challenges продолжают отправляться
+- Cooldown 4 недели: PoS challenges продолжают отправляться
 - Через cooldown → отправляет signed delete message holders
 - Пользователь заметил вирус → отменяет pending delete → отправляет cancel_delete → шарды спасены
 
