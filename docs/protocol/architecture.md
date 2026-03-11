@@ -8,9 +8,12 @@
 ┌─────────────────────────────────────────────────────┐
 │                    syncback daemon                   │
 ├──────────┬──────────┬──────────┬────────────────────┤
-│  Watcher │ Network  │ Storage  │    Scheduler       │
-│  (owner) │ (peer)   │ (holder) │    (cron)          │
-├──────────┴──────────┴──────────┴────────────────────┤
+│  Watcher │ Packer   │ Network  │    Scheduler       │
+│  (files) │ (units)  │ (peers)  │    (cron)          │
+├──────────┴──────────┼──────────┤                    │
+│  Shard Manager      │ Storage  │                    │
+│  (encrypt+erasure)  │ (holder) │                    │
+├─────────────────────┴──────────┴────────────────────┤
 │                   Local DB (redb)                    │
 ├─────────────────────────────────────────────────────┤
 │              Transport (iroh adapter)                │
@@ -19,14 +22,77 @@
 
 ## Watcher (роль: owner)
 
-Отвечает за мои файлы.
+Отвечает за мои файлы. Только локальные операции, никакой сетевой активности.
 
 - Мониторит настроенные папки (notify: inotify/FSEvents)
 - Детектит изменения: new/modified/deleted
-- Pipeline: file → encrypt (ChaCha20) → erasure code (Reed-Solomon) → upload shards (iroh-blobs)
-- Шарды НЕ хранятся локально — стримятся партнёрам, удаляются после подтверждения
-- При изменении файла: новый file_id, новые шарды. Старые — delete с cooldown.
-- File catalog: path → hash → file_id → shard map
+- Записывает в DB: `{path, new_hash, timestamp, dirty=true}`
+- **Не запускает backup сразу.** Только помечает файлы как dirty.
+
+## Packer (роль: owner)
+
+Превращает файлы в units. Вызывается Scheduler'ом (weekly sync), не Watcher'ом.
+
+```
+Unit size = U (default 256 МБ)
+
+Файл < U  → pack с другими мелкими в unit ~U
+Файл ≥ U  → split на chunks по U, каждый chunk = unit
+```
+
+### Batch model (не реагируем на каждый чих)
+
+```
+РЕАЛЬНОЕ ВРЕМЯ (Watcher)
+  файл изменился → dirty=true в DB
+  Всё. Никаких сетевых операций.
+
+WEEKLY SYNC (Scheduler → Packer → Shard Manager)
+  → собрать все dirty файлы
+  → мелкие: создать delta packs (только изменённые файлы)
+  → крупные: пересоздать только изменённые chunks
+  → encrypt → erasure → upload
+  → dirty=false, обновить current_unit_id
+  → старые units с изменёнными файлами → status=stale
+
+VACUUM (раз в месяц, Scheduler → Packer)
+  → найти stale packs где >50% файлов устарело
+  → пересобрать: живые файлы → новые чистые packs
+  → старые stale packs → delete с cooldown
+```
+
+### Пример lifecycle
+
+```
+Неделя 1: initial backup
+  Pack A: [file1, file2, file3, file4, file5]  → в сети
+
+Неделя 2: file2 и file4 изменились
+  Pack A: всё ещё в сети (stale — 2 из 5 устарели)
+  Pack B: [file2_v2, file4_v2]  → delta pack, в сети
+  file2.current_unit = Pack B
+  file4.current_unit = Pack B
+
+Неделя 3: file1 изменился
+  Pack A: stale (3 из 5 устарели)
+  Pack B: живёт
+  Pack C: [file1_v2]  → delta pack
+
+Месяц 1: vacuum
+  Pack A: 3/5 устарели → удалить
+  Pack B, C: тоже stale после repacking
+  Pack D: [file1_v2, file2_v2, file3, file4_v2, file5]  → чистый pack
+```
+
+### Restore
+
+Каждый файл знает свой `current_unit_id`. Скачиваем только актуальные units:
+
+```
+file_id → current_unit_id → скачать unit → извлечь файл
+```
+
+Stale packs не нужны для restore (только для cooldown ransomware protection).
 
 ## Network (роль: peer)
 
@@ -38,6 +104,16 @@
 - PoS challenger: генерировать challenges для holder'ов своих шардов
 - Peer management: bootstrap, peer exchange, allowlist (partners + 2 hops)
 
+## Shard Manager (роль: owner)
+
+Превращает units в шарды и управляет их lifecycle.
+
+- Encrypt unit (ChaCha20-Poly1305, ключ из identity)
+- Erasure code (Reed-Solomon, k-of-n)
+- Placement: выбрать n партнёров (weighted by trust)
+- Upload: шарды стримятся партнёрам через iroh-blobs, не хранятся локально
+- Repair: обнаружить потерянные шарды → пересоздать → разместить на новых партнёрах
+
 ## Storage (роль: holder)
 
 Отвечает за чужие шарды на моём диске.
@@ -48,54 +124,55 @@
 - Shard lifecycle: active → marked-for-delete (cooldown 4wk) → deleted
 - При нехватке места: дропать по приоритетам (2.8 в overview.md)
 - Silent shards: owner замолчал — хранить если high I-score, дропать если low
+- Storage warning: получил уведомление о bit rot → selfcheck, уведомить пользователя
 
 ## Scheduler (периодические задачи)
 
-- Каждые ~2 дня: PoS challenges для своих шардов
-- Еженедельно: trust update (агрегация P), repair check, mailbox cleanup (TTL 7d)
-- Event-driven: при подключении партнёра — sync mailbox, pending transfers
+```
+Еженедельно:
+  → Weekly sync: Packer собирает dirty файлы → Shard Manager → upload
+  → PoS sampling: для каждого партнёра → 5 случайных шардов → challenge
+  → Trust update: агрегация P за неделю
+  → Repair check: есть ли units с < n живых шардов?
+  → Mailbox cleanup: удалить записи старше TTL (7 дней)
+  → System state backup: обновить если были изменения
+
+Ежемесячно:
+  → Vacuum: пересобрать stale packs, delete старые с cooldown
+
+Event-driven:
+  → Подключение партнёра → sync mailbox, pending transfers
+```
 
 ## Local DB (redb)
 
 ```
-files:    file_id   → {path, hash, size, version, status, created_at}
-shards:   shard_id  → {file_id, shard_index, holder_id, status, last_verified}
+files:    file_id   → {path, hash, size, dirty, current_unit_id, last_backed_up}
+units:    unit_id   → {type(pack|chunk), status(active|stale|deleted),
+                       member_files[], parent_file_id, chunk_index,
+                       size, hash, created_at}
+shards:   shard_id  → {unit_id, shard_index, holder_id, status, last_verified}
 peers:    identity  → {node_id, trust_P, trust_I, trust_S, first_seen, last_seen, subnet}
 holding:  shard_id  → {owner_pub, size, state, received_at, delete_requested_at}
 config:   key       → value
-```
-
-## Поток данных: backup
-
-```
-Файл на диске
-  → notify: file changed
-  → hash → сравнить с file catalog → изменился?
-  → encrypt (ChaCha20, ключ из identity, nonce из file_hash)
-  → erasure code (k-of-n, Reed-Solomon)
-  → placement: выбрать n партнёров (weighted by trust)
-  → каждый шард → iroh-blobs local store (временно)
-  → iroh передаёт партнёру → подтверждение
-  → удалить шард из local store
-  → записать shard map в DB
 ```
 
 ## Поток данных: repair
 
 ```
 Scheduler: repair check
-  → для каждого file_id: сколько живых шардов?
-  → если < n (но ≥ k): repair возможен
-    → файл не изменился? → пересоздать потерянные шарды из оригинала
-    → файл изменился? → скачать k шардов от живых holders
-      → восстановить файл → пересоздать потерянные шарды
+  → для каждого unit_id: сколько живых шардов?
+  → если < n (но ≥ k): repair
+    → unit = chunk? → пересоздать из локального файла (если не изменился)
+    → unit = pack? → пересоздать из локальных файлов (если все на месте)
+    → иначе: скачать k шардов от живых holders → восстановить unit → пересоздать
     → разместить на новых партнёрах
   → если < k: данные потеряны (не должно случиться при 5-of-15)
 ```
 
 ## System state backup
 
-Зашифрованный снимок состояния ноды (~8-24 МБ в зависимости от объёма данных), сам бекапится в сеть с максимальной redundancy. Обновляется при каждом существенном изменении.
+Зашифрованный снимок состояния ноды (~8-24 МБ), сам бекапится в сеть с максимальной redundancy. Обновляется еженедельно (или при существенных изменениях).
 
 Содержимое: file manifest, shard map, trust state, peer directory.
 
@@ -117,10 +194,10 @@ Scheduler: repair check
   → нода знает ВСЁ: файлы, где шарды, кто партнёры, trust
 
 День 1-14: Восстановление файлов
-  → по shard map: запросить k шардов каждого unit'а у holder'ов
+  → для каждого файла: current_unit_id → скачать k шардов unit'а
   → escrow check: I-score высокий (кумулятивный, не обнуляется) → ок
-  → Reed-Solomon decode → расшифровка → файлы на диске
-  → приоритет: мелкие файлы (документы) → крупные (фото) → огромные (видео)
+  → Reed-Solomon decode → расшифровка → извлечь файл из unit'а
+  → приоритет: документы → фото → видео
 
 Неделя 4+: Полная функциональность
   → trust к партнёрам стабилизируется (P накопится за 4 недели)
@@ -128,27 +205,13 @@ Scheduler: repair check
   → нода полностью функциональна
 ```
 
-## Units и размер шардов
-
-Два правила, один концепт (unit):
-
-```
-Unit size = U (default 256 МБ)
-
-Файл < U  → pack с другими мелкими в unit ~U
-Файл ≥ U  → split на chunks по U, каждый chunk = unit
-```
-
-Каждый unit → encrypt → erasure code → n шардов по ~U/k.
-
-- При изменении файла в pack → перепаковать unit
-- При изменении chunk'а большого файла → пересоздать только этот unit
-- RS encoding: max 256 МБ в памяти (вместо размера всего файла)
-
 ## Конфигурация пользователя
 
 - Какие папки бекапить (include/exclude patterns)
 - Сколько места отдать под чужие шарды (GB или % свободного)
 - Seed nodes (default: hardcoded list)
 - k и n (default: 5-of-15)
+- Unit size U (default: 256 МБ)
+- Sync frequency (default: weekly)
+- Vacuum frequency (default: monthly)
 - Bandwidth limit (default: без ограничений)
