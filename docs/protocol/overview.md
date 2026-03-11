@@ -153,7 +153,37 @@ SyncBack — тонкая обёртка над существующими те�
 Upload: owner шифрует файл → erasure coding → отправляет шарды как blobs партнёрам.
 Download (restore): owner запрашивает k шардов у holder'ов → Reed-Solomon декодирование → расшифровка.
 
-### 1.7. Escrow (правила restore)
+### 1.7. Shard lifecycle messages
+
+Протокол определяет два сообщения управления шардами:
+
+**Delete request:**
+```
+Owner → Holder:
+  {type: "delete", file_id, timestamp, sig_owner}
+```
+
+Owner сообщает holder'у что шард больше не нужен. Holder SHOULD удалить шард, но НЕ сразу — рекомендуется cooldown (см. 2.8). Это защита от ransomware: вирус может удалить файлы локально, но не может заставить holders немедленно удалить шарды.
+
+**Cancel delete:**
+```
+Owner → Holder:
+  {type: "cancel_delete", file_id, timestamp, sig_owner}
+```
+
+Owner отменяет ранее отправленный delete. Если cooldown ещё не истёк — шард сохраняется. Сценарий: пользователь обнаружил ransomware, восстановил identity из seed phrase, отменил удаление.
+
+**Три состояния шарда на holder'е:**
+
+| Состояние | PoS приходит? | Delete msg? | Поведение holder'а |
+|-----------|:---:|:---:|---|
+| Active | Да | Нет | Хранить, высокий приоритет |
+| Marked for delete | Да (cooldown) | Да | Хранить до истечения cooldown, потом удалить |
+| Silent | Нет | Нет | Хранить; приоритет определяется owner's trust (см. 2.8) |
+
+**Silent ≠ delete.** Молчание owner'а означает "что-то случилось" (потеря устройства, болезнь, тюрьма), а не "удали мои данные". Owner с высоким I-score (годы в сети) → holder хранит шарды пока может. Owner с низким I-score → holder дропает при нехватке места.
+
+### 1.8. Escrow (правила restore)
 
 Протокол определяет механизм, параметры — решение реализации:
 
@@ -216,6 +246,26 @@ Holder может отдать шард кому угодно и когда уг
 ### 2.7. Adaptive n
 
 Рекомендация: увеличивать n при низком среднем trust партнёров. Нода может использовать фиксированный n.
+
+### 2.8. Holder storage policy
+
+Рекомендация по приоритетам хранения чужих шардов (при нехватке места — дропать сверху вниз):
+
+```
+1. Marked-for-delete + cooldown истёк     → удалить (owner сам попросил)
+2. Low-trust owner + silent (нет PoS > 8w) → вероятно ушёл навсегда
+3. Low-trust owner + active               → фрилоадер, мало ценен
+4. High-trust owner + silent              → "в тюрьме", хранить пока есть место
+5. High-trust owner + active              → не дропать
+```
+
+**Cooldown на delete:** holder получает delete request → ждёт 4 недели перед удалением. Если за это время придёт cancel_delete — шард сохраняется. Защита от ransomware.
+
+**Trusted identities (whitelist):** holder может вручную пометить identities как trusted — их шарды не дропаются и не подлежат escrow. Use case: NAS помогает другу с бекапом.
+
+### 2.9. File versioning
+
+Рекомендация: при изменении файла локально — создать новый file_id, новые шарды. Старые шарды НЕ удалять немедленно (cooldown). При disaster recovery — восстанавливаются все доступные версии.
 
 ---
 
