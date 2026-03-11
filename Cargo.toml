@@ -42,6 +42,7 @@ iroh-gossip = "0.96"
 
 # Error handling
 thiserror = "2"
+anyhow = "1"
 
 # Logging
 tracing = "0.1"
