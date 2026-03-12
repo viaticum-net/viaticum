@@ -590,6 +590,7 @@ async fn weekly_sync_dirty_event_creates_file_record_and_updates_schedule() {
         config,
         identity_key,
         pub_key,
+        "test-node-id".to_string(),
     ));
 
     tokio::time::sleep(Duration::from_millis(10)).await;

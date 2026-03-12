@@ -507,6 +507,27 @@ impl Packer {
     }
 
     // -------------------------------------------------------------------------
+    // Helpers used by integration tests
+    // -------------------------------------------------------------------------
+
+    /// Encrypt `plaintext` and split into `n` shard blobs.
+    ///
+    /// Used by integration tests to pre-populate holder storage without going
+    /// through the full ShardManager upload path.
+    pub fn plaintext_to_shards(
+        &self,
+        unit_id: UnitId,
+        plaintext: &[u8],
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<Vec<u8>>, PackerError> {
+        let ikm: [u8; 32] = self.identity_key.to_bytes();
+        let enc_key = crypto::derive_unit_key(&ikm, unit_id);
+        let ciphertext = crypto::encrypt_plaintext(&enc_key, plaintext)?;
+        let shards = crypto::rs_encode(&ciphertext, k, n)?;
+        Ok(shards)
+    }
+
     // Reverse path: shards → files (restore)
     // -------------------------------------------------------------------------
 

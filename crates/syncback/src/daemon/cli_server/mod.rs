@@ -33,6 +33,10 @@ pub enum CliRequest {
     Peers,
     /// Gracefully stop the daemon.
     Shutdown,
+    /// Connect to a peer by node address string (JSON-encoded EndpointAddr).
+    ConnectPeer {
+        node_addr: String,
+    },
 }
 
 /// Response sent by the daemon back to the CLI client.
@@ -60,6 +64,9 @@ pub struct StatusPayload {
     pub shards_placed: usize,
     pub budget_gb: f64,
     pub dirty_files: usize,
+    /// JSON-encoded EndpointAddr of this daemon's iroh endpoint.
+    /// Pass this to `CliRequest::ConnectPeer` on another daemon to connect.
+    pub own_node_id: String,
 }
 
 impl From<StatusReply> for StatusPayload {
@@ -71,6 +78,7 @@ impl From<StatusReply> for StatusPayload {
             shards_placed: r.shards_placed,
             budget_gb: r.budget_gb,
             dirty_files: r.dirty_files,
+            own_node_id: r.own_node_id,
         }
     }
 }
@@ -256,6 +264,28 @@ async fn dispatch(
                 .await;
             CliResponse::Ok {
                 message: "shutdown requested".into(),
+            }
+        }
+
+        CliRequest::ConnectPeer { node_addr } => {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let cmd = ProcessorMsg::Cli(CliCmd::ConnectPeer {
+                node_addr: node_addr.clone(),
+                reply: reply_tx,
+            });
+            if processor_tx.send(cmd).await.is_err() {
+                return CliResponse::Error {
+                    message: "daemon not responding".into(),
+                };
+            }
+            match reply_rx.await {
+                Ok(Ok(())) => CliResponse::Ok {
+                    message: format!("connecting to {node_addr}"),
+                },
+                Ok(Err(e)) => CliResponse::Error { message: e },
+                Err(_) => CliResponse::Error {
+                    message: "processor dropped reply".into(),
+                },
             }
         }
     }

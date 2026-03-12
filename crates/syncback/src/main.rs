@@ -1,9 +1,8 @@
-mod cli;
-mod daemon;
+use syncback::cli;
+use syncback::daemon::{Config, DaemonHandle};
 
 use clap::Parser;
 use cli::{Cli, Commands};
-use daemon::{Config, DaemonHandle};
 
 fn main() -> anyhow::Result<()> {
     let cli_args = Cli::parse();

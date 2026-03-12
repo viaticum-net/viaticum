@@ -1,4 +1,4 @@
-pub(crate) mod cli_server;
+pub mod cli_server;
 pub(crate) mod crypto;
 pub(crate) mod merkle;
 mod network;
@@ -146,6 +146,11 @@ pub enum CliCmd {
         reply: tokio::sync::oneshot::Sender<Vec<crate::daemon::cli_server::PeerInfo>>,
     },
     Shutdown,
+    /// Connect to a peer by node address string (JSON-encoded EndpointAddr).
+    ConnectPeer {
+        node_addr: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +270,8 @@ pub struct StatusReply {
     pub shards_placed: usize,
     pub budget_gb: f64,
     pub dirty_files: usize,
+    /// JSON-encoded EndpointAddr — use serde_json::from_str to reconstruct.
+    pub own_node_id: String,
 }
 
 // ============================================================
@@ -330,19 +337,30 @@ impl DaemonHandle {
             std::fs::remove_file(&cli_socket_path)?;
         }
 
-        // Generate ephemeral keys for this daemon instance.
-        // In production these would be derived from the seed phrase.
-        let iroh_secret_key = {
+        // Load identity from identity.key if it exists (deterministic from seed phrase),
+        // otherwise generate ephemeral keys (useful when no init has been run).
+        let identity_key_path = syncback_dir.join("identity.key");
+        let (iroh_secret_key, identity_signing_key) = if identity_key_path.exists() {
+            let key_file = crate::cli::init::load_identity(&syncback_dir)
+                .expect("failed to load identity.key");
+            let iroh_key = iroh::SecretKey::from_bytes(&key_file.iroh_priv);
+            let identity_key = ed25519_dalek::SigningKey::from_bytes(&key_file.identity_priv);
+            tracing::info!(
+                identity = hex::encode(&key_file.identity_pub[..8]),
+                "daemon: loaded identity from identity.key"
+            );
+            (iroh_key, identity_key)
+        } else {
             use rand::RngCore;
-            let mut bytes = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut bytes);
-            iroh::SecretKey::from_bytes(&bytes)
-        };
-        let identity_signing_key = {
-            use rand::RngCore;
-            let mut bytes = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut bytes);
-            ed25519_dalek::SigningKey::from_bytes(&bytes)
+            let mut iroh_bytes = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut iroh_bytes);
+            let mut identity_bytes = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut identity_bytes);
+            tracing::info!("daemon: using ephemeral keys (no identity.key found)");
+            (
+                iroh::SecretKey::from_bytes(&iroh_bytes),
+                ed25519_dalek::SigningKey::from_bytes(&identity_bytes),
+            )
         };
         let identity_pub_bytes: [u8; 32] = identity_signing_key.verifying_key().to_bytes();
         let identity_pub = syncback_core::types::IdentityPub(identity_pub_bytes);
@@ -364,6 +382,9 @@ impl DaemonHandle {
         let net_cmd_tx = net_handle.cmd_tx.clone();
 
         let watcher_db = db.clone();
+        let own_node_id = serde_json::to_string(&net_handle.endpoint_addr)
+            .expect("EndpointAddr serializes cleanly");
+
         let processor_handle = tokio::spawn(processor::run(
             db,
             cancel.clone(),
@@ -374,6 +395,7 @@ impl DaemonHandle {
             config.clone(),
             identity_signing_key,
             identity_pub,
+            own_node_id,
         ));
 
         let network_handle = tokio::spawn({

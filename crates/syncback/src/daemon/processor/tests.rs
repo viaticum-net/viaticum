@@ -89,6 +89,7 @@ fn spawn_processor(
         config,
         identity_key,
         identity_pub,
+        "test-node-id".to_string(),
     ));
 
     (cancel, processor_tx, dirty_tx, net_event_tx, net_cmd_rx, handle)

@@ -46,6 +46,29 @@ struct PendingPosChallenge {
 // Processor struct
 // ============================================================
 
+/// State for a restore operation in progress.
+/// Accumulates k shard blobs and completes when all k shards arrive.
+struct PendingRestore {
+    /// Destination file path.
+    dest: std::path::PathBuf,
+    /// Original file path (used to find the file in the pack unit's index).
+    original_path: String,
+    /// Unit ID being restored.
+    unit_id: syncback_core::types::UnitId,
+    /// Unit type (Pack or Chunk).
+    unit_type: syncback_core::types::UnitType,
+    /// RS parameters.
+    k: usize,
+    n: usize,
+    /// Accumulated shard blobs indexed by shard_index.
+    /// None = not yet received.
+    shard_blobs: Vec<Option<Vec<u8>>>,
+    /// Number of blobs received so far.
+    received: usize,
+    /// CLI reply channel. Consumed on completion.
+    reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+}
+
 struct Processor {
     db: Db,
     config: Config,
@@ -71,8 +94,17 @@ struct Processor {
     storage: Storage,
     repair_engine: RepairEngine,
 
+    /// JSON-encoded EndpointAddr of our iroh endpoint (for Status responses).
+    own_node_id: String,
+
     started_at: std::time::Instant,
     pending_pos_challenges: HashMap<[u8; 32], PendingPosChallenge>,
+    /// Active restore operations, keyed by restore ID (u64 counter).
+    pending_restores: HashMap<u64, PendingRestore>,
+    /// Maps each awaited ShardId to (restore_id, shard_index).
+    pending_shard_to_restore: HashMap<syncback_core::types::ShardId, (u64, usize)>,
+    /// Counter for restore IDs.
+    next_restore_id: u64,
 }
 
 // ============================================================
@@ -91,6 +123,7 @@ pub async fn run(
     config: Config,
     identity_key: ed25519_dalek::SigningKey,
     identity_pub: IdentityPub,
+    own_node_id: String,
 ) {
     let trust = TrustEngine::new(db.clone());
     let escrow = EscrowChecker::new(db.clone());
@@ -139,8 +172,12 @@ pub async fn run(
         shard_manager,
         storage,
         repair_engine,
+        own_node_id,
         started_at: std::time::Instant::now(),
         pending_pos_challenges: HashMap::new(),
+        pending_restores: HashMap::new(),
+        pending_shard_to_restore: HashMap::new(),
+        next_restore_id: 0,
     };
 
     tracing::info!("processor: started");
@@ -500,6 +537,9 @@ impl Processor {
                 tracing::info!("processor: shutdown requested via CLI");
                 self.cancel.cancel();
             }
+            CliCmd::ConnectPeer { node_addr, reply } => {
+                self.handle_cli_connect_peer(node_addr, reply).await;
+            }
         }
     }
 
@@ -535,6 +575,7 @@ impl Processor {
             shards_placed,
             budget_gb,
             dirty_files,
+            own_node_id: self.own_node_id.clone(),
         };
 
         let _ = reply.send(reply_value);
@@ -549,16 +590,301 @@ impl Processor {
         let _ = reply.send(Ok(()));
     }
 
-    async fn handle_cli_restore(
+    async fn handle_cli_connect_peer(
         &self,
+        node_addr: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        tracing::info!(addr = %node_addr, "cli: connect peer requested");
+        let result = self
+            .net_cmd_tx
+            .send(NetCommand::ConnectAddr { node_addr })
+            .await;
+        match result {
+            Ok(()) => {
+                let _ = reply.send(Ok(()));
+            }
+            Err(_) => {
+                let _ = reply.send(Err("network channel closed".to_string()));
+            }
+        }
+    }
+
+    /// Start a restore operation.
+    ///
+    /// This method does NOT block the event loop. It:
+    /// 1. Validates the file/unit in DB.
+    /// 2. Registers a PendingRestore state machine.
+    /// 3. Sends RestoreRequest NetCommands to holders.
+    /// 4. Returns immediately — ShardData responses arrive later via handle_direct_message.
+    async fn handle_cli_restore(
+        &mut self,
         path: PathBuf,
         dest: PathBuf,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     ) {
-        tracing::info!(?path, ?dest, "restore: requested (stub — Phase 3)");
-        let _ = reply.send(Err(
-            "restore not yet implemented (Phase 3)".to_string(),
-        ));
+        use syncback_core::types::ShardStatus;
+
+        tracing::info!(?path, ?dest, "restore: requested");
+        let path_str = path.to_string_lossy().to_string();
+
+        // 1. Look up file record.
+        let file_record = match self.db.get_file(&path_str) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                let _ = reply.send(Err(format!("file not found in DB: {path_str}")));
+                return;
+            }
+            Err(e) => {
+                let _ = reply.send(Err(format!("db error looking up file: {e}")));
+                return;
+            }
+        };
+
+        let unit_id = match file_record.current_unit_id {
+            Some(id) => id,
+            None => {
+                let _ = reply.send(Err(format!(
+                    "file has no current unit (not backed up): {path_str}"
+                )));
+                return;
+            }
+        };
+
+        // 2. Look up unit record.
+        let unit_record = match self.db.get_unit(&unit_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                let _ = reply.send(Err(format!("unit not found in DB: {unit_id}")));
+                return;
+            }
+            Err(e) => {
+                let _ = reply.send(Err(format!("db error looking up unit: {e}")));
+                return;
+            }
+        };
+
+        let k = unit_record.rs_k as usize;
+        let n = unit_record.rs_n as usize;
+
+        // 3. Get shard records — select k shards with status Stored.
+        let all_shards = match self.db.list_shards_for_unit(&unit_id) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = reply.send(Err(format!("db error listing shards: {e}")));
+                return;
+            }
+        };
+
+        let stored: Vec<_> = all_shards
+            .iter()
+            .filter(|s| s.status == ShardStatus::Stored)
+            .collect();
+
+        if stored.len() < k {
+            let _ = reply.send(Err(format!(
+                "not enough stored shards: need {k}, have {} (status=Stored) out of {}",
+                stored.len(),
+                all_shards.len()
+            )));
+            return;
+        }
+
+        let selected = &stored[..k];
+
+        // 4. Register the PendingRestore state machine.
+        let restore_id = self.next_restore_id;
+        self.next_restore_id += 1;
+
+        // Register each shard we'll be waiting for.
+        // pending_shard_to_restore maps ShardId → (restore_id, shard_index).
+        for shard_rec in selected {
+            self.pending_shard_to_restore.insert(
+                shard_rec.shard_id,
+                (restore_id, shard_rec.shard_index as usize),
+            );
+        }
+
+        self.pending_restores.insert(
+            restore_id,
+            PendingRestore {
+                dest: dest.clone(),
+                original_path: path_str.clone(),
+                unit_id,
+                unit_type: unit_record.unit_type,
+                k,
+                n,
+                shard_blobs: vec![None; n],
+                received: 0,
+                reply: Some(reply),
+            },
+        );
+
+        // 5. Send RestoreRequest to each holder.
+        for shard_rec in selected {
+            let shard_id = shard_rec.shard_id;
+            let holder = shard_rec.holder_id;
+
+            let peer_record = match self.db.get_peer(&holder) {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    tracing::debug!(holder = %holder, "restore: holder not in DB, skipping shard");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!(holder = %holder, error = %e, "restore: db error");
+                    continue;
+                }
+            };
+
+            let holder_addr = match peer_record.node_id {
+                Some(node_id) => match iroh::PublicKey::from_bytes(&node_id.0) {
+                    Ok(pk) => iroh::EndpointAddr::new(pk),
+                    Err(e) => {
+                        tracing::debug!(holder = %holder, error = %e, "restore: invalid node_id");
+                        continue;
+                    }
+                },
+                None => {
+                    tracing::debug!(holder = %holder, "restore: holder has no known node_id");
+                    continue;
+                }
+            };
+
+            let restore_msg = syncback_core::messages::DirectMessage {
+                v: syncback_core::constants::PROTOCOL_VERSION,
+                body: syncback_core::messages::DirectBody::RestoreRequest(
+                    syncback_core::messages::RestoreRequestMsg {
+                        v: 1,
+                        shard_id,
+                        ts: syncback_core::types::Timestamp::now().0,
+                    },
+                ),
+            };
+
+            if self.net_cmd_tx
+                .send(NetCommand::Connect {
+                    peer_addr: holder_addr,
+                    peer_identity: holder,
+                    message: restore_msg,
+                })
+                .await
+                .is_err()
+            {
+                tracing::debug!("restore: net channel closed");
+                break;
+            }
+        }
+    }
+
+    /// Advance a pending restore when a ShardData message arrives.
+    ///
+    /// If all k shards are now available, performs RS decode + decrypt + file write.
+    /// The reply sender is consumed on completion.
+    async fn on_shard_data_received(
+        &mut self,
+        shard_id: syncback_core::types::ShardId,
+        data: Vec<u8>,
+    ) {
+        use syncback_core::types::UnitType;
+
+        let (restore_id, shard_index) = match self.pending_shard_to_restore.remove(&shard_id) {
+            Some(pair) => pair,
+            None => {
+                tracing::debug!(shard = %shard_id, "shard_data: no pending restore, ignoring");
+                return;
+            }
+        };
+
+        let pending = match self.pending_restores.get_mut(&restore_id) {
+            Some(p) => p,
+            None => return,
+        };
+
+        if shard_index < pending.n && pending.shard_blobs[shard_index].is_none() {
+            pending.shard_blobs[shard_index] = Some(data);
+            pending.received += 1;
+        }
+
+        tracing::debug!(
+            shard = %shard_id,
+            received = pending.received,
+            k = pending.k,
+            "restore: shard received"
+        );
+
+        if pending.received < pending.k {
+            // Still waiting for more shards.
+            return;
+        }
+
+        // All k shards received — perform RS decode + decrypt + write.
+        let pending = self.pending_restores.remove(&restore_id).expect("just checked");
+
+        let identity_key = ed25519_dalek::SigningKey::from_bytes(&self.identity_key_bytes);
+        let packer = crate::daemon::packer::Packer::new(
+            self.db.clone(),
+            identity_key,
+            self.identity_pub,
+            crate::daemon::packer::DEFAULT_UNIT_SIZE_BYTES,
+        );
+
+        let result = match packer.unpack_unit(
+            pending.unit_id,
+            pending.unit_type,
+            pending.shard_blobs,
+            pending.k,
+            pending.n,
+        ) {
+            Ok(unpack) => {
+                let path_str = &pending.original_path;
+                let dest = &pending.dest;
+                match pending.unit_type {
+                    UnitType::Pack => {
+                        match unpack.files.into_iter().find(|f| f.path.as_deref() == Some(path_str)) {
+                            Some(unpacked) => {
+                                if let Some(parent) = dest.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                std::fs::write(dest, &unpacked.bytes)
+                                    .map_err(|e| format!("write file failed: {e}"))
+                            }
+                            None => Err(format!("file not found in pack unit: {path_str}")),
+                        }
+                    }
+                    UnitType::Chunk => {
+                        match unpack.files.into_iter().next() {
+                            Some(unpacked) => {
+                                if let Some(parent) = dest.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                std::fs::write(dest, &unpacked.bytes)
+                                    .map_err(|e| format!("write file failed: {e}"))
+                            }
+                            None => Err("empty chunk unpack result".to_string()),
+                        }
+                    }
+                }
+            }
+            Err(e) => Err(format!("unpack failed: {e}")),
+        };
+
+        if let Some(reply) = pending.reply {
+            let _ = reply.send(result.clone());
+        }
+
+        match result {
+            Ok(()) => tracing::info!(
+                path = %pending.original_path,
+                dest = ?pending.dest,
+                "restore: complete"
+            ),
+            Err(ref e) => tracing::info!(
+                path = %pending.original_path,
+                error = %e,
+                "restore: failed"
+            ),
+        }
     }
 
     async fn handle_cli_peers(
@@ -709,9 +1035,9 @@ impl Processor {
         match event {
             NetEvent::PeerConnected {
                 peer_identity,
-                peer_node_id: _,
+                peer_node_id,
             } => {
-                self.handle_peer_connected(peer_identity).await;
+                self.handle_peer_connected(peer_identity, peer_node_id).await;
             }
             NetEvent::MessageReceived { from, message } => {
                 self.handle_direct_message(from, message).await;
@@ -747,18 +1073,33 @@ impl Processor {
         }
     }
 
-    async fn handle_peer_connected(&self, peer: IdentityPub) {
+    async fn handle_peer_connected(
+        &self,
+        peer: IdentityPub,
+        node_id: syncback_core::types::NodeId,
+    ) {
         tracing::info!(peer = %peer, "peer connected");
         let now = Timestamp::now();
         match self.db.get_peer(&peer).expect("get_peer failed") {
             Some(mut record) => {
                 record.last_seen = now;
+                record.node_id = Some(node_id);
                 self.db.upsert_peer(&record).expect("upsert_peer failed");
             }
             None => {
+                // New peer: create record with node_id set.
                 self.trust
                     .upsert_peer(&peer, now)
                     .expect("upsert_peer failed");
+                // Update node_id on the freshly created record.
+                if let Some(mut record) = self
+                    .db
+                    .get_peer(&peer)
+                    .expect("get_peer failed")
+                {
+                    record.node_id = Some(node_id);
+                    self.db.upsert_peer(&record).expect("upsert_peer failed");
+                }
             }
         }
     }
@@ -780,6 +1121,8 @@ impl Processor {
                     current_weeks = denied.current_weeks,
                     "restore denied by holder (escrow)"
                 );
+                // Remove from pending map — this shard won't arrive.
+                self.pending_shard_to_restore.remove(&denied.shard_id);
             }
             DirectBody::BlobReady(ready) => {
                 tracing::debug!(
@@ -787,6 +1130,15 @@ impl Processor {
                     shard = %ready.shard_id,
                     "blob ready from holder (pull in Phase 3)"
                 );
+            }
+            DirectBody::ShardData(shard_data) => {
+                tracing::debug!(
+                    peer = %from,
+                    shard = %shard_data.shard_id,
+                    bytes = shard_data.data.len(),
+                    "shard data received inline"
+                );
+                self.on_shard_data_received(shard_data.shard_id, shard_data.data).await;
             }
         }
     }
@@ -1281,15 +1633,30 @@ impl Processor {
 
         match self.storage.read_shard_for_restore(req.shard_id, &from, now) {
             Ok(blob) => {
+                // Send shard data inline via ShardData message (Phase 3 approach).
+                // The owner sent a RestoreRequest via NetCommand::Connect and is waiting
+                // on the same connection for a response.
+                let shard_data_msg = syncback_core::messages::DirectMessage {
+                    v: syncback_core::constants::PROTOCOL_VERSION,
+                    body: syncback_core::messages::DirectBody::ShardData(
+                        syncback_core::messages::ShardDataMsg {
+                            shard_id: req.shard_id,
+                            data: blob,
+                        },
+                    ),
+                };
+                // Encode and send via SendDirect. The peer identity is `from` (the owner).
+                // Note: SendDirect opens a new outgoing connection to `from`.
+                // This is necessary because the holder cannot send back on the same incoming conn
+                // in the current architecture (handle_incoming processes messages but doesn't
+                // hold a reference to the connection for sending back).
+                let cbor = syncback_core::messages::frame_message(&shard_data_msg)
+                    .expect("ShardData serializes cleanly");
                 self.net_cmd_tx
-                    .send(NetCommand::UploadShard {
-                        shard_id: req.shard_id,
-                        holder: from,
-                        data: blob,
-                    })
+                    .send(NetCommand::SendDirect { peer: from, payload: cbor })
                     .await
                     .expect("net channel closed");
-                tracing::info!(shard = %req.shard_id, owner = %from, "restore: blob sent");
+                tracing::info!(shard = %req.shard_id, owner = %from, "restore: shard data sent inline");
             }
             Err(StorageError::EscrowDenied(denial)) => {
                 tracing::info!(

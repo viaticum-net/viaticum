@@ -239,25 +239,54 @@ fn frame_message_error_on_oversized_payload() {
     };
     assert!(frame_message(&small_msg).is_ok());
 
-    // Verify the TooLarge error path exists for payloads exceeding MAX_MESSAGE_SIZE.
-    // We construct a big CBOR buffer and manually verify the check:
-    let big_payload: Vec<u8> = vec![0u8; 66000];
-    let big_cbor = to_cbor(&big_payload).unwrap();
-    assert!(big_cbor.len() > MAX_MESSAGE_SIZE as usize);
-    // The frame_message function would return TooLarge for any message whose
-    // CBOR encoding exceeds 65535 bytes. We verify the error variant is correct:
-    assert!(matches!(
-        MessageError::TooLarge { size: big_cbor.len() },
-        MessageError::TooLarge { .. }
-    ));
-
-    // Also verify parse_framed returns TooLarge for a prefix > MAX_MESSAGE_SIZE:
+    // Verify that the TooLarge error path is reachable via parse_framed.
+    // parse_framed checks the u32 length prefix before allocating.
     let mut buf = [0u8; 8];
-    // Set length prefix to 65536 (one over the limit)
     let too_big: u32 = MAX_MESSAGE_SIZE + 1;
     buf[..4].copy_from_slice(&too_big.to_be_bytes());
     let result = parse_framed(&buf);
     assert!(matches!(result, Err(MessageError::TooLarge { .. })));
+
+    // ShardData messages with inline blob data work correctly (core use case).
+    let shard_msg = DirectMessage {
+        v: 1,
+        body: DirectBody::ShardData(ShardDataMsg {
+            shard_id: ShardId([1u8; 32]),
+            data: vec![0xABu8; 100_000], // 100 KB inline blob — well under 4 MiB limit
+        }),
+    };
+    assert!(frame_message(&shard_msg).is_ok(), "100 KB ShardData must fit in 4 MiB frame");
+}
+
+// Test 15b: shard_data_msg_roundtrip
+#[test]
+fn shard_data_msg_roundtrip() {
+    let shard_id = ShardId([42u8; 32]);
+    let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+    let msg = ShardDataMsg {
+        shard_id,
+        data: data.clone(),
+    };
+    let bytes = to_cbor(&msg).unwrap();
+    let decoded: ShardDataMsg = from_cbor(&bytes).unwrap();
+    assert_eq!(decoded.shard_id.0, shard_id.0);
+    assert_eq!(decoded.data, data);
+
+    // Verify it works as a DirectBody variant.
+    let direct = DirectMessage {
+        v: 1,
+        body: DirectBody::ShardData(msg),
+    };
+    let framed = frame_message(&direct).unwrap();
+    let (parsed, consumed) = parse_framed(&framed).unwrap();
+    assert_eq!(consumed, framed.len());
+    match parsed.body {
+        DirectBody::ShardData(s) => {
+            assert_eq!(s.shard_id.0, shard_id.0);
+            assert_eq!(s.data, data);
+        }
+        _ => panic!("expected ShardData variant"),
+    }
 }
 
 // Test 16: msg_id_derive_is_deterministic

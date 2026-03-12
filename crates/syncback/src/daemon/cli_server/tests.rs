@@ -66,6 +66,7 @@ async fn status_returns_status_payload_when_processor_responds() {
                     shards_placed: 500,
                     budget_gb: 12.5,
                     dirty_files: 2,
+                    own_node_id: "test-node-id".to_string(),
                 });
             }
         }
@@ -208,6 +209,7 @@ async fn multiple_concurrent_connections_handled_independently() {
                     shards_placed: 0,
                     budget_gb: 0.0,
                     dirty_files: 0,
+                    own_node_id: "test-node".to_string(),
                 });
             }
         }

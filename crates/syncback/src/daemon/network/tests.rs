@@ -86,19 +86,14 @@ fn frame_and_parse_roundtrip_for_handshake() {
 }
 
 #[test]
-fn frame_rejects_message_over_64kb() {
-    // Construct a DirectMessage whose CBOR exceeds 64 KB.
-    // Use a RestoreRequest with a large shard_id payload padded via a wrapper.
-    // Simplest: test frame_message directly using the core test approach.
-    // We'll exploit the fact that the CBOR of a Vec<u8> payload grows linearly.
-    // Create a fake msg using RestoreRequest with a known-serializable large shard_id.
-    // Actually, RestoreRequestMsg only has v+shard_id+ts — not enough to exceed 64KB.
-    // Instead, test frame_message itself with a directly crafted oversized buffer
-    // by testing parse_framed with a >64KB length prefix.
-    let big_len: u32 = 65537; // > MAX_MESSAGE_SIZE (65536)
+fn frame_rejects_message_over_max_size() {
+    // Test parse_framed with a length prefix that exceeds MAX_MESSAGE_SIZE (4 MiB).
+    // MAX_MESSAGE_SIZE was raised from 64 KiB to 4 MiB to support inline ShardData.
+    let big_len: u32 = 4 * 1024 * 1024 + 1; // > MAX_MESSAGE_SIZE (4 MiB)
     let mut buf = Vec::new();
     buf.extend_from_slice(&big_len.to_be_bytes());
-    buf.extend(vec![0u8; big_len as usize]);
+    // Don't allocate big_len bytes — parse_framed checks the prefix before reading body.
+    buf.extend(vec![0u8; 64]); // small body, irrelevant — size check fires on prefix
 
     let result = parse_framed(&buf);
     assert!(

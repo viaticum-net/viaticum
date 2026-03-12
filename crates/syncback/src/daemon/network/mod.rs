@@ -60,6 +60,9 @@ pub struct NetworkTask {
     identity_pub: IdentityPub,
     cmd_rx: mpsc::Receiver<NetCommand>,
     cancel: CancellationToken,
+    /// Map of identity_pub → EndpointAddr for recently connected peers.
+    /// Used by SendDirect to open a connection when only identity is known.
+    peer_addrs: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<IdentityPub, iroh::EndpointAddr>>>,
 }
 
 impl NetworkTask {
@@ -98,6 +101,10 @@ impl NetworkTask {
             node_id,
         };
 
+        let peer_addrs = std::sync::Arc::new(
+            tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        );
+
         let task = NetworkTask {
             endpoint,
             node_id,
@@ -105,6 +112,7 @@ impl NetworkTask {
             identity_pub,
             cmd_rx,
             cancel,
+            peer_addrs,
         };
 
         Ok((task, handle))
@@ -122,8 +130,9 @@ impl NetworkTask {
                             let event_tx = event_tx.clone();
                             let identity_key = self.identity_key.clone();
                             let identity_pub = self.identity_pub;
+                            let peer_addrs = self.peer_addrs.clone();
                             tokio::spawn(async move {
-                                handle_incoming(incoming, event_tx, identity_key, identity_pub).await;
+                                handle_incoming(incoming, event_tx, identity_key, identity_pub, peer_addrs).await;
                             });
                         }
                         None => {
@@ -139,6 +148,7 @@ impl NetworkTask {
                             let identity_key = self.identity_key.clone();
                             let identity_pub = self.identity_pub;
                             let event_tx = event_tx.clone();
+                            let peer_addrs = self.peer_addrs.clone();
                             tokio::spawn(async move {
                                 handle_command(
                                     cmd,
@@ -146,6 +156,7 @@ impl NetworkTask {
                                     &identity_key,
                                     identity_pub,
                                     event_tx,
+                                    peer_addrs,
                                 ).await;
                             });
                         }
@@ -170,11 +181,14 @@ impl NetworkTask {
 // Incoming connection handler
 // ============================================================
 
+type PeerAddrMap = std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<IdentityPub, iroh::EndpointAddr>>>;
+
 async fn handle_incoming(
     incoming: iroh::endpoint::Incoming,
     event_tx: mpsc::Sender<NetEvent>,
     identity_key: SigningKey,
     identity_pub: IdentityPub,
+    peer_addrs: PeerAddrMap,
 ) {
     let accepting = match incoming.accept() {
         Ok(a) => a,
@@ -258,6 +272,13 @@ async fn handle_incoming(
 
     let peer_node_id = NodeId(*conn.remote_id().as_bytes());
 
+    // Store the peer's EndpointAddr for future SendDirect commands.
+    let peer_endpoint_addr = iroh::EndpointAddr::new(conn.remote_id());
+    {
+        let mut map = peer_addrs.lock().await;
+        map.insert(peer_identity, peer_endpoint_addr);
+    }
+
     tracing::info!(peer_id = %peer_identity, "peer connected");
     if event_tx
         .send(NetEvent::PeerConnected {
@@ -306,6 +327,7 @@ async fn handle_command(
     identity_key: &SigningKey,
     identity_pub: IdentityPub,
     event_tx: mpsc::Sender<NetEvent>,
+    peer_addrs: PeerAddrMap,
 ) {
     match cmd {
         NetCommand::Connect {
@@ -315,6 +337,7 @@ async fn handle_command(
         } => {
             // TODO: connection pool for frequent peers
             tracing::debug!(peer_id = %peer_identity, addr = ?peer_addr, "outgoing connect");
+            // Store peer addr after successful connect.
             connect_and_send(
                 endpoint,
                 peer_addr,
@@ -323,6 +346,7 @@ async fn handle_command(
                 identity_key,
                 identity_pub,
                 event_tx,
+                peer_addrs,
             )
             .await;
         }
@@ -342,6 +366,7 @@ async fn handle_command(
                 identity_key,
                 identity_pub,
                 event_tx,
+                peer_addrs,
             )
             .await;
         }
@@ -353,13 +378,55 @@ async fn handle_command(
             // TODO Phase 2: send PoS challenge via board.
             tracing::debug!(holder = %holder, shard = %shard_id, "network: SendPosChallenge not yet implemented");
         }
-        NetCommand::SendDirect { peer, .. } => {
-            // TODO Phase 2: send direct message to peer.
-            tracing::debug!(peer = %peer, "network: SendDirect not yet implemented");
+        NetCommand::SendDirect { peer, payload } => {
+            // Send a pre-framed DirectMessage to a peer. Opens a new connection.
+            // Looks up the peer's EndpointAddr from the peer_addrs map.
+            tracing::debug!(peer = %peer, "network: SendDirect");
+            let addr = {
+                let map = peer_addrs.lock().await;
+                map.get(&peer).cloned()
+            };
+            match addr {
+                Some(peer_addr) => {
+                    send_direct_payload(
+                        endpoint,
+                        peer_addr,
+                        peer,
+                        payload,
+                        identity_key,
+                        identity_pub,
+                        event_tx,
+                        peer_addrs,
+                    )
+                    .await;
+                }
+                None => {
+                    tracing::debug!(peer = %peer, "SendDirect: no known addr for peer, dropping");
+                }
+            }
         }
         NetCommand::ConnectAddr { node_addr } => {
-            // TODO Phase 2: connect to peer by address string.
-            tracing::debug!(addr = %node_addr, "network: ConnectAddr not yet implemented");
+            // Connect to a peer by JSON-encoded EndpointAddr string.
+            // Used for bootstrap/discovery: ConnectPeer CLI command.
+            tracing::debug!(addr = %node_addr, "network: ConnectAddr");
+            let peer_addr: iroh::EndpointAddr = match serde_json::from_str(&node_addr) {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::debug!(addr = %node_addr, error = %e, "ConnectAddr: failed to parse EndpointAddr");
+                    return;
+                }
+            };
+            // Connect with just the handshake — no application message.
+            // After handshake, emit PeerConnected and close.
+            connect_handshake_only(
+                endpoint,
+                peer_addr,
+                identity_key,
+                identity_pub,
+                event_tx,
+                peer_addrs,
+            )
+            .await;
         }
         NetCommand::DownloadShard {
             shard_id,
@@ -386,6 +453,7 @@ async fn connect_and_send(
     identity_key: &SigningKey,
     identity_pub: IdentityPub,
     event_tx: mpsc::Sender<NetEvent>,
+    peer_addrs: PeerAddrMap,
 ) {
     let conn = match endpoint.connect(peer_addr, ALPN).await {
         Ok(c) => c,
@@ -453,6 +521,13 @@ async fn connect_and_send(
 
     let peer_node_id = NodeId(*conn.remote_id().as_bytes());
 
+    // Store peer addr for future SendDirect calls.
+    let peer_endpoint_addr = iroh::EndpointAddr::new(conn.remote_id());
+    {
+        let mut map = peer_addrs.lock().await;
+        map.insert(peer_identity, peer_endpoint_addr);
+    }
+
     tracing::info!(peer_id = %peer_identity, "peer connected");
     if event_tx
         .send(NetEvent::PeerConnected {
@@ -484,6 +559,202 @@ async fn connect_and_send(
     // Wait for the peer to finish their send side (stream 0 B→A direction).
     // This ensures QUIC has time to deliver our data before the conn closes.
     // If B closes gracefully we get Ok(()), if conn resets we get Err.
+    let _ = recv.read_to_end(MAX_MESSAGE_SIZE).await;
+}
+
+/// Connect to a peer and perform handshake only (no application message).
+/// Emits PeerConnected. Used by ConnectAddr (bootstrap/discovery).
+async fn connect_handshake_only(
+    endpoint: &Endpoint,
+    peer_addr: EndpointAddr,
+    identity_key: &SigningKey,
+    identity_pub: IdentityPub,
+    event_tx: mpsc::Sender<NetEvent>,
+    peer_addrs: PeerAddrMap,
+) {
+    let conn = match endpoint.connect(peer_addr, ALPN).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(reason = %e, "ConnectAddr: connection failed");
+            return;
+        }
+    };
+
+    let (mut send, mut recv) = match conn.open_bi().await {
+        Ok(streams) => streams,
+        Err(e) => {
+            tracing::debug!(reason = %e, "ConnectAddr: open_bi failed");
+            return;
+        }
+    };
+
+    // Send our handshake.
+    let now = unix_now();
+    let our_hs = HandshakeMsg::new(identity_pub, now, identity_key);
+    let our_msg = DirectMessage {
+        v: syncback_core::constants::PROTOCOL_VERSION,
+        body: DirectBody::Handshake(our_hs),
+    };
+    if let Err(e) = write_message(&mut send, &our_msg).await {
+        tracing::debug!(reason = %e, "ConnectAddr: write handshake failed");
+        return;
+    }
+
+    // Read their handshake.
+    let their_msg = match read_message(&mut recv).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(reason = %e, "ConnectAddr: read handshake failed");
+            return;
+        }
+    };
+
+    let their_handshake = match their_msg.body {
+        DirectBody::Handshake(h) => h,
+        other => {
+            tracing::debug!(got = %other.variant_name(), "ConnectAddr: unexpected message");
+            return;
+        }
+    };
+
+    if let Err(e) = their_handshake.verify() {
+        tracing::debug!(reason = %e, "ConnectAddr: handshake sig invalid");
+        return;
+    }
+
+    let now2 = unix_now();
+    if let Err(e) = their_handshake.check_freshness(now2) {
+        tracing::debug!(reason = %e, "ConnectAddr: handshake stale");
+        return;
+    }
+
+    let peer_identity = their_handshake.identity_pub;
+    let peer_node_id = NodeId(*conn.remote_id().as_bytes());
+
+    // Store peer addr.
+    let peer_endpoint_addr = iroh::EndpointAddr::new(conn.remote_id());
+    {
+        let mut map = peer_addrs.lock().await;
+        map.insert(peer_identity, peer_endpoint_addr);
+    }
+
+    tracing::info!(peer_id = %peer_identity, "ConnectAddr: peer connected");
+
+    let _ = send.finish();
+    // The event receiver (processor) will register the peer.
+    let _ = event_tx
+        .send(NetEvent::PeerConnected {
+            peer_identity,
+            peer_node_id,
+        })
+        .await;
+}
+
+/// Send a pre-framed DirectMessage payload to a peer via a new outgoing connection.
+/// Opens connection → handshake → sends framed payload.
+async fn send_direct_payload(
+    endpoint: &Endpoint,
+    peer_addr: EndpointAddr,
+    peer_identity: IdentityPub,
+    payload: Vec<u8>,
+    identity_key: &SigningKey,
+    identity_pub: IdentityPub,
+    event_tx: mpsc::Sender<NetEvent>,
+    peer_addrs: PeerAddrMap,
+) {
+    let conn = match endpoint.connect(peer_addr, ALPN).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(peer_id = %peer_identity, reason = %e, "SendDirect: connection failed");
+            return;
+        }
+    };
+
+    let (mut send, mut recv) = match conn.open_bi().await {
+        Ok(streams) => streams,
+        Err(e) => {
+            tracing::debug!(peer_id = %peer_identity, reason = %e, "SendDirect: open_bi failed");
+            return;
+        }
+    };
+
+    // Send handshake.
+    let now = unix_now();
+    let our_hs = HandshakeMsg::new(identity_pub, now, identity_key);
+    let our_msg = DirectMessage {
+        v: syncback_core::constants::PROTOCOL_VERSION,
+        body: DirectBody::Handshake(our_hs),
+    };
+    if let Err(e) = write_message(&mut send, &our_msg).await {
+        tracing::debug!(peer_id = %peer_identity, reason = %e, "SendDirect: write handshake failed");
+        return;
+    }
+
+    // Read their handshake.
+    let their_msg = match read_message(&mut recv).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(peer_id = %peer_identity, reason = %e, "SendDirect: read handshake failed");
+            return;
+        }
+    };
+
+    let their_handshake = match their_msg.body {
+        DirectBody::Handshake(h) => h,
+        other => {
+            tracing::debug!(
+                peer_id = %peer_identity,
+                got = %other.variant_name(),
+                "SendDirect: unexpected message type in handshake"
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = their_handshake.verify() {
+        tracing::debug!(peer_id = %peer_identity, reason = %e, "SendDirect: handshake sig invalid");
+        return;
+    }
+
+    let now2 = unix_now();
+    if let Err(e) = their_handshake.check_freshness(now2) {
+        tracing::debug!(peer_id = %peer_identity, reason = %e, "SendDirect: handshake stale");
+        return;
+    }
+
+    // Store updated peer addr.
+    let peer_endpoint_addr = iroh::EndpointAddr::new(conn.remote_id());
+    {
+        let mut map = peer_addrs.lock().await;
+        map.insert(peer_identity, peer_endpoint_addr);
+    }
+
+    // Emit PeerConnected if not already known.
+    let peer_node_id = NodeId(*conn.remote_id().as_bytes());
+    let _ = event_tx
+        .send(NetEvent::PeerConnected {
+            peer_identity,
+            peer_node_id,
+        })
+        .await;
+
+    // Send the pre-framed payload bytes directly (already a framed DirectMessage).
+    tracing::debug!(
+        peer_id = %peer_identity,
+        bytes = payload.len(),
+        "SendDirect: sending payload"
+    );
+    if let Err(e) = send.write_all(&payload).await {
+        tracing::debug!(peer_id = %peer_identity, reason = %e, "SendDirect: write payload failed");
+        return;
+    }
+
+    if let Err(e) = send.finish() {
+        tracing::debug!(peer_id = %peer_identity, reason = %e, "SendDirect: finish stream failed");
+        return;
+    }
+
+    // Drain the recv side.
     let _ = recv.read_to_end(MAX_MESSAGE_SIZE).await;
 }
 
@@ -557,6 +828,7 @@ impl VariantName for DirectBody {
             DirectBody::RestoreRequest(_) => "RestoreRequest",
             DirectBody::RestoreDenied(_) => "RestoreDenied",
             DirectBody::BlobReady(_) => "BlobReady",
+            DirectBody::ShardData(_) => "ShardData",
         }
     }
 }

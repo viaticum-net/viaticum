@@ -147,6 +147,17 @@ pub enum DirectBody {
     RestoreRequest(RestoreRequestMsg),
     RestoreDenied(RestoreDeniedMsg),
     BlobReady(BlobReadyMsg),
+    ShardData(ShardDataMsg),
+}
+
+/// Holder → Owner. Inline shard blob transfer over a direct connection.
+/// Sent in response to RestoreRequest when iroh-blobs is not available (Phase 3).
+/// DirectBody::ShardData(ShardDataMsg).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ShardDataMsg {
+    pub shard_id: ShardId,
+    /// Raw shard blob bytes (~1-3 MiB, fits in QUIC with increased MAX_MESSAGE_SIZE).
+    pub data: Vec<u8>,
 }
 
 // --- EncryptedPayload ---
