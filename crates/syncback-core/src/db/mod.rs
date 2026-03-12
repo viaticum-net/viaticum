@@ -5,7 +5,7 @@ use redb::{ReadableTable, TableDefinition};
 use crate::types::{
     from_cbor_bytes, to_cbor_bytes, BudgetRecord, EscrowRestoreLog, FileId, FileRecord,
     HoldingRecord, IdentityPub, PeerRecord, ScheduleRecord, ShardId, ShardRecord, ShardState,
-    ShardStatus, Timestamp, UnitId, UnitRecord, UnitStatus,
+    ShardStatus, SystemStateBlobRecord, Timestamp, UnitId, UnitRecord, UnitStatus,
 };
 
 // === Table definitions ===
@@ -56,6 +56,12 @@ const ESCROW_RESTORE_LOG: TableDefinition<&[u8; 32], &[u8]> =
 /// Used by trust module for P/I calculation.
 pub(crate) const POS_WEEKLY: TableDefinition<&[u8; 36], &[u8]> =
     TableDefinition::new("pos_weekly");
+
+/// System state blobs held for other nodes (holder view).
+/// Key = IdentityPub bytes (32 bytes). Value = CBOR(SystemStateBlobRecord).
+/// One entry per owner — new backup overwrites old.
+const SYSTEM_STATE_BLOBS: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("system_state_blobs");
 
 // === DbError ===
 
@@ -130,6 +136,7 @@ impl Db {
             tx.open_table(UNVERIFIED_SHARDS)?;
             tx.open_table(ESCROW_RESTORE_LOG)?;
             tx.open_table(POS_WEEKLY)?;
+            tx.open_table(SYSTEM_STATE_BLOBS)?;
         }
         tx.commit()?;
         Ok(Db {
@@ -990,6 +997,66 @@ impl Db {
             }
         }
         Ok(count)
+    }
+}
+
+// === System state blobs table ===
+
+impl Db {
+    /// Store a system state blob for the given owner. Overwrites any previous blob.
+    pub fn store_system_state_blob(
+        &self,
+        owner: &IdentityPub,
+        record: &SystemStateBlobRecord,
+    ) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(SYSTEM_STATE_BLOBS)?;
+            let bytes = to_cbor_bytes(record);
+            table.insert(&owner.0, bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve the stored system state blob for an owner, if any.
+    pub fn get_system_state_blob(
+        &self,
+        owner: &IdentityPub,
+    ) -> Result<Option<SystemStateBlobRecord>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(SYSTEM_STATE_BLOBS)?;
+        match table.get(&owner.0)? {
+            Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete the stored system state blob for an owner (used during eviction).
+    pub fn delete_system_state_blob(&self, owner: &IdentityPub) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(SYSTEM_STATE_BLOBS)?;
+            table.remove(&owner.0)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// List all owners for which a system state blob is stored.
+    /// Returns (IdentityPub, received_at) pairs.
+    pub fn list_system_state_blob_owners(
+        &self,
+    ) -> Result<Vec<(IdentityPub, Timestamp)>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(SYSTEM_STATE_BLOBS)?;
+        let mut results = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            let record: SystemStateBlobRecord = from_cbor_bytes(v.value())?;
+            results.push((IdentityPub(*k.value()), record.received_at));
+        }
+        Ok(results)
     }
 }
 

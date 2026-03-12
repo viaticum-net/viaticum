@@ -148,6 +148,14 @@ pub enum DirectBody {
     RestoreDenied(RestoreDeniedMsg),
     BlobReady(BlobReadyMsg),
     ShardData(ShardDataMsg),
+    /// Owner → Holder. Push a system state backup blob for the holder to store.
+    SystemStateBackup(SystemStateBackupMsg),
+    /// Holder → Owner. Confirms (or denies) storage of a system state blob.
+    SystemStateAck(SystemStateAckMsg),
+    /// Requester → Holder. Ask for the stored system state blob for requester's identity.
+    SystemStateRequest(SystemStateRequestMsg),
+    /// Holder → Requester. The stored blob (or empty on not-found).
+    SystemStateResponse(SystemStateResponseMsg),
 }
 
 /// Holder → Owner. Inline shard blob transfer over a direct connection.
@@ -158,6 +166,43 @@ pub struct ShardDataMsg {
     pub shard_id: ShardId,
     /// Raw shard blob bytes (~1-3 MiB, fits in QUIC with increased MAX_MESSAGE_SIZE).
     pub data: Vec<u8>,
+}
+
+/// Owner → Holder. Push a system state backup blob for the holder to store.
+/// DirectBody::SystemStateBackup(SystemStateBackupMsg).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SystemStateBackupMsg {
+    /// Encrypted system state blob (only readable by the owner's identity key).
+    pub blob: Vec<u8>,
+    /// Unix timestamp when this backup was created.
+    pub created_at: u64,
+}
+
+/// Holder → Owner. Confirms (or denies) storage of a system state blob.
+/// DirectBody::SystemStateAck(SystemStateAckMsg).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SystemStateAckMsg {
+    /// True if the holder successfully stored the blob.
+    pub stored: bool,
+}
+
+/// Requester → Holder. Ask for the stored system state blob for requester's identity.
+/// DirectBody::SystemStateRequest(SystemStateRequestMsg).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SystemStateRequestMsg {
+    /// The identity requesting its own system state.
+    /// The holder verifies this matches the handshake identity before sending.
+    pub requester: IdentityPub,
+}
+
+/// Holder → Requester. The stored blob (or empty on not-found).
+/// DirectBody::SystemStateResponse(SystemStateResponseMsg).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SystemStateResponseMsg {
+    /// Empty vec means "not found".
+    pub blob: Vec<u8>,
+    /// Zero when not found.
+    pub created_at: u64,
 }
 
 // --- EncryptedPayload ---

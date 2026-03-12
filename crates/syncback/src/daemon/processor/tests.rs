@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use syncback_core::db::Db;
 use syncback_core::types::{
-    FileType, HoldingRecord, IdentityPub, PeerRecord, ShardId, ShardRecord, ShardState,
-    ShardStatus, Timestamp, UnitId,
+    FileType, HoldingRecord, IdentityPub, NodeId, PeerRecord, ShardId, ShardRecord, ShardState,
+    ShardStatus, SystemStateBlobRecord, Timestamp, UnitId,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -78,6 +78,42 @@ fn spawn_processor(
     let (net_cmd_tx, net_cmd_rx) = mpsc::channel::<NetCommand>(64);
 
     let (identity_key, identity_pub) = test_identity();
+
+    let handle = tokio::spawn(run(
+        db,
+        cancel.clone(),
+        processor_rx,
+        dirty_rx,
+        net_event_rx,
+        net_cmd_tx,
+        config,
+        identity_key,
+        identity_pub,
+        "test-node-id".to_string(),
+    ));
+
+    (cancel, processor_tx, dirty_tx, net_event_tx, net_cmd_rx, handle)
+}
+
+/// Spawn processor with a specific identity key (for DR tests).
+fn spawn_processor_with_identity(
+    db: Db,
+    config: Config,
+    identity_key: ed25519_dalek::SigningKey,
+    identity_pub: IdentityPub,
+) -> (
+    CancellationToken,
+    mpsc::Sender<ProcessorMsg>,
+    mpsc::Sender<DirtyEvent>,
+    mpsc::Sender<NetEvent>,
+    mpsc::Receiver<NetCommand>,
+    tokio::task::JoinHandle<()>,
+) {
+    let cancel = CancellationToken::new();
+    let (processor_tx, processor_rx) = mpsc::channel::<ProcessorMsg>(64);
+    let (dirty_tx, dirty_rx) = mpsc::channel::<DirtyEvent>(64);
+    let (net_event_tx, net_event_rx) = mpsc::channel::<NetEvent>(64);
+    let (net_cmd_tx, net_cmd_rx) = mpsc::channel::<NetCommand>(64);
 
     let handle = tokio::spawn(run(
         db,
@@ -383,4 +419,563 @@ async fn processor_handles_fatal_error_cancels_token() {
     let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
     assert!(result.is_ok(), "processor should have exited after fatal error");
     assert!(cancel.is_cancelled(), "cancel token should be set");
+}
+
+// ============================================================
+// System state and DR boot tests
+// ============================================================
+
+/// Helper: generate a BIP39 mnemonic from 32 bytes of entropy.
+fn make_mnemonic(entropy: [u8; 32]) -> (Vec<String>, [u8; 32], IdentityPub) {
+    use bip39::Mnemonic;
+    let mnemonic = Mnemonic::from_entropy(&entropy).expect("valid entropy");
+    let words: Vec<String> = mnemonic.words().map(|s| s.to_string()).collect();
+    let seed = mnemonic.to_seed("");
+    let (signing_key, _) = crate::cli::init::derive_keys(&seed);
+    let pub_bytes: [u8; 32] = signing_key.verifying_key().to_bytes();
+    let identity_key_bytes: [u8; 32] = signing_key.to_bytes();
+    (words, identity_key_bytes, IdentityPub(pub_bytes))
+}
+
+/// Build a PeerRecord with a known NodeId (so it can be selected for backup).
+/// Uses a valid ed25519 public key derived from the given seed byte for the NodeId.
+fn make_peer_with_node_id(identity: IdentityPub, seed_byte: u8, now: Timestamp) -> PeerRecord {
+    // Derive a valid ed25519 key from a known seed byte for the NodeId.
+    let mut seed = [0u8; 32];
+    seed[0] = seed_byte;
+    seed[31] = 0x01; // ensure non-zero
+    let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let node_id_bytes: [u8; 32] = sk.verifying_key().to_bytes();
+    PeerRecord {
+        identity,
+        node_id: Some(NodeId(node_id_bytes)),
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_sent_to_peer: 0,
+        bytes_received_from_peer: 0,
+        first_seen: now,
+        last_seen: now,
+        weeks_in_network: 10,
+        subnet_prefix: None,
+        allowlisted: false,
+    }
+}
+
+/// Drain all NetCommands from rx without blocking.
+fn drain_net_cmds(rx: &mut mpsc::Receiver<NetCommand>) -> Vec<NetCommand> {
+    let mut cmds = Vec::new();
+    while let Ok(cmd) = rx.try_recv() {
+        cmds.push(cmd);
+    }
+    cmds
+}
+
+/// system_state_backup_sends_to_peers_when_enough_known
+///
+/// Owner has 3+ peers with node_ids. Triggering SystemStateBackup should
+/// emit SendMessage commands for each of them.
+#[tokio::test]
+async fn system_state_backup_sends_to_peers_when_enough_known() {
+    let (db, dir) = test_db();
+    let config = test_config(dir.path().to_path_buf());
+    let db2 = db.clone();
+    let now = Timestamp::now();
+
+    // Create 3 peers with known NodeIds so the backup can select them.
+    for i in 1u8..=3 {
+        let mut bytes = [0u8; 32];
+        bytes[0] = i;
+        bytes[31] = 0x01; // ensure distinct, non-zero identity
+        let identity = IdentityPub(bytes);
+        let record = make_peer_with_node_id(identity, i, now);
+        db2.upsert_peer(&record).expect("upsert peer");
+    }
+
+    let (cancel, processor_tx, _dirty_tx, _net_event_tx, mut net_cmd_rx, handle) =
+        spawn_processor(db, config);
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    processor_tx
+        .send(ProcessorMsg::Scheduled(ScheduledCmd::SystemStateBackup))
+        .await
+        .expect("send cmd");
+
+    // Give time to process and emit commands.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let cmds = drain_net_cmds(&mut net_cmd_rx);
+
+    let send_message_count = cmds
+        .iter()
+        .filter(|c| matches!(c, NetCommand::SendMessage { .. }))
+        .count();
+
+    assert!(
+        send_message_count >= 3,
+        "expected at least 3 SendMessage commands, got {send_message_count}. cmds: {cmds:?}"
+    );
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+}
+
+/// system_state_backup_too_few_peers_skips_sending
+///
+/// When fewer than 3 peers have known node_ids, backup should not send anything.
+#[tokio::test]
+async fn system_state_backup_too_few_peers_skips_sending() {
+    let (db, dir) = test_db();
+    let config = test_config(dir.path().to_path_buf());
+    let db2 = db.clone();
+    let now = Timestamp::now();
+
+    // Only 2 peers — below minimum of 3.
+    for i in 1u8..=2 {
+        let mut bytes = [0u8; 32];
+        bytes[0] = i;
+        bytes[31] = 0x01;
+        let identity = IdentityPub(bytes);
+        let record = make_peer_with_node_id(identity, i, now);
+        db2.upsert_peer(&record).expect("upsert peer");
+    }
+
+    let (cancel, processor_tx, _dirty_tx, _net_event_tx, mut net_cmd_rx, handle) =
+        spawn_processor(db, config);
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    processor_tx
+        .send(ProcessorMsg::Scheduled(ScheduledCmd::SystemStateBackup))
+        .await
+        .expect("send cmd");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let cmds = drain_net_cmds(&mut net_cmd_rx);
+    let send_message_count = cmds
+        .iter()
+        .filter(|c| matches!(c, NetCommand::SendMessage { .. }))
+        .count();
+
+    assert_eq!(
+        send_message_count, 0,
+        "expected no SendMessage with fewer than 3 peers, got {send_message_count}"
+    );
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+}
+
+/// system_state_backup_received_stores_blob_from_known_peer
+///
+/// Holder processor receives SystemStateBackup from a known peer.
+/// Blob should be stored in DB, ack sent via SendDirect.
+#[tokio::test]
+async fn system_state_backup_received_stores_blob_from_known_peer() {
+    use syncback_core::messages::{DirectBody, DirectMessage, SystemStateBackupMsg};
+
+    let (holder_db, dir) = test_db();
+    let config = test_config(dir.path().to_path_buf());
+    let holder_db2 = holder_db.clone();
+    let now = Timestamp::now();
+
+    // Register the owner peer in holder's DB.
+    let mut owner_bytes = [0u8; 32];
+    owner_bytes[0] = 77;
+    let owner_identity = IdentityPub(owner_bytes);
+    let owner_record = make_peer_record(owner_identity, now);
+    holder_db2.upsert_peer(&owner_record).expect("upsert owner peer");
+
+    let (cancel, _processor_tx, _dirty_tx, net_event_tx, mut net_cmd_rx, handle) =
+        spawn_processor(holder_db.clone(), config);
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Simulate owner sending SystemStateBackup to holder.
+    let blob = vec![0u8; 100]; // Fake blob (small but non-empty).
+    let msg = DirectMessage {
+        v: syncback_core::constants::PROTOCOL_VERSION,
+        body: DirectBody::SystemStateBackup(SystemStateBackupMsg {
+            blob: blob.clone(),
+            created_at: now.0,
+        }),
+    };
+    net_event_tx
+        .send(NetEvent::MessageReceived {
+            from: owner_identity,
+            message: msg,
+        })
+        .await
+        .expect("send net event");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify blob stored in holder's DB.
+    let stored = holder_db
+        .get_system_state_blob(&owner_identity)
+        .expect("get blob");
+    assert!(stored.is_some(), "expected blob to be stored");
+    assert_eq!(stored.unwrap().blob, blob);
+
+    // Verify ack sent via SendDirect.
+    let cmds = drain_net_cmds(&mut net_cmd_rx);
+    let has_ack = cmds
+        .iter()
+        .any(|c| matches!(c, NetCommand::SendDirect { peer, .. } if *peer == owner_identity));
+    assert!(has_ack, "expected SendDirect ack to owner");
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+}
+
+/// system_state_backup_received_rejects_from_unknown_peer
+///
+/// Holder receives SystemStateBackup from an unknown peer.
+/// Should send ack(stored=false) and NOT store the blob.
+#[tokio::test]
+async fn system_state_backup_received_rejects_from_unknown_peer() {
+    use syncback_core::messages::{DirectBody, DirectMessage, SystemStateBackupMsg};
+
+    let (holder_db, dir) = test_db();
+    let config = test_config(dir.path().to_path_buf());
+    let holder_db2 = holder_db.clone();
+    let now = Timestamp::now();
+
+    // Unknown peer — NOT in DB.
+    let mut unknown_bytes = [0u8; 32];
+    unknown_bytes[0] = 99;
+    let unknown_identity = IdentityPub(unknown_bytes);
+
+    let (cancel, _processor_tx, _dirty_tx, net_event_tx, _net_cmd_rx, handle) =
+        spawn_processor(holder_db.clone(), config);
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let msg = DirectMessage {
+        v: syncback_core::constants::PROTOCOL_VERSION,
+        body: DirectBody::SystemStateBackup(SystemStateBackupMsg {
+            blob: vec![42u8; 50],
+            created_at: now.0,
+        }),
+    };
+    net_event_tx
+        .send(NetEvent::MessageReceived {
+            from: unknown_identity,
+            message: msg,
+        })
+        .await
+        .expect("send net event");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Blob should NOT be stored.
+    let stored = holder_db2
+        .get_system_state_blob(&unknown_identity)
+        .expect("get blob");
+    assert!(stored.is_none(), "expected blob NOT to be stored for unknown peer");
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+}
+
+/// system_state_request_found_returns_blob
+///
+/// Holder has a blob for owner. SystemStateRequest should return it via SendDirect.
+#[tokio::test]
+async fn system_state_request_found_returns_blob() {
+    use syncback_core::messages::{DirectBody, DirectMessage, SystemStateRequestMsg};
+
+    let (holder_db, dir) = test_db();
+    let config = test_config(dir.path().to_path_buf());
+    let holder_db2 = holder_db.clone();
+    let now = Timestamp::now();
+
+    let mut owner_bytes = [0u8; 32];
+    owner_bytes[0] = 55;
+    let owner_identity = IdentityPub(owner_bytes);
+
+    // Pre-store a blob for owner.
+    let blob = vec![1u8, 2, 3, 4, 5];
+    holder_db2
+        .store_system_state_blob(
+            &owner_identity,
+            &SystemStateBlobRecord {
+                blob: blob.clone(),
+                created_at: now,
+                received_at: now,
+            },
+        )
+        .expect("store blob");
+
+    let (cancel, _processor_tx, _dirty_tx, net_event_tx, mut net_cmd_rx, handle) =
+        spawn_processor(holder_db, config);
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Owner sends SystemStateRequest.
+    let msg = DirectMessage {
+        v: syncback_core::constants::PROTOCOL_VERSION,
+        body: DirectBody::SystemStateRequest(SystemStateRequestMsg {
+            requester: owner_identity,
+        }),
+    };
+    net_event_tx
+        .send(NetEvent::MessageReceived {
+            from: owner_identity,
+            message: msg,
+        })
+        .await
+        .expect("send");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let cmds = drain_net_cmds(&mut net_cmd_rx);
+    let has_response = cmds
+        .iter()
+        .any(|c| matches!(c, NetCommand::SendDirect { peer, .. } if *peer == owner_identity));
+    assert!(has_response, "expected SendDirect response to owner");
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+}
+
+/// system_state_request_not_found_returns_empty
+///
+/// Holder has NO blob for owner. SystemStateRequest should return empty blob via SendDirect.
+#[tokio::test]
+async fn system_state_request_not_found_returns_empty() {
+    use syncback_core::messages::{DirectBody, DirectMessage, SystemStateRequestMsg};
+
+    let (holder_db, dir) = test_db();
+    let config = test_config(dir.path().to_path_buf());
+
+    let mut owner_bytes = [0u8; 32];
+    owner_bytes[0] = 44;
+    let owner_identity = IdentityPub(owner_bytes);
+
+    // No blob stored for owner.
+
+    let (cancel, _processor_tx, _dirty_tx, net_event_tx, mut net_cmd_rx, handle) =
+        spawn_processor(holder_db, config);
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let msg = DirectMessage {
+        v: syncback_core::constants::PROTOCOL_VERSION,
+        body: DirectBody::SystemStateRequest(SystemStateRequestMsg {
+            requester: owner_identity,
+        }),
+    };
+    net_event_tx
+        .send(NetEvent::MessageReceived {
+            from: owner_identity,
+            message: msg,
+        })
+        .await
+        .expect("send");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let cmds = drain_net_cmds(&mut net_cmd_rx);
+    // A SendDirect command should be sent (the "not found" response).
+    let has_response = cmds
+        .iter()
+        .any(|c| matches!(c, NetCommand::SendDirect { peer, .. } if *peer == owner_identity));
+    assert!(has_response, "expected SendDirect response (empty) to owner");
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+}
+
+/// system_state_request_requester_mismatch_is_ignored
+///
+/// Peer C sends SystemStateRequest with requester=A (forged).
+/// Holder should NOT send any response (requester != from).
+#[tokio::test]
+async fn system_state_request_requester_mismatch_is_ignored() {
+    use syncback_core::messages::{DirectBody, DirectMessage, SystemStateRequestMsg};
+
+    let (holder_db, dir) = test_db();
+    let config = test_config(dir.path().to_path_buf());
+
+    let mut a_bytes = [0u8; 32];
+    a_bytes[0] = 0xAA;
+    let a_identity = IdentityPub(a_bytes);
+
+    let mut c_bytes = [0u8; 32];
+    c_bytes[0] = 0xCC;
+    let c_identity = IdentityPub(c_bytes);
+
+    let (cancel, _processor_tx, _dirty_tx, net_event_tx, mut net_cmd_rx, handle) =
+        spawn_processor(holder_db, config);
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // C sends a request claiming to be A.
+    let msg = DirectMessage {
+        v: syncback_core::constants::PROTOCOL_VERSION,
+        body: DirectBody::SystemStateRequest(SystemStateRequestMsg {
+            requester: a_identity, // forged — should be c_identity
+        }),
+    };
+    net_event_tx
+        .send(NetEvent::MessageReceived {
+            from: c_identity,
+            message: msg,
+        })
+        .await
+        .expect("send");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // No response should have been sent to C or A.
+    let cmds = drain_net_cmds(&mut net_cmd_rx);
+    let response_count = cmds.iter().filter(|c| matches!(c, NetCommand::SendDirect { .. })).count();
+    assert_eq!(
+        response_count, 0,
+        "expected no response to forged requester mismatch, got: {cmds:?}"
+    );
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+}
+
+/// dr_restore_rejects_wrong_seed_phrase
+///
+/// Processor has identity from entropy A. DrRestore with seed from entropy B
+/// should fail with an error.
+#[tokio::test]
+async fn dr_restore_rejects_wrong_seed_phrase() {
+    let (db, dir) = test_db();
+    let config = test_config(dir.path().to_path_buf());
+
+    // Entropy A → identity A.
+    let entropy_a = [0u8; 32];
+    let (_words_a, key_bytes_a, identity_a) = make_mnemonic(entropy_a);
+
+    // Entropy B → identity B (different).
+    let entropy_b = [1u8; 32];
+    let (words_b, _key_bytes_b, _identity_b) = make_mnemonic(entropy_b);
+
+    // Spawn processor with identity A.
+    let signing_key_a = ed25519_dalek::SigningKey::from_bytes(&key_bytes_a);
+    let (cancel, processor_tx, _dirty_tx, _net_event_tx, _net_cmd_rx, handle) =
+        spawn_processor_with_identity(db, config, signing_key_a, identity_a);
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Try DR restore with seed B (wrong seed for this daemon).
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    processor_tx
+        .send(ProcessorMsg::Cli(CliCmd::DrRestore {
+            seed_phrase: words_b,
+            peer_addr: "{}".to_string(), // invalid addr (won't get there)
+            reply: reply_tx,
+        }))
+        .await
+        .expect("send");
+
+    let result = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+        .await
+        .expect("timeout")
+        .expect("channel");
+
+    assert!(
+        result.is_err(),
+        "expected error for wrong seed phrase, got: {result:?}"
+    );
+    let err_msg = result.unwrap_err();
+    assert!(
+        err_msg.contains("seed phrase does not match") || err_msg.contains("identity"),
+        "unexpected error message: {err_msg}"
+    );
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+}
+
+/// system_state_backup_overwrites_old_blob
+///
+/// Holder receives two SystemStateBackup messages from the same owner.
+/// Only the latest blob should be stored (overwrite semantics).
+#[tokio::test]
+async fn system_state_backup_overwrites_old_blob() {
+    use syncback_core::messages::{DirectBody, DirectMessage, SystemStateBackupMsg};
+
+    let (holder_db, dir) = test_db();
+    let config = test_config(dir.path().to_path_buf());
+    let holder_db2 = holder_db.clone();
+    let now = Timestamp::now();
+
+    let mut owner_bytes = [0u8; 32];
+    owner_bytes[0] = 33;
+    let owner_identity = IdentityPub(owner_bytes);
+
+    // Register owner as a known peer.
+    let owner_record = make_peer_record(owner_identity, now);
+    holder_db2.upsert_peer(&owner_record).expect("upsert owner");
+
+    let (cancel, _processor_tx, _dirty_tx, net_event_tx, _net_cmd_rx, handle) =
+        spawn_processor(holder_db.clone(), config);
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // First backup.
+    let blob_v1 = vec![1u8; 50];
+    let msg_v1 = DirectMessage {
+        v: syncback_core::constants::PROTOCOL_VERSION,
+        body: DirectBody::SystemStateBackup(SystemStateBackupMsg {
+            blob: blob_v1.clone(),
+            created_at: 1000,
+        }),
+    };
+    net_event_tx
+        .send(NetEvent::MessageReceived {
+            from: owner_identity,
+            message: msg_v1,
+        })
+        .await
+        .expect("send v1");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Second backup (newer).
+    let blob_v2 = vec![2u8; 60];
+    let msg_v2 = DirectMessage {
+        v: syncback_core::constants::PROTOCOL_VERSION,
+        body: DirectBody::SystemStateBackup(SystemStateBackupMsg {
+            blob: blob_v2.clone(),
+            created_at: 2000,
+        }),
+    };
+    net_event_tx
+        .send(NetEvent::MessageReceived {
+            from: owner_identity,
+            message: msg_v2,
+        })
+        .await
+        .expect("send v2");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Only latest blob should be stored.
+    let stored = holder_db
+        .get_system_state_blob(&owner_identity)
+        .expect("get blob")
+        .expect("blob should be stored");
+
+    assert_eq!(stored.blob, blob_v2, "expected latest blob (v2) to be stored");
+    assert_eq!(stored.created_at.0, 2000, "expected latest created_at=2000");
+
+    // Only one entry should exist.
+    let all_owners = holder_db
+        .list_system_state_blob_owners()
+        .expect("list owners");
+    let owner_count = all_owners.iter().filter(|(id, _)| *id == owner_identity).count();
+    assert_eq!(owner_count, 1, "expected exactly 1 entry per owner");
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
 }

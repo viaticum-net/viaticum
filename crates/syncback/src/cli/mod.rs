@@ -39,6 +39,15 @@ pub enum Commands {
     Peers,
     /// Gracefully stop the running daemon
     Stop,
+    /// Disaster recovery: restore DB from a peer using your seed phrase
+    DrRestore {
+        /// 24-word BIP39 seed phrase (space-separated, in quotes)
+        #[arg(long, required = true)]
+        seed: String,
+        /// JSON-encoded iroh EndpointAddr of a peer that holds your system state
+        #[arg(long, required = true)]
+        peer: String,
+    },
 }
 
 // ============================================================
@@ -169,6 +178,22 @@ pub fn run_stop() -> anyhow::Result<()> {
     match response {
         CliResponse::Ok { message } => println!("{message}"),
         CliResponse::Error { message } => eprintln!("error: {message}"),
+        other => eprintln!("unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+pub fn run_dr_restore(seed: String, peer: String) -> anyhow::Result<()> {
+    let response = send_request(&CliRequest::DrRestore {
+        seed_phrase: seed,
+        peer_addr: peer,
+    })?;
+    match response {
+        CliResponse::Ok { message } => println!("{message}"),
+        CliResponse::Error { message } => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
         other => eprintln!("unexpected response: {:?}", other),
     }
     Ok(())

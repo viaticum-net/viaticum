@@ -16,6 +16,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Restore { path, dest } => cli::run_restore(path, dest),
         Commands::Peers => cli::run_peers(),
         Commands::Stop => cli::run_stop(),
+        Commands::DrRestore { seed, peer } => cli::run_dr_restore(seed, peer),
     }
 }
 

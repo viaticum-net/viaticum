@@ -355,7 +355,19 @@ pub fn restore_db(db: &Db, state: &SystemState) -> Result<(), SystemStateError> 
     if !db.list_all_files()?.is_empty() || !db.list_all_peers()?.is_empty() {
         return Err(SystemStateError::DbNotEmpty);
     }
+    restore_db_inner(db, state)
+}
 
+/// Like `restore_db` but skips the empty-DB check.
+///
+/// Used by the DR boot flow where the daemon may have already registered the
+/// holder peer before the system state response arrives. The restored data
+/// overwrites any ephemeral state.
+pub fn restore_db_force(db: &Db, state: &SystemState) -> Result<(), SystemStateError> {
+    restore_db_inner(db, state)
+}
+
+fn restore_db_inner(db: &Db, state: &SystemState) -> Result<(), SystemStateError> {
     for record in &state.files {
         db.upsert_file(record)?;
     }

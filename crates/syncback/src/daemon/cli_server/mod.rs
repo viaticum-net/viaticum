@@ -37,6 +37,13 @@ pub enum CliRequest {
     ConnectPeer {
         node_addr: String,
     },
+    /// Disaster recovery: retrieve system state from a peer using the seed phrase.
+    DrRestore {
+        /// 24 BIP39 words, space-separated.
+        seed_phrase: String,
+        /// JSON-encoded iroh EndpointAddr of a peer that holds the system state.
+        peer_addr: String,
+    },
 }
 
 /// Response sent by the daemon back to the CLI client.
@@ -285,6 +292,46 @@ async fn dispatch(
                 Ok(Err(e)) => CliResponse::Error { message: e },
                 Err(_) => CliResponse::Error {
                     message: "processor dropped reply".into(),
+                },
+            }
+        }
+
+        CliRequest::DrRestore { seed_phrase, peer_addr } => {
+            let words: Vec<String> = seed_phrase
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            if words.len() != 24 {
+                return CliResponse::Error {
+                    message: format!("seed phrase must be 24 words, got {}", words.len()),
+                };
+            }
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let cmd = ProcessorMsg::Cli(CliCmd::DrRestore {
+                seed_phrase: words,
+                peer_addr: peer_addr.clone(),
+                reply: reply_tx,
+            });
+            if processor_tx.send(cmd).await.is_err() {
+                return CliResponse::Error {
+                    message: "daemon not responding".into(),
+                };
+            }
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                reply_rx,
+            )
+            .await
+            {
+                Ok(Ok(Ok(()))) => CliResponse::Ok {
+                    message: "DR restore completed: DB populated. Run 'syncback restore <file>' to restore files.".into(),
+                },
+                Ok(Ok(Err(e))) => CliResponse::Error { message: e },
+                Ok(Err(_)) => CliResponse::Error {
+                    message: "processor dropped reply".into(),
+                },
+                Err(_) => CliResponse::Error {
+                    message: "DR restore timed out after 30s".into(),
                 },
             }
         }

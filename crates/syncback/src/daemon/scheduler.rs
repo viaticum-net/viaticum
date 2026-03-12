@@ -13,6 +13,9 @@ const WEEKLY: Duration = Duration::from_secs(604_800); // 7 days
 const MONTHLY: Duration = Duration::from_secs(2_592_000); // 30 days
 const POS_FIRST_OFFSET: Duration = Duration::from_secs(86_400); // 1 day
 const REPAIR_FIRST_OFFSET: Duration = Duration::from_secs(172_800); // 2 days
+/// First system state backup fires 8 days after startup (1 day after WeeklySync).
+/// This acts as a safety net; WeeklySync also triggers backup inline.
+const SYSTEM_STATE_BACKUP_FIRST_OFFSET: Duration = Duration::from_secs(8 * 24 * 3600);
 
 // ============================================================
 // run()
@@ -29,6 +32,7 @@ pub async fn run(cancel: CancellationToken, processor_tx: mpsc::Sender<Processor
     let mut pos_round_due = start + POS_FIRST_OFFSET;
     let mut repair_check_due = start + REPAIR_FIRST_OFFSET;
     let mut vacuum_due = start + MONTHLY;
+    let mut system_state_backup_due = start + SYSTEM_STATE_BACKUP_FIRST_OFFSET;
 
     tracing::debug!("scheduler: started");
     tracing::debug!(
@@ -46,6 +50,10 @@ pub async fn run(cancel: CancellationToken, processor_tx: mpsc::Sender<Processor
     tracing::debug!(
         secs = MONTHLY.as_secs(),
         "scheduler: next vacuum in"
+    );
+    tracing::debug!(
+        secs = SYSTEM_STATE_BACKUP_FIRST_OFFSET.as_secs(),
+        "scheduler: next system_state_backup in"
     );
 
     loop {
@@ -76,6 +84,16 @@ pub async fn run(cancel: CancellationToken, processor_tx: mpsc::Sender<Processor
                 if now >= vacuum_due {
                     send_cmd(&processor_tx, ScheduledCmd::Vacuum, "vacuum").await;
                     vacuum_due = now + MONTHLY;
+                    any_fired = true;
+                }
+                if now >= system_state_backup_due {
+                    send_cmd(
+                        &processor_tx,
+                        ScheduledCmd::SystemStateBackup,
+                        "system_state_backup",
+                    )
+                    .await;
+                    system_state_backup_due = now + WEEKLY;
                     any_fired = true;
                 }
 
@@ -262,7 +280,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn scheduler_fires_vacuum_after_thirty_days() {
         let cancel = CancellationToken::new();
-        let (tx, mut rx) = make_channel(16);
+        // Capacity 32: 30 days produces ~4 weekly cycles * 4 cmds + Vacuum = 17+ messages.
+        let (tx, mut rx) = make_channel(32);
 
         tokio::spawn(super::run(cancel.clone(), tx));
 

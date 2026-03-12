@@ -423,6 +423,18 @@ pub struct EscrowRestoreLog {
     pub last_restore_at: Option<Timestamp>,
 }
 
+/// Stored in SYSTEM_STATE_BLOBS. Keyed by owner IdentityPub.
+/// The holder stores one entry per owner whose system state it holds.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SystemStateBlobRecord {
+    /// Encrypted system state blob (only readable by the owner's identity key).
+    pub blob: Vec<u8>,
+    /// When the owner created this backup (from the message).
+    pub created_at: Timestamp,
+    /// When this node received and stored it.
+    pub received_at: Timestamp,
+}
+
 /// Stored in the `budget` table. Singleton, key = "budget".
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BudgetRecord {

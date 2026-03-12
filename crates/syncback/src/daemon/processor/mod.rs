@@ -6,10 +6,11 @@ use syncback_core::constants::SECS_PER_WEEK;
 use syncback_core::db::Db;
 use syncback_core::escrow::EscrowChecker;
 use syncback_core::messages::{
-    from_cbor, to_cbor, CancelDeleteMsg, DeleteMsg, DenyReason, DirectBody, MsgId,
-    PeerAnnounceMsg, PosChallengeMsg, PosResponseMsg, RejectReason, RestoreDeniedMsg,
-    RestoreRequestMsg, ShardAcceptMsg, ShardDropNoticeMsg, ShardDroppedMsg, ShardOfferMsg,
-    ShardRejectMsg, ShardStoredMsg, StorageWarningMsg,
+    frame_message, from_cbor, to_cbor, CancelDeleteMsg, DeleteMsg, DenyReason, DirectBody,
+    DirectMessage, MsgId, PeerAnnounceMsg, PosChallengeMsg, PosResponseMsg, RejectReason,
+    RestoreDeniedMsg, RestoreRequestMsg, ShardAcceptMsg, ShardDropNoticeMsg, ShardDroppedMsg,
+    ShardOfferMsg, ShardRejectMsg, ShardStoredMsg, StorageWarningMsg, SystemStateAckMsg,
+    SystemStateBackupMsg, SystemStateRequestMsg, SystemStateResponseMsg,
 };
 use syncback_core::placement::PlacementEngine;
 use syncback_core::trust::{TransferEvent, TrustEngine};
@@ -105,6 +106,16 @@ struct Processor {
     pending_shard_to_restore: HashMap<syncback_core::types::ShardId, (u64, usize)>,
     /// Counter for restore IDs.
     next_restore_id: u64,
+
+    // ---- DR boot state machine ----
+    /// Set during DR restore; cleared when PeerConnected fires and request is sent.
+    pending_dr_peer_addr: Option<String>,
+    /// CLI reply sender for DR restore; cleared when SystemStateResponse arrives or fails.
+    pending_dr_cli_reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    /// Set when DR request is sent; cleared when SystemStateResponse arrives.
+    /// (Unused in current single-step flow but kept for future retry logic.)
+    #[allow(dead_code)]
+    pending_dr_reply: Option<tokio::sync::oneshot::Sender<Result<SystemStateResponseMsg, String>>>,
 }
 
 // ============================================================
@@ -178,6 +189,9 @@ pub async fn run(
         pending_restores: HashMap::new(),
         pending_shard_to_restore: HashMap::new(),
         next_restore_id: 0,
+        pending_dr_peer_addr: None,
+        pending_dr_cli_reply: None,
+        pending_dr_reply: None,
     };
 
     tracing::info!("processor: started");
@@ -240,10 +254,16 @@ impl Processor {
 impl Processor {
     async fn handle_scheduled(&mut self, cmd: ScheduledCmd) {
         match cmd {
-            ScheduledCmd::WeeklySync => self.run_weekly_sync().await,
+            ScheduledCmd::WeeklySync => {
+                self.run_weekly_sync().await;
+                // After weekly sync, trigger system state backup inline.
+                self.handle_system_state_backup().await;
+            }
             ScheduledCmd::PosRound => self.run_pos_round().await,
             ScheduledCmd::Vacuum => self.run_vacuum().await,
             ScheduledCmd::RepairCheck => self.run_repair_check().await,
+            // Safety-net: also fired weekly by scheduler if WeeklySync was skipped.
+            ScheduledCmd::SystemStateBackup => self.handle_system_state_backup().await,
         }
     }
 
@@ -540,6 +560,13 @@ impl Processor {
             CliCmd::ConnectPeer { node_addr, reply } => {
                 self.handle_cli_connect_peer(node_addr, reply).await;
             }
+            CliCmd::DrRestore {
+                seed_phrase,
+                peer_addr,
+                reply,
+            } => {
+                self.handle_dr_restore(seed_phrase, peer_addr, reply).await;
+            }
         }
     }
 
@@ -587,6 +614,7 @@ impl Processor {
     ) {
         tracing::info!("backup now: triggered by CLI");
         self.run_weekly_sync().await;
+        self.handle_system_state_backup().await;
         let _ = reply.send(Ok(()));
     }
 
@@ -924,6 +952,370 @@ impl Processor {
 }
 
 // ============================================================
+// System state handlers
+// ============================================================
+
+impl Processor {
+    /// Owner-side: snapshot, encrypt, and push system state blob to top-15 peers.
+    async fn handle_system_state_backup(&mut self) {
+        let now = Timestamp::now();
+
+        // 1. Snapshot DB.
+        let state = match crate::daemon::system_state::snapshot_db(&self.db) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::info!(error = %e, "system_state_backup: snapshot_db failed, skipping");
+                return;
+            }
+        };
+
+        // 2. Pack (encrypt + compress).
+        let blob = match crate::daemon::system_state::pack_system_state(&state, &self.identity_key_bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::info!(error = %e, "system_state_backup: pack_system_state failed, skipping");
+                return;
+            }
+        };
+
+        // 3. Select up to 15 peers by trust score. Skip peers without a known node_addr.
+        let all_peers = self
+            .db
+            .list_all_peers()
+            .expect("list_all_peers: db error is fatal");
+
+        let mut scored: Vec<(f64, syncback_core::types::PeerRecord)> = all_peers
+            .into_iter()
+            .filter(|p| p.node_id.is_some())
+            .map(|p| {
+                let score = self.trust.combined_score(&p.identity).unwrap_or(0.0);
+                (score, p)
+            })
+            .collect();
+
+        // Sort descending by trust score.
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let selected: Vec<_> = scored.into_iter().take(15).collect();
+
+        if selected.len() < 3 {
+            tracing::info!(
+                peers = selected.len(),
+                "system_state_backup: too few peers for system state backup, skipping"
+            );
+            return;
+        }
+
+        let blob_bytes = blob.len();
+        let mut sent_count = 0usize;
+
+        // 4. Send to each selected peer (fire and forget).
+        for (_, peer_record) in &selected {
+            let node_id = match peer_record.node_id {
+                Some(ref n) => n,
+                None => continue,
+            };
+
+            let peer_pub_key = match iroh::PublicKey::from_bytes(&node_id.0) {
+                Ok(pk) => pk,
+                Err(e) => {
+                    tracing::debug!(peer = %peer_record.identity, error = %e, "system_state_backup: invalid node_id");
+                    continue;
+                }
+            };
+            let peer_addr = iroh::EndpointAddr::new(peer_pub_key);
+
+            let msg = DirectMessage {
+                v: syncback_core::constants::PROTOCOL_VERSION,
+                body: DirectBody::SystemStateBackup(SystemStateBackupMsg {
+                    blob: blob.clone(),
+                    created_at: now.0,
+                }),
+            };
+
+            let result = self
+                .net_cmd_tx
+                .send(NetCommand::SendMessage {
+                    peer_identity: peer_record.identity,
+                    peer_addr,
+                    message: msg,
+                })
+                .await;
+
+            if result.is_err() {
+                tracing::debug!("system_state_backup: net channel closed");
+                break;
+            }
+            sent_count += 1;
+        }
+
+        tracing::info!(
+            sent = sent_count,
+            blob_bytes = blob_bytes,
+            "system_state_backup: sent to peers"
+        );
+    }
+
+    /// Holder-side: receive and store a system state blob pushed by an owner.
+    async fn handle_system_state_backup_received(
+        &mut self,
+        from: IdentityPub,
+        msg: SystemStateBackupMsg,
+    ) {
+        // 1. Validate.
+        if msg.blob.is_empty() || msg.created_at == 0 {
+            tracing::debug!(peer = %from, "system_state_backup_received: invalid (empty blob or zero created_at)");
+            self.send_system_state_ack(from, false).await;
+            return;
+        }
+
+        // 2. Only accept from known peers.
+        match self.db.get_peer(&from).expect("get_peer failed") {
+            Some(_) => {}
+            None => {
+                tracing::debug!(peer = %from, "system_state_backup_received: unknown peer, rejecting");
+                self.send_system_state_ack(from, false).await;
+                return;
+            }
+        }
+
+        // 3. Store (overwrites any previous blob for this owner).
+        let now = Timestamp::now();
+        let record = syncback_core::types::SystemStateBlobRecord {
+            blob: msg.blob,
+            created_at: Timestamp(msg.created_at),
+            received_at: now,
+        };
+
+        self.db
+            .store_system_state_blob(&from, &record)
+            .expect("store_system_state_blob: db error is fatal");
+
+        tracing::info!(
+            peer = %from,
+            bytes = record.blob.len(),
+            "system_state_backup_received: stored blob"
+        );
+
+        // 4. Send ack.
+        self.send_system_state_ack(from, true).await;
+    }
+
+    /// Holder-side: respond to a system state request from the owner.
+    async fn handle_system_state_request(&self, from: IdentityPub, msg: SystemStateRequestMsg) {
+        // 1. Verify requester matches the handshake identity.
+        if msg.requester != from {
+            tracing::debug!(
+                peer = %from,
+                requested = %msg.requester,
+                "system_state_request: requester mismatch, ignoring"
+            );
+            return;
+        }
+
+        // 2. Look up blob.
+        let response_msg = match self
+            .db
+            .get_system_state_blob(&msg.requester)
+            .expect("get_system_state_blob: db error is fatal")
+        {
+            Some(record) => SystemStateResponseMsg {
+                blob: record.blob,
+                created_at: record.created_at.0,
+            },
+            None => SystemStateResponseMsg {
+                blob: vec![],
+                created_at: 0,
+            },
+        };
+
+        let found = !response_msg.blob.is_empty();
+
+        // 3. Send response via SendDirect.
+        let dm = DirectMessage {
+            v: syncback_core::constants::PROTOCOL_VERSION,
+            body: DirectBody::SystemStateResponse(response_msg),
+        };
+        let framed = frame_message(&dm).expect("SystemStateResponse frames cleanly");
+        self.net_cmd_tx
+            .send(NetCommand::SendDirect {
+                peer: from,
+                payload: framed,
+            })
+            .await
+            .expect("net channel closed");
+
+        tracing::debug!(peer = %from, found = found, "system_state_request: responded");
+    }
+
+    /// Owner-side (DR boot): receive the system state blob from a holder, decrypt, restore DB.
+    async fn handle_system_state_response(&mut self, from: IdentityPub, msg: SystemStateResponseMsg) {
+        let cli_reply = match self.pending_dr_cli_reply.take() {
+            Some(r) => r,
+            None => {
+                tracing::debug!(peer = %from, "system_state_response: unexpected, no pending DR, ignoring");
+                return;
+            }
+        };
+
+        if msg.blob.is_empty() {
+            let _ = cli_reply.send(Err(format!(
+                "peer {from} does not have a system state backup for this identity"
+            )));
+            return;
+        }
+
+        // Decrypt and deserialize.
+        let state =
+            match crate::daemon::system_state::unpack_system_state(&msg.blob, &self.identity_key_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = cli_reply.send(Err(format!("failed to unpack system state: {e}")));
+                    return;
+                }
+            };
+
+        // Populate DB. Use force variant since the DR connection may have already
+        // registered the holder as a peer in the local DB.
+        if let Err(e) = crate::daemon::system_state::restore_db_force(&self.db, &state) {
+            let _ = cli_reply.send(Err(format!("failed to restore DB: {e}")));
+            return;
+        }
+
+        tracing::info!(
+            peer = %from,
+            files = state.files.len(),
+            shards = state.shards.len(),
+            peers = state.peers.len(),
+            "DR restore: DB populated from system state"
+        );
+
+        let _ = cli_reply.send(Ok(()));
+    }
+
+    /// Owner-side: receive ack from holder that it stored/rejected the backup.
+    async fn handle_system_state_ack(&self, from: IdentityPub, msg: SystemStateAckMsg) {
+        if msg.stored {
+            tracing::info!(peer = %from, "system_state_ack: holder stored backup");
+        } else {
+            tracing::info!(peer = %from, "system_state_ack: holder rejected backup");
+        }
+    }
+
+    /// Helper: send a SystemStateAck to a peer via SendDirect.
+    async fn send_system_state_ack(&self, to: IdentityPub, stored: bool) {
+        let dm = DirectMessage {
+            v: syncback_core::constants::PROTOCOL_VERSION,
+            body: DirectBody::SystemStateAck(SystemStateAckMsg { stored }),
+        };
+        let framed = frame_message(&dm).expect("SystemStateAck frames cleanly");
+        let _ = self
+            .net_cmd_tx
+            .send(NetCommand::SendDirect {
+                peer: to,
+                payload: framed,
+            })
+            .await;
+    }
+}
+
+// ============================================================
+// DR boot handlers
+// ============================================================
+
+impl Processor {
+    /// CLI handler for CliCmd::DrRestore.
+    /// Verifies seed phrase matches daemon identity, then initiates connection to peer.
+    async fn handle_dr_restore(
+        &mut self,
+        seed_phrase: Vec<String>,
+        peer_addr: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        // Step 1: Verify seed phrase matches our identity.
+        let derived_identity = match derive_identity_from_seed(&seed_phrase) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = reply.send(Err(format!("invalid seed phrase: {e}")));
+                return;
+            }
+        };
+        if derived_identity != self.identity_pub {
+            let _ = reply.send(Err(
+                "seed phrase does not match daemon identity. \
+                 Re-run 'syncback init' with your seed phrase first."
+                    .to_string(),
+            ));
+            return;
+        }
+
+        // Step 2: Connect to the peer (fire and forget — PeerConnected event follows).
+        let result = self
+            .net_cmd_tx
+            .send(NetCommand::ConnectAddr {
+                node_addr: peer_addr.clone(),
+            })
+            .await;
+        if result.is_err() {
+            let _ = reply.send(Err("network channel closed".to_string()));
+            return;
+        }
+
+        // Step 3: Set pending state so handle_peer_connected_for_dr sends the request.
+        self.pending_dr_peer_addr = Some(peer_addr);
+        self.pending_dr_cli_reply = Some(reply);
+    }
+
+    /// Called from handle_peer_connected. If a DR restore is pending, sends the request.
+    async fn handle_peer_connected_for_dr(&mut self, peer_identity: IdentityPub) {
+        // Clean up stale reply if CLI timed out (sender closed).
+        if let Some(ref reply) = self.pending_dr_cli_reply {
+            if reply.is_closed() {
+                self.pending_dr_peer_addr = None;
+                self.pending_dr_cli_reply = None;
+                return;
+            }
+        }
+
+        if self.pending_dr_peer_addr.take().is_none() {
+            return; // Not a DR connect.
+        }
+
+        // Send SystemStateRequest.
+        let msg = DirectMessage {
+            v: syncback_core::constants::PROTOCOL_VERSION,
+            body: DirectBody::SystemStateRequest(SystemStateRequestMsg {
+                requester: self.identity_pub,
+            }),
+        };
+        let framed = frame_message(&msg).expect("SystemStateRequest frames cleanly");
+        let _ = self
+            .net_cmd_tx
+            .try_send(NetCommand::SendDirect {
+                peer: peer_identity,
+                payload: framed,
+            });
+
+        tracing::debug!(peer = %peer_identity, "DR restore: SystemStateRequest sent");
+        // pending_dr_cli_reply stays set until SystemStateResponse arrives.
+    }
+}
+
+// ============================================================
+// Helper: derive identity from BIP39 seed phrase
+// ============================================================
+
+fn derive_identity_from_seed(words: &[String]) -> Result<IdentityPub, String> {
+    let phrase = words.join(" ");
+    let mnemonic =
+        bip39::Mnemonic::parse(&phrase).map_err(|e| format!("invalid mnemonic: {e}"))?;
+    let seed_bytes = mnemonic.to_seed("");
+    let (signing_key, _iroh_priv) = crate::cli::init::derive_keys(&seed_bytes);
+    let pub_bytes: [u8; 32] = signing_key.verifying_key().to_bytes();
+    Ok(IdentityPub(pub_bytes))
+}
+
+// ============================================================
 // DirtyEvent handler
 // ============================================================
 
@@ -1074,7 +1466,7 @@ impl Processor {
     }
 
     async fn handle_peer_connected(
-        &self,
+        &mut self,
         peer: IdentityPub,
         node_id: syncback_core::types::NodeId,
     ) {
@@ -1102,6 +1494,9 @@ impl Processor {
                 }
             }
         }
+
+        // If this connection was initiated for DR restore, send the request.
+        self.handle_peer_connected_for_dr(peer).await;
     }
 
     async fn handle_direct_message(&mut self, from: IdentityPub, message: syncback_core::messages::DirectMessage) {
@@ -1139,6 +1534,18 @@ impl Processor {
                     "shard data received inline"
                 );
                 self.on_shard_data_received(shard_data.shard_id, shard_data.data).await;
+            }
+            DirectBody::SystemStateBackup(msg) => {
+                self.handle_system_state_backup_received(from, msg).await;
+            }
+            DirectBody::SystemStateRequest(msg) => {
+                self.handle_system_state_request(from, msg).await;
+            }
+            DirectBody::SystemStateResponse(msg) => {
+                self.handle_system_state_response(from, msg).await;
+            }
+            DirectBody::SystemStateAck(msg) => {
+                self.handle_system_state_ack(from, msg).await;
             }
         }
     }

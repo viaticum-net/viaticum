@@ -8,7 +8,7 @@ pub(crate) mod repair;
 mod scheduler;
 pub(crate) mod shard_manager;
 pub mod storage;
-pub(crate) mod system_state;
+pub mod system_state;
 mod watcher;
 
 #[cfg(test)]
@@ -128,6 +128,8 @@ pub enum ScheduledCmd {
     PosRound,
     Vacuum,
     RepairCheck,
+    /// Triggered after WeeklySync (and weekly by scheduler as safety net).
+    SystemStateBackup,
 }
 
 #[derive(Debug)]
@@ -150,6 +152,14 @@ pub enum CliCmd {
     /// Connect to a peer by node address string (JSON-encoded EndpointAddr).
     ConnectPeer {
         node_addr: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Disaster recovery: retrieve system state from a known peer and populate local DB.
+    DrRestore {
+        /// 24 BIP39 words (already parsed and validated by cli_server).
+        seed_phrase: Vec<String>,
+        /// JSON-encoded iroh EndpointAddr of a peer that holds the system state.
+        peer_addr: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
 }

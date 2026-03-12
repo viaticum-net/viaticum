@@ -829,6 +829,10 @@ impl VariantName for DirectBody {
             DirectBody::RestoreDenied(_) => "RestoreDenied",
             DirectBody::BlobReady(_) => "BlobReady",
             DirectBody::ShardData(_) => "ShardData",
+            DirectBody::SystemStateBackup(_) => "SystemStateBackup",
+            DirectBody::SystemStateAck(_) => "SystemStateAck",
+            DirectBody::SystemStateRequest(_) => "SystemStateRequest",
+            DirectBody::SystemStateResponse(_) => "SystemStateResponse",
         }
     }
 }
