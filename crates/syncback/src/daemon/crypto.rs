@@ -97,17 +97,23 @@ pub(crate) fn decrypt_ciphertext(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>,
 
 /// Encode `ciphertext` into n shards using Reed-Solomon (k data, n-k parity).
 ///
-/// Returns exactly n shards, each of equal size (padded if needed).
+/// Prepends an 8-byte LE length prefix so that `rs_decode` can strip padding.
+/// Returns exactly n shards, each of equal size.
 pub(crate) fn rs_encode(ciphertext: &[u8], k: usize, n: usize) -> Result<Vec<Vec<u8>>, CryptoError> {
     let r = ReedSolomon::new(k, n - k)
         .map_err(|e| CryptoError::ReedSolomon(e.to_string()))?;
 
-    let shard_size = ciphertext.len().div_ceil(k);
-    let padded_len = shard_size * k;
-    let mut padded = ciphertext.to_vec();
-    padded.resize(padded_len, 0u8);
+    // Prefix with 8-byte LE length so rs_decode can strip zero padding.
+    let orig_len = ciphertext.len() as u64;
+    let mut data = Vec::with_capacity(8 + ciphertext.len());
+    data.extend_from_slice(&orig_len.to_le_bytes());
+    data.extend_from_slice(ciphertext);
 
-    let mut shards: Vec<Vec<u8>> = padded.chunks(shard_size).map(|s| s.to_vec()).collect();
+    let shard_size = data.len().div_ceil(k);
+    let padded_len = shard_size * k;
+    data.resize(padded_len, 0u8);
+
+    let mut shards: Vec<Vec<u8>> = data.chunks(shard_size).map(|s| s.to_vec()).collect();
     for _ in 0..(n - k) {
         shards.push(vec![0u8; shard_size]);
     }
@@ -121,7 +127,7 @@ pub(crate) fn rs_encode(ciphertext: &[u8], k: usize, n: usize) -> Result<Vec<Vec
 /// Decode shards back to ciphertext using Reed-Solomon reconstruction.
 ///
 /// `shard_blobs`: exactly n entries, None for lost shards.
-/// At least k must be Some. Returns the concatenated k data shards (original ciphertext, padded).
+/// At least k must be Some. Strips the length prefix and zero padding added by `rs_encode`.
 pub(crate) fn rs_decode(
     mut shard_blobs: Vec<Option<Vec<u8>>>,
     k: usize,
@@ -146,10 +152,20 @@ pub(crate) fn rs_decode(
         .map_err(|e| CryptoError::ReedSolomon(e.to_string()))?;
 
     // Concatenate only the k data shards.
-    let mut ciphertext = Vec::with_capacity(shard_size * k);
+    let mut data = Vec::with_capacity(shard_size * k);
     for shard in shard_blobs.into_iter().take(k) {
-        ciphertext
-            .extend_from_slice(&shard.expect("reconstruct filled all missing data shards"));
+        data.extend_from_slice(&shard.expect("reconstruct filled all missing data shards"));
     }
-    Ok(ciphertext)
+
+    // Read the 8-byte LE length prefix and truncate to original ciphertext length.
+    if data.len() < 8 {
+        return Err(CryptoError::ReedSolomon("decoded data too short for length prefix".into()));
+    }
+    let orig_len = u64::from_le_bytes(
+        data[..8].try_into().expect("slice is exactly 8 bytes"),
+    ) as usize;
+    if orig_len + 8 > data.len() {
+        return Err(CryptoError::ReedSolomon("length prefix exceeds decoded data".into()));
+    }
+    Ok(data[8..8 + orig_len].to_vec())
 }

@@ -127,9 +127,14 @@ pub const WEEKLY_STATS_WINDOW: u32 = 4;
 
 // === Wire format ===
 
-/// Max CBOR message frame size (4 MiB).
-/// Increased from 64 KiB to accommodate inline shard blob transfers (ShardData).
-pub const MAX_MESSAGE_SIZE: u32 = 4 * 1024 * 1024;
+/// Max CBOR message frame size (64 MiB).
+///
+/// Must accommodate:
+///   - Inline shard transfer: 32 MB unit / 5 shards = 6.4 MB per shard
+///   - System state backup: plain-copy files, largest expected ~13 MB compressed
+///
+/// DoS protection: legitimate messages never approach this ceiling.
+pub const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 
 /// ALPN protocol identifier for direct QUIC connections.
 pub const ALPN: &[u8] = b"syncback/1";

@@ -26,11 +26,18 @@ mod tests;
 // Constants
 // ============================================================
 
-/// Default unit size: 256 MiB. Files smaller than this are packed together;
+/// Default unit size: 32 MiB. Files smaller than this are packed together;
 /// files >= this are split into chunks.
-pub const DEFAULT_UNIT_SIZE_BYTES: u64 = 256 * 1024 * 1024;
+///
+/// Reduced from 256 MiB in Phase 4. At 32 MiB units with 5-of-15 erasure,
+/// each shard is 32 MB / 5 ≈ 6.4 MB (well under MAX_MESSAGE_SIZE = 64 MB).
+/// Peak RAM for one unit: ~160 MB vs ~1.3 GB at 256 MiB.
+pub const DEFAULT_UNIT_SIZE_BYTES: u64 = 32 * 1024 * 1024;
 
 const STALE_RATIO_THRESHOLD: f64 = 0.5;
+
+/// zstd compression level for unit plaintext. Level 3 = library default.
+const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
 // ============================================================
 // Public types
@@ -143,6 +150,9 @@ pub enum PackerError {
 
     #[error("importance too low to back up (< 0.1): {0}")]
     ImportanceTooLow(f64),
+
+    #[error("zstd compression error: {0}")]
+    Compression(String),
 
     #[error("db error: {0}")]
     Db(#[from] syncback_core::db::DbError),
@@ -333,6 +343,10 @@ impl Packer {
             plaintext.extend_from_slice(content);
         }
 
+        // 3b. Compress the plaintext.
+        let plaintext = zstd::encode_all(plaintext.as_slice(), ZSTD_COMPRESSION_LEVEL)
+            .map_err(|e| PackerError::Compression(e.to_string()))?;
+
         // 4. Derive UnitId.
         let unit_id = self.next_pack_unit_id();
 
@@ -422,6 +436,8 @@ impl Packer {
                 break;
             }
             let chunk_bytes = buf[..bytes_read].to_vec();
+            let chunk_bytes = zstd::encode_all(chunk_bytes.as_slice(), ZSTD_COMPRESSION_LEVEL)
+                .map_err(|e| PackerError::Compression(e.to_string()))?;
 
             // Derive UnitId from content_hash + chunk_index (stable across identical content).
             let unit_id = derive_chunk_unit_id(&file.content_hash, chunk_index);
@@ -471,7 +487,8 @@ impl Packer {
 
         // Edge case: empty file → produce one empty chunk.
         if results.is_empty() {
-            let chunk_bytes = Vec::new();
+            let chunk_bytes = zstd::encode_all([].as_slice(), ZSTD_COMPRESSION_LEVEL)
+                .map_err(|e| PackerError::Compression(e.to_string()))?;
             let unit_id = derive_chunk_unit_id(&file.content_hash, 0);
             let shard_preview = self.compute_shard_preview(unit_id, &chunk_bytes, k, n);
             let plaintext_hash = *blake3::hash(&chunk_bytes).as_bytes();
@@ -482,7 +499,7 @@ impl Packer {
                 member_file_ids: vec![file.file_id],
                 chunk_index: Some(0),
                 parent_file_id: Some(file.file_id),
-                size_bytes: 0,
+                size_bytes: chunk_bytes.len() as u64,
                 plaintext_hash,
                 created_at: now,
                 importance_avg: importance,
@@ -521,9 +538,11 @@ impl Packer {
         k: usize,
         n: usize,
     ) -> Result<Vec<Vec<u8>>, PackerError> {
+        let compressed = zstd::encode_all(plaintext, ZSTD_COMPRESSION_LEVEL)
+            .map_err(|e| PackerError::Compression(e.to_string()))?;
         let ikm: [u8; 32] = self.identity_key.to_bytes();
         let enc_key = crypto::derive_unit_key(&ikm, unit_id);
-        let ciphertext = crypto::encrypt_plaintext(&enc_key, plaintext)?;
+        let ciphertext = crypto::encrypt_plaintext(&enc_key, &compressed)?;
         let shards = crypto::rs_encode(&ciphertext, k, n)?;
         Ok(shards)
     }
@@ -550,6 +569,10 @@ impl Packer {
         let ikm: [u8; 32] = self.identity_key.to_bytes();
         let enc_key = crypto::derive_unit_key(&ikm, unit_id);
         let plaintext = crypto::decrypt_ciphertext(&enc_key, &ciphertext)?;
+
+        // 2b. Decompress.
+        let plaintext = zstd::decode_all(plaintext.as_slice())
+            .map_err(|e| PackerError::Compression(e.to_string()))?;
 
         // 3. Unpack based on unit type.
         match unit_type {

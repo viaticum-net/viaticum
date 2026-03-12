@@ -324,7 +324,12 @@ async fn run_full_backup_restore() -> anyhow::Result<()> {
     let n = pack_result.unit_record.rs_n as usize;
 
     // Encrypt + erasure-code to get the shard blobs.
-    let shard_blobs = packer.plaintext_to_shards(unit_id, &pack_result.plaintext, k, n)
+    // pack_result.plaintext holds zstd-compressed bytes; plaintext_to_shards expects
+    // uncompressed input (it compresses before encrypting). Decompress first so the
+    // round-trip through unpack_unit works correctly.
+    let uncompressed_plaintext = zstd::decode_all(pack_result.plaintext.as_slice())
+        .map_err(|e| anyhow::anyhow!("zstd decompress failed: {e}"))?;
+    let shard_blobs = packer.plaintext_to_shards(unit_id, &uncompressed_plaintext, k, n)
         .map_err(|e| anyhow::anyhow!("plaintext_to_shards failed: {e}"))?;
     anyhow::ensure!(shard_blobs.len() == n, "expected {n} shards, got {}", shard_blobs.len());
 

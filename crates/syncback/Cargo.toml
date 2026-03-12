@@ -41,7 +41,9 @@ notify = "6"
 notify-debouncer-mini = "0.4"
 glob = "0.3"
 walkdir = "2"
+zstd = "0.13"
 
 [dev-dependencies]
 tempfile = { workspace = true }
 syncback-core = { workspace = true, features = ["testutil"] }
+zstd = "0.13"

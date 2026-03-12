@@ -87,9 +87,8 @@ fn frame_and_parse_roundtrip_for_handshake() {
 
 #[test]
 fn frame_rejects_message_over_max_size() {
-    // Test parse_framed with a length prefix that exceeds MAX_MESSAGE_SIZE (4 MiB).
-    // MAX_MESSAGE_SIZE was raised from 64 KiB to 4 MiB to support inline ShardData.
-    let big_len: u32 = 4 * 1024 * 1024 + 1; // > MAX_MESSAGE_SIZE (4 MiB)
+    // Test parse_framed with a length prefix that exceeds MAX_MESSAGE_SIZE (64 MiB).
+    let big_len: u32 = 64 * 1024 * 1024 + 1; // > MAX_MESSAGE_SIZE (64 MiB)
     let mut buf = Vec::new();
     buf.extend_from_slice(&big_len.to_be_bytes());
     // Don't allocate big_len bytes — parse_framed checks the prefix before reading body.

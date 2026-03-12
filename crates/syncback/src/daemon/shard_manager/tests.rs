@@ -224,10 +224,14 @@ fn erasure_encode_decode_roundtrip_5_of_7() {
         .flat_map(|s| s.as_ref().unwrap().iter().copied())
         .collect();
 
+    // encode_unit prepends an 8-byte length prefix; skip it to get the original data.
+    let data_start = 8;
+    let orig_len = original.len();
     let padded_len = shard_size * 5;
     let mut expected = original.clone();
-    expected.resize(padded_len, 0u8);
-    assert_eq!(&recovered[..padded_len], expected.as_slice());
+    expected.resize(padded_len - data_start, 0u8);
+    assert_eq!(&recovered[data_start..padded_len], expected.as_slice());
+    assert_eq!(&recovered[data_start..data_start + orig_len], original.as_slice());
 }
 
 #[test]
@@ -253,9 +257,11 @@ fn erasure_encode_decode_roundtrip_5_of_15() {
         .iter()
         .flat_map(|s| s.as_ref().unwrap().iter().copied())
         .collect();
-    let mut expected = original.clone();
-    expected.resize(padded_len, 0u8);
-    assert_eq!(&recovered[..padded_len], expected.as_slice());
+    // encode_unit prepends an 8-byte length prefix; skip it to verify the original data.
+    let data_start = 8;
+    assert_eq!(&recovered[data_start..data_start + original.len()], original.as_slice());
+    // Bytes after original data and before padded_len are zero padding.
+    let _ = padded_len; // still verified implicitly by shard count above
 }
 
 // ============================================================

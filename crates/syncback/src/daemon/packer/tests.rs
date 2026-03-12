@@ -161,8 +161,8 @@ fn pack_unit_single_small_file() {
     assert_eq!(result.unit_record.unit_type, UnitType::Pack);
     assert_eq!(result.unit_record.member_file_ids, vec![FileId(1)]);
     assert!((result.unit_record.importance_avg - 0.9).abs() < 1e-9);
-    // Plaintext has 4-byte prefix + index bytes + file bytes.
-    assert!(result.plaintext.len() > content.len());
+    // After compression the size is not predictable for small inputs.
+    assert!(!result.plaintext.is_empty());
     assert_eq!(result.file_records.len(), 1);
     assert_eq!(result.file_records[0].file_id, FileId(1));
     assert!((result.importance - 0.9).abs() < 1e-9);
@@ -187,8 +187,9 @@ fn pack_unit_multiple_files_index_round_trip() {
     let now = test_timestamp();
     let result = packer.pack_unit(&files, 0.5, now).unwrap();
 
-    // Round-trip: unpack the plaintext.
-    let unpacked = unpack_pack_plaintext(&result.plaintext).unwrap();
+    // Round-trip: decompress then unpack the plaintext.
+    let decompressed = zstd::decode_all(result.plaintext.as_slice()).unwrap();
+    let unpacked = unpack_pack_plaintext(&decompressed).unwrap();
     assert_eq!(unpacked.len(), 3);
     for (i, uf) in unpacked.iter().enumerate() {
         assert_eq!(uf.bytes, contents[i]);
@@ -238,7 +239,7 @@ fn chunk_file_exact_unit_size_produces_one_chunk() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].unit_record.unit_type, UnitType::Chunk);
     assert_eq!(results[0].unit_record.chunk_index, Some(0));
-    assert_eq!(results[0].plaintext.len(), unit_size as usize);
+    assert!(!results[0].plaintext.is_empty());
     assert_eq!(results[0].unit_record.parent_file_id, Some(FileId(1)));
     let ci = results[0].chunk_info.as_ref().unwrap();
     assert_eq!(ci.chunk_index, 0);
@@ -262,11 +263,9 @@ fn chunk_file_splits_large_file() {
     for (i, r) in results.iter().enumerate() {
         assert_eq!(r.unit_record.unit_type, UnitType::Chunk);
         assert_eq!(r.unit_record.chunk_index, Some(i as u32));
+        // After compression, sizes are not predictable but plaintext must be non-empty.
+        assert!(!r.plaintext.is_empty());
     }
-    assert_eq!(results[0].plaintext.len(), unit_size as usize);
-    assert_eq!(results[1].plaintext.len(), unit_size as usize);
-    assert_eq!(results[2].plaintext.len(), unit_size as usize);
-    assert_eq!(results[3].plaintext.len(), 512); // remainder
 }
 
 #[test]
@@ -536,10 +535,9 @@ fn pack_batch_chunks_large_file() {
     assert_eq!(results.len(), 3);
     for r in &results {
         assert_eq!(r.unit_record.unit_type, UnitType::Chunk);
+        // After compression, sizes are not predictable but plaintext must be non-empty.
+        assert!(!r.plaintext.is_empty());
     }
-    assert_eq!(results[0].plaintext.len(), unit_size as usize);
-    assert_eq!(results[1].plaintext.len(), unit_size as usize);
-    assert_eq!(results[2].plaintext.len(), unit_size as usize / 2); // 512 bytes
 }
 
 #[test]
@@ -572,4 +570,105 @@ fn pack_batch_missing_file_skips_gracefully() {
     // Should not panic; skips the missing file.
     let results = packer.pack_batch(&candidates, test_timestamp());
     assert!(results.is_empty());
+}
+
+// ============================================================
+// zstd compression tests
+// ============================================================
+
+#[test]
+fn zstd_compress_decompress_roundtrip_text() {
+    let input: Vec<u8> = b"Hello SyncBack backup system! "
+        .iter()
+        .cloned()
+        .cycle()
+        .take(1000)
+        .collect();
+    let compressed = zstd::encode_all(input.as_slice(), 3).unwrap();
+    let decompressed = zstd::decode_all(compressed.as_slice()).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn zstd_compress_decompress_roundtrip_incompressible() {
+    let input: Vec<u8> = (0..10_000u32)
+        .map(|i| (i.wrapping_mul(17).wrapping_add(3)) as u8)
+        .collect();
+    let compressed = zstd::encode_all(input.as_slice(), 3).unwrap();
+    let decompressed = zstd::decode_all(compressed.as_slice()).unwrap();
+    assert_eq!(decompressed, input);
+    // Compressed size may exceed input for random data — this is acceptable.
+    // Just verify we can round-trip.
+}
+
+#[test]
+fn zstd_text_data_compresses_smaller() {
+    let template = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit. ";
+    let input: Vec<u8> = template.iter().cloned().cycle().take(50_000).collect();
+    let compressed = zstd::encode_all(input.as_slice(), 3).unwrap();
+    assert!(
+        compressed.len() < input.len(),
+        "expected compression for text: {} -> {} bytes",
+        input.len(),
+        compressed.len()
+    );
+}
+
+#[test]
+fn pack_unit_roundtrip_with_text_content() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let content = b"The quick brown fox jumps over the lazy dog. "
+        .iter()
+        .cloned()
+        .cycle()
+        .take(5_000)
+        .collect::<Vec<u8>>();
+    let file = make_file_record(&dir, "text.txt", &content, 1, 0.9);
+
+    let packer = make_packer();
+    let result = packer.pack_unit(&[file.clone()], 0.9, test_timestamp()).unwrap();
+
+    let unit_id = result.unit_record.unit_id;
+    let (blobs, k, n) = shards_from_pack_result(&packer, &result);
+
+    let unpacked = packer
+        .unpack_unit(unit_id, UnitType::Pack, blobs, k, n)
+        .unwrap();
+    assert_eq!(unpacked.files.len(), 1);
+    assert_eq!(unpacked.files[0].bytes, content.as_slice());
+}
+
+#[test]
+fn chunk_file_roundtrip_with_compression() {
+    let unit_size: u64 = 1024;
+    let dir = tempfile::TempDir::new().unwrap();
+    let content: Vec<u8> = (0..unit_size as usize).map(|i| (i % 26) as u8 + b'a').collect();
+    let file = make_file_record(&dir, "chunk_text.bin", &content, 1, 0.9);
+
+    let packer = make_packer_with_unit_size(unit_size);
+    let results = packer.chunk_file(&file, test_timestamp()).unwrap();
+    assert_eq!(results.len(), 1);
+
+    let result = &results[0];
+    let unit_id = result.unit_record.unit_id;
+    let (blobs, k, n) = shards_from_pack_result(&packer, result);
+
+    let unpacked = packer
+        .unpack_unit(unit_id, UnitType::Chunk, blobs, k, n)
+        .unwrap();
+    assert_eq!(unpacked.files.len(), 1);
+    assert!(unpacked.files[0].path.is_none());
+    assert_eq!(unpacked.files[0].bytes, content);
+}
+
+#[test]
+fn max_message_size_accommodates_largest_shard() {
+    use syncback_core::constants::{ERASURE_K, MAX_MESSAGE_SIZE};
+    // Worst-case: 32 MiB unit, before compression (incompressible data), k=5.
+    // Shard size = unit_size / k (data shards only). Plus encryption overhead (12 + 16 bytes).
+    let max_shard_bytes = DEFAULT_UNIT_SIZE_BYTES / ERASURE_K as u64 + 28;
+    assert!(
+        max_shard_bytes < MAX_MESSAGE_SIZE as u64,
+        "shard size {max_shard_bytes} exceeds MAX_MESSAGE_SIZE {MAX_MESSAGE_SIZE}"
+    );
 }
