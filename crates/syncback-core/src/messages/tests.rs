@@ -16,8 +16,8 @@ fn make_x25519_keypair(seed: u8) -> ([u8; 32], [u8; 32]) {
     (priv_bytes, pub_bytes)
 }
 
-fn make_shard_descriptor_unsigned(seed: u8) -> ShardDescriptorUnsigned {
-    ShardDescriptorUnsigned {
+fn make_shard_descriptor_unsigned(seed: u8) -> SignedShardDescriptorUnsigned {
+    SignedShardDescriptorUnsigned {
         shard_id: ShardId([seed; 32]),
         unit_id: UnitId([seed.wrapping_add(1); 32]),
         shard_index: 0,
@@ -80,7 +80,7 @@ fn handshake_check_freshness_fails_outside_window() {
 fn shard_descriptor_sign_and_verify() {
     let key = make_signing_key(3);
     let unsigned = make_shard_descriptor_unsigned(3);
-    let descriptor = ShardDescriptor::sign(unsigned, &key).unwrap();
+    let descriptor = SignedShardDescriptor::sign(unsigned, &key).unwrap();
     descriptor.verify_sig().unwrap();
 }
 
@@ -89,7 +89,7 @@ fn shard_descriptor_sign_and_verify() {
 fn shard_descriptor_verify_sig_fails_on_tamper() {
     let key = make_signing_key(3);
     let unsigned = make_shard_descriptor_unsigned(3);
-    let mut descriptor = ShardDescriptor::sign(unsigned, &key).unwrap();
+    let mut descriptor = SignedShardDescriptor::sign(unsigned, &key).unwrap();
     descriptor.importance = 0.1f32;
     let result = descriptor.verify_sig();
     assert!(matches!(result, Err(MessageError::InvalidSignature)));
@@ -101,7 +101,7 @@ fn shard_descriptor_verify_blob_passes() {
     let key = make_signing_key(4);
     let blob: Vec<u8> = (0u8..100).collect();
     let shard_id = ShardId(*blake3::hash(&blob).as_bytes());
-    let unsigned = ShardDescriptorUnsigned {
+    let unsigned = SignedShardDescriptorUnsigned {
         shard_id,
         unit_id: UnitId([0u8; 32]),
         shard_index: 0,
@@ -113,7 +113,7 @@ fn shard_descriptor_verify_blob_passes() {
         file_type: FileType::User,
         created_at: 0,
     };
-    let descriptor = ShardDescriptor::sign(unsigned, &key).unwrap();
+    let descriptor = SignedShardDescriptor::sign(unsigned, &key).unwrap();
     descriptor.verify_blob(&blob).unwrap();
 }
 
@@ -122,7 +122,7 @@ fn shard_descriptor_verify_blob_passes() {
 fn shard_descriptor_verify_blob_fails_on_mismatch() {
     let key = make_signing_key(4);
     let unsigned = make_shard_descriptor_unsigned(4);
-    let descriptor = ShardDescriptor::sign(unsigned, &key).unwrap();
+    let descriptor = SignedShardDescriptor::sign(unsigned, &key).unwrap();
     let result = descriptor.verify_blob(b"wrong content");
     assert!(matches!(result, Err(MessageError::BlobHashMismatch)));
 }
@@ -286,7 +286,7 @@ fn msg_id_to_hex_is_64_chars() {
 fn shard_offer_msg_cbor_roundtrip() {
     let key = make_signing_key(11);
     let unsigned = make_shard_descriptor_unsigned(11);
-    let descriptor = ShardDescriptor::sign(unsigned, &key).unwrap();
+    let descriptor = SignedShardDescriptor::sign(unsigned, &key).unwrap();
     let msg = ShardOfferMsg {
         v: 1,
         descriptor,
@@ -429,7 +429,7 @@ fn board_entry_sign_verify_directed() {
     let author = make_identity(13);
     let target = make_identity(14);
     let unsigned = make_shard_descriptor_unsigned(13);
-    let descriptor = ShardDescriptor::sign(unsigned, &key).unwrap();
+    let descriptor = SignedShardDescriptor::sign(unsigned, &key).unwrap();
     let payload = to_cbor(&ShardOfferMsg {
         v: 1,
         descriptor,

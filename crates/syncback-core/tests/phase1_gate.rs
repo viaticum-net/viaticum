@@ -16,8 +16,8 @@ use syncback_core::{
     messages::{
         self, BoardEntry, BlobReadyMsg, CancelDeleteMsg, DeleteMsg, DirectBody, DirectMessage,
         EntryKind, FileType, HandshakeMsg, MsgId, PosChallengeMsg, PosResponseMsg, RejectReason,
-        RelayEntry, RestoreDeniedMsg, RestoreRequestMsg, ShardAcceptMsg, ShardDescriptor,
-        ShardDescriptorUnsigned, ShardDropNoticeMsg, ShardDroppedMsg, ShardOfferMsg,
+        RelayEntry, RestoreDeniedMsg, RestoreRequestMsg, ShardAcceptMsg, SignedShardDescriptor,
+        SignedShardDescriptorUnsigned, ShardDropNoticeMsg, ShardDroppedMsg, ShardOfferMsg,
         ShardRejectMsg, ShardStoredMsg, StorageWarningMsg, DenyReason,
         EncryptedPayload,
     },
@@ -338,7 +338,7 @@ fn message_roundtrip_shard_offer_accept_reject_stored() {
     let shard_id = test_shard_id(1);
     let unit_id = test_unit_id(1);
 
-    let unsigned = ShardDescriptorUnsigned {
+    let unsigned = SignedShardDescriptorUnsigned {
         shard_id,
         unit_id,
         shard_index: 0,
@@ -350,7 +350,7 @@ fn message_roundtrip_shard_offer_accept_reject_stored() {
         file_type: FileType::User,
         created_at: 1000u64,
     };
-    let descriptor = ShardDescriptor::sign(unsigned, &signing_key).unwrap();
+    let descriptor = SignedShardDescriptor::sign(unsigned, &signing_key).unwrap();
 
     // shard_offer
     let offer = ShardOfferMsg {
@@ -654,7 +654,7 @@ fn shard_descriptor_verify_blob() {
     let blob = b"fake shard blob content for testing";
     let shard_id = syncback_core::types::ShardId(*blake3::hash(blob).as_bytes());
 
-    let unsigned = ShardDescriptorUnsigned {
+    let unsigned = SignedShardDescriptorUnsigned {
         shard_id,
         unit_id: test_unit_id(1),
         shard_index: 0,
@@ -666,7 +666,7 @@ fn shard_descriptor_verify_blob() {
         file_type: FileType::User,
         created_at: 500u64,
     };
-    let descriptor = ShardDescriptor::sign(unsigned, &signing_key).unwrap();
+    let descriptor = SignedShardDescriptor::sign(unsigned, &signing_key).unwrap();
 
     // Correct blob verifies OK
     descriptor.verify_blob(blob).expect("blob hash must match shard_id");

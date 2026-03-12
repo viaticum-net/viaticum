@@ -1,4 +1,4 @@
-use syncback_core::messages::{FileType as MsgFileType, ShardDescriptor, ShardDescriptorUnsigned};
+use syncback_core::messages::{FileType as MsgFileType, SignedShardDescriptor, SignedShardDescriptorUnsigned};
 use syncback_core::testutil::{test_db, test_peer, test_unit_id};
 use syncback_core::trust::TrustEngine;
 use syncback_core::types::{
@@ -55,7 +55,7 @@ fn make_descriptor(
     signing_key: &ed25519_dalek::SigningKey,
     importance: f32,
     file_type: MsgFileType,
-) -> ShardDescriptor {
+) -> SignedShardDescriptor {
     let shard_id = ShardId(*blake3::hash(blob).as_bytes());
     let tree = build_merkle_tree(blob);
     let merkle_root = if tree.is_empty() {
@@ -64,7 +64,7 @@ fn make_descriptor(
         tree[tree.len() - 1]
     };
     let owner_pub = identity_from_key(signing_key);
-    let unsigned = ShardDescriptorUnsigned {
+    let unsigned = SignedShardDescriptorUnsigned {
         shard_id,
         unit_id: test_unit_id(1),
         shard_index: 0,
@@ -76,7 +76,7 @@ fn make_descriptor(
         file_type,
         created_at: 0,
     };
-    ShardDescriptor::sign(unsigned, signing_key).unwrap()
+    SignedShardDescriptor::sign(unsigned, signing_key).unwrap()
 }
 
 fn insert_peer(db: &syncback_core::db::Db, identity: IdentityPub) {
@@ -173,12 +173,9 @@ async fn answer_pos_challenge_correct_hash_and_proof() {
         .answer_pos_challenge(descriptor.shard_id, 1, &nonce)
         .unwrap();
 
-    // Verify block_data_hash
+    // Verify block_data_hash — plain leaf hash (no nonce)
     let block_bytes = &blob[BLOCK_SIZE..2 * BLOCK_SIZE];
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(block_bytes);
-    hasher.update(&nonce);
-    let expected_hash = *hasher.finalize().as_bytes();
+    let expected_hash = *blake3::hash(block_bytes).as_bytes();
     assert_eq!(answer.block_data_hash, expected_hash);
 
     // 3 blocks → padded to 4 leaves → proof length = log2(4) = 2

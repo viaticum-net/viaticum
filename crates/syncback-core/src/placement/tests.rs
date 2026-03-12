@@ -1,11 +1,11 @@
 use super::*;
 use crate::{
-    testutil::{test_db, test_peer, test_peers, test_shard_id, test_unit_id, week},
+    testutil::{test_db, test_peer, test_peers, test_unit_id, week},
     trust::{PosOutcome, TrustEngine},
     types::{ShardRecord, ShardStatus, Timestamp},
 };
 
-fn setup_peer_with_trust(engine: &TrustEngine, db: &crate::db::Db, peer: &IdentityPub, trust_val: f64) {
+fn setup_peer_with_trust(engine: &TrustEngine, _db: &crate::db::Db, peer: &IdentityPub, trust_val: f64) {
     // We use a known formula: trust = (KP*P + KI*I) * clamp(S, 0.1, 1.0)
     // With S=1.0 (neutral), to get combined ≈ trust_val we need:
     // (0.4*P + 1.75*I) * 1.0 = trust_val
@@ -257,7 +257,7 @@ fn subnet_diversity_limits_per_subnet_shards() {
 
     // 15 peers all with same /24 subnet
     let peers = test_peers(15);
-    for (i, p) in peers.iter().enumerate() {
+    for p in peers.iter() {
         setup_peer_with_trust(&trust, &db, p, 1.0);
         // Set subnet to [192, 168, 1]
         let mut record = db.get_peer(p).unwrap().unwrap();

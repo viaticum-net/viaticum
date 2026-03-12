@@ -11,7 +11,7 @@ use sha2::Sha256;
 use syncback_core::budget::BudgetPlanner;
 use syncback_core::db::Db;
 use syncback_core::messages::{
-    to_cbor, FileType as MsgFileType, MsgId, ShardDescriptor, ShardDescriptorUnsigned,
+    to_cbor, FileType as MsgFileType, MsgId, SignedShardDescriptor, SignedShardDescriptorUnsigned,
     ShardOfferMsg,
 };
 use syncback_core::placement::{PlacementEngine, PlacementError};
@@ -223,8 +223,8 @@ impl ShardManager {
             let root = merkle::merkle_root(&shard_bytes);
             let holder = assignment.holder;
 
-            // Build and sign ShardDescriptor.
-            let unsigned = ShardDescriptorUnsigned {
+            // Build and sign SignedShardDescriptor.
+            let unsigned = SignedShardDescriptorUnsigned {
                 shard_id,
                 unit_id,
                 shard_index: assignment.shard_index,
@@ -236,7 +236,7 @@ impl ShardManager {
                 file_type: convert_file_type(file_type),
                 created_at: now.0,
             };
-            let descriptor = ShardDescriptor::sign(unsigned, &self.identity_key)?;
+            let descriptor = SignedShardDescriptor::sign(unsigned, &self.identity_key)?;
             let offer_msg = ShardOfferMsg {
                 v: 1,
                 descriptor,
@@ -521,7 +521,7 @@ impl ShardManager {
             let root = merkle::merkle_root(&shard_bytes);
             let holder = assignment.holder;
 
-            let unsigned = ShardDescriptorUnsigned {
+            let unsigned = SignedShardDescriptorUnsigned {
                 shard_id,
                 unit_id,
                 shard_index: *missing_idx,
@@ -533,7 +533,7 @@ impl ShardManager {
                 file_type: convert_file_type(file_type),
                 created_at: now.0,
             };
-            let descriptor = ShardDescriptor::sign(unsigned, &self.identity_key)?;
+            let descriptor = SignedShardDescriptor::sign(unsigned, &self.identity_key)?;
             let offer_msg = ShardOfferMsg {
                 v: 1,
                 descriptor,

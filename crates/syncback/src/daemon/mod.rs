@@ -10,6 +10,9 @@ mod watcher;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod gate_tests;
+
 use std::path::PathBuf;
 
 use tokio::sync::mpsc;

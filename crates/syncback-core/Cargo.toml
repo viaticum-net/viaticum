@@ -29,3 +29,7 @@ tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[[test]]
+name = "phase1_gate"
+required-features = ["testutil"]

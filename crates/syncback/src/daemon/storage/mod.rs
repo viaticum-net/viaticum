@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use syncback_core::budget::{BudgetError, BudgetPlanner, DiskPressure, PressureResult};
 use syncback_core::db::{Db, DbError};
 use syncback_core::escrow::{EscrowChecker, EscrowDenial, EscrowError, RestoreDecision};
-use syncback_core::messages::{FileType as MsgFileType, MessageError, ShardDescriptor};
+use syncback_core::messages::{FileType as MsgFileType, MessageError, SignedShardDescriptor};
 use syncback_core::trust::TrustEngine;
 use syncback_core::types::{
     FileType, HoldingRecord, IdentityPub, ShardId, ShardState, Timestamp,
@@ -116,7 +116,7 @@ impl Storage {
 
     pub fn should_accept_offer(
         &self,
-        descriptor: &ShardDescriptor,
+        descriptor: &SignedShardDescriptor,
     ) -> Result<OfferDecision, StorageError> {
         let used_bytes = self.db.total_holding_bytes()?;
         let used_gb = used_bytes as f64 / 1_073_741_824.0;
@@ -133,7 +133,7 @@ impl Storage {
 
     pub async fn store_shard(
         &self,
-        descriptor: &ShardDescriptor,
+        descriptor: &SignedShardDescriptor,
         blob: &[u8],
     ) -> Result<(), StorageError> {
         // 1. Hash verify
@@ -226,7 +226,7 @@ impl Storage {
         &self,
         shard_id: ShardId,
         block_index: u32,
-        nonce: &[u8; 32],
+        _nonce: &[u8; 32],
     ) -> Result<PosAnswer, StorageError> {
         let path = shard_path(&self.shards_dir, &shard_id);
         if !path.exists() {
@@ -250,11 +250,10 @@ impl Storage {
         let block_end = (block_start + BLOCK_SIZE).min(blob.len());
         let block_bytes = &blob[block_start..block_end];
 
-        // hash = blake3(block_bytes || nonce)
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(block_bytes);
-        hasher.update(nonce);
-        let block_data_hash = *hasher.finalize().as_bytes();
+        // Plain leaf hash — matches the Merkle tree leaf (no nonce mixed in).
+        // Nonce is a challenge identifier for replay prevention at the protocol level,
+        // not part of the cryptographic proof.
+        let block_data_hash = *blake3::hash(block_bytes).as_bytes();
 
         // Build Merkle tree and extract proof
         let tree = build_merkle_tree(&blob);

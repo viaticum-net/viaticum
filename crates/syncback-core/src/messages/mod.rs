@@ -223,7 +223,7 @@ pub struct PosResponseMsg {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShardOfferMsg {
     pub v: u8,
-    pub descriptor: ShardDescriptor,
+    pub descriptor: SignedShardDescriptor,
     pub ts: u64,
 }
 
@@ -412,12 +412,12 @@ pub struct BlobReadyMsg {
     pub ts: u64,
 }
 
-// --- ShardDescriptor ---
+// --- SignedShardDescriptor ---
 
 /// Signed descriptor attached to a shard. Sent in shard_offer messages.
 /// Uses f32 importance (deterministic CBOR across platforms) and Signature newtype.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ShardDescriptor {
+pub struct SignedShardDescriptor {
     pub shard_id: ShardId,
     pub unit_id: UnitId,
     pub shard_index: u8,
@@ -431,9 +431,9 @@ pub struct ShardDescriptor {
     pub sig_owner: Signature,
 }
 
-/// The unsigned fields of ShardDescriptor (for signature computation).
+/// The unsigned fields of SignedShardDescriptor (for signature computation).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ShardDescriptorUnsigned {
+pub struct SignedShardDescriptorUnsigned {
     pub shard_id: ShardId,
     pub unit_id: UnitId,
     pub shard_index: u8,
@@ -446,15 +446,15 @@ pub struct ShardDescriptorUnsigned {
     pub created_at: u64,
 }
 
-impl ShardDescriptor {
+impl SignedShardDescriptor {
     /// Sign a descriptor. The signing key must belong to owner_pub.
     pub fn sign(
-        unsigned: ShardDescriptorUnsigned,
+        unsigned: SignedShardDescriptorUnsigned,
         signing_key: &ed25519_dalek::SigningKey,
-    ) -> Result<ShardDescriptor, MessageError> {
+    ) -> Result<SignedShardDescriptor, MessageError> {
         let cbor = to_cbor(&unsigned)?;
         let sig = signing_key.sign(&cbor);
-        Ok(ShardDescriptor {
+        Ok(SignedShardDescriptor {
             shard_id: unsigned.shard_id,
             unit_id: unsigned.unit_id,
             shard_index: unsigned.shard_index,
@@ -471,7 +471,7 @@ impl ShardDescriptor {
 
     /// Verify the owner's signature on this descriptor.
     pub fn verify_sig(&self) -> Result<(), MessageError> {
-        let unsigned = ShardDescriptorUnsigned {
+        let unsigned = SignedShardDescriptorUnsigned {
             shard_id: self.shard_id,
             unit_id: self.unit_id,
             shard_index: self.shard_index,
