@@ -8,6 +8,7 @@ pub(crate) mod repair;
 mod scheduler;
 pub(crate) mod shard_manager;
 pub mod storage;
+pub(crate) mod system_state;
 mod watcher;
 
 #[cfg(test)]

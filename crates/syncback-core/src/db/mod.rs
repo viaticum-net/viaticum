@@ -105,7 +105,7 @@ impl From<redb::TransactionError> for DbError {
 /// All methods take &self — redb's internal MVCC handles concurrency.
 #[derive(Clone)]
 pub struct Db {
-    pub(crate) inner: Arc<redb::Database>,
+    pub inner: Arc<redb::Database>,
 }
 
 impl Db {

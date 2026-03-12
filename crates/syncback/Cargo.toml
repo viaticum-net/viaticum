@@ -26,6 +26,7 @@ blake3 = { workspace = true }
 reed-solomon-erasure = { workspace = true }
 ciborium = { workspace = true }
 serde_json = "1"
+zstd = "0.13"
 bip39 = { version = "2", features = ["rand"] }
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
