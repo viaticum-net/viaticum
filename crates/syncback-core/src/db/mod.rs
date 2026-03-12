@@ -970,6 +970,29 @@ impl Db {
     }
 }
 
+// === CLI helpers ===
+
+impl Db {
+    /// Count shards in the `shards` table where holder_id == peer and status == Stored.
+    /// Used by the CLI "peers" command to show how many of our shards each peer holds.
+    pub fn count_stored_shards_for_holder(
+        &self,
+        peer: &IdentityPub,
+    ) -> Result<usize, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(SHARDS)?;
+        let mut count = 0usize;
+        for item in table.iter()? {
+            let (_, v) = item?;
+            let record: ShardRecord = from_cbor_bytes(v.value())?;
+            if record.holder_id == *peer && record.status == ShardStatus::Stored {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+}
+
 // === Config table ===
 
 impl Db {

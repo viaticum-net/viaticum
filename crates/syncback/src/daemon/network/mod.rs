@@ -361,6 +361,20 @@ async fn handle_command(
             // TODO Phase 2: connect to peer by address string.
             tracing::debug!(addr = %node_addr, "network: ConnectAddr not yet implemented");
         }
+        NetCommand::DownloadShard {
+            shard_id,
+            holder,
+            reply,
+        } => {
+            // TODO Phase 3: connect to holder and download blob via iroh-blobs.
+            // For now, reply with an error so the repair engine defers to next cycle.
+            tracing::debug!(
+                shard = %shard_id,
+                holder = %holder,
+                "network: DownloadShard not yet implemented"
+            );
+            let _ = reply.send(Err("DownloadShard not yet implemented".to_string()));
+        }
     }
 }
 

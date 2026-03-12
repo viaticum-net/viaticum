@@ -1,12 +1,7 @@
 use std::collections::HashMap;
 
-use chacha20poly1305::aead::{Aead, NewAead};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use hkdf::Hkdf;
 use rand::Rng;
 use rand_core::{OsRng, RngCore};
-use reed_solomon_erasure::galois_8::ReedSolomon;
-use sha2::Sha256;
 
 use syncback_core::budget::BudgetPlanner;
 use syncback_core::db::Db;
@@ -20,10 +15,9 @@ use syncback_core::types::{
     UnitStatus,
 };
 
-use crate::daemon::{merkle, NetCommand};
+use crate::daemon::{crypto, merkle, NetCommand};
 
 const MAX_POS_CHALLENGES_PER_PEER: usize = 5;
-const FILE_ENCRYPTION_INFO: &[u8] = b"syncback-file-encryption";
 
 // ============================================================
 // Supporting types
@@ -146,12 +140,7 @@ impl ShardManager {
 
     pub fn derive_unit_key(&self, unit_id: UnitId) -> [u8; 32] {
         let ikm: [u8; 32] = self.identity_key.to_bytes();
-        let salt = &unit_id.0;
-        let hk = Hkdf::<Sha256>::new(Some(salt), &ikm);
-        let mut key = [0u8; 32];
-        hk.expand(FILE_ENCRYPTION_INFO, &mut key)
-            .expect("HKDF expand: 32-byte output always valid");
-        key
+        crypto::derive_unit_key(&ikm, unit_id)
     }
 
     // -------------------------------------------------------------------------
@@ -758,53 +747,32 @@ fn convert_file_type(ft: FileType) -> MsgFileType {
 }
 
 fn encrypt_unit(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, ShardManagerError> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| ShardManagerError::Encryption(e.to_string()))?;
-
-    let mut out = Vec::with_capacity(12 + ciphertext.len());
-    out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
+    crypto::encrypt_plaintext(key, plaintext).map_err(|e| ShardManagerError::Encryption(e.to_string()))
 }
 
-fn decrypt_unit(key: &[u8; 32], ciphertext_with_nonce: &[u8]) -> Result<Vec<u8>, ShardManagerError> {
-    if ciphertext_with_nonce.len() < 12 {
-        return Err(ShardManagerError::Encryption("ciphertext too short".to_string()));
-    }
-    let nonce_bytes: [u8; 12] = ciphertext_with_nonce[..12]
-        .try_into()
-        .expect("slice length is 12");
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    cipher
-        .decrypt(nonce, &ciphertext_with_nonce[12..])
+fn decode_unit(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, ShardManagerError> {
+    crypto::decrypt_ciphertext(key, ciphertext)
         .map_err(|e| ShardManagerError::Encryption(e.to_string()))
 }
 
 fn encode_unit(ciphertext: &[u8], k: usize, n: usize) -> Result<Vec<Vec<u8>>, ShardManagerError> {
-    let r = ReedSolomon::new(k, n - k)
-        .map_err(|e| ShardManagerError::ReedSolomon(e.to_string()))?;
+    crypto::rs_encode(ciphertext, k, n).map_err(|e| ShardManagerError::ReedSolomon(e.to_string()))
+}
 
-    let shard_size = ciphertext.len().div_ceil(k);
-    let padded_len = shard_size * k;
-    let mut padded = ciphertext.to_vec();
-    padded.resize(padded_len, 0u8);
+// Functions exposed for tests in the child tests module.
+#[cfg(test)]
+pub(super) fn encrypt_unit_test(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, ShardManagerError> {
+    encrypt_unit(key, plaintext)
+}
 
-    let mut shards: Vec<Vec<u8>> = padded.chunks(shard_size).map(|s| s.to_vec()).collect();
-    for _ in 0..(n - k) {
-        shards.push(vec![0u8; shard_size]);
-    }
+#[cfg(test)]
+pub(super) fn encode_unit_test(ciphertext: &[u8], k: usize, n: usize) -> Result<Vec<Vec<u8>>, ShardManagerError> {
+    encode_unit(ciphertext, k, n)
+}
 
-    r.encode(&mut shards)
-        .map_err(|e| ShardManagerError::ReedSolomon(e.to_string()))?;
-
-    Ok(shards)
+#[cfg(test)]
+pub(super) fn decrypt_unit(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, ShardManagerError> {
+    decode_unit(key, ciphertext)
 }
 
 #[cfg(test)]

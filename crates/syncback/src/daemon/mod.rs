@@ -1,7 +1,10 @@
-mod cli_server;
+pub(crate) mod cli_server;
+pub(crate) mod crypto;
 pub(crate) mod merkle;
 mod network;
+pub mod packer;
 mod processor;
+pub(crate) mod repair;
 mod scheduler;
 pub(crate) mod shard_manager;
 pub mod storage;
@@ -139,6 +142,9 @@ pub enum CliCmd {
         dest: PathBuf,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    Peers {
+        reply: tokio::sync::oneshot::Sender<Vec<crate::daemon::cli_server::PeerInfo>>,
+    },
     Shutdown,
 }
 
@@ -241,6 +247,13 @@ pub enum NetCommand {
     /// Connect to a peer by node address string (discovery/bootstrap).
     ConnectAddr {
         node_addr: String,
+    },
+    /// Download a shard blob from a holder peer via iroh-blobs.
+    /// reply receives Ok(blob_bytes) on success, Err(message) on failure.
+    DownloadShard {
+        shard_id: syncback_core::types::ShardId,
+        holder: syncback_core::types::IdentityPub,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
     },
 }
 
@@ -350,6 +363,7 @@ impl DaemonHandle {
 
         let net_cmd_tx = net_handle.cmd_tx.clone();
 
+        let watcher_db = db.clone();
         let processor_handle = tokio::spawn(processor::run(
             db,
             cancel.clone(),
@@ -380,7 +394,12 @@ impl DaemonHandle {
             cli_socket_path.clone(),
         ));
 
-        tokio::spawn(watcher::run(cancel.clone(), dirty_tx.clone()));
+        tokio::spawn(watcher::run(
+            cancel.clone(),
+            dirty_tx.clone(),
+            watcher_db,
+            config.clone(),
+        ));
 
         tracing::info!(socket = ?cli_socket_path, "daemon started");
 

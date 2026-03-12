@@ -18,6 +18,8 @@ use syncback_core::types::{FileId, FileRecord, IdentityPub, ScheduleRecord, Shar
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::daemon::packer::Packer;
+use crate::daemon::repair::RepairEngine;
 use crate::daemon::shard_manager::{PosResponse, PosResult, ShardManager, ShardManagerError};
 use crate::daemon::storage::{OfferDecision, Storage, StorageError};
 use crate::daemon::{
@@ -54,6 +56,11 @@ struct Processor {
     net_event_rx: mpsc::Receiver<NetEvent>,
     net_cmd_tx: mpsc::Sender<NetCommand>,
 
+    /// Stored as raw bytes so we can reconstruct SigningKey per-operation
+    /// (ed25519_dalek::SigningKey does not impl Clone).
+    identity_key_bytes: [u8; 32],
+    identity_pub: IdentityPub,
+
     trust: TrustEngine,
     #[allow(dead_code)]
     escrow: EscrowChecker,
@@ -62,6 +69,7 @@ struct Processor {
     budget: BudgetPlanner,
     shard_manager: ShardManager,
     storage: Storage,
+    repair_engine: RepairEngine,
 
     started_at: std::time::Instant,
     pending_pos_challenges: HashMap<[u8; 32], PendingPosChallenge>,
@@ -110,6 +118,10 @@ pub async fn run(
         net_cmd_tx.clone(),
     );
 
+    let repair_engine = RepairEngine::new(db.clone());
+
+    let identity_key_bytes = identity_key.to_bytes();
+
     let mut proc = Processor {
         db,
         config,
@@ -118,12 +130,15 @@ pub async fn run(
         dirty_rx,
         net_event_rx,
         net_cmd_tx,
+        identity_key_bytes,
+        identity_pub,
         trust,
         escrow,
         placement,
         budget,
         shard_manager,
         storage,
+        repair_engine,
         started_at: std::time::Instant::now(),
         pending_pos_challenges: HashMap::new(),
     };
@@ -218,13 +233,59 @@ impl Processor {
             "weekly sync: backup batch selected"
         );
 
-        // 3. For each candidate: Phase 2 stub — log only.
-        for candidate in &batch.candidates {
-            tracing::debug!(
-                path = candidate.path,
-                importance = candidate.importance,
-                "weekly sync: would back up (packer not implemented in Phase 2)"
-            );
+        // 3. Pack dirty files into units and upload via ShardManager.
+        let packer = Packer::new(
+            self.db.clone(),
+            ed25519_dalek::SigningKey::from_bytes(&self.identity_key_bytes),
+            self.identity_pub,
+            crate::daemon::packer::DEFAULT_UNIT_SIZE_BYTES,
+        );
+        let pack_results = packer.pack_batch(&batch.candidates, now);
+        tracing::info!(units = pack_results.len(), "weekly sync: pack_batch complete");
+
+        for result in pack_results {
+            // Write unit record to DB.
+            self.db
+                .upsert_unit(&result.unit_record)
+                .expect("upsert_unit: db error is fatal");
+
+            // Upload shards via ShardManager.
+            match self
+                .shard_manager
+                .upload_unit(
+                    result.unit_record.unit_id,
+                    &result.unit_record,
+                    &result.plaintext,
+                    result.importance,
+                    syncback_core::types::FileType::User,
+                    now,
+                )
+                .await
+            {
+                Ok(placements) => {
+                    tracing::info!(
+                        unit_id = %result.unit_record.unit_id,
+                        shards = placements.len(),
+                        "weekly sync: unit uploaded"
+                    );
+                    // Mark each member file as backed-up.
+                    for file_record in &result.file_records {
+                        self.db
+                            .mark_file_clean(&file_record.path, now, result.unit_record.unit_id)
+                            .expect("mark_file_clean: db error is fatal");
+                    }
+                }
+                Err(ShardManagerError::NotEnoughPeers { need, have }) => {
+                    tracing::info!(
+                        need,
+                        have,
+                        unit_id = %result.unit_record.unit_id,
+                        "weekly sync: not enough peers for upload, retry next week"
+                    );
+                    // Files remain dirty — will be retried next cycle.
+                }
+                Err(e) => panic!("upload_unit unexpected error: {e}"),
+            }
         }
 
         // 4. Trust update: recalculate trust for all peers.
@@ -362,6 +423,8 @@ impl Processor {
     async fn run_repair_check(&mut self) {
         let now = Timestamp::now();
 
+        self.repair_engine.reset_cycle();
+
         let under_replicated = self
             .shard_manager
             .find_under_replicated_units()
@@ -377,12 +440,11 @@ impl Processor {
                 .repair_unit(unit_id, None, now)
                 .await
             {
-                Ok(n) => tracing::info!(unit = %unit_id, shards = n, "repair: repaired unit"),
+                Ok(n) => {
+                    tracing::info!(unit = %unit_id, shards = n, "repair: repaired from local plaintext");
+                }
                 Err(ShardManagerError::PlaintextNotAvailable) => {
-                    tracing::info!(
-                        unit = %unit_id,
-                        "repair: need restore flow (Phase 3)"
-                    );
+                    self.repair_engine.queue_for_restore(unit_id);
                 }
                 Err(ShardManagerError::NotEnoughPeers { need, have }) => {
                     tracing::info!(
@@ -396,11 +458,26 @@ impl Processor {
             }
         }
 
+        let net_cmd_tx = self.net_cmd_tx.clone();
+        let summary = self
+            .repair_engine
+            .run_pending(&self.shard_manager, now, &net_cmd_tx)
+            .await;
+
+        tracing::info!(
+            repaired = summary.units_repaired,
+            skipped_shards = summary.units_skipped_not_enough_shards,
+            skipped_peers = summary.units_skipped_no_peers,
+            rate_limited = summary.units_skipped_rate_limited,
+            offers_sent = summary.shards_offered,
+            "repair check: complete"
+        );
+
         self.db
             .set_schedule(&ScheduleRecord {
                 task_name: "repair_check".to_string(),
                 last_run: Some(now),
-                next_run: Timestamp(now.0 + 7 * 604_800),
+                next_run: Timestamp(now.0 + SECS_PER_WEEK),
             })
             .expect("set_schedule failed");
     }
@@ -418,6 +495,7 @@ impl Processor {
             CliCmd::RestoreFile { path, dest, reply } => {
                 self.handle_cli_restore(path, dest, reply).await;
             }
+            CliCmd::Peers { reply } => self.handle_cli_peers(reply).await,
             CliCmd::Shutdown => {
                 tracing::info!("processor: shutdown requested via CLI");
                 self.cancel.cancel();
@@ -481,6 +559,41 @@ impl Processor {
         let _ = reply.send(Err(
             "restore not yet implemented (Phase 3)".to_string(),
         ));
+    }
+
+    async fn handle_cli_peers(
+        &self,
+        reply: tokio::sync::oneshot::Sender<Vec<crate::daemon::cli_server::PeerInfo>>,
+    ) {
+        let now = syncback_core::types::Timestamp::now();
+        let peers = self
+            .db
+            .list_all_peers()
+            .expect("list_all_peers: db error is fatal");
+
+        let peer_infos = peers
+            .into_iter()
+            .map(|rec| {
+                let trust_score = self.trust.combined_score(&rec.identity).unwrap_or(0.0);
+                let shards_held_for_us = self
+                    .db
+                    .count_stored_shards_for_holder(&rec.identity)
+                    .unwrap_or(0);
+                let last_seen_secs_ago = rec.last_seen.secs_elapsed(now);
+                crate::daemon::cli_server::PeerInfo {
+                    identity: hex::encode(&rec.identity.0[..8]),
+                    trust_p: rec.trust_p,
+                    trust_i: rec.trust_i,
+                    trust_s: rec.trust_s,
+                    trust_score,
+                    weeks_in_network: rec.weeks_in_network,
+                    shards_held_for_us,
+                    last_seen_secs_ago,
+                }
+            })
+            .collect();
+
+        let _ = reply.send(peer_infos);
     }
 }
 

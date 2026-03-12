@@ -1,26 +1,22 @@
+mod cli;
 mod daemon;
 
+use clap::Parser;
+use cli::{Cli, Commands};
 use daemon::{Config, DaemonHandle};
 
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let subcommand = args.get(1).map(String::as_str);
-
+    let cli_args = Cli::parse();
     init_tracing();
 
-    match subcommand {
-        Some("daemon") => run_daemon(&args[2..]),
-        Some("init") => run_init(&args[2..]),
-        Some("status") => run_cli_status(&args[2..]),
-        Some("stop") => run_cli_stop(&args[2..]),
-        _ => {
-            eprintln!("Usage: syncback <daemon|init|status|stop>");
-            eprintln!("  daemon  — start the daemon (foreground)");
-            eprintln!("  init    — initialize ~/.syncback/");
-            eprintln!("  status  — print daemon status");
-            eprintln!("  stop    — gracefully stop the running daemon");
-            std::process::exit(1);
-        }
+    match cli_args.command {
+        Commands::Daemon => run_daemon(),
+        Commands::Init => cli::init::run_init(),
+        Commands::Status => cli::run_status(),
+        Commands::Backup => cli::run_backup(),
+        Commands::Restore { path, dest } => cli::run_restore(path, dest),
+        Commands::Peers => cli::run_peers(),
+        Commands::Stop => cli::run_stop(),
     }
 }
 
@@ -40,7 +36,7 @@ fn default_syncback_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".syncback")
 }
 
-fn run_daemon(_args: &[String]) -> anyhow::Result<()> {
+fn run_daemon() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .thread_name("syncback-worker")
@@ -50,24 +46,7 @@ fn run_daemon(_args: &[String]) -> anyhow::Result<()> {
     rt.block_on(async {
         let config = Config::load(default_syncback_dir())?;
         let handle = DaemonHandle::start(config).await?;
-
-        // Drive until Ctrl+C or a task exits.
         handle.join().await?;
         Ok(())
     })
-}
-
-fn run_init(_args: &[String]) -> anyhow::Result<()> {
-    eprintln!("syncback init: not yet implemented");
-    Ok(())
-}
-
-fn run_cli_status(_args: &[String]) -> anyhow::Result<()> {
-    eprintln!("syncback status: not yet implemented");
-    Ok(())
-}
-
-fn run_cli_stop(_args: &[String]) -> anyhow::Result<()> {
-    eprintln!("syncback stop: not yet implemented");
-    Ok(())
 }

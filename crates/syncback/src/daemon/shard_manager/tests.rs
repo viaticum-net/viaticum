@@ -7,7 +7,12 @@ use syncback_core::types::{
 };
 
 use super::{
-    decrypt_unit, encode_unit, encrypt_unit, PosResponse, PosResult, ShardManager,
+    decrypt_unit,
+    encode_unit_test as encode_unit,
+    encrypt_unit_test as encrypt_unit,
+    PosResponse,
+    PosResult,
+    ShardManager,
     ShardManagerError,
 };
 use crate::daemon::merkle;
