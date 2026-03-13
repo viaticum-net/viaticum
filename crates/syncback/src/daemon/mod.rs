@@ -90,9 +90,85 @@ pub enum VacuumFrequency {
 }
 
 impl Config {
-    pub fn load(_syncback_dir: PathBuf) -> anyhow::Result<Self> {
-        tracing::debug!("config load: using defaults");
-        Ok(Self::default())
+    pub fn load(syncback_dir: PathBuf) -> anyhow::Result<Self> {
+        let config_path = syncback_dir.join("config.toml");
+        if config_path.exists() {
+            let content = std::fs::read_to_string(&config_path)?;
+            let toml_val: toml::Value = content
+                .parse()
+                .map_err(|e| anyhow::anyhow!("config.toml parse error: {e}"))?;
+
+            let mut config = Config {
+                syncback_dir,
+                ..Config::default_no_home()
+            };
+
+            // Parse [backup] section
+            if let Some(backup) = toml_val.get("backup") {
+                if let Some(includes) = backup.get("include").and_then(|v| v.as_array()) {
+                    config.backup.include = includes
+                        .iter()
+                        .filter_map(|entry| {
+                            let path = entry.get("path")?.as_str()?;
+                            let importance = entry.get("importance")?.as_float()?;
+                            Some(IncludeEntry {
+                                path: PathBuf::from(path),
+                                importance,
+                            })
+                        })
+                        .collect();
+                }
+                if let Some(excludes) = backup.get("exclude").and_then(|v| v.as_array()) {
+                    config.backup.exclude = excludes
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+                }
+            }
+
+            // Parse [storage] section
+            if let Some(storage) = toml_val.get("storage") {
+                if let Some(quota) = storage.get("quota_gb").and_then(|v| v.as_integer()) {
+                    config.storage.quota_gb = quota as u64;
+                }
+            }
+
+            // Parse [test] section (time_scale for integration tests)
+            if let Some(test) = toml_val.get("test") {
+                if let Some(ts) = test.get("time_scale").and_then(|v| v.as_integer()) {
+                    config.time_scale = ts as u64;
+                }
+            }
+
+            tracing::info!("config loaded from {:?}", config_path);
+            Ok(config)
+        } else {
+            tracing::debug!("no config.toml found, using defaults");
+            Ok(Config {
+                syncback_dir,
+                ..Config::default_no_home()
+            })
+        }
+    }
+
+    fn default_no_home() -> Self {
+        Config {
+            syncback_dir: PathBuf::new(),
+            backup: BackupConfig {
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            storage: StorageConfig { quota_gb: 100 },
+            network: NetworkConfig {
+                seed_nodes: Vec::new(),
+                bandwidth_limit_mbps: 0,
+            },
+            schedule: ScheduleConfig {
+                sync: SyncFrequency::Weekly,
+                vacuum: VacuumFrequency::Monthly,
+            },
+            time_scale: 1,
+        }
     }
 }
 

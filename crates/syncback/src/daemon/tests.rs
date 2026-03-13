@@ -32,12 +32,14 @@ async fn cancellation_token_propagates_to_all_stubs() {
 }
 
 #[tokio::test]
-async fn config_default_returns_home_dir() {
+async fn config_load_stores_given_dir_and_uses_defaults() {
+    // No config.toml at this path — should fall back to defaults.
     let path = std::path::PathBuf::from("/nonexistent/path");
-    let config = Config::load(path).unwrap();
-    assert!(
-        config.syncback_dir.ends_with(".syncback"),
-        "syncback_dir should end with .syncback"
+    let config = Config::load(path.clone()).unwrap();
+    // syncback_dir must be exactly the path we provided, not HOME.
+    assert_eq!(
+        config.syncback_dir, path,
+        "syncback_dir should be the path passed to load()"
     );
     assert!(config.storage.quota_gb > 0, "quota_gb should be > 0");
 }

@@ -1,0 +1,48 @@
+services:
+  node-a:
+    build:
+      context: ../..
+      dockerfile: experiments/docker/Dockerfile
+    container_name: syncback-node-a
+    hostname: node-a
+    volumes:
+      - node-a-data:/home/syncback/.syncback
+      - node-a-files:/data/files
+    networks:
+      - syncback-net
+
+  node-b:
+    build:
+      context: ../..
+      dockerfile: experiments/docker/Dockerfile
+    container_name: syncback-node-b
+    hostname: node-b
+    volumes:
+      - node-b-data:/home/syncback/.syncback
+      - node-b-files:/data/files
+    networks:
+      - syncback-net
+
+  node-c:
+    build:
+      context: ../..
+      dockerfile: experiments/docker/Dockerfile
+    container_name: syncback-node-c
+    hostname: node-c
+    volumes:
+      - node-c-data:/home/syncback/.syncback
+      - node-c-files:/data/files
+    networks:
+      - syncback-net
+
+networks:
+  syncback-net:
+    driver: bridge
+
+volumes:
+  node-a-data:
+  node-a-files:
+  node-b-data:
+  node-b-files:
+  node-c-data:
+  node-c-files:

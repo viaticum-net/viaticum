@@ -20,9 +20,23 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Initialize ~/.syncback/ (generate seed phrase, derive keys)
-    Init,
+    Init {
+        /// BIP39 mnemonic (24 words, space-separated). Skips interactive confirmation.
+        #[arg(long)]
+        mnemonic: Option<String>,
+    },
     /// Start the daemon (runs in foreground; use systemd for background)
-    Daemon,
+    Daemon {
+        /// Override time_scale (default from config.toml or 1)
+        #[arg(long)]
+        time_scale: Option<u64>,
+        /// Override storage quota in GB
+        #[arg(long)]
+        quota_gb: Option<u64>,
+        /// Additional backup include path (can be repeated): "path:importance"
+        #[arg(long = "include")]
+        includes: Vec<String>,
+    },
     /// Show daemon status
     Status,
     /// Trigger an immediate backup

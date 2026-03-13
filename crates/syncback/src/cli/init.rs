@@ -157,6 +157,21 @@ pub fn run_init() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Non-interactive init via CLI flag: validates a user-supplied phrase and initializes.
+/// Prints the same output as `run_init` but skips the interactive confirmation step.
+pub fn run_init_with_phrase(phrase: &str) -> anyhow::Result<()> {
+    let home = std::env::var("HOME")?;
+    let syncback_dir = std::path::PathBuf::from(home).join(".syncback");
+    let words: Vec<&str> = phrase.split_whitespace().collect();
+    if words.len() != 24 {
+        anyhow::bail!("expected 24 words, got {}", words.len());
+    }
+    let key_file = init_with_mnemonic(&syncback_dir, &words)?;
+    println!("Initialized ~/.syncback/");
+    println!("Identity: {}", hex::encode(&key_file.identity_pub[..8]));
+    Ok(())
+}
+
 /// Non-interactive init for testing: takes mnemonic words, no prompts.
 /// Creates the directory structure and writes key file.
 /// Used by integration tests that need a known identity.
