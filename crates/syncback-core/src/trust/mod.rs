@@ -203,7 +203,9 @@ impl TrustEngine {
             }
         }
         let p = if p_challenged == 0 {
-            0.0
+            // No PoS data yet — preserve bootstrap trust (INITIAL_TRUST_P).
+            // Recalculating with zero evidence shouldn't downgrade from bootstrap.
+            INITIAL_TRUST_P
         } else {
             p_passed as f64 / p_challenged as f64
         };

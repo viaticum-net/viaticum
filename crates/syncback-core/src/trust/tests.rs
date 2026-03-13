@@ -195,6 +195,19 @@ fn s_score_exceeds_one_is_clamped_in_combined() {
 }
 
 #[test]
+fn recalculate_preserves_initial_trust_when_no_pos_data() {
+    let (engine, _tmp) = make_engine();
+    let peer = test_peer(60);
+    engine.upsert_peer(&peer, week(0)).unwrap();
+    // Recalculate with no PoS records should preserve INITIAL_TRUST_P
+    let score = engine.recalculate(&peer, week(5), 5).unwrap();
+    assert_eq!(score.p, crate::constants::INITIAL_TRUST_P, "P should stay at INITIAL_TRUST_P when no PoS data");
+    assert_eq!(score.i, 0.0);
+    let expected = KP * crate::constants::INITIAL_TRUST_P;
+    assert!((score.combined - expected).abs() < 1e-10);
+}
+
+#[test]
 fn zero_trust_clears_scores() {
     let (engine, _tmp) = make_engine();
     let peer = test_peer(10);

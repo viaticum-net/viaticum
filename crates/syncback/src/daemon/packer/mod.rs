@@ -7,7 +7,6 @@
 
 use std::io::Read as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use syncback_core::budget::BackupCandidate;
 use syncback_core::constants::ERASURE_K;
@@ -180,8 +179,6 @@ pub struct Packer {
     identity_pub: syncback_core::types::IdentityPub,
     /// Maximum size of one unit in bytes. Files >= this are chunked.
     unit_size_bytes: u64,
-    /// Session counter for pack UnitId derivation. Resets on restart (that is fine).
-    unit_counter: AtomicU64,
 }
 
 impl Packer {
@@ -196,7 +193,6 @@ impl Packer {
             identity_key,
             identity_pub,
             unit_size_bytes,
-            unit_counter: AtomicU64::new(0),
         }
     }
 
@@ -347,8 +343,10 @@ impl Packer {
         let plaintext = zstd::encode_all(plaintext.as_slice(), ZSTD_COMPRESSION_LEVEL)
             .map_err(|e| PackerError::Compression(e.to_string()))?;
 
-        // 4. Derive UnitId.
-        let unit_id = self.next_pack_unit_id();
+        // 4. Derive UnitId as content-addressed hash (stable across restarts, idempotent).
+        //    blake3(identity_pub || 0x01 || plaintext_hash)
+        let plaintext_hash = *blake3::hash(&plaintext).as_bytes();
+        let unit_id = derive_pack_unit_id(&self.identity_pub, &plaintext_hash);
 
         // 5. Compute shard_preview (approximate, different nonce than ShardManager will use).
         let tier = ErasureTier::from_importance(importance).expect("importance checked above");
@@ -357,7 +355,6 @@ impl Packer {
         let shard_preview = self.compute_shard_preview(unit_id, &plaintext, k, n);
 
         // 6. Build UnitRecord.
-        let plaintext_hash = *blake3::hash(&plaintext).as_bytes();
         let unit_record = UnitRecord {
             unit_id,
             unit_type: UnitType::Pack,
@@ -687,16 +684,6 @@ impl Packer {
         crypto::derive_unit_key(&ikm, unit_id)
     }
 
-    /// Allocate the next pack UnitId using the session counter.
-    fn next_pack_unit_id(&self) -> UnitId {
-        let counter = self.unit_counter.fetch_add(1, Ordering::Relaxed);
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&self.identity_pub.0);
-        hasher.update(&[0x01u8]); // type discriminant: pack
-        hasher.update(&counter.to_le_bytes());
-        UnitId(*hasher.finalize().as_bytes())
-    }
-
     /// Compute shard_preview by doing a preview encryption + RS encode.
     ///
     /// NOTE: these shard IDs are approximate and will differ from final IDs
@@ -787,6 +774,19 @@ impl Packer {
 // ============================================================
 // Free helpers
 // ============================================================
+
+/// Derive UnitId for a pack unit: blake3(identity_pub || 0x01 || plaintext_hash).
+/// Content-addressed: same plaintext → same UnitId, different content → different UnitId.
+pub(crate) fn derive_pack_unit_id(
+    identity_pub: &syncback_core::types::IdentityPub,
+    plaintext_hash: &[u8; 32],
+) -> UnitId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&identity_pub.0);
+    hasher.update(&[0x01u8]); // type discriminant: pack
+    hasher.update(plaintext_hash);
+    UnitId(*hasher.finalize().as_bytes())
+}
 
 /// Derive UnitId for a chunk: blake3(content_hash || chunk_index_le_u32).
 pub(crate) fn derive_chunk_unit_id(content_hash: &[u8; 32], chunk_index: u32) -> UnitId {

@@ -269,8 +269,8 @@ fn zero_trust_peers_excluded() {
     let zero_peers = test_peers(10);
     for p in &zero_peers {
         trust.upsert_peer(p, week(1)).unwrap();
-        // recalculate with no PoS records → trust = 0
-        trust.recalculate(p, week(2), 1).unwrap();
+        // Explicitly zero out trust (recalculate preserves INITIAL_TRUST_P for no-PoS peers)
+        trust.zero_trust(p, week(2)).unwrap();
     }
 
     let positive_peers: Vec<_> = (10..17).map(|i| test_peer(i as u8)).collect();
