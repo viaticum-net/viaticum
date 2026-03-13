@@ -99,6 +99,7 @@ fn make_config(syncback_dir: std::path::PathBuf, include: Vec<IncludeEntry>) -> 
             sync: SyncFrequency::Weekly,
             vacuum: VacuumFrequency::Monthly,
         },
+        time_scale: 1,
     }
 }
 

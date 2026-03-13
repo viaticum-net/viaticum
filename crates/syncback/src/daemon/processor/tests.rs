@@ -47,6 +47,7 @@ fn test_config(syncback_dir: PathBuf) -> Config {
             sync: SyncFrequency::Weekly,
             vacuum: VacuumFrequency::Monthly,
         },
+        time_scale: 1,
     }
 }
 
@@ -978,4 +979,41 @@ async fn system_state_backup_overwrites_old_blob() {
 
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+}
+
+// ============================================================
+// VirtualClock unit tests
+// ============================================================
+
+#[test]
+fn virtual_clock_scale_1_approximates_real_time() {
+    let clock = super::VirtualClock::new(1);
+    let real_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let virtual_now = clock.now().0;
+    assert!(
+        virtual_now.abs_diff(real_now) <= 2,
+        "virtual={virtual_now}, real={real_now}"
+    );
+}
+
+#[test]
+fn virtual_clock_advances_proportionally() {
+    let scale = 100_u64;
+    let clock = super::VirtualClock::new(scale);
+    let t0 = clock.now().0;
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let t1 = clock.now().0;
+    let delta = t1 - t0;
+    assert!(delta <= 10, "unexpected large delta: {delta}s in 10ms real time");
+}
+
+#[test]
+fn virtual_clock_scale_zero_treated_as_one() {
+    let c0 = super::VirtualClock::new(0);
+    let c1 = super::VirtualClock::new(1);
+    let diff = c0.now().0.abs_diff(c1.now().0);
+    assert!(diff <= 1, "scale=0 and scale=1 should produce same virtual time, diff={diff}");
 }

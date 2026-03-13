@@ -42,6 +42,12 @@ pub struct Config {
     pub storage: StorageConfig,
     pub network: NetworkConfig,
     pub schedule: ScheduleConfig,
+    /// Virtual time acceleration factor.
+    /// 1 = real time (default, production behavior).
+    /// N = each real second counts as N virtual seconds.
+    /// Scheduler intervals are divided by this value.
+    /// Only intended for integration tests.
+    pub time_scale: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +115,7 @@ impl Default for Config {
                 sync: SyncFrequency::Weekly,
                 vacuum: VacuumFrequency::Monthly,
             },
+            time_scale: 1,
         }
     }
 }
@@ -419,6 +426,7 @@ impl DaemonHandle {
         let scheduler_handle = tokio::spawn(scheduler::run(
             cancel.clone(),
             processor_tx.clone(),
+            config.time_scale,
         ));
 
         let cli_server_handle = tokio::spawn(cli_server::run(

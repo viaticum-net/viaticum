@@ -26,6 +26,7 @@ fn make_test_daemon_config(
             sync: crate::daemon::SyncFrequency::Weekly,
             vacuum: crate::daemon::VacuumFrequency::Monthly,
         },
+        time_scale: 1,
     }
 }
 

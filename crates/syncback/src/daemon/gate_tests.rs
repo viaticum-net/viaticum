@@ -569,6 +569,7 @@ async fn weekly_sync_dirty_event_creates_file_record_and_updates_schedule() {
             sync: SyncFrequency::Weekly,
             vacuum: VacuumFrequency::Monthly,
         },
+        time_scale: 1,
     };
 
     let cancel = CancellationToken::new();

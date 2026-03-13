@@ -32,6 +32,38 @@ use crate::daemon::{
 mod tests;
 
 // ============================================================
+// VirtualClock
+// ============================================================
+
+/// Tracks virtual time state for time-scaled operation.
+/// When time_scale == 1, `now()` returns real wall-clock time.
+struct VirtualClock {
+    real_start: std::time::Instant,
+    virtual_start_secs: u64,
+    time_scale: u64,
+}
+
+impl VirtualClock {
+    fn new(time_scale: u64) -> Self {
+        let virtual_start_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_secs();
+        VirtualClock {
+            real_start: std::time::Instant::now(),
+            virtual_start_secs,
+            time_scale: time_scale.max(1),
+        }
+    }
+
+    fn now(&self) -> syncback_core::types::Timestamp {
+        let elapsed_real_secs = self.real_start.elapsed().as_secs();
+        let virtual_secs = self.virtual_start_secs + elapsed_real_secs * self.time_scale;
+        syncback_core::types::Timestamp(virtual_secs)
+    }
+}
+
+// ============================================================
 // Internal state for pending PoS challenges
 // ============================================================
 
@@ -116,6 +148,8 @@ struct Processor {
     /// (Unused in current single-step flow but kept for future retry logic.)
     #[allow(dead_code)]
     pending_dr_reply: Option<tokio::sync::oneshot::Sender<Result<SystemStateResponseMsg, String>>>,
+
+    clock: VirtualClock,
 }
 
 // ============================================================
@@ -165,6 +199,7 @@ pub async fn run(
     let repair_engine = RepairEngine::new(db.clone());
 
     let identity_key_bytes = identity_key.to_bytes();
+    let clock = VirtualClock::new(config.time_scale);
 
     let mut proc = Processor {
         db,
@@ -192,11 +227,22 @@ pub async fn run(
         pending_dr_peer_addr: None,
         pending_dr_cli_reply: None,
         pending_dr_reply: None,
+        clock,
     };
 
     tracing::info!("processor: started");
     proc.run_loop().await;
     tracing::info!("processor: stopped");
+}
+
+// ============================================================
+// Time helper
+// ============================================================
+
+impl Processor {
+    fn now(&self) -> syncback_core::types::Timestamp {
+        self.clock.now()
+    }
 }
 
 // ============================================================
@@ -268,7 +314,7 @@ impl Processor {
     }
 
     async fn run_weekly_sync(&mut self) {
-        let now = Timestamp::now();
+        let now = self.now();
         tracing::info!("weekly sync: starting");
 
         // 1. Estimate budget.
@@ -406,7 +452,7 @@ impl Processor {
     }
 
     async fn run_pos_round(&mut self) {
-        let now = Timestamp::now();
+        let now = self.now();
 
         let challenges = self
             .shard_manager
@@ -451,7 +497,7 @@ impl Processor {
     }
 
     async fn run_vacuum(&mut self) {
-        let now = Timestamp::now();
+        let now = self.now();
         tracing::info!("vacuum: running (stub — full vacuum in Phase 3)");
 
         let stale_units = self
@@ -478,7 +524,7 @@ impl Processor {
     }
 
     async fn run_repair_check(&mut self) {
-        let now = Timestamp::now();
+        let now = self.now();
 
         self.repair_engine.reset_cycle();
 
@@ -785,7 +831,7 @@ impl Processor {
                     syncback_core::messages::RestoreRequestMsg {
                         v: 1,
                         shard_id,
-                        ts: syncback_core::types::Timestamp::now().0,
+                        ts: self.now().0,
                     },
                 ),
             };
@@ -919,7 +965,7 @@ impl Processor {
         &self,
         reply: tokio::sync::oneshot::Sender<Vec<crate::daemon::cli_server::PeerInfo>>,
     ) {
-        let now = syncback_core::types::Timestamp::now();
+        let now = self.now();
         let peers = self
             .db
             .list_all_peers()
@@ -958,7 +1004,7 @@ impl Processor {
 impl Processor {
     /// Owner-side: snapshot, encrypt, and push system state blob to top-15 peers.
     async fn handle_system_state_backup(&mut self) {
-        let now = Timestamp::now();
+        let now = self.now();
 
         // 1. Snapshot DB.
         let state = match crate::daemon::system_state::snapshot_db(&self.db) {
@@ -1080,7 +1126,7 @@ impl Processor {
         }
 
         // 3. Store (overwrites any previous blob for this owner).
-        let now = Timestamp::now();
+        let now = self.now();
         let record = syncback_core::types::SystemStateBlobRecord {
             blob: msg.blob,
             created_at: Timestamp(msg.created_at),
@@ -1471,7 +1517,7 @@ impl Processor {
         node_id: syncback_core::types::NodeId,
     ) {
         tracing::info!(peer = %peer, "peer connected");
-        let now = Timestamp::now();
+        let now = self.now();
         match self.db.get_peer(&peer).expect("get_peer failed") {
             Some(mut record) => {
                 record.last_seen = now;
@@ -1500,7 +1546,7 @@ impl Processor {
     }
 
     async fn handle_direct_message(&mut self, from: IdentityPub, message: syncback_core::messages::DirectMessage) {
-        let now = Timestamp::now();
+        let now = self.now();
         match message.body {
             DirectBody::Handshake(_) => {
                 tracing::debug!(peer = %from, "direct: unexpected handshake in processor");
@@ -1564,7 +1610,7 @@ impl Processor {
             return;
         }
 
-        let now = Timestamp::now();
+        let now = self.now();
 
         match msg_type.as_str() {
             "shard_offer" => {
@@ -2118,7 +2164,7 @@ impl Processor {
         bytes: u64,
     ) {
         tracing::debug!(shard = %shard_id, holder = %holder, bytes, "shard uploaded to holder");
-        let now = Timestamp::now();
+        let now = self.now();
         let event = TransferEvent {
             peer: holder,
             bytes_sent_to_peer: bytes,
@@ -2138,7 +2184,7 @@ impl Processor {
         bytes: u64,
     ) {
         tracing::debug!(shard = %shard_id, peer = %peer, bytes, "shard downloaded/served");
-        let now = Timestamp::now();
+        let now = self.now();
         let event = TransferEvent {
             peer,
             bytes_sent_to_peer: bytes,
