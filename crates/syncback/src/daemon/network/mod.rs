@@ -370,9 +370,92 @@ async fn handle_command(
             )
             .await;
         }
-        NetCommand::PublishBoard { .. } | NetCommand::UploadShard { .. } => {
-            // TODO Phase 2: iroh-docs board publish and blob upload.
-            tracing::debug!("network: board/shard command not yet implemented");
+        NetCommand::PublishBoard { msg_type, payload, directed_to } => {
+            // Alpha: no iroh-docs. Send directed board messages as direct messages.
+            if let Some(target) = directed_to {
+                let proxy = DirectMessage {
+                    v: syncback_core::constants::PROTOCOL_VERSION,
+                    body: DirectBody::BoardProxy(syncback_core::messages::BoardProxyMsg {
+                        msg_type,
+                        payload,
+                    }),
+                };
+                let payload_bytes = match frame_message(&proxy) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "board proxy: serialize failed");
+                        return;
+                    }
+                };
+                let addr = {
+                    let map = peer_addrs.lock().await;
+                    map.get(&target).cloned()
+                };
+                match addr {
+                    Some(peer_addr) => {
+                        send_direct_payload(
+                            endpoint,
+                            peer_addr,
+                            target,
+                            payload_bytes,
+                            identity_key,
+                            identity_pub,
+                            event_tx,
+                            peer_addrs,
+                        )
+                        .await;
+                    }
+                    None => {
+                        tracing::debug!(peer = %target, "board proxy: no known addr, dropping");
+                    }
+                }
+            } else {
+                tracing::debug!(msg_type = %msg_type, "network: broadcast board message not implemented in alpha");
+            }
+        }
+        NetCommand::UploadShard { shard_id, holder, data } => {
+            // Alpha inline transfer: send ShardData as a direct message.
+            let msg = DirectMessage {
+                v: syncback_core::constants::PROTOCOL_VERSION,
+                body: DirectBody::ShardData(syncback_core::messages::ShardDataMsg {
+                    shard_id,
+                    data: data.clone(),
+                }),
+            };
+            let addr = {
+                let map = peer_addrs.lock().await;
+                map.get(&holder).cloned()
+            };
+            match addr {
+                Some(peer_addr) => {
+                    let data_len = data.len() as u64;
+                    connect_and_send(
+                        endpoint,
+                        peer_addr,
+                        holder,
+                        msg,
+                        identity_key,
+                        identity_pub,
+                        event_tx.clone(),
+                        peer_addrs,
+                    )
+                    .await;
+                    let _ = event_tx
+                        .send(NetEvent::ShardUploaded {
+                            shard_id,
+                            holder,
+                            bytes: data_len,
+                        })
+                        .await;
+                }
+                None => {
+                    tracing::debug!(
+                        shard = %shard_id,
+                        holder = %holder,
+                        "UploadShard: no known addr, dropping"
+                    );
+                }
+            }
         }
         NetCommand::SendPosChallenge { holder, shard_id, .. } => {
             // TODO Phase 2: send PoS challenge via board.
@@ -833,6 +916,7 @@ impl VariantName for DirectBody {
             DirectBody::SystemStateAck(_) => "SystemStateAck",
             DirectBody::SystemStateRequest(_) => "SystemStateRequest",
             DirectBody::SystemStateResponse(_) => "SystemStateResponse",
+            DirectBody::BoardProxy(_) => "BoardProxy",
         }
     }
 }

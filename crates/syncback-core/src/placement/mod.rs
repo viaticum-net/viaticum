@@ -150,37 +150,50 @@ impl PlacementEngine {
         let params = ErasureParams { k: base_params.k, n };
 
         let existing_counts = self.current_shard_counts(unit_id)?;
+        let cap = MAX_SHARDS_PER_PARTNER as usize;
 
-        // Build weighted pool: (peer, weight, subnet_prefix)
+        // Build weighted pool with remaining capacity per peer.
+        // Each peer can hold up to MAX_SHARDS_PER_PARTNER shards of this unit.
         // weight = trust^2
-        let mut pool: Vec<(IdentityPub, f64, Option<[u8; 3]>)> = candidates
-            .iter()
-            .filter(|(peer, _, _)| {
-                let count = existing_counts.get(peer).copied().unwrap_or(0);
-                count < MAX_SHARDS_PER_PARTNER as usize
-            })
-            .map(|(peer, trust, subnet)| (*peer, trust * trust, *subnet))
-            .collect();
+        let build_pool = |candidates: &[(IdentityPub, f64, Option<[u8; 3]>)],
+                          existing: &HashMap<IdentityPub, usize>,
+                          assigned: &[ShardAssignment]|
+            -> Vec<(IdentityPub, f64, Option<[u8; 3]>, usize)> {
+            candidates
+                .iter()
+                .filter_map(|(peer, trust, subnet)| {
+                    let ex = existing.get(peer).copied().unwrap_or(0);
+                    let asgn = assigned.iter().filter(|a| a.holder == *peer).count();
+                    let used = ex + asgn;
+                    if used >= cap {
+                        None
+                    } else {
+                        Some((*peer, trust * trust, *subnet, cap - used))
+                    }
+                })
+                .collect()
+        };
 
-        let eligible_count = pool.len();
-        if eligible_count < n {
+        let mut pool = build_pool(&candidates, &existing_counts, &[]);
+
+        // Check total available slots, not just unique peers
+        let total_slots: usize = pool.iter().map(|e| e.3).sum();
+        if total_slots < n {
             return Err(PlacementError::NotEnoughPeers {
                 need: n,
-                have: eligible_count,
+                have: total_slots,
             });
         }
 
         let mut assignments: Vec<ShardAssignment> = Vec::with_capacity(n);
-        // Track subnets used in this placement
         let mut used_subnets: Vec<[u8; 3]> = Vec::new();
-        // TODO: ASN diversity not enforced (ASN data not collected in MVP)
 
         let mut rng = rand::thread_rng();
         let mut shard_index: u8 = 0;
         let mut relaxed_subnet = false;
 
         while assignments.len() < n {
-            let total_weight: f64 = pool.iter().map(|(_, w, _)| *w).sum();
+            let total_weight: f64 = pool.iter().map(|e| e.1).sum();
             if total_weight <= 0.0 {
                 break;
             }
@@ -189,15 +202,15 @@ impl PlacementEngine {
             let target = rng.r#gen::<f64>() * total_weight;
             let mut acc = 0.0;
             let mut chosen_idx = 0;
-            for (i, (_, w, _)) in pool.iter().enumerate() {
-                acc += w;
+            for (i, entry) in pool.iter().enumerate() {
+                acc += entry.1;
                 if acc >= target {
                     chosen_idx = i;
                     break;
                 }
             }
 
-            let (peer, _, subnet) = pool[chosen_idx];
+            let (peer, _, subnet, _) = pool[chosen_idx];
 
             // Subnet diversity check (best-effort)
             let subnet_ok = match subnet {
@@ -206,25 +219,14 @@ impl PlacementEngine {
             };
 
             if !subnet_ok {
-                // Remove from pool and try next
                 pool.remove(chosen_idx);
                 if pool.is_empty() {
-                    // Relax subnet rule — all remaining peers share a subnet
                     tracing::debug!(
                         unit_id = %unit_id,
                         "subnet diversity rule relaxed: all remaining peers share a subnet"
                     );
                     relaxed_subnet = true;
-                    // Rebuild pool without subnet filtering
-                    pool = candidates
-                        .iter()
-                        .filter(|(peer, _, _)| {
-                            let count = existing_counts.get(peer).copied().unwrap_or(0);
-                            count < MAX_SHARDS_PER_PARTNER as usize
-                        })
-                        .filter(|(peer, _, _)| !assignments.iter().any(|a| a.holder == *peer))
-                        .map(|(peer, trust, subnet)| (*peer, trust * trust, *subnet))
-                        .collect();
+                    pool = build_pool(&candidates, &existing_counts, &assignments);
                     if pool.is_empty() {
                         break;
                     }
@@ -241,7 +243,12 @@ impl PlacementEngine {
                 holder: peer,
             });
             shard_index += 1;
-            pool.remove(chosen_idx);
+
+            // Decrement remaining capacity; remove when exhausted
+            pool[chosen_idx].3 -= 1;
+            if pool[chosen_idx].3 == 0 {
+                pool.remove(chosen_idx);
+            }
         }
 
         if assignments.len() < n {

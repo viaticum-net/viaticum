@@ -87,7 +87,9 @@ SyncBack — тонкая обёртка над существующими те�
 [u32 BE длина][CBOR payload][u32 BE длина][CBOR payload]...
 ```
 
-Каждое сообщение = 4 байта длины (big-endian) + CBOR bytes. Максимальный размер одного сообщения: 64 КБ (защита от DoS). Стрим открывается поверх QUIC-соединения iroh.
+Каждое сообщение = 4 байта длины (big-endian) + CBOR bytes. Максимальный размер одного сообщения: 64 МБ (inline shard transfer в альфе, MAX_MESSAGE_SIZE). Стрим открывается поверх QUIC-соединения iroh.
+
+**API дисциплина:** В коде ОБЯЗАТЕЛЬНО различать `frame_message()` (CBOR + u32 BE prefix = wire-ready) и `to_cbor()` (голый CBOR, для вложенных payload'ов). Если отправить голый CBOR в сокет, получатель прочитает первые 4 байта CBOR-header как length prefix и получит мусор (например, 0xA2626964 = 2.7 ГБ "длина"). Публичный API для отправки по сети — только `frame_message()`.
 
 **Записи на доске (iroh-docs):**
 
@@ -502,6 +504,28 @@ Seed phrase → derive identity keypair + iroh keypair (детерминиров
      Owner видит при следующем sync → шард размещён ✓
 ```
 
+**Holder state machine (offer→accept→blob→stored):**
+```
+shard_offer received
+  → verify sig, check allowlist, check quota
+  → Accept: СОХРАНИТЬ ShardDescriptor в памяти (pending_descriptors[shard_id])
+  → отправить shard_accept
+
+ShardData received (blob от owner)
+  → lookup descriptor в pending_descriptors[shard_id]
+  → verify blake3(blob) == shard_id
+  → lazy reservation check (шаг 7)
+  → записать blob на диск + HoldingRecord в DB
+  → удалить из pending_descriptors
+  → отправить shard_stored
+```
+Критично: holder ДОЛЖЕН хранить descriptor между accept и получением blob. Без него невозможно проверить hash и создать HoldingRecord. Потеря descriptor → blob отклоняется.
+
+**ShardData — двунаправленный message type:**
+- Upload flow: Owner → Holder (ShardData с blob'ом после shard_accept)
+- Restore flow: Holder → Owner (ShardData с blob'ом после RestoreRequest)
+Обработчик на получателе должен различать оба направления по наличию pending state (pending_descriptors для upload, pending_shard_to_restore для restore).
+
 **Lazy reservation:** accept — мягкое намерение, не жёсткое бронирование. Holder НЕ вытесняет данные при accept. Eviction только в момент получения blob'а (шаг 7). Если owner не пришёл — ничего не потеряно.
 
 **Таймауты:**
@@ -676,6 +700,8 @@ trust_AB = (kp × P_B + ki × I_B) × clamp(S_AB, 0.1, 1.0)
 
 Единственное ограничение: нода, игнорирующая trust, будет размещать шарды на ненадёжных партнёрах и потеряет свои данные. Это самонаказание, не нарушение протокола.
 
+**Bootstrap trust (INITIAL_TRUST_P):** Для нового пира P=0, I=0, S=1.0 → combined trust = 0. Placement фильтрует пиров с trust > 0.0, поэтому при P=0 ни один пир не проходит. Решение: `INITIAL_TRUST_P = 0.1` — "кредит доверия" для новых пиров. Combined = kp × 0.1 × 1.0 = 0.04 — ненулевой, но низкий. Без этого свежая сеть не может разместить ни одного шарда (chicken-and-egg problem).
+
 ### 2.2. Параметры erasure coding
 
 Рекомендуемые defaults зависят от importance:
@@ -710,7 +736,9 @@ Holder может отдать шард кому угодно и когда уг
 
 ### 2.6. Размещение шардов (weighted vs equal)
 
-Рекомендация: weighted placement (больше шардов надёжным партнёрам). Нода может раскладывать шарды равномерно или по любой другой схеме.
+Рекомендация: weighted placement (больше шардов надёжным партнёрам, w_i = trust^2). Нода может раскладывать шарды равномерно или по любой другой схеме.
+
+**MAX_SHARDS_PER_PARTNER = 6:** Один партнёр может хранить до 6 шардов одного юнита. Это позволяет работать при малом числе пиров: 4 пира × 6 слотов = 24 слота ≥ 17 (n при 5-of-17). Placement pool считает не уникальных пиров, а доступные слоты (capacity). При выборе каждый пир декрементирует свой capacity, а не удаляется из пула. Без этого при n > числа пиров placement невозможен — критичный edge case при малом числе пиров.
 
 ### 2.7. Adaptive n
 

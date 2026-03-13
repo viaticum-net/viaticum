@@ -35,6 +35,30 @@ services:
     networks:
       - syncback-net
 
+  node-d:
+    build:
+      context: ../..
+      dockerfile: experiments/docker/Dockerfile
+    container_name: syncback-node-d
+    hostname: node-d
+    volumes:
+      - node-d-data:/home/syncback/.syncback
+      - node-d-files:/data/files
+    networks:
+      - syncback-net
+
+  node-e:
+    build:
+      context: ../..
+      dockerfile: experiments/docker/Dockerfile
+    container_name: syncback-node-e
+    hostname: node-e
+    volumes:
+      - node-e-data:/home/syncback/.syncback
+      - node-e-files:/data/files
+    networks:
+      - syncback-net
+
 networks:
   syncback-net:
     driver: bridge
@@ -46,3 +70,7 @@ volumes:
   node-b-files:
   node-c-data:
   node-c-files:
+  node-d-data:
+  node-d-files:
+  node-e-data:
+  node-e-files:

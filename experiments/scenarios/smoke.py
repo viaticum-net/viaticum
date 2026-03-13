@@ -1,4 +1,4 @@
-"""Smoke test: 3 nodes connect, backup files, restore."""
+"""Smoke test: 5 nodes connect, backup files, verify shard distribution."""
 
 import time
 from scenarios.base import BaseScenario
@@ -21,11 +21,24 @@ MNEMONICS = {
         "ability ability ability ability ability ability ability ability "
         "ability ability ability ability ability ability ability able"
     ),
+    "node-d": (
+        "about about about about about about about about "
+        "about about about about about about about about "
+        "about about about about about about about above"
+    ),
+    "node-e": (
+        "abstract abstract abstract abstract abstract abstract abstract abstract "
+        "abstract abstract abstract abstract abstract abstract abstract abstract "
+        "abstract abstract abstract abstract abstract abstract abstract absurd"
+    ),
 }
+
+ALL_NODES = ["node-a", "node-b", "node-c", "node-d", "node-e"]
+HOLDER_NODES = ["node-b", "node-c", "node-d", "node-e"]
 
 
 class SmokeScenario(BaseScenario):
-    name = "smoke_3node"
+    name = "smoke_5node"
 
     def run(self) -> bool:
         print(f"\n{'='*60}")
@@ -50,8 +63,8 @@ class SmokeScenario(BaseScenario):
             return False
 
     def _init_nodes(self) -> None:
-        self.log("phase", details="Initializing nodes")
-        for name in ["node-a", "node-b", "node-c"]:
+        self.log("phase", details="Initializing 5 nodes")
+        for name in ALL_NODES:
             node = self.cluster.node(name)
             output = node.init(MNEMONICS[name])
             self.log("init", node=name, details=output)
@@ -63,42 +76,36 @@ class SmokeScenario(BaseScenario):
         a = self.cluster.node("node-a")
         a.start_daemon(quota_gb=1, includes=["/data/files:0.9"])
 
-        # Nodes B, C: holders only
-        for name in ["node-b", "node-c"]:
+        # Nodes B-E: holders only
+        for name in HOLDER_NODES:
             node = self.cluster.node(name)
             node.start_daemon(quota_gb=10)
 
         # Wait for all to be ready
-        for name in ["node-a", "node-b", "node-c"]:
+        for name in ALL_NODES:
             node = self.cluster.node(name)
             status = node.wait_ready(timeout=15)
             self.log("ready", node=name, details=str(status))
 
     def _connect_peers(self) -> None:
-        self.log("phase", details="Connecting peers")
+        self.log("phase", details="Connecting A to all holders")
         a = self.cluster.node("node-a")
-        b = self.cluster.node("node-b")
-        c = self.cluster.node("node-c")
 
-        # Get node addresses
-        addr_b = b.get_node_addr()
-        addr_c = c.get_node_addr()
-        self.log("addr", node="node-b", details=addr_b[:60] + "...")
-        self.log("addr", node="node-c", details=addr_c[:60] + "...")
+        for name in HOLDER_NODES:
+            holder = self.cluster.node(name)
+            addr = holder.get_node_addr()
+            self.log("addr", node=name, details=addr[:60] + "...")
+            a.connect_peer(addr)
 
-        # Connect A to B and C
-        a.connect_peer(addr_b)
-        a.connect_peer(addr_c)
-        time.sleep(2)
-
+        time.sleep(3)
         self.snapshot_all()
 
     def _create_and_backup(self) -> None:
         self.log("phase", details="Creating files and backing up")
         a = self.cluster.node("node-a")
 
-        # Create test files
-        files = a.create_text_files(n=3)
+        # Create 5 test files
+        files = a.create_text_files(n=5)
         self.log("files_created", node="node-a", details=f"{len(files)} files")
 
         # Trigger backup
@@ -117,19 +124,22 @@ class SmokeScenario(BaseScenario):
         self.snapshot_all()
 
     def _verify_shards(self) -> None:
-        self.log("phase", details="Verifying shard distribution")
+        self.log("phase", details="Verifying shard distribution across holders")
 
-        for name in ["node-b", "node-c"]:
+        total_held = 0
+        for name in HOLDER_NODES:
             node = self.cluster.node(name)
             status = node.status()
             held = int(status.get("shards_held", "0"))
+            total_held += held
             self.log("verify", node=name, details=f"shards_held={held}")
 
+        self.log("verify_total", details=f"total_shards_held={total_held}")
         self.snapshot_all()
 
     def _stop_all(self) -> None:
         self.log("phase", details="Stopping all daemons")
-        for name in ["node-a", "node-b", "node-c"]:
+        for name in ALL_NODES:
             try:
                 self.cluster.node(name).stop()
             except Exception:

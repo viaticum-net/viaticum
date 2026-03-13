@@ -19,6 +19,11 @@ pub const KI: f64 = 1.75;
 /// Rolling window length for P score (weeks).
 pub const P_WINDOW_WEEKS: u32 = 4;
 
+/// Initial P value for newly connected peers.
+/// Represents "benefit of the doubt" — unproven but assumed good faith.
+/// combined = KP * 0.1 * 1.0 = 0.04 — low but nonzero, allows initial placement.
+pub const INITIAL_TRUST_P: f64 = 0.1;
+
 /// S floor — even zero-storage peers get 10% trust multiplier.
 pub const S_CLAMP_MIN: f64 = 0.1;
 

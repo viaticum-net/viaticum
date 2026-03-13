@@ -203,13 +203,35 @@ Lowest priority → evict first. Hysteresis: evict только если new_pri
 
 Отвечает за чужие шарды на моём диске.
 
-- Принимать входящие шарды (iroh-blobs) если есть место и owner в allowlist
+- Принимать входящие шарды (inline ShardData или iroh-blobs) если есть место и owner в allowlist
 - Отвечать на PoS challenges (hash(range + nonce) + merkle proof)
-- Escrow: проверять I-score при restore request
+- Escrow: проверять weeks_in_network при restore request
 - Shard lifecycle: active → marked-for-delete (cooldown 4wk) → deleted
 - При нехватке места: дропать по приоритетам (2.8 в overview.md)
 - Silent shards: owner замолчал — хранить если high I-score, дропать если low
 - Storage warning: получил уведомление о bit rot → selfcheck, уведомить пользователя
+
+### In-memory state Processor'а (промежуточные состояния протокола)
+
+Processor держит в памяти промежуточные состояния для stateful протокольных flow:
+
+```
+pending_descriptors: HashMap<ShardId, SignedShardDescriptor>
+  — holder side: сохраняется при shard_accept, используется при получении ShardData blob
+  — удаляется после store_shard() или по таймауту
+
+pending_shard_to_restore: HashMap<ShardId, (restore_id, shard_index)>
+  — owner side: маппинг ожидаемых шардов к активному restore
+  — удаляется при получении ShardData или restore_denied
+
+pending_pos_challenges: HashMap<nonce, PendingPosChallenge>
+  — owner side: отправленные PoS challenges, ожидающие ответа
+
+pending_restores: HashMap<restore_id, PendingRestore>
+  — owner side: активные restore операции (k шардов, буферы)
+```
+
+**Критично:** потеря промежуточного состояния (например, pending_descriptors) приводит к молчаливому отбрасыванию сообщений. ShardData от owner будет проигнорирован, если descriptor не сохранён при accept.
 
 ## Scheduler (периодические задачи)
 

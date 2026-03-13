@@ -138,6 +138,8 @@ struct Processor {
     pending_shard_to_restore: HashMap<syncback_core::types::ShardId, (u64, usize)>,
     /// Counter for restore IDs.
     next_restore_id: u64,
+    /// Descriptors from accepted shard offers (holder side), awaiting blob arrival.
+    pending_descriptors: HashMap<syncback_core::types::ShardId, syncback_core::messages::SignedShardDescriptor>,
 
     // ---- DR boot state machine ----
     /// Set during DR restore; cleared when PeerConnected fires and request is sent.
@@ -224,6 +226,7 @@ pub async fn run(
         pending_restores: HashMap::new(),
         pending_shard_to_restore: HashMap::new(),
         next_restore_id: 0,
+        pending_descriptors: HashMap::new(),
         pending_dr_peer_addr: None,
         pending_dr_cli_reply: None,
         pending_dr_reply: None,
@@ -1579,7 +1582,15 @@ impl Processor {
                     bytes = shard_data.data.len(),
                     "shard data received inline"
                 );
-                self.on_shard_data_received(shard_data.shard_id, shard_data.data).await;
+                // Check if this is a restore flow (owner receiving) or upload flow (holder receiving).
+                if self.pending_shard_to_restore.contains_key(&shard_data.shard_id) {
+                    self.on_shard_data_received(shard_data.shard_id, shard_data.data).await;
+                } else if let Some(descriptor) = self.pending_descriptors.remove(&shard_data.shard_id) {
+                    // Holder receiving blob from owner — store it.
+                    self.on_shard_upload_received(from, descriptor, shard_data.data).await;
+                } else {
+                    tracing::debug!(shard = %shard_data.shard_id, "shard_data: no pending restore or descriptor, ignoring");
+                }
             }
             DirectBody::SystemStateBackup(msg) => {
                 self.handle_system_state_backup_received(from, msg).await;
@@ -1592,6 +1603,10 @@ impl Processor {
             }
             DirectBody::SystemStateAck(msg) => {
                 self.handle_system_state_ack(from, msg).await;
+            }
+            DirectBody::BoardProxy(proxy) => {
+                // Alpha: board messages delivered as direct messages.
+                self.handle_board_message(from, proxy.msg_type, proxy.payload).await;
             }
         }
     }
@@ -1831,6 +1846,8 @@ impl Processor {
         {
             OfferDecision::Accept => {
                 tracing::debug!(shard = %descriptor.shard_id, "shard offer: accepting");
+                // Store descriptor for when the blob arrives via ShardData.
+                self.pending_descriptors.insert(descriptor.shard_id, msg.descriptor.clone());
                 let accept_msg = ShardAcceptMsg {
                     v: 1,
                     shard_id: descriptor.shard_id,
@@ -1864,6 +1881,42 @@ impl Processor {
                     now,
                 )
                 .await;
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Shard upload received (we are the holder, owner sent blob)
+    // ----------------------------------------------------------------
+
+    async fn on_shard_upload_received(
+        &self,
+        from: IdentityPub,
+        descriptor: syncback_core::messages::SignedShardDescriptor,
+        data: Vec<u8>,
+    ) {
+        let shard_id = descriptor.shard_id;
+        match self.storage.store_shard(&descriptor, &data).await {
+            Ok(()) => {
+                tracing::info!(shard = %shard_id, owner = %from, bytes = data.len(), "shard stored from upload");
+                // Send shard_stored board message back to the owner.
+                let stored_msg = ShardStoredMsg {
+                    v: 1,
+                    shard_id,
+                    ts: Timestamp::now().0,
+                };
+                let payload = to_cbor(&stored_msg).expect("cbor failed");
+                self.net_cmd_tx
+                    .send(NetCommand::PublishBoard {
+                        msg_type: "shard_stored".to_string(),
+                        payload,
+                        directed_to: Some(from),
+                    })
+                    .await
+                    .expect("net channel closed");
+            }
+            Err(e) => {
+                tracing::debug!(shard = %shard_id, error = %e, "shard upload: store failed");
             }
         }
     }

@@ -199,7 +199,26 @@ impl BudgetPlanner {
         };
 
         let headroom_gb = committed_gb * placement_success_rate * WILLINGNESS_FACTOR;
-        let total_gb = committed_gb + headroom_gb;
+        let mut total_gb = committed_gb + headroom_gb;
+
+        // Bootstrap: on first run with no committed shards, allow backing up all dirty files.
+        // Without this, budget=0 means nothing ever gets uploaded (chicken-and-egg).
+        if committed_gb < 1e-9 {
+            let dirty_paths = self.db.list_dirty_files()?;
+            let mut dirty_bytes: u64 = 0;
+            for path in &dirty_paths {
+                if let Some(f) = self.db.get_file(path)? {
+                    if ErasureTier::from_importance(f.importance).is_some() {
+                        dirty_bytes += f.size_bytes;
+                    }
+                }
+            }
+            if dirty_bytes > 0 {
+                // Use max overhead factor (3.0 for importance >= 0.8) as conservative estimate.
+                let bootstrap_gb = dirty_bytes as f64 / 1_073_741_824.0 * 3.0;
+                total_gb = total_gb.max(bootstrap_gb);
+            }
+        }
         let now = Timestamp::now();
 
         // Persist updated record.

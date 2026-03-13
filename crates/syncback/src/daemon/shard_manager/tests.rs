@@ -361,7 +361,8 @@ async fn upload_unit_produces_n_shards_and_offers() {
 #[tokio::test]
 async fn upload_unit_fails_with_not_enough_peers() {
     let (db, _tmp) = test_db();
-    make_peers(&db, 3);
+    // 1 peer × 6 cap = 6 slots < 10 (importance=0.5, n=10+adaptive)
+    make_peers(&db, 1);
 
     let (mgr, _rx) = make_shard_manager(db.clone());
 

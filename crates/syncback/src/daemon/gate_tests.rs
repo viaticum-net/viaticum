@@ -420,9 +420,9 @@ fn trust_updates_after_pos_round() {
     let now = Timestamp(1_700_000_000);
     trust.upsert_peer(&peer, now).unwrap();
 
-    // Initial score: 0.
+    // Initial score: small (INITIAL_TRUST_P), not zero.
     let score_before = trust.score(&peer).unwrap();
-    assert_eq!(score_before.combined, 0.0, "new peer has zero trust");
+    assert!(score_before.combined > 0.0, "new peer has initial trust > 0");
 
     // Record a perfect PoS week.
     trust
@@ -500,14 +500,15 @@ async fn placement_and_upload_full_flow_distributes_shards() {
         placements.len()
     );
 
-    // All holders must be distinct.
-    let holders: std::collections::HashSet<IdentityPub> =
-        placements.iter().map(|(_, h)| *h).collect();
-    assert_eq!(
-        holders.len(),
-        placements.len(),
-        "all shard holders must be distinct"
-    );
+    // No single peer exceeds MAX_SHARDS_PER_PARTNER.
+    let mut per_peer: std::collections::HashMap<IdentityPub, usize> = std::collections::HashMap::new();
+    for (_, h) in &placements {
+        *per_peer.entry(*h).or_insert(0) += 1;
+    }
+    for (peer, count) in &per_peer {
+        assert!(*count <= syncback_core::constants::MAX_SHARDS_PER_PARTNER as usize,
+            "peer {:?} got {} shards, exceeds cap", peer, count);
+    }
 
     // Net channel must have received one offer per shard.
     let mut offer_count = 0;

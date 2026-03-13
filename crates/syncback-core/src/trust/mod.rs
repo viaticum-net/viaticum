@@ -1,6 +1,6 @@
 use redb::ReadableTable;
 
-use crate::constants::{KI, KP, P_WINDOW_WEEKS, S_CLAMP_MAX, S_CLAMP_MIN, SECS_PER_WEEK};
+use crate::constants::{INITIAL_TRUST_P, KI, KP, P_WINDOW_WEEKS, S_CLAMP_MAX, S_CLAMP_MIN, SECS_PER_WEEK};
 use crate::db::{Db, DbError, POS_WEEKLY};
 use crate::types::{from_cbor_bytes, to_cbor_bytes, IdentityPub, PeerRecord, Timestamp};
 
@@ -109,7 +109,7 @@ impl TrustEngine {
                 let record = PeerRecord {
                     identity: *peer,
                     node_id: None,
-                    trust_p: 0.0,
+                    trust_p: INITIAL_TRUST_P,
                     trust_i: 0.0,
                     trust_s: 1.0,
                     bytes_sent_to_peer: 0,

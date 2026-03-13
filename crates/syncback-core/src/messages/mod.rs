@@ -156,6 +156,17 @@ pub enum DirectBody {
     SystemStateRequest(SystemStateRequestMsg),
     /// Holder → Requester. The stored blob (or empty on not-found).
     SystemStateResponse(SystemStateResponseMsg),
+    /// Alpha-only: wraps a board message payload for direct transport
+    /// (iroh-docs not implemented in alpha).
+    BoardProxy(BoardProxyMsg),
+}
+
+/// Alpha-only: wraps a board message for direct transport.
+/// In production, these would go through iroh-docs boards.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BoardProxyMsg {
+    pub msg_type: String,
+    pub payload: Vec<u8>,
 }
 
 /// Holder → Owner. Inline shard blob transfer over a direct connection.

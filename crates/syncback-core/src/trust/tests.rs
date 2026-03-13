@@ -28,10 +28,12 @@ fn upsert_peer_creates_neutral_record() {
     let peer = test_peer(1);
     engine.upsert_peer(&peer, Timestamp(1000)).unwrap();
     let score = engine.score(&peer).unwrap();
-    assert_eq!(score.p, 0.0);
+    assert_eq!(score.p, crate::constants::INITIAL_TRUST_P);
     assert_eq!(score.i, 0.0);
     assert_eq!(score.s_raw, 1.0);
-    assert_eq!(score.combined, 0.0);
+    // combined = (KP * INITIAL_TRUST_P + KI * 0.0) * clamp(1.0, 0.1, 1.0)
+    let expected = KP * crate::constants::INITIAL_TRUST_P;
+    assert!((score.combined - expected).abs() < 1e-10);
 }
 
 #[test]
@@ -154,7 +156,7 @@ fn s_score_freeloader_gets_minimum() {
     // combined uses clamp(0.0, 0.1, 1.0) = 0.1
     let score = engine.score(&peer).unwrap();
     assert!((score.s_raw - 0.0).abs() < 1e-10);
-    let expected_combined = (KP * 0.0 + KI * 0.0) * 0.1;
+    let expected_combined = (KP * crate::constants::INITIAL_TRUST_P + KI * 0.0) * 0.1;
     assert!((score.combined - expected_combined).abs() < 1e-10);
 }
 
@@ -188,7 +190,7 @@ fn s_score_exceeds_one_is_clamped_in_combined() {
     assert!((record.trust_s - 2.0).abs() < 1e-10, "s_raw={}", record.trust_s);
     let score = engine.score(&peer).unwrap();
     // clamp(2.0, 0.1, 1.0) = 1.0
-    let expected_combined = (KP * 0.0 + KI * 0.0) * 1.0;
+    let expected_combined = (KP * crate::constants::INITIAL_TRUST_P + KI * 0.0) * 1.0;
     assert!((score.combined - expected_combined).abs() < 1e-10);
 }
 

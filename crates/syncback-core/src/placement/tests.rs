@@ -87,18 +87,18 @@ fn placement_fails_when_called_with_low_importance() {
 }
 
 #[test]
-fn placement_fails_when_fewer_peers_than_n() {
+fn placement_fails_when_total_slots_less_than_n() {
     let (db, _tmp) = test_db();
     let trust = TrustEngine::new(db.clone());
     let engine = PlacementEngine::new(db.clone(), TrustEngine::new(db.clone()));
     let unit_id = test_unit_id(1);
-    let peers = test_peers(4);
+    // 2 peers × 6 cap = 12 total slots < 15 (importance=0.8)
+    let peers = test_peers(2);
     for p in &peers {
         setup_peer_with_trust(&trust, &db, p, 0.5);
     }
-    // importance=0.8 → base_n=15, avg_trust > 0.6 so no extra
     let result = engine.select_holders(unit_id, 0.8);
-    assert!(matches!(result, Err(PlacementError::NotEnoughPeers { need: _, have: 4 })));
+    assert!(matches!(result, Err(PlacementError::NotEnoughPeers { .. })));
 }
 
 #[test]
@@ -118,9 +118,15 @@ fn placement_succeeds_with_exact_n_peers() {
     assert!(result.is_ok(), "unexpected error: {:?}", result);
     let plan = result.unwrap();
     assert_eq!(plan.assignments.len(), 15);
-    // All holders must be unique
-    let holders: std::collections::HashSet<_> = plan.assignments.iter().map(|a| a.holder).collect();
-    assert_eq!(holders.len(), 15);
+    // No single peer exceeds MAX_SHARDS_PER_PARTNER
+    let mut per_peer: std::collections::HashMap<IdentityPub, usize> = std::collections::HashMap::new();
+    for a in &plan.assignments {
+        *per_peer.entry(a.holder).or_insert(0) += 1;
+    }
+    for (peer, count) in &per_peer {
+        assert!(*count <= MAX_SHARDS_PER_PARTNER as usize,
+            "peer {:?} got {} shards, exceeds cap {}", peer, count, MAX_SHARDS_PER_PARTNER);
+    }
 }
 
 #[test]
@@ -194,38 +200,17 @@ fn per_partner_cap_enforced() {
         db.upsert_shard(&record).unwrap();
     }
 
-    // importance=0.1 → n=7, adaptive bump depends on avg trust
-    // avg trust is high (≈1.0 for all), so n stays 7
-    // But only 3 unique peers, one is capped → only 2 eligible
-    // So we need n <= 2 for this to work, or we need to accept it fails
-    // The test says: peer A must NEVER appear in the 1 remaining slot
-    // With n=7 and only 2 eligible peers, it will fail
-    // The spec says importance=0.1 (n=7) — 3 peers, A capped, B+C eligible → fails
-    // Test: verify A is not in any plan (even if plan fails)
-
-    // Let's do: with fewer n needed — use importance with n=2 would need a non-standard tier
-    // Actually re-reading spec test 5:
-    // "Unit already has 6 shards assigned to peer A in DB. importance = 0.1 (n=7).
-    //  Expected: peer A never appears in assignment for the remaining 1 slot."
-    // This implies n shards total - 6 already assigned to A = 1 slot remaining
-    // But the engine doesn't see "already placed" as reducing n — it just enforces cap
-    // With 3 peers where A is at cap: pool = [B, C] → 2 eligible < n=7 → NotEnoughPeers
-    // Test: verify error is NotEnoughPeers (not placement with A), or verify A not selected
-
+    // importance=0.1 → n=7, avg trust is high → no adaptive bump
+    // Peer A at cap (6 existing), B and C have 6 slots each = 12 total >= 7
+    // Verify: A never appears in the new assignments
     let result = engine.select_holders(unit_id, 0.1);
-    match result {
-        Err(PlacementError::NotEnoughPeers { .. }) => {
-            // Expected: can't fill 7 slots with 2 eligible peers (A is capped)
-        }
-        Ok(plan) => {
-            // If somehow succeeded, A must not appear
-            assert!(
-                !plan.assignments.iter().any(|a| a.holder == peer_a),
-                "peer A (at cap) should not be selected"
-            );
-        }
-        Err(e) => panic!("unexpected error: {:?}", e),
-    }
+    assert!(result.is_ok(), "should succeed: B+C have 12 slots for n=7, got: {:?}", result);
+    let plan = result.unwrap();
+    assert_eq!(plan.assignments.len(), 7);
+    assert!(
+        !plan.assignments.iter().any(|a| a.holder == peer_a),
+        "peer A (at cap) should not be selected"
+    );
 }
 
 #[test]

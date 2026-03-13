@@ -6,6 +6,12 @@
 
 Шарды передаются целиком внутри CBOR-сообщения (`DirectBody::ShardData`). MAX_MESSAGE_SIZE = 64 MiB.
 
+`ShardData` — двунаправленный message type:
+- Upload flow (Owner → Holder): после shard_accept, owner отправляет blob через `NetCommand::UploadShard` → `connect_and_send` с `ShardData` message
+- Restore flow (Holder → Owner): после RestoreRequest, holder отправляет blob через `NetCommand::SendDirect` с `ShardData` message
+
+Получатель различает направления по наличию pending state: `pending_descriptors` (upload) или `pending_shard_to_restore` (restore).
+
 **Последствия:**
 - ~100 МБ RAM на один активный transfer (sender + receiver)
 - Нет resume: обрыв = retry с нуля (~20с на шард при 20 Мбит/с)
@@ -15,16 +21,19 @@
 
 **Решение:** iroh-blobs (content-addressed transfer с verified streaming и resume).
 
-## No iroh-docs (gossip boards)
+## No iroh-docs (gossip boards) → BoardProxy
 
-iroh-docs объявлены в зависимостях, но не используются. Peer discovery, PoS challenges, shard offers — всё через прямые соединения.
+iroh-docs объявлены в зависимостях, но не используются. Все board messages (shard_offer, shard_accept, shard_stored, pos_challenge, etc.) доставляются как `DirectBody::BoardProxy` — прямое QUIC-соединение, handshake, framed CBOR message.
+
+**Механизм:** `NetCommand::PublishBoard { msg_type, payload, directed_to }` → network открывает connection к `directed_to`, отправляет `DirectMessage { body: BoardProxy(BoardProxyMsg { msg_type, payload }) }`. Получатель в `handle_direct_message` маршрутизирует по `msg_type` в `handle_board_message`.
 
 **Последствия:**
-- Нет асинхронной доставки сообщений (оба peer должны быть онлайн)
-- Нет gossip relay (peer_announce не распространяется)
-- Peer discovery — ручное (ConnectPeer)
+- Оба peer должны быть онлайн одновременно для обмена сообщениями
+- Нет gossip relay (peer_announce не распространяется — каждый пир знает только тех, к кому подключился)
+- Peer discovery — ручное (ConnectPeer CLI команда)
+- Каждое board message = новое QUIC connection + handshake (нет connection pool)
 
-**Решение:** интеграция iroh-docs для board-based messaging.
+**Решение:** интеграция iroh-docs для board-based messaging (асинхронная доставка, gossip relay, offline message delivery).
 
 ## In-memory packer и RAM profile
 
@@ -47,6 +56,14 @@ iroh-docs объявлены в зависимостях, но не исполь
 2. Streaming compress+encrypt — не читать весь файл целиком
 3. Streaming RS — encode по мере шифрования
 4. Restore шарды на диск — RS decode читает с диска
+
+## Trust bootstrap
+
+Новые пиры получают `INITIAL_TRUST_P = 0.1` вместо 0. Без этого P=0, I=0 → combined trust = 0 → placement фильтрует всех → невозможно разместить ни одного шарда в свежей сети.
+
+Combined trust нового пира = KP × 0.1 × 1.0 = 0.04 — достаточно для placement, но trust^2 = 0.0016 → вес при placement крайне низкий. Это "кредит доверия" — доказать надёжность можно только через PoS.
+
+**Когда станет проблемой:** если INITIAL_TRUST_P слишком высокий — Sybil атака легче. Текущий 0.1 — компромисс.
 
 ## No file versioning
 

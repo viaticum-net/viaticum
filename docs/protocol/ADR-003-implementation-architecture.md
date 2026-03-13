@@ -108,8 +108,14 @@ loop {
 
 - `syncback daemon` — запускает демон в foreground
 - `syncback status`, `syncback backup`, ... — CLI-команды, общаются с демоном через Unix domain socket
-- Протокол: JSON request/response (для альфы достаточно)
+- Протокол: JSON request → JSON response (одна строка, `\n`-terminated)
 - Автозапуск: systemd (Linux) / launchd (Mac), не daemonize в коде
+
+**Формат ответа:** Плоский JSON с `#[serde(tag = "status")]` дискриминантом. Все поля на верхнем уровне:
+```json
+{"status":"status_ok","own_node_id":"...","peers":4,"shards_held":0,"shards_placed":17}
+```
+НЕ вложенный формат вроде `{"status_ok":{"own_node_id":"..."}}`. Это важно для парсинга в скриптах.
 
 ## Runtime paths
 
@@ -288,26 +294,54 @@ Struct + impl + Error enum. Никаких trait'ов "на будущее", н�
 - `From`/`Into` только для error conversion (`#[from]` в thiserror)
 - Минимум generics — конкретные типы где возможно
 
-### Тесты рядом с кодом
+### Нет молчаливых заглушек на data path
 
-Unit тесты — в том же файле. Интеграционные — в `tests/` директории crate'а.
+Все варианты `match` на `NetCommand`, `DirectBody` и других enum'ах протокольных сообщений ДОЛЖНЫ быть реализованы или использовать `unimplemented!("reason")`. Никогда `_ => {}` или `debug!("not implemented")` — это приводит к молчаливой потере данных. Минимум: `warn!("XYZ not implemented, message dropped")`.
+
+### Тесты в отдельных файлах
+
+Unit тесты — в отдельном файле `tests.rs` рядом с модулем. Модуль = директория:
+
+```
+module/
+  mod.rs       — реализация
+  tests.rs     — unit тесты (#[cfg(test)])
+```
 
 ```rust
-// trust.rs
+// module/mod.rs
 pub struct TrustEngine { ... }
 impl TrustEngine { ... }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pos_success_increases_trust() { ... }
-
-    #[test]
-    fn four_week_window_decays() { ... }
-}
+mod tests;
 ```
+
+```rust
+// module/tests.rs
+use super::*;
+
+#[test]
+fn pos_success_increases_trust() { ... }
+```
+
+Интеграционные тесты — в `tests/` директории crate'а.
+
+### Критичные константы
+
+Эти значения влияют на корректность протокола, не только на производительность:
+
+- `INITIAL_TRUST_P = 0.1` — bootstrap trust для новых пиров. Без него P=0 → trust=0 → placement невозможен
+- `MAX_SHARDS_PER_PARTNER = 6` — cap шардов одного юнита на одном пире. Placement считает слоты (peers × 6), не уникальных пиров
+- `MAX_MESSAGE_SIZE = 64 MiB` — лимит одного framed сообщения (inline shard transfer)
+
+### Serialization API
+
+- `frame_message(msg) → Vec<u8>` — единственный способ подготовить сообщение для отправки по сети (u32 BE prefix + CBOR)
+- `to_cbor(msg) → Vec<u8>` — голый CBOR, только для вложенных payload'ов (например, payload внутри BoardProxy)
+- `parse_framed(buf) → DirectMessage` — единственный способ прочитать сообщение из сети
+
+Путаница: если отправить `to_cbor()` байты напрямую в сокет, получатель прочитает CBOR-header как length prefix (например, 0xA2626964 → "2.7 ГБ длина") → connection closed.
 
 ## Тестирование
 

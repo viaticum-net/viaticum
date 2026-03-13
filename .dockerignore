@@ -1,0 +1,8 @@
+target/
+.git/
+.claude/
+results/
+simulations/
+__pycache__/
+*.pyc
+experiments/results/
