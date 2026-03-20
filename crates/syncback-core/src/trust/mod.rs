@@ -45,6 +45,12 @@ pub struct TrustEngine {
     pos_weekly: HashMap<(IdentityPub, u32), WeeklyPosRecord>,
 }
 
+impl Default for TrustEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrustEngine {
     pub fn new() -> Self {
         TrustEngine {

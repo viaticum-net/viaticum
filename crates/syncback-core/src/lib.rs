@@ -5,6 +5,8 @@
 pub mod budget;
 pub mod cluster;
 pub mod constants;
+pub mod db;
+pub mod erasure;
 pub mod escrow;
 pub mod trust;
 pub mod types;
