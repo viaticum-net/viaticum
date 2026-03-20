@@ -8,5 +8,6 @@ pub mod constants;
 pub mod db;
 pub mod erasure;
 pub mod escrow;
+pub mod pos;
 pub mod trust;
 pub mod types;
