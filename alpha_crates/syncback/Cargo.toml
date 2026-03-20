@@ -1,0 +1,48 @@
+[package]
+name = "syncback"
+description = "SyncBack daemon and CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+syncback-core = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+redb = { workspace = true }
+anyhow = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+rand_core = { version = "0.6", features = ["getrandom"] }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+blake3 = { workspace = true }
+reed-solomon-erasure = { workspace = true }
+ciborium = { workspace = true }
+serde_json = "1"
+zstd = "0.13"
+bip39 = { version = "2", features = ["rand"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+hex = "0.4"
+
+# P2P networking
+iroh = { workspace = true }
+iroh-blobs = { workspace = true }
+iroh-docs = { workspace = true }
+iroh-gossip = { workspace = true }
+
+notify = "6"
+notify-debouncer-mini = "0.4"
+glob = "0.3"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+syncback-core = { workspace = true, features = ["testutil"] }

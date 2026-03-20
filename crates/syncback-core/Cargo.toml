@@ -1,6 +1,6 @@
 [package]
 name = "syncback-core"
-description = "SyncBack core logic: trust, escrow, placement, budget, messages"
+description = "SyncBack core logic: types, trust, escrow, placement, erasure, cluster"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,22 +14,18 @@ serde = { workspace = true }
 ciborium = { workspace = true }
 blake3 = { workspace = true }
 chacha20poly1305 = { workspace = true }
+chacha20 = { workspace = true }
 ed25519-dalek = { workspace = true }
 x25519-dalek = { workspace = true }
 hkdf = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
-reed-solomon-erasure = { workspace = true }
+raptorq = { workspace = true }
 redb = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-# Only needed when the testutil feature is enabled (integration tests, external test helpers).
 tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-
-[[test]]
-name = "phase1_gate"
-required-features = ["testutil"]

@@ -1,51 +1,49 @@
 use crate::constants::{
-    ERASURE_K, SECS_PER_WEEK, TIER_HIGH_N, TIER_HIGH_THRESHOLD, TIER_LOW_N, TIER_LOW_THRESHOLD,
-    TIER_MID_N, TIER_MID_THRESHOLD,
+    DECODE_OVERHEAD, OVERHEAD_BASE, OVERHEAD_SCALE, SECS_PER_WEEK, SYMBOL_SIZE,
 };
 
 // ============================================================
 // Newtype ID wrappers
 // ============================================================
 
-/// BLAKE3 hash of shard blob content. 32 bytes.
+/// BLAKE3 hash of encrypted source block content. 32 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct ShardId(pub [u8; 32]);
+pub struct SourceBlockId(pub [u8; 32]);
 
-/// Identifier of a unit (pack or chunk). Derived from owner+index+hash.
-/// 32 bytes, opaque — exact derivation is in shard_manager.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct UnitId(pub [u8; 32]);
-
-/// Ed25519 public key of a peer identity. 32 bytes.
+/// Ed25519 public key of a peer identity (master key). 32 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct IdentityPub(pub [u8; 32]);
+
+/// Random device identifier, stored in ~/.syncback/device_id. 16 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct DeviceId(pub [u8; 16]);
 
 /// Monotonically-increasing file identifier. u64, assigned on first index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FileId(pub u64);
 
-/// iroh NodeId — the transport-layer peer identity. 32 bytes (Ed25519 pubkey).
+/// iroh NodeId — transport-layer peer identity. 32 bytes (Ed25519 pubkey).
 /// Distinct from IdentityPub: IdentityPub = "who you are", NodeId = "how to reach you".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct NodeId(pub [u8; 32]);
 
 // --- Display ---
 
-impl std::fmt::Display for ShardId {
+impl std::fmt::Display for SourceBlockId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode_upper_lower(&self.0[..8]))
-    }
-}
-
-impl std::fmt::Display for UnitId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode_upper_lower(&self.0[..8]))
+        write!(f, "{}", hex_lower(&self.0[..8]))
     }
 }
 
 impl std::fmt::Display for IdentityPub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode_upper_lower(&self.0[..8]))
+        write!(f, "{}", hex_lower(&self.0[..8]))
+    }
+}
+
+impl std::fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", hex_lower(&self.0[..8]))
     }
 }
 
@@ -57,32 +55,29 @@ impl std::fmt::Display for FileId {
 
 impl std::fmt::Display for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode_upper_lower(&self.0[..8]))
+        write!(f, "{}", hex_lower(&self.0[..8]))
     }
 }
 
-// Inline helper — lowercase hex of a byte slice.
-mod hex {
-    pub fn encode_upper_lower(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // --- AsRef<[u8]> ---
 
-impl AsRef<[u8]> for ShardId {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl AsRef<[u8]> for UnitId {
+impl AsRef<[u8]> for SourceBlockId {
     fn as_ref(&self) -> &[u8] {
         &self.0
     }
 }
 
 impl AsRef<[u8]> for IdentityPub {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for DeviceId {
     fn as_ref(&self) -> &[u8] {
         &self.0
     }
@@ -98,13 +93,13 @@ impl AsRef<[u8]> for NodeId {
 // Timestamp
 // ============================================================
 
-/// Unix timestamp in seconds. u64 — no negatives, good until year 2554.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+/// Unix timestamp in seconds.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Timestamp(pub u64);
 
 impl Timestamp {
-    /// Current wall-clock time (seconds since Unix epoch).
-    /// Uses std::time::SystemTime — no tokio dependency.
     pub fn now() -> Self {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -113,413 +108,340 @@ impl Timestamp {
         Timestamp(secs)
     }
 
-    /// Add a number of seconds.
     pub fn add_secs(self, secs: u64) -> Self {
         Timestamp(self.0 + secs)
     }
 
-    /// Add a number of weeks (1 week = 604800 seconds).
     pub fn add_weeks(self, weeks: u64) -> Self {
         Timestamp(self.0 + weeks * SECS_PER_WEEK)
     }
 
-    /// How many whole weeks have elapsed since `self` as of `now`.
-    /// Returns 0 if `now` < `self`.
     pub fn weeks_elapsed(self, now: Timestamp) -> u64 {
-        if now.0 <= self.0 {
-            return 0;
-        }
-        (now.0 - self.0) / SECS_PER_WEEK
+        now.0.saturating_sub(self.0) / SECS_PER_WEEK
     }
 
-    /// How many whole seconds have elapsed since `self` as of `now`.
     pub fn secs_elapsed(self, now: Timestamp) -> u64 {
-        if now.0 <= self.0 {
-            return 0;
-        }
-        now.0 - self.0
+        now.0.saturating_sub(self.0)
     }
 }
 
 // ============================================================
-// Erasure coding tier
+// Erasure parameters
 // ============================================================
 
-/// Reed-Solomon tier derived from importance score.
-/// Tiers are fixed by the protocol recommendation (overview.md §2.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ErasureTier {
-    /// importance >= 0.8 → 5-of-15 (×3.0 overhead)
-    High,
-    /// importance >= 0.4 → 5-of-10 (×2.0 overhead)
-    Medium,
-    /// importance >= 0.1 → 5-of-7 (×1.4 overhead)
-    Low,
+/// Computed erasure coding parameters for a source block.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ErasureParams {
+    /// Source symbols count (source_block_size / T).
+    pub k: u32,
+    /// Effective K for decode (K + DECODE_OVERHEAD).
+    pub k_eff: u32,
+    /// Symbol size in bytes.
+    pub t: u16,
+    /// Overhead multiplier (1.5 + importance * 1.5).
+    pub overhead: f64,
+    /// Total symbols to distribute (k_eff * overhead, rounded up).
+    pub n: u32,
 }
 
-impl ErasureTier {
-    /// Minimum shards required for reconstruction (k).
-    pub fn k(self) -> usize {
-        ERASURE_K as usize
-    }
-
-    /// Total shards before adaptive adjustment (n_base).
-    pub fn n_base(self) -> usize {
-        match self {
-            ErasureTier::High => TIER_HIGH_N as usize,
-            ErasureTier::Medium => TIER_MID_N as usize,
-            ErasureTier::Low => TIER_LOW_N as usize,
-        }
-    }
-
-    /// Overhead multiplier (n_base / k), as a float.
-    pub fn overhead(self) -> f64 {
-        self.n_base() as f64 / self.k() as f64
-    }
-
-    /// Derive tier from importance score [0.0, 1.0].
-    /// importance < 0.1 → None (do not back up).
-    pub fn from_importance(importance: f64) -> Option<Self> {
-        if importance >= TIER_HIGH_THRESHOLD {
-            Some(ErasureTier::High)
-        } else if importance >= TIER_MID_THRESHOLD {
-            Some(ErasureTier::Medium)
-        } else if importance >= TIER_LOW_THRESHOLD {
-            Some(ErasureTier::Low)
-        } else {
-            None
+impl ErasureParams {
+    /// Compute erasure parameters for a given source block size and importance.
+    pub fn compute(source_block_size: u64, importance: f64) -> Self {
+        let t = SYMBOL_SIZE;
+        let k = (source_block_size as f64 / t as f64).ceil() as u32;
+        let k_eff = k + DECODE_OVERHEAD;
+        let overhead = OVERHEAD_BASE + importance.clamp(0.0, 1.0) * OVERHEAD_SCALE;
+        let n = (k_eff as f64 * overhead).ceil() as u32;
+        ErasureParams {
+            k,
+            k_eff,
+            t,
+            overhead,
+            n,
         }
     }
+
+    /// Max symbols any single holder should store.
+    /// min(K_eff - 1, concentration_cap * N).
+    pub fn max_per_holder(&self) -> u32 {
+        let cap_fraction = (1.0 - 1.0 / self.overhead) * crate::constants::CONCENTRATION_CAP_FACTOR;
+        let cap = (cap_fraction * self.n as f64).floor() as u32;
+        cap.min(self.k_eff - 1)
+    }
 }
 
 // ============================================================
-// File type
+// File types
 // ============================================================
 
-/// Whether a shard belongs to user data or the system state backup.
-/// Stored in ShardDescriptor, signed by owner.
+/// Category for packing queue assignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FileType {
-    /// Normal user file shard.
-    User,
-    /// System state backup shard. Holder stores with max priority, TTL 5 years.
-    System,
+pub enum FileCategory {
+    Photo,
+    Document,
+    Video,
+    Other,
+}
+
+/// Local state of a file on a specific device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LocalState {
+    Present,
+    Deleted(Timestamp),
 }
 
 // ============================================================
-// Shard state (holder side)
+// Source block
 // ============================================================
 
-/// Lifecycle state of a shard on the holder's side.
+/// How the source block was created.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum SourceBlockType {
+    /// Batch of small files packed together. Index describes contents.
+    Pack { entries: Vec<PackEntry> },
+    /// One file (or one chunk of a large file).
+    Single,
+}
+
+/// Entry in a pack index: which file, at what offset and size within the pack.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PackEntry {
+    pub file_id: FileId,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// Lifecycle status of a source block on the owner's side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ShardState {
-    /// Stored, PoS challenges expected. High priority.
+pub enum SourceBlockStatus {
+    /// Symbols distributed, active.
     Active,
-    /// Owner sent `delete`. Cooling down (4 weeks). Then delete.
-    MarkedForDelete,
-    /// No PoS challenges, no delete message. Owner silent.
-    /// Priority determined by owner trust.
-    Silent,
-}
-
-// ============================================================
-// Unit type and status
-// ============================================================
-
-/// How the unit was created from the source file(s).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum UnitType {
-    /// Multiple small files packed into one unit.
-    Pack,
-    /// One chunk of a large file (≥ U bytes). Index stored in UnitRecord.
-    Chunk,
-}
-
-/// Lifecycle status of a unit on the owner's side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum UnitStatus {
-    /// Current version, shards distributed in network.
-    Active,
-    /// One or more member files have changed. Unit exists in network but is outdated.
+    /// >50% members invalid, vacuum candidate.
     Stale,
-    /// Delete message sent to all holders. Waiting for cooldown.
+    /// Delete in progress (cooldown).
     Deleting,
-    /// Cooldown elapsed, treated as removed.
+    /// Fully cleaned up.
     Deleted,
 }
 
 // ============================================================
-// Shard status (owner side)
+// Records (stored in DB)
 // ============================================================
 
-/// Status of a shard from the owner's perspective.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ShardStatus {
-    /// shard_offer sent, no shard_accept/reject yet.
-    Offered,
-    /// shard_accept received, blob transfer in progress.
-    Accepted,
-    /// shard_stored received. Holder confirmed storage.
-    Stored,
-    /// Holder dropped or lost the shard (shard_dropped, PoS fail, timeout).
-    Lost,
-    /// delete message sent. Cooldown in progress.
-    Deleting,
-}
-
-// ============================================================
-// Record structs
-// ============================================================
-
-/// Stored in the `files` table. Key: file_path (UTF-8 string bytes).
+/// File catalog entry. Key: file path.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileRecord {
     pub file_id: FileId,
-    /// Canonical absolute path (UTF-8).
     pub path: String,
-    /// BLAKE3 hash of the file's last-seen content.
-    pub content_hash: [u8; 32],
-    pub size_bytes: u64,
-    /// Importance score from config, range [0.0, 1.0].
     pub importance: f64,
-    /// File has changed since last backup. Watcher sets this.
-    pub dirty: bool,
-    /// Current unit containing this file's latest version.
-    /// None before first backup or after deletion.
-    pub current_unit_id: Option<UnitId>,
-    /// When this file was last successfully backed up.
-    pub last_backed_up: Option<Timestamp>,
-    /// Whether this file has ever been fully backed up.
-    pub backed_up: bool,
-    /// When the file was first indexed.
+    pub devices: Vec<(DeviceId, LocalState)>,
+    pub versions: Vec<FileVersion>,
     pub first_seen: Timestamp,
 }
 
-/// Stored in the `units` table. Key: UnitId (32 bytes).
+/// One version of a file (immutable once created).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct UnitRecord {
-    pub unit_id: UnitId,
-    pub unit_type: UnitType,
-    pub status: UnitStatus,
-    /// File IDs that are members of this pack. For Chunk units: single element.
-    pub member_file_ids: Vec<FileId>,
-    /// For Chunk units: which chunk (0-indexed) of the parent file.
-    pub chunk_index: Option<u32>,
-    /// For Chunk units: the parent file.
-    pub parent_file_id: Option<FileId>,
-    /// Unencrypted size of this unit's content in bytes.
-    pub size_bytes: u64,
-    /// BLAKE3 hash of the unencrypted plaintext unit content.
-    pub plaintext_hash: [u8; 32],
-    /// When this unit was created.
+pub struct FileVersion {
+    pub content_hash: [u8; 32],
+    pub source_block_id: SourceBlockId,
+    pub k: u32,
+    pub t: u16,
     pub created_at: Timestamp,
-    /// Average importance of member files. Used for erasure tier selection.
-    pub importance_avg: f64,
-    /// Reed-Solomon k parameter used when sharding this unit.
-    pub rs_k: u8,
-    /// Reed-Solomon n parameter (actual, post-adaptive adjustment).
-    pub rs_n: u8,
+    pub backed_up_at: Option<Timestamp>,
 }
 
-/// Stored in the `shards` table. Key: ShardId (32 bytes).
-/// Represents a shard the local node has placed in the network (owner view).
+/// Source block metadata. Key: SourceBlockId.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ShardRecord {
-    pub shard_id: ShardId,
-    pub unit_id: UnitId,
-    /// Index of this shard in the RS set (0-indexed).
-    pub shard_index: u8,
-    /// Peer holding this shard.
-    pub holder_id: IdentityPub,
-    pub status: ShardStatus,
-    /// Timestamp of last successful PoS verification.
-    pub last_verified: Option<Timestamp>,
-    /// When this shard was offered.
-    pub offered_at: Timestamp,
-    /// When shard_stored was received.
-    pub stored_at: Option<Timestamp>,
-    /// BLAKE3 Merkle root over 64 KB blocks of the shard blob.
-    /// Used by the owner to verify PoS responses from the holder.
-    #[serde(default)]
-    pub merkle_root: [u8; 32],
+pub struct SourceBlockRecord {
+    pub block_id: SourceBlockId,
+    pub k: u32,
+    pub t: u16,
+    pub block_type: SourceBlockType,
+    pub status: SourceBlockStatus,
+    pub created_at: Timestamp,
 }
 
-/// Stored in the `peers` table. Key: IdentityPub (32 bytes).
+/// Symbol placement from owner's perspective. Key: (SourceBlockId, holder IdentityPub).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SymbolPlacement {
+    pub source_block_id: SourceBlockId,
+    pub holder_id: IdentityPub,
+    /// File that owns this source block (for O(1) index updates).
+    pub file_id: FileId,
+    /// Ranges of ESIs assigned to this holder: (start_esi, count).
+    pub esi_ranges: Vec<(u32, u32)>,
+    /// Seed for per-holder binding: HKDF(source_block_id, holder_id).
+    pub binding_seed: [u8; 32],
+    pub status: PlacementStatus,
+    pub last_verified: Option<Timestamp>,
+    pub placed_at: Timestamp,
+}
+
+impl SymbolPlacement {
+    /// Total number of symbols at this holder.
+    pub fn symbol_count(&self) -> u32 {
+        self.esi_ranges.iter().map(|(_, count)| count).sum()
+    }
+}
+
+/// Status of symbols from the owner's perspective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PlacementStatus {
+    /// symbol_offer sent, waiting for response.
+    Offered,
+    /// Holder accepted, transfer in progress.
+    Accepted,
+    /// Symbols stored and confirmed.
+    Alive,
+    /// Holder dropped symbols or failed PoS.
+    Lost,
+    /// Delete in progress.
+    Deleting,
+}
+
+/// Peer info. Key: IdentityPub.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerRecord {
     pub identity: IdentityPub,
-    /// Last known iroh NodeId for transport connection.
     pub node_id: Option<NodeId>,
-    /// P component: rolling 4-week PoS success rate.
-    /// Range [0.0, 1.0].
+    /// P component: rolling 4-week PoS success rate [0.0, 1.0].
     pub trust_p: f64,
-    /// I component: cumulative mean PoS success rate.
-    /// Range [0.0, 1.0].
+    /// I component: cumulative mean PoS success rate [0.0, 1.0].
     pub trust_i: f64,
-    /// S component: pairwise storage ratio (their_stored_for_us / our_stored_for_them).
-    /// Range [0.0, ∞), clamped to [0.1, 1.0] in trust formula.
+    /// S component: pairwise storage ratio (raw, not clamped).
     pub trust_s: f64,
-    /// Total bytes we have sent to this peer (for S calculation).
-    pub bytes_sent_to_peer: u64,
-    /// Total bytes we have received from this peer (for S calculation).
-    pub bytes_received_from_peer: u64,
-    /// When this peer was first seen.
+    /// Total bytes we store for this peer.
+    pub bytes_we_store_for_peer: u64,
+    /// Total bytes this peer stores for us.
+    pub bytes_peer_stores_for_us: u64,
     pub first_seen: Timestamp,
-    /// When we last received any message from this peer.
     pub last_seen: Timestamp,
-    /// How many weeks this peer has been in the network (cumulative, never decrements).
+    /// Calendar weeks since first_seen.
     pub weeks_in_network: u32,
-    /// IPv4 /24 subnet prefix (first 3 octets), or None if unknown/IPv6.
-    /// Used for Sybil resistance: max 1 shard per /24.
-    pub subnet_prefix: Option<[u8; 3]>,
-    /// Whether this peer is manually trusted (trusted identity / allowlist).
-    /// Shards from allowlisted peers are never evicted and bypass escrow.
-    pub allowlisted: bool,
+    /// Which device manages this peer relationship (peer-to-device affinity).
+    pub device_id: Option<DeviceId>,
 }
 
-/// Stored in the `holding` table. Key: ShardId (32 bytes).
-/// Represents a shard we are holding for someone else (holder view).
+/// Symbols we hold for another owner. Key: (SourceBlockId, owner IdentityPub).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HoldingRecord {
-    pub shard_id: ShardId,
-    pub owner_pub: IdentityPub,
-    /// Importance claimed by owner in ShardDescriptor. Verified via signature.
+    pub source_block_id: SourceBlockId,
+    pub owner_id: IdentityPub,
+    pub esi_ranges: Vec<(u32, u32)>,
     pub importance: f64,
-    /// Shard blob size on disk in bytes.
-    pub size_bytes: u64,
-    /// Lifecycle state on our side.
-    pub state: ShardState,
-    /// When we received and stored this shard.
+    pub total_bytes: u64,
+    pub status: HoldingStatus,
     pub received_at: Timestamp,
-    /// When we received a `delete` message from owner. None if no delete request.
     pub delete_requested_at: Option<Timestamp>,
-    /// When we sent shard_drop_notice to owner (Phase 2 disk pressure).
-    /// Shard deletable after sent_at + DROP_NOTICE_WINDOW_SECS (7 days).
     pub drop_notice_sent_at: Option<Timestamp>,
-    /// file_type from ShardDescriptor: User or System.
-    pub file_type: FileType,
-    /// Merkle root from ShardDescriptor (for PoS verification).
-    pub merkle_root: [u8; 32],
-    /// RS k parameter from ShardDescriptor.
-    pub rs_k: u8,
-    /// RS n parameter from ShardDescriptor.
-    pub rs_n: u8,
-    /// Shard index in RS set (0-indexed).
-    pub shard_index: u8,
 }
 
-/// Stored in the `escrow_restore_log` table. Key = IdentityPub (32 bytes).
-/// Tracks cumulative bytes served by this holder to each owner via restore.
-/// Holder-local heuristic for escrow tier determination.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct EscrowRestoreLog {
-    pub owner_pub: IdentityPub,
-    /// Total bytes served to this owner via restore operations.
-    pub bytes_restored: u64,
-    /// Timestamp of the first restore we served to this owner.
-    pub first_restore_at: Option<Timestamp>,
-    /// Timestamp of the most recent restore we served to this owner.
-    pub last_restore_at: Option<Timestamp>,
+impl HoldingRecord {
+    pub fn symbol_count(&self) -> u32 {
+        self.esi_ranges.iter().map(|(_, count)| count).sum()
+    }
 }
 
-/// Stored in SYSTEM_STATE_BLOBS. Keyed by owner IdentityPub.
-/// The holder stores one entry per owner whose system state it holds.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SystemStateBlobRecord {
-    /// Encrypted system state blob (only readable by the owner's identity key).
-    pub blob: Vec<u8>,
-    /// When the owner created this backup (from the message).
-    pub created_at: Timestamp,
-    /// When this node received and stored it.
-    pub received_at: Timestamp,
+/// Lifecycle state of held symbols.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HoldingStatus {
+    /// Stored, PoS challenges expected.
+    Active,
+    /// Owner sent delete. Cooling down.
+    MarkedForDelete,
+    /// No PoS challenges, owner silent. Priority by owner trust.
+    Silent,
 }
 
-/// Stored in the `budget` table. Singleton, key = "budget".
+/// Budget estimation record. Singleton.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BudgetRecord {
-    /// Estimated network storage budget available for our backups, in GB.
     pub estimated_gb: f64,
-    /// When the last budget estimation ran.
     pub last_calculated: Timestamp,
-    /// Fraction of recent shard_offer attempts that got shard_stored.
-    /// Range [0.0, 1.0].
     pub placement_success_rate: f64,
-    /// Rolling window of (offered, accepted) counts per week.
-    /// Length <= WEEKLY_STATS_WINDOW (4). Oldest entry at index 0.
-    /// Added in budget module; default = empty vec for backward-compatible deserialization.
-    #[serde(default)]
     pub weekly_stats: Vec<(u32, u32)>,
 }
 
-/// Stored in the `schedule` table. Key = task name (UTF-8).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ScheduleRecord {
-    pub task_name: String,
-    pub last_run: Option<Timestamp>,
-    pub next_run: Timestamp,
+// ============================================================
+// RAM hot aggregates
+// ============================================================
+
+/// Per-source-block aggregate (RAM layer).
+#[derive(Debug, Clone, Copy)]
+pub struct BlockAgg {
+    pub k: u32,
+    pub total_alive_symbols: u32,
 }
 
-/// Signed descriptor attached to a shard. Sent in shard_offer messages.
-/// Holder verifies this before accepting blob.
-/// See overview.md §1.2 and §1.7.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ShardDescriptor {
-    /// BLAKE3 hash of the raw shard blob content.
-    pub shard_id: ShardId,
-    /// Unit this shard belongs to (encryption scope).
-    pub unit_id: UnitId,
-    /// Zero-indexed position in the RS set.
-    pub shard_index: u8,
-    /// Minimum shards required for reconstruction.
-    pub rs_k: u8,
-    /// Total shards in the RS set.
-    pub rs_n: u8,
-    /// Root of the BLAKE3 Merkle tree over 64 KB blocks (for PoS).
-    pub merkle_root: [u8; 32],
-    /// Owner's Ed25519 public key.
-    pub owner_pub: IdentityPub,
-    /// Importance score [0.0, 1.0].
-    pub importance: f64,
-    /// User data or system state backup.
-    pub file_type: FileType,
-    /// When this descriptor was created.
-    pub created_at: Timestamp,
-    /// Ed25519 signature over all fields above, by owner's identity key.
-    /// Covers CBOR encoding of all preceding fields in field order.
-    #[serde(with = "sig64")]
-    pub sig_owner: [u8; 64],
+/// Per-(source_block, holder) aggregate (RAM layer).
+#[derive(Debug, Clone, Copy)]
+pub struct PlacementAgg {
+    pub symbol_count: u32,
+    pub status: PlacementStatus,
+    pub last_pos: Option<Timestamp>,
 }
 
-/// Serde helper for `[u8; 64]` — serde only auto-impls arrays up to 32 bytes.
-mod sig64 {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+// ============================================================
+// Event log
+// ============================================================
 
-    pub fn serialize<S: Serializer>(bytes: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
-        bytes.as_slice().serialize(s)
-    }
+/// Events for cluster sync (append-only, commutative).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum Event {
+    SymbolsPlaced {
+        source_block_id: SourceBlockId,
+        holder_id: IdentityPub,
+        esi_range: (u32, u32),
+    },
+    SymbolsLost {
+        source_block_id: SourceBlockId,
+        holder_id: IdentityPub,
+    },
+    SymbolsVerified {
+        source_block_id: SourceBlockId,
+        holder_id: IdentityPub,
+    },
+    FileAdded {
+        file_id: FileId,
+        path: String,
+    },
+    FileModified {
+        file_id: FileId,
+        content_hash: [u8; 32],
+    },
+    FileDeleted {
+        file_id: FileId,
+        device_id: DeviceId,
+    },
+    DeviceAdded {
+        device_id: DeviceId,
+    },
+    DeviceRevoked {
+        device_id: DeviceId,
+    },
+    EpochRotated {
+        epoch: u32,
+    },
+}
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
-        let v: Vec<u8> = Vec::deserialize(d)?;
-        v.try_into()
-            .map_err(|_| serde::de::Error::custom("expected 64 bytes for sig_owner"))
-    }
+/// One entry in the append-only event log.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EventEntry {
+    pub timestamp: Timestamp,
+    pub device_id: DeviceId,
+    pub event: Event,
 }
 
 // ============================================================
 // CBOR serialization helpers
 // ============================================================
 
-/// Serialize a value to CBOR bytes.
-/// Panics if serialization fails (only possible with non-serializable types —
-/// all types in this module serialize cleanly).
 pub fn to_cbor_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
     let mut buf = Vec::new();
     ciborium::ser::into_writer(value, &mut buf).expect("cbor serialization failed");
     buf
 }
 
-/// Deserialize a value from CBOR bytes.
 pub fn from_cbor_bytes<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, CborError> {
     ciborium::de::from_reader(bytes).map_err(|e| CborError::Decode(e.to_string()))
 }
@@ -529,7 +451,6 @@ pub enum CborError {
     #[error("cbor decode: {0}")]
     Decode(String),
 }
-
 
 #[cfg(test)]
 mod tests;

@@ -1,345 +1,437 @@
-use super::*;
-use crate::testutil::{test_db, test_peer, week};
+use super::{compute_combined, PosOutcome, TrustEngine};
+use crate::constants::{INITIAL_TRUST_P, KI, KP};
+use crate::types::{IdentityPub, Timestamp};
 
-fn make_engine() -> (TrustEngine, tempfile::NamedTempFile) {
-    let (db, tmp) = test_db();
-    (TrustEngine::new(db), tmp)
+fn peer(byte: u8) -> IdentityPub {
+    let mut key = [0u8; 32];
+    key[0] = byte;
+    IdentityPub(key)
+}
+
+fn ts(secs: u64) -> Timestamp {
+    Timestamp(secs)
 }
 
 #[test]
-fn trust_score_is_error_for_unknown_peer() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(1);
-    let result = engine.score(&peer);
-    assert!(matches!(result, Err(TrustError::UnknownPeer(_))));
+fn compute_combined_basic() {
+    let result = compute_combined(0.8, 0.5, 0.7);
+    let expected = (KP * 0.8 + KI * 0.5) * 0.7;
+    assert!((result - expected).abs() < 1e-10, "got {result}, expected {expected}");
+    assert!((result - 0.8365).abs() < 1e-4);
+}
+
+#[test]
+fn compute_combined_s_clamp_min() {
+    let result = compute_combined(0.8, 0.5, 0.0);
+    let expected = (KP * 0.8 + KI * 0.5) * 0.1;
+    assert!((result - expected).abs() < 1e-10);
+    assert!((result - 0.1195).abs() < 1e-4);
+}
+
+#[test]
+fn compute_combined_s_clamp_max() {
+    let result = compute_combined(0.8, 0.5, 2.5);
+    let expected = (KP * 0.8 + KI * 0.5) * 1.0;
+    assert!((result - expected).abs() < 1e-10);
+    assert!((result - 1.195).abs() < 1e-4);
+}
+
+#[test]
+fn upsert_peer_new_gets_initial_trust() {
+    let mut engine = TrustEngine::new();
+    let peer_a = peer(1);
+    let now = ts(1_000_000);
+
+    engine.upsert_peer(peer_a, now);
+    let score = engine.score(&peer_a).unwrap();
+
+    assert_eq!(score.p, INITIAL_TRUST_P);
+    assert_eq!(score.i, 0.0);
+    assert_eq!(score.s_raw, 1.0);
+
+    let expected_combined = (KP * INITIAL_TRUST_P + KI * 0.0) * 1.0;
+    assert!((score.combined - expected_combined).abs() < 1e-10);
+    assert!((score.combined - 0.04).abs() < 1e-4);
+}
+
+#[test]
+fn upsert_peer_reconnect_preserves_state() {
+    let mut engine = TrustEngine::new();
+    let peer_a = peer(1);
+    let t0 = ts(1_000_000);
+    let t1 = ts(2_000_000);
+
+    engine.upsert_peer(peer_a, t0);
+    engine
+        .record_pos_result(
+            peer_a,
+            PosOutcome {
+                week_number: 1,
+                challenged: 10,
+                passed: 9,
+            },
+        )
+        .unwrap();
+    engine.recalculate(&peer_a, t0, 1).unwrap();
+
+    let score_before = engine.score(&peer_a).unwrap();
+
+    engine.upsert_peer(peer_a, t1);
+
+    let score_after = engine.score(&peer_a).unwrap();
+    assert_eq!(score_before.p, score_after.p);
+    assert_eq!(score_before.i, score_after.i);
+
+    let record = engine.get_peer(&peer_a).unwrap();
+    assert_eq!(record.last_seen, t1);
+}
+
+#[test]
+fn recalculate_p_rolling_window() {
+    let mut engine = TrustEngine::new();
+    let peer_a = peer(1);
+    let now = ts(1_000_000);
+
+    engine.upsert_peer(peer_a, now);
+
+    let records = vec![
+        (6u32, 5u32, 5u32),
+        (7u32, 5u32, 3u32),
+        (10u32, 2u32, 2u32),
+    ];
+    for (week, challenged, passed) in records {
+        engine
+            .record_pos_result(
+                peer_a,
+                PosOutcome {
+                    week_number: week,
+                    challenged,
+                    passed,
+                },
+            )
+            .unwrap();
+    }
+
+    let current_week = 10;
+    let score = engine.recalculate(&peer_a, now, current_week).unwrap();
+
+    // Window [7, 10]: weeks 7 and 10 are in range; week 6 is excluded.
+    // P = (3 + 2) / (5 + 2) = 5/7
+    let expected_p = 5.0 / 7.0;
+    assert!((score.p - expected_p).abs() < 1e-10, "p={} expected={}", score.p, expected_p);
+
+    // I = mean of all active weeks: week6=1.0, week7=0.6, week10=1.0 → (1.0+0.6+1.0)/3
+    let expected_i = (1.0 + 0.6 + 1.0) / 3.0;
+    assert!((score.i - expected_i).abs() < 1e-10, "i={} expected={}", score.i, expected_i);
+}
+
+#[test]
+fn recalculate_p_is_initial_when_no_pos_data_in_window() {
+    let mut engine = TrustEngine::new();
+    let peer_a = peer(1);
+    let now = ts(1_000_000);
+
+    engine.upsert_peer(peer_a, now);
+    engine
+        .record_pos_result(
+            peer_a,
+            PosOutcome {
+                week_number: 3,
+                challenged: 5,
+                passed: 5,
+            },
+        )
+        .unwrap();
+
+    // current_week=10, window=[7,10] — week 3 is outside.
+    let score = engine.recalculate(&peer_a, now, 10).unwrap();
+
+    assert_eq!(score.p, INITIAL_TRUST_P, "P should be INITIAL_TRUST_P when no data in window");
+    // I is still computed from all active weeks (week 3 passes 5/5 = 1.0)
+    assert!((score.i - 1.0).abs() < 1e-10, "I should be 1.0");
+}
+
+#[test]
+fn update_storage_bytes_s_neutral_when_we_store_nothing() {
+    let mut engine = TrustEngine::new();
+    let peer_a = peer(1);
+    let now = ts(1_000_000);
+
+    engine.upsert_peer(peer_a, now);
+    engine
+        .update_storage_bytes(peer_a, 0, 500_000)
+        .unwrap();
+
+    let record = engine.get_peer(&peer_a).unwrap();
+    assert_eq!(record.trust_s, 1.0, "S should be 1.0 (neutral) when we store nothing");
+}
+
+#[test]
+fn update_storage_bytes_s_below_one_when_peer_stores_less() {
+    let mut engine = TrustEngine::new();
+    let peer_a = peer(1);
+    let now = ts(1_000_000);
+
+    engine.upsert_peer(peer_a, now);
+    engine
+        .update_storage_bytes(peer_a, 1_000_000_000, 500_000_000)
+        .unwrap();
+
+    let record = engine.get_peer(&peer_a).unwrap();
+    let expected_s = 0.5;
+    assert!(
+        (record.trust_s - expected_s).abs() < 1e-10,
+        "s={} expected={}",
+        record.trust_s,
+        expected_s
+    );
+}
+
+#[test]
+fn zero_trust_resets_p_and_i() {
+    let mut engine = TrustEngine::new();
+    let peer_a = peer(1);
+    let now = ts(1_000_000);
+
+    engine.upsert_peer(peer_a, now);
+    for week in 1..=5u32 {
+        engine
+            .record_pos_result(
+                peer_a,
+                PosOutcome {
+                    week_number: week,
+                    challenged: 10,
+                    passed: 10,
+                },
+            )
+            .unwrap();
+    }
+    engine.recalculate(&peer_a, now, 5).unwrap();
+
+    let score_before = engine.score(&peer_a).unwrap();
+    assert!(score_before.p > 0.0);
+    assert!(score_before.i > 0.0);
+
+    engine
+        .update_storage_bytes(peer_a, 0, 1_000_000)
+        .unwrap();
+    let s_before = engine.get_peer(&peer_a).unwrap().trust_s;
+
+    engine.zero_trust(&peer_a).unwrap();
+
+    let score_after = engine.score(&peer_a).unwrap();
+    assert_eq!(score_after.p, 0.0, "P should be 0.0 after zero_trust");
+    assert_eq!(score_after.i, 0.0, "I should be 0.0 after zero_trust");
+
+    let record = engine.get_peer(&peer_a).unwrap();
+    assert_eq!(record.trust_s, s_before, "S should be unchanged by zero_trust");
+}
+
+#[test]
+fn load_round_trips_state() {
+    let mut engine1 = TrustEngine::new();
+    let peer_a = peer(1);
+    let peer_b = peer(2);
+    let now = ts(1_000_000);
+
+    engine1.upsert_peer(peer_a, now);
+    engine1.upsert_peer(peer_b, now);
+
+    engine1
+        .record_pos_result(
+            peer_a,
+            PosOutcome {
+                week_number: 1,
+                challenged: 10,
+                passed: 8,
+            },
+        )
+        .unwrap();
+    engine1
+        .record_pos_result(
+            peer_b,
+            PosOutcome {
+                week_number: 2,
+                challenged: 5,
+                passed: 5,
+            },
+        )
+        .unwrap();
+
+    engine1.update_storage_bytes(peer_a, 1_000, 500).unwrap();
+
+    engine1.recalculate(&peer_a, now, 5).unwrap();
+    engine1.recalculate(&peer_b, now, 5).unwrap();
+
+    let score_a1 = engine1.score(&peer_a).unwrap();
+    let score_b1 = engine1.score(&peer_b).unwrap();
+
+    let peers = engine1.export_peers();
+    let pos = engine1.export_pos_history();
+
+    let mut engine2 = TrustEngine::load(peers, pos);
+
+    let score_a2 = engine2.score(&peer_a).unwrap();
+    let score_b2 = engine2.score(&peer_b).unwrap();
+
+    assert_eq!(score_a1, score_a2, "peer_a scores should match after round-trip");
+    assert_eq!(score_b1, score_b2, "peer_b scores should match after round-trip");
+
+    // Verify recalculate produces same results after load
+    engine2.recalculate(&peer_a, now, 5).unwrap();
+    let score_a2_recalc = engine2.score(&peer_a).unwrap();
+    assert_eq!(score_a1, score_a2_recalc);
+}
+
+#[test]
+fn recalculate_all_returns_count() {
+    let mut engine = TrustEngine::new();
+    let now = ts(1_000_000);
+
+    engine.upsert_peer(peer(1), now);
+    engine.upsert_peer(peer(2), now);
+    engine.upsert_peer(peer(3), now);
+
+    let count = engine.recalculate_all(now, 5);
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn peers_by_trust_sorted_descending() {
+    let mut engine = TrustEngine::new();
+    let peer_a = peer(1);
+    let peer_b = peer(2);
+    let peer_c = peer(3);
+    let now = ts(1_000_000);
+
+    engine.upsert_peer(peer_a, now);
+    engine.upsert_peer(peer_b, now);
+    engine.upsert_peer(peer_c, now);
+
+    // Give peer_a lots of PoS
+    for week in 1..=4u32 {
+        engine
+            .record_pos_result(
+                peer_a,
+                PosOutcome {
+                    week_number: week,
+                    challenged: 10,
+                    passed: 10,
+                },
+            )
+            .unwrap();
+    }
+    // Give peer_b some PoS
+    engine
+        .record_pos_result(
+            peer_b,
+            PosOutcome {
+                week_number: 1,
+                challenged: 10,
+                passed: 5,
+            },
+        )
+        .unwrap();
+    // peer_c has no PoS
+
+    engine.recalculate_all(now, 4);
+
+    let ranked = engine.peers_by_trust();
+    assert_eq!(ranked.len(), 3);
+
+    let scores: Vec<f64> = ranked.iter().map(|(_, s)| s.combined).collect();
+    for i in 0..scores.len() - 1 {
+        assert!(
+            scores[i] >= scores[i + 1],
+            "scores not sorted descending: {scores:?}"
+        );
+    }
+
+    // peer_a should be first (best trust)
+    assert_eq!(ranked[0].0.identity, peer_a);
 }
 
 #[test]
 fn combined_score_returns_zero_for_unknown_peer() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(1);
-    let result = engine.combined_score(&peer).unwrap();
-    assert_eq!(result, 0.0);
+    let engine = TrustEngine::new();
+    let unknown = peer(99);
+    assert_eq!(engine.combined_score(&unknown), 0.0);
 }
 
 #[test]
-fn upsert_peer_creates_neutral_record() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(1);
-    engine.upsert_peer(&peer, Timestamp(1000)).unwrap();
-    let score = engine.score(&peer).unwrap();
-    assert_eq!(score.p, crate::constants::INITIAL_TRUST_P);
-    assert_eq!(score.i, 0.0);
-    assert_eq!(score.s_raw, 1.0);
-    // combined = (KP * INITIAL_TRUST_P + KI * 0.0) * clamp(1.0, 0.1, 1.0)
-    let expected = KP * crate::constants::INITIAL_TRUST_P;
-    assert!((score.combined - expected).abs() < 1e-10);
+fn score_returns_error_for_unknown_peer() {
+    let engine = TrustEngine::new();
+    let unknown = peer(99);
+    assert!(engine.score(&unknown).is_err());
 }
 
 #[test]
-fn pos_success_increases_p_score() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(1);
-    let t0 = week(0);
-    engine.upsert_peer(&peer, t0).unwrap();
-    engine.record_pos_result(&peer, PosOutcome { week_number: 1, challenged: 5, passed: 5 }).unwrap();
-    let score = engine.recalculate(&peer, week(1), 1).unwrap();
-    assert_eq!(score.p, 1.0);
-    assert_eq!(score.i, 1.0);
-    let expected_combined = (KP * 1.0 + KI * 1.0) * 1.0_f64.clamp(S_CLAMP_MIN, S_CLAMP_MAX);
-    assert!((score.combined - expected_combined).abs() < 1e-10);
+fn record_pos_result_returns_error_for_unknown_peer() {
+    let mut engine = TrustEngine::new();
+    let unknown = peer(99);
+    let result = engine.record_pos_result(
+        unknown,
+        PosOutcome {
+            week_number: 1,
+            challenged: 1,
+            passed: 1,
+        },
+    );
+    assert!(result.is_err());
 }
 
 #[test]
-fn pos_partial_failure_reduces_p() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(2);
-    engine.upsert_peer(&peer, week(0)).unwrap();
-    engine.record_pos_result(&peer, PosOutcome { week_number: 1, challenged: 10, passed: 8 }).unwrap();
-    let score = engine.recalculate(&peer, week(1), 1).unwrap();
-    assert!((score.p - 0.8).abs() < 1e-10);
-    assert!((score.i - 0.8).abs() < 1e-10);
-    let expected = (KP * 0.8 + KI * 0.8) * 1.0;
-    assert!((score.combined - expected).abs() < 1e-10);
+fn update_storage_bytes_returns_error_for_unknown_peer() {
+    let mut engine = TrustEngine::new();
+    let unknown = peer(99);
+    let result = engine.update_storage_bytes(unknown, 100, 100);
+    assert!(result.is_err());
 }
 
 #[test]
-fn p_window_is_exactly_4_weeks() {
-    // Formula: window = [current_week - P_WINDOW_WEEKS + 1, current_week]
-    // With P_WINDOW_WEEKS=4, current_week=5 → window = [2, 5]
+fn weeks_in_network_computed_on_recalculate() {
+    let mut engine = TrustEngine::new();
+    let peer_a = peer(1);
+    let t0 = ts(0);
+    // 3 weeks later
+    let t1 = ts(3 * 604_800);
 
-    // Setup 1: weeks 1-5 all pass, current_week=5
-    // Window covers weeks 2,3,4,5 only (week 1 outside). P = 40/40 = 1.0
-    {
-        let (engine, _tmp) = make_engine();
-        let peer = test_peer(3);
-        engine.upsert_peer(&peer, week(0)).unwrap();
-        for w in 1..=5u32 {
-            engine.record_pos_result(&peer, PosOutcome { week_number: w, challenged: 10, passed: 10 }).unwrap();
-        }
-        let score = engine.recalculate(&peer, week(5), 5).unwrap();
-        assert!((score.p - 1.0).abs() < 1e-10, "setup1 p={}", score.p);
-    }
+    engine.upsert_peer(peer_a, t0);
+    engine.recalculate(&peer_a, t1, 1).unwrap();
 
-    // Setup 2: week 1 fails, weeks 2-4 pass, current_week=4
-    // Window = [1, 4]. Week 5 (if it existed) would be excluded.
-    // P = (0+10+10+10)/(10+10+10+10) = 30/40 = 0.75
-    {
-        let (engine, _tmp) = make_engine();
-        let peer = test_peer(3);
-        engine.upsert_peer(&peer, week(0)).unwrap();
-        engine.record_pos_result(&peer, PosOutcome { week_number: 1, challenged: 10, passed: 0 }).unwrap();
-        for w in 2..=5u32 {
-            engine.record_pos_result(&peer, PosOutcome { week_number: w, challenged: 10, passed: 10 }).unwrap();
-        }
-        // current_week=4: window=[1,4]. Week 5 is outside. Week 1 (fail) IS inside.
-        let score = engine.recalculate(&peer, week(4), 4).unwrap();
-        let expected_p = 30.0 / 40.0;
-        assert!((score.p - expected_p).abs() < 1e-10, "setup2 p={} expected={}", score.p, expected_p);
-        // Verify week 5 data excluded (if included, P would be 40/50=0.8)
-        assert!((score.p - 0.8).abs() > 0.01, "setup2 should NOT be 0.8 (would mean 5 weeks included)");
-    }
+    let record = engine.get_peer(&peer_a).unwrap();
+    assert_eq!(record.weeks_in_network, 3);
 }
 
 #[test]
-fn i_is_cumulative_all_time_mean() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(4);
-    engine.upsert_peer(&peer, week(0)).unwrap();
-    engine.record_pos_result(&peer, PosOutcome { week_number: 1, challenged: 10, passed: 10 }).unwrap();
-    engine.record_pos_result(&peer, PosOutcome { week_number: 2, challenged: 10, passed: 5 }).unwrap();
-    engine.record_pos_result(&peer, PosOutcome { week_number: 3, challenged: 10, passed: 0 }).unwrap();
-    let score = engine.recalculate(&peer, week(3), 3).unwrap();
-    // I = mean(1.0, 0.5, 0.0) = 0.5
-    assert!((score.i - 0.5).abs() < 1e-10, "i={}", score.i);
-    // P over last 4 weeks (0..3): (10+5+0)/(10+10+10) = 0.5
-    assert!((score.p - 0.5).abs() < 1e-10, "p={}", score.p);
-}
+fn pos_accumulates_within_same_week() {
+    let mut engine = TrustEngine::new();
+    let peer_a = peer(1);
+    let now = ts(1_000_000);
 
-#[test]
-fn silent_week_not_counted_in_i() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(5);
-    engine.upsert_peer(&peer, week(0)).unwrap();
-    engine.record_pos_result(&peer, PosOutcome { week_number: 1, challenged: 10, passed: 10 }).unwrap();
-    // week 2: no record (silent)
-    engine.record_pos_result(&peer, PosOutcome { week_number: 3, challenged: 10, passed: 10 }).unwrap();
-    let score = engine.recalculate(&peer, week(3), 3).unwrap();
-    // I = mean(1.0, 1.0) = 1.0 (week 2 excluded)
-    assert!((score.i - 1.0).abs() < 1e-10, "i={}", score.i);
-    // P covers weeks 0..3: weeks 1 and 3 have data: P = 20/20 = 1.0
-    assert!((score.p - 1.0).abs() < 1e-10, "p={}", score.p);
-}
+    engine.upsert_peer(peer_a, now);
+    engine
+        .record_pos_result(
+            peer_a,
+            PosOutcome {
+                week_number: 1,
+                challenged: 5,
+                passed: 4,
+            },
+        )
+        .unwrap();
+    engine
+        .record_pos_result(
+            peer_a,
+            PosOutcome {
+                week_number: 1,
+                challenged: 5,
+                passed: 5,
+            },
+        )
+        .unwrap();
 
-#[test]
-fn s_score_neutral_when_no_transfers() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(6);
-    engine.upsert_peer(&peer, week(0)).unwrap();
-    let record = engine.get_peer(&peer).unwrap().unwrap();
-    assert_eq!(record.trust_s, 1.0);
-}
-
-#[test]
-fn s_score_freeloader_gets_minimum() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(7);
-    engine.upsert_peer(&peer, week(0)).unwrap();
-    let event = TransferEvent {
-        peer,
-        bytes_sent_to_peer: 1_000_000_000,
-        bytes_received_from_peer: 0,
-    };
-    engine.record_transfer(&event, week(1)).unwrap();
-    let record = engine.get_peer(&peer).unwrap().unwrap();
-    assert_eq!(record.trust_s, 0.0);
-    // combined uses clamp(0.0, 0.1, 1.0) = 0.1
-    let score = engine.score(&peer).unwrap();
-    assert!((score.s_raw - 0.0).abs() < 1e-10);
-    let expected_combined = (KP * crate::constants::INITIAL_TRUST_P + KI * 0.0) * 0.1;
-    assert!((score.combined - expected_combined).abs() < 1e-10);
-}
-
-#[test]
-fn s_score_good_reciprocator() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(8);
-    engine.upsert_peer(&peer, week(0)).unwrap();
-    let event = TransferEvent {
-        peer,
-        bytes_sent_to_peer: 1_000_000_000,
-        bytes_received_from_peer: 1_000_000_000,
-    };
-    engine.record_transfer(&event, week(1)).unwrap();
-    let record = engine.get_peer(&peer).unwrap().unwrap();
-    assert!((record.trust_s - 1.0).abs() < 1e-10);
-}
-
-#[test]
-fn s_score_exceeds_one_is_clamped_in_combined() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(9);
-    engine.upsert_peer(&peer, week(0)).unwrap();
-    let event = TransferEvent {
-        peer,
-        bytes_sent_to_peer: 100,
-        bytes_received_from_peer: 200,
-    };
-    engine.record_transfer(&event, week(1)).unwrap();
-    let record = engine.get_peer(&peer).unwrap().unwrap();
-    assert!((record.trust_s - 2.0).abs() < 1e-10, "s_raw={}", record.trust_s);
-    let score = engine.score(&peer).unwrap();
-    // clamp(2.0, 0.1, 1.0) = 1.0
-    let expected_combined = (KP * crate::constants::INITIAL_TRUST_P + KI * 0.0) * 1.0;
-    assert!((score.combined - expected_combined).abs() < 1e-10);
-}
-
-#[test]
-fn recalculate_preserves_initial_trust_when_no_pos_data() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(60);
-    engine.upsert_peer(&peer, week(0)).unwrap();
-    // Recalculate with no PoS records should preserve INITIAL_TRUST_P
-    let score = engine.recalculate(&peer, week(5), 5).unwrap();
-    assert_eq!(score.p, crate::constants::INITIAL_TRUST_P, "P should stay at INITIAL_TRUST_P when no PoS data");
-    assert_eq!(score.i, 0.0);
-    let expected = KP * crate::constants::INITIAL_TRUST_P;
-    assert!((score.combined - expected).abs() < 1e-10);
-}
-
-#[test]
-fn zero_trust_clears_scores() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(10);
-    engine.upsert_peer(&peer, week(0)).unwrap();
-    engine.record_pos_result(&peer, PosOutcome { week_number: 1, challenged: 5, passed: 5 }).unwrap();
-    engine.recalculate(&peer, week(1), 1).unwrap();
-    let before = engine.score(&peer).unwrap();
-    assert!(before.combined > 0.0);
-
-    engine.zero_trust(&peer, week(2)).unwrap();
-    let after = engine.score(&peer).unwrap();
-    assert_eq!(after.p, 0.0);
-    assert_eq!(after.i, 0.0);
-    assert_eq!(after.combined, 0.0);
-}
-
-#[test]
-fn recalculate_all_updates_all_peers() {
-    let (engine, _tmp) = make_engine();
-    let peer_a = test_peer(11);
-    let peer_b = test_peer(12);
-    let t0 = week(0);
-    engine.upsert_peer(&peer_a, t0).unwrap();
-    engine.upsert_peer(&peer_b, t0).unwrap();
-    engine.record_pos_result(&peer_a, PosOutcome { week_number: 1, challenged: 5, passed: 5 }).unwrap();
-    engine.record_pos_result(&peer_b, PosOutcome { week_number: 1, challenged: 5, passed: 4 }).unwrap();
-    let count = engine.recalculate_all(week(1), 1).unwrap();
-    assert_eq!(count, 2);
-    let score_a = engine.score(&peer_a).unwrap();
-    let score_b = engine.score(&peer_b).unwrap();
-    assert!(score_a.combined > score_b.combined);
-}
-
-#[test]
-fn weeks_in_network_computed_correctly() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(13);
-    engine.upsert_peer(&peer, Timestamp(0)).unwrap();
-    engine.recalculate(&peer, Timestamp(604800 * 13), 13).unwrap();
-    let record = engine.get_peer(&peer).unwrap().unwrap();
-    assert_eq!(record.weeks_in_network, 13);
-}
-
-#[test]
-fn pos_results_accumulate_within_week() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(14);
-    engine.upsert_peer(&peer, week(0)).unwrap();
-    engine.record_pos_result(&peer, PosOutcome { week_number: 1, challenged: 5, passed: 4 }).unwrap();
-    engine.record_pos_result(&peer, PosOutcome { week_number: 1, challenged: 5, passed: 5 }).unwrap();
-    let score = engine.recalculate(&peer, week(1), 1).unwrap();
-    // P = (4+5)/(5+5) = 0.9
+    let score = engine.recalculate(&peer_a, now, 1).unwrap();
+    // P = (4+5)/(5+5) = 9/10
     assert!((score.p - 0.9).abs() < 1e-10, "p={}", score.p);
-}
-
-#[test]
-fn upsert_peer_idempotent() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(15);
-    engine.upsert_peer(&peer, Timestamp(1000)).unwrap();
-    engine.upsert_peer(&peer, Timestamp(2000)).unwrap();
-    let record = engine.get_peer(&peer).unwrap().unwrap();
-    assert_eq!(record.first_seen, Timestamp(1000));
-    assert_eq!(record.last_seen, Timestamp(2000));
-}
-
-#[test]
-fn all_peers_with_scores_returns_all() {
-    let (engine, _tmp) = make_engine();
-    let peers = crate::testutil::test_peers(3);
-    for p in &peers {
-        engine.upsert_peer(p, week(0)).unwrap();
-    }
-    let result = engine.all_peers_with_scores().unwrap();
-    assert_eq!(result.len(), 3);
-}
-
-#[test]
-fn get_peer_returns_none_for_unknown() {
-    let (engine, _tmp) = make_engine();
-    let result = engine.get_peer(&test_peer(99)).unwrap();
-    assert!(result.is_none());
-}
-
-#[test]
-fn record_transfer_updates_last_seen() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(20);
-    engine.upsert_peer(&peer, week(0)).unwrap();
-    let event = TransferEvent {
-        peer,
-        bytes_sent_to_peer: 1000,
-        bytes_received_from_peer: 500,
-    };
-    engine.record_transfer(&event, week(3)).unwrap();
-    let record = engine.get_peer(&peer).unwrap().unwrap();
-    assert_eq!(record.last_seen, week(3));
-    // s_raw = 500 / 1000 = 0.5
-    assert!((record.trust_s - 0.5).abs() < 1e-10);
-}
-
-#[test]
-fn record_transfer_on_unknown_peer_returns_error() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(30);
-    let event = TransferEvent { peer, bytes_sent_to_peer: 100, bytes_received_from_peer: 100 };
-    let result = engine.record_transfer(&event, week(0));
-    assert!(matches!(result, Err(TrustError::UnknownPeer(_))));
-}
-
-#[test]
-fn zero_trust_on_unknown_peer_returns_error() {
-    let (engine, _tmp) = make_engine();
-    let result = engine.zero_trust(&test_peer(40), week(0));
-    assert!(matches!(result, Err(TrustError::UnknownPeer(_))));
-}
-
-#[test]
-fn zero_trust_preserves_s_raw() {
-    let (engine, _tmp) = make_engine();
-    let peer = test_peer(50);
-    engine.upsert_peer(&peer, week(0)).unwrap();
-    let event = TransferEvent {
-        peer,
-        bytes_sent_to_peer: 100,
-        bytes_received_from_peer: 200,
-    };
-    engine.record_transfer(&event, week(1)).unwrap();
-    engine.zero_trust(&peer, week(2)).unwrap();
-    let score = engine.score(&peer).unwrap();
-    assert_eq!(score.p, 0.0);
-    assert_eq!(score.i, 0.0);
-    // s_raw should be preserved (2.0)
-    assert!((score.s_raw - 2.0).abs() < 1e-10, "s_raw={}", score.s_raw);
 }

@@ -19,13 +19,14 @@ ciborium = "0.2"
 # Crypto
 blake3 = "1"
 chacha20poly1305 = "0.5"
+chacha20 = "0.9"
 ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
 x25519-dalek = { version = "2", features = ["serde", "static_secrets"] }
 hkdf = "0.12"
 sha2 = "0.10"
 
 # Erasure coding
-reed-solomon-erasure = "6"
+raptorq = "2"
 
 # Database
 redb = "2"
@@ -34,11 +35,8 @@ redb = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 
-# P2P networking (iroh ecosystem)
+# P2P networking
 iroh = "0.96"
-iroh-blobs = "0.98"
-iroh-docs = "0.96"
-iroh-gossip = "0.96"
 
 # Error handling
 thiserror = "2"

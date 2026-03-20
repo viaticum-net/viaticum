@@ -2,27 +2,27 @@ use crate::constants::{
     DROP_NOTICE_WINDOW_SECS, ESCROW_TIER1_WEEKS, ESCROW_TIER2_WEEKS, ESCROW_TIER3_WEEKS,
     FREE_TIER_BYTES, HOLDER_DELETE_COOLDOWN_SECS, TIER1_MAX_BYTES, TIER2_MAX_BYTES,
 };
-use crate::db::Db;
-use crate::types::{EscrowRestoreLog, HoldingRecord, IdentityPub, ShardId, ShardState, Timestamp};
+use crate::types::Timestamp;
 
 // ============================================================
-// Escrow types
+// Types
 // ============================================================
 
-/// The three escrow tiers plus the free demo tier.
+/// The escrow tier a restore request falls into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EscrowTier {
-    /// First 1 GiB: always available without any weeks requirement.
+    /// First FREE_TIER_BYTES (1 GiB) restored: no weeks required.
     FreeTier,
-    /// < 5 GiB total restored: requires >= 4 weeks in network.
+    /// bytes_restored in [1 GiB, 5 GiB): requires >= ESCROW_TIER1_WEEKS (4 wk).
     Tier1,
-    /// < 50 GiB total restored: requires >= 13 weeks in network.
+    /// bytes_restored in [5 GiB, 50 GiB): requires >= ESCROW_TIER2_WEEKS (13 wk).
     Tier2,
-    /// >= 50 GiB total restored: requires >= 26 weeks in network.
+    /// bytes_restored >= 50 GiB: requires >= ESCROW_TIER3_WEEKS (26 wk).
     Tier3,
 }
 
 impl EscrowTier {
+    /// Minimum weeks_in_network required for this tier.
     pub fn required_weeks(self) -> u32 {
         match self {
             EscrowTier::FreeTier => 0,
@@ -32,12 +32,13 @@ impl EscrowTier {
         }
     }
 
-    fn from_bytes_restored(bytes: u64) -> Self {
-        if bytes < FREE_TIER_BYTES {
+    /// Determine tier from cumulative bytes already restored to this owner.
+    pub fn from_bytes_restored(bytes_restored: u64) -> Self {
+        if bytes_restored < FREE_TIER_BYTES {
             EscrowTier::FreeTier
-        } else if bytes < TIER1_MAX_BYTES {
+        } else if bytes_restored < TIER1_MAX_BYTES {
             EscrowTier::Tier1
-        } else if bytes < TIER2_MAX_BYTES {
+        } else if bytes_restored < TIER2_MAX_BYTES {
             EscrowTier::Tier2
         } else {
             EscrowTier::Tier3
@@ -45,409 +46,103 @@ impl EscrowTier {
     }
 }
 
-/// Reason a restore was denied by escrow.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct EscrowDenial {
-    pub shard_id: ShardId,
+/// Decision from check_restore().
+#[derive(Debug, Clone, PartialEq)]
+pub enum RestoreDecision {
+    Allowed,
+    Denied(RestoreDenial),
+}
+
+/// Reason for denial, sent back to owner as restore_denied message payload.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RestoreDenial {
     pub tier: EscrowTier,
     pub required_weeks: u32,
     pub current_weeks: u32,
+    /// How many more bytes they can restore before moving to next tier.
+    pub remaining_bytes_in_tier: u64,
 }
 
-/// Decision returned by check_restore().
-#[derive(Debug)]
-pub enum RestoreDecision {
-    Allowed,
-    Denied(EscrowDenial),
-}
-
-/// Decision returned by should_delete_now().
-#[derive(Debug)]
+/// Decision for holder cooldown (delete flow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteDecision {
     Keep,
     Delete,
 }
 
-/// Decision returned by check_drop_notice().
-#[derive(Debug)]
+/// Decision for drop notice flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropNoticeDecision {
     DeleteNow,
     StillWaiting,
 }
 
 // ============================================================
-// Error
+// Pure functions
 // ============================================================
 
-#[derive(Debug, thiserror::Error)]
-pub enum EscrowError {
-    #[error("shard not held: {0:?}")]
-    ShardNotHeld(ShardId),
-
-    #[error("owner mismatch for shard {shard:?}: expected {expected:?}, got {actual:?}")]
-    OwnerMismatch {
-        shard: ShardId,
-        expected: IdentityPub,
-        actual: IdentityPub,
-    },
-
-    #[error("db error: {0}")]
-    Db(#[from] crate::db::DbError),
-}
-
-// ============================================================
-// EscrowChecker
-// ============================================================
-
-pub struct EscrowChecker {
-    db: Db,
-}
-
-impl EscrowChecker {
-    pub fn new(db: Db) -> Self {
-        EscrowChecker { db }
+/// Primary escrow check. Called by holder when owner requests restore.
+///
+/// weeks_in_network: caller looks this up from PeerRecord.weeks_in_network
+/// bytes_already_restored: cumulative bytes holder has served to this owner
+pub fn check_restore(weeks_in_network: u32, bytes_already_restored: u64) -> RestoreDecision {
+    let tier = EscrowTier::from_bytes_restored(bytes_already_restored);
+    if tier == EscrowTier::FreeTier {
+        return RestoreDecision::Allowed;
     }
-
-    // -------------------------------------------------------------------------
-    // Restore decisions
-    // -------------------------------------------------------------------------
-
-    pub fn check_restore(
-        &self,
-        shard_id: &ShardId,
-        owner_pub: &IdentityPub,
-        now: Timestamp,
-    ) -> Result<RestoreDecision, EscrowError> {
-        let record = match self.db.get_holding(shard_id)? {
-            Some(r) => r,
-            None => {
-                tracing::debug!(?shard_id, "check_restore: shard not held");
-                return Err(EscrowError::ShardNotHeld(*shard_id));
-            }
-        };
-
-        if record.owner_pub != *owner_pub {
-            return Err(EscrowError::OwnerMismatch {
-                shard: *shard_id,
-                expected: record.owner_pub,
-                actual: *owner_pub,
-            });
-        }
-
-        if record.state == ShardState::MarkedForDelete {
-            let requested_at = record
-                .delete_requested_at
-                .expect("invariant: MarkedForDelete without delete_requested_at");
-            let elapsed = now.0.saturating_sub(requested_at.0);
-            if elapsed >= HOLDER_DELETE_COOLDOWN_SECS {
-                tracing::debug!(?shard_id, "check_restore: denied — cooldown expired");
-                return Ok(RestoreDecision::Denied(EscrowDenial {
-                    shard_id: *shard_id,
-                    tier: EscrowTier::FreeTier,
-                    required_weeks: 0,
-                    current_weeks: 0,
-                }));
-            }
-        }
-
-        let bytes_restored = self
-            .db
-            .get_restore_log(owner_pub)?
-            .map(|log| log.bytes_restored)
-            .unwrap_or(0);
-
-        let tier = EscrowTier::from_bytes_restored(bytes_restored);
-
-        if tier == EscrowTier::FreeTier {
-            tracing::debug!(?shard_id, "check_restore: allowed (free tier)");
-            return Ok(RestoreDecision::Allowed);
-        }
-
-        let current_weeks = self
-            .db
-            .get_peer(owner_pub)?
-            .map(|p| p.weeks_in_network)
-            .unwrap_or(0);
-
-        let required_weeks = tier.required_weeks();
-
-        if current_weeks >= required_weeks {
-            tracing::debug!(?shard_id, current_weeks, "check_restore: allowed");
-            Ok(RestoreDecision::Allowed)
-        } else {
-            tracing::debug!(
-                ?shard_id,
-                current_weeks,
-                required_weeks,
-                "check_restore: denied"
-            );
-            Ok(RestoreDecision::Denied(EscrowDenial {
-                shard_id: *shard_id,
-                tier,
-                required_weeks,
-                current_weeks,
-            }))
-        }
-    }
-
-    pub fn record_restore(
-        &self,
-        _shard_id: &ShardId,
-        owner_pub: &IdentityPub,
-        bytes_served: u64,
-        now: Timestamp,
-    ) -> Result<(), EscrowError> {
-        let mut log = self
-            .db
-            .get_restore_log(owner_pub)?
-            .unwrap_or(EscrowRestoreLog {
-                owner_pub: *owner_pub,
-                bytes_restored: 0,
-                first_restore_at: None,
-                last_restore_at: None,
-            });
-
-        log.bytes_restored = log.bytes_restored.saturating_add(bytes_served);
-        log.last_restore_at = Some(now);
-        if log.first_restore_at.is_none() {
-            log.first_restore_at = Some(now);
-        }
-
-        self.db.upsert_restore_log(&log)?;
-        Ok(())
-    }
-
-    // -------------------------------------------------------------------------
-    // Shard lifecycle (delete flow)
-    // -------------------------------------------------------------------------
-
-    pub fn mark_for_delete(
-        &self,
-        shard_id: &ShardId,
-        owner_pub: &IdentityPub,
-        now: Timestamp,
-    ) -> Result<(), EscrowError> {
-        let mut record = match self.db.get_holding(shard_id)? {
-            Some(r) => r,
-            None => return Err(EscrowError::ShardNotHeld(*shard_id)),
-        };
-
-        if record.owner_pub != *owner_pub {
-            return Err(EscrowError::OwnerMismatch {
-                shard: *shard_id,
-                expected: record.owner_pub,
-                actual: *owner_pub,
-            });
-        }
-
-        if record.state == ShardState::MarkedForDelete {
-            return Ok(());
-        }
-
-        record.state = ShardState::MarkedForDelete;
-        record.delete_requested_at = Some(now);
-        self.db.upsert_holding(&record)?;
-        tracing::debug!(?shard_id, "mark_for_delete: state = MarkedForDelete");
-        Ok(())
-    }
-
-    pub fn cancel_delete(
-        &self,
-        shard_id: &ShardId,
-        owner_pub: &IdentityPub,
-    ) -> Result<(), EscrowError> {
-        let mut record = match self.db.get_holding(shard_id)? {
-            Some(r) => r,
-            None => return Err(EscrowError::ShardNotHeld(*shard_id)),
-        };
-
-        if record.owner_pub != *owner_pub {
-            return Err(EscrowError::OwnerMismatch {
-                shard: *shard_id,
-                expected: record.owner_pub,
-                actual: *owner_pub,
-            });
-        }
-
-        if record.state == ShardState::Active {
-            return Ok(());
-        }
-
-        record.state = ShardState::Active;
-        record.delete_requested_at = None;
-        self.db.upsert_holding(&record)?;
-        tracing::debug!(?shard_id, "cancel_delete: state = Active");
-        Ok(())
-    }
-
-    pub fn should_delete_now(
-        &self,
-        shard_id: &ShardId,
-        now: Timestamp,
-    ) -> Result<DeleteDecision, EscrowError> {
-        let record = match self.db.get_holding(shard_id)? {
-            Some(r) => r,
-            None => return Err(EscrowError::ShardNotHeld(*shard_id)),
-        };
-
-        if record.state != ShardState::MarkedForDelete {
-            return Ok(DeleteDecision::Keep);
-        }
-
-        let requested_at = record
-            .delete_requested_at
-            .expect("invariant: MarkedForDelete without delete_requested_at");
-
-        let elapsed = now.0.saturating_sub(requested_at.0);
-        if elapsed >= HOLDER_DELETE_COOLDOWN_SECS {
-            Ok(DeleteDecision::Delete)
-        } else {
-            Ok(DeleteDecision::Keep)
-        }
-    }
-
-    pub fn mark_silent(&self, shard_id: &ShardId) -> Result<(), EscrowError> {
-        let mut record = match self.db.get_holding(shard_id)? {
-            Some(r) => r,
-            None => return Err(EscrowError::ShardNotHeld(*shard_id)),
-        };
-
-        if record.state == ShardState::MarkedForDelete {
-            return Ok(());
-        }
-
-        record.state = ShardState::Silent;
-        self.db.upsert_holding(&record)?;
-        tracing::debug!(?shard_id, "mark_silent: state = Silent");
-        Ok(())
-    }
-
-    pub fn mark_active(&self, shard_id: &ShardId) -> Result<(), EscrowError> {
-        let mut record = match self.db.get_holding(shard_id)? {
-            Some(r) => r,
-            None => return Err(EscrowError::ShardNotHeld(*shard_id)),
-        };
-
-        if record.state == ShardState::Active {
-            return Ok(());
-        }
-
-        record.state = ShardState::Active;
-        self.db.upsert_holding(&record)?;
-        tracing::debug!(?shard_id, "mark_active: state = Active");
-        Ok(())
-    }
-
-    // -------------------------------------------------------------------------
-    // Disk pressure (holder-initiated eviction, Phase 2)
-    // -------------------------------------------------------------------------
-
-    pub fn record_drop_notice(
-        &self,
-        shard_id: &ShardId,
-        now: Timestamp,
-    ) -> Result<(), EscrowError> {
-        let mut record = match self.db.get_holding(shard_id)? {
-            Some(r) => r,
-            None => return Err(EscrowError::ShardNotHeld(*shard_id)),
-        };
-
-        record.drop_notice_sent_at = Some(now);
-        self.db.upsert_holding(&record)?;
-        Ok(())
-    }
-
-    pub fn check_drop_notice(
-        &self,
-        shard_id: &ShardId,
-        now: Timestamp,
-    ) -> Result<DropNoticeDecision, EscrowError> {
-        let record = match self.db.get_holding(shard_id)? {
-            Some(r) => r,
-            None => return Err(EscrowError::ShardNotHeld(*shard_id)),
-        };
-
-        match record.drop_notice_sent_at {
-            None => Ok(DropNoticeDecision::StillWaiting),
-            Some(sent_at) => {
-                let elapsed = now.0.saturating_sub(sent_at.0);
-                if elapsed >= DROP_NOTICE_WINDOW_SECS {
-                    Ok(DropNoticeDecision::DeleteNow)
-                } else {
-                    Ok(DropNoticeDecision::StillWaiting)
-                }
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Queries
-    // -------------------------------------------------------------------------
-
-    pub fn expired_deletes(&self, now: Timestamp) -> Result<Vec<ShardId>, EscrowError> {
-        let records = self.db.list_all_holding()?;
-        let result = records
-            .into_iter()
-            .filter(|r| {
-                if r.state != ShardState::MarkedForDelete {
-                    return false;
-                }
-                let Some(requested_at) = r.delete_requested_at else {
-                    return false;
-                };
-                let elapsed = now.0.saturating_sub(requested_at.0);
-                elapsed >= HOLDER_DELETE_COOLDOWN_SECS
-            })
-            .map(|r| r.shard_id)
-            .collect();
-        Ok(result)
-    }
-
-    pub fn expired_drop_notices(&self, now: Timestamp) -> Result<Vec<ShardId>, EscrowError> {
-        let records = self.db.list_all_holding()?;
-        let result = records
-            .into_iter()
-            .filter(|r| {
-                let Some(sent_at) = r.drop_notice_sent_at else {
-                    return false;
-                };
-                let elapsed = now.0.saturating_sub(sent_at.0);
-                elapsed >= DROP_NOTICE_WINDOW_SECS
-            })
-            .map(|r| r.shard_id)
-            .collect();
-        Ok(result)
-    }
-
-    pub fn silent_shards(&self) -> Result<Vec<ShardId>, EscrowError> {
-        let records = self.db.list_all_holding()?;
-        let result = records
-            .into_iter()
-            .filter(|r| r.state == ShardState::Silent)
-            .map(|r| r.shard_id)
-            .collect();
-        Ok(result)
-    }
-
-    pub fn get_holding(&self, shard_id: &ShardId) -> Result<Option<HoldingRecord>, EscrowError> {
-        Ok(self.db.get_holding(shard_id)?)
-    }
-
-    pub fn all_holdings(&self) -> Result<Vec<HoldingRecord>, EscrowError> {
-        Ok(self.db.list_all_holding()?)
-    }
-
-    pub fn insert_holding(&self, record: HoldingRecord) -> Result<(), EscrowError> {
-        self.db.upsert_holding(&record)?;
-        Ok(())
-    }
-
-    pub fn remove_holding(&self, shard_id: &ShardId) -> Result<(), EscrowError> {
-        self.db.delete_holding(shard_id)?;
-        Ok(())
+    let required = tier.required_weeks();
+    if weeks_in_network >= required {
+        RestoreDecision::Allowed
+    } else {
+        RestoreDecision::Denied(RestoreDenial {
+            tier,
+            required_weeks: required,
+            current_weeks: weeks_in_network,
+            remaining_bytes_in_tier: remaining_bytes_in_tier(bytes_already_restored),
+        })
     }
 }
 
+/// Determine which tier applies to the given cumulative bytes restored.
+pub fn tier_for_bytes(bytes_restored: u64) -> EscrowTier {
+    EscrowTier::from_bytes_restored(bytes_restored)
+}
+
+/// How many bytes remain before moving to the next tier.
+/// Returns u64::MAX for Tier3 (no upper bound).
+pub fn remaining_bytes_in_tier(bytes_restored: u64) -> u64 {
+    match EscrowTier::from_bytes_restored(bytes_restored) {
+        EscrowTier::FreeTier => FREE_TIER_BYTES - bytes_restored,
+        EscrowTier::Tier1 => TIER1_MAX_BYTES - bytes_restored,
+        EscrowTier::Tier2 => TIER2_MAX_BYTES - bytes_restored,
+        EscrowTier::Tier3 => u64::MAX,
+    }
+}
+
+/// Holder-side: should we physically delete symbols now?
+/// Called periodically while status == MarkedForDelete.
+pub fn should_delete_now(delete_requested_at: Timestamp, now: Timestamp) -> DeleteDecision {
+    let elapsed = now.0.saturating_sub(delete_requested_at.0);
+    if elapsed >= HOLDER_DELETE_COOLDOWN_SECS {
+        DeleteDecision::Delete
+    } else {
+        DeleteDecision::Keep
+    }
+}
+
+/// Holder-side: has the drop-notice window expired?
+/// Called after sending symbol_drop_notice to owner.
+pub fn should_drop_after_notice(
+    drop_notice_sent_at: Timestamp,
+    now: Timestamp,
+) -> DropNoticeDecision {
+    let elapsed = now.0.saturating_sub(drop_notice_sent_at.0);
+    if elapsed >= DROP_NOTICE_WINDOW_SECS {
+        DropNoticeDecision::DeleteNow
+    } else {
+        DropNoticeDecision::StillWaiting
+    }
+}
 
 #[cfg(test)]
 mod tests;

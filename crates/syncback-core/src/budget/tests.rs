@@ -1,591 +1,324 @@
 use super::*;
-use crate::testutil::{test_db, test_peer, test_shard_id, test_unit_id};
-use crate::trust::TrustEngine;
-use crate::types::{
-    BudgetRecord, FileId, FileRecord, FileType, HoldingRecord, ShardRecord, ShardState,
-    ShardStatus, Timestamp, UnitRecord, UnitStatus, UnitType,
-};
+use crate::constants::{DEFAULT_SUCCESS_RATE, SECS_PER_WEEK, UNKNOWN_OWNER_TRUST_FLOOR, WEEKLY_STATS_WINDOW};
+use crate::types::{BudgetRecord, HoldingRecord, HoldingStatus, IdentityPub, SourceBlockId, Timestamp};
 
-// ---- helpers ----
-
-fn make_planner() -> (BudgetPlanner, tempfile::NamedTempFile) {
-    let (db, tmp) = test_db();
-    let trust = TrustEngine::new(db.clone());
-    let planner = BudgetPlanner::new(db, trust);
-    (planner, tmp)
+fn gib(n: u64) -> u64 {
+    n * 1024 * 1024 * 1024
 }
 
-fn make_planner_with_db() -> (BudgetPlanner, crate::db::Db, tempfile::NamedTempFile) {
-    let (db, tmp) = test_db();
-    let trust = TrustEngine::new(db.clone());
-    let planner = BudgetPlanner::new(db.clone(), trust);
-    (planner, db, tmp)
+fn mib(n: u64) -> u64 {
+    n * 1024 * 1024
 }
 
-fn make_file_record(
-    path: &str,
-    file_id: u64,
-    size_bytes: u64,
+fn make_holding(
+    block_id: [u8; 32],
+    owner_id: [u8; 32],
     importance: f64,
-    dirty: bool,
-) -> FileRecord {
-    FileRecord {
-        file_id: FileId(file_id),
-        path: path.to_string(),
-        content_hash: [0u8; 32],
-        size_bytes,
-        importance,
-        dirty,
-        current_unit_id: None,
-        last_backed_up: None,
-        backed_up: false,
-        first_seen: Timestamp(0),
-    }
-}
-
-fn make_holding_record(
-    shard_seed: u8,
-    owner_seed: u8,
-    importance: f64,
-    size_bytes: u64,
-    file_type: FileType,
+    total_bytes: u64,
+    status: HoldingStatus,
     received_at: Timestamp,
 ) -> HoldingRecord {
     HoldingRecord {
-        shard_id: test_shard_id(shard_seed),
-        owner_pub: test_peer(owner_seed),
+        source_block_id: SourceBlockId(block_id),
+        owner_id: IdentityPub(owner_id),
+        esi_ranges: vec![],
         importance,
-        size_bytes,
-        state: ShardState::Active,
+        total_bytes,
+        status,
         received_at,
         delete_requested_at: None,
         drop_notice_sent_at: None,
-        file_type,
-        merkle_root: [0u8; 32],
-        rs_k: 5,
-        rs_n: 10,
-        shard_index: 0,
     }
 }
 
-fn make_unit_record(seed: u8, size_bytes: u64, rs_n: u8) -> UnitRecord {
-    UnitRecord {
-        unit_id: test_unit_id(seed),
-        unit_type: UnitType::Pack,
-        status: UnitStatus::Active,
-        member_file_ids: vec![FileId(1)],
-        chunk_index: None,
-        parent_file_id: None,
-        size_bytes,
-        plaintext_hash: [0u8; 32],
-        created_at: Timestamp(0),
-        importance_avg: 0.5,
-        rs_k: 5,
-        rs_n,
-    }
-}
-
-fn make_shard_record(
-    shard_seed: u8,
-    unit_seed: u8,
-    holder_seed: u8,
-    status: ShardStatus,
-) -> ShardRecord {
-    ShardRecord {
-        shard_id: test_shard_id(shard_seed),
-        unit_id: test_unit_id(unit_seed),
-        shard_index: 0,
-        holder_id: test_peer(holder_seed),
-        status,
-        last_verified: None,
-        offered_at: Timestamp(0),
-        stored_at: None,
-        merkle_root: [0u8; 32],
-    }
-}
-
-// ---- test 1 ----
+// ============================================================
+// overhead_factor
+// ============================================================
 
 #[test]
-fn overhead_factor_returns_correct_multiplier() {
-    // High tier: >= 0.8
-    assert!((BudgetPlanner::overhead_factor(1.0) - 3.0).abs() < 1e-10);
-    assert!((BudgetPlanner::overhead_factor(0.8) - 3.0).abs() < 1e-10);
-    // Medium tier: >= 0.4
-    assert!((BudgetPlanner::overhead_factor(0.5) - 2.0).abs() < 1e-10);
-    assert!((BudgetPlanner::overhead_factor(0.4) - 2.0).abs() < 1e-10);
-    // Low tier: >= 0.1
-    assert!((BudgetPlanner::overhead_factor(0.2) - 1.4).abs() < 1e-10);
-    assert!((BudgetPlanner::overhead_factor(0.1) - 1.4).abs() < 1e-10);
-    // Below threshold: not backed up
-    assert!((BudgetPlanner::overhead_factor(0.09) - 0.0).abs() < 1e-10);
-    assert!((BudgetPlanner::overhead_factor(0.0) - 0.0).abs() < 1e-10);
+fn overhead_factor_at_zero_importance() {
+    let result = overhead_factor(0.0);
+    assert!((result - 1.5).abs() < 1e-9, "expected 1.5, got {result}");
 }
 
-// ---- test 2 ----
+#[test]
+fn overhead_factor_at_full_importance() {
+    let result = overhead_factor(1.0);
+    assert!((result - 3.0).abs() < 1e-9, "expected 3.0, got {result}");
+}
 
 #[test]
-fn select_backup_batch_sorts_by_importance_descending() {
-    let (planner, db, _tmp) = make_planner_with_db();
+fn overhead_factor_midpoint() {
+    let result = overhead_factor(0.5);
+    assert!((result - 2.25).abs() < 1e-9, "expected 2.25, got {result}");
+}
 
-    // Insert 5 dirty files with varying importance.
-    let data = [
-        ("file_a", 1u64, 1024u64, 0.3f64),
-        ("file_b", 2, 1024, 0.9),
-        ("file_c", 3, 1024, 0.1),
-        ("file_d", 4, 1024, 0.7),
-        ("file_e", 5, 1024, 0.5),
-    ];
-    for (path, id, size, imp) in data {
-        db.upsert_file(&make_file_record(path, id, size, imp, true)).unwrap();
-    }
+// ============================================================
+// estimate_budget
+// ============================================================
 
-    let batch = planner.select_backup_batch(100.0).unwrap();
+#[test]
+fn estimate_budget_no_history() {
+    let committed_bytes = gib(10);
+    let estimate = estimate_budget(committed_bytes, None);
 
-    assert_eq!(batch.candidates.len(), 5);
-    let importances: Vec<f64> = batch.candidates.iter().map(|c| c.importance).collect();
+    assert!((estimate.placement_success_rate - DEFAULT_SUCCESS_RATE).abs() < 1e-9);
+    // headroom = 10 * 0.5 * 0.5 = 2.5 GiB
+    let committed_gb = gib(10) as f64 / 1_073_741_824.0;
+    let expected_headroom = committed_gb * DEFAULT_SUCCESS_RATE * 0.5;
+    let expected_total = committed_gb + expected_headroom;
     assert!(
-        importances[0] > importances[1]
-            && importances[1] > importances[2]
-            && importances[2] > importances[3]
-            && importances[3] > importances[4],
-        "Expected descending order, got: {:?}",
-        importances
+        (estimate.committed_gb - committed_gb).abs() < 1e-6,
+        "committed_gb mismatch"
     );
-    // Check order is [0.9, 0.7, 0.5, 0.3, 0.1]
-    assert!((importances[0] - 0.9).abs() < 1e-10);
-    assert!((importances[1] - 0.7).abs() < 1e-10);
-    assert!((importances[2] - 0.5).abs() < 1e-10);
-    assert!((importances[3] - 0.3).abs() < 1e-10);
-    assert!((importances[4] - 0.1).abs() < 1e-10);
-    assert_eq!(batch.deferred_count, 0);
+    assert!(
+        (estimate.headroom_gb - expected_headroom).abs() < 1e-6,
+        "headroom_gb mismatch: expected {expected_headroom}, got {}",
+        estimate.headroom_gb
+    );
+    assert!(
+        (estimate.total_gb - expected_total).abs() < 1e-6,
+        "total_gb mismatch: expected {expected_total}, got {}",
+        estimate.total_gb
+    );
 }
 
-// ---- test 3 ----
-
 #[test]
-fn select_backup_batch_cutoff_at_budget() {
-    let (planner, db, _tmp) = make_planner_with_db();
-
-    // file_A: 10 GB, importance 0.8, required_gb = 10*3 = 30
-    // file_B: 5 GB,  importance 0.5, required_gb = 5*2 = 10
-    // file_C: 20 GB, importance 0.1, required_gb = 20*1.4 = 28
-    let gb = 1_073_741_824u64;
-    db.upsert_file(&make_file_record("file_a", 1, 10 * gb, 0.8, true)).unwrap();
-    db.upsert_file(&make_file_record("file_b", 2, 5 * gb, 0.5, true)).unwrap();
-    db.upsert_file(&make_file_record("file_c", 3, 20 * gb, 0.1, true)).unwrap();
-
-    let batch = planner.select_backup_batch(40.0).unwrap();
-
-    // A (30) + B (10) = 40 fits; C (28) would push to 68 > 40, deferred.
-    assert_eq!(batch.candidates.len(), 2, "candidates: {:?}", batch.candidates.iter().map(|c| &c.path).collect::<Vec<_>>());
-    assert!((batch.total_required_gb - 40.0).abs() < 1e-6);
-    assert_eq!(batch.deferred_count, 1);
-    assert!((batch.candidates[0].importance - 0.8).abs() < 1e-10);
-    assert!((batch.candidates[1].importance - 0.5).abs() < 1e-10);
-}
-
-// ---- test 4 ----
-
-#[test]
-fn select_backup_batch_skips_low_importance_silently() {
-    let (planner, db, _tmp) = make_planner_with_db();
-
-    db.upsert_file(&make_file_record("file_a", 1, 1024, 0.09, true)).unwrap();
-    db.upsert_file(&make_file_record("file_b", 2, 1024, 0.05, true)).unwrap();
-
-    let batch = planner.select_backup_batch(100.0).unwrap();
-
-    assert!(batch.candidates.is_empty());
-    assert_eq!(batch.deferred_count, 0);
-}
-
-// ---- test 5 ----
-
-#[test]
-fn estimate_budget_uses_committed_plus_headroom() {
-    let (planner, db, _tmp) = make_planner_with_db();
-
-    // 3 active shards, each from a unit of 10 GB with rs_n=1 (so each shard = 10 GB).
-    let unit_size = 10u64 * 1_073_741_824;
-    for i in 0..3u8 {
-        let unit = make_unit_record(i, unit_size, 1);
-        db.upsert_unit(&unit).unwrap();
-        let mut shard = make_shard_record(i, i, i + 10, ShardStatus::Stored);
-        shard.unit_id = test_unit_id(i);
-        db.upsert_shard(&shard).unwrap();
-    }
-
-    // Set budget record with known success rate.
-    let budget_record = BudgetRecord {
+fn estimate_budget_with_stats() {
+    let committed_bytes = gib(10);
+    let record = BudgetRecord {
         estimated_gb: 0.0,
         last_calculated: Timestamp(0),
-        placement_success_rate: 0.8,
-        weekly_stats: vec![(10, 8)], // non-empty, success_rate = 0.8
+        placement_success_rate: 0.0,
+        weekly_stats: vec![(10, 8), (10, 6)],
     };
-    db.set_budget(&budget_record).unwrap();
+    let estimate = estimate_budget(committed_bytes, Some(&record));
 
-    let estimate = planner.estimate_budget().unwrap();
-
-    // committed = 30 GB (3 shards × 10 GB each)
-    assert!((estimate.committed_gb - 30.0).abs() < 1e-6, "committed_gb={}", estimate.committed_gb);
-    // headroom = 30 * 0.8 * 0.5 = 12
-    assert!((estimate.headroom_gb - 12.0).abs() < 1e-6, "headroom_gb={}", estimate.headroom_gb);
-    assert!((estimate.total_gb - 42.0).abs() < 1e-6, "total_gb={}", estimate.total_gb);
+    // rate = (8+6)/(10+10) = 14/20 = 0.7
+    let expected_rate = 14.0 / 20.0;
+    assert!(
+        (estimate.placement_success_rate - expected_rate).abs() < 1e-9,
+        "rate mismatch"
+    );
+    let committed_gb = gib(10) as f64 / 1_073_741_824.0;
+    // headroom = 10 * 0.7 * 0.5 = 3.5 GiB
+    let expected_headroom = committed_gb * expected_rate * 0.5;
+    let expected_total = committed_gb + expected_headroom;
+    assert!(
+        (estimate.total_gb - expected_total).abs() < 1e-6,
+        "total_gb mismatch: expected {expected_total}, got {}",
+        estimate.total_gb
+    );
 }
 
-// ---- test 6 ----
+// ============================================================
+// select_backup_batch
+// ============================================================
 
 #[test]
-fn estimate_budget_default_rate_on_first_run() {
-    let (planner, _tmp) = make_planner();
+fn select_backup_batch_fits_all() {
+    let candidates = vec![
+        ("a.jpg".to_string(), 0.6, mib(50)),
+        ("b.doc".to_string(), 0.9, mib(10)),
+    ];
+    let batch = select_backup_batch(&candidates, 100.0);
 
-    // Empty DB: no shards, no budget record.
-    let estimate = planner.estimate_budget().unwrap();
-
-    // committed = 0, success_rate = DEFAULT (0.5)
-    assert!((estimate.committed_gb - 0.0).abs() < 1e-10);
-    assert!((estimate.placement_success_rate - 0.5).abs() < 1e-10);
-    assert!((estimate.total_gb - 0.0).abs() < 1e-10);
+    assert_eq!(batch.deferred_count, 0);
+    assert_eq!(batch.candidates.len(), 2);
+    // sorted by importance DESC: b.doc first, a.jpg second
+    assert_eq!(batch.candidates[0].path, "b.doc");
+    assert_eq!(batch.candidates[1].path, "a.jpg");
 }
 
-// ---- test 7 ----
+#[test]
+fn select_backup_batch_defers_overflow() {
+    // budget = 40 MiB = 0.04 GiB (approximately)
+    let budget_gb = mib(40) as f64 / 1_073_741_824.0;
+    let candidates = vec![
+        ("big.jpg".to_string(), 0.6, mib(50)),
+        ("small.doc".to_string(), 0.9, mib(1)),
+    ];
+    let batch = select_backup_batch(&candidates, budget_gb);
+
+    assert_eq!(batch.deferred_count, 1, "big.jpg should be deferred");
+    assert_eq!(batch.candidates.len(), 1);
+    assert_eq!(batch.candidates[0].path, "small.doc");
+}
 
 #[test]
-fn disk_pressure_normal_when_15_percent_free() {
-    let (planner, _tmp) = make_planner();
+fn select_backup_batch_importance_zero_excluded() {
+    let candidates = vec![("zero.jpg".to_string(), 0.0, mib(100))];
+    let batch = select_backup_batch(&candidates, 1000.0);
 
-    // quota=100, used=85 → free_ratio = 0.15 → Normal.
-    let result = planner.evaluate_pressure(100.0, 85.0, 0).unwrap();
+    assert_eq!(batch.candidates.len(), 0);
+    assert_eq!(batch.deferred_count, 0, "importance=0.0 must not be deferred");
+}
+
+// ============================================================
+// record_placement_outcome
+// ============================================================
+
+#[test]
+fn record_placement_outcome_rolling_window() {
+    let mut record: Option<BudgetRecord> = None;
+    for i in 0..5u32 {
+        record = Some(record_placement_outcome(record, 10, i));
+    }
+    let r = record.unwrap();
+    assert_eq!(
+        r.weekly_stats.len(),
+        WEEKLY_STATS_WINDOW as usize,
+        "should have exactly WEEKLY_STATS_WINDOW entries after 5 calls"
+    );
+    // The oldest entry (offered=10, accepted=0) should have been dropped.
+    // Remaining: calls 1,2,3,4 → accepted = 1,2,3,4.
+    assert_eq!(r.weekly_stats[0].1, 1, "oldest remaining should be accepted=1");
+}
+
+// ============================================================
+// eviction_priority
+// ============================================================
+
+#[test]
+fn eviction_priority_new_data() {
+    let now_secs = 1_000_000u64;
+    let received_at = Timestamp(now_secs);
+    let priority = eviction_priority(0.8, 0.9, received_at, now_secs);
+    // age_bonus = 0.0, priority = 0.8 * 0.9 * 1.0 = 0.72
+    assert!((priority - 0.72).abs() < 1e-9, "priority={priority}");
+}
+
+#[test]
+fn eviction_priority_old_data_max_bonus() {
+    let now_secs = 26 * SECS_PER_WEEK;
+    let received_at = Timestamp(0);
+    let priority = eviction_priority(0.8, 0.9, received_at, now_secs);
+    // age_bonus = min(26/26, 0.3) = 0.3
+    // priority = 0.8 * 0.9 * 1.3 = 0.936
+    assert!((priority - 0.936).abs() < 1e-9, "priority={priority}");
+}
+
+#[test]
+fn eviction_priority_old_data_capped_bonus() {
+    let now_secs = 52 * SECS_PER_WEEK;
+    let received_at = Timestamp(0);
+    let priority = eviction_priority(0.8, 0.9, received_at, now_secs);
+    // age_bonus = min(52/26, 0.3) = min(2.0, 0.3) = 0.3 (capped)
+    // priority = 0.8 * 0.9 * 1.3 = 0.936 — same as 26 weeks
+    assert!((priority - 0.936).abs() < 1e-9, "priority={priority}");
+}
+
+#[test]
+fn eviction_priority_unknown_owner_uses_floor() {
+    let now_secs = 1_000_000u64;
+    let received_at = Timestamp(now_secs);
+    // Caller passes UNKNOWN_OWNER_TRUST_FLOOR explicitly for unknown peers
+    let priority = eviction_priority(0.8, UNKNOWN_OWNER_TRUST_FLOOR, received_at, now_secs);
+    // priority = 0.8 * 0.1 * 1.0 = 0.08
+    assert!((priority - 0.08).abs() < 1e-9, "priority={priority}");
+}
+
+// ============================================================
+// evaluate_pressure
+// ============================================================
+
+fn unknown_trust(_: &IdentityPub) -> f64 {
+    UNKNOWN_OWNER_TRUST_FLOOR
+}
+
+#[test]
+fn evaluate_pressure_normal() {
+    // quota=100 GiB, used=80 GiB → free_ratio=0.20 → Normal
+    let result = evaluate_pressure(gib(100), gib(80), &[], unknown_trust, 0);
     assert_eq!(result.pressure, DiskPressure::Normal);
     assert!(result.immediate_evictions.is_empty());
     assert!(result.drop_notices.is_empty());
-    assert!((result.freed_gb - 0.0).abs() < 1e-10);
+    assert_eq!(result.freed_bytes, 0);
 }
 
-// ---- test 8 ----
-
 #[test]
-fn disk_pressure_soft_when_between_5_and_15_percent_free() {
-    let (planner, _tmp) = make_planner();
-
-    // quota=100, used=90 → free_ratio = 0.10 → Soft.
-    let result = planner.evaluate_pressure(100.0, 90.0, 0).unwrap();
+fn evaluate_pressure_soft() {
+    // quota=100 GiB, used=88 GiB → free_ratio=0.12 → Soft
+    let result = evaluate_pressure(gib(100), gib(88), &[], unknown_trust, 0);
     assert_eq!(result.pressure, DiskPressure::Soft);
     assert!(result.immediate_evictions.is_empty());
     assert!(result.drop_notices.is_empty());
 }
 
-// ---- test 9 ----
-
 #[test]
-fn disk_pressure_hard_triggers_phase1_evictions() {
-    let (planner, db, _tmp) = make_planner_with_db();
+fn evaluate_pressure_hard_evicts_lowest_priority() {
+    // quota=100 GiB, used=97 GiB → free_ratio=0.03 → Hard
+    // deficit = 0.15*100 - 3 = 12 GiB
+    let now_secs = 0u64;
+    let holdings = vec![
+        // A: importance=0.1, trust=0.5 → priority=0.05, 5 GiB
+        make_holding(
+            [0u8; 32],
+            [1u8; 32],
+            0.1,
+            gib(5),
+            HoldingStatus::Active,
+            Timestamp(now_secs),
+        ),
+        // B: importance=0.9, trust=0.9 → priority=0.81, 5 GiB
+        make_holding(
+            [1u8; 32],
+            [2u8; 32],
+            0.9,
+            gib(5),
+            HoldingStatus::Active,
+            Timestamp(now_secs),
+        ),
+        // C: importance=0.5, trust=0.5 → priority=0.25, 5 GiB
+        make_holding(
+            [2u8; 32],
+            [3u8; 32],
+            0.5,
+            gib(5),
+            HoldingStatus::Active,
+            Timestamp(now_secs),
+        ),
+    ];
 
-    // 5 shards, each 2 GB, with known priorities.
-    // Importance is the main driver (trust_of_owner = UNKNOWN_OWNER_TRUST_FLOOR = 0.1
-    // since owners are not in peers table; age_bonus = 0 since received_at = now).
-    // priority = importance * 0.1 * 1.0
-    // priorities: [0.1*0.1, 0.2*0.1, 0.3*0.1, 0.4*0.1, 0.9*0.1] = [0.01, 0.02, 0.03, 0.04, 0.09]
-    // Sorted ascending: shards at importance 0.1, 0.2, 0.3, 0.4, 0.9.
-    let two_gb = 2u64 * 1_073_741_824;
-    let importances = [0.1f64, 0.2, 0.3, 0.4, 0.9];
-    let now_secs = 1_000_000u64;
+    let trust_fn = |id: &IdentityPub| -> f64 {
+        if id.0 == [1u8; 32] {
+            0.5 // owner of A
+        } else if id.0 == [2u8; 32] {
+            0.9 // owner of B
+        } else {
+            0.5 // owner of C
+        }
+    };
 
-    for (i, &imp) in importances.iter().enumerate() {
-        let mut record = make_holding_record(i as u8, i as u8, imp, two_gb, FileType::User, Timestamp(now_secs));
-        record.received_at = Timestamp(now_secs); // just received, age_bonus=0
-        db.upsert_holding(&record).unwrap();
-    }
-
-    // quota=100 GB, used=96 GB → free=4 GB → free_ratio=0.04 < 0.05 → Hard.
-    // deficit = 0.15*100 - 4 = 11 GB. Need to free 11 GB.
-    // Each shard is 2 GB. Evict 4 shards to free 8 GB (4+8=12 >= 15).
-    // Actually: deficit = target_free - free_gb = 15 - 4 = 11.
-    // After 4 evictions: freed = 8 GB. Check: free + freed = 4+8 = 12 >= 15. Stop after 4.
-    let result = planner.evaluate_pressure(100.0, 96.0, now_secs).unwrap();
-
+    let result = evaluate_pressure(gib(100), gib(97), &holdings, trust_fn, now_secs);
     assert_eq!(result.pressure, DiskPressure::Hard);
+
+    // Evict order: A (priority=0.05), C (priority=0.25), B (priority=0.81)
+    // deficit=12 GiB: A(5)+C(5)=10 < 12, so also B(5) → freed=15 >= 12
     assert_eq!(
         result.immediate_evictions.len(),
-        4,
-        "expected 4 immediate evictions, got {}",
-        result.immediate_evictions.len()
+        3,
+        "all three must be evicted to cover 12 GiB deficit"
     );
-    assert!((result.freed_gb - 8.0).abs() < 1e-6, "freed_gb={}", result.freed_gb);
 
-    // Verify priorities are ascending (lowest first).
-    let priorities: Vec<f64> = result.immediate_evictions.iter().map(|e| e.priority).collect();
-    for w in priorities.windows(2) {
-        assert!(
-            w[0] <= w[1],
-            "priorities not ascending: {:?}",
-            priorities
-        );
-    }
+    // Verify eviction order: A first, C second, B last
+    assert_eq!(result.immediate_evictions[0].source_block_id, SourceBlockId([0u8; 32]));
+    assert_eq!(result.immediate_evictions[1].source_block_id, SourceBlockId([2u8; 32]));
+    assert_eq!(result.immediate_evictions[2].source_block_id, SourceBlockId([1u8; 32]));
 }
 
-// ---- test 10 ----
+// ============================================================
+// should_reject_offers
+// ============================================================
 
 #[test]
-fn disk_pressure_hard_phase2_drop_notices() {
-    let (planner, db, _tmp) = make_planner_with_db();
-
-    let two_gb = 2u64 * 1_073_741_824;
-    let importances = [0.1f64, 0.2, 0.3, 0.4, 0.9];
-    let now_secs = 1_000_000u64;
-
-    for (i, &imp) in importances.iter().enumerate() {
-        let mut record = make_holding_record(i as u8, i as u8, imp, two_gb, FileType::User, Timestamp(now_secs));
-        record.received_at = Timestamp(now_secs);
-        db.upsert_holding(&record).unwrap();
-    }
-
-    let result = planner.evaluate_pressure(100.0, 96.0, now_secs).unwrap();
-
-    // Phase 1: 4 shards evicted (same as test 9).
-    assert_eq!(result.immediate_evictions.len(), 4);
-
-    // Phase 2: buffer_gb = 5% * 100 = 5 GB. Remaining 1 shard (2 GB). That 1 shard covers 5 GB need? No.
-    // 2 GB < 5 GB, but we only have 1 shard left. So we add it to drop_notices.
-    assert_eq!(
-        result.drop_notices.len(),
-        1,
-        "expected 1 drop notice, got {}",
-        result.drop_notices.len()
-    );
-
-    // Deadline = now + 7 days.
-    let expected_deadline = now_secs + DROP_NOTICE_WINDOW_SECS;
-    assert_eq!(result.drop_notices[0].deadline, expected_deadline);
-
-    // freed_gb reflects Phase 1 only.
-    assert!((result.freed_gb - 8.0).abs() < 1e-6);
+fn should_reject_offers_above_soft() {
+    // quota=100 GiB, used=86 GiB → free_ratio=0.14 < 0.15 → true
+    assert!(should_reject_offers(gib(100), gib(86)));
 }
 
-// ---- test 11 ----
-
 #[test]
-fn eviction_priority_increases_with_age() {
-    let (planner, db, _tmp) = make_planner_with_db();
-
-    let shard_id = test_shard_id(1);
-    let owner = test_peer(1);
-    let now_secs = 26u64 * SECS_PER_WEEK + 1_000_000;
-    let received_at = Timestamp(now_secs - 26 * SECS_PER_WEEK);
-
-    // Set up peer with known trust.
-    db.upsert_peer(&crate::types::PeerRecord {
-        identity: owner,
-        node_id: None,
-        trust_p: 0.6,
-        trust_i: 0.0,
-        trust_s: 1.0,
-        bytes_sent_to_peer: 0,
-        bytes_received_from_peer: 0,
-        first_seen: Timestamp(0),
-        last_seen: Timestamp(0),
-        weeks_in_network: 0,
-        subnet_prefix: None,
-        allowlisted: false,
-    }).unwrap();
-
-    // Fake combined score: trust.score() returns combined from PeerRecord.
-    // combined = (KP*P + KI*I) * clamp(S, 0.1, 1.0) = (0.4*0.6 + 1.75*0.0) * 1.0 = 0.24
-    // We want trust_of_owner = 0.6 for the test.
-    // Let's set up P and I such that combined = 0.6.
-    // (0.4*P + 1.75*I) * 1.0 = 0.6. Simplest: P=0, I=0.6/1.75 ≈ 0.343. But let's just
-    // set trust values directly to get a simple combined = 0.6.
-    // Try: P=1.0, I=0.0 → combined = 0.4 * 1.0 * 1.0 = 0.4. Not 0.6.
-    // Try: P=0.0, I=0.343 → combined = 1.75 * 0.343 * 1.0 ≈ 0.6.
-    // Actually, the spec says trust_of_owner = score.combined clamped to [0.0, 1.0].
-    // For simplicity, use direct values.
-    // Let's just use importance=0.5, trust computed from peer record.
-    // We'll verify the formula instead of exact value.
-
-    // Reinsert with values that give combined ≈ 0.6.
-    // (KP*P + KI*I) * clamp(S) = 0.6
-    // With KP=0.4, KI=1.75: easiest to hit 0.6 with I=0, P=1.5 (not valid, P capped).
-    // Instead: set I=0.6/1.75 ≈ 0.3429, P=0, S=1.0.
-    let i_val = 0.6f64 / 1.75f64;
-    db.upsert_peer(&crate::types::PeerRecord {
-        identity: owner,
-        node_id: None,
-        trust_p: 0.0,
-        trust_i: i_val,
-        trust_s: 1.0,
-        bytes_sent_to_peer: 0,
-        bytes_received_from_peer: 0,
-        first_seen: Timestamp(0),
-        last_seen: Timestamp(0),
-        weeks_in_network: 0,
-        subnet_prefix: None,
-        allowlisted: false,
-    }).unwrap();
-
-    let record = make_holding_record(1, 1, 0.5, 1024, FileType::User, received_at);
-    db.upsert_holding(&record).unwrap();
-
-    let priority = planner.eviction_priority(shard_id, now_secs).unwrap();
-
-    // age_bonus = min(26/26, 0.3) = 0.3
-    // trust_of_owner ≈ 0.6 (combined from peer record)
-    // priority = 0.5 * 0.6 * 1.3 = 0.39
-    let expected = 0.5 * 0.6 * 1.3;
-    assert!(
-        (priority - expected).abs() < 1e-6,
-        "priority={:.6} expected={:.6}",
-        priority,
-        expected
-    );
-}
-
-// ---- test 12 ----
-
-#[test]
-fn eviction_priority_age_bonus_capped_at_0_3() {
-    let (planner, db, _tmp) = make_planner_with_db();
-
-    let shard_id = test_shard_id(2);
-    let owner = test_peer(2);
-    let now_secs = 200u64 * SECS_PER_WEEK + 1_000_000;
-    let received_at = Timestamp(now_secs - 100 * SECS_PER_WEEK); // 100 weeks ago
-
-    // Set owner with trust combined = 1.0.
-    // (KP * P + KI * I) * S = 1.0 with P=0, I=1.0/1.75, S=1.0.
-    let i_val = 1.0f64 / 1.75f64;
-    db.upsert_peer(&crate::types::PeerRecord {
-        identity: owner,
-        node_id: None,
-        trust_p: 0.0,
-        trust_i: i_val,
-        trust_s: 1.0,
-        bytes_sent_to_peer: 0,
-        bytes_received_from_peer: 0,
-        first_seen: Timestamp(0),
-        last_seen: Timestamp(0),
-        weeks_in_network: 0,
-        subnet_prefix: None,
-        allowlisted: false,
-    }).unwrap();
-
-    let record = make_holding_record(2, 2, 1.0, 1024, FileType::User, received_at);
-    db.upsert_holding(&record).unwrap();
-
-    let priority = planner.eviction_priority(shard_id, now_secs).unwrap();
-
-    // age_bonus = min(100/26, 0.3) = 0.3
-    // trust_of_owner = 1.0
-    // priority = 1.0 * 1.0 * 1.3 = 1.3
-    let expected = 1.0f64 * 1.0 * 1.3;
-    assert!(
-        (priority - expected).abs() < 1e-6,
-        "priority={:.6} expected={:.6}",
-        priority,
-        expected
-    );
-}
-
-// ---- test 13 ----
-
-#[test]
-fn system_state_shards_never_evicted() {
-    let (planner, db, _tmp) = make_planner_with_db();
-
-    let five_gb = 5u64 * 1_073_741_824;
-    let now_secs = 1_000_000u64;
-
-    // System shard: should not appear in immediate_evictions.
-    let sys_record = make_holding_record(0, 0, 0.5, five_gb, FileType::System, Timestamp(now_secs));
-    db.upsert_holding(&sys_record).unwrap();
-
-    // User shard: low importance, should be evicted.
-    let user_record = make_holding_record(1, 1, 0.1, five_gb, FileType::User, Timestamp(now_secs));
-    db.upsert_holding(&user_record).unwrap();
-
-    // quota=100, used=99 → very high pressure.
-    let result = planner.evaluate_pressure(100.0, 99.0, now_secs).unwrap();
-
-    assert_eq!(result.pressure, DiskPressure::Hard);
-
-    // System shard must NOT be in immediate evictions.
-    let evicted_ids: Vec<ShardId> = result.immediate_evictions.iter().map(|e| e.shard_id).collect();
-    let system_shard_id = test_shard_id(0);
-    assert!(
-        !evicted_ids.contains(&system_shard_id),
-        "system shard should not be evicted"
-    );
-
-    // User shard should be in immediate evictions.
-    let user_shard_id = test_shard_id(1);
-    assert!(
-        evicted_ids.contains(&user_shard_id),
-        "user shard should be evicted"
-    );
-}
-
-// ---- test 14 ----
-
-#[test]
-fn record_placement_outcome_rolling_window() {
-    let (planner, db, _tmp) = make_planner_with_db();
-
-    // Record 5 weeks: each offered=10, accepted=8.
-    for _ in 0..5 {
-        planner.record_placement_outcome(10, 8).unwrap();
-    }
-
-    let budget = db.get_budget().unwrap().expect("budget should be set");
-
-    // Window = 4; oldest entry (first call) should be dropped.
-    assert_eq!(
-        budget.weekly_stats.len(),
-        4,
-        "weekly_stats should have 4 entries, got {}",
-        budget.weekly_stats.len()
-    );
-
-    // All remaining entries are (10, 8).
-    for (offered, accepted) in &budget.weekly_stats {
-        assert_eq!(*offered, 10);
-        assert_eq!(*accepted, 8);
-    }
-
-    // success_rate = 32/40 = 0.8.
-    let total_offered: u32 = budget.weekly_stats.iter().map(|(o, _)| o).sum();
-    let total_accepted: u32 = budget.weekly_stats.iter().map(|(_, a)| a).sum();
-    let rate = total_accepted as f64 / total_offered as f64;
-    assert!((rate - 0.8).abs() < 1e-10, "rate={}", rate);
-    assert!((budget.placement_success_rate - 0.8).abs() < 1e-10);
-}
-
-// ---- test 15 ----
-
-#[test]
-fn should_reject_offers_true_when_soft_or_hard() {
-    let (planner, _tmp) = make_planner();
-
-    // Soft pressure: free_ratio = 0.14 < 0.15 → reject.
-    assert!(
-        planner.should_reject_offers(100.0, 86.0),
-        "should reject when 14% free"
-    );
-
-    // Normal: free_ratio = 0.20 >= 0.15 → accept.
-    assert!(
-        !planner.should_reject_offers(100.0, 80.0),
-        "should NOT reject when 20% free"
-    );
-
-    // Hard pressure: free_ratio = 0.02 < 0.05 → reject.
-    assert!(
-        planner.should_reject_offers(100.0, 98.0),
-        "should reject under hard pressure"
-    );
-
-    // Exactly at boundary: free_ratio = 0.15 → accept (>= 0.15).
-    assert!(
-        !planner.should_reject_offers(100.0, 85.0),
-        "should NOT reject at exactly 15% free"
-    );
+fn should_reject_offers_unlimited_quota() {
+    // quota=0 → unlimited → false
+    assert!(!should_reject_offers(0, gib(999)));
 }
