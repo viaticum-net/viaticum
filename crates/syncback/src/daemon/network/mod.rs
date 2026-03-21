@@ -94,6 +94,9 @@ pub struct NetworkConfig {
     /// When Some, the iroh endpoint uses this key (stable NodeId).
     /// When None, iroh generates a random key (ephemeral NodeId — tests only).
     pub iroh_secret_key: Option<IrohSecretKey>,
+    /// iroh relay mode. Use RelayMode::Default to enable NAT traversal.
+    /// Use RelayMode::Disabled for direct-only setups (tests, LAN).
+    pub relay_mode: RelayMode,
 }
 
 // ─── Connection pool ──────────────────────────────────────────────────────────
@@ -140,7 +143,7 @@ impl NetworkHandle {
 
         let mut builder = Endpoint::builder()
             .alpns(vec![ALPN.to_vec()])
-            .relay_mode(RelayMode::Disabled);
+            .relay_mode(config.relay_mode.clone());
 
         if let Some(key) = config.iroh_secret_key {
             builder = builder.secret_key(key);

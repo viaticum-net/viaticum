@@ -72,6 +72,7 @@ fn config_roundtrips_all_fields() {
             relay_max_entries: 1000,
             relay_max_size_mb: 4,
             relay_ttl_days: 14,
+            enable_relay: false,
         },
         cluster: ClusterCfg {
             sync_batch_size: 200,
@@ -313,4 +314,26 @@ fn hard_quota_bytes_converts_fractional_gb() {
     let mut cfg = AppConfig::default();
     cfg.storage.hard_quota_gb = 0.5;
     assert_eq!(hard_quota_bytes(&cfg), 536_870_912);
+}
+
+#[test]
+fn network_cfg_default_enable_relay_is_true() {
+    let cfg = NetworkCfg::default();
+    assert!(cfg.enable_relay, "enable_relay must default to true");
+}
+
+#[test]
+fn network_cfg_toml_enable_relay_false() {
+    let toml = r#"
+[network]
+enable_relay = false
+"#;
+    let app: AppConfig = toml::from_str(toml).unwrap();
+    assert!(!app.network.enable_relay);
+}
+
+#[test]
+fn network_cfg_toml_missing_field_defaults_true() {
+    let app: AppConfig = toml::from_str("").unwrap();
+    assert!(app.network.enable_relay);
 }

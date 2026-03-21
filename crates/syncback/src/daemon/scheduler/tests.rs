@@ -335,6 +335,7 @@ async fn make_stub_network() -> Arc<crate::daemon::network::NetworkHandle> {
         known_peers: std::collections::HashMap::new(),
         device_cert: None,
         iroh_secret_key: None,
+        relay_mode: iroh::RelayMode::Disabled,
     };
 
     Arc::new(

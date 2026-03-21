@@ -95,6 +95,7 @@ async fn make_network_handle() -> NetworkHandle {
             known_peers: HashMap::new(),
             device_cert: None,
             iroh_secret_key: None,
+            relay_mode: iroh::RelayMode::Disabled,
         },
         tx,
     )
@@ -246,13 +247,13 @@ async fn network_symbol_transfer_between_nodes() {
     let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(64);
 
     let handle_a = NetworkHandle::start(
-        NetworkConfig { signing_key: sk_a, known_peers: HashMap::new(), device_cert: None, iroh_secret_key: None },
+        NetworkConfig { signing_key: sk_a, known_peers: HashMap::new(), device_cert: None, iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled },
         tx_a,
     )
     .await
     .unwrap();
     let handle_b = NetworkHandle::start(
-        NetworkConfig { signing_key: sk_b, known_peers: HashMap::new(), device_cert: None, iroh_secret_key: None },
+        NetworkConfig { signing_key: sk_b, known_peers: HashMap::new(), device_cert: None, iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled },
         tx_b,
     )
     .await

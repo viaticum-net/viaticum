@@ -82,6 +82,7 @@ async fn make_network_handle() -> NetworkHandle {
             known_peers: HashMap::new(),
             device_cert: None,
             iroh_secret_key: None,
+            relay_mode: iroh::RelayMode::Disabled,
         },
         tx,
     )

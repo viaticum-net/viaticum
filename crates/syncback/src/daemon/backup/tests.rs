@@ -780,6 +780,7 @@ async fn deliver_symbols_logs_warn_on_peer_not_found() {
                 known_peers: HashMap::new(),
                 device_cert: None,
                 iroh_secret_key: None,
+                relay_mode: iroh::RelayMode::Disabled,
             },
             tx,
         )
@@ -861,6 +862,7 @@ async fn deliver_symbols_sends_to_reachable_holder() {
                 known_peers: HashMap::new(),
                 device_cert: None,
                 iroh_secret_key: None,
+                relay_mode: iroh::RelayMode::Disabled,
             },
             tx_holder,
         )
@@ -880,6 +882,7 @@ async fn deliver_symbols_sends_to_reachable_holder() {
                 known_peers,
                 device_cert: None,
                 iroh_secret_key: None,
+                relay_mode: iroh::RelayMode::Disabled,
             },
             tx_owner,
         )

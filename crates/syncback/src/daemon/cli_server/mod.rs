@@ -266,6 +266,7 @@ fn dispatch_status(state: &DaemonState) -> CliResponse {
                     crate::daemon::network::addr::format_node_addr(
                         &state.network.node_id,
                         socket_addr,
+                        None,
                     )
                 })
         })
@@ -535,14 +536,16 @@ async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
     use crate::daemon::network::addr::{parse_node_addr, to_endpoint_addr};
     use syncback_core::types::{PeerRecord, Timestamp};
 
-    let (node_id, socket_addr) = match parse_node_addr(&addr) {
-        Ok(pair) => pair,
+    let parsed = match parse_node_addr(&addr) {
+        Ok(p) => p,
         Err(e) => {
             return CliResponse::Error(format!("invalid peer address '{addr}': {e}"));
         }
     };
 
-    let endpoint_addr = match to_endpoint_addr(&node_id, socket_addr) {
+    let node_id = parsed.node_id;
+
+    let endpoint_addr = match to_endpoint_addr(&parsed) {
         Ok(ea) => ea,
         Err(e) => {
             return CliResponse::Error(format!("cannot build endpoint addr: {e}"));

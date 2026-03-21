@@ -67,6 +67,7 @@ async fn test_restore_coord(
         known_peers: Default::default(),
         device_cert: None,
         iroh_secret_key: None,
+        relay_mode: iroh::RelayMode::Disabled,
     };
     let network = NetworkHandle::start(config_net, tx)
         .await
@@ -96,6 +97,7 @@ async fn test_restore_coord(
             known_peers: Default::default(),
             device_cert: None,
             iroh_secret_key: None,
+            relay_mode: iroh::RelayMode::Disabled,
         },
         tx2,
     )

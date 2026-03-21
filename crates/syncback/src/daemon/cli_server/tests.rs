@@ -7,6 +7,8 @@ use tokio_util::sync::CancellationToken;
 use syncback_core::db::Db;
 use syncback_core::types::{DeviceId, IdentityPub};
 
+use iroh::RelayMode;
+
 use crate::cli::types::{CliRequest, CliResponse};
 use crate::daemon::handle::DaemonState;
 use crate::daemon::network::{NetworkConfig, NetworkHandle};
@@ -30,6 +32,7 @@ async fn make_test_state() -> Arc<DaemonState> {
         known_peers: Default::default(),
         device_cert: None,
         iroh_secret_key: None,
+        relay_mode: RelayMode::Disabled,
     };
     let (incoming_tx, _incoming_rx) =
         mpsc::channel::<crate::daemon::network::connection::Connection>(1);
@@ -252,6 +255,7 @@ async fn dispatch_connect_two_daemons_registers_peer() {
                 known_peers: Default::default(),
                 device_cert: None,
                 iroh_secret_key: None,
+                relay_mode: RelayMode::Disabled,
             },
             tx_b,
         )
@@ -264,7 +268,7 @@ async fn dispatch_connect_two_daemons_registers_peer() {
         .next()
         .copied()
         .expect("B must have a local IP addr");
-    let addr_b_str = crate::daemon::network::addr::format_node_addr(&handle_b.node_id, socket_addr_b);
+    let addr_b_str = crate::daemon::network::addr::format_node_addr(&handle_b.node_id, socket_addr_b, None);
 
     let db_a = Db::open_in_memory().expect("db_a");
     let (tx_a, _rx_a) = mpsc::channel::<crate::daemon::network::connection::Connection>(4);
@@ -275,6 +279,7 @@ async fn dispatch_connect_two_daemons_registers_peer() {
                 known_peers: Default::default(),
                 device_cert: None,
                 iroh_secret_key: None,
+                relay_mode: RelayMode::Disabled,
             },
             tx_a,
         )

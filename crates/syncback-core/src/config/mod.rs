@@ -130,6 +130,13 @@ pub struct NetworkCfg {
     /// Relay entry time-to-live in days.
     /// Default: 7.
     pub relay_ttl_days: u64,
+
+    /// Enable iroh NAT relay (DERP). When true, uses RelayMode::Default so
+    /// two nodes behind NAT can connect via the iroh relay network.
+    /// When false, uses RelayMode::Disabled (direct connections only — LAN or
+    /// port-forwarded setups).
+    /// Default: true.
+    pub enable_relay: bool,
 }
 
 impl Default for NetworkCfg {
@@ -138,6 +145,7 @@ impl Default for NetworkCfg {
             relay_max_entries: MAX_BOARD_ENTRIES,
             relay_max_size_mb: MAX_BOARD_SIZE_BYTES / 1_048_576,
             relay_ttl_days: RELAY_TTL_SECS / 86400,
+            enable_relay: true,
         }
     }
 }

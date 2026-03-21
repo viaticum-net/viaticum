@@ -18,6 +18,8 @@ use syncback_core::messages::{
 use syncback_core::erasure::Symbol;
 use syncback_core::types::{DeviceId, IdentityPub, NodeId, SourceBlockId, Timestamp};
 
+use iroh::RelayMode;
+
 use crate::daemon::network::{NetworkConfig, NetworkError, NetworkHandle};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -36,6 +38,7 @@ fn make_config(signing_key: SigningKey) -> NetworkConfig {
         known_peers: HashMap::new(),
         device_cert: None,
         iroh_secret_key: None,
+        relay_mode: RelayMode::Disabled,
     }
 }
 
@@ -350,6 +353,7 @@ async fn handshake_initiator_includes_device_cert() {
         known_peers: HashMap::new(),
         device_cert: Some(cert),
         iroh_secret_key: None,
+        relay_mode: RelayMode::Disabled,
     };
 
     // Node B is a plain single-device node.
@@ -443,14 +447,15 @@ async fn handshake_without_cert_peer_master_identity_is_none() {
 #[test]
 fn to_endpoint_addr_roundtrip_ipv4() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use crate::daemon::network::addr::to_endpoint_addr;
+    use crate::daemon::network::addr::{ParsedNodeAddr, to_endpoint_addr};
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     let pk_bytes = sk.verifying_key().to_bytes();
     let node_id = NodeId(pk_bytes);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 12345);
 
-    let endpoint_addr = to_endpoint_addr(&node_id, addr).expect("should succeed");
+    let parsed = ParsedNodeAddr { node_id, socket_addr: addr, relay_url: None };
+    let endpoint_addr = to_endpoint_addr(&parsed).expect("should succeed");
     let ip_addrs: Vec<_> = endpoint_addr.ip_addrs().collect();
     assert_eq!(ip_addrs.len(), 1);
     assert_eq!(*ip_addrs[0], addr);
@@ -466,14 +471,15 @@ fn to_endpoint_addr_roundtrip_ipv4() {
 #[test]
 fn to_endpoint_addr_accepts_arbitrary_bytes_in_iroh_096() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use crate::daemon::network::addr::to_endpoint_addr;
+    use crate::daemon::network::addr::{ParsedNodeAddr, to_endpoint_addr};
 
     // iroh 0.96: all 32-byte arrays are accepted (lenient Ed25519 validation).
     let node_id = NodeId([0xFFu8; 32]);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9000);
 
     // This succeeds; ToEndpointAddrError path is a defensive guard for future stricter validation.
-    let result = to_endpoint_addr(&node_id, addr);
+    let parsed = ParsedNodeAddr { node_id, socket_addr: addr, relay_url: None };
+    let result = to_endpoint_addr(&parsed);
     assert!(result.is_ok(), "iroh 0.96 accepts all 32-byte node ids: {result:?}");
 }
 
@@ -516,33 +522,35 @@ async fn add_peer_makes_get_connection_find_peer() {
 
 // ─── addr format tests ────────────────────────────────────────────────────────
 
-use crate::daemon::network::addr::{format_node_addr, parse_node_addr, AddrParseError};
+use crate::daemon::network::addr::{AddrParseError, format_node_addr, parse_node_addr};
 
 #[test]
 fn format_and_parse_roundtrip_ipv4() {
     let node_id = NodeId([0xab; 32]);
     let addr: std::net::SocketAddr = "192.168.1.5:12345".parse().unwrap();
-    let formatted = format_node_addr(&node_id, addr);
-    let (parsed_id, parsed_addr) = parse_node_addr(&formatted).unwrap();
-    assert_eq!(parsed_id, node_id);
-    assert_eq!(parsed_addr, addr);
+    let formatted = format_node_addr(&node_id, addr, None);
+    let parsed = parse_node_addr(&formatted).unwrap();
+    assert_eq!(parsed.node_id, node_id);
+    assert_eq!(parsed.socket_addr, addr);
+    assert!(parsed.relay_url.is_none());
 }
 
 #[test]
 fn format_and_parse_roundtrip_ipv6() {
     let node_id = NodeId([0x01; 32]);
     let addr: std::net::SocketAddr = "[::1]:9000".parse().unwrap();
-    let formatted = format_node_addr(&node_id, addr);
-    let (parsed_id, parsed_addr) = parse_node_addr(&formatted).unwrap();
-    assert_eq!(parsed_id, node_id);
-    assert_eq!(parsed_addr, addr);
+    let formatted = format_node_addr(&node_id, addr, None);
+    let parsed = parse_node_addr(&formatted).unwrap();
+    assert_eq!(parsed.node_id, node_id);
+    assert_eq!(parsed.socket_addr, addr);
+    assert!(parsed.relay_url.is_none());
 }
 
 #[test]
 fn format_node_addr_produces_64_hex_prefix() {
     let node_id = NodeId([0u8; 32]);
     let addr: std::net::SocketAddr = "127.0.0.1:1234".parse().unwrap();
-    let formatted = format_node_addr(&node_id, addr);
+    let formatted = format_node_addr(&node_id, addr, None);
     let hex_part = formatted.split('@').next().unwrap();
     assert_eq!(hex_part.len(), 64, "NodeId hex must be 64 chars");
     assert_eq!(hex_part, "0".repeat(64), "all-zero NodeId encodes as 64 zeros");
@@ -634,3 +642,102 @@ fn peer_record_revoked_device_pub_keys_default_empty() {
     assert_eq!(decoded.revoked_device_pub_keys, Vec::<[u8; 32]>::new());
 }
 
+// ─── Phase 7.4: relay addr format tests ──────────────────────────────────────
+
+#[test]
+fn parse_node_addr_no_relay_backward_compat() {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let hex: String = sk
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let s = format!("{hex}@192.168.1.5:12345");
+
+    let parsed = parse_node_addr(&s).expect("should parse");
+    assert_eq!(parsed.socket_addr, "192.168.1.5:12345".parse().unwrap());
+    assert!(parsed.relay_url.is_none());
+}
+
+#[test]
+fn parse_node_addr_with_relay_url() {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+    let hex: String = sk
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let s = format!("{hex}@https://relay.iroh.network,10.0.0.1:9000");
+
+    let parsed = parse_node_addr(&s).expect("should parse");
+    assert_eq!(parsed.socket_addr, "10.0.0.1:9000".parse().unwrap());
+    assert_eq!(
+        parsed.relay_url.as_deref(),
+        Some("https://relay.iroh.network")
+    );
+}
+
+#[test]
+fn format_node_addr_none_relay_matches_old_format() {
+    let node_id = NodeId([0x42u8; 32]);
+    let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+    let s = format_node_addr(&node_id, addr, None);
+    let parsed = parse_node_addr(&s).expect("must parse");
+    assert_eq!(parsed.node_id, node_id);
+    assert_eq!(parsed.socket_addr, addr);
+    assert!(parsed.relay_url.is_none());
+}
+
+#[test]
+fn format_and_parse_roundtrip_with_relay() {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+    let node_id = NodeId(sk.verifying_key().to_bytes());
+    let addr: std::net::SocketAddr = "10.1.2.3:4567".parse().unwrap();
+    let relay = "https://relay.iroh.network";
+
+    let s = format_node_addr(&node_id, addr, Some(relay));
+    let parsed = parse_node_addr(&s).unwrap();
+
+    assert_eq!(parsed.node_id, node_id);
+    assert_eq!(parsed.socket_addr, addr);
+    assert_eq!(parsed.relay_url.as_deref(), Some(relay));
+}
+
+#[test]
+fn parse_node_addr_relay_url_no_addr_returns_error() {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
+    let hex: String = sk
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let s = format!("{hex}@https://relay.iroh.network");
+    let result = parse_node_addr(&s);
+    assert!(
+        matches!(result, Err(AddrParseError::BadSocketAddr(_))),
+        "expected BadSocketAddr for relay-only addr"
+    );
+}
+
+#[tokio::test]
+#[ignore = "network"]
+async fn network_handle_starts_with_relay_default() {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let handle = NetworkHandle::start(
+        NetworkConfig {
+            signing_key: sk,
+            known_peers: Default::default(),
+            device_cert: None,
+            iroh_secret_key: None,
+            relay_mode: RelayMode::Default,
+        },
+        tx,
+    )
+    .await
+    .expect("should start with RelayMode::Default");
+    handle.shutdown().await;
+}

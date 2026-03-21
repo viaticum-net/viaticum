@@ -24,6 +24,8 @@ use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
 use syncback_core::types::{DeviceId, IdentityPub, Timestamp};
 
+use iroh::RelayMode;
+
 use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent};
 use crate::daemon::cli_server::{self, CliServerConfig};
 use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
@@ -173,8 +175,8 @@ impl DaemonHandle {
             for peer in peers {
                 for addr_str in &peer.addrs {
                     match parse_node_addr(addr_str) {
-                        Ok((node_id, socket_addr)) => {
-                            match to_endpoint_addr(&node_id, socket_addr) {
+                        Ok(parsed) => {
+                            match to_endpoint_addr(&parsed) {
                                 Ok(ea) => {
                                     map.insert(peer.identity, ea);
                                     break;
@@ -212,11 +214,18 @@ impl DaemonHandle {
                 .map(|entry| entry.certificate.clone())
         });
 
+        let relay_mode = if app_config.network.enable_relay {
+            RelayMode::Default
+        } else {
+            RelayMode::Disabled
+        };
+
         let net_config = NetworkConfig {
             signing_key: device_key.clone(),
             known_peers,
             device_cert: device_cert_for_network,
             iroh_secret_key: Some(iroh::SecretKey::from_bytes(&iroh_key_bytes)),
+            relay_mode,
         };
         let network = Arc::new(NetworkHandle::start(net_config, incoming_tx).await?);
 
