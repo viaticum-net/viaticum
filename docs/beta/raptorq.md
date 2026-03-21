@@ -165,15 +165,38 @@ Owner:
   → pos_challenge { source_block_id, esi: 47 }
 
 Holder:
-  read bound symbol ESI=47 from disk (256 КБ)
-  → pos_response { esi: 47, data: [256 КБ] }
+  символ есть → pos_response { esi: 47, data: [64 КБ] }
+  символа нет → pos_nack { reason: SymbolNotHeld }
 
 Owner verifies:
-  Файл на диске → recompute symbol + binding → compare ✓ (хеши НЕ хранятся)
+  pos_response → recompute symbol + binding → compare ✓ (хеши НЕ хранятся)
+  pos_nack     → немедленный repair (holder честно сказал "нет")
+  timeout      → graduated response (см. ниже)
   Файл удалён → cooldown → PoS не делаем (символы скоро удалятся)
 ```
 
-Bandwidth: 256 КБ × 15 holders = **3.75 МБ/неделю**. Ничто.
+Bandwidth: 64 КБ × 15 holders = **0.94 МБ/неделю**. Ничто.
+
+### VerifyOutcome и реакция
+
+```
+Pass     → trust P +1, всё ок
+NotHeld  → trust НЕ трогать, немедленный repair
+           (holder имеет право вытеснять, наказывать за честность — ошибка)
+Fail     → trust P -1, немедленный repair
+           (данные повреждены или подделаны)
+Timeout  → trust P -1, graduated repair:
+           1 miss  → Uncertain (не трогать, ждать)
+           2 misses → Uncertain (ждать)
+           3+ misses → PresumedLost → запустить repair
+```
+
+Graduated response для Timeout — идея из Samsara (probabilistic discard).
+Логика: timeout = "не знаем что случилось". Пир мог уехать в отпуск (1-2 недели
+offline нормально для cold backup). 3 пропуска = 3+ недели → скорее всего ушёл.
+
+NotHeld и Fail = определённость → реагируем сразу. Timeout = неопределённость →
+реагируем постепенно.
 
 ---
 

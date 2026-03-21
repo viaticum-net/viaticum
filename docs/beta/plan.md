@@ -165,6 +165,7 @@ WARM (redb, ~133 МБ для 5 ТБ):
 |---|------|----------|
 | 13 | Chunk restore | Файлы >32 МБ |
 | 14 | PoS SendPosChallenge | Реальная реализация (сейчас stub) |
+| 14b | **PosNack** | Holder отвечает NotHeld вместо молчания при отсутствии символа. Graduated repair: NotHeld/Fail → немедленный repair, Timeout → graduated (3 misses → PresumedLost). Вдохновлено Samsara probabilistic discard |
 | 15 | Vacuum / stale cleanup | Очистка мёртвых записей |
 | 16 | File deletion | Watcher → local_state=Deleted → cooldown 4+4 → удаление символов |
 | 17 | **Disk pressure rework** | effective_quota = min(soft_quota, disk_free - reserve), hard_quota = floor |
@@ -206,6 +207,12 @@ Phase β.2 — Pipeline:
   SymbolBudgetManager
   Per-holder binding
   Relay mailbox (relay_store/fetch через mutual peers, ~100 строк)
+
+Phase β.2.5 — PosNack + repair:
+  Обновить PoS engine: VerifyOutcome::NotHeld, PosNackMsg
+  PlacementStatus state machine (Alive/Uncertain/PresumedLost)
+  RepairAgent: graduated repair trigger
+  Гонка SymbolDropped vs PosNack: idempotent transitions
 
 Phase β.3 — Personal Cluster:
   Device registration / revocation

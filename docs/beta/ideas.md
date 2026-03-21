@@ -78,6 +78,32 @@ Raspberry Pi (512 МБ RAM) → block=32 МБ, overhead чуть выше (+3%),
 
 Минус — анонимность. Опционально.
 
+### Edge case: гонка SymbolDropped vs PosNack (β, Phase 2)
+
+При вытеснении символов holder может одновременно послать `SymbolDropped` и ответить `PosNack` на pending challenge. Два сигнала о потере одних и тех же символов — порядок прихода не определён.
+
+**Сценарии:**
+
+```
+A) PosNack приходит первым:
+   Owner → NotHeld → marks placement as lost → starts repair
+   Позже: SymbolDropped → placement уже lost → idempotent, ignore
+
+B) SymbolDropped приходит первым:
+   Owner → marks placement as lost → starts repair
+   Позже: PosNack → placement уже lost → idempotent, ignore
+
+C) SymbolDropped приходит, но challenge был ДО вытеснения:
+   Holder получил challenge когда символ ещё был → PosResponse (Pass)
+   Owner получает SymbolDropped → marks as lost → starts repair
+   Позже: PosResponse (Pass) → символ WAS valid, но теперь lost
+   → Accept Pass для trust (он ответил честно), но repair не отменять
+```
+
+**Решение:** idempotent transitions. `Stored → Lost` — однонаправленный переход. Повторный `Lost` — no-op. RepairAgent проверяет текущий статус placement перед действием.
+
+**Ключевое правило:** `SymbolDropped` авторитетен. Даже если `PosResponse(Pass)` пришёл позже — символы уже потеряны на момент получения `SymbolDropped`.
+
 ---
 
 ## Исследовательские вопросы

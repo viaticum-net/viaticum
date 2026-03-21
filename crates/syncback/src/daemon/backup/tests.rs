@@ -1,0 +1,498 @@
+// Tests for BackupCoordinator.
+// All tests use real Db::open_in_memory(), real RaptorQEncoder, and tempfile::TempDir.
+// Source block size is set small (128 KB) for fast tests.
+
+use std::sync::Arc;
+
+use syncback_core::db::Db;
+use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
+use syncback_core::types::{DeviceId, ErasureParams, Event, FileCategory, LocalState};
+use tempfile::TempDir;
+
+use super::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
+use crate::daemon::backup::pipeline::decrypt_and_decompress;
+use crate::daemon::backup::packing::parse_pack_index;
+
+/// Small source block size for fast tests (128 KB).
+const SMALL_BLOCK_SIZE: u64 = 128 * 1024;
+
+/// Build a test coordinator with a tempdir for symbols.
+fn test_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
+    let config = BackupConfig {
+        source_block_size: SMALL_BLOCK_SIZE,
+        symbols_dir: symbols_dir.path().to_path_buf(),
+        epoch_key: [42u8; 32],
+        device_id: DeviceId([1u8; 16]),
+        mock_holders: test_holders(),
+    };
+    BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
+}
+
+/// 5 mock holders with varying trust scores.
+fn test_holders() -> Vec<syncback_core::placement::HolderCandidate> {
+    (0..5)
+        .map(|i| syncback_core::placement::HolderCandidate {
+            identity: syncback_core::types::IdentityPub([(i + 1) as u8; 32]),
+            trust: 0.3 + (i as f64) * 0.1, // 0.3, 0.4, 0.5, 0.6, 0.7
+        })
+        .collect()
+}
+
+/// Write a file to tempdir and return its absolute path.
+fn write_file(dir: &TempDir, name: &str, content: &[u8]) -> String {
+    let path = dir.path().join(name);
+    std::fs::write(&path, content).expect("write test file");
+    path.to_string_lossy().into_owned()
+}
+
+/// Create an Added DirtyEvent for a path.
+fn added_event(path: &str) -> DirtyEvent {
+    DirtyEvent {
+        path: path.to_string(),
+        kind: DirtyKind::Added,
+        device_id: DeviceId([1u8; 16]),
+    }
+}
+
+fn modified_event(path: &str) -> DirtyEvent {
+    DirtyEvent {
+        path: path.to_string(),
+        kind: DirtyKind::Modified,
+        device_id: DeviceId([1u8; 16]),
+    }
+}
+
+fn deleted_event(path: &str) -> DirtyEvent {
+    DirtyEvent {
+        path: path.to_string(),
+        kind: DirtyKind::Deleted,
+        device_id: DeviceId([1u8; 16]),
+    }
+}
+
+// ─── Test 1: process_event_added_creates_file_record ─────────────────────────
+
+#[test]
+fn process_event_added_creates_file_record() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    let content = b"fake image data fake image data fake image data";
+    let path = write_file(&files_dir, "photo.jpg", content);
+
+    coord.process_event(added_event(&path)).unwrap();
+
+    let record = db.get_file(&path).unwrap().expect("record should exist");
+    assert_eq!(record.path, path);
+    assert_eq!(record.versions.len(), 1);
+
+    let expected_hash: [u8; 32] = *blake3::hash(content).as_bytes();
+    assert_eq!(record.versions[0].content_hash, expected_hash);
+    assert!(record.versions[0].backed_up_at.is_none(), "not yet flushed");
+}
+
+// ─── Test 2: process_event_deleted_marks_local_state ─────────────────────────
+
+#[test]
+fn process_event_deleted_marks_local_state() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    let path = write_file(&files_dir, "doc.txt", b"some content");
+
+    // Add the file first
+    coord.process_event(added_event(&path)).unwrap();
+
+    // Then delete it
+    coord.process_event(deleted_event(&path)).unwrap();
+
+    let record = db.get_file(&path).unwrap().expect("record should exist");
+    let device_id = DeviceId([1u8; 16]);
+    let state = record
+        .devices
+        .iter()
+        .find(|(d, _)| *d == device_id)
+        .map(|(_, s)| s)
+        .expect("device entry should exist");
+    assert!(
+        matches!(state, LocalState::Deleted(_)),
+        "expected Deleted, got {:?}",
+        state
+    );
+}
+
+// ─── Test 3: process_event_dedup_same_content_no_new_version ─────────────────
+
+#[test]
+fn process_event_dedup_same_content_no_new_version() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    let content = b"same content for both files";
+    let path1 = write_file(&files_dir, "file1.txt", content);
+    let path2 = write_file(&files_dir, "file2.txt", content);
+
+    coord.process_event(added_event(&path1)).unwrap();
+    coord.process_event(added_event(&path2)).unwrap();
+
+    let record1 = db.get_file(&path1).unwrap().expect("record1 should exist");
+    let record2 = db.get_file(&path2).unwrap().expect("record2 should exist");
+
+    // Both records exist with the same content_hash and source_block_id
+    assert_eq!(record1.versions.len(), 1);
+    assert_eq!(record2.versions.len(), 1);
+    assert_eq!(
+        record1.versions[0].content_hash,
+        record2.versions[0].content_hash
+    );
+    // Both point to same source_block_id (dedup: zero traffic)
+    assert_eq!(
+        record1.versions[0].source_block_id,
+        record2.versions[0].source_block_id
+    );
+}
+
+// ─── Test 4: flush_queue_below_min_batch_skips ───────────────────────────────
+
+#[test]
+fn flush_queue_below_min_batch_skips() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    // A tiny file (100 bytes) << MIN_BATCH_BYTES (1 MB)
+    let path = write_file(&files_dir, "tiny.txt", &[0u8; 100]);
+    coord.process_event(added_event(&path)).unwrap();
+
+    let results = coord.flush_queue(FileCategory::Document, false).unwrap();
+    assert!(
+        results.is_empty(),
+        "should skip flush below MIN_BATCH_BYTES"
+    );
+}
+
+// ─── Test 5: flush_queue_with_force_flushes_any_size ─────────────────────────
+
+#[test]
+fn flush_queue_with_force_flushes_any_size() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    // A tiny file
+    let path = write_file(&files_dir, "tiny.txt", &[0u8; 100]);
+    coord.process_event(added_event(&path)).unwrap();
+
+    let results = coord.flush_queue(FileCategory::Document, true).unwrap();
+    assert!(!results.is_empty(), "force=true should flush any size");
+}
+
+// ─── Test 6: flush_queue_creates_source_block_record ─────────────────────────
+
+#[test]
+fn flush_queue_creates_source_block_record() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    // Queue enough data to exceed MIN_BATCH_BYTES (1 MB).
+    // Files must be < SMALL_BLOCK_SIZE (128 KB) to go to the queue (not large-file path).
+    // 20 files x 60 KB = 1.2 MB > 1 MB (MIN_BATCH_BYTES).
+    for i in 0..20u8 {
+        // Use pseudo-random content to avoid trivial zstd compression.
+        let content: Vec<u8> = (0..60_000u32)
+            .map(|j| (i as u32 ^ (j % 251)) as u8)
+            .collect();
+        let path = write_file(&files_dir, &format!("doc{i}.txt"), &content);
+        coord.process_event(added_event(&path)).unwrap();
+    }
+
+    let results = coord.flush_queue(FileCategory::Document, false).unwrap();
+    assert!(!results.is_empty(), "should produce results");
+
+    for result in &results {
+        let block = db
+            .get_source_block(&result.source_block_id)
+            .unwrap()
+            .expect("source block should exist");
+        assert!(
+            matches!(
+                block.block_type,
+                syncback_core::types::SourceBlockType::Pack { .. }
+            ),
+            "should be Pack type"
+        );
+        assert_eq!(block.status, syncback_core::types::SourceBlockStatus::Active);
+    }
+}
+
+// ─── Test 7: flush_queue_writes_symbol_files ─────────────────────────────────
+
+#[test]
+fn flush_queue_writes_symbol_files() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    // Files < SMALL_BLOCK_SIZE so they go to queue (not large-file path).
+    for i in 0..4u8 {
+        let content: Vec<u8> = (0..50_000u32)
+            .map(|j| (i as u32 ^ (j % 251)) as u8)
+            .collect();
+        let path = write_file(&files_dir, &format!("f{i}.txt"), &content);
+        coord.process_event(added_event(&path)).unwrap();
+    }
+
+    let results = coord.flush_queue(FileCategory::Document, true).unwrap();
+    assert!(!results.is_empty());
+
+    for result in &results {
+        let block_hex: String = result
+            .source_block_id
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let block_dir = symbols_dir.path().join(&block_hex);
+        assert!(block_dir.exists(), "block symbol dir should exist");
+
+        for (_, count) in &result.symbol_count_per_holder {
+            assert!(*count > 0, "each holder should have >0 symbols");
+        }
+
+        // Verify symbol files exist in the directory
+        let entries: Vec<_> = std::fs::read_dir(&block_dir).unwrap().collect();
+        assert!(!entries.is_empty(), "symbol files should exist in dir");
+    }
+}
+
+// ─── Test 8: flush_queue_updates_backed_up_at ────────────────────────────────
+
+#[test]
+fn flush_queue_updates_backed_up_at() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    let content = b"this is a document that will be backed up";
+    let path = write_file(&files_dir, "report.txt", content);
+    coord.process_event(added_event(&path)).unwrap();
+
+    // Verify backed_up_at is None before flush
+    let before = db.get_file(&path).unwrap().unwrap();
+    assert!(before.versions[0].backed_up_at.is_none());
+
+    coord.flush_queue(FileCategory::Document, true).unwrap();
+
+    let after = db.get_file(&path).unwrap().unwrap();
+    assert!(
+        after.versions[0].backed_up_at.is_some(),
+        "backed_up_at should be set after flush"
+    );
+}
+
+// ─── Test 9: pipeline_roundtrip_can_decode ───────────────────────────────────
+// THE MOST IMPORTANT TEST: backup -> decode -> verify content.
+
+#[test]
+fn pipeline_roundtrip_can_decode() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let epoch_key = [7u8; 32];
+
+    let config = BackupConfig {
+        source_block_size: SMALL_BLOCK_SIZE,
+        symbols_dir: symbols_dir.path().to_path_buf(),
+        epoch_key,
+        device_id: DeviceId([1u8; 16]),
+        mock_holders: test_holders(),
+    };
+    let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
+    let mut coord = BackupCoordinator::new(db.clone(), config, encoder.clone());
+
+    // Write a test file with recognizable content.
+    let content = b"roundtrip test content ---";
+    let repeated: Vec<u8> = content.iter().cycle().take(4096).cloned().collect();
+    let path = write_file(&files_dir, "data.txt", &repeated);
+
+    coord.process_event(added_event(&path)).unwrap();
+    let results = coord.flush_queue(FileCategory::Document, true).unwrap();
+    assert_eq!(results.len(), 1, "should produce one source block");
+
+    let block_id = results[0].source_block_id;
+    // stored_size is returned by PipelineResult -- use it to trim decoded block.
+    let stored_size = results[0].stored_size as usize;
+    let placements = db.list_placements_for_block(&block_id).unwrap();
+    assert!(!placements.is_empty(), "should have placements");
+
+    // Reconstruct ErasureParams using the actual stored_size.
+    let params = ErasureParams::compute(stored_size as u64, 0.5);
+
+    // Collect unbound symbols from all placements until we have k_eff.
+    let mut unbound_symbols: Vec<syncback_core::erasure::Symbol> = Vec::new();
+    let needed = params.k_eff as usize;
+
+    'outer: for placement in &placements {
+        let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+        let block_dir = symbols_dir.path().join(&block_hex);
+
+        for (start_esi, count) in &placement.esi_ranges {
+            for i in 0..*count {
+                let esi = start_esi + i;
+                let sym_path = block_dir.join(format!("{esi}.bin"));
+                if !sym_path.exists() {
+                    continue;
+                }
+                let data = std::fs::read(&sym_path).unwrap();
+                let bound = syncback_core::erasure::Symbol { esi, data };
+                let unbound = encoder.unbind(bound, &block_id, &placement.holder_id);
+                unbound_symbols.push(unbound);
+
+                if unbound_symbols.len() >= needed {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    assert!(
+        unbound_symbols.len() >= needed,
+        "not enough symbols: have {}, need {}",
+        unbound_symbols.len(),
+        needed
+    );
+
+    // Decode: returns k*t zero-padded bytes.
+    let decoded_padded = encoder.decode(&unbound_symbols, &params).unwrap();
+
+    // Trim to exact stored_size (the decoder pads with zeros to k*t).
+    assert!(
+        decoded_padded.len() >= stored_size,
+        "decoded block too small: {} < {}",
+        decoded_padded.len(),
+        stored_size
+    );
+    let stored_blob = &decoded_padded[..stored_size];
+
+    // Decrypt and decompress.
+    let plaintext = decrypt_and_decompress(stored_blob, &epoch_key)
+        .expect("should be able to decrypt and decompress");
+
+    // Parse pack index and find our file.
+    let parsed = parse_pack_index(&plaintext).unwrap();
+    let file_data_start = parsed.index_len;
+    assert!(!parsed.entries.is_empty(), "pack index should have entries");
+
+    // Extract file content.
+    let entry = &parsed.entries[0];
+    let start = file_data_start + entry.offset as usize;
+    let end = start + entry.size as usize;
+    let extracted = &plaintext[start..end];
+
+    assert_eq!(
+        extracted, &repeated,
+        "extracted content should match original"
+    );
+}
+
+// ─── Test 10: process_event_modified_adds_new_version ────────────────────────
+
+#[test]
+fn process_event_modified_adds_new_version() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    let path = write_file(&files_dir, "evolving.txt", b"version 1 content");
+
+    coord.process_event(added_event(&path)).unwrap();
+
+    // Overwrite the file with new content
+    std::fs::write(
+        files_dir.path().join("evolving.txt"),
+        b"version 2 entirely different",
+    )
+    .unwrap();
+
+    coord.process_event(modified_event(&path)).unwrap();
+
+    let record = db.get_file(&path).unwrap().unwrap();
+    assert_eq!(record.versions.len(), 2, "should have 2 versions");
+    assert_ne!(
+        record.versions[0].content_hash,
+        record.versions[1].content_hash,
+        "versions should have different content hashes"
+    );
+}
+
+// ─── Test 11: flush_queue_appends_event_log ───────────────────────────────────
+
+#[test]
+fn flush_queue_appends_event_log() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    let content = b"event log test document";
+    let path = write_file(&files_dir, "eventlog.txt", content);
+    coord.process_event(added_event(&path)).unwrap();
+    coord.flush_queue(FileCategory::Document, true).unwrap();
+
+    let events = db.events_after(0, 100).unwrap();
+    let has_symbols_placed = events
+        .iter()
+        .any(|(_, e)| matches!(e.event, Event::SymbolsPlaced { .. }));
+    assert!(
+        has_symbols_placed,
+        "should have at least one SymbolsPlaced event"
+    );
+}
+
+// ─── Test 12: process_large_file_creates_single_block ────────────────────────
+// (spec test 10)
+
+#[test]
+fn process_large_file_creates_single_block() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    // File larger than source_block_size (128 KB + 1 KB).
+    // Use pseudo-random content so it doesn't compress to nothing.
+    let large_content: Vec<u8> = (0..(SMALL_BLOCK_SIZE as usize + 1024))
+        .map(|i| ((i * 7 + 13) % 256) as u8)
+        .collect();
+    let path = write_file(&files_dir, "large_video.mp4", &large_content);
+
+    // process_event detects size >= source_block_size and calls process_large_file immediately.
+    coord.process_event(added_event(&path)).unwrap();
+
+    // The Single block was written to DB during process_event, not via flush_all.
+    let blocks = db
+        .list_source_blocks_by_status(syncback_core::types::SourceBlockStatus::Active)
+        .unwrap();
+
+    let has_single = blocks
+        .iter()
+        .any(|b| matches!(b.block_type, syncback_core::types::SourceBlockType::Single));
+
+    assert!(
+        has_single,
+        "should have created a Single-type source block for large file"
+    );
+}

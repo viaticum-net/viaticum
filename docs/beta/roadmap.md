@@ -47,6 +47,23 @@ Milestone: "кирпичики компилируются и тестируют�
 Milestone: "два node'а, backup → restore end-to-end"
 ```
 
+## Phase 2.5: PosNack + repair
+
+```
+□ Обновить PoS engine: VerifyOutcome::NotHeld, PosNackMsg
+□ PlacementStatus state machine: Alive → Uncertain → PresumedLost
+  consecutive_misses tracking per placement
+□ RepairAgent: graduated repair trigger
+  NotHeld/Fail → immediate repair
+  Timeout → graduated (1-2 misses = Uncertain, 3+ = PresumedLost → repair)
+□ Обновить messages: PosNack variant в Message enum
+□ Гонка SymbolDropped vs PosNack: idempotent transitions
+  GATE: holder evicts → PosNack → owner triggers repair
+  GATE: SymbolDropped + PosNack в любом порядке → одинаковый результат
+
+Milestone: "repair agent реагирует на потерю символов"
+```
+
 ## Phase 3: cluster
 
 ```

@@ -28,6 +28,9 @@ sha2 = "0.10"
 # Erasure coding
 raptorq = "2"
 
+# Compression
+zstd = "0.13"
+
 # Database
 redb = "2"
 

@@ -175,7 +175,7 @@ impl ErasureParams {
 // ============================================================
 
 /// Category for packing queue assignment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FileCategory {
     Photo,
     Document,

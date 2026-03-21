@@ -274,8 +274,9 @@ Holder ОБЯЗАН проверить при получении шарда:
 ```
 
 - Доставка через gossip relay (см. 1.5), не требует одновременного online
-- Результат проверки (pass/fail) — локальное знание challenger'а
-- **TTL записи на доске (7 дней) = естественный deadline для PoS response.** Если за 7 дней response не появился на доске holder'а — fail.
+- Результат проверки (pass/fail/nack) — локальное знание challenger'а
+- **TTL записи на доске (7 дней) = естественный deadline для PoS response.** Если за 7 дней response не появился на доске holder'а — timeout.
+- **PosNack (β):** holder, у которого нет запрошенного символа, отвечает `pos_nack { reason: SymbolNotHeld }` вместо молчания. Owner получает немедленное уведомление о потере → repair без ожидания timeout. Trust не снижается (holder имеет право вытеснять).
 
 **Sampling PoS:** при большом количестве шардов проверять все каждую неделю нереально. Вместо этого — случайная выборка N шардов на партнёра в неделю (рекомендация: 5). Нам важна надёжность партнёра, а не статус конкретного шарда.
 
@@ -362,6 +363,7 @@ BROADCAST (видны всем):
 DIRECTED (зашифрованы для получателя):
   pos_challenge/{msg_id}    → target: holder   | {shard_id, block_range, nonce, ts}
   pos_response/{msg_id}     → target: challenger | {challenge_id, hash, merkle_proof, ts}
+  pos_nack/{msg_id}         → target: challenger | {challenge_id, reason: SymbolNotHeld, ts}
   shard_offer/{msg_id}      → target: holder   | {ShardDescriptor, ts}
   shard_accept/{msg_id}     → target: owner    | {shard_id, offer_msg_id, ts}
   shard_reject/{msg_id}     → target: owner    | {shard_id, offer_msg_id, reason, ts}
@@ -831,7 +833,7 @@ disk_free = 250 ГБ, effective_quota = min(500, 250-20) = 230 ГБ.
 4. Фаза 2: пометить ещё часть → shard_drop_notice (7 дней)
 5. Пользователь удаляет скачанное → disk_free растёт → effective_quota возвращается → можно снова принимать
 
-**Shard_dropped и shard_drop_notice — не требование протокола, а рекомендация.** Owner всё равно обнаружит потерю при следующем PoS (1-7 дней). Уведомление — хороший тон, ускоряет repair.
+**Shard_dropped и shard_drop_notice — не требование протокола, а рекомендация.** Owner обнаружит потерю при следующем PoS через PosNack (секунды, если оба online) или timeout (до 7 дней). Уведомление — хороший тон, может опередить PoS challenge.
 
 **Гейминг importance:** owner может завысить importance на всех файлах. Но это самонаказание: higher importance → higher n → больше RS overhead → больше хранилища потребляет → S-score падает → trust падает → priority падает.
 

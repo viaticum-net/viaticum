@@ -240,6 +240,20 @@ impl ErasureEncoder for RaptorQEncoder {
     }
 }
 
+/// Compute binding seed for a (block_id, holder_id) pair.
+///
+/// Returns the first 32 bytes of the HKDF output used for per-holder binding.
+/// This value is stored in `SymbolPlacement.binding_seed` for the RestoreCoordinator.
+pub fn binding_seed(block_id: &SourceBlockId, holder_id: &IdentityPub) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(block_id.0.as_ref()), holder_id.0.as_ref());
+    let mut okm = [0u8; 44];
+    hk.expand(b"syncback-binding", &mut okm)
+        .expect("44 is a valid HKDF-SHA256 output length");
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&okm[..32]);
+    seed
+}
+
 /// Derive per-holder binding keystream for one symbol.
 ///
 /// HKDF(salt=source_block_id, ikm=holder_id, info="syncback-binding", len=44)
