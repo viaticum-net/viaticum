@@ -126,6 +126,7 @@ pub struct RestoreConfig {
     /// Epoch key for decryption. 32 bytes. Must match the key used during backup.
     pub epoch_key: [u8; 32],
     /// Max parallel holders to fetch symbols from for one block.
+    /// TODO: not yet used — fetch_from_holders iterates sequentially.
     pub parallel_holders: usize,
     /// This device's identity (for trust lookup and LocalState update).
     pub identity: IdentityPub,

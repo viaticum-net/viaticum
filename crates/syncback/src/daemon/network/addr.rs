@@ -14,7 +14,9 @@
 
 use std::net::SocketAddr;
 
-use syncback_core::types::NodeId;
+use syncback_core::types::{hex_encode, NodeId};
+
+use super::NetworkHandle;
 
 /// Error returned by `parse_node_addr`.
 #[derive(Debug, thiserror::Error)]
@@ -57,7 +59,7 @@ pub struct ParsedNodeAddr {
 /// The NodeId is encoded as 64 lowercase hex chars.
 /// IPv6 addresses are wrapped in brackets per standard notation: `[::1]:port`.
 pub fn format_node_addr(node_id: &NodeId, addr: SocketAddr, relay_url: Option<&str>) -> String {
-    let hex: String = node_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = hex_encode(&node_id.0);
     match relay_url {
         Some(relay) => format!("{hex}@{relay},{addr}"),
         None => format!("{hex}@{addr}"),
@@ -150,6 +152,51 @@ pub fn to_endpoint_addr(
     }
 
     Ok(ea)
+}
+
+/// Resolve the local node's address string for display (e.g. `syncback status`).
+///
+/// Combines:
+/// - IP from iroh's address discovery (STUN/relay) — non-loopback
+/// - Port from `bound_sockets()` (actual listening port, not NAT-mapped)
+/// - Relay URL from iroh (for NAT traversal)
+///
+/// Returns the formatted `NodeId@relay,ip:port` string, or falls back to
+/// hex-encoded NodeId if IP/port cannot be determined.
+pub fn resolve_local_addr(network: &NetworkHandle) -> String {
+    let endpoint_addr = network.local_addr().ok();
+
+    let relay_url: Option<String> = endpoint_addr.as_ref().and_then(|ea| {
+        ea.addrs.iter().find_map(|a| match a {
+            iroh::TransportAddr::Relay(url) => Some(url.to_string()),
+            _ => None,
+        })
+    });
+
+    let discovered_ip = endpoint_addr.as_ref().and_then(|ea| {
+        ea.addrs
+            .iter()
+            .filter_map(|a| match a {
+                iroh::TransportAddr::Ip(addr) => Some(addr.ip()),
+                _ => None,
+            })
+            .find(|ip| !ip.is_loopback())
+    });
+
+    let bound = network.bound_sockets();
+    let bound_port = bound
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or(bound.first())
+        .map(|a| a.port());
+
+    match (discovered_ip, bound_port) {
+        (Some(ip), Some(port)) => {
+            let addr = SocketAddr::new(ip, port);
+            format_node_addr(&network.node_id, addr, relay_url.as_deref())
+        }
+        _ => hex_encode(&network.node_id.0),
+    }
 }
 
 fn hex_nibble(b: u8) -> Result<u8, String> {

@@ -72,7 +72,7 @@ pub struct BackupConfig {
     pub epoch_key: [u8; 32],
     /// This device's ID (for LocalState and EventLog).
     pub device_id: DeviceId,
-    /// Holder candidates for Phase 2 testing. Overrides DB peers when non-empty.
+    /// Holder candidates override (tests only). Production code passes `vec![]`.
     pub mock_holders: Vec<HolderCandidate>,
     /// Optional cluster state for dedup check (multi-device).
     /// If None: use inline DB scan (single-device backward compat).
@@ -181,7 +181,7 @@ impl BackupCoordinator {
             .sum()
     }
 
-    /// Get holder candidates: mock_holders if configured, else compute from DB peers.
+    /// Get holder candidates: mock_holders if configured (tests only), else compute from DB peers.
     pub(crate) fn get_candidates(&self) -> anyhow::Result<Vec<HolderCandidate>> {
         if !self.config.mock_holders.is_empty() {
             return Ok(self.config.mock_holders.clone());

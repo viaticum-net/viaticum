@@ -1,27 +1,10 @@
-use crate::types::{DeviceId, IdentityPub, Timestamp};
+use crate::types::{sig_serde, DeviceId, IdentityPub, Timestamp};
 use ed25519_dalek::{Signer, Verifier};
 use hkdf::Hkdf;
 use sha2::Sha256;
 
 #[cfg(test)]
 mod tests;
-
-// ============================================================
-// Serde helper for [u8; 64]
-// ============================================================
-
-mod sig_serde {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(sig: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
-        sig.as_slice().serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
-        let v: Vec<u8> = Vec::deserialize(d)?;
-        v.try_into().map_err(|_| serde::de::Error::custom("expected 64-byte signature"))
-    }
-}
 
 // ============================================================
 // Types

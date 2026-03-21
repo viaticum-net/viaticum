@@ -22,7 +22,7 @@ use syncback_core::cluster::{
 use syncback_core::config::AppConfig;
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
-use syncback_core::types::{DeviceId, IdentityPub, Timestamp};
+use syncback_core::types::{hex_encode, DeviceId, IdentityPub, Timestamp};
 
 use iroh::RelayMode;
 
@@ -159,7 +159,7 @@ impl DaemonHandle {
             mpsc::channel::<crate::daemon::relay::SyncTrigger>(64);
         let (incoming_tx, incoming_rx) =
             mpsc::channel::<crate::daemon::network::connection::Connection>(64);
-        // relay inbound messages — wired to Processor in Phase 7.6
+        // relay inbound messages → Processor dispatch_relay
         let (inbound_tx, inbound_rx) =
             mpsc::channel::<crate::daemon::relay::InboundMessage>(128);
 
@@ -453,28 +453,10 @@ impl DaemonHandle {
             }));
         }
         // ── Phase 6.5: Scheduler ──────────────────────────────────────────────
-        // Create the shared PendingChallenges map. The Scheduler writes to it;
-        // the Processor will read from it (Phase 6.5+) to match PosResponse messages
-        // to their issuing context without an ESI scan.
+        // Create the shared PendingChallenges map. The Scheduler writes to it.
+        // TODO: wire to Processor so PosResponse can be matched without ESI scan.
         let pending_challenges: PendingChallenges =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-
-        // A second repair_tx for the Scheduler (the original is held by the cancel task).
-        let (scheduler_repair_tx, scheduler_repair_rx) = mpsc::channel::<RepairTrigger>(64);
-        // Forward Scheduler triggers into the RepairAgent's rx.
-        // RepairAgent only has one rx, so we route scheduler triggers through a forwarding task.
-        // NOTE: this is simpler than merging channels; RepairAgent's repair_rx is already wired.
-        // We spawn a forwarder that reads from scheduler_repair_rx and sends to repair_tx clone.
-        // repair_tx is dropped in the cancel task below, which closes it; we keep a clone here.
-        let repair_tx_for_scheduler = repair_tx.clone();
-        tokio::spawn(async move {
-            let mut rx = scheduler_repair_rx;
-            while let Some(trigger) = rx.recv().await {
-                if repair_tx_for_scheduler.send(trigger).await.is_err() {
-                    break;
-                }
-            }
-        });
 
         let scheduler = Scheduler::new(
             db.clone(),
@@ -484,7 +466,7 @@ impl DaemonHandle {
                 time_scale,
             },
             network.clone(),
-            scheduler_repair_tx,
+            repair_tx.clone(),
             pending_challenges,
         );
         let cancel_scheduler = cancel.clone();
@@ -505,11 +487,7 @@ impl DaemonHandle {
         });
 
         // ── 16. Log startup ───────────────────────────────────────────────────
-        let identity_hex: String = identity_pub
-            .0
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let identity_hex = hex_encode(&identity_pub.0);
         tracing::info!(
             identity = %identity_hex,
             data_dir = %cfg.data_dir.display(),

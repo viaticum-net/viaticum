@@ -31,19 +31,19 @@ pub struct NodeId(pub [u8; 32]);
 
 impl std::fmt::Display for SourceBlockId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex_lower(&self.0[..8]))
+        write!(f, "{}", hex_encode(&self.0[..8]))
     }
 }
 
 impl std::fmt::Display for IdentityPub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex_lower(&self.0[..8]))
+        write!(f, "{}", hex_encode(&self.0[..8]))
     }
 }
 
 impl std::fmt::Display for DeviceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex_lower(&self.0[..8]))
+        write!(f, "{}", hex_encode(&self.0[..8]))
     }
 }
 
@@ -55,11 +55,12 @@ impl std::fmt::Display for FileId {
 
 impl std::fmt::Display for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex_lower(&self.0[..8]))
+        write!(f, "{}", hex_encode(&self.0[..8]))
     }
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+/// Encode bytes as lowercase hex string.
+pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -475,6 +476,21 @@ pub fn from_cbor_bytes<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T
 pub enum CborError {
     #[error("cbor decode: {0}")]
     Decode(String),
+}
+
+/// Serde helper for `[u8; 64]` signature fields. Use with `#[serde(with = "sig_serde")]`.
+pub mod sig_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(sig: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+        sig.as_slice().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+        let v: Vec<u8> = Vec::deserialize(d)?;
+        v.try_into()
+            .map_err(|_| serde::de::Error::custom("expected 64-byte signature"))
+    }
 }
 
 #[cfg(test)]

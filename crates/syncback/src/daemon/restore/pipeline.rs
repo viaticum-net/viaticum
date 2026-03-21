@@ -1,9 +1,12 @@
-// Restore pipeline helpers: decrypt_and_decompress, extract_from_pack, hex_encode.
+// Restore pipeline helpers: decrypt_and_decompress, extract_from_pack.
 //
 // These are thin wrappers / re-exports from backup pipeline and packing,
 // kept here so RestoreCoordinator has a clean local import path.
 
 use syncback_core::types::FileId;
+
+/// Re-export hex_encode from core types.
+pub use syncback_core::types::hex_encode;
 
 /// Decrypt and decompress a stored blob.
 ///
@@ -20,9 +23,4 @@ pub fn extract_from_pack(
     file_id: FileId,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     crate::daemon::backup::packing::extract_file_from_pack(plaintext, file_id)
-}
-
-/// Hex-encode bytes to lowercase string. Used for block_id directory names.
-pub fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

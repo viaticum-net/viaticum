@@ -3,30 +3,12 @@ use crate::constants::{
     PROTOCOL_VERSION, RELAY_TTL_SECS,
 };
 use crate::erasure::Symbol;
-use crate::types::{IdentityPub, NodeId, SourceBlockId, Timestamp};
+use crate::types::{sig_serde, IdentityPub, NodeId, SourceBlockId, Timestamp};
 use chacha20poly1305::aead::{AeadInPlace, NewAead};
 use chacha20poly1305::ChaCha20Poly1305;
 use ed25519_dalek::Signer;
 use hkdf::Hkdf;
 use sha2::Sha256;
-
-// ============================================================
-// Serde helper for [u8; 64] (Ed25519 signatures)
-// ============================================================
-
-mod sig_serde {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(sig: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
-        sig.as_slice().serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
-        let v: Vec<u8> = Vec::deserialize(d)?;
-        v.try_into()
-            .map_err(|_| serde::de::Error::custom("expected 64-byte signature"))
-    }
-}
 
 // ============================================================
 // Message structs

@@ -6,13 +6,12 @@ use std::sync::Arc;
 use syncback_core::db::Db;
 use syncback_core::erasure::RaptorQEncoder;
 use syncback_core::types::{
-    FileId, IdentityPub, PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus,
-    SourceBlockType, SymbolPlacement, Timestamp,
+    hex_encode, FileId, IdentityPub, PlacementStatus, SourceBlockId, SourceBlockRecord,
+    SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
 };
 use tempfile::TempDir;
 
 use super::{RepairAgent, RepairConfig, RepairError};
-use super::to_hex;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -30,7 +29,7 @@ fn now() -> Timestamp {
 
 /// Write a source block "blob" file at {symbols_dir}/{hex(block_id)}/block.bin
 fn write_source_block_file(symbols_dir: &std::path::Path, bid: &SourceBlockId, data: &[u8]) {
-    let dir = symbols_dir.join(to_hex(&bid.0));
+    let dir = symbols_dir.join(hex_encode(&bid.0));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("block.bin"), data).unwrap();
 }
@@ -112,8 +111,8 @@ async fn repair_placement_generates_symbol_files() {
     // Symbol file must exist at {symbols_dir}/{hex(bid)}/{hex(hid)}/0.sym
     let sym_path = symbols_dir
         .path()
-        .join(to_hex(&bid.0))
-        .join(to_hex(&hid.0))
+        .join(hex_encode(&bid.0))
+        .join(hex_encode(&hid.0))
         .join("0.sym");
     assert!(sym_path.exists(), "symbol file must exist: {:?}", sym_path);
 
@@ -344,8 +343,8 @@ async fn gate_holder_evicts_pos_nack_owner_triggers_repair() {
     // 5. Verify: symbol file exists, placement is Alive
     let sym_path = symbols_dir
         .path()
-        .join(to_hex(&bid.0))
-        .join(to_hex(&hid.0))
+        .join(hex_encode(&bid.0))
+        .join(hex_encode(&hid.0))
         .join("0.sym");
     assert!(sym_path.exists(), "symbol file must exist after repair");
 

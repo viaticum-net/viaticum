@@ -5,7 +5,7 @@ use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
 
 use syncback_core::trust::compute_combined;
-use syncback_core::types::{LocalState, SourceBlockStatus, Timestamp};
+use syncback_core::types::{hex_encode, LocalState, SourceBlockStatus, Timestamp};
 
 use crate::cli::types::{
     CliRequest, CliResponse, DeviceEntry, FileEntry, PeerSummary, RestoreData, StatusData,
@@ -164,6 +164,7 @@ pub(crate) async fn dispatch(request: CliRequest, state: &DaemonState) -> CliRes
         CliRequest::DeviceAdd { label } => dispatch_device_add(state, label),
 
         CliRequest::DeviceRevoke { device_id_hex } => {
+            // TODO: implement actual revocation (ClusterState + DB + broadcast)
             CliResponse::DeviceRevoked { device_id_hex }
         }
 
@@ -243,60 +244,9 @@ fn dispatch_status(state: &DaemonState) -> CliResponse {
         .filter(|b| b.status == SourceBlockStatus::Stale)
         .count() as u32;
 
-    let node_identity = bytes_to_hex_full(&state.identity_pub.0);
+    let node_identity = hex_encode(&state.identity_pub.0);
 
-    // Build node_addr combining:
-    // - IP from iroh's address discovery (STUN/relay)
-    // - Port from bound_sockets() (actual listening port, not NAT-mapped)
-    // - Relay URL from iroh (for NAT traversal)
-    let node_addr = {
-        let endpoint_addr = state.network.local_addr().ok();
-
-        // Get relay URL if present.
-        let relay_url: Option<String> = endpoint_addr.as_ref().and_then(|ea| {
-            ea.addrs.iter().find_map(|a| match a {
-                iroh::TransportAddr::Relay(url) => Some(url.to_string()),
-                _ => None,
-            })
-        });
-
-        // Get discovered IP from iroh (non-loopback).
-        let discovered_ip = endpoint_addr.as_ref().and_then(|ea| {
-            ea.addrs
-                .iter()
-                .filter_map(|a| match a {
-                    iroh::TransportAddr::Ip(addr) => Some(addr.ip()),
-                    _ => None,
-                })
-                .find(|ip| !ip.is_loopback())
-        });
-
-        // Get actual listening port from bound sockets.
-        let bound = state.network.bound_sockets();
-        let bound_port = bound
-            .iter()
-            .find(|a| a.is_ipv4())
-            .or(bound.first())
-            .map(|a| a.port());
-
-        match (discovered_ip, bound_port) {
-            (Some(ip), Some(port)) => {
-                let addr = std::net::SocketAddr::new(ip, port);
-                crate::daemon::network::addr::format_node_addr(
-                    &state.network.node_id,
-                    addr,
-                    relay_url.as_deref(),
-                )
-            }
-            _ => state
-                .network
-                .node_id
-                .0
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>(),
-        }
-    };
+    let node_addr = crate::daemon::network::addr::resolve_local_addr(&state.network);
 
     CliResponse::Status(StatusData {
         node_identity,
@@ -308,7 +258,7 @@ fn dispatch_status(state: &DaemonState) -> CliResponse {
         backed_up_bytes,
         blocks_needing_repair,
         peers: peer_summaries,
-        effective_quota_bytes: 0, // Phase 4: disk pressure not yet computed
+        effective_quota_bytes: 0, // TODO: compute from config soft_quota + disk_free - reserve
         used_bytes: holdings_bytes,
     })
 }
@@ -379,8 +329,8 @@ fn dispatch_versions(state: &DaemonState, path: &str) -> CliResponse {
                 .backed_up_at
                 .map(timestamp_to_iso)
                 .unwrap_or_else(|| "pending".to_string());
-            let content_hash_hex = bytes_to_hex_full(&v.content_hash);
-            let source_block_id_hex = bytes_to_hex_full(&v.source_block_id.0);
+            let content_hash_hex = hex_encode(&v.content_hash);
+            let source_block_id_hex = hex_encode(&v.source_block_id.0);
             VersionEntry {
                 version: (idx + 1) as u32,
                 created_at: timestamp_to_iso(v.created_at),
@@ -455,7 +405,7 @@ async fn dispatch_restore(
             let hash_hex = record
                 .versions
                 .get(v_idx)
-                .map(|v| bytes_to_hex_full(&v.content_hash))
+                .map(|v| hex_encode(&v.content_hash))
                 .unwrap_or_else(|| "0".repeat(64));
             ((v_idx + 1) as u32, hash_hex)
         }
@@ -500,7 +450,7 @@ fn dispatch_device_list(state: &DaemonState) -> CliResponse {
         .all_devices()
         .iter()
         .map(|d| {
-            let device_id_hex = bytes_to_hex_full(&d.device_id.0);
+            let device_id_hex = hex_encode(&d.device_id.0);
             let is_current = d.device_id == state.device_id;
             let added_at = timestamp_to_iso_date(d.certificate.issued_at);
             let is_revoked = revoked.contains(&d.device_id);
@@ -520,10 +470,9 @@ fn dispatch_device_list(state: &DaemonState) -> CliResponse {
 // ── Device add ────────────────────────────────────────────────────────────────
 
 fn dispatch_device_add(state: &DaemonState, label: String) -> CliResponse {
-    // Phase 6.6: device registration requires key exchange with the new device
-    // (Phase 3 ClusterSync). Return a stub that acknowledges the label.
-    // The real implementation will generate a cert and sync via cluster_sync.
-    tracing::info!(label = %label, "DeviceAdd request received (stub — ClusterSync not yet wired)");
+    // TODO: implement real device registration (cert generation + ClusterSync key exchange).
+    // Currently returns a stub with a fake device ID derived from identity+label.
+    tracing::warn!(label = %label, "DeviceAdd: stub — returns fake device ID, no actual registration");
 
     let device_id_bytes = {
         // Derive a deterministic placeholder from our identity + label for display.
@@ -540,7 +489,7 @@ fn dispatch_device_add(state: &DaemonState, label: String) -> CliResponse {
     let added_at = timestamp_to_iso_date(Timestamp::now());
 
     CliResponse::DeviceAdded(DeviceEntry {
-        device_id_hex: bytes_to_hex_full(&device_id_bytes),
+        device_id_hex: hex_encode(&device_id_bytes),
         label,
         is_current: false,
         added_at,
@@ -641,7 +590,7 @@ async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
         "peer connected and registered"
     );
 
-    let peer_id_hex = bytes_to_hex_full(&peer_identity.0);
+    let peer_id_hex = hex_encode(&peer_identity.0);
     CliResponse::Connected { peer_id: peer_id_hex }
 }
 
@@ -651,15 +600,7 @@ async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
 
 /// First 8 bytes as lowercase hex (16 chars). Used for peer identity display.
 fn bytes_to_hex_8(bytes: &[u8]) -> String {
-    bytes[..8.min(bytes.len())]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
-/// Full bytes as lowercase hex.
-fn bytes_to_hex_full(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    hex_encode(&bytes[..8.min(bytes.len())])
 }
 
 /// Unix timestamp → "YYYY-MM-DD HH:MM:SS" (UTC, approximate).

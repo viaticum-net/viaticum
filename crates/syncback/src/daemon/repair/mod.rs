@@ -10,7 +10,7 @@ use syncback_core::constants::DECODE_OVERHEAD;
 use syncback_core::db::{Db, DbError};
 use syncback_core::erasure::ErasureEncoder;
 use syncback_core::types::{
-    ErasureParams, FileId, IdentityPub, PlacementStatus, SourceBlockId, Timestamp,
+    hex_encode, ErasureParams, FileId, IdentityPub, PlacementStatus, SourceBlockId, Timestamp,
 };
 
 #[cfg(test)]
@@ -187,7 +187,7 @@ impl RepairAgent {
         let block_file_path = self
             .config
             .source_blocks_dir
-            .join(to_hex(&block_id.0))
+            .join(hex_encode(&block_id.0))
             .join("block.bin");
 
         let source_data = match tokio::fs::read(&block_file_path).await {
@@ -210,11 +210,11 @@ impl RepairAgent {
         };
 
         // 5. For each ESI in placement.esi_ranges, encode and write symbol file
-        let holder_hex = to_hex(&holder_id.0);
+        let holder_hex = hex_encode(&holder_id.0);
         let sym_dir = self
             .config
             .symbols_dir
-            .join(to_hex(&block_id.0))
+            .join(hex_encode(&block_id.0))
             .join(&holder_hex);
 
         tokio::fs::create_dir_all(&sym_dir).await.map_err(RepairError::Io)?;
@@ -386,8 +386,3 @@ impl RepairAgent {
 // Helpers
 // ============================================================
 
-/// Full hex encoding of a byte slice (lowercase).
-/// Note: Display impls on ID types only show first 8 bytes.
-pub(crate) fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}

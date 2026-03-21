@@ -12,8 +12,9 @@ use syncback_core::db::Db;
 use syncback_core::erasure::{binding_seed, ErasureEncoder};
 use syncback_core::placement::{compute_allocation, HolderCandidate, PlacementError};
 use syncback_core::types::{
-    ErasureParams, Event, EventEntry, FileId, IdentityPub, PlacementStatus, SourceBlockId,
-    SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
+    hex_encode, ErasureParams, Event, EventEntry, FileId, IdentityPub, PlacementStatus,
+    SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement,
+    Timestamp,
 };
 
 use super::packing::build_plaintext;
@@ -362,11 +363,6 @@ pub fn update_backed_up_at(
         }
     }
     Ok(())
-}
-
-/// Hex-encode a byte slice.
-pub fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Read symbol files for a given holder from the symbols directory.

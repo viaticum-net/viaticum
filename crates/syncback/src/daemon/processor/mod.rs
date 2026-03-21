@@ -36,7 +36,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use syncback_core::constants::{DECODE_OVERHEAD, INITIAL_TRUST_P};
+use syncback_core::constants::{DECODE_OVERHEAD, INITIAL_TRUST_P, SYMBOL_SIZE};
 use syncback_core::db::{Db, WeeklyPosEntry};
 use syncback_core::erasure::{ErasureEncoder, Symbol};
 use syncback_core::messages::{
@@ -50,8 +50,8 @@ use syncback_core::pos::{
 };
 use syncback_core::trust::PosOutcome;
 use syncback_core::types::{
-    ErasureParams, HoldingRecord, HoldingStatus, IdentityPub, PeerRecord, PlacementStatus,
-    Timestamp,
+    hex_encode, ErasureParams, HoldingRecord, HoldingStatus, IdentityPub, PeerRecord,
+    PlacementStatus, Timestamp,
 };
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -66,8 +66,6 @@ use crate::daemon::repair::RepairTrigger;
 #[cfg(test)]
 mod tests;
 
-// Symbol size constant (T = 64 KB - 1 = 65535 bytes per RaptorQ spec)
-const SYMBOL_SIZE: u64 = 65_535;
 
 // ─── Error type ───────────────────────────────────────────────────────────────
 
@@ -97,7 +95,8 @@ pub enum ProcessorError {
 /// Routes incoming connections and dispatches messages to appropriate handlers.
 pub struct Processor {
     db: Db,
-    own_identity: IdentityPub,
+    /// Our identity — will be used for escrow check (TODO Phase 7.6+).
+    _own_identity: IdentityPub,
     repair_tx: mpsc::Sender<RepairTrigger>,
     cluster_sync: Arc<ClusterSyncManager>,
     encoder: Arc<dyn ErasureEncoder>,
@@ -135,7 +134,7 @@ impl Processor {
     ) -> Self {
         Processor {
             db,
-            own_identity,
+            _own_identity: own_identity,
             repair_tx,
             cluster_sync,
             encoder,
@@ -376,7 +375,7 @@ impl Processor {
         transfer: SymbolTransferMsg,
     ) -> Result<(), ProcessorError> {
         let block_id = transfer.source_block_id;
-        let block_hex = to_hex(&block_id.0);
+        let block_hex = hex_encode(&block_id.0);
         let block_dir = self.holdings_dir.join(&block_hex);
 
         tokio::fs::create_dir_all(&block_dir).await?;
@@ -465,7 +464,7 @@ impl Processor {
         let esi = challenge.esi;
         let sym_path = self
             .holdings_dir
-            .join(to_hex(&block_id.0))
+            .join(hex_encode(&block_id.0))
             .join(format!("{esi}.bin"));
 
         match tokio::fs::read(&sym_path).await {
@@ -566,7 +565,7 @@ impl Processor {
 
         let block_path = self
             .source_blocks_dir
-            .join(to_hex(&block_id.0))
+            .join(hex_encode(&block_id.0))
             .join("block.bin");
 
         let source_data = match tokio::fs::read(&block_path).await {
@@ -765,7 +764,7 @@ impl Processor {
         let offer_bytes: u64 = offer
             .esi_ranges
             .iter()
-            .map(|&(_start, count)| count as u64 * SYMBOL_SIZE)
+            .map(|&(_start, count)| count as u64 * SYMBOL_SIZE as u64)
             .sum();
 
         let accept = self.decide_symbol_offer(offer_bytes)?;
@@ -883,7 +882,7 @@ impl Processor {
         };
 
         // Load symbol files from disk.
-        let block_hex = to_hex(&block_id.0);
+        let block_hex = hex_encode(&block_id.0);
         let block_dir = self.holdings_dir.join(&block_hex);
         let mut symbols: Vec<Symbol> = Vec::with_capacity(esis_to_send.len());
 
@@ -1201,7 +1200,3 @@ fn current_week_number() -> u32 {
     ((secs / 604_800) as u32).max(1)
 }
 
-/// Full hex encoding (lowercase) for directory names.
-fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}

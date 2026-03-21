@@ -1,6 +1,7 @@
 use clap::Parser;
 use syncback::cli::{Cli, Command};
 use syncback::daemon::handle::{DaemonConfig, DaemonHandle};
+use syncback_core::types::hex_encode;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -58,8 +59,4 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
