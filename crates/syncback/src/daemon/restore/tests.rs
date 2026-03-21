@@ -49,6 +49,7 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         device_id: DeviceId([1u8; 16]),
         mock_holders: test_holders(),
         cluster_state: None,
+        network: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }

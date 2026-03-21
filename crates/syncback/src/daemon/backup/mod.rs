@@ -76,6 +76,10 @@ pub struct BackupConfig {
     /// Optional cluster state for dedup check (multi-device).
     /// If None: use inline DB scan (single-device backward compat).
     pub cluster_state: Option<std::sync::Arc<std::sync::Mutex<syncback_core::cluster::ClusterState>>>,
+    /// Network handle for symbol delivery.
+    /// When None: symbols are encoded and written to disk but not delivered
+    /// (pre-7.5 behavior; also used in unit tests that do not spin up a network).
+    pub network: Option<std::sync::Arc<crate::daemon::network::NetworkHandle>>,
 }
 
 impl Default for BackupConfig {
@@ -87,6 +91,7 @@ impl Default for BackupConfig {
             device_id: DeviceId([0u8; 16]),
             mock_holders: vec![],
             cluster_state: None,
+            network: None,
         }
     }
 }
@@ -328,25 +333,116 @@ impl BackupCoordinator {
                         }
                         None => {
                             tracing::info!("BackupCoordinator: channel closed, flushing and exiting");
-                            let _ = self.flush_all(true);
+                            match self.flush_all(true) {
+                                Ok(results) => self.deliver_symbols(&results).await,
+                                Err(e) => tracing::error!("final flush error: {e}"),
+                            }
                             break;
                         }
                     }
                 }
                 _ = idle_timer.tick() => {
                     tracing::debug!("idle flush triggered");
-                    if let Err(e) = self.flush_all(false) {
-                        tracing::error!("idle flush error: {e}");
+                    match self.flush_all(false) {
+                        Ok(results) => {
+                            if !results.is_empty() {
+                                self.deliver_symbols(&results).await;
+                            }
+                        }
+                        Err(e) => tracing::error!("idle flush error: {e}"),
                     }
                 }
                 _ = fallback_timer.tick() => {
                     tracing::debug!("fallback flush triggered");
-                    if let Err(e) = self.flush_all(true) {
-                        tracing::error!("fallback flush error: {e}");
+                    match self.flush_all(true) {
+                        Ok(results) => {
+                            if !results.is_empty() {
+                                self.deliver_symbols(&results).await;
+                            }
+                        }
+                        Err(e) => tracing::error!("fallback flush error: {e}"),
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Deliver encoded symbols to their assigned holders over the network.
+    ///
+    /// For each `PipelineResult`:
+    ///   1. Load `SymbolPlacement` records for the source block from DB.
+    ///   2. For each placement, read symbol files from disk, build `SymbolTransferMsg`,
+    ///      and call `network.send_symbols(holder_identity, msg)`.
+    ///
+    /// Errors are logged but not propagated — delivery failures do not abort the backup.
+    /// No-op when `config.network` is None.
+    async fn deliver_symbols(&self, results: &[PipelineResult]) {
+        let network = match &self.config.network {
+            Some(n) => n.clone(),
+            None => return,
+        };
+
+        for result in results {
+            let placements = match self.db.list_placements_for_block(&result.source_block_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(
+                        block = ?result.source_block_id,
+                        error = %e,
+                        "deliver_symbols: failed to load placements from DB"
+                    );
+                    continue;
+                }
+            };
+
+            for placement in &placements {
+                if let Err(e) = self.deliver_to_holder(&network, result, placement).await {
+                    tracing::warn!(
+                        block = ?result.source_block_id,
+                        holder = %placement.holder_id,
+                        error = %e,
+                        "deliver_symbols: failed to deliver to holder (will retry on repair)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Deliver symbols for one (block, holder) pair.
+    async fn deliver_to_holder(
+        &self,
+        network: &crate::daemon::network::NetworkHandle,
+        result: &PipelineResult,
+        placement: &syncback_core::types::SymbolPlacement,
+    ) -> anyhow::Result<()> {
+        use syncback_core::messages::SymbolTransferMsg;
+        use syncback_core::types::Timestamp;
+
+        let symbols = pipeline::read_symbols_for_holder(
+            &self.config.symbols_dir,
+            &result.source_block_id,
+            &placement.esi_ranges,
+        )?;
+
+        if symbols.is_empty() {
+            anyhow::bail!(
+                "no symbol files found for block {:?} holder {}",
+                result.source_block_id,
+                placement.holder_id
+            );
+        }
+
+        let msg = SymbolTransferMsg {
+            v: 1,
+            source_block_id: result.source_block_id,
+            symbols,
+            timestamp: Timestamp::now(),
+        };
+
+        network
+            .send_symbols(placement.holder_id, msg)
+            .await
+            .map_err(|e| anyhow::anyhow!("send_symbols: {e}"))
     }
 }

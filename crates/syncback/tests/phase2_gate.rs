@@ -63,6 +63,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         device_id: DEVICE_A,
         mock_holders: test_holders(),
         cluster_state: None,
+        network: None,
     }
 }
 

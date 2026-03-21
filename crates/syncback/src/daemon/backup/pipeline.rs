@@ -368,3 +368,30 @@ pub fn update_backed_up_at(
 pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// Read symbol files for a given holder from the symbols directory.
+///
+/// Reads files named `{esi}.bin` for each ESI in `esi_ranges`.
+/// Returns `Vec<Symbol>` in ESI order.
+/// Returns error if any file cannot be read.
+pub(crate) fn read_symbols_for_holder(
+    symbols_dir: &std::path::Path,
+    block_id: &syncback_core::types::SourceBlockId,
+    esi_ranges: &[(u32, u32)],
+) -> anyhow::Result<Vec<syncback_core::erasure::Symbol>> {
+    use syncback_core::erasure::Symbol;
+
+    let block_dir = symbols_dir.join(hex_encode(&block_id.0));
+    let mut symbols = Vec::new();
+
+    for &(start_esi, count) in esi_ranges {
+        for esi in start_esi..start_esi + count {
+            let path = block_dir.join(format!("{esi}.bin"));
+            let data = std::fs::read(&path)
+                .map_err(|e| anyhow::anyhow!("read symbol {}: {e}", path.display()))?;
+            symbols.push(Symbol { esi, data });
+        }
+    }
+
+    Ok(symbols)
+}

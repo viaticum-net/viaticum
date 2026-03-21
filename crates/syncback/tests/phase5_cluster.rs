@@ -79,6 +79,7 @@ fn backup_cfg_with_cluster(
         device_id,
         mock_holders: holders_5(),
         cluster_state: Some(cluster_state),
+        network: None,
     }
 }
 

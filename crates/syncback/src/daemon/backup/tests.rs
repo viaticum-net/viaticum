@@ -31,6 +31,7 @@ fn test_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         device_id: DeviceId([1u8; 16]),
         mock_holders: test_holders(),
         cluster_state: None,
+        network: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -326,6 +327,7 @@ fn pipeline_roundtrip_can_decode() {
         device_id: DeviceId([1u8; 16]),
         mock_holders: test_holders(),
         cluster_state: None,
+        network: None,
     };
     let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let mut coord = BackupCoordinator::new(db.clone(), config, encoder.clone());
@@ -639,6 +641,7 @@ fn dedup_via_cluster_state_skips_already_backed_up() {
         device_id: DeviceId([1u8; 16]),
         mock_holders: test_holders(),
         cluster_state: Some(cluster_state),
+        network: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -650,4 +653,310 @@ fn dedup_via_cluster_state_skips_already_backed_up() {
         queue_len, 0,
         "ClusterState dedup should skip file already backed up"
     );
+}
+
+// ─── Phase 7.5 tests ──────────────────────────────────────────────────────────
+
+// ─── Test 16: read_symbols_for_holder_reads_correct_files ────────────────────
+
+#[test]
+fn read_symbols_for_holder_reads_correct_files() {
+    use crate::daemon::backup::pipeline::read_symbols_for_holder;
+
+    let dir = TempDir::new().unwrap();
+    let block_id = SourceBlockId([0x01u8; 32]);
+    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let block_dir = dir.path().join(&block_hex);
+    std::fs::create_dir_all(&block_dir).unwrap();
+
+    for esi in [0u32, 1, 2] {
+        std::fs::write(block_dir.join(format!("{esi}.bin")), vec![esi as u8; 64]).unwrap();
+    }
+
+    let symbols = read_symbols_for_holder(dir.path(), &block_id, &[(0, 3)]).unwrap();
+
+    assert_eq!(symbols.len(), 3);
+    assert_eq!(symbols[0].esi, 0);
+    assert_eq!(symbols[1].esi, 1);
+    assert_eq!(symbols[2].esi, 2);
+    assert_eq!(symbols[0].data, vec![0u8; 64]);
+}
+
+// ─── Test 17: read_symbols_for_holder_missing_file_returns_error ─────────────
+
+#[test]
+fn read_symbols_for_holder_missing_file_returns_error() {
+    use crate::daemon::backup::pipeline::read_symbols_for_holder;
+
+    let dir = TempDir::new().unwrap();
+    let block_id = SourceBlockId([0x02u8; 32]);
+
+    let result = read_symbols_for_holder(dir.path(), &block_id, &[(0, 1)]);
+    assert!(result.is_err(), "must return error when symbol file is missing");
+}
+
+// ─── Test 18: read_symbols_for_holder_multiple_ranges ────────────────────────
+
+#[test]
+fn read_symbols_for_holder_multiple_ranges() {
+    use crate::daemon::backup::pipeline::read_symbols_for_holder;
+
+    let dir = TempDir::new().unwrap();
+    let block_id = SourceBlockId([0x03u8; 32]);
+    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let block_dir = dir.path().join(&block_hex);
+    std::fs::create_dir_all(&block_dir).unwrap();
+
+    for esi in [0u32, 1, 5, 6, 7] {
+        std::fs::write(block_dir.join(format!("{esi}.bin")), vec![esi as u8; 8]).unwrap();
+    }
+
+    let symbols =
+        read_symbols_for_holder(dir.path(), &block_id, &[(0, 2), (5, 3)]).unwrap();
+
+    assert_eq!(symbols.len(), 5);
+    let esis: Vec<u32> = symbols.iter().map(|s| s.esi).collect();
+    assert_eq!(esis, vec![0, 1, 5, 6, 7]);
+}
+
+// ─── Test 19: backup_config_default_network_is_none ──────────────────────────
+
+#[test]
+fn backup_config_default_network_is_none() {
+    let cfg = BackupConfig::default();
+    assert!(cfg.network.is_none(), "default config must have network=None");
+}
+
+// ─── Test 20: deliver_symbols_no_op_when_network_none ────────────────────────
+
+#[tokio::test]
+async fn deliver_symbols_no_op_when_network_none() {
+    use super::PipelineResult;
+    use syncback_core::types::IdentityPub;
+
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let coordinator = BackupCoordinator::new(
+        db,
+        BackupConfig {
+            symbols_dir: symbols_dir.path().to_path_buf(),
+            network: None,
+            ..BackupConfig::default()
+        },
+        Arc::new(RaptorQEncoder::new()),
+    );
+
+    coordinator.deliver_symbols(&[]).await;
+
+    let fake_result = PipelineResult {
+        source_block_id: SourceBlockId([0u8; 32]),
+        k: 1,
+        n: 2,
+        symbol_count_per_holder: vec![(IdentityPub([0u8; 32]), 1)],
+        stored_size: 0,
+    };
+    coordinator.deliver_symbols(&[fake_result]).await;
+}
+
+// ─── Test 21: deliver_symbols_logs_warn_on_peer_not_found ────────────────────
+
+#[tokio::test]
+async fn deliver_symbols_logs_warn_on_peer_not_found() {
+    use std::collections::HashMap;
+
+    use ed25519_dalek::SigningKey;
+    use syncback_core::types::{IdentityPub, PlacementStatus, SymbolPlacement};
+
+    use crate::daemon::network::{NetworkConfig, NetworkHandle};
+
+    use super::PipelineResult;
+
+    let sk_owner = SigningKey::from_bytes(&[10u8; 32]);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let network = std::sync::Arc::new(
+        NetworkHandle::start(
+            NetworkConfig {
+                signing_key: sk_owner.clone(),
+                known_peers: HashMap::new(),
+                device_cert: None,
+                iroh_secret_key: None,
+            },
+            tx,
+        )
+        .await
+        .unwrap(),
+    );
+
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+
+    let block_id = SourceBlockId([0xAAu8; 32]);
+    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let block_dir = dir.path().join(&block_hex);
+    std::fs::create_dir_all(&block_dir).unwrap();
+    std::fs::write(block_dir.join("0.bin"), vec![0u8; 64]).unwrap();
+
+    let unknown_holder = IdentityPub([0xFFu8; 32]);
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id: unknown_holder,
+        file_id: FileId(1),
+        esi_ranges: vec![(0, 1)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp::now(),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+
+    let coordinator = BackupCoordinator::new(
+        db,
+        BackupConfig {
+            symbols_dir: dir.path().to_path_buf(),
+            network: Some(network.clone()),
+            ..BackupConfig::default()
+        },
+        Arc::new(RaptorQEncoder::new()),
+    );
+
+    let result = PipelineResult {
+        source_block_id: block_id,
+        k: 1,
+        n: 2,
+        symbol_count_per_holder: vec![(unknown_holder, 1)],
+        stored_size: 64,
+    };
+
+    coordinator.deliver_symbols(&[result]).await;
+
+    Arc::try_unwrap(network).ok().map(|n| async move { n.shutdown().await });
+}
+
+// ─── Test 22: deliver_symbols_sends_to_reachable_holder ──────────────────────
+
+#[tokio::test]
+async fn deliver_symbols_sends_to_reachable_holder() {
+    use std::collections::HashMap;
+
+    use ed25519_dalek::SigningKey;
+    use syncback_core::messages::Message;
+    use syncback_core::types::{IdentityPub, PlacementStatus, SymbolPlacement};
+
+    use crate::daemon::network::{NetworkConfig, NetworkHandle};
+
+    use super::PipelineResult;
+
+    let sk_owner = SigningKey::from_bytes(&[20u8; 32]);
+    let sk_holder = SigningKey::from_bytes(&[21u8; 32]);
+    let holder_identity = IdentityPub(sk_holder.verifying_key().to_bytes());
+
+    let (tx_owner, _rx_owner) = tokio::sync::mpsc::channel(4);
+    let (tx_holder, mut rx_holder) = tokio::sync::mpsc::channel(4);
+
+    let network_holder = std::sync::Arc::new(
+        NetworkHandle::start(
+            NetworkConfig {
+                signing_key: sk_holder,
+                known_peers: HashMap::new(),
+                device_cert: None,
+                iroh_secret_key: None,
+            },
+            tx_holder,
+        )
+        .await
+        .unwrap(),
+    );
+
+    let holder_addr = network_holder.local_addr().unwrap();
+
+    let mut known_peers = HashMap::new();
+    known_peers.insert(holder_identity, holder_addr);
+
+    let network_owner = std::sync::Arc::new(
+        NetworkHandle::start(
+            NetworkConfig {
+                signing_key: sk_owner.clone(),
+                known_peers,
+                device_cert: None,
+                iroh_secret_key: None,
+            },
+            tx_owner,
+        )
+        .await
+        .unwrap(),
+    );
+
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let block_id = SourceBlockId([0x99u8; 32]);
+    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let block_dir = dir.path().join(&block_hex);
+    std::fs::create_dir_all(&block_dir).unwrap();
+
+    for esi in 0u32..2 {
+        std::fs::write(block_dir.join(format!("{esi}.bin")), vec![esi as u8; 64]).unwrap();
+    }
+
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id: holder_identity,
+        file_id: FileId(1),
+        esi_ranges: vec![(0, 2)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp::now(),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+
+    let coordinator = BackupCoordinator::new(
+        db,
+        BackupConfig {
+            symbols_dir: dir.path().to_path_buf(),
+            network: Some(network_owner.clone()),
+            ..BackupConfig::default()
+        },
+        Arc::new(RaptorQEncoder::new()),
+    );
+
+    let result = PipelineResult {
+        source_block_id: block_id,
+        k: 2,
+        n: 4,
+        symbol_count_per_holder: vec![(holder_identity, 2)],
+        stored_size: 128,
+    };
+
+    coordinator.deliver_symbols(&[result]).await;
+
+    let mut conn = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        rx_holder.recv(),
+    )
+    .await
+    .expect("timeout waiting for connection")
+    .expect("channel closed");
+
+    let msg = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        conn.recv_message(),
+    )
+    .await
+    .expect("timeout waiting for message")
+    .expect("recv_message failed");
+
+    match msg {
+        Message::SymbolTransfer(transfer) => {
+            assert_eq!(transfer.source_block_id, block_id);
+            assert_eq!(transfer.symbols.len(), 2);
+            assert_eq!(transfer.symbols[0].esi, 0);
+            assert_eq!(transfer.symbols[1].esi, 1);
+        }
+        other => panic!("expected SymbolTransfer, got {other:?}"),
+    }
+
+    Arc::try_unwrap(network_owner).ok().map(|n| async move { n.shutdown().await });
+    Arc::try_unwrap(network_holder).ok().map(|n| async move { n.shutdown().await });
 }

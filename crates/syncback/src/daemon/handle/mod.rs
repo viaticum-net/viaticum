@@ -239,6 +239,7 @@ impl DaemonHandle {
                 device_id,
                 mock_holders: vec![],
                 cluster_state: cluster_state.clone(),
+                network: Some(network.clone()),
             },
             encoder.clone(),
         );

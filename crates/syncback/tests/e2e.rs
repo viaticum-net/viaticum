@@ -53,6 +53,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         device_id: DEVICE_A,
         mock_holders: test_holders(),
         cluster_state: None,
+        network: None,
     }
 }
 
@@ -312,6 +313,7 @@ async fn full_lifecycle_e2e() {
             device_id: DEVICE_B,
             mock_holders: test_holders(),
             cluster_state: Some(Arc::clone(&cluster_state)),
+            network: None,
         },
         Arc::new(RaptorQEncoder::new()),
     );
