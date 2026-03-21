@@ -47,6 +47,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<String>,
 
+    /// Data directory (determines socket path). Default: ~/.syncback
+    #[arg(long, global = true, default_value = "~/.syncback")]
+    pub data_dir: String,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -58,9 +62,6 @@ pub enum Command {
         /// Time scale factor (1 = real time, 604800 = 1 sec equals 1 week).
         #[arg(long, default_value = "1")]
         time_scale: u64,
-        /// Data directory.
-        #[arg(long, default_value = "~/.syncback")]
-        data_dir: String,
         /// Directories to watch for backup (may be specified multiple times).
         #[arg(long)]
         watch_dir: Vec<std::path::PathBuf>,
@@ -71,9 +72,6 @@ pub enum Command {
         /// BIP39 mnemonic phrase (24 words). If omitted, generates a new one.
         #[arg(long)]
         mnemonic: Option<String>,
-        /// Data directory (default: ~/.syncback)
-        #[arg(long, default_value = "~/.syncback")]
-        data_dir: String,
     },
 
     /// Show overall system status

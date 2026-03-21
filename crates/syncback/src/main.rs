@@ -5,20 +5,19 @@ use syncback::daemon::handle::{DaemonConfig, DaemonHandle};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let global_dir = syncback::cli::expand_data_dir(&cli.data_dir);
+    let global_socket = global_dir.join("syncback.sock").to_string_lossy().to_string();
+
     match &cli.command {
         Command::Daemon {
             time_scale,
-            data_dir,
             watch_dir,
         } => {
             tracing_subscriber::fmt::init();
 
-            let dir = syncback::cli::expand_data_dir(data_dir);
             let cfg = DaemonConfig {
-                data_dir: dir,
-                socket_path: syncback::cli::expand_socket_path(
-                    syncback::cli::DEFAULT_SOCKET_PATH,
-                ),
+                data_dir: global_dir.clone(),
+                socket_path: global_socket.clone(),
                 time_scale: *time_scale,
                 watch_dirs: watch_dir.clone(),
             };
@@ -30,8 +29,8 @@ async fn main() -> anyhow::Result<()> {
             handle.stop();
             handle.wait().await?;
         }
-        Command::Init { mnemonic, data_dir } => {
-            let dir = syncback::cli::expand_data_dir(data_dir);
+        Command::Init { mnemonic } => {
+            let dir = global_dir.clone();
             let result = match mnemonic {
                 Some(m) => {
                     syncback::daemon::identity::init_identity_from_mnemonic(&dir, m)
@@ -52,9 +51,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         other => {
-            let socket_path =
-                syncback::cli::expand_socket_path(syncback::cli::DEFAULT_SOCKET_PATH);
-            if let Err(e) = syncback::cli::run_command(other, &socket_path) {
+            if let Err(e) = syncback::cli::run_command(other, &global_socket) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }

@@ -202,6 +202,18 @@ impl NetworkHandle {
         Ok(self.endpoint.addr())
     }
 
+    /// Return a reference to the signing key (for building PeerAnnounce messages).
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
+
+    /// Return the actual bound socket addresses (local listening ports).
+    /// These are the real ports iroh is listening on, unlike `local_addr()`
+    /// which may return STUN-discovered external ports.
+    pub fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
+        self.endpoint.bound_sockets()
+    }
+
     /// Connect to a peer by iroh [`EndpointAddr`].
     ///
     /// Performs the SyncBack handshake (A-side):
@@ -345,6 +357,18 @@ impl NetworkHandle {
             .await
             .insert(peer_identity, ConnectionState::Backoff { retry_after });
         debug!(peer = %peer_identity, "connection evicted, backoff recorded");
+    }
+
+    /// Store an established connection in the pool so it stays alive.
+    ///
+    /// Used by dispatch_connect to keep the connection from being dropped
+    /// after the CLI returns.
+    pub async fn store_connection(&self, peer_identity: IdentityPub, conn: Connection) {
+        self.connections
+            .lock()
+            .await
+            .insert(peer_identity, ConnectionState::Live(Arc::new(Mutex::new(conn))));
+        debug!(peer = %peer_identity, "connection stored in pool");
     }
 
     /// Register a peer in the known_peers directory.

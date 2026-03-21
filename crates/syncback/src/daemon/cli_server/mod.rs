@@ -244,41 +244,59 @@ fn dispatch_status(state: &DaemonState) -> CliResponse {
         .count() as u32;
 
     let node_identity = bytes_to_hex_full(&state.identity_pub.0);
-    let node_addr = state
-        .network
-        .local_addr()
-        .ok()
-        .and_then(|endpoint_addr| {
-            // EndpointAddr.addrs is a BTreeSet<TransportAddr>; filter for Ip variants.
-            let mut ip_addrs = endpoint_addr.addrs.iter().filter_map(|a| match a {
-                iroh::TransportAddr::Ip(addr) => Some(*addr),
+
+    // Build node_addr combining:
+    // - IP from iroh's address discovery (STUN/relay)
+    // - Port from bound_sockets() (actual listening port, not NAT-mapped)
+    // - Relay URL from iroh (for NAT traversal)
+    let node_addr = {
+        let endpoint_addr = state.network.local_addr().ok();
+
+        // Get relay URL if present.
+        let relay_url: Option<String> = endpoint_addr.as_ref().and_then(|ea| {
+            ea.addrs.iter().find_map(|a| match a {
+                iroh::TransportAddr::Relay(url) => Some(url.to_string()),
                 _ => None,
-            });
-            ip_addrs
-                .find(|a| !a.ip().is_loopback())
-                .or_else(|| {
-                    endpoint_addr.addrs.iter().find_map(|a| match a {
-                        iroh::TransportAddr::Ip(addr) => Some(*addr),
-                        _ => None,
-                    })
+            })
+        });
+
+        // Get discovered IP from iroh (non-loopback).
+        let discovered_ip = endpoint_addr.as_ref().and_then(|ea| {
+            ea.addrs
+                .iter()
+                .filter_map(|a| match a {
+                    iroh::TransportAddr::Ip(addr) => Some(addr.ip()),
+                    _ => None,
                 })
-                .map(|socket_addr| {
-                    crate::daemon::network::addr::format_node_addr(
-                        &state.network.node_id,
-                        socket_addr,
-                        None,
-                    )
-                })
-        })
-        .unwrap_or_else(|| {
-            state
+                .find(|ip| !ip.is_loopback())
+        });
+
+        // Get actual listening port from bound sockets.
+        let bound = state.network.bound_sockets();
+        let bound_port = bound
+            .iter()
+            .find(|a| a.is_ipv4())
+            .or(bound.first())
+            .map(|a| a.port());
+
+        match (discovered_ip, bound_port) {
+            (Some(ip), Some(port)) => {
+                let addr = std::net::SocketAddr::new(ip, port);
+                crate::daemon::network::addr::format_node_addr(
+                    &state.network.node_id,
+                    addr,
+                    relay_url.as_deref(),
+                )
+            }
+            _ => state
                 .network
                 .node_id
                 .0
                 .iter()
                 .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        });
+                .collect::<String>(),
+        }
+    };
 
     CliResponse::Status(StatusData {
         node_identity,
@@ -552,7 +570,7 @@ async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
         }
     };
 
-    let conn = match state.network.connect(endpoint_addr.clone(), None).await {
+    let mut conn = match state.network.connect(endpoint_addr.clone(), None).await {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(addr = %addr, error = %e, "connect failed");
@@ -561,6 +579,25 @@ async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
     };
 
     let peer_identity = conn.peer_identity;
+
+    // Send PeerAnnounce so the remote peer registers us.
+    {
+        use syncback_core::messages::{build_peer_announce, Message};
+        use syncback_core::types::Timestamp;
+        let pa = build_peer_announce(
+            state.identity_pub,
+            state.network.node_id,
+            Timestamp::now(),
+            state.network.signing_key(),
+        );
+        let msg = Message::PeerAnnounce(pa);
+        if let Err(e) = crate::daemon::network::NetworkHandle::send_message(&mut conn, &msg).await
+        {
+            tracing::warn!(peer = %peer_identity, error = %e, "failed to send PeerAnnounce after connect");
+        } else {
+            tracing::debug!(peer = %peer_identity, "sent PeerAnnounce after connect");
+        }
+    }
     let now = Timestamp::now();
 
     let existing = state.db.get_peer(&peer_identity).unwrap_or(None);
@@ -594,6 +631,9 @@ async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
     }
 
     state.network.add_peer(peer_identity, endpoint_addr).await;
+
+    // Store connection in pool so it stays alive and can be reused.
+    state.network.store_connection(peer_identity, conn).await;
 
     tracing::info!(
         peer = %peer_identity,

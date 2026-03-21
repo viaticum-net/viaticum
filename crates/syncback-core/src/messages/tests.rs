@@ -596,3 +596,83 @@ fn cluster_sync_response_msg_round_trip() {
     assert_eq!(decoded.events.len(), 1);
     assert_eq!(decoded.events[0].0, 1u64);
 }
+
+// ─── build_peer_announce / verify_peer_announce ───────────────────────────────
+
+#[test]
+fn build_peer_announce_produces_valid_signature() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let identity_pub = IdentityPub(sk.verifying_key().to_bytes());
+    let node_id = make_node_id(5);
+    let ts = Timestamp(1_000_000);
+
+    let msg = super::build_peer_announce(identity_pub, node_id, ts, &sk);
+
+    assert_eq!(msg.v, crate::constants::PROTOCOL_VERSION);
+    assert_eq!(msg.identity_pub, identity_pub);
+    assert_eq!(msg.node_id, node_id);
+    assert_eq!(msg.timestamp, ts);
+
+    // Signature must verify.
+    super::verify_peer_announce(&msg).expect("signature should verify");
+}
+
+#[test]
+fn verify_peer_announce_rejects_tampered_identity() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let identity_pub = IdentityPub(sk.verifying_key().to_bytes());
+    let node_id = make_node_id(6);
+    let ts = Timestamp(2_000_000);
+
+    let mut msg = super::build_peer_announce(identity_pub, node_id, ts, &sk);
+
+    // Tamper with the identity_pub — sig should no longer verify.
+    msg.identity_pub = make_identity_pub(0xFF);
+
+    let result = super::verify_peer_announce(&msg);
+    assert!(
+        matches!(result, Err(super::MessageError::BadSignature)),
+        "tampered identity_pub should fail verification"
+    );
+}
+
+#[test]
+fn verify_peer_announce_rejects_tampered_node_id() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let identity_pub = IdentityPub(sk.verifying_key().to_bytes());
+    let node_id = make_node_id(7);
+    let ts = Timestamp(3_000_000);
+
+    let mut msg = super::build_peer_announce(identity_pub, node_id, ts, &sk);
+
+    // Tamper with the node_id.
+    msg.node_id = make_node_id(0xFF);
+
+    let result = super::verify_peer_announce(&msg);
+    assert!(
+        matches!(result, Err(super::MessageError::BadSignature)),
+        "tampered node_id should fail verification"
+    );
+}
+
+#[test]
+fn peer_announce_cbor_round_trip() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let identity_pub = IdentityPub(sk.verifying_key().to_bytes());
+    let node_id = make_node_id(8);
+    let ts = Timestamp(4_000_000);
+
+    let msg = super::build_peer_announce(identity_pub, node_id, ts, &sk);
+
+    // Serialize to CBOR and deserialize.
+    let encoded = to_cbor(&msg).expect("cbor encode failed");
+    let decoded: PeerAnnounceMsg = from_cbor(&encoded).expect("cbor decode failed");
+
+    assert_eq!(decoded.identity_pub, msg.identity_pub);
+    assert_eq!(decoded.node_id, msg.node_id);
+    assert_eq!(decoded.timestamp, msg.timestamp);
+    assert_eq!(decoded.sig, msg.sig);
+
+    // Signature must still verify after CBOR round-trip.
+    super::verify_peer_announce(&decoded).expect("signature should verify after cbor round-trip");
+}

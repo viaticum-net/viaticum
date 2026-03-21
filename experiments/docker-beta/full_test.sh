@@ -105,20 +105,30 @@ echo "=== Test 4: Multiple daemons ==="
 for node in node-b node-c node-d; do
     docker exec -d "$PREFIX-$node" sh -c 'syncback daemon --watch-dir /data/files 2>/tmp/daemon.log'
 done
-sleep 3
+sleep 5
 
 UP_COUNT=0
-declare -A NODE_ADDRS
+ADDR_B=""
+ADDR_C=""
+ADDR_D=""
 for node in node-a node-b node-c node-d; do
-    STATUS=$(exec_node_q $node syncback status 2>/dev/null || true)
-    if echo "$STATUS" | grep -q "identity:"; then
+    if exec_node_q $node syncback status 2>/dev/null | grep -q "identity:"; then
         ((UP_COUNT++)) || true
-        # Capture addr for connect tests (strip leading whitespace)
-        NODE_ADDRS[$node]=$(echo "$STATUS" | grep "addr:" | sed 's/.*addr:[[:space:]]*//')
     fi
 done
 
+# Get addrs separately (more reliable than parsing multi-line status)
+get_addr() {
+    exec_node_q "$1" syncback status 2>/dev/null | grep "addr:" | awk '{for(i=1;i<=NF;i++) if($i ~ /@/) print $i}'
+}
+ADDR_B=$(get_addr node-b)
+ADDR_C=$(get_addr node-c)
+ADDR_D=$(get_addr node-d)
+
 echo "  Daemons responding: $UP_COUNT/4"
+echo "  addr B: ${ADDR_B:0:20}..."
+echo "  addr C: ${ADDR_C:0:20}..."
+echo "  addr D: ${ADDR_D:0:20}..."
 if [ "$UP_COUNT" -eq 4 ]; then
     pass "all 4 daemons running"
 else
@@ -145,11 +155,27 @@ fi
 # Connect A→C and A→D too
 ADDR_C="${NODE_ADDRS[node-c]}"
 ADDR_D="${NODE_ADDRS[node-d]}"
+CONNECT_OK=1
 if [ -n "$ADDR_C" ]; then
-    exec_node_q node-a syncback connect "$ADDR_C" > /dev/null 2>&1 || true
+    RC=$(exec_node_q node-a syncback connect "$ADDR_C" 2>&1 || true)
+    echo "  A→C: $(echo "$RC" | head -1)"
+    echo "$RC" | grep -qi "connected" || CONNECT_OK=0
+else
+    echo "  A→C: addr not available"
+    CONNECT_OK=0
 fi
 if [ -n "$ADDR_D" ]; then
-    exec_node_q node-a syncback connect "$ADDR_D" > /dev/null 2>&1 || true
+    RD=$(exec_node_q node-a syncback connect "$ADDR_D" 2>&1 || true)
+    echo "  A→D: $(echo "$RD" | head -1)"
+    echo "$RD" | grep -qi "connected" || CONNECT_OK=0
+else
+    echo "  A→D: addr not available"
+    CONNECT_OK=0
+fi
+if [ "$CONNECT_OK" -eq 1 ]; then
+    pass "connected to all 3 peers"
+else
+    fail "some peer connections failed"
 fi
 
 # Verify peers show up in status
@@ -157,8 +183,10 @@ sleep 2
 PEER_STATUS=$(exec_node_q node-a syncback status || true)
 PEER_COUNT=$(echo "$PEER_STATUS" | grep "peers:" | head -1 | sed 's/.*peers:[[:space:]]*//' | awk '{print $1}')
 echo "  peers after connect: $PEER_COUNT"
-if [ "${PEER_COUNT:-0}" -ge 1 ] 2>/dev/null; then
-    pass "peers registered after connect"
+if [ "${PEER_COUNT:-0}" -ge 3 ] 2>/dev/null; then
+    pass "all 3 peers registered"
+elif [ "${PEER_COUNT:-0}" -ge 1 ] 2>/dev/null; then
+    pass "peers registered ($PEER_COUNT/3)"
 else
     fail "no peers registered (count=$PEER_COUNT)"
 fi
