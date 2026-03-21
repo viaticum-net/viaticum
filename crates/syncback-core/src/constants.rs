@@ -175,6 +175,14 @@ pub const WILLINGNESS_FACTOR: f64 = 0.5;
 /// Rolling window for weekly placement stats.
 pub const WEEKLY_STATS_WINDOW: u32 = 4;
 
+// === Relay board limits ===
+
+/// Max entries per relay board (from protocol.md §1.5).
+pub const MAX_BOARD_ENTRIES: usize = 2000;
+
+/// Max total board size in bytes (8 MB, from protocol.md §1.5).
+pub const MAX_BOARD_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
 // === Compile-time sanity checks ===
 
 const _: () = assert!(S_CLAMP_MIN < S_CLAMP_MAX);

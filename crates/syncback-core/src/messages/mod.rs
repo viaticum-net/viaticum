@@ -249,11 +249,39 @@ pub enum Message {
     RestoreRequest(RestoreRequestMsg),
     RestoreResponse(RestoreResponseMsg),
     RestoreDenied(RestoreDeniedMsg),
+    BoardSync(BoardSyncMsg),
 }
 
 // ============================================================
 // Relay board types
 // ============================================================
+
+/// One entry stored in the board file (on disk) or exchanged during board sync.
+///
+/// Wraps a [`BoardEntry`] with its identifying metadata so the board file and
+/// wire format carry a self-contained, independently verifiable record.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredEntry {
+    /// Type string (e.g. "pos_challenge", "peer_announce").
+    pub msg_type: String,
+    /// 16-byte unique ID.
+    pub msg_id: [u8; 16],
+    /// The board entry itself.
+    pub entry: BoardEntry,
+}
+
+/// Batch of relay board entries exchanged on connection setup.
+///
+/// Sent as the first message after handshake to let each peer populate its
+/// board with entries it may have missed while offline. Old nodes that do not
+/// recognise the `BoardSync` variant will log an unknown-variant decode error
+/// and skip it — no connection is terminated.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BoardSyncMsg {
+    pub v: u8,
+    pub entries: Vec<StoredEntry>,
+    pub timestamp: Timestamp,
+}
 
 /// One entry on a relay board (append-only file).
 /// key: "{type}/{msg_id}"

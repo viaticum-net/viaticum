@@ -259,6 +259,11 @@ pub struct SourceBlockRecord {
     pub block_type: SourceBlockType,
     pub status: SourceBlockStatus,
     pub created_at: Timestamp,
+    /// Exact byte length of the stored blob ([nonce][ciphertext]).
+    /// Required for restore: decoded erasure block is padded to k*t; trim to encrypted_size.
+    /// None for records created before this field was added (legacy).
+    #[serde(default)]
+    pub encrypted_size: Option<u64>,
 }
 
 /// Symbol placement from owner's perspective. Key: (SourceBlockId, holder IdentityPub).

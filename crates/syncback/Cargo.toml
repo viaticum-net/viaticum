@@ -22,6 +22,7 @@ serde = { workspace = true }
 rand = { workspace = true }
 iroh = { workspace = true }
 ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

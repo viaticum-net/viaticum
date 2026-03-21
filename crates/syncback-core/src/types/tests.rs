@@ -178,6 +178,7 @@ fn cbor_roundtrip_source_block_pack() {
         },
         status: SourceBlockStatus::Active,
         created_at: Timestamp(5000),
+        encrypted_size: None,
     };
     let bytes = to_cbor_bytes(&sb);
     let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();

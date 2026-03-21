@@ -34,6 +34,7 @@ fn make_source_block(seed: u8, status: SourceBlockStatus) -> SourceBlockRecord {
         block_type: SourceBlockType::Single,
         status,
         created_at: Timestamp(1000),
+        encrypted_size: None,
     }
 }
 

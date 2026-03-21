@@ -199,6 +199,7 @@ pub fn run_pipeline(
         block_type,
         status: SourceBlockStatus::Active,
         created_at: Timestamp::now(),
+        encrypted_size: Some(stored.len() as u64),
     };
     db.upsert_source_block(&block_record)?;
 
