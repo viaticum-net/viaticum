@@ -90,6 +90,7 @@ fn make_peer(identity: IdentityPub) -> PeerRecord {
         last_seen: Timestamp(2000),
         weeks_in_network: 4,
         device_id: None,
+        revoked_device_pub_keys: vec![],
     }
 }
 

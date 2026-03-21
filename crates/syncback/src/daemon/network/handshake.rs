@@ -14,9 +14,11 @@
 use ed25519_dalek::SigningKey;
 use iroh::endpoint::Connection as IrohConnection;
 use iroh::Endpoint;
+use syncback_core::cluster::DeviceCertificate;
 use syncback_core::constants::MAX_MESSAGE_SIZE;
 use syncback_core::messages::{
-    Message, MessageError, build_handshake, frame_message, from_cbor, verify_handshake,
+    Message, MessageError, build_handshake, extract_cluster_identity, frame_message, from_cbor,
+    verify_handshake,
 };
 use syncback_core::types::{IdentityPub, Timestamp};
 use tokio::io::AsyncWriteExt;
@@ -34,6 +36,7 @@ pub(super) async fn handshake_initiator(
     signing_key: &SigningKey,
     our_identity: IdentityPub,
     expected_identity: Option<IdentityPub>,
+    device_cert: Option<DeviceCertificate>,
 ) -> Result<Connection, NetworkError> {
     let (mut send, mut recv) = iroh_conn
         .open_bi()
@@ -41,13 +44,15 @@ pub(super) async fn handshake_initiator(
         .map_err(|e| NetworkError::Iroh(anyhow::anyhow!("{e}")))?;
 
     // Initiator sends handshake first.
-    send_handshake_on_stream(&mut send, signing_key, our_identity).await?;
+    send_handshake_on_stream(&mut send, signing_key, our_identity, device_cert).await?;
 
     // Read peer's handshake.
-    let peer_identity = recv_and_verify_handshake(&mut recv, expected_identity).await?;
+    let (peer_identity, peer_master_identity) =
+        recv_and_verify_handshake(&mut recv, expected_identity).await?;
 
     Ok(Connection {
         peer_identity,
+        peer_master_identity,
         inner: iroh_conn,
         send,
         recv,
@@ -63,6 +68,7 @@ pub(super) async fn handshake_acceptor(
     iroh_conn: IrohConnection,
     signing_key: &SigningKey,
     our_identity: IdentityPub,
+    device_cert: Option<DeviceCertificate>,
 ) -> Result<Connection, NetworkError> {
     let (mut send, mut recv) = iroh_conn
         .accept_bi()
@@ -70,13 +76,15 @@ pub(super) async fn handshake_acceptor(
         .map_err(|e| NetworkError::Iroh(anyhow::anyhow!("{e}")))?;
 
     // Acceptor reads initiator's handshake first.
-    let peer_identity = recv_and_verify_handshake(&mut recv, None).await?;
+    let (peer_identity, peer_master_identity) =
+        recv_and_verify_handshake(&mut recv, None).await?;
 
     // Then sends its own.
-    send_handshake_on_stream(&mut send, signing_key, our_identity).await?;
+    send_handshake_on_stream(&mut send, signing_key, our_identity, device_cert).await?;
 
     Ok(Connection {
         peer_identity,
+        peer_master_identity,
         inner: iroh_conn,
         send,
         recv,
@@ -88,9 +96,10 @@ async fn send_handshake_on_stream(
     send: &mut iroh::endpoint::SendStream,
     signing_key: &SigningKey,
     our_identity: IdentityPub,
+    device_cert: Option<DeviceCertificate>,
 ) -> Result<(), NetworkError> {
     let now = Timestamp::now();
-    let hs = build_handshake(our_identity, now, signing_key);
+    let hs = build_handshake(our_identity, now, signing_key, device_cert);
     let framed = frame_message(&Message::Handshake(hs)).map_err(NetworkError::Message)?;
     send.write_all(&framed)
         .await
@@ -103,11 +112,13 @@ async fn send_handshake_on_stream(
 
 /// Read and verify a single HandshakeMsg from a RecvStream.
 ///
-/// Returns the peer's `IdentityPub` on success.
+/// Returns `(peer_identity, peer_master_identity)` on success.
+/// `peer_master_identity` is `Some(master_pub)` if the peer presented a valid
+/// device certificate, `None` for single-device nodes.
 async fn recv_and_verify_handshake(
     recv: &mut iroh::endpoint::RecvStream,
     expected_identity: Option<IdentityPub>,
-) -> Result<IdentityPub, NetworkError> {
+) -> Result<(IdentityPub, Option<IdentityPub>), NetworkError> {
     let msg = recv_framed_message(recv).await?;
 
     match msg {
@@ -124,7 +135,10 @@ async fn recv_and_verify_handshake(
                 }
             }
 
-            Ok(hs.identity_pub)
+            let peer_master_identity = extract_cluster_identity(&hs)
+                .map_err(|e| NetworkError::HandshakeFailed(e.to_string()))?;
+
+            Ok((hs.identity_pub, peer_master_identity))
         }
         other => Err(NetworkError::HandshakeFailed(format!(
             "expected Handshake variant, got {:?}",
@@ -164,6 +178,7 @@ pub(super) async fn accept_loop(
     endpoint: Endpoint,
     signing_key: SigningKey,
     our_identity: IdentityPub,
+    device_cert: Option<DeviceCertificate>,
     incoming_tx: tokio::sync::mpsc::Sender<Connection>,
 ) {
     info!("accept loop started");
@@ -178,6 +193,7 @@ pub(super) async fn accept_loop(
 
         let signing_key = signing_key.clone();
         let incoming_tx = incoming_tx.clone();
+        let device_cert = device_cert.clone();
 
         tokio::spawn(async move {
             // Upgrade Incoming -> IrohConnection (QUIC + TLS).
@@ -190,13 +206,15 @@ pub(super) async fn accept_loop(
             };
 
             // SyncBack handshake (B side).
-            let conn = match handshake_acceptor(iroh_conn, &signing_key, our_identity).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("SyncBack handshake failed on accept: {e}");
-                    return;
-                }
-            };
+            let conn =
+                match handshake_acceptor(iroh_conn, &signing_key, our_identity, device_cert).await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("SyncBack handshake failed on accept: {e}");
+                        return;
+                    }
+                };
 
             debug!(peer = %conn.peer_identity, "accepted authenticated connection");
 

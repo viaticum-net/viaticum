@@ -333,6 +333,17 @@ pub struct PeerRecord {
     pub weeks_in_network: u32,
     /// Which device manages this peer relationship (peer-to-device affinity).
     pub device_id: Option<DeviceId>,
+    /// Device public keys we know are revoked for this peer identity.
+    /// Populated when we receive a valid RevocationBroadcast via relay board.
+    #[serde(default)]
+    pub revoked_device_pub_keys: Vec<[u8; 32]>,
+}
+
+impl PeerRecord {
+    /// Check if a device IdentityPub is in the revoked list for this peer.
+    pub fn is_device_revoked(&self, device_identity: &IdentityPub) -> bool {
+        self.revoked_device_pub_keys.contains(&device_identity.0)
+    }
 }
 
 /// Symbols we hold for another owner. Key: (SourceBlockId, owner IdentityPub).
@@ -399,7 +410,7 @@ pub struct PlacementAgg {
 // ============================================================
 
 /// Events for cluster sync (append-only, commutative).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Event {
     SymbolsPlaced {
         source_block_id: SourceBlockId,
@@ -438,7 +449,7 @@ pub enum Event {
 }
 
 /// One entry in the append-only event log.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EventEntry {
     pub timestamp: Timestamp,
     pub device_id: DeviceId,

@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use redb::{ReadableTable, TableDefinition};
 
 use crate::constants::{HOLDER_DELETE_COOLDOWN_SECS, DROP_NOTICE_WINDOW_SECS};
+use crate::cluster::StoredClusterState;
 use crate::types::{
     from_cbor_bytes, to_cbor_bytes, BlockAgg, BudgetRecord, EventEntry, FileId, FileRecord,
     HoldingRecord, HoldingStatus, IdentityPub, PlacementAgg, PlacementStatus, PeerRecord,
@@ -47,6 +48,9 @@ const BUDGET: TableDefinition<&str, &[u8]> = TableDefinition::new("budget");
 /// Value = CBOR(WeeklyPosEntry).
 pub(crate) const POS_WEEKLY: TableDefinition<&[u8; 36], &[u8]> =
     TableDefinition::new("pos_weekly");
+
+/// Cluster state singleton. Key = "cluster_state". Value = CBOR(StoredClusterState).
+const CLUSTER_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("cluster_state");
 
 // --- Indices ---
 
@@ -232,6 +236,7 @@ impl Db {
             tx.open_table(POS_WEEKLY)?;
             tx.open_table(FILE_HOLDERS)?;
             tx.open_table(HOLDER_FILES)?;
+            tx.open_table(CLUSTER_STATE)?;
         }
         tx.commit()?;
         Ok(())
@@ -984,6 +989,32 @@ impl Db {
             result.push((week, entry));
         }
         Ok(result)
+    }
+}
+
+// ============================================================
+// Cluster state table
+// ============================================================
+
+impl Db {
+    pub fn get_cluster_state(&self) -> Result<Option<StoredClusterState>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(CLUSTER_STATE)?;
+        match table.get("cluster_state")? {
+            Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_cluster_state(&self, state: &StoredClusterState) -> Result<(), DbError> {
+        let bytes = to_cbor_bytes(state);
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(CLUSTER_STATE)?;
+            table.insert("cluster_state", bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 }
 

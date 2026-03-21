@@ -34,6 +34,7 @@ mod sig_serde {
 
 /// Sent in both directions at connection open on ALPN "syncback/1".
 /// sig covers: "handshake" || identity_pub.0 || timestamp.0.to_be_bytes()
+/// The device_cert, if present, is NOT covered by sig (it is self-signed by master key).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HandshakeMsg {
     pub v: u8,
@@ -42,6 +43,10 @@ pub struct HandshakeMsg {
     /// Ed25519 signature. 64 bytes.
     #[serde(with = "sig_serde")]
     pub sig: [u8; 64],
+    /// Device certificate: master_key.sign(device_pub_key).
+    /// Present when this node is part of a multi-device identity.
+    #[serde(default)]
+    pub device_cert: Option<crate::cluster::DeviceCertificate>,
 }
 
 /// Broadcast peer announcement. Relay board key: "peer_announce/{msg_id}".
@@ -243,6 +248,31 @@ pub struct RestoreDeniedMsg {
     pub timestamp: Timestamp,
 }
 
+/// Payload for relay board "device_revocation" broadcast.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RevocationBroadcast {
+    pub revocation: crate::cluster::RevocationCertificate,
+    pub device_cert: crate::cluster::DeviceCertificate,
+}
+
+/// Cluster device → cluster device. Request event log entries since last_known_seq.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ClusterSyncRequestMsg {
+    pub v: u8,
+    pub from_device_id: crate::types::DeviceId,
+    pub last_known_seq: u64,
+    pub timestamp: Timestamp,
+}
+
+/// Response to ClusterSyncRequestMsg. Contains event log entries.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ClusterSyncResponseMsg {
+    pub v: u8,
+    pub events: Vec<(u64, crate::types::EventEntry)>,
+    pub responder_last_seq: u64,
+    pub timestamp: Timestamp,
+}
+
 // ============================================================
 // Top-level Message enum
 // ============================================================
@@ -270,6 +300,8 @@ pub enum Message {
     RestoreResponse(RestoreResponseMsg),
     RestoreDenied(RestoreDeniedMsg),
     BoardSync(BoardSyncMsg),
+    ClusterSyncRequest(ClusterSyncRequestMsg),
+    ClusterSyncResponse(ClusterSyncResponseMsg),
 }
 
 // ============================================================
@@ -447,10 +479,14 @@ fn handshake_sig_input(identity_pub: &IdentityPub, timestamp: &Timestamp) -> Vec
 }
 
 /// Build a HandshakeMsg signed with signing_key.
+///
+/// The sig covers only "handshake" || identity_pub || timestamp, NOT the device_cert.
+/// The cert is self-signed by master key and verified separately.
 pub fn build_handshake(
     identity_pub: IdentityPub,
     timestamp: Timestamp,
     signing_key: &ed25519_dalek::SigningKey,
+    device_cert: Option<crate::cluster::DeviceCertificate>,
 ) -> HandshakeMsg {
     let sig_input = handshake_sig_input(&identity_pub, &timestamp);
     let signature = signing_key.sign(&sig_input);
@@ -459,7 +495,46 @@ pub fn build_handshake(
         identity_pub,
         timestamp,
         sig: signature.to_bytes(),
+        device_cert,
     }
+}
+
+/// Extract the cluster master identity from a handshake message.
+///
+/// If no device_cert is present, returns Ok(None).
+/// If a cert is present, verifies it and returns Ok(Some(master_pub_key)) on success.
+pub fn extract_cluster_identity(
+    msg: &HandshakeMsg,
+) -> Result<Option<IdentityPub>, MessageError> {
+    let cert = match &msg.device_cert {
+        None => return Ok(None),
+        Some(c) => c,
+    };
+
+    // The device_pub_key in the cert must match the identity_pub in the handshake.
+    if cert.device_pub_key != msg.identity_pub.0 {
+        return Err(MessageError::BadSignature);
+    }
+
+    // Verify the cert signature using the master pub key embedded in the cert.
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&cert.master_pub_key.0)
+        .map_err(|_| MessageError::BadSignature)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&cert.signature);
+    let payload = device_cert_payload_for_verify(cert);
+    verifying_key
+        .verify_strict(&payload, &sig)
+        .map_err(|_| MessageError::BadSignature)?;
+
+    Ok(Some(cert.master_pub_key))
+}
+
+/// Reconstruct the signed payload for a DeviceCertificate (mirrors cluster::device_cert_payload).
+fn device_cert_payload_for_verify(cert: &crate::cluster::DeviceCertificate) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(56);
+    payload.extend_from_slice(&cert.device_id.0);
+    payload.extend_from_slice(&cert.device_pub_key);
+    payload.extend_from_slice(&cert.issued_at.0.to_be_bytes());
+    payload
 }
 
 /// Verify a received HandshakeMsg.

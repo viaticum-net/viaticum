@@ -8,12 +8,15 @@ use std::collections::HashMap;
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use syncback_core::cluster::{
+    derive_device_key, derive_master_key, issue_device_certificate, master_identity,
+};
 use syncback_core::messages::{
     Message, PosChallengeMsg, StorageWarningMsg, SymbolTransferMsg, build_handshake,
     verify_handshake,
 };
 use syncback_core::erasure::Symbol;
-use syncback_core::types::{IdentityPub, SourceBlockId, Timestamp};
+use syncback_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp};
 
 use crate::daemon::network::{NetworkConfig, NetworkError, NetworkHandle};
 
@@ -31,6 +34,7 @@ fn make_config(signing_key: SigningKey) -> NetworkConfig {
     NetworkConfig {
         signing_key,
         known_peers: HashMap::new(),
+        device_cert: None,
     }
 }
 
@@ -210,7 +214,7 @@ async fn send_symbol_transfer_roundtrip() {
 fn handshake_rejects_stale_timestamp() {
     let (sk, pk) = keygen();
     let stale_ts = Timestamp(0); // Unix epoch — definitely stale.
-    let hs = build_handshake(pk, stale_ts, &sk);
+    let hs = build_handshake(pk, stale_ts, &sk, None);
 
     let result = verify_handshake(&hs, Timestamp::now());
     assert!(
@@ -224,7 +228,7 @@ fn handshake_rejects_stale_timestamp() {
 #[test]
 fn handshake_rejects_bad_signature() {
     let (sk, pk) = keygen();
-    let mut hs = build_handshake(pk, Timestamp::now(), &sk);
+    let mut hs = build_handshake(pk, Timestamp::now(), &sk, None);
     hs.sig[0] ^= 0xFF; // corrupt first byte
 
     let result = verify_handshake(&hs, Timestamp::now());
@@ -325,3 +329,169 @@ async fn multiple_messages_on_same_connection() {
     handle_a.shutdown().await;
     handle_b.shutdown().await;
 }
+
+// ─── Test 8: initiator with device cert — acceptor sees peer_master_identity ──
+
+#[tokio::test]
+async fn handshake_initiator_includes_device_cert() {
+    // Build a cluster: master key → device key → cert.
+    let master_key = derive_master_key(&[1u8; 32]).expect("master key");
+    let device_id = DeviceId([2u8; 16]);
+    let device_key = derive_device_key(&[1u8; 32], &device_id).expect("device key");
+    let device_pub_key = device_key.verifying_key().to_bytes();
+    let cert = issue_device_certificate(&master_key, device_id, device_pub_key, Timestamp(100));
+    let master_pub = master_identity(&master_key);
+
+    // Node A uses the device key + cert.
+    let device_identity = IdentityPub(device_pub_key);
+    let config_a = NetworkConfig {
+        signing_key: device_key,
+        known_peers: HashMap::new(),
+        device_cert: Some(cert),
+    };
+
+    // Node B is a plain single-device node.
+    let (sk_b, _pk_b) = keygen();
+    let config_b = make_config(sk_b);
+
+    let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
+    let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(10);
+
+    let handle_a = NetworkHandle::start(config_a, tx_a)
+        .await
+        .expect("handle_a start");
+    let handle_b = NetworkHandle::start(config_b, tx_b)
+        .await
+        .expect("handle_b start");
+
+    let addr_b = handle_b.local_addr().expect("addr_b");
+
+    // A (device) connects to B.
+    let conn_a_to_b = handle_a
+        .connect(addr_b, None)
+        .await
+        .expect("connect a -> b");
+
+    // B receives the connection.
+    let incoming_b = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        rx_b.recv(),
+    )
+    .await
+    .expect("timeout waiting for B to receive connection")
+    .expect("channel closed");
+
+    // A connected to B: A sees no master identity for B (B is single-device).
+    assert_eq!(conn_a_to_b.peer_master_identity, None, "B has no cluster cert");
+
+    // B received connection from A: B should see A's master identity.
+    assert_eq!(
+        incoming_b.peer_identity,
+        device_identity,
+        "B sees A's device identity"
+    );
+    assert_eq!(
+        incoming_b.peer_master_identity,
+        Some(master_pub),
+        "B sees A's cluster master identity from device cert"
+    );
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+}
+
+// ─── Test 9: handshake without cert — peer_master_identity is None ────────────
+
+#[tokio::test]
+async fn handshake_without_cert_peer_master_identity_is_none() {
+    let (sk_a, _pk_a) = keygen();
+    let (sk_b, _pk_b) = keygen();
+
+    let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
+    let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(10);
+
+    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+        .await
+        .expect("handle_a");
+    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+        .await
+        .expect("handle_b");
+
+    let addr_b = handle_b.local_addr().expect("addr_b");
+
+    let conn_a = handle_a.connect(addr_b, None).await.expect("connect");
+    let conn_b = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        rx_b.recv(),
+    )
+    .await
+    .expect("timeout")
+    .expect("channel closed");
+
+    // Neither side presents a device cert.
+    assert_eq!(conn_a.peer_master_identity, None, "no cert -> None");
+    assert_eq!(conn_b.peer_master_identity, None, "no cert -> None");
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+}
+
+// ─── Test 10: PeerRecord.is_device_revoked ────────────────────────────────────
+
+#[test]
+fn revocation_check_rejects_revoked_device_pub_key() {
+    use syncback_core::types::PeerRecord;
+
+    let revoked_pub = [3u8; 32];
+    let record = PeerRecord {
+        identity: IdentityPub([0u8; 32]),
+        node_id: None,
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        weeks_in_network: 0,
+        device_id: None,
+        revoked_device_pub_keys: vec![revoked_pub],
+    };
+
+    assert!(
+        record.is_device_revoked(&IdentityPub(revoked_pub)),
+        "revoked key must be detected"
+    );
+    assert!(
+        !record.is_device_revoked(&IdentityPub([4u8; 32])),
+        "non-revoked key must not trigger revocation"
+    );
+}
+
+// ─── Test 11: PeerRecord backward compat — revoked_device_pub_keys defaults ───
+
+#[test]
+fn peer_record_revoked_device_pub_keys_default_empty() {
+    use syncback_core::types::{from_cbor_bytes, to_cbor_bytes, PeerRecord};
+
+    let record = PeerRecord {
+        identity: IdentityPub([1u8; 32]),
+        node_id: None,
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        weeks_in_network: 0,
+        device_id: None,
+        revoked_device_pub_keys: vec![],
+    };
+
+    // Round-trip through CBOR.
+    let bytes = to_cbor_bytes(&record);
+    let decoded: PeerRecord = from_cbor_bytes(&bytes).expect("decode");
+    assert_eq!(decoded.revoked_device_pub_keys, Vec::<[u8; 32]>::new());
+}
+

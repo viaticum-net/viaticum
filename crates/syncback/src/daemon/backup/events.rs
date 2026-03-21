@@ -51,21 +51,38 @@ impl BackupCoordinator {
         let size_bytes = file_bytes.len() as u64;
         let content_hash: [u8; 32] = *blake3::hash(&file_bytes).as_bytes();
 
-        // Dedup check: scan all files for matching content_hash.
-        let all_files = self.db.list_all_files()?;
-        let dedup_match = all_files
-            .iter()
-            .find(|r| r.versions.iter().any(|v| v.content_hash == content_hash));
+        // Dedup check: content already backed up → zero traffic.
+        // Use ClusterState if available (multi-device), else inline scan.
+        let is_backed_up = if let Some(cs) = &self.config.cluster_state {
+            let guard = cs.lock().expect("cluster_state lock poisoned");
+            guard
+                .is_content_backed_up(&content_hash)
+                .map_err(|e| anyhow::anyhow!("cluster dedup check: {e}"))?
+        } else {
+            let all_files = self.db.list_all_files()?;
+            all_files.iter().any(|r| {
+                r.versions
+                    .iter()
+                    .any(|v| v.content_hash == content_hash && v.backed_up_at.is_some())
+            })
+        };
 
-        if let Some(existing) = dedup_match {
-            // Zero traffic: content already backed up.
-            tracing::debug!(
-                "dedup: {} matches existing record path={}",
-                event.path,
-                existing.path
-            );
-            self.handle_dedup(event, existing, content_hash)?;
-            return Ok(());
+        if is_backed_up {
+            // Content is already fully backed up — update catalog without re-uploading.
+            let all_files = self.db.list_all_files()?;
+            if let Some(existing) = all_files
+                .iter()
+                .find(|r| r.versions.iter().any(|v| v.content_hash == content_hash))
+            {
+                tracing::debug!(
+                    "dedup: {} matches existing record path={}",
+                    event.path,
+                    existing.path
+                );
+                let existing = existing.clone();
+                self.handle_dedup(event, &existing, content_hash)?;
+                return Ok(());
+            }
         }
 
         // Not a duplicate — classify and enqueue or process immediately (large file).

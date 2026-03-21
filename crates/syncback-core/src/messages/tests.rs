@@ -1,6 +1,7 @@
+use crate::cluster::{derive_device_key, derive_master_key, issue_device_certificate, master_identity, issue_revocation, EpochCounter};
 use crate::constants::{HANDSHAKE_FRESHNESS_SECS, MAX_RELAY_HOP, RELAY_TTL_SECS};
 use crate::erasure::Symbol;
-use crate::types::{IdentityPub, NodeId, SourceBlockId, Timestamp};
+use crate::types::{DeviceId, Event, EventEntry, IdentityPub, NodeId, SourceBlockId, Timestamp};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -35,6 +36,7 @@ fn minimal_handshake() -> Message {
         identity_pub: IdentityPub([1u8; 32]),
         timestamp: Timestamp(1000),
         sig: [0u8; 64],
+        device_cert: None,
     })
 }
 
@@ -118,7 +120,7 @@ fn build_and_verify_handshake_passes() {
     let signing_key = SigningKey::generate(&mut OsRng);
     let identity_pub = IdentityPub(signing_key.verifying_key().to_bytes());
     let now = Timestamp(1_000_000);
-    let msg = build_handshake(identity_pub, now, &signing_key);
+    let msg = build_handshake(identity_pub, now, &signing_key, None);
     let result = verify_handshake(&msg, now);
     assert!(result.is_ok());
 }
@@ -127,7 +129,7 @@ fn build_and_verify_handshake_passes() {
 fn verify_handshake_fails_bad_signature() {
     let signing_key = SigningKey::generate(&mut OsRng);
     let identity_pub = IdentityPub(signing_key.verifying_key().to_bytes());
-    let mut msg = build_handshake(identity_pub, Timestamp(1_000_000), &signing_key);
+    let mut msg = build_handshake(identity_pub, Timestamp(1_000_000), &signing_key, None);
     msg.sig[0] ^= 0xFF;
     let result = verify_handshake(&msg, Timestamp(1_000_000));
     assert!(matches!(result, Err(MessageError::BadSignature)));
@@ -139,7 +141,7 @@ fn verify_handshake_fails_stale_timestamp() {
     let identity_pub = IdentityPub(signing_key.verifying_key().to_bytes());
     let old_ts = Timestamp(1_000_000);
     let now = Timestamp(1_000_000 + HANDSHAKE_FRESHNESS_SECS + 1);
-    let msg = build_handshake(identity_pub, old_ts, &signing_key);
+    let msg = build_handshake(identity_pub, old_ts, &signing_key, None);
     let result = verify_handshake(&msg, now);
     assert!(matches!(result, Err(MessageError::HandshakeStale { .. })));
 }
@@ -272,6 +274,7 @@ fn all_message_variants_frame_roundtrip() {
             identity_pub: IdentityPub([1u8; 32]),
             timestamp: ts,
             sig: [0u8; 64],
+            device_cert: None,
         }),
         Message::PeerAnnounce(PeerAnnounceMsg {
             v: 1,
@@ -447,4 +450,148 @@ fn pos_nack_framing_roundtrip() {
     let (decoded, consumed) = unframe_message(&framed).unwrap();
     assert_eq!(decoded, msg);
     assert_eq!(consumed, framed.len());
+}
+
+// ─── cluster / handshake extension tests ────────────────────────────────────
+
+fn make_device_cert_for_test() -> (
+    ed25519_dalek::SigningKey, // master key
+    ed25519_dalek::SigningKey, // device key
+    crate::cluster::DeviceCertificate,
+    IdentityPub,               // master identity
+    DeviceId,
+) {
+    let seed = [0xAAu8; 32];
+    let master_key = derive_master_key(&seed).unwrap();
+    let device_id = DeviceId([0x01u8; 16]);
+    let device_key = derive_device_key(&seed, &device_id).unwrap();
+    let device_pub = device_key.verifying_key().to_bytes();
+    let cert = issue_device_certificate(&master_key, device_id, device_pub, Timestamp(1_000_000));
+    let master_pub = master_identity(&master_key);
+    (master_key, device_key, cert, master_pub, device_id)
+}
+
+#[test]
+fn handshake_with_device_cert_round_trip() {
+    let (_, device_key, cert, _, _) = make_device_cert_for_test();
+    let device_pub = IdentityPub(device_key.verifying_key().to_bytes());
+    let now = Timestamp(1_000_000);
+    let msg = build_handshake(device_pub, now, &device_key, Some(cert.clone()));
+    let framed = frame_message(&Message::Handshake(msg.clone())).unwrap();
+    let (decoded, _) = unframe_message(&framed).unwrap();
+    match decoded {
+        Message::Handshake(h) => {
+            assert_eq!(h.device_cert, Some(cert));
+            assert_eq!(h.identity_pub, device_pub);
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn handshake_without_device_cert_backward_compat() {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let identity_pub = IdentityPub(signing_key.verifying_key().to_bytes());
+    let now = Timestamp(1_000_000);
+    let msg = build_handshake(identity_pub, now, &signing_key, None);
+    let framed = frame_message(&Message::Handshake(msg)).unwrap();
+    let (decoded, _) = unframe_message(&framed).unwrap();
+    match decoded {
+        Message::Handshake(h) => assert!(h.device_cert.is_none()),
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn extract_cluster_identity_valid_cert() {
+    let (_, device_key, cert, master_pub, _) = make_device_cert_for_test();
+    let device_pub = IdentityPub(device_key.verifying_key().to_bytes());
+    let msg = build_handshake(device_pub, Timestamp(1_000_000), &device_key, Some(cert));
+    let result = extract_cluster_identity(&msg).unwrap();
+    assert_eq!(result, Some(master_pub));
+}
+
+#[test]
+fn extract_cluster_identity_none_for_no_cert() {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let identity_pub = IdentityPub(signing_key.verifying_key().to_bytes());
+    let msg = build_handshake(identity_pub, Timestamp(1_000_000), &signing_key, None);
+    let result = extract_cluster_identity(&msg).unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn extract_cluster_identity_rejects_mismatched_device_pub() {
+    let (_, device_key, cert, _, _) = make_device_cert_for_test();
+    // Use a different identity_pub that doesn't match cert.device_pub_key
+    let other_key = SigningKey::generate(&mut OsRng);
+    let other_pub = IdentityPub(other_key.verifying_key().to_bytes());
+    let msg = HandshakeMsg {
+        v: 1,
+        identity_pub: other_pub,
+        timestamp: Timestamp(1_000_000),
+        sig: [0u8; 64],
+        device_cert: Some(cert),
+    };
+    let result = extract_cluster_identity(&msg);
+    assert!(matches!(result, Err(MessageError::BadSignature)));
+}
+
+#[test]
+fn extract_cluster_identity_rejects_invalid_cert_signature() {
+    let (_, device_key, mut cert, _, _) = make_device_cert_for_test();
+    cert.signature[0] ^= 0xFF; // tamper with signature
+    let device_pub = IdentityPub(device_key.verifying_key().to_bytes());
+    let msg = build_handshake(device_pub, Timestamp(1_000_000), &device_key, Some(cert));
+    let result = extract_cluster_identity(&msg);
+    assert!(matches!(result, Err(MessageError::BadSignature)));
+}
+
+#[test]
+fn revocation_broadcast_cbor_round_trip() {
+    let seed = [0xBBu8; 32];
+    let master_key = derive_master_key(&seed).unwrap();
+    let device_id = DeviceId([0x02u8; 16]);
+    let device_key = derive_device_key(&seed, &device_id).unwrap();
+    let device_pub = device_key.verifying_key().to_bytes();
+    let cert = issue_device_certificate(&master_key, device_id, device_pub, Timestamp(1_000_000));
+    let revocation = issue_revocation(&master_key, device_id, Timestamp(2_000_000), EpochCounter(1));
+    let broadcast = RevocationBroadcast { revocation, device_cert: cert };
+    let bytes = to_cbor(&broadcast).unwrap();
+    let decoded: RevocationBroadcast = from_cbor(&bytes).unwrap();
+    assert_eq!(decoded, broadcast);
+}
+
+#[test]
+fn cluster_sync_request_msg_round_trip() {
+    let msg = ClusterSyncRequestMsg {
+        v: 1,
+        from_device_id: DeviceId([0x03u8; 16]),
+        last_known_seq: 42,
+        timestamp: Timestamp(1_000_000),
+    };
+    let bytes = to_cbor(&msg).unwrap();
+    let decoded: ClusterSyncRequestMsg = from_cbor(&bytes).unwrap();
+    assert_eq!(decoded, msg);
+}
+
+#[test]
+fn cluster_sync_response_msg_round_trip() {
+    let event_entry = EventEntry {
+        timestamp: Timestamp(1_000_000),
+        device_id: DeviceId([0x04u8; 16]),
+        event: Event::DeviceAdded { device_id: DeviceId([0x05u8; 16]) },
+    };
+    let msg = ClusterSyncResponseMsg {
+        v: 1,
+        events: vec![(1u64, event_entry)],
+        responder_last_seq: 1,
+        timestamp: Timestamp(1_000_000),
+    };
+    let bytes = to_cbor(&msg).unwrap();
+    let decoded: ClusterSyncResponseMsg = from_cbor(&bytes).unwrap();
+    assert_eq!(decoded.v, msg.v);
+    assert_eq!(decoded.responder_last_seq, msg.responder_last_seq);
+    assert_eq!(decoded.events.len(), 1);
+    assert_eq!(decoded.events[0].0, 1u64);
 }

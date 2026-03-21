@@ -23,8 +23,11 @@ use crate::daemon::network::NetworkError;
 /// Wraps one iroh QUIC bidirectional stream opened at handshake time.
 /// All subsequent protocol messages share this single stream.
 pub struct Connection {
-    /// Authenticated remote identity (from handshake).
+    /// Authenticated remote identity (from handshake sig — device-level key).
     pub peer_identity: IdentityPub,
+    /// Peer's cluster master identity, if they presented a valid device cert.
+    /// None if peer has no device_cert (single-device node).
+    pub peer_master_identity: Option<IdentityPub>,
     /// iroh connection handle (kept alive so the connection does not close).
     pub(crate) inner: iroh::endpoint::Connection,
     /// Write half of the bidirectional stream.

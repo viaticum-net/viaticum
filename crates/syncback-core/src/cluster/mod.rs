@@ -32,7 +32,7 @@ mod sig_serde {
 pub struct EpochCounter(pub u32);
 
 /// Certificate issued by master key to authorize a device.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceCertificate {
     pub device_id: DeviceId,
     /// Device's Ed25519 public key (used as iroh NodeId).
@@ -46,7 +46,7 @@ pub struct DeviceCertificate {
 }
 
 /// Certificate revoking a device key.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RevocationCertificate {
     pub device_id: DeviceId,
     pub revoked_at: Timestamp,
@@ -280,4 +280,387 @@ pub fn esi_namespace_start(device_index: u8) -> u32 {
 /// ESI namespace end (exclusive) for a device index.
 pub fn esi_namespace_end(device_index: u8) -> u32 {
     esi_namespace_start(device_index + 1)
+}
+
+// ============================================================
+// ClusterState
+// ============================================================
+
+/// Persistent snapshot of cluster state stored in DB.
+/// Used for fast load at startup without replaying entire event log.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredClusterState {
+    pub master_pub: IdentityPub,
+    pub devices: Vec<DeviceEntry>,
+    pub current_epoch: EpochCounter,
+    /// Epoch rotation history: (epoch_counter, activated_at). Sorted ascending by activated_at.
+    pub epoch_history: Vec<(EpochCounter, Timestamp)>,
+    /// Revoked device IDs. Append-only.
+    pub revoked_devices: Vec<crate::types::DeviceId>,
+    /// Peer-to-device affinity: which local device manages each external peer.
+    pub peer_affinity: Vec<(IdentityPub, crate::types::DeviceId)>,
+    /// Last applied event log sequence number.
+    pub last_applied_seq: u64,
+    /// Per-device sync cursors for ClusterSync (device pub → last received seq).
+    #[serde(default)]
+    pub sync_cursors: std::collections::HashMap<IdentityPub, u64>,
+}
+
+/// One registered device in the cluster.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeviceEntry {
+    pub device_id: crate::types::DeviceId,
+    /// Device's Ed25519 public key (= iroh NodeId bytes).
+    pub device_pub_key: [u8; 32],
+    /// Certificate issued by master key.
+    pub certificate: DeviceCertificate,
+    /// Index assigned at registration. Immutable once assigned. Range: 0..=15.
+    pub device_index: u8,
+}
+
+/// Error type for ClusterState operations.
+#[derive(Debug, thiserror::Error)]
+pub enum ClusterStateError {
+    #[error("db error: {0}")]
+    Db(#[from] crate::db::DbError),
+
+    #[error("cluster crypto error: {0}")]
+    Cluster(#[from] ClusterError),
+
+    #[error("device already registered: {0:?}")]
+    DeviceAlreadyRegistered(crate::types::DeviceId),
+
+    #[error("device not found: {0:?}")]
+    DeviceNotFound(crate::types::DeviceId),
+
+    #[error("device is revoked: {0:?}")]
+    DeviceRevoked(crate::types::DeviceId),
+
+    #[error("max devices reached (limit: 16)")]
+    MaxDevicesReached,
+
+    #[error("invalid certificate: {0}")]
+    InvalidCertificate(String),
+
+    #[error("not initialized")]
+    NotInitialized,
+
+    #[error("already initialized")]
+    AlreadyInitialized,
+}
+
+const MAX_DEVICES: usize = 16;
+
+/// Stateful cluster registry. Persisted via Db.
+pub struct ClusterState {
+    db: crate::db::Db,
+    state: StoredClusterState,
+}
+
+impl ClusterState {
+    /// Load existing cluster state from DB.
+    /// Returns Err(NotInitialized) if no state exists.
+    pub fn load(db: crate::db::Db) -> Result<Self, ClusterStateError> {
+        match db.get_cluster_state()? {
+            Some(state) => Ok(ClusterState { db, state }),
+            None => Err(ClusterStateError::NotInitialized),
+        }
+    }
+
+    /// Initialize a new cluster (first device registration).
+    pub fn init(
+        db: crate::db::Db,
+        master_pub: IdentityPub,
+        first_device_cert: DeviceCertificate,
+        epoch0_activated_at: crate::types::Timestamp,
+        now: crate::types::Timestamp,
+    ) -> Result<Self, ClusterStateError> {
+        if db.get_cluster_state()?.is_some() {
+            return Err(ClusterStateError::AlreadyInitialized);
+        }
+        verify_device_certificate(&first_device_cert, &master_pub)
+            .map_err(|e| ClusterStateError::InvalidCertificate(e.to_string()))?;
+
+        let device_pub_key = first_device_cert.device_pub_key;
+        let device_id = first_device_cert.device_id;
+        let entry = DeviceEntry {
+            device_id,
+            device_pub_key,
+            certificate: first_device_cert,
+            device_index: 0,
+        };
+
+        let state = StoredClusterState {
+            master_pub,
+            devices: vec![entry],
+            current_epoch: EpochCounter(0),
+            epoch_history: vec![(EpochCounter(0), epoch0_activated_at)],
+            revoked_devices: Vec::new(),
+            peer_affinity: Vec::new(),
+            last_applied_seq: 0,
+            sync_cursors: std::collections::HashMap::new(),
+        };
+
+        db.append_event(&crate::types::EventEntry {
+            timestamp: now,
+            device_id,
+            event: crate::types::Event::DeviceAdded { device_id },
+        })?;
+
+        db.set_cluster_state(&state)?;
+        Ok(ClusterState { db, state })
+    }
+
+    /// Register a new device. Appends DeviceAdded event.
+    pub fn add_device(
+        &mut self,
+        certificate: DeviceCertificate,
+        now: crate::types::Timestamp,
+    ) -> Result<(), ClusterStateError> {
+        let device_id = certificate.device_id;
+
+        if self.state.devices.iter().any(|d| d.device_id == device_id) {
+            return Err(ClusterStateError::DeviceAlreadyRegistered(device_id));
+        }
+        if self.state.devices.len() >= MAX_DEVICES {
+            return Err(ClusterStateError::MaxDevicesReached);
+        }
+        verify_device_certificate(&certificate, &self.state.master_pub)
+            .map_err(|e| ClusterStateError::InvalidCertificate(e.to_string()))?;
+
+        let device_index = self.state.devices.len() as u8;
+        let device_pub_key = certificate.device_pub_key;
+        self.state.devices.push(DeviceEntry {
+            device_id,
+            device_pub_key,
+            certificate,
+            device_index,
+        });
+
+        self.db.append_event(&crate::types::EventEntry {
+            timestamp: now,
+            device_id,
+            event: crate::types::Event::DeviceAdded { device_id },
+        })?;
+
+        self.db.set_cluster_state(&self.state)?;
+        Ok(())
+    }
+
+    /// Revoke a device. Rotates epoch.
+    pub fn revoke_device(
+        &mut self,
+        revocation_cert: RevocationCertificate,
+        epoch_activated_at: crate::types::Timestamp,
+        now: crate::types::Timestamp,
+    ) -> Result<(), ClusterStateError> {
+        let device_id = revocation_cert.device_id;
+
+        if !self.state.devices.iter().any(|d| d.device_id == device_id) {
+            return Err(ClusterStateError::DeviceNotFound(device_id));
+        }
+        if self.state.revoked_devices.contains(&device_id) {
+            return Err(ClusterStateError::DeviceRevoked(device_id));
+        }
+        verify_revocation(&revocation_cert, &self.state.master_pub)
+            .map_err(|e| ClusterStateError::InvalidCertificate(e.to_string()))?;
+
+        let new_epoch = revocation_cert.new_epoch;
+        self.state.revoked_devices.push(device_id);
+        self.state.current_epoch = new_epoch;
+        self.state.epoch_history.push((new_epoch, epoch_activated_at));
+
+        let caller_device_id = self
+            .state
+            .devices
+            .first()
+            .map(|d| d.device_id)
+            .unwrap_or(device_id);
+
+        self.db.append_event(&crate::types::EventEntry {
+            timestamp: now,
+            device_id: caller_device_id,
+            event: crate::types::Event::DeviceRevoked { device_id },
+        })?;
+        self.db.append_event(&crate::types::EventEntry {
+            timestamp: now,
+            device_id: caller_device_id,
+            event: crate::types::Event::EpochRotated { epoch: new_epoch.0 },
+        })?;
+
+        self.db.set_cluster_state(&self.state)?;
+        Ok(())
+    }
+
+    /// List all active (non-revoked) devices.
+    pub fn active_devices(&self) -> Vec<&DeviceEntry> {
+        self.state
+            .devices
+            .iter()
+            .filter(|d| !self.state.revoked_devices.contains(&d.device_id))
+            .collect()
+    }
+
+    /// List all devices (including revoked).
+    pub fn all_devices(&self) -> &[DeviceEntry] {
+        &self.state.devices
+    }
+
+    /// Get device entry by device_id.
+    pub fn get_device(&self, device_id: &crate::types::DeviceId) -> Option<&DeviceEntry> {
+        self.state.devices.iter().find(|d| &d.device_id == device_id)
+    }
+
+    /// Check if a device is revoked.
+    pub fn is_device_revoked(&self, device_id: &crate::types::DeviceId) -> bool {
+        self.state.revoked_devices.contains(device_id)
+    }
+
+    /// Current epoch counter.
+    pub fn current_epoch(&self) -> EpochCounter {
+        self.state.current_epoch
+    }
+
+    /// Full epoch history sorted ascending.
+    pub fn epoch_history(&self) -> &[(EpochCounter, crate::types::Timestamp)] {
+        &self.state.epoch_history
+    }
+
+    /// Assign a peer to a device (or reassign). Persists to DB.
+    pub fn set_peer_affinity(
+        &mut self,
+        peer: IdentityPub,
+        device_id: crate::types::DeviceId,
+    ) -> Result<(), ClusterStateError> {
+        if let Some(entry) = self.state.peer_affinity.iter_mut().find(|(p, _)| p == &peer) {
+            entry.1 = device_id;
+        } else {
+            self.state.peer_affinity.push((peer, device_id));
+        }
+        self.db.set_cluster_state(&self.state)?;
+        Ok(())
+    }
+
+    /// Get the device managing a peer.
+    pub fn peer_device(&self, peer: &IdentityPub) -> Option<crate::types::DeviceId> {
+        self.state
+            .peer_affinity
+            .iter()
+            .find(|(p, _)| p == peer)
+            .map(|(_, d)| *d)
+    }
+
+    /// List all peers assigned to a specific device.
+    pub fn peers_for_device(&self, device_id: &crate::types::DeviceId) -> Vec<IdentityPub> {
+        self.state
+            .peer_affinity
+            .iter()
+            .filter(|(_, d)| d == device_id)
+            .map(|(p, _)| *p)
+            .collect()
+    }
+
+    /// Check if a content_hash is already backed up.
+    pub fn is_content_backed_up(
+        &self,
+        content_hash: &[u8; 32],
+    ) -> Result<bool, ClusterStateError> {
+        let files = self.db.list_all_files()?;
+        for file in &files {
+            for version in &file.versions {
+                if &version.content_hash == content_hash && version.backed_up_at.is_some() {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Find the source_block_id for an already-backed-up content_hash.
+    pub fn find_source_block_for_content(
+        &self,
+        content_hash: &[u8; 32],
+    ) -> Result<Option<crate::types::SourceBlockId>, ClusterStateError> {
+        let files = self.db.list_all_files()?;
+        for file in &files {
+            for version in &file.versions {
+                if &version.content_hash == content_hash && version.backed_up_at.is_some() {
+                    return Ok(Some(version.source_block_id));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Apply a batch of events from another device.
+    pub fn apply_events(
+        &mut self,
+        events: &[(u64, crate::types::EventEntry)],
+    ) -> Result<usize, ClusterStateError> {
+        let mut applied = 0;
+        for (seq, entry) in events {
+            match &entry.event {
+                crate::types::Event::DeviceAdded { device_id } => {
+                    if !self.state.devices.iter().any(|d| &d.device_id == device_id) {
+                        let device_index = self.state.devices.len() as u8;
+                        self.state.devices.push(DeviceEntry {
+                            device_id: *device_id,
+                            device_pub_key: [0u8; 32],
+                            certificate: DeviceCertificate {
+                                device_id: *device_id,
+                                device_pub_key: [0u8; 32],
+                                issued_at: entry.timestamp,
+                                signature: [0u8; 64],
+                                master_pub_key: self.state.master_pub,
+                            },
+                            device_index,
+                        });
+                        applied += 1;
+                    }
+                }
+                crate::types::Event::DeviceRevoked { device_id } => {
+                    if !self.state.revoked_devices.contains(device_id) {
+                        self.state.revoked_devices.push(*device_id);
+                        applied += 1;
+                    }
+                }
+                crate::types::Event::EpochRotated { epoch } => {
+                    let new_epoch = EpochCounter(*epoch);
+                    if new_epoch > self.state.current_epoch {
+                        self.state.current_epoch = new_epoch;
+                        self.state.epoch_history.push((new_epoch, entry.timestamp));
+                        applied += 1;
+                    }
+                }
+                _ => {}
+            }
+            if *seq > self.state.last_applied_seq {
+                self.state.last_applied_seq = *seq;
+            }
+        }
+        self.db.set_cluster_state(&self.state)?;
+        Ok(applied)
+    }
+
+    /// Last applied event sequence number.
+    pub fn local_last_seq(&self) -> Result<u64, ClusterStateError> {
+        Ok(self.db.last_event_seq()?)
+    }
+
+    /// Our master public key.
+    pub fn master_pub(&self) -> IdentityPub {
+        self.state.master_pub
+    }
+
+    /// ESI namespace for a device_id. Returns (start, end). None if device not registered.
+    pub fn esi_namespace(
+        &self,
+        device_id: &crate::types::DeviceId,
+    ) -> Option<(u32, u32)> {
+        let entry = self.get_device(device_id)?;
+        Some((
+            esi_namespace_start(entry.device_index),
+            esi_namespace_end(entry.device_index),
+        ))
+    }
 }

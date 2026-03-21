@@ -61,7 +61,7 @@ pub struct QueuedFile {
 }
 
 /// Configuration for BackupCoordinator.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BackupConfig {
     /// Source block size in bytes. Default: DEFAULT_SOURCE_BLOCK_SIZE.
     pub source_block_size: u64,
@@ -73,6 +73,9 @@ pub struct BackupConfig {
     pub device_id: DeviceId,
     /// Holder candidates for Phase 2 testing. Overrides DB peers when non-empty.
     pub mock_holders: Vec<HolderCandidate>,
+    /// Optional cluster state for dedup check (multi-device).
+    /// If None: use inline DB scan (single-device backward compat).
+    pub cluster_state: Option<std::sync::Arc<std::sync::Mutex<syncback_core::cluster::ClusterState>>>,
 }
 
 impl Default for BackupConfig {
@@ -83,6 +86,7 @@ impl Default for BackupConfig {
             epoch_key: [0u8; 32],
             device_id: DeviceId([0u8; 16]),
             mock_holders: vec![],
+            cluster_state: None,
         }
     }
 }

@@ -48,6 +48,7 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         epoch_key: TEST_EPOCH_KEY,
         device_id: DeviceId([1u8; 16]),
         mock_holders: test_holders(),
+        cluster_state: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -63,6 +64,7 @@ async fn test_restore_coord(
     let config_net = NetworkConfig {
         signing_key: signing_key.clone(),
         known_peers: Default::default(),
+        device_cert: None,
     };
     let network = NetworkHandle::start(config_net, tx)
         .await
@@ -90,6 +92,7 @@ async fn test_restore_coord(
         NetworkConfig {
             signing_key: signing_key2,
             known_peers: Default::default(),
+            device_cert: None,
         },
         tx2,
     )

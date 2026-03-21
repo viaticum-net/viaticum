@@ -2,11 +2,17 @@
 // All tests use real Db::open_in_memory(), real RaptorQEncoder, and tempfile::TempDir.
 // Source block size is set small (128 KB) for fast tests.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use syncback_core::cluster::{
+    derive_master_key, issue_device_certificate, master_identity, ClusterState,
+};
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
-use syncback_core::types::{DeviceId, ErasureParams, Event, FileCategory, LocalState};
+use syncback_core::types::{
+    DeviceId, ErasureParams, Event, FileCategory, FileId, FileRecord, FileVersion, LocalState,
+    SourceBlockId, Timestamp,
+};
 use tempfile::TempDir;
 
 use super::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
@@ -24,6 +30,7 @@ fn test_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         epoch_key: [42u8; 32],
         device_id: DeviceId([1u8; 16]),
         mock_holders: test_holders(),
+        cluster_state: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -318,6 +325,7 @@ fn pipeline_roundtrip_can_decode() {
         epoch_key,
         device_id: DeviceId([1u8; 16]),
         mock_holders: test_holders(),
+        cluster_state: None,
     };
     let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let mut coord = BackupCoordinator::new(db.clone(), config, encoder.clone());
@@ -494,5 +502,152 @@ fn process_large_file_creates_single_block() {
     assert!(
         has_single,
         "should have created a Single-type source block for large file"
+    );
+}
+
+// ─── Test 13: dedup_skips_file_already_backed_up ─────────────────────────────
+
+/// Insert a FileRecord with backed_up_at=Some; process an event with the same
+/// content_hash. The file must NOT be added to the queue (zero-traffic dedup).
+#[test]
+fn dedup_skips_file_already_backed_up() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+
+    let content = b"content already backed up on another device";
+    let content_hash: [u8; 32] = *blake3::hash(content).as_bytes();
+
+    // Pre-insert a FileRecord whose version has backed_up_at=Some.
+    let existing_record = FileRecord {
+        file_id: FileId(1),
+        path: "/other/device/file.txt".to_string(),
+        importance: 0.5,
+        devices: vec![(DeviceId([9u8; 16]), LocalState::Present)],
+        versions: vec![FileVersion {
+            content_hash,
+            source_block_id: SourceBlockId([1u8; 32]),
+            k: 4,
+            t: 65535,
+            created_at: Timestamp(1_000_000),
+            backed_up_at: Some(Timestamp(2_000_000)),
+        }],
+        first_seen: Timestamp(1_000_000),
+    };
+    db.upsert_file(&existing_record).unwrap();
+
+    // Write the file locally and process the event.
+    let path = write_file(&files_dir, "local_copy.txt", content);
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+    coord.process_event(added_event(&path)).unwrap();
+
+    // The file should not be queued — dedup recognized it as already backed up.
+    let queue_len: usize = coord.queues.values().map(|q| q.len()).sum();
+    assert_eq!(
+        queue_len, 0,
+        "dedup should skip file already backed up (backed_up_at=Some)"
+    );
+}
+
+// ─── Test 14: dedup_does_not_skip_file_not_yet_backed_up ─────────────────────
+
+/// Insert a FileRecord with backed_up_at=None; process an event with the same
+/// content_hash. The file MUST be queued — upload not yet complete.
+#[test]
+fn dedup_does_not_skip_file_not_yet_backed_up() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+
+    let content = b"content queued but not yet uploaded";
+    let content_hash: [u8; 32] = *blake3::hash(content).as_bytes();
+
+    // Pre-insert a FileRecord whose version has backed_up_at=None (still queued).
+    let existing_record = FileRecord {
+        file_id: FileId(1),
+        path: "/other/path/pending.txt".to_string(),
+        importance: 0.5,
+        devices: vec![(DeviceId([9u8; 16]), LocalState::Present)],
+        versions: vec![FileVersion {
+            content_hash,
+            source_block_id: SourceBlockId([0u8; 32]),
+            k: 0,
+            t: 0,
+            created_at: Timestamp(1_000_000),
+            backed_up_at: None, // not yet uploaded
+        }],
+        first_seen: Timestamp(1_000_000),
+    };
+    db.upsert_file(&existing_record).unwrap();
+
+    // Write the file locally and process the event.
+    let path = write_file(&files_dir, "local_pending.txt", content);
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+    coord.process_event(added_event(&path)).unwrap();
+
+    // The file SHOULD be queued — content not yet backed up.
+    let queue_len: usize = coord.queues.values().map(|q| q.len()).sum();
+    assert_eq!(
+        queue_len, 1,
+        "file should be queued when backed_up_at=None (not yet uploaded)"
+    );
+}
+
+// ─── Test 15: dedup_via_cluster_state_skips_already_backed_up ────────────────
+
+/// Same as test 13, but using ClusterState for the dedup check.
+#[test]
+fn dedup_via_cluster_state_skips_already_backed_up() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+
+    let content = b"cluster dedup content already backed up";
+    let content_hash: [u8; 32] = *blake3::hash(content).as_bytes();
+
+    // Pre-insert a FileRecord with backed_up_at=Some.
+    let existing_record = FileRecord {
+        file_id: FileId(1),
+        path: "/cluster/device_a/file.txt".to_string(),
+        importance: 0.5,
+        devices: vec![(DeviceId([9u8; 16]), LocalState::Present)],
+        versions: vec![FileVersion {
+            content_hash,
+            source_block_id: SourceBlockId([2u8; 32]),
+            k: 4,
+            t: 65535,
+            created_at: Timestamp(1_000_000),
+            backed_up_at: Some(Timestamp(3_000_000)),
+        }],
+        first_seen: Timestamp(1_000_000),
+    };
+    db.upsert_file(&existing_record).unwrap();
+
+    let seed = [99u8; 32];
+    let master_key = derive_master_key(&seed).unwrap();
+    let master_pub = master_identity(&master_key);
+    let dev_id = DeviceId([99u8; 16]);
+    let dev_key = syncback_core::cluster::derive_device_key(&seed, &dev_id).unwrap();
+    let dev_pub = dev_key.verifying_key().to_bytes();
+    let cert = issue_device_certificate(&master_key, dev_id, dev_pub, Timestamp(1));
+    let cs = ClusterState::init(db.clone(), master_pub, cert, Timestamp(1), Timestamp(1)).unwrap();
+    let cluster_state = Arc::new(Mutex::new(cs));
+    let config = BackupConfig {
+        source_block_size: SMALL_BLOCK_SIZE,
+        symbols_dir: symbols_dir.path().to_path_buf(),
+        epoch_key: [42u8; 32],
+        device_id: DeviceId([1u8; 16]),
+        mock_holders: test_holders(),
+        cluster_state: Some(cluster_state),
+    };
+    let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
+
+    let path = write_file(&files_dir, "device_b_copy.txt", content);
+    coord.process_event(added_event(&path)).unwrap();
+
+    let queue_len: usize = coord.queues.values().map(|q| q.len()).sum();
+    assert_eq!(
+        queue_len, 0,
+        "ClusterState dedup should skip file already backed up"
     );
 }

@@ -86,6 +86,10 @@ pub struct NetworkConfig {
     pub signing_key: SigningKey,
     /// Peer directory populated by the caller (from DB PeerRecords).
     pub known_peers: HashMap<IdentityPub, EndpointAddr>,
+    /// Optional device certificate for cluster nodes.
+    /// When present, included in the SyncBack handshake so partners can
+    /// identify which cluster master identity this node belongs to.
+    pub device_cert: Option<syncback_core::cluster::DeviceCertificate>,
 }
 
 // ─── Connection pool ──────────────────────────────────────────────────────────
@@ -110,6 +114,8 @@ pub struct NetworkHandle {
     pub node_id: NodeId,
     /// Signing key for building handshake messages.
     signing_key: SigningKey,
+    /// Device certificate for cluster nodes. Passed in handshake if present.
+    device_cert: Option<syncback_core::cluster::DeviceCertificate>,
     /// Known peers directory (for `get_connection` by IdentityPub).
     known_peers: HashMap<IdentityPub, EndpointAddr>,
     /// Live authenticated connections keyed by peer IdentityPub.
@@ -151,11 +157,13 @@ impl NetworkHandle {
         let accept_endpoint = endpoint.clone();
         let signing_key_clone = config.signing_key.clone();
         let identity_pub_clone = identity_pub;
+        let device_cert_clone = config.device_cert.clone();
         tokio::spawn(async move {
             accept_loop(
                 accept_endpoint,
                 signing_key_clone,
                 identity_pub_clone,
+                device_cert_clone,
                 incoming_tx,
             )
             .await;
@@ -166,6 +174,7 @@ impl NetworkHandle {
             identity_pub,
             node_id,
             signing_key: config.signing_key,
+            device_cert: config.device_cert,
             known_peers: config.known_peers,
             connections,
         })
@@ -200,9 +209,14 @@ impl NetworkHandle {
             .await
             .map_err(|e| NetworkError::Iroh(anyhow::anyhow!("{e}")))?;
 
-        let conn =
-            handshake_initiator(iroh_conn, &self.signing_key, self.identity_pub, expected_identity)
-                .await?;
+        let conn = handshake_initiator(
+            iroh_conn,
+            &self.signing_key,
+            self.identity_pub,
+            expected_identity,
+            self.device_cert.clone(),
+        )
+        .await?;
 
         info!(peer = %conn.peer_identity, "connection established");
         Ok(conn)
