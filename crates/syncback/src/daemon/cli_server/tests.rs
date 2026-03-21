@@ -195,14 +195,120 @@ async fn dispatch_device_add_returns_device_added_with_label() {
 }
 
 #[tokio::test]
-async fn dispatch_connect_returns_connected_with_addr() {
+async fn dispatch_connect_invalid_addr_returns_error() {
     let state = make_test_state().await;
-    let addr = "192.168.1.1:12345".to_string();
-    let response = dispatch(CliRequest::Connect { addr: addr.clone() }, &state).await;
-    let CliResponse::Connected { peer_id } = response else {
-        panic!("expected Connected");
+    let response = dispatch(
+        CliRequest::Connect { addr: "192.168.1.1:12345".to_string() },
+        &state,
+    )
+    .await;
+    assert!(
+        matches!(response, CliResponse::Error(_)),
+        "expected Error for invalid addr format, got {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_connect_valid_addr_but_unreachable_returns_error() {
+    let state = make_test_state().await;
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    let node_id_bytes = sk.verifying_key().to_bytes();
+    let node_id_hex: String = node_id_bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+    // Port 1 is almost certainly not listening; this will fail at iroh connect.
+    let addr = format!("{node_id_hex}@127.0.0.1:1");
+
+    let response = dispatch(CliRequest::Connect { addr }, &state).await;
+    assert!(
+        matches!(response, CliResponse::Error(_)),
+        "expected Error for unreachable peer, got {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_connect_two_daemons_registers_peer() {
+    use std::sync::Arc;
+    use syncback_core::db::Db;
+    use syncback_core::types::DeviceId;
+    use crate::daemon::network::{NetworkConfig, NetworkHandle};
+
+    let (sk_a, pk_a) = {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let pk = IdentityPub(sk.verifying_key().to_bytes());
+        (sk, pk)
     };
-    assert_eq!(peer_id, addr);
+    let (sk_b, pk_b) = {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+        let pk = IdentityPub(sk.verifying_key().to_bytes());
+        (sk, pk)
+    };
+
+    let (tx_b, _rx_b) = mpsc::channel::<crate::daemon::network::connection::Connection>(4);
+    let handle_b = Arc::new(
+        NetworkHandle::start(
+            NetworkConfig {
+                signing_key: sk_b,
+                known_peers: Default::default(),
+                device_cert: None,
+                iroh_secret_key: None,
+            },
+            tx_b,
+        )
+        .await
+        .expect("handle_b"),
+    );
+    let addr_b_endpoint = handle_b.local_addr().expect("addr_b");
+    let socket_addr_b = addr_b_endpoint
+        .ip_addrs()
+        .next()
+        .copied()
+        .expect("B must have a local IP addr");
+    let addr_b_str = crate::daemon::network::addr::format_node_addr(&handle_b.node_id, socket_addr_b);
+
+    let db_a = Db::open_in_memory().expect("db_a");
+    let (tx_a, _rx_a) = mpsc::channel::<crate::daemon::network::connection::Connection>(4);
+    let handle_a = Arc::new(
+        NetworkHandle::start(
+            NetworkConfig {
+                signing_key: sk_a,
+                known_peers: Default::default(),
+                device_cert: None,
+                iroh_secret_key: None,
+            },
+            tx_a,
+        )
+        .await
+        .expect("handle_a"),
+    );
+    let (restore_tx, _restore_rx) = mpsc::channel::<(
+        RestoreRequest,
+        tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
+    )>(4);
+    let state_a = Arc::new(DaemonState {
+        db: db_a.clone(),
+        identity_pub: pk_a,
+        device_id: DeviceId([1u8; 16]),
+        network: handle_a.clone(),
+        restore_tx,
+        cluster_state: None,
+    });
+
+    let response = dispatch(CliRequest::Connect { addr: addr_b_str }, &state_a).await;
+
+    let CliResponse::Connected { peer_id } = response else {
+        panic!("expected Connected, got {response:?}");
+    };
+    let expected_hex: String = pk_b.0.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(peer_id, expected_hex, "peer_id should be B's full identity hex");
+
+    let stored = db_a.get_peer(&pk_b).expect("db get_peer").expect("peer in db");
+    assert_eq!(stored.identity, pk_b);
+    assert!(!stored.addrs.is_empty(), "addr should be stored");
+
+    let _ = handle_a.get_connection(pk_b).await.expect("get_connection after connect");
+    // Handles are inside Arc (shared with state_a), so we skip explicit shutdown;
+    // iroh endpoints are closed when the Arc is dropped at end of test.
 }
 
 // ============================================================

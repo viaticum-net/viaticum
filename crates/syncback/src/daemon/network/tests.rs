@@ -438,6 +438,82 @@ async fn handshake_without_cert_peer_master_identity_is_none() {
     handle_b.shutdown().await;
 }
 
+// ─── Test 10a: to_endpoint_addr roundtrip with IPv4 ──────────────────────────
+
+#[test]
+fn to_endpoint_addr_roundtrip_ipv4() {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use crate::daemon::network::addr::to_endpoint_addr;
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let pk_bytes = sk.verifying_key().to_bytes();
+    let node_id = NodeId(pk_bytes);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 12345);
+
+    let endpoint_addr = to_endpoint_addr(&node_id, addr).expect("should succeed");
+    let ip_addrs: Vec<_> = endpoint_addr.ip_addrs().collect();
+    assert_eq!(ip_addrs.len(), 1);
+    assert_eq!(*ip_addrs[0], addr);
+}
+
+// ─── Test 10b: to_endpoint_addr succeeds for arbitrary 32-byte node ids ───────
+//
+// NOTE: iroh 0.96 (ed25519-dalek 3.0.0-pre.1) accepts all 32-byte arrays as
+// valid Ed25519 public keys without strict curve point validation.
+// Therefore ToEndpointAddrError::InvalidNodeId is unreachable in practice with
+// this iroh version. We document this here rather than assert an error.
+
+#[test]
+fn to_endpoint_addr_accepts_arbitrary_bytes_in_iroh_096() {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use crate::daemon::network::addr::to_endpoint_addr;
+
+    // iroh 0.96: all 32-byte arrays are accepted (lenient Ed25519 validation).
+    let node_id = NodeId([0xFFu8; 32]);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9000);
+
+    // This succeeds; ToEndpointAddrError path is a defensive guard for future stricter validation.
+    let result = to_endpoint_addr(&node_id, addr);
+    assert!(result.is_ok(), "iroh 0.96 accepts all 32-byte node ids: {result:?}");
+}
+
+// ─── Test 10c: add_peer makes get_connection find peer ────────────────────────
+
+#[tokio::test]
+async fn add_peer_makes_get_connection_find_peer() {
+    let (sk_a, _) = keygen();
+    let (sk_b, pk_b) = keygen();
+
+    let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
+    let (tx_b, _rx_b) = tokio::sync::mpsc::channel(10);
+
+    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+        .await
+        .expect("handle_a");
+    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+        .await
+        .expect("handle_b");
+
+    let addr_b = handle_b.local_addr().expect("addr_b");
+
+    let conn = handle_a
+        .connect(addr_b.clone(), None)
+        .await
+        .expect("connect");
+    let peer_identity = conn.peer_identity;
+    assert_eq!(peer_identity, pk_b, "peer identity from handshake matches B's key");
+
+    handle_a.add_peer(peer_identity, addr_b).await;
+
+    let _arc = handle_a
+        .get_connection(peer_identity)
+        .await
+        .expect("get_connection should succeed after add_peer");
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+}
+
 // ─── addr format tests ────────────────────────────────────────────────────────
 
 use crate::daemon::network::addr::{format_node_addr, parse_node_addr, AddrParseError};

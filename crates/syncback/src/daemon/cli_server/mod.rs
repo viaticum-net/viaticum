@@ -167,12 +167,7 @@ pub(crate) async fn dispatch(request: CliRequest, state: &DaemonState) -> CliRes
             CliResponse::DeviceRevoked { device_id_hex }
         }
 
-        CliRequest::Connect { addr } => {
-            // Phase 6.6: connection not yet fully wired (Processor 6.3 handles discovery).
-            // Return stub; the address is echoed back as the peer_id.
-            tracing::info!(addr = %addr, "connect request received (stub — Processor not wired yet)");
-            CliResponse::Connected { peer_id: addr }
-        }
+        CliRequest::Connect { addr } => dispatch_connect(state, addr).await,
     }
 }
 
@@ -532,6 +527,79 @@ fn dispatch_device_add(state: &DaemonState, label: String) -> CliResponse {
         added_at,
         revoked: false,
     })
+}
+
+// ── Connect ───────────────────────────────────────────────────────────────────
+
+async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
+    use crate::daemon::network::addr::{parse_node_addr, to_endpoint_addr};
+    use syncback_core::types::{PeerRecord, Timestamp};
+
+    let (node_id, socket_addr) = match parse_node_addr(&addr) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return CliResponse::Error(format!("invalid peer address '{addr}': {e}"));
+        }
+    };
+
+    let endpoint_addr = match to_endpoint_addr(&node_id, socket_addr) {
+        Ok(ea) => ea,
+        Err(e) => {
+            return CliResponse::Error(format!("cannot build endpoint addr: {e}"));
+        }
+    };
+
+    let conn = match state.network.connect(endpoint_addr.clone(), None).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(addr = %addr, error = %e, "connect failed");
+            return CliResponse::Error(format!("connect failed: {e}"));
+        }
+    };
+
+    let peer_identity = conn.peer_identity;
+    let now = Timestamp::now();
+
+    let existing = state.db.get_peer(&peer_identity).unwrap_or(None);
+    let record = if let Some(mut existing) = existing {
+        if !existing.addrs.contains(&addr) {
+            existing.addrs.push(addr.clone());
+        }
+        existing.last_seen = now;
+        existing.node_id = Some(node_id);
+        existing
+    } else {
+        PeerRecord {
+            identity: peer_identity,
+            node_id: Some(node_id),
+            trust_p: 0.0,
+            trust_i: 0.0,
+            trust_s: 1.0,
+            bytes_we_store_for_peer: 0,
+            bytes_peer_stores_for_us: 0,
+            first_seen: now,
+            last_seen: now,
+            device_id: Some(state.device_id),
+            revoked_device_pub_keys: vec![],
+            addrs: vec![addr.clone()],
+        }
+    };
+
+    if let Err(e) = state.db.upsert_peer(&record) {
+        tracing::error!(peer = %peer_identity, error = %e, "failed to upsert peer in db");
+        return CliResponse::Error(format!("connected but db write failed: {e}"));
+    }
+
+    state.network.add_peer(peer_identity, endpoint_addr).await;
+
+    tracing::info!(
+        peer = %peer_identity,
+        addr = %addr,
+        "peer connected and registered"
+    );
+
+    let peer_id_hex = bytes_to_hex_full(&peer_identity.0);
+    CliResponse::Connected { peer_id: peer_id_hex }
 }
 
 // ============================================================

@@ -25,7 +25,7 @@ use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey as IrohSecretKey};
 use syncback_core::constants::ALPN;
 use syncback_core::messages::{Message, SymbolTransferMsg};
 use syncback_core::types::{IdentityPub, NodeId};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info};
 
 pub mod addr;
@@ -121,7 +121,7 @@ pub struct NetworkHandle {
     /// Device certificate for cluster nodes. Passed in handshake if present.
     device_cert: Option<syncback_core::cluster::DeviceCertificate>,
     /// Known peers directory (for `get_connection` by IdentityPub).
-    known_peers: HashMap<IdentityPub, EndpointAddr>,
+    known_peers: Arc<RwLock<HashMap<IdentityPub, EndpointAddr>>>,
     /// Live authenticated connections keyed by peer IdentityPub.
     connections: Arc<Mutex<HashMap<IdentityPub, ConnectionState>>>,
 }
@@ -185,7 +185,7 @@ impl NetworkHandle {
             node_id,
             signing_key: config.signing_key,
             device_cert: config.device_cert,
-            known_peers: config.known_peers,
+            known_peers: Arc::new(RwLock::new(config.known_peers)),
             connections,
         })
     }
@@ -248,12 +248,12 @@ impl NetworkHandle {
             }
         }
 
-        // Resolve address.
-        let peer_addr = self
-            .known_peers
-            .get(&peer_identity)
-            .cloned()
-            .ok_or(NetworkError::PeerNotFound(peer_identity))?;
+        // Resolve address. Drop the guard before the connect await.
+        let peer_addr = {
+            let peers = self.known_peers.read().await;
+            peers.get(&peer_identity).cloned()
+        }
+        .ok_or(NetworkError::PeerNotFound(peer_identity))?;
 
         // Connect and authenticate.
         let conn = self.connect(peer_addr, Some(peer_identity)).await?;
@@ -266,6 +266,15 @@ impl NetworkHandle {
             .insert(peer_identity, ConnectionState::Live(arc.clone()));
 
         Ok(arc)
+    }
+
+    /// Register a peer in the known_peers directory.
+    ///
+    /// After this call, `get_connection(identity)` will find the peer's address.
+    /// If the peer was already present, the address is updated.
+    pub async fn add_peer(&self, identity: IdentityPub, addr: EndpointAddr) {
+        let mut peers = self.known_peers.write().await;
+        peers.insert(identity, addr);
     }
 
     /// Send a [`Message`] on an established connection (static helper).

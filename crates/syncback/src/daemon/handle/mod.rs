@@ -164,6 +164,46 @@ impl DaemonHandle {
         // ── 7. Build erasure encoder ──────────────────────────────────────────
         let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
 
+        // ── 7a. Load known peers from DB → populate known_peers map ──────────
+        // This lets get_connection() find existing peers immediately after restart.
+        let known_peers = {
+            use crate::daemon::network::addr::{parse_node_addr, to_endpoint_addr};
+            let peers = db.list_all_peers().unwrap_or_default();
+            let mut map = HashMap::new();
+            for peer in peers {
+                for addr_str in &peer.addrs {
+                    match parse_node_addr(addr_str) {
+                        Ok((node_id, socket_addr)) => {
+                            match to_endpoint_addr(&node_id, socket_addr) {
+                                Ok(ea) => {
+                                    map.insert(peer.identity, ea);
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        peer = %peer.identity,
+                                        addr = %addr_str,
+                                        error = %e,
+                                        "startup: skipping unparseable peer addr"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                peer = %peer.identity,
+                                addr = %addr_str,
+                                error = %e,
+                                "startup: skipping malformed peer addr"
+                            );
+                        }
+                    }
+                }
+            }
+            tracing::info!(count = map.len(), "loaded peers from db");
+            map
+        };
+
         // ── 8. Start network ──────────────────────────────────────────────────
         let device_cert_for_network = cluster_state.as_ref().and_then(|cs| {
             let state = cs.lock().expect("cluster_state lock poisoned");
@@ -174,7 +214,7 @@ impl DaemonHandle {
 
         let net_config = NetworkConfig {
             signing_key: device_key.clone(),
-            known_peers: HashMap::new(), // Populated by Processor in 6.3
+            known_peers,
             device_cert: device_cert_for_network,
             iroh_secret_key: Some(iroh::SecretKey::from_bytes(&iroh_key_bytes)),
         };

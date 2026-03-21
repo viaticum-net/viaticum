@@ -11,7 +11,27 @@
 
 use std::net::SocketAddr;
 
+use iroh::EndpointAddr;
 use syncback_core::types::NodeId;
+
+/// Error returned by `to_endpoint_addr`.
+#[derive(Debug, thiserror::Error)]
+pub enum ToEndpointAddrError {
+    #[error("invalid node id (not a valid Ed25519 public key): {0}")]
+    InvalidNodeId(String),
+}
+
+/// Convert a (NodeId, SocketAddr) pair to an iroh EndpointAddr for direct connection.
+///
+/// Returns Err if the NodeId bytes do not represent a valid Ed25519 public key.
+pub fn to_endpoint_addr(
+    node_id: &NodeId,
+    addr: SocketAddr,
+) -> Result<EndpointAddr, ToEndpointAddrError> {
+    let pubkey = iroh::PublicKey::from_bytes(&node_id.0)
+        .map_err(|e| ToEndpointAddrError::InvalidNodeId(e.to_string()))?;
+    Ok(EndpointAddr::new(pubkey).with_ip_addr(addr))
+}
 
 /// Error returned by `parse_node_addr`.
 #[derive(Debug, thiserror::Error)]
