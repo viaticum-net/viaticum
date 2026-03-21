@@ -238,17 +238,8 @@ fn format_bytes_gigabytes() {
 }
 
 // ============================================================
-// Output formatting tests (capture via String)
+// render_status tests
 // ============================================================
-
-fn capture_status(data: &StatusData) -> String {
-    // We re-implement a string-returning version for testing.
-    // format_status prints directly; we test key substrings instead.
-    let _ = data; // silence unused warning
-    // Use format_status indirectly: test its structure by calling the
-    // functions and asserting they don't panic, plus check specific fields.
-    "ok".to_string()
-}
 
 fn make_status_zero_peers() -> StatusData {
     StatusData {
@@ -265,157 +256,26 @@ fn make_status_zero_peers() -> StatusData {
     }
 }
 
-// For output formatting we verify the functions don't panic and
-// check output by inspecting format logic inline (format_bytes tested above).
-// Full stdout-capture tests are integration-level; we test via the formatter
-// functions returning Strings (which we expose for testing).
-
-/// A testable variant of format_status that returns a String.
-fn render_status(data: &StatusData) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("syncback status\n"));
-    out.push_str(&format!("  identity:       {}\n", data.node_identity));
-    out.push_str(&format!(
-        "  peers:          {}  (avg trust: {:.2})\n",
-        data.peer_count, data.avg_trust
-    ));
-    out.push_str(&format!(
-        "  holding:        {} for {} peers\n",
-        output::format_bytes(data.holding_bytes),
-        data.peer_count
-    ));
-    out.push_str(&format!(
-        "  backed up:      {} files, {}\n",
-        data.backed_up_files,
-        output::format_bytes(data.backed_up_bytes)
-    ));
-    out.push_str(&format!(
-        "  repair needed:  {} blocks\n",
-        data.blocks_needing_repair
-    ));
-    let quota_str = if data.effective_quota_bytes == 0 {
-        "unlimited".to_string()
-    } else {
-        output::format_bytes(data.effective_quota_bytes)
-    };
-    out.push_str(&format!(
-        "  quota:          {}  (used: {})\n",
-        quota_str,
-        output::format_bytes(data.used_bytes)
-    ));
-    if data.peer_count == 0 {
-        out.push_str("  no peers yet\n");
-    } else {
-        out.push('\n');
-        out.push_str("top peers:\n");
-        for peer in &data.peers {
-            let short_id = if peer.identity_hex.len() >= 8 {
-                &peer.identity_hex[..8]
-            } else {
-                &peer.identity_hex
-            };
-            out.push_str(&format!(
-                "  {}  trust={:.2}  stores={}/{}  last={}\n",
-                short_id,
-                peer.trust,
-                output::format_bytes(peer.bytes_we_store),
-                output::format_bytes(peer.bytes_peer_stores),
-                peer.last_seen
-            ));
-        }
-    }
-    out
-}
-
-fn render_files(files: &[FileEntry]) -> String {
-    let mut out = String::new();
-    if files.is_empty() {
-        out.push_str("no files backed up\n");
-        return out;
-    }
-    out.push_str(&format!("backed-up files ({}):\n", files.len()));
-    for file in files {
-        let version_label = if file.versions == 1 {
-            "1 version".to_string()
-        } else {
-            format!("{} versions", file.versions)
-        };
-        out.push_str(&format!(
-            "  {}   {}   {}   {}   {}\n",
-            file.path,
-            version_label,
-            file.last_backed_up,
-            output::format_bytes(file.size_bytes),
-            file.local_state
-        ));
-    }
-    out
-}
-
-fn render_versions(path: &str, versions: &[VersionEntry]) -> String {
-    let mut out = String::new();
-    if versions.is_empty() {
-        out.push_str(&format!("no versions found for {path}\n"));
-        return out;
-    }
-    out.push_str(&format!(
-        "versions of {} ({}):\n",
-        path,
-        versions.len()
-    ));
-    for entry in versions {
-        let hash_short = if entry.content_hash_hex.len() > 8 {
-            format!("{}...", &entry.content_hash_hex[..8])
-        } else {
-            entry.content_hash_hex.clone()
-        };
-        let block_short = if entry.source_block_id_hex.len() >= 8 {
-            entry.source_block_id_hex[..8].to_string()
-        } else {
-            entry.source_block_id_hex.clone()
-        };
-        out.push_str(&format!(
-            "  v{}  {}  backed {}  {}  {}  [block: {}]\n",
-            entry.version,
-            entry.created_at,
-            entry.backed_up_at,
-            hash_short,
-            output::format_bytes(entry.size_bytes),
-            block_short
-        ));
-    }
-    out
-}
-
-fn render_device_list(devices: &[DeviceEntry]) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("cluster devices ({}):\n", devices.len()));
-    for device in devices {
-        let marker = if device.revoked {
-            "[R]"
-        } else if device.is_current {
-            "[*]"
-        } else {
-            "   "
-        };
-        let short_id = if device.device_id_hex.len() >= 16 {
-            &device.device_id_hex[..16]
-        } else {
-            &device.device_id_hex
-        };
-        out.push_str(&format!(
-            "  {} {}  {}  added {}\n",
-            marker, short_id, device.label, device.added_at
-        ));
-    }
-    out
-}
-
 #[test]
 fn format_status_zero_peers_prints_no_peers_yet() {
     let data = make_status_zero_peers();
-    let rendered = render_status(&data);
+    let rendered = output::render_status(&data);
     assert!(rendered.contains("no peers yet"), "got: {rendered}");
+}
+
+#[test]
+fn format_status_includes_identity_and_header() {
+    let data = make_status_zero_peers();
+    let rendered = output::render_status(&data);
+    assert!(rendered.contains("syncback status"), "got: {rendered}");
+    assert!(rendered.contains("0000000000000000"), "got: {rendered}");
+}
+
+#[test]
+fn format_status_unlimited_quota_when_zero() {
+    let data = make_status_zero_peers();
+    let rendered = output::render_status(&data);
+    assert!(rendered.contains("unlimited"), "got: {rendered}");
 }
 
 #[test]
@@ -447,16 +307,21 @@ fn format_status_top_peers_printed() {
         effective_quota_bytes: 0,
         used_bytes: 0,
     };
-    let rendered = render_status(&data);
+    let rendered = output::render_status(&data);
     assert!(rendered.contains("a1b2c3d4"), "got: {rendered}");
     assert!(rendered.contains("trust=2.31"), "got: {rendered}");
     assert!(rendered.contains("e5f60708"), "got: {rendered}");
     assert!(rendered.contains("trust=1.87"), "got: {rendered}");
+    assert!(rendered.contains("top peers:"), "got: {rendered}");
 }
+
+// ============================================================
+// render_files tests
+// ============================================================
 
 #[test]
 fn format_files_empty_list() {
-    let rendered = render_files(&[]);
+    let rendered = output::render_files(&[]);
     assert!(rendered.contains("no files backed up"), "got: {rendered}");
 }
 
@@ -469,7 +334,7 @@ fn format_files_single_entry_singular_version() {
         size_bytes: 250_000,
         local_state: "present".into(),
     }];
-    let rendered = render_files(&files);
+    let rendered = output::render_files(&files);
     assert!(rendered.contains("1 version"), "got: {rendered}");
     assert!(!rendered.contains("1 versions"), "should be singular: {rendered}");
     // 250000 / 1024 = 244.14... → 244 KB
@@ -477,8 +342,26 @@ fn format_files_single_entry_singular_version() {
 }
 
 #[test]
+fn format_files_multiple_versions_plural() {
+    let files = vec![FileEntry {
+        path: "archive.tar".into(),
+        versions: 5,
+        last_backed_up: "2026-03-21".into(),
+        size_bytes: 1_048_576,
+        local_state: "present".into(),
+    }];
+    let rendered = output::render_files(&files);
+    assert!(rendered.contains("5 versions"), "got: {rendered}");
+    assert!(rendered.contains("backed-up files (1):"), "got: {rendered}");
+}
+
+// ============================================================
+// render_versions tests
+// ============================================================
+
+#[test]
 fn format_versions_empty() {
-    let rendered = render_versions("photos/img.jpg", &[]);
+    let rendered = output::render_versions("photos/img.jpg", &[]);
     assert!(
         rendered.contains("no versions found for photos/img.jpg"),
         "got: {rendered}"
@@ -495,11 +378,30 @@ fn format_versions_pending_backed_up() {
         size_bytes: 1_048_576,
         source_block_id_hex: "cd".repeat(32),
     };
-    let rendered = render_versions("f", &[entry]);
+    let rendered = output::render_versions("f", &[entry]);
     assert!(rendered.contains("pending"), "got: {rendered}");
     assert!(rendered.contains("v1"), "got: {rendered}");
     assert!(rendered.contains("1.0 MB"), "got: {rendered}");
 }
+
+#[test]
+fn format_versions_hash_truncated_to_8_chars() {
+    let entry = VersionEntry {
+        version: 2,
+        created_at: "2026-03-21T09:00:00".into(),
+        backed_up_at: "2026-03-21T09:01:00".into(),
+        content_hash_hex: "aabbccdd11223344".repeat(4),
+        size_bytes: 512,
+        source_block_id_hex: "11223344aabbccdd".repeat(4),
+    };
+    let rendered = output::render_versions("test.txt", &[entry]);
+    assert!(rendered.contains("aabbccdd..."), "got: {rendered}");
+    assert!(rendered.contains("[block: 11223344]"), "got: {rendered}");
+}
+
+// ============================================================
+// render_device_list tests
+// ============================================================
 
 #[test]
 fn format_device_list_marks_current() {
@@ -519,7 +421,7 @@ fn format_device_list_marks_current() {
             revoked: false,
         },
     ];
-    let rendered = render_device_list(&devices);
+    let rendered = output::render_device_list(&devices);
     assert!(rendered.contains("[*]"), "got: {rendered}");
     assert!(rendered.contains("laptop"), "got: {rendered}");
     assert!(rendered.contains("phone"), "got: {rendered}");
@@ -534,8 +436,174 @@ fn format_device_list_marks_revoked() {
         added_at: "2025-06-01".into(),
         revoked: true,
     }];
-    let rendered = render_device_list(&devices);
+    let rendered = output::render_device_list(&devices);
     assert!(rendered.contains("[R]"), "got: {rendered}");
+}
+
+#[test]
+fn format_device_list_includes_count_header() {
+    let devices = vec![DeviceEntry {
+        device_id_hex: "aa".repeat(16),
+        label: "desktop".into(),
+        is_current: false,
+        added_at: "2026-01-01".into(),
+        revoked: false,
+    }];
+    let rendered = output::render_device_list(&devices);
+    assert!(rendered.contains("cluster devices (1):"), "got: {rendered}");
+}
+
+#[test]
+fn format_device_list_device_id_truncated_to_16_chars() {
+    let full_id = "ab".repeat(16); // 32 hex chars
+    let devices = vec![DeviceEntry {
+        device_id_hex: full_id.clone(),
+        label: "server".into(),
+        is_current: false,
+        added_at: "2026-03-01".into(),
+        revoked: false,
+    }];
+    let rendered = output::render_device_list(&devices);
+    let expected_prefix = &full_id[..16];
+    assert!(rendered.contains(expected_prefix), "got: {rendered}");
+    assert!(!rendered.contains(&full_id), "full id should be truncated: {rendered}");
+}
+
+// ============================================================
+// render_restore tests
+// ============================================================
+
+#[test]
+fn format_restore_includes_path_version_status() {
+    let data = RestoreData {
+        path: "/home/user/doc.pdf".into(),
+        version_used: 3,
+        content_hash_hex: "aabbccdd11223344556677889900aabb".into(),
+        status: "started".into(),
+    };
+    let rendered = output::render_restore(&data);
+    assert!(rendered.contains("restore started"), "got: {rendered}");
+    assert!(rendered.contains("/home/user/doc.pdf"), "got: {rendered}");
+    assert!(rendered.contains("version:  3"), "got: {rendered}");
+    assert!(rendered.contains("status:   started"), "got: {rendered}");
+}
+
+#[test]
+fn format_restore_hash_truncated_to_16_chars() {
+    let data = RestoreData {
+        path: "f".into(),
+        version_used: 1,
+        content_hash_hex: "aabbccdd11223344556677889900aabb".into(),
+        status: "queued".into(),
+    };
+    let rendered = output::render_restore(&data);
+    // First 16 chars + "..."
+    assert!(rendered.contains("aabbccdd11223344..."), "got: {rendered}");
+}
+
+#[test]
+fn format_restore_short_hash_not_truncated() {
+    let data = RestoreData {
+        path: "f".into(),
+        version_used: 1,
+        content_hash_hex: "aabb".into(),
+        status: "queued".into(),
+    };
+    let rendered = output::render_restore(&data);
+    assert!(rendered.contains("aabb"), "got: {rendered}");
+    assert!(!rendered.contains("..."), "short hash should not have ellipsis: {rendered}");
+}
+
+// ============================================================
+// render_device_added tests
+// ============================================================
+
+#[test]
+fn format_device_added_shows_label_and_id() {
+    let device = DeviceEntry {
+        device_id_hex: "ff".repeat(16),
+        label: "my-tablet".into(),
+        is_current: false,
+        added_at: "2026-03-15".into(),
+        revoked: false,
+    };
+    let rendered = output::render_device_added(&device);
+    assert!(rendered.contains("device added"), "got: {rendered}");
+    assert!(rendered.contains("my-tablet"), "got: {rendered}");
+    assert!(rendered.contains("ffffffffffffffff..."), "got: {rendered}");
+}
+
+#[test]
+fn format_device_added_short_id_not_truncated() {
+    let device = DeviceEntry {
+        device_id_hex: "abcd".into(),
+        label: "watch".into(),
+        is_current: false,
+        added_at: "2026-03-15".into(),
+        revoked: false,
+    };
+    let rendered = output::render_device_added(&device);
+    assert!(rendered.contains("abcd"), "got: {rendered}");
+    assert!(!rendered.contains("..."), "short id should not have ellipsis: {rendered}");
+}
+
+// ============================================================
+// render_device_revoked tests
+// ============================================================
+
+#[test]
+fn format_device_revoked_truncates_long_id() {
+    let id = "01".repeat(16);
+    let rendered = output::render_device_revoked(&id);
+    assert!(rendered.contains("device revoked:"), "got: {rendered}");
+    assert!(rendered.contains("0101010101010101..."), "got: {rendered}");
+}
+
+#[test]
+fn format_device_revoked_short_id_shown_in_full() {
+    let rendered = output::render_device_revoked("abcdef");
+    assert!(rendered.contains("device revoked: abcdef"), "got: {rendered}");
+}
+
+// ============================================================
+// render_error tests
+// ============================================================
+
+#[test]
+fn format_error_prefixes_with_error() {
+    let rendered = output::render_error("connection refused");
+    assert_eq!(rendered, "error: connection refused\n");
+}
+
+#[test]
+fn format_error_empty_message() {
+    let rendered = output::render_error("");
+    assert_eq!(rendered, "error: \n");
+}
+
+// ============================================================
+// expand_socket_path tests
+// ============================================================
+
+#[test]
+fn expand_socket_path_expands_tilde_with_home_set() {
+    // SAFETY: single-threaded test; no other threads read HOME concurrently.
+    unsafe { std::env::set_var("HOME", "/home/testuser") };
+    let result = super::expand_socket_path("~/.syncback/syncback.sock");
+    assert_eq!(result, "/home/testuser/.syncback/syncback.sock");
+}
+
+#[test]
+fn expand_socket_path_leaves_absolute_path_unchanged() {
+    let result = super::expand_socket_path("/run/syncback.sock");
+    assert_eq!(result, "/run/syncback.sock");
+}
+
+#[test]
+fn expand_socket_path_tilde_only_not_expanded_as_dir() {
+    // "~" alone (no slash) is returned as-is
+    let result = super::expand_socket_path("~");
+    assert_eq!(result, "~");
 }
 
 // ============================================================

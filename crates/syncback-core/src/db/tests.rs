@@ -567,3 +567,53 @@ fn upsert_placement_updates_alive_count_on_status_change() {
     db.upsert_placement(&p3).unwrap();
     assert_eq!(db.hot().blocks.get(&bid).map(|a| a.total_alive_symbols).unwrap_or(0), 0);
 }
+
+// ============================================================
+// Extra: list_placements_for_holder
+// ============================================================
+
+#[test]
+fn list_placements_for_holder_returns_all_blocks_for_holder() {
+    let db = test_db();
+    let holder = IdentityPub([0xAAu8; 32]);
+    let fid = FileId(20);
+
+    // Place holder on 3 different blocks
+    for seed in [10u8, 11, 12] {
+        let p = make_placement(seed, holder, fid, PlacementStatus::Alive, 50);
+        db.upsert_placement(&p).unwrap();
+    }
+
+    let placements = db.list_placements_for_holder(&holder).unwrap();
+    assert_eq!(placements.len(), 3);
+    for p in &placements {
+        assert_eq!(p.holder_id, holder);
+    }
+}
+
+#[test]
+fn list_placements_for_holder_returns_empty_when_no_placements() {
+    let db = test_db();
+    let holder = IdentityPub([0xBBu8; 32]);
+    let placements = db.list_placements_for_holder(&holder).unwrap();
+    assert!(placements.is_empty());
+}
+
+#[test]
+fn list_placements_for_holder_does_not_return_other_holders() {
+    let db = test_db();
+    let holder_a = IdentityPub([0x01u8; 32]);
+    let holder_b = IdentityPub([0x02u8; 32]);
+    let fid = FileId(30);
+
+    db.upsert_placement(&make_placement(20, holder_a, fid, PlacementStatus::Alive, 10)).unwrap();
+    db.upsert_placement(&make_placement(21, holder_b, fid, PlacementStatus::Alive, 10)).unwrap();
+
+    let a_placements = db.list_placements_for_holder(&holder_a).unwrap();
+    assert_eq!(a_placements.len(), 1);
+    assert_eq!(a_placements[0].holder_id, holder_a);
+
+    let b_placements = db.list_placements_for_holder(&holder_b).unwrap();
+    assert_eq!(b_placements.len(), 1);
+    assert_eq!(b_placements[0].holder_id, holder_b);
+}

@@ -1,4 +1,4 @@
-use super::{ErasureEncoder, ErasureError, RaptorQEncoder, Symbol};
+use super::{ErasureEncoder, ErasureError, RaptorQEncoder, Symbol, binding_seed};
 use crate::types::{ErasureParams, IdentityPub, SourceBlockId};
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -280,4 +280,64 @@ fn decode_with_exactly_k_eff_symbols() {
     // With exactly k_eff symbols, RaptorQ should succeed (extremely high probability)
     let decoded = enc.decode(&unbound, &params).unwrap();
     assert_eq!(&decoded[..source.len()], &source[..]);
+}
+
+#[test]
+fn binding_seed_is_deterministic() {
+    let bid = block_id(1);
+    let hid = holder(1);
+    let seed1 = binding_seed(&bid, &hid);
+    let seed2 = binding_seed(&bid, &hid);
+    assert_eq!(seed1, seed2);
+}
+
+#[test]
+fn binding_seed_differs_per_holder() {
+    let bid = block_id(1);
+    let hid_a = holder(1);
+    let hid_b = holder(2);
+    let seed_a = binding_seed(&bid, &hid_a);
+    let seed_b = binding_seed(&bid, &hid_b);
+    assert_ne!(seed_a, seed_b);
+}
+
+#[test]
+fn binding_seed_differs_per_block() {
+    let bid_a = block_id(1);
+    let bid_b = block_id(2);
+    let hid = holder(1);
+    let seed_a = binding_seed(&bid_a, &hid);
+    let seed_b = binding_seed(&bid_b, &hid);
+    assert_ne!(seed_a, seed_b);
+}
+
+#[test]
+fn binding_seed_is_32_bytes() {
+    let seed = binding_seed(&block_id(5), &holder(5));
+    assert_eq!(seed.len(), 32);
+}
+
+#[test]
+fn symbol_size_bytes_returns_data_length() {
+    let sym = Symbol {
+        esi: 0,
+        data: vec![0u8; 65_535],
+    };
+    assert_eq!(sym.size_bytes(), 65_535);
+}
+
+#[test]
+fn symbol_size_bytes_returns_zero_for_empty_data() {
+    let sym = Symbol {
+        esi: 0,
+        data: vec![],
+    };
+    assert_eq!(sym.size_bytes(), 0);
+}
+
+#[test]
+fn symbol_size_bytes_matches_data_len() {
+    let data = vec![0xFFu8; 100];
+    let sym = Symbol { esi: 7, data: data.clone() };
+    assert_eq!(sym.size_bytes(), data.len());
 }

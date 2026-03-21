@@ -190,3 +190,83 @@ fn cbor_roundtrip_source_block_pack() {
         panic!("expected Pack");
     }
 }
+
+#[test]
+fn peer_record_is_device_revoked_returns_false_when_list_empty() {
+    let peer = PeerRecord {
+        identity: IdentityPub([0; 32]),
+        node_id: None,
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        device_id: None,
+        revoked_device_pub_keys: vec![],
+    };
+    assert!(!peer.is_device_revoked(&IdentityPub([1; 32])));
+}
+
+#[test]
+fn peer_record_is_device_revoked_returns_true_when_key_present() {
+    let revoked_key = [0xABu8; 32];
+    let peer = PeerRecord {
+        identity: IdentityPub([0; 32]),
+        node_id: None,
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        device_id: None,
+        revoked_device_pub_keys: vec![revoked_key],
+    };
+    assert!(peer.is_device_revoked(&IdentityPub(revoked_key)));
+}
+
+#[test]
+fn peer_record_is_device_revoked_does_not_match_different_key() {
+    let revoked_key = [0xABu8; 32];
+    let other_key = [0xCDu8; 32];
+    let peer = PeerRecord {
+        identity: IdentityPub([0; 32]),
+        node_id: None,
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        device_id: None,
+        revoked_device_pub_keys: vec![revoked_key],
+    };
+    assert!(!peer.is_device_revoked(&IdentityPub(other_key)));
+}
+
+#[test]
+fn peer_record_is_device_revoked_with_multiple_keys() {
+    let key_a = [0x01u8; 32];
+    let key_b = [0x02u8; 32];
+    let key_c = [0x03u8; 32];
+    let peer = PeerRecord {
+        identity: IdentityPub([0; 32]),
+        node_id: None,
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        device_id: None,
+        revoked_device_pub_keys: vec![key_a, key_b],
+    };
+    assert!(peer.is_device_revoked(&IdentityPub(key_a)));
+    assert!(peer.is_device_revoked(&IdentityPub(key_b)));
+    assert!(!peer.is_device_revoked(&IdentityPub(key_c)));
+}

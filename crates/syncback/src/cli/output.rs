@@ -22,78 +22,93 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Format and print StatusData to stdout.
-pub fn format_status(data: &StatusData) {
-    println!("syncback status");
-    println!("  identity:       {}", data.node_identity);
-    println!(
-        "  peers:          {}  (avg trust: {:.2})",
+/// Render StatusData to a String.
+pub fn render_status(data: &StatusData) -> String {
+    let mut out = String::new();
+    out.push_str("syncback status\n");
+    out.push_str(&format!("  identity:       {}\n", data.node_identity));
+    out.push_str(&format!(
+        "  peers:          {}  (avg trust: {:.2})\n",
         data.peer_count, data.avg_trust
-    );
-    println!(
-        "  holding:        {} for {} peers",
+    ));
+    out.push_str(&format!(
+        "  holding:        {} for {} peers\n",
         format_bytes(data.holding_bytes),
         data.peer_count
-    );
-    println!(
-        "  backed up:      {} files, {}",
+    ));
+    out.push_str(&format!(
+        "  backed up:      {} files, {}\n",
         data.backed_up_files,
         format_bytes(data.backed_up_bytes)
-    );
-    println!("  repair needed:  {} blocks", data.blocks_needing_repair);
-
+    ));
+    out.push_str(&format!(
+        "  repair needed:  {} blocks\n",
+        data.blocks_needing_repair
+    ));
     let quota_str = if data.effective_quota_bytes == 0 {
         "unlimited".to_string()
     } else {
         format_bytes(data.effective_quota_bytes)
     };
-    println!(
-        "  quota:          {}  (used: {})",
+    out.push_str(&format!(
+        "  quota:          {}  (used: {})\n",
         quota_str,
         format_bytes(data.used_bytes)
-    );
-
+    ));
     if data.peer_count == 0 {
-        println!("  no peers yet");
+        out.push_str("  no peers yet\n");
     } else {
-        println!();
-        println!("top peers:");
+        out.push('\n');
+        out.push_str("top peers:\n");
         for peer in &data.peers {
             let short_id = if peer.identity_hex.len() >= 8 {
                 &peer.identity_hex[..8]
             } else {
                 &peer.identity_hex
             };
-            println!(
-                "  {}  trust={:.2}  stores={}/{} last={}",
+            out.push_str(&format!(
+                "  {}  trust={:.2}  stores={}/{} last={}\n",
                 short_id,
                 peer.trust,
                 format_bytes(peer.bytes_we_store),
                 format_bytes(peer.bytes_peer_stores),
                 peer.last_seen
-            );
+            ));
         }
     }
+    out
 }
 
-/// Format and print RestoreData to stdout.
-pub fn format_restore(data: &RestoreData) {
-    println!("restore started");
-    println!("  path:     {}", data.path);
-    println!("  version:  {}", data.version_used);
-    // Show first 16 chars of hash + ellipsis
+/// Format and print StatusData to stdout.
+pub fn format_status(data: &StatusData) {
+    print!("{}", render_status(data));
+}
+
+/// Render RestoreData to a String.
+pub fn render_restore(data: &RestoreData) -> String {
+    let mut out = String::new();
+    out.push_str("restore started\n");
+    out.push_str(&format!("  path:     {}\n", data.path));
+    out.push_str(&format!("  version:  {}\n", data.version_used));
     let hash_display = if data.content_hash_hex.len() > 16 {
         format!("{}...", &data.content_hash_hex[..16])
     } else {
         data.content_hash_hex.clone()
     };
-    println!("  hash:     {}", hash_display);
-    println!("  status:   {}", data.status);
+    out.push_str(&format!("  hash:     {}\n", hash_display));
+    out.push_str(&format!("  status:   {}\n", data.status));
+    out
 }
 
-/// Format and print a list of DeviceEntry to stdout.
-pub fn format_device_list(devices: &[DeviceEntry]) {
-    println!("cluster devices ({}):", devices.len());
+/// Format and print RestoreData to stdout.
+pub fn format_restore(data: &RestoreData) {
+    print!("{}", render_restore(data));
+}
+
+/// Render a list of DeviceEntry to a String.
+pub fn render_device_list(devices: &[DeviceEntry]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("cluster devices ({}):\n", devices.len()));
     for device in devices {
         let marker = if device.revoked {
             "[R]"
@@ -102,100 +117,132 @@ pub fn format_device_list(devices: &[DeviceEntry]) {
         } else {
             "   "
         };
-        // Show first 16 chars of device_id_hex
         let short_id = if device.device_id_hex.len() >= 16 {
             &device.device_id_hex[..16]
         } else {
             &device.device_id_hex
         };
-        println!(
-            "  {} {}  {}  added {}",
+        out.push_str(&format!(
+            "  {} {}  {}  added {}\n",
             marker, short_id, device.label, device.added_at
-        );
+        ));
     }
+    out
 }
 
-/// Format and print a newly-added DeviceEntry to stdout.
-pub fn format_device_added(device: &DeviceEntry) {
-    println!("device added");
-    // Show first 16 chars + ellipsis
+/// Format and print a list of DeviceEntry to stdout.
+pub fn format_device_list(devices: &[DeviceEntry]) {
+    print!("{}", render_device_list(devices));
+}
+
+/// Render a newly-added DeviceEntry to a String.
+pub fn render_device_added(device: &DeviceEntry) -> String {
+    let mut out = String::new();
+    out.push_str("device added\n");
     let id_display = if device.device_id_hex.len() > 16 {
         format!("{}...", &device.device_id_hex[..16])
     } else {
         device.device_id_hex.clone()
     };
-    println!("  id:    {}", id_display);
-    println!("  label: {}", device.label);
+    out.push_str(&format!("  id:    {}\n", id_display));
+    out.push_str(&format!("  label: {}\n", device.label));
+    out
 }
 
-/// Format and print a device revocation confirmation to stdout.
-pub fn format_device_revoked(device_id_hex: &str) {
+/// Format and print a newly-added DeviceEntry to stdout.
+pub fn format_device_added(device: &DeviceEntry) {
+    print!("{}", render_device_added(device));
+}
+
+/// Render a device revocation confirmation to a String.
+pub fn render_device_revoked(device_id_hex: &str) -> String {
     let short = if device_id_hex.len() > 16 {
         format!("{}...", &device_id_hex[..16])
     } else {
         device_id_hex.to_string()
     };
-    println!("device revoked: {short}");
+    format!("device revoked: {short}\n")
 }
 
-/// Format and print a list of FileEntry to stdout.
-pub fn format_files(files: &[FileEntry]) {
+/// Format and print a device revocation confirmation to stdout.
+pub fn format_device_revoked(device_id_hex: &str) {
+    print!("{}", render_device_revoked(device_id_hex));
+}
+
+/// Render a list of FileEntry to a String.
+pub fn render_files(files: &[FileEntry]) -> String {
+    let mut out = String::new();
     if files.is_empty() {
-        println!("no files backed up");
-        return;
+        out.push_str("no files backed up\n");
+        return out;
     }
-    println!("backed-up files ({}):", files.len());
+    out.push_str(&format!("backed-up files ({}):\n", files.len()));
     for file in files {
         let version_label = if file.versions == 1 {
             "1 version".to_string()
         } else {
             format!("{} versions", file.versions)
         };
-        println!(
-            "  {}   {}   {}   {}   {}",
+        out.push_str(&format!(
+            "  {}   {}   {}   {}   {}\n",
             file.path,
             version_label,
             file.last_backed_up,
             format_bytes(file.size_bytes),
             file.local_state
-        );
+        ));
     }
+    out
 }
 
-/// Format and print a list of VersionEntry for one path.
-pub fn format_versions(path: &str, versions: &[VersionEntry]) {
+/// Format and print a list of FileEntry to stdout.
+pub fn format_files(files: &[FileEntry]) {
+    print!("{}", render_files(files));
+}
+
+/// Render a list of VersionEntry for one path to a String.
+pub fn render_versions(path: &str, versions: &[VersionEntry]) -> String {
+    let mut out = String::new();
     if versions.is_empty() {
-        println!("no versions found for {path}");
-        return;
+        out.push_str(&format!("no versions found for {path}\n"));
+        return out;
     }
-    println!("versions of {} ({}):", path, versions.len());
+    out.push_str(&format!("versions of {} ({}):\n", path, versions.len()));
     for entry in versions {
-        // Show first 8 chars of hash + "..."
         let hash_short = if entry.content_hash_hex.len() > 8 {
             format!("{}...", &entry.content_hash_hex[..8])
         } else {
             entry.content_hash_hex.clone()
         };
-        // Show first 8 chars of block id
         let block_short = if entry.source_block_id_hex.len() >= 8 {
             entry.source_block_id_hex[..8].to_string()
         } else {
             entry.source_block_id_hex.clone()
         };
-        let backed_str = &entry.backed_up_at;
-        println!(
-            "  v{}  {}  backed {}  {}  {}  [block: {}]",
+        out.push_str(&format!(
+            "  v{}  {}  backed {}  {}  {}  [block: {}]\n",
             entry.version,
             entry.created_at,
-            backed_str,
+            entry.backed_up_at,
             hash_short,
             format_bytes(entry.size_bytes),
             block_short
-        );
+        ));
     }
+    out
+}
+
+/// Format and print a list of VersionEntry for one path to stdout.
+pub fn format_versions(path: &str, versions: &[VersionEntry]) {
+    print!("{}", render_versions(path, versions));
+}
+
+/// Render a daemon error message to a String.
+pub fn render_error(msg: &str) -> String {
+    format!("error: {msg}\n")
 }
 
 /// Format and print a daemon error message to stderr.
 pub fn format_error(msg: &str) {
-    eprintln!("error: {msg}");
+    eprint!("{}", render_error(msg));
 }

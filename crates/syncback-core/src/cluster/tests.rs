@@ -348,6 +348,139 @@ mod cluster_state_tests {
         state.apply_events(&older_events).unwrap();
         assert_eq!(state.current_epoch(), EpochCounter(3));
     }
+
+    // 20. sync_cursor returns 0 when no cursor set
+    #[test]
+    fn sync_cursor_returns_zero_when_not_set() {
+        let state = make_cluster_state();
+        let peer = IdentityPub([0x42u8; 32]);
+        assert_eq!(state.sync_cursor(&peer), 0);
+    }
+
+    // 21. update_sync_cursor persists and is readable
+    #[test]
+    fn update_sync_cursor_persists_value() {
+        let mut state = make_cluster_state();
+        let peer = IdentityPub([0x55u8; 32]);
+        state.update_sync_cursor(peer, 42).unwrap();
+        assert_eq!(state.sync_cursor(&peer), 42);
+    }
+
+    // 22. update_sync_cursor survives reload
+    #[test]
+    fn update_sync_cursor_survives_reload() {
+        let db = Db::open_in_memory().unwrap();
+        let (master_key, master_pub, device_id, device_pub) = make_master_and_cert();
+        let cert = issue_device_certificate(&master_key, device_id, device_pub, NOW);
+        let mut state = ClusterState::init(db.clone(), master_pub, cert, NOW, NOW).unwrap();
+
+        let peer = IdentityPub([0xAAu8; 32]);
+        state.update_sync_cursor(peer, 99).unwrap();
+        drop(state);
+
+        let loaded = ClusterState::load(db).unwrap();
+        assert_eq!(loaded.sync_cursor(&peer), 99);
+    }
+
+    // 23. update_sync_cursor overwrites previous value
+    #[test]
+    fn update_sync_cursor_overwrites_previous_value() {
+        let mut state = make_cluster_state();
+        let peer = IdentityPub([0x77u8; 32]);
+        state.update_sync_cursor(peer, 10).unwrap();
+        state.update_sync_cursor(peer, 50).unwrap();
+        assert_eq!(state.sync_cursor(&peer), 50);
+    }
+
+    // 24. sync_cursor independent per peer
+    #[test]
+    fn sync_cursor_independent_per_peer() {
+        let mut state = make_cluster_state();
+        let peer_a = IdentityPub([0x11u8; 32]);
+        let peer_b = IdentityPub([0x22u8; 32]);
+        state.update_sync_cursor(peer_a, 100).unwrap();
+        state.update_sync_cursor(peer_b, 200).unwrap();
+        assert_eq!(state.sync_cursor(&peer_a), 100);
+        assert_eq!(state.sync_cursor(&peer_b), 200);
+    }
+
+    // 25. find_source_block_for_content returns Some when backed up
+    #[test]
+    fn find_source_block_for_content_returns_some_when_backed_up() {
+        let state = make_cluster_state();
+        let hash = [0xDDu8; 32];
+        let expected_block = SourceBlockId([0xABu8; 32]);
+        let record = FileRecord {
+            file_id: FileId(5),
+            path: "/some/file".to_string(),
+            importance: 0.5,
+            devices: vec![(DeviceId(DEVICE_ID_BYTES), LocalState::Present)],
+            versions: vec![FileVersion {
+                content_hash: hash,
+                source_block_id: expected_block,
+                k: 2,
+                t: 65535,
+                created_at: NOW,
+                backed_up_at: Some(NOW),
+            }],
+            first_seen: NOW,
+        };
+        state.db.upsert_file(&record).unwrap();
+        let result = state.find_source_block_for_content(&hash).unwrap();
+        assert_eq!(result, Some(expected_block));
+    }
+
+    // 26. find_source_block_for_content returns None when not backed up
+    #[test]
+    fn find_source_block_for_content_returns_none_when_not_backed_up() {
+        let state = make_cluster_state();
+        let hash = [0xEEu8; 32];
+        let record = make_file_record_with_version(hash, None);
+        state.db.upsert_file(&record).unwrap();
+        let result = state.find_source_block_for_content(&hash).unwrap();
+        assert_eq!(result, None);
+    }
+
+    // 27. find_source_block_for_content returns None when no files
+    #[test]
+    fn find_source_block_for_content_returns_none_when_no_files() {
+        let state = make_cluster_state();
+        let result = state.find_source_block_for_content(&[0u8; 32]).unwrap();
+        assert_eq!(result, None);
+    }
+
+    // 28. local_last_seq returns 0 when no events appended
+    #[test]
+    fn local_last_seq_returns_one_after_init() {
+        let state = make_cluster_state();
+        // init() appends one DeviceAdded event, so last_seq = 1
+        let seq = state.local_last_seq().unwrap();
+        assert_eq!(seq, 1);
+    }
+
+    // 29. local_last_seq increments with appended events
+    #[test]
+    fn local_last_seq_increments_with_appended_events() {
+        let db = Db::open_in_memory().unwrap();
+        let (master_key, master_pub, device_id, device_pub) = make_master_and_cert();
+        let cert = issue_device_certificate(&master_key, device_id, device_pub, NOW);
+        let state = ClusterState::init(db.clone(), master_pub, cert, NOW, NOW).unwrap();
+
+        // init appended 1 event; append 2 more manually
+        db.append_event(&EventEntry {
+            timestamp: NOW,
+            device_id,
+            event: Event::EpochRotated { epoch: 1 },
+        }).unwrap();
+        db.append_event(&EventEntry {
+            timestamp: NOW,
+            device_id,
+            event: Event::EpochRotated { epoch: 2 },
+        }).unwrap();
+
+        let seq = state.local_last_seq().unwrap();
+        assert_eq!(seq, 3);
+    }
 }
 
 #[cfg(test)]

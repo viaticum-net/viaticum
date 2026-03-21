@@ -4,7 +4,7 @@ use std::io::Write;
 #[cfg(test)]
 use crate::config::{
     AppConfig, BackupCfg, ClusterCfg, ConfigError, EscrowCfg, NetworkCfg, StorageCfg,
-    disk_reserve_bytes, expand_data_dir, soft_quota_bytes, source_block_size_bytes,
+    disk_reserve_bytes, expand_data_dir, hard_quota_bytes, soft_quota_bytes, source_block_size_bytes,
 };
 #[cfg(test)]
 use crate::constants::{
@@ -292,4 +292,25 @@ fn config_defaults_match_constants() {
     assert_eq!(cfg.escrow.trust_factor, DEFAULT_ESCROW_TRUST_FACTOR);
     assert_eq!(cfg.network.relay_max_entries, MAX_BOARD_ENTRIES);
     assert_eq!(cfg.network.relay_max_size_mb, MAX_BOARD_SIZE_BYTES / 1_048_576);
+}
+
+#[test]
+fn hard_quota_bytes_returns_zero_for_no_floor() {
+    let mut cfg = AppConfig::default();
+    cfg.storage.hard_quota_gb = 0.0;
+    assert_eq!(hard_quota_bytes(&cfg), 0);
+}
+
+#[test]
+fn hard_quota_bytes_converts_nonzero_gb() {
+    let mut cfg = AppConfig::default();
+    cfg.storage.hard_quota_gb = 1.0;
+    assert_eq!(hard_quota_bytes(&cfg), 1_073_741_824);
+}
+
+#[test]
+fn hard_quota_bytes_converts_fractional_gb() {
+    let mut cfg = AppConfig::default();
+    cfg.storage.hard_quota_gb = 0.5;
+    assert_eq!(hard_quota_bytes(&cfg), 536_870_912);
 }

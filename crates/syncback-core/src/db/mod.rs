@@ -395,6 +395,19 @@ impl Db {
         Ok(())
     }
 
+    /// List all source blocks (any status).
+    pub fn list_all_source_blocks(&self) -> Result<Vec<SourceBlockRecord>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(SOURCE_BLOCKS)?;
+        let mut records = Vec::new();
+        for item in table.iter()? {
+            let (_, v) = item?;
+            let record: SourceBlockRecord = from_cbor_bytes(v.value())?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
     /// List all source blocks with given status.
     pub fn list_source_blocks_by_status(
         &self,
