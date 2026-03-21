@@ -29,6 +29,11 @@ pub enum CliRequest {
     Versions {
         path: String,
     },
+    /// Connect to a peer by iroh address string.
+    Connect {
+        /// Iroh node address of the peer.
+        addr: String,
+    },
 }
 
 /// Response from daemon to CLI process.
@@ -41,6 +46,11 @@ pub enum CliResponse {
     DeviceRevoked { device_id_hex: String },
     Files(Vec<FileEntry>),
     Versions(Vec<VersionEntry>),
+    /// Response to Connect: contains the peer's identity pubkey as hex.
+    Connected {
+        /// Hex-encoded IdentityPub of the connected peer.
+        peer_id: String,
+    },
     Error(String),
 }
 

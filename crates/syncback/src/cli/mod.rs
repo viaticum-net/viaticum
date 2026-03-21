@@ -16,6 +16,17 @@ pub const DEFAULT_SOCKET_PATH: &str = "~/.syncback/syncback.sock";
 /// Expand `~` in socket path to the home directory.
 /// Returns the raw path unchanged if `HOME` is not set.
 pub fn expand_socket_path(path: &str) -> String {
+    expand_tilde(path)
+}
+
+/// Expand `~` in a data directory path to the home directory.
+/// Returns a `PathBuf` — caller decides whether to resolve symlinks.
+pub fn expand_data_dir(path: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(expand_tilde(path))
+}
+
+/// Expand a leading `~/` to `$HOME/`. Returns `path` unchanged if HOME is unset.
+fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return format!("{home}/{rest}");
@@ -43,7 +54,27 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Start the syncback daemon
-    Daemon,
+    Daemon {
+        /// Time scale factor (1 = real time, 604800 = 1 sec equals 1 week).
+        #[arg(long, default_value = "1")]
+        time_scale: u64,
+        /// Data directory.
+        #[arg(long, default_value = "~/.syncback")]
+        data_dir: String,
+        /// Directories to watch for backup (may be specified multiple times).
+        #[arg(long)]
+        watch_dir: Vec<std::path::PathBuf>,
+    },
+
+    /// Initialize a new SyncBack identity
+    Init {
+        /// BIP39 mnemonic phrase (24 words). If omitted, generates a new one.
+        #[arg(long)]
+        mnemonic: Option<String>,
+        /// Data directory (default: ~/.syncback)
+        #[arg(long, default_value = "~/.syncback")]
+        data_dir: String,
+    },
 
     /// Show overall system status
     Status,
@@ -83,6 +114,13 @@ pub enum Command {
         /// Path as stored in the backup catalog
         path: String,
     },
+
+    /// Connect to a peer by iroh node address
+    Connect {
+        /// Iroh node address (from `syncback status` on the remote node)
+        #[arg()]
+        addr: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -121,7 +159,8 @@ pub fn run_command(cmd: &Command, socket_path: &str) -> Result<(), CliError> {
 /// Build a `CliRequest` from parsed CLI command, applying validation.
 fn build_request(cmd: &Command) -> Result<CliRequest, CliError> {
     match cmd {
-        Command::Daemon => unreachable!("Daemon command handled before run_command"),
+        Command::Daemon { .. } => unreachable!("Daemon command handled before run_command"),
+        Command::Init { .. } => unreachable!("Init command handled before run_command"),
         Command::Status => Ok(CliRequest::Status),
         Command::Restore {
             path,
@@ -164,6 +203,7 @@ fn build_request(cmd: &Command) -> Result<CliRequest, CliError> {
             path_prefix: path_prefix.clone(),
         }),
         Command::Versions { path } => Ok(CliRequest::Versions { path: path.clone() }),
+        Command::Connect { addr } => Ok(CliRequest::Connect { addr: addr.clone() }),
     }
 }
 
@@ -193,6 +233,7 @@ fn handle_response(response: CliResponse) {
             // In practice, the caller knows the path from the command args.
             output::format_versions("", &versions)
         }
+        CliResponse::Connected { peer_id } => output::format_connected(&peer_id),
         CliResponse::Error(msg) => output::format_error(&msg),
     }
 }

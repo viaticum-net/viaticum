@@ -632,6 +632,20 @@ impl Db {
         Ok(result)
     }
 
+    /// Return all placements in the DB (any status).
+    /// Used by Scheduler to enumerate candidates for PoS challenges.
+    pub fn list_all_placements(&self) -> Result<Vec<SymbolPlacement>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(SYMBOL_PLACEMENTS)?;
+        let mut records = Vec::new();
+        for item in table.iter()? {
+            let (_, v) = item?;
+            let record: SymbolPlacement = from_cbor_bytes(v.value())?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
     /// Return all placements with status Lost or PresumedLost.
     /// Used by RepairAgent to find work.
     pub fn list_placements_needing_repair(&self) -> Result<Vec<SymbolPlacement>, DbError> {

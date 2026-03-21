@@ -29,6 +29,7 @@ pub struct Connection {
     /// None if peer has no device_cert (single-device node).
     pub peer_master_identity: Option<IdentityPub>,
     /// iroh connection handle (kept alive so the connection does not close).
+    #[allow(dead_code)]
     pub(crate) inner: iroh::endpoint::Connection,
     /// Write half of the bidirectional stream.
     pub(crate) send: SendStream,

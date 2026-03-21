@@ -1,7 +1,12 @@
 pub mod backup;
 pub mod cli_server;
 pub mod cluster_sync;
+pub mod handle;
+pub mod identity;
 pub mod network;
+pub mod processor;
 pub mod relay;
 pub mod repair;
 pub mod restore;
+pub mod scheduler;
+pub mod watcher;

@@ -237,6 +237,21 @@ pub fn format_versions(path: &str, versions: &[VersionEntry]) {
     print!("{}", render_versions(path, versions));
 }
 
+/// Render a Connect success response to a String.
+pub fn render_connected(peer_id: &str) -> String {
+    let short = if peer_id.len() > 16 {
+        format!("{}...", &peer_id[..16])
+    } else {
+        peer_id.to_string()
+    };
+    format!("connected to peer: {short}\n")
+}
+
+/// Format and print a Connect success response to stdout.
+pub fn format_connected(peer_id: &str) {
+    print!("{}", render_connected(peer_id));
+}
+
 /// Render a daemon error message to a String.
 pub fn render_error(msg: &str) -> String {
     format!("error: {msg}\n")
