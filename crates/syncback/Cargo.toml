@@ -20,6 +20,9 @@ zstd = { workspace = true }
 ciborium = { workspace = true }
 serde = { workspace = true }
 rand = { workspace = true }
+iroh = { workspace = true }
+ed25519-dalek = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
