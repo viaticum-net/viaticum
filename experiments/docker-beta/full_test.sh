@@ -1,5 +1,5 @@
 #!/bin/bash
-# SyncBack β Full E2E Test
+# SyncBack β Full E2E Test — Phase 7 (P2P wired)
 # Run from project root: bash experiments/docker-beta/full_test.sh
 COMPOSE="docker compose -f experiments/docker-beta/compose.yml"
 PREFIX="syncback-beta"
@@ -15,13 +15,14 @@ exec_node() { docker exec "$PREFIX-$1" "${@:2}"; }
 exec_node_q() { docker exec "$PREFIX-$1" "${@:2}" 2>/dev/null; }
 
 echo "============================================================"
-echo "  SyncBack β Full E2E Test"
+echo "  SyncBack β Full E2E Test (Phase 7: P2P wired)"
 echo "============================================================"
 
 # ── SETUP ──────────────────────────────────────────────────────
 echo ""
 echo "=== Setup ==="
 $COMPOSE down -v 2>&1 | tail -1 || true
+$COMPOSE build 2>&1 | tail -3
 $COMPOSE up -d 2>&1 | tail -1
 sleep 2
 
@@ -31,8 +32,7 @@ exec_node node-a syncback init --mnemonic "$MNEMONIC_A" > /dev/null
 exec_node node-b syncback init --mnemonic "creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke knock" > /dev/null
 exec_node node-c syncback init --mnemonic "crouch payment artist half drive borrow speak make crouch payment artist half drive borrow speak make crouch payment artist half drive borrow speak off" > /dev/null
 exec_node node-d syncback init --mnemonic "cry predict essence heavy fashion once state pluck cry predict essence heavy fashion once state pluck cry predict essence heavy fashion once state rent" > /dev/null
-exec_node node-e syncback init --mnemonic "curtain random mirror hockey gloom brand sugar short curtain random mirror hockey gloom brand sugar short curtain random mirror hockey gloom brand sugar session" > /dev/null
-echo "  5 nodes initialized"
+echo "  4 nodes initialized"
 
 # ── TEST 1: Identity ──────────────────────────────────────────
 echo ""
@@ -48,11 +48,13 @@ fi
 echo ""
 echo "=== Test 2: Deterministic identity (DR restore) ==="
 
-PUBKEY_A=$(exec_node_q node-a syncback init --mnemonic "$MNEMONIC_A" 2>&1 | grep "already" > /dev/null && echo "")
-# Can't re-init — read from status after daemon starts. Do init check on node-e.
-# Wipe node-e, re-init with A's mnemonic
-# Volume names use compose project name (directory-based: docker-beta)
+# Wipe node-e (not initialized above), init with A's mnemonic
 VPREFIX="docker-beta"
+exec_node node-d syncback init --mnemonic "$MNEMONIC_A" 2>&1 | grep -q "already" && {
+    # node-d already initialized with different mnemonic — use node-e instead
+    true
+}
+# Use a fresh container: wipe node-e volume, re-create
 $COMPOSE rm -fsv node-e > /dev/null 2>&1 || true
 docker volume rm "${VPREFIX}_node-e-data" "${VPREFIX}_node-e-files" > /dev/null 2>&1 || true
 $COMPOSE up -d node-e > /dev/null 2>&1
@@ -82,6 +84,14 @@ if echo "$STATUS" | grep -q "identity:"; then
     pass "daemon responds to CLI"
     IDENTITY=$(echo "$STATUS" | grep "identity:" | awk '{print $2}')
     echo "  identity: ${IDENTITY:0:16}..."
+    # Check stable NodeId (addr should be hex@ip:port format)
+    ADDR=$(echo "$STATUS" | grep "addr:" | awk '{print $2}')
+    if echo "$ADDR" | grep -q "@"; then
+        pass "node_addr has stable NodeId format (hex@ip:port)"
+        echo "  addr: ${ADDR:0:24}..."
+    else
+        skip "node_addr format not yet hex@ip:port"
+    fi
 else
     fail "daemon not responding"
     echo "  --- Daemon log ---"
@@ -98,9 +108,13 @@ done
 sleep 3
 
 UP_COUNT=0
+declare -A NODE_ADDRS
 for node in node-a node-b node-c node-d; do
-    if exec_node_q $node syncback status 2>/dev/null | grep -q "identity:"; then
+    STATUS=$(exec_node_q $node syncback status 2>/dev/null || true)
+    if echo "$STATUS" | grep -q "identity:"; then
         ((UP_COUNT++)) || true
+        # Capture addr for connect tests (strip leading whitespace)
+        NODE_ADDRS[$node]=$(echo "$STATUS" | grep "addr:" | sed 's/.*addr:[[:space:]]*//')
     fi
 done
 
@@ -111,30 +125,73 @@ else
     fail "only $UP_COUNT/4 daemons responding"
 fi
 
-# ── TEST 5: File watcher ─────────────────────────────────────
+# ── TEST 5: Peer connect ──────────────────────────────────────
 echo ""
-echo "=== Test 5: File watcher ==="
+echo "=== Test 5: Peer connect ==="
 
-exec_node node-a sh -c 'echo "hello beta" > /data/files/test.txt'
-sleep 5
-
-# Check if file was detected (check daemon log for watcher activity)
-WATCHER_LOG=$(exec_node_q node-a cat /tmp/daemon.log | grep -ci "dirty\|DirtyEvent\|file.*event\|backup" || echo "0")
-echo "  Watcher/backup log entries: $WATCHER_LOG"
-
-if [ "$WATCHER_LOG" -gt 0 ] 2>/dev/null; then
-    pass "file watcher detected activity"
+ADDR_B="${NODE_ADDRS[node-b]}"
+if [ -n "$ADDR_B" ]; then
+    CONNECT_RESULT=$(exec_node_q node-a syncback connect "$ADDR_B" 2>&1 || true)
+    echo "  connect result: $(echo "$CONNECT_RESULT" | head -1)"
+    if echo "$CONNECT_RESULT" | grep -qi "connected\|peer"; then
+        pass "node-a connected to node-b"
+    else
+        fail "connect to node-b failed: $CONNECT_RESULT"
+    fi
 else
-    skip "watcher activity not confirmed in logs (may need tracing enabled)"
+    fail "node-b addr not available for connect"
 fi
 
-# ── SKIPPED: P2P features ────────────────────────────────────
+# Connect A→C and A→D too
+ADDR_C="${NODE_ADDRS[node-c]}"
+ADDR_D="${NODE_ADDRS[node-d]}"
+if [ -n "$ADDR_C" ]; then
+    exec_node_q node-a syncback connect "$ADDR_C" > /dev/null 2>&1 || true
+fi
+if [ -n "$ADDR_D" ]; then
+    exec_node_q node-a syncback connect "$ADDR_D" > /dev/null 2>&1 || true
+fi
+
+# Verify peers show up in status
+sleep 2
+PEER_STATUS=$(exec_node_q node-a syncback status || true)
+PEER_COUNT=$(echo "$PEER_STATUS" | grep "peers:" | head -1 | sed 's/.*peers:[[:space:]]*//' | awk '{print $1}')
+echo "  peers after connect: $PEER_COUNT"
+if [ "${PEER_COUNT:-0}" -ge 1 ] 2>/dev/null; then
+    pass "peers registered after connect"
+else
+    fail "no peers registered (count=$PEER_COUNT)"
+fi
+
+# ── TEST 6: File watcher + backup ─────────────────────────────
 echo ""
-echo "=== Skipped: P2P features (need connect wiring) ==="
-skip "peer connection — Connect is stub"
-skip "symbol distribution — needs network delivery"
-skip "restore from peers — needs connected peers"
-skip "PoS challenges — needs placed symbols"
+echo "=== Test 6: File watcher + backup ==="
+
+exec_node node-a sh -c 'echo "hello beta phase 7" > /data/files/test.txt'
+sleep 5
+
+# Check files command
+FILES_OUTPUT=$(exec_node_q node-a syncback files || true)
+echo "  files output: $(echo "$FILES_OUTPUT" | head -2)"
+if echo "$FILES_OUTPUT" | grep -q "test.txt"; then
+    pass "file detected and tracked"
+else
+    skip "file not yet in syncback files (watcher timing)"
+fi
+
+# ── TEST 7: Status shows backed-up info ───────────────────────
+echo ""
+echo "=== Test 7: Status shows backup info ==="
+
+STATUS_FINAL=$(exec_node_q node-a syncback status || true)
+echo "$STATUS_FINAL" | head -8
+
+BACKED_UP=$(echo "$STATUS_FINAL" | grep "backed up:" | head -1)
+if [ -n "$BACKED_UP" ]; then
+    pass "status shows backed-up info"
+else
+    skip "backed-up info not in status"
+fi
 
 # ── RESULTS ──────────────────────────────────────────────────
 echo ""
@@ -145,7 +202,7 @@ echo "============================================================"
 if [ "$FAIL" -gt 0 ]; then
     echo ""
     echo "=== Node A daemon log ==="
-    exec_node_q node-a cat /tmp/daemon.log | grep -vE 'TRACE' | tail -20
+    exec_node_q node-a cat /tmp/daemon.log | grep -vE 'TRACE' | tail -30
 fi
 
 echo ""
