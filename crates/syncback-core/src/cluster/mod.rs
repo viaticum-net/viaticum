@@ -663,4 +663,25 @@ impl ClusterState {
             esi_namespace_end(entry.device_index),
         ))
     }
+
+    /// Get the sync cursor (last received seq) for a peer device.
+    /// Returns 0 if no cursor exists (meaning "start from beginning").
+    pub fn sync_cursor(&self, peer_identity: &IdentityPub) -> u64 {
+        self.state
+            .sync_cursors
+            .get(peer_identity)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Update the sync cursor for a peer device and persist to DB.
+    pub fn update_sync_cursor(
+        &mut self,
+        peer_identity: IdentityPub,
+        seq: u64,
+    ) -> Result<(), ClusterStateError> {
+        self.state.sync_cursors.insert(peer_identity, seq);
+        self.db.set_cluster_state(&self.state)?;
+        Ok(())
+    }
 }
