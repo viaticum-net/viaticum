@@ -137,6 +137,41 @@ pub struct NetworkCfg {
     /// port-forwarded setups).
     /// Default: true.
     pub enable_relay: bool,
+
+    /// Bootstrap peer addresses to connect on startup.
+    /// Format: "NodeId_hex@ip:port" or "NodeId_hex@relay_url,ip:port".
+    /// Default: [] (empty — no bootstrap peers).
+    #[serde(default)]
+    pub bootstrap_peers: Vec<String>,
+}
+
+// ============================================================
+// Watch config
+// ============================================================
+
+/// Default importance value used when no watch config matches a path.
+pub const DEFAULT_IMPORTANCE: f64 = 0.5;
+
+fn default_importance() -> f64 {
+    DEFAULT_IMPORTANCE
+}
+
+/// Per-directory watch configuration with importance override.
+///
+/// Listed under [[watch]] in config.toml. The daemon watches each configured
+/// path (and its subdirectories) for file changes. The importance value controls
+/// how many erasure symbols are allocated for files under this directory —
+/// higher importance means more redundancy.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct WatchConfig {
+    /// Absolute or tilde-prefixed path to watch recursively.
+    pub path: String,
+
+    /// Importance override for files under this directory. Range: [0.0, 1.0].
+    /// 0.0 = minimum redundancy, 1.0 = maximum redundancy.
+    /// Default: 0.5.
+    #[serde(default = "default_importance")]
+    pub importance: f64,
 }
 
 impl Default for NetworkCfg {
@@ -146,6 +181,7 @@ impl Default for NetworkCfg {
             relay_max_size_mb: MAX_BOARD_SIZE_BYTES / 1_048_576,
             relay_ttl_days: RELAY_TTL_SECS / 86400,
             enable_relay: true,
+            bootstrap_peers: vec![],
         }
     }
 }
@@ -181,6 +217,10 @@ pub struct AppConfig {
     pub escrow: EscrowCfg,
     pub network: NetworkCfg,
     pub cluster: ClusterCfg,
+    /// Per-directory watch configuration.
+    /// Listed as [[watch]] array in config.toml.
+    /// When empty, watch_dirs from CLI are used with DEFAULT_IMPORTANCE.
+    pub watch: Vec<WatchConfig>,
 }
 
 impl AppConfig {
@@ -357,6 +397,31 @@ pub fn expand_data_dir(cfg: &AppConfig) -> PathBuf {
     } else {
         PathBuf::from(s)
     }
+}
+
+/// Look up the importance for a file path by matching against watch configs.
+///
+/// Iterates `watch_cfgs` in order. Returns the importance of the first entry
+/// whose `path` is a prefix of `file_path`. If no entry matches, returns
+/// `DEFAULT_IMPORTANCE` (0.5).
+///
+/// Matching is prefix-based on the string representation of the path.
+/// A trailing separator is added to the watch path before comparison so that
+/// `/home/user/docs` does not accidentally match `/home/user/documents/file.txt`.
+pub fn lookup_importance(file_path: &str, watch_cfgs: &[WatchConfig]) -> f64 {
+    for wc in watch_cfgs {
+        // Normalise: the watch path might or might not end with '/'.
+        // We compare against "watch_path/" so `/docs` doesn't match `/documents`.
+        let prefix = if wc.path.ends_with('/') {
+            wc.path.clone()
+        } else {
+            format!("{}/", wc.path)
+        };
+        if file_path.starts_with(prefix.as_str()) || file_path == wc.path.as_str() {
+            return wc.importance;
+        }
+    }
+    DEFAULT_IMPORTANCE
 }
 
 // ============================================================

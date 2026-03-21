@@ -54,6 +54,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         mock_holders: test_holders(),
         cluster_state: None,
         network: None,
+        watch_configs: vec![],
     }
 }
 
@@ -315,6 +316,7 @@ async fn full_lifecycle_e2e() {
             mock_holders: test_holders(),
             cluster_state: Some(Arc::clone(&cluster_state)),
             network: None,
+            watch_configs: vec![],
         },
         Arc::new(RaptorQEncoder::new()),
     );

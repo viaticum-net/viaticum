@@ -159,8 +159,8 @@ impl DaemonHandle {
             mpsc::channel::<crate::daemon::relay::SyncTrigger>(64);
         let (incoming_tx, incoming_rx) =
             mpsc::channel::<crate::daemon::network::connection::Connection>(64);
-        // relay inbound messages — drained by a background task until Phase 7.6
-        let (inbound_tx, mut inbound_rx) =
+        // relay inbound messages — wired to Processor in Phase 7.6
+        let (inbound_tx, inbound_rx) =
             mpsc::channel::<crate::daemon::relay::InboundMessage>(128);
 
         // ── 7. Build erasure encoder ──────────────────────────────────────────
@@ -203,6 +203,48 @@ impl DaemonHandle {
                 }
             }
             tracing::info!(count = map.len(), "loaded peers from db");
+
+            // ── 7b. Inject bootstrap peers from config ────────────────────────
+            // Bootstrap peers are added to known_peers so get_connection() can
+            // reach them on first contact without a prior peer exchange.
+            // Errors are logged and skipped — a bad bootstrap address should not
+            // prevent the daemon from starting.
+            {
+                use crate::daemon::network::addr::{parse_node_addr, to_endpoint_addr};
+                let mut bootstrap_added = 0usize;
+                for addr_str in &app_config.network.bootstrap_peers {
+                    match parse_node_addr(addr_str) {
+                        Ok(parsed) => {
+                            match to_endpoint_addr(&parsed) {
+                                Ok(ea) => {
+                                    // Convert NodeId → IdentityPub (both are 32-byte pubkeys).
+                                    let identity = syncback_core::types::IdentityPub(parsed.node_id.0);
+                                    map.insert(identity, ea);
+                                    bootstrap_added += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        addr = %addr_str,
+                                        error = %e,
+                                        "startup: skipping bootstrap peer with unparseable addr"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                addr = %addr_str,
+                                error = %e,
+                                "startup: skipping malformed bootstrap peer addr"
+                            );
+                        }
+                    }
+                }
+                if bootstrap_added > 0 {
+                    tracing::info!(count = bootstrap_added, "loaded bootstrap peers from config");
+                }
+            }
+
             map
         };
 
@@ -249,6 +291,7 @@ impl DaemonHandle {
                 mock_holders: vec![],
                 cluster_state: cluster_state.clone(),
                 network: Some(network.clone()),
+                watch_configs: app_config.watch.clone(),
             },
             encoder.clone(),
         );
@@ -340,6 +383,11 @@ impl DaemonHandle {
 
         // ── Phase 7.2: spawn Processor ────────────────────────────────────────
         let repair_tx_for_processor = repair_tx.clone();
+        let soft_quota_bytes = syncback_core::config::soft_quota_bytes(&app_config);
+        let hard_quota_bytes = syncback_core::config::hard_quota_bytes(&app_config);
+        // Treat 0 (unlimited sentinel from config) as u64::MAX for Processor.
+        let soft_quota_bytes = if soft_quota_bytes == 0 { u64::MAX } else { soft_quota_bytes };
+        let hard_quota_bytes = if hard_quota_bytes == 0 { u64::MAX } else { hard_quota_bytes };
         if let Some(cs) = cluster_state.as_ref() {
             let cluster_sync = Arc::new(ClusterSyncManager::new(
                 db.clone(),
@@ -357,30 +405,23 @@ impl DaemonHandle {
                 encoder.clone(),
                 holdings_dir.clone(),
                 symbols_dir.clone(), // source_blocks_dir: owner's blocks for PoS verification
+                network.clone(),
+                relay_sync_tx.clone(),
+                soft_quota_bytes,
+                hard_quota_bytes,
             );
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {
-                processor.run(incoming_rx, cancel_processor).await
+                processor.run(incoming_rx, inbound_rx, cancel_processor).await
             }));
         } else {
             tracing::warn!("cluster state unavailable — Processor not started, incoming connections will be dropped");
             // Drop incoming_rx so the network accept loop's incoming_tx send() will
             // eventually get channel-full backpressure rather than silent discard.
             drop(incoming_rx);
+            drop(inbound_rx);
             drop(repair_tx_for_processor);
         }
-
-        // Drain relay inbound messages at DEBUG level until Phase 7.6 wires them to Processor.
-        // NOTE: remove this drain task in Phase 7.6 when Processor gains an inbound_rx parameter.
-        tokio::spawn(async move {
-            while let Some(msg) = inbound_rx.recv().await {
-                tracing::debug!(
-                    from = %msg.from,
-                    msg_type = %msg.msg_type,
-                    "handle: relay inbound message (drained, not yet processed)"
-                );
-            }
-        });
 
         // Phase 6.4: spawn Watcher when watch_dirs are configured.
         if !cfg.watch_dirs.is_empty() {

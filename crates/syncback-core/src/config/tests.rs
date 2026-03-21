@@ -3,8 +3,9 @@ use std::io::Write;
 
 #[cfg(test)]
 use crate::config::{
-    AppConfig, BackupCfg, ClusterCfg, ConfigError, EscrowCfg, NetworkCfg, StorageCfg,
-    disk_reserve_bytes, expand_data_dir, hard_quota_bytes, soft_quota_bytes, source_block_size_bytes,
+    AppConfig, BackupCfg, ClusterCfg, ConfigError, EscrowCfg, NetworkCfg, StorageCfg, WatchConfig,
+    disk_reserve_bytes, expand_data_dir, hard_quota_bytes, lookup_importance, soft_quota_bytes,
+    source_block_size_bytes, DEFAULT_IMPORTANCE,
 };
 #[cfg(test)]
 use crate::constants::{
@@ -73,10 +74,12 @@ fn config_roundtrips_all_fields() {
             relay_max_size_mb: 4,
             relay_ttl_days: 14,
             enable_relay: false,
+            bootstrap_peers: vec![],
         },
         cluster: ClusterCfg {
             sync_batch_size: 200,
         },
+        watch: vec![],
     };
 
     let toml_str = toml::to_string(&original).unwrap();
@@ -336,4 +339,175 @@ enable_relay = false
 fn network_cfg_toml_missing_field_defaults_true() {
     let app: AppConfig = toml::from_str("").unwrap();
     assert!(app.network.enable_relay);
+}
+
+// ============================================================
+// bootstrap_peers tests
+// ============================================================
+
+#[test]
+fn network_cfg_bootstrap_peers_defaults_empty() {
+    let cfg = NetworkCfg::default();
+    assert!(cfg.bootstrap_peers.is_empty(), "bootstrap_peers must default to empty");
+}
+
+#[test]
+fn network_cfg_bootstrap_peers_loads_from_toml() {
+    let toml = r#"
+[network]
+bootstrap_peers = [
+    "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ef@192.168.1.5:12345",
+    "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12@10.0.0.1:54321",
+]
+"#;
+    let app: AppConfig = toml::from_str(toml).unwrap();
+    assert_eq!(app.network.bootstrap_peers.len(), 2);
+    assert!(app.network.bootstrap_peers[0].contains("192.168.1.5:12345"));
+    assert!(app.network.bootstrap_peers[1].contains("10.0.0.1:54321"));
+}
+
+#[test]
+fn network_cfg_bootstrap_peers_empty_array_in_toml() {
+    let toml = "[network]\nbootstrap_peers = []\n";
+    let app: AppConfig = toml::from_str(toml).unwrap();
+    assert!(app.network.bootstrap_peers.is_empty());
+}
+
+#[test]
+fn network_cfg_bootstrap_peers_missing_section_defaults_empty() {
+    let app: AppConfig = toml::from_str("").unwrap();
+    assert!(app.network.bootstrap_peers.is_empty());
+}
+
+// ============================================================
+// WatchConfig / lookup_importance tests
+// ============================================================
+
+#[test]
+fn watch_config_default_importance_is_half() {
+    let wc: WatchConfig = toml::from_str(r#"path = "/home/user/docs""#).unwrap();
+    assert_eq!(wc.importance, DEFAULT_IMPORTANCE);
+}
+
+#[test]
+fn watch_config_explicit_importance_roundtrips() {
+    let wc = WatchConfig {
+        path: "/home/user/photos".to_string(),
+        importance: 0.9,
+    };
+    let serialized = toml::to_string(&wc).unwrap();
+    let loaded: WatchConfig = toml::from_str(&serialized).unwrap();
+    assert_eq!(loaded.path, "/home/user/photos");
+    assert!((loaded.importance - 0.9).abs() < 1e-9);
+}
+
+#[test]
+fn lookup_importance_returns_default_when_no_watch_configs() {
+    let result = lookup_importance("/home/user/docs/file.txt", &[]);
+    assert_eq!(result, DEFAULT_IMPORTANCE);
+}
+
+#[test]
+fn lookup_importance_returns_default_when_no_match() {
+    let cfgs = vec![WatchConfig {
+        path: "/home/user/photos".to_string(),
+        importance: 0.9,
+    }];
+    let result = lookup_importance("/home/user/docs/file.txt", &cfgs);
+    assert_eq!(result, DEFAULT_IMPORTANCE);
+}
+
+#[test]
+fn lookup_importance_matches_exact_directory_prefix() {
+    let cfgs = vec![WatchConfig {
+        path: "/home/user/docs".to_string(),
+        importance: 0.8,
+    }];
+    let result = lookup_importance("/home/user/docs/report.pdf", &cfgs);
+    assert!((result - 0.8).abs() < 1e-9);
+}
+
+#[test]
+fn lookup_importance_does_not_match_partial_directory_name() {
+    // /home/user/docs should NOT match /home/user/documents/file.txt
+    let cfgs = vec![WatchConfig {
+        path: "/home/user/docs".to_string(),
+        importance: 0.8,
+    }];
+    let result = lookup_importance("/home/user/documents/file.txt", &cfgs);
+    assert_eq!(result, DEFAULT_IMPORTANCE);
+}
+
+#[test]
+fn lookup_importance_uses_first_matching_config() {
+    let cfgs = vec![
+        WatchConfig {
+            path: "/home/user".to_string(),
+            importance: 0.3,
+        },
+        WatchConfig {
+            path: "/home/user/photos".to_string(),
+            importance: 0.9,
+        },
+    ];
+    // /home/user/photos/img.jpg matches both; first match wins (0.3, not 0.9).
+    let result = lookup_importance("/home/user/photos/img.jpg", &cfgs);
+    assert!((result - 0.3).abs() < 1e-9);
+}
+
+#[test]
+fn lookup_importance_path_with_trailing_slash_in_config() {
+    let cfgs = vec![WatchConfig {
+        path: "/home/user/docs/".to_string(),
+        importance: 0.7,
+    }];
+    let result = lookup_importance("/home/user/docs/file.txt", &cfgs);
+    assert!((result - 0.7).abs() < 1e-9);
+}
+
+#[test]
+fn lookup_importance_exact_path_match() {
+    // file_path == wc.path (no trailing content): edge case for bare path match.
+    let cfgs = vec![WatchConfig {
+        path: "/home/user/docs".to_string(),
+        importance: 0.6,
+    }];
+    let result = lookup_importance("/home/user/docs", &cfgs);
+    assert!((result - 0.6).abs() < 1e-9);
+}
+
+#[test]
+fn app_config_watch_loads_from_toml() {
+    let toml_str = r#"
+[[watch]]
+path = "/home/user/photos"
+importance = 0.9
+
+[[watch]]
+path = "/home/user/docs"
+importance = 0.6
+"#;
+    let app: AppConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(app.watch.len(), 2);
+    assert_eq!(app.watch[0].path, "/home/user/photos");
+    assert!((app.watch[0].importance - 0.9).abs() < 1e-9);
+    assert_eq!(app.watch[1].path, "/home/user/docs");
+    assert!((app.watch[1].importance - 0.6).abs() < 1e-9);
+}
+
+#[test]
+fn app_config_watch_defaults_empty() {
+    let app: AppConfig = toml::from_str("").unwrap();
+    assert!(app.watch.is_empty());
+}
+
+#[test]
+fn app_config_watch_missing_importance_uses_default() {
+    let toml_str = r#"
+[[watch]]
+path = "/home/user/videos"
+"#;
+    let app: AppConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(app.watch.len(), 1);
+    assert_eq!(app.watch[0].importance, DEFAULT_IMPORTANCE);
 }

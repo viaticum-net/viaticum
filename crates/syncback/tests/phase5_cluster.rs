@@ -80,6 +80,7 @@ fn backup_cfg_with_cluster(
         mock_holders: holders_5(),
         cluster_state: Some(cluster_state),
         network: None,
+        watch_configs: vec![],
     }
 }
 

@@ -1,22 +1,23 @@
 // RestoreCoordinator: orchestrate symbol fetch → decode → file write.
 //
-// Phase 2: local restore only. Symbols already on disk written by BackupCoordinator.
-// Network fetch (fetch_from_holder) is implemented for Phase 3+ integration.
+// Strategy: try local symbols first (symbols_dir); fall back to network fetch
+// from holders if insufficient. Network fetch is sequential per holder.
 //
 // Module layout:
 //   mod.rs      — RestoreCoordinator struct, public API, restore(), run()
 //   pipeline.rs — decode_block(), extract_from_pack()
 //   tests.rs    — all test scenarios
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, Symbol};
+use syncback_core::messages::{Message, RestoreRequestMsg};
 use syncback_core::types::{
     DeviceId, ErasureParams, FileRecord, FileVersion, IdentityPub, LocalState,
-    PlacementStatus, SourceBlockId, SourceBlockType, Timestamp,
+    PlacementStatus, SourceBlockId, SourceBlockType, SymbolPlacement, Timestamp,
 };
 use tracing::{debug, error, info, warn};
 
@@ -154,8 +155,7 @@ pub struct RestoreCoordinator {
     db: Db,
     config: RestoreConfig,
     encoder: Arc<dyn ErasureEncoder>,
-    /// Network handle for Phase 3+ remote restore.
-    #[allow(dead_code)]
+    /// Network handle for remote restore fallback.
     network: Arc<NetworkHandle>,
 }
 
@@ -309,10 +309,14 @@ impl RestoreCoordinator {
         })
     }
 
-    /// Decode one source block from local symbols_dir (Phase 2).
+    /// Decode one source block.
     ///
-    /// Reads symbol files for each alive placement, unbinds, decodes,
-    /// decrypts, decompresses. Returns plaintext bytes.
+    /// Strategy:
+    ///   1. Try local: read symbol files from symbols_dir.
+    ///   2. If insufficient local symbols (<k_eff), try network fetch for remaining.
+    ///   3. Combine local + network symbols, then decode.
+    ///
+    /// Decrypts and decompresses the decoded data before returning.
     pub async fn decode_block_local(
         &self,
         block_id: &SourceBlockId,
@@ -367,11 +371,37 @@ impl RestoreCoordinator {
         }
 
         if unbound_symbols.len() < k_eff {
-            return Err(RestoreError::InsufficientSymbols {
-                block: *block_id,
-                got: unbound_symbols.len(),
-                need: k_eff,
-            });
+            // Not enough locally — try network fetch for the remainder.
+            debug!(
+                block = %block_id,
+                local = unbound_symbols.len(),
+                need = k_eff,
+                "decode: insufficient local symbols, trying network"
+            );
+
+            let mut network_symbols = self
+                .fetch_from_holders(block_id, &alive_placements, params)
+                .await?;
+
+            // Merge: avoid duplicates by ESI.
+            let existing_esis: HashSet<u32> =
+                unbound_symbols.iter().map(|s| s.esi).collect();
+            for sym in network_symbols.drain(..) {
+                if !existing_esis.contains(&sym.esi) {
+                    unbound_symbols.push(sym);
+                    if unbound_symbols.len() >= k_eff {
+                        break;
+                    }
+                }
+            }
+
+            if unbound_symbols.len() < k_eff {
+                return Err(RestoreError::InsufficientSymbols {
+                    block: *block_id,
+                    got: unbound_symbols.len(),
+                    need: k_eff,
+                });
+            }
         }
 
         // Decode: padded to k*t bytes
@@ -398,6 +428,140 @@ impl RestoreCoordinator {
             error!(block = %block_id, "decrypt_and_decompress failed: {e}");
             RestoreError::DecryptionFailed(*block_id)
         })
+    }
+
+    /// Fetch symbols for a source block from holders over the network.
+    ///
+    /// Tries holders sequentially, stopping once `k_eff` unbound symbols are
+    /// collected. Holders that return RestoreDenied are logged at WARN and
+    /// skipped. Network errors per holder are logged at WARN and skipped.
+    ///
+    /// Returns unbound symbols ready for `encoder.decode()`.
+    pub async fn fetch_from_holders(
+        &self,
+        block_id: &SourceBlockId,
+        placements: &[SymbolPlacement],
+        params: &ErasureParams,
+    ) -> Result<Vec<Symbol>, RestoreError> {
+        let k_eff = params.k_eff as usize;
+        let mut unbound_symbols: Vec<Symbol> = Vec::new();
+
+        for placement in placements {
+            if placement.status != PlacementStatus::Alive {
+                continue;
+            }
+            if unbound_symbols.len() >= k_eff {
+                break;
+            }
+
+            let still_needed = k_eff - unbound_symbols.len();
+            let wanted_esis: Vec<u32> = collect_esis_from_ranges(&placement.esi_ranges)
+                .into_iter()
+                .take(still_needed)
+                .collect();
+
+            if wanted_esis.is_empty() {
+                continue;
+            }
+
+            let request = RestoreRequestMsg {
+                v: 1,
+                source_block_id: *block_id,
+                esi_list: wanted_esis,
+                timestamp: Timestamp::now(),
+            };
+
+            match self
+                .fetch_symbols_from_holder(&placement.holder_id, request)
+                .await
+            {
+                Ok(symbols) => {
+                    debug!(
+                        holder = %placement.holder_id,
+                        block = %block_id,
+                        count = symbols.len(),
+                        "fetch: received bound symbols from holder"
+                    );
+                    for sym in symbols {
+                        let unbound = self.encoder.unbind(sym, block_id, &placement.holder_id);
+                        unbound_symbols.push(unbound);
+                    }
+                }
+                Err(RestoreError::EscrowDenied { ref holder, .. }) => {
+                    warn!(
+                        holder = %holder,
+                        block = %block_id,
+                        "fetch: holder denied restore (escrow), skipping"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        holder = %placement.holder_id,
+                        block = %block_id,
+                        err = %e,
+                        "fetch: holder failed, skipping"
+                    );
+                }
+            }
+        }
+
+        if unbound_symbols.len() < k_eff {
+            Err(RestoreError::InsufficientSymbols {
+                block: *block_id,
+                got: unbound_symbols.len(),
+                need: k_eff,
+            })
+        } else {
+            Ok(unbound_symbols)
+        }
+    }
+
+    /// Contact one holder, send a RestoreRequest, receive RestoreResponse.
+    ///
+    /// Returns the raw bound symbols (not yet unbound).
+    async fn fetch_symbols_from_holder(
+        &self,
+        holder_id: &IdentityPub,
+        request: RestoreRequestMsg,
+    ) -> Result<Vec<Symbol>, RestoreError> {
+        let conn_arc = self.network.get_connection(*holder_id).await?;
+        let mut guard = conn_arc.lock().await;
+
+        guard
+            .send_message(&Message::RestoreRequest(request))
+            .await?;
+
+        let resp_msg = guard.recv_message().await?;
+
+        match resp_msg {
+            Message::RestoreResponse(resp) => {
+                debug!(
+                    holder = %holder_id,
+                    symbols = resp.symbols.len(),
+                    "fetch: received RestoreResponse"
+                );
+                Ok(resp.symbols)
+            }
+            Message::RestoreDenied(denied) => Err(RestoreError::EscrowDenied {
+                holder: *holder_id,
+                current_trust: denied.current_trust,
+                needed_trust: denied.needed_trust,
+                restore_budget_gb: denied.restore_budget_gb,
+                restore_gb: denied.restore_budget_gb + 1.0, // approximate
+            }),
+            other => {
+                warn!(
+                    holder = %holder_id,
+                    msg = ?std::mem::discriminant(&other),
+                    "fetch: unexpected message type, treating as error"
+                );
+                Err(RestoreError::Network(
+                    crate::daemon::network::NetworkError::HandshakeFailed(
+                        "unexpected message type during restore".to_string(),
+                    ),
+                ))
+            }
+        }
     }
 
     /// Extract one file from decoded plaintext and write to output_dir.
@@ -517,4 +681,14 @@ impl RestoreCoordinator {
         info!("RestoreCoordinator: channel closed, exiting");
         Ok(())
     }
+}
+
+// ─── Free helpers ─────────────────────────────────────────────────────────────
+
+/// Expand (start, count) ESI ranges into a flat sorted list of ESIs.
+pub(crate) fn collect_esis_from_ranges(ranges: &[(u32, u32)]) -> Vec<u32> {
+    ranges
+        .iter()
+        .flat_map(|&(start, count)| start..start + count)
+        .collect()
 }

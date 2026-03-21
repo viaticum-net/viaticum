@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use syncback_core::config::WatchConfig;
 use syncback_core::constants::DEFAULT_SOURCE_BLOCK_SIZE;
 use syncback_core::db::Db;
 use syncback_core::erasure::ErasureEncoder;
@@ -80,6 +81,10 @@ pub struct BackupConfig {
     /// When None: symbols are encoded and written to disk but not delivered
     /// (pre-7.5 behavior; also used in unit tests that do not spin up a network).
     pub network: Option<std::sync::Arc<crate::daemon::network::NetworkHandle>>,
+    /// Per-directory importance overrides from config.
+    /// Used to look up the importance of a file when creating a backup event.
+    /// When empty, DEFAULT_IMPORTANCE (0.5) is used for all files.
+    pub watch_configs: Vec<WatchConfig>,
 }
 
 impl Default for BackupConfig {
@@ -92,6 +97,7 @@ impl Default for BackupConfig {
             mock_holders: vec![],
             cluster_state: None,
             network: None,
+            watch_configs: vec![],
         }
     }
 }

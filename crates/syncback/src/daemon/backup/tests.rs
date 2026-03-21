@@ -32,6 +32,7 @@ fn test_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         mock_holders: test_holders(),
         cluster_state: None,
         network: None,
+        watch_configs: vec![],
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -328,6 +329,7 @@ fn pipeline_roundtrip_can_decode() {
         mock_holders: test_holders(),
         cluster_state: None,
         network: None,
+        watch_configs: vec![],
     };
     let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let mut coord = BackupCoordinator::new(db.clone(), config, encoder.clone());
@@ -642,6 +644,7 @@ fn dedup_via_cluster_state_skips_already_backed_up() {
         mock_holders: test_holders(),
         cluster_state: Some(cluster_state),
         network: None,
+        watch_configs: vec![],
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -962,4 +965,105 @@ async fn deliver_symbols_sends_to_reachable_holder() {
 
     Arc::try_unwrap(network_owner).ok().map(|n| async move { n.shutdown().await });
     Arc::try_unwrap(network_holder).ok().map(|n| async move { n.shutdown().await });
+}
+
+// ─── Phase 7.9 tests: watch_configs importance lookup ────────────────────────
+
+/// Helper: build coordinator with specific watch_configs.
+fn coord_with_watch(
+    db: Db,
+    symbols_dir: &TempDir,
+    watch_configs: Vec<syncback_core::config::WatchConfig>,
+) -> BackupCoordinator {
+    let config = BackupConfig {
+        source_block_size: SMALL_BLOCK_SIZE,
+        symbols_dir: symbols_dir.path().to_path_buf(),
+        epoch_key: [42u8; 32],
+        device_id: DeviceId([1u8; 16]),
+        mock_holders: test_holders(),
+        cluster_state: None,
+        network: None,
+        watch_configs,
+    };
+    BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
+}
+
+#[test]
+fn watch_config_importance_applied_to_queued_file() {
+    // When a file is queued, the QueuedFile.importance should reflect the
+    // watch_config matching the file's directory.
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+
+    let watch_cfgs = vec![syncback_core::config::WatchConfig {
+        path: files_dir.path().to_string_lossy().into_owned(),
+        importance: 0.9,
+    }];
+    let mut coord = coord_with_watch(db, &symbols_dir, watch_cfgs);
+
+    let content = b"some document content here";
+    let path = write_file(&files_dir, "report.txt", content);
+
+    coord.process_event(added_event(&path)).unwrap();
+
+    // File should be queued (it's small) with importance 0.9.
+    let queued: Vec<_> = coord.queues.values().flat_map(|q| q.iter()).collect();
+    assert_eq!(queued.len(), 1, "exactly one file should be queued");
+    assert!(
+        (queued[0].importance - 0.9).abs() < 1e-9,
+        "importance should be 0.9 from watch config, got {}",
+        queued[0].importance
+    );
+}
+
+#[test]
+fn watch_config_default_importance_used_when_no_match() {
+    // When no watch_config matches the file's directory, DEFAULT_IMPORTANCE (0.5) is used.
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+
+    // Watch config points to a different directory.
+    let watch_cfgs = vec![syncback_core::config::WatchConfig {
+        path: "/nonexistent/other/dir".to_string(),
+        importance: 0.9,
+    }];
+    let mut coord = coord_with_watch(db, &symbols_dir, watch_cfgs);
+
+    let content = b"some document content here";
+    let path = write_file(&files_dir, "report.txt", content);
+
+    coord.process_event(added_event(&path)).unwrap();
+
+    let queued: Vec<_> = coord.queues.values().flat_map(|q| q.iter()).collect();
+    assert_eq!(queued.len(), 1, "exactly one file should be queued");
+    assert!(
+        (queued[0].importance - 0.5).abs() < 1e-9,
+        "importance should default to 0.5, got {}",
+        queued[0].importance
+    );
+}
+
+#[test]
+fn watch_config_empty_uses_default_importance() {
+    // When watch_configs is empty, DEFAULT_IMPORTANCE (0.5) is used for all files.
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+
+    let mut coord = coord_with_watch(db, &symbols_dir, vec![]);
+
+    let content = b"some document content here";
+    let path = write_file(&files_dir, "notes.txt", content);
+
+    coord.process_event(added_event(&path)).unwrap();
+
+    let queued: Vec<_> = coord.queues.values().flat_map(|q| q.iter()).collect();
+    assert_eq!(queued.len(), 1, "exactly one file should be queued");
+    assert!(
+        (queued[0].importance - 0.5).abs() < 1e-9,
+        "importance should default to 0.5 when watch_configs is empty, got {}",
+        queued[0].importance
+    );
 }

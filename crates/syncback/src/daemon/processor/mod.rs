@@ -11,6 +11,13 @@
 //   PosNack received        → we are the owner   → mark placement Lost, trigger repair
 //   SymbolTransfer received → we are the holder  → write symbols to disk, record HoldingRecord
 //   SymbolDropped received  → we are the owner   → mark placement Lost, trigger repair
+//   SymbolOffer received    → we are the holder  → check quota, send Accept or Reject
+//   SymbolAccept received   → we are the owner   → log (BackupCoordinator wiring Phase 7.5)
+//   SymbolReject received   → we are the owner   → log
+//   RestoreRequest received → we are the holder  → load symbols, send RestoreResponse
+//   RestoreDenied received  → we are the owner   → log warning
+//   BoardSync received      → forward to RelayManager via relay_sync_tx
+//   PeerAnnounce received   → upsert peer record in DB
 //   ClusterSyncRequest      → we are cluster peer → serve event log entries
 //   ClusterSyncResponse     → we are cluster peer → apply received events
 //
@@ -22,19 +29,22 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use syncback_core::constants::DECODE_OVERHEAD;
+use syncback_core::constants::{DECODE_OVERHEAD, INITIAL_TRUST_P};
 use syncback_core::db::{Db, WeeklyPosEntry};
-use syncback_core::erasure::ErasureEncoder;
+use syncback_core::erasure::{ErasureEncoder, Symbol};
 use syncback_core::messages::{
-    ClusterSyncRequestMsg, ClusterSyncResponseMsg, Message, PosNackMsg, PosResponseMsg,
-    SymbolDroppedMsg, SymbolTransferMsg,
+    BoardSyncMsg, ClusterSyncRequestMsg, ClusterSyncResponseMsg, Message, PeerAnnounceMsg,
+    PosNackMsg, PosResponseMsg, RejectReason, RestoreDeniedMsg, RestoreRequestMsg,
+    RestoreResponseMsg, SymbolAcceptMsg, SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg,
+    SymbolTransferMsg,
 };
 use syncback_core::pos::{
     apply_pos_outcome, outcome_from_verify, verify_response, PosResponse, VerifyOutcome,
 };
 use syncback_core::trust::PosOutcome;
 use syncback_core::types::{
-    ErasureParams, HoldingRecord, HoldingStatus, IdentityPub, PlacementStatus, Timestamp,
+    ErasureParams, HoldingRecord, HoldingStatus, IdentityPub, PeerRecord, PlacementStatus,
+    Timestamp,
 };
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -42,10 +52,15 @@ use tracing::{debug, error, info, warn};
 
 use crate::daemon::cluster_sync::ClusterSyncManager;
 use crate::daemon::network::connection::Connection;
+use crate::daemon::network::NetworkHandle;
+use crate::daemon::relay::InboundMessage;
 use crate::daemon::repair::RepairTrigger;
 
 #[cfg(test)]
 mod tests;
+
+// Symbol size constant (T = 64 KB - 1 = 65535 bytes per RaptorQ spec)
+const SYMBOL_SIZE: u64 = 65_535;
 
 // ─── Error type ───────────────────────────────────────────────────────────────
 
@@ -75,7 +90,6 @@ pub enum ProcessorError {
 /// Routes incoming connections and dispatches messages to appropriate handlers.
 pub struct Processor {
     db: Db,
-    #[allow(dead_code)]
     own_identity: IdentityPub,
     repair_tx: mpsc::Sender<RepairTrigger>,
     cluster_sync: Arc<ClusterSyncManager>,
@@ -85,6 +99,15 @@ pub struct Processor {
     /// Directory where our own source blocks live (for PoS verification as owner):
     /// `{source_blocks_dir}/{block_id_hex}/block.bin`
     source_blocks_dir: PathBuf,
+    /// Network handle for sending replies (SymbolAccept, SymbolReject, RestoreResponse).
+    network: Arc<NetworkHandle>,
+    /// Channel to relay manager: push BoardSync entries from incoming connections.
+    relay_sync_tx: mpsc::Sender<crate::daemon::relay::SyncTrigger>,
+    /// Soft quota in bytes. 0 = unlimited (treat as u64::MAX internally).
+    soft_quota_bytes: u64,
+    /// Hard quota in bytes: floor; never accept symbols above this held total.
+    /// 0 = no hard floor.
+    hard_quota_bytes: u64,
 }
 
 impl Processor {
@@ -98,6 +121,10 @@ impl Processor {
         encoder: Arc<dyn ErasureEncoder>,
         holdings_dir: PathBuf,
         source_blocks_dir: PathBuf,
+        network: Arc<NetworkHandle>,
+        relay_sync_tx: mpsc::Sender<crate::daemon::relay::SyncTrigger>,
+        soft_quota_bytes: u64,
+        hard_quota_bytes: u64,
     ) -> Self {
         Processor {
             db,
@@ -107,6 +134,10 @@ impl Processor {
             encoder,
             holdings_dir,
             source_blocks_dir,
+            network,
+            relay_sync_tx,
+            soft_quota_bytes,
+            hard_quota_bytes,
         }
     }
 
@@ -118,6 +149,7 @@ impl Processor {
     pub async fn run(
         self,
         mut incoming_rx: mpsc::Receiver<Connection>,
+        mut inbound_rx: mpsc::Receiver<InboundMessage>,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let (msg_tx, mut msg_rx) =
@@ -189,10 +221,47 @@ impl Processor {
                         }
                     }
                 }
+
+                maybe_relay = inbound_rx.recv() => {
+                    match maybe_relay {
+                        None => {
+                            info!("processor: inbound_rx closed");
+                            // Not a fatal condition; relay may be disabled.
+                        }
+                        Some(relay_msg) => {
+                            let this2 = this.clone();
+                            tokio::spawn(async move {
+                                this2.dispatch_relay(relay_msg).await;
+                            });
+                        }
+                    }
+                }
             }
         }
 
         Ok(())
+    }
+
+    // =========================================================
+    // Relay dispatch (one-way messages only)
+    // =========================================================
+
+    async fn dispatch_relay(&self, msg: InboundMessage) {
+        use syncback_core::messages::from_cbor;
+        if msg.msg_type == "peer_announce" {
+            match from_cbor::<PeerAnnounceMsg>(&msg.payload) {
+                Ok(pa) => {
+                    if let Err(e) = self.handle_peer_announce(pa).await {
+                        warn!(err = %e, "processor: PeerAnnounce via relay failed");
+                    }
+                }
+                Err(e) => {
+                    warn!(err = %e, "processor: failed to decode PeerAnnounce from relay");
+                }
+            }
+        } else {
+            debug!(msg_type = %msg.msg_type, "processor: relay message, no handler");
+        }
     }
 
     // =========================================================
@@ -227,6 +296,27 @@ impl Processor {
             }
             Message::ClusterSyncResponse(response) => {
                 self.handle_cluster_sync_response(from, response).await?;
+            }
+            Message::SymbolOffer(offer) => {
+                self.handle_symbol_offer(from, offer, conn).await?;
+            }
+            Message::SymbolAccept(accept) => {
+                self.handle_symbol_accept(from, accept).await?;
+            }
+            Message::SymbolReject(reject) => {
+                self.handle_symbol_reject(from, reject).await?;
+            }
+            Message::RestoreRequest(req) => {
+                self.handle_restore_request(from, req, conn).await?;
+            }
+            Message::RestoreDenied(denied) => {
+                self.handle_restore_denied(from, denied).await?;
+            }
+            Message::BoardSync(board_sync) => {
+                self.handle_board_sync(from, board_sync).await?;
+            }
+            Message::PeerAnnounce(pa) => {
+                self.handle_peer_announce(pa).await?;
             }
             other => {
                 debug!(
@@ -591,6 +681,315 @@ impl Processor {
                 holder_id: from,
             })
             .await;
+        Ok(())
+    }
+
+    // =========================================================
+    // SymbolOffer: we are the holder
+    // =========================================================
+
+    /// Decide whether to accept or reject a SymbolOffer based on disk quota.
+    ///
+    /// Returns `true` = accept, `false` = reject.
+    /// This is a sync helper used by `handle_symbol_offer` and tests.
+    pub(crate) fn decide_symbol_offer(
+        &self,
+        offer_bytes: u64,
+    ) -> Result<bool, ProcessorError> {
+        let held_bytes = self.db.total_holding_bytes()?;
+
+        let effective_hard = if self.hard_quota_bytes == 0 {
+            u64::MAX
+        } else {
+            self.hard_quota_bytes
+        };
+        let effective_soft = if self.soft_quota_bytes == 0 {
+            u64::MAX
+        } else {
+            self.soft_quota_bytes
+        };
+
+        if held_bytes >= effective_hard {
+            return Ok(false);
+        }
+        if effective_soft < u64::MAX && held_bytes + offer_bytes > effective_soft {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Receive a SymbolOffer, decide Accept or Reject, send reply on conn.
+    ///
+    /// Does NOT create a HoldingRecord — that happens in handle_symbol_transfer
+    /// when symbols actually arrive.
+    pub(crate) async fn handle_symbol_offer(
+        &self,
+        owner_id: IdentityPub,
+        offer: SymbolOfferMsg,
+        conn: Arc<Mutex<Connection>>,
+    ) -> Result<(), ProcessorError> {
+        let offer_bytes: u64 = offer
+            .esi_ranges
+            .iter()
+            .map(|&(_start, count)| count as u64 * SYMBOL_SIZE)
+            .sum();
+
+        let accept = self.decide_symbol_offer(offer_bytes)?;
+
+        let reply = if accept {
+            info!(
+                owner = %owner_id,
+                block_id = %offer.source_block_id,
+                offer_bytes,
+                "processor: SymbolOffer accepted"
+            );
+            Message::SymbolAccept(SymbolAcceptMsg {
+                v: 1,
+                source_block_id: offer.source_block_id,
+                offer_msg_id: offer.msg_id,
+                timestamp: Timestamp::now(),
+            })
+        } else {
+            debug!(
+                owner = %owner_id,
+                block_id = %offer.source_block_id,
+                offer_bytes,
+                "processor: SymbolOffer rejected (quota full)"
+            );
+            Message::SymbolReject(SymbolRejectMsg {
+                v: 1,
+                source_block_id: offer.source_block_id,
+                offer_msg_id: offer.msg_id,
+                reason: RejectReason::QuotaFull,
+                timestamp: Timestamp::now(),
+            })
+        };
+
+        let mut guard = conn.lock().await;
+        guard.send_message(&reply).await?;
+        Ok(())
+    }
+
+    // =========================================================
+    // SymbolAccept / SymbolReject: we are the owner
+    // =========================================================
+
+    /// Holder accepted our offer. Log only — BackupCoordinator wiring is Phase 7.5.
+    async fn handle_symbol_accept(
+        &self,
+        holder_id: IdentityPub,
+        accept: SymbolAcceptMsg,
+    ) -> Result<(), ProcessorError> {
+        info!(
+            holder = %holder_id,
+            block_id = %accept.source_block_id,
+            offer_msg_id = ?accept.offer_msg_id,
+            "processor: SymbolAccept received (log only, Phase 7.5 wires to BackupCoordinator)"
+        );
+        Ok(())
+    }
+
+    /// Holder rejected our offer. Log.
+    async fn handle_symbol_reject(
+        &self,
+        holder_id: IdentityPub,
+        reject: SymbolRejectMsg,
+    ) -> Result<(), ProcessorError> {
+        info!(
+            holder = %holder_id,
+            block_id = %reject.source_block_id,
+            reason = ?reject.reason,
+            "processor: SymbolReject received"
+        );
+        Ok(())
+    }
+
+    // =========================================================
+    // RestoreRequest: we are the holder
+    // =========================================================
+
+    /// Load held symbols for owner and return a RestoreResponseMsg.
+    ///
+    /// Inner method for testability — does not touch the network connection.
+    pub(crate) async fn handle_restore_request_inner(
+        &self,
+        owner_id: IdentityPub,
+        request: RestoreRequestMsg,
+    ) -> Result<RestoreResponseMsg, ProcessorError> {
+        let block_id = request.source_block_id;
+
+        // Check HoldingRecord.
+        let holding = self.db.get_holding(&block_id, &owner_id)?;
+        let holding = match holding {
+            Some(h) if h.status == HoldingStatus::Active => h,
+            _ => {
+                // Not held or not active: return empty response (not a protocol error).
+                return Ok(RestoreResponseMsg {
+                    v: 1,
+                    source_block_id: block_id,
+                    symbols: vec![],
+                    timestamp: Timestamp::now(),
+                });
+            }
+        };
+
+        // TODO Phase 7.6+: escrow check (verify owner has enough trust to unlock restore).
+
+        // Determine which ESIs to send.
+        let held_esis = ranges_to_esi_list(&holding.esi_ranges);
+        let esis_to_send: Vec<u32> = if request.esi_list.is_empty() {
+            held_esis
+        } else {
+            let held_set: std::collections::HashSet<u32> = held_esis.into_iter().collect();
+            request
+                .esi_list
+                .into_iter()
+                .filter(|esi| held_set.contains(esi))
+                .collect()
+        };
+
+        // Load symbol files from disk.
+        let block_hex = to_hex(&block_id.0);
+        let block_dir = self.holdings_dir.join(&block_hex);
+        let mut symbols: Vec<Symbol> = Vec::with_capacity(esis_to_send.len());
+
+        for esi in esis_to_send {
+            let sym_path = block_dir.join(format!("{esi}.bin"));
+            match tokio::fs::read(&sym_path).await {
+                Ok(data) => {
+                    symbols.push(Symbol { esi, data });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    debug!(
+                        block_id = %block_id,
+                        esi,
+                        "processor: RestoreRequest — symbol file missing on disk, skipping"
+                    );
+                }
+                Err(e) => return Err(ProcessorError::Io(e)),
+            }
+        }
+
+        if symbols.is_empty() {
+            warn!(
+                block_id = %block_id,
+                owner = %owner_id,
+                "processor: RestoreRequest — HoldingRecord exists but no symbol files found on disk"
+            );
+        } else {
+            info!(
+                block_id = %block_id,
+                owner = %owner_id,
+                symbols = symbols.len(),
+                "processor: sending RestoreResponse"
+            );
+        }
+
+        Ok(RestoreResponseMsg {
+            v: 1,
+            source_block_id: block_id,
+            symbols,
+            timestamp: Timestamp::now(),
+        })
+    }
+
+    /// Handle a RestoreRequest from an owner: load symbols and send RestoreResponse on conn.
+    pub(crate) async fn handle_restore_request(
+        &self,
+        owner_id: IdentityPub,
+        request: RestoreRequestMsg,
+        conn: Arc<Mutex<Connection>>,
+    ) -> Result<(), ProcessorError> {
+        let response = self.handle_restore_request_inner(owner_id, request).await?;
+        let mut guard = conn.lock().await;
+        guard
+            .send_message(&Message::RestoreResponse(response))
+            .await?;
+        Ok(())
+    }
+
+    // =========================================================
+    // RestoreDenied: we are the owner
+    // =========================================================
+
+    /// Holder denied our restore request. Log warning.
+    async fn handle_restore_denied(
+        &self,
+        holder_id: IdentityPub,
+        denied: RestoreDeniedMsg,
+    ) -> Result<(), ProcessorError> {
+        warn!(
+            holder = %holder_id,
+            block_id = %denied.source_block_id,
+            current_trust = denied.current_trust,
+            needed_trust = denied.needed_trust,
+            restore_budget_gb = denied.restore_budget_gb,
+            "processor: RestoreDenied received"
+        );
+        Ok(())
+    }
+
+    // =========================================================
+    // BoardSync: forward to relay manager
+    // =========================================================
+
+    /// Peer sent us board entries. Forward to RelayManager via relay_sync_tx.
+    async fn handle_board_sync(
+        &self,
+        from: IdentityPub,
+        msg: BoardSyncMsg,
+    ) -> Result<(), ProcessorError> {
+        let trigger = crate::daemon::relay::SyncTrigger {
+            partner_identity: from,
+            partner_entries: msg.entries,
+        };
+        if self.relay_sync_tx.send(trigger).await.is_err() {
+            warn!(peer = %from, "processor: relay_sync_tx closed, dropping BoardSync");
+        }
+        Ok(())
+    }
+
+    // =========================================================
+    // PeerAnnounce: upsert peer in DB
+    // =========================================================
+
+    /// Learn about a peer's identity. Upsert PeerRecord in DB.
+    ///
+    /// Note: `network.add_peer` requires an EndpointAddr, which we cannot construct
+    /// from a NodeId alone without iroh resolution. That mapping is done in Phase 7.9
+    /// (bootstrap peers) and Phase 7.3 (connect). This handler only updates the DB.
+    pub(crate) async fn handle_peer_announce(
+        &self,
+        msg: PeerAnnounceMsg,
+    ) -> Result<(), ProcessorError> {
+        let now = Timestamp::now();
+        let record = match self.db.get_peer(&msg.identity_pub)? {
+            None => PeerRecord {
+                identity: msg.identity_pub,
+                node_id: Some(msg.node_id),
+                trust_p: INITIAL_TRUST_P,
+                trust_i: 0.0,
+                trust_s: 1.0,
+                bytes_we_store_for_peer: 0,
+                bytes_peer_stores_for_us: 0,
+                first_seen: now,
+                last_seen: now,
+                device_id: None,
+                revoked_device_pub_keys: vec![],
+                addrs: vec![],
+            },
+            Some(mut existing) => {
+                existing.node_id = Some(msg.node_id);
+                existing.last_seen = now;
+                existing
+            }
+        };
+        self.db.upsert_peer(&record)?;
+        info!(
+            identity = %msg.identity_pub,
+            node_id = %msg.node_id,
+            "processor: PeerAnnounce upserted peer record"
+        );
         Ok(())
     }
 

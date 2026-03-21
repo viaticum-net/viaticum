@@ -64,6 +64,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         mock_holders: test_holders(),
         cluster_state: None,
         network: None,
+        watch_configs: vec![],
     }
 }
 

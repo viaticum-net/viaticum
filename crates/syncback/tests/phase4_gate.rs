@@ -68,6 +68,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         mock_holders: test_holders(),
         cluster_state: None,
         network: None,
+        watch_configs: vec![],
     }
 }
 
@@ -134,6 +135,7 @@ fn config_source_block_size_drives_backup() {
             mock_holders: test_holders(),
             cluster_state: None,
             network: None,
+            watch_configs: vec![],
         },
         Arc::new(RaptorQEncoder::new()),
     );

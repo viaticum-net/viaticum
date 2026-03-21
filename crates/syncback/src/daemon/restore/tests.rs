@@ -4,15 +4,27 @@
 // All tests use real Db::open_in_memory(), real RaptorQEncoder, tempfile::TempDir.
 // Source block size is small (65_535 * 2 = ~128 KB) to keep encode/decode fast.
 // Async tests use #[tokio::test].
+//
+// Network-fetch tests (Phase 7.7):
+//   - collect_esis_from_ranges_* — unit tests for the ESI helper.
+//   - fetch_from_holders_returns_insufficient_when_no_peers_reachable — all
+//     holders unreachable → InsufficientSymbols.
+//   - fetch_skips_denied_holder_and_tries_next — holder A returns
+//     RestoreDenied; holder B returns symbols; decode succeeds.
+//   - decode_block_fetches_from_network_when_local_files_missing — owner
+//     symbols_dir empty; two holder nodes serve symbols over iroh; decode
+//     roundtrip produces original plaintext.
 
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use syncback_core::db::Db;
-use syncback_core::erasure::RaptorQEncoder;
+use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
+use syncback_core::messages::{Message, RestoreDeniedMsg, RestoreResponseMsg};
 use syncback_core::types::{
-    DeviceId, FileId, FileRecord, FileVersion, IdentityPub, LocalState, PackEntry, SourceBlockId,
-    Timestamp,
+    DeviceId, ErasureParams, FileId, FileRecord, FileVersion, IdentityPub, LocalState, PackEntry,
+    PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType,
+    SymbolPlacement, Timestamp,
 };
 use syncback_core::types::to_cbor_bytes;
 use tempfile::TempDir;
@@ -20,9 +32,11 @@ use tempfile::TempDir;
 use crate::daemon::backup::{
     BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind,
 };
+use crate::daemon::backup::pipeline::compress_and_encrypt;
 use crate::daemon::network::{NetworkConfig, NetworkHandle};
+use crate::daemon::restore::pipeline::hex_encode;
 
-use super::{RestoreConfig, RestoreCoordinator, VersionSelector};
+use super::{collect_esis_from_ranges, RestoreConfig, RestoreCoordinator, VersionSelector};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -50,6 +64,7 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         mock_holders: test_holders(),
         cluster_state: None,
         network: None,
+        watch_configs: vec![],
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -570,4 +585,510 @@ async fn restore_deduplicates_source_blocks() {
     assert_eq!(result.files_restored, 2, "failures: {:?}", result.failures);
     assert_eq!(result.blocks_fetched, 1, "should decode exactly 1 block");
     assert!(result.failures.is_empty());
+}
+
+// ─── collect_esis_from_ranges unit tests ──────────────────────────────────────
+
+#[test]
+fn collect_esis_from_ranges_empty_returns_empty() {
+    assert_eq!(collect_esis_from_ranges(&[]), Vec::<u32>::new());
+}
+
+#[test]
+fn collect_esis_from_ranges_single_range() {
+    assert_eq!(collect_esis_from_ranges(&[(0, 3)]), vec![0, 1, 2]);
+}
+
+#[test]
+fn collect_esis_from_ranges_two_disjoint_ranges() {
+    assert_eq!(
+        collect_esis_from_ranges(&[(0, 2), (5, 2)]),
+        vec![0, 1, 5, 6]
+    );
+}
+
+#[test]
+fn collect_esis_from_ranges_count_one() {
+    assert_eq!(collect_esis_from_ranges(&[(7, 1)]), vec![7]);
+}
+
+// ─── fetch_from_holders: unreachable peers → InsufficientSymbols ──────────────
+
+#[tokio::test]
+async fn fetch_from_holders_returns_insufficient_when_no_peers_reachable() {
+    // 3 placements, all Alive, but the owner NetworkHandle has no known_peers.
+    // Every get_connection call returns PeerNotFound; all holders are skipped.
+    // Expected: InsufficientSymbols(got=0).
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+
+    let block_id = SourceBlockId([0xBBu8; 32]);
+
+    let placements: Vec<SymbolPlacement> = (0u8..3)
+        .map(|i| SymbolPlacement {
+            source_block_id: block_id,
+            holder_id: IdentityPub([(i + 1) * 0x11u8; 32]),
+            file_id: FileId(1),
+            esi_ranges: vec![(u32::from(i) * 3, 3)],
+            binding_seed: [0u8; 32],
+            status: PlacementStatus::Alive,
+            last_verified: None,
+            placed_at: Timestamp(0),
+            consecutive_misses: 0,
+        })
+        .collect();
+
+    let (coord, _net) = test_restore_coord(db, &symbols_dir).await;
+    let params = ErasureParams::compute(65_535_u64, 0.5);
+
+    let result = coord
+        .fetch_from_holders(&block_id, &placements, &params)
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(super::RestoreError::InsufficientSymbols { got: 0, .. })
+        ),
+        "expected InsufficientSymbols(got=0), got: {result:?}"
+    );
+}
+
+// ─── fetch_skips_denied_holder_and_tries_next ─────────────────────────────────
+
+/// Holder A returns RestoreDenied; Holder B has all k_eff symbols.
+/// fetch_from_holders skips A and collects from B successfully.
+#[tokio::test]
+async fn fetch_skips_denied_holder_and_tries_next() {
+    let content = b"hello from the network restore test";
+    let epoch_key = [0x77u8; 32];
+
+    let stored = compress_and_encrypt(content, &epoch_key).expect("compress_and_encrypt");
+    let encrypted_size = stored.len() as u64;
+
+    let encoder = Arc::new(RaptorQEncoder::new());
+    // k=1 (one symbol source block). k_eff = 1 + 3 = 4.
+    let params = ErasureParams::compute(65_535_u64, 0.5);
+    let k_eff = params.k_eff as usize;
+
+    let total_size = (params.k as usize) * (params.t as usize);
+    let mut padded = stored.clone();
+    padded.resize(total_size, 0u8);
+
+    let block_id = SourceBlockId([0xCCu8; 32]);
+
+    let sk_b = SigningKey::from_bytes(&[0x0Bu8; 32]);
+    let pk_b = IdentityPub(sk_b.verifying_key().to_bytes());
+
+    let symbols_b = encoder
+        .encode(&padded, &params, 0, k_eff as u32, &block_id, &pk_b)
+        .expect("encode for holder_b");
+
+    let holdings_dir_b = TempDir::new().unwrap();
+    let block_dir_b = holdings_dir_b.path().join(hex_encode(&block_id.0));
+    std::fs::create_dir_all(&block_dir_b).unwrap();
+    for sym in &symbols_b {
+        std::fs::write(block_dir_b.join(format!("{}.bin", sym.esi)), &sym.data).unwrap();
+    }
+
+    let sk_a = SigningKey::from_bytes(&[0x0Au8; 32]);
+    let pk_a = IdentityPub(sk_a.verifying_key().to_bytes());
+
+    let (tx_a, mut rx_a) =
+        tokio::sync::mpsc::channel::<crate::daemon::network::connection::Connection>(4);
+    let (tx_b, mut rx_b) =
+        tokio::sync::mpsc::channel::<crate::daemon::network::connection::Connection>(4);
+
+    let handle_a = NetworkHandle::start(
+        NetworkConfig {
+            signing_key: sk_a,
+            known_peers: Default::default(),
+            device_cert: None,
+            iroh_secret_key: None,
+            relay_mode: iroh::RelayMode::Disabled,
+        },
+        tx_a,
+    )
+    .await
+    .unwrap();
+
+    let handle_b = NetworkHandle::start(
+        NetworkConfig {
+            signing_key: sk_b,
+            known_peers: Default::default(),
+            device_cert: None,
+            iroh_secret_key: None,
+            relay_mode: iroh::RelayMode::Disabled,
+        },
+        tx_b,
+    )
+    .await
+    .unwrap();
+
+    let addr_a = handle_a.local_addr().unwrap();
+    let addr_b = handle_b.local_addr().unwrap();
+
+    // Holder A: always returns RestoreDenied.
+    tokio::spawn(async move {
+        while let Some(mut conn) = rx_a.recv().await {
+            tokio::spawn(async move {
+                loop {
+                    match conn.recv_message().await {
+                        Ok(Message::RestoreRequest(req)) => {
+                            let denied = Message::RestoreDenied(RestoreDeniedMsg {
+                                v: 1,
+                                source_block_id: req.source_block_id,
+                                reason: "test always denied".to_string(),
+                                current_trust: 0.0,
+                                needed_trust: 0.5,
+                                restore_budget_gb: 0.0,
+                                timestamp: Timestamp::now(),
+                            });
+                            let _ = conn.send_message(&denied).await;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    });
+
+    // Holder B: serves symbols from disk.
+    let dir_b = block_dir_b.clone();
+    tokio::spawn(async move {
+        while let Some(mut conn) = rx_b.recv().await {
+            let dir = dir_b.clone();
+            tokio::spawn(async move {
+                loop {
+                    match conn.recv_message().await {
+                        Ok(Message::RestoreRequest(req)) => {
+                            let mut symbols = Vec::new();
+                            for esi in &req.esi_list {
+                                let path = dir.join(format!("{esi}.bin"));
+                                if let Ok(data) = std::fs::read(&path) {
+                                    symbols.push(syncback_core::erasure::Symbol {
+                                        esi: *esi,
+                                        data,
+                                    });
+                                }
+                            }
+                            let resp = Message::RestoreResponse(RestoreResponseMsg {
+                                v: 1,
+                                source_block_id: req.source_block_id,
+                                symbols,
+                                timestamp: Timestamp::now(),
+                            });
+                            let _ = conn.send_message(&resp).await;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    });
+
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+
+    // Placement for Holder A: claims 1 symbol (it will deny).
+    let placement_a = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id: pk_a,
+        file_id: FileId(1),
+        esi_ranges: vec![(0, 1)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp::now(),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement_a).unwrap();
+
+    // Placement for Holder B: all k_eff symbols.
+    let placement_b = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id: pk_b,
+        file_id: FileId(1),
+        esi_ranges: vec![(0, k_eff as u32)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp::now(),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement_b).unwrap();
+
+    let sk_owner = SigningKey::from_bytes(&[0x99u8; 32]);
+    let (tx_owner, _rx_owner) = tokio::sync::mpsc::channel(4);
+    let owner_net = NetworkHandle::start(
+        NetworkConfig {
+            signing_key: sk_owner,
+            known_peers: Default::default(),
+            device_cert: None,
+            iroh_secret_key: None,
+            relay_mode: iroh::RelayMode::Disabled,
+        },
+        tx_owner,
+    )
+    .await
+    .unwrap();
+    owner_net.add_peer(pk_a, addr_a).await;
+    owner_net.add_peer(pk_b, addr_b).await;
+
+    let restore_config = RestoreConfig {
+        epoch_key,
+        parallel_holders: 5,
+        identity: IdentityPub([0x99u8; 32]),
+        device_id: DeviceId([0xAAu8; 16]),
+        symbols_dir: symbols_dir.path().to_path_buf(),
+    };
+    let coord = RestoreCoordinator::new(
+        db,
+        restore_config,
+        encoder.clone(),
+        Arc::new(owner_net),
+    );
+
+    let placements = vec![placement_a, placement_b];
+    let result = coord
+        .fetch_from_holders(&block_id, &placements, &params)
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "fetch_from_holders should succeed (skipping denied holder): {result:?}"
+    );
+    let unbound = result.unwrap();
+    assert!(
+        unbound.len() >= k_eff,
+        "should have >= k_eff unbound symbols, got {}",
+        unbound.len()
+    );
+
+    // Verify the symbols actually decode to the original content.
+    let decoded_padded = encoder.decode(&unbound, &params).expect("decode");
+    let decoded_stored = &decoded_padded[..encrypted_size as usize];
+    let plaintext =
+        crate::daemon::backup::pipeline::decrypt_and_decompress(decoded_stored, &epoch_key)
+            .expect("decrypt_and_decompress");
+    assert_eq!(plaintext, content);
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+}
+
+// ─── decode_block_fetches_from_network_when_local_files_missing ──────────────
+
+/// Owner symbols_dir is empty. Two holder network nodes each serve their
+/// portion of symbols. decode_block_local falls back to network and returns
+/// the original plaintext.
+#[tokio::test]
+async fn decode_block_fetches_from_network_when_local_files_missing() {
+    let content = b"network restore integration test content for phase 7.7";
+    let epoch_key = [0x42u8; 32];
+
+    let stored = compress_and_encrypt(content, &epoch_key).expect("compress_and_encrypt");
+    let encrypted_size = stored.len() as u64;
+
+    let encoder = Arc::new(RaptorQEncoder::new());
+    // k=1 source block. k_eff = 4.
+    let params = ErasureParams::compute(65_535_u64, 0.5);
+    let k_eff = params.k_eff as usize;
+
+    let total_size = (params.k as usize) * (params.t as usize);
+    let mut padded = stored.clone();
+    padded.resize(total_size, 0u8);
+
+    let block_id = SourceBlockId([0xDDu8; 32]);
+
+    let sk_h1 = SigningKey::from_bytes(&[0x11u8; 32]);
+    let pk_h1 = IdentityPub(sk_h1.verifying_key().to_bytes());
+    let sk_h2 = SigningKey::from_bytes(&[0x22u8; 32]);
+    let pk_h2 = IdentityPub(sk_h2.verifying_key().to_bytes());
+
+    // Split k_eff symbols between two holders.
+    let h1_count = (k_eff / 2) as u32;
+    let h2_count = k_eff as u32 - h1_count;
+
+    let symbols_h1 = encoder
+        .encode(&padded, &params, 0, h1_count, &block_id, &pk_h1)
+        .expect("encode h1");
+    let symbols_h2 = encoder
+        .encode(&padded, &params, h1_count, h2_count, &block_id, &pk_h2)
+        .expect("encode h2");
+
+    let block_hex = hex_encode(&block_id.0);
+
+    let holdings_dir_h1 = TempDir::new().unwrap();
+    let block_dir_h1 = holdings_dir_h1.path().join(&block_hex);
+    std::fs::create_dir_all(&block_dir_h1).unwrap();
+    for sym in &symbols_h1 {
+        std::fs::write(block_dir_h1.join(format!("{}.bin", sym.esi)), &sym.data).unwrap();
+    }
+
+    let holdings_dir_h2 = TempDir::new().unwrap();
+    let block_dir_h2 = holdings_dir_h2.path().join(&block_hex);
+    std::fs::create_dir_all(&block_dir_h2).unwrap();
+    for sym in &symbols_h2 {
+        std::fs::write(block_dir_h2.join(format!("{}.bin", sym.esi)), &sym.data).unwrap();
+    }
+
+    let (tx_h1, mut rx_h1) =
+        tokio::sync::mpsc::channel::<crate::daemon::network::connection::Connection>(4);
+    let (tx_h2, mut rx_h2) =
+        tokio::sync::mpsc::channel::<crate::daemon::network::connection::Connection>(4);
+
+    let handle_h1 = NetworkHandle::start(
+        NetworkConfig {
+            signing_key: sk_h1,
+            known_peers: Default::default(),
+            device_cert: None,
+            iroh_secret_key: None,
+            relay_mode: iroh::RelayMode::Disabled,
+        },
+        tx_h1,
+    )
+    .await
+    .unwrap();
+
+    let handle_h2 = NetworkHandle::start(
+        NetworkConfig {
+            signing_key: sk_h2,
+            known_peers: Default::default(),
+            device_cert: None,
+            iroh_secret_key: None,
+            relay_mode: iroh::RelayMode::Disabled,
+        },
+        tx_h2,
+    )
+    .await
+    .unwrap();
+
+    let addr_h1 = handle_h1.local_addr().unwrap();
+    let addr_h2 = handle_h2.local_addr().unwrap();
+
+    fn spawn_mock_holder(
+        mut rx: tokio::sync::mpsc::Receiver<crate::daemon::network::connection::Connection>,
+        block_dir: std::path::PathBuf,
+    ) {
+        tokio::spawn(async move {
+            while let Some(mut conn) = rx.recv().await {
+                let dir = block_dir.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.recv_message().await {
+                            Ok(Message::RestoreRequest(req)) => {
+                                let mut symbols = Vec::new();
+                                for esi in &req.esi_list {
+                                    let path = dir.join(format!("{esi}.bin"));
+                                    if let Ok(data) = std::fs::read(&path) {
+                                        symbols.push(syncback_core::erasure::Symbol {
+                                            esi: *esi,
+                                            data,
+                                        });
+                                    }
+                                }
+                                let resp = Message::RestoreResponse(RestoreResponseMsg {
+                                    v: 1,
+                                    source_block_id: req.source_block_id,
+                                    symbols,
+                                    timestamp: Timestamp::now(),
+                                });
+                                let _ = conn.send_message(&resp).await;
+                            }
+                            Ok(_) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    spawn_mock_holder(rx_h1, block_dir_h1.clone());
+    spawn_mock_holder(rx_h2, block_dir_h2.clone());
+
+    let db = Db::open_in_memory().unwrap();
+
+    let block_record = SourceBlockRecord {
+        block_id,
+        k: params.k,
+        t: params.t,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp::now(),
+        encrypted_size: Some(encrypted_size),
+    };
+    db.upsert_source_block(&block_record).unwrap();
+
+    let placement_h1 = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id: pk_h1,
+        file_id: FileId(1),
+        esi_ranges: vec![(0, h1_count)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp::now(),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement_h1).unwrap();
+
+    let placement_h2 = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id: pk_h2,
+        file_id: FileId(1),
+        esi_ranges: vec![(h1_count, h2_count)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp::now(),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement_h2).unwrap();
+
+    let sk_owner = SigningKey::from_bytes(&[0x55u8; 32]);
+    let (tx_owner, _rx_owner) = tokio::sync::mpsc::channel(4);
+    let owner_net = NetworkHandle::start(
+        NetworkConfig {
+            signing_key: sk_owner,
+            known_peers: Default::default(),
+            device_cert: None,
+            iroh_secret_key: None,
+            relay_mode: iroh::RelayMode::Disabled,
+        },
+        tx_owner,
+    )
+    .await
+    .unwrap();
+    owner_net.add_peer(pk_h1, addr_h1).await;
+    owner_net.add_peer(pk_h2, addr_h2).await;
+
+    // Owner symbols_dir is EMPTY.
+    let symbols_dir = TempDir::new().unwrap();
+
+    let restore_config = RestoreConfig {
+        epoch_key,
+        parallel_holders: 5,
+        identity: IdentityPub([0x55u8; 32]),
+        device_id: DeviceId([0x66u8; 16]),
+        symbols_dir: symbols_dir.path().to_path_buf(),
+    };
+    let coord = RestoreCoordinator::new(db, restore_config, encoder, Arc::new(owner_net));
+
+    // decode_block_local: empty local symbols_dir → falls back to network.
+    let plaintext = coord
+        .decode_block_local(&block_id, &params, encrypted_size)
+        .await
+        .expect("decode_block_local should succeed via network fetch");
+
+    assert_eq!(
+        plaintext, content,
+        "decoded plaintext must match original content"
+    );
+
+    handle_h1.shutdown().await;
+    handle_h2.shutdown().await;
 }

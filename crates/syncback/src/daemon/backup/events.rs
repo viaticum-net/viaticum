@@ -1,6 +1,7 @@
 // Event processing: handle_deleted, handle_added_or_modified, get_or_create_file_id.
 // Called from BackupCoordinator::process_event (mod.rs).
 
+use syncback_core::config::lookup_importance;
 use syncback_core::types::{
     FileId, FileRecord, FileVersion, LocalState, SourceBlockId, Timestamp,
 };
@@ -88,11 +89,13 @@ impl BackupCoordinator {
         // Not a duplicate — classify and enqueue or process immediately (large file).
         let category = Self::classify(&event.path);
 
+        let importance = lookup_importance(&event.path, &self.config.watch_configs);
+
         if size_bytes >= self.config.source_block_size {
             let file_id =
                 self.get_or_create_file_id(&event.path, &event.device_id, content_hash)?;
             let candidates = self.get_candidates()?;
-            self.process_large_file(&event.path, file_id, content_hash, 0.5, &candidates)?;
+            self.process_large_file(&event.path, file_id, content_hash, importance, &candidates)?;
             return Ok(());
         }
 
@@ -111,7 +114,7 @@ impl BackupCoordinator {
             content_hash,
             size_bytes,
             category: queue_category,
-            importance: 0.5,
+            importance,
         };
 
         self.queues.entry(queue_category).or_default().push(qf);
