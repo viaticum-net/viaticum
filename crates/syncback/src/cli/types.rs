@@ -57,8 +57,10 @@ pub enum CliResponse {
 /// Data for the `status` subcommand.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatusData {
-    /// This node's identity pubkey (hex, 16 chars = 8 bytes).
+    /// This node's identity pubkey (hex).
     pub node_identity: String,
+    /// This node's iroh endpoint address (for `syncback connect`).
+    pub node_addr: String,
     /// Number of known peers.
     pub peer_count: u32,
     /// Average trust score across all peers (combined score).

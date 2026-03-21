@@ -267,7 +267,7 @@ impl DaemonHandle {
 
         // ── 14. Compute scan interval (scaled by time_scale) ──────────────────
         let time_scale = cfg.time_scale.max(1);
-        let repair_interval_secs = 3600 / time_scale;
+        let repair_interval_secs = (3600 / time_scale).max(1);
 
         // ── 15. Spawn subsystem tasks ─────────────────────────────────────────
         let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();

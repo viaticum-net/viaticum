@@ -249,9 +249,15 @@ fn dispatch_status(state: &DaemonState) -> CliResponse {
         .count() as u32;
 
     let node_identity = bytes_to_hex_full(&state.identity_pub.0);
+    let node_addr = state
+        .network
+        .local_addr()
+        .map(|a| format!("{a:?}"))
+        .unwrap_or_default();
 
     CliResponse::Status(StatusData {
         node_identity,
+        node_addr,
         peer_count: peers.len() as u32,
         avg_trust,
         holding_bytes: holdings_bytes,
