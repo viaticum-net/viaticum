@@ -153,7 +153,7 @@ WARM (redb, ~133 МБ для 5 ТБ):
 
 | # | Фича | Описание |
 |---|------|----------|
-| 8 | **Symbol budget** | Распределение символов по trust^2 весам |
+| 8 | **Symbol budget** | Распределение символов по trust/sqrt(1-t) весам |
 | 9 | **Commitment telemetry** | Holder автоматически сообщает eviction risk per owner (computed, не self-reported) |
 | 10 | **Reliability forecast** | `syncback status --forecast` — прогноз per file/folder |
 | 11 | **Selective restore** | `syncback restore photos/vacation/` по DB каталогу |
@@ -221,6 +221,12 @@ Phase β.2.6 — Trust-based escrow:
   Убрать EscrowTier, tier constants. Одна непрерывная формула
   Мотивация: время — плохой proxy для вклада, trust уже содержит время (I) + взаимность (S)
 
+Phase β.2.7 — Holder limits:
+  MAX_HOLDERS_PER_BLOCK = 30 (restore ≤14 conn, PoS ~246K/нед на 1 ТБ)
+  MIN_SYMBOLS_PER_HOLDER = 32 (2 МБ, защита маленьких блоков)
+  compute_allocation: pre-filter top-N по весу
+  Убран TARGET_HOLDER_COUNT (ни за что не отвечал)
+
 Phase β.3 — Personal Cluster:
   Device registration / revocation
   ClusterSync (event log)
@@ -261,4 +267,5 @@ GATE: E2E тест — 2+ устройства, RaptorQ, backup → versioned re
 - `docs/beta/personal_cluster.md` — Personal Cluster (key hierarchy, revocation, state sync)
 - `docs/beta/ideas.md` — непроработанные идеи
 - `docs/alpha/ADR-003-implementation-architecture.md` — α архитектура (базовый контекст)
-- `docs/research/protocol.md` — протокол (source of truth, обновлён disk pressure)
+- `docs/beta/protocol.md` — протокол β (source of truth)
+- `docs/alpha/protocol.md` — протокол α (архив, историческая справка)

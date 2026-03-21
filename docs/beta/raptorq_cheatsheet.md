@@ -226,7 +226,7 @@ Flow:
 
   4. Per source_block:
      → найти holders (SymbolPlacement, status=Alive)
-     → escrow check (weeks_in_network)
+     → escrow check (trust-based)
      → collect K_eff symbols (parallel, от разных holders)
      → unbind → RaptorQ decode → decrypt → decompress
 
@@ -238,7 +238,7 @@ Flow:
 ```
 
 Оптимизация: шаг 3. Файлы из одного batch = один download.
-Friction: restore одного файла = скачать весь batch (256 МБ). Для cold backup — ок.
+Friction: restore одного файла = скачать весь batch (128 МБ). Для cold backup — ок.
 
 ---
 
@@ -253,7 +253,7 @@ Backup trigger — event-driven, НЕ раз в неделю.
 
 Packing queue per file type (photos, docs, video):
   Flush условие (любое из):
-    1. Очередь ≥ 256 МБ         → flush сразу (полная пачка)
+    1. Очередь ≥ source_block_size (128 МБ) → flush сразу (полная пачка)
     2. Нет активности 1 час    → flush что есть
     3. Прошло 24 часа           → flush что есть (fallback)
   Min batch size: 1 МБ.

@@ -81,6 +81,23 @@ Milestone: "repair agent реагирует на потерю символов"
 Milestone: "escrow на базе trust, не времени"
 ```
 
+## Phase 2.7: holder limits
+
+```
+☑ MAX_HOLDERS_PER_BLOCK = 30
+  Защита от разрастания числа пиров на блок.
+  При 1 ТБ и 50+ холдерах: PoS/restore overhead растёт линейно.
+  30 = sweet spot: restore ≤14 connections, PoS ~246K/нед на 1 ТБ.
+☑ MIN_SYMBOLS_PER_HOLDER = 32 (2 МБ)
+  Защита для маленьких блоков (32 МБ, overhead 1.5x → N=768).
+  Ниже 32 символов overhead трекинга не оправдан.
+☑ compute_allocation: pre-filter кандидатов
+  effective = min(candidates, MAX_HOLDERS, N/MIN_SYMBOLS).max(2)
+  Top-N по весу. 3 новых теста.
+
+Milestone: "placement защищён от O(N_peers) разрастания"
+```
+
 ## Phase 3: cluster
 
 ```
@@ -97,7 +114,6 @@ Milestone: "два устройства, shared identity, dedup"
 ## Phase 4: polish
 
 ```
-□ Variable T для файлов > 3.5 ГБ
 □ Disk pressure: effective_quota, soft/hard quota
 □ File deletion: watcher → Deleted → cooldown → cleanup
 □ Commitment telemetry

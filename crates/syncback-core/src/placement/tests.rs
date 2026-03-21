@@ -91,17 +91,37 @@ fn compute_allocation_filters_degenerate_keeps_valid() {
 
 #[test]
 fn compute_allocation_n_too_small_returns_error() {
-    // 5 candidates but N = 3 (impossible to assign 1 each)
-    let candidates: Vec<_> = (0..5).map(|i| candidate(i, 0.5)).collect();
+    // N=1 with 2+ valid candidates after truncation → NTooSmall
+    let candidates = vec![candidate(1, 0.5), candidate(2, 0.6)];
     let p = ErasureParams {
         k: 1,
-        k_eff: 4,
+        k_eff: 2,
         t: 65535,
         overhead: 1.5,
-        n: 3,
+        n: 1,
     };
     let result = compute_allocation(&candidates, &p);
     assert!(matches!(result, Err(PlacementError::NTooSmall { .. })));
+}
+
+#[test]
+fn compute_allocation_many_candidates_truncated_by_max_holders() {
+    // 50 candidates but MAX_HOLDERS_PER_BLOCK = 30 → top-30 by weight kept
+    let p = ErasureParams::compute(128 * 1024 * 1024, 0.5);
+    let candidates: Vec<_> = (0..50)
+        .map(|i| candidate(i + 1, 0.3 + (i as f64) * 0.012))
+        .collect();
+    let allocs = compute_allocation(&candidates, &p).unwrap();
+    assert!(allocs.len() <= 30, "got {} holders", allocs.len());
+    let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
+    assert_eq!(total, p.n);
+    // Verify highest-trust candidates were kept (not the low ones)
+    let lowest_trust_in_result = allocs
+        .iter()
+        .map(|a| candidates.iter().find(|c| c.identity == a.identity).unwrap().trust)
+        .fold(f64::INFINITY, f64::min);
+    // The bottom 20 (trust 0.3..0.54) should be dropped; lowest kept >= ~0.54
+    assert!(lowest_trust_in_result > 0.5, "lowest trust = {lowest_trust_in_result}");
 }
 
 // ─── basic correctness ───────────────────────────────────────────────────────
@@ -262,6 +282,48 @@ fn esi_range_helper_returns_start_and_count() {
         start_esi: 500,
     };
     assert_eq!(alloc.esi_range(), (500, 100));
+}
+
+#[test]
+fn compute_allocation_min_symbols_caps_holder_count_on_small_block() {
+    // 32 MB block, overhead 1.5x → small N.
+    // N/MIN_SYMBOLS_PER_HOLDER limits holder count to keep average symbols/holder sane.
+    // Pass 30 candidates → should be trimmed.
+    let p = ErasureParams::compute(32 * 1024 * 1024, 0.0); // overhead = 1.5x
+    let max_holders = (p.n / crate::constants::MIN_SYMBOLS_PER_HOLDER) as usize;
+    let candidates: Vec<_> = (0..30)
+        .map(|i| candidate(i + 1, 0.3 + (i as f64) * 0.02))
+        .collect();
+    let allocs = compute_allocation(&candidates, &p).unwrap();
+    assert!(
+        allocs.len() <= max_holders,
+        "got {} holders, expected <= {max_holders} (N={}, min_sym={})",
+        allocs.len(),
+        p.n,
+        crate::constants::MIN_SYMBOLS_PER_HOLDER,
+    );
+    // Average symbols per holder is at least MIN_SYMBOLS_PER_HOLDER
+    let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
+    let avg = total / allocs.len() as u32;
+    assert!(
+        avg >= crate::constants::MIN_SYMBOLS_PER_HOLDER,
+        "avg {avg} < min {}",
+        crate::constants::MIN_SYMBOLS_PER_HOLDER
+    );
+    assert_eq!(total, p.n);
+}
+
+#[test]
+fn compute_allocation_100_candidates_trimmed_to_30() {
+    // Large block, 100 candidates → MAX_HOLDERS_PER_BLOCK = 30
+    let p = ErasureParams::compute(128 * 1024 * 1024, 0.5);
+    let candidates: Vec<_> = (0..100)
+        .map(|i| candidate((i % 255) as u8 + 1, 0.1 + (i as f64) * 0.008))
+        .collect();
+    let allocs = compute_allocation(&candidates, &p).unwrap();
+    assert_eq!(allocs.len(), 30);
+    let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
+    assert_eq!(total, p.n);
 }
 
 #[test]

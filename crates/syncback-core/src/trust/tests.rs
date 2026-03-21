@@ -389,21 +389,6 @@ fn update_storage_bytes_returns_error_for_unknown_peer() {
 }
 
 #[test]
-fn weeks_in_network_computed_on_recalculate() {
-    let mut engine = TrustEngine::new();
-    let peer_a = peer(1);
-    let t0 = ts(0);
-    // 3 weeks later
-    let t1 = ts(3 * 604_800);
-
-    engine.upsert_peer(peer_a, t0);
-    engine.recalculate(&peer_a, t1, 1).unwrap();
-
-    let record = engine.get_peer(&peer_a).unwrap();
-    assert_eq!(record.weeks_in_network, 3);
-}
-
-#[test]
 fn pos_accumulates_within_same_week() {
     let mut engine = TrustEngine::new();
     let peer_a = peer(1);

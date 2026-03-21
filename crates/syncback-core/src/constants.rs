@@ -66,8 +66,13 @@ pub const OVERHEAD_SCALE: f64 = 1.5;
 
 // === Placement ===
 
-/// Target number of holders for symbol distribution.
-pub const TARGET_HOLDER_COUNT: u32 = 15;
+/// Maximum holders per source block. Beyond ~30, marginal fault tolerance
+/// gain is tiny while PoS/restore overhead grows linearly.
+pub const MAX_HOLDERS_PER_BLOCK: u32 = 30;
+
+/// Minimum symbols assigned per holder. Below this threshold the per-holder
+/// tracking overhead (PoS, repair) isn't justified. Protects small-block configs.
+pub const MIN_SYMBOLS_PER_HOLDER: u32 = 32; // 2 MB at T=64KB
 
 /// Concentration cap factor: max_share = (1 - 1/overhead) * this.
 pub const CONCENTRATION_CAP_FACTOR: f64 = 0.85;

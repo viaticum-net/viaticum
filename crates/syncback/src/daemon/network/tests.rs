@@ -453,7 +453,6 @@ fn revocation_check_rejects_revoked_device_pub_key() {
         bytes_peer_stores_for_us: 0,
         first_seen: Timestamp(0),
         last_seen: Timestamp(0),
-        weeks_in_network: 0,
         device_id: None,
         revoked_device_pub_keys: vec![revoked_pub],
     };
@@ -484,7 +483,6 @@ fn peer_record_revoked_device_pub_keys_default_empty() {
         bytes_peer_stores_for_us: 0,
         first_seen: Timestamp(0),
         last_seen: Timestamp(0),
-        weeks_in_network: 0,
         device_id: None,
         revoked_device_pub_keys: vec![],
     };

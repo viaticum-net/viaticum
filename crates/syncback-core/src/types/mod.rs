@@ -329,8 +329,6 @@ pub struct PeerRecord {
     pub bytes_peer_stores_for_us: u64,
     pub first_seen: Timestamp,
     pub last_seen: Timestamp,
-    /// Calendar weeks since first_seen.
-    pub weeks_in_network: u32,
     /// Which device manages this peer relationship (peer-to-device affinity).
     pub device_id: Option<DeviceId>,
     /// Device public keys we know are revoked for this peer identity.

@@ -103,7 +103,7 @@ epoch_key = HKDF(seed, "syncback-encryption", epoch_counter)
 3. Device certificate = master_key.sign(device_id, device_pub_key, timestamp)
 4. Новое устройство публикует certificate в сеть → партнёры принимают как часть identity
 5. Seed стирается из RAM
-6. Получение cluster state (file catalog, placements, trust) через iroh-blobs от другого устройства
+6. Получение cluster state (file catalog, placements, trust) через direct iroh connection от другого устройства
    или через сеть (если единственное устройство — disaster recovery)
 ```
 
@@ -152,7 +152,7 @@ epoch_key = HKDF(seed, "syncback-encryption", epoch_counter)
 
 Sync = обмен хвостами логов:
   Device A: "мой последний event от B = ts=1000"
-  Device B: "вот все мои events после ts=1000" → iroh-blob
+  Device B: "вот все мои events после ts=1000" → direct connection
   Device A: применяет events → state обновлён
 ```
 - CRDT-like: events commutative, порядок не важен для финального state
@@ -163,11 +163,12 @@ Sync = обмен хвостами логов:
 - Периодический snapshot всего state → iroh-blob → другие устройства скачивают
 - Проще, но не инкрементально. При расхождении — merge конфликты.
 
-**Вариант C: iroh-docs (board per identity)**
+**Вариант C: iroh-docs (ОТКЛОНЁН — β не использует iroh-docs)**
 - Один board для cluster metadata
 - Каждое устройство = author
 - iroh-docs handles sync автоматически
 - Зависимость от iroh-docs maturity
+- Отклонён: β явно не использует iroh-docs (см. plan.md)
 
 **Рекомендация: A (event log) с fallback на B (snapshot для disaster recovery).**
 
@@ -273,7 +274,7 @@ Challenger → pos_challenge → Device A (online)
   Всё в рамках стандартных 7 дней
 ```
 
-**PoS:** каждое устройство отвечает на PoS для шардов/символов, которые ОНО хранит, от СВОИХ назначенных пиров. Не нужна синхронизация MMR peaks между устройствами — каждое знает свои.
+**PoS:** каждое устройство отвечает на PoS для символов, которые ОНО хранит, от СВОИХ назначенных пиров. Не нужна синхронизация MMR peaks между устройствами — каждое знает свои.
 
 **Repair:**
 - Устройство видит что символы у его пира потеряны (holder ушёл)

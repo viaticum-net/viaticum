@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::constants::{
-    INITIAL_TRUST_P, KI, KP, P_WINDOW_WEEKS, S_CLAMP_MAX, S_CLAMP_MIN, SECS_PER_WEEK,
+    INITIAL_TRUST_P, KI, KP, P_WINDOW_WEEKS, S_CLAMP_MAX, S_CLAMP_MIN,
 };
 use crate::types::{IdentityPub, PeerRecord, Timestamp};
 
@@ -110,7 +110,6 @@ impl TrustEngine {
                 bytes_peer_stores_for_us: 0,
                 first_seen: now,
                 last_seen: now,
-                weeks_in_network: 0,
                 device_id: None,
                 revoked_device_pub_keys: vec![],
             };
@@ -168,7 +167,7 @@ impl TrustEngine {
     pub fn recalculate(
         &mut self,
         peer: &IdentityPub,
-        now: Timestamp,
+        _now: Timestamp,
         current_week: u32,
     ) -> Result<TrustScore, TrustError> {
         let window_start = current_week.saturating_sub(P_WINDOW_WEEKS - 1);
@@ -210,10 +209,8 @@ impl TrustEngine {
         let s_raw = record.trust_s;
         let combined = compute_combined(p, i, s_raw);
 
-        let weeks_in_network = (now.0.saturating_sub(record.first_seen.0) / SECS_PER_WEEK) as u32;
         record.trust_p = p;
         record.trust_i = i;
-        record.weeks_in_network = weeks_in_network;
 
         Ok(TrustScore {
             p,

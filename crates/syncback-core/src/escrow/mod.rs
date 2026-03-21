@@ -14,8 +14,8 @@ pub enum RestoreDecision {
 
 /// Reason for denial, sent back to owner as restore_denied message payload.
 ///
-/// Fields map directly to the wire message fields from protocol.md §1.10:
-///   restore_denied { shard_id, reason, current_trust, needed_trust, restore_budget_gb }
+/// Fields map directly to RestoreDeniedMsg wire message fields:
+///   restore_denied { source_block_id, reason, current_trust, needed_trust, restore_budget_gb }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RestoreDenial {
     /// Holder's trust score for this owner at the time of denial.

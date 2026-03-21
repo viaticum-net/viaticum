@@ -2,6 +2,7 @@
 // Pure logic — no DB, no async, no network.
 // Weight formula: trust / sqrt(1 - trust)  (mean-variance optimum)
 
+use crate::constants::{MAX_HOLDERS_PER_BLOCK, MIN_SYMBOLS_PER_HOLDER};
 use crate::types::{ErasureParams, IdentityPub};
 
 #[cfg(test)]
@@ -68,6 +69,8 @@ pub fn holder_weight(trust: f64) -> f64 {
 ///
 /// Algorithm:
 /// 1. Filter out candidates with trust >= 1.0. Error if all filtered or < 2 remain.
+///    Then enforce holder limits (MAX_HOLDERS_PER_BLOCK, N / MIN_SYMBOLS_PER_HOLDER),
+///    keeping top candidates by weight.
 /// 2. Check N >= candidate count (NTooSmall guard).
 /// 3. Clamp trust to [0.001, 0.999].
 /// 4. Compute weight_i = trust_i / sqrt(1 - trust_i).
@@ -89,13 +92,32 @@ pub fn compute_allocation(
     }
 
     // Step 1: filter degenerate (trust >= 1.0)
-    let valid: Vec<&HolderCandidate> = candidates.iter().filter(|c| c.trust < 1.0).collect();
+    let mut valid: Vec<&HolderCandidate> = candidates.iter().filter(|c| c.trust < 1.0).collect();
 
     if valid.is_empty() {
         return Err(PlacementError::AllTrustMaximum);
     }
     if valid.len() < 2 {
         return Err(PlacementError::TooFewHolders { count: valid.len() });
+    }
+
+    // Step 1b: enforce holder limits
+    let max_by_symbols = if MIN_SYMBOLS_PER_HOLDER > 0 {
+        (params.n / MIN_SYMBOLS_PER_HOLDER) as usize
+    } else {
+        usize::MAX
+    };
+    let effective_max = (MAX_HOLDERS_PER_BLOCK as usize).min(max_by_symbols).max(2);
+
+    if valid.len() > effective_max {
+        // Sort by weight descending, keep top effective_max
+        valid.sort_by(|a, b| {
+            holder_weight(b.trust)
+                .partial_cmp(&holder_weight(a.trust))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.identity.0.cmp(&b.identity.0))
+        });
+        valid.truncate(effective_max);
     }
 
     let n = params.n;

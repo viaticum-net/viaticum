@@ -95,7 +95,7 @@ Rebalancing = только добавление новых символов (н�
 
 ### Decoding
 
-1. Собрать любые K+2 символов (любые ESI, от любых holders)
+1. Собрать любые K+3 символов (K_eff) (любые ESI, от любых holders)
 2. Решить систему → восстановить source data — O(K)
 
 ### Ключевое свойство
@@ -131,7 +131,7 @@ stored_symbol = symbol XOR ChaCha20_stream(HKDF(source_block_id, holder_id))
 BACKUP:
   файл → zstd compress (streaming) → ChaCha20 encrypt (streaming) → source block
   → K = ceil(size / T), N = K × overhead(importance)
-  → placement: выбрать holders по trust² × importance
+  → placement: выбрать holders по trust/sqrt(1-t)
   → per holder:
       generate symbols (ESI unique per holder)
       → XOR bind с holder-specific key
@@ -140,8 +140,8 @@ BACKUP:
 
 RESTORE:
   DB lookup: path → source_block_id → holders
-  → escrow check (weeks_in_network)
-  → collect K+2 symbols от holders
+  → escrow check (trust-based)
+  → collect K_eff symbols от holders
   → unbind (XOR back) → RaptorQ decode → decrypt → decompress → файл
 
 REPAIR (файл на диске):
@@ -149,7 +149,7 @@ REPAIR (файл на диске):
   (не нужно ничего скачивать из сети!)
 
 REPAIR (файл удалён):
-  download K+2 symbols → unbind → decode → source block
+  download K_eff symbols → unbind → decode → source block
   → generate new symbols → bind → send to new holders
 ```
 
@@ -206,8 +206,8 @@ NotHeld и Fail = определённость → реагируем сразу
 
 ```
 HOT (RAM, ~1 МБ на 1000 файлов):
-  file_id → { K, total_alive_symbols }
-  (file_id, holder_id) → { symbol_count, status, last_pos }
+  source_block_id → { K, total_alive_symbols }
+  (source_block_id, holder_id) → { symbol_count, status, last_pos }
   Все решения: placement, budget, repair, reliability
 
 WARM (redb):
@@ -253,12 +253,12 @@ holder_files: (holder_id, file_id) → symbol_count
 ### Формула
 
 ```
-P(файл жив) = P(Binomial(N, p) ≥ K)
+P(файл жив) = P(Binomial(N, p) ≥ K_eff)
 ```
 
 N = distributed symbols, K = needed for decode, p = peer survival (1 - churn_rate).
 
-Если символы **на руках** — decode детерминистский (RS: 100%, RaptorQ: 99.98% при K+2).
+Если символы **на руках** — decode детерминистский (RS: 100%, RaptorQ: 99.98% при K_eff (K+3)).
 Reliability = вопрос survival (будут ли K символов живы через год), не decode.
 
 ### Таблица (annual churn 30%, p=0.7)

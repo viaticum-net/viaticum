@@ -243,8 +243,9 @@ pub struct RestoreDeniedMsg {
     pub v: u8,
     pub source_block_id: SourceBlockId,
     pub reason: String,
-    pub required_weeks: u32,
-    pub current_weeks: u32,
+    pub current_trust: f64,
+    pub needed_trust: f64,
+    pub restore_budget_gb: f64,
     pub timestamp: Timestamp,
 }
 

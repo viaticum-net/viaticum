@@ -41,13 +41,13 @@ Watcher может пропустить события (restart daemon'а, sleep
 ```
 photo_queue:    [img1.jpg, img2.jpg, ...]
 document_queue: [report.docx, notes.md, ...]
-large_files:    [video.mp4]                    // ≥256 МБ, сразу отдельно
+large_files:    [video.mp4]                    // ≥128 МБ (source_block_size), сразу отдельно
 ```
 
 ### Flush условия (любое из)
 
 ```
-1. Очередь ≥ 256 МБ         → flush сразу (полная пачка)
+1. Очередь ≥ source_block_size (128 МБ) → flush сразу (полная пачка)
 2. Нет активности 1 час    → flush что есть (юзер закончил работу)
 3. Прошло 24 часа           → flush что есть (fallback)
 
@@ -86,12 +86,12 @@ for each (path, event) in dirty_files:
 ## 4. Packing → source blocks
 
 ```
-Flush photo_queue (≥256 МБ или timer):
+Flush photo_queue (≥128 МБ или timer):
   files = photo_queue.drain()
 
-  group into batches ~256 МБ:
-    batch_1: [img1(5MB), img2(8MB), img3(3MB), ...] = ~256 МБ
-    batch_2: [img11(10MB), img12(7MB), ...]          = ~256 МБ
+  group into batches ~128 МБ:
+    batch_1: [img1(5MB), img2(8MB), img3(3MB), ...] = ~128 МБ
+    batch_2: [img11(10MB), img12(7MB), ...]          = ~128 МБ
     last_batch: [img45(3MB), img46(5MB)]              = ~8 МБ (< 50, ок)
 
   for each batch:
@@ -102,7 +102,7 @@ Flush photo_queue (≥256 МБ или timer):
     → source_block_id = blake3(ciphertext)
 
 Flush large_files:
-  for each file ≥ 256 МБ:
+  for each file ≥ 128 МБ (source_block_size):
     → compress → encrypt → own source block
 ```
 
@@ -116,19 +116,20 @@ for each source_block:
   N = K × overhead(importance)            // overhead = 1.5 + imp × 1.5
 
   // Placement
-  holders = placement_engine.select(
-    count: 15,                            // target holder count
-    weight: trust² × available_space,
-    exclude: holders_already_full,
-    max_symbols_per_holder: min(K_eff - 1, concentration_cap),  // K-1: смерть одного holder'а не убивает файл
+  holders = placement_engine.compute_allocation(
+    candidates,
+    weight: trust / sqrt(1 - trust),     // mean-variance optimum
+    max_per_holder: min(K_eff - 1, concentration_cap × N),
+    max_holders: 30,                      // MAX_HOLDERS_PER_BLOCK
+    min_symbols: 32,                      // MIN_SYMBOLS_PER_HOLDER
   )
+  // Symbols allocated proportionally to weight (NOT equally!)
 
   // ESI allocation
   esi_offset = 0
   for each holder:
-    symbols_for_holder = N / len(holders)  // roughly equal
-    esi_range = (esi_offset, symbols_for_holder)
-    esi_offset += symbols_for_holder
+    esi_range = (esi_offset, holder.symbols_allocated)
+    esi_offset += holder.symbols_allocated
 
     // Generate + encrypt + send
     for esi in esi_range:
@@ -217,12 +218,12 @@ RAM hot:
                  queue    queue   (immediate)
                     │       │        │
               ──────┼───────┼────────┼──── flush trigger:
-              │  ≥256MB / 1hr idle / 24hr fallback
+              │  ≥128MB / 1hr idle / 24hr fallback
               │  min batch: 1 МБ
                     │       │        │
                     ▼       ▼        ▼
                   batch   batch   source
-                  ~256MB   ~256MB   block
+                  ~128MB   ~128MB   block
                     │       │        │
                     └───────┼────────┘
                             ▼
@@ -234,7 +235,7 @@ RAM hot:
                             ▼
                    per-holder ChaCha20 bind
                             │
-                   placement (trust² weight)
+                   placement (trust/√(1-t) weight)
                             │
                    ┌────────┼────────┐
                    ▼        ▼        ▼
@@ -257,7 +258,7 @@ RAM hot:
   17:00 — импорт
   17:01 — watcher: 50 dirty
   17:30 — debounce expired
-  17:31 — flush: 2 batches × 256 МБ
+  17:31 — flush: 4 batches × 128 МБ
   17:35 — encode + distribute done
   Итого: 35 минут от импорта до backed up.
 
@@ -273,8 +274,8 @@ RAM hot:
 Видео 2 ГБ:
   20:00 — file created
   20:30 — debounce expired
-  20:31 — ≥ 256 МБ → immediate source block
-  20:35 — encode (K=8000, N=15600)
+  20:31 — ≥ 128 МБ (source_block_size) → 16 source blocks
+  20:35 — encode (K=2048, N≈3999 при imp=0.3)
   20:40 — distribute to 15 holders (~260 МБ each)
   ~21:00 — backed up (зависит от upload speed)
 ```

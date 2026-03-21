@@ -391,9 +391,10 @@ fn all_message_variants_frame_roundtrip() {
         Message::RestoreDenied(RestoreDeniedMsg {
             v: 1,
             source_block_id: sbid,
-            reason: "not enough tenure".to_string(),
-            required_weeks: 4,
-            current_weeks: 1,
+            reason: "insufficient trust".to_string(),
+            current_trust: 0.5,
+            needed_trust: 2.0,
+            restore_budget_gb: 11.0,
             timestamp: ts,
         }),
     ];
