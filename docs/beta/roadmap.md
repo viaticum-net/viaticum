@@ -64,6 +64,23 @@ Milestone: "два node'а, backup → restore end-to-end"
 Milestone: "repair agent реагирует на потерю символов"
 ```
 
+## Phase 2.6: trust-based escrow
+
+```
+□ Переписать escrow модуль: time-based → trust-based
+  check_restore(trust, restore_gb) вместо check_restore(weeks, bytes)
+  Формула: max_restorable_gb = FREE_TIER_GB + trust × ESCROW_TRUST_FACTOR
+  FREE_TIER_GB = 1.0 (demo credit), ESCROW_TRUST_FACTOR = 20.0 (configurable)
+□ Убрать EscrowTier enum, tier-based константы
+□ Добавить restore_budget(trust) → f64
+□ Обновить RestoreConfig: убрать weeks_in_network
+□ Обновить RestoreError::EscrowDenied: trust-based поля
+□ Новые тесты
+  GATE: hit-and-run (trust=0) blocked, honest user (trust≥2) gets full access
+
+Milestone: "escrow на базе trust, не времени"
+```
+
 ## Phase 3: cluster
 
 ```

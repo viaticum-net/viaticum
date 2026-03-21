@@ -88,7 +88,7 @@ fn encode_file(&self, path: &Path) -> impl Stream<Item = BoundSymbol>
 syncback-core/        — pure logic, no async, no network
   types               — Symbol, ESI, SymbolPlacement, DeviceId, EpochCounter...
   trust               — TrustEngine (без изменений)
-  escrow              — EscrowEngine (без изменений)
+  escrow              — EscrowChecker (trust-based, rewritten in Phase 2.6)
   placement           — SymbolBudgetEngine (бывший PlacementEngine)
   budget              — BudgetEngine (без изменений)
   messages            — wire format (обновлённый для символов)
@@ -213,6 +213,13 @@ Phase β.2.5 — PosNack + repair:
   PlacementStatus state machine (Alive/Uncertain/PresumedLost)
   RepairAgent: graduated repair trigger
   Гонка SymbolDropped vs PosNack: idempotent transitions
+
+Phase β.2.6 — Trust-based escrow:
+  Переписать escrow: time-based → trust-based
+  Формула: max_restorable_gb = FREE_TIER_GB + trust × ESCROW_TRUST_FACTOR
+  FREE_TIER_GB = 1.0, ESCROW_TRUST_FACTOR = 20.0 (configurable, calibrate later)
+  Убрать EscrowTier, tier constants. Одна непрерывная формула
+  Мотивация: время — плохой proxy для вклада, trust уже содержит время (I) + взаимность (S)
 
 Phase β.3 — Personal Cluster:
   Device registration / revocation

@@ -205,7 +205,7 @@ Lowest priority → evict first. Hysteresis: evict только если new_pri
 
 - Принимать входящие шарды (inline ShardData или iroh-blobs) если есть место и owner в allowlist
 - Отвечать на PoS challenges (hash(range + nonce) + merkle proof)
-- Escrow: проверять weeks_in_network при restore request
+- Escrow: проверять trust score при restore request (trust-based, см. §2.5 в protocol.md)
 - Shard lifecycle: active → marked-for-delete (cooldown 4wk) → deleted
 - При нехватке места: дропать по приоритетам (2.8 в overview.md)
 - Silent shards: owner замолчал — хранить если high I-score, дропать если low
@@ -308,7 +308,7 @@ Scheduler: repair check
 
 День 1-14: Восстановление файлов
   → для каждого файла: current_unit_id → скачать k шардов unit'а
-  → escrow check: I-score высокий (кумулятивный, не обнуляется) → ок
+  → escrow check: trust score высокий (I-score кумулятивный, не обнуляется) → ок
   → Reed-Solomon decode → расшифровка → извлечь файл из unit'а
   → приоритет: документы → фото → видео
 

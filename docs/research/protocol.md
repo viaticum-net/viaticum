@@ -552,10 +552,10 @@ Restore — прямое соединение через iroh, не через �
    Owner → iroh connect → запрос blob по shard_id
    Holder проверяет:
      a) ShardDescriptor.owner_pub == запрашивающий identity?
-     b) Escrow: weeks_in_network owner'а достаточно для tier?
+     b) Escrow: trust score owner'а достаточно для запрошенного объёма? (§2.5)
      c) Шард в состоянии active?
    → отдаёт blob, или отправляет restore_denied если escrow не пройден:
-       restore_denied { shard_id, reason, required_weeks, current_weeks }
+       restore_denied { shard_id, reason, current_trust, needed_trust, restore_budget_gb }
    Owner показывает пользователю "restore доступен через ~N недель" вместо retry
 
 4. Holder офлайн → пропустить, следующий
@@ -580,7 +580,7 @@ Restore — прямое соединение через iroh, не через �
 
 Фаза 3 — System state (минуты):
   → system state шарды хранятся с max redundancy (5-of-25), max priority, TTL 5 лет
-  → escrow проходит: weeks_in_network кумулятивный, не обнуляется при потере устройства
+  → escrow проходит: trust score на базе I-score (кумулятивный, не обнуляется при потере устройства)
   → скачать k шардов system state → RS decode → расшифровка
   → получаем: file manifest, shard map, trust state, peer directory
   → нода знает ВСЁ
@@ -595,7 +595,7 @@ Restore — прямое соединение через iroh, не через �
   → нода полностью функциональна
 ```
 
-**Escrow при disaster:** holder видит знакомый identity_pub, но P=0. Escrow проходит по `weeks_in_network` — этот счётчик кумулятивный и не обнуляется при потере устройства (identity сохраняется из seed phrase). Пользователь с годами в сети → weeks_in_network >> 26 → tier 3 проходит. Новичок → только demo credit (1 ГБ).
+**Escrow при disaster:** holder видит знакомый identity_pub, но P=0. Escrow проходит по trust score — I-score кумулятивный и не обнуляется при потере устройства (identity сохраняется из seed phrase). Пользователь с годами в сети → высокий I → высокий trust → restore budget достаточен. Новичок → только demo credit (1 ГБ).
 
 **Repair flow:**
 
@@ -678,7 +678,7 @@ Owner отменяет ранее отправленный delete. Если cool
 - **Restore:** holder шарда МОЖЕТ отказать в выдаче, если owner не соответствует локальным критериям holder'а.
 - Протокол гарантирует: holder не может прочитать содержимое шарда (зашифровано ключом owner'а). Holder может только хранить или удалить.
 
-Escrow — это не запрет на уровне протокола. Это ПРАВО holder'а не отдавать шард. Каждый holder решает сам, по каким критериям отдавать. Рекомендуемая реализация: по `weeks_in_network` owner'а — сколько недель он в сети (см. §2.5). I-score (кумулятивные GB·days) — отдельная метрика для disaster recovery, не для escrow порогов.
+Escrow — это не запрет на уровне протокола. Это ПРАВО holder'а не отдавать шард. Каждый holder решает сам, по каким критериям отдавать. Рекомендуемая реализация: по trust score owner'а (см. §2.5). Trust уже содержит время в сети (I-score), взаимность (S-score) и надёжность (P-score) — отдельный time-based механизм не нужен.
 
 ---
 
@@ -728,11 +728,23 @@ trust_AB = (kp × P_B + ki × I_B) × clamp(S_AB, 0.1, 1.0)
 
 ### 2.5. Escrow policy
 
-Рекомендуемые пороги для отказа в выдаче шардов:
-- Tier 1 (< 5 ГБ): после 4 недель в сети
-- Tier 2 (< 50 ГБ): после 13 недель
-- Tier 3 (> 50 ГБ): после 26 недель
-- Первый 1 ГБ: бесплатный демо-кредит
+Рекомендуемая формула: trust-based restore budget.
+
+```
+max_restorable_gb = FREE_TIER_GB + trust × ESCROW_TRUST_FACTOR
+```
+
+- `FREE_TIER_GB = 1.0` — демо-кредит, доступен сразу (trust=0)
+- `ESCROW_TRUST_FACTOR = 20.0` — конфигурируемый, GB на единицу trust (калибровать через симуляцию)
+- trust = pairwise trust score holder'а к owner'у (§2.1)
+
+Пример: owner с trust=2.0 (4 недели, хороший S) → max_restorable = 1 + 2.0×20 = 41 GB.
+
+Мотивация перехода от time-based (weeks_in_network) к trust-based:
+- Время — плохой proxy для вклада. Нода онлайн 26 недель с пустым диском проходила старый escrow.
+- Trust уже содержит время (I-score), взаимность (S-score) и надёжность (P-score).
+- Непрерывная формула вместо дискретных тиров — плавная разблокировка.
+- Gamification: "restore budget: 41 GB, храните больше — растёт" вместо "ждите 13 недель".
 
 Holder может отдать шард кому угодно и когда угодно. Или не отдать никому. Это его решение. Рекомендация — для устойчивости экономики сети.
 
