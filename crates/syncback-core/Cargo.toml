@@ -12,6 +12,7 @@ testutil = ["dep:tempfile"]
 [dependencies]
 serde = { workspace = true }
 ciborium = { workspace = true }
+toml = { workspace = true }
 blake3 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 chacha20 = { workspace = true }

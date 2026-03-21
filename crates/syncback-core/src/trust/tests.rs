@@ -420,3 +420,61 @@ fn pos_accumulates_within_same_week() {
     // P = (4+5)/(5+5) = 9/10
     assert!((score.p - 0.9).abs() < 1e-10, "p={}", score.p);
 }
+
+#[test]
+fn recent_pos_stats_no_data_returns_zeros() {
+    let engine = TrustEngine::new();
+    let p = peer(1);
+    let (challenged, passed) = engine.recent_pos_stats(&p, 10, 4);
+    assert_eq!(challenged, 0);
+    assert_eq!(passed, 0);
+}
+
+#[test]
+fn recent_pos_stats_single_week_in_window() {
+    let mut engine = TrustEngine::new();
+    let p = peer(1);
+    engine.upsert_peer(p, ts(1_000_000));
+    engine
+        .record_pos_result(p, PosOutcome { week_number: 10, challenged: 5, passed: 4 })
+        .unwrap();
+    let (challenged, passed) = engine.recent_pos_stats(&p, 10, 4);
+    assert_eq!(challenged, 5);
+    assert_eq!(passed, 4);
+}
+
+#[test]
+fn recent_pos_stats_multiple_weeks_summed() {
+    let mut engine = TrustEngine::new();
+    let p = peer(1);
+    engine.upsert_peer(p, ts(1_000_000));
+    engine
+        .record_pos_result(p, PosOutcome { week_number: 8, challenged: 3, passed: 2 })
+        .unwrap();
+    engine
+        .record_pos_result(p, PosOutcome { week_number: 9, challenged: 5, passed: 5 })
+        .unwrap();
+    engine
+        .record_pos_result(p, PosOutcome { week_number: 10, challenged: 4, passed: 3 })
+        .unwrap();
+    let (challenged, passed) = engine.recent_pos_stats(&p, 10, 4);
+    assert_eq!(challenged, 12);
+    assert_eq!(passed, 10);
+}
+
+#[test]
+fn recent_pos_stats_excludes_weeks_outside_window() {
+    let mut engine = TrustEngine::new();
+    let p = peer(1);
+    engine.upsert_peer(p, ts(1_000_000));
+    // week 5 is outside a 4-week window ending at week 10 (window: 7..=10)
+    engine
+        .record_pos_result(p, PosOutcome { week_number: 5, challenged: 10, passed: 10 })
+        .unwrap();
+    engine
+        .record_pos_result(p, PosOutcome { week_number: 9, challenged: 3, passed: 2 })
+        .unwrap();
+    let (challenged, passed) = engine.recent_pos_stats(&p, 10, 4);
+    assert_eq!(challenged, 3);
+    assert_eq!(passed, 2);
+}

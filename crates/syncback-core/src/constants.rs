@@ -169,6 +169,11 @@ pub const WILLINGNESS_FACTOR: f64 = 0.5;
 /// Rolling window for weekly placement stats.
 pub const WEEKLY_STATS_WINDOW: u32 = 4;
 
+// === Cluster ===
+
+/// Default max events per cluster sync batch.
+pub const DEFAULT_CLUSTER_SYNC_BATCH_SIZE: usize = 100;
+
 // === Relay board limits ===
 
 /// Max entries per relay board (from protocol.md §1.5).
@@ -186,6 +191,45 @@ pub const POS_CONSECUTIVE_MISS_UNCERTAIN: u32 = 1;
 /// Number of consecutive PoS timeouts before a placement is marked PresumedLost.
 /// 3+ consecutive misses → PresumedLost → triggers repair.
 pub const POS_CONSECUTIVE_MISS_PRESUMED_LOST: u32 = 3;
+
+// === Commitment telemetry ===
+
+/// Weight of PoS pass rate in commitment score.
+pub const COMMITMENT_POS_WEIGHT: f64 = 0.5;
+
+/// Weight of disk pressure signal in commitment score.
+pub const COMMITMENT_PRESSURE_WEIGHT: f64 = 0.25;
+
+/// Weight of relationship age signal in commitment score.
+pub const COMMITMENT_AGE_WEIGHT: f64 = 0.15;
+
+/// Weight of eviction priority of our data at the holder's node.
+pub const COMMITMENT_PRIORITY_WEIGHT: f64 = 0.10;
+
+/// Weeks of relationship needed to reach full age signal (1.0).
+pub const COMMITMENT_AGE_SATURATION_WEEKS: f64 = 26.0;
+
+/// Minimum PoS challenges required for the pass rate to count.
+/// Below this: treat as if pass rate were 0. Prevents "no challenges = pass_rate=1.0".
+pub const COMMITMENT_MIN_CHALLENGES: u32 = 1;
+
+/// Eviction priority threshold below which commitment takes a penalty.
+/// Set to 0.0 to disable the relative penalty (use only absolute priority).
+pub const COMMITMENT_PRIORITY_FLOOR: f64 = 0.0;
+
+// === Reliability forecast ===
+
+/// Default assumed annual churn (30%). Used when no per-holder commitment data
+/// is available. Matches the calibration table in docs/beta/raptorq.md.
+pub const DEFAULT_ANNUAL_CHURN_RATE: f64 = 0.30;
+
+/// Reliability threshold below which a block is flagged needs_repair.
+/// 99.0% = two nines. Blocks below this get flagged in ReliabilityReport.
+pub const RELIABILITY_REPAIR_THRESHOLD: f64 = 0.99;
+
+/// Small N threshold: use exact binomial CDF for N < this value, normal
+/// approximation for N >= this value.
+pub const BINOMIAL_EXACT_THRESHOLD: u32 = 100;
 
 // === Compile-time sanity checks ===
 

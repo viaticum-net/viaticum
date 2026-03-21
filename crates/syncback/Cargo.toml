@@ -9,6 +9,8 @@ rust-version.workspace = true
 [dependencies]
 syncback-core = { workspace = true, features = ["testutil"] }
 tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

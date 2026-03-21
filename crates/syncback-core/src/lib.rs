@@ -4,12 +4,16 @@
 
 pub mod budget;
 pub mod cluster;
+pub mod commitment;
+pub mod deletion;
+pub mod config;
 pub mod constants;
 pub mod db;
 pub mod erasure;
 pub mod escrow;
 pub mod messages;
 pub mod placement;
+pub mod reliability;
 pub mod pos;
 pub mod trust;
 pub mod types;

@@ -229,7 +229,7 @@ fn unknown_trust(_: &IdentityPub) -> f64 {
 #[test]
 fn evaluate_pressure_normal() {
     // quota=100 GiB, used=80 GiB → free_ratio=0.20 → Normal
-    let result = evaluate_pressure(gib(100), gib(80), &[], unknown_trust, 0);
+    let result = evaluate_pressure(gib(100), 0, gib(80), &[], unknown_trust, 0);
     assert_eq!(result.pressure, DiskPressure::Normal);
     assert!(result.immediate_evictions.is_empty());
     assert!(result.drop_notices.is_empty());
@@ -239,7 +239,7 @@ fn evaluate_pressure_normal() {
 #[test]
 fn evaluate_pressure_soft() {
     // quota=100 GiB, used=88 GiB → free_ratio=0.12 → Soft
-    let result = evaluate_pressure(gib(100), gib(88), &[], unknown_trust, 0);
+    let result = evaluate_pressure(gib(100), 0, gib(88), &[], unknown_trust, 0);
     assert_eq!(result.pressure, DiskPressure::Soft);
     assert!(result.immediate_evictions.is_empty());
     assert!(result.drop_notices.is_empty());
@@ -290,7 +290,7 @@ fn evaluate_pressure_hard_evicts_lowest_priority() {
         }
     };
 
-    let result = evaluate_pressure(gib(100), gib(97), &holdings, trust_fn, now_secs);
+    let result = evaluate_pressure(gib(100), 0, gib(97), &holdings, trust_fn, now_secs);
     assert_eq!(result.pressure, DiskPressure::Hard);
 
     // Evict order: A (priority=0.05), C (priority=0.25), B (priority=0.81)
@@ -321,4 +321,181 @@ fn should_reject_offers_above_soft() {
 fn should_reject_offers_unlimited_quota() {
     // quota=0 → unlimited → false
     assert!(!should_reject_offers(0, gib(999)));
+}
+
+// ============================================================
+// compute_effective_quota
+// ============================================================
+
+#[test]
+fn compute_effective_quota_no_soft_cap() {
+    // soft_quota=0 (unlimited), disk_free=100 GiB, reserve=20 GiB → 80 GiB
+    let result = compute_effective_quota(0, gib(100), gib(20));
+    assert_eq!(result, gib(80));
+}
+
+#[test]
+fn compute_effective_quota_soft_cap_is_tighter() {
+    // soft_quota=50 GiB, disk_free=200 GiB, reserve=20 GiB
+    // available_from_disk=180 GiB, effective=min(50,180)=50 GiB
+    let result = compute_effective_quota(gib(50), gib(200), gib(20));
+    assert_eq!(result, gib(50));
+}
+
+#[test]
+fn compute_effective_quota_disk_free_is_tighter() {
+    // soft_quota=100 GiB, disk_free=30 GiB, reserve=20 GiB
+    // available_from_disk=10 GiB, effective=min(100,10)=10 GiB
+    let result = compute_effective_quota(gib(100), gib(30), gib(20));
+    assert_eq!(result, gib(10));
+}
+
+#[test]
+fn compute_effective_quota_disk_critically_full() {
+    // soft_quota=0, disk_free=10 GiB, reserve=20 GiB → saturating_sub → 0
+    let result = compute_effective_quota(0, gib(10), gib(20));
+    assert_eq!(result, 0);
+}
+
+#[test]
+fn compute_effective_quota_soft_cap_zero_and_disk_large() {
+    // soft_quota=0, disk_free=1000 GiB, reserve=20 GiB → 980 GiB
+    let result = compute_effective_quota(0, gib(1000), gib(20));
+    assert_eq!(result, gib(980));
+}
+
+#[test]
+fn compute_effective_quota_exact_reserve_boundary() {
+    // soft_quota=0, disk_free=20 GiB, reserve=20 GiB → 20-20=0
+    let result = compute_effective_quota(0, gib(20), gib(20));
+    assert_eq!(result, 0);
+}
+
+// ============================================================
+// evaluate_pressure with hard_quota
+// ============================================================
+
+#[test]
+fn evaluate_pressure_hard_quota_prevents_eviction() {
+    // quota=100 GiB, hard_quota=100 GiB (floor=entire quota → nothing can be evicted)
+    // used=97 GiB → free_ratio=0.03 → Hard
+    // Evicting A (5 GiB) would leave 92 GiB < 100 GiB floor → skip
+    let now_secs = 0u64;
+    let holdings = vec![make_holding(
+        [0u8; 32],
+        [1u8; 32],
+        0.1,
+        gib(5),
+        HoldingStatus::Active,
+        Timestamp(now_secs),
+    )];
+    let trust_fn = |_: &IdentityPub| -> f64 { 0.5 };
+    let result = evaluate_pressure(gib(100), gib(100), gib(97), &holdings, trust_fn, now_secs);
+    assert_eq!(result.pressure, DiskPressure::Hard);
+    assert!(
+        result.immediate_evictions.is_empty(),
+        "hard_quota floor must block eviction"
+    );
+    assert_eq!(result.freed_bytes, 0);
+}
+
+#[test]
+fn evaluate_pressure_hard_quota_partial_eviction() {
+    // quota=100 GiB, hard_quota=90 GiB (can free down to 90 GiB usage)
+    // used=97 GiB → Hard, deficit=12 GiB
+    // A: importance=0.1, trust=0.5 → priority=0.05, 5 GiB
+    // B: importance=0.9, trust=0.9 → priority=0.81, 5 GiB
+    // Evict A: projected_used=92 >= 90 → allowed. freed=5 GiB.
+    // Evict B: projected_used=87 < 90 → SKIP.
+    let now_secs = 0u64;
+    let holdings = vec![
+        make_holding(
+            [0u8; 32],
+            [1u8; 32],
+            0.1,
+            gib(5),
+            HoldingStatus::Active,
+            Timestamp(now_secs),
+        ),
+        make_holding(
+            [1u8; 32],
+            [2u8; 32],
+            0.9,
+            gib(5),
+            HoldingStatus::Active,
+            Timestamp(now_secs),
+        ),
+    ];
+    let trust_fn = |id: &IdentityPub| -> f64 {
+        if id.0 == [1u8; 32] { 0.5 } else { 0.9 }
+    };
+    let result = evaluate_pressure(gib(100), gib(90), gib(97), &holdings, trust_fn, now_secs);
+    assert_eq!(result.pressure, DiskPressure::Hard);
+    assert_eq!(
+        result.immediate_evictions.len(),
+        1,
+        "only A should be evicted"
+    );
+    assert_eq!(
+        result.immediate_evictions[0].source_block_id,
+        SourceBlockId([0u8; 32])
+    );
+    assert_eq!(result.freed_bytes, gib(5));
+}
+
+#[test]
+fn evaluate_pressure_hard_quota_zero_disables_floor() {
+    // hard_quota=0 → no floor, same as before
+    // quota=100 GiB, used=97 GiB → Hard, deficit=12 GiB
+    // A+C+B = 15 GiB freed (all three evicted)
+    let now_secs = 0u64;
+    let holdings = vec![
+        make_holding(
+            [0u8; 32],
+            [1u8; 32],
+            0.1,
+            gib(5),
+            HoldingStatus::Active,
+            Timestamp(now_secs),
+        ),
+        make_holding(
+            [1u8; 32],
+            [2u8; 32],
+            0.9,
+            gib(5),
+            HoldingStatus::Active,
+            Timestamp(now_secs),
+        ),
+        make_holding(
+            [2u8; 32],
+            [3u8; 32],
+            0.5,
+            gib(5),
+            HoldingStatus::Active,
+            Timestamp(now_secs),
+        ),
+    ];
+    let trust_fn = |id: &IdentityPub| -> f64 {
+        if id.0 == [1u8; 32] { 0.5 }
+        else if id.0 == [2u8; 32] { 0.9 }
+        else { 0.5 }
+    };
+    let result = evaluate_pressure(gib(100), 0, gib(97), &holdings, trust_fn, now_secs);
+    assert_eq!(result.pressure, DiskPressure::Hard);
+    assert_eq!(
+        result.immediate_evictions.len(),
+        3,
+        "all three evicted when no floor"
+    );
+    assert_eq!(result.freed_bytes, gib(15));
+}
+
+#[test]
+fn should_reject_offers_with_effective_quota() {
+    // soft_quota=80 GiB, disk_free=50 GiB, reserve=20 GiB
+    // effective = min(80, 30) = 30 GiB
+    // used=26 GiB, free_ratio=(30-26)/30 ≈ 0.133 < 0.15 → true
+    let effective = compute_effective_quota(gib(80), gib(50), gib(20));
+    assert_eq!(effective, gib(30));
+    assert!(should_reject_offers(effective, gib(26)));
 }

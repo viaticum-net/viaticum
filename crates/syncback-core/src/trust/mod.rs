@@ -275,6 +275,21 @@ impl TrustEngine {
         result
     }
 
+    /// Returns (total_challenged, total_passed) for the last `weeks` weeks ending at `current_week`.
+    /// If no data for the period, returns (0, 0).
+    pub fn recent_pos_stats(&self, peer: &IdentityPub, current_week: u32, weeks: u32) -> (u32, u32) {
+        let window_start = current_week.saturating_sub(weeks.saturating_sub(1));
+        let mut total_challenged = 0u32;
+        let mut total_passed = 0u32;
+        for week in window_start..=current_week {
+            if let Some(rec) = self.pos_weekly.get(&(*peer, week)) {
+                total_challenged = total_challenged.saturating_add(rec.challenged);
+                total_passed = total_passed.saturating_add(rec.passed);
+            }
+        }
+        (total_challenged, total_passed)
+    }
+
     pub fn zero_trust(&mut self, peer: &IdentityPub) -> Result<(), TrustError> {
         let record = self
             .peers

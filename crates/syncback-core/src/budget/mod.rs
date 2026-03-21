@@ -227,15 +227,40 @@ pub fn record_placement_outcome(
     r
 }
 
+/// Compute the effective storage quota for held symbols.
+///
+/// soft_quota:   user-configured cap in bytes. 0 = unlimited (no cap).
+/// disk_free:    current free bytes on the filesystem partition (passed in
+///               by caller — this function does NOT query the OS).
+/// disk_reserve: minimum free bytes to keep on the filesystem. Typically
+///               DEFAULT_DISK_RESERVE_BYTES (20 GB).
+///
+/// Formula:
+///   available_from_disk = disk_free.saturating_sub(disk_reserve)
+///   if soft_quota == 0 { available_from_disk }
+///   else               { soft_quota.min(available_from_disk) }
+pub fn compute_effective_quota(soft_quota: u64, disk_free: u64, disk_reserve: u64) -> u64 {
+    let available_from_disk = disk_free.saturating_sub(disk_reserve);
+    if soft_quota == 0 {
+        available_from_disk
+    } else {
+        soft_quota.min(available_from_disk)
+    }
+}
+
 /// Evaluate disk pressure and compute eviction targets.
 ///
-/// quota_bytes: storage quota (from config). 0 = unlimited (returns Normal always).
-/// used_bytes: current bytes used by all held symbols.
-/// holdings: all HoldingRecord entries (caller loads from DB).
-/// owner_trust: closure providing combined trust score for an owner.
-/// now_secs: current Unix timestamp.
+/// quota_bytes:      effective quota (call compute_effective_quota first).
+///                   0 = unlimited (returns Normal always).
+/// hard_quota_bytes: eviction floor. Never evict if remaining usage would
+///                   drop below this. 0 = disabled (no floor).
+/// used_bytes:       current bytes used by all held symbols.
+/// holdings:         all HoldingRecord entries (caller loads from DB).
+/// owner_trust:      closure providing combined trust score for an owner.
+/// now_secs:         current Unix timestamp.
 pub fn evaluate_pressure(
     quota_bytes: u64,
+    hard_quota_bytes: u64,
     used_bytes: u64,
     holdings: &[HoldingRecord],
     owner_trust: impl Fn(&IdentityPub) -> f64,
@@ -316,6 +341,10 @@ pub fn evaluate_pressure(
     for candidate in &candidates {
         if !phase1_done {
             if freed_bytes < deficit_bytes {
+                let projected_used = used_bytes.saturating_sub(freed_bytes).saturating_sub(candidate.record.total_bytes);
+                if hard_quota_bytes > 0 && projected_used < hard_quota_bytes {
+                    continue;
+                }
                 freed_bytes += candidate.record.total_bytes;
                 immediate_evictions.push(EvictionTarget {
                     source_block_id: candidate.record.source_block_id,
