@@ -7,7 +7,7 @@ use sha2::Sha256;
 use crate::types::{ErasureParams, IdentityPub, SourceBlockId};
 
 /// One encoding symbol: ESI (which symbol) + T bytes of data.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Symbol {
     pub esi: u32,
     /// Always exactly ErasureParams.t bytes.
