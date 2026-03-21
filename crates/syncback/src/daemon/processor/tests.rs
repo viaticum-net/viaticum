@@ -1033,3 +1033,122 @@ async fn symbol_reject_logs_without_error() {
         .await
         .expect("handle_symbol_reject should return Ok");
 }
+
+// ─── Phase 7.10: peer gossip on connect ───────────────────────────────────────
+
+/// A valid Ed25519 public key (iroh-compatible) for use in tests.
+///
+/// Returns both the 32-byte seed and the resulting public key bytes.
+fn make_valid_iroh_node_id() -> syncback_core::types::NodeId {
+    use syncback_core::types::NodeId;
+    // Use a deterministic key: derive from a known signing key so the 32 bytes
+    // are a valid Ed25519 (and therefore valid iroh PublicKey) byte sequence.
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    NodeId(sk.verifying_key().to_bytes())
+}
+
+#[tokio::test]
+async fn peer_announce_with_valid_node_id_registers_in_network() {
+    // When handle_peer_announce receives a PeerAnnounceMsg whose NodeId is a
+    // valid iroh PublicKey, it should call network.add_peer() so the peer can
+    // be reached via get_connection() in the future.
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let identity = make_identity(50);
+    let valid_node_id = make_valid_iroh_node_id();
+
+    let msg = PeerAnnounceMsg {
+        v: 1,
+        identity_pub: identity,
+        node_id: valid_node_id,
+        timestamp: Timestamp::now(),
+        sig: [0u8; 64],
+    };
+
+    processor
+        .handle_peer_announce(msg)
+        .await
+        .expect("handle_peer_announce should succeed with valid NodeId");
+
+    // DB record should be created.
+    let record = db.get_peer(&identity).unwrap();
+    assert!(record.is_some(), "PeerRecord should have been created");
+    assert_eq!(record.unwrap().node_id, Some(valid_node_id));
+
+    // The peer should now be in network's known_peers directory.
+    assert!(
+        processor.network.has_known_peer(&identity).await,
+        "peer should be registered in network after PeerAnnounce with valid NodeId"
+    );
+}
+
+#[tokio::test]
+async fn peer_announce_db_upsert_succeeds_regardless_of_node_id_validity() {
+    // handle_peer_announce must always succeed and upsert the DB record
+    // regardless of whether the NodeId bytes form a valid iroh PublicKey.
+    // For invalid NodeIds the network.add_peer() is skipped gracefully.
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let identity = make_identity(51);
+    // All-zeros is a special case: the identity point of the Ed25519 group —
+    // iroh may or may not accept it as valid, but handle_peer_announce must
+    // succeed either way.
+    use syncback_core::types::NodeId;
+    let node_id = NodeId([0u8; 32]);
+
+    let msg = PeerAnnounceMsg {
+        v: 1,
+        identity_pub: identity,
+        node_id,
+        timestamp: Timestamp::now(),
+        sig: [0u8; 64],
+    };
+
+    processor
+        .handle_peer_announce(msg)
+        .await
+        .expect("handle_peer_announce should return Ok regardless of NodeId validity");
+
+    // DB record must be created in all cases.
+    let record = db.get_peer(&identity).unwrap();
+    assert!(record.is_some(), "PeerRecord should have been created");
+    assert_eq!(record.unwrap().node_id, Some(node_id));
+}
+
+#[tokio::test]
+async fn build_peer_announce_produces_message_with_our_identity() {
+    // NetworkHandle::build_peer_announce should return a PeerAnnounceMsg
+    // whose identity_pub and node_id match the network handle's own values.
+    let network = make_network().await;
+    let now = Timestamp::now();
+
+    let msg = network.build_peer_announce(now);
+
+    assert_eq!(
+        msg.identity_pub, network.identity_pub,
+        "identity_pub should match our own identity"
+    );
+    assert_eq!(
+        msg.node_id, network.node_id,
+        "node_id should match our iroh NodeId"
+    );
+    assert_eq!(msg.v, 1, "version should be 1");
+}
+
+#[tokio::test]
+async fn build_peer_announce_signature_is_verifiable() {
+    // The signature on the PeerAnnounceMsg built by NetworkHandle must verify
+    // against the identity_pub embedded in the message.
+    use syncback_core::messages::verify_peer_announce;
+
+    let network = make_network().await;
+    let msg = network.build_peer_announce(Timestamp::now());
+
+    verify_peer_announce(&msg).expect("PeerAnnounce signature should verify successfully");
+}
