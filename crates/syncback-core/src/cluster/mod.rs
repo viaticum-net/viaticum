@@ -110,6 +110,24 @@ pub fn derive_device_key(
     Ok(ed25519_dalek::SigningKey::from_bytes(&okm))
 }
 
+/// Derive iroh transport secret key from seed + device_id.
+///
+/// HKDF-SHA256(ikm=seed_bytes, salt=device_id.0, info=b"syncback-iroh-ed25519") → 32 bytes
+/// The returned bytes are used directly as an iroh::SecretKey.
+///
+/// Separate from derive_device_key (different domain string), so the iroh NodeId
+/// is independent from the SyncBack protocol identity.
+pub fn derive_iroh_key(
+    seed_bytes: &[u8],
+    device_id: &DeviceId,
+) -> Result<[u8; 32], ClusterError> {
+    let hk = Hkdf::<Sha256>::new(Some(&device_id.0), seed_bytes);
+    let mut okm = [0u8; 32];
+    hk.expand(b"syncback-iroh-ed25519", &mut okm)
+        .map_err(|e| ClusterError::KeyDerivation(e.to_string()))?;
+    Ok(okm)
+}
+
 /// Derive epoch encryption key.
 ///
 /// HKDF-SHA256(ikm=seed_bytes, salt=epoch.0.to_be_bytes(), info=b"syncback-encryption") → 32 bytes

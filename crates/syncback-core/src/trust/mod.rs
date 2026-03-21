@@ -112,6 +112,7 @@ impl TrustEngine {
                 last_seen: now,
                 device_id: None,
                 revoked_device_pub_keys: vec![],
+                addrs: vec![],
             };
             self.peers.insert(peer, record);
         }

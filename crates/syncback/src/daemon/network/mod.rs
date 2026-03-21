@@ -21,13 +21,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
-use iroh::{Endpoint, EndpointAddr, RelayMode};
+use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey as IrohSecretKey};
 use syncback_core::constants::ALPN;
 use syncback_core::messages::{Message, SymbolTransferMsg};
 use syncback_core::types::{IdentityPub, NodeId};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
+pub mod addr;
 pub mod connection;
 mod handshake;
 
@@ -90,6 +91,9 @@ pub struct NetworkConfig {
     /// When present, included in the SyncBack handshake so partners can
     /// identify which cluster master identity this node belongs to.
     pub device_cert: Option<syncback_core::cluster::DeviceCertificate>,
+    /// When Some, the iroh endpoint uses this key (stable NodeId).
+    /// When None, iroh generates a random key (ephemeral NodeId — tests only).
+    pub iroh_secret_key: Option<IrohSecretKey>,
 }
 
 // ─── Connection pool ──────────────────────────────────────────────────────────
@@ -134,9 +138,15 @@ impl NetworkHandle {
     ) -> Result<Self, NetworkError> {
         let identity_pub = IdentityPub(config.signing_key.verifying_key().to_bytes());
 
-        let endpoint = Endpoint::builder()
+        let mut builder = Endpoint::builder()
             .alpns(vec![ALPN.to_vec()])
-            .relay_mode(RelayMode::Disabled)
+            .relay_mode(RelayMode::Disabled);
+
+        if let Some(key) = config.iroh_secret_key {
+            builder = builder.secret_key(key);
+        }
+
+        let endpoint = builder
             .bind()
             .await
             .map_err(|e| NetworkError::Iroh(anyhow::anyhow!("{e}")))?;

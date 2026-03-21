@@ -16,7 +16,7 @@ use syncback_core::messages::{
     verify_handshake,
 };
 use syncback_core::erasure::Symbol;
-use syncback_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp};
+use syncback_core::types::{DeviceId, IdentityPub, NodeId, SourceBlockId, Timestamp};
 
 use crate::daemon::network::{NetworkConfig, NetworkError, NetworkHandle};
 
@@ -35,6 +35,7 @@ fn make_config(signing_key: SigningKey) -> NetworkConfig {
         signing_key,
         known_peers: HashMap::new(),
         device_cert: None,
+        iroh_secret_key: None,
     }
 }
 
@@ -348,6 +349,7 @@ async fn handshake_initiator_includes_device_cert() {
         signing_key: device_key,
         known_peers: HashMap::new(),
         device_cert: Some(cert),
+        iroh_secret_key: None,
     };
 
     // Node B is a plain single-device node.
@@ -436,6 +438,67 @@ async fn handshake_without_cert_peer_master_identity_is_none() {
     handle_b.shutdown().await;
 }
 
+// ─── addr format tests ────────────────────────────────────────────────────────
+
+use crate::daemon::network::addr::{format_node_addr, parse_node_addr, AddrParseError};
+
+#[test]
+fn format_and_parse_roundtrip_ipv4() {
+    let node_id = NodeId([0xab; 32]);
+    let addr: std::net::SocketAddr = "192.168.1.5:12345".parse().unwrap();
+    let formatted = format_node_addr(&node_id, addr);
+    let (parsed_id, parsed_addr) = parse_node_addr(&formatted).unwrap();
+    assert_eq!(parsed_id, node_id);
+    assert_eq!(parsed_addr, addr);
+}
+
+#[test]
+fn format_and_parse_roundtrip_ipv6() {
+    let node_id = NodeId([0x01; 32]);
+    let addr: std::net::SocketAddr = "[::1]:9000".parse().unwrap();
+    let formatted = format_node_addr(&node_id, addr);
+    let (parsed_id, parsed_addr) = parse_node_addr(&formatted).unwrap();
+    assert_eq!(parsed_id, node_id);
+    assert_eq!(parsed_addr, addr);
+}
+
+#[test]
+fn format_node_addr_produces_64_hex_prefix() {
+    let node_id = NodeId([0u8; 32]);
+    let addr: std::net::SocketAddr = "127.0.0.1:1234".parse().unwrap();
+    let formatted = format_node_addr(&node_id, addr);
+    let hex_part = formatted.split('@').next().unwrap();
+    assert_eq!(hex_part.len(), 64, "NodeId hex must be 64 chars");
+    assert_eq!(hex_part, "0".repeat(64), "all-zero NodeId encodes as 64 zeros");
+}
+
+#[test]
+fn parse_node_addr_rejects_missing_at() {
+    let result = parse_node_addr("abcd1234noatsign");
+    assert!(matches!(result, Err(AddrParseError::MissingAt)));
+}
+
+#[test]
+fn parse_node_addr_rejects_short_node_id() {
+    let result = parse_node_addr("abcd1234@127.0.0.1:1234");
+    assert!(matches!(result, Err(AddrParseError::BadNodeIdLength(_))));
+}
+
+#[test]
+fn parse_node_addr_rejects_non_hex_node_id() {
+    let bad: String = "z".repeat(64) + "@127.0.0.1:1234";
+    let result = parse_node_addr(&bad);
+    assert!(matches!(result, Err(AddrParseError::BadNodeIdHex(_))));
+}
+
+#[test]
+fn parse_node_addr_rejects_bad_socket_addr() {
+    let node_id_hex = "ab".repeat(32);
+    let s = format!("{node_id_hex}@not_a_valid_addr");
+    let result = parse_node_addr(&s);
+    assert!(matches!(result, Err(AddrParseError::BadSocketAddr(_))));
+}
+
 // ─── Test 10: PeerRecord.is_device_revoked ────────────────────────────────────
 
 #[test]
@@ -455,6 +518,7 @@ fn revocation_check_rejects_revoked_device_pub_key() {
         last_seen: Timestamp(0),
         device_id: None,
         revoked_device_pub_keys: vec![revoked_pub],
+        addrs: vec![],
     };
 
     assert!(
@@ -485,6 +549,7 @@ fn peer_record_revoked_device_pub_keys_default_empty() {
         last_seen: Timestamp(0),
         device_id: None,
         revoked_device_pub_keys: vec![],
+        addrs: vec![],
     };
 
     // Round-trip through CBOR.

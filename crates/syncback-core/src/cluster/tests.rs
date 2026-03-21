@@ -486,7 +486,7 @@ mod cluster_state_tests {
 #[cfg(test)]
 mod tests {
     use crate::cluster::{
-        derive_device_key, derive_epoch_key, derive_master_key, epoch_for_time,
+        derive_device_key, derive_epoch_key, derive_iroh_key, derive_master_key, epoch_for_time,
         esi_namespace_end, esi_namespace_start, issue_device_certificate, issue_revocation,
         master_identity, next_epoch, verify_device_certificate, verify_revocation, ClusterError,
         EpochCounter,
@@ -630,6 +630,47 @@ mod tests {
         }
         assert_eq!(esi_namespace_start(15), 15 * (1 << 20));
         assert_eq!(esi_namespace_end(15), 16 * (1 << 20));
+    }
+
+    // ============================================================
+    // derive_iroh_key tests
+    // ============================================================
+
+    #[test]
+    fn derive_iroh_key_is_deterministic() {
+        let seed = [42u8; 64];
+        let device_id = DeviceId([1u8; 16]);
+        let key1 = derive_iroh_key(&seed, &device_id).unwrap();
+        let key2 = derive_iroh_key(&seed, &device_id).unwrap();
+        assert_eq!(key1, key2, "same seed+device_id must produce same iroh key");
+    }
+
+    #[test]
+    fn derive_iroh_key_differs_per_device() {
+        let seed = [42u8; 64];
+        let device_a = DeviceId([1u8; 16]);
+        let device_b = DeviceId([2u8; 16]);
+        let key_a = derive_iroh_key(&seed, &device_a).unwrap();
+        let key_b = derive_iroh_key(&seed, &device_b).unwrap();
+        assert_ne!(key_a, key_b, "different device_ids must produce different iroh keys");
+    }
+
+    #[test]
+    fn derive_iroh_key_differs_from_device_key() {
+        let seed = [42u8; 64];
+        let device_id = DeviceId([1u8; 16]);
+        let iroh_bytes = derive_iroh_key(&seed, &device_id).unwrap();
+        let device_signing = derive_device_key(&seed, &device_id).unwrap();
+        let device_bytes = device_signing.to_bytes();
+        assert_ne!(iroh_bytes, device_bytes, "iroh key must differ from device signing key");
+    }
+
+    #[test]
+    fn derive_iroh_key_output_is_32_bytes() {
+        let seed = [0u8; 32];
+        let device_id = DeviceId([0u8; 16]);
+        let key = derive_iroh_key(&seed, &device_id).unwrap();
+        assert_eq!(key.len(), 32);
     }
 
     #[test]

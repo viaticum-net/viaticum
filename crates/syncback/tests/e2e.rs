@@ -80,6 +80,7 @@ async fn make_network_handle() -> NetworkHandle {
             signing_key: sk,
             known_peers: HashMap::new(),
             device_cert: None,
+            iroh_secret_key: None,
         },
         tx,
     )
@@ -378,6 +379,7 @@ async fn full_lifecycle_e2e() {
         last_seen: NOW,
         device_id: None,
         revoked_device_pub_keys: vec![],
+        addrs: vec![],
     };
     peer.revoked_device_pub_keys.push(b_device_pub);
 

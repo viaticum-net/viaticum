@@ -65,6 +65,7 @@ async fn test_restore_coord(
         signing_key: signing_key.clone(),
         known_peers: Default::default(),
         device_cert: None,
+        iroh_secret_key: None,
     };
     let network = NetworkHandle::start(config_net, tx)
         .await
@@ -93,6 +94,7 @@ async fn test_restore_coord(
             signing_key: signing_key2,
             known_peers: Default::default(),
             device_cert: None,
+            iroh_secret_key: None,
         },
         tx2,
     )

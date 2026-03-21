@@ -335,6 +335,9 @@ pub struct PeerRecord {
     /// Populated when we receive a valid RevocationBroadcast via relay board.
     #[serde(default)]
     pub revoked_device_pub_keys: Vec<[u8; 32]>,
+    /// Known addresses in "NodeId_hex@ip:port" format.
+    #[serde(default)]
+    pub addrs: Vec<String>,
 }
 
 impl PeerRecord {

@@ -159,8 +159,8 @@ fn derive_keys_deterministic() {
     let dir = tmp_dir();
     let keyfile = init_identity(dir.path()).expect("init_identity");
 
-    let (master1, device1, epoch1) = derive_keys(&keyfile, 0).expect("derive_keys first");
-    let (master2, device2, epoch2) = derive_keys(&keyfile, 0).expect("derive_keys second");
+    let (master1, device1, epoch1, _) = derive_keys(&keyfile, 0).expect("derive_keys first");
+    let (master2, device2, epoch2, _) = derive_keys(&keyfile, 0).expect("derive_keys second");
 
     assert_eq!(
         master1.verifying_key().to_bytes(),
@@ -180,8 +180,8 @@ fn derive_keys_differ_per_epoch() {
     let dir = tmp_dir();
     let keyfile = init_identity(dir.path()).expect("init_identity");
 
-    let (_, _, epoch_key_0) = derive_keys(&keyfile, 0).expect("derive epoch 0");
-    let (_, _, epoch_key_1) = derive_keys(&keyfile, 1).expect("derive epoch 1");
+    let (_, _, epoch_key_0, _) = derive_keys(&keyfile, 0).expect("derive epoch 0");
+    let (_, _, epoch_key_1, _) = derive_keys(&keyfile, 1).expect("derive epoch 1");
 
     assert_ne!(epoch_key_0, epoch_key_1, "different epochs must produce different epoch keys");
 }
@@ -191,11 +191,44 @@ fn derive_keys_master_matches_identity_pub() {
     let dir = tmp_dir();
     let keyfile = init_identity(dir.path()).expect("init_identity");
 
-    let (master_key, _, _) = derive_keys(&keyfile, 0).expect("derive_keys");
+    let (master_key, _, _, _) = derive_keys(&keyfile, 0).expect("derive_keys");
     let derived_pub = master_key.verifying_key().to_bytes();
 
     assert_eq!(
         derived_pub, keyfile.identity_pub,
         "master verifying key must match stored identity_pub"
+    );
+}
+
+// ============================================================
+// derive_keys iroh key tests
+// ============================================================
+
+#[test]
+fn derive_keys_returns_iroh_key() {
+    let dir = tmp_dir();
+    let keyfile = init_identity(dir.path()).expect("init_identity");
+    let (_master, _device, _epoch, iroh) = derive_keys(&keyfile, 0).expect("derive_keys");
+    assert_eq!(iroh.len(), 32, "iroh key must be 32 bytes");
+}
+
+#[test]
+fn derive_keys_iroh_key_is_deterministic() {
+    let dir = tmp_dir();
+    let keyfile = init_identity(dir.path()).expect("init_identity");
+    let (_, _, _, iroh1) = derive_keys(&keyfile, 0).expect("first call");
+    let (_, _, _, iroh2) = derive_keys(&keyfile, 0).expect("second call");
+    assert_eq!(iroh1, iroh2, "iroh key must be deterministic");
+}
+
+#[test]
+fn derive_keys_iroh_key_differs_from_device_key() {
+    let dir = tmp_dir();
+    let keyfile = init_identity(dir.path()).expect("init_identity");
+    let (_, device, _, iroh) = derive_keys(&keyfile, 0).expect("derive_keys");
+    assert_ne!(
+        iroh,
+        device.to_bytes(),
+        "iroh key bytes must differ from device signing key bytes"
     );
 }

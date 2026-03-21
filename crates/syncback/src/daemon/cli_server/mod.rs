@@ -252,8 +252,37 @@ fn dispatch_status(state: &DaemonState) -> CliResponse {
     let node_addr = state
         .network
         .local_addr()
-        .map(|a| format!("{a:?}"))
-        .unwrap_or_default();
+        .ok()
+        .and_then(|endpoint_addr| {
+            // EndpointAddr.addrs is a BTreeSet<TransportAddr>; filter for Ip variants.
+            let mut ip_addrs = endpoint_addr.addrs.iter().filter_map(|a| match a {
+                iroh::TransportAddr::Ip(addr) => Some(*addr),
+                _ => None,
+            });
+            ip_addrs
+                .find(|a| !a.ip().is_loopback())
+                .or_else(|| {
+                    endpoint_addr.addrs.iter().find_map(|a| match a {
+                        iroh::TransportAddr::Ip(addr) => Some(*addr),
+                        _ => None,
+                    })
+                })
+                .map(|socket_addr| {
+                    crate::daemon::network::addr::format_node_addr(
+                        &state.network.node_id,
+                        socket_addr,
+                    )
+                })
+        })
+        .unwrap_or_else(|| {
+            state
+                .network
+                .node_id
+                .0
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        });
 
     CliResponse::Status(StatusData {
         node_identity,

@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use syncback_core::cluster::{derive_device_key, derive_epoch_key, derive_master_key, master_identity, EpochCounter};
+use syncback_core::cluster::{derive_device_key, derive_epoch_key, derive_iroh_key, derive_master_key, master_identity, EpochCounter};
 use syncback_core::types::DeviceId;
 
 #[cfg(test)]
@@ -111,23 +111,26 @@ pub fn load_identity(data_dir: &Path) -> Result<IdentityKeyFile, IdentityError> 
     ciborium::de::from_reader(bytes.as_slice()).map_err(|e| IdentityError::Cbor(e.to_string()))
 }
 
-/// Derive the three active keys from a loaded keyfile for a given epoch.
+/// Derive the four active keys from a loaded keyfile for a given epoch.
 ///
 /// Returns:
 ///   - `master_signing_key` — Ed25519 signing key for the master identity
 ///   - `device_signing_key` — Ed25519 signing key for this device
 ///   - `epoch_key_bytes`    — 32-byte ChaCha20 symmetric key for `epoch`
+///   - `iroh_key_bytes`     — 32-byte raw bytes for `iroh::SecretKey`
 pub fn derive_keys(
     keyfile: &IdentityKeyFile,
     epoch: u32,
-) -> Result<(ed25519_dalek::SigningKey, ed25519_dalek::SigningKey, [u8; 32]), IdentityError> {
+) -> Result<(ed25519_dalek::SigningKey, ed25519_dalek::SigningKey, [u8; 32], [u8; 32]), IdentityError> {
     let master_key = derive_master_key(&keyfile.seed)
         .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
     let device_key = derive_device_key(&keyfile.seed, &DeviceId(keyfile.device_id))
         .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
     let epoch_key = derive_epoch_key(&keyfile.seed, EpochCounter(epoch))
         .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
-    Ok((master_key, device_key, epoch_key.key_bytes))
+    let iroh_key_bytes = derive_iroh_key(&keyfile.seed, &DeviceId(keyfile.device_id))
+        .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
+    Ok((master_key, device_key, epoch_key.key_bytes, iroh_key_bytes))
 }
 
 // ============================================================

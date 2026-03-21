@@ -109,7 +109,7 @@ impl DaemonHandle {
 
         // ── 4. Derive keys ────────────────────────────────────────────────────
         // Epoch 0 is the initial epoch; epoch rotation happens on device revocation.
-        let (master_key, device_key, epoch_key_bytes) = derive_keys(&keyfile, 0)?;
+        let (master_key, device_key, epoch_key_bytes, iroh_key_bytes) = derive_keys(&keyfile, 0)?;
         let identity_pub: IdentityPub = master_identity(&master_key);
         let device_id = DeviceId(keyfile.device_id);
 
@@ -174,6 +174,7 @@ impl DaemonHandle {
             signing_key: device_key.clone(),
             known_peers: HashMap::new(), // Populated by Processor in 6.3
             device_cert: device_cert_for_network,
+            iroh_secret_key: Some(iroh::SecretKey::from_bytes(&iroh_key_bytes)),
         };
         let network = Arc::new(NetworkHandle::start(net_config, incoming_tx).await?);
 

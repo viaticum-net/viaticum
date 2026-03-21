@@ -29,6 +29,7 @@ async fn make_test_state() -> Arc<DaemonState> {
         signing_key,
         known_peers: Default::default(),
         device_cert: None,
+        iroh_secret_key: None,
     };
     let (incoming_tx, _incoming_rx) =
         mpsc::channel::<crate::daemon::network::connection::Connection>(1);
@@ -224,8 +225,13 @@ async fn cli_server_accepts_connection_and_responds() {
         .await
         .expect("server start");
 
-    // Give the server a moment to bind.
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    // Poll for socket existence instead of a fixed sleep.
+    for _ in 0..50 {
+        if socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 
     // Connect via blocking UnixStream (CLI side).
     let socket_path_clone = socket_path_str.clone();
