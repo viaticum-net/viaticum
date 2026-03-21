@@ -6,7 +6,8 @@
 //   - Inbound accept loop (background task)
 //   - Framed CBOR message send/receive (via Connection)
 //   - Connection pool (reuse per peer IdentityPub)
-//   - send_symbols high-level helper
+//   - send_symbols / send_to_peer high-level helpers
+//   - Backoff: failed connections are not retried for RECONNECT_BACKOFF_SECS
 //
 // iroh is used as pure transport. No iroh-blobs, no iroh-docs.
 // All business logic lives in BackupCoordinator, RestoreCoordinator, etc.
@@ -22,11 +23,11 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey as IrohSecretKey};
-use syncback_core::constants::ALPN;
+use syncback_core::constants::{ALPN, RECONNECT_BACKOFF_SECS};
 use syncback_core::messages::{Message, SymbolTransferMsg};
 use syncback_core::types::{IdentityPub, NodeId};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub mod addr;
 pub mod connection;
@@ -55,7 +56,7 @@ pub enum NetworkError {
     #[error("message error: {0}")]
     Message(#[from] syncback_core::messages::MessageError),
 
-    /// Peer identity not in known_peers directory.
+    /// Peer identity not in known_peers directory, or currently in backoff window.
     #[error("peer not found in directory: {0}")]
     PeerNotFound(IdentityPub),
 
@@ -101,9 +102,12 @@ pub struct NetworkConfig {
 
 // ─── Connection pool ──────────────────────────────────────────────────────────
 
-/// Internal live-connection entry in the pool.
+/// Internal pool entry.
 enum ConnectionState {
+    /// Live authenticated connection.
     Live(Arc<Mutex<Connection>>),
+    /// Connection failed recently. Don't retry until `retry_after` unix timestamp (seconds).
+    Backoff { retry_after: u64 },
 }
 
 // ─── NetworkHandle ────────────────────────────────────────────────────────────
@@ -125,7 +129,7 @@ pub struct NetworkHandle {
     device_cert: Option<syncback_core::cluster::DeviceCertificate>,
     /// Known peers directory (for `get_connection` by IdentityPub).
     known_peers: Arc<RwLock<HashMap<IdentityPub, EndpointAddr>>>,
-    /// Live authenticated connections keyed by peer IdentityPub.
+    /// Authenticated connections keyed by peer IdentityPub (Live or Backoff).
     connections: Arc<Mutex<HashMap<IdentityPub, ConnectionState>>>,
 }
 
@@ -239,36 +243,108 @@ impl NetworkHandle {
     ///
     /// Checks the pool first; creates a new connection if none exists.
     /// Looks up the peer's `EndpointAddr` in `known_peers` if needed.
+    ///
+    /// Returns `Err(NetworkError::PeerNotFound)` if the peer is currently in
+    /// a backoff window (recent connect failure). After the window expires the
+    /// next call attempts a fresh connect automatically.
     pub async fn get_connection(
         &self,
         peer_identity: IdentityPub,
     ) -> Result<Arc<Mutex<Connection>>, NetworkError> {
-        // Check pool first.
+        // ── 1. Check pool ──────────────────────────────────────────────────────
         {
             let pool = self.connections.lock().await;
-            if let Some(ConnectionState::Live(arc)) = pool.get(&peer_identity) {
-                return Ok(arc.clone());
+            match pool.get(&peer_identity) {
+                Some(ConnectionState::Live(arc)) => {
+                    return Ok(arc.clone());
+                }
+                Some(ConnectionState::Backoff { retry_after }) => {
+                    let now = unix_now();
+                    if now < *retry_after {
+                        // Still in backoff window — do not hammer the peer.
+                        return Err(NetworkError::PeerNotFound(peer_identity));
+                    }
+                    // Backoff expired; fall through to reconnect.
+                }
+                None => {
+                    // Not in pool; fall through to fresh connect.
+                }
             }
         }
 
-        // Resolve address. Drop the guard before the connect await.
+        // ── 2. Resolve address ─────────────────────────────────────────────────
         let peer_addr = {
             let peers = self.known_peers.read().await;
             peers.get(&peer_identity).cloned()
         }
         .ok_or(NetworkError::PeerNotFound(peer_identity))?;
 
-        // Connect and authenticate.
-        let conn = self.connect(peer_addr, Some(peer_identity)).await?;
-        let arc = Arc::new(Mutex::new(conn));
+        // ── 3. Connect and authenticate ────────────────────────────────────────
+        match self.connect(peer_addr, Some(peer_identity)).await {
+            Ok(conn) => {
+                let arc = Arc::new(Mutex::new(conn));
+                self.connections
+                    .lock()
+                    .await
+                    .insert(peer_identity, ConnectionState::Live(arc.clone()));
+                Ok(arc)
+            }
+            Err(e) => {
+                // Record backoff so we don't spam connect attempts.
+                let retry_after = unix_now() + RECONNECT_BACKOFF_SECS;
+                self.connections
+                    .lock()
+                    .await
+                    .insert(peer_identity, ConnectionState::Backoff { retry_after });
+                Err(e)
+            }
+        }
+    }
 
-        // Store in pool.
+    /// Send a message to a peer by identity.
+    ///
+    /// Obtains or creates a pooled connection, then sends `msg`. On send
+    /// failure the dead pool entry is replaced with a `Backoff` entry so the
+    /// next `get_connection` attempt reconnects rather than reusing the stale
+    /// `Arc`.
+    pub async fn send_to_peer(
+        &self,
+        peer_identity: IdentityPub,
+        msg: &Message,
+    ) -> Result<(), NetworkError> {
+        let arc = self.get_connection(peer_identity).await?;
+        let mut guard = arc.lock().await;
+        match guard.send_message(msg).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!(
+                    peer = %peer_identity,
+                    err = %e,
+                    "send_to_peer: send failed, evicting from pool"
+                );
+                drop(guard); // release conn lock before pool lock
+                let retry_after = unix_now() + RECONNECT_BACKOFF_SECS;
+                self.connections
+                    .lock()
+                    .await
+                    .insert(peer_identity, ConnectionState::Backoff { retry_after });
+                Err(e)
+            }
+        }
+    }
+
+    /// Remove a connection from the pool and record a backoff entry.
+    ///
+    /// Called by the Processor read loop when a connection dies unexpectedly.
+    /// After this call, `get_connection` for this peer will return an error
+    /// until the backoff window expires, then attempt a fresh connect.
+    pub async fn evict_connection(&self, peer_identity: IdentityPub) {
+        let retry_after = unix_now() + RECONNECT_BACKOFF_SECS;
         self.connections
             .lock()
             .await
-            .insert(peer_identity, ConnectionState::Live(arc.clone()));
-
-        Ok(arc)
+            .insert(peer_identity, ConnectionState::Backoff { retry_after });
+        debug!(peer = %peer_identity, "connection evicted, backoff recorded");
     }
 
     /// Register a peer in the known_peers directory.
@@ -295,16 +371,32 @@ impl NetworkHandle {
 
     /// Send symbols to a peer.
     ///
-    /// Obtains or creates a pooled connection to `peer_identity`, then sends
-    /// `msg` as [`Message::SymbolTransfer`].
+    /// Uses `send_to_peer` so that a send failure evicts the dead connection
+    /// and records a backoff entry, preventing repeated attempts on a dead
+    /// socket until the backoff window expires.
     pub async fn send_symbols(
         &self,
         peer_identity: IdentityPub,
         msg: SymbolTransferMsg,
     ) -> Result<(), NetworkError> {
-        let arc = self.get_connection(peer_identity).await?;
-        let mut guard = arc.lock().await;
-        guard.send_message(&Message::SymbolTransfer(msg)).await
+        self.send_to_peer(peer_identity, &Message::SymbolTransfer(msg))
+            .await
+    }
+
+    /// Build a signed PeerAnnounceMsg for this node.
+    ///
+    /// Used to introduce ourselves when a new connection is established.
+    /// The sig covers identity_pub || node_id || timestamp.
+    pub fn build_peer_announce(
+        &self,
+        timestamp: syncback_core::types::Timestamp,
+    ) -> syncback_core::messages::PeerAnnounceMsg {
+        syncback_core::messages::build_peer_announce(
+            self.identity_pub,
+            self.node_id,
+            timestamp,
+            &self.signing_key,
+        )
     }
 
     /// Gracefully shut down the endpoint.
@@ -312,4 +404,38 @@ impl NetworkHandle {
         info!("shutting down network handle");
         self.endpoint.close().await;
     }
+
+    /// Test-only: inject a `Backoff` entry for a peer.
+    #[cfg(test)]
+    pub async fn inject_backoff_for_test(&self, peer: IdentityPub, retry_after: u64) {
+        self.connections
+            .lock()
+            .await
+            .insert(peer, ConnectionState::Backoff { retry_after });
+    }
+
+    /// Test-only: check whether a peer's pool entry is a `Backoff`.
+    #[cfg(test)]
+    pub async fn is_peer_in_backoff(&self, peer: &IdentityPub) -> bool {
+        matches!(
+            self.connections.lock().await.get(peer),
+            Some(ConnectionState::Backoff { .. })
+        )
+    }
+
+    /// Test-only: check if a peer is in the known_peers directory.
+    #[cfg(test)]
+    pub async fn has_known_peer(&self, identity: &IdentityPub) -> bool {
+        self.known_peers.read().await.contains_key(identity)
+    }
+}
+
+// ─── Private helpers ──────────────────────────────────────────────────────────
+
+/// Current Unix timestamp in seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

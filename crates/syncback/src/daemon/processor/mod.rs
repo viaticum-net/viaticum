@@ -17,9 +17,16 @@
 //   RestoreRequest received → we are the holder  → load symbols, send RestoreResponse
 //   RestoreDenied received  → we are the owner   → log warning
 //   BoardSync received      → forward to RelayManager via relay_sync_tx
-//   PeerAnnounce received   → upsert peer record in DB
+//   PeerAnnounce received   → upsert peer record in DB + add to known_peers
 //   ClusterSyncRequest      → we are cluster peer → serve event log entries
 //   ClusterSyncResponse     → we are cluster peer → apply received events
+//
+// Phase 7.10 — Peer gossip on connect:
+//   On every new incoming connection we immediately send our PeerAnnounceMsg
+//   so the remote learns our identity ↔ NodeId binding. The peer does the
+//   same, so after the first exchange both sides can reach each other by
+//   identity. When we receive a PeerAnnounce we upsert the DB record AND
+//   call network.add_peer() so future get_connection() calls can reach them.
 //
 // Design note: PosResponseMsg on the wire does not carry source_block_id.
 // We recover it by scanning placements for the holder and finding one whose
@@ -176,6 +183,29 @@ impl Processor {
                             let conn_arc = Arc::new(Mutex::new(conn));
                             let conn_arc2 = conn_arc.clone();
                             let tx = msg_tx.clone();
+                            let network_arc = this.network.clone();
+
+                            // Phase 7.10: send our PeerAnnounceMsg immediately so the
+                            // remote learns our identity ↔ NodeId mapping.
+                            let pa_msg = {
+                                let pa = network_arc.build_peer_announce(Timestamp::now());
+                                Message::PeerAnnounce(pa)
+                            };
+                            {
+                                let mut guard = conn_arc.lock().await;
+                                if let Err(e) = guard.send_message(&pa_msg).await {
+                                    warn!(
+                                        peer = %peer_id,
+                                        err = %e,
+                                        "processor: failed to send PeerAnnounce on new connection"
+                                    );
+                                } else {
+                                    debug!(
+                                        peer = %peer_id,
+                                        "processor: sent PeerAnnounce on new connection"
+                                    );
+                                }
+                            }
 
                             tokio::spawn(async move {
                                 debug!(peer = %peer_id, "processor: read loop started");
@@ -190,6 +220,10 @@ impl Processor {
                                                     err = %e,
                                                     "processor: connection closed"
                                                 );
+                                                // Evict the dead connection so get_connection
+                                                // reconnects next time instead of reusing the
+                                                // stale Arc.
+                                                network_arc.evict_connection(peer_id).await;
                                                 break;
                                             }
                                         }
@@ -953,11 +987,15 @@ impl Processor {
     // PeerAnnounce: upsert peer in DB
     // =========================================================
 
-    /// Learn about a peer's identity. Upsert PeerRecord in DB.
+    /// Learn about a peer's identity. Upsert PeerRecord in DB and register
+    /// the peer's NodeId in the network layer so future `get_connection` calls
+    /// can reach them.
     ///
-    /// Note: `network.add_peer` requires an EndpointAddr, which we cannot construct
-    /// from a NodeId alone without iroh resolution. That mapping is done in Phase 7.9
-    /// (bootstrap peers) and Phase 7.3 (connect). This handler only updates the DB.
+    /// We build an `EndpointAddr` from the NodeId alone (no socket address).
+    /// iroh can still connect to a NodeId-only addr via the relay network
+    /// (RelayMode::Default) or direct discovery. For LAN-only setups (tests)
+    /// this is a no-op from a routing standpoint, but the record is still
+    /// stored for when the peer later connects with a full addr.
     pub(crate) async fn handle_peer_announce(
         &self,
         msg: PeerAnnounceMsg,
@@ -985,11 +1023,35 @@ impl Processor {
             }
         };
         self.db.upsert_peer(&record)?;
-        info!(
-            identity = %msg.identity_pub,
-            node_id = %msg.node_id,
-            "processor: PeerAnnounce upserted peer record"
-        );
+
+        // Register the peer in the network layer so get_connection() can reach
+        // them. Build an EndpointAddr from the NodeId (iroh PublicKey) alone;
+        // a socket address is not required when the relay is enabled.
+        match iroh::PublicKey::from_bytes(&msg.node_id.0) {
+            Ok(pubkey) => {
+                let addr = iroh::EndpointAddr::new(pubkey);
+                self.network.add_peer(msg.identity_pub, addr).await;
+                info!(
+                    identity = %msg.identity_pub,
+                    node_id = %msg.node_id,
+                    "processor: PeerAnnounce upserted peer record and registered in network"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    identity = %msg.identity_pub,
+                    node_id = %msg.node_id,
+                    err = %e,
+                    "processor: PeerAnnounce — invalid NodeId bytes, skipping network.add_peer"
+                );
+                info!(
+                    identity = %msg.identity_pub,
+                    node_id = %msg.node_id,
+                    "processor: PeerAnnounce upserted peer record (no network entry)"
+                );
+            }
+        }
+
         Ok(())
     }
 

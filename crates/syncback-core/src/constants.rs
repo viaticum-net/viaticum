@@ -231,6 +231,11 @@ pub const RELIABILITY_REPAIR_THRESHOLD: f64 = 0.99;
 /// approximation for N >= this value.
 pub const BINOMIAL_EXACT_THRESHOLD: u32 = 100;
 
+// === Network reconnection ===
+
+/// Seconds before retrying a failed peer connection.
+pub const RECONNECT_BACKOFF_SECS: u64 = 30;
+
 // === Compile-time sanity checks ===
 
 const _: () = assert!(S_CLAMP_MIN < S_CLAMP_MAX);

@@ -500,6 +500,54 @@ pub fn build_handshake(
     }
 }
 
+// ============================================================
+// PeerAnnounce
+// ============================================================
+
+fn peer_announce_sig_input(
+    identity_pub: &IdentityPub,
+    node_id: &crate::types::NodeId,
+    timestamp: &Timestamp,
+) -> Vec<u8> {
+    let mut input = Vec::with_capacity(32 + 32 + 8);
+    input.extend_from_slice(&identity_pub.0);
+    input.extend_from_slice(&node_id.0);
+    input.extend_from_slice(&timestamp.0.to_be_bytes());
+    input
+}
+
+/// Build a signed PeerAnnounceMsg.
+///
+/// The sig covers identity_pub || node_id || timestamp.
+pub fn build_peer_announce(
+    identity_pub: IdentityPub,
+    node_id: crate::types::NodeId,
+    timestamp: Timestamp,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> PeerAnnounceMsg {
+    let sig_input = peer_announce_sig_input(&identity_pub, &node_id, &timestamp);
+    let signature = signing_key.sign(&sig_input);
+    PeerAnnounceMsg {
+        v: PROTOCOL_VERSION,
+        identity_pub,
+        node_id,
+        timestamp,
+        sig: signature.to_bytes(),
+    }
+}
+
+/// Verify a received PeerAnnounceMsg signature.
+pub fn verify_peer_announce(msg: &PeerAnnounceMsg) -> Result<(), MessageError> {
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&msg.identity_pub.0)
+        .map_err(|_| MessageError::BadSignature)?;
+    let signature = ed25519_dalek::Signature::from_bytes(&msg.sig);
+    let sig_input = peer_announce_sig_input(&msg.identity_pub, &msg.node_id, &msg.timestamp);
+    verifying_key
+        .verify_strict(&sig_input, &signature)
+        .map_err(|_| MessageError::BadSignature)?;
+    Ok(())
+}
+
 /// Extract the cluster master identity from a handshake message.
 ///
 /// If no device_cert is present, returns Ok(None).

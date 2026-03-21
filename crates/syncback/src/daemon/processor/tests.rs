@@ -13,8 +13,9 @@
 //   decide_symbol_offer             — quota check logic
 //   handle_restore_request_inner    — returns symbols or empty response
 //   handle_board_sync               — forwards to relay_sync_tx
-//   handle_peer_announce            — upserts PeerRecord in DB
+//   handle_peer_announce            — upserts PeerRecord in DB + network.add_peer (Phase 7.10)
 //   dispatch_relay                  — PeerAnnounce via relay
+//   build_peer_announce             — NetworkHandle helper builds a signed message (Phase 7.10)
 
 use std::sync::{Arc, Mutex};
 

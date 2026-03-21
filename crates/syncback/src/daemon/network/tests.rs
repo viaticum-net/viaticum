@@ -741,3 +741,199 @@ async fn network_handle_starts_with_relay_default() {
     .expect("should start with RelayMode::Default");
     handle.shutdown().await;
 }
+
+// ─── Phase 7.8: Reconnection + backoff tests ──────────────────────────────────
+
+// Test 12a: get_connection returns error during active backoff window.
+//
+// We inject a Backoff entry with retry_after = now + 3600 (far future).
+// get_connection must return Err without attempting to connect.
+
+#[tokio::test]
+async fn get_connection_returns_error_during_backoff() {
+    let (sk_a, _pk_a) = keygen();
+    let (_, pk_b) = keygen();
+
+    let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
+
+    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+        .await
+        .expect("handle_a");
+
+    // Inject a far-future backoff for peer_b (no real node running).
+    let future_retry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        + 3600;
+    handle_a.inject_backoff_for_test(pk_b, future_retry).await;
+
+    // get_connection must fail immediately without trying to connect.
+    let result = handle_a.get_connection(pk_b).await;
+    assert!(
+        matches!(result, Err(NetworkError::PeerNotFound(_))),
+        "get_connection must return PeerNotFound during backoff"
+    );
+
+    // Peer must still be in backoff (not removed by the failed call).
+    assert!(
+        handle_a.is_peer_in_backoff(&pk_b).await,
+        "peer must remain in backoff after rejected get_connection"
+    );
+
+    handle_a.shutdown().await;
+}
+
+// Test 12b: get_connection reconnects after backoff expires.
+//
+// We inject an already-expired Backoff entry (retry_after = unix epoch + 1),
+// then call get_connection. It must fall through to a real connect.
+
+#[tokio::test]
+async fn get_connection_reconnects_after_backoff_expires() {
+    let (sk_a, _pk_a) = keygen();
+    let (sk_b, pk_b) = keygen();
+
+    let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
+    let (tx_b, _rx_b) = tokio::sync::mpsc::channel(10);
+
+    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+        .await
+        .expect("handle_a");
+    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+        .await
+        .expect("handle_b");
+
+    let addr_b = handle_b.local_addr().expect("addr_b");
+
+    // Register peer_b so get_connection can resolve the address.
+    handle_a.add_peer(pk_b, addr_b).await;
+
+    // Inject an expired backoff (retry_after = 1 second past epoch — always in the past).
+    handle_a.inject_backoff_for_test(pk_b, 1).await;
+    assert!(
+        handle_a.is_peer_in_backoff(&pk_b).await,
+        "sanity: injected backoff must be visible"
+    );
+
+    // get_connection must see the expired backoff and attempt a fresh connect.
+    let result = handle_a.get_connection(pk_b).await;
+    assert!(
+        result.is_ok(),
+        "get_connection must succeed after backoff expires"
+    );
+
+    // Pool must now contain a Live entry (not Backoff).
+    assert!(
+        !handle_a.is_peer_in_backoff(&pk_b).await,
+        "pool must contain Live after successful reconnect"
+    );
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+}
+
+// Test 12c: evict_connection removes Live entry and replaces with Backoff.
+
+#[tokio::test]
+async fn evict_connection_removes_live_entry() {
+    let (sk_a, _pk_a) = keygen();
+    let (sk_b, pk_b) = keygen();
+
+    let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
+    let (tx_b, _rx_b) = tokio::sync::mpsc::channel(10);
+
+    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+        .await
+        .expect("handle_a");
+    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+        .await
+        .expect("handle_b");
+
+    let addr_b = handle_b.local_addr().expect("addr_b");
+
+    // Establish a live connection and store it in the pool.
+    handle_a.add_peer(pk_b, addr_b).await;
+    let _arc = handle_a
+        .get_connection(pk_b)
+        .await
+        .expect("initial get_connection");
+    assert!(
+        !handle_a.is_peer_in_backoff(&pk_b).await,
+        "after successful connect, entry must be Live (not Backoff)"
+    );
+
+    // Evict it.
+    handle_a.evict_connection(pk_b).await;
+
+    // Pool must now contain Backoff.
+    assert!(
+        handle_a.is_peer_in_backoff(&pk_b).await,
+        "after evict_connection, entry must be Backoff"
+    );
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+}
+
+// Test 12d: send_to_peer records backoff on send failure.
+//
+// We establish a connection A→B, then close B's endpoint so its side goes
+// away. Sending on the now-dead connection must fail and record Backoff.
+
+#[tokio::test]
+async fn send_to_peer_records_backoff_on_send_failure() {
+    let (sk_a, _pk_a) = keygen();
+    let (sk_b, pk_b) = keygen();
+
+    let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
+    let (tx_b, _rx_b) = tokio::sync::mpsc::channel(10);
+
+    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+        .await
+        .expect("handle_a");
+    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+        .await
+        .expect("handle_b");
+
+    let addr_b = handle_b.local_addr().expect("addr_b");
+    handle_a.add_peer(pk_b, addr_b).await;
+
+    // Establish a live connection (populates pool).
+    let _arc = handle_a
+        .get_connection(pk_b)
+        .await
+        .expect("initial get_connection");
+
+    // Close B's endpoint so any send attempt will fail.
+    handle_b.shutdown().await;
+
+    // Wait briefly for the QUIC close to propagate.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Build a minimal message to send.
+    use syncback_core::types::{SourceBlockId, Timestamp};
+    let msg = syncback_core::messages::Message::PosChallenge(
+        syncback_core::messages::PosChallengeMsg {
+            v: 1,
+            challenge_id: [0u8; 16],
+            source_block_id: SourceBlockId([0u8; 32]),
+            esi: 0,
+            timestamp: Timestamp::now(),
+        },
+    );
+
+    let result = handle_a.send_to_peer(pk_b, &msg).await;
+    assert!(
+        result.is_err(),
+        "send_to_peer must fail after peer closes endpoint"
+    );
+
+    // The dead entry must have been replaced with Backoff.
+    assert!(
+        handle_a.is_peer_in_backoff(&pk_b).await,
+        "send_to_peer must record Backoff after send failure"
+    );
+
+    handle_a.shutdown().await;
+}
