@@ -151,6 +151,12 @@ pub fn run_pipeline(
     std::fs::create_dir_all(&symbols_block_dir)
         .map_err(|e| anyhow::anyhow!("create symbols dir: {e}"))?;
 
+    // Also save the stored blob alongside symbols for RepairAgent use.
+    // Path: {symbols_dir}/{block_id_hex}/block.bin
+    let block_blob_path = symbols_block_dir.join("block.bin");
+    std::fs::write(&block_blob_path, &stored)
+        .map_err(|e| anyhow::anyhow!("write block.bin: {e}"))?;
+
     let mut symbol_count_per_holder: Vec<(IdentityPub, u32)> = Vec::new();
 
     for alloc in &allocations_result {
@@ -218,6 +224,7 @@ pub fn run_pipeline(
             status: PlacementStatus::Alive, // Phase 2: set directly to Alive
             last_verified: None,
             placed_at: now,
+            consecutive_misses: 0,
         };
         db.upsert_placement(&placement)?;
     }

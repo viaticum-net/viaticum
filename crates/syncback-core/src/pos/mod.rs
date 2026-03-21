@@ -1,7 +1,12 @@
-use crate::constants::{POS_BASE_CHALLENGES_PER_WEEK, POS_TIMEOUT_SECS, POS_VOLUME_DIVISOR, SECS_PER_WEEK};
+use crate::constants::{
+    POS_BASE_CHALLENGES_PER_WEEK, POS_CONSECUTIVE_MISS_PRESUMED_LOST,
+    POS_CONSECUTIVE_MISS_UNCERTAIN, POS_TIMEOUT_SECS, POS_VOLUME_DIVISOR, SECS_PER_WEEK,
+};
 use crate::erasure::{ErasureEncoder, ErasureError};
 use crate::trust::PosOutcome;
-use crate::types::{ErasureParams, IdentityPub, SourceBlockId, SymbolPlacement, Timestamp};
+use crate::types::{
+    ErasureParams, IdentityPub, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
+};
 
 /// A single PoS challenge issued by the owner to one holder.
 /// Sent over the wire as part of PosChallenge message.
@@ -39,6 +44,8 @@ pub enum VerifyOutcome {
     Fail { esi: u32 },
     /// Response was not received before the deadline (7 days).
     Timeout,
+    /// Holder explicitly responded that it does not hold this symbol (PosNack received).
+    NotHeld { esi: u32 },
 }
 
 /// One holder's challenge schedule entry.
@@ -251,18 +258,107 @@ pub fn is_timed_out(challenge: &PosChallenge, now: Timestamp) -> bool {
 /// ready to pass to TrustEngine::record_pos_result.
 ///
 /// Each call represents one challenge that was either passed, failed, or timed out.
-/// Timeout counts as a challenged-but-not-passed event (challenged=1, passed=0).
+/// Timeout and NotHeld count as challenged-but-not-passed events (challenged=1, passed=0).
+/// NotHeld counts as challenged=1, passed=0 (same as Fail — holder no longer holds data).
 ///
 /// week_number: monotonically increasing protocol week number (caller tracks this).
 pub fn outcome_from_verify(result: &VerifyOutcome, week_number: u32) -> PosOutcome {
     let passed = match result {
         VerifyOutcome::Pass => 1,
-        VerifyOutcome::Fail { .. } | VerifyOutcome::Timeout => 0,
+        VerifyOutcome::Fail { .. }
+        | VerifyOutcome::Timeout
+        | VerifyOutcome::NotHeld { .. } => 0,
     };
     PosOutcome {
         week_number,
         challenged: 1,
         passed,
+    }
+}
+
+/// Result of applying a PoS outcome to a placement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacementTransition {
+    /// New status for the placement.
+    pub new_status: PlacementStatus,
+    /// New consecutive_misses count.
+    pub new_consecutive_misses: u32,
+    /// Whether repair should be triggered for this placement.
+    pub trigger_repair: bool,
+}
+
+/// Apply a PoS outcome to a placement record and return the resulting transition.
+///
+/// State machine rules:
+///
+///   Lost/Deleting + any → no-op (return current state, trigger_repair=false)
+///   Any + Pass        → Alive, misses=0, repair=false
+///   Any + Fail        → Lost,  misses=0, repair=true   (explicit wrong data)
+///   Any + NotHeld     → Lost,  misses=0, repair=true   (explicit no-hold)
+///   Any + Timeout:
+///     new_misses < UNCERTAIN_THRESHOLD  → Alive (stays Alive)
+///     new_misses >= UNCERTAIN && < PRESUMED_LOST → Uncertain
+///     new_misses >= PRESUMED_LOST → PresumedLost, repair=true
+///
+/// With default constants (UNCERTAIN=1, PRESUMED_LOST=3):
+///   Alive + Timeout → Uncertain (misses=1)
+///   Uncertain + Timeout → Uncertain (misses=2)
+///   Uncertain + Timeout → PresumedLost, repair (misses=3)
+///   PresumedLost + Pass → Alive, misses=0
+///   PresumedLost + Fail → Lost, repair
+///   PresumedLost + Timeout → PresumedLost (misses++, repair still pending)
+pub fn apply_pos_outcome(
+    placement: &SymbolPlacement,
+    outcome: &VerifyOutcome,
+) -> PlacementTransition {
+    // Dead placements: no further transitions
+    if placement.status == PlacementStatus::Lost
+        || placement.status == PlacementStatus::Deleting
+    {
+        return PlacementTransition {
+            new_status: placement.status,
+            new_consecutive_misses: placement.consecutive_misses,
+            trigger_repair: false,
+        };
+    }
+
+    match outcome {
+        VerifyOutcome::Pass => PlacementTransition {
+            new_status: PlacementStatus::Alive,
+            new_consecutive_misses: 0,
+            trigger_repair: false,
+        },
+
+        VerifyOutcome::Fail { .. } | VerifyOutcome::NotHeld { .. } => PlacementTransition {
+            new_status: PlacementStatus::Lost,
+            new_consecutive_misses: 0,
+            trigger_repair: true,
+        },
+
+        VerifyOutcome::Timeout => {
+            let new_misses = placement.consecutive_misses + 1;
+            if new_misses >= POS_CONSECUTIVE_MISS_PRESUMED_LOST {
+                PlacementTransition {
+                    new_status: PlacementStatus::PresumedLost,
+                    new_consecutive_misses: new_misses,
+                    trigger_repair: true,
+                }
+            } else if new_misses >= POS_CONSECUTIVE_MISS_UNCERTAIN {
+                PlacementTransition {
+                    new_status: PlacementStatus::Uncertain,
+                    new_consecutive_misses: new_misses,
+                    trigger_repair: false,
+                }
+            } else {
+                // Should not happen with UNCERTAIN=1 (new_misses always >= 1),
+                // but keep for correctness if constants change.
+                PlacementTransition {
+                    new_status: PlacementStatus::Alive,
+                    new_consecutive_misses: new_misses,
+                    trigger_repair: false,
+                }
+            }
+        }
     }
 }
 

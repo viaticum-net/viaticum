@@ -614,6 +614,24 @@ impl Db {
         Ok(result)
     }
 
+    /// Return all placements with status Lost or PresumedLost.
+    /// Used by RepairAgent to find work.
+    pub fn list_placements_needing_repair(&self) -> Result<Vec<SymbolPlacement>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(SYMBOL_PLACEMENTS)?;
+        let mut records = Vec::new();
+        for item in table.iter()? {
+            let (_, v) = item?;
+            let record: SymbolPlacement = from_cbor_bytes(v.value())?;
+            if record.status == PlacementStatus::Lost
+                || record.status == PlacementStatus::PresumedLost
+            {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
     /// Convenience: list all file_ids a holder has symbols for (via holder_files index).
     pub fn list_files_for_holder(&self, holder_id: &IdentityPub) -> Result<Vec<FileId>, DbError> {
         let tx = self.inner.begin_read()?;

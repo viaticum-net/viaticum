@@ -1,8 +1,8 @@
 use crate::constants::{POS_BASE_CHALLENGES_PER_WEEK, POS_TIMEOUT_SECS};
 use crate::erasure::{ErasureEncoder, RaptorQEncoder};
 use crate::pos::{
-    challenges_per_week, due_challenges, is_timed_out, outcome_from_verify, select_challenge_esi,
-    verify_response, PosChallenge, PosError, PosResponse, VerifyOutcome,
+    apply_pos_outcome, challenges_per_week, due_challenges, is_timed_out, outcome_from_verify,
+    select_challenge_esi, verify_response, PosChallenge, PosError, PosResponse, VerifyOutcome,
 };
 use crate::types::{
     ErasureParams, FileId, IdentityPub, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
@@ -28,6 +28,27 @@ fn make_placement(block: SourceBlockId, h: IdentityPub, esi_ranges: Vec<(u32, u3
         status: PlacementStatus::Alive,
         last_verified: None,
         placed_at: Timestamp(0),
+        consecutive_misses: 0,
+    }
+}
+
+fn make_placement_with_status(
+    block: SourceBlockId,
+    h: IdentityPub,
+    esi_ranges: Vec<(u32, u32)>,
+    status: PlacementStatus,
+    consecutive_misses: u32,
+) -> SymbolPlacement {
+    SymbolPlacement {
+        source_block_id: block,
+        holder_id: h,
+        file_id: FileId(1),
+        esi_ranges,
+        binding_seed: [0u8; 32],
+        status,
+        last_verified: None,
+        placed_at: Timestamp(0),
+        consecutive_misses,
     }
 }
 
@@ -340,4 +361,136 @@ fn outcome_from_verify_timeout_counts_as_challenged() {
     assert_eq!(outcome.week_number, 5);
     assert_eq!(outcome.challenged, 1);
     assert_eq!(outcome.passed, 0);
+}
+
+// ─── apply_pos_outcome state machine ────────────────────────────────────────
+
+#[test]
+fn apply_pos_outcome_pass_resets_to_alive() {
+    // Placement was Uncertain with consecutive_misses=2
+    let placement = make_placement_with_status(
+        block_id(1), holder(2), vec![(0, 5)],
+        PlacementStatus::Uncertain, 2,
+    );
+    let result = apply_pos_outcome(&placement, &VerifyOutcome::Pass);
+    assert_eq!(result.new_status, PlacementStatus::Alive);
+    assert_eq!(result.new_consecutive_misses, 0);
+    assert!(!result.trigger_repair);
+}
+
+#[test]
+fn apply_pos_outcome_fail_immediately_marks_lost() {
+    let placement = make_placement(block_id(1), holder(2), vec![(0, 5)]);
+    let result = apply_pos_outcome(&placement, &VerifyOutcome::Fail { esi: 42 });
+    assert_eq!(result.new_status, PlacementStatus::Lost);
+    assert_eq!(result.new_consecutive_misses, 0);
+    assert!(result.trigger_repair);
+}
+
+#[test]
+fn apply_pos_outcome_not_held_immediately_marks_lost() {
+    let placement = make_placement(block_id(1), holder(2), vec![(0, 5)]);
+    let result = apply_pos_outcome(&placement, &VerifyOutcome::NotHeld { esi: 7 });
+    assert_eq!(result.new_status, PlacementStatus::Lost);
+    assert_eq!(result.new_consecutive_misses, 0);
+    assert!(result.trigger_repair);
+}
+
+#[test]
+fn apply_pos_outcome_first_timeout_gives_uncertain() {
+    // Alive, consecutive_misses=0: first timeout → Uncertain (misses=1)
+    let placement = make_placement(block_id(1), holder(2), vec![(0, 5)]);
+    let result = apply_pos_outcome(&placement, &VerifyOutcome::Timeout);
+    assert_eq!(result.new_status, PlacementStatus::Uncertain);
+    assert_eq!(result.new_consecutive_misses, 1);
+    assert!(!result.trigger_repair);
+}
+
+#[test]
+fn apply_pos_outcome_second_timeout_stays_uncertain() {
+    // Uncertain, consecutive_misses=1: second timeout → Uncertain (misses=2)
+    let placement = make_placement_with_status(
+        block_id(1), holder(2), vec![(0, 5)],
+        PlacementStatus::Uncertain, 1,
+    );
+    let result = apply_pos_outcome(&placement, &VerifyOutcome::Timeout);
+    assert_eq!(result.new_status, PlacementStatus::Uncertain);
+    assert_eq!(result.new_consecutive_misses, 2);
+    assert!(!result.trigger_repair);
+}
+
+#[test]
+fn apply_pos_outcome_third_timeout_gives_presumed_lost() {
+    // Uncertain, consecutive_misses=2: third timeout → PresumedLost (misses=3)
+    let placement = make_placement_with_status(
+        block_id(1), holder(2), vec![(0, 5)],
+        PlacementStatus::Uncertain, 2,
+    );
+    let result = apply_pos_outcome(&placement, &VerifyOutcome::Timeout);
+    assert_eq!(result.new_status, PlacementStatus::PresumedLost);
+    assert_eq!(result.new_consecutive_misses, 3);
+    assert!(result.trigger_repair);
+}
+
+#[test]
+fn apply_pos_outcome_presumed_lost_pass_recovers_to_alive() {
+    let placement = make_placement_with_status(
+        block_id(1), holder(2), vec![(0, 5)],
+        PlacementStatus::PresumedLost, 3,
+    );
+    let result = apply_pos_outcome(&placement, &VerifyOutcome::Pass);
+    assert_eq!(result.new_status, PlacementStatus::Alive);
+    assert_eq!(result.new_consecutive_misses, 0);
+    assert!(!result.trigger_repair);
+}
+
+#[test]
+fn apply_pos_outcome_lost_is_noop_for_all_outcomes() {
+    let placement = make_placement_with_status(
+        block_id(1), holder(2), vec![(0, 5)],
+        PlacementStatus::Lost, 0,
+    );
+    let outcomes = [
+        VerifyOutcome::Pass,
+        VerifyOutcome::Fail { esi: 0 },
+        VerifyOutcome::NotHeld { esi: 0 },
+        VerifyOutcome::Timeout,
+    ];
+    for outcome in &outcomes {
+        let result = apply_pos_outcome(&placement, outcome);
+        assert_eq!(result.new_status, PlacementStatus::Lost, "outcome: {:?}", outcome);
+        assert!(!result.trigger_repair, "outcome: {:?}", outcome);
+    }
+}
+
+#[test]
+fn apply_pos_outcome_deleting_is_noop_for_all_outcomes() {
+    let placement = make_placement_with_status(
+        block_id(1), holder(2), vec![(0, 5)],
+        PlacementStatus::Deleting, 0,
+    );
+    let outcomes = [
+        VerifyOutcome::Pass,
+        VerifyOutcome::Fail { esi: 0 },
+        VerifyOutcome::Timeout,
+    ];
+    for outcome in &outcomes {
+        let result = apply_pos_outcome(&placement, outcome);
+        assert_eq!(result.new_status, PlacementStatus::Deleting, "outcome: {:?}", outcome);
+        assert!(!result.trigger_repair, "outcome: {:?}", outcome);
+    }
+}
+
+#[test]
+fn outcome_from_verify_not_held_counts_as_challenged() {
+    let outcome = outcome_from_verify(&VerifyOutcome::NotHeld { esi: 3 }, 7);
+    assert_eq!(outcome.week_number, 7);
+    assert_eq!(outcome.challenged, 1);
+    assert_eq!(outcome.passed, 0);
+}
+
+#[test]
+fn verify_outcome_enum_has_not_held_variant() {
+    let o = VerifyOutcome::NotHeld { esi: 0 };
+    assert!(matches!(o, VerifyOutcome::NotHeld { .. }));
 }

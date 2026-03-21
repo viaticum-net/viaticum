@@ -103,6 +103,7 @@ fn symbol_placement_count() {
         status: PlacementStatus::Alive,
         last_verified: None,
         placed_at: Timestamp(0),
+        consecutive_misses: 0,
     };
     assert_eq!(p.symbol_count(), 150);
 }

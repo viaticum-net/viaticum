@@ -183,6 +183,16 @@ pub const MAX_BOARD_ENTRIES: usize = 2000;
 /// Max total board size in bytes (8 MB, from protocol.md §1.5).
 pub const MAX_BOARD_SIZE_BYTES: usize = 8 * 1024 * 1024;
 
+// === PoS placement status thresholds ===
+
+/// Number of consecutive PoS timeouts before a placement is marked Uncertain.
+/// First timeout → Uncertain immediately (1 miss = Uncertain).
+pub const POS_CONSECUTIVE_MISS_UNCERTAIN: u32 = 1;
+
+/// Number of consecutive PoS timeouts before a placement is marked PresumedLost.
+/// 3+ consecutive misses → PresumedLost → triggers repair.
+pub const POS_CONSECUTIVE_MISS_PRESUMED_LOST: u32 = 3;
+
 // === Compile-time sanity checks ===
 
 const _: () = assert!(S_CLAMP_MIN < S_CLAMP_MAX);

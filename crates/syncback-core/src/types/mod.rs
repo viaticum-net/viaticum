@@ -280,6 +280,10 @@ pub struct SymbolPlacement {
     pub status: PlacementStatus,
     pub last_verified: Option<Timestamp>,
     pub placed_at: Timestamp,
+    /// Consecutive PoS timeout misses. Reset to 0 on Pass. Not incremented on Fail/NotHeld
+    /// (those are immediate: status → Lost without graduation).
+    #[serde(default)]
+    pub consecutive_misses: u32,
 }
 
 impl SymbolPlacement {
@@ -296,9 +300,13 @@ pub enum PlacementStatus {
     Offered,
     /// Holder accepted, transfer in progress.
     Accepted,
-    /// Symbols stored and confirmed.
+    /// Symbols stored and confirmed. PoS challenges active.
     Alive,
-    /// Holder dropped symbols or failed PoS.
+    /// Holder missed 1-2 consecutive PoS challenges (timeout). Not yet confirmed lost.
+    Uncertain,
+    /// Holder missed 3+ consecutive PoS challenges. Repair will be triggered.
+    PresumedLost,
+    /// Holder dropped symbols or explicitly failed PoS. Repair triggered.
     Lost,
     /// Delete in progress.
     Deleting,

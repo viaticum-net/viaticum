@@ -97,6 +97,7 @@ fn pos_challenge_verify_roundtrip() {
         status: PlacementStatus::Alive,
         last_verified: None,
         placed_at: now(),
+        consecutive_misses: 0,
     };
 
     // Select a challenge ESI deterministically.
@@ -138,6 +139,7 @@ fn pos_challenge_detect_corruption() {
         status: PlacementStatus::Alive,
         last_verified: None,
         placed_at: now(),
+        consecutive_misses: 0,
     };
 
     let esi = select_challenge_esi(&placement, 7).expect("select esi");
@@ -266,6 +268,7 @@ fn db_stores_and_retrieves_full_records() {
         status: PlacementStatus::Alive,
         last_verified: None,
         placed_at: t,
+        consecutive_misses: 0,
     };
     db.upsert_placement(&placement).expect("upsert_placement");
 
@@ -543,6 +546,7 @@ fn full_owner_flow() {
         status: PlacementStatus::Alive,
         last_verified: None,
         placed_at: t,
+        consecutive_misses: 0,
     };
     db.upsert_placement(&placement).expect("upsert_placement");
 

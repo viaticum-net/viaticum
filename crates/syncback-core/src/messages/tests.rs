@@ -5,6 +5,8 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use super::PosNackMsg;
+
 use super::*;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -292,6 +294,13 @@ fn all_message_variants_frame_roundtrip() {
             data: vec![0u8; 16],
             timestamp: ts,
         }),
+        Message::PosNack(PosNackMsg {
+            v: 1,
+            challenge_id: [0xABu8; 16],
+            source_block_id: sbid,
+            esi: 42,
+            timestamp: ts,
+        }),
         Message::SymbolOffer(SymbolOfferMsg {
             v: 1,
             msg_id: [0u8; 16],
@@ -407,4 +416,35 @@ fn to_cbor_from_cbor_roundtrip() {
     let bytes = to_cbor(&offer).unwrap();
     let decoded: SymbolOfferMsg = from_cbor(&bytes).unwrap();
     assert_eq!(decoded, offer);
+}
+
+#[test]
+fn pos_nack_msg_roundtrip() {
+    let sbid = SourceBlockId([1u8; 32]);
+    let ts = Timestamp(1_000_000);
+    let msg = PosNackMsg {
+        v: 1,
+        challenge_id: [0xABu8; 16],
+        source_block_id: sbid,
+        esi: 42,
+        timestamp: ts,
+    };
+    let encoded = to_cbor(&Message::PosNack(msg.clone())).unwrap();
+    let decoded: Message = from_cbor(&encoded).unwrap();
+    assert!(matches!(decoded, Message::PosNack(ref m) if *m == msg));
+}
+
+#[test]
+fn pos_nack_framing_roundtrip() {
+    let msg = Message::PosNack(PosNackMsg {
+        v: 1,
+        challenge_id: [0xCDu8; 16],
+        source_block_id: SourceBlockId([2u8; 32]),
+        esi: 99,
+        timestamp: Timestamp(2_000_000),
+    });
+    let framed = frame_message(&msg).unwrap();
+    let (decoded, consumed) = unframe_message(&framed).unwrap();
+    assert_eq!(decoded, msg);
+    assert_eq!(consumed, framed.len());
 }

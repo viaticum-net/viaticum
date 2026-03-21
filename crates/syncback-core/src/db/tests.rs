@@ -54,6 +54,7 @@ fn make_placement(
         status,
         last_verified: None,
         placed_at: Timestamp(1000),
+        consecutive_misses: 0,
     }
 }
 

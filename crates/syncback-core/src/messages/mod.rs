@@ -78,6 +78,25 @@ pub struct PosResponseMsg {
     pub timestamp: Timestamp,
 }
 
+/// Holder → Owner. Holder received a PoS challenge but does not hold the symbol.
+///
+/// Sent in response to PosChallengeMsg when:
+///   - The holder has evicted the symbols for this source block.
+///   - The holder never received the symbols (missed transfer).
+///   - The holder's HoldingRecord for this block has status != Active.
+///
+/// The owner treats this as VerifyOutcome::NotHeld → PlacementStatus::Lost → repair.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PosNackMsg {
+    pub v: u8,
+    /// challenge_id from the PosChallengeMsg this is responding to.
+    pub challenge_id: [u8; 16],
+    pub source_block_id: SourceBlockId,
+    /// The challenged ESI the holder cannot serve.
+    pub esi: u32,
+    pub timestamp: Timestamp,
+}
+
 /// Owner → Holder. Offer to store symbols for a source block.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SymbolOfferMsg {
@@ -236,6 +255,7 @@ pub enum Message {
     PeerAnnounce(PeerAnnounceMsg),
     PosChallenge(PosChallengeMsg),
     PosResponse(PosResponseMsg),
+    PosNack(PosNackMsg),
     SymbolOffer(SymbolOfferMsg),
     SymbolAccept(SymbolAcceptMsg),
     SymbolReject(SymbolRejectMsg),
