@@ -8,10 +8,10 @@ use syncback_core::{
         issue_revocation, master_identity, next_epoch, verify_device_certificate, verify_revocation,
         EpochCounter,
     },
-    constants::{ESCROW_TIER1_WEEKS, ESCROW_TIER2_WEEKS, ESCROW_TIER3_WEEKS, FREE_TIER_BYTES, TIER1_MAX_BYTES, TIER2_MAX_BYTES},
+    constants::DEFAULT_ESCROW_TRUST_FACTOR,
     db::testutil::test_db,
     erasure::{ErasureEncoder, RaptorQEncoder},
-    escrow::{check_restore, EscrowTier, RestoreDecision},
+    escrow::{check_restore, RestoreDecision},
     pos::{outcome_from_verify, select_challenge_esi, verify_response, PosResponse, VerifyOutcome},
     trust::{PosOutcome, TrustEngine},
     types::{
@@ -379,60 +379,46 @@ fn budget_selects_files_within_capacity() {
 // ─── 8. escrow_tier_progression ─────────────────────────────────────────────
 
 #[test]
-fn escrow_tier_progression() {
-    // 0 weeks, 0 bytes → FreeTier, allowed.
+fn escrow_trust_progression() {
+    let factor = DEFAULT_ESCROW_TRUST_FACTOR;
+
+    // trust=0.0, restore=0.5 GB → within free tier → Allowed.
     assert_eq!(
-        check_restore(0, 0),
+        check_restore(0.0, 0.5, factor),
         RestoreDecision::Allowed,
-        "free tier: 0 weeks, 0 bytes"
+        "free tier: trust=0, restore=0.5 GB"
     );
 
-    // 0 weeks, FREE_TIER_BYTES (1 GiB) → Tier1, denied (need 4 weeks).
-    match check_restore(0, FREE_TIER_BYTES) {
+    // trust=0.0, restore=1.5 GB → exceeds budget (1.0 GB) → Denied.
+    match check_restore(0.0, 1.5, factor) {
         RestoreDecision::Denied(d) => {
-            assert_eq!(d.tier, EscrowTier::Tier1);
-            assert_eq!(d.required_weeks, ESCROW_TIER1_WEEKS);
+            assert!((d.current_trust - 0.0).abs() < f64::EPSILON);
+            assert!(d.restore_budget_gb <= 1.5, "budget must be less than request");
         }
-        RestoreDecision::Allowed => panic!("expected denial for Tier1 with 0 weeks"),
+        RestoreDecision::Allowed => panic!("expected denial for hit-and-run node"),
     }
 
-    // 4 weeks, FREE_TIER_BYTES → Tier1, allowed.
+    // trust=2.0, restore=40.0 GB → within budget (41 GB) → Allowed.
     assert_eq!(
-        check_restore(ESCROW_TIER1_WEEKS, FREE_TIER_BYTES),
+        check_restore(2.0, 40.0, factor),
         RestoreDecision::Allowed,
-        "tier1: exactly 4 weeks"
+        "honest user: trust=2.0, restore=40 GB"
     );
 
-    // 4 weeks, TIER1_MAX_BYTES (5 GiB) → Tier2, denied (need 13 weeks).
-    match check_restore(ESCROW_TIER1_WEEKS, TIER1_MAX_BYTES) {
+    // trust=2.0, restore=42.0 GB → exceeds budget (41 GB) → Denied.
+    match check_restore(2.0, 42.0, factor) {
         RestoreDecision::Denied(d) => {
-            assert_eq!(d.tier, EscrowTier::Tier2);
-            assert_eq!(d.required_weeks, ESCROW_TIER2_WEEKS);
+            assert!((d.current_trust - 2.0).abs() < f64::EPSILON);
+            assert!(d.restore_budget_gb < 42.0);
         }
-        RestoreDecision::Allowed => panic!("expected denial for Tier2 with 4 weeks"),
+        RestoreDecision::Allowed => panic!("expected denial for large restore with trust=2"),
     }
 
-    // 13 weeks, TIER1_MAX_BYTES → Tier2, allowed.
+    // trust=5.0, restore=100.0 GB → within budget (101 GB) → Allowed.
     assert_eq!(
-        check_restore(ESCROW_TIER2_WEEKS, TIER1_MAX_BYTES),
+        check_restore(5.0, 100.0, factor),
         RestoreDecision::Allowed,
-        "tier2: exactly 13 weeks"
-    );
-
-    // 13 weeks, TIER2_MAX_BYTES (50 GiB) → Tier3, denied (need 26 weeks).
-    match check_restore(ESCROW_TIER2_WEEKS, TIER2_MAX_BYTES) {
-        RestoreDecision::Denied(d) => {
-            assert_eq!(d.tier, EscrowTier::Tier3);
-            assert_eq!(d.required_weeks, ESCROW_TIER3_WEEKS);
-        }
-        RestoreDecision::Allowed => panic!("expected denial for Tier3 with 13 weeks"),
-    }
-
-    // 26 weeks, TIER2_MAX_BYTES → Tier3, allowed.
-    assert_eq!(
-        check_restore(ESCROW_TIER3_WEEKS, TIER2_MAX_BYTES),
-        RestoreDecision::Allowed,
-        "tier3: exactly 26 weeks"
+        "high trust: trust=5.0, restore=100 GB"
     );
 }
 

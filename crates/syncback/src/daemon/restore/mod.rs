@@ -63,11 +63,13 @@ pub enum RestoreError {
     #[error("pack index parse failed for block {0}: {1}")]
     PackIndexParseFailed(SourceBlockId, String),
 
-    #[error("restore denied by holder {holder}: requires {required_weeks} weeks, have {current_weeks}")]
+    #[error("restore denied by holder {holder}: trust {current_trust:.2}, budget {restore_budget_gb:.1} GB, requested {restore_gb:.1} GB")]
     EscrowDenied {
         holder: IdentityPub,
-        required_weeks: u32,
-        current_weeks: u32,
+        current_trust: f64,
+        needed_trust: f64,
+        restore_budget_gb: f64,
+        restore_gb: f64,
     },
 
     #[error("network error: {0}")]
@@ -128,8 +130,6 @@ pub struct RestoreConfig {
     pub identity: IdentityPub,
     /// This device's ID (for LocalState).
     pub device_id: DeviceId,
-    /// weeks_in_network for escrow check on self-restore.
-    pub weeks_in_network: u32,
     /// Directory where bound symbol files are stored (must match BackupConfig.symbols_dir).
     /// Used for Phase 2 local restore.
     pub symbols_dir: PathBuf,
@@ -142,7 +142,6 @@ impl Default for RestoreConfig {
             parallel_holders: 5,
             identity: IdentityPub([0u8; 32]),
             device_id: DeviceId([0u8; 16]),
-            weeks_in_network: 0,
             symbols_dir: PathBuf::from("symbols"),
         }
     }

@@ -64,7 +64,6 @@ fn restore_config(symbols_dir: &TempDir) -> RestoreConfig {
         parallel_holders: 5,
         identity: IdentityPub([9u8; 32]),
         device_id: DEVICE_B,
-        weeks_in_network: 0,
         symbols_dir: symbols_dir.path().to_path_buf(),
     }
 }

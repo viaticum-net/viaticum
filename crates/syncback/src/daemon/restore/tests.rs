@@ -73,7 +73,6 @@ async fn test_restore_coord(
         parallel_holders: 5,
         identity: IdentityPub([9u8; 32]),
         device_id: DeviceId([2u8; 16]),
-        weeks_in_network: 0,
         symbols_dir: symbols_dir.path().to_path_buf(),
     };
 

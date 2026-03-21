@@ -28,25 +28,14 @@ pub const S_CLAMP_MIN: f64 = 0.1;
 /// S ceiling.
 pub const S_CLAMP_MAX: f64 = 1.0;
 
-// === Escrow tiers (weeks_in_network thresholds) ===
+// === Escrow (trust-based) ===
 
-/// Tier 1: basic restore access (1 month).
-pub const ESCROW_TIER1_WEEKS: u32 = 4;
+/// Demo credit — first 1 GB restorable at trust=0.
+pub const FREE_TIER_GB: f64 = 1.0;
 
-/// Tier 2: full restore access (3 months).
-pub const ESCROW_TIER2_WEEKS: u32 = 13;
-
-/// Tier 3: unlimited restore (6 months).
-pub const ESCROW_TIER3_WEEKS: u32 = 26;
-
-/// Free demo credit — first 1 GiB restorable with zero tenure.
-pub const FREE_TIER_BYTES: u64 = 1 << 30; // 1 GiB
-
-/// Tier 1 max cumulative restore (5 GiB).
-pub const TIER1_MAX_BYTES: u64 = 5 << 30; // 5 GiB
-
-/// Tier 2 max cumulative restore (50 GiB).
-pub const TIER2_MAX_BYTES: u64 = 50 << 30; // 50 GiB
+/// GB per unit of trust. To be calibrated via simulation.
+/// Default: trust=2.0 → budget = 1 + 2.0 × 20.0 = 41 GB.
+pub const DEFAULT_ESCROW_TRUST_FACTOR: f64 = 20.0;
 
 // === Cooldown (ransomware protection) ===
 
@@ -196,7 +185,5 @@ pub const POS_CONSECUTIVE_MISS_PRESUMED_LOST: u32 = 3;
 // === Compile-time sanity checks ===
 
 const _: () = assert!(S_CLAMP_MIN < S_CLAMP_MAX);
-const _: () = assert!(ESCROW_TIER1_WEEKS < ESCROW_TIER2_WEEKS);
-const _: () = assert!(ESCROW_TIER2_WEEKS < ESCROW_TIER3_WEEKS);
 const _: () = assert!(OVERHEAD_BASE > 1.0);
 const _: () = assert!(DECODE_OVERHEAD > 0);

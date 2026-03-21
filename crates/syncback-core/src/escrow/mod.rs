@@ -1,50 +1,9 @@
-use crate::constants::{
-    DROP_NOTICE_WINDOW_SECS, ESCROW_TIER1_WEEKS, ESCROW_TIER2_WEEKS, ESCROW_TIER3_WEEKS,
-    FREE_TIER_BYTES, HOLDER_DELETE_COOLDOWN_SECS, TIER1_MAX_BYTES, TIER2_MAX_BYTES,
-};
+use crate::constants::{DROP_NOTICE_WINDOW_SECS, FREE_TIER_GB, HOLDER_DELETE_COOLDOWN_SECS};
 use crate::types::Timestamp;
 
 // ============================================================
 // Types
 // ============================================================
-
-/// The escrow tier a restore request falls into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum EscrowTier {
-    /// First FREE_TIER_BYTES (1 GiB) restored: no weeks required.
-    FreeTier,
-    /// bytes_restored in [1 GiB, 5 GiB): requires >= ESCROW_TIER1_WEEKS (4 wk).
-    Tier1,
-    /// bytes_restored in [5 GiB, 50 GiB): requires >= ESCROW_TIER2_WEEKS (13 wk).
-    Tier2,
-    /// bytes_restored >= 50 GiB: requires >= ESCROW_TIER3_WEEKS (26 wk).
-    Tier3,
-}
-
-impl EscrowTier {
-    /// Minimum weeks_in_network required for this tier.
-    pub fn required_weeks(self) -> u32 {
-        match self {
-            EscrowTier::FreeTier => 0,
-            EscrowTier::Tier1 => ESCROW_TIER1_WEEKS,
-            EscrowTier::Tier2 => ESCROW_TIER2_WEEKS,
-            EscrowTier::Tier3 => ESCROW_TIER3_WEEKS,
-        }
-    }
-
-    /// Determine tier from cumulative bytes already restored to this owner.
-    pub fn from_bytes_restored(bytes_restored: u64) -> Self {
-        if bytes_restored < FREE_TIER_BYTES {
-            EscrowTier::FreeTier
-        } else if bytes_restored < TIER1_MAX_BYTES {
-            EscrowTier::Tier1
-        } else if bytes_restored < TIER2_MAX_BYTES {
-            EscrowTier::Tier2
-        } else {
-            EscrowTier::Tier3
-        }
-    }
-}
 
 /// Decision from check_restore().
 #[derive(Debug, Clone, PartialEq)]
@@ -54,13 +13,19 @@ pub enum RestoreDecision {
 }
 
 /// Reason for denial, sent back to owner as restore_denied message payload.
+///
+/// Fields map directly to the wire message fields from protocol.md §1.10:
+///   restore_denied { shard_id, reason, current_trust, needed_trust, restore_budget_gb }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RestoreDenial {
-    pub tier: EscrowTier,
-    pub required_weeks: u32,
-    pub current_weeks: u32,
-    /// How many more bytes they can restore before moving to next tier.
-    pub remaining_bytes_in_tier: u64,
+    /// Holder's trust score for this owner at the time of denial.
+    pub current_trust: f64,
+    /// Minimum trust score that would allow this restore.
+    /// needed_trust = (restore_gb - FREE_TIER_GB) / escrow_trust_factor
+    /// Clamped to 0.0 if restore_gb <= FREE_TIER_GB.
+    pub needed_trust: f64,
+    /// Max GB restorable at current trust level.
+    pub restore_budget_gb: f64,
 }
 
 /// Decision for holder cooldown (delete flow).
@@ -81,41 +46,35 @@ pub enum DropNoticeDecision {
 // Pure functions
 // ============================================================
 
+/// Compute max GB restorable at the given trust score.
+///
+/// Formula: max_restorable_gb = FREE_TIER_GB + trust * escrow_trust_factor
+///
+/// Trust is allowed to be negative (new peers in edge cases); result is clamped
+/// to FREE_TIER_GB minimum so the demo credit is always available.
+pub fn restore_budget(trust: f64, escrow_trust_factor: f64) -> f64 {
+    (FREE_TIER_GB + trust * escrow_trust_factor).max(FREE_TIER_GB)
+}
+
 /// Primary escrow check. Called by holder when owner requests restore.
 ///
-/// weeks_in_network: caller looks this up from PeerRecord.weeks_in_network
-/// bytes_already_restored: cumulative bytes holder has served to this owner
-pub fn check_restore(weeks_in_network: u32, bytes_already_restored: u64) -> RestoreDecision {
-    let tier = EscrowTier::from_bytes_restored(bytes_already_restored);
-    if tier == EscrowTier::FreeTier {
-        return RestoreDecision::Allowed;
-    }
-    let required = tier.required_weeks();
-    if weeks_in_network >= required {
+/// Parameters:
+///   trust               — holder's pairwise trust score for the owner
+///   restore_gb          — size of the requested restore in GB
+///   escrow_trust_factor — configurable multiplier (pass DEFAULT_ESCROW_TRUST_FACTOR unless overridden)
+///
+/// Returns: Allowed if restore_gb <= restore_budget(trust), else Denied.
+pub fn check_restore(trust: f64, restore_gb: f64, escrow_trust_factor: f64) -> RestoreDecision {
+    let budget = restore_budget(trust, escrow_trust_factor);
+    if restore_gb <= budget {
         RestoreDecision::Allowed
     } else {
+        let needed_trust = ((restore_gb - FREE_TIER_GB) / escrow_trust_factor).max(0.0);
         RestoreDecision::Denied(RestoreDenial {
-            tier,
-            required_weeks: required,
-            current_weeks: weeks_in_network,
-            remaining_bytes_in_tier: remaining_bytes_in_tier(bytes_already_restored),
+            current_trust: trust,
+            needed_trust,
+            restore_budget_gb: budget,
         })
-    }
-}
-
-/// Determine which tier applies to the given cumulative bytes restored.
-pub fn tier_for_bytes(bytes_restored: u64) -> EscrowTier {
-    EscrowTier::from_bytes_restored(bytes_restored)
-}
-
-/// How many bytes remain before moving to the next tier.
-/// Returns u64::MAX for Tier3 (no upper bound).
-pub fn remaining_bytes_in_tier(bytes_restored: u64) -> u64 {
-    match EscrowTier::from_bytes_restored(bytes_restored) {
-        EscrowTier::FreeTier => FREE_TIER_BYTES - bytes_restored,
-        EscrowTier::Tier1 => TIER1_MAX_BYTES - bytes_restored,
-        EscrowTier::Tier2 => TIER2_MAX_BYTES - bytes_restored,
-        EscrowTier::Tier3 => u64::MAX,
     }
 }
 
