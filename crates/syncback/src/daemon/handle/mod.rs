@@ -1,8 +1,8 @@
 // DaemonHandle: wires all subsystems and manages their lifecycle.
 //
-// Phase 6.2 skeleton: BackupCoordinator, RestoreCoordinator, RepairAgent,
-// RelayManager, NetworkHandle, and CliServer are started here.
-// Processor (6.3), Watcher (6.4), Scheduler (6.5) are TODO stubs.
+// All subsystems are started here: BackupCoordinator, RestoreCoordinator,
+// RepairAgent, RelayManager, NetworkHandle, Processor, Watcher, Scheduler,
+// and CliServer.
 
 #[cfg(test)]
 mod tests;
@@ -26,8 +26,10 @@ use syncback_core::types::{DeviceId, IdentityPub, Timestamp};
 
 use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent};
 use crate::daemon::cli_server::{self, CliServerConfig};
+use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
 use crate::daemon::identity::{derive_keys, load_identity, IdentityError};
 use crate::daemon::network::{NetworkConfig, NetworkHandle};
+use crate::daemon::processor::Processor;
 use crate::daemon::relay::{RelayConfig, RelayManager};
 use crate::daemon::repair::{RepairAgent, RepairConfig, RepairTrigger};
 use crate::daemon::restore::{RestoreConfig, RestoreCoordinator, RestoreError, RestoreRequest, RestoreResult};
@@ -153,10 +155,10 @@ impl DaemonHandle {
         let (repair_tx, repair_rx) = mpsc::channel::<RepairTrigger>(64);
         let (relay_sync_tx, relay_sync_rx) =
             mpsc::channel::<crate::daemon::relay::SyncTrigger>(64);
-        let (incoming_tx, _incoming_rx) =
+        let (incoming_tx, incoming_rx) =
             mpsc::channel::<crate::daemon::network::connection::Connection>(64);
-        // relay inbound messages (consumed by Processor in 6.3)
-        let (inbound_tx, _inbound_rx) =
+        // relay inbound messages — drained by a background task until Phase 7.6
+        let (inbound_tx, mut inbound_rx) =
             mpsc::channel::<crate::daemon::relay::InboundMessage>(128);
 
         // ── 7. Build erasure encoder ──────────────────────────────────────────
@@ -178,9 +180,11 @@ impl DaemonHandle {
         };
         let network = Arc::new(NetworkHandle::start(net_config, incoming_tx).await?);
 
-        // ── 9. Ensure symbols directory exists ────────────────────────────────
+        // ── 9. Ensure symbols and holdings directories exist ──────────────────
         let symbols_dir = cfg.data_dir.join("symbols");
         std::fs::create_dir_all(&symbols_dir)?;
+        let holdings_dir = cfg.data_dir.join("holdings");
+        std::fs::create_dir_all(&holdings_dir)?;
 
         // ── 10. Build subsystems ──────────────────────────────────────────────
         let source_block_size =
@@ -284,7 +288,50 @@ impl DaemonHandle {
             Ok(())
         }));
 
-        // TODO Phase 6.3: spawn Processor (routes incoming_rx, relay_sync_tx, repair_tx)
+        // ── Phase 7.2: spawn Processor ────────────────────────────────────────
+        let repair_tx_for_processor = repair_tx.clone();
+        if let Some(cs) = cluster_state.as_ref() {
+            let cluster_sync = Arc::new(ClusterSyncManager::new(
+                db.clone(),
+                ClusterSyncConfig {
+                    our_device_id: device_id,
+                    batch_size: 1000,
+                },
+                cs.clone(),
+            ));
+            let processor = Processor::new(
+                db.clone(),
+                identity_pub,
+                repair_tx_for_processor,
+                cluster_sync,
+                encoder.clone(),
+                holdings_dir.clone(),
+                symbols_dir.clone(), // source_blocks_dir: owner's blocks for PoS verification
+            );
+            let cancel_processor = cancel.clone();
+            tasks.push(tokio::spawn(async move {
+                processor.run(incoming_rx, cancel_processor).await
+            }));
+        } else {
+            tracing::warn!("cluster state unavailable — Processor not started, incoming connections will be dropped");
+            // Drop incoming_rx so the network accept loop's incoming_tx send() will
+            // eventually get channel-full backpressure rather than silent discard.
+            drop(incoming_rx);
+            drop(repair_tx_for_processor);
+        }
+
+        // Drain relay inbound messages at DEBUG level until Phase 7.6 wires them to Processor.
+        // NOTE: remove this drain task in Phase 7.6 when Processor gains an inbound_rx parameter.
+        tokio::spawn(async move {
+            while let Some(msg) = inbound_rx.recv().await {
+                tracing::debug!(
+                    from = %msg.from,
+                    msg_type = %msg.msg_type,
+                    "handle: relay inbound message (drained, not yet processed)"
+                );
+            }
+        });
+
         // Phase 6.4: spawn Watcher when watch_dirs are configured.
         if !cfg.watch_dirs.is_empty() {
             let watcher_config = WatcherConfig {
