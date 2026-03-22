@@ -65,6 +65,9 @@ pub enum Command {
         /// Directories to watch for backup (may be specified multiple times).
         #[arg(long)]
         watch_dir: Vec<std::path::PathBuf>,
+        /// Log output format: "text" (default) or "json".
+        #[arg(long, default_value = "text")]
+        log_format: String,
     },
 
     /// Initialize a new SyncBack identity
@@ -75,7 +78,11 @@ pub enum Command {
     },
 
     /// Show overall system status
-    Status,
+    Status {
+        /// Output as JSON (machine-readable)
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Restore a file or directory from backup
     Restore {
@@ -150,7 +157,8 @@ pub enum DeviceAction {
 pub fn run_command(cmd: &Command, socket_path: &str) -> Result<(), CliError> {
     let request = build_request(cmd)?;
     let response = send_request(socket_path, &request)?;
-    handle_response(response);
+    let json_output = matches!(cmd, Command::Status { json: true });
+    handle_response(response, json_output);
     Ok(())
 }
 
@@ -159,7 +167,7 @@ fn build_request(cmd: &Command) -> Result<CliRequest, CliError> {
     match cmd {
         Command::Daemon { .. } => unreachable!("Daemon command handled before run_command"),
         Command::Init { .. } => unreachable!("Init command handled before run_command"),
-        Command::Status => Ok(CliRequest::Status),
+        Command::Status { .. } => Ok(CliRequest::Status),
         Command::Restore {
             path,
             version,
@@ -216,9 +224,15 @@ fn validate_device_id_hex(id: &str) -> Result<(), CliError> {
 }
 
 /// Print the formatted response to stdout (or stderr for errors).
-fn handle_response(response: CliResponse) {
+fn handle_response(response: CliResponse, json_output: bool) {
     match response {
-        CliResponse::Status(data) => output::format_status(&data),
+        CliResponse::Status(data) => {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&data).unwrap());
+            } else {
+                output::format_status(&data);
+            }
+        }
         CliResponse::Restore(data) => output::format_restore(&data),
         CliResponse::DeviceList(devices) => output::format_device_list(&devices),
         CliResponse::DeviceAdded(device) => output::format_device_added(&device),

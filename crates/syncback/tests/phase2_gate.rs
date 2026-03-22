@@ -65,6 +65,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         cluster_state: None,
         network: None,
         watch_configs: vec![],
+        time_scale: 1,
     }
 }
 

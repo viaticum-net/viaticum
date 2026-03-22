@@ -37,7 +37,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use syncback_core::constants::{
-    DECODE_OVERHEAD, DEFAULT_ESCROW_TRUST_FACTOR, INITIAL_TRUST_P, SYMBOL_SIZE,
+    DECODE_OVERHEAD, DEFAULT_ESCROW_TRUST_FACTOR, INITIAL_TRUST_P, KI, KP, P_WINDOW_WEEKS,
+    SYMBOL_SIZE,
 };
 use syncback_core::escrow::{check_restore, RestoreDecision};
 use syncback_core::trust::compute_combined;
@@ -639,12 +640,31 @@ impl Processor {
         }
         self.db.upsert_placement(&updated)?;
 
-        // Update PoS weekly stats for trust calculation.
+        // Update PoS weekly stats and recalculate trust.
         let week = current_week_number();
         let pos_outcome = outcome_from_verify(&outcome, week);
         record_pos_weekly(&self.db, holder_id, pos_outcome);
 
+        // Recalculate trust scores from accumulated PoS history.
+        if let Some((old_p, old_i, new_p, new_i)) =
+            recalculate_trust(&self.db, &holder_id, week)
+        {
+            let old_combined = compute_combined(old_p, old_i, 1.0);
+            let new_combined = compute_combined(new_p, new_i, 1.0);
+            info!(
+                peer = %holder_id,
+                trust_p_before = format!("{old_p:.4}"),
+                trust_p_after = format!("{new_p:.4}"),
+                trust_i_before = format!("{old_i:.4}"),
+                trust_i_after = format!("{new_i:.4}"),
+                trust_combined_before = format!("{old_combined:.4}"),
+                trust_combined_after = format!("{new_combined:.4}"),
+                "trust: score updated after PoS"
+            );
+        }
+
         if transition.trigger_repair {
+            info!(block_id = %block_id, holder = %holder_id, "repair: triggered");
             let _ = self
                 .repair_tx
                 .send(RepairTrigger::RepairNow {
@@ -690,6 +710,7 @@ impl Processor {
     ) -> Result<(), ProcessorError> {
         let block_id = nack.source_block_id;
         self.handle_pos_nack_sync(from, &nack)?;
+        info!(block_id = %block_id, holder = %from, "repair: triggered");
         let _ = self
             .repair_tx
             .send(RepairTrigger::RepairNow {
@@ -724,6 +745,7 @@ impl Processor {
     ) -> Result<(), ProcessorError> {
         let block_id = dropped.source_block_id;
         self.handle_symbol_dropped_sync(from, &dropped)?;
+        info!(block_id = %block_id, holder = %from, "repair: triggered");
         let _ = self
             .repair_tx
             .send(RepairTrigger::RepairNow {
@@ -1223,7 +1245,7 @@ fn mark_placement_lost(
 }
 
 /// Record PoS outcome in the weekly stats table (best-effort, logs on error).
-fn record_pos_weekly(db: &Db, peer: IdentityPub, outcome: PosOutcome) {
+pub(crate) fn record_pos_weekly(db: &Db, peer: IdentityPub, outcome: PosOutcome) {
     let week = outcome.week_number;
     let existing = match db.get_pos_weekly(&peer, week) {
         Ok(v) => v,
@@ -1239,6 +1261,61 @@ fn record_pos_weekly(db: &Db, peer: IdentityPub, outcome: PosOutcome) {
     if let Err(e) = db.upsert_pos_weekly(&peer, week, &entry) {
         error!(peer = %peer, err = %e, "processor: failed to update pos_weekly");
     }
+}
+
+/// Recalculate trust P and I for a peer from pos_weekly data, persist to PeerRecord.
+/// Returns (old_p, old_i, new_p, new_i) for logging, or None on error.
+pub(crate) fn recalculate_trust(
+    db: &Db,
+    peer: &IdentityPub,
+    current_week: u32,
+) -> Option<(f64, f64, f64, f64)> {
+    let mut record = match db.get_peer(peer) {
+        Ok(Some(r)) => r,
+        _ => return None,
+    };
+    let old_p = record.trust_p;
+    let old_i = record.trust_i;
+
+    let entries = db.list_pos_weekly_for_peer(peer).unwrap_or_default();
+
+    // P: rolling window pass rate over last P_WINDOW_WEEKS weeks.
+    let window_start = current_week.saturating_sub(P_WINDOW_WEEKS - 1);
+    let mut p_challenged = 0u64;
+    let mut p_passed = 0u64;
+    let mut all_pass_rates: Vec<f64> = Vec::new();
+    for (week, entry) in &entries {
+        if entry.challenged > 0 {
+            let rate = entry.passed as f64 / entry.challenged as f64;
+            all_pass_rates.push(rate);
+            if *week >= window_start && *week <= current_week {
+                p_challenged += entry.challenged as u64;
+                p_passed += entry.passed as u64;
+            }
+        }
+    }
+
+    let new_p = if p_challenged == 0 {
+        INITIAL_TRUST_P
+    } else {
+        p_passed as f64 / p_challenged as f64
+    };
+
+    // I: cumulative mean of all weekly pass rates.
+    let new_i = if all_pass_rates.is_empty() {
+        0.0
+    } else {
+        all_pass_rates.iter().sum::<f64>() / all_pass_rates.len() as f64
+    };
+
+    record.trust_p = new_p;
+    record.trust_i = new_i;
+    if let Err(e) = db.upsert_peer(&record) {
+        error!(peer = %peer, err = %e, "processor: failed to persist trust update");
+        return None;
+    }
+
+    Some((old_p, old_i, new_p, new_i))
 }
 
 /// Convert a sorted list of ESIs to compact (start, count) ranges.
@@ -1271,7 +1348,7 @@ pub(crate) fn ranges_to_esi_list(ranges: &[(u32, u32)]) -> Vec<u32> {
 }
 
 /// Approximate protocol week number from the current unix timestamp (1-indexed).
-fn current_week_number() -> u32 {
+pub(crate) fn current_week_number() -> u32 {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

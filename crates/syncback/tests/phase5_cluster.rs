@@ -81,6 +81,7 @@ fn backup_cfg_with_cluster(
         cluster_state: Some(cluster_state),
         network: None,
         watch_configs: vec![],
+        time_scale: 1,
     }
 }
 

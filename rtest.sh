@@ -13,7 +13,7 @@ if ssh -o ConnectTimeout=2 -o BatchMode=yes "$SERVER" "echo ok" &>/dev/null; the
         --exclude .claude \
         --exclude '.git/objects' \
         . "$SERVER:~/$REMOTE_DIR/"
-    ssh "$SERVER" "cd ~/$REMOTE_DIR && cargo test $ARGS"
+    ssh "$SERVER" "source ~/.cargo/env && cd ~/$REMOTE_DIR && cargo test $ARGS"
     echo "=== Done (remote) ==="
 else
     echo "=== Server offline, testing locally ==="

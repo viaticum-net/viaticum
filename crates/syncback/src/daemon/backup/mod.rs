@@ -537,6 +537,7 @@ impl BackupCoordinator {
             );
         }
 
+        let symbol_count = symbols.len();
         let msg = SymbolTransferMsg {
             v: 1,
             source_block_id: result.source_block_id,
@@ -547,6 +548,14 @@ impl BackupCoordinator {
         network
             .send_symbols(placement.holder_id, msg)
             .await
-            .map_err(|e| anyhow::anyhow!("send_symbols: {e}"))
+            .map_err(|e| anyhow::anyhow!("send_symbols: {e}"))?;
+
+        tracing::info!(
+            holder = %placement.holder_id,
+            block_id = %result.source_block_id,
+            symbols = symbol_count,
+            "backup: symbols delivered"
+        );
+        Ok(())
     }
 }

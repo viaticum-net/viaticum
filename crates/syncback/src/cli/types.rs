@@ -79,6 +79,27 @@ pub struct StatusData {
     pub effective_quota_bytes: u64,
     /// Bytes currently used for held symbols.
     pub used_bytes: u64,
+    /// Total PoS challenges issued (all peers, all weeks).
+    #[serde(default)]
+    pub pos_total_challenges: u32,
+    /// Total PoS challenges passed (all peers, all weeks).
+    #[serde(default)]
+    pub pos_total_passes: u32,
+    /// Total placement records.
+    #[serde(default)]
+    pub placement_count: u32,
+    /// Placements with Alive status.
+    #[serde(default)]
+    pub placement_alive: u32,
+    /// Placements with Lost/PresumedLost status.
+    #[serde(default)]
+    pub placement_lost: u32,
+    /// Source blocks with alive placements >= k (healthy).
+    #[serde(default)]
+    pub blocks_ok: u32,
+    /// Source blocks with alive placements < k (at risk).
+    #[serde(default)]
+    pub blocks_at_risk: u32,
 }
 
 /// Peer summary shown in `syncback status`.
@@ -94,6 +115,21 @@ pub struct PeerSummary {
     pub bytes_peer_stores: u64,
     /// ISO-8601 date of last_seen.
     pub last_seen: String,
+    /// Proportional trust component.
+    #[serde(default)]
+    pub trust_p: f64,
+    /// Integral trust component.
+    #[serde(default)]
+    pub trust_i: f64,
+    /// Storage balance factor.
+    #[serde(default)]
+    pub trust_s: f64,
+    /// PoS challenges in last 4 weeks.
+    #[serde(default)]
+    pub pos_challenges_recent: u32,
+    /// PoS passes in last 4 weeks.
+    #[serde(default)]
+    pub pos_passes_recent: u32,
 }
 
 /// Data returned by `syncback restore`.

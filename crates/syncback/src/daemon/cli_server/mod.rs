@@ -198,6 +198,25 @@ fn dispatch_status(state: &DaemonState) -> CliResponse {
             return CliResponse::Error(format!("db error reading source blocks: {e}"));
         }
     };
+    let placements = match state.db.list_all_placements() {
+        Ok(p) => p,
+        Err(e) => {
+            return CliResponse::Error(format!("db error reading placements: {e}"));
+        }
+    };
+
+    // PoS totals across all peers.
+    let (pos_total_challenges, pos_total_passes) = state.db.total_pos_stats().unwrap_or((0, 0));
+
+    // Current week for recent PoS window (last 4 weeks).
+    let now_week = {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        ((secs / 604_800) as u32).max(1)
+    };
+    let recent_window_start = now_week.saturating_sub(3); // last 4 weeks inclusive
 
     // Compute peer summaries, sorted by combined trust descending (top 20).
     let mut peer_summaries: Vec<PeerSummary> = peers
@@ -206,12 +225,29 @@ fn dispatch_status(state: &DaemonState) -> CliResponse {
             let combined = compute_combined(p.trust_p, p.trust_i, p.trust_s);
             let identity_hex = bytes_to_hex_8(&p.identity.0);
             let last_seen = timestamp_to_iso(p.last_seen);
+
+            // Recent PoS stats for this peer.
+            let (ch, pa) = state
+                .db
+                .list_pos_weekly_for_peer(&p.identity)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(week, _)| *week >= recent_window_start)
+                .fold((0u32, 0u32), |(c, p), (_, e)| {
+                    (c.saturating_add(e.challenged), p.saturating_add(e.passed))
+                });
+
             PeerSummary {
                 identity_hex,
                 trust: combined,
                 bytes_we_store: p.bytes_we_store_for_peer,
                 bytes_peer_stores: p.bytes_peer_stores_for_us,
                 last_seen,
+                trust_p: p.trust_p,
+                trust_i: p.trust_i,
+                trust_s: p.trust_s,
+                pos_challenges_recent: ch,
+                pos_passes_recent: pa,
             }
         })
         .collect();
@@ -243,6 +279,37 @@ fn dispatch_status(state: &DaemonState) -> CliResponse {
         .filter(|b| b.status == SourceBlockStatus::Stale)
         .count() as u32;
 
+    // Placement stats.
+    use syncback_core::types::PlacementStatus;
+    let placement_count = placements.len() as u32;
+    let placement_alive = placements
+        .iter()
+        .filter(|p| matches!(p.status, PlacementStatus::Alive | PlacementStatus::Uncertain))
+        .count() as u32;
+    let placement_lost = placements
+        .iter()
+        .filter(|p| matches!(p.status, PlacementStatus::Lost | PlacementStatus::PresumedLost))
+        .count() as u32;
+
+    // Block health: per source block, count alive placements vs k.
+    use std::collections::HashMap;
+    let mut alive_per_block: HashMap<[u8; 32], u32> = HashMap::new();
+    for pl in &placements {
+        if matches!(pl.status, PlacementStatus::Alive | PlacementStatus::Uncertain) {
+            *alive_per_block.entry(pl.source_block_id.0).or_default() += 1;
+        }
+    }
+    let mut blocks_ok = 0u32;
+    let mut blocks_at_risk = 0u32;
+    for sb in &source_blocks {
+        let alive = alive_per_block.get(&sb.block_id.0).copied().unwrap_or(0);
+        if alive >= sb.k {
+            blocks_ok += 1;
+        } else {
+            blocks_at_risk += 1;
+        }
+    }
+
     let node_identity = hex_encode(&state.identity_pub.0);
 
     let node_addr = crate::daemon::network::addr::resolve_local_addr(&state.network);
@@ -266,6 +333,13 @@ fn dispatch_status(state: &DaemonState) -> CliResponse {
             )
         },
         used_bytes: holdings_bytes,
+        pos_total_challenges,
+        pos_total_passes,
+        placement_count,
+        placement_alive,
+        placement_lost,
+        blocks_ok,
+        blocks_at_risk,
     })
 }
 

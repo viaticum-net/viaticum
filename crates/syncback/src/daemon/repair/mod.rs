@@ -315,7 +315,7 @@ impl RepairAgent {
         loop {
             tokio::select! {
                 _ = timer.tick() => {
-                    tracing::debug!("RepairAgent: periodic scan triggered");
+                    tracing::info!("RepairAgent: periodic scan triggered");
                     self.scan_and_repair().await;
                 }
                 maybe_trigger = rx.recv() => {

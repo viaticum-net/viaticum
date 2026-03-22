@@ -244,10 +244,19 @@ pub fn run_pipeline(
         db.append_event(&entry)?;
     }
 
+    let n = params.n;
+    tracing::info!(
+        block_id = %block_id,
+        k = params.k,
+        n,
+        holders = allocations_result.len(),
+        "backup: pipeline complete"
+    );
+
     Ok(PipelineResult {
         source_block_id: block_id,
         k: params.k,
-        n: params.n,
+        n,
         symbol_count_per_holder,
         stored_size: stored.len() as u64,
     })

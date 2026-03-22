@@ -1017,6 +1017,22 @@ impl Db {
         }
         Ok(result)
     }
+
+    /// Sum all challenged and passed counts across all peers and all weeks.
+    /// Returns (total_challenged, total_passed).
+    pub fn total_pos_stats(&self) -> Result<(u32, u32), DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(POS_WEEKLY)?;
+        let mut challenged = 0u32;
+        let mut passed = 0u32;
+        for item in table.iter()? {
+            let (_k, v) = item?;
+            let entry: WeeklyPosEntry = from_cbor_bytes(v.value())?;
+            challenged = challenged.saturating_add(entry.challenged);
+            passed = passed.saturating_add(entry.passed);
+        }
+        Ok((challenged, passed))
+    }
 }
 
 // ============================================================

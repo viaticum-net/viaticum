@@ -14,7 +14,7 @@ if ssh -o ConnectTimeout=2 -o BatchMode=yes "$SERVER" "echo ok" &>/dev/null; the
         --exclude .claude \
         --exclude '.git/objects' \
         . "$SERVER:~/$REMOTE_DIR/"
-    ssh "$SERVER" "cd ~/$REMOTE_DIR && cargo build $ARGS"
+    ssh "$SERVER" "source ~/.cargo/env && cd ~/$REMOTE_DIR && cargo build $ARGS"
     echo "=== Copying binary ==="
     mkdir -p target/release
     scp "$SERVER:~/$REMOTE_DIR/target/release/syncback" target/release/ 2>/dev/null || true

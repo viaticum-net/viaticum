@@ -17,7 +17,7 @@ use std::time::Duration;
 use syncback_core::constants::{POS_TIMEOUT_SECS, KI, KP, S_CLAMP_MAX, S_CLAMP_MIN};
 use syncback_core::db::Db;
 use syncback_core::messages::{Message, PosChallengeMsg};
-use syncback_core::pos::{apply_pos_outcome, due_challenges, select_challenge_esi, VerifyOutcome};
+use syncback_core::pos::{apply_pos_outcome, due_challenges, outcome_from_verify, select_challenge_esi, VerifyOutcome};
 use syncback_core::types::{IdentityPub, PlacementStatus, SourceBlockId, Timestamp};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -299,7 +299,7 @@ impl Scheduler {
                 },
             );
 
-            debug!(
+            info!(
                 block_id = %entry.source_block_id,
                 holder_id = %entry.holder_id,
                 esi,
@@ -380,6 +380,12 @@ impl Scheduler {
                 // Don't remove from pending if we couldn't persist — retry next cycle.
                 continue;
             }
+
+            // Record timeout as a challenged-but-not-passed event for trust.
+            let week = crate::daemon::processor::current_week_number();
+            let pos_outcome = outcome_from_verify(&VerifyOutcome::Timeout, week);
+            crate::daemon::processor::record_pos_weekly(&self.db, holder_id, pos_outcome);
+            crate::daemon::processor::recalculate_trust(&self.db, &holder_id, week);
 
             info!(
                 block_id = %block_id,

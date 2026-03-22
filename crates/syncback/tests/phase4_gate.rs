@@ -69,6 +69,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         cluster_state: None,
         network: None,
         watch_configs: vec![],
+        time_scale: 1,
     }
 }
 
@@ -136,6 +137,7 @@ fn config_source_block_size_drives_backup() {
             cluster_state: None,
             network: None,
             watch_configs: vec![],
+            time_scale: 1,
         },
         Arc::new(RaptorQEncoder::new()),
     );

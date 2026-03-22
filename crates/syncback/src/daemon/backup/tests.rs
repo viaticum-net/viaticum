@@ -987,6 +987,7 @@ fn coord_with_watch(
         cluster_state: None,
         network: None,
         watch_configs,
+        time_scale: 1,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }

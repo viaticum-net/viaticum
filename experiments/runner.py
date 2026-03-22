@@ -57,39 +57,13 @@ class Node:
         raise TimeoutError(f"{self.container} not ready after {timeout}s")
 
     def status(self) -> dict:
-        """Query daemon status via CLI. Parse human output into dict."""
-        raw = self.exec("syncback", "status")
-        result = {}
-        for line in raw.strip().split('\n'):
-            parts = line.split(':', 1)
-            if len(parts) == 2:
-                key = parts[0].strip().replace(' ', '_')
-                val = parts[1].strip()
-                result[key] = val
-        return result
-
-    def status_json(self) -> dict:
-        """Query daemon status via raw socket JSON."""
-        raw = self.exec("sh", "-c",
-            'echo \'{"cmd":"status"}\' | socat - UNIX-CONNECT:/home/syncback/.syncback/syncback.sock')
-        return json.loads(raw)
-
-    def peers(self) -> str:
-        """Get peers list."""
-        return self.exec("syncback", "peers")
-
-    def peers_json(self) -> dict:
-        """Get peers via socket."""
-        raw = self.exec("sh", "-c",
-            'echo \'{"cmd":"peers"}\' | socat - UNIX-CONNECT:/home/syncback/.syncback/syncback.sock')
+        """Query daemon status via CLI JSON output."""
+        raw = self.exec("syncback", "status", "--json")
         return json.loads(raw)
 
     def connect_peer(self, node_addr: str) -> str:
-        """Connect to another peer by node_addr JSON string."""
-        escaped = node_addr.replace('"', '\\"')
-        raw = self.exec("sh", "-c",
-            f'echo \'{{"cmd":"connect_peer","node_addr":"{escaped}"}}\' | socat - UNIX-CONNECT:/home/syncback/.syncback/syncback.sock')
-        return raw
+        """Connect to another peer by node address."""
+        return self.exec("syncback", "connect", node_addr)
 
     def backup(self) -> str:
         """Trigger immediate backup."""
@@ -101,12 +75,8 @@ class Node:
 
     def get_node_addr(self) -> str:
         """Get this node's addr from status."""
-        status = self.status_json()
-        # StatusOk has own_node_id field
-        if "own_node_id" in status:
-            self.node_addr = status["own_node_id"]
-        elif "status_ok" in status:
-            self.node_addr = status["status_ok"].get("own_node_id", "")
+        status = self.status()
+        self.node_addr = status.get("node_addr", "")
         return self.node_addr or ""
 
     def create_test_files(self, n: int = 5, size_kb: int = 10) -> list[str]:
@@ -235,22 +205,20 @@ class MetricsCollector:
     def snapshot(self, scenario: str, node_name: str, node: Node) -> None:
         """Take a status snapshot from a node."""
         try:
-            status = node.status_json()
+            status = node.status()
             ts = datetime.utcnow().isoformat()
-
-            payload = status.get("status_ok", status)
             self.conn.execute("""
                 INSERT INTO snapshots (ts, scenario, node, uptime_secs, peer_count,
                     shards_held, shards_placed, budget_gb, dirty_files, raw_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 ts, scenario, node_name,
-                payload.get("uptime_secs", 0),
-                payload.get("peer_count", 0),
-                payload.get("shards_held", 0),
-                payload.get("shards_placed", 0),
-                payload.get("budget_gb", 0.0),
-                payload.get("dirty_files", 0),
+                0,  # uptime not in status yet
+                status.get("peer_count", 0),
+                status.get("holding_bytes", 0),
+                status.get("placement_count", 0),
+                0.0,  # budget_gb not directly available
+                0,    # dirty_files not in status yet
                 json.dumps(status)
             ))
             self.conn.commit()
@@ -260,11 +228,9 @@ class MetricsCollector:
     def snapshot_peers(self, scenario: str, node_name: str, node: Node) -> None:
         """Take a peers snapshot from a node."""
         try:
-            peers = node.peers_json()
+            status = node.status()
             ts = datetime.utcnow().isoformat()
-
-            peer_list = peers.get("peers_ok", {}).get("peers", [])
-            for p in peer_list:
+            for p in status.get("peers", []):
                 self.conn.execute("""
                     INSERT INTO peer_snapshots (ts, scenario, node, peer_identity,
                         trust_p, trust_i, trust_s, trust_score, weeks_in_network,
@@ -272,13 +238,13 @@ class MetricsCollector:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     ts, scenario, node_name,
-                    p.get("identity", ""),
+                    p.get("identity_hex", ""),
                     p.get("trust_p", 0.0),
                     p.get("trust_i", 0.0),
                     p.get("trust_s", 0.0),
-                    p.get("trust_score", 0.0),
-                    p.get("weeks_in_network", 0),
-                    p.get("shards_held_for_us", 0)
+                    p.get("trust", 0.0),
+                    0,  # weeks_in_network not directly available
+                    p.get("bytes_peer_stores", 0)
                 ))
             self.conn.commit()
         except Exception as e:

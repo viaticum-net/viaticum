@@ -65,6 +65,7 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         cluster_state: None,
         network: None,
         watch_configs: vec![],
+        time_scale: 1,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -935,9 +936,9 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
         std::fs::write(block_dir_h2.join(format!("{}.bin", sym.esi)), &sym.data).unwrap();
     }
 
-    let (tx_h1, mut rx_h1) =
+    let (tx_h1, rx_h1) =
         tokio::sync::mpsc::channel::<crate::daemon::network::connection::Connection>(4);
-    let (tx_h2, mut rx_h2) =
+    let (tx_h2, rx_h2) =
         tokio::sync::mpsc::channel::<crate::daemon::network::connection::Connection>(4);
 
     let handle_h1 = NetworkHandle::start(

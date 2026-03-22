@@ -21,6 +21,7 @@ sha2 = { workspace = true }
 zstd = { workspace = true }
 ciborium = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 rand = { workspace = true }
 iroh = { workspace = true }
 ed25519-dalek = { workspace = true }

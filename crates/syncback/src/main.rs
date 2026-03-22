@@ -13,8 +13,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Daemon {
             time_scale,
             watch_dir,
+            log_format,
         } => {
-            tracing_subscriber::fmt::init();
+            if log_format == "json" {
+                tracing_subscriber::fmt().json().init();
+            } else {
+                tracing_subscriber::fmt::init();
+            }
 
             let cfg = DaemonConfig {
                 data_dir: global_dir.clone(),

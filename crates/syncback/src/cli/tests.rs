@@ -17,7 +17,7 @@ fn parse(args: &[&str]) -> Command {
 
 #[test]
 fn command_status_parses_correctly() {
-    assert!(matches!(parse(&["syncback", "status"]), Command::Status));
+    assert!(matches!(parse(&["syncback", "status"]), Command::Status { json: false }));
 }
 
 #[test]
@@ -199,7 +199,7 @@ fn run_command_device_revoke_rejects_non_hex() {
 
 #[test]
 fn run_command_fails_when_daemon_not_running() {
-    let cmd = Command::Status;
+    let cmd = Command::Status { json: false };
     let err =
         super::run_command(&cmd, "/tmp/syncback_test_nonexistent_9999.sock").unwrap_err();
     assert!(matches!(err, CliError::DaemonNotRunning { .. }));
@@ -254,6 +254,13 @@ fn make_status_zero_peers() -> StatusData {
         peers: vec![],
         effective_quota_bytes: 0,
         used_bytes: 0,
+        pos_total_challenges: 0,
+        pos_total_passes: 0,
+        placement_count: 0,
+        placement_alive: 0,
+        placement_lost: 0,
+        blocks_ok: 0,
+        blocks_at_risk: 0,
     }
 }
 
@@ -297,6 +304,11 @@ fn format_status_top_peers_printed() {
                 bytes_we_store: 1_288_490_189,
                 bytes_peer_stores: 858_993_459,
                 last_seen: "2026-03-20".into(),
+                trust_p: 0.8,
+                trust_i: 1.2,
+                trust_s: 0.9,
+                pos_challenges_recent: 4,
+                pos_passes_recent: 4,
             },
             PeerSummary {
                 identity_hex: "e5f60708090a0b0c".into(),
@@ -304,10 +316,22 @@ fn format_status_top_peers_printed() {
                 bytes_we_store: 429_496_730,
                 bytes_peer_stores: 2_254_857_830,
                 last_seen: "2026-03-19".into(),
+                trust_p: 0.7,
+                trust_i: 1.0,
+                trust_s: 0.85,
+                pos_challenges_recent: 4,
+                pos_passes_recent: 3,
             },
         ],
         effective_quota_bytes: 0,
         used_bytes: 0,
+        pos_total_challenges: 8,
+        pos_total_passes: 7,
+        placement_count: 10,
+        placement_alive: 8,
+        placement_lost: 2,
+        blocks_ok: 3,
+        blocks_at_risk: 1,
     };
     let rendered = output::render_status(&data);
     assert!(rendered.contains("a1b2c3d4"), "got: {rendered}");
@@ -670,6 +694,13 @@ fn cli_response_roundtrips_cbor() {
             peers: vec![],
             effective_quota_bytes: 0,
             used_bytes: 1_000_000,
+            pos_total_challenges: 0,
+            pos_total_passes: 0,
+            placement_count: 0,
+            placement_alive: 0,
+            placement_lost: 0,
+            blocks_ok: 0,
+            blocks_at_risk: 0,
         }),
         CliResponse::DeviceList(vec![]),
         CliResponse::Error("oops".into()),

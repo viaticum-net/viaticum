@@ -55,6 +55,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         cluster_state: None,
         network: None,
         watch_configs: vec![],
+        time_scale: 1,
     }
 }
 
@@ -317,6 +318,7 @@ async fn full_lifecycle_e2e() {
             cluster_state: Some(Arc::clone(&cluster_state)),
             network: None,
             watch_configs: vec![],
+            time_scale: 1,
         },
         Arc::new(RaptorQEncoder::new()),
     );
