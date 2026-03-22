@@ -1,0 +1,6 @@
+apiVersion: 1
+datasources:
+  - name: VictoriaMetrics
+    type: prometheus
+    url: http://victoria:8428
+    isDefault: true

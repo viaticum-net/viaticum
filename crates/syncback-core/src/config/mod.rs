@@ -204,6 +204,32 @@ impl Default for ClusterCfg {
 }
 
 // ============================================================
+// Metrics config
+// ============================================================
+
+/// Configuration for periodic metrics push to a Prometheus-compatible endpoint.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MetricsCfg {
+    /// Enable metrics push.
+    pub enabled: bool,
+    /// URL to POST Prometheus text metrics to (e.g. VictoriaMetrics import endpoint).
+    pub push_url: String,
+    /// Push interval in seconds.
+    pub push_interval_secs: u64,
+}
+
+impl Default for MetricsCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            push_url: String::new(),
+            push_interval_secs: 60,
+        }
+    }
+}
+
+// ============================================================
 // Top-level config
 // ============================================================
 
@@ -217,6 +243,7 @@ pub struct AppConfig {
     pub escrow: EscrowCfg,
     pub network: NetworkCfg,
     pub cluster: ClusterCfg,
+    pub metrics: MetricsCfg,
     /// Per-directory watch configuration.
     /// Listed as [[watch]] array in config.toml.
     /// When empty, watch_dirs from CLI are used with DEFAULT_IMPORTANCE.
@@ -335,6 +362,13 @@ impl AppConfig {
             return Err(ConfigError::Validation {
                 field: "cluster.sync_batch_size".to_string(),
                 reason: "must be >= 1".to_string(),
+            });
+        }
+
+        if self.metrics.enabled && self.metrics.push_url.is_empty() {
+            return Err(ConfigError::Validation {
+                field: "metrics.push_url".to_string(),
+                reason: "push_url must be set when metrics are enabled".to_string(),
             });
         }
 

@@ -3,7 +3,7 @@ use std::io::Write;
 
 #[cfg(test)]
 use crate::config::{
-    AppConfig, BackupCfg, ClusterCfg, ConfigError, EscrowCfg, NetworkCfg, StorageCfg, WatchConfig,
+    AppConfig, BackupCfg, ClusterCfg, ConfigError, EscrowCfg, MetricsCfg, NetworkCfg, StorageCfg, WatchConfig,
     disk_reserve_bytes, expand_data_dir, hard_quota_bytes, lookup_importance, soft_quota_bytes,
     source_block_size_bytes, DEFAULT_IMPORTANCE,
 };
@@ -79,6 +79,7 @@ fn config_roundtrips_all_fields() {
         cluster: ClusterCfg {
             sync_batch_size: 200,
         },
+        metrics: MetricsCfg::default(),
         watch: vec![],
     };
 

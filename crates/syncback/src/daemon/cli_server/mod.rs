@@ -173,7 +173,7 @@ pub(crate) async fn dispatch(request: CliRequest, state: &DaemonState) -> CliRes
 
 // ── Status ────────────────────────────────────────────────────────────────────
 
-fn dispatch_status(state: &DaemonState) -> CliResponse {
+pub(crate) fn dispatch_status(state: &DaemonState) -> CliResponse {
     let peers = match state.db.list_all_peers() {
         Ok(p) => p,
         Err(e) => {

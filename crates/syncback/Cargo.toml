@@ -30,6 +30,7 @@ thiserror = { workspace = true }
 bip39 = { workspace = true }
 notify = { workspace = true }
 libc = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 syncback-core = { workspace = true, features = ["testutil"] }

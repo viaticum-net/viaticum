@@ -69,5 +69,8 @@ notify = "6"
 # System
 libc = "0.2"
 
+# HTTP client (metrics push)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
 # Internal
 syncback-core = { path = "crates/syncback-core" }

@@ -382,6 +382,13 @@ impl DaemonHandle {
             disk_reserve_bytes: syncback_core::config::disk_reserve_bytes(&app_config),
         });
 
+        // Clone state for metrics pusher before cli_server consumes it.
+        let state_for_metrics = if app_config.metrics.enabled {
+            Some(state.clone())
+        } else {
+            None
+        };
+
         // ── 13. Start CLI server ──────────────────────────────────────────────
         let cli_config = CliServerConfig {
             socket_path: cfg.socket_path.clone(),
@@ -500,6 +507,15 @@ impl DaemonHandle {
         tasks.push(tokio::spawn(async move {
             scheduler.run(cancel_scheduler).await
         }));
+
+        // ── Metrics pusher (optional) ──────────────────────────────────────
+        if let Some(state_m) = state_for_metrics {
+            let metrics_cfg = app_config.metrics.clone();
+            let cancel_m = cancel.clone();
+            tasks.push(tokio::spawn(async move {
+                crate::daemon::metrics::run(metrics_cfg, state_m, cancel_m).await
+            }));
+        }
 
         // Keep channel senders alive so receivers don't immediately close.
         // They are moved into a background task that holds them until cancel fires.

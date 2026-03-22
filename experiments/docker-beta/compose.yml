@@ -59,11 +59,36 @@ services:
     networks:
       - syncback-net
 
+  victoria:
+    image: victoriametrics/victoria-metrics:latest
+    container_name: syncback-beta-victoria
+    ports:
+      - "8428:8428"
+    volumes:
+      - victoria-data:/victoria-metrics-data
+    networks:
+      - syncback-net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: syncback-beta-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    networks:
+      - syncback-net
+
 networks:
   syncback-net:
     driver: bridge
 
 volumes:
+  victoria-data:
+  grafana-data:
   node-a-data:
   node-a-files:
   node-b-data:
