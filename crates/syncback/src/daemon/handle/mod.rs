@@ -311,6 +311,7 @@ impl DaemonHandle {
                 cluster_state: cluster_state.clone(),
                 network: Some(network.clone()),
                 watch_configs: app_config.watch.clone(),
+                time_scale: cfg.time_scale.max(1),
             },
             encoder.clone(),
         );

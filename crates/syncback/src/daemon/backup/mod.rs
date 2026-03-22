@@ -101,6 +101,8 @@ pub struct BackupConfig {
     /// Used to look up the importance of a file when creating a backup event.
     /// When empty, DEFAULT_IMPORTANCE (0.5) is used for all files.
     pub watch_configs: Vec<WatchConfig>,
+    /// Time acceleration factor. Divides flush timer intervals.
+    pub time_scale: u64,
 }
 
 impl Default for BackupConfig {
@@ -114,6 +116,7 @@ impl Default for BackupConfig {
             cluster_state: None,
             network: None,
             watch_configs: vec![],
+            time_scale: 1,
         }
     }
 }
@@ -336,12 +339,13 @@ impl BackupCoordinator {
     ) -> anyhow::Result<()> {
         use tokio::time::{interval, Duration, MissedTickBehavior};
 
+        let scale = self.config.time_scale.max(1);
         let mut idle_timer =
-            interval(Duration::from_secs(syncback_core::constants::FLUSH_IDLE_SECS));
+            interval(Duration::from_secs((syncback_core::constants::FLUSH_IDLE_SECS / scale).max(1)));
         idle_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         let mut fallback_timer =
-            interval(Duration::from_secs(syncback_core::constants::FLUSH_FALLBACK_SECS));
+            interval(Duration::from_secs((syncback_core::constants::FLUSH_FALLBACK_SECS / scale).max(1)));
         fallback_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
@@ -366,7 +370,7 @@ impl BackupCoordinator {
                 }
                 _ = idle_timer.tick() => {
                     tracing::debug!("idle flush triggered");
-                    match self.flush_all(false) {
+                    match self.flush_all(true) {
                         Ok(results) => {
                             if !results.is_empty() {
                                 self.deliver_symbols(&results).await;

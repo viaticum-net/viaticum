@@ -33,6 +33,7 @@ fn test_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         cluster_state: None,
         network: None,
         watch_configs: vec![],
+        time_scale: 1,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -330,6 +331,7 @@ fn pipeline_roundtrip_can_decode() {
         cluster_state: None,
         network: None,
         watch_configs: vec![],
+        time_scale: 1,
     };
     let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let mut coord = BackupCoordinator::new(db.clone(), config, encoder.clone());
@@ -645,6 +647,7 @@ fn dedup_via_cluster_state_skips_already_backed_up() {
         cluster_state: Some(cluster_state),
         network: None,
         watch_configs: vec![],
+        time_scale: 1,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
