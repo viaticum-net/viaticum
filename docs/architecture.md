@@ -1,6 +1,8 @@
-# Архитектура демона SyncBack β
+# SyncBack Architecture
 
-*2026-03-21. Отражает реальный код Phases 1–2.7.*
+*2026-03-22. Reflects actual code — all phases complete (675 tests, ~32K lines Rust).*
+
+*See also: [overview.md](overview.md) for end-to-end flows, [logic.md](logic.md) for algorithms, [protocol.md](protocol.md) for wire format.*
 
 ---
 
@@ -27,13 +29,19 @@
 ┌─────────────────────────── syncback (daemon) ───────────────────────────┐
 │  (tokio async, iroh transport, координаторы)                             │
 │                                                                          │
-│  network ◄──── incoming connections (ALPN "syncback/1")                 │
+│  handle ────── DaemonHandle: owns & wires all subsystems                │
 │     │                                                                    │
-│     ├──► backup      (BackupCoordinator: watcher events → symbols)      │
-│     ├──► restore     (RestoreCoordinator: symbols → files)              │
-│     ├──► repair      (RepairAgent: Lost/PresumedLost → re-encode)       │
+│     ├──► network      (iroh QUIC, NAT relay, connection pool, backoff)  │
+│     ├──► processor    (message router: dispatches all incoming msgs)     │
+│     ├──► backup       (BackupCoordinator: watcher → symbols)            │
+│     ├──► restore      (RestoreCoordinator: symbols → files)             │
+│     ├──► repair       (RepairAgent: Lost/PresumedLost → re-encode)      │
+│     ├──► scheduler    (PoS challenge scheduling, timeout detection)     │
+│     ├──► watcher      (fs-notify: recursive watch → DirtyEvent)         │
+│     ├──► relay        (RelayManager: epidemic board, hop≤2)             │
 │     ├──► cluster_sync (ClusterSyncManager: event log exchange)          │
-│     └──► relay       (RelayManager: epidemic board, hop≤2)              │
+│     ├──► cli_server   (Unix socket: CLI commands → DaemonState)         │
+│     └──► identity     (BIP39 → HKDF → keys, identity file mgmt)        │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -57,12 +65,16 @@ crates/syncback-core/src/
   db/             — Db newtype + HotCache + CRUD методы для всех таблиц
   trust/          — TrustEngine (P/I/S формула)
   escrow/         — EscrowChecker (trust-based gate)
-  budget/         — BudgetEngine (GB estimate)
+  budget/         — BudgetEngine (GB estimate, eviction priority)
   placement/      — SymbolBudgetEngine (weighted allocation)
   erasure/        — ErasureEncoder trait + RaptorQ impl + per-holder binding
   cluster/        — DeviceCertificate, RevocationCertificate, ClusterState, epochs
   pos/            — PosEngine (challenge selection, verify, adaptive schedule)
   messages/       — все wire-сообщения + relay board helpers
+  config/         — TOML config loading and validation (AppConfig)
+  commitment/     — Holder eviction risk estimation (CommitmentScore)
+  reliability/    — P(block recoverable) forecast (Binomial model)
+  deletion/       — Double cooldown deletion flow + vacuum
 ```
 
 ### syncback
@@ -71,15 +83,23 @@ Daemon + CLI. Использует tokio. Импортирует `syncback-core`
 
 ```
 crates/syncback/src/
+  main.rs         — binary entry point: CLI dispatch, tracing setup
   lib.rs          — pub mod daemon
+  cli/            — Clap CLI, CliRequest/CliResponse types, output formatting
   daemon/
     mod.rs        — pub mod на все daemon модули
+    handle/       — DaemonHandle: top-level wiring, DaemonState
+    processor/    — Processor: message router for all incoming messages
+    network/      — NetworkHandle (+ connection.rs, handshake.rs, addr.rs)
     backup/       — BackupCoordinator (+ events.rs, pipeline.rs, packing.rs)
     restore/      — RestoreCoordinator (+ pipeline.rs)
     repair/       — RepairAgent
-    cluster_sync/ — ClusterSyncManager
-    network/      — NetworkHandle (+ connection.rs, handshake.rs)
+    scheduler/    — Scheduler: PoS challenge timing, PendingChallenges
+    watcher/      — fs-notify watcher: recursive, debounce, DirtyEvent
     relay/        — RelayManager (+ board.rs)
+    cluster_sync/ — ClusterSyncManager
+    cli_server/   — Unix socket server: bridges CLI to DaemonState
+    identity/     — BIP39/HKDF key derivation, identity.key file
 ```
 
 ---
@@ -326,7 +346,7 @@ pub struct HotCache {
 `NetworkHandle` — единственный iroh endpoint на экземпляр daemon'а.
 
 **Ответственности:**
-- Создаёт iroh QUIC endpoint с ALPN `"syncback/1"`, relay_mode = Disabled
+- Создаёт iroh QUIC endpoint с ALPN `"syncback/1"`, relay_mode = Default (NAT traversal)
 - Запускает background accept loop (аутентификация входящих соединений)
 - Connection pool: reuse по `IdentityPub`
 - Handshake: mutual Ed25519 signature verification + freshness check (±300 сек)
@@ -422,8 +442,8 @@ RestoreRequest(path, version_selector, output_dir, device_id)
   → update FileRecord.devices: device_id → Present
 ```
 
-Phase 2: local restore (символы на диске из BackupCoordinator).
-Phase 3+: network fetch через NetworkHandle (`fetch_from_holder`).
+Local restore: символы на диске из BackupCoordinator.
+Network restore: fetch from holders через NetworkHandle (`fetch_from_holder`).
 
 **Async run():** принимает `(RestoreRequest, oneshot::Sender)` из mpsc, обрабатывает последовательно.
 
@@ -451,7 +471,7 @@ Phase 3+: network fetch через NetworkHandle (`fetch_from_holder`).
 
 **handle_symbol_dropped / handle_pos_nack:** оба делают одно — `mark_placement_lost` (idempotent: если уже Lost/Deleting — no-op).
 
-Phase 2.5: только локальная регенерация. Сетевая доставка отремонтированных символов holder'у — Phase 3.
+Repair: local re-encode + network delivery to new holders.
 
 ---
 
@@ -502,6 +522,108 @@ prune: TTL + size limits (MAX_BOARD_ENTRIES=2000, MAX_BOARD_SIZE_BYTES=8MB)
 
 ---
 
+### handle
+
+`DaemonHandle` — top-level entry point. Owns and wires all subsystems.
+
+**DaemonState** (shared via `Arc`):
+```rust
+DaemonState {
+    db, identity_pub, device_id, network, restore_tx,
+    cluster_state, incoming_tx, master_key, seed,
+    data_dir, soft_quota_bytes, disk_reserve_bytes,
+}
+```
+
+**Startup sequence:**
+1. Load/create identity (BIP39 → keys)
+2. Open DB
+3. Start NetworkHandle (iroh endpoint + accept loop)
+4. Spawn Processor (message router)
+5. Spawn BackupCoordinator, RestoreCoordinator, RepairAgent
+6. Spawn Scheduler (PoS), RelayManager, ClusterSyncManager
+7. Start Watcher (fs-notify) for configured directories
+8. Start CliServer (Unix socket)
+9. Load peers from DB → known_peers in network
+
+---
+
+### processor
+
+`Processor` — thin message router. Receives incoming connections from network, dispatches messages to appropriate handlers.
+
+**Dispatch table (20 message types):**
+- `Handshake` → auth (handled by network accept loop)
+- `PeerAnnounce` → upsert peer, add to known_peers, store addrs
+- `PosChallenge` → look up holding, re-read symbol, send PosResponse or PosNack
+- `PosResponse` → verify, update placement status + trust
+- `PosNack` → mark placement Lost, trigger repair
+- `SymbolOffer` → check quota → SymbolAccept / SymbolReject
+- `SymbolAccept` → update placement to Alive (via BackupEvent channel)
+- `SymbolReject` → update placement, log
+- `SymbolTransfer` → write symbols to disk, update HoldingRecord
+- `SymbolStored` → log confirmation
+- `RestoreRequest` → escrow check → read symbols → RestoreResponse or RestoreDenied
+- `BoardSync` → relay_sync_tx (forwarded to RelayManager)
+- `ClusterSync*` → forwarded to ClusterSyncManager
+- `Delete/CancelDelete` → update HoldingRecord status
+- `StorageWarning/SymbolDropped/SymbolDropNotice` → log, update placements
+
+**On new connection:** stores in pool, sends PeerAnnounce + BoardSync, spawns read loop.
+
+---
+
+### watcher
+
+`WatcherConfig` → fs-notify recursive watcher on configured directories.
+
+**Pipeline:**
+```
+fs event → notify::Event → std channel → tokio task → debounce (30 min)
+  → DirtyEvent { path, kind: Added/Modified/Deleted, device_id }
+  → mpsc → BackupCoordinator
+```
+
+Filters: hidden files (dotfiles), temporary files.
+Only detects changes AFTER daemon start — pre-existing files not scanned.
+
+---
+
+### scheduler
+
+`Scheduler` — periodic PoS challenge issuance.
+
+- Computes `due_challenges()` from placements + last_verified timestamps
+- Issues PosChallenge via network, stores in `PendingChallenges` (shared with Processor)
+- On timeout (7 days): records as Timeout, updates placement status
+- Adaptive rate: `challenges/week = base * volume_factor * trust_factor`
+
+---
+
+### cli_server
+
+Unix socket server at `{data_dir}/syncback.sock`.
+
+**Commands:** status, files, versions, peers, restore, connect, device (add/revoke/list), backup (force flush)
+
+Bridges CLI → DaemonState for reads, CLI → RestoreCoordinator for restores, CLI → NetworkHandle for connections.
+
+---
+
+### identity
+
+BIP39 mnemonic (24 words) → seed → HKDF key derivation.
+
+**Derived keys:**
+- master_key (Ed25519): `HKDF(seed, info="syncback-identity-ed25519")`
+- device_key (Ed25519): `HKDF(seed, salt=device_id, info="syncback-device-ed25519")`
+- epoch_key: `HKDF(seed, salt=epoch_counter, info="syncback-encryption")`
+- iroh_key: `HKDF(seed, info="syncback-iroh-ed25519")` → stable NodeId
+
+Identity file: `{data_dir}/identity.key` (mode 0600), stores encrypted seed.
+
+---
+
 ## Потоки данных
 
 ### Backup
@@ -509,7 +631,7 @@ prune: TTL + size limits (MAX_BOARD_ENTRIES=2000, MAX_BOARD_SIZE_BYTES=8MB)
 ```
 Файловая система
   │
-  ├─ fs-notify (watcher, будущий Phase 4)
+  ├─ fs-notify (watcher)
   │    debounce 30 мин → dirty_files
   │
   └─ DirtyEvent → BackupCoordinator.process_event()

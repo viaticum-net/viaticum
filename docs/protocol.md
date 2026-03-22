@@ -1,6 +1,8 @@
-# SyncBack β: спецификация протокола
+# SyncBack: Wire Protocol Specification
 
-*2026-03-21. Версия β. Заменяет docs/research/protocol.md для β реализации.*
+*2026-03-21. Version β. Authoritative protocol spec.*
+
+*See also: [logic.md](logic.md) for algorithm quick-reference, [overview.md](overview.md) for end-to-end flows.*
 
 ---
 
