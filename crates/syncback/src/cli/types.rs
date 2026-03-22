@@ -100,6 +100,9 @@ pub struct StatusData {
     /// Source blocks with alive placements < k (at risk).
     #[serde(default)]
     pub blocks_at_risk: u32,
+    /// DB table row counts (shown only in --json mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_stats: Option<syncback_core::db::TableStats>,
 }
 
 /// Peer summary shown in `syncback status`.

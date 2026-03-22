@@ -21,6 +21,7 @@ fn make_status(peers: Vec<PeerSummary>) -> StatusData {
         placement_lost: 2,
         blocks_ok: 5,
         blocks_at_risk: 1,
+        table_stats: None,
     }
 }
 

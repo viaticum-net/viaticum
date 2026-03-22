@@ -334,6 +334,7 @@ pub(crate) fn dispatch_status(state: &DaemonState) -> CliResponse {
         placement_lost,
         blocks_ok,
         blocks_at_risk,
+        table_stats: state.db.table_stats().ok(),
     })
 }
 

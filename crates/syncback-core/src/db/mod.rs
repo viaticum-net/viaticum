@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 
-use redb::{ReadableTable, TableDefinition};
+use redb::{ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::constants::{HOLDER_DELETE_COOLDOWN_SECS, DROP_NOTICE_WINDOW_SECS};
 use crate::cluster::StoredClusterState;
@@ -1166,6 +1166,44 @@ impl Db {
         }
         tx.commit()?;
         Ok(())
+    }
+}
+
+// ============================================================
+// Table stats
+// ============================================================
+
+/// Row counts per DB table, for observability.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TableStats {
+    pub files: u64,
+    pub source_blocks: u64,
+    pub symbol_placements: u64,
+    pub peers: u64,
+    pub holdings: u64,
+    pub event_log: u64,
+    pub pos_weekly: u64,
+    pub system_state_blobs: u64,
+    pub file_holders: u64,
+    pub holder_files: u64,
+}
+
+impl Db {
+    /// Return row counts for all data tables.
+    pub fn table_stats(&self) -> Result<TableStats, DbError> {
+        let tx = self.inner.begin_read()?;
+        Ok(TableStats {
+            files: tx.open_table(FILES)?.len()?,
+            source_blocks: tx.open_table(SOURCE_BLOCKS)?.len()?,
+            symbol_placements: tx.open_table(SYMBOL_PLACEMENTS)?.len()?,
+            peers: tx.open_table(PEERS)?.len()?,
+            holdings: tx.open_table(HOLDINGS)?.len()?,
+            event_log: tx.open_table(EVENT_LOG)?.len()?,
+            pos_weekly: tx.open_table(POS_WEEKLY)?.len()?,
+            system_state_blobs: tx.open_table(SYSTEM_STATE_BLOBS)?.len()?,
+            file_holders: tx.open_table(FILE_HOLDERS)?.len()?,
+            holder_files: tx.open_table(HOLDER_FILES)?.len()?,
+        })
     }
 }
 

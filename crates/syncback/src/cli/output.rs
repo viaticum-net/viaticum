@@ -60,6 +60,26 @@ pub fn render_status(data: &StatusData) -> String {
     ));
     if data.peer_count == 0 {
         out.push_str("  no peers yet\n");
+        out.push_str("  WARNING: backup requires >= 2 peers for erasure coding\n");
+    } else if data.peer_count == 1 {
+        out.push_str("  WARNING: only 1 peer, backup requires >= 2 for erasure coding\n");
+        out.push('\n');
+        out.push_str("top peers:\n");
+        for peer in &data.peers {
+            let short_id = if peer.identity_hex.len() >= 8 {
+                &peer.identity_hex[..8]
+            } else {
+                &peer.identity_hex
+            };
+            out.push_str(&format!(
+                "  {}  trust={:.2}  stores={}/{} last={}\n",
+                short_id,
+                peer.trust,
+                format_bytes(peer.bytes_we_store),
+                format_bytes(peer.bytes_peer_stores),
+                peer.last_seen
+            ));
+        }
     } else {
         out.push('\n');
         out.push_str("top peers:\n");

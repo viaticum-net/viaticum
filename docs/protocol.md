@@ -73,6 +73,12 @@ pub enum Message {
     BoardSync(BoardSyncMsg),
     ClusterSyncRequest(ClusterSyncRequestMsg),
     ClusterSyncResponse(ClusterSyncResponseMsg),
+    SystemStateBackup(SystemStateBackupMsg),
+    SystemStateAck(SystemStateAckMsg),
+    SystemStateRequest(SystemStateRequestMsg),
+    SystemStateResponse(SystemStateResponseMsg),
+    PeerDiscoveryRequest(PeerDiscoveryRequestMsg),
+    PeerDiscoveryResponse(PeerDiscoveryResponseMsg),
 }
 ```
 
@@ -817,6 +823,62 @@ S-score: per (device, peer) pair — протокол не знает про к�
 
 ---
 
+### 1.10. System State backup и Peer Discovery (δ.1)
+
+#### SystemState backup
+
+Периодический push зашифрованного DB-снапшота на всех пиров. Один blob per owner, перезаписывается при каждом push.
+
+```rust
+// Owner → Holder. Push encrypted DB snapshot.
+pub struct SystemStateBackupMsg { pub v: u8, pub encrypted_blob: Vec<u8>, pub timestamp: Timestamp }
+
+// Holder → Owner. Acknowledge storage.
+pub struct SystemStateAckMsg { pub v: u8, pub stored: bool, pub timestamp: Timestamp }
+
+// Requester → Holder. Request stored blob (identity from handshake).
+pub struct SystemStateRequestMsg { pub v: u8, pub timestamp: Timestamp }
+
+// Holder → Requester. Return blob (empty vec = not found).
+pub struct SystemStateResponseMsg { pub v: u8, pub encrypted_blob: Vec<u8>, pub timestamp: Timestamp }
+```
+
+**Encryption:** HKDF-SHA256(ikm=seed, salt=random_24, info=b"syncback-system-state") → ChaCha20-Poly1305. Wire format: `[salt(24)][nonce(12)][ciphertext+tag]`.
+
+**Serialization:** SystemState → CBOR → zstd compress → encrypt.
+
+**Security:**
+- `SystemStateBackup` — принимает только от **known peers** (prevents storage spam)
+- `SystemStateRequest/Response` — отвечает любому (blob зашифрован, бесполезен без ключа владельца)
+- TTL = 365 дней, автоудаление expired blob'ов при чтении
+
+**Таблица:** `system_state_blobs` — key: `[u8; 32]` (owner identity_pub), value: CBOR(`SystemStateBlobRecord`).
+
+#### Peer Discovery
+
+BFS-обнаружение для DR и начальной загрузки пиров.
+
+```rust
+// Requester → Peer. "Give me your peer list."
+pub struct PeerDiscoveryRequestMsg { pub v: u8, pub timestamp: Timestamp }
+
+// Peer → Requester. List of known peers with iroh NodeIds.
+pub struct PeerDiscoveryResponseMsg {
+    pub v: u8,
+    pub peers: Vec<DiscoveredPeer>,
+    pub timestamp: Timestamp,
+}
+
+pub struct DiscoveredPeer {
+    pub identity_pub: IdentityPub,
+    pub node_id: NodeId,
+}
+```
+
+**Security:** `PeerDiscoveryRequest` — отвечает **любому authenticated connection** (handshake достаточен). Peer list не секрет в P2P сети. Работает и для DR (old peer), и для first bootstrap (new node).
+
+---
+
 ## 2. Что протокол НЕ определяет (рекомендации реализации)
 
 Следующие параметры — рекомендуемые значения, не требования совместимости.
@@ -852,7 +914,7 @@ S-score: per (device, peer) pair — протокол не знает про к�
 7. issue_device_certificate(master_key, device_id, device_pub_key, now) → сохранить cert
 8. ClusterState::init(db, master_pub, first_device_cert, ...)
 9. PeerAnnounce через relay board: "я существую, мой NodeId = ..."
-10. Bootstrap peers: discovery через relay board или hardcoded bootstrap nodes
+10. Bootstrap auto-connect: connect to bootstrap peers → PeerDiscoveryRequest → learn peer list (1-hop)
 ```
 
 ### 3.2. Нормальная работа
@@ -914,13 +976,22 @@ syncback restore <path> [--version N] [--date YYYY-MM-DD]
 ```
 Все устройства потеряны, остался только seed phrase:
 
-1. Новое устройство, ввести seed
-2. Revoke все предыдущие device keys (broadcast RevocationBroadcast)
-3. Новый epoch → все будущие файлы защищены
-4. Bootstrap из сети:
-   - ClusterSync с партнёрами → получить file catalog + placements
-   - Для критичных файлов: restore немедленно
-5. Старые файлы: re-encrypt по мере скачивания
+syncback dr --mnemonic "24 words" --peer <addr>
+
+1. Derive identity from seed → IdentityPub
+2. Open fresh DB (remove stale db.redb if any)
+3. Start minimal NetworkHandle (iroh endpoint, no Processor)
+4. BFS over peers:
+   - Connect to seed --peer addresses
+   - Send SystemStateRequest → collect encrypted DB snapshots
+   - Send PeerDiscoveryRequest → discover more peers (visited set)
+   - Limits: 500 peers, 10 blobs, 120s timeout
+5. Select freshest blob (max created_at)
+6. Decrypt (ChaCha20-Poly1305 with HKDF-derived key from seed)
+7. Restore DB: files, source blocks, placements, peers, pos_weekly, cluster_state
+8. "Run syncback daemon, then syncback restore <path>"
+
+DB snapshots pushed periodically (6h) by daemon → SystemStateBackup → peers store one blob per owner (TTL 365 days).
 ```
 
 ### 3.5. File deletion
@@ -1031,6 +1102,7 @@ Threat model: "lazy not malicious". Для активного противник
 | `MAX_MESSAGE_SIZE` | 64 МБ | Максимальный фрейм |
 | `PROTOCOL_VERSION` | 1 | Версия протокола |
 | `ALPN` | `b"syncback/1"` | ALPN идентификатор |
+| `SYSTEM_STATE_TTL_SECS` | 31_536_000 (365 дней) | TTL stored system state blobs |
 | `HANDSHAKE_FRESHNESS_SECS` | 300 | Окно свежести handshake (±5 мин) |
 | `KP` | 0.4 | Вес P в trust формуле |
 | `KI` | 1.75 | Вес I в trust формуле |
@@ -1069,6 +1141,7 @@ WARM (redb):
   EventLog (append-only): Vec<(seq: u64, EventEntry)>
   Indices: file→holders, holder→files (двойной индекс)
   ClusterState (singleton): StoredClusterState
+  SystemStateBlobRecord { owner, encrypted_blob, created_at, stored_at } — 1 per owner, TTL 365d
 ```
 
 Values = CBOR (`ciborium`). DB = `Arc<redb::Database>`.

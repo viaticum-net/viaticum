@@ -718,3 +718,25 @@ fn expired_blob_returns_none() {
     db.store_system_state_blob(&owner, &record).unwrap();
     assert!(db.get_system_state_blob(&owner).unwrap().is_none());
 }
+
+#[test]
+fn table_stats_counts_rows() {
+    let db = test_db();
+    let stats = db.table_stats().unwrap();
+    assert_eq!(stats.files, 0);
+    assert_eq!(stats.peers, 0);
+
+    // Insert a peer and check count increments.
+    let peer = PeerRecord {
+        identity: test_peer(),
+        node_id: Some(crate::types::NodeId([0u8; 32])),
+        device_id: Some(DeviceId([0u8; 16])),
+        trust_p: 0.0, trust_i: 0.0, trust_s: 0.0,
+        bytes_we_store_for_peer: 0, bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0), last_seen: Timestamp(0),
+        revoked_device_pub_keys: vec![], addrs: vec![],
+    };
+    db.upsert_peer(&peer).unwrap();
+    let stats = db.table_stats().unwrap();
+    assert_eq!(stats.peers, 1);
+}

@@ -261,6 +261,7 @@ fn make_status_zero_peers() -> StatusData {
         placement_lost: 0,
         blocks_ok: 0,
         blocks_at_risk: 0,
+        table_stats: None,
     }
 }
 
@@ -269,6 +270,7 @@ fn format_status_zero_peers_prints_no_peers_yet() {
     let data = make_status_zero_peers();
     let rendered = output::render_status(&data);
     assert!(rendered.contains("no peers yet"), "got: {rendered}");
+    assert!(rendered.contains("WARNING"), "got: {rendered}");
 }
 
 #[test]
@@ -332,6 +334,7 @@ fn format_status_top_peers_printed() {
         placement_lost: 2,
         blocks_ok: 3,
         blocks_at_risk: 1,
+        table_stats: None,
     };
     let rendered = output::render_status(&data);
     assert!(rendered.contains("a1b2c3d4"), "got: {rendered}");
@@ -701,6 +704,7 @@ fn cli_response_roundtrips_cbor() {
             placement_lost: 0,
             blocks_ok: 0,
             blocks_at_risk: 0,
+            table_stats: None,
         }),
         CliResponse::DeviceList(vec![]),
         CliResponse::Error("oops".into()),

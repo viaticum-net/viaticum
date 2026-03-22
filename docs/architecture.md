@@ -1,6 +1,6 @@
 # SyncBack Architecture
 
-*2026-03-22. Reflects actual code — all phases complete (675 tests, ~32K lines Rust).*
+*2026-03-22. Reflects actual code — all phases + δ.1 complete (716 tests, ~34K lines Rust).*
 
 *See also: [overview.md](overview.md) for end-to-end flows, [logic.md](logic.md) for algorithms, [protocol.md](protocol.md) for wire format.*
 
@@ -13,7 +13,7 @@
 │  (pure Rust, no async, no network)                                       │
 │                                                                          │
 │  types ──► db ──────────────────────────────────────────────────────    │
-│   │         (Db, HotCache, 11 redb tables)                          │    │
+│   │         (Db, HotCache, 12 redb tables)                          │    │
 │   │                                                                  │    │
 │   ├──► trust    (TrustEngine: P, I, S)                              │    │
 │   ├──► escrow   (EscrowChecker: trust-based budget gate)            │    │
@@ -23,6 +23,7 @@
 │   ├──► cluster  (key derivation, certs, ClusterState, epochs)      │    │
 │   ├──► pos      (PosEngine: challenge, verify, adaptive schedule)  │    │
 │   ├──► messages (wire format, all message structs)                  │    │
+│   ├──► system_state (SystemState: snapshot, restore, pack/unpack)   │    │
 │   └──► constants (все числовые параметры протокола)                 │    │
 └──────────────────────────────────────────────────────────────────────────┘
 
@@ -41,7 +42,9 @@
 │     ├──► relay        (RelayManager: epidemic board, hop≤2)             │
 │     ├──► cluster_sync (ClusterSyncManager: event log exchange)          │
 │     ├──► cli_server   (Unix socket: CLI commands → DaemonState)         │
-│     └──► identity     (BIP39 → HKDF → keys, identity file mgmt)        │
+│     ├──► identity     (BIP39 → HKDF → keys, identity file mgmt)        │
+│     ├──► system_state (periodic DB push, bootstrap discovery)           │
+│     └──► dr           (disaster recovery: BFS, standalone restore)      │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -75,6 +78,7 @@ crates/syncback-core/src/
   commitment/     — Holder eviction risk estimation (CommitmentScore)
   reliability/    — P(block recoverable) forecast (Binomial model)
   deletion/       — Double cooldown deletion flow + vacuum
+  system_state/   — SystemState struct, snapshot_db, restore_db, pack/unpack (CBOR+zstd+ChaCha20)
 ```
 
 ### syncback
@@ -100,6 +104,8 @@ crates/syncback/src/
     cluster_sync/ — ClusterSyncManager
     cli_server/   — Unix socket server: bridges CLI to DaemonState
     identity/     — BIP39/HKDF key derivation, identity.key file
+    system_state/ — periodic DB push to peers, bootstrap discovery
+    dr/           — disaster recovery CLI: BFS peer discovery, standalone restore
 ```
 
 ---
@@ -298,11 +304,11 @@ ALPN: `"syncback/1"`. HandshakeMsg подписывается Ed25519: `sign("ha
 Cheaply cloneable: `clone()` = increment refcount. Все методы принимают `&self`.
 MVCC в redb обеспечивает read-параллелизм. Write-lock только на HotCache при мутациях.
 
-Открытие: `Db::open(path)` создаёт все таблицы и строит HotCache full scan из SYMBOL_PLACEMENTS.
+Открытие: `Db::open(path)` — pre-open backup (.redb.bak), `DatabaseBuilder` с `repair_callback`, `check_integrity()`, создаёт все таблицы и строит HotCache full scan из SYMBOL_PLACEMENTS.
 
 **Два слоя:**
 - **HOT (RAM, ~13 МБ на 5 ТБ):** HashMap агрегаты `BlockAgg` и `PlacementAgg` в `HotCache`
-- **WARM (redb, ~133 МБ на 5 ТБ):** все 11 таблиц, CBOR-значения
+- **WARM (redb, ~133 МБ на 5 ТБ):** все 12 таблиц, CBOR-значения
 
 ---
 
@@ -323,6 +329,7 @@ MVCC в redb обеспечивает read-параллелизм. Write-lock т
 | `cluster_state` | `"cluster_state"` | CBOR(`StoredClusterState`) | Singleton: состояние кластера |
 | `file_holders` | `&[u8; 40]` (file_id_BE8 ∥ holder_id) | `u32` (symbol_count) | Индекс file → holders |
 | `holder_files` | `&[u8; 40]` (holder_id ∥ file_id_BE8) | `u32` (symbol_count) | Индекс holder → files |
+| `system_state_blobs` | `&[u8; 32]` (owner identity_pub) | CBOR(`SystemStateBlobRecord`) | Encrypted DB snapshots from peers (1 per owner, TTL 365 days) |
 
 ### HotCache (RAM слой)
 
@@ -537,14 +544,16 @@ DaemonState {
 
 **Startup sequence:**
 1. Load/create identity (BIP39 → keys)
-2. Open DB
+2. Open DB (with repair callback + pre-open backup)
 3. Start NetworkHandle (iroh endpoint + accept loop)
 4. Spawn Processor (message router)
 5. Spawn BackupCoordinator, RestoreCoordinator, RepairAgent
 6. Spawn Scheduler (PoS), RelayManager, ClusterSyncManager
-7. Start Watcher (fs-notify) for configured directories
-8. Start CliServer (Unix socket)
-9. Load peers from DB → known_peers in network
+7. Spawn SystemState periodic push (interval = 6h / time_scale, min 60s)
+8. Start Watcher (fs-notify) for configured directories
+9. Start CliServer (Unix socket)
+10. Load peers from DB → known_peers in network
+11. Bootstrap discovery: connect to bootstrap peers, PeerDiscoveryRequest (1-hop)
 
 ---
 
@@ -552,7 +561,7 @@ DaemonState {
 
 `Processor` — thin message router. Receives incoming connections from network, dispatches messages to appropriate handlers.
 
-**Dispatch table (20 message types):**
+**Dispatch table (26 message types):**
 - `Handshake` → auth (handled by network accept loop)
 - `PeerAnnounce` → upsert peer, add to known_peers, store addrs
 - `PosChallenge` → look up holding, re-read symbol, send PosResponse or PosNack
@@ -568,6 +577,11 @@ DaemonState {
 - `ClusterSync*` → forwarded to ClusterSyncManager
 - `Delete/CancelDelete` → update HoldingRecord status
 - `StorageWarning/SymbolDropped/SymbolDropNotice` → log, update placements
+- `SystemStateBackup` → store blob (known peers only) → SystemStateAck
+- `SystemStateRequest` → return stored blob → SystemStateResponse
+- `SystemStateAck/Response` → log / forward to DR
+- `PeerDiscoveryRequest` → return peer list (any authenticated connection)
+- `PeerDiscoveryResponse` → forward to DR / bootstrap
 
 **On new connection:** stores in pool, sends PeerAnnounce + BoardSync, spawns read loop.
 

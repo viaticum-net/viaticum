@@ -43,9 +43,20 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 ### Peer Discovery
 
 1. Bootstrap peers from config: `[network] bootstrap_peers = ["NodeId@ip:port"]`
-2. On connect: PeerAnnounce exchange (identity, node_id, addresses)
-3. Epidemic relay: BoardSync messages gossip peer info (hop <= 2, TTL 7 days)
-4. iroh QUIC transport with NAT traversal (relay servers for peers behind NAT)
+2. **Bootstrap auto-connect:** on daemon startup, connect to bootstrap peers and send PeerDiscoveryRequest to learn their peer lists (1-hop)
+3. On connect: PeerAnnounce exchange (identity, node_id, addresses)
+4. PeerDiscoveryRequest/Response: request peer list from any authenticated connection
+5. Epidemic relay: BoardSync messages gossip peer info (hop <= 2, TTL 7 days)
+6. iroh QUIC transport with NAT traversal (relay servers for peers behind NAT)
+
+### Disaster Recovery
+
+1. `syncback dr --mnemonic "24 words" --peer <addr>` — standalone, no daemon needed
+2. Derive identity from seed phrase, open fresh DB
+3. BFS over peers: SystemStateRequest + PeerDiscoveryRequest on each connection
+4. Limits: 500 peers, 10 blobs, 120s timeout
+5. Select freshest blob (max created_at), decrypt with identity key, restore DB
+6. Run `syncback daemon` then `syncback restore <path>` to recover files
 
 ### Deletion
 
@@ -71,8 +82,9 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 | `erasure` | ErasureEncoder trait + RaptorQ impl, per-holder XOR binding |
 | `cluster` | Multi-device identity: device certs, epoch keys, revocation |
 | `db` | redb schema: files, source blocks, placements, peers, holdings, events |
-| `messages` | Wire messages (CBOR): 15+ message types |
+| `messages` | Wire messages (CBOR): 20+ message types |
 | `config` | TOML config loading and validation |
+| `system_state` | SystemState snapshot/restore, CBOR+zstd+ChaCha20-Poly1305 pack/unpack |
 | `pos` | PoS challenge/verify, adaptive scheduling, state machine |
 | `commitment` | Holder eviction risk estimation from PoS history + disk pressure |
 | `reliability` | P(block recoverable) = P(Binomial(N,p) >= K_eff) |
@@ -94,12 +106,15 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 | `relay` | Epidemic relay board: store-and-forward, hop-limited gossip |
 | `cluster_sync` | Event log exchange between devices of same cluster |
 | `identity` | BIP39 mnemonic -> seed -> HKDF key derivation, identity file management |
-| `cli` | Clap CLI: daemon, init, status, files, versions, peers, restore, device |
+| `system_state` | Daemon wrappers: snapshot+encrypt, periodic push to peers, bootstrap discovery |
+| `dr` | Disaster recovery CLI: BFS peer discovery, blob collection, DB restore from seed phrase |
+| `cli` | Clap CLI: daemon, init, status, files, versions, peers, restore, device, dr |
 
 ## Current State
 
-- **675 tests, ~32K lines Rust**, clippy clean
+- **716 tests, ~34K lines Rust**, clippy clean
 - Phases 1-7 complete (core logic, daemon wiring, P2P networking)
+- δ.1 Database Reliability complete: crash safety, DB backup to peers, DR from seed phrase
 - Real-world P2P tested: LAN (Netbird) + NAT (iroh relay, both peers behind NAT)
 - All features wired: escrow check, effective_quota, device add/revoke, SymbolAccept->BackupCoordinator
 
