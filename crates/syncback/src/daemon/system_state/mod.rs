@@ -99,11 +99,14 @@ pub async fn run_periodic_push(
     interval_secs: u64,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let period = Duration::from_secs(interval_secs.max(60));
+    let clamped = interval_secs.max(60);
+    info!(interval_secs = clamped, "system_state periodic push: started");
+    let period = Duration::from_secs(clamped);
     let mut ticker = tokio::time::interval(period);
     // The first tick fires immediately; skip it so we don't push on startup
     // before the node has had time to learn its peers.
     ticker.tick().await;
+    info!("system_state periodic push: first tick skipped, waiting for next");
 
     loop {
         tokio::select! {
@@ -148,10 +151,10 @@ pub async fn run_periodic_push(
         let mut fail_count = 0usize;
         for peer in &peers {
             let identity = peer.identity;
-            match network.send_to_peer(identity, &msg).await {
+            match network.send_message_oneshot(identity, &msg).await {
                 Ok(()) => ok_count += 1,
                 Err(e) => {
-                    debug!(peer = %identity, error = %e, "system_state push: send failed");
+                    warn!(peer = %identity, error = %e, "system_state push: send failed");
                     fail_count += 1;
                 }
             }

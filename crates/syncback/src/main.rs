@@ -15,10 +15,17 @@ async fn main() -> anyhow::Result<()> {
             watch_dir,
             log_format,
         } => {
+            let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
             if log_format == "json" {
-                tracing_subscriber::fmt().json().init();
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_env_filter(env_filter)
+                    .init();
             } else {
-                tracing_subscriber::fmt::init();
+                tracing_subscriber::fmt()
+                    .with_env_filter(env_filter)
+                    .init();
             }
 
             let cfg = DaemonConfig {

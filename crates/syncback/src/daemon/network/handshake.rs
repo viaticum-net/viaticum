@@ -50,13 +50,7 @@ pub(super) async fn handshake_initiator(
     let (peer_identity, peer_master_identity) =
         recv_and_verify_handshake(&mut recv, expected_identity).await?;
 
-    Ok(Connection {
-        peer_identity,
-        peer_master_identity,
-        inner: iroh_conn,
-        send,
-        recv,
-    })
+    Ok(Connection::new(peer_identity, peer_master_identity, iroh_conn, send, recv))
 }
 
 /// Perform the acceptor (B) side of the SyncBack handshake.
@@ -82,13 +76,7 @@ pub(super) async fn handshake_acceptor(
     // Then sends its own.
     send_handshake_on_stream(&mut send, signing_key, our_identity, device_cert).await?;
 
-    Ok(Connection {
-        peer_identity,
-        peer_master_identity,
-        inner: iroh_conn,
-        send,
-        recv,
-    })
+    Ok(Connection::new(peer_identity, peer_master_identity, iroh_conn, send, recv))
 }
 
 /// Write a HandshakeMsg to a SendStream (before [`Connection`] exists).

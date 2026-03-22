@@ -59,7 +59,7 @@ use syncback_core::types::{
     hex_encode, ErasureParams, HoldingRecord, HoldingStatus, IdentityPub, PeerRecord,
     PlacementStatus, Timestamp,
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -180,7 +180,7 @@ impl Processor {
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let (msg_tx, mut msg_rx) =
-            mpsc::channel::<(IdentityPub, Message, Arc<Mutex<Connection>>)>(256);
+            mpsc::channel::<(IdentityPub, Message, Arc<Connection>)>(256);
         let this = Arc::new(self);
 
         info!("processor running");
@@ -203,14 +203,13 @@ impl Processor {
 
                             // Send PeerAnnounce on this connection before
                             // splitting into separate read-loop and pool entry.
-                            let conn_arc = Arc::new(Mutex::new(conn));
+                            let conn_arc = Arc::new(conn);
                             {
                                 let pa_msg = {
                                     let pa = this.network.build_peer_announce(Timestamp::now());
                                     Message::PeerAnnounce(pa)
                                 };
-                                let mut guard = conn_arc.lock().await;
-                                if let Err(e) = guard.send_message(&pa_msg).await {
+                                if let Err(e) = conn_arc.send_message(&pa_msg).await {
                                     warn!(
                                         peer = %peer_id,
                                         err = %e,
@@ -224,35 +223,52 @@ impl Processor {
                                 }
                             }
 
-                            // NOTE: we do NOT store this inbound connection in the
-                            // pool. The pool is for OUTBOUND connections used by
-                            // send_to_peer. Inbound connections are only used for
-                            // the read loop (and dispatch responses via msg_tx).
-                            // This avoids Mutex deadlock: read loop holds the lock
-                            // during recv_message, and send_to_peer would block.
+                            // Register peer's address in known_peers so that
+                            // send_to_peer can create an outbound connection
+                            // later (e.g. for system state push). We do NOT
+                            // store the inbound connection in the pool — that
+                            // would cause reads and sends to contend on the
+                            // same connection from different tasks.
+                            //
+                            // Use remote_endpoint_addr() to get the full
+                            // address (IP:port + relay) from iroh's internal
+                            // state, not just the bare NodeId.
+                            {
+                                let remote_pubkey = conn_arc.inner.remote_id();
+                                let endpoint_addr = match this.network
+                                    .remote_endpoint_addr(remote_pubkey).await
+                                {
+                                    Some(addr) => addr,
+                                    None => iroh::EndpointAddr::new(remote_pubkey),
+                                };
+                                this.network.add_peer(peer_id, endpoint_addr).await;
+                                debug!(
+                                    peer = %peer_id,
+                                    "processor: registered inbound peer in known_peers"
+                                );
+                            }
+
                             let conn_arc2 = conn_arc.clone();
                             let tx = msg_tx.clone();
                             let network_arc = this.network.clone();
                             tokio::spawn(async move {
                                 debug!(peer = %peer_id, "processor: read loop started");
                                 loop {
-                                    let msg = {
-                                        let mut guard = conn_arc2.lock().await;
-                                        match guard.recv_message().await {
-                                            Ok(m) => m,
-                                            Err(e) => {
-                                                debug!(
-                                                    peer = %peer_id,
-                                                    err = %e,
-                                                    "processor: connection closed"
-                                                );
-                                                network_arc.evict_connection(peer_id).await;
+                                    match conn_arc2.recv_message().await {
+                                        Ok(msg) => {
+                                            if tx.send((peer_id, msg, conn_arc2.clone())).await.is_err() {
                                                 break;
                                             }
                                         }
-                                    };
-                                    if tx.send((peer_id, msg, conn_arc2.clone())).await.is_err() {
-                                        break;
+                                        Err(e) => {
+                                            debug!(
+                                                peer = %peer_id,
+                                                err = %e,
+                                                "processor: connection closed"
+                                            );
+                                            network_arc.evict_connection(peer_id).await;
+                                            break;
+                                        }
                                     }
                                 }
                                 debug!(peer = %peer_id, "processor: read loop exited");
@@ -270,23 +286,21 @@ impl Processor {
                         debug!(peer = %peer_id, "processor: read loop started (auto-reconnect)");
                         tokio::spawn(async move {
                             loop {
-                                let msg = {
-                                    let mut guard = conn_arc2.lock().await;
-                                    match guard.recv_message().await {
-                                        Ok(m) => m,
-                                        Err(e) => {
-                                            debug!(
-                                                peer = %peer_id,
-                                                err = %e,
-                                                "processor: auto-reconnect connection closed"
-                                            );
-                                            network_arc.evict_connection(peer_id).await;
+                                match conn_arc2.recv_message().await {
+                                    Ok(msg) => {
+                                        if tx.send((peer_id, msg, conn_arc2.clone())).await.is_err() {
                                             break;
                                         }
                                     }
-                                };
-                                if tx.send((peer_id, msg, conn_arc2.clone())).await.is_err() {
-                                    break;
+                                    Err(e) => {
+                                        debug!(
+                                            peer = %peer_id,
+                                            err = %e,
+                                            "processor: auto-reconnect connection closed"
+                                        );
+                                        network_arc.evict_connection(peer_id).await;
+                                        break;
+                                    }
                                 }
                             }
                         });
@@ -361,7 +375,7 @@ impl Processor {
         &self,
         from: IdentityPub,
         msg: Message,
-        conn: Arc<Mutex<Connection>>,
+        conn: Arc<Connection>,
     ) -> anyhow::Result<()> {
         match msg {
             Message::SymbolTransfer(transfer) => {
@@ -578,11 +592,10 @@ impl Processor {
         &self,
         from: IdentityPub,
         challenge: syncback_core::messages::PosChallengeMsg,
-        conn: Arc<Mutex<Connection>>,
+        conn: Arc<Connection>,
     ) -> Result<(), ProcessorError> {
         let reply = self.handle_pos_challenge_inner(from, challenge).await?;
-        let mut guard = conn.lock().await;
-        guard.send_message(&reply).await?;
+        conn.send_message(&reply).await?;
         Ok(())
     }
 
@@ -854,7 +867,7 @@ impl Processor {
         &self,
         owner_id: IdentityPub,
         offer: SymbolOfferMsg,
-        conn: Arc<Mutex<Connection>>,
+        conn: Arc<Connection>,
     ) -> Result<(), ProcessorError> {
         let offer_bytes: u64 = offer
             .esi_ranges
@@ -893,8 +906,7 @@ impl Processor {
             })
         };
 
-        let mut guard = conn.lock().await;
-        guard.send_message(&reply).await?;
+        conn.send_message(&reply).await?;
         Ok(())
     }
 
@@ -1067,14 +1079,12 @@ impl Processor {
         &self,
         owner_id: IdentityPub,
         request: RestoreRequestMsg,
-        conn: Arc<Mutex<Connection>>,
+        conn: Arc<Connection>,
     ) -> Result<(), ProcessorError> {
         let block_id = request.source_block_id;
         match self.handle_restore_request_inner(owner_id, request).await {
             Ok(response) => {
-                let mut guard = conn.lock().await;
-                guard
-                    .send_message(&Message::RestoreResponse(response))
+                conn.send_message(&Message::RestoreResponse(response))
                     .await?;
                 Ok(())
             }
@@ -1088,9 +1098,7 @@ impl Processor {
                     restore_budget_gb: denial.restore_budget_gb,
                     timestamp: Timestamp::now(),
                 };
-                let mut guard = conn.lock().await;
-                guard
-                    .send_message(&Message::RestoreDenied(denied_msg))
+                conn.send_message(&Message::RestoreDenied(denied_msg))
                     .await?;
                 Ok(())
             }
@@ -1181,11 +1189,14 @@ impl Processor {
         self.db.upsert_peer(&record)?;
 
         // Register the peer in the network layer so get_connection() can reach
-        // them. Build an EndpointAddr from the NodeId (iroh PublicKey) alone;
-        // a socket address is not required when the relay is enabled.
+        // them. Try to get the full address (IP:port + relay) from iroh's
+        // internal state first; fall back to NodeId-only if unavailable.
         match iroh::PublicKey::from_bytes(&msg.node_id.0) {
             Ok(pubkey) => {
-                let addr = iroh::EndpointAddr::new(pubkey);
+                let addr = match self.network.remote_endpoint_addr(pubkey).await {
+                    Some(full_addr) => full_addr,
+                    None => iroh::EndpointAddr::new(pubkey),
+                };
                 self.network.add_peer(msg.identity_pub, addr).await;
                 info!(
                     identity = %msg.identity_pub,
@@ -1219,13 +1230,11 @@ impl Processor {
         &self,
         from: IdentityPub,
         request: ClusterSyncRequestMsg,
-        conn: Arc<Mutex<Connection>>,
+        conn: Arc<Connection>,
     ) -> Result<(), ProcessorError> {
         match self.cluster_sync.handle_sync_request(&request) {
             Ok(response) => {
-                let mut guard = conn.lock().await;
-                guard
-                    .send_message(&Message::ClusterSyncResponse(response))
+                conn.send_message(&Message::ClusterSyncResponse(response))
                     .await?;
                 debug!(peer = %from, "processor: ClusterSyncRequest served");
             }
@@ -1333,7 +1342,7 @@ impl Processor {
         &self,
         requester_id: IdentityPub,
         _req: SystemStateRequestMsg,
-        conn: Arc<Mutex<Connection>>,
+        conn: Arc<Connection>,
     ) -> Result<(), ProcessorError> {
         let blob = match self.db.get_system_state_blob(&requester_id)? {
             Some(r) => r.encrypted_blob,
@@ -1346,8 +1355,7 @@ impl Processor {
             encrypted_blob: blob,
             timestamp: Timestamp::now(),
         });
-        let mut guard = conn.lock().await;
-        guard.send_message(&resp).await?;
+        conn.send_message(&resp).await?;
         Ok(())
     }
 
@@ -1378,7 +1386,7 @@ impl Processor {
         &self,
         requester_id: IdentityPub,
         _req: PeerDiscoveryRequestMsg,
-        conn: Arc<Mutex<Connection>>,
+        conn: Arc<Connection>,
     ) -> Result<(), ProcessorError> {
         let peers = self.db.list_all_peers()?;
         let discovered: Vec<DiscoveredPeer> = peers
@@ -1400,8 +1408,7 @@ impl Processor {
             peers: discovered,
             timestamp: Timestamp::now(),
         });
-        let mut guard = conn.lock().await;
-        guard.send_message(&resp).await?;
+        conn.send_message(&resp).await?;
         Ok(())
     }
 

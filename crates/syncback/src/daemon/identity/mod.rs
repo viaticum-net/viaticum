@@ -75,12 +75,15 @@ pub fn init_identity(data_dir: &Path) -> Result<IdentityKeyFile, IdentityError> 
     rand::rngs::OsRng.fill_bytes(&mut entropy);
     let mnemonic = bip39::Mnemonic::from_entropy(&entropy)
         .map_err(|e| IdentityError::InvalidMnemonic(e.to_string()))?;
-    create_keyfile(data_dir, &mnemonic)
+    create_keyfile(data_dir, &mnemonic, false)
 }
 
 /// Initialize from an existing 24-word BIP39 mnemonic (for DR restore / Docker testing).
 ///
-/// Same behaviour as `init_identity` but uses the supplied mnemonic instead of generating one.
+/// Same behaviour as `init_identity` but uses the supplied mnemonic instead of
+/// generating one. The device_id is derived deterministically from the seed
+/// (via HKDF) so that DR restores produce the same handshake identity as the
+/// original node. This is critical for SystemState blob lookup.
 pub fn init_identity_from_mnemonic(
     data_dir: &Path,
     mnemonic: &str,
@@ -93,7 +96,7 @@ pub fn init_identity_from_mnemonic(
             mnemonic.word_count()
         )));
     }
-    create_keyfile(data_dir, &mnemonic)
+    create_keyfile(data_dir, &mnemonic, true)
 }
 
 /// Load an existing identity from `<data_dir>/identity.key`.
@@ -142,9 +145,14 @@ fn keyfile_path(data_dir: &Path) -> PathBuf {
 }
 
 /// Shared logic for init_identity and init_identity_from_mnemonic.
+///
+/// When `deterministic_device_id` is true, the device_id is derived from the
+/// seed via HKDF so that the same mnemonic always produces the same identity
+/// (critical for DR blob lookup). When false, a random device_id is generated.
 fn create_keyfile(
     data_dir: &Path,
     mnemonic: &bip39::Mnemonic,
+    deterministic_device_id: bool,
 ) -> Result<IdentityKeyFile, IdentityError> {
     let path = keyfile_path(data_dir);
     if path.exists() {
@@ -162,8 +170,18 @@ fn create_keyfile(
         .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
     let identity_pub = master_identity(&master_key).0;
 
-    // Stable random device ID for this installation.
-    let device_id: [u8; 16] = rand::random();
+    // Device ID: deterministic from seed for DR restore, random for fresh init.
+    let device_id: [u8; 16] = if deterministic_device_id {
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        let hkdf = Hkdf::<Sha256>::new(None, &seed);
+        let mut id = [0u8; 16];
+        hkdf.expand(b"syncback-device-id-v1", &mut id)
+            .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
+        id
+    } else {
+        rand::random()
+    };
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

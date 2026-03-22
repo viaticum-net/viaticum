@@ -276,8 +276,7 @@ impl Scheduler {
                     continue;
                 }
                 Ok(conn_arc) => {
-                    let mut conn = conn_arc.lock().await;
-                    if let Err(e) = conn.send_message(&msg).await {
+                    if let Err(e) = conn_arc.send_message(&msg).await {
                         warn!(
                             holder_id = %entry.holder_id,
                             "scheduler: send PosChallenge failed: {e}"

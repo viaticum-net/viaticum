@@ -105,7 +105,7 @@ pub struct NetworkConfig {
 /// Internal pool entry.
 enum ConnectionState {
     /// Live authenticated connection.
-    Live(Arc<Mutex<Connection>>),
+    Live(Arc<Connection>),
     /// Connection failed recently. Don't retry until `retry_after` unix timestamp (seconds).
     Backoff { retry_after: u64 },
 }
@@ -117,7 +117,7 @@ enum ConnectionState {
 /// Owns the iroh [`Endpoint`] and manages the connection pool.
 /// Constructed via [`NetworkHandle::start`].
 /// Request to spawn a read loop for an auto-reconnected connection.
-pub type ReadLoopRequest = (IdentityPub, Arc<Mutex<Connection>>);
+pub type ReadLoopRequest = (IdentityPub, Arc<Connection>);
 
 pub struct NetworkHandle {
     /// iroh endpoint (transport identity).
@@ -246,22 +246,30 @@ impl NetworkHandle {
         peer_addr: EndpointAddr,
         expected_identity: Option<IdentityPub>,
     ) -> Result<Connection, NetworkError> {
-        debug!(peer = ?peer_addr.id, "connecting");
+        debug!(peer = ?peer_addr.id, addrs = ?peer_addr.addrs, "connecting");
 
-        let iroh_conn = self
-            .endpoint
-            .connect(peer_addr, ALPN)
+        let connect_fut = async {
+            let iroh_conn = self
+                .endpoint
+                .connect(peer_addr, ALPN)
+                .await
+                .map_err(|e| NetworkError::Iroh(anyhow::anyhow!("{e}")))?;
+
+            handshake_initiator(
+                iroh_conn,
+                &self.signing_key,
+                self.identity_pub,
+                expected_identity,
+                self.device_cert.clone(),
+            )
             .await
-            .map_err(|e| NetworkError::Iroh(anyhow::anyhow!("{e}")))?;
+        };
 
-        let conn = handshake_initiator(
-            iroh_conn,
-            &self.signing_key,
-            self.identity_pub,
-            expected_identity,
-            self.device_cert.clone(),
-        )
-        .await?;
+        // 15-second timeout prevents hanging on unreachable peers.
+        let conn = tokio::time::timeout(std::time::Duration::from_secs(15), connect_fut)
+            .await
+            .map_err(|_| NetworkError::Iroh(anyhow::anyhow!("connect timed out (15s)")))?
+            ?;
 
         info!(peer = %conn.peer_identity, "connection established");
         Ok(conn)
@@ -278,7 +286,7 @@ impl NetworkHandle {
     pub async fn get_connection(
         &self,
         peer_identity: IdentityPub,
-    ) -> Result<Arc<Mutex<Connection>>, NetworkError> {
+    ) -> Result<Arc<Connection>, NetworkError> {
         // ── 1. Check pool ──────────────────────────────────────────────────────
         {
             let pool = self.connections.lock().await;
@@ -310,7 +318,7 @@ impl NetworkHandle {
         // ── 3. Connect and authenticate ────────────────────────────────────────
         match self.connect(peer_addr, Some(peer_identity)).await {
             Ok(conn) => {
-                let arc = Arc::new(Mutex::new(conn));
+                let arc = Arc::new(conn);
                 self.connections
                     .lock()
                     .await
@@ -348,8 +356,7 @@ impl NetworkHandle {
         msg: &Message,
     ) -> Result<(), NetworkError> {
         let arc = self.get_connection(peer_identity).await?;
-        let mut guard = arc.lock().await;
-        match guard.send_message(msg).await {
+        match arc.send_message(msg).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 warn!(
@@ -357,7 +364,6 @@ impl NetworkHandle {
                     err = %e,
                     "send_to_peer: send failed, evicting from pool"
                 );
-                drop(guard); // release conn lock before pool lock
                 let retry_after = unix_now() + RECONNECT_BACKOFF_SECS;
                 self.connections
                     .lock()
@@ -390,7 +396,7 @@ impl NetworkHandle {
         self.connections
             .lock()
             .await
-            .insert(peer_identity, ConnectionState::Live(Arc::new(Mutex::new(conn))));
+            .insert(peer_identity, ConnectionState::Live(Arc::new(conn)));
         debug!(peer = %peer_identity, "connection stored in pool");
     }
 
@@ -401,7 +407,7 @@ impl NetworkHandle {
     pub async fn store_connection_arc(
         &self,
         peer_identity: IdentityPub,
-        arc: Arc<Mutex<Connection>>,
+        arc: Arc<Connection>,
     ) {
         self.connections
             .lock()
@@ -415,20 +421,70 @@ impl NetworkHandle {
     /// After this call, `get_connection(identity)` will find the peer's address.
     /// If the peer was already present, the address is updated.
     pub async fn add_peer(&self, identity: IdentityPub, addr: EndpointAddr) {
+        debug!(
+            peer = %identity,
+            node_id = ?addr.id,
+            num_addrs = addr.addrs.len(),
+            addrs = ?addr.addrs,
+            "add_peer: registering"
+        );
         let mut peers = self.known_peers.write().await;
         peers.insert(identity, addr);
     }
 
+    /// Build a full [`EndpointAddr`] for a remote peer using iroh's internal
+    /// address book. Returns `None` if iroh has no info for this peer.
+    ///
+    /// This is much better than `EndpointAddr::new(pubkey)` (NodeId-only)
+    /// because it includes actual IP:port and relay URLs that iroh has learned
+    /// through the existing connection.
+    pub async fn remote_endpoint_addr(&self, remote_id: iroh::PublicKey) -> Option<EndpointAddr> {
+        let info = self.endpoint.remote_info(remote_id).await?;
+        let addr = EndpointAddr::from_parts(
+            info.id(),
+            info.into_addrs().map(|a| a.into_addr()),
+        );
+        Some(addr)
+    }
+
     /// Send a [`Message`] on an established connection (static helper).
     pub async fn send_message(
-        conn: &mut Connection,
+        conn: &Connection,
         msg: &Message,
     ) -> Result<(), NetworkError> {
         conn.send_message(msg).await
     }
 
+    /// Send a message to a peer using a fresh one-shot connection.
+    ///
+    /// Unlike `send_to_peer` which uses the connection pool (and may block
+    /// when the read loop holds the Mutex), this opens a fresh connection,
+    /// sends the message, and waits briefly for the peer to process it.
+    /// Ideal for periodic fire-and-forget messages (system state push).
+    pub async fn send_message_oneshot(
+        &self,
+        peer_identity: IdentityPub,
+        msg: &Message,
+    ) -> Result<(), NetworkError> {
+        let peer_addr = {
+            let peers = self.known_peers.read().await;
+            peers.get(&peer_identity).cloned()
+        }
+        .ok_or(NetworkError::PeerNotFound(peer_identity))?;
+
+        let conn = self.connect(peer_addr, Some(peer_identity)).await?;
+        conn.send_message(msg).await?;
+        // Finish the send stream to signal "done" and give the peer time
+        // to read the data before the QUIC connection drops.
+        conn.finish_send();
+        // Brief wait ensures the peer's read loop processes the message
+        // before the connection close frame arrives.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        Ok(())
+    }
+
     /// Receive the next [`Message`] from an established connection (static helper).
-    pub async fn recv_message(conn: &mut Connection) -> Result<Message, NetworkError> {
+    pub async fn recv_message(conn: &Connection) -> Result<Message, NetworkError> {
         conn.recv_message().await
     }
 
@@ -444,6 +500,12 @@ impl NetworkHandle {
     ) -> Result<(), NetworkError> {
         self.send_to_peer(peer_identity, &Message::SymbolTransfer(msg))
             .await
+    }
+
+    /// Look up a peer's EndpointAddr from the known_peers directory.
+    pub async fn get_peer_addr(&self, identity: &IdentityPub) -> Option<EndpointAddr> {
+        let peers = self.known_peers.read().await;
+        peers.get(identity).cloned()
     }
 
     /// Build a signed PeerAnnounceMsg for this node.

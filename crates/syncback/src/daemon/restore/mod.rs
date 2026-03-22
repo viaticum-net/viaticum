@@ -519,20 +519,41 @@ impl RestoreCoordinator {
 
     /// Contact one holder, send a RestoreRequest, receive RestoreResponse.
     ///
+    /// Uses a fresh direct connection (not the pool) because pooled connections
+    /// have read loops that would race for the recv Mutex and may consume
+    /// the RestoreResponse before we read it.
+    ///
     /// Returns the raw bound symbols (not yet unbound).
     async fn fetch_symbols_from_holder(
         &self,
         holder_id: &IdentityPub,
         request: RestoreRequestMsg,
     ) -> Result<Vec<Symbol>, RestoreError> {
-        let conn_arc = self.network.get_connection(*holder_id).await?;
-        let mut guard = conn_arc.lock().await;
+        // Look up peer address, then connect directly (bypass pool).
+        let peer_addr = self
+            .network
+            .get_peer_addr(holder_id)
+            .await
+            .ok_or_else(|| {
+                crate::daemon::network::NetworkError::PeerNotFound(*holder_id)
+            })?;
 
-        guard
-            .send_message(&Message::RestoreRequest(request))
+        let conn = self
+            .network
+            .connect(peer_addr, Some(*holder_id))
             .await?;
 
-        let resp_msg = guard.recv_message().await?;
+        conn.send_message(&Message::RestoreRequest(request))
+            .await?;
+
+        // Read response — may need to skip PeerAnnounce from the peer's Processor.
+        let resp_msg = loop {
+            let msg = conn.recv_message().await?;
+            match msg {
+                Message::PeerAnnounce(_) => continue, // skip, try next message
+                other => break other,
+            }
+        };
 
         match resp_msg {
             Message::RestoreResponse(resp) => {

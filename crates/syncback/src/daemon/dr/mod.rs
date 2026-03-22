@@ -188,7 +188,7 @@ async fn bfs_collect_blobs(
         );
 
         // Connect directly (bypasses known_peers lookup).
-        let mut conn = match tokio::time::timeout(
+        let conn = match tokio::time::timeout(
             Duration::from_secs(CONNECT_TIMEOUT_SECS),
             network.connect(endpoint_addr, None),
         )
@@ -219,7 +219,7 @@ async fn bfs_collect_blobs(
         }
 
         // Wait for SystemStateResponse, skipping other message types.
-        match recv_expecting_system_state(&mut conn).await {
+        match recv_expecting_system_state(&conn).await {
             Some(resp) if !resp.encrypted_blob.is_empty() => {
                 println!("  found blob ({} bytes)", resp.encrypted_blob.len());
                 blobs.push((resp.timestamp.0, resp.encrypted_blob));
@@ -243,7 +243,7 @@ async fn bfs_collect_blobs(
             continue;
         }
 
-        match recv_expecting_peer_discovery(&mut conn).await {
+        match recv_expecting_peer_discovery(&conn).await {
             Some(resp) => {
                 // DiscoveredPeer carries identity_pub + node_id but no socket address,
                 // so we cannot directly enqueue discovered peers as connectable addresses.
@@ -289,7 +289,7 @@ async fn bfs_collect_blobs(
 ///
 /// Returns `None` on timeout or connection error.
 async fn recv_expecting_system_state(
-    conn: &mut crate::daemon::network::connection::Connection,
+    conn: &crate::daemon::network::connection::Connection,
 ) -> Option<syncback_core::messages::SystemStateResponseMsg> {
     let deadline = Duration::from_secs(REQUEST_TIMEOUT_SECS);
     let start = Instant::now();
@@ -314,7 +314,7 @@ async fn recv_expecting_system_state(
 ///
 /// Returns `None` on timeout or connection error.
 async fn recv_expecting_peer_discovery(
-    conn: &mut crate::daemon::network::connection::Connection,
+    conn: &crate::daemon::network::connection::Connection,
 ) -> Option<syncback_core::messages::PeerDiscoveryResponseMsg> {
     let deadline = Duration::from_secs(REQUEST_TIMEOUT_SECS);
     let start = Instant::now();
