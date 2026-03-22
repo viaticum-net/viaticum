@@ -116,6 +116,9 @@ enum ConnectionState {
 ///
 /// Owns the iroh [`Endpoint`] and manages the connection pool.
 /// Constructed via [`NetworkHandle::start`].
+/// Request to spawn a read loop for an auto-reconnected connection.
+pub type ReadLoopRequest = (IdentityPub, Arc<Mutex<Connection>>);
+
 pub struct NetworkHandle {
     /// iroh endpoint (transport identity).
     endpoint: Endpoint,
@@ -131,6 +134,11 @@ pub struct NetworkHandle {
     known_peers: Arc<RwLock<HashMap<IdentityPub, EndpointAddr>>>,
     /// Authenticated connections keyed by peer IdentityPub (Live or Backoff).
     connections: Arc<Mutex<HashMap<IdentityPub, ConnectionState>>>,
+    /// Channel to request Processor to spawn read loops for auto-reconnected
+    /// outbound connections. Without this, only accepted (inbound) connections
+    /// get a read loop, so PoS responses on auto-reconnected connections
+    /// would be silently dropped. None in tests.
+    read_loop_tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<ReadLoopRequest>>>,
 }
 
 impl NetworkHandle {
@@ -194,7 +202,15 @@ impl NetworkHandle {
             device_cert: config.device_cert,
             known_peers: Arc::new(RwLock::new(config.known_peers)),
             connections,
+            read_loop_tx: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Set the read-loop channel so auto-reconnected outbound connections
+    /// get a Processor read loop (enabling bidirectional communication).
+    /// Called by DaemonHandle after creating the Processor channel.
+    pub fn set_read_loop_tx(&self, tx: tokio::sync::mpsc::Sender<ReadLoopRequest>) {
+        *self.read_loop_tx.lock().unwrap() = Some(tx);
     }
 
     /// Return the iroh [`EndpointAddr`] for this endpoint (for peer_announce).
@@ -299,6 +315,13 @@ impl NetworkHandle {
                     .lock()
                     .await
                     .insert(peer_identity, ConnectionState::Live(arc.clone()));
+
+                // Notify Processor to spawn a read loop so we can receive
+                // responses (PoS, SymbolAccept, etc.) on this connection.
+                if let Some(tx) = self.read_loop_tx.lock().unwrap().as_ref() {
+                    let _ = tx.try_send((peer_identity, arc.clone()));
+                }
+
                 Ok(arc)
             }
             Err(e) => {

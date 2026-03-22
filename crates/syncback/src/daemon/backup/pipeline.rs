@@ -257,6 +257,7 @@ pub fn run_pipeline(
         source_block_id: block_id,
         k: params.k,
         n,
+        t: params.t,
         symbol_count_per_holder,
         stored_size: stored.len() as u64,
     })
@@ -312,7 +313,7 @@ pub fn flush_queue_inner(
         if !batch.is_empty() && batch_bytes + file_size > config.source_block_size {
             // Flush current batch
             let result = run_pipeline(db, config, encoder, &batch, BlockTypeTag::Pack, candidates, &[])?;
-            update_backed_up_at(db, &batch, result.source_block_id)?;
+            update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
             results.push(result);
             batch.clear();
             batch_bytes = 0;
@@ -324,7 +325,7 @@ pub fn flush_queue_inner(
         // If batch is now at or over limit, flush immediately
         if batch_bytes >= config.source_block_size {
             let result = run_pipeline(db, config, encoder, &batch, BlockTypeTag::Pack, candidates, &[])?;
-            update_backed_up_at(db, &batch, result.source_block_id)?;
+            update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
             results.push(result);
             batch.clear();
             batch_bytes = 0;
@@ -334,7 +335,7 @@ pub fn flush_queue_inner(
     // Flush remaining batch
     if !batch.is_empty() {
         let result = run_pipeline(db, config, encoder, &batch, BlockTypeTag::Pack, candidates, &[])?;
-        update_backed_up_at(db, &batch, result.source_block_id)?;
+        update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
         results.push(result);
     }
 
@@ -346,6 +347,8 @@ pub fn update_backed_up_at(
     db: &Db,
     batch: &[(QueuedFile, Vec<u8>)],
     block_id: SourceBlockId,
+    k: u32,
+    t: u16,
 ) -> anyhow::Result<()> {
     let now = Timestamp::now();
     for (qf, _) in batch {
@@ -357,6 +360,8 @@ pub fn update_backed_up_at(
                 if version.content_hash == qf.content_hash {
                     version.backed_up_at = Some(now);
                     version.source_block_id = block_id;
+                    version.k = k;
+                    version.t = t;
                     updated = true;
                     break;
                 }

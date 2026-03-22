@@ -433,6 +433,11 @@ impl DaemonHandle {
                 },
                 cs.clone(),
             ));
+            // Create channel for auto-reconnect read loops and wire to network.
+            let (read_loop_tx, read_loop_rx) =
+                mpsc::channel::<crate::daemon::network::ReadLoopRequest>(64);
+            network.set_read_loop_tx(read_loop_tx);
+
             let processor = Processor::new(
                 db.clone(),
                 identity_pub,
@@ -450,7 +455,7 @@ impl DaemonHandle {
             );
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {
-                processor.run(incoming_rx, inbound_rx, cancel_processor).await
+                processor.run(incoming_rx, inbound_rx, read_loop_rx, cancel_processor).await
             }));
         } else {
             tracing::warn!("cluster state unavailable — Processor not started, incoming connections will be dropped");

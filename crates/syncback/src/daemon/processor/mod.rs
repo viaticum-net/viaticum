@@ -175,6 +175,7 @@ impl Processor {
         self,
         mut incoming_rx: mpsc::Receiver<Connection>,
         mut inbound_rx: mpsc::Receiver<InboundMessage>,
+        mut read_loop_rx: mpsc::Receiver<crate::daemon::network::ReadLoopRequest>,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let (msg_tx, mut msg_rx) =
@@ -198,21 +199,15 @@ impl Processor {
                         }
                         Some(conn) => {
                             let peer_id = conn.peer_identity;
+
+                            // Send PeerAnnounce on this connection before
+                            // splitting into separate read-loop and pool entry.
                             let conn_arc = Arc::new(Mutex::new(conn));
-                            let conn_arc2 = conn_arc.clone();
-                            let tx = msg_tx.clone();
-                            let network_arc = this.network.clone();
-
-                            // Store in connection pool so send_to_peer can reuse it.
-                            network_arc.store_connection_arc(peer_id, conn_arc.clone()).await;
-
-                            // Send our PeerAnnounceMsg immediately so the
-                            // remote learns our identity ↔ NodeId mapping.
-                            let pa_msg = {
-                                let pa = network_arc.build_peer_announce(Timestamp::now());
-                                Message::PeerAnnounce(pa)
-                            };
                             {
+                                let pa_msg = {
+                                    let pa = this.network.build_peer_announce(Timestamp::now());
+                                    Message::PeerAnnounce(pa)
+                                };
                                 let mut guard = conn_arc.lock().await;
                                 if let Err(e) = guard.send_message(&pa_msg).await {
                                     warn!(
@@ -228,6 +223,15 @@ impl Processor {
                                 }
                             }
 
+                            // NOTE: we do NOT store this inbound connection in the
+                            // pool. The pool is for OUTBOUND connections used by
+                            // send_to_peer. Inbound connections are only used for
+                            // the read loop (and dispatch responses via msg_tx).
+                            // This avoids Mutex deadlock: read loop holds the lock
+                            // during recv_message, and send_to_peer would block.
+                            let conn_arc2 = conn_arc.clone();
+                            let tx = msg_tx.clone();
+                            let network_arc = this.network.clone();
                             tokio::spawn(async move {
                                 debug!(peer = %peer_id, "processor: read loop started");
                                 loop {
@@ -241,9 +245,6 @@ impl Processor {
                                                     err = %e,
                                                     "processor: connection closed"
                                                 );
-                                                // Evict the dead connection so get_connection
-                                                // reconnects next time instead of reusing the
-                                                // stale Arc.
                                                 network_arc.evict_connection(peer_id).await;
                                                 break;
                                             }
@@ -256,6 +257,38 @@ impl Processor {
                                 debug!(peer = %peer_id, "processor: read loop exited");
                             });
                         }
+                    }
+                }
+
+                // Auto-reconnected outbound connections need a read loop too.
+                maybe_rl = read_loop_rx.recv() => {
+                    if let Some((peer_id, conn_arc)) = maybe_rl {
+                        let conn_arc2 = conn_arc.clone();
+                        let tx = msg_tx.clone();
+                        let network_arc = this.network.clone();
+                        debug!(peer = %peer_id, "processor: read loop started (auto-reconnect)");
+                        tokio::spawn(async move {
+                            loop {
+                                let msg = {
+                                    let mut guard = conn_arc2.lock().await;
+                                    match guard.recv_message().await {
+                                        Ok(m) => m,
+                                        Err(e) => {
+                                            debug!(
+                                                peer = %peer_id,
+                                                err = %e,
+                                                "processor: auto-reconnect connection closed"
+                                            );
+                                            network_arc.evict_connection(peer_id).await;
+                                            break;
+                                        }
+                                    }
+                                };
+                                if tx.send((peer_id, msg, conn_arc2.clone())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
                     }
                 }
 

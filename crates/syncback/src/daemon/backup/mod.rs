@@ -127,6 +127,8 @@ pub struct PipelineResult {
     pub source_block_id: SourceBlockId,
     pub k: u32,
     pub n: u32,
+    /// Symbol size in bytes (SYMBOL_SIZE).
+    pub t: u16,
     pub symbol_count_per_holder: Vec<(IdentityPub, u32)>,
     /// Exact byte length of the stored blob ([nonce][ciphertext]).
     /// Required for restore: the decoded erasure block is zero-padded to k*t; trim to stored_size.
@@ -324,7 +326,7 @@ impl BackupCoordinator {
             candidates,
             &[],
         )?;
-        update_backed_up_at(&self.db, &batch, result.source_block_id)?;
+        update_backed_up_at(&self.db, &batch, result.source_block_id, result.k, result.t)?;
         Ok(result)
     }
 
@@ -484,8 +486,15 @@ impl BackupCoordinator {
     async fn deliver_symbols(&self, results: &[PipelineResult]) {
         let network = match &self.config.network {
             Some(n) => n.clone(),
-            None => return,
+            None => {
+                tracing::debug!("deliver_symbols: no network configured, skipping");
+                return;
+            }
         };
+        tracing::info!(
+            blocks = results.len(),
+            "deliver_symbols: starting delivery"
+        );
 
         for result in results {
             let placements = match self.db.list_placements_for_block(&result.source_block_id) {

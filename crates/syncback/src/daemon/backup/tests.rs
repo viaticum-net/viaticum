@@ -758,6 +758,7 @@ async fn deliver_symbols_no_op_when_network_none() {
         source_block_id: SourceBlockId([0u8; 32]),
         k: 1,
         n: 2,
+        t: 65535,
         symbol_count_per_holder: vec![(IdentityPub([0u8; 32]), 1)],
         stored_size: 0,
     };
@@ -831,6 +832,7 @@ async fn deliver_symbols_logs_warn_on_peer_not_found() {
         source_block_id: block_id,
         k: 1,
         n: 2,
+        t: 65535,
         symbol_count_per_holder: vec![(unknown_holder, 1)],
         stored_size: 64,
     };
@@ -934,6 +936,7 @@ async fn deliver_symbols_sends_to_reachable_holder() {
         source_block_id: block_id,
         k: 2,
         n: 4,
+        t: 65535,
         symbol_count_per_holder: vec![(holder_identity, 2)],
         stored_size: 128,
     };

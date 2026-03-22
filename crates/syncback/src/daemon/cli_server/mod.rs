@@ -259,11 +259,11 @@ pub(crate) fn dispatch_status(state: &DaemonState) -> CliResponse {
         sum / peers.len() as f64
     };
 
-    // backed_up_bytes: sum of latest-version sizes (use file_size from latest FileVersion).
-    // We approximate by using k*t of the latest version's source block params.
+    // backed_up_bytes: sum of k*t for files that have been backed up (backed_up_at set).
     let backed_up_bytes: u64 = files
         .iter()
         .filter_map(|f| f.versions.last())
+        .filter(|v| v.backed_up_at.is_some())
         .map(|v| v.k as u64 * v.t as u64)
         .sum();
 

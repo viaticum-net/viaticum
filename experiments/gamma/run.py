@@ -137,8 +137,8 @@ def phase_start_daemons(nodes: list[dict], time_scale: int):
     print(f"\n=== Phase: Start daemons (time_scale={time_scale}) ===")
     for n in nodes:
         exec_node_bg(n["name"], "sh", "-c",
-                     f"syncback daemon --time-scale {time_scale} --watch-dir /data/files "
-                     f"2>/tmp/daemon.log")
+                     f"RUST_LOG=info syncback daemon --time-scale {time_scale} --watch-dir /data/files "
+                     f">/tmp/daemon.log 2>&1")
     # Wait for all to be ready
     time.sleep(5)
     ready = 0
@@ -248,8 +248,8 @@ def phase_behavior_loop(nodes: list[dict], duration_secs: int, time_scale: int):
                 else:
                     # Restart daemon
                     exec_node_bg(name, "sh", "-c",
-                                 f"syncback daemon --time-scale {time_scale} "
-                                 f"--watch-dir /data/files 2>>/tmp/daemon.log")
+                                 f"RUST_LOG=info syncback daemon --time-scale {time_scale} "
+                                 f"--watch-dir /data/files >>/tmp/daemon.log 2>&1")
                     state[name] = True
                     next_toggle[name] = now + n.get("on_secs", 180) + random.uniform(-30, 30)
 
