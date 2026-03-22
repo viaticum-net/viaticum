@@ -3669,6 +3669,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "hkdf",
  "iroh",
+ "libc",
  "notify",
  "rand 0.8.5",
  "serde",

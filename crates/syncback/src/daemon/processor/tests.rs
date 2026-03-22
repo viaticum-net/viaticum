@@ -108,6 +108,8 @@ async fn make_processor_with_quota(
     let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let network = make_network().await;
 
+    let (backup_event_tx, _backup_event_rx) =
+        tokio::sync::mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
     let processor = Processor::new(
         db,
         own_identity,
@@ -120,6 +122,7 @@ async fn make_processor_with_quota(
         relay_sync_tx,
         soft_quota_bytes,
         hard_quota_bytes,
+        backup_event_tx,
     );
 
     (processor, repair_rx, relay_sync_rx)

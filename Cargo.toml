@@ -65,5 +65,8 @@ tempfile = "3"
 # File-system watching
 notify = "6"
 
+# System
+libc = "0.2"
+
 # Internal
 syncback-core = { path = "crates/syncback-core" }

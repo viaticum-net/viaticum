@@ -75,6 +75,19 @@ pub struct DaemonState {
     )>,
     /// Cluster state (optional — None before first device registration).
     pub cluster_state: Option<Arc<Mutex<ClusterState>>>,
+    /// Channel to send connections to the Processor for read-loop spawning.
+    /// Used by dispatch_connect for outbound connections.
+    pub incoming_tx: mpsc::Sender<crate::daemon::network::connection::Connection>,
+    /// Master signing key (for issuing device certs, revocations).
+    pub master_key: ed25519_dalek::SigningKey,
+    /// Raw seed bytes (for deriving new device keys).
+    pub seed: Vec<u8>,
+    /// Data directory path (for disk space queries).
+    pub data_dir: PathBuf,
+    /// Soft quota in bytes (0 = unlimited).
+    pub soft_quota_bytes: u64,
+    /// Disk reserve in bytes.
+    pub disk_reserve_bytes: u64,
 }
 
 // ─── DaemonHandle ─────────────────────────────────────────────────────────────
@@ -155,6 +168,8 @@ impl DaemonHandle {
             tokio::sync::oneshot::Sender<Result<RestoreResult, crate::daemon::restore::RestoreError>>,
         )>(16);
         let (repair_tx, repair_rx) = mpsc::channel::<RepairTrigger>(64);
+        let (backup_event_tx, backup_event_rx) =
+            mpsc::channel::<crate::daemon::backup::BackupEvent>(64);
         let (relay_sync_tx, relay_sync_rx) =
             mpsc::channel::<crate::daemon::relay::SyncTrigger>(64);
         let (incoming_tx, incoming_rx) =
@@ -269,6 +284,10 @@ impl DaemonHandle {
             iroh_secret_key: Some(iroh::SecretKey::from_bytes(&iroh_key_bytes)),
             relay_mode,
         };
+        // Clone incoming_tx before it's moved into NetworkHandle::start.
+        // The clone goes into DaemonState so dispatch_connect can send outbound
+        // connections to the Processor for read-loop spawning.
+        let incoming_tx_for_state = incoming_tx.clone();
         let network = Arc::new(NetworkHandle::start(net_config, incoming_tx).await?);
 
         // ── 9. Ensure symbols and holdings directories exist ──────────────────
@@ -354,6 +373,12 @@ impl DaemonHandle {
             network: network.clone(),
             restore_tx: restore_tx.clone(),
             cluster_state: cluster_state.clone(),
+            incoming_tx: incoming_tx_for_state,
+            master_key: master_key.clone(),
+            seed: keyfile.seed.clone(),
+            data_dir: cfg.data_dir.clone(),
+            soft_quota_bytes: syncback_core::config::soft_quota_bytes(&app_config),
+            disk_reserve_bytes: syncback_core::config::disk_reserve_bytes(&app_config),
         });
 
         // ── 13. Start CLI server ──────────────────────────────────────────────
@@ -370,7 +395,7 @@ impl DaemonHandle {
         // ── 15. Spawn subsystem tasks ─────────────────────────────────────────
         let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
 
-        tasks.push(tokio::spawn(backup.run(dirty_rx)));
+        tasks.push(tokio::spawn(backup.run(dirty_rx, backup_event_rx)));
         tasks.push(tokio::spawn(restore.run(restore_rx)));
         tasks.push(tokio::spawn(repair.run(repair_interval_secs, repair_rx)));
         tasks.push(tokio::spawn(relay.run(relay_sync_rx, inbound_tx)));
@@ -409,6 +434,7 @@ impl DaemonHandle {
                 relay_sync_tx.clone(),
                 soft_quota_bytes,
                 hard_quota_bytes,
+                backup_event_tx,
             );
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {

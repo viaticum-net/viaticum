@@ -36,6 +36,7 @@ async fn make_test_state() -> Arc<DaemonState> {
     };
     let (incoming_tx, _incoming_rx) =
         mpsc::channel::<crate::daemon::network::connection::Connection>(1);
+    let incoming_tx_for_state = incoming_tx.clone();
     let network = Arc::new(
         NetworkHandle::start(net_config, incoming_tx)
             .await
@@ -47,6 +48,8 @@ async fn make_test_state() -> Arc<DaemonState> {
         tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
     )>(4);
 
+    let master_key = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+
     Arc::new(DaemonState {
         db,
         identity_pub,
@@ -54,6 +57,12 @@ async fn make_test_state() -> Arc<DaemonState> {
         network,
         restore_tx,
         cluster_state: None,
+        incoming_tx: incoming_tx_for_state,
+        master_key,
+        seed: vec![0u8; 64],
+        data_dir: std::path::PathBuf::from("/tmp"),
+        soft_quota_bytes: 0,
+        disk_reserve_bytes: 0,
     })
 }
 
@@ -138,17 +147,15 @@ async fn dispatch_restore_coordinator_not_running_returns_error() {
 }
 
 #[tokio::test]
-async fn dispatch_device_revoke_echoes_id() {
+async fn dispatch_device_revoke_no_cluster_returns_error() {
     let state = make_test_state().await;
     let id = "aa".repeat(16);
     let request = CliRequest::DeviceRevoke {
         device_id_hex: id.clone(),
     };
     let response = dispatch(request, &state).await;
-    let CliResponse::DeviceRevoked { device_id_hex } = response else {
-        panic!("expected DeviceRevoked response");
-    };
-    assert_eq!(device_id_hex, id);
+    // Without cluster_state, revoke returns an error.
+    assert!(matches!(response, CliResponse::Error(_)));
 }
 
 #[tokio::test]
@@ -180,7 +187,7 @@ async fn dispatch_device_list_empty_when_no_cluster() {
 }
 
 #[tokio::test]
-async fn dispatch_device_add_returns_device_added_with_label() {
+async fn dispatch_device_add_no_cluster_returns_error() {
     let state = make_test_state().await;
     let response = dispatch(
         CliRequest::DeviceAdd {
@@ -189,12 +196,8 @@ async fn dispatch_device_add_returns_device_added_with_label() {
         &state,
     )
     .await;
-    let CliResponse::DeviceAdded(entry) = response else {
-        panic!("expected DeviceAdded");
-    };
-    assert_eq!(entry.label, "my-laptop");
-    assert!(!entry.revoked);
-    assert!(!entry.is_current);
+    // Without cluster_state, add returns an error.
+    assert!(matches!(response, CliResponse::Error(_)));
 }
 
 #[tokio::test]
@@ -272,6 +275,7 @@ async fn dispatch_connect_two_daemons_registers_peer() {
 
     let db_a = Db::open_in_memory().expect("db_a");
     let (tx_a, _rx_a) = mpsc::channel::<crate::daemon::network::connection::Connection>(4);
+    let tx_a_for_state = tx_a.clone();
     let handle_a = Arc::new(
         NetworkHandle::start(
             NetworkConfig {
@@ -297,6 +301,12 @@ async fn dispatch_connect_two_daemons_registers_peer() {
         network: handle_a.clone(),
         restore_tx,
         cluster_state: None,
+        incoming_tx: tx_a_for_state,
+        master_key: ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
+        seed: vec![0u8; 64],
+        data_dir: std::path::PathBuf::from("/tmp"),
+        soft_quota_bytes: 0,
+        disk_reserve_bytes: 0,
     });
 
     let response = dispatch(CliRequest::Connect { addr: addr_b_str }, &state_a).await;

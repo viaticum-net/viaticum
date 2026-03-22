@@ -49,6 +49,22 @@ pub enum DirtyKind {
     Deleted,
 }
 
+/// Notification from Processor about symbol offer outcomes.
+#[derive(Debug, Clone)]
+pub enum BackupEvent {
+    /// Holder accepted our symbols for this block.
+    SymbolAccepted {
+        holder_id: IdentityPub,
+        source_block_id: SourceBlockId,
+    },
+    /// Holder rejected our symbols for this block.
+    SymbolRejected {
+        holder_id: IdentityPub,
+        source_block_id: SourceBlockId,
+        reason: String,
+    },
+}
+
 /// One item waiting in a packing queue.
 #[derive(Debug, Clone)]
 pub struct QueuedFile {
@@ -316,6 +332,7 @@ impl BackupCoordinator {
     pub async fn run(
         mut self,
         mut rx: tokio::sync::mpsc::Receiver<DirtyEvent>,
+        mut backup_event_rx: tokio::sync::mpsc::Receiver<BackupEvent>,
     ) -> anyhow::Result<()> {
         use tokio::time::{interval, Duration, MissedTickBehavior};
 
@@ -369,9 +386,86 @@ impl BackupCoordinator {
                         Err(e) => tracing::error!("fallback flush error: {e}"),
                     }
                 }
+                maybe_backup = backup_event_rx.recv() => {
+                    if let Some(event) = maybe_backup {
+                        self.handle_backup_event(event);
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// Handle a BackupEvent from the Processor.
+    fn handle_backup_event(&self, event: BackupEvent) {
+        match event {
+            BackupEvent::SymbolAccepted {
+                holder_id,
+                source_block_id,
+            } => {
+                tracing::info!(
+                    holder = %holder_id,
+                    block_id = %source_block_id,
+                    "holder accepted symbols"
+                );
+                // Update placement status to Alive (confirmed by holder).
+                match self.db.get_placement(&source_block_id, &holder_id) {
+                    Ok(Some(mut placement)) => {
+                        if placement.status == syncback_core::types::PlacementStatus::Alive {
+                            // Already alive — nothing to do.
+                            return;
+                        }
+                        placement.status = syncback_core::types::PlacementStatus::Alive;
+                        if let Err(e) = self.db.upsert_placement(&placement) {
+                            tracing::error!(
+                                holder = %holder_id,
+                                block_id = %source_block_id,
+                                error = %e,
+                                "failed to update placement after SymbolAccept"
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            holder = %holder_id,
+                            block_id = %source_block_id,
+                            "SymbolAccept for unknown placement"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "DB error on SymbolAccept");
+                    }
+                }
+            }
+            BackupEvent::SymbolRejected {
+                holder_id,
+                source_block_id,
+                reason,
+            } => {
+                tracing::warn!(
+                    holder = %holder_id,
+                    block_id = %source_block_id,
+                    reason = %reason,
+                    "holder rejected symbols"
+                );
+                // Mark placement as Lost — triggers repair to find new holder.
+                match self.db.get_placement(&source_block_id, &holder_id) {
+                    Ok(Some(mut placement)) => {
+                        placement.status = syncback_core::types::PlacementStatus::Lost;
+                        if let Err(e) = self.db.upsert_placement(&placement) {
+                            tracing::error!(
+                                error = %e,
+                                "failed to update placement after SymbolReject"
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "DB error on SymbolReject");
+                    }
+                }
+            }
+        }
     }
 
     /// Deliver encoded symbols to their assigned holders over the network.

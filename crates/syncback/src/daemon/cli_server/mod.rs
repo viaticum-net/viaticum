@@ -164,8 +164,7 @@ pub(crate) async fn dispatch(request: CliRequest, state: &DaemonState) -> CliRes
         CliRequest::DeviceAdd { label } => dispatch_device_add(state, label),
 
         CliRequest::DeviceRevoke { device_id_hex } => {
-            // TODO: implement actual revocation (ClusterState + DB + broadcast)
-            CliResponse::DeviceRevoked { device_id_hex }
+            dispatch_device_revoke(state, device_id_hex)
         }
 
         CliRequest::Connect { addr } => dispatch_connect(state, addr).await,
@@ -258,7 +257,14 @@ fn dispatch_status(state: &DaemonState) -> CliResponse {
         backed_up_bytes,
         blocks_needing_repair,
         peers: peer_summaries,
-        effective_quota_bytes: 0, // TODO: compute from config soft_quota + disk_free - reserve
+        effective_quota_bytes: {
+            let disk_free = disk_available_bytes(&state.data_dir);
+            syncback_core::budget::compute_effective_quota(
+                state.soft_quota_bytes,
+                disk_free,
+                state.disk_reserve_bytes,
+            )
+        },
         used_bytes: holdings_bytes,
     })
 }
@@ -470,13 +476,16 @@ fn dispatch_device_list(state: &DaemonState) -> CliResponse {
 // ── Device add ────────────────────────────────────────────────────────────────
 
 fn dispatch_device_add(state: &DaemonState, label: String) -> CliResponse {
-    // TODO: implement real device registration (cert generation + ClusterSync key exchange).
-    // Currently returns a stub with a fake device ID derived from identity+label.
-    tracing::warn!(label = %label, "DeviceAdd: stub — returns fake device ID, no actual registration");
+    use syncback_core::cluster::{derive_device_key, issue_device_certificate};
+    use syncback_core::types::DeviceId;
 
+    let cluster_state = match &state.cluster_state {
+        Some(cs) => cs,
+        None => return CliResponse::Error("cluster state not initialized".to_string()),
+    };
+
+    // Derive a deterministic device_id from identity + label.
     let device_id_bytes = {
-        // Derive a deterministic placeholder from our identity + label for display.
-        // Real registration will use the new device's public key.
         let mut h = blake3::Hasher::new();
         h.update(&state.identity_pub.0);
         h.update(label.as_bytes());
@@ -485,9 +494,32 @@ fn dispatch_device_add(state: &DaemonState, label: String) -> CliResponse {
         id.copy_from_slice(&hash.as_bytes()[..16]);
         id
     };
+    let device_id = DeviceId(device_id_bytes);
 
-    let added_at = timestamp_to_iso_date(Timestamp::now());
+    // Derive the new device's key pair from the shared seed.
+    let device_key = match derive_device_key(&state.seed, &device_id) {
+        Ok(k) => k,
+        Err(e) => return CliResponse::Error(format!("key derivation failed: {e}")),
+    };
+    let device_pub_key = device_key.verifying_key().to_bytes();
 
+    let now = Timestamp::now();
+    let cert = issue_device_certificate(&state.master_key, device_id, device_pub_key, now);
+
+    // Register in ClusterState.
+    let mut cs = cluster_state.lock().expect("cluster_state lock");
+    if let Err(e) = cs.add_device(cert, now) {
+        return CliResponse::Error(format!("device registration failed: {e}"));
+    }
+    drop(cs);
+
+    tracing::info!(
+        label = %label,
+        device_id = %hex_encode(&device_id_bytes),
+        "device registered"
+    );
+
+    let added_at = timestamp_to_iso_date(now);
     CliResponse::DeviceAdded(DeviceEntry {
         device_id_hex: hex_encode(&device_id_bytes),
         label,
@@ -495,6 +527,64 @@ fn dispatch_device_add(state: &DaemonState, label: String) -> CliResponse {
         added_at,
         revoked: false,
     })
+}
+
+// ── Device revoke ─────────────────────────────────────────────────────────────
+
+fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> CliResponse {
+    use syncback_core::cluster::{issue_revocation, EpochCounter};
+    use syncback_core::types::DeviceId;
+
+    let cluster_state = match &state.cluster_state {
+        Some(cs) => cs,
+        None => return CliResponse::Error("cluster state not initialized".to_string()),
+    };
+
+    // Parse hex device_id.
+    if device_id_hex.len() != 32 {
+        return CliResponse::Error(format!(
+            "device_id must be 32 hex chars (16 bytes), got {}",
+            device_id_hex.len()
+        ));
+    }
+    let mut device_id_bytes = [0u8; 16];
+    for (i, chunk) in device_id_hex.as_bytes().chunks(2).enumerate() {
+        let hi = match chunk[0] {
+            b'0'..=b'9' => chunk[0] - b'0',
+            b'a'..=b'f' => chunk[0] - b'a' + 10,
+            _ => return CliResponse::Error(format!("invalid hex char in device_id: {}", chunk[0] as char)),
+        };
+        let lo = match chunk[1] {
+            b'0'..=b'9' => chunk[1] - b'0',
+            b'a'..=b'f' => chunk[1] - b'a' + 10,
+            _ => return CliResponse::Error(format!("invalid hex char in device_id: {}", chunk[1] as char)),
+        };
+        device_id_bytes[i] = (hi << 4) | lo;
+    }
+    let device_id = DeviceId(device_id_bytes);
+
+    // Prevent revoking our own device.
+    if device_id == state.device_id {
+        return CliResponse::Error("cannot revoke the current device".to_string());
+    }
+
+    let mut cs = cluster_state.lock().expect("cluster_state lock");
+    let new_epoch = EpochCounter(cs.current_epoch().0 + 1);
+    let now = Timestamp::now();
+
+    let revocation = issue_revocation(&state.master_key, device_id, now, new_epoch);
+    if let Err(e) = cs.revoke_device(revocation, now, now) {
+        return CliResponse::Error(format!("revocation failed: {e}"));
+    }
+    drop(cs);
+
+    tracing::info!(
+        device_id = %device_id_hex,
+        new_epoch = new_epoch.0,
+        "device revoked, epoch rotated"
+    );
+
+    CliResponse::DeviceRevoked { device_id_hex }
 }
 
 // ── Connect ───────────────────────────────────────────────────────────────────
@@ -519,7 +609,7 @@ async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
         }
     };
 
-    let mut conn = match state.network.connect(endpoint_addr.clone(), None).await {
+    let conn = match state.network.connect(endpoint_addr.clone(), None).await {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(addr = %addr, error = %e, "connect failed");
@@ -528,25 +618,6 @@ async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
     };
 
     let peer_identity = conn.peer_identity;
-
-    // Send PeerAnnounce so the remote peer registers us.
-    {
-        use syncback_core::messages::{build_peer_announce, Message};
-        use syncback_core::types::Timestamp;
-        let pa = build_peer_announce(
-            state.identity_pub,
-            state.network.node_id,
-            Timestamp::now(),
-            state.network.signing_key(),
-        );
-        let msg = Message::PeerAnnounce(pa);
-        if let Err(e) = crate::daemon::network::NetworkHandle::send_message(&mut conn, &msg).await
-        {
-            tracing::warn!(peer = %peer_identity, error = %e, "failed to send PeerAnnounce after connect");
-        } else {
-            tracing::debug!(peer = %peer_identity, "sent PeerAnnounce after connect");
-        }
-    }
     let now = Timestamp::now();
 
     let existing = state.db.get_peer(&peer_identity).unwrap_or(None);
@@ -581,8 +652,11 @@ async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
 
     state.network.add_peer(peer_identity, endpoint_addr).await;
 
-    // Store connection in pool so it stays alive and can be reused.
-    state.network.store_connection(peer_identity, conn).await;
+    // Send connection to Processor for read-loop spawning + pool storage.
+    // The Processor will also send PeerAnnounce on the connection.
+    if state.incoming_tx.send(conn).await.is_err() {
+        tracing::error!(peer = %peer_identity, "failed to send connection to Processor (channel closed)");
+    }
 
     tracing::info!(
         peer = %peer_identity,
@@ -670,6 +744,31 @@ fn parse_iso_date(s: &str) -> Option<Timestamp> {
         return None;
     }
     Some(Timestamp(days as u64 * 86400))
+}
+
+// ============================================================
+// Disk space
+// ============================================================
+
+/// Query available bytes on the filesystem containing `path` via statvfs(2).
+/// Returns 0 on error (conservative — treats as "disk full").
+fn disk_available_bytes(path: &std::path::Path) -> u64 {
+    let path_str = match path.to_str() {
+        Some(s) => s,
+        None => return 0,
+    };
+    let c_path = match std::ffi::CString::new(path_str) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+            stat.f_bavail * stat.f_frsize
+        } else {
+            0
+        }
+    }
 }
 
 // ============================================================

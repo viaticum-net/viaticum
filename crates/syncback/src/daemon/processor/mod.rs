@@ -36,7 +36,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use syncback_core::constants::{DECODE_OVERHEAD, INITIAL_TRUST_P, SYMBOL_SIZE};
+use syncback_core::constants::{
+    DECODE_OVERHEAD, DEFAULT_ESCROW_TRUST_FACTOR, INITIAL_TRUST_P, SYMBOL_SIZE,
+};
+use syncback_core::escrow::{check_restore, RestoreDecision};
+use syncback_core::trust::compute_combined;
 use syncback_core::db::{Db, WeeklyPosEntry};
 use syncback_core::erasure::{ErasureEncoder, Symbol};
 use syncback_core::messages::{
@@ -86,6 +90,12 @@ pub enum ProcessorError {
     #[error("cluster sync error: {0}")]
     ClusterSync(#[from] crate::daemon::cluster_sync::ClusterSyncError),
 
+    #[error("escrow denied for block {block_id}")]
+    EscrowDenied {
+        block_id: syncback_core::types::SourceBlockId,
+        denial: syncback_core::escrow::RestoreDenial,
+    },
+
     #[error("task join error: {0}")]
     Join(String),
 }
@@ -114,6 +124,8 @@ pub struct Processor {
     /// Hard quota in bytes: floor; never accept symbols above this held total.
     /// 0 = no hard floor.
     hard_quota_bytes: u64,
+    /// Channel to notify BackupCoordinator about symbol accept/reject outcomes.
+    backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
 }
 
 impl Processor {
@@ -131,6 +143,7 @@ impl Processor {
         relay_sync_tx: mpsc::Sender<crate::daemon::relay::SyncTrigger>,
         soft_quota_bytes: u64,
         hard_quota_bytes: u64,
+        backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
     ) -> Self {
         Processor {
             db,
@@ -144,6 +157,7 @@ impl Processor {
             relay_sync_tx,
             soft_quota_bytes,
             hard_quota_bytes,
+            backup_event_tx,
         }
     }
 
@@ -184,7 +198,10 @@ impl Processor {
                             let tx = msg_tx.clone();
                             let network_arc = this.network.clone();
 
-                            // Phase 7.10: send our PeerAnnounceMsg immediately so the
+                            // Store in connection pool so send_to_peer can reuse it.
+                            network_arc.store_connection_arc(peer_id, conn_arc.clone()).await;
+
+                            // Send our PeerAnnounceMsg immediately so the
                             // remote learns our identity ↔ NodeId mapping.
                             let pa_msg = {
                                 let pa = network_arc.build_peer_announce(Timestamp::now());
@@ -807,7 +824,7 @@ impl Processor {
     // SymbolAccept / SymbolReject: we are the owner
     // =========================================================
 
-    /// Holder accepted our offer. Log only — BackupCoordinator wiring is Phase 7.5.
+    /// Holder accepted our symbol offer. Notify BackupCoordinator.
     async fn handle_symbol_accept(
         &self,
         holder_id: IdentityPub,
@@ -816,24 +833,36 @@ impl Processor {
         info!(
             holder = %holder_id,
             block_id = %accept.source_block_id,
-            offer_msg_id = ?accept.offer_msg_id,
-            "processor: SymbolAccept received (log only, Phase 7.5 wires to BackupCoordinator)"
+            "processor: SymbolAccept received"
         );
+        let _ = self.backup_event_tx.send(
+            crate::daemon::backup::BackupEvent::SymbolAccepted {
+                holder_id,
+                source_block_id: accept.source_block_id,
+            },
+        ).await;
         Ok(())
     }
 
-    /// Holder rejected our offer. Log.
+    /// Holder rejected our symbol offer. Notify BackupCoordinator.
     async fn handle_symbol_reject(
         &self,
         holder_id: IdentityPub,
         reject: SymbolRejectMsg,
     ) -> Result<(), ProcessorError> {
-        info!(
+        warn!(
             holder = %holder_id,
             block_id = %reject.source_block_id,
             reason = ?reject.reason,
             "processor: SymbolReject received"
         );
+        let _ = self.backup_event_tx.send(
+            crate::daemon::backup::BackupEvent::SymbolRejected {
+                holder_id,
+                source_block_id: reject.source_block_id,
+                reason: format!("{:?}", reject.reason),
+            },
+        ).await;
         Ok(())
     }
 
@@ -866,7 +895,35 @@ impl Processor {
             }
         };
 
-        // TODO Phase 7.6+: escrow check (verify owner has enough trust to unlock restore).
+        // Escrow check: verify owner has enough trust to unlock restore.
+        let trust = match self.db.get_peer(&owner_id)? {
+            Some(peer) => compute_combined(peer.trust_p, peer.trust_i, peer.trust_s),
+            None => 0.0, // unknown peer → zero trust → free tier only
+        };
+        let restore_gb = holding
+            .esi_ranges
+            .iter()
+            .map(|&(_start, count)| count as f64 * SYMBOL_SIZE as f64)
+            .sum::<f64>()
+            / (1024.0 * 1024.0 * 1024.0);
+        if let RestoreDecision::Denied(denial) = check_restore(
+            trust,
+            restore_gb,
+            DEFAULT_ESCROW_TRUST_FACTOR,
+        ) {
+            warn!(
+                owner = %owner_id,
+                block_id = %block_id,
+                current_trust = denial.current_trust,
+                needed_trust = denial.needed_trust,
+                restore_budget_gb = denial.restore_budget_gb,
+                "processor: RestoreRequest denied by escrow check"
+            );
+            return Err(ProcessorError::EscrowDenied {
+                block_id,
+                denial,
+            });
+        }
 
         // Determine which ESIs to send.
         let held_esis = ranges_to_esi_list(&holding.esi_ranges);
@@ -927,18 +984,40 @@ impl Processor {
     }
 
     /// Handle a RestoreRequest from an owner: load symbols and send RestoreResponse on conn.
+    /// If escrow check fails, sends RestoreDeniedMsg instead.
     pub(crate) async fn handle_restore_request(
         &self,
         owner_id: IdentityPub,
         request: RestoreRequestMsg,
         conn: Arc<Mutex<Connection>>,
     ) -> Result<(), ProcessorError> {
-        let response = self.handle_restore_request_inner(owner_id, request).await?;
-        let mut guard = conn.lock().await;
-        guard
-            .send_message(&Message::RestoreResponse(response))
-            .await?;
-        Ok(())
+        let block_id = request.source_block_id;
+        match self.handle_restore_request_inner(owner_id, request).await {
+            Ok(response) => {
+                let mut guard = conn.lock().await;
+                guard
+                    .send_message(&Message::RestoreResponse(response))
+                    .await?;
+                Ok(())
+            }
+            Err(ProcessorError::EscrowDenied { denial, .. }) => {
+                let denied_msg = RestoreDeniedMsg {
+                    v: 1,
+                    source_block_id: block_id,
+                    reason: "escrow check failed".to_string(),
+                    current_trust: denial.current_trust,
+                    needed_trust: denial.needed_trust,
+                    restore_budget_gb: denial.restore_budget_gb,
+                    timestamp: Timestamp::now(),
+                };
+                let mut guard = conn.lock().await;
+                guard
+                    .send_message(&Message::RestoreDenied(denied_msg))
+                    .await?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     // =========================================================

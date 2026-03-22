@@ -371,6 +371,22 @@ impl NetworkHandle {
         debug!(peer = %peer_identity, "connection stored in pool");
     }
 
+    /// Store a pre-wrapped connection Arc in the pool.
+    ///
+    /// Used by the Processor to register connections it manages so that
+    /// `get_connection()` and `send_to_peer()` can reuse them.
+    pub async fn store_connection_arc(
+        &self,
+        peer_identity: IdentityPub,
+        arc: Arc<Mutex<Connection>>,
+    ) {
+        self.connections
+            .lock()
+            .await
+            .insert(peer_identity, ConnectionState::Live(arc));
+        debug!(peer = %peer_identity, "connection arc stored in pool");
+    }
+
     /// Register a peer in the known_peers directory.
     ///
     /// After this call, `get_connection(identity)` will find the peer's address.
