@@ -208,14 +208,8 @@ pub(crate) fn dispatch_status(state: &DaemonState) -> CliResponse {
     // PoS totals across all peers.
     let (pos_total_challenges, pos_total_passes) = state.db.total_pos_stats().unwrap_or((0, 0));
 
-    // Current week for recent PoS window (last 4 weeks).
-    let now_week = {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        ((secs / 604_800) as u32).max(1)
-    };
+    // Current week for recent PoS window (last 4 weeks), scaled by time_scale.
+    let now_week = crate::daemon::processor::current_week_number_scaled(state.time_scale);
     let recent_window_start = now_week.saturating_sub(3); // last 4 weeks inclusive
 
     // Compute peer summaries, sorted by combined trust descending (top 20).

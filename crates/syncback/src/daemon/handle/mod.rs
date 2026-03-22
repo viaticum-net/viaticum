@@ -88,6 +88,8 @@ pub struct DaemonState {
     pub soft_quota_bytes: u64,
     /// Disk reserve in bytes.
     pub disk_reserve_bytes: u64,
+    /// Time acceleration factor (1 = real time).
+    pub time_scale: u64,
 }
 
 // ─── DaemonHandle ─────────────────────────────────────────────────────────────
@@ -380,6 +382,7 @@ impl DaemonHandle {
             data_dir: cfg.data_dir.clone(),
             soft_quota_bytes: syncback_core::config::soft_quota_bytes(&app_config),
             disk_reserve_bytes: syncback_core::config::disk_reserve_bytes(&app_config),
+            time_scale: cfg.time_scale.max(1),
         });
 
         // Clone state for metrics pusher before cli_server consumes it.
@@ -443,6 +446,7 @@ impl DaemonHandle {
                 soft_quota_bytes,
                 hard_quota_bytes,
                 backup_event_tx,
+                time_scale,
             );
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {

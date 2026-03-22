@@ -63,6 +63,7 @@ async fn make_test_state() -> Arc<DaemonState> {
         data_dir: std::path::PathBuf::from("/tmp"),
         soft_quota_bytes: 0,
         disk_reserve_bytes: 0,
+        time_scale: 1,
     })
 }
 
@@ -307,6 +308,7 @@ async fn dispatch_connect_two_daemons_registers_peer() {
         data_dir: std::path::PathBuf::from("/tmp"),
         soft_quota_bytes: 0,
         disk_reserve_bytes: 0,
+        time_scale: 1,
     });
 
     let response = dispatch(CliRequest::Connect { addr: addr_b_str }, &state_a).await;

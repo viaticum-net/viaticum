@@ -382,7 +382,7 @@ impl Scheduler {
             }
 
             // Record timeout as a challenged-but-not-passed event for trust.
-            let week = crate::daemon::processor::current_week_number();
+            let week = crate::daemon::processor::current_week_number_scaled(scale);
             let pos_outcome = outcome_from_verify(&VerifyOutcome::Timeout, week);
             crate::daemon::processor::record_pos_weekly(&self.db, holder_id, pos_outcome);
             crate::daemon::processor::recalculate_trust(&self.db, &holder_id, week);

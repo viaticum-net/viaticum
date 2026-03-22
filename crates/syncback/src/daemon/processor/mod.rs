@@ -127,6 +127,8 @@ pub struct Processor {
     hard_quota_bytes: u64,
     /// Channel to notify BackupCoordinator about symbol accept/reject outcomes.
     backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
+    /// Time acceleration factor (1 = real time). Scales week numbers for trust.
+    time_scale: u64,
 }
 
 impl Processor {
@@ -145,6 +147,7 @@ impl Processor {
         soft_quota_bytes: u64,
         hard_quota_bytes: u64,
         backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
+        time_scale: u64,
     ) -> Self {
         Processor {
             db,
@@ -159,6 +162,7 @@ impl Processor {
             soft_quota_bytes,
             hard_quota_bytes,
             backup_event_tx,
+            time_scale,
         }
     }
 
@@ -641,7 +645,7 @@ impl Processor {
         self.db.upsert_placement(&updated)?;
 
         // Update PoS weekly stats and recalculate trust.
-        let week = current_week_number();
+        let week = current_week_number_scaled(self.time_scale);
         let pos_outcome = outcome_from_verify(&outcome, week);
         record_pos_weekly(&self.db, holder_id, pos_outcome);
 
@@ -1348,11 +1352,16 @@ pub(crate) fn ranges_to_esi_list(ranges: &[(u32, u32)]) -> Vec<u32> {
 }
 
 /// Approximate protocol week number from the current unix timestamp (1-indexed).
-pub(crate) fn current_week_number() -> u32 {
+///
+/// When `time_scale` > 1, simulated time advances faster: each real second
+/// counts as `time_scale` simulated seconds. This ensures the trust P-window
+/// slides during accelerated experiments.
+pub(crate) fn current_week_number_scaled(time_scale: u64) -> u32 {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    ((secs / 604_800) as u32).max(1)
+    let scaled = secs.saturating_mul(time_scale.max(1));
+    ((scaled / 604_800) as u32).max(1)
 }
 

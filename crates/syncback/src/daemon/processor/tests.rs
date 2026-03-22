@@ -123,6 +123,7 @@ async fn make_processor_with_quota(
         soft_quota_bytes,
         hard_quota_bytes,
         backup_event_tx,
+        1, // time_scale
     );
 
     (processor, repair_rx, relay_sync_rx)
