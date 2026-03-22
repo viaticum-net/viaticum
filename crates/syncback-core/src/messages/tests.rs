@@ -597,6 +597,93 @@ fn cluster_sync_response_msg_round_trip() {
     assert_eq!(decoded.events[0].0, 1u64);
 }
 
+// ─── SystemState + PeerDiscovery roundtrips ──────────────────────────────────
+
+#[test]
+fn system_state_backup_msg_roundtrip() {
+    let msg = Message::SystemStateBackup(SystemStateBackupMsg {
+        v: 1,
+        encrypted_blob: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        timestamp: Timestamp(1_000_000),
+    });
+    let framed = frame_message(&msg).unwrap();
+    let (decoded, consumed) = unframe_message(&framed).unwrap();
+    assert_eq!(decoded, msg);
+    assert_eq!(consumed, framed.len());
+}
+
+#[test]
+fn system_state_ack_msg_roundtrip() {
+    let msg = Message::SystemStateAck(SystemStateAckMsg {
+        v: 1,
+        stored: true,
+        timestamp: Timestamp(1_000_001),
+    });
+    let framed = frame_message(&msg).unwrap();
+    let (decoded, consumed) = unframe_message(&framed).unwrap();
+    assert_eq!(decoded, msg);
+    assert_eq!(consumed, framed.len());
+}
+
+#[test]
+fn system_state_request_msg_roundtrip() {
+    let msg = Message::SystemStateRequest(SystemStateRequestMsg {
+        v: 1,
+        timestamp: Timestamp(1_000_002),
+    });
+    let framed = frame_message(&msg).unwrap();
+    let (decoded, consumed) = unframe_message(&framed).unwrap();
+    assert_eq!(decoded, msg);
+    assert_eq!(consumed, framed.len());
+}
+
+#[test]
+fn system_state_response_msg_roundtrip() {
+    let msg = Message::SystemStateResponse(SystemStateResponseMsg {
+        v: 1,
+        encrypted_blob: vec![],
+        timestamp: Timestamp(1_000_003),
+    });
+    let framed = frame_message(&msg).unwrap();
+    let (decoded, consumed) = unframe_message(&framed).unwrap();
+    assert_eq!(decoded, msg);
+    assert_eq!(consumed, framed.len());
+}
+
+#[test]
+fn peer_discovery_request_msg_roundtrip() {
+    let msg = Message::PeerDiscoveryRequest(PeerDiscoveryRequestMsg {
+        v: 1,
+        timestamp: Timestamp(1_000_004),
+    });
+    let framed = frame_message(&msg).unwrap();
+    let (decoded, consumed) = unframe_message(&framed).unwrap();
+    assert_eq!(decoded, msg);
+    assert_eq!(consumed, framed.len());
+}
+
+#[test]
+fn peer_discovery_response_msg_roundtrip() {
+    let msg = Message::PeerDiscoveryResponse(PeerDiscoveryResponseMsg {
+        v: 1,
+        peers: vec![
+            DiscoveredPeer {
+                identity_pub: make_identity_pub(10),
+                node_id: make_node_id(10),
+            },
+            DiscoveredPeer {
+                identity_pub: make_identity_pub(11),
+                node_id: make_node_id(11),
+            },
+        ],
+        timestamp: Timestamp(1_000_005),
+    });
+    let framed = frame_message(&msg).unwrap();
+    let (decoded, consumed) = unframe_message(&framed).unwrap();
+    assert_eq!(decoded, msg);
+    assert_eq!(consumed, framed.len());
+}
+
 // ─── build_peer_announce / verify_peer_announce ───────────────────────────────
 
 #[test]

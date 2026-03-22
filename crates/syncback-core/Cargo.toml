@@ -26,6 +26,7 @@ raptorq = { workspace = true }
 redb = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+zstd = { workspace = true }
 tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]

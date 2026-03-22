@@ -52,6 +52,14 @@ pub(crate) const POS_WEEKLY: TableDefinition<&[u8; 36], &[u8]> =
 /// Cluster state singleton. Key = "cluster_state". Value = CBOR(StoredClusterState).
 const CLUSTER_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("cluster_state");
 
+/// System state blobs stored for other nodes (holder-side).
+/// Key = owner IdentityPub [u8;32]. Value = CBOR(SystemStateBlobRecord).
+const SYSTEM_STATE_BLOBS: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("system_state_blobs");
+
+/// TTL for stored system state blobs: 365 days.
+pub const SYSTEM_STATE_TTL_SECS: u64 = 365 * 24 * 3600;
+
 // --- Indices ---
 
 /// file → holders index. Key = (FileId u64 BE[8] || holder IdentityPub[32]) = [u8;40].
@@ -110,6 +118,15 @@ fn pos_key(peer: &IdentityPub, week_number: u32) -> [u8; 36] {
 pub struct WeeklyPosEntry {
     pub challenged: u32,
     pub passed: u32,
+}
+
+/// One stored system state blob. Stored by holder on behalf of an owner.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SystemStateBlobRecord {
+    pub owner: IdentityPub,
+    pub encrypted_blob: Vec<u8>,
+    pub created_at: Timestamp,
+    pub stored_at: Timestamp,
 }
 
 /// Hot layer: in-memory aggregates loaded at startup.
@@ -237,6 +254,7 @@ impl Db {
             tx.open_table(FILE_HOLDERS)?;
             tx.open_table(HOLDER_FILES)?;
             tx.open_table(CLUSTER_STATE)?;
+            tx.open_table(SYSTEM_STATE_BLOBS)?;
         }
         tx.commit()?;
         Ok(())
@@ -245,7 +263,36 @@ impl Db {
     /// Open or create database at path. Creates all tables.
     /// Builds hot cache from DB scan.
     pub fn open(path: &std::path::Path) -> Result<Self, DbError> {
-        let db = redb::Database::create(path)?;
+        if path.exists() {
+            let bak = path.with_extension("redb.bak");
+            if let Err(e) = std::fs::copy(path, &bak) {
+                tracing::warn!(err = %e, "db: failed to create pre-open backup");
+            }
+        }
+
+        let open_result = redb::Database::builder()
+            .set_repair_callback(|session| {
+                tracing::warn!(progress = session.progress(), "redb: repair in progress");
+            })
+            .create(path);
+
+        let mut db = match open_result {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!(err = %e, "db: open failed, retrying with repair");
+                redb::Database::builder()
+                    .set_repair_callback(|session| {
+                        tracing::warn!(progress = session.progress(), "redb: repair (retry)");
+                    })
+                    .create(path)?
+            }
+        };
+
+        let ok = db.check_integrity()?;
+        if !ok {
+            tracing::warn!("db: check_integrity returned false, proceeding anyway");
+        }
+
         Self::create_tables(&db)?;
         let hot = HotCache::build_from_db(&db)?;
         Ok(Db {
@@ -1055,6 +1102,67 @@ impl Db {
         {
             let mut table = tx.open_table(CLUSTER_STATE)?;
             table.insert("cluster_state", bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+// ============================================================
+// System state blobs table
+// ============================================================
+
+impl Db {
+    /// Store a system state blob from an owner. Overwrites any previous blob.
+    pub fn store_system_state_blob(
+        &self,
+        owner: &IdentityPub,
+        record: &SystemStateBlobRecord,
+    ) -> Result<(), DbError> {
+        let val = to_cbor_bytes(record);
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(SYSTEM_STATE_BLOBS)?;
+            table.insert(&owner.0, val.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get a stored system state blob for an owner.
+    /// Returns None if not found or expired (stored_at older than TTL).
+    pub fn get_system_state_blob(
+        &self,
+        owner: &IdentityPub,
+    ) -> Result<Option<SystemStateBlobRecord>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(SYSTEM_STATE_BLOBS)?;
+        match table.get(&owner.0)? {
+            None => Ok(None),
+            Some(guard) => {
+                let record: SystemStateBlobRecord = from_cbor_bytes(guard.value())?;
+                let now = Timestamp::now();
+                if now.0.saturating_sub(record.stored_at.0) > SYSTEM_STATE_TTL_SECS {
+                    drop(guard);
+                    drop(table);
+                    drop(tx);
+                    let _ = self.delete_system_state_blob(owner);
+                    return Ok(None);
+                }
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// Delete stored blob for an owner. No-op if not found.
+    pub fn delete_system_state_blob(
+        &self,
+        owner: &IdentityPub,
+    ) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(SYSTEM_STATE_BLOBS)?;
+            table.remove(&owner.0)?;
         }
         tx.commit()?;
         Ok(())

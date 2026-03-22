@@ -1156,3 +1156,187 @@ async fn build_peer_announce_signature_is_verifiable() {
 
     verify_peer_announce(&msg).expect("PeerAnnounce signature should verify successfully");
 }
+
+// ─── handle_system_state_backup ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn handle_system_state_backup_stores_blob_for_known_peer() {
+    use syncback_core::db::SystemStateBlobRecord;
+    use syncback_core::messages::SystemStateBackupMsg;
+    use syncback_core::types::{NodeId, PeerRecord};
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let owner = make_identity(60);
+    let now = Timestamp::now();
+
+    // Register owner as a known peer so the handler accepts the backup.
+    db.upsert_peer(&PeerRecord {
+        identity: owner,
+        node_id: Some(NodeId([60u8; 32])),
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: now,
+        last_seen: now,
+        device_id: None,
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+    })
+    .unwrap();
+
+    let blob = vec![0xBEu8; 128];
+    let msg = SystemStateBackupMsg {
+        v: 1,
+        encrypted_blob: blob.clone(),
+        timestamp: now,
+    };
+
+    processor
+        .handle_system_state_backup(owner, msg)
+        .await
+        .expect("handle_system_state_backup failed");
+
+    let stored: Option<SystemStateBlobRecord> = db.get_system_state_blob(&owner).unwrap();
+    assert!(stored.is_some(), "blob should have been stored in DB");
+    assert_eq!(stored.unwrap().encrypted_blob, blob);
+}
+
+#[tokio::test]
+async fn handle_system_state_backup_rejects_unknown_peer() {
+    use syncback_core::messages::SystemStateBackupMsg;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let stranger = make_identity(61);
+    let msg = SystemStateBackupMsg {
+        v: 1,
+        encrypted_blob: vec![0xFFu8; 64],
+        timestamp: Timestamp::now(),
+    };
+
+    processor
+        .handle_system_state_backup(stranger, msg)
+        .await
+        .expect("handle_system_state_backup should return Ok even when rejecting");
+
+    // DB must remain empty — unknown peer must not be stored.
+    let stored = db.get_system_state_blob(&stranger).unwrap();
+    assert!(stored.is_none(), "blob should not be stored for unknown peer");
+}
+
+#[tokio::test]
+async fn handle_system_state_backup_ignores_empty_blob() {
+    use syncback_core::messages::SystemStateBackupMsg;
+    use syncback_core::types::{NodeId, PeerRecord};
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let owner = make_identity(62);
+    let now = Timestamp::now();
+    db.upsert_peer(&PeerRecord {
+        identity: owner,
+        node_id: Some(NodeId([62u8; 32])),
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: now,
+        last_seen: now,
+        device_id: None,
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+    })
+    .unwrap();
+
+    let msg = SystemStateBackupMsg {
+        v: 1,
+        encrypted_blob: vec![],
+        timestamp: now,
+    };
+
+    processor
+        .handle_system_state_backup(owner, msg)
+        .await
+        .expect("empty blob should return Ok");
+
+    // Empty blob must not be stored.
+    let stored = db.get_system_state_blob(&owner).unwrap();
+    assert!(stored.is_none(), "empty blob should not be stored");
+}
+
+// ─── handle_system_state_request ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn handle_system_state_ack_logs_without_error() {
+    use syncback_core::messages::SystemStateAckMsg;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let peer = make_identity(63);
+
+    // Both stored=true and stored=false should be handled without panic.
+    processor.handle_system_state_ack(
+        peer,
+        SystemStateAckMsg {
+            v: 1,
+            stored: true,
+            timestamp: Timestamp::now(),
+        },
+    );
+    processor.handle_system_state_ack(
+        peer,
+        SystemStateAckMsg {
+            v: 1,
+            stored: false,
+            timestamp: Timestamp::now(),
+        },
+    );
+}
+
+// ─── handle_peer_discovery_response ───────────────────────────────────────────
+
+#[tokio::test]
+async fn handle_peer_discovery_response_logs_without_error() {
+    use syncback_core::messages::{DiscoveredPeer, PeerDiscoveryResponseMsg};
+    use syncback_core::types::NodeId;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let peer = make_identity(70);
+    let resp = PeerDiscoveryResponseMsg {
+        v: 1,
+        peers: vec![
+            DiscoveredPeer {
+                identity_pub: make_identity(71),
+                node_id: NodeId([71u8; 32]),
+            },
+            DiscoveredPeer {
+                identity_pub: make_identity(72),
+                node_id: NodeId([72u8; 32]),
+            },
+        ],
+        timestamp: Timestamp::now(),
+    };
+
+    // Should complete without panic.
+    processor.handle_peer_discovery_response(peer, resp).await;
+}

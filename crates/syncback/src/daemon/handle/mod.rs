@@ -526,6 +526,37 @@ impl DaemonHandle {
             }));
         }
 
+        // ── System state periodic push ──────────────────────────────────────
+        {
+            let ss_db = db.clone();
+            let ss_network = network.clone();
+            let ss_seed = keyfile.seed.clone();
+            let ss_interval = (6 * 3600 / time_scale).max(60);
+            let cancel_ss = cancel.clone();
+            tasks.push(tokio::spawn(async move {
+                if let Err(e) = crate::daemon::system_state::run_periodic_push(
+                    ss_db, ss_network, ss_seed, ss_interval, cancel_ss,
+                ).await {
+                    tracing::error!(error = %e, "system_state periodic push failed");
+                }
+                Ok(())
+            }));
+        }
+
+        // ── Bootstrap auto-connect ──────────────────────────────────────────
+        if !app_config.network.bootstrap_peers.is_empty() {
+            let net_bs = network.clone();
+            let db_bs = db.clone();
+            let bootstrap_peers = app_config.network.bootstrap_peers.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::daemon::system_state::run_bootstrap_discovery(
+                    net_bs, db_bs, bootstrap_peers,
+                ).await {
+                    tracing::error!(error = %e, "bootstrap discovery failed");
+                }
+            });
+        }
+
         // Keep channel senders alive so receivers don't immediately close.
         // They are moved into a background task that holds them until cancel fires.
         let cancel_clone = cancel.clone();

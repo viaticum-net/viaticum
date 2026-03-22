@@ -56,6 +56,23 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Command::Dr {
+            mnemonic,
+            peer,
+            data_dir,
+        } => {
+            tracing_subscriber::fmt::init();
+            let dr_dir = match data_dir {
+                Some(d) => syncback::cli::expand_data_dir(d),
+                None => global_dir.clone(),
+            };
+            if let Err(e) =
+                syncback::daemon::dr::run_dr(mnemonic.clone(), peer.clone(), dr_dir).await
+            {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         other => {
             if let Err(e) = syncback::cli::run_command(other, &global_socket) {
                 eprintln!("error: {e}");

@@ -1,5 +1,5 @@
 use crate::db::testutil::{test_db, test_peer, test_peers};
-use crate::db::WeeklyPosEntry;
+use crate::db::{SystemStateBlobRecord, WeeklyPosEntry};
 use crate::types::{
     BudgetRecord, DeviceId, EventEntry, Event, FileId, FileRecord,
     HoldingRecord, HoldingStatus, IdentityPub, LocalState, PlacementStatus, PeerRecord,
@@ -617,4 +617,104 @@ fn list_placements_for_holder_does_not_return_other_holders() {
     let b_placements = db.list_placements_for_holder(&holder_b).unwrap();
     assert_eq!(b_placements.len(), 1);
     assert_eq!(b_placements[0].holder_id, holder_b);
+}
+
+// ============================================================
+// Db::open hardening
+// ============================================================
+
+#[test]
+fn db_open_creates_backup_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("test.redb");
+    let db = crate::db::Db::open(&path).unwrap();
+    drop(db);
+    let _db2 = crate::db::Db::open(&path).unwrap();
+    let bak = path.with_extension("redb.bak");
+    assert!(bak.exists(), ".redb.bak should exist after reopening");
+}
+
+#[test]
+fn db_open_fresh_path_no_backup() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("fresh.redb");
+    let _db = crate::db::Db::open(&path).unwrap();
+    let bak = path.with_extension("redb.bak");
+    assert!(!bak.exists(), ".redb.bak should NOT exist on first open");
+}
+
+#[test]
+fn db_integrity_check_passes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("integrity.redb");
+    let db = crate::db::Db::open(&path).unwrap();
+    assert!(db.list_all_files().unwrap().is_empty());
+}
+
+// ============================================================
+// System state blobs
+// ============================================================
+
+#[test]
+fn store_and_retrieve_system_state_blob() {
+    let db = test_db();
+    let owner = IdentityPub([1u8; 32]);
+    let record = SystemStateBlobRecord {
+        owner,
+        encrypted_blob: vec![1, 2, 3, 4, 5],
+        created_at: Timestamp::now(),
+        stored_at: Timestamp::now(),
+    };
+    db.store_system_state_blob(&owner, &record).unwrap();
+    let retrieved = db.get_system_state_blob(&owner).unwrap().unwrap();
+    assert_eq!(retrieved.encrypted_blob, vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn store_overwrites_previous_blob() {
+    let db = test_db();
+    let owner = IdentityPub([2u8; 32]);
+    let r1 = SystemStateBlobRecord {
+        owner, encrypted_blob: vec![1], created_at: Timestamp::now(), stored_at: Timestamp::now(),
+    };
+    let r2 = SystemStateBlobRecord {
+        owner, encrypted_blob: vec![2, 3], created_at: Timestamp::now(), stored_at: Timestamp::now(),
+    };
+    db.store_system_state_blob(&owner, &r1).unwrap();
+    db.store_system_state_blob(&owner, &r2).unwrap();
+    let retrieved = db.get_system_state_blob(&owner).unwrap().unwrap();
+    assert_eq!(retrieved.encrypted_blob, vec![2, 3]);
+}
+
+#[test]
+fn get_system_state_blob_not_found() {
+    let db = test_db();
+    let owner = IdentityPub([3u8; 32]);
+    assert!(db.get_system_state_blob(&owner).unwrap().is_none());
+}
+
+#[test]
+fn delete_system_state_blob_removes_it() {
+    let db = test_db();
+    let owner = IdentityPub([4u8; 32]);
+    let record = SystemStateBlobRecord {
+        owner, encrypted_blob: vec![9, 8, 7], created_at: Timestamp::now(), stored_at: Timestamp::now(),
+    };
+    db.store_system_state_blob(&owner, &record).unwrap();
+    db.delete_system_state_blob(&owner).unwrap();
+    assert!(db.get_system_state_blob(&owner).unwrap().is_none());
+}
+
+#[test]
+fn expired_blob_returns_none() {
+    let db = test_db();
+    let owner = IdentityPub([5u8; 32]);
+    let two_years_ago = Timestamp(Timestamp::now().0 - 2 * 365 * 24 * 3600);
+    let record = SystemStateBlobRecord {
+        owner, encrypted_blob: vec![1, 2, 3],
+        created_at: two_years_ago,
+        stored_at: two_years_ago,
+    };
+    db.store_system_state_blob(&owner, &record).unwrap();
+    assert!(db.get_system_state_blob(&owner).unwrap().is_none());
 }

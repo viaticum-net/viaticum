@@ -126,6 +126,19 @@ pub enum Command {
         #[arg()]
         addr: String,
     },
+
+    /// Disaster recovery: restore node state from seed phrase
+    Dr {
+        /// BIP39 mnemonic phrase (24 words)
+        #[arg(long)]
+        mnemonic: String,
+        /// Peer addresses to start discovery from (format: <node_id_hex>@<ip>:<port>)
+        #[arg(long, num_args = 1..)]
+        peer: Vec<String>,
+        /// Data directory to restore into (default: global --data-dir)
+        #[arg(long)]
+        data_dir: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -210,6 +223,7 @@ fn build_request(cmd: &Command) -> Result<CliRequest, CliError> {
         }),
         Command::Versions { path } => Ok(CliRequest::Versions { path: path.clone() }),
         Command::Connect { addr } => Ok(CliRequest::Connect { addr: addr.clone() }),
+        Command::Dr { .. } => unreachable!("Dr command handled before run_command"),
     }
 }
 

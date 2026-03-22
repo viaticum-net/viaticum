@@ -256,6 +256,59 @@ pub struct ClusterSyncResponseMsg {
     pub timestamp: Timestamp,
 }
 
+/// Owner → Holder. Push encrypted DB snapshot for safekeeping.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SystemStateBackupMsg {
+    pub v: u8,
+    pub encrypted_blob: Vec<u8>,
+    pub timestamp: Timestamp,
+}
+
+/// Holder → Owner. Acknowledge receipt of system state backup.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SystemStateAckMsg {
+    pub v: u8,
+    pub stored: bool,
+    pub timestamp: Timestamp,
+}
+
+/// Requester → Holder. Request stored system state blob. Identity from handshake.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SystemStateRequestMsg {
+    pub v: u8,
+    pub timestamp: Timestamp,
+}
+
+/// Holder → Requester. Return stored blob (empty vec = not found).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SystemStateResponseMsg {
+    pub v: u8,
+    pub encrypted_blob: Vec<u8>,
+    pub timestamp: Timestamp,
+}
+
+/// Requester → Peer. Ask for known peers list. Responded to any authenticated connection.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PeerDiscoveryRequestMsg {
+    pub v: u8,
+    pub timestamp: Timestamp,
+}
+
+/// Peer → Requester. List of known peers with iroh NodeIds.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PeerDiscoveryResponseMsg {
+    pub v: u8,
+    pub peers: Vec<DiscoveredPeer>,
+    pub timestamp: Timestamp,
+}
+
+/// A discovered peer entry (identity + transport address).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveredPeer {
+    pub identity_pub: IdentityPub,
+    pub node_id: NodeId,
+}
+
 // ============================================================
 // Top-level Message enum
 // ============================================================
@@ -285,6 +338,12 @@ pub enum Message {
     BoardSync(BoardSyncMsg),
     ClusterSyncRequest(ClusterSyncRequestMsg),
     ClusterSyncResponse(ClusterSyncResponseMsg),
+    SystemStateBackup(SystemStateBackupMsg),
+    SystemStateAck(SystemStateAckMsg),
+    SystemStateRequest(SystemStateRequestMsg),
+    SystemStateResponse(SystemStateResponseMsg),
+    PeerDiscoveryRequest(PeerDiscoveryRequestMsg),
+    PeerDiscoveryResponse(PeerDiscoveryResponseMsg),
 }
 
 // ============================================================

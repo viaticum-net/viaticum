@@ -42,13 +42,14 @@ use syncback_core::constants::{
 };
 use syncback_core::escrow::{check_restore, RestoreDecision};
 use syncback_core::trust::compute_combined;
-use syncback_core::db::{Db, WeeklyPosEntry};
+use syncback_core::db::{Db, SystemStateBlobRecord, WeeklyPosEntry};
 use syncback_core::erasure::{ErasureEncoder, Symbol};
 use syncback_core::messages::{
-    BoardSyncMsg, ClusterSyncRequestMsg, ClusterSyncResponseMsg, Message, PeerAnnounceMsg,
-    PosNackMsg, PosResponseMsg, RejectReason, RestoreDeniedMsg, RestoreRequestMsg,
-    RestoreResponseMsg, SymbolAcceptMsg, SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg,
-    SymbolTransferMsg,
+    BoardSyncMsg, ClusterSyncRequestMsg, ClusterSyncResponseMsg, DiscoveredPeer, Message,
+    PeerAnnounceMsg, PeerDiscoveryRequestMsg, PeerDiscoveryResponseMsg, PosNackMsg, PosResponseMsg,
+    RejectReason, RestoreDeniedMsg, RestoreRequestMsg, RestoreResponseMsg, SymbolAcceptMsg,
+    SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg, SymbolTransferMsg, SystemStateAckMsg,
+    SystemStateBackupMsg, SystemStateRequestMsg, SystemStateResponseMsg,
 };
 use syncback_core::pos::{
     apply_pos_outcome, outcome_from_verify, verify_response, PosResponse, VerifyOutcome,
@@ -405,6 +406,24 @@ impl Processor {
             }
             Message::PeerAnnounce(pa) => {
                 self.handle_peer_announce(pa).await?;
+            }
+            Message::SystemStateBackup(msg) => {
+                self.handle_system_state_backup(from, msg).await?;
+            }
+            Message::SystemStateAck(msg) => {
+                self.handle_system_state_ack(from, msg);
+            }
+            Message::SystemStateRequest(msg) => {
+                self.handle_system_state_request(from, msg, conn).await?;
+            }
+            Message::SystemStateResponse(msg) => {
+                self.handle_system_state_response(from, msg).await;
+            }
+            Message::PeerDiscoveryRequest(msg) => {
+                self.handle_peer_discovery_request(from, msg, conn).await?;
+            }
+            Message::PeerDiscoveryResponse(msg) => {
+                self.handle_peer_discovery_response(from, msg).await;
             }
             other => {
                 debug!(
@@ -1239,6 +1258,178 @@ impl Processor {
             }
         }
         Ok(())
+    }
+
+    // =========================================================
+    // SystemStateBackup: we are the holder
+    // =========================================================
+
+    /// Receive and store a system state blob from a peer.
+    /// Only accepts blobs from known peers to prevent storage spam.
+    /// Sends a SystemStateAck back regardless of outcome.
+    pub(crate) async fn handle_system_state_backup(
+        &self,
+        owner_id: IdentityPub,
+        backup: SystemStateBackupMsg,
+    ) -> Result<(), ProcessorError> {
+        if backup.encrypted_blob.is_empty() {
+            warn!(peer = %owner_id, "processor: SystemStateBackup: empty blob, ignoring");
+            let ack = Message::SystemStateAck(SystemStateAckMsg {
+                v: 1,
+                stored: false,
+                timestamp: Timestamp::now(),
+            });
+            let _ = self.network.send_to_peer(owner_id, &ack).await;
+            return Ok(());
+        }
+        // Only accept from known peers (prevent storage spam from strangers).
+        if self.db.get_peer(&owner_id)?.is_none() {
+            warn!(peer = %owner_id, "processor: SystemStateBackup: unknown peer, rejecting");
+            let ack = Message::SystemStateAck(SystemStateAckMsg {
+                v: 1,
+                stored: false,
+                timestamp: Timestamp::now(),
+            });
+            let _ = self.network.send_to_peer(owner_id, &ack).await;
+            return Ok(());
+        }
+        let record = SystemStateBlobRecord {
+            owner: owner_id,
+            encrypted_blob: backup.encrypted_blob,
+            created_at: backup.timestamp,
+            stored_at: Timestamp::now(),
+        };
+        self.db.store_system_state_blob(&owner_id, &record)?;
+        info!(peer = %owner_id, "processor: SystemStateBackup: stored");
+        let ack = Message::SystemStateAck(SystemStateAckMsg {
+            v: 1,
+            stored: true,
+            timestamp: Timestamp::now(),
+        });
+        let _ = self.network.send_to_peer(owner_id, &ack).await;
+        Ok(())
+    }
+
+    // =========================================================
+    // SystemStateAck: we are the owner
+    // =========================================================
+
+    /// Log receipt of a system state ack from a holder.
+    pub(crate) fn handle_system_state_ack(&self, peer_id: IdentityPub, ack: SystemStateAckMsg) {
+        if ack.stored {
+            info!(peer = %peer_id, "processor: SystemStateAck: stored");
+        } else {
+            warn!(peer = %peer_id, "processor: SystemStateAck: rejected");
+        }
+    }
+
+    // =========================================================
+    // SystemStateRequest: we are the holder
+    // =========================================================
+
+    /// Respond to a system state request with the stored blob for the requester.
+    /// Sends an empty blob if nothing is stored.
+    pub(crate) async fn handle_system_state_request(
+        &self,
+        requester_id: IdentityPub,
+        _req: SystemStateRequestMsg,
+        conn: Arc<Mutex<Connection>>,
+    ) -> Result<(), ProcessorError> {
+        let blob = match self.db.get_system_state_blob(&requester_id)? {
+            Some(r) => r.encrypted_blob,
+            None => vec![],
+        };
+        let found = !blob.is_empty();
+        debug!(peer = %requester_id, found, "processor: SystemStateRequest: responding");
+        let resp = Message::SystemStateResponse(SystemStateResponseMsg {
+            v: 1,
+            encrypted_blob: blob,
+            timestamp: Timestamp::now(),
+        });
+        let mut guard = conn.lock().await;
+        guard.send_message(&resp).await?;
+        Ok(())
+    }
+
+    // =========================================================
+    // SystemStateResponse: we are the DR/owner requester
+    // =========================================================
+
+    /// Log a system state response.
+    /// The disaster recovery flow handles this via a dedicated channel; here we
+    /// only log so that the dispatch loop does not drop it silently.
+    pub(crate) async fn handle_system_state_response(
+        &self,
+        peer_id: IdentityPub,
+        _resp: SystemStateResponseMsg,
+    ) {
+        debug!(
+            peer = %peer_id,
+            "processor: SystemStateResponse: received (not in DR mode, ignoring)"
+        );
+    }
+
+    // =========================================================
+    // PeerDiscoveryRequest: respond with known peer list
+    // =========================================================
+
+    /// Respond to a peer discovery request with all peers known to this node.
+    pub(crate) async fn handle_peer_discovery_request(
+        &self,
+        requester_id: IdentityPub,
+        _req: PeerDiscoveryRequestMsg,
+        conn: Arc<Mutex<Connection>>,
+    ) -> Result<(), ProcessorError> {
+        let peers = self.db.list_all_peers()?;
+        let discovered: Vec<DiscoveredPeer> = peers
+            .iter()
+            .filter_map(|p| {
+                p.node_id.map(|nid| DiscoveredPeer {
+                    identity_pub: p.identity,
+                    node_id: nid,
+                })
+            })
+            .collect();
+        debug!(
+            peer = %requester_id,
+            count = discovered.len(),
+            "processor: PeerDiscoveryRequest: responding"
+        );
+        let resp = Message::PeerDiscoveryResponse(PeerDiscoveryResponseMsg {
+            v: 1,
+            peers: discovered,
+            timestamp: Timestamp::now(),
+        });
+        let mut guard = conn.lock().await;
+        guard.send_message(&resp).await?;
+        Ok(())
+    }
+
+    // =========================================================
+    // PeerDiscoveryResponse: we are the bootstrap/DR requester
+    // =========================================================
+
+    /// Log a peer discovery response.
+    /// Logs newly seen peers for informational purposes; connection management
+    /// is handled by the bootstrap/DR flow that issued the request.
+    pub(crate) async fn handle_peer_discovery_response(
+        &self,
+        peer_id: IdentityPub,
+        resp: PeerDiscoveryResponseMsg,
+    ) {
+        info!(
+            peer = %peer_id,
+            discovered_count = resp.peers.len(),
+            "processor: PeerDiscoveryResponse: received"
+        );
+        for dp in &resp.peers {
+            if self.db.get_peer(&dp.identity_pub).ok().flatten().is_none() {
+                debug!(
+                    peer = %dp.identity_pub,
+                    "processor: PeerDiscoveryResponse: new peer discovered"
+                );
+            }
+        }
     }
 }
 
