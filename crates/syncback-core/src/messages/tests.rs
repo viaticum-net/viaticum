@@ -741,6 +741,227 @@ fn discovered_peer_addrs_default_for_old_cbor() {
     assert_eq!(decoded.peers[0].addrs, Vec::<String>::new());
 }
 
+// ─── PROP-01: CBOR roundtrip sweep — all 27 Message variants ────────────────
+
+fn all_27_message_variants() -> Vec<Message> {
+    let sbid = make_source_block_id(1);
+    let ts = Timestamp(1000);
+
+    let board_entry = BoardEntry {
+        kind: BoardEntryKind::Broadcast,
+        target_pub: None,
+        payload: vec![0xAA, 0xBB],
+        sig_author: [0u8; 64],
+        author: make_identity_pub(7),
+        hop: 0,
+        created_at: ts,
+    };
+    let stored_entry = StoredEntry {
+        msg_type: "peer_announce".to_string(),
+        msg_id: [0u8; 16],
+        entry: board_entry,
+    };
+
+    vec![
+        Message::Handshake(HandshakeMsg {
+            v: 1,
+            identity_pub: IdentityPub([1u8; 32]),
+            timestamp: ts,
+            sig: [0u8; 64],
+            device_cert: None,
+        }),
+        Message::PeerAnnounce(PeerAnnounceMsg {
+            v: 1,
+            identity_pub: make_identity_pub(1),
+            node_id: make_node_id(1),
+            timestamp: ts,
+            sig: [0u8; 64],
+        }),
+        Message::PosChallenge(PosChallengeMsg {
+            v: 1,
+            challenge_id: [0u8; 16],
+            source_block_id: sbid,
+            esi: 0,
+            timestamp: ts,
+        }),
+        Message::PosResponse(PosResponseMsg {
+            v: 1,
+            challenge_id: [0u8; 16],
+            esi: 0,
+            data: vec![0u8; 16],
+            timestamp: ts,
+        }),
+        Message::PosNack(PosNackMsg {
+            v: 1,
+            challenge_id: [0xABu8; 16],
+            source_block_id: sbid,
+            esi: 42,
+            timestamp: ts,
+        }),
+        Message::SymbolOffer(SymbolOfferMsg {
+            v: 1,
+            msg_id: [0u8; 16],
+            source_block_id: sbid,
+            esi_ranges: vec![(0, 10)],
+            importance: 0.5,
+            timestamp: ts,
+            sig: [0u8; 64],
+        }),
+        Message::SymbolAccept(SymbolAcceptMsg {
+            v: 1,
+            source_block_id: sbid,
+            offer_msg_id: [0u8; 16],
+            timestamp: ts,
+        }),
+        Message::SymbolReject(SymbolRejectMsg {
+            v: 1,
+            source_block_id: sbid,
+            offer_msg_id: [0u8; 16],
+            reason: RejectReason::QuotaFull,
+            timestamp: ts,
+        }),
+        Message::SymbolStored(SymbolStoredMsg {
+            v: 1,
+            source_block_id: sbid,
+            esi_ranges: vec![(0, 5)],
+            timestamp: ts,
+        }),
+        Message::SymbolTransfer(SymbolTransferMsg {
+            v: 1,
+            source_block_id: sbid,
+            symbols: vec![crate::erasure::Symbol { esi: 0, data: vec![0u8; 8] }],
+            timestamp: ts,
+        }),
+        Message::Delete(DeleteMsg {
+            v: 1,
+            source_block_id: sbid,
+            timestamp: ts,
+            sig: [0u8; 64],
+        }),
+        Message::CancelDelete(CancelDeleteMsg {
+            v: 1,
+            source_block_id: sbid,
+            timestamp: ts,
+            sig: [0u8; 64],
+        }),
+        Message::StorageWarning(StorageWarningMsg {
+            v: 1,
+            source_block_id: sbid,
+            esi: 0,
+            details: "bit rot".to_string(),
+            timestamp: ts,
+        }),
+        Message::SymbolDropped(SymbolDroppedMsg {
+            v: 1,
+            source_block_id: sbid,
+            esi_ranges: vec![(0, 3)],
+            timestamp: ts,
+        }),
+        Message::SymbolDropNotice(SymbolDropNoticeMsg {
+            v: 1,
+            source_block_id: sbid,
+            esi_ranges: vec![(0, 3)],
+            deadline: Timestamp(2000),
+            timestamp: ts,
+        }),
+        Message::RestoreRequest(RestoreRequestMsg {
+            v: 1,
+            source_block_id: sbid,
+            esi_list: vec![0, 1, 2],
+            timestamp: ts,
+        }),
+        Message::RestoreResponse(RestoreResponseMsg {
+            v: 1,
+            source_block_id: sbid,
+            symbols: vec![crate::erasure::Symbol { esi: 0, data: vec![0u8; 8] }],
+            timestamp: ts,
+        }),
+        Message::RestoreDenied(RestoreDeniedMsg {
+            v: 1,
+            source_block_id: sbid,
+            reason: "insufficient trust".to_string(),
+            current_trust: 0.5,
+            needed_trust: 2.0,
+            restore_budget_gb: 11.0,
+            timestamp: ts,
+        }),
+        Message::BoardSync(BoardSyncMsg {
+            v: 1,
+            entries: vec![stored_entry],
+            timestamp: ts,
+        }),
+        Message::ClusterSyncRequest(ClusterSyncRequestMsg {
+            v: 1,
+            from_device_id: DeviceId([0x03u8; 16]),
+            last_known_seq: 7,
+            timestamp: ts,
+        }),
+        Message::ClusterSyncResponse(ClusterSyncResponseMsg {
+            v: 1,
+            events: vec![(
+                1u64,
+                EventEntry {
+                    timestamp: ts,
+                    device_id: DeviceId([0x04u8; 16]),
+                    event: Event::DeviceAdded { device_id: DeviceId([0x05u8; 16]) },
+                },
+            )],
+            responder_last_seq: 1,
+            timestamp: ts,
+        }),
+        Message::SystemStateBackup(SystemStateBackupMsg {
+            v: 1,
+            encrypted_blob: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            timestamp: ts,
+        }),
+        Message::SystemStateAck(SystemStateAckMsg {
+            v: 1,
+            stored: true,
+            timestamp: ts,
+        }),
+        Message::SystemStateRequest(SystemStateRequestMsg { v: 1, timestamp: ts }),
+        Message::SystemStateResponse(SystemStateResponseMsg {
+            v: 1,
+            encrypted_blob: vec![],
+            timestamp: ts,
+        }),
+        Message::PeerDiscoveryRequest(PeerDiscoveryRequestMsg { v: 1, timestamp: ts }),
+        Message::PeerDiscoveryResponse(PeerDiscoveryResponseMsg {
+            v: 1,
+            peers: vec![DiscoveredPeer {
+                identity_pub: make_identity_pub(10),
+                node_id: make_node_id(10),
+                addrs: vec![],
+            }],
+            timestamp: ts,
+        }),
+    ]
+}
+
+#[test]
+fn all_message_variants_cbor_roundtrip_sweep() {
+    let variants = all_27_message_variants();
+    assert_eq!(variants.len(), 27, "expected 27 Message variants");
+    for msg in &variants {
+        let bytes = to_cbor(msg).expect("to_cbor must not fail");
+        let decoded: Message = from_cbor(&bytes).expect("from_cbor must not fail");
+        assert_eq!(decoded, *msg, "CBOR roundtrip mismatch for {msg:?}");
+    }
+}
+
+#[test]
+fn all_message_variants_frame_unframe_roundtrip_sweep() {
+    let variants = all_27_message_variants();
+    assert_eq!(variants.len(), 27, "expected 27 Message variants");
+    for msg in &variants {
+        let framed = frame_message(msg).expect("frame_message must not fail");
+        let (decoded, consumed) =
+            unframe_message(&framed).expect("unframe_message must not fail");
+        assert_eq!(decoded, *msg, "frame/unframe roundtrip mismatch for {msg:?}");
+        assert_eq!(consumed, framed.len(), "consumed != framed.len() for {msg:?}");
+    }
+}
+
 // ─── build_peer_announce / verify_peer_announce ───────────────────────────────
 
 #[test]
@@ -819,4 +1040,151 @@ fn peer_announce_cbor_round_trip() {
 
     // Signature must still verify after CBOR round-trip.
     super::verify_peer_announce(&decoded).expect("signature should verify after cbor round-trip");
+}
+
+// ─── PROP-20: handshake freshness is relative to clock, not peer identity ────
+
+#[test]
+fn handshake_freshness_symmetric() {
+    // Two distinct peers (A and B) each build a handshake at the same timestamp.
+    // Freshness check (verify_handshake) is purely clock-relative: it only checks
+    // |msg.timestamp - now|. Therefore, both handshakes must verify successfully
+    // when the verifier's clock equals the timestamp they were built with.
+    //
+    // This also confirms that the identities are independent: verifying A's
+    // handshake using A's clock works, and verifying B's using B's clock works —
+    // neither party needs to know the other's identity to accept the timestamp.
+    let sk_a = SigningKey::generate(&mut OsRng);
+    let sk_b = SigningKey::generate(&mut OsRng);
+
+    let identity_a = IdentityPub(sk_a.verifying_key().to_bytes());
+    let identity_b = IdentityPub(sk_b.verifying_key().to_bytes());
+
+    // Both built at the same timestamp.
+    let shared_ts = Timestamp(1_700_000_000);
+
+    let hs_a = build_handshake(identity_a, shared_ts, &sk_a, None);
+    let hs_b = build_handshake(identity_b, shared_ts, &sk_b, None);
+
+    // Both verify successfully when now == shared_ts (delta=0).
+    verify_handshake(&hs_a, shared_ts)
+        .expect("peer A handshake must verify at its own timestamp");
+    verify_handshake(&hs_b, shared_ts)
+        .expect("peer B handshake must verify at its own timestamp");
+
+    // Also verify that both still verify within the freshness window.
+    let within_window = Timestamp(shared_ts.0 + HANDSHAKE_FRESHNESS_SECS - 1);
+    verify_handshake(&hs_a, within_window)
+        .expect("peer A handshake must verify within freshness window");
+    verify_handshake(&hs_b, within_window)
+        .expect("peer B handshake must verify within freshness window");
+
+    // And both reject outside the freshness window.
+    let outside_window = Timestamp(shared_ts.0 + HANDSHAKE_FRESHNESS_SECS + 1);
+    assert!(
+        matches!(verify_handshake(&hs_a, outside_window), Err(MessageError::HandshakeStale { .. })),
+        "peer A handshake must be stale past freshness window"
+    );
+    assert!(
+        matches!(verify_handshake(&hs_b, outside_window), Err(MessageError::HandshakeStale { .. })),
+        "peer B handshake must be stale past freshness window"
+    );
+}
+
+// ─── MSG-11: unknown_message_variant_returns_error_not_panic ─────────────────
+
+#[test]
+fn unknown_message_variant_returns_error_not_panic() {
+    // Build a CBOR map: {"type": "nonexistent_type", "v": 1}.
+    // Message uses #[serde(tag = "type", rename_all = "snake_case")], so an
+    // unknown "type" value must produce a deserialization error, not a panic.
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(
+        &ciborium::value::Value::Map(vec![
+            (
+                ciborium::value::Value::Text("type".to_string()),
+                ciborium::value::Value::Text("nonexistent_type".to_string()),
+            ),
+            (
+                ciborium::value::Value::Text("v".to_string()),
+                ciborium::value::Value::Integer(1.into()),
+            ),
+        ]),
+        &mut buf,
+    )
+    .expect("CBOR encode of raw map failed");
+
+    let result = from_cbor::<Message>(&buf);
+    assert!(
+        result.is_err(),
+        "deserializing an unknown message type must return Err, not Ok or panic"
+    );
+}
+
+// ─── MSG-12: all 27 message variants have v == 1 ─────────────────────────────
+
+#[test]
+fn all_messages_have_version_one() {
+    let variants = all_27_message_variants();
+    assert_eq!(variants.len(), 27, "expected 27 Message variants");
+
+    for msg in &variants {
+        let v = match msg {
+            Message::Handshake(m) => m.v,
+            Message::PeerAnnounce(m) => m.v,
+            Message::PosChallenge(m) => m.v,
+            Message::PosResponse(m) => m.v,
+            Message::PosNack(m) => m.v,
+            Message::SymbolOffer(m) => m.v,
+            Message::SymbolAccept(m) => m.v,
+            Message::SymbolReject(m) => m.v,
+            Message::SymbolStored(m) => m.v,
+            Message::SymbolTransfer(m) => m.v,
+            Message::Delete(m) => m.v,
+            Message::CancelDelete(m) => m.v,
+            Message::StorageWarning(m) => m.v,
+            Message::SymbolDropped(m) => m.v,
+            Message::SymbolDropNotice(m) => m.v,
+            Message::RestoreRequest(m) => m.v,
+            Message::RestoreResponse(m) => m.v,
+            Message::RestoreDenied(m) => m.v,
+            Message::BoardSync(m) => m.v,
+            Message::ClusterSyncRequest(m) => m.v,
+            Message::ClusterSyncResponse(m) => m.v,
+            Message::SystemStateBackup(m) => m.v,
+            Message::SystemStateAck(m) => m.v,
+            Message::SystemStateRequest(m) => m.v,
+            Message::SystemStateResponse(m) => m.v,
+            Message::PeerDiscoveryRequest(m) => m.v,
+            Message::PeerDiscoveryResponse(m) => m.v,
+        };
+        assert_eq!(
+            v, 1,
+            "message variant {:?} has v={v}, expected 1",
+            std::mem::discriminant(msg)
+        );
+    }
+}
+
+// ─── MSG-13: RestoreDeniedMsg struct fields exist (compile-time check) ────────
+
+#[test]
+fn restore_denied_msg_fields_exist() {
+    // Compile-time check that RestoreDeniedMsg has the expected fields.
+    // The GAP spec mentions 'required_weeks'/'current_weeks' but those do not exist
+    // in the current protocol. The actual fields are current_trust and needed_trust.
+    // This test documents the actual structure and would fail to compile if the
+    // fields were removed.
+    let msg = RestoreDeniedMsg {
+        v: 1,
+        source_block_id: make_source_block_id(1),
+        reason: "test".to_string(),
+        current_trust: 0.3,
+        needed_trust: 0.7,
+        restore_budget_gb: 10.0,
+        timestamp: Timestamp(1000),
+    };
+    assert_eq!(msg.v, 1);
+    assert!((msg.current_trust - 0.3).abs() < f64::EPSILON);
+    assert!((msg.needed_trust - 0.7).abs() < f64::EPSILON);
 }

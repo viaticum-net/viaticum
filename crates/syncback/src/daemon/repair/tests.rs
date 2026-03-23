@@ -354,3 +354,181 @@ async fn gate_holder_evicts_pos_nack_owner_triggers_repair() {
     assert_eq!(final_placement.status, PlacementStatus::Alive);
     assert_eq!(final_placement.consecutive_misses, 0);
 }
+
+// ─── REPAIR-08: insufficient peers for placement — analysis ──────────────────
+//
+// FINDING: REPAIR-08 is a false GAP at the repair level.
+//
+// repair_placement() (Phase 2.5) re-encodes symbols locally from the source
+// block file. It does NOT call compute_allocation — there is no peer selection
+// at this stage. The placement's esi_ranges are already recorded in the DB from
+// the original backup; repair just regenerates those specific ESIs and writes
+// symbol files to disk.
+//
+// compute_allocation is called only in the backup pipeline (BackupCoordinator)
+// when initially distributing symbols to holders. The RepairAgent has no concept
+// of "available peers" — it works entirely offline with local data.
+//
+// Therefore, "repair with insufficient peers" cannot be tested at repair level.
+// The failure mode (too few peers) belongs in BackupCoordinator tests, not here.
+
+// ─── REPAIR-09: RepairNow trigger repairs only the targeted block ─────────────
+
+#[tokio::test]
+async fn repair_now_trigger_repairs_specific_block() {
+    // Two Lost placements (different blocks). Send RepairTrigger::RepairNow for
+    // bid1/hid1 only. Verify bid1 becomes Alive and bid2 stays Lost.
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+
+    let bid1 = block_id(110);
+    let hid1 = holder_id(111);
+    let bid2 = block_id(120);
+    let hid2 = holder_id(121);
+
+    let source_data = vec![0xBBu8; 65535];
+
+    // Set up bid1 with source file on disk
+    write_source_block_file(symbols_dir.path(), &bid1, &source_data);
+    db.upsert_source_block(&make_source_block_record(bid1, 1, 65535)).unwrap();
+    db.upsert_placement(&make_placement(bid1, hid1, vec![(0, 1)], PlacementStatus::Lost))
+        .unwrap();
+
+    // Set up bid2 as Lost with NO source file on disk (so it cannot be repaired)
+    db.upsert_source_block(&make_source_block_record(bid2, 1, 65535)).unwrap();
+    db.upsert_placement(&make_placement(bid2, hid2, vec![(0, 1)], PlacementStatus::Lost))
+        .unwrap();
+
+    let agent = make_agent(db.clone(), symbols_dir.path());
+
+    // Send RepairNow for bid1 only; bid2 is not targeted
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    tx.send(super::RepairTrigger::RepairNow {
+        block_id: bid1,
+        holder_id: hid1,
+    })
+    .await
+    .unwrap();
+    // Drop sender so run() exits after processing the one message
+    drop(tx);
+
+    agent.run(3600, rx).await.unwrap();
+
+    // bid1 must be Alive
+    let p1 = db.get_placement(&bid1, &hid1).unwrap().unwrap();
+    assert_eq!(
+        p1.status,
+        PlacementStatus::Alive,
+        "bid1 must be Alive after RepairNow"
+    );
+
+    // bid2 must still be Lost — it was not targeted
+    let p2 = db.get_placement(&bid2, &hid2).unwrap().unwrap();
+    assert_eq!(
+        p2.status,
+        PlacementStatus::Lost,
+        "bid2 must remain Lost — RepairNow did not target it"
+    );
+}
+
+// ─── REPAIR-10: ScanAll trigger repairs all Lost placements ──────────────────
+
+#[tokio::test]
+async fn scan_all_trigger_repairs_all_lost() {
+    // Two Lost placements. Send RepairTrigger::ScanAll via channel.
+    // Verify both become Alive after run() processes the trigger.
+    //
+    // NOTE: scan_and_repair_finds_lost_placement_and_repairs covers the direct
+    // scan_and_repair() call with one block. This test verifies the ScanAll
+    // trigger path through run() with two blocks — different code path.
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+
+    let bid1 = block_id(130);
+    let hid1 = holder_id(131);
+    let bid2 = block_id(140);
+    let hid2 = holder_id(141);
+
+    let source_data = vec![0xDDu8; 65535];
+
+    // Both blocks have source files on disk
+    write_source_block_file(symbols_dir.path(), &bid1, &source_data);
+    write_source_block_file(symbols_dir.path(), &bid2, &source_data);
+
+    db.upsert_source_block(&make_source_block_record(bid1, 1, 65535)).unwrap();
+    db.upsert_placement(&make_placement(bid1, hid1, vec![(0, 1)], PlacementStatus::Lost))
+        .unwrap();
+
+    db.upsert_source_block(&make_source_block_record(bid2, 1, 65535)).unwrap();
+    db.upsert_placement(&make_placement(bid2, hid2, vec![(0, 1)], PlacementStatus::Lost))
+        .unwrap();
+
+    let agent = make_agent(db.clone(), symbols_dir.path());
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    tx.send(super::RepairTrigger::ScanAll).await.unwrap();
+    drop(tx);
+
+    agent.run(3600, rx).await.unwrap();
+
+    // Both placements must be Alive after ScanAll
+    let p1 = db.get_placement(&bid1, &hid1).unwrap().unwrap();
+    assert_eq!(p1.status, PlacementStatus::Alive, "bid1 must be Alive after ScanAll");
+
+    let p2 = db.get_placement(&bid2, &hid2).unwrap().unwrap();
+    assert_eq!(p2.status, PlacementStatus::Alive, "bid2 must be Alive after ScanAll");
+}
+
+// ─── test 24: pos_fail_marks_lost_then_repair_restores_to_alive ───────────────
+// REPAIR-11: Full cycle — PoS fail → placement Lost → repair generates new symbols.
+// Placement starts Alive; PoS fail is simulated via handle_pos_nack (same path
+// as apply_pos_outcome for Fail); scan_and_repair then restores it to Alive.
+
+#[tokio::test]
+async fn pos_fail_marks_lost_then_repair_restores_to_alive() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+
+    let bid = block_id(90);
+    let hid = holder_id(91);
+    let source_data = vec![0xCCu8; 65535];
+
+    // Setup: source block record + file on disk
+    db.upsert_source_block(&make_source_block_record(bid, 1, 65535)).unwrap();
+    write_source_block_file(symbols_dir.path(), &bid, &source_data);
+
+    // Placement starts Alive (as it would be in steady state)
+    db.upsert_placement(&make_placement(bid, hid, vec![(0, 1)], PlacementStatus::Alive))
+        .unwrap();
+
+    let agent = make_agent(db.clone(), symbols_dir.path());
+
+    // ── Simulate PoS fail outcome ────────────────────────────────────────────
+    // handle_pos_nack mirrors what apply_pos_outcome does for a Fail result:
+    // marks placement Lost and resets consecutive_misses to 0.
+    agent.handle_pos_nack(&bid, &hid, now()).await.unwrap();
+
+    // ── Verify Lost state ────────────────────────────────────────────────────
+    let after_pos_fail = db.get_placement(&bid, &hid).unwrap().unwrap();
+    assert_eq!(after_pos_fail.status, PlacementStatus::Lost);
+
+    // ── Run repair ───────────────────────────────────────────────────────────
+    let repaired = agent.scan_and_repair().await;
+    assert_eq!(repaired, 1);
+
+    // ── Verify repair results ────────────────────────────────────────────────
+    let restored = db.get_placement(&bid, &hid).unwrap().unwrap();
+    assert_eq!(restored.status, PlacementStatus::Alive);
+    assert_eq!(restored.consecutive_misses, 0);
+
+    // Symbol file must exist at {symbols_dir}/{hex(bid)}/{hex(hid)}/0.sym
+    let sym_path = symbols_dir
+        .path()
+        .join(hex_encode(&bid.0))
+        .join(hex_encode(&hid.0))
+        .join("0.sym");
+    assert!(sym_path.exists(), "symbol file must exist after repair: {:?}", sym_path);
+
+    let sym_data = std::fs::read(&sym_path).unwrap();
+    assert_eq!(sym_data.len(), 65535, "symbol must be exactly T bytes");
+}

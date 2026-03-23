@@ -362,6 +362,58 @@ mod cluster_sync_tests {
         assert_eq!(decoded.device_cert.device_id, DEVICE_B_ID);
     }
 
+    // ─── PROC-16: cluster_sync_request_from_revoked_device_rejected ──────────
+
+    #[test]
+    fn cluster_sync_request_from_revoked_device_rejected() {
+        // A device that was added to the cluster and then revoked must not be
+        // served event log entries via handle_sync_request.
+        let db = Db::open_in_memory().unwrap();
+        let master_key = make_master_key();
+
+        // Set up cluster with DEVICE_A as the sole active device.
+        let master_pub = master_identity(&master_key);
+        let cert_a = issue_device_certificate(
+            &master_key,
+            DEVICE_A_ID,
+            device_pub(DEVICE_A_ID),
+            NOW,
+        );
+        let mut state = ClusterState::init(db.clone(), master_pub, cert_a, NOW, NOW).unwrap();
+
+        // Add DEVICE_B, then immediately revoke it.
+        let cert_b = issue_device_certificate(
+            &master_key,
+            DEVICE_B_ID,
+            device_pub(DEVICE_B_ID),
+            NOW,
+        );
+        state.add_device(cert_b, NOW).unwrap();
+
+        let rev = issue_revocation(&master_key, DEVICE_B_ID, NOW, EpochCounter(1));
+        state.revoke_device(rev, NOW, NOW).unwrap();
+
+        // Confirm revocation took effect.
+        assert!(state.is_device_revoked(&DEVICE_B_ID));
+
+        let manager = make_manager_with_state(db, state, DEVICE_A_ID);
+
+        // DEVICE_B sends a ClusterSyncRequest — must be rejected.
+        let request = ClusterSyncRequestMsg {
+            v: 1,
+            from_device_id: DEVICE_B_ID,
+            last_known_seq: 0,
+            timestamp: NOW,
+        };
+        let result = manager.handle_sync_request(&request);
+
+        assert!(
+            matches!(result, Err(ClusterSyncError::NotClusterDevice(id)) if id == DEVICE_B_ID),
+            "revoked device must be rejected with NotClusterDevice, got {:?}",
+            result
+        );
+    }
+
     // ─── Message serialization round-trips ───────────────────────────────────
 
     #[test]

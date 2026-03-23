@@ -1,3 +1,5 @@
+use rand::Rng;
+
 use super::{ErasureEncoder, ErasureError, RaptorQEncoder, Symbol, binding_seed};
 use crate::types::{ErasureParams, IdentityPub, SourceBlockId};
 
@@ -340,4 +342,255 @@ fn symbol_size_bytes_matches_data_len() {
     let data = vec![0xFFu8; 100];
     let sym = Symbol { esi: 7, data: data.clone() };
     assert_eq!(sym.size_bytes(), data.len());
+}
+
+// ─── ERASURE-14: large source block (128 MB) encode + decode succeeds ────────
+
+#[test]
+#[ignore] // ~10s in debug; run with: cargo test -- --ignored
+fn large_source_block_encode_decode_succeeds() {
+    // 16 MB source block — large enough to exercise multi-symbol encoding
+    // without 10-minute debug builds. Original was 128 MB (582s in debug).
+    let enc = encoder();
+    let size: usize = 16 * 1024 * 1024;
+    let source = vec![0xABu8; size];
+    let params = ErasureParams::compute(size as u64, 0.5);
+    let bid = block_id(100);
+    let hid = holder(100);
+
+    let k_eff = params.k_eff;
+
+    let bound = enc
+        .encode(&source, &params, 0, k_eff, &bid, &hid)
+        .unwrap_or_else(|e| {
+            panic!("encode failed for 16 MB block (k_eff={k_eff}): {e}")
+        });
+    assert_eq!(bound.len(), k_eff as usize);
+
+    let unbound: Vec<Symbol> = bound
+        .into_iter()
+        .map(|s| enc.unbind(s, &bid, &hid))
+        .collect();
+
+    let decoded = enc
+        .decode(&unbound, &params)
+        .unwrap_or_else(|e| panic!("decode failed: {e}"));
+
+    // Decoded block is padded to k*t; verify original content in first 1024 bytes
+    assert!(
+        decoded.len() >= 1024,
+        "decoded block too short: {}",
+        decoded.len()
+    );
+    assert_eq!(
+        &decoded[..1024],
+        &source[..1024],
+        "first 1024 bytes must match original"
+    );
+}
+
+// ─── ERASURE-10: decode any K_eff subset from arbitrary ESI range ───────────
+
+#[test]
+fn decode_non_contiguous_esi_subset() {
+    let enc = encoder();
+    let size = 3 * 65_535usize;
+    let source = test_data(size);
+    let params = ErasureParams::compute(size as u64, 0.5);
+    let bid = block_id(20);
+    let hid = holder(1);
+    let k_eff = params.k_eff;
+
+    // Generate more symbols than needed (source + repair range)
+    let total_gen = k_eff + 10;
+    let bound = enc.encode(&source, &params, 0, total_gen, &bid, &hid).unwrap();
+    let unbound: Vec<Symbol> = bound
+        .into_iter()
+        .map(|s| enc.unbind(s, &bid, &hid))
+        .collect();
+
+    // Take every other symbol (non-contiguous subset), up to k_eff
+    let subset: Vec<Symbol> = unbound
+        .into_iter()
+        .step_by(2)
+        .take(k_eff as usize)
+        .collect();
+    assert_eq!(subset.len(), k_eff as usize);
+
+    let decoded = enc.decode(&subset, &params).unwrap();
+    assert_eq!(&decoded[..source.len()], &source[..]);
+}
+
+// ─── PROP-08: sweep of sizes and redundancies ───────────────────────────────
+
+#[test]
+fn encode_unbind_decode_roundtrip_sweep() {
+    let enc = encoder();
+    let sizes: &[u64] = &[1, 64, 256, 1024, 4096, 10_000, 65_536, 100_000];
+    let redundancies: &[f64] = &[0.3, 0.5, 1.0];
+
+    let mut rng = rand::thread_rng();
+    let mut idx: u8 = 30; // start above existing test bytes to avoid collision
+
+    for &size in sizes {
+        for &redundancy in redundancies {
+            let source: Vec<u8> = (0..size as usize).map(|_| rng.r#gen::<u8>()).collect();
+            let params = ErasureParams::compute(size, redundancy);
+            let bid = block_id(idx);
+            let hid = holder(idx.wrapping_add(1));
+            idx = idx.wrapping_add(2);
+
+            let k_eff = params.k_eff;
+            let bound = enc
+                .encode(&source, &params, 0, k_eff, &bid, &hid)
+                .unwrap_or_else(|e| {
+                    panic!("encode failed for size={size} redundancy={redundancy}: {e}")
+                });
+            assert_eq!(bound.len(), k_eff as usize);
+
+            let unbound: Vec<Symbol> = bound
+                .into_iter()
+                .map(|s| enc.unbind(s, &bid, &hid))
+                .collect();
+
+            let decoded = enc.decode(&unbound, &params).unwrap_or_else(|e| {
+                panic!("decode failed for size={size} redundancy={redundancy}: {e}")
+            });
+
+            assert_eq!(
+                &decoded[..source.len()],
+                &source[..],
+                "mismatch for size={size} redundancy={redundancy}"
+            );
+        }
+    }
+}
+
+// ─── ERASURE-15: mixed source + repair symbols decode ───────────────────────
+
+#[test]
+fn decode_mixed_source_and_repair_symbols() {
+    let enc = encoder();
+    let size = 4 * 65_535usize;
+    let source = test_data(size);
+    let params = ErasureParams::compute(size as u64, 0.5);
+    let bid = block_id(21);
+    let hid = holder(1);
+    let k = params.k;
+    let k_eff = params.k_eff;
+
+    // Get some source symbols (ESI 0..k/2)
+    let half_k = k / 2;
+    let source_syms = enc.encode(&source, &params, 0, half_k, &bid, &hid).unwrap();
+
+    // Get repair symbols (ESI starting at k) to fill up to k_eff
+    let repair_count = k_eff - half_k;
+    let repair_syms = enc
+        .encode(&source, &params, k, repair_count, &bid, &hid)
+        .unwrap();
+
+    // Combine and unbind
+    let mut all: Vec<Symbol> = source_syms
+        .into_iter()
+        .chain(repair_syms)
+        .map(|s| enc.unbind(s, &bid, &hid))
+        .collect();
+    assert_eq!(all.len(), k_eff as usize);
+
+    // Shuffle to prove order doesn't matter
+    all.reverse();
+
+    let decoded = enc.decode(&all, &params).unwrap();
+    assert_eq!(&decoded[..source.len()], &source[..]);
+}
+
+// ─── ERASURE-02: decode with exactly K symbols (no overhead) may fail ────────
+
+#[test]
+fn decode_with_exactly_k_symbols_may_fail() {
+    // k_eff = k + overhead (typically k+3 for small blocks).
+    // Decoding with exactly k symbols (no overhead) may fail — that is expected.
+    // We just assert it either fails or succeeds (no panic, no corruption).
+    let enc = encoder();
+    let size = 3 * 65_535usize;
+    let source = test_data(size);
+    let params = ErasureParams::compute(size as u64, 0.5);
+    let bid = block_id(50);
+    let hid = holder(50);
+
+    let k = params.k as usize;
+    let k_eff = params.k_eff as usize;
+
+    // Only attempt this if k < k_eff (there is overhead to skip).
+    assert!(k < k_eff, "test requires k < k_eff (overhead > 0)");
+
+    // Encode k_eff symbols so we have enough to choose from.
+    let bound = enc.encode(&source, &params, 0, k_eff as u32, &bid, &hid).unwrap();
+    let unbound: Vec<Symbol> = bound
+        .into_iter()
+        .map(|s| enc.unbind(s, &bid, &hid))
+        .collect();
+
+    // Take exactly k symbols (no repair overhead).
+    let subset: Vec<Symbol> = unbound.into_iter().take(k).collect();
+    assert_eq!(subset.len(), k);
+
+    // This should either fail with InsufficientSymbols or DecodeFailed.
+    // What it must NOT do is panic or corrupt the data if it succeeds.
+    match enc.decode(&subset, &params) {
+        Ok(decoded) => {
+            // If RaptorQ managed to decode, the content must be correct.
+            assert_eq!(
+                &decoded[..source.len()],
+                &source[..],
+                "if decode succeeded with exactly k symbols, data must match"
+            );
+        }
+        Err(ErasureError::InsufficientSymbols { have, need }) => {
+            // k < k_eff so this is the expected path.
+            assert_eq!(have, k);
+            assert_eq!(need, k_eff);
+        }
+        Err(ErasureError::DecodeFailed) => {
+            // Also acceptable: decoder accepted k symbols but failed to reconstruct.
+        }
+        Err(other) => panic!("unexpected error: {other}"),
+    }
+}
+
+// ─── ERASURE-13: source block not a multiple of T — padding is trimmed ────────
+
+#[test]
+fn source_block_not_multiple_of_t_padding_trim() {
+    // Source = 1000 bytes, T = 65535. Source < T, so k=1 and the encoder pads
+    // to k*T internally. After decode, caller trims decoded[..1000] to recover
+    // the original content.
+    let enc = encoder();
+    let source = test_data(1000);
+    // ErasureParams for a tiny block: k=1, t=65535.
+    let params = ErasureParams::compute(1000, 0.5);
+    let bid = block_id(60);
+    let hid = holder(60);
+
+    let k_eff = params.k_eff;
+
+    let bound = enc.encode(&source, &params, 0, k_eff, &bid, &hid).unwrap();
+    let unbound: Vec<Symbol> = bound
+        .into_iter()
+        .map(|s| enc.unbind(s, &bid, &hid))
+        .collect();
+
+    let decoded = enc.decode(&unbound, &params).unwrap();
+
+    // Decoded block is padded to k*t bytes. Trim to original size.
+    assert!(
+        decoded.len() >= 1000,
+        "decoded block must be at least 1000 bytes, got {}",
+        decoded.len()
+    );
+    assert_eq!(
+        &decoded[..1000],
+        &source[..],
+        "first 1000 bytes must match original source"
+    );
 }

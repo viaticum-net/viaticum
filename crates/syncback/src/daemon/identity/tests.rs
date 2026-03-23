@@ -232,3 +232,33 @@ fn derive_keys_iroh_key_differs_from_device_key() {
         "iroh key bytes must differ from device signing key bytes"
     );
 }
+
+// ─── ID-07: two different 24-word mnemonics produce different identities ──────
+
+#[test]
+fn bip39_24_words_produce_unique_identity() {
+    // Generate two different identities from two different 24-word mnemonics.
+    // Each must produce a unique identity_pub.
+    let mnemonic_a = "abandon abandon abandon abandon abandon abandon \
+                      abandon abandon abandon abandon abandon abandon \
+                      abandon abandon abandon abandon abandon abandon \
+                      abandon abandon abandon abandon abandon art";
+
+    let mnemonic_b = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo \
+                      zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote";
+
+    let dir_a = tmp_dir();
+    let dir_b = tmp_dir();
+
+    let kf_a = init_identity_from_mnemonic(dir_a.path(), mnemonic_a).expect("init a");
+    let kf_b = init_identity_from_mnemonic(dir_b.path(), mnemonic_b).expect("init b");
+
+    assert_ne!(
+        kf_a.identity_pub, kf_b.identity_pub,
+        "different mnemonics must produce different identity_pub"
+    );
+    assert_ne!(
+        kf_a.seed, kf_b.seed,
+        "different mnemonics must produce different seeds"
+    );
+}

@@ -478,3 +478,84 @@ fn recent_pos_stats_excludes_weeks_outside_window() {
     assert_eq!(challenged, 3);
     assert_eq!(passed, 2);
 }
+
+// ─── TRUST-17: trust can exceed 1.0 ────────────────────────────────────────
+
+#[test]
+fn trust_can_exceed_one() {
+    // P=1.0, I=1.0, S=1.0 → combined = (KP*1 + KI*1) * 1 = 0.4 + 1.75 = 2.15
+    let combined = compute_combined(1.0, 1.0, 1.0);
+    let expected = KP + KI; // 0.4 + 1.75 = 2.15
+    assert!(
+        (combined - expected).abs() < 1e-10,
+        "expected {expected}, got {combined}"
+    );
+    assert!(combined > 1.0, "trust should be able to exceed 1.0");
+}
+
+// ─── PROP-02: compute_combined bounded across all input combinations ─────────
+
+#[test]
+fn trust_combined_bounded_across_inputs() {
+    // Sweep P in {0.0, 0.25, 0.5, 0.75, 1.0}, I in {0.0, 0.5, 1.0},
+    // S_raw in {0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0}.
+    // For each: result must be >= 0.0 and finite.
+    let p_values = [0.0_f64, 0.25, 0.5, 0.75, 1.0];
+    let i_values = [0.0_f64, 0.5, 1.0];
+    let s_values = [0.0_f64, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0];
+
+    for p in p_values {
+        for i in i_values {
+            for s in s_values {
+                let combined = compute_combined(p, i, s);
+                assert!(
+                    combined >= 0.0,
+                    "compute_combined({p}, {i}, {s}) = {combined} — must be >= 0.0"
+                );
+                assert!(
+                    combined.is_finite(),
+                    "compute_combined({p}, {i}, {s}) = {combined} — must be finite"
+                );
+            }
+        }
+    }
+}
+
+// ─── TRUST-20: trust convergence after perfect PoS ──────────────────────────
+
+#[test]
+fn trust_converges_after_sustained_perfect_pos() {
+    let mut engine = TrustEngine::new();
+    let p = peer(1);
+    engine.upsert_peer(p, ts(1_000_000));
+
+    // 20 weeks of perfect PoS (challenged=10, passed=10 each week)
+    for week in 1..=20 {
+        engine
+            .record_pos_result(
+                p,
+                PosOutcome { week_number: week, challenged: 10, passed: 10 },
+            )
+            .unwrap();
+    }
+
+    // Must recalculate to update P and I from weekly data
+    let score = engine.recalculate(&p, ts(2_000_000), 20).unwrap();
+    // After 20 weeks perfect: P=1.0 (rolling 4-week), I → 1.0 (all weeks perfect)
+    assert!(
+        (score.p - 1.0).abs() < 1e-10,
+        "P should be 1.0 after perfect PoS, got {}",
+        score.p
+    );
+    assert!(
+        score.i > 0.9,
+        "I should be near 1.0 after 20 perfect weeks, got {}",
+        score.i
+    );
+    // combined = (0.4*1.0 + 1.75*I) * S, S defaults to 1.0
+    assert!(
+        score.combined > 1.5,
+        "combined should be well above 1.0, got {}",
+        score.combined
+    );
+}

@@ -484,11 +484,13 @@ fn apply_pos_outcome_deleting_is_noop_for_all_outcomes() {
 }
 
 #[test]
-fn outcome_from_verify_not_held_counts_as_challenged() {
+fn outcome_from_verify_not_held_is_trust_neutral() {
+    // NotHeld = holder honestly reports missing symbol.
+    // Must NOT penalize trust (incentivize PosNack over silence).
     let outcome = outcome_from_verify(&VerifyOutcome::NotHeld { esi: 3 }, 7);
     assert_eq!(outcome.week_number, 7);
-    assert_eq!(outcome.challenged, 1);
-    assert_eq!(outcome.passed, 0);
+    assert_eq!(outcome.challenged, 0, "NotHeld must not record a challenge");
+    assert_eq!(outcome.passed, 0, "NotHeld must not record a pass");
 }
 
 #[test]
@@ -526,4 +528,180 @@ fn apply_pos_outcome_cannot_verify_is_noop_on_uncertain() {
     assert_eq!(result.new_status, PlacementStatus::Uncertain);
     assert_eq!(result.new_consecutive_misses, 2);
     assert!(!result.trigger_repair);
+}
+
+// ─── POS-31: Deleting/Lost placements do not trigger repair on any outcome ───
+
+#[test]
+fn pos_should_skip_deleting_placements_no_repair_on_fail() {
+    // A Deleting placement that receives a Fail outcome must NOT trigger repair.
+    // Deletion is in progress — repairing would be wasteful and incorrect.
+    let placement = make_placement_with_status(
+        block_id(1), holder(2), vec![(0, 5)],
+        PlacementStatus::Deleting, 0,
+    );
+    let result = apply_pos_outcome(&placement, &VerifyOutcome::Fail { esi: 3 });
+    assert_eq!(
+        result.new_status,
+        PlacementStatus::Deleting,
+        "Deleting placement must stay Deleting after Fail"
+    );
+    assert!(
+        !result.trigger_repair,
+        "Deleting placement must NOT trigger repair on Fail"
+    );
+}
+
+#[test]
+fn pos_should_skip_deleting_placements_no_repair_on_not_held() {
+    // A Deleting placement where holder responds NotHeld must NOT trigger repair.
+    // Holder correctly dropped the symbols per the delete protocol.
+    let placement = make_placement_with_status(
+        block_id(1), holder(2), vec![(0, 5)],
+        PlacementStatus::Deleting, 0,
+    );
+    let result = apply_pos_outcome(&placement, &VerifyOutcome::NotHeld { esi: 3 });
+    assert_eq!(result.new_status, PlacementStatus::Deleting);
+    assert!(!result.trigger_repair, "Deleting placement must NOT trigger repair on NotHeld");
+}
+
+#[test]
+fn pos_due_challenges_does_not_filter_by_status() {
+    // due_challenges does NOT filter by placement status — the caller (daemon scheduler)
+    // is responsible for pre-filtering Deleting/Lost placements before calling.
+    // This test documents that behavior: a Deleting placement with valid ESI ranges
+    // WILL appear in due_challenges results if the caller doesn't filter.
+    let bid = block_id(1);
+    let hid = holder(2);
+    let mut placement = make_placement(bid, hid, vec![(0, 10)]);
+    placement.status = PlacementStatus::Deleting;
+
+    let now = Timestamp(1_000_000);
+    let last_verified = vec![(bid, hid, None)];
+
+    // due_challenges returns it — caller must filter before using
+    let entries = due_challenges(&[placement], &last_verified, now, |_| 0.5);
+    assert_eq!(
+        entries.len(),
+        1,
+        "due_challenges does not filter by PlacementStatus — caller responsibility"
+    );
+}
+
+// ─── PROP-13: select_challenge_esi always within esi_ranges ─────────────────
+
+#[test]
+fn select_challenge_esi_always_within_ranges() {
+    // Sweep multiple ESI range configurations and many nonces.
+    let configs: Vec<Vec<(u32, u32)>> = vec![
+        vec![(0, 10)],                    // single range
+        vec![(100, 50)],                  // offset start
+        vec![(0, 5), (10, 5)],            // two disjoint ranges
+        vec![(0, 3), (100, 7), (500, 20)], // three ranges
+        vec![(0, 1)],                     // single ESI
+        vec![(0, 1000)],                  // large range
+    ];
+
+    for esi_ranges in &configs {
+        let placement = SymbolPlacement {
+            source_block_id: SourceBlockId([0u8; 32]),
+            holder_id: IdentityPub([1u8; 32]),
+            file_id: crate::types::FileId(1),
+            esi_ranges: esi_ranges.clone(),
+            binding_seed: [0u8; 32],
+            status: PlacementStatus::Alive,
+            last_verified: None,
+            placed_at: Timestamp(0),
+            consecutive_misses: 0,
+        };
+
+        for nonce in 0u64..50 {
+            let esi = select_challenge_esi(&placement, nonce).unwrap();
+            let in_range = esi_ranges
+                .iter()
+                .any(|&(start, count)| esi >= start && esi < start + count);
+            assert!(
+                in_range,
+                "ESI {esi} not in ranges {:?} for nonce {nonce}",
+                esi_ranges
+            );
+        }
+    }
+}
+
+// ─── PROP-11: challenges_per_week always >= POS_BASE_CHALLENGES_PER_WEEK ─────
+
+#[test]
+fn challenges_per_week_always_at_least_base() {
+    // Sweep symbol_count and trust across a wide range.
+    // Result must always be >= POS_BASE_CHALLENGES_PER_WEEK.
+    let symbol_counts = [0u32, 1, 100, 1000, 10000];
+    let trust_values = [0.0_f64, 0.1, 0.5, 1.0, 2.0];
+
+    for symbol_count in symbol_counts {
+        for trust in trust_values {
+            let result = challenges_per_week(symbol_count, trust);
+            assert!(
+                result >= POS_BASE_CHALLENGES_PER_WEEK,
+                "challenges_per_week({symbol_count}, {trust}) = {result} \
+                 — must be >= POS_BASE_CHALLENGES_PER_WEEK ({POS_BASE_CHALLENGES_PER_WEEK})"
+            );
+        }
+    }
+}
+
+// ─── SCHED-06: adaptive_rate_low_trust_more_challenges ───────────────────────
+
+#[test]
+fn adaptive_rate_low_trust_more_challenges() {
+    // The challenge rate adapts to trust: lower trust → more challenges.
+    // trust_factor = 2.0 - trust, so lower trust → higher factor → more challenges.
+    // Need volume_factor=2 (symbol_count=2000) so ceil() resolves the difference:
+    //   trust=0.1: ceil(1 * 2 * 1.9) = ceil(3.8) = 4
+    //   trust=0.9: ceil(1 * 2 * 1.1) = ceil(2.2) = 3
+    let symbol_count = 2000;
+    let low_trust = 0.1;
+    let high_trust = 0.9;
+
+    let low_result = challenges_per_week(symbol_count, low_trust);
+    let high_result = challenges_per_week(symbol_count, high_trust);
+
+    assert!(
+        low_result > high_result,
+        "low trust ({low_trust}) should produce more challenges ({low_result}) \
+         than high trust ({high_trust}) ({high_result})"
+    );
+}
+
+// ─── POS-32: trust_factor clamped when trust > 1.0 ───────────────────────────
+
+#[test]
+fn trust_factor_clamped_above_two() {
+    // challenges_per_week clamps trust to [0.0, 1.0] before computing trust_factor.
+    // trust_factor = 2.0 - trust.clamp(0.0, 1.0)
+    // If trust = 2.0, clamped trust = 1.0, trust_factor = 1.0 (not 0.0).
+    // Result must be >= POS_BASE_CHALLENGES_PER_WEEK.
+    let symbol_count = 1000u32;
+
+    // trust > 1.0 should not produce trust_factor = 0.0 (which could give 0 challenges).
+    let result_over = challenges_per_week(symbol_count, 2.0);
+    assert!(
+        result_over >= POS_BASE_CHALLENGES_PER_WEEK,
+        "trust=2.0 must not drop below base challenges: got {result_over}"
+    );
+
+    // trust = 1.0 (maximum valid): trust_factor = 2.0 - 1.0 = 1.0.
+    let result_one = challenges_per_week(symbol_count, 1.0);
+    assert_eq!(
+        result_over, result_one,
+        "trust=2.0 should give same result as trust=1.0 due to clamping"
+    );
+
+    // trust = -1.0 (below range): clamped to 0.0, trust_factor = 2.0.
+    // Should produce more challenges than trust=1.0.
+    let result_neg = challenges_per_week(symbol_count, -1.0);
+    assert!(
+        result_neg >= result_one,
+        "trust=-1.0 (clamped to 0.0) should produce >= challenges of trust=1.0"
+    );
 }

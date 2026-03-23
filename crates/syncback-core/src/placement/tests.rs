@@ -332,3 +332,253 @@ fn holder_weight_at_half_is_sqrt_half() {
     // 0.5/sqrt(0.5) = 0.5/0.7071... ≈ 0.7071
     assert!((w - 0.7071).abs() < 0.001);
 }
+
+// ─── PLACE-14: bootstrap problem ────────────────────────────────────────────
+
+#[test]
+fn compute_allocation_works_with_bootstrap_trust() {
+    // New peers have trust = INITIAL_TRUST_P = 0.1 → combined ≈ 0.04.
+    // Placement must work even when all peers have very low trust.
+    let p = params_large(0.5);
+    let candidates: Vec<_> = (1..=5).map(|b| candidate(b, 0.04)).collect();
+    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
+    assert_eq!(total, p.n);
+    assert_eq!(allocs.len(), 5);
+    for alloc in &allocs {
+        assert!(alloc.symbol_count >= 1);
+    }
+}
+
+// ─── PLACE-17: deterministic ────────────────────────────────────────────────
+
+#[test]
+fn compute_allocation_is_deterministic() {
+    let p = params_large(0.6);
+    let candidates: Vec<_> = (1..=8)
+        .map(|b| candidate(b, 0.1 + (b as f64) * 0.1))
+        .collect();
+    let allocs_a = compute_allocation(&candidates, &p).unwrap();
+    let allocs_b = compute_allocation(&candidates, &p).unwrap();
+    assert_eq!(allocs_a, allocs_b);
+}
+
+// ─── PLACE-15: excess redistribution is proportional ────────────────────────
+
+#[test]
+fn redistribution_excess_is_proportional() {
+    // Scenario: 4 holders where one very high-trust holder (0.99) would claim
+    // far more than max_per_holder. The excess must be distributed to the other
+    // 3 holders proportionally to their weights.
+    //
+    // Use a large block so max_per_holder is a meaningful constraint.
+    let p = params_large(0.5); // 8 MB block, overhead ~2.25x
+    let max_per = p.max_per_holder();
+
+    // H1: very high trust — will be capped
+    // H2, H3, H4: varied trust, will receive the redistributed symbols
+    let candidates = vec![
+        candidate(1, 0.99), // dominant, will hit cap
+        candidate(2, 0.6),
+        candidate(3, 0.4),
+        candidate(4, 0.2),
+    ];
+
+    let allocs = compute_allocation(&candidates, &p).unwrap();
+    assert_eq!(allocs.len(), 4);
+
+    let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
+    assert_eq!(total, p.n, "total must equal N");
+
+    // H1 must be capped at max_per_holder
+    let alloc_h1 = allocs.iter().find(|a| a.identity == identity(1)).unwrap();
+    assert_eq!(
+        alloc_h1.symbol_count, max_per,
+        "high-trust holder must be capped at max_per_holder={max_per}"
+    );
+
+    // H2 must receive more than H3, H3 more than H4 (proportional by weight)
+    let alloc_h2 = allocs.iter().find(|a| a.identity == identity(2)).unwrap();
+    let alloc_h3 = allocs.iter().find(|a| a.identity == identity(3)).unwrap();
+    let alloc_h4 = allocs.iter().find(|a| a.identity == identity(4)).unwrap();
+
+    assert!(
+        alloc_h2.symbol_count >= alloc_h3.symbol_count,
+        "h2 (trust=0.6) should get >= h3 (trust=0.4): h2={}, h3={}",
+        alloc_h2.symbol_count,
+        alloc_h3.symbol_count,
+    );
+    assert!(
+        alloc_h3.symbol_count >= alloc_h4.symbol_count,
+        "h3 (trust=0.4) should get >= h4 (trust=0.2): h3={}, h4={}",
+        alloc_h3.symbol_count,
+        alloc_h4.symbol_count,
+    );
+
+    // All uncapped holders must each receive at least 1 symbol
+    for alloc in &[alloc_h2, alloc_h3, alloc_h4] {
+        assert!(alloc.symbol_count >= 1, "every holder must have >= 1 symbol");
+    }
+}
+
+// ─── PLACE-20: five holders with varying trust all get symbols ───────────────
+
+#[test]
+fn compute_allocation_five_holders_all_get_symbols() {
+    // Five holders with trust 0.1, 0.3, 0.5, 0.7, 0.9 and N=5000.
+    // Even the lowest-trust holder must receive at least 1 symbol.
+    let p = ErasureParams {
+        k: 4000,
+        k_eff: 4003,
+        t: 65_535,
+        overhead: 1.5,
+        n: 5000,
+    };
+    let candidates = vec![
+        candidate(1, 0.1),
+        candidate(2, 0.3),
+        candidate(3, 0.5),
+        candidate(4, 0.7),
+        candidate(5, 0.9),
+    ];
+
+    let allocs = compute_allocation(&candidates, &p).unwrap();
+
+    assert_eq!(allocs.len(), 5, "all 5 holders must be allocated");
+    let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
+    assert_eq!(total, p.n, "total symbols must equal N=5000");
+
+    for alloc in &allocs {
+        assert!(
+            alloc.symbol_count >= 1,
+            "every holder must get >= 1 symbol; holder {:?} got 0",
+            alloc.identity
+        );
+    }
+
+    // Higher-trust holders must receive more symbols than lower-trust holders
+    let count = |byte: u8| {
+        allocs
+            .iter()
+            .find(|a| a.identity == identity(byte))
+            .unwrap()
+            .symbol_count
+    };
+    assert!(count(5) > count(1), "trust=0.9 must beat trust=0.1");
+    assert!(count(4) > count(2), "trust=0.7 must beat trust=0.3");
+}
+
+// ─── PROP-03/04/05/15: placement invariants across many configurations ──────
+
+#[test]
+fn placement_invariants_hold_across_configurations() {
+    // Sweep: varying holder count, trust distributions, block sizes, importance.
+    let configs: Vec<(usize, f64, u64, f64)> = vec![
+        // (num_holders, base_trust, block_size, importance)
+        (2, 0.5, 1024 * 1024, 0.5),
+        (3, 0.04, 1024 * 1024, 0.5),       // bootstrap trust
+        (5, 0.3, 8 * 1024 * 1024, 0.0),     // low importance
+        (5, 0.3, 8 * 1024 * 1024, 1.0),     // high importance
+        (10, 0.5, 32 * 1024 * 1024, 0.5),
+        (15, 0.2, 128 * 1024 * 1024, 0.6),
+        (20, 0.7, 128 * 1024 * 1024, 0.5),
+        (30, 0.1, 128 * 1024 * 1024, 0.3),  // near MAX_HOLDERS_PER_BLOCK
+        (3, 0.99, 1024 * 1024, 0.5),        // very high trust
+        (5, 0.01, 8 * 1024 * 1024, 0.5),    // very low trust
+    ];
+
+    for (num_holders, base_trust, block_size, importance) in &configs {
+        let p = ErasureParams::compute(*block_size, *importance);
+        let max_per = p.max_per_holder();
+
+        let candidates: Vec<_> = (0..*num_holders)
+            .map(|i| {
+                let trust = (base_trust + (i as f64) * 0.03).min(0.99);
+                candidate((i % 255) as u8 + 1, trust)
+            })
+            .collect();
+
+        let allocs = match compute_allocation(&candidates, &p) {
+            Ok(a) => a,
+            Err(_) => continue, // NTooSmall etc — skip degenerate combos
+        };
+
+        // PROP-03: sum = N (when enough holders to absorb all symbols)
+        let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
+        let total_capacity: u32 = allocs.len() as u32 * max_per;
+        if total_capacity >= p.n {
+            // Enough holders — sum must equal N exactly
+            assert_eq!(
+                total, p.n,
+                "PROP-03 violated: sum={total} != N={} for config ({num_holders}, {base_trust}, {block_size}, {importance})",
+                p.n
+            );
+        } else {
+            // Too few holders — sum = total_capacity (by design, concentration cap)
+            assert!(
+                total <= p.n,
+                "PROP-03: sum={total} exceeds N={}",
+                p.n
+            );
+        }
+
+        // PROP-04: max <= max_per_holder
+        for alloc in &allocs {
+            assert!(
+                alloc.symbol_count <= max_per,
+                "PROP-04 violated: {} > max_per_holder={max_per}",
+                alloc.symbol_count
+            );
+        }
+
+        // PROP-05: each holder >= 1
+        for alloc in &allocs {
+            assert!(
+                alloc.symbol_count >= 1,
+                "PROP-05 violated: holder has 0 symbols"
+            );
+        }
+
+        // PROP-15: ESI ranges disjoint and contiguous
+        let mut sorted = allocs.clone();
+        sorted.sort_by_key(|a| a.start_esi);
+        let mut next_esi = 0u32;
+        for alloc in &sorted {
+            assert_eq!(
+                alloc.start_esi, next_esi,
+                "PROP-15 violated: ESI gap at {next_esi}, got start_esi={}",
+                alloc.start_esi
+            );
+            next_esi = alloc.start_esi + alloc.symbol_count;
+        }
+        assert_eq!(next_esi, total, "PROP-15 violated: ESI range doesn't cover total");
+    }
+}
+
+// ─── PROP-10: holder_weight positive for all valid trust values ───────────────
+
+#[test]
+fn holder_weight_positive_for_valid_trust() {
+    // Sweep trust from 0.0 to 0.99 in steps of 0.01.
+    // holder_weight clamps to [0.001, 0.999] so all inputs must yield weight > 0.
+    let mut t = 0.0f64;
+    while t < 1.0 {
+        let w = holder_weight(t);
+        assert!(
+            w > 0.0,
+            "holder_weight({t:.2}) = {w} — must be > 0 for valid trust"
+        );
+        assert!(
+            w.is_finite(),
+            "holder_weight({t:.2}) = {w} — must be finite"
+        );
+        t += 0.01;
+    }
+
+    // Also test exact boundary and out-of-range values.
+    for &trust in &[0.0f64, 0.001, 0.5, 0.9, 0.99, 0.999, 1.0, 1.5] {
+        let w = holder_weight(trust);
+        assert!(w > 0.0, "holder_weight({trust}) = {w} — must be > 0");
+        assert!(w.is_finite(), "holder_weight({trust}) = {w} — must be finite");
+    }
+}

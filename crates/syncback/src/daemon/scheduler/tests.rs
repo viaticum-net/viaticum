@@ -318,6 +318,109 @@ async fn issue_due_challenges_skips_already_pending() {
     assert_eq!(entry.esi, 5, "existing pending entry esi unchanged");
 }
 
+// ─── SCHED-07: scheduler_skips_deleting_placements ───────────────────────────
+
+/// Placements with status Deleting must not be challenged.
+/// issue_due_challenges() filters to Alive|Uncertain|PresumedLost only.
+/// A Deleting placement with last_verified=None (normally always due) should
+/// never appear in the pending map.
+#[tokio::test]
+async fn scheduler_skips_deleting_placements() {
+    let db = Db::open_in_memory().expect("db open");
+    let block_id = make_block_id(50);
+    let holder_id = make_identity(51);
+
+    // Insert a Deleting placement — would be due for a challenge if not filtered.
+    let mut placement = make_placement(block_id, holder_id);
+    placement.status = PlacementStatus::Deleting;
+    placement.last_verified = None; // would normally trigger immediate challenge
+    db.upsert_placement(&placement).expect("upsert");
+
+    let pending = make_pending_challenges();
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+    };
+    let network = make_stub_network().await;
+    let scheduler = Scheduler::new(db, config, network, repair_tx, pending.clone());
+
+    scheduler.issue_due_challenges().await.expect("issue_due_challenges");
+
+    // Pending map must remain empty: Deleting placement was filtered out.
+    assert!(
+        pending.lock().await.is_empty(),
+        "Deleting placement must not generate a pending challenge"
+    );
+}
+
+// ─── SCHED-08: time_scale_divides_intervals ───────────────────────────────────
+
+/// With time_scale=N, the timeout threshold is divided by N.
+/// A challenge issued `POS_TIMEOUT_SECS / N + 1` seconds ago must be treated
+/// as timed out when time_scale=N, but the same challenge would NOT be timed
+/// out with time_scale=1 (which needs 7 days).
+#[tokio::test]
+async fn time_scale_divides_intervals() {
+    use syncback_core::constants::POS_TIMEOUT_SECS;
+
+    let db = Db::open_in_memory().expect("db open");
+    let block_id = make_block_id(60);
+    let holder_id = make_identity(61);
+
+    let mut placement = make_placement(block_id, holder_id);
+    placement.consecutive_misses = 0;
+    db.upsert_placement(&placement).expect("upsert");
+
+    let pending = make_pending_challenges();
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+
+    // time_scale = POS_TIMEOUT_SECS means threshold = 1 second.
+    // Issue challenge 5 seconds in the past.
+    let scale = POS_TIMEOUT_SECS;
+    let now = Timestamp::now();
+    let issued_at = Timestamp(now.0.saturating_sub(5));
+
+    {
+        let mut guard = pending.lock().await;
+        guard.insert(
+            (block_id, holder_id),
+            crate::daemon::scheduler::PendingChallenge {
+                source_block_id: block_id,
+                holder_id,
+                esi: 0,
+                issued_at,
+                challenge_id: [0u8; 16],
+            },
+        );
+    }
+
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: scale,
+    };
+    let network = make_stub_network().await;
+    let scheduler = Scheduler::new(db.clone(), config, network, repair_tx, pending.clone());
+
+    scheduler.check_timeouts().await.expect("check_timeouts");
+
+    // With time_scale=POS_TIMEOUT_SECS, threshold = 1 second.
+    // Challenge issued 5 seconds ago must have been processed (removed from pending).
+    assert!(
+        pending.lock().await.is_empty(),
+        "with time_scale={scale}, a 5s-old challenge should be timed out (threshold=1s)"
+    );
+
+    // Placement status updated: consecutive_misses=1 → Uncertain.
+    let updated = db
+        .get_placement(&block_id, &holder_id)
+        .expect("db read")
+        .expect("placement exists");
+    assert_eq!(updated.status, PlacementStatus::Uncertain);
+}
+
 // ─── Stub network helper ──────────────────────────────────────────────────────
 
 /// Build a real NetworkHandle bound to localhost with a dummy identity.

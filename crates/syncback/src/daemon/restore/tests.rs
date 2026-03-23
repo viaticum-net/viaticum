@@ -244,6 +244,58 @@ fn select_version_before_date_returns_none_when_all_after() {
     assert!(result.is_none());
 }
 
+// ─── REST-09: prefix_restore_finds_multiple_files ────────────────────────────
+
+/// resolve_path with trailing '/' uses list_files_with_prefix.
+/// Insert 3 FileRecords: 2 under "/data/photos/", 1 under "/data/docs/".
+/// Resolving prefix "/data/photos/" must return exactly 2 records.
+///
+/// We test the DB layer directly — the resolve_path method is private but
+/// list_files_with_prefix is the exact call it delegates to, so this is
+/// equivalent coverage without depending on internal RestoreCoordinator state.
+#[test]
+fn prefix_restore_finds_multiple_files() {
+    let db = Db::open_in_memory().unwrap();
+
+    let make_record = |path: &str, id: u64| -> FileRecord {
+        FileRecord {
+            file_id: FileId(id),
+            path: path.to_string(),
+            importance: 0.5,
+            devices: vec![],
+            versions: vec![FileVersion {
+                content_hash: [id as u8; 32],
+                source_block_id: SourceBlockId([id as u8; 32]),
+                k: 2,
+                t: 65_535,
+                created_at: Timestamp(id * 1000),
+                backed_up_at: Some(Timestamp(id * 2000)),
+            }],
+            first_seen: Timestamp(0),
+        }
+    };
+
+    db.upsert_file(&make_record("/data/photos/a.jpg", 1)).unwrap();
+    db.upsert_file(&make_record("/data/photos/b.jpg", 2)).unwrap();
+    db.upsert_file(&make_record("/data/docs/c.txt", 3)).unwrap();
+
+    let photos = db.list_files_with_prefix("/data/photos/").unwrap();
+    assert_eq!(photos.len(), 2, "prefix /data/photos/ should match 2 files");
+    let paths: Vec<&str> = photos.iter().map(|r| r.path.as_str()).collect();
+    assert!(
+        paths.contains(&"/data/photos/a.jpg"),
+        "a.jpg missing from results"
+    );
+    assert!(
+        paths.contains(&"/data/photos/b.jpg"),
+        "b.jpg missing from results"
+    );
+
+    let docs = db.list_files_with_prefix("/data/docs/").unwrap();
+    assert_eq!(docs.len(), 1, "prefix /data/docs/ should match 1 file");
+    assert_eq!(docs[0].path, "/data/docs/c.txt");
+}
+
 // ─── extract_from_pack tests ──────────────────────────────────────────────────
 
 #[test]

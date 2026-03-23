@@ -503,3 +503,218 @@ fn process_cooldowns_empty_inputs_returns_empty() {
     let actions = engine.process_cooldowns(&[], &[], &[], ts(9_999_999));
     assert!(actions.is_empty());
 }
+
+// ─── DEL-13: single device deletion cooldown starts immediately ─────────────
+
+#[test]
+fn single_device_deletion_cooldown_starts_immediately() {
+    // With only one device, deleting it triggers the cooldown right away —
+    // no waiting for other devices (there are none).
+    let engine = DeletionEngine::new();
+    let dev_a = device(1);
+    let fid = file_id(10);
+    let bid = block_id(10);
+    let holder_a = holder(20);
+
+    let deleted_at = ts(1_000_000);
+
+    let file = make_file(
+        fid,
+        vec![(dev_a, LocalState::Deleted(deleted_at))],
+        vec![make_version(bid)],
+    );
+    let block = make_block(bid, SourceBlockStatus::Active, SourceBlockType::Single);
+    let placement = make_placement(bid, holder_a, fid, PlacementStatus::Alive);
+
+    // Before owner cooldown: no actions
+    let before = ts(deleted_at.0 + OWNER_DELETE_COOLDOWN_SECS - 1);
+    let actions = engine.process_cooldowns(&[file.clone()], &[block.clone()], &[placement.clone()], before);
+    assert!(
+        actions.is_empty(),
+        "cooldown not yet elapsed — no actions expected"
+    );
+
+    // Exactly at owner cooldown expiry: SendDropNotice must be issued immediately
+    let at_expiry = ts(deleted_at.0 + OWNER_DELETE_COOLDOWN_SECS);
+    let actions = engine.process_cooldowns(&[file], &[block], &[placement], at_expiry);
+    assert!(
+        actions.contains(&DeletionAction::SendDropNotice {
+            source_block_id: bid,
+            holder_id: holder_a,
+        }),
+        "single-device file must start owner cooldown immediately upon deletion"
+    );
+}
+
+#[test]
+fn multi_device_deletion_cooldown_starts_only_when_all_deleted() {
+    // With two devices, the cooldown does NOT start until both are deleted.
+    // Contrast with single-device: the engine waits for the second device.
+    let engine = DeletionEngine::new();
+    let dev_a = device(1);
+    let dev_b = device(2);
+    let fid = file_id(11);
+    let bid = block_id(11);
+    let holder_a = holder(21);
+
+    let dev_a_deleted_at = ts(1_000_000);
+
+    // Only dev_a deleted; dev_b still Present
+    let file = make_file(
+        fid,
+        vec![
+            (dev_a, LocalState::Deleted(dev_a_deleted_at)),
+            (dev_b, LocalState::Present),
+        ],
+        vec![make_version(bid)],
+    );
+    let block = make_block(bid, SourceBlockStatus::Active, SourceBlockType::Single);
+    let placement = make_placement(bid, holder_a, fid, PlacementStatus::Alive);
+
+    // Even well after dev_a cooldown would have expired: no actions because dev_b is Present
+    let much_later = ts(dev_a_deleted_at.0 + OWNER_DELETE_COOLDOWN_SECS + 1_000_000);
+    let actions = engine.process_cooldowns(&[file], &[block], &[placement], much_later);
+    assert!(
+        actions.is_empty(),
+        "cooldown must not start until all devices are deleted"
+    );
+}
+
+// ─── DEL-11: ransomware protection ──────────────────────────────────────────
+
+#[test]
+fn ransomware_protection_no_physical_delete_before_8_weeks() {
+    // Scenario: file backed up, then ransomware deletes it 2 days later.
+    // The 8-week cooldown (4 owner + 4 holder) must protect the backup.
+    let engine = DeletionEngine::new();
+    let dev_a = device(1);
+    let fid = file_id(1);
+    let bid = block_id(1);
+    let holder_a = holder(10);
+
+    let backup_time = ts(1_000_000);
+    let ransomware_time = ts(backup_time.0 + 2 * 86_400); // 2 days later
+
+    let file = make_file(
+        fid,
+        vec![(dev_a, LocalState::Deleted(ransomware_time))],
+        vec![make_version(bid)],
+    );
+    let block = make_block(bid, SourceBlockStatus::Active, SourceBlockType::Single);
+    let placement = make_placement(bid, holder_a, fid, PlacementStatus::Alive);
+
+    // At every point before 8 weeks: no CleanupPlacement/CleanupBlock
+    let eight_weeks = OWNER_DELETE_COOLDOWN_SECS + HOLDER_DELETE_COOLDOWN_SECS;
+    for weeks in 0..8 {
+        let check_time = ts(ransomware_time.0 + weeks * 7 * 86_400);
+        let actions =
+            engine.process_cooldowns(&[file.clone()], &[block.clone()], &[placement.clone()], check_time);
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                DeletionAction::CleanupPlacement { .. } | DeletionAction::CleanupBlock { .. }
+            )),
+            "physical delete must not happen at week {weeks}"
+        );
+    }
+
+    // At exactly 8 weeks (owner cooldown + holder cooldown): physical delete happens
+    let delete_time = ts(ransomware_time.0 + eight_weeks);
+    let block_deleting = make_block(bid, SourceBlockStatus::Deleting, SourceBlockType::Single);
+    let placement_deleting = make_placement(bid, holder_a, fid, PlacementStatus::Deleting);
+    let actions =
+        engine.process_cooldowns(&[file], &[block_deleting], &[placement_deleting], delete_time);
+    assert!(
+        actions.iter().any(|a| matches!(a, DeletionAction::CleanupPlacement { .. })),
+        "physical delete should happen at 8 weeks"
+    );
+}
+
+// ─── DEL-12: cancel delete in owner cooldown reverses deletion ───────────────
+
+#[test]
+fn cancel_delete_in_owner_cooldown_reverses_deletion() {
+    // Scenario: device A deletes the file (cooldown starts), but then the
+    // delete is cancelled — device A is set back to Present (simulating
+    // CancelDelete/user restores the file before the cooldown expires).
+    // Even at a time past the original cooldown expiry, process_cooldowns
+    // must produce NO delete actions because the file has a Present device.
+    let engine = DeletionEngine::new();
+    let dev_a = device(1);
+    let fid = file_id(100);
+    let bid = block_id(100);
+    let holder_a = holder(50);
+
+    let deleted_at = ts(1_000_000);
+
+    // After CancelDelete: device is back to Present.
+    // This is what the daemon would persist after receiving a cancel signal.
+    let file_after_cancel = make_file(
+        fid,
+        vec![(dev_a, LocalState::Present)],
+        vec![make_version(bid)],
+    );
+    let block = make_block(bid, SourceBlockStatus::Active, SourceBlockType::Single);
+    let placement = make_placement(bid, holder_a, fid, PlacementStatus::Alive);
+
+    // Check at a time well after the original cooldown would have expired
+    let after_cooldown = ts(deleted_at.0 + OWNER_DELETE_COOLDOWN_SECS + 1_000_000);
+    let actions = engine.process_cooldowns(
+        &[file_after_cancel],
+        &[block],
+        &[placement],
+        after_cooldown,
+    );
+
+    assert!(
+        actions.is_empty(),
+        "after CancelDelete (device Present), no delete actions must be produced; got: {actions:?}"
+    );
+}
+
+// ─── PROP-18: process_cooldowns delete actions monotone in time ───────────────
+
+#[test]
+fn should_delete_now_monotone_in_time() {
+    // If process_cooldowns produces a SendDropNotice action at time T,
+    // it must also produce it at any time T' > T (monotone in time).
+    // We test with: file deleted at t=0, block Active, one holder Alive.
+    let engine = DeletionEngine::new();
+    let dev_a = device(1);
+    let fid = file_id(42);
+    let bid = block_id(42);
+    let holder_a = holder(42);
+
+    let file = make_file(
+        fid,
+        vec![(dev_a, LocalState::Deleted(ts(0)))],
+        vec![make_version(bid)],
+    );
+    let block = make_block(bid, SourceBlockStatus::Active, SourceBlockType::Single);
+    let placement = make_placement(bid, holder_a, fid, PlacementStatus::Alive);
+
+    // Before owner cooldown: no actions.
+    let before = ts(OWNER_DELETE_COOLDOWN_SECS - 1);
+    let actions_before = engine.process_cooldowns(&[file.clone()], &[block.clone()], &[placement.clone()], before);
+    assert!(
+        actions_before.is_empty(),
+        "expected no actions before owner cooldown, got {actions_before:?}"
+    );
+
+    // From the owner cooldown boundary onward: SendDropNotice must be present
+    // at every subsequent week-step (monotone property).
+    let week_secs = 7 * 24 * 3600_u64;
+    for extra_weeks in 0u64..6 {
+        let check_time = ts(OWNER_DELETE_COOLDOWN_SECS + extra_weeks * week_secs);
+        let actions = engine.process_cooldowns(
+            &[file.clone()],
+            &[block.clone()],
+            &[placement.clone()],
+            check_time,
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, DeletionAction::SendDropNotice { .. })),
+            "expected SendDropNotice at extra_weeks={extra_weeks}, got {actions:?}"
+        );
+    }
+}

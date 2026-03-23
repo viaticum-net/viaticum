@@ -301,6 +301,62 @@ fn file_reliability_invalid_k_eff_zero_propagates() {
     assert!(matches!(result, Err(ReliabilityError::InvalidKEff(0))));
 }
 
+// ─── REL-14: multi-block file reliability is P(block)^block_count ────────────
+
+#[test]
+fn multi_block_file_reliability_is_product_of_block_reliabilities() {
+    // For a 16-block file where each block has the same parameters,
+    // P(file) must equal P(single_block)^16.
+    // This verifies the independence assumption: all blocks must survive.
+    let alive_symbols = 15u32;
+    let k_eff = 5u32;
+    let survival_prob = 0.7_f64;
+    let block_count = 16usize;
+
+    let single_block_p = binomial_survival(alive_symbols, k_eff, survival_prob).unwrap();
+    let expected_file_p = single_block_p.powi(block_count as i32);
+
+    let blocks: Vec<(u32, u32, f64)> = std::iter::repeat((alive_symbols, k_eff, survival_prob))
+        .take(block_count)
+        .collect();
+    let file_p = file_reliability(&blocks).unwrap();
+
+    assert!(
+        (file_p - expected_file_p).abs() < 1e-9,
+        "P(file) = {file_p} must equal P(block)^{block_count} = {expected_file_p}"
+    );
+}
+
+#[test]
+fn multi_block_file_reliability_single_block_equals_block_reliability() {
+    // Special case: a 1-block file has P(file) = P(block).
+    let p = binomial_survival(15, 5, 0.7).unwrap();
+    let file_p = file_reliability(&[(15, 5, 0.7)]).unwrap();
+    assert!(
+        (file_p - p).abs() < 1e-9,
+        "1-block file: P(file)={file_p} must equal P(block)={p}"
+    );
+}
+
+#[test]
+fn multi_block_file_reliability_decreases_as_block_count_increases() {
+    // Adding more blocks to a file reduces overall reliability
+    // (more things that can independently fail).
+    let params = (15u32, 5u32, 0.9_f64);
+    let p1 = file_reliability(&[params]).unwrap();
+    let p2 = file_reliability(&[params, params]).unwrap();
+    let p8 = file_reliability(&vec![params; 8]).unwrap();
+
+    assert!(
+        p1 > p2,
+        "P(1-block file)={p1} must be > P(2-block file)={p2}"
+    );
+    assert!(
+        p2 > p8,
+        "P(2-block file)={p2} must be > P(8-block file)={p8}"
+    );
+}
+
 // ============================================================
 // Tests: per_holder_impact
 // ============================================================
@@ -514,5 +570,100 @@ fn survival_prob_round_trips_commitment() {
             "score={score_val}: sp={sp}, er={er}, sum={}",
             sp + er
         );
+    }
+}
+
+// ─── PROP-06: binomial_survival monotone with N ──────────────────────────────
+
+#[test]
+fn binomial_survival_monotone_with_n() {
+    // Fixed K=5, p=0.95. As N increases from 5 to 29 (inclusive),
+    // P(Binomial(N, p) >= K) must be non-decreasing.
+    let k = 5u32;
+    let p = 0.95_f64;
+    let mut prev = binomial_survival(k, k, p).unwrap();
+    for n in (k + 1)..30 {
+        let curr = binomial_survival(n, k, p).unwrap();
+        assert!(
+            curr >= prev - 1e-12,
+            "binomial_survival not monotone: N={} gives {curr} < N={} gives {prev}",
+            n,
+            n - 1
+        );
+        prev = curr;
+    }
+}
+
+// ─── PROP-07: binomial_survival result always in [0.0, 1.0] ─────────────────
+
+#[test]
+fn binomial_survival_in_zero_one_range() {
+    let n_values = [1u32, 5, 10, 20, 50];
+    let k_values = [1u32, 3, 5, 10];
+    let p_values = [0.0_f64, 0.5, 0.8, 0.95, 1.0];
+
+    for n in n_values {
+        for k in k_values {
+            if k > n {
+                continue;
+            }
+            for p in p_values {
+                let result = binomial_survival(n, k, p).unwrap();
+                assert!(
+                    result >= 0.0 && result <= 1.0,
+                    "binomial_survival({n}, {k}, {p}) = {result} — out of [0, 1]"
+                );
+            }
+        }
+    }
+}
+
+// ─── PROP-14: block_reliability always in [0.0, 1.0] ────────────────────────
+
+#[test]
+fn block_reliability_in_zero_one() {
+    // Sweep various BlockReliabilityInput configurations.
+    // Result must always be in [0.0, 1.0].
+    let k_eff_values = [1u32, 3, 5, 10];
+    let alive_values = [0u32, 1, 5, 10, 20];
+    let survival_values = [0.0_f64, 0.3, 0.5, 0.8, 0.95, 1.0];
+
+    for k_eff in k_eff_values {
+        for alive in alive_values {
+            for survival_prob in survival_values {
+                let input = BlockReliabilityInput {
+                    block_id: block_id(1),
+                    k_eff,
+                    holders: vec![HolderReliabilityInput {
+                        holder_id: holder_id(1),
+                        alive_symbols: alive,
+                        survival_prob,
+                    }],
+                };
+                let result = block_reliability(&input).unwrap();
+                assert!(
+                    result >= 0.0 && result <= 1.0,
+                    "block_reliability(k_eff={k_eff}, alive={alive}, p={survival_prob}) = {result} — out of [0, 1]"
+                );
+            }
+        }
+    }
+}
+
+// ─── PROP-21: binomial_survival with K > N returns 0.0 ──────────────────────
+
+#[test]
+fn binomial_survival_k_greater_than_n_returns_zero() {
+    // For K > N, it is impossible to get K successes from N trials with p in (0,1).
+    let cases = [(3u32, 5u32), (1, 2), (5, 10), (0, 1), (10, 11)];
+    for (n, k) in cases {
+        // Only test with p in (0, 1) — p=0 and p=1 are handled by edge-case logic.
+        for p in [0.3_f64, 0.5, 0.7, 0.9] {
+            let result = binomial_survival(n, k, p).unwrap();
+            assert!(
+                result == 0.0,
+                "binomial_survival({n}, {k}, {p}) = {result} — expected 0.0 for K > N"
+            );
+        }
     }
 }

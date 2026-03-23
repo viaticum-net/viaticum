@@ -1074,3 +1074,87 @@ fn watch_config_empty_uses_default_importance() {
         queued[0].importance
     );
 }
+
+// ─── BACKUP-12: large_file_processed_as_single_block ─────────────────────────
+// NOTE: This scenario is already covered by Test 12 (process_large_file_creates_single_block).
+// That test verifies: a file >= source_block_size triggers process_large_file immediately
+// and produces SourceBlockType::Single. Adding a duplicate test here adds no new coverage.
+
+// ─── BACKUP-15: same_content_two_devices_both_in_file_record ─────────────────
+
+/// When the same file path is backed up from two different devices with
+/// identical content, both devices should appear in FileRecord.devices.
+///
+/// Flow: device A triggers an Added event → FileRecord created with device A.
+/// Then device B triggers an Added event for the same path + same content.
+/// The dedup path (content already backed up) adds device B to the record.
+#[test]
+fn same_content_two_devices_both_in_file_record() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+
+    let content = b"shared content across two devices -- unique enough to not compress away";
+    let path = write_file(&files_dir, "shared.txt", content);
+
+    let device_a = DeviceId([0xAAu8; 16]);
+    let device_b = DeviceId([0xBBu8; 16]);
+
+    // Device A processes the file.
+    let config_a = BackupConfig {
+        source_block_size: SMALL_BLOCK_SIZE,
+        symbols_dir: symbols_dir.path().to_path_buf(),
+        epoch_key: [42u8; 32],
+        device_id: device_a,
+        mock_holders: test_holders(),
+        cluster_state: None,
+        network: None,
+        watch_configs: vec![],
+        time_scale: 1,
+    };
+    let mut coord_a =
+        BackupCoordinator::new(db.clone(), config_a, Arc::new(RaptorQEncoder::new()));
+    coord_a
+        .process_event(DirtyEvent {
+            path: path.clone(),
+            kind: DirtyKind::Added,
+            device_id: device_a,
+        })
+        .unwrap();
+    // Force flush so backed_up_at is set (dedup check requires backed_up_at=Some).
+    coord_a.flush_all(true).unwrap();
+
+    // Device B processes the same file with the same content.
+    let config_b = BackupConfig {
+        source_block_size: SMALL_BLOCK_SIZE,
+        symbols_dir: symbols_dir.path().to_path_buf(),
+        epoch_key: [42u8; 32],
+        device_id: device_b,
+        mock_holders: test_holders(),
+        cluster_state: None,
+        network: None,
+        watch_configs: vec![],
+        time_scale: 1,
+    };
+    let mut coord_b =
+        BackupCoordinator::new(db.clone(), config_b, Arc::new(RaptorQEncoder::new()));
+    coord_b
+        .process_event(DirtyEvent {
+            path: path.clone(),
+            kind: DirtyKind::Added,
+            device_id: device_b,
+        })
+        .unwrap();
+
+    // Both devices should be listed in the FileRecord.
+    let record = db.get_file(&path).unwrap().expect("FileRecord must exist");
+    let listed_devices: Vec<DeviceId> = record.devices.iter().map(|(d, _)| *d).collect();
+    assert!(
+        listed_devices.contains(&device_a),
+        "device A missing from FileRecord.devices: {listed_devices:?}"
+    );
+    assert!(
+        listed_devices.contains(&device_b),
+        "device B missing from FileRecord.devices: {listed_devices:?}"
+    );
+}

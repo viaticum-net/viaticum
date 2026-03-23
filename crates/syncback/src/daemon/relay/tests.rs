@@ -5,11 +5,15 @@
 
 use rand::rngs::OsRng;
 use syncback_core::constants::{MAX_BOARD_ENTRIES, MAX_BOARD_SIZE_BYTES, RELAY_TTL_SECS};
-use syncback_core::messages::{
-    build_broadcast_entry, build_directed_entry, encrypt_directed, to_cbor, BoardEntryKind,
-    StoredEntry,
+use syncback_core::cluster::{
+    issue_device_certificate, issue_revocation, verify_device_certificate, verify_revocation,
+    EpochCounter,
 };
-use syncback_core::types::{IdentityPub, Timestamp};
+use syncback_core::messages::{
+    build_broadcast_entry, build_directed_entry, encrypt_directed, from_cbor, to_cbor,
+    BoardEntryKind, RevocationBroadcast, StoredEntry,
+};
+use syncback_core::types::{DeviceId, IdentityPub, Timestamp};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
@@ -607,4 +611,171 @@ fn relay_three_hop_propagation() {
         .unwrap();
     assert_eq!(accepted_d, 0, "hop=2 entry must not be relayed further");
     assert_eq!(manager_d.stats().0, 0);
+}
+
+#[test]
+fn revocation_broadcast_propagates_through_relay() {
+    // RELAY-13: RevocationBroadcast must survive full relay round-trip:
+    // post (node A) → sync (node B) → scan → deserialize → verify.
+
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+
+    let now = Timestamp::now();
+    let future = Timestamp(now.0 + 1_000_000);
+
+    // ── 1. Build master key, device key, issue cert, issue revocation ────
+    let master_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+    let master_pub = syncback_core::cluster::master_identity(&master_key);
+
+    let device_id = DeviceId([0xABu8; 16]);
+    let device_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+    let device_pub_bytes = device_key.verifying_key().to_bytes();
+
+    let device_cert = issue_device_certificate(&master_key, device_id, device_pub_bytes, future);
+    let revocation = issue_revocation(&master_key, device_id, future, EpochCounter(1));
+
+    // ── 2. Serialize RevocationBroadcast ────────────────────────────────
+    let broadcast = RevocationBroadcast {
+        revocation: revocation.clone(),
+        device_cert: device_cert.clone(),
+    };
+    let payload = to_cbor(&broadcast).unwrap();
+
+    // ── 3. Node A posts broadcast ────────────────────────────────────────
+    let (a_signing_key, a_identity) = make_identity();
+    let config_a = RelayConfig {
+        board_path: dir_a.path().join("board.bin"),
+        identity_pub: a_identity,
+        x25519_priv: StaticSecret::random_from_rng(OsRng),
+        signing_key: a_signing_key,
+        max_entries: MAX_BOARD_ENTRIES,
+        max_size_bytes: MAX_BOARD_SIZE_BYTES,
+        prune_interval_secs: 3600,
+    };
+    let mut manager_a = RelayManager::new(config_a).unwrap();
+
+    let msg_id = [0xCCu8; 16];
+    let stored = manager_a
+        .post_broadcast("device_revocation", msg_id, payload, future)
+        .unwrap();
+    assert_eq!(stored.entry.hop, 0);
+
+    // ── 4. Node B syncs from A ───────────────────────────────────────────
+    let (b_signing_key, b_identity) = make_identity();
+    let config_b = RelayConfig {
+        board_path: dir_b.path().join("board.bin"),
+        identity_pub: b_identity,
+        x25519_priv: StaticSecret::random_from_rng(OsRng),
+        signing_key: b_signing_key,
+        max_entries: MAX_BOARD_ENTRIES,
+        max_size_bytes: MAX_BOARD_SIZE_BYTES,
+        prune_interval_secs: 3600,
+    };
+    let mut manager_b = RelayManager::new(config_b).unwrap();
+
+    let a_entries = manager_a.entries_for_sync(future);
+    assert_eq!(a_entries.len(), 1);
+
+    let accepted = manager_b
+        .process_remote_entries(&a_entries, future)
+        .unwrap();
+    assert_eq!(accepted, 1);
+    assert_eq!(manager_b.entries[0].entry.hop, 1);
+
+    // ── 5. Node B scans and delivers via channel ─────────────────────────
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(10);
+    let count = manager_b.scan_for_self(&inbound_tx, future);
+    assert_eq!(count, 1);
+
+    let msg = inbound_rx.try_recv().unwrap();
+    assert_eq!(msg.msg_type, "device_revocation");
+    assert_eq!(msg.msg_id, msg_id);
+
+    // ── 6. Deserialize payload and verify certificates ───────────────────
+    let decoded: RevocationBroadcast = from_cbor(&msg.payload).unwrap();
+
+    verify_revocation(&decoded.revocation, &master_pub).unwrap();
+    verify_device_certificate(&decoded.device_cert, &master_pub).unwrap();
+
+    assert_eq!(decoded.revocation.device_id, device_id);
+    assert_eq!(decoded.revocation.new_epoch, EpochCounter(1));
+    assert_eq!(decoded.device_cert.device_pub_key, device_pub_bytes);
+}
+
+// ─── RELAY-11: board_sync_exchange_fills_missing_entries ─────────────────────
+
+/// Bidirectional sync: node A has {E1, E2}, node B has {E2, E3}.
+/// After A syncs from B and B syncs from A, both have {E1, E2, E3}.
+#[test]
+fn board_sync_exchange_fills_missing_entries() {
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+
+    let (key_a, identity_a) = make_identity();
+    let (key_b, identity_b) = make_identity();
+    let (key_e3, identity_e3) = make_identity();
+
+    let now = Timestamp::now();
+
+    // Build E1 (authored by A), E2 (authored by E3), E3 (authored by E3).
+    let e1 = make_broadcast_entry(&key_a, identity_a, "peer_announce", [0x01u8; 16], now);
+    let e2 = make_broadcast_entry(&key_e3, identity_e3, "peer_announce", [0x02u8; 16], now);
+    let e3 = make_broadcast_entry(&key_b, identity_b, "peer_announce", [0x03u8; 16], now);
+
+    // Node A: has E1, E2.
+    let config_a = RelayConfig {
+        board_path: dir_a.path().join("board.bin"),
+        identity_pub: identity_a,
+        x25519_priv: x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng),
+        signing_key: key_a,
+        max_entries: 100,
+        max_size_bytes: 1_000_000,
+        prune_interval_secs: 3600,
+    };
+    let mut manager_a = RelayManager::new(config_a).unwrap();
+    manager_a.process_remote_entries(&[e1.clone(), e2.clone()], now).unwrap();
+    assert_eq!(manager_a.entries.len(), 2);
+
+    // Node B: has E2, E3.
+    let config_b = RelayConfig {
+        board_path: dir_b.path().join("board.bin"),
+        identity_pub: identity_b,
+        x25519_priv: x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng),
+        signing_key: key_b,
+        max_entries: 100,
+        max_size_bytes: 1_000_000,
+        prune_interval_secs: 3600,
+    };
+    let mut manager_b = RelayManager::new(config_b).unwrap();
+    manager_b.process_remote_entries(&[e2.clone(), e3.clone()], now).unwrap();
+    assert_eq!(manager_b.entries.len(), 2);
+
+    // Exchange: A syncs from B, B syncs from A.
+    let a_entries = manager_a.entries_for_sync(now);
+    let b_entries = manager_b.entries_for_sync(now);
+
+    let accepted_by_b = manager_b.process_remote_entries(&a_entries, now).unwrap();
+    let accepted_by_a = manager_a.process_remote_entries(&b_entries, now).unwrap();
+
+    // A received E3 (the only entry from B it was missing).
+    assert_eq!(accepted_by_a, 1, "A should have accepted 1 new entry from B");
+    // B received E1 (the only entry from A it was missing); E2 deduped.
+    assert_eq!(accepted_by_b, 1, "B should have accepted 1 new entry from A");
+
+    // Both now have 3 entries.
+    assert_eq!(manager_a.entries.len(), 3, "A should have E1, E2, E3");
+    assert_eq!(manager_b.entries.len(), 3, "B should have E1, E2, E3");
+
+    let a_ids: std::collections::HashSet<[u8; 16]> =
+        manager_a.entries.iter().map(|e| e.msg_id).collect();
+    let b_ids: std::collections::HashSet<[u8; 16]> =
+        manager_b.entries.iter().map(|e| e.msg_id).collect();
+
+    assert!(a_ids.contains(&[0x01u8; 16]), "A missing E1");
+    assert!(a_ids.contains(&[0x02u8; 16]), "A missing E2");
+    assert!(a_ids.contains(&[0x03u8; 16]), "A missing E3");
+    assert!(b_ids.contains(&[0x01u8; 16]), "B missing E1");
+    assert!(b_ids.contains(&[0x02u8; 16]), "B missing E2");
+    assert!(b_ids.contains(&[0x03u8; 16]), "B missing E3");
 }

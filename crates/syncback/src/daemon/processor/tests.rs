@@ -49,6 +49,24 @@ fn make_block_id(seed: u8) -> SourceBlockId {
     SourceBlockId([seed; 32])
 }
 
+fn make_peer_record(identity: IdentityPub) -> syncback_core::types::PeerRecord {
+    let now = Timestamp::now();
+    syncback_core::types::PeerRecord {
+        identity,
+        node_id: None,
+        trust_p: syncback_core::constants::INITIAL_TRUST_P,
+        trust_i: 0.0,
+        trust_s: 0.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: now,
+        last_seen: now,
+        device_id: None,
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+    }
+}
+
 async fn make_network() -> Arc<NetworkHandle> {
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let cfg = NetworkConfig {
@@ -132,6 +150,65 @@ async fn make_processor_with_quota(
     (processor, repair_rx, relay_sync_rx)
 }
 
+async fn make_processor_with_pending(
+    db: Db,
+    holdings_dir: &TempDir,
+    source_blocks_dir: &TempDir,
+    pending: crate::daemon::scheduler::PendingChallenges,
+) -> (Processor, mpsc::Receiver<RepairTrigger>, mpsc::Receiver<SyncTrigger>) {
+    let (repair_tx, repair_rx) = mpsc::channel::<RepairTrigger>(16);
+    let (relay_sync_tx, relay_sync_rx) = mpsc::channel::<SyncTrigger>(16);
+
+    let master_key = derive_master_key(&[42u8; 64]).expect("derive_master_key failed");
+    let own_identity = master_identity(&master_key);
+    let device_id = DeviceId([1u8; 16]);
+    let now = Timestamp::now();
+
+    let device_pub_key = [0u8; 32];
+    let cert = syncback_core::cluster::issue_device_certificate(
+        &master_key,
+        device_id,
+        device_pub_key,
+        now,
+    );
+    let cluster_state = ClusterState::init(db.clone(), own_identity, cert, now, now)
+        .expect("ClusterState::init failed");
+    let cluster_state = Arc::new(Mutex::new(cluster_state));
+
+    let cluster_sync = Arc::new(ClusterSyncManager::new(
+        db.clone(),
+        ClusterSyncConfig {
+            our_device_id: device_id,
+            batch_size: 1000,
+        },
+        cluster_state,
+    ));
+
+    let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
+    let network = make_network().await;
+
+    let (backup_event_tx, _backup_event_rx) =
+        tokio::sync::mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
+    let processor = Processor::new(
+        db,
+        own_identity,
+        repair_tx,
+        cluster_sync,
+        encoder,
+        holdings_dir.path().to_path_buf(),
+        source_blocks_dir.path().to_path_buf(),
+        network,
+        relay_sync_tx,
+        u64::MAX,
+        u64::MAX,
+        backup_event_tx,
+        1, // time_scale
+        pending,
+    );
+
+    (processor, repair_rx, relay_sync_rx)
+}
+
 fn make_symbol_placement(
     block_id: SourceBlockId,
     holder_id: IdentityPub,
@@ -149,6 +226,151 @@ fn make_symbol_placement(
         placed_at: Timestamp(0),
         consecutive_misses: 0,
     }
+}
+
+// ─── PROC-11: symbol_accept_updates_backup_event ─────────────────────────────
+
+/// handle_symbol_accept sends BackupEvent::SymbolAccepted to backup_event_tx.
+///
+/// The make_processor helper drops the receiver immediately. This test keeps
+/// the receiver alive to verify the channel write actually happens.
+#[tokio::test]
+async fn symbol_accept_updates_backup_event() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+
+    // Build processor manually so we can keep backup_event_rx alive.
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
+    let (relay_sync_tx, _relay_sync_rx) = mpsc::channel::<SyncTrigger>(16);
+    let master_key = derive_master_key(&[42u8; 64]).unwrap();
+    let own_identity = master_identity(&master_key);
+    let device_id = DeviceId([1u8; 16]);
+    let now = Timestamp::now();
+    let cert = syncback_core::cluster::issue_device_certificate(&master_key, device_id, [0u8; 32], now);
+    let cluster_state = ClusterState::init(db.clone(), own_identity, cert, now, now).unwrap();
+    let cluster_state = Arc::new(Mutex::new(cluster_state));
+    let cluster_sync = Arc::new(ClusterSyncManager::new(
+        db.clone(),
+        ClusterSyncConfig { our_device_id: device_id, batch_size: 1000 },
+        cluster_state,
+    ));
+    let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
+    let network = make_network().await;
+    let (backup_event_tx, mut backup_event_rx) =
+        mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
+    let pending: crate::daemon::scheduler::PendingChallenges =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let processor = Processor::new(
+        db.clone(),
+        own_identity,
+        repair_tx,
+        cluster_sync,
+        encoder,
+        holdings_dir.path().to_path_buf(),
+        source_dir.path().to_path_buf(),
+        network,
+        relay_sync_tx,
+        u64::MAX,
+        u64::MAX,
+        backup_event_tx,
+        1,
+        pending,
+    );
+
+    let holder = make_identity(7);
+    let block_id = make_block_id(7);
+
+    let accept = SymbolAcceptMsg {
+        v: 1,
+        source_block_id: block_id,
+        offer_msg_id: [0u8; 16],
+        timestamp: Timestamp::now(),
+    };
+
+    processor.handle_symbol_accept(holder, accept).await.unwrap();
+
+    let event = backup_event_rx
+        .try_recv()
+        .expect("BackupEvent::SymbolAccepted must be sent");
+    match event {
+        crate::daemon::backup::BackupEvent::SymbolAccepted {
+            holder_id,
+            source_block_id,
+        } => {
+            assert_eq!(holder_id, holder);
+            assert_eq!(source_block_id, block_id);
+        }
+        other => panic!("expected SymbolAccepted, got {other:?}"),
+    }
+}
+
+// ─── PROC-12: symbol_reject_does_not_create_placement ────────────────────────
+
+/// handle_symbol_reject sends BackupEvent::SymbolRejected but creates no
+/// placement. The DB must not contain any placement for (block_id, holder_id).
+#[tokio::test]
+async fn symbol_reject_does_not_create_placement() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let holder = make_identity(8);
+    let block_id = make_block_id(8);
+
+    // No placement inserted — call the reject handler.
+    let reject = SymbolRejectMsg {
+        v: 1,
+        source_block_id: block_id,
+        offer_msg_id: [0u8; 16],
+        reason: syncback_core::messages::RejectReason::QuotaFull,
+        timestamp: Timestamp::now(),
+    };
+    processor
+        .handle_symbol_reject(holder, reject)
+        .await
+        .unwrap();
+
+    // No placement must exist.
+    let placement = db.get_placement(&block_id, &holder).unwrap();
+    assert!(
+        placement.is_none(),
+        "handle_symbol_reject must not create a placement"
+    );
+}
+
+// ─── BACKUP-17: symbol_offer_reject_quota_full_no_placement ──────────────────
+
+/// decide_symbol_offer returns false (reject) when both soft and hard quotas
+/// are 1 byte. No holding or placement must exist in DB after the call.
+#[tokio::test]
+async fn symbol_offer_reject_quota_full_no_placement() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    // Quota of 1 byte: any offer will be rejected.
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor_with_quota(db.clone(), &holdings_dir, &source_dir, 1, 1).await;
+
+    let offer_bytes: u64 = 10 * 65_535; // ~640 KB
+    let accept = processor
+        .decide_symbol_offer(offer_bytes)
+        .expect("decide_symbol_offer failed");
+    assert!(!accept, "should reject when quota is 1 byte");
+
+    // No holding or placement was created.
+    let all_holdings = db.list_all_holdings().unwrap();
+    let all_placements = db.list_all_placements().unwrap();
+    assert!(
+        all_holdings.is_empty(),
+        "no holdings should exist after a quota-full reject"
+    );
+    assert!(
+        all_placements.is_empty(),
+        "no placements should exist after a quota-full reject"
+    );
 }
 
 // ─── esi_list_to_ranges / ranges_to_esi_list ──────────────────────────────────
@@ -1344,4 +1566,246 @@ async fn handle_peer_discovery_response_logs_without_error() {
 
     // Should complete without panic.
     processor.handle_peer_discovery_response(peer, resp).await;
+}
+
+// ─── handle_pos_response ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn handle_pos_response_pass_records_trust_and_updates_placement() {
+    use std::collections::HashMap;
+    use syncback_core::constants::INITIAL_TRUST_P;
+    use syncback_core::erasure::ErasureEncoder;
+    use syncback_core::messages::PosResponseMsg;
+    use syncback_core::pos::VerifyOutcome;
+    use syncback_core::types::{ErasureParams, SourceBlockRecord, SourceBlockStatus, SourceBlockType};
+
+    use super::current_week_number_scaled;
+    use crate::daemon::scheduler::{PendingChallenge, PendingChallenges};
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+
+    let holder_id = make_identity(10);
+    let block_id = make_block_id(20);
+    let challenge_id = [0xAAu8; 16];
+
+    // Build pending challenges map with one entry.
+    let pending_map: HashMap<_, _> = [(
+        (block_id, holder_id),
+        PendingChallenge {
+            source_block_id: block_id,
+            holder_id,
+            esi: 0,
+            issued_at: Timestamp::now(),
+            challenge_id,
+        },
+    )]
+    .into_iter()
+    .collect();
+    let pending: PendingChallenges =
+        std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
+
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor_with_pending(db.clone(), &holdings_dir, &source_dir, pending).await;
+
+    // Insert PeerRecord with initial trust.
+    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
+
+    // Use legacy erasure params (n=None, overhead=None → ErasureParams::compute(65535, 0.0)).
+    let params = ErasureParams::compute(65_535, 0.0);
+
+    // Insert SourceBlockRecord.
+    db.upsert_source_block(&SourceBlockRecord {
+        block_id,
+        k: 1,
+        t: 65_535,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp::now(),
+        encrypted_size: Some(65_535),
+        n: None,
+        overhead: None,
+    })
+    .unwrap();
+
+    // Insert Alive placement covering ESI 0.
+    let placement = make_symbol_placement(block_id, holder_id, vec![(0, 1)], PlacementStatus::Alive);
+    db.upsert_placement(&placement).unwrap();
+
+    // Write source block file (exactly k*t = 65535 bytes).
+    let source_data: Vec<u8> = (0u8..=255).cycle().take(65_535).collect();
+    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let block_src_dir = source_dir.path().join(&block_hex);
+    std::fs::create_dir_all(&block_src_dir).unwrap();
+    std::fs::write(block_src_dir.join("block.bin"), &source_data).unwrap();
+
+    // Encode the valid bound symbol.
+    let encoder = syncback_core::erasure::RaptorQEncoder::new();
+    let symbols = encoder
+        .encode(&source_data, &params, 0, 1, &block_id, &holder_id)
+        .expect("encode failed");
+    let bound_data = symbols[0].data.clone();
+
+    let response = PosResponseMsg {
+        v: 1,
+        challenge_id,
+        esi: 0,
+        data: bound_data,
+        timestamp: Timestamp::now(),
+    };
+
+    let outcome = processor
+        .handle_pos_response(holder_id, response)
+        .await
+        .expect("handle_pos_response failed");
+
+    assert_eq!(outcome, VerifyOutcome::Pass, "outcome must be Pass");
+
+    // Placement last_verified is set.
+    let updated_placement = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
+    assert!(
+        updated_placement.last_verified.is_some(),
+        "last_verified must be Some after Pass"
+    );
+
+    // PoS weekly: challenged=1, passed=1.
+    let week = current_week_number_scaled(1);
+    let weekly = db.get_pos_weekly(&holder_id, week).unwrap();
+    assert!(weekly.is_some(), "pos_weekly entry must exist");
+    let weekly = weekly.unwrap();
+    assert_eq!(weekly.challenged, 1, "challenged must be 1");
+    assert_eq!(weekly.passed, 1, "passed must be 1");
+
+    // Trust P must have been recalculated upward.
+    let peer = db.get_peer(&holder_id).unwrap().unwrap();
+    assert!(
+        peer.trust_p > INITIAL_TRUST_P,
+        "trust_p={} must exceed INITIAL_TRUST_P={} after Pass",
+        peer.trust_p,
+        INITIAL_TRUST_P,
+    );
+}
+
+#[tokio::test]
+async fn handle_pos_response_fail_marks_lost_and_triggers_repair() {
+    use std::collections::HashMap;
+    use syncback_core::erasure::ErasureEncoder;
+    use syncback_core::messages::PosResponseMsg;
+    use syncback_core::pos::VerifyOutcome;
+    use syncback_core::types::{ErasureParams, SourceBlockRecord, SourceBlockStatus, SourceBlockType};
+
+    use crate::daemon::repair::RepairTrigger;
+    use crate::daemon::scheduler::{PendingChallenge, PendingChallenges};
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+
+    let holder_id = make_identity(11);
+    let block_id = make_block_id(21);
+    let challenge_id = [0xBBu8; 16];
+
+    let pending_map: HashMap<_, _> = [(
+        (block_id, holder_id),
+        PendingChallenge {
+            source_block_id: block_id,
+            holder_id,
+            esi: 0,
+            issued_at: Timestamp::now(),
+            challenge_id,
+        },
+    )]
+    .into_iter()
+    .collect();
+    let pending: PendingChallenges =
+        std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
+
+    let (processor, mut repair_rx, _relay_rx) =
+        make_processor_with_pending(db.clone(), &holdings_dir, &source_dir, pending).await;
+
+    // Insert PeerRecord.
+    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
+
+    let params = ErasureParams::compute(65_535, 0.0);
+
+    db.upsert_source_block(&SourceBlockRecord {
+        block_id,
+        k: 1,
+        t: 65_535,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp::now(),
+        encrypted_size: Some(65_535),
+        n: None,
+        overhead: None,
+    })
+    .unwrap();
+
+    let placement = make_symbol_placement(block_id, holder_id, vec![(0, 1)], PlacementStatus::Alive);
+    db.upsert_placement(&placement).unwrap();
+
+    let source_data: Vec<u8> = (0u8..=255).cycle().take(65_535).collect();
+    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let block_src_dir = source_dir.path().join(&block_hex);
+    std::fs::create_dir_all(&block_src_dir).unwrap();
+    std::fs::write(block_src_dir.join("block.bin"), &source_data).unwrap();
+
+    // Encode valid symbol then corrupt it.
+    let encoder = syncback_core::erasure::RaptorQEncoder::new();
+    let symbols = encoder
+        .encode(&source_data, &params, 0, 1, &block_id, &holder_id)
+        .expect("encode failed");
+    let mut corrupt_data = symbols[0].data.clone();
+    corrupt_data[0] ^= 0xFF;
+
+    let response = PosResponseMsg {
+        v: 1,
+        challenge_id,
+        esi: 0,
+        data: corrupt_data,
+        timestamp: Timestamp::now(),
+    };
+
+    let outcome = processor
+        .handle_pos_response(holder_id, response)
+        .await
+        .expect("handle_pos_response failed");
+
+    assert!(
+        matches!(outcome, VerifyOutcome::Fail { esi: 0 }),
+        "outcome must be Fail{{esi:0}}, got {outcome:?}"
+    );
+
+    // Placement must be Lost.
+    let updated_placement = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
+    assert_eq!(
+        updated_placement.status,
+        PlacementStatus::Lost,
+        "placement must be Lost after Fail"
+    );
+
+    // PoS weekly: challenged=1, passed=0.
+    use super::current_week_number_scaled;
+    let week = current_week_number_scaled(1);
+    let weekly = db.get_pos_weekly(&holder_id, week).unwrap();
+    assert!(weekly.is_some(), "pos_weekly entry must exist");
+    let weekly = weekly.unwrap();
+    assert_eq!(weekly.challenged, 1, "challenged must be 1");
+    assert_eq!(weekly.passed, 0, "passed must be 0");
+
+    // Repair trigger must be sent.
+    let trigger = repair_rx
+        .try_recv()
+        .expect("RepairTrigger must be sent after Fail");
+    match trigger {
+        RepairTrigger::RepairNow {
+            block_id: bid,
+            holder_id: hid,
+        } => {
+            assert_eq!(bid, block_id, "RepairNow block_id mismatch");
+            assert_eq!(hid, holder_id, "RepairNow holder_id mismatch");
+        }
+        other => panic!("expected RepairNow, got {other:?}"),
+    }
 }

@@ -520,6 +520,48 @@ fn budget_singleton() {
     assert_eq!(got.weekly_stats.len(), 2);
 }
 
+// ─── BUDGET-08: set_budget updates — does not duplicate ──────────────────────
+
+#[test]
+fn budget_upsert_updates_not_duplicates() {
+    // Call set_budget twice with different values. The second call must overwrite
+    // the first — there must be exactly one record and it must have the new values.
+    let db = test_db();
+
+    let first = BudgetRecord {
+        estimated_gb: 5.0,
+        last_calculated: Timestamp(1000),
+        placement_success_rate: 0.7,
+        weekly_stats: vec![(10, 7)],
+    };
+    db.set_budget(&first).unwrap();
+
+    let second = BudgetRecord {
+        estimated_gb: 99.5,
+        last_calculated: Timestamp(2000),
+        placement_success_rate: 0.9,
+        weekly_stats: vec![(20, 18), (30, 27)],
+    };
+    db.set_budget(&second).unwrap();
+
+    // Only one record must exist and it must have the second call's values.
+    let got = db.get_budget().unwrap().unwrap();
+    assert!(
+        (got.estimated_gb - 99.5).abs() < f64::EPSILON,
+        "estimated_gb must be updated to 99.5, got {}",
+        got.estimated_gb
+    );
+    assert_eq!(got.last_calculated, Timestamp(2000));
+    assert_eq!(
+        got.weekly_stats.len(),
+        2,
+        "weekly_stats must have 2 entries (from second record), got {}",
+        got.weekly_stats.len()
+    );
+    assert_eq!(got.weekly_stats[0], (20, 18));
+    assert_eq!(got.weekly_stats[1], (30, 27));
+}
+
 // ============================================================
 // Extra: non-alive placements don't count in hot.blocks
 // ============================================================
@@ -653,6 +695,54 @@ fn db_integrity_check_passes() {
     assert!(db.list_all_files().unwrap().is_empty());
 }
 
+// ─── DB-13: crash recovery (pre-open backup) ───────────────────────────────
+
+#[test]
+fn db_crash_recovery_backup_preserves_data() {
+    // Scenario: DB has data, then gets corrupted.
+    // Verify that .redb.bak was created before corruption and contains the data.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("crash.redb");
+
+    // 1. Create DB with data
+    {
+        let db = crate::db::Db::open(&path).unwrap();
+        let file = FileRecord {
+            file_id: FileId(999),
+            path: "/crash/test.bin".to_string(),
+            importance: 0.5,
+            devices: vec![],
+            versions: vec![],
+            first_seen: Timestamp(100),
+        };
+        db.upsert_file(&file).unwrap();
+        drop(db);
+    }
+
+    // 2. Reopen (creates .bak from good DB)
+    {
+        let db = crate::db::Db::open(&path).unwrap();
+        let files = db.list_all_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_id, FileId(999));
+        drop(db);
+    }
+
+    // 3. Verify .bak exists and is a valid DB
+    let bak = path.with_extension("redb.bak");
+    assert!(bak.exists());
+
+    // 4. Corrupt the main DB
+    std::fs::write(&path, b"CORRUPTED GARBAGE DATA").unwrap();
+
+    // 5. Main DB is now unrecoverable, but .bak has our data
+    // Open .bak directly to verify data is preserved
+    let bak_db = crate::db::Db::open(&bak).unwrap();
+    let files = bak_db.list_all_files().unwrap();
+    assert_eq!(files.len(), 1, ".bak must contain the pre-corruption data");
+    assert_eq!(files[0].file_id, FileId(999));
+}
+
 // ============================================================
 // System state blobs
 // ============================================================
@@ -741,4 +831,66 @@ fn table_stats_counts_rows() {
     db.upsert_peer(&peer).unwrap();
     let stats = db.table_stats().unwrap();
     assert_eq!(stats.peers, 1);
+}
+
+// ============================================================
+// DB-11: placement_upsert_updates_holder_indexes
+// ============================================================
+
+#[test]
+fn placement_upsert_updates_holder_indexes() {
+    // After upsert_placement, both the file_holders and holder_files indexes
+    // must reflect the new placement so that list_holders_for_file and
+    // list_files_for_holder return the correct entries.
+    let db = test_db();
+
+    let holder_a = IdentityPub([0xAAu8; 32]);
+    let holder_b = IdentityPub([0xBBu8; 32]);
+    let file_id_1 = FileId(1001);
+    let file_id_2 = FileId(1002);
+
+    // holder_a holds symbols for two different files.
+    let p_a1 = make_placement(0xA1, holder_a, file_id_1, PlacementStatus::Alive, 10);
+    let p_a2 = make_placement(0xA2, holder_a, file_id_2, PlacementStatus::Alive, 20);
+    // holder_b holds symbols for file_id_1 only.
+    let p_b1 = make_placement(0xB1, holder_b, file_id_1, PlacementStatus::Alive, 5);
+
+    db.upsert_placement(&p_a1).unwrap();
+    db.upsert_placement(&p_a2).unwrap();
+    db.upsert_placement(&p_b1).unwrap();
+
+    // file_holders index: file_id_1 must list both holder_a and holder_b.
+    let holders_1 = db.list_holders_for_file(file_id_1).unwrap();
+    assert!(
+        holders_1.contains(&holder_a),
+        "file_id_1 should have holder_a in file_holders index"
+    );
+    assert!(
+        holders_1.contains(&holder_b),
+        "file_id_1 should have holder_b in file_holders index"
+    );
+
+    // file_holders index: file_id_2 must list only holder_a.
+    let holders_2 = db.list_holders_for_file(file_id_2).unwrap();
+    assert_eq!(holders_2, vec![holder_a], "file_id_2 should list only holder_a");
+
+    // holder_files index: holder_a must list both file_id_1 and file_id_2.
+    let files_a = db.list_files_for_holder(&holder_a).unwrap();
+    assert!(files_a.contains(&file_id_1), "holder_a should list file_id_1");
+    assert!(files_a.contains(&file_id_2), "holder_a should list file_id_2");
+
+    // holder_files index: holder_b must list only file_id_1.
+    let files_b = db.list_files_for_holder(&holder_b).unwrap();
+    assert_eq!(files_b, vec![file_id_1], "holder_b should list only file_id_1");
+
+    // After upsert with updated symbol_count (re-insert), indexes must remain consistent.
+    let mut p_a1_updated = p_a1.clone();
+    p_a1_updated.esi_ranges = vec![(0, 15)]; // symbol_count changed from 10 to 15
+    db.upsert_placement(&p_a1_updated).unwrap();
+
+    let holders_1_after = db.list_holders_for_file(file_id_1).unwrap();
+    assert!(
+        holders_1_after.contains(&holder_a),
+        "holder_a must still appear in file_holders after re-upsert"
+    );
 }

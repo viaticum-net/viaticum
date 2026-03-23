@@ -5,6 +5,7 @@ mod cluster_state_tests {
         master_identity, ClusterState, ClusterStateError, EpochCounter,
     };
     use crate::db::Db;
+    use crate::messages::{build_handshake, extract_cluster_identity, verify_handshake};
     use crate::types::{
         DeviceId, EventEntry, Event, FileId, FileRecord, FileVersion, IdentityPub,
         LocalState, SourceBlockId, Timestamp,
@@ -480,6 +481,54 @@ mod cluster_state_tests {
 
         let seq = state.local_last_seq().unwrap();
         assert_eq!(seq, 3);
+    }
+
+    // CLUSTER-14: handshake crypto passes but state-level revocation check catches it
+    #[test]
+    fn handshake_with_revoked_device_cert_detected() {
+        // Step 1: generate master key pair
+        let master_key = derive_master_key(&SEED).unwrap();
+        let master_pub = master_identity(&master_key);
+
+        // Step 2: generate device key pair
+        let device_id = DeviceId(DEVICE_ID_BYTES);
+        let device_key = derive_device_key(&SEED, &device_id).unwrap();
+        let device_pub = device_key.verifying_key().to_bytes();
+
+        // Step 3: issue device certificate
+        let cert = issue_device_certificate(&master_key, device_id, device_pub, NOW);
+
+        // Step 4: build handshake — identity_pub = device pub key, signed with device key
+        // device_cert.device_pub_key must match identity_pub (enforced by extract_cluster_identity)
+        let device_identity_pub = IdentityPub(device_pub);
+        let hs = build_handshake(device_identity_pub, NOW, &device_key, Some(cert.clone()));
+
+        // Step 5: verify_handshake passes (signature is valid, timestamp is fresh)
+        assert!(verify_handshake(&hs, NOW).is_ok(), "handshake sig must be valid");
+
+        // Step 6: extract_cluster_identity passes (cert sig is valid)
+        let extracted = extract_cluster_identity(&hs).unwrap();
+        assert_eq!(extracted, Some(master_pub), "cluster identity must resolve to master pub");
+
+        // Step 7: issue revocation for the device
+        let rev = issue_revocation(&master_key, device_id, NOW, EpochCounter(1));
+
+        // Step 8: create ClusterState with a second device so revoking device_id is possible
+        // (revoke_device requires at least one active device to remain — but actually the API
+        //  does not enforce that, so we can have a single-device cluster and revoke it)
+        let db = Db::open_in_memory().unwrap();
+        let mut state = ClusterState::init(db, master_pub, cert, NOW, NOW).unwrap();
+        state.revoke_device(rev, NOW, NOW).unwrap();
+
+        // Step 9: the state-level check must catch the revoked device
+        assert!(
+            state.is_device_revoked(&device_id),
+            "device must be marked revoked in ClusterState"
+        );
+
+        // Summary: crypto verification (steps 5-6) passed because the cert signature is still
+        // cryptographically valid. The two-layer model requires the caller to also check
+        // ClusterState::is_device_revoked() after extract_cluster_identity succeeds.
     }
 }
 

@@ -490,6 +490,89 @@ fn evaluate_pressure_hard_quota_zero_disables_floor() {
     assert_eq!(result.freed_bytes, gib(15));
 }
 
+// ─── BUDGET-07: eviction removes lowest priority first ───────────────────────
+
+#[test]
+fn eviction_removes_lowest_priority_first() {
+    // quota=100 GiB, used=97 GiB → Hard, deficit=12 GiB.
+    // Three holdings with clearly distinct priorities.
+    // Eviction should consume from lowest-priority first until deficit is covered.
+    let now_secs = 0u64;
+
+    let holdings = vec![
+        // H_low: importance=0.1, trust=0.2 → priority=0.02, 8 GiB
+        make_holding(
+            [10u8; 32],
+            [1u8; 32],
+            0.1,
+            gib(8),
+            HoldingStatus::Active,
+            Timestamp(now_secs),
+        ),
+        // H_mid: importance=0.5, trust=0.5 → priority=0.25, 8 GiB
+        make_holding(
+            [20u8; 32],
+            [2u8; 32],
+            0.5,
+            gib(8),
+            HoldingStatus::Active,
+            Timestamp(now_secs),
+        ),
+        // H_high: importance=0.9, trust=0.9 → priority=0.81, 8 GiB
+        make_holding(
+            [30u8; 32],
+            [3u8; 32],
+            0.9,
+            gib(8),
+            HoldingStatus::Active,
+            Timestamp(now_secs),
+        ),
+    ];
+
+    let trust_fn = |id: &IdentityPub| -> f64 {
+        if id.0 == [1u8; 32] {
+            0.2
+        } else if id.0 == [2u8; 32] {
+            0.5
+        } else {
+            0.9
+        }
+    };
+
+    // quota=100 GiB, used=97 GiB → free_ratio=0.03 → Hard
+    // deficit = 0.15*100 - 3 = 12 GiB
+    // H_low (8 GiB) + H_mid (8 GiB) = 16 GiB ≥ 12 → both evicted, H_high spared
+    let result = evaluate_pressure(gib(100), 0, gib(97), &holdings, trust_fn, now_secs);
+    assert_eq!(result.pressure, DiskPressure::Hard);
+
+    // H_low must be first (lowest priority evicted first)
+    assert!(
+        !result.immediate_evictions.is_empty(),
+        "expected evictions"
+    );
+    assert_eq!(
+        result.immediate_evictions[0].source_block_id,
+        SourceBlockId([10u8; 32]),
+        "H_low must be evicted first"
+    );
+
+    // H_high must NOT be among evictions (sufficient freed without it)
+    let high_evicted = result
+        .immediate_evictions
+        .iter()
+        .any(|e| e.source_block_id == SourceBlockId([30u8; 32]));
+    assert!(
+        !high_evicted,
+        "H_high (highest priority) must be spared if lower-priority holdings cover the deficit"
+    );
+
+    assert!(
+        result.freed_bytes >= gib(12),
+        "freed_bytes={} must cover the 12 GiB deficit",
+        result.freed_bytes
+    );
+}
+
 #[test]
 fn should_reject_offers_with_effective_quota() {
     // soft_quota=80 GiB, disk_free=50 GiB, reserve=20 GiB

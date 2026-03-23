@@ -288,6 +288,74 @@ fn flag_for_proactive_repair_empty_input() {
     assert!(flagged.is_empty());
 }
 
+// ─── COMMIT-08: drop notice significantly lowers commitment score ─────────────
+
+#[test]
+fn holder_with_recent_drop_notice_scores_lower() {
+    // A holder that recently sent a drop notice is about to evict our data.
+    // Their commitment score must be significantly lower than an otherwise
+    // identical holder who has not sent a drop notice.
+    let base_profile = HolderProfile {
+        holder_id: peer(10),
+        recent_challenges: 10,
+        recent_passes: 9,
+        consecutive_misses: 0,
+        offers_rejected_recently: false,
+        drop_notice_sent_recently: false, // no drop notice
+        our_eviction_priority: 0.8,
+        max_known_eviction_priority: 1.0,
+        first_seen: ts(NOW - 20 * SECS_PER_WEEK),
+        now: ts(NOW),
+    };
+
+    let mut drop_notice_profile = base_profile.clone();
+    drop_notice_profile.drop_notice_sent_recently = true;
+
+    let score_normal = compute_commitment(&base_profile).unwrap();
+    let score_drop_notice = compute_commitment(&drop_notice_profile).unwrap();
+
+    assert!(
+        score_drop_notice.value() < score_normal.value(),
+        "drop notice holder must score lower: drop_notice={}, normal={}",
+        score_drop_notice.value(),
+        score_normal.value(),
+    );
+
+    // The drop notice penalty (0.4 on pressure_component * COMMITMENT_PRESSURE_WEIGHT)
+    // must cause a meaningful decrease — at least 0.05 in the final score.
+    let delta = score_normal.value() - score_drop_notice.value();
+    assert!(
+        delta >= 0.05,
+        "drop notice must cause a significant score drop (delta={delta:.4})"
+    );
+}
+
+#[test]
+fn holder_with_drop_notice_and_rejections_scores_at_risk() {
+    // A holder with both drop_notice AND offers_rejected is under severe pressure.
+    // pressure_component = 1.0 - 0.5 - 0.4 = 0.1. Combined score should be very low.
+    let profile = HolderProfile {
+        holder_id: peer(11),
+        recent_challenges: 5,
+        recent_passes: 0, // also failing PoS
+        consecutive_misses: 0,
+        offers_rejected_recently: true,
+        drop_notice_sent_recently: true,
+        our_eviction_priority: 0.1,
+        max_known_eviction_priority: 1.0,
+        first_seen: ts(NOW - SECS_PER_WEEK),
+        now: ts(NOW),
+    };
+
+    let score = compute_commitment(&profile).unwrap();
+    assert!(
+        score.value() < 0.20,
+        "holder with drop notice + rejected offers + 0% pass rate must be AtRisk, got {}",
+        score.value()
+    );
+    assert_eq!(score.tier(), CommitmentTier::AtRisk);
+}
+
 // --- CommitmentScore tier boundary tests ---
 
 #[test]
@@ -301,4 +369,89 @@ fn commitment_score_tier_boundaries() {
     // Low/AtRisk boundary at 0.20
     assert_eq!(CommitmentScore(0.19).tier(), CommitmentTier::AtRisk);
     assert_eq!(CommitmentScore(0.20).tier(), CommitmentTier::Low);
+}
+
+// ─── PROP-19: commitment score always in [0.0, 1.0] ─────────────────────────
+
+#[test]
+fn commitment_score_in_zero_one() {
+    // Sweep a range of HolderProfile inputs. For all valid inputs,
+    // compute_commitment must return a score in [0.0, 1.0].
+    let profiles: Vec<HolderProfile> = vec![
+        // All zeros / minimum values.
+        HolderProfile {
+            holder_id: peer(1),
+            recent_challenges: 0,
+            recent_passes: 0,
+            consecutive_misses: 0,
+            offers_rejected_recently: false,
+            drop_notice_sent_recently: false,
+            our_eviction_priority: 0.0,
+            max_known_eviction_priority: 0.0,
+            first_seen: ts(NOW),
+            now: ts(NOW),
+        },
+        // Maximum stress: everything bad.
+        HolderProfile {
+            holder_id: peer(2),
+            recent_challenges: 100,
+            recent_passes: 0,
+            consecutive_misses: 10,
+            offers_rejected_recently: true,
+            drop_notice_sent_recently: true,
+            our_eviction_priority: 0.0,
+            max_known_eviction_priority: 1.0,
+            first_seen: ts(NOW),
+            now: ts(NOW),
+        },
+        // Maximum confidence: everything perfect.
+        HolderProfile {
+            holder_id: peer(3),
+            recent_challenges: 50,
+            recent_passes: 50,
+            consecutive_misses: 0,
+            offers_rejected_recently: false,
+            drop_notice_sent_recently: false,
+            our_eviction_priority: 1.0,
+            max_known_eviction_priority: 1.0,
+            first_seen: ts(NOW - 52 * SECS_PER_WEEK),
+            now: ts(NOW),
+        },
+        // Partial signals.
+        HolderProfile {
+            holder_id: peer(4),
+            recent_challenges: 3,
+            recent_passes: 2,
+            consecutive_misses: 1,
+            offers_rejected_recently: true,
+            drop_notice_sent_recently: false,
+            our_eviction_priority: 0.5,
+            max_known_eviction_priority: 1.0,
+            first_seen: ts(NOW - 10 * SECS_PER_WEEK),
+            now: ts(NOW),
+        },
+        // Very high priority relative to max.
+        HolderProfile {
+            holder_id: peer(5),
+            recent_challenges: 20,
+            recent_passes: 15,
+            consecutive_misses: 0,
+            offers_rejected_recently: false,
+            drop_notice_sent_recently: false,
+            our_eviction_priority: 2.0, // above max — clamped to 1.0
+            max_known_eviction_priority: 1.0,
+            first_seen: ts(NOW - 26 * SECS_PER_WEEK),
+            now: ts(NOW),
+        },
+    ];
+
+    for profile in &profiles {
+        let score = compute_commitment(profile).expect("compute_commitment must not fail for valid profile");
+        let v = score.value();
+        assert!(
+            v >= 0.0 && v <= 1.0,
+            "commitment score must be in [0.0, 1.0], got {v} for holder {:?}",
+            profile.holder_id
+        );
+    }
 }

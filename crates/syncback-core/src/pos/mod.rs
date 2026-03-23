@@ -261,13 +261,20 @@ pub fn is_timed_out(challenge: &PosChallenge, now: Timestamp) -> bool {
 /// ready to pass to TrustEngine::record_pos_result.
 ///
 /// Each call represents one challenge that was either passed, failed, or timed out.
-/// Timeout and NotHeld count as challenged-but-not-passed events (challenged=1, passed=0).
-/// NotHeld counts as challenged=1, passed=0 (same as Fail — holder no longer holds data).
+/// Timeout and Fail count as challenged-but-not-passed events (challenged=1, passed=0).
+/// NotHeld is trust-neutral (challenged=0, passed=0) — holder honestly reported missing
+/// symbol, penalizing would remove incentive to send PosNack vs. staying silent.
+/// Placement transition to Lost + repair is handled separately by apply_pos_outcome.
 ///
 /// week_number: monotonically increasing protocol week number (caller tracks this).
 pub fn outcome_from_verify(result: &VerifyOutcome, week_number: u32) -> PosOutcome {
-    // CannotVerify: owner cannot verify, so no challenge is recorded at all.
-    if matches!(result, VerifyOutcome::CannotVerify) {
+    // CannotVerify / NotHeld: no trust event recorded.
+    // CannotVerify = owner can't verify (missing source block).
+    // NotHeld = holder honestly says "I don't have it" — trust-neutral per protocol.
+    if matches!(
+        result,
+        VerifyOutcome::CannotVerify | VerifyOutcome::NotHeld { .. }
+    ) {
         return PosOutcome {
             week_number,
             challenged: 0,
@@ -277,10 +284,10 @@ pub fn outcome_from_verify(result: &VerifyOutcome, week_number: u32) -> PosOutco
 
     let passed = match result {
         VerifyOutcome::Pass => 1,
-        VerifyOutcome::Fail { .. }
-        | VerifyOutcome::Timeout
-        | VerifyOutcome::NotHeld { .. } => 0,
-        VerifyOutcome::CannotVerify => unreachable!("handled above"),
+        VerifyOutcome::Fail { .. } | VerifyOutcome::Timeout => 0,
+        VerifyOutcome::CannotVerify | VerifyOutcome::NotHeld { .. } => {
+            unreachable!("handled above")
+        }
     };
     PosOutcome {
         week_number,
