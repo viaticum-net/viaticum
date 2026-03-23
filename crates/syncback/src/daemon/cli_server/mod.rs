@@ -304,7 +304,8 @@ pub(crate) fn dispatch_status(state: &DaemonState) -> CliResponse {
         }
     }
 
-    let node_identity = hex_encode(&state.identity_pub.0);
+    // Use network identity (device key) — this is what peers see in handshakes.
+    let node_identity = hex_encode(&state.network.identity_pub.0);
 
     let node_addr = crate::daemon::network::addr::resolve_local_addr(&state.network);
 

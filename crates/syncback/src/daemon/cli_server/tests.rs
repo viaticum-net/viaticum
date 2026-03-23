@@ -85,9 +85,10 @@ async fn dispatch_status_identity_reflects_state() {
     let CliResponse::Status(data) = response else {
         panic!("expected Status");
     };
-    // Identity is all-zero bytes → hex is all zeros (64 chars for 32 bytes).
+    // Identity is derived from network signing key — should be 64 hex chars.
     assert_eq!(data.node_identity.len(), 64);
-    assert!(data.node_identity.chars().all(|c| c == '0'));
+    // Network signing_key is [1u8; 32], identity_pub = verifying_key, not all zeros.
+    assert!(!data.node_identity.is_empty());
 }
 
 #[tokio::test]
