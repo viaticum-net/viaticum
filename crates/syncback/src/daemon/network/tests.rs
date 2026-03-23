@@ -36,6 +36,7 @@ fn make_node(seed_byte: u8) -> (IdentityPub, NetworkConfig) {
     );
     let config = NetworkConfig {
         signing_key: device_key,
+        master_identity: master_pub,
         known_peers: HashMap::new(),
         device_cert: Some(cert),
         iroh_secret_key: None,
@@ -354,6 +355,7 @@ async fn handshake_initiator_includes_device_cert() {
     let device_identity = IdentityPub(device_pub_key);
     let config_a = NetworkConfig {
         signing_key: device_key,
+        master_identity: master_pub,
         known_peers: HashMap::new(),
         device_cert: Some(cert),
         iroh_secret_key: None,
@@ -424,12 +426,16 @@ async fn handshake_without_cert_connection_is_rejected() {
     let (sk_a, _) = keygen();
     let (sk_b, _) = keygen();
 
-    let make_certless_config = |sk: ed25519_dalek::SigningKey| NetworkConfig {
-        signing_key: sk,
-        known_peers: HashMap::new(),
-        device_cert: None,
-        iroh_secret_key: None,
-        relay_mode: RelayMode::Disabled,
+    let make_certless_config = |sk: ed25519_dalek::SigningKey| {
+        let mi = IdentityPub(sk.verifying_key().to_bytes());
+        NetworkConfig {
+            signing_key: sk,
+            master_identity: mi,
+            known_peers: HashMap::new(),
+            device_cert: None,
+            iroh_secret_key: None,
+            relay_mode: RelayMode::Disabled,
+        }
     };
 
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
@@ -745,7 +751,8 @@ async fn network_handle_starts_with_relay_default() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let handle = NetworkHandle::start(
         NetworkConfig {
-            signing_key: sk,
+            signing_key: sk.clone(),
+            master_identity: IdentityPub(sk.verifying_key().to_bytes()),
             known_peers: Default::default(),
             device_cert: None,
             iroh_secret_key: None,

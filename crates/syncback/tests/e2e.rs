@@ -77,10 +77,12 @@ fn write_file(dir: &TempDir, name: &str, content: &[u8]) -> String {
 
 async fn make_network_handle() -> NetworkHandle {
     let sk = SigningKey::generate(&mut OsRng);
+    let mi = IdentityPub(sk.verifying_key().to_bytes());
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
     NetworkHandle::start(
         NetworkConfig {
             signing_key: sk,
+            master_identity: mi,
             known_peers: HashMap::new(),
             device_cert: None,
             iroh_secret_key: None,

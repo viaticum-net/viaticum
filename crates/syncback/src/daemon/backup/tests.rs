@@ -784,6 +784,7 @@ async fn deliver_symbols_logs_warn_on_peer_not_found() {
         NetworkHandle::start(
             NetworkConfig {
                 signing_key: sk_owner.clone(),
+                master_identity: IdentityPub(sk_owner.verifying_key().to_bytes()),
                 known_peers: HashMap::new(),
                 device_cert: None,
                 iroh_secret_key: None,
@@ -858,6 +859,7 @@ async fn deliver_symbols_sends_to_reachable_holder() {
     // Owner: seed [20u8; 32]
     let owner_seed = [20u8; 32];
     let owner_master_key = derive_master_key(&owner_seed).unwrap();
+    let owner_master = master_identity(&owner_master_key);
     let owner_did = DeviceId([20u8; 16]);
     let owner_device_key = derive_device_key(&owner_seed, &owner_did).unwrap();
     let owner_cert = issue_device_certificate(
@@ -887,6 +889,7 @@ async fn deliver_symbols_sends_to_reachable_holder() {
         NetworkHandle::start(
             NetworkConfig {
                 signing_key: holder_device_key,
+                master_identity: holder_master,
                 known_peers: HashMap::new(),
                 device_cert: Some(holder_cert),
                 iroh_secret_key: None,
@@ -907,6 +910,7 @@ async fn deliver_symbols_sends_to_reachable_holder() {
         NetworkHandle::start(
             NetworkConfig {
                 signing_key: owner_device_key,
+                master_identity: owner_master,
                 known_peers,
                 device_cert: Some(owner_cert),
                 iroh_secret_key: None,

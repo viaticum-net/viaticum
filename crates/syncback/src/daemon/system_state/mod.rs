@@ -20,7 +20,7 @@ pub use syncback_core::system_state::SYSTEM_STATE_VERSION;
 use syncback_core::messages::{
     Message, PeerDiscoveryRequestMsg, SystemStateBackupMsg,
 };
-use syncback_core::types::{IdentityPub, Timestamp};
+use syncback_core::types::Timestamp;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -198,8 +198,10 @@ pub async fn run_bootstrap_discovery(
         return Ok(());
     }
 
+    // Collect connected seed identities for re-query in round 2.
+    let mut seed_ids = Vec::new();
+
     for addr_str in &bootstrap_peers {
-        // 1. Parse address string.
         let parsed = match parse_node_addr(addr_str) {
             Ok(p) => p,
             Err(e) => {
@@ -208,7 +210,6 @@ pub async fn run_bootstrap_discovery(
             }
         };
 
-        // 2. Convert to iroh EndpointAddr.
         let endpoint_addr = match to_endpoint_addr(&parsed) {
             Ok(ea) => ea,
             Err(e) => {
@@ -217,38 +218,110 @@ pub async fn run_bootstrap_discovery(
             }
         };
 
-        // 3. Derive IdentityPub from NodeId bytes.
-        // NodeId is the iroh transport identity (Ed25519 pubkey).
-        // We use its raw bytes as IdentityPub for the bootstrap lookup.
-        // Real identity will be confirmed via handshake.
-        let identity = IdentityPub(parsed.node_id.0);
-
-        // 4. Register peer in the known_peers directory.
-        network.add_peer(identity, endpoint_addr).await;
-
-        // 5. Attempt connection (triggers handshake).
-        match network.get_connection(identity).await {
-            Ok(_conn) => {
-                info!(peer = %identity, "bootstrap discovery: connected");
-            }
+        // Connect without expected_identity — addr contains iroh NodeId,
+        // not SyncBack master identity. Handshake resolves via device cert.
+        let conn = match network.connect(endpoint_addr.clone(), None).await {
+            Ok(c) => c,
             Err(e) => {
-                warn!(peer = %identity, error = %e, "bootstrap discovery: connect failed, skipping");
+                warn!(addr = %addr_str, error = %e, "bootstrap discovery: connect failed, skipping");
                 continue;
             }
+        };
+
+        let master_id = conn.master_identity();
+        info!(peer = %master_id, "bootstrap discovery: connected");
+
+        network.add_peer(master_id, endpoint_addr).await;
+        network.register_connection(master_id, conn).await;
+        seed_ids.push(master_id);
+
+        send_discovery_request(&network, master_id).await;
+    }
+
+    // Round 2: wait for other nodes to also connect to seeds, then re-query.
+    // Seeds will now know about more peers → we discover them.
+    if !seed_ids.is_empty() {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        info!("bootstrap discovery: round 2 — re-querying seeds");
+        for &seed_id in &seed_ids {
+            send_discovery_request(&network, seed_id).await;
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_discovery_request(
+    network: &Arc<NetworkHandle>,
+    peer_id: syncback_core::types::IdentityPub,
+) {
+    let msg = Message::PeerDiscoveryRequest(PeerDiscoveryRequestMsg {
+        v: 1,
+        timestamp: Timestamp::now(),
+    });
+    match network.send_to_peer(peer_id, &msg).await {
+        Ok(()) => info!(peer = %peer_id, "discovery: PeerDiscoveryRequest sent"),
+        Err(e) => debug!(peer = %peer_id, error = %e, "discovery: send failed"),
+    }
+}
+
+// ─── run_periodic_discovery ──────────────────────────────────────────────────
+
+/// Periodically send PeerDiscoveryRequest to random known peers.
+///
+/// This allows the network to "grow" — each node gradually learns about all
+/// peers through gossip-like discovery. Interval is scaled by time_scale.
+///
+/// Base interval: 5 minutes (300s). With time_scale, clamped to min 10s.
+pub async fn run_periodic_discovery(
+    db: Db,
+    network: Arc<NetworkHandle>,
+    interval_secs: u64,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let clamped = interval_secs.max(10);
+    info!(interval_secs = clamped, "periodic discovery: started");
+    let period = Duration::from_secs(clamped);
+    let mut ticker = tokio::time::interval(period);
+    // Skip first tick (bootstrap discovery handles initial connections).
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = cancel.cancelled() => {
+                info!("periodic discovery: cancelled");
+                break;
+            }
         }
 
-        // 6. Send PeerDiscoveryRequest.
-        // TODO: uncomment when PeerDiscoveryRequestMsg is added to syncback_core::messages.
-        //
-        // 6. Send PeerDiscoveryRequest.
-        let msg = Message::PeerDiscoveryRequest(PeerDiscoveryRequestMsg {
-            v: 1,
-            timestamp: Timestamp::now(),
-        });
-        match network.send_to_peer(identity, &msg).await {
-            Ok(()) => info!(peer = %identity, "bootstrap discovery: PeerDiscoveryRequest sent"),
-            Err(e) => warn!(peer = %identity, error = %e, "bootstrap discovery: send failed"),
+        let peers = match db.list_all_peers() {
+            Ok(p) => p,
+            Err(e) => {
+                error!(error = %e, "periodic discovery: list_all_peers failed");
+                continue;
+            }
+        };
+
+        if peers.is_empty() {
+            continue;
         }
+
+        // Pick up to 3 random peers to query.
+        let query_count = peers.len().min(3);
+        let selected: Vec<_> = {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::thread_rng();
+            let mut shuffled = peers;
+            shuffled.shuffle(&mut rng);
+            shuffled.into_iter().take(query_count).collect()
+        };
+
+        for peer in &selected {
+            send_discovery_request(&network, peer.identity).await;
+        }
+
+        debug!(queried = query_count, "periodic discovery: round complete");
     }
 
     Ok(())

@@ -1511,6 +1511,7 @@ impl Processor {
             "processor: PeerDiscoveryResponse: received"
         );
 
+        let mut connected = 0usize;
         for dp in &resp.peers {
             if dp.identity_pub == self.own_identity {
                 debug!(
@@ -1569,11 +1570,35 @@ impl Processor {
             };
 
             self.network.add_peer(dp.identity_pub, endpoint_addr).await;
-            debug!(
-                identity = %dp.identity_pub,
-                "processor: PeerDiscoveryResponse: registered peer in network"
-            );
+
+            // Connect to a limited number of discovered peers per response.
+            // Remaining peers are in known_peers and will be connected in
+            // future discovery rounds or when get_connection is called.
+            if connected < 5 {
+                match self.network.get_connection(dp.identity_pub).await {
+                    Ok(_) => {
+                        connected += 1;
+                        info!(
+                            identity = %dp.identity_pub,
+                            "processor: PeerDiscoveryResponse: connected to discovered peer"
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            identity = %dp.identity_pub,
+                            err = %e,
+                            "processor: PeerDiscoveryResponse: connect failed (peer may be offline)"
+                        );
+                    }
+                }
+            }
         }
+        info!(
+            peer = %peer_id,
+            added = resp.peers.len(),
+            connected,
+            "processor: PeerDiscoveryResponse: done"
+        );
     }
 }
 

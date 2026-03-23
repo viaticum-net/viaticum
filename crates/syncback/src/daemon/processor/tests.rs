@@ -69,8 +69,10 @@ fn make_peer_record(identity: IdentityPub) -> syncback_core::types::PeerRecord {
 
 async fn make_network() -> Arc<NetworkHandle> {
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let mi = IdentityPub(signing_key.verifying_key().to_bytes());
     let cfg = NetworkConfig {
         signing_key,
+        master_identity: mi,
         known_peers: Default::default(),
         device_cert: None,
         iroh_secret_key: None,

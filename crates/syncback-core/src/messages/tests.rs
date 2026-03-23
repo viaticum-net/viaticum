@@ -523,7 +523,7 @@ fn extract_cluster_identity_none_for_no_cert() {
 
 #[test]
 fn extract_cluster_identity_rejects_mismatched_device_pub() {
-    let (_, device_key, cert, _, _) = make_device_cert_for_test();
+    let (_, _device_key, cert, _, _) = make_device_cert_for_test();
     // Use a different identity_pub that doesn't match cert.device_pub_key
     let other_key = SigningKey::generate(&mut OsRng);
     let other_pub = IdentityPub(other_key.verifying_key().to_bytes());

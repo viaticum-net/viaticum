@@ -84,8 +84,12 @@ pub enum NetworkError {
 /// `known_peers` maps peer IdentityPub to their iroh EndpointAddr.
 #[derive(Clone)]
 pub struct NetworkConfig {
-    /// Ed25519 signing key — identity_pub = signing_key.verifying_key().
+    /// Ed25519 signing key (device key) used for handshake signatures.
     pub signing_key: SigningKey,
+    /// Master identity (from cluster master key). This is the identity
+    /// announced in PeerAnnounce and used for all protocol operations.
+    /// Different from signing_key.verifying_key() which is the device identity.
+    pub master_identity: IdentityPub,
     /// Peer directory populated by the caller (from DB PeerRecords).
     pub known_peers: HashMap<IdentityPub, EndpointAddr>,
     /// Optional device certificate for cluster nodes.
@@ -122,8 +126,12 @@ pub type ReadLoopRequest = (IdentityPub, Arc<Connection>);
 pub struct NetworkHandle {
     /// iroh endpoint (transport identity).
     endpoint: Endpoint,
-    /// Our SyncBack protocol identity.
+    /// Our SyncBack master identity (from cluster master key).
+    /// Used in PeerAnnounce and all protocol operations.
     pub identity_pub: IdentityPub,
+    /// Device-level identity (signing_key.verifying_key()).
+    /// Used in handshake — the key that actually signs the HandshakeMsg.
+    device_identity: IdentityPub,
     /// Our iroh transport identity as SyncBack NodeId bytes.
     pub node_id: NodeId,
     /// Signing key for building handshake messages.
@@ -151,7 +159,8 @@ impl NetworkHandle {
         config: NetworkConfig,
         incoming_tx: tokio::sync::mpsc::Sender<Connection>,
     ) -> Result<Self, NetworkError> {
-        let identity_pub = IdentityPub(config.signing_key.verifying_key().to_bytes());
+        let identity_pub = config.master_identity;
+        let device_identity = IdentityPub(config.signing_key.verifying_key().to_bytes());
 
         let mut builder = Endpoint::builder()
             .alpns(vec![ALPN.to_vec()])
@@ -170,7 +179,8 @@ impl NetworkHandle {
         let node_id = NodeId(*iroh_id.as_bytes());
 
         info!(
-            identity_pub = %identity_pub,
+            master_identity = %identity_pub,
+            device_identity = %device_identity,
             node_id = %node_id,
             "network handle started"
         );
@@ -178,16 +188,16 @@ impl NetworkHandle {
         let connections: Arc<Mutex<HashMap<IdentityPub, ConnectionState>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        // Spawn accept loop.
+        // Spawn accept loop — uses device_identity for handshake signing.
         let accept_endpoint = endpoint.clone();
         let signing_key_clone = config.signing_key.clone();
-        let identity_pub_clone = identity_pub;
+        let device_identity_clone = device_identity;
         let device_cert_clone = config.device_cert.clone();
         tokio::spawn(async move {
             accept_loop(
                 accept_endpoint,
                 signing_key_clone,
-                identity_pub_clone,
+                device_identity_clone,
                 device_cert_clone,
                 incoming_tx,
             )
@@ -197,6 +207,7 @@ impl NetworkHandle {
         Ok(Self {
             endpoint,
             identity_pub,
+            device_identity,
             node_id,
             signing_key: config.signing_key,
             device_cert: config.device_cert,
@@ -258,7 +269,7 @@ impl NetworkHandle {
             handshake_initiator(
                 iroh_conn,
                 &self.signing_key,
-                self.identity_pub,
+                self.device_identity,
                 expected_identity,
                 self.device_cert.clone(),
             )
@@ -420,6 +431,32 @@ impl NetworkHandle {
             .await
             .insert(peer_identity, ConnectionState::Live(arc));
         debug!(peer = %peer_identity, "connection arc stored in pool");
+    }
+
+    /// Register an already-established connection in the pool and spawn its
+    /// read loop. Used by bootstrap discovery which connects without knowing
+    /// the peer's master identity in advance.
+    pub async fn register_connection(
+        &self,
+        peer_identity: IdentityPub,
+        conn: Connection,
+    ) {
+        let arc = Arc::new(conn);
+        self.connections
+            .lock()
+            .await
+            .insert(peer_identity, ConnectionState::Live(arc.clone()));
+
+        if let Some(tx) = self.read_loop_tx.lock().unwrap().as_ref() {
+            if let Err(e) = tx.send((peer_identity, arc)) {
+                tracing::warn!(
+                    peer = %peer_identity,
+                    err = %e,
+                    "register_connection: read_loop_tx closed"
+                );
+            }
+        }
+        debug!(peer = %peer_identity, "connection registered in pool");
     }
 
     /// Register a peer in the known_peers directory.

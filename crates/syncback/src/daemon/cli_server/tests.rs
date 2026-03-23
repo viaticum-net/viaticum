@@ -31,6 +31,7 @@ async fn make_test_state() -> Arc<DaemonState> {
 
     let net_config = NetworkConfig {
         signing_key: device_key,
+        master_identity: identity_pub,
         known_peers: Default::default(),
         device_cert: None,
         iroh_secret_key: None,
@@ -265,6 +266,7 @@ async fn dispatch_connect_two_daemons_registers_peer() {
         NetworkHandle::start(
             NetworkConfig {
                 signing_key: device_b,
+                master_identity: pk_b,
                 known_peers: Default::default(),
                 device_cert: Some(cert_b),
                 iroh_secret_key: None,
@@ -290,6 +292,7 @@ async fn dispatch_connect_two_daemons_registers_peer() {
         NetworkHandle::start(
             NetworkConfig {
                 signing_key: device_a,
+                master_identity: pk_a,
                 known_peers: Default::default(),
                 device_cert: Some(cert_a),
                 iroh_secret_key: None,

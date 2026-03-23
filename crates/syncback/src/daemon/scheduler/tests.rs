@@ -431,10 +431,12 @@ async fn make_stub_network() -> Arc<crate::daemon::network::NetworkHandle> {
     use rand::rngs::OsRng;
 
     let signing_key = SigningKey::generate(&mut OsRng);
+    let mi = syncback_core::types::IdentityPub(signing_key.verifying_key().to_bytes());
     let (incoming_tx, _incoming_rx) = tokio::sync::mpsc::channel(1);
 
     let config = crate::daemon::network::NetworkConfig {
         signing_key,
+        master_identity: mi,
         known_peers: std::collections::HashMap::new(),
         device_cert: None,
         iroh_secret_key: None,

@@ -221,46 +221,13 @@ impl DaemonHandle {
             }
             tracing::info!(count = map.len(), "loaded peers from db");
 
-            // ── 7b. Inject bootstrap peers from config ────────────────────────
-            // Bootstrap peers are added to known_peers so get_connection() can
-            // reach them on first contact without a prior peer exchange.
-            // Errors are logged and skipped — a bad bootstrap address should not
-            // prevent the daemon from starting.
-            {
-                use crate::daemon::network::addr::{parse_node_addr, to_endpoint_addr};
-                let mut bootstrap_added = 0usize;
-                for addr_str in &app_config.network.bootstrap_peers {
-                    match parse_node_addr(addr_str) {
-                        Ok(parsed) => {
-                            match to_endpoint_addr(&parsed) {
-                                Ok(ea) => {
-                                    // Convert NodeId → IdentityPub (both are 32-byte pubkeys).
-                                    let identity = syncback_core::types::IdentityPub(parsed.node_id.0);
-                                    map.insert(identity, ea);
-                                    bootstrap_added += 1;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        addr = %addr_str,
-                                        error = %e,
-                                        "startup: skipping bootstrap peer with unparseable addr"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                addr = %addr_str,
-                                error = %e,
-                                "startup: skipping malformed bootstrap peer addr"
-                            );
-                        }
-                    }
-                }
-                if bootstrap_added > 0 {
-                    tracing::info!(count = bootstrap_added, "loaded bootstrap peers from config");
-                }
-            }
+            // ── 7b. Bootstrap peers ──────────────────────────────────────────
+            // Bootstrap peers are NOT added to known_peers here because the
+            // address contains the iroh NodeId, not the SyncBack master identity.
+            // Actual connection + identity resolution happens in
+            // run_bootstrap_discovery (spawned later), which calls
+            // network.connect(None) → gets master identity from handshake →
+            // network.add_peer(master_id, addr).
 
             map
         };
@@ -281,6 +248,7 @@ impl DaemonHandle {
 
         let net_config = NetworkConfig {
             signing_key: device_key.clone(),
+            master_identity: identity_pub,
             known_peers,
             device_cert: device_cert_for_network,
             iroh_secret_key: Some(iroh::SecretKey::from_bytes(&iroh_key_bytes)),
@@ -541,6 +509,22 @@ impl DaemonHandle {
                     ss_db, ss_network, ss_seed, ss_interval, cancel_ss,
                 ).await {
                     tracing::error!(error = %e, "system_state periodic push failed");
+                }
+                Ok(())
+            }));
+        }
+
+        // ── Periodic peer discovery ──────────────────────────────────────────
+        {
+            let disc_db = db.clone();
+            let disc_network = network.clone();
+            let disc_interval = (300 / time_scale).max(10);
+            let cancel_disc = cancel.clone();
+            tasks.push(tokio::spawn(async move {
+                if let Err(e) = crate::daemon::system_state::run_periodic_discovery(
+                    disc_db, disc_network, disc_interval, cancel_disc,
+                ).await {
+                    tracing::error!(error = %e, "periodic discovery failed");
                 }
                 Ok(())
             }));

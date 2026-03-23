@@ -25,7 +25,7 @@ use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder, Symbol};
 use syncback_core::messages::{Message, SymbolTransferMsg};
 use syncback_core::placement::{compute_allocation, HolderCandidate};
-use syncback_core::cluster::{derive_device_key, derive_master_key, issue_device_certificate};
+use syncback_core::cluster::{derive_device_key, derive_master_key, issue_device_certificate, master_identity};
 use syncback_core::types::{DeviceId, ErasureParams, IdentityPub, SourceBlockId, Timestamp};
 use tempfile::TempDir;
 
@@ -91,10 +91,12 @@ fn write_file(dir: &TempDir, name: &str, content: &[u8]) -> String {
 /// Create a NetworkHandle with a fresh signing key and empty peer directory.
 async fn make_network_handle() -> NetworkHandle {
     let sk = SigningKey::generate(&mut OsRng);
+    let mi = IdentityPub(sk.verifying_key().to_bytes());
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
     NetworkHandle::start(
         NetworkConfig {
             signing_key: sk,
+            master_identity: mi,
             known_peers: HashMap::new(),
             device_cert: None,
             iroh_secret_key: None,
@@ -267,17 +269,20 @@ async fn network_symbol_transfer_between_nodes() {
         Timestamp::now(),
     );
 
+    let pk_a = master_identity(&master_key_a);
+    let pk_b = master_identity(&master_key_b);
+
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(64);
     let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(64);
 
     let handle_a = NetworkHandle::start(
-        NetworkConfig { signing_key: device_key_a, known_peers: HashMap::new(), device_cert: Some(cert_a), iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled },
+        NetworkConfig { signing_key: device_key_a, master_identity: pk_a, known_peers: HashMap::new(), device_cert: Some(cert_a), iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled },
         tx_a,
     )
     .await
     .unwrap();
     let handle_b = NetworkHandle::start(
-        NetworkConfig { signing_key: device_key_b, known_peers: HashMap::new(), device_cert: Some(cert_b), iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled },
+        NetworkConfig { signing_key: device_key_b, master_identity: pk_b, known_peers: HashMap::new(), device_cert: Some(cert_b), iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled },
         tx_b,
     )
     .await

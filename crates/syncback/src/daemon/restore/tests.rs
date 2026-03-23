@@ -83,6 +83,7 @@ async fn test_restore_coord(
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let config_net = NetworkConfig {
         signing_key: signing_key.clone(),
+        master_identity: IdentityPub(signing_key.verifying_key().to_bytes()),
         known_peers: Default::default(),
         device_cert: None,
         iroh_secret_key: None,
@@ -112,7 +113,8 @@ async fn test_restore_coord(
     let (tx2, _rx2) = tokio::sync::mpsc::channel(1);
     let net2 = NetworkHandle::start(
         NetworkConfig {
-            signing_key: signing_key2,
+            signing_key: signing_key2.clone(),
+            master_identity: IdentityPub(signing_key2.verifying_key().to_bytes()),
             known_peers: Default::default(),
             device_cert: None,
             iroh_secret_key: None,
@@ -778,6 +780,7 @@ async fn fetch_skips_denied_holder_and_tries_next() {
     let handle_a = NetworkHandle::start(
         NetworkConfig {
             signing_key: device_key_a,
+            master_identity: master_a,
             known_peers: Default::default(),
             device_cert: Some(cert_a),
             iroh_secret_key: None,
@@ -791,6 +794,7 @@ async fn fetch_skips_denied_holder_and_tries_next() {
     let handle_b = NetworkHandle::start(
         NetworkConfig {
             signing_key: device_key_b,
+            master_identity: master_b,
             known_peers: Default::default(),
             device_cert: Some(cert_b),
             iroh_secret_key: None,
@@ -912,6 +916,7 @@ async fn fetch_skips_denied_holder_and_tries_next() {
     let owner_net = NetworkHandle::start(
         NetworkConfig {
             signing_key: owner_device_key,
+            master_identity: owner_master,
             known_peers: Default::default(),
             device_cert: Some(owner_cert),
             iroh_secret_key: None,
@@ -1051,6 +1056,7 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
     let handle_h1 = NetworkHandle::start(
         NetworkConfig {
             signing_key: device_key_h1,
+            master_identity: master_h1,
             known_peers: Default::default(),
             device_cert: Some(cert_h1),
             iroh_secret_key: None,
@@ -1064,6 +1070,7 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
     let handle_h2 = NetworkHandle::start(
         NetworkConfig {
             signing_key: device_key_h2,
+            master_identity: master_h2,
             known_peers: Default::default(),
             device_cert: Some(cert_h2),
             iroh_secret_key: None,
@@ -1175,6 +1182,7 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
     let owner_net = NetworkHandle::start(
         NetworkConfig {
             signing_key: owner_device_key,
+            master_identity: owner_master,
             known_peers: Default::default(),
             device_cert: Some(owner_cert),
             iroh_secret_key: None,
