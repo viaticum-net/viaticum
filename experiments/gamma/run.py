@@ -599,11 +599,24 @@ def main():
         print(f"  {arch}: {count} nodes")
 
     if args.build:
-        print("\n=== Building images ===")
-        r = compose("build", timeout=600)
+        print("\n=== Building syncback binary ===")
+        r = subprocess.run(
+            ["cargo", "build", "--release", "-p", "syncback"],
+            cwd=PROJECT_DIR, timeout=600,
+        )
         if r.returncode != 0:
-            print(f"Build failed: {r.stderr}")
             sys.exit(1)
+        print("\n=== Building runtime images ===")
+        r = compose("build", timeout=120)
+        if r.returncode != 0:
+            print(f"Image build failed: {r.stderr}")
+            sys.exit(1)
+
+    # Verify binary exists
+    binary = os.path.join(PROJECT_DIR, "target", "release", "syncback")
+    if not os.path.isfile(binary):
+        print(f"ERROR: {binary} not found. Run with --build first.")
+        sys.exit(1)
 
     print("\n=== Starting containers ===")
     r = compose("up", "-d", timeout=120)

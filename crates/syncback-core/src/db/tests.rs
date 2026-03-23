@@ -894,3 +894,194 @@ fn placement_upsert_updates_holder_indexes() {
         "holder_a must still appear in file_holders after re-upsert"
     );
 }
+
+// ============================================================
+// refresh_peer_storage_bytes
+// ============================================================
+
+/// When a peer stores bytes for us (Alive placement) and we store bytes for
+/// them (Active holding), refresh_peer_storage_bytes must update all three
+/// fields: bytes_we_store_for_peer, bytes_peer_stores_for_us, trust_s.
+#[test]
+fn refresh_peer_storage_bytes_updates_trust_s() {
+    let db = test_db();
+    let peer = IdentityPub([0xA1u8; 32]);
+
+    // Insert peer with default trust_s = 1.0.
+    db.upsert_peer(&make_peer(peer)).unwrap();
+
+    // ── Set up: peer holds 10 symbols of our data (owner view) ──────────────
+    // Source block t=1000 → bytes = 10 * 1000 = 10_000.
+    let block_id_a = SourceBlockId([0xA0u8; 32]);
+    let sb_a = SourceBlockRecord {
+        block_id: block_id_a,
+        k: 10,
+        t: 1000,
+        block_type: crate::types::SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(1000),
+        encrypted_size: None,
+        n: None,
+        overhead: None,
+    };
+    db.upsert_source_block(&sb_a).unwrap();
+
+    let placement = SymbolPlacement {
+        source_block_id: block_id_a,
+        holder_id: peer,
+        file_id: FileId(1),
+        esi_ranges: vec![(0, 10)], // 10 symbols
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp(1000),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+
+    // ── Set up: we store 5000 bytes for the peer (holder view) ───────────────
+    let holding = HoldingRecord {
+        source_block_id: SourceBlockId([0xB0u8; 32]),
+        owner_id: peer,
+        esi_ranges: vec![(0, 5)],
+        importance: 0.5,
+        total_bytes: 5000,
+        status: HoldingStatus::Active,
+        received_at: Timestamp(1000),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&holding).unwrap();
+
+    // ── Refresh and verify ────────────────────────────────────────────────────
+    db.refresh_peer_storage_bytes(&peer).unwrap();
+
+    let updated = db.get_peer(&peer).unwrap().unwrap();
+    assert_eq!(updated.bytes_we_store_for_peer, 5000, "should equal holding.total_bytes");
+    assert_eq!(updated.bytes_peer_stores_for_us, 10_000, "should equal 10 symbols * t=1000");
+    // trust_s = 10_000 / 5_000 = 2.0
+    let expected_trust_s = 10_000_f64 / 5_000_f64;
+    assert!(
+        (updated.trust_s - expected_trust_s).abs() < 1e-9,
+        "trust_s = {}, expected {}",
+        updated.trust_s,
+        expected_trust_s,
+    );
+}
+
+/// When we store nothing for the peer, trust_s must be 1.0 (neutral).
+#[test]
+fn refresh_peer_storage_bytes_neutral_when_we_store_nothing() {
+    let db = test_db();
+    let peer = IdentityPub([0xA2u8; 32]);
+    db.upsert_peer(&make_peer(peer)).unwrap();
+
+    // Peer holds 5 symbols of ours (Alive).
+    let block_id_b = SourceBlockId([0xC0u8; 32]);
+    let sb = SourceBlockRecord {
+        block_id: block_id_b,
+        k: 5,
+        t: 2000,
+        block_type: crate::types::SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(1000),
+        encrypted_size: None,
+        n: None,
+        overhead: None,
+    };
+    db.upsert_source_block(&sb).unwrap();
+    let p = SymbolPlacement {
+        source_block_id: block_id_b,
+        holder_id: peer,
+        file_id: FileId(2),
+        esi_ranges: vec![(0, 5)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp(1000),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&p).unwrap();
+
+    // No holdings for this peer (bytes_we_store = 0).
+    db.refresh_peer_storage_bytes(&peer).unwrap();
+
+    let updated = db.get_peer(&peer).unwrap().unwrap();
+    assert_eq!(updated.bytes_we_store_for_peer, 0);
+    assert_eq!(updated.bytes_peer_stores_for_us, 10_000); // 5 * 2000
+    // trust_s must be 1.0 when we_store == 0 (avoid division by zero).
+    assert!(
+        (updated.trust_s - 1.0).abs() < 1e-9,
+        "trust_s must be 1.0 when bytes_we_store_for_peer == 0, got {}",
+        updated.trust_s,
+    );
+}
+
+/// Non-Alive placements must NOT count towards bytes_peer_stores_for_us.
+/// Non-Active holdings must NOT count towards bytes_we_store_for_peer.
+#[test]
+fn refresh_peer_storage_bytes_only_alive_and_active_count() {
+    let db = test_db();
+    let peer = IdentityPub([0xA3u8; 32]);
+    db.upsert_peer(&make_peer(peer)).unwrap();
+
+    // Source block for placements.
+    let block_id_c = SourceBlockId([0xD0u8; 32]);
+    let sb = SourceBlockRecord {
+        block_id: block_id_c,
+        k: 10,
+        t: 500,
+        block_type: crate::types::SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(1000),
+        encrypted_size: None,
+        n: None,
+        overhead: None,
+    };
+    db.upsert_source_block(&sb).unwrap();
+
+    // One Lost placement — must NOT count.
+    let lost = SymbolPlacement {
+        source_block_id: block_id_c,
+        holder_id: peer,
+        file_id: FileId(3),
+        esi_ranges: vec![(0, 10)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Lost,
+        last_verified: None,
+        placed_at: Timestamp(1000),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&lost).unwrap();
+
+    // One MarkedForDelete holding — must NOT count.
+    let mfd_holding = HoldingRecord {
+        source_block_id: SourceBlockId([0xE0u8; 32]),
+        owner_id: peer,
+        esi_ranges: vec![(0, 5)],
+        importance: 0.5,
+        total_bytes: 9999,
+        status: HoldingStatus::MarkedForDelete,
+        received_at: Timestamp(1000),
+        delete_requested_at: Some(Timestamp(2000)),
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&mfd_holding).unwrap();
+
+    db.refresh_peer_storage_bytes(&peer).unwrap();
+
+    let updated = db.get_peer(&peer).unwrap().unwrap();
+    assert_eq!(updated.bytes_we_store_for_peer, 0, "MarkedForDelete holdings must not count");
+    assert_eq!(updated.bytes_peer_stores_for_us, 0, "Lost placements must not count");
+    assert!((updated.trust_s - 1.0).abs() < 1e-9, "trust_s must be 1.0 when both counts are 0");
+}
+
+/// refresh_peer_storage_bytes must be a no-op when the peer is not in the DB.
+#[test]
+fn refresh_peer_storage_bytes_noop_for_unknown_peer() {
+    let db = test_db();
+    let unknown = IdentityPub([0xFFu8; 32]);
+    // Must not panic or return an error.
+    db.refresh_peer_storage_bytes(&unknown).unwrap();
+    assert!(db.get_peer(&unknown).unwrap().is_none());
+}

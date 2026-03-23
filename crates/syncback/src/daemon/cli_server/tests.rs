@@ -22,13 +22,14 @@ use super::dispatch;
 
 async fn make_test_state() -> Arc<DaemonState> {
     let db = Db::open_in_memory().expect("in-memory db");
-    let identity_pub = IdentityPub([0u8; 32]);
     let device_id = DeviceId([0u8; 16]);
 
-    // Minimal network handle (iroh endpoint — binds an ephemeral port).
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    // In production, signing_key = master_key, so identity_pub = master_key.verifying_key().
+    let master_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let identity_pub = IdentityPub(master_key.verifying_key().to_bytes());
+
     let net_config = NetworkConfig {
-        signing_key,
+        signing_key: master_key.clone(),
         known_peers: Default::default(),
         device_cert: None,
         iroh_secret_key: None,
@@ -47,8 +48,6 @@ async fn make_test_state() -> Arc<DaemonState> {
         RestoreRequest,
         tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
     )>(4);
-
-    let master_key = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
 
     Arc::new(DaemonState {
         db,
@@ -85,10 +84,13 @@ async fn dispatch_status_identity_reflects_state() {
     let CliResponse::Status(data) = response else {
         panic!("expected Status");
     };
-    // Identity is derived from network signing key — should be 64 hex chars.
+    // Identity = master_key.verifying_key() hex (64 chars for 32 bytes).
     assert_eq!(data.node_identity.len(), 64);
-    // Network signing_key is [1u8; 32], identity_pub = verifying_key, not all zeros.
-    assert!(!data.node_identity.is_empty());
+    // Must match state.identity_pub which equals network.identity_pub (both from master_key).
+    let expected = syncback_core::types::hex_encode(&IdentityPub(
+        ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key().to_bytes()
+    ).0);
+    assert_eq!(data.node_identity, expected);
 }
 
 #[tokio::test]

@@ -778,6 +778,60 @@ impl Db {
         }
         Ok(records)
     }
+
+    /// Recompute storage-balance fields for a peer and update `trust_s` in the PeerRecord.
+    ///
+    /// - `bytes_we_store_for_peer`: sum of `total_bytes` over Active holdings whose
+    ///   `owner_id == peer`.  (HOLDINGS table — our holder-side view.)
+    /// - `bytes_peer_stores_for_us`: sum of `symbol_count * t` over Alive placements
+    ///   whose `holder_id == peer`.  (SYMBOL_PLACEMENTS table — our owner-side view.)
+    ///
+    /// `trust_s = if bytes_we_store == 0 { 1.0 } else { peer_stores / we_store }`
+    ///
+    /// No-op (returns Ok) if the peer is not yet in the DB.
+    pub fn refresh_peer_storage_bytes(&self, peer: &IdentityPub) -> Result<(), DbError> {
+        // Compute bytes_we_store_for_peer from HOLDINGS.
+        let we_store: u64 = self
+            .list_holdings_for_owner(peer)?
+            .into_iter()
+            .filter(|h| h.status == HoldingStatus::Active)
+            .map(|h| h.total_bytes)
+            .sum();
+
+        // Compute bytes_peer_stores_for_us from SYMBOL_PLACEMENTS.
+        // Each alive placement contributes symbol_count * t bytes.
+        let peer_stores: u64 = {
+            let mut total = 0u64;
+            for placement in self.list_placements_for_holder(peer)? {
+                if placement.status != PlacementStatus::Alive {
+                    continue;
+                }
+                let t = self
+                    .get_source_block(&placement.source_block_id)?
+                    .map(|sb| sb.t as u64)
+                    .unwrap_or(0);
+                total += placement.symbol_count() as u64 * t;
+            }
+            total
+        };
+
+        let trust_s = if we_store == 0 {
+            1.0_f64
+        } else {
+            peer_stores as f64 / we_store as f64
+        };
+
+        // Update PeerRecord. No-op if peer not yet in DB.
+        let mut record = match self.get_peer(peer)? {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        record.bytes_we_store_for_peer = we_store;
+        record.bytes_peer_stores_for_us = peer_stores;
+        record.trust_s = trust_s;
+        self.upsert_peer(&record)?;
+        Ok(())
+    }
 }
 
 // ============================================================

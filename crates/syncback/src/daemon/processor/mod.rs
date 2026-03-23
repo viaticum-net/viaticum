@@ -526,6 +526,15 @@ impl Processor {
 
         self.db.upsert_holding(&record)?;
 
+        // Refresh trust_s for this peer: we now store more bytes for them.
+        if let Err(e) = self.db.refresh_peer_storage_bytes(&owner_id) {
+            error!(
+                peer = %owner_id,
+                err = %e,
+                "processor: failed to refresh storage balance after SymbolTransfer"
+            );
+        }
+
         info!(
             block_id = %block_id,
             owner = %owner_id,
@@ -743,6 +752,15 @@ impl Processor {
         }
         self.db.upsert_placement(&updated)?;
 
+        // Refresh trust_s: placement status changed, so bytes_peer_stores_for_us may differ.
+        if let Err(e) = self.db.refresh_peer_storage_bytes(&holder_id) {
+            error!(
+                peer = %holder_id,
+                err = %e,
+                "processor: failed to refresh storage balance after PosResponse"
+            );
+        }
+
         // Update PoS weekly stats and recalculate trust.
         let week = current_week_number_scaled(self.time_scale);
         let pos_outcome = outcome_from_verify(&outcome, week);
@@ -813,6 +831,16 @@ impl Processor {
     ) -> Result<(), ProcessorError> {
         let block_id = nack.source_block_id;
         self.handle_pos_nack_sync(from, &nack)?;
+
+        // Refresh trust_s: holder no longer stores those symbols for us.
+        if let Err(e) = self.db.refresh_peer_storage_bytes(&from) {
+            error!(
+                peer = %from,
+                err = %e,
+                "processor: failed to refresh storage balance after PosNack"
+            );
+        }
+
         info!(block_id = %block_id, holder = %from, "repair: triggered");
         let _ = self
             .repair_tx
@@ -848,6 +876,16 @@ impl Processor {
     ) -> Result<(), ProcessorError> {
         let block_id = dropped.source_block_id;
         self.handle_symbol_dropped_sync(from, &dropped)?;
+
+        // Refresh trust_s: holder evicted our symbols, bytes_peer_stores_for_us decreased.
+        if let Err(e) = self.db.refresh_peer_storage_bytes(&from) {
+            error!(
+                peer = %from,
+                err = %e,
+                "processor: failed to refresh storage balance after SymbolDropped"
+            );
+        }
+
         info!(block_id = %block_id, holder = %from, "repair: triggered");
         let _ = self
             .repair_tx
