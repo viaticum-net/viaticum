@@ -280,7 +280,7 @@ impl DaemonHandle {
         };
 
         let net_config = NetworkConfig {
-            signing_key: master_key.clone(),
+            signing_key: device_key.clone(),
             known_peers,
             device_cert: device_cert_for_network,
             iroh_secret_key: Some(iroh::SecretKey::from_bytes(&iroh_key_bytes)),
@@ -357,7 +357,7 @@ impl DaemonHandle {
             board_path,
             identity_pub,
             x25519_priv,
-            signing_key: master_key.clone(),
+            signing_key: device_key.clone(),
             max_entries: app_config.network.relay_max_entries,
             max_size_bytes: app_config.network.relay_max_size_mb * 1_048_576,
             prune_interval_secs: 3600,

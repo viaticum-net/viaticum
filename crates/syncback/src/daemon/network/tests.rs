@@ -17,45 +17,59 @@ use syncback_core::messages::{
 };
 use syncback_core::erasure::Symbol;
 use syncback_core::types::{DeviceId, IdentityPub, NodeId, SourceBlockId, Timestamp};
-
 use iroh::RelayMode;
 
 use crate::daemon::network::{NetworkConfig, NetworkError, NetworkHandle};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Generate a fresh signing key and matching IdentityPub.
+/// Generate a full key hierarchy (master + device + cert) from a seed byte.
+/// Returns (device_signing_key, master_identity_pub, network_config).
+fn make_node(seed_byte: u8) -> (IdentityPub, NetworkConfig) {
+    let seed = [seed_byte; 32];
+    let master_key = derive_master_key(&seed).expect("derive_master_key");
+    let master_pub = master_identity(&master_key);
+    let did = DeviceId([seed_byte; 16]);
+    let device_key = derive_device_key(&seed, &did).expect("derive_device_key");
+    let cert = issue_device_certificate(
+        &master_key, did, device_key.verifying_key().to_bytes(), Timestamp::now(),
+    );
+    let config = NetworkConfig {
+        signing_key: device_key,
+        known_peers: HashMap::new(),
+        device_cert: Some(cert),
+        iroh_secret_key: None,
+        relay_mode: RelayMode::Disabled,
+    };
+    (master_pub, config)
+}
+
+/// Generate a fresh signing key and matching IdentityPub (device-level).
 fn keygen() -> (SigningKey, IdentityPub) {
     let sk = SigningKey::generate(&mut OsRng);
     let pk = IdentityPub(sk.verifying_key().to_bytes());
     (sk, pk)
 }
 
-/// Create a NetworkConfig with empty known_peers.
-fn make_config(signing_key: SigningKey) -> NetworkConfig {
-    NetworkConfig {
-        signing_key,
-        known_peers: HashMap::new(),
-        device_cert: None,
-        iroh_secret_key: None,
-        relay_mode: RelayMode::Disabled,
-    }
+/// Create a NetworkConfig with device cert from a seed byte.
+fn make_config_with_cert(seed_byte: u8) -> NetworkConfig {
+    make_node(seed_byte).1
 }
 
 // ─── Test 1: basic connection + handshake ─────────────────────────────────────
 
 #[tokio::test]
 async fn two_nodes_connect_and_handshake() {
-    let (sk_a, _pk_a) = keygen();
-    let (sk_b, _pk_b) = keygen();
+    let (master_a, config_a) = make_node(1);
+    let (master_b, config_b) = make_node(2);
 
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
     let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(10);
 
-    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+    let handle_a = NetworkHandle::start(config_a, tx_a)
         .await
         .expect("handle_a start");
-    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+    let handle_b = NetworkHandle::start(config_b, tx_b)
         .await
         .expect("handle_b start");
 
@@ -76,16 +90,16 @@ async fn two_nodes_connect_and_handshake() {
     .expect("timeout waiting for B to receive connection")
     .expect("channel closed");
 
-    // Verify identities.
+    // Verify master identities (protocol-level identity from cert).
     assert_eq!(
-        conn_a_to_b.peer_identity,
-        handle_b.identity_pub,
-        "A sees B's identity"
+        conn_a_to_b.master_identity(),
+        master_b,
+        "A sees B's master identity"
     );
     assert_eq!(
-        incoming_b.peer_identity,
-        handle_a.identity_pub,
-        "B sees A's identity"
+        incoming_b.master_identity(),
+        master_a,
+        "B sees A's master identity"
     );
 
     handle_a.shutdown().await;
@@ -96,16 +110,13 @@ async fn two_nodes_connect_and_handshake() {
 
 #[tokio::test]
 async fn send_and_receive_message_roundtrip() {
-    let (sk_a, _pk_a) = keygen();
-    let (sk_b, _pk_b) = keygen();
-
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
     let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(10);
 
-    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+    let handle_a = NetworkHandle::start(make_config_with_cert(1), tx_a)
         .await
         .expect("handle_a");
-    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+    let handle_b = NetworkHandle::start(make_config_with_cert(2), tx_b)
         .await
         .expect("handle_b");
 
@@ -151,16 +162,13 @@ async fn send_and_receive_message_roundtrip() {
 
 #[tokio::test]
 async fn send_symbol_transfer_roundtrip() {
-    let (sk_a, _pk_a) = keygen();
-    let (sk_b, _pk_b) = keygen();
-
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
     let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(10);
 
-    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+    let handle_a = NetworkHandle::start(make_config_with_cert(3), tx_a)
         .await
         .expect("handle_a");
-    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+    let handle_b = NetworkHandle::start(make_config_with_cert(4), tx_b)
         .await
         .expect("handle_b");
 
@@ -246,24 +254,23 @@ fn handshake_rejects_bad_signature() {
 
 #[tokio::test]
 async fn connect_with_expected_identity_mismatch_fails() {
-    let (sk_a, _pk_a) = keygen();
-    let (sk_b, _pk_b) = keygen();
-    let (_, wrong_pk) = keygen(); // completely different key
+    // wrong_master is a completely different master identity (from node 99).
+    let (wrong_master, _) = make_node(99);
 
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
     let (tx_b, _rx_b) = tokio::sync::mpsc::channel(10);
 
-    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+    let handle_a = NetworkHandle::start(make_config_with_cert(6), tx_a)
         .await
         .expect("handle_a");
-    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+    let handle_b = NetworkHandle::start(make_config_with_cert(7), tx_b)
         .await
         .expect("handle_b");
 
     let addr_b = handle_b.local_addr().expect("addr_b");
 
-    // A connects to B but expects the wrong identity.
-    let result = handle_a.connect(addr_b, Some(wrong_pk)).await;
+    // A connects to B but expects the wrong master identity.
+    let result = handle_a.connect(addr_b, Some(wrong_master)).await;
 
     assert!(
         matches!(result, Err(NetworkError::IdentityMismatch { .. })),
@@ -278,16 +285,13 @@ async fn connect_with_expected_identity_mismatch_fails() {
 
 #[tokio::test]
 async fn multiple_messages_on_same_connection() {
-    let (sk_a, _pk_a) = keygen();
-    let (sk_b, _pk_b) = keygen();
-
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
     let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(10);
 
-    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+    let handle_a = NetworkHandle::start(make_config_with_cert(11), tx_a)
         .await
         .expect("handle_a");
-    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+    let handle_b = NetworkHandle::start(make_config_with_cert(12), tx_b)
         .await
         .expect("handle_b");
 
@@ -356,9 +360,8 @@ async fn handshake_initiator_includes_device_cert() {
         relay_mode: RelayMode::Disabled,
     };
 
-    // Node B is a plain single-device node.
-    let (sk_b, _pk_b) = keygen();
-    let config_b = make_config(sk_b);
+    // Node B also needs a cert (handshake now rejects cert-less peers).
+    let (master_b, config_b) = make_node(2);
 
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
     let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(10);
@@ -387,10 +390,14 @@ async fn handshake_initiator_includes_device_cert() {
     .expect("timeout waiting for B to receive connection")
     .expect("channel closed");
 
-    // A connected to B: A sees no master identity for B (B is single-device).
-    assert_eq!(conn_a_to_b.peer_master_identity, None, "B has no cluster cert");
+    // A connected to B: A sees B's master identity.
+    assert_eq!(
+        conn_a_to_b.master_identity(),
+        master_b,
+        "A sees B's master identity"
+    );
 
-    // B received connection from A: B should see A's master identity.
+    // B received connection from A: B should see A's device identity and master identity.
     assert_eq!(
         incoming_b.peer_identity,
         device_identity,
@@ -406,37 +413,45 @@ async fn handshake_initiator_includes_device_cert() {
     handle_b.shutdown().await;
 }
 
-// ─── Test 9: handshake without cert — peer_master_identity is None ────────────
+// ─── Test 9: handshake without cert — connection is rejected ──────────────────
+//
+// The handshake now requires a device certificate. Cert-less peers must be
+// rejected with HandshakeFailed, not accepted with peer_master_identity=None.
 
 #[tokio::test]
-async fn handshake_without_cert_peer_master_identity_is_none() {
-    let (sk_a, _pk_a) = keygen();
-    let (sk_b, _pk_b) = keygen();
+async fn handshake_without_cert_connection_is_rejected() {
+    // Build two cert-less nodes (raw signing keys, no cert).
+    let (sk_a, _) = keygen();
+    let (sk_b, _) = keygen();
+
+    let make_certless_config = |sk: ed25519_dalek::SigningKey| NetworkConfig {
+        signing_key: sk,
+        known_peers: HashMap::new(),
+        device_cert: None,
+        iroh_secret_key: None,
+        relay_mode: RelayMode::Disabled,
+    };
 
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
-    let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(10);
+    let (tx_b, _rx_b) = tokio::sync::mpsc::channel(10);
 
-    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+    let handle_a = NetworkHandle::start(make_certless_config(sk_a), tx_a)
         .await
         .expect("handle_a");
-    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+    let handle_b = NetworkHandle::start(make_certless_config(sk_b), tx_b)
         .await
         .expect("handle_b");
 
     let addr_b = handle_b.local_addr().expect("addr_b");
 
-    let conn_a = handle_a.connect(addr_b, None).await.expect("connect");
-    let conn_b = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        rx_b.recv(),
-    )
-    .await
-    .expect("timeout")
-    .expect("channel closed");
-
-    // Neither side presents a device cert.
-    assert_eq!(conn_a.peer_master_identity, None, "no cert -> None");
-    assert_eq!(conn_b.peer_master_identity, None, "no cert -> None");
+    // A connects to B: B rejects A because A sends no cert.
+    // (The acceptor's recv_and_verify_handshake returns HandshakeFailed.)
+    // The initiator sees the connection fail.
+    let result = handle_a.connect(addr_b, None).await;
+    assert!(
+        result.is_err(),
+        "cert-less connection must be rejected"
+    );
 
     handle_a.shutdown().await;
     handle_b.shutdown().await;
@@ -487,16 +502,15 @@ fn to_endpoint_addr_accepts_arbitrary_bytes_in_iroh_096() {
 
 #[tokio::test]
 async fn add_peer_makes_get_connection_find_peer() {
-    let (sk_a, _) = keygen();
-    let (sk_b, pk_b) = keygen();
+    let (master_b, config_b) = make_node(20);
 
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
     let (tx_b, _rx_b) = tokio::sync::mpsc::channel(10);
 
-    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+    let handle_a = NetworkHandle::start(make_config_with_cert(21), tx_a)
         .await
         .expect("handle_a");
-    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+    let handle_b = NetworkHandle::start(config_b, tx_b)
         .await
         .expect("handle_b");
 
@@ -506,13 +520,15 @@ async fn add_peer_makes_get_connection_find_peer() {
         .connect(addr_b.clone(), None)
         .await
         .expect("connect");
-    let peer_identity = conn.peer_identity;
-    assert_eq!(peer_identity, pk_b, "peer identity from handshake matches B's key");
+    // Protocol operations key on master identity (from cert), not device identity.
+    let peer_master = conn.master_identity();
+    assert_eq!(peer_master, master_b, "peer master identity from handshake matches B's master key");
 
-    handle_a.add_peer(peer_identity, addr_b).await;
+    // Register peer by master identity so get_connection can find and verify it.
+    handle_a.add_peer(peer_master, addr_b).await;
 
     let _arc = handle_a
-        .get_connection(peer_identity)
+        .get_connection(peer_master)
         .await
         .expect("get_connection should succeed after add_peer");
 
@@ -751,12 +767,12 @@ async fn network_handle_starts_with_relay_default() {
 
 #[tokio::test]
 async fn get_connection_returns_error_during_backoff() {
-    let (sk_a, _pk_a) = keygen();
-    let (_, pk_b) = keygen();
+    // pk_b is a phantom master identity used only as a pool key.
+    let (pk_b, _) = make_node(30);
 
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
 
-    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+    let handle_a = NetworkHandle::start(make_config_with_cert(31), tx_a)
         .await
         .expect("handle_a");
 
@@ -791,33 +807,32 @@ async fn get_connection_returns_error_during_backoff() {
 
 #[tokio::test]
 async fn get_connection_reconnects_after_backoff_expires() {
-    let (sk_a, _pk_a) = keygen();
-    let (sk_b, pk_b) = keygen();
+    let (master_b, config_b) = make_node(32);
 
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
     let (tx_b, _rx_b) = tokio::sync::mpsc::channel(10);
 
-    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+    let handle_a = NetworkHandle::start(make_config_with_cert(33), tx_a)
         .await
         .expect("handle_a");
-    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+    let handle_b = NetworkHandle::start(config_b, tx_b)
         .await
         .expect("handle_b");
 
     let addr_b = handle_b.local_addr().expect("addr_b");
 
-    // Register peer_b so get_connection can resolve the address.
-    handle_a.add_peer(pk_b, addr_b).await;
+    // Register peer_b by master identity so get_connection can resolve the address.
+    handle_a.add_peer(master_b, addr_b).await;
 
     // Inject an expired backoff (retry_after = 1 second past epoch — always in the past).
-    handle_a.inject_backoff_for_test(pk_b, 1).await;
+    handle_a.inject_backoff_for_test(master_b, 1).await;
     assert!(
-        handle_a.is_peer_in_backoff(&pk_b).await,
+        handle_a.is_peer_in_backoff(&master_b).await,
         "sanity: injected backoff must be visible"
     );
 
     // get_connection must see the expired backoff and attempt a fresh connect.
-    let result = handle_a.get_connection(pk_b).await;
+    let result = handle_a.get_connection(master_b).await;
     assert!(
         result.is_ok(),
         "get_connection must succeed after backoff expires"
@@ -825,7 +840,7 @@ async fn get_connection_reconnects_after_backoff_expires() {
 
     // Pool must now contain a Live entry (not Backoff).
     assert!(
-        !handle_a.is_peer_in_backoff(&pk_b).await,
+        !handle_a.is_peer_in_backoff(&master_b).await,
         "pool must contain Live after successful reconnect"
     );
 
@@ -837,38 +852,37 @@ async fn get_connection_reconnects_after_backoff_expires() {
 
 #[tokio::test]
 async fn evict_connection_removes_live_entry() {
-    let (sk_a, _pk_a) = keygen();
-    let (sk_b, pk_b) = keygen();
+    let (master_b, config_b) = make_node(34);
 
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
     let (tx_b, _rx_b) = tokio::sync::mpsc::channel(10);
 
-    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+    let handle_a = NetworkHandle::start(make_config_with_cert(35), tx_a)
         .await
         .expect("handle_a");
-    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+    let handle_b = NetworkHandle::start(config_b, tx_b)
         .await
         .expect("handle_b");
 
     let addr_b = handle_b.local_addr().expect("addr_b");
 
-    // Establish a live connection and store it in the pool.
-    handle_a.add_peer(pk_b, addr_b).await;
+    // Establish a live connection and store it in the pool (keyed by master identity).
+    handle_a.add_peer(master_b, addr_b).await;
     let _arc = handle_a
-        .get_connection(pk_b)
+        .get_connection(master_b)
         .await
         .expect("initial get_connection");
     assert!(
-        !handle_a.is_peer_in_backoff(&pk_b).await,
+        !handle_a.is_peer_in_backoff(&master_b).await,
         "after successful connect, entry must be Live (not Backoff)"
     );
 
     // Evict it.
-    handle_a.evict_connection(pk_b).await;
+    handle_a.evict_connection(master_b).await;
 
     // Pool must now contain Backoff.
     assert!(
-        handle_a.is_peer_in_backoff(&pk_b).await,
+        handle_a.is_peer_in_backoff(&master_b).await,
         "after evict_connection, entry must be Backoff"
     );
 
@@ -883,25 +897,24 @@ async fn evict_connection_removes_live_entry() {
 
 #[tokio::test]
 async fn send_to_peer_records_backoff_on_send_failure() {
-    let (sk_a, _pk_a) = keygen();
-    let (sk_b, pk_b) = keygen();
+    let (master_b, config_b) = make_node(36);
 
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
     let (tx_b, _rx_b) = tokio::sync::mpsc::channel(10);
 
-    let handle_a = NetworkHandle::start(make_config(sk_a), tx_a)
+    let handle_a = NetworkHandle::start(make_config_with_cert(37), tx_a)
         .await
         .expect("handle_a");
-    let handle_b = NetworkHandle::start(make_config(sk_b), tx_b)
+    let handle_b = NetworkHandle::start(config_b, tx_b)
         .await
         .expect("handle_b");
 
     let addr_b = handle_b.local_addr().expect("addr_b");
-    handle_a.add_peer(pk_b, addr_b).await;
+    handle_a.add_peer(master_b, addr_b).await;
 
     // Establish a live connection (populates pool).
     let _arc = handle_a
-        .get_connection(pk_b)
+        .get_connection(master_b)
         .await
         .expect("initial get_connection");
 
@@ -923,7 +936,7 @@ async fn send_to_peer_records_backoff_on_send_failure() {
         },
     );
 
-    let result = handle_a.send_to_peer(pk_b, &msg).await;
+    let result = handle_a.send_to_peer(master_b, &msg).await;
     assert!(
         result.is_err(),
         "send_to_peer must fail after peer closes endpoint"
@@ -931,9 +944,50 @@ async fn send_to_peer_records_backoff_on_send_failure() {
 
     // The dead entry must have been replaced with Backoff.
     assert!(
-        handle_a.is_peer_in_backoff(&pk_b).await,
+        handle_a.is_peer_in_backoff(&master_b).await,
         "send_to_peer must record Backoff after send failure"
     );
 
     handle_a.shutdown().await;
+}
+
+// ─── Test: HKDF-derived master key works in handshake ────────────────────────
+
+#[tokio::test]
+async fn two_nodes_hkdf_master_key_handshake() {
+    // make_node uses derive_master_key + derive_device_key internally,
+    // replicating the real daemon key hierarchy.
+    let (master_pub_a, config_a) = make_node(1);
+    let (master_pub_b, config_b) = make_node(2);
+
+    let (tx_a, _rx_a) = tokio::sync::mpsc::channel(10);
+    let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(10);
+
+    let handle_a = NetworkHandle::start(config_a, tx_a)
+        .await
+        .expect("handle_a start");
+    let handle_b = NetworkHandle::start(config_b, tx_b)
+        .await
+        .expect("handle_b start");
+
+    let addr_b = handle_b.local_addr().expect("addr_b");
+
+    let conn_a_to_b = handle_a
+        .connect(addr_b, None)
+        .await
+        .expect("connect a -> b with HKDF master keys");
+
+    let incoming_b = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        rx_b.recv(),
+    )
+    .await
+    .expect("timeout")
+    .expect("channel closed");
+
+    assert_eq!(conn_a_to_b.master_identity(), master_pub_b);
+    assert_eq!(incoming_b.master_identity(), master_pub_a);
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
 }

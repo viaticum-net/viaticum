@@ -18,6 +18,9 @@
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
+use syncback_core::cluster::{
+    derive_device_key, derive_master_key, issue_device_certificate, master_identity,
+};
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
 use syncback_core::messages::{Message, RestoreDeniedMsg, RestoreResponseMsg};
@@ -730,11 +733,21 @@ async fn fetch_skips_denied_holder_and_tries_next() {
 
     let block_id = SourceBlockId([0xCCu8; 32]);
 
-    let sk_b = SigningKey::from_bytes(&[0x0Bu8; 32]);
-    let pk_b = IdentityPub(sk_b.verifying_key().to_bytes());
+    // Holder B: seed [0x0Bu8; 32]
+    let seed_b = [0x0Bu8; 32];
+    let master_key_b = derive_master_key(&seed_b).unwrap();
+    let master_b = master_identity(&master_key_b);
+    let did_b = DeviceId([0x0Bu8; 16]);
+    let device_key_b = derive_device_key(&seed_b, &did_b).unwrap();
+    let cert_b = issue_device_certificate(
+        &master_key_b,
+        did_b,
+        device_key_b.verifying_key().to_bytes(),
+        Timestamp::now(),
+    );
 
     let symbols_b = encoder
-        .encode(&padded, &params, 0, k_eff as u32, &block_id, &pk_b)
+        .encode(&padded, &params, 0, k_eff as u32, &block_id, &master_b)
         .expect("encode for holder_b");
 
     let holdings_dir_b = TempDir::new().unwrap();
@@ -744,8 +757,18 @@ async fn fetch_skips_denied_holder_and_tries_next() {
         std::fs::write(block_dir_b.join(format!("{}.bin", sym.esi)), &sym.data).unwrap();
     }
 
-    let sk_a = SigningKey::from_bytes(&[0x0Au8; 32]);
-    let pk_a = IdentityPub(sk_a.verifying_key().to_bytes());
+    // Holder A: seed [0x0Au8; 32]
+    let seed_a = [0x0Au8; 32];
+    let master_key_a = derive_master_key(&seed_a).unwrap();
+    let master_a = master_identity(&master_key_a);
+    let did_a = DeviceId([0x0Au8; 16]);
+    let device_key_a = derive_device_key(&seed_a, &did_a).unwrap();
+    let cert_a = issue_device_certificate(
+        &master_key_a,
+        did_a,
+        device_key_a.verifying_key().to_bytes(),
+        Timestamp::now(),
+    );
 
     let (tx_a, mut rx_a) =
         tokio::sync::mpsc::channel::<crate::daemon::network::connection::Connection>(4);
@@ -754,9 +777,9 @@ async fn fetch_skips_denied_holder_and_tries_next() {
 
     let handle_a = NetworkHandle::start(
         NetworkConfig {
-            signing_key: sk_a,
+            signing_key: device_key_a,
             known_peers: Default::default(),
-            device_cert: None,
+            device_cert: Some(cert_a),
             iroh_secret_key: None,
             relay_mode: iroh::RelayMode::Disabled,
         },
@@ -767,9 +790,9 @@ async fn fetch_skips_denied_holder_and_tries_next() {
 
     let handle_b = NetworkHandle::start(
         NetworkConfig {
-            signing_key: sk_b,
+            signing_key: device_key_b,
             known_peers: Default::default(),
-            device_cert: None,
+            device_cert: Some(cert_b),
             iroh_secret_key: None,
             relay_mode: iroh::RelayMode::Disabled,
         },
@@ -848,7 +871,7 @@ async fn fetch_skips_denied_holder_and_tries_next() {
     // Placement for Holder A: claims 1 symbol (it will deny).
     let placement_a = SymbolPlacement {
         source_block_id: block_id,
-        holder_id: pk_a,
+        holder_id: master_a,
         file_id: FileId(1),
         esi_ranges: vec![(0, 1)],
         binding_seed: [0u8; 32],
@@ -862,7 +885,7 @@ async fn fetch_skips_denied_holder_and_tries_next() {
     // Placement for Holder B: all k_eff symbols.
     let placement_b = SymbolPlacement {
         source_block_id: block_id,
-        holder_id: pk_b,
+        holder_id: master_b,
         file_id: FileId(1),
         esi_ranges: vec![(0, k_eff as u32)],
         binding_seed: [0u8; 32],
@@ -873,13 +896,24 @@ async fn fetch_skips_denied_holder_and_tries_next() {
     };
     db.upsert_placement(&placement_b).unwrap();
 
-    let sk_owner = SigningKey::from_bytes(&[0x99u8; 32]);
+    // Owner: seed [0x99u8; 32]
+    let seed_owner = [0x99u8; 32];
+    let owner_master_key = derive_master_key(&seed_owner).unwrap();
+    let owner_master = master_identity(&owner_master_key);
+    let owner_did = DeviceId([0xAAu8; 16]);
+    let owner_device_key = derive_device_key(&seed_owner, &owner_did).unwrap();
+    let owner_cert = issue_device_certificate(
+        &owner_master_key,
+        owner_did,
+        owner_device_key.verifying_key().to_bytes(),
+        Timestamp::now(),
+    );
     let (tx_owner, _rx_owner) = tokio::sync::mpsc::channel(4);
     let owner_net = NetworkHandle::start(
         NetworkConfig {
-            signing_key: sk_owner,
+            signing_key: owner_device_key,
             known_peers: Default::default(),
-            device_cert: None,
+            device_cert: Some(owner_cert),
             iroh_secret_key: None,
             relay_mode: iroh::RelayMode::Disabled,
         },
@@ -887,14 +921,14 @@ async fn fetch_skips_denied_holder_and_tries_next() {
     )
     .await
     .unwrap();
-    owner_net.add_peer(pk_a, addr_a).await;
-    owner_net.add_peer(pk_b, addr_b).await;
+    owner_net.add_peer(master_a, addr_a).await;
+    owner_net.add_peer(master_b, addr_b).await;
 
     let restore_config = RestoreConfig {
         epoch_key,
         parallel_holders: 5,
-        identity: IdentityPub([0x99u8; 32]),
-        device_id: DeviceId([0xAAu8; 16]),
+        identity: owner_master,
+        device_id: owner_did,
         symbols_dir: symbols_dir.path().to_path_buf(),
     };
     let coord = RestoreCoordinator::new(
@@ -956,20 +990,41 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
 
     let block_id = SourceBlockId([0xDDu8; 32]);
 
-    let sk_h1 = SigningKey::from_bytes(&[0x11u8; 32]);
-    let pk_h1 = IdentityPub(sk_h1.verifying_key().to_bytes());
-    let sk_h2 = SigningKey::from_bytes(&[0x22u8; 32]);
-    let pk_h2 = IdentityPub(sk_h2.verifying_key().to_bytes());
+    // Holder H1: seed [0x11u8; 32]
+    let seed_h1 = [0x11u8; 32];
+    let master_key_h1 = derive_master_key(&seed_h1).unwrap();
+    let master_h1 = master_identity(&master_key_h1);
+    let did_h1 = DeviceId([0x11u8; 16]);
+    let device_key_h1 = derive_device_key(&seed_h1, &did_h1).unwrap();
+    let cert_h1 = issue_device_certificate(
+        &master_key_h1,
+        did_h1,
+        device_key_h1.verifying_key().to_bytes(),
+        Timestamp::now(),
+    );
+
+    // Holder H2: seed [0x22u8; 32]
+    let seed_h2 = [0x22u8; 32];
+    let master_key_h2 = derive_master_key(&seed_h2).unwrap();
+    let master_h2 = master_identity(&master_key_h2);
+    let did_h2 = DeviceId([0x22u8; 16]);
+    let device_key_h2 = derive_device_key(&seed_h2, &did_h2).unwrap();
+    let cert_h2 = issue_device_certificate(
+        &master_key_h2,
+        did_h2,
+        device_key_h2.verifying_key().to_bytes(),
+        Timestamp::now(),
+    );
 
     // Split k_eff symbols between two holders.
     let h1_count = (k_eff / 2) as u32;
     let h2_count = k_eff as u32 - h1_count;
 
     let symbols_h1 = encoder
-        .encode(&padded, &params, 0, h1_count, &block_id, &pk_h1)
+        .encode(&padded, &params, 0, h1_count, &block_id, &master_h1)
         .expect("encode h1");
     let symbols_h2 = encoder
-        .encode(&padded, &params, h1_count, h2_count, &block_id, &pk_h2)
+        .encode(&padded, &params, h1_count, h2_count, &block_id, &master_h2)
         .expect("encode h2");
 
     let block_hex = hex_encode(&block_id.0);
@@ -995,9 +1050,9 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
 
     let handle_h1 = NetworkHandle::start(
         NetworkConfig {
-            signing_key: sk_h1,
+            signing_key: device_key_h1,
             known_peers: Default::default(),
-            device_cert: None,
+            device_cert: Some(cert_h1),
             iroh_secret_key: None,
             relay_mode: iroh::RelayMode::Disabled,
         },
@@ -1008,9 +1063,9 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
 
     let handle_h2 = NetworkHandle::start(
         NetworkConfig {
-            signing_key: sk_h2,
+            signing_key: device_key_h2,
             known_peers: Default::default(),
-            device_cert: None,
+            device_cert: Some(cert_h2),
             iroh_secret_key: None,
             relay_mode: iroh::RelayMode::Disabled,
         },
@@ -1080,7 +1135,7 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
 
     let placement_h1 = SymbolPlacement {
         source_block_id: block_id,
-        holder_id: pk_h1,
+        holder_id: master_h1,
         file_id: FileId(1),
         esi_ranges: vec![(0, h1_count)],
         binding_seed: [0u8; 32],
@@ -1093,7 +1148,7 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
 
     let placement_h2 = SymbolPlacement {
         source_block_id: block_id,
-        holder_id: pk_h2,
+        holder_id: master_h2,
         file_id: FileId(1),
         esi_ranges: vec![(h1_count, h2_count)],
         binding_seed: [0u8; 32],
@@ -1104,13 +1159,24 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
     };
     db.upsert_placement(&placement_h2).unwrap();
 
-    let sk_owner = SigningKey::from_bytes(&[0x55u8; 32]);
+    // Owner: seed [0x55u8; 32]
+    let seed_owner = [0x55u8; 32];
+    let owner_master_key = derive_master_key(&seed_owner).unwrap();
+    let owner_master = master_identity(&owner_master_key);
+    let owner_did = DeviceId([0x66u8; 16]);
+    let owner_device_key = derive_device_key(&seed_owner, &owner_did).unwrap();
+    let owner_cert = issue_device_certificate(
+        &owner_master_key,
+        owner_did,
+        owner_device_key.verifying_key().to_bytes(),
+        Timestamp::now(),
+    );
     let (tx_owner, _rx_owner) = tokio::sync::mpsc::channel(4);
     let owner_net = NetworkHandle::start(
         NetworkConfig {
-            signing_key: sk_owner,
+            signing_key: owner_device_key,
             known_peers: Default::default(),
-            device_cert: None,
+            device_cert: Some(owner_cert),
             iroh_secret_key: None,
             relay_mode: iroh::RelayMode::Disabled,
         },
@@ -1118,8 +1184,8 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
     )
     .await
     .unwrap();
-    owner_net.add_peer(pk_h1, addr_h1).await;
-    owner_net.add_peer(pk_h2, addr_h2).await;
+    owner_net.add_peer(master_h1, addr_h1).await;
+    owner_net.add_peer(master_h2, addr_h2).await;
 
     // Owner symbols_dir is EMPTY.
     let symbols_dir = TempDir::new().unwrap();
@@ -1127,8 +1193,8 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
     let restore_config = RestoreConfig {
         epoch_key,
         parallel_holders: 5,
-        identity: IdentityPub([0x55u8; 32]),
-        device_id: DeviceId([0x66u8; 16]),
+        identity: owner_master,
+        device_id: owner_did,
         symbols_dir: symbols_dir.path().to_path_buf(),
     };
     let coord = RestoreCoordinator::new(db, restore_config, encoder, Arc::new(owner_net));

@@ -24,12 +24,13 @@ async fn make_test_state() -> Arc<DaemonState> {
     let db = Db::open_in_memory().expect("in-memory db");
     let device_id = DeviceId([0u8; 16]);
 
-    // In production, signing_key = master_key, so identity_pub = master_key.verifying_key().
+    // In production: identity_pub = master_identity(master_key), signing_key = device_key.
     let master_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     let identity_pub = IdentityPub(master_key.verifying_key().to_bytes());
+    let device_key = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
 
     let net_config = NetworkConfig {
-        signing_key: master_key.clone(),
+        signing_key: device_key,
         known_peers: Default::default(),
         device_cert: None,
         iroh_secret_key: None,
@@ -239,28 +240,33 @@ async fn dispatch_connect_valid_addr_but_unreachable_returns_error() {
 #[tokio::test]
 async fn dispatch_connect_two_daemons_registers_peer() {
     use std::sync::Arc;
+    use syncback_core::cluster::{derive_master_key, derive_device_key, master_identity, issue_device_certificate};
     use syncback_core::db::Db;
-    use syncback_core::types::DeviceId;
+    use syncback_core::types::{DeviceId, Timestamp};
     use crate::daemon::network::{NetworkConfig, NetworkHandle};
 
-    let (sk_a, pk_a) = {
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-        let pk = IdentityPub(sk.verifying_key().to_bytes());
-        (sk, pk)
-    };
-    let (sk_b, pk_b) = {
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
-        let pk = IdentityPub(sk.verifying_key().to_bytes());
-        (sk, pk)
-    };
+    let seed_a = [1u8; 32];
+    let seed_b = [2u8; 32];
+    let master_a = derive_master_key(&seed_a).unwrap();
+    let master_b = derive_master_key(&seed_b).unwrap();
+    let pk_a = master_identity(&master_a);
+    let pk_b = master_identity(&master_b);
+
+    let did_a = DeviceId([1u8; 16]);
+    let did_b = DeviceId([2u8; 16]);
+    let device_a = derive_device_key(&seed_a, &did_a).unwrap();
+    let device_b = derive_device_key(&seed_b, &did_b).unwrap();
+
+    let cert_a = issue_device_certificate(&master_a, did_a, device_a.verifying_key().to_bytes(), Timestamp::now());
+    let cert_b = issue_device_certificate(&master_b, did_b, device_b.verifying_key().to_bytes(), Timestamp::now());
 
     let (tx_b, _rx_b) = mpsc::channel::<crate::daemon::network::connection::Connection>(4);
     let handle_b = Arc::new(
         NetworkHandle::start(
             NetworkConfig {
-                signing_key: sk_b,
+                signing_key: device_b,
                 known_peers: Default::default(),
-                device_cert: None,
+                device_cert: Some(cert_b),
                 iroh_secret_key: None,
                 relay_mode: RelayMode::Disabled,
             },
@@ -283,9 +289,9 @@ async fn dispatch_connect_two_daemons_registers_peer() {
     let handle_a = Arc::new(
         NetworkHandle::start(
             NetworkConfig {
-                signing_key: sk_a,
+                signing_key: device_a,
                 known_peers: Default::default(),
-                device_cert: None,
+                device_cert: Some(cert_a),
                 iroh_secret_key: None,
                 relay_mode: RelayMode::Disabled,
             },
@@ -301,12 +307,12 @@ async fn dispatch_connect_two_daemons_registers_peer() {
     let state_a = Arc::new(DaemonState {
         db: db_a.clone(),
         identity_pub: pk_a,
-        device_id: DeviceId([1u8; 16]),
+        device_id: did_a,
         network: handle_a.clone(),
         restore_tx,
         cluster_state: None,
         incoming_tx: tx_a_for_state,
-        master_key: ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
+        master_key: master_a,
         seed: vec![0u8; 64],
         data_dir: std::path::PathBuf::from("/tmp"),
         soft_quota_bytes: 0,
@@ -319,16 +325,16 @@ async fn dispatch_connect_two_daemons_registers_peer() {
     let CliResponse::Connected { peer_id } = response else {
         panic!("expected Connected, got {response:?}");
     };
+    // Connected peer_id should be B's master identity (from cert).
     let expected_hex: String = pk_b.0.iter().map(|b| format!("{b:02x}")).collect();
-    assert_eq!(peer_id, expected_hex, "peer_id should be B's full identity hex");
+    assert_eq!(peer_id, expected_hex, "peer_id should be B's master identity hex");
 
+    // Peer should be stored under master identity.
     let stored = db_a.get_peer(&pk_b).expect("db get_peer").expect("peer in db");
     assert_eq!(stored.identity, pk_b);
     assert!(!stored.addrs.is_empty(), "addr should be stored");
 
     let _ = handle_a.get_connection(pk_b).await.expect("get_connection after connect");
-    // Handles are inside Arc (shared with state_a), so we skip explicit shutdown;
-    // iroh endpoints are closed when the Arc is dropped at end of test.
 }
 
 // ============================================================

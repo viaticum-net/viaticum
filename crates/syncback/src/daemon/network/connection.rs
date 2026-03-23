@@ -33,8 +33,9 @@ use crate::daemon::network::NetworkError;
 pub struct Connection {
     /// Authenticated remote identity (from handshake sig — device-level key).
     pub peer_identity: IdentityPub,
-    /// Peer's cluster master identity, if they presented a valid device cert.
-    /// None if peer has no device_cert (single-device node).
+    /// Peer's master identity (from device cert). Every node must present a cert,
+    /// so this is always Some after a valid handshake. Trust, placement, and all
+    /// protocol operations use this identity — never the device-level key.
     pub peer_master_identity: Option<IdentityPub>,
     /// iroh connection handle (kept alive so the connection does not close).
     #[allow(dead_code)]
@@ -61,6 +62,14 @@ impl Connection {
             send: Mutex::new(send),
             recv: Mutex::new(recv),
         }
+    }
+
+    /// The peer's master identity. All protocol operations (trust, placement,
+    /// PoS) use this identity. Panics if the peer did not present a device cert —
+    /// this should never happen because the handshake rejects cert-less peers.
+    pub fn master_identity(&self) -> IdentityPub {
+        self.peer_master_identity
+            .expect("BUG: connection without device cert — handshake should have rejected")
     }
 
     /// Send a [`Message`] on this connection.

@@ -686,7 +686,7 @@ async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
         }
     };
 
-    let peer_identity = conn.peer_identity;
+    let peer_identity = conn.master_identity();
     let now = Timestamp::now();
 
     let existing = state.db.get_peer(&peer_identity).unwrap_or(None);

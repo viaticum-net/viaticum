@@ -25,6 +25,7 @@ use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder, Symbol};
 use syncback_core::messages::{Message, SymbolTransferMsg};
 use syncback_core::placement::{compute_allocation, HolderCandidate};
+use syncback_core::cluster::{derive_device_key, derive_master_key, issue_device_certificate};
 use syncback_core::types::{DeviceId, ErasureParams, IdentityPub, SourceBlockId, Timestamp};
 use tempfile::TempDir;
 
@@ -242,20 +243,41 @@ async fn backup_restore_pack_multiple_files() {
 
 #[tokio::test]
 async fn network_symbol_transfer_between_nodes() {
-    let sk_a = SigningKey::generate(&mut OsRng);
-    let sk_b = SigningKey::generate(&mut OsRng);
+    // Node A
+    let seed_a = [0xA1u8; 32];
+    let master_key_a = derive_master_key(&seed_a).unwrap();
+    let did_a = DeviceId([0xA1u8; 16]);
+    let device_key_a = derive_device_key(&seed_a, &did_a).unwrap();
+    let cert_a = issue_device_certificate(
+        &master_key_a,
+        did_a,
+        device_key_a.verifying_key().to_bytes(),
+        Timestamp::now(),
+    );
+
+    // Node B
+    let seed_b = [0xB1u8; 32];
+    let master_key_b = derive_master_key(&seed_b).unwrap();
+    let did_b = DeviceId([0xB1u8; 16]);
+    let device_key_b = derive_device_key(&seed_b, &did_b).unwrap();
+    let cert_b = issue_device_certificate(
+        &master_key_b,
+        did_b,
+        device_key_b.verifying_key().to_bytes(),
+        Timestamp::now(),
+    );
 
     let (tx_a, _rx_a) = tokio::sync::mpsc::channel(64);
     let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(64);
 
     let handle_a = NetworkHandle::start(
-        NetworkConfig { signing_key: sk_a, known_peers: HashMap::new(), device_cert: None, iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled },
+        NetworkConfig { signing_key: device_key_a, known_peers: HashMap::new(), device_cert: Some(cert_a), iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled },
         tx_a,
     )
     .await
     .unwrap();
     let handle_b = NetworkHandle::start(
-        NetworkConfig { signing_key: sk_b, known_peers: HashMap::new(), device_cert: None, iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled },
+        NetworkConfig { signing_key: device_key_b, known_peers: HashMap::new(), device_cert: Some(cert_b), iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled },
         tx_b,
     )
     .await

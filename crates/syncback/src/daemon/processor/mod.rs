@@ -203,7 +203,7 @@ impl Processor {
                             break;
                         }
                         Some(conn) => {
-                            let peer_id = conn.peer_identity;
+                            let peer_id = conn.master_identity();
 
                             // Send PeerAnnounce on this connection before
                             // splitting into separate read-loop and pool entry.

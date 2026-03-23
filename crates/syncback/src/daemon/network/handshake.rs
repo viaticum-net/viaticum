@@ -100,9 +100,9 @@ async fn send_handshake_on_stream(
 
 /// Read and verify a single HandshakeMsg from a RecvStream.
 ///
-/// Returns `(peer_identity, peer_master_identity)` on success.
-/// `peer_master_identity` is `Some(master_pub)` if the peer presented a valid
-/// device certificate, `None` for single-device nodes.
+/// Returns `(peer_device_identity, peer_master_identity)` on success.
+/// Every peer must present a device certificate proving the link device→master.
+/// Connections without a cert are rejected.
 async fn recv_and_verify_handshake(
     recv: &mut iroh::endpoint::RecvStream,
     expected_identity: Option<IdentityPub>,
@@ -114,19 +114,27 @@ async fn recv_and_verify_handshake(
             verify_handshake(&hs, Timestamp::now())
                 .map_err(|e| NetworkError::HandshakeFailed(e.to_string()))?;
 
+            let peer_master_identity = extract_cluster_identity(&hs)
+                .map_err(|e| NetworkError::HandshakeFailed(e.to_string()))?;
+
+            let master_pub = peer_master_identity.ok_or_else(|| {
+                NetworkError::HandshakeFailed(
+                    "peer did not present a device certificate".to_string(),
+                )
+            })?;
+
+            // Check expected identity against the MASTER identity (from cert),
+            // not the device identity. Protocol operations key on master identity.
             if let Some(expected) = expected_identity {
-                if hs.identity_pub != expected {
+                if master_pub != expected {
                     return Err(NetworkError::IdentityMismatch {
                         expected,
-                        got: hs.identity_pub,
+                        got: master_pub,
                     });
                 }
             }
 
-            let peer_master_identity = extract_cluster_identity(&hs)
-                .map_err(|e| NetworkError::HandshakeFailed(e.to_string()))?;
-
-            Ok((hs.identity_pub, peer_master_identity))
+            Ok((hs.identity_pub, Some(master_pub)))
         }
         other => Err(NetworkError::HandshakeFailed(format!(
             "expected Handshake variant, got {:?}",

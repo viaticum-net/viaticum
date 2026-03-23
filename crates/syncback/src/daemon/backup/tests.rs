@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use syncback_core::cluster::{
-    derive_master_key, issue_device_certificate, master_identity, ClusterState,
+    derive_device_key, derive_master_key, issue_device_certificate, master_identity, ClusterState,
 };
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
@@ -848,7 +848,6 @@ async fn deliver_symbols_logs_warn_on_peer_not_found() {
 async fn deliver_symbols_sends_to_reachable_holder() {
     use std::collections::HashMap;
 
-    use ed25519_dalek::SigningKey;
     use syncback_core::messages::Message;
     use syncback_core::types::{IdentityPub, PlacementStatus, SymbolPlacement};
 
@@ -856,9 +855,30 @@ async fn deliver_symbols_sends_to_reachable_holder() {
 
     use super::PipelineResult;
 
-    let sk_owner = SigningKey::from_bytes(&[20u8; 32]);
-    let sk_holder = SigningKey::from_bytes(&[21u8; 32]);
-    let holder_identity = IdentityPub(sk_holder.verifying_key().to_bytes());
+    // Owner: seed [20u8; 32]
+    let owner_seed = [20u8; 32];
+    let owner_master_key = derive_master_key(&owner_seed).unwrap();
+    let owner_did = DeviceId([20u8; 16]);
+    let owner_device_key = derive_device_key(&owner_seed, &owner_did).unwrap();
+    let owner_cert = issue_device_certificate(
+        &owner_master_key,
+        owner_did,
+        owner_device_key.verifying_key().to_bytes(),
+        Timestamp::now(),
+    );
+
+    // Holder: seed [21u8; 32]
+    let holder_seed = [21u8; 32];
+    let holder_master_key = derive_master_key(&holder_seed).unwrap();
+    let holder_master = master_identity(&holder_master_key);
+    let holder_did = DeviceId([21u8; 16]);
+    let holder_device_key = derive_device_key(&holder_seed, &holder_did).unwrap();
+    let holder_cert = issue_device_certificate(
+        &holder_master_key,
+        holder_did,
+        holder_device_key.verifying_key().to_bytes(),
+        Timestamp::now(),
+    );
 
     let (tx_owner, _rx_owner) = tokio::sync::mpsc::channel(4);
     let (tx_holder, mut rx_holder) = tokio::sync::mpsc::channel(4);
@@ -866,9 +886,9 @@ async fn deliver_symbols_sends_to_reachable_holder() {
     let network_holder = std::sync::Arc::new(
         NetworkHandle::start(
             NetworkConfig {
-                signing_key: sk_holder,
+                signing_key: holder_device_key,
                 known_peers: HashMap::new(),
-                device_cert: None,
+                device_cert: Some(holder_cert),
                 iroh_secret_key: None,
                 relay_mode: iroh::RelayMode::Disabled,
             },
@@ -881,14 +901,14 @@ async fn deliver_symbols_sends_to_reachable_holder() {
     let holder_addr = network_holder.local_addr().unwrap();
 
     let mut known_peers = HashMap::new();
-    known_peers.insert(holder_identity, holder_addr);
+    known_peers.insert(holder_master, holder_addr);
 
     let network_owner = std::sync::Arc::new(
         NetworkHandle::start(
             NetworkConfig {
-                signing_key: sk_owner.clone(),
+                signing_key: owner_device_key,
                 known_peers,
-                device_cert: None,
+                device_cert: Some(owner_cert),
                 iroh_secret_key: None,
                 relay_mode: iroh::RelayMode::Disabled,
             },
@@ -911,7 +931,7 @@ async fn deliver_symbols_sends_to_reachable_holder() {
 
     let placement = SymbolPlacement {
         source_block_id: block_id,
-        holder_id: holder_identity,
+        holder_id: holder_master,
         file_id: FileId(1),
         esi_ranges: vec![(0, 2)],
         binding_seed: [0u8; 32],
@@ -937,7 +957,7 @@ async fn deliver_symbols_sends_to_reachable_holder() {
         k: 2,
         n: 4,
         t: 65535,
-        symbol_count_per_holder: vec![(holder_identity, 2)],
+        symbol_count_per_holder: vec![(holder_master, 2)],
         stored_size: 128,
     };
 
