@@ -151,7 +151,7 @@ pub async fn run_periodic_push(
         let mut fail_count = 0usize;
         for peer in &peers {
             let identity = peer.identity;
-            match network.send_message_oneshot(identity, &msg).await {
+            match network.send_to_peer(identity, &msg).await {
                 Ok(()) => ok_count += 1,
                 Err(e) => {
                     warn!(peer = %identity, error = %e, "system_state push: send failed");

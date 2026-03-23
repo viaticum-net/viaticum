@@ -307,6 +307,10 @@ pub struct PeerDiscoveryResponseMsg {
 pub struct DiscoveredPeer {
     pub identity_pub: IdentityPub,
     pub node_id: NodeId,
+    /// Known addresses in "NodeId_hex@ip:port" format. Added in protocol v2.
+    /// Empty on older peers that don't include addrs in their response.
+    #[serde(default)]
+    pub addrs: Vec<String>,
 }
 
 // ============================================================

@@ -670,10 +670,12 @@ fn peer_discovery_response_msg_roundtrip() {
             DiscoveredPeer {
                 identity_pub: make_identity_pub(10),
                 node_id: make_node_id(10),
+                addrs: vec![],
             },
             DiscoveredPeer {
                 identity_pub: make_identity_pub(11),
                 node_id: make_node_id(11),
+                addrs: vec![],
             },
         ],
         timestamp: Timestamp(1_000_005),
@@ -682,6 +684,61 @@ fn peer_discovery_response_msg_roundtrip() {
     let (decoded, consumed) = unframe_message(&framed).unwrap();
     assert_eq!(decoded, msg);
     assert_eq!(consumed, framed.len());
+}
+
+#[test]
+fn discovered_peer_with_addrs_roundtrip() {
+    let msg = Message::PeerDiscoveryResponse(PeerDiscoveryResponseMsg {
+        v: 1,
+        peers: vec![DiscoveredPeer {
+            identity_pub: make_identity_pub(20),
+            node_id: make_node_id(20),
+            addrs: vec![
+                "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890@192.168.1.5:12345"
+                    .to_string(),
+                "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890@[::1]:9000"
+                    .to_string(),
+            ],
+        }],
+        timestamp: Timestamp(1_000_006),
+    });
+    let framed = frame_message(&msg).unwrap();
+    let (decoded, consumed) = unframe_message(&framed).unwrap();
+    assert_eq!(decoded, msg);
+    assert_eq!(consumed, framed.len());
+}
+
+#[test]
+fn discovered_peer_addrs_default_for_old_cbor() {
+    // Simulate a DiscoveredPeer serialized without the addrs field (protocol v1 peer).
+    // With #[serde(default)], decoding must succeed and addrs must be empty.
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct OldDiscoveredPeer {
+        identity_pub: IdentityPub,
+        node_id: NodeId,
+    }
+    #[derive(Serialize)]
+    struct OldPeerDiscoveryResponseMsg {
+        v: u8,
+        peers: Vec<OldDiscoveredPeer>,
+        timestamp: Timestamp,
+    }
+
+    let old = OldPeerDiscoveryResponseMsg {
+        v: 1,
+        peers: vec![OldDiscoveredPeer {
+            identity_pub: make_identity_pub(30),
+            node_id: make_node_id(30),
+        }],
+        timestamp: Timestamp(1_000_007),
+    };
+    let cbor = to_cbor(&old).unwrap();
+    let decoded: PeerDiscoveryResponseMsg = from_cbor(&cbor).unwrap();
+    assert_eq!(decoded.peers.len(), 1);
+    assert_eq!(decoded.peers[0].identity_pub, make_identity_pub(30));
+    assert_eq!(decoded.peers[0].addrs, Vec::<String>::new());
 }
 
 // ─── build_peer_announce / verify_peer_announce ───────────────────────────────

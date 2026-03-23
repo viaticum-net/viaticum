@@ -110,6 +110,8 @@ async fn make_processor_with_quota(
 
     let (backup_event_tx, _backup_event_rx) =
         tokio::sync::mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
+    let pending_challenges: crate::daemon::scheduler::PendingChallenges =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let processor = Processor::new(
         db,
         own_identity,
@@ -124,6 +126,7 @@ async fn make_processor_with_quota(
         hard_quota_bytes,
         backup_event_tx,
         1, // time_scale
+        pending_challenges,
     );
 
     (processor, repair_rx, relay_sync_rx)
@@ -1328,10 +1331,12 @@ async fn handle_peer_discovery_response_logs_without_error() {
             DiscoveredPeer {
                 identity_pub: make_identity(71),
                 node_id: NodeId([71u8; 32]),
+                addrs: vec![],
             },
             DiscoveredPeer {
                 identity_pub: make_identity(72),
                 node_id: NodeId([72u8; 32]),
+                addrs: vec![],
             },
         ],
         timestamp: Timestamp::now(),

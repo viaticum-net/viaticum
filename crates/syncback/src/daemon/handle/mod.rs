@@ -418,6 +418,11 @@ impl DaemonHandle {
         }));
 
         // ── Phase 7.2: spawn Processor ────────────────────────────────────────
+        // Create the PendingChallenges map here so both Processor and Scheduler
+        // share the same Arc. Scheduler is wired below; Processor consumes its clone.
+        let pending_challenges: PendingChallenges =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
         let repair_tx_for_processor = repair_tx.clone();
         let soft_quota_bytes = syncback_core::config::soft_quota_bytes(&app_config);
         let hard_quota_bytes = syncback_core::config::hard_quota_bytes(&app_config);
@@ -435,7 +440,7 @@ impl DaemonHandle {
             ));
             // Create channel for auto-reconnect read loops and wire to network.
             let (read_loop_tx, read_loop_rx) =
-                mpsc::channel::<crate::daemon::network::ReadLoopRequest>(64);
+                mpsc::unbounded_channel::<crate::daemon::network::ReadLoopRequest>();
             network.set_read_loop_tx(read_loop_tx);
 
             let processor = Processor::new(
@@ -452,6 +457,7 @@ impl DaemonHandle {
                 hard_quota_bytes,
                 backup_event_tx,
                 time_scale,
+                pending_challenges.clone(),
             );
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {
@@ -496,11 +502,8 @@ impl DaemonHandle {
             }));
         }
         // ── Phase 6.5: Scheduler ──────────────────────────────────────────────
-        // Create the shared PendingChallenges map. The Scheduler writes to it.
-        // TODO: wire to Processor so PosResponse can be matched without ESI scan.
-        let pending_challenges: PendingChallenges =
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-
+        // Pass the same PendingChallenges Arc created for Processor above.
+        // Scheduler writes to it; Processor reads it when verifying PosResponse.
         let scheduler = Scheduler::new(
             db.clone(),
             SchedulerConfig {

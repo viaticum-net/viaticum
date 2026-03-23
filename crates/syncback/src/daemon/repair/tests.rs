@@ -43,6 +43,8 @@ fn make_source_block_record(bid: SourceBlockId, k: u32, t: u16) -> SourceBlockRe
         status: SourceBlockStatus::Active,
         created_at: now(),
         encrypted_size: Some(k as u64 * t as u64),
+        n: None,
+        overhead: None,
     }
 }
 

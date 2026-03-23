@@ -46,6 +46,9 @@ pub enum VerifyOutcome {
     Timeout,
     /// Holder explicitly responded that it does not hold this symbol (PosNack received).
     NotHeld { esi: u32 },
+    /// Source block data is unavailable on the owner side (DB record or file missing).
+    /// Verification is impossible; no trust event recorded, placement state unchanged.
+    CannotVerify,
 }
 
 /// One holder's challenge schedule entry.
@@ -263,11 +266,21 @@ pub fn is_timed_out(challenge: &PosChallenge, now: Timestamp) -> bool {
 ///
 /// week_number: monotonically increasing protocol week number (caller tracks this).
 pub fn outcome_from_verify(result: &VerifyOutcome, week_number: u32) -> PosOutcome {
+    // CannotVerify: owner cannot verify, so no challenge is recorded at all.
+    if matches!(result, VerifyOutcome::CannotVerify) {
+        return PosOutcome {
+            week_number,
+            challenged: 0,
+            passed: 0,
+        };
+    }
+
     let passed = match result {
         VerifyOutcome::Pass => 1,
         VerifyOutcome::Fail { .. }
         | VerifyOutcome::Timeout
         | VerifyOutcome::NotHeld { .. } => 0,
+        VerifyOutcome::CannotVerify => unreachable!("handled above"),
     };
     PosOutcome {
         week_number,
@@ -326,6 +339,12 @@ pub fn apply_pos_outcome(
         VerifyOutcome::Pass => PlacementTransition {
             new_status: PlacementStatus::Alive,
             new_consecutive_misses: 0,
+            trigger_repair: false,
+        },
+
+        VerifyOutcome::CannotVerify => PlacementTransition {
+            new_status: placement.status,
+            new_consecutive_misses: placement.consecutive_misses,
             trigger_repair: false,
         },
 

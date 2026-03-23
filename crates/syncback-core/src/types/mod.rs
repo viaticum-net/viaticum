@@ -265,6 +265,37 @@ pub struct SourceBlockRecord {
     /// None for records created before this field was added (legacy).
     #[serde(default)]
     pub encrypted_size: Option<u64>,
+    /// Total repair symbols distributed (N = ceil(k_eff * overhead)).
+    /// None for records created before this field was added (legacy).
+    #[serde(default)]
+    pub n: Option<u32>,
+    /// Overhead multiplier used at encode time (1.5 + importance * 1.5).
+    /// None for records created before this field was added (legacy).
+    #[serde(default)]
+    pub overhead: Option<f64>,
+}
+
+impl SourceBlockRecord {
+    /// Return the ErasureParams for this block.
+    ///
+    /// If both `n` and `overhead` are stored, uses them directly.
+    /// Otherwise falls back to `ErasureParams::compute(k * t, 0.0)` for legacy records
+    /// (importance=0.0 gives the most conservative overhead=1.5).
+    pub fn erasure_params(&self) -> ErasureParams {
+        match (self.n, self.overhead) {
+            (Some(n), Some(overhead)) => {
+                let k_eff = self.k + DECODE_OVERHEAD;
+                ErasureParams {
+                    k: self.k,
+                    k_eff,
+                    t: self.t,
+                    overhead,
+                    n,
+                }
+            }
+            _ => ErasureParams::compute(self.k as u64 * self.t as u64, 0.0),
+        }
+    }
 }
 
 /// Symbol placement from owner's perspective. Key: (SourceBlockId, holder IdentityPub).

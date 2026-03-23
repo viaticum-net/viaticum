@@ -1021,6 +1021,8 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
         status: SourceBlockStatus::Active,
         created_at: Timestamp::now(),
         encrypted_size: Some(encrypted_size),
+        n: None,
+        overhead: None,
     };
     db.upsert_source_block(&block_record).unwrap();
 

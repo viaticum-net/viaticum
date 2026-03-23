@@ -1,5 +1,107 @@
 use super::*;
 
+// ============================================================
+// SourceBlockRecord::erasure_params tests
+// ============================================================
+
+#[test]
+fn erasure_params_returns_stored_values() {
+    let record = SourceBlockRecord {
+        block_id: SourceBlockId([0; 32]),
+        k: 100,
+        t: 65535,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(0),
+        encrypted_size: None,
+        n: Some(512),
+        overhead: Some(3.0),
+    };
+    let params = record.erasure_params();
+    assert_eq!(params.k, 100);
+    assert_eq!(params.k_eff, 103); // k + DECODE_OVERHEAD (3)
+    assert_eq!(params.t, 65535);
+    assert_eq!(params.n, 512);
+    assert!((params.overhead - 3.0).abs() < 1e-10);
+}
+
+#[test]
+fn erasure_params_legacy_fallback() {
+    // n=None, overhead=None → falls back to ErasureParams::compute(k*t, 0.0)
+    let k: u32 = 100;
+    let t: u16 = 65535;
+    let record = SourceBlockRecord {
+        block_id: SourceBlockId([0; 32]),
+        k,
+        t,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(0),
+        encrypted_size: None,
+        n: None,
+        overhead: None,
+    };
+    let params = record.erasure_params();
+    let expected = ErasureParams::compute(k as u64 * t as u64, 0.0);
+    assert_eq!(params.k, expected.k);
+    assert_eq!(params.k_eff, expected.k_eff);
+    assert_eq!(params.t, expected.t);
+    assert_eq!(params.n, expected.n);
+    assert!((params.overhead - expected.overhead).abs() < 1e-10);
+}
+
+#[test]
+fn source_block_record_roundtrips_n_and_overhead() {
+    let record = SourceBlockRecord {
+        block_id: SourceBlockId([0xAB; 32]),
+        k: 200,
+        t: 65535,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(9999),
+        encrypted_size: Some(13_107_000),
+        n: Some(930),
+        overhead: Some(2.4),
+    };
+    let bytes = to_cbor_bytes(&record);
+    let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();
+    assert_eq!(decoded.n, Some(930));
+    assert!(decoded.overhead.is_some());
+    assert!((decoded.overhead.unwrap() - 2.4).abs() < 1e-10);
+    assert_eq!(decoded.k, 200);
+    assert_eq!(decoded.encrypted_size, Some(13_107_000));
+}
+
+#[test]
+fn source_block_record_legacy_deserializes_as_none() {
+    // Serialize a record WITHOUT n/overhead fields by constructing the CBOR manually
+    // via a helper struct that doesn't have these fields.
+    #[derive(serde::Serialize)]
+    struct LegacySourceBlockRecord {
+        block_id: SourceBlockId,
+        k: u32,
+        t: u16,
+        block_type: SourceBlockType,
+        status: SourceBlockStatus,
+        created_at: Timestamp,
+        encrypted_size: Option<u64>,
+    }
+    let legacy = LegacySourceBlockRecord {
+        block_id: SourceBlockId([0; 32]),
+        k: 50,
+        t: 65535,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(1000),
+        encrypted_size: Some(3_276_750),
+    };
+    let bytes = to_cbor_bytes(&legacy);
+    let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();
+    assert_eq!(decoded.n, None);
+    assert_eq!(decoded.overhead, None);
+    assert_eq!(decoded.k, 50);
+}
+
 #[test]
 fn erasure_params_default_block_size() {
     let params = ErasureParams::compute(128 * 1024 * 1024, 0.6);
@@ -180,6 +282,8 @@ fn cbor_roundtrip_source_block_pack() {
         status: SourceBlockStatus::Active,
         created_at: Timestamp(5000),
         encrypted_size: None,
+        n: None,
+        overhead: None,
     };
     let bytes = to_cbor_bytes(&sb);
     let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();

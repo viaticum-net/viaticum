@@ -37,8 +37,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use syncback_core::constants::{
-    DECODE_OVERHEAD, DEFAULT_ESCROW_TRUST_FACTOR, INITIAL_TRUST_P, KI, KP, P_WINDOW_WEEKS,
-    SYMBOL_SIZE,
+    DEFAULT_ESCROW_TRUST_FACTOR, INITIAL_TRUST_P, P_WINDOW_WEEKS, SYMBOL_SIZE,
 };
 use syncback_core::escrow::{check_restore, RestoreDecision};
 use syncback_core::trust::compute_combined;
@@ -56,8 +55,7 @@ use syncback_core::pos::{
 };
 use syncback_core::trust::PosOutcome;
 use syncback_core::types::{
-    hex_encode, ErasureParams, HoldingRecord, HoldingStatus, IdentityPub, PeerRecord,
-    PlacementStatus, Timestamp,
+    hex_encode, HoldingRecord, HoldingStatus, IdentityPub, PeerRecord, PlacementStatus, Timestamp,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -68,6 +66,7 @@ use crate::daemon::network::connection::Connection;
 use crate::daemon::network::NetworkHandle;
 use crate::daemon::relay::InboundMessage;
 use crate::daemon::repair::RepairTrigger;
+use crate::daemon::scheduler::PendingChallenges;
 
 #[cfg(test)]
 mod tests;
@@ -107,8 +106,8 @@ pub enum ProcessorError {
 /// Routes incoming connections and dispatches messages to appropriate handlers.
 pub struct Processor {
     db: Db,
-    /// Our identity — will be used for escrow check (TODO Phase 7.6+).
-    _own_identity: IdentityPub,
+    /// Our identity — used to skip self in PeerDiscoveryResponse handling.
+    own_identity: IdentityPub,
     repair_tx: mpsc::Sender<RepairTrigger>,
     cluster_sync: Arc<ClusterSyncManager>,
     encoder: Arc<dyn ErasureEncoder>,
@@ -130,6 +129,9 @@ pub struct Processor {
     backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
     /// Time acceleration factor (1 = real time). Scales week numbers for trust.
     time_scale: u64,
+    /// Shared map of in-flight PoS challenges. Written by Scheduler, read here
+    /// to resolve challenge_id → source_block_id without scanning placements.
+    pending_challenges: PendingChallenges,
 }
 
 impl Processor {
@@ -149,10 +151,11 @@ impl Processor {
         hard_quota_bytes: u64,
         backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
         time_scale: u64,
+        pending_challenges: PendingChallenges,
     ) -> Self {
         Processor {
             db,
-            _own_identity: own_identity,
+            own_identity,
             repair_tx,
             cluster_sync,
             encoder,
@@ -164,6 +167,7 @@ impl Processor {
             hard_quota_bytes,
             backup_event_tx,
             time_scale,
+            pending_challenges,
         }
     }
 
@@ -176,7 +180,7 @@ impl Processor {
         self,
         mut incoming_rx: mpsc::Receiver<Connection>,
         mut inbound_rx: mpsc::Receiver<InboundMessage>,
-        mut read_loop_rx: mpsc::Receiver<crate::daemon::network::ReadLoopRequest>,
+        mut read_loop_rx: mpsc::UnboundedReceiver<crate::daemon::network::ReadLoopRequest>,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let (msg_tx, mut msg_rx) =
@@ -605,9 +609,10 @@ impl Processor {
 
     /// Verify a PoS response from a holder.
     ///
-    /// Looks up the placement by scanning this holder's placements for a
-    /// matching ESI, loads the source block from disk, re-encodes and
-    /// compares. Updates placement status and trust accordingly.
+    /// Looks up the pending challenge by challenge_id in the shared PendingChallenges
+    /// map (written by Scheduler when the challenge was issued). On match, consumes
+    /// the entry and proceeds to verify. If no match is found the response is stale
+    /// or unknown and is silently dropped.
     ///
     /// Returns the VerifyOutcome for testing.
     pub(crate) async fn handle_pos_response(
@@ -615,38 +620,60 @@ impl Processor {
         holder_id: IdentityPub,
         response: PosResponseMsg,
     ) -> Result<VerifyOutcome, ProcessorError> {
-        let esi = response.esi;
-
-        // Recover source_block_id: find the placement for this holder that owns this ESI.
-        let placements = self.db.list_placements_for_holder(&holder_id)?;
-        let placement = placements.into_iter().find(|p| {
-            p.esi_ranges
+        // Resolve challenge_id → (source_block_id, map key) via the pending map.
+        // Linear scan over in-flight challenges is fine: bounded by active placements,
+        // typically in the hundreds.
+        let pending_key = {
+            let guard = self.pending_challenges.lock().await;
+            guard
                 .iter()
-                .any(|&(start, count)| esi >= start && esi < start + count)
-        });
+                .find(|(_, v)| v.challenge_id == response.challenge_id)
+                .map(|(k, _)| *k)
+        };
 
-        let placement = match placement {
-            Some(p) => p,
+        let key = match pending_key {
+            Some(k) => k,
             None => {
                 warn!(
                     holder = %holder_id,
-                    esi,
-                    "processor: PosResponse for unknown placement, ignoring"
+                    challenge_id = %hex_encode(&response.challenge_id),
+                    "processor: PosResponse with unknown challenge_id (stale or duplicate), ignoring"
                 );
                 return Ok(VerifyOutcome::Pass);
             }
         };
 
-        let block_id = placement.source_block_id;
+        // Consume the entry — challenge lifecycle ends here regardless of outcome.
+        // Also capture the challenged ESI for logging below.
+        let esi = {
+            let mut guard = self.pending_challenges.lock().await;
+            guard.remove(&key).map(|c| c.esi).unwrap_or(response.esi)
+        };
+
+        let block_id = key.0;
+
+        // Load the placement record from DB.
+        let placement = match self.db.get_placement(&block_id, &holder_id)? {
+            Some(p) => p,
+            None => {
+                warn!(
+                    block_id = %block_id,
+                    holder = %holder_id,
+                    "processor: PosResponse — placement missing from DB, ignoring"
+                );
+                return Ok(VerifyOutcome::Pass);
+            }
+        };
 
         let block_record = match self.db.get_source_block(&block_id)? {
             Some(r) => r,
             None => {
                 warn!(
                     block_id = %block_id,
-                    "processor: PosResponse — source block record missing, ignoring"
+                    holder = %holder_id,
+                    "processor: PosResponse — source block DB record missing, cannot verify"
                 );
-                return Ok(VerifyOutcome::Pass);
+                return Ok(VerifyOutcome::CannotVerify);
             }
         };
 
@@ -660,20 +687,16 @@ impl Processor {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 warn!(
                     block_id = %block_id,
+                    holder = %holder_id,
+                    path = %block_path.display(),
                     "processor: PosResponse — source block file missing, cannot verify"
                 );
-                return Ok(VerifyOutcome::Pass);
+                return Ok(VerifyOutcome::CannotVerify);
             }
             Err(e) => return Err(ProcessorError::Io(e)),
         };
 
-        let params = ErasureParams {
-            k: block_record.k,
-            k_eff: block_record.k + DECODE_OVERHEAD,
-            t: block_record.t,
-            overhead: 1.5,
-            n: block_record.k * 4,
-        };
+        let params = block_record.erasure_params();
 
         let pos_response = PosResponse {
             challenge_id: response.challenge_id,
@@ -698,6 +721,17 @@ impl Processor {
         .await
         .map_err(|e| ProcessorError::Join(e.to_string()))?
         .map_err(ProcessorError::PosVerify)?;
+
+        // CannotVerify: owner-side data unavailable. Skip all state updates.
+        if outcome == VerifyOutcome::CannotVerify {
+            debug!(
+                block_id = %block_id,
+                holder = %holder_id,
+                esi,
+                "processor: PoS response received but cannot verify (source block unavailable)"
+            );
+            return Ok(VerifyOutcome::CannotVerify);
+        }
 
         // Apply placement state transition.
         let transition = apply_pos_outcome(&placement, &outcome);
@@ -1395,6 +1429,7 @@ impl Processor {
                 p.node_id.map(|nid| DiscoveredPeer {
                     identity_pub: p.identity,
                     node_id: nid,
+                    addrs: p.addrs.clone(),
                 })
             })
             .collect();
@@ -1416,26 +1451,90 @@ impl Processor {
     // PeerDiscoveryResponse: we are the bootstrap/DR requester
     // =========================================================
 
-    /// Log a peer discovery response.
-    /// Logs newly seen peers for informational purposes; connection management
-    /// is handled by the bootstrap/DR flow that issued the request.
+    /// Handle a peer discovery response: register each discovered peer in the
+    /// network layer so future `get_connection` calls can reach them.
+    ///
+    /// For each peer in the response:
+    ///   - Skip if identity == our own identity.
+    ///   - Try to build an EndpointAddr from the first parseable addr string.
+    ///   - Fall back to NodeId-only EndpointAddr (iroh relay/DNS discovery).
+    ///   - Call network.add_peer to register in-memory.
+    ///   - DB persistence happens later via PeerAnnounce on handshake.
     pub(crate) async fn handle_peer_discovery_response(
         &self,
         peer_id: IdentityPub,
         resp: PeerDiscoveryResponseMsg,
     ) {
+        use crate::daemon::network::addr::{parse_node_addr, to_endpoint_addr};
+
         info!(
             peer = %peer_id,
             discovered_count = resp.peers.len(),
             "processor: PeerDiscoveryResponse: received"
         );
+
         for dp in &resp.peers {
+            if dp.identity_pub == self.own_identity {
+                debug!(
+                    peer = %dp.identity_pub,
+                    "processor: PeerDiscoveryResponse: skipping self"
+                );
+                continue;
+            }
+
             if self.db.get_peer(&dp.identity_pub).ok().flatten().is_none() {
                 debug!(
                     peer = %dp.identity_pub,
                     "processor: PeerDiscoveryResponse: new peer discovered"
                 );
             }
+
+            // Build EndpointAddr: try each addr string, use first parseable one.
+            // Fall back to NodeId-only if none parse (iroh relay/DNS will resolve).
+            let endpoint_addr = match iroh::PublicKey::from_bytes(&dp.node_id.0) {
+                Err(e) => {
+                    warn!(
+                        identity = %dp.identity_pub,
+                        err = %e,
+                        "processor: PeerDiscoveryResponse: invalid NodeId bytes, skipping"
+                    );
+                    continue;
+                }
+                Ok(pubkey) => {
+                    let mut resolved: Option<iroh::EndpointAddr> = None;
+                    for addr_str in &dp.addrs {
+                        match parse_node_addr(addr_str) {
+                            Ok(parsed) => match to_endpoint_addr(&parsed) {
+                                Ok(ea) => {
+                                    resolved = Some(ea);
+                                    break;
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        addr = %addr_str,
+                                        err = %e,
+                                        "processor: PeerDiscoveryResponse: to_endpoint_addr failed"
+                                    );
+                                }
+                            },
+                            Err(e) => {
+                                debug!(
+                                    addr = %addr_str,
+                                    err = %e,
+                                    "processor: PeerDiscoveryResponse: addr parse failed"
+                                );
+                            }
+                        }
+                    }
+                    resolved.unwrap_or_else(|| iroh::EndpointAddr::new(pubkey))
+                }
+            };
+
+            self.network.add_peer(dp.identity_pub, endpoint_addr).await;
+            debug!(
+                identity = %dp.identity_pub,
+                "processor: PeerDiscoveryResponse: registered peer in network"
+            );
         }
     }
 }

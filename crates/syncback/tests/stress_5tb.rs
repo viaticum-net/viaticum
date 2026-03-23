@@ -111,6 +111,8 @@ fn stress_5tb_metadata_scale() {
             status: SourceBlockStatus::Active,
             created_at: NOW,
             encrypted_size: Some(128 * 1024 * 1024),
+            n: None,
+            overhead: None,
         };
         db.upsert_source_block(&record)
             .unwrap_or_else(|e| panic!("upsert_source_block[{i}]: {e}"));

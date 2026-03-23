@@ -63,6 +63,8 @@ fn make_block(bid: SourceBlockId, status: SourceBlockStatus, block_type: SourceB
         status,
         created_at: ts(0),
         encrypted_size: None,
+        n: None,
+        overhead: None,
     }
 }
 

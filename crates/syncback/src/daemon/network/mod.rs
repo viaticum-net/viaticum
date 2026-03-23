@@ -138,7 +138,7 @@ pub struct NetworkHandle {
     /// outbound connections. Without this, only accepted (inbound) connections
     /// get a read loop, so PoS responses on auto-reconnected connections
     /// would be silently dropped. None in tests.
-    read_loop_tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<ReadLoopRequest>>>,
+    read_loop_tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReadLoopRequest>>>,
 }
 
 impl NetworkHandle {
@@ -209,7 +209,7 @@ impl NetworkHandle {
     /// Set the read-loop channel so auto-reconnected outbound connections
     /// get a Processor read loop (enabling bidirectional communication).
     /// Called by DaemonHandle after creating the Processor channel.
-    pub fn set_read_loop_tx(&self, tx: tokio::sync::mpsc::Sender<ReadLoopRequest>) {
+    pub fn set_read_loop_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<ReadLoopRequest>) {
         *self.read_loop_tx.lock().unwrap() = Some(tx);
     }
 
@@ -327,7 +327,13 @@ impl NetworkHandle {
                 // Notify Processor to spawn a read loop so we can receive
                 // responses (PoS, SymbolAccept, etc.) on this connection.
                 if let Some(tx) = self.read_loop_tx.lock().unwrap().as_ref() {
-                    let _ = tx.try_send((peer_identity, arc.clone()));
+                    if let Err(e) = tx.send((peer_identity, arc.clone())) {
+                        tracing::warn!(
+                            peer = %peer_identity,
+                            err = %e,
+                            "get_connection: read_loop_tx closed, read loop not spawned"
+                        );
+                    }
                 }
 
                 Ok(arc)
@@ -453,34 +459,6 @@ impl NetworkHandle {
         msg: &Message,
     ) -> Result<(), NetworkError> {
         conn.send_message(msg).await
-    }
-
-    /// Send a message to a peer using a fresh one-shot connection.
-    ///
-    /// Unlike `send_to_peer` which uses the connection pool (and may block
-    /// when the read loop holds the Mutex), this opens a fresh connection,
-    /// sends the message, and waits briefly for the peer to process it.
-    /// Ideal for periodic fire-and-forget messages (system state push).
-    pub async fn send_message_oneshot(
-        &self,
-        peer_identity: IdentityPub,
-        msg: &Message,
-    ) -> Result<(), NetworkError> {
-        let peer_addr = {
-            let peers = self.known_peers.read().await;
-            peers.get(&peer_identity).cloned()
-        }
-        .ok_or(NetworkError::PeerNotFound(peer_identity))?;
-
-        let conn = self.connect(peer_addr, Some(peer_identity)).await?;
-        conn.send_message(msg).await?;
-        // Finish the send stream to signal "done" and give the peer time
-        // to read the data before the QUIC connection drops.
-        conn.finish_send();
-        // Brief wait ensures the peer's read loop processes the message
-        // before the connection close frame arrives.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        Ok(())
     }
 
     /// Receive the next [`Message`] from an established connection (static helper).

@@ -249,6 +249,8 @@ fn db_stores_and_retrieves_full_records() {
         status: SourceBlockStatus::Active,
         created_at: t,
         encrypted_size: None,
+        n: None,
+        overhead: None,
     };
     db.upsert_source_block(&sbr).expect("upsert_source_block");
 
@@ -513,6 +515,8 @@ fn full_owner_flow() {
         status: SourceBlockStatus::Active,
         created_at: t,
         encrypted_size: None,
+        n: None,
+        overhead: None,
     };
     db.upsert_source_block(&sbr).expect("upsert_source_block");
 

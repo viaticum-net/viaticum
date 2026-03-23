@@ -455,6 +455,7 @@ fn apply_pos_outcome_lost_is_noop_for_all_outcomes() {
         VerifyOutcome::Fail { esi: 0 },
         VerifyOutcome::NotHeld { esi: 0 },
         VerifyOutcome::Timeout,
+        VerifyOutcome::CannotVerify,
     ];
     for outcome in &outcomes {
         let result = apply_pos_outcome(&placement, outcome);
@@ -473,6 +474,7 @@ fn apply_pos_outcome_deleting_is_noop_for_all_outcomes() {
         VerifyOutcome::Pass,
         VerifyOutcome::Fail { esi: 0 },
         VerifyOutcome::Timeout,
+        VerifyOutcome::CannotVerify,
     ];
     for outcome in &outcomes {
         let result = apply_pos_outcome(&placement, outcome);
@@ -493,4 +495,35 @@ fn outcome_from_verify_not_held_counts_as_challenged() {
 fn verify_outcome_enum_has_not_held_variant() {
     let o = VerifyOutcome::NotHeld { esi: 0 };
     assert!(matches!(o, VerifyOutcome::NotHeld { .. }));
+}
+
+// ─── CannotVerify ────────────────────────────────────────────────────────────
+
+#[test]
+fn outcome_from_verify_cannot_verify_produces_no_trust_event() {
+    let outcome = outcome_from_verify(&VerifyOutcome::CannotVerify, 5);
+    assert_eq!(outcome.week_number, 5);
+    assert_eq!(outcome.challenged, 0, "CannotVerify must not record a challenge");
+    assert_eq!(outcome.passed, 0, "CannotVerify must not record a pass");
+}
+
+#[test]
+fn apply_pos_outcome_cannot_verify_is_noop_on_alive() {
+    let placement = make_placement(block_id(1), holder(2), vec![(0, 5)]);
+    let result = apply_pos_outcome(&placement, &VerifyOutcome::CannotVerify);
+    assert_eq!(result.new_status, PlacementStatus::Alive);
+    assert_eq!(result.new_consecutive_misses, 0);
+    assert!(!result.trigger_repair);
+}
+
+#[test]
+fn apply_pos_outcome_cannot_verify_is_noop_on_uncertain() {
+    let placement = make_placement_with_status(
+        block_id(1), holder(2), vec![(0, 5)],
+        PlacementStatus::Uncertain, 2,
+    );
+    let result = apply_pos_outcome(&placement, &VerifyOutcome::CannotVerify);
+    assert_eq!(result.new_status, PlacementStatus::Uncertain);
+    assert_eq!(result.new_consecutive_misses, 2);
+    assert!(!result.trigger_repair);
 }

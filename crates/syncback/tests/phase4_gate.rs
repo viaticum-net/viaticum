@@ -231,6 +231,8 @@ fn deletion_cooldown_full_lifecycle() {
         status: SourceBlockStatus::Active,
         created_at: now,
         encrypted_size: None,
+        n: None,
+        overhead: None,
     };
 
     // Two placements, both Alive
