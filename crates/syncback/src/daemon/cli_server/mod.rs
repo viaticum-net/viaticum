@@ -285,19 +285,20 @@ pub(crate) fn dispatch_status(state: &DaemonState) -> CliResponse {
         .filter(|p| matches!(p.status, PlacementStatus::Lost | PlacementStatus::PresumedLost))
         .count() as u32;
 
-    // Block health: per source block, count alive placements vs k.
+    // Block health: per source block, count alive symbols vs k_eff (k + 3).
     use std::collections::HashMap;
-    let mut alive_per_block: HashMap<[u8; 32], u32> = HashMap::new();
+    let mut alive_symbols_per_block: HashMap<[u8; 32], u32> = HashMap::new();
     for pl in &placements {
         if matches!(pl.status, PlacementStatus::Alive | PlacementStatus::Uncertain) {
-            *alive_per_block.entry(pl.source_block_id.0).or_default() += 1;
+            *alive_symbols_per_block.entry(pl.source_block_id.0).or_default() += pl.symbol_count();
         }
     }
     let mut blocks_ok = 0u32;
     let mut blocks_at_risk = 0u32;
     for sb in &source_blocks {
-        let alive = alive_per_block.get(&sb.block_id.0).copied().unwrap_or(0);
-        if alive >= sb.k {
+        let alive = alive_symbols_per_block.get(&sb.block_id.0).copied().unwrap_or(0);
+        let k_eff = sb.k + 3;
+        if alive >= k_eff {
             blocks_ok += 1;
         } else {
             blocks_at_risk += 1;

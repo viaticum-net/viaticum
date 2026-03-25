@@ -8,7 +8,7 @@ Build it first: cargo build --release -p syncback
 import argparse
 
 
-def generate(n_nodes: int, out_path: str) -> None:
+def generate(n_nodes: int, out_path: str, include_metrics: bool = True) -> None:
     services = []
     volumes = []
 
@@ -29,7 +29,8 @@ def generate(n_nodes: int, out_path: str) -> None:
         volumes.append(f"  {name}-data:")
         volumes.append(f"  {name}-files:")
 
-    services.append("""  victoria:
+    if include_metrics:
+        services.append("""  victoria:
     image: victoriametrics/victoria-metrics:latest
     container_name: gamma-victoria
     ports:
@@ -52,8 +53,8 @@ def generate(n_nodes: int, out_path: str) -> None:
     networks:
       - gamma-net""")
 
-    volumes.append("  victoria-data:")
-    volumes.append("  grafana-data:")
+        volumes.append("  victoria-data:")
+        volumes.append("  grafana-data:")
 
     compose = "services:\n" + "\n\n".join(services) + "\n"
     compose += "\nnetworks:\n  gamma-net:\n    driver: bridge\n"
@@ -62,7 +63,8 @@ def generate(n_nodes: int, out_path: str) -> None:
     with open(out_path, "w") as f:
         f.write(compose)
 
-    print(f"Generated {out_path} with {n_nodes} nodes + victoria + grafana")
+    suffix = " + victoria + grafana" if include_metrics else ""
+    print(f"Generated {out_path} with {n_nodes} nodes{suffix}")
 
 
 if __name__ == "__main__":

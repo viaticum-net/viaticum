@@ -1,11 +1,12 @@
 services:
   node-00:
     build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     container_name: gamma-node-00
     hostname: node-00
     volumes:
+      - ../../target/release/syncback:/usr/local/bin/syncback:ro
       - node-00-data:/home/syncback/.syncback
       - node-00-files:/data/files
     networks:
@@ -13,11 +14,12 @@ services:
 
   node-01:
     build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     container_name: gamma-node-01
     hostname: node-01
     volumes:
+      - ../../target/release/syncback:/usr/local/bin/syncback:ro
       - node-01-data:/home/syncback/.syncback
       - node-01-files:/data/files
     networks:
@@ -25,11 +27,12 @@ services:
 
   node-02:
     build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     container_name: gamma-node-02
     hostname: node-02
     volumes:
+      - ../../target/release/syncback:/usr/local/bin/syncback:ro
       - node-02-data:/home/syncback/.syncback
       - node-02-files:/data/files
     networks:
@@ -37,11 +40,12 @@ services:
 
   node-03:
     build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     container_name: gamma-node-03
     hostname: node-03
     volumes:
+      - ../../target/release/syncback:/usr/local/bin/syncback:ro
       - node-03-data:/home/syncback/.syncback
       - node-03-files:/data/files
     networks:
@@ -49,216 +53,14 @@ services:
 
   node-04:
     build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     container_name: gamma-node-04
     hostname: node-04
     volumes:
+      - ../../target/release/syncback:/usr/local/bin/syncback:ro
       - node-04-data:/home/syncback/.syncback
       - node-04-files:/data/files
-    networks:
-      - gamma-net
-
-  node-05:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-05
-    hostname: node-05
-    volumes:
-      - node-05-data:/home/syncback/.syncback
-      - node-05-files:/data/files
-    networks:
-      - gamma-net
-
-  node-06:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-06
-    hostname: node-06
-    volumes:
-      - node-06-data:/home/syncback/.syncback
-      - node-06-files:/data/files
-    networks:
-      - gamma-net
-
-  node-07:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-07
-    hostname: node-07
-    volumes:
-      - node-07-data:/home/syncback/.syncback
-      - node-07-files:/data/files
-    networks:
-      - gamma-net
-
-  node-08:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-08
-    hostname: node-08
-    volumes:
-      - node-08-data:/home/syncback/.syncback
-      - node-08-files:/data/files
-    networks:
-      - gamma-net
-
-  node-09:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-09
-    hostname: node-09
-    volumes:
-      - node-09-data:/home/syncback/.syncback
-      - node-09-files:/data/files
-    networks:
-      - gamma-net
-
-  node-10:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-10
-    hostname: node-10
-    volumes:
-      - node-10-data:/home/syncback/.syncback
-      - node-10-files:/data/files
-    networks:
-      - gamma-net
-
-  node-11:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-11
-    hostname: node-11
-    volumes:
-      - node-11-data:/home/syncback/.syncback
-      - node-11-files:/data/files
-    networks:
-      - gamma-net
-
-  node-12:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-12
-    hostname: node-12
-    volumes:
-      - node-12-data:/home/syncback/.syncback
-      - node-12-files:/data/files
-    networks:
-      - gamma-net
-
-  node-13:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-13
-    hostname: node-13
-    volumes:
-      - node-13-data:/home/syncback/.syncback
-      - node-13-files:/data/files
-    networks:
-      - gamma-net
-
-  node-14:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-14
-    hostname: node-14
-    volumes:
-      - node-14-data:/home/syncback/.syncback
-      - node-14-files:/data/files
-    networks:
-      - gamma-net
-
-  node-15:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-15
-    hostname: node-15
-    volumes:
-      - node-15-data:/home/syncback/.syncback
-      - node-15-files:/data/files
-    networks:
-      - gamma-net
-
-  node-16:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-16
-    hostname: node-16
-    volumes:
-      - node-16-data:/home/syncback/.syncback
-      - node-16-files:/data/files
-    networks:
-      - gamma-net
-
-  node-17:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-17
-    hostname: node-17
-    volumes:
-      - node-17-data:/home/syncback/.syncback
-      - node-17-files:/data/files
-    networks:
-      - gamma-net
-
-  node-18:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-18
-    hostname: node-18
-    volumes:
-      - node-18-data:/home/syncback/.syncback
-      - node-18-files:/data/files
-    networks:
-      - gamma-net
-
-  node-19:
-    build:
-      context: ../..
-      dockerfile: experiments/docker-beta/Dockerfile
-    container_name: gamma-node-19
-    hostname: node-19
-    volumes:
-      - node-19-data:/home/syncback/.syncback
-      - node-19-files:/data/files
-    networks:
-      - gamma-net
-
-  victoria:
-    image: victoriametrics/victoria-metrics:latest
-    container_name: gamma-victoria
-    ports:
-      - "8428:8428"
-    volumes:
-      - victoria-data:/victoria-metrics-data
-    networks:
-      - gamma-net
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: gamma-grafana
-    ports:
-      - "3001:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ../docker-beta/grafana/provisioning:/etc/grafana/provisioning
     networks:
       - gamma-net
 
@@ -277,35 +79,3 @@ volumes:
   node-03-files:
   node-04-data:
   node-04-files:
-  node-05-data:
-  node-05-files:
-  node-06-data:
-  node-06-files:
-  node-07-data:
-  node-07-files:
-  node-08-data:
-  node-08-files:
-  node-09-data:
-  node-09-files:
-  node-10-data:
-  node-10-files:
-  node-11-data:
-  node-11-files:
-  node-12-data:
-  node-12-files:
-  node-13-data:
-  node-13-files:
-  node-14-data:
-  node-14-files:
-  node-15-data:
-  node-15-files:
-  node-16-data:
-  node-16-files:
-  node-17-data:
-  node-17-files:
-  node-18-data:
-  node-18-files:
-  node-19-data:
-  node-19-files:
-  victoria-data:
-  grafana-data:
