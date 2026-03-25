@@ -325,12 +325,14 @@ impl RestoreCoordinator {
         encrypted_size: u64,
     ) -> Result<Vec<u8>, RestoreError> {
         let placements = self.db.list_placements_for_block(block_id)?;
-        let alive_placements: Vec<_> = placements
+        // For local symbol reads, use all non-deleted placements: the symbols
+        // are on the owner's disk regardless of holder reachability status.
+        let usable_placements: Vec<_> = placements
             .into_iter()
-            .filter(|p| p.status == PlacementStatus::Alive)
+            .filter(|p| !matches!(p.status, PlacementStatus::Deleting | PlacementStatus::Lost))
             .collect();
 
-        if alive_placements.is_empty() {
+        if usable_placements.is_empty() {
             return Err(RestoreError::NoHolders(*block_id));
         }
 
@@ -342,7 +344,7 @@ impl RestoreCoordinator {
         let mut unbound_symbols: Vec<Symbol> = Vec::new();
         let k_eff = params.k_eff as usize;
 
-        'outer: for placement in &alive_placements {
+        'outer: for placement in &usable_placements {
             for (start_esi, count) in &placement.esi_ranges {
                 for i in 0..*count {
                     let esi = start_esi + i;
@@ -380,8 +382,14 @@ impl RestoreCoordinator {
                 "decode: insufficient local symbols, trying network"
             );
 
+            // Only try network fetch for Alive placements (reachable holders).
+            let alive_for_fetch: Vec<_> = usable_placements
+                .iter()
+                .filter(|p| p.status == PlacementStatus::Alive)
+                .cloned()
+                .collect();
             let mut network_symbols = self
-                .fetch_from_holders(block_id, &alive_placements, params)
+                .fetch_from_holders(block_id, &alive_for_fetch, params)
                 .await?;
 
             // Merge: avoid duplicates by ESI.

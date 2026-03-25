@@ -266,44 +266,53 @@ impl Scheduler {
                 timestamp: now,
             });
 
-            // Attempt to send. Log and continue on failure; don't record as pending.
-            match self.network.get_connection(entry.holder_id).await {
+            // Attempt to send. On connection/send failure, treat as immediate timeout:
+            // if we can't reach the holder, that's equivalent to no response.
+            let send_ok = match self.network.get_connection(entry.holder_id).await {
                 Err(e) => {
                     warn!(
                         holder_id = %entry.holder_id,
                         "scheduler: cannot connect to holder for PoS: {e}"
                     );
-                    continue;
+                    false
                 }
                 Ok(conn_arc) => {
-                    if let Err(e) = conn_arc.send_message(&msg).await {
-                        warn!(
-                            holder_id = %entry.holder_id,
-                            "scheduler: send PosChallenge failed: {e}"
-                        );
-                        continue;
+                    match conn_arc.send_message(&msg).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            warn!(
+                                holder_id = %entry.holder_id,
+                                "scheduler: send PosChallenge failed: {e}"
+                            );
+                            false
+                        }
                     }
                 }
-            }
+            };
 
-            // Challenge successfully sent — track in pending map.
-            self.pending.lock().await.insert(
-                key,
-                PendingChallenge {
-                    source_block_id: entry.source_block_id,
-                    holder_id: entry.holder_id,
+            if send_ok {
+                // Challenge successfully sent — track in pending map.
+                self.pending.lock().await.insert(
+                    key,
+                    PendingChallenge {
+                        source_block_id: entry.source_block_id,
+                        holder_id: entry.holder_id,
+                        esi,
+                        issued_at: now,
+                        challenge_id,
+                    },
+                );
+
+                info!(
+                    block_id = %entry.source_block_id,
+                    holder_id = %entry.holder_id,
                     esi,
-                    issued_at: now,
-                    challenge_id,
-                },
-            );
-
-            info!(
-                block_id = %entry.source_block_id,
-                holder_id = %entry.holder_id,
-                esi,
-                "scheduler: PoS challenge issued"
-            );
+                    "scheduler: PoS challenge issued"
+                );
+            } else {
+                // Unreachable holder — apply immediate timeout to placement.
+                self.apply_unreachable_timeout(entry.source_block_id, entry.holder_id).await;
+            }
         }
 
         Ok(())
@@ -408,6 +417,61 @@ impl Scheduler {
         }
 
         Ok(())
+    }
+
+    /// Apply a Timeout outcome when we can't even connect to a holder.
+    ///
+    /// This is equivalent to a normal PoS timeout: the holder is unreachable,
+    /// so we treat it as a missed challenge. After enough consecutive misses,
+    /// the placement transitions to PresumedLost and triggers repair.
+    async fn apply_unreachable_timeout(
+        &self,
+        block_id: SourceBlockId,
+        holder_id: IdentityPub,
+    ) {
+        let placement = match self.db.get_placement(&block_id, &holder_id) {
+            Ok(Some(p)) => p,
+            Ok(None) => return,
+            Err(e) => {
+                error!("scheduler: DB error reading placement for unreachable timeout: {e}");
+                return;
+            }
+        };
+
+        let transition = apply_pos_outcome(&placement, &VerifyOutcome::Timeout);
+
+        let mut updated = placement;
+        updated.status = transition.new_status;
+        updated.consecutive_misses = transition.new_consecutive_misses;
+        // Update last_verified so due_challenges knows we attempted this cycle.
+        updated.last_verified = Some(Timestamp::now());
+
+        if let Err(e) = self.db.upsert_placement(&updated) {
+            error!("scheduler: DB error updating placement after unreachable timeout: {e}");
+            return;
+        }
+
+        let scale = self.config.time_scale.max(1);
+        let week = crate::daemon::processor::current_week_number_scaled(scale);
+        let pos_outcome = outcome_from_verify(&VerifyOutcome::Timeout, week);
+        crate::daemon::processor::record_pos_weekly(&self.db, holder_id, pos_outcome);
+        crate::daemon::processor::recalculate_trust(&self.db, &holder_id, week);
+
+        info!(
+            block_id = %block_id,
+            holder_id = %holder_id,
+            new_status = ?transition.new_status,
+            misses = transition.new_consecutive_misses,
+            trigger_repair = transition.trigger_repair,
+            "scheduler: unreachable holder, applied timeout"
+        );
+
+        if transition.trigger_repair {
+            let _ = self
+                .repair_tx
+                .send(RepairTrigger::RepairNow { block_id, holder_id })
+                .await;
+        }
     }
 }
 
