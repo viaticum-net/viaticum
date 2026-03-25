@@ -206,7 +206,7 @@ impl Scheduler {
             }
         };
 
-        let due = due_challenges(&challengeable, &last_verified, now, trust_fn);
+        let due = due_challenges(&challengeable, &last_verified, now, trust_fn, self.config.time_scale);
 
         if due.is_empty() {
             debug!("scheduler: no challenges due at this interval");

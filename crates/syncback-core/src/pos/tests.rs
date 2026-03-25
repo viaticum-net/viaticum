@@ -258,7 +258,7 @@ fn due_challenges_returns_placement_with_no_last_verified() {
     let now = Timestamp(1_000_000);
     let last_verified = vec![(bid, hid, None)];
 
-    let entries = due_challenges(&[placement], &last_verified, now, |_| 0.5);
+    let entries = due_challenges(&[placement], &last_verified, now, |_| 0.5, 1);
     assert_eq!(entries.len(), 1);
 }
 
@@ -274,7 +274,7 @@ fn due_challenges_skips_recently_verified() {
     let last_verified_ts = Timestamp(now.0 - 86400); // 1 day ago
     let last_verified = vec![(bid, hid, Some(last_verified_ts))];
 
-    let entries = due_challenges(&[placement], &last_verified, now, |_| 1.0);
+    let entries = due_challenges(&[placement], &last_verified, now, |_| 1.0, 1);
     assert!(entries.is_empty());
 }
 
@@ -289,7 +289,7 @@ fn due_challenges_returns_overdue_placement() {
     let last_verified_ts = Timestamp(now.0 - 8 * 24 * 3600); // 8 days ago
     let last_verified = vec![(bid, hid, Some(last_verified_ts))];
 
-    let entries = due_challenges(&[placement], &last_verified, now, |_| 1.0);
+    let entries = due_challenges(&[placement], &last_verified, now, |_| 1.0, 1);
     assert_eq!(entries.len(), 1);
 }
 
@@ -301,7 +301,7 @@ fn due_challenges_available_esis_match_ranges() {
     let now = Timestamp(1_000_000);
     let last_verified = vec![(bid, hid, None)];
 
-    let entries = due_challenges(&[placement], &last_verified, now, |_| 0.5);
+    let entries = due_challenges(&[placement], &last_verified, now, |_| 0.5, 1);
     assert_eq!(entries.len(), 1);
     let available = &entries[0].available_esis;
     assert_eq!(available, &[100, 101, 102]);
@@ -580,7 +580,7 @@ fn pos_due_challenges_does_not_filter_by_status() {
     let last_verified = vec![(bid, hid, None)];
 
     // due_challenges returns it — caller must filter before using
-    let entries = due_challenges(&[placement], &last_verified, now, |_| 0.5);
+    let entries = due_challenges(&[placement], &last_verified, now, |_| 0.5, 1);
     assert_eq!(
         entries.len(),
         1,

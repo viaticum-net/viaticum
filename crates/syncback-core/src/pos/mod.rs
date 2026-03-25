@@ -194,20 +194,23 @@ pub fn challenges_per_week(symbol_count: u32, trust_score: f64) -> u32 {
 ///
 /// A placement is due if:
 ///   last_verified.is_none()
-///   OR now.0 - last_verified.0 >= secs_per_challenge_interval(challenges_per_week_for_this_holder)
+///   OR now.0 - last_verified.0 >= secs_per_challenge_interval / time_scale
 ///
 /// Entries with no available ESIs (esi_ranges empty) are silently skipped.
 ///
 /// trust_fn: closure to look up trust score for a holder.
+/// time_scale: acceleration factor (1 = real time). Divides the challenge interval.
 pub fn due_challenges<F>(
     placements: &[SymbolPlacement],
     last_verified: &[(SourceBlockId, IdentityPub, Option<Timestamp>)],
     now: Timestamp,
     trust_fn: F,
+    time_scale: u64,
 ) -> Vec<ChallengeScheduleEntry>
 where
     F: Fn(&IdentityPub) -> f64,
 {
+    let scale = time_scale.max(1);
     placements
         .iter()
         .filter_map(|p| {
@@ -218,7 +221,7 @@ where
 
             let trust = trust_fn(&p.holder_id);
             let cpw = challenges_per_week(p.symbol_count(), trust);
-            let interval_secs = SECS_PER_WEEK / cpw as u64;
+            let interval_secs = (SECS_PER_WEEK / cpw as u64) / scale;
 
             let lv = last_verified
                 .iter()
