@@ -84,10 +84,12 @@ pub struct DaemonState {
     pub seed: Vec<u8>,
     /// Data directory path (for disk space queries).
     pub data_dir: PathBuf,
-    /// Soft quota in bytes (0 = unlimited).
+    /// Raw soft quota in bytes from config (0 = use disk-based limit).
     pub soft_quota_bytes: u64,
     /// Disk reserve in bytes.
     pub disk_reserve_bytes: u64,
+    /// Raw hard quota in bytes from config (0 = no eviction floor).
+    pub hard_quota_bytes: u64,
     /// Time acceleration factor (1 = real time).
     pub time_scale: u64,
 }
@@ -354,6 +356,7 @@ impl DaemonHandle {
             data_dir: cfg.data_dir.clone(),
             soft_quota_bytes: syncback_core::config::soft_quota_bytes(&app_config),
             disk_reserve_bytes: syncback_core::config::disk_reserve_bytes(&app_config),
+            hard_quota_bytes: syncback_core::config::hard_quota_bytes(&app_config),
             time_scale: cfg.time_scale.max(1),
         });
 
@@ -408,11 +411,11 @@ impl DaemonHandle {
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
         let repair_tx_for_processor = repair_tx.clone();
+        // Raw quota values from config. 0 = "not configured" (use disk-based limit).
+        // Processor and holder_cleanup compute effective_quota from disk_free at runtime.
         let soft_quota_bytes = syncback_core::config::soft_quota_bytes(&app_config);
         let hard_quota_bytes = syncback_core::config::hard_quota_bytes(&app_config);
-        // Treat 0 (unlimited sentinel from config) as u64::MAX for Processor.
-        let soft_quota_bytes = if soft_quota_bytes == 0 { u64::MAX } else { soft_quota_bytes };
-        let hard_quota_bytes = if hard_quota_bytes == 0 { u64::MAX } else { hard_quota_bytes };
+        let disk_reserve_bytes = syncback_core::config::disk_reserve_bytes(&app_config);
         if let Some(cs) = cluster_state.as_ref() {
             let cluster_sync = Arc::new(ClusterSyncManager::new(
                 db.clone(),
@@ -439,6 +442,8 @@ impl DaemonHandle {
                 relay_sync_tx.clone(),
                 soft_quota_bytes,
                 hard_quota_bytes,
+                cfg.data_dir.clone(),
+                disk_reserve_bytes,
                 backup_event_tx,
                 time_scale,
                 pending_challenges.clone(),
@@ -568,6 +573,7 @@ impl DaemonHandle {
             let cleanup_holdings = holdings_dir.clone();
             let cleanup_relay = relay_post_tx.clone();
             let cleanup_cancel = cancel.clone();
+            let cleanup_data_dir = cfg.data_dir.clone();
             let cleanup_interval = (3600 / time_scale).max(1);
             let pressure_interval = (3600 / time_scale).max(60);
             tasks.push(tokio::spawn(async move {
@@ -577,6 +583,8 @@ impl DaemonHandle {
                     cleanup_relay,
                     soft_quota_bytes,
                     hard_quota_bytes,
+                    cleanup_data_dir,
+                    disk_reserve_bytes,
                     cleanup_interval,
                     pressure_interval,
                     cleanup_cancel,
@@ -621,5 +629,28 @@ impl DaemonHandle {
             task.await??;
         }
         Ok(())
+    }
+}
+
+// ── Disk space ────────────────────────────────────────────────────────────────
+
+/// Query available bytes on the filesystem containing `path` via statvfs(2).
+/// Returns 0 on error (conservative — treats as "disk full").
+pub(crate) fn disk_available_bytes(path: &std::path::Path) -> u64 {
+    let path_str = match path.to_str() {
+        Some(s) => s,
+        None => return 0,
+    };
+    let c_path = match std::ffi::CString::new(path_str) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+            stat.f_bavail * stat.f_frsize
+        } else {
+            0
+        }
     }
 }

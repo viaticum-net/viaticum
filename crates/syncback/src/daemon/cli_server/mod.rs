@@ -320,7 +320,7 @@ pub(crate) fn dispatch_status(state: &DaemonState) -> CliResponse {
         blocks_needing_repair,
         peers: peer_summaries,
         effective_quota_bytes: {
-            let disk_free = disk_available_bytes(&state.data_dir);
+            let disk_free = crate::daemon::handle::disk_available_bytes(&state.data_dir);
             syncback_core::budget::compute_effective_quota(
                 state.soft_quota_bytes,
                 disk_free,
@@ -815,31 +815,6 @@ fn parse_iso_date(s: &str) -> Option<Timestamp> {
         return None;
     }
     Some(Timestamp(days as u64 * 86400))
-}
-
-// ============================================================
-// Disk space
-// ============================================================
-
-/// Query available bytes on the filesystem containing `path` via statvfs(2).
-/// Returns 0 on error (conservative — treats as "disk full").
-fn disk_available_bytes(path: &std::path::Path) -> u64 {
-    let path_str = match path.to_str() {
-        Some(s) => s,
-        None => return 0,
-    };
-    let c_path = match std::ffi::CString::new(path_str) {
-        Ok(p) => p,
-        Err(_) => return 0,
-    };
-    unsafe {
-        let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-            stat.f_bavail * stat.f_frsize
-        } else {
-            0
-        }
-    }
 }
 
 // ============================================================

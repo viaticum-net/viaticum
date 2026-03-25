@@ -153,13 +153,16 @@ async fn check_pressure_normal_does_nothing() {
         db.upsert_holding(&h).unwrap();
     }
 
-    // Pass u64::MAX for both quotas → pressure is always Normal.
+    // Pass u64::MAX for soft quota, 0 for hard quota → pressure is always Normal.
+    // data_dir = holdings_dir (any existing path for statvfs).
     super::check_pressure(
         &db,
         &holdings_dir.path().to_path_buf(),
         &relay_post_tx,
         u64::MAX,
-        u64::MAX,
+        0,
+        &holdings_dir.path().to_path_buf(),
+        0,
     )
     .await
     .unwrap();

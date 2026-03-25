@@ -34,6 +34,8 @@ pub async fn run(
     relay_post_tx: mpsc::Sender<RelayPost>,
     soft_quota_bytes: u64,
     hard_quota_bytes: u64,
+    data_dir: PathBuf,
+    disk_reserve_bytes: u64,
     cleanup_interval_secs: u64,
     pressure_interval_secs: u64,
     cancel: CancellationToken,
@@ -63,6 +65,7 @@ pub async fn run(
                 if let Err(e) = check_pressure(
                     &db, &holdings_dir, &relay_post_tx,
                     soft_quota_bytes, hard_quota_bytes,
+                    &data_dir, disk_reserve_bytes,
                 ).await {
                     error!("holder_cleanup: check_pressure error: {e}");
                 }
@@ -147,10 +150,18 @@ async fn check_pressure(
     relay_post_tx: &mpsc::Sender<RelayPost>,
     soft_quota_bytes: u64,
     hard_quota_bytes: u64,
+    data_dir: &PathBuf,
+    disk_reserve_bytes: u64,
 ) -> anyhow::Result<()> {
     let now = Timestamp::now();
     let holdings = db.list_all_holdings()?;
     let used_bytes: u64 = holdings.iter().map(|h| h.total_bytes).sum();
+
+    // Compute effective quota from config + actual disk space.
+    let disk_free = crate::daemon::handle::disk_available_bytes(data_dir);
+    let effective_quota = syncback_core::budget::compute_effective_quota(
+        soft_quota_bytes, disk_free, disk_reserve_bytes,
+    );
 
     let trust_fn = |owner: &IdentityPub| -> f64 {
         match db.get_peer(owner) {
@@ -163,7 +174,7 @@ async fn check_pressure(
     };
 
     let result = evaluate_pressure(
-        soft_quota_bytes,
+        effective_quota,
         hard_quota_bytes,
         used_bytes,
         &holdings,
@@ -176,14 +187,14 @@ async fn check_pressure(
         DiskPressure::Soft => {
             info!(
                 used_bytes,
-                soft_quota_bytes,
+                effective_quota,
                 "holder_cleanup: soft disk pressure — not accepting new symbols"
             );
         }
         DiskPressure::Hard => {
             info!(
                 used_bytes,
-                hard_quota_bytes,
+                effective_quota,
                 evictions = result.immediate_evictions.len(),
                 freed_bytes = result.freed_bytes,
                 "holder_cleanup: hard disk pressure — evicting holdings"

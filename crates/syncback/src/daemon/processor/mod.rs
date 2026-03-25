@@ -121,11 +121,14 @@ pub struct Processor {
     network: Arc<NetworkHandle>,
     /// Channel to relay manager: push BoardSync entries from incoming connections.
     relay_sync_tx: mpsc::Sender<crate::daemon::relay::SyncTrigger>,
-    /// Soft quota in bytes. 0 = unlimited (treat as u64::MAX internally).
+    /// Raw soft quota in bytes from config. 0 = use disk-based limit.
     soft_quota_bytes: u64,
-    /// Hard quota in bytes: floor; never accept symbols above this held total.
-    /// 0 = no hard floor.
+    /// Raw hard quota in bytes. 0 = no hard floor.
     hard_quota_bytes: u64,
+    /// Data directory path for disk space queries (statvfs).
+    data_dir: PathBuf,
+    /// Disk reserve bytes — minimum free space to keep on the filesystem.
+    disk_reserve_bytes: u64,
     /// Channel to notify BackupCoordinator about symbol accept/reject outcomes.
     backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
     /// Time acceleration factor (1 = real time). Scales week numbers for trust.
@@ -152,6 +155,8 @@ impl Processor {
         relay_sync_tx: mpsc::Sender<crate::daemon::relay::SyncTrigger>,
         soft_quota_bytes: u64,
         hard_quota_bytes: u64,
+        data_dir: PathBuf,
+        disk_reserve_bytes: u64,
         backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
         time_scale: u64,
         pending_challenges: PendingChallenges,
@@ -169,6 +174,8 @@ impl Processor {
             relay_sync_tx,
             soft_quota_bytes,
             hard_quota_bytes,
+            data_dir,
+            disk_reserve_bytes,
             backup_event_tx,
             time_scale,
             pending_challenges,
@@ -1148,21 +1155,20 @@ impl Processor {
     ) -> Result<bool, ProcessorError> {
         let held_bytes = self.db.total_holding_bytes()?;
 
-        let effective_hard = if self.hard_quota_bytes == 0 {
-            u64::MAX
-        } else {
-            self.hard_quota_bytes
-        };
-        let effective_soft = if self.soft_quota_bytes == 0 {
-            u64::MAX
-        } else {
-            self.soft_quota_bytes
-        };
-
-        if held_bytes >= effective_hard {
+        // Hard quota: absolute ceiling — always reject above this.
+        if self.hard_quota_bytes > 0 && held_bytes >= self.hard_quota_bytes {
             return Ok(false);
         }
-        if effective_soft < u64::MAX && held_bytes + offer_bytes > effective_soft {
+
+        // Effective soft quota: min(config_soft_quota, disk_free - reserve).
+        // When soft_quota=0, uses all available disk minus reserve.
+        let disk_free = crate::daemon::handle::disk_available_bytes(&self.data_dir);
+        let effective = syncback_core::budget::compute_effective_quota(
+            self.soft_quota_bytes,
+            disk_free,
+            self.disk_reserve_bytes,
+        );
+        if held_bytes + offer_bytes > effective {
             return Ok(false);
         }
         Ok(true)

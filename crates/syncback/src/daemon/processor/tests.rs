@@ -148,6 +148,8 @@ async fn make_processor_with_quota(
         relay_sync_tx,
         soft_quota_bytes,
         hard_quota_bytes,
+        holdings_dir.path().to_path_buf(), // data_dir (for disk space queries in tests)
+        0,                                 // disk_reserve_bytes (no reserve in tests)
         backup_event_tx,
         1, // time_scale
         pending_challenges,
@@ -209,6 +211,8 @@ async fn make_processor_with_pending(
         relay_sync_tx,
         u64::MAX,
         u64::MAX,
+        holdings_dir.path().to_path_buf(),
+        0,
         backup_event_tx,
         1, // time_scale
         pending,
@@ -283,6 +287,8 @@ async fn symbol_accept_updates_backup_event() {
         relay_sync_tx,
         u64::MAX,
         u64::MAX,
+        holdings_dir.path().to_path_buf(),
+        0,
         backup_event_tx,
         1,
         pending,
@@ -943,12 +949,14 @@ async fn symbol_offer_accept_when_unlimited_quota() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
     let source_dir = TempDir::new().unwrap();
+    // soft_quota=0 means "use disk-based limit" (effective = disk_free - reserve).
+    // With reserve=0, any offer fitting in disk space is accepted.
     let (processor, _rx, _relay_rx) =
-        make_processor_with_quota(db.clone(), &holdings_dir, &source_dir, u64::MAX, u64::MAX)
+        make_processor_with_quota(db.clone(), &holdings_dir, &source_dir, 0, 0)
             .await;
 
     let accept = processor
-        .decide_symbol_offer(1_000_000_000_000)
+        .decide_symbol_offer(65_535) // one symbol — always fits
         .expect("decide_symbol_offer failed");
     assert!(accept, "should accept when quota is unlimited");
 }
@@ -2110,7 +2118,9 @@ async fn dispatch_relay_pos_challenge_sends_response_via_board() {
     let processor = Processor::new(
         db.clone(), own_identity, repair_tx, cluster_sync, encoder,
         holdings_dir.path().to_path_buf(), source_dir.path().to_path_buf(),
-        network, relay_sync_tx, u64::MAX, u64::MAX, backup_event_tx, 1,
+        network, relay_sync_tx, u64::MAX, u64::MAX,
+        holdings_dir.path().to_path_buf(), 0,
+        backup_event_tx, 1,
         pending, relay_post_tx,
     );
 
