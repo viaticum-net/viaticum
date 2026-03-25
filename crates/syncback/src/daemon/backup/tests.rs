@@ -789,6 +789,7 @@ async fn deliver_symbols_logs_warn_on_peer_not_found() {
                 device_cert: None,
                 iroh_secret_key: None,
                 relay_mode: iroh::RelayMode::Disabled,
+                x25519_pub: None,
             },
             tx,
         )
@@ -894,6 +895,7 @@ async fn deliver_symbols_sends_to_reachable_holder() {
                 device_cert: Some(holder_cert),
                 iroh_secret_key: None,
                 relay_mode: iroh::RelayMode::Disabled,
+                x25519_pub: None,
             },
             tx_holder,
         )
@@ -915,6 +917,7 @@ async fn deliver_symbols_sends_to_reachable_holder() {
                 device_cert: Some(owner_cert),
                 iroh_secret_key: None,
                 relay_mode: iroh::RelayMode::Disabled,
+                x25519_pub: None,
             },
             tx_owner,
         )

@@ -42,6 +42,10 @@ pub struct PeerAnnounceMsg {
     /// Ed25519 signature of identity_pub || node_id || timestamp. 64 bytes.
     #[serde(with = "sig_serde")]
     pub sig: [u8; 64],
+    /// X25519 public key for directed relay board encryption.
+    /// Not covered by sig — informational field only.
+    #[serde(default)]
+    pub x25519_pub: Option<[u8; 32]>,
 }
 
 /// Owner → Holder. Challenge ESI to prove possession.
@@ -564,11 +568,13 @@ fn peer_announce_sig_input(
 /// Build a signed PeerAnnounceMsg.
 ///
 /// The sig covers identity_pub || node_id || timestamp.
+/// `x25519_pub` is NOT part of the signature — it is an informational field.
 pub fn build_peer_announce(
     identity_pub: IdentityPub,
     node_id: crate::types::NodeId,
     timestamp: Timestamp,
     signing_key: &ed25519_dalek::SigningKey,
+    x25519_pub: Option<[u8; 32]>,
 ) -> PeerAnnounceMsg {
     let sig_input = peer_announce_sig_input(&identity_pub, &node_id, &timestamp);
     let signature = signing_key.sign(&sig_input);
@@ -578,6 +584,7 @@ pub fn build_peer_announce(
         node_id,
         timestamp,
         sig: signature.to_bytes(),
+        x25519_pub,
     }
 }
 
@@ -589,6 +596,87 @@ pub fn verify_peer_announce(msg: &PeerAnnounceMsg) -> Result<(), MessageError> {
     let sig_input = peer_announce_sig_input(&msg.identity_pub, &msg.node_id, &msg.timestamp);
     verifying_key
         .verify_strict(&sig_input, &signature)
+        .map_err(|_| MessageError::BadSignature)?;
+    Ok(())
+}
+
+// ============================================================
+// Delete / CancelDelete signatures
+// ============================================================
+
+fn delete_sig_input(source_block_id: &SourceBlockId, timestamp: &Timestamp) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 32 + 8);
+    v.push(b'd');
+    v.extend_from_slice(&source_block_id.0);
+    v.extend_from_slice(&timestamp.0.to_be_bytes());
+    v
+}
+
+/// Build a signed DeleteMsg.
+///
+/// Sig covers: `'d' || source_block_id(32) || timestamp(8 BE)`.
+pub fn build_delete_msg(
+    source_block_id: SourceBlockId,
+    timestamp: Timestamp,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> DeleteMsg {
+    let sig_input = delete_sig_input(&source_block_id, &timestamp);
+    let sig = signing_key.sign(&sig_input).to_bytes();
+    DeleteMsg {
+        v: 1,
+        source_block_id,
+        timestamp,
+        sig,
+    }
+}
+
+/// Verify a DeleteMsg signature against the claimed owner identity.
+pub fn verify_delete_msg(msg: &DeleteMsg, owner: &IdentityPub) -> Result<(), MessageError> {
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&owner.0)
+        .map_err(|_| MessageError::BadSignature)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&msg.sig);
+    let input = delete_sig_input(&msg.source_block_id, &msg.timestamp);
+    vk.verify_strict(&input, &sig)
+        .map_err(|_| MessageError::BadSignature)?;
+    Ok(())
+}
+
+fn cancel_delete_sig_input(source_block_id: &SourceBlockId, timestamp: &Timestamp) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 32 + 8);
+    v.push(b'c');
+    v.extend_from_slice(&source_block_id.0);
+    v.extend_from_slice(&timestamp.0.to_be_bytes());
+    v
+}
+
+/// Build a signed CancelDeleteMsg.
+///
+/// Sig covers: `'c' || source_block_id(32) || timestamp(8 BE)`.
+pub fn build_cancel_delete_msg(
+    source_block_id: SourceBlockId,
+    timestamp: Timestamp,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> CancelDeleteMsg {
+    let sig_input = cancel_delete_sig_input(&source_block_id, &timestamp);
+    let sig = signing_key.sign(&sig_input).to_bytes();
+    CancelDeleteMsg {
+        v: 1,
+        source_block_id,
+        timestamp,
+        sig,
+    }
+}
+
+/// Verify a CancelDeleteMsg signature against the claimed owner identity.
+pub fn verify_cancel_delete_msg(
+    msg: &CancelDeleteMsg,
+    owner: &IdentityPub,
+) -> Result<(), MessageError> {
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&owner.0)
+        .map_err(|_| MessageError::BadSignature)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&msg.sig);
+    let input = cancel_delete_sig_input(&msg.source_block_id, &msg.timestamp);
+    vk.verify_strict(&input, &sig)
         .map_err(|_| MessageError::BadSignature)?;
     Ok(())
 }

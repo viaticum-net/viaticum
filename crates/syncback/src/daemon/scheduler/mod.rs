@@ -16,14 +16,15 @@ use std::time::Duration;
 
 use syncback_core::constants::{POS_TIMEOUT_SECS, KI, KP, S_CLAMP_MAX, S_CLAMP_MIN};
 use syncback_core::db::Db;
-use syncback_core::messages::{Message, PosChallengeMsg};
+use syncback_core::deletion::{DeletionAction, DeletionEngine};
+use syncback_core::messages::PosChallengeMsg;
 use syncback_core::pos::{apply_pos_outcome, due_challenges, outcome_from_verify, select_challenge_esi, VerifyOutcome};
-use syncback_core::types::{IdentityPub, PlacementStatus, SourceBlockId, Timestamp};
+use syncback_core::types::{IdentityPub, PlacementStatus, SourceBlockId, SourceBlockStatus, Timestamp};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::daemon::network::NetworkHandle;
+use crate::daemon::relay::RelayPost;
 use crate::daemon::repair::RepairTrigger;
 
 #[cfg(test)]
@@ -80,10 +81,13 @@ impl SchedulerConfig {
 pub struct Scheduler {
     db: Db,
     config: SchedulerConfig,
-    network: Arc<NetworkHandle>,
     repair_tx: mpsc::Sender<RepairTrigger>,
     /// Shared with Processor for response matching.
     pending: PendingChallenges,
+    /// Channel to post messages to the relay board.
+    relay_post_tx: mpsc::Sender<RelayPost>,
+    /// Signing key for building DeleteMsg signatures.
+    signing_key: ed25519_dalek::SigningKey,
 }
 
 impl Scheduler {
@@ -91,16 +95,18 @@ impl Scheduler {
     pub fn new(
         db: Db,
         config: SchedulerConfig,
-        network: Arc<NetworkHandle>,
         repair_tx: mpsc::Sender<RepairTrigger>,
         pending: PendingChallenges,
+        relay_post_tx: mpsc::Sender<RelayPost>,
+        signing_key: ed25519_dalek::SigningKey,
     ) -> Self {
         Scheduler {
             db,
             config,
-            network,
             repair_tx,
             pending,
+            relay_post_tx,
+            signing_key,
         }
     }
 
@@ -115,12 +121,16 @@ impl Scheduler {
         let pos_interval = Duration::from_secs((self.config.pos_interval_secs / scale).max(1));
         let timeout_interval =
             Duration::from_secs((self.config.timeout_check_secs / scale).max(1));
+        // Deletion check: same interval as PoS (hourly, scaled).
+        let deletion_interval = Duration::from_secs((3600 / scale).max(1));
 
         let mut pos_timer = tokio::time::interval(pos_interval);
         let mut timeout_timer = tokio::time::interval(timeout_interval);
+        let mut deletion_timer = tokio::time::interval(deletion_interval);
         // Skip the first immediate tick so we don't fire right at startup.
         pos_timer.tick().await;
         timeout_timer.tick().await;
+        deletion_timer.tick().await;
 
         info!(
             pos_interval_secs = self.config.pos_interval_secs / scale,
@@ -142,6 +152,11 @@ impl Scheduler {
                 _ = timeout_timer.tick() => {
                     if let Err(e) = self.check_timeouts().await {
                         error!("scheduler: check_timeouts error: {e}");
+                    }
+                }
+                _ = deletion_timer.tick() => {
+                    if let Err(e) = self.process_deletion_tick().await {
+                        error!("scheduler: process_deletion_tick error: {e}");
                     }
                 }
             }
@@ -258,61 +273,53 @@ impl Scheduler {
             };
 
             let challenge_id = random_challenge_id();
-            let msg = Message::PosChallenge(PosChallengeMsg {
+            let challenge_msg = PosChallengeMsg {
                 v: 1,
                 challenge_id,
                 source_block_id: entry.source_block_id,
                 esi,
                 timestamp: now,
-            });
-
-            // Attempt to send. On connection/send failure, treat as immediate timeout:
-            // if we can't reach the holder, that's equivalent to no response.
-            let send_ok = match self.network.get_connection(entry.holder_id).await {
-                Err(e) => {
-                    warn!(
-                        holder_id = %entry.holder_id,
-                        "scheduler: cannot connect to holder for PoS: {e}"
-                    );
-                    false
-                }
-                Ok(conn_arc) => {
-                    match conn_arc.send_message(&msg).await {
-                        Ok(()) => true,
-                        Err(e) => {
-                            warn!(
-                                holder_id = %entry.holder_id,
-                                "scheduler: send PosChallenge failed: {e}"
-                            );
-                            false
-                        }
-                    }
-                }
             };
 
-            if send_ok {
-                // Challenge successfully sent — track in pending map.
-                self.pending.lock().await.insert(
-                    key,
-                    PendingChallenge {
-                        source_block_id: entry.source_block_id,
-                        holder_id: entry.holder_id,
-                        esi,
-                        issued_at: now,
-                        challenge_id,
-                    },
-                );
-
-                info!(
-                    block_id = %entry.source_block_id,
-                    holder_id = %entry.holder_id,
-                    esi,
-                    "scheduler: PoS challenge issued"
-                );
-            } else {
-                // Unreachable holder — apply immediate timeout to placement.
-                self.apply_unreachable_timeout(entry.source_block_id, entry.holder_id).await;
+            // Post challenge to relay board (directed to holder).
+            // Board always accepts locally — no unreachable fallback needed.
+            match syncback_core::messages::to_cbor(&challenge_msg) {
+                Ok(payload) => {
+                    let _ = self.relay_post_tx.send(crate::daemon::relay::RelayPost {
+                        msg_type: "pos_challenge".to_string(),
+                        target: Some(entry.holder_id),
+                        payload,
+                        msg_id: challenge_id,
+                    }).await;
+                }
+                Err(e) => {
+                    error!(
+                        block_id = %entry.source_block_id,
+                        holder_id = %entry.holder_id,
+                        "scheduler: failed to encode PosChallenge: {e}"
+                    );
+                    continue;
+                }
             }
+
+            // Challenge posted to board — track in pending map.
+            self.pending.lock().await.insert(
+                key,
+                PendingChallenge {
+                    source_block_id: entry.source_block_id,
+                    holder_id: entry.holder_id,
+                    esi,
+                    issued_at: now,
+                    challenge_id,
+                },
+            );
+
+            info!(
+                block_id = %entry.source_block_id,
+                holder_id = %entry.holder_id,
+                esi,
+                "scheduler: PoS challenge issued via board"
+            );
         }
 
         Ok(())
@@ -419,59 +426,98 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Apply a Timeout outcome when we can't even connect to a holder.
-    ///
-    /// This is equivalent to a normal PoS timeout: the holder is unreachable,
-    /// so we treat it as a missed challenge. After enough consecutive misses,
-    /// the placement transitions to PresumedLost and triggers repair.
-    async fn apply_unreachable_timeout(
-        &self,
-        block_id: SourceBlockId,
-        holder_id: IdentityPub,
-    ) {
-        let placement = match self.db.get_placement(&block_id, &holder_id) {
-            Ok(Some(p)) => p,
-            Ok(None) => return,
-            Err(e) => {
-                error!("scheduler: DB error reading placement for unreachable timeout: {e}");
-                return;
+    /// Process deletion cooldowns: run DeletionEngine, execute returned actions.
+    pub async fn process_deletion_tick(&self) -> anyhow::Result<()> {
+        let now = Timestamp::now();
+        let engine = DeletionEngine::new();
+
+        let files = self.db.list_all_files().unwrap_or_default();
+        let blocks = self.db.list_all_source_blocks().unwrap_or_default();
+        let placements = self.db.list_all_placements().unwrap_or_default();
+
+        let actions = engine.process_cooldowns(&files, &blocks, &placements, now);
+        if actions.is_empty() {
+            return Ok(());
+        }
+
+        info!(count = actions.len(), "scheduler: processing deletion actions");
+
+        for action in actions {
+            match action {
+                DeletionAction::SendDropNotice { source_block_id, holder_id } => {
+                    // Build signed DeleteMsg, post to board, mark placement Deleting.
+                    let delete_msg = syncback_core::messages::build_delete_msg(
+                        source_block_id, now, &self.signing_key,
+                    );
+                    if let Ok(payload) = syncback_core::messages::to_cbor(&delete_msg) {
+                        let mut msg_id = [0u8; 16];
+                        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut msg_id);
+                        let _ = self.relay_post_tx.send(RelayPost {
+                            msg_type: "delete".to_string(),
+                            target: Some(holder_id),
+                            payload,
+                            msg_id,
+                        }).await;
+                    }
+
+                    // Mark placement status Deleting.
+                    if let Ok(Some(mut p)) = self.db.get_placement(&source_block_id, &holder_id) {
+                        p.status = PlacementStatus::Deleting;
+                        let _ = self.db.upsert_placement(&p);
+                    }
+
+                    // Mark source block status Deleting (if still Active).
+                    if let Ok(Some(mut sb)) = self.db.get_source_block(&source_block_id) {
+                        if sb.status == SourceBlockStatus::Active || sb.status == SourceBlockStatus::Stale {
+                            sb.status = SourceBlockStatus::Deleting;
+                            let _ = self.db.upsert_source_block(&sb);
+                        }
+                    }
+
+                    info!(
+                        block_id = %source_block_id,
+                        holder_id = %holder_id,
+                        "scheduler: sent DeleteMsg via board, placement → Deleting"
+                    );
+                }
+                DeletionAction::CleanupPlacement { source_block_id, holder_id } => {
+                    let _ = self.db.delete_placement(&source_block_id, &holder_id);
+                    info!(
+                        block_id = %source_block_id,
+                        holder_id = %holder_id,
+                        "scheduler: cleaned up placement"
+                    );
+                }
+                DeletionAction::CleanupBlock { source_block_id, file_id } => {
+                    let _ = self.db.delete_source_block(&source_block_id);
+                    // Prune the file version that references this block.
+                    if let Ok(Some(mut file)) = self.db.get_file_by_id(file_id) {
+                        file.versions.retain(|v| v.source_block_id != source_block_id);
+                        let _ = self.db.upsert_file(&file);
+                    }
+                    info!(
+                        block_id = %source_block_id,
+                        file_id = %file_id,
+                        "scheduler: cleaned up source block + file version"
+                    );
+                }
+                DeletionAction::VacuumBlock { source_block_id, .. } => {
+                    // Vacuum (repack) is complex — defer for now, just log.
+                    debug!(
+                        block_id = %source_block_id,
+                        "scheduler: VacuumBlock deferred (repack not implemented)"
+                    );
+                }
+                DeletionAction::WaitForOtherDevices { file_id } => {
+                    debug!(
+                        file_id = %file_id,
+                        "scheduler: waiting for other devices to delete"
+                    );
+                }
             }
-        };
-
-        let transition = apply_pos_outcome(&placement, &VerifyOutcome::Timeout);
-
-        let mut updated = placement;
-        updated.status = transition.new_status;
-        updated.consecutive_misses = transition.new_consecutive_misses;
-        // Update last_verified so due_challenges knows we attempted this cycle.
-        updated.last_verified = Some(Timestamp::now());
-
-        if let Err(e) = self.db.upsert_placement(&updated) {
-            error!("scheduler: DB error updating placement after unreachable timeout: {e}");
-            return;
         }
 
-        let scale = self.config.time_scale.max(1);
-        let week = crate::daemon::processor::current_week_number_scaled(scale);
-        let pos_outcome = outcome_from_verify(&VerifyOutcome::Timeout, week);
-        crate::daemon::processor::record_pos_weekly(&self.db, holder_id, pos_outcome);
-        crate::daemon::processor::recalculate_trust(&self.db, &holder_id, week);
-
-        info!(
-            block_id = %block_id,
-            holder_id = %holder_id,
-            new_status = ?transition.new_status,
-            misses = transition.new_consecutive_misses,
-            trigger_repair = transition.trigger_repair,
-            "scheduler: unreachable holder, applied timeout"
-        );
-
-        if transition.trigger_repair {
-            let _ = self
-                .repair_tx
-                .send(RepairTrigger::RepairNow { block_id, holder_id })
-                .await;
-        }
+        Ok(())
     }
 }
 

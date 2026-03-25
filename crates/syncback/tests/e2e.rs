@@ -87,6 +87,7 @@ async fn make_network_handle() -> NetworkHandle {
             device_cert: None,
             iroh_secret_key: None,
             relay_mode: iroh::RelayMode::Disabled,
+            x25519_pub: None,
         },
         tx,
     )
@@ -389,6 +390,7 @@ async fn full_lifecycle_e2e() {
         device_id: None,
         revoked_device_pub_keys: vec![],
         addrs: vec![],
+        x25519_pub: None,
     };
     peer.revoked_device_pub_keys.push(b_device_pub);
 

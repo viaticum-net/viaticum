@@ -89,6 +89,7 @@ pub async fn run_dr(
         device_cert: None,
         iroh_secret_key: Some(iroh::SecretKey::from_bytes(&iroh_key_bytes)),
         relay_mode: RelayMode::Default,
+        x25519_pub: None,
     };
 
     let network = Arc::new(NetworkHandle::start(net_config, incoming_tx).await?);

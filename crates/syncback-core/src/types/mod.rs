@@ -370,6 +370,10 @@ pub struct PeerRecord {
     /// Known addresses in "NodeId_hex@ip:port" format.
     #[serde(default)]
     pub addrs: Vec<String>,
+    /// X25519 public key for directed relay board encryption.
+    /// Received via PeerAnnounce; None for peers that have not sent it yet.
+    #[serde(default)]
+    pub x25519_pub: Option<[u8; 32]>,
 }
 
 impl PeerRecord {

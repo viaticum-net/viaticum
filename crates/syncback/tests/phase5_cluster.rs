@@ -210,6 +210,7 @@ fn device_revocation_epoch_rotation_rejects_revoked_key() {
         device_id: None,
         revoked_device_pub_keys: Vec::new(),
         addrs: vec![],
+        x25519_pub: None,
     };
     peer_record.revoked_device_pub_keys.push(revoked_pub);
 

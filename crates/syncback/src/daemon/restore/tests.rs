@@ -88,6 +88,7 @@ async fn test_restore_coord(
         device_cert: None,
         iroh_secret_key: None,
         relay_mode: iroh::RelayMode::Disabled,
+        x25519_pub: None,
     };
     let network = NetworkHandle::start(config_net, tx)
         .await
@@ -119,6 +120,7 @@ async fn test_restore_coord(
             device_cert: None,
             iroh_secret_key: None,
             relay_mode: iroh::RelayMode::Disabled,
+            x25519_pub: None,
         },
         tx2,
     )
@@ -785,6 +787,7 @@ async fn fetch_skips_denied_holder_and_tries_next() {
             device_cert: Some(cert_a),
             iroh_secret_key: None,
             relay_mode: iroh::RelayMode::Disabled,
+            x25519_pub: None,
         },
         tx_a,
     )
@@ -799,6 +802,7 @@ async fn fetch_skips_denied_holder_and_tries_next() {
             device_cert: Some(cert_b),
             iroh_secret_key: None,
             relay_mode: iroh::RelayMode::Disabled,
+            x25519_pub: None,
         },
         tx_b,
     )
@@ -921,6 +925,7 @@ async fn fetch_skips_denied_holder_and_tries_next() {
             device_cert: Some(owner_cert),
             iroh_secret_key: None,
             relay_mode: iroh::RelayMode::Disabled,
+            x25519_pub: None,
         },
         tx_owner,
     )
@@ -1061,6 +1066,7 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
             device_cert: Some(cert_h1),
             iroh_secret_key: None,
             relay_mode: iroh::RelayMode::Disabled,
+            x25519_pub: None,
         },
         tx_h1,
     )
@@ -1075,6 +1081,7 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
             device_cert: Some(cert_h2),
             iroh_secret_key: None,
             relay_mode: iroh::RelayMode::Disabled,
+            x25519_pub: None,
         },
         tx_h2,
     )
@@ -1187,6 +1194,7 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
             device_cert: Some(owner_cert),
             iroh_secret_key: None,
             relay_mode: iroh::RelayMode::Disabled,
+            x25519_pub: None,
         },
         tx_owner,
     )

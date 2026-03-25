@@ -23,8 +23,9 @@ use syncback_core::cluster::{derive_master_key, master_identity, ClusterState};
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
 use syncback_core::messages::{
-    BoardSyncMsg, PeerAnnounceMsg, PosNackMsg, PosChallengeMsg, RestoreRequestMsg,
-    SymbolAcceptMsg, SymbolDroppedMsg, SymbolRejectMsg, SymbolTransferMsg,
+    BoardSyncMsg, CancelDeleteMsg, DeleteMsg, PeerAnnounceMsg, PosNackMsg, PosChallengeMsg,
+    RestoreRequestMsg, SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolDroppedMsg, SymbolRejectMsg,
+    SymbolTransferMsg,
 };
 use syncback_core::types::{
     DeviceId, FileId, HoldingRecord, HoldingStatus, IdentityPub, PlacementStatus, SourceBlockId,
@@ -36,7 +37,7 @@ use tokio::sync::mpsc;
 use super::{esi_list_to_ranges, ranges_to_esi_list, Processor};
 use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
 use crate::daemon::network::{NetworkConfig, NetworkHandle};
-use crate::daemon::relay::{InboundMessage, SyncTrigger};
+use crate::daemon::relay::{InboundMessage, RelayPost, SyncTrigger};
 use crate::daemon::repair::RepairTrigger;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
@@ -64,6 +65,7 @@ fn make_peer_record(identity: IdentityPub) -> syncback_core::types::PeerRecord {
         device_id: None,
         revoked_device_pub_keys: vec![],
         addrs: vec![],
+        x25519_pub: None,
     }
 }
 
@@ -77,6 +79,7 @@ async fn make_network() -> Arc<NetworkHandle> {
         device_cert: None,
         iroh_secret_key: None,
         relay_mode: iroh::RelayMode::Disabled,
+        x25519_pub: None,
     };
     let (incoming_tx, _incoming_rx) = mpsc::channel(8);
     Arc::new(NetworkHandle::start(cfg, incoming_tx).await.expect("network start"))
@@ -132,6 +135,7 @@ async fn make_processor_with_quota(
         tokio::sync::mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
     let pending_challenges: crate::daemon::scheduler::PendingChallenges =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let processor = Processor::new(
         db,
         own_identity,
@@ -147,6 +151,7 @@ async fn make_processor_with_quota(
         backup_event_tx,
         1, // time_scale
         pending_challenges,
+        relay_post_tx,
     );
 
     (processor, repair_rx, relay_sync_rx)
@@ -191,6 +196,7 @@ async fn make_processor_with_pending(
 
     let (backup_event_tx, _backup_event_rx) =
         tokio::sync::mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let processor = Processor::new(
         db,
         own_identity,
@@ -206,6 +212,7 @@ async fn make_processor_with_pending(
         backup_event_tx,
         1, // time_scale
         pending,
+        relay_post_tx,
     );
 
     (processor, repair_rx, relay_sync_rx)
@@ -263,6 +270,7 @@ async fn symbol_accept_updates_backup_event() {
         mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
     let pending: crate::daemon::scheduler::PendingChallenges =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let processor = Processor::new(
         db.clone(),
         own_identity,
@@ -278,6 +286,7 @@ async fn symbol_accept_updates_backup_event() {
         backup_event_tx,
         1,
         pending,
+        relay_post_tx,
     );
 
     let holder = make_identity(7);
@@ -1111,6 +1120,7 @@ fn make_peer_announce_msg(identity: IdentityPub) -> PeerAnnounceMsg {
         node_id: NodeId([42u8; 32]),
         timestamp: Timestamp::now(),
         sig: [0u8; 64],
+        x25519_pub: None,
     }
 }
 
@@ -1164,6 +1174,7 @@ async fn peer_announce_updates_existing_peer_node_id() {
         device_id: None,
         revoked_device_pub_keys: vec![],
         addrs: vec![],
+        x25519_pub: None,
     })
     .unwrap();
 
@@ -1174,6 +1185,7 @@ async fn peer_announce_updates_existing_peer_node_id() {
         node_id: new_node_id,
         timestamp: Timestamp::now(),
         sig: [0u8; 64],
+        x25519_pub: None,
     };
 
     processor
@@ -1297,6 +1309,7 @@ async fn peer_announce_with_valid_node_id_registers_in_network() {
         node_id: valid_node_id,
         timestamp: Timestamp::now(),
         sig: [0u8; 64],
+        x25519_pub: None,
     };
 
     processor
@@ -1339,6 +1352,7 @@ async fn peer_announce_db_upsert_succeeds_regardless_of_node_id_validity() {
         node_id,
         timestamp: Timestamp::now(),
         sig: [0u8; 64],
+        x25519_pub: None,
     };
 
     processor
@@ -1414,6 +1428,7 @@ async fn handle_system_state_backup_stores_blob_for_known_peer() {
         device_id: None,
         revoked_device_pub_keys: vec![],
         addrs: vec![],
+        x25519_pub: None,
     })
     .unwrap();
 
@@ -1485,6 +1500,7 @@ async fn handle_system_state_backup_ignores_empty_blob() {
         device_id: None,
         revoked_device_pub_keys: vec![],
         addrs: vec![],
+        x25519_pub: None,
     })
     .unwrap();
 
@@ -1810,4 +1826,365 @@ async fn handle_pos_response_fail_marks_lost_and_triggers_repair() {
         }
         other => panic!("expected RepairNow, got {other:?}"),
     }
+}
+
+// ─── handle_delete tests ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn handle_delete_marks_holding_for_deletion() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0xDD);
+
+    // Insert an Active holding.
+    let holding = HoldingRecord {
+        source_block_id: block_id,
+        owner_id,
+        esi_ranges: vec![(0, 10)],
+        importance: 0.5,
+        total_bytes: 1000,
+        status: HoldingStatus::Active,
+        received_at: Timestamp(100),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&holding).unwrap();
+
+    // Build a valid delete message.
+    let delete_msg = syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
+    processor.handle_delete(owner_id, delete_msg).await.unwrap();
+
+    let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
+    assert_eq!(updated.status, HoldingStatus::MarkedForDelete);
+    assert!(updated.delete_requested_at.is_some());
+}
+
+#[tokio::test]
+async fn handle_delete_ignores_non_active_holding() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0xDE);
+
+    // Insert a MarkedForDelete holding.
+    let holding = HoldingRecord {
+        source_block_id: block_id,
+        owner_id,
+        esi_ranges: vec![(0, 5)],
+        importance: 0.5,
+        total_bytes: 500,
+        status: HoldingStatus::MarkedForDelete,
+        received_at: Timestamp(100),
+        delete_requested_at: Some(Timestamp(200)),
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&holding).unwrap();
+
+    let delete_msg = syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
+    processor.handle_delete(owner_id, delete_msg).await.unwrap();
+
+    // Status should not change.
+    let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
+    assert_eq!(updated.status, HoldingStatus::MarkedForDelete);
+}
+
+#[tokio::test]
+async fn handle_delete_ignores_no_holding() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0xDF);
+
+    // No holding in DB — should not panic.
+    let delete_msg = syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
+    processor.handle_delete(owner_id, delete_msg).await.unwrap();
+}
+
+#[tokio::test]
+async fn handle_delete_rejects_invalid_signature() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
+    let wrong_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let block_id = make_block_id(0xE0);
+
+    let holding = HoldingRecord {
+        source_block_id: block_id,
+        owner_id,
+        esi_ranges: vec![(0, 10)],
+        importance: 0.5,
+        total_bytes: 1000,
+        status: HoldingStatus::Active,
+        received_at: Timestamp(100),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&holding).unwrap();
+
+    // Sign with wrong key.
+    let delete_msg = syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &wrong_key);
+    processor.handle_delete(owner_id, delete_msg).await.unwrap();
+
+    // Holding should remain Active (bad sig rejected silently).
+    let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
+    assert_eq!(updated.status, HoldingStatus::Active);
+}
+
+// ─── handle_cancel_delete tests ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn handle_cancel_delete_reverts_to_active() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0xE1);
+
+    let holding = HoldingRecord {
+        source_block_id: block_id,
+        owner_id,
+        esi_ranges: vec![(0, 10)],
+        importance: 0.5,
+        total_bytes: 1000,
+        status: HoldingStatus::MarkedForDelete,
+        received_at: Timestamp(100),
+        delete_requested_at: Some(Timestamp(200)),
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&holding).unwrap();
+
+    let cancel_msg = syncback_core::messages::build_cancel_delete_msg(block_id, Timestamp::now(), &owner_key);
+    processor.handle_cancel_delete(owner_id, cancel_msg).await.unwrap();
+
+    let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
+    assert_eq!(updated.status, HoldingStatus::Active);
+    assert!(updated.delete_requested_at.is_none());
+}
+
+#[tokio::test]
+async fn handle_cancel_delete_ignores_active_holding() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0xE2);
+
+    let holding = HoldingRecord {
+        source_block_id: block_id,
+        owner_id,
+        esi_ranges: vec![(0, 10)],
+        importance: 0.5,
+        total_bytes: 1000,
+        status: HoldingStatus::Active,
+        received_at: Timestamp(100),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&holding).unwrap();
+
+    let cancel_msg = syncback_core::messages::build_cancel_delete_msg(block_id, Timestamp::now(), &owner_key);
+    processor.handle_cancel_delete(owner_id, cancel_msg).await.unwrap();
+
+    // Should remain Active (no-op).
+    let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
+    assert_eq!(updated.status, HoldingStatus::Active);
+}
+
+#[tokio::test]
+async fn handle_cancel_delete_rejects_bad_sig() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
+    let wrong_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let block_id = make_block_id(0xE3);
+
+    let holding = HoldingRecord {
+        source_block_id: block_id,
+        owner_id,
+        esi_ranges: vec![(0, 10)],
+        importance: 0.5,
+        total_bytes: 1000,
+        status: HoldingStatus::MarkedForDelete,
+        received_at: Timestamp(100),
+        delete_requested_at: Some(Timestamp(200)),
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&holding).unwrap();
+
+    let cancel_msg = syncback_core::messages::build_cancel_delete_msg(block_id, Timestamp::now(), &wrong_key);
+    processor.handle_cancel_delete(owner_id, cancel_msg).await.unwrap();
+
+    // Should remain MarkedForDelete (bad sig).
+    let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
+    assert_eq!(updated.status, HoldingStatus::MarkedForDelete);
+}
+
+// ─── handle_symbol_drop_notice test ───────────────────────────────────────────
+
+#[tokio::test]
+async fn handle_symbol_drop_notice_does_not_panic() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let holder = make_identity(0xF0);
+    let notice = SymbolDropNoticeMsg {
+        v: 1,
+        source_block_id: make_block_id(0xF0),
+        esi_ranges: vec![(0, 100)],
+        deadline: Timestamp(Timestamp::now().0 + 604_800),
+        timestamp: Timestamp::now(),
+    };
+
+    // Should not panic — just logs.
+    processor.handle_symbol_drop_notice(holder, notice);
+}
+
+// ─── dispatch_relay tests for new message types ───────────────────────────────
+
+#[tokio::test]
+async fn dispatch_relay_pos_challenge_sends_response_via_board() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+
+    // Build processor manually to keep relay_post_rx alive.
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
+    let (relay_sync_tx, _relay_sync_rx) = mpsc::channel::<SyncTrigger>(16);
+    let master_key = syncback_core::cluster::derive_master_key(&[42u8; 64]).unwrap();
+    let own_identity = syncback_core::cluster::master_identity(&master_key);
+    let device_id = DeviceId([1u8; 16]);
+    let now = Timestamp::now();
+    let cert = syncback_core::cluster::issue_device_certificate(&master_key, device_id, [0u8; 32], now);
+    let cluster_state = syncback_core::cluster::ClusterState::init(db.clone(), own_identity, cert, now, now).unwrap();
+    let cluster_state = Arc::new(std::sync::Mutex::new(cluster_state));
+    let cluster_sync = Arc::new(ClusterSyncManager::new(
+        db.clone(),
+        ClusterSyncConfig { our_device_id: device_id, batch_size: 1000 },
+        cluster_state,
+    ));
+    let encoder: Arc<dyn syncback_core::erasure::ErasureEncoder> =
+        Arc::new(syncback_core::erasure::RaptorQEncoder::new());
+    let network = make_network().await;
+    let (backup_event_tx, _backup_event_rx) =
+        mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
+    let pending: crate::daemon::scheduler::PendingChallenges =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    let processor = Processor::new(
+        db.clone(), own_identity, repair_tx, cluster_sync, encoder,
+        holdings_dir.path().to_path_buf(), source_dir.path().to_path_buf(),
+        network, relay_sync_tx, u64::MAX, u64::MAX, backup_event_tx, 1,
+        pending, relay_post_tx,
+    );
+
+    // Create a symbol file so PoS can respond.
+    let block_id = make_block_id(0xA1);
+    let block_hex = syncback_core::types::hex_encode(&block_id.0);
+    let block_dir = holdings_dir.path().join(&block_hex);
+    std::fs::create_dir_all(&block_dir).unwrap();
+    std::fs::write(block_dir.join("42.bin"), b"test_symbol_data").unwrap();
+
+    // Build a PoS challenge as an InboundMessage.
+    let challenger = make_identity(0xB1);
+    let challenge = PosChallengeMsg {
+        v: 1,
+        challenge_id: [0xCC; 16],
+        source_block_id: block_id,
+        esi: 42,
+        timestamp: now,
+    };
+    let payload = syncback_core::messages::to_cbor(&challenge).unwrap();
+    let relay_msg = InboundMessage {
+        from: challenger,
+        payload,
+        msg_type: "pos_challenge".to_string(),
+        msg_id: [0xAA; 16],
+        created_at: now,
+    };
+
+    // Dispatch the relay message.
+    processor.dispatch_relay(relay_msg).await;
+
+    // Check that a pos_response was posted to relay_post_tx.
+    let post = relay_post_rx.try_recv().expect("expected a RelayPost for pos_response");
+    assert_eq!(post.msg_type, "pos_response");
+    assert_eq!(post.target, Some(challenger));
+}
+
+#[tokio::test]
+async fn dispatch_relay_delete_marks_holding() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0xE5);
+
+    let holding = HoldingRecord {
+        source_block_id: block_id,
+        owner_id,
+        esi_ranges: vec![(0, 10)],
+        importance: 0.5,
+        total_bytes: 1000,
+        status: HoldingStatus::Active,
+        received_at: Timestamp(100),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&holding).unwrap();
+
+    let delete_msg = syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
+    let payload = syncback_core::messages::to_cbor(&delete_msg).unwrap();
+    let relay_msg = InboundMessage {
+        from: owner_id,
+        payload,
+        msg_type: "delete".to_string(),
+        msg_id: [0xBB; 16],
+        created_at: Timestamp::now(),
+    };
+
+    processor.dispatch_relay(relay_msg).await;
+
+    let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
+    assert_eq!(updated.status, HoldingStatus::MarkedForDelete);
 }

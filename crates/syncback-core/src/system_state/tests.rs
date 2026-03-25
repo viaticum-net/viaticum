@@ -72,6 +72,7 @@ fn make_peer(seed: u8) -> PeerRecord {
         device_id: None,
         revoked_device_pub_keys: vec![],
         addrs: vec![],
+        x25519_pub: None,
     }
 }
 

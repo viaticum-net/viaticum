@@ -44,11 +44,12 @@ use syncback_core::trust::compute_combined;
 use syncback_core::db::{Db, SystemStateBlobRecord, WeeklyPosEntry};
 use syncback_core::erasure::{ErasureEncoder, Symbol};
 use syncback_core::messages::{
-    BoardSyncMsg, ClusterSyncRequestMsg, ClusterSyncResponseMsg, DiscoveredPeer, Message,
-    PeerAnnounceMsg, PeerDiscoveryRequestMsg, PeerDiscoveryResponseMsg, PosNackMsg, PosResponseMsg,
-    RejectReason, RestoreDeniedMsg, RestoreRequestMsg, RestoreResponseMsg, SymbolAcceptMsg,
-    SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg, SymbolTransferMsg, SystemStateAckMsg,
-    SystemStateBackupMsg, SystemStateRequestMsg, SystemStateResponseMsg,
+    BoardSyncMsg, CancelDeleteMsg, ClusterSyncRequestMsg, ClusterSyncResponseMsg, DeleteMsg,
+    DiscoveredPeer, Message, PeerAnnounceMsg, PeerDiscoveryRequestMsg, PeerDiscoveryResponseMsg,
+    PosChallengeMsg, PosNackMsg, PosResponseMsg, RejectReason, RestoreDeniedMsg, RestoreRequestMsg,
+    RestoreResponseMsg, SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolDroppedMsg, SymbolOfferMsg,
+    SymbolRejectMsg, SymbolTransferMsg, SystemStateAckMsg, SystemStateBackupMsg,
+    SystemStateRequestMsg, SystemStateResponseMsg,
 };
 use syncback_core::pos::{
     apply_pos_outcome, outcome_from_verify, verify_response, PosResponse, VerifyOutcome,
@@ -64,7 +65,7 @@ use tracing::{debug, error, info, warn};
 use crate::daemon::cluster_sync::ClusterSyncManager;
 use crate::daemon::network::connection::Connection;
 use crate::daemon::network::NetworkHandle;
-use crate::daemon::relay::InboundMessage;
+use crate::daemon::relay::{InboundMessage, RelayPost};
 use crate::daemon::repair::RepairTrigger;
 use crate::daemon::scheduler::PendingChallenges;
 
@@ -132,6 +133,8 @@ pub struct Processor {
     /// Shared map of in-flight PoS challenges. Written by Scheduler, read here
     /// to resolve challenge_id → source_block_id without scanning placements.
     pending_challenges: PendingChallenges,
+    /// Channel to post messages to the relay board (for board-based responses).
+    relay_post_tx: mpsc::Sender<RelayPost>,
 }
 
 impl Processor {
@@ -152,6 +155,7 @@ impl Processor {
         backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
         time_scale: u64,
         pending_challenges: PendingChallenges,
+        relay_post_tx: mpsc::Sender<RelayPost>,
     ) -> Self {
         Processor {
             db,
@@ -168,6 +172,7 @@ impl Processor {
             backup_event_tx,
             time_scale,
             pending_challenges,
+            relay_post_tx,
         }
     }
 
@@ -355,19 +360,114 @@ impl Processor {
 
     async fn dispatch_relay(&self, msg: InboundMessage) {
         use syncback_core::messages::from_cbor;
-        if msg.msg_type == "peer_announce" {
-            match from_cbor::<PeerAnnounceMsg>(&msg.payload) {
-                Ok(pa) => {
-                    if let Err(e) = self.handle_peer_announce(pa).await {
-                        warn!(err = %e, "processor: PeerAnnounce via relay failed");
+        match msg.msg_type.as_str() {
+            "peer_announce" => {
+                match from_cbor::<PeerAnnounceMsg>(&msg.payload) {
+                    Ok(pa) => {
+                        if let Err(e) = self.handle_peer_announce(pa).await {
+                            warn!(err = %e, "processor: PeerAnnounce via relay failed");
+                        }
                     }
-                }
-                Err(e) => {
-                    warn!(err = %e, "processor: failed to decode PeerAnnounce from relay");
+                    Err(e) => warn!(err = %e, "processor: failed to decode PeerAnnounce from relay"),
                 }
             }
-        } else {
-            debug!(msg_type = %msg.msg_type, "processor: relay message, no handler");
+            "pos_challenge" => {
+                match from_cbor::<PosChallengeMsg>(&msg.payload) {
+                    Ok(challenge) => {
+                        match self.handle_pos_challenge_inner(msg.from, challenge).await {
+                            Ok(reply) => {
+                                // Send response back via board (directed to challenger).
+                                let (reply_type, reply_payload) = match &reply {
+                                    Message::PosResponse(r) => {
+                                        match syncback_core::messages::to_cbor(r) {
+                                            Ok(bytes) => ("pos_response", bytes),
+                                            Err(e) => { warn!(err = %e, "processor: failed to encode PosResponse"); return; }
+                                        }
+                                    }
+                                    Message::PosNack(n) => {
+                                        match syncback_core::messages::to_cbor(n) {
+                                            Ok(bytes) => ("pos_nack", bytes),
+                                            Err(e) => { warn!(err = %e, "processor: failed to encode PosNack"); return; }
+                                        }
+                                    }
+                                    _ => return,
+                                };
+                                let mut reply_id = [0u8; 16];
+                                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut reply_id);
+                                let _ = self.relay_post_tx.send(RelayPost {
+                                    msg_type: reply_type.to_string(),
+                                    target: Some(msg.from),
+                                    payload: reply_payload,
+                                    msg_id: reply_id,
+                                }).await;
+                            }
+                            Err(e) => warn!(err = %e, "processor: PosChallenge via relay failed"),
+                        }
+                    }
+                    Err(e) => warn!(err = %e, "processor: failed to decode PosChallenge from relay"),
+                }
+            }
+            "pos_response" => {
+                match from_cbor::<PosResponseMsg>(&msg.payload) {
+                    Ok(response) => {
+                        if let Err(e) = self.handle_pos_response(msg.from, response).await {
+                            warn!(err = %e, "processor: PosResponse via relay failed");
+                        }
+                    }
+                    Err(e) => warn!(err = %e, "processor: failed to decode PosResponse from relay"),
+                }
+            }
+            "pos_nack" => {
+                match from_cbor::<PosNackMsg>(&msg.payload) {
+                    Ok(nack) => {
+                        if let Err(e) = self.handle_pos_nack(msg.from, nack).await {
+                            warn!(err = %e, "processor: PosNack via relay failed");
+                        }
+                    }
+                    Err(e) => warn!(err = %e, "processor: failed to decode PosNack from relay"),
+                }
+            }
+            "delete" => {
+                match from_cbor::<DeleteMsg>(&msg.payload) {
+                    Ok(delete) => {
+                        if let Err(e) = self.handle_delete(msg.from, delete).await {
+                            warn!(err = %e, "processor: Delete via relay failed");
+                        }
+                    }
+                    Err(e) => warn!(err = %e, "processor: failed to decode DeleteMsg from relay"),
+                }
+            }
+            "cancel_delete" => {
+                match from_cbor::<CancelDeleteMsg>(&msg.payload) {
+                    Ok(cancel) => {
+                        if let Err(e) = self.handle_cancel_delete(msg.from, cancel).await {
+                            warn!(err = %e, "processor: CancelDelete via relay failed");
+                        }
+                    }
+                    Err(e) => warn!(err = %e, "processor: failed to decode CancelDeleteMsg from relay"),
+                }
+            }
+            "symbol_dropped" => {
+                match from_cbor::<SymbolDroppedMsg>(&msg.payload) {
+                    Ok(dropped) => {
+                        if let Err(e) = self.handle_symbol_dropped(msg.from, dropped).await {
+                            warn!(err = %e, "processor: SymbolDropped via relay failed");
+                        }
+                    }
+                    Err(e) => warn!(err = %e, "processor: failed to decode SymbolDroppedMsg from relay"),
+                }
+            }
+            "symbol_drop_notice" => {
+                match from_cbor::<SymbolDropNoticeMsg>(&msg.payload) {
+                    Ok(notice) => {
+                        self.handle_symbol_drop_notice(msg.from, notice);
+                    }
+                    Err(e) => warn!(err = %e, "processor: failed to decode SymbolDropNoticeMsg from relay"),
+                }
+            }
+            other => {
+                debug!(msg_type = %other, "processor: relay message, no handler");
+            }
         }
     }
 
@@ -442,6 +542,15 @@ impl Processor {
             }
             Message::PeerDiscoveryResponse(msg) => {
                 self.handle_peer_discovery_response(from, msg).await;
+            }
+            Message::Delete(msg) => {
+                self.handle_delete(from, msg).await?;
+            }
+            Message::CancelDelete(msg) => {
+                self.handle_cancel_delete(from, msg).await?;
+            }
+            Message::SymbolDropNotice(msg) => {
+                self.handle_symbol_drop_notice(from, msg);
             }
             other => {
                 debug!(
@@ -898,6 +1007,134 @@ impl Processor {
     }
 
     // =========================================================
+    // Delete: we are the holder
+    // =========================================================
+
+    /// Handle a Delete request from the owner. Verify signature, then mark
+    /// the holding as MarkedForDelete so the cleanup task can process it later.
+    pub(crate) async fn handle_delete(
+        &self,
+        from: IdentityPub,
+        delete: DeleteMsg,
+    ) -> Result<(), ProcessorError> {
+        let block_id = delete.source_block_id;
+
+        // Verify signature against the sender's identity (the owner).
+        if let Err(e) = syncback_core::messages::verify_delete_msg(&delete, &from) {
+            warn!(
+                block_id = %block_id,
+                owner = %from,
+                err = %e,
+                "processor: Delete signature verification failed"
+            );
+            return Ok(());
+        }
+
+        // Look up the holding — only Active holdings can be marked for deletion.
+        match self.db.get_holding(&block_id, &from)? {
+            Some(mut holding) => {
+                if holding.status == HoldingStatus::Active {
+                    holding.status = HoldingStatus::MarkedForDelete;
+                    holding.delete_requested_at = Some(Timestamp::now());
+                    self.db.upsert_holding(&holding)?;
+                    info!(
+                        block_id = %block_id,
+                        owner = %from,
+                        "processor: holding marked for deletion"
+                    );
+                } else {
+                    debug!(
+                        block_id = %block_id,
+                        owner = %from,
+                        status = ?holding.status,
+                        "processor: Delete ignored — holding not Active"
+                    );
+                }
+            }
+            None => {
+                debug!(
+                    block_id = %block_id,
+                    owner = %from,
+                    "processor: Delete ignored — no holding for this block"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // =========================================================
+    // CancelDelete: we are the holder
+    // =========================================================
+
+    /// Handle a CancelDelete from the owner. Revert MarkedForDelete → Active.
+    pub(crate) async fn handle_cancel_delete(
+        &self,
+        from: IdentityPub,
+        cancel: CancelDeleteMsg,
+    ) -> Result<(), ProcessorError> {
+        let block_id = cancel.source_block_id;
+
+        if let Err(e) = syncback_core::messages::verify_cancel_delete_msg(&cancel, &from) {
+            warn!(
+                block_id = %block_id,
+                owner = %from,
+                err = %e,
+                "processor: CancelDelete signature verification failed"
+            );
+            return Ok(());
+        }
+
+        match self.db.get_holding(&block_id, &from)? {
+            Some(mut holding) => {
+                if holding.status == HoldingStatus::MarkedForDelete {
+                    holding.status = HoldingStatus::Active;
+                    holding.delete_requested_at = None;
+                    self.db.upsert_holding(&holding)?;
+                    info!(
+                        block_id = %block_id,
+                        owner = %from,
+                        "processor: cancel delete — holding reverted to Active"
+                    );
+                } else {
+                    debug!(
+                        block_id = %block_id,
+                        owner = %from,
+                        status = ?holding.status,
+                        "processor: CancelDelete ignored — holding not MarkedForDelete"
+                    );
+                }
+            }
+            None => {
+                debug!(
+                    block_id = %block_id,
+                    owner = %from,
+                    "processor: CancelDelete ignored — no holding for this block"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // =========================================================
+    // SymbolDropNotice: we are the owner (advance warning)
+    // =========================================================
+
+    /// Handle advance eviction notice from a holder. Log for now; repair
+    /// will be triggered when the actual SymbolDropped arrives.
+    pub(crate) fn handle_symbol_drop_notice(
+        &self,
+        from: IdentityPub,
+        notice: SymbolDropNoticeMsg,
+    ) {
+        info!(
+            block_id = %notice.source_block_id,
+            holder = %from,
+            deadline = notice.deadline.0,
+            "processor: received SymbolDropNotice — holder will drop symbols"
+        );
+    }
+
+    // =========================================================
     // SymbolOffer: we are the holder
     // =========================================================
 
@@ -1251,10 +1488,14 @@ impl Processor {
                 device_id: None,
                 revoked_device_pub_keys: vec![],
                 addrs: vec![],
+                x25519_pub: msg.x25519_pub,
             },
             Some(mut existing) => {
                 existing.node_id = Some(msg.node_id);
                 existing.last_seen = now;
+                if msg.x25519_pub.is_some() {
+                    existing.x25519_pub = msg.x25519_pub;
+                }
                 existing
             }
         };

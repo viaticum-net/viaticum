@@ -13,6 +13,7 @@ use syncback_core::types::{
 };
 use tokio::sync::{mpsc, Mutex};
 
+use crate::daemon::relay::RelayPost;
 use crate::daemon::repair::RepairTrigger;
 use crate::daemon::scheduler::{PendingChallenges, Scheduler, SchedulerConfig};
 
@@ -88,9 +89,9 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
 
     // We need a NetworkHandle for the constructor. Build a no-op one via a stub.
     // Since check_timeouts doesn't use network, we pass a real (but unused) handle.
-    let network = make_stub_network().await;
-
-    let scheduler = Scheduler::new(db.clone(), config, network, repair_tx, pending.clone());
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key);
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -153,8 +154,9 @@ async fn check_timeouts_ignores_fresh_challenges() {
         timeout_check_secs: 3600,
         time_scale: 1, // POS_TIMEOUT_SECS = 604_800 s — fresh challenge won't expire
     };
-    let network = make_stub_network().await;
-    let scheduler = Scheduler::new(db, config, network, repair_tx, pending.clone());
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key);
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -248,8 +250,9 @@ async fn check_timeouts_respects_time_scale() {
         timeout_check_secs: 3600,
         time_scale: syncback_core::constants::POS_TIMEOUT_SECS, // threshold = 1 second
     };
-    let network = make_stub_network().await;
-    let scheduler = Scheduler::new(db.clone(), config, network, repair_tx, pending.clone());
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key);
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -302,8 +305,9 @@ async fn issue_due_challenges_skips_already_pending() {
         timeout_check_secs: 3600,
         time_scale: 1,
     };
-    let network = make_stub_network().await;
-    let scheduler = Scheduler::new(db, config, network, repair_tx, pending.clone());
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key);
 
     // issue_due_challenges should skip this holder because it's already pending.
     // The existing pending entry's esi (5) should not be overwritten.
@@ -343,8 +347,9 @@ async fn scheduler_skips_deleting_placements() {
         timeout_check_secs: 3600,
         time_scale: 1,
     };
-    let network = make_stub_network().await;
-    let scheduler = Scheduler::new(db, config, network, repair_tx, pending.clone());
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key);
 
     scheduler.issue_due_challenges().await.expect("issue_due_challenges");
 
@@ -401,8 +406,9 @@ async fn time_scale_divides_intervals() {
         timeout_check_secs: 3600,
         time_scale: scale,
     };
-    let network = make_stub_network().await;
-    let scheduler = Scheduler::new(db.clone(), config, network, repair_tx, pending.clone());
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key);
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -421,31 +427,127 @@ async fn time_scale_divides_intervals() {
     assert_eq!(updated.status, PlacementStatus::Uncertain);
 }
 
-// ─── Stub network helper ──────────────────────────────────────────────────────
+// ─── process_deletion_tick tests ──────────────────────────────────────────────
 
-/// Build a real NetworkHandle bound to localhost with a dummy identity.
-/// Used where the Scheduler constructor needs one but the test doesn't exercise
-/// the network path.
-async fn make_stub_network() -> Arc<crate::daemon::network::NetworkHandle> {
-    use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
-
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let mi = syncback_core::types::IdentityPub(signing_key.verifying_key().to_bytes());
-    let (incoming_tx, _incoming_rx) = tokio::sync::mpsc::channel(1);
-
-    let config = crate::daemon::network::NetworkConfig {
-        signing_key,
-        master_identity: mi,
-        known_peers: std::collections::HashMap::new(),
-        device_cert: None,
-        iroh_secret_key: None,
-        relay_mode: iroh::RelayMode::Disabled,
+/// When a file has all devices deleted and owner cooldown has elapsed,
+/// process_deletion_tick sends DeleteMsg via board and marks placement Deleting.
+#[tokio::test]
+async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
+    use syncback_core::constants::OWNER_DELETE_COOLDOWN_SECS;
+    use syncback_core::types::{
+        DeviceId, FileRecord, FileVersion, LocalState, SourceBlockRecord, SourceBlockStatus,
+        SourceBlockType,
     };
 
-    Arc::new(
-        crate::daemon::network::NetworkHandle::start(config, incoming_tx)
-            .await
-            .expect("stub network"),
-    )
+    let db = Db::open_in_memory().unwrap();
+    let block_id = make_block_id(0xD1);
+    let holder_id = make_identity(0xD2);
+    let device_id = DeviceId([0x01; 16]);
+
+    // File: all devices deleted, deleted_at = 0 (very old).
+    let file = FileRecord {
+        file_id: FileId(1),
+        path: "test.txt".to_string(),
+        importance: 0.5,
+        devices: vec![(device_id, LocalState::Deleted(Timestamp(0)))],
+        versions: vec![FileVersion {
+            content_hash: [0; 32],
+            source_block_id: block_id,
+            k: 100,
+            t: 65535,
+            created_at: Timestamp(0),
+            backed_up_at: Some(Timestamp(0)),
+        }],
+        first_seen: Timestamp(0),
+    };
+    db.upsert_file(&file).unwrap();
+
+    // Source block: Active.
+    let sb = SourceBlockRecord {
+        block_id,
+        k: 100,
+        t: 65535,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(0),
+        encrypted_size: None,
+        n: None,
+        overhead: None,
+    };
+    db.upsert_source_block(&sb).unwrap();
+
+    // Placement: Alive.
+    let placement = make_placement(block_id, holder_id);
+    db.upsert_placement(&placement).unwrap();
+
+    // Peer record (needed for trust lookup in due_challenges, also for deletion signing).
+    let peer = syncback_core::types::PeerRecord {
+        identity: holder_id,
+        node_id: None,
+        trust_p: 0.5,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        device_id: None,
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+    };
+    db.upsert_peer(&peer).unwrap();
+
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
+    let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let pending = make_pending_challenges();
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+    };
+    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending, relay_post_tx, signing_key);
+
+    // Now = after owner cooldown. Deleted_at=0, cooldown=4 weeks.
+    // process_deletion_tick uses Timestamp::now() internally. Since deleted_at=0,
+    // any now > OWNER_DELETE_COOLDOWN_SECS will trigger.
+    scheduler.process_deletion_tick().await.unwrap();
+
+    // Should have posted a "delete" message via relay.
+    let post = relay_post_rx.try_recv().expect("expected a delete RelayPost");
+    assert_eq!(post.msg_type, "delete");
+    assert_eq!(post.target, Some(holder_id));
+
+    // Placement should be Deleting.
+    let updated = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
+    assert_eq!(updated.status, PlacementStatus::Deleting);
+
+    // Source block should be Deleting.
+    let updated_sb = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(updated_sb.status, SourceBlockStatus::Deleting);
 }
+
+/// When no files are eligible, process_deletion_tick is a no-op.
+#[tokio::test]
+async fn deletion_tick_noop_when_no_eligible_files() {
+    let db = Db::open_in_memory().unwrap();
+
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
+    let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let pending = make_pending_challenges();
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+    };
+    let scheduler = Scheduler::new(db, config, repair_tx, pending, relay_post_tx, signing_key);
+
+    scheduler.process_deletion_tick().await.unwrap();
+
+    // No messages should be posted.
+    assert!(relay_post_rx.try_recv().is_err());
+}
+
+// ─── Stub network helper ──────────────────────────────────────────────────────

@@ -779,3 +779,112 @@ fn board_sync_exchange_fills_missing_entries() {
     assert!(b_ids.contains(&[0x02u8; 16]), "B missing E2");
     assert!(b_ids.contains(&[0x03u8; 16]), "B missing E3");
 }
+
+#[test]
+fn scan_for_self_delivers_each_msg_once() {
+    // Post a broadcast entry, call scan_for_self twice.
+    // The second call must not re-deliver the same message.
+    let dir = TempDir::new().unwrap();
+    let config = make_config(&dir);
+    let mut manager = RelayManager::new(config).unwrap();
+
+    let now = Timestamp::now();
+    let future = Timestamp(now.0 + 1_000_000);
+
+    let (sender_key, sender_identity) = make_identity();
+    let entry = build_broadcast_entry(
+        "peer_announce",
+        [0xA1u8; 16],
+        b"once_only".to_vec(),
+        sender_identity,
+        future,
+        &sender_key,
+    );
+    manager.entries.push(StoredEntry {
+        msg_type: "peer_announce".to_string(),
+        msg_id: [0xA1u8; 16],
+        entry,
+    });
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(10);
+
+    // First scan: must deliver 1 message.
+    let count1 = manager.scan_for_self(&inbound_tx, future);
+    assert_eq!(count1, 1);
+    let msg = inbound_rx.try_recv().unwrap();
+    assert_eq!(msg.msg_id, [0xA1u8; 16]);
+
+    // Second scan: same entry is still on the board but must not be re-delivered.
+    let count2 = manager.scan_for_self(&inbound_tx, future);
+    assert_eq!(count2, 0);
+    assert!(inbound_rx.try_recv().is_err(), "no second delivery expected");
+}
+
+#[test]
+fn scan_for_self_delivers_new_after_prune() {
+    // After prune clears the old entry and a new entry arrives, scan delivers it.
+    let dir = TempDir::new().unwrap();
+    let now_real = Timestamp::now();
+    let base = now_real.0 + 1_000_000;
+
+    let config = RelayConfig {
+        board_path: dir.path().join("board.bin"),
+        max_entries: MAX_BOARD_ENTRIES,
+        max_size_bytes: MAX_BOARD_SIZE_BYTES,
+        prune_interval_secs: 3600,
+        ..RelayConfig::defaults_for_test(dir.path().join("board.bin"))
+    };
+    let mut manager = RelayManager::new(config).unwrap();
+
+    let (sender_key, sender_identity) = make_identity();
+
+    // Post entry A with a timestamp that will expire when we advance "now".
+    let entry_a = build_broadcast_entry(
+        "peer_announce",
+        [0xB1u8; 16],
+        b"entry_a".to_vec(),
+        sender_identity,
+        Timestamp(base),
+        &sender_key,
+    );
+    manager.entries.push(StoredEntry {
+        msg_type: "peer_announce".to_string(),
+        msg_id: [0xB1u8; 16],
+        entry: entry_a,
+    });
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(10);
+
+    // First scan: delivers entry A.
+    let count1 = manager.scan_for_self(&inbound_tx, Timestamp(base + 1));
+    assert_eq!(count1, 1);
+    let _ = inbound_rx.try_recv().unwrap();
+
+    // Advance time past TTL so entry A expires; prune removes it.
+    let prune_now = Timestamp(base + RELAY_TTL_SECS + 1);
+    let pruned = manager.prune(prune_now).unwrap();
+    assert_eq!(pruned, 1, "entry A should have been pruned");
+    assert_eq!(manager.entries.len(), 0);
+
+    // Post entry B with a fresh timestamp (far future, won't expire).
+    let entry_b = build_broadcast_entry(
+        "peer_announce",
+        [0xB2u8; 16],
+        b"entry_b".to_vec(),
+        sender_identity,
+        Timestamp(base + 2_000_000),
+        &sender_key,
+    );
+    manager.entries.push(StoredEntry {
+        msg_type: "peer_announce".to_string(),
+        msg_id: [0xB2u8; 16],
+        entry: entry_b,
+    });
+
+    // Second scan with new "now": entry B is new and must be delivered.
+    let count2 = manager.scan_for_self(&inbound_tx, prune_now);
+    assert_eq!(count2, 1);
+    let msg = inbound_rx.try_recv().unwrap();
+    assert_eq!(msg.msg_id, [0xB2u8; 16]);
+    assert_eq!(msg.payload, b"entry_b");
+}

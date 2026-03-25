@@ -174,6 +174,8 @@ impl DaemonHandle {
             mpsc::channel::<crate::daemon::backup::BackupEvent>(64);
         let (relay_sync_tx, relay_sync_rx) =
             mpsc::channel::<crate::daemon::relay::SyncTrigger>(64);
+        let (relay_post_tx, relay_post_rx) =
+            mpsc::channel::<crate::daemon::relay::RelayPost>(256);
         let (incoming_tx, incoming_rx) =
             mpsc::channel::<crate::daemon::network::connection::Connection>(64);
         // relay inbound messages → Processor dispatch_relay
@@ -246,6 +248,17 @@ impl DaemonHandle {
             RelayMode::Disabled
         };
 
+        // Derive a stable x25519 private key from seed for relay encryption.
+        // HKDF-SHA256(ikm=seed, salt=b"", info=b"syncback-x25519") → 32 bytes.
+        let x25519_priv = {
+            let hk = Hkdf::<Sha256>::new(Some(b""), &keyfile.seed);
+            let mut okm = [0u8; 32];
+            hk.expand(b"syncback-x25519", &mut okm)
+                .expect("HKDF expand for x25519 cannot fail with valid length");
+            x25519_dalek::StaticSecret::from(okm)
+        };
+        let x25519_pub_key = x25519_dalek::PublicKey::from(&x25519_priv);
+
         let net_config = NetworkConfig {
             signing_key: device_key.clone(),
             master_identity: identity_pub,
@@ -253,6 +266,7 @@ impl DaemonHandle {
             device_cert: device_cert_for_network,
             iroh_secret_key: Some(iroh::SecretKey::from_bytes(&iroh_key_bytes)),
             relay_mode,
+            x25519_pub: Some(x25519_pub_key.to_bytes()),
         };
         // Clone incoming_tx before it's moved into NetworkHandle::start.
         // The clone goes into DaemonState so dispatch_connect can send outbound
@@ -310,22 +324,12 @@ impl DaemonHandle {
             encoder.clone(),
         );
 
-        // Derive a stable x25519 private key from seed for relay encryption.
-        // HKDF-SHA256(ikm=seed, salt=b"", info=b"syncback-x25519") → 32 bytes.
-        let x25519_priv = {
-            let hk = Hkdf::<Sha256>::new(Some(b""), &keyfile.seed);
-            let mut okm = [0u8; 32];
-            hk.expand(b"syncback-x25519", &mut okm)
-                .expect("HKDF expand for x25519 cannot fail with valid length");
-            x25519_dalek::StaticSecret::from(okm)
-        };
-
         let board_path = cfg.data_dir.join("relay.board");
         let relay = RelayManager::new(RelayConfig {
             board_path,
             identity_pub,
             x25519_priv,
-            signing_key: device_key.clone(),
+            signing_key: master_key.clone(),
             max_entries: app_config.network.relay_max_entries,
             max_size_bytes: app_config.network.relay_max_size_mb * 1_048_576,
             prune_interval_secs: 3600,
@@ -377,7 +381,19 @@ impl DaemonHandle {
         tasks.push(tokio::spawn(backup.run(dirty_rx, backup_event_rx)));
         tasks.push(tokio::spawn(restore.run(restore_rx)));
         tasks.push(tokio::spawn(repair.run(repair_interval_secs, repair_rx)));
-        tasks.push(tokio::spawn(relay.run(relay_sync_rx, inbound_tx)));
+        // Board sync must be faster than PoS timeout so challenges
+        // arrive before they expire. POS_TIMEOUT_SECS/time_scale gives
+        // the effective timeout; sync at ~1/3 of that, floor 2s.
+        let pos_timeout_scaled = (syncback_core::constants::POS_TIMEOUT_SECS / time_scale).max(1);
+        let board_sync_interval = (pos_timeout_scaled / 3).max(2);
+        tasks.push(tokio::spawn(relay.run(
+            relay_sync_rx,
+            inbound_tx,
+            relay_post_rx,
+            db.clone(),
+            network.clone(),
+            board_sync_interval,
+        )));
 
         // Wrap the cli server JoinHandle<()> into JoinHandle<anyhow::Result<()>>.
         tasks.push(tokio::spawn(async move {
@@ -426,6 +442,7 @@ impl DaemonHandle {
                 backup_event_tx,
                 time_scale,
                 pending_challenges.clone(),
+                relay_post_tx.clone(),
             );
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {
@@ -479,9 +496,10 @@ impl DaemonHandle {
                 timeout_check_secs: 3600,
                 time_scale,
             },
-            network.clone(),
             repair_tx.clone(),
             pending_challenges,
+            relay_post_tx.clone(),
+            master_key.clone(),
         );
         let cancel_scheduler = cancel.clone();
         tasks.push(tokio::spawn(async move {
@@ -544,6 +562,28 @@ impl DaemonHandle {
             });
         }
 
+        // ── Holder cleanup task ────────────────────────────────────────────
+        {
+            let cleanup_db = db.clone();
+            let cleanup_holdings = holdings_dir.clone();
+            let cleanup_relay = relay_post_tx.clone();
+            let cleanup_cancel = cancel.clone();
+            let cleanup_interval = (3600 / time_scale).max(1);
+            let pressure_interval = (3600 / time_scale).max(60);
+            tasks.push(tokio::spawn(async move {
+                crate::daemon::holder_cleanup::run(
+                    cleanup_db,
+                    cleanup_holdings,
+                    cleanup_relay,
+                    soft_quota_bytes,
+                    hard_quota_bytes,
+                    cleanup_interval,
+                    pressure_interval,
+                    cleanup_cancel,
+                ).await
+            }));
+        }
+
         // Keep channel senders alive so receivers don't immediately close.
         // They are moved into a background task that holds them until cancel fires.
         let cancel_clone = cancel.clone();
@@ -554,6 +594,7 @@ impl DaemonHandle {
             drop(restore_tx);
             drop(repair_tx);
             drop(relay_sync_tx);
+            drop(relay_post_tx);
         });
 
         // ── 16. Log startup ───────────────────────────────────────────────────

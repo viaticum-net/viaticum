@@ -36,6 +36,7 @@ async fn make_test_state() -> Arc<DaemonState> {
         device_cert: None,
         iroh_secret_key: None,
         relay_mode: RelayMode::Disabled,
+        x25519_pub: None,
     };
     let (incoming_tx, _incoming_rx) =
         mpsc::channel::<crate::daemon::network::connection::Connection>(1);
@@ -271,6 +272,7 @@ async fn dispatch_connect_two_daemons_registers_peer() {
                 device_cert: Some(cert_b),
                 iroh_secret_key: None,
                 relay_mode: RelayMode::Disabled,
+                x25519_pub: None,
             },
             tx_b,
         )
@@ -297,6 +299,7 @@ async fn dispatch_connect_two_daemons_registers_peer() {
                 device_cert: Some(cert_a),
                 iroh_secret_key: None,
                 relay_mode: RelayMode::Disabled,
+                x25519_pub: None,
             },
             tx_a,
         )

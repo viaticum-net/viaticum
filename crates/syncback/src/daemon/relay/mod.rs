@@ -110,6 +110,16 @@ pub struct SyncTrigger {
     pub partner_entries: Vec<StoredEntry>,
 }
 
+/// Command to post a message to the local board.
+/// Sent by Scheduler/Processor via relay_post_tx.
+#[derive(Debug)]
+pub struct RelayPost {
+    pub msg_type: String,
+    pub target: Option<IdentityPub>, // None = broadcast
+    pub payload: Vec<u8>,            // CBOR-encoded message
+    pub msg_id: [u8; 16],
+}
+
 // ─── RelayManager ────────────────────────────────────────────────────────────
 
 /// Manages the local relay board and syncs with partner boards.
@@ -119,6 +129,8 @@ pub struct RelayManager {
     known_ids: HashSet<[u8; 16]>,
     /// All entries currently on our board, in append order.
     pub entries: Vec<StoredEntry>,
+    /// msg_ids already delivered to inbound_tx. Prevents re-delivery on every scan.
+    delivered_ids: HashSet<[u8; 16]>,
 }
 
 impl RelayManager {
@@ -134,6 +146,7 @@ impl RelayManager {
             config,
             known_ids,
             entries,
+            delivered_ids: HashSet::new(),
         };
 
         // Prune on startup so stale entries from a previous run don't linger.
@@ -289,11 +302,13 @@ impl RelayManager {
     /// Directed entries are decrypted with our X25519 private key.
     ///
     /// Uses `try_send` — if the channel is full the message is dropped and a
-    /// warning is logged. Callers may call this periodically to re-deliver.
+    /// warning is logged. Each msg_id is delivered at most once per manager
+    /// lifetime (tracked via `delivered_ids`); entries already delivered are
+    /// skipped on subsequent scans.
     ///
     /// Returns the count of messages sent to `inbound_tx`.
     pub fn scan_for_self(
-        &self,
+        &mut self,
         inbound_tx: &tokio::sync::mpsc::Sender<InboundMessage>,
         now: Timestamp,
     ) -> usize {
@@ -301,6 +316,11 @@ impl RelayManager {
 
         for stored in &self.entries {
             if is_board_entry_expired(&stored.entry, now) {
+                continue;
+            }
+
+            // Skip entries already delivered in a previous scan.
+            if self.delivered_ids.contains(&stored.msg_id) {
                 continue;
             }
 
@@ -355,7 +375,10 @@ impl RelayManager {
 
             if let Some(msg) = msg_opt {
                 match inbound_tx.try_send(msg) {
-                    Ok(()) => delivered += 1,
+                    Ok(()) => {
+                        self.delivered_ids.insert(stored.msg_id);
+                        delivered += 1;
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         warn!(msg_id = ?stored.msg_id, "relay: inbound channel full, dropping message");
                     }
@@ -410,6 +433,9 @@ impl RelayManager {
             // Rebuild known_ids from survivors.
             self.known_ids = self.entries.iter().map(|e| e.msg_id).collect();
 
+            // Discard delivered_ids for entries that are no longer on the board.
+            self.delivered_ids.retain(|id| self.known_ids.contains(id));
+
             // Atomic rewrite.
             board::rewrite_board(&self.config.board_path, &self.entries)?;
 
@@ -441,13 +467,20 @@ impl RelayManager {
     /// Run the relay manager as a tokio task.
     ///
     /// Listens for sync triggers (partner connections) via `sync_rx`.
+    /// Accepts new posts from other subsystems via `post_rx`.
+    /// Periodically broadcasts the board to all known peers.
     /// Runs a prune timer every `prune_interval_secs`.
     /// Delivers inbound messages to `inbound_tx`.
     pub async fn run(
         mut self,
         mut sync_rx: tokio::sync::mpsc::Receiver<SyncTrigger>,
         inbound_tx: tokio::sync::mpsc::Sender<InboundMessage>,
+        mut post_rx: tokio::sync::mpsc::Receiver<RelayPost>,
+        db: syncback_core::db::Db,
+        network: std::sync::Arc<crate::daemon::network::NetworkHandle>,
+        board_sync_interval_secs: u64,
     ) -> anyhow::Result<()> {
+        use syncback_core::messages::{BoardSyncMsg, Message};
         use tokio::time::{interval, Duration};
 
         let prune_interval =
@@ -456,6 +489,10 @@ impl RelayManager {
         // First tick fires immediately; skip it so we don't double-prune
         // right after `new()` already pruned on startup.
         prune_timer.tick().await;
+
+        let board_sync_interval = Duration::from_secs(board_sync_interval_secs);
+        let mut board_sync_timer = interval(board_sync_interval);
+        board_sync_timer.tick().await; // skip first tick
 
         info!("relay manager running");
 
@@ -487,6 +524,76 @@ impl RelayManager {
                             }
                             self.scan_for_self(&inbound_tx, now);
                         }
+                    }
+                }
+
+                post = post_rx.recv() => {
+                    match post {
+                        None => {
+                            info!("relay: post_rx closed, shutting down");
+                            break;
+                        }
+                        Some(post) => {
+                            let now = Timestamp::now();
+                            if let Some(target) = post.target {
+                                match db.get_peer(&target) {
+                                    Ok(Some(peer)) => {
+                                        if let Some(x25519_bytes) = peer.x25519_pub {
+                                            let x25519_pub = x25519_dalek::PublicKey::from(x25519_bytes);
+                                            if let Err(e) = self.post_directed_with_key(
+                                                &post.msg_type, post.msg_id, target,
+                                                &x25519_pub, &post.payload, now,
+                                            ) {
+                                                error!(err = %e, msg_type = %post.msg_type, "relay: post_directed failed");
+                                            }
+                                        } else {
+                                            warn!(target = %target, msg_type = %post.msg_type,
+                                                  "relay: no x25519_pub for target, dropping directed post");
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        warn!(target = %target, msg_type = %post.msg_type,
+                                              "relay: peer not found for directed post");
+                                    }
+                                    Err(e) => {
+                                        error!(err = %e, "relay: db.get_peer failed");
+                                    }
+                                }
+                            } else if let Err(e) = self.post_broadcast(
+                                &post.msg_type, post.msg_id, post.payload, now,
+                            ) {
+                                error!(err = %e, msg_type = %post.msg_type, "relay: post_broadcast failed");
+                            }
+                        }
+                    }
+                }
+
+                _ = board_sync_timer.tick() => {
+                    let now = Timestamp::now();
+                    let entries = self.entries_for_sync(now);
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    let msg = Message::BoardSync(BoardSyncMsg {
+                        v: 1,
+                        entries,
+                        timestamp: now,
+                    });
+                    let peers = match db.list_all_peers() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            error!(err = %e, "relay: failed to list peers for board sync");
+                            continue;
+                        }
+                    };
+                    let sent = peers.len();
+                    for peer in peers {
+                        if let Err(e) = network.send_to_peer(peer.identity, &msg).await {
+                            debug!(peer = %peer.identity, err = %e, "relay: board sync send failed");
+                        }
+                    }
+                    if sent > 0 {
+                        debug!(peers = sent, entries = self.entries.len(), "relay: board sync sent");
                     }
                 }
 

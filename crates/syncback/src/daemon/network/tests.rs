@@ -41,6 +41,7 @@ fn make_node(seed_byte: u8) -> (IdentityPub, NetworkConfig) {
         device_cert: Some(cert),
         iroh_secret_key: None,
         relay_mode: RelayMode::Disabled,
+        x25519_pub: None,
     };
     (master_pub, config)
 }
@@ -360,6 +361,7 @@ async fn handshake_initiator_includes_device_cert() {
         device_cert: Some(cert),
         iroh_secret_key: None,
         relay_mode: RelayMode::Disabled,
+        x25519_pub: None,
     };
 
     // Node B also needs a cert (handshake now rejects cert-less peers).
@@ -435,6 +437,7 @@ async fn handshake_without_cert_connection_is_rejected() {
             device_cert: None,
             iroh_secret_key: None,
             relay_mode: RelayMode::Disabled,
+            x25519_pub: None,
         }
     };
 
@@ -625,6 +628,7 @@ fn revocation_check_rejects_revoked_device_pub_key() {
         device_id: None,
         revoked_device_pub_keys: vec![revoked_pub],
         addrs: vec![],
+        x25519_pub: None,
     };
 
     assert!(
@@ -656,6 +660,7 @@ fn peer_record_revoked_device_pub_keys_default_empty() {
         device_id: None,
         revoked_device_pub_keys: vec![],
         addrs: vec![],
+        x25519_pub: None,
     };
 
     // Round-trip through CBOR.
@@ -757,6 +762,7 @@ async fn network_handle_starts_with_relay_default() {
             device_cert: None,
             iroh_secret_key: None,
             relay_mode: RelayMode::Default,
+            x25519_pub: None,
         },
         tx,
     )

@@ -102,6 +102,9 @@ pub struct NetworkConfig {
     /// iroh relay mode. Use RelayMode::Default to enable NAT traversal.
     /// Use RelayMode::Disabled for direct-only setups (tests, LAN).
     pub relay_mode: RelayMode,
+    /// X25519 public key for directed relay board encryption.
+    /// Advertised in PeerAnnounce so peers can encrypt messages to us.
+    pub x25519_pub: Option<[u8; 32]>,
 }
 
 // ─── Connection pool ──────────────────────────────────────────────────────────
@@ -138,6 +141,8 @@ pub struct NetworkHandle {
     signing_key: SigningKey,
     /// Device certificate for cluster nodes. Passed in handshake if present.
     device_cert: Option<syncback_core::cluster::DeviceCertificate>,
+    /// X25519 public key for directed relay board encryption.
+    x25519_pub: Option<[u8; 32]>,
     /// Known peers directory (for `get_connection` by IdentityPub).
     known_peers: Arc<RwLock<HashMap<IdentityPub, EndpointAddr>>>,
     /// Authenticated connections keyed by peer IdentityPub (Live or Backoff).
@@ -211,6 +216,7 @@ impl NetworkHandle {
             node_id,
             signing_key: config.signing_key,
             device_cert: config.device_cert,
+            x25519_pub: config.x25519_pub,
             known_peers: Arc::new(RwLock::new(config.known_peers)),
             connections,
             read_loop_tx: std::sync::Mutex::new(None),
@@ -527,6 +533,7 @@ impl NetworkHandle {
     ///
     /// Used to introduce ourselves when a new connection is established.
     /// The sig covers identity_pub || node_id || timestamp.
+    /// x25519_pub is included as an informational field (not signed).
     pub fn build_peer_announce(
         &self,
         timestamp: syncback_core::types::Timestamp,
@@ -536,6 +543,7 @@ impl NetworkHandle {
             self.node_id,
             timestamp,
             &self.signing_key,
+            self.x25519_pub,
         )
     }
 

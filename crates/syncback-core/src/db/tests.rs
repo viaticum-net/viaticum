@@ -93,6 +93,7 @@ fn make_peer(identity: IdentityPub) -> PeerRecord {
         device_id: None,
         revoked_device_pub_keys: vec![],
         addrs: vec![],
+        x25519_pub: None,
     }
 }
 
@@ -826,7 +827,7 @@ fn table_stats_counts_rows() {
         trust_p: 0.0, trust_i: 0.0, trust_s: 0.0,
         bytes_we_store_for_peer: 0, bytes_peer_stores_for_us: 0,
         first_seen: Timestamp(0), last_seen: Timestamp(0),
-        revoked_device_pub_keys: vec![], addrs: vec![],
+        revoked_device_pub_keys: vec![], addrs: vec![], x25519_pub: None,
     };
     db.upsert_peer(&peer).unwrap();
     let stats = db.table_stats().unwrap();

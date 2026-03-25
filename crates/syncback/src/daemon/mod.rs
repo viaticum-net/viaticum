@@ -3,6 +3,7 @@ pub mod cli_server;
 pub mod cluster_sync;
 pub mod dr;
 pub mod handle;
+pub mod holder_cleanup;
 pub mod identity;
 pub mod metrics;
 pub mod network;

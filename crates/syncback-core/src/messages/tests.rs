@@ -47,6 +47,7 @@ fn minimal_peer_announce() -> Message {
         node_id: make_node_id(2),
         timestamp: Timestamp(1000),
         sig: [0u8; 64],
+        x25519_pub: None,
     })
 }
 
@@ -282,6 +283,7 @@ fn all_message_variants_frame_roundtrip() {
             node_id: make_node_id(1),
             timestamp: ts,
             sig: [0u8; 64],
+            x25519_pub: None,
         }),
         Message::PosChallenge(PosChallengeMsg {
             v: 1,
@@ -776,6 +778,7 @@ fn all_27_message_variants() -> Vec<Message> {
             node_id: make_node_id(1),
             timestamp: ts,
             sig: [0u8; 64],
+            x25519_pub: None,
         }),
         Message::PosChallenge(PosChallengeMsg {
             v: 1,
@@ -971,7 +974,7 @@ fn build_peer_announce_produces_valid_signature() {
     let node_id = make_node_id(5);
     let ts = Timestamp(1_000_000);
 
-    let msg = super::build_peer_announce(identity_pub, node_id, ts, &sk);
+    let msg = super::build_peer_announce(identity_pub, node_id, ts, &sk, None);
 
     assert_eq!(msg.v, crate::constants::PROTOCOL_VERSION);
     assert_eq!(msg.identity_pub, identity_pub);
@@ -989,7 +992,7 @@ fn verify_peer_announce_rejects_tampered_identity() {
     let node_id = make_node_id(6);
     let ts = Timestamp(2_000_000);
 
-    let mut msg = super::build_peer_announce(identity_pub, node_id, ts, &sk);
+    let mut msg = super::build_peer_announce(identity_pub, node_id, ts, &sk, None);
 
     // Tamper with the identity_pub — sig should no longer verify.
     msg.identity_pub = make_identity_pub(0xFF);
@@ -1008,7 +1011,7 @@ fn verify_peer_announce_rejects_tampered_node_id() {
     let node_id = make_node_id(7);
     let ts = Timestamp(3_000_000);
 
-    let mut msg = super::build_peer_announce(identity_pub, node_id, ts, &sk);
+    let mut msg = super::build_peer_announce(identity_pub, node_id, ts, &sk, None);
 
     // Tamper with the node_id.
     msg.node_id = make_node_id(0xFF);
@@ -1027,7 +1030,7 @@ fn peer_announce_cbor_round_trip() {
     let node_id = make_node_id(8);
     let ts = Timestamp(4_000_000);
 
-    let msg = super::build_peer_announce(identity_pub, node_id, ts, &sk);
+    let msg = super::build_peer_announce(identity_pub, node_id, ts, &sk, None);
 
     // Serialize to CBOR and deserialize.
     let encoded = to_cbor(&msg).expect("cbor encode failed");
@@ -1187,4 +1190,163 @@ fn restore_denied_msg_fields_exist() {
     assert_eq!(msg.v, 1);
     assert!((msg.current_trust - 0.3).abs() < f64::EPSILON);
     assert!((msg.needed_trust - 0.7).abs() < f64::EPSILON);
+}
+
+// ─── Delete / CancelDelete signature helpers ─────────────────────────────────
+
+#[test]
+fn delete_msg_builds_and_verifies() {
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    let key = SigningKey::generate(&mut OsRng);
+    let identity = IdentityPub(key.verifying_key().to_bytes());
+    let block_id = SourceBlockId([7u8; 32]);
+    let ts = Timestamp(123456);
+
+    let msg = build_delete_msg(block_id, ts, &key);
+    assert_eq!(msg.v, 1);
+    assert_eq!(msg.source_block_id, block_id);
+    assert_eq!(msg.timestamp, ts);
+    assert!(verify_delete_msg(&msg, &identity).is_ok());
+}
+
+#[test]
+fn delete_msg_wrong_owner_fails_verify() {
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    let key = SigningKey::generate(&mut OsRng);
+    let other_key = SigningKey::generate(&mut OsRng);
+    let other_identity = IdentityPub(other_key.verifying_key().to_bytes());
+    let block_id = SourceBlockId([8u8; 32]);
+
+    let msg = build_delete_msg(block_id, Timestamp(100), &key);
+    assert!(verify_delete_msg(&msg, &other_identity).is_err());
+}
+
+#[test]
+fn cancel_delete_msg_builds_and_verifies() {
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    let key = SigningKey::generate(&mut OsRng);
+    let identity = IdentityPub(key.verifying_key().to_bytes());
+    let block_id = SourceBlockId([9u8; 32]);
+    let ts = Timestamp(789000);
+
+    let msg = build_cancel_delete_msg(block_id, ts, &key);
+    assert_eq!(msg.v, 1);
+    assert_eq!(msg.source_block_id, block_id);
+    assert!(verify_cancel_delete_msg(&msg, &identity).is_ok());
+}
+
+#[test]
+fn cancel_delete_msg_wrong_owner_fails() {
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    let key = SigningKey::generate(&mut OsRng);
+    let other_key = SigningKey::generate(&mut OsRng);
+    let other_identity = IdentityPub(other_key.verifying_key().to_bytes());
+
+    let msg = build_cancel_delete_msg(SourceBlockId([10u8; 32]), Timestamp(100), &key);
+    assert!(verify_cancel_delete_msg(&msg, &other_identity).is_err());
+}
+
+#[test]
+fn delete_sig_not_valid_as_cancel_delete() {
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    let key = SigningKey::generate(&mut OsRng);
+    let identity = IdentityPub(key.verifying_key().to_bytes());
+    let block_id = SourceBlockId([11u8; 32]);
+    let ts = Timestamp(500);
+
+    let delete_msg = build_delete_msg(block_id, ts, &key);
+    // Reuse the delete sig as a cancel_delete — must fail (different discriminator).
+    let fake_cancel = CancelDeleteMsg {
+        v: 1,
+        source_block_id: block_id,
+        timestamp: ts,
+        sig: delete_msg.sig,
+    };
+    assert!(verify_cancel_delete_msg(&fake_cancel, &identity).is_err());
+}
+
+// ─── x25519_pub field: roundtrip and backward compat ─────────────────────────
+
+#[test]
+fn peer_announce_with_x25519_roundtrips_cbor() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let identity_pub = IdentityPub(sk.verifying_key().to_bytes());
+    let node_id = make_node_id(10);
+    let ts = Timestamp(5_000_000);
+    let x25519_bytes = [42u8; 32];
+
+    let msg = super::build_peer_announce(identity_pub, node_id, ts, &sk, Some(x25519_bytes));
+    assert_eq!(msg.x25519_pub, Some(x25519_bytes));
+
+    // Frame as a full Message and unframe.
+    let framed = frame_message(&Message::PeerAnnounce(msg.clone())).expect("frame failed");
+    let (decoded_msg, consumed) = unframe_message(&framed).expect("unframe failed");
+    assert_eq!(consumed, framed.len());
+
+    let decoded = match decoded_msg {
+        Message::PeerAnnounce(m) => m,
+        other => panic!("expected PeerAnnounce, got {other:?}"),
+    };
+    assert_eq!(decoded.x25519_pub, Some(x25519_bytes), "x25519_pub must survive frame/unframe");
+    assert_eq!(decoded.identity_pub, msg.identity_pub);
+    assert_eq!(decoded.node_id, msg.node_id);
+    // Signature still verifies after round-trip.
+    super::verify_peer_announce(&decoded).expect("sig must verify after roundtrip");
+}
+
+#[test]
+fn peer_announce_without_x25519_deserializes_as_none() {
+    // Simulate a pre-x25519_pub node by building a CBOR map that lacks the
+    // x25519_pub key entirely (not just null). #[serde(default)] must produce
+    // x25519_pub == None when the field is missing from the wire payload.
+    use ciborium::value::Value;
+
+    let sk = SigningKey::generate(&mut OsRng);
+    let identity_pub_bytes = sk.verifying_key().to_bytes();
+    let node_id_bytes = [11u8; 32];
+    let ts_u64: u64 = 6_000_000;
+    // Build a 64-byte zero signature (not actually valid — sufficient for this decode test).
+    let sig_bytes = vec![0u8; 64];
+
+    // Manually craft CBOR for PeerAnnounceMsg without x25519_pub field.
+    // Fields: v, identity_pub, node_id, timestamp, sig.
+    let cbor_map = Value::Map(vec![
+        (Value::Text("v".into()), Value::Integer(1.into())),
+        (
+            Value::Text("identity_pub".into()),
+            Value::Bytes(identity_pub_bytes.to_vec()),
+        ),
+        (
+            Value::Text("node_id".into()),
+            Value::Bytes(node_id_bytes.to_vec()),
+        ),
+        (
+            Value::Text("timestamp".into()),
+            Value::Integer(ts_u64.into()),
+        ),
+        (
+            Value::Text("sig".into()),
+            Value::Bytes(sig_bytes),
+        ),
+        // x25519_pub is intentionally absent.
+    ]);
+
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&cbor_map, &mut buf).expect("CBOR encode failed");
+
+    let decoded: PeerAnnounceMsg = from_cbor(&buf).expect("decode must succeed without x25519_pub field");
+    assert_eq!(
+        decoded.x25519_pub, None,
+        "x25519_pub must default to None when field is absent (backward compat)"
+    );
 }

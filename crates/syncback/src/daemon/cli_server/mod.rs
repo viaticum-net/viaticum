@@ -712,6 +712,7 @@ async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
             device_id: Some(state.device_id),
             revoked_device_pub_keys: vec![],
             addrs: vec![addr.clone()],
+            x25519_pub: None,
         }
     };
 
