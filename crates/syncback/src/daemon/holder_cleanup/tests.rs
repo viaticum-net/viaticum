@@ -64,7 +64,7 @@ async fn cleanup_expired_deletes_files_and_posts_symbol_dropped() {
     // cleanup_expired calls Timestamp::now() internally, so we rely on the
     // real wall-clock being >> HOLDER_DELETE_COOLDOWN_SECS (which is 4 weeks
     // in seconds, ~2.4 million). Any Unix timestamp past 2024 qualifies.
-    super::cleanup_expired(&db, &holdings_dir.path().to_path_buf(), &relay_post_tx)
+    super::cleanup_expired(&db, &holdings_dir.path().to_path_buf(), &relay_post_tx, 1)
         .await
         .unwrap();
 
@@ -111,7 +111,7 @@ async fn cleanup_expired_tolerates_missing_files() {
     // Intentionally do NOT create any files on disk.
 
     // Should not error even though no files exist.
-    super::cleanup_expired(&db, &holdings_dir.path().to_path_buf(), &relay_post_tx)
+    super::cleanup_expired(&db, &holdings_dir.path().to_path_buf(), &relay_post_tx, 1)
         .await
         .unwrap();
 

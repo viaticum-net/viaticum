@@ -587,6 +587,7 @@ impl DaemonHandle {
                     disk_reserve_bytes,
                     cleanup_interval,
                     pressure_interval,
+                    time_scale,
                     cleanup_cancel,
                 ).await
             }));

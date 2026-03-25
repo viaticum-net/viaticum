@@ -173,7 +173,7 @@ fn process_cooldowns_owner_cooldown_not_elapsed() {
     let block = make_block(bid, SourceBlockStatus::Active, SourceBlockType::Single);
     let now = ts(OWNER_DELETE_COOLDOWN_SECS - 1);
 
-    let actions = engine.process_cooldowns(&[file], &[block], &[], now);
+    let actions = engine.process_cooldowns(&[file], &[block], &[], now, 1);
 
     assert!(actions.is_empty());
 }
@@ -197,7 +197,7 @@ fn process_cooldowns_sends_drop_notice_at_owner_cooldown_expiry() {
     let p_b = make_placement(bid, holder_b, fid, PlacementStatus::Alive);
     let now = ts(OWNER_DELETE_COOLDOWN_SECS);
 
-    let actions = engine.process_cooldowns(&[file], &[block], &[p_a, p_b], now);
+    let actions = engine.process_cooldowns(&[file], &[block], &[p_a, p_b], now, 1);
 
     assert_eq!(actions.len(), 2);
     assert!(actions.contains(&DeletionAction::SendDropNotice {
@@ -229,7 +229,7 @@ fn process_cooldowns_skip_already_deleting_placements() {
     let p_b = make_placement(bid, holder_b, fid, PlacementStatus::Alive);
     let now = ts(OWNER_DELETE_COOLDOWN_SECS + 10);
 
-    let actions = engine.process_cooldowns(&[file], &[block], &[p_a, p_b], now);
+    let actions = engine.process_cooldowns(&[file], &[block], &[p_a, p_b], now, 1);
 
     assert_eq!(actions.len(), 1);
     assert_eq!(
@@ -258,7 +258,7 @@ fn process_cooldowns_cleanup_after_holder_cooldown() {
     let p_a = make_placement(bid, holder_a, fid, PlacementStatus::Deleting);
     let now = ts(OWNER_DELETE_COOLDOWN_SECS + HOLDER_DELETE_COOLDOWN_SECS);
 
-    let actions = engine.process_cooldowns(&[file], &[block], &[p_a], now);
+    let actions = engine.process_cooldowns(&[file], &[block], &[p_a], now, 1);
 
     assert!(actions.contains(&DeletionAction::CleanupPlacement {
         source_block_id: bid,
@@ -289,7 +289,7 @@ fn process_cooldowns_cleanup_waits_for_all_holders() {
     let p_b = make_placement(bid, holder_b, fid, PlacementStatus::Alive);
     let now = ts(OWNER_DELETE_COOLDOWN_SECS + HOLDER_DELETE_COOLDOWN_SECS);
 
-    let actions = engine.process_cooldowns(&[file], &[block], &[p_a, p_b], now);
+    let actions = engine.process_cooldowns(&[file], &[block], &[p_a, p_b], now, 1);
 
     assert!(actions.contains(&DeletionAction::CleanupPlacement {
         source_block_id: bid,
@@ -324,7 +324,7 @@ fn process_cooldowns_file_still_present_on_one_device_skipped() {
     let block = make_block(bid, SourceBlockStatus::Active, SourceBlockType::Single);
     let now = ts(OWNER_DELETE_COOLDOWN_SECS + 1_000_000);
 
-    let actions = engine.process_cooldowns(&[file], &[block], &[], now);
+    let actions = engine.process_cooldowns(&[file], &[block], &[], now, 1);
 
     assert!(actions.is_empty());
 }
@@ -409,7 +409,7 @@ fn process_cooldowns_vacuum_triggered_for_stale_pack() {
     let block2 = make_block(bid2, SourceBlockStatus::Active, SourceBlockType::Single);
 
     let now = ts(1000);
-    let actions = engine.process_cooldowns(&[f1, f2, f3, f4], &[block1, block2], &[], now);
+    let actions = engine.process_cooldowns(&[f1, f2, f3, f4], &[block1, block2], &[], now, 1);
 
     assert_eq!(actions.len(), 1);
     assert!(matches!(
@@ -434,7 +434,7 @@ fn process_cooldowns_no_vacuum_for_single_block_type() {
     let block = make_block(bid, SourceBlockStatus::Active, SourceBlockType::Single);
     let now = ts(1000);
 
-    let actions = engine.process_cooldowns(&[file], &[block], &[], now);
+    let actions = engine.process_cooldowns(&[file], &[block], &[], now, 1);
 
     assert!(!actions.iter().any(|a| matches!(a, DeletionAction::VacuumBlock { .. })));
 }
@@ -469,7 +469,7 @@ fn process_cooldowns_no_vacuum_for_stale_block() {
     );
     let now = ts(1000);
 
-    let actions = engine.process_cooldowns(&[f1, f2], &[block], &[], now);
+    let actions = engine.process_cooldowns(&[f1, f2], &[block], &[], now, 1);
 
     assert!(!actions.iter().any(|a| matches!(a, DeletionAction::VacuumBlock { .. })));
 }
@@ -491,8 +491,8 @@ fn process_cooldowns_idempotent() {
     let p_a = make_placement(bid, holder_a, fid, PlacementStatus::Alive);
     let now = ts(OWNER_DELETE_COOLDOWN_SECS + 100);
 
-    let actions1 = engine.process_cooldowns(&[file.clone()], &[block.clone()], &[p_a.clone()], now);
-    let actions2 = engine.process_cooldowns(&[file], &[block], &[p_a], now);
+    let actions1 = engine.process_cooldowns(&[file.clone()], &[block.clone()], &[p_a.clone()], now, 1);
+    let actions2 = engine.process_cooldowns(&[file], &[block], &[p_a], now, 1);
 
     assert_eq!(actions1, actions2);
 }
@@ -500,7 +500,7 @@ fn process_cooldowns_idempotent() {
 #[test]
 fn process_cooldowns_empty_inputs_returns_empty() {
     let engine = DeletionEngine::new();
-    let actions = engine.process_cooldowns(&[], &[], &[], ts(9_999_999));
+    let actions = engine.process_cooldowns(&[], &[], &[], ts(9_999_999), 1);
     assert!(actions.is_empty());
 }
 
@@ -528,7 +528,7 @@ fn single_device_deletion_cooldown_starts_immediately() {
 
     // Before owner cooldown: no actions
     let before = ts(deleted_at.0 + OWNER_DELETE_COOLDOWN_SECS - 1);
-    let actions = engine.process_cooldowns(&[file.clone()], &[block.clone()], &[placement.clone()], before);
+    let actions = engine.process_cooldowns(&[file.clone()], &[block.clone()], &[placement.clone()], before, 1);
     assert!(
         actions.is_empty(),
         "cooldown not yet elapsed — no actions expected"
@@ -536,7 +536,7 @@ fn single_device_deletion_cooldown_starts_immediately() {
 
     // Exactly at owner cooldown expiry: SendDropNotice must be issued immediately
     let at_expiry = ts(deleted_at.0 + OWNER_DELETE_COOLDOWN_SECS);
-    let actions = engine.process_cooldowns(&[file], &[block], &[placement], at_expiry);
+    let actions = engine.process_cooldowns(&[file], &[block], &[placement], at_expiry, 1);
     assert!(
         actions.contains(&DeletionAction::SendDropNotice {
             source_block_id: bid,
@@ -573,7 +573,7 @@ fn multi_device_deletion_cooldown_starts_only_when_all_deleted() {
 
     // Even well after dev_a cooldown would have expired: no actions because dev_b is Present
     let much_later = ts(dev_a_deleted_at.0 + OWNER_DELETE_COOLDOWN_SECS + 1_000_000);
-    let actions = engine.process_cooldowns(&[file], &[block], &[placement], much_later);
+    let actions = engine.process_cooldowns(&[file], &[block], &[placement], much_later, 1);
     assert!(
         actions.is_empty(),
         "cooldown must not start until all devices are deleted"
@@ -608,7 +608,7 @@ fn ransomware_protection_no_physical_delete_before_8_weeks() {
     for weeks in 0..8 {
         let check_time = ts(ransomware_time.0 + weeks * 7 * 86_400);
         let actions =
-            engine.process_cooldowns(&[file.clone()], &[block.clone()], &[placement.clone()], check_time);
+            engine.process_cooldowns(&[file.clone()], &[block.clone()], &[placement.clone()], check_time, 1);
         assert!(
             !actions.iter().any(|a| matches!(
                 a,
@@ -623,7 +623,7 @@ fn ransomware_protection_no_physical_delete_before_8_weeks() {
     let block_deleting = make_block(bid, SourceBlockStatus::Deleting, SourceBlockType::Single);
     let placement_deleting = make_placement(bid, holder_a, fid, PlacementStatus::Deleting);
     let actions =
-        engine.process_cooldowns(&[file], &[block_deleting], &[placement_deleting], delete_time);
+        engine.process_cooldowns(&[file], &[block_deleting], &[placement_deleting], delete_time, 1);
     assert!(
         actions.iter().any(|a| matches!(a, DeletionAction::CleanupPlacement { .. })),
         "physical delete should happen at 8 weeks"
@@ -664,6 +664,7 @@ fn cancel_delete_in_owner_cooldown_reverses_deletion() {
         &[block],
         &[placement],
         after_cooldown,
+        1,
     );
 
     assert!(
@@ -695,7 +696,7 @@ fn should_delete_now_monotone_in_time() {
 
     // Before owner cooldown: no actions.
     let before = ts(OWNER_DELETE_COOLDOWN_SECS - 1);
-    let actions_before = engine.process_cooldowns(&[file.clone()], &[block.clone()], &[placement.clone()], before);
+    let actions_before = engine.process_cooldowns(&[file.clone()], &[block.clone()], &[placement.clone()], before, 1);
     assert!(
         actions_before.is_empty(),
         "expected no actions before owner cooldown, got {actions_before:?}"
@@ -711,6 +712,7 @@ fn should_delete_now_monotone_in_time() {
             &[block.clone()],
             &[placement.clone()],
             check_time,
+            1,
         );
         assert!(
             actions.iter().any(|a| matches!(a, DeletionAction::SendDropNotice { .. })),

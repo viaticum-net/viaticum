@@ -38,6 +38,7 @@ pub async fn run(
     disk_reserve_bytes: u64,
     cleanup_interval_secs: u64,
     pressure_interval_secs: u64,
+    time_scale: u64,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut cleanup_timer =
@@ -57,7 +58,7 @@ pub async fn run(
                 break;
             }
             _ = cleanup_timer.tick() => {
-                if let Err(e) = cleanup_expired(&db, &holdings_dir, &relay_post_tx).await {
+                if let Err(e) = cleanup_expired(&db, &holdings_dir, &relay_post_tx, time_scale).await {
                     error!("holder_cleanup: cleanup_expired error: {e}");
                 }
             }
@@ -81,9 +82,10 @@ async fn cleanup_expired(
     db: &Db,
     holdings_dir: &PathBuf,
     relay_post_tx: &mpsc::Sender<RelayPost>,
+    time_scale: u64,
 ) -> anyhow::Result<()> {
     let now = Timestamp::now();
-    let expired = db.list_holdings_cooldown_expired(now)?;
+    let expired = db.list_holdings_cooldown_expired(now, time_scale)?;
 
     if expired.is_empty() {
         return Ok(());

@@ -126,6 +126,9 @@ impl DeletionEngine {
     /// Called by the scheduler on every tick. Scans all provided records and
     /// returns the actions to execute this tick.
     ///
+    /// `time_scale` accelerates cooldowns: effective cooldown = constant / time_scale.
+    /// Pass 1 for real-time.
+    ///
     /// Returns actions sorted: SendDropNotice first, then CleanupPlacement,
     /// then CleanupBlock. VacuumBlock appended last.
     ///
@@ -136,7 +139,9 @@ impl DeletionEngine {
         blocks: &[SourceBlockRecord],
         placements: &[SymbolPlacement],
         now: Timestamp,
+        time_scale: u64,
     ) -> Vec<DeletionAction> {
+        let scale = time_scale.max(1);
         let mut send_drop: Vec<DeletionAction> = Vec::new();
         let mut cleanup_placement: Vec<DeletionAction> = Vec::new();
         let mut cleanup_block: Vec<DeletionAction> = Vec::new();
@@ -147,15 +152,18 @@ impl DeletionEngine {
                 None => continue,
             };
 
+            let owner_cooldown = OWNER_DELETE_COOLDOWN_SECS / scale;
+            let holder_cooldown = HOLDER_DELETE_COOLDOWN_SECS / scale;
+
             let owner_cooldown_elapsed =
-                all_deleted_at.0 + OWNER_DELETE_COOLDOWN_SECS <= now.0;
+                all_deleted_at.0 + owner_cooldown <= now.0;
             if !owner_cooldown_elapsed {
                 continue;
             }
 
-            let drop_sent_at = all_deleted_at.0 + OWNER_DELETE_COOLDOWN_SECS;
+            let drop_sent_at = all_deleted_at.0 + owner_cooldown;
             let holder_cooldown_elapsed =
-                drop_sent_at + HOLDER_DELETE_COOLDOWN_SECS <= now.0;
+                drop_sent_at + holder_cooldown <= now.0;
 
             for version in &file.versions {
                 let block = match blocks

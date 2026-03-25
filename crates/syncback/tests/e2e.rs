@@ -464,7 +464,7 @@ async fn full_lifecycle_e2e() {
         .flat_map(|b| db.list_placements_for_block(&b.block_id).unwrap())
         .collect();
     let pre_actions =
-        engine.process_cooldowns(&[updated_doc.clone()], &all_blocks, &all_placements, NOW);
+        engine.process_cooldowns(&[updated_doc.clone()], &all_blocks, &all_placements, NOW, 1);
     let pre_drop_notices: Vec<_> = pre_actions
         .iter()
         .filter(|a| matches!(a, DeletionAction::SendDropNotice { .. }))
@@ -478,7 +478,7 @@ async fn full_lifecycle_e2e() {
     // After owner cooldown expires: SendDropNotice for each holder of doc's blocks
     let after_owner = Timestamp(NOW.0 + OWNER_DELETE_COOLDOWN_SECS + 1);
     let post_actions =
-        engine.process_cooldowns(&[updated_doc], &all_blocks, &all_placements, after_owner);
+        engine.process_cooldowns(&[updated_doc], &all_blocks, &all_placements, after_owner, 1);
     let drop_notices: Vec<_> = post_actions
         .iter()
         .filter(|a| matches!(a, DeletionAction::SendDropNotice { .. }))

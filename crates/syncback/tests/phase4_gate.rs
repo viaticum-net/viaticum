@@ -286,6 +286,7 @@ fn deletion_cooldown_full_lifecycle() {
         std::slice::from_ref(&block),
         &[placement_1.clone(), placement_2.clone()],
         before_owner,
+        1,
     );
     assert!(actions.is_empty(), "before owner cooldown, no actions expected");
 
@@ -296,6 +297,7 @@ fn deletion_cooldown_full_lifecycle() {
         std::slice::from_ref(&block),
         &[placement_1.clone(), placement_2.clone()],
         after_owner,
+        1,
     );
     let send_drops: Vec<_> = actions
         .iter()
@@ -326,6 +328,7 @@ fn deletion_cooldown_full_lifecycle() {
         &[block_deleting],
         &[placement_1_deleting, placement_2_deleting],
         after_both,
+        1,
     );
 
     let cleanups: Vec<_> = actions

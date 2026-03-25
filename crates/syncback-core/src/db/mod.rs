@@ -932,11 +932,13 @@ impl Db {
         Ok(total)
     }
 
-    /// Holdings where delete_requested_at + HOLDER_DELETE_COOLDOWN_SECS <= now.
+    /// Holdings where delete_requested_at + HOLDER_DELETE_COOLDOWN_SECS/time_scale <= now.
     pub fn list_holdings_cooldown_expired(
         &self,
         now: Timestamp,
+        time_scale: u64,
     ) -> Result<Vec<HoldingRecord>, DbError> {
+        let cooldown = HOLDER_DELETE_COOLDOWN_SECS / time_scale.max(1);
         let tx = self.inner.begin_read()?;
         let table = tx.open_table(HOLDINGS)?;
         let mut records = Vec::new();
@@ -945,7 +947,7 @@ impl Db {
             let record: HoldingRecord = from_cbor_bytes(v.value())?;
             if record.status == HoldingStatus::MarkedForDelete {
                 if let Some(requested_at) = record.delete_requested_at {
-                    if requested_at.0 + HOLDER_DELETE_COOLDOWN_SECS <= now.0 {
+                    if requested_at.0 + cooldown <= now.0 {
                         records.push(record);
                     }
                 }

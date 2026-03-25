@@ -435,7 +435,7 @@ impl Scheduler {
         let blocks = self.db.list_all_source_blocks().unwrap_or_default();
         let placements = self.db.list_all_placements().unwrap_or_default();
 
-        let actions = engine.process_cooldowns(&files, &blocks, &placements, now);
+        let actions = engine.process_cooldowns(&files, &blocks, &placements, now, self.config.time_scale);
         if actions.is_empty() {
             return Ok(());
         }

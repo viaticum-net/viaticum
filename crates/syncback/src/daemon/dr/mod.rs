@@ -68,7 +68,7 @@ pub async fn run_dr(
     let identity_pub_hex = hex_encode(&keyfile.identity_pub);
     println!("Identity restored: {identity_pub_hex}");
 
-    let (_master_key, device_key, _epoch_key_bytes, iroh_key_bytes) = derive_keys(&keyfile, 0)?;
+    let (master_key, device_key, _epoch_key_bytes, iroh_key_bytes) = derive_keys(&keyfile, 0)?;
 
     // ── 2. Open fresh DB ──────────────────────────────────────────────────────
     let db_path = data_dir.join("db.redb");
@@ -82,11 +82,20 @@ pub async fn run_dr(
     // We need an incoming_tx but won't use it (no Processor in DR mode).
     let (incoming_tx, _incoming_rx) = mpsc::channel(16);
 
+    // Issue a device certificate so the handshake succeeds.
+    let device_id = syncback_core::types::DeviceId(keyfile.device_id);
+    let device_cert = syncback_core::cluster::issue_device_certificate(
+        &master_key,
+        device_id,
+        device_key.verifying_key().to_bytes(),
+        Timestamp::now(),
+    );
+
     let net_config = NetworkConfig {
         signing_key: device_key,
         master_identity: syncback_core::types::IdentityPub(keyfile.identity_pub),
         known_peers: std::collections::HashMap::new(),
-        device_cert: None,
+        device_cert: Some(device_cert),
         iroh_secret_key: Some(iroh::SecretKey::from_bytes(&iroh_key_bytes)),
         relay_mode: RelayMode::Default,
         x25519_pub: None,

@@ -360,7 +360,7 @@ fn holding_cooldown_expired() {
     db.upsert_holding(&h3).unwrap();
 
     let now = Timestamp(HOLDER_DELETE_COOLDOWN_SECS);
-    let expired = db.list_holdings_cooldown_expired(now).unwrap();
+    let expired = db.list_holdings_cooldown_expired(now, 1).unwrap();
     assert_eq!(expired.len(), 2);
     let ids: Vec<_> = expired.iter().map(|r| r.owner_id).collect();
     assert!(ids.contains(&owner1));
