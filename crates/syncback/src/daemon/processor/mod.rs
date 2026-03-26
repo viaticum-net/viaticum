@@ -1383,7 +1383,7 @@ impl Processor {
         // Escrow check: verify owner has earned enough restore budget through storage contribution.
         const BYTES_PER_GB: f64 = 1_073_741_824.0;
         let k_factor = self.escrow_cfg.k_factor;
-        let stored_gb_days = self.db.stored_for_peer_gb_days(&owner_id, Timestamp::now())?;
+        let stored_gb_days = self.db.stored_for_peer_gb_days(&owner_id, Timestamp::now(), self.time_scale)?;
         let already_restored_bytes = self.db.restored_total_bytes(&owner_id)?;
         let already_restored_gb = already_restored_bytes as f64 / BYTES_PER_GB;
         let this_request_gb = holding

@@ -1256,7 +1256,7 @@ fn make_holding_with_bytes(
 fn stored_for_peer_gb_days_empty_returns_zero() {
     let db = test_db();
     let owner = IdentityPub([0xAAu8; 32]);
-    let result = db.stored_for_peer_gb_days(&owner, Timestamp(1_000_000)).unwrap();
+    let result = db.stored_for_peer_gb_days(&owner, Timestamp(1_000_000), 1).unwrap();
     assert_eq!(result, 0.0);
 }
 
@@ -1284,7 +1284,7 @@ fn stored_for_peer_gb_days_sums_active_only() {
     db.upsert_holding(&active).unwrap();
     db.upsert_holding(&marked).unwrap();
 
-    let result = db.stored_for_peer_gb_days(&owner, now).unwrap();
+    let result = db.stored_for_peer_gb_days(&owner, now, 1).unwrap();
     // 5 GB * 10 days = 50 GB·days (MarkedForDelete excluded)
     let expected = 50.0_f64;
     assert!(
@@ -1317,7 +1317,7 @@ fn stored_for_peer_gb_days_multiple_holdings() {
     // Use now = 14 days for h2 and 7 days for h1 is impossible with one `now`.
     // Use separate calls to test incrementally: test at now=7days then now=14days.
     let result_7d = db
-        .stored_for_peer_gb_days(&owner, Timestamp(seven_days))
+        .stored_for_peer_gb_days(&owner, Timestamp(seven_days), 1)
         .unwrap();
     // Both holdings: 10*7 + 20*7 = 70 + 140 = 210
     assert!(
@@ -1326,7 +1326,7 @@ fn stored_for_peer_gb_days_multiple_holdings() {
     );
 
     let result_14d = db
-        .stored_for_peer_gb_days(&owner, Timestamp(fourteen_days))
+        .stored_for_peer_gb_days(&owner, Timestamp(fourteen_days), 1)
         .unwrap();
     // 10*14 + 20*14 = 140 + 280 = 420
     assert!(
@@ -1345,7 +1345,7 @@ fn stored_for_peer_gb_days_zero_age_returns_zero() {
     let h = make_holding_with_bytes(0x01, owner, HoldingStatus::Active, one_gb, ts);
     db.upsert_holding(&h).unwrap();
 
-    let result = db.stored_for_peer_gb_days(&owner, ts).unwrap();
+    let result = db.stored_for_peer_gb_days(&owner, ts, 1).unwrap();
     assert_eq!(result, 0.0);
 }
 

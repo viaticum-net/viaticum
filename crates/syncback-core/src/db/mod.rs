@@ -1268,17 +1268,22 @@ impl Db {
     /// Compute GB·days stored for a given owner across all Active holdings.
     ///
     /// Formula: sum over active holdings of (total_bytes / BYTES_PER_GB * age_days)
-    /// where age_days = (now - received_at) / SECS_PER_DAY.
+    /// where age_days = (now - received_at) * time_scale / SECS_PER_DAY.
+    ///
+    /// `time_scale` accelerates simulated time (1 = real time, 100_000 = gamma tests).
+    /// This matches the same time acceleration used everywhere else in the protocol.
     ///
     /// Returns 0.0 if no active holdings exist for this owner.
     pub fn stored_for_peer_gb_days(
         &self,
         owner_id: &IdentityPub,
         now: Timestamp,
+        time_scale: u64,
     ) -> Result<f64, DbError> {
         const BYTES_PER_GB: f64 = 1_073_741_824.0;
         const SECS_PER_DAY: f64 = 86_400.0;
 
+        let scale = time_scale.max(1) as f64;
         let holdings = self.list_holdings_for_owner(owner_id)?;
         let mut total = 0.0_f64;
         for h in holdings {
@@ -1286,7 +1291,7 @@ impl Db {
                 continue;
             }
             let age_secs = now.0.saturating_sub(h.received_at.0) as f64;
-            let age_days = age_secs / SECS_PER_DAY;
+            let age_days = age_secs * scale / SECS_PER_DAY;
             let gb = h.total_bytes as f64 / BYTES_PER_GB;
             total += gb * age_days;
         }
