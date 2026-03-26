@@ -155,6 +155,7 @@ async fn make_processor_with_quota(
         pending_challenges,
         relay_post_tx,
         None, // cluster_state: not needed for handler unit tests
+        syncback_core::config::EscrowCfg::default(),
     );
 
     (processor, repair_rx, relay_sync_rx)
@@ -219,6 +220,7 @@ async fn make_processor_with_pending(
         pending,
         relay_post_tx,
         None, // cluster_state: not needed for handler unit tests
+        syncback_core::config::EscrowCfg::default(),
     );
 
     (processor, repair_rx, relay_sync_rx)
@@ -296,6 +298,7 @@ async fn symbol_accept_updates_backup_event() {
         pending,
         relay_post_tx,
         None, // cluster_state: not needed for handler unit tests
+        syncback_core::config::EscrowCfg::default(),
     );
 
     let holder = make_identity(7);
@@ -1013,15 +1016,16 @@ async fn restore_request_returns_held_symbols() {
         std::fs::write(block_dir.join(format!("{esi}.bin")), vec![esi as u8; 32]).unwrap();
     }
 
-    // Upsert HoldingRecord
+    // Upsert HoldingRecord with received_at 30 days ago so escrow sees non-zero contribution.
+    let thirty_days_ago = Timestamp(Timestamp::now().0.saturating_sub(30 * 86_400));
     db.upsert_holding(&HoldingRecord {
         source_block_id: block_id,
         owner_id: owner,
         esi_ranges: vec![(0, 3)],
         importance: 0.5,
-        total_bytes: 3 * 32,
+        total_bytes: 1_073_741_824, // 1 GB so budget = 1*30/7 ≈ 4.3 GB
         status: HoldingStatus::Active,
-        received_at: Timestamp::now(),
+        received_at: thirty_days_ago,
         delete_requested_at: None,
         drop_notice_sent_at: None,
     })
@@ -1061,14 +1065,16 @@ async fn restore_request_filters_by_esi_list() {
         std::fs::write(block_dir.join(format!("{esi}.bin")), vec![esi as u8; 32]).unwrap();
     }
 
+    // received_at 30 days ago so escrow sees non-zero contribution.
+    let thirty_days_ago = Timestamp(Timestamp::now().0.saturating_sub(30 * 86_400));
     db.upsert_holding(&HoldingRecord {
         source_block_id: block_id,
         owner_id: owner,
         esi_ranges: vec![(0, 5)],
         importance: 0.5,
-        total_bytes: 5 * 32,
+        total_bytes: 1_073_741_824, // 1 GB so budget = 1*30/7 ≈ 4.3 GB
         status: HoldingStatus::Active,
-        received_at: Timestamp::now(),
+        received_at: thirty_days_ago,
         delete_requested_at: None,
         drop_notice_sent_at: None,
     })
@@ -2126,6 +2132,7 @@ async fn dispatch_relay_pos_challenge_sends_response_via_board() {
         backup_event_tx, 1,
         pending, relay_post_tx,
         None, // cluster_state: not needed for this test
+        syncback_core::config::EscrowCfg::default(),
     );
 
     // Create a symbol file so PoS can respond.
@@ -2268,6 +2275,7 @@ async fn make_processor_with_cluster_state(
         pending,
         relay_post_tx,
         Some(cluster_state.clone()),
+        syncback_core::config::EscrowCfg::default(),
     );
 
     (processor, cluster_state, own_identity)

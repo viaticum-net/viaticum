@@ -57,6 +57,11 @@ const CLUSTER_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("cluste
 const SYSTEM_STATE_BLOBS: TableDefinition<&[u8; 32], &[u8]> =
     TableDefinition::new("system_state_blobs");
 
+/// Total bytes restored per peer (cumulative, append-only counter).
+/// Key = owner IdentityPub [u8;32]. Value = CBOR(u64) — total bytes served.
+const RESTORE_SERVED: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("restore_served");
+
 /// TTL for stored system state blobs: 365 days.
 pub const SYSTEM_STATE_TTL_SECS: u64 = 365 * 24 * 3600;
 
@@ -255,6 +260,7 @@ impl Db {
             tx.open_table(HOLDER_FILES)?;
             tx.open_table(CLUSTER_STATE)?;
             tx.open_table(SYSTEM_STATE_BLOBS)?;
+            tx.open_table(RESTORE_SERVED)?;
         }
         tx.commit()?;
         Ok(())
@@ -1248,6 +1254,75 @@ impl Db {
         {
             let mut table = tx.open_table(SYSTEM_STATE_BLOBS)?;
             table.remove(&owner.0)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+// ============================================================
+// Restore served table
+// ============================================================
+
+impl Db {
+    /// Compute GB·days stored for a given owner across all Active holdings.
+    ///
+    /// Formula: sum over active holdings of (total_bytes / BYTES_PER_GB * age_days)
+    /// where age_days = (now - received_at) / SECS_PER_DAY.
+    ///
+    /// Returns 0.0 if no active holdings exist for this owner.
+    pub fn stored_for_peer_gb_days(
+        &self,
+        owner_id: &IdentityPub,
+        now: Timestamp,
+    ) -> Result<f64, DbError> {
+        const BYTES_PER_GB: f64 = 1_073_741_824.0;
+        const SECS_PER_DAY: f64 = 86_400.0;
+
+        let holdings = self.list_holdings_for_owner(owner_id)?;
+        let mut total = 0.0_f64;
+        for h in holdings {
+            if h.status != HoldingStatus::Active {
+                continue;
+            }
+            let age_secs = now.0.saturating_sub(h.received_at.0) as f64;
+            let age_days = age_secs / SECS_PER_DAY;
+            let gb = h.total_bytes as f64 / BYTES_PER_GB;
+            total += gb * age_days;
+        }
+        Ok(total)
+    }
+
+    /// Total bytes we have served to this owner for restore (cumulative).
+    /// Returns 0 if no record exists.
+    pub fn restored_total_bytes(&self, owner_id: &IdentityPub) -> Result<u64, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(RESTORE_SERVED)?;
+        match table.get(&owner_id.0)? {
+            Some(v) => {
+                let total: u64 = from_cbor_bytes(v.value())?;
+                Ok(total)
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Increment the restore-served counter for this owner by `bytes_served`.
+    ///
+    /// Reads current value, adds bytes_served, writes back atomically.
+    /// Called after successful symbol delivery.
+    pub fn record_restore_served(
+        &self,
+        owner_id: &IdentityPub,
+        bytes_served: u64,
+    ) -> Result<(), DbError> {
+        let current = self.restored_total_bytes(owner_id)?;
+        let new_total = current.saturating_add(bytes_served);
+        let bytes = to_cbor_bytes(&new_total);
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(RESTORE_SERVED)?;
+            table.insert(&owner_id.0, bytes.as_slice())?;
         }
         tx.commit()?;
         Ok(())

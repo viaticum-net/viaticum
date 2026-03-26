@@ -36,11 +36,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use syncback_core::constants::{
-    DEFAULT_ESCROW_TRUST_FACTOR, INITIAL_TRUST_P, P_WINDOW_WEEKS, SYMBOL_SIZE,
-};
+use syncback_core::config::EscrowCfg;
+use syncback_core::constants::{INITIAL_TRUST_P, P_WINDOW_WEEKS, SYMBOL_SIZE};
 use syncback_core::escrow::{check_restore, RestoreDecision};
-use syncback_core::trust::compute_combined;
 use syncback_core::db::{Db, SystemStateBlobRecord, WeeklyPosEntry};
 use syncback_core::erasure::{ErasureEncoder, Symbol};
 use syncback_core::messages::{
@@ -54,7 +52,7 @@ use syncback_core::messages::{
 use syncback_core::pos::{
     apply_pos_outcome, outcome_from_verify, verify_response, PosResponse, VerifyOutcome,
 };
-use syncback_core::trust::PosOutcome;
+use syncback_core::trust::{compute_combined, PosOutcome};
 use syncback_core::types::{
     hex_encode, HoldingRecord, HoldingStatus, IdentityPub, PeerRecord, PlacementStatus, Timestamp,
 };
@@ -140,6 +138,8 @@ pub struct Processor {
     relay_post_tx: mpsc::Sender<RelayPost>,
     /// Cluster state for auto-add on same-identity handshake. None if not initialized.
     cluster_state: Option<Arc<std::sync::Mutex<syncback_core::cluster::ClusterState>>>,
+    /// Escrow configuration for contribution-based restore budget checks.
+    escrow_cfg: EscrowCfg,
 }
 
 impl Processor {
@@ -164,6 +164,7 @@ impl Processor {
         pending_challenges: PendingChallenges,
         relay_post_tx: mpsc::Sender<RelayPost>,
         cluster_state: Option<Arc<std::sync::Mutex<syncback_core::cluster::ClusterState>>>,
+        escrow_cfg: EscrowCfg,
     ) -> Self {
         Processor {
             db,
@@ -184,6 +185,7 @@ impl Processor {
             pending_challenges,
             relay_post_tx,
             cluster_state,
+            escrow_cfg,
         }
     }
 
@@ -1378,28 +1380,28 @@ impl Processor {
             }
         };
 
-        // Escrow check: verify owner has enough trust to unlock restore.
-        let trust = match self.db.get_peer(&owner_id)? {
-            Some(peer) => compute_combined(peer.trust_p, peer.trust_i, peer.trust_s),
-            None => 0.0, // unknown peer → zero trust → free tier only
-        };
-        let restore_gb = holding
+        // Escrow check: verify owner has earned enough restore budget through storage contribution.
+        const BYTES_PER_GB: f64 = 1_073_741_824.0;
+        let k_factor = self.escrow_cfg.k_factor;
+        let stored_gb_days = self.db.stored_for_peer_gb_days(&owner_id, Timestamp::now())?;
+        let already_restored_bytes = self.db.restored_total_bytes(&owner_id)?;
+        let already_restored_gb = already_restored_bytes as f64 / BYTES_PER_GB;
+        let this_request_gb = holding
             .esi_ranges
             .iter()
             .map(|&(_start, count)| count as f64 * SYMBOL_SIZE as f64)
             .sum::<f64>()
-            / (1024.0 * 1024.0 * 1024.0);
-        if let RestoreDecision::Denied(denial) = check_restore(
-            trust,
-            restore_gb,
-            DEFAULT_ESCROW_TRUST_FACTOR,
-        ) {
+            / BYTES_PER_GB;
+        if let RestoreDecision::Denied(denial) =
+            check_restore(stored_gb_days, already_restored_gb, this_request_gb, k_factor)
+        {
             warn!(
                 owner = %owner_id,
                 block_id = %block_id,
-                current_trust = denial.current_trust,
-                needed_trust = denial.needed_trust,
-                restore_budget_gb = denial.restore_budget_gb,
+                stored_gb_days,
+                already_restored_gb,
+                this_request_gb,
+                budget = denial.restore_budget_gb,
                 "processor: RestoreRequest denied by escrow check"
             );
             return Err(ProcessorError::EscrowDenied {
@@ -1456,6 +1458,15 @@ impl Processor {
                 symbols = symbols.len(),
                 "processor: sending RestoreResponse"
             );
+        }
+
+        // Increment restore-served counter for this owner after successful symbol load.
+        let bytes_served: u64 = symbols.iter().map(|s| s.data.len() as u64).sum();
+        if bytes_served > 0 {
+            if let Err(e) = self.db.record_restore_served(&owner_id, bytes_served) {
+                // Non-fatal: log and continue. Worst case: budget is slightly over-estimated next time.
+                warn!(owner = %owner_id, err = %e, "processor: failed to record restore_served");
+            }
         }
 
         Ok(RestoreResponseMsg {

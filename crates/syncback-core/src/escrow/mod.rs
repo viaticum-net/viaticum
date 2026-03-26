@@ -1,4 +1,4 @@
-use crate::constants::{DROP_NOTICE_WINDOW_SECS, FREE_TIER_GB, HOLDER_DELETE_COOLDOWN_SECS};
+use crate::constants::{DROP_NOTICE_WINDOW_SECS, HOLDER_DELETE_COOLDOWN_SECS};
 use crate::types::Timestamp;
 
 // ============================================================
@@ -14,18 +14,19 @@ pub enum RestoreDecision {
 
 /// Reason for denial, sent back to owner as restore_denied message payload.
 ///
-/// Fields map directly to RestoreDeniedMsg wire message fields:
-///   restore_denied { source_block_id, reason, current_trust, needed_trust, restore_budget_gb }
+/// Wire format compatibility: fields current_trust/needed_trust/restore_budget_gb
+/// remain present. For contribution-based denial: current_trust=0.0, needed_trust=0.0,
+/// restore_budget_gb = computed budget. Owner sees how large the budget is.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RestoreDenial {
-    /// Holder's trust score for this owner at the time of denial.
+    /// Always 0.0 in the new escrow (trust is not used for gating).
     pub current_trust: f64,
-    /// Minimum trust score that would allow this restore.
-    /// needed_trust = (restore_gb - FREE_TIER_GB) / escrow_trust_factor
-    /// Clamped to 0.0 if restore_gb <= FREE_TIER_GB.
+    /// Always 0.0 in the new escrow.
     pub needed_trust: f64,
-    /// Max GB restorable at current trust level.
+    /// Max GB restorable given current contribution (stored_gb_days / k_factor).
     pub restore_budget_gb: f64,
+    /// GB already consumed from the budget.
+    pub already_restored_gb: f64,
 }
 
 /// Decision for holder cooldown (delete flow).
@@ -46,34 +47,42 @@ pub enum DropNoticeDecision {
 // Pure functions
 // ============================================================
 
-/// Compute max GB restorable at the given trust score.
+/// Compute restore budget from contribution.
 ///
-/// Formula: max_restorable_gb = FREE_TIER_GB + trust * escrow_trust_factor
-///
-/// Trust is allowed to be negative (new peers in edge cases); result is clamped
-/// to FREE_TIER_GB minimum so the demo credit is always available.
-pub fn restore_budget(trust: f64, escrow_trust_factor: f64) -> f64 {
-    (FREE_TIER_GB + trust * escrow_trust_factor).max(FREE_TIER_GB)
+/// Formula: restore_budget_gb = stored_gb_days / k_factor.
+/// Returns 0.0 if stored_gb_days == 0 or k_factor <= 0.
+pub fn compute_restore_budget(stored_gb_days: f64, k_factor: f64) -> f64 {
+    if k_factor <= 0.0 || stored_gb_days <= 0.0 {
+        return 0.0;
+    }
+    stored_gb_days / k_factor
 }
 
-/// Primary escrow check. Called by holder when owner requests restore.
+/// Primary escrow check. Called by the holder's processor when owner requests restore.
 ///
 /// Parameters:
-///   trust               — holder's pairwise trust score for the owner
-///   restore_gb          — size of the requested restore in GB
-///   escrow_trust_factor — configurable multiplier (pass DEFAULT_ESCROW_TRUST_FACTOR unless overridden)
+///   stored_gb_days      — result of db.stored_for_peer_gb_days(owner, now)
+///   already_restored_gb — result of db.restored_total_bytes(owner) / BYTES_PER_GB
+///   this_request_gb     — size of THIS block's symbols in GB
+///   k_factor            — from EscrowCfg (default 7.0)
 ///
-/// Returns: Allowed if restore_gb <= restore_budget(trust), else Denied.
-pub fn check_restore(trust: f64, restore_gb: f64, escrow_trust_factor: f64) -> RestoreDecision {
-    let budget = restore_budget(trust, escrow_trust_factor);
-    if restore_gb <= budget {
+/// Returns Allowed if (budget - already_restored) >= this_request_gb, else Denied.
+pub fn check_restore(
+    stored_gb_days: f64,
+    already_restored_gb: f64,
+    this_request_gb: f64,
+    k_factor: f64,
+) -> RestoreDecision {
+    let budget = compute_restore_budget(stored_gb_days, k_factor);
+    let remaining = (budget - already_restored_gb).max(0.0);
+    if this_request_gb <= remaining {
         RestoreDecision::Allowed
     } else {
-        let needed_trust = ((restore_gb - FREE_TIER_GB) / escrow_trust_factor).max(0.0);
         RestoreDecision::Denied(RestoreDenial {
-            current_trust: trust,
-            needed_trust,
+            current_trust: 0.0,
+            needed_trust: 0.0,
             restore_budget_gb: budget,
+            already_restored_gb,
         })
     }
 }

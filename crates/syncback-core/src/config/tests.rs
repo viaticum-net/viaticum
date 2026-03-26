@@ -9,8 +9,8 @@ use crate::config::{
 };
 #[cfg(test)]
 use crate::constants::{
-    DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_TRUST_FACTOR, DEFAULT_MAX_VERSIONS,
-    DEFAULT_SOURCE_BLOCK_SIZE, FREE_TIER_GB, MAX_BOARD_ENTRIES, MAX_BOARD_SIZE_BYTES,
+    DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_K_FACTOR, DEFAULT_MAX_VERSIONS,
+    DEFAULT_SOURCE_BLOCK_SIZE, MAX_BOARD_ENTRIES, MAX_BOARD_SIZE_BYTES,
 };
 
 #[cfg(test)]
@@ -32,8 +32,7 @@ fn config_loads_defaults_when_file_is_empty() {
     assert_eq!(cfg.storage.hard_quota_gb, defaults.storage.hard_quota_gb);
     assert_eq!(cfg.storage.disk_reserve_gb, defaults.storage.disk_reserve_gb);
     assert_eq!(cfg.storage.data_dir, defaults.storage.data_dir);
-    assert_eq!(cfg.escrow.free_tier_gb, defaults.escrow.free_tier_gb);
-    assert_eq!(cfg.escrow.trust_factor, defaults.escrow.trust_factor);
+    assert_eq!(cfg.escrow.k_factor, defaults.escrow.k_factor);
     assert_eq!(cfg.network.relay_max_entries, defaults.network.relay_max_entries);
     assert_eq!(cfg.network.relay_max_size_mb, defaults.network.relay_max_size_mb);
     assert_eq!(cfg.network.relay_ttl_days, defaults.network.relay_ttl_days);
@@ -47,7 +46,7 @@ fn config_loads_partial_file_merging_with_defaults() {
     assert_eq!(cfg.backup.source_block_size_mb, 32);
     assert_eq!(cfg.backup.max_versions, DEFAULT_MAX_VERSIONS);
     assert_eq!(cfg.storage.disk_reserve_gb, DEFAULT_DISK_RESERVE_BYTES as f64 / 1_073_741_824.0);
-    assert_eq!(cfg.escrow.trust_factor, DEFAULT_ESCROW_TRUST_FACTOR);
+    assert_eq!(cfg.escrow.k_factor, DEFAULT_ESCROW_K_FACTOR);
     assert_eq!(cfg.cluster.sync_batch_size, 100);
 }
 
@@ -66,8 +65,7 @@ fn config_roundtrips_all_fields() {
             data_dir: "/data/syncback".to_string(),
         },
         escrow: EscrowCfg {
-            free_tier_gb: 2.0,
-            trust_factor: 30.0,
+            k_factor: 14.0,
         },
         network: NetworkCfg {
             relay_max_entries: 1000,
@@ -94,8 +92,7 @@ fn config_roundtrips_all_fields() {
     assert_eq!(loaded.storage.hard_quota_gb, 10.0);
     assert_eq!(loaded.storage.disk_reserve_gb, 50.0);
     assert_eq!(loaded.storage.data_dir, "/data/syncback");
-    assert_eq!(loaded.escrow.free_tier_gb, 2.0);
-    assert_eq!(loaded.escrow.trust_factor, 30.0);
+    assert_eq!(loaded.escrow.k_factor, 14.0);
     assert_eq!(loaded.network.relay_max_entries, 1000);
     assert_eq!(loaded.network.relay_max_size_mb, 4);
     assert_eq!(loaded.network.relay_ttl_days, 14);
@@ -215,6 +212,29 @@ fn config_validate_rejects_cluster_sync_batch_size_zero() {
 }
 
 #[test]
+fn config_validate_rejects_escrow_k_factor_zero() {
+    let mut cfg = AppConfig::default();
+    cfg.escrow.k_factor = 0.0;
+    let err = cfg.validate().unwrap_err();
+    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "escrow.k_factor"));
+}
+
+#[test]
+fn config_validate_rejects_escrow_k_factor_negative() {
+    let mut cfg = AppConfig::default();
+    cfg.escrow.k_factor = -1.0;
+    let err = cfg.validate().unwrap_err();
+    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "escrow.k_factor"));
+}
+
+#[test]
+fn config_validate_accepts_positive_k_factor() {
+    let mut cfg = AppConfig::default();
+    cfg.escrow.k_factor = 14.0;
+    cfg.validate().unwrap();
+}
+
+#[test]
 fn config_load_returns_parse_error_for_invalid_toml() {
     let f = write_toml("not valid toml ][[ garbage");
     let err = AppConfig::load(f.path()).unwrap_err();
@@ -293,8 +313,7 @@ fn config_defaults_match_constants() {
         cfg.storage.disk_reserve_gb,
         DEFAULT_DISK_RESERVE_BYTES as f64 / 1_073_741_824.0
     );
-    assert_eq!(cfg.escrow.free_tier_gb, FREE_TIER_GB);
-    assert_eq!(cfg.escrow.trust_factor, DEFAULT_ESCROW_TRUST_FACTOR);
+    assert_eq!(cfg.escrow.k_factor, DEFAULT_ESCROW_K_FACTOR);
     assert_eq!(cfg.network.relay_max_entries, MAX_BOARD_ENTRIES);
     assert_eq!(cfg.network.relay_max_size_mb, MAX_BOARD_SIZE_BYTES / 1_048_576);
 }

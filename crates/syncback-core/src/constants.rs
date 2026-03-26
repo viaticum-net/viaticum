@@ -28,14 +28,18 @@ pub const S_CLAMP_MIN: f64 = 0.1;
 /// S ceiling.
 pub const S_CLAMP_MAX: f64 = 1.0;
 
-// === Escrow (trust-based) ===
+// === Escrow (contribution-based) ===
 
-/// Demo credit — first 1 GB restorable at trust=0.
+/// Days of storage contribution required to earn 1 GB of restore credit.
+/// Formula: restore_budget_gb = stored_gb_days / k_factor.
+/// Default K=7: store 1 GB for 7 days → earn 1 GB restore budget.
+pub const DEFAULT_ESCROW_K_FACTOR: f64 = 7.0;
+
+// === Budget floor (owner-side) ===
+
+/// Owner-side budget floor: minimum GB offered even with zero committed storage.
+/// Used by budget planner (not escrow). Ensures new nodes can start backing up.
 pub const FREE_TIER_GB: f64 = 1.0;
-
-/// GB per unit of trust. To be calibrated via simulation.
-/// Default: trust=2.0 → budget = 1 + 2.0 × 20.0 = 41 GB.
-pub const DEFAULT_ESCROW_TRUST_FACTOR: f64 = 20.0;
 
 // === Cooldown (ransomware protection) ===
 
@@ -235,6 +239,11 @@ pub const BINOMIAL_EXACT_THRESHOLD: u32 = 100;
 
 /// Seconds before retrying a failed peer connection.
 pub const RECONNECT_BACKOFF_SECS: u64 = 30;
+
+// === Holdings integrity scan ===
+
+/// Default holdings integrity scan interval in seconds (1 day).
+pub const DEFAULT_HOLDINGS_INTEGRITY_INTERVAL_SECS: u64 = 86_400;
 
 // === Compile-time sanity checks ===
 

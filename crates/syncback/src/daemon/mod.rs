@@ -4,6 +4,7 @@ pub mod cluster_sync;
 pub mod dr;
 pub mod handle;
 pub mod holder_cleanup;
+pub mod holdings_integrity;
 pub mod identity;
 pub mod metrics;
 pub mod network;

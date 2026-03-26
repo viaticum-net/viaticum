@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::constants::{
-    DEFAULT_CLUSTER_SYNC_BATCH_SIZE, DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_TRUST_FACTOR,
-    DEFAULT_MAX_VERSIONS, DEFAULT_MAX_VERSION_AGE_SECS, DEFAULT_SOURCE_BLOCK_SIZE, FREE_TIER_GB,
+    DEFAULT_CLUSTER_SYNC_BATCH_SIZE, DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_K_FACTOR,
+    DEFAULT_MAX_VERSIONS, DEFAULT_MAX_VERSION_AGE_SECS, DEFAULT_SOURCE_BLOCK_SIZE,
     MAX_BOARD_ENTRIES, MAX_BOARD_SIZE_BYTES, RELAY_TTL_SECS,
 };
 
@@ -93,24 +93,20 @@ impl Default for StorageCfg {
     }
 }
 
-/// [escrow] — trust-based restore credit.
+/// [escrow] — contribution-based restore budget.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct EscrowCfg {
-    /// Demo credit available at trust=0 (GB). Default: 1.0.
-    pub free_tier_gb: f64,
-
-    /// GB of restore credit per unit of trust.
-    /// max_restorable_gb = free_tier_gb + trust * trust_factor.
-    /// Default: 20.0.
-    pub trust_factor: f64,
+    /// Days of storage contribution required to earn 1 GB of restore credit.
+    /// Formula: restore_budget_gb = stored_gb_days / k_factor.
+    /// Default: 7.0 (store 1 GB for 7 days → earn 1 GB restore budget).
+    pub k_factor: f64,
 }
 
 impl Default for EscrowCfg {
     fn default() -> Self {
         Self {
-            free_tier_gb: FREE_TIER_GB,
-            trust_factor: DEFAULT_ESCROW_TRUST_FACTOR,
+            k_factor: DEFAULT_ESCROW_K_FACTOR,
         }
     }
 }
@@ -328,16 +324,10 @@ impl AppConfig {
                 reason: "hard floor cannot exceed soft ceiling".to_string(),
             });
         }
-        if e.free_tier_gb < 0.0 {
+        if e.k_factor <= 0.0 {
             return Err(ConfigError::Validation {
-                field: "escrow.free_tier_gb".to_string(),
-                reason: "must be >= 0.0".to_string(),
-            });
-        }
-        if e.trust_factor < 0.0 {
-            return Err(ConfigError::Validation {
-                field: "escrow.trust_factor".to_string(),
-                reason: "must be >= 0.0".to_string(),
+                field: "escrow.k_factor".to_string(),
+                reason: "must be > 0.0".to_string(),
             });
         }
         if n.relay_max_entries < 1 {

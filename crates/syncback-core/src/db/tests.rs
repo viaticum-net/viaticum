@@ -1227,3 +1227,170 @@ fn max_esi_for_block_multiple_ranges_in_one_placement() {
     let hwm = db.max_esi_for_block(&bid).unwrap();
     assert_eq!(hwm, 520, "expected high-watermark = 520 (500+20)");
 }
+
+// ============================================================
+// Restore served table tests
+// ============================================================
+
+fn make_holding_with_bytes(
+    block_seed: u8,
+    owner: IdentityPub,
+    status: HoldingStatus,
+    total_bytes: u64,
+    received_at: Timestamp,
+) -> HoldingRecord {
+    HoldingRecord {
+        source_block_id: block_id(block_seed),
+        owner_id: owner,
+        esi_ranges: vec![(0, 10)],
+        importance: 0.5,
+        total_bytes,
+        status,
+        received_at,
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    }
+}
+
+#[test]
+fn stored_for_peer_gb_days_empty_returns_zero() {
+    let db = test_db();
+    let owner = IdentityPub([0xAAu8; 32]);
+    let result = db.stored_for_peer_gb_days(&owner, Timestamp(1_000_000)).unwrap();
+    assert_eq!(result, 0.0);
+}
+
+#[test]
+fn stored_for_peer_gb_days_sums_active_only() {
+    // AC-6: 1 Active (5 GB, 10 days) + 1 MarkedForDelete (10 GB, 10 days) → 50.0 GB·days
+    let db = test_db();
+    let owner = IdentityPub([0xBBu8; 32]);
+
+    let ten_days_secs = 10 * 86_400u64;
+    let received_at = Timestamp(0);
+    let now = Timestamp(ten_days_secs);
+
+    let five_gb = 5 * 1_073_741_824u64;
+    let ten_gb = 10 * 1_073_741_824u64;
+
+    let active = make_holding_with_bytes(0x01, owner, HoldingStatus::Active, five_gb, received_at);
+    let marked = make_holding_with_bytes(
+        0x02,
+        owner,
+        HoldingStatus::MarkedForDelete,
+        ten_gb,
+        received_at,
+    );
+    db.upsert_holding(&active).unwrap();
+    db.upsert_holding(&marked).unwrap();
+
+    let result = db.stored_for_peer_gb_days(&owner, now).unwrap();
+    // 5 GB * 10 days = 50 GB·days (MarkedForDelete excluded)
+    let expected = 50.0_f64;
+    assert!(
+        (result - expected).abs() < 0.001,
+        "expected ~50 GB·days, got {result}"
+    );
+}
+
+#[test]
+fn stored_for_peer_gb_days_multiple_holdings() {
+    // 2 Active: (10 GB, 7 days) + (20 GB, 14 days) → 70 + 280 = 350.0 GB·days
+    let db = test_db();
+    let owner = IdentityPub([0xCCu8; 32]);
+
+    let seven_days = 7 * 86_400u64;
+    let fourteen_days = 14 * 86_400u64;
+
+    let ten_gb = 10 * 1_073_741_824u64;
+    let twenty_gb = 20 * 1_073_741_824u64;
+
+    // First holding: received at t=0, now at 7 days → 7 day age
+    let h1 =
+        make_holding_with_bytes(0x01, owner, HoldingStatus::Active, ten_gb, Timestamp(0));
+    // Second holding: received at t=0, now at 14 days → 14 day age
+    let h2 =
+        make_holding_with_bytes(0x02, owner, HoldingStatus::Active, twenty_gb, Timestamp(0));
+    db.upsert_holding(&h1).unwrap();
+    db.upsert_holding(&h2).unwrap();
+
+    // Use now = 14 days for h2 and 7 days for h1 is impossible with one `now`.
+    // Use separate calls to test incrementally: test at now=7days then now=14days.
+    let result_7d = db
+        .stored_for_peer_gb_days(&owner, Timestamp(seven_days))
+        .unwrap();
+    // Both holdings: 10*7 + 20*7 = 70 + 140 = 210
+    assert!(
+        (result_7d - 210.0).abs() < 0.01,
+        "at 7 days expected 210 GB·days, got {result_7d}"
+    );
+
+    let result_14d = db
+        .stored_for_peer_gb_days(&owner, Timestamp(fourteen_days))
+        .unwrap();
+    // 10*14 + 20*14 = 140 + 280 = 420
+    assert!(
+        (result_14d - 420.0).abs() < 0.01,
+        "at 14 days expected 420 GB·days, got {result_14d}"
+    );
+}
+
+#[test]
+fn stored_for_peer_gb_days_zero_age_returns_zero() {
+    // received_at == now → age=0 → 0.0 GB·days
+    let db = test_db();
+    let owner = IdentityPub([0xDDu8; 32]);
+    let ts = Timestamp(1_000_000);
+    let one_gb = 1_073_741_824u64;
+    let h = make_holding_with_bytes(0x01, owner, HoldingStatus::Active, one_gb, ts);
+    db.upsert_holding(&h).unwrap();
+
+    let result = db.stored_for_peer_gb_days(&owner, ts).unwrap();
+    assert_eq!(result, 0.0);
+}
+
+#[test]
+fn restored_total_bytes_returns_zero_for_unknown_peer() {
+    let db = test_db();
+    let owner = IdentityPub([0xEEu8; 32]);
+    let result = db.restored_total_bytes(&owner).unwrap();
+    assert_eq!(result, 0);
+}
+
+#[test]
+fn record_restore_served_increments_counter() {
+    let db = test_db();
+    let owner = IdentityPub([0xFFu8; 32]);
+
+    db.record_restore_served(&owner, 1_000_000).unwrap();
+    let result = db.restored_total_bytes(&owner).unwrap();
+    assert_eq!(result, 1_000_000);
+}
+
+#[test]
+fn record_restore_served_accumulates_multiple_calls() {
+    // Add 1 GB, 2 GB, 3 GB → total = 6 GB
+    let db = test_db();
+    let owner = IdentityPub([0x11u8; 32]);
+    let one_gb = 1_073_741_824u64;
+
+    db.record_restore_served(&owner, one_gb).unwrap();
+    db.record_restore_served(&owner, 2 * one_gb).unwrap();
+    db.record_restore_served(&owner, 3 * one_gb).unwrap();
+
+    let result = db.restored_total_bytes(&owner).unwrap();
+    assert_eq!(result, 6 * one_gb);
+}
+
+#[test]
+fn record_restore_served_saturates_at_u64_max() {
+    // Start near u64::MAX, add more → no overflow panic (saturating_add)
+    let db = test_db();
+    let owner = IdentityPub([0x22u8; 32]);
+
+    db.record_restore_served(&owner, u64::MAX - 10).unwrap();
+    db.record_restore_served(&owner, 100).unwrap();
+
+    let result = db.restored_total_bytes(&owner).unwrap();
+    assert_eq!(result, u64::MAX, "saturating_add should cap at u64::MAX");
+}

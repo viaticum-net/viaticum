@@ -457,6 +457,7 @@ impl DaemonHandle {
                 pending_challenges.clone(),
                 relay_post_tx.clone(),
                 Some(cs.clone()),
+                app_config.escrow.clone(),
             );
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {
@@ -650,6 +651,27 @@ impl DaemonHandle {
                     time_scale,
                     cleanup_cancel,
                 ).await
+            }));
+        }
+
+        // ── Holdings integrity scan task ───────────────────────────────────
+        {
+            let integrity_db = db.clone();
+            let integrity_holdings = holdings_dir.clone();
+            let integrity_relay = relay_post_tx.clone();
+            let integrity_cancel = cancel.clone();
+            let integrity_interval = syncback_core::constants::DEFAULT_HOLDINGS_INTEGRITY_INTERVAL_SECS;
+            tasks.push(tokio::spawn(async move {
+                crate::daemon::holdings_integrity::run(
+                    integrity_db,
+                    integrity_holdings,
+                    integrity_relay,
+                    identity_pub,
+                    integrity_interval,
+                    time_scale,
+                    integrity_cancel,
+                )
+                .await
             }));
         }
 

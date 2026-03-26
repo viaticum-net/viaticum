@@ -8,7 +8,7 @@ use syncback_core::{
         issue_revocation, master_identity, next_epoch, verify_device_certificate, verify_revocation,
         EpochCounter,
     },
-    constants::DEFAULT_ESCROW_TRUST_FACTOR,
+    constants::DEFAULT_ESCROW_K_FACTOR,
     db::testutil::test_db,
     erasure::{ErasureEncoder, RaptorQEncoder},
     escrow::{check_restore, RestoreDecision},
@@ -378,49 +378,47 @@ fn budget_selects_files_within_capacity() {
     );
 }
 
-// ─── 8. escrow_tier_progression ─────────────────────────────────────────────
+// ─── 8. escrow_contribution_progression ─────────────────────────────────────
 
 #[test]
-fn escrow_trust_progression() {
-    let factor = DEFAULT_ESCROW_TRUST_FACTOR;
+fn escrow_contribution_progression() {
+    let k = DEFAULT_ESCROW_K_FACTOR; // 7.0
 
-    // trust=0.0, restore=0.5 GB → within free tier → Allowed.
-    assert_eq!(
-        check_restore(0.0, 0.5, factor),
-        RestoreDecision::Allowed,
-        "free tier: trust=0, restore=0.5 GB"
-    );
-
-    // trust=0.0, restore=1.5 GB → exceeds budget (1.0 GB) → Denied.
-    match check_restore(0.0, 1.5, factor) {
+    // No contribution → budget=0 → any restore denied.
+    match check_restore(0.0, 0.0, 0.5, k) {
         RestoreDecision::Denied(d) => {
-            assert!((d.current_trust - 0.0).abs() < f64::EPSILON);
-            assert!(d.restore_budget_gb <= 1.5, "budget must be less than request");
+            assert_eq!(d.restore_budget_gb, 0.0);
         }
-        RestoreDecision::Allowed => panic!("expected denial for hit-and-run node"),
+        RestoreDecision::Allowed => panic!("expected denial for zero contribution"),
     }
 
-    // trust=2.0, restore=40.0 GB → within budget (41 GB) → Allowed.
+    // 7 GB·days stored, k=7 → budget=1 GB. Request 0.5 GB → Allowed.
     assert_eq!(
-        check_restore(2.0, 40.0, factor),
+        check_restore(7.0, 0.0, 0.5, k),
         RestoreDecision::Allowed,
-        "honest user: trust=2.0, restore=40 GB"
+        "1 GB budget: 0.5 GB request allowed"
     );
 
-    // trust=2.0, restore=42.0 GB → exceeds budget (41 GB) → Denied.
-    match check_restore(2.0, 42.0, factor) {
+    // 140 GB·days stored, k=7 → budget=20 GB. Request 15 GB → Allowed.
+    assert_eq!(
+        check_restore(140.0, 0.0, 15.0, k),
+        RestoreDecision::Allowed,
+        "20 GB budget: 15 GB request allowed"
+    );
+
+    // 140 GB·days stored, already_restored=20 GB → remaining=0. Request 1 GB → Denied.
+    match check_restore(140.0, 20.0, 1.0, k) {
         RestoreDecision::Denied(d) => {
-            assert!((d.current_trust - 2.0).abs() < f64::EPSILON);
-            assert!(d.restore_budget_gb < 42.0);
+            assert!((d.restore_budget_gb - 20.0).abs() < f64::EPSILON);
         }
-        RestoreDecision::Allowed => panic!("expected denial for large restore with trust=2"),
+        RestoreDecision::Allowed => panic!("expected denial when budget exhausted"),
     }
 
-    // trust=5.0, restore=100.0 GB → within budget (101 GB) → Allowed.
+    // 350 GB·days stored, k=7 → budget=50 GB. Request 49 GB → Allowed.
     assert_eq!(
-        check_restore(5.0, 100.0, factor),
+        check_restore(350.0, 0.0, 49.0, k),
         RestoreDecision::Allowed,
-        "high trust: trust=5.0, restore=100 GB"
+        "50 GB budget: 49 GB request allowed"
     );
 }
 
