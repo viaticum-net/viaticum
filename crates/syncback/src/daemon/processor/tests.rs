@@ -16,6 +16,7 @@
 //   handle_peer_announce            — upserts PeerRecord in DB + network.add_peer (Phase 7.10)
 //   dispatch_relay                  — PeerAnnounce via relay
 //   build_peer_announce             — NetworkHandle helper builds a signed message (Phase 7.10)
+//   handle_revocation_broadcast     — verifies certs and marks device key revoked in PeerRecord
 
 use std::sync::{Arc, Mutex};
 
@@ -2449,4 +2450,281 @@ async fn cluster_device_not_added_when_no_cert() {
         1,
         "cluster_state must remain unchanged with no cert"
     );
+}
+
+// ─── handle_revocation_broadcast tests ───────────────────────────────────────
+
+// revocation_broadcast_marks_device_key_revoked
+//
+// Given: Known peer in DB. Valid RevocationBroadcast from that peer.
+// When: handle_revocation_broadcast called.
+// Then: PeerRecord.revoked_device_pub_keys contains the device's pub key.
+
+#[tokio::test]
+async fn revocation_broadcast_marks_device_key_revoked() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+
+    let (processor, _repair_rx, _sync_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    // Build peer master key and identity.
+    let peer_master_key = derive_master_key(&[0x55u8; 64]).expect("derive_master_key");
+    let peer_identity = master_identity(&peer_master_key);
+
+    // Device being revoked.
+    let device_id = DeviceId([0xDDu8; 16]);
+    let device_pub_key = [0xEEu8; 32];
+    let now = Timestamp::now();
+
+    // Insert a known PeerRecord for this peer.
+    let peer_record = make_peer_record(peer_identity);
+    db.upsert_peer(&peer_record).expect("upsert_peer");
+
+    // Build a valid RevocationBroadcast.
+    let device_cert = syncback_core::cluster::issue_device_certificate(
+        &peer_master_key,
+        device_id,
+        device_pub_key,
+        now,
+    );
+    let new_epoch = syncback_core::cluster::EpochCounter(1);
+    let revocation =
+        syncback_core::cluster::issue_revocation(&peer_master_key, device_id, now, new_epoch);
+    let broadcast = syncback_core::messages::RevocationBroadcast {
+        revocation,
+        device_cert,
+    };
+
+    processor
+        .handle_revocation_broadcast(peer_identity, broadcast)
+        .await
+        .expect("handle_revocation_broadcast must succeed");
+
+    let updated = db.get_peer(&peer_identity).expect("get_peer").expect("peer must exist");
+    assert!(
+        updated.revoked_device_pub_keys.contains(&device_pub_key),
+        "device pub key must be in revoked list"
+    );
+}
+
+// revocation_broadcast_idempotent_on_duplicate
+//
+// Given: Peer already has device_pub_key in revoked list.
+// When: Same RevocationBroadcast received again.
+// Then: Succeeds without duplicating the entry.
+
+#[tokio::test]
+async fn revocation_broadcast_idempotent_on_duplicate() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+
+    let (processor, _repair_rx, _sync_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let peer_master_key = derive_master_key(&[0x66u8; 64]).expect("derive_master_key");
+    let peer_identity = master_identity(&peer_master_key);
+    let device_id = DeviceId([0xAAu8; 16]);
+    let device_pub_key = [0xBBu8; 32];
+    let now = Timestamp::now();
+
+    // Insert peer with the key already in the revoked list.
+    let mut peer_record = make_peer_record(peer_identity);
+    peer_record.revoked_device_pub_keys.push(device_pub_key);
+    db.upsert_peer(&peer_record).expect("upsert_peer");
+
+    let device_cert = syncback_core::cluster::issue_device_certificate(
+        &peer_master_key,
+        device_id,
+        device_pub_key,
+        now,
+    );
+    let revocation = syncback_core::cluster::issue_revocation(
+        &peer_master_key,
+        device_id,
+        now,
+        syncback_core::cluster::EpochCounter(1),
+    );
+    let broadcast = syncback_core::messages::RevocationBroadcast {
+        revocation,
+        device_cert,
+    };
+
+    processor
+        .handle_revocation_broadcast(peer_identity, broadcast)
+        .await
+        .expect("duplicate broadcast must not error");
+
+    let updated = db.get_peer(&peer_identity).expect("get_peer").expect("peer must exist");
+    assert_eq!(
+        updated.revoked_device_pub_keys.iter().filter(|&&k| k == device_pub_key).count(),
+        1,
+        "revoked key must appear exactly once"
+    );
+}
+
+// revocation_broadcast_invalid_device_cert_rejected
+//
+// Given: RevocationBroadcast with a DeviceCertificate signed by a different master key.
+// When: handle_revocation_broadcast called with the real peer identity.
+// Then: Succeeds (no error), but PeerRecord is NOT updated.
+
+#[tokio::test]
+async fn revocation_broadcast_invalid_device_cert_rejected() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+
+    let (processor, _repair_rx, _sync_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let peer_master_key = derive_master_key(&[0x77u8; 64]).expect("derive_master_key");
+    let peer_identity = master_identity(&peer_master_key);
+
+    // Different key that signed the cert — attacker trying to forge.
+    let attacker_key = derive_master_key(&[0x88u8; 64]).expect("derive_master_key");
+
+    let device_id = DeviceId([0xCCu8; 16]);
+    let device_pub_key = [0xFFu8; 32];
+    let now = Timestamp::now();
+
+    let peer_record = make_peer_record(peer_identity);
+    db.upsert_peer(&peer_record).expect("upsert_peer");
+
+    // DeviceCertificate signed by attacker, but from = real peer identity.
+    let bad_cert = syncback_core::cluster::issue_device_certificate(
+        &attacker_key,
+        device_id,
+        device_pub_key,
+        now,
+    );
+    let revocation = syncback_core::cluster::issue_revocation(
+        &peer_master_key,
+        device_id,
+        now,
+        syncback_core::cluster::EpochCounter(1),
+    );
+    let broadcast = syncback_core::messages::RevocationBroadcast {
+        revocation,
+        device_cert: bad_cert,
+    };
+
+    // Must not error, but must silently ignore the forged broadcast.
+    processor
+        .handle_revocation_broadcast(peer_identity, broadcast)
+        .await
+        .expect("invalid cert must not propagate error");
+
+    let updated = db.get_peer(&peer_identity).expect("get_peer").expect("peer must exist");
+    assert!(
+        updated.revoked_device_pub_keys.is_empty(),
+        "forged broadcast must not update revoked list"
+    );
+}
+
+// revocation_broadcast_device_id_mismatch_rejected
+//
+// Given: RevocationBroadcast where device_cert.device_id != revocation.device_id.
+// When: handle_revocation_broadcast called.
+// Then: Succeeds (no error), PeerRecord is NOT updated.
+
+#[tokio::test]
+async fn revocation_broadcast_device_id_mismatch_rejected() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+
+    let (processor, _repair_rx, _sync_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let peer_master_key = derive_master_key(&[0x99u8; 64]).expect("derive_master_key");
+    let peer_identity = master_identity(&peer_master_key);
+    let now = Timestamp::now();
+
+    let device_id_a = DeviceId([0x01u8; 16]);
+    let device_id_b = DeviceId([0x02u8; 16]);
+    let device_pub_key = [0x03u8; 32];
+
+    let peer_record = make_peer_record(peer_identity);
+    db.upsert_peer(&peer_record).expect("upsert_peer");
+
+    // Cert for device_id_a, revocation for device_id_b — mismatch.
+    let device_cert = syncback_core::cluster::issue_device_certificate(
+        &peer_master_key,
+        device_id_a,
+        device_pub_key,
+        now,
+    );
+    let revocation = syncback_core::cluster::issue_revocation(
+        &peer_master_key,
+        device_id_b,
+        now,
+        syncback_core::cluster::EpochCounter(1),
+    );
+    let broadcast = syncback_core::messages::RevocationBroadcast {
+        revocation,
+        device_cert,
+    };
+
+    processor
+        .handle_revocation_broadcast(peer_identity, broadcast)
+        .await
+        .expect("device_id mismatch must not propagate error");
+
+    let updated = db.get_peer(&peer_identity).expect("get_peer").expect("peer must exist");
+    assert!(
+        updated.revoked_device_pub_keys.is_empty(),
+        "mismatched device_id broadcast must not update revoked list"
+    );
+}
+
+// revocation_broadcast_unknown_peer_ignored
+//
+// Given: No PeerRecord in DB for the broadcaster.
+// When: handle_revocation_broadcast called with valid certs.
+// Then: Succeeds (no error), no new PeerRecord created.
+
+#[tokio::test]
+async fn revocation_broadcast_unknown_peer_ignored() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+
+    let (processor, _repair_rx, _sync_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let peer_master_key = derive_master_key(&[0xAAu8; 64]).expect("derive_master_key");
+    let peer_identity = master_identity(&peer_master_key);
+    let device_id = DeviceId([0x10u8; 16]);
+    let device_pub_key = [0x11u8; 32];
+    let now = Timestamp::now();
+
+    // No upsert_peer — peer is unknown.
+    let device_cert = syncback_core::cluster::issue_device_certificate(
+        &peer_master_key,
+        device_id,
+        device_pub_key,
+        now,
+    );
+    let revocation = syncback_core::cluster::issue_revocation(
+        &peer_master_key,
+        device_id,
+        now,
+        syncback_core::cluster::EpochCounter(1),
+    );
+    let broadcast = syncback_core::messages::RevocationBroadcast {
+        revocation,
+        device_cert,
+    };
+
+    processor
+        .handle_revocation_broadcast(peer_identity, broadcast)
+        .await
+        .expect("unknown peer broadcast must not error");
+
+    // Must not create a phantom PeerRecord.
+    let record = db.get_peer(&peer_identity).expect("get_peer");
+    assert!(record.is_none(), "no PeerRecord must be created for unknown peer");
 }

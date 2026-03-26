@@ -673,6 +673,63 @@ fn upsert_placement_updates_alive_count_on_status_change() {
 }
 
 // ============================================================
+// Extra: Uncertain counts as alive in hot cache (matches cli_server)
+// ============================================================
+
+#[test]
+fn uncertain_placement_counts_as_alive_in_block_agg() {
+    let db = test_db();
+    let holder = test_peer();
+    let fid = FileId(77);
+    let bid = block_id(9);
+
+    // Uncertain = 1 missed PoS; symbols are likely still held.
+    let p = make_placement(9, holder, fid, PlacementStatus::Uncertain, 80);
+    db.upsert_placement(&p).unwrap();
+
+    let hot = db.hot();
+    let alive = hot.blocks.get(&bid).map(|a| a.total_alive_symbols).unwrap_or(0);
+    assert_eq!(alive, 80, "Uncertain must contribute to total_alive_symbols");
+}
+
+#[test]
+fn uncertain_to_lost_removes_alive_count() {
+    let db = test_db();
+    let holder = test_peer();
+    let fid = FileId(78);
+    let bid = block_id(15);
+
+    // Start as Uncertain — counts as alive.
+    let p1 = make_placement(15, holder, fid, PlacementStatus::Uncertain, 60);
+    db.upsert_placement(&p1).unwrap();
+    assert_eq!(db.hot().blocks.get(&bid).unwrap().total_alive_symbols, 60);
+
+    // Transition to Lost — should drop to 0.
+    let p2 = make_placement(15, holder, fid, PlacementStatus::Lost, 60);
+    db.upsert_placement(&p2).unwrap();
+    assert_eq!(db.hot().blocks.get(&bid).map(|a| a.total_alive_symbols).unwrap_or(0), 0);
+}
+
+#[test]
+fn uncertain_in_rebuilt_hot_cache() {
+    let tmpfile = tempfile::NamedTempFile::new().unwrap();
+    let tmp_path = tmpfile.into_temp_path();
+    let holder = test_peer();
+    let fid = FileId(79);
+
+    {
+        let db = crate::db::Db::open(&tmp_path).unwrap();
+        let p = make_placement(16, holder, fid, PlacementStatus::Uncertain, 120);
+        db.upsert_placement(&p).unwrap();
+    }
+
+    // Rebuild from disk — Uncertain must still count as alive.
+    let db2 = crate::db::Db::open(&tmp_path).unwrap();
+    let agg = db2.hot().blocks.get(&block_id(16)).cloned();
+    assert_eq!(agg.map(|a| a.total_alive_symbols).unwrap_or(0), 120);
+}
+
+// ============================================================
 // Extra: list_placements_for_holder
 // ============================================================
 

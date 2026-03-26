@@ -45,8 +45,8 @@ use syncback_core::messages::{
     BoardSyncMsg, CancelDeleteMsg, ClusterSyncRequestMsg, ClusterSyncResponseMsg, DeleteMsg,
     DiscoveredPeer, Message, PeerAnnounceMsg, PeerDiscoveryRequestMsg, PeerDiscoveryResponseMsg,
     PosChallengeMsg, PosNackMsg, PosResponseMsg, RejectReason, RestoreDeniedMsg, RestoreRequestMsg,
-    RestoreResponseMsg, SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolDroppedMsg, SymbolOfferMsg,
-    SymbolRejectMsg, SymbolTransferMsg, SystemStateAckMsg, SystemStateBackupMsg,
+    RestoreResponseMsg, RevocationBroadcast, SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolDroppedMsg,
+    SymbolOfferMsg, SymbolRejectMsg, SymbolTransferMsg, SystemStateAckMsg, SystemStateBackupMsg,
     SystemStateRequestMsg, SystemStateResponseMsg,
 };
 use syncback_core::pos::{
@@ -542,6 +542,16 @@ impl Processor {
                         self.handle_symbol_drop_notice(msg.from, notice);
                     }
                     Err(e) => warn!(err = %e, "processor: failed to decode SymbolDropNoticeMsg from relay"),
+                }
+            }
+            "revocation_broadcast" => {
+                match from_cbor::<RevocationBroadcast>(&msg.payload) {
+                    Ok(broadcast) => {
+                        if let Err(e) = self.handle_revocation_broadcast(msg.from, broadcast).await {
+                            warn!(err = %e, "processor: RevocationBroadcast via relay failed");
+                        }
+                    }
+                    Err(e) => warn!(err = %e, "processor: failed to decode RevocationBroadcast from relay"),
                 }
             }
             other => {
@@ -1626,6 +1636,87 @@ impl Processor {
                 );
             }
         }
+
+        Ok(())
+    }
+
+    // =========================================================
+    // RevocationBroadcast: mark peer device key as revoked
+    // =========================================================
+
+    /// Receive a RevocationBroadcast from the relay board.
+    ///
+    /// Verifies both the DeviceCertificate and RevocationCertificate signatures
+    /// against the broadcaster's master identity (msg.from). If valid, adds the
+    /// device pub key to `PeerRecord.revoked_device_pub_keys` for that peer.
+    ///
+    /// Peers we have no record of are ignored — we only track revocations for
+    /// known peers. This avoids creating phantom PeerRecords from forged broadcasts.
+    async fn handle_revocation_broadcast(
+        &self,
+        from: IdentityPub,
+        broadcast: RevocationBroadcast,
+    ) -> Result<(), ProcessorError> {
+        // Verify DeviceCertificate: signed by the peer's master key.
+        if let Err(e) =
+            syncback_core::cluster::verify_device_certificate(&broadcast.device_cert, &from)
+        {
+            warn!(
+                peer = %from,
+                err = %e,
+                "processor: RevocationBroadcast — invalid DeviceCertificate, ignoring"
+            );
+            return Ok(());
+        }
+
+        // Verify RevocationCertificate: signed by the peer's master key.
+        if let Err(e) = syncback_core::cluster::verify_revocation(&broadcast.revocation, &from) {
+            warn!(
+                peer = %from,
+                err = %e,
+                "processor: RevocationBroadcast — invalid RevocationCertificate, ignoring"
+            );
+            return Ok(());
+        }
+
+        // Cross-check: both certs must refer to the same device_id.
+        if broadcast.revocation.device_id != broadcast.device_cert.device_id {
+            warn!(
+                peer = %from,
+                revocation_device = ?broadcast.revocation.device_id,
+                cert_device = ?broadcast.device_cert.device_id,
+                "processor: RevocationBroadcast — device_id mismatch, ignoring"
+            );
+            return Ok(());
+        }
+
+        let revoked_pub = broadcast.device_cert.device_pub_key;
+
+        // Only update PeerRecords we already know about. Unknown peers are skipped.
+        let mut record = match self.db.get_peer(&from)? {
+            Some(r) => r,
+            None => {
+                debug!(
+                    peer = %from,
+                    "processor: RevocationBroadcast from unknown peer, ignoring"
+                );
+                return Ok(());
+            }
+        };
+
+        if record.revoked_device_pub_keys.contains(&revoked_pub) {
+            debug!(peer = %from, "processor: RevocationBroadcast device already in revoked list");
+            return Ok(());
+        }
+
+        record.revoked_device_pub_keys.push(revoked_pub);
+        self.db.upsert_peer(&record)?;
+
+        info!(
+            peer = %from,
+            device_id = ?broadcast.revocation.device_id,
+            "processor: RevocationBroadcast applied — device key marked revoked"
+        );
 
         Ok(())
     }

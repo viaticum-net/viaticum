@@ -166,8 +166,10 @@ impl HotCache {
                     last_pos: placement.last_verified,
                 },
             );
-            // Accumulate alive symbols per block
-            if placement.status == PlacementStatus::Alive {
+            // Accumulate alive symbols per block.
+            // Uncertain = 1 missed PoS (peer may be on vacation); symbols are
+            // likely still held, so count it as alive — matching cli_server behaviour.
+            if matches!(placement.status, PlacementStatus::Alive | PlacementStatus::Uncertain) {
                 let agg = cache
                     .blocks
                     .entry(placement.source_block_id)
@@ -525,16 +527,20 @@ impl Db {
             let mut hot = self.hot.write().expect("hot cache lock poisoned");
 
             // Adjust block aggregate: remove old alive contribution, add new.
+            // Alive | Uncertain both count — matches cli_server and protocol intent.
             let old_alive = old
                 .as_ref()
-                .filter(|o| o.status == PlacementStatus::Alive)
+                .filter(|o| {
+                    matches!(o.status, PlacementStatus::Alive | PlacementStatus::Uncertain)
+                })
                 .map(|o| o.symbol_count())
                 .unwrap_or(0);
-            let new_alive = if record.status == PlacementStatus::Alive {
-                count
-            } else {
-                0
-            };
+            let new_alive =
+                if matches!(record.status, PlacementStatus::Alive | PlacementStatus::Uncertain) {
+                    count
+                } else {
+                    0
+                };
 
             let block_agg = hot
                 .blocks
@@ -605,7 +611,10 @@ impl Db {
                 let mut hot = self.hot.write().expect("hot cache lock poisoned");
                 hot.placements.remove(&(*block_id, *holder_id));
 
-                if old_record.status == PlacementStatus::Alive {
+                if matches!(
+                    old_record.status,
+                    PlacementStatus::Alive | PlacementStatus::Uncertain
+                ) {
                     let count = old_record.symbol_count();
                     if let Some(agg) = hot.blocks.get_mut(block_id) {
                         agg.total_alive_symbols = agg.total_alive_symbols.saturating_sub(count);
