@@ -1004,3 +1004,153 @@ async fn two_nodes_hkdf_master_key_handshake() {
     handle_a.shutdown().await;
     handle_b.shutdown().await;
 }
+
+// ─── C3: cluster_peers tests ──────────────────────────────────────────────────
+
+// cluster_peer_add_and_retrieve
+//
+// Given: NetworkHandle with no cluster peers.
+// When: add_cluster_peer(device_id_A, addr_A) called.
+// Then: cluster_peers() returns a vec containing (device_id_A, addr_A).
+
+#[tokio::test]
+async fn cluster_peer_add_and_retrieve() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let handle = NetworkHandle::start(make_config_with_cert(50), tx)
+        .await
+        .expect("start");
+
+    let device_id = DeviceId([0xAAu8; 16]);
+    let addr = handle.local_addr().expect("local_addr");
+
+    handle.add_cluster_peer(device_id, addr.clone()).await;
+
+    let peers = handle.cluster_peers().await;
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].0, device_id);
+
+    handle.shutdown().await;
+}
+
+// cluster_peer_update_on_duplicate
+//
+// Given: NetworkHandle with device_id_A → addr_A.
+// When: add_cluster_peer(device_id_A, addr_B) called.
+// Then: cluster_peers() returns (device_id_A, addr_B) — address updated, not duplicated.
+
+#[tokio::test]
+async fn cluster_peer_update_on_duplicate() {
+    let (tx_a, _rx_a) = tokio::sync::mpsc::channel(4);
+    let (tx_b, _rx_b) = tokio::sync::mpsc::channel(4);
+
+    let handle_a = NetworkHandle::start(make_config_with_cert(51), tx_a)
+        .await
+        .expect("handle_a");
+    let handle_b = NetworkHandle::start(make_config_with_cert(52), tx_b)
+        .await
+        .expect("handle_b");
+
+    let device_id = DeviceId([0xBBu8; 16]);
+    let addr_a = handle_a.local_addr().expect("addr_a");
+    let addr_b = handle_b.local_addr().expect("addr_b");
+
+    handle_a.add_cluster_peer(device_id, addr_a).await;
+    // Overwrite with addr_b.
+    handle_a.add_cluster_peer(device_id, addr_b.clone()).await;
+
+    let peers = handle_a.cluster_peers().await;
+    assert_eq!(peers.len(), 1, "must not duplicate on re-insert");
+    assert_eq!(peers[0].0, device_id);
+    // The stored addr should be addr_b (most recently inserted).
+    assert_eq!(peers[0].1.id, addr_b.id, "address must be updated to addr_b");
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+}
+
+// cluster_peer_remove
+//
+// Given: NetworkHandle with device_id_A registered.
+// When: remove_cluster_peer(&device_id_A) called.
+// Then: cluster_peers() returns empty vec.
+
+#[tokio::test]
+async fn cluster_peer_remove() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let handle = NetworkHandle::start(make_config_with_cert(53), tx)
+        .await
+        .expect("start");
+
+    let device_id = DeviceId([0xCCu8; 16]);
+    let addr = handle.local_addr().expect("local_addr");
+
+    handle.add_cluster_peer(device_id, addr).await;
+    assert_eq!(handle.cluster_peers().await.len(), 1);
+
+    handle.remove_cluster_peer(&device_id).await;
+    assert_eq!(
+        handle.cluster_peers().await.len(),
+        0,
+        "cluster_peers must be empty after remove"
+    );
+
+    handle.shutdown().await;
+}
+
+// cluster_peer_remove_nonexistent_is_noop
+//
+// Given: empty cluster_peers.
+// When: remove_cluster_peer(&device_id_X) called.
+// Then: no panic, cluster_peers() still empty.
+
+#[tokio::test]
+async fn cluster_peer_remove_nonexistent_is_noop() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let handle = NetworkHandle::start(make_config_with_cert(54), tx)
+        .await
+        .expect("start");
+
+    let device_id = DeviceId([0xDDu8; 16]);
+
+    // No insert — just remove. Must not panic.
+    handle.remove_cluster_peer(&device_id).await;
+    assert_eq!(handle.cluster_peers().await.len(), 0);
+
+    handle.shutdown().await;
+}
+
+// cluster_peers_independent_from_known_peers
+//
+// Given: add_peer(identity_A, addr_A) and add_cluster_peer(device_id_A, addr_A).
+// When: remove_cluster_peer(&device_id_A) called.
+// Then: has_known_peer(&identity_A) is still true, cluster_peers() is empty.
+
+#[tokio::test]
+async fn cluster_peers_independent_from_known_peers() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let handle = NetworkHandle::start(make_config_with_cert(55), tx)
+        .await
+        .expect("start");
+
+    let identity_a = IdentityPub([0xEEu8; 32]);
+    let device_id_a = DeviceId([0xEEu8; 16]);
+    let addr = handle.local_addr().expect("local_addr");
+
+    handle.add_peer(identity_a, addr.clone()).await;
+    handle.add_cluster_peer(device_id_a, addr).await;
+
+    // Remove from cluster_peers — known_peers must be unaffected.
+    handle.remove_cluster_peer(&device_id_a).await;
+
+    assert!(
+        handle.has_known_peer(&identity_a).await,
+        "known_peers must not be affected by remove_cluster_peer"
+    );
+    assert_eq!(
+        handle.cluster_peers().await.len(),
+        0,
+        "cluster_peers must be empty after remove"
+    );
+
+    handle.shutdown().await;
+}

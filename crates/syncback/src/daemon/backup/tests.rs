@@ -10,12 +10,12 @@ use syncback_core::cluster::{
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
 use syncback_core::types::{
-    DeviceId, ErasureParams, Event, FileCategory, FileId, FileRecord, FileVersion, LocalState,
-    SourceBlockId, Timestamp,
+    DeviceId, ErasureParams, Event, FileCategory, FileId, FileRecord, FileVersion, IdentityPub,
+    LocalState, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
 };
 use tempfile::TempDir;
 
-use super::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
+use super::{BackupConfig, BackupCoordinator, BackupEvent, DirtyEvent, DirtyKind};
 use crate::daemon::backup::pipeline::decrypt_and_decompress;
 use crate::daemon::backup::packing::parse_pack_index;
 
@@ -34,6 +34,7 @@ fn test_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         network: None,
         watch_configs: vec![],
         time_scale: 1,
+        mock_offer_budget_gb: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -332,6 +333,7 @@ fn pipeline_roundtrip_can_decode() {
         network: None,
         watch_configs: vec![],
         time_scale: 1,
+        mock_offer_budget_gb: None,
     };
     let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let mut coord = BackupCoordinator::new(db.clone(), config, encoder.clone());
@@ -648,6 +650,7 @@ fn dedup_via_cluster_state_skips_already_backed_up() {
         network: None,
         watch_configs: vec![],
         time_scale: 1,
+        mock_offer_budget_gb: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -772,7 +775,7 @@ async fn deliver_symbols_logs_warn_on_peer_not_found() {
     use std::collections::HashMap;
 
     use ed25519_dalek::SigningKey;
-    use syncback_core::types::{IdentityPub, PlacementStatus, SymbolPlacement};
+    use syncback_core::types::{PlacementStatus, SymbolPlacement};
 
     use crate::daemon::network::{NetworkConfig, NetworkHandle};
 
@@ -851,7 +854,7 @@ async fn deliver_symbols_sends_to_reachable_holder() {
     use std::collections::HashMap;
 
     use syncback_core::messages::Message;
-    use syncback_core::types::{IdentityPub, PlacementStatus, SymbolPlacement};
+    use syncback_core::types::{PlacementStatus, SymbolPlacement};
 
     use crate::daemon::network::{NetworkConfig, NetworkHandle};
 
@@ -1018,6 +1021,7 @@ fn coord_with_watch(
         network: None,
         watch_configs,
         time_scale: 1,
+        mock_offer_budget_gb: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -1138,6 +1142,7 @@ fn same_content_two_devices_both_in_file_record() {
         network: None,
         watch_configs: vec![],
         time_scale: 1,
+        mock_offer_budget_gb: None,
     };
     let mut coord_a =
         BackupCoordinator::new(db.clone(), config_a, Arc::new(RaptorQEncoder::new()));
@@ -1162,6 +1167,7 @@ fn same_content_two_devices_both_in_file_record() {
         network: None,
         watch_configs: vec![],
         time_scale: 1,
+        mock_offer_budget_gb: None,
     };
     let mut coord_b =
         BackupCoordinator::new(db.clone(), config_b, Arc::new(RaptorQEncoder::new()));
@@ -1183,5 +1189,299 @@ fn same_content_two_devices_both_in_file_record() {
     assert!(
         listed_devices.contains(&device_b),
         "device B missing from FileRecord.devices: {listed_devices:?}"
+    );
+}
+
+// ─── B3 tests: budget-gated flush ─────────────────────────────────────────────
+
+// ─── B3-T1: flush_queue_deferred_files_remain_in_queue ───────────────────────
+
+/// When mock_offer_budget_gb = 0.0, no files can be selected by select_backup_batch.
+/// flush_queue must return empty results and leave all files in the queue.
+#[test]
+fn flush_queue_deferred_files_remain_in_queue() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+
+    let config = BackupConfig {
+        source_block_size: SMALL_BLOCK_SIZE,
+        symbols_dir: symbols_dir.path().to_path_buf(),
+        epoch_key: [42u8; 32],
+        device_id: DeviceId([1u8; 16]),
+        mock_holders: test_holders(),
+        cluster_state: None,
+        network: None,
+        watch_configs: vec![],
+        time_scale: 1,
+        // Zero budget: all files must be deferred.
+        mock_offer_budget_gb: Some(0.0),
+    };
+    let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
+
+    // Queue 3 small files (all well below SMALL_BLOCK_SIZE).
+    for i in 0..3u8 {
+        let content = vec![i; 30_000];
+        let path = write_file(&files_dir, &format!("file{i}.txt"), &content);
+        coord.process_event(added_event(&path)).unwrap();
+    }
+
+    // With budget=0, flush should defer all files and return empty.
+    let results = coord.flush_queue(FileCategory::Document, true).unwrap();
+    assert!(results.is_empty(), "zero budget: no files should be processed");
+
+    // All 3 files must remain in the queue.
+    let queue_len: usize = coord.queues.values().map(|q| q.len()).sum();
+    assert_eq!(queue_len, 3, "all 3 files should remain in queue when budget=0");
+
+    // No source blocks should have been written to DB.
+    let blocks = db
+        .list_source_blocks_by_status(syncback_core::types::SourceBlockStatus::Active)
+        .unwrap();
+    assert!(blocks.is_empty(), "no blocks should exist with zero budget");
+}
+
+// ─── B3-T2: flush_queue_budget_selects_highest_importance_first ──────────────
+
+/// When budget allows only one file, the file with higher importance is selected.
+/// The lower-importance file stays in the queue.
+#[test]
+fn flush_queue_budget_selects_highest_importance_first() {
+    use super::QueuedFile;
+
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+
+    // Budget for ~1 file:
+    // overhead_factor(0.9) = 1.5 + 0.9 * 1.5 = 2.85
+    // required_gb for 30_000 bytes at importance=0.9 = 30_000 / 1_073_741_824 * 2.85 ≈ 7.96e-5 GB
+    // Set budget to 1e-4 (just above one high-importance file, far below two).
+    let config = BackupConfig {
+        source_block_size: SMALL_BLOCK_SIZE,
+        symbols_dir: symbols_dir.path().to_path_buf(),
+        epoch_key: [42u8; 32],
+        device_id: DeviceId([1u8; 16]),
+        mock_holders: test_holders(),
+        cluster_state: None,
+        network: None,
+        watch_configs: vec![],
+        time_scale: 1,
+        mock_offer_budget_gb: Some(1e-4),
+    };
+    let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
+
+    // Write two files with distinct content so hashes differ.
+    let content_a = vec![0xABu8; 30_000];
+    let content_b = vec![0xCDu8; 30_000];
+    let path_a = write_file(&files_dir, "high_importance.txt", &content_a);
+    let path_b = write_file(&files_dir, "low_importance.txt", &content_b);
+    let hash_a: [u8; 32] = *blake3::hash(&content_a).as_bytes();
+    let hash_b: [u8; 32] = *blake3::hash(&content_b).as_bytes();
+
+    // Directly push QueuedFile entries with specific importance values.
+    coord.queues.entry(FileCategory::Document).or_default().push(QueuedFile {
+        path: path_a.clone(),
+        file_id: syncback_core::types::FileId(1),
+        content_hash: hash_a,
+        size_bytes: 30_000,
+        category: FileCategory::Document,
+        importance: 0.9,
+    });
+    coord.queues.entry(FileCategory::Document).or_default().push(QueuedFile {
+        path: path_b.clone(),
+        file_id: syncback_core::types::FileId(2),
+        content_hash: hash_b,
+        size_bytes: 30_000,
+        category: FileCategory::Document,
+        importance: 0.3,
+    });
+
+    let results = coord.flush_queue(FileCategory::Document, true).unwrap();
+
+    // At least one file should have been processed.
+    assert!(!results.is_empty(), "at least one file should be processed");
+
+    // The low-importance file (path_b) must remain in queue.
+    let doc_queue = coord.queues.get(&FileCategory::Document).unwrap();
+    assert_eq!(doc_queue.len(), 1, "exactly one file should remain deferred");
+    assert_eq!(
+        doc_queue[0].path, path_b,
+        "the low-importance file should be the deferred one"
+    );
+}
+
+// ─── B3-T3: large_file_skipped_when_budget_insufficient ──────────────────────
+
+/// A large file (>= source_block_size) is skipped when offer_budget_gb = 0.
+/// No FileRecord should be created (get_or_create_file_id was not called).
+#[test]
+fn large_file_skipped_when_budget_insufficient() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+
+    let config = BackupConfig {
+        source_block_size: SMALL_BLOCK_SIZE,
+        symbols_dir: symbols_dir.path().to_path_buf(),
+        epoch_key: [42u8; 32],
+        device_id: DeviceId([1u8; 16]),
+        mock_holders: test_holders(),
+        cluster_state: None,
+        network: None,
+        watch_configs: vec![],
+        time_scale: 1,
+        // Zero budget: large file must be skipped.
+        mock_offer_budget_gb: Some(0.0),
+    };
+    let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
+
+    // Write a file of exactly SMALL_BLOCK_SIZE + some bytes so it takes the large-file path.
+    let large_content: Vec<u8> = (0..(SMALL_BLOCK_SIZE as usize + 512))
+        .map(|i| ((i * 7 + 13) % 256) as u8)
+        .collect();
+    let path = write_file(&files_dir, "large_file.bin", &large_content);
+
+    // process_event must return Ok(()) without processing the file.
+    coord.process_event(added_event(&path)).unwrap();
+
+    // No FileRecord should exist for this path (get_or_create_file_id was not called).
+    let record = db.get_file(&path).unwrap();
+    assert!(
+        record.is_none(),
+        "no FileRecord should be created for a large file skipped due to budget"
+    );
+
+    // No source blocks should exist.
+    let blocks = db
+        .list_source_blocks_by_status(syncback_core::types::SourceBlockStatus::Active)
+        .unwrap();
+    assert!(blocks.is_empty(), "no blocks should exist when large file is skipped");
+}
+
+// ─── B4 tests: placement outcome tracking ─────────────────────────────────────
+
+// ─── B4-T1: handle_backup_event_increments_accepted_counter ──────────────────
+
+/// SymbolAccepted event increments accepted_this_cycle.
+#[test]
+fn handle_backup_event_increments_accepted_counter() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    let holder_id = IdentityPub([0x55u8; 32]);
+    let block_id = SourceBlockId([0xAAu8; 32]);
+
+    // Insert a placement so the handler doesn't log a warning about unknown placement.
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id,
+        file_id: syncback_core::types::FileId(1),
+        esi_ranges: vec![(0, 2)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Offered,
+        last_verified: None,
+        placed_at: Timestamp::now(),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+
+    coord.offered_this_cycle = 5;
+    assert_eq!(coord.accepted_this_cycle, 0);
+
+    coord.handle_backup_event(BackupEvent::SymbolAccepted {
+        holder_id,
+        source_block_id: block_id,
+    });
+
+    assert_eq!(coord.accepted_this_cycle, 1, "accepted_this_cycle should be 1 after one SymbolAccepted");
+}
+
+// ─── B4-T2: persist_cycle_budget_saves_stats_and_resets_counters ─────────────
+
+/// persist_cycle_budget writes the (offered, accepted) pair to DB and resets counters.
+#[test]
+fn persist_cycle_budget_saves_stats_and_resets_counters() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    // No existing BudgetRecord.
+    assert!(db.get_budget().unwrap().is_none());
+
+    coord.offered_this_cycle = 10;
+    coord.accepted_this_cycle = 8;
+    coord.persist_cycle_budget();
+
+    // Counters must be reset.
+    assert_eq!(coord.offered_this_cycle, 0, "offered_this_cycle should be 0 after persist");
+    assert_eq!(coord.accepted_this_cycle, 0, "accepted_this_cycle should be 0 after persist");
+
+    // DB must have a BudgetRecord with weekly_stats = [(10, 8)].
+    let record = db.get_budget().unwrap().expect("BudgetRecord must exist after persist");
+    assert_eq!(record.weekly_stats, vec![(10u32, 8u32)]);
+
+    // placement_success_rate should be 8/10 = 0.8.
+    let expected_rate = 8.0 / 10.0;
+    assert!(
+        (record.placement_success_rate - expected_rate).abs() < 1e-9,
+        "placement_success_rate should be 0.8, got {}",
+        record.placement_success_rate
+    );
+}
+
+// ─── B4-T3: persist_cycle_budget_noop_when_zero_offered ──────────────────────
+
+/// persist_cycle_budget is a no-op when offered_this_cycle == 0.
+#[test]
+fn persist_cycle_budget_noop_when_zero_offered() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    coord.offered_this_cycle = 0;
+    coord.accepted_this_cycle = 0;
+    coord.persist_cycle_budget();
+
+    // DB must still have no BudgetRecord.
+    assert!(
+        db.get_budget().unwrap().is_none(),
+        "BudgetRecord must not be created when offered=0"
+    );
+}
+
+// ─── B4-T4: persist_cycle_budget_accumulates_over_multiple_cycles ────────────
+
+/// Calling persist_cycle_budget twice accumulates weekly_stats entries.
+#[test]
+fn persist_cycle_budget_accumulates_over_multiple_cycles() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    // First cycle: 10 offered, 8 accepted.
+    coord.offered_this_cycle = 10;
+    coord.accepted_this_cycle = 8;
+    coord.persist_cycle_budget();
+
+    // Second cycle: 5 offered, 3 accepted.
+    coord.offered_this_cycle = 5;
+    coord.accepted_this_cycle = 3;
+    coord.persist_cycle_budget();
+
+    let record = db.get_budget().unwrap().expect("BudgetRecord must exist");
+    assert_eq!(
+        record.weekly_stats,
+        vec![(10u32, 8u32), (5u32, 3u32)],
+        "weekly_stats should have two entries"
+    );
+
+    // Rate = (8+3) / (10+5) = 11/15 ≈ 0.7333
+    let expected_rate = 11.0 / 15.0;
+    assert!(
+        (record.placement_success_rate - expected_rate).abs() < 1e-9,
+        "placement_success_rate should be 11/15, got {}",
+        record.placement_success_rate
     );
 }

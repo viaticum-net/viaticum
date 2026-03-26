@@ -164,7 +164,7 @@ pub const VACUUM_INVALID_THRESHOLD: f64 = 0.5;
 pub const DEFAULT_SUCCESS_RATE: f64 = 0.5;
 
 /// Conservative headroom multiplier.
-pub const WILLINGNESS_FACTOR: f64 = 0.5;
+pub const WILLINGNESS_FACTOR: f64 = 1.0;
 
 /// Rolling window for weekly placement stats.
 pub const WEEKLY_STATS_WINDOW: u32 = 4;

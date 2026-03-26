@@ -25,7 +25,7 @@ use ed25519_dalek::SigningKey;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey as IrohSecretKey};
 use syncback_core::constants::{ALPN, RECONNECT_BACKOFF_SECS};
 use syncback_core::messages::{Message, SymbolTransferMsg};
-use syncback_core::types::{IdentityPub, NodeId};
+use syncback_core::types::{DeviceId, IdentityPub, NodeId};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
@@ -152,6 +152,10 @@ pub struct NetworkHandle {
     /// get a read loop, so PoS responses on auto-reconnected connections
     /// would be silently dropped. None in tests.
     read_loop_tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReadLoopRequest>>>,
+    /// Cluster peer directory: maps DeviceId → EndpointAddr for same-cluster devices.
+    /// Populated when an inbound connection is auto-added to the cluster.
+    /// Keyed by DeviceId (distinct from known_peers which is keyed by master IdentityPub).
+    cluster_peers: Arc<RwLock<HashMap<DeviceId, EndpointAddr>>>,
 }
 
 impl NetworkHandle {
@@ -220,6 +224,7 @@ impl NetworkHandle {
             known_peers: Arc::new(RwLock::new(config.known_peers)),
             connections,
             read_loop_tx: std::sync::Mutex::new(None),
+            cluster_peers: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -575,6 +580,33 @@ impl NetworkHandle {
     #[cfg(test)]
     pub async fn has_known_peer(&self, identity: &IdentityPub) -> bool {
         self.known_peers.read().await.contains_key(identity)
+    }
+
+    /// Register a cluster device's network address.
+    ///
+    /// Called by Processor after auto-adding a device to ClusterState.
+    /// If the device_id is already present, the address is updated.
+    pub async fn add_cluster_peer(&self, device_id: DeviceId, addr: EndpointAddr) {
+        let mut peers = self.cluster_peers.write().await;
+        peers.insert(device_id, addr);
+        debug!(device_id = %device_id, "cluster peer registered");
+    }
+
+    /// List all known cluster peers.
+    ///
+    /// Returns a snapshot of the current cluster_peers map.
+    pub async fn cluster_peers(&self) -> Vec<(DeviceId, EndpointAddr)> {
+        let peers = self.cluster_peers.read().await;
+        peers.iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+
+    /// Remove a cluster peer from the directory.
+    ///
+    /// Called on device revocation. Does nothing if the device_id is not present.
+    pub async fn remove_cluster_peer(&self, device_id: &DeviceId) {
+        let mut peers = self.cluster_peers.write().await;
+        peers.remove(device_id);
+        debug!(device_id = %device_id, "cluster peer removed");
     }
 }
 

@@ -3,7 +3,8 @@
 use std::os::unix::fs::PermissionsExt;
 
 use super::{
-    derive_keys, init_identity, init_identity_from_mnemonic, load_identity, IdentityError,
+    derive_keys, init_identity, init_identity_from_mnemonic, init_identity_new_device,
+    load_identity, IdentityError,
 };
 
 fn tmp_dir() -> tempfile::TempDir {
@@ -230,6 +231,84 @@ fn derive_keys_iroh_key_differs_from_device_key() {
         iroh,
         device.to_bytes(),
         "iroh key bytes must differ from device signing key bytes"
+    );
+}
+
+// ============================================================
+// init_identity_new_device tests
+// ============================================================
+
+const MNEMONIC_24: &str = "abandon abandon abandon abandon abandon abandon \
+                            abandon abandon abandon abandon abandon abandon \
+                            abandon abandon abandon abandon abandon abandon \
+                            abandon abandon abandon abandon abandon art";
+
+const MNEMONIC_12: &str = "abandon abandon abandon abandon abandon abandon \
+                            abandon abandon abandon abandon abandon about";
+
+#[test]
+fn new_device_produces_different_device_id_same_identity() {
+    let dir1 = tmp_dir();
+    let dir2 = tmp_dir();
+
+    let kf_new = init_identity_new_device(dir1.path(), MNEMONIC_24).expect("new_device");
+    let kf_det = init_identity_from_mnemonic(dir2.path(), MNEMONIC_24).expect("from_mnemonic");
+
+    assert_eq!(
+        kf_new.identity_pub, kf_det.identity_pub,
+        "same mnemonic → same identity_pub"
+    );
+    assert_eq!(kf_new.seed, kf_det.seed, "same mnemonic → same seed");
+    assert_ne!(
+        kf_new.device_id, kf_det.device_id,
+        "new_device must have a random (different) device_id"
+    );
+}
+
+#[test]
+fn new_device_two_calls_produce_different_device_ids() {
+    let dir1 = tmp_dir();
+    let dir2 = tmp_dir();
+
+    let kf1 = init_identity_new_device(dir1.path(), MNEMONIC_24).expect("call 1");
+    let kf2 = init_identity_new_device(dir2.path(), MNEMONIC_24).expect("call 2");
+
+    assert_eq!(kf1.identity_pub, kf2.identity_pub, "same mnemonic → same identity_pub");
+    assert_ne!(
+        kf1.device_id, kf2.device_id,
+        "two new_device calls must produce different device_ids"
+    );
+}
+
+#[test]
+fn new_device_rejects_duplicate() {
+    let dir = tmp_dir();
+    init_identity_new_device(dir.path(), MNEMONIC_24).expect("first call");
+
+    let result = init_identity_new_device(dir.path(), MNEMONIC_24);
+    assert!(
+        matches!(result, Err(IdentityError::AlreadyInitialized(_))),
+        "second call should return AlreadyInitialized, got {result:?}"
+    );
+}
+
+#[test]
+fn new_device_rejects_invalid_mnemonic() {
+    let dir = tmp_dir();
+    let result = init_identity_new_device(dir.path(), "not a mnemonic");
+    assert!(
+        matches!(result, Err(IdentityError::InvalidMnemonic(_))),
+        "garbage mnemonic should return InvalidMnemonic, got {result:?}"
+    );
+}
+
+#[test]
+fn new_device_rejects_12_word_mnemonic() {
+    let dir = tmp_dir();
+    let result = init_identity_new_device(dir.path(), MNEMONIC_12);
+    assert!(
+        matches!(result, Err(IdentityError::InvalidMnemonic(_))),
+        "12-word mnemonic should return InvalidMnemonic, got {result:?}"
     );
 }
 

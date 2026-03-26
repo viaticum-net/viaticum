@@ -92,10 +92,28 @@ impl BackupCoordinator {
         let importance = lookup_importance(&event.path, &self.config.watch_configs);
 
         if size_bytes >= self.config.source_block_size {
+            // Budget check for single large file.
+            let offer_budget_gb = self.compute_offer_budget_gb();
+            let required_gb = size_bytes as f64 / 1_073_741_824.0
+                * syncback_core::budget::overhead_factor(importance);
+            if required_gb > offer_budget_gb {
+                tracing::warn!(
+                    path = %event.path,
+                    size_bytes,
+                    required_gb,
+                    offer_budget_gb,
+                    "large file exceeds budget this cycle; will retry on next watcher scan"
+                );
+                return Ok(());
+            }
             let file_id =
                 self.get_or_create_file_id(&event.path, &event.device_id, content_hash)?;
             let candidates = self.get_candidates()?;
-            self.process_large_file(&event.path, file_id, content_hash, importance, &candidates)?;
+            let result =
+                self.process_large_file(&event.path, file_id, content_hash, importance, &candidates)?;
+            // Tally offered holders for this single block.
+            self.offered_this_cycle = self.offered_this_cycle
+                .saturating_add(result.symbol_count_per_holder.len() as u32);
             return Ok(());
         }
 

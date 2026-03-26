@@ -414,6 +414,87 @@ mod cluster_sync_tests {
         );
     }
 
+    // ─── C4: per-device cursor and master_pub helper ──────────────────────────
+
+    /// master_pub() returns the cluster's master identity used to initialise state.
+    #[test]
+    fn master_pub_returns_cluster_identity() {
+        let db = Db::open_in_memory().unwrap();
+        let master_key = make_master_key();
+        let master_pub = master_identity(&master_key);
+        let cert_a = issue_device_certificate(&master_key, DEVICE_A_ID, device_pub(DEVICE_A_ID), NOW);
+        let state = ClusterState::init(db.clone(), master_pub, cert_a, NOW, NOW).unwrap();
+        let shared = Arc::new(Mutex::new(state));
+        let manager = ClusterSyncManager::new(
+            db,
+            ClusterSyncConfig { our_device_id: DEVICE_A_ID, batch_size: 100 },
+            shared,
+        );
+
+        assert_eq!(manager.master_pub(), master_pub);
+    }
+
+    /// build_sync_request uses per-device IdentityPub(device_pub_key) as cursor key,
+    /// not the master identity. Setting the cursor on the device-level key is
+    /// reflected in the built request's last_known_seq.
+    #[test]
+    fn build_sync_request_uses_device_level_cursor_key() {
+        let db = Db::open_in_memory().unwrap();
+        let state = make_cluster_state_two_devices(db.clone());
+        let shared = Arc::new(Mutex::new(state));
+
+        // Cursor set on device-B's device-level IdentityPub.
+        let device_b_key = IdentityPub(device_pub(DEVICE_B_ID));
+        {
+            let mut s = shared.lock().unwrap();
+            s.update_sync_cursor(device_b_key, 77).unwrap();
+        }
+
+        let manager = ClusterSyncManager::new(
+            db,
+            ClusterSyncConfig { our_device_id: DEVICE_A_ID, batch_size: 100 },
+            shared,
+        );
+
+        // Build request using device-level cursor — must see seq=77.
+        let msg = manager.build_sync_request(&device_b_key);
+        assert_eq!(msg.last_known_seq, 77, "cursor must be per device_pub_key");
+        assert_eq!(msg.from_device_id, DEVICE_A_ID);
+    }
+
+    /// process_sync_response updates the cursor under the device-level IdentityPub key.
+    /// A subsequent build_sync_request with the same device-level key reflects the update.
+    #[test]
+    fn process_sync_response_updates_device_level_cursor() {
+        let db = Db::open_in_memory().unwrap();
+        let state = make_cluster_state_two_devices(db.clone());
+        let shared = Arc::new(Mutex::new(state));
+        let manager = ClusterSyncManager::new(
+            db,
+            ClusterSyncConfig { our_device_id: DEVICE_A_ID, batch_size: 100 },
+            shared.clone(),
+        );
+
+        let device_b_key = IdentityPub(device_pub(DEVICE_B_ID));
+
+        // No cursor yet → request should start from 0.
+        let req_before = manager.build_sync_request(&device_b_key);
+        assert_eq!(req_before.last_known_seq, 0);
+
+        // Apply a response: responder_last_seq = 15.
+        let response = ClusterSyncResponseMsg {
+            v: 1,
+            events: vec![],
+            responder_last_seq: 15,
+            timestamp: NOW,
+        };
+        manager.process_sync_response(&device_b_key, response).unwrap();
+
+        // After response, cursor advanced → next request starts from 15.
+        let req_after = manager.build_sync_request(&device_b_key);
+        assert_eq!(req_after.last_known_seq, 15, "cursor must advance after process_sync_response");
+    }
+
     // ─── Message serialization round-trips ───────────────────────────────────
 
     #[test]

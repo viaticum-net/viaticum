@@ -82,6 +82,7 @@ fn backup_cfg_with_cluster(
         network: None,
         watch_configs: vec![],
         time_scale: 1,
+        mock_offer_budget_gb: None,
     }
 }
 

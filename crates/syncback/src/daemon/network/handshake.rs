@@ -47,10 +47,10 @@ pub(super) async fn handshake_initiator(
     send_handshake_on_stream(&mut send, signing_key, our_identity, device_cert).await?;
 
     // Read peer's handshake.
-    let (peer_identity, peer_master_identity) =
+    let (peer_identity, peer_master_identity, peer_device_cert) =
         recv_and_verify_handshake(&mut recv, expected_identity).await?;
 
-    Ok(Connection::new(peer_identity, peer_master_identity, iroh_conn, send, recv))
+    Ok(Connection::new(peer_identity, peer_master_identity, peer_device_cert, iroh_conn, send, recv))
 }
 
 /// Perform the acceptor (B) side of the SyncBack handshake.
@@ -70,13 +70,13 @@ pub(super) async fn handshake_acceptor(
         .map_err(|e| NetworkError::Iroh(anyhow::anyhow!("{e}")))?;
 
     // Acceptor reads initiator's handshake first.
-    let (peer_identity, peer_master_identity) =
+    let (peer_identity, peer_master_identity, peer_device_cert) =
         recv_and_verify_handshake(&mut recv, None).await?;
 
     // Then sends its own.
     send_handshake_on_stream(&mut send, signing_key, our_identity, device_cert).await?;
 
-    Ok(Connection::new(peer_identity, peer_master_identity, iroh_conn, send, recv))
+    Ok(Connection::new(peer_identity, peer_master_identity, peer_device_cert, iroh_conn, send, recv))
 }
 
 /// Write a HandshakeMsg to a SendStream (before [`Connection`] exists).
@@ -100,13 +100,13 @@ async fn send_handshake_on_stream(
 
 /// Read and verify a single HandshakeMsg from a RecvStream.
 ///
-/// Returns `(peer_device_identity, peer_master_identity)` on success.
+/// Returns `(peer_device_identity, peer_master_identity, peer_device_cert)` on success.
 /// Every peer must present a device certificate proving the link device→master.
 /// Connections without a cert are rejected.
 async fn recv_and_verify_handshake(
     recv: &mut iroh::endpoint::RecvStream,
     expected_identity: Option<IdentityPub>,
-) -> Result<(IdentityPub, Option<IdentityPub>), NetworkError> {
+) -> Result<(IdentityPub, Option<IdentityPub>, Option<DeviceCertificate>), NetworkError> {
     let msg = recv_framed_message(recv).await?;
 
     match msg {
@@ -134,7 +134,8 @@ async fn recv_and_verify_handshake(
                 }
             }
 
-            Ok((hs.identity_pub, Some(master_pub)))
+            let cert = hs.device_cert.clone();
+            Ok((hs.identity_pub, Some(master_pub), cert))
         }
         other => Err(NetworkError::HandshakeFailed(format!(
             "expected Handshake variant, got {:?}",

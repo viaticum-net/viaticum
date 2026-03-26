@@ -3,8 +3,8 @@
 // All pure functions — no state, no DB, no async.
 
 use crate::constants::{
-    AGE_BONUS_CAP, AGE_BONUS_WEEKS, DEFAULT_SUCCESS_RATE, DROP_NOTICE_WINDOW_SECS, OVERHEAD_BASE,
-    OVERHEAD_SCALE, SECS_PER_WEEK, WEEKLY_STATS_WINDOW,
+    AGE_BONUS_CAP, AGE_BONUS_WEEKS, DEFAULT_SUCCESS_RATE, DROP_NOTICE_WINDOW_SECS,
+    FREE_TIER_GB, OVERHEAD_BASE, OVERHEAD_SCALE, SECS_PER_WEEK, WEEKLY_STATS_WINDOW,
     WILLINGNESS_FACTOR,
 };
 use crate::types::{BudgetRecord, HoldingRecord, HoldingStatus, IdentityPub, SourceBlockId, Timestamp};
@@ -22,14 +22,18 @@ const HARD_PRESSURE_THRESHOLD: f64 = 0.05;
 /// Owner-side budget snapshot.
 #[derive(Debug, Clone)]
 pub struct BudgetEstimate {
-    /// GB confirmed stored (Alive placements).
+    /// GB confirmed stored (Active source blocks).
     pub committed_gb: f64,
     /// Conservative additional capacity estimate.
     pub headroom_gb: f64,
-    /// committed_gb + headroom_gb.
+    /// committed_gb + headroom_gb, floored at FREE_TIER_GB.
     pub total_gb: f64,
     /// Placement success rate used for this estimate.
     pub placement_success_rate: f64,
+    /// How many GB of symbols to offer to the network this cycle.
+    /// Always >= total_gb. Accounts for expected rejections.
+    /// Formula: total_gb / placement_success_rate.max(0.2)
+    pub offer_budget_gb: f64,
 }
 
 /// A file the owner wants to back up this cycle.
@@ -105,8 +109,8 @@ pub enum BudgetError {
 
 /// Estimate current network budget from placement stats.
 ///
-/// committed_bytes: sum of total_bytes of all HoldingRecord-equivalent entries
-///                  where PlacementStatus == Alive (owner view, loaded by caller).
+/// committed_bytes: result of Db::committed_bytes() — sum of encrypted_size
+///                  for all Active source blocks (owner view, loaded by caller).
 /// budget_record: last persisted BudgetRecord (caller loads from DB), None on first run.
 pub fn estimate_budget(committed_bytes: u64, budget_record: Option<&BudgetRecord>) -> BudgetEstimate {
     let committed_gb = committed_bytes as f64 / 1_073_741_824.0;
@@ -125,13 +129,15 @@ pub fn estimate_budget(committed_bytes: u64, budget_record: Option<&BudgetRecord
     };
 
     let headroom_gb = committed_gb * placement_success_rate * WILLINGNESS_FACTOR;
-    let total_gb = committed_gb + headroom_gb;
+    let total_gb = (committed_gb + headroom_gb).max(FREE_TIER_GB);
+    let offer_budget_gb = total_gb / placement_success_rate.max(0.2);
 
     BudgetEstimate {
         committed_gb,
         headroom_gb,
         total_gb,
         placement_success_rate,
+        offer_budget_gb,
     }
 }
 

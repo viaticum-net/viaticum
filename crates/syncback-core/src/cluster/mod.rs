@@ -305,6 +305,9 @@ pub struct StoredClusterState {
     /// Per-device sync cursors for ClusterSync (device pub → last received seq).
     #[serde(default)]
     pub sync_cursors: std::collections::HashMap<IdentityPub, u64>,
+    /// Last known network addresses for cluster devices (for reconnect after restart).
+    #[serde(default)]
+    pub cluster_addrs: std::collections::HashMap<crate::types::DeviceId, String>,
 }
 
 /// One registered device in the cluster.
@@ -400,6 +403,7 @@ impl ClusterState {
             peer_affinity: Vec::new(),
             last_applied_seq: 0,
             sync_cursors: std::collections::HashMap::new(),
+            cluster_addrs: std::collections::HashMap::new(),
         };
 
         db.append_event(&crate::types::EventEntry {
@@ -684,5 +688,21 @@ impl ClusterState {
         self.state.sync_cursors.insert(peer_identity, seq);
         self.db.set_cluster_state(&self.state)?;
         Ok(())
+    }
+
+    /// Store a cluster device's network address for reconnect after daemon restart.
+    pub fn set_cluster_addr(
+        &mut self,
+        device_id: crate::types::DeviceId,
+        addr: String,
+    ) -> Result<(), ClusterStateError> {
+        self.state.cluster_addrs.insert(device_id, addr);
+        self.db.set_cluster_state(&self.state)?;
+        Ok(())
+    }
+
+    /// Get all stored cluster device addresses.
+    pub fn cluster_addrs(&self) -> &std::collections::HashMap<crate::types::DeviceId, String> {
+        &self.state.cluster_addrs
     }
 }

@@ -78,6 +78,29 @@ pub fn init_identity(data_dir: &Path) -> Result<IdentityKeyFile, IdentityError> 
     create_keyfile(data_dir, &mnemonic, false)
 }
 
+/// Initialize this device as a new member of an existing cluster identified by `mnemonic`.
+///
+/// Uses the same BIP39 mnemonic as the existing cluster, so `identity_pub` matches.
+/// Generates a fresh random `device_id`, giving this device its own unique device key
+/// and iroh NodeId. Writes `<data_dir>/identity.key` (mode 0600).
+///
+/// Returns `IdentityError::AlreadyInitialized` if identity.key already exists.
+/// Returns `IdentityError::InvalidMnemonic` if mnemonic is not valid 24-word BIP39.
+pub fn init_identity_new_device(
+    data_dir: &Path,
+    mnemonic: &str,
+) -> Result<IdentityKeyFile, IdentityError> {
+    let mnemonic = bip39::Mnemonic::parse(mnemonic)
+        .map_err(|e| IdentityError::InvalidMnemonic(e.to_string()))?;
+    if mnemonic.word_count() != 24 {
+        return Err(IdentityError::InvalidMnemonic(format!(
+            "expected 24 words, got {}",
+            mnemonic.word_count()
+        )));
+    }
+    create_keyfile(data_dir, &mnemonic, false)
+}
+
 /// Initialize from an existing 24-word BIP39 mnemonic (for DR restore / Docker testing).
 ///
 /// Same behaviour as `init_identity` but uses the supplied mnemonic instead of

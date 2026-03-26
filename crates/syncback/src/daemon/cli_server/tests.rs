@@ -67,6 +67,7 @@ async fn make_test_state() -> Arc<DaemonState> {
         disk_reserve_bytes: 0,
         hard_quota_bytes: 0,
         time_scale: 1,
+        relay_post_tx: None,
     })
 }
 
@@ -164,6 +165,137 @@ async fn dispatch_device_revoke_no_cluster_returns_error() {
     let response = dispatch(request, &state).await;
     // Without cluster_state, revoke returns an error.
     assert!(matches!(response, CliResponse::Error(_)));
+}
+
+#[tokio::test]
+async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
+    use std::sync::{Arc, Mutex};
+
+    use syncback_core::cluster::{
+        derive_device_key, issue_device_certificate, issue_revocation, master_identity,
+        ClusterState, EpochCounter,
+    };
+    use syncback_core::messages::RevocationBroadcast;
+    use syncback_core::types::{DeviceId, IdentityPub, Timestamp};
+
+    use crate::daemon::relay::RelayPost;
+
+    // Build two devices: A (this device), B (to be revoked).
+    let seed_a = [10u8; 32];
+    let master_key = syncback_core::cluster::derive_master_key(&seed_a).unwrap();
+    let identity_pub = master_identity(&master_key);
+
+    let device_id_a = DeviceId([0xA0u8; 16]);
+    let device_id_b = DeviceId([0xB0u8; 16]);
+
+    let dev_key_a = derive_device_key(&seed_a, &device_id_a).unwrap();
+    let dev_key_b = derive_device_key(&seed_a, &device_id_b).unwrap();
+
+    let now = Timestamp(1_000_000);
+    let cert_a = issue_device_certificate(
+        &master_key,
+        device_id_a,
+        dev_key_a.verifying_key().to_bytes(),
+        now,
+    );
+    let cert_b = issue_device_certificate(
+        &master_key,
+        device_id_b,
+        dev_key_b.verifying_key().to_bytes(),
+        now,
+    );
+
+    let db = syncback_core::db::Db::open_in_memory().unwrap();
+    let mut cs = ClusterState::init(db.clone(), identity_pub, cert_a.clone(), now, now).unwrap();
+    cs.add_device(cert_b.clone(), now).unwrap();
+    let cluster_state = Arc::new(Mutex::new(cs));
+
+    // Wire up a relay_post channel so we can observe the broadcast.
+    let (relay_post_tx, mut relay_post_rx) = tokio::sync::mpsc::channel::<RelayPost>(4);
+
+    let device_key = dev_key_a;
+    let net_config = crate::daemon::network::NetworkConfig {
+        signing_key: device_key,
+        master_identity: identity_pub,
+        known_peers: Default::default(),
+        device_cert: None,
+        iroh_secret_key: None,
+        relay_mode: iroh::RelayMode::Disabled,
+        x25519_pub: None,
+    };
+    let (incoming_tx, _incoming_rx) =
+        mpsc::channel::<crate::daemon::network::connection::Connection>(1);
+    let incoming_tx_for_state = incoming_tx.clone();
+    let network = Arc::new(
+        crate::daemon::network::NetworkHandle::start(net_config, incoming_tx)
+            .await
+            .unwrap(),
+    );
+    let (restore_tx, _restore_rx) = mpsc::channel::<(
+        crate::daemon::restore::RestoreRequest,
+        tokio::sync::oneshot::Sender<Result<
+            crate::daemon::restore::RestoreResult,
+            crate::daemon::restore::RestoreError,
+        >>,
+    )>(4);
+
+    let state = Arc::new(DaemonState {
+        db,
+        identity_pub,
+        device_id: device_id_a,
+        network,
+        restore_tx,
+        cluster_state: Some(cluster_state),
+        incoming_tx: incoming_tx_for_state,
+        master_key,
+        seed: seed_a.to_vec(),
+        data_dir: std::path::PathBuf::from("/tmp"),
+        soft_quota_bytes: 0,
+        disk_reserve_bytes: 0,
+        hard_quota_bytes: 0,
+        time_scale: 1,
+        relay_post_tx: Some(relay_post_tx),
+    });
+
+    // Revoke device B.
+    let device_b_hex: String = device_id_b
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let response = dispatch(
+        CliRequest::DeviceRevoke {
+            device_id_hex: device_b_hex.clone(),
+        },
+        &state,
+    )
+    .await;
+
+    assert!(
+        matches!(response, CliResponse::DeviceRevoked { .. }),
+        "expected DeviceRevoked, got {response:?}"
+    );
+
+    // Relay post channel must have received a RevocationBroadcast.
+    let post = relay_post_rx
+        .try_recv()
+        .expect("relay_post_rx must have a message after revoke");
+
+    assert_eq!(post.msg_type, "revocation_broadcast");
+    assert!(post.target.is_none(), "broadcast must have no target");
+
+    // Decode and verify payload.
+    let broadcast: RevocationBroadcast =
+        syncback_core::messages::from_cbor(&post.payload)
+            .expect("payload must decode as RevocationBroadcast");
+    assert_eq!(
+        broadcast.device_cert.device_id, device_id_b,
+        "broadcast must reference the revoked device"
+    );
+    assert_eq!(
+        broadcast.revocation.device_id, device_id_b,
+        "revocation cert must target device B"
+    );
 }
 
 #[tokio::test]
@@ -326,6 +458,7 @@ async fn dispatch_connect_two_daemons_registers_peer() {
         disk_reserve_bytes: 0,
         hard_quota_bytes: 0,
         time_scale: 1,
+        relay_post_tx: None,
     });
 
     let response = dispatch(CliRequest::Connect { addr: addr_b_str }, &state_a).await;

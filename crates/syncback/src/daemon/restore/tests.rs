@@ -69,6 +69,7 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         network: None,
         watch_configs: vec![],
         time_scale: 1,
+        mock_offer_budget_gb: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }

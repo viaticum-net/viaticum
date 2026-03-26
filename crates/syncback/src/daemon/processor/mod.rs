@@ -138,6 +138,8 @@ pub struct Processor {
     pending_challenges: PendingChallenges,
     /// Channel to post messages to the relay board (for board-based responses).
     relay_post_tx: mpsc::Sender<RelayPost>,
+    /// Cluster state for auto-add on same-identity handshake. None if not initialized.
+    cluster_state: Option<Arc<std::sync::Mutex<syncback_core::cluster::ClusterState>>>,
 }
 
 impl Processor {
@@ -161,6 +163,7 @@ impl Processor {
         time_scale: u64,
         pending_challenges: PendingChallenges,
         relay_post_tx: mpsc::Sender<RelayPost>,
+        cluster_state: Option<Arc<std::sync::Mutex<syncback_core::cluster::ClusterState>>>,
     ) -> Self {
         Processor {
             db,
@@ -180,6 +183,7 @@ impl Processor {
             time_scale,
             pending_challenges,
             relay_post_tx,
+            cluster_state,
         }
     }
 
@@ -257,11 +261,18 @@ impl Processor {
                                     Some(addr) => addr,
                                     None => iroh::EndpointAddr::new(remote_pubkey),
                                 };
-                                this.network.add_peer(peer_id, endpoint_addr).await;
+                                this.network.add_peer(peer_id, endpoint_addr.clone()).await;
                                 debug!(
                                     peer = %peer_id,
                                     "processor: registered inbound peer in known_peers"
                                 );
+
+                                // Auto-add cluster device if same master identity.
+                                this.try_auto_add_cluster_device(
+                                    Some(peer_id),
+                                    conn_arc.peer_device_cert.clone(),
+                                    endpoint_addr,
+                                ).await;
                             }
 
                             let conn_arc2 = conn_arc.clone();
@@ -359,6 +370,65 @@ impl Processor {
         }
 
         Ok(())
+    }
+
+    // =========================================================
+    // Cluster auto-add helper
+    // =========================================================
+
+    /// Auto-add a cluster device if the incoming connection has the same master identity.
+    ///
+    /// Checks whether `peer_master_identity == own_identity`. If so, extracts the
+    /// device cert from `peer_device_cert`, calls `cluster_state.add_device`, and
+    /// registers the device in `cluster_peers` via the network handle.
+    ///
+    /// Errors from `add_device`:
+    ///   - `DeviceAlreadyRegistered` → logged at debug, not an error condition.
+    ///   - Other errors → logged at warn.
+    ///
+    /// Returns `true` if the device was newly added, `false` otherwise.
+    pub async fn try_auto_add_cluster_device(
+        &self,
+        peer_master_identity: Option<syncback_core::types::IdentityPub>,
+        peer_device_cert: Option<syncback_core::cluster::DeviceCertificate>,
+        endpoint_addr: iroh::EndpointAddr,
+    ) -> bool {
+        let peer_master = match peer_master_identity {
+            Some(id) => id,
+            None => return false,
+        };
+        if peer_master != self.own_identity {
+            return false;
+        }
+        let cert = match peer_device_cert {
+            Some(c) => c,
+            None => return false,
+        };
+        let cs = match self.cluster_state.as_ref() {
+            Some(cs) => cs,
+            None => return false,
+        };
+        // Store hex of device_pub_key — used to derive iroh NodeId for reconnect.
+        let addr_str = syncback_core::types::hex_encode(&cert.device_pub_key);
+        let result = {
+            let mut guard = cs.lock().unwrap();
+            let r = guard.add_device(cert.clone(), Timestamp::now());
+            // Persist address for reconnect after restart (best-effort).
+            let _ = guard.set_cluster_addr(cert.device_id, addr_str);
+            r
+        };
+        match result {
+            Ok(()) => {
+                self.network.add_cluster_peer(cert.device_id, endpoint_addr).await;
+                true
+            }
+            Err(syncback_core::cluster::ClusterStateError::DeviceAlreadyRegistered(_)) => {
+                // Still update cluster_peers — addr may have changed.
+                self.network.add_cluster_peer(cert.device_id, endpoint_addr).await;
+                false
+            }
+            Err(_) => false,
+        }
     }
 
     // =========================================================
@@ -509,7 +579,15 @@ impl Processor {
                     .await?;
             }
             Message::ClusterSyncResponse(response) => {
-                self.handle_cluster_sync_response(from, response).await?;
+                // Use device-level identity as cursor key (per-device cursors).
+                // conn.peer_device_cert carries the peer's device_pub_key from the handshake.
+                // Fall back to master identity if cert is unavailable (should not happen).
+                let device_identity = conn
+                    .peer_device_cert
+                    .as_ref()
+                    .map(|c| IdentityPub(c.device_pub_key))
+                    .unwrap_or(from);
+                self.handle_cluster_sync_response(device_identity, response).await?;
             }
             Message::SymbolOffer(offer) => {
                 self.handle_symbol_offer(from, offer, conn).await?;

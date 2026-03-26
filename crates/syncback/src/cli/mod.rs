@@ -75,6 +75,11 @@ pub enum Command {
         /// BIP39 mnemonic phrase (24 words). If omitted, generates a new one.
         #[arg(long)]
         mnemonic: Option<String>,
+        /// Add this machine as a new device to an existing cluster.
+        /// Must be combined with --mnemonic. Generates a random device ID
+        /// so this device has its own keys while sharing the cluster identity.
+        #[arg(long, requires = "mnemonic")]
+        new_device: bool,
     },
 
     /// Show overall system status

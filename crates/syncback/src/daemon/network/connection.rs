@@ -14,6 +14,7 @@
 // to NetworkError to avoid ambiguity.
 
 use iroh::endpoint::{ReadExactError, RecvStream, SendStream};
+use syncback_core::cluster::DeviceCertificate;
 use syncback_core::constants::MAX_MESSAGE_SIZE;
 use syncback_core::messages::{Message, MessageError, frame_message, from_cbor};
 use syncback_core::types::IdentityPub;
@@ -37,6 +38,9 @@ pub struct Connection {
     /// so this is always Some after a valid handshake. Trust, placement, and all
     /// protocol operations use this identity — never the device-level key.
     pub peer_master_identity: Option<IdentityPub>,
+    /// Device certificate from the peer's handshake. Present for all valid connections
+    /// (handshake rejects cert-less peers). Used by Processor for cluster auto-add.
+    pub peer_device_cert: Option<DeviceCertificate>,
     /// iroh connection handle (kept alive so the connection does not close).
     #[allow(dead_code)]
     pub(crate) inner: iroh::endpoint::Connection,
@@ -51,6 +55,7 @@ impl Connection {
     pub(crate) fn new(
         peer_identity: IdentityPub,
         peer_master_identity: Option<IdentityPub>,
+        peer_device_cert: Option<DeviceCertificate>,
         inner: iroh::endpoint::Connection,
         send: SendStream,
         recv: RecvStream,
@@ -58,6 +63,7 @@ impl Connection {
         Self {
             peer_identity,
             peer_master_identity,
+            peer_device_cert,
             inner,
             send: Mutex::new(send),
             recv: Mutex::new(recv),

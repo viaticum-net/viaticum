@@ -10,6 +10,7 @@ use sha2::Sha256;
 use syncback_core::constants::MIN_BATCH_BYTES;
 use syncback_core::db::Db;
 use syncback_core::erasure::{binding_seed, ErasureEncoder};
+use syncback_core::cluster::esi_namespace_start;
 use syncback_core::placement::{compute_allocation, HolderCandidate, PlacementError};
 use syncback_core::types::{
     hex_encode, ErasureParams, Event, EventEntry, FileId, IdentityPub, PlacementStatus,
@@ -124,8 +125,21 @@ pub fn run_pipeline(
     let params = ErasureParams::compute(stored.len() as u64, avg_importance);
 
     // 5. Placement allocation
+    // Compute ESI offset from cluster state so each device gets a non-overlapping
+    // ESI namespace. Falls back to 0 for single-device or when cluster unavailable.
+    let esi_offset: u32 = config
+        .cluster_state
+        .as_ref()
+        .and_then(|cs| {
+            cs.lock()
+                .ok()
+                .and_then(|guard| guard.get_device(&config.device_id).map(|e| e.device_index))
+        })
+        .map(esi_namespace_start)
+        .unwrap_or(0);
+
     let allocations_result = if candidates.len() >= 2 {
-        match compute_allocation(candidates, &params) {
+        match compute_allocation(candidates, &params, esi_offset) {
             Ok(allocs) => allocs,
             Err(PlacementError::NTooSmall { .. }) => {
                 tracing::warn!(

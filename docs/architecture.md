@@ -182,7 +182,7 @@ crates/syncback/src/
 
 `BudgetEngine` — оценивает, сколько GB мы можем разместить у других peer'ов.
 
-Учитывает placement_success_rate (rolling 4-week), willingness_factor (0.5 консерватизм).
+Учитывает placement_success_rate (rolling 4-week), willingness_factor (1.0), FREE_TIER_GB bootstrap (1 GB), offer_budget_gb (inflated by 1/sr).
 
 Singleton `BudgetRecord` хранится в redb таблице `BUDGET`.
 

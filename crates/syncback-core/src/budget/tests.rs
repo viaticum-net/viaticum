@@ -63,10 +63,11 @@ fn estimate_budget_no_history() {
     let estimate = estimate_budget(committed_bytes, None);
 
     assert!((estimate.placement_success_rate - DEFAULT_SUCCESS_RATE).abs() < 1e-9);
-    // headroom = 10 * 0.5 * 0.5 = 2.5 GiB
     let committed_gb = gib(10) as f64 / 1_073_741_824.0;
-    let expected_headroom = committed_gb * DEFAULT_SUCCESS_RATE * 0.5;
-    let expected_total = committed_gb + expected_headroom;
+    // headroom = 10 * 0.5 * 1.0 = 5.0 GiB
+    let expected_headroom = committed_gb * DEFAULT_SUCCESS_RATE * 1.0;
+    let expected_total = (committed_gb + expected_headroom).max(1.0);
+    let expected_offer = expected_total / DEFAULT_SUCCESS_RATE.max(0.2);
     assert!(
         (estimate.committed_gb - committed_gb).abs() < 1e-6,
         "committed_gb mismatch"
@@ -80,6 +81,11 @@ fn estimate_budget_no_history() {
         (estimate.total_gb - expected_total).abs() < 1e-6,
         "total_gb mismatch: expected {expected_total}, got {}",
         estimate.total_gb
+    );
+    assert!(
+        (estimate.offer_budget_gb - expected_offer).abs() < 1e-6,
+        "offer_budget_gb mismatch: expected {expected_offer}, got {}",
+        estimate.offer_budget_gb
     );
 }
 
@@ -101,13 +107,96 @@ fn estimate_budget_with_stats() {
         "rate mismatch"
     );
     let committed_gb = gib(10) as f64 / 1_073_741_824.0;
-    // headroom = 10 * 0.7 * 0.5 = 3.5 GiB
-    let expected_headroom = committed_gb * expected_rate * 0.5;
-    let expected_total = committed_gb + expected_headroom;
+    // headroom = 10 * 0.7 * 1.0 = 7.0 GiB
+    let expected_headroom = committed_gb * expected_rate * 1.0;
+    let expected_total = (committed_gb + expected_headroom).max(1.0);
+    let expected_offer = expected_total / expected_rate.max(0.2);
     assert!(
         (estimate.total_gb - expected_total).abs() < 1e-6,
         "total_gb mismatch: expected {expected_total}, got {}",
         estimate.total_gb
+    );
+    assert!(
+        (estimate.offer_budget_gb - expected_offer).abs() < 1e-6,
+        "offer_budget_gb mismatch: expected {expected_offer}, got {}",
+        estimate.offer_budget_gb
+    );
+}
+
+#[test]
+fn bootstrap_allows_first_gb() {
+    // committed=0 → raw total=0.0, but FREE_TIER floor raises it to 1.0
+    let estimate = estimate_budget(0, None);
+    assert!(
+        (estimate.total_gb - 1.0).abs() < 1e-9,
+        "total_gb must be 1.0 (FREE_TIER_GB) when committed=0, got {}",
+        estimate.total_gb
+    );
+    // offer_budget = 1.0 / max(0.5, 0.2) = 1.0 / 0.5 = 2.0
+    assert!(
+        (estimate.offer_budget_gb - 2.0).abs() < 1e-9,
+        "offer_budget_gb must be 2.0 when total=1.0 and sr=0.5, got {}",
+        estimate.offer_budget_gb
+    );
+    assert!(
+        (estimate.committed_gb - 0.0).abs() < 1e-9,
+        "committed_gb must be 0.0"
+    );
+}
+
+#[test]
+fn offer_budget_inflated_by_success_rate() {
+    // committed=1 GiB, sr=0.5 (no history → DEFAULT_SUCCESS_RATE)
+    // headroom = 1.0 * 0.5 * 1.0 = 0.5
+    // total = max(1.5, 1.0) = 1.5
+    // offer = 1.5 / 0.5 = 3.0
+    let estimate = estimate_budget(gib(1), None);
+    assert!(
+        (estimate.total_gb - 1.5).abs() < 1e-6,
+        "total_gb expected 1.5, got {}",
+        estimate.total_gb
+    );
+    assert!(
+        (estimate.offer_budget_gb - 3.0).abs() < 1e-6,
+        "offer_budget_gb expected 3.0, got {}",
+        estimate.offer_budget_gb
+    );
+}
+
+#[test]
+fn offer_budget_capped_at_5x() {
+    // sr=0.1 → below the 0.2 floor → denominator = 0.2 → offer = total / 0.2 (5x)
+    // Not total / 0.1 (10x).
+    // Use stats that produce sr=0.1: offered=10, accepted=1
+    let record = BudgetRecord {
+        estimated_gb: 0.0,
+        last_calculated: Timestamp(0),
+        placement_success_rate: 0.0,
+        weekly_stats: vec![(10, 1)],
+    };
+    let estimate = estimate_budget(gib(1), Some(&record));
+    // sr = 1/10 = 0.1
+    assert!(
+        (estimate.placement_success_rate - 0.1).abs() < 1e-9,
+        "expected sr=0.1, got {}",
+        estimate.placement_success_rate
+    );
+    // headroom = 1.0 * 0.1 * 1.0 = 0.1
+    // total = max(1.1, 1.0) = 1.1
+    // offer = 1.1 / 0.2 = 5.5 (not 1.1 / 0.1 = 11.0)
+    let expected_offer = estimate.total_gb / 0.2;
+    assert!(
+        (estimate.offer_budget_gb - expected_offer).abs() < 1e-6,
+        "offer_budget_gb expected {} (capped at /0.2), got {}",
+        expected_offer,
+        estimate.offer_budget_gb
+    );
+    // Confirm it is NOT the uncapped value
+    let uncapped = estimate.total_gb / 0.1;
+    assert!(
+        (estimate.offer_budget_gb - uncapped).abs() > 1e-6,
+        "offer_budget_gb must not be the uncapped value {}",
+        uncapped
     );
 }
 

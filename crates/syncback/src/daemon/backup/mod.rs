@@ -103,6 +103,9 @@ pub struct BackupConfig {
     pub watch_configs: Vec<WatchConfig>,
     /// Time acceleration factor. Divides flush timer intervals.
     pub time_scale: u64,
+    /// Override offer_budget_gb for testing. None = compute from DB (production).
+    /// Follows the same pattern as mock_holders.
+    pub mock_offer_budget_gb: Option<f64>,
 }
 
 impl Default for BackupConfig {
@@ -117,6 +120,7 @@ impl Default for BackupConfig {
             network: None,
             watch_configs: vec![],
             time_scale: 1,
+            mock_offer_budget_gb: None,
         }
     }
 }
@@ -146,6 +150,10 @@ pub struct BackupCoordinator {
     pub(crate) queues: HashMap<FileCategory, Vec<QueuedFile>>,
     /// Monotonically increasing FileId counter.
     pub(crate) next_file_id: u64,
+    /// Holders offered symbols this flush cycle (reset after persist).
+    pub(crate) offered_this_cycle: u32,
+    /// Holders that accepted symbols this flush cycle (reset after persist).
+    pub(crate) accepted_this_cycle: u32,
 }
 
 impl BackupCoordinator {
@@ -171,6 +179,8 @@ impl BackupCoordinator {
             encoder,
             queues,
             next_file_id,
+            offered_this_cycle: 0,
+            accepted_this_cycle: 0,
         }
     }
 
@@ -237,10 +247,42 @@ impl BackupCoordinator {
         }
     }
 
+    /// Compute how many GB we can offer to the network this cycle.
+    /// Returns offer_budget_gb from BudgetEstimate.
+    /// On DB error: returns FREE_TIER_GB (safe fallback — never block all backups).
+    fn compute_offer_budget_gb(&self) -> f64 {
+        if let Some(gb) = self.config.mock_offer_budget_gb {
+            return gb;
+        }
+        let committed_bytes = match self.db.committed_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("budget: committed_bytes query failed: {e}");
+                return syncback_core::constants::FREE_TIER_GB;
+            }
+        };
+        let budget_record = match self.db.get_budget() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("budget: get_budget query failed: {e}");
+                None
+            }
+        };
+        let estimate = syncback_core::budget::estimate_budget(committed_bytes, budget_record.as_ref());
+        tracing::debug!(
+            committed_gb = estimate.committed_gb,
+            offer_budget_gb = estimate.offer_budget_gb,
+            placement_success_rate = estimate.placement_success_rate,
+            "budget estimate"
+        );
+        estimate.offer_budget_gb
+    }
+
     /// Flush the specified category queue if it meets flush criteria.
     ///
     /// Flushes when: total queue bytes >= source_block_size, OR force=true.
     /// Skips if total bytes across all categories < MIN_BATCH_BYTES and force=false.
+    /// Applies budget check: files not selected by select_backup_batch stay in queue.
     pub fn flush_queue(
         &mut self,
         category: FileCategory,
@@ -263,18 +305,61 @@ impl BackupCoordinator {
             return Ok(vec![]);
         }
 
-        let candidates = self.get_candidates()?;
+        // Budget check: select which queued files fit within this cycle's budget.
+        let offer_budget_gb = self.compute_offer_budget_gb();
         let queue = self.queues.entry(category).or_default();
 
-        flush_queue_inner(
+        let candidates_input: Vec<(String, f64, u64)> = queue
+            .iter()
+            .map(|qf| (qf.path.clone(), qf.importance, qf.size_bytes))
+            .collect();
+
+        let batch = syncback_core::budget::select_backup_batch(&candidates_input, offer_budget_gb);
+
+        // Split: selected files proceed, deferred files stay in queue.
+        let selected_paths: std::collections::HashSet<&str> =
+            batch.candidates.iter().map(|c| c.path.as_str()).collect();
+
+        let (selected, deferred): (Vec<QueuedFile>, Vec<QueuedFile>) =
+            std::mem::take(queue).into_iter().partition(|qf| selected_paths.contains(qf.path.as_str()));
+
+        // Put deferred files back.
+        *queue = deferred;
+
+        if batch.deferred_count > 0 {
+            tracing::warn!(
+                category = ?category,
+                deferred = batch.deferred_count,
+                offer_budget_gb,
+                "flush_queue: {} files deferred due to budget constraint",
+                batch.deferred_count
+            );
+        }
+
+        if selected.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let candidates = self.get_candidates()?;
+        let mut selected_queue = selected;
+
+        let results = flush_queue_inner(
             &self.db,
             &self.config,
             &self.encoder,
-            queue,
+            &mut selected_queue,
             total_all,
             force,
             &candidates,
-        )
+        )?;
+
+        // Tally the number of distinct holders offered to in this batch.
+        for result in &results {
+            let holder_count = result.symbol_count_per_holder.len() as u32;
+            self.offered_this_cycle = self.offered_this_cycle.saturating_add(holder_count);
+        }
+
+        Ok(results)
     }
 
     /// Flush all categories.
@@ -366,6 +451,7 @@ impl BackupCoordinator {
                                 Ok(results) => self.deliver_symbols(&results).await,
                                 Err(e) => tracing::error!("final flush error: {e}"),
                             }
+                            self.persist_cycle_budget();
                             break;
                         }
                     }
@@ -380,6 +466,7 @@ impl BackupCoordinator {
                         }
                         Err(e) => tracing::error!("idle flush error: {e}"),
                     }
+                    self.persist_cycle_budget();
                 }
                 _ = fallback_timer.tick() => {
                     tracing::debug!("fallback flush triggered");
@@ -391,6 +478,7 @@ impl BackupCoordinator {
                         }
                         Err(e) => tracing::error!("fallback flush error: {e}"),
                     }
+                    self.persist_cycle_budget();
                 }
                 maybe_backup = backup_event_rx.recv() => {
                     if let Some(event) = maybe_backup {
@@ -403,7 +491,7 @@ impl BackupCoordinator {
     }
 
     /// Handle a BackupEvent from the Processor.
-    fn handle_backup_event(&self, event: BackupEvent) {
+    fn handle_backup_event(&mut self, event: BackupEvent) {
         match event {
             BackupEvent::SymbolAccepted {
                 holder_id,
@@ -442,6 +530,7 @@ impl BackupCoordinator {
                         tracing::error!(error = %e, "DB error on SymbolAccept");
                     }
                 }
+                self.accepted_this_cycle = self.accepted_this_cycle.saturating_add(1);
             }
             BackupEvent::SymbolRejected {
                 holder_id,
@@ -472,6 +561,38 @@ impl BackupCoordinator {
                 }
             }
         }
+    }
+
+    /// Persist accumulated placement stats to DB and reset cycle counters.
+    /// No-op if offered_this_cycle == 0 (nothing was sent this cycle).
+    fn persist_cycle_budget(&mut self) {
+        if self.offered_this_cycle == 0 {
+            return;
+        }
+        let budget_record = match self.db.get_budget() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("persist_cycle_budget: get_budget failed: {e}");
+                return;
+            }
+        };
+        let updated = syncback_core::budget::record_placement_outcome(
+            budget_record,
+            self.offered_this_cycle,
+            self.accepted_this_cycle,
+        );
+        if let Err(e) = self.db.set_budget(&updated) {
+            tracing::error!("persist_cycle_budget: set_budget failed: {e}");
+        } else {
+            tracing::info!(
+                offered = self.offered_this_cycle,
+                accepted = self.accepted_this_cycle,
+                placement_success_rate = updated.placement_success_rate,
+                "budget: cycle stats persisted"
+            );
+        }
+        self.offered_this_cycle = 0;
+        self.accepted_this_cycle = 0;
     }
 
     /// Deliver encoded symbols to their assigned holders over the network.

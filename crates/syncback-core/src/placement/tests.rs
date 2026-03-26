@@ -55,7 +55,7 @@ fn holder_weight_clamps_degenerate_inputs() {
 #[test]
 fn compute_allocation_no_candidates_fails() {
     let p = params(0.5);
-    let result = compute_allocation(&[], &p);
+    let result = compute_allocation(&[], &p, 0);
     assert!(matches!(result, Err(PlacementError::NoCandidates)));
 }
 
@@ -63,7 +63,7 @@ fn compute_allocation_no_candidates_fails() {
 fn compute_allocation_single_holder_fails() {
     let p = params(0.5);
     let candidates = vec![candidate(1, 0.8)];
-    let result = compute_allocation(&candidates, &p);
+    let result = compute_allocation(&candidates, &p, 0);
     assert!(matches!(
         result,
         Err(PlacementError::TooFewHolders { count: 1 })
@@ -74,7 +74,7 @@ fn compute_allocation_single_holder_fails() {
 fn compute_allocation_all_trust_maximum_fails() {
     let p = params(0.5);
     let candidates = vec![candidate(1, 1.0), candidate(2, 1.5), candidate(3, 2.0)];
-    let result = compute_allocation(&candidates, &p);
+    let result = compute_allocation(&candidates, &p, 0);
     assert!(matches!(result, Err(PlacementError::AllTrustMaximum)));
 }
 
@@ -82,7 +82,7 @@ fn compute_allocation_all_trust_maximum_fails() {
 fn compute_allocation_filters_degenerate_keeps_valid() {
     let p = params(0.5);
     let candidates = vec![candidate(1, 1.0), candidate(2, 0.7)];
-    let result = compute_allocation(&candidates, &p);
+    let result = compute_allocation(&candidates, &p, 0);
     assert!(matches!(
         result,
         Err(PlacementError::TooFewHolders { count: 1 })
@@ -100,7 +100,7 @@ fn compute_allocation_n_too_small_returns_error() {
         overhead: 1.5,
         n: 1,
     };
-    let result = compute_allocation(&candidates, &p);
+    let result = compute_allocation(&candidates, &p, 0);
     assert!(matches!(result, Err(PlacementError::NTooSmall { .. })));
 }
 
@@ -111,7 +111,7 @@ fn compute_allocation_many_candidates_truncated_by_max_holders() {
     let candidates: Vec<_> = (0..50)
         .map(|i| candidate(i + 1, 0.3 + (i as f64) * 0.012))
         .collect();
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     assert!(allocs.len() <= 30, "got {} holders", allocs.len());
     let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
     assert_eq!(total, p.n);
@@ -135,7 +135,7 @@ fn compute_allocation_total_equals_n() {
             candidate(b, trust)
         })
         .collect();
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
     assert_eq!(total, p.n);
 }
@@ -144,7 +144,7 @@ fn compute_allocation_total_equals_n() {
 fn compute_allocation_all_above_one_symbol() {
     let p = params_large(0.5);
     let candidates: Vec<_> = (1..=10).map(|b| candidate(b, 0.5)).collect();
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     for alloc in &allocs {
         assert!(alloc.symbol_count >= 1);
     }
@@ -155,7 +155,7 @@ fn compute_allocation_none_exceed_max_per_holder() {
     let p = params_large(0.5);
     let max = p.max_per_holder();
     let candidates: Vec<_> = (1..=8).map(|b| candidate(b, 0.7)).collect();
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     for alloc in &allocs {
         assert!(alloc.symbol_count <= max);
     }
@@ -165,7 +165,7 @@ fn compute_allocation_none_exceed_max_per_holder() {
 fn compute_allocation_esi_ranges_are_contiguous_non_overlapping() {
     let p = params_large(0.5);
     let candidates: Vec<_> = (1..=10).map(|b| candidate(b, 0.6)).collect();
-    let mut allocs = compute_allocation(&candidates, &p).unwrap();
+    let mut allocs = compute_allocation(&candidates, &p, 0).unwrap();
     allocs.sort_by_key(|a| a.start_esi);
     let mut next_esi = 0;
     for alloc in &allocs {
@@ -183,7 +183,7 @@ fn compute_allocation_high_trust_holder_gets_more_symbols() {
         candidate(2, 0.3),
         candidate(3, 0.5),
     ];
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     let alloc_95 = allocs.iter().find(|a| a.identity == identity(1)).unwrap();
     let alloc_30 = allocs.iter().find(|a| a.identity == identity(2)).unwrap();
     assert!(alloc_95.symbol_count > alloc_30.symbol_count);
@@ -193,7 +193,7 @@ fn compute_allocation_high_trust_holder_gets_more_symbols() {
 fn compute_allocation_equal_trust_distributes_evenly() {
     let p = params_large(0.5);
     let candidates: Vec<_> = (0..3).map(|i| candidate(i + 1, 0.7)).collect();
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     let expected = p.n / 3;
     for alloc in &allocs {
         assert!((alloc.symbol_count as i64 - expected as i64).abs() <= 1);
@@ -209,7 +209,7 @@ fn compute_allocation_cap_enforced_with_very_high_trust() {
         candidate(2, 0.01),
         candidate(3, 0.01),
     ];
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     let alloc_99 = allocs.iter().find(|a| a.identity == identity(1)).unwrap();
     assert!(alloc_99.symbol_count <= max);
     let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
@@ -224,7 +224,7 @@ fn compute_allocation_two_candidates_minimum_viable() {
     let p = params_large(0.5);
     let max = p.max_per_holder();
     let candidates = vec![candidate(1, 0.8), candidate(2, 0.6)];
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     assert_eq!(allocs.len(), 2);
     for alloc in &allocs {
         assert!(alloc.symbol_count >= 1);
@@ -238,7 +238,7 @@ fn compute_allocation_sorted_descending_by_symbol_count() {
     let candidates: Vec<_> = (1..=6)
         .map(|b| candidate(b, b as f64 * 0.1 + 0.1))
         .collect();
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     for window in allocs.windows(2) {
         assert!(window[0].symbol_count >= window[1].symbol_count);
     }
@@ -253,7 +253,7 @@ fn compute_allocation_fifteen_holders_realistic_params() {
             candidate(b, trust)
         })
         .collect();
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     assert_eq!(allocs.len(), 15);
     let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
     assert_eq!(total, p.n);
@@ -294,7 +294,7 @@ fn compute_allocation_min_symbols_caps_holder_count_on_small_block() {
     let candidates: Vec<_> = (0..30)
         .map(|i| candidate(i + 1, 0.3 + (i as f64) * 0.02))
         .collect();
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     assert!(
         allocs.len() <= max_holders,
         "got {} holders, expected <= {max_holders} (N={}, min_sym={})",
@@ -320,7 +320,7 @@ fn compute_allocation_100_candidates_trimmed_to_30() {
     let candidates: Vec<_> = (0..100)
         .map(|i| candidate((i % 255) as u8 + 1, 0.1 + (i as f64) * 0.008))
         .collect();
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     assert_eq!(allocs.len(), 30);
     let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
     assert_eq!(total, p.n);
@@ -341,7 +341,7 @@ fn compute_allocation_works_with_bootstrap_trust() {
     // Placement must work even when all peers have very low trust.
     let p = params_large(0.5);
     let candidates: Vec<_> = (1..=5).map(|b| candidate(b, 0.04)).collect();
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
     assert_eq!(total, p.n);
     assert_eq!(allocs.len(), 5);
@@ -358,8 +358,8 @@ fn compute_allocation_is_deterministic() {
     let candidates: Vec<_> = (1..=8)
         .map(|b| candidate(b, 0.1 + (b as f64) * 0.1))
         .collect();
-    let allocs_a = compute_allocation(&candidates, &p).unwrap();
-    let allocs_b = compute_allocation(&candidates, &p).unwrap();
+    let allocs_a = compute_allocation(&candidates, &p, 0).unwrap();
+    let allocs_b = compute_allocation(&candidates, &p, 0).unwrap();
     assert_eq!(allocs_a, allocs_b);
 }
 
@@ -384,7 +384,7 @@ fn redistribution_excess_is_proportional() {
         candidate(4, 0.2),
     ];
 
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     assert_eq!(allocs.len(), 4);
 
     let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
@@ -442,7 +442,7 @@ fn compute_allocation_five_holders_all_get_symbols() {
         candidate(5, 0.9),
     ];
 
-    let allocs = compute_allocation(&candidates, &p).unwrap();
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
 
     assert_eq!(allocs.len(), 5, "all 5 holders must be allocated");
     let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
@@ -498,7 +498,7 @@ fn placement_invariants_hold_across_configurations() {
             })
             .collect();
 
-        let allocs = match compute_allocation(&candidates, &p) {
+        let allocs = match compute_allocation(&candidates, &p, 0) {
             Ok(a) => a,
             Err(_) => continue, // NTooSmall etc — skip degenerate combos
         };
@@ -580,5 +580,43 @@ fn holder_weight_positive_for_valid_trust() {
         let w = holder_weight(trust);
         assert!(w > 0.0, "holder_weight({trust}) = {w} — must be > 0");
         assert!(w.is_finite(), "holder_weight({trust}) = {w} — must be finite");
+    }
+}
+
+// ─── C6: esi_offset parameter ────────────────────────────────────────────────
+
+#[test]
+fn compute_allocation_with_esi_offset() {
+    // With esi_offset=1000, all allocated ESI ranges must start >= 1000.
+    // The first allocation's start_esi == 1000, subsequent ones are larger.
+    let offset: u32 = 1000;
+    let p = params_large(0.5);
+    let candidates: Vec<_> = (1..=5).map(|b| candidate(b, 0.5 + (b as f64) * 0.05)).collect();
+    let allocs = compute_allocation(&candidates, &p, offset).unwrap();
+
+    assert!(!allocs.is_empty());
+    let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
+    assert_eq!(total, p.n, "total symbols must equal N");
+
+    // All start ESIs must be >= offset.
+    for alloc in &allocs {
+        assert!(
+            alloc.start_esi >= offset,
+            "start_esi={} is below esi_offset={offset}",
+            alloc.start_esi
+        );
+    }
+
+    // Ranges are contiguous starting at offset.
+    let mut sorted = allocs.clone();
+    sorted.sort_by_key(|a| a.start_esi);
+    let mut cursor = offset;
+    for alloc in &sorted {
+        assert_eq!(
+            alloc.start_esi, cursor,
+            "gap in ESI range at cursor={cursor}, got start_esi={}",
+            alloc.start_esi
+        );
+        cursor = alloc.start_esi + alloc.symbol_count;
     }
 }

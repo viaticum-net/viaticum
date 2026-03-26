@@ -268,7 +268,7 @@ fn stress_5tb_metadata_scale() {
     assert_eq!(params.k, K, "expected K={K}, got {}", params.k);
     assert_eq!(params.k_eff, K_EFF, "expected K_eff={K_EFF}, got {}", params.k_eff);
 
-    let allocations = compute_allocation(&candidates, &params)
+    let allocations = compute_allocation(&candidates, &params, 0)
         .expect("compute_allocation must succeed with 30 candidates");
 
     // All placements respect MAX_HOLDERS constraint.

@@ -42,13 +42,16 @@ async fn main() -> anyhow::Result<()> {
             handle.stop();
             handle.wait().await?;
         }
-        Command::Init { mnemonic } => {
+        Command::Init { mnemonic, new_device } => {
             let dir = global_dir.clone();
-            let result = match mnemonic {
-                Some(m) => {
+            let result = match (mnemonic, new_device) {
+                (Some(m), true) => {
+                    syncback::daemon::identity::init_identity_new_device(&dir, m)
+                }
+                (Some(m), false) => {
                     syncback::daemon::identity::init_identity_from_mnemonic(&dir, m)
                 }
-                None => syncback::daemon::identity::init_identity(&dir),
+                (None, _) => syncback::daemon::identity::init_identity(&dir),
             };
             match result {
                 Ok(keyfile) => {

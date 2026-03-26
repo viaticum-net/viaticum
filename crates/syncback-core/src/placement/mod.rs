@@ -82,10 +82,16 @@ pub fn holder_weight(trust: f64) -> f64 {
 /// 8. Adjust total to exactly params.n:
 ///    - sum > n: reduce from lowest-weight holders first (keep >= 1).
 ///    - sum < n: add to highest-weight uncapped holders first.
-/// 9. Assign ESI ranges sorted by descending symbol_count (ties broken by identity bytes).
+/// 9. Assign ESI ranges starting at `esi_offset`, sorted by descending symbol_count
+///    (ties broken by identity bytes).
+///
+/// `esi_offset` is the first ESI to assign. Pass `0` for single-device or test scenarios.
+/// In a multi-device cluster, pass `esi_namespace_start(device_index)` so each device
+/// allocates non-overlapping ESI ranges.
 pub fn compute_allocation(
     candidates: &[HolderCandidate],
     params: &ErasureParams,
+    esi_offset: u32,
 ) -> Result<Vec<HolderAllocation>, PlacementError> {
     if candidates.is_empty() {
         return Err(PlacementError::NoCandidates);
@@ -227,7 +233,7 @@ pub fn compute_allocation(
     });
 
     let mut allocations = Vec::with_capacity(valid.len());
-    let mut esi_cursor: u32 = 0;
+    let mut esi_cursor: u32 = esi_offset;
 
     for idx in order {
         let count = counts[idx];

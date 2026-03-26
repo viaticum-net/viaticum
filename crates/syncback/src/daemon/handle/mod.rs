@@ -92,6 +92,9 @@ pub struct DaemonState {
     pub hard_quota_bytes: u64,
     /// Time acceleration factor (1 = real time).
     pub time_scale: u64,
+    /// Channel to post messages to the relay board (e.g. RevocationBroadcast).
+    /// None in tests that do not wire up a RelayManager.
+    pub relay_post_tx: Option<mpsc::Sender<crate::daemon::relay::RelayPost>>,
 }
 
 // ─── DaemonHandle ─────────────────────────────────────────────────────────────
@@ -298,6 +301,7 @@ impl DaemonHandle {
                 network: Some(network.clone()),
                 watch_configs: app_config.watch.clone(),
                 time_scale: cfg.time_scale.max(1),
+                mock_offer_budget_gb: None,
             },
             encoder.clone(),
         );
@@ -350,7 +354,7 @@ impl DaemonHandle {
             network: network.clone(),
             restore_tx: restore_tx.clone(),
             cluster_state: cluster_state.clone(),
-            incoming_tx: incoming_tx_for_state,
+            incoming_tx: incoming_tx_for_state.clone(),
             master_key: master_key.clone(),
             seed: keyfile.seed.clone(),
             data_dir: cfg.data_dir.clone(),
@@ -358,6 +362,7 @@ impl DaemonHandle {
             disk_reserve_bytes: syncback_core::config::disk_reserve_bytes(&app_config),
             hard_quota_bytes: syncback_core::config::hard_quota_bytes(&app_config),
             time_scale: cfg.time_scale.max(1),
+            relay_post_tx: Some(relay_post_tx.clone()),
         });
 
         // Clone state for metrics pusher before cli_server consumes it.
@@ -425,6 +430,9 @@ impl DaemonHandle {
                 },
                 cs.clone(),
             ));
+            // Clone for periodic sync task before cluster_sync is moved into Processor.
+            let cluster_sync_for_sync_loop = cluster_sync.clone();
+
             // Create channel for auto-reconnect read loops and wire to network.
             let (read_loop_tx, read_loop_rx) =
                 mpsc::unbounded_channel::<crate::daemon::network::ReadLoopRequest>();
@@ -448,11 +456,63 @@ impl DaemonHandle {
                 time_scale,
                 pending_challenges.clone(),
                 relay_post_tx.clone(),
+                Some(cs.clone()),
             );
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {
                 processor.run(incoming_rx, inbound_rx, read_loop_rx, cancel_processor).await
             }));
+
+            // ── Populate cluster_peers from stored addresses (reconnect after restart) ──
+            {
+                // Collect addrs under lock, then use them without holding guard across .await.
+                let stored: Vec<_> = {
+                    let guard = cs.lock().unwrap();
+                    guard.cluster_addrs()
+                        .iter()
+                        .filter(|(did, _)| **did != device_id)
+                        .map(|(did, hex)| (*did, hex.clone()))
+                        .collect()
+                };
+                for (dev_id, node_id_hex) in stored {
+                    // Stored as hex NodeId — parse back to EndpointAddr (relay-assisted).
+                    if node_id_hex.len() == 64 {
+                        let fake_addr = format!("{node_id_hex}@0.0.0.0:1");
+                        if let Ok(parsed) = crate::daemon::network::addr::parse_node_addr(&fake_addr) {
+                            if let Ok(ea) = crate::daemon::network::addr::to_endpoint_addr(&parsed) {
+                                network.add_cluster_peer(dev_id, ea).await;
+                                tracing::info!(?dev_id, "restored cluster peer addr from DB");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Cluster periodic sync ──────────────────────────────────────────
+            {
+                let cs_sync = cluster_sync_for_sync_loop;
+                let cs_state = cs.clone();
+                let cs_network = network.clone();
+                let cs_incoming = incoming_tx_for_state.clone();
+                let cs_interval = (300 / time_scale).max(10);
+                let cancel_cs = cancel.clone();
+                tasks.push(tokio::spawn(async move {
+                    if let Err(e) = crate::daemon::cluster_sync::run_periodic_sync(
+                        cs_sync,
+                        cs_state,
+                        cs_network,
+                        device_id,
+                        cs_interval,
+                        cancel_cs,
+                        cs_incoming,
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %e, "cluster periodic sync failed");
+                    }
+                    Ok(())
+                }));
+            }
         } else {
             tracing::warn!("cluster state unavailable — Processor not started, incoming connections will be dropped");
             // Drop incoming_rx so the network accept loop's incoming_tx send() will

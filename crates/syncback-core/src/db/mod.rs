@@ -472,6 +472,17 @@ impl Db {
         }
         Ok(records)
     }
+
+    /// Sum of bytes committed to the network (Active source blocks only).
+    /// Uses encrypted_size if available, falls back to k * t as a conservative estimate.
+    /// k * t is the padded encoded size before trim — a safe upper bound for legacy records.
+    pub fn committed_bytes(&self) -> Result<u64, DbError> {
+        let blocks = self.list_source_blocks_by_status(SourceBlockStatus::Active)?;
+        Ok(blocks
+            .iter()
+            .map(|b| b.encrypted_size.unwrap_or(b.k as u64 * b.t as u64))
+            .sum())
+    }
 }
 
 // ============================================================
@@ -709,6 +720,24 @@ impl Db {
             }
         }
         Ok(records)
+    }
+
+    /// Return the high-water mark ESI for a source block.
+    ///
+    /// Scans all placements for `block_id` and returns `max(start + count)` across
+    /// all `esi_ranges` entries. Returns 0 if there are no placements.
+    ///
+    /// Used by RepairAgent to allocate new ESI ranges that do not overlap existing
+    /// ones when placing a repaired block on a new holder.
+    pub fn max_esi_for_block(&self, block_id: &SourceBlockId) -> Result<u32, DbError> {
+        let placements = self.list_placements_for_block(block_id)?;
+        let max_esi = placements
+            .iter()
+            .flat_map(|p| p.esi_ranges.iter())
+            .map(|(start, count)| start.saturating_add(*count))
+            .max()
+            .unwrap_or(0);
+        Ok(max_esi)
     }
 
     /// Convenience: list all file_ids a holder has symbols for (via holder_files index).

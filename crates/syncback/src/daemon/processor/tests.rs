@@ -154,6 +154,7 @@ async fn make_processor_with_quota(
         1, // time_scale
         pending_challenges,
         relay_post_tx,
+        None, // cluster_state: not needed for handler unit tests
     );
 
     (processor, repair_rx, relay_sync_rx)
@@ -217,6 +218,7 @@ async fn make_processor_with_pending(
         1, // time_scale
         pending,
         relay_post_tx,
+        None, // cluster_state: not needed for handler unit tests
     );
 
     (processor, repair_rx, relay_sync_rx)
@@ -293,6 +295,7 @@ async fn symbol_accept_updates_backup_event() {
         1,
         pending,
         relay_post_tx,
+        None, // cluster_state: not needed for handler unit tests
     );
 
     let holder = make_identity(7);
@@ -2122,6 +2125,7 @@ async fn dispatch_relay_pos_challenge_sends_response_via_board() {
         holdings_dir.path().to_path_buf(), 0,
         backup_event_tx, 1,
         pending, relay_post_tx,
+        None, // cluster_state: not needed for this test
     );
 
     // Create a symbol file so PoS can respond.
@@ -2197,4 +2201,244 @@ async fn dispatch_relay_delete_marks_holding() {
 
     let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
     assert_eq!(updated.status, HoldingStatus::MarkedForDelete);
+}
+
+// ─── C2: cluster device auto-add tests ───────────────────────────────────────
+//
+// These tests drive try_auto_add_cluster_device directly, bypassing the
+// run() loop (which needs a real iroh Connection). The method is #[cfg(test)]
+// and contains the same logic as the run() loop auto-add block.
+
+/// Build a Processor with a real ClusterState containing one device (seed byte 0xAA),
+/// and return (processor, cluster_state, own_master_identity).
+async fn make_processor_with_cluster_state(
+    db: Db,
+    holdings_dir: &TempDir,
+    source_blocks_dir: &TempDir,
+) -> (
+    Processor,
+    Arc<Mutex<ClusterState>>,
+    IdentityPub,
+) {
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
+    let (relay_sync_tx, _relay_sync_rx) = mpsc::channel::<SyncTrigger>(16);
+
+    let master_key = derive_master_key(&[0xAAu8; 64]).expect("derive_master_key");
+    let own_identity = master_identity(&master_key);
+    let device_id_a = DeviceId([0x01u8; 16]);
+    let now = Timestamp::now();
+
+    let cert_a = syncback_core::cluster::issue_device_certificate(
+        &master_key, device_id_a, [0xA0u8; 32], now,
+    );
+    let cluster_state = ClusterState::init(db.clone(), own_identity, cert_a, now, now)
+        .expect("ClusterState::init");
+    let cluster_state = Arc::new(Mutex::new(cluster_state));
+
+    let cluster_sync = Arc::new(ClusterSyncManager::new(
+        db.clone(),
+        ClusterSyncConfig { our_device_id: device_id_a, batch_size: 1000 },
+        cluster_state.clone(),
+    ));
+
+    let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
+    let network = make_network().await;
+    let (backup_event_tx, _backup_event_rx) =
+        mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
+    let pending: crate::daemon::scheduler::PendingChallenges =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
+
+    let processor = Processor::new(
+        db,
+        own_identity,
+        repair_tx,
+        cluster_sync,
+        encoder,
+        holdings_dir.path().to_path_buf(),
+        source_blocks_dir.path().to_path_buf(),
+        network,
+        relay_sync_tx,
+        u64::MAX,
+        u64::MAX,
+        holdings_dir.path().to_path_buf(),
+        0,
+        backup_event_tx,
+        1,
+        pending,
+        relay_post_tx,
+        Some(cluster_state.clone()),
+    );
+
+    (processor, cluster_state, own_identity)
+}
+
+/// Build a DeviceCertificate for device_id using the given master_key and device_pub_key.
+fn make_device_cert(
+    master_key: &ed25519_dalek::SigningKey,
+    device_id: DeviceId,
+    device_pub_key: [u8; 32],
+) -> syncback_core::cluster::DeviceCertificate {
+    syncback_core::cluster::issue_device_certificate(master_key, device_id, device_pub_key, Timestamp::now())
+}
+
+// cluster_device_auto_added_when_same_master_identity
+//
+// Given: Processor with own_identity = ID_M, cluster_state with device_A (0x01*16).
+//        peer_master_identity = ID_M (same master), cert for device_B (0x02*16).
+// When: try_auto_add_cluster_device called.
+// Then: returns true, cluster_state contains device_B.
+
+#[tokio::test]
+async fn cluster_device_auto_added_when_same_master_identity() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+
+    let (processor, cluster_state, own_identity) =
+        make_processor_with_cluster_state(db, &holdings_dir, &source_dir).await;
+
+    // Build a cert for device_B using the same master key.
+    let master_key = derive_master_key(&[0xAAu8; 64]).expect("derive_master_key");
+    let device_id_b = DeviceId([0x02u8; 16]);
+    let cert_b = make_device_cert(&master_key, device_id_b, [0xB0u8; 32]);
+
+    // Dummy endpoint addr — use a real ed25519 verifying key to form a valid iroh PublicKey.
+    let dummy_iroh_key = ed25519_dalek::SigningKey::from_bytes(&[0xF0u8; 32]);
+    let dummy_addr = iroh::EndpointAddr::new(
+        iroh::PublicKey::from_bytes(&dummy_iroh_key.verifying_key().to_bytes()).unwrap(),
+    );
+
+    let added = processor
+        .try_auto_add_cluster_device(Some(own_identity), Some(cert_b), dummy_addr)
+        .await;
+
+    assert!(added, "device_B must be auto-added");
+
+    let devices = cluster_state.lock().unwrap();
+    assert!(
+        devices.get_device(&device_id_b).is_some(),
+        "cluster_state must contain device_B after auto-add"
+    );
+}
+
+// cluster_device_not_added_when_different_master_identity
+//
+// Given: Processor with own_identity = ID_M.
+//        peer_master_identity = ID_OTHER (different master).
+// When: try_auto_add_cluster_device called.
+// Then: returns false, cluster_state unchanged (still 1 device).
+
+#[tokio::test]
+async fn cluster_device_not_added_when_different_master_identity() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+
+    let (processor, cluster_state, _own_identity) =
+        make_processor_with_cluster_state(db, &holdings_dir, &source_dir).await;
+
+    // Build a cert from a different master key.
+    let other_master_key = derive_master_key(&[0xBBu8; 64]).expect("derive_master_key");
+    let other_identity = master_identity(&other_master_key);
+    let device_id_x = DeviceId([0x0Eu8; 16]);
+    let cert_x = make_device_cert(&other_master_key, device_id_x, [0xE0u8; 32]);
+
+    let dummy_iroh_key = ed25519_dalek::SigningKey::from_bytes(&[0xF1u8; 32]);
+    let dummy_addr = iroh::EndpointAddr::new(
+        iroh::PublicKey::from_bytes(&dummy_iroh_key.verifying_key().to_bytes()).unwrap(),
+    );
+
+    let added = processor
+        .try_auto_add_cluster_device(Some(other_identity), Some(cert_x), dummy_addr)
+        .await;
+
+    assert!(!added, "device from different master must not be auto-added");
+
+    // Only the original device_A (0x01*16) should be present.
+    let devices = cluster_state.lock().unwrap();
+    assert_eq!(
+        devices.all_devices().len(),
+        1,
+        "cluster_state must remain unchanged"
+    );
+}
+
+// cluster_device_auto_add_idempotent_when_already_registered
+//
+// Given: Processor with cluster_state already containing device_B.
+// When: try_auto_add_cluster_device called twice with cert_B.
+// Then: second call returns false (already registered), cluster_state has device_B exactly once.
+
+#[tokio::test]
+async fn cluster_device_auto_add_idempotent_when_already_registered() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+
+    let (processor, cluster_state, own_identity) =
+        make_processor_with_cluster_state(db, &holdings_dir, &source_dir).await;
+
+    let master_key = derive_master_key(&[0xAAu8; 64]).expect("derive_master_key");
+    let device_id_b = DeviceId([0x02u8; 16]);
+    let cert_b = make_device_cert(&master_key, device_id_b, [0xB0u8; 32]);
+    let dummy_iroh_key = ed25519_dalek::SigningKey::from_bytes(&[0xF2u8; 32]);
+    let dummy_addr = iroh::EndpointAddr::new(
+        iroh::PublicKey::from_bytes(&dummy_iroh_key.verifying_key().to_bytes()).unwrap(),
+    );
+
+    // First call: should succeed.
+    let first = processor
+        .try_auto_add_cluster_device(Some(own_identity), Some(cert_b.clone()), dummy_addr.clone())
+        .await;
+    assert!(first, "first auto-add must succeed");
+
+    // Second call: same cert, same device_id — must be idempotent.
+    let second = processor
+        .try_auto_add_cluster_device(Some(own_identity), Some(cert_b), dummy_addr)
+        .await;
+    assert!(!second, "second auto-add must return false (already registered)");
+
+    // Only 2 devices total: original device_A + device_B.
+    let devices = cluster_state.lock().unwrap();
+    assert_eq!(
+        devices.all_devices().len(),
+        2,
+        "cluster_state must have exactly 2 devices"
+    );
+}
+
+// cluster_device_not_added_when_no_cert
+//
+// Given: Processor, peer_master_identity = own_identity, peer_device_cert = None.
+// When: try_auto_add_cluster_device called.
+// Then: returns false, cluster_state unchanged.
+
+#[tokio::test]
+async fn cluster_device_not_added_when_no_cert() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+
+    let (processor, cluster_state, own_identity) =
+        make_processor_with_cluster_state(db, &holdings_dir, &source_dir).await;
+
+    let dummy_iroh_key = ed25519_dalek::SigningKey::from_bytes(&[0xF3u8; 32]);
+    let dummy_addr = iroh::EndpointAddr::new(
+        iroh::PublicKey::from_bytes(&dummy_iroh_key.verifying_key().to_bytes()).unwrap(),
+    );
+
+    // cert is None — even though master identity matches.
+    let added = processor
+        .try_auto_add_cluster_device(Some(own_identity), None, dummy_addr)
+        .await;
+
+    assert!(!added, "no-cert case must not add any device");
+
+    let devices = cluster_state.lock().unwrap();
+    assert_eq!(
+        devices.all_devices().len(),
+        1,
+        "cluster_state must remain unchanged with no cert"
+    );
 }

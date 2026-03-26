@@ -164,7 +164,7 @@ pub(crate) async fn dispatch(request: CliRequest, state: &DaemonState) -> CliRes
         CliRequest::DeviceAdd { label } => dispatch_device_add(state, label),
 
         CliRequest::DeviceRevoke { device_id_hex } => {
-            dispatch_device_revoke(state, device_id_hex)
+            dispatch_device_revoke(state, device_id_hex).await
         }
 
         CliRequest::Connect { addr } => dispatch_connect(state, addr).await,
@@ -601,9 +601,13 @@ fn dispatch_device_add(state: &DaemonState, label: String) -> CliResponse {
 
 // ── Device revoke ─────────────────────────────────────────────────────────────
 
-fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> CliResponse {
+async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> CliResponse {
     use syncback_core::cluster::{issue_revocation, EpochCounter};
+    use syncback_core::messages::to_cbor;
     use syncback_core::types::DeviceId;
+
+    use crate::daemon::cluster_sync::ClusterSyncManager;
+    use crate::daemon::relay::RelayPost;
 
     let cluster_state = match &state.cluster_state {
         Some(cs) => cs,
@@ -638,21 +642,62 @@ fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> CliResp
         return CliResponse::Error("cannot revoke the current device".to_string());
     }
 
-    let mut cs = cluster_state.lock().expect("cluster_state lock");
-    let new_epoch = EpochCounter(cs.current_epoch().0 + 1);
-    let now = Timestamp::now();
+    // Lock scope: extract data and revoke. Drop guard before any await.
+    let (revocation, device_cert, new_epoch) = {
+        let mut cs = cluster_state.lock().expect("cluster_state lock");
+        let new_epoch = EpochCounter(cs.current_epoch().0 + 1);
+        let now = Timestamp::now();
 
-    let revocation = issue_revocation(&state.master_key, device_id, now, new_epoch);
-    if let Err(e) = cs.revoke_device(revocation, now, now) {
-        return CliResponse::Error(format!("revocation failed: {e}"));
-    }
-    drop(cs);
+        // Capture the device certificate before revoking (needed for broadcast).
+        let device_cert = cs.get_device(&device_id).map(|e| e.certificate.clone());
+
+        let revocation = issue_revocation(&state.master_key, device_id, now, new_epoch);
+        if let Err(e) = cs.revoke_device(revocation.clone(), now, now) {
+            return CliResponse::Error(format!("revocation failed: {e}"));
+        }
+        // Guard dropped here — no MutexGuard crosses the await boundary below.
+        (revocation, device_cert, new_epoch)
+    };
 
     tracing::info!(
         device_id = %device_id_hex,
         new_epoch = new_epoch.0,
         "device revoked, epoch rotated"
     );
+
+    // Post RevocationBroadcast to relay board so peers learn about the revocation.
+    if let (Some(cert), Some(relay_tx)) = (device_cert, &state.relay_post_tx) {
+        let broadcast = ClusterSyncManager::build_revocation_broadcast(&revocation, &cert);
+        match to_cbor(&broadcast) {
+            Ok(payload) => {
+                let msg_id: [u8; 16] = rand::random();
+                let post = RelayPost {
+                    msg_type: "revocation_broadcast".to_string(),
+                    target: None, // broadcast — no specific target
+                    payload,
+                    msg_id,
+                };
+                if relay_tx.send(post).await.is_err() {
+                    tracing::warn!(
+                        device_id = %device_id_hex,
+                        "relay channel closed — revocation broadcast not delivered"
+                    );
+                } else {
+                    tracing::info!(
+                        device_id = %device_id_hex,
+                        "revocation broadcast posted to relay board"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    device_id = %device_id_hex,
+                    err = %e,
+                    "failed to CBOR-encode revocation broadcast"
+                );
+            }
+        }
+    }
 
     CliResponse::DeviceRevoked { device_id_hex }
 }

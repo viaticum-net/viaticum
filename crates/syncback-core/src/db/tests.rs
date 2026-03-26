@@ -500,6 +500,64 @@ fn list_source_blocks_by_status() {
 }
 
 // ============================================================
+// committed_bytes
+// ============================================================
+
+#[test]
+fn committed_bytes_sums_active_blocks() {
+    let db = test_db();
+
+    // Block A: Active, encrypted_size=Some(1000)
+    let block_a = SourceBlockRecord {
+        block_id: block_id(10),
+        k: 5,
+        t: 100,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(1000),
+        encrypted_size: Some(1000),
+        n: None,
+        overhead: None,
+    };
+
+    // Block B: Active, encrypted_size=None → fallback to k*t = 10*100 = 1000
+    let block_b = SourceBlockRecord {
+        block_id: block_id(11),
+        k: 10,
+        t: 100,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(1000),
+        encrypted_size: None,
+        n: None,
+        overhead: None,
+    };
+
+    // Block C: Deleted, encrypted_size=Some(500) → must NOT be counted
+    let block_c = SourceBlockRecord {
+        block_id: block_id(12),
+        k: 5,
+        t: 100,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Deleted,
+        created_at: Timestamp(1000),
+        encrypted_size: Some(500),
+        n: None,
+        overhead: None,
+    };
+
+    db.upsert_source_block(&block_a).unwrap();
+    db.upsert_source_block(&block_b).unwrap();
+    db.upsert_source_block(&block_c).unwrap();
+
+    let total = db.committed_bytes().unwrap();
+    // A: 1000 (encrypted_size)
+    // B: 10 * 100 = 1000 (fallback k*t)
+    // C: excluded (Deleted)
+    assert_eq!(total, 2000, "expected 1000 + 1000 = 2000, got {total}");
+}
+
+// ============================================================
 // Extra: budget singleton
 // ============================================================
 
@@ -1085,4 +1143,87 @@ fn refresh_peer_storage_bytes_noop_for_unknown_peer() {
     // Must not panic or return an error.
     db.refresh_peer_storage_bytes(&unknown).unwrap();
     assert!(db.get_peer(&unknown).unwrap().is_none());
+}
+
+// ============================================================
+// max_esi_for_block
+// ============================================================
+
+/// max_esi_for_block returns 0 when no placements exist for a block.
+#[test]
+fn max_esi_for_block_no_placements_returns_zero() {
+    let db = test_db();
+    let bid = block_id(0xAA);
+    let result = db.max_esi_for_block(&bid).unwrap();
+    assert_eq!(result, 0);
+}
+
+/// max_esi_for_block returns max(start + count) across all placements and ranges.
+#[test]
+fn max_esi_for_block_returns_high_watermark() {
+    let db = test_db();
+    let bid = block_id(0xBB);
+    let peer_a = IdentityPub([1u8; 32]);
+    let peer_b = IdentityPub([2u8; 32]);
+    let fid = FileId(1);
+
+    // Placement A: ESI range (0, 100) → high = 100
+    let p_a = SymbolPlacement {
+        source_block_id: bid,
+        holder_id: peer_a,
+        file_id: fid,
+        esi_ranges: vec![(0, 100)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp(1000),
+        consecutive_misses: 0,
+    };
+    // Placement B: ESI range (100, 50) → high = 150
+    let p_b = SymbolPlacement {
+        source_block_id: bid,
+        holder_id: peer_b,
+        file_id: fid,
+        esi_ranges: vec![(100, 50)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp(1000),
+        consecutive_misses: 0,
+    };
+
+    db.upsert_source_block(&make_source_block(0xBB, SourceBlockStatus::Active)).unwrap();
+    db.upsert_placement(&p_a).unwrap();
+    db.upsert_placement(&p_b).unwrap();
+
+    let hwm = db.max_esi_for_block(&bid).unwrap();
+    assert_eq!(hwm, 150, "expected high-watermark = 150 (100+50)");
+}
+
+/// max_esi_for_block handles multiple esi_ranges within a single placement.
+#[test]
+fn max_esi_for_block_multiple_ranges_in_one_placement() {
+    let db = test_db();
+    let bid = block_id(0xCC);
+    let peer = IdentityPub([3u8; 32]);
+    let fid = FileId(2);
+
+    // Placement with two non-contiguous ranges: (0, 30) and (500, 20) → high = 520
+    let p = SymbolPlacement {
+        source_block_id: bid,
+        holder_id: peer,
+        file_id: fid,
+        esi_ranges: vec![(0, 30), (500, 20)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp(1000),
+        consecutive_misses: 0,
+    };
+
+    db.upsert_source_block(&make_source_block(0xCC, SourceBlockStatus::Active)).unwrap();
+    db.upsert_placement(&p).unwrap();
+
+    let hwm = db.max_esi_for_block(&bid).unwrap();
+    assert_eq!(hwm, 520, "expected high-watermark = 520 (500+20)");
 }

@@ -67,6 +67,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         network: None,
         watch_configs: vec![],
         time_scale: 1,
+        mock_offer_budget_gb: None,
     }
 }
 
@@ -362,7 +363,7 @@ fn placement_produces_valid_allocation_for_pipeline() {
 
     let params = ErasureParams::compute(stored.len() as u64, 0.5);
     let holders = test_holders_small();
-    let allocations = compute_allocation(&holders, &params).unwrap();
+    let allocations = compute_allocation(&holders, &params, 0).unwrap();
     assert!(!allocations.is_empty(), "should allocate to at least one holder");
 
     let block_id = SourceBlockId(*blake3::hash(&stored).as_bytes());
@@ -535,7 +536,7 @@ fn full_pipeline_backup_encode_decode_decrypt() {
     // Step 3: compute ErasureParams and placement allocation
     let params = ErasureParams::compute(stored.len() as u64, 0.5);
     let holders = test_holders_small();
-    let allocations = compute_allocation(&holders, &params).unwrap();
+    let allocations = compute_allocation(&holders, &params, 0).unwrap();
 
     // source_block_id = blake3(stored)
     let block_id = SourceBlockId(*blake3::hash(&stored).as_bytes());

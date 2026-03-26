@@ -4,7 +4,7 @@
 //   - Scan for holdings where MarkedForDelete cooldown has expired → delete files + DB record → post SymbolDropped.
 //   - Evaluate disk pressure periodically → evict lowest-priority holdings → post SymbolDropped.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use syncback_core::budget::{evaluate_pressure, DiskPressure};
 use syncback_core::constants::{KI, KP, S_CLAMP_MAX, S_CLAMP_MIN};
@@ -28,6 +28,7 @@ mod tests;
 ///    post SymbolDropped to the board (directed to the owner).
 /// 2. **Pressure tick** (every `pressure_interval_secs`): evaluate disk pressure.
 ///    On hard pressure, evict lowest-priority holdings and post SymbolDropped.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     db: Db,
     holdings_dir: PathBuf,
@@ -80,7 +81,7 @@ pub async fn run(
 /// Delete holdings whose MarkedForDelete cooldown has expired.
 async fn cleanup_expired(
     db: &Db,
-    holdings_dir: &PathBuf,
+    holdings_dir: &Path,
     relay_post_tx: &mpsc::Sender<RelayPost>,
     time_scale: u64,
 ) -> anyhow::Result<()> {
@@ -146,13 +147,14 @@ async fn cleanup_expired(
 }
 
 /// Evaluate disk pressure and evict if necessary.
+#[allow(clippy::too_many_arguments)]
 async fn check_pressure(
     db: &Db,
-    holdings_dir: &PathBuf,
+    holdings_dir: &Path,
     relay_post_tx: &mpsc::Sender<RelayPost>,
     soft_quota_bytes: u64,
     hard_quota_bytes: u64,
-    data_dir: &PathBuf,
+    data_dir: &Path,
     disk_reserve_bytes: u64,
 ) -> anyhow::Result<()> {
     let now = Timestamp::now();
