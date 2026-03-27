@@ -287,12 +287,16 @@ def main():
         if new_denials > 0 or (not success_a and not success_b):
             results["passed"].append("restore_denied_early")
             print(f"  Early restore correctly denied (denials={new_denials})")
-        else:
-            # It may have succeeded if backup took long enough (>60s wall = 70+ days scaled)
-            # In that case the test still passes but we note the timing
+        elif early_elapsed > 60.0:
+            # Backup took long enough to accrue budget (>60s wall = 70+ scaled days) — timing edge case.
             results["passed"].append("restore_denied_early")
             print(f"  Note: early restore not denied (backup took {early_elapsed:.0f}s "
-                  f"— may have accrued enough budget)")
+                  f"— accrued enough budget during backup)")
+        else:
+            # Both restores succeeded AND no denials AND backup finished quickly → escrow not working.
+            results["failed"].append("restore_denied_early")
+            print(f"  FAIL: early restore not denied and backup took only {early_elapsed:.0f}s "
+                  f"— escrow budget check appears broken")
         print()
 
         # -- Phase 5: restore_succeeds_after_aging --
@@ -358,9 +362,20 @@ def main():
             results["passed"].append("budget_exhausted")
             print(f"  Budget correctly exhausted after use (denials={new_denials2})")
         else:
-            # Budget grew while we were testing phase 5 — may have enough for two runs
-            results["passed"].append("budget_exhausted")
-            print(f"  Note: budget may have continued growing — both runs succeeded")
+            # Compute how much time elapsed — if very large, budget truly grew enough for two runs.
+            total_elapsed_ex = time.time() - backup_complete_time
+            scaled_days_ex = total_elapsed_ex * ts / 86400
+            if scaled_days_ex > 300:
+                # Budget genuinely grew large enough to cover two full restores — not a bug.
+                results["passed"].append("budget_exhausted")
+                print(f"  Note: budget grew large enough for two runs "
+                      f"({scaled_days_ex:.0f} scaled days elapsed)")
+            else:
+                # Both restores succeeded immediately after phase 5 with no denials → budget not consumed.
+                results["failed"].append("budget_exhausted")
+                print(f"  FAIL: both restores succeeded immediately after prior restore "
+                      f"({scaled_days_ex:.0f} scaled days elapsed) "
+                      f"— budget not being consumed on restore")
         print()
 
         # -- Phase 7: budget_recovers --

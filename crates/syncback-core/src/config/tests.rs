@@ -3,7 +3,7 @@ use std::io::Write;
 
 #[cfg(test)]
 use crate::config::{
-    AppConfig, BackupCfg, ClusterCfg, ConfigError, EscrowCfg, MetricsCfg, NetworkCfg, StorageCfg, WatchConfig,
+    AppConfig, BackupCfg, ClusterCfg, ConfigError, EscrowCfg, MetricsCfg, NetworkCfg, StorageCfg, WatchConfig, WebApiCfg,
     disk_reserve_bytes, expand_data_dir, hard_quota_bytes, lookup_importance, soft_quota_bytes,
     source_block_size_bytes, DEFAULT_IMPORTANCE,
 };
@@ -72,12 +72,14 @@ fn config_roundtrips_all_fields() {
             relay_max_size_mb: 4,
             relay_ttl_days: 14,
             enable_relay: false,
+            relay_url: None,
             bootstrap_peers: vec![],
         },
         cluster: ClusterCfg {
             sync_batch_size: 200,
         },
         metrics: MetricsCfg::default(),
+        web_api: WebApiCfg::default(),
         watch: vec![],
     };
 
@@ -397,6 +399,32 @@ fn network_cfg_bootstrap_peers_empty_array_in_toml() {
 fn network_cfg_bootstrap_peers_missing_section_defaults_empty() {
     let app: AppConfig = toml::from_str("").unwrap();
     assert!(app.network.bootstrap_peers.is_empty());
+}
+
+// ============================================================
+// relay_url tests
+// ============================================================
+
+#[test]
+fn network_cfg_relay_url_defaults_none() {
+    let cfg = NetworkCfg::default();
+    assert!(cfg.relay_url.is_none());
+}
+
+#[test]
+fn network_cfg_relay_url_loads_from_toml() {
+    let toml = r#"
+[network]
+relay_url = "http://my-relay:3340"
+"#;
+    let app: AppConfig = toml::from_str(toml).unwrap();
+    assert_eq!(app.network.relay_url.as_deref(), Some("http://my-relay:3340"));
+}
+
+#[test]
+fn network_cfg_relay_url_missing_defaults_none() {
+    let app: AppConfig = toml::from_str("[network]\nenable_relay = true\n").unwrap();
+    assert!(app.network.relay_url.is_none());
 }
 
 // ============================================================

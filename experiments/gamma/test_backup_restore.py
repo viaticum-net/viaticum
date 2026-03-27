@@ -327,8 +327,41 @@ enable_relay = false
             results["failed"].append("restore_bytewise_match")
         print()
 
-        # ── Phase 9: Check status consistency ────────────────────────────
-        print("Phase 9: Status consistency checks")
+        # ── Phase 9: Health check ─────────────────────────────────────
+        print("Phase 9: Block health check")
+        s = node_status(backup_node)
+        at_risk = s.get("blocks_at_risk", 0)
+        if at_risk == 0:
+            results["passed"].append("blocks_not_at_risk")
+            print(f"    blocks_at_risk=0: OK")
+        else:
+            results["failed"].append("blocks_not_at_risk")
+            print(f"    blocks_at_risk={at_risk}: FAIL")
+        print()
+
+        # ── Phase 10: Negative restore (nonexistent file) ────────────
+        print("Phase 10: Negative test — restore nonexistent file")
+        try:
+            out = exec_node(backup_node, "syncback", "restore",
+                            "/data/files/does_not_exist.txt",
+                            "--dest", "/tmp/neg_restore", timeout=30)
+            # CLI may return 0 even for unknown files (known issue).
+            # Check that no actual file was produced.
+            check = exec_node_quiet(backup_node, "ls",
+                                    "/tmp/neg_restore/data/files/does_not_exist.txt")
+            if not check:
+                results["passed"].append("negative_restore_no_output")
+                print(f"    Restore produced no output file (correct)")
+            else:
+                results["failed"].append("negative_restore_no_output")
+                print(f"    Restore produced a file for nonexistent path (bug)")
+        except RuntimeError:
+            results["passed"].append("negative_restore_no_output")
+            print(f"    Restore correctly rejected nonexistent file")
+        print()
+
+        # ── Phase 11: Check status consistency ───────────────────────
+        print("Phase 11: Status consistency checks")
 
         # Owner should have blocks_ok > 0
         s = node_status(backup_node)

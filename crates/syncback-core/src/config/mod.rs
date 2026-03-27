@@ -134,6 +134,13 @@ pub struct NetworkCfg {
     /// Default: true.
     pub enable_relay: bool,
 
+    /// Custom iroh relay URL. When set with enable_relay = true, uses
+    /// RelayMode::Custom pointing at this URL instead of the public iroh relays.
+    /// Format: "http://hostname:port" (dev mode) or "https://hostname" (production).
+    /// Default: None (use public iroh relay infrastructure).
+    #[serde(default)]
+    pub relay_url: Option<String>,
+
     /// Bootstrap peer addresses to connect on startup.
     /// Format: "NodeId_hex@ip:port" or "NodeId_hex@relay_url,ip:port".
     /// Default: [] (empty — no bootstrap peers).
@@ -177,6 +184,7 @@ impl Default for NetworkCfg {
             relay_max_size_mb: MAX_BOARD_SIZE_BYTES / 1_048_576,
             relay_ttl_days: RELAY_TTL_SECS / 86400,
             enable_relay: true,
+            relay_url: None,
             bootstrap_peers: vec![],
         }
     }
@@ -226,6 +234,33 @@ impl Default for MetricsCfg {
 }
 
 // ============================================================
+// Web API config
+// ============================================================
+
+/// Configuration for the built-in web UI / JSON API server.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WebApiCfg {
+    /// Enable the web API server.
+    pub enabled: bool,
+    /// TCP port to bind.
+    pub port: u16,
+    /// Directory containing the built SPA (index.html + assets).
+    /// Relative to data_dir if not absolute. Empty = no static file serving.
+    pub static_dir: String,
+}
+
+impl Default for WebApiCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 8384,
+            static_dir: String::new(),
+        }
+    }
+}
+
+// ============================================================
 // Top-level config
 // ============================================================
 
@@ -240,6 +275,7 @@ pub struct AppConfig {
     pub network: NetworkCfg,
     pub cluster: ClusterCfg,
     pub metrics: MetricsCfg,
+    pub web_api: WebApiCfg,
     /// Per-directory watch configuration.
     /// Listed as [[watch]] array in config.toml.
     /// When empty, watch_dirs from CLI are used with DEFAULT_IMPORTANCE.
@@ -355,6 +391,13 @@ impl AppConfig {
             });
         }
 
+        if self.web_api.enabled && self.web_api.port == 0 {
+            return Err(ConfigError::Validation {
+                field: "web_api.port".to_string(),
+                reason: "port must be > 0 when web_api is enabled".to_string(),
+            });
+        }
+
         if self.metrics.enabled && self.metrics.push_url.is_empty() {
             return Err(ConfigError::Validation {
                 field: "metrics.push_url".to_string(),
@@ -407,6 +450,24 @@ pub fn disk_reserve_bytes(cfg: &AppConfig) -> u64 {
 /// If the env var is missing, returns the path as-is (no `~` expansion).
 pub fn expand_data_dir(cfg: &AppConfig) -> PathBuf {
     let s = &cfg.storage.data_dir;
+    if s == "~" {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_default();
+        return PathBuf::from(home);
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_default();
+        PathBuf::from(home).join(rest)
+    } else {
+        PathBuf::from(s)
+    }
+}
+
+/// Expand `~` in a watch path to the user's home directory and return as PathBuf.
+pub fn expand_watch_path(s: &str) -> PathBuf {
     if s == "~" {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))

@@ -282,7 +282,13 @@ def main():
         backed_after_w2 = s.get("backed_up_files", 0)
         print(f"    After wave 2: blocks_ok={blocks_after_w2}, "
               f"backed_up={backed_after_w2}")
-        results["passed"].append("wave2_standard")
+        std_backed = count_backed_up_in_dir(owner, "/data/files/standard")
+        print(f"    Standard files actually backed up: {std_backed}/10")
+        if std_backed > 0:
+            results["passed"].append("wave2_standard")
+        else:
+            results["failed"].append("wave2_standard")
+            print(f"    FAIL: no standard files backed up after wave 2")
 
         # Check holder storage usage
         for h in holders[:2]:
