@@ -248,7 +248,14 @@ impl DaemonHandle {
         });
 
         let relay_mode = if app_config.network.enable_relay {
-            RelayMode::Default
+            if let Some(url_str) = &app_config.network.relay_url {
+                let relay_url: iroh::RelayUrl = url_str
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid relay_url '{url_str}': {e}"))?;
+                RelayMode::custom([relay_url])
+            } else {
+                RelayMode::Default
+            }
         } else {
             RelayMode::Disabled
         };
@@ -266,6 +273,7 @@ impl DaemonHandle {
 
         let net_config = NetworkConfig {
             signing_key: device_key.clone(),
+            master_signing_key: master_key.clone(),
             master_identity: identity_pub,
             known_peers,
             device_cert: device_cert_for_network,
@@ -365,7 +373,12 @@ impl DaemonHandle {
             relay_post_tx: Some(relay_post_tx.clone()),
         });
 
-        // Clone state for metrics pusher before cli_server consumes it.
+        // Clone state for web API and metrics pusher before cli_server consumes it.
+        let state_for_web_api = if app_config.web_api.enabled {
+            Some(state.clone())
+        } else {
+            None
+        };
         let state_for_metrics = if app_config.metrics.enabled {
             Some(state.clone())
         } else {
@@ -408,6 +421,27 @@ impl DaemonHandle {
             cli_handle.await.map_err(|e| anyhow::anyhow!("cli_server task panicked: {e}"))?;
             Ok(())
         }));
+
+        // ── Web API server (optional) ─────────────────────────────────────────
+        if let Some(web_state) = state_for_web_api {
+            let static_dir = if app_config.web_api.static_dir.is_empty() {
+                None
+            } else {
+                let p = std::path::PathBuf::from(&app_config.web_api.static_dir);
+                Some(if p.is_absolute() { p } else { cfg.data_dir.join(p) })
+            };
+            let web_config = crate::daemon::web_api::WebApiConfig {
+                port: app_config.web_api.port,
+                static_dir,
+            };
+            let web_handle = crate::daemon::web_api::start(
+                web_config,
+                cancel.clone(),
+                web_state,
+            )
+            .await?;
+            tasks.push(web_handle);
+        }
 
         // ── Phase 7.2: spawn Processor ────────────────────────────────────────
         // Create the PendingChallenges map here so both Processor and Scheduler
@@ -524,12 +558,23 @@ impl DaemonHandle {
         }
 
         // Phase 6.4: spawn Watcher when watch_dirs are configured.
-        if !cfg.watch_dirs.is_empty() {
+        // Merge CLI --watch-dir with [[watch]] paths from config.
+        let mut all_watch_dirs = cfg.watch_dirs.clone();
+        for wc in &app_config.watch {
+            let p = syncback_core::config::expand_watch_path(&wc.path);
+            if !all_watch_dirs.contains(&p) {
+                all_watch_dirs.push(p);
+            }
+        }
+        if !all_watch_dirs.is_empty() {
             let watcher_config = WatcherConfig {
-                watch_dirs: cfg.watch_dirs.clone(),
+                watch_dirs: all_watch_dirs,
                 device_id,
                 // Debounce 200 ms by default; scale by time_scale for testing.
                 debounce_ms: 200 / time_scale.max(1),
+                data_dir: cfg.data_dir.clone(),
+                // Rescan weekly; scale by time_scale for testing.
+                rescan_interval_secs: (604800 / time_scale).max(60),
             };
             let dirty_tx_watcher = dirty_tx.clone();
             let cancel_watcher = cancel.clone();

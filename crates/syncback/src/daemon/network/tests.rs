@@ -35,7 +35,8 @@ fn make_node(seed_byte: u8) -> (IdentityPub, NetworkConfig) {
         &master_key, did, device_key.verifying_key().to_bytes(), Timestamp::now(),
     );
     let config = NetworkConfig {
-        signing_key: device_key,
+        signing_key: device_key.clone(),
+        master_signing_key: device_key,
         master_identity: master_pub,
         known_peers: HashMap::new(),
         device_cert: Some(cert),
@@ -355,7 +356,8 @@ async fn handshake_initiator_includes_device_cert() {
     // Node A uses the device key + cert.
     let device_identity = IdentityPub(device_pub_key);
     let config_a = NetworkConfig {
-        signing_key: device_key,
+        signing_key: device_key.clone(),
+        master_signing_key: device_key,
         master_identity: master_pub,
         known_peers: HashMap::new(),
         device_cert: Some(cert),
@@ -431,7 +433,8 @@ async fn handshake_without_cert_connection_is_rejected() {
     let make_certless_config = |sk: ed25519_dalek::SigningKey| {
         let mi = IdentityPub(sk.verifying_key().to_bytes());
         NetworkConfig {
-            signing_key: sk,
+            signing_key: sk.clone(),
+            master_signing_key: sk,
             master_identity: mi,
             known_peers: HashMap::new(),
             device_cert: None,
@@ -757,6 +760,7 @@ async fn network_handle_starts_with_relay_default() {
     let handle = NetworkHandle::start(
         NetworkConfig {
             signing_key: sk.clone(),
+            master_signing_key: sk.clone(),
             master_identity: IdentityPub(sk.verifying_key().to_bytes()),
             known_peers: Default::default(),
             device_cert: None,

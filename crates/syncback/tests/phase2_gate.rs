@@ -96,7 +96,8 @@ async fn make_network_handle() -> NetworkHandle {
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
     NetworkHandle::start(
         NetworkConfig {
-            signing_key: sk,
+            signing_key: sk.clone(),
+            master_signing_key: sk,
             master_identity: mi,
             known_peers: HashMap::new(),
             device_cert: None,
@@ -278,13 +279,13 @@ async fn network_symbol_transfer_between_nodes() {
     let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(64);
 
     let handle_a = NetworkHandle::start(
-        NetworkConfig { signing_key: device_key_a, master_identity: pk_a, known_peers: HashMap::new(), device_cert: Some(cert_a), iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled, x25519_pub: None },
+        NetworkConfig { signing_key: device_key_a, master_signing_key: master_key_a, master_identity: pk_a, known_peers: HashMap::new(), device_cert: Some(cert_a), iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled, x25519_pub: None },
         tx_a,
     )
     .await
     .unwrap();
     let handle_b = NetworkHandle::start(
-        NetworkConfig { signing_key: device_key_b, master_identity: pk_b, known_peers: HashMap::new(), device_cert: Some(cert_b), iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled, x25519_pub: None },
+        NetworkConfig { signing_key: device_key_b, master_signing_key: master_key_b, master_identity: pk_b, known_peers: HashMap::new(), device_cert: Some(cert_b), iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled, x25519_pub: None },
         tx_b,
     )
     .await

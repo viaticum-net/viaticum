@@ -74,7 +74,8 @@ async fn make_network() -> Arc<NetworkHandle> {
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let mi = IdentityPub(signing_key.verifying_key().to_bytes());
     let cfg = NetworkConfig {
-        signing_key,
+        signing_key: signing_key.clone(),
+        master_signing_key: signing_key,
         master_identity: mi,
         known_peers: Default::default(),
         device_cert: None,
@@ -566,6 +567,19 @@ async fn handle_pos_challenge_responds_with_data_when_symbol_held() {
     let esi = 7u32;
     let symbol_data = vec![0xDEu8; 64];
 
+    // Create a HoldingRecord so the ownership check passes.
+    db.upsert_holding(&HoldingRecord {
+        source_block_id: block_id,
+        owner_id: owner,
+        esi_ranges: vec![(esi, 1)],
+        importance: 0.5,
+        total_bytes: symbol_data.len() as u64,
+        status: HoldingStatus::Active,
+        received_at: Timestamp::now(),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    }).unwrap();
+
     // Write the symbol file manually.
     let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
     let block_dir = holdings_dir.path().join(&block_hex);
@@ -607,6 +621,20 @@ async fn handle_pos_challenge_sends_nack_when_symbol_not_held() {
     let block_id = make_block_id(2);
     let esi = 99u32;
     let challenge_id = [77u8; 16];
+
+    // Create a HoldingRecord so ownership check passes,
+    // but don't create the symbol file — expect PosNack (not held on disk).
+    db.upsert_holding(&HoldingRecord {
+        source_block_id: block_id,
+        owner_id: owner,
+        esi_ranges: vec![(esi, 1)],
+        importance: 0.5,
+        total_bytes: 64,
+        status: HoldingStatus::Active,
+        received_at: Timestamp::now(),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    }).unwrap();
 
     let challenge = PosChallengeMsg {
         v: 1,
@@ -1130,8 +1158,17 @@ async fn board_sync_forwards_to_relay_sync_tx() {
 
 // ─── handle_peer_announce ────────────────────────────────────────────────────
 
+/// Create a signing key + identity pair from a seed byte.
+/// Returns (signing_key, identity_pub) where identity_pub is a valid Ed25519 public key.
+fn make_signing_identity(seed: u8) -> (ed25519_dalek::SigningKey, IdentityPub) {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let identity = IdentityPub(sk.verifying_key().to_bytes());
+    (sk, identity)
+}
+
 fn make_peer_announce_msg(identity: IdentityPub) -> PeerAnnounceMsg {
     use syncback_core::types::NodeId;
+    // For tests that don't care about signature validity, use make_signed_peer_announce instead.
     PeerAnnounceMsg {
         v: 1,
         identity_pub: identity,
@@ -1142,6 +1179,15 @@ fn make_peer_announce_msg(identity: IdentityPub) -> PeerAnnounceMsg {
     }
 }
 
+fn make_signed_peer_announce(seed: u8) -> (PeerAnnounceMsg, IdentityPub) {
+    use syncback_core::messages::build_peer_announce;
+    use syncback_core::types::NodeId;
+    let (sk, identity) = make_signing_identity(seed);
+    let node_id = NodeId([42u8; 32]);
+    let msg = build_peer_announce(identity, node_id, Timestamp::now(), &sk, None);
+    (msg, identity)
+}
+
 #[tokio::test]
 async fn peer_announce_creates_new_peer_record() {
     let db = Db::open_in_memory().unwrap();
@@ -1149,8 +1195,7 @@ async fn peer_announce_creates_new_peer_record() {
     let source_dir = TempDir::new().unwrap();
     let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
 
-    let identity = make_identity(20);
-    let msg = make_peer_announce_msg(identity);
+    let (msg, identity) = make_signed_peer_announce(20);
     let expected_node_id = msg.node_id;
 
     processor
@@ -1167,6 +1212,7 @@ async fn peer_announce_creates_new_peer_record() {
 
 #[tokio::test]
 async fn peer_announce_updates_existing_peer_node_id() {
+    use syncback_core::messages::build_peer_announce;
     use syncback_core::types::{NodeId, PeerRecord};
 
     let db = Db::open_in_memory().unwrap();
@@ -1174,7 +1220,7 @@ async fn peer_announce_updates_existing_peer_node_id() {
     let source_dir = TempDir::new().unwrap();
     let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
 
-    let identity = make_identity(21);
+    let (sk, identity) = make_signing_identity(21);
     let old_node_id = NodeId([10u8; 32]);
     let now = Timestamp::now();
 
@@ -1197,14 +1243,7 @@ async fn peer_announce_updates_existing_peer_node_id() {
     .unwrap();
 
     let new_node_id = NodeId([99u8; 32]);
-    let announce = PeerAnnounceMsg {
-        v: 1,
-        identity_pub: identity,
-        node_id: new_node_id,
-        timestamp: Timestamp::now(),
-        sig: [0u8; 64],
-        x25519_pub: None,
-    };
+    let announce = build_peer_announce(identity, new_node_id, Timestamp::now(), &sk, None);
 
     processor
         .handle_peer_announce(announce)
@@ -1228,8 +1267,7 @@ async fn peer_announce_via_relay_dispatch() {
     let source_dir = TempDir::new().unwrap();
     let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
 
-    let identity = make_identity(22);
-    let announce_msg = make_peer_announce_msg(identity);
+    let (announce_msg, identity) = make_signed_peer_announce(22);
     let expected_node_id = announce_msg.node_id;
     let payload = to_cbor(&announce_msg).expect("cbor encode failed");
 
@@ -1313,22 +1351,17 @@ async fn peer_announce_with_valid_node_id_registers_in_network() {
     // When handle_peer_announce receives a PeerAnnounceMsg whose NodeId is a
     // valid iroh PublicKey, it should call network.add_peer() so the peer can
     // be reached via get_connection() in the future.
+    use syncback_core::messages::build_peer_announce;
+
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
     let source_dir = TempDir::new().unwrap();
     let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
 
-    let identity = make_identity(50);
+    let (sk, identity) = make_signing_identity(50);
     let valid_node_id = make_valid_iroh_node_id();
 
-    let msg = PeerAnnounceMsg {
-        v: 1,
-        identity_pub: identity,
-        node_id: valid_node_id,
-        timestamp: Timestamp::now(),
-        sig: [0u8; 64],
-        x25519_pub: None,
-    };
+    let msg = build_peer_announce(identity, valid_node_id, Timestamp::now(), &sk, None);
 
     processor
         .handle_peer_announce(msg)
@@ -1352,26 +1385,20 @@ async fn peer_announce_db_upsert_succeeds_regardless_of_node_id_validity() {
     // handle_peer_announce must always succeed and upsert the DB record
     // regardless of whether the NodeId bytes form a valid iroh PublicKey.
     // For invalid NodeIds the network.add_peer() is skipped gracefully.
+    use syncback_core::messages::build_peer_announce;
+    use syncback_core::types::NodeId;
+
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
     let source_dir = TempDir::new().unwrap();
     let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
 
-    let identity = make_identity(51);
-    // All-zeros is a special case: the identity point of the Ed25519 group —
-    // iroh may or may not accept it as valid, but handle_peer_announce must
-    // succeed either way.
-    use syncback_core::types::NodeId;
+    let (sk, identity) = make_signing_identity(51);
+    // All-zeros NodeId: iroh may or may not accept it as valid, but
+    // handle_peer_announce must succeed either way (DB upsert + graceful skip).
     let node_id = NodeId([0u8; 32]);
 
-    let msg = PeerAnnounceMsg {
-        v: 1,
-        identity_pub: identity,
-        node_id,
-        timestamp: Timestamp::now(),
-        sig: [0u8; 64],
-        x25519_pub: None,
-    };
+    let msg = build_peer_announce(identity, node_id, Timestamp::now(), &sk, None);
 
     processor
         .handle_peer_announce(msg)
@@ -1414,6 +1441,27 @@ async fn build_peer_announce_signature_is_verifiable() {
     let msg = network.build_peer_announce(Timestamp::now());
 
     verify_peer_announce(&msg).expect("PeerAnnounce signature should verify successfully");
+}
+
+#[tokio::test]
+async fn peer_announce_with_invalid_signature_is_rejected() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    // Create a signed message, then corrupt the signature.
+    let (mut msg, identity) = make_signed_peer_announce(60);
+    msg.sig[0] ^= 0xff;
+
+    processor
+        .handle_peer_announce(msg)
+        .await
+        .expect("should return Ok (graceful reject, not error)");
+
+    // DB record should NOT be created — invalid signature means we ignore the announce.
+    let record = db.get_peer(&identity).unwrap();
+    assert!(record.is_none(), "PeerRecord should NOT be created for invalid signature");
 }
 
 // ─── handle_system_state_backup ───────────────────────────────────────────────
@@ -2143,8 +2191,19 @@ async fn dispatch_relay_pos_challenge_sends_response_via_board() {
     std::fs::create_dir_all(&block_dir).unwrap();
     std::fs::write(block_dir.join("42.bin"), b"test_symbol_data").unwrap();
 
-    // Build a PoS challenge as an InboundMessage.
+    // Create HoldingRecord so ownership check passes.
     let challenger = make_identity(0xB1);
+    db.upsert_holding(&HoldingRecord {
+        source_block_id: block_id,
+        owner_id: challenger,
+        esi_ranges: vec![(42, 1)],
+        importance: 0.5,
+        total_bytes: 16,
+        status: HoldingStatus::Active,
+        received_at: Timestamp::now(),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    }).unwrap();
     let challenge = PosChallengeMsg {
         v: 1,
         challenge_id: [0xCC; 16],

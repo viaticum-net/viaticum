@@ -86,6 +86,10 @@ pub enum NetworkError {
 pub struct NetworkConfig {
     /// Ed25519 signing key (device key) used for handshake signatures.
     pub signing_key: SigningKey,
+    /// Master signing key used for PeerAnnounce signatures.
+    /// In production: derived from seed via HKDF("syncback-master").
+    /// In tests: may be the same as signing_key for simplicity.
+    pub master_signing_key: SigningKey,
     /// Master identity (from cluster master key). This is the identity
     /// announced in PeerAnnounce and used for all protocol operations.
     /// Different from signing_key.verifying_key() which is the device identity.
@@ -137,8 +141,10 @@ pub struct NetworkHandle {
     device_identity: IdentityPub,
     /// Our iroh transport identity as SyncBack NodeId bytes.
     pub node_id: NodeId,
-    /// Signing key for building handshake messages.
+    /// Signing key for building handshake messages (device key).
     signing_key: SigningKey,
+    /// Master signing key for PeerAnnounce signatures.
+    master_signing_key: SigningKey,
     /// Device certificate for cluster nodes. Passed in handshake if present.
     device_cert: Option<syncback_core::cluster::DeviceCertificate>,
     /// X25519 public key for directed relay board encryption.
@@ -219,6 +225,7 @@ impl NetworkHandle {
             device_identity,
             node_id,
             signing_key: config.signing_key,
+            master_signing_key: config.master_signing_key,
             device_cert: config.device_cert,
             x25519_pub: config.x25519_pub,
             known_peers: Arc::new(RwLock::new(config.known_peers)),
@@ -547,7 +554,7 @@ impl NetworkHandle {
             self.identity_pub,
             self.node_id,
             timestamp,
-            &self.signing_key,
+            &self.master_signing_key,
             self.x25519_pub,
         )
     }

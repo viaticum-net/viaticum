@@ -30,7 +30,8 @@ async fn make_test_state() -> Arc<DaemonState> {
     let device_key = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
 
     let net_config = NetworkConfig {
-        signing_key: device_key,
+        signing_key: device_key.clone(),
+        master_signing_key: device_key,
         master_identity: identity_pub,
         known_peers: Default::default(),
         device_cert: None,
@@ -215,7 +216,8 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
 
     let device_key = dev_key_a;
     let net_config = crate::daemon::network::NetworkConfig {
-        signing_key: device_key,
+        signing_key: device_key.clone(),
+        master_signing_key: device_key,
         master_identity: identity_pub,
         known_peers: Default::default(),
         device_cert: None,
@@ -399,7 +401,8 @@ async fn dispatch_connect_two_daemons_registers_peer() {
     let handle_b = Arc::new(
         NetworkHandle::start(
             NetworkConfig {
-                signing_key: device_b,
+                signing_key: device_b.clone(),
+                master_signing_key: device_b,
                 master_identity: pk_b,
                 known_peers: Default::default(),
                 device_cert: Some(cert_b),
@@ -426,7 +429,8 @@ async fn dispatch_connect_two_daemons_registers_peer() {
     let handle_a = Arc::new(
         NetworkHandle::start(
             NetworkConfig {
-                signing_key: device_a,
+                signing_key: device_a.clone(),
+                master_signing_key: device_a,
                 master_identity: pk_a,
                 known_peers: Default::default(),
                 device_cert: Some(cert_a),

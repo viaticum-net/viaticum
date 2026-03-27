@@ -93,6 +93,7 @@ pub async fn run_dr(
 
     let net_config = NetworkConfig {
         signing_key: device_key,
+        master_signing_key: master_key,
         master_identity: syncback_core::types::IdentityPub(keyfile.identity_pub),
         known_peers: std::collections::HashMap::new(),
         device_cert: Some(device_cert),

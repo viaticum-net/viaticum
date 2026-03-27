@@ -82,7 +82,8 @@ async fn make_network_handle() -> NetworkHandle {
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
     NetworkHandle::start(
         NetworkConfig {
-            signing_key: sk,
+            signing_key: sk.clone(),
+            master_signing_key: sk,
             master_identity: mi,
             known_peers: HashMap::new(),
             device_cert: None,

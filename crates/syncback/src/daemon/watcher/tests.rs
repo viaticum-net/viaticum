@@ -26,11 +26,23 @@ async fn recv_with_timeout(
 }
 
 /// Build a WatcherConfig for a single temp directory.
+/// Uses a separate data_dir so that `last_scan` marker doesn't trigger watch events.
+/// Pre-creates the `last_scan` marker to skip the initial scan (which would
+/// emit Added events for existing files and interfere with test assertions).
 fn config_for(dir: &TempDir) -> WatcherConfig {
+    let data_dir = TempDir::new().unwrap().into_path();
+    // Write a recent timestamp to skip initial scan.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = std::fs::write(data_dir.join("last_scan"), now.to_string());
     WatcherConfig {
         watch_dirs: vec![dir.path().to_path_buf()],
         device_id: TEST_DEVICE_ID,
         debounce_ms: DEBOUNCE_MS,
+        data_dir,
+        rescan_interval_secs: 604800, // 1 week — effectively disabled for test duration
     }
 }
 
@@ -202,10 +214,13 @@ async fn watcher_stops_on_cancel() {
 async fn watcher_errors_on_empty_watch_dirs() {
     let (dirty_tx, _dirty_rx) = mpsc::channel(32);
     let cancel = CancellationToken::new();
+    let tmp = TempDir::new().unwrap();
     let config = WatcherConfig {
         watch_dirs: vec![],
         device_id: TEST_DEVICE_ID,
         debounce_ms: DEBOUNCE_MS,
+        data_dir: tmp.path().to_path_buf(),
+        rescan_interval_secs: 0,
     };
     let result = start_watcher(config, dirty_tx, cancel).await;
     assert!(
@@ -229,6 +244,8 @@ async fn debounce_multiple_changes_emit_one_event() {
         watch_dirs: vec![dir.path().to_path_buf()],
         device_id: TEST_DEVICE_ID,
         debounce_ms: 300,
+        data_dir: TempDir::new().unwrap().into_path(),
+        rescan_interval_secs: 0,
     };
 
     let cancel_clone = cancel.clone();
@@ -285,6 +302,8 @@ async fn file_deleted_before_debounce_emits_deleted_event() {
         watch_dirs: vec![dir.path().to_path_buf()],
         device_id: TEST_DEVICE_ID,
         debounce_ms: 400,
+        data_dir: TempDir::new().unwrap().into_path(),
+        rescan_interval_secs: 0,
     };
 
     let cancel_clone = cancel.clone();
@@ -391,6 +410,8 @@ async fn rapid_changes_no_panic() {
         watch_dirs: vec![dir.path().to_path_buf()],
         device_id: TEST_DEVICE_ID,
         debounce_ms: DEBOUNCE_MS,
+        data_dir: TempDir::new().unwrap().into_path(),
+        rescan_interval_secs: 0,
     };
 
     let cancel_clone = cancel.clone();

@@ -787,6 +787,7 @@ async fn deliver_symbols_logs_warn_on_peer_not_found() {
         NetworkHandle::start(
             NetworkConfig {
                 signing_key: sk_owner.clone(),
+                master_signing_key: sk_owner.clone(),
                 master_identity: IdentityPub(sk_owner.verifying_key().to_bytes()),
                 known_peers: HashMap::new(),
                 device_cert: None,
@@ -892,7 +893,8 @@ async fn deliver_symbols_sends_to_reachable_holder() {
     let network_holder = std::sync::Arc::new(
         NetworkHandle::start(
             NetworkConfig {
-                signing_key: holder_device_key,
+                signing_key: holder_device_key.clone(),
+                master_signing_key: holder_device_key,
                 master_identity: holder_master,
                 known_peers: HashMap::new(),
                 device_cert: Some(holder_cert),
@@ -914,7 +916,8 @@ async fn deliver_symbols_sends_to_reachable_holder() {
     let network_owner = std::sync::Arc::new(
         NetworkHandle::start(
             NetworkConfig {
-                signing_key: owner_device_key,
+                signing_key: owner_device_key.clone(),
+                master_signing_key: owner_device_key,
                 master_identity: owner_master,
                 known_peers,
                 device_cert: Some(owner_cert),
