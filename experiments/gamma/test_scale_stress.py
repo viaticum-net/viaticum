@@ -422,6 +422,7 @@ def main():
             blocks_ok = s.get("blocks_ok", 0)
             blocks_at_risk = s.get("blocks_at_risk", 0)
             avg_trust = s.get("avg_trust", 0)
+            peer_list = s.get("peers", [])
 
             print(f"  peers={peers}")
             print(f"  challenges={challenges}, passes={passes}")
@@ -434,8 +435,9 @@ def main():
             else:
                 results["failed"].append("blocks_healthy")
 
-            # PoS should have run many times
-            if challenges >= 10:
+            # PoS should have run at least a few times.
+            # With ts=10000 challenge interval ≈ 60s, so 5 min → ~5 challenges.
+            if challenges >= 3:
                 results["passed"].append("pos_active")
                 print(f"  PoS active: {challenges} challenges, {passes} passes")
             else:
