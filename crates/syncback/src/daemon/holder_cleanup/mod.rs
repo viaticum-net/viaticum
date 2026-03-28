@@ -46,9 +46,13 @@ pub async fn run(
         tokio::time::interval(std::time::Duration::from_secs(cleanup_interval_secs.max(1)));
     let mut pressure_timer =
         tokio::time::interval(std::time::Duration::from_secs(pressure_interval_secs.max(1)));
+    // Drop-notice cleanup runs on the same interval as delete-cooldown cleanup.
+    let mut drop_notice_timer =
+        tokio::time::interval(std::time::Duration::from_secs(cleanup_interval_secs.max(1)));
     // Skip first immediate tick.
     cleanup_timer.tick().await;
     pressure_timer.tick().await;
+    drop_notice_timer.tick().await;
 
     info!("holder_cleanup: started");
 
@@ -70,6 +74,11 @@ pub async fn run(
                     &data_dir, disk_reserve_bytes,
                 ).await {
                     error!("holder_cleanup: check_pressure error: {e}");
+                }
+            }
+            _ = drop_notice_timer.tick() => {
+                if let Err(e) = cleanup_drop_notices(&db, &holdings_dir, &relay_post_tx).await {
+                    error!("holder_cleanup: cleanup_drop_notices error: {e}");
                 }
             }
         }
@@ -140,6 +149,74 @@ async fn cleanup_expired(
             block_id = %holding.source_block_id,
             owner = %holding.owner_id,
             "holder_cleanup: expired holding cleaned up, SymbolDropped sent"
+        );
+    }
+
+    Ok(())
+}
+
+/// Evict holdings whose drop-notice window (7 days) has expired.
+/// The owner was notified via SymbolDropNotice; now we actually delete.
+async fn cleanup_drop_notices(
+    db: &Db,
+    holdings_dir: &Path,
+    relay_post_tx: &mpsc::Sender<RelayPost>,
+) -> anyhow::Result<()> {
+    let now = Timestamp::now();
+    let expired = db.list_holdings_drop_notice_expired(now)?;
+
+    if expired.is_empty() {
+        return Ok(());
+    }
+
+    info!(count = expired.len(), "holder_cleanup: processing expired drop notices");
+
+    for holding in &expired {
+        // Delete symbol files.
+        let block_hex = hex_encode(&holding.source_block_id.0);
+        let block_dir = holdings_dir.join(&block_hex);
+        if block_dir.exists() {
+            if let Err(e) = tokio::fs::remove_dir_all(&block_dir).await {
+                warn!(
+                    block_id = %holding.source_block_id,
+                    err = %e,
+                    "holder_cleanup: failed to remove symbol files for expired drop notice"
+                );
+            }
+        }
+
+        // Remove DB record.
+        if let Err(e) = db.delete_holding(&holding.source_block_id, &holding.owner_id) {
+            error!(
+                block_id = %holding.source_block_id,
+                owner = %holding.owner_id,
+                err = %e,
+                "holder_cleanup: failed to delete holding after drop notice expiry"
+            );
+            continue;
+        }
+
+        // Post SymbolDropped to the owner.
+        post_symbol_dropped(
+            relay_post_tx,
+            holding.owner_id,
+            holding.source_block_id,
+            &holding.esi_ranges,
+        ).await;
+
+        // Refresh storage bytes.
+        if let Err(e) = db.refresh_peer_storage_bytes(&holding.owner_id) {
+            warn!(
+                owner = %holding.owner_id,
+                err = %e,
+                "holder_cleanup: failed to refresh storage bytes after drop notice cleanup"
+            );
+        }
+
+        info!(
+            block_id = %holding.source_block_id,
+            owner = %holding.owner_id,
+            "holder_cleanup: drop notice expired, holding evicted"
         );
     }
 
@@ -244,16 +321,16 @@ async fn check_pressure(
                 ).await;
             }
 
-            // Post SymbolDropNotice for buffered drop notices.
+            // Post SymbolDropNotice for buffered drop notices and record sent_at.
             for notice in &result.drop_notices {
-                let notice_esi_ranges = match db.get_holding(&notice.source_block_id, &notice.owner_id) {
-                    Ok(Some(h)) => h.esi_ranges,
-                    _ => vec![],
+                let mut holding = match db.get_holding(&notice.source_block_id, &notice.owner_id) {
+                    Ok(Some(h)) => h,
+                    _ => continue,
                 };
                 let notice_msg = syncback_core::messages::SymbolDropNoticeMsg {
                     v: 1,
                     source_block_id: notice.source_block_id,
-                    esi_ranges: notice_esi_ranges,
+                    esi_ranges: holding.esi_ranges.clone(),
                     deadline: Timestamp(notice.deadline_secs),
                     timestamp: now,
                 };
@@ -266,6 +343,18 @@ async fn check_pressure(
                         payload,
                         msg_id,
                     }).await;
+                }
+                // Record when the notice was sent so cleanup_drop_notices can evict later.
+                if holding.drop_notice_sent_at.is_none() {
+                    holding.drop_notice_sent_at = Some(now);
+                    if let Err(e) = db.upsert_holding(&holding) {
+                        warn!(
+                            block_id = %notice.source_block_id,
+                            owner = %notice.owner_id,
+                            err = %e,
+                            "holder_cleanup: failed to record drop_notice_sent_at"
+                        );
+                    }
                 }
             }
 
