@@ -15,3 +15,4 @@ pub mod restore;
 pub mod scheduler;
 pub mod system_state;
 pub mod watcher;
+pub mod web_api;

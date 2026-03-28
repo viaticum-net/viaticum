@@ -64,32 +64,6 @@ services:
     networks:
       - gamma-net
 
-  node-05:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: gamma-node-05
-    hostname: node-05
-    volumes:
-      - ../../target/release/syncback:/usr/local/bin/syncback:ro
-      - node-05-data:/home/syncback/.syncback
-      - node-05-files:/data/files
-    networks:
-      - gamma-net
-
-  node-06:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: gamma-node-06
-    hostname: node-06
-    volumes:
-      - ../../target/release/syncback:/usr/local/bin/syncback:ro
-      - node-06-data:/home/syncback/.syncback
-      - node-06-files:/data/files
-    networks:
-      - gamma-net
-
 networks:
   gamma-net:
     driver: bridge
@@ -105,7 +79,3 @@ volumes:
   node-03-files:
   node-04-data:
   node-04-files:
-  node-05-data:
-  node-05-files:
-  node-06-data:
-  node-06-files:

@@ -1,0 +1,4 @@
+/* Minimal reset — all styling is in App.svelte <style> */
+*, *::before, *::after {
+  box-sizing: border-box;
+}

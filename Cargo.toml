@@ -72,5 +72,9 @@ libc = "0.2"
 # HTTP client (metrics push)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
+# HTTP server (web API)
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+
 # Internal
 syncback-core = { path = "crates/syncback-core" }
