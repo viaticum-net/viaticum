@@ -68,6 +68,8 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
+        master_signing_key: None,
+        pending_deliveries: None,
     }
 }
 

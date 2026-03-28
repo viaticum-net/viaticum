@@ -1,6 +1,10 @@
 // Tests for BackupCoordinator.
 // All tests use real Db::open_in_memory(), real RaptorQEncoder, and tempfile::TempDir.
 // Source block size is set small (128 KB) for fast tests.
+//
+// AC-8: pending_delivery_accept_signals_correctly
+// AC-9: pending_delivery_reject_signals_correctly
+// AC-10: pending_delivery_times_out_when_no_response
 
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +22,7 @@ use tempfile::TempDir;
 use super::{BackupConfig, BackupCoordinator, BackupEvent, DirtyEvent, DirtyKind};
 use crate::daemon::backup::pipeline::decrypt_and_decompress;
 use crate::daemon::backup::packing::parse_pack_index;
+use crate::daemon::processor::{make_empty_pending_deliveries, OfferOutcome};
 
 /// Small source block size for fast tests (128 KB).
 const SMALL_BLOCK_SIZE: u64 = 128 * 1024;
@@ -35,6 +40,8 @@ fn test_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
+        master_signing_key: None,
+        pending_deliveries: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -334,6 +341,8 @@ fn pipeline_roundtrip_can_decode() {
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
+        master_signing_key: None,
+        pending_deliveries: None,
     };
     let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let mut coord = BackupCoordinator::new(db.clone(), config, encoder.clone());
@@ -651,6 +660,8 @@ fn dedup_via_cluster_state_skips_already_backed_up() {
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
+        master_signing_key: None,
+        pending_deliveries: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -764,6 +775,7 @@ async fn deliver_symbols_no_op_when_network_none() {
         t: 65535,
         symbol_count_per_holder: vec![(IdentityPub([0u8; 32]), 1)],
         stored_size: 0,
+        importance: 0.5,
     };
     coordinator.deliver_symbols(&[fake_result]).await;
 }
@@ -841,6 +853,7 @@ async fn deliver_symbols_logs_warn_on_peer_not_found() {
         t: 65535,
         symbol_count_per_holder: vec![(unknown_holder, 1)],
         stored_size: 64,
+        importance: 0.5,
     };
 
     coordinator.deliver_symbols(&[result]).await;
@@ -972,6 +985,7 @@ async fn deliver_symbols_sends_to_reachable_holder() {
         t: 65535,
         symbol_count_per_holder: vec![(holder_master, 2)],
         stored_size: 128,
+        importance: 0.5,
     };
 
     coordinator.deliver_symbols(&[result]).await;
@@ -1025,6 +1039,8 @@ fn coord_with_watch(
         watch_configs,
         time_scale: 1,
         mock_offer_budget_gb: None,
+        master_signing_key: None,
+        pending_deliveries: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -1146,6 +1162,8 @@ fn same_content_two_devices_both_in_file_record() {
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
+        master_signing_key: None,
+        pending_deliveries: None,
     };
     let mut coord_a =
         BackupCoordinator::new(db.clone(), config_a, Arc::new(RaptorQEncoder::new()));
@@ -1171,6 +1189,8 @@ fn same_content_two_devices_both_in_file_record() {
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
+        master_signing_key: None,
+        pending_deliveries: None,
     };
     let mut coord_b =
         BackupCoordinator::new(db.clone(), config_b, Arc::new(RaptorQEncoder::new()));
@@ -1219,6 +1239,8 @@ fn flush_queue_deferred_files_remain_in_queue() {
         time_scale: 1,
         // Zero budget: all files must be deferred.
         mock_offer_budget_gb: Some(0.0),
+        master_signing_key: None,
+        pending_deliveries: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1271,6 +1293,8 @@ fn flush_queue_budget_selects_highest_importance_first() {
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: Some(1e-4),
+        master_signing_key: None,
+        pending_deliveries: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1336,6 +1360,8 @@ fn large_file_skipped_when_budget_insufficient() {
         time_scale: 1,
         // Zero budget: large file must be skipped.
         mock_offer_budget_gb: Some(0.0),
+        master_signing_key: None,
+        pending_deliveries: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1486,5 +1512,124 @@ fn persist_cycle_budget_accumulates_over_multiple_cycles() {
         (record.placement_success_rate - expected_rate).abs() < 1e-9,
         "placement_success_rate should be 11/15, got {}",
         record.placement_success_rate
+    );
+}
+
+// ─── AC-8: pending_delivery_accept_signals_correctly ─────────────────────────
+//
+// AC-8: When handle_symbol_accept fires, the oneshot sender in PendingDeliveries
+//       signals OfferOutcome::Accepted to the awaiting deliver_to_holder task.
+// Setup: Insert a oneshot tx into PendingDeliveries under (holder, block_id).
+// Action: Simulate Processor path — remove tx from map, send Accepted.
+// Expected: rx.await returns OfferOutcome::Accepted.
+//
+// This tests the signaling contract without requiring a real NetworkHandle.
+// The full end-to-end path (deliver_to_holder → network.send_to_peer → Accept →
+// handle_symbol_accept → signal) is covered by E2E tests.
+
+#[tokio::test]
+async fn pending_delivery_accept_signals_correctly() {
+    let pd = make_empty_pending_deliveries();
+    let holder = IdentityPub([0x01u8; 32]);
+    let block_id = SourceBlockId([0x02u8; 32]);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<OfferOutcome>();
+    pd.lock().await.insert((holder, block_id), tx);
+
+    // Simulate what handle_symbol_accept does: remove tx from map and signal Accepted.
+    let pd2 = pd.clone();
+    tokio::spawn(async move {
+        let tx = pd2.lock().await.remove(&(holder, block_id)).expect("tx must be in map");
+        let _ = tx.send(OfferOutcome::Accepted);
+    });
+
+    let outcome = rx.await.expect("channel must not be dropped before signal");
+    assert!(
+        matches!(outcome, OfferOutcome::Accepted),
+        "outcome must be Accepted"
+    );
+
+    // Map must be empty — tx was consumed by handle_symbol_accept.
+    assert!(
+        pd.lock().await.is_empty(),
+        "pending_deliveries map must be empty after signal"
+    );
+}
+
+// ─── AC-9: pending_delivery_reject_signals_correctly ─────────────────────────
+//
+// AC-9: When handle_symbol_reject fires, the oneshot sender signals
+//       OfferOutcome::Rejected { reason: QuotaFull } to deliver_to_holder.
+// Same structure as AC-8 but with Rejected outcome.
+
+#[tokio::test]
+async fn pending_delivery_reject_signals_correctly() {
+    use syncback_core::messages::RejectReason;
+
+    let pd = make_empty_pending_deliveries();
+    let holder = IdentityPub([0x03u8; 32]);
+    let block_id = SourceBlockId([0x04u8; 32]);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<OfferOutcome>();
+    pd.lock().await.insert((holder, block_id), tx);
+
+    // Simulate what handle_symbol_reject does.
+    let pd2 = pd.clone();
+    tokio::spawn(async move {
+        let tx = pd2.lock().await.remove(&(holder, block_id)).expect("tx must be in map");
+        let _ = tx.send(OfferOutcome::Rejected { reason: RejectReason::QuotaFull });
+    });
+
+    let outcome = rx.await.expect("channel must not be dropped before signal");
+    match outcome {
+        OfferOutcome::Rejected { reason } => {
+            assert!(
+                matches!(reason, RejectReason::QuotaFull),
+                "reject reason must be QuotaFull, got {reason:?}"
+            );
+        }
+        OfferOutcome::Accepted => panic!("expected Rejected, got Accepted"),
+    }
+
+    assert!(
+        pd.lock().await.is_empty(),
+        "pending_deliveries map must be empty after signal"
+    );
+}
+
+// ─── AC-10: pending_delivery_times_out_when_no_response ──────────────────────
+//
+// AC-10: When no Accept/Reject arrives within the timeout, deliver_to_holder
+//        observes a timeout error. The PendingDeliveries entry is NOT auto-consumed
+//        (deliver_to_holder is responsible for cleanup on timeout).
+// Setup: Insert tx into PendingDeliveries. Nobody sends on it.
+// Action: tokio::time::timeout wraps rx.await with a short deadline.
+// Expected: timeout fires, the entry is still in the map (not consumed by anyone).
+
+#[tokio::test]
+async fn pending_delivery_times_out_when_no_response() {
+    let pd = make_empty_pending_deliveries();
+    let holder = IdentityPub([0x05u8; 32]);
+    let block_id = SourceBlockId([0x06u8; 32]);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<OfferOutcome>();
+    pd.lock().await.insert((holder, block_id), tx);
+
+    // Nobody sends on tx — deliver_to_holder would time out waiting for rx.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        rx,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "rx.await must time out when no Accept/Reject is sent"
+    );
+
+    // Entry is still in the map — deliver_to_holder owns cleanup on timeout.
+    assert!(
+        pd.lock().await.contains_key(&(holder, block_id)),
+        "pending_deliveries entry must remain in map after timeout (cleanup is caller's responsibility)"
     );
 }

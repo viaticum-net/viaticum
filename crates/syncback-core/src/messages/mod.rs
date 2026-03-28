@@ -681,6 +681,75 @@ pub fn verify_cancel_delete_msg(
     Ok(())
 }
 
+// ============================================================
+// SymbolOffer signature
+// ============================================================
+
+/// Compute the signing input for SymbolOfferMsg.
+///
+/// Input: b"so" (2) || source_block_id (32) || esi_ranges_cbor (N)
+///     || importance_be_f64 (8) || timestamp_be_u64 (8)
+fn symbol_offer_sig_input(
+    source_block_id: &SourceBlockId,
+    esi_ranges: &[(u32, u32)],
+    importance: f64,
+    timestamp: &Timestamp,
+) -> Vec<u8> {
+    let mut esi_cbor = Vec::new();
+    ciborium::ser::into_writer(esi_ranges, &mut esi_cbor)
+        .expect("CBOR encode of (u32,u32) slice is infallible");
+    let mut input = Vec::with_capacity(2 + 32 + esi_cbor.len() + 8 + 8);
+    input.extend_from_slice(b"so");
+    input.extend_from_slice(&source_block_id.0);
+    input.extend_from_slice(&esi_cbor);
+    input.extend_from_slice(&importance.to_be_bytes());
+    input.extend_from_slice(&timestamp.0.to_be_bytes());
+    input
+}
+
+/// Build a signed SymbolOfferMsg.
+///
+/// `signing_key` must be the master identity signing key so the holder can
+/// verify against the `from` field (which is the master identity from the handshake).
+pub fn build_symbol_offer(
+    msg_id: [u8; 16],
+    source_block_id: SourceBlockId,
+    esi_ranges: Vec<(u32, u32)>,
+    importance: f64,
+    timestamp: Timestamp,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> SymbolOfferMsg {
+    let sig_input = symbol_offer_sig_input(&source_block_id, &esi_ranges, importance, &timestamp);
+    let sig = signing_key.sign(&sig_input).to_bytes();
+    SymbolOfferMsg {
+        v: PROTOCOL_VERSION,
+        msg_id,
+        source_block_id,
+        esi_ranges,
+        importance,
+        timestamp,
+        sig,
+    }
+}
+
+/// Verify a SymbolOfferMsg signature against the claimed owner identity.
+///
+/// `owner` is the IdentityPub extracted from the QUIC handshake (master identity).
+pub fn verify_symbol_offer(msg: &SymbolOfferMsg, owner: &IdentityPub) -> Result<(), MessageError> {
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&owner.0)
+        .map_err(|_| MessageError::BadSignature)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&msg.sig);
+    let input = symbol_offer_sig_input(
+        &msg.source_block_id,
+        &msg.esi_ranges,
+        msg.importance,
+        &msg.timestamp,
+    );
+    vk.verify_strict(&input, &sig)
+        .map_err(|_| MessageError::BadSignature)?;
+    Ok(())
+}
+
 /// Extract the cluster master identity from a handshake message.
 ///
 /// If no device_cert is present, returns Ok(None).

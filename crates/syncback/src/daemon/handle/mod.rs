@@ -297,6 +297,10 @@ impl DaemonHandle {
         let source_block_size =
             syncback_core::config::source_block_size_bytes(&app_config);
 
+        // Create offer/delivery state maps early — shared between BackupCoordinator and Processor.
+        let accepted_offers = crate::daemon::processor::make_empty_accepted_offers();
+        let pending_deliveries = crate::daemon::processor::make_empty_pending_deliveries();
+
         let backup = BackupCoordinator::new(
             db.clone(),
             BackupConfig {
@@ -310,6 +314,8 @@ impl DaemonHandle {
                 watch_configs: app_config.watch.clone(),
                 time_scale: cfg.time_scale.max(1),
                 mock_offer_budget_gb: None,
+                master_signing_key: Some(master_key.clone()),
+                pending_deliveries: Some(pending_deliveries.clone()),
             },
             encoder.clone(),
         );
@@ -492,6 +498,8 @@ impl DaemonHandle {
                 relay_post_tx.clone(),
                 Some(cs.clone()),
                 app_config.escrow.clone(),
+                accepted_offers,
+                pending_deliveries,
             );
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {

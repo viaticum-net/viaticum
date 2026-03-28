@@ -276,6 +276,7 @@ pub fn run_pipeline(
         t: params.t,
         symbol_count_per_holder,
         stored_size: stored.len() as u64,
+        importance: avg_importance,
     })
 }
 

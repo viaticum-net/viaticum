@@ -83,6 +83,8 @@ fn backup_cfg_with_cluster(
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
+        master_signing_key: None,
+        pending_deliveries: None,
     }
 }
 

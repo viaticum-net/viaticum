@@ -33,28 +33,34 @@
 // ESI ranges include the challenged ESI. This is a Phase 6.3 simplification;
 // Phase 6.5 (Scheduler) will track challenge context in a pending table.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use syncback_core::config::EscrowCfg;
-use syncback_core::constants::{INITIAL_TRUST_P, P_WINDOW_WEEKS, SYMBOL_SIZE};
+use syncback_core::constants::{
+    HANDSHAKE_FRESHNESS_SECS, INITIAL_TRUST_P, P_WINDOW_WEEKS, SYMBOL_OFFER_EXPIRY_SECS,
+    SYMBOL_SIZE,
+};
 use syncback_core::escrow::{check_restore, RestoreDecision};
 use syncback_core::db::{Db, SystemStateBlobRecord, WeeklyPosEntry};
 use syncback_core::erasure::{ErasureEncoder, Symbol};
 use syncback_core::messages::{
-    BoardSyncMsg, CancelDeleteMsg, ClusterSyncRequestMsg, ClusterSyncResponseMsg, DeleteMsg,
-    DiscoveredPeer, Message, PeerAnnounceMsg, PeerDiscoveryRequestMsg, PeerDiscoveryResponseMsg,
-    PosChallengeMsg, PosNackMsg, PosResponseMsg, RejectReason, RestoreDeniedMsg, RestoreRequestMsg,
-    RestoreResponseMsg, RevocationBroadcast, SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolDroppedMsg,
-    SymbolOfferMsg, SymbolRejectMsg, SymbolTransferMsg, SystemStateAckMsg, SystemStateBackupMsg,
-    SystemStateRequestMsg, SystemStateResponseMsg,
+    verify_symbol_offer, BoardSyncMsg, CancelDeleteMsg, ClusterSyncRequestMsg,
+    ClusterSyncResponseMsg, DeleteMsg, DiscoveredPeer, Message, PeerAnnounceMsg,
+    PeerDiscoveryRequestMsg, PeerDiscoveryResponseMsg, PosChallengeMsg, PosNackMsg, PosResponseMsg,
+    RejectReason, RestoreDeniedMsg, RestoreRequestMsg, RestoreResponseMsg, RevocationBroadcast,
+    SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg,
+    SymbolTransferMsg, SystemStateAckMsg, SystemStateBackupMsg, SystemStateRequestMsg,
+    SystemStateResponseMsg, verify_peer_announce,
 };
 use syncback_core::pos::{
     apply_pos_outcome, outcome_from_verify, verify_response, PosResponse, VerifyOutcome,
 };
 use syncback_core::trust::{compute_combined, PosOutcome};
 use syncback_core::types::{
-    hex_encode, HoldingRecord, HoldingStatus, IdentityPub, PeerRecord, PlacementStatus, Timestamp,
+    hex_encode, HoldingRecord, HoldingStatus, IdentityPub, PeerRecord, PlacementStatus,
+    SourceBlockId, Timestamp,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -69,7 +75,6 @@ use crate::daemon::scheduler::PendingChallenges;
 
 #[cfg(test)]
 mod tests;
-
 
 // ─── Error type ───────────────────────────────────────────────────────────────
 
@@ -98,6 +103,54 @@ pub enum ProcessorError {
 
     #[error("task join error: {0}")]
     Join(String),
+}
+
+// ─── Offer / delivery state ───────────────────────────────────────────────────
+
+/// An accepted symbol offer awaiting transfer from the owner.
+#[derive(Debug, Clone)]
+pub struct AcceptedOffer {
+    pub owner_id: IdentityPub,
+    pub source_block_id: SourceBlockId,
+    pub esi_ranges: Vec<(u32, u32)>,
+    pub importance: f64,
+    pub accepted_at: Timestamp,
+}
+
+/// Shared map of accepted offers: (owner_id, block_id) → AcceptedOffer.
+/// Written by handle_symbol_offer, read+removed by handle_symbol_transfer.
+/// Uses std::sync::Mutex (not tokio::sync::Mutex) because locks are never held
+/// across .await points — only brief insert/remove under the lock.
+pub type AcceptedOffers = Arc<Mutex<HashMap<(IdentityPub, SourceBlockId), AcceptedOffer>>>;
+
+// NOTE: OfferOutcome and PendingDeliveries are defined here (not in backup/) because
+// Processor is the component that signals outcomes via the oneshot channels. The backup
+// module imports these types from here.
+
+/// Outcome of a SymbolOffer — signals the owner-side deliver_to_holder task.
+#[derive(Debug)]
+pub enum OfferOutcome {
+    Accepted,
+    Rejected { reason: RejectReason },
+}
+
+/// Shared map of pending owner-side deliveries: (holder_id, block_id) → oneshot sender.
+/// Written by BackupCoordinator.deliver_to_holder before sending the offer;
+/// read here to signal outcome when Accept/Reject arrives.
+pub type PendingDeliveries = Arc<
+    tokio::sync::Mutex<
+        HashMap<(IdentityPub, SourceBlockId), tokio::sync::oneshot::Sender<OfferOutcome>>,
+    >,
+>;
+
+/// Construct an empty `AcceptedOffers` map (useful in tests and wiring).
+pub fn make_empty_accepted_offers() -> AcceptedOffers {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Construct an empty `PendingDeliveries` map (useful in tests and wiring).
+pub fn make_empty_pending_deliveries() -> PendingDeliveries {
+    Arc::new(tokio::sync::Mutex::new(HashMap::new()))
 }
 
 // ─── Processor ────────────────────────────────────────────────────────────────
@@ -140,6 +193,12 @@ pub struct Processor {
     cluster_state: Option<Arc<std::sync::Mutex<syncback_core::cluster::ClusterState>>>,
     /// Escrow configuration for contribution-based restore budget checks.
     escrow_cfg: EscrowCfg,
+    /// Accepted symbol offers awaiting SymbolTransfer from the owner.
+    /// Key: (owner_id, block_id). Entries expire after SYMBOL_OFFER_EXPIRY_SECS.
+    pub(crate) accepted_offers: AcceptedOffers,
+    /// Pending owner-side deliveries awaiting Accept/Reject.
+    /// Written by BackupCoordinator.deliver_to_holder; read here to signal outcome.
+    pub(crate) pending_deliveries: PendingDeliveries,
 }
 
 impl Processor {
@@ -165,6 +224,8 @@ impl Processor {
         relay_post_tx: mpsc::Sender<RelayPost>,
         cluster_state: Option<Arc<std::sync::Mutex<syncback_core::cluster::ClusterState>>>,
         escrow_cfg: EscrowCfg,
+        accepted_offers: AcceptedOffers,
+        pending_deliveries: PendingDeliveries,
     ) -> Self {
         Processor {
             db,
@@ -186,6 +247,8 @@ impl Processor {
             relay_post_tx,
             cluster_state,
             escrow_cfg,
+            accepted_offers,
+            pending_deliveries,
         }
     }
 
@@ -667,12 +730,66 @@ impl Processor {
     /// Store received symbols on disk and record a HoldingRecord in the DB.
     ///
     /// File layout: `{holdings_dir}/{block_id_hex}/{esi}.bin`
+    ///
+    /// Requires a prior accepted offer in `accepted_offers` for `(owner_id, block_id)`.
+    /// If no offer is found: silently rejects (does not store anything).
+    /// If the offer is expired: removes and silently rejects.
+    /// If any ESI is outside the accepted ranges: rejects (offer consumed).
     pub(crate) async fn handle_symbol_transfer(
         &self,
         owner_id: IdentityPub,
         transfer: SymbolTransferMsg,
     ) -> Result<(), ProcessorError> {
         let block_id = transfer.source_block_id;
+
+        // ── Offer lookup + validation ─────────────────────────────────────────
+        let (importance, accepted_esi_ranges) = {
+            let mut map = self.accepted_offers.lock().unwrap();
+            let key = (owner_id, block_id);
+            match map.remove(&key) {
+                None => {
+                    warn!(
+                        block_id = %block_id,
+                        owner = %owner_id,
+                        "processor: SymbolTransfer rejected — no accepted offer"
+                    );
+                    return Ok(());
+                }
+                Some(entry) => {
+                    let now = Timestamp::now().0;
+                    let age = now.saturating_sub(entry.accepted_at.0);
+                    if age > SYMBOL_OFFER_EXPIRY_SECS {
+                        debug!(
+                            block_id = %block_id,
+                            owner = %owner_id,
+                            age_secs = age,
+                            "processor: accepted offer expired — rejecting SymbolTransfer"
+                        );
+                        return Ok(());
+                    }
+                    (entry.importance, entry.esi_ranges)
+                }
+            }
+        };
+
+        // ── ESI range validation ──────────────────────────────────────────────
+        for symbol in &transfer.symbols {
+            let esi = symbol.esi;
+            let in_range = accepted_esi_ranges
+                .iter()
+                .any(|&(start, count)| esi >= start && esi < start + count);
+            if !in_range {
+                warn!(
+                    block_id = %block_id,
+                    owner = %owner_id,
+                    esi,
+                    "processor: SymbolTransfer rejected — ESI out of accepted range"
+                );
+                return Ok(());
+            }
+        }
+
+        // ── Write symbols to disk ─────────────────────────────────────────────
         let block_hex = hex_encode(&block_id.0);
         let block_dir = self.holdings_dir.join(&block_hex);
 
@@ -682,6 +799,20 @@ impl Processor {
         let mut total_bytes: u64 = 0;
 
         for symbol in &transfer.symbols {
+            // Reject oversized symbols: expected size is SYMBOL_SIZE (65535 bytes).
+            // Without this check, a malicious peer could write up to MAX_MESSAGE_SIZE
+            // per symbol, bypassing quota accounting.
+            if symbol.data.len() > SYMBOL_SIZE as usize {
+                warn!(
+                    block_id = %block_id,
+                    owner = %owner_id,
+                    esi = symbol.esi,
+                    size = symbol.data.len(),
+                    expected = SYMBOL_SIZE,
+                    "processor: SymbolTransfer rejected — oversized symbol"
+                );
+                return Ok(());
+            }
             let sym_path = block_dir.join(format!("{}.bin", symbol.esi));
             tokio::fs::write(&sym_path, &symbol.data).await?;
             received_esis.push(symbol.esi);
@@ -713,15 +844,16 @@ impl Processor {
                 existing.esi_ranges = esi_list_to_ranges(&all_esis);
                 existing.total_bytes += total_bytes;
                 existing.status = HoldingStatus::Active;
+                // importance: keep existing value (BR-7). New offer may have different
+                // importance, but the holding was already accepted at its original importance.
                 existing
             }
             None => HoldingRecord {
                 source_block_id: block_id,
                 owner_id,
                 esi_ranges: new_ranges,
-                // SymbolTransferMsg does not carry importance; use default 0.5.
-                // The accurate value is available in SymbolOfferMsg (Phase 6.3 limitation).
-                importance: 0.5,
+                // importance comes from the validated AcceptedOffer (verified by handle_symbol_offer).
+                importance,
                 total_bytes,
                 status: HoldingStatus::Active,
                 received_at: Timestamp::now(),
@@ -764,11 +896,33 @@ impl Processor {
     /// Returns the reply message so tests can inspect it without a real connection.
     pub(crate) async fn handle_pos_challenge_inner(
         &self,
-        _owner_id: IdentityPub,
+        owner_id: IdentityPub,
         challenge: syncback_core::messages::PosChallengeMsg,
     ) -> Result<Message, ProcessorError> {
         let block_id = challenge.source_block_id;
         let esi = challenge.esi;
+
+        // Verify we actually hold symbols for this owner+block.
+        // Without this check, any authenticated peer could probe our holdings
+        // for arbitrary block IDs and receive symbol data.
+        match self.db.get_holding(&block_id, &owner_id)? {
+            Some(_) => {}
+            None => {
+                warn!(
+                    block_id = %block_id,
+                    challenger = %owner_id,
+                    "processor: PoS challenge from non-owner, ignoring"
+                );
+                return Ok(Message::PosNack(PosNackMsg {
+                    v: 1,
+                    challenge_id: challenge.challenge_id,
+                    source_block_id: block_id,
+                    esi,
+                    timestamp: Timestamp::now(),
+                }));
+            }
+        }
+
         let sym_path = self
             .holdings_dir
             .join(hex_encode(&block_id.0))
@@ -854,7 +1008,7 @@ impl Processor {
                     challenge_id = %hex_encode(&response.challenge_id),
                     "processor: PosResponse with unknown challenge_id (stale or duplicate), ignoring"
                 );
-                return Ok(VerifyOutcome::Pass);
+                return Ok(VerifyOutcome::CannotVerify);
             }
         };
 
@@ -1116,6 +1270,19 @@ impl Processor {
     ) -> Result<(), ProcessorError> {
         let block_id = delete.source_block_id;
 
+        // Reject stale/replayed messages (same freshness window as handshake).
+        let now = Timestamp::now();
+        let age = now.0.saturating_sub(delete.timestamp.0);
+        if age > syncback_core::constants::HANDSHAKE_FRESHNESS_SECS {
+            warn!(
+                block_id = %block_id,
+                owner = %from,
+                age_secs = age,
+                "processor: Delete rejected — timestamp too old (possible replay)"
+            );
+            return Ok(());
+        }
+
         // Verify signature against the sender's identity (the owner).
         if let Err(e) = syncback_core::messages::verify_delete_msg(&delete, &from) {
             warn!(
@@ -1170,6 +1337,19 @@ impl Processor {
         cancel: CancelDeleteMsg,
     ) -> Result<(), ProcessorError> {
         let block_id = cancel.source_block_id;
+
+        // Reject stale/replayed messages.
+        let now = Timestamp::now();
+        let age = now.0.saturating_sub(cancel.timestamp.0);
+        if age > syncback_core::constants::HANDSHAKE_FRESHNESS_SECS {
+            warn!(
+                block_id = %block_id,
+                owner = %from,
+                age_secs = age,
+                "processor: CancelDelete rejected — timestamp too old (possible replay)"
+            );
+            return Ok(());
+        }
 
         if let Err(e) = syncback_core::messages::verify_cancel_delete_msg(&cancel, &from) {
             warn!(
@@ -1268,12 +1448,56 @@ impl Processor {
     ///
     /// Does NOT create a HoldingRecord — that happens in handle_symbol_transfer
     /// when symbols actually arrive.
+    ///
+    /// Security checks (in order):
+    ///   1. Freshness: |now - timestamp| <= HANDSHAKE_FRESHNESS_SECS
+    ///   2. Signature: verify_symbol_offer against owner_id (master identity from handshake)
+    ///   3. Quota: decide_symbol_offer
     pub(crate) async fn handle_symbol_offer(
         &self,
         owner_id: IdentityPub,
         offer: SymbolOfferMsg,
         conn: Arc<Connection>,
     ) -> Result<(), ProcessorError> {
+        let now = Timestamp::now().0;
+        let ts = offer.timestamp.0;
+        let delta = if now > ts { now - ts } else { ts - now };
+        if delta > HANDSHAKE_FRESHNESS_SECS {
+            warn!(
+                owner = %owner_id,
+                block_id = %offer.source_block_id,
+                delta_secs = delta,
+                "processor: SymbolOffer rejected — stale timestamp"
+            );
+            let reply = Message::SymbolReject(SymbolRejectMsg {
+                v: 1,
+                source_block_id: offer.source_block_id,
+                offer_msg_id: offer.msg_id,
+                reason: RejectReason::Other,
+                timestamp: Timestamp::now(),
+            });
+            conn.send_message(&reply).await?;
+            return Ok(());
+        }
+
+        if let Err(e) = verify_symbol_offer(&offer, &owner_id) {
+            warn!(
+                owner = %owner_id,
+                block_id = %offer.source_block_id,
+                err = %e,
+                "processor: SymbolOffer rejected — sig verification failed"
+            );
+            let reply = Message::SymbolReject(SymbolRejectMsg {
+                v: 1,
+                source_block_id: offer.source_block_id,
+                offer_msg_id: offer.msg_id,
+                reason: RejectReason::Other,
+                timestamp: Timestamp::now(),
+            });
+            conn.send_message(&reply).await?;
+            return Ok(());
+        }
+
         let offer_bytes: u64 = offer
             .esi_ranges
             .iter()
@@ -1289,6 +1513,19 @@ impl Processor {
                 offer_bytes,
                 "processor: SymbolOffer accepted"
             );
+            // Store accepted offer so handle_symbol_transfer can validate the transfer.
+            {
+                let accepted_offer = AcceptedOffer {
+                    owner_id,
+                    source_block_id: offer.source_block_id,
+                    esi_ranges: offer.esi_ranges.clone(),
+                    importance: offer.importance,
+                    accepted_at: Timestamp::now(),
+                };
+                let key = (owner_id, offer.source_block_id);
+                let mut map = self.accepted_offers.lock().unwrap();
+                map.insert(key, accepted_offer);
+            }
             Message::SymbolAccept(SymbolAcceptMsg {
                 v: 1,
                 source_block_id: offer.source_block_id,
@@ -1319,7 +1556,7 @@ impl Processor {
     // SymbolAccept / SymbolReject: we are the owner
     // =========================================================
 
-    /// Holder accepted our symbol offer. Notify BackupCoordinator.
+    /// Holder accepted our symbol offer. Notify BackupCoordinator and signal pending delivery.
     async fn handle_symbol_accept(
         &self,
         holder_id: IdentityPub,
@@ -1336,10 +1573,16 @@ impl Processor {
                 source_block_id: accept.source_block_id,
             },
         ).await;
+        // Signal the deliver_to_holder task waiting on the oneshot channel.
+        let key = (holder_id, accept.source_block_id);
+        let mut map = self.pending_deliveries.lock().await;
+        if let Some(tx) = map.remove(&key) {
+            let _ = tx.send(OfferOutcome::Accepted);
+        }
         Ok(())
     }
 
-    /// Holder rejected our symbol offer. Notify BackupCoordinator.
+    /// Holder rejected our symbol offer. Notify BackupCoordinator and signal pending delivery.
     async fn handle_symbol_reject(
         &self,
         holder_id: IdentityPub,
@@ -1358,6 +1601,12 @@ impl Processor {
                 reason: format!("{:?}", reject.reason),
             },
         ).await;
+        // Signal the deliver_to_holder task waiting on the oneshot channel.
+        let key = (holder_id, reject.source_block_id);
+        let mut map = self.pending_deliveries.lock().await;
+        if let Some(tx) = map.remove(&key) {
+            let _ = tx.send(OfferOutcome::Rejected { reason: reject.reason });
+        }
         Ok(())
     }
 
@@ -1503,13 +1752,16 @@ impl Processor {
                 Ok(())
             }
             Err(ProcessorError::EscrowDenied { denial, .. }) => {
+                // Don't leak internal trust scores or budget values to the requester.
+                // These help an attacker game the threshold precisely.
+                let _ = &denial; // suppress unused warning
                 let denied_msg = RestoreDeniedMsg {
                     v: 1,
                     source_block_id: block_id,
                     reason: "escrow check failed".to_string(),
-                    current_trust: denial.current_trust,
-                    needed_trust: denial.needed_trust,
-                    restore_budget_gb: denial.restore_budget_gb,
+                    current_trust: 0.0,
+                    needed_trust: 0.0,
+                    restore_budget_gb: 0.0,
                     timestamp: Timestamp::now(),
                 };
                 conn.send_message(&Message::RestoreDenied(denied_msg))
@@ -1578,6 +1830,16 @@ impl Processor {
         &self,
         msg: PeerAnnounceMsg,
     ) -> Result<(), ProcessorError> {
+        // Verify Ed25519 signature before trusting any fields.
+        if let Err(e) = verify_peer_announce(&msg) {
+            warn!(
+                identity = %msg.identity_pub,
+                err = %e,
+                "processor: PeerAnnounce signature verification failed, ignoring"
+            );
+            return Ok(());
+        }
+
         let now = Timestamp::now();
         let record = match self.db.get_peer(&msg.identity_pub)? {
             None => PeerRecord {
@@ -1600,6 +1862,10 @@ impl Processor {
                 existing.last_seen = now;
                 if msg.x25519_pub.is_some() {
                     existing.x25519_pub = msg.x25519_pub;
+                }
+                // Bootstrap trust if peer was created by dispatch_connect with zero trust.
+                if existing.trust_p == 0.0 && existing.trust_i == 0.0 {
+                    existing.trust_p = INITIAL_TRUST_P;
                 }
                 existing
             }
@@ -1731,6 +1997,21 @@ impl Processor {
         request: ClusterSyncRequestMsg,
         conn: Arc<Connection>,
     ) -> Result<(), ProcessorError> {
+        // Verify that the claimed device_id matches the connection's device cert.
+        // Without this, an authenticated cluster peer could enumerate membership
+        // by trying different device_ids.
+        if let Some(ref cert) = conn.peer_device_cert {
+            if cert.device_id != request.from_device_id {
+                warn!(
+                    peer = %from,
+                    claimed_device = ?request.from_device_id,
+                    actual_device = ?cert.device_id,
+                    "processor: ClusterSyncRequest device_id mismatch, rejecting"
+                );
+                return Ok(());
+            }
+        }
+
         match self.cluster_sync.handle_sync_request(&request) {
             Ok(response) => {
                 conn.send_message(&Message::ClusterSyncResponse(response))

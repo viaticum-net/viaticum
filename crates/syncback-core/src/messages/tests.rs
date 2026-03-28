@@ -1350,3 +1350,73 @@ fn peer_announce_without_x25519_deserializes_as_none() {
         "x25519_pub must default to None when field is absent (backward compat)"
     );
 }
+
+// ─── SymbolOffer sign / verify ────────────────────────────────────────────────
+
+#[test]
+fn symbol_offer_sign_verify_roundtrip() {
+    let key = SigningKey::generate(&mut OsRng);
+    let owner = IdentityPub(key.verifying_key().to_bytes());
+    let block_id = SourceBlockId([0x42u8; 32]);
+    let esi_ranges = vec![(0u32, 100u32), (200u32, 50u32)];
+    let importance = 0.7_f64;
+    let ts = Timestamp(9_999_999);
+    let msg_id = [0xABu8; 16];
+
+    let msg = super::build_symbol_offer(msg_id, block_id, esi_ranges.clone(), importance, ts, &key);
+
+    assert_eq!(msg.v, 1);
+    assert_eq!(msg.msg_id, msg_id);
+    assert_eq!(msg.source_block_id, block_id);
+    assert_eq!(msg.esi_ranges, esi_ranges);
+    assert_eq!(msg.importance, importance);
+    assert_eq!(msg.timestamp, ts);
+
+    super::verify_symbol_offer(&msg, &owner).expect("verify must succeed for correct owner");
+}
+
+#[test]
+fn symbol_offer_verify_fails_for_wrong_owner() {
+    let key = SigningKey::generate(&mut OsRng);
+    let other_key = SigningKey::generate(&mut OsRng);
+    let wrong_owner = IdentityPub(other_key.verifying_key().to_bytes());
+
+    let block_id = SourceBlockId([0x11u8; 32]);
+    let msg = super::build_symbol_offer(
+        [0u8; 16],
+        block_id,
+        vec![(0u32, 10u32)],
+        0.5,
+        Timestamp(1000),
+        &key,
+    );
+
+    assert!(
+        super::verify_symbol_offer(&msg, &wrong_owner).is_err(),
+        "verify must fail for wrong owner"
+    );
+}
+
+#[test]
+fn symbol_offer_verify_fails_for_tampered_sig() {
+    let key = SigningKey::generate(&mut OsRng);
+    let owner = IdentityPub(key.verifying_key().to_bytes());
+
+    let block_id = SourceBlockId([0x22u8; 32]);
+    let mut msg = super::build_symbol_offer(
+        [0u8; 16],
+        block_id,
+        vec![(0u32, 5u32)],
+        0.5,
+        Timestamp(2000),
+        &key,
+    );
+
+    // Flip the last byte of the signature.
+    msg.sig[63] ^= 0xFF;
+
+    assert!(
+        super::verify_symbol_offer(&msg, &owner).is_err(),
+        "verify must fail for tampered signature"
+    );
+}

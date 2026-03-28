@@ -235,6 +235,16 @@ pub const RELIABILITY_REPAIR_THRESHOLD: f64 = 0.99;
 /// approximation for N >= this value.
 pub const BINOMIAL_EXACT_THRESHOLD: u32 = 100;
 
+// === Symbol offer handshake ===
+
+/// Timeout for awaiting SymbolAccept on a direct QUIC connection (seconds).
+/// Direct connection: 30s is generous. If no reply in 30s, the connection is dead.
+pub const SYMBOL_OFFER_TIMEOUT_SECS: u64 = 30;
+
+/// Stale accepted offer expiry (seconds). AcceptedOffers older than this are
+/// discarded on next access even if no Transfer arrived.
+pub const SYMBOL_OFFER_EXPIRY_SECS: u64 = 300;
+
 // === Network reconnection ===
 
 /// Seconds before retrying a failed peer connection.
@@ -250,3 +260,4 @@ pub const DEFAULT_HOLDINGS_INTEGRITY_INTERVAL_SECS: u64 = 86_400;
 const _: () = assert!(S_CLAMP_MIN < S_CLAMP_MAX);
 const _: () = assert!(OVERHEAD_BASE > 1.0);
 const _: () = assert!(DECODE_OVERHEAD > 0);
+const _: () = assert!(SYMBOL_OFFER_TIMEOUT_SECS < SYMBOL_OFFER_EXPIRY_SECS);

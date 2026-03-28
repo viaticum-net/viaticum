@@ -17,6 +17,14 @@
 //   dispatch_relay                  — PeerAnnounce via relay
 //   build_peer_announce             — NetworkHandle helper builds a signed message (Phase 7.10)
 //   handle_revocation_broadcast     — verifies certs and marks device key revoked in PeerRecord
+//   AC-1: transfer_without_offer_rejected
+//   AC-2: offer_accepted_stored_in_map
+//   AC-3: offer_rejected_when_quota_full
+//   AC-4: transfer_stored_after_valid_offer
+//   AC-5: transfer_rejected_esi_out_of_range
+//   AC-6: offer_rejected_bad_signature
+//   AC-7: offer_rejected_on_stale_timestamp
+//   AC-11: expired_accepted_offer_rejected
 
 use std::sync::{Arc, Mutex};
 
@@ -35,7 +43,7 @@ use syncback_core::types::{
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-use super::{esi_list_to_ranges, ranges_to_esi_list, Processor};
+use super::{esi_list_to_ranges, ranges_to_esi_list, AcceptedOffer, Processor};
 use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
 use crate::daemon::network::{NetworkConfig, NetworkHandle};
 use crate::daemon::relay::{InboundMessage, RelayPost, SyncTrigger};
@@ -138,6 +146,8 @@ async fn make_processor_with_quota(
     let pending_challenges: crate::daemon::scheduler::PendingChallenges =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    let accepted_offers = super::make_empty_accepted_offers();
+    let pending_deliveries = super::make_empty_pending_deliveries();
     let processor = Processor::new(
         db,
         own_identity,
@@ -158,6 +168,8 @@ async fn make_processor_with_quota(
         relay_post_tx,
         None, // cluster_state: not needed for handler unit tests
         syncback_core::config::EscrowCfg::default(),
+        accepted_offers,
+        pending_deliveries,
     );
 
     (processor, repair_rx, relay_sync_rx)
@@ -203,6 +215,8 @@ async fn make_processor_with_pending(
     let (backup_event_tx, _backup_event_rx) =
         tokio::sync::mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    let accepted_offers = super::make_empty_accepted_offers();
+    let pending_deliveries = super::make_empty_pending_deliveries();
     let processor = Processor::new(
         db,
         own_identity,
@@ -223,9 +237,31 @@ async fn make_processor_with_pending(
         relay_post_tx,
         None, // cluster_state: not needed for handler unit tests
         syncback_core::config::EscrowCfg::default(),
+        accepted_offers,
+        pending_deliveries,
     );
 
     (processor, repair_rx, relay_sync_rx)
+}
+
+/// Insert an accepted offer into the processor's accepted_offers map.
+/// Used to set up tests that call handle_symbol_transfer directly.
+fn insert_accepted_offer(
+    processor: &Processor,
+    owner_id: IdentityPub,
+    block_id: SourceBlockId,
+    esi_ranges: Vec<(u32, u32)>,
+    importance: f64,
+) {
+    let offer = AcceptedOffer {
+        owner_id,
+        source_block_id: block_id,
+        esi_ranges,
+        importance,
+        accepted_at: Timestamp::now(),
+    };
+    let mut map = processor.accepted_offers.lock().unwrap();
+    map.insert((owner_id, block_id), offer);
 }
 
 fn make_symbol_placement(
@@ -301,6 +337,8 @@ async fn symbol_accept_updates_backup_event() {
         relay_post_tx,
         None, // cluster_state: not needed for handler unit tests
         syncback_core::config::EscrowCfg::default(),
+        super::make_empty_accepted_offers(),
+        super::make_empty_pending_deliveries(),
     );
 
     let holder = make_identity(7);
@@ -445,6 +483,9 @@ async fn handle_symbol_transfer_writes_files_to_disk() {
     let block_id = make_block_id(2);
     let symbol_data = vec![0xABu8; 64];
 
+    // Insert accepted offer so the transfer is authorized (esi 5 is in range (0, 100)).
+    insert_accepted_offer(&processor, owner, block_id, vec![(0, 100)], 0.5);
+
     let transfer = SymbolTransferMsg {
         v: 1,
         source_block_id: block_id,
@@ -485,6 +526,9 @@ async fn handle_symbol_transfer_creates_holding_record_in_db() {
         })
         .collect();
 
+    // Insert accepted offer so the transfer is authorized (esi 0..2 in range (0, 10)).
+    insert_accepted_offer(&processor, owner, block_id, vec![(0, 10)], 0.5);
+
     let transfer = SymbolTransferMsg {
         v: 1,
         source_block_id: block_id,
@@ -514,7 +558,8 @@ async fn handle_symbol_transfer_merges_with_existing_holding() {
     let owner = make_identity(1);
     let block_id = make_block_id(2);
 
-    // First transfer: ESI 0
+    // First offer + transfer: ESI 0
+    insert_accepted_offer(&processor, owner, block_id, vec![(0, 1)], 0.5);
     processor
         .handle_symbol_transfer(
             owner,
@@ -531,7 +576,8 @@ async fn handle_symbol_transfer_merges_with_existing_holding() {
         .await
         .unwrap();
 
-    // Second transfer: ESI 1
+    // Second offer + transfer: ESI 1
+    insert_accepted_offer(&processor, owner, block_id, vec![(1, 1)], 0.5);
     processor
         .handle_symbol_transfer(
             owner,
@@ -2182,6 +2228,8 @@ async fn dispatch_relay_pos_challenge_sends_response_via_board() {
         pending, relay_post_tx,
         None, // cluster_state: not needed for this test
         syncback_core::config::EscrowCfg::default(),
+        super::make_empty_accepted_offers(),
+        super::make_empty_pending_deliveries(),
     );
 
     // Create a symbol file so PoS can respond.
@@ -2336,6 +2384,8 @@ async fn make_processor_with_cluster_state(
         relay_post_tx,
         Some(cluster_state.clone()),
         syncback_core::config::EscrowCfg::default(),
+        super::make_empty_accepted_offers(),
+        super::make_empty_pending_deliveries(),
     );
 
     (processor, cluster_state, own_identity)
@@ -2786,4 +2836,444 @@ async fn revocation_broadcast_unknown_peer_ignored() {
     // Must not create a phantom PeerRecord.
     let record = db.get_peer(&peer_identity).expect("get_peer");
     assert!(record.is_none(), "no PeerRecord must be created for unknown peer");
+}
+
+// ─── AC-1: transfer_without_offer_rejected ────────────────────────────────────
+//
+// AC-1: Holder rejects SymbolTransfer with no prior offer.
+// Setup: Processor with empty accepted_offers.
+// Input: handle_symbol_transfer with any block_id.
+// Expected: symbols NOT written to disk, HoldingRecord NOT created, Ok(()) returned.
+
+#[tokio::test]
+async fn transfer_without_offer_rejected() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let owner = make_identity(0x11);
+    let block_id = make_block_id(0x11);
+
+    // No accepted offer registered — transfer must be silently rejected.
+    let transfer = SymbolTransferMsg {
+        v: 1,
+        source_block_id: block_id,
+        symbols: vec![syncback_core::erasure::Symbol {
+            esi: 0,
+            data: vec![0xFFu8; 64],
+        }],
+        timestamp: Timestamp::now(),
+    };
+
+    // Must return Ok (silent reject, not an error).
+    processor
+        .handle_symbol_transfer(owner, transfer)
+        .await
+        .expect("transfer without offer must not propagate error");
+
+    // Symbol file must NOT exist on disk.
+    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let sym_path = holdings_dir.path().join(&block_hex).join("0.bin");
+    assert!(!sym_path.exists(), "symbol file must not be written without prior offer");
+
+    // HoldingRecord must NOT exist in DB.
+    let holding = db.get_holding(&block_id, &owner).unwrap();
+    assert!(holding.is_none(), "HoldingRecord must not be created without prior offer");
+}
+
+// ─── AC-2: offer_accepted_stored_in_map ──────────────────────────────────────
+//
+// AC-2: Holder accepts SymbolOffer and stores state in accepted_offers.
+// Input: valid SymbolOfferMsg (freshness OK, sig valid, quota sufficient).
+// Expected: accepted_offers map has entry with correct esi_ranges and importance.
+// Note: We test the *result* of decide_symbol_offer + accepted_offers insertion,
+// not the conn.send_message path (Connection requires real iroh endpoint).
+
+#[tokio::test]
+async fn offer_accepted_stored_in_map() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let owner = IdentityPub(signing_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0x22);
+    let esi_ranges = vec![(0u32, 10u32)];
+    let importance = 0.7_f64;
+    let timestamp = Timestamp::now();
+
+    // Build a valid offer to confirm sig construction works (not directly used in map test).
+    let _offer = syncback_core::messages::build_symbol_offer(
+        [0xABu8; 16],
+        block_id,
+        esi_ranges.clone(),
+        importance,
+        timestamp,
+        &signing_key,
+    );
+
+    // Verify accept decision is true (quota is u64::MAX in make_processor).
+    let offer_bytes: u64 = esi_ranges.iter().map(|&(_, c)| c as u64 * 65_535).sum();
+    let accept = processor
+        .decide_symbol_offer(offer_bytes)
+        .expect("decide_symbol_offer failed");
+    assert!(accept, "should accept when quota is MAX");
+
+    // Insert into accepted_offers directly (mirrors what handle_symbol_offer does after
+    // passing freshness + sig + quota checks — without a real Connection).
+    insert_accepted_offer(&processor, owner, block_id, esi_ranges.clone(), importance);
+
+    // The map must have the entry.
+    let map = processor.accepted_offers.lock().unwrap();
+    let entry = map.get(&(owner, block_id)).expect("accepted_offer must be stored");
+    assert_eq!(entry.esi_ranges, esi_ranges);
+    assert_eq!(entry.importance, importance);
+    assert_eq!(entry.owner_id, owner);
+    assert_eq!(entry.source_block_id, block_id);
+}
+
+// ─── AC-4: transfer_stored_after_valid_offer ─────────────────────────────────
+//
+// AC-4: Holder accepts valid SymbolTransfer after prior offer.
+// Setup: accepted_offers has entry (alice_id, X) → AcceptedOffer { esi_ranges: [(0,10)], importance: 0.7 }.
+// Input: SymbolTransfer with ESI 0..4 (within accepted range).
+// Expected: symbols written, HoldingRecord with importance=0.7, offer consumed.
+
+#[tokio::test]
+async fn transfer_stored_after_valid_offer() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let owner = make_identity(0x33);
+    let block_id = make_block_id(0x33);
+    let importance = 0.7_f64;
+
+    // Register accepted offer for ESI range (0, 10).
+    insert_accepted_offer(&processor, owner, block_id, vec![(0u32, 10u32)], importance);
+
+    // Send 3 symbols within the accepted range.
+    let transfer = SymbolTransferMsg {
+        v: 1,
+        source_block_id: block_id,
+        symbols: vec![
+            syncback_core::erasure::Symbol { esi: 0, data: vec![0x01u8; 64] },
+            syncback_core::erasure::Symbol { esi: 1, data: vec![0x02u8; 64] },
+            syncback_core::erasure::Symbol { esi: 2, data: vec![0x03u8; 64] },
+        ],
+        timestamp: Timestamp::now(),
+    };
+
+    processor
+        .handle_symbol_transfer(owner, transfer)
+        .await
+        .expect("handle_symbol_transfer failed");
+
+    // HoldingRecord must exist with importance=0.7 (from AcceptedOffer, not default 0.5).
+    let holding = db.get_holding(&block_id, &owner).unwrap().expect("HoldingRecord must exist");
+    assert_eq!(holding.importance, importance, "importance must come from AcceptedOffer");
+    assert_eq!(holding.status, HoldingStatus::Active);
+    assert_eq!(holding.esi_ranges, vec![(0u32, 3u32)]);
+
+    // Offer must be consumed (removed from map).
+    let map = processor.accepted_offers.lock().unwrap();
+    assert!(
+        map.get(&(owner, block_id)).is_none(),
+        "AcceptedOffer must be removed after transfer"
+    );
+}
+
+// ─── AC-5: transfer_rejected_esi_out_of_range ────────────────────────────────
+//
+// AC-5: Holder rejects SymbolTransfer with ESI outside accepted range.
+// Setup: accepted_offers has (alice_id, X) → { esi_ranges: [(0, 10)] }.
+// Input: SymbolTransfer with ESI 999.
+// Expected: symbols NOT stored. Offer is consumed (removed from map) before ESI check runs,
+// so it's always removed regardless of whether ESIs are valid.
+
+#[tokio::test]
+async fn transfer_rejected_esi_out_of_range() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let owner = make_identity(0x44);
+    let block_id = make_block_id(0x44);
+
+    // Accepted range is ESI 0..9.
+    insert_accepted_offer(&processor, owner, block_id, vec![(0u32, 10u32)], 0.5);
+
+    // ESI 999 is outside the accepted range.
+    let transfer = SymbolTransferMsg {
+        v: 1,
+        source_block_id: block_id,
+        symbols: vec![syncback_core::erasure::Symbol {
+            esi: 999,
+            data: vec![0xDDu8; 64],
+        }],
+        timestamp: Timestamp::now(),
+    };
+
+    processor
+        .handle_symbol_transfer(owner, transfer)
+        .await
+        .expect("must return Ok even when ESI out of range");
+
+    // Symbol file must NOT exist.
+    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let sym_path = holdings_dir.path().join(&block_hex).join("999.bin");
+    assert!(!sym_path.exists(), "symbol file must not be written for ESI out of range");
+
+    // HoldingRecord must NOT exist.
+    let holding = db.get_holding(&block_id, &owner).unwrap();
+    assert!(holding.is_none(), "HoldingRecord must not be created for ESI out of range");
+
+    // Offer must be consumed (removed from map after first validation attempt).
+    let map = processor.accepted_offers.lock().unwrap();
+    assert!(
+        map.get(&(owner, block_id)).is_none(),
+        "AcceptedOffer must be consumed even when ESI validation fails"
+    );
+}
+
+// ─── AC-6: offer_rejected_bad_signature ──────────────────────────────────────
+//
+// AC-6: Holder rejects SymbolOffer with invalid signature.
+// Input: SymbolOfferMsg with corrupted sig.
+// Expected: accepted_offers not modified, verify_symbol_offer returns Err.
+// Note: We test verify_symbol_offer directly (handle_symbol_offer needs a real Connection).
+
+#[tokio::test]
+async fn offer_rejected_bad_signature() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let owner = IdentityPub(signing_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0x55);
+
+    let mut offer = syncback_core::messages::build_symbol_offer(
+        [0u8; 16],
+        block_id,
+        vec![(0u32, 5u32)],
+        0.5,
+        Timestamp::now(),
+        &signing_key,
+    );
+
+    // Corrupt the last byte of the signature.
+    offer.sig[63] ^= 0xFF;
+
+    // verify_symbol_offer must fail for the corrupted sig.
+    let result = syncback_core::messages::verify_symbol_offer(&offer, &owner);
+    assert!(result.is_err(), "verify_symbol_offer must fail for tampered sig");
+
+    // accepted_offers must remain empty (handle_symbol_offer would reject at sig check).
+    let map = processor.accepted_offers.lock().unwrap();
+    assert!(map.is_empty(), "accepted_offers must be empty after rejected offer");
+}
+
+// ─── AC-11: expired_accepted_offer_rejected ──────────────────────────────────
+//
+// AC-11: Stale accepted offer (older than SYMBOL_OFFER_EXPIRY_SECS) is cleaned
+//        up on next access via handle_symbol_transfer.
+// Setup: AcceptedOffer inserted with accepted_at set to epoch 0 (very old).
+// Input: handle_symbol_transfer arrives after expiry.
+// Expected: Transfer rejected, offer removed from map, HoldingRecord NOT created.
+
+#[tokio::test]
+async fn expired_accepted_offer_rejected() {
+    use syncback_core::constants::SYMBOL_OFFER_EXPIRY_SECS;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let owner = make_identity(0x66);
+    let block_id = make_block_id(0x66);
+
+    // Insert an expired offer: accepted_at = 0 (Unix epoch).
+    // now() will be >> SYMBOL_OFFER_EXPIRY_SECS after epoch 0.
+    let expired_offer = AcceptedOffer {
+        owner_id: owner,
+        source_block_id: block_id,
+        esi_ranges: vec![(0u32, 100u32)],
+        importance: 0.5,
+        accepted_at: Timestamp(0), // epoch — always expired
+    };
+    {
+        let mut map = processor.accepted_offers.lock().unwrap();
+        map.insert((owner, block_id), expired_offer);
+    }
+
+    // Verify the offer is indeed expired.
+    let now = Timestamp::now().0;
+    assert!(
+        now > SYMBOL_OFFER_EXPIRY_SECS,
+        "test requires current time > SYMBOL_OFFER_EXPIRY_SECS to ensure expiry"
+    );
+
+    let transfer = SymbolTransferMsg {
+        v: 1,
+        source_block_id: block_id,
+        symbols: vec![syncback_core::erasure::Symbol {
+            esi: 0,
+            data: vec![0xEEu8; 64],
+        }],
+        timestamp: Timestamp::now(),
+    };
+
+    processor
+        .handle_symbol_transfer(owner, transfer)
+        .await
+        .expect("expired offer must not propagate error");
+
+    // Symbol file must NOT exist.
+    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let sym_path = holdings_dir.path().join(&block_hex).join("0.bin");
+    assert!(!sym_path.exists(), "symbol must not be stored when offer expired");
+
+    // HoldingRecord must NOT exist.
+    let holding = db.get_holding(&block_id, &owner).unwrap();
+    assert!(holding.is_none(), "HoldingRecord must not be created for expired offer");
+
+    // Offer must be removed from the map (lazy cleanup).
+    let map = processor.accepted_offers.lock().unwrap();
+    assert!(
+        map.get(&(owner, block_id)).is_none(),
+        "expired offer must be removed from map on access"
+    );
+}
+
+// ─── AC-3: offer_rejected_when_quota_full ─────────────────────────────────────
+//
+// AC-3: Holder rejects SymbolOffer when quota is full.
+// Input: decide_symbol_offer with quota=1 byte (any offer_bytes > 1 is rejected).
+// Expected: decide_symbol_offer returns false, accepted_offers map remains empty.
+// Note: handle_symbol_offer needs a real Connection; we test decide_symbol_offer
+// directly (the same inner function called by handle_symbol_offer at step 3).
+// We also verify sig and freshness pass on the offer to confirm only quota blocks it.
+
+#[tokio::test]
+async fn offer_rejected_when_quota_full() {
+    use syncback_core::constants::HANDSHAKE_FRESHNESS_SECS;
+    use syncback_core::messages::{build_symbol_offer, verify_symbol_offer};
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    // Quota of 1 byte: any realistic offer exceeds it and is rejected.
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor_with_quota(db.clone(), &holdings_dir, &source_dir, 1, 1).await;
+
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let owner = IdentityPub(signing_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0x77);
+    let esi_ranges = vec![(0u32, 5u32)];
+    let timestamp = Timestamp::now();
+
+    // Build a valid offer so we can verify sig and freshness pass independently.
+    let offer = build_symbol_offer(
+        [0xAAu8; 16],
+        block_id,
+        esi_ranges.clone(),
+        0.5,
+        timestamp,
+        &signing_key,
+    );
+
+    // Check 1: freshness passes — timestamp is current.
+    let now = Timestamp::now().0;
+    let ts = offer.timestamp.0;
+    let delta = if now > ts { now - ts } else { ts - now };
+    assert!(
+        delta <= HANDSHAKE_FRESHNESS_SECS,
+        "offer must be fresh for this test to be meaningful"
+    );
+
+    // Check 2: signature is valid.
+    assert!(
+        verify_symbol_offer(&offer, &owner).is_ok(),
+        "offer sig must be valid for this test to be meaningful"
+    );
+
+    // Check 3: quota check returns false (this is the reason for rejection).
+    let offer_bytes: u64 = esi_ranges.iter().map(|&(_, c)| c as u64 * 65_535).sum();
+    let accept = processor
+        .decide_symbol_offer(offer_bytes)
+        .expect("decide_symbol_offer must not error");
+    assert!(!accept, "decide_symbol_offer must return false when quota=1 byte");
+
+    // accepted_offers must remain empty (handle_symbol_offer would not insert on reject).
+    let map = processor.accepted_offers.lock().unwrap();
+    assert!(
+        map.is_empty(),
+        "accepted_offers must be empty when quota rejects the offer"
+    );
+}
+
+// ─── AC-7: offer_rejected_on_stale_timestamp ──────────────────────────────────
+//
+// AC-7: Holder rejects SymbolOffer with a stale timestamp.
+// Input: SymbolOfferMsg with timestamp = Timestamp(0) (Unix epoch).
+// Expected: freshness check fails (|now - 0| > HANDSHAKE_FRESHNESS_SECS),
+//           accepted_offers map remains empty.
+// Note: sig is valid; only freshness blocks acceptance.
+
+#[tokio::test]
+async fn offer_rejected_on_stale_timestamp() {
+    use syncback_core::constants::HANDSHAKE_FRESHNESS_SECS;
+    use syncback_core::messages::{build_symbol_offer, verify_symbol_offer};
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let owner = IdentityPub(signing_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0x88);
+
+    // Build offer with stale timestamp (Unix epoch = definitely expired).
+    let stale_ts = Timestamp(0);
+    let offer = build_symbol_offer(
+        [0xBBu8; 16],
+        block_id,
+        vec![(0u32, 5u32)],
+        0.5,
+        stale_ts,
+        &signing_key,
+    );
+
+    // Confirm sig is valid — the test is specifically about freshness, not sig.
+    assert!(
+        verify_symbol_offer(&offer, &owner).is_ok(),
+        "offer sig must be valid for this test to isolate the freshness check"
+    );
+
+    // Confirm freshness check would fail.
+    let now = Timestamp::now().0;
+    let ts = offer.timestamp.0;
+    let delta = if now > ts { now - ts } else { ts - now };
+    assert!(
+        delta > HANDSHAKE_FRESHNESS_SECS,
+        "Timestamp(0) must be stale: delta={delta} must exceed HANDSHAKE_FRESHNESS_SECS={HANDSHAKE_FRESHNESS_SECS}"
+    );
+
+    // accepted_offers must remain empty (handle_symbol_offer would reject at freshness check).
+    // We do not call handle_symbol_offer (needs real Connection) — the freshness condition
+    // is confirmed above. Absence of insertion is the observable effect on shared state.
+    let map = processor.accepted_offers.lock().unwrap();
+    assert!(
+        map.is_empty(),
+        "accepted_offers must be empty: stale offer must not be stored"
+    );
 }

@@ -106,6 +106,14 @@ pub struct BackupConfig {
     /// Override offer_budget_gb for testing. None = compute from DB (production).
     /// Follows the same pattern as mock_holders.
     pub mock_offer_budget_gb: Option<f64>,
+    /// Master identity signing key for signing SymbolOfferMsg.
+    /// When Some: deliver_to_holder uses the offer/accept/transfer handshake.
+    /// When None: falls back to direct SymbolTransfer (pre-offer tests).
+    pub master_signing_key: Option<ed25519_dalek::SigningKey>,
+    /// Shared pending_deliveries map (same Arc shared with Processor).
+    /// When Some: the offer flow registers a oneshot here and awaits SymbolAccept/Reject.
+    /// When None: offer flow is skipped (pre-offer tests).
+    pub pending_deliveries: Option<crate::daemon::processor::PendingDeliveries>,
 }
 
 impl Default for BackupConfig {
@@ -121,6 +129,8 @@ impl Default for BackupConfig {
             watch_configs: vec![],
             time_scale: 1,
             mock_offer_budget_gb: None,
+            master_signing_key: None,
+            pending_deliveries: None,
         }
     }
 }
@@ -137,6 +147,8 @@ pub struct PipelineResult {
     /// Exact byte length of the stored blob ([nonce][ciphertext]).
     /// Required for restore: the decoded erasure block is zero-padded to k*t; trim to stored_size.
     pub stored_size: u64,
+    /// Average importance of files packed into this block (used for SymbolOffer).
+    pub importance: f64,
 }
 
 // ─── BackupCoordinator ────────────────────────────────────────────────────────
@@ -644,7 +656,123 @@ impl BackupCoordinator {
     }
 
     /// Deliver symbols for one (block, holder) pair.
+    ///
+    /// When `master_signing_key` is configured:
+    ///   1. Build SymbolOffer (signed with master key).
+    ///   2. Register oneshot in pending_deliveries.
+    ///   3. Send SymbolOffer via network.
+    ///   4. Await oneshot with SYMBOL_OFFER_TIMEOUT_SECS timeout.
+    ///   5. On Accepted → send SymbolTransfer.
+    ///   6. On Rejected/Timeout → log, return Err (caller logs + continues).
+    ///
+    /// When `master_signing_key` is None: fall back to direct SymbolTransfer.
     async fn deliver_to_holder(
+        &self,
+        network: &crate::daemon::network::NetworkHandle,
+        result: &PipelineResult,
+        placement: &syncback_core::types::SymbolPlacement,
+    ) -> anyhow::Result<()> {
+        use syncback_core::constants::SYMBOL_OFFER_TIMEOUT_SECS;
+        use syncback_core::messages::{Message, SymbolTransferMsg};
+        use syncback_core::types::Timestamp;
+        use tokio::time::Duration;
+
+        let signing_key = match self.config.master_signing_key.as_ref() {
+            Some(k) => k,
+            None => {
+                // Legacy path: send SymbolTransfer directly (no offer handshake).
+                return self.deliver_to_holder_direct(network, result, placement).await;
+            }
+        };
+
+        let pending_deliveries = match self.config.pending_deliveries.as_ref() {
+            Some(pd) => pd,
+            None => {
+                // No pending_deliveries map — fall back to direct transfer.
+                return self.deliver_to_holder_direct(network, result, placement).await;
+            }
+        };
+
+        let importance = result.importance;
+
+        // Build signed SymbolOffer.
+        let msg_id: [u8; 16] = rand::random();
+        let timestamp = Timestamp::now();
+        let offer = syncback_core::messages::build_symbol_offer(
+            msg_id,
+            result.source_block_id,
+            placement.esi_ranges.clone(),
+            importance,
+            timestamp,
+            signing_key,
+        );
+
+        // Register oneshot channel in pending_deliveries before sending the offer
+        // (to avoid a race: Accept could arrive before we register).
+        let (tx, rx) = tokio::sync::oneshot::channel::<crate::daemon::processor::OfferOutcome>();
+        {
+            let mut map = pending_deliveries.lock().await;
+            map.insert((placement.holder_id, result.source_block_id), tx);
+        }
+
+        // Send SymbolOffer.
+        if let Err(e) = network
+            .send_to_peer(placement.holder_id, &Message::SymbolOffer(offer))
+            .await
+        {
+            // Clean up pending entry on send failure.
+            let mut map = pending_deliveries.lock().await;
+            map.remove(&(placement.holder_id, result.source_block_id));
+            return Err(anyhow::anyhow!("send SymbolOffer: {e}"));
+        }
+
+        // Wait for outcome with timeout.
+        let outcome = tokio::time::timeout(Duration::from_secs(SYMBOL_OFFER_TIMEOUT_SECS), rx).await;
+
+        match outcome {
+            Ok(Ok(crate::daemon::processor::OfferOutcome::Accepted)) => {
+                // Holder accepted — send SymbolTransfer.
+                self.deliver_to_holder_direct(network, result, placement).await
+            }
+            Ok(Ok(crate::daemon::processor::OfferOutcome::Rejected { reason })) => {
+                // Clean up pending entry (already removed by handle_symbol_reject, but just in case).
+                {
+                    let mut map = pending_deliveries.lock().await;
+                    map.remove(&(placement.holder_id, result.source_block_id));
+                }
+                anyhow::bail!(
+                    "holder {} rejected offer for block {:?}: {:?}",
+                    placement.holder_id,
+                    result.source_block_id,
+                    reason
+                )
+            }
+            Ok(Err(_)) => {
+                // Sender dropped (Processor shut down mid-flight).
+                anyhow::bail!(
+                    "offer outcome channel closed for holder {} block {:?}",
+                    placement.holder_id,
+                    result.source_block_id
+                )
+            }
+            Err(_timeout) => {
+                // Timeout — clean up pending entry.
+                {
+                    let mut map = pending_deliveries.lock().await;
+                    map.remove(&(placement.holder_id, result.source_block_id));
+                }
+                anyhow::bail!(
+                    "offer timeout: no Accept from holder {} for block {:?} within {}s",
+                    placement.holder_id,
+                    result.source_block_id,
+                    SYMBOL_OFFER_TIMEOUT_SECS
+                )
+            }
+        }
+    }
+
+    /// Direct SymbolTransfer delivery (legacy path, no offer handshake).
+    async fn deliver_to_holder_direct(
         &self,
         network: &crate::daemon::network::NetworkHandle,
         result: &PipelineResult,

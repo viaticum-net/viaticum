@@ -71,6 +71,8 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
+        master_signing_key: None,
+        pending_deliveries: None,
     }
 }
 
@@ -140,6 +142,8 @@ fn config_source_block_size_drives_backup() {
             watch_configs: vec![],
             time_scale: 1,
             mock_offer_budget_gb: None,
+            master_signing_key: None,
+            pending_deliveries: None,
         },
         Arc::new(RaptorQEncoder::new()),
     );
