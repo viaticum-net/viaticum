@@ -167,17 +167,28 @@ mod cluster_sync_tests {
         );
 
         let peer_identity = device_b_identity();
+        // Cursor advances by event count (not responder_last_seq) to prevent
+        // a malicious peer from skipping events by sending an inflated seq.
+        let events: Vec<(u64, EventEntry)> = (0..3)
+            .map(|i| (i as u64 + 1, EventEntry {
+                event: Event::DeviceAdded {
+                    device_id: DeviceId([i as u8 + 10; 16]),
+                },
+                timestamp: NOW,
+                device_id: DEVICE_B_ID,
+            }))
+            .collect();
         let response = ClusterSyncResponseMsg {
             v: 1,
-            events: vec![],
-            responder_last_seq: 7,
+            events,
+            responder_last_seq: 100, // intentionally inflated — should be ignored
             timestamp: NOW,
         };
         manager.process_sync_response(&peer_identity, response).unwrap();
 
-        // Cursor must be updated to responder_last_seq.
+        // Cursor = initial(0) + events.len(3), NOT responder_last_seq(100).
         let cursor = shared.lock().unwrap().sync_cursor(&peer_identity);
-        assert_eq!(cursor, 7);
+        assert_eq!(cursor, 3);
     }
 
     // ─── 5. process_sync_response_idempotent ─────────────────────────────────
@@ -481,18 +492,27 @@ mod cluster_sync_tests {
         let req_before = manager.build_sync_request(&device_b_key);
         assert_eq!(req_before.last_known_seq, 0);
 
-        // Apply a response: responder_last_seq = 15.
+        // Apply a response with 5 events (cursor advances by event count).
+        let events: Vec<(u64, EventEntry)> = (0..5)
+            .map(|i| (i as u64 + 1, EventEntry {
+                event: Event::DeviceAdded {
+                    device_id: DeviceId([i as u8 + 20; 16]),
+                },
+                timestamp: NOW,
+                device_id: DEVICE_B_ID,
+            }))
+            .collect();
         let response = ClusterSyncResponseMsg {
             v: 1,
-            events: vec![],
+            events,
             responder_last_seq: 15,
             timestamp: NOW,
         };
         manager.process_sync_response(&device_b_key, response).unwrap();
 
-        // After response, cursor advanced → next request starts from 15.
+        // After response, cursor advanced by event count (5), not responder_last_seq (15).
         let req_after = manager.build_sync_request(&device_b_key);
-        assert_eq!(req_after.last_known_seq, 15, "cursor must advance after process_sync_response");
+        assert_eq!(req_after.last_known_seq, 5, "cursor must advance after process_sync_response");
     }
 
     // ─── Message serialization round-trips ───────────────────────────────────

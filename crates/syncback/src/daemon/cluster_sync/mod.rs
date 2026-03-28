@@ -138,14 +138,20 @@ impl ClusterSyncManager {
         peer_identity: &IdentityPub,
         response: ClusterSyncResponseMsg,
     ) -> Result<usize, ClusterSyncError> {
-        let responder_last_seq = response.responder_last_seq;
         let mut state = self
             .cluster_state
             .lock()
             .expect("cluster_state lock poisoned");
 
         let applied = state.apply_events(&response.events)?;
-        state.update_sync_cursor(*peer_identity, responder_last_seq)?;
+
+        // Only advance cursor by the number of events we actually received.
+        // A malicious peer could send responder_last_seq = u64::MAX to
+        // permanently skip future events. Instead, advance cursor by
+        // current_cursor + events_received_count.
+        let current_cursor = state.sync_cursor(peer_identity);
+        let safe_seq = current_cursor.saturating_add(response.events.len() as u64);
+        state.update_sync_cursor(*peer_identity, safe_seq)?;
 
         Ok(applied)
     }
