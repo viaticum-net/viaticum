@@ -48,6 +48,11 @@ pub struct WatcherConfig {
     /// Debounce window in milliseconds. Events arriving within this window
     /// for the same path are coalesced: only the last-seen kind is forwarded.
     pub debounce_ms: u64,
+    /// Data directory for storing last_scan timestamp file.
+    pub data_dir: PathBuf,
+    /// Rescan interval in seconds. 0 = no periodic rescan.
+    /// Default: 604800 (1 week).
+    pub rescan_interval_secs: u64,
 }
 
 // ─── start_watcher ────────────────────────────────────────────────────────────
@@ -99,6 +104,27 @@ pub async fn start_watcher(
         tracing::info!(dir = %dir.display(), "watching directory");
     }
 
+    // ── Initial / periodic scan ────────────────────────────────────────────
+    let scan_marker = config.data_dir.join("last_scan");
+    let needs_scan = should_run_scan(&scan_marker, config.rescan_interval_secs);
+    if needs_scan {
+        let count = run_full_scan(
+            &config.watch_dirs,
+            config.device_id,
+            &dirty_tx,
+        )
+        .await;
+        // Write current timestamp as marker.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let _ = std::fs::write(&scan_marker, now.to_string());
+        tracing::info!(files = count, "initial/periodic scan complete");
+    } else {
+        tracing::info!("scan skipped (last scan recent enough)");
+    }
+
     // Debounce state: path → (kind, deadline).
     let mut pending: HashMap<PathBuf, (DirtyKind, Instant)> = HashMap::new();
     let debounce_dur = std::time::Duration::from_millis(config.debounce_ms.max(1));
@@ -106,6 +132,15 @@ pub async fn start_watcher(
     // Poll the std channel at quarter-debounce resolution (min 10 ms).
     let poll_ms = (config.debounce_ms / 4).max(10);
     let mut poll_timer = interval(Duration::from_millis(poll_ms));
+
+    // Periodic rescan timer.
+    let rescan_secs = if config.rescan_interval_secs > 0 {
+        config.rescan_interval_secs
+    } else {
+        u64::MAX / 2 // effectively never
+    };
+    let mut rescan_timer = interval(Duration::from_secs(rescan_secs));
+    rescan_timer.tick().await; // skip immediate first tick
 
     // Keep watcher alive for the duration of this async function.
     let _watcher = watcher;
@@ -115,6 +150,19 @@ pub async fn start_watcher(
             _ = cancel.cancelled() => {
                 tracing::debug!("watcher: cancel requested, exiting");
                 break;
+            }
+            _ = rescan_timer.tick() => {
+                let count = run_full_scan(
+                    &config.watch_dirs,
+                    config.device_id,
+                    &dirty_tx,
+                ).await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let _ = std::fs::write(&scan_marker, now.to_string());
+                tracing::info!(files = count, "periodic rescan complete");
             }
             _ = poll_timer.tick() => {
                 // Drain all pending std-channel messages.
@@ -179,6 +227,72 @@ fn classify_event(kind: &EventKind) -> Option<DirtyKind> {
         EventKind::Remove(RemoveKind::Folder) => None,       // directory removal: ignore
         _ => None,
     }
+}
+
+/// Check whether a full scan is needed based on last_scan marker file.
+fn should_run_scan(marker: &std::path::Path, interval_secs: u64) -> bool {
+    let contents = match std::fs::read_to_string(marker) {
+        Ok(c) => c,
+        Err(_) => return true, // no marker = never scanned
+    };
+    let last_ts: u64 = match contents.trim().parse() {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.saturating_sub(last_ts) >= interval_secs
+}
+
+/// Walk all watch directories and emit DirtyEvent::Added for every file found.
+async fn run_full_scan(
+    dirs: &[PathBuf],
+    device_id: DeviceId,
+    dirty_tx: &mpsc::Sender<DirtyEvent>,
+) -> u64 {
+    let mut count: u64 = 0;
+    for dir in dirs {
+        let walker = match std::fs::read_dir(dir) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "scan: cannot read directory");
+                continue;
+            }
+        };
+        // Use a stack-based walk to avoid recursion depth issues.
+        let mut stack: Vec<PathBuf> = vec![dir.clone()];
+        while let Some(current) = stack.pop() {
+            let entries = match std::fs::read_dir(&current) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Skip hidden directories.
+                    if let Some(name) = path.file_name() {
+                        if !name.to_string_lossy().starts_with('.') {
+                            stack.push(path);
+                        }
+                    }
+                } else if should_watch_path(&path) {
+                    let event = DirtyEvent {
+                        path: path.to_string_lossy().into_owned(),
+                        kind: DirtyKind::Added,
+                        device_id,
+                    };
+                    if dirty_tx.send(event).await.is_err() {
+                        return count;
+                    }
+                    count += 1;
+                }
+            }
+        }
+        drop(walker);
+    }
+    count
 }
 
 /// Returns true if the path should trigger a DirtyEvent.
