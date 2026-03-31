@@ -164,8 +164,8 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
     let device_id_a = DeviceId([0xA0u8; 32]);
     let device_id_b = DeviceId([0xB0u8; 32]);
 
-    let dev_key_a = derive_device_key(&seed_a, &device_id_a.0).unwrap();
-    let dev_key_b = derive_device_key(&seed_a, &device_id_b.0).unwrap();
+    let _dev_key_a = derive_device_key(&seed_a, &device_id_a.0).unwrap();
+    let _dev_key_b = derive_device_key(&seed_a, &device_id_b.0).unwrap();
 
     let now = Timestamp(1_000_000);
     let cert_a = issue_device_certificate(

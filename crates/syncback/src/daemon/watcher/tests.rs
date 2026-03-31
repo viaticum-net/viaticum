@@ -30,7 +30,7 @@ async fn recv_with_timeout(
 /// Pre-creates the `last_scan` marker to skip the initial scan (which would
 /// emit Added events for existing files and interfere with test assertions).
 fn config_for(dir: &TempDir) -> WatcherConfig {
-    let data_dir = TempDir::new().unwrap().into_path();
+    let data_dir = TempDir::new().unwrap().keep();
     // Write a recent timestamp to skip initial scan.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -244,7 +244,7 @@ async fn debounce_multiple_changes_emit_one_event() {
         watch_dirs: vec![dir.path().to_path_buf()],
         device_id: TEST_DEVICE_ID,
         debounce_ms: 300,
-        data_dir: TempDir::new().unwrap().into_path(),
+        data_dir: TempDir::new().unwrap().keep(),
         rescan_interval_secs: 0,
     };
 
@@ -302,7 +302,7 @@ async fn file_deleted_before_debounce_emits_deleted_event() {
         watch_dirs: vec![dir.path().to_path_buf()],
         device_id: TEST_DEVICE_ID,
         debounce_ms: 400,
-        data_dir: TempDir::new().unwrap().into_path(),
+        data_dir: TempDir::new().unwrap().keep(),
         rescan_interval_secs: 0,
     };
 
@@ -410,7 +410,7 @@ async fn rapid_changes_no_panic() {
         watch_dirs: vec![dir.path().to_path_buf()],
         device_id: TEST_DEVICE_ID,
         debounce_ms: DEBOUNCE_MS,
-        data_dir: TempDir::new().unwrap().into_path(),
+        data_dir: TempDir::new().unwrap().keep(),
         rescan_interval_secs: 0,
     };
 

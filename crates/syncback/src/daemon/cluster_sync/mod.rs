@@ -15,8 +15,8 @@
 // Cursor persistence: sync_cursors stored in StoredClusterState via
 // ClusterState::update_sync_cursor(). No separate DB key needed.
 //
-// Cursor key: IdentityPub(device_id.0) — per-device identity. Each device
-// in the cluster has a unique device_id (Ed25519 pubkey), so cursors are tracked per device.
+// Cursor key: DeviceId — per-device. Each device in the cluster has a
+// unique device_id (Ed25519 pubkey), so cursors are tracked per device.
 
 use std::sync::{Arc, Mutex};
 
@@ -106,12 +106,12 @@ impl ClusterSyncManager {
     ///
     /// Uses sync_cursors from ClusterState to determine last_known_seq.
     /// Returns 0 if no cursor exists (peer is new / never synced).
-    pub fn build_sync_request(&self, peer_identity: &IdentityPub) -> ClusterSyncRequestMsg {
+    pub fn build_sync_request(&self, peer_device: &DeviceId) -> ClusterSyncRequestMsg {
         let last_known_seq = self
             .cluster_state
             .lock()
             .expect("cluster_state lock poisoned")
-            .sync_cursor(peer_identity);
+            .sync_cursor(peer_device);
 
         ClusterSyncRequestMsg {
             v: 1,
@@ -134,7 +134,7 @@ impl ClusterSyncManager {
     /// events are skipped by apply_events).
     pub fn process_sync_response(
         &self,
-        peer_identity: &IdentityPub,
+        peer_device: &DeviceId,
         response: ClusterSyncResponseMsg,
     ) -> Result<usize, ClusterSyncError> {
         let mut state = self
@@ -148,9 +148,9 @@ impl ClusterSyncManager {
         // A malicious peer could send responder_last_seq = u64::MAX to
         // permanently skip future events. Instead, advance cursor by
         // current_cursor + events_received_count.
-        let current_cursor = state.sync_cursor(peer_identity);
+        let current_cursor = state.sync_cursor(peer_device);
         let safe_seq = current_cursor.saturating_add(response.events.len() as u64);
-        state.update_sync_cursor(*peer_identity, safe_seq)?;
+        state.update_sync_cursor(*peer_device, safe_seq)?;
 
         Ok(applied)
     }
@@ -222,9 +222,6 @@ impl ClusterSyncManager {
     // =========================================================
 
     /// Return the cluster master identity (IdentityPub).
-    ///
-    /// This is the same key used by the Processor when it calls
-    /// `process_sync_response` — useful for building consistent cursor keys.
     pub fn master_pub(&self) -> IdentityPub {
         self.cluster_state
             .lock()
@@ -240,7 +237,7 @@ impl ClusterSyncManager {
 /// For each peer in cluster_state (excluding our own device):
 ///   1. Look up DeviceEntry in cluster_state (device_id.0 is the pub key).
 ///   2. Skip revoked devices.
-///   3. Build cursor key as `IdentityPub(device_id.0)` (per-device cursor).
+///   3. Build sync request using DeviceId as cursor key.
 ///   4. Derive PeerId from DeviceId; dial via swarm (best-effort, deduped by libp2p).
 ///   5. swarm.send_to_device(device_id, ClusterSyncRequest) → ClusterSyncResponse.
 ///      If PeerNotAuthenticated: skip this cycle (not yet connected).
@@ -268,7 +265,7 @@ pub async fn run_periodic_sync(
             }
             _ = interval.tick() => {
                 // Collect all active cluster devices (excluding self) under lock, then release.
-                let peer_devices: Vec<(DeviceId, [u8; 32], String)> = {
+                let peer_devices: Vec<(DeviceId, String)> = {
                     let state = cluster_state.lock().expect("cluster_state lock poisoned");
                     let addrs = state.cluster_addrs().clone();
                     state
@@ -277,7 +274,7 @@ pub async fn run_periodic_sync(
                         .filter(|e| e.device_id != our_device_id)
                         .map(|e| {
                             let addr = addrs.get(&e.device_id).cloned().unwrap_or_default();
-                            (e.device_id, e.device_id.0, addr)
+                            (e.device_id, addr)
                         })
                         .collect()
                 };
@@ -285,10 +282,8 @@ pub async fn run_periodic_sync(
                 let mut synced = 0usize;
                 let mut skipped = 0usize;
 
-                for (device_id, device_id_bytes, addr_str) in peer_devices {
-                    // Per-device cursor key: IdentityPub(device_id.0).
-                    let peer_identity = IdentityPub(device_id_bytes);
-                    let request = cluster_sync.build_sync_request(&peer_identity);
+                for (device_id, addr_str) in peer_devices {
+                    let request = cluster_sync.build_sync_request(&device_id);
 
                     // Derive PeerId and attempt dial (best-effort; libp2p deduplicates).
                     if !addr_str.is_empty() {
@@ -331,7 +326,7 @@ pub async fn run_periodic_sync(
 
                     match response {
                         Message::ClusterSyncResponse(resp) => {
-                            match cluster_sync.process_sync_response(&peer_identity, resp) {
+                            match cluster_sync.process_sync_response(&device_id, resp) {
                                 Ok(applied) => {
                                     debug!(device_id = %device_id, applied, "cluster_sync: response applied");
                                     synced += 1;

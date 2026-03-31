@@ -617,6 +617,7 @@ impl SwarmHandle {
     /// Scans the authenticated map for any device whose master identity matches.
     /// Returns Err(SwarmError::MasterNotAuthenticated) if no such device is connected.
     /// Blocks until a response is received or the 30s timeout expires.
+    #[deprecated(note = "use send_to_device with DeviceId instead")]
     pub async fn send_to_master(
         &self,
         master: IdentityPub,

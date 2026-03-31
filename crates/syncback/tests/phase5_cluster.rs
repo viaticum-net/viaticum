@@ -313,8 +313,8 @@ fn cluster_sync_propagates_file_deletion_event() {
     );
 
     // B requests sync from A (cursor = 0: never synced before).
-    let a_identity = IdentityPub(device_a_id().0);
-    let request = sync_b.build_sync_request(&a_identity);
+    let a_device = device_a_id();
+    let request = sync_b.build_sync_request(&a_device);
     assert_eq!(request.last_known_seq, 0, "B has never synced A before");
     assert_eq!(request.from_device_id, device_b_id());
 
@@ -336,11 +336,11 @@ fn cluster_sync_propagates_file_deletion_event() {
     assert!(has_deletion, "FileDeleted event must be present in sync response");
 
     // B applies the response.
-    let applied = sync_b.process_sync_response(&a_identity, response).unwrap();
+    let applied = sync_b.process_sync_response(&a_device, response).unwrap();
     assert!(applied > 0, "at least some events must be applied by B");
 
     // B's cursor for A must now be advanced to a_last_seq.
-    let req2 = sync_b.build_sync_request(&a_identity);
+    let req2 = sync_b.build_sync_request(&a_device);
     assert_eq!(
         req2.last_known_seq, a_last_seq,
         "B's cursor for A must advance to a_last_seq after sync"

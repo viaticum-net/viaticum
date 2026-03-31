@@ -281,9 +281,9 @@ pub struct StoredClusterState {
     pub peer_affinity: Vec<(IdentityPub, crate::types::DeviceId)>,
     /// Last applied event log sequence number.
     pub last_applied_seq: u64,
-    /// Per-device sync cursors for ClusterSync (device pub → last received seq).
+    /// Per-device sync cursors for ClusterSync (DeviceId → last received seq).
     #[serde(default)]
-    pub sync_cursors: std::collections::HashMap<IdentityPub, u64>,
+    pub sync_cursors: std::collections::HashMap<crate::types::DeviceId, u64>,
     /// Last known network addresses for cluster devices (for reconnect after restart).
     #[serde(default)]
     pub cluster_addrs: std::collections::HashMap<crate::types::DeviceId, String>,
@@ -643,10 +643,10 @@ impl ClusterState {
 
     /// Get the sync cursor (last received seq) for a peer device.
     /// Returns 0 if no cursor exists (meaning "start from beginning").
-    pub fn sync_cursor(&self, peer_identity: &IdentityPub) -> u64 {
+    pub fn sync_cursor(&self, device_id: &crate::types::DeviceId) -> u64 {
         self.state
             .sync_cursors
-            .get(peer_identity)
+            .get(device_id)
             .copied()
             .unwrap_or(0)
     }
@@ -654,10 +654,10 @@ impl ClusterState {
     /// Update the sync cursor for a peer device and persist to DB.
     pub fn update_sync_cursor(
         &mut self,
-        peer_identity: IdentityPub,
+        device_id: crate::types::DeviceId,
         seq: u64,
     ) -> Result<(), ClusterStateError> {
-        self.state.sync_cursors.insert(peer_identity, seq);
+        self.state.sync_cursors.insert(device_id, seq);
         self.db.set_cluster_state(&self.state)?;
         Ok(())
     }

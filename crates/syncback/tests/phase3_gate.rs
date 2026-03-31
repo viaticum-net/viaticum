@@ -150,8 +150,8 @@ fn cluster_sync_event_exchange() {
     );
 
     // B builds a request asking for everything (cursor = 0).
-    let a_identity = IdentityPub(device_a_id().0);
-    let request = sync_b.build_sync_request(&a_identity);
+    let a_device = device_a_id();
+    let request = sync_b.build_sync_request(&a_device);
     assert_eq!(request.last_known_seq, 0, "B has never synced A before");
     assert_eq!(request.from_device_id, device_b_id());
 
@@ -166,20 +166,20 @@ fn cluster_sync_event_exchange() {
     assert!(!response.events.is_empty(), "response must contain events");
 
     // B applies the response.
-    let applied = sync_b.process_sync_response(&a_identity, response).unwrap();
+    let applied = sync_b.process_sync_response(&a_device, response).unwrap();
     assert!(applied > 0, "at least some events must be applied");
 
     // B's cursor for A is now updated.
     // Access the shared state to check cursor.
     // Re-read by building a new request — it should use the updated cursor.
-    let request2 = sync_b.build_sync_request(&a_identity);
+    let request2 = sync_b.build_sync_request(&a_device);
     assert_eq!(
         request2.last_known_seq, a_last_seq,
         "cursor must be advanced to A's last_seq after sync"
     );
 
     // Second sync: no new events since A hasn't changed.
-    let request3 = sync_b.build_sync_request(&a_identity);
+    let request3 = sync_b.build_sync_request(&a_device);
     let response3 = sync_a.handle_sync_request(&request3).unwrap();
     assert!(response3.events.is_empty(), "no new events since last sync");
 }

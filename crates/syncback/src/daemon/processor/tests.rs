@@ -3529,13 +3529,18 @@ async fn cluster_sync_response_from_non_cluster_peer_is_rejected() {
         "guard condition: ClusterSyncResponse from foreign identity must be rejected"
     );
 
-    // Calling handle_cluster_sync_response with own_identity (cluster peer) must return Ok.
+    // Calling handle_cluster_sync_response with a cluster device must return Ok.
     let resp = ClusterSyncResponseMsg {
         v: 1,
         events: vec![],
         responder_last_seq: 0,
         timestamp: syncback_core::types::Timestamp::now(),
     };
-    let result = processor.handle_cluster_sync_response(own_identity, resp).await;
-    assert!(result.is_ok(), "handle_cluster_sync_response with own_identity must succeed");
+    // Use our own device_id as the "from" device — it's a cluster member.
+    // Derive the same way make_processor does (seed=[42u8;64], device_seed=[1u8;32]).
+    let device_signing_key = syncback_core::cluster::derive_device_key(&[42u8; 64], &[1u8; 32])
+        .expect("derive_device_key failed");
+    let our_device_id = DeviceId(device_signing_key.verifying_key().to_bytes());
+    let result = processor.handle_cluster_sync_response(our_device_id, resp).await;
+    assert!(result.is_ok(), "handle_cluster_sync_response with cluster device must succeed");
 }

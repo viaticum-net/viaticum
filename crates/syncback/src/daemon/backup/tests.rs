@@ -9,12 +9,12 @@
 use std::sync::{Arc, Mutex};
 
 use syncback_core::cluster::{
-    derive_device_key, derive_master_key, issue_device_certificate, master_identity, ClusterState,
+    derive_master_key, issue_device_certificate, master_identity, ClusterState,
 };
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
 use syncback_core::types::{
-    DeviceId, ErasureParams, Event, FileCategory, FileId, FileRecord, FileVersion, IdentityPub,
+    DeviceId, ErasureParams, Event, FileCategory, FileId, FileRecord, FileVersion,
     LocalState, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
 };
 use tempfile::TempDir;
@@ -747,7 +747,6 @@ fn backup_config_default_swarm_is_none() {
 #[tokio::test]
 async fn deliver_symbols_no_op_when_network_none() {
     use super::PipelineResult;
-    use syncback_core::types::IdentityPub;
 
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();

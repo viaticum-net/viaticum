@@ -517,7 +517,7 @@ impl Processor {
                     let _ = self.swarm.respond(response_channel, Message::Ack(AckMsg { v: 1 }));
                     return Ok(());
                 }
-                if let Err(e) = self.handle_cluster_sync_response(from_master, resp).await {
+                if let Err(e) = self.handle_cluster_sync_response(from_device, resp).await {
                     warn!(device = %from_device, err = %e, "processor: ClusterSyncResponse handler failed");
                 }
                 let ack = Message::SystemStateAck(SystemStateAckMsg {
@@ -2071,19 +2071,19 @@ impl Processor {
 
     pub(crate) async fn handle_cluster_sync_response(
         &self,
-        from: IdentityPub,
+        from_device: DeviceId,
         response: ClusterSyncResponseMsg,
     ) -> Result<(), ProcessorError> {
-        match self.cluster_sync.process_sync_response(&from, response) {
+        match self.cluster_sync.process_sync_response(&from_device, response) {
             Ok(n) => {
                 debug!(
-                    peer = %from,
+                    device = %from_device,
                     applied = n,
                     "processor: cluster sync applied events"
                 );
             }
             Err(e) => {
-                warn!(peer = %from, err = %e, "processor: cluster sync response error");
+                warn!(device = %from_device, err = %e, "processor: cluster sync response error");
             }
         }
         Ok(())

@@ -70,7 +70,7 @@ fn upsert_peer_reconnect_preserves_state() {
     let t0 = ts(1_000_000);
     let t1 = ts(2_000_000);
 
-    engine.upsert_peer(peer_a, t0);
+    engine.upsert_peer_device(peer_a, master(0), t0);
     engine
         .record_pos_result(
             peer_a,
@@ -85,7 +85,7 @@ fn upsert_peer_reconnect_preserves_state() {
 
     let score_before = engine.score(&peer_a).unwrap();
 
-    engine.upsert_peer(peer_a, t1);
+    engine.upsert_peer_device(peer_a, master(0), t1);
 
     let score_after = engine.score(&peer_a).unwrap();
     assert_eq!(score_before.p, score_after.p);

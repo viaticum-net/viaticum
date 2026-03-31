@@ -169,7 +169,7 @@ fn trust_records_pos_results() {
     let peer = peer_id(4);
     let t0 = now();
 
-    engine.upsert_peer(peer, t0);
+    engine.upsert_peer_device(peer, IdentityPub([0u8; 32]), t0);
 
     // Initial score should be low (no history).
     let initial = engine.recalculate(&peer, t0, 1).expect("recalculate");
@@ -576,7 +576,7 @@ fn full_owner_flow() {
 
     // ── Step 4: record PoS result in TrustEngine ─────────────────────────────
     let mut trust = TrustEngine::new();
-    trust.upsert_peer(holder, t);
+    trust.upsert_peer_device(holder, IdentityPub([0u8; 32]), t);
 
     let pos_outcome = outcome_from_verify(&outcome, 1);
     trust

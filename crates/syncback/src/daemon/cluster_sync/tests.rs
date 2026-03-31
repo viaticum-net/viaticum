@@ -13,7 +13,7 @@ mod cluster_sync_tests {
     };
     use syncback_core::db::Db;
     use syncback_core::messages::{from_cbor, to_cbor, ClusterSyncRequestMsg, ClusterSyncResponseMsg, RevocationBroadcast};
-    use syncback_core::types::{DeviceId, Event, EventEntry, IdentityPub, Timestamp};
+    use syncback_core::types::{DeviceId, Event, EventEntry, Timestamp};
 
     use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncError, ClusterSyncManager};
 
@@ -39,17 +39,6 @@ mod cluster_sync_tests {
         DeviceId(key.verifying_key().to_bytes())
     }
 
-    /// Returns the device signing key's public bytes for a given DeviceId.
-    /// In tests, DeviceId = pubkey of derived signing key; device_pub just returns inner bytes.
-    fn device_pub(did: DeviceId) -> [u8; 32] {
-        did.0
-    }
-
-
-    /// device_pub(seed) → IdentityPub containing the device signing key's pubkey
-    fn device_b_identity() -> IdentityPub {
-        IdentityPub(device_b_id().0)
-    }
 
     /// Initialize a ClusterState with device_a as the first device.
     fn make_cluster_state(db: Db) -> ClusterState {
@@ -86,9 +75,6 @@ mod cluster_sync_tests {
         ClusterSyncManager::new(db, config, shared)
     }
 
-    fn device_a_identity() -> IdentityPub {
-        IdentityPub(device_a_id().0)
-    }
 
     // ─── 1. build_sync_request_uses_cursor ───────────────────────────────────
 
@@ -96,13 +82,13 @@ mod cluster_sync_tests {
     fn build_sync_request_uses_cursor() {
         let db = Db::open_in_memory().unwrap();
         let state = make_cluster_state(db.clone());
-        let peer_identity = device_b_identity();
+        let peer_device = device_b_id();
 
         // Set a cursor manually via update_sync_cursor.
         let shared = Arc::new(Mutex::new(state));
         {
             let mut s = shared.lock().unwrap();
-            s.update_sync_cursor(peer_identity, 42).unwrap();
+            s.update_sync_cursor(peer_device, 42).unwrap();
         }
 
         let manager = ClusterSyncManager::new(
@@ -111,7 +97,7 @@ mod cluster_sync_tests {
             shared,
         );
 
-        let msg = manager.build_sync_request(&peer_identity);
+        let msg = manager.build_sync_request(&peer_device);
         assert_eq!(msg.last_known_seq, 42);
         assert_eq!(msg.from_device_id, device_a_id());
         assert_eq!(msg.v, 1);
@@ -123,10 +109,10 @@ mod cluster_sync_tests {
     fn build_sync_request_defaults_to_zero() {
         let db = Db::open_in_memory().unwrap();
         let state = make_cluster_state(db.clone());
-        let peer_identity = device_b_identity();
+        let peer_device = device_b_id();
         let manager = make_manager_with_state(db, state, device_a_id());
 
-        let msg = manager.build_sync_request(&peer_identity);
+        let msg = manager.build_sync_request(&peer_device);
         assert_eq!(msg.last_known_seq, 0);
         assert_eq!(msg.from_device_id, device_a_id());
     }
@@ -159,8 +145,8 @@ mod cluster_sync_tests {
             responder_last_seq: 1,
             timestamp: NOW,
         };
-        let peer_identity = device_b_identity();
-        let applied = manager.process_sync_response(&peer_identity, response).unwrap();
+        let peer_device = device_b_id();
+        let applied = manager.process_sync_response(&peer_device, response).unwrap();
         assert_eq!(applied, 1);
 
         // ClusterState should reflect the revocation.
@@ -181,7 +167,7 @@ mod cluster_sync_tests {
             shared.clone(),
         );
 
-        let peer_identity = device_b_identity();
+        let peer_device = device_b_id();
         // Cursor advances by event count (not responder_last_seq) to prevent
         // a malicious peer from skipping events by sending an inflated seq.
         let events: Vec<(u64, EventEntry)> = (0..3)
@@ -199,10 +185,10 @@ mod cluster_sync_tests {
             responder_last_seq: 100, // intentionally inflated — should be ignored
             timestamp: NOW,
         };
-        manager.process_sync_response(&peer_identity, response).unwrap();
+        manager.process_sync_response(&peer_device, response).unwrap();
 
         // Cursor = initial(0) + events.len(3), NOT responder_last_seq(100).
-        let cursor = shared.lock().unwrap().sync_cursor(&peer_identity);
+        let cursor = shared.lock().unwrap().sync_cursor(&peer_device);
         assert_eq!(cursor, 3);
     }
 
@@ -219,7 +205,7 @@ mod cluster_sync_tests {
             shared.clone(),
         );
 
-        let peer_identity = device_b_identity();
+        let peer_device = device_b_id();
         let events = vec![(
             1u64,
             EventEntry {
@@ -242,8 +228,8 @@ mod cluster_sync_tests {
             responder_last_seq: 1,
             timestamp: NOW,
         };
-        let applied1 = manager.process_sync_response(&peer_identity, response1).unwrap();
-        let applied2 = manager.process_sync_response(&peer_identity, response2).unwrap();
+        let applied1 = manager.process_sync_response(&peer_device, response1).unwrap();
+        let applied2 = manager.process_sync_response(&peer_device, response2).unwrap();
 
         // Second apply should not double-add.
         assert_eq!(applied1, 1);
@@ -458,20 +444,18 @@ mod cluster_sync_tests {
         assert_eq!(manager.master_pub(), master_pub);
     }
 
-    /// build_sync_request uses per-device IdentityPub(device_pub_key) as cursor key,
-    /// not the master identity. Setting the cursor on the device-level key is
-    /// reflected in the built request's last_known_seq.
+    /// build_sync_request uses DeviceId as cursor key. Setting the cursor on
+    /// the device key is reflected in the built request's last_known_seq.
     #[test]
     fn build_sync_request_uses_device_level_cursor_key() {
         let db = Db::open_in_memory().unwrap();
         let state = make_cluster_state_two_devices(db.clone());
         let shared = Arc::new(Mutex::new(state));
 
-        // Cursor set on device-B's device-level IdentityPub.
-        let device_b_key = IdentityPub(device_pub(device_b_id()));
+        let did_b = device_b_id();
         {
             let mut s = shared.lock().unwrap();
-            s.update_sync_cursor(device_b_key, 77).unwrap();
+            s.update_sync_cursor(did_b, 77).unwrap();
         }
 
         let manager = ClusterSyncManager::new(
@@ -480,14 +464,13 @@ mod cluster_sync_tests {
             shared,
         );
 
-        // Build request using device-level cursor — must see seq=77.
-        let msg = manager.build_sync_request(&device_b_key);
-        assert_eq!(msg.last_known_seq, 77, "cursor must be per device_pub_key");
+        let msg = manager.build_sync_request(&did_b);
+        assert_eq!(msg.last_known_seq, 77, "cursor must be per DeviceId");
         assert_eq!(msg.from_device_id, device_a_id());
     }
 
-    /// process_sync_response updates the cursor under the device-level IdentityPub key.
-    /// A subsequent build_sync_request with the same device-level key reflects the update.
+    /// process_sync_response updates the cursor under the DeviceId key.
+    /// A subsequent build_sync_request with the same key reflects the update.
     #[test]
     fn process_sync_response_updates_device_level_cursor() {
         let db = Db::open_in_memory().unwrap();
@@ -499,10 +482,10 @@ mod cluster_sync_tests {
             shared.clone(),
         );
 
-        let device_b_key = IdentityPub(device_pub(device_b_id()));
+        let did_b = device_b_id();
 
         // No cursor yet → request should start from 0.
-        let req_before = manager.build_sync_request(&device_b_key);
+        let req_before = manager.build_sync_request(&did_b);
         assert_eq!(req_before.last_known_seq, 0);
 
         // Apply a response with 5 events (cursor advances by event count).
@@ -521,10 +504,10 @@ mod cluster_sync_tests {
             responder_last_seq: 15,
             timestamp: NOW,
         };
-        manager.process_sync_response(&device_b_key, response).unwrap();
+        manager.process_sync_response(&did_b, response).unwrap();
 
         // After response, cursor advanced by event count (5), not responder_last_seq (15).
-        let req_after = manager.build_sync_request(&device_b_key);
+        let req_after = manager.build_sync_request(&did_b);
         assert_eq!(req_after.last_known_seq, 5, "cursor must advance after process_sync_response");
     }
 

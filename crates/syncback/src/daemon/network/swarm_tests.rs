@@ -11,7 +11,7 @@ use libp2p::request_response::Codec;
 use libp2p::StreamProtocol;
 use syncback_core::cluster::issue_device_certificate;
 use syncback_core::messages::{
-    AckMsg, Message, PosChallengeMsg, PosNackMsg, SymbolTransferMsg,
+    Message, PosChallengeMsg, PosNackMsg, SymbolTransferMsg,
 };
 use syncback_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp};
 use tokio::time::timeout;
@@ -292,7 +292,7 @@ async fn cert_timeout_does_not_panic() {
     let device_id_b = DeviceId(config_b.device_signing_key.verifying_key().to_bytes());
 
     let (handle_a, mut events_a) = SwarmHandle::start(config_a).await.expect("swarm A start");
-    let (handle_b, mut events_b) = SwarmHandle::start(config_b).await.expect("swarm B start");
+    let (handle_b, events_b) = SwarmHandle::start(config_b).await.expect("swarm B start");
 
     let addr_a = get_listen_addr(&handle_a).await;
 
@@ -370,7 +370,7 @@ async fn cert_mismatch_rejected() {
     let config_a = make_swarm_config(80);
 
     let (handle_a, mut events_a) = SwarmHandle::start(config_a).await.expect("swarm A start");
-    let (handle_b, mut events_b) = SwarmHandle::start(config_b).await.expect("swarm B start");
+    let (handle_b, events_b) = SwarmHandle::start(config_b).await.expect("swarm B start");
 
     let addr_a = get_listen_addr(&handle_a).await;
     handle_b
@@ -496,6 +496,7 @@ async fn swarm_handle_listen_addrs_nonempty() {
 // ─── send_to_master tests ─────────────────────────────────────────────────────
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn send_to_master_succeeds_when_device_authenticated() {
     // A sends a message to B's master identity. B responds with Ack.
     let config_a = make_swarm_config(100);
@@ -549,6 +550,7 @@ async fn send_to_master_succeeds_when_device_authenticated() {
 }
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn send_to_master_fails_when_no_device_for_master() {
     // A sends a message to an unknown master identity. No peer authenticated
     // for that master → MasterNotAuthenticated.

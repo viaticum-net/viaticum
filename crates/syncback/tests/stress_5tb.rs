@@ -38,7 +38,7 @@ use syncback_core::db::Db;
 use syncback_core::placement::{compute_allocation, HolderCandidate};
 use syncback_core::reliability::{block_reliability, BlockReliabilityInput, HolderReliabilityInput};
 use syncback_core::types::{
-    DeviceId, ErasureParams, FileId, FileRecord, FileVersion, IdentityPub, LocalState,
+    DeviceId, ErasureParams, FileId, FileRecord, FileVersion, LocalState,
     PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType,
     SymbolPlacement, Timestamp,
 };

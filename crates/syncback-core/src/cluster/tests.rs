@@ -350,7 +350,7 @@ mod cluster_state_tests {
     #[test]
     fn sync_cursor_returns_zero_when_not_set() {
         let state = make_cluster_state();
-        let peer = IdentityPub([0x42u8; 32]);
+        let peer = DeviceId([0x42u8; 32]);
         assert_eq!(state.sync_cursor(&peer), 0);
     }
 
@@ -358,7 +358,7 @@ mod cluster_state_tests {
     #[test]
     fn update_sync_cursor_persists_value() {
         let mut state = make_cluster_state();
-        let peer = IdentityPub([0x55u8; 32]);
+        let peer = DeviceId([0x55u8; 32]);
         state.update_sync_cursor(peer, 42).unwrap();
         assert_eq!(state.sync_cursor(&peer), 42);
     }
@@ -371,7 +371,7 @@ mod cluster_state_tests {
         let cert = issue_device_certificate(&master_key, device_id, NOW);
         let mut state = ClusterState::init(db.clone(), master_pub, cert, NOW, NOW).unwrap();
 
-        let peer = IdentityPub([0xAAu8; 32]);
+        let peer = DeviceId([0xAAu8; 32]);
         state.update_sync_cursor(peer, 99).unwrap();
         drop(state);
 
@@ -383,7 +383,7 @@ mod cluster_state_tests {
     #[test]
     fn update_sync_cursor_overwrites_previous_value() {
         let mut state = make_cluster_state();
-        let peer = IdentityPub([0x77u8; 32]);
+        let peer = DeviceId([0x77u8; 32]);
         state.update_sync_cursor(peer, 10).unwrap();
         state.update_sync_cursor(peer, 50).unwrap();
         assert_eq!(state.sync_cursor(&peer), 50);
@@ -393,8 +393,8 @@ mod cluster_state_tests {
     #[test]
     fn sync_cursor_independent_per_peer() {
         let mut state = make_cluster_state();
-        let peer_a = IdentityPub([0x11u8; 32]);
-        let peer_b = IdentityPub([0x22u8; 32]);
+        let peer_a = DeviceId([0x11u8; 32]);
+        let peer_b = DeviceId([0x22u8; 32]);
         state.update_sync_cursor(peer_a, 100).unwrap();
         state.update_sync_cursor(peer_b, 200).unwrap();
         assert_eq!(state.sync_cursor(&peer_a), 100);
