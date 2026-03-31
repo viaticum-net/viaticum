@@ -14,12 +14,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use syncback_core::constants::{POS_TIMEOUT_SECS, KI, KP, S_CLAMP_MAX, S_CLAMP_MIN};
+use syncback_core::constants::{POS_TIMEOUT_SECS, S_CLAMP_MAX, S_CLAMP_MIN};
+use syncback_core::trust::{compute_combined, compute_effective_trust};
 use syncback_core::db::Db;
 use syncback_core::deletion::{DeletionAction, DeletionEngine};
 use syncback_core::messages::PosChallengeMsg;
 use syncback_core::pos::{apply_pos_outcome, due_challenges, outcome_from_verify, select_challenge_esi, VerifyOutcome};
-use syncback_core::types::{IdentityPub, PlacementStatus, SourceBlockId, SourceBlockStatus, Timestamp};
+use syncback_core::types::{DeviceId, IdentityPub, PlacementStatus, SourceBlockId, SourceBlockStatus, Timestamp};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -36,7 +37,7 @@ mod tests;
 #[derive(Clone, Debug)]
 pub struct PendingChallenge {
     pub source_block_id: SourceBlockId,
-    pub holder_id: IdentityPub,
+    pub holder_id: DeviceId,
     /// The ESI the holder was asked to prove.
     pub esi: u32,
     /// Wall-clock time when the challenge was issued (for timeout detection).
@@ -49,7 +50,7 @@ pub struct PendingChallenge {
 /// One pending challenge per (block, holder) pair at a time.
 ///
 /// Shared between Scheduler (writes) and Processor (reads when verifying PosResponse).
-pub type PendingChallenges = Arc<Mutex<HashMap<(SourceBlockId, IdentityPub), PendingChallenge>>>;
+pub type PendingChallenges = Arc<Mutex<HashMap<(SourceBlockId, DeviceId), PendingChallenge>>>;
 
 // ─── SchedulerConfig ──────────────────────────────────────────────────────────
 
@@ -210,15 +211,26 @@ impl Scheduler {
             .map(|p| (p.source_block_id, p.holder_id, p.last_verified))
             .collect();
 
-        // Derive trust score from DB peer records.
-        let trust_fn = |holder: &IdentityPub| -> f64 {
-            match self.db.get_peer(holder) {
-                Ok(Some(peer)) => {
-                    let s = peer.trust_s.clamp(S_CLAMP_MIN, S_CLAMP_MAX);
-                    (KP * peer.trust_p + KI * peer.trust_i) * s
-                }
-                _ => 0.5, // unknown peer: medium trust
+        // Derive trust score from DB peer records (keyed by DeviceId).
+        let trust_fn = |holder: &DeviceId| -> f64 {
+            let peer = match self.db.get_peer(holder) {
+                Ok(Some(p)) => p,
+                _ => return 0.5, // unknown peer: medium trust
+            };
+            let s = peer.trust_s.clamp(S_CLAMP_MIN, S_CLAMP_MAX);
+            let master_identity = peer.master_identity;
+
+            // Look up master_trust and device_trust for two-level trust formula.
+            let master_trust = self.db.get_master_trust(&master_identity).ok().flatten();
+            let device_trust = self.db.get_device_trust(holder).ok().flatten();
+
+            if device_trust.is_none() && master_trust.is_none() {
+                // No two-level data yet: fall back to legacy formula.
+                return compute_combined(peer.trust_p, peer.trust_i, 1.0) * s;
             }
+
+            let effective = compute_effective_trust(device_trust.as_ref(), master_trust.as_ref());
+            effective * s
         };
 
         let due = due_challenges(&challengeable, &last_verified, now, trust_fn, self.config.time_scale);
@@ -229,7 +241,7 @@ impl Scheduler {
         }
 
         // Snapshot pending keys once to avoid repeatedly locking inside the loop.
-        let already_pending: Vec<(SourceBlockId, IdentityPub)> = {
+        let already_pending: Vec<(SourceBlockId, DeviceId)> = {
             let guard = self.pending.lock().await;
             guard.keys().copied().collect()
         };
@@ -272,6 +284,13 @@ impl Scheduler {
                 }
             };
 
+            // Resolve master identity for relay board addressing (board uses IdentityPub).
+            let holder_master = self.db.get_master_for_device(&entry.holder_id)
+                .ok()
+                .flatten()
+                .map(|m| IdentityPub(m.0))
+                .unwrap_or_else(|| IdentityPub(entry.holder_id.0));
+
             let challenge_id = random_challenge_id();
             let challenge_msg = PosChallengeMsg {
                 v: 1,
@@ -279,15 +298,16 @@ impl Scheduler {
                 source_block_id: entry.source_block_id,
                 esi,
                 timestamp: now,
+                device_id: Some(entry.holder_id),
             };
 
-            // Post challenge to relay board (directed to holder).
+            // Post challenge to relay board (directed to holder's master identity).
             // Board always accepts locally — no unreachable fallback needed.
             match syncback_core::messages::to_cbor(&challenge_msg) {
                 Ok(payload) => {
                     let _ = self.relay_post_tx.send(crate::daemon::relay::RelayPost {
                         msg_type: "pos_challenge".to_string(),
-                        target: Some(entry.holder_id),
+                        target: Some(holder_master),
                         payload,
                         msg_id: challenge_id,
                     }).await;
@@ -449,12 +469,17 @@ impl Scheduler {
                     let delete_msg = syncback_core::messages::build_delete_msg(
                         source_block_id, now, &self.signing_key,
                     );
+                    // Relay board uses master IdentityPub as target.
+                    let holder_master = self.db.get_master_for_device(&holder_id)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| IdentityPub(holder_id.0));
                     if let Ok(payload) = syncback_core::messages::to_cbor(&delete_msg) {
                         let mut msg_id = [0u8; 16];
                         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut msg_id);
                         let _ = self.relay_post_tx.send(RelayPost {
                             msg_type: "delete".to_string(),
-                            target: Some(holder_id),
+                            target: Some(holder_master),
                             payload,
                             msg_id,
                         }).await;

@@ -5,7 +5,8 @@ use crate::constants::{
 use crate::erasure::{ErasureEncoder, ErasureError};
 use crate::trust::PosOutcome;
 use crate::types::{
-    ErasureParams, IdentityPub, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
+    DeviceId, ErasureParams, PlacementStatus, SourceBlockId, SymbolPlacement,
+    Timestamp,
 };
 
 /// A single PoS challenge issued by the owner to one holder.
@@ -54,7 +55,7 @@ pub enum VerifyOutcome {
 /// One holder's challenge schedule entry.
 #[derive(Debug, Clone)]
 pub struct ChallengeScheduleEntry {
-    pub holder_id: IdentityPub,
+    pub holder_id: DeviceId,
     pub source_block_id: SourceBlockId,
     /// How many challenges to issue this week for this holder.
     pub challenges_due: u32,
@@ -142,7 +143,7 @@ pub fn verify_response(
     source_block: &[u8],
     params: &ErasureParams,
     block_id: &SourceBlockId,
-    holder_id: &IdentityPub,
+    holder_id: &DeviceId,
     encoder: &dyn ErasureEncoder,
 ) -> Result<VerifyOutcome, PosError> {
     let expected_size = params.t as usize;
@@ -202,13 +203,13 @@ pub fn challenges_per_week(symbol_count: u32, trust_score: f64) -> u32 {
 /// time_scale: acceleration factor (1 = real time). Divides the challenge interval.
 pub fn due_challenges<F>(
     placements: &[SymbolPlacement],
-    last_verified: &[(SourceBlockId, IdentityPub, Option<Timestamp>)],
+    last_verified: &[(SourceBlockId, DeviceId, Option<Timestamp>)],
     now: Timestamp,
     trust_fn: F,
     time_scale: u64,
 ) -> Vec<ChallengeScheduleEntry>
 where
-    F: Fn(&IdentityPub) -> f64,
+    F: Fn(&DeviceId) -> f64,
 {
     let scale = time_scale.max(1);
     placements

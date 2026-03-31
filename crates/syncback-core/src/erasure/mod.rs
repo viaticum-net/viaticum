@@ -4,7 +4,7 @@ use hkdf::Hkdf;
 use raptorq::{EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockDecoder, SourceBlockEncoder};
 use sha2::Sha256;
 
-use crate::types::{ErasureParams, IdentityPub, SourceBlockId};
+use crate::types::{DeviceId, ErasureParams, SourceBlockId};
 
 /// One encoding symbol: ESI (which symbol) + T bytes of data.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -55,7 +55,7 @@ pub trait ErasureEncoder: Send + Sync {
         start_esi: u32,
         count: u32,
         block_id: &SourceBlockId,
-        holder_id: &IdentityPub,
+        holder_id: &DeviceId,
     ) -> Result<Vec<Symbol>, ErasureError>;
 
     /// Decode source block from symbols (after unbinding).
@@ -79,7 +79,7 @@ pub trait ErasureEncoder: Send + Sync {
         params: &ErasureParams,
         esi: u32,
         block_id: &SourceBlockId,
-        holder_id: &IdentityPub,
+        holder_id: &DeviceId,
     ) -> Result<Symbol, ErasureError>;
 
     /// Unbind a received bound symbol: XOR ChaCha20 keystream back off.
@@ -88,7 +88,7 @@ pub trait ErasureEncoder: Send + Sync {
         &self,
         symbol: Symbol,
         block_id: &SourceBlockId,
-        holder_id: &IdentityPub,
+        holder_id: &DeviceId,
     ) -> Symbol;
 }
 
@@ -140,7 +140,7 @@ impl ErasureEncoder for RaptorQEncoder {
         start_esi: u32,
         count: u32,
         block_id: &SourceBlockId,
-        holder_id: &IdentityPub,
+        holder_id: &DeviceId,
     ) -> Result<Vec<Symbol>, ErasureError> {
         if source_block.is_empty() {
             return Err(ErasureError::EmptyBlock);
@@ -221,7 +221,7 @@ impl ErasureEncoder for RaptorQEncoder {
         params: &ErasureParams,
         esi: u32,
         block_id: &SourceBlockId,
-        holder_id: &IdentityPub,
+        holder_id: &DeviceId,
     ) -> Result<Symbol, ErasureError> {
         let mut symbols = self.encode(source_block, params, esi, 1, block_id, holder_id)?;
         Ok(symbols.remove(0))
@@ -231,7 +231,7 @@ impl ErasureEncoder for RaptorQEncoder {
         &self,
         mut symbol: Symbol,
         block_id: &SourceBlockId,
-        holder_id: &IdentityPub,
+        holder_id: &DeviceId,
     ) -> Symbol {
         let t = symbol.data.len();
         let keystream = binding_keystream(block_id, holder_id, symbol.esi, t);
@@ -244,7 +244,7 @@ impl ErasureEncoder for RaptorQEncoder {
 ///
 /// Returns the first 32 bytes of the HKDF output used for per-holder binding.
 /// This value is stored in `SymbolPlacement.binding_seed` for the RestoreCoordinator.
-pub fn binding_seed(block_id: &SourceBlockId, holder_id: &IdentityPub) -> [u8; 32] {
+pub fn binding_seed(block_id: &SourceBlockId, holder_id: &DeviceId) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(Some(block_id.0.as_ref()), holder_id.0.as_ref());
     let mut okm = [0u8; 44];
     hk.expand(b"syncback-binding", &mut okm)
@@ -261,7 +261,7 @@ pub fn binding_seed(block_id: &SourceBlockId, holder_id: &IdentityPub) -> [u8; 3
 /// → ChaCha20 stream of `t` zero-bytes = keystream
 fn binding_keystream(
     block_id: &SourceBlockId,
-    holder_id: &IdentityPub,
+    holder_id: &DeviceId,
     esi: u32,
     t: usize,
 ) -> Vec<u8> {

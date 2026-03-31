@@ -1,15 +1,15 @@
 use super::{compute_allocation, holder_weight, HolderCandidate, PlacementError};
-use crate::types::{ErasureParams, IdentityPub};
+use crate::types::{DeviceId, ErasureParams};
 
-fn identity(byte: u8) -> IdentityPub {
+fn device_id(byte: u8) -> DeviceId {
     let mut key = [0u8; 32];
     key[0] = byte;
-    IdentityPub(key)
+    DeviceId(key)
 }
 
 fn candidate(byte: u8, trust: f64) -> HolderCandidate {
     HolderCandidate {
-        identity: identity(byte),
+        device_id: device_id(byte),
         trust,
     }
 }
@@ -118,7 +118,7 @@ fn compute_allocation_many_candidates_truncated_by_max_holders() {
     // Verify highest-trust candidates were kept (not the low ones)
     let lowest_trust_in_result = allocs
         .iter()
-        .map(|a| candidates.iter().find(|c| c.identity == a.identity).unwrap().trust)
+        .map(|a| candidates.iter().find(|c| c.device_id == a.device_id).unwrap().trust)
         .fold(f64::INFINITY, f64::min);
     // The bottom 20 (trust 0.3..0.54) should be dropped; lowest kept >= ~0.54
     assert!(lowest_trust_in_result > 0.5, "lowest trust = {lowest_trust_in_result}");
@@ -184,8 +184,8 @@ fn compute_allocation_high_trust_holder_gets_more_symbols() {
         candidate(3, 0.5),
     ];
     let allocs = compute_allocation(&candidates, &p, 0).unwrap();
-    let alloc_95 = allocs.iter().find(|a| a.identity == identity(1)).unwrap();
-    let alloc_30 = allocs.iter().find(|a| a.identity == identity(2)).unwrap();
+    let alloc_95 = allocs.iter().find(|a| a.device_id == device_id(1)).unwrap();
+    let alloc_30 = allocs.iter().find(|a| a.device_id == device_id(2)).unwrap();
     assert!(alloc_95.symbol_count > alloc_30.symbol_count);
 }
 
@@ -210,7 +210,7 @@ fn compute_allocation_cap_enforced_with_very_high_trust() {
         candidate(3, 0.01),
     ];
     let allocs = compute_allocation(&candidates, &p, 0).unwrap();
-    let alloc_99 = allocs.iter().find(|a| a.identity == identity(1)).unwrap();
+    let alloc_99 = allocs.iter().find(|a| a.device_id == device_id(1)).unwrap();
     assert!(alloc_99.symbol_count <= max);
     let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
     assert_eq!(total, p.n);
@@ -277,7 +277,7 @@ fn compute_allocation_fifteen_holders_realistic_params() {
 fn esi_range_helper_returns_start_and_count() {
     use super::HolderAllocation;
     let alloc = HolderAllocation {
-        identity: identity(1),
+        device_id: device_id(1),
         symbol_count: 100,
         start_esi: 500,
     };
@@ -391,16 +391,16 @@ fn redistribution_excess_is_proportional() {
     assert_eq!(total, p.n, "total must equal N");
 
     // H1 must be capped at max_per_holder
-    let alloc_h1 = allocs.iter().find(|a| a.identity == identity(1)).unwrap();
+    let alloc_h1 = allocs.iter().find(|a| a.device_id == device_id(1)).unwrap();
     assert_eq!(
         alloc_h1.symbol_count, max_per,
         "high-trust holder must be capped at max_per_holder={max_per}"
     );
 
     // H2 must receive more than H3, H3 more than H4 (proportional by weight)
-    let alloc_h2 = allocs.iter().find(|a| a.identity == identity(2)).unwrap();
-    let alloc_h3 = allocs.iter().find(|a| a.identity == identity(3)).unwrap();
-    let alloc_h4 = allocs.iter().find(|a| a.identity == identity(4)).unwrap();
+    let alloc_h2 = allocs.iter().find(|a| a.device_id == device_id(2)).unwrap();
+    let alloc_h3 = allocs.iter().find(|a| a.device_id == device_id(3)).unwrap();
+    let alloc_h4 = allocs.iter().find(|a| a.device_id == device_id(4)).unwrap();
 
     assert!(
         alloc_h2.symbol_count >= alloc_h3.symbol_count,
@@ -452,7 +452,7 @@ fn compute_allocation_five_holders_all_get_symbols() {
         assert!(
             alloc.symbol_count >= 1,
             "every holder must get >= 1 symbol; holder {:?} got 0",
-            alloc.identity
+            alloc.device_id
         );
     }
 
@@ -460,7 +460,7 @@ fn compute_allocation_five_holders_all_get_symbols() {
     let count = |byte: u8| {
         allocs
             .iter()
-            .find(|a| a.identity == identity(byte))
+            .find(|a| a.device_id == device_id(byte))
             .unwrap()
             .symbol_count
     };

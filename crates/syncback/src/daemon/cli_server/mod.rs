@@ -217,13 +217,13 @@ pub(crate) fn dispatch_status(state: &DaemonState) -> CliResponse {
         .iter()
         .map(|p| {
             let combined = compute_combined(p.trust_p, p.trust_i, p.trust_s);
-            let identity_hex = bytes_to_hex_8(&p.identity.0);
+            let identity_hex = bytes_to_hex_8(&p.device_id.0);
             let last_seen = timestamp_to_iso(p.last_seen);
 
             // Recent PoS stats for this peer.
             let (ch, pa) = state
                 .db
-                .list_pos_weekly_for_peer(&p.identity)
+                .list_pos_weekly_for_peer(&p.device_id)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|(week, _)| *week >= recent_window_start)
@@ -307,7 +307,9 @@ pub(crate) fn dispatch_status(state: &DaemonState) -> CliResponse {
 
     let node_identity = hex_encode(&state.identity_pub.0);
 
-    let node_addr = crate::daemon::network::addr::resolve_local_addr(&state.network);
+    let node_addr = state.swarm_handle.as_ref()
+        .map(|s| s.peer_id.to_string())
+        .unwrap_or_else(|| hex_encode(&state.identity_pub.0));
 
     CliResponse::Status(StatusData {
         node_identity,
@@ -554,27 +556,23 @@ fn dispatch_device_add(state: &DaemonState, label: String) -> CliResponse {
         None => return CliResponse::Error("cluster state not initialized".to_string()),
     };
 
-    // Derive a deterministic device_id from identity + label.
-    let device_id_bytes = {
+    // Derive a deterministic device_seed from identity + label (blake3 → 32 bytes).
+    let device_seed: [u8; 32] = {
         let mut h = blake3::Hasher::new();
         h.update(&state.identity_pub.0);
         h.update(label.as_bytes());
-        let hash = h.finalize();
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&hash.as_bytes()[..16]);
-        id
+        h.finalize().into()
     };
-    let device_id = DeviceId(device_id_bytes);
 
-    // Derive the new device's key pair from the shared seed.
-    let device_key = match derive_device_key(&state.seed, &device_id) {
+    // Derive the new device's signing key; device_id.0 = verifying_key().to_bytes()
+    let device_key = match derive_device_key(&state.seed, &device_seed) {
         Ok(k) => k,
         Err(e) => return CliResponse::Error(format!("key derivation failed: {e}")),
     };
-    let device_pub_key = device_key.verifying_key().to_bytes();
+    let device_id = DeviceId(device_key.verifying_key().to_bytes());
 
     let now = Timestamp::now();
-    let cert = issue_device_certificate(&state.master_key, device_id, device_pub_key, now);
+    let cert = issue_device_certificate(&state.master_key, device_id, now);
 
     // Register in ClusterState.
     let mut cs = cluster_state.lock().expect("cluster_state lock");
@@ -585,13 +583,13 @@ fn dispatch_device_add(state: &DaemonState, label: String) -> CliResponse {
 
     tracing::info!(
         label = %label,
-        device_id = %hex_encode(&device_id_bytes),
+        device_id = %hex_encode(&device_id.0),
         "device registered"
     );
 
     let added_at = timestamp_to_iso_date(now);
     CliResponse::DeviceAdded(DeviceEntry {
-        device_id_hex: hex_encode(&device_id_bytes),
+        device_id_hex: hex_encode(&device_id.0),
         label,
         is_current: false,
         added_at,
@@ -614,14 +612,14 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
         None => return CliResponse::Error("cluster state not initialized".to_string()),
     };
 
-    // Parse hex device_id.
-    if device_id_hex.len() != 32 {
+    // Parse hex device_id (32 bytes = 64 hex chars).
+    if device_id_hex.len() != 64 {
         return CliResponse::Error(format!(
-            "device_id must be 32 hex chars (16 bytes), got {}",
+            "device_id must be 64 hex chars (32 bytes), got {}",
             device_id_hex.len()
         ));
     }
-    let mut device_id_bytes = [0u8; 16];
+    let mut device_id_bytes = [0u8; 32];
     for (i, chunk) in device_id_hex.as_bytes().chunks(2).enumerate() {
         let hi = match chunk[0] {
             b'0'..=b'9' => chunk[0] - b'0',
@@ -705,83 +703,46 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
 // ── Connect ───────────────────────────────────────────────────────────────────
 
 async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
-    use crate::daemon::network::addr::{parse_node_addr, to_endpoint_addr};
-    use syncback_core::types::{PeerRecord, Timestamp};
-
-    let parsed = match parse_node_addr(&addr) {
-        Ok(p) => p,
+    // addr is a libp2p Multiaddr string, e.g.:
+    //   /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...
+    let multiaddr: libp2p::Multiaddr = match addr.parse() {
+        Ok(ma) => ma,
         Err(e) => {
-            return CliResponse::Error(format!("invalid peer address '{addr}': {e}"));
+            return CliResponse::Error(format!("invalid multiaddr '{addr}': {e}"));
         }
     };
 
-    let node_id = parsed.node_id;
+    let swarm = match state.swarm_handle.as_ref() {
+        Some(s) => s,
+        None => return CliResponse::Error("swarm not available".to_string()),
+    };
 
-    let endpoint_addr = match to_endpoint_addr(&parsed) {
-        Ok(ea) => ea,
-        Err(e) => {
-            return CliResponse::Error(format!("cannot build endpoint addr: {e}"));
+    // Extract PeerId from the /p2p/... component of the multiaddr.
+    use libp2p::multiaddr::Protocol;
+    let peer_id = multiaddr.iter().find_map(|p| {
+        if let Protocol::P2p(peer_id) = p {
+            Some(peer_id)
+        } else {
+            None
+        }
+    });
+
+    let peer_id = match peer_id {
+        Some(id) => id,
+        None => {
+            return CliResponse::Error(
+                format!("multiaddr '{addr}' has no /p2p component — cannot identify peer")
+            );
         }
     };
 
-    let conn = match state.network.connect(endpoint_addr.clone(), None).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(addr = %addr, error = %e, "connect failed");
-            return CliResponse::Error(format!("connect failed: {e}"));
-        }
-    };
-
-    let peer_identity = conn.master_identity();
-    let now = Timestamp::now();
-
-    let existing = state.db.get_peer(&peer_identity).unwrap_or(None);
-    let record = if let Some(mut existing) = existing {
-        if !existing.addrs.contains(&addr) {
-            existing.addrs.push(addr.clone());
-        }
-        existing.last_seen = now;
-        existing.node_id = Some(node_id);
-        existing
-    } else {
-        PeerRecord {
-            identity: peer_identity,
-            node_id: Some(node_id),
-            trust_p: 0.0,
-            trust_i: 0.0,
-            trust_s: 1.0,
-            bytes_we_store_for_peer: 0,
-            bytes_peer_stores_for_us: 0,
-            first_seen: now,
-            last_seen: now,
-            device_id: Some(state.device_id),
-            revoked_device_pub_keys: vec![],
-            addrs: vec![addr.clone()],
-            x25519_pub: None,
-        }
-    };
-
-    if let Err(e) = state.db.upsert_peer(&record) {
-        tracing::error!(peer = %peer_identity, error = %e, "failed to upsert peer in db");
-        return CliResponse::Error(format!("connected but db write failed: {e}"));
+    if let Err(e) = swarm.dial(peer_id, multiaddr.clone()).await {
+        tracing::warn!(addr = %addr, error = %e, "connect failed");
+        return CliResponse::Error(format!("connect failed: {e}"));
     }
 
-    state.network.add_peer(peer_identity, endpoint_addr).await;
-
-    // Send connection to Processor for read-loop spawning + pool storage.
-    // The Processor will also send PeerAnnounce on the connection.
-    if state.incoming_tx.send(conn).await.is_err() {
-        tracing::error!(peer = %peer_identity, "failed to send connection to Processor (channel closed)");
-    }
-
-    tracing::info!(
-        peer = %peer_identity,
-        addr = %addr,
-        "peer connected and registered"
-    );
-
-    let peer_id_hex = hex_encode(&peer_identity.0);
-    CliResponse::Connected { peer_id: peer_id_hex }
+    tracing::info!(addr = %addr, "dial initiated — peer will be registered on connection");
+    CliResponse::Connected { peer_id: peer_id.to_string() }
 }
 
 // ============================================================

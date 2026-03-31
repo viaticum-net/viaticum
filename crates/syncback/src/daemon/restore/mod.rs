@@ -21,8 +21,6 @@ use syncback_core::types::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::daemon::network::NetworkHandle;
-
 pub mod pipeline;
 
 #[cfg(test)]
@@ -66,15 +64,15 @@ pub enum RestoreError {
 
     #[error("restore denied by holder {holder}: trust {current_trust:.2}, budget {restore_budget_gb:.1} GB, requested {restore_gb:.1} GB")]
     EscrowDenied {
-        holder: IdentityPub,
+        holder: DeviceId,
         current_trust: f64,
         needed_trust: f64,
         restore_budget_gb: f64,
         restore_gb: f64,
     },
 
-    #[error("network error: {0}")]
-    Network(#[from] crate::daemon::network::NetworkError),
+    #[error("swarm error: {0}")]
+    Swarm(String),
 
     #[error("db error: {0}")]
     Db(#[from] syncback_core::db::DbError),
@@ -135,6 +133,10 @@ pub struct RestoreConfig {
     /// Directory where bound symbol files are stored (must match BackupConfig.symbols_dir).
     /// Used for Phase 2 local restore.
     pub symbols_dir: PathBuf,
+    /// libp2p swarm handle for remote restore.
+    /// When Some: fetch_from_holders uses send_to_device (request-response).
+    /// When None: only local symbol files are used.
+    pub swarm: Option<std::sync::Arc<crate::daemon::network::swarm::SwarmHandle>>,
 }
 
 impl Default for RestoreConfig {
@@ -143,8 +145,9 @@ impl Default for RestoreConfig {
             epoch_key: [0u8; 32],
             parallel_holders: 5,
             identity: IdentityPub([0u8; 32]),
-            device_id: DeviceId([0u8; 16]),
+            device_id: DeviceId([0u8; 32]),
             symbols_dir: PathBuf::from("symbols"),
+            swarm: None,
         }
     }
 }
@@ -156,8 +159,8 @@ pub struct RestoreCoordinator {
     db: Db,
     config: RestoreConfig,
     encoder: Arc<dyn ErasureEncoder>,
-    /// Network handle for remote restore fallback.
-    network: Arc<NetworkHandle>,
+    /// libp2p swarm handle for remote restore.
+    swarm: Option<Arc<crate::daemon::network::swarm::SwarmHandle>>,
 }
 
 impl RestoreCoordinator {
@@ -166,15 +169,16 @@ impl RestoreCoordinator {
         db: Db,
         config: RestoreConfig,
         encoder: Arc<dyn ErasureEncoder>,
-        network: Arc<NetworkHandle>,
     ) -> Self {
+        let swarm = config.swarm.clone();
         RestoreCoordinator {
             db,
             config,
             encoder,
-            network,
+            swarm,
         }
     }
+
 
     /// Execute a restore request.
     ///
@@ -525,55 +529,39 @@ impl RestoreCoordinator {
         }
     }
 
-    /// Contact one holder, send a RestoreRequest, receive RestoreResponse.
-    ///
-    /// Uses a fresh direct connection (not the pool) because pooled connections
-    /// have read loops that would race for the recv Mutex and may consume
-    /// the RestoreResponse before we read it.
+    /// Contact one holder, send a RestoreRequest, receive RestoreResponse via libp2p swarm.
     ///
     /// Returns the raw bound symbols (not yet unbound).
     async fn fetch_symbols_from_holder(
         &self,
-        holder_id: &IdentityPub,
+        holder_device: &DeviceId,
         request: RestoreRequestMsg,
     ) -> Result<Vec<Symbol>, RestoreError> {
-        // Look up peer address, then connect directly (bypass pool).
-        let peer_addr = self
-            .network
-            .get_peer_addr(holder_id)
-            .await
-            .ok_or_else(|| {
-                crate::daemon::network::NetworkError::PeerNotFound(*holder_id)
-            })?;
-
-        let conn = self
-            .network
-            .connect(peer_addr, Some(*holder_id))
-            .await?;
-
-        conn.send_message(&Message::RestoreRequest(request))
-            .await?;
-
-        // Read response — may need to skip PeerAnnounce from the peer's Processor.
-        let resp_msg = loop {
-            let msg = conn.recv_message().await?;
-            match msg {
-                Message::PeerAnnounce(_) => continue, // skip, try next message
-                other => break other,
+        let swarm = match &self.swarm {
+            Some(s) => s,
+            None => {
+                return Err(RestoreError::Swarm(
+                    "no swarm configured for remote restore".to_string(),
+                ));
             }
         };
 
-        match resp_msg {
+        let response = swarm
+            .send_to_device(*holder_device, Message::RestoreRequest(request))
+            .await
+            .map_err(|e| RestoreError::Swarm(e.to_string()))?;
+
+        match response {
             Message::RestoreResponse(resp) => {
                 debug!(
-                    holder = %holder_id,
+                    holder = %holder_device,
                     symbols = resp.symbols.len(),
-                    "fetch: received RestoreResponse"
+                    "fetch: received RestoreResponse via swarm"
                 );
                 Ok(resp.symbols)
             }
             Message::RestoreDenied(denied) => Err(RestoreError::EscrowDenied {
-                holder: *holder_id,
+                holder: *holder_device,
                 current_trust: denied.current_trust,
                 needed_trust: denied.needed_trust,
                 restore_budget_gb: denied.restore_budget_gb,
@@ -581,14 +569,12 @@ impl RestoreCoordinator {
             }),
             other => {
                 warn!(
-                    holder = %holder_id,
+                    holder = %holder_device,
                     msg = ?std::mem::discriminant(&other),
-                    "fetch: unexpected message type, treating as error"
+                    "fetch: unexpected swarm response, treating as error"
                 );
-                Err(RestoreError::Network(
-                    crate::daemon::network::NetworkError::HandshakeFailed(
-                        "unexpected message type during restore".to_string(),
-                    ),
+                Err(RestoreError::Swarm(
+                    "unexpected message type during restore".to_string(),
                 ))
             }
         }

@@ -1,7 +1,7 @@
 use rand::Rng;
 
 use super::{ErasureEncoder, ErasureError, RaptorQEncoder, Symbol, binding_seed};
-use crate::types::{ErasureParams, IdentityPub, SourceBlockId};
+use crate::types::{DeviceId, ErasureParams, SourceBlockId};
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -11,10 +11,10 @@ fn block_id(byte: u8) -> SourceBlockId {
     SourceBlockId(id)
 }
 
-fn holder(byte: u8) -> IdentityPub {
+fn holder(byte: u8) -> DeviceId {
     let mut id = [0u8; 32];
     id[0] = byte;
-    IdentityPub(id)
+    DeviceId(id)
 }
 
 /// Repeating byte pattern for test data.

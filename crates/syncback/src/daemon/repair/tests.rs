@@ -6,7 +6,7 @@ use std::sync::Arc;
 use syncback_core::db::Db;
 use syncback_core::erasure::RaptorQEncoder;
 use syncback_core::types::{
-    hex_encode, FileId, IdentityPub, PlacementStatus, SourceBlockId, SourceBlockRecord,
+    hex_encode, DeviceId, FileId, IdentityPub, PlacementStatus, SourceBlockId, SourceBlockRecord,
     SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
 };
 use tempfile::TempDir;
@@ -19,8 +19,8 @@ fn block_id(byte: u8) -> SourceBlockId {
     SourceBlockId([byte; 32])
 }
 
-fn holder_id(byte: u8) -> IdentityPub {
-    IdentityPub([byte; 32])
+fn holder_id(byte: u8) -> DeviceId {
+    DeviceId([byte; 32])
 }
 
 fn now() -> Timestamp {
@@ -50,7 +50,7 @@ fn make_source_block_record(bid: SourceBlockId, k: u32, t: u16) -> SourceBlockRe
 
 fn make_placement(
     bid: SourceBlockId,
-    hid: IdentityPub,
+    hid: DeviceId,
     esi_ranges: Vec<(u32, u32)>,
     status: PlacementStatus,
 ) -> SymbolPlacement {

@@ -47,13 +47,13 @@ use tempfile::TempDir;
 
 const SMALL_BLOCK_SIZE: u64 = 65_535 * 2;
 const EPOCH_KEY: [u8; 32] = [0x77u8; 32];
-const DEVICE_A: DeviceId = DeviceId([0x01u8; 16]);
+const DEVICE_A: DeviceId = DeviceId([0x01u8; 32]);
 const NOW: Timestamp = Timestamp(1_700_000_000);
 
 fn test_holders() -> Vec<HolderCandidate> {
     (0..5)
         .map(|i| HolderCandidate {
-            identity: IdentityPub([(i + 1) as u8; 32]),
+            device_id: DeviceId([(i + 1) as u8; 32]),
             trust: 0.3 + (i as f64) * 0.1,
         })
         .collect()
@@ -67,12 +67,11 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         device_id: DEVICE_A,
         mock_holders: test_holders(),
         cluster_state: None,
-        network: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
         master_signing_key: None,
-        pending_deliveries: None,
+        swarm: None,
     }
 }
 
@@ -138,12 +137,11 @@ fn config_source_block_size_drives_backup() {
             device_id: DEVICE_A,
             mock_holders: test_holders(),
             cluster_state: None,
-            network: None,
             watch_configs: vec![],
             time_scale: 1,
             mock_offer_budget_gb: None,
             master_signing_key: None,
-            pending_deliveries: None,
+            swarm: None,
         },
         Arc::new(RaptorQEncoder::new()),
     );
@@ -208,8 +206,8 @@ fn deletion_cooldown_full_lifecycle() {
 
     let block_id = SourceBlockId([0xAA; 32]);
     let file_id = FileId(1);
-    let holder_1 = IdentityPub([0x11u8; 32]);
-    let holder_2 = IdentityPub([0x22u8; 32]);
+    let holder_1 = DeviceId([0x11u8; 32]);
+    let holder_2 = DeviceId([0x22u8; 32]);
 
     // Build a FileRecord with one device (DEVICE_A, Present)
     let file = FileRecord {
@@ -372,9 +370,9 @@ fn commitment_plus_reliability_flags_weak_holder() {
     let k_eff = 5u32;
     let now = Timestamp::now();
 
-    let h1 = IdentityPub([0x01u8; 32]);
-    let h2 = IdentityPub([0x02u8; 32]);
-    let h3 = IdentityPub([0x03u8; 32]);
+    let h1 = DeviceId([0x01u8; 32]);
+    let h2 = DeviceId([0x02u8; 32]);
+    let h3 = DeviceId([0x03u8; 32]);
 
     // H1 — strong: 100 challenges, 98 passes, 0 consecutive misses, no pressure, 52 weeks old
     let profile_h1 = HolderProfile {

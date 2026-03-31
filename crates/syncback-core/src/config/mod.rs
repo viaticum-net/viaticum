@@ -127,17 +127,16 @@ pub struct NetworkCfg {
     /// Default: 7.
     pub relay_ttl_days: u64,
 
-    /// Enable iroh NAT relay (DERP). When true, uses RelayMode::Default so
-    /// two nodes behind NAT can connect via the iroh relay network.
-    /// When false, uses RelayMode::Disabled (direct connections only — LAN or
-    /// port-forwarded setups).
+    /// Enable libp2p circuit relay for NAT traversal. When true, the swarm
+    /// uses relay servers to connect nodes behind NAT.
+    /// When false, only direct connections (LAN or port-forwarded setups).
     /// Default: true.
     pub enable_relay: bool,
 
-    /// Custom iroh relay URL. When set with enable_relay = true, uses
-    /// RelayMode::Custom pointing at this URL instead of the public iroh relays.
+    /// Custom relay server URL. When set with enable_relay = true, connects
+    /// to this relay server instead of bootstrap peers acting as relays.
     /// Format: "http://hostname:port" (dev mode) or "https://hostname" (production).
-    /// Default: None (use public iroh relay infrastructure).
+    /// Default: None (use bootstrap peers / Kademlia-discovered relays).
     #[serde(default)]
     pub relay_url: Option<String>,
 
@@ -146,6 +145,20 @@ pub struct NetworkCfg {
     /// Default: [] (empty — no bootstrap peers).
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,
+
+    /// Additional libp2p/Kademlia bootstrap nodes (Multiaddr strings).
+    /// These supplement the built-in IPFS bootstrap nodes.
+    /// Format: standard libp2p Multiaddr, e.g.
+    ///   "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
+    /// Default: [] (use only IPFS built-in bootstrap nodes).
+    #[serde(default)]
+    pub kademlia_bootstrap_peers: Vec<String>,
+
+    /// Disable IPFS built-in bootstrap nodes and use only kademlia_bootstrap_peers.
+    /// Useful for isolated test networks.
+    /// Default: false.
+    #[serde(default)]
+    pub kademlia_disable_ipfs_bootstrap: bool,
 }
 
 // ============================================================
@@ -186,6 +199,8 @@ impl Default for NetworkCfg {
             enable_relay: true,
             relay_url: None,
             bootstrap_peers: vec![],
+            kademlia_bootstrap_peers: vec![],
+            kademlia_disable_ipfs_bootstrap: false,
         }
     }
 }
@@ -389,6 +404,17 @@ impl AppConfig {
                 field: "cluster.sync_batch_size".to_string(),
                 reason: "must be >= 1".to_string(),
             });
+        }
+
+        // Validate kademlia_bootstrap_peers: each entry must start with '/'
+        // (basic Multiaddr syntax check; full parse happens in the daemon layer).
+        for (i, addr) in n.kademlia_bootstrap_peers.iter().enumerate() {
+            if addr.is_empty() || !addr.starts_with('/') {
+                return Err(ConfigError::Validation {
+                    field: format!("network.kademlia_bootstrap_peers[{i}]"),
+                    reason: format!("invalid multiaddr '{addr}': must start with '/'"),
+                });
+            }
         }
 
         if self.web_api.enabled && self.web_api.port == 0 {

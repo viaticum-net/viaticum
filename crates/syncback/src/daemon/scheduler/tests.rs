@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use syncback_core::db::Db;
 use syncback_core::types::{
-    FileId, IdentityPub, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
+    DeviceId, FileId, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
 };
 use tokio::sync::{mpsc, Mutex};
 
@@ -23,11 +23,11 @@ fn make_block_id(seed: u8) -> SourceBlockId {
     SourceBlockId([seed; 32])
 }
 
-fn make_identity(seed: u8) -> IdentityPub {
-    IdentityPub([seed; 32])
+fn make_identity(seed: u8) -> DeviceId {
+    DeviceId([seed; 32])
 }
 
-fn make_placement(block_id: SourceBlockId, holder_id: IdentityPub) -> SymbolPlacement {
+fn make_placement(block_id: SourceBlockId, holder_id: DeviceId) -> SymbolPlacement {
     SymbolPlacement {
         source_block_id: block_id,
         holder_id,
@@ -433,7 +433,6 @@ async fn time_scale_divides_intervals() {
 /// process_deletion_tick sends DeleteMsg via board and marks placement Deleting.
 #[tokio::test]
 async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
-    use syncback_core::constants::OWNER_DELETE_COOLDOWN_SECS;
     use syncback_core::types::{
         DeviceId, FileRecord, FileVersion, LocalState, SourceBlockRecord, SourceBlockStatus,
         SourceBlockType,
@@ -442,7 +441,7 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
     let db = Db::open_in_memory().unwrap();
     let block_id = make_block_id(0xD1);
     let holder_id = make_identity(0xD2);
-    let device_id = DeviceId([0x01; 16]);
+    let device_id = DeviceId([0x01; 32]);
 
     // File: all devices deleted, deleted_at = 0 (very old).
     let file = FileRecord {
@@ -482,8 +481,8 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
 
     // Peer record (needed for trust lookup in due_challenges, also for deletion signing).
     let peer = syncback_core::types::PeerRecord {
-        identity: holder_id,
-        node_id: None,
+        device_id: holder_id,
+        master_identity: syncback_core::types::IdentityPub(holder_id.0),
         trust_p: 0.5,
         trust_i: 0.0,
         trust_s: 1.0,
@@ -491,7 +490,6 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
         bytes_peer_stores_for_us: 0,
         first_seen: Timestamp(0),
         last_seen: Timestamp(0),
-        device_id: None,
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
@@ -517,7 +515,8 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
     // Should have posted a "delete" message via relay.
     let post = relay_post_rx.try_recv().expect("expected a delete RelayPost");
     assert_eq!(post.msg_type, "delete");
-    assert_eq!(post.target, Some(holder_id));
+    // process_deletion_tick falls back to IdentityPub(holder_id.0) when no master mapping.
+    assert_eq!(post.target, Some(syncback_core::types::IdentityPub(holder_id.0)));
 
     // Placement should be Deleting.
     let updated = db.get_placement(&block_id, &holder_id).unwrap().unwrap();

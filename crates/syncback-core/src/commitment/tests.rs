@@ -4,12 +4,12 @@ use super::{
     CommitmentTier, HolderProfile,
 };
 use crate::constants::SECS_PER_WEEK;
-use crate::types::{IdentityPub, Timestamp};
+use crate::types::{DeviceId, Timestamp};
 
-fn peer(byte: u8) -> IdentityPub {
+fn peer(byte: u8) -> DeviceId {
     let mut key = [0u8; 32];
     key[0] = byte;
-    IdentityPub(key)
+    DeviceId(key)
 }
 
 fn ts(secs: u64) -> Timestamp {

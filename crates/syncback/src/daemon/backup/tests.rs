@@ -22,7 +22,6 @@ use tempfile::TempDir;
 use super::{BackupConfig, BackupCoordinator, BackupEvent, DirtyEvent, DirtyKind};
 use crate::daemon::backup::pipeline::decrypt_and_decompress;
 use crate::daemon::backup::packing::parse_pack_index;
-use crate::daemon::processor::{make_empty_pending_deliveries, OfferOutcome};
 
 /// Small source block size for fast tests (128 KB).
 const SMALL_BLOCK_SIZE: u64 = 128 * 1024;
@@ -33,15 +32,14 @@ fn test_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         source_block_size: SMALL_BLOCK_SIZE,
         symbols_dir: symbols_dir.path().to_path_buf(),
         epoch_key: [42u8; 32],
-        device_id: DeviceId([1u8; 16]),
+        device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
         cluster_state: None,
-        network: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
         master_signing_key: None,
-        pending_deliveries: None,
+        swarm: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -50,7 +48,7 @@ fn test_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
 fn test_holders() -> Vec<syncback_core::placement::HolderCandidate> {
     (0..5)
         .map(|i| syncback_core::placement::HolderCandidate {
-            identity: syncback_core::types::IdentityPub([(i + 1) as u8; 32]),
+            device_id: syncback_core::types::DeviceId([(i + 1) as u8; 32]),
             trust: 0.3 + (i as f64) * 0.1, // 0.3, 0.4, 0.5, 0.6, 0.7
         })
         .collect()
@@ -68,7 +66,7 @@ fn added_event(path: &str) -> DirtyEvent {
     DirtyEvent {
         path: path.to_string(),
         kind: DirtyKind::Added,
-        device_id: DeviceId([1u8; 16]),
+        device_id: DeviceId([1u8; 32]),
     }
 }
 
@@ -76,7 +74,7 @@ fn modified_event(path: &str) -> DirtyEvent {
     DirtyEvent {
         path: path.to_string(),
         kind: DirtyKind::Modified,
-        device_id: DeviceId([1u8; 16]),
+        device_id: DeviceId([1u8; 32]),
     }
 }
 
@@ -84,7 +82,7 @@ fn deleted_event(path: &str) -> DirtyEvent {
     DirtyEvent {
         path: path.to_string(),
         kind: DirtyKind::Deleted,
-        device_id: DeviceId([1u8; 16]),
+        device_id: DeviceId([1u8; 32]),
     }
 }
 
@@ -129,7 +127,7 @@ fn process_event_deleted_marks_local_state() {
     coord.process_event(deleted_event(&path)).unwrap();
 
     let record = db.get_file(&path).unwrap().expect("record should exist");
-    let device_id = DeviceId([1u8; 16]);
+    let device_id = DeviceId([1u8; 32]);
     let state = record
         .devices
         .iter()
@@ -334,15 +332,14 @@ fn pipeline_roundtrip_can_decode() {
         source_block_size: SMALL_BLOCK_SIZE,
         symbols_dir: symbols_dir.path().to_path_buf(),
         epoch_key,
-        device_id: DeviceId([1u8; 16]),
+        device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
         cluster_state: None,
-        network: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
         master_signing_key: None,
-        pending_deliveries: None,
+        swarm: None,
     };
     let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let mut coord = BackupCoordinator::new(db.clone(), config, encoder.clone());
@@ -540,7 +537,7 @@ fn dedup_skips_file_already_backed_up() {
         file_id: FileId(1),
         path: "/other/device/file.txt".to_string(),
         importance: 0.5,
-        devices: vec![(DeviceId([9u8; 16]), LocalState::Present)],
+        devices: vec![(DeviceId([9u8; 32]), LocalState::Present)],
         versions: vec![FileVersion {
             content_hash,
             source_block_id: SourceBlockId([1u8; 32]),
@@ -584,7 +581,7 @@ fn dedup_does_not_skip_file_not_yet_backed_up() {
         file_id: FileId(1),
         path: "/other/path/pending.txt".to_string(),
         importance: 0.5,
-        devices: vec![(DeviceId([9u8; 16]), LocalState::Present)],
+        devices: vec![(DeviceId([9u8; 32]), LocalState::Present)],
         versions: vec![FileVersion {
             content_hash,
             source_block_id: SourceBlockId([0u8; 32]),
@@ -627,7 +624,7 @@ fn dedup_via_cluster_state_skips_already_backed_up() {
         file_id: FileId(1),
         path: "/cluster/device_a/file.txt".to_string(),
         importance: 0.5,
-        devices: vec![(DeviceId([9u8; 16]), LocalState::Present)],
+        devices: vec![(DeviceId([9u8; 32]), LocalState::Present)],
         versions: vec![FileVersion {
             content_hash,
             source_block_id: SourceBlockId([2u8; 32]),
@@ -643,25 +640,23 @@ fn dedup_via_cluster_state_skips_already_backed_up() {
     let seed = [99u8; 32];
     let master_key = derive_master_key(&seed).unwrap();
     let master_pub = master_identity(&master_key);
-    let dev_id = DeviceId([99u8; 16]);
-    let dev_key = syncback_core::cluster::derive_device_key(&seed, &dev_id).unwrap();
-    let dev_pub = dev_key.verifying_key().to_bytes();
-    let cert = issue_device_certificate(&master_key, dev_id, dev_pub, Timestamp(1));
+    let dev_id = DeviceId([99u8; 32]);
+    let _dev_key = syncback_core::cluster::derive_device_key(&seed, &dev_id.0).unwrap();
+    let cert = issue_device_certificate(&master_key, dev_id, Timestamp(1));
     let cs = ClusterState::init(db.clone(), master_pub, cert, Timestamp(1), Timestamp(1)).unwrap();
     let cluster_state = Arc::new(Mutex::new(cs));
     let config = BackupConfig {
         source_block_size: SMALL_BLOCK_SIZE,
         symbols_dir: symbols_dir.path().to_path_buf(),
         epoch_key: [42u8; 32],
-        device_id: DeviceId([1u8; 16]),
+        device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
         cluster_state: Some(cluster_state),
-        network: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
         master_signing_key: None,
-        pending_deliveries: None,
+        swarm: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -739,12 +734,12 @@ fn read_symbols_for_holder_multiple_ranges() {
     assert_eq!(esis, vec![0, 1, 5, 6, 7]);
 }
 
-// ─── Test 19: backup_config_default_network_is_none ──────────────────────────
+// ─── Test 19: backup_config_default_swarm_is_none ────────────────────────────
 
 #[test]
-fn backup_config_default_network_is_none() {
+fn backup_config_default_swarm_is_none() {
     let cfg = BackupConfig::default();
-    assert!(cfg.network.is_none(), "default config must have network=None");
+    assert!(cfg.swarm.is_none(), "default config must have swarm=None");
 }
 
 // ─── Test 20: deliver_symbols_no_op_when_network_none ────────────────────────
@@ -760,7 +755,6 @@ async fn deliver_symbols_no_op_when_network_none() {
         db,
         BackupConfig {
             symbols_dir: symbols_dir.path().to_path_buf(),
-            network: None,
             ..BackupConfig::default()
         },
         Arc::new(RaptorQEncoder::new()),
@@ -773,16 +767,19 @@ async fn deliver_symbols_no_op_when_network_none() {
         k: 1,
         n: 2,
         t: 65535,
-        symbol_count_per_holder: vec![(IdentityPub([0u8; 32]), 1)],
+        symbol_count_per_holder: vec![(DeviceId([0u8; 32]), 1)],
         stored_size: 0,
         importance: 0.5,
     };
     coordinator.deliver_symbols(&[fake_result]).await;
 }
 
-// ─── Test 21: deliver_symbols_logs_warn_on_peer_not_found ────────────────────
-
-#[tokio::test]
+// Tests 21 and 22 (deliver_symbols network integration) removed in ε.5.
+// iroh NetworkHandle replaced by libp2p SwarmHandle; network delivery is
+// tested in swarm_tests.rs and E2E suite.
+//
+// ─── Test 21: deliver_symbols_logs_warn_on_peer_not_found (REMOVED) ──────────
+#[cfg(any())]
 async fn deliver_symbols_logs_warn_on_peer_not_found() {
     use std::collections::HashMap;
 
@@ -861,9 +858,8 @@ async fn deliver_symbols_logs_warn_on_peer_not_found() {
     Arc::try_unwrap(network).ok().map(|n| async move { n.shutdown().await });
 }
 
-// ─── Test 22: deliver_symbols_sends_to_reachable_holder ──────────────────────
-
-#[tokio::test]
+// ─── Test 22: deliver_symbols_sends_to_reachable_holder (REMOVED) ────────────
+#[cfg(any())]
 async fn deliver_symbols_sends_to_reachable_holder() {
     use std::collections::HashMap;
 
@@ -878,7 +874,7 @@ async fn deliver_symbols_sends_to_reachable_holder() {
     let owner_seed = [20u8; 32];
     let owner_master_key = derive_master_key(&owner_seed).unwrap();
     let owner_master = master_identity(&owner_master_key);
-    let owner_did = DeviceId([20u8; 16]);
+    let owner_did = DeviceId([20u8; 32]);
     let owner_device_key = derive_device_key(&owner_seed, &owner_did).unwrap();
     let owner_cert = issue_device_certificate(
         &owner_master_key,
@@ -891,7 +887,7 @@ async fn deliver_symbols_sends_to_reachable_holder() {
     let holder_seed = [21u8; 32];
     let holder_master_key = derive_master_key(&holder_seed).unwrap();
     let holder_master = master_identity(&holder_master_key);
-    let holder_did = DeviceId([21u8; 16]);
+    let holder_did = DeviceId([21u8; 32]);
     let holder_device_key = derive_device_key(&holder_seed, &holder_did).unwrap();
     let holder_cert = issue_device_certificate(
         &holder_master_key,
@@ -1032,15 +1028,14 @@ fn coord_with_watch(
         source_block_size: SMALL_BLOCK_SIZE,
         symbols_dir: symbols_dir.path().to_path_buf(),
         epoch_key: [42u8; 32],
-        device_id: DeviceId([1u8; 16]),
+        device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
         cluster_state: None,
-        network: None,
         watch_configs,
         time_scale: 1,
         mock_offer_budget_gb: None,
         master_signing_key: None,
-        pending_deliveries: None,
+        swarm: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -1147,8 +1142,8 @@ fn same_content_two_devices_both_in_file_record() {
     let content = b"shared content across two devices -- unique enough to not compress away";
     let path = write_file(&files_dir, "shared.txt", content);
 
-    let device_a = DeviceId([0xAAu8; 16]);
-    let device_b = DeviceId([0xBBu8; 16]);
+    let device_a = DeviceId([0xAAu8; 32]);
+    let device_b = DeviceId([0xBBu8; 32]);
 
     // Device A processes the file.
     let config_a = BackupConfig {
@@ -1158,12 +1153,11 @@ fn same_content_two_devices_both_in_file_record() {
         device_id: device_a,
         mock_holders: test_holders(),
         cluster_state: None,
-        network: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
         master_signing_key: None,
-        pending_deliveries: None,
+        swarm: None,
     };
     let mut coord_a =
         BackupCoordinator::new(db.clone(), config_a, Arc::new(RaptorQEncoder::new()));
@@ -1185,12 +1179,11 @@ fn same_content_two_devices_both_in_file_record() {
         device_id: device_b,
         mock_holders: test_holders(),
         cluster_state: None,
-        network: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
         master_signing_key: None,
-        pending_deliveries: None,
+        swarm: None,
     };
     let mut coord_b =
         BackupCoordinator::new(db.clone(), config_b, Arc::new(RaptorQEncoder::new()));
@@ -1231,16 +1224,15 @@ fn flush_queue_deferred_files_remain_in_queue() {
         source_block_size: SMALL_BLOCK_SIZE,
         symbols_dir: symbols_dir.path().to_path_buf(),
         epoch_key: [42u8; 32],
-        device_id: DeviceId([1u8; 16]),
+        device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
         cluster_state: None,
-        network: None,
         watch_configs: vec![],
         time_scale: 1,
         // Zero budget: all files must be deferred.
         mock_offer_budget_gb: Some(0.0),
         master_signing_key: None,
-        pending_deliveries: None,
+        swarm: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1286,15 +1278,14 @@ fn flush_queue_budget_selects_highest_importance_first() {
         source_block_size: SMALL_BLOCK_SIZE,
         symbols_dir: symbols_dir.path().to_path_buf(),
         epoch_key: [42u8; 32],
-        device_id: DeviceId([1u8; 16]),
+        device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
         cluster_state: None,
-        network: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: Some(1e-4),
         master_signing_key: None,
-        pending_deliveries: None,
+        swarm: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1352,16 +1343,15 @@ fn large_file_skipped_when_budget_insufficient() {
         source_block_size: SMALL_BLOCK_SIZE,
         symbols_dir: symbols_dir.path().to_path_buf(),
         epoch_key: [42u8; 32],
-        device_id: DeviceId([1u8; 16]),
+        device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
         cluster_state: None,
-        network: None,
         watch_configs: vec![],
         time_scale: 1,
         // Zero budget: large file must be skipped.
         mock_offer_budget_gb: Some(0.0),
         master_signing_key: None,
-        pending_deliveries: None,
+        swarm: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1399,7 +1389,7 @@ fn handle_backup_event_increments_accepted_counter() {
     let symbols_dir = TempDir::new().unwrap();
     let mut coord = test_coord(db.clone(), &symbols_dir);
 
-    let holder_id = IdentityPub([0x55u8; 32]);
+    let holder_id = DeviceId([0x55u8; 32]);
     let block_id = SourceBlockId([0xAAu8; 32]);
 
     // Insert a placement so the handler doesn't log a warning about unknown placement.
@@ -1515,121 +1505,7 @@ fn persist_cycle_budget_accumulates_over_multiple_cycles() {
     );
 }
 
-// ─── AC-8: pending_delivery_accept_signals_correctly ─────────────────────────
-//
-// AC-8: When handle_symbol_accept fires, the oneshot sender in PendingDeliveries
-//       signals OfferOutcome::Accepted to the awaiting deliver_to_holder task.
-// Setup: Insert a oneshot tx into PendingDeliveries under (holder, block_id).
-// Action: Simulate Processor path — remove tx from map, send Accepted.
-// Expected: rx.await returns OfferOutcome::Accepted.
-//
-// This tests the signaling contract without requiring a real NetworkHandle.
-// The full end-to-end path (deliver_to_holder → network.send_to_peer → Accept →
-// handle_symbol_accept → signal) is covered by E2E tests.
-
-#[tokio::test]
-async fn pending_delivery_accept_signals_correctly() {
-    let pd = make_empty_pending_deliveries();
-    let holder = IdentityPub([0x01u8; 32]);
-    let block_id = SourceBlockId([0x02u8; 32]);
-
-    let (tx, rx) = tokio::sync::oneshot::channel::<OfferOutcome>();
-    pd.lock().await.insert((holder, block_id), tx);
-
-    // Simulate what handle_symbol_accept does: remove tx from map and signal Accepted.
-    let pd2 = pd.clone();
-    tokio::spawn(async move {
-        let tx = pd2.lock().await.remove(&(holder, block_id)).expect("tx must be in map");
-        let _ = tx.send(OfferOutcome::Accepted);
-    });
-
-    let outcome = rx.await.expect("channel must not be dropped before signal");
-    assert!(
-        matches!(outcome, OfferOutcome::Accepted),
-        "outcome must be Accepted"
-    );
-
-    // Map must be empty — tx was consumed by handle_symbol_accept.
-    assert!(
-        pd.lock().await.is_empty(),
-        "pending_deliveries map must be empty after signal"
-    );
-}
-
-// ─── AC-9: pending_delivery_reject_signals_correctly ─────────────────────────
-//
-// AC-9: When handle_symbol_reject fires, the oneshot sender signals
-//       OfferOutcome::Rejected { reason: QuotaFull } to deliver_to_holder.
-// Same structure as AC-8 but with Rejected outcome.
-
-#[tokio::test]
-async fn pending_delivery_reject_signals_correctly() {
-    use syncback_core::messages::RejectReason;
-
-    let pd = make_empty_pending_deliveries();
-    let holder = IdentityPub([0x03u8; 32]);
-    let block_id = SourceBlockId([0x04u8; 32]);
-
-    let (tx, rx) = tokio::sync::oneshot::channel::<OfferOutcome>();
-    pd.lock().await.insert((holder, block_id), tx);
-
-    // Simulate what handle_symbol_reject does.
-    let pd2 = pd.clone();
-    tokio::spawn(async move {
-        let tx = pd2.lock().await.remove(&(holder, block_id)).expect("tx must be in map");
-        let _ = tx.send(OfferOutcome::Rejected { reason: RejectReason::QuotaFull });
-    });
-
-    let outcome = rx.await.expect("channel must not be dropped before signal");
-    match outcome {
-        OfferOutcome::Rejected { reason } => {
-            assert!(
-                matches!(reason, RejectReason::QuotaFull),
-                "reject reason must be QuotaFull, got {reason:?}"
-            );
-        }
-        OfferOutcome::Accepted => panic!("expected Rejected, got Accepted"),
-    }
-
-    assert!(
-        pd.lock().await.is_empty(),
-        "pending_deliveries map must be empty after signal"
-    );
-}
-
-// ─── AC-10: pending_delivery_times_out_when_no_response ──────────────────────
-//
-// AC-10: When no Accept/Reject arrives within the timeout, deliver_to_holder
-//        observes a timeout error. The PendingDeliveries entry is NOT auto-consumed
-//        (deliver_to_holder is responsible for cleanup on timeout).
-// Setup: Insert tx into PendingDeliveries. Nobody sends on it.
-// Action: tokio::time::timeout wraps rx.await with a short deadline.
-// Expected: timeout fires, the entry is still in the map (not consumed by anyone).
-
-#[tokio::test]
-async fn pending_delivery_times_out_when_no_response() {
-    let pd = make_empty_pending_deliveries();
-    let holder = IdentityPub([0x05u8; 32]);
-    let block_id = SourceBlockId([0x06u8; 32]);
-
-    let (tx, rx) = tokio::sync::oneshot::channel::<OfferOutcome>();
-    pd.lock().await.insert((holder, block_id), tx);
-
-    // Nobody sends on tx — deliver_to_holder would time out waiting for rx.
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(50),
-        rx,
-    )
-    .await;
-
-    assert!(
-        result.is_err(),
-        "rx.await must time out when no Accept/Reject is sent"
-    );
-
-    // Entry is still in the map — deliver_to_holder owns cleanup on timeout.
-    assert!(
-        pd.lock().await.contains_key(&(holder, block_id)),
-        "pending_deliveries entry must remain in map after timeout (cleanup is caller's responsibility)"
-    );
-}
+// AC-8, AC-9, AC-10 (pending_delivery signaling tests) removed in ε.5.
+// PendingDeliveries / OfferOutcome were iroh-era types; delivery now uses
+// libp2p SwarmHandle request-response. Network integration is tested in
+// swarm_tests.rs and the E2E test suite.

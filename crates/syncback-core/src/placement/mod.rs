@@ -3,7 +3,7 @@
 // Weight formula: trust / sqrt(1 - trust)  (mean-variance optimum)
 
 use crate::constants::{MAX_HOLDERS_PER_BLOCK, MIN_SYMBOLS_PER_HOLDER};
-use crate::types::{ErasureParams, IdentityPub};
+use crate::types::{DeviceId, ErasureParams};
 
 #[cfg(test)]
 mod tests;
@@ -13,7 +13,7 @@ mod tests;
 /// A candidate holder for symbol placement.
 #[derive(Debug, Clone)]
 pub struct HolderCandidate {
-    pub identity: IdentityPub,
+    pub device_id: DeviceId,
     /// Combined trust score [0.0, 1.0).
     pub trust: f64,
 }
@@ -21,7 +21,7 @@ pub struct HolderCandidate {
 /// Allocation result for one holder.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HolderAllocation {
-    pub identity: IdentityPub,
+    pub device_id: DeviceId,
     /// Number of symbols assigned to this holder.
     pub symbol_count: u32,
     /// ESI range start (contiguous: ESIs start_esi .. start_esi + symbol_count).
@@ -121,7 +121,7 @@ pub fn compute_allocation(
             holder_weight(b.trust)
                 .partial_cmp(&holder_weight(a.trust))
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.identity.0.cmp(&b.identity.0))
+                .then_with(|| a.device_id.0.cmp(&b.device_id.0))
         });
         valid.truncate(effective_max);
     }
@@ -191,7 +191,7 @@ pub fn compute_allocation(
             weights[a]
                 .partial_cmp(&weights[b])
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| valid[a].identity.0.cmp(&valid[b].identity.0))
+                .then_with(|| valid[a].device_id.0.cmp(&valid[b].device_id.0))
         });
         let mut excess = total - n;
         for idx in indexed {
@@ -210,7 +210,7 @@ pub fn compute_allocation(
             weights[b]
                 .partial_cmp(&weights[a])
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| valid[a].identity.0.cmp(&valid[b].identity.0))
+                .then_with(|| valid[a].device_id.0.cmp(&valid[b].device_id.0))
         });
         let mut deficit = n - total;
         for idx in indexed {
@@ -224,12 +224,12 @@ pub fn compute_allocation(
         }
     }
 
-    // Step 9: assign ESI ranges sorted by descending symbol_count (ties by identity bytes)
+    // Step 9: assign ESI ranges sorted by descending symbol_count (ties by device_id bytes)
     let mut order: Vec<usize> = (0..counts.len()).collect();
     order.sort_by(|&a, &b| {
         counts[b]
             .cmp(&counts[a])
-            .then_with(|| valid[a].identity.0.cmp(&valid[b].identity.0))
+            .then_with(|| valid[a].device_id.0.cmp(&valid[b].device_id.0))
     });
 
     let mut allocations = Vec::with_capacity(valid.len());
@@ -241,7 +241,7 @@ pub fn compute_allocation(
             continue;
         }
         allocations.push(HolderAllocation {
-            identity: valid[idx].identity,
+            device_id: valid[idx].device_id,
             symbol_count: count,
             start_esi: esi_cursor,
         });

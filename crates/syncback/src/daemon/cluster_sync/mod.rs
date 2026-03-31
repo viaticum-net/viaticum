@@ -15,12 +15,11 @@
 // Cursor persistence: sync_cursors stored in StoredClusterState via
 // ClusterState::update_sync_cursor(). No separate DB key needed.
 //
-// Cursor key: IdentityPub(device_pub_key) — per-device identity. Each device
-// in the cluster has a unique device_pub_key, so cursors are tracked per device.
+// Cursor key: IdentityPub(device_id.0) — per-device identity. Each device
+// in the cluster has a unique device_id (Ed25519 pubkey), so cursors are tracked per device.
 
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -29,7 +28,7 @@ use syncback_core::db::Db;
 use syncback_core::messages::{ClusterSyncRequestMsg, ClusterSyncResponseMsg, Message, RevocationBroadcast};
 use syncback_core::types::{DeviceId, IdentityPub, Timestamp};
 
-use crate::daemon::network::NetworkHandle;
+use crate::daemon::network::swarm::{device_id_to_peer_id, SwarmHandle};
 
 #[cfg(test)]
 mod tests;
@@ -66,7 +65,7 @@ pub struct ClusterSyncConfig {
 impl Default for ClusterSyncConfig {
     fn default() -> Self {
         ClusterSyncConfig {
-            our_device_id: DeviceId([0u8; 16]),
+            our_device_id: DeviceId([0u8; 32]),
             batch_size: 1000,
         }
     }
@@ -236,26 +235,25 @@ impl ClusterSyncManager {
 
 // ─── Periodic sync task ───────────────────────────────────────────────────────
 
-/// Periodically send ClusterSyncRequest to each known cluster peer.
+/// Periodically send ClusterSyncRequest to each known cluster peer via SwarmHandle.
 ///
-/// For each peer in `network.cluster_peers()` (excluding our own device):
-///   1. Look up DeviceEntry in cluster_state to get device_pub_key.
+/// For each peer in cluster_state (excluding our own device):
+///   1. Look up DeviceEntry in cluster_state (device_id.0 is the pub key).
 ///   2. Skip revoked devices.
-///   3. Build cursor key as `IdentityPub(device_pub_key)` (per-device cursor).
-///   4. Connect directly to peer's EndpointAddr via `network.connect(addr, None)`.
-///   5. Send ClusterSyncRequest directly on the connection.
-///   6. Hand connection to `incoming_tx` so Processor spawns a read loop
-///      to receive and process the ClusterSyncResponse.
+///   3. Build cursor key as `IdentityPub(device_id.0)` (per-device cursor).
+///   4. Derive PeerId from DeviceId; dial via swarm (best-effort, deduped by libp2p).
+///   5. swarm.send_to_device(device_id, ClusterSyncRequest) → ClusterSyncResponse.
+///      If PeerNotAuthenticated: skip this cycle (not yet connected).
+///   6. Apply response via cluster_sync.process_sync_response.
 ///
 /// Errors per-peer are logged and skipped. Loop runs until `cancel` fires.
 pub async fn run_periodic_sync(
     cluster_sync: Arc<ClusterSyncManager>,
     cluster_state: Arc<Mutex<ClusterState>>,
-    network: Arc<NetworkHandle>,
+    swarm: Arc<SwarmHandle>,
     our_device_id: DeviceId,
     interval_secs: u64,
     cancel: CancellationToken,
-    incoming_tx: mpsc::Sender<crate::daemon::network::connection::Connection>,
 ) -> anyhow::Result<()> {
     let mut interval =
         tokio::time::interval(std::time::Duration::from_secs(interval_secs));
@@ -269,96 +267,90 @@ pub async fn run_periodic_sync(
                 break;
             }
             _ = interval.tick() => {
-                let peers = network.cluster_peers().await;
+                // Collect all active cluster devices (excluding self) under lock, then release.
+                let peer_devices: Vec<(DeviceId, [u8; 32], String)> = {
+                    let state = cluster_state.lock().expect("cluster_state lock poisoned");
+                    let addrs = state.cluster_addrs().clone();
+                    state
+                        .active_devices()
+                        .into_iter()
+                        .filter(|e| e.device_id != our_device_id)
+                        .map(|e| {
+                            let addr = addrs.get(&e.device_id).cloned().unwrap_or_default();
+                            (e.device_id, e.device_id.0, addr)
+                        })
+                        .collect()
+                };
+
                 let mut synced = 0usize;
                 let mut skipped = 0usize;
 
-                for (device_id, addr) in peers {
-                    if device_id == our_device_id {
-                        skipped += 1;
-                        continue;
-                    }
-
-                    // Look up DeviceEntry for device_pub_key and revocation check.
-                    let (device_pub_key, is_revoked) = {
-                        let state = cluster_state.lock().expect("cluster_state lock poisoned");
-                        let entry = state.get_device(&device_id);
-                        match entry {
-                            None => {
-                                warn!(
-                                    device_id = %device_id,
-                                    "cluster_sync: device not in cluster state, skipping"
-                                );
-                                skipped += 1;
-                                continue;
-                            }
-                            Some(e) => (e.device_pub_key, state.is_device_revoked(&device_id)),
-                        }
-                    };
-
-                    if is_revoked {
-                        debug!(
-                            device_id = %device_id,
-                            "cluster_sync: skipping revoked device"
-                        );
-                        skipped += 1;
-                        continue;
-                    }
-
-                    // Per-device cursor key: IdentityPub(device_pub_key).
-                    let peer_identity = IdentityPub(device_pub_key);
+                for (device_id, device_id_bytes, addr_str) in peer_devices {
+                    // Per-device cursor key: IdentityPub(device_id.0).
+                    let peer_identity = IdentityPub(device_id_bytes);
                     let request = cluster_sync.build_sync_request(&peer_identity);
 
-                    // Connect directly to peer's address (15 s timeout).
-                    let conn = match tokio::time::timeout(
-                        std::time::Duration::from_secs(15),
-                        network.connect(addr, None),
-                    )
-                    .await
+                    // Derive PeerId and attempt dial (best-effort; libp2p deduplicates).
+                    if !addr_str.is_empty() {
+                        match (
+                            device_id_to_peer_id(&device_id),
+                            addr_str.parse::<libp2p::Multiaddr>(),
+                        ) {
+                            (Ok(peer_id), Ok(multiaddr)) => {
+                                let _ = swarm.dial(peer_id, multiaddr).await;
+                            }
+                            (Err(e), _) => {
+                                debug!(device_id = %device_id, error = %e, "cluster_sync: PeerId derivation failed");
+                            }
+                            (_, Err(e)) => {
+                                debug!(device_id = %device_id, addr = %addr_str, error = %e, "cluster_sync: invalid Multiaddr");
+                            }
+                        }
+                    }
+
+                    // Send request; if not yet authenticated, skip this cycle.
+                    let response = match swarm
+                        .send_to_device(device_id, Message::ClusterSyncRequest(request))
+                        .await
                     {
-                        Ok(Ok(c)) => c,
-                        Ok(Err(e)) => {
-                            warn!(
+                        Ok(r) => r,
+                        Err(crate::daemon::network::swarm::SwarmError::PeerNotAuthenticated(_)) => {
+                            debug!(
                                 device_id = %device_id,
-                                error = %e,
-                                "cluster_sync: connect failed"
+                                "cluster_sync: peer not yet authenticated, skipping cycle"
                             );
                             skipped += 1;
                             continue;
                         }
-                        Err(_) => {
-                            warn!(
-                                device_id = %device_id,
-                                "cluster_sync: connect timed out"
-                            );
+                        Err(e) => {
+                            warn!(device_id = %device_id, error = %e, "cluster_sync: send failed");
                             skipped += 1;
                             continue;
                         }
                     };
 
-                    // Send ClusterSyncRequest directly on the connection.
-                    if let Err(e) = conn
-                        .send_message(&Message::ClusterSyncRequest(request))
-                        .await
-                    {
-                        warn!(
-                            device_id = %device_id,
-                            error = %e,
-                            "cluster_sync: failed to send ClusterSyncRequest"
-                        );
-                        skipped += 1;
-                        continue;
+                    match response {
+                        Message::ClusterSyncResponse(resp) => {
+                            match cluster_sync.process_sync_response(&peer_identity, resp) {
+                                Ok(applied) => {
+                                    debug!(device_id = %device_id, applied, "cluster_sync: response applied");
+                                    synced += 1;
+                                }
+                                Err(e) => {
+                                    warn!(device_id = %device_id, error = %e, "cluster_sync: process_sync_response failed");
+                                    skipped += 1;
+                                }
+                            }
+                        }
+                        other => {
+                            warn!(
+                                device_id = %device_id,
+                                msg = ?std::mem::discriminant(&other),
+                                "cluster_sync: unexpected response to ClusterSyncRequest"
+                            );
+                            skipped += 1;
+                        }
                     }
-
-                    // Register connection with Processor so it spawns a read loop
-                    // and handles the incoming ClusterSyncResponse.
-                    if incoming_tx.send(conn).await.is_err() {
-                        warn!("cluster_sync: incoming_tx closed (daemon shutting down?)");
-                        // Channel closed means daemon is shutting down — stop the loop.
-                        return Ok(());
-                    }
-
-                    synced += 1;
                 }
 
                 info!(

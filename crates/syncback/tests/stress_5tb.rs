@@ -55,14 +55,14 @@ fn block_id_from_index(i: usize) -> SourceBlockId {
 }
 
 /// Build 30 distinct mock holder IdentityPubs cycled across all blocks.
-fn mock_holder_ids() -> Vec<IdentityPub> {
+fn mock_holder_ids() -> Vec<DeviceId> {
     (0u32..30)
         .map(|i| {
             let mut key = [0u8; 32];
             // Write i into first 4 bytes; fill rest with 0xAB so all are distinct.
             key[..4].copy_from_slice(&i.to_le_bytes());
             key[4..].fill(0xAB);
-            IdentityPub(key)
+            DeviceId(key)
         })
         .collect()
 }
@@ -75,7 +75,7 @@ fn mock_candidates_30() -> Vec<HolderCandidate> {
             key[..4].copy_from_slice(&i.to_le_bytes());
             key[4..].fill(0xAB);
             HolderCandidate {
-                identity: IdentityPub(key),
+                device_id: DeviceId(key),
                 trust: 0.30 + (i as f64) * 0.02, // 0.30 .. 0.88
             }
         })
@@ -83,7 +83,7 @@ fn mock_candidates_30() -> Vec<HolderCandidate> {
 }
 
 const NOW: Timestamp = Timestamp(1_700_000_000);
-const DEVICE_A: DeviceId = DeviceId([0xA0u8; 16]);
+const DEVICE_A: DeviceId = DeviceId([0xA0u8; 32]);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The stress test
@@ -289,7 +289,7 @@ fn stress_5tb_metadata_scale() {
         assert!(
             alloc.symbol_count >= MIN_SYMBOLS_PER_HOLDER,
             "holder {:?} got {} symbols < MIN_SYMBOLS_PER_HOLDER={}",
-            alloc.identity,
+            alloc.device_id,
             alloc.symbol_count,
             MIN_SYMBOLS_PER_HOLDER,
         );

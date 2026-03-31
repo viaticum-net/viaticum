@@ -14,18 +14,16 @@ pub struct SourceBlockId(pub [u8; 32]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct IdentityPub(pub [u8; 32]);
 
-/// Random device identifier, stored in ~/.syncback/device_id. 16 bytes.
+/// Device identity = Ed25519 public key of the device signing key. 32 bytes.
+/// DeviceId.0 IS the public key — no separate device_pub_key field needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct DeviceId(pub [u8; 16]);
+pub struct DeviceId(pub [u8; 32]);
 
 /// Monotonically-increasing file identifier. u64, assigned on first index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FileId(pub u64);
 
-/// iroh NodeId — transport-layer peer identity. 32 bytes (Ed25519 pubkey).
-/// Distinct from IdentityPub: IdentityPub = "who you are", NodeId = "how to reach you".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct NodeId(pub [u8; 32]);
+
 
 // --- Display ---
 
@@ -53,12 +51,6 @@ impl std::fmt::Display for FileId {
     }
 }
 
-impl std::fmt::Display for NodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex_encode(&self.0[..8]))
-    }
-}
-
 /// Encode bytes as lowercase hex string.
 pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -79,12 +71,6 @@ impl AsRef<[u8]> for IdentityPub {
 }
 
 impl AsRef<[u8]> for DeviceId {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl AsRef<[u8]> for NodeId {
     fn as_ref(&self) -> &[u8] {
         &self.0
     }
@@ -298,11 +284,12 @@ impl SourceBlockRecord {
     }
 }
 
-/// Symbol placement from owner's perspective. Key: (SourceBlockId, holder IdentityPub).
+/// Symbol placement from owner's perspective. Key: (SourceBlockId, holder DeviceId).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SymbolPlacement {
     pub source_block_id: SourceBlockId,
-    pub holder_id: IdentityPub,
+    /// Device that holds these symbols.
+    pub holder_id: DeviceId,
     /// File that owns this source block (for O(1) index updates).
     pub file_id: FileId,
     /// Ranges of ESIs assigned to this holder: (start_esi, count).
@@ -344,26 +331,26 @@ pub enum PlacementStatus {
     Deleting,
 }
 
-/// Peer info. Key: IdentityPub.
+/// Peer info. Key: DeviceId.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerRecord {
-    pub identity: IdentityPub,
-    pub node_id: Option<NodeId>,
+    /// Primary key: the device this record describes.
+    pub device_id: DeviceId,
+    /// Master identity this device belongs to. Populated from DeviceCertExchange.
+    pub master_identity: IdentityPub,
     /// P component: rolling 4-week PoS success rate [0.0, 1.0].
     pub trust_p: f64,
     /// I component: cumulative mean PoS success rate [0.0, 1.0].
     pub trust_i: f64,
     /// S component: pairwise storage ratio (raw, not clamped).
     pub trust_s: f64,
-    /// Total bytes we store for this peer.
+    /// Total bytes we store for this peer's master identity.
     pub bytes_we_store_for_peer: u64,
-    /// Total bytes this peer stores for us.
+    /// Total bytes this specific device stores for us.
     pub bytes_peer_stores_for_us: u64,
     pub first_seen: Timestamp,
     pub last_seen: Timestamp,
-    /// Which device manages this peer relationship (peer-to-device affinity).
-    pub device_id: Option<DeviceId>,
-    /// Device public keys we know are revoked for this peer identity.
+    /// Device public keys we know are revoked for this peer's master identity.
     /// Populated when we receive a valid RevocationBroadcast via relay board.
     #[serde(default)]
     pub revoked_device_pub_keys: Vec<[u8; 32]>,
@@ -377,9 +364,9 @@ pub struct PeerRecord {
 }
 
 impl PeerRecord {
-    /// Check if a device IdentityPub is in the revoked list for this peer.
-    pub fn is_device_revoked(&self, device_identity: &IdentityPub) -> bool {
-        self.revoked_device_pub_keys.contains(&device_identity.0)
+    /// Check if a DeviceId is in the revoked list for this peer's master identity.
+    pub fn is_device_revoked(&self, device_id: &DeviceId) -> bool {
+        self.revoked_device_pub_keys.contains(&device_id.0)
     }
 }
 
@@ -451,16 +438,16 @@ pub struct PlacementAgg {
 pub enum Event {
     SymbolsPlaced {
         source_block_id: SourceBlockId,
-        holder_id: IdentityPub,
+        holder_id: DeviceId,
         esi_range: (u32, u32),
     },
     SymbolsLost {
         source_block_id: SourceBlockId,
-        holder_id: IdentityPub,
+        holder_id: DeviceId,
     },
     SymbolsVerified {
         source_block_id: SourceBlockId,
-        holder_id: IdentityPub,
+        holder_id: DeviceId,
     },
     FileAdded {
         file_id: FileId,

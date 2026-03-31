@@ -12,7 +12,7 @@ use syncback_core::types::DeviceId;
 use crate::daemon::backup::DirtyKind;
 use crate::daemon::watcher::{start_watcher, WatcherConfig};
 
-const TEST_DEVICE_ID: DeviceId = DeviceId([1u8; 16]);
+const TEST_DEVICE_ID: DeviceId = DeviceId([1u8; 32]);
 const DEBOUNCE_MS: u64 = 50;
 
 /// Receive one DirtyEvent with a timeout.

@@ -3,7 +3,7 @@ use crate::constants::{
     PROTOCOL_VERSION, RELAY_TTL_SECS,
 };
 use crate::erasure::Symbol;
-use crate::types::{sig_serde, IdentityPub, NodeId, SourceBlockId, Timestamp};
+use crate::types::{sig_serde, DeviceId, IdentityPub, SourceBlockId, Timestamp};
 use chacha20poly1305::aead::{AeadInPlace, NewAead};
 use chacha20poly1305::ChaCha20Poly1305;
 use ed25519_dalek::Signer;
@@ -36,10 +36,8 @@ pub struct HandshakeMsg {
 pub struct PeerAnnounceMsg {
     pub v: u8,
     pub identity_pub: IdentityPub,
-    /// iroh transport address (NodeId bytes).
-    pub node_id: NodeId,
     pub timestamp: Timestamp,
-    /// Ed25519 signature of identity_pub || node_id || timestamp. 64 bytes.
+    /// Ed25519 signature of identity_pub || timestamp. 64 bytes.
     #[serde(with = "sig_serde")]
     pub sig: [u8; 64],
     /// X25519 public key for directed relay board encryption.
@@ -56,6 +54,10 @@ pub struct PosChallengeMsg {
     pub source_block_id: SourceBlockId,
     pub esi: u32,
     pub timestamp: Timestamp,
+    /// Which device this challenge is addressed to.
+    /// Added in per-device refactor. Use #[serde(default)] for backward compat.
+    #[serde(default)]
+    pub device_id: Option<DeviceId>,
 }
 
 /// Holder → Owner. Response to a PoS challenge.
@@ -67,6 +69,9 @@ pub struct PosResponseMsg {
     /// Bound symbol data. Exactly T bytes.
     pub data: Vec<u8>,
     pub timestamp: Timestamp,
+    /// Which device is responding. Added in per-device refactor.
+    #[serde(default)]
+    pub device_id: Option<DeviceId>,
 }
 
 /// Holder → Owner. Holder received a PoS challenge but does not hold the symbol.
@@ -86,6 +91,9 @@ pub struct PosNackMsg {
     /// The challenged ESI the holder cannot serve.
     pub esi: u32,
     pub timestamp: Timestamp,
+    /// Which device is responding. Added in per-device refactor.
+    #[serde(default)]
+    pub device_id: Option<DeviceId>,
 }
 
 /// Owner → Holder. Offer to store symbols for a source block.
@@ -291,30 +299,12 @@ pub struct SystemStateResponseMsg {
     pub timestamp: Timestamp,
 }
 
-/// Requester → Peer. Ask for known peers list. Responded to any authenticated connection.
+/// Generic acknowledgement. Sent as a response to one-way messages delivered
+/// via libp2p request-response when the sender expects a reply to close the
+/// stream (Assumption A4 in ε.2 spec).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct PeerDiscoveryRequestMsg {
+pub struct AckMsg {
     pub v: u8,
-    pub timestamp: Timestamp,
-}
-
-/// Peer → Requester. List of known peers with iroh NodeIds.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct PeerDiscoveryResponseMsg {
-    pub v: u8,
-    pub peers: Vec<DiscoveredPeer>,
-    pub timestamp: Timestamp,
-}
-
-/// A discovered peer entry (identity + transport address).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct DiscoveredPeer {
-    pub identity_pub: IdentityPub,
-    pub node_id: NodeId,
-    /// Known addresses in "NodeId_hex@ip:port" format. Added in protocol v2.
-    /// Empty on older peers that don't include addrs in their response.
-    #[serde(default)]
-    pub addrs: Vec<String>,
 }
 
 // ============================================================
@@ -350,8 +340,7 @@ pub enum Message {
     SystemStateAck(SystemStateAckMsg),
     SystemStateRequest(SystemStateRequestMsg),
     SystemStateResponse(SystemStateResponseMsg),
-    PeerDiscoveryRequest(PeerDiscoveryRequestMsg),
-    PeerDiscoveryResponse(PeerDiscoveryResponseMsg),
+    Ack(AckMsg),
 }
 
 // ============================================================
@@ -553,35 +542,28 @@ pub fn build_handshake(
 // PeerAnnounce
 // ============================================================
 
-fn peer_announce_sig_input(
-    identity_pub: &IdentityPub,
-    node_id: &crate::types::NodeId,
-    timestamp: &Timestamp,
-) -> Vec<u8> {
-    let mut input = Vec::with_capacity(32 + 32 + 8);
+fn peer_announce_sig_input(identity_pub: &IdentityPub, timestamp: &Timestamp) -> Vec<u8> {
+    let mut input = Vec::with_capacity(32 + 8);
     input.extend_from_slice(&identity_pub.0);
-    input.extend_from_slice(&node_id.0);
     input.extend_from_slice(&timestamp.0.to_be_bytes());
     input
 }
 
 /// Build a signed PeerAnnounceMsg.
 ///
-/// The sig covers identity_pub || node_id || timestamp.
+/// The sig covers identity_pub || timestamp.
 /// `x25519_pub` is NOT part of the signature — it is an informational field.
 pub fn build_peer_announce(
     identity_pub: IdentityPub,
-    node_id: crate::types::NodeId,
     timestamp: Timestamp,
     signing_key: &ed25519_dalek::SigningKey,
     x25519_pub: Option<[u8; 32]>,
 ) -> PeerAnnounceMsg {
-    let sig_input = peer_announce_sig_input(&identity_pub, &node_id, &timestamp);
+    let sig_input = peer_announce_sig_input(&identity_pub, &timestamp);
     let signature = signing_key.sign(&sig_input);
     PeerAnnounceMsg {
         v: PROTOCOL_VERSION,
         identity_pub,
-        node_id,
         timestamp,
         sig: signature.to_bytes(),
         x25519_pub,
@@ -593,7 +575,7 @@ pub fn verify_peer_announce(msg: &PeerAnnounceMsg) -> Result<(), MessageError> {
     let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&msg.identity_pub.0)
         .map_err(|_| MessageError::BadSignature)?;
     let signature = ed25519_dalek::Signature::from_bytes(&msg.sig);
-    let sig_input = peer_announce_sig_input(&msg.identity_pub, &msg.node_id, &msg.timestamp);
+    let sig_input = peer_announce_sig_input(&msg.identity_pub, &msg.timestamp);
     verifying_key
         .verify_strict(&sig_input, &signature)
         .map_err(|_| MessageError::BadSignature)?;
@@ -762,8 +744,8 @@ pub fn extract_cluster_identity(
         Some(c) => c,
     };
 
-    // The device_pub_key in the cert must match the identity_pub in the handshake.
-    if cert.device_pub_key != msg.identity_pub.0 {
+    // device_id.0 IS the device public key — it must match the identity_pub in the handshake.
+    if cert.device_id.0 != msg.identity_pub.0 {
         return Err(MessageError::BadSignature);
     }
 
@@ -780,10 +762,10 @@ pub fn extract_cluster_identity(
 }
 
 /// Reconstruct the signed payload for a DeviceCertificate (mirrors cluster::device_cert_payload).
+/// Payload: device_id.0 (32 bytes) || issued_at.0.to_be_bytes() (8 bytes) = 40 bytes
 fn device_cert_payload_for_verify(cert: &crate::cluster::DeviceCertificate) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(56);
+    let mut payload = Vec::with_capacity(40);
     payload.extend_from_slice(&cert.device_id.0);
-    payload.extend_from_slice(&cert.device_pub_key);
     payload.extend_from_slice(&cert.issued_at.0.to_be_bytes());
     payload
 }

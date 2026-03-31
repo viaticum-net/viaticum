@@ -1,7 +1,7 @@
 use crate::cluster::{derive_device_key, derive_master_key, issue_device_certificate, master_identity, issue_revocation, EpochCounter};
 use crate::constants::{HANDSHAKE_FRESHNESS_SECS, MAX_RELAY_HOP, RELAY_TTL_SECS};
 use crate::erasure::Symbol;
-use crate::types::{DeviceId, Event, EventEntry, IdentityPub, NodeId, SourceBlockId, Timestamp};
+use crate::types::{DeviceId, Event, EventEntry, IdentityPub, SourceBlockId, Timestamp};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -24,12 +24,6 @@ fn make_identity_pub(byte: u8) -> IdentityPub {
     IdentityPub(id)
 }
 
-fn make_node_id(byte: u8) -> NodeId {
-    let mut id = [0u8; 32];
-    id[0] = byte;
-    NodeId(id)
-}
-
 fn minimal_handshake() -> Message {
     Message::Handshake(HandshakeMsg {
         v: 1,
@@ -44,7 +38,6 @@ fn minimal_peer_announce() -> Message {
     Message::PeerAnnounce(PeerAnnounceMsg {
         v: 1,
         identity_pub: make_identity_pub(2),
-        node_id: make_node_id(2),
         timestamp: Timestamp(1000),
         sig: [0u8; 64],
         x25519_pub: None,
@@ -99,8 +92,10 @@ fn unframe_message_returns_frame_length_mismatch() {
 
 #[test]
 fn frame_message_too_large_returns_error() {
-    // Construct a SymbolTransferMsg with > MAX_MESSAGE_SIZE worth of symbol data (~72 MB).
-    let big_symbols: Vec<Symbol> = (0..1100u32)
+    // Construct a SymbolTransferMsg with > MAX_MESSAGE_SIZE worth of symbol data.
+    // MAX_MESSAGE_SIZE = 128 MiB = 134_217_728 bytes.
+    // 2100 × 65535 bytes raw ≈ 137.7 MiB > 128 MiB (CBOR adds per-field overhead).
+    let big_symbols: Vec<Symbol> = (0..2100u32)
         .map(|i| Symbol {
             esi: i,
             data: vec![0u8; 65535],
@@ -280,7 +275,6 @@ fn all_message_variants_frame_roundtrip() {
         Message::PeerAnnounce(PeerAnnounceMsg {
             v: 1,
             identity_pub: make_identity_pub(1),
-            node_id: make_node_id(1),
             timestamp: ts,
             sig: [0u8; 64],
             x25519_pub: None,
@@ -291,6 +285,7 @@ fn all_message_variants_frame_roundtrip() {
             source_block_id: sbid,
             esi: 0,
             timestamp: ts,
+            device_id: None,
         }),
         Message::PosResponse(PosResponseMsg {
             v: 1,
@@ -298,6 +293,7 @@ fn all_message_variants_frame_roundtrip() {
             esi: 0,
             data: vec![0u8; 16],
             timestamp: ts,
+            device_id: None,
         }),
         Message::PosNack(PosNackMsg {
             v: 1,
@@ -305,6 +301,7 @@ fn all_message_variants_frame_roundtrip() {
             source_block_id: sbid,
             esi: 42,
             timestamp: ts,
+            device_id: None,
         }),
         Message::SymbolOffer(SymbolOfferMsg {
             v: 1,
@@ -434,6 +431,7 @@ fn pos_nack_msg_roundtrip() {
         source_block_id: sbid,
         esi: 42,
         timestamp: ts,
+        device_id: None,
     };
     let encoded = to_cbor(&Message::PosNack(msg.clone())).unwrap();
     let decoded: Message = from_cbor(&encoded).unwrap();
@@ -448,6 +446,7 @@ fn pos_nack_framing_roundtrip() {
         source_block_id: SourceBlockId([2u8; 32]),
         esi: 99,
         timestamp: Timestamp(2_000_000),
+        device_id: None,
     });
     let framed = frame_message(&msg).unwrap();
     let (decoded, consumed) = unframe_message(&framed).unwrap();
@@ -466,10 +465,11 @@ fn make_device_cert_for_test() -> (
 ) {
     let seed = [0xAAu8; 32];
     let master_key = derive_master_key(&seed).unwrap();
-    let device_id = DeviceId([0x01u8; 16]);
-    let device_key = derive_device_key(&seed, &device_id).unwrap();
-    let device_pub = device_key.verifying_key().to_bytes();
-    let cert = issue_device_certificate(&master_key, device_id, device_pub, Timestamp(1_000_000));
+    // device_seed is used to derive device signing key; device_id = pubkey
+    let device_seed = [0x01u8; 32];
+    let device_key = derive_device_key(&seed, &device_seed).unwrap();
+    let device_id = DeviceId(device_key.verifying_key().to_bytes());
+    let cert = issue_device_certificate(&master_key, device_id, Timestamp(1_000_000));
     let master_pub = master_identity(&master_key);
     (master_key, device_key, cert, master_pub, device_id)
 }
@@ -526,7 +526,7 @@ fn extract_cluster_identity_none_for_no_cert() {
 #[test]
 fn extract_cluster_identity_rejects_mismatched_device_pub() {
     let (_, _device_key, cert, _, _) = make_device_cert_for_test();
-    // Use a different identity_pub that doesn't match cert.device_pub_key
+    // Use a different identity_pub that doesn't match cert.device_id.0
     let other_key = SigningKey::generate(&mut OsRng);
     let other_pub = IdentityPub(other_key.verifying_key().to_bytes());
     let msg = HandshakeMsg {
@@ -554,10 +554,10 @@ fn extract_cluster_identity_rejects_invalid_cert_signature() {
 fn revocation_broadcast_cbor_round_trip() {
     let seed = [0xBBu8; 32];
     let master_key = derive_master_key(&seed).unwrap();
-    let device_id = DeviceId([0x02u8; 16]);
-    let device_key = derive_device_key(&seed, &device_id).unwrap();
-    let device_pub = device_key.verifying_key().to_bytes();
-    let cert = issue_device_certificate(&master_key, device_id, device_pub, Timestamp(1_000_000));
+    let device_seed = [0x02u8; 32];
+    let device_key = derive_device_key(&seed, &device_seed).unwrap();
+    let device_id = DeviceId(device_key.verifying_key().to_bytes());
+    let cert = issue_device_certificate(&master_key, device_id, Timestamp(1_000_000));
     let revocation = issue_revocation(&master_key, device_id, Timestamp(2_000_000), EpochCounter(1));
     let broadcast = RevocationBroadcast { revocation, device_cert: cert };
     let bytes = to_cbor(&broadcast).unwrap();
@@ -569,7 +569,7 @@ fn revocation_broadcast_cbor_round_trip() {
 fn cluster_sync_request_msg_round_trip() {
     let msg = ClusterSyncRequestMsg {
         v: 1,
-        from_device_id: DeviceId([0x03u8; 16]),
+        from_device_id: DeviceId([0x03u8; 32]),
         last_known_seq: 42,
         timestamp: Timestamp(1_000_000),
     };
@@ -582,8 +582,8 @@ fn cluster_sync_request_msg_round_trip() {
 fn cluster_sync_response_msg_round_trip() {
     let event_entry = EventEntry {
         timestamp: Timestamp(1_000_000),
-        device_id: DeviceId([0x04u8; 16]),
-        event: Event::DeviceAdded { device_id: DeviceId([0x05u8; 16]) },
+        device_id: DeviceId([0x04u8; 32]),
+        event: Event::DeviceAdded { device_id: DeviceId([0x05u8; 32]) },
     };
     let msg = ClusterSyncResponseMsg {
         v: 1,
@@ -652,100 +652,9 @@ fn system_state_response_msg_roundtrip() {
     assert_eq!(consumed, framed.len());
 }
 
-#[test]
-fn peer_discovery_request_msg_roundtrip() {
-    let msg = Message::PeerDiscoveryRequest(PeerDiscoveryRequestMsg {
-        v: 1,
-        timestamp: Timestamp(1_000_004),
-    });
-    let framed = frame_message(&msg).unwrap();
-    let (decoded, consumed) = unframe_message(&framed).unwrap();
-    assert_eq!(decoded, msg);
-    assert_eq!(consumed, framed.len());
-}
+// ─── PROP-01: CBOR roundtrip sweep — all 26 Message variants ────────────────
 
-#[test]
-fn peer_discovery_response_msg_roundtrip() {
-    let msg = Message::PeerDiscoveryResponse(PeerDiscoveryResponseMsg {
-        v: 1,
-        peers: vec![
-            DiscoveredPeer {
-                identity_pub: make_identity_pub(10),
-                node_id: make_node_id(10),
-                addrs: vec![],
-            },
-            DiscoveredPeer {
-                identity_pub: make_identity_pub(11),
-                node_id: make_node_id(11),
-                addrs: vec![],
-            },
-        ],
-        timestamp: Timestamp(1_000_005),
-    });
-    let framed = frame_message(&msg).unwrap();
-    let (decoded, consumed) = unframe_message(&framed).unwrap();
-    assert_eq!(decoded, msg);
-    assert_eq!(consumed, framed.len());
-}
-
-#[test]
-fn discovered_peer_with_addrs_roundtrip() {
-    let msg = Message::PeerDiscoveryResponse(PeerDiscoveryResponseMsg {
-        v: 1,
-        peers: vec![DiscoveredPeer {
-            identity_pub: make_identity_pub(20),
-            node_id: make_node_id(20),
-            addrs: vec![
-                "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890@192.168.1.5:12345"
-                    .to_string(),
-                "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890@[::1]:9000"
-                    .to_string(),
-            ],
-        }],
-        timestamp: Timestamp(1_000_006),
-    });
-    let framed = frame_message(&msg).unwrap();
-    let (decoded, consumed) = unframe_message(&framed).unwrap();
-    assert_eq!(decoded, msg);
-    assert_eq!(consumed, framed.len());
-}
-
-#[test]
-fn discovered_peer_addrs_default_for_old_cbor() {
-    // Simulate a DiscoveredPeer serialized without the addrs field (protocol v1 peer).
-    // With #[serde(default)], decoding must succeed and addrs must be empty.
-    use serde::Serialize;
-
-    #[derive(Serialize)]
-    struct OldDiscoveredPeer {
-        identity_pub: IdentityPub,
-        node_id: NodeId,
-    }
-    #[derive(Serialize)]
-    struct OldPeerDiscoveryResponseMsg {
-        v: u8,
-        peers: Vec<OldDiscoveredPeer>,
-        timestamp: Timestamp,
-    }
-
-    let old = OldPeerDiscoveryResponseMsg {
-        v: 1,
-        peers: vec![OldDiscoveredPeer {
-            identity_pub: make_identity_pub(30),
-            node_id: make_node_id(30),
-        }],
-        timestamp: Timestamp(1_000_007),
-    };
-    let cbor = to_cbor(&old).unwrap();
-    let decoded: PeerDiscoveryResponseMsg = from_cbor(&cbor).unwrap();
-    assert_eq!(decoded.peers.len(), 1);
-    assert_eq!(decoded.peers[0].identity_pub, make_identity_pub(30));
-    assert_eq!(decoded.peers[0].addrs, Vec::<String>::new());
-}
-
-// ─── PROP-01: CBOR roundtrip sweep — all 27 Message variants ────────────────
-
-fn all_27_message_variants() -> Vec<Message> {
+fn all_26_message_variants() -> Vec<Message> {
     let sbid = make_source_block_id(1);
     let ts = Timestamp(1000);
 
@@ -775,7 +684,6 @@ fn all_27_message_variants() -> Vec<Message> {
         Message::PeerAnnounce(PeerAnnounceMsg {
             v: 1,
             identity_pub: make_identity_pub(1),
-            node_id: make_node_id(1),
             timestamp: ts,
             sig: [0u8; 64],
             x25519_pub: None,
@@ -786,6 +694,7 @@ fn all_27_message_variants() -> Vec<Message> {
             source_block_id: sbid,
             esi: 0,
             timestamp: ts,
+            device_id: None,
         }),
         Message::PosResponse(PosResponseMsg {
             v: 1,
@@ -793,6 +702,7 @@ fn all_27_message_variants() -> Vec<Message> {
             esi: 0,
             data: vec![0u8; 16],
             timestamp: ts,
+            device_id: None,
         }),
         Message::PosNack(PosNackMsg {
             v: 1,
@@ -800,6 +710,7 @@ fn all_27_message_variants() -> Vec<Message> {
             source_block_id: sbid,
             esi: 42,
             timestamp: ts,
+            device_id: None,
         }),
         Message::SymbolOffer(SymbolOfferMsg {
             v: 1,
@@ -895,7 +806,7 @@ fn all_27_message_variants() -> Vec<Message> {
         }),
         Message::ClusterSyncRequest(ClusterSyncRequestMsg {
             v: 1,
-            from_device_id: DeviceId([0x03u8; 16]),
+            from_device_id: DeviceId([0x03u8; 32]),
             last_known_seq: 7,
             timestamp: ts,
         }),
@@ -905,8 +816,8 @@ fn all_27_message_variants() -> Vec<Message> {
                 1u64,
                 EventEntry {
                     timestamp: ts,
-                    device_id: DeviceId([0x04u8; 16]),
-                    event: Event::DeviceAdded { device_id: DeviceId([0x05u8; 16]) },
+                    device_id: DeviceId([0x04u8; 32]),
+                    event: Event::DeviceAdded { device_id: DeviceId([0x05u8; 32]) },
                 },
             )],
             responder_last_seq: 1,
@@ -928,23 +839,14 @@ fn all_27_message_variants() -> Vec<Message> {
             encrypted_blob: vec![],
             timestamp: ts,
         }),
-        Message::PeerDiscoveryRequest(PeerDiscoveryRequestMsg { v: 1, timestamp: ts }),
-        Message::PeerDiscoveryResponse(PeerDiscoveryResponseMsg {
-            v: 1,
-            peers: vec![DiscoveredPeer {
-                identity_pub: make_identity_pub(10),
-                node_id: make_node_id(10),
-                addrs: vec![],
-            }],
-            timestamp: ts,
-        }),
+        Message::Ack(AckMsg { v: 1 }),
     ]
 }
 
 #[test]
 fn all_message_variants_cbor_roundtrip_sweep() {
-    let variants = all_27_message_variants();
-    assert_eq!(variants.len(), 27, "expected 27 Message variants");
+    let variants = all_26_message_variants();
+    assert_eq!(variants.len(), 26, "expected 26 Message variants");
     for msg in &variants {
         let bytes = to_cbor(msg).expect("to_cbor must not fail");
         let decoded: Message = from_cbor(&bytes).expect("from_cbor must not fail");
@@ -954,8 +856,8 @@ fn all_message_variants_cbor_roundtrip_sweep() {
 
 #[test]
 fn all_message_variants_frame_unframe_roundtrip_sweep() {
-    let variants = all_27_message_variants();
-    assert_eq!(variants.len(), 27, "expected 27 Message variants");
+    let variants = all_26_message_variants();
+    assert_eq!(variants.len(), 26, "expected 26 Message variants");
     for msg in &variants {
         let framed = frame_message(msg).expect("frame_message must not fail");
         let (decoded, consumed) =
@@ -971,14 +873,12 @@ fn all_message_variants_frame_unframe_roundtrip_sweep() {
 fn build_peer_announce_produces_valid_signature() {
     let sk = SigningKey::generate(&mut OsRng);
     let identity_pub = IdentityPub(sk.verifying_key().to_bytes());
-    let node_id = make_node_id(5);
     let ts = Timestamp(1_000_000);
 
-    let msg = super::build_peer_announce(identity_pub, node_id, ts, &sk, None);
+    let msg = super::build_peer_announce(identity_pub, ts, &sk, None);
 
     assert_eq!(msg.v, crate::constants::PROTOCOL_VERSION);
     assert_eq!(msg.identity_pub, identity_pub);
-    assert_eq!(msg.node_id, node_id);
     assert_eq!(msg.timestamp, ts);
 
     // Signature must verify.
@@ -989,10 +889,9 @@ fn build_peer_announce_produces_valid_signature() {
 fn verify_peer_announce_rejects_tampered_identity() {
     let sk = SigningKey::generate(&mut OsRng);
     let identity_pub = IdentityPub(sk.verifying_key().to_bytes());
-    let node_id = make_node_id(6);
     let ts = Timestamp(2_000_000);
 
-    let mut msg = super::build_peer_announce(identity_pub, node_id, ts, &sk, None);
+    let mut msg = super::build_peer_announce(identity_pub, ts, &sk, None);
 
     // Tamper with the identity_pub — sig should no longer verify.
     msg.identity_pub = make_identity_pub(0xFF);
@@ -1005,39 +904,18 @@ fn verify_peer_announce_rejects_tampered_identity() {
 }
 
 #[test]
-fn verify_peer_announce_rejects_tampered_node_id() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let identity_pub = IdentityPub(sk.verifying_key().to_bytes());
-    let node_id = make_node_id(7);
-    let ts = Timestamp(3_000_000);
-
-    let mut msg = super::build_peer_announce(identity_pub, node_id, ts, &sk, None);
-
-    // Tamper with the node_id.
-    msg.node_id = make_node_id(0xFF);
-
-    let result = super::verify_peer_announce(&msg);
-    assert!(
-        matches!(result, Err(super::MessageError::BadSignature)),
-        "tampered node_id should fail verification"
-    );
-}
-
-#[test]
 fn peer_announce_cbor_round_trip() {
     let sk = SigningKey::generate(&mut OsRng);
     let identity_pub = IdentityPub(sk.verifying_key().to_bytes());
-    let node_id = make_node_id(8);
     let ts = Timestamp(4_000_000);
 
-    let msg = super::build_peer_announce(identity_pub, node_id, ts, &sk, None);
+    let msg = super::build_peer_announce(identity_pub, ts, &sk, None);
 
     // Serialize to CBOR and deserialize.
     let encoded = to_cbor(&msg).expect("cbor encode failed");
     let decoded: PeerAnnounceMsg = from_cbor(&encoded).expect("cbor decode failed");
 
     assert_eq!(decoded.identity_pub, msg.identity_pub);
-    assert_eq!(decoded.node_id, msg.node_id);
     assert_eq!(decoded.timestamp, msg.timestamp);
     assert_eq!(decoded.sig, msg.sig);
 
@@ -1124,12 +1002,12 @@ fn unknown_message_variant_returns_error_not_panic() {
     );
 }
 
-// ─── MSG-12: all 27 message variants have v == 1 ─────────────────────────────
+// ─── MSG-12: all 26 message variants have v == 1 ─────────────────────────────
 
 #[test]
 fn all_messages_have_version_one() {
-    let variants = all_27_message_variants();
-    assert_eq!(variants.len(), 27, "expected 27 Message variants");
+    let variants = all_26_message_variants();
+    assert_eq!(variants.len(), 26, "expected 26 Message variants");
 
     for msg in &variants {
         let v = match msg {
@@ -1158,8 +1036,7 @@ fn all_messages_have_version_one() {
             Message::SystemStateAck(m) => m.v,
             Message::SystemStateRequest(m) => m.v,
             Message::SystemStateResponse(m) => m.v,
-            Message::PeerDiscoveryRequest(m) => m.v,
-            Message::PeerDiscoveryResponse(m) => m.v,
+            Message::Ack(m) => m.v,
         };
         assert_eq!(
             v, 1,
@@ -1281,11 +1158,10 @@ fn delete_sig_not_valid_as_cancel_delete() {
 fn peer_announce_with_x25519_roundtrips_cbor() {
     let sk = SigningKey::generate(&mut OsRng);
     let identity_pub = IdentityPub(sk.verifying_key().to_bytes());
-    let node_id = make_node_id(10);
     let ts = Timestamp(5_000_000);
     let x25519_bytes = [42u8; 32];
 
-    let msg = super::build_peer_announce(identity_pub, node_id, ts, &sk, Some(x25519_bytes));
+    let msg = super::build_peer_announce(identity_pub, ts, &sk, Some(x25519_bytes));
     assert_eq!(msg.x25519_pub, Some(x25519_bytes));
 
     // Frame as a full Message and unframe.
@@ -1299,9 +1175,26 @@ fn peer_announce_with_x25519_roundtrips_cbor() {
     };
     assert_eq!(decoded.x25519_pub, Some(x25519_bytes), "x25519_pub must survive frame/unframe");
     assert_eq!(decoded.identity_pub, msg.identity_pub);
-    assert_eq!(decoded.node_id, msg.node_id);
     // Signature still verifies after round-trip.
     super::verify_peer_announce(&decoded).expect("sig must verify after roundtrip");
+}
+
+// ─── AckMsg ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn ack_msg_roundtrips_cbor() {
+    let msg = Message::Ack(AckMsg { v: 1 });
+
+    // CBOR roundtrip.
+    let bytes = to_cbor(&msg).expect("to_cbor must not fail");
+    let decoded: Message = from_cbor(&bytes).expect("from_cbor must not fail");
+    assert_eq!(decoded, msg, "CBOR roundtrip mismatch");
+
+    // Frame/unframe roundtrip.
+    let framed = frame_message(&msg).expect("frame_message must not fail");
+    let (unframed, consumed) = unframe_message(&framed).expect("unframe_message must not fail");
+    assert_eq!(unframed, msg, "frame/unframe roundtrip mismatch");
+    assert_eq!(consumed, framed.len(), "consumed != framed.len()");
 }
 
 #[test]

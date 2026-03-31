@@ -11,8 +11,8 @@
 | Компонент | Выбор | Примечание |
 |-----------|-------|------------|
 | Erasure coding | RaptorQ (RFC 6330), crate `raptorq` | НЕ Reed-Solomon |
-| Transport | iroh (QUIC + NAT traversal) | transport only |
-| Gossip / deferred | Epidemic relay (board-based) | НЕ iroh-blobs, НЕ iroh-docs |
+| Transport | libp2p (TCP + Noise + Yamux, Kademlia DHT, DCUtR) | transport only |
+| Gossip / deferred | Epidemic relay (board-based) | НЕ pubsub |
 | Wire format | CBOR + u32 BE length-prefix | `ciborium` crate |
 | ALPN | `"syncback/1"` | строка байт |
 | File encryption | ChaCha20-Poly1305 | epoch-keyed |
@@ -22,7 +22,7 @@
 | KDF | HKDF-SHA256 | domain-separated |
 | Хеши | BLAKE3 | content-addressed IDs |
 
-iroh-blobs и iroh-docs в β не используются. Прямые соединения + epidemic relay полностью покрывают потребности cold backup.
+Прямые соединения + epidemic relay полностью покрывают потребности cold backup.
 
 ---
 
@@ -79,6 +79,7 @@ pub enum Message {
     SystemStateResponse(SystemStateResponseMsg),
     PeerDiscoveryRequest(PeerDiscoveryRequestMsg),
     PeerDiscoveryResponse(PeerDiscoveryResponseMsg),
+    Ack(AckMsg),  // generic ack for request-response streams that expect a reply
 }
 ```
 
@@ -103,13 +104,13 @@ Seed phrase (BIP39, 24 слова)
 │
 ├─ Device key (Ed25519, per device)
 │   HKDF-SHA256(ikm=seed_bytes, salt=device_id.0, info=b"syncback-device-ed25519")
-│   NodeId = device_key.verifying_key()  ←── transport identity для iroh
+│   DeviceId = device_key.verifying_key()  ←── transport identity (libp2p PeerId derived from this)
 │
 └─ Epoch encryption key (ChaCha20, per epoch)
     HKDF-SHA256(ikm=seed_bytes, salt=epoch.0.to_be_bytes(), info=b"syncback-encryption")
 ```
 
-- `device_id`: случайный 16-байтный ID, генерируется при первой инициализации устройства
+- `DeviceId` = Ed25519 pubkey bytes of device signing key (32 bytes) — стабильный транспортный ID
 - Seed phrase стирается из RAM после деривации ключей
 - Устройство постоянно хранит: `device_key`, `epoch_key[current]`, `epoch_key[current-1]`
 
@@ -117,13 +118,13 @@ Seed phrase (BIP39, 24 слова)
 
 ```rust
 pub struct DeviceCertificate {
-    pub device_id: DeviceId,        // 16 bytes
-    pub device_pub_key: [u8; 32],   // Ed25519 pubkey
+    pub device_id: DeviceId,        // 32 bytes (Ed25519 pubkey of device key)
     pub issued_at: Timestamp,
     pub signature: [u8; 64],        // Ed25519: master_key.sign(payload)
     pub master_pub_key: IdentityPub,
 }
-// signed payload = device_id.0 (16) || device_pub_key (32) || issued_at.0.to_be_bytes() (8)
+// signed payload = device_id.0 (32) || issued_at.0.to_be_bytes() (8)
+// device_id.0 IS the device pubkey — no separate device_pub_key field
 ```
 
 #### Revocation certificate
@@ -144,7 +145,7 @@ pub struct RevocationCertificate {
 
 ### 1.2. Handshake (аутентификация соединения)
 
-Протокол SyncBack handshake выполняется поверх iroh QUIC+TLS слоя. iroh TLS использует собственную keypair (transport identity), никак не связанную с `IdentityPub`.
+Протокол SyncBack handshake выполняется поверх libp2p Noise IX слоя. После Noise-хэндшейка стороны обмениваются `DeviceCertExchangeMsg`, связывающим libp2p PeerId с `IdentityPub`.
 
 #### Порядок обмена
 
@@ -175,7 +176,7 @@ pub struct HandshakeMsg {
 1. `|timestamp - now| <= HANDSHAKE_FRESHNESS_SECS` (300 секунд)
 2. Проверить Ed25519 подпись `sig` на `identity_pub`
 3. Если `device_cert` присутствует:
-   - `cert.device_pub_key == handshake.identity_pub.0` (device_pub = то чем подписывали)
+   - `cert.device_id.0 == handshake.identity_pub.0` (device_id IS the pubkey)
    - Проверить `cert.signature` на `cert.master_pub_key`
    - Вернуть `master_pub_key` как cluster identity пира
 4. Если ожидается конкретный peer: `received.identity_pub == expected_identity`
@@ -373,7 +374,7 @@ Holder с большим количеством символов проверя�
 
 ### 1.5. Epidemic relay (gossip board)
 
-Epidemic relay — механизм доставки сообщений когда прямое соединение невозможно (peer offline). НЕ используются iroh-blobs или iroh-docs.
+Epidemic relay — механизм доставки сообщений когда прямое соединение невозможно (peer offline).
 
 #### Принцип работы
 
@@ -670,31 +671,27 @@ pub struct StorageWarningMsg {
 
 ---
 
-### 1.8. Escrow (trust-based)
+### 1.8. Escrow (contribution-based)
 
 Escrow контролирует доступ к restore. Цель: блокировать hit-and-run (взять символы, не вернуть взамен) и мотивировать взаимный вклад.
 
 #### Формула
 
 ```
-max_restorable_gb = FREE_TIER_GB + trust × ESCROW_TRUST_FACTOR
+restore_budget_gb = stored_gb_days / k_factor
 
-FREE_TIER_GB         = 1.0     // первый GB бесплатно
-ESCROW_TRUST_FACTOR  = 20.0    // GB на единицу trust (configurable)
+k_factor = DEFAULT_ESCROW_K_FACTOR = 7.0  // дни хранения на 1 GB restore
 ```
 
-Trust вычисляется по формуле: `trust = (KP × P + KI × I) × clamp(S, S_CLAMP_MIN, S_CLAMP_MAX)`
+Пример: хранишь 1 GB 7 дней → зарабатываешь 1 GB restore budget.
 
-Примеры:
-- trust = 0.0 → max 1 GB
-- trust = 1.0 → max 21 GB
-- trust = 2.0 → max 41 GB (trust может превышать 1.0 в PI+S модели)
+`stored_gb_days` рассчитывается как сумма `bytes_we_store_for_peer × days_held` по всем holding записям пира.
 
 #### Проверка
 
 Holder проверяет перед отправкой символов на restore:
 ```
-total_bytes_in_request <= max_restorable_gb × 1024³
+total_bytes_in_request <= restore_budget_gb × 1024³
 ```
 
 Если проверка не проходит — holder отправляет `RestoreDeniedMsg`.
@@ -719,8 +716,8 @@ Personal Cluster = несколько устройств одного владе
 
 Устройство кластера включает `device_cert` в handshake:
 ```
-HandshakeMsg.identity_pub = device_pub_key      (device identity)
-HandshakeMsg.device_cert  = DeviceCertificate   (master_key.sign(device_pub_key))
+HandshakeMsg.identity_pub = DeviceId.0          (device pubkey bytes = device identity)
+HandshakeMsg.device_cert  = DeviceCertificate   (master_key.sign(device_id.0 || issued_at))
 ```
 
 Получив такой handshake, partner извлекает `master_pub_key` из `device_cert` как cluster identity. Все дальнейшие trust/escrow операции ведутся по `master_pub_key`.
@@ -728,9 +725,9 @@ HandshakeMsg.device_cert  = DeviceCertificate   (master_key.sign(device_pub_key)
 #### Device registration
 
 ```
-1. Новое устройство генерирует device_id (random 16 байт)
-2. Вводит seed phrase → derive device_key
-3. Создаёт DeviceCertificate = master_key.sign(device_id || device_pub_key || issued_at)
+1. Новое устройство вводит seed phrase → derive device_key
+2. device_id = DeviceId(device_key.verifying_key().to_bytes())  // 32 bytes Ed25519 pubkey
+3. Создаёт DeviceCertificate = master_key.sign(device_id.0 || issued_at)
 4. Публикует cert через relay board → партнёры принимают устройство как часть identity
 5. Seed стирается из RAM
 6. Синхронизация state (file catalog, placements) через ClusterSync
@@ -862,7 +859,7 @@ BFS-обнаружение для DR и начальной загрузки пи
 // Requester → Peer. "Give me your peer list."
 pub struct PeerDiscoveryRequestMsg { pub v: u8, pub timestamp: Timestamp }
 
-// Peer → Requester. List of known peers with iroh NodeIds.
+// Peer → Requester. List of known peers.
 pub struct PeerDiscoveryResponseMsg {
     pub v: u8,
     pub peers: Vec<DiscoveredPeer>,
@@ -871,7 +868,7 @@ pub struct PeerDiscoveryResponseMsg {
 
 pub struct DiscoveredPeer {
     pub identity_pub: IdentityPub,
-    pub node_id: NodeId,
+    pub addrs: Vec<String>,  // multiaddrs
 }
 ```
 
@@ -907,11 +904,11 @@ pub struct DiscoveredPeer {
 ```
 1. Пользователь вводит seed phrase (24 слова BIP39)
 2. derive_master_key(seed) → master signing key
-3. Генерировать device_id (random 16 bytes) → сохранить в ~/.syncback/device_id
-4. derive_device_key(seed, device_id) → device signing key → сохранить
+3. derive_device_key(seed, device_seed) → device signing key → сохранить
+4. device_id = DeviceId(device_signing_key.verifying_key().to_bytes())  // 32 bytes Ed25519 pubkey
 5. derive_epoch_key(seed, epoch=0) → epoch_key[0] → сохранить
 6. Стереть seed phrase из RAM
-7. issue_device_certificate(master_key, device_id, device_pub_key, now) → сохранить cert
+7. issue_device_certificate(master_key, device_id, now) → сохранить cert
 8. ClusterState::init(db, master_pub, first_device_cert, ...)
 9. PeerAnnounce через relay board: "я существую, мой NodeId = ..."
 10. Bootstrap auto-connect: connect to bootstrap peers → PeerDiscoveryRequest → learn peer list (1-hop)
@@ -980,7 +977,7 @@ syncback dr --mnemonic "24 words" --peer <addr>
 
 1. Derive identity from seed → IdentityPub
 2. Open fresh DB (remove stale db.redb if any)
-3. Start minimal NetworkHandle (iroh endpoint, no Processor)
+3. Start minimal SwarmHandle (libp2p, no Processor)
 4. BFS over peers:
    - Connect to seed --peer addresses
    - Send SystemStateRequest → collect encrypted DB snapshots
@@ -1093,13 +1090,12 @@ Threat model: "lazy not malicious". Для активного противник
 | `OWNER_DELETE_COOLDOWN_SECS` | 2_419_200 (4 нед.) | Owner cooldown перед delete |
 | `HOLDER_DELETE_COOLDOWN_SECS` | 2_419_200 (4 нед.) | Holder cooldown после delete |
 | `DROP_NOTICE_WINDOW_SECS` | 604_800 (7 дней) | Advance notice перед drop |
-| `FREE_TIER_GB` | 1.0 | GB restore при trust=0 |
-| `DEFAULT_ESCROW_TRUST_FACTOR` | 20.0 | GB на единицу trust |
+| `DEFAULT_ESCROW_K_FACTOR` | 7.0 | Дней хранения на 1 GB restore |
 | `MAX_RELAY_HOP` | 2 | Максимум хопов в relay |
 | `RELAY_TTL_SECS` | 604_800 (7 дней) | TTL relay записей |
 | `MAX_BOARD_ENTRIES` | 2000 | Записей на relay board |
 | `MAX_BOARD_SIZE_BYTES` | 8 МБ | Размер relay board |
-| `MAX_MESSAGE_SIZE` | 64 МБ | Максимальный фрейм |
+| `MAX_MESSAGE_SIZE` | 128 МБ | Максимальный фрейм |
 | `PROTOCOL_VERSION` | 1 | Версия протокола |
 | `ALPN` | `b"syncback/1"` | ALPN идентификатор |
 | `SYSTEM_STATE_TTL_SECS` | 31_536_000 (365 дней) | TTL stored system state blobs |
@@ -1134,9 +1130,9 @@ WARM (redb):
                       binding_seed, status, last_verified, placed_at, consecutive_misses }
   HoldingRecord { source_block_id, owner_id, esi_ranges, importance, total_bytes,
                   status, received_at, delete_requested_at, drop_notice_sent_at }
-  PeerRecord    { identity, node_id, trust_p, trust_i, trust_s,
+  PeerRecord    { identity, trust_p, trust_i, trust_s,
                   bytes_we_store_for_peer, bytes_peer_stores_for_us,
-                  first_seen, last_seen, weeks_in_network, device_id, revoked_device_pub_keys }
+                  first_seen, last_seen, device_id, revoked_device_pub_keys, addrs, x25519_pub }
   BudgetRecord  { estimated_gb, last_calculated, placement_success_rate, weekly_stats }
   EventLog (append-only): Vec<(seq: u64, EventEntry)>
   Indices: file→holders, holder→files (двойной индекс)

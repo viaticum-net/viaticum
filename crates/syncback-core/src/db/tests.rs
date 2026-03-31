@@ -1,5 +1,6 @@
 use crate::db::testutil::{test_db, test_peer, test_peers};
 use crate::db::{SystemStateBlobRecord, WeeklyPosEntry};
+use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
 use crate::types::{
     BudgetRecord, DeviceId, EventEntry, Event, FileId, FileRecord,
     HoldingRecord, HoldingStatus, IdentityPub, LocalState, PlacementStatus, PeerRecord,
@@ -20,7 +21,7 @@ fn make_file_record(path: &str, file_id: u64) -> FileRecord {
         file_id: FileId(file_id),
         path: path.to_string(),
         importance: 0.5,
-        devices: vec![(DeviceId([0u8; 16]), LocalState::Present)],
+        devices: vec![(DeviceId([0u8; 32]), LocalState::Present)],
         versions: vec![],
         first_seen: Timestamp(1000),
     }
@@ -42,7 +43,7 @@ fn make_source_block(seed: u8, status: SourceBlockStatus) -> SourceBlockRecord {
 
 fn make_placement(
     block_seed: u8,
-    holder: IdentityPub,
+    holder: DeviceId,
     file_id: FileId,
     status: PlacementStatus,
     count: u32,
@@ -79,10 +80,10 @@ fn make_holding(
     }
 }
 
-fn make_peer(identity: IdentityPub) -> PeerRecord {
+fn make_peer(device_id: DeviceId) -> PeerRecord {
     PeerRecord {
-        identity,
-        node_id: None,
+        device_id,
+        master_identity: IdentityPub([0xAAu8; 32]),
         trust_p: 0.5,
         trust_i: 0.5,
         trust_s: 1.0,
@@ -90,7 +91,6 @@ fn make_peer(identity: IdentityPub) -> PeerRecord {
         bytes_peer_stores_for_us: 0,
         first_seen: Timestamp(1000),
         last_seen: Timestamp(2000),
-        device_id: None,
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
@@ -100,7 +100,7 @@ fn make_peer(identity: IdentityPub) -> PeerRecord {
 fn make_event(n: u8) -> EventEntry {
     EventEntry {
         timestamp: Timestamp(n as u64 * 100),
-        device_id: DeviceId([n; 16]),
+        device_id: DeviceId([n; 32]),
         event: Event::EpochRotated { epoch: n as u32 },
     }
 }
@@ -228,7 +228,7 @@ fn placement_delete_cleans_hot_cache() {
 #[test]
 fn double_index_consistency() {
     let db = test_db();
-    let holder = IdentityPub([9u8; 32]);
+    let holder = DeviceId([9u8; 32]);
     let fid = FileId(7);
     let p = make_placement(3, holder, fid, PlacementStatus::Alive, 50);
 
@@ -256,7 +256,7 @@ fn double_index_consistency() {
 #[test]
 fn holder_files_scan_on_holder_departure() {
     let db = test_db();
-    let holder = IdentityPub([5u8; 32]);
+    let holder = DeviceId([5u8; 32]);
 
     // Place holder on 3 different files
     for i in 0..3u8 {
@@ -318,7 +318,7 @@ fn event_log_sequence_monotonic() {
 #[test]
 fn holding_crud() {
     let db = test_db();
-    let owner = test_peer();
+    let owner = IdentityPub([1u8; 32]);
     let h = make_holding(1, owner, HoldingStatus::Active, 4096);
 
     db.upsert_holding(&h).unwrap();
@@ -376,18 +376,18 @@ fn holding_cooldown_expired() {
 #[test]
 fn peer_crud() {
     let db = test_db();
-    let identity = test_peer();
-    let p = make_peer(identity);
+    let device_id = test_peer();
+    let p = make_peer(device_id);
 
     db.upsert_peer(&p).unwrap();
-    let got = db.get_peer(&identity).unwrap().unwrap();
-    assert_eq!(got.identity, identity);
+    let got = db.get_peer(&device_id).unwrap().unwrap();
+    assert_eq!(got.device_id, device_id);
     assert_eq!(got.trust_p, 0.5);
 
     assert_eq!(db.list_all_peers().unwrap().len(), 1);
 
-    db.delete_peer(&identity).unwrap();
-    assert!(db.get_peer(&identity).unwrap().is_none());
+    db.delete_peer(&device_id).unwrap();
+    assert!(db.get_peer(&device_id).unwrap().is_none());
 }
 
 // ============================================================
@@ -736,7 +736,7 @@ fn uncertain_in_rebuilt_hot_cache() {
 #[test]
 fn list_placements_for_holder_returns_all_blocks_for_holder() {
     let db = test_db();
-    let holder = IdentityPub([0xAAu8; 32]);
+    let holder = DeviceId([0xAAu8; 32]);
     let fid = FileId(20);
 
     // Place holder on 3 different blocks
@@ -755,7 +755,7 @@ fn list_placements_for_holder_returns_all_blocks_for_holder() {
 #[test]
 fn list_placements_for_holder_returns_empty_when_no_placements() {
     let db = test_db();
-    let holder = IdentityPub([0xBBu8; 32]);
+    let holder = DeviceId([0xBBu8; 32]);
     let placements = db.list_placements_for_holder(&holder).unwrap();
     assert!(placements.is_empty());
 }
@@ -763,8 +763,8 @@ fn list_placements_for_holder_returns_empty_when_no_placements() {
 #[test]
 fn list_placements_for_holder_does_not_return_other_holders() {
     let db = test_db();
-    let holder_a = IdentityPub([0x01u8; 32]);
-    let holder_b = IdentityPub([0x02u8; 32]);
+    let holder_a = DeviceId([0x01u8; 32]);
+    let holder_b = DeviceId([0x02u8; 32]);
     let fid = FileId(30);
 
     db.upsert_placement(&make_placement(20, holder_a, fid, PlacementStatus::Alive, 10)).unwrap();
@@ -936,9 +936,8 @@ fn table_stats_counts_rows() {
 
     // Insert a peer and check count increments.
     let peer = PeerRecord {
-        identity: test_peer(),
-        node_id: Some(crate::types::NodeId([0u8; 32])),
-        device_id: Some(DeviceId([0u8; 16])),
+        device_id: DeviceId([0u8; 32]),
+        master_identity: IdentityPub([0u8; 32]),
         trust_p: 0.0, trust_i: 0.0, trust_s: 0.0,
         bytes_we_store_for_peer: 0, bytes_peer_stores_for_us: 0,
         first_seen: Timestamp(0), last_seen: Timestamp(0),
@@ -960,8 +959,8 @@ fn placement_upsert_updates_holder_indexes() {
     // list_files_for_holder return the correct entries.
     let db = test_db();
 
-    let holder_a = IdentityPub([0xAAu8; 32]);
-    let holder_b = IdentityPub([0xBBu8; 32]);
+    let holder_a = DeviceId([0xAAu8; 32]);
+    let holder_b = DeviceId([0xBBu8; 32]);
     let file_id_1 = FileId(1001);
     let file_id_2 = FileId(1002);
 
@@ -1021,10 +1020,13 @@ fn placement_upsert_updates_holder_indexes() {
 #[test]
 fn refresh_peer_storage_bytes_updates_trust_s() {
     let db = test_db();
-    let peer = IdentityPub([0xA1u8; 32]);
+    let device = DeviceId([0xA1u8; 32]);
+    let master = IdentityPub([0xA1u8; 32]); // master identity for this device
 
-    // Insert peer with default trust_s = 1.0.
-    db.upsert_peer(&make_peer(peer)).unwrap();
+    // Insert peer record keyed by DeviceId.
+    db.upsert_peer(&make_peer(device)).unwrap();
+    // Register device → master mapping so refresh can look up holdings by master.
+    db.set_master_for_device(&device, &master).unwrap();
 
     // ── Set up: peer holds 10 symbols of our data (owner view) ──────────────
     // Source block t=1000 → bytes = 10 * 1000 = 10_000.
@@ -1044,7 +1046,7 @@ fn refresh_peer_storage_bytes_updates_trust_s() {
 
     let placement = SymbolPlacement {
         source_block_id: block_id_a,
-        holder_id: peer,
+        holder_id: device,
         file_id: FileId(1),
         esi_ranges: vec![(0, 10)], // 10 symbols
         binding_seed: [0u8; 32],
@@ -1055,10 +1057,11 @@ fn refresh_peer_storage_bytes_updates_trust_s() {
     };
     db.upsert_placement(&placement).unwrap();
 
-    // ── Set up: we store 5000 bytes for the peer (holder view) ───────────────
+    // ── Set up: we store 5000 bytes for the peer's master (holder view) ──────
+    // Holdings are keyed by master IdentityPub (economic unit).
     let holding = HoldingRecord {
         source_block_id: SourceBlockId([0xB0u8; 32]),
-        owner_id: peer,
+        owner_id: master,
         esi_ranges: vec![(0, 5)],
         importance: 0.5,
         total_bytes: 5000,
@@ -1070,9 +1073,9 @@ fn refresh_peer_storage_bytes_updates_trust_s() {
     db.upsert_holding(&holding).unwrap();
 
     // ── Refresh and verify ────────────────────────────────────────────────────
-    db.refresh_peer_storage_bytes(&peer).unwrap();
+    db.refresh_peer_storage_bytes(&device).unwrap();
 
-    let updated = db.get_peer(&peer).unwrap().unwrap();
+    let updated = db.get_peer(&device).unwrap().unwrap();
     assert_eq!(updated.bytes_we_store_for_peer, 5000, "should equal holding.total_bytes");
     assert_eq!(updated.bytes_peer_stores_for_us, 10_000, "should equal 10 symbols * t=1000");
     // trust_s = 10_000 / 5_000 = 2.0
@@ -1089,8 +1092,10 @@ fn refresh_peer_storage_bytes_updates_trust_s() {
 #[test]
 fn refresh_peer_storage_bytes_neutral_when_we_store_nothing() {
     let db = test_db();
-    let peer = IdentityPub([0xA2u8; 32]);
-    db.upsert_peer(&make_peer(peer)).unwrap();
+    let device = DeviceId([0xA2u8; 32]);
+    let master = IdentityPub([0xA2u8; 32]);
+    db.upsert_peer(&make_peer(device)).unwrap();
+    db.set_master_for_device(&device, &master).unwrap();
 
     // Peer holds 5 symbols of ours (Alive).
     let block_id_b = SourceBlockId([0xC0u8; 32]);
@@ -1108,7 +1113,7 @@ fn refresh_peer_storage_bytes_neutral_when_we_store_nothing() {
     db.upsert_source_block(&sb).unwrap();
     let p = SymbolPlacement {
         source_block_id: block_id_b,
-        holder_id: peer,
+        holder_id: device,
         file_id: FileId(2),
         esi_ranges: vec![(0, 5)],
         binding_seed: [0u8; 32],
@@ -1119,10 +1124,10 @@ fn refresh_peer_storage_bytes_neutral_when_we_store_nothing() {
     };
     db.upsert_placement(&p).unwrap();
 
-    // No holdings for this peer (bytes_we_store = 0).
-    db.refresh_peer_storage_bytes(&peer).unwrap();
+    // No holdings for this master (bytes_we_store = 0).
+    db.refresh_peer_storage_bytes(&device).unwrap();
 
-    let updated = db.get_peer(&peer).unwrap().unwrap();
+    let updated = db.get_peer(&device).unwrap().unwrap();
     assert_eq!(updated.bytes_we_store_for_peer, 0);
     assert_eq!(updated.bytes_peer_stores_for_us, 10_000); // 5 * 2000
     // trust_s must be 1.0 when we_store == 0 (avoid division by zero).
@@ -1138,8 +1143,10 @@ fn refresh_peer_storage_bytes_neutral_when_we_store_nothing() {
 #[test]
 fn refresh_peer_storage_bytes_only_alive_and_active_count() {
     let db = test_db();
-    let peer = IdentityPub([0xA3u8; 32]);
-    db.upsert_peer(&make_peer(peer)).unwrap();
+    let device = DeviceId([0xA3u8; 32]);
+    let master = IdentityPub([0xA3u8; 32]);
+    db.upsert_peer(&make_peer(device)).unwrap();
+    db.set_master_for_device(&device, &master).unwrap();
 
     // Source block for placements.
     let block_id_c = SourceBlockId([0xD0u8; 32]);
@@ -1159,7 +1166,7 @@ fn refresh_peer_storage_bytes_only_alive_and_active_count() {
     // One Lost placement — must NOT count.
     let lost = SymbolPlacement {
         source_block_id: block_id_c,
-        holder_id: peer,
+        holder_id: device,
         file_id: FileId(3),
         esi_ranges: vec![(0, 10)],
         binding_seed: [0u8; 32],
@@ -1173,7 +1180,7 @@ fn refresh_peer_storage_bytes_only_alive_and_active_count() {
     // One MarkedForDelete holding — must NOT count.
     let mfd_holding = HoldingRecord {
         source_block_id: SourceBlockId([0xE0u8; 32]),
-        owner_id: peer,
+        owner_id: master,
         esi_ranges: vec![(0, 5)],
         importance: 0.5,
         total_bytes: 9999,
@@ -1184,9 +1191,9 @@ fn refresh_peer_storage_bytes_only_alive_and_active_count() {
     };
     db.upsert_holding(&mfd_holding).unwrap();
 
-    db.refresh_peer_storage_bytes(&peer).unwrap();
+    db.refresh_peer_storage_bytes(&device).unwrap();
 
-    let updated = db.get_peer(&peer).unwrap().unwrap();
+    let updated = db.get_peer(&device).unwrap().unwrap();
     assert_eq!(updated.bytes_we_store_for_peer, 0, "MarkedForDelete holdings must not count");
     assert_eq!(updated.bytes_peer_stores_for_us, 0, "Lost placements must not count");
     assert!((updated.trust_s - 1.0).abs() < 1e-9, "trust_s must be 1.0 when both counts are 0");
@@ -1196,7 +1203,7 @@ fn refresh_peer_storage_bytes_only_alive_and_active_count() {
 #[test]
 fn refresh_peer_storage_bytes_noop_for_unknown_peer() {
     let db = test_db();
-    let unknown = IdentityPub([0xFFu8; 32]);
+    let unknown = DeviceId([0xFFu8; 32]);
     // Must not panic or return an error.
     db.refresh_peer_storage_bytes(&unknown).unwrap();
     assert!(db.get_peer(&unknown).unwrap().is_none());
@@ -1220,8 +1227,8 @@ fn max_esi_for_block_no_placements_returns_zero() {
 fn max_esi_for_block_returns_high_watermark() {
     let db = test_db();
     let bid = block_id(0xBB);
-    let peer_a = IdentityPub([1u8; 32]);
-    let peer_b = IdentityPub([2u8; 32]);
+    let peer_a = DeviceId([1u8; 32]);
+    let peer_b = DeviceId([2u8; 32]);
     let fid = FileId(1);
 
     // Placement A: ESI range (0, 100) → high = 100
@@ -1262,7 +1269,7 @@ fn max_esi_for_block_returns_high_watermark() {
 fn max_esi_for_block_multiple_ranges_in_one_placement() {
     let db = test_db();
     let bid = block_id(0xCC);
-    let peer = IdentityPub([3u8; 32]);
+    let peer = DeviceId([3u8; 32]);
     let fid = FileId(2);
 
     // Placement with two non-contiguous ranges: (0, 30) and (500, 20) → high = 520
@@ -1450,4 +1457,85 @@ fn record_restore_served_saturates_at_u64_max() {
 
     let result = db.restored_total_bytes(&owner).unwrap();
     assert_eq!(result, u64::MAX, "saturating_add should cap at u64::MAX");
+}
+
+// ─── Two-level trust DB ──────────────────────────────────────────────────────
+
+#[test]
+fn db_device_trust_roundtrip() {
+    let db = test_db();
+    let device_id = DeviceId([0xAA; 32]);
+    let record = DeviceTrustRecord {
+        device_id,
+        trust_p: 0.8,
+        trust_i: 0.6,
+        last_week: 42,
+    };
+
+    db.set_device_trust(&record).unwrap();
+    let result = db.get_device_trust(&device_id).unwrap().expect("should be present");
+
+    assert_eq!(result.device_id, record.device_id);
+    assert!((result.trust_p - record.trust_p).abs() < 1e-10);
+    assert!((result.trust_i - record.trust_i).abs() < 1e-10);
+    assert_eq!(result.last_week, record.last_week);
+}
+
+#[test]
+fn db_master_trust_roundtrip() {
+    let db = test_db();
+    let identity = IdentityPub([0xBB; 32]);
+    let record = MasterTrustRecord {
+        identity,
+        combined: 1.5,
+        last_updated: Timestamp(9_999_999),
+    };
+
+    db.set_master_trust(&record).unwrap();
+    let result = db.get_master_trust(&identity).unwrap().expect("should be present");
+
+    assert_eq!(result.identity, record.identity);
+    assert!((result.combined - record.combined).abs() < 1e-10);
+    assert_eq!(result.last_updated, record.last_updated);
+}
+
+#[test]
+fn db_device_to_master_mapping() {
+    let db = test_db();
+    let device = DeviceId([0x11; 32]);
+    let master = IdentityPub([0x22; 32]);
+
+    db.set_master_for_device(&device, &master).unwrap();
+    let result = db.get_master_for_device(&device).unwrap().expect("should be present");
+
+    assert_eq!(result, master);
+}
+
+#[test]
+fn db_get_devices_for_master_returns_all() {
+    let db = test_db();
+    let master = IdentityPub([0xFF; 32]);
+    let device_a = DeviceId([0x01; 32]);
+    let device_b = DeviceId([0x02; 32]);
+    let device_c = DeviceId([0x03; 32]);
+
+    db.set_master_for_device(&device_a, &master).unwrap();
+    db.set_master_for_device(&device_b, &master).unwrap();
+    db.set_master_for_device(&device_c, &master).unwrap();
+
+    let mut devices = db.get_devices_for_master(&master).unwrap();
+    devices.sort_by_key(|d| d.0);
+
+    assert_eq!(devices.len(), 3);
+    assert!(devices.contains(&device_a));
+    assert!(devices.contains(&device_b));
+    assert!(devices.contains(&device_c));
+}
+
+#[test]
+fn db_get_device_trust_absent_returns_none() {
+    let db = test_db();
+    let unknown = DeviceId([0x99; 32]);
+    let result = db.get_device_trust(&unknown).unwrap();
+    assert!(result.is_none(), "should return None for unknown device");
 }

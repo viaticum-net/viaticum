@@ -9,8 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use syncback_core::cluster::{derive_device_key, derive_epoch_key, derive_iroh_key, derive_master_key, master_identity, EpochCounter};
-use syncback_core::types::DeviceId;
+use syncback_core::cluster::{derive_device_key, derive_epoch_key, derive_master_key, master_identity, EpochCounter};
 
 #[cfg(test)]
 mod tests;
@@ -33,8 +32,12 @@ pub struct IdentityKeyFile {
     pub seed: Vec<u8>,
     /// master_identity(derive_master_key(&seed)).0 — Ed25519 verifying key.
     pub identity_pub: [u8; 32],
-    /// Random 16-byte device identifier, stable per installation.
-    pub device_id: [u8; 16],
+    /// Random 32-byte device seed. Used to derive device signing key.
+    /// device_id = derive_device_key(seed, device_seed).verifying_key().to_bytes()
+    pub device_seed: [u8; 32],
+    /// Ed25519 public key of the device signing key. 32 bytes.
+    /// Equals derive_device_key(seed, device_seed).verifying_key().to_bytes().
+    pub device_id: [u8; 32],
     /// Unix timestamp of when init was run.
     pub created_at: u64,
 }
@@ -82,7 +85,7 @@ pub fn init_identity(data_dir: &Path) -> Result<IdentityKeyFile, IdentityError> 
 ///
 /// Uses the same BIP39 mnemonic as the existing cluster, so `identity_pub` matches.
 /// Generates a fresh random `device_id`, giving this device its own unique device key
-/// and iroh NodeId. Writes `<data_dir>/identity.key` (mode 0600).
+/// and libp2p PeerId. Writes `<data_dir>/identity.key` (mode 0600).
 ///
 /// Returns `IdentityError::AlreadyInitialized` if identity.key already exists.
 /// Returns `IdentityError::InvalidMnemonic` if mnemonic is not valid 24-word BIP39.
@@ -137,26 +140,24 @@ pub fn load_identity(data_dir: &Path) -> Result<IdentityKeyFile, IdentityError> 
     ciborium::de::from_reader(bytes.as_slice()).map_err(|e| IdentityError::Cbor(e.to_string()))
 }
 
-/// Derive the four active keys from a loaded keyfile for a given epoch.
+/// Derive the three active keys from a loaded keyfile for a given epoch.
 ///
 /// Returns:
 ///   - `master_signing_key` — Ed25519 signing key for the master identity
 ///   - `device_signing_key` — Ed25519 signing key for this device
 ///   - `epoch_key_bytes`    — 32-byte ChaCha20 symmetric key for `epoch`
-///   - `iroh_key_bytes`     — 32-byte raw bytes for `iroh::SecretKey`
+///   (iroh_key_bytes removed — iroh is gone in epsilon)
 pub fn derive_keys(
     keyfile: &IdentityKeyFile,
     epoch: u32,
-) -> Result<(ed25519_dalek::SigningKey, ed25519_dalek::SigningKey, [u8; 32], [u8; 32]), IdentityError> {
+) -> Result<(ed25519_dalek::SigningKey, ed25519_dalek::SigningKey, [u8; 32]), IdentityError> {
     let master_key = derive_master_key(&keyfile.seed)
         .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
-    let device_key = derive_device_key(&keyfile.seed, &DeviceId(keyfile.device_id))
+    let device_key = derive_device_key(&keyfile.seed, &keyfile.device_seed)
         .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
     let epoch_key = derive_epoch_key(&keyfile.seed, EpochCounter(epoch))
         .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
-    let iroh_key_bytes = derive_iroh_key(&keyfile.seed, &DeviceId(keyfile.device_id))
-        .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
-    Ok((master_key, device_key, epoch_key.key_bytes, iroh_key_bytes))
+    Ok((master_key, device_key, epoch_key.key_bytes))
 }
 
 // ============================================================
@@ -193,18 +194,23 @@ fn create_keyfile(
         .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
     let identity_pub = master_identity(&master_key).0;
 
-    // Device ID: deterministic from seed for DR restore, random for fresh init.
-    let device_id: [u8; 16] = if deterministic_device_id {
+    // device_seed: deterministic from seed for DR restore, random for fresh init.
+    // device_id = derive_device_key(seed, device_seed).verifying_key().to_bytes()
+    let device_seed: [u8; 32] = if deterministic_device_id {
         use hkdf::Hkdf;
         use sha2::Sha256;
         let hkdf = Hkdf::<Sha256>::new(None, &seed);
-        let mut id = [0u8; 16];
-        hkdf.expand(b"syncback-device-id-v1", &mut id)
+        let mut seed_out = [0u8; 32];
+        hkdf.expand(b"syncback-device-seed-v1", &mut seed_out)
             .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
-        id
+        seed_out
     } else {
         rand::random()
     };
+
+    let device_key = derive_device_key(&seed, &device_seed)
+        .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
+    let device_id: [u8; 32] = device_key.verifying_key().to_bytes();
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -215,6 +221,7 @@ fn create_keyfile(
         mnemonic: mnemonic.to_string(),
         seed,
         identity_pub,
+        device_seed,
         device_id,
         created_at,
     };

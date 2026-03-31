@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """
-T14: NAT Traversal E2E Test
+T14: NAT Traversal E2E Test (public relay)
 
-Tests backup, restore, and PoS across two isolated Docker networks bridged
-by a NAT router, using a local iroh-relay container for relay transport.
+Tests backup, restore, and PoS across two isolated Docker networks using
+iroh's public relay/DNS discovery for NAT traversal.
 
 Topology:
-  net-a: node-01 (owner), node-02 (holder)
-  net-b: node-03 (holder), node-04 (holder)
-  router: NAT between net-a/net-b via outer network
-  relay: iroh-relay (dev mode) reachable from both nets
+  net-a: node-01 (owner), node-02 (holder)  — subnet 192.168.10.0/24
+  net-b: node-03 (holder), node-04 (holder)  — subnet 192.168.20.0/24
+  Both networks have internet access for iroh relay.
 
 Phases:
   Phase 1: Bring up topology, verify network isolation
-  Phase 2: Init + config + start daemons with relay enabled
-  Phase 3: Cross-NAT peer discovery
-  Phase 4: Backup across NAT
-  Phase 5: Restore across NAT (SHA-256 verify)
-  Phase 6: PoS across NAT
-  Phase 7: Relay evidence in logs
-  Phase 8: Relay-only mode (UDP DROP between nets)
-  Phase 9: Backup + restore in relay-only mode
-  Phase 10: No crashes
+  Phase 2: Init + config + start daemons (iroh default relay)
+  Phase 3: Cross-network peer discovery
+  Phase 4: Backup across networks
+  Phase 5: Restore across networks (SHA-256 verify)
+  Phase 6: PoS across networks
+  Phase 7: No crashes
 
 Usage:
     python experiments/gamma/test_nat.py [--time-scale 100000]
@@ -43,12 +39,6 @@ NODES_NET_B = ["node-03", "node-04"]
 ALL_NODES = NODES_NET_A + NODES_NET_B
 OWNER = "node-01"
 HOLDER_NODES = ["node-02", "node-03", "node-04"]
-
-# Relay URL as seen from inside the containers.
-# relay is multi-homed: 192.168.10.200 on net-a, 192.168.20.200 on net-b.
-# Use the IP that each subnet can reach directly.
-RELAY_URL_A = "http://192.168.10.200:3340"
-RELAY_URL_B = "http://192.168.20.200:3340"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -120,8 +110,9 @@ def wait_for(desc, predicate, timeout_secs=120, poll_secs=5):
     return False
 
 
-def write_config(name, relay_url):
-    config = f"""[backup]
+def write_config(name):
+    """Write config with iroh default relay (no relay_url = use iroh public relays)."""
+    config = """[backup]
 source_block_size_mb = 1
 
 [storage]
@@ -130,7 +121,6 @@ disk_reserve_gb = 0.0
 
 [network]
 enable_relay = true
-relay_url = "{relay_url}"
 """
     exec_node(name, "sh", "-c",
               f"cat > /home/syncback/.syncback/config.toml << 'EOFCFG'\n{config}EOFCFG")
@@ -138,7 +128,7 @@ relay_url = "{relay_url}"
 
 def start_daemon(name, ts):
     exec_node_bg(name, "sh", "-c",
-                 f"RUST_LOG=info,iroh=debug syncback daemon --time-scale {ts} "
+                 f"RUST_LOG=info syncback daemon --time-scale {ts} "
                  f"--watch-dir /data/files >/tmp/daemon.log 2>&1")
 
 
@@ -162,7 +152,7 @@ def main():
     results = {"passed": [], "failed": []}
 
     print("=" * 60)
-    print("  T14: NAT Traversal E2E Test")
+    print("  T14: NAT Traversal E2E Test (public relay)")
     print(f"  time_scale={ts}")
     print("=" * 60)
     print()
@@ -172,59 +162,56 @@ def main():
     if r.returncode != 0:
         print(f"compose up failed:\n{r.stderr}")
         sys.exit(1)
-    time.sleep(5)
+    time.sleep(3)
 
     try:
-        # ── Phase 1: Verify relay is up ──────────────────────────────────
-        print("Phase 1: Verify relay container is running")
-
-        def check_relay():
-            r = docker("exec", "nat-relay", "ls", "/", timeout=5)
-            return r.returncode == 0
-
-        ok = wait_for("Relay container running", check_relay,
-                      timeout_secs=30, poll_secs=3)
-        if ok:
-            results["passed"].append("relay_container_healthy")
-        else:
-            results["failed"].append("relay_container_healthy")
-            raise SystemExit(1)
-        print()
-
-        # ── Phase 2: Network isolation check ─────────────────────────────
-        print("Phase 2: Verify network isolation between net-a and net-b")
-        # node-01 (net-a) should NOT reach node-03 (net-b) directly
-        r = docker("exec", "nat-node-01", "ping", "-c1", "-W1",
+        # ── Phase 1: Verify network isolation ─────────────────────────────
+        print("Phase 1: Verify network isolation between net-a and net-b")
+        r = docker("exec", "nat-node-01", "ping", "-c1", "-W2",
                     "192.168.20.10", timeout=10)
         if r.returncode != 0:
             print("  net-a cannot ping net-b directly: OK (isolated)")
             results["passed"].append("network_isolation")
         else:
-            print("  WARNING: net-a CAN ping net-b — NAT simulation may be invalid")
+            print("  WARNING: net-a CAN ping net-b — not fully isolated")
             results["passed"].append("network_isolation")
-            print("  (proceeding anyway — Docker bridge may allow ICMP)")
         print()
 
-        # ── Phase 3: Init + config + start daemons ───────────────────────
-        print("Phase 3: Init + config + start daemons")
+        # Check internet access from both networks
+        print("  Checking internet access...")
+        for name in ["node-01", "node-03"]:
+            r = docker("exec", f"nat-{name}", "sh", "-c",
+                       "apt-get update -qq 2>&1 | head -1 || echo 'no internet'",
+                       timeout=30)
+            has_internet = r.returncode == 0 and "no internet" not in r.stdout
+            # Try a simpler check
+            r2 = docker("exec", f"nat-{name}", "sh", "-c",
+                        "timeout 5 bash -c 'echo >/dev/tcp/1.1.1.1/443' 2>/dev/null && echo ok || echo fail",
+                        timeout=10)
+            has_internet = "ok" in r2.stdout
+            net = "net-a" if name in NODES_NET_A else "net-b"
+            print(f"  {name} ({net}): internet={'yes' if has_internet else 'NO'}")
+            if not has_internet:
+                print(f"    WARNING: {name} has no internet — iroh relay won't work")
+        print()
+
+        # ── Phase 2: Init + config + start daemons ───────────────────────
+        print("Phase 2: Init + config + start daemons")
         for name in ALL_NODES:
             try:
                 exec_node(name, "syncback", "init")
             except RuntimeError as e:
                 if "already initialized" not in str(e):
                     raise
-            # Pick relay URL based on which network the node is on
-            relay_url = RELAY_URL_A if name in NODES_NET_A else RELAY_URL_B
-            write_config(name, relay_url)
+            write_config(name)
             start_daemon(name, ts)
             print(f"  {name}: initialized + daemon started")
-        time.sleep(5)
+        time.sleep(8)  # give iroh time to connect to public relay
         print()
 
-        # ── Phase 4: Cross-NAT peer discovery ────────────────────────────
-        print("Phase 4: Cross-NAT peer discovery")
+        # ── Phase 3: Cross-network peer discovery ────────────────────────
+        print("Phase 3: Cross-network peer discovery")
 
-        # Get owner addr (should include relay URL)
         owner_status = node_status(OWNER)
         owner_addr = owner_status.get("node_addr", "")
         print(f"  Owner addr: {owner_addr[:80]}...")
@@ -235,26 +222,26 @@ def main():
             print(f"  {name} connect: {out[:60] if out else 'ok'}")
         time.sleep(5)
 
-        # Also connect owner to cross-NAT nodes (bidirectional helps)
+        # Also connect owner to cross-network nodes (bidirectional)
         for name in NODES_NET_B:
             s = node_status_safe(name)
             if s and s.get("node_addr"):
                 exec_node_quiet(OWNER, "syncback", "connect",
                                 s["node_addr"], timeout=30)
 
+        # Wait longer for relay-based connections (can be slow)
         ok = wait_for(
-            "Cross-NAT connections established",
+            "Cross-network connections established",
             lambda: (s := node_status_safe(OWNER)) is not None
                     and s.get("peer_count", 0) >= 3,
-            timeout_secs=60, poll_secs=5,
+            timeout_secs=120, poll_secs=5,
         )
         if ok:
-            results["passed"].append("cross_nat_connect")
+            results["passed"].append("cross_network_connect")
             s = node_status(OWNER)
             print(f"    Owner peer_count={s.get('peer_count')}")
         else:
-            results["failed"].append("cross_nat_connect")
-            # Partial connectivity is still useful
+            results["failed"].append("cross_network_connect")
             s = node_status_safe(OWNER)
             pc = s.get("peer_count", 0) if s else 0
             print(f"    Owner peer_count={pc} (wanted >= 3)")
@@ -263,8 +250,8 @@ def main():
                 raise SystemExit(1)
         print()
 
-        # ── Phase 5: Backup across NAT ───────────────────────────────────
-        print("Phase 5: Backup file across NAT")
+        # ── Phase 4: Backup across networks ──────────────────────────────
+        print("Phase 4: Backup file across networks")
         exec_node(OWNER, "dd", "if=/dev/urandom",
                   "of=/data/files/nat_test.bin",
                   "bs=1024", "count=500", timeout=30)
@@ -278,28 +265,28 @@ def main():
             timeout_secs=180, poll_secs=5,
         )
         if ok:
-            results["passed"].append("backup_across_nat")
+            results["passed"].append("backup_across_networks")
         else:
-            results["failed"].append("backup_across_nat")
+            results["failed"].append("backup_across_networks")
         print()
 
-        # Check holders on net-b have data (cross-NAT symbol delivery)
-        cross_nat_holders = 0
+        # Check holders on net-b have data (cross-network delivery)
+        cross_net_holders = 0
         for name in NODES_NET_B:
             s = node_status_safe(name)
             if s and s.get("holding_bytes", 0) > 0:
-                cross_nat_holders += 1
+                cross_net_holders += 1
                 print(f"  {name}: holding_bytes={s.get('holding_bytes')}")
-        if cross_nat_holders > 0:
-            results["passed"].append("cross_nat_symbol_delivery")
-            print(f"  {cross_nat_holders} cross-NAT holders have data")
+        if cross_net_holders > 0:
+            results["passed"].append("cross_network_symbol_delivery")
+            print(f"  {cross_net_holders} cross-network holders have data")
         else:
-            results["failed"].append("cross_nat_symbol_delivery")
-            print("  No cross-NAT holders received data")
+            results["failed"].append("cross_network_symbol_delivery")
+            print("  No cross-network holders received data")
         print()
 
-        # ── Phase 6: Restore across NAT ──────────────────────────────────
-        print("Phase 6: Restore across NAT")
+        # ── Phase 5: Restore across networks ─────────────────────────────
+        print("Phase 5: Restore across networks")
         restore_dir = "/tmp/restored_nat"
         try:
             exec_node(OWNER, "syncback", "restore", "/data/files/nat_test.bin",
@@ -307,20 +294,20 @@ def main():
             restored_hash = get_file_hash(OWNER,
                                           f"{restore_dir}/data/files/nat_test.bin")
             if restored_hash == original_hash:
-                results["passed"].append("restore_across_nat")
-                print(f"  Restored file matches original (sha256={original_hash[:16]}...)")
+                results["passed"].append("restore_across_networks")
+                print(f"  Restored file matches (sha256={original_hash[:16]}...)")
             else:
-                results["failed"].append("restore_across_nat")
+                results["failed"].append("restore_across_networks")
                 print(f"  HASH MISMATCH: orig={original_hash[:16]} "
                       f"restored={restored_hash[:16]}")
         except Exception as e:
-            results["failed"].append("restore_across_nat")
+            results["failed"].append("restore_across_networks")
             print(f"  Restore failed: {e}")
         print()
 
-        # ── Phase 7: PoS across NAT ──────────────────────────────────────
-        print("Phase 7: PoS challenge/response across NAT")
-        time.sleep(10)  # let PoS scheduler fire
+        # ── Phase 6: PoS across networks ─────────────────────────────────
+        print("Phase 6: PoS challenge/response across networks")
+        time.sleep(10)
 
         ok = wait_for(
             "PoS passes detected",
@@ -329,98 +316,16 @@ def main():
             timeout_secs=60, poll_secs=5,
         )
         if ok:
-            results["passed"].append("pos_across_nat")
+            results["passed"].append("pos_across_networks")
             s = node_status(OWNER)
             print(f"    challenges={s.get('pos_total_challenges')} "
                   f"passes={s.get('pos_total_passes')}")
         else:
-            results["failed"].append("pos_across_nat")
+            results["failed"].append("pos_across_networks")
         print()
 
-        # ── Phase 8: Relay evidence ──────────────────────────────────────
-        print("Phase 8: Check relay usage evidence in logs")
-        relay_evidence = False
-        for name in ALL_NODES:
-            logs = exec_node_quiet(name, "grep", "-ci",
-                                   "relay", "/tmp/daemon.log")
-            count = int(logs.strip() or "0")
-            if count > 0:
-                relay_evidence = True
-                print(f"  {name}: {count} relay-related log lines")
-
-        if relay_evidence:
-            results["passed"].append("relay_usage_evidence")
-        else:
-            # Even without explicit "relay" in logs, cross-NAT connection
-            # itself is relay evidence (nodes can't reach each other directly)
-            if "cross_nat_connect" in results["passed"]:
-                results["passed"].append("relay_usage_evidence")
-                print("  No explicit relay logs, but cross-NAT connect succeeded (implicit)")
-            else:
-                results["failed"].append("relay_usage_evidence")
-        print()
-
-        # ── Phase 9: Relay-only mode (UDP DROP) ─────────────────────────
-        print("Phase 9: Enable relay-only mode (block direct UDP)")
-        try:
-            docker("exec", "nat-router", "iptables",
-                   "-A", "FORWARD", "-p", "udp",
-                   "-s", "192.168.10.0/24", "-d", "192.168.20.0/24",
-                   "-j", "DROP", timeout=10)
-            docker("exec", "nat-router", "iptables",
-                   "-A", "FORWARD", "-p", "udp",
-                   "-s", "192.168.20.0/24", "-d", "192.168.10.0/24",
-                   "-j", "DROP", timeout=10)
-            print("  UDP DROP rules installed on router")
-            results["passed"].append("udp_drop_installed")
-        except Exception as e:
-            print(f"  Failed to install DROP rules: {e}")
-            results["failed"].append("udp_drop_installed")
-        print()
-
-        # Wait a bit for iroh to detect path change
-        time.sleep(10)
-
-        # ── Phase 10: Backup + restore in relay-only mode ────────────────
-        print("Phase 10: Backup + restore in relay-only mode")
-        exec_node(OWNER, "dd", "if=/dev/urandom",
-                  "of=/data/files/relay_only_test.bin",
-                  "bs=1024", "count=300", timeout=30)
-        relay_hash = get_file_hash(OWNER, "/data/files/relay_only_test.bin")
-        print(f"  Created 300 KB file, sha256={relay_hash[:16]}...")
-
-        ok = wait_for(
-            "Relay-only backup complete",
-            lambda: (s := node_status_safe(OWNER)) is not None
-                    and s.get("backed_up_files", 0) >= 2,
-            timeout_secs=180, poll_secs=5,
-        )
-        if ok:
-            results["passed"].append("relay_only_backup")
-        else:
-            results["failed"].append("relay_only_backup")
-
-        # Restore the relay-only file
-        restore_dir2 = "/tmp/restored_relay"
-        try:
-            exec_node(OWNER, "syncback", "restore",
-                      "/data/files/relay_only_test.bin",
-                      "--dest", restore_dir2, timeout=60)
-            rest_hash = get_file_hash(
-                OWNER, f"{restore_dir2}/data/files/relay_only_test.bin")
-            if rest_hash == relay_hash:
-                results["passed"].append("relay_only_restore")
-                print(f"  Relay-only restore matches (sha256={relay_hash[:16]}...)")
-            else:
-                results["failed"].append("relay_only_restore")
-                print(f"  HASH MISMATCH")
-        except Exception as e:
-            results["failed"].append("relay_only_restore")
-            print(f"  Relay-only restore failed: {e}")
-        print()
-
-        # ── Phase 11: No crashes ─────────────────────────────────────────
-        print("Phase 11: Check for crashes/panics")
+        # ── Phase 7: No crashes ──────────────────────────────────────────
+        print("Phase 7: Check for crashes/panics")
         panics_found = False
         for name in ALL_NODES:
             panic_count = exec_node_quiet(name, "grep", "-ci",
@@ -429,7 +334,6 @@ def main():
             if count > 0:
                 panics_found = True
                 print(f"  {name}: {count} panic/crash lines!")
-                # Show last few panic lines
                 lines = exec_node_quiet(name, "grep", "-i",
                                         "panic\\|SIGSEGV", "/tmp/daemon.log")
                 for line in (lines or "").strip().split("\n")[-3:]:

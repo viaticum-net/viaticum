@@ -1,8 +1,17 @@
-use super::{compute_combined, PosOutcome, TrustEngine};
-use crate::constants::{INITIAL_TRUST_P, KI, KP};
-use crate::types::{IdentityPub, Timestamp};
+use super::{
+    compute_combined, compute_effective_trust, recompute_master_trust, DeviceTrustRecord,
+    MasterTrustRecord, PosOutcome, TrustEngine,
+};
+use crate::constants::{INITIAL_TRUST_P, KI, KP, MAX_COMBINED_TRUST};
+use crate::types::{DeviceId, IdentityPub, Timestamp};
 
-fn peer(byte: u8) -> IdentityPub {
+fn peer(byte: u8) -> DeviceId {
+    let mut key = [0u8; 32];
+    key[0] = byte;
+    DeviceId(key)
+}
+
+fn master(byte: u8) -> IdentityPub {
     let mut key = [0u8; 32];
     key[0] = byte;
     IdentityPub(key)
@@ -42,7 +51,7 @@ fn upsert_peer_new_gets_initial_trust() {
     let peer_a = peer(1);
     let now = ts(1_000_000);
 
-    engine.upsert_peer(peer_a, now);
+    engine.upsert_peer_device(peer_a, master(0), now);
     let score = engine.score(&peer_a).unwrap();
 
     assert_eq!(score.p, INITIAL_TRUST_P);
@@ -92,7 +101,7 @@ fn recalculate_p_rolling_window() {
     let peer_a = peer(1);
     let now = ts(1_000_000);
 
-    engine.upsert_peer(peer_a, now);
+    engine.upsert_peer_device(peer_a, master(0), now);
 
     let records = vec![
         (6u32, 5u32, 5u32),
@@ -131,7 +140,7 @@ fn recalculate_p_is_initial_when_no_pos_data_in_window() {
     let peer_a = peer(1);
     let now = ts(1_000_000);
 
-    engine.upsert_peer(peer_a, now);
+    engine.upsert_peer_device(peer_a, master(0), now);
     engine
         .record_pos_result(
             peer_a,
@@ -157,7 +166,7 @@ fn update_storage_bytes_s_neutral_when_we_store_nothing() {
     let peer_a = peer(1);
     let now = ts(1_000_000);
 
-    engine.upsert_peer(peer_a, now);
+    engine.upsert_peer_device(peer_a, master(0), now);
     engine
         .update_storage_bytes(peer_a, 0, 500_000)
         .unwrap();
@@ -172,7 +181,7 @@ fn update_storage_bytes_s_below_one_when_peer_stores_less() {
     let peer_a = peer(1);
     let now = ts(1_000_000);
 
-    engine.upsert_peer(peer_a, now);
+    engine.upsert_peer_device(peer_a, master(0), now);
     engine
         .update_storage_bytes(peer_a, 1_000_000_000, 500_000_000)
         .unwrap();
@@ -193,7 +202,7 @@ fn zero_trust_resets_p_and_i() {
     let peer_a = peer(1);
     let now = ts(1_000_000);
 
-    engine.upsert_peer(peer_a, now);
+    engine.upsert_peer_device(peer_a, master(0), now);
     for week in 1..=5u32 {
         engine
             .record_pos_result(
@@ -234,8 +243,8 @@ fn load_round_trips_state() {
     let peer_b = peer(2);
     let now = ts(1_000_000);
 
-    engine1.upsert_peer(peer_a, now);
-    engine1.upsert_peer(peer_b, now);
+    engine1.upsert_peer_device(peer_a, master(0), now);
+    engine1.upsert_peer_device(peer_b, master(0), now);
 
     engine1
         .record_pos_result(
@@ -288,9 +297,9 @@ fn recalculate_all_returns_count() {
     let mut engine = TrustEngine::new();
     let now = ts(1_000_000);
 
-    engine.upsert_peer(peer(1), now);
-    engine.upsert_peer(peer(2), now);
-    engine.upsert_peer(peer(3), now);
+    engine.upsert_peer_device(peer(1), master(0), now);
+    engine.upsert_peer_device(peer(2), master(0), now);
+    engine.upsert_peer_device(peer(3), master(0), now);
 
     let count = engine.recalculate_all(now, 5);
     assert_eq!(count, 3);
@@ -304,9 +313,9 @@ fn peers_by_trust_sorted_descending() {
     let peer_c = peer(3);
     let now = ts(1_000_000);
 
-    engine.upsert_peer(peer_a, now);
-    engine.upsert_peer(peer_b, now);
-    engine.upsert_peer(peer_c, now);
+    engine.upsert_peer_device(peer_a, master(0), now);
+    engine.upsert_peer_device(peer_b, master(0), now);
+    engine.upsert_peer_device(peer_c, master(0), now);
 
     // Give peer_a lots of PoS
     for week in 1..=4u32 {
@@ -348,7 +357,7 @@ fn peers_by_trust_sorted_descending() {
     }
 
     // peer_a should be first (best trust)
-    assert_eq!(ranked[0].0.identity, peer_a);
+    assert_eq!(ranked[0].0.device_id, peer_a);
 }
 
 #[test]
@@ -394,7 +403,7 @@ fn pos_accumulates_within_same_week() {
     let peer_a = peer(1);
     let now = ts(1_000_000);
 
-    engine.upsert_peer(peer_a, now);
+    engine.upsert_peer_device(peer_a, master(0), now);
     engine
         .record_pos_result(
             peer_a,
@@ -434,7 +443,7 @@ fn recent_pos_stats_no_data_returns_zeros() {
 fn recent_pos_stats_single_week_in_window() {
     let mut engine = TrustEngine::new();
     let p = peer(1);
-    engine.upsert_peer(p, ts(1_000_000));
+    engine.upsert_peer_device(p, master(0), ts(1_000_000));
     engine
         .record_pos_result(p, PosOutcome { week_number: 10, challenged: 5, passed: 4 })
         .unwrap();
@@ -447,7 +456,7 @@ fn recent_pos_stats_single_week_in_window() {
 fn recent_pos_stats_multiple_weeks_summed() {
     let mut engine = TrustEngine::new();
     let p = peer(1);
-    engine.upsert_peer(p, ts(1_000_000));
+    engine.upsert_peer_device(p, master(0), ts(1_000_000));
     engine
         .record_pos_result(p, PosOutcome { week_number: 8, challenged: 3, passed: 2 })
         .unwrap();
@@ -466,7 +475,7 @@ fn recent_pos_stats_multiple_weeks_summed() {
 fn recent_pos_stats_excludes_weeks_outside_window() {
     let mut engine = TrustEngine::new();
     let p = peer(1);
-    engine.upsert_peer(p, ts(1_000_000));
+    engine.upsert_peer_device(p, master(0), ts(1_000_000));
     // week 5 is outside a 4-week window ending at week 10 (window: 7..=10)
     engine
         .record_pos_result(p, PosOutcome { week_number: 5, challenged: 10, passed: 10 })
@@ -527,7 +536,7 @@ fn trust_combined_bounded_across_inputs() {
 fn trust_converges_after_sustained_perfect_pos() {
     let mut engine = TrustEngine::new();
     let p = peer(1);
-    engine.upsert_peer(p, ts(1_000_000));
+    engine.upsert_peer_device(p, master(0), ts(1_000_000));
 
     // 20 weeks of perfect PoS (challenged=10, passed=10 each week)
     for week in 1..=20 {
@@ -558,4 +567,164 @@ fn trust_converges_after_sustained_perfect_pos() {
         "combined should be well above 1.0, got {}",
         score.combined
     );
+}
+
+// ─── Two-level trust ────────────────────────────────────────────────────────
+
+fn device_trust(p: f64, i: f64) -> DeviceTrustRecord {
+    DeviceTrustRecord {
+        device_id: DeviceId([1u8; 32]),
+        trust_p: p,
+        trust_i: i,
+        last_week: 10,
+    }
+}
+
+fn master_trust(combined: f64) -> MasterTrustRecord {
+    MasterTrustRecord {
+        identity: IdentityPub([2u8; 32]),
+        combined,
+        last_updated: Timestamp(1_000_000),
+    }
+}
+
+#[test]
+fn compute_effective_trust_new_user_new_device_returns_zero() {
+    let result = compute_effective_trust(None, None);
+    assert_eq!(result, 0.0);
+}
+
+#[test]
+fn compute_effective_trust_new_device_old_user() {
+    // device_trust=None, master=1.0 → base = 1.0 * 0.3 = 0.3, dt=0, effective=0.3
+    let result = compute_effective_trust(None, Some(&master_trust(1.0)));
+    let expected = 1.0_f64 * 0.3;
+    assert!(
+        (result - expected).abs() < 1e-10,
+        "expected {expected}, got {result}"
+    );
+}
+
+#[test]
+fn compute_effective_trust_mature_device() {
+    // dt = compute_combined(1.0, 1.0, 1.0) = KP + KI = 2.15
+    // base = 2.15 * 0.3 = 0.645
+    // effective = 0.645 + 2.15 * (1 - 0.645/2.15) = 0.645 + 2.15 * 0.7 = 2.15
+    let dt = device_trust(1.0, 1.0);
+    let mt = master_trust(MAX_COMBINED_TRUST);
+    let result = compute_effective_trust(Some(&dt), Some(&mt));
+    let expected = MAX_COMBINED_TRUST;
+    assert!(
+        (result - expected).abs() < 1e-9,
+        "expected {expected}, got {result}"
+    );
+}
+
+#[test]
+fn compute_effective_trust_device_above_master() {
+    // dt = 2.15, base = 0.5 * 0.3 = 0.15
+    // effective = 0.15 + 2.15 * (1 - 0.15/2.15) = 0.15 + 2.15 * 0.9302... ≈ 2.15
+    let dt = device_trust(1.0, 1.0);
+    let mt = master_trust(0.5);
+    let result = compute_effective_trust(Some(&dt), Some(&mt));
+    let base = 0.5_f64 * 0.3;
+    let dt_combined = compute_combined(1.0, 1.0, 1.0);
+    let expected = base + dt_combined * (1.0 - base / MAX_COMBINED_TRUST);
+    assert!(
+        (result - expected).abs() < 1e-10,
+        "expected {expected}, got {result}"
+    );
+    // Effective can exceed master.combined — this is correct
+    assert!(result > 0.5, "effective should exceed low master trust when device is mature");
+}
+
+#[test]
+fn compute_effective_trust_zero_device_trust_no_master() {
+    let dt = device_trust(0.0, 0.0);
+    let result = compute_effective_trust(Some(&dt), None);
+    // base = 0.0 * 0.3 = 0.0; dt = compute_combined(0,0,1) = 0; effective = 0
+    assert_eq!(result, 0.0);
+}
+
+#[test]
+fn recompute_master_trust_single_device() {
+    let d = device_trust(0.8, 0.8);
+    let expected = compute_combined(0.8, 0.8, 1.0);
+    let result = recompute_master_trust(&[(d, 1000)]);
+    assert!(
+        (result - expected).abs() < 1e-10,
+        "expected {expected}, got {result}"
+    );
+}
+
+#[test]
+fn recompute_master_trust_weighted_average() {
+    let da = device_trust(1.0, 1.0);
+    let db = device_trust(0.0, 0.0);
+    let dt_a = compute_combined(1.0, 1.0, 1.0);
+    let dt_b = 0.0_f64;
+    // weighted: (dt_a*2000 + dt_b*1000) / 3000 = dt_a * 2/3
+    let expected = (dt_a * 2000.0 + dt_b * 1000.0) / 3000.0;
+    let result = recompute_master_trust(&[(da, 2000), (db, 1000)]);
+    assert!(
+        (result - expected).abs() < 1e-10,
+        "expected {expected}, got {result}"
+    );
+}
+
+#[test]
+fn recompute_master_trust_no_devices_returns_zero() {
+    let result = recompute_master_trust(&[]);
+    assert_eq!(result, 0.0);
+}
+
+#[test]
+fn recompute_master_trust_equal_weight_when_all_symbols_zero() {
+    let da = device_trust(1.0, 1.0);
+    let db = device_trust(0.0, 0.0);
+    let dt_a = compute_combined(1.0, 1.0, 1.0);
+    let dt_b = 0.0_f64;
+    let expected = (dt_a + dt_b) / 2.0;
+    let result = recompute_master_trust(&[(da, 0), (db, 0)]);
+    assert!(
+        (result - expected).abs() < 1e-10,
+        "expected {expected}, got {result}"
+    );
+}
+
+#[test]
+fn effective_trust_does_not_exceed_max_for_max_inputs() {
+    let dt = device_trust(1.0, 1.0);
+    let mt = master_trust(MAX_COMBINED_TRUST);
+    let result = compute_effective_trust(Some(&dt), Some(&mt));
+    assert!(
+        result <= MAX_COMBINED_TRUST + 1e-9,
+        "effective trust {result} exceeds MAX_COMBINED_TRUST {MAX_COMBINED_TRUST}"
+    );
+}
+
+#[test]
+fn effective_trust_is_nonnegative() {
+    // Sweep representative inputs: p/i in {0,0.5,1}, master combined in {0,0.5,1,2.15}
+    let p_values = [0.0_f64, 0.5, 1.0];
+    let i_values = [0.0_f64, 0.5, 1.0];
+    let mt_values = [0.0_f64, 0.5, 1.0, MAX_COMBINED_TRUST];
+
+    for p in p_values {
+        for i in i_values {
+            for mt_val in mt_values {
+                let dt = device_trust(p, i);
+                let mt = master_trust(mt_val);
+                let result = compute_effective_trust(Some(&dt), Some(&mt));
+                assert!(
+                    result >= 0.0,
+                    "effective_trust({p},{i},{mt_val}) = {result} — must be >= 0.0"
+                );
+                assert!(
+                    result.is_finite(),
+                    "effective_trust({p},{i},{mt_val}) = {result} — must be finite"
+                );
+            }
+        }
+    }
 }

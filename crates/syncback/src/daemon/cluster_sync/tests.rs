@@ -20,36 +20,55 @@ mod cluster_sync_tests {
     // ─── Test fixtures ────────────────────────────────────────────────────────
 
     const SEED: [u8; 32] = [42u8; 32];
-    const DEVICE_A_ID: DeviceId = DeviceId([0x0Au8; 16]);
-    const DEVICE_B_ID: DeviceId = DeviceId([0x0Bu8; 16]);
+    // device_seed values used to derive device signing keys; device_id = pubkey
+    const DEVICE_SEED_A: [u8; 32] = [0x0Au8; 32];
+    const DEVICE_SEED_B: [u8; 32] = [0x0Bu8; 32];
     const NOW: Timestamp = Timestamp(100_000);
 
     fn make_master_key() -> ed25519_dalek::SigningKey {
         derive_master_key(&SEED).unwrap()
     }
 
-    fn device_pub(device_id: DeviceId) -> [u8; 32] {
-        derive_device_key(&SEED, &device_id)
-            .unwrap()
-            .verifying_key()
-            .to_bytes()
+    fn device_a_id() -> DeviceId {
+        let key = derive_device_key(&SEED, &DEVICE_SEED_A).unwrap();
+        DeviceId(key.verifying_key().to_bytes())
     }
 
-    /// Initialize a ClusterState with DEVICE_A as the first device.
+    fn device_b_id() -> DeviceId {
+        let key = derive_device_key(&SEED, &DEVICE_SEED_B).unwrap();
+        DeviceId(key.verifying_key().to_bytes())
+    }
+
+    /// Returns the device signing key's public bytes for a given DeviceId.
+    /// In tests, DeviceId = pubkey of derived signing key; device_pub just returns inner bytes.
+    fn device_pub(did: DeviceId) -> [u8; 32] {
+        did.0
+    }
+
+
+    /// device_pub(seed) → IdentityPub containing the device signing key's pubkey
+    fn device_b_identity() -> IdentityPub {
+        IdentityPub(device_b_id().0)
+    }
+
+    /// Initialize a ClusterState with device_a as the first device.
     fn make_cluster_state(db: Db) -> ClusterState {
         let master_key = make_master_key();
         let master_pub = master_identity(&master_key);
-        let cert_a = issue_device_certificate(&master_key, DEVICE_A_ID, device_pub(DEVICE_A_ID), NOW);
+        let did_a = device_a_id();
+        let cert_a = issue_device_certificate(&master_key, did_a, NOW);
         ClusterState::init(db, master_pub, cert_a, NOW, NOW).unwrap()
     }
 
-    /// Initialize a ClusterState with DEVICE_A + DEVICE_B as active devices.
+    /// Initialize a ClusterState with device_a + device_b as active devices.
     fn make_cluster_state_two_devices(db: Db) -> ClusterState {
         let master_key = make_master_key();
         let master_pub = master_identity(&master_key);
-        let cert_a = issue_device_certificate(&master_key, DEVICE_A_ID, device_pub(DEVICE_A_ID), NOW);
+        let did_a = device_a_id();
+        let did_b = device_b_id();
+        let cert_a = issue_device_certificate(&master_key, did_a, NOW);
         let mut state = ClusterState::init(db, master_pub, cert_a, NOW, NOW).unwrap();
-        let cert_b = issue_device_certificate(&master_key, DEVICE_B_ID, device_pub(DEVICE_B_ID), NOW);
+        let cert_b = issue_device_certificate(&master_key, did_b, NOW);
         state.add_device(cert_b, NOW).unwrap();
         state
     }
@@ -68,11 +87,7 @@ mod cluster_sync_tests {
     }
 
     fn device_a_identity() -> IdentityPub {
-        IdentityPub(device_pub(DEVICE_A_ID))
-    }
-
-    fn device_b_identity() -> IdentityPub {
-        IdentityPub(device_pub(DEVICE_B_ID))
+        IdentityPub(device_a_id().0)
     }
 
     // ─── 1. build_sync_request_uses_cursor ───────────────────────────────────
@@ -92,13 +107,13 @@ mod cluster_sync_tests {
 
         let manager = ClusterSyncManager::new(
             db,
-            ClusterSyncConfig { our_device_id: DEVICE_A_ID, batch_size: 100 },
+            ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
             shared,
         );
 
         let msg = manager.build_sync_request(&peer_identity);
         assert_eq!(msg.last_known_seq, 42);
-        assert_eq!(msg.from_device_id, DEVICE_A_ID);
+        assert_eq!(msg.from_device_id, device_a_id());
         assert_eq!(msg.v, 1);
     }
 
@@ -109,11 +124,11 @@ mod cluster_sync_tests {
         let db = Db::open_in_memory().unwrap();
         let state = make_cluster_state(db.clone());
         let peer_identity = device_b_identity();
-        let manager = make_manager_with_state(db, state, DEVICE_A_ID);
+        let manager = make_manager_with_state(db, state, device_a_id());
 
         let msg = manager.build_sync_request(&peer_identity);
         assert_eq!(msg.last_known_seq, 0);
-        assert_eq!(msg.from_device_id, DEVICE_A_ID);
+        assert_eq!(msg.from_device_id, device_a_id());
     }
 
     // ─── 3. process_sync_response_applies_events ─────────────────────────────
@@ -125,7 +140,7 @@ mod cluster_sync_tests {
         let shared = Arc::new(Mutex::new(state));
         let manager = ClusterSyncManager::new(
             db.clone(),
-            ClusterSyncConfig { our_device_id: DEVICE_A_ID, batch_size: 100 },
+            ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
             shared.clone(),
         );
 
@@ -134,8 +149,8 @@ mod cluster_sync_tests {
             1u64,
             EventEntry {
                 timestamp: NOW,
-                device_id: DEVICE_A_ID,
-                event: Event::DeviceRevoked { device_id: DEVICE_B_ID },
+                device_id: device_a_id(),
+                event: Event::DeviceRevoked { device_id: device_b_id() },
             },
         )];
         let response = ClusterSyncResponseMsg {
@@ -150,7 +165,7 @@ mod cluster_sync_tests {
 
         // ClusterState should reflect the revocation.
         let state = shared.lock().unwrap();
-        assert!(state.is_device_revoked(&DEVICE_B_ID));
+        assert!(state.is_device_revoked(&device_b_id()));
     }
 
     // ─── 4. process_sync_response_updates_cursor ─────────────────────────────
@@ -162,7 +177,7 @@ mod cluster_sync_tests {
         let shared = Arc::new(Mutex::new(state));
         let manager = ClusterSyncManager::new(
             db.clone(),
-            ClusterSyncConfig { our_device_id: DEVICE_A_ID, batch_size: 100 },
+            ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
             shared.clone(),
         );
 
@@ -172,10 +187,10 @@ mod cluster_sync_tests {
         let events: Vec<(u64, EventEntry)> = (0..3)
             .map(|i| (i as u64 + 1, EventEntry {
                 event: Event::DeviceAdded {
-                    device_id: DeviceId([i as u8 + 10; 16]),
+                    device_id: DeviceId([i as u8 + 10; 32]),
                 },
                 timestamp: NOW,
-                device_id: DEVICE_B_ID,
+                device_id: device_b_id(),
             }))
             .collect();
         let response = ClusterSyncResponseMsg {
@@ -200,7 +215,7 @@ mod cluster_sync_tests {
         let shared = Arc::new(Mutex::new(state));
         let manager = ClusterSyncManager::new(
             db.clone(),
-            ClusterSyncConfig { our_device_id: DEVICE_A_ID, batch_size: 100 },
+            ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
             shared.clone(),
         );
 
@@ -209,8 +224,8 @@ mod cluster_sync_tests {
             1u64,
             EventEntry {
                 timestamp: NOW,
-                device_id: DEVICE_A_ID,
-                event: Event::DeviceRevoked { device_id: DEVICE_B_ID },
+                device_id: device_a_id(),
+                event: Event::DeviceRevoked { device_id: device_b_id() },
             },
         )];
 
@@ -235,7 +250,7 @@ mod cluster_sync_tests {
         assert_eq!(applied2, 0);
 
         let state = shared.lock().unwrap();
-        assert!(state.is_device_revoked(&DEVICE_B_ID));
+        assert!(state.is_device_revoked(&device_b_id()));
     }
 
     // ─── 6. handle_sync_request_returns_events_after_seq ─────────────────────
@@ -253,19 +268,19 @@ mod cluster_sync_tests {
         for i in 0..3u64 {
             db.append_event(&EventEntry {
                 timestamp: Timestamp(NOW.0 + i),
-                device_id: DEVICE_A_ID,
+                device_id: device_a_id(),
                 event: Event::EpochRotated { epoch: (i + 1) as u32 },
             }).unwrap();
         }
         let last_seq = db.last_event_seq().unwrap();
         assert_eq!(last_seq, base_seq + 3);
 
-        let manager = make_manager_with_state(db.clone(), state, DEVICE_A_ID);
+        let manager = make_manager_with_state(db.clone(), state, device_a_id());
 
         // Request events after base_seq (i.e., the 3 synthetic ones).
         let request = ClusterSyncRequestMsg {
             v: 1,
-            from_device_id: DEVICE_B_ID,
+            from_device_id: device_b_id(),
             last_known_seq: base_seq,
             timestamp: NOW,
         };
@@ -286,12 +301,12 @@ mod cluster_sync_tests {
         let db = Db::open_in_memory().unwrap();
         let state = make_cluster_state_two_devices(db.clone());
         let last_seq = db.last_event_seq().unwrap();
-        let manager = make_manager_with_state(db, state, DEVICE_A_ID);
+        let manager = make_manager_with_state(db, state, device_a_id());
 
         // Request events after last_seq — nothing to return.
         let request = ClusterSyncRequestMsg {
             v: 1,
-            from_device_id: DEVICE_B_ID,
+            from_device_id: device_b_id(),
             last_known_seq: last_seq,
             timestamp: NOW,
         };
@@ -309,20 +324,20 @@ mod cluster_sync_tests {
 
         // Revoke DEVICE_B.
         let master_key = make_master_key();
-        let rev = issue_revocation(&master_key, DEVICE_B_ID, NOW, EpochCounter(1));
+        let rev = issue_revocation(&master_key, device_b_id(), NOW, EpochCounter(1));
         state.revoke_device(rev, NOW, NOW).unwrap();
 
-        let manager = make_manager_with_state(db, state, DEVICE_A_ID);
+        let manager = make_manager_with_state(db, state, device_a_id());
 
         let request = ClusterSyncRequestMsg {
             v: 1,
-            from_device_id: DEVICE_B_ID,
+            from_device_id: device_b_id(),
             last_known_seq: 0,
             timestamp: NOW,
         };
         let result = manager.handle_sync_request(&request);
         assert!(
-            matches!(result, Err(ClusterSyncError::NotClusterDevice(id)) if id == DEVICE_B_ID),
+            matches!(result, Err(ClusterSyncError::NotClusterDevice(id)) if id == device_b_id()),
             "expected NotClusterDevice for revoked device, got {:?}",
             result
         );
@@ -334,9 +349,9 @@ mod cluster_sync_tests {
     fn handle_sync_request_rejects_unknown_device() {
         let db = Db::open_in_memory().unwrap();
         let state = make_cluster_state(db.clone()); // Only DEVICE_A registered.
-        let manager = make_manager_with_state(db, state, DEVICE_A_ID);
+        let manager = make_manager_with_state(db, state, device_a_id());
 
-        let unknown_device_id = DeviceId([0xFFu8; 16]);
+        let unknown_device_id = DeviceId([0xFFu8; 32]);
         let request = ClusterSyncRequestMsg {
             v: 1,
             from_device_id: unknown_device_id,
@@ -358,8 +373,8 @@ mod cluster_sync_tests {
         let master_key = make_master_key();
         let master_pub = master_identity(&master_key);
 
-        let rev = issue_revocation(&master_key, DEVICE_B_ID, NOW, EpochCounter(1));
-        let cert_b = issue_device_certificate(&master_key, DEVICE_B_ID, device_pub(DEVICE_B_ID), NOW);
+        let rev = issue_revocation(&master_key, device_b_id(), NOW, EpochCounter(1));
+        let cert_b = issue_device_certificate(&master_key, device_b_id(), NOW);
 
         let broadcast = ClusterSyncManager::build_revocation_broadcast(&rev, &cert_b);
 
@@ -368,9 +383,9 @@ mod cluster_sync_tests {
         let decoded: RevocationBroadcast = from_cbor(&bytes).unwrap();
 
         assert_eq!(decoded, broadcast);
-        assert_eq!(decoded.revocation.device_id, DEVICE_B_ID);
+        assert_eq!(decoded.revocation.device_id, device_b_id());
         assert_eq!(decoded.revocation.master_pub_key, master_pub);
-        assert_eq!(decoded.device_cert.device_id, DEVICE_B_ID);
+        assert_eq!(decoded.device_cert.device_id, device_b_id());
     }
 
     // ─── PROC-16: cluster_sync_request_from_revoked_device_rejected ──────────
@@ -386,8 +401,7 @@ mod cluster_sync_tests {
         let master_pub = master_identity(&master_key);
         let cert_a = issue_device_certificate(
             &master_key,
-            DEVICE_A_ID,
-            device_pub(DEVICE_A_ID),
+            device_a_id(),
             NOW,
         );
         let mut state = ClusterState::init(db.clone(), master_pub, cert_a, NOW, NOW).unwrap();
@@ -395,31 +409,30 @@ mod cluster_sync_tests {
         // Add DEVICE_B, then immediately revoke it.
         let cert_b = issue_device_certificate(
             &master_key,
-            DEVICE_B_ID,
-            device_pub(DEVICE_B_ID),
+            device_b_id(),
             NOW,
         );
         state.add_device(cert_b, NOW).unwrap();
 
-        let rev = issue_revocation(&master_key, DEVICE_B_ID, NOW, EpochCounter(1));
+        let rev = issue_revocation(&master_key, device_b_id(), NOW, EpochCounter(1));
         state.revoke_device(rev, NOW, NOW).unwrap();
 
         // Confirm revocation took effect.
-        assert!(state.is_device_revoked(&DEVICE_B_ID));
+        assert!(state.is_device_revoked(&device_b_id()));
 
-        let manager = make_manager_with_state(db, state, DEVICE_A_ID);
+        let manager = make_manager_with_state(db, state, device_a_id());
 
         // DEVICE_B sends a ClusterSyncRequest — must be rejected.
         let request = ClusterSyncRequestMsg {
             v: 1,
-            from_device_id: DEVICE_B_ID,
+            from_device_id: device_b_id(),
             last_known_seq: 0,
             timestamp: NOW,
         };
         let result = manager.handle_sync_request(&request);
 
         assert!(
-            matches!(result, Err(ClusterSyncError::NotClusterDevice(id)) if id == DEVICE_B_ID),
+            matches!(result, Err(ClusterSyncError::NotClusterDevice(id)) if id == device_b_id()),
             "revoked device must be rejected with NotClusterDevice, got {:?}",
             result
         );
@@ -433,12 +446,12 @@ mod cluster_sync_tests {
         let db = Db::open_in_memory().unwrap();
         let master_key = make_master_key();
         let master_pub = master_identity(&master_key);
-        let cert_a = issue_device_certificate(&master_key, DEVICE_A_ID, device_pub(DEVICE_A_ID), NOW);
+        let cert_a = issue_device_certificate(&master_key, device_a_id(), NOW);
         let state = ClusterState::init(db.clone(), master_pub, cert_a, NOW, NOW).unwrap();
         let shared = Arc::new(Mutex::new(state));
         let manager = ClusterSyncManager::new(
             db,
-            ClusterSyncConfig { our_device_id: DEVICE_A_ID, batch_size: 100 },
+            ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
             shared,
         );
 
@@ -455,7 +468,7 @@ mod cluster_sync_tests {
         let shared = Arc::new(Mutex::new(state));
 
         // Cursor set on device-B's device-level IdentityPub.
-        let device_b_key = IdentityPub(device_pub(DEVICE_B_ID));
+        let device_b_key = IdentityPub(device_pub(device_b_id()));
         {
             let mut s = shared.lock().unwrap();
             s.update_sync_cursor(device_b_key, 77).unwrap();
@@ -463,14 +476,14 @@ mod cluster_sync_tests {
 
         let manager = ClusterSyncManager::new(
             db,
-            ClusterSyncConfig { our_device_id: DEVICE_A_ID, batch_size: 100 },
+            ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
             shared,
         );
 
         // Build request using device-level cursor — must see seq=77.
         let msg = manager.build_sync_request(&device_b_key);
         assert_eq!(msg.last_known_seq, 77, "cursor must be per device_pub_key");
-        assert_eq!(msg.from_device_id, DEVICE_A_ID);
+        assert_eq!(msg.from_device_id, device_a_id());
     }
 
     /// process_sync_response updates the cursor under the device-level IdentityPub key.
@@ -482,11 +495,11 @@ mod cluster_sync_tests {
         let shared = Arc::new(Mutex::new(state));
         let manager = ClusterSyncManager::new(
             db,
-            ClusterSyncConfig { our_device_id: DEVICE_A_ID, batch_size: 100 },
+            ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
             shared.clone(),
         );
 
-        let device_b_key = IdentityPub(device_pub(DEVICE_B_ID));
+        let device_b_key = IdentityPub(device_pub(device_b_id()));
 
         // No cursor yet → request should start from 0.
         let req_before = manager.build_sync_request(&device_b_key);
@@ -496,10 +509,10 @@ mod cluster_sync_tests {
         let events: Vec<(u64, EventEntry)> = (0..5)
             .map(|i| (i as u64 + 1, EventEntry {
                 event: Event::DeviceAdded {
-                    device_id: DeviceId([i as u8 + 20; 16]),
+                    device_id: DeviceId([i as u8 + 20; 32]),
                 },
                 timestamp: NOW,
-                device_id: DEVICE_B_ID,
+                device_id: device_b_id(),
             }))
             .collect();
         let response = ClusterSyncResponseMsg {
@@ -521,7 +534,7 @@ mod cluster_sync_tests {
     fn sync_request_msg_serialization_round_trip() {
         let msg = ClusterSyncRequestMsg {
             v: 1,
-            from_device_id: DeviceId([1u8; 16]),
+            from_device_id: DeviceId([1u8; 32]),
             last_known_seq: 42,
             timestamp: Timestamp(1000),
         };
@@ -534,7 +547,7 @@ mod cluster_sync_tests {
     fn sync_response_msg_serialization_round_trip() {
         let entry = EventEntry {
             timestamp: Timestamp(100),
-            device_id: DeviceId([2u8; 16]),
+            device_id: DeviceId([2u8; 32]),
             event: Event::EpochRotated { epoch: 1 },
         };
         let msg = ClusterSyncResponseMsg {

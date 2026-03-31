@@ -15,13 +15,14 @@ mod tests;
 pub struct EpochCounter(pub u32);
 
 /// Certificate issued by master key to authorize a device.
+///
+/// device_id.0 IS the Ed25519 public key of the device — no separate device_pub_key.
+/// Signed payload: device_id.0 (32 bytes) || issued_at.0.to_be_bytes() (8 bytes).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceCertificate {
     pub device_id: DeviceId,
-    /// Device's Ed25519 public key (used as iroh NodeId).
-    pub device_pub_key: [u8; 32],
     pub issued_at: Timestamp,
-    /// Ed25519 signature: master_key.sign(device_id || device_pub_key || issued_at_be)
+    /// Ed25519 signature: master_key.sign(device_id.0 || issued_at_be)
     #[serde(with = "sig_serde")]
     pub signature: [u8; 64],
     /// Identity (master) pub key, so verifier knows who signed.
@@ -79,36 +80,20 @@ pub fn derive_master_key(seed_bytes: &[u8]) -> Result<ed25519_dalek::SigningKey,
     Ok(ed25519_dalek::SigningKey::from_bytes(&okm))
 }
 
-/// Derive device Ed25519 signing key from seed + device_id.
+/// Derive device Ed25519 signing key from master seed + device_seed.
 ///
-/// HKDF-SHA256(ikm=seed_bytes, salt=device_id.0, info=b"syncback-device-ed25519") → 32 bytes
+/// HKDF-SHA256(ikm=seed_bytes, salt=device_seed, info=b"syncback-device-ed25519") → 32 bytes
+///
+/// The returned signing key's verifying_key().to_bytes() IS the DeviceId.
 pub fn derive_device_key(
     seed_bytes: &[u8],
-    device_id: &DeviceId,
+    device_seed: &[u8; 32],
 ) -> Result<ed25519_dalek::SigningKey, ClusterError> {
-    let hk = Hkdf::<Sha256>::new(Some(&device_id.0), seed_bytes);
+    let hk = Hkdf::<Sha256>::new(Some(device_seed), seed_bytes);
     let mut okm = [0u8; 32];
     hk.expand(b"syncback-device-ed25519", &mut okm)
         .map_err(|e| ClusterError::KeyDerivation(e.to_string()))?;
     Ok(ed25519_dalek::SigningKey::from_bytes(&okm))
-}
-
-/// Derive iroh transport secret key from seed + device_id.
-///
-/// HKDF-SHA256(ikm=seed_bytes, salt=device_id.0, info=b"syncback-iroh-ed25519") → 32 bytes
-/// The returned bytes are used directly as an iroh::SecretKey.
-///
-/// Separate from derive_device_key (different domain string), so the iroh NodeId
-/// is independent from the SyncBack protocol identity.
-pub fn derive_iroh_key(
-    seed_bytes: &[u8],
-    device_id: &DeviceId,
-) -> Result<[u8; 32], ClusterError> {
-    let hk = Hkdf::<Sha256>::new(Some(&device_id.0), seed_bytes);
-    let mut okm = [0u8; 32];
-    hk.expand(b"syncback-iroh-ed25519", &mut okm)
-        .map_err(|e| ClusterError::KeyDerivation(e.to_string()))?;
-    Ok(okm)
 }
 
 /// Derive epoch encryption key.
@@ -132,27 +117,25 @@ pub fn master_identity(master_key: &ed25519_dalek::SigningKey) -> IdentityPub {
 // Device certificates
 // ============================================================
 
-/// Issue a device certificate. Called when adding a new device.
+/// Issue a device certificate. device_id.0 must equal device_signing_key.verifying_key().to_bytes().
 ///
-/// Signed message: device_id.0 (16 bytes) || device_pub_key (32 bytes) || issued_at.0.to_be_bytes() (8 bytes)
+/// Signed message: device_id.0 (32 bytes) || issued_at.0.to_be_bytes() (8 bytes)
 pub fn issue_device_certificate(
     master_key: &ed25519_dalek::SigningKey,
     device_id: DeviceId,
-    device_pub_key: [u8; 32],
     issued_at: Timestamp,
 ) -> DeviceCertificate {
-    let payload = device_cert_payload(&device_id, &device_pub_key, issued_at);
+    let payload = device_cert_payload(&device_id, issued_at);
     let sig = master_key.sign(&payload);
     DeviceCertificate {
         device_id,
-        device_pub_key,
         issued_at,
         signature: sig.to_bytes(),
         master_pub_key: master_identity(master_key),
     }
 }
 
-/// Verify a device certificate.
+/// Verify a device certificate. Uses cert.device_id.0 as the device public key.
 ///
 /// Checks: 1) signature valid, 2) master_pub_key matches expected identity.
 pub fn verify_device_certificate(
@@ -165,20 +148,15 @@ pub fn verify_device_certificate(
     let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&cert.master_pub_key.0)
         .map_err(|_| ClusterError::InvalidSignature)?;
     let sig = ed25519_dalek::Signature::from_bytes(&cert.signature);
-    let payload = device_cert_payload(&cert.device_id, &cert.device_pub_key, cert.issued_at);
+    let payload = device_cert_payload(&cert.device_id, cert.issued_at);
     verifying_key
         .verify(&payload, &sig)
         .map_err(|_| ClusterError::InvalidSignature)
 }
 
-fn device_cert_payload(
-    device_id: &DeviceId,
-    device_pub_key: &[u8; 32],
-    issued_at: Timestamp,
-) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(56);
+fn device_cert_payload(device_id: &DeviceId, issued_at: Timestamp) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(40);
     payload.extend_from_slice(&device_id.0);
-    payload.extend_from_slice(device_pub_key);
     payload.extend_from_slice(&issued_at.0.to_be_bytes());
     payload
 }
@@ -189,7 +167,7 @@ fn device_cert_payload(
 
 /// Issue a revocation certificate for a device.
 ///
-/// Signed message: b"revoke" (6) || device_id.0 (16) || revoked_at.0.to_be_bytes() (8) || new_epoch.0.to_be_bytes() (4)
+/// Signed message: b"revoke" (6) || device_id.0 (32) || revoked_at.0.to_be_bytes() (8) || new_epoch.0.to_be_bytes() (4) = 50 bytes
 pub fn issue_revocation(
     master_key: &ed25519_dalek::SigningKey,
     device_id: DeviceId,
@@ -229,7 +207,8 @@ fn revocation_payload(
     revoked_at: Timestamp,
     new_epoch: EpochCounter,
 ) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(34);
+    // b"revoke" (6) || device_id.0 (32) || revoked_at_be (8) || epoch_be (4) = 50 bytes
+    let mut payload = Vec::with_capacity(50);
     payload.extend_from_slice(b"revoke");
     payload.extend_from_slice(&device_id.0);
     payload.extend_from_slice(&revoked_at.0.to_be_bytes());
@@ -314,8 +293,7 @@ pub struct StoredClusterState {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeviceEntry {
     pub device_id: crate::types::DeviceId,
-    /// Device's Ed25519 public key (= iroh NodeId bytes).
-    pub device_pub_key: [u8; 32],
+    // device_pub_key removed — device_id.0 is the Ed25519 public key
     /// Certificate issued by master key.
     pub certificate: DeviceCertificate,
     /// Index assigned at registration. Immutable once assigned. Range: 0..=15.
@@ -385,11 +363,9 @@ impl ClusterState {
         verify_device_certificate(&first_device_cert, &master_pub)
             .map_err(|e| ClusterStateError::InvalidCertificate(e.to_string()))?;
 
-        let device_pub_key = first_device_cert.device_pub_key;
         let device_id = first_device_cert.device_id;
         let entry = DeviceEntry {
             device_id,
-            device_pub_key,
             certificate: first_device_cert,
             device_index: 0,
         };
@@ -434,10 +410,8 @@ impl ClusterState {
             .map_err(|e| ClusterStateError::InvalidCertificate(e.to_string()))?;
 
         let device_index = self.state.devices.len() as u8;
-        let device_pub_key = certificate.device_pub_key;
         self.state.devices.push(DeviceEntry {
             device_id,
-            device_pub_key,
             certificate,
             device_index,
         });
@@ -610,10 +584,8 @@ impl ClusterState {
                         let device_index = self.state.devices.len() as u8;
                         self.state.devices.push(DeviceEntry {
                             device_id: *device_id,
-                            device_pub_key: [0u8; 32],
                             certificate: DeviceCertificate {
                                 device_id: *device_id,
-                                device_pub_key: [0u8; 32],
                                 issued_at: entry.timestamp,
                                 signature: [0u8; 64],
                                 master_pub_key: self.state.master_pub,

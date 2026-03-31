@@ -1,39 +1,6 @@
 services:
-  # iroh relay server (dev mode, HTTP on port 3340).
-  # Multi-homed: reachable from both private networks (simulates "the internet").
-  relay:
-    image: n0computer/iroh-relay:latest
-    container_name: nat-relay
-    hostname: nat-relay
-    command: ["--dev"]
-    networks:
-      nat-net-a:
-        ipv4_address: 192.168.10.200
-      nat-net-b:
-        ipv4_address: 192.168.20.200
-      nat-outer:
-        ipv4_address: 10.0.0.10
-
-  # NAT router: bridges net-a and net-b via outer network with MASQUERADE.
-  router:
-    build:
-      context: .
-      dockerfile: Dockerfile.router
-    container_name: nat-router
-    hostname: nat-router
-    cap_add:
-      - NET_ADMIN
-    sysctls:
-      - net.ipv4.ip_forward=1
-    networks:
-      nat-net-a:
-        ipv4_address: 192.168.10.100
-      nat-net-b:
-        ipv4_address: 192.168.20.100
-      nat-outer:
-        ipv4_address: 10.0.0.100
-
-  # Nodes on net-a (owner + holder)
+  # Nodes on net-a (owner + holder).
+  # Both networks have internet access for iroh's public relay/DNS discovery.
   node-01:
     build:
       context: .
@@ -45,8 +12,7 @@ services:
       - nat-node-01-data:/home/syncback/.syncback
       - nat-node-01-files:/data/files
     networks:
-      nat-net-a:
-        ipv4_address: 192.168.10.10
+      - nat-net-a
 
   node-02:
     build:
@@ -59,10 +25,9 @@ services:
       - nat-node-02-data:/home/syncback/.syncback
       - nat-node-02-files:/data/files
     networks:
-      nat-net-a:
-        ipv4_address: 192.168.10.11
+      - nat-net-a
 
-  # Nodes on net-b (holders behind different NAT)
+  # Nodes on net-b (holders behind different network)
   node-03:
     build:
       context: .
@@ -74,8 +39,7 @@ services:
       - nat-node-03-data:/home/syncback/.syncback
       - nat-node-03-files:/data/files
     networks:
-      nat-net-b:
-        ipv4_address: 192.168.20.10
+      - nat-net-b
 
   node-04:
     build:
@@ -88,8 +52,7 @@ services:
       - nat-node-04-data:/home/syncback/.syncback
       - nat-node-04-files:/data/files
     networks:
-      nat-net-b:
-        ipv4_address: 192.168.20.11
+      - nat-net-b
 
 networks:
   nat-net-a:
@@ -102,11 +65,6 @@ networks:
     ipam:
       config:
         - subnet: 192.168.20.0/24
-  nat-outer:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 10.0.0.0/24
 
 volumes:
   nat-node-01-data:

@@ -7,11 +7,8 @@ use tokio_util::sync::CancellationToken;
 use syncback_core::db::Db;
 use syncback_core::types::{DeviceId, IdentityPub};
 
-use iroh::RelayMode;
-
 use crate::cli::types::{CliRequest, CliResponse};
 use crate::daemon::handle::DaemonState;
-use crate::daemon::network::{NetworkConfig, NetworkHandle};
 use crate::daemon::restore::{RestoreError, RestoreRequest, RestoreResult};
 
 use super::dispatch;
@@ -22,31 +19,10 @@ use super::dispatch;
 
 async fn make_test_state() -> Arc<DaemonState> {
     let db = Db::open_in_memory().expect("in-memory db");
-    let device_id = DeviceId([0u8; 16]);
+    let device_id = DeviceId([0u8; 32]);
 
-    // In production: identity_pub = master_identity(master_key), signing_key = device_key.
     let master_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     let identity_pub = IdentityPub(master_key.verifying_key().to_bytes());
-    let device_key = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
-
-    let net_config = NetworkConfig {
-        signing_key: device_key.clone(),
-        master_signing_key: device_key,
-        master_identity: identity_pub,
-        known_peers: Default::default(),
-        device_cert: None,
-        iroh_secret_key: None,
-        relay_mode: RelayMode::Disabled,
-        x25519_pub: None,
-    };
-    let (incoming_tx, _incoming_rx) =
-        mpsc::channel::<crate::daemon::network::connection::Connection>(1);
-    let incoming_tx_for_state = incoming_tx.clone();
-    let network = Arc::new(
-        NetworkHandle::start(net_config, incoming_tx)
-            .await
-            .expect("network start"),
-    );
 
     let (restore_tx, _restore_rx) = mpsc::channel::<(
         RestoreRequest,
@@ -57,10 +33,8 @@ async fn make_test_state() -> Arc<DaemonState> {
         db,
         identity_pub,
         device_id,
-        network,
         restore_tx,
         cluster_state: None,
-        incoming_tx: incoming_tx_for_state,
         master_key,
         seed: vec![0u8; 64],
         data_dir: std::path::PathBuf::from("/tmp"),
@@ -69,6 +43,7 @@ async fn make_test_state() -> Arc<DaemonState> {
         hard_quota_bytes: 0,
         time_scale: 1,
         relay_post_tx: None,
+        swarm_handle: None,
     })
 }
 
@@ -173,11 +148,11 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
     use std::sync::{Arc, Mutex};
 
     use syncback_core::cluster::{
-        derive_device_key, issue_device_certificate, issue_revocation, master_identity,
-        ClusterState, EpochCounter,
+        derive_device_key, issue_device_certificate, master_identity,
+        ClusterState,
     };
     use syncback_core::messages::RevocationBroadcast;
-    use syncback_core::types::{DeviceId, IdentityPub, Timestamp};
+    use syncback_core::types::{DeviceId, Timestamp};
 
     use crate::daemon::relay::RelayPost;
 
@@ -186,23 +161,21 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
     let master_key = syncback_core::cluster::derive_master_key(&seed_a).unwrap();
     let identity_pub = master_identity(&master_key);
 
-    let device_id_a = DeviceId([0xA0u8; 16]);
-    let device_id_b = DeviceId([0xB0u8; 16]);
+    let device_id_a = DeviceId([0xA0u8; 32]);
+    let device_id_b = DeviceId([0xB0u8; 32]);
 
-    let dev_key_a = derive_device_key(&seed_a, &device_id_a).unwrap();
-    let dev_key_b = derive_device_key(&seed_a, &device_id_b).unwrap();
+    let dev_key_a = derive_device_key(&seed_a, &device_id_a.0).unwrap();
+    let dev_key_b = derive_device_key(&seed_a, &device_id_b.0).unwrap();
 
     let now = Timestamp(1_000_000);
     let cert_a = issue_device_certificate(
         &master_key,
         device_id_a,
-        dev_key_a.verifying_key().to_bytes(),
         now,
     );
     let cert_b = issue_device_certificate(
         &master_key,
         device_id_b,
-        dev_key_b.verifying_key().to_bytes(),
         now,
     );
 
@@ -214,25 +187,6 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
     // Wire up a relay_post channel so we can observe the broadcast.
     let (relay_post_tx, mut relay_post_rx) = tokio::sync::mpsc::channel::<RelayPost>(4);
 
-    let device_key = dev_key_a;
-    let net_config = crate::daemon::network::NetworkConfig {
-        signing_key: device_key.clone(),
-        master_signing_key: device_key,
-        master_identity: identity_pub,
-        known_peers: Default::default(),
-        device_cert: None,
-        iroh_secret_key: None,
-        relay_mode: iroh::RelayMode::Disabled,
-        x25519_pub: None,
-    };
-    let (incoming_tx, _incoming_rx) =
-        mpsc::channel::<crate::daemon::network::connection::Connection>(1);
-    let incoming_tx_for_state = incoming_tx.clone();
-    let network = Arc::new(
-        crate::daemon::network::NetworkHandle::start(net_config, incoming_tx)
-            .await
-            .unwrap(),
-    );
     let (restore_tx, _restore_rx) = mpsc::channel::<(
         crate::daemon::restore::RestoreRequest,
         tokio::sync::oneshot::Sender<Result<
@@ -245,10 +199,8 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
         db,
         identity_pub,
         device_id: device_id_a,
-        network,
         restore_tx,
         cluster_state: Some(cluster_state),
-        incoming_tx: incoming_tx_for_state,
         master_key,
         seed: seed_a.to_vec(),
         data_dir: std::path::PathBuf::from("/tmp"),
@@ -257,6 +209,7 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
         hard_quota_bytes: 0,
         time_scale: 1,
         relay_post_tx: Some(relay_post_tx),
+        swarm_handle: None,
     });
 
     // Revoke device B.
@@ -374,13 +327,15 @@ async fn dispatch_connect_valid_addr_but_unreachable_returns_error() {
     );
 }
 
-#[tokio::test]
-async fn dispatch_connect_two_daemons_registers_peer() {
+// dispatch_connect_two_daemons_registers_peer removed in ε.5 (iroh removal).
+// The libp2p equivalent test should be in swarm_tests.rs.
+
+#[cfg(any())]
+async fn _removed_dispatch_connect_two_daemons_registers_peer() {
     use std::sync::Arc;
     use syncback_core::cluster::{derive_master_key, derive_device_key, master_identity, issue_device_certificate};
     use syncback_core::db::Db;
     use syncback_core::types::{DeviceId, Timestamp};
-    use crate::daemon::network::{NetworkConfig, NetworkHandle};
 
     let seed_a = [1u8; 32];
     let seed_b = [2u8; 32];
@@ -389,8 +344,8 @@ async fn dispatch_connect_two_daemons_registers_peer() {
     let pk_a = master_identity(&master_a);
     let pk_b = master_identity(&master_b);
 
-    let did_a = DeviceId([1u8; 16]);
-    let did_b = DeviceId([2u8; 16]);
+    let did_a = DeviceId([1u8; 32]);
+    let did_b = DeviceId([2u8; 32]);
     let device_a = derive_device_key(&seed_a, &did_a).unwrap();
     let device_b = derive_device_key(&seed_b, &did_b).unwrap();
 
@@ -463,6 +418,7 @@ async fn dispatch_connect_two_daemons_registers_peer() {
         hard_quota_bytes: 0,
         time_scale: 1,
         relay_post_tx: None,
+        swarm_handle: None,
     });
 
     let response = dispatch(CliRequest::Connect { addr: addr_b_str }, &state_a).await;

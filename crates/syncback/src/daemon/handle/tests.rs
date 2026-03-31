@@ -10,12 +10,12 @@ use crate::daemon::identity::init_identity;
 /// Daemon starts cleanly with a freshly initialized identity and
 /// shuts down without error when stop() + wait() are called.
 ///
-/// Ignored by default because it starts a real iroh QUIC endpoint and
+/// Ignored by default because it starts a real libp2p swarm endpoint and
 /// the tokio scheduler load causes timing-sensitive tests in other modules
 /// to become flaky when run in the same binary. Run with `--ignored` for
 /// manual / CI integration verification.
 #[tokio::test]
-#[ignore = "heavy: starts real iroh QUIC endpoint; run with --ignored"]
+#[ignore = "heavy: starts real libp2p swarm endpoint; run with --ignored"]
 async fn daemon_starts_and_stops_cleanly() {
     let dir = tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();

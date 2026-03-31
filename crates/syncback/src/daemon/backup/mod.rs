@@ -20,7 +20,7 @@ use syncback_core::constants::DEFAULT_SOURCE_BLOCK_SIZE;
 use syncback_core::db::Db;
 use syncback_core::erasure::ErasureEncoder;
 use syncback_core::placement::HolderCandidate;
-use syncback_core::types::{DeviceId, FileCategory, FileId, IdentityPub, SourceBlockId};
+use syncback_core::types::{DeviceId, FileCategory, FileId, SourceBlockId};
 
 use pipeline::{flush_queue_inner, run_pipeline, update_backed_up_at, BlockTypeTag};
 
@@ -54,12 +54,12 @@ pub enum DirtyKind {
 pub enum BackupEvent {
     /// Holder accepted our symbols for this block.
     SymbolAccepted {
-        holder_id: IdentityPub,
+        holder_id: DeviceId,
         source_block_id: SourceBlockId,
     },
     /// Holder rejected our symbols for this block.
     SymbolRejected {
-        holder_id: IdentityPub,
+        holder_id: DeviceId,
         source_block_id: SourceBlockId,
         reason: String,
     },
@@ -93,10 +93,6 @@ pub struct BackupConfig {
     /// Optional cluster state for dedup check (multi-device).
     /// If None: use inline DB scan (single-device backward compat).
     pub cluster_state: Option<std::sync::Arc<std::sync::Mutex<syncback_core::cluster::ClusterState>>>,
-    /// Network handle for symbol delivery.
-    /// When None: symbols are encoded and written to disk but not delivered
-    /// (pre-7.5 behavior; also used in unit tests that do not spin up a network).
-    pub network: Option<std::sync::Arc<crate::daemon::network::NetworkHandle>>,
     /// Per-directory importance overrides from config.
     /// Used to look up the importance of a file when creating a backup event.
     /// When empty, DEFAULT_IMPORTANCE (0.5) is used for all files.
@@ -108,12 +104,12 @@ pub struct BackupConfig {
     pub mock_offer_budget_gb: Option<f64>,
     /// Master identity signing key for signing SymbolOfferMsg.
     /// When Some: deliver_to_holder uses the offer/accept/transfer handshake.
-    /// When None: falls back to direct SymbolTransfer (pre-offer tests).
+    /// When None: symbols are written to disk but not delivered (unit tests).
     pub master_signing_key: Option<ed25519_dalek::SigningKey>,
-    /// Shared pending_deliveries map (same Arc shared with Processor).
-    /// When Some: the offer flow registers a oneshot here and awaits SymbolAccept/Reject.
-    /// When None: offer flow is skipped (pre-offer tests).
-    pub pending_deliveries: Option<crate::daemon::processor::PendingDeliveries>,
+    /// libp2p swarm handle for symbol delivery.
+    /// When Some: deliver_to_holder uses send_to_device (request-response).
+    /// When None: symbols are encoded and written to disk but not delivered.
+    pub swarm: Option<std::sync::Arc<crate::daemon::network::swarm::SwarmHandle>>,
 }
 
 impl Default for BackupConfig {
@@ -122,15 +118,14 @@ impl Default for BackupConfig {
             source_block_size: DEFAULT_SOURCE_BLOCK_SIZE,
             symbols_dir: std::path::PathBuf::from("symbols"),
             epoch_key: [0u8; 32],
-            device_id: DeviceId([0u8; 16]),
+            device_id: DeviceId([0u8; 32]),
             mock_holders: vec![],
             cluster_state: None,
-            network: None,
             watch_configs: vec![],
             time_scale: 1,
             mock_offer_budget_gb: None,
             master_signing_key: None,
-            pending_deliveries: None,
+            swarm: None,
         }
     }
 }
@@ -143,7 +138,7 @@ pub struct PipelineResult {
     pub n: u32,
     /// Symbol size in bytes (SYMBOL_SIZE).
     pub t: u16,
-    pub symbol_count_per_holder: Vec<(IdentityPub, u32)>,
+    pub symbol_count_per_holder: Vec<(DeviceId, u32)>,
     /// Exact byte length of the stored blob ([nonce][ciphertext]).
     /// Required for restore: the decoded erasure block is zero-padded to k*t; trim to stored_size.
     pub stored_size: u64,
@@ -240,7 +235,7 @@ impl BackupCoordinator {
                         syncback_core::constants::S_CLAMP_MAX,
                     );
                 HolderCandidate {
-                    identity: p.identity,
+                    device_id: p.device_id,
                     trust: trust_raw.clamp(0.0, 0.999),
                 }
             })
@@ -612,18 +607,16 @@ impl BackupCoordinator {
     /// For each `PipelineResult`:
     ///   1. Load `SymbolPlacement` records for the source block from DB.
     ///   2. For each placement, read symbol files from disk, build `SymbolTransferMsg`,
-    ///      and call `network.send_symbols(holder_identity, msg)`.
+    ///      and deliver via libp2p swarm.
     ///
     /// Errors are logged but not propagated — delivery failures do not abort the backup.
-    /// No-op when `config.network` is None.
+    /// No-op when `config.swarm` is None.
     async fn deliver_symbols(&self, results: &[PipelineResult]) {
-        let network = match &self.config.network {
-            Some(n) => n.clone(),
-            None => {
-                tracing::debug!("deliver_symbols: no network configured, skipping");
-                return;
-            }
-        };
+        if self.config.swarm.is_none() {
+            tracing::debug!("deliver_symbols: no swarm configured, skipping");
+            return;
+        }
+
         tracing::info!(
             blocks = results.len(),
             "deliver_symbols: starting delivery"
@@ -643,7 +636,7 @@ impl BackupCoordinator {
             };
 
             for placement in &placements {
-                if let Err(e) = self.deliver_to_holder(&network, result, placement).await {
+                if let Err(e) = self.deliver_to_holder(result, placement).await {
                     tracing::warn!(
                         block = ?result.source_block_id,
                         holder = %placement.holder_id,
@@ -659,37 +652,32 @@ impl BackupCoordinator {
     ///
     /// When `master_signing_key` is configured:
     ///   1. Build SymbolOffer (signed with master key).
-    ///   2. Register oneshot in pending_deliveries.
-    ///   3. Send SymbolOffer via network.
-    ///   4. Await oneshot with SYMBOL_OFFER_TIMEOUT_SECS timeout.
-    ///   5. On Accepted → send SymbolTransfer.
-    ///   6. On Rejected/Timeout → log, return Err (caller logs + continues).
+    ///   2. Send SymbolOffer via swarm.send_to_device (request-response).
+    ///   3. On SymbolAccept reply → send SymbolTransfer.
+    ///   4. On SymbolReject/error → log, return Err (caller logs + continues).
     ///
     /// When `master_signing_key` is None: fall back to direct SymbolTransfer.
     async fn deliver_to_holder(
         &self,
-        network: &crate::daemon::network::NetworkHandle,
         result: &PipelineResult,
         placement: &syncback_core::types::SymbolPlacement,
     ) -> anyhow::Result<()> {
-        use syncback_core::constants::SYMBOL_OFFER_TIMEOUT_SECS;
-        use syncback_core::messages::{Message, SymbolTransferMsg};
+        use syncback_core::messages::Message;
         use syncback_core::types::Timestamp;
-        use tokio::time::Duration;
+
+        let swarm = match self.config.swarm.as_ref() {
+            Some(s) => s.clone(),
+            None => {
+                tracing::debug!("deliver_to_holder: no swarm, skipping");
+                return Ok(());
+            }
+        };
 
         let signing_key = match self.config.master_signing_key.as_ref() {
             Some(k) => k,
             None => {
-                // Legacy path: send SymbolTransfer directly (no offer handshake).
-                return self.deliver_to_holder_direct(network, result, placement).await;
-            }
-        };
-
-        let pending_deliveries = match self.config.pending_deliveries.as_ref() {
-            Some(pd) => pd,
-            None => {
-                // No pending_deliveries map — fall back to direct transfer.
-                return self.deliver_to_holder_direct(network, result, placement).await;
+                // No signing key: fall back to direct SymbolTransfer.
+                return self.deliver_to_holder_direct(&swarm, result, placement).await;
             }
         };
 
@@ -707,78 +695,43 @@ impl BackupCoordinator {
             signing_key,
         );
 
-        // Register oneshot channel in pending_deliveries before sending the offer
-        // (to avoid a race: Accept could arrive before we register).
-        let (tx, rx) = tokio::sync::oneshot::channel::<crate::daemon::processor::OfferOutcome>();
-        {
-            let mut map = pending_deliveries.lock().await;
-            map.insert((placement.holder_id, result.source_block_id), tx);
-        }
-
-        // Send SymbolOffer.
-        if let Err(e) = network
-            .send_to_peer(placement.holder_id, &Message::SymbolOffer(offer))
+        // Send SymbolOffer and wait for reply (request-response via libp2p).
+        let reply = swarm
+            .send_to_device(placement.holder_id, Message::SymbolOffer(offer))
             .await
-        {
-            // Clean up pending entry on send failure.
-            let mut map = pending_deliveries.lock().await;
-            map.remove(&(placement.holder_id, result.source_block_id));
-            return Err(anyhow::anyhow!("send SymbolOffer: {e}"));
-        }
+            .map_err(|e| anyhow::anyhow!("send SymbolOffer: {e}"))?;
 
-        // Wait for outcome with timeout.
-        let outcome = tokio::time::timeout(Duration::from_secs(SYMBOL_OFFER_TIMEOUT_SECS), rx).await;
-
-        match outcome {
-            Ok(Ok(crate::daemon::processor::OfferOutcome::Accepted)) => {
+        match reply {
+            Message::SymbolAccept(_accept) => {
                 // Holder accepted — send SymbolTransfer.
-                self.deliver_to_holder_direct(network, result, placement).await
+                self.deliver_to_holder_direct(&swarm, result, placement).await
             }
-            Ok(Ok(crate::daemon::processor::OfferOutcome::Rejected { reason })) => {
-                // Clean up pending entry (already removed by handle_symbol_reject, but just in case).
-                {
-                    let mut map = pending_deliveries.lock().await;
-                    map.remove(&(placement.holder_id, result.source_block_id));
-                }
+            Message::SymbolReject(reject) => {
                 anyhow::bail!(
                     "holder {} rejected offer for block {:?}: {:?}",
                     placement.holder_id,
                     result.source_block_id,
-                    reason
+                    reject.reason
                 )
             }
-            Ok(Err(_)) => {
-                // Sender dropped (Processor shut down mid-flight).
+            other => {
                 anyhow::bail!(
-                    "offer outcome channel closed for holder {} block {:?}",
+                    "unexpected reply to SymbolOffer from {}: {:?}",
                     placement.holder_id,
-                    result.source_block_id
-                )
-            }
-            Err(_timeout) => {
-                // Timeout — clean up pending entry.
-                {
-                    let mut map = pending_deliveries.lock().await;
-                    map.remove(&(placement.holder_id, result.source_block_id));
-                }
-                anyhow::bail!(
-                    "offer timeout: no Accept from holder {} for block {:?} within {}s",
-                    placement.holder_id,
-                    result.source_block_id,
-                    SYMBOL_OFFER_TIMEOUT_SECS
+                    std::mem::discriminant(&other)
                 )
             }
         }
     }
 
-    /// Direct SymbolTransfer delivery (legacy path, no offer handshake).
+    /// Direct SymbolTransfer delivery via libp2p swarm.
     async fn deliver_to_holder_direct(
         &self,
-        network: &crate::daemon::network::NetworkHandle,
+        swarm: &crate::daemon::network::swarm::SwarmHandle,
         result: &PipelineResult,
         placement: &syncback_core::types::SymbolPlacement,
     ) -> anyhow::Result<()> {
-        use syncback_core::messages::SymbolTransferMsg;
+        use syncback_core::messages::{Message, SymbolTransferMsg};
         use syncback_core::types::Timestamp;
 
         let symbols = pipeline::read_symbols_for_holder(
@@ -803,8 +756,8 @@ impl BackupCoordinator {
             timestamp: Timestamp::now(),
         };
 
-        network
-            .send_symbols(placement.holder_id, msg)
+        swarm
+            .send_to_device(placement.holder_id, Message::SymbolTransfer(msg))
             .await
             .map_err(|e| anyhow::anyhow!("send_symbols: {e}"))?;
 

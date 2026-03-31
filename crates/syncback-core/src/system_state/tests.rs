@@ -24,7 +24,7 @@ fn make_file(path: &str, id: u64) -> FileRecord {
         file_id: FileId(id),
         path: path.to_string(),
         importance: 0.5,
-        devices: vec![(DeviceId([0u8; 16]), LocalState::Present)],
+        devices: vec![(DeviceId([0u8; 32]), LocalState::Present)],
         versions: vec![],
         first_seen: Timestamp(1000),
     }
@@ -44,7 +44,7 @@ fn make_source_block(seed: u8) -> SourceBlockRecord {
     }
 }
 
-fn make_placement(block_seed: u8, holder: IdentityPub, file_id: FileId) -> SymbolPlacement {
+fn make_placement(block_seed: u8, holder: DeviceId, file_id: FileId) -> SymbolPlacement {
     SymbolPlacement {
         source_block_id: SourceBlockId([block_seed; 32]),
         holder_id: holder,
@@ -60,8 +60,8 @@ fn make_placement(block_seed: u8, holder: IdentityPub, file_id: FileId) -> Symbo
 
 fn make_peer(seed: u8) -> PeerRecord {
     PeerRecord {
-        identity: IdentityPub([seed; 32]),
-        node_id: None,
+        device_id: DeviceId([seed; 32]),
+        master_identity: IdentityPub([seed; 32]),
         trust_p: 0.5,
         trust_i: 0.5,
         trust_s: 1.0,
@@ -69,7 +69,6 @@ fn make_peer(seed: u8) -> PeerRecord {
         bytes_peer_stores_for_us: 0,
         first_seen: Timestamp(1000),
         last_seen: Timestamp(2000),
-        device_id: None,
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
@@ -123,7 +122,7 @@ fn roundtrip_snapshot_pack_unpack_restore() {
     db.upsert_source_block(&sb1).unwrap();
     db.upsert_source_block(&sb2).unwrap();
 
-    let holder = IdentityPub([7u8; 32]);
+    let holder = DeviceId([7u8; 32]);
     let placement = make_placement(1, holder, FileId(1));
     db.upsert_placement(&placement).unwrap();
 
@@ -133,7 +132,7 @@ fn roundtrip_snapshot_pack_unpack_restore() {
     db.upsert_peer(&peer2).unwrap();
 
     // Insert a pos_weekly entry
-    db.upsert_pos_weekly(&IdentityPub([10u8; 32]), 5, &WeeklyPosEntry { challenged: 3, passed: 2 })
+    db.upsert_pos_weekly(&DeviceId([10u8; 32]), 5, &WeeklyPosEntry { challenged: 3, passed: 2 })
         .unwrap();
 
     // Snapshot + pack + unpack
@@ -165,7 +164,7 @@ fn roundtrip_snapshot_pack_unpack_restore() {
 
     // Verify pos_weekly was restored
     let pos_entry = db2
-        .get_pos_weekly(&IdentityPub([10u8; 32]), 5)
+        .get_pos_weekly(&DeviceId([10u8; 32]), 5)
         .unwrap()
         .unwrap();
     assert_eq!(pos_entry.challenged, 3);
@@ -292,8 +291,8 @@ fn multiple_pos_weekly_entries_roundtrip() {
     let db = test_db();
     let key = make_key();
 
-    let peer_a = IdentityPub([1u8; 32]);
-    let peer_b = IdentityPub([2u8; 32]);
+    let peer_a = DeviceId([1u8; 32]);
+    let peer_b = DeviceId([2u8; 32]);
 
     db.upsert_pos_weekly(&peer_a, 1, &WeeklyPosEntry { challenged: 10, passed: 8 }).unwrap();
     db.upsert_pos_weekly(&peer_a, 2, &WeeklyPosEntry { challenged: 20, passed: 18 }).unwrap();

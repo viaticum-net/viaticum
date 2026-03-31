@@ -30,8 +30,8 @@ use tempfile::TempDir;
 // ─── Shared fixtures ──────────────────────────────────────────────────────────
 
 const SEED: &[u8] = &[0xBB_u8; 64];
-const DEVICE_A_ID: DeviceId = DeviceId([0xA1u8; 16]);
-const DEVICE_B_ID: DeviceId = DeviceId([0xB1u8; 16]);
+const DEVICE_A_SEED: [u8; 32] = [0xA1u8; 32];
+const DEVICE_B_SEED: [u8; 32] = [0xB1u8; 32];
 const NOW: Timestamp = Timestamp(1_700_000_000);
 const EPOCH_KEY: [u8; 32] = [0x55u8; 32];
 /// Small block size: two symbols. Fast encode in tests.
@@ -41,17 +41,21 @@ fn mk() -> ed25519_dalek::SigningKey {
     derive_master_key(SEED).unwrap()
 }
 
-fn device_pub(id: DeviceId) -> [u8; 32] {
-    derive_device_key(SEED, &id).unwrap().verifying_key().to_bytes()
+fn device_a_id() -> DeviceId {
+    DeviceId(derive_device_key(SEED, &DEVICE_A_SEED).unwrap().verifying_key().to_bytes())
+}
+
+fn device_b_id() -> DeviceId {
+    DeviceId(derive_device_key(SEED, &DEVICE_B_SEED).unwrap().verifying_key().to_bytes())
 }
 
 /// Init ClusterState with both DEVICE_A and DEVICE_B registered.
 fn init_cluster(db: Db) -> ClusterState {
     let master = mk();
     let mp = master_identity(&master);
-    let cert_a = issue_device_certificate(&master, DEVICE_A_ID, device_pub(DEVICE_A_ID), NOW);
+    let cert_a = issue_device_certificate(&master, device_a_id(), NOW);
     let mut state = ClusterState::init(db, mp, cert_a, NOW, NOW).unwrap();
-    let cert_b = issue_device_certificate(&master, DEVICE_B_ID, device_pub(DEVICE_B_ID), NOW);
+    let cert_b = issue_device_certificate(&master, device_b_id(), NOW);
     state.add_device(cert_b, NOW).unwrap();
     state
 }
@@ -60,7 +64,7 @@ fn init_cluster(db: Db) -> ClusterState {
 fn holders_5() -> Vec<HolderCandidate> {
     (0..5)
         .map(|i| HolderCandidate {
-            identity: IdentityPub([(i + 1) as u8; 32]),
+            device_id: DeviceId([(i + 1) as u8; 32]),
             trust: 0.3 + i as f64 * 0.1,
         })
         .collect()
@@ -79,12 +83,11 @@ fn backup_cfg_with_cluster(
         device_id,
         mock_holders: holders_5(),
         cluster_state: Some(cluster_state),
-        network: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
         master_signing_key: None,
-        pending_deliveries: None,
+        swarm: None,
     }
 }
 
@@ -118,14 +121,14 @@ fn two_devices_backup_then_dedup_on_second() {
     // Device A: back up the file.
     let mut backup_a = BackupCoordinator::new(
         db.clone(),
-        backup_cfg_with_cluster(&symbols_dir, DEVICE_A_ID, Arc::clone(&cluster_state)),
+        backup_cfg_with_cluster(&symbols_dir, device_a_id(), Arc::clone(&cluster_state)),
         Arc::new(RaptorQEncoder::new()),
     );
     backup_a
         .process_event(DirtyEvent {
             path: path.clone(),
             kind: DirtyKind::Added,
-            device_id: DEVICE_A_ID,
+            device_id: device_a_id(),
         })
         .unwrap();
     let results_a = backup_a.flush_all(true).unwrap();
@@ -141,14 +144,14 @@ fn two_devices_backup_then_dedup_on_second() {
     // Device B: same file path, same content → dedup must skip encoding.
     let mut backup_b = BackupCoordinator::new(
         db.clone(),
-        backup_cfg_with_cluster(&symbols_dir, DEVICE_B_ID, Arc::clone(&cluster_state)),
+        backup_cfg_with_cluster(&symbols_dir, device_b_id(), Arc::clone(&cluster_state)),
         Arc::new(RaptorQEncoder::new()),
     );
     backup_b
         .process_event(DirtyEvent {
             path: path.clone(),
             kind: DirtyKind::Added,
-            device_id: DEVICE_B_ID,
+            device_id: device_b_id(),
         })
         .unwrap();
     let results_b = backup_b.flush_all(true).unwrap();
@@ -180,29 +183,29 @@ fn device_revocation_epoch_rotation_rejects_revoked_key() {
 
     let master = mk();
     let new_epoch = EpochCounter(1);
-    let rev = issue_revocation(&master, DEVICE_A_ID, NOW, new_epoch);
+    let rev = issue_revocation(&master, device_a_id(), NOW, new_epoch);
     state.revoke_device(rev.clone(), NOW, NOW).unwrap();
 
     // ClusterState: A revoked, epoch incremented.
-    assert!(state.is_device_revoked(&DEVICE_A_ID), "device A must be revoked");
-    assert!(!state.is_device_revoked(&DEVICE_B_ID), "device B must not be revoked");
+    assert!(state.is_device_revoked(&device_a_id()), "device A must be revoked");
+    assert!(!state.is_device_revoked(&device_b_id()), "device B must not be revoked");
     assert_eq!(state.current_epoch(), EpochCounter(1), "epoch must be 1 after revocation");
 
     // Only B remains active.
     let active = state.active_devices();
     assert_eq!(active.len(), 1, "only device B must remain active");
-    assert_eq!(active[0].device_id, DEVICE_B_ID);
+    assert_eq!(active[0].device_id, device_b_id());
 
     // Build RevocationBroadcast (same as phase3_gate test 5).
-    let cert_a = issue_device_certificate(&master, DEVICE_A_ID, device_pub(DEVICE_A_ID), NOW);
+    let cert_a = issue_device_certificate(&master, device_a_id(), NOW);
     let broadcast = ClusterSyncManager::build_revocation_broadcast(&rev, &cert_a);
 
     // Simulate an external peer receiving the broadcast.
-    // The peer extracts device_pub_key from the cert and adds it to revoked list.
-    let revoked_pub = broadcast.device_cert.device_pub_key;
+    // device_id.0 IS the device pub key — no separate field.
+    let revoked_pub = broadcast.device_cert.device_id.0;
     let mut peer_record = PeerRecord {
-        identity: IdentityPub([0x77u8; 32]),
-        node_id: None,
+        device_id: DeviceId([0x77u8; 32]),
+        master_identity: IdentityPub([0x77u8; 32]),
         trust_p: 0.5,
         trust_i: 0.5,
         trust_s: 1.0,
@@ -210,21 +213,20 @@ fn device_revocation_epoch_rotation_rejects_revoked_key() {
         bytes_peer_stores_for_us: 0,
         first_seen: NOW,
         last_seen: NOW,
-        device_id: None,
         revoked_device_pub_keys: Vec::new(),
         addrs: vec![],
         x25519_pub: None,
     };
     peer_record.revoked_device_pub_keys.push(revoked_pub);
 
-    // A's device pub key must be rejected by the peer.
+    // A's device id (= pub key) must be rejected by the peer.
     assert!(
-        peer_record.is_device_revoked(&IdentityPub(device_pub(DEVICE_A_ID))),
+        peer_record.is_device_revoked(&device_a_id()),
         "peer must reject revoked device A key"
     );
-    // B's device pub key must NOT be in the revoked list.
+    // B's device id must NOT be in the revoked list.
     assert!(
-        !peer_record.is_device_revoked(&IdentityPub(device_pub(DEVICE_B_ID))),
+        !peer_record.is_device_revoked(&device_b_id()),
         "peer must not reject device B key"
     );
 
@@ -260,7 +262,7 @@ fn cluster_sync_propagates_file_deletion_event() {
     let file_id_a = FileId(42);
     db_a.append_event(&EventEntry {
         timestamp: NOW,
-        device_id: DEVICE_A_ID,
+        device_id: device_a_id(),
         event: Event::FileAdded {
             file_id: file_id_a,
             path: "/photos/sunset.jpg".to_string(),
@@ -271,8 +273,8 @@ fn cluster_sync_propagates_file_deletion_event() {
     // A records a FileDeleted event for the same file.
     db_a.append_event(&EventEntry {
         timestamp: NOW,
-        device_id: DEVICE_A_ID,
-        event: Event::FileDeleted { file_id: file_id_a, device_id: DEVICE_A_ID },
+        device_id: device_a_id(),
+        event: Event::FileDeleted { file_id: file_id_a, device_id: device_a_id() },
     })
     .unwrap();
 
@@ -282,7 +284,7 @@ fn cluster_sync_propagates_file_deletion_event() {
     // counts as "applied" for events B hasn't seen yet).
     db_a.append_event(&EventEntry {
         timestamp: NOW,
-        device_id: DEVICE_A_ID,
+        device_id: device_a_id(),
         event: Event::EpochRotated { epoch: 7 },
     })
     .unwrap();
@@ -296,7 +298,7 @@ fn cluster_sync_propagates_file_deletion_event() {
 
     let sync_a = ClusterSyncManager::new(
         db_a.clone(),
-        ClusterSyncConfig { our_device_id: DEVICE_A_ID, batch_size: 100 },
+        ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
         Arc::new(Mutex::new(state_a)),
     );
 
@@ -306,15 +308,15 @@ fn cluster_sync_propagates_file_deletion_event() {
 
     let sync_b = ClusterSyncManager::new(
         db_b.clone(),
-        ClusterSyncConfig { our_device_id: DEVICE_B_ID, batch_size: 100 },
+        ClusterSyncConfig { our_device_id: device_b_id(), batch_size: 100 },
         Arc::new(Mutex::new(state_b)),
     );
 
     // B requests sync from A (cursor = 0: never synced before).
-    let a_identity = IdentityPub(device_pub(DEVICE_A_ID));
+    let a_identity = IdentityPub(device_a_id().0);
     let request = sync_b.build_sync_request(&a_identity);
     assert_eq!(request.last_known_seq, 0, "B has never synced A before");
-    assert_eq!(request.from_device_id, DEVICE_B_ID);
+    assert_eq!(request.from_device_id, device_b_id());
 
     // A handles B's request.
     let response = sync_a.handle_sync_request(&request).unwrap();

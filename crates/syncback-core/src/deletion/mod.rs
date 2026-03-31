@@ -1,6 +1,6 @@
 use crate::constants::{HOLDER_DELETE_COOLDOWN_SECS, OWNER_DELETE_COOLDOWN_SECS, VACUUM_INVALID_THRESHOLD};
 use crate::types::{
-    DeviceId, FileId, FileRecord, IdentityPub, LocalState, PlacementStatus, SourceBlockId,
+    DeviceId, FileId, FileRecord, LocalState, PlacementStatus, SourceBlockId,
     SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
 };
 
@@ -14,7 +14,7 @@ pub enum DeletionAction {
     /// SourceBlockRecord.status = Deleting. One action per holder.
     SendDropNotice {
         source_block_id: SourceBlockId,
-        holder_id: IdentityPub,
+        holder_id: DeviceId,
     },
 
     /// Holder cooldown elapsed (delete_requested_at + HOLDER_DELETE_COOLDOWN_SECS).
@@ -23,7 +23,7 @@ pub enum DeletionAction {
     ///   2. If no placements remain for this block: delete_source_block(block_id)
     CleanupPlacement {
         source_block_id: SourceBlockId,
-        holder_id: IdentityPub,
+        holder_id: DeviceId,
     },
 
     /// All placements for this source block have been cleaned up.

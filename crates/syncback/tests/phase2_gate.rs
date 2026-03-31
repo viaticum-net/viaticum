@@ -3,29 +3,26 @@
 // Tests in this file exercise ALL cross-module flows from Phase 2:
 //   1. full_backup_restore_roundtrip            — single file, byte-for-byte verify
 //   2. backup_restore_pack_multiple_files        — multi-file pack, byte-for-byte verify
-//   3. network_symbol_transfer_between_nodes     — two iroh nodes, SymbolTransferMsg
+//   3. network_symbol_transfer_between_nodes     — removed in ε.5 (iroh removed)
 //   4. placement_produces_valid_allocation_for_pipeline — placement + erasure integration
 //   5. relay_three_hop_message_delivery          — A→B(hop1)→C(hop2) directed message
 //   6. full_pipeline_backup_encode_decode_decrypt — pure data path, no file I/O
 //
-// GATE CRITERIA: all 6 tests pass → Phase 2 is complete.
+// GATE CRITERIA: tests 1, 2, 4, 5, 6 pass → Phase 2 is complete.
+// Test 3 (QUIC symbol transfer) was iroh-era; libp2p equivalent in swarm_tests.rs.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use syncback::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
 use syncback::daemon::backup::pipeline::{compress_and_encrypt, decrypt_and_decompress};
-use syncback::daemon::network::{NetworkConfig, NetworkHandle};
 use syncback::daemon::relay::{RelayConfig, RelayManager};
 use syncback::daemon::restore::{RestoreConfig, RestoreCoordinator, RestoreRequest, VersionSelector};
 use syncback_core::constants::MAX_BOARD_ENTRIES;
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder, Symbol};
-use syncback_core::messages::{Message, SymbolTransferMsg};
 use syncback_core::placement::{compute_allocation, HolderCandidate};
-use syncback_core::cluster::{derive_device_key, derive_master_key, issue_device_certificate, master_identity};
 use syncback_core::types::{DeviceId, ErasureParams, IdentityPub, SourceBlockId, Timestamp};
 use tempfile::TempDir;
 
@@ -34,14 +31,14 @@ use tempfile::TempDir;
 /// Small block size for fast tests.
 const SMALL_BLOCK_SIZE: u64 = 65_535 * 2;
 const EPOCH_KEY: [u8; 32] = [77u8; 32];
-const DEVICE_A: DeviceId = DeviceId([1u8; 16]);
-const DEVICE_B: DeviceId = DeviceId([2u8; 16]);
+const DEVICE_A: DeviceId = DeviceId([1u8; 32]);
+const DEVICE_B: DeviceId = DeviceId([2u8; 32]);
 
 /// 5 mock holders with varying trust — for backup/restore tests with real files.
 fn test_holders() -> Vec<HolderCandidate> {
     (0..5)
         .map(|i| HolderCandidate {
-            identity: IdentityPub([(i + 1) as u8; 32]),
+            device_id: DeviceId([(i + 1) as u8; 32]),
             trust: 0.3 + (i as f64) * 0.1, // 0.3, 0.4, 0.5, 0.6, 0.7
         })
         .collect()
@@ -50,8 +47,8 @@ fn test_holders() -> Vec<HolderCandidate> {
 /// 2 holders for small-blob pure pipeline tests (avoids MIN_SYMBOLS_PER_HOLDER trimming).
 fn test_holders_small() -> Vec<HolderCandidate> {
     vec![
-        HolderCandidate { identity: IdentityPub([1u8; 32]), trust: 0.8 },
-        HolderCandidate { identity: IdentityPub([2u8; 32]), trust: 0.6 },
+        HolderCandidate { device_id: DeviceId([1u8; 32]), trust: 0.8 },
+        HolderCandidate { device_id: DeviceId([2u8; 32]), trust: 0.6 },
     ]
 }
 
@@ -64,12 +61,11 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         device_id: DEVICE_A,
         mock_holders: test_holders(),
         cluster_state: None,
-        network: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
         master_signing_key: None,
-        pending_deliveries: None,
+        swarm: None,
     }
 }
 
@@ -81,6 +77,7 @@ fn restore_config(symbols_dir: &TempDir) -> RestoreConfig {
         identity: IdentityPub([9u8; 32]),
         device_id: DEVICE_B,
         symbols_dir: symbols_dir.path().to_path_buf(),
+        swarm: None,
     }
 }
 
@@ -89,28 +86,6 @@ fn write_file(dir: &TempDir, name: &str, content: &[u8]) -> String {
     let path = dir.path().join(name);
     std::fs::write(&path, content).expect("write test file");
     path.to_string_lossy().into_owned()
-}
-
-/// Create a NetworkHandle with a fresh signing key and empty peer directory.
-async fn make_network_handle() -> NetworkHandle {
-    let sk = SigningKey::generate(&mut OsRng);
-    let mi = IdentityPub(sk.verifying_key().to_bytes());
-    let (tx, _rx) = tokio::sync::mpsc::channel(64);
-    NetworkHandle::start(
-        NetworkConfig {
-            signing_key: sk.clone(),
-            master_signing_key: sk,
-            master_identity: mi,
-            known_peers: HashMap::new(),
-            device_cert: None,
-            iroh_secret_key: None,
-            relay_mode: iroh::RelayMode::Disabled,
-            x25519_pub: None,
-        },
-        tx,
-    )
-    .await
-    .expect("NetworkHandle::start")
 }
 
 // ─── Test 1: full_backup_restore_roundtrip ────────────────────────────────────
@@ -145,12 +120,10 @@ async fn full_backup_restore_roundtrip() {
     assert!(!results.is_empty(), "backup should produce at least one block");
 
     // Restore phase
-    let network = Arc::new(make_network_handle().await);
     let restore = RestoreCoordinator::new(
         db.clone(),
         restore_config(&symbols_dir),
         Arc::new(RaptorQEncoder::new()),
-        network,
     );
     let result = restore
         .restore(RestoreRequest {
@@ -211,12 +184,10 @@ async fn backup_restore_pack_multiple_files() {
     assert_eq!(results.len(), 1, "all files should pack into one source block");
 
     // Restore by prefix (the files_dir path)
-    let network = Arc::new(make_network_handle().await);
     let restore = RestoreCoordinator::new(
         db.clone(),
         restore_config(&symbols_dir),
         Arc::new(RaptorQEncoder::new()),
-        network,
     );
     let prefix = files_dir.path().to_string_lossy().to_string() + "/";
     let result = restore
@@ -245,10 +216,10 @@ async fn backup_restore_pack_multiple_files() {
 
 // ─── Test 3: network_symbol_transfer_between_nodes ───────────────────────────
 //
-// Node A sends a SymbolTransferMsg with real symbol data to Node B.
-// Verifies QUIC handshake + framed CBOR send/recv across two iroh endpoints.
+// Disabled in ε.5: used iroh QUIC NetworkHandle.
+// Network transfer is tested in swarm_tests.rs (libp2p) and E2E suite.
 
-#[tokio::test]
+#[cfg(any())]
 async fn network_symbol_transfer_between_nodes() {
     // Node A
     let seed_a = [0xA1u8; 32];
@@ -372,7 +343,7 @@ fn placement_produces_valid_allocation_for_pipeline() {
     let block_id = SourceBlockId(*blake3::hash(&stored).as_bytes());
 
     // Encode symbols for each holder (binding applied)
-    let mut all_bound: Vec<(Symbol, IdentityPub)> = Vec::new();
+    let mut all_bound: Vec<(Symbol, DeviceId)> = Vec::new();
     for alloc in &allocations {
         let symbols = encoder
             .encode(
@@ -381,12 +352,12 @@ fn placement_produces_valid_allocation_for_pipeline() {
                 alloc.start_esi,
                 alloc.symbol_count,
                 &block_id,
-                &alloc.identity,
+                &alloc.device_id,
             )
             .unwrap();
         assert_eq!(symbols.len(), alloc.symbol_count as usize);
         for sym in symbols {
-            all_bound.push((sym, alloc.identity));
+            all_bound.push((sym, alloc.device_id));
         }
     }
 
@@ -554,13 +525,13 @@ fn full_pipeline_backup_encode_decode_decrypt() {
                 alloc.start_esi,
                 alloc.symbol_count,
                 &block_id,
-                &alloc.identity,
+                &alloc.device_id,
             )
             .unwrap();
 
         // Unbind immediately (simulating the restore path)
         for sym in bound_symbols {
-            let unbound = encoder.unbind(sym, &block_id, &alloc.identity);
+            let unbound = encoder.unbind(sym, &block_id, &alloc.device_id);
             all_unbound.push(unbound);
 
             // Stop once we have enough symbols (k_eff)

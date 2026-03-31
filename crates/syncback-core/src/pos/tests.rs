@@ -5,7 +5,8 @@ use crate::pos::{
     select_challenge_esi, verify_response, PosChallenge, PosError, PosResponse, VerifyOutcome,
 };
 use crate::types::{
-    ErasureParams, FileId, IdentityPub, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
+    DeviceId, ErasureParams, FileId, PlacementStatus, SourceBlockId, SymbolPlacement,
+    Timestamp,
 };
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -14,11 +15,11 @@ fn block_id(byte: u8) -> SourceBlockId {
     SourceBlockId([byte; 32])
 }
 
-fn holder(byte: u8) -> IdentityPub {
-    IdentityPub([byte; 32])
+fn holder(byte: u8) -> DeviceId {
+    DeviceId([byte; 32])
 }
 
-fn make_placement(block: SourceBlockId, h: IdentityPub, esi_ranges: Vec<(u32, u32)>) -> SymbolPlacement {
+fn make_placement(block: SourceBlockId, h: DeviceId, esi_ranges: Vec<(u32, u32)>) -> SymbolPlacement {
     SymbolPlacement {
         source_block_id: block,
         holder_id: h,
@@ -34,7 +35,7 @@ fn make_placement(block: SourceBlockId, h: IdentityPub, esi_ranges: Vec<(u32, u3
 
 fn make_placement_with_status(
     block: SourceBlockId,
-    h: IdentityPub,
+    h: DeviceId,
     esi_ranges: Vec<(u32, u32)>,
     status: PlacementStatus,
     consecutive_misses: u32,
@@ -160,8 +161,8 @@ fn verify_response_fail_on_wrong_holder() {
     let params = small_params();
     let source_block = small_source_block(&params);
     let bid = block_id(1);
-    let holder_a = IdentityPub([0xAA; 32]);
-    let holder_b = IdentityPub([0xBB; 32]);
+    let holder_a = DeviceId([0xAA; 32]);
+    let holder_b = DeviceId([0xBB; 32]);
     let encoder = RaptorQEncoder::new();
 
     let symbols = encoder.encode(&source_block, &params, 0, 1, &bid, &holder_a).unwrap();
@@ -256,7 +257,8 @@ fn due_challenges_returns_placement_with_no_last_verified() {
     let hid = holder(2);
     let placement = make_placement(bid, hid, vec![(0, 10)]);
     let now = Timestamp(1_000_000);
-    let last_verified = vec![(bid, hid, None)];
+    let last_verified: Vec<(SourceBlockId, DeviceId, Option<Timestamp>)> =
+        vec![(bid, hid, None)];
 
     let entries = due_challenges(&[placement], &last_verified, now, |_| 0.5, 1);
     assert_eq!(entries.len(), 1);
@@ -272,7 +274,8 @@ fn due_challenges_skips_recently_verified() {
     // Verified 1 day ago, not yet due
     let now = Timestamp(1_000_000);
     let last_verified_ts = Timestamp(now.0 - 86400); // 1 day ago
-    let last_verified = vec![(bid, hid, Some(last_verified_ts))];
+    let last_verified: Vec<(SourceBlockId, DeviceId, Option<Timestamp>)> =
+        vec![(bid, hid, Some(last_verified_ts))];
 
     let entries = due_challenges(&[placement], &last_verified, now, |_| 1.0, 1);
     assert!(entries.is_empty());
@@ -287,7 +290,8 @@ fn due_challenges_returns_overdue_placement() {
     // cpw=1, interval=7 days. Verified 8 days ago → overdue.
     let now = Timestamp(2_000_000);
     let last_verified_ts = Timestamp(now.0 - 8 * 24 * 3600); // 8 days ago
-    let last_verified = vec![(bid, hid, Some(last_verified_ts))];
+    let last_verified: Vec<(SourceBlockId, DeviceId, Option<Timestamp>)> =
+        vec![(bid, hid, Some(last_verified_ts))];
 
     let entries = due_challenges(&[placement], &last_verified, now, |_| 1.0, 1);
     assert_eq!(entries.len(), 1);
@@ -299,7 +303,8 @@ fn due_challenges_available_esis_match_ranges() {
     let hid = holder(2);
     let placement = make_placement(bid, hid, vec![(100, 3)]);
     let now = Timestamp(1_000_000);
-    let last_verified = vec![(bid, hid, None)];
+    let last_verified: Vec<(SourceBlockId, DeviceId, Option<Timestamp>)> =
+        vec![(bid, hid, None)];
 
     let entries = due_challenges(&[placement], &last_verified, now, |_| 0.5, 1);
     assert_eq!(entries.len(), 1);
@@ -577,7 +582,8 @@ fn pos_due_challenges_does_not_filter_by_status() {
     placement.status = PlacementStatus::Deleting;
 
     let now = Timestamp(1_000_000);
-    let last_verified = vec![(bid, hid, None)];
+    let last_verified: Vec<(SourceBlockId, DeviceId, Option<Timestamp>)> =
+        vec![(bid, hid, None)];
 
     // due_challenges returns it — caller must filter before using
     let entries = due_challenges(&[placement], &last_verified, now, |_| 0.5, 1);
@@ -605,7 +611,7 @@ fn select_challenge_esi_always_within_ranges() {
     for esi_ranges in &configs {
         let placement = SymbolPlacement {
             source_block_id: SourceBlockId([0u8; 32]),
-            holder_id: IdentityPub([1u8; 32]),
+            holder_id: DeviceId([1u8; 32]),
             file_id: crate::types::FileId(1),
             esi_ranges: esi_ranges.clone(),
             binding_seed: [0u8; 32],

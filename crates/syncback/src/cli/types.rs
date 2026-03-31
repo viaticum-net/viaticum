@@ -29,9 +29,9 @@ pub enum CliRequest {
     Versions {
         path: String,
     },
-    /// Connect to a peer by iroh address string.
+    /// Connect to a peer by node address string.
     Connect {
-        /// Iroh node address of the peer.
+        /// Node address of the peer (format: <device_id_hex>@<ip>:<port>).
         addr: String,
     },
 }
@@ -59,7 +59,7 @@ pub enum CliResponse {
 pub struct StatusData {
     /// This node's identity pubkey (hex).
     pub node_identity: String,
-    /// This node's iroh endpoint address (for `syncback connect`).
+    /// This node's libp2p address (for `syncback connect`).
     pub node_addr: String,
     /// Number of known peers.
     pub peer_count: u32,

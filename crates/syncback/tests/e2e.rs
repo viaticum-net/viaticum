@@ -6,13 +6,10 @@
 //
 // Run with: cargo test -p syncback --test e2e -- --nocapture
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use syncback::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
-use syncback::daemon::network::{NetworkConfig, NetworkHandle};
+
 use syncback::daemon::restore::{RestoreConfig, RestoreCoordinator, RestoreRequest, VersionSelector};
 use syncback_core::cluster::{
     derive_device_key, derive_epoch_key, derive_master_key, issue_device_certificate,
@@ -29,8 +26,8 @@ use tempfile::TempDir;
 // ─── Shared fixtures ──────────────────────────────────────────────────────────
 
 const SEED: &[u8] = &[0xCC_u8; 64];
-const DEVICE_A: DeviceId = DeviceId([0xA0u8; 16]);
-const DEVICE_B: DeviceId = DeviceId([0xB0u8; 16]);
+const DEVICE_A_SEED: [u8; 32] = [0xA0u8; 32];
+const DEVICE_B_SEED: [u8; 32] = [0xB0u8; 32];
 const EPOCH_KEY: [u8; 32] = [0x42u8; 32];
 /// Small source block size so all small test files fit within one block.
 const SMALL_BLOCK_SIZE: u64 = 65_535 * 2;
@@ -39,7 +36,7 @@ const NOW: Timestamp = Timestamp(1_700_000_000);
 fn test_holders() -> Vec<HolderCandidate> {
     (0..5)
         .map(|i| HolderCandidate {
-            identity: IdentityPub([(i + 1) as u8; 32]),
+            device_id: DeviceId([(i + 1) as u8; 32]),
             trust: 0.3 + (i as f64) * 0.1,
         })
         .collect()
@@ -50,15 +47,14 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         source_block_size: SMALL_BLOCK_SIZE,
         symbols_dir: symbols_dir.path().to_path_buf(),
         epoch_key: EPOCH_KEY,
-        device_id: DEVICE_A,
+        device_id: device_a(),
         mock_holders: test_holders(),
         cluster_state: None,
-        network: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
         master_signing_key: None,
-        pending_deliveries: None,
+        swarm: None,
     }
 }
 
@@ -67,8 +63,9 @@ fn restore_config(symbols_dir: &TempDir) -> RestoreConfig {
         epoch_key: EPOCH_KEY,
         parallel_holders: 5,
         identity: IdentityPub([0x99u8; 32]),
-        device_id: DEVICE_B,
+        device_id: device_b(),
         symbols_dir: symbols_dir.path().to_path_buf(),
+        swarm: None,
     }
 }
 
@@ -78,40 +75,22 @@ fn write_file(dir: &TempDir, name: &str, content: &[u8]) -> String {
     path.to_string_lossy().into_owned()
 }
 
-async fn make_network_handle() -> NetworkHandle {
-    let sk = SigningKey::generate(&mut OsRng);
-    let mi = IdentityPub(sk.verifying_key().to_bytes());
-    let (tx, _rx) = tokio::sync::mpsc::channel(64);
-    NetworkHandle::start(
-        NetworkConfig {
-            signing_key: sk.clone(),
-            master_signing_key: sk,
-            master_identity: mi,
-            known_peers: HashMap::new(),
-            device_cert: None,
-            iroh_secret_key: None,
-            relay_mode: iroh::RelayMode::Disabled,
-            x25519_pub: None,
-        },
-        tx,
-    )
-    .await
-    .expect("NetworkHandle::start")
+
+
+fn device_a() -> DeviceId {
+    DeviceId(derive_device_key(SEED, &DEVICE_A_SEED).unwrap().verifying_key().to_bytes())
 }
 
-fn device_pub_bytes(device_id: DeviceId) -> [u8; 32] {
-    derive_device_key(SEED, &device_id)
-        .unwrap()
-        .verifying_key()
-        .to_bytes()
+fn device_b() -> DeviceId {
+    DeviceId(derive_device_key(SEED, &DEVICE_B_SEED).unwrap().verifying_key().to_bytes())
 }
 
 fn init_cluster(db: Db) -> ClusterState {
     let master = derive_master_key(SEED).unwrap();
     let mp = master_identity(&master);
-    let cert_a = issue_device_certificate(&master, DEVICE_A, device_pub_bytes(DEVICE_A), NOW);
+    let cert_a = issue_device_certificate(&master, device_a(), NOW);
     let mut state = ClusterState::init(db, mp, cert_a, NOW, NOW).unwrap();
-    let cert_b = issue_device_certificate(&master, DEVICE_B, device_pub_bytes(DEVICE_B), NOW);
+    let cert_b = issue_device_certificate(&master, device_b(), NOW);
     state.add_device(cert_b, NOW).unwrap();
     state
 }
@@ -154,21 +133,21 @@ async fn full_lifecycle_e2e() {
         .process_event(DirtyEvent {
             path: photo_path.clone(),
             kind: DirtyKind::Added,
-            device_id: DEVICE_A,
+            device_id: device_a(),
         })
         .unwrap();
     backup
         .process_event(DirtyEvent {
             path: doc_path.clone(),
             kind: DirtyKind::Added,
-            device_id: DEVICE_A,
+            device_id: device_a(),
         })
         .unwrap();
     backup
         .process_event(DirtyEvent {
             path: archive_path.clone(),
             kind: DirtyKind::Added,
-            device_id: DEVICE_A,
+            device_id: device_a(),
         })
         .unwrap();
 
@@ -198,7 +177,7 @@ async fn full_lifecycle_e2e() {
         .process_event(DirtyEvent {
             path: photo_path.clone(),
             kind: DirtyKind::Modified,
-            device_id: DEVICE_A,
+            device_id: device_a(),
         })
         .unwrap();
     backup.flush_all(true).unwrap();
@@ -220,12 +199,10 @@ async fn full_lifecycle_e2e() {
 
     // ── Step 3: Selective restore ─────────────────────────────────────────────
 
-    let network = Arc::new(make_network_handle().await);
     let restore = RestoreCoordinator::new(
         db.clone(),
         restore_config(&symbols_dir),
         Arc::new(RaptorQEncoder::new()),
-        network,
     );
 
     // 3a — restore photo.jpg at Latest version → must be v1 (new_photo_content)
@@ -235,7 +212,7 @@ async fn full_lifecycle_e2e() {
             path: photo_path.clone(),
             version_selector: VersionSelector::Latest,
             output_dir: out_latest.path().to_path_buf(),
-            device_id: DEVICE_B,
+            device_id: device_b(),
         })
         .await
         .unwrap();
@@ -262,7 +239,7 @@ async fn full_lifecycle_e2e() {
             path: photo_path.clone(),
             version_selector: VersionSelector::Index(0),
             output_dir: out_v0.path().to_path_buf(),
-            device_id: DEVICE_B,
+            device_id: device_b(),
         })
         .await
         .unwrap();
@@ -289,7 +266,7 @@ async fn full_lifecycle_e2e() {
             path: prefix,
             version_selector: VersionSelector::Latest,
             output_dir: out_all.path().to_path_buf(),
-            device_id: DEVICE_B,
+            device_id: device_b(),
         })
         .await
         .unwrap();
@@ -320,15 +297,14 @@ async fn full_lifecycle_e2e() {
             source_block_size: SMALL_BLOCK_SIZE,
             symbols_dir: symbols_dir.path().to_path_buf(),
             epoch_key: EPOCH_KEY,
-            device_id: DEVICE_B,
+            device_id: device_b(),
             mock_holders: test_holders(),
             cluster_state: Some(Arc::clone(&cluster_state)),
-            network: None,
             watch_configs: vec![],
             time_scale: 1,
             mock_offer_budget_gb: None,
             master_signing_key: None,
-            pending_deliveries: None,
+            swarm: None,
         },
         Arc::new(RaptorQEncoder::new()),
     );
@@ -339,7 +315,7 @@ async fn full_lifecycle_e2e() {
         .process_event(DirtyEvent {
             path: b_photo_path.clone(),
             kind: DirtyKind::Added,
-            device_id: DEVICE_B,
+            device_id: device_b(),
         })
         .unwrap();
     let results_b = backup_b.flush_all(true).unwrap();
@@ -361,14 +337,14 @@ async fn full_lifecycle_e2e() {
 
     let master = derive_master_key(SEED).unwrap();
     let new_epoch = EpochCounter(1);
-    let rev = issue_revocation(&master, DEVICE_B, NOW, new_epoch);
+    let rev = issue_revocation(&master, device_b(), NOW, new_epoch);
 
     {
         let mut state = cluster_state.lock().unwrap();
         state.revoke_device(rev, NOW, NOW).unwrap();
 
-        assert!(state.is_device_revoked(&DEVICE_B), "B must be revoked");
-        assert!(!state.is_device_revoked(&DEVICE_A), "A must not be revoked");
+        assert!(state.is_device_revoked(&device_b()), "B must be revoked");
+        assert!(!state.is_device_revoked(&device_a()), "A must not be revoked");
         assert_eq!(state.current_epoch(), EpochCounter(1), "epoch must be 1");
     }
 
@@ -381,12 +357,12 @@ async fn full_lifecycle_e2e() {
     );
 
     // An external peer that learns about the revocation can store B's device
-    // pub key in its revoked list and reject further connections from B.
-    let b_device_pub = device_pub_bytes(DEVICE_B);
-    let a_device_pub = device_pub_bytes(DEVICE_A);
+    // id (= pub key) in its revoked list and reject further connections from B.
+    let b_device_pub = device_b().0;
+    let a_device_pub = device_a().0;
     let mut peer = PeerRecord {
-        identity: IdentityPub([0xFFu8; 32]),
-        node_id: None,
+        device_id: DeviceId([0xFFu8; 32]),
+        master_identity: IdentityPub([0xFFu8; 32]),
         trust_p: 0.5,
         trust_i: 0.5,
         trust_s: 1.0,
@@ -394,7 +370,6 @@ async fn full_lifecycle_e2e() {
         bytes_peer_stores_for_us: 0,
         first_seen: NOW,
         last_seen: NOW,
-        device_id: None,
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
@@ -402,11 +377,11 @@ async fn full_lifecycle_e2e() {
     peer.revoked_device_pub_keys.push(b_device_pub);
 
     assert!(
-        peer.is_device_revoked(&IdentityPub(b_device_pub)),
+        peer.is_device_revoked(&DeviceId(b_device_pub)),
         "peer must reject B's device pub key"
     );
     assert!(
-        !peer.is_device_revoked(&IdentityPub(a_device_pub)),
+        !peer.is_device_revoked(&DeviceId(a_device_pub)),
         "peer must not reject A's device pub key"
     );
 
@@ -427,18 +402,18 @@ async fn full_lifecycle_e2e() {
     // (In production, watcher would emit Deleted events on each device.)
     let mut doc_b_deleted = doc_record.clone();
     for (id, state) in &mut doc_b_deleted.devices {
-        if *id == DEVICE_B {
+        if *id == device_b() {
             *state = LocalState::Deleted(NOW);
         }
     }
     db.upsert_file(&doc_b_deleted).unwrap();
 
-    // Now re-read and mark DEVICE_A deleted: all devices are Deleted → CooldownStarted
+    // Now re-read and mark device_a deleted: all devices are Deleted → CooldownStarted
     let doc_record_fresh = db
         .get_file(&doc_path)
         .unwrap()
         .expect("document.txt must be in DB");
-    let del_result = engine.mark_deleted(&doc_record_fresh, DEVICE_A, NOW).unwrap();
+    let del_result = engine.mark_deleted(&doc_record_fresh, device_a(), NOW).unwrap();
     assert!(
         matches!(del_result, MarkDeletedResult::CooldownStarted { .. }),
         "all-devices-deleted must start cooldown: got {:?}",
@@ -455,7 +430,7 @@ async fn full_lifecycle_e2e() {
     // Persist DEVICE_A as Deleted(NOW) too
     let mut updated_doc = doc_record_fresh.clone();
     for (id, state) in &mut updated_doc.devices {
-        if *id == DEVICE_A {
+        if *id == device_a() {
             *state = LocalState::Deleted(NOW);
         }
     }

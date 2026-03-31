@@ -136,12 +136,16 @@ async fn report_missing_holding(
 ) -> anyhow::Result<()> {
     db.delete_holding(&holding.source_block_id, &holding.owner_id)?;
 
-    if let Err(e) = db.refresh_peer_storage_bytes(&holding.owner_id) {
-        warn!(
-            owner = %holding.owner_id,
-            err = %e,
-            "holdings_integrity: failed to refresh storage bytes"
-        );
+    // Refresh storage bytes for all devices of this owner's master identity.
+    for did in db.get_devices_for_master(&holding.owner_id).unwrap_or_default() {
+        if let Err(e) = db.refresh_peer_storage_bytes(&did) {
+            warn!(
+                owner = %holding.owner_id,
+                device = %did,
+                err = %e,
+                "holdings_integrity: failed to refresh storage bytes"
+            );
+        }
     }
 
     let msg = SymbolDroppedMsg {

@@ -5,28 +5,18 @@
 // Source block size is small (65_535 * 2 = ~128 KB) to keep encode/decode fast.
 // Async tests use #[tokio::test].
 //
-// Network-fetch tests (Phase 7.7):
-//   - collect_esis_from_ranges_* — unit tests for the ESI helper.
-//   - fetch_from_holders_returns_insufficient_when_no_peers_reachable — all
-//     holders unreachable → InsufficientSymbols.
-//   - fetch_skips_denied_holder_and_tries_next — holder A returns
-//     RestoreDenied; holder B returns symbols; decode succeeds.
-//   - decode_block_fetches_from_network_when_local_files_missing — owner
-//     symbols_dir empty; two holder nodes serve symbols over iroh; decode
-//     roundtrip produces original plaintext.
+// Network-fetch tests (Phase 7.7 iroh era) removed in ε.5:
+//   - fetch_skips_denied_holder_and_tries_next — used iroh NetworkHandle
+//   - decode_block_fetches_from_network_when_local_files_missing — used iroh NetworkHandle
+// Network restore via libp2p SwarmHandle is tested in swarm_tests.rs and E2E.
 
 use std::sync::Arc;
 
-use ed25519_dalek::SigningKey;
-use syncback_core::cluster::{
-    derive_device_key, derive_master_key, issue_device_certificate, master_identity,
-};
 use syncback_core::db::Db;
-use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
-use syncback_core::messages::{Message, RestoreDeniedMsg, RestoreResponseMsg};
+use syncback_core::erasure::RaptorQEncoder;
 use syncback_core::types::{
     DeviceId, ErasureParams, FileId, FileRecord, FileVersion, IdentityPub, LocalState, PackEntry,
-    PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType,
+    PlacementStatus, SourceBlockId,
     SymbolPlacement, Timestamp,
 };
 use syncback_core::types::to_cbor_bytes;
@@ -35,9 +25,6 @@ use tempfile::TempDir;
 use crate::daemon::backup::{
     BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind,
 };
-use crate::daemon::backup::pipeline::compress_and_encrypt;
-use crate::daemon::network::{NetworkConfig, NetworkHandle};
-use crate::daemon::restore::pipeline::hex_encode;
 
 use super::{collect_esis_from_ranges, RestoreConfig, RestoreCoordinator, VersionSelector};
 
@@ -51,7 +38,7 @@ const TEST_EPOCH_KEY: [u8; 32] = [42u8; 32];
 fn test_holders() -> Vec<syncback_core::placement::HolderCandidate> {
     (0..5)
         .map(|i| syncback_core::placement::HolderCandidate {
-            identity: IdentityPub([(i + 1) as u8; 32]),
+            device_id: syncback_core::types::DeviceId([(i + 1) as u8; 32]),
             trust: 0.3 + (i as f64) * 0.1,
         })
         .collect()
@@ -63,76 +50,37 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         source_block_size: SMALL_BLOCK_SIZE,
         symbols_dir: symbols_dir.path().to_path_buf(),
         epoch_key: TEST_EPOCH_KEY,
-        device_id: DeviceId([1u8; 16]),
+        device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
         cluster_state: None,
-        network: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
         master_signing_key: None,
-        pending_deliveries: None,
+        swarm: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
 
-/// Build a RestoreCoordinator for Phase 2 (local) tests.
-/// Creates a throwaway NetworkHandle; not used in local restore.
-async fn test_restore_coord(
+/// Build a RestoreCoordinator for Phase 2 (local) tests (no network needed).
+fn test_restore_coord(
     db: Db,
     symbols_dir: &TempDir,
-) -> (RestoreCoordinator, NetworkHandle) {
-    let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-    let (tx, _rx) = tokio::sync::mpsc::channel(1);
-    let config_net = NetworkConfig {
-        signing_key: signing_key.clone(),
-        master_signing_key: signing_key.clone(),
-        master_identity: IdentityPub(signing_key.verifying_key().to_bytes()),
-        known_peers: Default::default(),
-        device_cert: None,
-        iroh_secret_key: None,
-        relay_mode: iroh::RelayMode::Disabled,
-        x25519_pub: None,
-    };
-    let network = NetworkHandle::start(config_net, tx)
-        .await
-        .expect("NetworkHandle::start in test");
-
+) -> RestoreCoordinator {
     let restore_config = RestoreConfig {
         epoch_key: TEST_EPOCH_KEY,
         parallel_holders: 5,
         identity: IdentityPub([9u8; 32]),
-        device_id: DeviceId([2u8; 16]),
+        device_id: DeviceId([2u8; 32]),
         symbols_dir: symbols_dir.path().to_path_buf(),
+        swarm: None,
     };
 
-    let coord = RestoreCoordinator::new(
+    RestoreCoordinator::new(
         db,
         restore_config,
         Arc::new(RaptorQEncoder::new()),
-        Arc::new(network),
-    );
-    // We can't return network because it was moved into Arc; just return coord
-    // with a second one for shutdown if needed. For tests, leaking is fine.
-    let signing_key2 = SigningKey::from_bytes(&[10u8; 32]);
-    let (tx2, _rx2) = tokio::sync::mpsc::channel(1);
-    let net2 = NetworkHandle::start(
-        NetworkConfig {
-            signing_key: signing_key2.clone(),
-            master_signing_key: signing_key2.clone(),
-            master_identity: IdentityPub(signing_key2.verifying_key().to_bytes()),
-            known_peers: Default::default(),
-            device_cert: None,
-            iroh_secret_key: None,
-            relay_mode: iroh::RelayMode::Disabled,
-            x25519_pub: None,
-        },
-        tx2,
     )
-    .await
-    .expect("NetworkHandle::start in test 2");
-
-    (coord, net2)
 }
 
 /// Write a file to a TempDir and return its absolute path string.
@@ -147,7 +95,7 @@ fn added_event(path: &str) -> DirtyEvent {
     DirtyEvent {
         path: path.to_string(),
         kind: DirtyKind::Added,
-        device_id: DeviceId([1u8; 16]),
+        device_id: DeviceId([1u8; 32]),
     }
 }
 
@@ -372,12 +320,12 @@ async fn restore_single_file_by_exact_path() {
     assert!(!results.is_empty(), "should have produced at least one block");
 
     // Restore
-    let (restore, _net) = test_restore_coord(db.clone(), &symbols_dir).await;
+    let restore = test_restore_coord(db.clone(), &symbols_dir);
     let request = super::RestoreRequest {
         path: path.clone(),
         version_selector: VersionSelector::Latest,
         output_dir: out_dir.path().to_path_buf(),
-        device_id: DeviceId([2u8; 16]),
+        device_id: DeviceId([2u8; 32]),
     };
     let result = restore.restore(request).await.unwrap();
 
@@ -416,13 +364,13 @@ async fn restore_pack_multiple_files_roundtrip() {
     assert!(!results.is_empty(), "should have produced blocks");
 
     // Restore all 3 using prefix (the files_dir path as prefix)
-    let (restore, _net) = test_restore_coord(db.clone(), &symbols_dir).await;
+    let restore = test_restore_coord(db.clone(), &symbols_dir);
     let prefix = files_dir.path().to_string_lossy().to_string() + "/";
     let request = super::RestoreRequest {
         path: prefix,
         version_selector: VersionSelector::Latest,
         output_dir: out_dir.path().to_path_buf(),
-        device_id: DeviceId([2u8; 16]),
+        device_id: DeviceId([2u8; 32]),
     };
     let result = restore.restore(request).await.unwrap();
 
@@ -464,7 +412,7 @@ async fn restore_specific_version_by_index() {
         .process_event(DirtyEvent {
             path: path.clone(),
             kind: DirtyKind::Modified,
-            device_id: DeviceId([1u8; 16]),
+            device_id: DeviceId([1u8; 32]),
         })
         .unwrap();
     backup.flush_all(true).unwrap();
@@ -479,12 +427,12 @@ async fn restore_specific_version_by_index() {
     assert_eq!(backed_up_count, 2, "should have 2 backed-up versions");
 
     // Restore version index 0 (the first)
-    let (restore, _net) = test_restore_coord(db.clone(), &symbols_dir).await;
+    let restore = test_restore_coord(db.clone(), &symbols_dir);
     let request_v0 = super::RestoreRequest {
         path: path.clone(),
         version_selector: VersionSelector::Index(0),
         output_dir: out_dir1.path().to_path_buf(),
-        device_id: DeviceId([2u8; 16]),
+        device_id: DeviceId([2u8; 32]),
     };
     let result = restore.restore(request_v0).await.unwrap();
     assert_eq!(result.files_restored, 1, "failures: {:?}", result.failures);
@@ -498,7 +446,7 @@ async fn restore_specific_version_by_index() {
         path: path.clone(),
         version_selector: VersionSelector::Latest,
         output_dir: out_dir2.path().to_path_buf(),
-        device_id: DeviceId([2u8; 16]),
+        device_id: DeviceId([2u8; 32]),
     };
     let result2 = restore.restore(request_latest).await.unwrap();
     assert_eq!(result2.files_restored, 1, "failures: {:?}", result2.failures);
@@ -536,13 +484,13 @@ async fn restore_prefix_matches_multiple_files() {
     backup.flush_all(true).unwrap();
 
     // Restore only photos prefix
-    let (restore, _net) = test_restore_coord(db.clone(), &symbols_dir).await;
+    let restore = test_restore_coord(db.clone(), &symbols_dir);
     let photos_prefix = photos_dir.to_string_lossy().to_string() + "/";
     let request = super::RestoreRequest {
         path: photos_prefix,
         version_selector: VersionSelector::Latest,
         output_dir: out_dir.path().to_path_buf(),
-        device_id: DeviceId([2u8; 16]),
+        device_id: DeviceId([2u8; 32]),
     };
     let result = restore.restore(request).await.unwrap();
 
@@ -564,12 +512,12 @@ async fn restore_missing_path_returns_empty_result() {
     let symbols_dir = TempDir::new().unwrap();
     let out_dir = TempDir::new().unwrap();
 
-    let (restore, _net) = test_restore_coord(db.clone(), &symbols_dir).await;
+    let restore = test_restore_coord(db.clone(), &symbols_dir);
     let request = super::RestoreRequest {
         path: "/nonexistent/file.txt".to_string(),
         version_selector: VersionSelector::Latest,
         output_dir: out_dir.path().to_path_buf(),
-        device_id: DeviceId([2u8; 16]),
+        device_id: DeviceId([2u8; 32]),
     };
     let result = restore.restore(request).await.unwrap();
 
@@ -592,8 +540,8 @@ async fn restore_updates_local_state_to_present() {
     backup.process_event(added_event(&path)).unwrap();
     backup.flush_all(true).unwrap();
 
-    let restore_device = DeviceId([2u8; 16]);
-    let (restore, _net) = test_restore_coord(db.clone(), &symbols_dir).await;
+    let restore_device = DeviceId([2u8; 32]);
+    let restore = test_restore_coord(db.clone(), &symbols_dir);
     let request = super::RestoreRequest {
         path: path.clone(),
         version_selector: VersionSelector::Latest,
@@ -637,13 +585,13 @@ async fn restore_deduplicates_source_blocks() {
     // Both files should land in the same block (total size << SMALL_BLOCK_SIZE)
     assert_eq!(results.len(), 1, "should produce exactly 1 block");
 
-    let (restore, _net) = test_restore_coord(db.clone(), &symbols_dir).await;
+    let restore = test_restore_coord(db.clone(), &symbols_dir);
     let prefix = files_dir.path().to_string_lossy().to_string() + "/";
     let request = super::RestoreRequest {
         path: prefix,
         version_selector: VersionSelector::Latest,
         output_dir: out_dir.path().to_path_buf(),
-        device_id: DeviceId([2u8; 16]),
+        device_id: DeviceId([2u8; 32]),
     };
     let result = restore.restore(request).await.unwrap();
 
@@ -681,8 +629,7 @@ fn collect_esis_from_ranges_count_one() {
 
 #[tokio::test]
 async fn fetch_from_holders_returns_insufficient_when_no_peers_reachable() {
-    // 3 placements, all Alive, but the owner NetworkHandle has no known_peers.
-    // Every get_connection call returns PeerNotFound; all holders are skipped.
+    // 3 placements, all Alive, but swarm is None (no peers reachable).
     // Expected: InsufficientSymbols(got=0).
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
@@ -692,7 +639,7 @@ async fn fetch_from_holders_returns_insufficient_when_no_peers_reachable() {
     let placements: Vec<SymbolPlacement> = (0u8..3)
         .map(|i| SymbolPlacement {
             source_block_id: block_id,
-            holder_id: IdentityPub([(i + 1) * 0x11u8; 32]),
+            holder_id: syncback_core::types::DeviceId([(i + 1) * 0x11u8; 32]),
             file_id: FileId(1),
             esi_ranges: vec![(u32::from(i) * 3, 3)],
             binding_seed: [0u8; 32],
@@ -703,7 +650,7 @@ async fn fetch_from_holders_returns_insufficient_when_no_peers_reachable() {
         })
         .collect();
 
-    let (coord, _net) = test_restore_coord(db, &symbols_dir).await;
+    let coord = test_restore_coord(db, &symbols_dir);
     let params = ErasureParams::compute(65_535_u64, 0.5);
 
     let result = coord
@@ -719,11 +666,15 @@ async fn fetch_from_holders_returns_insufficient_when_no_peers_reachable() {
     );
 }
 
-// ─── fetch_skips_denied_holder_and_tries_next ─────────────────────────────────
+// fetch_skips_denied_holder_and_tries_next and
+// decode_block_fetches_from_network_when_local_files_missing removed in ε.5.
+// Both used iroh NetworkHandle + connection::Connection for direct QUIC exchange.
+// Network restore via libp2p SwarmHandle is tested in swarm_tests.rs and E2E.
 
 /// Holder A returns RestoreDenied; Holder B has all k_eff symbols.
 /// fetch_from_holders skips A and collects from B successfully.
-#[tokio::test]
+// Disabled in ε.5: used iroh NetworkHandle. Network restore tested in swarm_tests.rs + E2E.
+#[cfg(any())]
 async fn fetch_skips_denied_holder_and_tries_next() {
     let content = b"hello from the network restore test";
     let epoch_key = [0x77u8; 32];
@@ -746,7 +697,7 @@ async fn fetch_skips_denied_holder_and_tries_next() {
     let seed_b = [0x0Bu8; 32];
     let master_key_b = derive_master_key(&seed_b).unwrap();
     let master_b = master_identity(&master_key_b);
-    let did_b = DeviceId([0x0Bu8; 16]);
+    let did_b = DeviceId([0x0Bu8; 32]);
     let device_key_b = derive_device_key(&seed_b, &did_b).unwrap();
     let cert_b = issue_device_certificate(
         &master_key_b,
@@ -770,7 +721,7 @@ async fn fetch_skips_denied_holder_and_tries_next() {
     let seed_a = [0x0Au8; 32];
     let master_key_a = derive_master_key(&seed_a).unwrap();
     let master_a = master_identity(&master_key_a);
-    let did_a = DeviceId([0x0Au8; 16]);
+    let did_a = DeviceId([0x0Au8; 32]);
     let device_key_a = derive_device_key(&seed_a, &did_a).unwrap();
     let cert_a = issue_device_certificate(
         &master_key_a,
@@ -915,7 +866,7 @@ async fn fetch_skips_denied_holder_and_tries_next() {
     let seed_owner = [0x99u8; 32];
     let owner_master_key = derive_master_key(&seed_owner).unwrap();
     let owner_master = master_identity(&owner_master_key);
-    let owner_did = DeviceId([0xAAu8; 16]);
+    let owner_did = DeviceId([0xAAu8; 32]);
     let owner_device_key = derive_device_key(&seed_owner, &owner_did).unwrap();
     let owner_cert = issue_device_certificate(
         &owner_master_key,
@@ -948,6 +899,7 @@ async fn fetch_skips_denied_holder_and_tries_next() {
         identity: owner_master,
         device_id: owner_did,
         symbols_dir: symbols_dir.path().to_path_buf(),
+        swarm: None,
     };
     let coord = RestoreCoordinator::new(
         db,
@@ -989,7 +941,8 @@ async fn fetch_skips_denied_holder_and_tries_next() {
 /// Owner symbols_dir is empty. Two holder network nodes each serve their
 /// portion of symbols. decode_block_local falls back to network and returns
 /// the original plaintext.
-#[tokio::test]
+// Disabled in ε.5: used iroh NetworkHandle. Network restore tested in swarm_tests.rs + E2E.
+#[cfg(any())]
 async fn decode_block_fetches_from_network_when_local_files_missing() {
     let content = b"network restore integration test content for phase 7.7";
     let epoch_key = [0x42u8; 32];
@@ -1012,7 +965,7 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
     let seed_h1 = [0x11u8; 32];
     let master_key_h1 = derive_master_key(&seed_h1).unwrap();
     let master_h1 = master_identity(&master_key_h1);
-    let did_h1 = DeviceId([0x11u8; 16]);
+    let did_h1 = DeviceId([0x11u8; 32]);
     let device_key_h1 = derive_device_key(&seed_h1, &did_h1).unwrap();
     let cert_h1 = issue_device_certificate(
         &master_key_h1,
@@ -1025,7 +978,7 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
     let seed_h2 = [0x22u8; 32];
     let master_key_h2 = derive_master_key(&seed_h2).unwrap();
     let master_h2 = master_identity(&master_key_h2);
-    let did_h2 = DeviceId([0x22u8; 16]);
+    let did_h2 = DeviceId([0x22u8; 32]);
     let device_key_h2 = derive_device_key(&seed_h2, &did_h2).unwrap();
     let cert_h2 = issue_device_certificate(
         &master_key_h2,
@@ -1187,7 +1140,7 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
     let seed_owner = [0x55u8; 32];
     let owner_master_key = derive_master_key(&seed_owner).unwrap();
     let owner_master = master_identity(&owner_master_key);
-    let owner_did = DeviceId([0x66u8; 16]);
+    let owner_did = DeviceId([0x66u8; 32]);
     let owner_device_key = derive_device_key(&seed_owner, &owner_did).unwrap();
     let owner_cert = issue_device_certificate(
         &owner_master_key,
@@ -1223,6 +1176,7 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
         identity: owner_master,
         device_id: owner_did,
         symbols_dir: symbols_dir.path().to_path_buf(),
+        swarm: None,
     };
     let coord = RestoreCoordinator::new(db, restore_config, encoder, Arc::new(owner_net));
 

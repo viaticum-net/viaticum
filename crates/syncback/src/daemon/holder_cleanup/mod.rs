@@ -10,7 +10,7 @@ use syncback_core::budget::{evaluate_pressure, DiskPressure};
 use syncback_core::constants::{KI, KP, S_CLAMP_MAX, S_CLAMP_MIN};
 use syncback_core::db::Db;
 use syncback_core::messages::SymbolDroppedMsg;
-use syncback_core::types::{hex_encode, IdentityPub, Timestamp};
+use syncback_core::types::{hex_encode, IdentityPub, Timestamp}; // IdentityPub for HoldingRecord.owner_id
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -136,13 +136,16 @@ async fn cleanup_expired(
             &holding.esi_ranges,
         ).await;
 
-        // Refresh storage bytes for this peer.
-        if let Err(e) = db.refresh_peer_storage_bytes(&holding.owner_id) {
-            warn!(
-                owner = %holding.owner_id,
-                err = %e,
-                "holder_cleanup: failed to refresh storage bytes"
-            );
+        // Refresh storage bytes for all devices of this owner's master identity.
+        for did in db.get_devices_for_master(&holding.owner_id).unwrap_or_default() {
+            if let Err(e) = db.refresh_peer_storage_bytes(&did) {
+                warn!(
+                    owner = %holding.owner_id,
+                    device = %did,
+                    err = %e,
+                    "holder_cleanup: failed to refresh storage bytes"
+                );
+            }
         }
 
         info!(
@@ -204,13 +207,16 @@ async fn cleanup_drop_notices(
             &holding.esi_ranges,
         ).await;
 
-        // Refresh storage bytes.
-        if let Err(e) = db.refresh_peer_storage_bytes(&holding.owner_id) {
-            warn!(
-                owner = %holding.owner_id,
-                err = %e,
-                "holder_cleanup: failed to refresh storage bytes after drop notice cleanup"
-            );
+        // Refresh storage bytes for all devices of this owner's master identity.
+        for did in db.get_devices_for_master(&holding.owner_id).unwrap_or_default() {
+            if let Err(e) = db.refresh_peer_storage_bytes(&did) {
+                warn!(
+                    owner = %holding.owner_id,
+                    device = %did,
+                    err = %e,
+                    "holder_cleanup: failed to refresh storage bytes after drop notice cleanup"
+                );
+            }
         }
 
         info!(
@@ -245,12 +251,17 @@ async fn check_pressure(
     );
 
     let trust_fn = |owner: &IdentityPub| -> f64 {
-        match db.get_peer(owner) {
-            Ok(Some(peer)) => {
+        // PeerRecord is keyed by DeviceId; look up the first device for this master.
+        let devices = db.get_devices_for_master(owner).unwrap_or_default();
+        let peer_opt = devices
+            .iter()
+            .find_map(|did| db.get_peer(did).ok().flatten());
+        match peer_opt {
+            Some(peer) => {
                 let s = peer.trust_s.clamp(S_CLAMP_MIN, S_CLAMP_MAX);
                 (KP * peer.trust_p + KI * peer.trust_i) * s
             }
-            _ => 0.5,
+            None => 0.5,
         }
     };
 
@@ -358,14 +369,17 @@ async fn check_pressure(
                 }
             }
 
-            // Refresh storage bytes for evicted owners.
+            // Refresh storage bytes for evicted owners (all devices of each master).
             for target in &result.immediate_evictions {
-                if let Err(e) = db.refresh_peer_storage_bytes(&target.owner_id) {
-                    warn!(
-                        owner = %target.owner_id,
-                        err = %e,
-                        "holder_cleanup: failed to refresh storage bytes after eviction"
-                    );
+                for did in db.get_devices_for_master(&target.owner_id).unwrap_or_default() {
+                    if let Err(e) = db.refresh_peer_storage_bytes(&did) {
+                        warn!(
+                            owner = %target.owner_id,
+                            device = %did,
+                            err = %e,
+                            "holder_cleanup: failed to refresh storage bytes after eviction"
+                        );
+                    }
                 }
             }
         }

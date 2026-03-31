@@ -10,7 +10,8 @@ use syncback_core::constants::DECODE_OVERHEAD;
 use syncback_core::db::{Db, DbError};
 use syncback_core::erasure::ErasureEncoder;
 use syncback_core::types::{
-    hex_encode, ErasureParams, FileId, IdentityPub, PlacementStatus, SourceBlockId, Timestamp,
+    hex_encode, DeviceId, ErasureParams, FileId, IdentityPub, PlacementStatus, SourceBlockId,
+    Timestamp,
 };
 
 #[cfg(test)]
@@ -40,7 +41,7 @@ pub struct RepairConfig {
 #[derive(Debug, Clone)]
 pub struct RepairJob {
     pub source_block_id: SourceBlockId,
-    pub holder_id: IdentityPub,
+    pub holder_id: DeviceId,
     pub file_id: FileId,
 }
 
@@ -62,7 +63,7 @@ pub enum RepairError {
     RecordMissing(SourceBlockId),
 
     #[error("placement record missing from DB: block={0} holder={1}")]
-    PlacementMissing(SourceBlockId, IdentityPub),
+    PlacementMissing(SourceBlockId, DeviceId),
 
     #[error("erasure encode failed: {0}")]
     EncodeFailed(String),
@@ -80,7 +81,7 @@ pub enum RepairTrigger {
     /// Immediate repair of a specific placement.
     RepairNow {
         block_id: SourceBlockId,
-        holder_id: IdentityPub,
+        holder_id: DeviceId,
     },
     /// Full scan (same as periodic).
     ScanAll,
@@ -168,7 +169,7 @@ impl RepairAgent {
     pub async fn repair_placement(
         &self,
         block_id: &SourceBlockId,
-        holder_id: &IdentityPub,
+        holder_id: &DeviceId,
     ) -> Result<RepairOutcome, RepairError> {
         // 1. Get SourceBlockRecord for K and T
         let block_record = self
@@ -278,7 +279,7 @@ impl RepairAgent {
     pub async fn handle_symbol_dropped(
         &self,
         block_id: &SourceBlockId,
-        holder_id: &IdentityPub,
+        holder_id: &DeviceId,
         now: Timestamp,
     ) -> Result<(), RepairError> {
         self.mark_placement_lost(block_id, holder_id, now).await
@@ -291,7 +292,7 @@ impl RepairAgent {
     pub async fn handle_pos_nack(
         &self,
         block_id: &SourceBlockId,
-        holder_id: &IdentityPub,
+        holder_id: &DeviceId,
         now: Timestamp,
     ) -> Result<(), RepairError> {
         self.mark_placement_lost(block_id, holder_id, now).await
@@ -352,7 +353,7 @@ impl RepairAgent {
     async fn mark_placement_lost(
         &self,
         block_id: &SourceBlockId,
-        holder_id: &IdentityPub,
+        holder_id: &DeviceId,
         _now: Timestamp,
     ) -> Result<(), RepairError> {
         let placement = self

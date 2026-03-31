@@ -7,7 +7,7 @@ use crate::constants::{
     COMMITMENT_POS_WEIGHT, COMMITMENT_PRESSURE_WEIGHT, COMMITMENT_PRIORITY_WEIGHT,
     POS_CONSECUTIVE_MISS_PRESUMED_LOST, SECS_PER_WEEK,
 };
-use crate::types::{IdentityPub, Timestamp};
+use crate::types::{DeviceId, Timestamp};
 
 #[cfg(test)]
 mod tests;
@@ -56,7 +56,7 @@ pub enum CommitmentTier {
 #[derive(Debug, Clone)]
 pub struct HolderProfile {
     /// The holder's identity (informational; not used in computation directly).
-    pub holder_id: IdentityPub,
+    pub holder_id: DeviceId,
 
     // --- PoS signals ---
 
@@ -207,9 +207,9 @@ pub fn eviction_risk(score: CommitmentScore) -> f64 {
 ///   tier == AtRisk
 ///   OR (tier == Low AND importance >= 0.7)
 pub fn flag_for_proactive_repair(
-    holders: &[(IdentityPub, CommitmentScore)],
+    holders: &[(DeviceId, CommitmentScore)],
     importance: f64,
-) -> Vec<IdentityPub> {
+) -> Vec<DeviceId> {
     holders
         .iter()
         .filter(|(_, score)| {

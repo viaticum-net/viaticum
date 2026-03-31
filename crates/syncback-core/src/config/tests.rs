@@ -74,6 +74,8 @@ fn config_roundtrips_all_fields() {
             enable_relay: false,
             relay_url: None,
             bootstrap_peers: vec![],
+            kademlia_bootstrap_peers: vec![],
+            kademlia_disable_ipfs_bootstrap: false,
         },
         cluster: ClusterCfg {
             sync_batch_size: 200,

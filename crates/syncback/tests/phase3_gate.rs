@@ -32,28 +32,29 @@ use syncback_core::types::{
 
 /// Seed bytes for the "cluster" — both devices derive from this.
 const SEED: &[u8] = &[0xAA_u8; 64];
-const DEVICE_A_ID: DeviceId = DeviceId([0xA0u8; 16]);
-const DEVICE_B_ID: DeviceId = DeviceId([0xB0u8; 16]);
+const DEVICE_A_SEED: [u8; 32] = [0xA0u8; 32];
+const DEVICE_B_SEED: [u8; 32] = [0xB0u8; 32];
 const NOW: Timestamp = Timestamp(1_700_000_000);
 
 fn master_key() -> ed25519_dalek::SigningKey {
     derive_master_key(SEED).unwrap()
 }
 
-fn device_pub(device_id: DeviceId) -> [u8; 32] {
-    derive_device_key(SEED, &device_id)
-        .unwrap()
-        .verifying_key()
-        .to_bytes()
+fn device_a_id() -> DeviceId {
+    DeviceId(derive_device_key(SEED, &DEVICE_A_SEED).unwrap().verifying_key().to_bytes())
+}
+
+fn device_b_id() -> DeviceId {
+    DeviceId(derive_device_key(SEED, &DEVICE_B_SEED).unwrap().verifying_key().to_bytes())
 }
 
 /// Init ClusterState with both DEVICE_A and DEVICE_B.
 fn init_state_ab(db: Db) -> ClusterState {
     let mk = master_key();
     let mp = master_identity(&mk);
-    let cert_a = issue_device_certificate(&mk, DEVICE_A_ID, device_pub(DEVICE_A_ID), NOW);
+    let cert_a = issue_device_certificate(&mk, device_a_id(), NOW);
     let mut state = ClusterState::init(db, mp, cert_a, NOW, NOW).unwrap();
-    let cert_b = issue_device_certificate(&mk, DEVICE_B_ID, device_pub(DEVICE_B_ID), NOW);
+    let cert_b = issue_device_certificate(&mk, device_b_id(), NOW);
     state.add_device(cert_b, NOW).unwrap();
     state
 }
@@ -78,20 +79,20 @@ fn two_devices_shared_identity() {
     assert_eq!(mp, expected_mp, "master_pub must match derived identity");
 
     // Device indices: 0 and 1.
-    let dev_a = state.get_device(&DEVICE_A_ID).expect("device A must exist");
-    let dev_b = state.get_device(&DEVICE_B_ID).expect("device B must exist");
+    let dev_a = state.get_device(&device_a_id()).expect("device A must exist");
+    let dev_b = state.get_device(&device_b_id()).expect("device B must exist");
     assert_eq!(dev_a.device_index, 0);
     assert_eq!(dev_b.device_index, 1);
 
-    // Device pub keys are distinct (different device_ids → different HKDF output).
+    // Device ids are distinct (different seeds → different pubkeys).
     assert_ne!(
-        dev_a.device_pub_key, dev_b.device_pub_key,
-        "device pub keys must differ"
+        dev_a.device_id, dev_b.device_id,
+        "device ids must differ"
     );
 
     // ESI namespaces do not overlap.
-    let (_start_a, end_a) = state.esi_namespace(&DEVICE_A_ID).unwrap();
-    let (start_b, end_b) = state.esi_namespace(&DEVICE_B_ID).unwrap();
+    let (_start_a, end_a) = state.esi_namespace(&device_a_id()).unwrap();
+    let (start_b, end_b) = state.esi_namespace(&device_b_id()).unwrap();
     assert_eq!(end_a, start_b, "A's namespace ends exactly where B's begins");
     assert!(end_a <= start_b, "namespaces must not overlap");
     assert!(end_b > end_a, "B's namespace is after A's");
@@ -115,16 +116,16 @@ fn cluster_sync_event_exchange() {
     // Append two synthetic events that change ClusterState in ways B hasn't seen:
     //   - EpochRotated { epoch: 5 }  — B is still at epoch 0, so this is new
     //   - DeviceAdded for a brand-new device C not registered in B's state
-    let device_c_id = DeviceId([0xCC_u8; 16]);
+    let device_c_id = DeviceId([0xCC_u8; 32]);
     db_a.append_event(&EventEntry {
         timestamp: NOW,
-        device_id: DEVICE_A_ID,
+        device_id: device_a_id(),
         event: Event::EpochRotated { epoch: 5 },
     })
     .unwrap();
     db_a.append_event(&EventEntry {
         timestamp: NOW,
-        device_id: DEVICE_A_ID,
+        device_id: device_a_id(),
         event: Event::DeviceAdded { device_id: device_c_id },
     })
     .unwrap();
@@ -133,26 +134,26 @@ fn cluster_sync_event_exchange() {
 
     let sync_a = ClusterSyncManager::new(
         db_a.clone(),
-        ClusterSyncConfig { our_device_id: DEVICE_A_ID, batch_size: 100 },
+        ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
         Arc::new(Mutex::new(state_a)),
     );
 
     // Device B: separate DB, knows only itself initially.
     let db_b = Db::open_in_memory().unwrap();
     let state_b = init_state_ab(db_b.clone()); // uses same seed — same cluster
-    let _b_identity = IdentityPub(device_pub(DEVICE_B_ID));
+    let _b_identity = IdentityPub(device_b_id().0);
 
     let sync_b = ClusterSyncManager::new(
         db_b.clone(),
-        ClusterSyncConfig { our_device_id: DEVICE_B_ID, batch_size: 100 },
+        ClusterSyncConfig { our_device_id: device_b_id(), batch_size: 100 },
         Arc::new(Mutex::new(state_b)),
     );
 
     // B builds a request asking for everything (cursor = 0).
-    let a_identity = IdentityPub(device_pub(DEVICE_A_ID));
+    let a_identity = IdentityPub(device_a_id().0);
     let request = sync_b.build_sync_request(&a_identity);
     assert_eq!(request.last_known_seq, 0, "B has never synced A before");
-    assert_eq!(request.from_device_id, DEVICE_B_ID);
+    assert_eq!(request.from_device_id, device_b_id());
 
     // A handles the request.
     let response = sync_a.handle_sync_request(&request).unwrap();
@@ -202,7 +203,7 @@ fn dedup_across_devices() {
         file_id: FileId(1),
         path: "/device_a/docs/report.pdf".to_string(),
         importance: 0.8,
-        devices: vec![(DEVICE_A_ID, LocalState::Present)],
+        devices: vec![(device_a_id(), LocalState::Present)],
         versions: vec![FileVersion {
             content_hash: content_hash_backed,
             source_block_id: SourceBlockId([0xAA; 32]),
@@ -220,7 +221,7 @@ fn dedup_across_devices() {
         file_id: FileId(2),
         path: "/device_b/downloads/report_copy.pdf".to_string(),
         importance: 0.5,
-        devices: vec![(DEVICE_B_ID, LocalState::Present)],
+        devices: vec![(device_b_id(), LocalState::Present)],
         versions: vec![FileVersion {
             content_hash: content_hash_pending,
             source_block_id: SourceBlockId([0xBB; 32]),
@@ -283,19 +284,19 @@ fn device_revocation_rotates_epoch() {
 
     let mk = master_key();
     let new_epoch = EpochCounter(1);
-    let rev = issue_revocation(&mk, DEVICE_A_ID, NOW, new_epoch);
+    let rev = issue_revocation(&mk, device_a_id(), NOW, new_epoch);
     state.revoke_device(rev, NOW, NOW).unwrap();
 
     // Epoch incremented.
     assert_eq!(state.current_epoch(), new_epoch, "epoch must increment after revocation");
 
     // A is now revoked.
-    assert!(state.is_device_revoked(&DEVICE_A_ID), "device A must be revoked");
+    assert!(state.is_device_revoked(&device_a_id()), "device A must be revoked");
 
     // Only B is active.
     let active = state.active_devices();
     assert_eq!(active.len(), 1, "only device B must remain active");
-    assert_eq!(active[0].device_id, DEVICE_B_ID);
+    assert_eq!(active[0].device_id, device_b_id());
 
     // Epoch history has two entries: epoch 0 (genesis) and epoch 1 (after revocation).
     assert_eq!(state.epoch_history().len(), 2);
@@ -318,8 +319,8 @@ fn revocation_broadcast_round_trip() {
     let mp = master_identity(&mk);
     let new_epoch = EpochCounter(1);
 
-    let rev = issue_revocation(&mk, DEVICE_A_ID, NOW, new_epoch);
-    let cert_a = issue_device_certificate(&mk, DEVICE_A_ID, device_pub(DEVICE_A_ID), NOW);
+    let rev = issue_revocation(&mk, device_a_id(), NOW, new_epoch);
+    let cert_a = issue_device_certificate(&mk, device_a_id(), NOW);
 
     let broadcast = ClusterSyncManager::build_revocation_broadcast(&rev, &cert_a);
 
@@ -329,10 +330,10 @@ fn revocation_broadcast_round_trip() {
     assert_eq!(decoded, broadcast);
 
     // Structural check.
-    assert_eq!(decoded.revocation.device_id, DEVICE_A_ID);
+    assert_eq!(decoded.revocation.device_id, device_a_id());
     assert_eq!(decoded.revocation.master_pub_key, mp);
     assert_eq!(decoded.revocation.new_epoch, new_epoch);
-    assert_eq!(decoded.device_cert.device_id, DEVICE_A_ID);
+    assert_eq!(decoded.device_cert.device_id, device_a_id());
     assert_eq!(decoded.device_cert.master_pub_key, mp);
 
     // Signature verification on deserialized data.
@@ -341,9 +342,9 @@ fn revocation_broadcast_round_trip() {
     syncback_core::cluster::verify_device_certificate(&decoded.device_cert, &mp)
         .expect("device cert signature must verify after CBOR round-trip");
 
-    // Extract device_pub_key from cert for revocation list.
-    let revoked_device_pub = decoded.device_cert.device_pub_key;
-    assert_eq!(revoked_device_pub, device_pub(DEVICE_A_ID));
+    // device_id.0 IS the device pub key — no separate field.
+    let revoked_device_pub = decoded.device_cert.device_id.0;
+    assert_eq!(revoked_device_pub, device_a_id().0);
 }
 
 // ─── 6. handshake_with_cluster_identity ──────────────────────────────────────
@@ -357,12 +358,11 @@ fn handshake_with_cluster_identity() {
     let mk = master_key();
     let mp = master_identity(&mk);
 
-    // Device A's signing key is the device key.
-    let device_signing_key = derive_device_key(SEED, &DEVICE_A_ID).unwrap();
-    let device_pub_bytes = device_signing_key.verifying_key().to_bytes();
-    let device_identity = IdentityPub(device_pub_bytes);
+    // Device A's signing key is the device key. device_id.0 == pubkey.
+    let device_signing_key = derive_device_key(SEED, &DEVICE_A_SEED).unwrap();
+    let device_identity = IdentityPub(device_a_id().0);
 
-    let cert_a = issue_device_certificate(&mk, DEVICE_A_ID, device_pub_bytes, NOW);
+    let cert_a = issue_device_certificate(&mk, device_a_id(), NOW);
 
     // Use a fresh timestamp so verify_handshake doesn't reject it as stale.
     let ts = Timestamp::now();
@@ -407,17 +407,17 @@ fn peer_affinity_isolates_blast_radius() {
     let p5 = IdentityPub([0x55u8; 32]);
 
     // Assign P1, P2, P3 to device A.
-    state.set_peer_affinity(p1, DEVICE_A_ID).unwrap();
-    state.set_peer_affinity(p2, DEVICE_A_ID).unwrap();
-    state.set_peer_affinity(p3, DEVICE_A_ID).unwrap();
+    state.set_peer_affinity(p1, device_a_id()).unwrap();
+    state.set_peer_affinity(p2, device_a_id()).unwrap();
+    state.set_peer_affinity(p3, device_a_id()).unwrap();
 
     // Assign P4, P5 to device B.
-    state.set_peer_affinity(p4, DEVICE_B_ID).unwrap();
-    state.set_peer_affinity(p5, DEVICE_B_ID).unwrap();
+    state.set_peer_affinity(p4, device_b_id()).unwrap();
+    state.set_peer_affinity(p5, device_b_id()).unwrap();
 
     // Verify initial assignment.
-    let peers_a = state.peers_for_device(&DEVICE_A_ID);
-    let peers_b = state.peers_for_device(&DEVICE_B_ID);
+    let peers_a = state.peers_for_device(&device_a_id());
+    let peers_b = state.peers_for_device(&device_b_id());
 
     assert_eq!(peers_a.len(), 3, "A must manage 3 peers");
     assert!(peers_a.contains(&p1));
@@ -434,10 +434,10 @@ fn peer_affinity_isolates_blast_radius() {
     }
 
     // Reassign P2 from A to B.
-    state.set_peer_affinity(p2, DEVICE_B_ID).unwrap();
+    state.set_peer_affinity(p2, device_b_id()).unwrap();
 
-    let peers_a_after = state.peers_for_device(&DEVICE_A_ID);
-    let peers_b_after = state.peers_for_device(&DEVICE_B_ID);
+    let peers_a_after = state.peers_for_device(&device_a_id());
+    let peers_b_after = state.peers_for_device(&device_b_id());
 
     // P2 no longer in A.
     assert!(!peers_a_after.contains(&p2), "P2 must be removed from A after reassign");
@@ -448,7 +448,7 @@ fn peer_affinity_isolates_blast_radius() {
     assert_eq!(peers_b_after.len(), 3, "B must manage 3 peers after reassign");
 
     // Peer → device routing via peer_device.
-    assert_eq!(state.peer_device(&p2), Some(DEVICE_B_ID));
-    assert_eq!(state.peer_device(&p1), Some(DEVICE_A_ID));
-    assert_eq!(state.peer_device(&p4), Some(DEVICE_B_ID));
+    assert_eq!(state.peer_device(&p2), Some(device_b_id()));
+    assert_eq!(state.peer_device(&p1), Some(device_a_id()));
+    assert_eq!(state.peer_device(&p4), Some(device_b_id()));
 }

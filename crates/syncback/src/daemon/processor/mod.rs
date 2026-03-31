@@ -1,8 +1,7 @@
 // Message Router (Processor): routes incoming connections and dispatches messages.
 //
 // Responsibilities:
-//   - Accept new incoming connections from the network accept loop.
-//   - Spawn a per-connection read loop for each connection.
+//   - Accept ProtocolEvent from the libp2p SwarmHandle event_rx.
 //   - Dispatch received messages to the appropriate handler.
 //
 // Role separation:
@@ -17,16 +16,16 @@
 //   RestoreRequest received → we are the holder  → load symbols, send RestoreResponse
 //   RestoreDenied received  → we are the owner   → log warning
 //   BoardSync received      → forward to RelayManager via relay_sync_tx
-//   PeerAnnounce received   → upsert peer record in DB + add to known_peers
+//   PeerAnnounce received   → upsert peer record in DB
 //   ClusterSyncRequest      → we are cluster peer → serve event log entries
 //   ClusterSyncResponse     → we are cluster peer → apply received events
 //
-// Phase 7.10 — Peer gossip on connect:
-//   On every new incoming connection we immediately send our PeerAnnounceMsg
-//   so the remote learns our identity ↔ NodeId binding. The peer does the
-//   same, so after the first exchange both sides can reach each other by
-//   identity. When we receive a PeerAnnounce we upsert the DB record AND
-//   call network.add_peer() so future get_connection() calls can reach them.
+// ε.2 — libp2p wiring:
+//   Processor now consumes ProtocolEvent from SwarmHandle (not iroh Connection).
+//   PeerAuthenticated → upsert PeerRecord, auto-add cluster device, send PeerAnnounce.
+//   InboundRequest    → dispatch_libp2p: match Message variant, call handler, send via ResponseChannel.
+//   ConnectionClosed  → remove from peer_cert_map.
+//   One-way messages (PoS, Delete, Drop) still arrive via relay board (dispatch_relay).
 //
 // Design note: PosResponseMsg on the wire does not carry source_block_id.
 // We recover it by scanning placements for the holder and finding one whose
@@ -37,6 +36,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use libp2p::request_response::ResponseChannel;
+use libp2p::PeerId;
+use syncback_core::cluster::DeviceCertificate;
 use syncback_core::config::EscrowCfg;
 use syncback_core::constants::{
     HANDSHAKE_FRESHNESS_SECS, INITIAL_TRUST_P, P_WINDOW_WEEKS, SYMBOL_OFFER_EXPIRY_SECS,
@@ -46,9 +48,9 @@ use syncback_core::escrow::{check_restore, RestoreDecision};
 use syncback_core::db::{Db, SystemStateBlobRecord, WeeklyPosEntry};
 use syncback_core::erasure::{ErasureEncoder, Symbol};
 use syncback_core::messages::{
-    verify_symbol_offer, BoardSyncMsg, CancelDeleteMsg, ClusterSyncRequestMsg,
-    ClusterSyncResponseMsg, DeleteMsg, DiscoveredPeer, Message, PeerAnnounceMsg,
-    PeerDiscoveryRequestMsg, PeerDiscoveryResponseMsg, PosChallengeMsg, PosNackMsg, PosResponseMsg,
+    verify_symbol_offer, AckMsg, BoardSyncMsg, CancelDeleteMsg, ClusterSyncRequestMsg,
+    ClusterSyncResponseMsg, DeleteMsg, Message, PeerAnnounceMsg,
+    PosChallengeMsg, PosNackMsg, PosResponseMsg,
     RejectReason, RestoreDeniedMsg, RestoreRequestMsg, RestoreResponseMsg, RevocationBroadcast,
     SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg,
     SymbolTransferMsg, SystemStateAckMsg, SystemStateBackupMsg, SystemStateRequestMsg,
@@ -57,9 +59,11 @@ use syncback_core::messages::{
 use syncback_core::pos::{
     apply_pos_outcome, outcome_from_verify, verify_response, PosResponse, VerifyOutcome,
 };
-use syncback_core::trust::{compute_combined, PosOutcome};
+use syncback_core::trust::{
+    compute_combined, recompute_master_trust, DeviceTrustRecord, MasterTrustRecord, PosOutcome,
+};
 use syncback_core::types::{
-    hex_encode, HoldingRecord, HoldingStatus, IdentityPub, PeerRecord, PlacementStatus,
+    hex_encode, DeviceId, HoldingRecord, HoldingStatus, IdentityPub, PeerRecord, PlacementStatus,
     SourceBlockId, Timestamp,
 };
 use tokio::sync::mpsc;
@@ -67,8 +71,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::daemon::cluster_sync::ClusterSyncManager;
-use crate::daemon::network::connection::Connection;
-use crate::daemon::network::NetworkHandle;
+use crate::daemon::network::swarm::{ProtocolEvent, SwarmHandle};
 use crate::daemon::relay::{InboundMessage, RelayPost};
 use crate::daemon::repair::RepairTrigger;
 use crate::daemon::scheduler::PendingChallenges;
@@ -86,8 +89,8 @@ pub enum ProcessorError {
     #[error("db error: {0}")]
     Db(#[from] syncback_core::db::DbError),
 
-    #[error("network error: {0}")]
-    Network(#[from] crate::daemon::network::NetworkError),
+    #[error("swarm error: {0}")]
+    Swarm(#[from] crate::daemon::network::swarm::SwarmError),
 
     #[error("pos verify error: {0}")]
     PosVerify(#[from] syncback_core::pos::PosError),
@@ -123,34 +126,9 @@ pub struct AcceptedOffer {
 /// across .await points — only brief insert/remove under the lock.
 pub type AcceptedOffers = Arc<Mutex<HashMap<(IdentityPub, SourceBlockId), AcceptedOffer>>>;
 
-// NOTE: OfferOutcome and PendingDeliveries are defined here (not in backup/) because
-// Processor is the component that signals outcomes via the oneshot channels. The backup
-// module imports these types from here.
-
-/// Outcome of a SymbolOffer — signals the owner-side deliver_to_holder task.
-#[derive(Debug)]
-pub enum OfferOutcome {
-    Accepted,
-    Rejected { reason: RejectReason },
-}
-
-/// Shared map of pending owner-side deliveries: (holder_id, block_id) → oneshot sender.
-/// Written by BackupCoordinator.deliver_to_holder before sending the offer;
-/// read here to signal outcome when Accept/Reject arrives.
-pub type PendingDeliveries = Arc<
-    tokio::sync::Mutex<
-        HashMap<(IdentityPub, SourceBlockId), tokio::sync::oneshot::Sender<OfferOutcome>>,
-    >,
->;
-
 /// Construct an empty `AcceptedOffers` map (useful in tests and wiring).
 pub fn make_empty_accepted_offers() -> AcceptedOffers {
     Arc::new(Mutex::new(HashMap::new()))
-}
-
-/// Construct an empty `PendingDeliveries` map (useful in tests and wiring).
-pub fn make_empty_pending_deliveries() -> PendingDeliveries {
-    Arc::new(tokio::sync::Mutex::new(HashMap::new()))
 }
 
 // ─── Processor ────────────────────────────────────────────────────────────────
@@ -158,8 +136,8 @@ pub fn make_empty_pending_deliveries() -> PendingDeliveries {
 /// Routes incoming connections and dispatches messages to appropriate handlers.
 pub struct Processor {
     db: Db,
-    /// Our identity — used to skip self in PeerDiscoveryResponse handling.
-    own_identity: IdentityPub,
+    /// Our identity.
+    pub(crate) own_identity: IdentityPub,
     repair_tx: mpsc::Sender<RepairTrigger>,
     cluster_sync: Arc<ClusterSyncManager>,
     encoder: Arc<dyn ErasureEncoder>,
@@ -168,8 +146,8 @@ pub struct Processor {
     /// Directory where our own source blocks live (for PoS verification as owner):
     /// `{source_blocks_dir}/{block_id_hex}/block.bin`
     source_blocks_dir: PathBuf,
-    /// Network handle for sending replies (SymbolAccept, SymbolReject, RestoreResponse).
-    network: Arc<NetworkHandle>,
+    /// libp2p swarm handle — replaces iroh NetworkHandle for ε.2+.
+    swarm: Arc<SwarmHandle>,
     /// Channel to relay manager: push BoardSync entries from incoming connections.
     relay_sync_tx: mpsc::Sender<crate::daemon::relay::SyncTrigger>,
     /// Raw soft quota in bytes from config. 0 = use disk-based limit.
@@ -196,9 +174,10 @@ pub struct Processor {
     /// Accepted symbol offers awaiting SymbolTransfer from the owner.
     /// Key: (owner_id, block_id). Entries expire after SYMBOL_OFFER_EXPIRY_SECS.
     pub(crate) accepted_offers: AcceptedOffers,
-    /// Pending owner-side deliveries awaiting Accept/Reject.
-    /// Written by BackupCoordinator.deliver_to_holder; read here to signal outcome.
-    pub(crate) pending_deliveries: PendingDeliveries,
+    /// Authenticated peer map: DeviceId → (IdentityPub, DeviceCertificate).
+    /// Written by on_peer_authenticated, cleared by on_connection_closed.
+    /// Used by handle_cluster_sync_request_libp2p to validate from_device_id.
+    peer_cert_map: Arc<std::sync::Mutex<HashMap<DeviceId, (IdentityPub, DeviceCertificate)>>>,
 }
 
 impl Processor {
@@ -212,7 +191,7 @@ impl Processor {
         encoder: Arc<dyn ErasureEncoder>,
         holdings_dir: PathBuf,
         source_blocks_dir: PathBuf,
-        network: Arc<NetworkHandle>,
+        swarm: Arc<SwarmHandle>,
         relay_sync_tx: mpsc::Sender<crate::daemon::relay::SyncTrigger>,
         soft_quota_bytes: u64,
         hard_quota_bytes: u64,
@@ -225,7 +204,6 @@ impl Processor {
         cluster_state: Option<Arc<std::sync::Mutex<syncback_core::cluster::ClusterState>>>,
         escrow_cfg: EscrowCfg,
         accepted_offers: AcceptedOffers,
-        pending_deliveries: PendingDeliveries,
     ) -> Self {
         Processor {
             db,
@@ -235,7 +213,7 @@ impl Processor {
             encoder,
             holdings_dir,
             source_blocks_dir,
-            network,
+            swarm,
             relay_sync_tx,
             soft_quota_bytes,
             hard_quota_bytes,
@@ -248,24 +226,21 @@ impl Processor {
             cluster_state,
             escrow_cfg,
             accepted_offers,
-            pending_deliveries,
+            peer_cert_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
-    /// Main loop: accept connections and dispatch messages.
+    /// Main loop: receive ProtocolEvents from the libp2p swarm and relay-board messages.
     ///
-    /// Spawns a per-connection read task for each accepted connection.
-    /// All received messages are funneled through a single channel and
-    /// then dispatched via tokio::spawn (one task per message).
+    /// Dispatches each event to its handler in a new tokio::spawn task (I4 preserved).
+    /// - swarm_rx: ProtocolEvent stream from SwarmHandle (PeerAuthenticated, InboundRequest, ConnectionClosed)
+    /// - inbound_rx: relay board one-way messages (PoS, Delete, Drop, PeerAnnounce, etc.)
     pub async fn run(
         self,
-        mut incoming_rx: mpsc::Receiver<Connection>,
+        mut swarm_rx: mpsc::Receiver<ProtocolEvent>,
         mut inbound_rx: mpsc::Receiver<InboundMessage>,
-        mut read_loop_rx: mpsc::UnboundedReceiver<crate::daemon::network::ReadLoopRequest>,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
-        let (msg_tx, mut msg_rx) =
-            mpsc::channel::<(IdentityPub, Message, Arc<Connection>)>(256);
         let this = Arc::new(self);
 
         info!("processor running");
@@ -277,141 +252,55 @@ impl Processor {
                     break;
                 }
 
-                maybe_conn = incoming_rx.recv() => {
-                    match maybe_conn {
+                maybe_event = swarm_rx.recv() => {
+                    match maybe_event {
                         None => {
-                            info!("processor: incoming_rx closed, shutting down");
+                            info!("processor: swarm_rx closed, shutting down");
                             break;
                         }
-                        Some(conn) => {
-                            let peer_id = conn.master_identity();
-
-                            // Send PeerAnnounce on this connection before
-                            // splitting into separate read-loop and pool entry.
-                            let conn_arc = Arc::new(conn);
-                            {
-                                let pa_msg = {
-                                    let pa = this.network.build_peer_announce(Timestamp::now());
-                                    Message::PeerAnnounce(pa)
-                                };
-                                if let Err(e) = conn_arc.send_message(&pa_msg).await {
-                                    warn!(
-                                        peer = %peer_id,
-                                        err = %e,
-                                        "processor: failed to send PeerAnnounce on new connection"
-                                    );
-                                } else {
-                                    debug!(
-                                        peer = %peer_id,
-                                        "processor: sent PeerAnnounce on new connection"
-                                    );
-                                }
-                            }
-
-                            // Register peer's address in known_peers so that
-                            // send_to_peer can create an outbound connection
-                            // later (e.g. for system state push). We do NOT
-                            // store the inbound connection in the pool — that
-                            // would cause reads and sends to contend on the
-                            // same connection from different tasks.
-                            //
-                            // Use remote_endpoint_addr() to get the full
-                            // address (IP:port + relay) from iroh's internal
-                            // state, not just the bare NodeId.
-                            {
-                                let remote_pubkey = conn_arc.inner.remote_id();
-                                let endpoint_addr = match this.network
-                                    .remote_endpoint_addr(remote_pubkey).await
-                                {
-                                    Some(addr) => addr,
-                                    None => iroh::EndpointAddr::new(remote_pubkey),
-                                };
-                                this.network.add_peer(peer_id, endpoint_addr.clone()).await;
-                                debug!(
-                                    peer = %peer_id,
-                                    "processor: registered inbound peer in known_peers"
-                                );
-
-                                // Auto-add cluster device if same master identity.
-                                this.try_auto_add_cluster_device(
-                                    Some(peer_id),
-                                    conn_arc.peer_device_cert.clone(),
-                                    endpoint_addr,
-                                ).await;
-                            }
-
-                            let conn_arc2 = conn_arc.clone();
-                            let tx = msg_tx.clone();
-                            let network_arc = this.network.clone();
-                            tokio::spawn(async move {
-                                debug!(peer = %peer_id, "processor: read loop started");
-                                loop {
-                                    match conn_arc2.recv_message().await {
-                                        Ok(msg) => {
-                                            if tx.send((peer_id, msg, conn_arc2.clone())).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            debug!(
-                                                peer = %peer_id,
-                                                err = %e,
-                                                "processor: connection closed"
-                                            );
-                                            network_arc.evict_connection(peer_id).await;
-                                            break;
-                                        }
-                                    }
-                                }
-                                debug!(peer = %peer_id, "processor: read loop exited");
-                            });
-                        }
-                    }
-                }
-
-                // Auto-reconnected outbound connections need a read loop too.
-                maybe_rl = read_loop_rx.recv() => {
-                    if let Some((peer_id, conn_arc)) = maybe_rl {
-                        let conn_arc2 = conn_arc.clone();
-                        let tx = msg_tx.clone();
-                        let network_arc = this.network.clone();
-                        debug!(peer = %peer_id, "processor: read loop started (auto-reconnect)");
-                        tokio::spawn(async move {
-                            loop {
-                                match conn_arc2.recv_message().await {
-                                    Ok(msg) => {
-                                        if tx.send((peer_id, msg, conn_arc2.clone())).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        debug!(
-                                            peer = %peer_id,
-                                            err = %e,
-                                            "processor: auto-reconnect connection closed"
-                                        );
-                                        network_arc.evict_connection(peer_id).await;
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
-
-                maybe_msg = msg_rx.recv() => {
-                    match maybe_msg {
-                        None => break,
-                        Some((peer_id, msg, conn)) => {
+                        Some(ProtocolEvent::PeerAuthenticated {
+                            peer_id,
+                            device_id,
+                            identity_pub,
+                            device_cert,
+                            x25519_pub,
+                        }) => {
                             let this2 = this.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = this2.dispatch(peer_id, msg, conn).await {
+                                this2.on_peer_authenticated(
+                                    peer_id, device_id, identity_pub, device_cert, x25519_pub,
+                                ).await;
+                            });
+                        }
+                        Some(ProtocolEvent::InboundRequest {
+                            from_device,
+                            from_master,
+                            message,
+                            response_channel,
+                        }) => {
+                            let this2 = this.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = this2
+                                    .dispatch_libp2p(
+                                        from_device,
+                                        from_master,
+                                        message,
+                                        response_channel,
+                                    )
+                                    .await
+                                {
                                     error!(
-                                        peer = %peer_id,
+                                        device = %from_device,
                                         err = %e,
-                                        "processor: error handling message"
+                                        "processor: error handling libp2p message"
                                     );
                                 }
+                            });
+                        }
+                        Some(ProtocolEvent::ConnectionClosed { peer_id, device_id }) => {
+                            let this2 = this.clone();
+                            tokio::spawn(async move {
+                                this2.on_connection_closed(peer_id, device_id).await;
                             });
                         }
                     }
@@ -438,14 +327,309 @@ impl Processor {
     }
 
     // =========================================================
+    // libp2p event handlers
+    // =========================================================
+
+    /// Called when DeviceCertExchange succeeds for a peer (AC-1, AC-2).
+    ///
+    /// 1. Stores (identity_pub, device_cert) in peer_cert_map under device_id.
+    /// 2. Upserts PeerRecord in DB (sets device_id and x25519_pub fields).
+    /// 3. Calls try_auto_add_cluster_device if peer has same master identity.
+    /// 4. Sends PeerAnnounce to the newly authenticated peer via swarm.
+    async fn on_peer_authenticated(
+        &self,
+        _peer_id: PeerId,
+        device_id: DeviceId,
+        identity_pub: IdentityPub,
+        device_cert: DeviceCertificate,
+        x25519_pub: Option<[u8; 32]>,
+    ) {
+        // 1. Store in peer_cert_map.
+        {
+            let mut map = self.peer_cert_map.lock().unwrap();
+            map.insert(device_id, (identity_pub, device_cert.clone()));
+        }
+
+        // 2. Upsert PeerRecord in DB (keyed by DeviceId).
+        let now = Timestamp::now();
+        let record = match self.db.get_peer(&device_id) {
+            Ok(Some(mut existing)) => {
+                existing.master_identity = identity_pub;
+                existing.last_seen = now;
+                if x25519_pub.is_some() {
+                    existing.x25519_pub = x25519_pub;
+                }
+                if existing.trust_p == 0.0 && existing.trust_i == 0.0 {
+                    existing.trust_p = INITIAL_TRUST_P;
+                }
+                existing
+            }
+            Ok(None) => PeerRecord {
+                device_id,
+                master_identity: identity_pub,
+                trust_p: INITIAL_TRUST_P,
+                trust_i: 0.0,
+                trust_s: 1.0,
+                bytes_we_store_for_peer: 0,
+                bytes_peer_stores_for_us: 0,
+                first_seen: now,
+                last_seen: now,
+                revoked_device_pub_keys: vec![],
+                addrs: vec![],
+                x25519_pub,
+            },
+            Err(e) => {
+                error!(
+                    device = %device_id,
+                    err = %e,
+                    "processor: on_peer_authenticated: db.get_peer failed"
+                );
+                return;
+            }
+        };
+        if let Err(e) = self.db.upsert_peer(&record) {
+            error!(
+                device = %device_id,
+                err = %e,
+                "processor: on_peer_authenticated: db.upsert_peer failed"
+            );
+        }
+
+        // Store device-to-master mapping for two-level trust.
+        if let Err(e) = self.db.set_master_for_device(&device_id, &identity_pub) {
+            error!(
+                device = %device_id,
+                err = %e,
+                "processor: on_peer_authenticated: failed to store device-to-master mapping"
+            );
+        }
+
+        // 3. Auto-add cluster device if same master identity.
+        self.try_auto_add_cluster_device(Some(identity_pub), Some(device_cert)).await;
+
+        // 4. Send PeerAnnounce so the peer learns our identity ↔ DeviceId binding.
+        let pa = self.swarm.build_peer_announce(Timestamp::now());
+        let pa_msg = Message::PeerAnnounce(pa);
+        if let Err(e) = self.swarm.send_to_device(device_id, pa_msg).await {
+            warn!(
+                device = %device_id,
+                err = %e,
+                "processor: on_peer_authenticated: failed to send PeerAnnounce"
+            );
+        } else {
+            debug!(device = %device_id, "processor: sent PeerAnnounce after authentication");
+        }
+    }
+
+    /// Dispatch a libp2p InboundRequest to the correct handler.
+    ///
+    /// Every request must receive a response (libp2p request-response contract).
+    /// Handlers that previously used conn.send_message now send via ResponseChannel.
+    async fn dispatch_libp2p(
+        &self,
+        from_device: DeviceId,
+        from_master: IdentityPub,
+        message: Message,
+        response_channel: ResponseChannel<Message>,
+    ) -> anyhow::Result<()> {
+        match message {
+            Message::SymbolTransfer(transfer) => {
+                self.handle_symbol_transfer(from_master, transfer).await?;
+                let ack = Message::SystemStateAck(SystemStateAckMsg {
+                    v: 1,
+                    stored: true,
+                    timestamp: Timestamp::now(),
+                });
+                let _ = self.swarm.respond(response_channel, ack);
+            }
+            Message::PosChallenge(challenge) => {
+                match self.handle_pos_challenge_inner(from_master, challenge).await {
+                    Ok(reply) => {
+                        let _ = self.swarm.respond(response_channel, reply);
+                    }
+                    Err(e) => {
+                        warn!(device = %from_device, err = %e, "processor: PosChallenge handler failed");
+                    }
+                }
+            }
+            Message::SymbolOffer(offer) => {
+                let reply = self.handle_symbol_offer_inner(from_master, offer);
+                let _ = self.swarm.respond(response_channel, reply);
+            }
+            Message::RestoreRequest(req) => {
+                let block_id = req.source_block_id;
+                let reply = match self.handle_restore_request_inner(from_master, req).await {
+                    Ok(resp) => Message::RestoreResponse(resp),
+                    Err(ProcessorError::EscrowDenied { denial, .. }) => {
+                        let _ = &denial;
+                        Message::RestoreDenied(RestoreDeniedMsg {
+                            v: 1,
+                            source_block_id: block_id,
+                            reason: "escrow check failed".to_string(),
+                            current_trust: 0.0,
+                            needed_trust: 0.0,
+                            restore_budget_gb: 0.0,
+                            timestamp: Timestamp::now(),
+                        })
+                    }
+                    Err(e) => {
+                        warn!(device = %from_device, err = %e, "processor: RestoreRequest handler failed");
+                        return Ok(());
+                    }
+                };
+                let _ = self.swarm.respond(response_channel, reply);
+            }
+            Message::BoardSync(msg) => {
+                if let Err(e) = self.handle_board_sync(from_master, msg).await {
+                    warn!(device = %from_device, err = %e, "processor: BoardSync handler failed");
+                }
+                let ack = Message::SystemStateAck(SystemStateAckMsg {
+                    v: 1,
+                    stored: true,
+                    timestamp: Timestamp::now(),
+                });
+                let _ = self.swarm.respond(response_channel, ack);
+            }
+            Message::SystemStateBackup(backup) => {
+                let ack = self.handle_system_state_backup_inner(from_master, backup).await;
+                let _ = self.swarm.respond(response_channel, Message::SystemStateAck(ack));
+            }
+            Message::SystemStateRequest(req) => {
+                let resp = self.handle_system_state_request_inner(from_master, req).await;
+                let _ = self.swarm.respond(response_channel, Message::SystemStateResponse(resp));
+            }
+            Message::ClusterSyncRequest(req) => {
+                self.handle_cluster_sync_request_libp2p(
+                    from_device,
+                    from_master,
+                    req,
+                    response_channel,
+                )
+                .await?;
+            }
+            Message::ClusterSyncResponse(resp) => {
+                if from_master != self.own_identity {
+                    warn!(
+                        from = %from_master,
+                        own = %self.own_identity,
+                        "processor: ClusterSyncResponse from non-cluster peer, ignoring"
+                    );
+                    let _ = self.swarm.respond(response_channel, Message::Ack(AckMsg { v: 1 }));
+                    return Ok(());
+                }
+                if let Err(e) = self.handle_cluster_sync_response(from_master, resp).await {
+                    warn!(device = %from_device, err = %e, "processor: ClusterSyncResponse handler failed");
+                }
+                let ack = Message::SystemStateAck(SystemStateAckMsg {
+                    v: 1,
+                    stored: true,
+                    timestamp: Timestamp::now(),
+                });
+                let _ = self.swarm.respond(response_channel, ack);
+            }
+            Message::SymbolAccept(accept) => {
+                if let Err(e) = self.handle_symbol_accept(from_master, accept).await {
+                    warn!(device = %from_device, err = %e, "processor: SymbolAccept handler failed");
+                }
+                let ack = Message::SystemStateAck(SystemStateAckMsg {
+                    v: 1,
+                    stored: true,
+                    timestamp: Timestamp::now(),
+                });
+                let _ = self.swarm.respond(response_channel, ack);
+            }
+            Message::SymbolReject(reject) => {
+                if let Err(e) = self.handle_symbol_reject(from_master, reject).await {
+                    warn!(device = %from_device, err = %e, "processor: SymbolReject handler failed");
+                }
+                let ack = Message::SystemStateAck(SystemStateAckMsg {
+                    v: 1,
+                    stored: true,
+                    timestamp: Timestamp::now(),
+                });
+                let _ = self.swarm.respond(response_channel, ack);
+            }
+            Message::RestoreDenied(denied) => {
+                if let Err(e) = self.handle_restore_denied(from_master, denied).await {
+                    warn!(device = %from_device, err = %e, "processor: RestoreDenied handler failed");
+                }
+                let ack = Message::SystemStateAck(SystemStateAckMsg {
+                    v: 1,
+                    stored: true,
+                    timestamp: Timestamp::now(),
+                });
+                let _ = self.swarm.respond(response_channel, ack);
+            }
+            Message::PeerAnnounce(pa) => {
+                if let Err(e) = self.handle_peer_announce(pa).await {
+                    warn!(device = %from_device, err = %e, "processor: PeerAnnounce handler failed");
+                }
+                let ack = Message::SystemStateAck(SystemStateAckMsg {
+                    v: 1,
+                    stored: true,
+                    timestamp: Timestamp::now(),
+                });
+                let _ = self.swarm.respond(response_channel, ack);
+            }
+            Message::SystemStateAck(ack) => {
+                self.handle_system_state_ack(from_master, ack);
+                let resp = Message::SystemStateAck(SystemStateAckMsg {
+                    v: 1,
+                    stored: true,
+                    timestamp: Timestamp::now(),
+                });
+                let _ = self.swarm.respond(response_channel, resp);
+            }
+            Message::SystemStateResponse(resp) => {
+                self.handle_system_state_response(from_master, resp).await;
+                let ack = Message::SystemStateAck(SystemStateAckMsg {
+                    v: 1,
+                    stored: true,
+                    timestamp: Timestamp::now(),
+                });
+                let _ = self.swarm.respond(response_channel, ack);
+            }
+            other => {
+                warn!(
+                    device = %from_device,
+                    "processor: dispatch_libp2p: unhandled message variant {:?}",
+                    std::mem::discriminant(&other)
+                );
+                let ack = Message::SystemStateAck(SystemStateAckMsg {
+                    v: 1,
+                    stored: false,
+                    timestamp: Timestamp::now(),
+                });
+                let _ = self.swarm.respond(response_channel, ack);
+            }
+        }
+        Ok(())
+    }
+
+    /// Called when a libp2p connection closes (AC-13).
+    ///
+    /// Removes the device from peer_cert_map if present.
+    async fn on_connection_closed(&self, _peer_id: PeerId, device_id: Option<DeviceId>) {
+        if let Some(dev_id) = device_id {
+            let removed = {
+                let mut map = self.peer_cert_map.lock().unwrap();
+                map.remove(&dev_id).is_some()
+            };
+            debug!(device = %dev_id, removed, "processor: connection closed, removed from peer_cert_map");
+        } else {
+            debug!("processor: unauthenticated connection closed");
+        }
+    }
+
+    // =========================================================
     // Cluster auto-add helper
     // =========================================================
 
-    /// Auto-add a cluster device if the incoming connection has the same master identity.
+    /// Auto-add a cluster device if the peer has the same master identity as this node.
     ///
-    /// Checks whether `peer_master_identity == own_identity`. If so, extracts the
-    /// device cert from `peer_device_cert`, calls `cluster_state.add_device`, and
-    /// registers the device in `cluster_peers` via the network handle.
+    /// Checks whether `peer_master_identity == own_identity`. If so, calls
+    /// `cluster_state.add_device`. Routing is by DeviceId via SwarmHandle's
+    /// internal authenticated map — no explicit address registration needed.
     ///
     /// Errors from `add_device`:
     ///   - `DeviceAlreadyRegistered` → logged at debug, not an error condition.
@@ -456,7 +640,6 @@ impl Processor {
         &self,
         peer_master_identity: Option<syncback_core::types::IdentityPub>,
         peer_device_cert: Option<syncback_core::cluster::DeviceCertificate>,
-        endpoint_addr: iroh::EndpointAddr,
     ) -> bool {
         let peer_master = match peer_master_identity {
             Some(id) => id,
@@ -473,8 +656,8 @@ impl Processor {
             Some(cs) => cs,
             None => return false,
         };
-        // Store hex of device_pub_key — used to derive iroh NodeId for reconnect.
-        let addr_str = syncback_core::types::hex_encode(&cert.device_pub_key);
+        // Store hex of device_id.0 (= device pub key) — used for reconnect.
+        let addr_str = syncback_core::types::hex_encode(&cert.device_id.0);
         let result = {
             let mut guard = cs.lock().unwrap();
             let r = guard.add_device(cert.clone(), Timestamp::now());
@@ -484,12 +667,13 @@ impl Processor {
         };
         match result {
             Ok(()) => {
-                self.network.add_cluster_peer(cert.device_id, endpoint_addr).await;
+                // libp2p routing is by DeviceId via SwarmHandle's authenticated map.
+                // No explicit address registration needed (unlike iroh).
                 true
             }
             Err(syncback_core::cluster::ClusterStateError::DeviceAlreadyRegistered(_)) => {
-                // Still update cluster_peers — addr may have changed.
-                self.network.add_cluster_peer(cert.device_id, endpoint_addr).await;
+                // libp2p routing is by DeviceId; no explicit address update needed.
+                debug!(device = %cert.device_id, "cluster: device already registered, skipping add");
                 false
             }
             Err(_) => false,
@@ -552,7 +736,13 @@ impl Processor {
             "pos_response" => {
                 match from_cbor::<PosResponseMsg>(&msg.payload) {
                     Ok(response) => {
-                        if let Err(e) = self.handle_pos_response(msg.from, response).await {
+                        // Resolve DeviceId: use device_id from message body if present,
+                        // else fall back to first device for the master (msg.from).
+                        let holder_device = response.device_id
+                            .or_else(|| self.db.get_devices_for_master(&msg.from).ok()
+                                .and_then(|ds| ds.into_iter().next()))
+                            .unwrap_or_else(|| DeviceId(msg.from.0));
+                        if let Err(e) = self.handle_pos_response(holder_device, response).await {
                             warn!(err = %e, "processor: PosResponse via relay failed");
                         }
                     }
@@ -562,7 +752,13 @@ impl Processor {
             "pos_nack" => {
                 match from_cbor::<PosNackMsg>(&msg.payload) {
                     Ok(nack) => {
-                        if let Err(e) = self.handle_pos_nack(msg.from, nack).await {
+                        // Resolve DeviceId: use device_id from message body if present,
+                        // else fall back to first device for the master (msg.from).
+                        let from_device = nack.device_id
+                            .or_else(|| self.db.get_devices_for_master(&msg.from).ok()
+                                .and_then(|ds| ds.into_iter().next()))
+                            .unwrap_or_else(|| DeviceId(msg.from.0));
+                        if let Err(e) = self.handle_pos_nack(from_device, nack).await {
                             warn!(err = %e, "processor: PosNack via relay failed");
                         }
                     }
@@ -592,7 +788,11 @@ impl Processor {
             "symbol_dropped" => {
                 match from_cbor::<SymbolDroppedMsg>(&msg.payload) {
                     Ok(dropped) => {
-                        if let Err(e) = self.handle_symbol_dropped(msg.from, dropped).await {
+                        // SymbolDropped comes from a holder — resolve DeviceId from master.
+                        let from_device = self.db.get_devices_for_master(&msg.from).ok()
+                            .and_then(|ds| ds.into_iter().next())
+                            .unwrap_or_else(|| DeviceId(msg.from.0));
+                        if let Err(e) = self.handle_symbol_dropped(from_device, dropped).await {
                             warn!(err = %e, "processor: SymbolDropped via relay failed");
                         }
                     }
@@ -621,106 +821,6 @@ impl Processor {
                 debug!(msg_type = %other, "processor: relay message, no handler");
             }
         }
-    }
-
-    // =========================================================
-    // Message dispatch
-    // =========================================================
-
-    async fn dispatch(
-        &self,
-        from: IdentityPub,
-        msg: Message,
-        conn: Arc<Connection>,
-    ) -> anyhow::Result<()> {
-        match msg {
-            Message::SymbolTransfer(transfer) => {
-                self.handle_symbol_transfer(from, transfer).await?;
-            }
-            Message::PosChallenge(challenge) => {
-                self.handle_pos_challenge(from, challenge, conn).await?;
-            }
-            Message::PosResponse(response) => {
-                self.handle_pos_response(from, response).await?;
-            }
-            Message::PosNack(nack) => {
-                self.handle_pos_nack(from, nack).await?;
-            }
-            Message::SymbolDropped(dropped) => {
-                self.handle_symbol_dropped(from, dropped).await?;
-            }
-            Message::ClusterSyncRequest(request) => {
-                self.handle_cluster_sync_request(from, request, conn)
-                    .await?;
-            }
-            Message::ClusterSyncResponse(response) => {
-                // Use device-level identity as cursor key (per-device cursors).
-                // conn.peer_device_cert carries the peer's device_pub_key from the handshake.
-                // Fall back to master identity if cert is unavailable (should not happen).
-                let device_identity = conn
-                    .peer_device_cert
-                    .as_ref()
-                    .map(|c| IdentityPub(c.device_pub_key))
-                    .unwrap_or(from);
-                self.handle_cluster_sync_response(device_identity, response).await?;
-            }
-            Message::SymbolOffer(offer) => {
-                self.handle_symbol_offer(from, offer, conn).await?;
-            }
-            Message::SymbolAccept(accept) => {
-                self.handle_symbol_accept(from, accept).await?;
-            }
-            Message::SymbolReject(reject) => {
-                self.handle_symbol_reject(from, reject).await?;
-            }
-            Message::RestoreRequest(req) => {
-                self.handle_restore_request(from, req, conn).await?;
-            }
-            Message::RestoreDenied(denied) => {
-                self.handle_restore_denied(from, denied).await?;
-            }
-            Message::BoardSync(board_sync) => {
-                self.handle_board_sync(from, board_sync).await?;
-            }
-            Message::PeerAnnounce(pa) => {
-                self.handle_peer_announce(pa).await?;
-            }
-            Message::SystemStateBackup(msg) => {
-                self.handle_system_state_backup(from, msg).await?;
-            }
-            Message::SystemStateAck(msg) => {
-                self.handle_system_state_ack(from, msg);
-            }
-            Message::SystemStateRequest(msg) => {
-                self.handle_system_state_request(from, msg, conn).await?;
-            }
-            Message::SystemStateResponse(msg) => {
-                self.handle_system_state_response(from, msg).await;
-            }
-            Message::PeerDiscoveryRequest(msg) => {
-                self.handle_peer_discovery_request(from, msg, conn).await?;
-            }
-            Message::PeerDiscoveryResponse(msg) => {
-                self.handle_peer_discovery_response(from, msg).await;
-            }
-            Message::Delete(msg) => {
-                self.handle_delete(from, msg).await?;
-            }
-            Message::CancelDelete(msg) => {
-                self.handle_cancel_delete(from, msg).await?;
-            }
-            Message::SymbolDropNotice(msg) => {
-                self.handle_symbol_drop_notice(from, msg);
-            }
-            other => {
-                debug!(
-                    peer = %from,
-                    "processor: unhandled message variant {:?}, ignoring",
-                    std::mem::discriminant(&other)
-                );
-            }
-        }
-        Ok(())
     }
 
     // =========================================================
@@ -864,13 +964,16 @@ impl Processor {
 
         self.db.upsert_holding(&record)?;
 
-        // Refresh trust_s for this peer: we now store more bytes for them.
-        if let Err(e) = self.db.refresh_peer_storage_bytes(&owner_id) {
-            error!(
-                peer = %owner_id,
-                err = %e,
-                "processor: failed to refresh storage balance after SymbolTransfer"
-            );
+        // Refresh trust_s for all devices of this peer's master identity.
+        for did in self.db.get_devices_for_master(&owner_id).unwrap_or_default() {
+            if let Err(e) = self.db.refresh_peer_storage_bytes(&did) {
+                error!(
+                    peer = %owner_id,
+                    device = %did,
+                    err = %e,
+                    "processor: failed to refresh storage balance after SymbolTransfer"
+                );
+            }
         }
 
         info!(
@@ -880,8 +983,7 @@ impl Processor {
             "processor: stored symbols for block"
         );
 
-        // Send SymbolStored acknowledgement back through the connection.
-        // We don't hold conn here; ack is best-effort via NetworkHandle.
+        // In the libp2p path an Ack is sent via ResponseChannel in dispatch_libp2p.
         // The BackupCoordinator (sender side) handles the lack of ack gracefully.
 
         Ok(())
@@ -919,6 +1021,7 @@ impl Processor {
                     source_block_id: block_id,
                     esi,
                     timestamp: Timestamp::now(),
+                    device_id: challenge.device_id,
                 }));
             }
         }
@@ -941,6 +1044,7 @@ impl Processor {
                     esi,
                     data,
                     timestamp: Timestamp::now(),
+                    device_id: challenge.device_id,
                 }))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -955,21 +1059,11 @@ impl Processor {
                     source_block_id: block_id,
                     esi,
                     timestamp: Timestamp::now(),
+                    device_id: challenge.device_id,
                 }))
             }
             Err(e) => Err(ProcessorError::Io(e)),
         }
-    }
-
-    async fn handle_pos_challenge(
-        &self,
-        from: IdentityPub,
-        challenge: syncback_core::messages::PosChallengeMsg,
-        conn: Arc<Connection>,
-    ) -> Result<(), ProcessorError> {
-        let reply = self.handle_pos_challenge_inner(from, challenge).await?;
-        conn.send_message(&reply).await?;
-        Ok(())
     }
 
     // =========================================================
@@ -986,7 +1080,7 @@ impl Processor {
     /// Returns the VerifyOutcome for testing.
     pub(crate) async fn handle_pos_response(
         &self,
-        holder_id: IdentityPub,
+        holder_id: DeviceId,
         response: PosResponseMsg,
     ) -> Result<VerifyOutcome, ProcessorError> {
         // Resolve challenge_id → (source_block_id, map key) via the pending map.
@@ -1021,7 +1115,7 @@ impl Processor {
 
         let block_id = key.0;
 
-        // Load the placement record from DB.
+        // Load the placement record from DB (keyed by DeviceId).
         let placement = match self.db.get_placement(&block_id, &holder_id)? {
             Some(p) => p,
             None => {
@@ -1177,7 +1271,7 @@ impl Processor {
     /// Returns true if the placement was actually modified.
     pub(crate) fn handle_pos_nack_sync(
         &self,
-        holder_id: IdentityPub,
+        holder_id: DeviceId,
         nack: &PosNackMsg,
     ) -> Result<bool, ProcessorError> {
         let block_id = nack.source_block_id;
@@ -1186,27 +1280,27 @@ impl Processor {
 
     pub(crate) async fn handle_pos_nack(
         &self,
-        from: IdentityPub,
+        from_device: DeviceId,
         nack: PosNackMsg,
     ) -> Result<(), ProcessorError> {
         let block_id = nack.source_block_id;
-        self.handle_pos_nack_sync(from, &nack)?;
+        self.handle_pos_nack_sync(from_device, &nack)?;
 
         // Refresh trust_s: holder no longer stores those symbols for us.
-        if let Err(e) = self.db.refresh_peer_storage_bytes(&from) {
+        if let Err(e) = self.db.refresh_peer_storage_bytes(&from_device) {
             error!(
-                peer = %from,
+                device = %from_device,
                 err = %e,
                 "processor: failed to refresh storage balance after PosNack"
             );
         }
 
-        info!(block_id = %block_id, holder = %from, "repair: triggered");
+        info!(block_id = %block_id, holder = %from_device, "repair: triggered");
         let _ = self
             .repair_tx
             .send(RepairTrigger::RepairNow {
                 block_id,
-                holder_id: from,
+                holder_id: from_device,
             })
             .await;
         Ok(())
@@ -1222,7 +1316,7 @@ impl Processor {
     /// Returns true if the placement was actually modified.
     pub(crate) fn handle_symbol_dropped_sync(
         &self,
-        holder_id: IdentityPub,
+        holder_id: DeviceId,
         dropped: &SymbolDroppedMsg,
     ) -> Result<bool, ProcessorError> {
         let block_id = dropped.source_block_id;
@@ -1231,7 +1325,7 @@ impl Processor {
 
     pub(crate) async fn handle_symbol_dropped(
         &self,
-        from: IdentityPub,
+        from: DeviceId,
         dropped: SymbolDroppedMsg,
     ) -> Result<(), ProcessorError> {
         let block_id = dropped.source_block_id;
@@ -1240,7 +1334,7 @@ impl Processor {
         // Refresh trust_s: holder evicted our symbols, bytes_peer_stores_for_us decreased.
         if let Err(e) = self.db.refresh_peer_storage_bytes(&from) {
             error!(
-                peer = %from,
+                device = %from,
                 err = %e,
                 "processor: failed to refresh storage balance after SymbolDropped"
             );
@@ -1444,7 +1538,7 @@ impl Processor {
         Ok(true)
     }
 
-    /// Receive a SymbolOffer, decide Accept or Reject, send reply on conn.
+    /// Receive a SymbolOffer, decide Accept or Reject, return the reply Message.
     ///
     /// Does NOT create a HoldingRecord — that happens in handle_symbol_transfer
     /// when symbols actually arrive.
@@ -1453,15 +1547,16 @@ impl Processor {
     ///   1. Freshness: |now - timestamp| <= HANDSHAKE_FRESHNESS_SECS
     ///   2. Signature: verify_symbol_offer against owner_id (master identity from handshake)
     ///   3. Quota: decide_symbol_offer
-    pub(crate) async fn handle_symbol_offer(
+    ///
+    /// Called from dispatch_libp2p; reply is sent via ResponseChannel by caller.
+    pub(crate) fn handle_symbol_offer_inner(
         &self,
         owner_id: IdentityPub,
         offer: SymbolOfferMsg,
-        conn: Arc<Connection>,
-    ) -> Result<(), ProcessorError> {
+    ) -> Message {
         let now = Timestamp::now().0;
         let ts = offer.timestamp.0;
-        let delta = if now > ts { now - ts } else { ts - now };
+        let delta = now.abs_diff(ts);
         if delta > HANDSHAKE_FRESHNESS_SECS {
             warn!(
                 owner = %owner_id,
@@ -1469,15 +1564,13 @@ impl Processor {
                 delta_secs = delta,
                 "processor: SymbolOffer rejected — stale timestamp"
             );
-            let reply = Message::SymbolReject(SymbolRejectMsg {
+            return Message::SymbolReject(SymbolRejectMsg {
                 v: 1,
                 source_block_id: offer.source_block_id,
                 offer_msg_id: offer.msg_id,
                 reason: RejectReason::Other,
                 timestamp: Timestamp::now(),
             });
-            conn.send_message(&reply).await?;
-            return Ok(());
         }
 
         if let Err(e) = verify_symbol_offer(&offer, &owner_id) {
@@ -1487,15 +1580,13 @@ impl Processor {
                 err = %e,
                 "processor: SymbolOffer rejected — sig verification failed"
             );
-            let reply = Message::SymbolReject(SymbolRejectMsg {
+            return Message::SymbolReject(SymbolRejectMsg {
                 v: 1,
                 source_block_id: offer.source_block_id,
                 offer_msg_id: offer.msg_id,
                 reason: RejectReason::Other,
                 timestamp: Timestamp::now(),
             });
-            conn.send_message(&reply).await?;
-            return Ok(());
         }
 
         let offer_bytes: u64 = offer
@@ -1504,9 +1595,26 @@ impl Processor {
             .map(|&(_start, count)| count as u64 * SYMBOL_SIZE as u64)
             .sum();
 
-        let accept = self.decide_symbol_offer(offer_bytes)?;
+        let accept = match self.decide_symbol_offer(offer_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    owner = %owner_id,
+                    block_id = %offer.source_block_id,
+                    err = %e,
+                    "processor: SymbolOffer — quota check failed"
+                );
+                return Message::SymbolReject(SymbolRejectMsg {
+                    v: 1,
+                    source_block_id: offer.source_block_id,
+                    offer_msg_id: offer.msg_id,
+                    reason: RejectReason::QuotaFull,
+                    timestamp: Timestamp::now(),
+                });
+            }
+        };
 
-        let reply = if accept {
+        if accept {
             info!(
                 owner = %owner_id,
                 block_id = %offer.source_block_id,
@@ -1546,10 +1654,7 @@ impl Processor {
                 reason: RejectReason::QuotaFull,
                 timestamp: Timestamp::now(),
             })
-        };
-
-        conn.send_message(&reply).await?;
-        Ok(())
+        }
     }
 
     // =========================================================
@@ -1559,54 +1664,54 @@ impl Processor {
     /// Holder accepted our symbol offer. Notify BackupCoordinator and signal pending delivery.
     async fn handle_symbol_accept(
         &self,
-        holder_id: IdentityPub,
+        from_master: IdentityPub,
         accept: SymbolAcceptMsg,
     ) -> Result<(), ProcessorError> {
         info!(
-            holder = %holder_id,
+            holder = %from_master,
             block_id = %accept.source_block_id,
             "processor: SymbolAccept received"
         );
+        // BackupEvent now uses DeviceId — resolve from master.
+        let holder_device = self.db.get_devices_for_master(&from_master)
+            .unwrap_or_default()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| DeviceId(from_master.0));
         let _ = self.backup_event_tx.send(
             crate::daemon::backup::BackupEvent::SymbolAccepted {
-                holder_id,
+                holder_id: holder_device,
                 source_block_id: accept.source_block_id,
             },
         ).await;
-        // Signal the deliver_to_holder task waiting on the oneshot channel.
-        let key = (holder_id, accept.source_block_id);
-        let mut map = self.pending_deliveries.lock().await;
-        if let Some(tx) = map.remove(&key) {
-            let _ = tx.send(OfferOutcome::Accepted);
-        }
         Ok(())
     }
 
     /// Holder rejected our symbol offer. Notify BackupCoordinator and signal pending delivery.
     async fn handle_symbol_reject(
         &self,
-        holder_id: IdentityPub,
+        from_master: IdentityPub,
         reject: SymbolRejectMsg,
     ) -> Result<(), ProcessorError> {
         warn!(
-            holder = %holder_id,
+            holder = %from_master,
             block_id = %reject.source_block_id,
             reason = ?reject.reason,
             "processor: SymbolReject received"
         );
+        // BackupEvent now uses DeviceId — resolve from master.
+        let holder_device = self.db.get_devices_for_master(&from_master)
+            .unwrap_or_default()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| DeviceId(from_master.0));
         let _ = self.backup_event_tx.send(
             crate::daemon::backup::BackupEvent::SymbolRejected {
-                holder_id,
+                holder_id: holder_device,
                 source_block_id: reject.source_block_id,
                 reason: format!("{:?}", reject.reason),
             },
         ).await;
-        // Signal the deliver_to_holder task waiting on the oneshot channel.
-        let key = (holder_id, reject.source_block_id);
-        let mut map = self.pending_deliveries.lock().await;
-        if let Some(tx) = map.remove(&key) {
-            let _ = tx.send(OfferOutcome::Rejected { reason: reject.reason });
-        }
         Ok(())
     }
 
@@ -1736,42 +1841,6 @@ impl Processor {
         })
     }
 
-    /// Handle a RestoreRequest from an owner: load symbols and send RestoreResponse on conn.
-    /// If escrow check fails, sends RestoreDeniedMsg instead.
-    pub(crate) async fn handle_restore_request(
-        &self,
-        owner_id: IdentityPub,
-        request: RestoreRequestMsg,
-        conn: Arc<Connection>,
-    ) -> Result<(), ProcessorError> {
-        let block_id = request.source_block_id;
-        match self.handle_restore_request_inner(owner_id, request).await {
-            Ok(response) => {
-                conn.send_message(&Message::RestoreResponse(response))
-                    .await?;
-                Ok(())
-            }
-            Err(ProcessorError::EscrowDenied { denial, .. }) => {
-                // Don't leak internal trust scores or budget values to the requester.
-                // These help an attacker game the threshold precisely.
-                let _ = &denial; // suppress unused warning
-                let denied_msg = RestoreDeniedMsg {
-                    v: 1,
-                    source_block_id: block_id,
-                    reason: "escrow check failed".to_string(),
-                    current_trust: 0.0,
-                    needed_trust: 0.0,
-                    restore_budget_gb: 0.0,
-                    timestamp: Timestamp::now(),
-                };
-                conn.send_message(&Message::RestoreDenied(denied_msg))
-                    .await?;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
     // =========================================================
     // RestoreDenied: we are the owner
     // =========================================================
@@ -1817,15 +1886,13 @@ impl Processor {
     // PeerAnnounce: upsert peer in DB
     // =========================================================
 
-    /// Learn about a peer's identity. Upsert PeerRecord in DB and register
-    /// the peer's NodeId in the network layer so future `get_connection` calls
-    /// can reach them.
+    /// Learn about a peer's identity. Upsert PeerRecord in DB.
     ///
-    /// We build an `EndpointAddr` from the NodeId alone (no socket address).
-    /// iroh can still connect to a NodeId-only addr via the relay network
-    /// (RelayMode::Default) or direct discovery. For LAN-only setups (tests)
-    /// this is a no-op from a routing standpoint, but the record is still
-    /// stored for when the peer later connects with a full addr.
+    /// In the libp2p path, network routing is by PeerId/DeviceId via the
+    /// SwarmHandle's authenticated map — no explicit address registration needed.
+    /// The node_id field is kept in PeerRecord for backward compatibility
+    /// (used in relay board key derivation); it may be a zero placeholder for
+    /// libp2p peers.
     pub(crate) async fn handle_peer_announce(
         &self,
         msg: PeerAnnounceMsg,
@@ -1841,67 +1908,30 @@ impl Processor {
         }
 
         let now = Timestamp::now();
-        let record = match self.db.get_peer(&msg.identity_pub)? {
-            None => PeerRecord {
-                identity: msg.identity_pub,
-                node_id: Some(msg.node_id),
-                trust_p: INITIAL_TRUST_P,
-                trust_i: 0.0,
-                trust_s: 1.0,
-                bytes_we_store_for_peer: 0,
-                bytes_peer_stores_for_us: 0,
-                first_seen: now,
-                last_seen: now,
-                device_id: None,
-                revoked_device_pub_keys: vec![],
-                addrs: vec![],
-                x25519_pub: msg.x25519_pub,
-            },
-            Some(mut existing) => {
-                existing.node_id = Some(msg.node_id);
-                existing.last_seen = now;
-                if msg.x25519_pub.is_some() {
-                    existing.x25519_pub = msg.x25519_pub;
+        // PeerRecord is keyed by DeviceId. Look up all known devices for this master identity.
+        // If we have device records — update x25519_pub and last_seen.
+        // If no devices known yet — record is created later by on_peer_authenticated.
+        let devices = self.db.get_devices_for_master(&msg.identity_pub).unwrap_or_default();
+        for did in &devices {
+            match self.db.get_peer(did)? {
+                Some(mut existing) => {
+                    existing.last_seen = now;
+                    if msg.x25519_pub.is_some() {
+                        existing.x25519_pub = msg.x25519_pub;
+                    }
+                    if existing.trust_p == 0.0 && existing.trust_i == 0.0 {
+                        existing.trust_p = INITIAL_TRUST_P;
+                    }
+                    self.db.upsert_peer(&existing)?;
                 }
-                // Bootstrap trust if peer was created by dispatch_connect with zero trust.
-                if existing.trust_p == 0.0 && existing.trust_i == 0.0 {
-                    existing.trust_p = INITIAL_TRUST_P;
-                }
-                existing
-            }
-        };
-        self.db.upsert_peer(&record)?;
-
-        // Register the peer in the network layer so get_connection() can reach
-        // them. Try to get the full address (IP:port + relay) from iroh's
-        // internal state first; fall back to NodeId-only if unavailable.
-        match iroh::PublicKey::from_bytes(&msg.node_id.0) {
-            Ok(pubkey) => {
-                let addr = match self.network.remote_endpoint_addr(pubkey).await {
-                    Some(full_addr) => full_addr,
-                    None => iroh::EndpointAddr::new(pubkey),
-                };
-                self.network.add_peer(msg.identity_pub, addr).await;
-                info!(
-                    identity = %msg.identity_pub,
-                    node_id = %msg.node_id,
-                    "processor: PeerAnnounce upserted peer record and registered in network"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    identity = %msg.identity_pub,
-                    node_id = %msg.node_id,
-                    err = %e,
-                    "processor: PeerAnnounce — invalid NodeId bytes, skipping network.add_peer"
-                );
-                info!(
-                    identity = %msg.identity_pub,
-                    node_id = %msg.node_id,
-                    "processor: PeerAnnounce upserted peer record (no network entry)"
-                );
+                None => {}
             }
         }
+
+        info!(
+            identity = %msg.identity_pub,
+            "processor: PeerAnnounce upserted peer record"
+        );
 
         Ok(())
     }
@@ -1956,27 +1986,29 @@ impl Processor {
             return Ok(());
         }
 
-        let revoked_pub = broadcast.device_cert.device_pub_key;
+        // device_id.0 IS the device pub key — use it for the revocation list.
+        let revoked_pub = broadcast.device_cert.device_id.0;
 
         // Only update PeerRecords we already know about. Unknown peers are skipped.
-        let mut record = match self.db.get_peer(&from)? {
-            Some(r) => r,
-            None => {
-                debug!(
-                    peer = %from,
-                    "processor: RevocationBroadcast from unknown peer, ignoring"
-                );
-                return Ok(());
-            }
-        };
-
-        if record.revoked_device_pub_keys.contains(&revoked_pub) {
-            debug!(peer = %from, "processor: RevocationBroadcast device already in revoked list");
+        // PeerRecord is keyed by DeviceId; find any device of this master.
+        let devices = self.db.get_devices_for_master(&from).unwrap_or_default();
+        if devices.is_empty() {
+            debug!(
+                peer = %from,
+                "processor: RevocationBroadcast from unknown peer, ignoring"
+            );
             return Ok(());
         }
-
-        record.revoked_device_pub_keys.push(revoked_pub);
-        self.db.upsert_peer(&record)?;
+        for did in &devices {
+            let mut record = match self.db.get_peer(did)? {
+                Some(r) => r,
+                None => continue,
+            };
+            if !record.revoked_device_pub_keys.contains(&revoked_pub) {
+                record.revoked_device_pub_keys.push(revoked_pub);
+                self.db.upsert_peer(&record)?;
+            }
+        }
 
         info!(
             peer = %from,
@@ -1991,35 +2023,46 @@ impl Processor {
     // ClusterSyncRequest: serve event log to a peer device
     // =========================================================
 
-    async fn handle_cluster_sync_request(
+    /// Handle a ClusterSyncRequest via libp2p (AC-6).
+    ///
+    /// Validates that the claimed from_device_id matches the authenticated cert
+    /// stored in peer_cert_map. On mismatch: drops the ResponseChannel (no reply),
+    /// which causes libp2p to return an error to the sender.
+    async fn handle_cluster_sync_request_libp2p(
         &self,
-        from: IdentityPub,
+        from_device: DeviceId,
+        from_master: IdentityPub,
         request: ClusterSyncRequestMsg,
-        conn: Arc<Connection>,
+        response_channel: ResponseChannel<Message>,
     ) -> Result<(), ProcessorError> {
-        // Verify that the claimed device_id matches the connection's device cert.
-        // Without this, an authenticated cluster peer could enumerate membership
-        // by trying different device_ids.
-        if let Some(ref cert) = conn.peer_device_cert {
-            if cert.device_id != request.from_device_id {
-                warn!(
-                    peer = %from,
-                    claimed_device = ?request.from_device_id,
-                    actual_device = ?cert.device_id,
-                    "processor: ClusterSyncRequest device_id mismatch, rejecting"
-                );
-                return Ok(());
-            }
+        // Validate: the device cert stored in peer_cert_map must match from_device_id.
+        let cert_ok = {
+            let map = self.peer_cert_map.lock().unwrap();
+            map.get(&from_device)
+                .map(|(_, cert)| cert.device_id == request.from_device_id)
+                .unwrap_or(false)
+        };
+        if !cert_ok {
+            warn!(
+                device = %from_device,
+                claimed_device = ?request.from_device_id,
+                "processor: ClusterSyncRequest device_id mismatch, dropping"
+            );
+            // Drop response_channel — libp2p will return an error to the sender.
+            drop(response_channel);
+            return Ok(());
         }
 
         match self.cluster_sync.handle_sync_request(&request) {
             Ok(response) => {
-                conn.send_message(&Message::ClusterSyncResponse(response))
-                    .await?;
-                debug!(peer = %from, "processor: ClusterSyncRequest served");
+                let _ = self
+                    .swarm
+                    .respond(response_channel, Message::ClusterSyncResponse(response));
+                debug!(peer = %from_master, "processor: ClusterSyncRequest served");
             }
             Err(e) => {
-                warn!(peer = %from, err = %e, "processor: ClusterSyncRequest rejected");
+                warn!(peer = %from_master, err = %e, "processor: ClusterSyncRequest rejected");
+                drop(response_channel);
             }
         }
         Ok(())
@@ -2029,7 +2072,7 @@ impl Processor {
     // ClusterSyncResponse: apply events from a peer device
     // =========================================================
 
-    async fn handle_cluster_sync_response(
+    pub(crate) async fn handle_cluster_sync_response(
         &self,
         from: IdentityPub,
         response: ClusterSyncResponseMsg,
@@ -2056,31 +2099,27 @@ impl Processor {
     /// Receive and store a system state blob from a peer.
     /// Only accepts blobs from known peers to prevent storage spam.
     /// Sends a SystemStateAck back regardless of outcome.
-    pub(crate) async fn handle_system_state_backup(
+    /// Receive and store a system state blob from a peer. Returns the ack.
+    ///
+    /// In the libp2p path the ack is returned to the caller (dispatch_libp2p)
+    /// which sends it via ResponseChannel.
+    pub(crate) async fn handle_system_state_backup_inner(
         &self,
         owner_id: IdentityPub,
         backup: SystemStateBackupMsg,
-    ) -> Result<(), ProcessorError> {
+    ) -> SystemStateAckMsg {
         if backup.encrypted_blob.is_empty() {
             warn!(peer = %owner_id, "processor: SystemStateBackup: empty blob, ignoring");
-            let ack = Message::SystemStateAck(SystemStateAckMsg {
-                v: 1,
-                stored: false,
-                timestamp: Timestamp::now(),
-            });
-            let _ = self.network.send_to_peer(owner_id, &ack).await;
-            return Ok(());
+            return SystemStateAckMsg { v: 1, stored: false, timestamp: Timestamp::now() };
         }
         // Only accept from known peers (prevent storage spam from strangers).
-        if self.db.get_peer(&owner_id)?.is_none() {
+        // PeerRecord is keyed by DeviceId; check if any device of this master is known.
+        let known = self.db.get_devices_for_master(&owner_id)
+            .map(|ds| !ds.is_empty())
+            .unwrap_or(false);
+        if !known {
             warn!(peer = %owner_id, "processor: SystemStateBackup: unknown peer, rejecting");
-            let ack = Message::SystemStateAck(SystemStateAckMsg {
-                v: 1,
-                stored: false,
-                timestamp: Timestamp::now(),
-            });
-            let _ = self.network.send_to_peer(owner_id, &ack).await;
-            return Ok(());
+            return SystemStateAckMsg { v: 1, stored: false, timestamp: Timestamp::now() };
         }
         let record = SystemStateBlobRecord {
             owner: owner_id,
@@ -2088,15 +2127,16 @@ impl Processor {
             created_at: backup.timestamp,
             stored_at: Timestamp::now(),
         };
-        self.db.store_system_state_blob(&owner_id, &record)?;
-        info!(peer = %owner_id, "processor: SystemStateBackup: stored");
-        let ack = Message::SystemStateAck(SystemStateAckMsg {
-            v: 1,
-            stored: true,
-            timestamp: Timestamp::now(),
-        });
-        let _ = self.network.send_to_peer(owner_id, &ack).await;
-        Ok(())
+        match self.db.store_system_state_blob(&owner_id, &record) {
+            Ok(()) => {
+                info!(peer = %owner_id, "processor: SystemStateBackup: stored");
+                SystemStateAckMsg { v: 1, stored: true, timestamp: Timestamp::now() }
+            }
+            Err(e) => {
+                error!(peer = %owner_id, err = %e, "processor: SystemStateBackup: store failed");
+                SystemStateAckMsg { v: 1, stored: false, timestamp: Timestamp::now() }
+            }
+        }
     }
 
     // =========================================================
@@ -2116,27 +2156,29 @@ impl Processor {
     // SystemStateRequest: we are the holder
     // =========================================================
 
-    /// Respond to a system state request with the stored blob for the requester.
-    /// Sends an empty blob if nothing is stored.
-    pub(crate) async fn handle_system_state_request(
+    /// Respond to a system state request. Returns the response message.
+    ///
+    /// In the libp2p path the response is sent via ResponseChannel by the caller.
+    pub(crate) async fn handle_system_state_request_inner(
         &self,
         requester_id: IdentityPub,
         _req: SystemStateRequestMsg,
-        conn: Arc<Connection>,
-    ) -> Result<(), ProcessorError> {
-        let blob = match self.db.get_system_state_blob(&requester_id)? {
-            Some(r) => r.encrypted_blob,
-            None => vec![],
+    ) -> SystemStateResponseMsg {
+        let blob = match self.db.get_system_state_blob(&requester_id) {
+            Ok(Some(r)) => r.encrypted_blob,
+            Ok(None) => vec![],
+            Err(e) => {
+                error!(peer = %requester_id, err = %e, "processor: SystemStateRequest: db error");
+                vec![]
+            }
         };
         let found = !blob.is_empty();
         debug!(peer = %requester_id, found, "processor: SystemStateRequest: responding");
-        let resp = Message::SystemStateResponse(SystemStateResponseMsg {
+        SystemStateResponseMsg {
             v: 1,
             encrypted_blob: blob,
             timestamp: Timestamp::now(),
-        });
-        conn.send_message(&resp).await?;
-        Ok(())
+        }
     }
 
     // =========================================================
@@ -2157,158 +2199,9 @@ impl Processor {
         );
     }
 
-    // =========================================================
-    // PeerDiscoveryRequest: respond with known peer list
-    // =========================================================
-
-    /// Respond to a peer discovery request with all peers known to this node.
-    pub(crate) async fn handle_peer_discovery_request(
-        &self,
-        requester_id: IdentityPub,
-        _req: PeerDiscoveryRequestMsg,
-        conn: Arc<Connection>,
-    ) -> Result<(), ProcessorError> {
-        let peers = self.db.list_all_peers()?;
-        let discovered: Vec<DiscoveredPeer> = peers
-            .iter()
-            .filter_map(|p| {
-                p.node_id.map(|nid| DiscoveredPeer {
-                    identity_pub: p.identity,
-                    node_id: nid,
-                    addrs: p.addrs.clone(),
-                })
-            })
-            .collect();
-        debug!(
-            peer = %requester_id,
-            count = discovered.len(),
-            "processor: PeerDiscoveryRequest: responding"
-        );
-        let resp = Message::PeerDiscoveryResponse(PeerDiscoveryResponseMsg {
-            v: 1,
-            peers: discovered,
-            timestamp: Timestamp::now(),
-        });
-        conn.send_message(&resp).await?;
-        Ok(())
-    }
-
-    // =========================================================
-    // PeerDiscoveryResponse: we are the bootstrap/DR requester
-    // =========================================================
-
-    /// Handle a peer discovery response: register each discovered peer in the
-    /// network layer so future `get_connection` calls can reach them.
-    ///
-    /// For each peer in the response:
-    ///   - Skip if identity == our own identity.
-    ///   - Try to build an EndpointAddr from the first parseable addr string.
-    ///   - Fall back to NodeId-only EndpointAddr (iroh relay/DNS discovery).
-    ///   - Call network.add_peer to register in-memory.
-    ///   - DB persistence happens later via PeerAnnounce on handshake.
-    pub(crate) async fn handle_peer_discovery_response(
-        &self,
-        peer_id: IdentityPub,
-        resp: PeerDiscoveryResponseMsg,
-    ) {
-        use crate::daemon::network::addr::{parse_node_addr, to_endpoint_addr};
-
-        info!(
-            peer = %peer_id,
-            discovered_count = resp.peers.len(),
-            "processor: PeerDiscoveryResponse: received"
-        );
-
-        let mut connected = 0usize;
-        for dp in &resp.peers {
-            if dp.identity_pub == self.own_identity {
-                debug!(
-                    peer = %dp.identity_pub,
-                    "processor: PeerDiscoveryResponse: skipping self"
-                );
-                continue;
-            }
-
-            if self.db.get_peer(&dp.identity_pub).ok().flatten().is_none() {
-                debug!(
-                    peer = %dp.identity_pub,
-                    "processor: PeerDiscoveryResponse: new peer discovered"
-                );
-            }
-
-            // Build EndpointAddr: try each addr string, use first parseable one.
-            // Fall back to NodeId-only if none parse (iroh relay/DNS will resolve).
-            let endpoint_addr = match iroh::PublicKey::from_bytes(&dp.node_id.0) {
-                Err(e) => {
-                    warn!(
-                        identity = %dp.identity_pub,
-                        err = %e,
-                        "processor: PeerDiscoveryResponse: invalid NodeId bytes, skipping"
-                    );
-                    continue;
-                }
-                Ok(pubkey) => {
-                    let mut resolved: Option<iroh::EndpointAddr> = None;
-                    for addr_str in &dp.addrs {
-                        match parse_node_addr(addr_str) {
-                            Ok(parsed) => match to_endpoint_addr(&parsed) {
-                                Ok(ea) => {
-                                    resolved = Some(ea);
-                                    break;
-                                }
-                                Err(e) => {
-                                    debug!(
-                                        addr = %addr_str,
-                                        err = %e,
-                                        "processor: PeerDiscoveryResponse: to_endpoint_addr failed"
-                                    );
-                                }
-                            },
-                            Err(e) => {
-                                debug!(
-                                    addr = %addr_str,
-                                    err = %e,
-                                    "processor: PeerDiscoveryResponse: addr parse failed"
-                                );
-                            }
-                        }
-                    }
-                    resolved.unwrap_or_else(|| iroh::EndpointAddr::new(pubkey))
-                }
-            };
-
-            self.network.add_peer(dp.identity_pub, endpoint_addr).await;
-
-            // Connect to a limited number of discovered peers per response.
-            // Remaining peers are in known_peers and will be connected in
-            // future discovery rounds or when get_connection is called.
-            if connected < 5 {
-                match self.network.get_connection(dp.identity_pub).await {
-                    Ok(_) => {
-                        connected += 1;
-                        info!(
-                            identity = %dp.identity_pub,
-                            "processor: PeerDiscoveryResponse: connected to discovered peer"
-                        );
-                    }
-                    Err(e) => {
-                        debug!(
-                            identity = %dp.identity_pub,
-                            err = %e,
-                            "processor: PeerDiscoveryResponse: connect failed (peer may be offline)"
-                        );
-                    }
-                }
-            }
-        }
-        info!(
-            peer = %peer_id,
-            added = resp.peers.len(),
-            connected,
-            "processor: PeerDiscoveryResponse: done"
-        );
-    }
 }
+// PeerDiscoveryRequest and PeerDiscoveryResponse removed in ε.2 (AC-12).
+// Replaced by Kademlia DHT in ε.3.
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -2317,7 +2210,7 @@ impl Processor {
 fn mark_placement_lost(
     db: &Db,
     block_id: &syncback_core::types::SourceBlockId,
-    holder_id: &IdentityPub,
+    holder_id: &DeviceId,
 ) -> Result<bool, ProcessorError> {
     let placement = match db.get_placement(block_id, holder_id)? {
         Some(p) => p,
@@ -2350,12 +2243,12 @@ fn mark_placement_lost(
 }
 
 /// Record PoS outcome in the weekly stats table (best-effort, logs on error).
-pub(crate) fn record_pos_weekly(db: &Db, peer: IdentityPub, outcome: PosOutcome) {
+pub(crate) fn record_pos_weekly(db: &Db, device: DeviceId, outcome: PosOutcome) {
     let week = outcome.week_number;
-    let existing = match db.get_pos_weekly(&peer, week) {
+    let existing = match db.get_pos_weekly(&device, week) {
         Ok(v) => v,
         Err(e) => {
-            error!(peer = %peer, err = %e, "processor: failed to read pos_weekly");
+            error!(device = %device, err = %e, "processor: failed to read pos_weekly");
             return;
         }
     };
@@ -2363,26 +2256,26 @@ pub(crate) fn record_pos_weekly(db: &Db, peer: IdentityPub, outcome: PosOutcome)
         challenged: existing.as_ref().map(|e| e.challenged).unwrap_or(0) + outcome.challenged,
         passed: existing.as_ref().map(|e| e.passed).unwrap_or(0) + outcome.passed,
     };
-    if let Err(e) = db.upsert_pos_weekly(&peer, week, &entry) {
-        error!(peer = %peer, err = %e, "processor: failed to update pos_weekly");
+    if let Err(e) = db.upsert_pos_weekly(&device, week, &entry) {
+        error!(device = %device, err = %e, "processor: failed to update pos_weekly");
     }
 }
 
-/// Recalculate trust P and I for a peer from pos_weekly data, persist to PeerRecord.
+/// Recalculate trust P and I for a device from pos_weekly data, persist to PeerRecord.
 /// Returns (old_p, old_i, new_p, new_i) for logging, or None on error.
 pub(crate) fn recalculate_trust(
     db: &Db,
-    peer: &IdentityPub,
+    device: &DeviceId,
     current_week: u32,
 ) -> Option<(f64, f64, f64, f64)> {
-    let mut record = match db.get_peer(peer) {
+    let mut record = match db.get_peer(device) {
         Ok(Some(r)) => r,
         _ => return None,
     };
     let old_p = record.trust_p;
     let old_i = record.trust_i;
 
-    let entries = db.list_pos_weekly_for_peer(peer).unwrap_or_default();
+    let entries = db.list_pos_weekly_for_peer(device).unwrap_or_default();
 
     // P: rolling window pass rate over last P_WINDOW_WEEKS weeks.
     let window_start = current_week.saturating_sub(P_WINDOW_WEEKS - 1);
@@ -2416,8 +2309,49 @@ pub(crate) fn recalculate_trust(
     record.trust_p = new_p;
     record.trust_i = new_i;
     if let Err(e) = db.upsert_peer(&record) {
-        error!(peer = %peer, err = %e, "processor: failed to persist trust update");
+        error!(device = %device, err = %e, "processor: failed to persist trust update");
         return None;
+    }
+
+    // --- Two-level trust update ---
+    // Update DeviceTrustRecord for this specific device.
+    let dtr = DeviceTrustRecord {
+        device_id: *device,
+        trust_p: new_p,
+        trust_i: new_i,
+        last_week: current_week,
+    };
+    if let Err(e) = db.set_device_trust(&dtr) {
+        error!(device = %device, err = %e, "processor: failed to update device trust");
+    }
+
+    // Recompute master trust from all device trusts of this device's master.
+    let master_identity = record.master_identity;
+    let devices_for_master = db.get_devices_for_master(&master_identity).unwrap_or_default();
+    let device_data: Vec<(DeviceTrustRecord, u64)> = devices_for_master
+        .iter()
+        .filter_map(|did| {
+            db.get_device_trust(did).ok().flatten().map(|dt| {
+                // Weight = total alive symbol count for this device.
+                let weight: u64 = db
+                    .list_placements_for_holder(did)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|p| p.status == syncback_core::types::PlacementStatus::Alive)
+                    .map(|p| p.symbol_count() as u64)
+                    .sum();
+                (dt, weight.max(1))
+            })
+        })
+        .collect();
+    let master_combined = recompute_master_trust(&device_data);
+    let mtr = MasterTrustRecord {
+        identity: master_identity,
+        combined: master_combined,
+        last_updated: Timestamp::now(),
+    };
+    if let Err(e) = db.set_master_trust(&mtr) {
+        error!(device = %device, err = %e, "processor: failed to update master trust");
     }
 
     Some((old_p, old_i, new_p, new_i))

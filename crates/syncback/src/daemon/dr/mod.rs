@@ -1,51 +1,49 @@
-// Disaster recovery: restore node state from seed phrase via BFS peer discovery.
+// Disaster recovery: restore node state from seed phrase via peer discovery.
 //
-// Runs standalone (no daemon, no Processor). Connects directly to peers,
-// requests SystemState blobs, and restores the DB.
+// Runs standalone (no daemon, no Processor). Connects to seed peers via libp2p
+// SwarmHandle, requests SystemState blobs, and restores the DB.
 //
 // Flow:
 //   1. Init identity from mnemonic → IdentityKeyFile
 //   2. Open fresh DB (remove stale db.redb if present)
-//   3. Start minimal NetworkHandle (iroh endpoint, no Processor)
-//   4. BFS over peers: SystemStateRequest + PeerDiscoveryRequest on each connection
+//   3. Start minimal SwarmHandle (libp2p, no Processor)
+//   4. For each seed peer: dial → wait PeerAuthenticated → send SystemStateRequest
 //   5. Select freshest blob, decrypt and restore DB
+//
+// Note: PeerDiscovery (BFS expansion) is removed in ε.2. DHT-based discovery
+// comes in ε.3. For ε.2, only explicitly provided seed addresses are visited.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use iroh::RelayMode;
-use syncback_core::messages::{Message, PeerDiscoveryRequestMsg, SystemStateRequestMsg};
+use syncback_core::messages::{Message, SystemStateRequestMsg};
 use syncback_core::types::{hex_encode, Timestamp};
-use tokio::sync::mpsc;
 
 use crate::daemon::identity::{derive_keys, init_identity_from_mnemonic, load_identity};
-use crate::daemon::network::addr::{parse_node_addr, to_endpoint_addr};
-use crate::daemon::network::{NetworkConfig, NetworkHandle};
+use crate::daemon::network::swarm::{device_id_to_peer_id, ProtocolEvent, SwarmConfig, SwarmHandle};
 
 #[cfg(test)]
 mod tests;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-/// Total time budget for BFS discovery.
-const BFS_TIMEOUT_SECS: u64 = 120;
-/// Max peers to visit during BFS.
+/// Per-connection timeout for dial + DeviceCertExchange.
+const AUTH_TIMEOUT_SECS: u64 = 15;
+/// Per-request timeout for waiting for a SystemStateResponse.
+const REQUEST_TIMEOUT_SECS: u64 = 10;
+/// Max peers to visit.
 const BFS_MAX_PEERS: usize = 500;
 /// Stop collecting blobs after finding this many.
 const BFS_MAX_BLOBS: usize = 10;
-/// Per-connection timeout for connect + handshake.
-const CONNECT_TIMEOUT_SECS: u64 = 10;
-/// Per-request timeout for waiting for a response message.
-const REQUEST_TIMEOUT_SECS: u64 = 5;
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 /// Run disaster recovery: restore node state from mnemonic into data_dir.
 ///
-/// Connects to seed peers, discovers network via BFS, collects SystemState
-/// blobs, and restores the DB from the freshest blob found.
+/// Connects to seed peers via libp2p SwarmHandle. DeviceCertExchange happens
+/// automatically. Collects SystemState blobs via request-response and restores
+/// the DB from the freshest blob found.
 pub async fn run_dr(
     mnemonic: String,
     peer_addrs: Vec<String>,
@@ -68,7 +66,9 @@ pub async fn run_dr(
     let identity_pub_hex = hex_encode(&keyfile.identity_pub);
     println!("Identity restored: {identity_pub_hex}");
 
-    let (master_key, device_key, _epoch_key_bytes, iroh_key_bytes) = derive_keys(&keyfile, 0)?;
+    let (master_key, device_key, _epoch_key_bytes) = derive_keys(&keyfile, 0)?;
+    let identity_pub = syncback_core::types::IdentityPub(keyfile.identity_pub);
+    let device_id = syncback_core::types::DeviceId(keyfile.device_id);
 
     // ── 2. Open fresh DB ──────────────────────────────────────────────────────
     let db_path = data_dir.join("db.redb");
@@ -78,35 +78,34 @@ pub async fn run_dr(
     }
     let db = syncback_core::db::Db::open(&db_path)?;
 
-    // ── 3. Start minimal NetworkHandle ────────────────────────────────────────
-    // We need an incoming_tx but won't use it (no Processor in DR mode).
-    let (incoming_tx, _incoming_rx) = mpsc::channel(16);
-
-    // Issue a device certificate so the handshake succeeds.
-    let device_id = syncback_core::types::DeviceId(keyfile.device_id);
+    // ── 3. Start minimal SwarmHandle ─────────────────────────────────────────
+    // Issue a device certificate so DeviceCertExchange succeeds.
     let device_cert = syncback_core::cluster::issue_device_certificate(
         &master_key,
         device_id,
-        device_key.verifying_key().to_bytes(),
         Timestamp::now(),
     );
 
-    let net_config = NetworkConfig {
-        signing_key: device_key,
+    let swarm_cfg = SwarmConfig {
+        device_signing_key: device_key,
         master_signing_key: master_key,
-        master_identity: syncback_core::types::IdentityPub(keyfile.identity_pub),
-        known_peers: std::collections::HashMap::new(),
-        device_cert: Some(device_cert),
-        iroh_secret_key: Some(iroh::SecretKey::from_bytes(&iroh_key_bytes)),
-        relay_mode: RelayMode::Default,
+        identity_pub,
+        device_cert,
         x25519_pub: None,
+        listen_port: 0,
+        cert_timeout_secs: AUTH_TIMEOUT_SECS,
+        // DR mode: no Kademlia bootstrap — we dial explicit seed peers directly.
+        kademlia_bootstrap_peers: vec![],
+        kademlia_disable_ipfs_bootstrap: true,
+        kad_republish_interval_override: None,
+        kad_discovery_interval_override: None,
     };
 
-    let network = Arc::new(NetworkHandle::start(net_config, incoming_tx).await?);
+    let (swarm_handle, mut event_rx) = SwarmHandle::start(swarm_cfg).await?;
     println!("Network ready. Starting peer discovery...");
 
-    // ── 4. BFS discovery ──────────────────────────────────────────────────────
-    let blobs = bfs_collect_blobs(&network, peer_addrs).await;
+    // ── 4. BFS: dial seed peers, collect SystemState blobs ───────────────────
+    let blobs = bfs_collect_blobs(&swarm_handle, &mut event_rx, peer_addrs).await;
 
     // ── 5. Select freshest blob and restore ───────────────────────────────────
     if blobs.is_empty() {
@@ -133,33 +132,57 @@ pub async fn run_dr(
     println!();
     println!("Run 'syncback daemon' to start, then 'syncback restore <path>' to recover files.");
 
-    // Drop the Arc; the iroh endpoint closes when the last Arc is released.
-    drop(network);
     Ok(())
 }
 
 // ─── BFS implementation ───────────────────────────────────────────────────────
 
-/// BFS over peers, collecting (created_at, encrypted_blob) pairs.
+/// Parse a Multiaddr string that may contain a /p2p/<PeerId> component.
 ///
-/// Visits each peer once: sends SystemStateRequest and PeerDiscoveryRequest,
-/// collects blobs and queues newly discovered peers.
+/// Returns (PeerId, Multiaddr) if the p2p component is present, or an error.
+fn parse_multiaddr_with_peer_id(
+    addr_str: &str,
+) -> anyhow::Result<(libp2p::PeerId, libp2p::Multiaddr)> {
+    use libp2p::multiaddr::Protocol;
+    use std::str::FromStr;
+
+    let ma = libp2p::Multiaddr::from_str(addr_str)
+        .map_err(|e| anyhow::anyhow!("invalid multiaddr '{addr_str}': {e}"))?;
+
+    // Extract /p2p/<PeerId> from the last protocol component.
+    for proto in ma.iter() {
+        if let Protocol::P2p(peer_id) = proto {
+            // Strip the /p2p/... suffix so we can dial the transport address.
+            let transport_addr: libp2p::Multiaddr = ma
+                .iter()
+                .filter(|p| !matches!(p, Protocol::P2p(_)))
+                .collect();
+            return Ok((peer_id, transport_addr));
+        }
+    }
+
+    anyhow::bail!("multiaddr '{addr_str}' has no /p2p/<PeerId> component")
+}
+
+/// BFS over seed peers, collecting (created_at, encrypted_blob) pairs.
+///
+/// For each seed address:
+///   1. Parse Multiaddr (must include /p2p/<PeerId> suffix).
+///   2. dial → wait for PeerAuthenticated event (AUTH_TIMEOUT_SECS).
+///   3. send SystemStateRequest via send_to_device.
+///   4. Collect blob if SystemStateResponse is non-empty.
+///
+/// In ε.2, BFS expansion via PeerDiscovery is not supported.
+/// Only the explicitly provided seed addresses are visited.
 async fn bfs_collect_blobs(
-    network: &NetworkHandle,
+    swarm: &SwarmHandle,
+    event_rx: &mut tokio::sync::mpsc::Receiver<ProtocolEvent>,
     seed_addrs: Vec<String>,
 ) -> Vec<(u64, Vec<u8>)> {
-    let timeout = Duration::from_secs(BFS_TIMEOUT_SECS);
-    let start = Instant::now();
-
-    let mut queue: VecDeque<String> = seed_addrs.into();
     let mut visited: HashSet<[u8; 32]> = HashSet::new();
     let mut blobs: Vec<(u64, Vec<u8>)> = Vec::new();
 
-    while let Some(addr_str) = queue.pop_front() {
-        if start.elapsed() > timeout {
-            println!("BFS timeout reached ({BFS_TIMEOUT_SECS}s), stopping.");
-            break;
-        }
+    for addr_str in &seed_addrs {
         if visited.len() >= BFS_MAX_PEERS {
             println!("BFS peer limit reached ({BFS_MAX_PEERS}), stopping.");
             break;
@@ -170,178 +193,141 @@ async fn bfs_collect_blobs(
         }
 
         // Parse address.
-        let parsed = match parse_node_addr(&addr_str) {
-            Ok(p) => p,
+        let (peer_id, multiaddr) = match parse_multiaddr_with_peer_id(addr_str) {
+            Ok(r) => r,
             Err(e) => {
-                println!("  skip '{addr_str}': invalid address ({e})");
-                continue;
-            }
-        };
-        let endpoint_addr = match to_endpoint_addr(&parsed) {
-            Ok(ea) => ea,
-            Err(e) => {
-                println!("  skip '{addr_str}': to_endpoint_addr failed ({e})");
+                println!("  skip '{addr_str}': {e}");
                 continue;
             }
         };
 
-        // De-duplicate by iroh NodeId bytes (used as IdentityPub stand-in).
-        let node_id_bytes = parsed.node_id.0;
-        if visited.contains(&node_id_bytes) {
+        // De-duplicate by PeerId bytes.
+        let peer_id_bytes = peer_id.to_bytes();
+        // Use first 32 bytes as key (multihash is longer, but sufficient for dedup).
+        let key: [u8; 32] = {
+            let mut k = [0u8; 32];
+            let src = &peer_id_bytes[..peer_id_bytes.len().min(32)];
+            k[..src.len()].copy_from_slice(src);
+            k
+        };
+        if visited.contains(&key) {
             continue;
         }
-        visited.insert(node_id_bytes);
+        visited.insert(key);
 
         println!(
-            "  connecting to {} ({} visited, {} blobs so far)...",
-            hex_encode(&node_id_bytes),
+            "  dialing {} ({} visited, {} blobs so far)...",
+            &addr_str[..addr_str.len().min(80)],
             visited.len(),
             blobs.len()
         );
 
-        // Connect directly (bypasses known_peers lookup).
-        let conn = match tokio::time::timeout(
-            Duration::from_secs(CONNECT_TIMEOUT_SECS),
-            network.connect(endpoint_addr, None),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                println!("  skip: connect failed ({e})");
-                continue;
-            }
-            Err(_) => {
-                println!("  skip: connect timeout");
+        // Dial the peer.
+        if let Err(e) = swarm.dial(peer_id, multiaddr).await {
+            println!("  skip: dial failed ({e})");
+            continue;
+        }
+
+        // Wait for PeerAuthenticated event (with timeout).
+        let device_id = match wait_for_auth(event_rx, peer_id).await {
+            Some(did) => did,
+            None => {
+                println!("  skip: authentication timeout or connection closed");
                 continue;
             }
         };
 
-        let peer_identity = conn.peer_identity;
-        println!("  connected to {peer_identity}");
+        println!("  authenticated as device {device_id}");
 
-        // ── SystemStateRequest ────────────────────────────────────────────────
+        // Send SystemStateRequest via libp2p request-response.
         let req = Message::SystemStateRequest(SystemStateRequestMsg {
             v: 1,
             timestamp: Timestamp::now(),
         });
-        if let Err(e) = conn.send_message(&req).await {
-            println!("  send SystemStateRequest failed: {e}");
-            continue;
-        }
 
-        // Wait for SystemStateResponse, skipping other message types.
-        match recv_expecting_system_state(&conn).await {
-            Some(resp) if !resp.encrypted_blob.is_empty() => {
-                println!("  found blob ({} bytes)", resp.encrypted_blob.len());
-                blobs.push((resp.timestamp.0, resp.encrypted_blob));
-            }
-            Some(_) => {
-                println!("  peer has no blob stored for us");
-            }
-            None => {
-                println!("  SystemStateResponse timeout or error");
-                continue;
-            }
-        }
-
-        // ── PeerDiscoveryRequest ──────────────────────────────────────────────
-        let req = Message::PeerDiscoveryRequest(PeerDiscoveryRequestMsg {
-            v: 1,
-            timestamp: Timestamp::now(),
-        });
-        if let Err(e) = conn.send_message(&req).await {
-            println!("  send PeerDiscoveryRequest failed: {e}");
-            continue;
-        }
-
-        match recv_expecting_peer_discovery(&conn).await {
-            Some(resp) => {
-                // DiscoveredPeer carries identity_pub + node_id but no socket address,
-                // so we cannot directly enqueue discovered peers as connectable addresses.
-                // Connectivity to newly discovered peers requires a full addr string
-                // (node_id_hex@ip:port). For DR, the seed --peer addresses are the
-                // primary entry points. Mark discovered peers as visited for de-duplication
-                // so we don't re-visit them if they appear via another route.
-                let new_count = resp
-                    .peers
-                    .iter()
-                    .filter(|dp| !visited.contains(&dp.node_id.0))
-                    .count();
-                for dp in &resp.peers {
-                    visited.insert(dp.node_id.0);
+        match tokio::time::timeout(
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            swarm.send_to_device(device_id, req),
+        )
+        .await
+        {
+            Ok(Ok(Message::SystemStateResponse(resp))) => {
+                if !resp.encrypted_blob.is_empty() {
+                    println!("  found blob ({} bytes)", resp.encrypted_blob.len());
+                    blobs.push((resp.timestamp.0, resp.encrypted_blob));
+                } else {
+                    println!("  peer has no blob stored for us");
                 }
+            }
+            Ok(Ok(other)) => {
                 println!(
-                    "  discovered {} peers ({} new) from {peer_identity}",
-                    resp.peers.len(),
-                    new_count
+                    "  unexpected response: {:?}",
+                    std::mem::discriminant(&other)
                 );
             }
-            None => {
-                println!("  PeerDiscoveryResponse timeout or error");
+            Ok(Err(e)) => {
+                println!("  SystemStateRequest failed: {e}");
+            }
+            Err(_) => {
+                println!("  SystemStateRequest timed out");
             }
         }
     }
 
     println!(
-        "BFS complete: visited {} peers, collected {} blobs ({:.1}s elapsed)",
+        "BFS complete: visited {} peers, collected {} blobs",
         visited.len(),
         blobs.len(),
-        start.elapsed().as_secs_f32(),
     );
 
     blobs
 }
 
-// ─── Response helpers ─────────────────────────────────────────────────────────
-
-/// Read messages from `conn` until a `SystemStateResponse` arrives, discarding
-/// other message types (e.g. `PeerAnnounce` that the remote Processor may send
-/// immediately after handshake).
+/// Wait for a PeerAuthenticated event from the given peer_id.
 ///
-/// Returns `None` on timeout or connection error.
-async fn recv_expecting_system_state(
-    conn: &crate::daemon::network::connection::Connection,
-) -> Option<syncback_core::messages::SystemStateResponseMsg> {
-    let deadline = Duration::from_secs(REQUEST_TIMEOUT_SECS);
-    let start = Instant::now();
+/// Returns the DeviceId if authentication succeeds within AUTH_TIMEOUT_SECS.
+/// Returns None on timeout, channel close, or ConnectionClosed.
+async fn wait_for_auth(
+    event_rx: &mut tokio::sync::mpsc::Receiver<ProtocolEvent>,
+    expected_peer_id: libp2p::PeerId,
+) -> Option<syncback_core::types::DeviceId> {
+    let deadline = Duration::from_secs(AUTH_TIMEOUT_SECS);
 
-    loop {
-        let remaining = deadline.checked_sub(start.elapsed())?;
-        match tokio::time::timeout(remaining, conn.recv_message()).await {
-            Ok(Ok(Message::SystemStateResponse(resp))) => return Some(resp),
-            Ok(Ok(_other)) => {
-                // Skip unrelated messages (e.g. PeerAnnounce, BoardSync).
-                if start.elapsed() >= deadline {
-                    return None;
+    match tokio::time::timeout(deadline, async {
+        loop {
+            match event_rx.recv().await {
+                Some(ProtocolEvent::PeerAuthenticated { peer_id, device_id, .. }) => {
+                    if peer_id == expected_peer_id {
+                        return Some(device_id);
+                    }
+                    // Different peer authenticated — continue waiting.
                 }
-                continue;
+                Some(ProtocolEvent::ConnectionClosed { peer_id, .. }) => {
+                    if peer_id == expected_peer_id {
+                        return None;
+                    }
+                }
+                Some(ProtocolEvent::InboundRequest { .. }) => {
+                    // Ignore inbound requests during DR — no Processor running.
+                }
+                None => return None,
             }
-            Ok(Err(_)) | Err(_) => return None,
         }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_timeout) => None,
     }
 }
 
-/// Read messages from `conn` until a `PeerDiscoveryResponse` arrives.
-///
-/// Returns `None` on timeout or connection error.
-async fn recv_expecting_peer_discovery(
-    conn: &crate::daemon::network::connection::Connection,
-) -> Option<syncback_core::messages::PeerDiscoveryResponseMsg> {
-    let deadline = Duration::from_secs(REQUEST_TIMEOUT_SECS);
-    let start = Instant::now();
+// ─── device_id_to_peer_id helper ─────────────────────────────────────────────
 
-    loop {
-        let remaining = deadline.checked_sub(start.elapsed())?;
-        match tokio::time::timeout(remaining, conn.recv_message()).await {
-            Ok(Ok(Message::PeerDiscoveryResponse(resp))) => return Some(resp),
-            Ok(Ok(_other)) => {
-                if start.elapsed() >= deadline {
-                    return None;
-                }
-                continue;
-            }
-            Ok(Err(_)) | Err(_) => return None,
-        }
-    }
+/// Convert a DeviceId to a libp2p PeerId.
+///
+/// DeviceId.0 is the Ed25519 public key bytes; PeerId = multihash(pubkey).
+pub fn device_id_to_peer_id_dr(
+    device_id: syncback_core::types::DeviceId,
+) -> anyhow::Result<libp2p::PeerId> {
+    device_id_to_peer_id(&device_id).map_err(|e| anyhow::anyhow!("{e}"))
 }

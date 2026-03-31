@@ -1,7 +1,7 @@
 use crate::constants::{HOLDER_DELETE_COOLDOWN_SECS, OWNER_DELETE_COOLDOWN_SECS};
 use crate::deletion::{DeletionAction, DeletionEngine, DeletionError, MarkDeletedResult};
 use crate::types::{
-    DeviceId, FileId, FileRecord, FileVersion, IdentityPub, LocalState, PackEntry, PlacementStatus,
+    DeviceId, FileId, FileRecord, FileVersion, LocalState, PackEntry, PlacementStatus,
     SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement,
     Timestamp,
 };
@@ -9,11 +9,11 @@ use crate::types::{
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn device(n: u8) -> DeviceId {
-    DeviceId([n; 16])
+    DeviceId([n; 32])
 }
 
-fn holder(n: u8) -> IdentityPub {
-    IdentityPub([n; 32])
+fn holder(n: u8) -> DeviceId {
+    DeviceId([n; 32])
 }
 
 fn block_id(n: u8) -> SourceBlockId {
@@ -68,7 +68,7 @@ fn make_block(bid: SourceBlockId, status: SourceBlockStatus, block_type: SourceB
     }
 }
 
-fn make_placement(bid: SourceBlockId, hid: IdentityPub, fid: FileId, status: PlacementStatus) -> SymbolPlacement {
+fn make_placement(bid: SourceBlockId, hid: DeviceId, fid: FileId, status: PlacementStatus) -> SymbolPlacement {
     SymbolPlacement {
         source_block_id: bid,
         holder_id: hid,

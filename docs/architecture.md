@@ -28,11 +28,11 @@
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────── syncback (daemon) ───────────────────────────┐
-│  (tokio async, iroh transport, координаторы)                             │
+│  (tokio async, libp2p transport, координаторы)                          │
 │                                                                          │
 │  handle ────── DaemonHandle: owns & wires all subsystems                │
 │     │                                                                    │
-│     ├──► network      (iroh QUIC, NAT relay, connection pool, backoff)  │
+│     ├──► network      (libp2p TCP+Noise, DHT, DCUtR, SwarmHandle)       │
 │     ├──► processor    (message router: dispatches all incoming msgs)     │
 │     ├──► backup       (BackupCoordinator: watcher → symbols)            │
 │     ├──► restore      (RestoreCoordinator: symbols → files)             │
@@ -94,7 +94,7 @@ crates/syncback/src/
     mod.rs        — pub mod на все daemon модули
     handle/       — DaemonHandle: top-level wiring, DaemonState
     processor/    — Processor: message router for all incoming messages
-    network/      — NetworkHandle (+ connection.rs, handshake.rs, addr.rs)
+    network/      — SwarmHandle (swarm.rs)
     backup/       — BackupCoordinator (+ events.rs, pipeline.rs, packing.rs)
     restore/      — RestoreCoordinator (+ pipeline.rs)
     repair/       — RepairAgent
@@ -122,9 +122,8 @@ crates/syncback/src/
 |-----|----------|
 | `SourceBlockId([u8; 32])` | BLAKE3-хэш зашифрованного source block |
 | `IdentityPub([u8; 32])` | Ed25519 публичный ключ (мастер-идентичность) |
-| `DeviceId([u8; 16])` | Случайный идентификатор устройства |
+| `DeviceId([u8; 32])` | Ed25519 pubkey bytes of device signing key |
 | `FileId(u64)` | Монотонный ID файла, присваивается при первом индексировании |
-| `NodeId([u8; 32])` | iroh transport identity (не путать с IdentityPub) |
 | `Timestamp(u64)` | Unix timestamp в секундах |
 | `ErasureParams` | Вычисленные параметры: K, K_eff, T, overhead, N |
 | `FileRecord` | Запись каталога: path, importance, devices, versions |
@@ -168,13 +167,12 @@ crates/syncback/src/
 
 `EscrowChecker` — gate для restore-запросов.
 
-**Формула:** `max_restorable_gb = FREE_TIER_GB + trust × ESCROW_TRUST_FACTOR`
+**Формула:** `restore_budget_gb = stored_gb_days / k_factor`
 
-- FREE_TIER_GB = 1.0 (первый ГБ бесплатно при trust=0)
-- ESCROW_TRUST_FACTOR = 20.0 (configurable)
-- trust = combined score из TrustEngine
+- `k_factor = DEFAULT_ESCROW_K_FACTOR = 7.0` (дней хранения на 1 GB restore)
+- `stored_gb_days` = bytes_we_store_for_peer × days_held (суммарно по всем holding записям)
 
-Не time-based. trust уже содержит временную компоненту (I) и взаимность (S).
+Contribution-based: earn restore credit by storing data for others.
 
 ---
 
@@ -279,7 +277,7 @@ Alive → Fail / NotHeld → Lost → immediate repair
 | Тип | Направление | Описание |
 |-----|-------------|----------|
 | `HandshakeMsg` | ↔ | Взаимная аутентификация при открытии соединения |
-| `PeerAnnounceMsg` | broadcast relay | NodeId объявление (для iroh адресации) |
+| `PeerAnnounceMsg` | broadcast relay | Объявление адреса пира (discovery) |
 | `PosChallengeMsg` | owner → holder | Запрос данных символа по ESI |
 | `PosResponseMsg` | holder → owner | Ответ: данные символа |
 | `PosNackMsg` | holder → owner | Символ не хранится (evicted / missed) |
@@ -350,23 +348,22 @@ pub struct HotCache {
 
 ### network
 
-`NetworkHandle` — единственный iroh endpoint на экземпляр daemon'а.
+`SwarmHandle` — единственный libp2p swarm на экземпляр daemon'а.
 
 **Ответственности:**
-- Создаёт iroh QUIC endpoint с ALPN `"syncback/1"`, relay_mode = Default (NAT traversal)
-- Запускает background accept loop (аутентификация входящих соединений)
-- Connection pool: reuse по `IdentityPub`
-- Handshake: mutual Ed25519 signature verification + freshness check (±300 сек)
-- Разделение идентичностей: `IdentityPub` (протокол, из signing key) ≠ `NodeId` (iroh transport)
+- Создаёт libp2p swarm: TCP+Noise+Yamux, Kademlia DHT, DCUtR+Relay для NAT traversal
+- Запускает background swarm event loop (аутентификация входящих соединений)
+- DeviceCertExchange при подключении: связывает libp2p PeerId с IdentityPub
+- Handshake: DeviceCertExchange + Ed25519 verification + freshness check (±300 сек)
 
-**Ключевые методы:**
-- `start(config, incoming_tx)` — запуск endpoint + accept loop
-- `connect(peer_addr, expected_identity)` — исходящее соединение + handshake
-- `get_connection(peer_identity)` — pool lookup или новое соединение
-- `send_symbols(peer_identity, msg)` — высокоуровневый helper
-- `shutdown()` — graceful close
-
-`Connection` (в `connection.rs`) — framed CBOR read/write поверх iroh bidirectional stream.
+**API (SwarmHandle):**
+- `start(config) → (SwarmHandle, Receiver<ProtocolEvent>)` — запуск swarm + event loop
+- `send_to_device(device: DeviceId, msg)` — отправить сообщение устройству по DeviceId
+- `send_to_master(master: IdentityPub, msg)` — отправить любому устройству данного master
+- `dial(peer_id, addr)` — явный dial по libp2p PeerId + Multiaddr
+- `listen_addrs()` — список адресов, на которых слушаем
+- `respond(channel, msg)` — ответ на inbound request через ResponseChannel
+- `build_peer_announce(...)` — строит подписанный PeerAnnounceMsg
 
 ---
 
@@ -545,7 +542,7 @@ DaemonState {
 **Startup sequence:**
 1. Load/create identity (BIP39 → keys)
 2. Open DB (with repair callback + pre-open backup)
-3. Start NetworkHandle (iroh endpoint + accept loop)
+3. Start SwarmHandle (libp2p swarm + event loop)
 4. Spawn Processor (message router)
 5. Spawn BackupCoordinator, RestoreCoordinator, RepairAgent
 6. Spawn Scheduler (PoS), RelayManager, ClusterSyncManager
@@ -583,7 +580,7 @@ DaemonState {
 - `PeerDiscoveryRequest` → return peer list (any authenticated connection)
 - `PeerDiscoveryResponse` → forward to DR / bootstrap
 
-**On new connection:** stores in pool, sends PeerAnnounce + BoardSync, spawns read loop.
+**On new connection (PeerAuthenticated event):** upserts PeerRecord, sends PeerAnnounce, auto-adds cluster device.
 
 ---
 
@@ -632,8 +629,6 @@ BIP39 mnemonic (24 words) → seed → HKDF key derivation.
 - master_key (Ed25519): `HKDF(seed, info="syncback-identity-ed25519")`
 - device_key (Ed25519): `HKDF(seed, salt=device_id, info="syncback-device-ed25519")`
 - epoch_key: `HKDF(seed, salt=epoch_counter, info="syncback-encryption")`
-- iroh_key: `HKDF(seed, info="syncback-iroh-ed25519")` → stable NodeId
-
 Identity file: `{data_dir}/identity.key` (mode 0600), stores encrypted seed.
 
 ---

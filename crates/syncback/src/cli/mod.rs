@@ -125,9 +125,9 @@ pub enum Command {
         path: String,
     },
 
-    /// Connect to a peer by iroh node address
+    /// Connect to a peer by node address
     Connect {
-        /// Iroh node address (from `syncback status` on the remote node)
+        /// Node address (from `syncback status` on the remote node)
         #[arg()]
         addr: String,
     },

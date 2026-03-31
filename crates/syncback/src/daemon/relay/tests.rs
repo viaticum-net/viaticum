@@ -628,11 +628,12 @@ fn revocation_broadcast_propagates_through_relay() {
     let master_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
     let master_pub = syncback_core::cluster::master_identity(&master_key);
 
-    let device_id = DeviceId([0xABu8; 16]);
+    // device_id.0 IS the device pub key (Ed25519 pubkey from random signing key)
     let device_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
     let device_pub_bytes = device_key.verifying_key().to_bytes();
+    let device_id = DeviceId(device_pub_bytes);
 
-    let device_cert = issue_device_certificate(&master_key, device_id, device_pub_bytes, future);
+    let device_cert = issue_device_certificate(&master_key, device_id, future);
     let revocation = issue_revocation(&master_key, device_id, future, EpochCounter(1));
 
     // ── 2. Serialize RevocationBroadcast ────────────────────────────────
@@ -700,7 +701,8 @@ fn revocation_broadcast_propagates_through_relay() {
 
     assert_eq!(decoded.revocation.device_id, device_id);
     assert_eq!(decoded.revocation.new_epoch, EpochCounter(1));
-    assert_eq!(decoded.device_cert.device_pub_key, device_pub_bytes);
+    // device_id.0 IS the device pub key — verify they match
+    assert_eq!(decoded.device_cert.device_id.0, device_pub_bytes);
 }
 
 // ─── RELAY-11: board_sync_exchange_fills_missing_entries ─────────────────────

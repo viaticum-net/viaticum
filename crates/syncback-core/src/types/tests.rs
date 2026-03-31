@@ -198,7 +198,7 @@ fn file_id_display() {
 fn symbol_placement_count() {
     let p = SymbolPlacement {
         source_block_id: SourceBlockId([0; 32]),
-        holder_id: IdentityPub([1; 32]),
+        holder_id: DeviceId([1; 32]),
         file_id: FileId(1),
         esi_ranges: vec![(0, 100), (500, 50)],
         binding_seed: [0; 32],
@@ -232,7 +232,7 @@ fn cbor_roundtrip_file_record() {
         file_id: FileId(1),
         path: "photos/img.jpg".to_string(),
         importance: 0.6,
-        devices: vec![(DeviceId([0xaa; 16]), LocalState::Present)],
+        devices: vec![(DeviceId([0xaa; 32]), LocalState::Present)],
         versions: vec![FileVersion {
             content_hash: [0xbb; 32],
             source_block_id: SourceBlockId([0xcc; 32]),
@@ -255,10 +255,10 @@ fn cbor_roundtrip_file_record() {
 fn cbor_roundtrip_event() {
     let entry = EventEntry {
         timestamp: Timestamp(1000),
-        device_id: DeviceId([0; 16]),
+        device_id: DeviceId([0; 32]),
         event: Event::SymbolsPlaced {
             source_block_id: SourceBlockId([1; 32]),
-            holder_id: IdentityPub([2; 32]),
+            holder_id: DeviceId([2; 32]),
             esi_range: (0, 100),
         },
     };
@@ -298,8 +298,8 @@ fn cbor_roundtrip_source_block_pack() {
 #[test]
 fn peer_record_is_device_revoked_returns_false_when_list_empty() {
     let peer = PeerRecord {
-        identity: IdentityPub([0; 32]),
-        node_id: None,
+        device_id: DeviceId([0; 32]),
+        master_identity: IdentityPub([0xAA; 32]),
         trust_p: 0.5,
         trust_i: 0.5,
         trust_s: 1.0,
@@ -307,20 +307,19 @@ fn peer_record_is_device_revoked_returns_false_when_list_empty() {
         bytes_peer_stores_for_us: 0,
         first_seen: Timestamp(0),
         last_seen: Timestamp(0),
-        device_id: None,
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
     };
-    assert!(!peer.is_device_revoked(&IdentityPub([1; 32])));
+    assert!(!peer.is_device_revoked(&DeviceId([1; 32])));
 }
 
 #[test]
 fn peer_record_is_device_revoked_returns_true_when_key_present() {
     let revoked_key = [0xABu8; 32];
     let peer = PeerRecord {
-        identity: IdentityPub([0; 32]),
-        node_id: None,
+        device_id: DeviceId([0; 32]),
+        master_identity: IdentityPub([0xAA; 32]),
         trust_p: 0.5,
         trust_i: 0.5,
         trust_s: 1.0,
@@ -328,12 +327,11 @@ fn peer_record_is_device_revoked_returns_true_when_key_present() {
         bytes_peer_stores_for_us: 0,
         first_seen: Timestamp(0),
         last_seen: Timestamp(0),
-        device_id: None,
         revoked_device_pub_keys: vec![revoked_key],
         addrs: vec![],
         x25519_pub: None,
     };
-    assert!(peer.is_device_revoked(&IdentityPub(revoked_key)));
+    assert!(peer.is_device_revoked(&DeviceId(revoked_key)));
 }
 
 #[test]
@@ -341,8 +339,8 @@ fn peer_record_is_device_revoked_does_not_match_different_key() {
     let revoked_key = [0xABu8; 32];
     let other_key = [0xCDu8; 32];
     let peer = PeerRecord {
-        identity: IdentityPub([0; 32]),
-        node_id: None,
+        device_id: DeviceId([0; 32]),
+        master_identity: IdentityPub([0xAA; 32]),
         trust_p: 0.5,
         trust_i: 0.5,
         trust_s: 1.0,
@@ -350,12 +348,11 @@ fn peer_record_is_device_revoked_does_not_match_different_key() {
         bytes_peer_stores_for_us: 0,
         first_seen: Timestamp(0),
         last_seen: Timestamp(0),
-        device_id: None,
         revoked_device_pub_keys: vec![revoked_key],
         addrs: vec![],
         x25519_pub: None,
     };
-    assert!(!peer.is_device_revoked(&IdentityPub(other_key)));
+    assert!(!peer.is_device_revoked(&DeviceId(other_key)));
 }
 
 #[test]
@@ -364,8 +361,8 @@ fn peer_record_is_device_revoked_with_multiple_keys() {
     let key_b = [0x02u8; 32];
     let key_c = [0x03u8; 32];
     let peer = PeerRecord {
-        identity: IdentityPub([0; 32]),
-        node_id: None,
+        device_id: DeviceId([0; 32]),
+        master_identity: IdentityPub([0xAA; 32]),
         trust_p: 0.5,
         trust_i: 0.5,
         trust_s: 1.0,
@@ -373,12 +370,11 @@ fn peer_record_is_device_revoked_with_multiple_keys() {
         bytes_peer_stores_for_us: 0,
         first_seen: Timestamp(0),
         last_seen: Timestamp(0),
-        device_id: None,
         revoked_device_pub_keys: vec![key_a, key_b],
         addrs: vec![],
         x25519_pub: None,
     };
-    assert!(peer.is_device_revoked(&IdentityPub(key_a)));
-    assert!(peer.is_device_revoked(&IdentityPub(key_b)));
-    assert!(!peer.is_device_revoked(&IdentityPub(key_c)));
+    assert!(peer.is_device_revoked(&DeviceId(key_a)));
+    assert!(peer.is_device_revoked(&DeviceId(key_b)));
+    assert!(!peer.is_device_revoked(&DeviceId(key_c)));
 }

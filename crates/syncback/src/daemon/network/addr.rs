@@ -1,8 +1,8 @@
 // Address format utilities for SyncBack node addresses.
 //
-// Format: "<node_id_hex>@<ip>:<port>"
-//      or "<node_id_hex>@<relay_url>,<ip>:<port>"
-// - node_id_hex: 64 lowercase hex chars (32-byte Ed25519 pubkey)
+// Format: "<device_id_hex>@<ip>:<port>"
+//      or "<device_id_hex>@<relay_url>,<ip>:<port>"
+// - device_id_hex: 64 lowercase hex chars (32-byte Ed25519 pubkey = DeviceId)
 // - relay_url: optional https://... URL (relay hint for NAT traversal)
 // - ip: IPv4 or IPv6 address (IPv6 in brackets: [...])
 // - port: decimal u16
@@ -10,13 +10,13 @@
 // Examples:
 //   abcd1234...ef98@192.168.1.5:12345
 //   abcd1234...ef98@[::1]:12345
-//   abcd1234...ef98@https://relay.iroh.network,192.168.1.5:12345
+//   abcd1234...ef98@https://relay.example.com,192.168.1.5:12345
+//
+// Used by handle/mod.rs to load stored peer addresses from DB on startup.
 
 use std::net::SocketAddr;
 
-use syncback_core::types::{hex_encode, NodeId};
-
-use super::NetworkHandle;
+use syncback_core::types::DeviceId;
 
 /// Error returned by `parse_node_addr`.
 #[derive(Debug, thiserror::Error)]
@@ -24,42 +24,34 @@ pub enum AddrParseError {
     #[error("missing '@' separator")]
     MissingAt,
 
-    #[error("node_id is not 64 hex chars: got {0} chars")]
-    BadNodeIdLength(usize),
+    #[error("device_id is not 64 hex chars: got {0} chars")]
+    BadDeviceIdLength(usize),
 
-    #[error("node_id is not valid hex: {0}")]
-    BadNodeIdHex(String),
+    #[error("device_id is not valid hex: {0}")]
+    BadDeviceIdHex(String),
 
     #[error("socket address parse failed: {0}")]
     BadSocketAddr(String),
-}
-
-/// Error returned by `to_endpoint_addr`.
-#[derive(Debug, thiserror::Error)]
-pub enum ToEndpointAddrError {
-    #[error("invalid node id: {0}")]
-    InvalidNodeId(String),
 }
 
 /// Parsed result of a node address string.
 /// The relay_url field is present when the address was formatted with a relay hint.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedNodeAddr {
-    pub node_id: NodeId,
+    pub device_id: DeviceId,
     pub socket_addr: SocketAddr,
-    /// Optional relay URL. When present, callers may pass it to iroh's
-    /// EndpointAddr to hint which relay server to use.
+    /// Optional relay URL. Kept for backward compatibility with stored addresses.
     pub relay_url: Option<String>,
 }
 
-/// Format a NodeId and SocketAddr into a node address string.
+/// Format a DeviceId and SocketAddr into a node address string.
 ///
-/// When `relay_url` is Some, the format is `<node_id_hex>@<relay_url>,<ip>:<port>`.
-/// When `relay_url` is None, the format is `<node_id_hex>@<ip>:<port>`.
-/// The NodeId is encoded as 64 lowercase hex chars.
+/// When `relay_url` is Some, the format is `<device_id_hex>@<relay_url>,<ip>:<port>`.
+/// When `relay_url` is None, the format is `<device_id_hex>@<ip>:<port>`.
+/// The DeviceId is encoded as 64 lowercase hex chars.
 /// IPv6 addresses are wrapped in brackets per standard notation: `[::1]:port`.
-pub fn format_node_addr(node_id: &NodeId, addr: SocketAddr, relay_url: Option<&str>) -> String {
-    let hex = hex_encode(&node_id.0);
+pub fn format_node_addr(device_id: &DeviceId, addr: SocketAddr, relay_url: Option<&str>) -> String {
+    let hex = syncback_core::types::hex_encode(&device_id.0);
     match relay_url {
         Some(relay) => format!("{hex}@{relay},{addr}"),
         None => format!("{hex}@{addr}"),
@@ -69,10 +61,10 @@ pub fn format_node_addr(node_id: &NodeId, addr: SocketAddr, relay_url: Option<&s
 /// Parse a node address string into its components.
 ///
 /// Accepts two formats:
-///   `<node_id_hex>@<ip>:<port>`                      (no relay)
-///   `<node_id_hex>@<relay_url>,<ip>:<port>`           (with relay hint)
+///   `<device_id_hex>@<ip>:<port>`                      (no relay)
+///   `<device_id_hex>@<relay_url>,<ip>:<port>`           (with relay hint)
 ///
-/// `node_id_hex` must be exactly 64 lowercase hex chars.
+/// `device_id_hex` must be exactly 64 lowercase hex chars.
 /// `ip:port` must be a valid SocketAddr (IPv4 or IPv6 with brackets).
 pub fn parse_node_addr(s: &str) -> Result<ParsedNodeAddr, AddrParseError> {
     let at = s.find('@').ok_or(AddrParseError::MissingAt)?;
@@ -80,16 +72,16 @@ pub fn parse_node_addr(s: &str) -> Result<ParsedNodeAddr, AddrParseError> {
     let rest = &s[at + 1..];
 
     if hex_part.len() != 64 {
-        return Err(AddrParseError::BadNodeIdLength(hex_part.len()));
+        return Err(AddrParseError::BadDeviceIdLength(hex_part.len()));
     }
 
     let mut bytes = [0u8; 32];
     for (i, chunk) in hex_part.as_bytes().chunks(2).enumerate() {
-        let hi = hex_nibble(chunk[0]).map_err(AddrParseError::BadNodeIdHex)?;
-        let lo = hex_nibble(chunk[1]).map_err(AddrParseError::BadNodeIdHex)?;
+        let hi = hex_nibble(chunk[0]).map_err(AddrParseError::BadDeviceIdHex)?;
+        let lo = hex_nibble(chunk[1]).map_err(AddrParseError::BadDeviceIdHex)?;
         bytes[i] = (hi << 4) | lo;
     }
-    let node_id = NodeId(bytes);
+    let device_id = DeviceId(bytes);
 
     // Check for relay URL: relay URLs start with "http://" or "https://".
     // If rest contains a comma AND the text before the comma starts with
@@ -118,85 +110,10 @@ pub fn parse_node_addr(s: &str) -> Result<ParsedNodeAddr, AddrParseError> {
         .map_err(|e: std::net::AddrParseError| AddrParseError::BadSocketAddr(e.to_string()))?;
 
     Ok(ParsedNodeAddr {
-        node_id,
+        device_id,
         socket_addr,
         relay_url,
     })
-}
-
-/// Convert a ParsedNodeAddr to an iroh EndpointAddr.
-///
-/// When relay_url is Some, the relay hint is set on the EndpointAddr so iroh
-/// will prefer connecting via that relay for NAT traversal.
-pub fn to_endpoint_addr(
-    parsed: &ParsedNodeAddr,
-) -> Result<iroh::EndpointAddr, ToEndpointAddrError> {
-    let pubkey = iroh::PublicKey::from_bytes(&parsed.node_id.0)
-        .map_err(|e| ToEndpointAddrError::InvalidNodeId(e.to_string()))?;
-
-    let mut ea = iroh::EndpointAddr::new(pubkey).with_ip_addr(parsed.socket_addr);
-
-    if let Some(relay_url_str) = &parsed.relay_url {
-        match relay_url_str.parse::<iroh::RelayUrl>() {
-            Ok(relay_url) => {
-                ea = ea.with_relay_url(relay_url);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    relay_url = %relay_url_str,
-                    error = %e,
-                    "to_endpoint_addr: ignoring unparseable relay URL"
-                );
-            }
-        }
-    }
-
-    Ok(ea)
-}
-
-/// Resolve the local node's address string for display (e.g. `syncback status`).
-///
-/// Combines:
-/// - IP from iroh's address discovery (STUN/relay) — non-loopback
-/// - Port from `bound_sockets()` (actual listening port, not NAT-mapped)
-/// - Relay URL from iroh (for NAT traversal)
-///
-/// Returns the formatted `NodeId@relay,ip:port` string, or falls back to
-/// hex-encoded NodeId if IP/port cannot be determined.
-pub fn resolve_local_addr(network: &NetworkHandle) -> String {
-    let endpoint_addr = network.local_addr().ok();
-
-    let relay_url: Option<String> = endpoint_addr.as_ref().and_then(|ea| {
-        ea.addrs.iter().find_map(|a| match a {
-            iroh::TransportAddr::Relay(url) => Some(url.to_string()),
-            _ => None,
-        })
-    });
-
-    let discovered_ip = endpoint_addr.as_ref().and_then(|ea| {
-        ea.addrs
-            .iter()
-            .filter_map(|a| match a {
-                iroh::TransportAddr::Ip(addr) => Some(addr.ip()),
-                _ => None,
-            })
-            .find(|ip| !ip.is_loopback())
-    });
-
-    let bound = network.bound_sockets();
-    let bound_port = bound
-        .iter()
-        .find(|a| a.is_ipv4())
-        .or(bound.first())
-        .map(|a| a.port());
-
-    match (discovered_ip, bound_port) {
-        (Some(ip), Some(port)) => {
-            let addr = SocketAddr::new(ip, port);
-            format_node_addr(&network.node_id, addr, relay_url.as_deref())
-        }
-        _ => hex_encode(&network.node_id.0),
-    }
 }
 
 fn hex_nibble(b: u8) -> Result<u8, String> {

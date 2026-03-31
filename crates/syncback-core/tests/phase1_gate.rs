@@ -32,12 +32,16 @@ fn block_id(byte: u8) -> SourceBlockId {
     SourceBlockId([byte; 32])
 }
 
-fn peer_id(byte: u8) -> IdentityPub {
-    IdentityPub([byte; 32])
+fn peer_id(byte: u8) -> DeviceId {
+    DeviceId([byte; 32])
+}
+
+fn device_seed(byte: u8) -> [u8; 32] {
+    [byte; 32]
 }
 
 fn device_id(byte: u8) -> DeviceId {
-    DeviceId([byte; 16])
+    DeviceId([byte; 32])
 }
 
 fn seed(byte: u8) -> Vec<u8> {
@@ -311,13 +315,13 @@ fn cluster_key_hierarchy_end_to_end() {
     let master_key = derive_master_key(&seed_bytes).expect("derive_master_key");
     let identity = master_identity(&master_key);
 
-    // Derive device key.
-    let did = device_id(1);
-    let device_key = derive_device_key(&seed_bytes, &did).expect("derive_device_key");
-    let device_pub: [u8; 32] = device_key.verifying_key().to_bytes();
+    // Derive device key. device_id = pubkey of derived signing key.
+    let dev_seed = device_seed(1);
+    let device_key = derive_device_key(&seed_bytes, &dev_seed).expect("derive_device_key");
+    let did = DeviceId(device_key.verifying_key().to_bytes());
 
     // Issue and verify device certificate.
-    let cert = issue_device_certificate(&master_key, did, device_pub, t);
+    let cert = issue_device_certificate(&master_key, did, t);
     verify_device_certificate(&cert, &identity).expect("verify_device_certificate");
 
     // Issue and verify revocation.

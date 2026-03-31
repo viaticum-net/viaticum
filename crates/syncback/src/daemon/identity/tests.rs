@@ -28,6 +28,7 @@ fn init_creates_keyfile_and_is_deserializable() {
     assert_eq!(loaded.mnemonic, keyfile.mnemonic);
     assert_eq!(loaded.identity_pub, keyfile.identity_pub);
     assert_eq!(loaded.device_id, keyfile.device_id);
+    assert_eq!(loaded.device_seed, keyfile.device_seed);
 }
 
 #[test]
@@ -138,6 +139,7 @@ fn load_roundtrips_all_fields() {
     assert_eq!(loaded.seed, original.seed);
     assert_eq!(loaded.identity_pub, original.identity_pub);
     assert_eq!(loaded.device_id, original.device_id);
+    assert_eq!(loaded.device_seed, original.device_seed);
     assert_eq!(loaded.created_at, original.created_at);
 }
 
@@ -160,8 +162,8 @@ fn derive_keys_deterministic() {
     let dir = tmp_dir();
     let keyfile = init_identity(dir.path()).expect("init_identity");
 
-    let (master1, device1, epoch1, _) = derive_keys(&keyfile, 0).expect("derive_keys first");
-    let (master2, device2, epoch2, _) = derive_keys(&keyfile, 0).expect("derive_keys second");
+    let (master1, device1, epoch1) = derive_keys(&keyfile, 0).expect("derive_keys first");
+    let (master2, device2, epoch2) = derive_keys(&keyfile, 0).expect("derive_keys second");
 
     assert_eq!(
         master1.verifying_key().to_bytes(),
@@ -181,8 +183,8 @@ fn derive_keys_differ_per_epoch() {
     let dir = tmp_dir();
     let keyfile = init_identity(dir.path()).expect("init_identity");
 
-    let (_, _, epoch_key_0, _) = derive_keys(&keyfile, 0).expect("derive epoch 0");
-    let (_, _, epoch_key_1, _) = derive_keys(&keyfile, 1).expect("derive epoch 1");
+    let (_, _, epoch_key_0) = derive_keys(&keyfile, 0).expect("derive epoch 0");
+    let (_, _, epoch_key_1) = derive_keys(&keyfile, 1).expect("derive epoch 1");
 
     assert_ne!(epoch_key_0, epoch_key_1, "different epochs must produce different epoch keys");
 }
@@ -192,7 +194,7 @@ fn derive_keys_master_matches_identity_pub() {
     let dir = tmp_dir();
     let keyfile = init_identity(dir.path()).expect("init_identity");
 
-    let (master_key, _, _, _) = derive_keys(&keyfile, 0).expect("derive_keys");
+    let (master_key, _, _) = derive_keys(&keyfile, 0).expect("derive_keys");
     let derived_pub = master_key.verifying_key().to_bytes();
 
     assert_eq!(
@@ -201,36 +203,82 @@ fn derive_keys_master_matches_identity_pub() {
     );
 }
 
+#[test]
+fn derive_keys_returns_three_values_not_four() {
+    // Compile-time test: derive_keys returns a 3-tuple.
+    let dir = tmp_dir();
+    let keyfile = init_identity(dir.path()).expect("init_identity");
+    let (_master, _device, _epoch) = derive_keys(&keyfile, 0).expect("derive_keys");
+    // If this compiles, the test passes.
+}
+
 // ============================================================
-// derive_keys iroh key tests
+// Task A: identity-specific tests
 // ============================================================
 
 #[test]
-fn derive_keys_returns_iroh_key() {
+fn init_identity_creates_32byte_device_id() {
     let dir = tmp_dir();
     let keyfile = init_identity(dir.path()).expect("init_identity");
-    let (_master, _device, _epoch, iroh) = derive_keys(&keyfile, 0).expect("derive_keys");
-    assert_eq!(iroh.len(), 32, "iroh key must be 32 bytes");
+    assert_eq!(keyfile.device_id.len(), 32, "device_id must be 32 bytes");
+    assert_eq!(keyfile.device_seed.len(), 32, "device_seed must be 32 bytes");
 }
 
 #[test]
-fn derive_keys_iroh_key_is_deterministic() {
+fn device_id_equals_device_signing_key_pubkey() {
     let dir = tmp_dir();
     let keyfile = init_identity(dir.path()).expect("init_identity");
-    let (_, _, _, iroh1) = derive_keys(&keyfile, 0).expect("first call");
-    let (_, _, _, iroh2) = derive_keys(&keyfile, 0).expect("second call");
-    assert_eq!(iroh1, iroh2, "iroh key must be deterministic");
+    let (_, device_signing_key, _) = derive_keys(&keyfile, 0).expect("derive_keys");
+    assert_eq!(
+        device_signing_key.verifying_key().to_bytes(),
+        keyfile.device_id,
+        "device_id must equal device signing key's verifying key"
+    );
 }
 
 #[test]
-fn derive_keys_iroh_key_differs_from_device_key() {
-    let dir = tmp_dir();
-    let keyfile = init_identity(dir.path()).expect("init_identity");
-    let (_, device, _, iroh) = derive_keys(&keyfile, 0).expect("derive_keys");
+fn deterministic_device_id_is_reproducible() {
+    let mnemonic = "abandon abandon abandon abandon abandon abandon \
+                    abandon abandon abandon abandon abandon abandon \
+                    abandon abandon abandon abandon abandon abandon \
+                    abandon abandon abandon abandon abandon art";
+
+    let dir1 = tmp_dir();
+    let dir2 = tmp_dir();
+
+    let kf1 = init_identity_from_mnemonic(dir1.path(), mnemonic).expect("init1");
+    let kf2 = init_identity_from_mnemonic(dir2.path(), mnemonic).expect("init2");
+
+    assert_eq!(
+        kf1.device_id, kf2.device_id,
+        "deterministic init must produce the same device_id"
+    );
+    assert_eq!(
+        kf1.device_seed, kf2.device_seed,
+        "deterministic init must produce the same device_seed"
+    );
+}
+
+#[test]
+fn new_device_gets_different_device_id() {
+    let mnemonic = "abandon abandon abandon abandon abandon abandon \
+                    abandon abandon abandon abandon abandon abandon \
+                    abandon abandon abandon abandon abandon abandon \
+                    abandon abandon abandon abandon abandon art";
+
+    let dir1 = tmp_dir();
+    let dir2 = tmp_dir();
+
+    let kf_new = init_identity_new_device(dir1.path(), mnemonic).expect("new_device");
+    let kf_det = init_identity_from_mnemonic(dir2.path(), mnemonic).expect("from_mnemonic");
+
+    assert_eq!(
+        kf_new.identity_pub, kf_det.identity_pub,
+        "same mnemonic → same identity_pub"
+    );
     assert_ne!(
-        iroh,
-        device.to_bytes(),
-        "iroh key bytes must differ from device signing key bytes"
+        kf_new.device_id, kf_det.device_id,
+        "new_device must have a random (different) device_id"
     );
 }
 
@@ -316,8 +364,6 @@ fn new_device_rejects_12_word_mnemonic() {
 
 #[test]
 fn bip39_24_words_produce_unique_identity() {
-    // Generate two different identities from two different 24-word mnemonics.
-    // Each must produce a unique identity_pub.
     let mnemonic_a = "abandon abandon abandon abandon abandon abandon \
                       abandon abandon abandon abandon abandon abandon \
                       abandon abandon abandon abandon abandon abandon \

@@ -13,7 +13,7 @@ use syncback_core::erasure::{binding_seed, ErasureEncoder};
 use syncback_core::cluster::esi_namespace_start;
 use syncback_core::placement::{compute_allocation, HolderCandidate, PlacementError};
 use syncback_core::types::{
-    hex_encode, ErasureParams, Event, EventEntry, FileId, IdentityPub, PlacementStatus,
+    hex_encode, DeviceId, ErasureParams, Event, EventEntry, FileId, PlacementStatus,
     SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement,
     Timestamp,
 };
@@ -172,7 +172,7 @@ pub fn run_pipeline(
     std::fs::write(&block_blob_path, &stored)
         .map_err(|e| anyhow::anyhow!("write block.bin: {e}"))?;
 
-    let mut symbol_count_per_holder: Vec<(IdentityPub, u32)> = Vec::new();
+    let mut symbol_count_per_holder: Vec<(DeviceId, u32)> = Vec::new();
 
     for alloc in &allocations_result {
         let symbols = encoder.encode(
@@ -181,7 +181,7 @@ pub fn run_pipeline(
             alloc.start_esi,
             alloc.symbol_count,
             &block_id,
-            &alloc.identity,
+            &alloc.device_id,
         )?;
 
         for symbol in &symbols {
@@ -190,7 +190,7 @@ pub fn run_pipeline(
                 .map_err(|e| anyhow::anyhow!("write symbol {}: {e}", symbol.esi))?;
         }
 
-        symbol_count_per_holder.push((alloc.identity, alloc.symbol_count));
+        symbol_count_per_holder.push((alloc.device_id, alloc.symbol_count));
     }
 
     // 7. DB: upsert SourceBlockRecord
@@ -231,10 +231,10 @@ pub fn run_pipeline(
     let now = Timestamp::now();
 
     for alloc in &allocations_result {
-        let seed = binding_seed(&block_id, &alloc.identity);
+        let seed = binding_seed(&block_id, &alloc.device_id);
         let placement = SymbolPlacement {
             source_block_id: block_id,
-            holder_id: alloc.identity,
+            holder_id: alloc.device_id,
             file_id: primary_file_id,
             esi_ranges: vec![alloc.esi_range()],
             binding_seed: seed,
@@ -253,7 +253,7 @@ pub fn run_pipeline(
             device_id: config.device_id,
             event: Event::SymbolsPlaced {
                 source_block_id: block_id,
-                holder_id: alloc.identity,
+                holder_id: alloc.device_id,
                 esi_range: alloc.esi_range(),
             },
         };

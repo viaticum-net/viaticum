@@ -4,7 +4,7 @@ use super::{
     ReliabilityError,
 };
 use crate::commitment::CommitmentScore;
-use crate::types::{IdentityPub, SourceBlockId};
+use crate::types::{DeviceId, SourceBlockId};
 
 // ============================================================
 // Test helpers
@@ -16,10 +16,10 @@ fn block_id(byte: u8) -> SourceBlockId {
     SourceBlockId(b)
 }
 
-fn holder_id(byte: u8) -> IdentityPub {
+fn holder_id(byte: u8) -> DeviceId {
     let mut b = [0u8; 32];
     b[0] = byte;
-    IdentityPub(b)
+    DeviceId(b)
 }
 
 fn single_holder_input(alive_symbols: u32, survival_prob: f64) -> BlockReliabilityInput {

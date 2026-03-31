@@ -23,7 +23,9 @@ ciborium = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
-iroh = { workspace = true }
+async-trait = { workspace = true }
+libp2p = { workspace = true }
+futures = { workspace = true }
 ed25519-dalek = { workspace = true }
 x25519-dalek = { workspace = true }
 thiserror = { workspace = true }

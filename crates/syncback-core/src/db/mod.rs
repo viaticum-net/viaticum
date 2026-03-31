@@ -10,10 +10,11 @@ use redb::{ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::constants::{HOLDER_DELETE_COOLDOWN_SECS, DROP_NOTICE_WINDOW_SECS};
 use crate::cluster::StoredClusterState;
+use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
 use crate::types::{
-    from_cbor_bytes, to_cbor_bytes, BlockAgg, BudgetRecord, EventEntry, FileId, FileRecord,
-    HoldingRecord, HoldingStatus, IdentityPub, PlacementAgg, PlacementStatus, PeerRecord,
-    SourceBlockId, SourceBlockRecord, SourceBlockStatus, SymbolPlacement, Timestamp,
+    from_cbor_bytes, to_cbor_bytes, BlockAgg, BudgetRecord, DeviceId, EventEntry, FileId,
+    FileRecord, HoldingRecord, HoldingStatus, IdentityPub, PlacementAgg, PlacementStatus,
+    PeerRecord, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SymbolPlacement, Timestamp,
 };
 
 // ============================================================
@@ -26,12 +27,12 @@ const FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
 /// Source block metadata (owner view). Key = SourceBlockId [u8;32]. Value = CBOR(SourceBlockRecord).
 const SOURCE_BLOCKS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("source_blocks");
 
-/// Symbol placements (owner view). Key = (SourceBlockId[32] || holder IdentityPub[32]) = [u8;64].
+/// Symbol placements (owner view). Key = (SourceBlockId[32] || holder DeviceId[32]) = [u8;64].
 /// Value = CBOR(SymbolPlacement).
 const SYMBOL_PLACEMENTS: TableDefinition<&[u8; 64], &[u8]> =
     TableDefinition::new("symbol_placements");
 
-/// Peer records. Key = IdentityPub [u8;32]. Value = CBOR(PeerRecord).
+/// Peer records. Key = DeviceId [u8;32]. Value = CBOR(PeerRecord).
 const PEERS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("peers");
 
 /// Held symbols (holder view). Key = (SourceBlockId[32] || owner IdentityPub[32]) = [u8;64].
@@ -44,7 +45,7 @@ const EVENT_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("event_log")
 /// Budget singleton. Key = "budget". Value = CBOR(BudgetRecord).
 const BUDGET: TableDefinition<&str, &[u8]> = TableDefinition::new("budget");
 
-/// PoS weekly results. Key = [IdentityPub(32) || week_number_BE(4)] = [u8;36].
+/// PoS weekly results. Key = [DeviceId(32) || week_number_BE(4)] = [u8;36].
 /// Value = CBOR(WeeklyPosEntry).
 pub(crate) const POS_WEEKLY: TableDefinition<&[u8; 36], &[u8]> =
     TableDefinition::new("pos_weekly");
@@ -62,16 +63,27 @@ const SYSTEM_STATE_BLOBS: TableDefinition<&[u8; 32], &[u8]> =
 const RESTORE_SERVED: TableDefinition<&[u8; 32], &[u8]> =
     TableDefinition::new("restore_served");
 
+/// Device trust per DeviceId. Key = DeviceId [u8;32]. Value = CBOR(DeviceTrustRecord).
+const DEVICE_TRUST: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("device_trust");
+
+/// Master trust per IdentityPub. Key = IdentityPub [u8;32]. Value = CBOR(MasterTrustRecord).
+const MASTER_TRUST: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("master_trust");
+
+/// Device-to-master mapping. Key = DeviceId [u8;32]. Value = CBOR(IdentityPub [u8;32]).
+/// Populated from DeviceCertExchange (ε.1+); filled manually in tests.
+const DEVICE_TO_MASTER: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("device_to_master");
+
 /// TTL for stored system state blobs: 365 days.
 pub const SYSTEM_STATE_TTL_SECS: u64 = 365 * 24 * 3600;
 
 // --- Indices ---
 
-/// file → holders index. Key = (FileId u64 BE[8] || holder IdentityPub[32]) = [u8;40].
+/// file → holders index. Key = (FileId u64 BE[8] || holder DeviceId[32]) = [u8;40].
 /// Value = symbol_count (u32). Entry present ↔ holder has symbols for this file.
 const FILE_HOLDERS: TableDefinition<&[u8; 40], u32> = TableDefinition::new("file_holders");
 
-/// holder → files index. Key = (holder IdentityPub[32] || FileId u64 BE[8]) = [u8;40].
+/// holder → files index. Key = (holder DeviceId[32] || FileId u64 BE[8]) = [u8;40].
 /// Value = symbol_count (u32).
 const HOLDER_FILES: TableDefinition<&[u8; 40], u32> = TableDefinition::new("holder_files");
 
@@ -79,21 +91,21 @@ const HOLDER_FILES: TableDefinition<&[u8; 40], u32> = TableDefinition::new("hold
 // Key helpers
 // ============================================================
 
-fn file_holder_key(file_id: FileId, holder: &IdentityPub) -> [u8; 40] {
+fn file_holder_key(file_id: FileId, holder: &DeviceId) -> [u8; 40] {
     let mut key = [0u8; 40];
     key[..8].copy_from_slice(&file_id.0.to_be_bytes());
     key[8..40].copy_from_slice(&holder.0);
     key
 }
 
-fn holder_file_key(holder: &IdentityPub, file_id: FileId) -> [u8; 40] {
+fn holder_file_key(holder: &DeviceId, file_id: FileId) -> [u8; 40] {
     let mut key = [0u8; 40];
     key[..32].copy_from_slice(&holder.0);
     key[32..40].copy_from_slice(&file_id.0.to_be_bytes());
     key
 }
 
-fn placement_key(block_id: &SourceBlockId, holder: &IdentityPub) -> [u8; 64] {
+fn placement_key(block_id: &SourceBlockId, holder: &DeviceId) -> [u8; 64] {
     let mut key = [0u8; 64];
     key[..32].copy_from_slice(&block_id.0);
     key[32..64].copy_from_slice(&holder.0);
@@ -107,9 +119,9 @@ fn holding_key(block_id: &SourceBlockId, owner: &IdentityPub) -> [u8; 64] {
     key
 }
 
-fn pos_key(peer: &IdentityPub, week_number: u32) -> [u8; 36] {
+fn pos_key(device: &DeviceId, week_number: u32) -> [u8; 36] {
     let mut key = [0u8; 36];
-    key[..32].copy_from_slice(&peer.0);
+    key[..32].copy_from_slice(&device.0);
     key[32..36].copy_from_slice(&week_number.to_be_bytes());
     key
 }
@@ -137,7 +149,7 @@ pub struct SystemStateBlobRecord {
 /// Hot layer: in-memory aggregates loaded at startup.
 pub struct HotCache {
     pub blocks: HashMap<SourceBlockId, BlockAgg>,
-    pub placements: HashMap<(SourceBlockId, IdentityPub), PlacementAgg>,
+    pub placements: HashMap<(SourceBlockId, DeviceId), PlacementAgg>,
 }
 
 impl HotCache {
@@ -263,6 +275,9 @@ impl Db {
             tx.open_table(CLUSTER_STATE)?;
             tx.open_table(SYSTEM_STATE_BLOBS)?;
             tx.open_table(RESTORE_SERVED)?;
+            tx.open_table(DEVICE_TRUST)?;
+            tx.open_table(MASTER_TRUST)?;
+            tx.open_table(DEVICE_TO_MASTER)?;
         }
         tx.commit()?;
         Ok(())
@@ -570,7 +585,7 @@ impl Db {
     pub fn get_placement(
         &self,
         block_id: &SourceBlockId,
-        holder_id: &IdentityPub,
+        holder_id: &DeviceId,
     ) -> Result<Option<SymbolPlacement>, DbError> {
         let key = placement_key(block_id, holder_id);
         let tx = self.inner.begin_read()?;
@@ -585,7 +600,7 @@ impl Db {
     pub fn delete_placement(
         &self,
         block_id: &SourceBlockId,
-        holder_id: &IdentityPub,
+        holder_id: &DeviceId,
     ) -> Result<(), DbError> {
         let key = placement_key(block_id, holder_id);
 
@@ -663,7 +678,7 @@ impl Db {
     /// List all placements for a holder (via holder_files index then fetch from placements).
     pub fn list_placements_for_holder(
         &self,
-        holder_id: &IdentityPub,
+        holder_id: &DeviceId,
     ) -> Result<Vec<SymbolPlacement>, DbError> {
         // Scan SYMBOL_PLACEMENTS directly: iterate all, filter by holder_id.
         // Alternative would be to use holder_files index then query source_blocks,
@@ -685,7 +700,7 @@ impl Db {
     }
 
     /// Convenience: list all holders of a file (via file_holders index).
-    pub fn list_holders_for_file(&self, file_id: FileId) -> Result<Vec<IdentityPub>, DbError> {
+    pub fn list_holders_for_file(&self, file_id: FileId) -> Result<Vec<DeviceId>, DbError> {
         let tx = self.inner.begin_read()?;
         let table = tx.open_table(FILE_HOLDERS)?;
         let mut result = Vec::new();
@@ -700,7 +715,7 @@ impl Db {
             let key_bytes = k.value();
             let mut holder_bytes = [0u8; 32];
             holder_bytes.copy_from_slice(&key_bytes[8..40]);
-            result.push(IdentityPub(holder_bytes));
+            result.push(DeviceId(holder_bytes));
         }
         Ok(result)
     }
@@ -756,7 +771,7 @@ impl Db {
     }
 
     /// Convenience: list all file_ids a holder has symbols for (via holder_files index).
-    pub fn list_files_for_holder(&self, holder_id: &IdentityPub) -> Result<Vec<FileId>, DbError> {
+    pub fn list_files_for_holder(&self, holder_id: &DeviceId) -> Result<Vec<FileId>, DbError> {
         let tx = self.inner.begin_read()?;
         let table = tx.open_table(HOLDER_FILES)?;
         let mut result = Vec::new();
@@ -786,26 +801,26 @@ impl Db {
         let tx = self.inner.begin_write()?;
         {
             let mut peers = tx.open_table(PEERS)?;
-            peers.insert(&record.identity.0, bytes.as_slice())?;
+            peers.insert(&record.device_id.0, bytes.as_slice())?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    pub fn get_peer(&self, identity: &IdentityPub) -> Result<Option<PeerRecord>, DbError> {
+    pub fn get_peer(&self, device_id: &DeviceId) -> Result<Option<PeerRecord>, DbError> {
         let tx = self.inner.begin_read()?;
         let table = tx.open_table(PEERS)?;
-        match table.get(&identity.0)? {
+        match table.get(&device_id.0)? {
             Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
             None => Ok(None),
         }
     }
 
-    pub fn delete_peer(&self, identity: &IdentityPub) -> Result<(), DbError> {
+    pub fn delete_peer(&self, device_id: &DeviceId) -> Result<(), DbError> {
         let tx = self.inner.begin_write()?;
         {
             let mut peers = tx.open_table(PEERS)?;
-            peers.remove(&identity.0)?;
+            peers.remove(&device_id.0)?;
         }
         tx.commit()?;
         Ok(())
@@ -823,30 +838,34 @@ impl Db {
         Ok(records)
     }
 
-    /// Recompute storage-balance fields for a peer and update `trust_s` in the PeerRecord.
+    /// Recompute storage-balance fields for a device and update `trust_s` in the PeerRecord.
     ///
     /// - `bytes_we_store_for_peer`: sum of `total_bytes` over Active holdings whose
-    ///   `owner_id == peer`.  (HOLDINGS table — our holder-side view.)
+    ///   `owner_id == master_for(device_id)`. Per-master because escrow is economic
+    ///   between humans, not devices. (HOLDINGS table — our holder-side view.)
     /// - `bytes_peer_stores_for_us`: sum of `symbol_count * t` over Alive placements
-    ///   whose `holder_id == peer`.  (SYMBOL_PLACEMENTS table — our owner-side view.)
+    ///   whose `holder_id == device_id`. Per-device. (SYMBOL_PLACEMENTS table — our owner-side view.)
     ///
     /// `trust_s = if bytes_we_store == 0 { 1.0 } else { peer_stores / we_store }`
     ///
-    /// No-op (returns Ok) if the peer is not yet in the DB.
-    pub fn refresh_peer_storage_bytes(&self, peer: &IdentityPub) -> Result<(), DbError> {
-        // Compute bytes_we_store_for_peer from HOLDINGS.
-        let we_store: u64 = self
-            .list_holdings_for_owner(peer)?
-            .into_iter()
-            .filter(|h| h.status == HoldingStatus::Active)
-            .map(|h| h.total_bytes)
-            .sum();
+    /// No-op (returns Ok) if the device is not yet in the DB.
+    pub fn refresh_peer_storage_bytes(&self, device_id: &DeviceId) -> Result<(), DbError> {
+        // Compute bytes_we_store_for_peer from HOLDINGS (per-master).
+        let we_store: u64 = match self.get_master_for_device(device_id)? {
+            Some(master) => self
+                .list_holdings_for_owner(&master)?
+                .into_iter()
+                .filter(|h| h.status == HoldingStatus::Active)
+                .map(|h| h.total_bytes)
+                .sum(),
+            None => 0,
+        };
 
-        // Compute bytes_peer_stores_for_us from SYMBOL_PLACEMENTS.
+        // Compute bytes_peer_stores_for_us from SYMBOL_PLACEMENTS (per-device).
         // Each alive placement contributes symbol_count * t bytes.
         let peer_stores: u64 = {
             let mut total = 0u64;
-            for placement in self.list_placements_for_holder(peer)? {
+            for placement in self.list_placements_for_holder(device_id)? {
                 if placement.status != PlacementStatus::Alive {
                     continue;
                 }
@@ -865,8 +884,8 @@ impl Db {
             peer_stores as f64 / we_store as f64
         };
 
-        // Update PeerRecord. No-op if peer not yet in DB.
-        let mut record = match self.get_peer(peer)? {
+        // Update PeerRecord. No-op if device not yet in DB.
+        let mut record = match self.get_peer(device_id)? {
             Some(r) => r,
             None => return Ok(()),
         };
@@ -1108,14 +1127,14 @@ impl Db {
 // ============================================================
 
 impl Db {
-    /// Upsert weekly PoS entry for a peer.
+    /// Upsert weekly PoS entry for a device.
     pub fn upsert_pos_weekly(
         &self,
-        peer: &IdentityPub,
+        device: &DeviceId,
         week_number: u32,
         entry: &WeeklyPosEntry,
     ) -> Result<(), DbError> {
-        let key = pos_key(peer, week_number);
+        let key = pos_key(device, week_number);
         let bytes = to_cbor_bytes(entry);
         let tx = self.inner.begin_write()?;
         {
@@ -1129,10 +1148,10 @@ impl Db {
     /// Get entry, or None.
     pub fn get_pos_weekly(
         &self,
-        peer: &IdentityPub,
+        device: &DeviceId,
         week_number: u32,
     ) -> Result<Option<WeeklyPosEntry>, DbError> {
-        let key = pos_key(peer, week_number);
+        let key = pos_key(device, week_number);
         let tx = self.inner.begin_read()?;
         let table = tx.open_table(POS_WEEKLY)?;
         match table.get(&key)? {
@@ -1141,19 +1160,19 @@ impl Db {
         }
     }
 
-    /// All pos weekly entries for a peer (used by TrustEngine::load).
+    /// All pos weekly entries for a device.
     pub fn list_pos_weekly_for_peer(
         &self,
-        peer: &IdentityPub,
+        device: &DeviceId,
     ) -> Result<Vec<(u32, WeeklyPosEntry)>, DbError> {
         let tx = self.inner.begin_read()?;
         let table = tx.open_table(POS_WEEKLY)?;
         let mut result = Vec::new();
-        // Range scan: keys = [peer(32) || week_be(4)]. Prefix by peer bytes.
+        // Range scan: keys = [device(32) || week_be(4)]. Prefix by device bytes.
         let mut lo = [0u8; 36];
         let mut hi = [0u8; 36];
-        lo[..32].copy_from_slice(&peer.0);
-        hi[..32].copy_from_slice(&peer.0);
+        lo[..32].copy_from_slice(&device.0);
+        hi[..32].copy_from_slice(&device.0);
         hi[32..].fill(0xFF);
         for item in table.range::<&[u8; 36]>(&lo..=&hi)? {
             let (k, v) = item?;
@@ -1382,24 +1401,134 @@ impl Db {
 }
 
 // ============================================================
+// Device trust table
+// ============================================================
+
+impl Db {
+    /// Get device trust record. None if device not known.
+    pub fn get_device_trust(
+        &self,
+        device: &DeviceId,
+    ) -> Result<Option<DeviceTrustRecord>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(DEVICE_TRUST)?;
+        match table.get(&device.0)? {
+            Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Upsert device trust record.
+    pub fn set_device_trust(&self, record: &DeviceTrustRecord) -> Result<(), DbError> {
+        let bytes = to_cbor_bytes(record);
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(DEVICE_TRUST)?;
+            table.insert(&record.device_id.0, bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get master trust record. None if master not known.
+    pub fn get_master_trust(
+        &self,
+        master: &IdentityPub,
+    ) -> Result<Option<MasterTrustRecord>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(MASTER_TRUST)?;
+        match table.get(&master.0)? {
+            Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Upsert master trust record.
+    pub fn set_master_trust(&self, record: &MasterTrustRecord) -> Result<(), DbError> {
+        let bytes = to_cbor_bytes(record);
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(MASTER_TRUST)?;
+            table.insert(&record.identity.0, bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get the master IdentityPub for a device. None if mapping unknown.
+    pub fn get_master_for_device(
+        &self,
+        device: &DeviceId,
+    ) -> Result<Option<IdentityPub>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(DEVICE_TO_MASTER)?;
+        match table.get(&device.0)? {
+            Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Store device-to-master mapping (learned from DeviceCertificate).
+    pub fn set_master_for_device(
+        &self,
+        device: &DeviceId,
+        master: &IdentityPub,
+    ) -> Result<(), DbError> {
+        let bytes = to_cbor_bytes(master);
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(DEVICE_TO_MASTER)?;
+            table.insert(&device.0, bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// List all DeviceIds known to belong to a master identity.
+    pub fn get_devices_for_master(
+        &self,
+        master: &IdentityPub,
+    ) -> Result<Vec<DeviceId>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(DEVICE_TO_MASTER)?;
+        let mut result = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            let mapped_master: IdentityPub = from_cbor_bytes(v.value())?;
+            if mapped_master == *master {
+                result.push(DeviceId(*k.value()));
+            }
+        }
+        Ok(result)
+    }
+}
+
+// ============================================================
 // Testutil
 // ============================================================
 
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil {
     use crate::db::Db;
-    use crate::types::{IdentityPub, Timestamp};
+    use crate::types::{DeviceId, IdentityPub, Timestamp};
 
     pub fn test_db() -> Db {
         Db::open_in_memory().expect("test db")
     }
 
-    pub fn test_peer() -> IdentityPub {
-        IdentityPub([1u8; 32])
+    /// Legacy helper: returns a DeviceId for use in tests that previously used IdentityPub.
+    pub fn test_peer() -> DeviceId {
+        DeviceId([1u8; 32])
     }
 
-    pub fn test_peers(n: usize) -> Vec<IdentityPub> {
-        (0..n).map(|i| IdentityPub([i as u8 + 1; 32])).collect()
+    /// Legacy helper: returns Vec<DeviceId> for use in tests.
+    pub fn test_peers(n: usize) -> Vec<DeviceId> {
+        (0..n).map(|i| DeviceId([i as u8 + 1; 32])).collect()
+    }
+
+    /// Returns an IdentityPub for use in tests that need a master identity.
+    pub fn test_master() -> IdentityPub {
+        IdentityPub([0xAAu8; 32])
     }
 
     pub fn week(n: u32) -> Timestamp {

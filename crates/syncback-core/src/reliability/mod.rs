@@ -12,7 +12,7 @@
 
 use crate::commitment::{eviction_risk, CommitmentScore};
 use crate::constants::{BINOMIAL_EXACT_THRESHOLD, RELIABILITY_REPAIR_THRESHOLD};
-use crate::types::{IdentityPub, SourceBlockId};
+use crate::types::{DeviceId, SourceBlockId};
 
 #[cfg(test)]
 mod tests;
@@ -25,7 +25,7 @@ mod tests;
 /// The caller assembles this from SymbolPlacement + CommitmentScore.
 #[derive(Debug, Clone)]
 pub struct HolderReliabilityInput {
-    pub holder_id: IdentityPub,
+    pub holder_id: DeviceId,
     /// Number of symbols this holder currently holds (alive, not Lost/Deleting).
     pub alive_symbols: u32,
     /// Estimated survival probability for this holder's symbols.
@@ -71,7 +71,7 @@ pub struct ReliabilityReport {
 /// Describes the most critical single holder for a source block.
 #[derive(Debug, Clone)]
 pub struct WeakestHolderImpact {
-    pub holder_id: IdentityPub,
+    pub holder_id: DeviceId,
     /// Symbols held by this holder.
     pub symbols_held: u32,
     /// Reliability if this holder disappears.
@@ -92,7 +92,7 @@ pub enum ReliabilityError {
     #[error("alive_symbols overflow: sum exceeds u32::MAX")]
     SymbolCountOverflow,
     #[error("holder {0} not found in block input")]
-    HolderNotFound(IdentityPub),
+    HolderNotFound(DeviceId),
 }
 
 // ============================================================
@@ -216,7 +216,7 @@ pub fn file_reliability(blocks: &[(u32, u32, f64)]) -> Result<f64, ReliabilityEr
 /// or if any holder has an invalid survival_prob.
 pub fn per_holder_impact(
     input: &BlockReliabilityInput,
-    holder_id: &IdentityPub,
+    holder_id: &DeviceId,
 ) -> Result<f64, ReliabilityError> {
     if input.k_eff == 0 {
         return Err(ReliabilityError::InvalidKEff(0));
@@ -269,7 +269,7 @@ pub fn build_report(input: &BlockReliabilityInput) -> Result<ReliabilityReport, 
     let weakest_holder_impact = if input.holders.is_empty() {
         None
     } else {
-        let mut best: Option<(f64, u32, IdentityPub, f64)> = None;
+        let mut best: Option<(f64, u32, DeviceId, f64)> = None;
         // Track (delta, symbols_held, holder_id, reliability_without)
         // Larger delta = weaker (more critical).
 

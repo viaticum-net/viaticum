@@ -24,16 +24,17 @@ use crate::daemon::network::{NetworkConfig, NetworkError, NetworkHandle};
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Generate a full key hierarchy (master + device + cert) from a seed byte.
-/// Returns (device_signing_key, master_identity_pub, network_config).
+/// Returns (master_identity_pub, network_config).
+/// device_id.0 = device signing key verifying_key (Ed25519 pubkey).
 fn make_node(seed_byte: u8) -> (IdentityPub, NetworkConfig) {
     let seed = [seed_byte; 32];
     let master_key = derive_master_key(&seed).expect("derive_master_key");
     let master_pub = master_identity(&master_key);
-    let did = DeviceId([seed_byte; 16]);
-    let device_key = derive_device_key(&seed, &did).expect("derive_device_key");
-    let cert = issue_device_certificate(
-        &master_key, did, device_key.verifying_key().to_bytes(), Timestamp::now(),
-    );
+    // device_seed is the same bytes as seed for convenience in tests
+    let device_seed = [seed_byte; 32];
+    let device_key = derive_device_key(&seed, &device_seed).expect("derive_device_key");
+    let device_id = DeviceId(device_key.verifying_key().to_bytes());
+    let cert = issue_device_certificate(&master_key, device_id, Timestamp::now());
     let config = NetworkConfig {
         signing_key: device_key.clone(),
         master_signing_key: device_key,
@@ -346,15 +347,16 @@ async fn multiple_messages_on_same_connection() {
 #[tokio::test]
 async fn handshake_initiator_includes_device_cert() {
     // Build a cluster: master key → device key → cert.
+    // device_id.0 IS the device pub key (32-byte Ed25519 pubkey).
     let master_key = derive_master_key(&[1u8; 32]).expect("master key");
-    let device_id = DeviceId([2u8; 16]);
-    let device_key = derive_device_key(&[1u8; 32], &device_id).expect("device key");
-    let device_pub_key = device_key.verifying_key().to_bytes();
-    let cert = issue_device_certificate(&master_key, device_id, device_pub_key, Timestamp(100));
+    let device_seed = [2u8; 32];
+    let device_key = derive_device_key(&[1u8; 32], &device_seed).expect("device key");
+    let device_id = DeviceId(device_key.verifying_key().to_bytes());
+    let cert = issue_device_certificate(&master_key, device_id, Timestamp(100));
     let master_pub = master_identity(&master_key);
 
-    // Node A uses the device key + cert.
-    let device_identity = IdentityPub(device_pub_key);
+    // Node A uses the device key + cert; identity_pub = device_id.0
+    let device_identity = IdentityPub(device_id.0);
     let config_a = NetworkConfig {
         signing_key: device_key.clone(),
         master_signing_key: device_key,
@@ -1024,7 +1026,7 @@ async fn cluster_peer_add_and_retrieve() {
         .await
         .expect("start");
 
-    let device_id = DeviceId([0xAAu8; 16]);
+    let device_id = DeviceId([0xAAu8; 32]);
     let addr = handle.local_addr().expect("local_addr");
 
     handle.add_cluster_peer(device_id, addr.clone()).await;
@@ -1054,7 +1056,7 @@ async fn cluster_peer_update_on_duplicate() {
         .await
         .expect("handle_b");
 
-    let device_id = DeviceId([0xBBu8; 16]);
+    let device_id = DeviceId([0xBBu8; 32]);
     let addr_a = handle_a.local_addr().expect("addr_a");
     let addr_b = handle_b.local_addr().expect("addr_b");
 
@@ -1085,7 +1087,7 @@ async fn cluster_peer_remove() {
         .await
         .expect("start");
 
-    let device_id = DeviceId([0xCCu8; 16]);
+    let device_id = DeviceId([0xCCu8; 32]);
     let addr = handle.local_addr().expect("local_addr");
 
     handle.add_cluster_peer(device_id, addr).await;
@@ -1114,7 +1116,7 @@ async fn cluster_peer_remove_nonexistent_is_noop() {
         .await
         .expect("start");
 
-    let device_id = DeviceId([0xDDu8; 16]);
+    let device_id = DeviceId([0xDDu8; 32]);
 
     // No insert — just remove. Must not panic.
     handle.remove_cluster_peer(&device_id).await;
@@ -1137,7 +1139,7 @@ async fn cluster_peers_independent_from_known_peers() {
         .expect("start");
 
     let identity_a = IdentityPub([0xEEu8; 32]);
-    let device_id_a = DeviceId([0xEEu8; 16]);
+    let device_id_a = DeviceId([0xEEu8; 32]);
     let addr = handle.local_addr().expect("local_addr");
 
     handle.add_peer(identity_a, addr.clone()).await;

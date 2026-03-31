@@ -24,6 +24,28 @@ trust = (KP * P + KI * I) * clamp(S, S_MIN, S_MAX)
 - Free-rider (S near 0): multiplied by 0.1 -> trust capped at ~10% of full value
 - P reacts to recent behavior (4-week window), I stabilizes long-term reputation
 
+## Two-level trust (from ε.0)
+
+Trust is computed at two levels: device and master.
+
+**device_trust(DeviceId):** earned via PoS responses. Starts at zero. Specific to hardware.
+**master_trust(IdentityPub):** aggregated from device_trust of all known devices. Survives device replacement.
+**effective_trust(DeviceId):** what placement uses.
+
+Formula:
+  dt   = compute_combined(device.trust_p, device.trust_i, s=1.0)
+  mt   = master.combined
+  base = mt * TRUST_INHERITANCE_FACTOR  (= 0.3)
+  effective = base + dt * (1.0 - base / MAX_COMBINED_TRUST)
+
+S-component (storage reciprocity) is NOT part of effective_trust.
+It is applied by callers on top: effective * clamp(S, S_MIN, S_MAX).
+
+master_trust update:
+  weighted_average(dt_combined per device, weight = symbols_stored for that device)
+
+Constants: TRUST_INHERITANCE_FACTOR=0.3, MAX_COMBINED_TRUST=KP+KI=2.15
+
 ## Placement
 
 Distributes repair symbols across holders proportional to trust.
@@ -229,8 +251,7 @@ BIP39 mnemonic (24 words)
         -> device_id = BLAKE3(identity_pub + label)
       -> epoch_key (HKDF, domain "syncback-epoch-{counter}")
         -> file encryption keys
-      -> iroh_key (HKDF, domain "syncback-iroh-ed25519")
-        -> stable NodeId for P2P transport
+
 ```
 
 ### Device Registration

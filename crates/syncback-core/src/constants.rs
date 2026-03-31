@@ -114,11 +114,9 @@ pub const POS_VOLUME_DIVISOR: u32 = 1000;
 
 // === Wire format ===
 
-/// Max CBOR message frame size (64 MiB).
-pub const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
-
-/// ALPN protocol identifier for direct QUIC connections.
-pub const ALPN: &[u8] = b"syncback/1";
+/// Max CBOR message frame size (128 MiB). Must accommodate SymbolTransfer batches (~26 MB)
+/// with margin. Matches MAX_MSG_SIZE in swarm.rs codec.
+pub const MAX_MESSAGE_SIZE: u32 = 128 * 1024 * 1024;
 
 /// Protocol version for wire messages.
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -254,6 +252,17 @@ pub const RECONNECT_BACKOFF_SECS: u64 = 30;
 
 /// Default holdings integrity scan interval in seconds (1 day).
 pub const DEFAULT_HOLDINGS_INTEGRITY_INTERVAL_SECS: u64 = 86_400;
+
+// === Two-level trust ===
+
+/// Fraction of master_trust inherited by a new device with zero device_trust.
+/// effective_trust = base + dt * (1 - base/MAX_COMBINED_TRUST)
+/// where base = master_trust.combined * TRUST_INHERITANCE_FACTOR
+pub const TRUST_INHERITANCE_FACTOR: f64 = 0.3;
+
+/// Maximum combined trust value (P=1, I=1, S=1 → KP + KI = 2.15).
+/// Used in effective_trust formula denominator.
+pub const MAX_COMBINED_TRUST: f64 = KP + KI; // = 2.15
 
 // === Compile-time sanity checks ===
 

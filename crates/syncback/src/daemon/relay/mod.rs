@@ -477,10 +477,9 @@ impl RelayManager {
         inbound_tx: tokio::sync::mpsc::Sender<InboundMessage>,
         mut post_rx: tokio::sync::mpsc::Receiver<RelayPost>,
         db: syncback_core::db::Db,
-        network: std::sync::Arc<crate::daemon::network::NetworkHandle>,
         board_sync_interval_secs: u64,
     ) -> anyhow::Result<()> {
-        use syncback_core::messages::{BoardSyncMsg, Message};
+
         use tokio::time::{interval, Duration};
 
         let prune_interval =
@@ -490,9 +489,7 @@ impl RelayManager {
         // right after `new()` already pruned on startup.
         prune_timer.tick().await;
 
-        let board_sync_interval = Duration::from_secs(board_sync_interval_secs);
-        let mut board_sync_timer = interval(board_sync_interval);
-        board_sync_timer.tick().await; // skip first tick
+        let _board_sync_interval_secs = board_sync_interval_secs; // kept for future swarm-based sync
 
         info!("relay manager running");
 
@@ -536,8 +533,13 @@ impl RelayManager {
                         Some(post) => {
                             let now = Timestamp::now();
                             if let Some(target) = post.target {
-                                match db.get_peer(&target) {
-                                    Ok(Some(peer)) => {
+                                // PeerRecord is keyed by DeviceId; look up via master identity.
+                                let peer_opt = db.get_devices_for_master(&target)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .find_map(|did| db.get_peer(&did).ok().flatten());
+                                match peer_opt {
+                                    Some(peer) => {
                                         if let Some(x25519_bytes) = peer.x25519_pub {
                                             let x25519_pub = x25519_dalek::PublicKey::from(x25519_bytes);
                                             if let Err(e) = self.post_directed_with_key(
@@ -551,12 +553,9 @@ impl RelayManager {
                                                   "relay: no x25519_pub for target, dropping directed post");
                                         }
                                     }
-                                    Ok(None) => {
+                                    None => {
                                         warn!(target = %target, msg_type = %post.msg_type,
                                               "relay: peer not found for directed post");
-                                    }
-                                    Err(e) => {
-                                        error!(err = %e, "relay: db.get_peer failed");
                                     }
                                 }
                             } else if let Err(e) = self.post_broadcast(
@@ -568,34 +567,7 @@ impl RelayManager {
                     }
                 }
 
-                _ = board_sync_timer.tick() => {
-                    let now = Timestamp::now();
-                    let entries = self.entries_for_sync(now);
-                    if entries.is_empty() {
-                        continue;
-                    }
-                    let msg = Message::BoardSync(BoardSyncMsg {
-                        v: 1,
-                        entries,
-                        timestamp: now,
-                    });
-                    let peers = match db.list_all_peers() {
-                        Ok(p) => p,
-                        Err(e) => {
-                            error!(err = %e, "relay: failed to list peers for board sync");
-                            continue;
-                        }
-                    };
-                    let sent = peers.len();
-                    for peer in peers {
-                        if let Err(e) = network.send_to_peer(peer.identity, &msg).await {
-                            debug!(peer = %peer.identity, err = %e, "relay: board sync send failed");
-                        }
-                    }
-                    if sent > 0 {
-                        debug!(peers = sent, entries = self.entries.len(), "relay: board sync sent");
-                    }
-                }
+
 
                 _ = prune_timer.tick() => {
                     let now = Timestamp::now();

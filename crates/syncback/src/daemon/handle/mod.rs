@@ -1,13 +1,12 @@
 // DaemonHandle: wires all subsystems and manages their lifecycle.
 //
 // All subsystems are started here: BackupCoordinator, RestoreCoordinator,
-// RepairAgent, RelayManager, NetworkHandle, Processor, Watcher, Scheduler,
+// RepairAgent, RelayManager, SwarmHandle, Processor, Watcher, Scheduler,
 // and CliServer.
 
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -24,13 +23,10 @@ use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
 use syncback_core::types::{hex_encode, DeviceId, IdentityPub, Timestamp};
 
-use iroh::RelayMode;
-
 use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent};
 use crate::daemon::cli_server::{self, CliServerConfig};
 use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
 use crate::daemon::identity::{derive_keys, load_identity, IdentityError};
-use crate::daemon::network::{NetworkConfig, NetworkHandle};
 use crate::daemon::processor::Processor;
 use crate::daemon::relay::{RelayConfig, RelayManager};
 use crate::daemon::repair::{RepairAgent, RepairConfig, RepairTrigger};
@@ -66,8 +62,6 @@ pub struct DaemonState {
     pub identity_pub: IdentityPub,
     /// This device's ID.
     pub device_id: DeviceId,
-    /// Network handle for outbound connections (e.g. Connect request).
-    pub network: Arc<NetworkHandle>,
     /// Channel to send restore requests to RestoreCoordinator.
     pub restore_tx: mpsc::Sender<(
         RestoreRequest,
@@ -75,9 +69,6 @@ pub struct DaemonState {
     )>,
     /// Cluster state (optional — None before first device registration).
     pub cluster_state: Option<Arc<Mutex<ClusterState>>>,
-    /// Channel to send connections to the Processor for read-loop spawning.
-    /// Used by dispatch_connect for outbound connections.
-    pub incoming_tx: mpsc::Sender<crate::daemon::network::connection::Connection>,
     /// Master signing key (for issuing device certs, revocations).
     pub master_key: ed25519_dalek::SigningKey,
     /// Raw seed bytes (for deriving new device keys).
@@ -95,6 +86,8 @@ pub struct DaemonState {
     /// Channel to post messages to the relay board (e.g. RevocationBroadcast).
     /// None in tests that do not wire up a RelayManager.
     pub relay_post_tx: Option<mpsc::Sender<crate::daemon::relay::RelayPost>>,
+    /// libp2p swarm handle.
+    pub swarm_handle: Option<std::sync::Arc<crate::daemon::network::swarm::SwarmHandle>>,
 }
 
 // ─── DaemonHandle ─────────────────────────────────────────────────────────────
@@ -133,7 +126,7 @@ impl DaemonHandle {
 
         // ── 4. Derive keys ────────────────────────────────────────────────────
         // Epoch 0 is the initial epoch; epoch rotation happens on device revocation.
-        let (master_key, device_key, epoch_key_bytes, iroh_key_bytes) = derive_keys(&keyfile, 0)?;
+        let (master_key, device_key, epoch_key_bytes) = derive_keys(&keyfile, 0)?;
         let identity_pub: IdentityPub = master_identity(&master_key);
         let device_id = DeviceId(keyfile.device_id);
 
@@ -143,12 +136,10 @@ impl DaemonHandle {
                 Ok(state) => Some(Arc::new(Mutex::new(state))),
                 Err(syncback_core::cluster::ClusterStateError::NotInitialized) => {
                     // First-time startup: register this device as the sole cluster member.
-                    let device_pub_key = device_key.verifying_key().to_bytes();
                     let now = Timestamp::now();
                     let cert: DeviceCertificate = issue_device_certificate(
                         &master_key,
                         device_id,
-                        device_pub_key,
                         now,
                     );
                     match ClusterState::init(db.clone(), identity_pub, cert, now, now) {
@@ -181,8 +172,6 @@ impl DaemonHandle {
             mpsc::channel::<crate::daemon::relay::SyncTrigger>(64);
         let (relay_post_tx, relay_post_rx) =
             mpsc::channel::<crate::daemon::relay::RelayPost>(256);
-        let (incoming_tx, incoming_rx) =
-            mpsc::channel::<crate::daemon::network::connection::Connection>(64);
         // relay inbound messages → Processor dispatch_relay
         let (inbound_tx, inbound_rx) =
             mpsc::channel::<crate::daemon::relay::InboundMessage>(128);
@@ -190,77 +179,7 @@ impl DaemonHandle {
         // ── 7. Build erasure encoder ──────────────────────────────────────────
         let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
 
-        // ── 7a. Load known peers from DB → populate known_peers map ──────────
-        // This lets get_connection() find existing peers immediately after restart.
-        let known_peers = {
-            use crate::daemon::network::addr::{parse_node_addr, to_endpoint_addr};
-            let peers = db.list_all_peers().unwrap_or_default();
-            let mut map = HashMap::new();
-            for peer in peers {
-                for addr_str in &peer.addrs {
-                    match parse_node_addr(addr_str) {
-                        Ok(parsed) => {
-                            match to_endpoint_addr(&parsed) {
-                                Ok(ea) => {
-                                    map.insert(peer.identity, ea);
-                                    break;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        peer = %peer.identity,
-                                        addr = %addr_str,
-                                        error = %e,
-                                        "startup: skipping unparseable peer addr"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                peer = %peer.identity,
-                                addr = %addr_str,
-                                error = %e,
-                                "startup: skipping malformed peer addr"
-                            );
-                        }
-                    }
-                }
-            }
-            tracing::info!(count = map.len(), "loaded peers from db");
-
-            // ── 7b. Bootstrap peers ──────────────────────────────────────────
-            // Bootstrap peers are NOT added to known_peers here because the
-            // address contains the iroh NodeId, not the SyncBack master identity.
-            // Actual connection + identity resolution happens in
-            // run_bootstrap_discovery (spawned later), which calls
-            // network.connect(None) → gets master identity from handshake →
-            // network.add_peer(master_id, addr).
-
-            map
-        };
-
-        // ── 8. Start network ──────────────────────────────────────────────────
-        let device_cert_for_network = cluster_state.as_ref().and_then(|cs| {
-            let state = cs.lock().expect("cluster_state lock poisoned");
-            state
-                .get_device(&device_id)
-                .map(|entry| entry.certificate.clone())
-        });
-
-        let relay_mode = if app_config.network.enable_relay {
-            if let Some(url_str) = &app_config.network.relay_url {
-                let relay_url: iroh::RelayUrl = url_str
-                    .parse()
-                    .map_err(|e| anyhow::anyhow!("invalid relay_url '{url_str}': {e}"))?;
-                RelayMode::custom([relay_url])
-            } else {
-                RelayMode::Default
-            }
-        } else {
-            RelayMode::Disabled
-        };
-
-        // Derive a stable x25519 private key from seed for relay encryption.
+        // ── 8. Derive x25519 key for relay encryption ────────────────────────
         // HKDF-SHA256(ikm=seed, salt=b"", info=b"syncback-x25519") → 32 bytes.
         let x25519_priv = {
             let hk = Hkdf::<Sha256>::new(Some(b""), &keyfile.seed);
@@ -269,23 +188,6 @@ impl DaemonHandle {
                 .expect("HKDF expand for x25519 cannot fail with valid length");
             x25519_dalek::StaticSecret::from(okm)
         };
-        let x25519_pub_key = x25519_dalek::PublicKey::from(&x25519_priv);
-
-        let net_config = NetworkConfig {
-            signing_key: device_key.clone(),
-            master_signing_key: master_key.clone(),
-            master_identity: identity_pub,
-            known_peers,
-            device_cert: device_cert_for_network,
-            iroh_secret_key: Some(iroh::SecretKey::from_bytes(&iroh_key_bytes)),
-            relay_mode,
-            x25519_pub: Some(x25519_pub_key.to_bytes()),
-        };
-        // Clone incoming_tx before it's moved into NetworkHandle::start.
-        // The clone goes into DaemonState so dispatch_connect can send outbound
-        // connections to the Processor for read-loop spawning.
-        let incoming_tx_for_state = incoming_tx.clone();
-        let network = Arc::new(NetworkHandle::start(net_config, incoming_tx).await?);
 
         // ── 9. Ensure symbols and holdings directories exist ──────────────────
         let symbols_dir = cfg.data_dir.join("symbols");
@@ -293,13 +195,78 @@ impl DaemonHandle {
         let holdings_dir = cfg.data_dir.join("holdings");
         std::fs::create_dir_all(&holdings_dir)?;
 
+        // ── 9.5. Start libp2p swarm (before subsystems so they can receive swarm handle) ──
+        // swarm_event_rx is consumed by Processor::run below.
+        let (swarm_handle_arc, swarm_event_rx) = {
+            let device_cert_for_swarm = cluster_state.as_ref().and_then(|cs| {
+                let state = cs.lock().expect("cluster_state lock poisoned");
+                state
+                    .get_device(&device_id)
+                    .map(|entry| entry.certificate.clone())
+            });
+            if let Some(device_cert) = device_cert_for_swarm {
+                let x25519_pub = {
+                    let hk = Hkdf::<Sha256>::new(Some(b""), &keyfile.seed);
+                    let mut okm = [0u8; 32];
+                    hk.expand(b"syncback-x25519", &mut okm)
+                        .expect("HKDF expand cannot fail with valid length");
+                    let secret = x25519_dalek::StaticSecret::from(okm);
+                    let pub_key = x25519_dalek::PublicKey::from(&secret);
+                    Some(pub_key.to_bytes())
+                };
+                // Parse kademlia_bootstrap_peers from config strings → Multiaddr.
+                // AppConfig::validate() already checked basic syntax; full parse here.
+                let kademlia_bootstrap_peers: Vec<libp2p::Multiaddr> = app_config
+                    .network
+                    .kademlia_bootstrap_peers
+                    .iter()
+                    .filter_map(|s| {
+                        s.parse::<libp2p::Multiaddr>().map_err(|e| {
+                            tracing::warn!(addr = %s, error = %e, "skipping unparseable kademlia bootstrap peer");
+                        }).ok()
+                    })
+                    .collect();
+
+                let swarm_cfg = crate::daemon::network::swarm::SwarmConfig {
+                    device_signing_key: device_key.clone(),
+                    master_signing_key: master_key.clone(),
+                    identity_pub,
+                    device_cert,
+                    x25519_pub,
+                    listen_port: 0, // ephemeral port; configured port in ε.3
+                    cert_timeout_secs: 10,
+                    kademlia_bootstrap_peers,
+                    kademlia_disable_ipfs_bootstrap: app_config
+                        .network
+                        .kademlia_disable_ipfs_bootstrap,
+                    kad_republish_interval_override: None,
+                    kad_discovery_interval_override: None,
+                };
+                match crate::daemon::network::swarm::SwarmHandle::start(swarm_cfg).await {
+                    Ok((handle, events)) => {
+                        tracing::info!(
+                            peer_id = %handle.peer_id,
+                            "libp2p swarm started (ε.2, wired to processor)"
+                        );
+                        (Some(Arc::new(handle)), Some(events))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "libp2p swarm start failed, continuing without it");
+                        (None, None)
+                    }
+                }
+            } else {
+                tracing::debug!("no device cert available, skipping libp2p swarm start");
+                (None, None)
+            }
+        };
+
         // ── 10. Build subsystems ──────────────────────────────────────────────
         let source_block_size =
             syncback_core::config::source_block_size_bytes(&app_config);
 
-        // Create offer/delivery state maps early — shared between BackupCoordinator and Processor.
+        // Create accepted_offers map shared between BackupCoordinator and Processor.
         let accepted_offers = crate::daemon::processor::make_empty_accepted_offers();
-        let pending_deliveries = crate::daemon::processor::make_empty_pending_deliveries();
 
         let backup = BackupCoordinator::new(
             db.clone(),
@@ -310,12 +277,11 @@ impl DaemonHandle {
                 device_id,
                 mock_holders: vec![],
                 cluster_state: cluster_state.clone(),
-                network: Some(network.clone()),
                 watch_configs: app_config.watch.clone(),
                 time_scale: cfg.time_scale.max(1),
                 mock_offer_budget_gb: None,
                 master_signing_key: Some(master_key.clone()),
-                pending_deliveries: Some(pending_deliveries.clone()),
+                swarm: swarm_handle_arc.clone(),
             },
             encoder.clone(),
         );
@@ -328,9 +294,9 @@ impl DaemonHandle {
                 identity: identity_pub,
                 device_id,
                 symbols_dir: symbols_dir.clone(),
+                swarm: swarm_handle_arc.clone(),
             },
             encoder.clone(),
-            network.clone(),
         );
 
         let repair = RepairAgent::new(
@@ -365,10 +331,8 @@ impl DaemonHandle {
             db: db.clone(),
             identity_pub,
             device_id,
-            network: network.clone(),
             restore_tx: restore_tx.clone(),
             cluster_state: cluster_state.clone(),
-            incoming_tx: incoming_tx_for_state.clone(),
             master_key: master_key.clone(),
             seed: keyfile.seed.clone(),
             data_dir: cfg.data_dir.clone(),
@@ -377,6 +341,7 @@ impl DaemonHandle {
             hard_quota_bytes: syncback_core::config::hard_quota_bytes(&app_config),
             time_scale: cfg.time_scale.max(1),
             relay_post_tx: Some(relay_post_tx.clone()),
+            swarm_handle: swarm_handle_arc.clone(),
         });
 
         // Clone state for web API and metrics pusher before cli_server consumes it.
@@ -418,7 +383,6 @@ impl DaemonHandle {
             inbound_tx,
             relay_post_rx,
             db.clone(),
-            network.clone(),
             board_sync_interval,
         )));
 
@@ -473,10 +437,26 @@ impl DaemonHandle {
             // Clone for periodic sync task before cluster_sync is moved into Processor.
             let cluster_sync_for_sync_loop = cluster_sync.clone();
 
-            // Create channel for auto-reconnect read loops and wire to network.
-            let (read_loop_tx, read_loop_rx) =
-                mpsc::unbounded_channel::<crate::daemon::network::ReadLoopRequest>();
-            network.set_read_loop_tx(read_loop_tx);
+            // Require a SwarmHandle to start Processor. If swarm failed to start,
+            // skip Processor (same degraded behavior as before).
+            let swarm_for_processor = match swarm_handle_arc.clone() {
+                Some(s) => s,
+                None => {
+                    tracing::warn!("swarm unavailable — Processor not started");
+                    drop(inbound_rx);
+                    drop(repair_tx_for_processor);
+                    return Ok(DaemonHandle { cancel, tasks });
+                }
+            };
+            let swarm_event_rx_for_processor = match swarm_event_rx {
+                Some(rx) => rx,
+                None => {
+                    tracing::warn!("swarm events unavailable — Processor not started");
+                    drop(inbound_rx);
+                    drop(repair_tx_for_processor);
+                    return Ok(DaemonHandle { cancel, tasks });
+                }
+            };
 
             let processor = Processor::new(
                 db.clone(),
@@ -486,7 +466,7 @@ impl DaemonHandle {
                 encoder.clone(),
                 holdings_dir.clone(),
                 symbols_dir.clone(), // source_blocks_dir: owner's blocks for PoS verification
-                network.clone(),
+                swarm_for_processor,
                 relay_sync_tx.clone(),
                 soft_quota_bytes,
                 hard_quota_bytes,
@@ -499,68 +479,42 @@ impl DaemonHandle {
                 Some(cs.clone()),
                 app_config.escrow.clone(),
                 accepted_offers,
-                pending_deliveries,
             );
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {
-                processor.run(incoming_rx, inbound_rx, read_loop_rx, cancel_processor).await
+                processor.run(swarm_event_rx_for_processor, inbound_rx, cancel_processor).await
             }));
-
-            // ── Populate cluster_peers from stored addresses (reconnect after restart) ──
-            {
-                // Collect addrs under lock, then use them without holding guard across .await.
-                let stored: Vec<_> = {
-                    let guard = cs.lock().unwrap();
-                    guard.cluster_addrs()
-                        .iter()
-                        .filter(|(did, _)| **did != device_id)
-                        .map(|(did, hex)| (*did, hex.clone()))
-                        .collect()
-                };
-                for (dev_id, node_id_hex) in stored {
-                    // Stored as hex NodeId — parse back to EndpointAddr (relay-assisted).
-                    if node_id_hex.len() == 64 {
-                        let fake_addr = format!("{node_id_hex}@0.0.0.0:1");
-                        if let Ok(parsed) = crate::daemon::network::addr::parse_node_addr(&fake_addr) {
-                            if let Ok(ea) = crate::daemon::network::addr::to_endpoint_addr(&parsed) {
-                                network.add_cluster_peer(dev_id, ea).await;
-                                tracing::info!(?dev_id, "restored cluster peer addr from DB");
-                            }
-                        }
-                    }
-                }
-            }
 
             // ── Cluster periodic sync ──────────────────────────────────────────
             {
                 let cs_sync = cluster_sync_for_sync_loop;
                 let cs_state = cs.clone();
-                let cs_network = network.clone();
-                let cs_incoming = incoming_tx_for_state.clone();
+                let cs_swarm = swarm_handle_arc.clone();
                 let cs_interval = (300 / time_scale).max(10);
                 let cancel_cs = cancel.clone();
                 tasks.push(tokio::spawn(async move {
-                    if let Err(e) = crate::daemon::cluster_sync::run_periodic_sync(
-                        cs_sync,
-                        cs_state,
-                        cs_network,
-                        device_id,
-                        cs_interval,
-                        cancel_cs,
-                        cs_incoming,
-                    )
-                    .await
-                    {
-                        tracing::error!(error = %e, "cluster periodic sync failed");
+                    // Only run if swarm is available; otherwise skip (no libp2p cluster sync).
+                    if let Some(swarm) = cs_swarm {
+                        if let Err(e) = crate::daemon::cluster_sync::run_periodic_sync(
+                            cs_sync,
+                            cs_state,
+                            swarm,
+                            device_id,
+                            cs_interval,
+                            cancel_cs,
+                        )
+                        .await
+                        {
+                            tracing::error!(error = %e, "cluster periodic sync failed");
+                        }
+                    } else {
+                        tracing::warn!("swarm unavailable — cluster periodic sync not started");
                     }
                     Ok(())
                 }));
             }
         } else {
-            tracing::warn!("cluster state unavailable — Processor not started, incoming connections will be dropped");
-            // Drop incoming_rx so the network accept loop's incoming_tx send() will
-            // eventually get channel-full backpressure rather than silent discard.
-            drop(incoming_rx);
+            tracing::warn!("cluster state unavailable — Processor not started");
             drop(inbound_rx);
             drop(repair_tx_for_processor);
         }
@@ -635,50 +589,25 @@ impl DaemonHandle {
         }
 
         // ── System state periodic push ──────────────────────────────────────
+        // Uses SwarmHandle (ε.2+). Only started if swarm is available.
         {
             let ss_db = db.clone();
-            let ss_network = network.clone();
+            let ss_swarm = swarm_handle_arc.clone();
             let ss_seed = keyfile.seed.clone();
             let ss_interval = (6 * 3600 / time_scale).max(60);
             let cancel_ss = cancel.clone();
             tasks.push(tokio::spawn(async move {
-                if let Err(e) = crate::daemon::system_state::run_periodic_push(
-                    ss_db, ss_network, ss_seed, ss_interval, cancel_ss,
-                ).await {
-                    tracing::error!(error = %e, "system_state periodic push failed");
+                if let Some(swarm) = ss_swarm {
+                    if let Err(e) = crate::daemon::system_state::run_periodic_push(
+                        ss_db, swarm, ss_seed, ss_interval, cancel_ss,
+                    ).await {
+                        tracing::error!(error = %e, "system_state periodic push failed");
+                    }
+                } else {
+                    tracing::warn!("swarm unavailable — system_state periodic push not started");
                 }
                 Ok(())
             }));
-        }
-
-        // ── Periodic peer discovery ──────────────────────────────────────────
-        {
-            let disc_db = db.clone();
-            let disc_network = network.clone();
-            let disc_interval = (300 / time_scale).max(10);
-            let cancel_disc = cancel.clone();
-            tasks.push(tokio::spawn(async move {
-                if let Err(e) = crate::daemon::system_state::run_periodic_discovery(
-                    disc_db, disc_network, disc_interval, cancel_disc,
-                ).await {
-                    tracing::error!(error = %e, "periodic discovery failed");
-                }
-                Ok(())
-            }));
-        }
-
-        // ── Bootstrap auto-connect ──────────────────────────────────────────
-        if !app_config.network.bootstrap_peers.is_empty() {
-            let net_bs = network.clone();
-            let db_bs = db.clone();
-            let bootstrap_peers = app_config.network.bootstrap_peers.clone();
-            tokio::spawn(async move {
-                if let Err(e) = crate::daemon::system_state::run_bootstrap_discovery(
-                    net_bs, db_bs, bootstrap_peers,
-                ).await {
-                    tracing::error!(error = %e, "bootstrap discovery failed");
-                }
-            });
         }
 
         // ── Holder cleanup task ────────────────────────────────────────────
