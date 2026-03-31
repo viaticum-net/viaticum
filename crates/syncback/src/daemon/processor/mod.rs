@@ -21,7 +21,7 @@
 //   ClusterSyncResponse     → we are cluster peer → apply received events
 //
 // ε.2 — libp2p wiring:
-//   Processor now consumes ProtocolEvent from SwarmHandle (not iroh Connection).
+//   Processor now consumes ProtocolEvent from SwarmHandle.
 //   PeerAuthenticated → upsert PeerRecord, auto-add cluster device, send PeerAnnounce.
 //   InboundRequest    → dispatch_libp2p: match Message variant, call handler, send via ResponseChannel.
 //   ConnectionClosed  → remove from peer_cert_map.
@@ -146,7 +146,7 @@ pub struct Processor {
     /// Directory where our own source blocks live (for PoS verification as owner):
     /// `{source_blocks_dir}/{block_id_hex}/block.bin`
     source_blocks_dir: PathBuf,
-    /// libp2p swarm handle — replaces iroh NetworkHandle for ε.2+.
+    /// libp2p swarm handle.
     swarm: Arc<SwarmHandle>,
     /// Channel to relay manager: push BoardSync entries from incoming connections.
     relay_sync_tx: mpsc::Sender<crate::daemon::relay::SyncTrigger>,
@@ -741,7 +741,7 @@ impl Processor {
                         let holder_device = response.device_id
                             .or_else(|| self.db.get_devices_for_master(&msg.from).ok()
                                 .and_then(|ds| ds.into_iter().next()))
-                            .unwrap_or_else(|| DeviceId(msg.from.0));
+                            .unwrap_or(DeviceId(msg.from.0));
                         if let Err(e) = self.handle_pos_response(holder_device, response).await {
                             warn!(err = %e, "processor: PosResponse via relay failed");
                         }
@@ -757,7 +757,7 @@ impl Processor {
                         let from_device = nack.device_id
                             .or_else(|| self.db.get_devices_for_master(&msg.from).ok()
                                 .and_then(|ds| ds.into_iter().next()))
-                            .unwrap_or_else(|| DeviceId(msg.from.0));
+                            .unwrap_or(DeviceId(msg.from.0));
                         if let Err(e) = self.handle_pos_nack(from_device, nack).await {
                             warn!(err = %e, "processor: PosNack via relay failed");
                         }
@@ -791,7 +791,7 @@ impl Processor {
                         // SymbolDropped comes from a holder — resolve DeviceId from master.
                         let from_device = self.db.get_devices_for_master(&msg.from).ok()
                             .and_then(|ds| ds.into_iter().next())
-                            .unwrap_or_else(|| DeviceId(msg.from.0));
+                            .unwrap_or(DeviceId(msg.from.0));
                         if let Err(e) = self.handle_symbol_dropped(from_device, dropped).await {
                             warn!(err = %e, "processor: SymbolDropped via relay failed");
                         }
@@ -1677,7 +1677,7 @@ impl Processor {
             .unwrap_or_default()
             .into_iter()
             .next()
-            .unwrap_or_else(|| DeviceId(from_master.0));
+            .unwrap_or(DeviceId(from_master.0));
         let _ = self.backup_event_tx.send(
             crate::daemon::backup::BackupEvent::SymbolAccepted {
                 holder_id: holder_device,
@@ -1704,7 +1704,7 @@ impl Processor {
             .unwrap_or_default()
             .into_iter()
             .next()
-            .unwrap_or_else(|| DeviceId(from_master.0));
+            .unwrap_or(DeviceId(from_master.0));
         let _ = self.backup_event_tx.send(
             crate::daemon::backup::BackupEvent::SymbolRejected {
                 holder_id: holder_device,
@@ -1913,18 +1913,15 @@ impl Processor {
         // If no devices known yet — record is created later by on_peer_authenticated.
         let devices = self.db.get_devices_for_master(&msg.identity_pub).unwrap_or_default();
         for did in &devices {
-            match self.db.get_peer(did)? {
-                Some(mut existing) => {
-                    existing.last_seen = now;
-                    if msg.x25519_pub.is_some() {
-                        existing.x25519_pub = msg.x25519_pub;
-                    }
-                    if existing.trust_p == 0.0 && existing.trust_i == 0.0 {
-                        existing.trust_p = INITIAL_TRUST_P;
-                    }
-                    self.db.upsert_peer(&existing)?;
+            if let Some(mut existing) = self.db.get_peer(did)? {
+                existing.last_seen = now;
+                if msg.x25519_pub.is_some() {
+                    existing.x25519_pub = msg.x25519_pub;
                 }
-                None => {}
+                if existing.trust_p == 0.0 && existing.trust_i == 0.0 {
+                    existing.trust_p = INITIAL_TRUST_P;
+                }
+                self.db.upsert_peer(&existing)?;
             }
         }
 

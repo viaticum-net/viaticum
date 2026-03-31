@@ -42,12 +42,12 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 
 ### Peer Discovery
 
-1. Bootstrap peers from config: `[network] bootstrap_peers = ["NodeId@ip:port"]`
+1. Bootstrap peers from config: `[network] bootstrap_peers = ["DeviceId@ip:port"]`
 2. **Bootstrap auto-connect:** on daemon startup, connect to bootstrap peers and send PeerDiscoveryRequest to learn their peer lists (1-hop)
 3. On connect: PeerAnnounce exchange (identity, node_id, addresses)
 4. PeerDiscoveryRequest/Response: request peer list from any authenticated connection
 5. Epidemic relay: BoardSync messages gossip peer info (hop <= 2, TTL 7 days)
-6. iroh QUIC transport with NAT traversal (relay servers for peers behind NAT)
+6. libp2p (TCP+Noise+Yamux) transport with NAT traversal (relay + DCUtR)
 
 ### Disaster Recovery
 
@@ -96,7 +96,7 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 |--------|-------------|
 | `handle` | Top-level wiring: starts all subsystems, owns DaemonState |
 | `processor` | Message router: dispatches all incoming messages to handlers |
-| `network` | iroh QUIC transport: connections, handshake, connection pool, backoff |
+| `network` | libp2p transport: SwarmHandle, Kademlia DHT, NAT traversal (relay + DCUtR) |
 | `backup` | BackupCoordinator: watcher events -> dedup -> pack -> encode -> distribute |
 | `restore` | RestoreCoordinator: fetch symbols -> decode -> decrypt -> write files |
 | `repair` | RepairAgent: scan lost placements -> re-encode -> re-place |
@@ -115,7 +115,7 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 - **716 tests, ~34K lines Rust**, clippy clean
 - Phases 1-7 complete (core logic, daemon wiring, P2P networking)
 - δ.1 Database Reliability complete: crash safety, DB backup to peers, DR from seed phrase
-- Real-world P2P tested: LAN (Netbird) + NAT (iroh relay, both peers behind NAT)
+- Real-world P2P tested: LAN (Netbird) + NAT (relay + DCUtR, both peers behind NAT)
 - All features wired: escrow check, effective_quota, device add/revoke, SymbolAccept->BackupCoordinator
 
 See [tech-debt.md](tech-debt.md) for known issues, [features.md](features.md) for future plans.

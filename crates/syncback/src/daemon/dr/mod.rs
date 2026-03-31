@@ -21,7 +21,7 @@ use syncback_core::messages::{Message, SystemStateRequestMsg};
 use syncback_core::types::{hex_encode, Timestamp};
 
 use crate::daemon::identity::{derive_keys, init_identity_from_mnemonic, load_identity};
-use crate::daemon::network::swarm::{device_id_to_peer_id, ProtocolEvent, SwarmConfig, SwarmHandle};
+use crate::daemon::network::swarm::{ProtocolEvent, SwarmConfig, SwarmHandle};
 
 #[cfg(test)]
 mod tests;
@@ -293,7 +293,7 @@ async fn wait_for_auth(
 ) -> Option<syncback_core::types::DeviceId> {
     let deadline = Duration::from_secs(AUTH_TIMEOUT_SECS);
 
-    match tokio::time::timeout(deadline, async {
+    tokio::time::timeout(deadline, async {
         loop {
             match event_rx.recv().await {
                 Some(ProtocolEvent::PeerAuthenticated { peer_id, device_id, .. }) => {
@@ -315,19 +315,6 @@ async fn wait_for_auth(
         }
     })
     .await
-    {
-        Ok(result) => result,
-        Err(_timeout) => None,
-    }
-}
-
-// ─── device_id_to_peer_id helper ─────────────────────────────────────────────
-
-/// Convert a DeviceId to a libp2p PeerId.
-///
-/// DeviceId.0 is the Ed25519 public key bytes; PeerId = multihash(pubkey).
-pub fn device_id_to_peer_id_dr(
-    device_id: syncback_core::types::DeviceId,
-) -> anyhow::Result<libp2p::PeerId> {
-    device_id_to_peer_id(&device_id).map_err(|e| anyhow::anyhow!("{e}"))
+    .ok()
+    .flatten()
 }

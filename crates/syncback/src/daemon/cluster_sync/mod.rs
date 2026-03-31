@@ -10,7 +10,7 @@
 //
 // Design: synchronous (no async). Callers manage connections.
 // NetworkHandle is NOT a field — sync methods take Connection as parameter.
-// This keeps tests simple (no iroh needed).
+// This keeps tests simple (no network dependency).
 //
 // Cursor persistence: sync_cursors stored in StoredClusterState via
 // ClusterState::update_sync_cursor(). No separate DB key needed.

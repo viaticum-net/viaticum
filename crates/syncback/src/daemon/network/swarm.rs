@@ -65,7 +65,7 @@ pub const KAD_INITIAL_DISCOVERY_DELAY: Duration = Duration::from_secs(15);
 
 /// CBOR codec for libp2p request-response (main protocol).
 ///
-/// Wire format: [u32 BE length][CBOR bytes] — identical to iroh stack.
+/// Wire format: [u32 BE length][CBOR bytes].
 /// Uses futures::AsyncRead/AsyncWrite (NOT tokio) as required by libp2p.
 #[derive(Debug, Clone, Default)]
 pub struct SyncBackCodec;
@@ -360,7 +360,7 @@ pub struct SwarmConfig {
 
 /// Handle to the running libp2p swarm event loop.
 ///
-/// In ε.1 this runs alongside iroh; Processor wiring is ε.2.
+/// Owns the libp2p swarm event loop.
 pub struct SwarmHandle {
     cmd_tx: mpsc::Sender<SwarmCommand>,
     /// Our libp2p PeerId (stable, derived from device signing key).

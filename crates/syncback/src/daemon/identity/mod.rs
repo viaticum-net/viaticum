@@ -146,7 +146,6 @@ pub fn load_identity(data_dir: &Path) -> Result<IdentityKeyFile, IdentityError> 
 ///   - `master_signing_key` — Ed25519 signing key for the master identity
 ///   - `device_signing_key` — Ed25519 signing key for this device
 ///   - `epoch_key_bytes`    — 32-byte ChaCha20 symmetric key for `epoch`
-///   (iroh_key_bytes removed — iroh is gone in epsilon)
 pub fn derive_keys(
     keyfile: &IdentityKeyFile,
     epoch: u32,
