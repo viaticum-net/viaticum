@@ -361,7 +361,7 @@ impl DaemonHandle {
             socket_path: cfg.socket_path.clone(),
         };
         // The returned handle is a JoinHandle<()>; wrap it so it fits our Vec.
-        let cli_handle = cli_server::start(cli_config, cancel.clone(), state).await?;
+        let cli_handle = cli_server::start(cli_config, cancel.clone(), state.clone()).await?;
 
         // ── 14. Compute scan interval (scaled by time_scale) ──────────────────
         let time_scale = cfg.time_scale.max(1);
@@ -378,12 +378,14 @@ impl DaemonHandle {
         // the effective timeout; sync at ~1/3 of that, floor 2s.
         let pos_timeout_scaled = (syncback_core::constants::POS_TIMEOUT_SECS / time_scale).max(1);
         let board_sync_interval = (pos_timeout_scaled / 3).max(2);
+        let swarm_for_relay = state.swarm_handle.clone();
         tasks.push(tokio::spawn(relay.run(
             relay_sync_rx,
             inbound_tx,
             relay_post_rx,
             db.clone(),
             board_sync_interval,
+            swarm_for_relay,
         )));
 
         // Wrap the cli server JoinHandle<()> into JoinHandle<anyhow::Result<()>>.

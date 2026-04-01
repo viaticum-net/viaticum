@@ -478,6 +478,7 @@ impl RelayManager {
         mut post_rx: tokio::sync::mpsc::Receiver<RelayPost>,
         db: syncback_core::db::Db,
         board_sync_interval_secs: u64,
+        swarm: Option<std::sync::Arc<crate::daemon::network::swarm::SwarmHandle>>,
     ) -> anyhow::Result<()> {
 
         use tokio::time::{interval, Duration};
@@ -489,9 +490,14 @@ impl RelayManager {
         // right after `new()` already pruned on startup.
         prune_timer.tick().await;
 
-        let _board_sync_interval_secs = board_sync_interval_secs; // kept for future swarm-based sync
+        let mut board_push_timer = interval(Duration::from_secs(board_sync_interval_secs));
+        // Skip first tick (entries are empty at startup anyway).
+        board_push_timer.tick().await;
 
-        info!("relay manager running");
+        info!(
+            board_sync_interval_secs,
+            "relay manager running"
+        );
 
         loop {
             tokio::select! {
@@ -567,7 +573,11 @@ impl RelayManager {
                     }
                 }
 
-
+                _ = board_push_timer.tick() => {
+                    if let Some(ref swarm) = swarm {
+                        self.push_board_to_peers(&db, swarm).await;
+                    }
+                }
 
                 _ = prune_timer.tick() => {
                     let now = Timestamp::now();
@@ -586,6 +596,46 @@ impl RelayManager {
         }
 
         Ok(())
+    }
+
+    /// Push local board entries to all connected peers via BoardSync messages.
+    async fn push_board_to_peers(
+        &self,
+        db: &syncback_core::db::Db,
+        swarm: &crate::daemon::network::swarm::SwarmHandle,
+    ) {
+        use syncback_core::messages::{BoardSyncMsg, Message};
+
+        if self.entries.is_empty() {
+            return;
+        }
+
+        let peers = match db.list_all_peers() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(err = %e, "relay: board push — failed to list peers");
+                return;
+            }
+        };
+
+        let msg = BoardSyncMsg {
+            v: 1,
+            entries: self.entries.clone(),
+            timestamp: Timestamp::now(),
+        };
+
+        let mut ok = 0u32;
+        let mut fail = 0u32;
+        for peer in &peers {
+            match swarm.send_to_device(peer.device_id, Message::BoardSync(msg.clone())).await {
+                Ok(_) => { ok += 1; }
+                Err(_) => { fail += 1; }
+            }
+        }
+
+        if ok > 0 || fail > 0 {
+            debug!(entries = self.entries.len(), ok, fail, "relay: board push complete");
+        }
     }
 
     // ── Internal ───────────────────────────────────────────────────────────
