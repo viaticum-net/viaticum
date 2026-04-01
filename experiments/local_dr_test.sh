@@ -73,16 +73,12 @@ wait_daemon() {
 
 get_addr() {
     local idx="$1"
+    # Status now shows a libp2p multiaddr: /ip4/0.0.0.0/tcp/PORT/p2p/PEERID
     local RAW_ADDR=$(run_cli_q "$idx" status 2>/dev/null | grep "addr:" \
-        | awk '{for(i=1;i<=NF;i++) if($i ~ /@/) print $i}')
-    if [ -z "$RAW_ADDR" ]; then
-        return
-    fi
-    # Extract node_id (before @) and port (after last :)
-    local NODE_ID=$(echo "$RAW_ADDR" | cut -d@ -f1)
-    local PORT=$(echo "$RAW_ADDR" | grep -oE '[0-9]+$')
-    # Use 127.0.0.1 since all processes are on the same machine
-    echo "${NODE_ID}@127.0.0.1:${PORT}"
+        | grep -oE '/ip4/[^ ]+')
+    if [ -z "$RAW_ADDR" ]; then return; fi
+    # Replace 0.0.0.0 with 127.0.0.1 for local testing.
+    echo "$RAW_ADDR" | sed 's|/ip4/0.0.0.0/|/ip4/127.0.0.1/|'
 }
 
 get_peer_count() {
