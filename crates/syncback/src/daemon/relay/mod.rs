@@ -131,6 +131,8 @@ pub struct RelayManager {
     pub entries: Vec<StoredEntry>,
     /// msg_ids already delivered to inbound_tx. Prevents re-delivery on every scan.
     delivered_ids: HashSet<[u8; 16]>,
+    /// True when entries changed since last board push (avoids redundant broadcasts).
+    board_dirty: bool,
 }
 
 impl RelayManager {
@@ -145,6 +147,7 @@ impl RelayManager {
         let mut manager = Self {
             config,
             known_ids,
+            board_dirty: !entries.is_empty(),
             entries,
             delivered_ids: HashSet::new(),
         };
@@ -599,16 +602,18 @@ impl RelayManager {
     }
 
     /// Push local board entries to all connected peers via BoardSync messages.
+    /// Only pushes when new entries were added since last push (board_dirty flag).
     async fn push_board_to_peers(
-        &self,
+        &mut self,
         db: &syncback_core::db::Db,
         swarm: &crate::daemon::network::swarm::SwarmHandle,
     ) {
         use syncback_core::messages::{BoardSyncMsg, Message};
 
-        if self.entries.is_empty() {
+        if self.entries.is_empty() || !self.board_dirty {
             return;
         }
+        self.board_dirty = false;
 
         let peers = match db.list_all_peers() {
             Ok(p) => p,
@@ -645,6 +650,7 @@ impl RelayManager {
         board::append_entry(&self.config.board_path, &stored)?;
         self.known_ids.insert(stored.msg_id);
         self.entries.push(stored.clone());
+        self.board_dirty = true;
         Ok(stored)
     }
 }

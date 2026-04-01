@@ -226,6 +226,7 @@ soft_quota_gb = {n['quota_gb']}.0
 
 [network]
 enable_relay = false
+kademlia_disable_ipfs_bootstrap = true
 """
         exec_node(n["name"], "sh", "-c",
                   f"cat > /home/syncback/.syncback/config.toml << 'EOFCFG'\n{config}EOFCFG")
