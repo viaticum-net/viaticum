@@ -146,7 +146,7 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: Arc<DaemonStat
 /// Dispatch a CliRequest and produce a CliResponse.
 pub(crate) async fn dispatch(request: CliRequest, state: &DaemonState) -> CliResponse {
     match request {
-        CliRequest::Status => dispatch_status(state),
+        CliRequest::Status => dispatch_status(state).await,
 
         CliRequest::Files { path_prefix } => dispatch_files(state, path_prefix),
 
@@ -173,7 +173,7 @@ pub(crate) async fn dispatch(request: CliRequest, state: &DaemonState) -> CliRes
 
 // ── Status ────────────────────────────────────────────────────────────────────
 
-pub(crate) fn dispatch_status(state: &DaemonState) -> CliResponse {
+pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
     let peers = match state.db.list_all_peers() {
         Ok(p) => p,
         Err(e) => {
@@ -307,9 +307,23 @@ pub(crate) fn dispatch_status(state: &DaemonState) -> CliResponse {
 
     let node_identity = hex_encode(&state.identity_pub.0);
 
-    let node_addr = state.swarm_handle.as_ref()
-        .map(|s| s.peer_id.to_string())
-        .unwrap_or_else(|| hex_encode(&state.identity_pub.0));
+    let node_addr = match state.swarm_handle.as_ref() {
+        Some(swarm) => {
+            let addrs = swarm.listen_addrs().await.unwrap_or_default();
+            // Prefer non-loopback, fallback to any address.
+            let base = addrs.iter()
+                .find(|a| !a.to_string().contains("/127.0.0.1/"))
+                .or(addrs.first())
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            if base.is_empty() {
+                swarm.peer_id.to_string()
+            } else {
+                format!("{}/p2p/{}", base, swarm.peer_id)
+            }
+        }
+        None => hex_encode(&state.identity_pub.0),
+    };
 
     CliResponse::Status(StatusData {
         node_identity,
