@@ -789,7 +789,9 @@ impl BackupCoordinator {
         Ok(())
     }
 
-    /// Remove block.bin and the block directory if all symbol files have been delivered.
+    /// Log that all symbol files for a block have been delivered.
+    /// block.bin is kept — needed for PoS verification and repair (nonce is random,
+    /// so the blob cannot be deterministically rebuilt from source files).
     fn cleanup_block_dir(&self, block_id: &syncback_core::types::SourceBlockId) {
         let block_hex = syncback_core::types::hex_encode(&block_id.0);
         let block_dir = self.config.symbols_dir.join(&block_hex);
@@ -807,17 +809,10 @@ impl BackupCoordinator {
                     name.ends_with(".bin") && name != "block.bin"
                 })
             })
-            .unwrap_or(true); // if read_dir fails, don't delete
+            .unwrap_or(true);
 
         if !has_remaining_symbols {
-            // All symbols delivered — remove block.bin and directory.
-            let _ = std::fs::remove_file(block_dir.join("block.bin"));
-            if let Err(e) = std::fs::remove_dir(&block_dir) {
-                // Not empty (e.g. .sym files from repair) — that's fine.
-                tracing::debug!(dir = %block_dir.display(), "cleanup: block dir not empty: {e}");
-            } else {
-                tracing::info!(block_id = %block_id, "backup: cleaned up block dir after full delivery");
-            }
+            tracing::info!(block_id = %block_id, "backup: all symbols delivered, block.bin retained for PoS/repair");
         }
     }
 }

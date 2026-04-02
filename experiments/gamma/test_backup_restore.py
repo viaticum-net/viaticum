@@ -288,8 +288,49 @@ enable_relay = false
             results["failed"].append("placement_distributed")
         print()
 
-        # ── Phase 8: Restore to different path ───────────────────────────
-        print("Phase 8: Restore files")
+        # ── Phase 8: Early restore — escrow should DENY ──────────────────
+        print("Phase 8: Early restore (escrow should deny)")
+
+        # Symbols are cleaned up after delivery, so restore goes to holders.
+        # Escrow budget hasn't accrued yet → expect denial.
+        early_restore_dir = "/tmp/restored_early"
+        exec_node(backup_node, "mkdir", "-p", early_restore_dir)
+        first_file = list(TEST_FILES.keys())[0]
+        src_path = f"/data/files/{first_file}"
+        restored_file = f"{early_restore_dir}/{src_path.lstrip('/')}"
+
+        try:
+            exec_node(backup_node, "syncback", "restore", src_path,
+                      "--dest", early_restore_dir, timeout=30)
+        except Exception:
+            pass
+        time.sleep(3)  # let async restore attempt complete
+
+        early_exists = False
+        try:
+            exec_node(backup_node, "test", "-f", restored_file)
+            early_exists = True
+        except Exception:
+            pass
+
+        if not early_exists:
+            print(f"  Early restore of {first_file}: DENIED (correct)")
+            results["passed"].append("escrow_denies_early_restore")
+        else:
+            print(f"  Early restore of {first_file}: SUCCEEDED (escrow not enforced)")
+            results["failed"].append("escrow_denies_early_restore")
+        print()
+
+        # ── Phase 9: Wait for escrow budget to accrue ────────────────────
+        # Budget = stored_gb_days / k_factor. At time_scale=100000 with ~786KB stored,
+        # ~10s real time ≈ 11.6 simulated days → budget ≈ 0.0013 GB >> file size.
+        wait_secs = 15
+        print(f"Phase 9: Wait {wait_secs}s for escrow budget to accrue")
+        time.sleep(wait_secs)
+        print()
+
+        # ── Phase 10: Restore after escrow budget accrued ────────────────
+        print("Phase 10: Restore files (escrow should allow)")
         restore_ok = 0
         restore_fail = 0
 
@@ -298,13 +339,19 @@ enable_relay = false
 
         for fname in TEST_FILES:
             src_path = f"/data/files/{fname}"
-            # --dest sets output_dir; file written to output_dir/<rel_path>
-            # e.g. /tmp/restored/data/files/small_a.txt
             restored_file = f"{restore_dir}/{src_path.lstrip('/')}"
             try:
                 out = exec_node(backup_node, "syncback", "restore", src_path,
                                 "--dest", restore_dir, timeout=60)
                 print(f"  restore {fname}: {out}")
+
+                # Wait for async restore to write the file
+                for _ in range(10):
+                    try:
+                        exec_node(backup_node, "test", "-f", restored_file)
+                        break
+                    except Exception:
+                        time.sleep(1)
 
                 # Compare hash
                 restored_hash = get_file_hash_on_node(backup_node, restored_file)
@@ -327,8 +374,8 @@ enable_relay = false
             results["failed"].append("restore_bytewise_match")
         print()
 
-        # ── Phase 9: Health check ─────────────────────────────────────
-        print("Phase 9: Block health check")
+        # ── Phase 11: Health check ────────────────────────────────────
+        print("Phase 11: Block health check")
         s = node_status(backup_node)
         at_risk = s.get("blocks_at_risk", 0)
         if at_risk == 0:
@@ -339,8 +386,8 @@ enable_relay = false
             print(f"    blocks_at_risk={at_risk}: FAIL")
         print()
 
-        # ── Phase 10: Negative restore (nonexistent file) ────────────
-        print("Phase 10: Negative test — restore nonexistent file")
+        # ── Phase 12: Negative restore (nonexistent file) ────────────
+        print("Phase 12: Negative test — restore nonexistent file")
         try:
             out = exec_node(backup_node, "syncback", "restore",
                             "/data/files/does_not_exist.txt",
@@ -360,8 +407,8 @@ enable_relay = false
             print(f"    Restore correctly rejected nonexistent file")
         print()
 
-        # ── Phase 11: Check status consistency ───────────────────────
-        print("Phase 11: Status consistency checks")
+        # ── Phase 13: Check status consistency ───────────────────────
+        print("Phase 13: Status consistency checks")
 
         # Owner should have blocks_ok > 0
         s = node_status(backup_node)

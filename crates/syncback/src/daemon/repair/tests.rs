@@ -145,11 +145,7 @@ async fn repair_placement_missing_source_block_returns_error() {
     let agent = make_agent(db, symbols_dir.path());
     let result = agent.repair_placement(&bid, &hid).await;
 
-    // Without block.bin AND without source files in DB, rebuild fails.
-    assert!(
-        matches!(result, Err(RepairError::SourceBlockMissing(_)) | Err(RepairError::RebuildFailed(_))),
-        "expected SourceBlockMissing or RebuildFailed, got: {result:?}"
-    );
+    assert!(matches!(result, Err(RepairError::SourceBlockMissing(_))));
 }
 
 // ─── test 16: handle_symbol_dropped_transitions_to_lost ──────────────────────

@@ -468,7 +468,6 @@ impl DaemonHandle {
                 encoder.clone(),
                 holdings_dir.clone(),
                 symbols_dir.clone(), // source_blocks_dir: owner's blocks for PoS verification
-                epoch_key_bytes,
                 swarm_for_processor,
                 relay_sync_tx.clone(),
                 soft_quota_bytes,

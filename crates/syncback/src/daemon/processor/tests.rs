@@ -172,7 +172,6 @@ async fn make_processor_with_quota(
         encoder,
         holdings_dir.path().to_path_buf(),
         source_blocks_dir.path().to_path_buf(),
-        [0u8; 32], // epoch_key (unused in most tests)
         swarm,
         relay_sync_tx,
         soft_quota_bytes,
@@ -241,7 +240,6 @@ async fn make_processor_with_pending(
         encoder,
         holdings_dir.path().to_path_buf(),
         source_blocks_dir.path().to_path_buf(),
-        [0u8; 32], // epoch_key (unused in most tests)
         swarm,
         relay_sync_tx,
         u64::MAX,
@@ -343,7 +341,6 @@ async fn symbol_accept_updates_backup_event() {
         encoder,
         holdings_dir.path().to_path_buf(),
         source_dir.path().to_path_buf(),
-        [0u8; 32], // epoch_key
         swarm,
         relay_sync_tx,
         u64::MAX,
@@ -2114,7 +2111,6 @@ async fn dispatch_relay_pos_challenge_sends_response_via_board() {
     let processor = Processor::new(
         db.clone(), own_identity, repair_tx, cluster_sync, encoder,
         holdings_dir.path().to_path_buf(), source_dir.path().to_path_buf(),
-        [0u8; 32], // epoch_key
         swarm, relay_sync_tx, u64::MAX, u64::MAX,
         holdings_dir.path().to_path_buf(), 0,
         backup_event_tx, 1,
@@ -2268,7 +2264,6 @@ async fn make_processor_with_cluster_state(
         encoder,
         holdings_dir.path().to_path_buf(),
         source_blocks_dir.path().to_path_buf(),
-        [0u8; 32], // epoch_key (unused in most tests)
         swarm,
         relay_sync_tx,
         u64::MAX,
