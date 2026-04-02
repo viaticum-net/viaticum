@@ -146,6 +146,8 @@ pub struct Processor {
     /// Directory where our own source blocks live (for PoS verification as owner):
     /// `{source_blocks_dir}/{block_id_hex}/block.bin`
     source_blocks_dir: PathBuf,
+    /// Epoch key for rebuilding stored blob from source files when block.bin is absent.
+    epoch_key: [u8; 32],
     /// libp2p swarm handle.
     swarm: Arc<SwarmHandle>,
     /// Channel to relay manager: push BoardSync entries from incoming connections.
@@ -191,6 +193,7 @@ impl Processor {
         encoder: Arc<dyn ErasureEncoder>,
         holdings_dir: PathBuf,
         source_blocks_dir: PathBuf,
+        epoch_key: [u8; 32],
         swarm: Arc<SwarmHandle>,
         relay_sync_tx: mpsc::Sender<crate::daemon::relay::SyncTrigger>,
         soft_quota_bytes: u64,
@@ -213,6 +216,7 @@ impl Processor {
             encoder,
             holdings_dir,
             source_blocks_dir,
+            epoch_key,
             swarm,
             relay_sync_tx,
             soft_quota_bytes,
@@ -1148,13 +1152,21 @@ impl Processor {
         let source_data = match tokio::fs::read(&block_path).await {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                warn!(
-                    block_id = %block_id,
-                    holder = %holder_id,
-                    path = %block_path.display(),
-                    "processor: PosResponse — source block file missing, cannot verify"
-                );
-                return Ok(VerifyOutcome::CannotVerify);
+                // block.bin cleaned up after delivery — rebuild from source files.
+                match crate::daemon::repair::rebuild_stored_blob_for_block(
+                    &self.db, &block_id, &block_record.block_type, &self.epoch_key,
+                ) {
+                    Ok(blob) => blob,
+                    Err(re) => {
+                        warn!(
+                            block_id = %block_id,
+                            holder = %holder_id,
+                            err = %re,
+                            "processor: PosResponse — cannot rebuild blob, skipping verify"
+                        );
+                        return Ok(VerifyOutcome::CannotVerify);
+                    }
+                }
             }
             Err(e) => return Err(ProcessorError::Io(e)),
         };
