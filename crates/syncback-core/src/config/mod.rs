@@ -155,8 +155,8 @@ pub struct NetworkCfg {
     pub kademlia_bootstrap_peers: Vec<String>,
 
     /// Disable IPFS built-in bootstrap nodes and use only kademlia_bootstrap_peers.
-    /// Useful for isolated test networks.
-    /// Default: false.
+    /// Default: true (IPFS public DHT is a separate network, not useful for SyncBack).
+    /// Set to false only if you have custom bootstrap infrastructure on the IPFS DHT.
     #[serde(default)]
     pub kademlia_disable_ipfs_bootstrap: bool,
 }
@@ -200,7 +200,7 @@ impl Default for NetworkCfg {
             relay_url: None,
             bootstrap_peers: vec![],
             kademlia_bootstrap_peers: vec![],
-            kademlia_disable_ipfs_bootstrap: false,
+            kademlia_disable_ipfs_bootstrap: true,
         }
     }
 }
