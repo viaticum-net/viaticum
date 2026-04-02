@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-NUM_NODES=5
+NUM_NODES=7
 TIME_SCALE=1000
 TEST_DIR="/tmp/syncback-fault-$$"
 BINARY="${BINARY:-syncback}"
@@ -112,6 +112,9 @@ for i in $(seq 0 $((NUM_NODES-1))); do
     cat > "$(node_dir "$i")/config.toml" << 'CFGEOF'
 [storage]
 disk_reserve_gb = 0.0
+
+[escrow]
+k_factor = 0.001
 CFGEOF
 done
 
@@ -158,7 +161,7 @@ echo "=== Phase 2: File Backup ==="
 
 # Create test file (256 KB for good erasure spread)
 echo "  Creating 256 KB test file..."
-dd if=/dev/urandom of="$(node_dir 0)/files/fault_test.bin" bs=1024 count=256 2>/dev/null
+dd if=/dev/urandom of="$(node_dir 0)/files/fault_test.bin" bs=1024 count=4096 2>/dev/null
 ORIG_MD5=$(md5sum "$(node_dir 0)/files/fault_test.bin" | awk '{print $1}')
 echo "  MD5: $ORIG_MD5"
 
@@ -188,33 +191,41 @@ fi
 echo "  Waiting for symbol transfer (10s)..."
 sleep 10
 
-# ── PHASE 3: FAULT INJECTION — KILL HOLDERS ─────────────────────
+# ── PHASE 3: FAULT INJECTION — KILL ONE HOLDER ────────────────────
 echo ""
 echo "=== Phase 3: Fault Injection ==="
 
-# Kill nodes 3 and 4 (holders). Node 0 is owner, nodes 1-2 survive.
-KILL_1=3
-KILL_2=4
-echo "  Killing node-$(printf '%02d' $KILL_1) (PID ${PIDS[$KILL_1]})..."
-kill "${PIDS[$KILL_1]}" 2>/dev/null || true
-echo "  Killing node-$(printf '%02d' $KILL_2) (PID ${PIDS[$KILL_2]})..."
-kill "${PIDS[$KILL_2]}" 2>/dev/null || true
+# Find a holder node dynamically (not node-00, which is the owner).
+# Kill only ONE holder so the other can still serve restore.
+KILL_IDX=""
+for i in $(seq 1 $((NUM_NODES-1))); do
+    HB=$(get_json_field "$i" holding_bytes)
+    if [ "${HB:-0}" -gt 0 ]; then
+        KILL_IDX=$i
+        echo "  node-$(printf '%02d' "$i") holds ${HB} bytes — will kill"
+        break
+    fi
+done
+
+if [ -z "$KILL_IDX" ]; then
+    # Fallback: kill nodes 3 and 4 (old behavior).
+    KILL_IDX=3
+    echo "  No holder found dynamically, killing node-03 as fallback"
+fi
+
+echo "  Killing node-$(printf '%02d' $KILL_IDX) (PID ${PIDS[$KILL_IDX]})..."
+kill "${PIDS[$KILL_IDX]}" 2>/dev/null || true
 sleep 2
-
-# Verify they're dead
-if kill -0 "${PIDS[$KILL_1]}" 2>/dev/null; then
-    kill -9 "${PIDS[$KILL_1]}" 2>/dev/null || true
-fi
-if kill -0 "${PIDS[$KILL_2]}" 2>/dev/null; then
-    kill -9 "${PIDS[$KILL_2]}" 2>/dev/null || true
+if kill -0 "${PIDS[$KILL_IDX]}" 2>/dev/null; then
+    kill -9 "${PIDS[$KILL_IDX]}" 2>/dev/null || true
 fi
 
-echo "  Nodes $KILL_1 and $KILL_2 killed. ${NUM_NODES}-2=$((NUM_NODES-2)) nodes alive."
-pass "holders killed (nodes $KILL_1, $KILL_2)"
+echo "  Node $KILL_IDX killed. $((NUM_NODES-1)) nodes remain."
+pass "holder killed (node $KILL_IDX)"
 
 # ── PHASE 4: RESTORE WITH DEAD HOLDERS ──────────────────────────
 echo ""
-echo "=== Phase 4: Restore with Dead Holders (E2E-07) ==="
+echo "=== Phase 4: Restore with Dead Holder (E2E-07) ==="
 
 if [ "$PLACED" -eq 0 ]; then
     skip "restore skipped (no placements)"
@@ -222,7 +233,7 @@ else
     RESTORE_DEST="$(node_dir 0)/restored"
     mkdir -p "$RESTORE_DEST"
     RESTORE_PATH="$(node_dir 0)/files/fault_test.bin"
-    echo "  Restoring $RESTORE_PATH with 2/$((NUM_NODES-1)) holders dead..."
+    echo "  Restoring $RESTORE_PATH with 1 holder dead..."
 
     set +e
     RESTORE_OUTPUT=$(run_cli 0 restore "$RESTORE_PATH" --dest "$RESTORE_DEST" 2>&1)
