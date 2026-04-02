@@ -603,6 +603,8 @@ impl RelayManager {
 
     /// Push local board entries to all connected peers via BoardSync messages.
     /// Only pushes when new entries were added since last push (board_dirty flag).
+    /// Sends to all peers concurrently with a short timeout (3s) so that
+    /// unreachable peers don't block the relay loop.
     async fn push_board_to_peers(
         &mut self,
         db: &syncback_core::db::Db,
@@ -629,12 +631,18 @@ impl RelayManager {
             timestamp: Timestamp::now(),
         };
 
-        let mut ok = 0u32;
-        let mut fail = 0u32;
+        // Send to all peers sequentially, each with a 3s timeout.
+        // Board sync is best-effort — we don't need confirmations.
+        let mut ok = 0usize;
+        let mut fail = 0usize;
         for peer in &peers {
-            match swarm.send_to_device(peer.device_id, Message::BoardSync(msg.clone())).await {
-                Ok(_) => { ok += 1; }
-                Err(_) => { fail += 1; }
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                swarm.send_to_device(peer.device_id, Message::BoardSync(msg.clone())),
+            ).await;
+            match result {
+                Ok(Ok(_)) => { ok += 1; }
+                _ => { fail += 1; }
             }
         }
 
