@@ -645,6 +645,9 @@ impl BackupCoordinator {
                     );
                 }
             }
+
+            // Clean up block.bin and directory if all symbol files were delivered.
+            self.cleanup_block_dir(&result.source_block_id);
         }
     }
 
@@ -767,6 +770,54 @@ impl BackupCoordinator {
             symbols = symbol_count,
             "backup: symbols delivered"
         );
+
+        // Clean up delivered symbol files from owner's disk.
+        let block_hex = syncback_core::types::hex_encode(&result.source_block_id.0);
+        let block_dir = self.config.symbols_dir.join(&block_hex);
+        for &(start_esi, count) in &placement.esi_ranges {
+            for i in 0..count {
+                let esi = start_esi + i;
+                let path = block_dir.join(format!("{esi}.bin"));
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(path = %path.display(), "cleanup: failed to remove symbol file: {e}");
+                    }
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// Remove block.bin and the block directory if all symbol files have been delivered.
+    fn cleanup_block_dir(&self, block_id: &syncback_core::types::SourceBlockId) {
+        let block_hex = syncback_core::types::hex_encode(&block_id.0);
+        let block_dir = self.config.symbols_dir.join(&block_hex);
+
+        if !block_dir.exists() {
+            return;
+        }
+
+        // Check if any .bin symbol files remain (exclude block.bin).
+        let has_remaining_symbols = std::fs::read_dir(&block_dir)
+            .map(|entries| {
+                entries.filter_map(|e| e.ok()).any(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.ends_with(".bin") && name != "block.bin"
+                })
+            })
+            .unwrap_or(true); // if read_dir fails, don't delete
+
+        if !has_remaining_symbols {
+            // All symbols delivered — remove block.bin and directory.
+            let _ = std::fs::remove_file(block_dir.join("block.bin"));
+            if let Err(e) = std::fs::remove_dir(&block_dir) {
+                // Not empty (e.g. .sym files from repair) — that's fine.
+                tracing::debug!(dir = %block_dir.display(), "cleanup: block dir not empty: {e}");
+            } else {
+                tracing::info!(block_id = %block_id, "backup: cleaned up block dir after full delivery");
+            }
+        }
     }
 }
