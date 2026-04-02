@@ -183,20 +183,8 @@ impl RepairAgent {
             .get_placement(block_id, holder_id)?
             .ok_or(RepairError::PlacementMissing(*block_id, *holder_id))?;
 
-        // 3. Read source block file (block.bin is retained after symbol delivery).
-        let block_file_path = self
-            .config
-            .source_blocks_dir
-            .join(hex_encode(&block_id.0))
-            .join("block.bin");
-
-        let source_data = match tokio::fs::read(&block_file_path).await {
-            Ok(data) => data,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(RepairError::SourceBlockMissing(*block_id));
-            }
-            Err(e) => return Err(RepairError::Io(e)),
-        };
+        // 3. Read source block file, or rebuild from source files if block.bin was cleaned up.
+        let source_data = self.load_or_rebuild_blob(block_id).await?;
 
         // 4. Build ErasureParams for encoding
         let k = block_record.k;
@@ -348,6 +336,70 @@ impl RepairAgent {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
+    /// Load block.bin from disk, or rebuild it from source files if absent.
+    ///
+    /// Encryption is deterministic (nonce = HKDF(epoch_key, blake3(compressed))),
+    /// so re-running compress_and_encrypt on the same plaintext produces the
+    /// exact same blob with the same block_id.
+    async fn load_or_rebuild_blob(
+        &self,
+        block_id: &SourceBlockId,
+    ) -> Result<Vec<u8>, RepairError> {
+        let block_file_path = self
+            .config
+            .source_blocks_dir
+            .join(hex_encode(&block_id.0))
+            .join("block.bin");
+
+        // Try reading block.bin first (fast path).
+        match tokio::fs::read(&block_file_path).await {
+            Ok(data) => return Ok(data),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(block_id = %block_id, "block.bin missing, attempting rebuild from source files");
+            }
+            Err(e) => return Err(RepairError::Io(e)),
+        }
+
+        // Rebuild: find source files for this block and re-run the pipeline.
+        let block_record = self
+            .db
+            .get_source_block(block_id)?
+            .ok_or(RepairError::RecordMissing(*block_id))?;
+
+        let plaintext = crate::daemon::backup::packing::rebuild_plaintext_from_db(
+            &self.db,
+            &block_record,
+        )
+        .map_err(|e| RepairError::EncodeFailed(format!("rebuild plaintext: {e}")))?;
+
+        let epoch_key = self.config.epoch_key;
+        let expected_id = *block_id;
+
+        let stored = tokio::task::spawn_blocking(move || {
+            crate::daemon::backup::pipeline::compress_and_encrypt(&plaintext, &epoch_key)
+        })
+        .await
+        .map_err(|e| RepairError::EncodeFailed(e.to_string()))?
+        .map_err(|e| RepairError::EncodeFailed(e.to_string()))?;
+
+        // Verify hash matches expected block_id.
+        let rebuilt_id: [u8; 32] = *blake3::hash(&stored).as_bytes();
+        debug_assert_eq!(
+            rebuilt_id, expected_id.0,
+            "rebuilt blob hash must match block_id (deterministic encryption)"
+        );
+        if rebuilt_id != expected_id.0 {
+            return Err(RepairError::EncodeFailed(format!(
+                "rebuilt blob hash {} != expected block_id {}",
+                hex_encode(&rebuilt_id),
+                hex_encode(&expected_id.0),
+            )));
+        }
+
+        tracing::info!(block_id = %block_id, "repair: rebuilt blob from source files");
+        Ok(stored)
+    }
+
     /// Mark a placement as Lost. Idempotent: no-op if already Lost or Deleting.
     async fn mark_placement_lost(
         &self,
@@ -382,8 +434,4 @@ impl RepairAgent {
     }
 }
 
-// Note: block.bin MUST be retained after symbol delivery because
-// compress_and_encrypt uses a random nonce — the blob cannot be
-// deterministically rebuilt from source files. Both PoS verification
-// and repair require the exact same blob that was originally encoded.
 

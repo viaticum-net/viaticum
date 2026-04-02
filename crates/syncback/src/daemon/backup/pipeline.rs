@@ -32,9 +32,24 @@ pub fn derive_block_key(epoch_key: &[u8; 32]) -> [u8; 32] {
     key
 }
 
+/// Derive a deterministic 12-byte nonce from epoch_key and compressed data.
+///
+/// Uses HKDF-SHA256 with `blake3(compressed)` as salt and epoch_key as IKM.
+/// This is a SIV-like construction: nonce depends on message content,
+/// so the same plaintext always produces the same blob.
+fn derive_nonce(epoch_key: &[u8; 32], compressed: &[u8]) -> [u8; 12] {
+    let hash = blake3::hash(compressed);
+    let hk = Hkdf::<Sha256>::new(Some(hash.as_bytes()), epoch_key);
+    let mut nonce = [0u8; 12];
+    hk.expand(b"syncback-block-nonce", &mut nonce)
+        .expect("12 is a valid HKDF-SHA256 output length");
+    nonce
+}
+
 /// Encrypt plaintext: compress → encrypt → prepend nonce.
 ///
 /// Returns `[12-byte nonce][ciphertext]`.
+/// Deterministic: same (plaintext, epoch_key) always produces same output.
 pub fn compress_and_encrypt(plaintext: &[u8], epoch_key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
     // zstd compress (level 3)
     let compressed = zstd::encode_all(std::io::Cursor::new(plaintext), 3)
@@ -44,8 +59,8 @@ pub fn compress_and_encrypt(plaintext: &[u8], epoch_key: &[u8; 32]) -> anyhow::R
     let key = derive_block_key(epoch_key);
     let cipher = ChaCha20Poly1305::new(&key.into());
 
-    // Random 12-byte nonce
-    let nonce_bytes: [u8; 12] = rand::random();
+    // Deterministic nonce derived from epoch_key + blake3(compressed)
+    let nonce_bytes = derive_nonce(epoch_key, &compressed);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher

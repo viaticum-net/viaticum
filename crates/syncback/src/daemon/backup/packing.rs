@@ -79,6 +79,76 @@ pub fn extract_file_from_pack(plaintext: &[u8], file_id: FileId) -> anyhow::Resu
     Ok(None)
 }
 
+/// Rebuild the plaintext for a source block by re-reading files from disk.
+///
+/// Used by repair when block.bin is absent (cleaned up after delivery).
+/// Reads each file referenced in the block record, rebuilds the same
+/// plaintext that was originally passed to compress_and_encrypt.
+pub fn rebuild_plaintext_from_db(
+    db: &syncback_core::db::Db,
+    block_record: &syncback_core::types::SourceBlockRecord,
+) -> anyhow::Result<Vec<u8>> {
+    use syncback_core::types::SourceBlockType;
+
+    match &block_record.block_type {
+        SourceBlockType::Single => {
+            // Single block: find any file version referencing this block_id.
+            let file_record = find_file_for_block(db, block_record.block_id)?;
+            let bytes = std::fs::read(&file_record.path)
+                .map_err(|e| anyhow::anyhow!("read source file {}: {e}", file_record.path))?;
+            Ok(bytes)
+        }
+        SourceBlockType::Pack { entries } => {
+            // Pack block: rebuild [CBOR index][file1][file2]...
+            let mut file_bytes_list = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let file_record = db
+                    .get_file_by_id(entry.file_id)?
+                    .ok_or_else(|| anyhow::anyhow!("file_id {} not found in DB", entry.file_id))?;
+                let bytes = std::fs::read(&file_record.path)
+                    .map_err(|e| anyhow::anyhow!("read source file {}: {e}", file_record.path))?;
+                file_bytes_list.push((entry.file_id, bytes));
+            }
+
+            // Rebuild pack index + data in same order as original.
+            let mut pack_entries = Vec::with_capacity(entries.len());
+            let mut offset = 0u64;
+            for (file_id, bytes) in &file_bytes_list {
+                pack_entries.push(syncback_core::types::PackEntry {
+                    file_id: *file_id,
+                    offset,
+                    size: bytes.len() as u64,
+                });
+                offset += bytes.len() as u64;
+            }
+
+            let index_bytes = syncback_core::types::to_cbor_bytes(&pack_entries);
+            let mut plaintext = index_bytes;
+            for (_, bytes) in &file_bytes_list {
+                plaintext.extend_from_slice(bytes);
+            }
+            Ok(plaintext)
+        }
+    }
+}
+
+/// Find a FileRecord whose version references the given block_id.
+fn find_file_for_block(
+    db: &syncback_core::db::Db,
+    block_id: syncback_core::types::SourceBlockId,
+) -> anyhow::Result<syncback_core::types::FileRecord> {
+    // Scan all files to find one with a version referencing this block.
+    let files = db.list_all_files()?;
+    for file in files {
+        for version in &file.versions {
+            if version.source_block_id == block_id {
+                return Ok(file);
+            }
+        }
+    }
+    anyhow::bail!("no file found referencing block_id {block_id}")
+}
+
 /// Serialize PackEntry list using CBOR. Used by RestoreCoordinator.
 pub fn serialize_pack_index(entries: &[PackEntry]) -> Vec<u8> {
     let v = entries.to_vec();

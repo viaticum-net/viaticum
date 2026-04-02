@@ -318,7 +318,8 @@ impl DaemonHandle {
             signing_key: master_key.clone(),
             max_entries: app_config.network.relay_max_entries,
             max_size_bytes: app_config.network.relay_max_size_mb * 1_048_576,
-            prune_interval_secs: 3600,
+            prune_interval_secs: (3600 / cfg.time_scale.max(1)).max(5),
+            ttl_secs: (syncback_core::constants::RELAY_TTL_SECS / cfg.time_scale.max(1)).max(60),
         })?;
 
         // ── 11. CancellationToken ─────────────────────────────────────────────
@@ -481,6 +482,7 @@ impl DaemonHandle {
                 Some(cs.clone()),
                 app_config.escrow.clone(),
                 accepted_offers,
+                epoch_key_bytes,
             );
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {

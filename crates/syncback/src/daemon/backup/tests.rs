@@ -1504,6 +1504,42 @@ fn persist_cycle_budget_accumulates_over_multiple_cycles() {
     );
 }
 
+// ─── Deterministic encryption ────────────────────────────────────────────────
+
+#[test]
+fn compress_and_encrypt_is_deterministic() {
+    use crate::daemon::backup::pipeline::compress_and_encrypt;
+
+    let plaintext = b"hello world, this is a test of deterministic encryption";
+    let epoch_key = [42u8; 32];
+
+    let blob1 = compress_and_encrypt(plaintext, &epoch_key).unwrap();
+    let blob2 = compress_and_encrypt(plaintext, &epoch_key).unwrap();
+
+    assert_eq!(blob1, blob2, "same plaintext + epoch_key must produce identical blob");
+
+    // Different plaintext → different blob.
+    let blob3 = compress_and_encrypt(b"different content", &epoch_key).unwrap();
+    assert_ne!(blob1, blob3);
+
+    // Different epoch_key → different blob.
+    let blob4 = compress_and_encrypt(plaintext, &[99u8; 32]).unwrap();
+    assert_ne!(blob1, blob4);
+}
+
+#[test]
+fn compress_and_encrypt_roundtrip_with_deterministic_nonce() {
+    use crate::daemon::backup::pipeline::{compress_and_encrypt, decrypt_and_decompress};
+
+    let plaintext = b"roundtrip test data for deterministic nonce verification";
+    let epoch_key = [7u8; 32];
+
+    let blob = compress_and_encrypt(plaintext, &epoch_key).unwrap();
+    let decrypted = decrypt_and_decompress(&blob, &epoch_key).unwrap();
+
+    assert_eq!(&decrypted, plaintext);
+}
+
 // AC-8, AC-9, AC-10 (pending_delivery signaling tests) removed in ε.5.
 // PendingDeliveries / OfferOutcome were iroh-era types; delivery now uses
 // libp2p SwarmHandle request-response. Network integration is tested in

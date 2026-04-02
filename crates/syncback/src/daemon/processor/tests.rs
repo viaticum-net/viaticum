@@ -185,6 +185,7 @@ async fn make_processor_with_quota(
         None, // cluster_state: not needed for handler unit tests
         syncback_core::config::EscrowCfg::default(),
         accepted_offers,
+        [0u8; 32], // epoch_key
     );
 
     (processor, repair_rx, relay_sync_rx)
@@ -253,6 +254,7 @@ async fn make_processor_with_pending(
         None, // cluster_state: not needed for handler unit tests
         syncback_core::config::EscrowCfg::default(),
         accepted_offers,
+        [0u8; 32], // epoch_key
     );
 
     (processor, repair_rx, relay_sync_rx)
@@ -354,6 +356,7 @@ async fn symbol_accept_updates_backup_event() {
         None, // cluster_state: not needed for handler unit tests
         syncback_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
+        [0u8; 32], // epoch_key
     );
 
     let holder = make_identity(7);
@@ -2118,6 +2121,7 @@ async fn dispatch_relay_pos_challenge_sends_response_via_board() {
         None, // cluster_state: not needed for this test
         syncback_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
+        [0u8; 32], // epoch_key
     );
 
     // Create a symbol file so PoS can respond.
@@ -2277,6 +2281,7 @@ async fn make_processor_with_cluster_state(
         Some(cluster_state.clone()),
         syncback_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
+        [0u8; 32], // epoch_key
     );
 
     (processor, cluster_state, own_identity)

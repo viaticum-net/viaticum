@@ -17,10 +17,10 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use syncback_core::constants::{MAX_BOARD_ENTRIES, MAX_BOARD_SIZE_BYTES};
+use syncback_core::constants::{MAX_BOARD_ENTRIES, MAX_BOARD_SIZE_BYTES, RELAY_TTL_SECS};
 use syncback_core::messages::{
     build_broadcast_entry, build_directed_entry, check_relay_hop, decrypt_directed,
-    encrypt_directed, from_cbor, is_board_entry_expired, relay_copy, to_cbor,
+    encrypt_directed, from_cbor, relay_copy, to_cbor,
     verify_board_entry_sig, BoardEntryKind, MessageError, StoredEntry,
 };
 use syncback_core::types::{IdentityPub, Timestamp};
@@ -65,6 +65,9 @@ pub struct RelayConfig {
     pub max_size_bytes: usize,
     /// How often to prune the board (seconds).
     pub prune_interval_secs: u64,
+    /// Entry TTL in seconds. Overrides RELAY_TTL_SECS when set.
+    /// Used to scale TTL with time_scale for testing.
+    pub ttl_secs: u64,
 }
 
 impl RelayConfig {
@@ -82,6 +85,7 @@ impl RelayConfig {
             max_entries: MAX_BOARD_ENTRIES,
             max_size_bytes: MAX_BOARD_SIZE_BYTES,
             prune_interval_secs: 3600,
+            ttl_secs: RELAY_TTL_SECS,
         }
     }
 }
@@ -139,6 +143,11 @@ pub struct RelayManager {
 }
 
 impl RelayManager {
+    /// Check if an entry is expired according to the configured TTL.
+    fn is_expired(&self, entry: &syncback_core::messages::BoardEntry, now: Timestamp) -> bool {
+        entry.created_at.0.saturating_add(self.config.ttl_secs) <= now.0
+    }
+
     /// Create a new manager.
     ///
     /// Loads existing board from disk (if present), rebuilds the `known_ids`
@@ -260,7 +269,7 @@ impl RelayManager {
             }
 
             // 2. TTL check.
-            if is_board_entry_expired(&remote.entry, now) {
+            if self.is_expired(&remote.entry, now) {
                 debug!(msg_id = ?remote.msg_id, "relay: skipping expired entry");
                 continue;
             }
@@ -322,7 +331,7 @@ impl RelayManager {
         let mut delivered = 0usize;
 
         for stored in &self.entries {
-            if is_board_entry_expired(&stored.entry, now) {
+            if self.is_expired(&stored.entry, now) {
                 continue;
             }
 
@@ -413,9 +422,10 @@ impl RelayManager {
     pub fn prune(&mut self, now: Timestamp) -> Result<usize, RelayError> {
         let before = self.entries.len();
 
-        // 1. Remove expired entries.
+        // 1. Remove expired entries (using config TTL, which may be scaled).
+        let ttl = self.config.ttl_secs;
         self.entries
-            .retain(|e| !is_board_entry_expired(&e.entry, now));
+            .retain(|e| e.entry.created_at.0.saturating_add(ttl) > now.0);
 
         // 2. Enforce size limits (oldest-first: entries are in append order).
         // Drop from the front until within limits.
@@ -462,7 +472,7 @@ impl RelayManager {
     pub fn entries_for_sync(&self, now: Timestamp) -> Vec<StoredEntry> {
         self.entries
             .iter()
-            .filter(|e| !is_board_entry_expired(&e.entry, now))
+            .filter(|e| !self.is_expired(&e.entry, now))
             .cloned()
             .collect()
     }

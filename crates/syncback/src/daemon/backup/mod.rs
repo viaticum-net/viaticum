@@ -789,9 +789,9 @@ impl BackupCoordinator {
         Ok(())
     }
 
-    /// Log that all symbol files for a block have been delivered.
-    /// block.bin is kept — needed for PoS verification and repair (nonce is random,
-    /// so the blob cannot be deterministically rebuilt from source files).
+    /// Clean up block directory after all symbols have been delivered.
+    /// Encryption is deterministic (nonce derived from content), so block.bin
+    /// can be rebuilt from source files for PoS/repair. Safe to delete.
     fn cleanup_block_dir(&self, block_id: &syncback_core::types::SourceBlockId) {
         let block_hex = syncback_core::types::hex_encode(&block_id.0);
         let block_dir = self.config.symbols_dir.join(&block_hex);
@@ -812,7 +812,19 @@ impl BackupCoordinator {
             .unwrap_or(true);
 
         if !has_remaining_symbols {
-            tracing::info!(block_id = %block_id, "backup: all symbols delivered, block.bin retained for PoS/repair");
+            // Delete block.bin and the directory.
+            let block_bin = block_dir.join("block.bin");
+            if let Err(e) = std::fs::remove_file(&block_bin) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %block_bin.display(), "cleanup: failed to remove block.bin: {e}");
+                }
+            }
+            if let Err(e) = std::fs::remove_dir(&block_dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %block_dir.display(), "cleanup: failed to remove block dir: {e}");
+                }
+            }
+            tracing::info!(block_id = %block_id, "backup: all symbols delivered, block dir cleaned up");
         }
     }
 }

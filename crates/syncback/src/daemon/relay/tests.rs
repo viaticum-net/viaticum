@@ -262,6 +262,7 @@ fn scan_for_self_delivers_directed_message() {
         max_entries: MAX_BOARD_ENTRIES,
         max_size_bytes: MAX_BOARD_SIZE_BYTES,
         prune_interval_secs: 3600,
+        ttl_secs: RELAY_TTL_SECS,
     };
     let mut manager = RelayManager::new(config).unwrap();
 
@@ -313,6 +314,7 @@ fn scan_for_self_ignores_directed_to_other() {
         max_entries: MAX_BOARD_ENTRIES,
         max_size_bytes: MAX_BOARD_SIZE_BYTES,
         prune_interval_secs: 3600,
+        ttl_secs: RELAY_TTL_SECS,
     };
     let mut manager = RelayManager::new(config).unwrap();
 
@@ -520,6 +522,7 @@ fn relay_three_hop_propagation() {
         max_entries: MAX_BOARD_ENTRIES,
         max_size_bytes: MAX_BOARD_SIZE_BYTES,
         prune_interval_secs: 3600,
+        ttl_secs: RELAY_TTL_SECS,
     };
     let mut manager_a = RelayManager::new(config_a).unwrap();
 
@@ -545,6 +548,7 @@ fn relay_three_hop_propagation() {
         max_entries: MAX_BOARD_ENTRIES,
         max_size_bytes: MAX_BOARD_SIZE_BYTES,
         prune_interval_secs: 3600,
+        ttl_secs: RELAY_TTL_SECS,
     };
     let mut manager_b = RelayManager::new(config_b).unwrap();
 
@@ -568,6 +572,7 @@ fn relay_three_hop_propagation() {
         max_entries: MAX_BOARD_ENTRIES,
         max_size_bytes: MAX_BOARD_SIZE_BYTES,
         prune_interval_secs: 3600,
+        ttl_secs: RELAY_TTL_SECS,
     };
     let mut manager_c = RelayManager::new(config_c).unwrap();
 
@@ -600,6 +605,7 @@ fn relay_three_hop_propagation() {
         max_entries: MAX_BOARD_ENTRIES,
         max_size_bytes: MAX_BOARD_SIZE_BYTES,
         prune_interval_secs: 3600,
+        ttl_secs: RELAY_TTL_SECS,
     };
     let mut manager_d = RelayManager::new(config_d).unwrap();
 
@@ -653,6 +659,7 @@ fn revocation_broadcast_propagates_through_relay() {
         max_entries: MAX_BOARD_ENTRIES,
         max_size_bytes: MAX_BOARD_SIZE_BYTES,
         prune_interval_secs: 3600,
+        ttl_secs: RELAY_TTL_SECS,
     };
     let mut manager_a = RelayManager::new(config_a).unwrap();
 
@@ -672,6 +679,7 @@ fn revocation_broadcast_propagates_through_relay() {
         max_entries: MAX_BOARD_ENTRIES,
         max_size_bytes: MAX_BOARD_SIZE_BYTES,
         prune_interval_secs: 3600,
+        ttl_secs: RELAY_TTL_SECS,
     };
     let mut manager_b = RelayManager::new(config_b).unwrap();
 
@@ -734,6 +742,7 @@ fn board_sync_exchange_fills_missing_entries() {
         max_entries: 100,
         max_size_bytes: 1_000_000,
         prune_interval_secs: 3600,
+        ttl_secs: RELAY_TTL_SECS,
     };
     let mut manager_a = RelayManager::new(config_a).unwrap();
     manager_a.process_remote_entries(&[e1.clone(), e2.clone()], now).unwrap();
@@ -748,6 +757,7 @@ fn board_sync_exchange_fills_missing_entries() {
         max_entries: 100,
         max_size_bytes: 1_000_000,
         prune_interval_secs: 3600,
+        ttl_secs: RELAY_TTL_SECS,
     };
     let mut manager_b = RelayManager::new(config_b).unwrap();
     manager_b.process_remote_entries(&[e2.clone(), e3.clone()], now).unwrap();

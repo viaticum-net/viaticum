@@ -178,6 +178,8 @@ pub struct Processor {
     /// Written by on_peer_authenticated, cleared by on_connection_closed.
     /// Used by handle_cluster_sync_request_libp2p to validate from_device_id.
     peer_cert_map: Arc<std::sync::Mutex<HashMap<DeviceId, (IdentityPub, DeviceCertificate)>>>,
+    /// Epoch key for rebuilding stored blobs when block.bin is absent.
+    epoch_key: [u8; 32],
 }
 
 impl Processor {
@@ -204,6 +206,7 @@ impl Processor {
         cluster_state: Option<Arc<std::sync::Mutex<syncback_core::cluster::ClusterState>>>,
         escrow_cfg: EscrowCfg,
         accepted_offers: AcceptedOffers,
+        epoch_key: [u8; 32],
     ) -> Self {
         Processor {
             db,
@@ -227,6 +230,7 @@ impl Processor {
             escrow_cfg,
             accepted_offers,
             peer_cert_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            epoch_key,
         }
     }
 
@@ -1148,13 +1152,23 @@ impl Processor {
         let source_data = match tokio::fs::read(&block_path).await {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                warn!(
+                // block.bin cleaned up after delivery — rebuild from source files.
+                debug!(
                     block_id = %block_id,
-                    holder = %holder_id,
-                    path = %block_path.display(),
-                    "processor: PosResponse — source block file missing, cannot verify"
+                    "processor: block.bin missing, rebuilding from source files"
                 );
-                return Ok(VerifyOutcome::CannotVerify);
+                match self.rebuild_blob_for_pos(&block_id).await {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!(
+                            block_id = %block_id,
+                            holder = %holder_id,
+                            err = %e,
+                            "processor: PosResponse — cannot rebuild blob, skipping verify"
+                        );
+                        return Ok(VerifyOutcome::CannotVerify);
+                    }
+                }
             }
             Err(e) => return Err(ProcessorError::Io(e)),
         };
@@ -1259,6 +1273,49 @@ impl Processor {
         );
 
         Ok(outcome)
+    }
+
+    /// Rebuild stored blob from source files for PoS verification.
+    ///
+    /// Used when block.bin has been cleaned up after symbol delivery.
+    /// Encryption is deterministic, so rebuild produces identical blob.
+    async fn rebuild_blob_for_pos(
+        &self,
+        block_id: &SourceBlockId,
+    ) -> Result<Vec<u8>, ProcessorError> {
+        let block_record = self
+            .db
+            .get_source_block(block_id)?
+            .ok_or_else(|| ProcessorError::Join(
+                format!("source block record missing: {block_id}")
+            ))?;
+
+        let db = self.db.clone();
+        let epoch_key = self.epoch_key;
+        let expected_id = *block_id;
+
+        let stored = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+            let plaintext = crate::daemon::backup::packing::rebuild_plaintext_from_db(
+                &db,
+                &block_record,
+            )?;
+            let blob = crate::daemon::backup::pipeline::compress_and_encrypt(&plaintext, &epoch_key)?;
+            let rebuilt_id: [u8; 32] = *blake3::hash(&blob).as_bytes();
+            if rebuilt_id != expected_id.0 {
+                anyhow::bail!(
+                    "rebuilt blob hash {} != expected block_id {}",
+                    hex_encode(&rebuilt_id),
+                    hex_encode(&expected_id.0),
+                );
+            }
+            Ok(blob)
+        })
+        .await
+        .map_err(|e| ProcessorError::Join(e.to_string()))?
+        .map_err(|e| ProcessorError::Join(e.to_string()))?;
+
+        info!(block_id = %block_id, "processor: rebuilt blob from source files for PoS");
+        Ok(stored)
     }
 
     // =========================================================

@@ -145,7 +145,8 @@ async fn repair_placement_missing_source_block_returns_error() {
     let agent = make_agent(db, symbols_dir.path());
     let result = agent.repair_placement(&bid, &hid).await;
 
-    assert!(matches!(result, Err(RepairError::SourceBlockMissing(_))));
+    // block.bin missing AND no source files → rebuild fails with EncodeFailed.
+    assert!(matches!(result, Err(RepairError::EncodeFailed(_))));
 }
 
 // ─── test 16: handle_symbol_dropped_transitions_to_lost ──────────────────────

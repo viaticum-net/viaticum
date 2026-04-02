@@ -447,6 +447,7 @@ fn relay_three_hop_message_delivery() {
         max_entries: MAX_BOARD_ENTRIES,
         max_size_bytes: syncback_core::constants::MAX_BOARD_SIZE_BYTES,
         prune_interval_secs: 3600,
+        ttl_secs: syncback_core::constants::RELAY_TTL_SECS,
     };
     let mut manager_c = RelayManager::new(config_c).unwrap();
 
