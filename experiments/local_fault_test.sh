@@ -107,6 +107,14 @@ done
 wait
 echo "  ${NUM_NODES} nodes initialized."
 
+# Set disk_reserve_gb=0 so tests work on low-disk machines.
+for i in $(seq 0 $((NUM_NODES-1))); do
+    cat > "$(node_dir "$i")/config.toml" << 'CFGEOF'
+[storage]
+disk_reserve_gb = 0.0
+CFGEOF
+done
+
 # Start all daemons
 echo "  Starting daemons (time_scale=${TIME_SCALE})..."
 for i in $(seq 0 $((NUM_NODES-1))); do

@@ -111,6 +111,14 @@ done
 wait
 echo "  ${NUM_NODES} nodes initialized."
 
+# Set disk_reserve_gb=0 so tests work on low-disk machines.
+for i in $(seq 0 $((NUM_NODES-1))); do
+    cat > "$(node_dir "$i")/config.toml" << 'CFGEOF'
+[storage]
+disk_reserve_gb = 0.0
+CFGEOF
+done
+
 # Start all daemons
 echo "  Starting daemons (time_scale=${TIME_SCALE})..."
 for i in $(seq 0 $((NUM_NODES-1))); do
@@ -275,14 +283,14 @@ else
     skip "trust data not available"
 fi
 
-# Check PoS weekly entries
-POS_WEEKLY=$(run_cli_q 0 status --json 2>/dev/null \
-    | grep -oE '"pos_weekly":\s*[0-9]+' | grep -oE '[0-9]+$')
-echo "  PoS weekly entries: ${POS_WEEKLY:-0}"
-if [ "${POS_WEEKLY:-0}" -ge 1 ]; then
-    pass "PoS challenges recorded (${POS_WEEKLY})"
+# Check PoS totals
+POS_CH=$(get_json_field 0 pos_total_challenges)
+POS_PA=$(get_json_field 0 pos_total_passes)
+echo "  PoS: challenges=${POS_CH:-0}, passes=${POS_PA:-0}"
+if [ "${POS_PA:-0}" -ge 1 ]; then
+    pass "PoS challenges recorded (challenges=${POS_CH}, passes=${POS_PA})"
 else
-    skip "no PoS entries yet (may need more time)"
+    skip "no PoS passes yet (may need more time at time_scale=${TIME_SCALE})"
 fi
 
 # ── PHASE 5: FILE VERSIONS ──────────────────────────────────────

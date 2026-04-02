@@ -93,6 +93,14 @@ for i in $(seq 0 $((NUM_NODES-1))); do
 done
 wait
 
+# Set disk_reserve_gb=0 so tests work on low-disk machines.
+for i in $(seq 0 $((NUM_NODES-1))); do
+    cat > "$(node_dir "$i")/config.toml" << 'CFGEOF'
+[storage]
+disk_reserve_gb = 0.0
+CFGEOF
+done
+
 echo "  Starting daemons..."
 for i in $(seq 0 $((NUM_NODES-1))); do
     mkdir -p "$(node_dir "$i")/files"
