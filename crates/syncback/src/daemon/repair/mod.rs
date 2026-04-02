@@ -11,7 +11,7 @@ use syncback_core::db::{Db, DbError};
 use syncback_core::erasure::ErasureEncoder;
 use syncback_core::types::{
     hex_encode, DeviceId, ErasureParams, FileId, IdentityPub, PlacementStatus, SourceBlockId,
-    Timestamp,
+    SourceBlockType, Timestamp,
 };
 
 #[cfg(test)]
@@ -58,6 +58,12 @@ pub struct RepairOutcome {
 pub enum RepairError {
     #[error("source block file not found: {0}")]
     SourceBlockMissing(SourceBlockId),
+
+    #[error("source file deleted from disk, skipping repair: {0}")]
+    SourceFileDeleted(String),
+
+    #[error("rebuild stored blob failed: {0}")]
+    RebuildFailed(String),
 
     #[error("source block record missing from DB: {0}")]
     RecordMissing(SourceBlockId),
@@ -145,6 +151,12 @@ impl RepairAgent {
                         "repair_placement: source block file missing, cannot repair locally"
                     );
                 }
+                Err(RepairError::SourceFileDeleted(ref path)) => {
+                    tracing::info!(
+                        path = %path,
+                        "repair_placement: source file deleted, skipping (deletion pipeline will clean up)"
+                    );
+                }
                 Err(e) => {
                     tracing::error!(
                         block_id = %placement.source_block_id,
@@ -183,8 +195,7 @@ impl RepairAgent {
             .get_placement(block_id, holder_id)?
             .ok_or(RepairError::PlacementMissing(*block_id, *holder_id))?;
 
-        // 3. Read source block file
-        // BackupCoordinator writes: {symbols_dir}/{hex(block_id)}/block.bin
+        // 3. Get stored blob: try block.bin first, then rebuild from source files.
         let block_file_path = self
             .config
             .source_blocks_dir
@@ -194,7 +205,9 @@ impl RepairAgent {
         let source_data = match tokio::fs::read(&block_file_path).await {
             Ok(data) => data,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(RepairError::SourceBlockMissing(*block_id));
+                // block.bin cleaned up after delivery — rebuild from source files.
+                self.rebuild_stored_blob(block_id, &block_record.block_type)
+                    .await?
             }
             Err(e) => return Err(RepairError::Io(e)),
         };
@@ -348,6 +361,90 @@ impl RepairAgent {
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Rebuild the stored blob (encrypted+compressed) from the original source files on disk.
+    ///
+    /// For Pack blocks: reads all files referenced in PackEntry, builds plaintext via packing,
+    /// then compress+encrypt. For Single blocks: reads the single file directly.
+    /// Verifies blake3 hash matches the expected block_id.
+    async fn rebuild_stored_blob(
+        &self,
+        block_id: &SourceBlockId,
+        block_type: &SourceBlockType,
+    ) -> Result<Vec<u8>, RepairError> {
+        use crate::daemon::backup::packing::build_plaintext;
+        use crate::daemon::backup::pipeline::compress_and_encrypt;
+        use crate::daemon::backup::QueuedFile;
+
+        let plaintext = match block_type {
+            SourceBlockType::Pack { entries } => {
+                let mut files: Vec<(QueuedFile, Vec<u8>)> = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let file_record = self.db.get_file_by_id(entry.file_id)
+                        .map_err(|e| RepairError::RebuildFailed(format!("db lookup file {}: {e}", entry.file_id.0)))?
+                        .ok_or_else(|| RepairError::RebuildFailed(format!("file {} not in DB", entry.file_id.0)))?;
+
+                    let data = match std::fs::read(&file_record.path) {
+                        Ok(d) => d,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(RepairError::SourceFileDeleted(file_record.path.clone()));
+                        }
+                        Err(e) => return Err(RepairError::Io(e)),
+                    };
+
+                    let qf = QueuedFile {
+                        path: file_record.path.clone(),
+                        file_id: entry.file_id,
+                        content_hash: [0u8; 32], // not used by build_plaintext
+                        size_bytes: data.len() as u64,
+                        category: syncback_core::types::FileCategory::Other,
+                        importance: file_record.importance,
+                    };
+                    files.push((qf, data));
+                }
+                build_plaintext(&files)
+            }
+            SourceBlockType::Single => {
+                // For single-file blocks, find the file via DB scan.
+                let all_files = self.db.list_all_files()
+                    .map_err(|e| RepairError::RebuildFailed(format!("list_all_files: {e}")))?;
+                let file_record = all_files.iter()
+                    .find(|f| f.versions.iter().any(|v| v.source_block_id == *block_id))
+                    .ok_or_else(|| RepairError::RebuildFailed(
+                        format!("no file references block {block_id}")
+                    ))?;
+
+                match std::fs::read(&file_record.path) {
+                    Ok(d) => d,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(RepairError::SourceFileDeleted(file_record.path.clone()));
+                    }
+                    Err(e) => return Err(RepairError::Io(e)),
+                }
+            }
+        };
+
+        let stored = compress_and_encrypt(&plaintext, &self.config.epoch_key)
+            .map_err(|e| RepairError::RebuildFailed(format!("compress_and_encrypt: {e}")))?;
+
+        // Sanity: verify hash matches block_id.
+        let hash: [u8; 32] = *blake3::hash(&stored).as_bytes();
+        if hash != block_id.0 {
+            return Err(RepairError::RebuildFailed(format!(
+                "rebuilt blob hash {} != expected block_id {}",
+                hex_encode(&hash),
+                block_id
+            )));
+        }
+
+        tracing::info!(
+            block_id = %block_id,
+            blob_bytes = stored.len(),
+            "repair: rebuilt stored blob from source files"
+        );
+
+        Ok(stored)
+    }
 
     /// Mark a placement as Lost. Idempotent: no-op if already Lost or Deleting.
     async fn mark_placement_lost(
