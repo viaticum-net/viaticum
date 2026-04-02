@@ -133,6 +133,9 @@ pub struct RelayManager {
     delivered_ids: HashSet<[u8; 16]>,
     /// True when entries changed since last board push (avoids redundant broadcasts).
     board_dirty: bool,
+    /// Index into `entries`: only send entries[last_push_idx..] on next push.
+    /// Reset to 0 after prune() which may remove entries.
+    last_push_idx: usize,
 }
 
 impl RelayManager {
@@ -148,6 +151,7 @@ impl RelayManager {
             config,
             known_ids,
             board_dirty: !entries.is_empty(),
+            last_push_idx: 0,
             entries,
             delivered_ids: HashSet::new(),
         };
@@ -439,6 +443,10 @@ impl RelayManager {
             // Discard delivered_ids for entries that are no longer on the board.
             self.delivered_ids.retain(|id| self.known_ids.contains(id));
 
+            // Reset push index — entries were reshuffled, need full resend.
+            self.last_push_idx = 0;
+            self.board_dirty = !self.entries.is_empty();
+
             // Atomic rewrite.
             board::rewrite_board(&self.config.board_path, &self.entries)?;
 
@@ -625,9 +633,17 @@ impl RelayManager {
             }
         };
 
+        // Only send entries added since last push.
+        let new_entries = self.entries[self.last_push_idx..].to_vec();
+        self.last_push_idx = self.entries.len();
+
+        if new_entries.is_empty() {
+            return;
+        }
+
         let msg = BoardSyncMsg {
             v: 1,
-            entries: self.entries.clone(),
+            entries: new_entries,
             timestamp: Timestamp::now(),
         };
 
