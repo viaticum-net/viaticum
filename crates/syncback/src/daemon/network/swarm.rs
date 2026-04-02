@@ -483,6 +483,9 @@ impl SwarmHandle {
                 }
             })
             .map_err(|e| SwarmError::Transport(e.to_string()))?
+            .with_swarm_config(|cfg| {
+                cfg.with_idle_connection_timeout(std::time::Duration::from_secs(600))
+            })
             .build();
 
         swarm
