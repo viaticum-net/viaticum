@@ -313,7 +313,7 @@ impl Db {
 
         let ok = db.check_integrity()?;
         if !ok {
-            tracing::warn!("db: check_integrity returned false, proceeding anyway");
+            tracing::error!("db: check_integrity returned false, proceeding anyway");
         }
 
         Self::create_tables(&db)?;
@@ -413,15 +413,13 @@ impl Db {
         let tx = self.inner.begin_read()?;
         let table = tx.open_table(FILES)?;
         let mut records = Vec::new();
-        // redb stores &str keys in lexicographic order, so a range scan works.
-        // We use range from `prefix` to `prefix\xFF` (exclusive upper bound via open end).
-        // Simplest correct approach: full scan with prefix check.
-        for item in table.iter()? {
+        for item in table.range::<&str>(prefix..)? {
             let (k, v) = item?;
-            if k.value().starts_with(prefix) {
-                let record: FileRecord = from_cbor_bytes(v.value())?;
-                records.push(record);
+            if !k.value().starts_with(prefix) {
+                break;
             }
+            let record: FileRecord = from_cbor_bytes(v.value())?;
+            records.push(record);
         }
         Ok(records)
     }
@@ -603,11 +601,12 @@ impl Db {
     }
 
     /// Delete placement. Also cleans up indices and HOT cache.
+    /// Returns the deleted placement, or None if it did not exist.
     pub fn delete_placement(
         &self,
         block_id: &SourceBlockId,
         holder_id: &DeviceId,
-    ) -> Result<(), DbError> {
+    ) -> Result<Option<SymbolPlacement>, DbError> {
         let key = placement_key(block_id, holder_id);
 
         // Capture the old record inside the transaction to compute the hot cache delta,
@@ -638,7 +637,7 @@ impl Db {
         }
 
         // DB is committed; now apply delta to the hot cache.
-        if let Some(old_rec) = old_record {
+        if let Some(ref old_rec) = old_record {
             let mut hot = self.hot.write().expect("hot cache lock poisoned");
             hot.placements.remove(&(*block_id, *holder_id));
 
@@ -662,7 +661,7 @@ impl Db {
             }
         }
 
-        Ok(())
+        Ok(old_record)
     }
 
     /// List all placements for a source block. Uses prefix range scan on composite key.

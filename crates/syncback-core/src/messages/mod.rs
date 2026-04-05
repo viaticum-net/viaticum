@@ -492,6 +492,9 @@ pub fn unframe_message(buf: &[u8]) -> Result<(Message, usize), MessageError> {
         return Err(MessageError::BufferTooShort);
     }
     let declared = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+    if declared > MAX_MESSAGE_SIZE {
+        return Err(MessageError::TooLarge { size: declared as usize });
+    }
     let declared_usize = declared as usize;
     let available = buf.len() - 4;
     if available < declared_usize {

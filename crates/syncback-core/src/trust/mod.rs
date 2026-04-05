@@ -376,7 +376,7 @@ pub fn compute_effective_trust(
         .map(|d| compute_combined(d.trust_p, d.trust_i, 1.0))
         .unwrap_or(0.0);
 
-    base + dt * (1.0 - base / MAX_COMBINED_TRUST)
+    (base + dt * (1.0 - base / MAX_COMBINED_TRUST)).min(MAX_COMBINED_TRUST)
 }
 
 /// Recompute master_trust for a given master identity from all its devices' trust.

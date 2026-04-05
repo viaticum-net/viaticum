@@ -306,6 +306,8 @@ impl DaemonHandle {
                 symbols_dir: symbols_dir.clone(),
                 epoch_key: epoch_key_bytes,
                 own_identity: identity_pub,
+                master_signing_key: Some(master_key.clone()),
+                swarm: swarm_handle_arc.clone(),
             },
             encoder.clone(),
         );

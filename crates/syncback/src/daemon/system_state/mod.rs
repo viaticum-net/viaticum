@@ -83,7 +83,7 @@ pub fn decrypt_and_restore(
 
 /// Periodically snapshot the DB, encrypt the blob, and push it to all known peers.
 ///
-/// Uses SwarmHandle.send_to_master (libp2p request-response, ε.2+).
+/// Uses SwarmHandle.send_to_device (libp2p request-response, ε.2+).
 /// SystemStateBackup is sent as a request; the response (SystemStateAck or Ack) is logged.
 ///
 /// The minimum interval is clamped to 60 seconds to avoid hammering peers.

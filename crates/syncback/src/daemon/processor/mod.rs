@@ -821,7 +821,8 @@ impl Processor {
                 }
             }
             other => {
-                debug!(msg_type = %other, "processor: relay message, no handler");
+                let safe_type: String = other.chars().take(64).filter(|c| c.is_ascii_graphic() || *c == ' ').collect();
+                debug!("dispatch_relay: unknown msg_type={safe_type}");
             }
         }
     }

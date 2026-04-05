@@ -90,7 +90,7 @@ impl Timestamp {
     pub fn now() -> Self {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time before unix epoch")
+            .unwrap_or_default()
             .as_secs();
         Timestamp(secs)
     }

@@ -488,14 +488,18 @@ impl Scheduler {
                     // Mark placement status Deleting.
                     if let Ok(Some(mut p)) = self.db.get_placement(&source_block_id, &holder_id) {
                         p.status = PlacementStatus::Deleting;
-                        let _ = self.db.upsert_placement(&p);
+                        if let Err(e) = self.db.upsert_placement(&p) {
+                            error!(block_id = %source_block_id, holder_id = %holder_id, "deletion: failed to update placement: {e}");
+                        }
                     }
 
                     // Mark source block status Deleting (if still Active).
                     if let Ok(Some(mut sb)) = self.db.get_source_block(&source_block_id) {
                         if sb.status == SourceBlockStatus::Active || sb.status == SourceBlockStatus::Stale {
                             sb.status = SourceBlockStatus::Deleting;
-                            let _ = self.db.upsert_source_block(&sb);
+                            if let Err(e) = self.db.upsert_source_block(&sb) {
+                                error!(block_id = %source_block_id, "deletion: failed to update source block: {e}");
+                            }
                         }
                     }
 
@@ -506,7 +510,9 @@ impl Scheduler {
                     );
                 }
                 DeletionAction::CleanupPlacement { source_block_id, holder_id } => {
-                    let _ = self.db.delete_placement(&source_block_id, &holder_id);
+                    if let Err(e) = self.db.delete_placement(&source_block_id, &holder_id) {
+                        error!(block_id = %source_block_id, holder_id = %holder_id, "deletion: failed to delete placement: {e}");
+                    }
                     info!(
                         block_id = %source_block_id,
                         holder_id = %holder_id,
@@ -514,11 +520,15 @@ impl Scheduler {
                     );
                 }
                 DeletionAction::CleanupBlock { source_block_id, file_id } => {
-                    let _ = self.db.delete_source_block(&source_block_id);
+                    if let Err(e) = self.db.delete_source_block(&source_block_id) {
+                        error!(block_id = %source_block_id, "deletion: failed to delete source block: {e}");
+                    }
                     // Prune the file version that references this block.
                     if let Ok(Some(mut file)) = self.db.get_file_by_id(file_id) {
                         file.versions.retain(|v| v.source_block_id != source_block_id);
-                        let _ = self.db.upsert_file(&file);
+                        if let Err(e) = self.db.upsert_file(&file) {
+                            error!(file_id = %file_id, "deletion: failed to update file after block cleanup: {e}");
+                        }
                     }
                     info!(
                         block_id = %source_block_id,

@@ -184,11 +184,11 @@ async fn bfs_collect_blobs(
 
     for addr_str in &seed_addrs {
         if visited.len() >= BFS_MAX_PEERS {
-            println!("BFS peer limit reached ({BFS_MAX_PEERS}), stopping.");
+            tracing::info!("BFS peer limit reached ({BFS_MAX_PEERS}), stopping.");
             break;
         }
         if blobs.len() >= BFS_MAX_BLOBS {
-            println!("BFS blob limit reached ({BFS_MAX_BLOBS}), stopping.");
+            tracing::info!("BFS blob limit reached ({BFS_MAX_BLOBS}), stopping.");
             break;
         }
 
@@ -196,7 +196,7 @@ async fn bfs_collect_blobs(
         let (peer_id, multiaddr) = match parse_multiaddr_with_peer_id(addr_str) {
             Ok(r) => r,
             Err(e) => {
-                println!("  skip '{addr_str}': {e}");
+                tracing::info!("  skip '{addr_str}': {e}");
                 continue;
             }
         };
@@ -215,16 +215,16 @@ async fn bfs_collect_blobs(
         }
         visited.insert(key);
 
-        println!(
-            "  dialing {} ({} visited, {} blobs so far)...",
-            &addr_str[..addr_str.len().min(80)],
-            visited.len(),
-            blobs.len()
+        tracing::info!(
+            addr = &addr_str[..addr_str.len().min(80)],
+            visited = visited.len(),
+            blobs = blobs.len(),
+            "dr: dialing peer"
         );
 
         // Dial the peer.
         if let Err(e) = swarm.dial(peer_id, multiaddr).await {
-            println!("  skip: dial failed ({e})");
+            tracing::info!("dr: skip: dial failed ({e})");
             continue;
         }
 
@@ -232,12 +232,12 @@ async fn bfs_collect_blobs(
         let device_id = match wait_for_auth(event_rx, peer_id).await {
             Some(did) => did,
             None => {
-                println!("  skip: authentication timeout or connection closed");
+                tracing::info!("dr: skip: authentication timeout or connection closed");
                 continue;
             }
         };
 
-        println!("  authenticated as device {device_id}");
+        tracing::info!(device = %device_id, "dr: authenticated");
 
         // Send SystemStateRequest via libp2p request-response.
         let req = Message::SystemStateRequest(SystemStateRequestMsg {
@@ -253,31 +253,31 @@ async fn bfs_collect_blobs(
         {
             Ok(Ok(Message::SystemStateResponse(resp))) => {
                 if !resp.encrypted_blob.is_empty() {
-                    println!("  found blob ({} bytes)", resp.encrypted_blob.len());
+                    tracing::info!(bytes = resp.encrypted_blob.len(), "dr: found blob");
                     blobs.push((resp.timestamp.0, resp.encrypted_blob));
                 } else {
-                    println!("  peer has no blob stored for us");
+                    tracing::info!("dr: peer has no blob stored for us");
                 }
             }
             Ok(Ok(other)) => {
-                println!(
-                    "  unexpected response: {:?}",
-                    std::mem::discriminant(&other)
+                tracing::info!(
+                    response = ?std::mem::discriminant(&other),
+                    "dr: unexpected response"
                 );
             }
             Ok(Err(e)) => {
-                println!("  SystemStateRequest failed: {e}");
+                tracing::info!("dr: SystemStateRequest failed: {e}");
             }
             Err(_) => {
-                println!("  SystemStateRequest timed out");
+                tracing::info!("dr: SystemStateRequest timed out");
             }
         }
     }
 
-    println!(
-        "BFS complete: visited {} peers, collected {} blobs",
-        visited.len(),
-        blobs.len(),
+    tracing::info!(
+        visited = visited.len(),
+        blobs = blobs.len(),
+        "dr: BFS complete"
     );
 
     blobs

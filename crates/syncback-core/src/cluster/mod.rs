@@ -254,6 +254,7 @@ pub fn epoch_for_time(
 /// ESI = device_index * 2^20 + local_counter.
 /// Max 16 devices (ESI space = 2^24, 2^20 per device).
 pub fn esi_namespace_start(device_index: u8) -> u32 {
+    debug_assert!(device_index <= 16, "max 16 devices supported (0..=15, 16 as exclusive end)");
     (device_index as u32) << 20
 }
 

@@ -178,7 +178,8 @@ fn placement_crud() {
     assert_eq!(got.symbol_count(), 50);
     assert_eq!(got.holder_id, holder);
 
-    db.delete_placement(&block_id(1), &holder).unwrap();
+    let deleted = db.delete_placement(&block_id(1), &holder).unwrap();
+    assert!(deleted.is_some());
     assert!(db.get_placement(&block_id(1), &holder).unwrap().is_none());
 }
 
@@ -213,7 +214,7 @@ fn placement_delete_cleans_hot_cache() {
     let p = make_placement(2, holder, FileId(8), PlacementStatus::Alive, 75);
 
     db.upsert_placement(&p).unwrap();
-    db.delete_placement(&block_id(2), &holder).unwrap();
+    let _ = db.delete_placement(&block_id(2), &holder).unwrap();
 
     let hot = db.hot();
     assert!(hot.placements.get(&(block_id(2), holder)).is_none());
@@ -240,7 +241,7 @@ fn double_index_consistency() {
     let files = db.list_files_for_holder(&holder).unwrap();
     assert!(files.contains(&fid));
 
-    db.delete_placement(&block_id(3), &holder).unwrap();
+    let _ = db.delete_placement(&block_id(3), &holder).unwrap();
 
     let holders_after = db.list_holders_for_file(fid).unwrap();
     assert!(holders_after.is_empty());
@@ -1538,4 +1539,106 @@ fn db_get_device_trust_absent_returns_none() {
     let unknown = DeviceId([0x99; 32]);
     let result = db.get_device_trust(&unknown).unwrap();
     assert!(result.is_none(), "should return None for unknown device");
+}
+
+// ============================================================
+// delete_placement returning Option<SymbolPlacement>
+// ============================================================
+
+#[test]
+fn delete_placement_removes_record() {
+    let db = test_db();
+    let holder = DeviceId([0xD0u8; 32]);
+    let p = make_placement(0xD0, holder, FileId(200), PlacementStatus::Alive, 40);
+    db.upsert_placement(&p).unwrap();
+
+    let _ = db.delete_placement(&block_id(0xD0), &holder).unwrap();
+
+    assert!(
+        db.get_placement(&block_id(0xD0), &holder).unwrap().is_none(),
+        "placement must be absent after delete"
+    );
+}
+
+#[test]
+fn delete_placement_returns_deleted_record() {
+    let db = test_db();
+    let holder = DeviceId([0xD1u8; 32]);
+    let p = make_placement(0xD1, holder, FileId(201), PlacementStatus::Alive, 55);
+    db.upsert_placement(&p).unwrap();
+
+    let deleted = db.delete_placement(&block_id(0xD1), &holder).unwrap();
+
+    assert!(deleted.is_some(), "must return Some for existing placement");
+    let rec = deleted.unwrap();
+    assert_eq!(rec.holder_id, holder);
+    assert_eq!(rec.symbol_count(), 55);
+    assert_eq!(rec.file_id, FileId(201));
+}
+
+#[test]
+fn delete_placement_nonexistent_returns_none() {
+    let db = test_db();
+    let holder = DeviceId([0xD2u8; 32]);
+
+    let result = db.delete_placement(&block_id(0xD2), &holder).unwrap();
+
+    assert!(result.is_none(), "must return None when placement does not exist");
+}
+
+#[test]
+fn delete_placement_updates_hot_cache() {
+    let db = test_db();
+    let holder = DeviceId([0xD3u8; 32]);
+    let p = make_placement(0xD3, holder, FileId(203), PlacementStatus::Alive, 70);
+    db.upsert_placement(&p).unwrap();
+
+    {
+        let hot = db.hot();
+        assert_eq!(
+            hot.blocks.get(&block_id(0xD3)).map(|a| a.total_alive_symbols).unwrap_or(0),
+            70,
+            "alive count must be 70 before delete"
+        );
+        assert!(hot.placements.contains_key(&(block_id(0xD3), holder)));
+    }
+
+    let deleted = db.delete_placement(&block_id(0xD3), &holder).unwrap();
+    assert!(deleted.is_some());
+
+    {
+        let hot = db.hot();
+        assert_eq!(
+            hot.blocks.get(&block_id(0xD3)).map(|a| a.total_alive_symbols).unwrap_or(0),
+            0,
+            "alive count must drop to 0 after delete"
+        );
+        assert!(
+            !hot.placements.contains_key(&(block_id(0xD3), holder)),
+            "placement must be removed from hot cache"
+        );
+    }
+}
+
+#[test]
+fn delete_placement_cleans_indexes() {
+    let db = test_db();
+    let holder = DeviceId([0xD4u8; 32]);
+    let fid = FileId(204);
+    let p = make_placement(0xD4, holder, fid, PlacementStatus::Alive, 30);
+    db.upsert_placement(&p).unwrap();
+
+    assert!(db.list_holders_for_file(fid).unwrap().contains(&holder));
+    assert!(db.list_files_for_holder(&holder).unwrap().contains(&fid));
+
+    let _ = db.delete_placement(&block_id(0xD4), &holder).unwrap();
+
+    assert!(
+        db.list_holders_for_file(fid).unwrap().is_empty(),
+        "FILE_HOLDERS index must be cleaned after delete"
+    );
+    assert!(
+        db.list_files_for_holder(&holder).unwrap().is_empty(),
+        "HOLDER_FILES index must be cleaned after delete"
+    );
 }

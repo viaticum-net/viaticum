@@ -318,9 +318,10 @@ impl RestoreCoordinator {
         let placements = self.db.list_placements_for_block(block_id)?;
         // For local symbol reads, use all non-deleted placements: the symbols
         // are on the owner's disk regardless of holder reachability status.
+        // Lost means the holder's copy is gone, not the owner's local .bin files.
         let usable_placements: Vec<_> = placements
             .into_iter()
-            .filter(|p| !matches!(p.status, PlacementStatus::Deleting | PlacementStatus::Lost))
+            .filter(|p| p.status != PlacementStatus::Deleting)
             .collect();
 
         if usable_placements.is_empty() {
