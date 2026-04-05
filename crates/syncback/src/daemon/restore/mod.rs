@@ -259,20 +259,7 @@ impl RestoreCoordinator {
                 }
             };
 
-            // Reconstruct ErasureParams from stored k and t.
-            // importance=0.5 is used only to satisfy the API; k and t drive the actual params.
-            let params = ErasureParams::compute(
-                block_record.k as u64 * block_record.t as u64,
-                0.5,
-            );
-            debug_assert_eq!(
-                params.k, block_record.k,
-                "reconstructed k must match stored k"
-            );
-            debug_assert_eq!(
-                params.t, block_record.t,
-                "reconstructed t must match stored t"
-            );
+            let params = block_record.erasure_params();
 
             // Decode the block (Phase 2: local symbols_dir)
             let plaintext = self

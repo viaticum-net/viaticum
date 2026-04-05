@@ -306,7 +306,7 @@ impl Default for DeletionEngine {
 /// any device is still Present.
 fn all_devices_deleted_at(file: &FileRecord) -> Option<Timestamp> {
     if file.devices.is_empty() {
-        return Some(Timestamp(0));
+        return None;
     }
     let mut max_ts = Timestamp(0);
     for (_, state) in &file.devices {

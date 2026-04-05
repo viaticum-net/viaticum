@@ -548,28 +548,8 @@ impl Scheduler {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Generate a 16-byte challenge ID from system time.
-///
-/// Not cryptographically secure — challenge_id is used only for matching
-/// responses to pending challenges, not as a secret.
 fn random_challenge_id() -> [u8; 16] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-
-    // LCG mixing to generate two distinct 8-byte halves.
-    let a = ns
-        .wrapping_mul(6_364_136_223_846_793_005)
-        .wrapping_add(1_442_695_040_888_963_407);
-    let b = a
-        .wrapping_mul(6_364_136_223_846_793_005)
-        .wrapping_add(1_442_695_040_888_963_407);
-
     let mut id = [0u8; 16];
-    id[..8].copy_from_slice(&a.to_le_bytes());
-    id[8..].copy_from_slice(&b.to_le_bytes());
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
     id
 }

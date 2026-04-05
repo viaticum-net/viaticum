@@ -150,7 +150,7 @@ pub fn verify_device_certificate(
     let sig = ed25519_dalek::Signature::from_bytes(&cert.signature);
     let payload = device_cert_payload(&cert.device_id, cert.issued_at);
     verifying_key
-        .verify(&payload, &sig)
+        .verify_strict(&payload, &sig)
         .map_err(|_| ClusterError::InvalidSignature)
 }
 
@@ -198,7 +198,7 @@ pub fn verify_revocation(
     let sig = ed25519_dalek::Signature::from_bytes(&cert.signature);
     let payload = revocation_payload(&cert.device_id, cert.revoked_at, cert.new_epoch);
     verifying_key
-        .verify(&payload, &sig)
+        .verify_strict(&payload, &sig)
         .map_err(|_| ClusterError::InvalidSignature)
 }
 
@@ -259,7 +259,9 @@ pub fn esi_namespace_start(device_index: u8) -> u32 {
 
 /// ESI namespace end (exclusive) for a device index.
 pub fn esi_namespace_end(device_index: u8) -> u32 {
-    esi_namespace_start(device_index + 1)
+    device_index
+        .checked_add(1)
+        .map_or(u32::MAX, esi_namespace_start)
 }
 
 // ============================================================

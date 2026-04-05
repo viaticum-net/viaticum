@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use redb::{ReadableTable, ReadableTableMetadata, TableDefinition};
 
-use crate::constants::{HOLDER_DELETE_COOLDOWN_SECS, DROP_NOTICE_WINDOW_SECS};
+use crate::constants::{BYTES_PER_GB, DROP_NOTICE_WINDOW_SECS, HOLDER_DELETE_COOLDOWN_SECS};
 use crate::cluster::StoredClusterState;
 use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
 use crate::types::{
@@ -521,63 +521,69 @@ impl Db {
         let hf_key = holder_file_key(&record.holder_id, record.file_id);
         let count = record.symbol_count();
 
-        let tx = self.inner.begin_write()?;
+        // Compute delta inside the transaction, but apply to hot cache only after commit.
+        let old_alive: u32;
+        let new_alive: u32;
         {
-            let mut placements = tx.open_table(SYMBOL_PLACEMENTS)?;
-            // Read old record to adjust hot cache delta correctly
-            let old: Option<SymbolPlacement> = match placements.get(&key)? {
-                Some(v) => Some(from_cbor_bytes(v.value())?),
-                None => None,
-            };
-            placements.insert(&key, bytes.as_slice())?;
-
-            // Update indices
-            let mut fh = tx.open_table(FILE_HOLDERS)?;
-            let mut hf = tx.open_table(HOLDER_FILES)?;
-            fh.insert(&fh_key, count)?;
-            hf.insert(&hf_key, count)?;
-
-            // Update hot cache under write lock — do this inside transaction scope
-            // so that cache and DB stay in sync on failure.
-            let mut hot = self.hot.write().expect("hot cache lock poisoned");
-
-            // Adjust block aggregate: remove old alive contribution, add new.
-            // Alive | Uncertain both count — matches cli_server and protocol intent.
-            let old_alive = old
-                .as_ref()
-                .filter(|o| {
-                    matches!(o.status, PlacementStatus::Alive | PlacementStatus::Uncertain)
-                })
-                .map(|o| o.symbol_count())
-                .unwrap_or(0);
-            let new_alive =
-                if matches!(record.status, PlacementStatus::Alive | PlacementStatus::Uncertain) {
-                    count
-                } else {
-                    0
+            let tx = self.inner.begin_write()?;
+            {
+                let mut placements = tx.open_table(SYMBOL_PLACEMENTS)?;
+                // Read old record to adjust hot cache delta correctly.
+                let old: Option<SymbolPlacement> = match placements.get(&key)? {
+                    Some(v) => Some(from_cbor_bytes(v.value())?),
+                    None => None,
                 };
+                placements.insert(&key, bytes.as_slice())?;
 
-            let block_agg = hot
-                .blocks
-                .entry(record.source_block_id)
-                .or_insert(BlockAgg {
-                    k: 0,
-                    total_alive_symbols: 0,
-                });
-            block_agg.total_alive_symbols =
-                block_agg.total_alive_symbols.saturating_sub(old_alive) + new_alive;
+                // Update indices
+                let mut fh = tx.open_table(FILE_HOLDERS)?;
+                let mut hf = tx.open_table(HOLDER_FILES)?;
+                fh.insert(&fh_key, count)?;
+                hf.insert(&hf_key, count)?;
 
-            // Update per-(block, holder) aggregate.
-            hot.placements.insert(
-                (record.source_block_id, record.holder_id),
-                PlacementAgg {
-                    symbol_count: count,
-                    status: record.status,
-                    last_pos: record.last_verified,
-                },
-            );
+                // Compute the delta (what needs to change in the hot cache).
+                // Alive | Uncertain both count — matches cli_server and protocol intent.
+                old_alive = old
+                    .as_ref()
+                    .filter(|o| {
+                        matches!(o.status, PlacementStatus::Alive | PlacementStatus::Uncertain)
+                    })
+                    .map(|o| o.symbol_count())
+                    .unwrap_or(0);
+                new_alive =
+                    if matches!(record.status, PlacementStatus::Alive | PlacementStatus::Uncertain)
+                    {
+                        count
+                    } else {
+                        0
+                    };
+            }
+            // Commit DB first — hot cache must only be updated after a successful commit.
+            tx.commit()?;
         }
-        tx.commit()?;
+
+        // DB is committed; now apply delta to the hot cache.
+        let mut hot = self.hot.write().expect("hot cache lock poisoned");
+        let block_agg = hot
+            .blocks
+            .entry(record.source_block_id)
+            .or_insert(BlockAgg {
+                k: 0,
+                total_alive_symbols: 0,
+            });
+        block_agg.total_alive_symbols =
+            block_agg.total_alive_symbols.saturating_sub(old_alive) + new_alive;
+
+        // Update per-(block, holder) aggregate.
+        hot.placements.insert(
+            (record.source_block_id, record.holder_id),
+            PlacementAgg {
+                symbol_count: count,
+                status: record.status,
+                last_pos: record.last_verified,
+            },
+        );
+
         Ok(())
     }
 
@@ -604,52 +610,58 @@ impl Db {
     ) -> Result<(), DbError> {
         let key = placement_key(block_id, holder_id);
 
-        let tx = self.inner.begin_write()?;
+        // Capture the old record inside the transaction to compute the hot cache delta,
+        // but apply to the hot cache only after a successful commit.
+        let old_record: Option<SymbolPlacement>;
         {
-            let mut placements = tx.open_table(SYMBOL_PLACEMENTS)?;
-            // Read before delete so we can update indices and hot cache.
-            let old: Option<SymbolPlacement> = match placements.get(&key)? {
-                Some(v) => Some(from_cbor_bytes(v.value())?),
-                None => None,
-            };
-            placements.remove(&key)?;
+            let tx = self.inner.begin_write()?;
+            {
+                let mut placements = tx.open_table(SYMBOL_PLACEMENTS)?;
+                // Read before delete so we can update indices and hot cache.
+                old_record = match placements.get(&key)? {
+                    Some(v) => Some(from_cbor_bytes(v.value())?),
+                    None => None,
+                };
+                placements.remove(&key)?;
 
-            if let Some(old_record) = old {
-                let fh_key = file_holder_key(old_record.file_id, holder_id);
-                let hf_key = holder_file_key(holder_id, old_record.file_id);
-                let mut fh = tx.open_table(FILE_HOLDERS)?;
-                let mut hf = tx.open_table(HOLDER_FILES)?;
-                fh.remove(&fh_key)?;
-                hf.remove(&hf_key)?;
+                if let Some(ref rec) = old_record {
+                    let fh_key = file_holder_key(rec.file_id, holder_id);
+                    let hf_key = holder_file_key(holder_id, rec.file_id);
+                    let mut fh = tx.open_table(FILE_HOLDERS)?;
+                    let mut hf = tx.open_table(HOLDER_FILES)?;
+                    fh.remove(&fh_key)?;
+                    hf.remove(&hf_key)?;
+                }
+            }
+            // Commit DB first — hot cache must only be updated after a successful commit.
+            tx.commit()?;
+        }
 
-                // Update hot cache
-                let mut hot = self.hot.write().expect("hot cache lock poisoned");
-                hot.placements.remove(&(*block_id, *holder_id));
+        // DB is committed; now apply delta to the hot cache.
+        if let Some(old_rec) = old_record {
+            let mut hot = self.hot.write().expect("hot cache lock poisoned");
+            hot.placements.remove(&(*block_id, *holder_id));
 
-                if matches!(
-                    old_record.status,
-                    PlacementStatus::Alive | PlacementStatus::Uncertain
-                ) {
-                    let count = old_record.symbol_count();
-                    if let Some(agg) = hot.blocks.get_mut(block_id) {
-                        agg.total_alive_symbols = agg.total_alive_symbols.saturating_sub(count);
-                        if agg.total_alive_symbols == 0 {
-                            hot.blocks.remove(block_id);
-                        }
-                    }
-                } else {
-                    // If no more placements for this block at all, remove the block entry
-                    let still_has_placements = hot
-                        .placements
-                        .keys()
-                        .any(|(bid, _)| bid == block_id);
-                    if !still_has_placements {
+            if matches!(
+                old_rec.status,
+                PlacementStatus::Alive | PlacementStatus::Uncertain
+            ) {
+                let count = old_rec.symbol_count();
+                if let Some(agg) = hot.blocks.get_mut(block_id) {
+                    agg.total_alive_symbols = agg.total_alive_symbols.saturating_sub(count);
+                    if agg.total_alive_symbols == 0 {
                         hot.blocks.remove(block_id);
                     }
                 }
+            } else {
+                // If no more placements for this block at all, remove the block entry.
+                let still_has_placements = hot.placements.keys().any(|(bid, _)| bid == block_id);
+                if !still_has_placements {
+                    hot.blocks.remove(block_id);
+                }
             }
         }
-        tx.commit()?;
+
         Ok(())
     }
 
@@ -1010,7 +1022,7 @@ impl Db {
             let record: HoldingRecord = from_cbor_bytes(v.value())?;
             if record.status == HoldingStatus::MarkedForDelete {
                 if let Some(requested_at) = record.delete_requested_at {
-                    if requested_at.0 + cooldown <= now.0 {
+                    if requested_at.0.saturating_add(cooldown) <= now.0 {
                         records.push(record);
                     }
                 }
@@ -1032,7 +1044,7 @@ impl Db {
             let (_, v) = item?;
             let record: HoldingRecord = from_cbor_bytes(v.value())?;
             if let Some(sent_at) = record.drop_notice_sent_at {
-                if sent_at.0 + DROP_NOTICE_WINDOW_SECS <= now.0 {
+                if sent_at.0.saturating_add(DROP_NOTICE_WINDOW_SECS) <= now.0 {
                     records.push(record);
                 }
             }
@@ -1308,7 +1320,6 @@ impl Db {
         now: Timestamp,
         time_scale: u64,
     ) -> Result<f64, DbError> {
-        const BYTES_PER_GB: f64 = 1_073_741_824.0;
         const SECS_PER_DAY: f64 = 86_400.0;
 
         let scale = time_scale.max(1) as f64;
@@ -1349,12 +1360,15 @@ impl Db {
         owner_id: &IdentityPub,
         bytes_served: u64,
     ) -> Result<(), DbError> {
-        let current = self.restored_total_bytes(owner_id)?;
-        let new_total = current.saturating_add(bytes_served);
-        let bytes = to_cbor_bytes(&new_total);
         let tx = self.inner.begin_write()?;
         {
             let mut table = tx.open_table(RESTORE_SERVED)?;
+            let current: u64 = match table.get(&owner_id.0)? {
+                Some(v) => from_cbor_bytes(v.value())?,
+                None => 0,
+            };
+            let new_total = current.saturating_add(bytes_served);
+            let bytes = to_cbor_bytes(&new_total);
             table.insert(&owner_id.0, bytes.as_slice())?;
         }
         tx.commit()?;

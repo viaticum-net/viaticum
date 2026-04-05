@@ -41,8 +41,8 @@ use libp2p::PeerId;
 use syncback_core::cluster::DeviceCertificate;
 use syncback_core::config::EscrowCfg;
 use syncback_core::constants::{
-    HANDSHAKE_FRESHNESS_SECS, INITIAL_TRUST_P, P_WINDOW_WEEKS, SYMBOL_OFFER_EXPIRY_SECS,
-    SYMBOL_SIZE,
+    BYTES_PER_GB, HANDSHAKE_FRESHNESS_SECS, INITIAL_TRUST_P, P_WINDOW_WEEKS,
+    SYMBOL_OFFER_EXPIRY_SECS, SYMBOL_SIZE,
 };
 use syncback_core::escrow::{check_restore, RestoreDecision};
 use syncback_core::db::{Db, SystemStateBlobRecord, WeeklyPosEntry};
@@ -465,14 +465,13 @@ impl Processor {
                 let reply = match self.handle_restore_request_inner(from_master, req).await {
                     Ok(resp) => Message::RestoreResponse(resp),
                     Err(ProcessorError::EscrowDenied { denial, .. }) => {
-                        let _ = &denial;
                         Message::RestoreDenied(RestoreDeniedMsg {
                             v: 1,
                             source_block_id: block_id,
                             reason: "escrow check failed".to_string(),
-                            current_trust: 0.0,
-                            needed_trust: 0.0,
-                            restore_budget_gb: 0.0,
+                            current_trust: denial.current_trust,
+                            needed_trust: denial.needed_trust,
+                            restore_budget_gb: denial.restore_budget_gb,
                             timestamp: Timestamp::now(),
                         })
                     }
@@ -939,14 +938,16 @@ impl Processor {
         let record = match self.db.get_holding(&block_id, &owner_id)? {
             Some(mut existing) => {
                 let mut all_esis = ranges_to_esi_list(&existing.esi_ranges);
-                for &esi in &received_esis {
-                    if !all_esis.contains(&esi) {
-                        all_esis.push(esi);
+                let mut new_bytes: u64 = 0;
+                for symbol in &transfer.symbols {
+                    if !all_esis.contains(&symbol.esi) {
+                        new_bytes += symbol.data.len() as u64;
+                        all_esis.push(symbol.esi);
                     }
                 }
                 all_esis.sort_unstable();
                 existing.esi_ranges = esi_list_to_ranges(&all_esis);
-                existing.total_bytes += total_bytes;
+                existing.total_bytes += new_bytes;
                 existing.status = HoldingStatus::Active;
                 // importance: keep existing value (BR-7). New offer may have different
                 // importance, but the holding was already accepted at its original importance.
@@ -1342,6 +1343,18 @@ impl Processor {
     ) -> Result<(), ProcessorError> {
         let block_id = nack.source_block_id;
         self.handle_pos_nack_sync(from_device, &nack)?;
+
+        // Consume the pending challenge so the scheduler does not re-send it.
+        {
+            let mut guard = self.pending_challenges.lock().await;
+            let key = guard
+                .iter()
+                .find(|(_, v)| v.challenge_id == nack.challenge_id)
+                .map(|(k, _)| *k);
+            if let Some(k) = key {
+                guard.remove(&k);
+            }
+        }
 
         // Refresh trust_s: holder no longer stores those symbols for us.
         if let Err(e) = self.db.refresh_peer_storage_bytes(&from_device) {
@@ -1802,7 +1815,6 @@ impl Processor {
         };
 
         // Escrow check: verify owner has earned enough restore budget through storage contribution.
-        const BYTES_PER_GB: f64 = 1_073_741_824.0;
         let k_factor = self.escrow_cfg.k_factor;
         let stored_gb_days = self.db.stored_for_peer_gb_days(&owner_id, Timestamp::now(), self.time_scale)?;
         let already_restored_bytes = self.db.restored_total_bytes(&owner_id)?;
@@ -1965,6 +1977,22 @@ impl Processor {
         }
 
         let now = Timestamp::now();
+        let age = now.0.saturating_sub(msg.timestamp.0);
+        if age > HANDSHAKE_FRESHNESS_SECS {
+            warn!(
+                identity = %msg.identity_pub,
+                age_secs = age,
+                "processor: PeerAnnounce rejected — timestamp too old (possible replay)"
+            );
+            return Ok(());
+        }
+        if msg.timestamp.0 > now.0.saturating_add(HANDSHAKE_FRESHNESS_SECS) {
+            warn!(
+                identity = %msg.identity_pub,
+                "processor: PeerAnnounce rejected — timestamp is in the future"
+            );
+            return Ok(());
+        }
         // PeerRecord is keyed by DeviceId. Look up all known devices for this master identity.
         // If we have device records — update x25519_pub and last_seen.
         // If no devices known yet — record is created later by on_peer_authenticated.

@@ -264,6 +264,11 @@ pub const TRUST_INHERITANCE_FACTOR: f64 = 0.3;
 /// Used in effective_trust formula denominator.
 pub const MAX_COMBINED_TRUST: f64 = KP + KI; // = 2.15
 
+// === Units ===
+
+/// Bytes in one gibibyte (2^30).
+pub const BYTES_PER_GB: f64 = 1_073_741_824.0;
+
 // === Compile-time sanity checks ===
 
 const _: () = assert!(S_CLAMP_MIN < S_CLAMP_MAX);

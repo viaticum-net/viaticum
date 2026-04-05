@@ -94,7 +94,7 @@ impl BackupCoordinator {
         if size_bytes >= self.config.source_block_size {
             // Budget check for single large file.
             let offer_budget_gb = self.compute_offer_budget_gb();
-            let required_gb = size_bytes as f64 / 1_073_741_824.0
+            let required_gb = size_bytes as f64 / syncback_core::constants::BYTES_PER_GB
                 * syncback_core::budget::overhead_factor(importance);
             if required_gb > offer_budget_gb {
                 tracing::warn!(

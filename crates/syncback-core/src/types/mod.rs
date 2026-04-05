@@ -153,7 +153,7 @@ impl ErasureParams {
     pub fn max_per_holder(&self) -> u32 {
         let cap_fraction = (1.0 - 1.0 / self.overhead) * crate::constants::CONCENTRATION_CAP_FACTOR;
         let cap = (cap_fraction * self.n as f64).floor() as u32;
-        cap.min(self.k_eff - 1)
+        cap.min(self.k_eff.saturating_sub(1))
     }
 }
 
