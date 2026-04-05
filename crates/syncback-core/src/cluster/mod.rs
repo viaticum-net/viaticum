@@ -1,5 +1,5 @@
 use crate::types::{sig_serde, DeviceId, IdentityPub, Timestamp};
-use ed25519_dalek::{Signer, Verifier};
+use ed25519_dalek::Signer;
 use hkdf::Hkdf;
 use sha2::Sha256;
 
