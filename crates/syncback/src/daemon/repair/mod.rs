@@ -13,7 +13,6 @@
 
 use std::sync::Arc;
 
-use syncback_core::cluster::esi_namespace_start;
 use syncback_core::constants::DECODE_OVERHEAD;
 use syncback_core::db::{Db, DbError};
 use syncback_core::erasure::{binding_seed, ErasureEncoder};

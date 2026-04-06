@@ -81,6 +81,8 @@ fn repair_config(symbols_dir: &TempDir) -> RepairConfig {
         symbols_dir: symbols_dir.path().to_path_buf(),
         epoch_key: EPOCH_KEY,
         own_identity: IdentityPub([0x99u8; 32]),
+        master_signing_key: None,
+        swarm: None,
     }
 }
 
