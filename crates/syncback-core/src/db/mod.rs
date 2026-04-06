@@ -253,7 +253,7 @@ impl From<redb::TransactionError> for DbError {
 /// Hot cache is write-locked during mutations (same transaction as redb write).
 #[derive(Clone)]
 pub struct Db {
-    pub inner: Arc<redb::Database>,
+    pub(crate) inner: Arc<redb::Database>,
     /// Shared hot cache. Protected by RwLock; write-locked on mutations.
     hot: Arc<RwLock<HotCache>>,
 }
@@ -1513,6 +1513,330 @@ impl Db {
             }
         }
         Ok(result)
+    }
+}
+
+// ============================================================
+// Multi-table atomic write transaction
+// ============================================================
+
+/// Internal: one pending hot-cache update, queued during a DbWriteTxn.
+/// Applied in order after a successful commit.
+enum HotCacheDelta {
+    /// A placement was written. Carries the old alive count (before this txn
+    /// write) and the new alive count (after).
+    PlacementUpserted {
+        block_id: SourceBlockId,
+        holder_id: DeviceId,
+        old_alive: u32,
+        new_alive: u32,
+        new_count: u32,
+        new_status: PlacementStatus,
+        new_last_pos: Option<Timestamp>,
+    },
+    /// A placement was deleted.
+    PlacementDeleted {
+        block_id: SourceBlockId,
+        holder_id: DeviceId,
+        was_alive: bool,
+        old_count: u32,
+    },
+}
+
+/// Handle to an open, uncommitted write transaction.
+///
+/// Call individual write methods to accumulate operations, then call
+/// `commit()` to flush all writes atomically and update the hot cache.
+///
+/// If dropped without calling `commit()`, the transaction is rolled back.
+/// No partial writes reach disk. The hot cache is not updated.
+///
+/// Note: redb supports only one concurrent write transaction. Calling
+/// `db.write_txn()` while another `DbWriteTxn` is open for the same `Db`
+/// will block until the first is committed or dropped.
+///
+/// `DbWriteTxn` is `!Send` because redb's `WriteTransaction` is `!Send`.
+pub struct DbWriteTxn<'db> {
+    txn: redb::WriteTransaction,
+    hot: &'db Arc<RwLock<HotCache>>,
+    /// Accumulated hot-cache deltas to apply after commit, in order.
+    deltas: Vec<HotCacheDelta>,
+}
+
+impl<'db> DbWriteTxn<'db> {
+    /// Insert or replace a SourceBlockRecord. No hot cache entry (blocks agg
+    /// is derived from placements, not source block records).
+    pub fn upsert_source_block(&mut self, record: &SourceBlockRecord) -> Result<(), DbError> {
+        let bytes = to_cbor_bytes(record);
+        {
+            let mut table = self.txn.open_table(SOURCE_BLOCKS)?;
+            table.insert(&record.block_id.0, bytes.as_slice())?;
+        }
+        Ok(())
+    }
+
+    /// Delete a SourceBlockRecord. No hot cache entry.
+    pub fn delete_source_block(&mut self, block_id: &SourceBlockId) -> Result<(), DbError> {
+        {
+            let mut table = self.txn.open_table(SOURCE_BLOCKS)?;
+            table.remove(&block_id.0)?;
+        }
+        Ok(())
+    }
+
+    /// Insert or replace a SymbolPlacement. Queues a hot cache delta.
+    pub fn upsert_placement(&mut self, record: &SymbolPlacement) -> Result<(), DbError> {
+        let bytes = to_cbor_bytes(record);
+        let key = placement_key(&record.source_block_id, &record.holder_id);
+        let fh_key = file_holder_key(record.file_id, &record.holder_id);
+        let hf_key = holder_file_key(&record.holder_id, record.file_id);
+        let count = record.symbol_count();
+
+        let old_alive: u32;
+        let new_alive: u32;
+
+        {
+            let mut placements = self.txn.open_table(SYMBOL_PLACEMENTS)?;
+            // Read old record (within this transaction) to compute the delta correctly.
+            let old: Option<SymbolPlacement> = match placements.get(&key)? {
+                Some(v) => Some(from_cbor_bytes(v.value())?),
+                None => None,
+            };
+            placements.insert(&key, bytes.as_slice())?;
+
+            // Compute delta.
+            old_alive = old
+                .as_ref()
+                .filter(|o| {
+                    matches!(o.status, PlacementStatus::Alive | PlacementStatus::Uncertain)
+                })
+                .map(|o| o.symbol_count())
+                .unwrap_or(0);
+            new_alive =
+                if matches!(record.status, PlacementStatus::Alive | PlacementStatus::Uncertain) {
+                    count
+                } else {
+                    0
+                };
+        }
+        {
+            let mut fh = self.txn.open_table(FILE_HOLDERS)?;
+            fh.insert(&fh_key, count)?;
+        }
+        {
+            let mut hf = self.txn.open_table(HOLDER_FILES)?;
+            hf.insert(&hf_key, count)?;
+        }
+
+        self.deltas.push(HotCacheDelta::PlacementUpserted {
+            block_id: record.source_block_id,
+            holder_id: record.holder_id,
+            old_alive,
+            new_alive,
+            new_count: count,
+            new_status: record.status,
+            new_last_pos: record.last_verified,
+        });
+
+        Ok(())
+    }
+
+    /// Delete a SymbolPlacement. Queues a hot cache delta.
+    /// Returns the deleted placement, or None if it did not exist.
+    pub fn delete_placement(
+        &mut self,
+        block_id: &SourceBlockId,
+        holder_id: &DeviceId,
+    ) -> Result<Option<SymbolPlacement>, DbError> {
+        let key = placement_key(block_id, holder_id);
+
+        let old_record: Option<SymbolPlacement>;
+        {
+            let mut placements = self.txn.open_table(SYMBOL_PLACEMENTS)?;
+            old_record = match placements.get(&key)? {
+                Some(v) => Some(from_cbor_bytes(v.value())?),
+                None => None,
+            };
+            placements.remove(&key)?;
+        }
+
+        if let Some(ref rec) = old_record {
+            let fh_key = file_holder_key(rec.file_id, holder_id);
+            let hf_key = holder_file_key(holder_id, rec.file_id);
+            {
+                let mut fh = self.txn.open_table(FILE_HOLDERS)?;
+                fh.remove(&fh_key)?;
+            }
+            {
+                let mut hf = self.txn.open_table(HOLDER_FILES)?;
+                hf.remove(&hf_key)?;
+            }
+
+            let was_alive = matches!(
+                rec.status,
+                PlacementStatus::Alive | PlacementStatus::Uncertain
+            );
+            self.deltas.push(HotCacheDelta::PlacementDeleted {
+                block_id: *block_id,
+                holder_id: *holder_id,
+                was_alive,
+                old_count: rec.symbol_count(),
+            });
+        }
+
+        Ok(old_record)
+    }
+
+    /// Append an EventEntry. Assigns the next sequence number within the
+    /// transaction (visible to subsequent reads within the same transaction).
+    /// Returns the assigned sequence number.
+    pub fn append_event(&mut self, entry: &EventEntry) -> Result<u64, DbError> {
+        let bytes = to_cbor_bytes(entry);
+        let seq = {
+            // Read last seq from within the same transaction so multiple calls
+            // within one DbWriteTxn assign contiguous sequence numbers.
+            let table = self.txn.open_table(EVENT_LOG)?;
+            let last_seq = match table.last()? {
+                Some((k, _)) => k.value(),
+                None => 0,
+            };
+            drop(table);
+            let next_seq = last_seq + 1;
+            let mut table = self.txn.open_table(EVENT_LOG)?;
+            table.insert(next_seq, bytes.as_slice())?;
+            next_seq
+        };
+        Ok(seq)
+    }
+
+    /// Insert or replace a FileRecord.
+    pub fn upsert_file(&mut self, record: &FileRecord) -> Result<(), DbError> {
+        let bytes = to_cbor_bytes(record);
+        {
+            let mut files = self.txn.open_table(FILES)?;
+            files.insert(record.path.as_str(), bytes.as_slice())?;
+        }
+        Ok(())
+    }
+
+    /// Delete a FileRecord by path.
+    pub fn delete_file(&mut self, path: &str) -> Result<(), DbError> {
+        {
+            let mut files = self.txn.open_table(FILES)?;
+            files.remove(path)?;
+        }
+        Ok(())
+    }
+
+    /// Insert or replace a HoldingRecord.
+    pub fn upsert_holding(&mut self, record: &HoldingRecord) -> Result<(), DbError> {
+        let bytes = to_cbor_bytes(record);
+        let key = holding_key(&record.source_block_id, &record.owner_id);
+        {
+            let mut holdings = self.txn.open_table(HOLDINGS)?;
+            holdings.insert(&key, bytes.as_slice())?;
+        }
+        Ok(())
+    }
+
+    /// Delete a HoldingRecord.
+    pub fn delete_holding(
+        &mut self,
+        block_id: &SourceBlockId,
+        owner_id: &IdentityPub,
+    ) -> Result<(), DbError> {
+        let key = holding_key(block_id, owner_id);
+        {
+            let mut holdings = self.txn.open_table(HOLDINGS)?;
+            holdings.remove(&key)?;
+        }
+        Ok(())
+    }
+
+    /// Commit all writes atomically. Updates hot cache after successful commit.
+    /// Consumes self: the guard is unusable after this call.
+    pub fn commit(self) -> Result<(), DbError> {
+        // Commit to redb first. On failure, hot cache is NOT updated.
+        self.txn.commit()?;
+
+        // redb commit succeeded — now apply accumulated deltas to the hot cache.
+        let mut hot = self.hot.write().expect("hot cache lock poisoned");
+        for delta in self.deltas {
+            match delta {
+                HotCacheDelta::PlacementUpserted {
+                    block_id,
+                    holder_id,
+                    old_alive,
+                    new_alive,
+                    new_count,
+                    new_status,
+                    new_last_pos,
+                } => {
+                    // Update block aggregate.
+                    let block_agg = hot.blocks.entry(block_id).or_insert(BlockAgg {
+                        k: 0,
+                        total_alive_symbols: 0,
+                    });
+                    block_agg.total_alive_symbols =
+                        block_agg.total_alive_symbols.saturating_sub(old_alive) + new_alive;
+
+                    // Update per-(block, holder) aggregate.
+                    hot.placements.insert(
+                        (block_id, holder_id),
+                        PlacementAgg {
+                            symbol_count: new_count,
+                            status: new_status,
+                            last_pos: new_last_pos,
+                        },
+                    );
+                }
+                HotCacheDelta::PlacementDeleted {
+                    block_id,
+                    holder_id,
+                    was_alive,
+                    old_count,
+                } => {
+                    hot.placements.remove(&(block_id, holder_id));
+
+                    if was_alive {
+                        if let Some(agg) = hot.blocks.get_mut(&block_id) {
+                            agg.total_alive_symbols =
+                                agg.total_alive_symbols.saturating_sub(old_count);
+                            if agg.total_alive_symbols == 0 {
+                                hot.blocks.remove(&block_id);
+                            }
+                        }
+                    } else {
+                        // Placement wasn't alive; check if any placements remain.
+                        let still_has_placements =
+                            hot.placements.keys().any(|(bid, _)| *bid == block_id);
+                        if !still_has_placements {
+                            hot.blocks.remove(&block_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Db {
+    /// Open a multi-table write transaction. All writes on the returned guard
+    /// are part of a single redb `WriteTransaction`. Call `guard.commit()` to
+    /// flush atomically and update the hot cache.
+    ///
+    /// Note: redb supports only one concurrent write transaction per database.
+    /// Calling `write_txn()` while another `DbWriteTxn` is open will block
+    /// until the first is committed or dropped.
+    pub fn write_txn(&self) -> Result<DbWriteTxn<'_>, DbError> {
+        let txn = self.inner.begin_write()?;
+        Ok(DbWriteTxn {
+            txn,
+            hot: &self.hot,
+            deltas: Vec::new(),
+        })
     }
 }
 

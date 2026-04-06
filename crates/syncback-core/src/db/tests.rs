@@ -1642,3 +1642,262 @@ fn delete_placement_cleans_indexes() {
         "HOLDER_FILES index must be cleaned after delete"
     );
 }
+
+// ============================================================
+// DbWriteTxn tests
+// ============================================================
+
+// Test 1: all writes within a single write_txn commit atomically.
+#[test]
+fn write_txn_commits_all_writes_atomically() {
+    let db = test_db();
+    let bob = DeviceId([0xE1u8; 32]);
+    let block_a = make_source_block(0xE1, SourceBlockStatus::Active);
+    let placement_a_bob = make_placement(0xE1, bob, FileId(0xE1), PlacementStatus::Alive, 5);
+    let event_1 = make_event(1);
+
+    let mut txn = db.write_txn().unwrap();
+    txn.upsert_source_block(&block_a).unwrap();
+    txn.upsert_placement(&placement_a_bob).unwrap();
+    txn.append_event(&event_1).unwrap();
+    txn.commit().unwrap();
+
+    assert!(
+        db.get_source_block(&block_id(0xE1)).unwrap().is_some(),
+        "source block must be visible after commit"
+    );
+    let placements = db.list_placements_for_block(&block_id(0xE1)).unwrap();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].holder_id, bob);
+
+    let events = db.events_after(0, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, 1);
+}
+
+// Test 2: dropping without commit leaves DB unchanged.
+#[test]
+fn write_txn_rollback_on_drop_leaves_db_empty() {
+    let db = test_db();
+    let block_a = make_source_block(0xE2, SourceBlockStatus::Active);
+
+    {
+        let mut txn = db.write_txn().unwrap();
+        txn.upsert_source_block(&block_a).unwrap();
+        // Drop txn here without calling commit — redb rolls back automatically.
+    }
+
+    assert!(
+        db.get_source_block(&block_id(0xE2)).unwrap().is_none(),
+        "source block must NOT be visible after implicit rollback"
+    );
+}
+
+// Test 3: hot cache is NOT updated until commit() is called.
+#[test]
+fn write_txn_hot_cache_not_updated_before_commit() {
+    let db = test_db();
+    let bob = DeviceId([0xE3u8; 32]);
+    let fid = FileId(0xE3);
+
+    // Set up: existing Alive placement (5 symbols) already committed.
+    let initial = make_placement(0xE3, bob, fid, PlacementStatus::Alive, 5);
+    db.upsert_placement(&initial).unwrap();
+    assert_eq!(
+        db.hot().blocks.get(&block_id(0xE3)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        5,
+        "initial hot cache: 5 alive"
+    );
+
+    let mut txn = db.write_txn().unwrap();
+    // Change status to Lost (0 alive symbols) inside transaction.
+    let lost = make_placement(0xE3, bob, fid, PlacementStatus::Lost, 5);
+    txn.upsert_placement(&lost).unwrap();
+
+    // Before commit: hot cache still shows Alive.
+    assert_eq!(
+        db.hot().placements.get(&(block_id(0xE3), bob)).map(|a| a.status),
+        Some(PlacementStatus::Alive),
+        "hot cache must NOT be updated before commit"
+    );
+
+    txn.commit().unwrap();
+
+    // After commit: hot cache reflects Lost status (0 alive symbols).
+    assert_eq!(
+        db.hot().placements.get(&(block_id(0xE3), bob)).map(|a| a.status),
+        Some(PlacementStatus::Lost),
+        "hot cache must be updated after commit"
+    );
+    assert_eq!(
+        db.hot().blocks.get(&block_id(0xE3)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        0,
+        "alive symbols must drop to 0 after committing Lost placement"
+    );
+}
+
+// Test 4: multiple placements in one txn, hot cache totals correct.
+#[test]
+fn write_txn_hot_cache_updated_correctly_for_multiple_placements() {
+    let db = test_db();
+    let bob = DeviceId([0xE4u8; 32]);
+    let carol = DeviceId([0xE5u8; 32]);
+    let dave = DeviceId([0xE6u8; 32]);
+    let fid = FileId(0xE4);
+
+    // First txn: insert three Alive placements (5 alive symbols each).
+    {
+        let mut txn = db.write_txn().unwrap();
+        txn.upsert_placement(&make_placement(0xE4, bob, fid, PlacementStatus::Alive, 5)).unwrap();
+        txn.upsert_placement(&make_placement(0xE4, carol, fid, PlacementStatus::Alive, 5)).unwrap();
+        txn.upsert_placement(&make_placement(0xE4, dave, fid, PlacementStatus::Alive, 5)).unwrap();
+        txn.commit().unwrap();
+    }
+    assert_eq!(
+        db.hot().blocks.get(&block_id(0xE4)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        15,
+        "three placements of 5 each = 15 alive symbols"
+    );
+
+    // Second txn: mark bob's placement Lost.
+    {
+        let mut txn = db.write_txn().unwrap();
+        txn.upsert_placement(&make_placement(0xE4, bob, fid, PlacementStatus::Lost, 5)).unwrap();
+        txn.commit().unwrap();
+    }
+    assert_eq!(
+        db.hot().blocks.get(&block_id(0xE4)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        10,
+        "after bob goes Lost, alive symbols = 10"
+    );
+}
+
+// Test 5: append_event inside a txn assigns contiguous sequence numbers.
+#[test]
+fn write_txn_event_sequence_numbers_are_contiguous() {
+    let db = test_db();
+
+    // Pre-seed 3 events so the last seq is 3.
+    for i in 1..=3u8 {
+        db.append_event(&make_event(i)).unwrap();
+    }
+    assert_eq!(db.last_event_seq().unwrap(), 3);
+
+    let mut txn = db.write_txn().unwrap();
+    let s4 = txn.append_event(&make_event(4)).unwrap();
+    let s5 = txn.append_event(&make_event(5)).unwrap();
+    let s6 = txn.append_event(&make_event(6)).unwrap();
+    txn.commit().unwrap();
+
+    assert_eq!((s4, s5, s6), (4, 5, 6), "sequence numbers must be contiguous");
+    assert_eq!(db.last_event_seq().unwrap(), 6);
+    let after_3 = db.events_after(3, 10).unwrap();
+    assert_eq!(after_3.len(), 3, "must have exactly 3 events after seq 3");
+}
+
+// Test 6: single-operation methods and write_txn interleave correctly.
+#[test]
+fn write_txn_and_single_operation_methods_interleave_correctly() {
+    let db = test_db();
+    let bob = DeviceId([0xE7u8; 32]);
+    let carol = DeviceId([0xE8u8; 32]);
+    let dave = DeviceId([0xE9u8; 32]);
+    let fid = FileId(0xE7);
+
+    // Step 1: single-operation write.
+    db.upsert_source_block(&make_source_block(0xE7, SourceBlockStatus::Active)).unwrap();
+
+    // Step 2: multi-operation txn.
+    {
+        let mut txn = db.write_txn().unwrap();
+        txn.upsert_placement(&make_placement(0xE7, bob, fid, PlacementStatus::Alive, 5)).unwrap();
+        txn.upsert_placement(&make_placement(0xE7, carol, fid, PlacementStatus::Alive, 5)).unwrap();
+        txn.commit().unwrap();
+    }
+
+    // Step 3: another single-operation write.
+    db.upsert_placement(&make_placement(0xE7, dave, fid, PlacementStatus::Alive, 5)).unwrap();
+
+    // Verify all writes are visible.
+    assert!(db.get_source_block(&block_id(0xE7)).unwrap().is_some());
+    let placements = db.list_placements_for_block(&block_id(0xE7)).unwrap();
+    assert_eq!(placements.len(), 3);
+    assert_eq!(
+        db.hot().blocks.get(&block_id(0xE7)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        15,
+        "three placements of 5 each = 15 alive symbols"
+    );
+}
+
+// Test 7: rollback leaves hot cache unchanged.
+#[test]
+fn write_txn_rollback_leaves_hot_cache_unchanged() {
+    let db = test_db();
+    let bob = DeviceId([0xEAu8; 32]);
+    let fid = FileId(0xEA);
+
+    // Set up: Alive placement with 5 symbols.
+    db.upsert_placement(&make_placement(0xEA, bob, fid, PlacementStatus::Alive, 5)).unwrap();
+    assert_eq!(
+        db.hot().blocks.get(&block_id(0xEA)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        5
+    );
+
+    // Open txn, queue a delta, then drop without commit.
+    {
+        let mut txn = db.write_txn().unwrap();
+        txn.upsert_placement(&make_placement(0xEA, bob, fid, PlacementStatus::Lost, 5)).unwrap();
+        // Drop without commit — redb rolls back, hot cache must NOT be touched.
+    }
+
+    // Hot cache unchanged: still 5 alive, still Alive status.
+    assert_eq!(
+        db.hot().blocks.get(&block_id(0xEA)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        5,
+        "hot cache alive count must be unchanged after rollback"
+    );
+    assert_eq!(
+        db.hot().placements.get(&(block_id(0xEA), bob)).map(|a| a.status),
+        Some(PlacementStatus::Alive),
+        "hot cache placement status must be unchanged after rollback"
+    );
+    // DB record also unchanged.
+    let rec = db.get_placement(&block_id(0xEA), &bob).unwrap().unwrap();
+    assert_eq!(rec.status, PlacementStatus::Alive, "DB record must be unchanged after rollback");
+}
+
+// Test 8: delete_placement inside a txn queues correct delta and cleans indexes.
+#[test]
+fn write_txn_delete_placement_queues_correct_delta() {
+    let db = test_db();
+    let bob = DeviceId([0xEBu8; 32]);
+    let fid = FileId(0xEB);
+
+    // Set up: Alive placement with 5 symbols.
+    db.upsert_placement(&make_placement(0xEB, bob, fid, PlacementStatus::Alive, 5)).unwrap();
+    assert_eq!(
+        db.hot().blocks.get(&block_id(0xEB)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        5
+    );
+
+    // Delete inside txn, then commit.
+    let mut txn = db.write_txn().unwrap();
+    let deleted = txn.delete_placement(&block_id(0xEB), &bob).unwrap();
+    assert!(deleted.is_some(), "delete_placement must return the old record");
+    txn.commit().unwrap();
+
+    // Hot cache: placement entry gone, block entry gone (no more alive symbols).
+    assert!(
+        db.hot().placements.get(&(block_id(0xEB), bob)).is_none(),
+        "placement must be removed from hot cache after txn delete"
+    );
+    assert!(
+        db.hot().blocks.get(&block_id(0xEB)).is_none(),
+        "block entry must be removed from hot cache when all placements deleted"
+    );
+
+    // DB: placement gone, indexes cleaned.
+    assert!(db.list_placements_for_block(&block_id(0xEB)).unwrap().is_empty());
+    assert!(db.list_holders_for_file(fid).unwrap().is_empty());
+    assert!(db.list_files_for_holder(&bob).unwrap().is_empty());
+}

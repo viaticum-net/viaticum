@@ -239,11 +239,14 @@ pub fn run_pipeline(
         n: Some(params.n),
         overhead: Some(params.overhead),
     };
-    db.upsert_source_block(&block_record)?;
-
-    // 8. DB: upsert SymbolPlacement per holder
+    // 8 & 9. DB: atomically write source block + all placements + all events.
+    // Using a single write transaction ensures that on crash before commit,
+    // neither the source block nor any placement is visible — no orphaned state.
     let primary_file_id = files[0].0.file_id;
     let now = Timestamp::now();
+
+    let mut txn = db.write_txn()?;
+    txn.upsert_source_block(&block_record)?;
 
     for alloc in &allocations_result {
         let seed = binding_seed(&block_id, &alloc.device_id);
@@ -258,10 +261,9 @@ pub fn run_pipeline(
             placed_at: now,
             consecutive_misses: 0,
         };
-        db.upsert_placement(&placement)?;
+        txn.upsert_placement(&placement)?;
     }
 
-    // 9. Append EventLog for each placement
     for alloc in &allocations_result {
         let entry = EventEntry {
             timestamp: now,
@@ -272,8 +274,10 @@ pub fn run_pipeline(
                 esi_range: alloc.esi_range(),
             },
         };
-        db.append_event(&entry)?;
+        txn.append_event(&entry)?;
     }
+
+    txn.commit()?;
 
     let n = params.n;
     tracing::info!(

@@ -485,20 +485,38 @@ impl Scheduler {
                         }).await;
                     }
 
-                    // Mark placement status Deleting.
-                    if let Ok(Some(mut p)) = self.db.get_placement(&source_block_id, &holder_id) {
-                        p.status = PlacementStatus::Deleting;
-                        if let Err(e) = self.db.upsert_placement(&p) {
-                            error!(block_id = %source_block_id, holder_id = %holder_id, "deletion: failed to update placement: {e}");
-                        }
-                    }
+                    // Mark placement + source block Deleting atomically.
+                    let placement = self.db.get_placement(&source_block_id, &holder_id).ok().flatten();
+                    let source_block = self.db.get_source_block(&source_block_id).ok().flatten();
 
-                    // Mark source block status Deleting (if still Active).
-                    if let Ok(Some(mut sb)) = self.db.get_source_block(&source_block_id) {
-                        if sb.status == SourceBlockStatus::Active || sb.status == SourceBlockStatus::Stale {
-                            sb.status = SourceBlockStatus::Deleting;
-                            if let Err(e) = self.db.upsert_source_block(&sb) {
-                                error!(block_id = %source_block_id, "deletion: failed to update source block: {e}");
+                    if placement.is_some() || source_block.is_some() {
+                        match self.db.write_txn() {
+                            Err(e) => error!(block_id = %source_block_id, "deletion: failed to open write txn: {e}"),
+                            Ok(mut txn) => {
+                                let mut txn_ok = true;
+                                if let Some(mut p) = placement {
+                                    p.status = PlacementStatus::Deleting;
+                                    if let Err(e) = txn.upsert_placement(&p) {
+                                        error!(block_id = %source_block_id, holder_id = %holder_id, "deletion: failed to update placement: {e}");
+                                        txn_ok = false;
+                                    }
+                                }
+                                if txn_ok {
+                                    if let Some(mut sb) = source_block {
+                                        if sb.status == SourceBlockStatus::Active || sb.status == SourceBlockStatus::Stale {
+                                            sb.status = SourceBlockStatus::Deleting;
+                                            if let Err(e) = txn.upsert_source_block(&sb) {
+                                                error!(block_id = %source_block_id, "deletion: failed to update source block: {e}");
+                                                txn_ok = false;
+                                            }
+                                        }
+                                    }
+                                }
+                                if txn_ok {
+                                    if let Err(e) = txn.commit() {
+                                        error!(block_id = %source_block_id, "deletion: failed to commit txn: {e}");
+                                    }
+                                }
                             }
                         }
                     }
@@ -520,14 +538,33 @@ impl Scheduler {
                     );
                 }
                 DeletionAction::CleanupBlock { source_block_id, file_id } => {
-                    if let Err(e) = self.db.delete_source_block(&source_block_id) {
-                        error!(block_id = %source_block_id, "deletion: failed to delete source block: {e}");
-                    }
-                    // Prune the file version that references this block.
-                    if let Ok(Some(mut file)) = self.db.get_file_by_id(file_id) {
+                    // Read the file record before opening the transaction (read-then-write pattern).
+                    let file_opt = self.db.get_file_by_id(file_id).ok().flatten().map(|mut file| {
                         file.versions.retain(|v| v.source_block_id != source_block_id);
-                        if let Err(e) = self.db.upsert_file(&file) {
-                            error!(file_id = %file_id, "deletion: failed to update file after block cleanup: {e}");
+                        file
+                    });
+                    // Delete source block + update file record atomically.
+                    match self.db.write_txn() {
+                        Err(e) => error!(block_id = %source_block_id, "deletion: failed to open write txn: {e}"),
+                        Ok(mut txn) => {
+                            let mut txn_ok = true;
+                            if let Err(e) = txn.delete_source_block(&source_block_id) {
+                                error!(block_id = %source_block_id, "deletion: failed to delete source block: {e}");
+                                txn_ok = false;
+                            }
+                            if txn_ok {
+                                if let Some(file) = file_opt {
+                                    if let Err(e) = txn.upsert_file(&file) {
+                                        error!(file_id = %file_id, "deletion: failed to update file after block cleanup: {e}");
+                                        txn_ok = false;
+                                    }
+                                }
+                            }
+                            if txn_ok {
+                                if let Err(e) = txn.commit() {
+                                    error!(block_id = %source_block_id, "deletion: failed to commit cleanup txn: {e}");
+                                }
+                            }
                         }
                     }
                     info!(
