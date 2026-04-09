@@ -137,7 +137,13 @@ pub fn run_pipeline(
         let sum: f64 = files.iter().map(|(qf, _)| qf.importance).sum();
         sum / files.len() as f64
     };
-    let params = ErasureParams::compute(stored.len() as u64, avg_importance);
+    // Guard: compress_and_encrypt always produces at least 12 bytes (nonce) + auth
+    // tag, so stored.len() > 0 in practice. The check is explicit for correctness.
+    if stored.is_empty() {
+        anyhow::bail!("compressed+encrypted block is empty — cannot compute erasure params");
+    }
+    let params = ErasureParams::compute(stored.len() as u64, avg_importance)
+        .map_err(|e| anyhow::anyhow!("ErasureParams::compute failed: {e}"))?;
 
     // 5. Placement allocation
     // Compute ESI offset from cluster state so each device gets a non-overlapping

@@ -41,6 +41,10 @@ fn relay_channel() -> (mpsc::Sender<RelayPost>, mpsc::Receiver<RelayPost>) {
 
 // ─── test 1: cleanup_expired_deletes_files_and_posts_symbol_dropped ─────────
 
+fn test_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32])
+}
+
 #[tokio::test]
 async fn cleanup_expired_deletes_files_and_posts_symbol_dropped() {
     let db = Db::open_in_memory().unwrap();
@@ -64,7 +68,7 @@ async fn cleanup_expired_deletes_files_and_posts_symbol_dropped() {
     // cleanup_expired calls Timestamp::now() internally, so we rely on the
     // real wall-clock being >> HOLDER_DELETE_COOLDOWN_SECS (which is 4 weeks
     // in seconds, ~2.4 million). Any Unix timestamp past 2024 qualifies.
-    super::cleanup_expired(&db, &holdings_dir.path().to_path_buf(), &relay_post_tx, 1)
+    super::cleanup_expired(&db, &holdings_dir.path().to_path_buf(), &relay_post_tx, 1, &test_key())
         .await
         .unwrap();
 
@@ -111,7 +115,7 @@ async fn cleanup_expired_tolerates_missing_files() {
     // Intentionally do NOT create any files on disk.
 
     // Should not error even though no files exist.
-    super::cleanup_expired(&db, &holdings_dir.path().to_path_buf(), &relay_post_tx, 1)
+    super::cleanup_expired(&db, &holdings_dir.path().to_path_buf(), &relay_post_tx, 1, &test_key())
         .await
         .unwrap();
 
@@ -163,6 +167,7 @@ async fn check_pressure_normal_does_nothing() {
         0,
         &holdings_dir.path().to_path_buf(),
         0,
+        &test_key(),
     )
     .await
     .unwrap();

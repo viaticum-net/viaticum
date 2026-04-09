@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use syncback_core::db::Db;
-use syncback_core::messages::SymbolDroppedMsg;
 use syncback_core::types::{hex_encode, HoldingRecord, HoldingStatus, IdentityPub, Timestamp};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -37,6 +36,7 @@ pub async fn run(
     my_identity: IdentityPub,
     scan_interval_secs: u64,
     time_scale: u64,
+    master_signing_key: ed25519_dalek::SigningKey,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let interval_secs = (scan_interval_secs / time_scale.max(1)).max(1);
@@ -56,7 +56,7 @@ pub async fn run(
                 break;
             }
             _ = timer.tick() => {
-                match scan_holdings(&db, &holdings_dir, &relay_post_tx).await {
+                match scan_holdings(&db, &holdings_dir, &relay_post_tx, &master_signing_key).await {
                     Ok(missing) if missing > 0 => {
                         warn!(missing, "holdings_integrity: found missing holdings");
                     }
@@ -80,6 +80,7 @@ async fn scan_holdings(
     db: &Db,
     holdings_dir: &Path,
     relay_post_tx: &mpsc::Sender<RelayPost>,
+    master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<usize> {
     if !holdings_dir.exists() {
         error!(
@@ -106,7 +107,7 @@ async fn scan_holdings(
                 owner = %holding.owner_id,
                 "holdings_integrity: symbol directory missing on disk"
             );
-            if let Err(e) = report_missing_holding(db, holding, relay_post_tx).await {
+            if let Err(e) = report_missing_holding(db, holding, relay_post_tx, master_signing_key).await {
                 warn!(
                     block_id = %holding.source_block_id,
                     owner = %holding.owner_id,
@@ -133,6 +134,7 @@ async fn report_missing_holding(
     db: &Db,
     holding: &HoldingRecord,
     relay_post_tx: &mpsc::Sender<RelayPost>,
+    master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
     db.delete_holding(&holding.source_block_id, &holding.owner_id)?;
 
@@ -148,12 +150,12 @@ async fn report_missing_holding(
         }
     }
 
-    let msg = SymbolDroppedMsg {
-        v: 1,
-        source_block_id: holding.source_block_id,
-        esi_ranges: holding.esi_ranges.clone(),
-        timestamp: Timestamp::now(),
-    };
+    let msg = syncback_core::messages::build_symbol_dropped(
+        holding.source_block_id,
+        holding.esi_ranges.clone(),
+        Timestamp::now(),
+        master_signing_key,
+    );
     if let Ok(payload) = syncback_core::messages::to_cbor(&msg) {
         let mut msg_id = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut msg_id);

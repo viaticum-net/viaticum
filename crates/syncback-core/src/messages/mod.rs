@@ -82,6 +82,9 @@ pub struct PosResponseMsg {
 ///   - The holder's HoldingRecord for this block has status != Active.
 ///
 /// The owner treats this as VerifyOutcome::NotHeld → PlacementStatus::Lost → repair.
+///
+/// sig covers: b"pn" || challenge_id || source_block_id || esi_be || timestamp_be
+/// Signed by the holder's master identity key.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PosNackMsg {
     pub v: u8,
@@ -94,6 +97,11 @@ pub struct PosNackMsg {
     /// Which device is responding. Added in per-device refactor.
     #[serde(default)]
     pub device_id: Option<DeviceId>,
+    /// Ed25519 signature by the holder's master identity key. 64 bytes.
+    /// Covers: b"pn" || challenge_id || source_block_id || esi_be || timestamp_be.
+    #[serde(with = "sig_serde")]
+    #[serde(default = "default_sig")]
+    pub sig: [u8; 64],
 }
 
 /// Owner → Holder. Offer to store symbols for a source block.
@@ -193,12 +201,20 @@ pub struct StorageWarningMsg {
 }
 
 /// Holder → Owner. Holder evicted symbols (disk pressure).
+///
+/// sig covers: b"sd" || source_block_id || esi_ranges_cbor || timestamp_be
+/// Signed by the holder's master identity key.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SymbolDroppedMsg {
     pub v: u8,
     pub source_block_id: SourceBlockId,
     pub esi_ranges: Vec<(u32, u32)>,
     pub timestamp: Timestamp,
+    /// Ed25519 signature by the holder's master identity key. 64 bytes.
+    /// Covers: b"sd" || source_block_id || esi_ranges_cbor || timestamp_be.
+    #[serde(with = "sig_serde")]
+    #[serde(default = "default_sig")]
+    pub sig: [u8; 64],
 }
 
 /// Holder → Owner. Advance notice: will drop these symbols by deadline.
@@ -448,6 +464,15 @@ pub enum MessageError {
 
     #[error("relay hop limit exceeded: hop={hop}")]
     HopLimitExceeded { hop: u8 },
+}
+
+// ============================================================
+// Serde helpers
+// ============================================================
+
+/// Default value for optional sig fields (all-zero signature, used for backward compat).
+fn default_sig() -> [u8; 64] {
+    [0u8; 64]
 }
 
 // ============================================================
@@ -993,6 +1018,121 @@ pub fn relay_copy(entry: &BoardEntry) -> BoardEntry {
         hop: entry.hop + 1,
         ..entry.clone()
     }
+}
+
+// ============================================================
+// PosNack signature
+// ============================================================
+
+/// Compute the signing input for PosNackMsg.
+///
+/// Input: b"pn" (2) || challenge_id (16) || source_block_id (32) || esi_be (4) || timestamp_be (8)
+fn pos_nack_sig_input(
+    challenge_id: &[u8; 16],
+    source_block_id: &SourceBlockId,
+    esi: u32,
+    timestamp: &Timestamp,
+) -> Vec<u8> {
+    let mut input = Vec::with_capacity(2 + 16 + 32 + 4 + 8);
+    input.extend_from_slice(b"pn");
+    input.extend_from_slice(challenge_id);
+    input.extend_from_slice(&source_block_id.0);
+    input.extend_from_slice(&esi.to_be_bytes());
+    input.extend_from_slice(&timestamp.0.to_be_bytes());
+    input
+}
+
+/// Build a signed PosNackMsg.
+///
+/// `signing_key` must be the holder's master identity key.
+pub fn build_pos_nack(
+    challenge_id: [u8; 16],
+    source_block_id: SourceBlockId,
+    esi: u32,
+    timestamp: Timestamp,
+    device_id: Option<DeviceId>,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> PosNackMsg {
+    let sig_input = pos_nack_sig_input(&challenge_id, &source_block_id, esi, &timestamp);
+    let sig = signing_key.sign(&sig_input).to_bytes();
+    PosNackMsg {
+        v: PROTOCOL_VERSION,
+        challenge_id,
+        source_block_id,
+        esi,
+        timestamp,
+        device_id,
+        sig,
+    }
+}
+
+/// Verify a PosNackMsg signature against the claimed holder identity.
+///
+/// `holder` is the IdentityPub of the peer who sent this message.
+pub fn verify_pos_nack(msg: &PosNackMsg, holder: &IdentityPub) -> Result<(), MessageError> {
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&holder.0)
+        .map_err(|_| MessageError::BadSignature)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&msg.sig);
+    let input = pos_nack_sig_input(&msg.challenge_id, &msg.source_block_id, msg.esi, &msg.timestamp);
+    vk.verify_strict(&input, &sig)
+        .map_err(|_| MessageError::BadSignature)?;
+    Ok(())
+}
+
+// ============================================================
+// SymbolDropped signature
+// ============================================================
+
+/// Compute the signing input for SymbolDroppedMsg.
+///
+/// Input: b"sd" (2) || source_block_id (32) || esi_ranges_cbor (N) || timestamp_be (8)
+fn symbol_dropped_sig_input(
+    source_block_id: &SourceBlockId,
+    esi_ranges: &[(u32, u32)],
+    timestamp: &Timestamp,
+) -> Vec<u8> {
+    let mut esi_cbor = Vec::new();
+    ciborium::ser::into_writer(esi_ranges, &mut esi_cbor)
+        .expect("CBOR encode of (u32,u32) slice is infallible");
+    let mut input = Vec::with_capacity(2 + 32 + esi_cbor.len() + 8);
+    input.extend_from_slice(b"sd");
+    input.extend_from_slice(&source_block_id.0);
+    input.extend_from_slice(&esi_cbor);
+    input.extend_from_slice(&timestamp.0.to_be_bytes());
+    input
+}
+
+/// Build a signed SymbolDroppedMsg.
+///
+/// `signing_key` must be the holder's master identity key.
+pub fn build_symbol_dropped(
+    source_block_id: SourceBlockId,
+    esi_ranges: Vec<(u32, u32)>,
+    timestamp: Timestamp,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> SymbolDroppedMsg {
+    let sig_input = symbol_dropped_sig_input(&source_block_id, &esi_ranges, &timestamp);
+    let sig = signing_key.sign(&sig_input).to_bytes();
+    SymbolDroppedMsg {
+        v: PROTOCOL_VERSION,
+        source_block_id,
+        esi_ranges,
+        timestamp,
+        sig,
+    }
+}
+
+/// Verify a SymbolDroppedMsg signature against the claimed holder identity.
+///
+/// `holder` is the IdentityPub of the peer who sent this message.
+pub fn verify_symbol_dropped(msg: &SymbolDroppedMsg, holder: &IdentityPub) -> Result<(), MessageError> {
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&holder.0)
+        .map_err(|_| MessageError::BadSignature)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&msg.sig);
+    let input = symbol_dropped_sig_input(&msg.source_block_id, &msg.esi_ranges, &msg.timestamp);
+    vk.verify_strict(&input, &sig)
+        .map_err(|_| MessageError::BadSignature)?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -16,12 +16,12 @@ fn candidate(byte: u8, trust: f64) -> HolderCandidate {
 
 fn params(importance: f64) -> ErasureParams {
     // 1 MB block: K = ceil(1MB / 65535) = 16, K_eff = 19, N ~ 29..57 range.
-    ErasureParams::compute(1024 * 1024, importance)
+    ErasureParams::compute(1024 * 1024, importance).unwrap()
 }
 
 fn params_large(importance: f64) -> ErasureParams {
     // 8 MB block: K = ceil(8MB / 65535) = 123, K_eff = 126, N ~ 189..378 range.
-    ErasureParams::compute(8 * 1024 * 1024, importance)
+    ErasureParams::compute(8 * 1024 * 1024, importance).unwrap()
 }
 
 // ─── holder_weight tests ─────────────────────────────────────────────────────
@@ -107,7 +107,7 @@ fn compute_allocation_n_too_small_returns_error() {
 #[test]
 fn compute_allocation_many_candidates_truncated_by_max_holders() {
     // 50 candidates but MAX_HOLDERS_PER_BLOCK = 30 → top-30 by weight kept
-    let p = ErasureParams::compute(128 * 1024 * 1024, 0.5);
+    let p = ErasureParams::compute(128 * 1024 * 1024, 0.5).unwrap();
     let candidates: Vec<_> = (0..50)
         .map(|i| candidate(i + 1, 0.3 + (i as f64) * 0.012))
         .collect();
@@ -246,7 +246,7 @@ fn compute_allocation_sorted_descending_by_symbol_count() {
 
 #[test]
 fn compute_allocation_fifteen_holders_realistic_params() {
-    let p = ErasureParams::compute(128 * 1024 * 1024, 0.6);
+    let p = ErasureParams::compute(128 * 1024 * 1024, 0.6).unwrap();
     let candidates: Vec<_> = (1..=15)
         .map(|b| {
             let trust = 0.2 + (b as f64 - 1.0) * 0.05;
@@ -289,7 +289,7 @@ fn compute_allocation_min_symbols_caps_holder_count_on_small_block() {
     // 32 MB block, overhead 1.5x → small N.
     // N/MIN_SYMBOLS_PER_HOLDER limits holder count to keep average symbols/holder sane.
     // Pass 30 candidates → should be trimmed.
-    let p = ErasureParams::compute(32 * 1024 * 1024, 0.0); // overhead = 1.5x
+    let p = ErasureParams::compute(32 * 1024 * 1024, 0.0).unwrap(); // overhead = 1.5x
     let max_holders = (p.n / crate::constants::MIN_SYMBOLS_PER_HOLDER) as usize;
     let candidates: Vec<_> = (0..30)
         .map(|i| candidate(i + 1, 0.3 + (i as f64) * 0.02))
@@ -316,7 +316,7 @@ fn compute_allocation_min_symbols_caps_holder_count_on_small_block() {
 #[test]
 fn compute_allocation_100_candidates_trimmed_to_30() {
     // Large block, 100 candidates → MAX_HOLDERS_PER_BLOCK = 30
-    let p = ErasureParams::compute(128 * 1024 * 1024, 0.5);
+    let p = ErasureParams::compute(128 * 1024 * 1024, 0.5).unwrap();
     let candidates: Vec<_> = (0..100)
         .map(|i| candidate((i % 255) as u8 + 1, 0.1 + (i as f64) * 0.008))
         .collect();
@@ -488,7 +488,7 @@ fn placement_invariants_hold_across_configurations() {
     ];
 
     for (num_holders, base_trust, block_size, importance) in &configs {
-        let p = ErasureParams::compute(*block_size, *importance);
+        let p = ErasureParams::compute(*block_size, *importance).unwrap();
         let max_per = p.max_per_holder();
 
         let candidates: Vec<_> = (0..*num_holders)

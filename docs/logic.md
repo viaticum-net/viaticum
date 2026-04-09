@@ -130,17 +130,33 @@ Lost / Deleting + any outcome → no-op
 
 ## Escrow
 
-Trust-based restore gating. Prevents hit-and-run: new peer can't dump data and immediately restore.
+Contribution-based restore gating. Prevents hit-and-run: a peer cannot dump data and immediately restore — it must first store other peers' data for some time to accumulate restore budget.
 
 ```
-max_restorable_gb = FREE_TIER_GB + trust * escrow_trust_factor
+restore_budget_gb = stored_gb_days / k_factor
+remaining_budget  = restore_budget_gb - already_restored_gb
 ```
 
-**Constants:** FREE_TIER_GB = 1.0, DEFAULT_ESCROW_TRUST_FACTOR = 20.0
+Where `stored_gb_days` is the cumulative GB·day contribution the owner earned by hosting symbols for other peers (integrated over time since each placement was `received_at`).
 
-**Example:** trust=2.0 -> budget = 1 + 2.0 * 20.0 = 41 GB. Trust=0 -> 1 GB (demo credit, always available).
+**Constants:** `DEFAULT_ESCROW_K_FACTOR = 7.0` (i.e. store 1 GB for 7 days → earn 1 GB of restore credit). See `syncback-core/src/constants.rs`.
 
-Holder checks on RestoreRequest. If restore_gb > budget -> RestoreDenied with current_trust, needed_trust, budget.
+**Example:** hold 100 GB for 14 days → `stored_gb_days = 1400`, budget = `1400 / 7 = 200 GB`. After restoring 50 GB, `remaining_budget = 150 GB`.
+
+Unlike the earlier trust-based formula, the new scheme has NO free tier: a brand-new peer with zero contribution has zero restore budget. `FREE_TIER_GB` still exists but now belongs to the owner-side budget planner (minimum outgoing backup budget), not escrow.
+
+**Accounting:**
+- `stored_gb_days` grows monotonically as time passes (holder-side, `db::stored_for_peer_gb_days`).
+- `already_restored_gb` is `restored_total_bytes / BYTES_PER_GB` from `record_restore_served` — also monotonic.
+- Budget therefore always grows unless a restore is served.
+- Atomic read-modify-write in `record_restore_served` closes a TOCTOU race on concurrent restores (see db/mod.rs).
+
+**Check on RestoreRequest:**
+1. Holder looks up `stored_gb_days(owner, now)` and `already_restored_gb(owner)`.
+2. Computes `remaining = (stored_gb_days / k_factor) - already_restored_gb`.
+3. If `requested_gb > remaining` → `RestoreDenied { restore_budget_gb, already_restored_gb, needed_gb_days }`.
+
+**No trust dependency.** The earlier `max_restorable_gb = FREE_TIER_GB + trust * escrow_trust_factor` formula is obsolete — trust now controls only placement weights (P, I, S factors), not restore gating.
 
 ## Repair
 

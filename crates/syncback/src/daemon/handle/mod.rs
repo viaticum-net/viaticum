@@ -485,6 +485,7 @@ impl DaemonHandle {
                 app_config.escrow.clone(),
                 accepted_offers,
                 epoch_key_bytes,
+                master_key.clone(),
             );
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {
@@ -623,6 +624,7 @@ impl DaemonHandle {
             let cleanup_relay = relay_post_tx.clone();
             let cleanup_cancel = cancel.clone();
             let cleanup_data_dir = cfg.data_dir.clone();
+            let cleanup_master_key = master_key.clone();
             let cleanup_interval = (3600 / time_scale).max(1);
             let pressure_interval = (3600 / time_scale).max(60);
             tasks.push(tokio::spawn(async move {
@@ -637,6 +639,7 @@ impl DaemonHandle {
                     cleanup_interval,
                     pressure_interval,
                     time_scale,
+                    cleanup_master_key,
                     cleanup_cancel,
                 ).await
             }));
@@ -648,6 +651,7 @@ impl DaemonHandle {
             let integrity_holdings = holdings_dir.clone();
             let integrity_relay = relay_post_tx.clone();
             let integrity_cancel = cancel.clone();
+            let integrity_master_key = master_key.clone();
             let integrity_interval = syncback_core::constants::DEFAULT_HOLDINGS_INTEGRITY_INTERVAL_SECS;
             tasks.push(tokio::spawn(async move {
                 crate::daemon::holdings_integrity::run(
@@ -657,6 +661,7 @@ impl DaemonHandle {
                     identity_pub,
                     integrity_interval,
                     time_scale,
+                    integrity_master_key,
                     integrity_cancel,
                 )
                 .await

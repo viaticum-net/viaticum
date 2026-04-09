@@ -76,6 +76,10 @@ fn check_holding_on_disk_returns_false_when_holdings_dir_itself_missing() {
 
 // ─── scan_holdings tests ──────────────────────────────────────────────────────
 
+fn test_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32])
+}
+
 #[tokio::test]
 async fn scan_holdings_reports_missing_active_holding() {
     let db = Db::open_in_memory().unwrap();
@@ -88,7 +92,7 @@ async fn scan_holdings_reports_missing_active_holding() {
     db.upsert_holding(&holding).unwrap();
     // No directory on disk.
 
-    let count = super::scan_holdings(&db, tmp.path(), &relay_tx).await.unwrap();
+    let count = super::scan_holdings(&db, tmp.path(), &relay_tx, &test_key()).await.unwrap();
 
     assert_eq!(count, 1, "should report 1 missing holding");
     assert!(
@@ -112,7 +116,7 @@ async fn scan_holdings_does_not_report_present_holding() {
     db.upsert_holding(&holding).unwrap();
     make_block_dir(tmp.path(), 0xBB);
 
-    let count = super::scan_holdings(&db, tmp.path(), &relay_tx).await.unwrap();
+    let count = super::scan_holdings(&db, tmp.path(), &relay_tx, &test_key()).await.unwrap();
 
     assert_eq!(count, 0);
     assert!(
@@ -143,7 +147,7 @@ async fn scan_holdings_skips_marked_for_delete_holdings() {
     db.upsert_holding(&holding).unwrap();
     // No directory on disk.
 
-    let count = super::scan_holdings(&db, tmp.path(), &relay_tx).await.unwrap();
+    let count = super::scan_holdings(&db, tmp.path(), &relay_tx, &test_key()).await.unwrap();
 
     assert_eq!(count, 0);
     assert!(relay_rx.try_recv().is_err(), "no messages for MarkedForDelete");
@@ -170,7 +174,7 @@ async fn scan_holdings_skips_silent_holdings() {
     db.upsert_holding(&holding).unwrap();
     // No directory on disk.
 
-    let count = super::scan_holdings(&db, tmp.path(), &relay_tx).await.unwrap();
+    let count = super::scan_holdings(&db, tmp.path(), &relay_tx, &test_key()).await.unwrap();
 
     assert_eq!(count, 0);
     assert!(relay_rx.try_recv().is_err(), "no messages for Silent");
@@ -190,7 +194,7 @@ async fn scan_holdings_handles_mix_of_present_and_missing() {
     make_block_dir(tmp.path(), 0x20);
     // 0x30 has no directory.
 
-    let count = super::scan_holdings(&db, tmp.path(), &relay_tx).await.unwrap();
+    let count = super::scan_holdings(&db, tmp.path(), &relay_tx, &test_key()).await.unwrap();
 
     assert_eq!(count, 1, "exactly 1 missing");
     // Holdings 0x10 and 0x20 should still be present.
@@ -215,7 +219,7 @@ async fn scan_holdings_does_not_fire_when_holdings_dir_missing() {
         db.upsert_holding(&active_holding(seed, owner_id(seed))).unwrap();
     }
 
-    let count = super::scan_holdings(&db, &non_existent, &relay_tx).await.unwrap();
+    let count = super::scan_holdings(&db, &non_existent, &relay_tx, &test_key()).await.unwrap();
 
     assert_eq!(count, 0, "systemic guard: 0 reported when holdings_dir missing");
     assert!(relay_rx.try_recv().is_err(), "no messages when holdings_dir missing");
@@ -233,7 +237,7 @@ async fn report_missing_holding_removes_from_db_and_posts_symbol_dropped() {
     let holding = active_holding(0x60, owner);
     db.upsert_holding(&holding).unwrap();
 
-    super::report_missing_holding(&db, &holding, &relay_tx).await.unwrap();
+    super::report_missing_holding(&db, &holding, &relay_tx, &test_key()).await.unwrap();
 
     assert!(
         db.get_holding(&block, &owner).unwrap().is_none(),
@@ -264,7 +268,7 @@ async fn report_missing_holding_symbol_dropped_fields_correct() {
     };
     db.upsert_holding(&holding).unwrap();
 
-    super::report_missing_holding(&db, &holding, &relay_tx).await.unwrap();
+    super::report_missing_holding(&db, &holding, &relay_tx, &test_key()).await.unwrap();
 
     let post = relay_rx.try_recv().unwrap();
     assert_eq!(post.msg_type, "symbol_dropped");

@@ -360,7 +360,7 @@ fn pipeline_roundtrip_can_decode() {
     assert!(!placements.is_empty(), "should have placements");
 
     // Reconstruct ErasureParams using the actual stored_size.
-    let params = ErasureParams::compute(stored_size as u64, 0.5);
+    let params = ErasureParams::compute(stored_size as u64, 0.5).unwrap();
 
     // Collect unbound symbols from all placements until we have k_eff.
     let mut unbound_symbols: Vec<syncback_core::erasure::Symbol> = Vec::new();

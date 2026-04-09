@@ -27,7 +27,7 @@ fn erasure_params_returns_stored_values() {
 
 #[test]
 fn erasure_params_legacy_fallback() {
-    // n=None, overhead=None → falls back to ErasureParams::compute(k*t, 0.0)
+    // n=None, overhead=None → falls back to ErasureParams::compute(k*t, 0.0).unwrap()
     let k: u32 = 100;
     let t: u16 = 65535;
     let record = SourceBlockRecord {
@@ -42,7 +42,7 @@ fn erasure_params_legacy_fallback() {
         overhead: None,
     };
     let params = record.erasure_params();
-    let expected = ErasureParams::compute(k as u64 * t as u64, 0.0);
+    let expected = ErasureParams::compute(k as u64 * t as u64, 0.0).unwrap();
     assert_eq!(params.k, expected.k);
     assert_eq!(params.k_eff, expected.k_eff);
     assert_eq!(params.t, expected.t);
@@ -104,7 +104,7 @@ fn source_block_record_legacy_deserializes_as_none() {
 
 #[test]
 fn erasure_params_default_block_size() {
-    let params = ErasureParams::compute(128 * 1024 * 1024, 0.6);
+    let params = ErasureParams::compute(128 * 1024 * 1024, 0.6).unwrap();
     // K = ceil(128MB / 65535) = 2049 (T=65535, not 65536)
     assert_eq!(params.k, 2049);
     assert_eq!(params.k_eff, 2052);
@@ -117,7 +117,7 @@ fn erasure_params_default_block_size() {
 
 #[test]
 fn erasure_params_small_block_raspberry_pi() {
-    let params = ErasureParams::compute(32 * 1024 * 1024, 0.6);
+    let params = ErasureParams::compute(32 * 1024 * 1024, 0.6).unwrap();
     // K = ceil(32MB / 65535) = 513
     assert_eq!(params.k, 513);
     assert_eq!(params.k_eff, 516);
@@ -126,28 +126,28 @@ fn erasure_params_small_block_raspberry_pi() {
 
 #[test]
 fn erasure_params_high_importance() {
-    let params = ErasureParams::compute(128 * 1024 * 1024, 1.0);
+    let params = ErasureParams::compute(128 * 1024 * 1024, 1.0).unwrap();
     // overhead = 1.5 + 1.0 * 1.5 = 3.0
     assert!((params.overhead - 3.0).abs() < 0.001);
 }
 
 #[test]
 fn erasure_params_low_importance() {
-    let params = ErasureParams::compute(128 * 1024 * 1024, 0.0);
+    let params = ErasureParams::compute(128 * 1024 * 1024, 0.0).unwrap();
     // overhead = 1.5 + 0.0 * 1.5 = 1.5
     assert!((params.overhead - 1.5).abs() < 0.001);
 }
 
 #[test]
 fn erasure_params_importance_clamped() {
-    let params = ErasureParams::compute(128 * 1024 * 1024, 1.5);
+    let params = ErasureParams::compute(128 * 1024 * 1024, 1.5).unwrap();
     // importance clamped to 1.0, overhead = 3.0
     assert!((params.overhead - 3.0).abs() < 0.001);
 }
 
 #[test]
 fn max_per_holder_concentration_cap() {
-    let params = ErasureParams::compute(128 * 1024 * 1024, 0.6);
+    let params = ErasureParams::compute(128 * 1024 * 1024, 0.6).unwrap();
     let max = params.max_per_holder();
     // cap = (1 - 1/2.4) * 0.85 * 4925 = 0.5833 * 0.85 * 4925 = ~2442
     // k_eff - 1 = 2051
@@ -157,7 +157,7 @@ fn max_per_holder_concentration_cap() {
 
 #[test]
 fn max_per_holder_cap_stricter_at_high_overhead() {
-    let params = ErasureParams::compute(128 * 1024 * 1024, 0.0);
+    let params = ErasureParams::compute(128 * 1024 * 1024, 0.0).unwrap();
     let max = params.max_per_holder();
     // overhead = 1.5, cap = (1 - 1/1.5) * 0.85 * n = 0.3333 * 0.85 * n
     // k_eff - 1 = 2050
@@ -167,6 +167,34 @@ fn max_per_holder_cap_stricter_at_high_overhead() {
     assert!(max > 0);
 }
 
+
+
+#[test]
+fn erasure_params_compute_rejects_empty_block() {
+    let result = ErasureParams::compute(0, 0.5);
+    assert!(
+        matches!(result, Err(ErasureParamsError::EmptySourceBlock)),
+        "expected EmptySourceBlock, got {result:?}"
+    );
+}
+
+#[test]
+fn erasure_params_compute_handles_max_size() {
+    // Max valid size: k must stay below u32::MAX / 4 to leave headroom for
+    // DECODE_OVERHEAD and the importance multiplier without overflow.
+    let k_limit: u64 = (u32::MAX / 4) as u64;
+    let t: u64 = super::SYMBOL_SIZE as u64;
+    let max_ok_size: u64 = k_limit * t;
+    let result = ErasureParams::compute(max_ok_size, 0.0);
+    assert!(result.is_ok(), "expected Ok for max valid size, got {result:?}");
+
+    let too_large: u64 = max_ok_size + t + 1;
+    let result = ErasureParams::compute(too_large, 0.0);
+    assert!(
+        matches!(result, Err(ErasureParamsError::TooLarge(_))),
+        "expected TooLarge, got {result:?}"
+    );
+}
 #[test]
 fn timestamp_weeks_elapsed() {
     let t0 = Timestamp(1_000_000);

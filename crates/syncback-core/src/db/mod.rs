@@ -74,6 +74,12 @@ const MASTER_TRUST: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("ma
 const DEVICE_TO_MASTER: TableDefinition<&[u8; 32], &[u8]> =
     TableDefinition::new("device_to_master");
 
+/// meta: key-value singletons (e.g., next_file_id).
+const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+
+/// Meta key for persisted next_file_id.
+const META_KEY_NEXT_FILE_ID: &str = "next_file_id";
+
 /// TTL for stored system state blobs: 365 days.
 pub const SYSTEM_STATE_TTL_SECS: u64 = 365 * 24 * 3600;
 
@@ -278,6 +284,32 @@ impl Db {
             tx.open_table(DEVICE_TRUST)?;
             tx.open_table(MASTER_TRUST)?;
             tx.open_table(DEVICE_TO_MASTER)?;
+            tx.open_table(META)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load the persisted `next_file_id` singleton. Returns 1 on fresh database.
+    /// Used by the backup coordinator at startup to avoid reusing file IDs after
+    /// a crash between file-id allocation and file record persistence.
+    pub fn load_next_file_id(&self) -> Result<u64, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(META)?;
+        match table.get(META_KEY_NEXT_FILE_ID)? {
+            Some(v) => Ok(from_cbor_bytes::<u64>(v.value())?),
+            None => Ok(1),
+        }
+    }
+
+    /// Persist the next file id singleton. Called every time a new FileId is allocated
+    /// so the counter survives daemon restart.
+    pub fn store_next_file_id(&self, value: u64) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(META)?;
+            let bytes = to_cbor_bytes(&value);
+            table.insert(META_KEY_NEXT_FILE_ID, bytes.as_slice())?;
         }
         tx.commit()?;
         Ok(())
@@ -338,8 +370,14 @@ impl Db {
     }
 
     /// Access hot cache for read.
+    ///
+    /// If the lock is poisoned (another thread panicked while holding write access),
+    /// we fall back to the inner data rather than propagating the panic. The hot
+    /// cache is only mutated AFTER `tx.commit()` succeeds (see BLOCK-3 fix), so the
+    /// poisoned state is at worst a partial delta from an interrupted apply — the
+    /// reader gets eventually-consistent data and the next write re-applies.
     pub fn hot(&self) -> impl Deref<Target = HotCache> + '_ {
-        self.hot.read().expect("hot cache lock poisoned")
+        self.hot.read().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -561,7 +599,7 @@ impl Db {
         }
 
         // DB is committed; now apply delta to the hot cache.
-        let mut hot = self.hot.write().expect("hot cache lock poisoned");
+        let mut hot = self.hot.write().unwrap_or_else(|e| e.into_inner());
         let block_agg = hot
             .blocks
             .entry(record.source_block_id)
@@ -638,7 +676,7 @@ impl Db {
 
         // DB is committed; now apply delta to the hot cache.
         if let Some(ref old_rec) = old_record {
-            let mut hot = self.hot.write().expect("hot cache lock poisoned");
+            let mut hot = self.hot.write().unwrap_or_else(|e| e.into_inner());
             hot.placements.remove(&(*block_id, *holder_id));
 
             if matches!(
@@ -1760,7 +1798,7 @@ impl<'db> DbWriteTxn<'db> {
         self.txn.commit()?;
 
         // redb commit succeeded — now apply accumulated deltas to the hot cache.
-        let mut hot = self.hot.write().expect("hot cache lock poisoned");
+        let mut hot = self.hot.write().unwrap_or_else(|e| e.into_inner());
         for delta in self.deltas {
             match delta {
                 HotCacheDelta::PlacementUpserted {

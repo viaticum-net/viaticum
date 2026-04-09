@@ -651,7 +651,7 @@ async fn fetch_from_holders_returns_insufficient_when_no_peers_reachable() {
         .collect();
 
     let coord = test_restore_coord(db, &symbols_dir);
-    let params = ErasureParams::compute(65_535_u64, 0.5);
+    let params = ErasureParams::compute(65_535_u64, 0.5).unwrap();
 
     let result = coord
         .fetch_from_holders(&block_id, &placements, &params)
@@ -684,7 +684,7 @@ async fn fetch_skips_denied_holder_and_tries_next() {
 
     let encoder = Arc::new(RaptorQEncoder::new());
     // k=1 (one symbol source block). k_eff = 1 + 3 = 4.
-    let params = ErasureParams::compute(65_535_u64, 0.5);
+    let params = ErasureParams::compute(65_535_u64, 0.5).unwrap();
     let k_eff = params.k_eff as usize;
 
     let total_size = (params.k as usize) * (params.t as usize);
@@ -952,7 +952,7 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
 
     let encoder = Arc::new(RaptorQEncoder::new());
     // k=1 source block. k_eff = 4.
-    let params = ErasureParams::compute(65_535_u64, 0.5);
+    let params = ErasureParams::compute(65_535_u64, 0.5).unwrap();
     let k_eff = params.k_eff as usize;
 
     let total_size = (params.k as usize) * (params.t as usize);

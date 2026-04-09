@@ -34,8 +34,8 @@ use syncback_core::cluster::{derive_master_key, master_identity, ClusterState};
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
 use syncback_core::messages::{
-    BoardSyncMsg, PeerAnnounceMsg, PosNackMsg, PosChallengeMsg,
-    RestoreRequestMsg, SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolDroppedMsg, SymbolRejectMsg,
+    BoardSyncMsg, PeerAnnounceMsg, PosChallengeMsg,
+    RestoreRequestMsg, SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolRejectMsg,
     SymbolTransferMsg,
 };
 use syncback_core::types::{
@@ -186,6 +186,7 @@ async fn make_processor_with_quota(
         syncback_core::config::EscrowCfg::default(),
         accepted_offers,
         [0u8; 32], // epoch_key
+        ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     );
 
     (processor, repair_rx, relay_sync_rx)
@@ -255,6 +256,7 @@ async fn make_processor_with_pending(
         syncback_core::config::EscrowCfg::default(),
         accepted_offers,
         [0u8; 32], // epoch_key
+        ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     );
 
     (processor, repair_rx, relay_sync_rx)
@@ -357,6 +359,7 @@ async fn symbol_accept_updates_backup_event() {
         syncback_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
         [0u8; 32], // epoch_key
+        ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     );
 
     let holder = make_identity(7);
@@ -741,14 +744,7 @@ async fn handle_pos_nack_marks_alive_placement_lost() {
     let placement = make_symbol_placement(block_id, holder, vec![(0, 5)], PlacementStatus::Alive);
     db.upsert_placement(&placement).unwrap();
 
-    let nack = PosNackMsg {
-        v: 1,
-        challenge_id: [0u8; 16],
-        source_block_id: block_id,
-        esi: 0,
-        timestamp: Timestamp::now(),
-        device_id: None,
-    };
+    let nack = syncback_core::messages::build_pos_nack([0u8; 16], block_id, 0, Timestamp::now(), None, &ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]));
 
     let changed = processor
         .handle_pos_nack_sync(holder, &nack)
@@ -773,14 +769,7 @@ async fn handle_pos_nack_is_idempotent_for_lost_placement() {
     let placement = make_symbol_placement(block_id, holder, vec![(0, 5)], PlacementStatus::Lost);
     db.upsert_placement(&placement).unwrap();
 
-    let nack = PosNackMsg {
-        v: 1,
-        challenge_id: [0u8; 16],
-        source_block_id: block_id,
-        esi: 0,
-        timestamp: Timestamp::now(),
-        device_id: None,
-    };
+    let nack = syncback_core::messages::build_pos_nack([0u8; 16], block_id, 0, Timestamp::now(), None, &ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]));
 
     let changed = processor
         .handle_pos_nack_sync(holder, &nack)
@@ -799,14 +788,7 @@ async fn handle_pos_nack_returns_false_for_unknown_placement() {
     let holder = make_device_id(1);
     let block_id = make_block_id(99); // not in DB
 
-    let nack = PosNackMsg {
-        v: 1,
-        challenge_id: [0u8; 16],
-        source_block_id: block_id,
-        esi: 0,
-        timestamp: Timestamp::now(),
-        device_id: None,
-    };
+    let nack = syncback_core::messages::build_pos_nack([0u8; 16], block_id, 0, Timestamp::now(), None, &ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]));
 
     let changed = processor
         .handle_pos_nack_sync(holder, &nack)
@@ -824,20 +806,18 @@ async fn handle_pos_nack_sends_repair_trigger() {
     let (processor, mut repair_rx, _relay_rx) =
         make_processor(db.clone(), &holdings_dir, &source_dir).await;
 
-    let holder = make_device_id(1);
+    // Use a signing key whose public key equals the device_id, and register
+    // the device → master mapping so signature verification can succeed.
+    let holder_key = ed25519_dalek::SigningKey::from_bytes(&[0x41u8; 32]);
+    let holder = DeviceId(holder_key.verifying_key().to_bytes());
+    let master = IdentityPub(holder_key.verifying_key().to_bytes());
+    db.set_master_for_device(&holder, &master).unwrap();
     let block_id = make_block_id(2);
 
     let placement = make_symbol_placement(block_id, holder, vec![(0, 5)], PlacementStatus::Alive);
     db.upsert_placement(&placement).unwrap();
 
-    let nack = PosNackMsg {
-        v: 1,
-        challenge_id: [0u8; 16],
-        source_block_id: block_id,
-        esi: 0,
-        timestamp: Timestamp::now(),
-        device_id: None,
-    };
+    let nack = syncback_core::messages::build_pos_nack([0u8; 16], block_id, 0, Timestamp::now(), None, &holder_key);
 
     // Call the async version that also sends to repair channel.
     processor
@@ -877,12 +857,12 @@ async fn handle_symbol_dropped_marks_alive_placement_lost() {
         make_symbol_placement(block_id, holder, vec![(10, 8)], PlacementStatus::Uncertain);
     db.upsert_placement(&placement).unwrap();
 
-    let dropped = SymbolDroppedMsg {
-        v: 1,
-        source_block_id: block_id,
-        esi_ranges: vec![(10, 8)],
-        timestamp: Timestamp::now(),
-    };
+    let dropped = syncback_core::messages::build_symbol_dropped(
+        block_id,
+        vec![(10, 8)],
+        Timestamp::now(),
+        &ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]),
+    );
 
     let changed = processor
         .handle_symbol_dropped_sync(holder, &dropped)
@@ -912,12 +892,12 @@ async fn handle_symbol_dropped_is_idempotent_for_deleting_placement() {
     );
     db.upsert_placement(&placement).unwrap();
 
-    let dropped = SymbolDroppedMsg {
-        v: 1,
-        source_block_id: block_id,
-        esi_ranges: vec![(10, 8)],
-        timestamp: Timestamp::now(),
-    };
+    let dropped = syncback_core::messages::build_symbol_dropped(
+        block_id,
+        vec![(10, 8)],
+        Timestamp::now(),
+        &ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]),
+    );
 
     let changed = processor
         .handle_symbol_dropped_sync(holder, &dropped)
@@ -933,18 +913,23 @@ async fn handle_symbol_dropped_sends_repair_trigger() {
     let (processor, mut repair_rx, _relay_rx) =
         make_processor(db.clone(), &holdings_dir, &source_dir).await;
 
-    let holder = make_device_id(3);
+    // Use a signing key whose public key equals the device_id, and register
+    // the device → master mapping so signature verification can succeed.
+    let holder_key = ed25519_dalek::SigningKey::from_bytes(&[0x43u8; 32]);
+    let holder = DeviceId(holder_key.verifying_key().to_bytes());
+    let master = IdentityPub(holder_key.verifying_key().to_bytes());
+    db.set_master_for_device(&holder, &master).unwrap();
     let block_id = make_block_id(4);
 
     let placement = make_symbol_placement(block_id, holder, vec![(0, 4)], PlacementStatus::Alive);
     db.upsert_placement(&placement).unwrap();
 
-    let dropped = SymbolDroppedMsg {
-        v: 1,
-        source_block_id: block_id,
-        esi_ranges: vec![(0, 4)],
-        timestamp: Timestamp::now(),
-    };
+    let dropped = syncback_core::messages::build_symbol_dropped(
+        block_id,
+        vec![(0, 4)],
+        Timestamp::now(),
+        &holder_key,
+    );
 
     processor
         .handle_symbol_dropped(holder, dropped)
@@ -1630,8 +1615,8 @@ async fn handle_pos_response_pass_records_trust_and_updates_placement() {
     // Insert PeerRecord with initial trust.
     db.upsert_peer(&make_peer_record(holder_id)).unwrap();
 
-    // Use legacy erasure params (n=None, overhead=None → ErasureParams::compute(65535, 0.0)).
-    let params = ErasureParams::compute(65_535, 0.0);
+    // Use legacy erasure params (n=None, overhead=None → ErasureParams::compute(65535, 0.0).unwrap()).
+    let params = ErasureParams::compute(65_535, 0.0).unwrap();
 
     // Insert SourceBlockRecord.
     db.upsert_source_block(&SourceBlockRecord {
@@ -1746,7 +1731,7 @@ async fn handle_pos_response_fail_marks_lost_and_triggers_repair() {
     // Insert PeerRecord.
     db.upsert_peer(&make_peer_record(holder_id)).unwrap();
 
-    let params = ErasureParams::compute(65_535, 0.0);
+    let params = ErasureParams::compute(65_535, 0.0).unwrap();
 
     db.upsert_source_block(&SourceBlockRecord {
         block_id,
@@ -2122,6 +2107,7 @@ async fn dispatch_relay_pos_challenge_sends_response_via_board() {
         syncback_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
         [0u8; 32], // epoch_key
+        ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     );
 
     // Create a symbol file so PoS can respond.
@@ -2282,6 +2268,7 @@ async fn make_processor_with_cluster_state(
         syncback_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
         [0u8; 32], // epoch_key
+        ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     );
 
     (processor, cluster_state, own_identity)

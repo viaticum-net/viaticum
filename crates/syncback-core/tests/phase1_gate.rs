@@ -58,7 +58,7 @@ fn now() -> Timestamp {
 fn full_encode_decode_pipeline() {
     // One symbol of source data (65535 bytes).
     let source = test_data(65_535);
-    let params = ErasureParams::compute(65_535, 0.7);
+    let params = ErasureParams::compute(65_535, 0.7).unwrap();
     let bid = block_id(1);
     let holder = peer_id(1);
     let enc = RaptorQEncoder::new();
@@ -86,7 +86,7 @@ fn full_encode_decode_pipeline() {
 #[test]
 fn pos_challenge_verify_roundtrip() {
     let source = test_data(65_535);
-    let params = ErasureParams::compute(65_535, 0.5);
+    let params = ErasureParams::compute(65_535, 0.5).unwrap();
     let bid = block_id(2);
     let holder = peer_id(2);
     let enc = RaptorQEncoder::new();
@@ -129,7 +129,7 @@ fn pos_challenge_verify_roundtrip() {
 #[test]
 fn pos_challenge_detect_corruption() {
     let source = test_data(65_535);
-    let params = ErasureParams::compute(65_535, 0.5);
+    let params = ErasureParams::compute(65_535, 0.5).unwrap();
     let bid = block_id(3);
     let holder = peer_id(3);
     let enc = RaptorQEncoder::new();
@@ -488,7 +488,7 @@ fn full_owner_flow() {
 
     // ── Step 1: source block + file record ──────────────────────────────────
     let source = test_data(65_535);
-    let params = ErasureParams::compute(65_535, 0.8);
+    let params = ErasureParams::compute(65_535, 0.8).unwrap();
     let bid = block_id(10);
     let fid = FileId(10);
 

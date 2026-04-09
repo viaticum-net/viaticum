@@ -131,21 +131,50 @@ pub struct ErasureParams {
     pub n: u32,
 }
 
+/// Errors returned by [`ErasureParams::compute`].
+#[derive(Debug, thiserror::Error)]
+pub enum ErasureParamsError {
+    #[error("source block is empty")]
+    EmptySourceBlock,
+    #[error("source block too large: {0} bytes (k would overflow u32)")]
+    TooLarge(u64),
+}
+
 impl ErasureParams {
     /// Compute erasure parameters for a given source block size and importance.
-    pub fn compute(source_block_size: u64, importance: f64) -> Self {
+    ///
+    /// Returns `Err(EmptySourceBlock)` if `source_block_size == 0` — an empty
+    /// block cannot be erasure-coded (k=0 is invalid for RaptorQ).
+    ///
+    /// Returns `Err(TooLarge)` if the resulting k would exceed `u32::MAX` — the
+    /// silent `as u32` truncation would produce a wrong k value (review L-1).
+    pub fn compute(
+        source_block_size: u64,
+        importance: f64,
+    ) -> Result<Self, ErasureParamsError> {
+        if source_block_size == 0 {
+            return Err(ErasureParamsError::EmptySourceBlock);
+        }
         let t = SYMBOL_SIZE;
-        let k = (source_block_size as f64 / t as f64).ceil() as u32;
+        let k_raw = (source_block_size as f64 / t as f64).ceil() as u64;
+        // Reserve headroom for DECODE_OVERHEAD and the overhead multiplier so
+        // k_eff and n do not silently overflow. Cap at u32::MAX / 4 to keep the
+        // margin generous even with importance=1.0 (overhead = 3x).
+        let k_limit = (u32::MAX / 4) as u64;
+        if k_raw > k_limit {
+            return Err(ErasureParamsError::TooLarge(source_block_size));
+        }
+        let k = k_raw as u32;
         let k_eff = k + DECODE_OVERHEAD;
         let overhead = OVERHEAD_BASE + importance.clamp(0.0, 1.0) * OVERHEAD_SCALE;
         let n = (k_eff as f64 * overhead).ceil() as u32;
-        ErasureParams {
+        Ok(ErasureParams {
             k,
             k_eff,
             t,
             overhead,
             n,
-        }
+        })
     }
 
     /// Max symbols any single holder should store.
@@ -279,7 +308,10 @@ impl SourceBlockRecord {
                     n,
                 }
             }
-            _ => ErasureParams::compute(self.k as u64 * self.t as u64, 0.0),
+            // Legacy record: k and t were validated when the block was created, so
+            // k*t > 0 is guaranteed (k=0 was the bug we're fixing going forward).
+            _ => ErasureParams::compute(self.k as u64 * self.t as u64, 0.0)
+                .expect("legacy SourceBlockRecord has valid k>0 and t>0"),
         }
     }
 }

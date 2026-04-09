@@ -38,6 +38,14 @@ pub enum ErasureError {
     /// Symbol data has wrong size (not T bytes).
     #[error("symbol size mismatch: expected {expected}, got {got}")]
     SymbolSizeMismatch { expected: usize, got: usize },
+
+    /// Source packet missing for the requested ESI (internal encoder inconsistency).
+    #[error("source packet missing for esi {esi}")]
+    SourcePacketMissing { esi: u32 },
+
+    /// Repair packet not produced by RaptorQ for the requested ESI.
+    #[error("repair packet not produced for esi {esi}")]
+    RepairPacketMissing { esi: u32 },
 }
 
 /// Erasure coding abstraction. Stateless — all inputs explicit.
@@ -162,14 +170,22 @@ impl ErasureEncoder for RaptorQEncoder {
             let esi = start_esi + i;
             let raw_data: Vec<u8> = if esi < k {
                 // Source symbol range: ESI 0..K-1
-                source_packets.as_ref().unwrap()[esi as usize]
+                source_packets
+                    .as_ref()
+                    .and_then(|v| v.get(esi as usize))
+                    .ok_or(ErasureError::SourcePacketMissing { esi })?
                     .data()
                     .to_vec()
             } else {
                 // Repair symbol range: ESI >= K
                 let repair_offset = esi - k;
                 let packets = encoder.repair_packets(repair_offset, 1);
-                packets.into_iter().next().unwrap().data().to_vec()
+                packets
+                    .into_iter()
+                    .next()
+                    .ok_or(ErasureError::RepairPacketMissing { esi })?
+                    .data()
+                    .to_vec()
             };
 
             let mut data = raw_data;

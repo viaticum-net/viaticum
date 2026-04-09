@@ -302,6 +302,7 @@ fn all_message_variants_frame_roundtrip() {
             esi: 42,
             timestamp: ts,
             device_id: None,
+            sig: [0u8; 64],
         }),
         Message::SymbolOffer(SymbolOfferMsg {
             v: 1,
@@ -364,6 +365,7 @@ fn all_message_variants_frame_roundtrip() {
             source_block_id: sbid,
             esi_ranges: vec![(0, 3)],
             timestamp: ts,
+            sig: [0u8; 64],
         }),
         Message::SymbolDropNotice(SymbolDropNoticeMsg {
             v: 1,
@@ -425,14 +427,8 @@ fn to_cbor_from_cbor_roundtrip() {
 fn pos_nack_msg_roundtrip() {
     let sbid = SourceBlockId([1u8; 32]);
     let ts = Timestamp(1_000_000);
-    let msg = PosNackMsg {
-        v: 1,
-        challenge_id: [0xABu8; 16],
-        source_block_id: sbid,
-        esi: 42,
-        timestamp: ts,
-        device_id: None,
-    };
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let msg = build_pos_nack([0xABu8; 16], sbid, 42, ts, None, &signing_key);
     let encoded = to_cbor(&Message::PosNack(msg.clone())).unwrap();
     let decoded: Message = from_cbor(&encoded).unwrap();
     assert!(matches!(decoded, Message::PosNack(ref m) if *m == msg));
@@ -440,14 +436,15 @@ fn pos_nack_msg_roundtrip() {
 
 #[test]
 fn pos_nack_framing_roundtrip() {
-    let msg = Message::PosNack(PosNackMsg {
-        v: 1,
-        challenge_id: [0xCDu8; 16],
-        source_block_id: SourceBlockId([2u8; 32]),
-        esi: 99,
-        timestamp: Timestamp(2_000_000),
-        device_id: None,
-    });
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+    let msg = Message::PosNack(build_pos_nack(
+        [0xCDu8; 16],
+        SourceBlockId([2u8; 32]),
+        99,
+        Timestamp(2_000_000),
+        None,
+        &signing_key,
+    ));
     let framed = frame_message(&msg).unwrap();
     let (decoded, consumed) = unframe_message(&framed).unwrap();
     assert_eq!(decoded, msg);
@@ -711,6 +708,7 @@ fn all_26_message_variants() -> Vec<Message> {
             esi: 42,
             timestamp: ts,
             device_id: None,
+            sig: [0u8; 64],
         }),
         Message::SymbolOffer(SymbolOfferMsg {
             v: 1,
@@ -770,6 +768,7 @@ fn all_26_message_variants() -> Vec<Message> {
             source_block_id: sbid,
             esi_ranges: vec![(0, 3)],
             timestamp: ts,
+            sig: [0u8; 64],
         }),
         Message::SymbolDropNotice(SymbolDropNoticeMsg {
             v: 1,

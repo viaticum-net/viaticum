@@ -335,7 +335,7 @@ fn placement_produces_valid_allocation_for_pipeline() {
     let plaintext = b"placement integration test payload";
     let stored = compress_and_encrypt(plaintext, &EPOCH_KEY).unwrap();
 
-    let params = ErasureParams::compute(stored.len() as u64, 0.5);
+    let params = ErasureParams::compute(stored.len() as u64, 0.5).unwrap();
     let holders = test_holders_small();
     let allocations = compute_allocation(&holders, &params, 0).unwrap();
     assert!(!allocations.is_empty(), "should allocate to at least one holder");
@@ -509,7 +509,7 @@ fn full_pipeline_backup_encode_decode_decrypt() {
     assert!(stored.len() > 12, "stored must be longer than nonce");
 
     // Step 3: compute ErasureParams and placement allocation
-    let params = ErasureParams::compute(stored.len() as u64, 0.5);
+    let params = ErasureParams::compute(stored.len() as u64, 0.5).unwrap();
     let holders = test_holders_small();
     let allocations = compute_allocation(&holders, &params, 0).unwrap();
 

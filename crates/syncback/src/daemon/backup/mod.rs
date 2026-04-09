@@ -166,13 +166,17 @@ pub struct BackupCoordinator {
 impl BackupCoordinator {
     /// Create a new coordinator.
     pub fn new(db: Db, config: BackupConfig, encoder: Arc<dyn ErasureEncoder>) -> Self {
-        let next_file_id = db
+        // Prefer the persisted singleton; fall back to scanning files on legacy
+        // databases that pre-date the META table.
+        let stored = db.load_next_file_id().unwrap_or(0);
+        let scanned = db
             .list_all_files()
             .unwrap_or_default()
             .iter()
             .map(|r| r.file_id.0 + 1)
             .max()
             .unwrap_or(1);
+        let next_file_id = stored.max(scanned);
 
         let mut queues = HashMap::new();
         queues.insert(FileCategory::Photo, vec![]);
@@ -204,9 +208,16 @@ impl BackupCoordinator {
     }
 
     /// Allocate the next FileId.
+    ///
+    /// Persists the updated counter to the DB so a crash between allocation and
+    /// FileRecord write does not reuse the id on restart. Storage failure is
+    /// logged but not propagated — we prefer to continue rather than block backup.
     pub(crate) fn alloc_file_id(&mut self) -> FileId {
         let id = FileId(self.next_file_id);
         self.next_file_id += 1;
+        if let Err(e) = self.db.store_next_file_id(self.next_file_id) {
+            tracing::error!(err = %e, "backup: failed to persist next_file_id");
+        }
         id
     }
 

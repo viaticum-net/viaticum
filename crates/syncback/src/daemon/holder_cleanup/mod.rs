@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use syncback_core::budget::{evaluate_pressure, DiskPressure};
 use syncback_core::constants::{KI, KP, S_CLAMP_MAX, S_CLAMP_MIN};
 use syncback_core::db::Db;
-use syncback_core::messages::SymbolDroppedMsg;
 use syncback_core::types::{hex_encode, IdentityPub, Timestamp}; // IdentityPub for HoldingRecord.owner_id
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -40,6 +39,7 @@ pub async fn run(
     cleanup_interval_secs: u64,
     pressure_interval_secs: u64,
     time_scale: u64,
+    master_signing_key: ed25519_dalek::SigningKey,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut cleanup_timer =
@@ -63,7 +63,7 @@ pub async fn run(
                 break;
             }
             _ = cleanup_timer.tick() => {
-                if let Err(e) = cleanup_expired(&db, &holdings_dir, &relay_post_tx, time_scale).await {
+                if let Err(e) = cleanup_expired(&db, &holdings_dir, &relay_post_tx, time_scale, &master_signing_key).await {
                     error!("holder_cleanup: cleanup_expired error: {e}");
                 }
             }
@@ -72,12 +72,13 @@ pub async fn run(
                     &db, &holdings_dir, &relay_post_tx,
                     soft_quota_bytes, hard_quota_bytes,
                     &data_dir, disk_reserve_bytes,
+                    &master_signing_key,
                 ).await {
                     error!("holder_cleanup: check_pressure error: {e}");
                 }
             }
             _ = drop_notice_timer.tick() => {
-                if let Err(e) = cleanup_drop_notices(&db, &holdings_dir, &relay_post_tx).await {
+                if let Err(e) = cleanup_drop_notices(&db, &holdings_dir, &relay_post_tx, &master_signing_key).await {
                     error!("holder_cleanup: cleanup_drop_notices error: {e}");
                 }
             }
@@ -93,6 +94,7 @@ async fn cleanup_expired(
     holdings_dir: &Path,
     relay_post_tx: &mpsc::Sender<RelayPost>,
     time_scale: u64,
+    master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
     let now = Timestamp::now();
     let expired = db.list_holdings_cooldown_expired(now, time_scale)?;
@@ -134,6 +136,7 @@ async fn cleanup_expired(
             holding.owner_id,
             holding.source_block_id,
             &holding.esi_ranges,
+            master_signing_key,
         ).await;
 
         // Refresh storage bytes for all devices of this owner's master identity.
@@ -164,6 +167,7 @@ async fn cleanup_drop_notices(
     db: &Db,
     holdings_dir: &Path,
     relay_post_tx: &mpsc::Sender<RelayPost>,
+    master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
     let now = Timestamp::now();
     let expired = db.list_holdings_drop_notice_expired(now)?;
@@ -205,6 +209,7 @@ async fn cleanup_drop_notices(
             holding.owner_id,
             holding.source_block_id,
             &holding.esi_ranges,
+            master_signing_key,
         ).await;
 
         // Refresh storage bytes for all devices of this owner's master identity.
@@ -239,6 +244,7 @@ async fn check_pressure(
     hard_quota_bytes: u64,
     data_dir: &Path,
     disk_reserve_bytes: u64,
+    master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
     let now = Timestamp::now();
     let holdings = db.list_all_holdings()?;
@@ -329,6 +335,7 @@ async fn check_pressure(
                     target.owner_id,
                     target.source_block_id,
                     &esi_ranges,
+                    master_signing_key,
                 ).await;
             }
 
@@ -394,13 +401,14 @@ async fn post_symbol_dropped(
     owner_id: IdentityPub,
     source_block_id: syncback_core::types::SourceBlockId,
     esi_ranges: &[(u32, u32)],
+    master_signing_key: &ed25519_dalek::SigningKey,
 ) {
-    let msg = SymbolDroppedMsg {
-        v: 1,
+    let msg = syncback_core::messages::build_symbol_dropped(
         source_block_id,
-        esi_ranges: esi_ranges.to_vec(),
-        timestamp: Timestamp::now(),
-    };
+        esi_ranges.to_vec(),
+        Timestamp::now(),
+        master_signing_key,
+    );
     if let Ok(payload) = syncback_core::messages::to_cbor(&msg) {
         let mut msg_id = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut msg_id);

@@ -954,7 +954,7 @@ syncback restore <path> [--version N] [--date YYYY-MM-DD]
 3. Dedup: multiple files in same batch → один download
 4. Per source_block:
    a. Find holders: SymbolPlacement WHERE status=Alive
-   b. Escrow check: max_restorable_gb достаточен?
+   b. Escrow check: `remaining = stored_gb_days/k_factor - already_restored_gb` достаточен?
    c. RestoreRequest к K_eff holders параллельно
    d. Collect K_eff bound symbols (любые ESI)
    e. Unbind: XOR ChaCha20(HKDF(block_id, holder_id))

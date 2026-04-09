@@ -264,7 +264,7 @@ fn stress_5tb_metadata_scale() {
     let t_placement = std::time::Instant::now();
     let candidates = mock_candidates_30();
     // Use 128 MB block, importance = 0.5.
-    let params = ErasureParams::compute(128 * 1024 * 1024, 0.5);
+    let params = ErasureParams::compute(128 * 1024 * 1024, 0.5).unwrap();
     assert_eq!(params.k, K, "expected K={K}, got {}", params.k);
     assert_eq!(params.k_eff, K_EFF, "expected K_eff={K_EFF}, got {}", params.k_eff);
 

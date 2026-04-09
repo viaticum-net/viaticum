@@ -776,7 +776,7 @@ process_sync_response():
 | `max_versions` | 5 | Максимум версий на один путь |
 | `max_version_age` | 90 дней | Максимальный возраст старых версий |
 | `parallel_holders` | 5 | Параллельные соединения при restore |
-| `escrow_trust_factor` | 20.0 | ESCROW_TRUST_FACTOR (GB per trust unit) |
+| `escrow_k_factor` | 7.0 | `DEFAULT_ESCROW_K_FACTOR` — GB·days required per 1 GB restore credit |
 | `prune_interval_secs` | 3600 | Интервал очистки relay board |
 
 Все числовые протокольные параметры вынесены в `syncback-core/src/constants.rs`.

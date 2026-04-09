@@ -180,6 +180,8 @@ pub struct Processor {
     peer_cert_map: Arc<std::sync::Mutex<HashMap<DeviceId, (IdentityPub, DeviceCertificate)>>>,
     /// Epoch key for rebuilding stored blobs when block.bin is absent.
     epoch_key: [u8; 32],
+    /// Master identity signing key for producing signed PosNack / SymbolDropped messages.
+    master_signing_key: ed25519_dalek::SigningKey,
 }
 
 impl Processor {
@@ -207,6 +209,7 @@ impl Processor {
         escrow_cfg: EscrowCfg,
         accepted_offers: AcceptedOffers,
         epoch_key: [u8; 32],
+        master_signing_key: ed25519_dalek::SigningKey,
     ) -> Self {
         Processor {
             db,
@@ -231,6 +234,7 @@ impl Processor {
             accepted_offers,
             peer_cert_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             epoch_key,
+            master_signing_key,
         }
     }
 
@@ -348,6 +352,34 @@ impl Processor {
         device_cert: DeviceCertificate,
         x25519_pub: Option<[u8; 32]>,
     ) {
+        // 0. Revocation check (review S1): reject if this device key is in the
+        //    cluster's revocation list. We check against both the cluster_state
+        //    (master's authoritative list) and the per-peer PeerRecord
+        //    revoked_device_pub_keys field (for device-level revocation seen
+        //    via signed RevocationMsg). Must come before any DB write so a
+        //    revoked device leaves no trace.
+        if let Some(cs_arc) = self.cluster_state.as_ref() {
+            let cs = cs_arc.lock().unwrap();
+            if cs.is_device_revoked(&device_id) {
+                warn!(
+                    device = %device_id,
+                    master = %identity_pub,
+                    "processor: revoked device attempted connection — rejecting authentication"
+                );
+                return;
+            }
+        }
+        if let Ok(Some(existing_peer)) = self.db.get_peer(&device_id) {
+            if existing_peer.is_device_revoked(&device_id) {
+                warn!(
+                    device = %device_id,
+                    master = %identity_pub,
+                    "processor: peer has revoked device key — rejecting authentication"
+                );
+                return;
+            }
+        }
+
         // 1. Store in peer_cert_map.
         {
             let mut map = self.peer_cert_map.lock().unwrap();
@@ -1021,14 +1053,14 @@ impl Processor {
                     challenger = %owner_id,
                     "processor: PoS challenge from non-owner, ignoring"
                 );
-                return Ok(Message::PosNack(PosNackMsg {
-                    v: 1,
-                    challenge_id: challenge.challenge_id,
-                    source_block_id: block_id,
+                return Ok(Message::PosNack(syncback_core::messages::build_pos_nack(
+                    challenge.challenge_id,
+                    block_id,
                     esi,
-                    timestamp: Timestamp::now(),
-                    device_id: challenge.device_id,
-                }));
+                    Timestamp::now(),
+                    challenge.device_id,
+                    &self.master_signing_key,
+                )));
             }
         }
 
@@ -1059,14 +1091,14 @@ impl Processor {
                     esi,
                     "processor: PoS challenge — symbol not held, sending PosNack"
                 );
-                Ok(Message::PosNack(PosNackMsg {
-                    v: 1,
-                    challenge_id: challenge.challenge_id,
-                    source_block_id: block_id,
+                Ok(Message::PosNack(syncback_core::messages::build_pos_nack(
+                    challenge.challenge_id,
+                    block_id,
                     esi,
-                    timestamp: Timestamp::now(),
-                    device_id: challenge.device_id,
-                }))
+                    Timestamp::now(),
+                    challenge.device_id,
+                    &self.master_signing_key,
+                )))
             }
             Err(e) => Err(ProcessorError::Io(e)),
         }
@@ -1343,6 +1375,40 @@ impl Processor {
         nack: PosNackMsg,
     ) -> Result<(), ProcessorError> {
         let block_id = nack.source_block_id;
+
+        // Verify the per-message signature using the holder's master identity.
+        // Without this check, any peer who knows the victim's IdentityPub could
+        // forge a PosNack and trigger a spurious repair (DoS on placement records).
+        match self.db.get_master_for_device(&from_device) {
+            Ok(Some(master)) => {
+                if let Err(e) = syncback_core::messages::verify_pos_nack(&nack, &master) {
+                    warn!(
+                        device = %from_device,
+                        block_id = %block_id,
+                        err = %e,
+                        "processor: PosNack signature verification failed — ignoring"
+                    );
+                    return Ok(());
+                }
+            }
+            Ok(None) => {
+                warn!(
+                    device = %from_device,
+                    block_id = %block_id,
+                    "processor: PosNack from unknown device — ignoring"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                error!(
+                    device = %from_device,
+                    err = %e,
+                    "processor: PosNack — DB lookup failed"
+                );
+                return Ok(());
+            }
+        }
+
         self.handle_pos_nack_sync(from_device, &nack)?;
 
         // Consume the pending challenge so the scheduler does not re-send it.
@@ -1400,6 +1466,40 @@ impl Processor {
         dropped: SymbolDroppedMsg,
     ) -> Result<(), ProcessorError> {
         let block_id = dropped.source_block_id;
+
+        // Verify the per-message signature using the claimant holder's master
+        // identity. Without this, any peer knowing the victim's IdentityPub could
+        // forge a SymbolDropped and trigger a repair storm (review S2).
+        match self.db.get_master_for_device(&from) {
+            Ok(Some(master)) => {
+                if let Err(e) = syncback_core::messages::verify_symbol_dropped(&dropped, &master) {
+                    warn!(
+                        device = %from,
+                        block_id = %block_id,
+                        err = %e,
+                        "processor: SymbolDropped signature verification failed — ignoring"
+                    );
+                    return Ok(());
+                }
+            }
+            Ok(None) => {
+                warn!(
+                    device = %from,
+                    block_id = %block_id,
+                    "processor: SymbolDropped from unknown device — ignoring"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                error!(
+                    device = %from,
+                    err = %e,
+                    "processor: SymbolDropped — DB lookup failed"
+                );
+                return Ok(());
+            }
+        }
+
         self.handle_symbol_dropped_sync(from, &dropped)?;
 
         // Refresh trust_s: holder evicted our symbols, bytes_peer_stores_for_us decreased.

@@ -11,7 +11,7 @@ use libp2p::request_response::Codec;
 use libp2p::StreamProtocol;
 use syncback_core::cluster::issue_device_certificate;
 use syncback_core::messages::{
-    Message, PosChallengeMsg, PosNackMsg, SymbolTransferMsg,
+    Message, PosChallengeMsg, SymbolTransferMsg,
 };
 use syncback_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp};
 use tokio::time::timeout;
@@ -35,14 +35,15 @@ fn make_pos_challenge() -> Message {
 
 /// Build a PosNack message for testing.
 fn make_pos_nack() -> Message {
-    Message::PosNack(PosNackMsg {
-        v: 1,
-        challenge_id: [1u8; 16],
-        source_block_id: SourceBlockId([2u8; 32]),
-        esi: 42,
-        timestamp: Timestamp(1001),
-        device_id: None,
-    })
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]);
+    Message::PosNack(syncback_core::messages::build_pos_nack(
+        [1u8; 16],
+        SourceBlockId([2u8; 32]),
+        42,
+        Timestamp(1001),
+        None,
+        &key,
+    ))
 }
 
 // ─── Codec unit tests ─────────────────────────────────────────────────────────

@@ -63,7 +63,7 @@ fn small_source_block(params: &ErasureParams) -> Vec<u8> {
 /// ErasureParams for 1-symbol source block (block_size = t).
 fn small_params() -> ErasureParams {
     // Use 1 source symbol: block_size = SYMBOL_SIZE = 65535
-    ErasureParams::compute(65_535, 0.5)
+    ErasureParams::compute(65_535, 0.5).unwrap()
 }
 
 // ─── select_challenge_esi ────────────────────────────────────────────────────
