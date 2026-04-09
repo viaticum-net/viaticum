@@ -131,6 +131,24 @@ pub fn make_empty_accepted_offers() -> AcceptedOffers {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// Drop any accepted offers whose age exceeds `SYMBOL_OFFER_EXPIRY_SECS`.
+///
+/// Review B1 / H-1: without this sweep, an accepted offer that is never followed
+/// by a matching `SymbolTransfer` lives in the map forever — a slow memory leak
+/// that a malicious owner can weaponise by flooding `SymbolOffer` messages and
+/// never delivering. Called periodically by the scheduler.
+///
+/// Returns the number of entries evicted.
+pub fn prune_expired_accepted_offers(accepted: &AcceptedOffers, now: Timestamp) -> usize {
+    let mut map = accepted.lock().unwrap();
+    let before = map.len();
+    map.retain(|_, offer| {
+        let age = now.0.saturating_sub(offer.accepted_at.0);
+        age <= SYMBOL_OFFER_EXPIRY_SECS
+    });
+    before - map.len()
+}
+
 // ─── Processor ────────────────────────────────────────────────────────────────
 
 /// Routes incoming connections and dispatches messages to appropriate handlers.
@@ -851,6 +869,18 @@ impl Processor {
                     }
                     Err(e) => warn!(err = %e, "processor: failed to decode RevocationBroadcast from relay"),
                 }
+            }
+            "symbol_stored" => {
+                // Informational notification from a holder — Delta-era protocol
+                // surface kept for wire compatibility. No action taken: the owner
+                // already tracks placement state via SymbolAccept/SymbolTransfer.
+                debug!(from = %msg.from, "processor: symbol_stored — informational, no-op");
+            }
+            "storage_warning" => {
+                // Informational bit-rot / PoS pre-warning. No-op for now; the
+                // authoritative signal is PosNack / SymbolDropped which are
+                // already handled and trigger repair.
+                debug!(from = %msg.from, "processor: storage_warning — informational, no-op");
             }
             other => {
                 let safe_type: String = other.chars().take(64).filter(|c| c.is_ascii_graphic() || *c == ' ').collect();

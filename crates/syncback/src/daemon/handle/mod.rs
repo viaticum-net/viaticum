@@ -483,7 +483,7 @@ impl DaemonHandle {
                 relay_post_tx.clone(),
                 Some(cs.clone()),
                 app_config.escrow.clone(),
-                accepted_offers,
+                accepted_offers.clone(),
                 epoch_key_bytes,
                 master_key.clone(),
             );
@@ -580,6 +580,8 @@ impl DaemonHandle {
             pending_challenges,
             relay_post_tx.clone(),
             master_key.clone(),
+            symbols_dir.clone(),
+            accepted_offers,
         );
         let cancel_scheduler = cancel.clone();
         tasks.push(tokio::spawn(async move {

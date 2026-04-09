@@ -1143,6 +1143,32 @@ impl Db {
             None => Ok(0),
         }
     }
+
+    /// Drop all event_log entries with sequence number < `seq`.
+    ///
+    /// Review BLOCK-4: event_log grows unbounded without pruning.
+    /// Returns number of rows removed.
+    pub fn truncate_event_log_before(&self, seq: u64) -> Result<usize, DbError> {
+        let tx = self.inner.begin_write()?;
+        let mut removed = 0usize;
+        {
+            let mut table = tx.open_table(EVENT_LOG)?;
+            // Collect keys first to avoid iterator invalidation.
+            let mut to_delete: Vec<u64> = Vec::new();
+            let upper: u64 = seq.saturating_sub(1);
+            for item in table.range::<u64>(..=upper)? {
+                let (k, _) = item?;
+                to_delete.push(k.value());
+            }
+            for k in to_delete {
+                if table.remove(&k)?.is_some() {
+                    removed += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
 }
 
 // ============================================================
@@ -1247,6 +1273,35 @@ impl Db {
             passed = passed.saturating_add(entry.passed);
         }
         Ok((challenged, passed))
+    }
+
+    /// Drop all pos_weekly entries whose week number is strictly less than
+    /// `keep_after_week`. Returns the number of rows removed.
+    ///
+    /// Review BLOCK-4: pos_weekly grows unbounded. With P_WINDOW_WEEKS rolling
+    /// at ~30 entries per device, anything older is pure history we never use.
+    pub fn prune_pos_weekly_before(&self, keep_after_week: u32) -> Result<usize, DbError> {
+        let tx = self.inner.begin_write()?;
+        let mut removed = 0usize;
+        {
+            let mut table = tx.open_table(POS_WEEKLY)?;
+            let mut to_delete: Vec<[u8; 36]> = Vec::new();
+            for item in table.iter()? {
+                let (k, _) = item?;
+                let key_bytes: [u8; 36] = *k.value();
+                let week = u32::from_be_bytes(key_bytes[32..36].try_into().unwrap());
+                if week < keep_after_week {
+                    to_delete.push(key_bytes);
+                }
+            }
+            for k in &to_delete {
+                if table.remove(k)?.is_some() {
+                    removed += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 }
 

@@ -91,7 +91,7 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
     // Since check_timeouts doesn't use network, we pass a real (but unused) handle.
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key);
+    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -156,7 +156,7 @@ async fn check_timeouts_ignores_fresh_challenges() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key);
+    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -252,7 +252,7 @@ async fn check_timeouts_respects_time_scale() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key);
+    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -307,7 +307,7 @@ async fn issue_due_challenges_skips_already_pending() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key);
+    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
 
     // issue_due_challenges should skip this holder because it's already pending.
     // The existing pending entry's esi (5) should not be overwritten.
@@ -349,7 +349,7 @@ async fn scheduler_skips_deleting_placements() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key);
+    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
 
     scheduler.issue_due_challenges().await.expect("issue_due_challenges");
 
@@ -408,7 +408,7 @@ async fn time_scale_divides_intervals() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key);
+    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -505,7 +505,7 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
         timeout_check_secs: 3600,
         time_scale: 1,
     };
-    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending, relay_post_tx, signing_key);
+    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending, relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
 
     // Now = after owner cooldown. Deleted_at=0, cooldown=4 weeks.
     // process_deletion_tick uses Timestamp::now() internally. Since deleted_at=0,
@@ -541,7 +541,7 @@ async fn deletion_tick_noop_when_no_eligible_files() {
         timeout_check_secs: 3600,
         time_scale: 1,
     };
-    let scheduler = Scheduler::new(db, config, repair_tx, pending, relay_post_tx, signing_key);
+    let scheduler = Scheduler::new(db, config, repair_tx, pending, relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
 
     scheduler.process_deletion_tick().await.unwrap();
 

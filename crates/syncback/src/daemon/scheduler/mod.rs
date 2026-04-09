@@ -89,10 +89,16 @@ pub struct Scheduler {
     relay_post_tx: mpsc::Sender<RelayPost>,
     /// Signing key for building DeleteMsg signatures.
     signing_key: ed25519_dalek::SigningKey,
+    /// Directory containing owner-side source block files (`{block_id_hex}/*.bin`).
+    /// Used by CleanupBlock to remove leftover symbol files from disk.
+    source_blocks_dir: std::path::PathBuf,
+    /// Shared accepted-offers map, periodically swept to evict stale entries.
+    accepted_offers: crate::daemon::processor::AcceptedOffers,
 }
 
 impl Scheduler {
     /// Create a new Scheduler.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Db,
         config: SchedulerConfig,
@@ -100,6 +106,8 @@ impl Scheduler {
         pending: PendingChallenges,
         relay_post_tx: mpsc::Sender<RelayPost>,
         signing_key: ed25519_dalek::SigningKey,
+        source_blocks_dir: std::path::PathBuf,
+        accepted_offers: crate::daemon::processor::AcceptedOffers,
     ) -> Self {
         Scheduler {
             db,
@@ -108,6 +116,8 @@ impl Scheduler {
             pending,
             relay_post_tx,
             signing_key,
+            source_blocks_dir,
+            accepted_offers,
         }
     }
 
@@ -124,14 +134,18 @@ impl Scheduler {
             Duration::from_secs((self.config.timeout_check_secs / scale).max(1));
         // Deletion check: same interval as PoS (hourly, scaled).
         let deletion_interval = Duration::from_secs((3600 / scale).max(1));
+        // accepted_offers sweep: 60 seconds / time_scale, min 1.
+        let sweep_interval = Duration::from_secs((60 / scale).max(1));
 
         let mut pos_timer = tokio::time::interval(pos_interval);
         let mut timeout_timer = tokio::time::interval(timeout_interval);
         let mut deletion_timer = tokio::time::interval(deletion_interval);
+        let mut sweep_timer = tokio::time::interval(sweep_interval);
         // Skip the first immediate tick so we don't fire right at startup.
         pos_timer.tick().await;
         timeout_timer.tick().await;
         deletion_timer.tick().await;
+        sweep_timer.tick().await;
 
         info!(
             pos_interval_secs = self.config.pos_interval_secs / scale,
@@ -158,6 +172,44 @@ impl Scheduler {
                 _ = deletion_timer.tick() => {
                     if let Err(e) = self.process_deletion_tick().await {
                         error!("scheduler: process_deletion_tick error: {e}");
+                    }
+                }
+                _ = sweep_timer.tick() => {
+                    let evicted = crate::daemon::processor::prune_expired_accepted_offers(
+                        &self.accepted_offers,
+                        Timestamp::now(),
+                    );
+                    if evicted > 0 {
+                        debug!(evicted, "scheduler: swept expired accepted offers");
+                    }
+
+                    // Opportunistic pruning of append-only tables (review BLOCK-4).
+                    // Event log: keep only the last EVENT_LOG_RETAIN_ROWS entries.
+                    // pos_weekly: keep the most recent P_WINDOW_WEEKS * 2 weeks for all devices.
+                    const EVENT_LOG_RETAIN_ROWS: u64 = 100_000;
+                    if let Ok(last_seq) = self.db.last_event_seq() {
+                        if last_seq > EVENT_LOG_RETAIN_ROWS {
+                            let cutoff = last_seq - EVENT_LOG_RETAIN_ROWS;
+                            if let Ok(dropped) = self.db.truncate_event_log_before(cutoff) {
+                                if dropped > 0 {
+                                    debug!(dropped, cutoff, "scheduler: pruned event_log");
+                                }
+                            }
+                        }
+                    }
+                    // Current scaled week (same formula as trust recalc).
+                    let now = Timestamp::now();
+                    let scale = self.config.time_scale.max(1);
+                    let week_secs = syncback_core::constants::SECS_PER_WEEK / scale;
+                    let current_week = (now.0 / week_secs) as u32;
+                    let retain_weeks = (syncback_core::constants::P_WINDOW_WEEKS as u32) * 2;
+                    if current_week > retain_weeks {
+                        let keep_after = current_week - retain_weeks;
+                        if let Ok(dropped) = self.db.prune_pos_weekly_before(keep_after) {
+                            if dropped > 0 {
+                                debug!(dropped, keep_after, "scheduler: pruned pos_weekly");
+                            }
+                        }
                     }
                 }
             }
@@ -567,10 +619,25 @@ impl Scheduler {
                             }
                         }
                     }
+                    // Remove owner-side symbol files from disk (review B2 / Flow 7 BLOCK).
+                    // Previously the DB record was cleaned up but `{source_blocks_dir}/{block_id}/*.bin`
+                    // remained forever, leaking disk space.
+                    let block_hex = syncback_core::types::hex_encode(&source_block_id.0);
+                    let block_dir = self.source_blocks_dir.join(&block_hex);
+                    if block_dir.exists() {
+                        if let Err(e) = std::fs::remove_dir_all(&block_dir) {
+                            warn!(
+                                block_id = %source_block_id,
+                                path = %block_dir.display(),
+                                err = %e,
+                                "scheduler: failed to remove owner-side source block directory"
+                            );
+                        }
+                    }
                     info!(
                         block_id = %source_block_id,
                         file_id = %file_id,
-                        "scheduler: cleaned up source block + file version"
+                        "scheduler: cleaned up source block + file version + disk files"
                     );
                 }
                 DeletionAction::VacuumBlock { source_block_id, .. } => {
