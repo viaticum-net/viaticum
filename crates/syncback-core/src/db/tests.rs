@@ -1901,3 +1901,64 @@ fn write_txn_delete_placement_queues_correct_delta() {
     assert!(db.list_holders_for_file(fid).unwrap().is_empty());
     assert!(db.list_files_for_holder(&bob).unwrap().is_empty());
 }
+
+// ─── Retention / pruning (review BLOCK-4, Wave 2 B5) ──────────────────────────
+
+#[test]
+fn truncate_event_log_before_drops_old_entries_and_keeps_new() {
+    let db = crate::db::Db::open_in_memory().unwrap();
+    for i in 0..10 {
+        db.append_event(&make_event(i)).unwrap();
+    }
+    // Prune entries with seq < 5 → removes seqs 1..=4.
+    let removed = db.truncate_event_log_before(5).unwrap();
+    assert_eq!(removed, 4, "four rows expected to be removed");
+
+    // Seqs 5..=10 must still be there.
+    let remaining = db.events_after(0, 100).unwrap();
+    assert_eq!(remaining.len(), 6);
+    assert_eq!(remaining[0].0, 5, "first surviving seq");
+    assert_eq!(remaining.last().unwrap().0, 10, "last surviving seq");
+}
+
+#[test]
+fn truncate_event_log_before_noop_when_seq_zero() {
+    let db = crate::db::Db::open_in_memory().unwrap();
+    db.append_event(&make_event(1)).unwrap();
+    db.append_event(&make_event(2)).unwrap();
+    let removed = db.truncate_event_log_before(0).unwrap();
+    assert_eq!(removed, 0);
+    assert_eq!(db.events_after(0, 100).unwrap().len(), 2);
+}
+
+#[test]
+fn prune_pos_weekly_before_keeps_recent_weeks() {
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let dev = DeviceId([1u8; 32]);
+    for week in 0..20u32 {
+        let entry = WeeklyPosEntry { challenged: week, passed: week };
+        db.upsert_pos_weekly(&dev, week, &entry).unwrap();
+    }
+    // Prune anything with week < 10 — weeks 0..=9 should disappear.
+    let removed = db.prune_pos_weekly_before(10).unwrap();
+    assert_eq!(removed, 10);
+
+    let remaining = db.list_pos_weekly_for_peer(&dev).unwrap();
+    assert_eq!(remaining.len(), 10);
+    let min_week = remaining.iter().map(|(w, _)| *w).min().unwrap();
+    assert_eq!(min_week, 10);
+}
+
+#[test]
+fn next_file_id_persists_across_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("db.redb");
+    {
+        let db = crate::db::Db::open(&path).unwrap();
+        assert_eq!(db.load_next_file_id().unwrap(), 1, "fresh db defaults to 1");
+        db.store_next_file_id(42).unwrap();
+    }
+    // Reopen and verify the counter survived.
+    let db2 = crate::db::Db::open(&path).unwrap();
+    assert_eq!(db2.load_next_file_id().unwrap(), 42);
+}

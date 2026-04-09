@@ -840,6 +840,149 @@ async fn handle_pos_nack_sends_repair_trigger() {
     }
 }
 
+// ─── Wave 1 security: signature verification on PosNack / SymbolDropped ─────
+
+/// Review S2: a forged PosNack signed by the wrong key must be rejected.
+/// The placement stays Alive and no repair trigger is enqueued.
+#[tokio::test]
+async fn forged_pos_nack_is_rejected_and_no_repair_triggered() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, mut repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    // Victim: honest holder whose identity is known to the DB.
+    let victim_key = ed25519_dalek::SigningKey::from_bytes(&[0x55u8; 32]);
+    let victim = DeviceId(victim_key.verifying_key().to_bytes());
+    let victim_master = IdentityPub(victim_key.verifying_key().to_bytes());
+    db.set_master_for_device(&victim, &victim_master).unwrap();
+
+    let block_id = make_block_id(7);
+    let placement = make_symbol_placement(block_id, victim, vec![(0, 5)], PlacementStatus::Alive);
+    db.upsert_placement(&placement).unwrap();
+
+    // Attacker signs a PosNack with their OWN key, then pretends it came from
+    // the victim. This must fail verify_pos_nack.
+    let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0xEEu8; 32]);
+    let forged = syncback_core::messages::build_pos_nack(
+        [0u8; 16],
+        block_id,
+        0,
+        Timestamp::now(),
+        None,
+        &attacker_key,
+    );
+
+    processor
+        .handle_pos_nack(victim, forged)
+        .await
+        .expect("handle_pos_nack must not propagate an error — just log and drop");
+
+    // Placement must still be Alive (no mark_placement_lost).
+    let updated = db.get_placement(&block_id, &victim).unwrap().unwrap();
+    assert_eq!(
+        updated.status,
+        PlacementStatus::Alive,
+        "forged PosNack must not change placement state"
+    );
+    // No repair trigger must have been sent.
+    assert!(
+        repair_rx.try_recv().is_err(),
+        "forged PosNack must not enqueue a repair trigger"
+    );
+}
+
+/// Review S2: a forged SymbolDropped signed by the wrong key must be rejected.
+#[tokio::test]
+async fn forged_symbol_dropped_is_rejected_and_no_repair_triggered() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let (processor, mut repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+
+    let victim_key = ed25519_dalek::SigningKey::from_bytes(&[0x66u8; 32]);
+    let victim = DeviceId(victim_key.verifying_key().to_bytes());
+    let victim_master = IdentityPub(victim_key.verifying_key().to_bytes());
+    db.set_master_for_device(&victim, &victim_master).unwrap();
+
+    let block_id = make_block_id(8);
+    let placement = make_symbol_placement(block_id, victim, vec![(0, 4)], PlacementStatus::Alive);
+    db.upsert_placement(&placement).unwrap();
+
+    let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0xDDu8; 32]);
+    let forged = syncback_core::messages::build_symbol_dropped(
+        block_id,
+        vec![(0, 4)],
+        Timestamp::now(),
+        &attacker_key,
+    );
+
+    processor
+        .handle_symbol_dropped(victim, forged)
+        .await
+        .expect("handle_symbol_dropped must not propagate an error");
+
+    let updated = db.get_placement(&block_id, &victim).unwrap().unwrap();
+    assert_eq!(
+        updated.status,
+        PlacementStatus::Alive,
+        "forged SymbolDropped must not change placement state"
+    );
+    assert!(
+        repair_rx.try_recv().is_err(),
+        "forged SymbolDropped must not enqueue a repair trigger"
+    );
+}
+
+/// Review B1 / H-1: prune_expired_accepted_offers evicts entries older than
+/// SYMBOL_OFFER_EXPIRY_SECS and leaves fresh entries alone.
+#[tokio::test]
+async fn prune_expired_accepted_offers_drops_stale_keeps_fresh() {
+    use super::{prune_expired_accepted_offers, AcceptedOffer};
+    use syncback_core::constants::SYMBOL_OFFER_EXPIRY_SECS;
+
+    let map = super::make_empty_accepted_offers();
+    let now = Timestamp(1_000_000);
+
+    let owner_old = IdentityPub([0x11u8; 32]);
+    let owner_new = IdentityPub([0x22u8; 32]);
+    let block_a = SourceBlockId([0xAAu8; 32]);
+    let block_b = SourceBlockId([0xBBu8; 32]);
+
+    {
+        let mut m = map.lock().unwrap();
+        m.insert(
+            (owner_old, block_a),
+            AcceptedOffer {
+                owner_id: owner_old,
+                source_block_id: block_a,
+                esi_ranges: vec![(0, 3)],
+                importance: 0.5,
+                accepted_at: Timestamp(now.0 - SYMBOL_OFFER_EXPIRY_SECS - 10),
+            },
+        );
+        m.insert(
+            (owner_new, block_b),
+            AcceptedOffer {
+                owner_id: owner_new,
+                source_block_id: block_b,
+                esi_ranges: vec![(0, 3)],
+                importance: 0.5,
+                accepted_at: Timestamp(now.0 - 5),
+            },
+        );
+    }
+
+    let evicted = prune_expired_accepted_offers(&map, now);
+    assert_eq!(evicted, 1, "exactly one stale offer must be evicted");
+
+    let m = map.lock().unwrap();
+    assert!(m.contains_key(&(owner_new, block_b)));
+    assert!(!m.contains_key(&(owner_old, block_a)));
+}
+
 // ─── handle_symbol_dropped_sync ───────────────────────────────────────────────
 
 #[tokio::test]
