@@ -689,10 +689,5 @@ impl RestoreCoordinator {
 
 // ─── Free helpers ─────────────────────────────────────────────────────────────
 
-/// Expand (start, count) ESI ranges into a flat sorted list of ESIs.
-pub(crate) fn collect_esis_from_ranges(ranges: &[(u32, u32)]) -> Vec<u32> {
-    ranges
-        .iter()
-        .flat_map(|&(start, count)| start..start + count)
-        .collect()
-}
+// Re-export shared helper from core (review A3).
+pub(crate) use syncback_core::types::ranges_to_esi_list as collect_esis_from_ranges;

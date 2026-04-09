@@ -513,6 +513,45 @@ pub struct EventEntry {
 }
 
 // ============================================================
+// ESI range helpers
+// ============================================================
+
+/// Convert a sorted list of ESIs to compact `(start, count)` ranges.
+///
+/// Consecutive ESIs are merged into a single range. The input MUST be sorted
+/// in ascending order — this function does not sort.
+///
+/// Lives in core (review A3) so `processor`, `restore`, `holder_cleanup` and
+/// any future module share the same implementation instead of drifting.
+pub fn esi_list_to_ranges(esis: &[u32]) -> Vec<(u32, u32)> {
+    if esis.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    let mut start = esis[0];
+    let mut count = 1u32;
+    for &esi in &esis[1..] {
+        if esi == start + count {
+            count += 1;
+        } else {
+            ranges.push((start, count));
+            start = esi;
+            count = 1;
+        }
+    }
+    ranges.push((start, count));
+    ranges
+}
+
+/// Expand `(start, count)` ESI ranges back to a flat sorted list of ESIs.
+pub fn ranges_to_esi_list(ranges: &[(u32, u32)]) -> Vec<u32> {
+    ranges
+        .iter()
+        .flat_map(|&(start, count)| start..start + count)
+        .collect()
+}
+
+// ============================================================
 // CBOR serialization helpers
 // ============================================================
 

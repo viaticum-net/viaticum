@@ -458,14 +458,23 @@ impl BackupCoordinator {
                 maybe_event = rx.recv() => {
                     match maybe_event {
                         Some(event) => {
-                            if let Err(e) = self.process_event(event) {
+                            // process_event reads files from disk; wrap in
+                            // block_in_place so other tokio tasks keep running
+                            // while we do synchronous I/O (review A1).
+                            let res = tokio::task::block_in_place(|| self.process_event(event));
+                            if let Err(e) = res {
                                 tracing::error!("process_event error: {e}");
                             }
                             idle_timer.reset();
                         }
                         None => {
                             tracing::info!("BackupCoordinator: channel closed, flushing and exiting");
-                            match self.flush_all(true) {
+                            // Wrap the blocking flush in block_in_place so the tokio
+                            // runtime can still make progress on other tasks while
+                            // we compress, encrypt, encode and write to disk
+                            // (review A1 / HIGH blocking-I/O).
+                            let flush_result = tokio::task::block_in_place(|| self.flush_all(true));
+                            match flush_result {
                                 Ok(results) => self.deliver_symbols(&results).await,
                                 Err(e) => tracing::error!("final flush error: {e}"),
                             }
@@ -476,7 +485,8 @@ impl BackupCoordinator {
                 }
                 _ = idle_timer.tick() => {
                     tracing::debug!("idle flush triggered");
-                    match self.flush_all(true) {
+                    let flush_result = tokio::task::block_in_place(|| self.flush_all(true));
+                    match flush_result {
                         Ok(results) => {
                             if !results.is_empty() {
                                 self.deliver_symbols(&results).await;
@@ -488,7 +498,8 @@ impl BackupCoordinator {
                 }
                 _ = fallback_timer.tick() => {
                     tracing::debug!("fallback flush triggered");
-                    match self.flush_all(true) {
+                    let flush_result = tokio::task::block_in_place(|| self.flush_all(true));
+                    match flush_result {
                         Ok(results) => {
                             if !results.is_empty() {
                                 self.deliver_symbols(&results).await;

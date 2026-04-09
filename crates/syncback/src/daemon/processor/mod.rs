@@ -2570,34 +2570,8 @@ pub(crate) fn recalculate_trust(
     Some((old_p, old_i, new_p, new_i))
 }
 
-/// Convert a sorted list of ESIs to compact (start, count) ranges.
-pub(crate) fn esi_list_to_ranges(esis: &[u32]) -> Vec<(u32, u32)> {
-    if esis.is_empty() {
-        return Vec::new();
-    }
-    let mut ranges: Vec<(u32, u32)> = Vec::new();
-    let mut start = esis[0];
-    let mut count = 1u32;
-    for &esi in &esis[1..] {
-        if esi == start + count {
-            count += 1;
-        } else {
-            ranges.push((start, count));
-            start = esi;
-            count = 1;
-        }
-    }
-    ranges.push((start, count));
-    ranges
-}
-
-/// Expand (start, count) ranges back to a flat sorted list of ESIs.
-pub(crate) fn ranges_to_esi_list(ranges: &[(u32, u32)]) -> Vec<u32> {
-    ranges
-        .iter()
-        .flat_map(|&(start, count)| start..start + count)
-        .collect()
-}
+// ESI range helpers moved to syncback_core::types — use those directly.
+pub(crate) use syncback_core::types::{esi_list_to_ranges, ranges_to_esi_list};
 
 /// Approximate protocol week number from the current unix timestamp (1-indexed).
 ///
