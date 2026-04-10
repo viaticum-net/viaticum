@@ -244,6 +244,7 @@ pub fn run_pipeline(
         encrypted_size: Some(stored.len() as u64),
         n: Some(params.n),
         overhead: Some(params.overhead),
+        drop_notice_sent_at: None,
     };
     // 8 & 9. DB: atomically write source block + all placements + all events.
     // Using a single write transaction ensures that on crash before commit,

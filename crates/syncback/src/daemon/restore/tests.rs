@@ -1107,6 +1107,7 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
         encrypted_size: Some(encrypted_size),
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     };
     db.upsert_source_block(&block_record).unwrap();
 

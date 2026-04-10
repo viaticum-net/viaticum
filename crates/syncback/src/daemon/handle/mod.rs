@@ -575,6 +575,8 @@ impl DaemonHandle {
                 pos_interval_secs: 3600,
                 timeout_check_secs: 3600,
                 time_scale,
+                event_log_retain_rows: 100_000,
+                pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
             },
             repair_tx.clone(),
             pending_challenges,

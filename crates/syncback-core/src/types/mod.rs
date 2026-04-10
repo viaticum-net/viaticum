@@ -288,6 +288,10 @@ pub struct SourceBlockRecord {
     /// None for records created before this field was added (legacy).
     #[serde(default)]
     pub overhead: Option<f64>,
+    /// Timestamp when SymbolDropNotice was first sent to holders for this block.
+    /// Set on first send; prevents re-sending on subsequent scheduler ticks.
+    #[serde(default)]
+    pub drop_notice_sent_at: Option<Timestamp>,
 }
 
 impl SourceBlockRecord {

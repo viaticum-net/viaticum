@@ -38,6 +38,7 @@ fn make_source_block(seed: u8, status: SourceBlockStatus) -> SourceBlockRecord {
         encrypted_size: None,
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     }
 }
 
@@ -519,6 +520,7 @@ fn committed_bytes_sums_active_blocks() {
         encrypted_size: Some(1000),
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     };
 
     // Block B: Active, encrypted_size=None → fallback to k*t = 10*100 = 1000
@@ -532,6 +534,7 @@ fn committed_bytes_sums_active_blocks() {
         encrypted_size: None,
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     };
 
     // Block C: Deleted, encrypted_size=Some(500) → must NOT be counted
@@ -545,6 +548,7 @@ fn committed_bytes_sums_active_blocks() {
         encrypted_size: Some(500),
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     };
 
     db.upsert_source_block(&block_a).unwrap();
@@ -1042,6 +1046,7 @@ fn refresh_peer_storage_bytes_updates_trust_s() {
         encrypted_size: None,
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     };
     db.upsert_source_block(&sb_a).unwrap();
 
@@ -1110,6 +1115,7 @@ fn refresh_peer_storage_bytes_neutral_when_we_store_nothing() {
         encrypted_size: None,
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     };
     db.upsert_source_block(&sb).unwrap();
     let p = SymbolPlacement {
@@ -1161,6 +1167,7 @@ fn refresh_peer_storage_bytes_only_alive_and_active_count() {
         encrypted_size: None,
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     };
     db.upsert_source_block(&sb).unwrap();
 

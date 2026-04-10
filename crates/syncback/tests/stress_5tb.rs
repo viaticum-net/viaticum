@@ -113,6 +113,7 @@ fn stress_5tb_metadata_scale() {
             encrypted_size: Some(128 * 1024 * 1024),
             n: None,
             overhead: None,
+        drop_notice_sent_at: None,
         };
         db.upsert_source_block(&record)
             .unwrap_or_else(|e| panic!("upsert_source_block[{i}]: {e}"));

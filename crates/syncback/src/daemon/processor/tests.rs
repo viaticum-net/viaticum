@@ -1772,6 +1772,7 @@ async fn handle_pos_response_pass_records_trust_and_updates_placement() {
         encrypted_size: Some(65_535),
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     })
     .unwrap();
 
@@ -1886,6 +1887,7 @@ async fn handle_pos_response_fail_marks_lost_and_triggers_repair() {
         encrypted_size: Some(65_535),
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     })
     .unwrap();
 

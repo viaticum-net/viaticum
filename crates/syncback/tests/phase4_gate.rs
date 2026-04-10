@@ -239,6 +239,7 @@ fn deletion_cooldown_full_lifecycle() {
         encrypted_size: None,
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     };
 
     // Two placements, both Alive

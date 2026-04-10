@@ -85,6 +85,8 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
         time_scale: 1, // real-time scale, threshold = POS_TIMEOUT_SECS
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
 
     // We need a NetworkHandle for the constructor. Build a no-op one via a stub.
@@ -153,6 +155,8 @@ async fn check_timeouts_ignores_fresh_challenges() {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
         time_scale: 1, // POS_TIMEOUT_SECS = 604_800 s — fresh challenge won't expire
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
@@ -249,6 +253,8 @@ async fn check_timeouts_respects_time_scale() {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
         time_scale: syncback_core::constants::POS_TIMEOUT_SECS, // threshold = 1 second
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
@@ -304,6 +310,8 @@ async fn issue_due_challenges_skips_already_pending() {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
         time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
@@ -346,6 +354,8 @@ async fn scheduler_skips_deleting_placements() {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
         time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
@@ -405,6 +415,8 @@ async fn time_scale_divides_intervals() {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
         time_scale: scale,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
@@ -472,6 +484,7 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
         encrypted_size: None,
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     };
     db.upsert_source_block(&sb).unwrap();
 
@@ -504,6 +517,8 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
         time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
     let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending, relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
 
@@ -540,6 +555,8 @@ async fn deletion_tick_noop_when_no_eligible_files() {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
         time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
     let scheduler = Scheduler::new(db, config, repair_tx, pending, relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
 
@@ -584,6 +601,8 @@ async fn offered_placement_timeout_marks_lost() {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
         time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
     let scheduler = Scheduler::new(
         db.clone(),
@@ -653,6 +672,8 @@ async fn offered_placement_not_swept_before_timeout() {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
         time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
     let scheduler = Scheduler::new(
         db.clone(),
@@ -682,6 +703,118 @@ async fn offered_placement_not_swept_before_timeout() {
     assert!(
         repair_rx.try_recv().is_err(),
         "no repair should be triggered for fresh Offered placement"
+    );
+}
+
+// ─── D3: drop_notice dedup tests ──────────────────────────────────────────────
+
+/// Drop notice is sent only once even when process_deletion_tick is called twice.
+/// On the second tick, drop_notice_sent_at is Some → skip sending.
+#[tokio::test]
+async fn drop_notice_sent_only_once_when_tick_called_twice() {
+    use syncback_core::types::{
+        DeviceId, FileRecord, FileVersion, LocalState, SourceBlockRecord, SourceBlockStatus,
+        SourceBlockType,
+    };
+
+    let db = Db::open_in_memory().unwrap();
+    let block_id = make_block_id(0xE1);
+    let holder_id = make_identity(0xE2);
+    let device_id = DeviceId([0x01; 32]);
+
+    // File: all devices deleted, deleted_at = 0 (well past owner cooldown).
+    let file = FileRecord {
+        file_id: FileId(99),
+        path: "dedup_test.txt".to_string(),
+        importance: 0.5,
+        devices: vec![(device_id, LocalState::Deleted(Timestamp(0)))],
+        versions: vec![FileVersion {
+            content_hash: [0; 32],
+            source_block_id: block_id,
+            k: 10,
+            t: 65535,
+            created_at: Timestamp(0),
+            backed_up_at: Some(Timestamp(0)),
+        }],
+        first_seen: Timestamp(0),
+    };
+    db.upsert_file(&file).unwrap();
+
+    // Source block: Active, drop_notice_sent_at = None.
+    let sb = SourceBlockRecord {
+        block_id,
+        k: 10,
+        t: 65535,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(0),
+        encrypted_size: None,
+        n: None,
+        overhead: None,
+        drop_notice_sent_at: None,
+    };
+    db.upsert_source_block(&sb).unwrap();
+
+    // Placement: Alive.
+    let placement = make_placement(block_id, holder_id);
+    db.upsert_placement(&placement).unwrap();
+
+    // Peer record.
+    let peer = syncback_core::types::PeerRecord {
+        device_id: holder_id,
+        master_identity: syncback_core::types::IdentityPub(holder_id.0),
+        trust_p: 0.5,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+    };
+    db.upsert_peer(&peer).unwrap();
+
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
+    let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<RelayPost>(64);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let pending = make_pending_challenges();
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending,
+        relay_post_tx,
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+    );
+
+    // First tick: should send the drop notice.
+    scheduler.process_deletion_tick().await.unwrap();
+    let first_post = relay_post_rx.try_recv().expect("first tick must send a delete msg");
+    assert_eq!(first_post.msg_type, "delete");
+
+    // drop_notice_sent_at must now be set.
+    let updated_sb = db.get_source_block(&block_id).unwrap().unwrap();
+    assert!(
+        updated_sb.drop_notice_sent_at.is_some(),
+        "drop_notice_sent_at must be set after first tick"
+    );
+
+    // Second tick: must NOT send another message.
+    scheduler.process_deletion_tick().await.unwrap();
+    assert!(
+        relay_post_rx.try_recv().is_err(),
+        "second tick must not send another drop notice (dedup)"
     );
 }
 

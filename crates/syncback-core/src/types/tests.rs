@@ -16,6 +16,7 @@ fn erasure_params_returns_stored_values() {
         encrypted_size: None,
         n: Some(512),
         overhead: Some(3.0),
+        drop_notice_sent_at: None,
     };
     let params = record.erasure_params();
     assert_eq!(params.k, 100);
@@ -40,6 +41,7 @@ fn erasure_params_legacy_fallback() {
         encrypted_size: None,
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     };
     let params = record.erasure_params();
     let expected = ErasureParams::compute(k as u64 * t as u64, 0.0).unwrap();
@@ -62,6 +64,7 @@ fn source_block_record_roundtrips_n_and_overhead() {
         encrypted_size: Some(13_107_000),
         n: Some(930),
         overhead: Some(2.4),
+        drop_notice_sent_at: None,
     };
     let bytes = to_cbor_bytes(&record);
     let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();
@@ -312,6 +315,7 @@ fn cbor_roundtrip_source_block_pack() {
         encrypted_size: None,
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     };
     let bytes = to_cbor_bytes(&sb);
     let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();

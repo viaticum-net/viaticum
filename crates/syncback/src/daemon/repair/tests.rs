@@ -47,6 +47,7 @@ fn make_source_block_record(bid: SourceBlockId, k: u32, t: u16) -> SourceBlockRe
         // n=k*2 (the default) yields max_per=0 for small k, which causes empty allocations.
         n: Some(k * 4),
         overhead: None,
+        drop_notice_sent_at: None,
     }
 }
 

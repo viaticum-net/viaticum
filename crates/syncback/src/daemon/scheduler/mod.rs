@@ -63,6 +63,10 @@ pub struct SchedulerConfig {
     /// Time acceleration factor. 1 = real time. Scales intervals and timeout threshold.
     /// Set > 1 in tests/demos to run weeks of PoS in seconds.
     pub time_scale: u64,
+    /// Maximum number of event_log rows to retain. Default: 100_000.
+    pub event_log_retain_rows: u64,
+    /// Number of pos_weekly weeks to retain. Default: P_WINDOW_WEEKS * 2.
+    pub pos_weekly_retain_weeks: u32,
 }
 
 impl SchedulerConfig {
@@ -72,6 +76,8 @@ impl SchedulerConfig {
             pos_interval_secs: 3600,
             timeout_check_secs: 3600,
             time_scale: 1,
+            event_log_retain_rows: 100_000,
+            pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
         }
     }
 }
@@ -184,12 +190,10 @@ impl Scheduler {
                     }
 
                     // Opportunistic pruning of append-only tables (review BLOCK-4).
-                    // Event log: keep only the last EVENT_LOG_RETAIN_ROWS entries.
-                    // pos_weekly: keep the most recent P_WINDOW_WEEKS * 2 weeks for all devices.
-                    const EVENT_LOG_RETAIN_ROWS: u64 = 100_000;
+                    let event_log_retain_rows = self.config.event_log_retain_rows;
                     if let Ok(last_seq) = self.db.last_event_seq() {
-                        if last_seq > EVENT_LOG_RETAIN_ROWS {
-                            let cutoff = last_seq - EVENT_LOG_RETAIN_ROWS;
+                        if last_seq > event_log_retain_rows {
+                            let cutoff = last_seq - event_log_retain_rows;
                             if let Ok(dropped) = self.db.truncate_event_log_before(cutoff) {
                                 if dropped > 0 {
                                     debug!(dropped, cutoff, "scheduler: pruned event_log");
@@ -202,7 +206,7 @@ impl Scheduler {
                     let scale = self.config.time_scale.max(1);
                     let week_secs = syncback_core::constants::SECS_PER_WEEK / scale;
                     let current_week = (now.0 / week_secs) as u32;
-                    let retain_weeks = (syncback_core::constants::P_WINDOW_WEEKS as u32) * 2;
+                    let retain_weeks = self.config.pos_weekly_retain_weeks;
                     if current_week > retain_weeks {
                         let keep_after = current_week - retain_weeks;
                         if let Ok(dropped) = self.db.prune_pos_weekly_before(keep_after) {
@@ -326,10 +330,13 @@ impl Scheduler {
                 None => continue, // race: shouldn't happen
             };
 
-            // Select ESI: nonce = timestamp XOR first 8 bytes of holder_id.
-            let holder_prefix = entry.holder_id.0[..8].try_into().unwrap_or([0u8; 8]);
-            let nonce = now.0 ^ u64::from_le_bytes(holder_prefix);
-            let esi = match select_challenge_esi(placement, nonce) {
+            // Generate the random challenge_id first so its bytes can seed ESI selection.
+            // This makes the challenged ESI unpredictable to the holder.
+            let challenge_id = random_challenge_id();
+
+            // Select ESI: derive seed from the random challenge_id bytes.
+            let seed = u64::from_le_bytes(challenge_id[..8].try_into().unwrap());
+            let esi = match select_challenge_esi(placement, seed) {
                 Ok(e) => e,
                 Err(e) => {
                     warn!(
@@ -347,8 +354,6 @@ impl Scheduler {
                 .flatten()
                 .map(|m| IdentityPub(m.0))
                 .unwrap_or_else(|| IdentityPub(entry.holder_id.0));
-
-            let challenge_id = random_challenge_id();
             let challenge_msg = PosChallengeMsg {
                 v: 1,
                 challenge_id,
@@ -522,6 +527,17 @@ impl Scheduler {
         for action in actions {
             match action {
                 DeletionAction::SendDropNotice { source_block_id, holder_id } => {
+                    // Dedup: only send once per source block.
+                    let source_block = self.db.get_source_block(&source_block_id).ok().flatten();
+                    if source_block.as_ref().and_then(|sb| sb.drop_notice_sent_at).is_some() {
+                        debug!(
+                            block_id = %source_block_id,
+                            holder_id = %holder_id,
+                            "scheduler: drop notice already sent for this block, skipping"
+                        );
+                        continue;
+                    }
+
                     // Build signed DeleteMsg, post to board, mark placement Deleting.
                     let delete_msg = syncback_core::messages::build_delete_msg(
                         source_block_id, now, &self.signing_key,
@@ -542,9 +558,8 @@ impl Scheduler {
                         }).await;
                     }
 
-                    // Mark placement + source block Deleting atomically.
+                    // Mark placement + source block Deleting, record drop_notice_sent_at atomically.
                     let placement = self.db.get_placement(&source_block_id, &holder_id).ok().flatten();
-                    let source_block = self.db.get_source_block(&source_block_id).ok().flatten();
 
                     if placement.is_some() || source_block.is_some() {
                         match self.db.write_txn() {
@@ -560,12 +575,13 @@ impl Scheduler {
                                 }
                                 if txn_ok {
                                     if let Some(mut sb) = source_block {
+                                        sb.drop_notice_sent_at = Some(now);
                                         if sb.status == SourceBlockStatus::Active || sb.status == SourceBlockStatus::Stale {
                                             sb.status = SourceBlockStatus::Deleting;
-                                            if let Err(e) = txn.upsert_source_block(&sb) {
-                                                error!(block_id = %source_block_id, "deletion: failed to update source block: {e}");
-                                                txn_ok = false;
-                                            }
+                                        }
+                                        if let Err(e) = txn.upsert_source_block(&sb) {
+                                            error!(block_id = %source_block_id, "deletion: failed to update source block: {e}");
+                                            txn_ok = false;
                                         }
                                     }
                                 }

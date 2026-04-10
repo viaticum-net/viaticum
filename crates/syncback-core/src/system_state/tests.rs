@@ -41,6 +41,7 @@ fn make_source_block(seed: u8) -> SourceBlockRecord {
         encrypted_size: None,
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     }
 }
 

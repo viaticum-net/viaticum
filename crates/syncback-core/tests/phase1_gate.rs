@@ -255,6 +255,7 @@ fn db_stores_and_retrieves_full_records() {
         encrypted_size: None,
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     };
     db.upsert_source_block(&sbr).expect("upsert_source_block");
 
@@ -519,6 +520,7 @@ fn full_owner_flow() {
         encrypted_size: None,
         n: None,
         overhead: None,
+        drop_notice_sent_at: None,
     };
     db.upsert_source_block(&sbr).expect("upsert_source_block");
 
