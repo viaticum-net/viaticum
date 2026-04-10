@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use syncback_core::constants::{POS_TIMEOUT_SECS, S_CLAMP_MAX, S_CLAMP_MIN, SYMBOL_OFFER_TIMEOUT_SECS};
-use syncback_core::trust::{compute_combined, compute_effective_trust};
+use syncback_core::trust::{compute_combined, compute_effective_trust, recalculate_trust};
 use syncback_core::db::Db;
 use syncback_core::deletion::{DeletionAction, DeletionEngine};
 use syncback_core::messages::PosChallengeMsg;
@@ -482,7 +482,7 @@ impl Scheduler {
             let week = crate::daemon::processor::current_week_number_scaled(scale);
             let pos_outcome = outcome_from_verify(&VerifyOutcome::Timeout, week);
             crate::daemon::processor::record_pos_weekly(&self.db, holder_id, pos_outcome);
-            crate::daemon::processor::recalculate_trust(&self.db, &holder_id, week);
+            recalculate_trust(&self.db, &holder_id, week);
 
             info!(
                 block_id = %block_id,

@@ -3,7 +3,7 @@
 //
 // All tests use real Db::open_in_memory(), real RaptorQEncoder, tempfile::TempDir.
 // Source block size is small (65_535 * 2 = ~128 KB) to keep encode/decode fast.
-// Async tests use #[tokio::test].
+// Async tests use #[tokio::test(flavor = "multi_thread", worker_threads = 2)].
 //
 // Network-fetch tests (Phase 7.7 iroh era) removed in ε.5:
 //   - fetch_skips_denied_holder_and_tries_next — used iroh NetworkHandle
@@ -304,7 +304,7 @@ fn extract_from_pack_unknown_file_id_returns_none() {
 
 // ─── Roundtrip tests (backup → restore) ──────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_single_file_by_exact_path() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
@@ -339,7 +339,7 @@ async fn restore_single_file_by_exact_path() {
     assert_eq!(restored, content);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_pack_multiple_files_roundtrip() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
@@ -391,7 +391,7 @@ async fn restore_pack_multiple_files_roundtrip() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_specific_version_by_index() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
@@ -455,7 +455,7 @@ async fn restore_specific_version_by_index() {
     assert_eq!(out_latest, b"version two content");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_prefix_matches_multiple_files() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
@@ -506,7 +506,7 @@ async fn restore_prefix_matches_multiple_files() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_missing_path_returns_empty_result() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
@@ -526,7 +526,7 @@ async fn restore_missing_path_returns_empty_result() {
     assert_eq!(result.failures[0].0, "/nonexistent/file.txt");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_updates_local_state_to_present() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
@@ -565,7 +565,7 @@ async fn restore_updates_local_state_to_present() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_deduplicates_source_blocks() {
     // Two files backed up in same pack block should cause only 1 decode call.
     // We verify this indirectly: blocks_fetched == 1 even though files_restored == 2.
@@ -627,7 +627,7 @@ fn collect_esis_from_ranges_count_one() {
 
 // ─── fetch_from_holders: unreachable peers → InsufficientSymbols ──────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_from_holders_returns_insufficient_when_no_peers_reachable() {
     // 3 placements, all Alive, but swarm is None (no peers reachable).
     // Expected: InsufficientSymbols(got=0).

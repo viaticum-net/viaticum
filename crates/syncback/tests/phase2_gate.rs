@@ -93,7 +93,7 @@ fn write_file(dir: &TempDir, name: &str, content: &[u8]) -> String {
 // End-to-end: one file → backup → restore → byte-for-byte match.
 // Cross-module flow: BackupCoordinator → DB → symbols_dir → RestoreCoordinator.
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_backup_restore_roundtrip() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
@@ -149,7 +149,7 @@ async fn full_backup_restore_roundtrip() {
 // Multiple small files packed into one source block, all restore correctly.
 // Validates Pack index serialization and per-file extraction in RestoreCoordinator.
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backup_restore_pack_multiple_files() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();

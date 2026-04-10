@@ -97,7 +97,7 @@ fn init_cluster(db: Db) -> ClusterState {
 
 // ─── Full lifecycle E2E test ──────────────────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_lifecycle_e2e() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();

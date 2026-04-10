@@ -41,8 +41,8 @@ use libp2p::PeerId;
 use syncback_core::cluster::DeviceCertificate;
 use syncback_core::config::EscrowCfg;
 use syncback_core::constants::{
-    BYTES_PER_GB, HANDSHAKE_FRESHNESS_SECS, INITIAL_TRUST_P, P_WINDOW_WEEKS,
-    SYMBOL_OFFER_EXPIRY_SECS, SYMBOL_SIZE,
+    BYTES_PER_GB, HANDSHAKE_FRESHNESS_SECS, INITIAL_TRUST_P, SYMBOL_OFFER_EXPIRY_SECS,
+    SYMBOL_SIZE,
 };
 use syncback_core::escrow::{check_restore, RestoreDecision};
 use syncback_core::db::{Db, SystemStateBlobRecord, WeeklyPosEntry};
@@ -59,9 +59,7 @@ use syncback_core::messages::{
 use syncback_core::pos::{
     apply_pos_outcome, outcome_from_verify, verify_response, PosResponse, VerifyOutcome,
 };
-use syncback_core::trust::{
-    compute_combined, recompute_master_trust, DeviceTrustRecord, MasterTrustRecord, PosOutcome,
-};
+use syncback_core::trust::{compute_combined, recalculate_trust, PosOutcome};
 use syncback_core::types::{
     hex_encode, DeviceId, HoldingRecord, HoldingStatus, IdentityPub, PeerRecord, PlacementStatus,
     SourceBlockId, Timestamp,
@@ -2491,102 +2489,6 @@ pub(crate) fn record_pos_weekly(db: &Db, device: DeviceId, outcome: PosOutcome) 
     if let Err(e) = db.upsert_pos_weekly(&device, week, &entry) {
         error!(device = %device, err = %e, "processor: failed to update pos_weekly");
     }
-}
-
-/// Recalculate trust P and I for a device from pos_weekly data, persist to PeerRecord.
-/// Returns (old_p, old_i, new_p, new_i) for logging, or None on error.
-pub(crate) fn recalculate_trust(
-    db: &Db,
-    device: &DeviceId,
-    current_week: u32,
-) -> Option<(f64, f64, f64, f64)> {
-    let mut record = match db.get_peer(device) {
-        Ok(Some(r)) => r,
-        _ => return None,
-    };
-    let old_p = record.trust_p;
-    let old_i = record.trust_i;
-
-    let entries = db.list_pos_weekly_for_peer(device).unwrap_or_default();
-
-    // P: rolling window pass rate over last P_WINDOW_WEEKS weeks.
-    let window_start = current_week.saturating_sub(P_WINDOW_WEEKS - 1);
-    let mut p_challenged = 0u64;
-    let mut p_passed = 0u64;
-    let mut all_pass_rates: Vec<f64> = Vec::new();
-    for (week, entry) in &entries {
-        if entry.challenged > 0 {
-            let rate = entry.passed as f64 / entry.challenged as f64;
-            all_pass_rates.push(rate);
-            if *week >= window_start && *week <= current_week {
-                p_challenged += entry.challenged as u64;
-                p_passed += entry.passed as u64;
-            }
-        }
-    }
-
-    let new_p = if p_challenged == 0 {
-        INITIAL_TRUST_P
-    } else {
-        p_passed as f64 / p_challenged as f64
-    };
-
-    // I: cumulative mean of all weekly pass rates.
-    let new_i = if all_pass_rates.is_empty() {
-        0.0
-    } else {
-        all_pass_rates.iter().sum::<f64>() / all_pass_rates.len() as f64
-    };
-
-    record.trust_p = new_p;
-    record.trust_i = new_i;
-    if let Err(e) = db.upsert_peer(&record) {
-        error!(device = %device, err = %e, "processor: failed to persist trust update");
-        return None;
-    }
-
-    // --- Two-level trust update ---
-    // Update DeviceTrustRecord for this specific device.
-    let dtr = DeviceTrustRecord {
-        device_id: *device,
-        trust_p: new_p,
-        trust_i: new_i,
-        last_week: current_week,
-    };
-    if let Err(e) = db.set_device_trust(&dtr) {
-        error!(device = %device, err = %e, "processor: failed to update device trust");
-    }
-
-    // Recompute master trust from all device trusts of this device's master.
-    let master_identity = record.master_identity;
-    let devices_for_master = db.get_devices_for_master(&master_identity).unwrap_or_default();
-    let device_data: Vec<(DeviceTrustRecord, u64)> = devices_for_master
-        .iter()
-        .filter_map(|did| {
-            db.get_device_trust(did).ok().flatten().map(|dt| {
-                // Weight = total alive symbol count for this device.
-                let weight: u64 = db
-                    .list_placements_for_holder(did)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|p| p.status == syncback_core::types::PlacementStatus::Alive)
-                    .map(|p| p.symbol_count() as u64)
-                    .sum();
-                (dt, weight.max(1))
-            })
-        })
-        .collect();
-    let master_combined = recompute_master_trust(&device_data);
-    let mtr = MasterTrustRecord {
-        identity: master_identity,
-        combined: master_combined,
-        last_updated: Timestamp::now(),
-    };
-    if let Err(e) = db.set_master_trust(&mtr) {
-        error!(device = %device, err = %e, "processor: failed to update master trust");
-    }
-
-    Some((old_p, old_i, new_p, new_i))
 }
 
 // ESI range helpers moved to syncback_core::types — use those directly.

@@ -268,15 +268,18 @@ impl RestoreCoordinator {
 
             blocks_fetched += 1;
 
-            // Extract each file from this block
+            // Extract each file from this block; create_dir_all + fs::write
+            // are blocking; wrap in block_in_place (review A1).
             for (record, version) in files_in_block {
-                let result = self.extract_and_write_file(
-                    record,
-                    version,
-                    &block_record.block_type,
-                    &plaintext,
-                    &request.output_dir,
-                );
+                let result = tokio::task::block_in_place(|| {
+                    self.extract_and_write_file(
+                        record,
+                        version,
+                        &block_record.block_type,
+                        &plaintext,
+                        &request.output_dir,
+                    )
+                });
                 match result {
                     Ok(()) => {
                         if let Err(e) =
@@ -333,37 +336,45 @@ impl RestoreCoordinator {
             .symbols_dir
             .join(pipeline::hex_encode(&block_id.0));
 
-        let mut unbound_symbols: Vec<Symbol> = Vec::new();
         let k_eff = params.k_eff as usize;
 
-        'outer: for placement in &usable_placements {
-            for (start_esi, count) in &placement.esi_ranges {
-                for i in 0..*count {
-                    let esi = start_esi + i;
-                    let symbol_path = block_dir.join(format!("{esi}.bin"));
-                    let data = match std::fs::read(&symbol_path) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            debug!(
-                                block = %block_id,
-                                esi,
-                                "symbol file missing or unreadable: {e}"
-                            );
-                            continue;
-                        }
-                    };
-                    let bound = Symbol { esi, data };
-                    let unbound = self
-                        .encoder
-                        .unbind(bound, block_id, &placement.holder_id);
-                    unbound_symbols.push(unbound);
+        // Reading symbol files from disk is blocking I/O; wrap the entire
+        // local-symbol scan in block_in_place so the tokio runtime keeps
+        // making progress on other tasks (review A1).
+        let mut unbound_symbols: Vec<Symbol> = tokio::task::block_in_place(|| {
+            let mut collected: Vec<Symbol> = Vec::new();
 
-                    if unbound_symbols.len() >= k_eff {
-                        break 'outer;
+            'outer: for placement in &usable_placements {
+                for (start_esi, count) in &placement.esi_ranges {
+                    for i in 0..*count {
+                        let esi = start_esi + i;
+                        let symbol_path = block_dir.join(format!("{esi}.bin"));
+                        let data = match std::fs::read(&symbol_path) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                debug!(
+                                    block = %block_id,
+                                    esi,
+                                    "symbol file missing or unreadable: {e}"
+                                );
+                                continue;
+                            }
+                        };
+                        let bound = Symbol { esi, data };
+                        let unbound = self
+                            .encoder
+                            .unbind(bound, block_id, &placement.holder_id);
+                        collected.push(unbound);
+
+                        if collected.len() >= k_eff {
+                            break 'outer;
+                        }
                     }
                 }
             }
-        }
+
+            collected
+        });
 
         if unbound_symbols.len() < k_eff {
             // Not enough locally — try network fetch for the remainder.
@@ -405,29 +416,31 @@ impl RestoreCoordinator {
             }
         }
 
-        // Decode: padded to k*t bytes
-        let padded = self
-            .encoder
-            .decode(&unbound_symbols, params)
-            .map_err(|e| RestoreError::DecodeFailed(*block_id, e.to_string()))?;
+        // Erasure decode + decrypt + decompress are CPU-heavy; wrap in
+        // block_in_place so the tokio runtime keeps running while we work
+        // (review A1).
+        tokio::task::block_in_place(|| {
+            let padded = self
+                .encoder
+                .decode(&unbound_symbols, params)
+                .map_err(|e| RestoreError::DecodeFailed(*block_id, e.to_string()))?;
 
-        // Trim to stored blob size
-        if padded.len() < encrypted_size as usize {
-            return Err(RestoreError::DecodeFailed(
-                *block_id,
-                format!(
-                    "decoded block ({} bytes) smaller than encrypted_size ({})",
-                    padded.len(),
-                    encrypted_size
-                ),
-            ));
-        }
-        let stored = &padded[..encrypted_size as usize];
+            if padded.len() < encrypted_size as usize {
+                return Err(RestoreError::DecodeFailed(
+                    *block_id,
+                    format!(
+                        "decoded block ({} bytes) smaller than encrypted_size ({})",
+                        padded.len(),
+                        encrypted_size
+                    ),
+                ));
+            }
+            let stored = &padded[..encrypted_size as usize];
 
-        // Decrypt + decompress
-        pipeline::decrypt_and_decompress(stored, &self.config.epoch_key).map_err(|e| {
-            error!(block = %block_id, "decrypt_and_decompress failed: {e}");
-            RestoreError::DecryptionFailed(*block_id)
+            pipeline::decrypt_and_decompress(stored, &self.config.epoch_key).map_err(|e| {
+                error!(block = %block_id, "decrypt_and_decompress failed: {e}");
+                RestoreError::DecryptionFailed(*block_id)
+            })
         })
     }
 
