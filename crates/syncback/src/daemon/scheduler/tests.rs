@@ -595,7 +595,7 @@ async fn offered_placement_timeout_marks_lost() {
     let pending = make_pending_challenges();
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
 
-    // time_scale = 1: threshold = SYMBOL_OFFER_TIMEOUT_SECS / 1 = 30 s.
+    // Threshold = SYMBOL_OFFER_TIMEOUT_SECS = 30 s (not scaled).
     // placed_at = 0 means age = now >> 30 s.
     let config = SchedulerConfig {
         pos_interval_secs: 3600,

@@ -689,8 +689,10 @@ impl Scheduler {
     /// Called on the sweep_timer tick (same interval as accepted_offers pruning).
     pub async fn sweep_offered_placements(&self) -> anyhow::Result<()> {
         let now = Timestamp::now();
-        let scale = self.config.time_scale.max(1);
-        let threshold = SYMBOL_OFFER_TIMEOUT_SECS / scale;
+        // Offered timeout is real-world network delivery time, NOT protocol time.
+        // Do NOT scale by time_scale — delivery takes real seconds regardless of
+        // how fast we run PoS/escrow timers.
+        let threshold = SYMBOL_OFFER_TIMEOUT_SECS;
 
         let placements = self.db.list_all_placements()?;
         for p in &placements {
