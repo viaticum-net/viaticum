@@ -296,9 +296,17 @@ impl Processor {
                             message,
                             response_channel,
                         }) => {
-                            let this2 = this.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = this2
+                            // Heavy messages (SymbolTransfer, RestoreRequest) carry
+                            // large payloads (25-50 MB). Processing them inline
+                            // (sequential) keeps peak RSS low — only one transfer
+                            // in memory at a time. Light messages are spawned for
+                            // concurrency.
+                            let is_heavy = matches!(
+                                message,
+                                Message::SymbolTransfer(_) | Message::RestoreRequest(_)
+                            );
+                            if is_heavy {
+                                if let Err(e) = this
                                     .dispatch_libp2p(
                                         from_device,
                                         from_master,
@@ -313,7 +321,26 @@ impl Processor {
                                         "processor: error handling libp2p message"
                                     );
                                 }
-                            });
+                            } else {
+                                let this2 = this.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = this2
+                                        .dispatch_libp2p(
+                                            from_device,
+                                            from_master,
+                                            message,
+                                            response_channel,
+                                        )
+                                        .await
+                                    {
+                                        error!(
+                                            device = %from_device,
+                                            err = %e,
+                                            "processor: error handling libp2p message"
+                                        );
+                                    }
+                                });
+                            }
                         }
                         Some(ProtocolEvent::ConnectionClosed { peer_id, device_id }) => {
                             let this2 = this.clone();
