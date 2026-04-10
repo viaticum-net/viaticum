@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use syncback_core::constants::{POS_TIMEOUT_SECS, S_CLAMP_MAX, S_CLAMP_MIN, SYMBOL_OFFER_TIMEOUT_SECS};
+use syncback_core::constants::{OFFERED_PLACEMENT_TIMEOUT_SECS, POS_TIMEOUT_SECS, S_CLAMP_MAX, S_CLAMP_MIN};
 use syncback_core::trust::{compute_combined, compute_effective_trust, recalculate_trust};
 use syncback_core::db::Db;
 use syncback_core::deletion::{DeletionAction, DeletionEngine};
@@ -692,7 +692,7 @@ impl Scheduler {
         // Offered timeout is real-world network delivery time, NOT protocol time.
         // Do NOT scale by time_scale — delivery takes real seconds regardless of
         // how fast we run PoS/escrow timers.
-        let threshold = SYMBOL_OFFER_TIMEOUT_SECS;
+        let threshold = OFFERED_PLACEMENT_TIMEOUT_SECS;
 
         let placements = self.db.list_all_placements()?;
         for p in &placements {

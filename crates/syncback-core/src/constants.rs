@@ -235,9 +235,14 @@ pub const BINOMIAL_EXACT_THRESHOLD: u32 = 100;
 
 // === Symbol offer handshake ===
 
-/// Timeout for awaiting SymbolAccept on a direct QUIC connection (seconds).
-/// Direct connection: 30s is generous. If no reply in 30s, the connection is dead.
+/// Timeout for awaiting SymbolAccept on a direct connection (seconds).
+/// Direct connection: 30s is generous for the offer→accept handshake.
 pub const SYMBOL_OFFER_TIMEOUT_SECS: u64 = 30;
+
+/// Timeout before an Offered placement is swept to Lost (seconds).
+/// Must be long enough for full symbol delivery (encode + transfer + disk write).
+/// 300s = 5 minutes — same as SYMBOL_OFFER_EXPIRY_SECS.
+pub const OFFERED_PLACEMENT_TIMEOUT_SECS: u64 = 300;
 
 /// Stale accepted offer expiry (seconds). AcceptedOffers older than this are
 /// discarded on next access even if no Transfer arrived.
