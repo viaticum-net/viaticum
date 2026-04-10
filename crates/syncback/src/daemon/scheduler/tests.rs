@@ -549,4 +549,140 @@ async fn deletion_tick_noop_when_no_eligible_files() {
     assert!(relay_post_rx.try_recv().is_err());
 }
 
+// ─── B3: sweep_offered_placements tests ──────────────────────────────────────
+
+/// An Offered placement past its timeout threshold is marked Lost and triggers repair.
+#[tokio::test]
+async fn offered_placement_timeout_marks_lost() {
+    let db = Db::open_in_memory().unwrap();
+    let block_id = make_block_id(20);
+    let holder_id = make_identity(21);
+
+    // Place far in the past so it's definitely timed out.
+    let ancient = Timestamp(0);
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id,
+        file_id: FileId(1),
+        esi_ranges: vec![(0, 64)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Offered,
+        last_verified: None,
+        placed_at: ancient,
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+
+    let (repair_tx, mut repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    let pending = make_pending_challenges();
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+
+    // time_scale = 1: threshold = SYMBOL_OFFER_TIMEOUT_SECS / 1 = 30 s.
+    // placed_at = 0 means age = now >> 30 s.
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending,
+        relay_post_tx,
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+    );
+
+    scheduler.sweep_offered_placements().await.unwrap();
+
+    // Placement should be Lost now.
+    let updated = db
+        .get_placement(&block_id, &holder_id)
+        .unwrap()
+        .expect("placement exists");
+    assert_eq!(
+        updated.status,
+        PlacementStatus::Lost,
+        "timed-out Offered placement should become Lost"
+    );
+
+    // repair_tx should have received RepairNow.
+    let trigger = repair_rx.try_recv().expect("repair trigger must be sent");
+    match trigger {
+        RepairTrigger::RepairNow {
+            block_id: bid,
+            holder_id: hid,
+        } => {
+            assert_eq!(bid, block_id);
+            assert_eq!(hid, holder_id);
+        }
+        other => panic!("expected RepairNow, got {other:?}"),
+    }
+}
+
+/// An Offered placement that was just created is NOT swept.
+#[tokio::test]
+async fn offered_placement_not_swept_before_timeout() {
+    let db = Db::open_in_memory().unwrap();
+    let block_id = make_block_id(22);
+    let holder_id = make_identity(23);
+
+    // Created right now — age ≈ 0, far below SYMBOL_OFFER_TIMEOUT_SECS.
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id,
+        file_id: FileId(1),
+        esi_ranges: vec![(0, 64)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Offered,
+        last_verified: None,
+        placed_at: Timestamp::now(),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+
+    let (repair_tx, mut repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    let pending = make_pending_challenges();
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending,
+        relay_post_tx,
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+    );
+
+    scheduler.sweep_offered_placements().await.unwrap();
+
+    // Placement should remain Offered — not yet expired.
+    let updated = db
+        .get_placement(&block_id, &holder_id)
+        .unwrap()
+        .expect("placement exists");
+    assert_eq!(
+        updated.status,
+        PlacementStatus::Offered,
+        "fresh Offered placement must not be swept"
+    );
+
+    // No repair triggered.
+    assert!(
+        repair_rx.try_recv().is_err(),
+        "no repair should be triggered for fresh Offered placement"
+    );
+}
+
 // ─── Stub network helper ──────────────────────────────────────────────────────

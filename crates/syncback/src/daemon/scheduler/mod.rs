@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use syncback_core::constants::{POS_TIMEOUT_SECS, S_CLAMP_MAX, S_CLAMP_MIN};
+use syncback_core::constants::{POS_TIMEOUT_SECS, S_CLAMP_MAX, S_CLAMP_MIN, SYMBOL_OFFER_TIMEOUT_SECS};
 use syncback_core::trust::{compute_combined, compute_effective_trust};
 use syncback_core::db::Db;
 use syncback_core::deletion::{DeletionAction, DeletionEngine};
@@ -210,6 +210,11 @@ impl Scheduler {
                                 debug!(dropped, keep_after, "scheduler: pruned pos_weekly");
                             }
                         }
+                    }
+
+                    // Sweep stale Offered placements → Lost.
+                    if let Err(e) = self.sweep_offered_placements().await {
+                        error!("scheduler: sweep_offered_placements error: {e}");
                     }
                 }
             }
@@ -656,6 +661,50 @@ impl Scheduler {
             }
         }
 
+        Ok(())
+    }
+
+    /// Sweep Offered placements that have exceeded the timeout threshold.
+    ///
+    /// For each stale Offered placement:
+    ///   1. Transition status to Lost via upsert_placement.
+    ///   2. Send RepairTrigger::RepairNow { block_id, holder_id }.
+    ///
+    /// Called on the sweep_timer tick (same interval as accepted_offers pruning).
+    pub async fn sweep_offered_placements(&self) -> anyhow::Result<()> {
+        let now = Timestamp::now();
+        let scale = self.config.time_scale.max(1);
+        let threshold = SYMBOL_OFFER_TIMEOUT_SECS / scale;
+
+        let placements = self.db.list_all_placements()?;
+        for p in &placements {
+            if p.status != PlacementStatus::Offered {
+                continue;
+            }
+            let age = now.0.saturating_sub(p.placed_at.0);
+            if age < threshold {
+                continue;
+            }
+            // Transition Offered → Lost.
+            let mut updated = p.clone();
+            updated.status = PlacementStatus::Lost;
+            self.db.upsert_placement(&updated)?;
+
+            info!(
+                block_id = %p.source_block_id,
+                holder = %p.holder_id,
+                age_secs = age,
+                "scheduler: Offered placement timed out → Lost"
+            );
+
+            let _ = self
+                .repair_tx
+                .send(RepairTrigger::RepairNow {
+                    block_id: p.source_block_id,
+                    holder_id: p.holder_id,
+                })
+                .await;
+        }
         Ok(())
     }
 }

@@ -1544,3 +1544,42 @@ fn compress_and_encrypt_roundtrip_with_deterministic_nonce() {
 // PendingDeliveries / OfferOutcome were iroh-era types; delivery now uses
 // libp2p SwarmHandle request-response. Network integration is tested in
 // swarm_tests.rs and the E2E test suite.
+
+// ─── B3 (Offered→Alive): pipeline creates Offered placements ─────────────────
+
+/// After flush_queue(), placements must be Offered (not Alive).
+/// They transition to Alive only after SymbolStored confirmation from the holder.
+#[test]
+fn pipeline_creates_offered_placements() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    // Enough data to trigger a flush (> source_block_size).
+    // Use .txt extension so files go to the Document category queue.
+    for i in 0..20u8 {
+        let content: Vec<u8> = (0..60_000u32)
+            .map(|j| (i as u32 ^ (j % 251)) as u8)
+            .collect();
+        let path = write_file(&files_dir, &format!("doc{i}.txt"), &content);
+        coord.process_event(added_event(&path)).unwrap();
+    }
+
+    let results = coord.flush_queue(FileCategory::Document, true).unwrap();
+    assert!(!results.is_empty(), "should produce at least one source block");
+
+    for result in &results {
+        let placements = db.list_placements_for_block(&result.source_block_id).unwrap();
+        assert!(!placements.is_empty(), "pipeline must create placements");
+        for p in &placements {
+            assert_eq!(
+                p.status,
+                PlacementStatus::Offered,
+                "pipeline must create Offered placements (not Alive), got {:?} for holder {}",
+                p.status,
+                p.holder_id
+            );
+        }
+    }
+}

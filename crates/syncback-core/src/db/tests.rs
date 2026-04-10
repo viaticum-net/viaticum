@@ -1,5 +1,5 @@
 use crate::db::testutil::{test_db, test_peer, test_peers};
-use crate::db::{SystemStateBlobRecord, WeeklyPosEntry};
+use crate::db::{Db, SystemStateBlobRecord, WeeklyPosEntry};
 use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
 use crate::types::{
     BudgetRecord, DeviceId, EventEntry, Event, FileId, FileRecord,
@@ -1961,4 +1961,111 @@ fn next_file_id_persists_across_reopen() {
     // Reopen and verify the counter survived.
     let db2 = crate::db::Db::open(&path).unwrap();
     assert_eq!(db2.load_next_file_id().unwrap(), 42);
+}
+
+// ============================================================
+// B3: transition_placement_offered_to_alive tests
+// ============================================================
+
+#[test]
+fn transition_offered_to_alive_updates_status() {
+    let db = Db::open_in_memory().unwrap();
+    let block_id = SourceBlockId([7; 32]);
+    let holder_id = DeviceId([8; 32]);
+    let placed_at = Timestamp(1000);
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id,
+        file_id: FileId(1),
+        esi_ranges: vec![(0, 50)],
+        binding_seed: [0; 32],
+        status: PlacementStatus::Offered,
+        last_verified: None,
+        placed_at,
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+
+    let alive_at = Timestamp(2000);
+    let result = db
+        .transition_placement_offered_to_alive(&block_id, &holder_id, alive_at)
+        .unwrap();
+    assert!(result, "should have transitioned");
+
+    let updated = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
+    assert_eq!(updated.status, PlacementStatus::Alive);
+    assert_eq!(
+        updated.placed_at, alive_at,
+        "placed_at should be updated to alive_at"
+    );
+
+    // Hot cache should now count these symbols as alive.
+    let hot = db.hot();
+    let agg = hot.blocks.get(&block_id).unwrap();
+    assert_eq!(agg.total_alive_symbols, 50);
+}
+
+#[test]
+fn transition_offered_to_alive_is_idempotent() {
+    let db = Db::open_in_memory().unwrap();
+    let block_id = SourceBlockId([9; 32]);
+    let holder_id = DeviceId([10; 32]);
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id,
+        file_id: FileId(1),
+        esi_ranges: vec![(0, 30)],
+        binding_seed: [0; 32],
+        status: PlacementStatus::Offered,
+        last_verified: None,
+        placed_at: Timestamp(1000),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+
+    let r1 = db
+        .transition_placement_offered_to_alive(&block_id, &holder_id, Timestamp(2000))
+        .unwrap();
+    assert!(r1);
+
+    let r2 = db
+        .transition_placement_offered_to_alive(&block_id, &holder_id, Timestamp(3000))
+        .unwrap();
+    assert!(!r2, "second call should be no-op (already Alive)");
+
+    let final_p = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
+    assert_eq!(final_p.status, PlacementStatus::Alive);
+    assert_eq!(
+        final_p.placed_at,
+        Timestamp(2000),
+        "placed_at should not change on second call"
+    );
+}
+
+#[test]
+fn transition_non_offered_placement_is_noop() {
+    let db = Db::open_in_memory().unwrap();
+    let block_id = SourceBlockId([11; 32]);
+    let holder_id = DeviceId([12; 32]);
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id,
+        file_id: FileId(1),
+        esi_ranges: vec![(0, 20)],
+        binding_seed: [0; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp(500),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+
+    let result = db
+        .transition_placement_offered_to_alive(&block_id, &holder_id, Timestamp(1000))
+        .unwrap();
+    assert!(!result, "should not transition Alive placement");
+
+    let p = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
+    assert_eq!(p.placed_at, Timestamp(500), "placed_at unchanged");
+    assert_eq!(p.status, PlacementStatus::Alive);
 }

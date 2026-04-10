@@ -638,6 +638,33 @@ impl Db {
         }
     }
 
+    /// Transition a placement from Offered to Alive.
+    ///
+    /// - Reads the existing placement from DB.
+    /// - If the placement does not exist or its status is not Offered: returns Ok(false).
+    /// - Sets status = Alive, placed_at = alive_at.
+    /// - Calls upsert_placement to persist the change and update the hot cache.
+    /// - Returns Ok(true) if the transition happened, Ok(false) if skipped.
+    pub fn transition_placement_offered_to_alive(
+        &self,
+        block_id: &SourceBlockId,
+        holder_id: &DeviceId,
+        alive_at: Timestamp,
+    ) -> Result<bool, DbError> {
+        let existing = match self.get_placement(block_id, holder_id)? {
+            Some(p) => p,
+            None => return Ok(false),
+        };
+        if existing.status != PlacementStatus::Offered {
+            return Ok(false);
+        }
+        let mut updated = existing;
+        updated.status = PlacementStatus::Alive;
+        updated.placed_at = alive_at;
+        self.upsert_placement(&updated)?;
+        Ok(true)
+    }
+
     /// Delete placement. Also cleans up indices and HOT cache.
     /// Returns the deleted placement, or None if it did not exist.
     pub fn delete_placement(

@@ -53,8 +53,8 @@ use syncback_core::messages::{
     PosChallengeMsg, PosNackMsg, PosResponseMsg,
     RejectReason, RestoreDeniedMsg, RestoreRequestMsg, RestoreResponseMsg, RevocationBroadcast,
     SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg,
-    SymbolTransferMsg, SystemStateAckMsg, SystemStateBackupMsg, SystemStateRequestMsg,
-    SystemStateResponseMsg, verify_peer_announce,
+    SymbolStoredMsg, SymbolTransferMsg, SystemStateAckMsg, SystemStateBackupMsg,
+    SystemStateRequestMsg, SystemStateResponseMsg, verify_peer_announce,
 };
 use syncback_core::pos::{
     apply_pos_outcome, outcome_from_verify, verify_response, PosResponse, VerifyOutcome,
@@ -488,13 +488,32 @@ impl Processor {
     ) -> anyhow::Result<()> {
         match message {
             Message::SymbolTransfer(transfer) => {
-                self.handle_symbol_transfer(from_master, transfer).await?;
-                let ack = Message::SystemStateAck(SystemStateAckMsg {
-                    v: 1,
-                    stored: true,
-                    timestamp: Timestamp::now(),
-                });
-                let _ = self.swarm.respond(response_channel, ack);
+                let block_id = transfer.source_block_id;
+                // Extract ESI list before moving transfer into handle_symbol_transfer.
+                let mut esi_list: Vec<u32> =
+                    transfer.symbols.iter().map(|s| s.esi).collect();
+                esi_list.sort_unstable();
+                match self.handle_symbol_transfer(from_master, transfer).await {
+                    Ok(()) => {
+                        let stored_ranges = esi_list_to_ranges(&esi_list);
+                        let reply = Message::SymbolStored(SymbolStoredMsg {
+                            v: 1,
+                            source_block_id: block_id,
+                            esi_ranges: stored_ranges,
+                            timestamp: Timestamp::now(),
+                        });
+                        let _ = self.swarm.respond(response_channel, reply);
+                    }
+                    Err(e) => {
+                        warn!(device = %from_device, err = %e, "processor: SymbolTransfer failed");
+                        let ack = Message::SystemStateAck(SystemStateAckMsg {
+                            v: 1,
+                            stored: false,
+                            timestamp: Timestamp::now(),
+                        });
+                        let _ = self.swarm.respond(response_channel, ack);
+                    }
+                }
             }
             Message::PosChallenge(challenge) => {
                 match self.handle_pos_challenge_inner(from_master, challenge).await {

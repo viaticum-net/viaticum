@@ -781,10 +781,58 @@ impl BackupCoordinator {
             timestamp: Timestamp::now(),
         };
 
-        swarm
+        let reply = swarm
             .send_to_device(placement.holder_id, Message::SymbolTransfer(msg))
             .await
-            .map_err(|e| anyhow::anyhow!("send_symbols: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("send SymbolTransfer: {e}"))?;
+
+        match reply {
+            Message::SymbolStored(_stored) => {
+                let now = Timestamp::now();
+                match self.db.transition_placement_offered_to_alive(
+                    &result.source_block_id,
+                    &placement.holder_id,
+                    now,
+                ) {
+                    Ok(true) => {
+                        tracing::info!(
+                            holder = %placement.holder_id,
+                            block_id = %result.source_block_id,
+                            symbols = symbol_count,
+                            "backup: symbols confirmed stored, placement Offered→Alive"
+                        );
+                    }
+                    Ok(false) => {
+                        tracing::debug!(
+                            holder = %placement.holder_id,
+                            "backup: placement transition skipped (not in Offered state)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            holder = %placement.holder_id,
+                            err = %e,
+                            "backup: DB error transitioning Offered→Alive"
+                        );
+                    }
+                }
+            }
+            Message::SystemStateAck(_) => {
+                // Old-protocol holder (pre-B3): accept delivery but do not transition.
+                // Placement stays Offered; sweep will mark it Lost after SYMBOL_OFFER_TIMEOUT_SECS.
+                tracing::debug!(
+                    holder = %placement.holder_id,
+                    "backup: got SystemStateAck instead of SymbolStored (old protocol)"
+                );
+            }
+            other => {
+                tracing::warn!(
+                    holder = %placement.holder_id,
+                    "backup: unexpected reply to SymbolTransfer: {:?}",
+                    std::mem::discriminant(&other)
+                );
+            }
+        }
 
         tracing::info!(
             holder = %placement.holder_id,

@@ -262,7 +262,7 @@ pub fn run_pipeline(
             file_id: primary_file_id,
             esi_ranges: vec![alloc.esi_range()],
             binding_seed: seed,
-            status: PlacementStatus::Alive, // Phase 2: set directly to Alive
+            status: PlacementStatus::Offered, // Offered; transitions to Alive after SymbolStored confirmation
             last_verified: None,
             placed_at: now,
             consecutive_misses: 0,
