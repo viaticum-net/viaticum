@@ -1,8 +1,9 @@
 use crate::constants::{POS_BASE_CHALLENGES_PER_WEEK, POS_TIMEOUT_SECS};
 use crate::erasure::{ErasureEncoder, RaptorQEncoder};
 use crate::pos::{
-    apply_pos_outcome, challenges_per_week, due_challenges, is_timed_out, outcome_from_verify,
-    select_challenge_esi, verify_response, PosChallenge, PosError, PosResponse, VerifyOutcome,
+    apply_pos_outcome, challenges_per_week, compute_chain_hash, due_challenges, is_timed_out,
+    outcome_from_verify, select_challenge_esi, verify_hash_response, verify_response, PosChallenge,
+    PosError, PosResponse, VerifyOutcome,
 };
 use crate::types::{
     DeviceId, ErasureParams, FileId, PlacementStatus, SourceBlockId, SymbolPlacement,
@@ -677,6 +678,51 @@ fn adaptive_rate_low_trust_more_challenges() {
         "low trust ({low_trust}) should produce more challenges ({low_result}) \
          than high trust ({high_trust}) ({high_result})"
     );
+}
+
+// ─── compute_chain_hash ──────────────────────────────────────────────────────
+
+#[test]
+fn compute_chain_hash_single_symbol() {
+    use sha2::{Digest, Sha256};
+    let data = vec![0xABu8; 64];
+    let symbols = vec![(0u32, data.as_slice())];
+    let hash = compute_chain_hash(&symbols).unwrap();
+    // Manual: h0 = [0;32], h1 = SHA256([0;32] || data)
+    let mut hasher = Sha256::new();
+    hasher.update([0u8; 32]);
+    hasher.update(&data);
+    let expected: [u8; 32] = hasher.finalize().into();
+    assert_eq!(hash, expected);
+}
+
+#[test]
+fn compute_chain_hash_order_dependent() {
+    let sym_a = vec![1u8; 32];
+    let sym_b = vec![2u8; 32];
+    let hash_ab = compute_chain_hash(&[(0, sym_a.as_slice()), (1, sym_b.as_slice())]).unwrap();
+    let hash_ba = compute_chain_hash(&[(0, sym_b.as_slice()), (1, sym_a.as_slice())]).unwrap();
+    assert_ne!(hash_ab, hash_ba);
+}
+
+#[test]
+fn compute_chain_hash_empty_errors() {
+    let result = compute_chain_hash(&[]);
+    assert!(matches!(result, Err(PosError::ChainHashEmptyInput)));
+}
+
+#[test]
+fn verify_hash_response_pass() {
+    let hash = [0xAAu8; 32];
+    assert_eq!(verify_hash_response(&hash, &hash, 0), VerifyOutcome::Pass);
+}
+
+#[test]
+fn verify_hash_response_fail() {
+    let hash_a = [0xAAu8; 32];
+    let hash_b = [0xBBu8; 32];
+    let result = verify_hash_response(&hash_a, &hash_b, 42);
+    assert_eq!(result, VerifyOutcome::Fail { esi: 42 });
 }
 
 // ─── POS-32: trust_factor clamped when trust > 1.0 ───────────────────────────

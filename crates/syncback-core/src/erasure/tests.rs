@@ -618,6 +618,65 @@ fn encode_never_panics_across_repair_esi_range() {
     }
 }
 
+// ─── encode_raw / apply_binding split ───────────────────────────────────────
+
+#[test]
+fn encode_raw_then_bind_equals_encode() {
+    let enc = encoder();
+    let source = test_data(65_535);
+    let params = ErasureParams::compute(65_535, 0.5).unwrap();
+    let bid = block_id(80);
+    let hid = holder(80);
+
+    let raw = enc.encode_raw(&source, &params, 0, 5).unwrap();
+    let via_split: Vec<Symbol> = raw
+        .into_iter()
+        .map(|s| enc.apply_binding(s, &bid, &hid))
+        .collect();
+
+    let via_encode = enc.encode(&source, &params, 0, 5, &bid, &hid).unwrap();
+
+    assert_eq!(via_split.len(), via_encode.len());
+    for (a, b) in via_split.iter().zip(via_encode.iter()) {
+        assert_eq!(a.esi, b.esi);
+        assert_eq!(a.data, b.data);
+    }
+}
+
+#[test]
+fn encode_raw_is_holder_independent() {
+    let enc = encoder();
+    let source = test_data(65_535);
+    let params = ErasureParams::compute(65_535, 0.5).unwrap();
+
+    let raw1 = enc.encode_raw(&source, &params, 0, 5).unwrap();
+    let raw2 = enc.encode_raw(&source, &params, 0, 5).unwrap();
+
+    assert_eq!(raw1.len(), raw2.len());
+    for (a, b) in raw1.iter().zip(raw2.iter()) {
+        assert_eq!(a.esi, b.esi);
+        assert_eq!(a.data, b.data);
+    }
+}
+
+#[test]
+fn encode_deterministic_two_calls() {
+    let enc = encoder();
+    let source = test_data(65_535);
+    let params = ErasureParams::compute(65_535, 0.5).unwrap();
+    let bid = block_id(81);
+    let hid = holder(81);
+
+    let r1 = enc.encode(&source, &params, 0, 5, &bid, &hid).unwrap();
+    let r2 = enc.encode(&source, &params, 0, 5, &bid, &hid).unwrap();
+
+    assert_eq!(r1.len(), r2.len());
+    for (a, b) in r1.iter().zip(r2.iter()) {
+        assert_eq!(a.esi, b.esi);
+        assert_eq!(a.data, b.data);
+    }
+}
+
 // ─── ERASURE-13: source block not a multiple of T — padding is trimmed ────────
 
 #[test]

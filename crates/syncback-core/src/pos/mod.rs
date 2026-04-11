@@ -77,6 +77,10 @@ pub enum PosError {
     /// Response data length does not match expected symbol size.
     #[error("response data length {got} != expected {expected}")]
     ResponseSizeMismatch { expected: usize, got: usize },
+
+    /// Chain hash input is empty (no symbols to hash).
+    #[error("chain hash input is empty (no symbols to hash)")]
+    ChainHashEmptyInput,
 }
 
 // ─── FNV-1a 32-bit (no external crate) ──────────────────────────────────────
@@ -391,6 +395,72 @@ pub fn apply_pos_outcome(
         }
     }
 }
+
+// ─── Chain hash ─────────────────────────────────────────────────────────────
+
+use sha2::{Digest, Sha256};
+
+/// Compute Samsara-style chain hash over bound symbol data.
+///
+/// Symbols must be provided as (esi, data) pairs sorted by ESI ascending.
+/// Algorithm: h0 = [0u8; 32], h_i = SHA256(h_{i-1} || symbol_data[i]), result = h_n.
+///
+/// Returns Err(ChainHashEmptyInput) if symbols is empty.
+pub fn compute_chain_hash(symbols: &[(u32, &[u8])]) -> Result<[u8; 32], PosError> {
+    if symbols.is_empty() {
+        return Err(PosError::ChainHashEmptyInput);
+    }
+    let mut h = [0u8; 32];
+    for (_esi, data) in symbols {
+        let mut hasher = Sha256::new();
+        hasher.update(h);
+        hasher.update(data);
+        let result = hasher.finalize();
+        h.copy_from_slice(&result);
+    }
+    Ok(h)
+}
+
+/// Verify a holder's chain hash response against the expected hash.
+///
+/// Returns Pass if hashes match, Fail { esi: first_esi } otherwise.
+/// first_esi is the first ESI in the holder's range — used for the Fail variant.
+pub fn verify_hash_response(
+    response_hash: &[u8; 32],
+    expected_hash: &[u8; 32],
+    first_esi: u32,
+) -> VerifyOutcome {
+    if response_hash == expected_hash {
+        VerifyOutcome::Pass
+    } else {
+        VerifyOutcome::Fail { esi: first_esi }
+    }
+}
+
+// ─── PendingHashChallenge ────────────────────────────────────────────────────
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// In-memory record for one outstanding block-level chain hash challenge.
+/// Keyed by (SourceBlockId, DeviceId) in the shared map.
+#[derive(Debug, Clone)]
+pub struct PendingHashChallenge {
+    pub source_block_id: SourceBlockId,
+    pub holder_id: DeviceId,
+    /// ESI ranges the holder was asked to prove.
+    pub esi_ranges: Vec<(u32, u32)>,
+    /// Expected chain hash, computed by owner at challenge time.
+    pub expected_chain_hash: [u8; 32],
+    /// Wall-clock time when challenge was issued.
+    pub issued_at: Timestamp,
+    /// Raw challenge_id from the wire message.
+    pub challenge_id: [u8; 16],
+}
+
+/// Shared map of in-flight hash challenges keyed by (SourceBlockId, DeviceId).
+pub type PendingHashChallenges =
+    Arc<Mutex<HashMap<(SourceBlockId, DeviceId), PendingHashChallenge>>>;
 
 #[cfg(test)]
 mod tests;

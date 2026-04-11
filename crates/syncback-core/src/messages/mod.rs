@@ -104,6 +104,50 @@ pub struct PosNackMsg {
     pub sig: [u8; 64],
 }
 
+/// Owner → Holder. Block-level chain hash challenge.
+/// Covers all ESI ranges for this holder for this source block.
+/// Response: holder computes SHA256-chain over all bound symbols (ESIs sorted ascending).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PosHashChallengeMsg {
+    pub v: u8,
+    /// Unique identifier for this challenge (random 16 bytes).
+    pub challenge_id: [u8; 16],
+    pub source_block_id: SourceBlockId,
+    /// ESI ranges assigned to this holder.
+    pub esi_ranges: Vec<(u32, u32)>,
+    pub timestamp: Timestamp,
+    #[serde(default)]
+    pub device_id: Option<DeviceId>,
+}
+
+/// Holder → Owner. Response to PosHashChallengeMsg.
+/// chain_hash = SHA256-chain over bound symbol data for all assigned ESIs (sorted ascending):
+///   h0 = [0u8; 32], h_i = SHA256(h_{i-1} || symbol[esi_i]), chain_hash = h_n
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PosHashResponseMsg {
+    pub v: u8,
+    pub challenge_id: [u8; 16],
+    /// Chain hash over all assigned ESIs.
+    pub chain_hash: [u8; 32],
+    pub timestamp: Timestamp,
+    #[serde(default)]
+    pub device_id: Option<DeviceId>,
+}
+
+/// Holder → Owner. Cannot serve the chain hash challenge (symbols missing).
+/// Sent when ANY of the challenged ESIs is missing on disk.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PosHashNackMsg {
+    pub v: u8,
+    pub challenge_id: [u8; 16],
+    pub source_block_id: SourceBlockId,
+    /// First missing ESI (ascending sort).
+    pub first_missing_esi: u32,
+    pub timestamp: Timestamp,
+    #[serde(default)]
+    pub device_id: Option<DeviceId>,
+}
+
 /// Owner → Holder. Offer to store symbols for a source block.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SymbolOfferMsg {
@@ -336,6 +380,9 @@ pub enum Message {
     PosChallenge(PosChallengeMsg),
     PosResponse(PosResponseMsg),
     PosNack(PosNackMsg),
+    PosHashChallenge(PosHashChallengeMsg),
+    PosHashResponse(PosHashResponseMsg),
+    PosHashNack(PosHashNackMsg),
     SymbolOffer(SymbolOfferMsg),
     SymbolAccept(SymbolAcceptMsg),
     SymbolReject(SymbolRejectMsg),

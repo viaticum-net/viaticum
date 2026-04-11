@@ -98,6 +98,25 @@ pub trait ErasureEncoder: Send + Sync {
         block_id: &SourceBlockId,
         holder_id: &DeviceId,
     ) -> Symbol;
+
+    /// Encode source_block into raw (unbound) RaptorQ symbols.
+    /// No per-holder XOR is applied. ESI = start_esi..start_esi+count-1.
+    fn encode_raw(
+        &self,
+        source_block: &[u8],
+        params: &ErasureParams,
+        start_esi: u32,
+        count: u32,
+    ) -> Result<Vec<Symbol>, ErasureError>;
+
+    /// Apply per-holder binding to a raw symbol.
+    /// XORs the symbol data with the binding keystream derived from (block_id, holder_id, esi).
+    fn apply_binding(
+        &self,
+        raw_symbol: Symbol,
+        block_id: &SourceBlockId,
+        holder_id: &DeviceId,
+    ) -> Symbol;
 }
 
 /// RaptorQ implementation using the `raptorq` crate.
@@ -150,59 +169,8 @@ impl ErasureEncoder for RaptorQEncoder {
         block_id: &SourceBlockId,
         holder_id: &DeviceId,
     ) -> Result<Vec<Symbol>, ErasureError> {
-        if source_block.is_empty() {
-            return Err(ErasureError::EmptyBlock);
-        }
-
-        let encoder = Self::make_block_encoder(source_block, params);
-        let k = params.k;
-        let t = params.t as usize;
-
-        // Fetch source packets once (only if we need any source-range ESIs).
-        let source_packets: Option<Vec<EncodingPacket>> = if start_esi < k {
-            Some(encoder.source_packets())
-        } else {
-            None
-        };
-
-        let mut symbols = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            let esi = start_esi + i;
-            let raw_data: Vec<u8> = if esi < k {
-                // Source symbol range: ESI 0..K-1
-                source_packets
-                    .as_ref()
-                    .and_then(|v| v.get(esi as usize))
-                    .ok_or(ErasureError::SourcePacketMissing { esi })?
-                    .data()
-                    .to_vec()
-            } else {
-                // Repair symbol range: ESI >= K
-                let repair_offset = esi - k;
-                let packets = encoder.repair_packets(repair_offset, 1);
-                packets
-                    .into_iter()
-                    .next()
-                    .ok_or(ErasureError::RepairPacketMissing { esi })?
-                    .data()
-                    .to_vec()
-            };
-
-            let mut data = raw_data;
-            if data.len() != t {
-                return Err(ErasureError::SymbolSizeMismatch {
-                    expected: t,
-                    got: data.len(),
-                });
-            }
-
-            let keystream = binding_keystream(block_id, holder_id, esi, t);
-            xor_inplace(&mut data, &keystream);
-
-            symbols.push(Symbol { esi, data });
-        }
-
-        Ok(symbols)
+        let raw = self.encode_raw(source_block, params, start_esi, count)?;
+        Ok(raw.into_iter().map(|s| self.apply_binding(s, block_id, holder_id)).collect())
     }
 
     fn decode(
@@ -254,6 +222,74 @@ impl ErasureEncoder for RaptorQEncoder {
         xor_inplace(&mut symbol.data, &keystream);
         symbol
     }
+
+    fn encode_raw(
+        &self,
+        source_block: &[u8],
+        params: &ErasureParams,
+        start_esi: u32,
+        count: u32,
+    ) -> Result<Vec<Symbol>, ErasureError> {
+        if source_block.is_empty() {
+            return Err(ErasureError::EmptyBlock);
+        }
+
+        let encoder = Self::make_block_encoder(source_block, params);
+        let k = params.k;
+        let t = params.t as usize;
+
+        // Fetch source packets once (only if we need any source-range ESIs).
+        let source_packets: Option<Vec<EncodingPacket>> = if start_esi < k {
+            Some(encoder.source_packets())
+        } else {
+            None
+        };
+
+        let mut symbols = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let esi = start_esi + i;
+            let raw_data: Vec<u8> = if esi < k {
+                source_packets
+                    .as_ref()
+                    .and_then(|v| v.get(esi as usize))
+                    .ok_or(ErasureError::SourcePacketMissing { esi })?
+                    .data()
+                    .to_vec()
+            } else {
+                let repair_offset = esi - k;
+                let packets = encoder.repair_packets(repair_offset, 1);
+                packets
+                    .into_iter()
+                    .next()
+                    .ok_or(ErasureError::RepairPacketMissing { esi })?
+                    .data()
+                    .to_vec()
+            };
+
+            if raw_data.len() != t {
+                return Err(ErasureError::SymbolSizeMismatch {
+                    expected: t,
+                    got: raw_data.len(),
+                });
+            }
+
+            symbols.push(Symbol { esi, data: raw_data });
+        }
+
+        Ok(symbols)
+    }
+
+    fn apply_binding(
+        &self,
+        mut raw_symbol: Symbol,
+        block_id: &SourceBlockId,
+        holder_id: &DeviceId,
+    ) -> Symbol {
+        let t = raw_symbol.data.len();
+        let keystream = binding_keystream(block_id, holder_id, raw_symbol.esi, t);
+        xor_inplace(&mut raw_symbol.data, &keystream);
+        raw_symbol
+    }
 }
 
 /// Compute binding seed for a (block_id, holder_id) pair.
@@ -275,7 +311,7 @@ pub fn binding_seed(block_id: &SourceBlockId, holder_id: &DeviceId) -> [u8; 32] 
 /// HKDF(salt=source_block_id, ikm=holder_id, info="syncback-binding", len=44)
 /// → 32-byte ChaCha20 key + 12-byte nonce base, with ESI XOR'd into nonce[8..12]
 /// → ChaCha20 stream of `t` zero-bytes = keystream
-fn binding_keystream(
+pub(crate) fn binding_keystream(
     block_id: &SourceBlockId,
     holder_id: &DeviceId,
     esi: u32,
