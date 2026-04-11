@@ -677,6 +677,41 @@ fn encode_deterministic_two_calls() {
     }
 }
 
+// ─── encode_raw empty block returns EmptyBlock error ────────────────────────────
+
+#[test]
+fn encode_empty_source_block_returns_error() {
+    let enc = encoder();
+    let params = ErasureParams { k: 1, t: 65535, overhead: 55.0, n: 2, k_eff: 1 };
+    let result = enc.encode_raw(&[], &params, 0, 1);
+    assert!(
+        matches!(result, Err(ErasureError::EmptyBlock)),
+        "expected EmptyBlock, got {result:?}"
+    );
+}
+
+// ─── encode_raw determinism across 100 calls ────────────────────────────────────
+
+#[test]
+fn encode_raw_deterministic_across_100_calls() {
+    let enc = encoder();
+    let source = vec![0xABu8; 65535 * 4]; // 4 source symbols
+    let params = ErasureParams { k: 4, t: 65535, overhead: 55.0, n: 8, k_eff: 4 };
+
+    let baseline = enc.encode_raw(&source, &params, 0, 8).unwrap();
+    for _ in 0..100 {
+        let result = enc.encode_raw(&source, &params, 0, 8).unwrap();
+        for (a, b) in baseline.iter().zip(result.iter()) {
+            assert_eq!(a.esi, b.esi);
+            assert_eq!(
+                a.data, b.data,
+                "non-deterministic encode at ESI {}",
+                a.esi
+            );
+        }
+    }
+}
+
 // ─── ERASURE-13: source block not a multiple of T — padding is trimmed ────────
 
 #[test]

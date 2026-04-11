@@ -838,4 +838,124 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
     );
 }
 
+// ─── D4: cleanup_block_removes_files_from_disk ───────────────────────────────
+
+/// CleanupBlock must call remove_dir_all on the owner-side source block directory.
+///
+/// Setup:
+///   - File: single device, deleted_at = 0 (well past owner + holder cooldowns).
+///   - Source block: Deleting.
+///   - Placement: Deleting.
+///   - source_blocks_dir contains {block_hex}/block.bin.
+///
+/// After process_deletion_tick the directory must be gone.
+#[tokio::test]
+async fn cleanup_block_removes_files_from_disk() {
+    use syncback_core::types::{
+        DeviceId, FileRecord, FileVersion, LocalState, SourceBlockRecord, SourceBlockStatus,
+        SourceBlockType,
+    };
+    use tempfile::TempDir;
+
+    let db = Db::open_in_memory().unwrap();
+    let source_blocks_tmp = TempDir::new().expect("tempdir");
+
+    let block_id = make_block_id(0xC1);
+    let holder_id = make_identity(0xC2);
+    let device_id = DeviceId([0xC3u8; 32]);
+
+    // File: single device, fully deleted at time 0.
+    let file = syncback_core::types::FileRecord {
+        file_id: FileId(200),
+        path: "cleanup_test.bin".to_string(),
+        importance: 0.5,
+        devices: vec![(device_id, syncback_core::types::LocalState::Deleted(Timestamp(0)))],
+        versions: vec![syncback_core::types::FileVersion {
+            content_hash: [0; 32],
+            source_block_id: block_id,
+            k: 10,
+            t: 65535,
+            created_at: Timestamp(0),
+            backed_up_at: Some(Timestamp(0)),
+        }],
+        first_seen: Timestamp(0),
+    };
+    db.upsert_file(&file).unwrap();
+
+    // Source block: already in Deleting state.
+    let sb = syncback_core::types::SourceBlockRecord {
+        block_id,
+        k: 10,
+        t: 65535,
+        block_type: syncback_core::types::SourceBlockType::Single,
+        status: syncback_core::types::SourceBlockStatus::Deleting,
+        created_at: Timestamp(0),
+        encrypted_size: None,
+        n: None,
+        overhead: None,
+        drop_notice_sent_at: Some(Timestamp(0)), // already sent, skip SendDropNotice
+    };
+    db.upsert_source_block(&sb).unwrap();
+
+    // Placement: already Deleting (holder has acknowledged).
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id,
+        file_id: FileId(200),
+        esi_ranges: vec![(0, 64)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Deleting,
+        last_verified: None,
+        placed_at: Timestamp(0),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+
+    // Create the owner-side directory with a fake block.bin.
+    let block_hex = syncback_core::types::hex_encode(&block_id.0);
+    let block_dir = source_blocks_tmp.path().join(&block_hex);
+    std::fs::create_dir_all(&block_dir).unwrap();
+    std::fs::write(block_dir.join("block.bin"), b"fake content").unwrap();
+    assert!(block_dir.exists(), "block dir must exist before the tick");
+
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let pending = make_pending_challenges();
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending,
+        relay_post_tx,
+        signing_key,
+        source_blocks_tmp.path().to_path_buf(),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+    );
+
+    scheduler.process_deletion_tick().await.unwrap();
+
+    // The block directory must have been removed.
+    assert!(
+        !block_dir.exists(),
+        "CleanupBlock must remove the source block directory from disk"
+    );
+
+    // Source block record must also be gone from DB.
+    let sb_after = db.get_source_block(&block_id).unwrap();
+    assert!(
+        sb_after.is_none(),
+        "CleanupBlock must delete the source block record from DB"
+    );
+}
+
 // ─── Stub network helper ──────────────────────────────────────────────────────

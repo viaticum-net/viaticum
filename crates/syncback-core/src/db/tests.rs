@@ -1912,6 +1912,31 @@ fn write_txn_delete_placement_queues_correct_delta() {
 // ─── Retention / pruning (review BLOCK-4, Wave 2 B5) ──────────────────────────
 
 #[test]
+fn event_log_pruning_reduces_rows() {
+    let db = crate::db::Db::open_in_memory().unwrap();
+    // Write 100 events.
+    for i in 0u8..100 {
+        db.append_event(&make_event(i % 250)).unwrap();
+    }
+    // Verify we have 100 (seqs 1..=100).
+    let events = db.events_after(0, 200).unwrap();
+    assert_eq!(events.len(), 100);
+
+    // Prune: keep seq >= 81 (i.e. drop seq 1..=80).
+    let removed = db.truncate_event_log_before(81).unwrap();
+    assert_eq!(removed, 80, "should remove exactly 80 rows");
+
+    let after = db.events_after(0, 200).unwrap();
+    assert!(
+        after.len() <= 20,
+        "after pruning: {} rows (expected ≤ 20)",
+        after.len()
+    );
+    // Verify the first surviving sequence number is 81.
+    assert_eq!(after[0].0, 81, "first surviving seq must be 81");
+}
+
+#[test]
 fn truncate_event_log_before_drops_old_entries_and_keeps_new() {
     let db = crate::db::Db::open_in_memory().unwrap();
     for i in 0..10 {
