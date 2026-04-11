@@ -11,7 +11,7 @@ use libp2p::request_response::Codec;
 use libp2p::StreamProtocol;
 use syncback_core::cluster::issue_device_certificate;
 use syncback_core::messages::{
-    Message, PosChallengeMsg, SymbolTransferMsg,
+    Message, PosHashChallengeMsg, SymbolTransferMsg,
 };
 use syncback_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp};
 use tokio::time::timeout;
@@ -21,29 +21,28 @@ use crate::daemon::network::swarm::{
 };
 use super::swarm_test_helpers::{get_listen_addr, make_cert, make_signing_key, make_swarm_config, wait_for_authenticated};
 
-/// Build a PosChallenge message for testing.
+/// Build a PosHashChallenge message for testing.
 fn make_pos_challenge() -> Message {
-    Message::PosChallenge(PosChallengeMsg {
+    Message::PosHashChallenge(PosHashChallengeMsg {
         v: 1,
         challenge_id: [1u8; 16],
         source_block_id: SourceBlockId([2u8; 32]),
-        esi: 42,
+        esi_ranges: vec![(42, 1)],
         timestamp: Timestamp(1000),
         device_id: None,
     })
 }
 
-/// Build a PosNack message for testing.
+/// Build a PosHashNack message for testing.
 fn make_pos_nack() -> Message {
-    let key = ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]);
-    Message::PosNack(syncback_core::messages::build_pos_nack(
-        [1u8; 16],
-        SourceBlockId([2u8; 32]),
-        42,
-        Timestamp(1001),
-        None,
-        &key,
-    ))
+    Message::PosHashNack(syncback_core::messages::PosHashNackMsg {
+        v: 1,
+        challenge_id: [1u8; 16],
+        source_block_id: SourceBlockId([2u8; 32]),
+        first_missing_esi: 42,
+        timestamp: Timestamp(1001),
+        device_id: None,
+    })
 }
 
 // ─── Codec unit tests ─────────────────────────────────────────────────────────
@@ -242,7 +241,7 @@ async fn send_to_device_round_trip() {
     tokio::spawn(async move {
         while let Some(event) = events_b.recv().await {
             if let ProtocolEvent::InboundRequest {
-                message: Message::PosChallenge(_),
+                message: Message::PosHashChallenge(_),
                 response_channel,
                 ..
             } = event

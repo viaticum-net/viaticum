@@ -5,9 +5,9 @@
 //   - Dispatch received messages to the appropriate handler.
 //
 // Role separation:
-//   PosChallenge received   → we are the holder  → load symbol, send PosResponse or PosNack
-//   PosResponse received    → we are the owner   → verify, update trust/placement
-//   PosNack received        → we are the owner   → mark placement Lost, trigger repair
+//   PosHashChallenge received → we are the holder  → compute chain hash, send PosHashResponse or PosHashNack
+//   PosHashResponse received  → we are the owner   → verify hash, update trust/placement
+//   PosHashNack received      → we are the owner   → mark placement Lost, trigger repair
 //   SymbolTransfer received → we are the holder  → write symbols to disk, record HoldingRecord
 //   SymbolDropped received  → we are the owner   → mark placement Lost, trigger repair
 //   SymbolOffer received    → we are the holder  → check quota, send Accept or Reject
@@ -25,12 +25,11 @@
 //   PeerAuthenticated → upsert PeerRecord, auto-add cluster device, send PeerAnnounce.
 //   InboundRequest    → dispatch_libp2p: match Message variant, call handler, send via ResponseChannel.
 //   ConnectionClosed  → remove from peer_cert_map.
-//   One-way messages (PoS, Delete, Drop) still arrive via relay board (dispatch_relay).
+//   One-way messages (PosHash, Delete, Drop) still arrive via relay board (dispatch_relay).
 //
-// Design note: PosResponseMsg on the wire does not carry source_block_id.
-// We recover it by scanning placements for the holder and finding one whose
-// ESI ranges include the challenged ESI. This is a Phase 6.3 simplification;
-// Phase 6.5 (Scheduler) will track challenge context in a pending table.
+// Design note: PosHashResponseMsg on the wire does not carry source_block_id.
+// We recover it by looking up the challenge_id in the shared PendingChallenges
+// map (written by Scheduler when the challenge was issued).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -44,7 +43,7 @@ use syncback_core::db::Db;
 use syncback_core::erasure::ErasureEncoder;
 use syncback_core::messages::{
     AckMsg, CancelDeleteMsg, DeleteMsg, Message, PeerAnnounceMsg,
-    PosChallengeMsg, PosNackMsg, PosResponseMsg,
+    PosHashChallengeMsg, PosHashNackMsg, PosHashResponseMsg,
     RestoreDeniedMsg, RevocationBroadcast,
     SymbolDropNoticeMsg, SymbolDroppedMsg,
     SymbolStoredMsg, SystemStateAckMsg,
@@ -411,13 +410,13 @@ impl Processor {
                     }
                 }
             }
-            Message::PosChallenge(challenge) => {
-                match self.handle_pos_challenge_inner(from_master, challenge).await {
+            Message::PosHashChallenge(challenge) => {
+                match self.handle_pos_hash_challenge_inner(from_master, challenge).await {
                     Ok(reply) => {
                         let _ = self.swarm.respond(response_channel, reply);
                     }
                     Err(e) => {
-                        warn!(device = %from_device, err = %e, "processor: PosChallenge handler failed");
+                        warn!(device = %from_device, err = %e, "processor: PosHashChallenge handler failed");
                     }
                 }
             }
@@ -587,23 +586,23 @@ impl Processor {
                     Err(e) => warn!(err = %e, "processor: failed to decode PeerAnnounce from relay"),
                 }
             }
-            "pos_challenge" => {
-                match from_cbor::<PosChallengeMsg>(&msg.payload) {
+            "pos_hash_challenge" => {
+                match from_cbor::<PosHashChallengeMsg>(&msg.payload) {
                     Ok(challenge) => {
-                        match self.handle_pos_challenge_inner(msg.from, challenge).await {
+                        match self.handle_pos_hash_challenge_inner(msg.from, challenge).await {
                             Ok(reply) => {
                                 // Send response back via board (directed to challenger).
                                 let (reply_type, reply_payload) = match &reply {
-                                    Message::PosResponse(r) => {
+                                    Message::PosHashResponse(r) => {
                                         match syncback_core::messages::to_cbor(r) {
-                                            Ok(bytes) => ("pos_response", bytes),
-                                            Err(e) => { warn!(err = %e, "processor: failed to encode PosResponse"); return; }
+                                            Ok(bytes) => ("pos_hash_response", bytes),
+                                            Err(e) => { warn!(err = %e, "processor: failed to encode PosHashResponse"); return; }
                                         }
                                     }
-                                    Message::PosNack(n) => {
+                                    Message::PosHashNack(n) => {
                                         match syncback_core::messages::to_cbor(n) {
-                                            Ok(bytes) => ("pos_nack", bytes),
-                                            Err(e) => { warn!(err = %e, "processor: failed to encode PosNack"); return; }
+                                            Ok(bytes) => ("pos_hash_nack", bytes),
+                                            Err(e) => { warn!(err = %e, "processor: failed to encode PosHashNack"); return; }
                                         }
                                     }
                                     _ => return,
@@ -617,14 +616,14 @@ impl Processor {
                                     msg_id: reply_id,
                                 }).await;
                             }
-                            Err(e) => warn!(err = %e, "processor: PosChallenge via relay failed"),
+                            Err(e) => warn!(err = %e, "processor: PosHashChallenge via relay failed"),
                         }
                     }
-                    Err(e) => warn!(err = %e, "processor: failed to decode PosChallenge from relay"),
+                    Err(e) => warn!(err = %e, "processor: failed to decode PosHashChallenge from relay"),
                 }
             }
-            "pos_response" => {
-                match from_cbor::<PosResponseMsg>(&msg.payload) {
+            "pos_hash_response" => {
+                match from_cbor::<PosHashResponseMsg>(&msg.payload) {
                     Ok(response) => {
                         // Resolve DeviceId: use device_id from message body if present,
                         // else fall back to first device for the master (msg.from).
@@ -632,15 +631,15 @@ impl Processor {
                             .or_else(|| self.db.get_devices_for_master(&msg.from).ok()
                                 .and_then(|ds| ds.into_iter().next()))
                             .unwrap_or(DeviceId(msg.from.0));
-                        if let Err(e) = self.handle_pos_response(holder_device, response).await {
-                            warn!(err = %e, "processor: PosResponse via relay failed");
+                        if let Err(e) = self.handle_pos_hash_response(holder_device, response).await {
+                            warn!(err = %e, "processor: PosHashResponse via relay failed");
                         }
                     }
-                    Err(e) => warn!(err = %e, "processor: failed to decode PosResponse from relay"),
+                    Err(e) => warn!(err = %e, "processor: failed to decode PosHashResponse from relay"),
                 }
             }
-            "pos_nack" => {
-                match from_cbor::<PosNackMsg>(&msg.payload) {
+            "pos_hash_nack" => {
+                match from_cbor::<PosHashNackMsg>(&msg.payload) {
                     Ok(nack) => {
                         // Resolve DeviceId: use device_id from message body if present,
                         // else fall back to first device for the master (msg.from).
@@ -648,11 +647,11 @@ impl Processor {
                             .or_else(|| self.db.get_devices_for_master(&msg.from).ok()
                                 .and_then(|ds| ds.into_iter().next()))
                             .unwrap_or(DeviceId(msg.from.0));
-                        if let Err(e) = self.handle_pos_nack(from_device, nack).await {
-                            warn!(err = %e, "processor: PosNack via relay failed");
+                        if let Err(e) = self.handle_pos_hash_nack(from_device, nack).await {
+                            warn!(err = %e, "processor: PosHashNack via relay failed");
                         }
                     }
-                    Err(e) => warn!(err = %e, "processor: failed to decode PosNack from relay"),
+                    Err(e) => warn!(err = %e, "processor: failed to decode PosHashNack from relay"),
                 }
             }
             "delete" => {

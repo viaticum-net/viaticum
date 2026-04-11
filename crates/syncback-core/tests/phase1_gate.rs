@@ -12,7 +12,7 @@ use syncback_core::{
     db::testutil::test_db,
     erasure::{ErasureEncoder, RaptorQEncoder},
     escrow::{check_restore, RestoreDecision},
-    pos::{outcome_from_verify, select_challenge_esi, verify_response, PosResponse, VerifyOutcome},
+    pos::{compute_chain_hash, outcome_from_verify, verify_hash_response, VerifyOutcome},
     trust::{PosOutcome, TrustEngine},
     types::{
         DeviceId, Event, EventEntry, ErasureParams, FileId, FileRecord, FileVersion,
@@ -81,84 +81,85 @@ fn full_encode_decode_pipeline() {
     assert_eq!(&decoded[..source.len()], source.as_slice());
 }
 
-// ─── 2. pos_challenge_verify_roundtrip ──────────────────────────────────────
+// ─── 2. pos_hash_challenge_verify_roundtrip ─────────────────────────────────
 
 #[test]
-fn pos_challenge_verify_roundtrip() {
+fn pos_hash_challenge_verify_roundtrip() {
     let source = test_data(65_535);
     let params = ErasureParams::compute(65_535, 0.5).unwrap();
     let bid = block_id(2);
     let holder = peer_id(2);
     let enc = RaptorQEncoder::new();
 
-    // Build a placement covering ESI 0..4.
-    let placement = SymbolPlacement {
-        source_block_id: bid,
-        holder_id: holder,
-        file_id: FileId(1),
-        esi_ranges: vec![(0, 4)],
-        binding_seed: [0u8; 32],
-        status: PlacementStatus::Alive,
-        last_verified: None,
-        placed_at: now(),
-        consecutive_misses: 0,
-    };
+    // ESI ranges assigned to the holder: ESIs 0..4.
+    let esi_ranges = vec![(0u32, 4u32)];
+    let esis: Vec<u32> = (0..4).collect();
 
-    // Select a challenge ESI deterministically.
-    let esi = select_challenge_esi(&placement, 42).expect("select_challenge_esi must succeed");
-    assert!(esi < 4, "ESI must be within assigned range");
+    // Owner side: encode all symbols and compute expected chain hash.
+    let mut symbol_data: Vec<(u32, Vec<u8>)> = Vec::new();
+    for &esi in &esis {
+        let bound = enc
+            .encode(&source, &params, esi, 1, &bid, &holder)
+            .expect("encode must succeed");
+        symbol_data.push((esi, bound[0].data.clone()));
+    }
+    let refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
+    let expected_hash = compute_chain_hash(&refs).expect("compute_chain_hash must succeed");
 
-    // Holder encodes the challenged symbol.
-    let bound = enc
-        .encode(&source, &params, esi, 1, &bid, &holder)
-        .expect("encode must succeed");
-    let response = PosResponse {
-        challenge_id: [0u8; 16],
-        esi,
-        data: bound[0].data.clone(),
-    };
+    // Holder side: reads same symbols and computes same chain hash.
+    let holder_refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
+    let holder_hash = compute_chain_hash(&holder_refs).expect("holder compute_chain_hash");
 
     // Verify.
-    let outcome = verify_response(&response, &source, &params, &bid, &holder, &enc)
-        .expect("verify_response must not error");
+    let first_esi = esi_ranges[0].0;
+    let outcome = verify_hash_response(&holder_hash, &expected_hash, first_esi);
     assert_eq!(outcome, VerifyOutcome::Pass);
+
+    // Unused but kept for completeness.
+    let _ = esi_ranges;
 }
 
-// ─── 3. pos_challenge_detect_corruption ─────────────────────────────────────
+// ─── 3. pos_hash_challenge_detect_corruption ────────────────────────────────
 
 #[test]
-fn pos_challenge_detect_corruption() {
+fn pos_hash_challenge_detect_corruption() {
     let source = test_data(65_535);
     let params = ErasureParams::compute(65_535, 0.5).unwrap();
     let bid = block_id(3);
     let holder = peer_id(3);
     let enc = RaptorQEncoder::new();
 
-    let placement = SymbolPlacement {
-        source_block_id: bid,
-        holder_id: holder,
-        file_id: FileId(1),
-        esi_ranges: vec![(0, 4)],
-        binding_seed: [0u8; 32],
-        status: PlacementStatus::Alive,
-        last_verified: None,
-        placed_at: now(),
-        consecutive_misses: 0,
-    };
+    // ESI range: 0..4.
+    let esis: Vec<u32> = (0..4).collect();
+    let first_esi = esis[0];
 
-    let esi = select_challenge_esi(&placement, 7).expect("select esi");
+    // Owner computes expected chain hash from correct symbol data.
+    let mut symbol_data: Vec<(u32, Vec<u8>)> = Vec::new();
+    for &esi in &esis {
+        let bound = enc
+            .encode(&source, &params, esi, 1, &bid, &holder)
+            .expect("encode must succeed");
+        symbol_data.push((esi, bound[0].data.clone()));
+    }
+    let refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
+    let expected_hash = compute_chain_hash(&refs).expect("compute expected chain hash");
 
-    // Build a corrupted response: all zeros of the right size.
-    let corrupt_data = vec![0u8; params.t as usize];
-    let response = PosResponse {
-        challenge_id: [0u8; 16],
-        esi,
-        data: corrupt_data,
-    };
+    // Holder has corrupted data: all zeros for each symbol.
+    let corrupt_symbol_data: Vec<(u32, Vec<u8>)> = esis
+        .iter()
+        .map(|&esi| (esi, vec![0u8; params.t as usize]))
+        .collect();
+    let corrupt_refs: Vec<(u32, &[u8])> = corrupt_symbol_data.iter()
+        .map(|(e, d)| (*e, d.as_slice()))
+        .collect();
+    let corrupt_hash = compute_chain_hash(&corrupt_refs).expect("compute corrupt chain hash");
 
-    let outcome = verify_response(&response, &source, &params, &bid, &holder, &enc)
-        .expect("verify_response must not error on well-formed input");
-    assert_eq!(outcome, VerifyOutcome::Fail { esi });
+    // Verify: hash mismatch → Fail.
+    let outcome = verify_hash_response(&corrupt_hash, &expected_hash, first_esi);
+    assert!(
+        matches!(outcome, VerifyOutcome::Fail { esi } if esi == first_esi),
+        "expected Fail{{esi: {first_esi}}}, got {outcome:?}"
+    );
 }
 
 // ─── 4. trust_records_pos_results ───────────────────────────────────────────
@@ -551,29 +552,31 @@ fn full_owner_flow() {
         assert_eq!(agg.symbol_count, k_eff);
     }
 
-    // ── Step 3: generate PoS challenge and verify ────────────────────────────
+    // ── Step 3: generate hash PoS challenge and verify ──────────────────────
     let loaded_placement = db
         .get_placement(&bid, &holder)
         .expect("get_placement")
         .expect("must exist");
 
-    let esi = select_challenge_esi(&loaded_placement, 99).expect("select_challenge_esi");
+    // Owner encodes all symbols and computes expected chain hash.
+    let mut symbol_data: Vec<(u32, Vec<u8>)> = Vec::new();
+    for &(start, count) in &loaded_placement.esi_ranges {
+        for esi in start..start + count {
+            let bound = enc
+                .encode(&source, &params, esi, 1, &bid, &holder)
+                .expect("encode for challenge");
+            symbol_data.push((esi, bound[0].data.clone()));
+        }
+    }
+    let refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
+    let expected_hash = compute_chain_hash(&refs).expect("compute expected chain hash");
 
-    // Re-encode expected symbol (owner side).
-    let expected_bound = enc
-        .encode(&source, &params, esi, 1, &bid, &holder)
-        .expect("encode for challenge");
+    // Holder computes the same chain hash and returns it.
+    let holder_refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
+    let holder_hash = compute_chain_hash(&holder_refs).expect("holder compute chain hash");
 
-    // Simulate holder response.
-    let response = PosResponse {
-        challenge_id: [0u8; 16],
-        esi,
-        data: expected_bound[0].data.clone(),
-    };
-
-    let outcome =
-        verify_response(&response, &source, &params, &bid, &holder, &enc)
-            .expect("verify_response");
+    let first_esi = loaded_placement.esi_ranges.first().map(|&(s, _)| s).unwrap_or(0);
+    let outcome = verify_hash_response(&holder_hash, &expected_hash, first_esi);
     assert_eq!(outcome, VerifyOutcome::Pass);
 
     // ── Step 4: record PoS result in TrustEngine ─────────────────────────────

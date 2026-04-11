@@ -6,8 +6,6 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use super::PosNackMsg;
-
 use super::*;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -279,31 +277,6 @@ fn all_message_variants_frame_roundtrip() {
             sig: [0u8; 64],
             x25519_pub: None,
         }),
-        Message::PosChallenge(PosChallengeMsg {
-            v: 1,
-            challenge_id: [0u8; 16],
-            source_block_id: sbid,
-            esi: 0,
-            timestamp: ts,
-            device_id: None,
-        }),
-        Message::PosResponse(PosResponseMsg {
-            v: 1,
-            challenge_id: [0u8; 16],
-            esi: 0,
-            data: vec![0u8; 16],
-            timestamp: ts,
-            device_id: None,
-        }),
-        Message::PosNack(PosNackMsg {
-            v: 1,
-            challenge_id: [0xABu8; 16],
-            source_block_id: sbid,
-            esi: 42,
-            timestamp: ts,
-            device_id: None,
-            sig: [0u8; 64],
-        }),
         Message::SymbolOffer(SymbolOfferMsg {
             v: 1,
             msg_id: [0u8; 16],
@@ -421,34 +394,6 @@ fn to_cbor_from_cbor_roundtrip() {
     let bytes = to_cbor(&offer).unwrap();
     let decoded: SymbolOfferMsg = from_cbor(&bytes).unwrap();
     assert_eq!(decoded, offer);
-}
-
-#[test]
-fn pos_nack_msg_roundtrip() {
-    let sbid = SourceBlockId([1u8; 32]);
-    let ts = Timestamp(1_000_000);
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-    let msg = build_pos_nack([0xABu8; 16], sbid, 42, ts, None, &signing_key);
-    let encoded = to_cbor(&Message::PosNack(msg.clone())).unwrap();
-    let decoded: Message = from_cbor(&encoded).unwrap();
-    assert!(matches!(decoded, Message::PosNack(ref m) if *m == msg));
-}
-
-#[test]
-fn pos_nack_framing_roundtrip() {
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
-    let msg = Message::PosNack(build_pos_nack(
-        [0xCDu8; 16],
-        SourceBlockId([2u8; 32]),
-        99,
-        Timestamp(2_000_000),
-        None,
-        &signing_key,
-    ));
-    let framed = frame_message(&msg).unwrap();
-    let (decoded, consumed) = unframe_message(&framed).unwrap();
-    assert_eq!(decoded, msg);
-    assert_eq!(consumed, framed.len());
 }
 
 // ─── cluster / handshake extension tests ────────────────────────────────────
@@ -649,9 +594,9 @@ fn system_state_response_msg_roundtrip() {
     assert_eq!(consumed, framed.len());
 }
 
-// ─── PROP-01: CBOR roundtrip sweep — all 29 Message variants ────────────────
+// ─── PROP-01: CBOR roundtrip sweep — all 26 Message variants ────────────────
 
-fn all_29_message_variants() -> Vec<Message> {
+fn all_26_message_variants() -> Vec<Message> {
     let sbid = make_source_block_id(1);
     let ts = Timestamp(1000);
 
@@ -684,31 +629,6 @@ fn all_29_message_variants() -> Vec<Message> {
             timestamp: ts,
             sig: [0u8; 64],
             x25519_pub: None,
-        }),
-        Message::PosChallenge(PosChallengeMsg {
-            v: 1,
-            challenge_id: [0u8; 16],
-            source_block_id: sbid,
-            esi: 0,
-            timestamp: ts,
-            device_id: None,
-        }),
-        Message::PosResponse(PosResponseMsg {
-            v: 1,
-            challenge_id: [0u8; 16],
-            esi: 0,
-            data: vec![0u8; 16],
-            timestamp: ts,
-            device_id: None,
-        }),
-        Message::PosNack(PosNackMsg {
-            v: 1,
-            challenge_id: [0xABu8; 16],
-            source_block_id: sbid,
-            esi: 42,
-            timestamp: ts,
-            device_id: None,
-            sig: [0u8; 64],
         }),
         Message::PosHashChallenge(PosHashChallengeMsg {
             v: 1,
@@ -867,8 +787,8 @@ fn all_29_message_variants() -> Vec<Message> {
 
 #[test]
 fn all_message_variants_cbor_roundtrip_sweep() {
-    let variants = all_29_message_variants();
-    assert_eq!(variants.len(), 29, "expected 29 Message variants");
+    let variants = all_26_message_variants();
+    assert_eq!(variants.len(), 26, "expected 26 Message variants");
     for msg in &variants {
         let bytes = to_cbor(msg).expect("to_cbor must not fail");
         let decoded: Message = from_cbor(&bytes).expect("from_cbor must not fail");
@@ -878,8 +798,8 @@ fn all_message_variants_cbor_roundtrip_sweep() {
 
 #[test]
 fn all_message_variants_frame_unframe_roundtrip_sweep() {
-    let variants = all_29_message_variants();
-    assert_eq!(variants.len(), 29, "expected 29 Message variants");
+    let variants = all_26_message_variants();
+    assert_eq!(variants.len(), 26, "expected 26 Message variants");
     for msg in &variants {
         let framed = frame_message(msg).expect("frame_message must not fail");
         let (decoded, consumed) =
@@ -1028,16 +948,13 @@ fn unknown_message_variant_returns_error_not_panic() {
 
 #[test]
 fn all_messages_have_version_one() {
-    let variants = all_29_message_variants();
-    assert_eq!(variants.len(), 29, "expected 29 Message variants");
+    let variants = all_26_message_variants();
+    assert_eq!(variants.len(), 26, "expected 26 Message variants");
 
     for msg in &variants {
         let v = match msg {
             Message::Handshake(m) => m.v,
             Message::PeerAnnounce(m) => m.v,
-            Message::PosChallenge(m) => m.v,
-            Message::PosResponse(m) => m.v,
-            Message::PosNack(m) => m.v,
             Message::PosHashChallenge(m) => m.v,
             Message::PosHashResponse(m) => m.v,
             Message::PosHashNack(m) => m.v,

@@ -5,20 +5,20 @@
 // need a real handle but don't exercise network I/O.
 //
 // Test coverage:
-//   handle_symbol_transfer          — writes files, upserts HoldingRecord
-//   handle_pos_challenge_inner      — responds with data or PosNack
-//   handle_pos_nack_sync            — marks placement Lost
-//   handle_symbol_dropped_sync      — marks placement Lost
+//   handle_symbol_transfer               — writes files, upserts HoldingRecord
+//   handle_pos_hash_challenge_inner      — responds with chain hash or PosHashNack
+//   handle_pos_hash_response             — verifies chain hash, updates trust/placement
+//   handle_symbol_dropped_sync           — marks placement Lost
 //   esi_list_to_ranges / ranges_to_esi_list — round-trip helpers
-//   decide_symbol_offer             — quota check logic
-//   handle_restore_request_inner    — returns symbols or empty response
-//   handle_board_sync               — forwards to relay_sync_tx
-//   handle_peer_announce            — upserts PeerRecord in DB (ε.2: no iroh add_peer)
-//   dispatch_relay                  — PeerAnnounce via relay
-//   build_peer_announce             — SwarmHandle helper builds a signed message
-//   handle_revocation_broadcast     — verifies certs and marks device key revoked in PeerRecord
-//   on_peer_authenticated           — AC-1, AC-2: upserts PeerRecord, auto-adds cluster device
-//   on_connection_closed            — AC-13: removes from peer_cert_map
+//   decide_symbol_offer                  — quota check logic
+//   handle_restore_request_inner         — returns symbols or empty response
+//   handle_board_sync                    — forwards to relay_sync_tx
+//   handle_peer_announce                 — upserts PeerRecord in DB
+//   dispatch_relay                       — PeerAnnounce via relay
+//   build_peer_announce                  — SwarmHandle helper builds a signed message
+//   handle_revocation_broadcast          — verifies certs and marks device key revoked
+//   on_peer_authenticated                — AC-1, AC-2: upserts PeerRecord, auto-adds cluster device
+//   on_connection_closed                 — AC-13: removes from peer_cert_map
 //   AC-1: transfer_without_offer_rejected
 //   AC-2: offer_accepted_stored_in_map
 //   AC-3: offer_rejected_when_quota_full
@@ -34,7 +34,7 @@ use syncback_core::cluster::{derive_master_key, master_identity, ClusterState};
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
 use syncback_core::messages::{
-    BoardSyncMsg, PeerAnnounceMsg, PosChallengeMsg,
+    BoardSyncMsg, PeerAnnounceMsg, PosHashChallengeMsg,
     RestoreRequestMsg, SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolRejectMsg,
     SymbolTransferMsg,
 };
@@ -620,10 +620,10 @@ async fn handle_symbol_transfer_merges_with_existing_holding() {
     assert_eq!(holding.esi_ranges, vec![(0, 2)]);
 }
 
-// ─── handle_pos_challenge_inner ───────────────────────────────────────────────
+// ─── handle_pos_hash_challenge_inner ─────────────────────────────────────────
 
 #[tokio::test]
-async fn handle_pos_challenge_responds_with_data_when_symbol_held() {
+async fn handle_pos_hash_challenge_responds_with_chain_hash_when_symbols_held() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
     let source_dir = TempDir::new().unwrap();
@@ -654,32 +654,35 @@ async fn handle_pos_challenge_responds_with_data_when_symbol_held() {
     std::fs::write(block_dir.join(format!("{esi}.bin")), &symbol_data).unwrap();
 
     let challenge_id = [99u8; 16];
-    let challenge = PosChallengeMsg {
+    let challenge = PosHashChallengeMsg {
         v: 1,
         challenge_id,
         source_block_id: block_id,
-        esi,
+        esi_ranges: vec![(esi, 1)],
         timestamp: Timestamp::now(),
         device_id: None,
     };
 
     let reply = processor
-        .handle_pos_challenge_inner(owner, challenge)
+        .handle_pos_hash_challenge_inner(owner, challenge)
         .await
-        .expect("handle_pos_challenge_inner failed");
+        .expect("handle_pos_hash_challenge_inner failed");
 
     match reply {
-        syncback_core::messages::Message::PosResponse(resp) => {
+        syncback_core::messages::Message::PosHashResponse(resp) => {
             assert_eq!(resp.challenge_id, challenge_id);
-            assert_eq!(resp.esi, esi);
-            assert_eq!(resp.data, symbol_data);
+            // Verify the chain hash is correct.
+            let expected_hash = syncback_core::pos::compute_chain_hash(
+                &[(esi, symbol_data.as_slice())]
+            ).expect("compute_chain_hash");
+            assert_eq!(resp.chain_hash, expected_hash);
         }
-        other => panic!("expected PosResponse, got {:?}", std::mem::discriminant(&other)),
+        other => panic!("expected PosHashResponse, got {:?}", std::mem::discriminant(&other)),
     }
 }
 
 #[tokio::test]
-async fn handle_pos_challenge_sends_nack_when_symbol_not_held() {
+async fn handle_pos_hash_challenge_sends_nack_when_symbol_not_held() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
     let source_dir = TempDir::new().unwrap();
@@ -691,7 +694,7 @@ async fn handle_pos_challenge_sends_nack_when_symbol_not_held() {
     let challenge_id = [77u8; 16];
 
     // Create a HoldingRecord so ownership check passes,
-    // but don't create the symbol file — expect PosNack (not held on disk).
+    // but don't create the symbol file — expect PosHashNack.
     db.upsert_holding(&HoldingRecord {
         source_block_id: block_id,
         owner_id: owner,
@@ -704,126 +707,62 @@ async fn handle_pos_challenge_sends_nack_when_symbol_not_held() {
         drop_notice_sent_at: None,
     }).unwrap();
 
-    let challenge = PosChallengeMsg {
+    let challenge = PosHashChallengeMsg {
         v: 1,
         challenge_id,
         source_block_id: block_id,
-        esi,
+        esi_ranges: vec![(esi, 1)],
         timestamp: Timestamp::now(),
         device_id: None,
     };
 
     let reply = processor
-        .handle_pos_challenge_inner(owner, challenge)
+        .handle_pos_hash_challenge_inner(owner, challenge)
         .await
-        .expect("handle_pos_challenge_inner failed");
+        .expect("handle_pos_hash_challenge_inner failed");
 
     match reply {
-        syncback_core::messages::Message::PosNack(nack) => {
+        syncback_core::messages::Message::PosHashNack(nack) => {
             assert_eq!(nack.challenge_id, challenge_id);
-            assert_eq!(nack.esi, esi);
+            assert_eq!(nack.first_missing_esi, esi);
             assert_eq!(nack.source_block_id, block_id);
         }
-        other => panic!("expected PosNack, got {:?}", std::mem::discriminant(&other)),
+        other => panic!("expected PosHashNack, got {:?}", std::mem::discriminant(&other)),
     }
 }
 
-// ─── handle_pos_nack_sync ─────────────────────────────────────────────────────
+// ─── handle_pos_hash_nack triggers repair ────────────────────────────────────
 
 #[tokio::test]
-async fn handle_pos_nack_marks_alive_placement_lost() {
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
-
-    let holder = make_device_id(1);
-    let block_id = make_block_id(2);
-
-    let placement = make_symbol_placement(block_id, holder, vec![(0, 5)], PlacementStatus::Alive);
-    db.upsert_placement(&placement).unwrap();
-
-    let nack = syncback_core::messages::build_pos_nack([0u8; 16], block_id, 0, Timestamp::now(), None, &ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]));
-
-    let changed = processor
-        .handle_pos_nack_sync(holder, &nack)
-        .expect("handle_pos_nack_sync failed");
-    assert!(changed, "expected placement to be modified");
-
-    let updated = db.get_placement(&block_id, &holder).unwrap().unwrap();
-    assert_eq!(updated.status, PlacementStatus::Lost);
-}
-
-#[tokio::test]
-async fn handle_pos_nack_is_idempotent_for_lost_placement() {
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
-
-    let holder = make_device_id(1);
-    let block_id = make_block_id(2);
-
-    let placement = make_symbol_placement(block_id, holder, vec![(0, 5)], PlacementStatus::Lost);
-    db.upsert_placement(&placement).unwrap();
-
-    let nack = syncback_core::messages::build_pos_nack([0u8; 16], block_id, 0, Timestamp::now(), None, &ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]));
-
-    let changed = processor
-        .handle_pos_nack_sync(holder, &nack)
-        .expect("handle_pos_nack_sync failed");
-    assert!(!changed, "expected no change for already-Lost placement");
-}
-
-#[tokio::test]
-async fn handle_pos_nack_returns_false_for_unknown_placement() {
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
-
-    let holder = make_device_id(1);
-    let block_id = make_block_id(99); // not in DB
-
-    let nack = syncback_core::messages::build_pos_nack([0u8; 16], block_id, 0, Timestamp::now(), None, &ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]));
-
-    let changed = processor
-        .handle_pos_nack_sync(holder, &nack)
-        .expect("handle_pos_nack_sync failed");
-    assert!(!changed);
-}
-
-// ─── handle_pos_nack triggers repair ─────────────────────────────────────────
-
-#[tokio::test]
-async fn handle_pos_nack_sends_repair_trigger() {
+async fn handle_pos_hash_nack_marks_alive_placement_lost_and_triggers_repair() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
     let source_dir = TempDir::new().unwrap();
     let (processor, mut repair_rx, _relay_rx) =
         make_processor(db.clone(), &holdings_dir, &source_dir).await;
 
-    // Use a signing key whose public key equals the device_id, and register
-    // the device → master mapping so signature verification can succeed.
-    let holder_key = ed25519_dalek::SigningKey::from_bytes(&[0x41u8; 32]);
-    let holder = DeviceId(holder_key.verifying_key().to_bytes());
-    let master = IdentityPub(holder_key.verifying_key().to_bytes());
-    db.set_master_for_device(&holder, &master).unwrap();
+    let holder = make_device_id(1);
     let block_id = make_block_id(2);
 
     let placement = make_symbol_placement(block_id, holder, vec![(0, 5)], PlacementStatus::Alive);
     db.upsert_placement(&placement).unwrap();
 
-    let nack = syncback_core::messages::build_pos_nack([0u8; 16], block_id, 0, Timestamp::now(), None, &holder_key);
+    let nack = syncback_core::messages::PosHashNackMsg {
+        v: 1,
+        challenge_id: [0u8; 16],
+        source_block_id: block_id,
+        first_missing_esi: 0,
+        timestamp: Timestamp::now(),
+        device_id: None,
+    };
 
-    // Call the async version that also sends to repair channel.
     processor
-        .handle_pos_nack(holder, nack)
+        .handle_pos_hash_nack(holder, nack)
         .await
-        .expect("handle_pos_nack failed");
+        .expect("handle_pos_hash_nack failed");
+
+    let updated = db.get_placement(&block_id, &holder).unwrap().unwrap();
+    assert_eq!(updated.status, PlacementStatus::Lost);
 
     let trigger = repair_rx
         .try_recv()
@@ -840,57 +779,37 @@ async fn handle_pos_nack_sends_repair_trigger() {
     }
 }
 
-// ─── Wave 1 security: signature verification on PosNack / SymbolDropped ─────
-
-/// Review S2: a forged PosNack signed by the wrong key must be rejected.
-/// The placement stays Alive and no repair trigger is enqueued.
 #[tokio::test]
-async fn forged_pos_nack_is_rejected_and_no_repair_triggered() {
+async fn handle_pos_hash_nack_is_noop_for_lost_placement() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
     let source_dir = TempDir::new().unwrap();
-    let (processor, mut repair_rx, _relay_rx) =
+    let (processor, _repair_rx, _relay_rx) =
         make_processor(db.clone(), &holdings_dir, &source_dir).await;
 
-    // Victim: honest holder whose identity is known to the DB.
-    let victim_key = ed25519_dalek::SigningKey::from_bytes(&[0x55u8; 32]);
-    let victim = DeviceId(victim_key.verifying_key().to_bytes());
-    let victim_master = IdentityPub(victim_key.verifying_key().to_bytes());
-    db.set_master_for_device(&victim, &victim_master).unwrap();
+    let holder = make_device_id(1);
+    let block_id = make_block_id(2);
 
-    let block_id = make_block_id(7);
-    let placement = make_symbol_placement(block_id, victim, vec![(0, 5)], PlacementStatus::Alive);
+    let placement = make_symbol_placement(block_id, holder, vec![(0, 5)], PlacementStatus::Lost);
     db.upsert_placement(&placement).unwrap();
 
-    // Attacker signs a PosNack with their OWN key, then pretends it came from
-    // the victim. This must fail verify_pos_nack.
-    let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0xEEu8; 32]);
-    let forged = syncback_core::messages::build_pos_nack(
-        [0u8; 16],
-        block_id,
-        0,
-        Timestamp::now(),
-        None,
-        &attacker_key,
-    );
+    let nack = syncback_core::messages::PosHashNackMsg {
+        v: 1,
+        challenge_id: [0u8; 16],
+        source_block_id: block_id,
+        first_missing_esi: 0,
+        timestamp: Timestamp::now(),
+        device_id: None,
+    };
 
     processor
-        .handle_pos_nack(victim, forged)
+        .handle_pos_hash_nack(holder, nack)
         .await
-        .expect("handle_pos_nack must not propagate an error — just log and drop");
+        .expect("handle_pos_hash_nack failed");
 
-    // Placement must still be Alive (no mark_placement_lost).
-    let updated = db.get_placement(&block_id, &victim).unwrap().unwrap();
-    assert_eq!(
-        updated.status,
-        PlacementStatus::Alive,
-        "forged PosNack must not change placement state"
-    );
-    // No repair trigger must have been sent.
-    assert!(
-        repair_rx.try_recv().is_err(),
-        "forged PosNack must not enqueue a repair trigger"
-    );
+    // Placement stays Lost — already Lost, no change.
+    let updated = db.get_placement(&block_id, &holder).unwrap().unwrap();
+    assert_eq!(updated.status, PlacementStatus::Lost);
 }
 
 /// Review S2: a forged SymbolDropped signed by the wrong key must be rejected.
@@ -1714,16 +1633,14 @@ async fn handle_system_state_ack_logs_without_error() {
 }
 
 
-// ─── handle_pos_response ──────────────────────────────────────────────────────
+// ─── handle_pos_hash_response ────────────────────────────────────────────────
 
 #[tokio::test]
-async fn handle_pos_response_pass_records_trust_and_updates_placement() {
+async fn handle_pos_hash_response_pass_records_trust_and_updates_placement() {
     use std::collections::HashMap;
     use syncback_core::constants::INITIAL_TRUST_P;
-    use syncback_core::erasure::ErasureEncoder;
-    use syncback_core::messages::PosResponseMsg;
-    use syncback_core::pos::VerifyOutcome;
-    use syncback_core::types::{ErasureParams, SourceBlockRecord, SourceBlockStatus, SourceBlockType};
+    use syncback_core::messages::PosHashResponseMsg;
+    use syncback_core::pos::{compute_chain_hash, VerifyOutcome};
 
     use super::current_week_number_scaled;
     use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
@@ -1736,14 +1653,18 @@ async fn handle_pos_response_pass_records_trust_and_updates_placement() {
     let block_id = make_block_id(20);
     let challenge_id = [0xAAu8; 16];
 
-    // Build pending challenges map with one entry.
+    // Owner computes expected chain hash for ESI 0 with symbol data [0xAB; 64].
+    let symbol_data = vec![0xABu8; 64];
+    let expected_hash = compute_chain_hash(&[(0u32, symbol_data.as_slice())]).unwrap();
+
+    // Build pending challenges map with one entry including the expected chain hash.
     let pending_map: HashMap<_, _> = [(
         (block_id, holder_id),
         PendingHashChallenge {
             source_block_id: block_id,
             holder_id,
             esi_ranges: vec![(0, 1)],
-            expected_chain_hash: [0u8; 32],
+            expected_chain_hash: expected_hash,
             issued_at: Timestamp::now(),
             challenge_id,
         },
@@ -1759,55 +1680,23 @@ async fn handle_pos_response_pass_records_trust_and_updates_placement() {
     // Insert PeerRecord with initial trust.
     db.upsert_peer(&make_peer_record(holder_id)).unwrap();
 
-    // Use legacy erasure params (n=None, overhead=None → ErasureParams::compute(65535, 0.0).unwrap()).
-    let params = ErasureParams::compute(65_535, 0.0).unwrap();
-
-    // Insert SourceBlockRecord.
-    db.upsert_source_block(&SourceBlockRecord {
-        block_id,
-        k: 1,
-        t: 65_535,
-        block_type: SourceBlockType::Single,
-        status: SourceBlockStatus::Active,
-        created_at: Timestamp::now(),
-        encrypted_size: Some(65_535),
-        n: None,
-        overhead: None,
-        drop_notice_sent_at: None,
-    })
-    .unwrap();
-
     // Insert Alive placement covering ESI 0.
     let placement = make_symbol_placement(block_id, holder_id, vec![(0, 1)], PlacementStatus::Alive);
     db.upsert_placement(&placement).unwrap();
 
-    // Write source block file (exactly k*t = 65535 bytes).
-    let source_data: Vec<u8> = (0u8..=255).cycle().take(65_535).collect();
-    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
-    let block_src_dir = source_dir.path().join(&block_hex);
-    std::fs::create_dir_all(&block_src_dir).unwrap();
-    std::fs::write(block_src_dir.join("block.bin"), &source_data).unwrap();
-
-    // Encode the valid bound symbol.
-    let encoder = syncback_core::erasure::RaptorQEncoder::new();
-    let symbols = encoder
-        .encode(&source_data, &params, 0, 1, &block_id, &holder_id)
-        .expect("encode failed");
-    let bound_data = symbols[0].data.clone();
-
-    let response = PosResponseMsg {
+    // Holder sends correct chain hash.
+    let response = PosHashResponseMsg {
         v: 1,
         challenge_id,
-        esi: 0,
-        data: bound_data,
+        chain_hash: expected_hash,
         timestamp: Timestamp::now(),
         device_id: None,
     };
 
     let outcome = processor
-        .handle_pos_response(holder_id, response)
+        .handle_pos_hash_response(holder_id, response)
         .await
-        .expect("handle_pos_response failed");
+        .expect("handle_pos_hash_response failed");
 
     assert_eq!(outcome, VerifyOutcome::Pass, "outcome must be Pass");
 
@@ -1837,12 +1726,10 @@ async fn handle_pos_response_pass_records_trust_and_updates_placement() {
 }
 
 #[tokio::test]
-async fn handle_pos_response_fail_marks_lost_and_triggers_repair() {
+async fn handle_pos_hash_response_fail_marks_lost_and_triggers_repair() {
     use std::collections::HashMap;
-    use syncback_core::erasure::ErasureEncoder;
-    use syncback_core::messages::PosResponseMsg;
-    use syncback_core::pos::VerifyOutcome;
-    use syncback_core::types::{ErasureParams, SourceBlockRecord, SourceBlockStatus, SourceBlockType};
+    use syncback_core::messages::PosHashResponseMsg;
+    use syncback_core::pos::{compute_chain_hash, VerifyOutcome};
 
     use crate::daemon::repair::RepairTrigger;
     use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
@@ -1855,13 +1742,17 @@ async fn handle_pos_response_fail_marks_lost_and_triggers_repair() {
     let block_id = make_block_id(21);
     let challenge_id = [0xBBu8; 16];
 
+    // Owner's expected chain hash for correct symbol data.
+    let correct_symbol = vec![0xCCu8; 64];
+    let expected_hash = compute_chain_hash(&[(0u32, correct_symbol.as_slice())]).unwrap();
+
     let pending_map: HashMap<_, _> = [(
         (block_id, holder_id),
         PendingHashChallenge {
             source_block_id: block_id,
             holder_id,
             esi_ranges: vec![(0, 1)],
-            expected_chain_hash: [0u8; 32],
+            expected_chain_hash: expected_hash,
             issued_at: Timestamp::now(),
             challenge_id,
         },
@@ -1877,52 +1768,25 @@ async fn handle_pos_response_fail_marks_lost_and_triggers_repair() {
     // Insert PeerRecord.
     db.upsert_peer(&make_peer_record(holder_id)).unwrap();
 
-    let params = ErasureParams::compute(65_535, 0.0).unwrap();
-
-    db.upsert_source_block(&SourceBlockRecord {
-        block_id,
-        k: 1,
-        t: 65_535,
-        block_type: SourceBlockType::Single,
-        status: SourceBlockStatus::Active,
-        created_at: Timestamp::now(),
-        encrypted_size: Some(65_535),
-        n: None,
-        overhead: None,
-        drop_notice_sent_at: None,
-    })
-    .unwrap();
-
     let placement = make_symbol_placement(block_id, holder_id, vec![(0, 1)], PlacementStatus::Alive);
     db.upsert_placement(&placement).unwrap();
 
-    let source_data: Vec<u8> = (0u8..=255).cycle().take(65_535).collect();
-    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
-    let block_src_dir = source_dir.path().join(&block_hex);
-    std::fs::create_dir_all(&block_src_dir).unwrap();
-    std::fs::write(block_src_dir.join("block.bin"), &source_data).unwrap();
+    // Holder sends WRONG chain hash (corrupted symbol).
+    let corrupt_symbol = vec![0x00u8; 64];
+    let wrong_hash = compute_chain_hash(&[(0u32, corrupt_symbol.as_slice())]).unwrap();
 
-    // Encode valid symbol then corrupt it.
-    let encoder = syncback_core::erasure::RaptorQEncoder::new();
-    let symbols = encoder
-        .encode(&source_data, &params, 0, 1, &block_id, &holder_id)
-        .expect("encode failed");
-    let mut corrupt_data = symbols[0].data.clone();
-    corrupt_data[0] ^= 0xFF;
-
-    let response = PosResponseMsg {
+    let response = PosHashResponseMsg {
         v: 1,
         challenge_id,
-        esi: 0,
-        data: corrupt_data,
+        chain_hash: wrong_hash,
         timestamp: Timestamp::now(),
         device_id: None,
     };
 
     let outcome = processor
-        .handle_pos_response(holder_id, response)
+        .handle_pos_hash_response(holder_id, response)
         .await
-        .expect("handle_pos_response failed");
+        .expect("handle_pos_hash_response failed");
 
     assert!(
         matches!(outcome, VerifyOutcome::Fail { esi: 0 }),
@@ -2213,7 +2077,7 @@ async fn handle_symbol_drop_notice_does_not_panic() {
 // ─── dispatch_relay tests for new message types ───────────────────────────────
 
 #[tokio::test]
-async fn dispatch_relay_pos_challenge_sends_response_via_board() {
+async fn dispatch_relay_pos_hash_challenge_sends_response_via_board() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
     let source_dir = TempDir::new().unwrap();
@@ -2277,11 +2141,11 @@ async fn dispatch_relay_pos_challenge_sends_response_via_board() {
         delete_requested_at: None,
         drop_notice_sent_at: None,
     }).unwrap();
-    let challenge = PosChallengeMsg {
+    let challenge = PosHashChallengeMsg {
         v: 1,
         challenge_id: [0xCC; 16],
         source_block_id: block_id,
-        esi: 42,
+        esi_ranges: vec![(42, 1)],
         timestamp: now,
         device_id: None,
     };
@@ -2289,7 +2153,7 @@ async fn dispatch_relay_pos_challenge_sends_response_via_board() {
     let relay_msg = InboundMessage {
         from: challenger,
         payload,
-        msg_type: "pos_challenge".to_string(),
+        msg_type: "pos_hash_challenge".to_string(),
         msg_id: [0xAA; 16],
         created_at: now,
     };
@@ -2297,9 +2161,9 @@ async fn dispatch_relay_pos_challenge_sends_response_via_board() {
     // Dispatch the relay message.
     processor.dispatch_relay(relay_msg).await;
 
-    // Check that a pos_response was posted to relay_post_tx.
-    let post = relay_post_rx.try_recv().expect("expected a RelayPost for pos_response");
-    assert_eq!(post.msg_type, "pos_response");
+    // Check that a pos_hash_response was posted to relay_post_tx.
+    let post = relay_post_rx.try_recv().expect("expected a RelayPost for pos_hash_response");
+    assert_eq!(post.msg_type, "pos_hash_response");
     assert_eq!(post.target, Some(challenger));
 }
 

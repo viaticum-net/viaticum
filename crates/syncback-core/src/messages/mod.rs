@@ -46,64 +46,6 @@ pub struct PeerAnnounceMsg {
     pub x25519_pub: Option<[u8; 32]>,
 }
 
-/// Owner → Holder. Challenge ESI to prove possession.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct PosChallengeMsg {
-    pub v: u8,
-    pub challenge_id: [u8; 16],
-    pub source_block_id: SourceBlockId,
-    pub esi: u32,
-    pub timestamp: Timestamp,
-    /// Which device this challenge is addressed to.
-    /// Added in per-device refactor. Use #[serde(default)] for backward compat.
-    #[serde(default)]
-    pub device_id: Option<DeviceId>,
-}
-
-/// Holder → Owner. Response to a PoS challenge.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct PosResponseMsg {
-    pub v: u8,
-    pub challenge_id: [u8; 16],
-    pub esi: u32,
-    /// Bound symbol data. Exactly T bytes.
-    pub data: Vec<u8>,
-    pub timestamp: Timestamp,
-    /// Which device is responding. Added in per-device refactor.
-    #[serde(default)]
-    pub device_id: Option<DeviceId>,
-}
-
-/// Holder → Owner. Holder received a PoS challenge but does not hold the symbol.
-///
-/// Sent in response to PosChallengeMsg when:
-///   - The holder has evicted the symbols for this source block.
-///   - The holder never received the symbols (missed transfer).
-///   - The holder's HoldingRecord for this block has status != Active.
-///
-/// The owner treats this as VerifyOutcome::NotHeld → PlacementStatus::Lost → repair.
-///
-/// sig covers: b"pn" || challenge_id || source_block_id || esi_be || timestamp_be
-/// Signed by the holder's master identity key.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct PosNackMsg {
-    pub v: u8,
-    /// challenge_id from the PosChallengeMsg this is responding to.
-    pub challenge_id: [u8; 16],
-    pub source_block_id: SourceBlockId,
-    /// The challenged ESI the holder cannot serve.
-    pub esi: u32,
-    pub timestamp: Timestamp,
-    /// Which device is responding. Added in per-device refactor.
-    #[serde(default)]
-    pub device_id: Option<DeviceId>,
-    /// Ed25519 signature by the holder's master identity key. 64 bytes.
-    /// Covers: b"pn" || challenge_id || source_block_id || esi_be || timestamp_be.
-    #[serde(with = "sig_serde")]
-    #[serde(default = "default_sig")]
-    pub sig: [u8; 64],
-}
-
 /// Owner → Holder. Block-level chain hash challenge.
 /// Covers all ESI ranges for this holder for this source block.
 /// Response: holder computes SHA256-chain over all bound symbols (ESIs sorted ascending).
@@ -377,9 +319,6 @@ pub struct AckMsg {
 pub enum Message {
     Handshake(HandshakeMsg),
     PeerAnnounce(PeerAnnounceMsg),
-    PosChallenge(PosChallengeMsg),
-    PosResponse(PosResponseMsg),
-    PosNack(PosNackMsg),
     PosHashChallenge(PosHashChallengeMsg),
     PosHashResponse(PosHashResponseMsg),
     PosHashNack(PosHashNackMsg),
@@ -1065,65 +1004,6 @@ pub fn relay_copy(entry: &BoardEntry) -> BoardEntry {
         hop: entry.hop + 1,
         ..entry.clone()
     }
-}
-
-// ============================================================
-// PosNack signature
-// ============================================================
-
-/// Compute the signing input for PosNackMsg.
-///
-/// Input: b"pn" (2) || challenge_id (16) || source_block_id (32) || esi_be (4) || timestamp_be (8)
-fn pos_nack_sig_input(
-    challenge_id: &[u8; 16],
-    source_block_id: &SourceBlockId,
-    esi: u32,
-    timestamp: &Timestamp,
-) -> Vec<u8> {
-    let mut input = Vec::with_capacity(2 + 16 + 32 + 4 + 8);
-    input.extend_from_slice(b"pn");
-    input.extend_from_slice(challenge_id);
-    input.extend_from_slice(&source_block_id.0);
-    input.extend_from_slice(&esi.to_be_bytes());
-    input.extend_from_slice(&timestamp.0.to_be_bytes());
-    input
-}
-
-/// Build a signed PosNackMsg.
-///
-/// `signing_key` must be the holder's master identity key.
-pub fn build_pos_nack(
-    challenge_id: [u8; 16],
-    source_block_id: SourceBlockId,
-    esi: u32,
-    timestamp: Timestamp,
-    device_id: Option<DeviceId>,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> PosNackMsg {
-    let sig_input = pos_nack_sig_input(&challenge_id, &source_block_id, esi, &timestamp);
-    let sig = signing_key.sign(&sig_input).to_bytes();
-    PosNackMsg {
-        v: PROTOCOL_VERSION,
-        challenge_id,
-        source_block_id,
-        esi,
-        timestamp,
-        device_id,
-        sig,
-    }
-}
-
-/// Verify a PosNackMsg signature against the claimed holder identity.
-///
-/// `holder` is the IdentityPub of the peer who sent this message.
-pub fn verify_pos_nack(msg: &PosNackMsg, holder: &IdentityPub) -> Result<(), MessageError> {
-    let vk = ed25519_dalek::VerifyingKey::from_bytes(&holder.0)
-        .map_err(|_| MessageError::BadSignature)?;
-    let sig = ed25519_dalek::Signature::from_bytes(&msg.sig);
-    let input = pos_nack_sig_input(&msg.challenge_id, &msg.source_block_id, msg.esi, &msg.timestamp);
-    vk.verify_strict(&input, &sig)
-        .map_err(|_| MessageError::BadSignature)?;
-    Ok(())
 }
 
 // ============================================================

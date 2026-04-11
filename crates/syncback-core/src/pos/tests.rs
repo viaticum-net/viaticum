@@ -1,12 +1,11 @@
-use crate::constants::{POS_BASE_CHALLENGES_PER_WEEK, POS_TIMEOUT_SECS};
-use crate::erasure::{ErasureEncoder, RaptorQEncoder};
+use crate::constants::POS_BASE_CHALLENGES_PER_WEEK;
 use crate::pos::{
-    apply_pos_outcome, challenges_per_week, compute_chain_hash, due_challenges, is_timed_out,
-    outcome_from_verify, select_challenge_esi, verify_hash_response, verify_response, PosChallenge,
-    PosError, PosResponse, VerifyOutcome,
+    apply_pos_outcome, challenges_per_week, compute_chain_hash, due_challenges,
+    outcome_from_verify, verify_hash_response,
+    PosError, VerifyOutcome,
 };
 use crate::types::{
-    DeviceId, ErasureParams, FileId, PlacementStatus, SourceBlockId, SymbolPlacement,
+    DeviceId, FileId, PlacementStatus, SourceBlockId, SymbolPlacement,
     Timestamp,
 };
 
@@ -52,167 +51,6 @@ fn make_placement_with_status(
         placed_at: Timestamp(0),
         consecutive_misses,
     }
-}
-
-/// Small source block padded to exactly params.t bytes (1 symbol).
-fn small_source_block(params: &ErasureParams) -> Vec<u8> {
-    let mut data = b"hello world".to_vec();
-    data.resize(params.t as usize, 0u8);
-    data
-}
-
-/// ErasureParams for 1-symbol source block (block_size = t).
-fn small_params() -> ErasureParams {
-    // Use 1 source symbol: block_size = SYMBOL_SIZE = 65535
-    ErasureParams::compute(65_535, 0.5).unwrap()
-}
-
-// ─── select_challenge_esi ────────────────────────────────────────────────────
-
-#[test]
-fn select_challenge_esi_selects_valid_esi() {
-    let placement = make_placement(block_id(1), holder(2), vec![(0, 100)]);
-    let result = select_challenge_esi(&placement, 42);
-    assert!(result.is_ok());
-    let esi = result.unwrap();
-    assert!(esi < 100);
-}
-
-#[test]
-fn select_challenge_esi_is_deterministic() {
-    let placement = make_placement(block_id(1), holder(2), vec![(0, 100)]);
-    let result1 = select_challenge_esi(&placement, 99).unwrap();
-    let result2 = select_challenge_esi(&placement, 99).unwrap();
-    assert_eq!(result1, result2);
-}
-
-#[test]
-fn select_challenge_esi_varies_with_nonce() {
-    let placement = make_placement(block_id(1), holder(2), vec![(0, 1000)]);
-    let results: std::collections::HashSet<u32> =
-        (0..20).map(|n| select_challenge_esi(&placement, n).unwrap()).collect();
-    assert!(results.len() > 10, "expected nonce diversity, got {} unique ESIs", results.len());
-}
-
-#[test]
-fn select_challenge_esi_works_with_multiple_ranges() {
-    let placement = make_placement(block_id(1), holder(2), vec![(0, 10), (500, 5)]);
-    for nonce in 0..15 {
-        let esi = select_challenge_esi(&placement, nonce).unwrap();
-        let in_first = esi < 10;
-        let in_second = esi >= 500 && esi < 505;
-        assert!(in_first || in_second, "ESI {} not in expected ranges", esi);
-    }
-}
-
-#[test]
-fn select_challenge_esi_fails_for_empty_placement() {
-    let placement = make_placement(block_id(1), holder(2), vec![]);
-    let result = select_challenge_esi(&placement, 0);
-    assert!(matches!(result, Err(PosError::NoEsis(_))));
-}
-
-// ─── verify_response ─────────────────────────────────────────────────────────
-
-#[test]
-fn verify_response_pass_matches_encoder() {
-    let params = small_params();
-    let source_block = small_source_block(&params);
-    let bid = block_id(1);
-    let hid = holder(2);
-    let encoder = RaptorQEncoder::new();
-
-    let symbols = encoder.encode(&source_block, &params, 0, 1, &bid, &hid).unwrap();
-    let expected_data = symbols[0].data.clone();
-
-    let response = PosResponse {
-        challenge_id: [0u8; 16],
-        esi: 0,
-        data: expected_data,
-    };
-
-    let result = verify_response(&response, &source_block, &params, &bid, &hid, &encoder);
-    assert_eq!(result.unwrap(), VerifyOutcome::Pass);
-}
-
-#[test]
-fn verify_response_fail_on_corrupt_data() {
-    let params = small_params();
-    let source_block = small_source_block(&params);
-    let bid = block_id(1);
-    let hid = holder(2);
-    let encoder = RaptorQEncoder::new();
-
-    let symbols = encoder.encode(&source_block, &params, 0, 1, &bid, &hid).unwrap();
-    let mut data = symbols[0].data.clone();
-    data[0] ^= 0xFF;
-
-    let response = PosResponse {
-        challenge_id: [0u8; 16],
-        esi: 0,
-        data,
-    };
-
-    let result = verify_response(&response, &source_block, &params, &bid, &hid, &encoder);
-    assert!(matches!(result, Ok(VerifyOutcome::Fail { esi: 0 })));
-}
-
-#[test]
-fn verify_response_fail_on_wrong_holder() {
-    let params = small_params();
-    let source_block = small_source_block(&params);
-    let bid = block_id(1);
-    let holder_a = DeviceId([0xAA; 32]);
-    let holder_b = DeviceId([0xBB; 32]);
-    let encoder = RaptorQEncoder::new();
-
-    let symbols = encoder.encode(&source_block, &params, 0, 1, &bid, &holder_a).unwrap();
-    let response = PosResponse {
-        challenge_id: [0u8; 16],
-        esi: 0,
-        data: symbols[0].data.clone(),
-    };
-
-    let result = verify_response(&response, &source_block, &params, &bid, &holder_b, &encoder);
-    assert!(matches!(result, Ok(VerifyOutcome::Fail { .. })));
-}
-
-#[test]
-fn verify_response_size_mismatch_returns_error() {
-    let params = small_params();
-    let source_block = small_source_block(&params);
-    let bid = block_id(1);
-    let hid = holder(2);
-    let encoder = RaptorQEncoder::new();
-
-    let response = PosResponse {
-        challenge_id: [0u8; 16],
-        esi: 0,
-        data: vec![0u8; 100],
-    };
-
-    let result = verify_response(&response, &source_block, &params, &bid, &hid, &encoder);
-    assert!(matches!(result, Err(PosError::ResponseSizeMismatch { .. })));
-}
-
-#[test]
-fn verify_response_consistent_across_calls() {
-    let params = small_params();
-    let source_block = small_source_block(&params);
-    let bid = block_id(1);
-    let hid = holder(2);
-    let encoder = RaptorQEncoder::new();
-
-    let symbols = encoder.encode(&source_block, &params, 0, 1, &bid, &hid).unwrap();
-    let response = PosResponse {
-        challenge_id: [0u8; 16],
-        esi: 0,
-        data: symbols[0].data.clone(),
-    };
-
-    let result1 = verify_response(&response, &source_block, &params, &bid, &hid, &encoder);
-    let result2 = verify_response(&response, &source_block, &params, &bid, &hid, &encoder);
-    assert_eq!(result1.unwrap(), result2.unwrap());
 }
 
 // ─── challenges_per_week ─────────────────────────────────────────────────────
@@ -311,36 +149,6 @@ fn due_challenges_available_esis_match_ranges() {
     assert_eq!(entries.len(), 1);
     let available = &entries[0].available_esis;
     assert_eq!(available, &[100, 101, 102]);
-}
-
-// ─── is_timed_out ────────────────────────────────────────────────────────────
-
-#[test]
-fn is_timed_out_false_before_deadline() {
-    let challenge = PosChallenge {
-        challenge_id: [0u8; 16],
-        source_block_id: block_id(1),
-        esi: 0,
-        issued_at: Timestamp(1_000_000),
-    };
-    let now = Timestamp(1_000_000 + POS_TIMEOUT_SECS - 1);
-    assert!(!is_timed_out(&challenge, now));
-}
-
-#[test]
-fn is_timed_out_true_at_and_after_deadline() {
-    let challenge = PosChallenge {
-        challenge_id: [0u8; 16],
-        source_block_id: block_id(1),
-        esi: 0,
-        issued_at: Timestamp(1_000_000),
-    };
-
-    let now = Timestamp(1_000_000 + POS_TIMEOUT_SECS);
-    assert!(is_timed_out(&challenge, now));
-
-    let now2 = Timestamp(1_000_000 + POS_TIMEOUT_SECS + 3600);
-    assert!(is_timed_out(&challenge, now2));
 }
 
 // ─── outcome_from_verify ─────────────────────────────────────────────────────
@@ -593,47 +401,6 @@ fn pos_due_challenges_does_not_filter_by_status() {
         1,
         "due_challenges does not filter by PlacementStatus — caller responsibility"
     );
-}
-
-// ─── PROP-13: select_challenge_esi always within esi_ranges ─────────────────
-
-#[test]
-fn select_challenge_esi_always_within_ranges() {
-    // Sweep multiple ESI range configurations and many nonces.
-    let configs: Vec<Vec<(u32, u32)>> = vec![
-        vec![(0, 10)],                    // single range
-        vec![(100, 50)],                  // offset start
-        vec![(0, 5), (10, 5)],            // two disjoint ranges
-        vec![(0, 3), (100, 7), (500, 20)], // three ranges
-        vec![(0, 1)],                     // single ESI
-        vec![(0, 1000)],                  // large range
-    ];
-
-    for esi_ranges in &configs {
-        let placement = SymbolPlacement {
-            source_block_id: SourceBlockId([0u8; 32]),
-            holder_id: DeviceId([1u8; 32]),
-            file_id: crate::types::FileId(1),
-            esi_ranges: esi_ranges.clone(),
-            binding_seed: [0u8; 32],
-            status: PlacementStatus::Alive,
-            last_verified: None,
-            placed_at: Timestamp(0),
-            consecutive_misses: 0,
-        };
-
-        for nonce in 0u64..50 {
-            let esi = select_challenge_esi(&placement, nonce).unwrap();
-            let in_range = esi_ranges
-                .iter()
-                .any(|&(start, count)| esi >= start && esi < start + count);
-            assert!(
-                in_range,
-                "ESI {esi} not in ranges {:?} for nonce {nonce}",
-                esi_ranges
-            );
-        }
-    }
 }
 
 // ─── PROP-11: challenges_per_week always >= POS_BASE_CHALLENGES_PER_WEEK ─────
