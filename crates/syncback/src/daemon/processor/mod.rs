@@ -189,7 +189,10 @@ pub struct Processor {
     peer_cert_map: Arc<std::sync::Mutex<HashMap<DeviceId, (IdentityPub, DeviceCertificate)>>>,
     /// Epoch key for rebuilding stored blobs when block.bin is absent.
     epoch_key: [u8; 32],
-    /// Master identity signing key for producing signed PosNack / SymbolDropped messages.
+    /// Master identity signing key for producing signed messages.
+    /// Currently unused after PoS hash chain migration (PosHashNackMsg is unsigned in MVP).
+    /// Will be needed when signed PosHashNack is added.
+    #[allow(dead_code)]
     master_signing_key: ed25519_dalek::SigningKey,
 }
 
