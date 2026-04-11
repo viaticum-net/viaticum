@@ -1726,7 +1726,7 @@ async fn handle_pos_response_pass_records_trust_and_updates_placement() {
     use syncback_core::types::{ErasureParams, SourceBlockRecord, SourceBlockStatus, SourceBlockType};
 
     use super::current_week_number_scaled;
-    use crate::daemon::scheduler::{PendingChallenge, PendingChallenges};
+    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
@@ -1739,10 +1739,11 @@ async fn handle_pos_response_pass_records_trust_and_updates_placement() {
     // Build pending challenges map with one entry.
     let pending_map: HashMap<_, _> = [(
         (block_id, holder_id),
-        PendingChallenge {
+        PendingHashChallenge {
             source_block_id: block_id,
             holder_id,
-            esi: 0,
+            esi_ranges: vec![(0, 1)],
+            expected_chain_hash: [0u8; 32],
             issued_at: Timestamp::now(),
             challenge_id,
         },
@@ -1844,7 +1845,7 @@ async fn handle_pos_response_fail_marks_lost_and_triggers_repair() {
     use syncback_core::types::{ErasureParams, SourceBlockRecord, SourceBlockStatus, SourceBlockType};
 
     use crate::daemon::repair::RepairTrigger;
-    use crate::daemon::scheduler::{PendingChallenge, PendingChallenges};
+    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
@@ -1856,10 +1857,11 @@ async fn handle_pos_response_fail_marks_lost_and_triggers_repair() {
 
     let pending_map: HashMap<_, _> = [(
         (block_id, holder_id),
-        PendingChallenge {
+        PendingHashChallenge {
             source_block_id: block_id,
             holder_id,
-            esi: 0,
+            esi_ranges: vec![(0, 1)],
+            expected_chain_hash: [0u8; 32],
             issued_at: Timestamp::now(),
             challenge_id,
         },

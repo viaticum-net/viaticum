@@ -311,7 +311,7 @@ pub fn binding_seed(block_id: &SourceBlockId, holder_id: &DeviceId) -> [u8; 32] 
 /// HKDF(salt=source_block_id, ikm=holder_id, info="syncback-binding", len=44)
 /// → 32-byte ChaCha20 key + 12-byte nonce base, with ESI XOR'd into nonce[8..12]
 /// → ChaCha20 stream of `t` zero-bytes = keystream
-pub(crate) fn binding_keystream(
+pub fn binding_keystream(
     block_id: &SourceBlockId,
     holder_id: &DeviceId,
     esi: u32,

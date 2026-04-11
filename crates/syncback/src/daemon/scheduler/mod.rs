@@ -18,8 +18,7 @@ use syncback_core::constants::{OFFERED_PLACEMENT_TIMEOUT_SECS, POS_TIMEOUT_SECS,
 use syncback_core::trust::{compute_combined, compute_effective_trust, recalculate_trust};
 use syncback_core::db::Db;
 use syncback_core::deletion::{DeletionAction, DeletionEngine};
-use syncback_core::messages::PosChallengeMsg;
-use syncback_core::pos::{apply_pos_outcome, due_challenges, outcome_from_verify, select_challenge_esi, VerifyOutcome};
+use syncback_core::pos::{apply_pos_outcome, due_challenges, outcome_from_verify, VerifyOutcome};
 use syncback_core::types::{DeviceId, IdentityPub, PlacementStatus, SourceBlockId, SourceBlockStatus, Timestamp};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -31,26 +30,19 @@ use crate::daemon::repair::RepairTrigger;
 #[cfg(test)]
 mod tests;
 
-// ─── PendingChallenge ──────────────────────────────────────────────────────────
+// ─── PendingHashChallenge ─────────────────────────────────────────────────────
 
-/// Context for a pending PoS challenge awaiting response from a holder.
-#[derive(Clone, Debug)]
-pub struct PendingChallenge {
-    pub source_block_id: SourceBlockId,
-    pub holder_id: DeviceId,
-    /// The ESI the holder was asked to prove.
-    pub esi: u32,
-    /// Wall-clock time when the challenge was issued (for timeout detection).
-    pub issued_at: Timestamp,
-    /// Raw challenge_id sent in the PosChallengeMsg (matches response challenge_id).
-    pub challenge_id: [u8; 16],
-}
+/// Re-exported from syncback-core for use in tests and wiring.
+pub use syncback_core::pos::PendingHashChallenge;
 
-/// Shared map of in-flight PoS challenges keyed by (source_block_id, holder_id).
+/// Shared map of in-flight PoS hash challenges keyed by (source_block_id, holder_id).
 /// One pending challenge per (block, holder) pair at a time.
 ///
-/// Shared between Scheduler (writes) and Processor (reads when verifying PosResponse).
-pub type PendingChallenges = Arc<Mutex<HashMap<(SourceBlockId, DeviceId), PendingChallenge>>>;
+/// Shared between Scheduler (writes) and Processor (reads when verifying PosHashResponse).
+///
+/// NOTE: Uses tokio::sync::Mutex (not std::sync::Mutex) because locks are held
+/// across .await points in issue_due_challenges / check_timeouts.
+pub type PendingChallenges = Arc<Mutex<HashMap<(SourceBlockId, DeviceId), PendingHashChallenge>>>;
 
 // ─── SchedulerConfig ──────────────────────────────────────────────────────────
 
@@ -100,6 +92,10 @@ pub struct Scheduler {
     source_blocks_dir: std::path::PathBuf,
     /// Shared accepted-offers map, periodically swept to evict stale entries.
     accepted_offers: crate::daemon::processor::AcceptedOffers,
+    /// Erasure encoder for computing raw symbols during hash challenge issuance.
+    encoder: std::sync::Arc<dyn syncback_core::erasure::ErasureEncoder>,
+    /// Epoch encryption key for rebuilding source block blobs.
+    epoch_key: [u8; 32],
 }
 
 impl Scheduler {
@@ -114,6 +110,8 @@ impl Scheduler {
         signing_key: ed25519_dalek::SigningKey,
         source_blocks_dir: std::path::PathBuf,
         accepted_offers: crate::daemon::processor::AcceptedOffers,
+        encoder: std::sync::Arc<dyn syncback_core::erasure::ErasureEncoder>,
+        epoch_key: [u8; 32],
     ) -> Self {
         Scheduler {
             db,
@@ -124,6 +122,8 @@ impl Scheduler {
             signing_key,
             source_blocks_dir,
             accepted_offers,
+            encoder,
+            epoch_key,
         }
     }
 
@@ -227,16 +227,17 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Issue PoS challenges to all holders that are due for a challenge this cycle.
+    /// Issue PoS hash challenges to all holders that are due for a challenge this cycle.
     ///
     /// Steps:
     ///   1. Get current timestamp.
     ///   2. List all placements from DB; filter to challengeable statuses.
     ///   3. Use due_challenges() to find which holders are overdue.
     ///   4. Skip placements that already have a pending challenge (avoid double-issue).
-    ///   5. For each due entry: select ESI, build PosChallengeMsg, send via network.
-    ///   6. On successful send: insert into pending_challenges.
-    ///   7. Per-holder send errors are logged but do not abort the loop.
+    ///   5. Group due entries by source_block_id.
+    ///   6. For each block: encode_raw once (union of all holders' ESI ranges), then
+    ///      per-holder apply binding + compute chain hash in spawn_blocking.
+    ///   7. Post PosHashChallengeMsg to relay board and insert into pending map.
     pub async fn issue_due_challenges(&self) -> anyhow::Result<()> {
         let now = Timestamp::now();
 
@@ -307,104 +308,231 @@ impl Scheduler {
             guard.keys().copied().collect()
         };
 
-        info!(due = due.len(), "scheduler: issuing PoS challenges");
+        info!(due = due.len(), "scheduler: issuing PoS hash challenges");
 
-        for entry in due {
-            let key = (entry.source_block_id, entry.holder_id);
+        // Group due entries by source_block_id so we encode each block's raw symbols once.
+        let mut by_block: HashMap<SourceBlockId, Vec<&syncback_core::pos::ChallengeScheduleEntry>> = HashMap::new();
+        for entry in &due {
+            by_block.entry(entry.source_block_id).or_default().push(entry);
+        }
 
-            // Skip if we are still waiting for a prior response from this holder/block.
-            if already_pending.contains(&key) {
-                debug!(
-                    block_id = %entry.source_block_id,
-                    holder_id = %entry.holder_id,
-                    "scheduler: challenge already pending, skipping"
-                );
+        for (block_id, block_entries) in by_block {
+            // Filter out already-pending entries.
+            let block_entries: Vec<_> = block_entries.into_iter()
+                .filter(|e| !already_pending.contains(&(e.source_block_id, e.holder_id)))
+                .collect();
+            if block_entries.is_empty() {
                 continue;
             }
 
-            // Find the corresponding SymbolPlacement for select_challenge_esi.
-            let placement = match challengeable.iter().find(|p| {
-                p.source_block_id == entry.source_block_id && p.holder_id == entry.holder_id
-            }) {
-                Some(p) => p,
-                None => continue, // race: shouldn't happen
-            };
+            // Find corresponding SymbolPlacements.
+            let holder_placements: Vec<_> = block_entries.iter()
+                .filter_map(|e| {
+                    challengeable.iter().find(|p| {
+                        p.source_block_id == e.source_block_id && p.holder_id == e.holder_id
+                    })
+                })
+                .collect();
 
-            // Generate the random challenge_id first so its bytes can seed ESI selection.
-            // This makes the challenged ESI unpredictable to the holder.
-            let challenge_id = random_challenge_id();
+            if holder_placements.is_empty() {
+                continue;
+            }
 
-            // Select ESI: derive seed from the random challenge_id bytes.
-            let seed = u64::from_le_bytes(challenge_id[..8].try_into().unwrap());
-            let esi = match select_challenge_esi(placement, seed) {
-                Ok(e) => e,
+            // Load source block data (from block.bin or rebuild).
+            let source_data = match self.load_source_block_data(&block_id).await {
+                Ok(d) => d,
                 Err(e) => {
                     warn!(
-                        block_id = %entry.source_block_id,
-                        holder_id = %entry.holder_id,
-                        "scheduler: select_challenge_esi failed: {e}"
+                        block_id = %block_id,
+                        err = %e,
+                        "scheduler: cannot load source block for PoS hash, skipping"
                     );
                     continue;
                 }
             };
 
-            // Resolve master identity for relay board addressing (board uses IdentityPub).
-            let holder_master = self.db.get_master_for_device(&entry.holder_id)
-                .ok()
-                .flatten()
-                .map(|m| IdentityPub(m.0))
-                .unwrap_or_else(|| IdentityPub(entry.holder_id.0));
-            let challenge_msg = PosChallengeMsg {
-                v: 1,
-                challenge_id,
-                source_block_id: entry.source_block_id,
-                esi,
-                timestamp: now,
-                device_id: Some(entry.holder_id),
+            let block_record = match self.db.get_source_block(&block_id) {
+                Ok(Some(r)) => r,
+                _ => {
+                    warn!(block_id = %block_id, "scheduler: source block record missing, skipping");
+                    continue;
+                }
             };
+            let params = block_record.erasure_params();
 
-            // Post challenge to relay board (directed to holder's master identity).
-            // Board always accepts locally — no unreachable fallback needed.
-            match syncback_core::messages::to_cbor(&challenge_msg) {
-                Ok(payload) => {
+            // Compute union of all ESI ranges across all holders for this block.
+            let mut all_esi_ranges: Vec<(u32, u32)> = Vec::new();
+            for p in &holder_placements {
+                all_esi_ranges.extend_from_slice(&p.esi_ranges);
+            }
+
+            // Per-holder data for the spawn_blocking closure.
+            let holder_data: Vec<(DeviceId, Vec<(u32, u32)>)> = holder_placements.iter()
+                .map(|p| (p.holder_id, p.esi_ranges.clone()))
+                .collect();
+
+            let encoder = std::sync::Arc::clone(&self.encoder);
+            let block_id_clone = block_id;
+
+            // encode_raw once for the block, then compute per-holder chain hashes.
+            let hash_results = tokio::task::spawn_blocking(move || -> Vec<(DeviceId, [u8; 32], Vec<(u32, u32)>)> {
+                // Encode raw symbols for the union of all holders' ESI ranges.
+                let mut raw_symbols: HashMap<u32, Vec<u8>> = HashMap::new();
+                for &(start, count) in &all_esi_ranges {
+                    if count == 0 {
+                        continue;
+                    }
+                    match encoder.encode_raw(&source_data, &params, start, count) {
+                        Ok(syms) => {
+                            for sym in syms {
+                                raw_symbols.insert(sym.esi, sym.data);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                block_id = %block_id_clone,
+                                "scheduler: encode_raw failed: {e}"
+                            );
+                            return vec![];
+                        }
+                    }
+                }
+
+                // Per-holder: apply binding, compute chain hash.
+                let mut results = Vec::new();
+                for (holder_id, esi_ranges) in &holder_data {
+                    // Expand ranges to sorted ESI list.
+                    let mut esis: Vec<u32> = esi_ranges.iter()
+                        .flat_map(|&(start, count)| start..start + count)
+                        .collect();
+                    esis.sort_unstable();
+
+                    // Apply binding keystream and collect bound symbols.
+                    let bound_pairs: Vec<(u32, Vec<u8>)> = esis.iter()
+                        .filter_map(|&esi| {
+                            raw_symbols.get(&esi).map(|raw_data| {
+                                let mut data = raw_data.clone();
+                                let ks = syncback_core::erasure::binding_keystream(
+                                    &block_id_clone, holder_id, esi, data.len(),
+                                );
+                                for (d, k) in data.iter_mut().zip(ks.iter()) {
+                                    *d ^= k;
+                                }
+                                (esi, data)
+                            })
+                        })
+                        .collect();
+
+                    let refs: Vec<(u32, &[u8])> = bound_pairs.iter()
+                        .map(|(esi, data)| (*esi, data.as_slice()))
+                        .collect();
+
+                    match syncback_core::pos::compute_chain_hash(&refs) {
+                        Ok(hash) => results.push((*holder_id, hash, esi_ranges.clone())),
+                        Err(e) => {
+                            tracing::error!(
+                                holder = %holder_id,
+                                block_id = %block_id_clone,
+                                "scheduler: chain hash failed: {e}"
+                            );
+                        }
+                    }
+                }
+                results
+            }).await.unwrap_or_default();
+
+            // Post a challenge for each holder we computed a hash for.
+            for (holder_id, expected_hash, esi_ranges) in hash_results {
+                let challenge_id = random_challenge_id();
+                let holder_master = self.db.get_master_for_device(&holder_id)
+                    .ok()
+                    .flatten()
+                    .map(|m| IdentityPub(m.0))
+                    .unwrap_or_else(|| IdentityPub(holder_id.0));
+
+                let challenge_msg = syncback_core::messages::PosHashChallengeMsg {
+                    v: 1,
+                    challenge_id,
+                    source_block_id: block_id,
+                    esi_ranges: esi_ranges.clone(),
+                    timestamp: now,
+                    device_id: Some(holder_id),
+                };
+
+                if let Ok(payload) = syncback_core::messages::to_cbor(&challenge_msg) {
                     let _ = self.relay_post_tx.send(crate::daemon::relay::RelayPost {
-                        msg_type: "pos_challenge".to_string(),
+                        msg_type: "pos_hash_challenge".to_string(),
                         target: Some(holder_master),
                         payload,
                         msg_id: challenge_id,
                     }).await;
-                }
-                Err(e) => {
+                } else {
                     error!(
-                        block_id = %entry.source_block_id,
-                        holder_id = %entry.holder_id,
-                        "scheduler: failed to encode PosChallenge: {e}"
+                        block_id = %block_id,
+                        holder_id = %holder_id,
+                        "scheduler: failed to encode PosHashChallenge"
                     );
                     continue;
                 }
+
+                self.pending.lock().await.insert(
+                    (block_id, holder_id),
+                    PendingHashChallenge {
+                        source_block_id: block_id,
+                        holder_id,
+                        esi_ranges,
+                        expected_chain_hash: expected_hash,
+                        issued_at: now,
+                        challenge_id,
+                    },
+                );
+
+                info!(
+                    block_id = %block_id,
+                    holder_id = %holder_id,
+                    "scheduler: PoS hash challenge issued"
+                );
             }
-
-            // Challenge posted to board — track in pending map.
-            self.pending.lock().await.insert(
-                key,
-                PendingChallenge {
-                    source_block_id: entry.source_block_id,
-                    holder_id: entry.holder_id,
-                    esi,
-                    issued_at: now,
-                    challenge_id,
-                },
-            );
-
-            info!(
-                block_id = %entry.source_block_id,
-                holder_id = %entry.holder_id,
-                esi,
-                "scheduler: PoS challenge issued via board"
-            );
         }
 
         Ok(())
+    }
+
+    /// Load source block data for PoS challenge computation.
+    ///
+    /// First tries reading block.bin from disk; if not found, rebuilds from
+    /// source files using compress_and_encrypt (same path as Processor::rebuild_blob_for_pos).
+    async fn load_source_block_data(&self, block_id: &SourceBlockId) -> anyhow::Result<Vec<u8>> {
+        let block_hex = syncback_core::types::hex_encode(&block_id.0);
+        let block_path = self.source_blocks_dir.join(&block_hex).join("block.bin");
+
+        match tokio::fs::read(&block_path).await {
+            Ok(data) => return Ok(data),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Rebuild from source files.
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        let block_record = self.db.get_source_block(block_id)?
+            .ok_or_else(|| anyhow::anyhow!("source block record missing: {block_id}"))?;
+        let db = self.db.clone();
+        let epoch_key = self.epoch_key;
+        let expected_id = *block_id;
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+            let plaintext = crate::daemon::backup::packing::rebuild_plaintext_from_db(
+                &db, &block_record,
+            )?;
+            let blob = crate::daemon::backup::pipeline::compress_and_encrypt(
+                &plaintext, &epoch_key,
+            )?;
+            let rebuilt_id: [u8; 32] = *blake3::hash(&blob).as_bytes();
+            if rebuilt_id != expected_id.0 {
+                anyhow::bail!("rebuilt blob hash mismatch for {expected_id}");
+            }
+            Ok(blob)
+        }).await?
     }
 
     /// Check all pending challenges for timeout.
@@ -424,7 +552,7 @@ impl Scheduler {
         let threshold = POS_TIMEOUT_SECS / scale;
 
         // Collect timed-out entries without holding the lock during DB calls.
-        let timed_out: Vec<PendingChallenge> = {
+        let timed_out: Vec<PendingHashChallenge> = {
             let guard = self.pending.lock().await;
             guard
                 .values()

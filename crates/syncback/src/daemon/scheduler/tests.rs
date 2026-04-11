@@ -13,9 +13,11 @@ use syncback_core::types::{
 };
 use tokio::sync::{mpsc, Mutex};
 
+use syncback_core::erasure::RaptorQEncoder;
+
 use crate::daemon::relay::RelayPost;
 use crate::daemon::repair::RepairTrigger;
-use crate::daemon::scheduler::{PendingChallenges, Scheduler, SchedulerConfig};
+use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge, Scheduler, SchedulerConfig};
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -46,6 +48,12 @@ fn make_pending_challenges() -> PendingChallenges {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+fn make_test_encoder() -> std::sync::Arc<dyn syncback_core::erasure::ErasureEncoder> {
+    std::sync::Arc::new(RaptorQEncoder::new())
+}
+
+const TEST_EPOCH_KEY: [u8; 32] = [0u8; 32];
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 /// After check_timeouts() processes a stale entry, the entry is removed from
@@ -70,10 +78,11 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
         let mut guard = pending.lock().await;
         guard.insert(
             (block_id, holder_id),
-            crate::daemon::scheduler::PendingChallenge {
+            PendingHashChallenge {
                 source_block_id: block_id,
                 holder_id,
-                esi: 0,
+                esi_ranges: vec![(0, 64)],
+                expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp(0), // ancient — definitely timed out
                 challenge_id: [0u8; 16],
             },
@@ -93,7 +102,7 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
     // Since check_timeouts doesn't use network, we pass a real (but unused) handle.
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
+    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -141,10 +150,11 @@ async fn check_timeouts_ignores_fresh_challenges() {
         let mut guard = pending.lock().await;
         guard.insert(
             (block_id, holder_id),
-            crate::daemon::scheduler::PendingChallenge {
+            PendingHashChallenge {
                 source_block_id: block_id,
                 holder_id,
-                esi: 5,
+                esi_ranges: vec![(5, 1)],
+                expected_chain_hash: [0u8; 32],
                 issued_at: now,
                 challenge_id: [1u8; 16],
             },
@@ -160,7 +170,7 @@ async fn check_timeouts_ignores_fresh_challenges() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
+    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -193,10 +203,11 @@ async fn pending_challenges_shared_between_tasks() {
         let mut guard = pending_writer.lock().await;
         guard.insert(
             (block_id, holder_id),
-            crate::daemon::scheduler::PendingChallenge {
+            PendingHashChallenge {
                 source_block_id: block_id,
                 holder_id,
-                esi: 42,
+                esi_ranges: vec![(42, 1)],
+                expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp::now(),
                 challenge_id: [7u8; 16],
             },
@@ -210,7 +221,7 @@ async fn pending_challenges_shared_between_tasks() {
         let guard = pending_reader.lock().await;
         assert_eq!(guard.len(), 1, "reader should see written entry");
         let entry = guard.get(&(block_id, holder_id)).expect("entry present");
-        assert_eq!(entry.esi, 42);
+        assert_eq!(entry.esi_ranges, vec![(42, 1)]);
     });
 
     read_handle.await.expect("reader task");
@@ -239,10 +250,11 @@ async fn check_timeouts_respects_time_scale() {
         let mut guard = pending.lock().await;
         guard.insert(
             (block_id, holder_id),
-            crate::daemon::scheduler::PendingChallenge {
+            PendingHashChallenge {
                 source_block_id: block_id,
                 holder_id,
-                esi: 0,
+                esi_ranges: vec![(0, 64)],
+                expected_chain_hash: [0u8; 32],
                 issued_at,
                 challenge_id: [0u8; 16],
             },
@@ -258,7 +270,7 @@ async fn check_timeouts_respects_time_scale() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
+    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -296,10 +308,11 @@ async fn issue_due_challenges_skips_already_pending() {
         let mut guard = pending.lock().await;
         guard.insert(
             (block_id, holder_id),
-            crate::daemon::scheduler::PendingChallenge {
+            PendingHashChallenge {
                 source_block_id: block_id,
                 holder_id,
-                esi: 5,
+                esi_ranges: vec![(5, 1)],
+                expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp::now(),
                 challenge_id: [2u8; 16],
             },
@@ -315,10 +328,10 @@ async fn issue_due_challenges_skips_already_pending() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
+    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
 
     // issue_due_challenges should skip this holder because it's already pending.
-    // The existing pending entry's esi (5) should not be overwritten.
+    // The existing pending entry's esi_ranges should not be overwritten.
     scheduler
         .issue_due_challenges()
         .await
@@ -327,7 +340,7 @@ async fn issue_due_challenges_skips_already_pending() {
     let guard = pending.lock().await;
     assert_eq!(guard.len(), 1, "only the pre-existing entry should remain");
     let entry = guard.get(&(block_id, holder_id)).expect("entry present");
-    assert_eq!(entry.esi, 5, "existing pending entry esi unchanged");
+    assert_eq!(entry.esi_ranges, vec![(5, 1)], "existing pending entry esi_ranges unchanged");
 }
 
 // ─── SCHED-07: scheduler_skips_deleting_placements ───────────────────────────
@@ -359,7 +372,7 @@ async fn scheduler_skips_deleting_placements() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
+    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
 
     scheduler.issue_due_challenges().await.expect("issue_due_challenges");
 
@@ -401,10 +414,11 @@ async fn time_scale_divides_intervals() {
         let mut guard = pending.lock().await;
         guard.insert(
             (block_id, holder_id),
-            crate::daemon::scheduler::PendingChallenge {
+            PendingHashChallenge {
                 source_block_id: block_id,
                 holder_id,
-                esi: 0,
+                esi_ranges: vec![(0, 1)],
+                expected_chain_hash: [0u8; 32],
                 issued_at,
                 challenge_id: [0u8; 16],
             },
@@ -420,7 +434,7 @@ async fn time_scale_divides_intervals() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
+    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -520,7 +534,7 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
         event_log_retain_rows: 100_000,
         pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
-    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending, relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
+    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending, relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
 
     // Now = after owner cooldown. Deleted_at=0, cooldown=4 weeks.
     // process_deletion_tick uses Timestamp::now() internally. Since deleted_at=0,
@@ -558,7 +572,7 @@ async fn deletion_tick_noop_when_no_eligible_files() {
         event_log_retain_rows: 100_000,
         pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
-    let scheduler = Scheduler::new(db, config, repair_tx, pending, relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers());
+    let scheduler = Scheduler::new(db, config, repair_tx, pending, relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
 
     scheduler.process_deletion_tick().await.unwrap();
 
@@ -613,6 +627,8 @@ async fn offered_placement_timeout_marks_lost() {
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
     );
 
     scheduler.sweep_offered_placements().await.unwrap();
@@ -684,6 +700,8 @@ async fn offered_placement_not_swept_before_timeout() {
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
     );
 
     scheduler.sweep_offered_placements().await.unwrap();
@@ -796,6 +814,8 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
     );
 
     // First tick: should send the drop notice.
