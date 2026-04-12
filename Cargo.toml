@@ -78,6 +78,7 @@ tempfile = "3"
 
 # File-system watching
 notify = "6"
+ignore = "0.4"
 
 # System
 libc = "0.2"

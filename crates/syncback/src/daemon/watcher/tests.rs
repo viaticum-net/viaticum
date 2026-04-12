@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use syncback_core::types::DeviceId;
 
 use crate::daemon::backup::DirtyKind;
-use crate::daemon::watcher::{start_watcher, WatcherConfig};
+use crate::daemon::watcher::{start_watcher, IgnoreSet, WatcherConfig};
 
 const TEST_DEVICE_ID: DeviceId = DeviceId([1u8; 32]);
 const DEBOUNCE_MS: u64 = 50;
@@ -447,6 +447,165 @@ async fn rapid_changes_no_panic() {
 
     // Debounce should have coalesced the writes; we expect at least 1 event.
     assert!(count >= 1, "at least one event must arrive after 10 rapid writes");
+
+    cancel.cancel();
+}
+
+// ─── .syncbackignore tests ───────────────────────────────────────────────────
+
+/// `IgnoreSet::build` with an empty `.syncbackignore` still enforces defaults.
+#[test]
+fn ignore_set_default_patterns_match_target_and_node_modules() {
+    let root = TempDir::new().unwrap();
+    let set = IgnoreSet::build(&[root.path().to_path_buf()]).unwrap();
+
+    // Defaults: target/, node_modules/, .git/, __pycache__/, .cache/
+    assert!(set.is_ignored(&root.path().join("target"), true));
+    assert!(set.is_ignored(&root.path().join("target/foo.bin"), false));
+    assert!(set.is_ignored(&root.path().join("node_modules/react/index.js"), false));
+    assert!(set.is_ignored(&root.path().join(".git/HEAD"), false));
+    assert!(set.is_ignored(&root.path().join("__pycache__/x.pyc"), false));
+
+    // Not ignored: regular user files
+    assert!(!set.is_ignored(&root.path().join("README.md"), false));
+    assert!(!set.is_ignored(&root.path().join("src/main.rs"), false));
+}
+
+/// A `.syncbackignore` file with user patterns is loaded and applied on top of
+/// the defaults.
+#[test]
+fn ignore_set_loads_syncbackignore_file() {
+    let root = TempDir::new().unwrap();
+    std::fs::write(
+        root.path().join(".syncbackignore"),
+        "secrets/\n*.tmp\nbuild/output.log\n",
+    )
+    .unwrap();
+
+    let set = IgnoreSet::build(&[root.path().to_path_buf()]).unwrap();
+
+    assert!(set.is_ignored(&root.path().join("secrets"), true));
+    assert!(set.is_ignored(&root.path().join("secrets/passwords.txt"), false));
+    assert!(set.is_ignored(&root.path().join("scratch.tmp"), false));
+    assert!(set.is_ignored(&root.path().join("build/output.log"), false));
+
+    assert!(!set.is_ignored(&root.path().join("build/release.bin"), false));
+    assert!(!set.is_ignored(&root.path().join("notes.txt"), false));
+}
+
+/// Negation syntax (`!pattern`) un-ignores a file previously matched by a
+/// default or earlier rule.
+#[test]
+fn ignore_set_negation_overrides_default() {
+    let root = TempDir::new().unwrap();
+    // Keep `target/important.keep` even though `target/` is a default ignore.
+    std::fs::write(
+        root.path().join(".syncbackignore"),
+        "!target/\n!target/important.keep\n",
+    )
+    .unwrap();
+
+    let set = IgnoreSet::build(&[root.path().to_path_buf()]).unwrap();
+
+    // File explicitly whitelisted
+    assert!(!set.is_ignored(&root.path().join("target/important.keep"), false));
+    // Defaults for other paths still in force (we didn't un-ignore node_modules)
+    assert!(set.is_ignored(&root.path().join("node_modules/x.js"), false));
+}
+
+/// Missing `.syncbackignore` is not an error — the matcher is built from the
+/// defaults alone.
+#[test]
+fn ignore_set_missing_file_is_ok() {
+    let root = TempDir::new().unwrap();
+    assert!(!root.path().join(".syncbackignore").exists());
+
+    let set = IgnoreSet::build(&[root.path().to_path_buf()]).unwrap();
+
+    assert!(set.is_ignored(&root.path().join("target/foo"), false));
+    assert!(!set.is_ignored(&root.path().join("src/lib.rs"), false));
+}
+
+/// Paths outside every configured watch directory fall through as "not
+/// ignored" — no matcher claims them.
+#[test]
+fn ignore_set_path_outside_any_watch_dir_is_not_ignored() {
+    let watched = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+
+    let set = IgnoreSet::build(&[watched.path().to_path_buf()]).unwrap();
+
+    // Path under a completely different root: not filtered.
+    assert!(!set.is_ignored(&elsewhere.path().join("target/evil.bin"), false));
+}
+
+/// End-to-end: the initial scan walks the watch dir and emits events only for
+/// files not matched by `.syncbackignore`.
+#[tokio::test]
+async fn watcher_initial_scan_respects_syncbackignore() {
+    let dir = TempDir::new().unwrap();
+
+    // Create .syncbackignore with one pattern.
+    std::fs::write(dir.path().join(".syncbackignore"), "ignored/\n*.log\n").unwrap();
+
+    // Files that must be emitted:
+    let keep = dir.path().join("keep.txt");
+    std::fs::write(&keep, b"keep").unwrap();
+
+    // Files that must be skipped:
+    std::fs::create_dir_all(dir.path().join("ignored")).unwrap();
+    std::fs::write(dir.path().join("ignored/inner.txt"), b"x").unwrap();
+    std::fs::write(dir.path().join("scratch.log"), b"y").unwrap();
+
+    // Default ignore: target/
+    std::fs::create_dir_all(dir.path().join("target")).unwrap();
+    std::fs::write(dir.path().join("target/out.bin"), b"z").unwrap();
+
+    let (dirty_tx, mut dirty_rx) = mpsc::channel(32);
+    let cancel = CancellationToken::new();
+
+    // Fresh data_dir with NO last_scan marker → forces initial scan.
+    let data_dir = TempDir::new().unwrap().keep();
+    let config = WatcherConfig {
+        watch_dirs: vec![dir.path().to_path_buf()],
+        device_id: TEST_DEVICE_ID,
+        debounce_ms: DEBOUNCE_MS,
+        data_dir,
+        rescan_interval_secs: 604800,
+    };
+
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        start_watcher(config, dirty_tx, cancel_clone)
+            .await
+            .expect("watcher error");
+    });
+
+    // Collect events for 500 ms — enough for the initial scan to complete.
+    let mut seen: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(100), dirty_rx.recv()).await {
+            Ok(Some(e)) => seen.push(e.path),
+            Ok(None) => break,
+            Err(_) => continue, // tick, keep waiting
+        }
+    }
+
+    // keep.txt must be present.
+    assert!(
+        seen.iter().any(|p| p == keep.to_string_lossy().as_ref()),
+        "expected keep.txt in scan results, got {:?}",
+        seen
+    );
+    // Ignored files / dirs must be absent.
+    for bad in &["ignored/inner.txt", "scratch.log", "target/out.bin"] {
+        assert!(
+            !seen.iter().any(|p| p.ends_with(bad)),
+            "{bad} should have been filtered by .syncbackignore, got {:?}",
+            seen
+        );
+    }
 
     cancel.cancel();
 }

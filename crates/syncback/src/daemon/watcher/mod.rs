@@ -9,10 +9,12 @@
 // DirtyEvent to the backup coordinator channel.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::time::Instant;
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::event::{EventKind, ModifyKind, RemoveKind};
 use notify::{recommended_watcher, Event, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
@@ -21,6 +23,22 @@ use tokio_util::sync::CancellationToken;
 
 use crate::daemon::backup::{DirtyEvent, DirtyKind};
 use syncback_core::types::DeviceId;
+
+/// Built-in ignore patterns applied to every watch directory.
+///
+/// These are common build-artifact / cache directories that should never be
+/// part of a backup. Users can override with `!pattern` in `.syncbackignore`.
+const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
+    ".git/",
+    "node_modules/",
+    "target/",
+    "__pycache__/",
+    ".cache/",
+];
+
+/// Filename recognized at the root of each watch directory, holding
+/// gitignore-syntax patterns for files that should not be backed up.
+pub const SYNCBACKIGNORE_FILENAME: &str = ".syncbackignore";
 
 #[cfg(test)]
 mod tests;
@@ -35,6 +53,96 @@ pub enum WatcherError {
 
     #[error("no watch directories configured")]
     NoWatchDirs,
+
+    #[error("failed to build ignore matcher: {0}")]
+    IgnoreBuild(String),
+}
+
+// ─── IgnoreSet ────────────────────────────────────────────────────────────────
+
+/// Gitignore-style path matcher for a set of watch directories.
+///
+/// Each watch directory gets its own `Gitignore`, seeded with
+/// [`DEFAULT_IGNORE_PATTERNS`] and optionally extended from a `.syncbackignore`
+/// file at the root of that directory. A path is checked against the matcher
+/// whose root is an ancestor of the path.
+///
+/// The matcher answers "is this path (or directory) ignored?" — see
+/// [`IgnoreSet::is_ignored`].
+pub struct IgnoreSet {
+    matchers: Vec<(PathBuf, Gitignore)>,
+}
+
+impl IgnoreSet {
+    /// Build a matcher covering every watch directory.
+    ///
+    /// For each directory:
+    /// 1. Seed a `GitignoreBuilder` with `DEFAULT_IGNORE_PATTERNS`.
+    /// 2. If a `.syncbackignore` exists at the directory root, append its
+    ///    rules. A malformed file is logged and ignored (non-fatal).
+    /// 3. Build the final `Gitignore`.
+    pub fn build(watch_dirs: &[PathBuf]) -> Result<Self, WatcherError> {
+        let mut matchers = Vec::with_capacity(watch_dirs.len());
+        for dir in watch_dirs {
+            let mut builder = GitignoreBuilder::new(dir);
+            for pat in DEFAULT_IGNORE_PATTERNS {
+                // `add_line` only fails on truly malformed patterns — the
+                // constants above are hand-written, so this is effectively
+                // infallible. Surface any breakage loudly in tests.
+                builder
+                    .add_line(None, pat)
+                    .map_err(|e| WatcherError::IgnoreBuild(format!("default pattern {pat}: {e}")))?;
+            }
+            let ignore_file = dir.join(SYNCBACKIGNORE_FILENAME);
+            if ignore_file.is_file() {
+                if let Some(err) = builder.add(&ignore_file) {
+                    tracing::warn!(
+                        path = %ignore_file.display(),
+                        error = %err,
+                        "watcher: failed to parse .syncbackignore, skipping"
+                    );
+                } else {
+                    tracing::info!(path = %ignore_file.display(), "loaded .syncbackignore");
+                }
+            }
+            let gi = builder
+                .build()
+                .map_err(|e| WatcherError::IgnoreBuild(e.to_string()))?;
+            matchers.push((dir.clone(), gi));
+        }
+        Ok(Self { matchers })
+    }
+
+    /// Empty matcher — nothing is ignored. Used in tests that don't exercise
+    /// the ignore path.
+    pub fn empty() -> Self {
+        Self { matchers: Vec::new() }
+    }
+
+    /// Returns true if `path` should be skipped (not watched, not scanned).
+    ///
+    /// Finds the watch-dir matcher that is an ancestor of `path` and queries
+    /// it. `is_dir` matters because gitignore patterns distinguish `build/`
+    /// from `build` — a trailing slash matches only directories.
+    ///
+    /// Uses `matched_path_or_any_parents` so that a directory pattern like
+    /// `target/` correctly prunes every file under `target/`. Pure `matched`
+    /// only checks the leaf and would miss such subtree rules.
+    ///
+    /// Paths outside every watch dir fall through as "not ignored" — filtering
+    /// of such stray paths is the caller's responsibility.
+    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        for (root, gi) in &self.matchers {
+            if path.starts_with(root) {
+                match gi.matched_path_or_any_parents(path, is_dir) {
+                    ignore::Match::Ignore(_) => return true,
+                    ignore::Match::Whitelist(_) => return false,
+                    ignore::Match::None => return false,
+                }
+            }
+        }
+        false
+    }
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -76,17 +184,21 @@ pub async fn start_watcher(
         return Err(WatcherError::NoWatchDirs);
     }
 
+    // Build the ignore matcher once, share with notify callback and full-scan.
+    let ignore_set = Arc::new(IgnoreSet::build(&config.watch_dirs)?);
+
     // Bridge: notify → std channel → tokio task.
     let (std_tx, std_rx) = std_mpsc::channel::<(PathBuf, DirtyKind)>();
 
     // Build the notify watcher. The closure runs in a thread managed by notify.
     let std_tx_clone = std_tx.clone();
+    let ignore_for_notify = Arc::clone(&ignore_set);
     let mut watcher = recommended_watcher(move |res: Result<Event, notify::Error>| {
         match res {
             Ok(event) => {
                 if let Some(kind) = classify_event(&event.kind) {
                     for path in &event.paths {
-                        if should_watch_path(path) {
+                        if should_watch_path(path, &ignore_for_notify) {
                             let _ = std_tx_clone.send((path.clone(), kind));
                         }
                     }
@@ -112,6 +224,7 @@ pub async fn start_watcher(
             &config.watch_dirs,
             config.device_id,
             &dirty_tx,
+            &ignore_set,
         )
         .await;
         // Write current timestamp as marker.
@@ -156,6 +269,7 @@ pub async fn start_watcher(
                     &config.watch_dirs,
                     config.device_id,
                     &dirty_tx,
+                    &ignore_set,
                 ).await;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -247,10 +361,15 @@ fn should_run_scan(marker: &std::path::Path, interval_secs: u64) -> bool {
 }
 
 /// Walk all watch directories and emit DirtyEvent::Added for every file found.
+///
+/// Directories matching `ignore_set` are pruned at descent time (no files
+/// under an ignored directory are emitted). Individual files are checked via
+/// [`should_watch_path`] using the same matcher.
 async fn run_full_scan(
     dirs: &[PathBuf],
     device_id: DeviceId,
     dirty_tx: &mpsc::Sender<DirtyEvent>,
+    ignore_set: &IgnoreSet,
 ) -> u64 {
     let mut count: u64 = 0;
     for dir in dirs {
@@ -273,11 +392,16 @@ async fn run_full_scan(
                 if path.is_dir() {
                     // Skip hidden directories.
                     if let Some(name) = path.file_name() {
-                        if !name.to_string_lossy().starts_with('.') {
-                            stack.push(path);
+                        if name.to_string_lossy().starts_with('.') {
+                            continue;
                         }
                     }
-                } else if should_watch_path(&path) {
+                    // Prune subtrees matched by .syncbackignore / defaults.
+                    if ignore_set.is_ignored(&path, true) {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if should_watch_path(&path, ignore_set) {
                     let event = DirtyEvent {
                         path: path.to_string_lossy().into_owned(),
                         kind: DirtyKind::Added,
@@ -301,7 +425,8 @@ async fn run_full_scan(
 /// - Paths with no filename component
 /// - Hidden files (basename starts with '.')
 /// - Directories (if stat is available)
-pub(crate) fn should_watch_path(path: &std::path::Path) -> bool {
+/// - Paths matched by the ignore set (`.syncbackignore` + defaults)
+pub(crate) fn should_watch_path(path: &std::path::Path, ignore_set: &IgnoreSet) -> bool {
     // Require a filename component.
     let Some(name) = path.file_name() else {
         return false;
@@ -309,6 +434,11 @@ pub(crate) fn should_watch_path(path: &std::path::Path) -> bool {
 
     // Skip hidden files.
     if name.to_string_lossy().starts_with('.') {
+        return false;
+    }
+
+    // Ignore-set match (files).
+    if ignore_set.is_ignored(path, false) {
         return false;
     }
 

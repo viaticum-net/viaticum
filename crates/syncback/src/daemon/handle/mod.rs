@@ -560,6 +560,9 @@ impl DaemonHandle {
                     Err(WatcherError::Notify(e)) => {
                         Err(anyhow::anyhow!("watcher error: {e}"))
                     }
+                    Err(WatcherError::IgnoreBuild(e)) => {
+                        Err(anyhow::anyhow!("watcher ignore matcher build failed: {e}"))
+                    }
                 }
             }));
         }
