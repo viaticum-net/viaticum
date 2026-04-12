@@ -3,7 +3,7 @@
 # Server is faster (48 cores) and keeps laptop cool.
 set -euo pipefail
 
-SERVER="your-user@your-server"
+SERVER="${SYNCBACK_SERVER:-your-user@your-server}"
 REMOTE_DIR="projects/syncback"
 ARGS="${@:---release -p syncback}"
 
