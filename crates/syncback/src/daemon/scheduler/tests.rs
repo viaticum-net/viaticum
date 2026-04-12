@@ -851,10 +851,7 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
 /// After process_deletion_tick the directory must be gone.
 #[tokio::test]
 async fn cleanup_block_removes_files_from_disk() {
-    use syncback_core::types::{
-        DeviceId, FileRecord, FileVersion, LocalState, SourceBlockRecord, SourceBlockStatus,
-        SourceBlockType,
-    };
+    use syncback_core::types::DeviceId;
     use tempfile::TempDir;
 
     let db = Db::open_in_memory().unwrap();

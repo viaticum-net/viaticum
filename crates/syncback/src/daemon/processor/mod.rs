@@ -40,7 +40,6 @@ use syncback_core::cluster::DeviceCertificate;
 use syncback_core::config::EscrowCfg;
 use syncback_core::constants::SYMBOL_OFFER_EXPIRY_SECS;
 use syncback_core::db::Db;
-use syncback_core::erasure::ErasureEncoder;
 use syncback_core::messages::{
     AckMsg, CancelDeleteMsg, DeleteMsg, Message, PeerAnnounceMsg,
     PosHashChallengeMsg, PosHashNackMsg, PosHashResponseMsg,
@@ -149,12 +148,8 @@ pub struct Processor {
     pub(crate) own_identity: IdentityPub,
     repair_tx: mpsc::Sender<RepairTrigger>,
     cluster_sync: Arc<ClusterSyncManager>,
-    encoder: Arc<dyn ErasureEncoder>,
     /// Directory where we store symbols held for others: `{holdings_dir}/{block_id_hex}/{esi}.bin`
     holdings_dir: PathBuf,
-    /// Directory where our own source blocks live (for PoS verification as owner):
-    /// `{source_blocks_dir}/{block_id_hex}/block.bin`
-    source_blocks_dir: PathBuf,
     /// libp2p swarm handle.
     swarm: Arc<SwarmHandle>,
     /// Channel to relay manager: push BoardSync entries from incoming connections.
@@ -187,8 +182,6 @@ pub struct Processor {
     /// Written by on_peer_authenticated, cleared by on_connection_closed.
     /// Used by handle_cluster_sync_request_libp2p to validate from_device_id.
     peer_cert_map: Arc<std::sync::Mutex<HashMap<DeviceId, (IdentityPub, DeviceCertificate)>>>,
-    /// Epoch key for rebuilding stored blobs when block.bin is absent.
-    epoch_key: [u8; 32],
     /// Master identity signing key for producing signed messages.
     /// Currently unused after PoS hash chain migration (PosHashNackMsg is unsigned in MVP).
     /// Will be needed when signed PosHashNack is added.
@@ -204,9 +197,7 @@ impl Processor {
         own_identity: IdentityPub,
         repair_tx: mpsc::Sender<RepairTrigger>,
         cluster_sync: Arc<ClusterSyncManager>,
-        encoder: Arc<dyn ErasureEncoder>,
         holdings_dir: PathBuf,
-        source_blocks_dir: PathBuf,
         swarm: Arc<SwarmHandle>,
         relay_sync_tx: mpsc::Sender<crate::daemon::relay::SyncTrigger>,
         soft_quota_bytes: u64,
@@ -220,7 +211,6 @@ impl Processor {
         cluster_state: Option<Arc<std::sync::Mutex<syncback_core::cluster::ClusterState>>>,
         escrow_cfg: EscrowCfg,
         accepted_offers: AcceptedOffers,
-        epoch_key: [u8; 32],
         master_signing_key: ed25519_dalek::SigningKey,
     ) -> Self {
         Processor {
@@ -228,9 +218,7 @@ impl Processor {
             own_identity,
             repair_tx,
             cluster_sync,
-            encoder,
             holdings_dir,
-            source_blocks_dir,
             swarm,
             relay_sync_tx,
             soft_quota_bytes,
@@ -245,7 +233,6 @@ impl Processor {
             escrow_cfg,
             accepted_offers,
             peer_cert_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            epoch_key,
             master_signing_key,
         }
     }
@@ -794,6 +781,7 @@ pub(crate) fn record_pos_weekly(db: &Db, device: DeviceId, outcome: syncback_cor
 pub(crate) use syncback_core::types::{esi_list_to_ranges, ranges_to_esi_list};
 
 // Re-export for tests.
+#[cfg(test)]
 pub(crate) use syncback_core::trust::recalculate_trust;
 
 /// Approximate protocol week number from the current unix timestamp (1-indexed).

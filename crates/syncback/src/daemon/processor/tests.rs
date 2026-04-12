@@ -32,7 +32,6 @@ use std::sync::{Arc, Mutex};
 
 use syncback_core::cluster::{derive_master_key, master_identity, ClusterState};
 use syncback_core::db::Db;
-use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
 use syncback_core::messages::{
     BoardSyncMsg, PeerAnnounceMsg, PosHashChallengeMsg,
     RestoreRequestMsg, SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolRejectMsg,
@@ -113,15 +112,13 @@ async fn make_swarm() -> Arc<SwarmHandle> {
 async fn make_processor(
     db: Db,
     holdings_dir: &TempDir,
-    source_blocks_dir: &TempDir,
 ) -> (Processor, mpsc::Receiver<RepairTrigger>, mpsc::Receiver<SyncTrigger>) {
-    make_processor_with_quota(db, holdings_dir, source_blocks_dir, u64::MAX, u64::MAX).await
+    make_processor_with_quota(db, holdings_dir, u64::MAX, u64::MAX).await
 }
 
 async fn make_processor_with_quota(
     db: Db,
     holdings_dir: &TempDir,
-    source_blocks_dir: &TempDir,
     soft_quota_bytes: u64,
     hard_quota_bytes: u64,
 ) -> (Processor, mpsc::Receiver<RepairTrigger>, mpsc::Receiver<SyncTrigger>) {
@@ -155,7 +152,6 @@ async fn make_processor_with_quota(
         cluster_state,
     ));
 
-    let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let swarm = make_swarm().await;
 
     let (backup_event_tx, _backup_event_rx) =
@@ -169,9 +165,7 @@ async fn make_processor_with_quota(
         own_identity,
         repair_tx,
         cluster_sync,
-        encoder,
         holdings_dir.path().to_path_buf(),
-        source_blocks_dir.path().to_path_buf(),
         swarm,
         relay_sync_tx,
         soft_quota_bytes,
@@ -185,7 +179,6 @@ async fn make_processor_with_quota(
         None, // cluster_state: not needed for handler unit tests
         syncback_core::config::EscrowCfg::default(),
         accepted_offers,
-        [0u8; 32], // epoch_key
         ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     );
 
@@ -195,7 +188,6 @@ async fn make_processor_with_quota(
 async fn make_processor_with_pending(
     db: Db,
     holdings_dir: &TempDir,
-    source_blocks_dir: &TempDir,
     pending: crate::daemon::scheduler::PendingChallenges,
 ) -> (Processor, mpsc::Receiver<RepairTrigger>, mpsc::Receiver<SyncTrigger>) {
     let (repair_tx, repair_rx) = mpsc::channel::<RepairTrigger>(16);
@@ -227,7 +219,6 @@ async fn make_processor_with_pending(
         cluster_state,
     ));
 
-    let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let swarm = make_swarm().await;
 
     let (backup_event_tx, _backup_event_rx) =
@@ -239,9 +230,7 @@ async fn make_processor_with_pending(
         own_identity,
         repair_tx,
         cluster_sync,
-        encoder,
         holdings_dir.path().to_path_buf(),
-        source_blocks_dir.path().to_path_buf(),
         swarm,
         relay_sync_tx,
         u64::MAX,
@@ -255,7 +244,6 @@ async fn make_processor_with_pending(
         None, // cluster_state: not needed for handler unit tests
         syncback_core::config::EscrowCfg::default(),
         accepted_offers,
-        [0u8; 32], // epoch_key
         ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     );
 
@@ -311,7 +299,6 @@ fn make_symbol_placement(
 async fn symbol_accept_updates_backup_event() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
 
     // Build processor manually so we can keep backup_event_rx alive.
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
@@ -330,7 +317,6 @@ async fn symbol_accept_updates_backup_event() {
         ClusterSyncConfig { our_device_id: device_id, batch_size: 1000 },
         cluster_state,
     ));
-    let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let swarm = make_swarm().await;
     let (backup_event_tx, mut backup_event_rx) =
         mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
@@ -342,9 +328,7 @@ async fn symbol_accept_updates_backup_event() {
         own_identity,
         repair_tx,
         cluster_sync,
-        encoder,
         holdings_dir.path().to_path_buf(),
-        source_dir.path().to_path_buf(),
         swarm,
         relay_sync_tx,
         u64::MAX,
@@ -358,7 +342,6 @@ async fn symbol_accept_updates_backup_event() {
         None, // cluster_state: not needed for handler unit tests
         syncback_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
-        [0u8; 32], // epoch_key
         ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     );
 
@@ -397,9 +380,8 @@ async fn symbol_accept_updates_backup_event() {
 async fn symbol_reject_does_not_create_placement() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_identity(8);
     let block_id = make_block_id(8);
@@ -433,10 +415,9 @@ async fn symbol_reject_does_not_create_placement() {
 async fn symbol_offer_reject_quota_full_no_placement() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     // Quota of 1 byte: any offer will be rejected.
     let (processor, _repair_rx, _relay_rx) =
-        make_processor_with_quota(db.clone(), &holdings_dir, &source_dir, 1, 1).await;
+        make_processor_with_quota(db.clone(), &holdings_dir, 1, 1).await;
 
     let offer_bytes: u64 = 10 * 65_535; // ~640 KB
     let accept = processor
@@ -497,8 +478,7 @@ fn esi_ranges_single_element() {
 async fn handle_symbol_transfer_writes_files_to_disk() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(1);
     let block_id = make_block_id(2);
@@ -534,8 +514,7 @@ async fn handle_symbol_transfer_writes_files_to_disk() {
 async fn handle_symbol_transfer_creates_holding_record_in_db() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(1);
     let block_id = make_block_id(2);
@@ -573,8 +552,7 @@ async fn handle_symbol_transfer_creates_holding_record_in_db() {
 async fn handle_symbol_transfer_merges_with_existing_holding() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(1);
     let block_id = make_block_id(2);
@@ -626,8 +604,7 @@ async fn handle_symbol_transfer_merges_with_existing_holding() {
 async fn handle_pos_hash_challenge_responds_with_chain_hash_when_symbols_held() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(1);
     let block_id = make_block_id(2);
@@ -685,8 +662,7 @@ async fn handle_pos_hash_challenge_responds_with_chain_hash_when_symbols_held() 
 async fn handle_pos_hash_challenge_sends_nack_when_symbol_not_held() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(1);
     let block_id = make_block_id(2);
@@ -737,9 +713,8 @@ async fn handle_pos_hash_challenge_sends_nack_when_symbol_not_held() {
 async fn handle_pos_hash_nack_marks_alive_placement_lost_and_triggers_repair() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, mut repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_device_id(1);
     let block_id = make_block_id(2);
@@ -783,9 +758,8 @@ async fn handle_pos_hash_nack_marks_alive_placement_lost_and_triggers_repair() {
 async fn handle_pos_hash_nack_is_noop_for_lost_placement() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_device_id(1);
     let block_id = make_block_id(2);
@@ -817,9 +791,8 @@ async fn handle_pos_hash_nack_is_noop_for_lost_placement() {
 async fn forged_symbol_dropped_is_rejected_and_no_repair_triggered() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, mut repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let victim_key = ed25519_dalek::SigningKey::from_bytes(&[0x66u8; 32]);
     let victim = DeviceId(victim_key.verifying_key().to_bytes());
@@ -908,9 +881,8 @@ async fn prune_expired_accepted_offers_drops_stale_keeps_fresh() {
 async fn handle_symbol_dropped_marks_alive_placement_lost() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_device_id(3);
     let block_id = make_block_id(4);
@@ -939,9 +911,8 @@ async fn handle_symbol_dropped_marks_alive_placement_lost() {
 async fn handle_symbol_dropped_is_idempotent_for_deleting_placement() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_device_id(3);
     let block_id = make_block_id(4);
@@ -971,9 +942,8 @@ async fn handle_symbol_dropped_is_idempotent_for_deleting_placement() {
 async fn handle_symbol_dropped_sends_repair_trigger() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, mut repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     // Use a signing key whose public key equals the device_id, and register
     // the device → master mapping so signature verification can succeed.
@@ -1019,11 +989,10 @@ async fn handle_symbol_dropped_sends_repair_trigger() {
 async fn symbol_offer_accept_when_quota_not_exceeded() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     // 1 GB soft quota, no hard quota
     let soft = 1_073_741_824u64; // 1 GB
     let (processor, _rx, _relay_rx) =
-        make_processor_with_quota(db.clone(), &holdings_dir, &source_dir, soft, u64::MAX).await;
+        make_processor_with_quota(db.clone(), &holdings_dir, soft, u64::MAX).await;
 
     // 10 symbols * 65535 bytes = ~640 KB — well under 1 GB
     let offer_bytes: u64 = 10 * 65_535;
@@ -1037,11 +1006,10 @@ async fn symbol_offer_accept_when_quota_not_exceeded() {
 async fn symbol_offer_reject_when_hard_quota_exceeded() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     // Hard quota of 100 bytes — already exceeded because we'll store a holding record
     let hard = 100u64;
     let (processor, _rx, _relay_rx) =
-        make_processor_with_quota(db.clone(), &holdings_dir, &source_dir, u64::MAX, hard).await;
+        make_processor_with_quota(db.clone(), &holdings_dir, u64::MAX, hard).await;
 
     // Insert a holding with total_bytes = 200 > 100 (hard floor)
     let owner = make_identity(1);
@@ -1069,11 +1037,10 @@ async fn symbol_offer_reject_when_hard_quota_exceeded() {
 async fn symbol_offer_reject_when_soft_quota_would_overflow() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     // Soft quota 1000 bytes, held 900 bytes, offer 200 bytes → would exceed
     let soft = 1000u64;
     let (processor, _rx, _relay_rx) =
-        make_processor_with_quota(db.clone(), &holdings_dir, &source_dir, soft, u64::MAX).await;
+        make_processor_with_quota(db.clone(), &holdings_dir, soft, u64::MAX).await;
 
     let owner = make_identity(2);
     let block_id = make_block_id(2);
@@ -1100,11 +1067,10 @@ async fn symbol_offer_reject_when_soft_quota_would_overflow() {
 async fn symbol_offer_accept_when_unlimited_quota() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     // soft_quota=0 means "use disk-based limit" (effective = disk_free - reserve).
     // With reserve=0, any offer fitting in disk space is accepted.
     let (processor, _rx, _relay_rx) =
-        make_processor_with_quota(db.clone(), &holdings_dir, &source_dir, 0, 0)
+        make_processor_with_quota(db.clone(), &holdings_dir, 0, 0)
             .await;
 
     let accept = processor
@@ -1119,8 +1085,7 @@ async fn symbol_offer_accept_when_unlimited_quota() {
 async fn restore_request_returns_empty_when_no_holding() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(5);
     let block_id = make_block_id(5);
@@ -1148,8 +1113,7 @@ async fn restore_request_returns_empty_when_no_holding() {
 async fn restore_request_returns_held_symbols() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(6);
     let block_id = make_block_id(6);
@@ -1197,8 +1161,7 @@ async fn restore_request_returns_held_symbols() {
 async fn restore_request_filters_by_esi_list() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(7);
     let block_id = make_block_id(7);
@@ -1250,9 +1213,8 @@ async fn restore_request_filters_by_esi_list() {
 async fn board_sync_forwards_to_relay_sync_tx() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _rx, mut relay_sync_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let from = make_identity(10);
     let msg = BoardSyncMsg {
@@ -1297,8 +1259,7 @@ async fn peer_announce_for_unknown_peer_is_ignored() {
     // An announce from a peer with no registered DeviceId creates nothing.
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let (msg, _identity) = make_signed_peer_announce(20);
 
@@ -1316,8 +1277,7 @@ async fn peer_announce_updates_existing_peer_last_seen() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let (sk, identity) = make_signing_identity(21);
     let now = Timestamp::now();
@@ -1364,8 +1324,7 @@ async fn peer_announce_via_relay_dispatch() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let (announce_msg, identity) = make_signed_peer_announce(22);
     let payload = to_cbor(&announce_msg).expect("cbor encode failed");
@@ -1391,8 +1350,7 @@ async fn peer_announce_via_relay_dispatch() {
 async fn symbol_accept_logs_without_error() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_identity(30);
     let accept = SymbolAcceptMsg {
@@ -1414,8 +1372,7 @@ async fn symbol_reject_logs_without_error() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_identity(31);
     let reject = SymbolRejectMsg {
@@ -1441,8 +1398,7 @@ async fn peer_announce_db_upsert_always_succeeds() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let (sk, identity) = make_signing_identity(51);
     let msg = build_peer_announce(identity, Timestamp::now(), &sk, None);
@@ -1461,8 +1417,7 @@ async fn peer_announce_db_upsert_always_succeeds() {
 async fn peer_announce_with_invalid_signature_is_rejected() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     // Create a signed message, then corrupt the signature.
     let (mut msg, identity) = make_signed_peer_announce(60);
@@ -1488,8 +1443,7 @@ async fn handle_system_state_backup_stores_blob_for_known_peer() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(60);
     let now = Timestamp::now();
@@ -1536,8 +1490,7 @@ async fn handle_system_state_backup_rejects_unknown_peer() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let stranger = make_identity(61);
     let msg = SystemStateBackupMsg {
@@ -1562,8 +1515,7 @@ async fn handle_system_state_backup_ignores_empty_blob() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(62);
     let now = Timestamp::now();
@@ -1608,8 +1560,7 @@ async fn handle_system_state_ack_logs_without_error() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let peer = make_identity(63);
 
@@ -1647,7 +1598,6 @@ async fn handle_pos_hash_response_pass_records_trust_and_updates_placement() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
 
     let holder_id = make_device_id(10);
     let block_id = make_block_id(20);
@@ -1675,7 +1625,7 @@ async fn handle_pos_hash_response_pass_records_trust_and_updates_placement() {
         std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
 
     let (processor, _repair_rx, _relay_rx) =
-        make_processor_with_pending(db.clone(), &holdings_dir, &source_dir, pending).await;
+        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
 
     // Insert PeerRecord with initial trust.
     db.upsert_peer(&make_peer_record(holder_id)).unwrap();
@@ -1736,7 +1686,6 @@ async fn handle_pos_hash_response_fail_marks_lost_and_triggers_repair() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
 
     let holder_id = make_device_id(11);
     let block_id = make_block_id(21);
@@ -1763,7 +1712,7 @@ async fn handle_pos_hash_response_fail_marks_lost_and_triggers_repair() {
         std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
 
     let (processor, mut repair_rx, _relay_rx) =
-        make_processor_with_pending(db.clone(), &holdings_dir, &source_dir, pending).await;
+        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
 
     // Insert PeerRecord.
     db.upsert_peer(&make_peer_record(holder_id)).unwrap();
@@ -1832,9 +1781,8 @@ async fn handle_pos_hash_response_fail_marks_lost_and_triggers_repair() {
 async fn handle_delete_marks_holding_for_deletion() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -1867,9 +1815,8 @@ async fn handle_delete_marks_holding_for_deletion() {
 async fn handle_delete_ignores_non_active_holding() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -1901,9 +1848,8 @@ async fn handle_delete_ignores_non_active_holding() {
 async fn handle_delete_ignores_no_holding() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -1918,9 +1864,8 @@ async fn handle_delete_ignores_no_holding() {
 async fn handle_delete_rejects_invalid_signature() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -1955,9 +1900,8 @@ async fn handle_delete_rejects_invalid_signature() {
 async fn handle_cancel_delete_reverts_to_active() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -1988,9 +1932,8 @@ async fn handle_cancel_delete_reverts_to_active() {
 async fn handle_cancel_delete_ignores_active_holding() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2021,9 +1964,8 @@ async fn handle_cancel_delete_ignores_active_holding() {
 async fn handle_cancel_delete_rejects_bad_sig() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2057,9 +1999,8 @@ async fn handle_cancel_delete_rejects_bad_sig() {
 async fn handle_symbol_drop_notice_does_not_panic() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_identity(0xF0);
     let notice = SymbolDropNoticeMsg {
@@ -2080,7 +2021,6 @@ async fn handle_symbol_drop_notice_does_not_panic() {
 async fn dispatch_relay_pos_hash_challenge_sends_response_via_board() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
 
     // Build processor manually to keep relay_post_rx alive.
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
@@ -2099,8 +2039,6 @@ async fn dispatch_relay_pos_hash_challenge_sends_response_via_board() {
         ClusterSyncConfig { our_device_id: device_id, batch_size: 1000 },
         cluster_state,
     ));
-    let encoder: Arc<dyn syncback_core::erasure::ErasureEncoder> =
-        Arc::new(syncback_core::erasure::RaptorQEncoder::new());
     let swarm = make_swarm().await;
     let (backup_event_tx, _backup_event_rx) =
         mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
@@ -2108,8 +2046,8 @@ async fn dispatch_relay_pos_hash_challenge_sends_response_via_board() {
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let processor = Processor::new(
-        db.clone(), own_identity, repair_tx, cluster_sync, encoder,
-        holdings_dir.path().to_path_buf(), source_dir.path().to_path_buf(),
+        db.clone(), own_identity, repair_tx, cluster_sync,
+        holdings_dir.path().to_path_buf(),
         swarm, relay_sync_tx, u64::MAX, u64::MAX,
         holdings_dir.path().to_path_buf(), 0,
         backup_event_tx, 1,
@@ -2117,7 +2055,6 @@ async fn dispatch_relay_pos_hash_challenge_sends_response_via_board() {
         None, // cluster_state: not needed for this test
         syncback_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
-        [0u8; 32], // epoch_key
         ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     );
 
@@ -2171,9 +2108,8 @@ async fn dispatch_relay_pos_hash_challenge_sends_response_via_board() {
 async fn dispatch_relay_delete_marks_holding() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2219,7 +2155,6 @@ async fn dispatch_relay_delete_marks_holding() {
 async fn make_processor_with_cluster_state(
     db: Db,
     holdings_dir: &TempDir,
-    source_blocks_dir: &TempDir,
 ) -> (
     Processor,
     Arc<Mutex<ClusterState>>,
@@ -2249,7 +2184,6 @@ async fn make_processor_with_cluster_state(
         cluster_state.clone(),
     ));
 
-    let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let swarm = make_swarm().await;
     let (backup_event_tx, _backup_event_rx) =
         mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
@@ -2262,9 +2196,7 @@ async fn make_processor_with_cluster_state(
         own_identity,
         repair_tx,
         cluster_sync,
-        encoder,
         holdings_dir.path().to_path_buf(),
-        source_blocks_dir.path().to_path_buf(),
         swarm,
         relay_sync_tx,
         u64::MAX,
@@ -2278,7 +2210,6 @@ async fn make_processor_with_cluster_state(
         Some(cluster_state.clone()),
         syncback_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
-        [0u8; 32], // epoch_key
         ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     );
 
@@ -2304,10 +2235,9 @@ fn make_device_cert(
 async fn cluster_device_auto_added_when_same_master_identity() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
 
     let (processor, cluster_state, own_identity) =
-        make_processor_with_cluster_state(db, &holdings_dir, &source_dir).await;
+        make_processor_with_cluster_state(db, &holdings_dir).await;
 
     // Build a cert for device_B using the same master key.
     let master_key = derive_master_key(&[0xAAu8; 64]).expect("derive_master_key");
@@ -2341,10 +2271,9 @@ async fn cluster_device_auto_added_when_same_master_identity() {
 async fn cluster_device_not_added_when_different_master_identity() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
 
     let (processor, cluster_state, _own_identity) =
-        make_processor_with_cluster_state(db, &holdings_dir, &source_dir).await;
+        make_processor_with_cluster_state(db, &holdings_dir).await;
 
     // Build a cert from a different master key.
     let other_master_key = derive_master_key(&[0xBBu8; 64]).expect("derive_master_key");
@@ -2380,10 +2309,9 @@ async fn cluster_device_not_added_when_different_master_identity() {
 async fn cluster_device_auto_add_idempotent_when_already_registered() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
 
     let (processor, cluster_state, own_identity) =
-        make_processor_with_cluster_state(db, &holdings_dir, &source_dir).await;
+        make_processor_with_cluster_state(db, &holdings_dir).await;
 
     let master_key = derive_master_key(&[0xAAu8; 64]).expect("derive_master_key");
     let device_seed_b = [0x02u8; 32];
@@ -2422,10 +2350,9 @@ async fn cluster_device_auto_add_idempotent_when_already_registered() {
 async fn cluster_device_not_added_when_no_cert() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
 
     let (processor, cluster_state, own_identity) =
-        make_processor_with_cluster_state(db, &holdings_dir, &source_dir).await;
+        make_processor_with_cluster_state(db, &holdings_dir).await;
 
     // cert is None — even though master identity matches.
     let added = processor
@@ -2454,10 +2381,9 @@ async fn cluster_device_not_added_when_no_cert() {
 async fn revocation_broadcast_marks_device_key_revoked() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
 
     let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     // Build peer master key and identity.
     let peer_master_key = derive_master_key(&[0x55u8; 64]).expect("derive_master_key");
@@ -2526,10 +2452,9 @@ async fn revocation_broadcast_marks_device_key_revoked() {
 async fn revocation_broadcast_idempotent_on_duplicate() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
 
     let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0x66u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -2598,10 +2523,9 @@ async fn revocation_broadcast_idempotent_on_duplicate() {
 async fn revocation_broadcast_invalid_device_cert_rejected() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
 
     let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0x77u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -2673,10 +2597,9 @@ async fn revocation_broadcast_invalid_device_cert_rejected() {
 async fn revocation_broadcast_device_id_mismatch_rejected() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
 
     let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0x99u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -2748,10 +2671,9 @@ async fn revocation_broadcast_device_id_mismatch_rejected() {
 async fn revocation_broadcast_unknown_peer_ignored() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
 
     let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0xAAu8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -2799,8 +2721,7 @@ async fn revocation_broadcast_unknown_peer_ignored() {
 async fn transfer_without_offer_rejected() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(0x11);
     let block_id = make_block_id(0x11);
@@ -2844,8 +2765,7 @@ async fn transfer_without_offer_rejected() {
 async fn offer_accepted_stored_in_map() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let owner = IdentityPub(signing_key.verifying_key().to_bytes());
@@ -2895,8 +2815,7 @@ async fn offer_accepted_stored_in_map() {
 async fn transfer_stored_after_valid_offer() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(0x33);
     let block_id = make_block_id(0x33);
@@ -2948,8 +2867,7 @@ async fn transfer_stored_after_valid_offer() {
 async fn transfer_rejected_esi_out_of_range() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(0x44);
     let block_id = make_block_id(0x44);
@@ -3001,8 +2919,7 @@ async fn transfer_rejected_esi_out_of_range() {
 async fn offer_rejected_bad_signature() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let owner = IdentityPub(signing_key.verifying_key().to_bytes());
@@ -3043,8 +2960,7 @@ async fn expired_accepted_offer_rejected() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir, &source_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(0x66);
     let block_id = make_block_id(0x66);
@@ -3118,10 +3034,9 @@ async fn offer_rejected_when_quota_full() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     // Quota of 1 byte: any realistic offer exceeds it and is rejected.
     let (processor, _repair_rx, _relay_rx) =
-        make_processor_with_quota(db.clone(), &holdings_dir, &source_dir, 1, 1).await;
+        make_processor_with_quota(db.clone(), &holdings_dir, 1, 1).await;
 
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let owner = IdentityPub(signing_key.verifying_key().to_bytes());
@@ -3184,9 +3099,8 @@ async fn offer_rejected_on_stale_timestamp() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let owner = IdentityPub(signing_key.verifying_key().to_bytes());
@@ -3241,9 +3155,8 @@ async fn offer_rejected_on_stale_timestamp() {
 async fn peer_authenticated_upserts_peer_record() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0xD1u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -3300,10 +3213,9 @@ async fn peer_authenticated_upserts_peer_record() {
 async fn peer_authenticated_same_master_triggers_cluster_add() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
 
     let (processor, cluster_state, own_identity) =
-        make_processor_with_cluster_state(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor_with_cluster_state(db.clone(), &holdings_dir).await;
 
     // Peer uses the same master key (0xAAu8; 64 — matches make_processor_with_cluster_state).
     let master_key = derive_master_key(&[0xAAu8; 64]).expect("derive_master_key");
@@ -3347,9 +3259,8 @@ async fn peer_authenticated_same_master_triggers_cluster_add() {
 async fn connection_closed_removes_from_peer_cert_map() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0xE3u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -3392,9 +3303,8 @@ async fn connection_closed_removes_from_peer_cert_map() {
 async fn peer_authenticated_stores_device_to_master_mapping() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let source_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir, &source_dir).await;
+        make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0xF1u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -3515,8 +3425,7 @@ async fn cluster_sync_response_from_non_cluster_peer_is_rejected() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings = TempDir::new().unwrap();
-    let blocks = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db, &holdings, &blocks).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db, &holdings).await;
 
     let own_identity = processor.own_identity;
 

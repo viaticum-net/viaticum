@@ -468,9 +468,7 @@ impl DaemonHandle {
                 identity_pub,
                 repair_tx_for_processor,
                 cluster_sync,
-                encoder.clone(),
                 holdings_dir.clone(),
-                symbols_dir.clone(), // source_blocks_dir: owner's blocks for PoS verification
                 swarm_for_processor,
                 relay_sync_tx.clone(),
                 soft_quota_bytes,
@@ -484,7 +482,6 @@ impl DaemonHandle {
                 Some(cs.clone()),
                 app_config.escrow.clone(),
                 accepted_offers.clone(),
-                epoch_key_bytes,
                 master_key.clone(),
             );
             let cancel_processor = cancel.clone();
