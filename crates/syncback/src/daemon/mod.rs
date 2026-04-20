@@ -13,6 +13,7 @@ pub mod relay;
 pub mod repair;
 pub mod restore;
 pub mod scheduler;
+pub mod symbol_fetch;
 pub mod system_state;
 pub mod watcher;
 pub mod web_api;

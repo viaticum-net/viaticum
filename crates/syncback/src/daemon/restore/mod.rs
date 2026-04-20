@@ -14,7 +14,6 @@ use std::sync::Arc;
 
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, Symbol};
-use syncback_core::messages::{Message, RestoreRequestMsg};
 use syncback_core::types::{
     DeviceId, ErasureParams, FileRecord, FileVersion, IdentityPub, LocalState,
     PlacementStatus, SourceBlockId, SourceBlockType, SymbolPlacement, Timestamp,
@@ -79,6 +78,35 @@ pub enum RestoreError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl RestoreError {
+    /// Wrap a shared `FetchError` as `RestoreError`, tagging `InsufficientSymbols`
+    /// with the requested `block` for the context caller operates in.
+    pub(crate) fn from_fetch(err: crate::daemon::symbol_fetch::FetchError) -> Self {
+        use crate::daemon::symbol_fetch::FetchError;
+        match err {
+            FetchError::InsufficientSymbols { block, got, need } => {
+                RestoreError::InsufficientSymbols { block, got, need }
+            }
+            FetchError::EscrowDenied {
+                holder,
+                current_trust,
+                needed_trust,
+                restore_budget_gb,
+            } => RestoreError::EscrowDenied {
+                holder,
+                current_trust,
+                needed_trust,
+                restore_budget_gb,
+                // RestoreDeniedMsg doesn't carry the requested size — we only
+                // know the holder's budget view. Report NaN so callers (and
+                // operators) don't mistake this number for a real measurement.
+                restore_gb: f64::NAN,
+            },
+            FetchError::Swarm(s) => RestoreError::Swarm(s),
+        }
+    }
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -446,139 +474,36 @@ impl RestoreCoordinator {
 
     /// Fetch symbols for a source block from holders over the network.
     ///
-    /// Tries holders sequentially, stopping once `k_eff` unbound symbols are
-    /// collected. Holders that return RestoreDenied are logged at WARN and
-    /// skipped. Network errors per holder are logged at WARN and skipped.
-    ///
-    /// Returns unbound symbols ready for `encoder.decode()`.
+    /// Thin wrapper around `symbol_fetch::fetch_unbound_symbols`; maps the
+    /// shared `FetchError` into `RestoreError`. Kept as a method so existing
+    /// integration tests continue to call `coordinator.fetch_from_holders(...)`.
     pub async fn fetch_from_holders(
         &self,
         block_id: &SourceBlockId,
         placements: &[SymbolPlacement],
         params: &ErasureParams,
     ) -> Result<Vec<Symbol>, RestoreError> {
-        let k_eff = params.k_eff as usize;
-        let mut unbound_symbols: Vec<Symbol> = Vec::new();
-
-        for placement in placements {
-            if placement.status != PlacementStatus::Alive {
-                continue;
-            }
-            if unbound_symbols.len() >= k_eff {
-                break;
-            }
-
-            let still_needed = k_eff - unbound_symbols.len();
-            let wanted_esis: Vec<u32> = collect_esis_from_ranges(&placement.esi_ranges)
-                .into_iter()
-                .take(still_needed)
-                .collect();
-
-            if wanted_esis.is_empty() {
-                continue;
-            }
-
-            let request = RestoreRequestMsg {
-                v: 1,
-                source_block_id: *block_id,
-                esi_list: wanted_esis,
-                timestamp: Timestamp::now(),
-            };
-
-            match self
-                .fetch_symbols_from_holder(&placement.holder_id, request)
-                .await
-            {
-                Ok(symbols) => {
-                    debug!(
-                        holder = %placement.holder_id,
-                        block = %block_id,
-                        count = symbols.len(),
-                        "fetch: received bound symbols from holder"
-                    );
-                    for sym in symbols {
-                        let unbound = self.encoder.unbind(sym, block_id, &placement.holder_id);
-                        unbound_symbols.push(unbound);
-                    }
-                }
-                Err(RestoreError::EscrowDenied { ref holder, .. }) => {
-                    warn!(
-                        holder = %holder,
-                        block = %block_id,
-                        "fetch: holder denied restore (escrow), skipping"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        holder = %placement.holder_id,
-                        block = %block_id,
-                        err = %e,
-                        "fetch: holder failed, skipping"
-                    );
-                }
-            }
-        }
-
-        if unbound_symbols.len() < k_eff {
-            Err(RestoreError::InsufficientSymbols {
-                block: *block_id,
-                got: unbound_symbols.len(),
-                need: k_eff,
-            })
-        } else {
-            Ok(unbound_symbols)
-        }
-    }
-
-    /// Contact one holder, send a RestoreRequest, receive RestoreResponse via libp2p swarm.
-    ///
-    /// Returns the raw bound symbols (not yet unbound).
-    async fn fetch_symbols_from_holder(
-        &self,
-        holder_device: &DeviceId,
-        request: RestoreRequestMsg,
-    ) -> Result<Vec<Symbol>, RestoreError> {
-        let swarm = match &self.swarm {
+        // Without a swarm no holder is reachable; preserve the old behavior of
+        // returning InsufficientSymbols(got=0) rather than a Swarm error.
+        let swarm = match self.swarm.as_ref() {
             Some(s) => s,
             None => {
-                return Err(RestoreError::Swarm(
-                    "no swarm configured for remote restore".to_string(),
-                ));
+                return Err(RestoreError::InsufficientSymbols {
+                    block: *block_id,
+                    got: 0,
+                    need: params.k_eff as usize,
+                });
             }
         };
-
-        let response = swarm
-            .send_to_device(*holder_device, Message::RestoreRequest(request))
-            .await
-            .map_err(|e| RestoreError::Swarm(e.to_string()))?;
-
-        match response {
-            Message::RestoreResponse(resp) => {
-                debug!(
-                    holder = %holder_device,
-                    symbols = resp.symbols.len(),
-                    "fetch: received RestoreResponse via swarm"
-                );
-                Ok(resp.symbols)
-            }
-            Message::RestoreDenied(denied) => Err(RestoreError::EscrowDenied {
-                holder: *holder_device,
-                current_trust: denied.current_trust,
-                needed_trust: denied.needed_trust,
-                restore_budget_gb: denied.restore_budget_gb,
-                restore_gb: denied.restore_budget_gb + 1.0, // approximate
-            }),
-            other => {
-                warn!(
-                    holder = %holder_device,
-                    msg = ?std::mem::discriminant(&other),
-                    "fetch: unexpected swarm response, treating as error"
-                );
-                Err(RestoreError::Swarm(
-                    "unexpected message type during restore".to_string(),
-                ))
-            }
-        }
+        crate::daemon::symbol_fetch::fetch_unbound_symbols(
+            swarm,
+            &self.encoder,
+            block_id,
+            placements,
+            params.k_eff as usize,
+        )
+        .await
+        .map_err(RestoreError::from_fetch)
     }
 
     /// Extract one file from decoded plaintext and write to output_dir.
@@ -703,4 +628,5 @@ impl RestoreCoordinator {
 // ─── Free helpers ─────────────────────────────────────────────────────────────
 
 // Re-export shared helper from core (review A3).
+#[cfg(test)]
 pub(crate) use syncback_core::types::ranges_to_esi_list as collect_esis_from_ranges;
