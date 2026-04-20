@@ -668,11 +668,22 @@ impl RepairAgent {
         }
     }
 
-    /// Load block.bin from disk, or rebuild it from source files if absent.
+    /// Load block.bin from disk, or rebuild it from source files, or fetch it
+    /// from holders over the network — in that order.
     ///
     /// Encryption is deterministic (nonce = HKDF(epoch_key, blake3(compressed))),
     /// so re-running compress_and_encrypt on the same plaintext produces the
-    /// exact same blob with the same block_id.
+    /// exact same blob with the same block_id. Likewise, decoding `k_eff`
+    /// symbols fetched from holders and truncating to `encrypted_size` yields
+    /// the same stored blob bit-for-bit.
+    ///
+    /// Fallback order (single attempt each, D2):
+    ///   1. `block.bin` from `source_blocks_dir`
+    ///   2. Re-run compress/encrypt on source files (rebuild_plaintext_from_db)
+    ///   3. Fetch k_eff unbound symbols from Alive holders, decode, truncate
+    ///
+    /// If all three fail the caller (repair_placement) logs at ERROR (D3);
+    /// no new `PermanentlyLost` status is introduced.
     async fn load_or_rebuild_blob(
         &self,
         block_id: &SourceBlockId,
@@ -683,7 +694,7 @@ impl RepairAgent {
             .join(hex_encode(&block_id.0))
             .join("block.bin");
 
-        // Try reading block.bin first (fast path).
+        // (1) block.bin fast path.
         match tokio::fs::read(&block_file_path).await {
             Ok(data) => return Ok(data),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -692,15 +703,39 @@ impl RepairAgent {
             Err(e) => return Err(RepairError::Io(e)),
         }
 
-        // Rebuild: find source files for this block and re-run the pipeline.
         let block_record = self
             .db
             .get_source_block(block_id)?
             .ok_or(RepairError::RecordMissing(*block_id))?;
 
+        // (2) Rebuild from source files.
+        match self.rebuild_blob_from_source(block_id, &block_record).await {
+            Ok(stored) => {
+                tracing::info!(block_id = %block_id, "repair: rebuilt blob from source files");
+                return Ok(stored);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    block_id = %block_id,
+                    "repair: local rebuild failed ({e}); falling back to fetch from holders"
+                );
+            }
+        }
+
+        // (3) Network fallback: fetch from holders and decode.
+        self.fetch_and_rebuild_blob(block_id, &block_record).await
+    }
+
+    /// Re-run the backup pipeline (read source files → compress → encrypt)
+    /// and verify the resulting blob's hash equals `block_id`.
+    async fn rebuild_blob_from_source(
+        &self,
+        block_id: &SourceBlockId,
+        block_record: &syncback_core::types::SourceBlockRecord,
+    ) -> Result<Vec<u8>, RepairError> {
         let plaintext = crate::daemon::backup::packing::rebuild_plaintext_from_db(
             &self.db,
-            &block_record,
+            block_record,
         )
         .map_err(|e| RepairError::EncodeFailed(format!("rebuild plaintext: {e}")))?;
 
@@ -714,12 +749,7 @@ impl RepairAgent {
         .map_err(|e| RepairError::EncodeFailed(e.to_string()))?
         .map_err(|e| RepairError::EncodeFailed(e.to_string()))?;
 
-        // Verify hash matches expected block_id.
         let rebuilt_id: [u8; 32] = *blake3::hash(&stored).as_bytes();
-        debug_assert_eq!(
-            rebuilt_id, expected_id.0,
-            "rebuilt blob hash must match block_id (deterministic encryption)"
-        );
         if rebuilt_id != expected_id.0 {
             return Err(RepairError::EncodeFailed(format!(
                 "rebuilt blob hash {} != expected block_id {}",
@@ -727,8 +757,106 @@ impl RepairAgent {
                 hex_encode(&expected_id.0),
             )));
         }
+        Ok(stored)
+    }
 
-        tracing::info!(block_id = %block_id, "repair: rebuilt blob from source files");
+    /// Fetch k_eff unbound symbols from Alive holders, decode, truncate to
+    /// `encrypted_size` — yielding the same ciphertext that was originally
+    /// stored as `block.bin`.
+    ///
+    /// Escrow (D1): holders may reply with `RestoreDenied`; the shared
+    /// `symbol_fetch` helper skips them and keeps collecting from the next
+    /// holder. If fewer than `k_eff` unbound symbols arrive, returns
+    /// `EncodeFailed` (the caller logs at ERROR — D3).
+    async fn fetch_and_rebuild_blob(
+        &self,
+        block_id: &SourceBlockId,
+        block_record: &syncback_core::types::SourceBlockRecord,
+    ) -> Result<Vec<u8>, RepairError> {
+        let swarm = match self.config.swarm.as_ref() {
+            Some(s) => s,
+            None => {
+                return Err(RepairError::EncodeFailed(
+                    "no swarm configured; cannot fetch from holders".to_string(),
+                ));
+            }
+        };
+
+        let encrypted_size = block_record.encrypted_size.ok_or_else(|| {
+            RepairError::EncodeFailed(format!(
+                "block {block_id} has no encrypted_size (legacy record); cannot fetch and rebuild"
+            ))
+        })?;
+        let params = block_record.erasure_params();
+        let k_eff = params.k_eff as usize;
+
+        // SymbolPlacement rows describe symbols stored by *other* devices for
+        // blocks this node owns — there are no placements where holder == self,
+        // so no self-filter is needed here.
+        let placements = self.db.list_placements_for_block(block_id)?;
+        let alive: Vec<_> = placements
+            .into_iter()
+            .filter(|p| p.status == syncback_core::types::PlacementStatus::Alive)
+            .collect();
+
+        if alive.is_empty() {
+            return Err(RepairError::EncodeFailed(format!(
+                "no alive placements for block {block_id}; cannot fetch"
+            )));
+        }
+
+        tracing::info!(
+            block_id = %block_id,
+            alive = alive.len(),
+            k_eff,
+            "repair: fetching symbols from holders to rebuild lost blob"
+        );
+
+        let unbound = crate::daemon::symbol_fetch::fetch_unbound_symbols(
+            swarm,
+            &self.encoder,
+            block_id,
+            &alive,
+            k_eff,
+        )
+        .await
+        .map_err(|e| RepairError::EncodeFailed(format!("fetch_unbound_symbols: {e}")))?;
+
+        // Decode + truncate in spawn_blocking (decode is CPU-heavy).
+        let encoder = Arc::clone(&self.encoder);
+        let expected_id = *block_id;
+        let stored = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, RepairError> {
+            let padded = encoder
+                .decode(&unbound, &params)
+                .map_err(|e| RepairError::EncodeFailed(format!("decode: {e}")))?;
+
+            if padded.len() < encrypted_size as usize {
+                return Err(RepairError::EncodeFailed(format!(
+                    "decoded block ({} bytes) smaller than encrypted_size ({})",
+                    padded.len(),
+                    encrypted_size
+                )));
+            }
+            let stored = padded[..encrypted_size as usize].to_vec();
+
+            // Verify hash — this is our integrity check for the fetched blob.
+            let rebuilt_id: [u8; 32] = *blake3::hash(&stored).as_bytes();
+            if rebuilt_id != expected_id.0 {
+                return Err(RepairError::EncodeFailed(format!(
+                    "fetched blob hash {} != expected block_id {}",
+                    hex_encode(&rebuilt_id),
+                    hex_encode(&expected_id.0),
+                )));
+            }
+            Ok(stored)
+        })
+        .await
+        .map_err(|e| RepairError::EncodeFailed(e.to_string()))??;
+
+        tracing::info!(
+            block_id = %block_id,
+            "repair: rebuilt blob from holder symbols (network fallback)"
+        );
         Ok(stored)
     }
 

@@ -189,6 +189,50 @@ async fn repair_placement_missing_source_block_returns_error() {
     assert!(matches!(result, Err(RepairError::EncodeFailed(_))));
 }
 
+// ─── test 15b: network fallback error when swarm is absent ──────────────────
+
+/// When block.bin is missing, source rebuild fails, *and* no swarm is
+/// configured, `load_or_rebuild_blob` must report the missing network path.
+/// Verifies the new third-stage fallback is reached and fails with a clear
+/// "no swarm configured" message (D3: failure logged, no new Lost status).
+#[tokio::test]
+async fn repair_network_fallback_absent_reports_no_swarm() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+
+    let bid = block_id(12);
+    let hid = holder_id(13);
+
+    // Source block exists in DB; block.bin absent; no source files to rebuild from.
+    db.upsert_source_block(&make_source_block_record(bid, 1, 65535))
+        .unwrap();
+    // Insert one Alive placement so the fallback actually tries to fetch
+    // (rather than bailing on "no alive placements"). swarm=None then kicks in.
+    db.upsert_placement(&make_placement(
+        bid,
+        holder_id(99),
+        vec![(0, 1)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_placement(bid, hid, vec![(1, 1)], PlacementStatus::Lost))
+        .unwrap();
+    insert_candidate_peers(&db, 20, 21);
+
+    let agent = make_agent(db, symbols_dir.path());
+    let result = agent.repair_placement(&bid, &hid).await;
+
+    match result {
+        Err(RepairError::EncodeFailed(msg)) => {
+            assert!(
+                msg.contains("no swarm configured"),
+                "expected 'no swarm configured' in fallback error, got: {msg}"
+            );
+        }
+        other => panic!("expected EncodeFailed with swarm-related message, got: {other:?}"),
+    }
+}
+
 // ─── test 16: handle_symbol_dropped_transitions_to_lost ──────────────────────
 
 #[tokio::test]
