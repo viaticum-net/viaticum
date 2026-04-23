@@ -55,6 +55,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         mock_offer_budget_gb: None,
         master_signing_key: None,
         swarm: None,
+        live_watch_configs: None,
     }
 }
 
@@ -305,6 +306,7 @@ async fn full_lifecycle_e2e() {
             mock_offer_budget_gb: None,
             master_signing_key: None,
             swarm: None,
+        live_watch_configs: None,
         },
         Arc::new(RaptorQEncoder::new()),
     );

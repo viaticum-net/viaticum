@@ -44,6 +44,7 @@ async fn make_test_state() -> Arc<DaemonState> {
         time_scale: 1,
         relay_post_tx: None,
         swarm_handle: None,
+        watch_admin: None,
     })
 }
 
@@ -210,6 +211,7 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
         time_scale: 1,
         relay_post_tx: Some(relay_post_tx),
         swarm_handle: None,
+        watch_admin: None,
     });
 
     // Revoke device B.
@@ -419,6 +421,7 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
         time_scale: 1,
         relay_post_tx: None,
         swarm_handle: None,
+        watch_admin: None,
     });
 
     let response = dispatch(CliRequest::Connect { addr: addr_b_str }, &state_a).await;

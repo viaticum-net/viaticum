@@ -14,6 +14,11 @@ use crate::cli::types::{
 };
 use crate::daemon::cli_server::dispatch;
 use crate::daemon::handle::DaemonState;
+use crate::daemon::watch_admin::{
+    AddWatchRequest, DeleteWatchQuery, PatchWatchRequest, WatchAdminError, WatchDefaults,
+    WatchEntry,
+};
+use syncback_core::config::DEFAULT_IMPORTANCE;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -36,6 +41,19 @@ pub async fn start(
         .route("/api/restore", axum::routing::post(handle_restore))
         .route("/api/devices", axum::routing::get(handle_devices))
         .route("/api/connect", axum::routing::post(handle_connect))
+        // ── Watch management routes ───────────────────────────────────────────
+        .route(
+            "/api/watches",
+            axum::routing::get(handle_watches_list).post(handle_watches_add),
+        )
+        .route("/api/watches/defaults", axum::routing::get(handle_watches_defaults))
+        .route("/api/watches/refresh", axum::routing::post(handle_watches_refresh))
+        .route(
+            "/api/watches/{path_b64}",
+            axum::routing::patch(handle_watches_patch).delete(handle_watches_delete),
+        )
+        .route("/api/watches/{path_b64}/scan", axum::routing::post(handle_watches_scan))
+        .route("/api/browse", axum::routing::get(handle_browse))
         .with_state(state);
 
     // Serve static files (SPA) if configured.
@@ -158,4 +176,155 @@ async fn handle_connect(
         CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
         _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "unexpected response".into())),
     }
+}
+
+// ── Watch management handlers ─────────────────────────────────────────────────
+
+/// Map WatchAdminError to (StatusCode, String).
+fn watch_admin_err(e: WatchAdminError) -> (StatusCode, String) {
+    let status = match &e {
+        WatchAdminError::NotFound(_) => StatusCode::NOT_FOUND,
+        WatchAdminError::NotADirectory(_) | WatchAdminError::NotAbsolute(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        WatchAdminError::Nested { .. } => StatusCode::CONFLICT,
+        WatchAdminError::ConfigSave(_)
+        | WatchAdminError::Db(_)
+        | WatchAdminError::WatcherGone => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, e.to_string())
+}
+
+/// Helper: get watch_admin or return 503 Service Unavailable.
+fn require_watch_admin(
+    state: &DaemonState,
+) -> Result<&std::sync::Arc<crate::daemon::watch_admin::WatchAdmin>, (StatusCode, String)> {
+    state.watch_admin.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "watch admin not available".to_string(),
+        )
+    })
+}
+
+async fn handle_watches_list(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<Json<Vec<WatchEntry>>, (StatusCode, String)> {
+    let admin = require_watch_admin(&state)?;
+    Ok(Json(admin.list_watches()))
+}
+
+async fn handle_watches_defaults() -> Json<WatchDefaults> {
+    Json(WatchDefaults {
+        importance: DEFAULT_IMPORTANCE,
+    })
+}
+
+async fn handle_watches_add(
+    State(state): State<Arc<DaemonState>>,
+    Json(body): Json<AddWatchRequest>,
+) -> Result<(StatusCode, Json<WatchEntry>), (StatusCode, String)> {
+    let admin = require_watch_admin(&state)?;
+    let entry = admin.add_watch(body).await.map_err(watch_admin_err)?;
+    Ok((StatusCode::CREATED, Json(entry)))
+}
+
+async fn handle_watches_patch(
+    State(state): State<Arc<DaemonState>>,
+    axum::extract::Path(path_b64): axum::extract::Path<String>,
+    Json(body): Json<PatchWatchRequest>,
+) -> Result<Json<WatchEntry>, (StatusCode, String)> {
+    let admin = require_watch_admin(&state)?;
+    let entry = admin.patch_watch(&path_b64, body).await.map_err(watch_admin_err)?;
+    Ok(Json(entry))
+}
+
+async fn handle_watches_delete(
+    State(state): State<Arc<DaemonState>>,
+    axum::extract::Path(path_b64): axum::extract::Path<String>,
+    Query(q): Query<DeleteWatchQuery>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let admin = require_watch_admin(&state)?;
+    admin
+        .remove_watch(&path_b64, q.purge)
+        .await
+        .map_err(watch_admin_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn handle_watches_scan(
+    State(state): State<Arc<DaemonState>>,
+    axum::extract::Path(path_b64): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let admin = require_watch_admin(&state)?;
+    admin.scan_watch(&path_b64).await.map_err(watch_admin_err)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn handle_watches_refresh(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let admin = require_watch_admin(&state)?;
+    admin.recompute_all_rollups().map_err(watch_admin_err)?;
+    Ok(StatusCode::OK)
+}
+
+// ── Filesystem browser ────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct BrowseQuery {
+    path: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct BrowseEntry {
+    name: String,
+    is_dir: bool,
+}
+
+#[derive(serde::Serialize)]
+struct BrowseResponse {
+    path: String,
+    parent: Option<String>,
+    entries: Vec<BrowseEntry>,
+}
+
+/// List subdirectories of a given path, default to user home.
+/// Used by the "Browse" picker in the Add-folder dialog.
+async fn handle_browse(
+    Query(q): Query<BrowseQuery>,
+) -> Result<Json<BrowseResponse>, (StatusCode, String)> {
+    let raw = q.path.unwrap_or_else(|| "~".to_string());
+    let expanded = if let Some(rest) = raw.strip_prefix("~") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        PathBuf::from(format!("{home}{rest}"))
+    } else {
+        PathBuf::from(&raw)
+    };
+    let canonical = expanded.canonicalize().map_err(|e| {
+        (StatusCode::BAD_REQUEST, format!("cannot resolve {}: {e}", expanded.display()))
+    })?;
+    if !canonical.is_dir() {
+        return Err((StatusCode::BAD_REQUEST, format!("not a directory: {}", canonical.display())));
+    }
+    let read = std::fs::read_dir(&canonical).map_err(|e| {
+        (StatusCode::FORBIDDEN, format!("cannot read directory: {e}"))
+    })?;
+    let mut entries: Vec<BrowseEntry> = read
+        .filter_map(|res| res.ok())
+        .filter_map(|d| {
+            let name = d.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') { return None; }
+            let is_dir = d.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if !is_dir { return None; }
+            Some(BrowseEntry { name, is_dir })
+        })
+        .collect();
+    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    let parent = canonical.parent().map(|p| p.to_string_lossy().into_owned());
+    Ok(Json(BrowseResponse {
+        path: canonical.to_string_lossy().into_owned(),
+        parent,
+        entries,
+    }))
 }

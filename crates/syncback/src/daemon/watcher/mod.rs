@@ -14,6 +14,7 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::Instant;
 
+use arc_swap::ArcSwap; // crate: arc-swap
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::event::{EventKind, ModifyKind, RemoveKind};
 use notify::{recommended_watcher, Event, RecursiveMode, Watcher};
@@ -22,6 +23,8 @@ use tokio::time::{interval, Duration};
 use tokio_util::sync::CancellationToken;
 
 use crate::daemon::backup::{DirtyEvent, DirtyKind};
+use crate::daemon::watch_admin::{WatchEntryState, WatcherStatusSignal};
+use std::sync::RwLock;
 use syncback_core::types::DeviceId;
 
 /// Built-in ignore patterns applied to every watch directory.
@@ -56,6 +59,19 @@ pub enum WatcherError {
 
     #[error("failed to build ignore matcher: {0}")]
     IgnoreBuild(String),
+}
+
+// ─── WatcherCommand ───────────────────────────────────────────────────────────
+
+/// Commands sent from WatchAdmin to the watcher task.
+pub enum WatcherCommand {
+    /// Start watching a new directory with given importance.
+    /// The watcher registers the path, rebuilds IgnoreSet, and runs a full scan.
+    Add { path: PathBuf, importance: f64 },
+    /// Stop watching a directory.
+    Remove { path: PathBuf },
+    /// Trigger a full scan of a specific directory (already watched).
+    Scan { path: PathBuf },
 }
 
 // ─── IgnoreSet ────────────────────────────────────────────────────────────────
@@ -161,6 +177,11 @@ pub struct WatcherConfig {
     /// Rescan interval in seconds. 0 = no periodic rescan.
     /// Default: 604800 (1 week).
     pub rescan_interval_secs: u64,
+    /// Optional shared watch_states map (owned by WatchAdmin). When provided,
+    /// the watcher writes status transitions into it: Scanning during scans,
+    /// Idle when complete, Error on failure. None in tests that don't use
+    /// WatchAdmin.
+    pub watch_states: Option<Arc<RwLock<HashMap<PathBuf, WatchEntryState>>>>,
 }
 
 // ─── start_watcher ────────────────────────────────────────────────────────────
@@ -173,32 +194,36 @@ pub struct WatcherConfig {
 /// 3. Debounces events by path within `debounce_ms`.
 /// 4. Sends `DirtyEvent` to `dirty_tx`.
 /// 5. Exits cleanly when `cancel` is triggered.
+/// 6. Processes `WatcherCommand` messages from `control_rx` to add/remove/scan dirs.
 ///
-/// Returns `WatcherError` immediately if any watch directory fails to register.
+/// Starts cleanly with an empty watch directory list (receives `Add` commands later).
 pub async fn start_watcher(
     config: WatcherConfig,
     dirty_tx: mpsc::Sender<DirtyEvent>,
+    mut control_rx: mpsc::Receiver<WatcherCommand>,
     cancel: CancellationToken,
 ) -> Result<(), WatcherError> {
-    if config.watch_dirs.is_empty() {
-        return Err(WatcherError::NoWatchDirs);
-    }
+    // Mutable local list of watched directories (starts from config, grows/shrinks via commands).
+    let mut watch_dirs: Vec<PathBuf> = config.watch_dirs.clone();
 
-    // Build the ignore matcher once, share with notify callback and full-scan.
-    let ignore_set = Arc::new(IgnoreSet::build(&config.watch_dirs)?);
+    // Build the ignore matcher; share via ArcSwap so notify callback always sees the latest.
+    let ignore_arc: Arc<ArcSwap<IgnoreSet>> = Arc::new(ArcSwap::new(Arc::new(
+        IgnoreSet::build(&watch_dirs)?,
+    )));
 
     // Bridge: notify → std channel → tokio task.
     let (std_tx, std_rx) = std_mpsc::channel::<(PathBuf, DirtyKind)>();
 
     // Build the notify watcher. The closure runs in a thread managed by notify.
     let std_tx_clone = std_tx.clone();
-    let ignore_for_notify = Arc::clone(&ignore_set);
-    let mut watcher = recommended_watcher(move |res: Result<Event, notify::Error>| {
+    let ignore_for_notify = Arc::clone(&ignore_arc);
+    let mut watcher_inner = recommended_watcher(move |res: Result<Event, notify::Error>| {
         match res {
             Ok(event) => {
                 if let Some(kind) = classify_event(&event.kind) {
                     for path in &event.paths {
-                        if should_watch_path(path, &ignore_for_notify) {
+                        let ig = ignore_for_notify.load();
+                        if should_watch_path(path, &**ig) {
                             let _ = std_tx_clone.send((path.clone(), kind));
                         }
                     }
@@ -210,21 +235,25 @@ pub async fn start_watcher(
         }
     })?;
 
-    // Register all directories.
-    for dir in &config.watch_dirs {
-        watcher.watch(dir, RecursiveMode::Recursive)?;
+    // Register all directories (empty list = no-op).
+    for dir in &watch_dirs {
+        watcher_inner.watch(dir, RecursiveMode::Recursive)?;
         tracing::info!(dir = %dir.display(), "watching directory");
     }
 
     // ── Initial / periodic scan ────────────────────────────────────────────
     let scan_marker = config.data_dir.join("last_scan");
     let needs_scan = should_run_scan(&scan_marker, config.rescan_interval_secs);
-    if needs_scan {
+    if needs_scan && !watch_dirs.is_empty() {
+        for dir in &watch_dirs {
+            set_status(&config.watch_states, dir, WatcherStatusSignal::Scanning, None);
+        }
+        let ig = ignore_arc.load();
         let count = run_full_scan(
-            &config.watch_dirs,
+            &watch_dirs,
             config.device_id,
             &dirty_tx,
-            &ignore_set,
+            &**ig,
         )
         .await;
         // Write current timestamp as marker.
@@ -233,7 +262,12 @@ pub async fn start_watcher(
             .unwrap_or_default()
             .as_secs();
         let _ = std::fs::write(&scan_marker, now.to_string());
+        for dir in &watch_dirs {
+            set_status(&config.watch_states, dir, WatcherStatusSignal::Idle, None);
+        }
         tracing::info!(files = count, "initial/periodic scan complete");
+    } else if watch_dirs.is_empty() {
+        tracing::info!("watcher started with empty watch list; awaiting Add commands");
     } else {
         tracing::info!("scan skipped (last scan recent enough)");
     }
@@ -256,7 +290,8 @@ pub async fn start_watcher(
     rescan_timer.tick().await; // skip immediate first tick
 
     // Keep watcher alive for the duration of this async function.
-    let _watcher = watcher;
+    // Must be mut so we can call watch()/unwatch() on Add/Remove commands.
+    let mut notify_watcher = watcher_inner;
 
     loop {
         tokio::select! {
@@ -265,18 +300,89 @@ pub async fn start_watcher(
                 break;
             }
             _ = rescan_timer.tick() => {
-                let count = run_full_scan(
-                    &config.watch_dirs,
-                    config.device_id,
-                    &dirty_tx,
-                    &ignore_set,
-                ).await;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let _ = std::fs::write(&scan_marker, now.to_string());
-                tracing::info!(files = count, "periodic rescan complete");
+                if !watch_dirs.is_empty() {
+                    for dir in &watch_dirs {
+                        set_status(&config.watch_states, dir,
+                            WatcherStatusSignal::Scanning, None);
+                    }
+                    let ig = ignore_arc.load();
+                    let count = run_full_scan(
+                        &watch_dirs,
+                        config.device_id,
+                        &dirty_tx,
+                        &**ig,
+                    ).await;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let _ = std::fs::write(&scan_marker, now.to_string());
+                    for dir in &watch_dirs {
+                        set_status(&config.watch_states, dir,
+                            WatcherStatusSignal::Idle, None);
+                    }
+                    tracing::info!(files = count, "periodic rescan complete");
+                }
+            }
+            Some(cmd) = control_rx.recv() => {
+                match cmd {
+                    WatcherCommand::Add { path, importance: _ } => {
+                        if let Err(e) = notify_watcher.watch(&path, RecursiveMode::Recursive) {
+                            tracing::warn!(
+                                path = %path.display(), error = %e,
+                                "watcher: failed to watch new directory"
+                            );
+                            set_status(&config.watch_states, &path,
+                                WatcherStatusSignal::Error, Some(e.to_string()));
+                        } else {
+                            watch_dirs.push(path.clone());
+                            // Rebuild IgnoreSet for all current dirs.
+                            match IgnoreSet::build(&watch_dirs) {
+                                Ok(new_set) => {
+                                    ignore_arc.store(Arc::new(new_set));
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "watcher: IgnoreSet rebuild failed");
+                                }
+                            }
+                            // Trigger initial scan of the new dir only.
+                            set_status(&config.watch_states, &path,
+                                WatcherStatusSignal::Scanning, None);
+                            let ig = ignore_arc.load();
+                            let count = run_full_scan_one(
+                                &path, config.device_id, &dirty_tx, &**ig
+                            ).await;
+                            tracing::info!(
+                                dir = %path.display(), files = count,
+                                "watcher: initial scan of newly added dir"
+                            );
+                            set_status(&config.watch_states, &path,
+                                WatcherStatusSignal::Idle, None);
+                        }
+                    }
+                    WatcherCommand::Remove { path } => {
+                        let _ = notify_watcher.unwatch(&path);
+                        watch_dirs.retain(|d| d != &path);
+                        match IgnoreSet::build(&watch_dirs) {
+                            Ok(new_set) => { ignore_arc.store(Arc::new(new_set)); }
+                            Err(e) => { tracing::warn!(error = %e, "watcher: IgnoreSet rebuild"); }
+                        }
+                    }
+                    WatcherCommand::Scan { path } => {
+                        set_status(&config.watch_states, &path,
+                            WatcherStatusSignal::Scanning, None);
+                        let ig = ignore_arc.load();
+                        let count = run_full_scan_one(
+                            &path, config.device_id, &dirty_tx, &**ig
+                        ).await;
+                        tracing::info!(
+                            dir = %path.display(), files = count,
+                            "watcher: manual rescan complete"
+                        );
+                        set_status(&config.watch_states, &path,
+                            WatcherStatusSignal::Idle, None);
+                    }
+                }
             }
             _ = poll_timer.tick() => {
                 // Drain all pending std-channel messages.
@@ -360,6 +466,76 @@ fn should_run_scan(marker: &std::path::Path, interval_secs: u64) -> bool {
     now.saturating_sub(last_ts) >= interval_secs
 }
 
+/// Update the shared watch_states map for a single path, preserving last_event_at.
+/// No-op when watch_states is None (tests without WatchAdmin).
+fn set_status(
+    states: &Option<Arc<RwLock<HashMap<PathBuf, WatchEntryState>>>>,
+    path: &Path,
+    signal: WatcherStatusSignal,
+    error: Option<String>,
+) {
+    let Some(states) = states else { return };
+    let Ok(mut map) = states.write() else { return };
+    let prev_event_at = map.get(path).and_then(|s| s.last_event_at);
+    map.insert(
+        path.to_path_buf(),
+        WatchEntryState {
+            status: signal,
+            error,
+            last_changed: Instant::now(),
+            last_event_at: prev_event_at,
+        },
+    );
+}
+
+/// Walk a single directory and emit DirtyEvent::Added for every non-ignored file.
+pub(crate) async fn run_full_scan_one(
+    dir: &Path,
+    device_id: DeviceId,
+    dirty_tx: &mpsc::Sender<DirtyEvent>,
+    ignore_set: &IgnoreSet,
+) -> u64 {
+    let mut count: u64 = 0;
+    // Use a stack-based walk to avoid recursion depth issues.
+    let mut stack: Vec<PathBuf> = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(dir = %current.display(), error = %e, "scan: cannot read directory");
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Skip hidden directories.
+                if let Some(name) = path.file_name() {
+                    if name.to_string_lossy().starts_with('.') {
+                        continue;
+                    }
+                }
+                // Prune subtrees matched by .syncbackignore / defaults.
+                if ignore_set.is_ignored(&path, true) {
+                    continue;
+                }
+                stack.push(path);
+            } else if should_watch_path(&path, ignore_set) {
+                let event = DirtyEvent {
+                    path: path.to_string_lossy().into_owned(),
+                    kind: DirtyKind::Added,
+                    device_id,
+                };
+                if dirty_tx.send(event).await.is_err() {
+                    return count;
+                }
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 /// Walk all watch directories and emit DirtyEvent::Added for every file found.
 ///
 /// Directories matching `ignore_set` are pruned at descent time (no files
@@ -373,48 +549,7 @@ async fn run_full_scan(
 ) -> u64 {
     let mut count: u64 = 0;
     for dir in dirs {
-        let walker = match std::fs::read_dir(dir) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(dir = %dir.display(), error = %e, "scan: cannot read directory");
-                continue;
-            }
-        };
-        // Use a stack-based walk to avoid recursion depth issues.
-        let mut stack: Vec<PathBuf> = vec![dir.clone()];
-        while let Some(current) = stack.pop() {
-            let entries = match std::fs::read_dir(&current) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    // Skip hidden directories.
-                    if let Some(name) = path.file_name() {
-                        if name.to_string_lossy().starts_with('.') {
-                            continue;
-                        }
-                    }
-                    // Prune subtrees matched by .syncbackignore / defaults.
-                    if ignore_set.is_ignored(&path, true) {
-                        continue;
-                    }
-                    stack.push(path);
-                } else if should_watch_path(&path, ignore_set) {
-                    let event = DirtyEvent {
-                        path: path.to_string_lossy().into_owned(),
-                        kind: DirtyKind::Added,
-                        device_id,
-                    };
-                    if dirty_tx.send(event).await.is_err() {
-                        return count;
-                    }
-                    count += 1;
-                }
-            }
-        }
-        drop(walker);
+        count += run_full_scan_one(dir, device_id, dirty_tx, ignore_set).await;
     }
     count
 }

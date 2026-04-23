@@ -15,5 +15,6 @@ pub mod restore;
 pub mod scheduler;
 pub mod symbol_fetch;
 pub mod system_state;
+pub mod watch_admin;
 pub mod watcher;
 pub mod web_api;

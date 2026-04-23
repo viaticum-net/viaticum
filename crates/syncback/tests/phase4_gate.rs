@@ -72,6 +72,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         mock_offer_budget_gb: None,
         master_signing_key: None,
         swarm: None,
+        live_watch_configs: None,
     }
 }
 
@@ -144,6 +145,7 @@ fn config_source_block_size_drives_backup() {
             mock_offer_budget_gb: None,
             master_signing_key: None,
             swarm: None,
+            live_watch_configs: None,
         },
         Arc::new(RaptorQEncoder::new()),
     );

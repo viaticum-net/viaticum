@@ -1,11 +1,13 @@
 <script>
   import Dashboard from './lib/Dashboard.svelte';
   import Files from './lib/Files.svelte';
+  import Folders from './lib/Folders.svelte';
   import Devices from './lib/Devices.svelte';
   import Connect from './lib/Connect.svelte';
 
   const pages = [
     { id: 'dashboard', label: 'Dashboard' },
+    { id: 'folders', label: 'Folders' },
     { id: 'files', label: 'Files' },
     { id: 'devices', label: 'Devices' },
     { id: 'connect', label: 'Connect' },
@@ -34,6 +36,8 @@
   <main>
     {#if currentPage === 'dashboard'}
       <Dashboard />
+    {:else if currentPage === 'folders'}
+      <Folders />
     {:else if currentPage === 'files'}
       <Files />
     {:else if currentPage === 'devices'}

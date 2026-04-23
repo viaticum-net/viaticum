@@ -8,7 +8,7 @@
 mod tests;
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -32,7 +32,7 @@ use crate::daemon::relay::{RelayConfig, RelayManager};
 use crate::daemon::repair::{RepairAgent, RepairConfig, RepairTrigger};
 use crate::daemon::restore::{RestoreConfig, RestoreCoordinator, RestoreError, RestoreRequest, RestoreResult};
 use crate::daemon::scheduler::{PendingChallenges, Scheduler, SchedulerConfig};
-use crate::daemon::watcher::{WatcherConfig, WatcherError};
+use crate::daemon::watcher::{WatcherCommand, WatcherConfig};
 
 // ─── Public config ────────────────────────────────────────────────────────────
 
@@ -88,6 +88,9 @@ pub struct DaemonState {
     pub relay_post_tx: Option<mpsc::Sender<crate::daemon::relay::RelayPost>>,
     /// libp2p swarm handle.
     pub swarm_handle: Option<std::sync::Arc<crate::daemon::network::swarm::SwarmHandle>>,
+    /// Watch admin — manages dynamic folder add/remove/status.
+    /// None if web API is disabled.
+    pub watch_admin: Option<std::sync::Arc<crate::daemon::watch_admin::WatchAdmin>>,
 }
 
 // ─── DaemonHandle ─────────────────────────────────────────────────────────────
@@ -275,6 +278,27 @@ impl DaemonHandle {
         let source_block_size =
             syncback_core::config::source_block_size_bytes(&app_config);
 
+        // ── Step A: Build live_configs Arc ────────────────────────────────────
+        // Merge CLI watch_dirs with [[watch]] entries from config.
+        let mut initial_watch_configs: Vec<syncback_core::config::WatchConfig> =
+            app_config.watch.clone();
+        for dir in &cfg.watch_dirs {
+            let dir_str = dir.to_string_lossy().to_string();
+            if !initial_watch_configs.iter().any(|wc| {
+                syncback_core::config::expand_watch_path(&wc.path) == *dir
+            }) {
+                initial_watch_configs.push(syncback_core::config::WatchConfig {
+                    path: dir_str,
+                    importance: syncback_core::config::DEFAULT_IMPORTANCE,
+                });
+            }
+        }
+        let live_configs: Arc<RwLock<Vec<syncback_core::config::WatchConfig>>> =
+            Arc::new(RwLock::new(initial_watch_configs.clone()));
+
+        // ── Step B: Create watcher command channel ────────────────────────────
+        let (watcher_cmd_tx, watcher_cmd_rx) = mpsc::channel::<WatcherCommand>(64);
+
         // Create accepted_offers map shared between BackupCoordinator and Processor.
         let accepted_offers = crate::daemon::processor::make_empty_accepted_offers();
 
@@ -287,11 +311,13 @@ impl DaemonHandle {
                 device_id,
                 mock_holders: vec![],
                 cluster_state: cluster_state.clone(),
-                watch_configs: app_config.watch.clone(),
+                watch_configs: initial_watch_configs.clone(),
                 time_scale: cfg.time_scale.max(1),
                 mock_offer_budget_gb: None,
                 master_signing_key: Some(master_key.clone()),
                 swarm: swarm_handle_arc.clone(),
+                // ── Step C: Pass live_watch_configs ──────────────────────────
+                live_watch_configs: Some(Arc::clone(&live_configs)),
             },
             encoder.clone(),
         );
@@ -337,6 +363,14 @@ impl DaemonHandle {
         // ── 11. CancellationToken ─────────────────────────────────────────────
         let cancel = CancellationToken::new();
 
+        // ── Step D: Create WatchAdmin ──────────────────────────────────────────
+        let watch_admin = Arc::new(crate::daemon::watch_admin::WatchAdmin::new(
+            config_path.clone(),
+            Arc::clone(&live_configs),
+            watcher_cmd_tx.clone(),
+            db.clone(),
+        ));
+
         // ── 12. Build DaemonState (shared with CliServer) ─────────────────────
         // Clone restore_tx so CliServer can forward requests to RestoreCoordinator.
         // The original is held by the cancel task (dropped on shutdown to close channel).
@@ -355,6 +389,12 @@ impl DaemonHandle {
             time_scale: cfg.time_scale.max(1),
             relay_post_tx: Some(relay_post_tx.clone()),
             swarm_handle: swarm_handle_arc.clone(),
+            // ── Step E: Add watch_admin to DaemonState ────────────────────────
+            watch_admin: if app_config.web_api.enabled {
+                Some(Arc::clone(&watch_admin))
+            } else {
+                None
+            },
         });
 
         // Clone state for web API and metrics pusher before cli_server consumes it.
@@ -406,6 +446,27 @@ impl DaemonHandle {
             cli_handle.await.map_err(|e| anyhow::anyhow!("cli_server task panicked: {e}"))?;
             Ok(())
         }));
+
+        // ── Step E.5: Background rollup refresh task (every 5 min) ────────────
+        if let Some(admin) = state.watch_admin.as_ref() {
+            let admin_for_refresh = Arc::clone(admin);
+            let cancel_refresh = cancel.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_secs(300));
+                ticker.tick().await; // skip immediate tick (done in WatchAdmin::new)
+                loop {
+                    tokio::select! {
+                        _ = cancel_refresh.cancelled() => break Ok(()),
+                        _ = ticker.tick() => {
+                            if let Err(e) = admin_for_refresh.recompute_all_rollups() {
+                                tracing::warn!(error = %e, "rollup refresh failed");
+                            }
+                        }
+                    }
+                }
+            }));
+        }
 
         // ── Web API server (optional) ─────────────────────────────────────────
         if let Some(web_state) = state_for_web_api {
@@ -533,8 +594,8 @@ impl DaemonHandle {
             drop(repair_tx_for_processor);
         }
 
-        // Phase 6.4: spawn Watcher when watch_dirs are configured.
-        // Merge CLI --watch-dir with [[watch]] paths from config.
+        // ── Step F: Spawn watcher — ALWAYS (even with empty dir list) ────────
+        // Merge CLI --watch-dir with [[watch]] paths from config (same as initial_watch_configs).
         let mut all_watch_dirs = cfg.watch_dirs.clone();
         for wc in &app_config.watch {
             let p = syncback_core::config::expand_watch_path(&wc.path);
@@ -542,7 +603,7 @@ impl DaemonHandle {
                 all_watch_dirs.push(p);
             }
         }
-        if !all_watch_dirs.is_empty() {
+        {
             let watcher_config = WatcherConfig {
                 watch_dirs: all_watch_dirs,
                 device_id,
@@ -551,29 +612,22 @@ impl DaemonHandle {
                 data_dir: cfg.data_dir.clone(),
                 // Rescan weekly; scale by time_scale for testing.
                 rescan_interval_secs: (604800 / time_scale).max(60),
+                watch_states: state
+                    .watch_admin
+                    .as_ref()
+                    .map(|a| Arc::clone(&a.watch_states)),
             };
             let dirty_tx_watcher = dirty_tx.clone();
             let cancel_watcher = cancel.clone();
             tasks.push(tokio::spawn(async move {
-                match crate::daemon::watcher::start_watcher(
+                crate::daemon::watcher::start_watcher(
                     watcher_config,
                     dirty_tx_watcher,
+                    watcher_cmd_rx,
                     cancel_watcher,
                 )
                 .await
-                {
-                    Ok(()) => Ok(()),
-                    Err(WatcherError::NoWatchDirs) => {
-                        // Shouldn't happen — we checked above.
-                        Ok(())
-                    }
-                    Err(WatcherError::Notify(e)) => {
-                        Err(anyhow::anyhow!("watcher error: {e}"))
-                    }
-                    Err(WatcherError::IgnoreBuild(e)) => {
-                        Err(anyhow::anyhow!("watcher ignore matcher build failed: {e}"))
-                    }
-                }
+                .map_err(|e| anyhow::anyhow!("watcher error: {e}"))
             }));
         }
         // ── Phase 6.5: Scheduler ──────────────────────────────────────────────

@@ -89,7 +89,12 @@ impl BackupCoordinator {
         // Not a duplicate — classify and enqueue or process immediately (large file).
         let category = Self::classify(&event.path);
 
-        let importance = lookup_importance(&event.path, &self.config.watch_configs);
+        let importance = if let Some(live) = &self.config.live_watch_configs {
+            let guard = live.read().expect("live_watch_configs lock poisoned");
+            lookup_importance(&event.path, &*guard)
+        } else {
+            lookup_importance(&event.path, &self.config.watch_configs)
+        };
 
         if size_bytes >= self.config.source_block_size {
             // Budget check for single large file.

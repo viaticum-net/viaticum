@@ -88,6 +88,7 @@ fn backup_cfg_with_cluster(
         mock_offer_budget_gb: None,
         master_signing_key: None,
         swarm: None,
+        live_watch_configs: None,
     }
 }
 

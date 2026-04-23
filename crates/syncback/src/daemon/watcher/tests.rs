@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use syncback_core::types::DeviceId;
 
 use crate::daemon::backup::DirtyKind;
-use crate::daemon::watcher::{start_watcher, IgnoreSet, WatcherConfig};
+use crate::daemon::watcher::{start_watcher, IgnoreSet, WatcherConfig, WatcherCommand};
 
 const TEST_DEVICE_ID: DeviceId = DeviceId([1u8; 32]);
 const DEBOUNCE_MS: u64 = 50;
@@ -43,6 +43,7 @@ fn config_for(dir: &TempDir) -> WatcherConfig {
         debounce_ms: DEBOUNCE_MS,
         data_dir,
         rescan_interval_secs: 604800, // 1 week — effectively disabled for test duration
+        watch_states: None,
     }
 }
 
@@ -55,7 +56,7 @@ async fn watcher_detects_file_creation() {
     let cancel_clone = cancel.clone();
     let config = config_for(&dir);
     tokio::spawn(async move {
-        start_watcher(config, dirty_tx, cancel_clone)
+        start_watcher(config, dirty_tx, mpsc::channel(1).1, cancel_clone)
             .await
             .expect("watcher error");
     });
@@ -97,7 +98,7 @@ async fn watcher_detects_file_modification() {
     let cancel_clone = cancel.clone();
     let config = config_for(&dir);
     tokio::spawn(async move {
-        start_watcher(config, dirty_tx, cancel_clone)
+        start_watcher(config, dirty_tx, mpsc::channel(1).1, cancel_clone)
             .await
             .expect("watcher error");
     });
@@ -131,7 +132,7 @@ async fn watcher_detects_file_deletion() {
     let cancel_clone = cancel.clone();
     let config = config_for(&dir);
     tokio::spawn(async move {
-        start_watcher(config, dirty_tx, cancel_clone)
+        start_watcher(config, dirty_tx, mpsc::channel(1).1, cancel_clone)
             .await
             .expect("watcher error");
     });
@@ -156,7 +157,7 @@ async fn watcher_ignores_hidden_files() {
     let cancel_clone = cancel.clone();
     let config = config_for(&dir);
     tokio::spawn(async move {
-        start_watcher(config, dirty_tx, cancel_clone)
+        start_watcher(config, dirty_tx, mpsc::channel(1).1, cancel_clone)
             .await
             .expect("watcher error");
     });
@@ -193,7 +194,7 @@ async fn watcher_stops_on_cancel() {
     let cancel_clone = cancel.clone();
     let config = config_for(&dir);
     let handle = tokio::spawn(async move {
-        start_watcher(config, dirty_tx, cancel_clone)
+        start_watcher(config, dirty_tx, mpsc::channel(1).1, cancel_clone)
             .await
             .expect("watcher error");
     });
@@ -210,8 +211,10 @@ async fn watcher_stops_on_cancel() {
         .expect("watcher task panicked");
 }
 
+/// Watcher now starts cleanly with an empty watch_dirs list (awaits Add commands).
+/// Renamed from watcher_errors_on_empty_watch_dirs; the old behavior was removed per spec.
 #[tokio::test]
-async fn watcher_errors_on_empty_watch_dirs() {
+async fn watcher_starts_with_empty_dir_list_without_error() {
     let (dirty_tx, _dirty_rx) = mpsc::channel(32);
     let cancel = CancellationToken::new();
     let tmp = TempDir::new().unwrap();
@@ -221,12 +224,22 @@ async fn watcher_errors_on_empty_watch_dirs() {
         debounce_ms: DEBOUNCE_MS,
         data_dir: tmp.path().to_path_buf(),
         rescan_interval_secs: 0,
+        watch_states: None,
     };
-    let result = start_watcher(config, dirty_tx, cancel).await;
-    assert!(
-        result.is_err(),
-        "expected WatcherError::NoWatchDirs for empty watch_dirs"
-    );
+    let cancel_clone = cancel.clone();
+    let handle = tokio::spawn(async move {
+        start_watcher(config, dirty_tx, mpsc::channel(1).1, cancel_clone)
+            .await
+            .expect("watcher must not error with empty dir list")
+    });
+    // Give watcher time to start.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Cancel it; it should exit cleanly.
+    cancel.cancel();
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("watcher did not stop within 1 second")
+        .expect("watcher task panicked");
 }
 
 // ─── WATCH-05: debounce_multiple_changes_emit_one_event ───────────────────────
@@ -246,11 +259,12 @@ async fn debounce_multiple_changes_emit_one_event() {
         debounce_ms: 300,
         data_dir: TempDir::new().unwrap().keep(),
         rescan_interval_secs: 0,
+        watch_states: None,
     };
 
     let cancel_clone = cancel.clone();
     tokio::spawn(async move {
-        start_watcher(config, dirty_tx, cancel_clone)
+        start_watcher(config, dirty_tx, mpsc::channel(1).1, cancel_clone)
             .await
             .expect("watcher error");
     });
@@ -304,11 +318,12 @@ async fn file_deleted_before_debounce_emits_deleted_event() {
         debounce_ms: 400,
         data_dir: TempDir::new().unwrap().keep(),
         rescan_interval_secs: 0,
+        watch_states: None,
     };
 
     let cancel_clone = cancel.clone();
     tokio::spawn(async move {
-        start_watcher(config, dirty_tx, cancel_clone)
+        start_watcher(config, dirty_tx, mpsc::channel(1).1, cancel_clone)
             .await
             .expect("watcher error");
     });
@@ -372,7 +387,7 @@ async fn file_without_read_permission_no_panic() {
     let config = config_for(&dir);
     let cancel_clone = cancel.clone();
     tokio::spawn(async move {
-        start_watcher(config, dirty_tx, cancel_clone)
+        start_watcher(config, dirty_tx, mpsc::channel(1).1, cancel_clone)
             .await
             .expect("watcher error");
     });
@@ -412,11 +427,12 @@ async fn rapid_changes_no_panic() {
         debounce_ms: DEBOUNCE_MS,
         data_dir: TempDir::new().unwrap().keep(),
         rescan_interval_secs: 0,
+        watch_states: None,
     };
 
     let cancel_clone = cancel.clone();
     tokio::spawn(async move {
-        start_watcher(config, dirty_tx, cancel_clone)
+        start_watcher(config, dirty_tx, mpsc::channel(1).1, cancel_clone)
             .await
             .expect("watcher error");
     });
@@ -572,11 +588,12 @@ async fn watcher_initial_scan_respects_syncbackignore() {
         debounce_ms: DEBOUNCE_MS,
         data_dir,
         rescan_interval_secs: 604800,
+        watch_states: None,
     };
 
     let cancel_clone = cancel.clone();
     tokio::spawn(async move {
-        start_watcher(config, dirty_tx, cancel_clone)
+        start_watcher(config, dirty_tx, mpsc::channel(1).1, cancel_clone)
             .await
             .expect("watcher error");
     });
@@ -623,7 +640,7 @@ async fn large_file_generates_dirty_event() {
     let config = config_for(&dir);
     let cancel_clone = cancel.clone();
     tokio::spawn(async move {
-        start_watcher(config, dirty_tx, cancel_clone)
+        start_watcher(config, dirty_tx, mpsc::channel(1).1, cancel_clone)
             .await
             .expect("watcher error");
     });
@@ -657,6 +674,164 @@ async fn large_file_generates_dirty_event() {
         "expected Added or Modified for large file, got {:?}",
         event.kind
     );
+
+    cancel.cancel();
+}
+
+// ─── WatcherCommand integration tests ────────────────────────────────────────
+
+/// `WatcherCommand::Add` causes the watcher to register the new directory and
+/// emit DirtyEvent::Added when a file is written there.
+#[tokio::test]
+async fn watcher_add_command_registers_new_dir_and_emits_dirty_events() {
+    let dir = TempDir::new().unwrap();
+    let (dirty_tx, mut dirty_rx) = mpsc::channel(32);
+    let cancel = CancellationToken::new();
+
+    // Start watcher with empty dir list.
+    let (ctrl_tx, ctrl_rx) = mpsc::channel::<WatcherCommand>(8);
+    let cancel_clone = cancel.clone();
+    let data_dir = TempDir::new().unwrap();
+    // Write a recent last_scan marker so Add-triggered scan is skipped by should_run_scan.
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = std::fs::write(data_dir.path().join("last_scan"), now_ts.to_string());
+    let config = WatcherConfig {
+        watch_dirs: vec![],
+        device_id: TEST_DEVICE_ID,
+        debounce_ms: DEBOUNCE_MS,
+        data_dir: data_dir.path().to_path_buf(),
+        rescan_interval_secs: 604800,
+        watch_states: None,
+    };
+    tokio::spawn(async move {
+        start_watcher(config, dirty_tx, ctrl_rx, cancel_clone)
+            .await
+            .expect("watcher error");
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Send Add command for the directory.
+    ctrl_tx
+        .send(WatcherCommand::Add {
+            path: dir.path().to_path_buf(),
+            importance: 0.5,
+        })
+        .await
+        .expect("send failed");
+
+    // Allow watcher time to register the directory.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Write a file to the newly-added directory.
+    let file_path = dir.path().join("new_file.txt");
+    std::fs::write(&file_path, b"hello").unwrap();
+
+    // Should receive a DirtyEvent.
+    let event = recv_with_timeout(&mut dirty_rx).await;
+    assert!(
+        event.path.ends_with("new_file.txt"),
+        "expected event for file in newly-added dir, got: {}",
+        event.path
+    );
+
+    cancel.cancel();
+}
+
+/// `WatcherCommand::Remove` causes the watcher to stop watching the directory.
+/// Writing a file after removal should NOT produce a DirtyEvent.
+#[tokio::test]
+async fn watcher_remove_command_stops_watching_dir() {
+    let dir = TempDir::new().unwrap();
+    let (dirty_tx, mut dirty_rx) = mpsc::channel(32);
+    let cancel = CancellationToken::new();
+
+    let (ctrl_tx, ctrl_rx) = mpsc::channel::<WatcherCommand>(8);
+    let cancel_clone = cancel.clone();
+    let config = config_for(&dir);
+    tokio::spawn(async move {
+        start_watcher(config, dirty_tx, ctrl_rx, cancel_clone)
+            .await
+            .expect("watcher error");
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Send Remove command.
+    ctrl_tx
+        .send(WatcherCommand::Remove {
+            path: dir.path().to_path_buf(),
+        })
+        .await
+        .expect("send failed");
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Write a file to the removed directory.
+    std::fs::write(dir.path().join("post_remove.txt"), b"data").unwrap();
+
+    // Wait one full debounce window — no event should arrive.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let got_event = dirty_rx.try_recv().is_ok();
+    assert!(
+        !got_event,
+        "should not receive events after Remove command"
+    );
+
+    cancel.cancel();
+}
+
+/// `WatcherCommand::Scan` triggers a full scan of a watched directory,
+/// emitting DirtyEvent::Added for every file found.
+#[tokio::test]
+async fn watcher_scan_command_emits_added_events_for_all_files() {
+    let dir = TempDir::new().unwrap();
+
+    // Pre-create files so they exist before the scan.
+    std::fs::write(dir.path().join("a.txt"), b"aaa").unwrap();
+    std::fs::write(dir.path().join("b.txt"), b"bbb").unwrap();
+
+    let (dirty_tx, mut dirty_rx) = mpsc::channel(32);
+    let cancel = CancellationToken::new();
+
+    let (ctrl_tx, ctrl_rx) = mpsc::channel::<WatcherCommand>(8);
+    let cancel_clone = cancel.clone();
+    // config_for writes a recent last_scan marker — no auto-scan.
+    let config = config_for(&dir);
+    tokio::spawn(async move {
+        start_watcher(config, dirty_tx, ctrl_rx, cancel_clone)
+            .await
+            .expect("watcher error");
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Send Scan command.
+    ctrl_tx
+        .send(WatcherCommand::Scan {
+            path: dir.path().to_path_buf(),
+        })
+        .await
+        .expect("send failed");
+
+    // Collect events over 500ms.
+    let mut paths: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), dirty_rx.recv()).await {
+            Ok(Some(e)) => paths.push(e.path),
+            _ => {}
+        }
+    }
+
+    let has_a = paths.iter().any(|p| p.ends_with("a.txt"));
+    let has_b = paths.iter().any(|p| p.ends_with("b.txt"));
+    assert!(has_a, "expected a.txt in scan results, got {:?}", paths);
+    assert!(has_b, "expected b.txt in scan results, got {:?}", paths);
 
     cancel.cancel();
 }

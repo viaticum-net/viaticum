@@ -37,6 +37,9 @@ reqwest = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
 tikv-jemallocator = "0.6"
+toml_edit = "0.22"
+arc-swap = "1"
+base64 = "0.22"
 
 [dev-dependencies]
 syncback-core = { workspace = true, features = ["testutil"] }

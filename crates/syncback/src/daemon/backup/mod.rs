@@ -13,7 +13,7 @@
 //   tests.rs    -- all test scenarios
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use syncback_core::config::WatchConfig;
 use syncback_core::constants::DEFAULT_SOURCE_BLOCK_SIZE;
@@ -110,6 +110,10 @@ pub struct BackupConfig {
     /// When Some: deliver_to_holder uses send_to_device (request-response).
     /// When None: symbols are encoded and written to disk but not delivered.
     pub swarm: Option<std::sync::Arc<crate::daemon::network::swarm::SwarmHandle>>,
+    /// Live watch configs shared with WatchAdmin.
+    /// When Some: lookup_importance uses this instead of watch_configs.
+    /// When None: falls back to watch_configs (static copy for backward compat).
+    pub live_watch_configs: Option<Arc<RwLock<Vec<WatchConfig>>>>,
 }
 
 impl Default for BackupConfig {
@@ -126,6 +130,7 @@ impl Default for BackupConfig {
             mock_offer_budget_gb: None,
             master_signing_key: None,
             swarm: None,
+            live_watch_configs: None,
         }
     }
 }
