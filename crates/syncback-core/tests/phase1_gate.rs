@@ -348,7 +348,7 @@ fn cluster_key_hierarchy_end_to_end() {
 fn budget_selects_files_within_capacity() {
     // 2 GB committed, estimate gives ~3 GB total budget (0.5 success rate, 0.5 factor).
     let committed_bytes = 2u64 * 1024 * 1024 * 1024;
-    let budget = estimate_budget(committed_bytes, None);
+    let budget = estimate_budget(committed_bytes, None, 0.0);
     assert!(budget.total_gb > 0.0);
 
     // Candidates: one large low-importance, one small high-importance.

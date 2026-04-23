@@ -666,6 +666,58 @@ async fn fetch_from_holders_returns_insufficient_when_no_peers_reachable() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_from_holders_attempts_presumed_lost_and_uncertain_placements() {
+    // Regression: PresumedLost/Uncertain placements must be included in network
+    // fetch attempts. Before the fix, only Alive placements were tried — a holder
+    // that temporarily went offline and came back would be unreachable because
+    // its placement was PresumedLost (missed 3 PoS rounds) until the next PoS pass.
+    //
+    // With swarm=None all fetch attempts fail the same way (InsufficientSymbols),
+    // so we can't distinguish success vs skip here. This test verifies that
+    // passing PresumedLost/Uncertain placements does NOT cause a panic or a
+    // different error class — the caller code path reaches fetch_unbound_symbols.
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+
+    let block_id = SourceBlockId([0xCCu8; 32]);
+
+    let placements: Vec<SymbolPlacement> = [
+        PlacementStatus::PresumedLost,
+        PlacementStatus::Uncertain,
+        PlacementStatus::Alive,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, status)| SymbolPlacement {
+        source_block_id: block_id,
+        holder_id: syncback_core::types::DeviceId([(i as u8 + 1) * 0x11; 32]),
+        file_id: FileId(1),
+        esi_ranges: vec![(i as u32 * 3, 3)],
+        binding_seed: [0u8; 32],
+        status,
+        last_verified: None,
+        placed_at: Timestamp(0),
+        consecutive_misses: i as u32,
+    })
+    .collect();
+
+    let coord = test_restore_coord(db, &symbols_dir);
+    let params = ErasureParams::compute(65_535_u64, 0.5).unwrap();
+
+    let result = coord
+        .fetch_from_holders(&block_id, &placements, &params)
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(super::RestoreError::InsufficientSymbols { got: 0, .. })
+        ),
+        "expected InsufficientSymbols(got=0) for all-no-swarm case, got: {result:?}"
+    );
+}
+
 // fetch_skips_denied_holder_and_tries_next and
 // decode_block_fetches_from_network_when_local_files_missing removed in ε.5.
 // Both used iroh NetworkHandle + connection::Connection for direct QUIC exchange.

@@ -20,6 +20,35 @@ impl Symbol {
     }
 }
 
+/// Split `symbols` into contiguous chunks whose cumulative `data.len()` stays
+/// ≤ `budget_bytes`. A single symbol larger than the budget is still emitted as
+/// its own chunk (the caller is responsible for enforcing SYMBOL_SIZE).
+///
+/// Order of symbols is preserved. Empty input yields an empty Vec.
+///
+/// Used by the owner side of the backup/repair delivery path to stay below
+/// `MAX_MESSAGE_SIZE`. The budget leaves CBOR/overhead headroom — see
+/// `SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES`.
+pub fn chunk_symbols_by_size(symbols: Vec<Symbol>, budget_bytes: usize) -> Vec<Vec<Symbol>> {
+    let mut out: Vec<Vec<Symbol>> = Vec::new();
+    let mut current: Vec<Symbol> = Vec::new();
+    let mut current_bytes: usize = 0;
+
+    for symbol in symbols {
+        let sz = symbol.data.len();
+        if !current.is_empty() && current_bytes.saturating_add(sz) > budget_bytes {
+            out.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(sz);
+        current.push(symbol);
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
 /// Errors from encoding/decoding.
 #[derive(Debug, thiserror::Error)]
 pub enum ErasureError {

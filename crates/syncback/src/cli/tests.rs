@@ -244,6 +244,7 @@ fn format_bytes_gigabytes() {
 fn make_status_zero_peers() -> StatusData {
     StatusData {
         node_identity: "0000000000000000".into(),
+        device_id: "0000000000000000".into(),
         node_addr: String::new(),
         peer_count: 0,
         avg_trust: 0.0,
@@ -292,6 +293,7 @@ fn format_status_unlimited_quota_when_zero() {
 fn format_status_top_peers_printed() {
     let data = StatusData {
         node_identity: "a1b2c3d4e5f60708".into(),
+        device_id: "a1b2c3d4e5f60708".into(),
         node_addr: String::new(),
         peer_count: 2,
         avg_trust: 2.09,
@@ -687,6 +689,7 @@ fn cli_response_roundtrips_cbor() {
     let responses = vec![
         CliResponse::Status(StatusData {
             node_identity: "aabbccdd11223344".into(),
+            device_id: "aabbccdd11223344".into(),
             node_addr: String::new(),
             peer_count: 3,
             avg_trust: 1.5,

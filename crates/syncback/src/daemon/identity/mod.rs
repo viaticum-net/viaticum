@@ -47,6 +47,10 @@ pub enum IdentityError {
     #[error("already initialized: {0}")]
     AlreadyInitialized(PathBuf),
 
+    #[error("identity file at {0} is corrupt or from an incompatible binary version: {1}. \
+            Delete the file and re-run 'syncback init', or restore it from a backup.")]
+    Corrupt(PathBuf, String),
+
     #[error("not initialized: run 'syncback init' first")]
     NotInitialized,
 
@@ -137,7 +141,8 @@ pub fn load_identity(data_dir: &Path) -> Result<IdentityKeyFile, IdentityError> 
             IdentityError::Io(e)
         }
     })?;
-    ciborium::de::from_reader(bytes.as_slice()).map_err(|e| IdentityError::Cbor(e.to_string()))
+    ciborium::de::from_reader(bytes.as_slice())
+        .map_err(|e| IdentityError::Corrupt(path, e.to_string()))
 }
 
 /// Derive the three active keys from a loaded keyfile for a given epoch.
@@ -179,7 +184,16 @@ fn create_keyfile(
 ) -> Result<IdentityKeyFile, IdentityError> {
     let path = keyfile_path(data_dir);
     if path.exists() {
-        return Err(IdentityError::AlreadyInitialized(path));
+        // Distinguish "already initialized & valid" from "file exists but unusable".
+        // The former is benign; the latter must be surfaced clearly so the daemon
+        // doesn't later crash with a cryptic CBOR error.
+        return match std::fs::read(&path) {
+            Ok(bytes) => match ciborium::de::from_reader::<IdentityKeyFile, _>(bytes.as_slice()) {
+                Ok(_) => Err(IdentityError::AlreadyInitialized(path)),
+                Err(e) => Err(IdentityError::Corrupt(path, e.to_string())),
+            },
+            Err(e) => Err(IdentityError::Corrupt(path, e.to_string())),
+        };
     }
 
     std::fs::create_dir_all(data_dir)?;

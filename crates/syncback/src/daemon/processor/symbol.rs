@@ -34,10 +34,15 @@ impl Processor {
         let block_id = transfer.source_block_id;
 
         // ── Offer lookup + validation ─────────────────────────────────────────
+        // The offer entry persists across multiple SymbolTransfer messages for
+        // the same placement: owners chunk large deliveries into several frames
+        // because a single message cannot exceed MAX_MESSAGE_SIZE. We subtract
+        // the received ESIs from the remaining ranges on each transfer and drop
+        // the offer only when all expected ESIs have arrived or the expiry fires.
         let (importance, accepted_esi_ranges) = {
-            let mut map = self.accepted_offers.lock().unwrap();
+            let map = self.accepted_offers.lock().unwrap();
             let key = (owner_id, block_id);
-            match map.remove(&key) {
+            match map.get(&key) {
                 None => {
                     warn!(
                         block_id = %block_id,
@@ -56,14 +61,18 @@ impl Processor {
                             age_secs = age,
                             "processor: accepted offer expired — rejecting SymbolTransfer"
                         );
+                        drop(map);
+                        self.accepted_offers.lock().unwrap().remove(&key);
                         return Ok(());
                     }
-                    (entry.importance, entry.esi_ranges)
+                    (entry.importance, entry.esi_ranges.clone())
                 }
             }
         };
 
         // ── ESI range validation ──────────────────────────────────────────────
+        // A sender that attempts to store an ESI outside the accepted ranges is
+        // treated as misbehaving: we reject the whole transfer and drop the offer.
         for symbol in &transfer.symbols {
             let esi = symbol.esi;
             let in_range = accepted_esi_ranges
@@ -76,6 +85,7 @@ impl Processor {
                     esi,
                     "processor: SymbolTransfer rejected — ESI out of accepted range"
                 );
+                self.accepted_offers.lock().unwrap().remove(&(owner_id, block_id));
                 return Ok(());
             }
         }
@@ -102,6 +112,7 @@ impl Processor {
                     expected = SYMBOL_SIZE,
                     "processor: SymbolTransfer rejected — oversized symbol"
                 );
+                self.accepted_offers.lock().unwrap().remove(&(owner_id, block_id));
                 return Ok(());
             }
             let sym_path = block_dir.join(format!("{}.bin", symbol.esi));
@@ -156,6 +167,24 @@ impl Processor {
         };
 
         self.db.upsert_holding(&record)?;
+
+        // Subtract received ESIs from the offer's remaining ranges. The offer
+        // is dropped when fully covered; otherwise we keep it so a follow-up
+        // chunk for the same placement can still find and validate against it.
+        {
+            let mut map = self.accepted_offers.lock().unwrap();
+            let key = (owner_id, block_id);
+            if let Some(entry) = map.get_mut(&key) {
+                let mut remaining = ranges_to_esi_list(&entry.esi_ranges);
+                remaining.retain(|e| !received_esis.contains(e));
+                if remaining.is_empty() {
+                    map.remove(&key);
+                } else {
+                    remaining.sort_unstable();
+                    entry.esi_ranges = esi_list_to_ranges(&remaining);
+                }
+            }
+        }
 
         // Refresh trust_s for all devices of this peer's master identity.
         for did in self.db.get_devices_for_master(&owner_id).unwrap_or_default() {

@@ -201,11 +201,14 @@ impl Scheduler {
                             }
                         }
                     }
-                    // Current scaled week (same formula as trust recalc).
-                    let now = Timestamp::now();
+                    // Current scaled week — must match the formula in
+                    // processor::current_week_number_scaled. At time_scale > 1 the naive
+                    // `now / (SECS_PER_WEEK/scale)` form diverges from `(now*scale)/SECS_PER_WEEK`
+                    // by rounding, which caused prune_pos_weekly_before to wipe freshly
+                    // written entries.
                     let scale = self.config.time_scale.max(1);
-                    let week_secs = syncback_core::constants::SECS_PER_WEEK / scale;
-                    let current_week = (now.0 / week_secs) as u32;
+                    let current_week =
+                        crate::daemon::processor::current_week_number_scaled(scale);
                     let retain_weeks = self.config.pos_weekly_retain_weeks;
                     if current_week > retain_weeks {
                         let keep_after = current_week - retain_weeks;

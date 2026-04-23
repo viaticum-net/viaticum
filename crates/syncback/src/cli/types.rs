@@ -59,6 +59,9 @@ pub enum CliResponse {
 pub struct StatusData {
     /// This node's identity pubkey (hex).
     pub node_identity: String,
+    /// This node's DeviceId, first 8 bytes hex (16 chars). Matches PeerSummary.identity_hex.
+    #[serde(default)]
+    pub device_id: String,
     /// This node's libp2p address (for `syncback connect`).
     pub node_addr: String,
     /// Number of known peers.

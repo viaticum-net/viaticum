@@ -26,7 +26,9 @@ pub struct BudgetEstimate {
     pub committed_gb: f64,
     /// Conservative additional capacity estimate.
     pub headroom_gb: f64,
-    /// committed_gb + headroom_gb, floored at FREE_TIER_GB.
+    /// GB of offer credit earned by acting as a holder, trust-weighted.
+    pub earned_gb: f64,
+    /// committed_gb + headroom_gb + earned_gb, floored at FREE_TIER_GB.
     pub total_gb: f64,
     /// Placement success rate used for this estimate.
     pub placement_success_rate: f64,
@@ -112,7 +114,13 @@ pub enum BudgetError {
 /// committed_bytes: result of Db::committed_bytes() — sum of encrypted_size
 ///                  for all Active source blocks (owner view, loaded by caller).
 /// budget_record: last persisted BudgetRecord (caller loads from DB), None on first run.
-pub fn estimate_budget(committed_bytes: u64, budget_record: Option<&BudgetRecord>) -> BudgetEstimate {
+/// earned_gb: trust-weighted offer credit earned by holding for others (caller computes
+///            via held_contributions_gb_days + master_trust lookup). Zero for new nodes.
+pub fn estimate_budget(
+    committed_bytes: u64,
+    budget_record: Option<&BudgetRecord>,
+    earned_gb: f64,
+) -> BudgetEstimate {
     let committed_gb = committed_bytes as f64 / 1_073_741_824.0;
 
     let placement_success_rate = match budget_record {
@@ -129,16 +137,47 @@ pub fn estimate_budget(committed_bytes: u64, budget_record: Option<&BudgetRecord
     };
 
     let headroom_gb = committed_gb * placement_success_rate * WILLINGNESS_FACTOR;
-    let total_gb = (committed_gb + headroom_gb).max(FREE_TIER_GB);
+    let earned_gb = earned_gb.max(0.0);
+    let total_gb = (committed_gb + headroom_gb + earned_gb).max(FREE_TIER_GB);
     let offer_budget_gb = total_gb / placement_success_rate.max(0.2);
 
     BudgetEstimate {
         committed_gb,
         headroom_gb,
+        earned_gb,
         total_gb,
         placement_success_rate,
         offer_budget_gb,
     }
+}
+
+/// Compute trust-weighted earned offer credit from per-owner held contributions.
+///
+/// contributions: list of (owner_master_identity, gb_days) from
+///                `Db::held_contributions_gb_days`.
+/// master_trust: callback returning the MasterTrustRecord.combined score for the
+///               given master (0.0 if unknown). Trust-weighting caps Sybil abuse
+///               where many low-trust peers cross-hold among each other.
+/// k_offer_days: conversion factor (days needed to earn 1 GB of offer credit).
+pub fn compute_earned_offer_gb<F>(
+    contributions: &[(crate::types::IdentityPub, f64)],
+    master_trust: F,
+    k_offer_days: f64,
+) -> f64
+where
+    F: Fn(&crate::types::IdentityPub) -> f64,
+{
+    if k_offer_days <= 0.0 {
+        return 0.0;
+    }
+    let max_trust = crate::constants::MAX_COMBINED_TRUST;
+    let mut sum = 0.0_f64;
+    for (master, gb_days) in contributions {
+        let t = master_trust(master).max(0.0);
+        let weight = (t / max_trust).min(1.0);
+        sum += gb_days * weight;
+    }
+    sum / k_offer_days
 }
 
 /// Overhead factor for erasure coding: N/K for a given importance.

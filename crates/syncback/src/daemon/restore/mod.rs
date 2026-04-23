@@ -413,14 +413,19 @@ impl RestoreCoordinator {
                 "decode: insufficient local symbols, trying network"
             );
 
-            // Only try network fetch for Alive placements (reachable holders).
-            let alive_for_fetch: Vec<_> = usable_placements
+            // Try network fetch for Alive, Uncertain, and PresumedLost placements.
+            // PresumedLost holders may have returned after a temporary outage and
+            // still hold their symbols — worth asking before declaring restore failed.
+            let reachable_for_fetch: Vec<_> = usable_placements
                 .iter()
-                .filter(|p| p.status == PlacementStatus::Alive)
+                .filter(|p| matches!(
+                    p.status,
+                    PlacementStatus::Alive | PlacementStatus::Uncertain | PlacementStatus::PresumedLost
+                ))
                 .cloned()
                 .collect();
             let mut network_symbols = self
-                .fetch_from_holders(block_id, &alive_for_fetch, params)
+                .fetch_from_holders(block_id, &reachable_for_fetch, params)
                 .await?;
 
             // Merge: avoid duplicates by ESI.

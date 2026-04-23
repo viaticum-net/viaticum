@@ -77,7 +77,10 @@ pub(crate) async fn fetch_unbound_symbols(
     let mut unbound_symbols: Vec<Symbol> = Vec::new();
 
     for placement in placements {
-        if placement.status != PlacementStatus::Alive {
+        if !matches!(
+            placement.status,
+            PlacementStatus::Alive | PlacementStatus::Uncertain | PlacementStatus::PresumedLost
+        ) {
             continue;
         }
         if unbound_symbols.len() >= k_eff {

@@ -33,10 +33,10 @@ COMPOSE_FILE = "experiments/gamma/compose.yml"
 PROJECT_DIR = str(Path(__file__).parent.parent.parent)
 
 ARCHETYPES = {
-    "reliable":   {"fraction": 0.4, "quota_gb": 100, "behavior": "always_on"},
-    "flaky":      {"fraction": 0.4, "quota_gb": 100, "behavior": "cycle",
+    "reliable":   {"fraction": 0.4, "quota_gb": 20, "behavior": "always_on"},
+    "flaky":      {"fraction": 0.4, "quota_gb": 20, "behavior": "cycle",
                    "on_secs": 180, "off_secs": 180},
-    "freeloader": {"fraction": 0.2, "quota_gb": 1,   "behavior": "always_on"},
+    "freeloader": {"fraction": 0.2, "quota_gb": 5,  "behavior": "always_on"},
 }
 
 SNAPSHOT_INTERVAL = 60  # seconds between data collection snapshots
@@ -148,6 +148,8 @@ class DataCollector:
                 "sim_weeks": sim_weeks,
                 "node": n["name"],
                 "archetype": n["archetype"],
+                "device_id": s.get("device_id", ""),
+                "node_identity": s.get("node_identity", "")[:16],
                 "peer_count": s.get("peer_count", 0),
                 "avg_trust": round(s.get("avg_trust", 0), 4),
                 "holding_bytes": s.get("holding_bytes", 0),
@@ -331,21 +333,107 @@ def phase_connect_mesh(nodes: list[dict], dc: DataCollector):
              details=f"{len(connected_pairs)} pairs, low_peer_nodes={len(low_peers)}")
 
 
+# Owner profiles model different real-world user patterns. Each is assigned to
+# one reliable seeder. `initial` runs once at setup; `ongoing` fires every
+# `interval_secs` of REAL time during the behavior loop.
+OWNER_PROFILES = {
+    # Backup of an archive image — single large file that stresses both
+    # SymbolTransfer chunking AND the offer-budget bootstrap path (a fresh owner
+    # can't commit a 2 GB file without earned credit).
+    "archive_dump": {
+        "initial":  [{"prefix": "backup", "count": 1,   "size_kb": 2_000_000, "subdir": "archives"}],
+        "ongoing":  None,
+    },
+    # Photographer: many medium photos, adds new ones every cycle.
+    "photographer": {
+        "initial":  [{"prefix": "img",    "count": 120, "size_kb": 8_000,     "subdir": "photos"}],
+        "ongoing":  {"interval_secs": 90,  "items": [
+                        {"prefix": "img_new", "count": 3, "size_kb": 8_000, "subdir": "photos"}]},
+    },
+    # Document worker: many small files; constant trickle of updates.
+    "document_user": {
+        "initial":  [{"prefix": "doc",    "count": 300, "size_kb": 100,       "subdir": "docs"},
+                     {"prefix": "sheet",  "count": 30,  "size_kb": 500,       "subdir": "docs"}],
+        "ongoing":  {"interval_secs": 60, "items": [
+                        {"prefix": "doc_new",  "count": 10, "size_kb": 100, "subdir": "docs"}]},
+    },
+    # Mixed user: a project export, photos, configs.
+    "mixed": {
+        "initial":  [{"prefix": "export", "count": 1,   "size_kb": 500_000,   "subdir": "export"},
+                     {"prefix": "photo",  "count": 30,  "size_kb": 10_000,    "subdir": "photos"},
+                     {"prefix": "cfg",    "count": 100, "size_kb": 100,       "subdir": "configs"}],
+        "ongoing":  {"interval_secs": 120, "items": [
+                        {"prefix": "extra", "count": 5, "size_kb": 1_000, "subdir": "misc"}]},
+    },
+    # Video editor: several large clips.
+    "video_chunks": {
+        "initial":  [{"prefix": "clip",   "count": 10,  "size_kb": 150_000,   "subdir": "video"}],
+        "ongoing":  {"interval_secs": 180, "items": [
+                        {"prefix": "clip_new", "count": 1, "size_kb": 150_000, "subdir": "video"}]},
+    },
+}
+
+
+def _create_files(node_name: str, items: list[dict], tag: str) -> int:
+    """Create files for a single node according to a list of item specs.
+    Returns total bytes written."""
+    total_bytes = 0
+    parts = []
+    for item in items:
+        sub = item.get("subdir", "").strip("/")
+        path = f"/data/files/{sub}".rstrip("/")
+        # Use short label for new files in the ongoing phase to avoid collisions.
+        label = f"{tag}-{int(time.time())}" if tag else ""
+        parts.append(
+            f"mkdir -p {path}; "
+            f"for i in $(seq 1 {item['count']}); do "
+            f"dd if=/dev/urandom of={path}/{item['prefix']}_{label}_$i.bin "
+            f"bs=1024 count={item['size_kb']} 2>/dev/null; done"
+        )
+        total_bytes += item["count"] * item["size_kb"] * 1024
+    cmd = " && ".join(parts)
+    exec_node(node_name, "sh", "-c", cmd, timeout=600)
+    return total_bytes
+
+
 def phase_create_files(nodes: list[dict], dc: DataCollector):
-    """Create test files on reliable nodes for backup."""
-    print("\n=== Phase: Create files ===")
+    """Initial seeding for each reliable owner using its assigned profile."""
+    print("\n=== Phase: Create files (per owner profile) ===")
     reliable = [n for n in nodes if n["archetype"] == "reliable"]
-    files_per_node = 5
-    file_size_kb = 50
-    for n in reliable[:min(5, len(reliable))]:
-        exec_node(n["name"], "sh", "-c",
-                  f"for i in $(seq 1 {files_per_node}); do "
-                  f"dd if=/dev/urandom of=/data/files/test_$i.dat bs=1024 count={file_size_kb} 2>/dev/null; "
-                  f"done")
-        print(f"  {n['name']}: {files_per_node} files ({file_size_kb}KB each)")
+    profile_names = list(OWNER_PROFILES.keys())
+    seeders = reliable[:min(len(profile_names), len(reliable))]
+    for idx, n in enumerate(seeders):
+        profile_name = profile_names[idx]
+        profile = OWNER_PROFILES[profile_name]
+        n["owner_profile"] = profile_name
+        bytes_written = _create_files(n["name"], profile["initial"], tag="init")
+        print(f"  {n['name']} <{profile_name}>: {bytes_written/1_048_576:.1f} MB seeded")
+        dc.event("files_seeded", node=n["name"],
+                 details=f"profile={profile_name} bytes={bytes_written}")
     time.sleep(3)
-    dc.event("files_created",
-             details=f"{min(5, len(reliable))} nodes × {files_per_node} files × {file_size_kb}KB")
+
+
+def _run_ongoing_user_activity(nodes: list[dict], dc: DataCollector,
+                               last_fired: dict[str, float]) -> None:
+    """During behavior loop: trigger periodic file creation per owner profile."""
+    now = time.time()
+    for n in nodes:
+        profile_name = n.get("owner_profile")
+        if not profile_name:
+            continue
+        spec = OWNER_PROFILES[profile_name].get("ongoing")
+        if not spec:
+            continue
+        last = last_fired.get(n["name"], 0)
+        if now - last < spec["interval_secs"]:
+            continue
+        try:
+            bytes_written = _create_files(n["name"], spec["items"], tag="ongoing")
+            dc.event("user_added_files", node=n["name"],
+                     details=f"profile={profile_name} bytes={bytes_written}")
+            last_fired[n["name"]] = now
+        except Exception as e:
+            dc.event("user_added_files_failed", node=n["name"], details=str(e))
 
 
 def phase_behavior_loop(nodes: list[dict], duration_secs: int, time_scale: int,
@@ -360,6 +448,9 @@ def phase_behavior_loop(nodes: list[dict], duration_secs: int, time_scale: int,
     next_toggle = {}
     for n in flaky:
         next_toggle[n["name"]] = time.time() + random.uniform(10, n.get("on_secs", 180))
+
+    # Track last ongoing-user-activity firing per owner.
+    last_user_activity: dict[str, float] = {}
 
     start_time = time.time()
     last_snapshot = 0
@@ -398,6 +489,9 @@ def phase_behavior_loop(nodes: list[dict], duration_secs: int, time_scale: int,
                     time.sleep(2)
                     _reconnect_flaky(name, nodes)
 
+        # Periodic user-driven file creation per owner profile.
+        _run_ongoing_user_activity(nodes, dc, last_user_activity)
+
         # Collect data every SNAPSHOT_INTERVAL seconds
         if elapsed - last_snapshot >= SNAPSHOT_INTERVAL:
             dc.snapshot_all(nodes, time_scale)
@@ -434,6 +528,19 @@ def _reconnect_flaky(name: str, nodes: list[dict]):
                 exec_node(name, "syncback", "connect", addr, timeout=10)
         except Exception:
             pass
+
+
+def id_to_node_preview(nodes: list[dict]) -> dict[str, str]:
+    """Map device_id (first 8 bytes hex) → node name. Used by phase_report
+    to label peers from the reporter's status snapshots."""
+    out: dict[str, str] = {}
+    for n in nodes:
+        s = node_status_safe(n["name"])
+        if s:
+            key = s.get("device_id") or s.get("node_identity", "")[:16]
+            if key:
+                out[key] = n["name"]
+    return out
 
 
 def phase_report(nodes: list[dict], dc: DataCollector) -> str:
@@ -476,6 +583,10 @@ def phase_report(nodes: list[dict], dc: DataCollector) -> str:
                     "p": round(p.get("trust_p", 0), 4),
                     "i": round(p.get("trust_i", 0), 4),
                     "s": round(p.get("trust_s", 0), 4),
+                    "bytes_we_store": p.get("bytes_we_store", 0),
+                    "bytes_peer_stores": p.get("bytes_peer_stores", 0),
+                    "pos_ch": p.get("pos_challenges_recent", 0),
+                    "pos_pa": p.get("pos_passes_recent", 0),
                 }
                 for p in s.get("peers", [])
             ],
@@ -515,31 +626,108 @@ def phase_report(nodes: list[dict], dc: DataCollector) -> str:
                 f"avg_trust_received={avg_trust:.4f}"
             )
 
-    # Trust matrix: how each archetype views others
-    lines.append("\n--- Trust Matrix (observer → subject avg trust) ---")
-    # For each observer archetype, compute avg trust given to each subject archetype
-    # We need to match peer identity to archetype
+    # Trust matrix: how each archetype views others.
+    # Filter to observers that actually issue PoS (i.e. own placements) — non-owner
+    # observers have only the initial trust default (0.03) and smear the signal.
+    lines.append("\n--- Trust Matrix (active-owner observer → subject avg trust) ---")
     identity_to_arch = {}
     for n in nodes:
         s = node_status_safe(n["name"])
         if s:
-            identity_to_arch[s.get("node_identity", "")[:16]] = n["archetype"]
+            key = s.get("device_id") or s.get("node_identity", "")[:16]
+            if key:
+                identity_to_arch[key] = n["archetype"]
+
+    # Identify which devices are "active owners" (have placements) — the
+    # subjects-that-are-owners skew the S component because they make us
+    # store for them, which yields pairwise asymmetry.
+    owner_device_ids: set[str] = set()
+    for obs_arch in by_arch:
+        for e in by_arch[obs_arch]:
+            if e.get("online") and e.get("placement_alive", 0) > 0:
+                # Look up this node's device_id.
+                for key, name in [(k, v) for k, v in id_to_node_preview(nodes).items()]:
+                    if name == e["name"]:
+                        owner_device_ids.add(key)
 
     for obs_arch in by_arch:
-        obs_entries = [e for e in by_arch[obs_arch] if e.get("online")]
-        trust_by_subj: dict[str, list[float]] = {}
+        obs_entries = [
+            e for e in by_arch[obs_arch]
+            if e.get("online") and e.get("placement_alive", 0) > 0
+        ]
+        if not obs_entries:
+            lines.append(f"  {obs_arch:12s} → (no active owners in this archetype)")
+            continue
+        # Bucket subjects by (archetype, is_owner) to separate the S-asymmetry
+        # effect. Mixed averages obscure which group is actually misbehaving.
+        trust_plain: dict[str, list[float]] = {}
+        trust_owner: dict[str, list[float]] = {}
         for e in obs_entries:
             for pt in e.get("peer_trusts", []):
                 subj_arch = identity_to_arch.get(pt["id"], "?")
-                trust_by_subj.setdefault(subj_arch, []).append(pt["trust"])
-        parts = []
-        for subj_arch in ["reliable", "flaky", "freeloader"]:
-            vals = trust_by_subj.get(subj_arch, [])
-            if vals:
-                parts.append(f"{subj_arch}={sum(vals)/len(vals):.4f}")
-            else:
-                parts.append(f"{subj_arch}=n/a")
-        lines.append(f"  {obs_arch:12s} → {', '.join(parts)}")
+                bucket = trust_owner if pt["id"] in owner_device_ids else trust_plain
+                bucket.setdefault(subj_arch, []).append(pt["trust"])
+
+        def fmt(d):
+            parts_ = []
+            for subj_arch in ["reliable", "flaky", "freeloader"]:
+                vals = d.get(subj_arch, [])
+                if vals:
+                    parts_.append(f"{subj_arch}={sum(vals)/len(vals):.4f} (n={len(vals)})")
+                else:
+                    parts_.append(f"{subj_arch}=n/a")
+            return ", ".join(parts_)
+
+        lines.append(f"  {obs_arch:12s} → non-owner subjects: {fmt(trust_plain)}")
+        if any(trust_owner.values()):
+            lines.append(f"  {obs_arch:12s} → owner  subjects: {fmt(trust_owner)}")
+
+    # Per-peer breakdown for each active owner. Useful to sanity-check the
+    # trust-matrix aggregate (where high-trust peers can outweigh low ones).
+    id_to_node = id_to_node_preview(nodes)
+
+    lines.append("\n--- Per-peer trust (active owners) ---")
+    any_owner = False
+    for obs_arch in by_arch:
+        for e in by_arch[obs_arch]:
+            if not (e.get("online") and e.get("placement_alive", 0) > 0):
+                continue
+            any_owner = True
+            profile = next(
+                (n.get("owner_profile", "?") for n in nodes if n["name"] == e["name"]),
+                "?",
+            )
+            lines.append(
+                f"\n  {e['name']} <{obs_arch}/{profile}> "
+                f"placements={e['placement_alive']} pos={e.get('pos_passed',0)}/{e.get('pos_challenged',0)}"
+            )
+            lines.append(
+                f"    {'peer':18} {'arch':12} {'P':>6} {'I':>6} {'S':>6} {'combined':>9} "
+                f"{'held (MB)':>10} {'stores (MB)':>12} {'pos recent':>12}"
+            )
+            peers_sorted = sorted(
+                e.get("peer_trusts", []),
+                key=lambda p: p.get("trust", 0),
+                reverse=True,
+            )
+            for pt in peers_sorted:
+                subj_arch = identity_to_arch.get(pt["id"], "?")
+                subj_name = id_to_node.get(pt["id"], "?")
+                pos_ch = pt.get("pos_ch", 0)
+                pos_pa = pt.get("pos_pa", 0)
+                pos_rate = (
+                    f"{pos_pa}/{pos_ch} ({pos_pa / pos_ch * 100:.0f}%)"
+                    if pos_ch > 0 else "-"
+                )
+                lines.append(
+                    f"    {pt['id']:18} {subj_arch[:8] + '/' + subj_name:12} "
+                    f"{pt['p']:>6.3f} {pt['i']:>6.3f} {pt['s']:>6.3f} {pt['trust']:>9.4f} "
+                    f"{pt.get('bytes_peer_stores', 0)/1_048_576:>10.1f} "
+                    f"{pt.get('bytes_we_store', 0)/1_048_576:>12.1f} "
+                    f"{pos_rate:>12}"
+                )
+    if not any_owner:
+        lines.append("  (no active owners)")
 
     report = "\n".join(lines)
     print(report)

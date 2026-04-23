@@ -1456,6 +1456,41 @@ impl Db {
         Ok(total)
     }
 
+    /// Per-owner holding contribution in GB-days, summed across all active
+    /// HoldingRecords we hold for others. Used by the budget planner to grant
+    /// offer-side credit in proportion to our usefulness as a holder.
+    ///
+    /// Returns one entry per owner_id that has at least one active holding.
+    /// Owners with zero age contribute nothing and are omitted.
+    pub fn held_contributions_gb_days(
+        &self,
+        now: Timestamp,
+        time_scale: u64,
+    ) -> Result<Vec<(IdentityPub, f64)>, DbError> {
+        const SECS_PER_DAY: f64 = 86_400.0;
+
+        let scale = time_scale.max(1) as f64;
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(HOLDINGS)?;
+        let mut by_owner: std::collections::HashMap<IdentityPub, f64> =
+            std::collections::HashMap::new();
+        for item in table.iter()? {
+            let (_k, v) = item?;
+            let h: HoldingRecord = from_cbor_bytes(v.value())?;
+            if h.status != HoldingStatus::Active {
+                continue;
+            }
+            let age_secs = now.0.saturating_sub(h.received_at.0) as f64;
+            if age_secs <= 0.0 {
+                continue;
+            }
+            let age_days = age_secs * scale / SECS_PER_DAY;
+            let gb = h.total_bytes as f64 / BYTES_PER_GB;
+            *by_owner.entry(h.owner_id).or_insert(0.0) += gb * age_days;
+        }
+        Ok(by_owner.into_iter().collect())
+    }
+
     /// Total bytes we have served to this owner for restore (cumulative).
     /// Returns 0 if no record exists.
     pub fn restored_total_bytes(&self, owner_id: &IdentityPub) -> Result<u64, DbError> {

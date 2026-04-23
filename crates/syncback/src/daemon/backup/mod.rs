@@ -265,6 +265,43 @@ impl BackupCoordinator {
         }
     }
 
+    /// Earning-side weight for a master we hold data for.
+    ///
+    /// We cannot directly reuse the combined trust score: a pure holder trivially
+    /// has S=0.1 against every owner (they never stored anything for us), which
+    /// clamps combined toward zero and starves earned credit — defeating the
+    /// self-awareness story.
+    ///
+    /// We also cannot reuse just kp×P + ki×I, because `recalculate_trust` only
+    /// fires on the PoS OWNER side; a pure-holder daemon never updates trust_p
+    /// for any peer, so it stays at INITIAL_TRUST_P=0.1 and the weight stays tiny.
+    ///
+    /// The decision point that makes a master "legitimate to hold data for" is
+    /// the SymbolOffer/Accept handshake: the holder validated signatures and
+    /// chose to accept. Once a HoldingRecord exists and at least one PeerRecord
+    /// for a device of that master is on file, the master is trust-confirmed
+    /// from the holder's point of view. We return MAX_COMBINED_TRUST (= full
+    /// weight) in that case, and 0 otherwise.
+    ///
+    /// Sybil concern — logged in tech-debt: an attacker with many fake masters
+    /// could feed us offers for junk data and inflate our earned budget. They
+    /// must still burn real disk on our side, and accepting requires passing
+    /// quota/signature checks, so the cost is bounded. Future work: weight by
+    /// `master_trust.combined` once bi-directional trust propagation lands.
+    fn earning_weight_for_master(
+        &self,
+        master: &syncback_core::types::IdentityPub,
+    ) -> f64 {
+        use syncback_core::constants::MAX_COMBINED_TRUST;
+        let devices = self.db.get_devices_for_master(master).unwrap_or_default();
+        for did in devices {
+            if matches!(self.db.get_peer(&did), Ok(Some(_))) {
+                return MAX_COMBINED_TRUST;
+            }
+        }
+        0.0
+    }
+
     /// Compute how many GB we can offer to the network this cycle.
     /// Returns offer_budget_gb from BudgetEstimate.
     /// On DB error: returns FREE_TIER_GB (safe fallback — never block all backups).
@@ -286,9 +323,32 @@ impl BackupCoordinator {
                 None
             }
         };
-        let estimate = syncback_core::budget::estimate_budget(committed_bytes, budget_record.as_ref());
+
+        // Trust-weighted earned offer credit: reward us for being a useful holder
+        // so a fresh owner with zero committed can still back up their first files.
+        let earned_gb = {
+            use syncback_core::constants::OFFER_EARN_K_FACTOR_DAYS;
+            use syncback_core::types::Timestamp;
+            let now = Timestamp::now();
+            let contributions = self
+                .db
+                .held_contributions_gb_days(now, self.config.time_scale)
+                .unwrap_or_default();
+            syncback_core::budget::compute_earned_offer_gb(
+                &contributions,
+                |master| self.earning_weight_for_master(master),
+                OFFER_EARN_K_FACTOR_DAYS,
+            )
+        };
+
+        let estimate = syncback_core::budget::estimate_budget(
+            committed_bytes,
+            budget_record.as_ref(),
+            earned_gb,
+        );
         tracing::debug!(
             committed_gb = estimate.committed_gb,
+            earned_gb = estimate.earned_gb,
             offer_budget_gb = estimate.offer_budget_gb,
             placement_success_rate = estimate.placement_success_rate,
             "budget estimate"
@@ -756,6 +816,8 @@ impl BackupCoordinator {
         result: &PipelineResult,
         placement: &syncback_core::types::SymbolPlacement,
     ) -> anyhow::Result<()> {
+        use syncback_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES;
+        use syncback_core::erasure::chunk_symbols_by_size;
         use syncback_core::messages::{Message, SymbolTransferMsg};
         use syncback_core::types::Timestamp;
 
@@ -774,70 +836,106 @@ impl BackupCoordinator {
         }
 
         let symbol_count = symbols.len();
-        let msg = SymbolTransferMsg {
-            v: 1,
-            source_block_id: result.source_block_id,
-            symbols,
-            timestamp: Timestamp::now(),
-        };
+        // A single holder's share of a block may exceed MAX_MESSAGE_SIZE, so
+        // we chunk into multiple SymbolTransfer frames. Holder accumulates and
+        // only transitions Offered→Alive once every ACK is in.
+        let chunks = chunk_symbols_by_size(symbols, SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES);
+        let total_chunks = chunks.len();
+        let mut stored_ok = 0usize;
+        let mut saw_old_protocol = false;
 
-        let reply = swarm
-            .send_to_device(placement.holder_id, Message::SymbolTransfer(msg))
-            .await
-            .map_err(|e| anyhow::anyhow!("send SymbolTransfer: {e}"))?;
-
-        match reply {
-            Message::SymbolStored(_stored) => {
-                let now = Timestamp::now();
-                match self.db.transition_placement_offered_to_alive(
-                    &result.source_block_id,
-                    &placement.holder_id,
-                    now,
-                ) {
-                    Ok(true) => {
-                        tracing::info!(
-                            holder = %placement.holder_id,
-                            block_id = %result.source_block_id,
-                            symbols = symbol_count,
-                            "backup: symbols confirmed stored, placement Offered→Alive"
-                        );
-                    }
-                    Ok(false) => {
-                        tracing::debug!(
-                            holder = %placement.holder_id,
-                            "backup: placement transition skipped (not in Offered state)"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            holder = %placement.holder_id,
-                            err = %e,
-                            "backup: DB error transitioning Offered→Alive"
-                        );
-                    }
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            let chunk_len = chunk.len();
+            let msg = SymbolTransferMsg {
+                v: 1,
+                source_block_id: result.source_block_id,
+                symbols: chunk,
+                timestamp: Timestamp::now(),
+            };
+            let reply = swarm
+                .send_to_device(placement.holder_id, Message::SymbolTransfer(msg))
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "send SymbolTransfer chunk {}/{}: {}",
+                        idx + 1,
+                        total_chunks,
+                        e
+                    )
+                })?;
+            match reply {
+                Message::SymbolStored(_) => {
+                    stored_ok += 1;
+                    tracing::debug!(
+                        holder = %placement.holder_id,
+                        block_id = %result.source_block_id,
+                        chunk = idx + 1,
+                        total = total_chunks,
+                        symbols = chunk_len,
+                        "backup: chunk stored",
+                    );
+                }
+                Message::SystemStateAck(_) => {
+                    saw_old_protocol = true;
+                }
+                other => {
+                    tracing::warn!(
+                        holder = %placement.holder_id,
+                        "backup: unexpected reply to SymbolTransfer: {:?}",
+                        std::mem::discriminant(&other)
+                    );
                 }
             }
-            Message::SystemStateAck(_) => {
-                // Old-protocol holder (pre-B3): accept delivery but do not transition.
-                // Placement stays Offered; sweep will mark it Lost after SYMBOL_OFFER_TIMEOUT_SECS.
-                tracing::debug!(
+        }
+
+        if stored_ok == total_chunks {
+            let now = Timestamp::now();
+            match self.db.transition_placement_offered_to_alive(
+                &result.source_block_id,
+                &placement.holder_id,
+                now,
+            ) {
+                Ok(true) => {
+                    tracing::info!(
+                        holder = %placement.holder_id,
+                        block_id = %result.source_block_id,
+                        symbols = symbol_count,
+                        chunks = total_chunks,
+                        "backup: symbols confirmed stored, placement Offered→Alive"
+                    );
+                }
+                Ok(false) => tracing::debug!(
                     holder = %placement.holder_id,
-                    "backup: got SystemStateAck instead of SymbolStored (old protocol)"
-                );
-            }
-            other => {
-                tracing::warn!(
+                    "backup: placement transition skipped (not in Offered state)"
+                ),
+                Err(e) => tracing::error!(
                     holder = %placement.holder_id,
-                    "backup: unexpected reply to SymbolTransfer: {:?}",
-                    std::mem::discriminant(&other)
-                );
+                    err = %e,
+                    "backup: DB error transitioning Offered→Alive"
+                ),
             }
+        } else if saw_old_protocol {
+            tracing::debug!(
+                holder = %placement.holder_id,
+                chunks_ok = stored_ok,
+                chunks_total = total_chunks,
+                "backup: old-protocol holder (SystemStateAck); placement left Offered"
+            );
+        } else {
+            tracing::warn!(
+                holder = %placement.holder_id,
+                block_id = %result.source_block_id,
+                chunks_ok = stored_ok,
+                chunks_total = total_chunks,
+                "backup: not all chunks acked; placement left Offered"
+            );
         }
 
         tracing::info!(
             holder = %placement.holder_id,
             block_id = %result.source_block_id,
             symbols = symbol_count,
+            chunks = total_chunks,
             "backup: symbols delivered"
         );
 

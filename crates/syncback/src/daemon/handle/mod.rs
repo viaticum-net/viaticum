@@ -108,7 +108,17 @@ impl DaemonHandle {
             IdentityError::NotInitialized => {
                 anyhow::anyhow!("identity not initialized — run 'syncback init' first")
             }
-            other => anyhow::anyhow!("identity load error: {other}"),
+            IdentityError::Corrupt(p, msg) => anyhow::anyhow!(
+                "identity file at {} is corrupt or from an incompatible binary version ({}). \
+                 Delete the file and re-run 'syncback init', or restore from backup.",
+                p.display(),
+                msg
+            ),
+            other => anyhow::anyhow!(
+                "identity load error from {}: {}",
+                cfg.data_dir.join("identity.key").display(),
+                other
+            ),
         })?;
 
         // ── 2. Load or create AppConfig ───────────────────────────────────────

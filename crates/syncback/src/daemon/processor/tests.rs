@@ -2807,8 +2807,8 @@ async fn offer_accepted_stored_in_map() {
 // ─── AC-4: transfer_stored_after_valid_offer ─────────────────────────────────
 //
 // AC-4: Holder accepts valid SymbolTransfer after prior offer.
-// Setup: accepted_offers has entry (alice_id, X) → AcceptedOffer { esi_ranges: [(0,10)], importance: 0.7 }.
-// Input: SymbolTransfer with ESI 0..4 (within accepted range).
+// Setup: accepted_offers has entry (alice_id, X) → AcceptedOffer { esi_ranges: [(0,3)], importance: 0.7 }.
+// Input: SymbolTransfer covers the whole accepted range.
 // Expected: symbols written, HoldingRecord with importance=0.7, offer consumed.
 
 #[tokio::test]
@@ -2821,10 +2821,10 @@ async fn transfer_stored_after_valid_offer() {
     let block_id = make_block_id(0x33);
     let importance = 0.7_f64;
 
-    // Register accepted offer for ESI range (0, 10).
-    insert_accepted_offer(&processor, owner, block_id, vec![(0u32, 10u32)], importance);
+    // Register accepted offer covering exactly the 3 ESIs we'll send.
+    insert_accepted_offer(&processor, owner, block_id, vec![(0u32, 3u32)], importance);
 
-    // Send 3 symbols within the accepted range.
+    // Send all 3 accepted symbols in a single transfer.
     let transfer = SymbolTransferMsg {
         v: 1,
         source_block_id: block_id,
@@ -2847,12 +2847,89 @@ async fn transfer_stored_after_valid_offer() {
     assert_eq!(holding.status, HoldingStatus::Active);
     assert_eq!(holding.esi_ranges, vec![(0u32, 3u32)]);
 
-    // Offer must be consumed (removed from map).
+    // Offer must be consumed once the full accepted range has been delivered.
     let map = processor.accepted_offers.lock().unwrap();
     assert!(
         map.get(&(owner, block_id)).is_none(),
-        "AcceptedOffer must be removed after transfer"
+        "AcceptedOffer must be removed after all ESIs delivered"
     );
+}
+
+// ─── Chunked delivery: partial transfer keeps the offer alive ────────────────
+//
+// A SymbolTransfer that only covers a subset of the accepted range must leave
+// the AcceptedOffer in place so a follow-up transfer can deliver the rest —
+// this is the chunking scheme used by owners whose per-holder share would
+// exceed MAX_MESSAGE_SIZE in a single frame.
+
+#[tokio::test]
+async fn transfer_partial_keeps_offer_and_second_transfer_completes_it() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+
+    let owner = make_identity(0x55);
+    let block_id = make_block_id(0x55);
+
+    // Accepted: ESI 0..5.
+    insert_accepted_offer(&processor, owner, block_id, vec![(0u32, 5u32)], 0.6);
+
+    // First chunk: ESI 0..2.
+    processor
+        .handle_symbol_transfer(
+            owner,
+            SymbolTransferMsg {
+                v: 1,
+                source_block_id: block_id,
+                symbols: vec![
+                    syncback_core::erasure::Symbol { esi: 0, data: vec![0xAAu8; 32] },
+                    syncback_core::erasure::Symbol { esi: 1, data: vec![0xAAu8; 32] },
+                    syncback_core::erasure::Symbol { esi: 2, data: vec![0xAAu8; 32] },
+                ],
+                timestamp: Timestamp::now(),
+            },
+        )
+        .await
+        .expect("first chunk");
+
+    // Offer must still be present with the remaining ESIs 3..4.
+    {
+        let map = processor.accepted_offers.lock().unwrap();
+        let entry = map
+            .get(&(owner, block_id))
+            .expect("offer must remain after partial transfer");
+        assert_eq!(entry.esi_ranges, vec![(3u32, 2u32)]);
+    }
+
+    // Second chunk: ESI 3..4 finishes the placement.
+    processor
+        .handle_symbol_transfer(
+            owner,
+            SymbolTransferMsg {
+                v: 1,
+                source_block_id: block_id,
+                symbols: vec![
+                    syncback_core::erasure::Symbol { esi: 3, data: vec![0xBBu8; 32] },
+                    syncback_core::erasure::Symbol { esi: 4, data: vec![0xBBu8; 32] },
+                ],
+                timestamp: Timestamp::now(),
+            },
+        )
+        .await
+        .expect("second chunk");
+
+    // Offer gone, holding covers all 5 ESIs.
+    assert!(processor
+        .accepted_offers
+        .lock()
+        .unwrap()
+        .get(&(owner, block_id))
+        .is_none());
+    let holding = db
+        .get_holding(&block_id, &owner)
+        .unwrap()
+        .expect("holding must exist");
+    assert_eq!(holding.esi_ranges, vec![(0u32, 5u32)]);
 }
 
 // ─── AC-5: transfer_rejected_esi_out_of_range ────────────────────────────────

@@ -306,6 +306,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
     }
 
     let node_identity = hex_encode(&state.identity_pub.0);
+    let device_id = bytes_to_hex_8(&state.device_id.0);
 
     let node_addr = match state.swarm_handle.as_ref() {
         Some(swarm) => {
@@ -327,6 +328,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
 
     CliResponse::Status(StatusData {
         node_identity,
+        device_id,
         node_addr,
         peer_count: peers.len() as u32,
         avg_trust,

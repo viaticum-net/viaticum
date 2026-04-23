@@ -1,6 +1,8 @@
 use rand::Rng;
 
-use super::{ErasureEncoder, ErasureError, RaptorQEncoder, Symbol, binding_seed};
+use super::{
+    chunk_symbols_by_size, binding_seed, ErasureEncoder, ErasureError, RaptorQEncoder, Symbol,
+};
 use crate::types::{DeviceId, ErasureParams, SourceBlockId};
 
 // Helper: produce a params where k > 1 so we have multiple source symbols.
@@ -747,4 +749,76 @@ fn source_block_not_multiple_of_t_padding_trim() {
         &source[..],
         "first 1000 bytes must match original source"
     );
+}
+
+// ─── chunk_symbols_by_size ──────────────────────────────────────────────────
+
+fn sym(esi: u32, size: usize) -> Symbol {
+    Symbol { esi, data: vec![0u8; size] }
+}
+
+#[test]
+fn chunk_symbols_empty_input_returns_empty_vec() {
+    let out = chunk_symbols_by_size(vec![], 1024);
+    assert!(out.is_empty());
+}
+
+#[test]
+fn chunk_symbols_fits_in_one_chunk_when_under_budget() {
+    let symbols = vec![sym(0, 100), sym(1, 100), sym(2, 100)];
+    let out = chunk_symbols_by_size(symbols, 1024);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].len(), 3);
+}
+
+#[test]
+fn chunk_symbols_splits_at_budget_boundary() {
+    // Budget 250 bytes; three 100-byte symbols → [100+100]=200 fits, 100 overflows → two chunks.
+    let symbols = vec![sym(0, 100), sym(1, 100), sym(2, 100)];
+    let out = chunk_symbols_by_size(symbols, 250);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].len(), 2);
+    assert_eq!(out[1].len(), 1);
+    assert_eq!(out[0][0].esi, 0);
+    assert_eq!(out[1][0].esi, 2);
+}
+
+#[test]
+fn chunk_symbols_single_oversize_symbol_still_emitted() {
+    let symbols = vec![sym(0, 1000)];
+    let out = chunk_symbols_by_size(symbols, 100);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].len(), 1);
+}
+
+#[test]
+fn chunk_symbols_preserves_order() {
+    let symbols: Vec<Symbol> = (0..10u32).map(|i| sym(i, 50)).collect();
+    let out = chunk_symbols_by_size(symbols, 200);
+    let flat: Vec<u32> = out.iter().flatten().map(|s| s.esi).collect();
+    assert_eq!(flat, (0..10).collect::<Vec<_>>());
+}
+
+#[test]
+fn chunk_symbols_realistic_scenario_2300_full_size_symbols() {
+    use crate::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES;
+    let symbols: Vec<Symbol> = (0..2300u32)
+        .map(|i| Symbol { esi: i, data: vec![0u8; 65535] })
+        .collect();
+    let out = chunk_symbols_by_size(symbols, SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES);
+    // 2300 × 65535 = 150,730,500 bytes ≈ 143.7 MB > 100 MiB budget.
+    // Expect the helper to split into at least two chunks.
+    assert!(
+        out.len() >= 2,
+        "2300 full-size symbols should produce >= 2 chunks; got {}", out.len()
+    );
+    for c in &out {
+        let b: usize = c.iter().map(|s| s.data.len()).sum();
+        assert!(
+            b <= SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES
+                + (c.first().map(|s| s.data.len()).unwrap_or(0)),
+            "chunk {}MB above budget+1sym headroom",
+            b / 1024 / 1024
+        );
+    }
 }

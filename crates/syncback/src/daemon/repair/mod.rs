@@ -606,6 +606,8 @@ impl RepairAgent {
         block_id: &SourceBlockId,
         placement: &SymbolPlacement,
     ) -> anyhow::Result<()> {
+        use syncback_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES;
+        use syncback_core::erasure::chunk_symbols_by_size;
         use syncback_core::messages::{Message, SymbolTransferMsg};
         use syncback_core::types::Timestamp;
 
@@ -624,22 +626,33 @@ impl RepairAgent {
         }
 
         let symbol_count = symbols.len();
-        let msg = SymbolTransferMsg {
-            v: 1,
-            source_block_id: *block_id,
-            symbols,
-            timestamp: Timestamp::now(),
-        };
-
-        swarm
-            .send_to_device(placement.holder_id, Message::SymbolTransfer(msg))
-            .await
-            .map_err(|e| anyhow::anyhow!("send_symbols: {e}"))?;
+        let chunks = chunk_symbols_by_size(symbols, SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES);
+        let total_chunks = chunks.len();
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            let msg = SymbolTransferMsg {
+                v: 1,
+                source_block_id: *block_id,
+                symbols: chunk,
+                timestamp: Timestamp::now(),
+            };
+            swarm
+                .send_to_device(placement.holder_id, Message::SymbolTransfer(msg))
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "send_symbols chunk {}/{}: {}",
+                        idx + 1,
+                        total_chunks,
+                        e
+                    )
+                })?;
+        }
 
         tracing::info!(
             holder = %placement.holder_id,
             block_id = %block_id,
             symbols = symbol_count,
+            chunks = total_chunks,
             "repair: symbols delivered"
         );
 
@@ -794,20 +807,25 @@ impl RepairAgent {
         // blocks this node owns — there are no placements where holder == self,
         // so no self-filter is needed here.
         let placements = self.db.list_placements_for_block(block_id)?;
-        let alive: Vec<_> = placements
+        let reachable: Vec<_> = placements
             .into_iter()
-            .filter(|p| p.status == syncback_core::types::PlacementStatus::Alive)
+            .filter(|p| matches!(
+                p.status,
+                syncback_core::types::PlacementStatus::Alive
+                    | syncback_core::types::PlacementStatus::Uncertain
+                    | syncback_core::types::PlacementStatus::PresumedLost
+            ))
             .collect();
 
-        if alive.is_empty() {
+        if reachable.is_empty() {
             return Err(RepairError::EncodeFailed(format!(
-                "no alive placements for block {block_id}; cannot fetch"
+                "no reachable placements for block {block_id}; cannot fetch"
             )));
         }
 
         tracing::info!(
             block_id = %block_id,
-            alive = alive.len(),
+            reachable = reachable.len(),
             k_eff,
             "repair: fetching symbols from holders to rebuild lost blob"
         );
@@ -816,7 +834,7 @@ impl RepairAgent {
             swarm,
             &self.encoder,
             block_id,
-            &alive,
+            &reachable,
             k_eff,
         )
         .await

@@ -35,6 +35,14 @@ pub const S_CLAMP_MAX: f64 = 1.0;
 /// Default K=7: store 1 GB for 7 days → earn 1 GB restore budget.
 pub const DEFAULT_ESCROW_K_FACTOR: f64 = 7.0;
 
+/// Days of storage contribution required to earn 1 GB of OFFER budget (backup credit).
+/// Formula: earned_offer_gb = Σ(gb_days × master_trust / MAX_COMBINED_TRUST) / K_OFFER.
+/// Smaller than restore-K (7) on purpose — we want self-awareness for fresh
+/// owners (a node holding for the network a few days can back up its first
+/// files), and offering cost is already inflated ×overhead_factor by the
+/// caller. Set to 5 (tunable). Sybil mitigation logged in tech-debt.
+pub const OFFER_EARN_K_FACTOR_DAYS: f64 = 5.0;
+
 // === Budget floor (owner-side) ===
 
 /// Owner-side budget floor: minimum GB offered even with zero committed storage.
@@ -114,9 +122,18 @@ pub const POS_VOLUME_DIVISOR: u32 = 1000;
 
 // === Wire format ===
 
-/// Max CBOR message frame size (128 MiB). Must accommodate SymbolTransfer batches (~26 MB)
-/// with margin. Matches MAX_MSG_SIZE in swarm.rs codec.
+/// Max CBOR message frame size (128 MiB). Matches MAX_MSG_SIZE in swarm.rs codec.
 pub const MAX_MESSAGE_SIZE: u32 = 128 * 1024 * 1024;
+
+/// Soft budget for the symbol-data payload of a single SymbolTransferMsg.
+/// Owners chunk larger deliveries into multiple transfers to stay below
+/// MAX_MESSAGE_SIZE. The budget is expressed against *raw* `symbol.data.len()`
+/// and is set conservatively (≈60% of MAX_MESSAGE_SIZE) to absorb CBOR
+/// per-symbol overhead in the worst case we saw in gamma runs: ≈2240 symbols
+/// × 65548 wire bytes ≈ 146 MiB wire from ≈140 MiB raw. Lowering from 100 MiB
+/// to 80 MiB fixes those borderline cases; see tech-debt for the proper
+/// wire-size accurate variant.
+pub const SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES: usize = 80 * 1024 * 1024;
 
 /// Protocol version for wire messages.
 pub const PROTOCOL_VERSION: u8 = 1;

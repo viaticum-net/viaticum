@@ -60,7 +60,7 @@ fn overhead_factor_midpoint() {
 #[test]
 fn estimate_budget_no_history() {
     let committed_bytes = gib(10);
-    let estimate = estimate_budget(committed_bytes, None);
+    let estimate = estimate_budget(committed_bytes, None, 0.0);
 
     assert!((estimate.placement_success_rate - DEFAULT_SUCCESS_RATE).abs() < 1e-9);
     let committed_gb = gib(10) as f64 / 1_073_741_824.0;
@@ -98,7 +98,7 @@ fn estimate_budget_with_stats() {
         placement_success_rate: 0.0,
         weekly_stats: vec![(10, 8), (10, 6)],
     };
-    let estimate = estimate_budget(committed_bytes, Some(&record));
+    let estimate = estimate_budget(committed_bytes, Some(&record), 0.0);
 
     // rate = (8+6)/(10+10) = 14/20 = 0.7
     let expected_rate = 14.0 / 20.0;
@@ -126,7 +126,7 @@ fn estimate_budget_with_stats() {
 #[test]
 fn bootstrap_allows_first_gb() {
     // committed=0 → raw total=0.0, but FREE_TIER floor raises it to 1.0
-    let estimate = estimate_budget(0, None);
+    let estimate = estimate_budget(0, None, 0.0);
     assert!(
         (estimate.total_gb - 1.0).abs() < 1e-9,
         "total_gb must be 1.0 (FREE_TIER_GB) when committed=0, got {}",
@@ -150,7 +150,7 @@ fn offer_budget_inflated_by_success_rate() {
     // headroom = 1.0 * 0.5 * 1.0 = 0.5
     // total = max(1.5, 1.0) = 1.5
     // offer = 1.5 / 0.5 = 3.0
-    let estimate = estimate_budget(gib(1), None);
+    let estimate = estimate_budget(gib(1), None, 0.0);
     assert!(
         (estimate.total_gb - 1.5).abs() < 1e-6,
         "total_gb expected 1.5, got {}",
@@ -174,7 +174,7 @@ fn offer_budget_capped_at_5x() {
         placement_success_rate: 0.0,
         weekly_stats: vec![(10, 1)],
     };
-    let estimate = estimate_budget(gib(1), Some(&record));
+    let estimate = estimate_budget(gib(1), Some(&record), 0.0);
     // sr = 1/10 = 0.1
     assert!(
         (estimate.placement_success_rate - 0.1).abs() < 1e-9,
@@ -670,4 +670,78 @@ fn should_reject_offers_with_effective_quota() {
     let effective = compute_effective_quota(gib(80), gib(50), gib(20));
     assert_eq!(effective, gib(30));
     assert!(should_reject_offers(effective, gib(26)));
+}
+
+// ─── earned_gb / compute_earned_offer_gb ────────────────────────────────────
+
+#[test]
+fn compute_earned_offer_gb_zero_when_no_contributions() {
+    let result = compute_earned_offer_gb(&[], |_| 1.0, 30.0);
+    assert_eq!(result, 0.0);
+}
+
+#[test]
+fn compute_earned_offer_gb_scales_with_gb_days_and_trust() {
+    use crate::constants::MAX_COMBINED_TRUST;
+    use crate::types::IdentityPub;
+
+    let peer = IdentityPub([1u8; 32]);
+    // 300 gb_days × trust=MAX → weight=1 → 300 / 30 = 10 GB earned.
+    let earned = compute_earned_offer_gb(
+        &[(peer, 300.0)],
+        |_| MAX_COMBINED_TRUST,
+        30.0,
+    );
+    assert!((earned - 10.0).abs() < 1e-6, "got {earned}");
+}
+
+#[test]
+fn compute_earned_offer_gb_trust_weights_untrusted_low() {
+    use crate::constants::MAX_COMBINED_TRUST;
+    use crate::types::IdentityPub;
+
+    let peer = IdentityPub([2u8; 32]);
+    // Untrusted peer (0.1 out of 2.15) → weight ≈ 0.0465 → earned ≈ 0.465 / 30
+    let earned = compute_earned_offer_gb(
+        &[(peer, 300.0)],
+        |_| 0.1,
+        30.0,
+    );
+    let expected = 300.0 * (0.1 / MAX_COMBINED_TRUST) / 30.0;
+    assert!((earned - expected).abs() < 1e-6, "got {earned} vs {expected}");
+}
+
+#[test]
+fn compute_earned_offer_gb_sums_across_peers() {
+    use crate::constants::MAX_COMBINED_TRUST;
+    use crate::types::IdentityPub;
+
+    let a = IdentityPub([1u8; 32]);
+    let b = IdentityPub([2u8; 32]);
+    let earned = compute_earned_offer_gb(
+        &[(a, 100.0), (b, 200.0)],
+        |_| MAX_COMBINED_TRUST,
+        30.0,
+    );
+    assert!((earned - (300.0 / 30.0)).abs() < 1e-6);
+}
+
+#[test]
+fn earned_gb_raises_total_and_offer_budget() {
+    // Fresh owner with zero committed and zero history but 6 GB of earned credit.
+    let estimate = estimate_budget(0, None, 6.0);
+    assert_eq!(estimate.committed_gb, 0.0);
+    assert_eq!(estimate.headroom_gb, 0.0);
+    assert_eq!(estimate.earned_gb, 6.0);
+    // total_gb = max(0 + 0 + 6, FREE_TIER=1.0) = 6.0
+    assert!((estimate.total_gb - 6.0).abs() < 1e-9);
+    // offer_budget = 6.0 / 0.5 = 12.0 (default success rate)
+    assert!((estimate.offer_budget_gb - 12.0).abs() < 1e-9);
+}
+
+#[test]
+fn earned_gb_negative_input_treated_as_zero() {
+    let estimate = estimate_budget(0, None, -5.0);
+    assert_eq!(estimate.earned_gb, 0.0);
+    assert!((estimate.total_gb - FREE_TIER_GB).abs() < 1e-9);
 }
