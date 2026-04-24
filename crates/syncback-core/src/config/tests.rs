@@ -561,3 +561,41 @@ path = "/home/user/videos"
     assert_eq!(app.watch.len(), 1);
     assert_eq!(app.watch[0].importance, DEFAULT_IMPORTANCE);
 }
+
+#[test]
+fn webapi_cfg_default_bind_is_loopback_random_port() {
+    let cfg = WebApiCfg::default();
+    assert_eq!(cfg.bind, "127.0.0.1:0");
+}
+
+#[test]
+fn webapi_cfg_rejects_empty_bind_when_enabled() {
+    let mut cfg = AppConfig::default();
+    cfg.web_api.enabled = true;
+    cfg.web_api.bind = String::new();
+    assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn webapi_cfg_accepts_loopback_random() {
+    let mut cfg = AppConfig::default();
+    cfg.web_api.enabled = true;
+    cfg.web_api.bind = "127.0.0.1:0".into();
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn webapi_cfg_accepts_all_interfaces_fixed_port() {
+    let mut cfg = AppConfig::default();
+    cfg.web_api.enabled = true;
+    cfg.web_api.bind = "0.0.0.0:8080".into();
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn webapi_cfg_rejects_invalid_socket_addr() {
+    let mut cfg = AppConfig::default();
+    cfg.web_api.enabled = true;
+    cfg.web_api.bind = "not-a-socket".into();
+    assert!(cfg.validate().is_err());
+}

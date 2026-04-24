@@ -24,7 +24,7 @@ use syncback_core::config::DEFAULT_IMPORTANCE;
 
 /// Configuration for the web API server.
 pub struct WebApiConfig {
-    pub port: u16,
+    pub bind: String,
     pub static_dir: Option<PathBuf>,
 }
 
@@ -75,8 +75,9 @@ pub async fn start(
         }
     }
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port)).await?;
-    tracing::info!(port = config.port, "web API server started");
+    let listener = tokio::net::TcpListener::bind(&config.bind).await?;
+    let actual = listener.local_addr()?;
+    tracing::info!(bind = %actual, "web API server started");
 
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)

@@ -489,7 +489,7 @@ impl DaemonHandle {
                 Some(if p.is_absolute() { p } else { cfg.data_dir.join(p) })
             };
             let web_config = crate::daemon::web_api::WebApiConfig {
-                port: app_config.web_api.port,
+                bind: app_config.web_api.bind.clone(),
                 static_dir,
             };
             let web_handle = crate::daemon::web_api::start(

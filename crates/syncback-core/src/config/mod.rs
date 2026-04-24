@@ -258,10 +258,12 @@ impl Default for MetricsCfg {
 pub struct WebApiCfg {
     /// Enable the web API server.
     pub enabled: bool,
-    /// TCP port to bind.
-    pub port: u16,
+    /// Bind address. Format: "<host>:<port>".
+    /// Default: "127.0.0.1:0" (loopback, OS-chosen port — read from api-port file).
+    /// For LAN/NAS access: "0.0.0.0:8080".
+    pub bind: String,
     /// Directory containing the built SPA (index.html + assets).
-    /// Relative to data_dir if not absolute. Empty = no static file serving.
+    /// Relative to data_dir if not absolute. Empty = embedded assets (rust-embed).
     pub static_dir: String,
 }
 
@@ -269,7 +271,7 @@ impl Default for WebApiCfg {
     fn default() -> Self {
         Self {
             enabled: false,
-            port: 8384,
+            bind: "127.0.0.1:0".to_string(),
             static_dir: String::new(),
         }
     }
@@ -417,11 +419,20 @@ impl AppConfig {
             }
         }
 
-        if self.web_api.enabled && self.web_api.port == 0 {
-            return Err(ConfigError::Validation {
-                field: "web_api.port".to_string(),
-                reason: "port must be > 0 when web_api is enabled".to_string(),
-            });
+        if self.web_api.enabled {
+            if self.web_api.bind.is_empty() {
+                return Err(ConfigError::Validation {
+                    field: "web_api.bind".to_string(),
+                    reason: "bind must be non-empty when web_api is enabled".to_string(),
+                });
+            }
+            self.web_api
+                .bind
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| ConfigError::Validation {
+                    field: "web_api.bind".to_string(),
+                    reason: format!("invalid socket address: {e}"),
+                })?;
         }
 
         if self.metrics.enabled && self.metrics.push_url.is_empty() {
