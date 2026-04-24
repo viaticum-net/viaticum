@@ -1,5 +1,7 @@
 // Web API: axum JSON server wrapping the existing dispatch() handlers.
 
+mod embedded;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -63,7 +65,8 @@ pub async fn start(
         .route("/api/browse", axum::routing::get(handle_browse))
         .with_state(state);
 
-    // Serve static files (SPA) if configured.
+    // Serve static files (SPA) if configured and directory exists;
+    // else fall back to embedded assets (single-binary distribution).
     if let Some(ref dir) = config.static_dir {
         if dir.exists() {
             use tower_http::services::{ServeDir, ServeFile};
@@ -71,8 +74,14 @@ pub async fn start(
             let serve = ServeDir::new(dir).fallback(ServeFile::new(index));
             app = app.fallback_service(serve);
         } else {
-            tracing::warn!(path = %dir.display(), "web_api static_dir does not exist, skipping static file serving");
+            tracing::warn!(
+                path = %dir.display(),
+                "static_dir does not exist, falling back to embedded assets"
+            );
+            app = app.fallback(embedded::handle_embedded);
         }
+    } else {
+        app = app.fallback(embedded::handle_embedded);
     }
 
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
