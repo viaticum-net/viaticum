@@ -197,8 +197,11 @@ pub struct VersionEntry {
 /// Errors from CLI operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
-    #[error("daemon not running (socket not found at {path})")]
-    DaemonNotRunning { path: String },
+    #[error("daemon not reachable: {reason}")]
+    DaemonNotReachable { reason: String },
+
+    #[error("daemon refused auth — token mismatch")]
+    Unauthorized,
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

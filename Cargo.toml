@@ -68,7 +68,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 rand = "0.8"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # BIP39 mnemonic
 bip39 = "2"

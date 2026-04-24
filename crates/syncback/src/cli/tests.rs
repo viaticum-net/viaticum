@@ -202,7 +202,7 @@ fn run_command_fails_when_daemon_not_running() {
     let cmd = Command::Status { json: false };
     let err =
         super::run_command(&cmd, "/tmp/syncback_test_nonexistent_9999.sock").unwrap_err();
-    assert!(matches!(err, CliError::DaemonNotRunning { .. }));
+    assert!(matches!(err, CliError::DaemonNotReachable { .. }));
 }
 
 // ============================================================
@@ -647,6 +647,52 @@ fn expand_data_dir_absolute_path_passthrough() {
 fn expand_data_dir_relative_path_passthrough() {
     let p = super::expand_data_dir(Some("./local-data"));
     assert_eq!(p, std::path::PathBuf::from("./local-data"));
+}
+
+// ============================================================
+// resolve_connection tests
+// ============================================================
+
+#[test]
+fn resolve_connection_returns_explicit_when_both_provided() {
+    let conn = super::resolve_connection(
+        Some("http://remote:8080".to_string()),
+        Some("tok123".to_string()),
+        std::path::Path::new("/nonexistent"),
+    )
+    .unwrap();
+    assert_eq!(conn.url, "http://remote:8080");
+    assert_eq!(conn.token, "tok123");
+}
+
+#[test]
+fn resolve_connection_errors_when_only_server_provided() {
+    let err = super::resolve_connection(
+        Some("http://remote:8080".to_string()),
+        None,
+        std::path::Path::new("/nonexistent"),
+    );
+    assert!(err.is_err());
+}
+
+#[test]
+fn resolve_connection_errors_when_only_token_provided() {
+    let err = super::resolve_connection(
+        None,
+        Some("tok123".to_string()),
+        std::path::Path::new("/nonexistent"),
+    );
+    assert!(err.is_err());
+}
+
+#[test]
+fn resolve_connection_reads_port_and_token_from_data_dir_when_neither_provided() {
+    let tmp = tempfile::tempdir().unwrap();
+    crate::daemon::web_auth::load_or_create_token(tmp.path()).unwrap();
+    crate::daemon::web_auth::write_port_file(tmp.path(), 12345).unwrap();
+    let conn = super::resolve_connection(None, None, tmp.path()).unwrap();
+    assert_eq!(conn.url, "http://127.0.0.1:12345");
+    assert!(!conn.token.is_empty());
 }
 
 // ============================================================

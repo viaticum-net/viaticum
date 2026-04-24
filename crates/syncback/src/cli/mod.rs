@@ -68,8 +68,59 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub data_dir: Option<String>,
 
+    /// Connect to a remote daemon URL (e.g. http://nas.local:8080).
+    /// Must be combined with --token. Env: SYNCBACK_SERVER.
+    #[arg(long, global = true, env = "SYNCBACK_SERVER")]
+    pub server: Option<String>,
+
+    /// Bearer token for remote daemon auth. Env: SYNCBACK_TOKEN.
+    #[arg(long, global = true, env = "SYNCBACK_TOKEN")]
+    pub token: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// A resolved HTTP connection to a syncback daemon.
+#[derive(Debug, Clone)]
+pub struct Connection {
+    pub url: String,
+    pub token: String,
+}
+
+/// Resolve how to reach the daemon:
+/// - both `server` and `token` provided → remote mode
+/// - neither provided → local mode: read port + token from `data_dir`
+/// - only one provided → error (ambiguous)
+pub fn resolve_connection(
+    server: Option<String>,
+    token: Option<String>,
+    data_dir: &std::path::Path,
+) -> Result<Connection, CliError> {
+    match (server, token) {
+        (Some(url), Some(tok)) => Ok(Connection { url, token: tok }),
+        (Some(_), None) => Err(CliError::InvalidArgument(
+            "--server requires --token (or SYNCBACK_TOKEN)".into(),
+        )),
+        (None, Some(_)) => Err(CliError::InvalidArgument(
+            "--token without --server is not supported; omit both for local mode".into(),
+        )),
+        (None, None) => {
+            let (port, token) = crate::daemon::web_auth::read_port_and_token(data_dir).map_err(
+                |e| CliError::DaemonNotReachable {
+                    reason: format!(
+                        "cannot read {}/api-port or api-token: {}",
+                        data_dir.display(),
+                        e
+                    ),
+                },
+            )?;
+            Ok(Connection {
+                url: format!("http://127.0.0.1:{port}"),
+                token,
+            })
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -299,8 +350,8 @@ fn send_request(socket_path: &str, request: &CliRequest) -> Result<CliResponse, 
         if e.kind() == std::io::ErrorKind::NotFound
             || e.kind() == std::io::ErrorKind::ConnectionRefused
         {
-            CliError::DaemonNotRunning {
-                path: socket_path.to_string(),
+            CliError::DaemonNotReachable {
+                reason: format!("socket not found at {socket_path}"),
             }
         } else {
             CliError::Io(e)
