@@ -84,7 +84,7 @@ ignore = "0.4"
 libc = "0.2"
 
 # HTTP client (metrics push)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
 
 # HTTP server (web API)
 axum = "0.8"

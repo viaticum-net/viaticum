@@ -37,16 +37,8 @@ async fn daemon_starts_and_stops_cleanly() {
     // Provision identity so load_identity() succeeds.
     init_identity(&data_dir).expect("init_identity");
 
-    // Pick a unique socket path inside the temp dir to avoid collisions.
-    let socket_path = data_dir
-        .join("daemon_test.sock")
-        .to_str()
-        .expect("valid utf-8 path")
-        .to_string();
-
     let cfg = DaemonConfig {
         data_dir: data_dir.clone(),
-        socket_path,
         time_scale: 1,
         watch_dirs: vec![],
     };
@@ -98,15 +90,8 @@ async fn daemon_start_fails_without_identity() {
     let data_dir = dir.path().to_path_buf();
     // Deliberately skip init_identity.
 
-    let socket_path = data_dir
-        .join("daemon_test2.sock")
-        .to_str()
-        .expect("valid utf-8 path")
-        .to_string();
-
     let cfg = DaemonConfig {
         data_dir: data_dir.clone(),
-        socket_path,
         time_scale: 1,
         watch_dirs: vec![],
     };

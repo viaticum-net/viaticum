@@ -143,11 +143,16 @@ fn command_device_revoke() {
 }
 
 // ============================================================
-// run_command validation tests (no socket needed)
+// run_command validation tests (daemon not reachable — validation happens first)
 // ============================================================
 
 fn run(cmd: &Command) -> Result<(), CliError> {
-    super::run_command(cmd, "/tmp/syncback_test_nonexistent_9999.sock")
+    // 127.0.0.1:1 is effectively unreachable (port 1 reserved, no listener)
+    let conn = super::Connection {
+        url: "http://127.0.0.1:1".into(),
+        token: "irrelevant".into(),
+    };
+    super::run_command(cmd, &conn)
 }
 
 #[test]
@@ -198,10 +203,9 @@ fn run_command_device_revoke_rejects_non_hex() {
 }
 
 #[test]
-fn run_command_fails_when_daemon_not_running() {
+fn run_command_fails_when_daemon_not_reachable() {
     let cmd = Command::Status { json: false };
-    let err =
-        super::run_command(&cmd, "/tmp/syncback_test_nonexistent_9999.sock").unwrap_err();
+    let err = run(&cmd).unwrap_err();
     assert!(matches!(err, CliError::DaemonNotReachable { .. }));
 }
 
@@ -695,30 +699,6 @@ fn resolve_connection_reads_port_and_token_from_data_dir_when_neither_provided()
     assert!(!conn.token.is_empty());
 }
 
-// ============================================================
-// expand_socket_path tests
-// ============================================================
-
-#[test]
-fn expand_socket_path_expands_tilde_with_home_set() {
-    // SAFETY: single-threaded test; no other threads read HOME concurrently.
-    unsafe { std::env::set_var("HOME", "/home/testuser") };
-    let result = super::expand_socket_path("~/.syncback/syncback.sock");
-    assert_eq!(result, "/home/testuser/.syncback/syncback.sock");
-}
-
-#[test]
-fn expand_socket_path_leaves_absolute_path_unchanged() {
-    let result = super::expand_socket_path("/run/syncback.sock");
-    assert_eq!(result, "/run/syncback.sock");
-}
-
-#[test]
-fn expand_socket_path_tilde_only_not_expanded_as_dir() {
-    // "~" alone (no slash) is returned as-is
-    let result = super::expand_socket_path("~");
-    assert_eq!(result, "~");
-}
 
 // ============================================================
 // CBOR roundtrip tests

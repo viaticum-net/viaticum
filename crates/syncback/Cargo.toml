@@ -41,6 +41,7 @@ arc-swap = "1"
 base64 = "0.22"
 sysinfo = { version = "0.32", default-features = false, features = ["disk"] }
 dirs = "5"
+urlencoding = "2"
 rust-embed = { version = "8", features = ["mime-guess"] }
 mime_guess = "2"
 

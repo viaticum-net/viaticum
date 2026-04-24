@@ -24,7 +24,6 @@ use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
 use syncback_core::types::{hex_encode, DeviceId, IdentityPub, Timestamp};
 
 use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent};
-use crate::daemon::cli_server::{self, CliServerConfig};
 use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
 use crate::daemon::identity::{derive_keys, load_identity, IdentityError};
 use crate::daemon::processor::Processor;
@@ -40,8 +39,6 @@ use crate::daemon::watcher::{WatcherCommand, WatcherConfig};
 pub struct DaemonConfig {
     /// Directory holding identity.key, config.toml, db.redb, symbols/, relay.board.
     pub data_dir: PathBuf,
-    /// Expanded (tilde-resolved) Unix socket path.
-    pub socket_path: String,
     /// Time acceleration factor. 1 = real time; 604800 = 1 second equals 1 week.
     /// Used to scale periodic intervals in tests and demos.
     pub time_scale: u64,
@@ -421,12 +418,7 @@ impl DaemonHandle {
             None
         };
 
-        // ── 13. Start CLI server ──────────────────────────────────────────────
-        let cli_config = CliServerConfig {
-            socket_path: cfg.socket_path.clone(),
-        };
-        // The returned handle is a JoinHandle<()>; wrap it so it fits our Vec.
-        let cli_handle = cli_server::start(cli_config, cancel.clone(), state.clone()).await?;
+        // ── 13. (removed) Unix socket CLI server — CLI now speaks HTTP ───────
 
         // ── 14. Compute scan interval (scaled by time_scale) ──────────────────
         let time_scale = cfg.time_scale.max(1);
@@ -452,12 +444,6 @@ impl DaemonHandle {
             board_sync_interval,
             swarm_for_relay,
         )));
-
-        // Wrap the cli server JoinHandle<()> into JoinHandle<anyhow::Result<()>>.
-        tasks.push(tokio::spawn(async move {
-            cli_handle.await.map_err(|e| anyhow::anyhow!("cli_server task panicked: {e}"))?;
-            Ok(())
-        }));
 
         // ── Step E.5: Background rollup refresh task (every 5 min) ────────────
         if let Some(admin) = state.watch_admin.as_ref() {

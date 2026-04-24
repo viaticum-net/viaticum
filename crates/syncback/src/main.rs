@@ -15,7 +15,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let global_dir = syncback::cli::expand_data_dir(cli.data_dir.as_deref());
-    let global_socket = global_dir.join("syncback.sock").to_string_lossy().to_string();
 
     match &cli.command {
         Command::Daemon {
@@ -38,7 +37,6 @@ async fn main() -> anyhow::Result<()> {
 
             let cfg = DaemonConfig {
                 data_dir: global_dir.clone(),
-                socket_path: global_socket.clone(),
                 time_scale: *time_scale,
                 watch_dirs: watch_dir.clone(),
             };
@@ -92,7 +90,18 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         other => {
-            if let Err(e) = syncback::cli::run_command(other, &global_socket) {
+            let connection = match syncback::cli::resolve_connection(
+                cli.server.clone(),
+                cli.token.clone(),
+                &global_dir,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = syncback::cli::run_command(other, &connection) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }

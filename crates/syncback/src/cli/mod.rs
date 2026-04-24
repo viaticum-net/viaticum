@@ -5,19 +5,9 @@ pub mod types;
 mod tests;
 
 use clap::{Parser, Subcommand};
-use std::io::{Read, Write};
 
 pub use types::CliError;
-use types::{CliRequest, CliResponse};
-
-/// Default Unix socket path used by daemon and CLI.
-pub const DEFAULT_SOCKET_PATH: &str = "~/.syncback/syncback.sock";
-
-/// Expand `~` in socket path to the home directory.
-/// Returns the raw path unchanged if `HOME` is not set.
-pub fn expand_socket_path(path: &str) -> String {
-    expand_tilde(path)
-}
+use types::CliResponse;
 
 /// Resolve the data directory path.
 /// - `None` → platform-native `dirs::data_dir()/syncback`.
@@ -38,16 +28,6 @@ fn platform_default_data_dir() -> std::path::PathBuf {
     dirs::data_dir()
         .expect("could not determine platform data directory (HOME/APPDATA unset?)")
         .join("syncback")
-}
-
-/// Expand a leading `~/` to `$HOME/`. Returns `path` unchanged if HOME is unset.
-fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
-    }
-    path.to_string()
 }
 
 // ============================================================
@@ -212,6 +192,16 @@ pub enum Command {
         #[arg(long)]
         data_dir: Option<String>,
     },
+
+    /// Open the web UI in the default browser
+    Open,
+
+    /// Print the auth token (or a ready-to-use /auth/start URL with --url)
+    Token {
+        /// Print the full /auth/start URL instead of just the token.
+        #[arg(long)]
+        url: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -233,27 +223,71 @@ pub enum DeviceAction {
 }
 
 // ============================================================
-// Dispatch
+// Dispatch (HTTP)
 // ============================================================
 
-/// Parse `CliRequest` from `Command` args, send to daemon, receive `CliResponse`,
+/// Send the command over HTTP to the daemon, receive `CliResponse`,
 /// format and print to stdout.
-///
-/// `socket_path` is the expanded (tilde-resolved) path to the Unix socket.
-pub fn run_command(cmd: &Command, socket_path: &str) -> Result<(), CliError> {
-    let request = build_request(cmd)?;
-    let response = send_request(socket_path, &request)?;
+pub fn run_command(cmd: &Command, connection: &Connection) -> Result<(), CliError> {
+    let response = send_command_http(connection, cmd)?;
     let json_output = matches!(cmd, Command::Status { json: true });
     handle_response(response, json_output);
     Ok(())
 }
 
-/// Build a `CliRequest` from parsed CLI command, applying validation.
-fn build_request(cmd: &Command) -> Result<CliRequest, CliError> {
+fn send_command_http(conn: &Connection, cmd: &Command) -> Result<CliResponse, CliError> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| CliError::Io(std::io::Error::other(e.to_string())))?;
+
+    let (method, path, body) = command_to_http(cmd)?;
+    let url = format!("{}{}", conn.url.trim_end_matches('/'), path);
+    let mut req = client.request(method, &url).bearer_auth(&conn.token);
+    if let Some(b) = body {
+        req = req.header("content-type", "application/json").body(b);
+    }
+
+    let resp = req.send().map_err(|e| CliError::DaemonNotReachable {
+        reason: format!("HTTP request failed: {e}"),
+    })?;
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(CliError::Unauthorized);
+    }
+    let status = resp.status();
+    if status == reqwest::StatusCode::NO_CONTENT {
+        // Used by DELETE /api/devices/{id}; synthesize a response so the handler can format it.
+        if let Command::Device {
+            action: DeviceAction::Revoke { device_id },
+        } = cmd
+        {
+            return Ok(CliResponse::DeviceRevoked {
+                device_id_hex: device_id.clone(),
+            });
+        }
+        return Err(CliError::Decode("unexpected 204 from daemon".into()));
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(CliError::DaemonError(format!("HTTP {status}: {body}")));
+    }
+
+    // Endpoint shapes: the web API returns raw typed bodies (StatusData, Vec<FileEntry>, etc.)
+    // rather than a tagged CliResponse. Decode based on the command.
+    response_from_http(cmd, resp)
+}
+
+fn command_to_http(cmd: &Command) -> Result<(reqwest::Method, String, Option<String>), CliError> {
+    use reqwest::Method;
     match cmd {
-        Command::Daemon { .. } => unreachable!("Daemon command handled before run_command"),
-        Command::Init { .. } => unreachable!("Init command handled before run_command"),
-        Command::Status { .. } => Ok(CliRequest::Status),
+        Command::Daemon { .. } | Command::Init { .. } | Command::Dr { .. } => {
+            unreachable!("local-only command routed to HTTP dispatch")
+        }
+        Command::Open | Command::Token { .. } => {
+            unreachable!("Open/Token handled locally in main.rs before run_command")
+        }
+        Command::Status { .. } => Ok((Method::GET, "/api/status".into(), None)),
         Command::Restore {
             path,
             version,
@@ -267,36 +301,107 @@ fn build_request(cmd: &Command) -> Result<CliRequest, CliError> {
             }
             if let Some(v) = *version {
                 if v == 0 {
-                    return Err(CliError::InvalidArgument(
-                        "--version must be >= 1".into(),
-                    ));
+                    return Err(CliError::InvalidArgument("--version must be >= 1".into()));
                 }
             }
-            Ok(CliRequest::Restore {
-                path: path.clone(),
-                version: *version,
-                date: date.clone(),
-                dest: dest.clone(),
-            })
+            let body = serde_json::json!({
+                "path": path,
+                "version": version,
+                "date": date,
+                "dest": dest,
+            });
+            Ok((Method::POST, "/api/restore".into(), Some(body.to_string())))
         }
         Command::Device { action } => match action {
-            DeviceAction::List => Ok(CliRequest::DeviceList),
-            DeviceAction::Add { label } => Ok(CliRequest::DeviceAdd {
-                label: label.clone(),
-            }),
+            DeviceAction::List => Ok((Method::GET, "/api/devices".into(), None)),
+            DeviceAction::Add { label } => {
+                let body = serde_json::json!({ "label": label });
+                Ok((Method::POST, "/api/devices".into(), Some(body.to_string())))
+            }
             DeviceAction::Revoke { device_id } => {
                 validate_device_id_hex(device_id)?;
-                Ok(CliRequest::DeviceRevoke {
-                    device_id_hex: device_id.clone(),
-                })
+                Ok((
+                    Method::DELETE,
+                    format!("/api/devices/{}", device_id),
+                    None,
+                ))
             }
         },
-        Command::Files { path_prefix } => Ok(CliRequest::Files {
-            path_prefix: path_prefix.clone(),
-        }),
-        Command::Versions { path } => Ok(CliRequest::Versions { path: path.clone() }),
-        Command::Connect { addr } => Ok(CliRequest::Connect { addr: addr.clone() }),
-        Command::Dr { .. } => unreachable!("Dr command handled before run_command"),
+        Command::Files { path_prefix } => {
+            let q = path_prefix
+                .as_ref()
+                .map(|p| format!("?prefix={}", urlencoding::encode(p)))
+                .unwrap_or_default();
+            Ok((Method::GET, format!("/api/files{q}"), None))
+        }
+        Command::Versions { path } => Ok((
+            Method::GET,
+            format!("/api/versions?path={}", urlencoding::encode(path)),
+            None,
+        )),
+        Command::Connect { addr } => {
+            let body = serde_json::json!({ "addr": addr });
+            Ok((Method::POST, "/api/connect".into(), Some(body.to_string())))
+        }
+    }
+}
+
+/// Decode the HTTP body into the `CliResponse` variant matching `cmd`.
+/// Endpoints return typed JSON (StatusData, Vec<FileEntry>, DeviceEntry, ...) —
+/// not a tagged CliResponse — so we rehydrate here based on the command.
+fn response_from_http(cmd: &Command, resp: reqwest::blocking::Response) -> Result<CliResponse, CliError> {
+    use crate::cli::types::{DeviceEntry, FileEntry, RestoreData, StatusData, VersionEntry};
+
+    match cmd {
+        Command::Status { .. } => {
+            let data: StatusData = resp.json().map_err(|e| CliError::Decode(e.to_string()))?;
+            Ok(CliResponse::Status(data))
+        }
+        Command::Restore { .. } => {
+            let data: RestoreData = resp.json().map_err(|e| CliError::Decode(e.to_string()))?;
+            Ok(CliResponse::Restore(data))
+        }
+        Command::Files { .. } => {
+            let data: Vec<FileEntry> = resp.json().map_err(|e| CliError::Decode(e.to_string()))?;
+            Ok(CliResponse::Files(data))
+        }
+        Command::Versions { .. } => {
+            let data: Vec<VersionEntry> = resp.json().map_err(|e| CliError::Decode(e.to_string()))?;
+            Ok(CliResponse::Versions(data))
+        }
+        Command::Device { action } => match action {
+            DeviceAction::List => {
+                let data: Vec<DeviceEntry> =
+                    resp.json().map_err(|e| CliError::Decode(e.to_string()))?;
+                Ok(CliResponse::DeviceList(data))
+            }
+            DeviceAction::Add { .. } => {
+                let data: DeviceEntry = resp.json().map_err(|e| CliError::Decode(e.to_string()))?;
+                Ok(CliResponse::DeviceAdded(data))
+            }
+            DeviceAction::Revoke { .. } => {
+                // 204 path already handled in send_command_http
+                let data: serde_json::Value =
+                    resp.json().unwrap_or(serde_json::Value::Null);
+                let device_id_hex = data
+                    .get("device_id_hex")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                Ok(CliResponse::DeviceRevoked { device_id_hex })
+            }
+        },
+        Command::Connect { .. } => {
+            let data: serde_json::Value =
+                resp.json().map_err(|e| CliError::Decode(e.to_string()))?;
+            let peer_id = data
+                .get("peer_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Ok(CliResponse::Connected { peer_id })
+        }
+        _ => unreachable!("local-only command in response_from_http"),
     }
 }
 
@@ -337,49 +442,3 @@ fn handle_response(response: CliResponse, json_output: bool) {
     }
 }
 
-// ============================================================
-// Socket I/O (blocking, std — CLI runs sync)
-// ============================================================
-
-/// Connect to daemon socket, send request, receive response.
-/// Wire format: u32 BE length prefix || CBOR payload.
-fn send_request(socket_path: &str, request: &CliRequest) -> Result<CliResponse, CliError> {
-    use std::os::unix::net::UnixStream;
-
-    let stream = UnixStream::connect(socket_path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound
-            || e.kind() == std::io::ErrorKind::ConnectionRefused
-        {
-            CliError::DaemonNotReachable {
-                reason: format!("socket not found at {socket_path}"),
-            }
-        } else {
-            CliError::Io(e)
-        }
-    })?;
-
-    write_framed(&stream, request)?;
-    let response: CliResponse = read_framed(&stream)?;
-    Ok(response)
-}
-
-/// Write a CBOR-encoded value with u32 BE length prefix.
-fn write_framed<W: Write, T: serde::Serialize>(mut writer: W, value: &T) -> Result<(), CliError> {
-    let mut buf = Vec::new();
-    ciborium::ser::into_writer(value, &mut buf)
-        .map_err(|e| CliError::Encode(e.to_string()))?;
-    let len = buf.len() as u32;
-    writer.write_all(&len.to_be_bytes())?;
-    writer.write_all(&buf)?;
-    Ok(())
-}
-
-/// Read a CBOR-encoded value preceded by a u32 BE length prefix.
-fn read_framed<R: Read, T: serde::de::DeserializeOwned>(mut reader: R) -> Result<T, CliError> {
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload)?;
-    ciborium::de::from_reader(payload.as_slice()).map_err(|e| CliError::Decode(e.to_string()))
-}
