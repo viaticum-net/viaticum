@@ -3,9 +3,13 @@ use syncback::cli::{Cli, Command};
 use syncback::daemon::handle::{DaemonConfig, DaemonHandle};
 use syncback_core::types::hex_encode;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_os = "linux"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
