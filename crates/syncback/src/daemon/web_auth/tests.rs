@@ -65,3 +65,140 @@ fn write_port_file_sets_mode_0600_on_unix() {
     let mode = meta.permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
 }
+
+// ── Auth middleware + /auth/start ────────────────────────────────────────────
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::Router;
+use tower::ServiceExt;
+
+fn test_router(token: String) -> Router {
+    let auth = AuthState::new(token);
+    Router::new()
+        .route("/api/echo", axum::routing::get(|| async { "ok" }))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            require_auth,
+        ))
+        .with_state(auth)
+}
+
+#[tokio::test]
+async fn auth_middleware_rejects_missing_token() {
+    let app = test_router("secret".to_string());
+    let resp = app
+        .oneshot(Request::builder().uri("/api/echo").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn auth_middleware_rejects_wrong_bearer() {
+    let app = test_router("secret".to_string());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/echo")
+                .header("Authorization", "Bearer nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn auth_middleware_accepts_valid_bearer() {
+    let app = test_router("secret".to_string());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/echo")
+                .header("Authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_middleware_accepts_valid_session_cookie() {
+    let app = test_router("secret".to_string());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/echo")
+                .header("Cookie", "syncback_session=secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_middleware_rejects_wrong_cookie() {
+    let app = test_router("secret".to_string());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/echo")
+                .header("Cookie", "syncback_session=nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn auth_start_sets_cookie_and_redirects() {
+    let auth = AuthState::new("secret".to_string());
+    let app = Router::new()
+        .route("/auth/start", axum::routing::get(auth_start_handler))
+        .with_state(auth);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/auth/start?token=secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap();
+    assert!(set_cookie.contains("syncback_session=secret"));
+    assert!(set_cookie.contains("HttpOnly"));
+    assert!(set_cookie.contains("SameSite=Strict"));
+    assert_eq!(resp.headers().get("location").unwrap(), "/");
+}
+
+#[tokio::test]
+async fn auth_start_rejects_wrong_token() {
+    let auth = AuthState::new("secret".to_string());
+    let app = Router::new()
+        .route("/auth/start", axum::routing::get(auth_start_handler))
+        .with_state(auth);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/auth/start?token=nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

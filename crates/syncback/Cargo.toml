@@ -53,3 +53,4 @@ mimalloc = { version = "0.1", default-features = false }
 [dev-dependencies]
 syncback-core = { workspace = true, features = ["testutil"] }
 tempfile = { workspace = true }
+tower = "0.5"

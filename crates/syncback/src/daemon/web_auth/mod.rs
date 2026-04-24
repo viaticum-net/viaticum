@@ -7,6 +7,10 @@
 use std::io::Write;
 use std::path::Path;
 
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Redirect, Response};
 use rand::RngCore;
 
 #[cfg(test)]
@@ -52,6 +56,102 @@ pub fn read_port_and_token(data_dir: &Path) -> std::io::Result<(u16, String)> {
         .to_string();
     Ok((port, token))
 }
+
+// ── Auth middleware ──────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct AuthState {
+    token: std::sync::Arc<String>,
+}
+
+impl AuthState {
+    pub fn new(token: String) -> Self {
+        Self {
+            token: std::sync::Arc::new(token),
+        }
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Constant-time comparison of candidate vs stored token.
+    pub fn verify(&self, candidate: &str) -> bool {
+        constant_time_eq(candidate.as_bytes(), self.token.as_bytes())
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+pub async fn require_auth(
+    State(auth): State<AuthState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if is_authenticated(&auth, req.headers()) {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+fn is_authenticated(auth: &AuthState, headers: &HeaderMap) -> bool {
+    if let Some(h) = headers.get("Authorization").and_then(|v| v.to_str().ok()) {
+        if let Some(tok) = h.strip_prefix("Bearer ") {
+            if auth.verify(tok) {
+                return true;
+            }
+        }
+    }
+    if let Some(cookies) = headers.get("Cookie").and_then(|v| v.to_str().ok()) {
+        let prefix = format!("{SESSION_COOKIE_NAME}=");
+        for part in cookies.split(';') {
+            let part = part.trim();
+            if let Some(tok) = part.strip_prefix(&prefix) {
+                if auth.verify(tok) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[derive(serde::Deserialize)]
+pub struct AuthStartParams {
+    pub token: String,
+}
+
+/// GET /auth/start?token=<tok>
+/// Verifies the token, sets a session cookie, and 302-redirects to `/`.
+pub async fn auth_start_handler(
+    State(auth): State<AuthState>,
+    Query(params): Query<AuthStartParams>,
+) -> Result<Response, StatusCode> {
+    if !auth.verify(&params.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let cookie = format!(
+        "{}={}; Path=/; HttpOnly; SameSite=Strict",
+        SESSION_COOKIE_NAME, params.token
+    );
+    let mut response = Redirect::to("/").into_response();
+    response
+        .headers_mut()
+        .insert("set-cookie", cookie.parse().unwrap());
+    Ok(response)
+}
+
+// ── File I/O helpers ─────────────────────────────────────────────────────────
 
 /// Write `contents` to `path` with mode 0600 on unix. Creates parent dir.
 fn write_secure(path: &Path, contents: &[u8]) -> std::io::Result<()> {
