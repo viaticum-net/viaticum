@@ -20,6 +20,7 @@ use crate::daemon::watch_admin::{
     AddWatchRequest, DeleteWatchQuery, PatchWatchRequest, WatchAdminError, WatchDefaults,
     WatchEntry,
 };
+use crate::daemon::web_auth::{auth_start_handler, require_auth, AuthState};
 use syncback_core::config::DEFAULT_IMPORTANCE;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -35,8 +36,23 @@ pub async fn start(
     config: WebApiConfig,
     cancel: CancellationToken,
     state: Arc<DaemonState>,
+    auth: AuthState,
 ) -> Result<tokio::task::JoinHandle<anyhow::Result<()>>, anyhow::Error> {
-    let mut app = Router::new()
+    let listener = tokio::net::TcpListener::bind(&config.bind).await?;
+    start_with_listener(config, listener, cancel, state, auth).await
+}
+
+/// Like `start`, but uses an already-bound listener. Used by the daemon
+/// when it needs to read the actual port before starting (e.g. to write
+/// it to the api-port file).
+pub async fn start_with_listener(
+    config: WebApiConfig,
+    listener: tokio::net::TcpListener,
+    cancel: CancellationToken,
+    state: Arc<DaemonState>,
+    auth: AuthState,
+) -> Result<tokio::task::JoinHandle<anyhow::Result<()>>, anyhow::Error> {
+    let api = Router::new()
         .route("/api/status", axum::routing::get(handle_status))
         .route("/api/files", axum::routing::get(handle_files))
         .route("/api/versions", axum::routing::get(handle_versions))
@@ -50,7 +66,6 @@ pub async fn start(
             axum::routing::delete(handle_device_revoke),
         )
         .route("/api/connect", axum::routing::post(handle_connect))
-        // ── Watch management routes ───────────────────────────────────────────
         .route(
             "/api/watches",
             axum::routing::get(handle_watches_list).post(handle_watches_add),
@@ -63,10 +78,18 @@ pub async fn start(
         )
         .route("/api/watches/{path_b64}/scan", axum::routing::post(handle_watches_scan))
         .route("/api/browse", axum::routing::get(handle_browse))
-        .with_state(state);
+        .with_state(state)
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            require_auth,
+        ));
 
-    // Serve static files (SPA) if configured and directory exists;
-    // else fall back to embedded assets (single-binary distribution).
+    let auth_routes = Router::new()
+        .route("/auth/start", axum::routing::get(auth_start_handler))
+        .with_state(auth);
+
+    let mut app = api.merge(auth_routes);
+
     if let Some(ref dir) = config.static_dir {
         if dir.exists() {
             use tower_http::services::{ServeDir, ServeFile};
@@ -84,7 +107,6 @@ pub async fn start(
         app = app.fallback(embedded::handle_embedded);
     }
 
-    let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     let actual = listener.local_addr()?;
     tracing::info!(bind = %actual, "web API server started");
 

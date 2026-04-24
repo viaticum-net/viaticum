@@ -492,10 +492,19 @@ impl DaemonHandle {
                 bind: app_config.web_api.bind.clone(),
                 static_dir,
             };
-            let web_handle = crate::daemon::web_api::start(
+            // Load (or create) the bearer token; wrap in AuthState.
+            let token = crate::daemon::web_auth::load_or_create_token(&cfg.data_dir)?;
+            let auth = crate::daemon::web_auth::AuthState::new(token);
+            // Bind now to capture the actual OS-chosen port, then persist it for the CLI.
+            let listener = tokio::net::TcpListener::bind(&web_config.bind).await?;
+            let actual_port = listener.local_addr()?.port();
+            crate::daemon::web_auth::write_port_file(&cfg.data_dir, actual_port)?;
+            let web_handle = crate::daemon::web_api::start_with_listener(
                 web_config,
+                listener,
                 cancel.clone(),
                 web_state,
+                auth,
             )
             .await?;
             tasks.push(web_handle);
