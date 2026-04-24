@@ -780,23 +780,16 @@ impl DaemonHandle {
 
 // ── Disk space ────────────────────────────────────────────────────────────────
 
-/// Query available bytes on the filesystem containing `path` via statvfs(2).
-/// Returns 0 on error (conservative — treats as "disk full").
+/// Query available bytes on the filesystem containing `path` via `sysinfo`.
+/// Returns 0 if no mount point matches (conservative — treats as "disk full").
 pub(crate) fn disk_available_bytes(path: &std::path::Path) -> u64 {
-    let path_str = match path.to_str() {
-        Some(s) => s,
-        None => return 0,
-    };
-    let c_path = match std::ffi::CString::new(path_str) {
-        Ok(p) => p,
-        Err(_) => return 0,
-    };
-    unsafe {
-        let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-            stat.f_bavail * stat.f_frsize
-        } else {
-            0
-        }
-    }
+    use sysinfo::Disks;
+    let disks = Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|d| path.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space())
+        .unwrap_or(0)
 }

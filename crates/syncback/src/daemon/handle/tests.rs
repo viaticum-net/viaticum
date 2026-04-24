@@ -1,7 +1,21 @@
 use tempfile::tempdir;
 
-use super::{DaemonConfig, DaemonHandle};
+use super::{DaemonConfig, DaemonHandle, disk_available_bytes};
 use crate::daemon::identity::init_identity;
+
+#[test]
+fn disk_available_bytes_returns_positive_for_existing_path() {
+    let bytes = disk_available_bytes(std::path::Path::new("/"));
+    assert!(bytes > 0, "root filesystem should report > 0 available bytes");
+}
+
+#[test]
+fn disk_available_bytes_returns_zero_for_relative_path() {
+    // Mount points are absolute. A relative path never satisfies
+    // `path.starts_with(mount_point)`, so the sysinfo impl falls through to 0.
+    let bytes = disk_available_bytes(std::path::Path::new("not/an/absolute/path"));
+    assert_eq!(bytes, 0);
+}
 
 // ============================================================
 // DaemonHandle integration tests

@@ -39,6 +39,7 @@ tower-http = { workspace = true }
 toml_edit = "0.22"
 arc-swap = "1"
 base64 = "0.22"
+sysinfo = { version = "0.32", default-features = false, features = ["disk"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.6"
