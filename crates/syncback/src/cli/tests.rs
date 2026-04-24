@@ -699,6 +699,36 @@ fn resolve_connection_reads_port_and_token_from_data_dir_when_neither_provided()
     assert!(!conn.token.is_empty());
 }
 
+#[test]
+fn build_auth_url_local_uses_loopback_and_port() {
+    let conn = super::Connection {
+        url: "http://127.0.0.1:12345".into(),
+        token: "tok".into(),
+    };
+    let url = super::build_auth_start_url(&conn);
+    assert_eq!(url, "http://127.0.0.1:12345/auth/start?token=tok");
+}
+
+#[test]
+fn build_auth_url_remote_preserves_host() {
+    let conn = super::Connection {
+        url: "http://nas.local:8080".into(),
+        token: "tok".into(),
+    };
+    let url = super::build_auth_start_url(&conn);
+    assert_eq!(url, "http://nas.local:8080/auth/start?token=tok");
+}
+
+#[test]
+fn build_auth_url_percent_encodes_special_chars() {
+    let conn = super::Connection {
+        url: "http://127.0.0.1:1234".into(),
+        token: "a b/c+d".into(),
+    };
+    let url = super::build_auth_start_url(&conn);
+    assert_eq!(url, "http://127.0.0.1:1234/auth/start?token=a%20b%2Fc%2Bd");
+}
+
 
 // ============================================================
 // CBOR roundtrip tests

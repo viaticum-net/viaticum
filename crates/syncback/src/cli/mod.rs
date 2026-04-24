@@ -223,6 +223,55 @@ pub enum DeviceAction {
 }
 
 // ============================================================
+// Local-mode subcommands (open, token)
+// ============================================================
+
+pub fn build_auth_start_url(conn: &Connection) -> String {
+    format!(
+        "{}/auth/start?token={}",
+        conn.url.trim_end_matches('/'),
+        urlencoding::encode(&conn.token)
+    )
+}
+
+/// `syncback token` — print the bearer token, or the full /auth/start URL.
+pub fn cmd_token(conn: &Connection, url_mode: bool) {
+    if url_mode {
+        println!("{}", build_auth_start_url(conn));
+    } else {
+        println!("{}", conn.token);
+    }
+}
+
+/// `syncback open` — launch the default browser on /auth/start.
+pub fn cmd_open(conn: &Connection) -> Result<(), CliError> {
+    let url = build_auth_start_url(conn);
+    launch_browser(&url).map_err(|e| CliError::Io(std::io::Error::other(e.to_string())))
+}
+
+fn launch_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).status()?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open").arg(url).status()?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .status()?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        println!("Open this URL in your browser:\n  {url}");
+    }
+    Ok(())
+}
+
+// ============================================================
 // Dispatch (HTTP)
 // ============================================================
 

@@ -89,18 +89,19 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Open => {
+            let connection = resolve_or_exit(&cli, &global_dir);
+            if let Err(e) = syncback::cli::cmd_open(&connection) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Token { url } => {
+            let connection = resolve_or_exit(&cli, &global_dir);
+            syncback::cli::cmd_token(&connection, *url);
+        }
         other => {
-            let connection = match syncback::cli::resolve_connection(
-                cli.server.clone(),
-                cli.token.clone(),
-                &global_dir,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
-            };
+            let connection = resolve_or_exit(&cli, &global_dir);
             if let Err(e) = syncback::cli::run_command(other, &connection) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -108,4 +109,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn resolve_or_exit(cli: &Cli, global_dir: &std::path::Path) -> syncback::cli::Connection {
+    match syncback::cli::resolve_connection(cli.server.clone(), cli.token.clone(), global_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
 }
