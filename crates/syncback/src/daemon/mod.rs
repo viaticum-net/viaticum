@@ -18,3 +18,4 @@ pub mod system_state;
 pub mod watch_admin;
 pub mod watcher;
 pub mod web_api;
+pub mod web_auth;
