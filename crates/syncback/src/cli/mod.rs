@@ -19,10 +19,25 @@ pub fn expand_socket_path(path: &str) -> String {
     expand_tilde(path)
 }
 
-/// Expand `~` in a data directory path to the home directory.
-/// Returns a `PathBuf` — caller decides whether to resolve symlinks.
-pub fn expand_data_dir(path: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(expand_tilde(path))
+/// Resolve the data directory path.
+/// - `None` → platform-native `dirs::data_dir()/syncback`.
+/// - `Some("~/foo")` / `Some("~")` → expanded via `dirs::home_dir()`.
+/// - `Some(absolute_or_relative)` → used as-is.
+pub fn expand_data_dir(path: Option<&str>) -> std::path::PathBuf {
+    match path {
+        None => platform_default_data_dir(),
+        Some("~") => dirs::home_dir().expect("HOME not set"),
+        Some(s) => match s.strip_prefix("~/") {
+            Some(rest) => dirs::home_dir().expect("HOME not set").join(rest),
+            None => std::path::PathBuf::from(s),
+        },
+    }
+}
+
+fn platform_default_data_dir() -> std::path::PathBuf {
+    dirs::data_dir()
+        .expect("could not determine platform data directory (HOME/APPDATA unset?)")
+        .join("syncback")
 }
 
 /// Expand a leading `~/` to `$HOME/`. Returns `path` unchanged if HOME is unset.
@@ -47,9 +62,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<String>,
 
-    /// Data directory (determines socket path). Default: ~/.syncback
-    #[arg(long, global = true, default_value = "~/.syncback")]
-    pub data_dir: String,
+    /// Data directory. Default: platform-native
+    /// (Linux: ~/.local/share/syncback, macOS: ~/Library/Application Support/syncback,
+    /// Windows: %APPDATA%/syncback).
+    #[arg(long, global = true)]
+    pub data_dir: Option<String>,
 
     #[command(subcommand)]
     pub command: Command,

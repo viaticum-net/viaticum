@@ -14,7 +14,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let global_dir = syncback::cli::expand_data_dir(&cli.data_dir);
+    let global_dir = syncback::cli::expand_data_dir(cli.data_dir.as_deref());
     let global_socket = global_dir.join("syncback.sock").to_string_lossy().to_string();
 
     match &cli.command {
@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             tracing_subscriber::fmt::init();
             let dr_dir = match data_dir {
-                Some(d) => syncback::cli::expand_data_dir(d),
+                Some(d) => syncback::cli::expand_data_dir(Some(d)),
                 None => global_dir.clone(),
             };
             if let Err(e) =

@@ -613,6 +613,43 @@ fn format_error_empty_message() {
 }
 
 // ============================================================
+// expand_data_dir tests
+// ============================================================
+
+#[test]
+fn expand_data_dir_none_uses_platform_native_default() {
+    let p = super::expand_data_dir(None);
+    let expected_parent = dirs::data_dir().expect("data_dir");
+    assert_eq!(p, expected_parent.join("syncback"));
+}
+
+#[test]
+fn expand_data_dir_tilde_expansion_uses_home_dir() {
+    let p = super::expand_data_dir(Some("~/custom-sb"));
+    let home = dirs::home_dir().expect("home_dir");
+    assert_eq!(p, home.join("custom-sb"));
+}
+
+#[test]
+fn expand_data_dir_tilde_only_returns_home() {
+    let p = super::expand_data_dir(Some("~"));
+    let home = dirs::home_dir().expect("home_dir");
+    assert_eq!(p, home);
+}
+
+#[test]
+fn expand_data_dir_absolute_path_passthrough() {
+    let p = super::expand_data_dir(Some("/var/lib/syncback"));
+    assert_eq!(p, std::path::PathBuf::from("/var/lib/syncback"));
+}
+
+#[test]
+fn expand_data_dir_relative_path_passthrough() {
+    let p = super::expand_data_dir(Some("./local-data"));
+    assert_eq!(p, std::path::PathBuf::from("./local-data"));
+}
+
+// ============================================================
 // expand_socket_path tests
 // ============================================================
 
