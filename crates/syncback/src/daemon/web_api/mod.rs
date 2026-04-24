@@ -39,7 +39,14 @@ pub async fn start(
         .route("/api/files", axum::routing::get(handle_files))
         .route("/api/versions", axum::routing::get(handle_versions))
         .route("/api/restore", axum::routing::post(handle_restore))
-        .route("/api/devices", axum::routing::get(handle_devices))
+        .route(
+            "/api/devices",
+            axum::routing::get(handle_devices).post(handle_device_add),
+        )
+        .route(
+            "/api/devices/{device_id}",
+            axum::routing::delete(handle_device_revoke),
+        )
         .route("/api/connect", axum::routing::post(handle_connect))
         // ── Watch management routes ───────────────────────────────────────────
         .route(
@@ -155,6 +162,33 @@ async fn handle_devices(
 ) -> Result<Json<Vec<DeviceEntry>>, (StatusCode, String)> {
     match dispatch(CliRequest::DeviceList, &state).await {
         CliResponse::DeviceList(data) => Ok(Json(data)),
+        CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
+        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "unexpected response".into())),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DeviceAddBody {
+    label: String,
+}
+
+async fn handle_device_add(
+    State(state): State<Arc<DaemonState>>,
+    Json(body): Json<DeviceAddBody>,
+) -> Result<Json<DeviceEntry>, (StatusCode, String)> {
+    match dispatch(CliRequest::DeviceAdd { label: body.label }, &state).await {
+        CliResponse::DeviceAdded(entry) => Ok(Json(entry)),
+        CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
+        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "unexpected response".into())),
+    }
+}
+
+async fn handle_device_revoke(
+    State(state): State<Arc<DaemonState>>,
+    axum::extract::Path(device_id_hex): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    match dispatch(CliRequest::DeviceRevoke { device_id_hex }, &state).await {
+        CliResponse::DeviceRevoked { .. } => Ok(StatusCode::NO_CONTENT),
         CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
         _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "unexpected response".into())),
     }
