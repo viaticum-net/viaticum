@@ -106,6 +106,18 @@ pub struct DaemonHandle {
 impl DaemonHandle {
     /// Start the daemon: load identity, open DB, build subsystems, spawn tasks.
     pub async fn start(cfg: DaemonConfig) -> Result<Self, anyhow::Error> {
+        // Legacy data directory migration hint (one-shot WARN).
+        if let Some(home) = dirs::home_dir() {
+            let legacy = home.join(".syncback");
+            if legacy.exists() && cfg.data_dir != legacy {
+                tracing::warn!(
+                    legacy_path = %legacy.display(),
+                    current_path = %cfg.data_dir.display(),
+                    "legacy data directory detected at ~/.syncback; migrate to new platform-native path or set --data-dir explicitly"
+                );
+            }
+        }
+
         // ── 1. Load identity ──────────────────────────────────────────────────
         let keyfile = load_identity(&cfg.data_dir).map_err(|e| match e {
             IdentityError::NotInitialized => {
