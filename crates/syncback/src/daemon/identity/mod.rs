@@ -284,11 +284,18 @@ const DEFAULT_CONFIG_TOML: &str = r#"# SyncBack configuration
 # Generated automatically — edit as needed.
 
 [daemon]
-# data_dir = "~/.syncback"
-# socket_path = "~/.syncback/syncback.sock"
+# data_dir defaults to platform-native:
+#   Linux:   ~/.local/share/syncback
+#   macOS:   ~/Library/Application Support/syncback
+#   Windows: %APPDATA%/syncback
 # log_level = "info"
 
 [storage]
 # soft_quota_gb = 50
 # reserve_gb = 10
+
+[web_api]
+# enabled = true          # then CLI can talk to the daemon over HTTP
+# bind = "127.0.0.1:0"    # loopback, random port (default when enabled)
+# bind = "0.0.0.0:8080"   # opt-in LAN/NAS access — token auth still required
 "#;

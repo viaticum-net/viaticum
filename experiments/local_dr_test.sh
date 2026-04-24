@@ -46,7 +46,6 @@ cleanup() {
 trap cleanup EXIT
 
 node_dir() { echo "$TEST_DIR/node-$(printf '%02d' "$1")"; }
-node_sock() { echo "$(node_dir "$1")/syncback.sock"; }
 node_log() { echo "$(node_dir "$1")/daemon.log"; }
 
 run_cli() {

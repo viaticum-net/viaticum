@@ -101,7 +101,7 @@ bootstrap_peers = []
 
 [web_api]
 enabled    = true
-port       = $port
+bind       = "127.0.0.1:$port"
 static_dir = "$STATIC_DIR"
 CFGEOF
 done
