@@ -49,9 +49,9 @@ pub struct DaemonConfig {
 
 // ─── DaemonState ──────────────────────────────────────────────────────────────
 
-/// Shared live state threaded from DaemonHandle to subsystems (e.g. CliServer).
+/// Shared live state threaded from DaemonHandle to subsystems.
 ///
-/// Cheap to clone (Arc internals). Passed as `Arc<DaemonState>` to cli_server.
+/// Cheap to clone (Arc internals). Passed as `Arc<DaemonState>` to dispatch/web_api.
 pub struct DaemonState {
     /// Open database handle.
     pub db: Db,
@@ -406,7 +406,7 @@ impl DaemonHandle {
             },
         });
 
-        // Clone state for web API and metrics pusher before cli_server consumes it.
+        // Clone state for web API and metrics pusher.
         let state_for_web_api = if app_config.web_api.enabled {
             Some(state.clone())
         } else {

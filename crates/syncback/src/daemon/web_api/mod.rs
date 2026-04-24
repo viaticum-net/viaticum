@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::types::{
     CliRequest, CliResponse, DeviceEntry, FileEntry, RestoreData, StatusData, VersionEntry,
 };
-use crate::daemon::cli_server::dispatch;
+use crate::daemon::dispatch::dispatch;
 use crate::daemon::handle::DaemonState;
 use crate::daemon::watch_admin::{
     AddWatchRequest, DeleteWatchQuery, PatchWatchRequest, WatchAdminError, WatchDefaults,

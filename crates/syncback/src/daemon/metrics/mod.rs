@@ -116,7 +116,7 @@ pub async fn run(
                 break;
             }
             _ = interval.tick() => {
-                let response = crate::daemon::cli_server::dispatch_status(&state).await;
+                let response = crate::daemon::dispatch::dispatch_status(&state).await;
                 if let CliResponse::Status(data) = response {
                     let body = format_prometheus(&data, &node_id);
                     if let Err(e) = client

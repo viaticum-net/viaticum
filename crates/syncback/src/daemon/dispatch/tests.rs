@@ -1,8 +1,6 @@
-use std::io::{Read, Write};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 use syncback_core::db::Db;
 use syncback_core::types::{DeviceId, IdentityPub};
@@ -441,70 +439,3 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
     let _ = handle_a.get_connection(pk_b).await.expect("get_connection after connect");
 }
 
-// ============================================================
-// Integration test: full round-trip over Unix socket
-// ============================================================
-
-#[tokio::test]
-async fn cli_server_accepts_connection_and_responds() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let socket_path = dir.path().join("test.sock");
-    let socket_path_str = socket_path.to_str().expect("valid path").to_string();
-
-    let cancel = CancellationToken::new();
-    let config = super::CliServerConfig {
-        socket_path: socket_path_str.clone(),
-    };
-
-    let state = make_test_state().await;
-    let _handle = super::start(config, cancel.clone(), state)
-        .await
-        .expect("server start");
-
-    // Poll for socket existence instead of a fixed sleep.
-    for _ in 0..50 {
-        if socket_path.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
-    // Connect via blocking UnixStream (CLI side).
-    let socket_path_clone = socket_path_str.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        use std::os::unix::net::UnixStream;
-
-        let stream = UnixStream::connect(&socket_path_clone).expect("connect");
-
-        // Encode CliRequest::Status.
-        let request = CliRequest::Status;
-        let mut buf = Vec::new();
-        ciborium::ser::into_writer(&request, &mut buf).expect("encode");
-        let len = buf.len() as u32;
-
-        let mut writer = &stream;
-        writer.write_all(&len.to_be_bytes()).expect("write len");
-        writer.write_all(&buf).expect("write payload");
-
-        // Read response.
-        let mut reader = &stream;
-        let mut len_buf = [0u8; 4];
-        reader.read_exact(&mut len_buf).expect("read len");
-        let resp_len = u32::from_be_bytes(len_buf) as usize;
-        let mut payload = vec![0u8; resp_len];
-        reader.read_exact(&mut payload).expect("read payload");
-
-        let response: CliResponse =
-            ciborium::de::from_reader(payload.as_slice()).expect("decode response");
-        response
-    })
-    .await
-    .expect("task");
-
-    assert!(
-        matches!(result, CliResponse::Status(_)),
-        "expected Status response"
-    );
-
-    cancel.cancel();
-}
