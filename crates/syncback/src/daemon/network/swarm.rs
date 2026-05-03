@@ -248,6 +248,18 @@ pub enum ProtocolEvent {
         /// None if DeviceCertExchange never completed.
         device_id: Option<DeviceId>,
     },
+    /// Identify protocol delivered the peer's listen addresses for an already
+    /// authenticated peer. The processor persists them on the PeerRecord so the
+    /// daemon can re-dial after restart (otherwise PeerRecord rows have no
+    /// usable address and bootstrap breaks).
+    ///
+    /// Only emitted once cert exchange completed — before that we don't have a
+    /// DeviceId to attach the addrs to. If identify arrives first, addrs are
+    /// stashed in the swarm and re-emitted as part of `PeerAuthenticated.listen_addrs`.
+    PeerIdentified {
+        device_id: DeviceId,
+        listen_addrs: Vec<Multiaddr>,
+    },
 }
 
 /// Commands sent from SwarmHandle to the event loop.
@@ -560,6 +572,7 @@ impl SwarmHandle {
             authenticated: HashMap::new(),
             device_to_peer: HashMap::new(),
             pending_cert: HashMap::new(),
+            peer_addrs: HashMap::new(),
             pending_requests: HashMap::new(),
             our_cert: config.device_cert,
             our_x25519_pub: config.x25519_pub,
@@ -753,6 +766,12 @@ struct EventLoopState {
     /// just waits for inbound cert request.
     pending_cert: HashMap<PeerId, (Instant, u8)>,
 
+    /// PeerId → most recently identified listen_addrs. Updated on every
+    /// Identify::Received; consumed when emitting PeerAuthenticated, and used
+    /// to surface PeerIdentified events for already-authenticated peers so the
+    /// processor can persist addresses on the PeerRecord.
+    peer_addrs: HashMap<PeerId, Vec<Multiaddr>>,
+
     /// OutboundRequestId → oneshot sender for send_to_device responses.
     pending_requests: HashMap<OutboundRequestId, oneshot::Sender<Result<Message, SwarmError>>>,
 
@@ -932,6 +951,21 @@ impl EventLoopState {
                     .behaviour_mut()
                     .kad
                     .add_address(&peer_id, addr.clone());
+            }
+            // Stash addresses for use when cert exchange completes.
+            if !info.listen_addrs.is_empty() {
+                self.peer_addrs.insert(peer_id, info.listen_addrs.clone());
+                // If peer is already authenticated, surface the (possibly
+                // refreshed) addrs to the processor so it can persist them.
+                if let Some((device_id, _, _)) = self.authenticated.get(&peer_id) {
+                    emit_event(
+                        &self.event_tx,
+                        ProtocolEvent::PeerIdentified {
+                            device_id: *device_id,
+                            listen_addrs: info.listen_addrs.clone(),
+                        },
+                    );
+                }
             }
         }
     }
@@ -1176,6 +1210,20 @@ impl EventLoopState {
             x25519_pub: msg.x25519_pub,
         };
         emit_event(&self.event_tx, event);
+
+        // If we already saw this peer's identify before cert exchange, surface
+        // those addrs now so they get persisted on the freshly created PeerRecord.
+        if let Some(addrs) = self.peer_addrs.get(&peer_id) {
+            if !addrs.is_empty() {
+                emit_event(
+                    &self.event_tx,
+                    ProtocolEvent::PeerIdentified {
+                        device_id,
+                        listen_addrs: addrs.clone(),
+                    },
+                );
+            }
+        }
     }
 
     async fn handle_syncback_event(

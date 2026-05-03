@@ -517,6 +517,99 @@ impl DaemonHandle {
                 Ok(())
             }));
         }
+        // ── 9.3. Peer auto-dial: bootstrap from PeerRecord on startup,
+        //         periodic re-dial of known peers we are not currently connected to.
+        //         Without this, every daemon restart leaves the swarm isolated:
+        //         libp2p doesn't dial saved peers on its own, and PeerRecord rows
+        //         are useless until something issues a dial. Identify-driven persist
+        //         (processor::on_peer_identified) keeps `addrs` fresh on every
+        //         identify Received, so this loop always sees the latest endpoints.
+        if let Some(swarm_for_redial) = state.swarm_handle.clone() {
+            let db_for_redial = db.clone();
+            let cancel_for_redial = cancel.clone();
+            // 5 min real time, scaled (30 s on time_scale=10); floor 30 s so we
+            // don't re-dial-storm a single offline peer.
+            let redial_interval = std::time::Duration::from_secs(
+                (300 / time_scale).max(30),
+            );
+            tasks.push(tokio::spawn(async move {
+                use libp2p::{multiaddr::Protocol, Multiaddr};
+                use std::str::FromStr;
+
+                async fn redial_known_peers(
+                    db: &Db,
+                    swarm: &crate::daemon::network::swarm::SwarmHandle,
+                ) {
+                    // peer_sets returns DeviceIds: (connected_devices, auth_devices).
+                    // A device is "connected" only after cert exchange, which
+                    // implies a live transport — exactly what we want to skip
+                    // re-dialing. (Pre-cert connections are transient enough that
+                    // re-dialing them is harmless.)
+                    let connected_devices: std::collections::HashSet<_> =
+                        match swarm.peer_sets().await {
+                            Ok((conn, _auth)) => conn.into_iter().collect(),
+                            Err(_) => return,
+                        };
+                    let peers = match db.list_all_peers() {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    let mut dialed = 0u32;
+                    let mut skipped_already = 0u32;
+                    for record in &peers {
+                        if connected_devices.contains(&record.device_id) {
+                            skipped_already += 1;
+                            continue;
+                        }
+                        for addr_str in &record.addrs {
+                            let addr = match Multiaddr::from_str(addr_str) {
+                                Ok(a) => a,
+                                Err(_) => continue,
+                            };
+                            let peer_id = addr.iter().find_map(|p| match p {
+                                Protocol::P2p(pid) => Some(pid),
+                                _ => None,
+                            });
+                            let peer_id = match peer_id {
+                                Some(p) => p,
+                                None => continue,
+                            };
+                            if let Err(e) = swarm.dial(peer_id, addr).await {
+                                tracing::debug!(peer = %peer_id, err = %e,
+                                    "auto-dial failed (will retry next tick)");
+                            } else {
+                                dialed += 1;
+                            }
+                        }
+                    }
+                    if dialed > 0 || skipped_already > 0 {
+                        tracing::info!(
+                            dialed,
+                            already_connected = skipped_already,
+                            known_peers = peers.len(),
+                            "auto-dial pass"
+                        );
+                    }
+                }
+
+                // Initial bootstrap: dial everything we know about as soon as we
+                // come up. This is what makes restart actually re-establish links.
+                redial_known_peers(&db_for_redial, &swarm_for_redial).await;
+
+                let mut ticker = tokio::time::interval(redial_interval);
+                ticker.tick().await; // skip the immediate tick
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            redial_known_peers(&db_for_redial, &swarm_for_redial).await;
+                        }
+                        _ = cancel_for_redial.cancelled() => break,
+                    }
+                }
+                Ok(())
+            }));
+        }
+
         // Board sync must be faster than PoS timeout so challenges arrive before
         // they expire (POS_TIMEOUT_SECS/time_scale → sync at ~1/3 of that), AND
         // it must be fast enough to propagate SymbolDropped notices so owners

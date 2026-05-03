@@ -129,6 +129,49 @@ impl Processor {
         }
     }
 
+    /// Called when libp2p identify delivers a peer's listen addresses for an
+    /// already-authenticated peer. Persists them on the PeerRecord so that on
+    /// the next daemon restart the auto-dial loop in handle/mod.rs can re-dial
+    /// without external bootstrap config.
+    ///
+    /// Each address is stored as its full multiaddr string, including the
+    /// `/p2p/<peer_id>` suffix, so the bootstrap loop can extract the PeerId
+    /// without tracking it separately.
+    pub(crate) async fn on_peer_identified(
+        &self,
+        device_id: DeviceId,
+        listen_addrs: Vec<libp2p::Multiaddr>,
+    ) {
+        if listen_addrs.is_empty() {
+            return;
+        }
+        let addr_strings: Vec<String> = listen_addrs
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+
+        match self.db.get_peer(&device_id) {
+            Ok(Some(mut record)) => {
+                if record.addrs == addr_strings {
+                    return;
+                }
+                record.addrs = addr_strings;
+                if let Err(e) = self.db.upsert_peer(&record) {
+                    tracing::warn!(device = %device_id, err = %e,
+                        "on_peer_identified: failed to persist addrs");
+                }
+            }
+            Ok(None) => {
+                tracing::trace!(device = %device_id,
+                    "on_peer_identified: PeerRecord missing");
+            }
+            Err(e) => {
+                tracing::warn!(device = %device_id, err = %e,
+                    "on_peer_identified: db get_peer failed");
+            }
+        }
+    }
+
     /// Called when a libp2p connection closes (AC-13).
     ///
     /// Removes the device from peer_cert_map if present.

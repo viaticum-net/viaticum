@@ -310,6 +310,9 @@ async fn wait_for_auth(
                 Some(ProtocolEvent::InboundRequest { .. }) => {
                     // Ignore inbound requests during DR — no Processor running.
                 }
+                Some(ProtocolEvent::PeerIdentified { .. }) => {
+                    // No DB to persist into during DR; just ignore.
+                }
                 None => return None,
             }
         }

@@ -337,6 +337,12 @@ impl Processor {
                                 this2.on_connection_closed(peer_id, device_id).await;
                             });
                         }
+                        Some(ProtocolEvent::PeerIdentified { device_id, listen_addrs }) => {
+                            let this2 = this.clone();
+                            tokio::spawn(async move {
+                                this2.on_peer_identified(device_id, listen_addrs).await;
+                            });
+                        }
                     }
                 }
 
