@@ -1378,6 +1378,73 @@ async fn path_traversal_from_db_record_is_rejected() {
     );
 }
 
+/// E1 (integration): extract_and_write_file rejects malicious record.path values.
+///
+/// This test calls extract_and_write_file directly with pre-built plaintext bytes.
+/// If someone removes the validate_record_path call from extract_and_write_file,
+/// this test will write the file instead of returning PathUnsafe — and the
+/// assert will fail, making the regression immediately visible.
+#[test]
+fn extract_and_write_file_rejects_path_traversal() {
+    use syncback_core::types::{FileId, FileVersion, SourceBlockType, Timestamp};
+    use crate::daemon::restore::staging::{JobId, StagingWriter};
+
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+
+    let coord = test_restore_coord(db, &symbols_dir, &staging_dir);
+
+    let staging_root = staging_dir.path().join("restore");
+    let writer = StagingWriter::open(&staging_root, staging_dir.path(), JobId::new()).unwrap();
+
+    // Malicious paths that must be rejected.
+    // Note: "/etc/shadow" is intentionally omitted — the leading '/' is stripped
+    // by validate_record_path (POSIX backup paths normalised), so the file would
+    // land at staging/etc/shadow which is safe. Only true traversal is tested here.
+    let bad_paths = [
+        "../../../etc/passwd",
+        "foo/../../../etc/cron.d/evil",
+        "C:\\Windows\\System32\\evil.exe",
+        "..\\..\\windows\\evil.bat",
+    ];
+
+    for bad_path in &bad_paths {
+        let record = syncback_core::types::FileRecord {
+            file_id: FileId(1),
+            path: bad_path.to_string(),
+            importance: 0.5,
+            devices: vec![],
+            versions: vec![FileVersion {
+                content_hash: [0u8; 32],
+                source_block_id: syncback_core::types::SourceBlockId([0u8; 32]),
+                k: 2,
+                t: 65_535,
+                created_at: Timestamp(100),
+                backed_up_at: Some(Timestamp(200)),
+            }],
+            first_seen: Timestamp(0),
+        };
+        let version = record.versions[0].clone();
+        let plaintext = b"malicious payload";
+
+        let result = coord.extract_and_write_file(
+            &record,
+            &version,
+            &SourceBlockType::Single,
+            plaintext,
+            &writer,
+        );
+
+        assert!(
+            matches!(result, Err(super::RestoreError::PathUnsafe { .. })),
+            "extract_and_write_file must return PathUnsafe for {:?}, got: {:?}",
+            bad_path,
+            result,
+        );
+    }
+}
+
 /// Smoke test: result.staging_path is non-empty after successful restore.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_result_contains_staging_path() {
@@ -1589,5 +1656,81 @@ mod staging_tests {
         let id1 = JobId::new();
         let id2 = JobId::new();
         assert_ne!(id1, id2, "two JobId::new() calls must produce different IDs");
+    }
+}
+
+// ─── Cleanup tests ────────────────────────────────────────────────────────────
+// Moved here from cleanup.rs per convention (tests in separate files).
+
+mod cleanup_tests {
+    use std::path::Path;
+    use tempfile::TempDir;
+    use crate::daemon::restore::cleanup::{check_staging_warn, should_warn, staging_total_bytes};
+
+    #[test]
+    fn staging_total_bytes_returns_zero_for_missing_dir() {
+        let total = staging_total_bytes(Path::new("/nonexistent/path/that/does/not/exist"));
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn staging_total_bytes_returns_correct_sum() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.bin"), b"hello").unwrap();   // 5 bytes
+        std::fs::write(dir.path().join("b.bin"), b"world!!").unwrap(); // 7 bytes
+
+        let total = staging_total_bytes(dir.path());
+        assert_eq!(total, 12, "expected 5+7=12 bytes");
+    }
+
+    #[test]
+    fn staging_total_bytes_recurses_into_subdirectories() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.path().join("root.bin"), [0u8; 100]).unwrap();
+        std::fs::write(sub.join("nested.bin"), [0u8; 200]).unwrap();
+
+        let total = staging_total_bytes(dir.path());
+        assert_eq!(total, 300, "expected 100+200=300 bytes");
+    }
+
+    /// W2: should_warn returns false when used <= threshold.
+    #[test]
+    fn should_warn_returns_false_when_under_threshold() {
+        assert!(!should_warn(4, 1_073_741_824), "4 bytes must not exceed 1 GB threshold");
+    }
+
+    /// W2: should_warn returns true when used > threshold.
+    #[test]
+    fn should_warn_returns_true_when_over_threshold() {
+        assert!(should_warn(10, 5), "10 bytes must exceed 5-byte threshold");
+    }
+
+    /// W2: should_warn returns false when equal to threshold.
+    #[test]
+    fn should_warn_returns_false_when_equal_to_threshold() {
+        assert!(!should_warn(5, 5), "equal to threshold must not warn");
+    }
+
+    #[test]
+    fn staging_cleanup_warn_not_emitted_when_under_threshold() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("small.bin"), b"tiny").unwrap();
+
+        // Threshold = 1 GB; actual = 4 bytes → should not warn (no panic/error).
+        check_staging_warn(dir.path(), 1_073_741_824);
+        // No assertion — just verifying it doesn't panic or error.
+    }
+
+    #[test]
+    fn staging_cleanup_warn_emitted_when_over_threshold() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("big.bin"), b"0123456789").unwrap();
+
+        // 10 bytes > 5-byte threshold → should_warn must be true for this size.
+        assert!(should_warn(10, 5), "total must exceed threshold");
+        // check_staging_warn runs without panic.
+        check_staging_warn(dir.path(), 5);
     }
 }
