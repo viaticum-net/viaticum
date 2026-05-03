@@ -11,6 +11,9 @@ use crate::types::{DeviceId, ErasureParams, SourceBlockId};
 pub struct Symbol {
     pub esi: u32,
     /// Always exactly ErasureParams.t bytes.
+    /// `serde_bytes` forces CBOR byte-string encoding (3-byte overhead) instead of
+    /// the default array-of-u8 (≈2 bytes per byte for random data → 90% wire bloat).
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 

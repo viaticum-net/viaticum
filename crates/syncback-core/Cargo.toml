@@ -11,6 +11,7 @@ testutil = ["dep:tempfile"]
 
 [dependencies]
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 ciborium = { workspace = true }
 toml = { workspace = true }
 blake3 = { workspace = true }

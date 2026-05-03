@@ -274,6 +274,7 @@ pub struct ClusterSyncResponseMsg {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SystemStateBackupMsg {
     pub v: u8,
+    #[serde(with = "serde_bytes")]
     pub encrypted_blob: Vec<u8>,
     pub timestamp: Timestamp,
 }
@@ -297,6 +298,7 @@ pub struct SystemStateRequestMsg {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SystemStateResponseMsg {
     pub v: u8,
+    #[serde(with = "serde_bytes")]
     pub encrypted_blob: Vec<u8>,
     pub timestamp: Timestamp,
 }
@@ -386,6 +388,7 @@ pub struct BoardEntry {
     pub target_pub: Option<IdentityPub>,
     /// For broadcast: raw CBOR of the inner message.
     /// For directed: encrypted CBOR (ECDH + ChaCha20-Poly1305), see DirectedEnvelope.
+    #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
     /// Ed25519 sig over: type_str || msg_id || kind_str || target_pub_or_empty || payload.
     /// Signed by original author (preserved by relay nodes — never re-signed).
