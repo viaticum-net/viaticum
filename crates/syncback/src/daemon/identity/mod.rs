@@ -257,11 +257,13 @@ fn create_keyfile(
 }
 
 /// Write `contents` to `path` with Unix permissions 0600.
+/// On Windows the file inherits ACL from its parent directory; the daemon's
+/// data dir lives under per-user `%APPDATA%`, which already restricts access
+/// to that user.
 fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), IdentityError> {
-    use std::fs::OpenOptions;
-
     #[cfg(unix)]
     {
+        use std::fs::OpenOptions;
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = OpenOptions::new()
             .write(true)

@@ -1,0 +1,36 @@
+name: Windows
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, windows-port]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build SPA assets for rust-embed
+        working-directory: web-ui
+        shell: bash
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+            npm run build
+          else
+            mkdir -p dist
+            echo "<html><body>placeholder for rust-embed</body></html>" > dist/index.html
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cargo build
+        run: cargo build --workspace --all-targets
+
+      - name: Cargo test
+        run: cargo test --workspace
+
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

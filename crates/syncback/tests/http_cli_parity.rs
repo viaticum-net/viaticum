@@ -8,7 +8,6 @@
 //!   2. Valid bearer → 200 with decoded body.
 //!   3. Missing/wrong bearer → CliError::Unauthorized.
 
-use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{delete, get, post};

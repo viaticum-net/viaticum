@@ -1,7 +1,5 @@
 // Tests for daemon/identity module.
 
-use std::os::unix::fs::PermissionsExt;
-
 use super::{
     derive_keys, init_identity, init_identity_from_mnemonic, init_identity_new_device,
     load_identity, IdentityError,
@@ -31,8 +29,10 @@ fn init_creates_keyfile_and_is_deserializable() {
     assert_eq!(loaded.device_seed, keyfile.device_seed);
 }
 
+#[cfg(unix)]
 #[test]
 fn init_creates_keyfile_with_restricted_permissions() {
+    use std::os::unix::fs::PermissionsExt;
     let dir = tmp_dir();
     init_identity(dir.path()).expect("init_identity");
 
