@@ -80,6 +80,7 @@ fn make_agent(db: Db, symbols_dir: &std::path::Path) -> RepairAgent {
             own_identity: IdentityPub([9u8; 32]),
             master_signing_key: None,
             swarm: None,
+            peer_backoff: None,
         },
         Arc::new(RaptorQEncoder::new()),
     )

@@ -55,6 +55,11 @@ pub struct RepairConfig {
     /// libp2p swarm handle. When Some: deliver repaired symbols over network.
     /// When None: write `.bin` files only (unit tests, offline operation).
     pub swarm: Option<Arc<crate::daemon::network::swarm::SwarmHandle>>,
+
+    /// Per-peer rejection backoff. Holders that recently said `QuotaFull`
+    /// (or any other rejection) are soft-filtered from candidate selection
+    /// until the cooldown expires. Optional: tests pass `None`.
+    pub peer_backoff: Option<Arc<crate::daemon::peer_backoff::PeerBackoff>>,
 }
 
 /// One repair job: select new holder and deliver symbols for a Lost placement.
@@ -501,13 +506,16 @@ impl RepairAgent {
     /// Get holder candidates from DB, excluding one device_id.
     ///
     /// Same trust formula as BackupCoordinator::get_candidates().
-    /// Excludes `exclude` from the returned list.
+    /// Excludes `exclude` from the returned list. If a `peer_backoff` is
+    /// configured, soft-filters out peers currently on rejection cooldown
+    /// (falls back to the unfiltered list when filtering would leave fewer
+    /// than 2 candidates — compute_allocation needs at least 2).
     fn get_candidates_excluding(
         &self,
         exclude: &DeviceId,
     ) -> anyhow::Result<Vec<HolderCandidate>> {
         let peers = self.db.list_all_peers()?;
-        let candidates = peers
+        let candidates: Vec<HolderCandidate> = peers
             .into_iter()
             .filter(|p| &p.device_id != exclude)
             .map(|p| {
@@ -523,6 +531,19 @@ impl RepairAgent {
                 }
             })
             .collect();
+
+        if let Some(backoff) = self.config.peer_backoff.as_ref() {
+            let raw = candidates.clone();
+            let filtered = backoff.filter(candidates, 2, |c| &c.device_id);
+            if filtered.is_empty() {
+                tracing::debug!(
+                    "repair: all candidates on backoff, falling back to raw list ({})",
+                    raw.len()
+                );
+                return Ok(raw);
+            }
+            return Ok(filtered);
+        }
         Ok(candidates)
     }
 
@@ -577,11 +598,17 @@ impl RepairAgent {
 
         match reply {
             Message::SymbolAccept(_accept) => {
+                if let Some(backoff) = self.config.peer_backoff.as_ref() {
+                    backoff.record_accept(&placement.holder_id);
+                }
                 // Holder accepted — send SymbolTransfer.
                 self.deliver_repaired_symbols_direct(&swarm, block_id, placement)
                     .await
             }
             Message::SymbolReject(reject) => {
+                if let Some(backoff) = self.config.peer_backoff.as_ref() {
+                    backoff.record_reject(placement.holder_id);
+                }
                 anyhow::bail!(
                     "holder {} rejected offer for block {}: {:?}",
                     placement.holder_id,

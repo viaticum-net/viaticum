@@ -8,6 +8,7 @@ pub mod holder_cleanup;
 pub mod holdings_integrity;
 pub mod identity;
 pub mod metrics;
+pub mod peer_backoff;
 pub mod network;
 pub mod processor;
 pub mod relay;

@@ -60,7 +60,10 @@ fn upsert_peer_new_gets_initial_trust() {
 
     let expected_combined = (KP * INITIAL_TRUST_P + KI * 0.0) * 1.0;
     assert!((score.combined - expected_combined).abs() < 1e-10);
-    assert!((score.combined - 0.04).abs() < 1e-4);
+    // With INITIAL_TRUST_P = 0.5 (neutral Bayesian prior) and KP = 0.4,
+    // a fresh peer's combined trust is 0.2 — well above the floor, giving
+    // bootstrap nodes a real shot at being chosen as a holder.
+    assert!((score.combined - 0.2).abs() < 1e-4);
 }
 
 #[test]

@@ -97,6 +97,9 @@ pub struct DaemonState {
     /// Cancellation token shared with the daemon runtime; the restart handler
     /// cancels it after spawning the child to drain the current process.
     pub shutdown_token: CancellationToken,
+    /// Per-peer rejection backoff. Shared by repair + backup pipelines so a
+    /// QuotaFull from peer X in one path is also visible to the other.
+    pub peer_backoff: std::sync::Arc<crate::daemon::peer_backoff::PeerBackoff>,
 }
 
 // ─── DaemonHandle ─────────────────────────────────────────────────────────────
@@ -339,6 +342,14 @@ impl DaemonHandle {
         // Create accepted_offers map shared between BackupCoordinator and Processor.
         let accepted_offers = crate::daemon::processor::make_empty_accepted_offers();
 
+        // Per-peer rejection backoff. 6h cooldown in production, scaled by
+        // time_scale so demos and tests see proportionally shorter cooldowns.
+        let peer_backoff_secs =
+            (crate::daemon::peer_backoff::DEFAULT_COOLDOWN_SECS / cfg.time_scale.max(1)).max(1);
+        let peer_backoff = Arc::new(crate::daemon::peer_backoff::PeerBackoff::new(
+            peer_backoff_secs,
+        ));
+
         let backup = BackupCoordinator::new(
             db.clone(),
             BackupConfig {
@@ -355,6 +366,7 @@ impl DaemonHandle {
                 swarm: swarm_handle_arc.clone(),
                 // ── Step C: Pass live_watch_configs ──────────────────────────
                 live_watch_configs: Some(Arc::clone(&live_configs)),
+                peer_backoff: Some(Arc::clone(&peer_backoff)),
             },
             encoder.clone(),
         );
@@ -383,6 +395,7 @@ impl DaemonHandle {
                 own_identity: identity_pub,
                 master_signing_key: Some(master_key.clone()),
                 swarm: swarm_handle_arc.clone(),
+                peer_backoff: Some(Arc::clone(&peer_backoff)),
             },
             encoder.clone(),
         );
@@ -450,6 +463,7 @@ impl DaemonHandle {
                 None
             },
             shutdown_token: cancel.clone(),
+            peer_backoff: Arc::clone(&peer_backoff),
         });
 
         // Clone state for web API and metrics pusher.
@@ -503,11 +517,14 @@ impl DaemonHandle {
                 Ok(())
             }));
         }
-        // Board sync must be faster than PoS timeout so challenges
-        // arrive before they expire. POS_TIMEOUT_SECS/time_scale gives
-        // the effective timeout; sync at ~1/3 of that, floor 2s.
+        // Board sync must be faster than PoS timeout so challenges arrive before
+        // they expire (POS_TIMEOUT_SECS/time_scale → sync at ~1/3 of that), AND
+        // it must be fast enough to propagate SymbolDropped notices so owners
+        // can repair freed-up placements promptly. We cap at 10 min (scaled by
+        // time_scale, so 1 min at scale=10), floor 2s.
         let pos_timeout_scaled = (syncback_core::constants::POS_TIMEOUT_SECS / time_scale).max(1);
-        let board_sync_interval = (pos_timeout_scaled / 3).max(2);
+        let drop_notice_cap = (600 / time_scale).max(2);
+        let board_sync_interval = (pos_timeout_scaled / 3).min(drop_notice_cap).max(2);
         let swarm_for_relay = state.swarm_handle.clone();
         tasks.push(tokio::spawn(relay.run(
             relay_sync_rx,

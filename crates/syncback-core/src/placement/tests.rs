@@ -337,8 +337,10 @@ fn holder_weight_at_half_is_sqrt_half() {
 
 #[test]
 fn compute_allocation_works_with_bootstrap_trust() {
-    // New peers have trust = INITIAL_TRUST_P = 0.1 → combined ≈ 0.04.
-    // Placement must work even when all peers have very low trust.
+    // Bootstrap regression: even when all peers have very low combined trust
+    // (e.g. a punished cohort whose I-score collapsed), placement must still
+    // make a valid allocation. We pin trust at 0.04 here to keep the
+    // regression specific — independent of INITIAL_TRUST_P tuning.
     let p = params_large(0.5);
     let candidates: Vec<_> = (1..=5).map(|b| candidate(b, 0.04)).collect();
     let allocs = compute_allocation(&candidates, &p, 0).unwrap();

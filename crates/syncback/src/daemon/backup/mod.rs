@@ -114,6 +114,10 @@ pub struct BackupConfig {
     /// When Some: lookup_importance uses this instead of watch_configs.
     /// When None: falls back to watch_configs (static copy for backward compat).
     pub live_watch_configs: Option<Arc<RwLock<Vec<WatchConfig>>>>,
+    /// Per-peer rejection backoff. Holders that recently rejected an offer
+    /// are soft-filtered from candidate selection until cooldown expires.
+    /// Optional: tests pass `None`.
+    pub peer_backoff: Option<Arc<crate::daemon::peer_backoff::PeerBackoff>>,
 }
 
 impl Default for BackupConfig {
@@ -131,6 +135,7 @@ impl Default for BackupConfig {
             master_signing_key: None,
             swarm: None,
             live_watch_configs: None,
+            peer_backoff: None,
         }
     }
 }
@@ -236,12 +241,14 @@ impl BackupCoordinator {
     }
 
     /// Get holder candidates: mock_holders if configured (tests only), else compute from DB peers.
+    /// Soft-filters peers currently on rejection cooldown when peer_backoff is set
+    /// (falls back to the unfiltered list if filtering would leave fewer than 2).
     pub(crate) fn get_candidates(&self) -> anyhow::Result<Vec<HolderCandidate>> {
         if !self.config.mock_holders.is_empty() {
             return Ok(self.config.mock_holders.clone());
         }
         let peers = self.db.list_all_peers()?;
-        let candidates = peers
+        let candidates: Vec<HolderCandidate> = peers
             .into_iter()
             .map(|p| {
                 let trust_raw = (syncback_core::constants::KP * p.trust_p
@@ -256,6 +263,19 @@ impl BackupCoordinator {
                 }
             })
             .collect();
+
+        if let Some(backoff) = self.config.peer_backoff.as_ref() {
+            let raw = candidates.clone();
+            let filtered = backoff.filter(candidates, 2, |c| &c.device_id);
+            if filtered.is_empty() {
+                tracing::debug!(
+                    "backup: all candidates on backoff, falling back to raw list ({})",
+                    raw.len()
+                );
+                return Ok(raw);
+            }
+            return Ok(filtered);
+        }
         Ok(candidates)
     }
 
@@ -279,7 +299,8 @@ impl BackupCoordinator {
     ///
     /// We also cannot reuse just kp×P + ki×I, because `recalculate_trust` only
     /// fires on the PoS OWNER side; a pure-holder daemon never updates trust_p
-    /// for any peer, so it stays at INITIAL_TRUST_P=0.1 and the weight stays tiny.
+    /// for any peer, so it stays at INITIAL_TRUST_P (the prior) with no I
+    /// evidence — the weight stays tiny relative to peers with real PoS history.
     ///
     /// The decision point that makes a master "legitimate to hold data for" is
     /// the SymbolOffer/Accept handshake: the holder validated signatures and
@@ -803,10 +824,16 @@ impl BackupCoordinator {
 
         match reply {
             Message::SymbolAccept(_accept) => {
+                if let Some(backoff) = self.config.peer_backoff.as_ref() {
+                    backoff.record_accept(&placement.holder_id);
+                }
                 // Holder accepted — send SymbolTransfer.
                 self.deliver_to_holder_direct(&swarm, result, placement).await
             }
             Message::SymbolReject(reject) => {
+                if let Some(backoff) = self.config.peer_backoff.as_ref() {
+                    backoff.record_reject(placement.holder_id);
+                }
                 anyhow::bail!(
                     "holder {} rejected offer for block {:?}: {:?}",
                     placement.holder_id,

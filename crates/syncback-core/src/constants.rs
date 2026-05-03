@@ -19,8 +19,13 @@ pub const KI: f64 = 1.75;
 /// Rolling window length for P score (weeks).
 pub const P_WINDOW_WEEKS: u32 = 4;
 
-/// Initial P value for newly connected peers.
-pub const INITIAL_TRUST_P: f64 = 0.1;
+/// Initial P value for newly connected peers — neutral Bayesian prior.
+/// A new peer has no PoS history yet; we treat them as 50/50 rather than
+/// "minimally trusted" so they get a real shot at being chosen as a holder
+/// during their first few hours, before their P score becomes evidence-based.
+/// Without this they sit at the trust floor (~0.04 combined) and lose every
+/// holder selection to peers with even one passed challenge — bootstrap fails.
+pub const INITIAL_TRUST_P: f64 = 0.5;
 
 /// S floor — even zero-storage peers get 10% trust multiplier.
 pub const S_CLAMP_MIN: f64 = 0.1;
