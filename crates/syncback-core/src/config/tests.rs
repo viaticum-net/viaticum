@@ -601,3 +601,25 @@ fn webapi_cfg_rejects_invalid_socket_addr() {
     cfg.web_api.bind = "not-a-socket".into();
     assert!(cfg.validate().is_err());
 }
+
+#[test]
+fn restore_staging_warn_gb_zero_is_rejected() {
+    let mut cfg = AppConfig::default();
+    cfg.restore.staging_warn_gb = 0.0;
+    let err = cfg.validate().unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, .. } if field == "restore.staging_warn_gb"),
+        "expected Validation error for restore.staging_warn_gb, got: {err:?}"
+    );
+}
+
+#[test]
+fn restore_staging_warn_gb_negative_is_rejected() {
+    let mut cfg = AppConfig::default();
+    cfg.restore.staging_warn_gb = -1.0;
+    let err = cfg.validate().unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, .. } if field == "restore.staging_warn_gb"),
+        "expected Validation error for restore.staging_warn_gb, got: {err:?}"
+    );
+}
