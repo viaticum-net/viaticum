@@ -15,6 +15,7 @@ use crate::cli::types::{
 };
 use crate::daemon::handle::DaemonState;
 use crate::daemon::restore::{RestoreError, RestoreRequest, VersionSelector};
+use crate::daemon::restore::staging::JobId;
 
 #[cfg(test)]
 mod tests;
@@ -416,6 +417,11 @@ async fn dispatch_restore(
     date: Option<String>,
     dest: Option<String>,
 ) -> CliResponse {
+    // Alpha: dest is not supported. Reject immediately with a structured error.
+    if dest.is_some() {
+        return CliResponse::Error("dest_not_supported_in_alpha".to_string());
+    }
+
     // Resolve version selector.
     let version_selector = if let Some(v) = version {
         // version is 1-based from CLI; convert to 0-based index.
@@ -433,15 +439,13 @@ async fn dispatch_restore(
         VersionSelector::Latest
     };
 
-    let output_dir = dest
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let job_id = JobId::new();
 
     let request = RestoreRequest {
         path: path.clone(),
         version_selector,
-        output_dir,
         device_id: state.device_id,
+        job_id,
     };
 
     // Look up the file record to find the version that will be used.
@@ -481,11 +485,12 @@ async fn dispatch_restore(
     }
 
     match reply_rx.await {
-        Ok(Ok(_result)) => CliResponse::Restore(RestoreData {
+        Ok(Ok(result)) => CliResponse::Restore(RestoreData {
             path,
             version_used,
             content_hash_hex,
             status: "started".to_string(),
+            staging_path: result.staging_path.to_string_lossy().into_owned(),
         }),
         Ok(Err(e)) => match restore_error_to_blocker(&e) {
             Some(blocker) => CliResponse::RestoreBlocked(blocker),

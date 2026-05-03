@@ -284,6 +284,27 @@ impl Default for WebApiCfg {
 }
 
 // ============================================================
+// Restore config
+// ============================================================
+
+/// [restore] — restore staging configuration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct RestoreCfg {
+    /// Warn in log when total size of data_dir/restore/ exceeds this threshold.
+    /// Unit: gigabytes. Default: 50.
+    pub staging_warn_gb: f64,
+}
+
+impl Default for RestoreCfg {
+    fn default() -> Self {
+        Self {
+            staging_warn_gb: 50.0,
+        }
+    }
+}
+
+// ============================================================
 // Top-level config
 // ============================================================
 
@@ -299,6 +320,7 @@ pub struct AppConfig {
     pub cluster: ClusterCfg,
     pub metrics: MetricsCfg,
     pub web_api: WebApiCfg,
+    pub restore: RestoreCfg,
     /// Per-directory watch configuration.
     /// Listed as [[watch]] array in config.toml.
     /// When empty, watch_dirs from CLI are used with DEFAULT_IMPORTANCE.
@@ -445,6 +467,13 @@ impl AppConfig {
             return Err(ConfigError::Validation {
                 field: "metrics.push_url".to_string(),
                 reason: "push_url must be set when metrics are enabled".to_string(),
+            });
+        }
+
+        if self.restore.staging_warn_gb <= 0.0 {
+            return Err(ConfigError::Validation {
+                field: "restore.staging_warn_gb".to_string(),
+                reason: "must be > 0.0".to_string(),
             });
         }
 

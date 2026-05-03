@@ -170,6 +170,10 @@ pub struct RestoreData {
     pub content_hash_hex: String,
     /// "started" | "queued" | "error"
     pub status: String,
+    /// Absolute path to the per-job staging directory on the server.
+    /// Example: "/home/alice/.viaticum/restore/550e8400-.../home/alice/docs/report.docx"
+    #[serde(default)]
+    pub staging_path: String,
 }
 
 /// Device entry for `syncback device list`.

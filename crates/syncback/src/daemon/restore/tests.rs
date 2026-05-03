@@ -27,6 +27,7 @@ use crate::daemon::backup::{
 };
 
 use super::{collect_esis_from_ranges, RestoreConfig, RestoreCoordinator, VersionSelector};
+use crate::daemon::restore::staging::JobId;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -64,10 +65,17 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
 }
 
 /// Build a RestoreCoordinator for Phase 2 (local) tests (no network needed).
+/// `staging_dir`: the TempDir that will serve as both staging_root and data_dir
+/// (they're the same in tests — staging_root = staging_dir/restore, data_dir = staging_dir).
 fn test_restore_coord(
     db: Db,
     symbols_dir: &TempDir,
+    staging_dir: &TempDir,
 ) -> RestoreCoordinator {
+    // Create the restore staging subdirectory under staging_dir.
+    let staging_root = staging_dir.path().join("restore");
+    std::fs::create_dir_all(&staging_root).expect("create staging_root");
+
     let restore_config = RestoreConfig {
         epoch_key: TEST_EPOCH_KEY,
         parallel_holders: 5,
@@ -75,6 +83,8 @@ fn test_restore_coord(
         device_id: DeviceId([2u8; 32]),
         symbols_dir: symbols_dir.path().to_path_buf(),
         swarm: None,
+        staging_root,
+        data_dir: staging_dir.path().to_path_buf(),
     };
 
     RestoreCoordinator::new(
@@ -310,7 +320,7 @@ async fn restore_single_file_by_exact_path() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
     let files_dir = TempDir::new().unwrap();
-    let out_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
 
     // Backup one file
     let content = b"single file content for restore test";
@@ -321,21 +331,21 @@ async fn restore_single_file_by_exact_path() {
     assert!(!results.is_empty(), "should have produced at least one block");
 
     // Restore
-    let restore = test_restore_coord(db.clone(), &symbols_dir);
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
     let request = super::RestoreRequest {
         path: path.clone(),
         version_selector: VersionSelector::Latest,
-        output_dir: out_dir.path().to_path_buf(),
         device_id: DeviceId([2u8; 32]),
+        job_id: JobId::new(),
     };
     let result = restore.restore(request).await.unwrap();
 
     assert_eq!(result.files_restored, 1, "failures: {:?}", result.failures);
     assert!(result.failures.is_empty());
 
-    // Verify content
+    // Verify content: file is in staging_path/<rel_path>
     let rel = path.trim_start_matches('/');
-    let out_file = out_dir.path().join(rel);
+    let out_file = result.staging_path.join(rel);
     let restored = std::fs::read(&out_file).unwrap();
     assert_eq!(restored, content);
 }
@@ -345,7 +355,7 @@ async fn restore_pack_multiple_files_roundtrip() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
     let files_dir = TempDir::new().unwrap();
-    let out_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
 
     // Backup 3 files into one pack
     let contents: Vec<(&str, &[u8])> = vec![
@@ -365,13 +375,13 @@ async fn restore_pack_multiple_files_roundtrip() {
     assert!(!results.is_empty(), "should have produced blocks");
 
     // Restore all 3 using prefix (the files_dir path as prefix)
-    let restore = test_restore_coord(db.clone(), &symbols_dir);
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
     let prefix = files_dir.path().to_string_lossy().to_string() + "/";
     let request = super::RestoreRequest {
         path: prefix,
         version_selector: VersionSelector::Latest,
-        output_dir: out_dir.path().to_path_buf(),
         device_id: DeviceId([2u8; 32]),
+        job_id: JobId::new(),
     };
     let result = restore.restore(request).await.unwrap();
 
@@ -381,12 +391,12 @@ async fn restore_pack_multiple_files_roundtrip() {
     );
     assert!(result.failures.is_empty());
 
-    // Verify contents
+    // Verify contents — files are in staging_path/<rel_path>
     for (name, content) in &contents {
         let full_path = files_dir.path().join(name);
         let rel = full_path.to_string_lossy();
         let rel = rel.trim_start_matches('/');
-        let out_file = out_dir.path().join(rel);
+        let out_file = result.staging_path.join(rel);
         let restored = std::fs::read(&out_file).unwrap();
         assert_eq!(&restored, content, "content mismatch for {}", name);
     }
@@ -397,8 +407,7 @@ async fn restore_specific_version_by_index() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
     let files_dir = TempDir::new().unwrap();
-    let out_dir1 = TempDir::new().unwrap();
-    let out_dir2 = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
 
     // Create file, backup v1
     let path_name = "versioned.txt";
@@ -428,31 +437,31 @@ async fn restore_specific_version_by_index() {
     assert_eq!(backed_up_count, 2, "should have 2 backed-up versions");
 
     // Restore version index 0 (the first)
-    let restore = test_restore_coord(db.clone(), &symbols_dir);
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
     let request_v0 = super::RestoreRequest {
         path: path.clone(),
         version_selector: VersionSelector::Index(0),
-        output_dir: out_dir1.path().to_path_buf(),
         device_id: DeviceId([2u8; 32]),
+        job_id: JobId::new(),
     };
     let result = restore.restore(request_v0).await.unwrap();
     assert_eq!(result.files_restored, 1, "failures: {:?}", result.failures);
 
     let rel = path.trim_start_matches('/');
-    let out_v0 = std::fs::read(out_dir1.path().join(rel)).unwrap();
+    let out_v0 = std::fs::read(result.staging_path.join(rel)).unwrap();
     assert_eq!(out_v0, b"version one content");
 
-    // Restore latest (should be v2)
+    // Restore latest (should be v2) — use a different job_id for separate staging dir
     let request_latest = super::RestoreRequest {
         path: path.clone(),
         version_selector: VersionSelector::Latest,
-        output_dir: out_dir2.path().to_path_buf(),
         device_id: DeviceId([2u8; 32]),
+        job_id: JobId::new(),
     };
     let result2 = restore.restore(request_latest).await.unwrap();
     assert_eq!(result2.files_restored, 1, "failures: {:?}", result2.failures);
 
-    let out_latest = std::fs::read(out_dir2.path().join(rel)).unwrap();
+    let out_latest = std::fs::read(result2.staging_path.join(rel)).unwrap();
     assert_eq!(out_latest, b"version two content");
 }
 
@@ -461,7 +470,7 @@ async fn restore_prefix_matches_multiple_files() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
     let files_dir = TempDir::new().unwrap();
-    let out_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
 
     // Create a photos subdirectory and a docs subdirectory
     let photos_dir = files_dir.path().join("photos");
@@ -485,24 +494,24 @@ async fn restore_prefix_matches_multiple_files() {
     backup.flush_all(true).unwrap();
 
     // Restore only photos prefix
-    let restore = test_restore_coord(db.clone(), &symbols_dir);
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
     let photos_prefix = photos_dir.to_string_lossy().to_string() + "/";
     let request = super::RestoreRequest {
         path: photos_prefix,
         version_selector: VersionSelector::Latest,
-        output_dir: out_dir.path().to_path_buf(),
         device_id: DeviceId([2u8; 32]),
+        job_id: JobId::new(),
     };
     let result = restore.restore(request).await.unwrap();
 
     assert_eq!(result.files_restored, 2, "failures: {:?}", result.failures);
     assert!(result.failures.is_empty());
 
-    // doc_c should NOT be in output
+    // doc_c should NOT be in staging output
     let doc_c_rel = doc_c.to_string_lossy();
     let doc_c_rel = doc_c_rel.trim_start_matches('/');
     assert!(
-        !out_dir.path().join(doc_c_rel).exists(),
+        !result.staging_path.join(doc_c_rel).exists(),
         "docs/c.txt should not be in output"
     );
 }
@@ -511,14 +520,14 @@ async fn restore_prefix_matches_multiple_files() {
 async fn restore_missing_path_returns_empty_result() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
-    let out_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
 
-    let restore = test_restore_coord(db.clone(), &symbols_dir);
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
     let request = super::RestoreRequest {
         path: "/nonexistent/file.txt".to_string(),
         version_selector: VersionSelector::Latest,
-        output_dir: out_dir.path().to_path_buf(),
         device_id: DeviceId([2u8; 32]),
+        job_id: JobId::new(),
     };
     let result = restore.restore(request).await.unwrap();
 
@@ -532,7 +541,7 @@ async fn restore_updates_local_state_to_present() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
     let files_dir = TempDir::new().unwrap();
-    let out_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
 
     let content = b"state update test";
     let path = write_file(&files_dir, "state.txt", content);
@@ -542,12 +551,12 @@ async fn restore_updates_local_state_to_present() {
     backup.flush_all(true).unwrap();
 
     let restore_device = DeviceId([2u8; 32]);
-    let restore = test_restore_coord(db.clone(), &symbols_dir);
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
     let request = super::RestoreRequest {
         path: path.clone(),
         version_selector: VersionSelector::Latest,
-        output_dir: out_dir.path().to_path_buf(),
         device_id: restore_device,
+        job_id: JobId::new(),
     };
     let result = restore.restore(request).await.unwrap();
     assert_eq!(result.files_restored, 1);
@@ -573,7 +582,7 @@ async fn restore_deduplicates_source_blocks() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
     let files_dir = TempDir::new().unwrap();
-    let out_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
 
     let path_a = write_file(&files_dir, "a.txt", b"file a content");
     let path_b = write_file(&files_dir, "b.txt", b"file b content");
@@ -586,13 +595,13 @@ async fn restore_deduplicates_source_blocks() {
     // Both files should land in the same block (total size << SMALL_BLOCK_SIZE)
     assert_eq!(results.len(), 1, "should produce exactly 1 block");
 
-    let restore = test_restore_coord(db.clone(), &symbols_dir);
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
     let prefix = files_dir.path().to_string_lossy().to_string() + "/";
     let request = super::RestoreRequest {
         path: prefix,
         version_selector: VersionSelector::Latest,
-        output_dir: out_dir.path().to_path_buf(),
         device_id: DeviceId([2u8; 32]),
+        job_id: JobId::new(),
     };
     let result = restore.restore(request).await.unwrap();
 
@@ -651,7 +660,8 @@ async fn fetch_from_holders_returns_insufficient_when_no_peers_reachable() {
         })
         .collect();
 
-    let coord = test_restore_coord(db, &symbols_dir);
+    let staging_dir = TempDir::new().unwrap();
+    let coord = test_restore_coord(db, &symbols_dir, &staging_dir);
     let params = ErasureParams::compute(65_535_u64, 0.5).unwrap();
 
     let result = coord
@@ -703,7 +713,8 @@ async fn fetch_from_holders_attempts_presumed_lost_and_uncertain_placements() {
     })
     .collect();
 
-    let coord = test_restore_coord(db, &symbols_dir);
+    let staging_dir2 = TempDir::new().unwrap();
+    let coord = test_restore_coord(db, &symbols_dir, &staging_dir2);
     let params = ErasureParams::compute(65_535_u64, 0.5).unwrap();
 
     let result = coord
@@ -1247,4 +1258,338 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
 
     handle_h1.shutdown().await;
     handle_h2.shutdown().await;
+}
+
+// ─── Restore-safety tests (alpha_restore_safety spec) ─────────────────────────
+
+/// C2: Default restore (no dest) writes files to staging, not the original location.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_restore_writes_to_staging_not_origin() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+
+    let content = b"original content that must not be modified";
+    let original_path = write_file(&files_dir, "important.txt", content);
+
+    let mut backup = test_backup_coord(db.clone(), &symbols_dir);
+    backup.process_event(added_event(&original_path)).unwrap();
+    backup.flush_all(true).unwrap();
+
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
+    let request = super::RestoreRequest {
+        path: original_path.clone(),
+        version_selector: VersionSelector::Latest,
+        device_id: DeviceId([2u8; 32]),
+        job_id: JobId::new(),
+    };
+    let result = restore.restore(request).await.unwrap();
+
+    assert_eq!(result.files_restored, 1, "failures: {:?}", result.failures);
+
+    // staging_path must be inside staging_dir (not in files_dir).
+    assert!(
+        result.staging_path.starts_with(staging_dir.path()),
+        "staging_path {:?} must be inside staging_dir {:?}",
+        result.staging_path,
+        staging_dir.path()
+    );
+
+    // Original file must be unchanged.
+    let still_original = std::fs::read(&original_path).unwrap();
+    assert_eq!(still_original, content, "original file must not be modified");
+
+    // Restored file must exist in staging.
+    let rel = original_path.trim_start_matches('/');
+    let staged_file = result.staging_path.join(rel);
+    assert!(staged_file.exists(), "restored file must exist in staging at {staged_file:?}");
+    let restored = std::fs::read(&staged_file).unwrap();
+    assert_eq!(restored, content, "restored content must match original");
+}
+
+/// E1: Path traversal from DB record is rejected.
+/// Simulates a malicious DR blob where record.path = "../../../etc/cron.d/evil".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn path_traversal_from_db_record_is_rejected() {
+    use syncback_core::types::{FileId, FileVersion, SourceBlockId, Timestamp};
+    use syncback_core::db::Db;
+    use syncback_core::path_safety::PathSafetyError;
+
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+
+    // Insert a file record with a malicious path.
+    let malicious_path = "../../../etc/cron.d/evil";
+    let block_id = SourceBlockId([0xEEu8; 32]);
+
+    let record = syncback_core::types::FileRecord {
+        file_id: FileId(99),
+        path: malicious_path.to_string(),
+        importance: 0.5,
+        devices: vec![],
+        versions: vec![FileVersion {
+            content_hash: [0u8; 32],
+            source_block_id: block_id,
+            k: 2,
+            t: 65_535,
+            created_at: Timestamp(100),
+            backed_up_at: Some(Timestamp(200)),
+        }],
+        first_seen: Timestamp(0),
+    };
+    db.upsert_file(&record).unwrap();
+
+    // Insert a source block record.
+    let source_block = syncback_core::db::SourceBlockRecord {
+        block_id,
+        k: 2,
+        t: 65_535,
+        block_type: syncback_core::types::SourceBlockType::Single,
+        status: syncback_core::db::SourceBlockStatus::Active,
+        created_at: Timestamp(100),
+        encrypted_size: Some(10),
+        n: None,
+        overhead: None,
+        drop_notice_sent_at: None,
+    };
+    db.upsert_source_block(&source_block).unwrap();
+
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
+
+    // The restore will try to decode a block — it will fail because there are no symbols.
+    // But before that, if extract_and_write_file is called, path validation must reject it.
+    // Since there are no symbols, the restore returns InsufficientSymbols before writing.
+    // Test the validation directly via validate_record_path to confirm the E1 invariant.
+    let validation_result = syncback_core::path_safety::validate_record_path(malicious_path);
+    assert_eq!(
+        validation_result,
+        Err(PathSafetyError::DotDot),
+        "malicious path must be rejected by PathValidator"
+    );
+
+    // Also verify the RestoreError::PathUnsafe variant exists and maps correctly.
+    let err = super::RestoreError::PathUnsafe {
+        path: malicious_path.to_string(),
+        source: PathSafetyError::DotDot,
+    };
+    assert!(
+        format!("{err}").contains(".."),
+        "PathUnsafe error must describe the DotDot issue"
+    );
+}
+
+/// Smoke test: result.staging_path is non-empty after successful restore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_result_contains_staging_path() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+
+    let content = b"staging path smoke test content";
+    let path = write_file(&files_dir, "smoke.txt", content);
+
+    let mut backup = test_backup_coord(db.clone(), &symbols_dir);
+    backup.process_event(added_event(&path)).unwrap();
+    backup.flush_all(true).unwrap();
+
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
+    let request = super::RestoreRequest {
+        path: path.clone(),
+        version_selector: VersionSelector::Latest,
+        device_id: DeviceId([2u8; 32]),
+        job_id: JobId::new(),
+    };
+    let result = restore.restore(request).await.unwrap();
+
+    assert_eq!(result.files_restored, 1);
+    assert!(!result.staging_path.as_os_str().is_empty(), "staging_path must be non-empty");
+    assert!(
+        result.staging_path.is_dir(),
+        "staging_path {:?} must be an existing directory",
+        result.staging_path
+    );
+}
+
+// ─── StagingWriter tests ───────────────────────────────────────────────────────
+
+mod staging_tests {
+    use std::path::Path;
+    use tempfile::TempDir;
+    use crate::daemon::restore::staging::{JobId, StagingError, StagingWriter};
+    use syncback_core::path_safety::validate_record_path;
+
+    /// G1: staging writer creates file at the correct relative path.
+    #[test]
+    fn staging_writer_creates_file_at_correct_path() {
+        let data_dir = TempDir::new().unwrap();
+        let staging_root = data_dir.path().join("restore");
+        std::fs::create_dir_all(&staging_root).unwrap();
+
+        let job_id = JobId::new();
+        let writer = StagingWriter::open(&staging_root, data_dir.path(), job_id).unwrap();
+
+        let validated = validate_record_path("home/alice/docs/report.docx").unwrap();
+        let out = writer.write_file(&validated, b"report content").unwrap();
+
+        // File must exist at the returned path.
+        assert!(out.exists(), "file must exist at {out:?}");
+        let content = std::fs::read(&out).unwrap();
+        assert_eq!(content, b"report content");
+
+        // Path must be rooted in staging_path.
+        assert!(out.starts_with(writer.staging_path()), "file must be inside staging dir");
+    }
+
+    /// Basic open test: job dir is created.
+    #[test]
+    fn staging_writer_open_creates_job_dir() {
+        let data_dir = TempDir::new().unwrap();
+        let staging_root = data_dir.path().join("restore");
+        std::fs::create_dir_all(&staging_root).unwrap();
+
+        let job_id = JobId::new();
+        let writer = StagingWriter::open(&staging_root, data_dir.path(), job_id).unwrap();
+
+        assert!(
+            writer.staging_path().is_dir(),
+            "job staging dir must exist: {:?}", writer.staging_path()
+        );
+        // Job dir name must be the UUID string.
+        let dir_name = writer.staging_path().file_name().unwrap().to_string_lossy();
+        assert_eq!(dir_name, job_id.to_string(), "job dir name must be the UUID");
+    }
+
+    /// Mode 0o600 on written files (Unix only).
+    #[cfg(unix)]
+    #[test]
+    fn staging_writer_mode_is_600_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data_dir = TempDir::new().unwrap();
+        let staging_root = data_dir.path().join("restore");
+        std::fs::create_dir_all(&staging_root).unwrap();
+
+        let writer = StagingWriter::open(&staging_root, data_dir.path(), JobId::new()).unwrap();
+        let validated = validate_record_path("secret.txt").unwrap();
+        let out = writer.write_file(&validated, b"secret").unwrap();
+
+        let meta = std::fs::metadata(&out).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "file mode must be 0o600, got {:o}", mode);
+    }
+
+    /// Mode 0o700 on job staging directory (Unix only).
+    #[cfg(unix)]
+    #[test]
+    fn staging_writer_job_dir_mode_is_700_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data_dir = TempDir::new().unwrap();
+        let staging_root = data_dir.path().join("restore");
+        std::fs::create_dir_all(&staging_root).unwrap();
+
+        let writer = StagingWriter::open(&staging_root, data_dir.path(), JobId::new()).unwrap();
+
+        let meta = std::fs::metadata(writer.staging_path()).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "job dir mode must be 0o700, got {:o}", mode);
+    }
+
+    /// C1: Writing the same path twice in the same job fails on the second attempt.
+    #[test]
+    fn write_twice_same_path_fails_second() {
+        let data_dir = TempDir::new().unwrap();
+        let staging_root = data_dir.path().join("restore");
+        std::fs::create_dir_all(&staging_root).unwrap();
+
+        let writer = StagingWriter::open(&staging_root, data_dir.path(), JobId::new()).unwrap();
+        let validated = validate_record_path("docs/file.txt").unwrap();
+
+        // First write succeeds.
+        writer.write_file(&validated, b"first content").unwrap();
+
+        // Second write fails with AlreadyExists.
+        let result = writer.write_file(&validated, b"second content");
+        assert!(
+            matches!(result, Err(StagingError::AlreadyExists(_))),
+            "second write must fail with AlreadyExists, got: {result:?}"
+        );
+
+        // First file must be intact.
+        let out_path = writer.staging_path().join(validated.to_relative_path());
+        let content = std::fs::read(&out_path).unwrap();
+        assert_eq!(content, b"first content", "first file must remain intact");
+    }
+
+    /// B2: staging_root that is a symlink pointing outside data_dir is rejected.
+    #[cfg(unix)]
+    #[test]
+    fn staging_root_symlink_outside_data_dir_is_rejected() {
+        let data_dir = TempDir::new().unwrap();
+        // Create a separate "outside" directory.
+        let outside_dir = TempDir::new().unwrap();
+
+        // Create staging_root as a symlink to outside_dir.
+        let staging_root = data_dir.path().join("restore");
+        std::os::unix::fs::symlink(outside_dir.path(), &staging_root).unwrap();
+
+        let job_id = JobId::new();
+        let result = StagingWriter::open(&staging_root, data_dir.path(), job_id);
+
+        assert!(
+            matches!(result, Err(StagingError::OutsideDataDir { .. })),
+            "symlinked staging_root outside data_dir must be rejected, got: {result:?}"
+        );
+    }
+
+    /// B1: Write through a symlink in the staging tree — cap_std prevents symlink following.
+    /// The write should either succeed (capping to staging dir) or fail with an error,
+    /// but must NOT end up writing to the symlink target.
+    #[cfg(unix)]
+    #[test]
+    fn staging_write_does_not_follow_symlink_in_tree() {
+        let data_dir = TempDir::new().unwrap();
+        let staging_root = data_dir.path().join("restore");
+        std::fs::create_dir_all(&staging_root).unwrap();
+
+        let job_id = JobId::new();
+        let writer = StagingWriter::open(&staging_root, data_dir.path(), job_id).unwrap();
+
+        // Create a symlink inside the job dir that points to /tmp.
+        let job_dir = writer.staging_path();
+        let link_path = job_dir.join("link");
+        std::os::unix::fs::symlink("/tmp", &link_path).unwrap();
+
+        // Attempt to write "link/attack_file" — cap_std should not follow the symlink.
+        let validated = validate_record_path("link/attack_file").unwrap();
+        let result = writer.write_file(&validated, b"malicious content");
+
+        // The write must either fail (cap_std rejects symlink in tree) or succeed
+        // but land inside the staging dir (not in /tmp).
+        match result {
+            Err(_) => {
+                // Rejected by cap_std — the ideal outcome.
+                assert!(!Path::new("/tmp/attack_file").exists(), "/tmp/attack_file must not be created");
+            }
+            Ok(out_path) => {
+                // Allowed — but must not be at /tmp/attack_file.
+                assert!(
+                    out_path.starts_with(job_dir),
+                    "written file must be inside staging dir, not symlink target: {out_path:?}"
+                );
+                assert!(!Path::new("/tmp/attack_file").exists(), "/tmp/attack_file must not exist");
+            }
+        }
+    }
+
+    /// G2: Two restore jobs get different job_ids.
+    #[test]
+    fn two_restore_jobs_get_different_job_ids() {
+        let id1 = JobId::new();
+        let id2 = JobId::new();
+        assert_ne!(id1, id2, "two JobId::new() calls must produce different IDs");
+    }
 }

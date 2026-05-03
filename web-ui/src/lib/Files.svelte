@@ -189,7 +189,10 @@
       }
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
-      restoreMsg = { ok: true, text: `Restore started: ${data.path} v${data.version_used}` };
+      restoreMsg = {
+        ok: true,
+        text: `Restored to ${data.staging_path || data.path} (v${data.version_used})`,
+      };
     } catch (e) {
       restoreMsg = { ok: false, text: `Restore failed: ${e.message}` };
     }

@@ -120,6 +120,9 @@ pub fn render_restore(data: &RestoreData) -> String {
     };
     out.push_str(&format!("  hash:     {}\n", hash_display));
     out.push_str(&format!("  status:   {}\n", data.status));
+    if !data.staging_path.is_empty() {
+        out.push_str(&format!("  staging:  {}\n", data.staging_path));
+    }
     out
 }
 

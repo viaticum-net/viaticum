@@ -2,6 +2,9 @@
 
 mod embedded;
 
+#[cfg(test)]
+mod tests;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -195,6 +198,11 @@ async fn handle_restore(
         // RestoreBlocker so the UI can show a precise reason and ETA.
         CliResponse::RestoreBlocked(blocker) => {
             (StatusCode::CONFLICT, Json(blocker)).into_response()
+        }
+        // 400 Bad Request: dest is not supported in alpha.
+        CliResponse::Error(ref e) if e == "dest_not_supported_in_alpha" => {
+            let body = serde_json::json!({ "error": "dest_not_supported_in_alpha" });
+            (StatusCode::BAD_REQUEST, Json(body)).into_response()
         }
         CliResponse::Error(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "unexpected response").into_response(),

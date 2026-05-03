@@ -236,6 +236,15 @@ impl DaemonHandle {
         let holdings_dir = cfg.data_dir.join("holdings");
         std::fs::create_dir_all(&holdings_dir)?;
 
+        // ── 9.1. Ensure restore staging directory exists ──────────────────────
+        let staging_root = cfg.data_dir.join("restore");
+        std::fs::create_dir_all(&staging_root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&staging_root, std::fs::Permissions::from_mode(0o700))?;
+        }
+
         // ── 9.5. Start libp2p swarm (before subsystems so they can receive swarm handle) ──
         // swarm_event_rx is consumed by Processor::run below.
         let (swarm_handle_arc, swarm_event_rx) = {
@@ -359,6 +368,8 @@ impl DaemonHandle {
                 device_id,
                 symbols_dir: symbols_dir.clone(),
                 swarm: swarm_handle_arc.clone(),
+                staging_root: staging_root.clone(),
+                data_dir: cfg.data_dir.clone(),
             },
             encoder.clone(),
         );
@@ -465,6 +476,33 @@ impl DaemonHandle {
         tasks.push(tokio::spawn(backup.run(dirty_rx, backup_event_rx)));
         tasks.push(tokio::spawn(restore.run(restore_rx)));
         tasks.push(tokio::spawn(repair.run(repair_interval_secs, repair_rx)));
+
+        // ── 9.2. Spawn staging cleanup checker (warn if staging dir is large) ──
+        {
+            let staging_root_for_warn = staging_root.clone();
+            let warn_bytes = (app_config.restore.staging_warn_gb * 1_073_741_824.0) as u64;
+            let cancel_for_warn = cancel.clone();
+            tasks.push(tokio::spawn(async move {
+                // Check immediately at startup.
+                tokio::task::block_in_place(|| {
+                    crate::daemon::restore::cleanup::check_staging_warn(&staging_root_for_warn, warn_bytes);
+                });
+                // Then check every hour.
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+                interval.tick().await; // skip immediate tick (already checked above)
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            tokio::task::block_in_place(|| {
+                                crate::daemon::restore::cleanup::check_staging_warn(&staging_root_for_warn, warn_bytes);
+                            });
+                        }
+                        _ = cancel_for_warn.cancelled() => break,
+                    }
+                }
+                Ok(())
+            }));
+        }
         // Board sync must be faster than PoS timeout so challenges
         // arrive before they expire. POS_TIMEOUT_SECS/time_scale gives
         // the effective timeout; sync at ~1/3 of that, floor 2s.

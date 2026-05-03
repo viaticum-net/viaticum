@@ -336,6 +336,24 @@ async fn dispatch_connect_valid_addr_but_unreachable_returns_error() {
 // dispatch_connect_two_daemons_registers_peer removed in ε.5 (iroh removal).
 // The libp2p equivalent test should be in swarm_tests.rs.
 
+/// C3: Restore with dest returns "dest_not_supported_in_alpha" error.
+#[tokio::test]
+async fn restore_with_dest_returns_error() {
+    let state = make_test_state().await;
+    let request = CliRequest::Restore {
+        path: "/some/file.txt".into(),
+        version: None,
+        date: None,
+        dest: Some("/tmp/custom_dest".to_string()),
+    };
+    let response = dispatch(request, &state).await;
+    assert_eq!(
+        response,
+        CliResponse::Error("dest_not_supported_in_alpha".to_string()),
+        "dest must be rejected with dest_not_supported_in_alpha, got: {response:?}"
+    );
+}
+
 #[cfg(any())]
 async fn _removed_dispatch_connect_two_daemons_registers_peer() {
     use std::sync::Arc;
