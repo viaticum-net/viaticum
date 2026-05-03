@@ -19,6 +19,7 @@ use syncback::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, Dirt
 use syncback::daemon::backup::pipeline::{compress_and_encrypt, decrypt_and_decompress};
 use syncback::daemon::relay::{RelayConfig, RelayManager};
 use syncback::daemon::restore::{RestoreConfig, RestoreCoordinator, RestoreRequest, VersionSelector};
+use syncback::daemon::restore::staging::JobId;
 use syncback_core::constants::MAX_BOARD_ENTRIES;
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder, Symbol};
@@ -71,7 +72,10 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
 }
 
 /// Restore config pointing at the same symbols_dir.
-fn restore_config(symbols_dir: &TempDir) -> RestoreConfig {
+/// `staging_dir` is used as both data_dir and parent for restore/.
+fn restore_config(symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreConfig {
+    let staging_root = staging_dir.path().join("restore");
+    std::fs::create_dir_all(&staging_root).expect("create staging_root");
     RestoreConfig {
         epoch_key: EPOCH_KEY,
         parallel_holders: 5,
@@ -79,6 +83,8 @@ fn restore_config(symbols_dir: &TempDir) -> RestoreConfig {
         device_id: DEVICE_B,
         symbols_dir: symbols_dir.path().to_path_buf(),
         swarm: None,
+        staging_root,
+        data_dir: staging_dir.path().to_path_buf(),
     }
 }
 
@@ -99,7 +105,7 @@ async fn full_backup_restore_roundtrip() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
     let files_dir = TempDir::new().unwrap();
-    let out_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
 
     // Backup phase
     let content: Vec<u8> = (0..8192u32).map(|i| (i * 7 + 13) as u8).collect();
@@ -123,15 +129,15 @@ async fn full_backup_restore_roundtrip() {
     // Restore phase
     let restore = RestoreCoordinator::new(
         db.clone(),
-        restore_config(&symbols_dir),
+        restore_config(&symbols_dir, &staging_dir),
         Arc::new(RaptorQEncoder::new()),
     );
     let result = restore
         .restore(RestoreRequest {
             path: path.clone(),
             version_selector: VersionSelector::Latest,
-            output_dir: out_dir.path().to_path_buf(),
             device_id: DEVICE_B,
+            job_id: JobId::new(),
         })
         .await
         .unwrap();
@@ -139,9 +145,9 @@ async fn full_backup_restore_roundtrip() {
     assert_eq!(result.files_restored, 1, "failures: {:?}", result.failures);
     assert!(result.failures.is_empty());
 
-    // Byte-for-byte verify
+    // Byte-for-byte verify — file is in staging_path
     let rel = path.trim_start_matches('/');
-    let restored = std::fs::read(out_dir.path().join(rel)).unwrap();
+    let restored = std::fs::read(result.staging_path.join(rel)).unwrap();
     assert_eq!(restored, content, "restored content must match original byte-for-byte");
 }
 
@@ -155,7 +161,7 @@ async fn backup_restore_pack_multiple_files() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
     let files_dir = TempDir::new().unwrap();
-    let out_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
 
     let test_files: Vec<(&str, Vec<u8>)> = vec![
         ("alpha.txt", b"alpha content --- first file in the pack".to_vec()),
@@ -187,7 +193,7 @@ async fn backup_restore_pack_multiple_files() {
     // Restore by prefix (the files_dir path)
     let restore = RestoreCoordinator::new(
         db.clone(),
-        restore_config(&symbols_dir),
+        restore_config(&symbols_dir, &staging_dir),
         Arc::new(RaptorQEncoder::new()),
     );
     let prefix = files_dir.path().to_string_lossy().to_string() + "/";
@@ -195,8 +201,8 @@ async fn backup_restore_pack_multiple_files() {
         .restore(RestoreRequest {
             path: prefix,
             version_selector: VersionSelector::Latest,
-            output_dir: out_dir.path().to_path_buf(),
             device_id: DEVICE_B,
+            job_id: JobId::new(),
         })
         .await
         .unwrap();
@@ -205,12 +211,12 @@ async fn backup_restore_pack_multiple_files() {
     assert_eq!(result.blocks_fetched, 1, "all files are in one block");
     assert!(result.failures.is_empty());
 
-    // Byte-for-byte verify each file
+    // Byte-for-byte verify each file — files are in staging_path
     for (name, expected) in &test_files {
         let full_path = files_dir.path().join(name);
         let rel = full_path.to_string_lossy();
         let rel = rel.trim_start_matches('/');
-        let restored = std::fs::read(out_dir.path().join(rel)).unwrap();
+        let restored = std::fs::read(result.staging_path.join(rel)).unwrap();
         assert_eq!(&restored, expected, "content mismatch for {}", name);
     }
 }

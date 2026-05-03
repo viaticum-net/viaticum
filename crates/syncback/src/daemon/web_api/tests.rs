@@ -75,7 +75,6 @@ fn build_test_router(state: Arc<DaemonState>) -> axum::Router {
     use axum::routing::post;
     use axum::extract::{State, Json};
     use axum::http::StatusCode;
-    use axum::response::IntoResponse;
     use crate::daemon::dispatch::dispatch;
     use crate::cli::types::CliResponse;
 

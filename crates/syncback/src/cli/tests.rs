@@ -527,6 +527,7 @@ fn format_restore_includes_path_version_status() {
         version_used: 3,
         content_hash_hex: "aabbccdd11223344556677889900aabb".into(),
         status: "started".into(),
+        staging_path: "".into(),
     };
     let rendered = output::render_restore(&data);
     assert!(rendered.contains("restore started"), "got: {rendered}");
@@ -542,6 +543,7 @@ fn format_restore_hash_truncated_to_16_chars() {
         version_used: 1,
         content_hash_hex: "aabbccdd11223344556677889900aabb".into(),
         status: "queued".into(),
+        staging_path: "".into(),
     };
     let rendered = output::render_restore(&data);
     // First 16 chars + "..."
@@ -555,6 +557,7 @@ fn format_restore_short_hash_not_truncated() {
         version_used: 1,
         content_hash_hex: "aabb".into(),
         status: "queued".into(),
+        staging_path: "".into(),
     };
     let rendered = output::render_restore(&data);
     assert!(rendered.contains("aabb"), "got: {rendered}");
@@ -823,6 +826,7 @@ fn cli_response_roundtrips_cbor() {
             version_used: 2,
             content_hash_hex: "aa".repeat(32),
             status: "queued".into(),
+            staging_path: "".into(),
         }),
         CliResponse::DeviceRevoked {
             device_id_hex: "01".repeat(16),

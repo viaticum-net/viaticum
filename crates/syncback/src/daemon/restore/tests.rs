@@ -16,7 +16,7 @@ use syncback_core::db::Db;
 use syncback_core::erasure::RaptorQEncoder;
 use syncback_core::types::{
     DeviceId, ErasureParams, FileId, FileRecord, FileVersion, IdentityPub, LocalState, PackEntry,
-    PlacementStatus, SourceBlockId,
+    PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType,
     SymbolPlacement, Timestamp,
 };
 use syncback_core::types::to_cbor_bytes;
@@ -1312,8 +1312,6 @@ async fn default_restore_writes_to_staging_not_origin() {
 /// Simulates a malicious DR blob where record.path = "../../../etc/cron.d/evil".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn path_traversal_from_db_record_is_rejected() {
-    use syncback_core::types::{FileId, FileVersion, SourceBlockId, Timestamp};
-    use syncback_core::db::Db;
     use syncback_core::path_safety::PathSafetyError;
 
     let db = Db::open_in_memory().unwrap();
@@ -1342,12 +1340,12 @@ async fn path_traversal_from_db_record_is_rejected() {
     db.upsert_file(&record).unwrap();
 
     // Insert a source block record.
-    let source_block = syncback_core::db::SourceBlockRecord {
+    let source_block = SourceBlockRecord {
         block_id,
         k: 2,
         t: 65_535,
-        block_type: syncback_core::types::SourceBlockType::Single,
-        status: syncback_core::db::SourceBlockStatus::Active,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
         created_at: Timestamp(100),
         encrypted_size: Some(10),
         n: None,
@@ -1356,7 +1354,7 @@ async fn path_traversal_from_db_record_is_rejected() {
     };
     db.upsert_source_block(&source_block).unwrap();
 
-    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
+    let _restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
 
     // The restore will try to decode a block — it will fail because there are no symbols.
     // But before that, if extract_and_write_file is called, path validation must reject it.

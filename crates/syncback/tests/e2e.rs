@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use syncback::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
 
 use syncback::daemon::restore::{RestoreConfig, RestoreCoordinator, RestoreRequest, VersionSelector};
+use syncback::daemon::restore::staging::JobId;
 use syncback_core::cluster::{
     derive_device_key, derive_epoch_key, derive_master_key, issue_device_certificate,
     issue_revocation, master_identity, ClusterState, EpochCounter,
@@ -59,7 +60,9 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
     }
 }
 
-fn restore_config(symbols_dir: &TempDir) -> RestoreConfig {
+fn restore_config(symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreConfig {
+    let staging_root = staging_dir.path().join("restore");
+    std::fs::create_dir_all(&staging_root).expect("create staging_root");
     RestoreConfig {
         epoch_key: EPOCH_KEY,
         parallel_holders: 5,
@@ -67,6 +70,8 @@ fn restore_config(symbols_dir: &TempDir) -> RestoreConfig {
         device_id: device_b(),
         symbols_dir: symbols_dir.path().to_path_buf(),
         swarm: None,
+        staging_root,
+        data_dir: staging_dir.path().to_path_buf(),
     }
 }
 
@@ -200,20 +205,20 @@ async fn full_lifecycle_e2e() {
 
     // ── Step 3: Selective restore ─────────────────────────────────────────────
 
+    let staging_dir = TempDir::new().unwrap();
     let restore = RestoreCoordinator::new(
         db.clone(),
-        restore_config(&symbols_dir),
+        restore_config(&symbols_dir, &staging_dir),
         Arc::new(RaptorQEncoder::new()),
     );
 
     // 3a — restore photo.jpg at Latest version → must be v1 (new_photo_content)
-    let out_latest = TempDir::new().unwrap();
     let result_latest = restore
         .restore(RestoreRequest {
             path: photo_path.clone(),
             version_selector: VersionSelector::Latest,
-            output_dir: out_latest.path().to_path_buf(),
             device_id: device_b(),
+            job_id: JobId::new(),
         })
         .await
         .unwrap();
@@ -225,7 +230,7 @@ async fn full_lifecycle_e2e() {
     );
     assert!(result_latest.failures.is_empty());
     let rel = photo_path.trim_start_matches('/');
-    let restored_latest = std::fs::read(out_latest.path().join(rel)).unwrap();
+    let restored_latest = std::fs::read(result_latest.staging_path.join(rel)).unwrap();
     assert_eq!(
         restored_latest, new_photo_content,
         "Latest restore must return v1 (modified) content"
@@ -234,13 +239,12 @@ async fn full_lifecycle_e2e() {
     eprintln!("[E2E] Step 3a: Latest restore — byte-for-byte match (v1)");
 
     // 3b — restore photo.jpg at Index(0) → must be v0 (original_photo)
-    let out_v0 = TempDir::new().unwrap();
     let result_v0 = restore
         .restore(RestoreRequest {
             path: photo_path.clone(),
             version_selector: VersionSelector::Index(0),
-            output_dir: out_v0.path().to_path_buf(),
             device_id: device_b(),
+            job_id: JobId::new(),
         })
         .await
         .unwrap();
@@ -251,7 +255,7 @@ async fn full_lifecycle_e2e() {
         result_v0.failures
     );
     assert!(result_v0.failures.is_empty());
-    let restored_v0 = std::fs::read(out_v0.path().join(rel)).unwrap();
+    let restored_v0 = std::fs::read(result_v0.staging_path.join(rel)).unwrap();
     assert_eq!(
         restored_v0, original_photo,
         "Index(0) restore must return v0 (original) content"
@@ -260,14 +264,13 @@ async fn full_lifecycle_e2e() {
     eprintln!("[E2E] Step 3b: Version(0) restore — byte-for-byte match (v0)");
 
     // 3c — restore by directory prefix → all 3 files
-    let out_all = TempDir::new().unwrap();
     let prefix = files_dir.path().to_string_lossy().to_string() + "/";
     let result_all = restore
         .restore(RestoreRequest {
             path: prefix,
             version_selector: VersionSelector::Latest,
-            output_dir: out_all.path().to_path_buf(),
             device_id: device_b(),
+            job_id: JobId::new(),
         })
         .await
         .unwrap();

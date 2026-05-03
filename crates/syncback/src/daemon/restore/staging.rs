@@ -54,6 +54,7 @@ pub enum StagingError {
 /// Per-job staging directory wrapper.
 /// All writes go through cap_std::fs::Dir which enforces O_NOFOLLOW semantics
 /// and prevents escape from the staging root.
+#[derive(Debug)]
 pub struct StagingWriter {
     /// cap_std directory handle rooted at the job staging directory.
     dir: Dir,
