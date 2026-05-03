@@ -44,6 +44,8 @@ dirs = "5"
 urlencoding = "2"
 rust-embed = { version = "8", features = ["mime-guess"] }
 mime_guess = "2"
+cap-std = { workspace = true }
+uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.6"
