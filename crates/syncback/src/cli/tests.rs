@@ -251,6 +251,8 @@ fn make_status_zero_peers() -> StatusData {
         device_id: "0000000000000000".into(),
         node_addr: String::new(),
         peer_count: 0,
+        peer_count_connected: 0,
+        peer_count_authenticated: 0,
         avg_trust: 0.0,
         holding_bytes: 0,
         backed_up_files: 0,
@@ -300,6 +302,8 @@ fn format_status_top_peers_printed() {
         device_id: "a1b2c3d4e5f60708".into(),
         node_addr: String::new(),
         peer_count: 2,
+        peer_count_connected: 2,
+        peer_count_authenticated: 2,
         avg_trust: 2.09,
         holding_bytes: 0,
         backed_up_files: 0,
@@ -317,6 +321,7 @@ fn format_status_top_peers_printed() {
                 trust_s: 0.9,
                 pos_challenges_recent: 4,
                 pos_passes_recent: 4,
+                link: "auth".into(),
             },
             PeerSummary {
                 identity_hex: "e5f60708090a0b0c".into(),
@@ -329,6 +334,7 @@ fn format_status_top_peers_printed() {
                 trust_s: 0.85,
                 pos_challenges_recent: 4,
                 pos_passes_recent: 3,
+                link: "known".into(),
             },
         ],
         effective_quota_bytes: 0,
@@ -368,6 +374,7 @@ fn format_files_single_entry_singular_version() {
         last_backed_up: "2026-03-20".into(),
         size_bytes: 250_000,
         local_state: "present".into(),
+        effective_status: None,
     }];
     let rendered = output::render_files(&files);
     assert!(rendered.contains("1 version"), "got: {rendered}");
@@ -384,6 +391,7 @@ fn format_files_multiple_versions_plural() {
         last_backed_up: "2026-03-21".into(),
         size_bytes: 1_048_576,
         local_state: "present".into(),
+        effective_status: None,
     }];
     let rendered = output::render_files(&files);
     assert!(rendered.contains("5 versions"), "got: {rendered}");
@@ -412,6 +420,8 @@ fn format_versions_pending_backed_up() {
         content_hash_hex: "ab".repeat(32),
         size_bytes: 1_048_576,
         source_block_id_hex: "cd".repeat(32),
+        effective_status: crate::cli::types::EffectiveStatus::Queued,
+        restore_blocker: None,
     };
     let rendered = output::render_versions("f", &[entry]);
     assert!(rendered.contains("pending"), "got: {rendered}");
@@ -428,6 +438,8 @@ fn format_versions_hash_truncated_to_8_chars() {
         content_hash_hex: "aabbccdd11223344".repeat(4),
         size_bytes: 512,
         source_block_id_hex: "11223344aabbccdd".repeat(4),
+        effective_status: crate::cli::types::EffectiveStatus::Restorable { live: 8, target: 5 },
+        restore_blocker: None,
     };
     let rendered = output::render_versions("test.txt", &[entry]);
     assert!(rendered.contains("aabbccdd..."), "got: {rendered}");
@@ -785,6 +797,8 @@ fn cli_response_roundtrips_cbor() {
             device_id: "aabbccdd11223344".into(),
             node_addr: String::new(),
             peer_count: 3,
+            peer_count_connected: 3,
+            peer_count_authenticated: 3,
             avg_trust: 1.5,
             holding_bytes: 1_000_000,
             backed_up_files: 10,

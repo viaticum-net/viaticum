@@ -159,6 +159,11 @@ pub struct NetworkCfg {
     /// Set to false only if you have custom bootstrap infrastructure on the IPFS DHT.
     #[serde(default)]
     pub kademlia_disable_ipfs_bootstrap: bool,
+
+    /// libp2p TCP listen port. 0 = ephemeral (default). Set to a fixed value
+    /// when running behind a firewall that only opens specific ports.
+    #[serde(default)]
+    pub listen_port: u16,
 }
 
 // ============================================================
@@ -201,6 +206,7 @@ impl Default for NetworkCfg {
             bootstrap_peers: vec![],
             kademlia_bootstrap_peers: vec![],
             kademlia_disable_ipfs_bootstrap: true,
+            listen_port: 0,
         }
     }
 }

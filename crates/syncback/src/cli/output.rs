@@ -1,5 +1,5 @@
 use crate::cli::types::{
-    DeviceEntry, FileEntry, RestoreData, StatusData, VersionEntry,
+    DeviceEntry, FileEntry, RestoreBlocker, RestoreData, StatusData, VersionEntry,
 };
 
 /// Format bytes as human-readable size string.
@@ -126,6 +126,28 @@ pub fn render_restore(data: &RestoreData) -> String {
 /// Format and print RestoreData to stdout.
 pub fn format_restore(data: &RestoreData) {
     print!("{}", render_restore(data));
+}
+
+/// Render a structured RestoreBlocker to stderr-suitable text.
+pub fn format_restore_blocked(b: &RestoreBlocker) {
+    eprintln!("restore blocked:");
+    match b {
+        RestoreBlocker::InsufficientPlacements { have, need, holders_offline } => {
+            eprintln!("  reason: not enough live holders ({have}/{need} symbols, ~{holders_offline} offline)");
+            eprintln!("  hint:   wait for offline peers to come back, or trigger repair");
+        }
+        RestoreBlocker::EscrowLocked { budget_gb, needed_gb, est_seconds } => {
+            eprintln!("  reason: holders refused via escrow (budget {budget_gb:.2} GB, needed {needed_gb:.2} GB)");
+            if let Some(s) = est_seconds {
+                eprintln!("  eta:    ~{} sec until budget catches up", s);
+            } else {
+                eprintln!("  hint:   you need to hold data for other peers to earn restore credit");
+            }
+        }
+        RestoreBlocker::AllHoldersOffline { last_seen_secs_ago } => {
+            eprintln!("  reason: all holders offline (last seen {last_seen_secs_ago}s ago)");
+        }
+    }
 }
 
 /// Render a list of DeviceEntry to a String.

@@ -271,6 +271,17 @@ enum SwarmCommand {
     ListenAddrs {
         reply: oneshot::Sender<Vec<Multiaddr>>,
     },
+    /// Snapshot of swarm peer-set: connected_count vs authenticated_count.
+    /// Connected = libp2p has a live transport-level link (post-Noise+identify).
+    /// Authenticated = our cert exchange has succeeded (heavy messages allowed).
+    PeerCounts {
+        reply: oneshot::Sender<(u32, u32)>,
+    },
+    /// Snapshot of which DeviceIds are currently authenticated and which are
+    /// only connected (post-Noise but cert exchange in flight or never started).
+    PeerSets {
+        reply: oneshot::Sender<(HashSet<DeviceId>, HashSet<DeviceId>)>,
+    },
     /// Look up the PeerId for a DeviceId (checks authenticated map).
     LookupPeer {
         device: DeviceId,
@@ -488,6 +499,12 @@ impl SwarmHandle {
             })
             .build();
 
+        // Listen-port handover retry: when the daemon self-rexecs (Settings UI
+        // "Save & restart"), the child briefly races the parent for the listen
+        // port. Probe the port up to ~10s before handing off to libp2p.
+        if config.listen_port != 0 {
+            wait_for_tcp_port_free("0.0.0.0", config.listen_port).await;
+        }
         swarm
             .listen_on(
                 format!("/ip4/0.0.0.0/tcp/{}", config.listen_port)
@@ -615,6 +632,29 @@ impl SwarmHandle {
         reply_rx.await.map_err(|_| SwarmError::ChannelClosed)
     }
 
+    /// Snapshot of peer counts: (connected, authenticated).
+    pub async fn peer_counts(&self) -> Result<(u32, u32), SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::PeerCounts { reply: reply_tx })
+            .await
+            .map_err(|_| SwarmError::ChannelClosed)?;
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)
+    }
+
+    /// Snapshot of authenticated and connected DeviceId sets.
+    /// authenticated ⊆ connected (cert exchange done implies live connection).
+    pub async fn peer_sets(
+        &self,
+    ) -> Result<(HashSet<DeviceId>, HashSet<DeviceId>), SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::PeerSets { reply: reply_tx })
+            .await
+            .map_err(|_| SwarmError::ChannelClosed)?;
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)
+    }
+
     /// Send a protocol Message to a peer by master IdentityPub.
     ///
     /// Scans the authenticated map for any device whose master identity matches.
@@ -709,7 +749,9 @@ struct EventLoopState {
     device_to_peer: HashMap<DeviceId, PeerId>,
 
     /// PeerId → deadline for DeviceCertExchange timeout.
-    pending_cert: HashMap<PeerId, Instant>,
+    /// peer_id → (deadline, attempts_so_far). Dialer side only — listener
+    /// just waits for inbound cert request.
+    pending_cert: HashMap<PeerId, (Instant, u8)>,
 
     /// OutboundRequestId → oneshot sender for send_to_device responses.
     pending_requests: HashMap<OutboundRequestId, oneshot::Sender<Result<Message, SwarmError>>>,
@@ -748,6 +790,13 @@ impl EventLoopState {
     async fn run(mut self) {
         use futures::StreamExt;
         let mut cert_check = tokio::time::interval(Duration::from_secs(1));
+        // Periodic re-auth: every 10 minutes, re-issue cert request to every
+        // connected peer that is not authenticated yet. Catches: cert request
+        // exhausted retries (peer kept dropping requests) but the connection is
+        // still alive, OR new connection arrived as listener side and the
+        // dialer never sent their request.
+        let mut cert_sweep = tokio::time::interval(Duration::from_secs(600));
+        cert_sweep.tick().await; // skip immediate
 
         // Trigger Kademlia bootstrap on first iteration.
         self.do_bootstrap();
@@ -768,6 +817,9 @@ impl EventLoopState {
                 }
                 _ = cert_check.tick() => {
                     self.check_cert_timeouts().await;
+                }
+                _ = cert_sweep.tick() => {
+                    self.sweep_unauthenticated_connected().await;
                 }
                 _ = self.kad_republish_timer.tick() => {
                     self.do_kad_republish();
@@ -790,18 +842,19 @@ impl EventLoopState {
                 debug!(peer_id = %peer_id, "connection established");
                 // Clear dialing set entry now that connection is established.
                 self.dialing.remove(&peer_id);
-                // Record deadline for DeviceCertExchange.
-                let deadline = Instant::now() + self.cert_timeout;
-                self.pending_cert.insert(peer_id, deadline);
 
                 // Dialer sends the cert first; listener waits for inbound request.
+                // pending_cert is tracked only for the dialer side so the timeout
+                // task can retry the request — listener has nothing to retry.
                 if endpoint.is_dialer() {
+                    let deadline = Instant::now() + self.cert_timeout;
+                    self.pending_cert.insert(peer_id, (deadline, 1));
                     let msg = DeviceCertExchangeMsg {
                         cert: self.our_cert.clone(),
                         x25519_pub: self.our_x25519_pub,
                     };
                     let _req_id = self.swarm.behaviour_mut().cert.send_request(&peer_id, msg);
-                    debug!(peer_id = %peer_id, "sent DeviceCertExchange as dialer");
+                    debug!(peer_id = %peer_id, "sent DeviceCertExchange as dialer (attempt 1)");
                 }
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -1388,6 +1441,29 @@ impl EventLoopState {
                 let addrs: Vec<Multiaddr> = self.swarm.listeners().cloned().collect();
                 let _ = reply.send(addrs);
             }
+            SwarmCommand::PeerCounts { reply } => {
+                let connected = self.swarm.connected_peers().count() as u32;
+                let authenticated = self.authenticated.len() as u32;
+                let _ = reply.send((connected, authenticated));
+            }
+            SwarmCommand::PeerSets { reply } => {
+                let auth_devices: HashSet<DeviceId> = self
+                    .authenticated
+                    .values()
+                    .map(|(did, _, _)| *did)
+                    .collect();
+                let mut conn_devices: HashSet<DeviceId> = HashSet::new();
+                for peer_id in self.swarm.connected_peers() {
+                    if let Some((did, _, _)) = self.authenticated.get(peer_id) {
+                        conn_devices.insert(*did);
+                    }
+                }
+                // conn_devices currently only includes auth ones (we don't keep
+                // a peer_id → device_id map for unauthenticated). That's fine —
+                // `auth ⊆ conn` is preserved; "conn but not auth" simply isn't
+                // attributable to a specific master and so isn't shown per-row.
+                let _ = reply.send((auth_devices, conn_devices));
+            }
             SwarmCommand::LookupPeer { device, reply } => {
                 let result = self
                     .device_to_peer
@@ -1404,17 +1480,71 @@ impl EventLoopState {
         }
     }
 
+    /// Periodic sweep: every connected peer that is not yet authenticated
+    /// gets a fresh cert request. Resets retry count to 1. Idempotent on the
+    /// listener side (it just responds with its own cert).
+    async fn sweep_unauthenticated_connected(&mut self) {
+        let connected: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+        let mut sent = 0u32;
+        for peer_id in connected {
+            if self.authenticated.contains_key(&peer_id) {
+                continue;
+            }
+            let new_deadline = Instant::now() + self.cert_timeout;
+            self.pending_cert.insert(peer_id, (new_deadline, 1));
+            let msg = DeviceCertExchangeMsg {
+                cert: self.our_cert.clone(),
+                x25519_pub: self.our_x25519_pub,
+            };
+            let _req_id = self.swarm.behaviour_mut().cert.send_request(&peer_id, msg);
+            sent += 1;
+        }
+        if sent > 0 {
+            info!(unauthenticated_connected = sent, "cert sweep: re-issued cert requests");
+        }
+    }
+
     async fn check_cert_timeouts(&mut self) {
+        // Cert request can be lost on flaky links (proxies, NAT-traversal,
+        // tunnel jitter). Retry up to MAX_CERT_RETRIES before tearing down
+        // the connection — a fresh dial would have to come from peer
+        // discovery, which may not happen for hours.
+        const MAX_CERT_RETRIES: u8 = 10;
+
         let now = Instant::now();
-        let timed_out: Vec<PeerId> = self
+        let timed_out: Vec<(PeerId, u8)> = self
             .pending_cert
             .iter()
-            .filter(|(_, deadline)| **deadline < now)
-            .map(|(pid, _)| *pid)
+            .filter(|(_, (deadline, _))| *deadline < now)
+            .map(|(pid, (_, attempts))| (*pid, *attempts))
             .collect();
 
-        for peer_id in timed_out {
-            warn!(peer_id = %peer_id, "cert exchange timed out, closing connection");
+        for (peer_id, attempts) in timed_out {
+            // pending_cert only contains dialer-side entries (see ConnectionEstablished),
+            // so we always retry until the cap.
+            if attempts < MAX_CERT_RETRIES {
+                let new_deadline = Instant::now() + self.cert_timeout;
+                self.pending_cert
+                    .insert(peer_id, (new_deadline, attempts + 1));
+                let msg = DeviceCertExchangeMsg {
+                    cert: self.our_cert.clone(),
+                    x25519_pub: self.our_x25519_pub,
+                };
+                let _req_id = self.swarm.behaviour_mut().cert.send_request(&peer_id, msg);
+                warn!(
+                    peer_id = %peer_id,
+                    attempt = attempts + 1,
+                    max = MAX_CERT_RETRIES,
+                    "cert exchange timed out — retrying"
+                );
+                continue;
+            }
+
+            warn!(
+                peer_id = %peer_id,
+                attempts,
+                "cert exchange exhausted retries, closing connection"
+            );
             self.pending_cert.remove(&peer_id);
             self.swarm.disconnect_peer_id(peer_id).ok();
             let ev = ProtocolEvent::ConnectionClosed {
@@ -1436,6 +1566,35 @@ fn emit_event(tx: &mpsc::Sender<ProtocolEvent>, event: ProtocolEvent) {
     if tx.try_send(event).is_err() {
         warn!("event_tx full or closed, dropping protocol event");
     }
+}
+
+/// Probe the given TCP port; if it is held by another process (e.g. the
+/// previous daemon instance during self-rexec), retry with 1s/2s/4s/4s
+/// backoff (≤ 11s total) before giving up. Always returns — this is a
+/// best-effort wait; libp2p's `listen_on` will surface a real error if
+/// the port is still held when we hand off.
+async fn wait_for_tcp_port_free(host: &str, port: u16) {
+    use std::net::TcpListener;
+    let addr = format!("{host}:{port}");
+    let backoffs_ms = [0u64, 1000, 2000, 4000, 4000];
+    for (i, ms) in backoffs_ms.iter().enumerate() {
+        if *ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
+        }
+        match TcpListener::bind(&addr) {
+            Ok(l) => {
+                drop(l); // release immediately so libp2p can rebind
+                if i > 0 {
+                    info!(port, attempts = i + 1, "listen port became available");
+                }
+                return;
+            }
+            Err(e) => {
+                warn!(port, attempt = i + 1, error = %e, "listen port not free yet, retrying");
+            }
+        }
+    }
+    warn!(port, "listen port still held after retries; libp2p listen will likely fail");
 }
 
 // ─── Helper functions ─────────────────────────────────────────────────────────

@@ -12,10 +12,11 @@ use axum::Router;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::types::{
-    CliRequest, CliResponse, DeviceEntry, FileEntry, RestoreData, StatusData, VersionEntry,
+    CliRequest, CliResponse, DeviceEntry, FileEntry, StatusData, VersionEntry,
 };
 use crate::daemon::dispatch::dispatch;
 use crate::daemon::handle::DaemonState;
+use crate::daemon::config_admin::{ConfigAdminError, EditableConfig};
 use crate::daemon::watch_admin::{
     AddWatchRequest, DeleteWatchQuery, PatchWatchRequest, WatchAdminError, WatchDefaults,
     WatchEntry,
@@ -78,6 +79,11 @@ pub async fn start_with_listener(
         )
         .route("/api/watches/{path_b64}/scan", axum::routing::post(handle_watches_scan))
         .route("/api/browse", axum::routing::get(handle_browse))
+        .route(
+            "/api/config",
+            axum::routing::get(handle_config_get).put(handle_config_put),
+        )
+        .route("/api/restart", axum::routing::post(handle_restart))
         .with_state(state)
         .route_layer(axum::middleware::from_fn_with_state(
             auth.clone(),
@@ -175,7 +181,8 @@ struct RestoreBody {
 async fn handle_restore(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<RestoreBody>,
-) -> Result<Json<RestoreData>, (StatusCode, String)> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let req = CliRequest::Restore {
         path: body.path,
         version: body.version,
@@ -183,9 +190,14 @@ async fn handle_restore(
         dest: body.dest,
     };
     match dispatch(req, &state).await {
-        CliResponse::Restore(data) => Ok(Json(data)),
-        CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
-        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "unexpected response".into())),
+        CliResponse::Restore(data) => (StatusCode::OK, Json(data)).into_response(),
+        // 409 Conflict: restore preconditions not met. Body is structured
+        // RestoreBlocker so the UI can show a precise reason and ETA.
+        CliResponse::RestoreBlocked(blocker) => {
+            (StatusCode::CONFLICT, Json(blocker)).into_response()
+        }
+        CliResponse::Error(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "unexpected response").into_response(),
     }
 }
 
@@ -333,6 +345,90 @@ async fn handle_watches_refresh(
     let admin = require_watch_admin(&state)?;
     admin.recompute_all_rollups().map_err(watch_admin_err)?;
     Ok(StatusCode::OK)
+}
+
+// ── Config + restart handlers ─────────────────────────────────────────────────
+
+fn require_config_admin(
+    state: &DaemonState,
+) -> Result<&std::sync::Arc<crate::daemon::config_admin::ConfigAdmin>, (StatusCode, String)> {
+    state.config_admin.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config admin not available".to_string(),
+        )
+    })
+}
+
+async fn handle_config_get(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<Json<EditableConfig>, (StatusCode, String)> {
+    let admin = require_config_admin(&state)?;
+    admin
+        .read_editable()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+#[derive(serde::Serialize)]
+struct ConfigPutOk {
+    ok: bool,
+}
+
+#[derive(serde::Serialize)]
+struct ConfigPutErr {
+    field: String,
+    error: String,
+}
+
+async fn handle_config_put(
+    State(state): State<Arc<DaemonState>>,
+    Json(body): Json<EditableConfig>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let admin = match require_config_admin(&state) {
+        Ok(a) => a,
+        Err((s, msg)) => return (s, msg).into_response(),
+    };
+    match admin.update(body).await {
+        Ok(()) => (StatusCode::OK, Json(ConfigPutOk { ok: true })).into_response(),
+        Err(ConfigAdminError::Validation { field, msg }) => (
+            StatusCode::BAD_REQUEST,
+            Json(ConfigPutErr {
+                field,
+                error: msg,
+            }),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct RestartScheduled {
+    scheduled: bool,
+}
+
+async fn handle_restart(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<(StatusCode, Json<RestartScheduled>), (StatusCode, String)> {
+    let gate = state.restart_gate.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "restart gate not available".to_string(),
+        )
+    })?;
+    // Spawn the actual rexec on a blocking task so we can return 202 promptly,
+    // then let the runtime drain on the cancelled token.
+    let gate = gate.clone();
+    let token = state.shutdown_token.clone();
+    tokio::spawn(async move {
+        // Tiny grace period so the 202 response actually lands at the client
+        // before the swarm starts dropping connections.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        gate.trigger(&token);
+    });
+    Ok((StatusCode::ACCEPTED, Json(RestartScheduled { scheduled: true })))
 }
 
 // ── Filesystem browser ────────────────────────────────────────────────────────

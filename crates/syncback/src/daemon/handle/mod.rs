@@ -88,6 +88,15 @@ pub struct DaemonState {
     /// Watch admin — manages dynamic folder add/remove/status.
     /// None if web API is disabled.
     pub watch_admin: Option<std::sync::Arc<crate::daemon::watch_admin::WatchAdmin>>,
+    /// Config admin — read/write the editable subset of config.toml.
+    /// None if web API is disabled.
+    pub config_admin: Option<std::sync::Arc<crate::daemon::config_admin::ConfigAdmin>>,
+    /// Restart gate — guards POST /api/restart so it only fires once.
+    /// None if web API is disabled.
+    pub restart_gate: Option<std::sync::Arc<crate::daemon::restart::RestartGate>>,
+    /// Cancellation token shared with the daemon runtime; the restart handler
+    /// cancels it after spawning the child to drain the current process.
+    pub shutdown_token: CancellationToken,
 }
 
 // ─── DaemonHandle ─────────────────────────────────────────────────────────────
@@ -101,6 +110,12 @@ pub struct DaemonHandle {
 }
 
 impl DaemonHandle {
+    /// Returns a clone of the internal cancellation token. Caller can `cancelled()`
+    /// it from main() to wake up on either Ctrl-C or an in-process restart trigger.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
     /// Start the daemon: load identity, open DB, build subsystems, spawn tasks.
     pub async fn start(cfg: DaemonConfig) -> Result<Self, anyhow::Error> {
         // Legacy data directory migration hint (one-shot WARN).
@@ -144,7 +159,11 @@ impl DaemonHandle {
         app_config.validate()?;
 
         // ── 3. Open DB ────────────────────────────────────────────────────────
-        let db = Db::open(&cfg.data_dir.join("db.redb"))?;
+        // Retry on lock contention: when the daemon self-rexecs (Settings UI
+        // restart), the child briefly races the parent for the redb file lock.
+        // Total wait ≤ 11 s — same envelope as the libp2p listen-port retry.
+        let db_path = cfg.data_dir.join("db.redb");
+        let db = open_db_with_retry(&db_path).await?;
 
         // ── 4. Derive keys ────────────────────────────────────────────────────
         // Epoch 0 is the initial epoch; epoch rotation happens on device revocation.
@@ -255,7 +274,7 @@ impl DaemonHandle {
                     identity_pub,
                     device_cert,
                     x25519_pub,
-                    listen_port: 0, // ephemeral port; configured port in ε.3
+                    listen_port: app_config.network.listen_port,
                     cert_timeout_secs: 10,
                     kademlia_bootstrap_peers,
                     kademlia_disable_ipfs_bootstrap: app_config
@@ -380,6 +399,11 @@ impl DaemonHandle {
             db.clone(),
         ));
 
+        // ── Step D.1: Create ConfigAdmin and RestartGate ──────────────────────
+        let config_admin =
+            Arc::new(crate::daemon::config_admin::ConfigAdmin::new(config_path.clone()));
+        let restart_gate = Arc::new(crate::daemon::restart::RestartGate::new());
+
         // ── 12. Build DaemonState (shared with CliServer) ─────────────────────
         // Clone restore_tx so CliServer can forward requests to RestoreCoordinator.
         // The original is held by the cancel task (dropped on shutdown to close channel).
@@ -404,6 +428,17 @@ impl DaemonHandle {
             } else {
                 None
             },
+            config_admin: if app_config.web_api.enabled {
+                Some(Arc::clone(&config_admin))
+            } else {
+                None
+            },
+            restart_gate: if app_config.web_api.enabled {
+                Some(Arc::clone(&restart_gate))
+            } else {
+                None
+            },
+            shutdown_token: cancel.clone(),
         });
 
         // Clone state for web API and metrics pusher.
@@ -783,6 +818,39 @@ impl DaemonHandle {
         }
         Ok(())
     }
+}
+
+// ── DB open retry ────────────────────────────────────────────────────────────
+
+/// Wrap `Db::open` in a 1s/2s/4s/4s backoff (≤ 11s total) so a freshly
+/// rexec'd child can wait for the parent to release the redb file lock.
+async fn open_db_with_retry(path: &std::path::Path) -> Result<Db, anyhow::Error> {
+    let backoffs_ms = [0u64, 1000, 2000, 4000, 4000];
+    let mut last_err: Option<anyhow::Error> = None;
+    for (i, ms) in backoffs_ms.iter().enumerate() {
+        if *ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
+        }
+        match Db::open(path) {
+            Ok(db) => {
+                if i > 0 {
+                    tracing::info!(attempts = i + 1, "db open succeeded after retry");
+                }
+                return Ok(db);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let is_lock = msg.contains("Database already open")
+                    || msg.contains("Cannot acquire lock");
+                if !is_lock {
+                    return Err(e.into());
+                }
+                tracing::warn!(attempt = i + 1, error = %msg, "db locked, retrying");
+                last_err = Some(e.into());
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("db open failed after retries")))
 }
 
 // ── Disk space ────────────────────────────────────────────────────────────────

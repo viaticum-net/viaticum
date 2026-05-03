@@ -487,6 +487,7 @@ fn handle_response(response: CliResponse, json_output: bool) {
             output::format_versions("", &versions)
         }
         CliResponse::Connected { peer_id } => output::format_connected(&peer_id),
+        CliResponse::RestoreBlocked(blocker) => output::format_restore_blocked(&blocker),
         CliResponse::Error(msg) => output::format_error(&msg),
     }
 }

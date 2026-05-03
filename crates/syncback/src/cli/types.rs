@@ -41,6 +41,9 @@ pub enum CliRequest {
 pub enum CliResponse {
     Status(StatusData),
     Restore(RestoreData),
+    /// Restore was rejected before any data movement; reason carried in `RestoreBlocker`.
+    /// Maps to HTTP 409 in `web_api`.
+    RestoreBlocked(RestoreBlocker),
     DeviceList(Vec<DeviceEntry>),
     DeviceAdded(DeviceEntry),
     DeviceRevoked { device_id_hex: String },
@@ -64,8 +67,21 @@ pub struct StatusData {
     pub device_id: String,
     /// This node's libp2p address (for `syncback connect`).
     pub node_addr: String,
-    /// Number of known peers.
+    /// Number of known peers (PeerRecord rows in DB — includes peers that
+    /// were once seen via libp2p `identify` but never completed the syncback
+    /// cert exchange). For the count of peers we can actually exchange heavy
+    /// messages with, use `peer_count_authenticated`.
     pub peer_count: u32,
+    /// Number of peers libp2p currently has a live transport-level connection
+    /// to (post-Noise + identify). Subset of `peer_count`. 0 if swarm is down.
+    #[serde(default)]
+    pub peer_count_connected: u32,
+    /// Number of peers that have completed the syncback cert exchange and
+    /// are authorised for placement / restore / PoS traffic. Strict subset of
+    /// `peer_count_connected`. Restored from in-memory swarm state, so this
+    /// resets on daemon restart until cert exchange runs again.
+    #[serde(default)]
+    pub peer_count_authenticated: u32,
     /// Average trust score across all peers (combined score).
     pub avg_trust: f64,
     /// Total bytes we are storing for others.
@@ -136,7 +152,15 @@ pub struct PeerSummary {
     /// PoS passes in last 4 weeks.
     #[serde(default)]
     pub pos_passes_recent: u32,
+    /// "auth" / "conn" / "known": "auth" — cert exchange complete (any device
+    /// of this master is in swarm.authenticated); "conn" — at least one device
+    /// has a live libp2p connection (post-Noise+identify) but cert exchange
+    /// hasn't finished; "known" — only PeerRecord row in DB, no live link.
+    #[serde(default = "default_link")]
+    pub link: String,
 }
+
+fn default_link() -> String { "known".to_string() }
 
 /// Data returned by `syncback restore`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -163,6 +187,44 @@ pub struct DeviceEntry {
     pub revoked: bool,
 }
 
+/// Lifecycle state for a file's latest version, computed from placement counts
+/// + escrow estimate. Drives the badge in the UI. See `compute_effective_status`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EffectiveStatus {
+    /// In encoder queue, no source block yet.
+    Queued,
+    /// Source block created, holders haven't accepted enough.
+    /// `live` = placements in Alive; `target` = `k_eff` for the block.
+    Replicating { live: u32, target: u32 },
+    /// `live >= target` (k_eff alive), restore would also succeed today
+    /// (escrow budget is sufficient). Greenlight.
+    Restorable { live: u32, target: u32 },
+    /// `live >= target` but restore would be denied — escrow budget is below
+    /// what this block needs. Common right after first replication when
+    /// contribution hasn't accrued yet.
+    ReplicatedCold { live: u32, target: u32, est_seconds_to_restorable: Option<u64> },
+    /// We had `target` Alive at some point; now `live < target` after losses.
+    /// Repair pipeline is responsible for bringing it back.
+    Degraded { live: u32, lost: u32, target: u32 },
+}
+
+/// Reason a restore cannot succeed right now. Returned in 409 Conflict from
+/// POST /api/restore; UI surfaces it verbatim with a human-readable message.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RestoreBlocker {
+    /// `live < k_eff` — not enough Alive placements (some holders offline /
+    /// repair pending). Auto-resolves when more come back.
+    InsufficientPlacements { have: u32, need: u32, holders_offline: u32 },
+    /// All holders refused via escrow because we haven't earned enough
+    /// contribution yet. `est_seconds` is a rough wait-time estimate or None
+    /// if we can't predict (e.g. nothing accruing).
+    EscrowLocked { budget_gb: f64, needed_gb: f64, est_seconds: Option<u64> },
+    /// All `Alive` holders are unreachable (last_seen too old).
+    AllHoldersOffline { last_seen_secs_ago: u64 },
+}
+
 /// File entry for `syncback files`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileEntry {
@@ -171,10 +233,13 @@ pub struct FileEntry {
     pub versions: u32,
     /// Latest version's backed_up_at as ISO-8601 date, or "pending" if None.
     pub last_backed_up: String,
-    /// Size in bytes of the latest version.
+    /// Size in bytes of the latest version (encoded block size today; see
+    /// `FileVersion.source_size` tech-debt).
     pub size_bytes: u64,
     /// Whether the file is locally present on any device.
     pub local_state: String,
+    /// Lifecycle state for the latest version. None for files with no version.
+    pub effective_status: Option<EffectiveStatus>,
 }
 
 /// Version entry for `syncback versions <path>`.
@@ -188,10 +253,15 @@ pub struct VersionEntry {
     pub backed_up_at: String,
     /// BLAKE3 hex of content.
     pub content_hash_hex: String,
-    /// Size in bytes.
+    /// Size in bytes (encoded block size; see source_size tech-debt).
     pub size_bytes: u64,
     /// Block ID hex.
     pub source_block_id_hex: String,
+    /// Lifecycle state for THIS version's source block.
+    pub effective_status: EffectiveStatus,
+    /// None if restore would succeed, Some(reason) otherwise. Estimate based
+    /// on owner-side data — actual restore may still differ.
+    pub restore_blocker: Option<RestoreBlocker>,
 }
 
 /// Errors from CLI operations.

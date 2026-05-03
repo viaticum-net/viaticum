@@ -31,13 +31,17 @@
 <div class="connect-form">
   <h2>Connect to Peer</h2>
   <p class="hint">
-    Enter the peer's iroh node address. Format: <code>NodeId_hex@ip:port</code>
+    Paste a libp2p multiaddr. Copy it from <code>syncback status</code> on the remote node —
+    the line beginning with <code>addr:</code>.
+  </p>
+  <p class="hint">
+    Format: <code>/ip4/&lt;host&gt;/tcp/&lt;port&gt;/p2p/&lt;peer-id&gt;</code>
   </p>
 
   <div class="input-row">
     <input
       type="text"
-      placeholder="abcdef1234...@192.168.1.5:12345"
+      placeholder="/ip4/YOUR-LAN-IP/tcp/4500/p2p/12D3KooW..."
       bind:value={addr}
       onkeydown={(e) => e.key === 'Enter' && connect()}
       disabled={connecting}
@@ -52,6 +56,20 @@
       {result.text}
     </div>
   {/if}
+
+  <div class="future">
+    <h3>Connect new device / Restore from seed</h3>
+    <p class="hint">
+      Both flows currently exist as CLI only:
+    </p>
+    <ul class="hint">
+      <li><code>syncback init --new-device --mnemonic "&lt;24 words&gt;"</code> — join an existing cluster as a new device.</li>
+      <li><code>syncback dr --mnemonic "&lt;24 words&gt;"</code> — disaster recovery: rebuild node state from the seed phrase.</li>
+    </ul>
+    <p class="hint">
+      UI flows for both are tracked as a feature in <code>docs/features.md</code>.
+    </p>
+  </div>
 </div>
 
 <style>

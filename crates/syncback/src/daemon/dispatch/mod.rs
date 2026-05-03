@@ -5,14 +5,16 @@
 //! (Unix socket) — removed in the macOS port HTTP-unification work.
 
 use syncback_core::trust::compute_combined;
-use syncback_core::types::{hex_encode, LocalState, SourceBlockStatus, Timestamp};
+use syncback_core::types::{
+    hex_encode, FileVersion, LocalState, PlacementStatus, SourceBlockStatus, Timestamp,
+};
 
 use crate::cli::types::{
-    CliRequest, CliResponse, DeviceEntry, FileEntry, PeerSummary, RestoreData, StatusData,
-    VersionEntry,
+    CliRequest, CliResponse, DeviceEntry, EffectiveStatus, FileEntry, PeerSummary, RestoreBlocker,
+    RestoreData, StatusData, VersionEntry,
 };
 use crate::daemon::handle::DaemonState;
-use crate::daemon::restore::{RestoreRequest, VersionSelector};
+use crate::daemon::restore::{RestoreError, RestoreRequest, VersionSelector};
 
 #[cfg(test)]
 mod tests;
@@ -90,6 +92,15 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
     let now_week = crate::daemon::processor::current_week_number_scaled(state.time_scale);
     let recent_window_start = now_week.saturating_sub(3); // last 4 weeks inclusive
 
+    // Snapshot of authenticated DeviceIds (heavy traffic allowed). conn-only
+    // (post-Noise but pre-cert) is not attributable to a specific master, so
+    // peers list shows just `auth` vs `known`.
+    let auth_devices: std::collections::HashSet<syncback_core::types::DeviceId> =
+        match state.swarm_handle.as_ref() {
+            Some(s) => s.peer_sets().await.map(|(a, _)| a).unwrap_or_default(),
+            None => std::collections::HashSet::new(),
+        };
+
     // Compute peer summaries, sorted by combined trust descending (top 20).
     let mut peer_summaries: Vec<PeerSummary> = peers
         .iter()
@@ -120,6 +131,11 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
                 trust_s: p.trust_s,
                 pos_challenges_recent: ch,
                 pos_passes_recent: pa,
+                link: if auth_devices.contains(&p.device_id) {
+                    "auth".to_string()
+                } else {
+                    "known".to_string()
+                },
             }
         })
         .collect();
@@ -204,11 +220,18 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         None => hex_encode(&state.identity_pub.0),
     };
 
+    let (peer_count_connected, peer_count_authenticated) = match state.swarm_handle.as_ref() {
+        Some(s) => s.peer_counts().await.unwrap_or((0, 0)),
+        None => (0, 0),
+    };
+
     CliResponse::Status(StatusData {
         node_identity,
         device_id,
         node_addr,
         peer_count: peers.len() as u32,
+        peer_count_connected,
+        peer_count_authenticated,
         avg_trust,
         holding_bytes: holdings_bytes,
         backed_up_files: files.len() as u32,
@@ -236,6 +259,52 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
 }
 
 // ── Files ─────────────────────────────────────────────────────────────────────
+
+/// Owner-side estimate of a version's lifecycle state from placement counts.
+///
+/// `live` / `target` / `lost` are SYMBOL counts (not holder counts): we need
+/// k_eff symbols to decode, and each holder typically carries many symbols
+/// (an ESI range). Counting holders would give nonsensical "6/1195" displays.
+fn compute_effective_status(state: &DaemonState, version: &FileVersion) -> EffectiveStatus {
+    // backed_up_at == None means the encoder pipeline hasn't produced a block yet.
+    if version.backed_up_at.is_none() {
+        return EffectiveStatus::Queued;
+    }
+
+    let target = version.k + syncback_core::constants::DECODE_OVERHEAD;
+    let placements = match state.db.list_placements_for_block(&version.source_block_id) {
+        Ok(ps) => ps,
+        Err(_) => return EffectiveStatus::Queued, // Conservative on DB error.
+    };
+
+    let mut live_symbols = 0u32;
+    let mut lost_symbols = 0u32;
+    let mut known_symbols = 0u32; // anything not Lost/Deleting
+    for p in &placements {
+        let n = p.symbol_count();
+        match p.status {
+            PlacementStatus::Alive => {
+                live_symbols = live_symbols.saturating_add(n);
+                known_symbols = known_symbols.saturating_add(n);
+            }
+            PlacementStatus::Lost | PlacementStatus::Deleting => {
+                lost_symbols = lost_symbols.saturating_add(n);
+            }
+            // Offered/Accepted/Uncertain/PresumedLost — placed but not confirmed.
+            _ => {
+                known_symbols = known_symbols.saturating_add(n);
+            }
+        }
+    }
+
+    if live_symbols >= target {
+        EffectiveStatus::Restorable { live: live_symbols, target }
+    } else if known_symbols >= target && lost_symbols > 0 {
+        EffectiveStatus::Degraded { live: live_symbols, lost: lost_symbols, target }
+    } else {
+        EffectiveStatus::Replicating { live: live_symbols, target }
+    }
+}
 
 fn dispatch_files(state: &DaemonState, path_prefix: Option<String>) -> CliResponse {
     let records = match path_prefix {
@@ -270,12 +339,14 @@ fn dispatch_files(state: &DaemonState, path_prefix: Option<String>) -> CliRespon
                 .next()
                 .unwrap_or("unknown")
                 .to_string();
+            let effective_status = latest.map(|v| compute_effective_status(state, v));
             FileEntry {
                 path: f.path.clone(),
                 versions: f.versions.len() as u32,
                 last_backed_up,
                 size_bytes,
                 local_state,
+                effective_status,
             }
         })
         .collect();
@@ -303,6 +374,23 @@ fn dispatch_versions(state: &DaemonState, path: &str) -> CliResponse {
                 .unwrap_or_else(|| "pending".to_string());
             let content_hash_hex = hex_encode(&v.content_hash);
             let source_block_id_hex = hex_encode(&v.source_block_id.0);
+            let effective_status = compute_effective_status(state, v);
+            // restore_blocker is the count-side of effective_status; precise
+            // (escrow-aware) blocker is computed on click in dispatch_restore.
+            let restore_blocker = match &effective_status {
+                EffectiveStatus::Replicating { live, target }
+                | EffectiveStatus::Degraded { live, target, .. } => {
+                    // Estimate offline holders: placements not Alive that we
+                    // expected to count toward `target`.
+                    let holders_offline = target.saturating_sub(*live);
+                    Some(RestoreBlocker::InsufficientPlacements {
+                        have: *live,
+                        need: *target,
+                        holders_offline,
+                    })
+                }
+                _ => None,
+            };
             VersionEntry {
                 version: (idx + 1) as u32,
                 created_at: timestamp_to_iso(v.created_at),
@@ -310,6 +398,8 @@ fn dispatch_versions(state: &DaemonState, path: &str) -> CliResponse {
                 content_hash_hex,
                 size_bytes: v.k as u64 * v.t as u64,
                 source_block_id_hex,
+                effective_status,
+                restore_blocker,
             }
         })
         .collect();
@@ -397,8 +487,41 @@ async fn dispatch_restore(
             content_hash_hex,
             status: "started".to_string(),
         }),
-        Ok(Err(e)) => CliResponse::Error(format!("restore failed: {e}")),
+        Ok(Err(e)) => match restore_error_to_blocker(&e) {
+            Some(blocker) => CliResponse::RestoreBlocked(blocker),
+            None => CliResponse::Error(format!("restore failed: {e}")),
+        },
         Err(_) => CliResponse::Error("restore coordinator dropped response".to_string()),
+    }
+}
+
+/// Map RestoreError to a structured RestoreBlocker for UI consumption. Returns
+/// None for genuine internal errors (decode failures, IO, DB) — those stay as
+/// 500-class errors. Only "you can't restore yet because..." cases convert.
+fn restore_error_to_blocker(e: &RestoreError) -> Option<RestoreBlocker> {
+    match e {
+        RestoreError::InsufficientSymbols { got, need, .. } => {
+            Some(RestoreBlocker::InsufficientPlacements {
+                have: *got as u32,
+                need: *need as u32,
+                holders_offline: (*need as u32).saturating_sub(*got as u32),
+            })
+        }
+        RestoreError::NoHolders(_) => Some(RestoreBlocker::AllHoldersOffline {
+            last_seen_secs_ago: 0, // owner doesn't know per-holder last_seen here
+        }),
+        RestoreError::EscrowDenied {
+            restore_budget_gb,
+            restore_gb,
+            ..
+        } => Some(RestoreBlocker::EscrowLocked {
+            budget_gb: *restore_budget_gb,
+            // restore_gb may be NaN (set by from_fetch when block size unknown
+            // owner-side); pass through so the UI can decide whether to show it.
+            needed_gb: *restore_gb,
+            est_seconds: None,
+        }),
+        _ => None,
     }
 }
 
@@ -683,7 +806,8 @@ fn unix_secs_to_iso(secs: u64, include_time: bool) -> String {
         let h = time_secs / 3600;
         let min = (time_secs % 3600) / 60;
         let sec = time_secs % 60;
-        format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{sec:02}")
+        // RFC 3339 with explicit UTC marker so JS Date / chrono parse cleanly.
+        format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{sec:02}Z")
     } else {
         format!("{y:04}-{m:02}-{d:02}")
     }

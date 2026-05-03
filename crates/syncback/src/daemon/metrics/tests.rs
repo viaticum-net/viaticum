@@ -7,6 +7,8 @@ fn make_status(peers: Vec<PeerSummary>) -> StatusData {
         device_id: "abcdef0123456789".to_string(),
         node_addr: "test-addr".to_string(),
         peer_count: peers.len() as u32,
+        peer_count_connected: peers.len() as u32,
+        peer_count_authenticated: peers.len() as u32,
         avg_trust: 0.75,
         holding_bytes: 1024,
         backed_up_files: 3,
@@ -38,6 +40,7 @@ fn make_peer(identity_hex: &str, trust: f64) -> PeerSummary {
         trust_s: 1.0,
         pos_challenges_recent: 5,
         pos_passes_recent: 4,
+        link: "auth".to_string(),
     }
 }
 

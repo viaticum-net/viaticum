@@ -1,10 +1,33 @@
 <script>
   import { onMount } from 'svelte';
-  import { formatBytes } from './utils.js';
+  import { formatBytes, formatTime } from './utils.js';
 
   let status = $state(null);
   let error = $state(null);
   let loading = $state(true);
+  let warmupCounts = $state({ replicating: 0, restorable: 0, cold: 0, degraded: 0, total: 0 });
+  let bannerDismissed = $state(false);
+
+  // The banner shows for the first 24h of cluster lifetime and as long as no file
+  // is Restorable yet. Tracked in localStorage so it doesn't reset on page reload.
+  const FIRST_SEEN_KEY = 'viaticum_first_seen_ms';
+  const DISMISSED_KEY = 'viaticum_warmup_banner_dismissed';
+  const ONE_DAY_MS = 24 * 3600 * 1000;
+
+  function rememberFirstSeen() {
+    if (!localStorage.getItem(FIRST_SEEN_KEY)) {
+      localStorage.setItem(FIRST_SEEN_KEY, String(Date.now()));
+    }
+  }
+  function withinWarmupWindow() {
+    const t = parseInt(localStorage.getItem(FIRST_SEEN_KEY) || '0', 10);
+    if (!t) return true;
+    return Date.now() - t < ONE_DAY_MS;
+  }
+  function dismissBanner() {
+    localStorage.setItem(DISMISSED_KEY, '1');
+    bannerDismissed = true;
+  }
 
   async function fetchStatus() {
     try {
@@ -19,12 +42,56 @@
     }
   }
 
+  async function fetchWarmupCounts() {
+    try {
+      const res = await fetch('/api/files');
+      if (!res.ok) return;
+      const files = await res.json();
+      const counts = { replicating: 0, restorable: 0, cold: 0, degraded: 0, total: files.length };
+      for (const f of files) {
+        const k = f.effective_status?.kind;
+        if (k === 'replicating') counts.replicating++;
+        else if (k === 'restorable') counts.restorable++;
+        else if (k === 'replicated_cold') counts.cold++;
+        else if (k === 'degraded') counts.degraded++;
+      }
+      warmupCounts = counts;
+    } catch { /* silent — banner just hides */ }
+  }
+
+  let showWarmup = $derived(
+    !bannerDismissed
+    && warmupCounts.total > 0
+    && warmupCounts.restorable === 0
+    && withinWarmupWindow()
+  );
+
   onMount(() => {
+    rememberFirstSeen();
+    bannerDismissed = localStorage.getItem(DISMISSED_KEY) === '1';
     fetchStatus();
-    const interval = setInterval(fetchStatus, 5000);
+    fetchWarmupCounts();
+    const interval = setInterval(() => {
+      fetchStatus();
+      fetchWarmupCounts();
+    }, 5000);
     return () => clearInterval(interval);
   });
 </script>
+
+{#if showWarmup}
+  <div class="warmup-banner">
+    <div class="warmup-icon">⏳</div>
+    <div class="warmup-text">
+      <strong>Cluster is warming up.</strong>
+      Files are being encrypted and distributed across peers ({warmupCounts.replicating} replicating,
+      {warmupCounts.cold} placed-but-locked). Restore stays unavailable for a few days
+      until you've earned enough storage credit by holding other peers' data.
+      This is expected on day one of a new cluster.
+    </div>
+    <button class="warmup-close" onclick={dismissBanner} aria-label="Dismiss">×</button>
+  </div>
+{/if}
 
 {#if loading}
   <p class="muted">Loading...</p>
@@ -42,8 +109,12 @@
         <dd class="mono">{status.node_identity.slice(0, 16)}...</dd>
         <dt>Address</dt>
         <dd class="mono truncate">{status.node_addr.slice(0, 40)}...</dd>
-        <dt>Peers</dt>
-        <dd>{status.peer_count}</dd>
+        <dt>Peers (auth / conn / known)</dt>
+        <dd title="authenticated = cert exchange complete (can place/restore); connected = libp2p TCP+Noise live; known = ever seen via identify (DB rows)">
+          {status.peer_count_authenticated ?? 0}
+          / {status.peer_count_connected ?? 0}
+          / {status.peer_count}
+        </dd>
         <dt>Avg Trust</dt>
         <dd>{status.avg_trust.toFixed(3)}</dd>
       </dl>
@@ -94,6 +165,7 @@
           <thead>
             <tr>
               <th>Identity</th>
+              <th>Link</th>
               <th>Trust</th>
               <th>We store</th>
               <th>They store</th>
@@ -105,11 +177,18 @@
             {#each status.peers as peer}
               <tr>
                 <td class="mono">{peer.identity_hex}</td>
+                <td>
+                  {#if peer.link === 'auth'}
+                    <span class="link-badge link-auth" title="Cert exchange complete; can place/restore symbols.">auth</span>
+                  {:else}
+                    <span class="link-badge link-known" title="Only PeerRecord row in DB; not currently connected.">known</span>
+                  {/if}
+                </td>
                 <td>{peer.trust.toFixed(3)}</td>
                 <td>{formatBytes(peer.bytes_we_store)}</td>
                 <td>{formatBytes(peer.bytes_peer_stores)}</td>
                 <td>{peer.pos_passes_recent}/{peer.pos_challenges_recent}</td>
-                <td>{peer.last_seen}</td>
+                <td>{formatTime(peer.last_seen)}</td>
               </tr>
             {/each}
           </tbody>
@@ -118,3 +197,15 @@
     </section>
   {/if}
 {/if}
+
+<style>
+  .link-badge {
+    display: inline-block;
+    font-size: 0.72rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    line-height: 1;
+  }
+  .link-auth { background: #1b3d2f; color: #3fb950; }
+  .link-known { background: #2d2a1b; color: #d29922; }
+</style>

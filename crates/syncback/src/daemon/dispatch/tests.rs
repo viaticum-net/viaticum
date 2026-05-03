@@ -43,6 +43,9 @@ async fn make_test_state() -> Arc<DaemonState> {
         relay_post_tx: None,
         swarm_handle: None,
         watch_admin: None,
+        config_admin: None,
+        restart_gate: None,
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
     })
 }
 
@@ -210,6 +213,9 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
         relay_post_tx: Some(relay_post_tx),
         swarm_handle: None,
         watch_admin: None,
+        config_admin: None,
+        restart_gate: None,
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
     });
 
     // Revoke device B.
@@ -420,6 +426,9 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
         relay_post_tx: None,
         swarm_handle: None,
         watch_admin: None,
+        config_admin: None,
+        restart_gate: None,
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
     });
 
     let response = dispatch(CliRequest::Connect { addr: addr_b_str }, &state_a).await;

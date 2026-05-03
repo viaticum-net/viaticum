@@ -611,6 +611,16 @@ impl BackupCoordinator {
                                 error = %e,
                                 "failed to update placement after SymbolAccept"
                             );
+                        } else if let Err(e) = self.db.refresh_peer_storage_bytes(&holder_id) {
+                            // Counter is best-effort; failure here is logged but does not
+                            // roll back the placement transition. Without this refresh the
+                            // owner-side bytes_peer_stores_for_us stays at 0 until the
+                            // first PoS round triggers it (could be 6 min in demo, ~1h prod).
+                            tracing::error!(
+                                holder = %holder_id,
+                                err = %e,
+                                "failed to refresh storage balance after SymbolAccept"
+                            );
                         }
                     }
                     Ok(None) => {

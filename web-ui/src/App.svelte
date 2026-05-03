@@ -4,12 +4,14 @@
   import Folders from './lib/Folders.svelte';
   import Devices from './lib/Devices.svelte';
   import Connect from './lib/Connect.svelte';
+  import Settings from './lib/Settings.svelte';
 
   const pages = [
     { id: 'dashboard', label: 'Dashboard' },
     { id: 'folders', label: 'Folders' },
     { id: 'files', label: 'Files' },
     { id: 'devices', label: 'Devices' },
+    { id: 'settings', label: 'Settings' },
     { id: 'connect', label: 'Connect' },
   ];
 
@@ -42,6 +44,8 @@
       <Files />
     {:else if currentPage === 'devices'}
       <Devices />
+    {:else if currentPage === 'settings'}
+      <Settings />
     {:else if currentPage === 'connect'}
       <Connect />
     {/if}
@@ -76,6 +80,43 @@
     border: 1px solid #f85149;
     border-radius: 8px;
     padding: 1rem;
+  }
+
+  :global(.warmup-banner) {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.8rem;
+    background: #2c2510;
+    border: 1px solid #d29922;
+    border-radius: 8px;
+    padding: 0.85rem 1rem;
+    margin-bottom: 1rem;
+    color: #e1e4e8;
+    font-size: 0.88rem;
+    line-height: 1.4;
+  }
+  :global(.warmup-icon) {
+    font-size: 1.4rem;
+    line-height: 1;
+  }
+  :global(.warmup-text) {
+    flex: 1;
+  }
+  :global(.warmup-text strong) {
+    color: #d29922;
+    margin-right: 0.4rem;
+  }
+  :global(.warmup-close) {
+    background: none;
+    border: none;
+    color: #8b949e;
+    font-size: 1.4rem;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 0.2rem;
+  }
+  :global(.warmup-close:hover) {
+    color: #e1e4e8;
   }
 
   :global(.error-box button) {

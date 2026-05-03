@@ -42,9 +42,17 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let handle = DaemonHandle::start(cfg).await?;
+            let cancel = handle.cancel_token();
 
-            tokio::signal::ctrl_c().await?;
-            tracing::info!("received Ctrl-C, shutting down...");
+            tokio::select! {
+                r = tokio::signal::ctrl_c() => {
+                    r?;
+                    tracing::info!("received Ctrl-C, shutting down...");
+                }
+                _ = cancel.cancelled() => {
+                    tracing::info!("internal restart triggered, shutting down...");
+                }
+            }
             handle.stop();
             handle.wait().await?;
         }

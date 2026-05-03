@@ -1,5 +1,6 @@
 <script>
   import { onMount } from 'svelte';
+  import { formatTime } from './utils.js';
 
   let devices = $state([]);
   let loading = $state(true);
@@ -43,7 +44,7 @@
           <tr>
             <td class="mono">{dev.device_id_hex.slice(0, 16)}...</td>
             <td>{dev.label}</td>
-            <td>{dev.added_at}</td>
+            <td>{formatTime(dev.added_at)}</td>
             <td>
               {#if dev.is_current}
                 <span class="badge badge-current">current</span>

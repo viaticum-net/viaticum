@@ -1,4 +1,5 @@
 //! Embedded web UI assets. Used when `static_dir` is unset or missing.
+//! rebuild-marker: 2026-05-03-r2
 
 use axum::body::Body;
 use axum::http::{header, HeaderValue, StatusCode, Uri};
