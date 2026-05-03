@@ -13,10 +13,9 @@ use syncback_core::db::Db;
 use syncback_core::types::{DeviceId, IdentityPub};
 use tokio_util::sync::CancellationToken;
 
-use crate::cli::types::{CliRequest, CliResponse, RestoreData};
+use crate::cli::types::CliRequest;
 use crate::daemon::handle::DaemonState;
 use crate::daemon::restore::{RestoreError, RestoreRequest, RestoreResult};
-use crate::daemon::restore::staging::JobId;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
