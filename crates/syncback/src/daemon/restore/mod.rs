@@ -560,7 +560,7 @@ impl RestoreCoordinator {
     ///
     /// Validates the record path before writing (prevents path traversal from any
     /// source — normal restore, DR blobs, or malicious peers).
-    fn extract_and_write_file(
+    pub(crate) fn extract_and_write_file(
         &self,
         record: &FileRecord,
         version: &FileVersion,
