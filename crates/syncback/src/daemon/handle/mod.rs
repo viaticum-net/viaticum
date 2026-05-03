@@ -168,6 +168,45 @@ impl DaemonHandle {
         let db_path = cfg.data_dir.join("db.redb");
         let db = open_db_with_retry(&db_path).await?;
 
+        // ── 3.5. Migrate trust_p prior for evidence-less peers ────────────────
+        // INITIAL_TRUST_P was raised from 0.1 to 0.5 (neutral Bayesian prior)
+        // to give fresh peers a real shot at being chosen as a holder. That
+        // value is only applied when a PeerRecord is created — existing rows
+        // were sitting at the old prior, indistinguishable from a peer that
+        // failed every challenge. One-time bump: any peer with no observed
+        // PoS evidence (trust_i == 0.0) and a stored trust_p strictly below
+        // the new prior gets bumped. Never lowers an existing trust_p, so
+        // there's no risk of softening a deserved penalty.
+        {
+            use syncback_core::constants::INITIAL_TRUST_P;
+            match db.list_all_peers() {
+                Ok(peers) => {
+                    let mut migrated = 0u32;
+                    for mut record in peers {
+                        if record.trust_i == 0.0 && record.trust_p < INITIAL_TRUST_P {
+                            record.trust_p = INITIAL_TRUST_P;
+                            if let Err(e) = db.upsert_peer(&record) {
+                                tracing::warn!(device = %record.device_id, err = %e,
+                                    "trust_p migration: upsert failed");
+                            } else {
+                                migrated += 1;
+                            }
+                        }
+                    }
+                    if migrated > 0 {
+                        tracing::info!(
+                            migrated,
+                            new_prior = INITIAL_TRUST_P,
+                            "trust_p prior migration: bumped evidence-less peers"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "trust_p migration: list_all_peers failed");
+                }
+            }
+        }
+
         // ── 4. Derive keys ────────────────────────────────────────────────────
         // Epoch 0 is the initial epoch; epoch rotation happens on device revocation.
         let (master_key, device_key, epoch_key_bytes) = derive_keys(&keyfile, 0)?;
