@@ -51,6 +51,14 @@ tikv-jemallocator = "0.6"
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 mimalloc = { version = "0.1", default-features = false }
 
+[[bin]]
+name = "syncback"
+path = "src/main.rs"
+
+[[bin]]
+name = "bootstrap-trust"
+path = "src/bin/bootstrap_trust.rs"
+
 [dev-dependencies]
 syncback-core = { workspace = true, features = ["testutil"] }
 tempfile = { workspace = true }
