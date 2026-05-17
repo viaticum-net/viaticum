@@ -89,6 +89,7 @@ fn backup_cfg_with_cluster(
         master_signing_key: None,
         swarm: None,
         live_watch_configs: None,
+        peer_backoff: None,
     }
 }
 

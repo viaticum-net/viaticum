@@ -66,6 +66,7 @@ async fn make_test_state_with_restore(
         config_admin: None,
         restart_gate: None,
         shutdown_token: CancellationToken::new(),
+        peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
     })
 }
 

@@ -2,7 +2,7 @@ use super::{PeerBackoff, DEFAULT_COOLDOWN_SECS};
 use syncback_core::types::DeviceId;
 
 fn dev(byte: u8) -> DeviceId {
-    DeviceId([byte; 16])
+    DeviceId([byte; 32])
 }
 
 #[test]

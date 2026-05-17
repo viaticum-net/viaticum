@@ -73,6 +73,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         master_signing_key: None,
         swarm: None,
         live_watch_configs: None,
+        peer_backoff: None,
     }
 }
 
@@ -84,6 +85,7 @@ fn repair_config(symbols_dir: &TempDir) -> RepairConfig {
         own_identity: IdentityPub([0x99u8; 32]),
         master_signing_key: None,
         swarm: None,
+        peer_backoff: None,
     }
 }
 
@@ -146,6 +148,7 @@ fn config_source_block_size_drives_backup() {
             master_signing_key: None,
             swarm: None,
             live_watch_configs: None,
+            peer_backoff: None,
         },
         Arc::new(RaptorQEncoder::new()),
     );

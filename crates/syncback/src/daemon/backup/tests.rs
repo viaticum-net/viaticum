@@ -41,6 +41,7 @@ fn test_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         master_signing_key: None,
         swarm: None,
         live_watch_configs: None,
+        peer_backoff: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -342,6 +343,7 @@ fn pipeline_roundtrip_can_decode() {
         master_signing_key: None,
         swarm: None,
         live_watch_configs: None,
+        peer_backoff: None,
     };
     let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let mut coord = BackupCoordinator::new(db.clone(), config, encoder.clone());
@@ -660,6 +662,7 @@ fn dedup_via_cluster_state_skips_already_backed_up() {
         master_signing_key: None,
         swarm: None,
         live_watch_configs: None,
+        peer_backoff: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1039,6 +1042,7 @@ fn coord_with_watch(
         master_signing_key: None,
         swarm: None,
         live_watch_configs: None,
+        peer_backoff: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -1162,6 +1166,7 @@ fn same_content_two_devices_both_in_file_record() {
         master_signing_key: None,
         swarm: None,
         live_watch_configs: None,
+        peer_backoff: None,
     };
     let mut coord_a =
         BackupCoordinator::new(db.clone(), config_a, Arc::new(RaptorQEncoder::new()));
@@ -1189,6 +1194,7 @@ fn same_content_two_devices_both_in_file_record() {
         master_signing_key: None,
         swarm: None,
         live_watch_configs: None,
+        peer_backoff: None,
     };
     let mut coord_b =
         BackupCoordinator::new(db.clone(), config_b, Arc::new(RaptorQEncoder::new()));
@@ -1239,6 +1245,7 @@ fn flush_queue_deferred_files_remain_in_queue() {
         master_signing_key: None,
         swarm: None,
         live_watch_configs: None,
+        peer_backoff: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1293,6 +1300,7 @@ fn flush_queue_budget_selects_highest_importance_first() {
         master_signing_key: None,
         swarm: None,
         live_watch_configs: None,
+        peer_backoff: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1360,6 +1368,7 @@ fn large_file_skipped_when_budget_insufficient() {
         master_signing_key: None,
         swarm: None,
         live_watch_configs: None,
+        peer_backoff: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 

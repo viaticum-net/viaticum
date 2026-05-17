@@ -46,6 +46,7 @@ async fn make_test_state() -> Arc<DaemonState> {
         config_admin: None,
         restart_gate: None,
         shutdown_token: tokio_util::sync::CancellationToken::new(),
+        peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
     })
 }
 
@@ -216,6 +217,7 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
         config_admin: None,
         restart_gate: None,
         shutdown_token: tokio_util::sync::CancellationToken::new(),
+        peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
     });
 
     // Revoke device B.

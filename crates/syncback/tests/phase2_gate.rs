@@ -68,6 +68,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         master_signing_key: None,
         swarm: None,
         live_watch_configs: None,
+        peer_backoff: None,
     }
 }
 
