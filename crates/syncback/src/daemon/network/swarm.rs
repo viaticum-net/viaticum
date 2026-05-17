@@ -349,7 +349,22 @@ pub struct SwarmConfig {
     /// Master signing key. Used to sign PeerAnnounceMsg in build_peer_announce.
     pub master_signing_key: ed25519_dalek::SigningKey,
     /// This device's master identity (from cluster master key).
+    ///
+    /// Used for logging, board-message signing, and as the "who am I" in
+    /// peer-facing metadata. For a single-device cluster this equals
+    /// `cluster_master_pub`; for a multi-device cluster on a non-founder node
+    /// they differ — the founder's identity is stored as `cluster_master_pub`,
+    /// not as `identity_pub`.
     pub identity_pub: IdentityPub,
+    /// Cluster master identity — the anchor for `DeviceCertificate` signature
+    /// verification. Resolved from `ClusterState.master_pub()` at startup, NOT
+    /// from this node's own seed-derived master.
+    ///
+    /// On a founder/single-device node `cluster_master_pub == identity_pub`;
+    /// on a node that joined an existing cluster they differ (founder ≠ self).
+    /// Using `identity_pub` here instead would silently break multi-device
+    /// clusters — a joiner would reject legitimate certs signed by the founder.
+    pub cluster_master_pub: IdentityPub,
     /// Device certificate issued by cluster master.
     pub device_cert: DeviceCertificate,
     /// X25519 public key for directed relay board encryption.
@@ -593,7 +608,7 @@ impl SwarmHandle {
             pending_requests: HashMap::new(),
             our_cert: config.device_cert,
             our_x25519_pub: config.x25519_pub,
-            own_identity_pub: config.identity_pub,
+            cluster_master_pub: config.cluster_master_pub,
             cert_timeout: Duration::from_secs(config.cert_timeout_secs),
             kad_republish_timer,
             kad_discovery_timer,
@@ -796,9 +811,12 @@ struct EventLoopState {
     our_cert: DeviceCertificate,
     our_x25519_pub: Option<[u8; 32]>,
 
-    /// Own cluster master identity. Used in cert verification to check that
-    /// a peer's cert was signed by THIS cluster's master, not an attacker's.
-    own_identity_pub: IdentityPub,
+    /// Trusted cluster master identity — the anchor for `DeviceCertificate`
+    /// signature verification. Loaded from `ClusterState.master_pub()` at
+    /// startup (a multi-device joiner stores the founder's identity here).
+    /// MUST NOT be confused with this node's own seed-derived master pub —
+    /// for any non-founder node those values differ.
+    cluster_master_pub: IdentityPub,
 
     cert_timeout: Duration,
 
@@ -1136,7 +1154,7 @@ impl EventLoopState {
     ) {
         debug!(peer_id = %peer_id, "received cert request (listener side)");
 
-        if let Err(reason) = verify_cert_for_peer(&peer_id, &request.cert, &self.own_identity_pub) {
+        if let Err(reason) = verify_cert_for_peer(&peer_id, &request.cert, &self.cluster_master_pub) {
             warn!(
                 peer_id = %peer_id,
                 reason = %reason,
@@ -1168,7 +1186,7 @@ impl EventLoopState {
     async fn on_cert_response(&mut self, peer_id: PeerId, response: DeviceCertExchangeMsg) {
         debug!(peer_id = %peer_id, "received cert response (dialer side)");
 
-        if let Err(reason) = verify_cert_for_peer(&peer_id, &response.cert, &self.own_identity_pub) {
+        if let Err(reason) = verify_cert_for_peer(&peer_id, &response.cert, &self.cluster_master_pub) {
             warn!(
                 peer_id = %peer_id,
                 reason = %reason,
@@ -1609,15 +1627,20 @@ impl EventLoopState {
 ///
 /// Two checks:
 /// 1. cert.device_id → expected PeerId matches the Noise-authenticated PeerId.
-/// 2. cert signature is valid under `own_identity_pub` (the cluster master).
+/// 2. cert signature is valid under `cluster_master_pub`.
 ///
-/// SECURITY: `own_identity_pub` MUST come from the node's own seed-derived
-/// identity, NOT from `cert.master_pub_key`. Using the cert's own key would
-/// be tautological — any self-signed cert would pass.
+/// SECURITY: `cluster_master_pub` MUST be the cluster master pub stored in
+/// our local `ClusterState` (set when this node joined or founded the
+/// cluster), NOT the per-node seed-derived master and NOT `cert.master_pub_key`.
+///
+/// - Using `cert.master_pub_key` is tautological — any self-signed cert passes.
+/// - Using this node's own seed-derived master is correct for a single-device
+///   cluster (where founder = self) but rejects every legitimate cert in a
+///   multi-device cluster (founder ≠ self → signature fails to verify).
 pub(crate) fn verify_cert_for_peer(
     peer_id: &PeerId,
     cert: &DeviceCertificate,
-    own_identity_pub: &IdentityPub,
+    cluster_master_pub: &IdentityPub,
 ) -> Result<(), String> {
     // Check 1: does cert.device_id match the Noise-authenticated PeerId?
     let expected_peer_id = device_id_to_peer_id(&cert.device_id)
@@ -1630,9 +1653,11 @@ pub(crate) fn verify_cert_for_peer(
 
     // Check 2: cert is signed by the trusted cluster master.
     //
-    // Use own_identity_pub (derived from our seed at startup), NOT cert.master_pub_key.
-    // cert.master_pub_key is attacker-controlled; trusting it is tautological.
-    verify_device_certificate(cert, own_identity_pub)
+    // `cluster_master_pub` is the founder's identity, loaded from
+    // `ClusterState.master_pub()` at startup. For a single-device cluster it
+    // happens to equal this node's own derived master; for a joined cluster
+    // it's the founder's master (different from our own).
+    verify_device_certificate(cert, cluster_master_pub)
         .map_err(|e| format!("cert not signed by cluster master: {e}"))?;
 
     Ok(())

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use libp2p::Multiaddr;
 use syncback_core::config::{AppConfig, NetworkCfg};
-use syncback_core::types::{DeviceId, IdentityPub};
+use syncback_core::types::DeviceId;
 use tokio::time::timeout;
 
 use crate::daemon::network::swarm::{
@@ -23,14 +23,18 @@ use super::swarm_test_helpers::{get_listen_addr, make_signing_key, make_cert};
 /// Bootstrap peers can be added via kademlia_bootstrap_peers.
 /// kad_discovery_interval_override speeds up the discovery cycle.
 fn make_kad_config(seed_byte: u8, bootstrap_peers: Vec<Multiaddr>) -> SwarmConfig {
+    // Reuse the shared test-cluster master so Kad-discovered peers can complete
+    // DeviceCertExchange. `seed_byte` only distinguishes device keys.
+    use super::swarm_test_helpers::{test_cluster_master_key, test_cluster_master_pub};
     let device_key = make_signing_key(seed_byte);
-    let master_key = make_signing_key(seed_byte.wrapping_add(100));
-    let identity_pub = IdentityPub(master_key.verifying_key().to_bytes());
+    let master_key = test_cluster_master_key();
+    let identity_pub = test_cluster_master_pub();
     let cert = make_cert(&master_key, &device_key);
     SwarmConfig {
         device_signing_key: device_key,
         master_signing_key: master_key,
         identity_pub,
+        cluster_master_pub: identity_pub,
         device_cert: cert,
         x25519_pub: None,
         listen_port: 0,

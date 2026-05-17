@@ -358,6 +358,7 @@ async fn cert_mismatch_rejected() {
         device_signing_key: device_key_b,
         master_signing_key: master_key_b.clone(),
         identity_pub: identity_pub_b,
+        cluster_master_pub: identity_pub_b,
         device_cert: wrong_cert,
         x25519_pub: None,
         listen_port: 0,

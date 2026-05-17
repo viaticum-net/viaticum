@@ -113,3 +113,101 @@ fn cert_verify_uses_own_identity_not_cert_master_pub() {
         "fixed check must reject foreign-master cert"
     );
 }
+
+// ─── Multi-device cluster cases ───────────────────────────────────────────────
+//
+// These three tests exercise the case where the founder ≠ verifier. The
+// verifier (joiner) stores the FOUNDER's identity as its cluster_master_pub
+// in ClusterState; its own seed-derived master is something different and
+// MUST NOT be used as the verification anchor.
+//
+// Wave 1 only tested single-device and inter-cluster boundary; the
+// joiner-within-same-cluster case was the actual regression that broke
+// the demo cluster in 2026-05-17.
+
+/// AC-M1: A joiner verifying a cert signed by the founder.
+///
+/// Setup: founder F holds the cluster master key; joiner J has its own
+/// seed-derived master (≠ F) and stores F's identity_pub as cluster_master_pub
+/// (in real flow this happens during join when J persists state.master_pub).
+/// F issues a cert for J. When J verifies its own (founder-signed) cert,
+/// or any other founder-signed cert, the check MUST pass.
+#[test]
+fn cert_verify_multi_device_joiner_accepts_cert_signed_by_founder() {
+    // Founder.
+    let founder_master = derive_master_key(&[0x10u8; 64]).unwrap();
+    let founder_identity = master_identity(&founder_master);
+
+    // Joiner has its own (different) derived master; in real life this is
+    // never used as a signing authority — only J's device_key is.
+    let joiner_device_key = ed25519_dalek::SigningKey::from_bytes(&[0x21u8; 32]);
+    let (joiner_cert, joiner_peer_id) =
+        make_test_cert_for_device(&founder_master, &joiner_device_key);
+
+    // J's stored cluster_master_pub == founder_identity (loaded from
+    // ClusterState.master_pub() at daemon startup).
+    let result = verify_cert_for_peer(&joiner_peer_id, &joiner_cert, &founder_identity);
+    assert!(
+        result.is_ok(),
+        "joiner must accept its own founder-signed cert; got: {result:?}"
+    );
+
+    // Also accept ANOTHER joiner's cert that was signed by the same founder.
+    let other_device_key = ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]);
+    let (other_cert, other_peer_id) =
+        make_test_cert_for_device(&founder_master, &other_device_key);
+    let result = verify_cert_for_peer(&other_peer_id, &other_cert, &founder_identity);
+    assert!(
+        result.is_ok(),
+        "joiner must accept fellow joiner's founder-signed cert; got: {result:?}"
+    );
+}
+
+/// AC-M2: A joiner MUST reject a self-signed cert that another joiner
+/// fabricated using their OWN master (pretending to be cluster master).
+///
+/// This is the canonical multi-device attack: rogue device in same cluster
+/// tries to impersonate the founder. Wave 1's anchor (own_identity_pub) on
+/// the verifying joiner happens to be DIFFERENT from both the founder's and
+/// the rogue's master, so detection was incidental. With the correct anchor
+/// (cluster_master_pub = founder), this attack is detected directly.
+#[test]
+fn cert_verify_multi_device_rejects_self_signed_cert_from_joiner() {
+    let founder_master = derive_master_key(&[0x10u8; 64]).unwrap();
+    let founder_identity = master_identity(&founder_master);
+
+    // Rogue joiner derives its own master and self-signs a cert as if it
+    // were the cluster founder.
+    let rogue_master = derive_master_key(&[0x11u8; 64]).unwrap();
+    let rogue_device_key = ed25519_dalek::SigningKey::from_bytes(&[0x31u8; 32]);
+    let (rogue_cert, rogue_peer_id) =
+        make_test_cert_for_device(&rogue_master, &rogue_device_key);
+
+    let result = verify_cert_for_peer(&rogue_peer_id, &rogue_cert, &founder_identity);
+    assert!(
+        result.is_err(),
+        "rogue's self-signed cert must be rejected by a joiner whose anchor is the real founder; got: {result:?}"
+    );
+}
+
+/// AC-M3: After a joiner is added to the cluster, the founder verifies the
+/// joiner's cert using the founder's own cluster_master_pub (== founder's
+/// identity). Asymmetric setup: founder's anchor and signing key are the
+/// same, joiner's anchor is the founder.
+#[test]
+fn cert_verify_multi_device_founder_accepts_reissued_joiner_cert() {
+    let founder_master = derive_master_key(&[0x10u8; 64]).unwrap();
+    let founder_identity = master_identity(&founder_master);
+
+    // Joiner added later — founder issues a cert for them now.
+    let joiner_device_key = ed25519_dalek::SigningKey::from_bytes(&[0x41u8; 32]);
+    let (joiner_cert, joiner_peer_id) =
+        make_test_cert_for_device(&founder_master, &joiner_device_key);
+
+    // Founder verifying joiner's cert: anchor = founder_identity (its own).
+    let result = verify_cert_for_peer(&joiner_peer_id, &joiner_cert, &founder_identity);
+    assert!(
+        result.is_ok(),
+        "founder must accept its own reissued cert for joiner; got: {result:?}"
+    );
+}

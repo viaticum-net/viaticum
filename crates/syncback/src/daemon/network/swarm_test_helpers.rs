@@ -23,20 +23,46 @@ pub(crate) fn make_cert(master_key: &SigningKey, device_key: &SigningKey) -> Dev
     issue_device_certificate(master_key, device_id, Timestamp(0))
 }
 
+/// Seed byte for the shared test-cluster master key. All peers built by
+/// `make_swarm_config` are issued device certificates by this single master
+/// so they form one logical cluster (founder = the constant master, every
+/// caller-provided `seed_byte` distinguishes a *device* within that cluster).
+const TEST_CLUSTER_MASTER_SEED: u8 = 0xFF;
+
+/// Shared master key used by all test peers.
+pub(crate) fn test_cluster_master_key() -> SigningKey {
+    make_signing_key(TEST_CLUSTER_MASTER_SEED)
+}
+
+/// Shared master identity used by all test peers.
+pub(crate) fn test_cluster_master_pub() -> IdentityPub {
+    IdentityPub(test_cluster_master_key().verifying_key().to_bytes())
+}
+
 /// Build a SwarmConfig for testing.
 ///
-/// Uses seed_byte to derive device and master keys deterministically.
-/// IPFS bootstrap is disabled (kademlia_disable_ipfs_bootstrap = true) to avoid
-/// real network traffic in tests.
+/// `seed_byte` selects this peer's device key. The cluster master key is
+/// shared across every config built by this helper, so any two peers built
+/// from different `seed_byte`s belong to the same logical cluster and will
+/// successfully authenticate each other via DeviceCertExchange. To test
+/// rejection (peer from different cluster), build SwarmConfig manually with
+/// a fresh master and ignore this helper.
+///
+/// IPFS bootstrap is disabled to avoid real network traffic in tests.
 pub(crate) fn make_swarm_config(seed_byte: u8) -> SwarmConfig {
+    debug_assert!(
+        seed_byte != TEST_CLUSTER_MASTER_SEED,
+        "seed_byte 0xFF reserved for the shared test cluster master"
+    );
     let device_key = make_signing_key(seed_byte);
-    let master_key = make_signing_key(seed_byte.wrapping_add(128));
-    let identity_pub = IdentityPub(master_key.verifying_key().to_bytes());
+    let master_key = test_cluster_master_key();
+    let identity_pub = test_cluster_master_pub();
     let cert = make_cert(&master_key, &device_key);
     SwarmConfig {
         device_signing_key: device_key,
         master_signing_key: master_key,
         identity_pub,
+        cluster_master_pub: identity_pub,
         device_cert: cert,
         x25519_pub: None,
         listen_port: 0,

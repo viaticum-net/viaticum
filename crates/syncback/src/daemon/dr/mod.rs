@@ -90,6 +90,10 @@ pub async fn run_dr(
         device_signing_key: device_key,
         master_signing_key: master_key,
         identity_pub,
+        // DR recovers the founder's seed, so this node IS the cluster master.
+        // identity_pub == cluster_master_pub by construction here; peers we
+        // contact (former joiners) hold certs signed by this same master.
+        cluster_master_pub: identity_pub,
         device_cert,
         x25519_pub: None,
         listen_port: 0,

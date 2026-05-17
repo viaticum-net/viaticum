@@ -290,13 +290,18 @@ impl DaemonHandle {
         // ── 9.5. Start libp2p swarm (before subsystems so they can receive swarm handle) ──
         // swarm_event_rx is consumed by Processor::run below.
         let (swarm_handle_arc, swarm_event_rx) = {
-            let device_cert_for_swarm = cluster_state.as_ref().and_then(|cs| {
+            // Pull both the per-device cert and the cluster master pub from
+            // ClusterState. master_pub is the anchor for cert verification
+            // (see `verify_cert_for_peer`); it's the FOUNDER's identity, not
+            // necessarily this node's own derived master.
+            let cert_and_master = cluster_state.as_ref().and_then(|cs| {
                 let state = cs.lock().expect("cluster_state lock poisoned");
-                state
+                let cert = state
                     .get_device(&device_id)
-                    .map(|entry| entry.certificate.clone())
+                    .map(|entry| entry.certificate.clone())?;
+                Some((cert, state.master_pub()))
             });
-            if let Some(device_cert) = device_cert_for_swarm {
+            if let Some((device_cert, cluster_master_pub)) = cert_and_master {
                 let x25519_pub = {
                     let hk = Hkdf::<Sha256>::new(Some(b""), &keyfile.seed);
                     let mut okm = [0u8; 32];
@@ -323,6 +328,7 @@ impl DaemonHandle {
                     device_signing_key: device_key.clone(),
                     master_signing_key: master_key.clone(),
                     identity_pub,
+                    cluster_master_pub,
                     device_cert,
                     x25519_pub,
                     listen_port: app_config.network.listen_port,
