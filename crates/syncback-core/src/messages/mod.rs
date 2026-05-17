@@ -37,11 +37,13 @@ pub struct PeerAnnounceMsg {
     pub v: u8,
     pub identity_pub: IdentityPub,
     pub timestamp: Timestamp,
-    /// Ed25519 signature of identity_pub || timestamp. 64 bytes.
+    /// Ed25519 signature. 64 bytes.
+    /// Sig input: b"pa" (2) || identity_pub (32) || timestamp_be (8) || x25519_pub_or_zeroes (32)
+    /// Total: 74 bytes. If x25519_pub is None, the last 32 bytes are [0u8; 32].
     #[serde(with = "sig_serde")]
     pub sig: [u8; 64],
     /// X25519 public key for directed relay board encryption.
-    /// Not covered by sig — informational field only.
+    /// Covered by sig (see above).
     #[serde(default)]
     pub x25519_pub: Option<[u8; 32]>,
 }
@@ -559,24 +561,37 @@ pub fn build_handshake(
 // PeerAnnounce
 // ============================================================
 
-fn peer_announce_sig_input(identity_pub: &IdentityPub, timestamp: &Timestamp) -> Vec<u8> {
-    let mut input = Vec::with_capacity(32 + 8);
+/// Compute the signing input for PeerAnnounceMsg.
+///
+/// Input: b"pa" (2) || identity_pub (32) || timestamp_be (8) || x25519_pub_or_zeroes (32)
+/// Total: 74 bytes.
+/// If x25519_pub is None, the last 32 bytes are [0u8; 32] (so None and Some([0u8;32]) produce
+/// the same sig_input and are interchangeable for signature purposes).
+pub(crate) fn peer_announce_sig_input(
+    identity_pub: &IdentityPub,
+    timestamp: &Timestamp,
+    x25519_pub: Option<&[u8; 32]>,
+) -> Vec<u8> {
+    let zeroes = [0u8; 32];
+    let x25519_bytes = x25519_pub.unwrap_or(&zeroes);
+    let mut input = Vec::with_capacity(2 + 32 + 8 + 32);
+    input.extend_from_slice(b"pa");
     input.extend_from_slice(&identity_pub.0);
     input.extend_from_slice(&timestamp.0.to_be_bytes());
+    input.extend_from_slice(x25519_bytes);
     input
 }
 
 /// Build a signed PeerAnnounceMsg.
 ///
-/// The sig covers identity_pub || timestamp.
-/// `x25519_pub` is NOT part of the signature — it is an informational field.
+/// Sig covers: b"pa" || identity_pub || timestamp || x25519_pub_or_zeroes (74 bytes).
 pub fn build_peer_announce(
     identity_pub: IdentityPub,
     timestamp: Timestamp,
     signing_key: &ed25519_dalek::SigningKey,
     x25519_pub: Option<[u8; 32]>,
 ) -> PeerAnnounceMsg {
-    let sig_input = peer_announce_sig_input(&identity_pub, &timestamp);
+    let sig_input = peer_announce_sig_input(&identity_pub, &timestamp, x25519_pub.as_ref());
     let signature = signing_key.sign(&sig_input);
     PeerAnnounceMsg {
         v: PROTOCOL_VERSION,
@@ -592,7 +607,7 @@ pub fn verify_peer_announce(msg: &PeerAnnounceMsg) -> Result<(), MessageError> {
     let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&msg.identity_pub.0)
         .map_err(|_| MessageError::BadSignature)?;
     let signature = ed25519_dalek::Signature::from_bytes(&msg.sig);
-    let sig_input = peer_announce_sig_input(&msg.identity_pub, &msg.timestamp);
+    let sig_input = peer_announce_sig_input(&msg.identity_pub, &msg.timestamp, msg.x25519_pub.as_ref());
     verifying_key
         .verify_strict(&sig_input, &signature)
         .map_err(|_| MessageError::BadSignature)?;

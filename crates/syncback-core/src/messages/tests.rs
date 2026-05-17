@@ -1315,3 +1315,128 @@ fn message_enum_pos_hash_challenge_roundtrip() {
     let decoded: Message = from_cbor(&bytes).unwrap();
     assert_eq!(msg, decoded);
 }
+
+// ─── Issue D tests: PeerAnnounce x25519_pub coverage ─────────────────────────
+
+// AC-D1: tampered x25519_pub fails verification
+#[test]
+fn peer_announce_signature_covers_x25519_pub_tamper_fails() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let identity_pub = IdentityPub(sk.verifying_key().to_bytes());
+    let ts = Timestamp(1_000_000);
+    let x25519_bytes = [0x11u8; 32];
+
+    let mut msg = super::build_peer_announce(identity_pub, ts, &sk, Some(x25519_bytes));
+    // Tamper: change x25519_pub to a different value.
+    msg.x25519_pub = Some([0x22u8; 32]);
+
+    let result = super::verify_peer_announce(&msg);
+    assert!(
+        matches!(result, Err(super::MessageError::BadSignature)),
+        "tampered x25519_pub must fail verification"
+    );
+}
+
+// AC-D2: correct x25519_pub verifies
+#[test]
+fn peer_announce_with_correct_x25519_pub_verifies() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let identity_pub = IdentityPub(sk.verifying_key().to_bytes());
+    let ts = Timestamp(2_000_000);
+    let x25519_bytes = [0xABu8; 32];
+
+    let msg = super::build_peer_announce(identity_pub, ts, &sk, Some(x25519_bytes));
+    super::verify_peer_announce(&msg).expect("verify must succeed for correct x25519_pub");
+}
+
+// AC-D3: None x25519_pub and Some([0u8;32]) produce the same sig_input (both verify)
+#[test]
+fn peer_announce_none_x25519_pub_roundtrip() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let identity_pub = IdentityPub(sk.verifying_key().to_bytes());
+    let ts = Timestamp(3_000_000);
+
+    // Build with None — must verify.
+    let msg_none = super::build_peer_announce(identity_pub, ts, &sk, None);
+    super::verify_peer_announce(&msg_none).expect("None x25519_pub must verify");
+
+    // Build with Some([0u8;32]) — must also verify.
+    let msg_zero = super::build_peer_announce(identity_pub, ts, &sk, Some([0u8; 32]));
+    super::verify_peer_announce(&msg_zero).expect("Some([0u8;32]) x25519_pub must verify");
+
+    // Cross-check: sig_input for None == sig_input for Some([0u8;32]).
+    let input_none = super::peer_announce_sig_input(&identity_pub, &ts, None);
+    let input_zero = super::peer_announce_sig_input(&identity_pub, &ts, Some(&[0u8; 32]));
+    assert_eq!(
+        input_none, input_zero,
+        "None and Some([0u8;32]) must produce identical sig_input"
+    );
+
+    // Cross-verify: sig built with None must also verify when x25519_pub is Some([0u8;32]).
+    let mut msg_swapped = msg_none.clone();
+    msg_swapped.x25519_pub = Some([0u8; 32]);
+    super::verify_peer_announce(&msg_swapped)
+        .expect("sig built for None must verify when field is Some([0u8;32])");
+}
+
+// AC-D4: sig_input byte layout is exactly as specified
+#[test]
+fn peer_announce_sig_input_includes_x25519_pub_at_known_offset() {
+    let identity_pub = IdentityPub([0x01u8; 32]);
+    let ts = Timestamp(0x0102030405060708u64);
+    let x25519 = [0x55u8; 32];
+
+    let input = super::peer_announce_sig_input(&identity_pub, &ts, Some(&x25519));
+
+    assert_eq!(input.len(), 74, "sig_input must be 74 bytes");
+    assert_eq!(&input[0..2], b"pa", "first 2 bytes must be b\"pa\"");
+    assert_eq!(&input[2..34], &identity_pub.0, "bytes 2..34 must be identity_pub");
+    assert_eq!(
+        &input[34..42],
+        &ts.0.to_be_bytes(),
+        "bytes 34..42 must be timestamp big-endian"
+    );
+    assert_eq!(&input[42..74], &x25519, "bytes 42..74 must be x25519_pub");
+}
+
+// AC-D4 variant: None uses zeroes at x25519 slot
+#[test]
+fn peer_announce_sig_input_uses_zeroes_for_none_x25519() {
+    let identity_pub = IdentityPub([0x02u8; 32]);
+    let ts = Timestamp(100);
+
+    let input = super::peer_announce_sig_input(&identity_pub, &ts, None);
+    assert_eq!(&input[42..74], &[0u8; 32], "None x25519_pub must encode as [0u8;32]");
+}
+
+// AC-D5: old-format sig (covering only identity_pub || timestamp, 40 bytes) fails
+#[test]
+fn peer_announce_old_sig_format_fails_verification() {
+    use ed25519_dalek::Signer;
+
+    let sk = SigningKey::generate(&mut OsRng);
+    let identity_pub = IdentityPub(sk.verifying_key().to_bytes());
+    let ts = Timestamp(4_000_000);
+    let x25519 = [0xAAu8; 32];
+
+    // Build old-format sig_input: identity_pub (32) || timestamp (8) = 40 bytes (no b"pa", no x25519)
+    let mut old_input = Vec::with_capacity(40);
+    old_input.extend_from_slice(&identity_pub.0);
+    old_input.extend_from_slice(&ts.0.to_be_bytes());
+    let old_sig = sk.sign(&old_input).to_bytes();
+
+    // Construct msg with old sig and x25519_pub present.
+    let msg = super::PeerAnnounceMsg {
+        v: 1,
+        identity_pub,
+        timestamp: ts,
+        sig: old_sig,
+        x25519_pub: Some(x25519),
+    };
+
+    let result = super::verify_peer_announce(&msg);
+    assert!(
+        matches!(result, Err(super::MessageError::BadSignature)),
+        "old-format sig must fail verification with new verify_peer_announce"
+    );
+}
