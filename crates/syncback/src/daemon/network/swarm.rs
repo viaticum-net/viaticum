@@ -576,6 +576,7 @@ impl SwarmHandle {
             pending_requests: HashMap::new(),
             our_cert: config.device_cert,
             our_x25519_pub: config.x25519_pub,
+            own_identity_pub: config.identity_pub,
             cert_timeout: Duration::from_secs(config.cert_timeout_secs),
             kad_republish_timer,
             kad_discovery_timer,
@@ -777,6 +778,10 @@ struct EventLoopState {
 
     our_cert: DeviceCertificate,
     our_x25519_pub: Option<[u8; 32]>,
+
+    /// Own cluster master identity. Used in cert verification to check that
+    /// a peer's cert was signed by THIS cluster's master, not an attacker's.
+    own_identity_pub: IdentityPub,
 
     cert_timeout: Duration,
 
@@ -1114,7 +1119,7 @@ impl EventLoopState {
     ) {
         debug!(peer_id = %peer_id, "received cert request (listener side)");
 
-        if let Err(reason) = self.verify_cert_for_peer(&peer_id, &request.cert) {
+        if let Err(reason) = verify_cert_for_peer(&peer_id, &request.cert, &self.own_identity_pub) {
             warn!(
                 peer_id = %peer_id,
                 reason = %reason,
@@ -1146,7 +1151,7 @@ impl EventLoopState {
     async fn on_cert_response(&mut self, peer_id: PeerId, response: DeviceCertExchangeMsg) {
         debug!(peer_id = %peer_id, "received cert response (dialer side)");
 
-        if let Err(reason) = self.verify_cert_for_peer(&peer_id, &response.cert) {
+        if let Err(reason) = verify_cert_for_peer(&peer_id, &response.cert, &self.own_identity_pub) {
             warn!(
                 peer_id = %peer_id,
                 reason = %reason,
@@ -1157,28 +1162,6 @@ impl EventLoopState {
         }
 
         self.record_authenticated(peer_id, response).await;
-    }
-
-    /// Verify that a DeviceCertificate belongs to the given PeerId.
-    ///
-    /// Two checks:
-    /// 1. cert.device_id.0 → expected PeerId matches actual PeerId (Noise proof).
-    /// 2. verify_device_certificate signature (master signed the cert).
-    fn verify_cert_for_peer(&self, peer_id: &PeerId, cert: &DeviceCertificate) -> Result<(), String> {
-        // Check 1: does cert.device_id match the Noise-authenticated PeerId?
-        let expected_peer_id = device_id_to_peer_id(&cert.device_id)
-            .map_err(|e| format!("cannot derive PeerId from cert.device_id: {e}"))?;
-        if *peer_id != expected_peer_id {
-            return Err(format!(
-                "cert.device_id mismatch: expected peer_id {expected_peer_id}, got {peer_id}"
-            ));
-        }
-
-        // Check 2: master signature on cert is valid.
-        verify_device_certificate(cert, &cert.master_pub_key)
-            .map_err(|e| format!("cert signature invalid: {e}"))?;
-
-        Ok(())
     }
 
     /// Record a successfully verified peer in the authenticated maps.
@@ -1602,6 +1585,40 @@ impl EventLoopState {
             emit_event(&self.event_tx, ev);
         }
     }
+}
+
+/// Verify that a DeviceCertificate belongs to the given PeerId and was
+/// signed by the trusted cluster master.
+///
+/// Two checks:
+/// 1. cert.device_id → expected PeerId matches the Noise-authenticated PeerId.
+/// 2. cert signature is valid under `own_identity_pub` (the cluster master).
+///
+/// SECURITY: `own_identity_pub` MUST come from the node's own seed-derived
+/// identity, NOT from `cert.master_pub_key`. Using the cert's own key would
+/// be tautological — any self-signed cert would pass.
+pub(crate) fn verify_cert_for_peer(
+    peer_id: &PeerId,
+    cert: &DeviceCertificate,
+    own_identity_pub: &IdentityPub,
+) -> Result<(), String> {
+    // Check 1: does cert.device_id match the Noise-authenticated PeerId?
+    let expected_peer_id = device_id_to_peer_id(&cert.device_id)
+        .map_err(|e| format!("cannot derive PeerId from cert.device_id: {e}"))?;
+    if *peer_id != expected_peer_id {
+        return Err(format!(
+            "cert.device_id mismatch: expected peer_id {expected_peer_id}, got {peer_id}"
+        ));
+    }
+
+    // Check 2: cert is signed by the trusted cluster master.
+    //
+    // Use own_identity_pub (derived from our seed at startup), NOT cert.master_pub_key.
+    // cert.master_pub_key is attacker-controlled; trusting it is tautological.
+    verify_device_certificate(cert, own_identity_pub)
+        .map_err(|e| format!("cert not signed by cluster master: {e}"))?;
+
+    Ok(())
 }
 
 /// Emit a ProtocolEvent to the consumer channel (best-effort, non-blocking).

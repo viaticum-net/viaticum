@@ -18,3 +18,5 @@ mod swarm_tests;
 mod swarm_kad_tests;
 #[cfg(test)]
 mod swarm_nat_tests;
+#[cfg(test)]
+mod tests;
