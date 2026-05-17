@@ -711,25 +711,57 @@ async fn handle_pos_hash_challenge_sends_nack_when_symbol_not_held() {
 
 #[tokio::test]
 async fn handle_pos_hash_nack_marks_alive_placement_lost_and_triggers_repair() {
+    use std::collections::HashMap;
+    use syncback_core::cluster::{derive_master_key, master_identity};
+    use syncback_core::messages::build_pos_hash_nack;
+    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
+
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, mut repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
 
-    let holder = make_device_id(1);
+    // Use a proper key pair so we can sign the nack.
+    let holder_master_key = derive_master_key(&[0x01u8; 64]).expect("derive_master_key");
+    let holder_master = master_identity(&holder_master_key);
+    let holder = DeviceId(holder_master.0);
     let block_id = make_block_id(2);
+    let challenge_id = [0x01u8; 16];
+
+    // Register holder in DB so get_master_for_device succeeds.
+    db.upsert_peer(&make_peer_record(holder)).unwrap();
+    db.set_master_for_device(&holder, &holder_master).unwrap();
 
     let placement = make_symbol_placement(block_id, holder, vec![(0, 5)], PlacementStatus::Alive);
     db.upsert_placement(&placement).unwrap();
 
-    let nack = syncback_core::messages::PosHashNackMsg {
-        v: 1,
-        challenge_id: [0u8; 16],
-        source_block_id: block_id,
-        first_missing_esi: 0,
-        timestamp: Timestamp::now(),
-        device_id: None,
-    };
+    // Set up a pending challenge for this holder.
+    let pending_map: HashMap<_, _> = [(
+        (block_id, holder),
+        PendingHashChallenge {
+            source_block_id: block_id,
+            holder_id: holder,
+            esi_ranges: vec![(0, 5)],
+            expected_chain_hash: [0u8; 32],
+            issued_at: Timestamp::now(),
+            challenge_id,
+        },
+    )]
+    .into_iter()
+    .collect();
+    let pending: PendingChallenges =
+        std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
+
+    let (processor, mut repair_rx, _relay_rx) =
+        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
+
+    // Build a properly signed nack.
+    let nack = build_pos_hash_nack(
+        challenge_id,
+        block_id,
+        0,
+        Timestamp::now(),
+        None,
+        &holder_master_key,
+    );
 
     processor
         .handle_pos_hash_nack(holder, nack)
@@ -767,6 +799,8 @@ async fn handle_pos_hash_nack_is_noop_for_lost_placement() {
     let placement = make_symbol_placement(block_id, holder, vec![(0, 5)], PlacementStatus::Lost);
     db.upsert_placement(&placement).unwrap();
 
+    // Nack with unknown challenge_id (no pending challenge) → silently dropped.
+    // Placement stays Lost — already Lost, no change (either via early exit or mark_placement_lost).
     let nack = syncback_core::messages::PosHashNackMsg {
         v: 1,
         challenge_id: [0u8; 16],
@@ -774,6 +808,7 @@ async fn handle_pos_hash_nack_is_noop_for_lost_placement() {
         first_missing_esi: 0,
         timestamp: Timestamp::now(),
         device_id: None,
+        sig: [0u8; 64],
     };
 
     processor
@@ -781,7 +816,7 @@ async fn handle_pos_hash_nack_is_noop_for_lost_placement() {
         .await
         .expect("handle_pos_hash_nack failed");
 
-    // Placement stays Lost — already Lost, no change.
+    // Placement stays Lost — dropped early due to no pending challenge.
     let updated = db.get_placement(&block_id, &holder).unwrap().unwrap();
     assert_eq!(updated.status, PlacementStatus::Lost);
 }
@@ -3532,4 +3567,208 @@ async fn cluster_sync_response_from_non_cluster_peer_is_rejected() {
     let our_device_id = DeviceId(device_signing_key.verifying_key().to_bytes());
     let result = processor.handle_cluster_sync_response(our_device_id, resp).await;
     assert!(result.is_ok(), "handle_cluster_sync_response with cluster device must succeed");
+}
+
+// ─── Wave2 / Issue E: handle_pos_hash_nack signature verification ────────────
+
+// AC-E4: valid nack from expected holder → placement marked Lost, repair enqueued
+#[tokio::test]
+async fn handle_pos_hash_nack_valid_from_expected_holder_marks_lost() {
+    use std::collections::HashMap;
+    use syncback_core::cluster::{derive_master_key, master_identity};
+    use syncback_core::messages::build_pos_hash_nack;
+    use crate::daemon::repair::RepairTrigger;
+    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+
+    // Holder identity: separate key pair for the holder.
+    let holder_master_key = derive_master_key(&[0x10u8; 64]).expect("holder master key");
+    let holder_master = master_identity(&holder_master_key);
+    let holder_device = DeviceId(holder_master.0); // device_id == master pub for single-device
+
+    let block_id = make_block_id(50);
+    let challenge_id = [0x50u8; 16];
+
+    // Register holder in DB (PeerRecord + master mapping).
+    db.upsert_peer(&make_peer_record(holder_device)).unwrap();
+    db.set_master_for_device(&holder_device, &holder_master).unwrap();
+
+    // Insert Alive placement.
+    let placement = make_symbol_placement(block_id, holder_device, vec![(0, 1)], PlacementStatus::Alive);
+    db.upsert_placement(&placement).unwrap();
+
+    // Set up pending challenges.
+    let pending_map: HashMap<_, _> = [(
+        (block_id, holder_device),
+        PendingHashChallenge {
+            source_block_id: block_id,
+            holder_id: holder_device,
+            esi_ranges: vec![(0, 1)],
+            expected_chain_hash: [0u8; 32],
+            issued_at: Timestamp::now(),
+            challenge_id,
+        },
+    )]
+    .into_iter()
+    .collect();
+    let pending: PendingChallenges =
+        std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
+
+    let (processor, mut repair_rx, _relay_rx) =
+        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
+
+    // Build a valid signed nack from the holder.
+    let nack = build_pos_hash_nack(
+        challenge_id,
+        block_id,
+        0,
+        Timestamp::now(),
+        Some(holder_device),
+        &holder_master_key,
+    );
+
+    processor
+        .handle_pos_hash_nack(holder_device, nack)
+        .await
+        .expect("handle_pos_hash_nack must succeed");
+
+    // Placement must be Lost.
+    let updated = db.get_placement(&block_id, &holder_device).unwrap();
+    assert!(
+        matches!(updated, Some(ref p) if p.status == PlacementStatus::Lost),
+        "placement must be Lost after valid PosHashNack, got: {:?}",
+        updated
+    );
+
+    // RepairTrigger::RepairNow must have been enqueued.
+    let trigger = repair_rx.try_recv().expect("repair trigger must be enqueued");
+    assert!(
+        matches!(trigger, RepairTrigger::RepairNow { block_id: b, holder_id: h } if b == block_id && h == holder_device),
+        "repair trigger must reference correct block and holder"
+    );
+
+    // Pending challenge must have been consumed.
+    // (verified indirectly — a second call with same challenge_id would get "unknown challenge_id")
+}
+
+// AC-E5: nack signed by wrong key → placement unchanged, no repair
+#[tokio::test]
+async fn handle_pos_hash_nack_from_wrong_signer_rejected() {
+    use std::collections::HashMap;
+    use syncback_core::cluster::{derive_master_key, master_identity};
+    use syncback_core::messages::build_pos_hash_nack;
+    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+
+    // Holder identity.
+    let holder_master_key = derive_master_key(&[0x20u8; 64]).expect("holder master key");
+    let holder_master = master_identity(&holder_master_key);
+    let holder_device = DeviceId(holder_master.0);
+
+    // Attacker identity (different key).
+    let attacker_master_key = derive_master_key(&[0x21u8; 64]).expect("attacker master key");
+
+    let block_id = make_block_id(51);
+    let challenge_id = [0x51u8; 16];
+
+    // Register holder in DB.
+    db.upsert_peer(&make_peer_record(holder_device)).unwrap();
+    db.set_master_for_device(&holder_device, &holder_master).unwrap();
+
+    // Insert Alive placement.
+    let placement = make_symbol_placement(block_id, holder_device, vec![(0, 1)], PlacementStatus::Alive);
+    db.upsert_placement(&placement).unwrap();
+
+    // Pending challenge for holder.
+    let pending_map: HashMap<_, _> = [(
+        (block_id, holder_device),
+        PendingHashChallenge {
+            source_block_id: block_id,
+            holder_id: holder_device,
+            esi_ranges: vec![(0, 1)],
+            expected_chain_hash: [0u8; 32],
+            issued_at: Timestamp::now(),
+            challenge_id,
+        },
+    )]
+    .into_iter()
+    .collect();
+    let pending: PendingChallenges =
+        std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
+
+    let (processor, mut repair_rx, _relay_rx) =
+        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
+
+    // Build a nack signed by the ATTACKER key (not the holder).
+    let forged_nack = build_pos_hash_nack(
+        challenge_id,
+        block_id,
+        0,
+        Timestamp::now(),
+        Some(holder_device),
+        &attacker_master_key, // wrong key — attacker's
+    );
+
+    processor
+        .handle_pos_hash_nack(holder_device, forged_nack)
+        .await
+        .expect("handle_pos_hash_nack must return Ok even when rejecting");
+
+    // Placement must still be Alive (not modified).
+    let placement_after = db.get_placement(&block_id, &holder_device).unwrap().unwrap();
+    assert_eq!(
+        placement_after.status,
+        PlacementStatus::Alive,
+        "placement must remain Alive when forged nack is rejected"
+    );
+
+    // No repair trigger.
+    assert!(
+        repair_rx.try_recv().is_err(),
+        "repair_rx must be empty when forged nack is rejected"
+    );
+}
+
+// AC-E6: unknown challenge_id → silent drop, no placement change, no repair
+#[tokio::test]
+async fn handle_pos_hash_nack_unknown_challenge_id_silently_dropped() {
+    use syncback_core::cluster::{derive_master_key, master_identity};
+    use syncback_core::messages::build_pos_hash_nack;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+
+    let holder_master_key = derive_master_key(&[0x30u8; 64]).expect("holder master key");
+    let holder_master = master_identity(&holder_master_key);
+    let holder_device = DeviceId(holder_master.0);
+
+    let block_id = make_block_id(52);
+    let unknown_challenge_id = [0x99u8; 16]; // not in pending_challenges
+
+    // pending_challenges is empty (make_processor uses empty map).
+    let (processor, mut repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir).await;
+
+    // Build a nack with an unknown challenge_id.
+    let nack = build_pos_hash_nack(
+        unknown_challenge_id,
+        block_id,
+        0,
+        Timestamp::now(),
+        Some(holder_device),
+        &holder_master_key,
+    );
+
+    let result = processor.handle_pos_hash_nack(holder_device, nack).await;
+    assert!(result.is_ok(), "handle_pos_hash_nack must return Ok for unknown challenge_id");
+
+    // No repair trigger.
+    assert!(
+        repair_rx.try_recv().is_err(),
+        "repair_rx must be empty for unknown challenge_id"
+    );
 }

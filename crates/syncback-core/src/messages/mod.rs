@@ -80,6 +80,10 @@ pub struct PosHashResponseMsg {
 
 /// Holder → Owner. Cannot serve the chain hash challenge (symbols missing).
 /// Sent when ANY of the challenged ESIs is missing on disk.
+///
+/// sig covers: b"pn" (2) || challenge_id (16) || source_block_id (32) || timestamp_be (8)
+/// Total: 58 bytes. Signed by holder's master identity key.
+/// If sig is all-zero, the message is unsigned (old format) and will be rejected by the handler.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PosHashNackMsg {
     pub v: u8,
@@ -90,6 +94,12 @@ pub struct PosHashNackMsg {
     pub timestamp: Timestamp,
     #[serde(default)]
     pub device_id: Option<DeviceId>,
+    /// Ed25519 signature by the holder's master identity key. 64 bytes.
+    /// Defaults to [0u8; 64] on deserialization (old unsigned messages) which will
+    /// fail verify_pos_hash_nack — old messages are silently rejected.
+    #[serde(with = "sig_serde")]
+    #[serde(default = "default_sig")]
+    pub sig: [u8; 64],
 }
 
 /// Owner → Holder. Offer to store symbols for a source block.
@@ -1075,6 +1085,69 @@ pub fn verify_symbol_dropped(msg: &SymbolDroppedMsg, holder: &IdentityPub) -> Re
         .map_err(|_| MessageError::BadSignature)?;
     let sig = ed25519_dalek::Signature::from_bytes(&msg.sig);
     let input = symbol_dropped_sig_input(&msg.source_block_id, &msg.esi_ranges, &msg.timestamp);
+    vk.verify_strict(&input, &sig)
+        .map_err(|_| MessageError::BadSignature)?;
+    Ok(())
+}
+
+// ============================================================
+// PosHashNack signature
+// ============================================================
+
+/// Compute the signing input for PosHashNackMsg.
+///
+/// Input: b"pn" (2) || challenge_id (16) || source_block_id (32) || timestamp_be (8)
+/// Total: 58 bytes.
+fn pos_hash_nack_sig_input(
+    challenge_id: &[u8; 16],
+    source_block_id: &SourceBlockId,
+    timestamp: &Timestamp,
+) -> Vec<u8> {
+    let mut input = Vec::with_capacity(2 + 16 + 32 + 8);
+    input.extend_from_slice(b"pn");
+    input.extend_from_slice(challenge_id);
+    input.extend_from_slice(&source_block_id.0);
+    input.extend_from_slice(&timestamp.0.to_be_bytes());
+    input
+}
+
+/// Build a signed PosHashNackMsg.
+///
+/// `signing_key` must be the holder's master identity key.
+/// Sig covers: b"pn" || challenge_id || source_block_id || timestamp_be (58 bytes).
+pub fn build_pos_hash_nack(
+    challenge_id: [u8; 16],
+    source_block_id: SourceBlockId,
+    first_missing_esi: u32,
+    timestamp: Timestamp,
+    device_id: Option<DeviceId>,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> PosHashNackMsg {
+    let sig_input = pos_hash_nack_sig_input(&challenge_id, &source_block_id, &timestamp);
+    let sig = signing_key.sign(&sig_input).to_bytes();
+    PosHashNackMsg {
+        v: PROTOCOL_VERSION,
+        challenge_id,
+        source_block_id,
+        first_missing_esi,
+        timestamp,
+        device_id,
+        sig,
+    }
+}
+
+/// Verify a PosHashNackMsg signature against the expected holder's master identity.
+///
+/// `expected_holder_master` is the IdentityPub of the peer who was originally challenged.
+/// Returns Err(BadSignature) if the signature is invalid or all-zero (unsigned legacy message).
+pub fn verify_pos_hash_nack(
+    msg: &PosHashNackMsg,
+    expected_holder_master: &IdentityPub,
+) -> Result<(), MessageError> {
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&expected_holder_master.0)
+        .map_err(|_| MessageError::BadSignature)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&msg.sig);
+    let input = pos_hash_nack_sig_input(&msg.challenge_id, &msg.source_block_id, &msg.timestamp);
     vk.verify_strict(&input, &sig)
         .map_err(|_| MessageError::BadSignature)?;
     Ok(())

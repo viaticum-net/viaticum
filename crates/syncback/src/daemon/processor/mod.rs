@@ -183,9 +183,8 @@ pub struct Processor {
     /// Used by handle_cluster_sync_request_libp2p to validate from_device_id.
     peer_cert_map: Arc<std::sync::Mutex<HashMap<DeviceId, (IdentityPub, DeviceCertificate)>>>,
     /// Master identity signing key for producing signed messages.
-    /// Currently unused after PoS hash chain migration (PosHashNackMsg is unsigned in MVP).
-    /// Will be needed when signed PosHashNack is added.
-    #[allow(dead_code)]
+    /// Used to sign PosHashNackMsg (holder side) and other protocol messages requiring
+    /// master identity proof.
     master_signing_key: ed25519_dalek::SigningKey,
 }
 

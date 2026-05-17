@@ -1,6 +1,8 @@
 // PoS handlers: holder responds to hash challenge, owner verifies hash response or receives nack.
 
-use syncback_core::messages::{Message, PosHashNackMsg, PosHashResponseMsg};
+use syncback_core::messages::{
+    build_pos_hash_nack, verify_pos_hash_nack, Message, PosHashNackMsg, PosHashResponseMsg,
+};
 use syncback_core::pos::{
     apply_pos_outcome, compute_chain_hash, outcome_from_verify, verify_hash_response,
     VerifyOutcome,
@@ -36,14 +38,14 @@ impl Processor {
                     challenger = %owner_id,
                     "processor: PosHashChallenge from non-owner, sending nack"
                 );
-                return Ok(Message::PosHashNack(PosHashNackMsg {
-                    v: 1,
-                    challenge_id: challenge.challenge_id,
-                    source_block_id: block_id,
-                    first_missing_esi: 0,
-                    timestamp: Timestamp::now(),
-                    device_id: challenge.device_id,
-                }));
+                return Ok(Message::PosHashNack(build_pos_hash_nack(
+                    challenge.challenge_id,
+                    block_id,
+                    0,
+                    Timestamp::now(),
+                    challenge.device_id,
+                    &self.master_signing_key,
+                )));
             }
         }
 
@@ -68,14 +70,14 @@ impl Processor {
                         esi,
                         "processor: PosHashChallenge — symbol missing, sending nack"
                     );
-                    return Ok(Message::PosHashNack(PosHashNackMsg {
-                        v: 1,
-                        challenge_id: challenge.challenge_id,
-                        source_block_id: block_id,
-                        first_missing_esi: esi,
-                        timestamp: Timestamp::now(),
-                        device_id: challenge.device_id,
-                    }));
+                    return Ok(Message::PosHashNack(build_pos_hash_nack(
+                        challenge.challenge_id,
+                        block_id,
+                        esi,
+                        Timestamp::now(),
+                        challenge.device_id,
+                        &self.master_signing_key,
+                    )));
                 }
                 Err(e) => return Err(ProcessorError::Io(e)),
             }
@@ -154,7 +156,7 @@ impl Processor {
     }
 
     /// Owner side: receive PosHashNack — holder cannot serve the hash challenge.
-    /// Mark placement Lost and trigger repair.
+    /// Verifies that the nack is signed by the expected holder before marking placement Lost.
     pub(crate) async fn handle_pos_hash_nack(
         &self,
         from_device: DeviceId,
@@ -162,33 +164,72 @@ impl Processor {
     ) -> Result<(), ProcessorError> {
         let block_id = nack.source_block_id;
 
-        // Consume pending challenge (if any).
-        {
-            let mut guard = self.pending_challenges.lock().await;
-            let key = guard.iter()
+        // 1. Find pending challenge by challenge_id (linear scan, bounded by active placements).
+        let pending_key = {
+            let guard = self.pending_challenges.lock().await;
+            guard.iter()
                 .find(|(_, v)| v.challenge_id == nack.challenge_id)
-                .map(|(k, _)| *k);
-            if let Some(k) = key {
-                guard.remove(&k);
+                .map(|(k, _)| *k)
+        };
+
+        let key = match pending_key {
+            Some(k) => k,
+            None => {
+                warn!(
+                    holder = %from_device,
+                    "processor: PosHashNack with unknown challenge_id (stale or already consumed)"
+                );
+                return Ok(());
             }
+        };
+
+        // 2. Resolve the expected holder's master identity from the pending challenge.
+        //    pending_challenges key = (SourceBlockId, DeviceId) where DeviceId is the holder.
+        let expected_holder_device = key.1;
+        let expected_holder_master = match self.db.get_master_for_device(&expected_holder_device)? {
+            Some(m) => m,
+            None => {
+                warn!(
+                    holder = %expected_holder_device,
+                    "processor: PosHashNack expected holder not in DB, rejecting"
+                );
+                return Ok(());
+            }
+        };
+
+        // 3. Verify signature — signer must be the expected holder's master identity.
+        if let Err(e) = verify_pos_hash_nack(&nack, &expected_holder_master) {
+            warn!(
+                from = %from_device,
+                expected_holder = %expected_holder_device,
+                err = %e,
+                "processor: PosHashNack signature verification failed, ignoring"
+            );
+            return Ok(());
         }
 
-        // Mark placement Lost.
-        super::mark_placement_lost(&self.db, &block_id, &from_device)?;
+        // 4. Consume the challenge entry (challenge lifecycle ends here).
+        {
+            let mut guard = self.pending_challenges.lock().await;
+            guard.remove(&key);
+        }
 
-        // Refresh trust_s.
-        if let Err(e) = self.db.refresh_peer_storage_bytes(&from_device) {
+        // 5. Mark placement Lost.
+        super::mark_placement_lost(&self.db, &block_id, &expected_holder_device)?;
+
+        // 6. Refresh trust_s.
+        if let Err(e) = self.db.refresh_peer_storage_bytes(&expected_holder_device) {
             error!(
-                device = %from_device,
+                device = %expected_holder_device,
                 err = %e,
                 "processor: failed to refresh storage balance after PosHashNack"
             );
         }
 
-        info!(block_id = %block_id, holder = %from_device, "repair: triggered by PosHashNack");
+        info!(block_id = %block_id, holder = %expected_holder_device, "repair: triggered by PosHashNack");
         let _ = self
             .repair_tx
-            .send(RepairTrigger::RepairNow { block_id, holder_id: from_device })
+            .send(RepairTrigger::RepairNow { block_id, holder_id: expected_holder_device })
             .await;
         Ok(())
     }

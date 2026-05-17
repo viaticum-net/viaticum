@@ -652,6 +652,7 @@ fn all_26_message_variants() -> Vec<Message> {
             first_missing_esi: 7,
             timestamp: ts,
             device_id: None,
+            sig: [0u8; 64],
         }),
         Message::SymbolOffer(SymbolOfferMsg {
             v: 1,
@@ -1294,6 +1295,7 @@ fn pos_hash_nack_cbor_roundtrip() {
         first_missing_esi: 42,
         timestamp: Timestamp(1234567890),
         device_id: None,
+        sig: [0u8; 64],
     };
     let bytes = to_cbor(&msg).unwrap();
     let decoded: PosHashNackMsg = from_cbor(&bytes).unwrap();
@@ -1438,5 +1440,108 @@ fn peer_announce_old_sig_format_fails_verification() {
     assert!(
         matches!(result, Err(super::MessageError::BadSignature)),
         "old-format sig must fail verification with new verify_peer_announce"
+    );
+}
+
+// ─── Issue E tests: PosHashNack signature ────────────────────────────────────
+
+// AC-E1: tampered challenge_id fails
+#[test]
+fn pos_hash_nack_signature_covers_challenge_id() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let block_id = SourceBlockId([0xBBu8; 32]);
+    let ts = Timestamp(1_000_000);
+
+    let mut msg = super::build_pos_hash_nack([0x01u8; 16], block_id, 0, ts, None, &sk);
+    // Tamper challenge_id.
+    msg.challenge_id = [0x02u8; 16];
+
+    let holder = IdentityPub(sk.verifying_key().to_bytes());
+    let result = super::verify_pos_hash_nack(&msg, &holder);
+    assert!(
+        matches!(result, Err(super::MessageError::BadSignature)),
+        "tampered challenge_id must fail verification"
+    );
+}
+
+// AC-E2: tampered source_block_id fails
+#[test]
+fn pos_hash_nack_signature_covers_source_block_id() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let block_id_a = SourceBlockId([0xAAu8; 32]);
+    let block_id_b = SourceBlockId([0xCCu8; 32]);
+    let ts = Timestamp(2_000_000);
+
+    let mut msg = super::build_pos_hash_nack([0x10u8; 16], block_id_a, 5, ts, None, &sk);
+    // Tamper source_block_id.
+    msg.source_block_id = block_id_b;
+
+    let holder = IdentityPub(sk.verifying_key().to_bytes());
+    let result = super::verify_pos_hash_nack(&msg, &holder);
+    assert!(
+        matches!(result, Err(super::MessageError::BadSignature)),
+        "tampered source_block_id must fail verification"
+    );
+}
+
+// AC-E3: correctly built message verifies
+#[test]
+fn pos_hash_nack_with_correct_signature_verifies() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let block_id = SourceBlockId([0x77u8; 32]);
+    let ts = Timestamp(3_000_000);
+
+    let msg = super::build_pos_hash_nack([0x20u8; 16], block_id, 10, ts, None, &sk);
+    let holder = IdentityPub(sk.verifying_key().to_bytes());
+    super::verify_pos_hash_nack(&msg, &holder)
+        .expect("correctly built PosHashNack must verify");
+}
+
+// AC-E7: old-format message (no sig field in CBOR) deserializes with sig=[0u8;64]
+// and then verify_pos_hash_nack fails (zero sig is not a valid Ed25519 signature)
+#[test]
+fn pos_hash_nack_missing_sig_field_deserializes_to_zero() {
+    use ciborium::value::Value;
+
+    // Build a CBOR map that has all fields EXCEPT sig — simulates old wire format.
+    let cbor_map = Value::Map(vec![
+        (Value::Text("v".into()), Value::Integer(1.into())),
+        (
+            Value::Text("challenge_id".into()),
+            Value::Bytes(vec![0x11u8; 16]),
+        ),
+        (
+            Value::Text("source_block_id".into()),
+            Value::Bytes(vec![0x22u8; 32]),
+        ),
+        (
+            Value::Text("first_missing_esi".into()),
+            Value::Integer(42.into()),
+        ),
+        (
+            Value::Text("timestamp".into()),
+            Value::Integer(1234567890u64.into()),
+        ),
+        // sig field intentionally absent — old format
+    ]);
+
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&cbor_map, &mut buf).expect("CBOR encode failed");
+
+    let decoded: PosHashNackMsg = from_cbor(&buf).expect("deserialization must succeed without sig field");
+    assert_eq!(
+        decoded.sig,
+        [0u8; 64],
+        "missing sig field must default to [0u8; 64]"
+    );
+
+    // Now verify must fail — zero sig is not a valid Ed25519 signature.
+    // Use any key as the expected holder — the zero sig will fail regardless.
+    let sk = SigningKey::generate(&mut OsRng);
+    let holder = IdentityPub(sk.verifying_key().to_bytes());
+    let result = super::verify_pos_hash_nack(&decoded, &holder);
+    assert!(
+        matches!(result, Err(super::MessageError::BadSignature)),
+        "zero sig (old format) must fail verify_pos_hash_nack"
     );
 }

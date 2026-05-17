@@ -42,6 +42,7 @@ fn make_pos_nack() -> Message {
         first_missing_esi: 42,
         timestamp: Timestamp(1001),
         device_id: None,
+        sig: [0u8; 64],
     })
 }
 
