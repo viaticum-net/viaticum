@@ -4,7 +4,7 @@
 // All tests are synchronous (no tokio runtime needed for unit tests).
 
 use rand::rngs::OsRng;
-use syncback_core::constants::{MAX_BOARD_ENTRIES, MAX_BOARD_SIZE_BYTES, RELAY_TTL_SECS};
+use syncback_core::constants::{MAX_BOARD_ENTRIES, MAX_BOARD_ENTRIES_PER_AUTHOR, MAX_BOARD_SIZE_BYTES, RELAY_TTL_SECS};
 use syncback_core::cluster::{
     issue_device_certificate, issue_revocation, verify_device_certificate, verify_revocation,
     EpochCounter,
@@ -713,6 +713,40 @@ fn revocation_broadcast_propagates_through_relay() {
     assert_eq!(decoded.device_cert.device_id.0, device_pub_bytes);
 }
 
+// ─── Helper: generate N distinct entries for one author ──────────────────────
+
+/// Build `count` valid broadcast entries authored by `signing_key`/`identity`,
+/// each with a unique msg_id derived from `(namespace, index)`.
+/// `namespace` must be unique per author in multi-author tests to avoid msg_id collisions.
+fn make_broadcast_entries_ns(
+    signing_key: &ed25519_dalek::SigningKey,
+    identity: IdentityPub,
+    count: usize,
+    namespace: u8,
+    now: Timestamp,
+) -> Vec<StoredEntry> {
+    (0..count)
+        .map(|i| {
+            let mut msg_id = [0u8; 16];
+            // Encode index as little-endian u64 in first 8 bytes; namespace in byte 8.
+            msg_id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            msg_id[8] = namespace;
+            make_broadcast_entry(signing_key, identity, "peer_announce", msg_id, now)
+        })
+        .collect()
+}
+
+/// Convenience wrapper: namespace defaults to identity.0[0].
+/// Safe for single-author use.
+fn make_broadcast_entries(
+    signing_key: &ed25519_dalek::SigningKey,
+    identity: IdentityPub,
+    count: usize,
+    now: Timestamp,
+) -> Vec<StoredEntry> {
+    make_broadcast_entries_ns(signing_key, identity, count, identity.0[0], now)
+}
+
 // ─── RELAY-11: board_sync_exchange_fills_missing_entries ─────────────────────
 
 /// Bidirectional sync: node A has {E1, E2}, node B has {E2, E3}.
@@ -899,4 +933,228 @@ fn scan_for_self_delivers_new_after_prune() {
     let msg = inbound_rx.try_recv().unwrap();
     assert_eq!(msg.msg_id, [0xB2u8; 16]);
     assert_eq!(msg.payload, b"entry_b");
+}
+
+// ─── Issue G (H-2): per-author rate limit on process_remote_entries ──────────
+
+/// AC-G1: exactly MAX_BOARD_ENTRIES_PER_AUTHOR entries from one author → all accepted.
+#[test]
+fn process_remote_entries_accepts_under_per_author_cap() {
+    let dir = TempDir::new().unwrap();
+    let mut manager = RelayManager::new(make_config(&dir)).unwrap();
+
+    let (key_a, identity_a) = make_identity();
+    let now = Timestamp::now();
+
+    let entries = make_broadcast_entries(&key_a, identity_a, MAX_BOARD_ENTRIES_PER_AUTHOR, now);
+    let count = manager.process_remote_entries(&entries, now).unwrap();
+
+    assert_eq!(count, MAX_BOARD_ENTRIES_PER_AUTHOR, "all entries at cap should be accepted");
+    assert_eq!(manager.stats().0, MAX_BOARD_ENTRIES_PER_AUTHOR);
+}
+
+/// AC-G2: MAX_BOARD_ENTRIES_PER_AUTHOR + 1 entries from one author →
+///         first MAX_BOARD_ENTRIES_PER_AUTHOR accepted, last one dropped.
+#[test]
+fn process_remote_entries_truncates_over_per_author_cap() {
+    let dir = TempDir::new().unwrap();
+    let mut manager = RelayManager::new(make_config(&dir)).unwrap();
+
+    let (key_a, identity_a) = make_identity();
+    let now = Timestamp::now();
+
+    let entries = make_broadcast_entries(&key_a, identity_a, MAX_BOARD_ENTRIES_PER_AUTHOR + 1, now);
+    let count = manager.process_remote_entries(&entries, now).unwrap();
+
+    assert_eq!(count, MAX_BOARD_ENTRIES_PER_AUTHOR, "over-cap entry should be dropped");
+    assert_eq!(manager.stats().0, MAX_BOARD_ENTRIES_PER_AUTHOR);
+}
+
+/// AC-G3: per-author counts are independent — two authors each at cap = 2× entries accepted.
+#[test]
+fn process_remote_entries_per_author_counted_separately() {
+    let dir = TempDir::new().unwrap();
+    let mut manager = RelayManager::new(make_config(&dir)).unwrap();
+
+    let (key_a, identity_a) = make_identity();
+    let (key_b, identity_b) = make_identity();
+    let now = Timestamp::now();
+
+    // Use explicit namespaces 0xAA / 0xBB to prevent msg_id collision between authors.
+    let mut entries =
+        make_broadcast_entries_ns(&key_a, identity_a, MAX_BOARD_ENTRIES_PER_AUTHOR, 0xAA, now);
+    entries.extend(make_broadcast_entries_ns(
+        &key_b,
+        identity_b,
+        MAX_BOARD_ENTRIES_PER_AUTHOR,
+        0xBB,
+        now,
+    ));
+
+    let count = manager.process_remote_entries(&entries, now).unwrap();
+
+    assert_eq!(
+        count,
+        2 * MAX_BOARD_ENTRIES_PER_AUTHOR,
+        "both authors' entries should be accepted independently"
+    );
+    assert_eq!(manager.stats().0, 2 * MAX_BOARD_ENTRIES_PER_AUTHOR);
+}
+
+/// AC-G4: local entries posted via post_broadcast are not subject to the per-author cap.
+///
+/// Post 5 entries locally, then process MAX_BOARD_ENTRIES_PER_AUTHOR remote entries
+/// from an external author. Total on board should be cap + 5.
+#[test]
+fn process_remote_entries_does_not_affect_local_entries() {
+    let dir = TempDir::new().unwrap();
+    let mut manager = RelayManager::new(make_config(&dir)).unwrap();
+
+    let now = Timestamp::now();
+    let future = Timestamp(now.0 + 1_000_000);
+
+    // Post 5 local entries (authored by our own identity, hop=0).
+    for i in 0u8..5 {
+        let mut msg_id = [0xFFu8; 16];
+        msg_id[0] = i;
+        manager
+            .post_broadcast("peer_announce", msg_id, b"local".to_vec(), future)
+            .unwrap();
+    }
+    assert_eq!(manager.stats().0, 5);
+
+    // Now accept MAX_BOARD_ENTRIES_PER_AUTHOR from an external author.
+    let (key_a, identity_a) = make_identity();
+    let entries = make_broadcast_entries(&key_a, identity_a, MAX_BOARD_ENTRIES_PER_AUTHOR, future);
+    let count = manager.process_remote_entries(&entries, future).unwrap();
+
+    assert_eq!(count, MAX_BOARD_ENTRIES_PER_AUTHOR, "remote entries should all be accepted");
+    assert_eq!(
+        manager.stats().0,
+        MAX_BOARD_ENTRIES_PER_AUTHOR + 5,
+        "local entries are not affected by per-author cap"
+    );
+}
+
+/// AC-G6: per-call counter resets between separate process_remote_entries calls.
+///
+/// Call 1: MAX_BOARD_ENTRIES_PER_AUTHOR entries from author A → all accepted.
+/// Call 2: MAX_BOARD_ENTRIES_PER_AUTHOR more entries from author A (new msg_ids) → all accepted.
+/// Total on board = 2 × MAX_BOARD_ENTRIES_PER_AUTHOR.
+#[test]
+fn process_remote_entries_cap_resets_between_calls() {
+    let dir = TempDir::new().unwrap();
+    // Use a config with large max_entries to avoid the global board limit interfering.
+    let config = RelayConfig {
+        board_path: dir.path().join("board.bin"),
+        max_entries: MAX_BOARD_ENTRIES_PER_AUTHOR * 3,
+        max_size_bytes: MAX_BOARD_SIZE_BYTES,
+        ..RelayConfig::defaults_for_test(dir.path().join("board.bin"))
+    };
+    let mut manager = RelayManager::new(config).unwrap();
+
+    let (key_a, identity_a) = make_identity();
+    let now = Timestamp::now();
+    let future = Timestamp(now.0 + 1_000_000);
+
+    // First batch: indices 0..MAX.
+    let batch1 = make_broadcast_entries(&key_a, identity_a, MAX_BOARD_ENTRIES_PER_AUTHOR, future);
+    let count1 = manager.process_remote_entries(&batch1, future).unwrap();
+    assert_eq!(count1, MAX_BOARD_ENTRIES_PER_AUTHOR, "first call: all entries accepted");
+
+    // Second batch: indices MAX..2*MAX (new msg_ids — no dedup collision).
+    let batch2: Vec<StoredEntry> = (MAX_BOARD_ENTRIES_PER_AUTHOR..2 * MAX_BOARD_ENTRIES_PER_AUTHOR)
+        .map(|i| {
+            let mut msg_id = [0u8; 16];
+            msg_id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            msg_id[8] = identity_a.0[0];
+            msg_id[9] = 0x01; // distinguisher to ensure no collision with batch1
+            make_broadcast_entry(&key_a, identity_a, "peer_announce", msg_id, future)
+        })
+        .collect();
+    let count2 = manager.process_remote_entries(&batch2, future).unwrap();
+    assert_eq!(count2, MAX_BOARD_ENTRIES_PER_AUTHOR, "second call: counter reset, all accepted");
+
+    assert_eq!(
+        manager.stats().0,
+        2 * MAX_BOARD_ENTRIES_PER_AUTHOR,
+        "both batches on board"
+    );
+}
+
+/// AC-G5: over-cap entries are skipped, not aborting — other authors' entries continue.
+///
+/// Input: [A×10, B×1, A×195, B×2] — A gets 200 accepted, B gets all 3.
+/// Total accepted = 203.
+#[test]
+fn process_remote_entries_over_cap_does_not_block_other_authors() {
+    let dir = TempDir::new().unwrap();
+    // Use a config with large max_entries so the global limit doesn't interfere.
+    let config = RelayConfig {
+        board_path: dir.path().join("board.bin"),
+        max_entries: 2000,
+        max_size_bytes: MAX_BOARD_SIZE_BYTES,
+        ..RelayConfig::defaults_for_test(dir.path().join("board.bin"))
+    };
+    let mut manager = RelayManager::new(config).unwrap();
+
+    let (key_a, identity_a) = make_identity();
+    let (key_b, identity_b) = make_identity();
+    let now = Timestamp::now();
+    let future = Timestamp(now.0 + 1_000_000);
+
+    // Build interleaved slice: [A×10, B×1, A×195, B×2]
+    // A total = 205 (cap=200 → 5 dropped), B total = 3 (all accepted).
+    // Namespaces: A=0xAA, B=0xBB — distinct to prevent msg_id collision.
+    let mut entries = Vec::new();
+
+    // A: indices 0..10
+    for i in 0usize..10 {
+        let mut msg_id = [0u8; 16];
+        msg_id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        msg_id[8] = 0xAA;
+        entries.push(make_broadcast_entry(&key_a, identity_a, "peer_announce", msg_id, future));
+    }
+
+    // B: index 0
+    {
+        let mut msg_id = [0u8; 16];
+        msg_id[8] = 0xBB;
+        msg_id[9] = 0x00;
+        entries.push(make_broadcast_entry(&key_b, identity_b, "peer_announce", msg_id, future));
+    }
+
+    // A: indices 10..205
+    for i in 10usize..205 {
+        let mut msg_id = [0u8; 16];
+        msg_id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        msg_id[8] = 0xAA;
+        entries.push(make_broadcast_entry(&key_a, identity_a, "peer_announce", msg_id, future));
+    }
+
+    // B: indices 1..3
+    for i in 1usize..3 {
+        let mut msg_id = [0u8; 16];
+        msg_id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        msg_id[8] = 0xBB;
+        msg_id[9] = 0x01;
+        entries.push(make_broadcast_entry(&key_b, identity_b, "peer_announce", msg_id, future));
+    }
+
+    let count = manager.process_remote_entries(&entries, future).unwrap();
+
+    // A: 200 accepted (205 submitted, 5 over cap). B: 3 accepted.
+    assert_eq!(
+        count,
+        MAX_BOARD_ENTRIES_PER_AUTHOR + 3,
+        "A capped at 200, B all 3 accepted"
+    );
+
+    // All 3 B entries must be on the board.
+    let b_on_board = manager
+        .entries
+        .iter()
+        .filter(|e| e.entry.author == identity_b)
+        .count();
+    assert_eq!(b_on_board, 3, "all B entries must be present despite A overflow");
 }

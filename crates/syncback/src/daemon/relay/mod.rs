@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use syncback_core::constants::{MAX_BOARD_ENTRIES, MAX_BOARD_SIZE_BYTES, RELAY_TTL_SECS};
+use syncback_core::constants::{MAX_BOARD_ENTRIES, MAX_BOARD_ENTRIES_PER_AUTHOR, MAX_BOARD_SIZE_BYTES, RELAY_TTL_SECS};
 use syncback_core::messages::{
     build_broadcast_entry, build_directed_entry, check_relay_hop, decrypt_directed,
     encrypt_directed, from_cbor, relay_copy, to_cbor,
@@ -260,6 +260,10 @@ impl RelayManager {
         now: Timestamp,
     ) -> Result<usize, RelayError> {
         let mut accepted = 0usize;
+        // Per-author count for this call — prevents one author from flooding
+        // the board during a single sync event.
+        let mut author_counts: std::collections::HashMap<IdentityPub, usize> =
+            std::collections::HashMap::new();
 
         for remote in remote_entries {
             // 1. Dedup.
@@ -296,7 +300,21 @@ impl RelayManager {
                 continue;
             }
 
-            // 5. Accept: increment hop and store.
+            // 5. Per-author rate limit (checked after sig so we count only valid entries).
+            let author_count = author_counts.entry(remote.entry.author).or_insert(0);
+            if *author_count >= MAX_BOARD_ENTRIES_PER_AUTHOR {
+                warn!(
+                    msg_id = ?remote.msg_id,
+                    author = %remote.entry.author,
+                    count = *author_count,
+                    max = MAX_BOARD_ENTRIES_PER_AUTHOR,
+                    "relay: per-author entry cap exceeded, dropping"
+                );
+                continue;
+            }
+            *author_count += 1;
+
+            // 6. Accept: increment hop and store.
             let relayed = relay_copy(&remote.entry);
             let stored = StoredEntry {
                 msg_type: remote.msg_type.clone(),
