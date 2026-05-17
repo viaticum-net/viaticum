@@ -193,8 +193,8 @@
       phase = 'failed';
       phaseMessage =
         'Daemon failed to restart within 30s. Check the daemon log ' +
-        '(typically ~/.viaticum/main/daemon.log). The new config has NOT been ' +
-        'rolled back — fix or revert config.toml manually if needed.';
+        '(typically ~/.viaticum/main/daemon.log). ' +
+        'To restore previous config: rename config.toml.bak → config.toml, then restart the daemon.';
     }
   }
 
