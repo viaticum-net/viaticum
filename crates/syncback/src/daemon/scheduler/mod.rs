@@ -438,7 +438,13 @@ impl Scheduler {
                         .collect();
 
                     // Use the pre-generated challenge_id to seed the chain hash.
-                    let cid = challenge_ids_clone.get(holder_id).copied().unwrap_or([0u8; 16]);
+                    // Invariant: challenge_ids_clone is built from the same holder_data
+                    // iterated here, so the key is always present. Falling back to a
+                    // constant seed would silently bind chain_hash to a known value —
+                    // expect() surfaces any future invariant violation immediately.
+                    let cid = *challenge_ids_clone
+                        .get(holder_id)
+                        .expect("challenge_id always present: built from same holder_data");
                     match syncback_core::pos::compute_chain_hash(&cid, &refs) {
                         Ok(hash) => results.push((*holder_id, hash, esi_ranges.clone())),
                         Err(e) => {
