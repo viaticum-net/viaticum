@@ -128,6 +128,14 @@ impl ConfigAdmin {
             .map(|s| s.to_string());
         validate(&new, web_bind.as_deref())?;
 
+        // Backup current config.toml to config.toml.bak before overwriting.
+        // Skipped when the file does not yet exist (fresh install — nothing to back up).
+        // Overwrites any previous .bak so .bak always reflects the last confirmed-written config.
+        // Failure here is returned as Io error; the old config is left untouched (safe-fail).
+        if self.config_path.exists() {
+            std::fs::copy(&self.config_path, bak_sibling(&self.config_path))?;
+        }
+
         // Ensure section tables exist so the field assignments below don't panic
         // on a freshly-created (empty) document.
         if !doc.contains_key("storage") {
@@ -152,6 +160,12 @@ impl ConfigAdmin {
 fn tmp_sibling(p: &Path) -> PathBuf {
     let mut s = p.as_os_str().to_owned();
     s.push(".tmp");
+    PathBuf::from(s)
+}
+
+fn bak_sibling(p: &Path) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(".bak");
     PathBuf::from(s)
 }
 

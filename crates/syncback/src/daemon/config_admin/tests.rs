@@ -277,3 +277,145 @@ fn matches_validation(err: &ConfigAdminError, field: &str) {
         other => panic!("expected Validation, got {other:?}"),
     }
 }
+
+// ─── Issue J: .bak tests ──────────────────────────────────────────────────────
+
+// T-J1: saving an existing config creates .bak with the old listen_port value.
+#[tokio::test]
+async fn config_save_creates_bak_before_atomic_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_config(&dir, sample_config());
+    let admin = ConfigAdmin::new(p.clone());
+
+    admin
+        .update(EditableConfig {
+            storage: StorageEditable {
+                disk_reserve_gb: 10.0,
+                soft_quota_gb: 200.0,
+            },
+            network: NetworkEditable { listen_port: 5555 },
+        })
+        .await
+        .unwrap();
+
+    let bak = bak_sibling(&p);
+    assert!(bak.exists(), ".bak must exist after first save");
+    let bak_content = std::fs::read_to_string(&bak).unwrap();
+    // .bak must contain the old listen_port (4500), not the new one (5555).
+    assert!(
+        bak_content.contains("listen_port = 4500"),
+        ".bak must contain old listen_port 4500, got: {bak_content}"
+    );
+    assert!(
+        !bak_content.contains("listen_port = 5555"),
+        ".bak must NOT contain new listen_port 5555"
+    );
+}
+
+// T-J2: validation failure does not create .bak and does not touch config.toml.
+#[tokio::test]
+async fn config_save_preflight_validation_rejects_invalid_no_bak_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_config(&dir, sample_config());
+    let admin = ConfigAdmin::new(p.clone());
+
+    let err = admin
+        .update(EditableConfig {
+            storage: StorageEditable {
+                disk_reserve_gb: -1.0,
+                soft_quota_gb: 50.0,
+            },
+            network: NetworkEditable { listen_port: 4500 },
+        })
+        .await
+        .unwrap_err();
+
+    matches_validation(&err, "storage.disk_reserve_gb");
+
+    let bak = bak_sibling(&p);
+    assert!(!bak.exists(), ".bak must NOT exist when validation fails");
+
+    // config.toml still has original values.
+    let cfg = admin.read_editable().unwrap();
+    assert_eq!(cfg.storage.disk_reserve_gb, 5.0, "config.toml must be unchanged");
+    assert_eq!(cfg.network.listen_port, 4500, "config.toml must be unchanged");
+}
+
+// T-J3: second save overwrites .bak with the pre-second-save state.
+#[tokio::test]
+async fn config_save_overwrites_old_bak_with_pre_second_save_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_config(&dir, sample_config()); // port A = 4500
+    let admin = ConfigAdmin::new(p.clone());
+
+    // First save: port A → port B.
+    admin
+        .update(EditableConfig {
+            storage: StorageEditable { disk_reserve_gb: 5.0, soft_quota_gb: 50.0 },
+            network: NetworkEditable { listen_port: 5000 }, // port B
+        })
+        .await
+        .unwrap();
+    let bak = bak_sibling(&p);
+    let bak_after_first = std::fs::read_to_string(&bak).unwrap();
+    assert!(
+        bak_after_first.contains("listen_port = 4500"),
+        ".bak after 1st save must contain port A (4500)"
+    );
+
+    // Second save: port B → port C.
+    admin
+        .update(EditableConfig {
+            storage: StorageEditable { disk_reserve_gb: 5.0, soft_quota_gb: 50.0 },
+            network: NetworkEditable { listen_port: 6000 }, // port C
+        })
+        .await
+        .unwrap();
+    let bak_after_second = std::fs::read_to_string(&bak).unwrap();
+    assert!(
+        bak_after_second.contains("listen_port = 5000"),
+        ".bak after 2nd save must contain port B (5000), got: {bak_after_second}"
+    );
+    assert!(
+        !bak_after_second.contains("listen_port = 4500"),
+        ".bak after 2nd save must NOT contain port A (4500)"
+    );
+}
+
+// T-J4: read_editable returns config.toml values even when .bak is present.
+#[tokio::test]
+async fn config_load_normal_flow_unaffected_by_bak_presence() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_config(&dir, sample_config()); // listen_port = 4500
+    // Write a .bak with a different port.
+    let bak = bak_sibling(&p);
+    std::fs::write(&bak, "# old config\n[network]\nlisten_port = 9999\n").unwrap();
+    let admin = ConfigAdmin::new(p.clone());
+    let cfg = admin.read_editable().unwrap();
+    assert_eq!(
+        cfg.network.listen_port, 4500,
+        "read_editable must read config.toml (4500), not .bak (9999)"
+    );
+}
+
+// T-J5: no .bak is created when config.toml does not exist before the first save.
+#[tokio::test]
+async fn no_bak_created_when_config_file_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.toml");
+    let admin = ConfigAdmin::new(p.clone());
+
+    admin
+        .update(EditableConfig {
+            storage: StorageEditable { disk_reserve_gb: 3.0, soft_quota_gb: 100.0 },
+            network: NetworkEditable { listen_port: 7777 },
+        })
+        .await
+        .unwrap();
+
+    let bak = bak_sibling(&p);
+    assert!(!bak.exists(), ".bak must NOT exist when config.toml did not exist before save");
+    assert!(p.exists(), "config.toml must be created");
+    let cfg = admin.read_editable().unwrap();
+    assert_eq!(cfg.network.listen_port, 7777);
+}
