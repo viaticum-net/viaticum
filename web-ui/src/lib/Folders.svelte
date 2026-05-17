@@ -1,5 +1,6 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
+  import { pathToB64url } from './utils.js';
 
   let folders = $state([]);
   let error = $state(null);
@@ -58,14 +59,6 @@
   let deleteEntry = $state(null);
   let deletePurge = $state(false);
 
-  // base64url encode a path for API calls
-  function encodePath(path) {
-    return btoa(path)
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=/g, '');
-  }
-
   async function fetchFolders() {
     try {
       const res = await fetch('/api/watches');
@@ -103,7 +96,7 @@
   async function patchFolder() {
     dialogError = null;
     try {
-      const b64 = encodePath(editEntry.path);
+      const b64 = pathToB64url(editEntry.path);
       const res = await fetch(`/api/watches/${b64}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -124,7 +117,7 @@
   async function deleteFolder() {
     dialogError = null;
     try {
-      const b64 = encodePath(deleteEntry.path);
+      const b64 = pathToB64url(deleteEntry.path);
       const res = await fetch(`/api/watches/${b64}?purge=${deletePurge}`, {
         method: 'DELETE',
       });
@@ -142,7 +135,7 @@
   }
 
   async function rescan(entry) {
-    const b64 = encodePath(entry.path);
+    const b64 = pathToB64url(entry.path);
     try {
       await fetch(`/api/watches/${b64}/scan`, { method: 'POST' });
     } catch (e) {

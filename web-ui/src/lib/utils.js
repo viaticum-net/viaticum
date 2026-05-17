@@ -1,3 +1,28 @@
+/**
+ * Encode a filesystem path as URL-safe base64 (no padding) over UTF-8 bytes.
+ * Equivalent to Rust's base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(path.as_bytes()).
+ * Replaces btoa() which throws InvalidCharacterError on non-ASCII paths
+ * (Cyrillic, emoji, accented characters).
+ *
+ * Manual verification:
+ *   pathToB64url('/home/user/docs')          === 'L2hvbWUvdXNlci9kb2Nz'   (ASCII sanity)
+ *   pathToB64url('/home/иван/Документы')     // no throw, valid base64url
+ *   pathToB64url('/home/user/📁/file.txt')   // no throw, valid base64url
+ *   pathToB64url('/home/André/résumé.txt')   // no throw, valid base64url
+ *   pathToB64url('')                         === ''
+ *
+ * Run with: node --input-type=module < web-ui/test/utils.test.mjs
+ */
+export function pathToB64url(path) {
+  const bytes = new TextEncoder().encode(path);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
 export function formatBytes(bytes) {
   if (bytes === 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
