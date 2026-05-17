@@ -87,7 +87,8 @@ impl Processor {
         let refs: Vec<(u32, &[u8])> = symbol_data.iter()
             .map(|(esi, data)| (*esi, data.as_slice()))
             .collect();
-        let chain_hash = compute_chain_hash(&refs).map_err(ProcessorError::PosVerify)?;
+        let chain_hash = compute_chain_hash(&challenge.challenge_id, &refs)
+            .map_err(ProcessorError::PosVerify)?;
 
         debug!(block_id = %block_id, "processor: PosHashChallenge — responding with chain hash");
         Ok(Message::PosHashResponse(PosHashResponseMsg {

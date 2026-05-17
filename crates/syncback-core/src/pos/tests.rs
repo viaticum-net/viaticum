@@ -452,12 +452,14 @@ fn adaptive_rate_low_trust_more_challenges() {
 #[test]
 fn compute_chain_hash_single_symbol() {
     use sha2::{Digest, Sha256};
+    let challenge_id = [0u8; 16];
     let data = vec![0xABu8; 64];
     let symbols = vec![(0u32, data.as_slice())];
-    let hash = compute_chain_hash(&symbols).unwrap();
-    // Manual: h0 = [0;32], h1 = SHA256([0;32] || data)
+    let hash = compute_chain_hash(&challenge_id, &symbols).unwrap();
+    // Manual: h0 = SHA256(challenge_id), h1 = SHA256(h0 || data)
+    let h0: [u8; 32] = Sha256::digest(&challenge_id[..]).into();
     let mut hasher = Sha256::new();
-    hasher.update([0u8; 32]);
+    hasher.update(h0);
     hasher.update(&data);
     let expected: [u8; 32] = hasher.finalize().into();
     assert_eq!(hash, expected);
@@ -465,16 +467,18 @@ fn compute_chain_hash_single_symbol() {
 
 #[test]
 fn compute_chain_hash_order_dependent() {
+    let challenge_id = [0u8; 16];
     let sym_a = vec![1u8; 32];
     let sym_b = vec![2u8; 32];
-    let hash_ab = compute_chain_hash(&[(0, sym_a.as_slice()), (1, sym_b.as_slice())]).unwrap();
-    let hash_ba = compute_chain_hash(&[(0, sym_b.as_slice()), (1, sym_a.as_slice())]).unwrap();
+    let hash_ab = compute_chain_hash(&challenge_id, &[(0, sym_a.as_slice()), (1, sym_b.as_slice())]).unwrap();
+    let hash_ba = compute_chain_hash(&challenge_id, &[(0, sym_b.as_slice()), (1, sym_a.as_slice())]).unwrap();
     assert_ne!(hash_ab, hash_ba);
 }
 
 #[test]
 fn compute_chain_hash_empty_errors() {
-    let result = compute_chain_hash(&[]);
+    let challenge_id = [0u8; 16];
+    let result = compute_chain_hash(&challenge_id, &[]);
     assert!(matches!(result, Err(PosError::ChainHashEmptyInput)));
 }
 
@@ -490,6 +494,98 @@ fn verify_hash_response_fail() {
     let hash_b = [0xBBu8; 32];
     let result = verify_hash_response(&hash_a, &hash_b, 42);
     assert_eq!(result, VerifyOutcome::Fail { esi: 42 });
+}
+
+// ─── L-T1..L-T5: challenge_id freshness (MED-4) ─────────────────────────────
+
+#[test]
+fn pos_chain_hash_includes_challenge_id_in_seed() {
+    // Security property: same symbols, different challenge_id → different hash.
+    let challenge_id_a: [u8; 16] = [0xAA; 16];
+    let challenge_id_b: [u8; 16] = [0xBB; 16];
+    let data = vec![0x01u8; 64];
+    let symbols: &[(u32, &[u8])] = &[(0u32, data.as_slice())];
+
+    let hash_a = compute_chain_hash(&challenge_id_a, symbols).unwrap();
+    let hash_b = compute_chain_hash(&challenge_id_b, symbols).unwrap();
+
+    assert_ne!(
+        hash_a, hash_b,
+        "different challenge_ids must produce different chain hashes for the same symbols"
+    );
+}
+
+#[test]
+fn pos_chain_hash_correct_with_challenge_id() {
+    // Sanity: verifier and holder compute the same hash for the same inputs.
+    let challenge_id: [u8; 16] = [0x42; 16];
+    let data_a = vec![0xABu8; 64];
+    let data_b = vec![0xCDu8; 64];
+    let symbols: &[(u32, &[u8])] = &[(0u32, data_a.as_slice()), (1u32, data_b.as_slice())];
+
+    let verifier_hash = compute_chain_hash(&challenge_id, symbols).unwrap();
+    let holder_hash = compute_chain_hash(&challenge_id, symbols).unwrap();
+
+    assert_eq!(
+        verifier_hash, holder_hash,
+        "verifier and holder must compute identical hashes for same (challenge_id, symbols)"
+    );
+}
+
+#[test]
+fn pos_chain_hash_rejects_old_precomputed_answer() {
+    // Simulates pre-compute attack: cached hash from old challenge does not satisfy new challenge.
+    let data = vec![0x01u8; 64];
+    let symbols: &[(u32, &[u8])] = &[(0u32, data.as_slice())];
+
+    let old_challenge_id: [u8; 16] = [0x00; 16];
+    let new_challenge_id: [u8; 16] = [0x01; 16];
+
+    let precomputed = compute_chain_hash(&old_challenge_id, symbols).unwrap();
+    let expected = compute_chain_hash(&new_challenge_id, symbols).unwrap();
+
+    // verify_hash_response uses expected from new challenge:
+    let outcome = verify_hash_response(&precomputed, &expected, 0);
+    assert_eq!(
+        outcome,
+        VerifyOutcome::Fail { esi: 0 },
+        "pre-computed hash from old challenge must not satisfy new challenge"
+    );
+}
+
+#[test]
+fn pos_chain_hash_deterministic_with_fixed_seed() {
+    // Reproducibility: same inputs always produce the same output.
+    let challenge_id: [u8; 16] = [0x55; 16];
+    let data = vec![0xFFu8; 64];
+    let symbols: &[(u32, &[u8])] = &[(0u32, data.as_slice())];
+
+    let hash1 = compute_chain_hash(&challenge_id, symbols).unwrap();
+    let hash2 = compute_chain_hash(&challenge_id, symbols).unwrap();
+
+    assert_eq!(hash1, hash2, "compute_chain_hash must be deterministic");
+}
+
+#[test]
+fn pos_chain_seed_is_sha256_of_challenge_id() {
+    // Documents and verifies the exact seed formula: h_0 = SHA256(challenge_id).
+    use sha2::{Digest, Sha256};
+
+    let challenge_id: [u8; 16] = [0x42; 16];
+    let data = [0xABu8; 64];
+    let symbols: &[(u32, &[u8])] = &[(0u32, data.as_slice())];
+
+    // Expected: h0 = SHA256(challenge_id), h1 = SHA256(h0 || data)
+    let h0: [u8; 32] = Sha256::digest(&challenge_id[..]).into();
+    let h1: [u8; 32] = {
+        let mut hasher = Sha256::new();
+        hasher.update(h0);
+        hasher.update(data);
+        hasher.finalize().into()
+    };
+
+    let result = compute_chain_hash(&challenge_id, symbols).unwrap();
+    assert_eq!(result, h1, "chain hash seed must be SHA256(challenge_id), not raw challenge_id");
 }
 
 // ─── POS-32: trust_factor clamped when trust > 1.0 ───────────────────────────

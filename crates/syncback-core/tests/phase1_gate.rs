@@ -103,12 +103,13 @@ fn pos_hash_challenge_verify_roundtrip() {
             .expect("encode must succeed");
         symbol_data.push((esi, bound[0].data.clone()));
     }
+    let challenge_id = [0u8; 16];
     let refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
-    let expected_hash = compute_chain_hash(&refs).expect("compute_chain_hash must succeed");
+    let expected_hash = compute_chain_hash(&challenge_id, &refs).expect("compute_chain_hash must succeed");
 
     // Holder side: reads same symbols and computes same chain hash.
     let holder_refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
-    let holder_hash = compute_chain_hash(&holder_refs).expect("holder compute_chain_hash");
+    let holder_hash = compute_chain_hash(&challenge_id, &holder_refs).expect("holder compute_chain_hash");
 
     // Verify.
     let first_esi = esi_ranges[0].0;
@@ -141,8 +142,9 @@ fn pos_hash_challenge_detect_corruption() {
             .expect("encode must succeed");
         symbol_data.push((esi, bound[0].data.clone()));
     }
+    let challenge_id = [0u8; 16];
     let refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
-    let expected_hash = compute_chain_hash(&refs).expect("compute expected chain hash");
+    let expected_hash = compute_chain_hash(&challenge_id, &refs).expect("compute expected chain hash");
 
     // Holder has corrupted data: all zeros for each symbol.
     let corrupt_symbol_data: Vec<(u32, Vec<u8>)> = esis
@@ -152,7 +154,7 @@ fn pos_hash_challenge_detect_corruption() {
     let corrupt_refs: Vec<(u32, &[u8])> = corrupt_symbol_data.iter()
         .map(|(e, d)| (*e, d.as_slice()))
         .collect();
-    let corrupt_hash = compute_chain_hash(&corrupt_refs).expect("compute corrupt chain hash");
+    let corrupt_hash = compute_chain_hash(&challenge_id, &corrupt_refs).expect("compute corrupt chain hash");
 
     // Verify: hash mismatch → Fail.
     let outcome = verify_hash_response(&corrupt_hash, &expected_hash, first_esi);
@@ -568,12 +570,13 @@ fn full_owner_flow() {
             symbol_data.push((esi, bound[0].data.clone()));
         }
     }
+    let challenge_id = [0u8; 16];
     let refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
-    let expected_hash = compute_chain_hash(&refs).expect("compute expected chain hash");
+    let expected_hash = compute_chain_hash(&challenge_id, &refs).expect("compute expected chain hash");
 
     // Holder computes the same chain hash and returns it.
     let holder_refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
-    let holder_hash = compute_chain_hash(&holder_refs).expect("holder compute chain hash");
+    let holder_hash = compute_chain_hash(&challenge_id, &holder_refs).expect("holder compute chain hash");
 
     let first_esi = loaded_placement.esi_ranges.first().map(|&(s, _)| s).unwrap_or(0);
     let outcome = verify_hash_response(&holder_hash, &expected_hash, first_esi);

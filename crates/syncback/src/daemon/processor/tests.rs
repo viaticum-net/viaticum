@@ -649,8 +649,9 @@ async fn handle_pos_hash_challenge_responds_with_chain_hash_when_symbols_held() 
     match reply {
         syncback_core::messages::Message::PosHashResponse(resp) => {
             assert_eq!(resp.challenge_id, challenge_id);
-            // Verify the chain hash is correct.
+            // Verify the chain hash is correct (challenge_id is [99u8; 16] from above).
             let expected_hash = syncback_core::pos::compute_chain_hash(
+                &challenge_id,
                 &[(esi, symbol_data.as_slice())]
             ).expect("compute_chain_hash");
             assert_eq!(resp.chain_hash, expected_hash);
@@ -1814,7 +1815,7 @@ async fn handle_pos_hash_response_pass_records_trust_and_updates_placement() {
 
     // Owner computes expected chain hash for ESI 0 with symbol data [0xAB; 64].
     let symbol_data = vec![0xABu8; 64];
-    let expected_hash = compute_chain_hash(&[(0u32, symbol_data.as_slice())]).unwrap();
+    let expected_hash = compute_chain_hash(&challenge_id, &[(0u32, symbol_data.as_slice())]).unwrap();
 
     // Build pending challenges map with one entry including the expected chain hash.
     let pending_map: HashMap<_, _> = [(
@@ -1902,7 +1903,7 @@ async fn handle_pos_hash_response_fail_marks_lost_and_triggers_repair() {
 
     // Owner's expected chain hash for correct symbol data.
     let correct_symbol = vec![0xCCu8; 64];
-    let expected_hash = compute_chain_hash(&[(0u32, correct_symbol.as_slice())]).unwrap();
+    let expected_hash = compute_chain_hash(&challenge_id, &[(0u32, correct_symbol.as_slice())]).unwrap();
 
     let pending_map: HashMap<_, _> = [(
         (block_id, holder_id),
@@ -1931,7 +1932,7 @@ async fn handle_pos_hash_response_fail_marks_lost_and_triggers_repair() {
 
     // Holder sends WRONG chain hash (corrupted symbol).
     let corrupt_symbol = vec![0x00u8; 64];
-    let wrong_hash = compute_chain_hash(&[(0u32, corrupt_symbol.as_slice())]).unwrap();
+    let wrong_hash = compute_chain_hash(&challenge_id, &[(0u32, corrupt_symbol.as_slice())]).unwrap();
 
     let response = PosHashResponseMsg {
         v: 1,

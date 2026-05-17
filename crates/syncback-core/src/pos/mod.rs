@@ -270,17 +270,32 @@ pub fn apply_pos_outcome(
 
 use sha2::{Digest, Sha256};
 
-/// Compute Samsara-style chain hash over bound symbol data.
+/// Compute Samsara-style chain hash over bound symbol data, seeded by challenge_id.
 ///
 /// Symbols must be provided as (esi, data) pairs sorted by ESI ascending.
-/// Algorithm: h0 = [0u8; 32], h_i = SHA256(h_{i-1} || symbol_data[i]), result = h_n.
+/// Algorithm:
+///   h_0 = SHA256(challenge_id)   — domain separation; binds the chain to this specific challenge
+///   h_i = SHA256(h_{i-1} || symbol_data[i])
+///   result = h_n
+///
+/// Using SHA256(challenge_id) rather than raw challenge_id ensures the seed is always
+/// 32 bytes regardless of challenge_id length, with no ambiguity in the hash inputs.
 ///
 /// Returns Err(ChainHashEmptyInput) if symbols is empty.
-pub fn compute_chain_hash(symbols: &[(u32, &[u8])]) -> Result<[u8; 32], PosError> {
+pub fn compute_chain_hash(
+    challenge_id: &[u8; 16],
+    symbols: &[(u32, &[u8])],
+) -> Result<[u8; 32], PosError> {
     if symbols.is_empty() {
         return Err(PosError::ChainHashEmptyInput);
     }
-    let mut h = [0u8; 32];
+    // Seed: h_0 = SHA256(challenge_id) — unique per challenge, defeats pre-compute caching.
+    let h0: [u8; 32] = {
+        let mut hasher = Sha256::new();
+        hasher.update(challenge_id);
+        hasher.finalize().into()
+    };
+    let mut h = h0;
     for (_esi, data) in symbols {
         let mut hasher = Sha256::new();
         hasher.update(h);

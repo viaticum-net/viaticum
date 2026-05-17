@@ -374,6 +374,13 @@ impl Scheduler {
                 .map(|p| (p.holder_id, p.esi_ranges.clone()))
                 .collect();
 
+            // Generate challenge_ids BEFORE spawn_blocking so the OsRng nonce is committed
+            // before compute_chain_hash runs. This binds expected_hash to this challenge_id.
+            let challenge_ids: HashMap<DeviceId, [u8; 16]> = holder_data.iter()
+                .map(|(holder_id, _)| (*holder_id, random_challenge_id()))
+                .collect();
+            let challenge_ids_clone = challenge_ids.clone();
+
             let encoder = std::sync::Arc::clone(&self.encoder);
             let block_id_clone = block_id;
 
@@ -430,7 +437,9 @@ impl Scheduler {
                         .map(|(esi, data)| (*esi, data.as_slice()))
                         .collect();
 
-                    match syncback_core::pos::compute_chain_hash(&refs) {
+                    // Use the pre-generated challenge_id to seed the chain hash.
+                    let cid = challenge_ids_clone.get(holder_id).copied().unwrap_or([0u8; 16]);
+                    match syncback_core::pos::compute_chain_hash(&cid, &refs) {
                         Ok(hash) => results.push((*holder_id, hash, esi_ranges.clone())),
                         Err(e) => {
                             tracing::error!(
@@ -446,7 +455,7 @@ impl Scheduler {
 
             // Post a challenge for each holder we computed a hash for.
             for (holder_id, expected_hash, esi_ranges) in hash_results {
-                let challenge_id = random_challenge_id();
+                let challenge_id = challenge_ids[&holder_id];
                 let holder_master = self.db.get_master_for_device(&holder_id)
                     .ok()
                     .flatten()
