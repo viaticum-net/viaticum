@@ -14,7 +14,7 @@
 // Thread-safety: RelayManager is Send but not Sync (uses &mut self for writes).
 // The daemon wraps it in a Mutex<RelayManager> or runs it as a dedicated task.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use syncback_core::constants::{MAX_BOARD_ENTRIES, MAX_BOARD_ENTRIES_PER_AUTHOR, MAX_BOARD_SIZE_BYTES, RELAY_TTL_SECS};
@@ -262,8 +262,7 @@ impl RelayManager {
         let mut accepted = 0usize;
         // Per-author count for this call — prevents one author from flooding
         // the board during a single sync event.
-        let mut author_counts: std::collections::HashMap<IdentityPub, usize> =
-            std::collections::HashMap::new();
+        let mut author_counts: HashMap<IdentityPub, usize> = HashMap::new();
 
         for remote in remote_entries {
             // 1. Dedup.
