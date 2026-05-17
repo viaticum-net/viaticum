@@ -49,6 +49,18 @@ fn read_port_and_token_roundtrip() {
     assert_eq!(token, written_token);
 }
 
+// AC-B3: all N generated tokens are distinct (probabilistic uniqueness via OsRng)
+#[test]
+fn api_token_is_unique_across_multiple_generations() {
+    let mut tokens = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let tmp = tempfile::tempdir().unwrap();
+        let token = load_or_create_token(tmp.path()).unwrap();
+        tokens.insert(token);
+    }
+    assert_eq!(tokens.len(), 100, "all 100 generated tokens must be distinct");
+}
+
 #[test]
 fn read_port_and_token_errors_when_files_missing() {
     let tmp = tempfile::tempdir().unwrap();

@@ -11,7 +11,7 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
-use rand::RngCore;
+use rand_core::{OsRng, RngCore};
 
 #[cfg(test)]
 mod tests;
@@ -31,7 +31,7 @@ pub fn load_or_create_token(data_dir: &Path) -> std::io::Result<String> {
         }
     }
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    OsRng.fill_bytes(&mut bytes);
     use base64::Engine as _;
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     write_secure(&path, token.as_bytes())?;

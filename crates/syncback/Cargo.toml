@@ -23,6 +23,7 @@ ciborium = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
+rand_core = { version = "0.6", features = ["getrandom"] }
 async-trait = { workspace = true }
 libp2p = { workspace = true }
 futures = { workspace = true }
