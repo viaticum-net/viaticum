@@ -5,6 +5,33 @@ mod embedded;
 #[cfg(test)]
 mod tests;
 
+// ── Security headers middleware ───────────────────────────────────────────────
+
+/// Attach security-related headers to every HTTP response:
+///   Referrer-Policy: no-referrer        — prevents Referer leaks (token in URL)
+///   X-Content-Type-Options: nosniff     — blocks MIME sniffing
+///   X-Frame-Options: DENY               — prevents clickjacking
+pub(super) async fn add_security_headers(
+    response: axum::response::Response,
+) -> axum::response::Response {
+    use axum::http::HeaderValue;
+    let mut response = response;
+    let headers = response.headers_mut();
+    headers.insert(
+        "referrer-policy",
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        "x-frame-options",
+        HeaderValue::from_static("DENY"),
+    );
+    response
+}
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -115,6 +142,9 @@ pub async fn start_with_listener(
     } else {
         app = app.fallback(embedded::handle_embedded);
     }
+
+    // Apply security headers to every response, regardless of route.
+    let app = app.layer(axum::middleware::map_response(add_security_headers));
 
     let actual = listener.local_addr()?;
     tracing::info!(bind = %actual, "web API server started");

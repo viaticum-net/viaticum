@@ -150,6 +150,73 @@ async fn restore_api_returns_staging_path() {
     assert!(!sp.is_empty(), "staging_path must be non-empty, got: {json}");
 }
 
+// ─── Security header helpers ──────────────────────────────────────────────────
+
+/// Minimal router with only the security headers layer applied.
+fn build_headers_test_router() -> axum::Router {
+    use axum::routing::get;
+    axum::Router::new()
+        .route("/ping", get(|| async { "pong" }))
+        .layer(axum::middleware::map_response(super::add_security_headers))
+}
+
+/// Router with auth layer + security headers, used to test headers on 401.
+fn build_full_router_for_header_test() -> axum::Router {
+    use axum::routing::get;
+    let auth = crate::daemon::web_auth::AuthState::new("secret".to_string());
+    let api = axum::Router::new()
+        .route("/api/dummy", get(|| async { "ok" }))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            crate::daemon::web_auth::require_auth,
+        ));
+    api.layer(axum::middleware::map_response(super::add_security_headers))
+}
+
+// ─── Security header tests ────────────────────────────────────────────────────
+
+/// I-AC1/2/3: GET /ping → all three security headers present.
+#[tokio::test]
+async fn security_headers_present_on_api_response() {
+    let app = build_headers_test_router();
+    let resp = app
+        .oneshot(Request::builder().uri("/ping").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let headers = resp.headers();
+    assert_eq!(
+        headers.get("referrer-policy").unwrap(),
+        "no-referrer",
+        "Referrer-Policy must be no-referrer"
+    );
+    assert_eq!(
+        headers.get("x-content-type-options").unwrap(),
+        "nosniff",
+        "X-Content-Type-Options must be nosniff"
+    );
+    assert_eq!(
+        headers.get("x-frame-options").unwrap(),
+        "DENY",
+        "X-Frame-Options must be DENY"
+    );
+}
+
+/// I-AC4: GET /api/dummy without auth → 401, but security headers still present.
+#[tokio::test]
+async fn security_headers_present_on_401_response() {
+    let app = build_full_router_for_header_test();
+    let resp = app
+        .oneshot(Request::builder().uri("/api/dummy").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        resp.headers().get("referrer-policy").unwrap(),
+        "no-referrer",
+        "Referrer-Policy must be present even on 401"
+    );
+}
+
 /// F2: POST /api/restore with dest → 400 Bad Request with dest_not_supported_in_alpha.
 #[tokio::test]
 async fn restore_api_with_dest_returns_400() {
