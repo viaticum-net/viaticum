@@ -294,12 +294,18 @@ pub struct RestoreCfg {
     /// Warn in log when total size of data_dir/restore/ exceeds this threshold.
     /// Unit: gigabytes. Default: 50.
     pub staging_warn_gb: f64,
+
+    /// Timeout in seconds for fetching symbols from a holder over the network.
+    /// Applied to the entire fetch_from_holders() call (across all holders for one block).
+    /// Default: 60.
+    pub fetch_timeout_secs: u64,
 }
 
 impl Default for RestoreCfg {
     fn default() -> Self {
         Self {
             staging_warn_gb: 50.0,
+            fetch_timeout_secs: 60,
         }
     }
 }

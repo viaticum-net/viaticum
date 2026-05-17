@@ -427,6 +427,9 @@ impl DaemonHandle {
                 swarm: swarm_handle_arc.clone(),
                 staging_root: staging_root.clone(),
                 data_dir: cfg.data_dir.clone(),
+                fetch_timeout: std::time::Duration::from_secs(
+                    app_config.restore.fetch_timeout_secs,
+                ),
             },
             encoder.clone(),
         );

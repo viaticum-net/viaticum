@@ -234,6 +234,11 @@ async fn handle_restore(
             let body = serde_json::json!({ "error": "dest_not_supported_in_alpha" });
             (StatusCode::BAD_REQUEST, Json(body)).into_response()
         }
+        // 504 Gateway Timeout: fetch from holder timed out (daemon acted as proxy to offline peer).
+        CliResponse::Error(ref e) if e.contains("fetch from holders timed out") => {
+            let body = serde_json::json!({ "error": e });
+            (StatusCode::GATEWAY_TIMEOUT, Json(body)).into_response()
+        }
         CliResponse::Error(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "unexpected response").into_response(),
     }

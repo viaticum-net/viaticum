@@ -91,6 +91,9 @@ pub enum RestoreError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("fetch from holders timed out after {secs}s for block {block}")]
+    Timeout { block: SourceBlockId, secs: u64 },
 }
 
 impl RestoreError {
@@ -186,6 +189,10 @@ pub struct RestoreConfig {
     pub staging_root: PathBuf,
     /// `data_dir` — used to verify staging_root is inside it.
     pub data_dir: PathBuf,
+    /// Timeout for the entire fetch_from_holders() call per source block.
+    /// Applied once per block decode attempt, across all holders for that block.
+    /// Default: 60 seconds.
+    pub fetch_timeout: std::time::Duration,
 }
 
 impl Default for RestoreConfig {
@@ -199,6 +206,7 @@ impl Default for RestoreConfig {
             swarm: None,
             staging_root: PathBuf::from("restore"),
             data_dir: PathBuf::from("."),
+            fetch_timeout: std::time::Duration::from_secs(60),
         }
     }
 }
@@ -469,9 +477,15 @@ impl RestoreCoordinator {
                 ))
                 .cloned()
                 .collect();
-            let mut network_symbols = self
-                .fetch_from_holders(block_id, &reachable_for_fetch, params)
-                .await?;
+            let mut network_symbols = tokio::time::timeout(
+                self.config.fetch_timeout,
+                self.fetch_from_holders(block_id, &reachable_for_fetch, params),
+            )
+            .await
+            .map_err(|_elapsed| RestoreError::Timeout {
+                block: *block_id,
+                secs: self.config.fetch_timeout.as_secs(),
+            })??;
 
             // Merge: avoid duplicates by ESI.
             let existing_esis: HashSet<u32> =

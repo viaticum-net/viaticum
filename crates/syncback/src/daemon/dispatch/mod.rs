@@ -526,6 +526,7 @@ fn restore_error_to_blocker(e: &RestoreError) -> Option<RestoreBlocker> {
             needed_gb: *restore_gb,
             est_seconds: None,
         }),
+        RestoreError::Timeout { .. } => None,
         _ => None,
     }
 }

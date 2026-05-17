@@ -86,6 +86,7 @@ fn test_restore_coord(
         swarm: None,
         staging_root,
         data_dir: staging_dir.path().to_path_buf(),
+        fetch_timeout: std::time::Duration::from_secs(60),
     };
 
     RestoreCoordinator::new(
@@ -1734,4 +1735,52 @@ mod cleanup_tests {
         // check_staging_warn runs without panic.
         check_staging_warn(dir.path(), 5);
     }
+}
+
+// ─── Issue K: fetch timeout tests ────────────────────────────────────────────
+
+// T-K3: RestoreConfig default fetch_timeout is 60 seconds.
+#[test]
+fn restore_fetch_timeout_default_is_60_seconds() {
+    let cfg = RestoreConfig::default();
+    assert_eq!(
+        cfg.fetch_timeout,
+        std::time::Duration::from_secs(60),
+        "default fetch_timeout must be 60 seconds"
+    );
+}
+
+// T-K4: fetch_timeout_secs is configurable via AppConfig and converts correctly.
+#[test]
+fn restore_fetch_timeout_configurable_via_app_config() {
+    let mut app_config = syncback_core::config::AppConfig::default();
+    app_config.restore.fetch_timeout_secs = 120;
+    // This mirrors the conversion used in handle/mod.rs wiring.
+    let duration = std::time::Duration::from_secs(app_config.restore.fetch_timeout_secs);
+    assert_eq!(
+        duration,
+        std::time::Duration::from_secs(120),
+        "120s config must produce 120s Duration"
+    );
+}
+
+// T-K2 marker: timeout behavior when fetch_from_holders hangs.
+//
+// The timeout path (RestoreError::Timeout) cannot be exercised in unit tests
+// without injecting a slow mock for fetch_from_holders. Adding a trait for
+// fetch_from_holders conflicts with project conventions (no traits for the future).
+//
+// Coverage: manual E2E via experiments/local_fault_test.sh — kill a holder
+// mid-restore and observe 504 response and "fetch from holders timed out" body.
+//
+// This test verifies the compile-time presence of RestoreError::Timeout.
+#[test]
+fn restore_timeout_error_variant_exists() {
+    let block = SourceBlockId([0u8; 32]);
+    let err = super::RestoreError::Timeout { block, secs: 1 };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("timed out after 1s"),
+        "Timeout error message must mention timeout duration, got: {msg}"
+    );
 }

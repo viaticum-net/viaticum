@@ -73,6 +73,7 @@ fn restore_config(symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreConfig
         swarm: None,
         staging_root,
         data_dir: staging_dir.path().to_path_buf(),
+        fetch_timeout: std::time::Duration::from_secs(60),
     }
 }
 
