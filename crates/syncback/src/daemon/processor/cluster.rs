@@ -181,6 +181,16 @@ impl Processor {
             warn!(peer = %owner_id, "processor: SystemStateBackup: unknown peer, rejecting");
             return SystemStateAckMsg { v: 1, stored: false, timestamp: Timestamp::now() };
         }
+        // Enforce blob size cap to prevent disk DoS from authenticated peers.
+        if backup.encrypted_blob.len() > syncback_core::constants::MAX_SYSTEM_STATE_BLOB_BYTES {
+            warn!(
+                peer = %owner_id,
+                blob_len = backup.encrypted_blob.len(),
+                max = syncback_core::constants::MAX_SYSTEM_STATE_BLOB_BYTES,
+                "processor: SystemStateBackup: blob exceeds size cap, dropping"
+            );
+            return SystemStateAckMsg { v: 1, stored: false, timestamp: Timestamp::now() };
+        }
         let record = SystemStateBlobRecord {
             owner: owner_id,
             encrypted_blob: backup.encrypted_blob,

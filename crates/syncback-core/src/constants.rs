@@ -206,6 +206,16 @@ pub const MAX_BOARD_ENTRIES: usize = 2000;
 /// Max total board size in bytes (8 MB, from protocol.md §1.5).
 pub const MAX_BOARD_SIZE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Maximum relay board entries accepted from a single author per
+/// `process_remote_entries` call.
+///
+/// Prevents a malicious peer from filling the entire board with its own
+/// entries and crowding out legitimate messages (pos_challenge, peer_announce).
+///
+/// Derived from MAX_BOARD_ENTRIES / 10, assuming a cluster of ~10 peers.
+/// Each peer gets a fair share of the 2000-entry board.
+pub const MAX_BOARD_ENTRIES_PER_AUTHOR: usize = 200;
+
 // === PoS placement status thresholds ===
 
 /// Number of consecutive PoS timeouts before a placement is marked Uncertain.
@@ -296,9 +306,21 @@ pub const MAX_COMBINED_TRUST: f64 = KP + KI; // = 2.15
 /// Bytes in one gibibyte (2^30).
 pub const BYTES_PER_GB: f64 = 1_073_741_824.0;
 
+// === Disaster Recovery ===
+
+/// Maximum size of an encrypted SystemState blob accepted from a peer.
+///
+/// A legitimate SystemState blob for a cluster of ~20 peers (device certs,
+/// trust records, placement metadata) compresses to tens of KB at most.
+/// 2 MiB = ~100× headroom. Blobs above this limit are dropped with a warning
+/// to prevent disk DoS from authenticated-but-malicious peers.
+/// Must be << MAX_MESSAGE_SIZE (128 MiB).
+pub const MAX_SYSTEM_STATE_BLOB_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
+
 // === Compile-time sanity checks ===
 
 const _: () = assert!(S_CLAMP_MIN < S_CLAMP_MAX);
 const _: () = assert!(OVERHEAD_BASE > 1.0);
 const _: () = assert!(DECODE_OVERHEAD > 0);
 const _: () = assert!(SYMBOL_OFFER_TIMEOUT_SECS < SYMBOL_OFFER_EXPIRY_SECS);
+const _: () = assert!(MAX_SYSTEM_STATE_BLOB_BYTES < MAX_MESSAGE_SIZE as usize);

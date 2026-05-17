@@ -96,6 +96,7 @@ async fn make_swarm() -> Arc<SwarmHandle> {
         device_signing_key: device_key,
         master_signing_key: master_key,
         identity_pub,
+        cluster_master_pub: identity_pub,
         device_cert,
         x25519_pub: None,
         listen_port: 0, // OS assigns port
@@ -1585,6 +1586,179 @@ async fn handle_system_state_backup_ignores_empty_blob() {
     // Empty blob must not be stored.
     let stored = db.get_system_state_blob(&owner).unwrap();
     assert!(stored.is_none(), "empty blob should not be stored");
+}
+
+// ─── Issue F (H-1): SystemStateBackup blob size cap ──────────────────────────
+
+/// AC-F1: blob below the size cap is stored normally.
+#[tokio::test]
+async fn system_state_backup_with_blob_under_cap_accepted() {
+    use syncback_core::constants::MAX_SYSTEM_STATE_BLOB_BYTES;
+    use syncback_core::db::SystemStateBlobRecord;
+    use syncback_core::messages::SystemStateBackupMsg;
+    use syncback_core::types::PeerRecord;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+
+    let owner = make_identity(70);
+    let now = Timestamp::now();
+    let owner_device_id = DeviceId(owner.0);
+    db.upsert_peer(&PeerRecord {
+        device_id: owner_device_id,
+        master_identity: owner,
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: now,
+        last_seen: now,
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+    })
+    .unwrap();
+    db.set_master_for_device(&owner_device_id, &owner).unwrap();
+
+    let blob = vec![0xAAu8; MAX_SYSTEM_STATE_BLOB_BYTES - 1];
+    let msg = SystemStateBackupMsg {
+        v: 1,
+        encrypted_blob: blob.clone(),
+        timestamp: now,
+    };
+
+    let ack = processor.handle_system_state_backup_inner(owner, msg).await;
+
+    assert!(ack.stored, "blob under cap should be stored");
+    let stored: Option<SystemStateBlobRecord> = db.get_system_state_blob(&owner).unwrap();
+    assert!(stored.is_some(), "blob under cap should be written to DB");
+    assert_eq!(stored.unwrap().encrypted_blob, blob);
+}
+
+/// AC-F2: blob exactly at the size cap is stored (boundary inclusive).
+#[tokio::test]
+async fn system_state_backup_with_blob_at_cap_accepted() {
+    use syncback_core::constants::MAX_SYSTEM_STATE_BLOB_BYTES;
+    use syncback_core::db::SystemStateBlobRecord;
+    use syncback_core::messages::SystemStateBackupMsg;
+    use syncback_core::types::PeerRecord;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+
+    let owner = make_identity(71);
+    let now = Timestamp::now();
+    let owner_device_id = DeviceId(owner.0);
+    db.upsert_peer(&PeerRecord {
+        device_id: owner_device_id,
+        master_identity: owner,
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: now,
+        last_seen: now,
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+    })
+    .unwrap();
+    db.set_master_for_device(&owner_device_id, &owner).unwrap();
+
+    let blob = vec![0xBBu8; MAX_SYSTEM_STATE_BLOB_BYTES];
+    let msg = SystemStateBackupMsg {
+        v: 1,
+        encrypted_blob: blob.clone(),
+        timestamp: now,
+    };
+
+    let ack = processor.handle_system_state_backup_inner(owner, msg).await;
+
+    assert!(ack.stored, "blob at cap boundary should be stored");
+    let stored: Option<SystemStateBlobRecord> = db.get_system_state_blob(&owner).unwrap();
+    assert!(stored.is_some(), "blob at cap should be written to DB");
+}
+
+/// AC-F3: blob one byte over the size cap is dropped with stored=false; no DB write.
+#[tokio::test]
+async fn system_state_backup_with_blob_over_cap_rejected() {
+    use syncback_core::constants::MAX_SYSTEM_STATE_BLOB_BYTES;
+    use syncback_core::messages::SystemStateBackupMsg;
+    use syncback_core::types::PeerRecord;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+
+    let owner = make_identity(72);
+    let now = Timestamp::now();
+    let owner_device_id = DeviceId(owner.0);
+    db.upsert_peer(&PeerRecord {
+        device_id: owner_device_id,
+        master_identity: owner,
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: now,
+        last_seen: now,
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+    })
+    .unwrap();
+    db.set_master_for_device(&owner_device_id, &owner).unwrap();
+
+    let blob = vec![0xCCu8; MAX_SYSTEM_STATE_BLOB_BYTES + 1];
+    let msg = SystemStateBackupMsg {
+        v: 1,
+        encrypted_blob: blob,
+        timestamp: now,
+    };
+
+    let ack = processor.handle_system_state_backup_inner(owner, msg).await;
+
+    assert!(!ack.stored, "blob over cap should be rejected (stored=false)");
+    let stored = db.get_system_state_blob(&owner).unwrap();
+    assert!(stored.is_none(), "blob over cap must not be written to DB");
+}
+
+/// AC-F5: unknown peer is rejected before the size check (existing gate preserved).
+///
+/// If an unknown peer sends a giant blob, the known-peer check fires first.
+/// stored=false without writing to DB — same result as AC-F3 but via a different
+/// code path (the unknown-peer gate, not the size gate).
+#[tokio::test]
+async fn system_state_backup_unknown_peer_rejected_before_size_check() {
+    use syncback_core::constants::MAX_SYSTEM_STATE_BLOB_BYTES;
+    use syncback_core::messages::SystemStateBackupMsg;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+
+    // owner_id NOT registered in DB → unknown peer.
+    let owner = make_identity(73);
+    let now = Timestamp::now();
+
+    // Send an oversized blob to confirm ordering: unknown-peer check fires, not size check.
+    let blob = vec![0xDDu8; MAX_SYSTEM_STATE_BLOB_BYTES + 1];
+    let msg = SystemStateBackupMsg {
+        v: 1,
+        encrypted_blob: blob,
+        timestamp: now,
+    };
+
+    let ack = processor.handle_system_state_backup_inner(owner, msg).await;
+
+    assert!(!ack.stored, "unknown peer must be rejected regardless of blob size");
+    let stored = db.get_system_state_blob(&owner).unwrap();
+    assert!(stored.is_none(), "unknown peer blob must not be written to DB");
 }
 
 // ─── handle_system_state_request ──────────────────────────────────────────────
