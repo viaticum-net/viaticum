@@ -10,6 +10,11 @@ pub mod swarm;
 // Address format utilities (used by handle/mod.rs for loading stored peer addrs).
 pub mod addr;
 
+// Transport wrapper that strips `PortUse::Reuse` from outgoing dials. Used by
+// swarm.rs to keep flows compatible with tun-based VPN/proxy stacks (sing-box,
+// some hysteria2 setups) that drop TCP whose source port matches a listener.
+mod no_port_reuse;
+
 #[cfg(test)]
 pub(crate) mod swarm_test_helpers;
 #[cfg(test)]

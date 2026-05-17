@@ -472,11 +472,28 @@ impl SwarmHandle {
         // relay_client must precede dcutr for DCUtR to work correctly.
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
-            .with_tcp(
-                libp2p::tcp::Config::default(),
-                libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
-            )
+            // Wrap TCP in NoPortReuse so libp2p's port-reuse trick (binding
+            // outgoing sockets to the listener port via SO_REUSEPORT) never
+            // fires. Some tun-based VPN stacks (sing-box + hysteria2) silently
+            // drop TCP flows whose source port matches a local listener; cold
+            // backup doesn't need NAT hole-punching enough to keep that risk.
+            // Replicates `with_tcp`'s internal upgrade chain (noise + yamux,
+            // wrapped in `StreamMuxerBox`) on top of the wrapped transport.
+            .with_other_transport(|key| {
+                use libp2p::Transport as _;
+                use libp2p::core::muxing::StreamMuxerBox;
+                use libp2p::core::upgrade::Version;
+                let noise = libp2p::noise::Config::new(key)?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                    super::no_port_reuse::NoPortReuse::new(
+                        libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default()),
+                    )
+                    .upgrade(Version::V1Lazy)
+                    .authenticate(noise)
+                    .multiplex(libp2p::yamux::Config::default())
+                    .map(|(p, c), _| (p, StreamMuxerBox::new(c))),
+                )
+            })
             .map_err(|e| SwarmError::Transport(e.to_string()))?
             .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)
             .map_err(|e| SwarmError::Transport(e.to_string()))?
