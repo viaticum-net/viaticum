@@ -483,6 +483,13 @@ impl AppConfig {
             });
         }
 
+        if self.restore.fetch_timeout_secs == 0 {
+            return Err(ConfigError::Validation {
+                field: "restore.fetch_timeout_secs".to_string(),
+                reason: "must be > 0".to_string(),
+            });
+        }
+
         Ok(())
     }
 }

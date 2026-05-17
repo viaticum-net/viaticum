@@ -623,3 +623,14 @@ fn restore_staging_warn_gb_negative_is_rejected() {
         "expected Validation error for restore.staging_warn_gb, got: {err:?}"
     );
 }
+
+#[test]
+fn restore_fetch_timeout_zero_is_rejected() {
+    let mut cfg = AppConfig::default();
+    cfg.restore.fetch_timeout_secs = 0;
+    let err = cfg.validate().unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, .. } if field == "restore.fetch_timeout_secs"),
+        "expected Validation error for restore.fetch_timeout_secs, got: {err:?}"
+    );
+}
