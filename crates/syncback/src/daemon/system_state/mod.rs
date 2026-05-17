@@ -11,7 +11,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use syncback_core::cluster::derive_master_key;
+use hkdf::Hkdf;
+use sha2::Sha256;
 use syncback_core::db::Db;
 use syncback_core::system_state::{pack_system_state, restore_db, snapshot_db, SystemState};
 // Re-exported so tests (and callers) can check the current format version.
@@ -28,16 +29,19 @@ mod tests;
 
 // ─── Key derivation ───────────────────────────────────────────────────────────
 
-/// Derive the 32-byte encryption key from a BIP39 seed.
+/// Derive the 32-byte AEAD key material for DR blob encryption.
 ///
-/// Uses the same HKDF path as `derive_master_key` (syncback-core cluster module):
-/// HKDF-SHA256(ikm=seed, salt=b"", info=b"syncback-identity-ed25519") → 32 bytes.
-/// The scalar bytes of the resulting Ed25519 SigningKey are used directly as
-/// the ChaCha20-Poly1305 key in pack_system_state / unpack_system_state.
-fn identity_key_bytes_from_seed(seed: &[u8]) -> anyhow::Result<[u8; 32]> {
-    let master_key = derive_master_key(seed)
-        .map_err(|e| anyhow::anyhow!("derive_master_key failed: {e}"))?;
-    Ok(master_key.to_bytes())
+/// Uses HKDF-SHA256 directly on the raw BIP39 seed bytes (64 B).
+/// info = b"syncback-dr-key-v1" — distinct from all signing paths.
+///
+/// DOES NOT pass through Ed25519 SigningKey. The seed is the only IKM.
+/// This preserves key separation: signing scalar is never used as AEAD material.
+pub(crate) fn identity_key_bytes_from_seed(seed: &[u8]) -> anyhow::Result<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(None, seed);
+    let mut okm = [0u8; 32];
+    hk.expand(b"syncback-dr-key-v1", &mut okm)
+        .map_err(|e| anyhow::anyhow!("HKDF expand failed: {e}"))?;
+    Ok(okm)
 }
 
 // ─── snapshot_and_encrypt ────────────────────────────────────────────────────

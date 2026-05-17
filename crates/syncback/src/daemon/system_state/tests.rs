@@ -1,5 +1,44 @@
 use super::*;
 
+// ─── CRIT-1 ATDD: AEAD key must not be the Ed25519 signing scalar ─────────────
+
+// AC-A2: key derived from seed must differ from master signing scalar
+#[test]
+fn system_state_aead_key_is_different_from_master_signing_scalar() {
+    use syncback_core::cluster::derive_master_key;
+    let seed = [0xABu8; 64];
+    let aead_key = identity_key_bytes_from_seed(&seed).unwrap();
+    let signing_scalar = derive_master_key(&seed).unwrap().to_bytes();
+    assert_ne!(
+        aead_key, signing_scalar,
+        "AEAD key must not equal Ed25519 signing scalar"
+    );
+}
+
+// AC-A3: encrypt/decrypt roundtrip with new derivation
+#[test]
+fn system_state_encrypt_decrypt_roundtrip_with_new_derivation() {
+    let db = syncback_core::db::Db::open_in_memory().unwrap();
+    let seed = [0x11u8; 64];
+    let blob = snapshot_and_encrypt(&db, &seed).unwrap();
+    let db2 = syncback_core::db::Db::open_in_memory().unwrap();
+    let state = decrypt_and_restore(&db2, &blob, &seed).unwrap();
+    assert_eq!(state.version, SYSTEM_STATE_VERSION);
+}
+
+// AC-A4: wrong seed must fail decryption
+#[test]
+fn system_state_wrong_seed_fails_decrypt_after_fix() {
+    let db = syncback_core::db::Db::open_in_memory().unwrap();
+    let seed = [0x11u8; 64];
+    let blob = snapshot_and_encrypt(&db, &seed).unwrap();
+    let db2 = syncback_core::db::Db::open_in_memory().unwrap();
+    assert!(
+        decrypt_and_restore(&db2, &blob, &[0x22u8; 64]).is_err(),
+        "wrong seed must fail decryption"
+    );
+}
+
 // ─── snapshot_and_encrypt ────────────────────────────────────────────────────
 
 #[test]
