@@ -142,7 +142,8 @@ async fn add_watch_with_valid_dir_appends_to_live_configs() {
     let result = admin
         .add_watch(AddWatchRequest {
             path: watch_dir.path().to_string_lossy().into_owned(),
-            importance: 0.6,
+            importance_multiplier: Some(0.6),
+            importance_legacy: None,
         })
         .await;
 
@@ -176,7 +177,8 @@ async fn add_watch_writes_entry_to_config_toml_preserving_other_sections() {
     admin
         .add_watch(AddWatchRequest {
             path: watch_dir.path().to_string_lossy().into_owned(),
-            importance: 0.5,
+            importance_multiplier: Some(0.5),
+            importance_legacy: None,
         })
         .await
         .unwrap();
@@ -200,7 +202,8 @@ async fn add_watch_fails_with_not_a_directory_for_nonexistent_path() {
     let result = admin
         .add_watch(AddWatchRequest {
             path: "/nonexistent/path/does/not/exist".to_string(),
-            importance: 0.5,
+            importance_multiplier: Some(0.5),
+            importance_legacy: None,
         })
         .await;
 
@@ -234,7 +237,8 @@ async fn add_watch_fails_with_nested_when_path_is_child_of_existing_watch() {
     let result = admin
         .add_watch(AddWatchRequest {
             path: child_path.to_string_lossy().into_owned(),
-            importance: 0.5,
+            importance_multiplier: Some(0.5),
+            importance_legacy: None,
         })
         .await;
 
@@ -269,7 +273,8 @@ async fn add_watch_fails_with_nested_when_existing_watch_is_child_of_new_path() 
     let result = admin
         .add_watch(AddWatchRequest {
             path: parent_dir.path().to_string_lossy().into_owned(),
-            importance: 0.5,
+            importance_multiplier: Some(0.5),
+            importance_legacy: None,
         })
         .await;
 
@@ -305,7 +310,7 @@ async fn patch_watch_updates_importance_in_live_configs_and_toml() {
     let result = admin
         .patch_watch(
             &path_b64,
-            PatchWatchRequest { importance: 0.9 },
+            PatchWatchRequest { importance_multiplier: Some(0.9), importance_legacy: None },
         )
         .await;
 
@@ -333,7 +338,7 @@ async fn patch_watch_returns_not_found_for_unknown_path() {
     // Encode a path that is not watched.
     let path_b64 = encode_path_b64(&PathBuf::from("/not/a/watch"));
     let result = admin
-        .patch_watch(&path_b64, PatchWatchRequest { importance: 0.5 })
+        .patch_watch(&path_b64, PatchWatchRequest { importance_multiplier: Some(0.5), importance_legacy: None })
         .await;
 
     assert!(
@@ -775,7 +780,7 @@ async fn patch_watch_preserves_classification_when_changing_multiplier() {
     let (admin, _rx) = make_watch_admin_with_config(config_path.clone(), vec![existing], db);
 
     let path_b64 = encode_path_b64(watch_dir.path());
-    admin.patch_watch(&path_b64, PatchWatchRequest { importance: 0.9 }).await.unwrap();
+    admin.patch_watch(&path_b64, PatchWatchRequest { importance_multiplier: Some(0.9), importance_legacy: None }).await.unwrap();
 
     let cfgs = admin.live_configs.read().unwrap();
     assert_eq!(cfgs.len(), 1);
@@ -945,4 +950,81 @@ fn derive_status_returns_error_regardless_of_rollup_when_signal_error() {
         derive_status(&WatcherStatusSignal::Error, &rollup),
         WatchStatus::Error
     );
+}
+
+// ─── Wave 12: WatchEntry rename / alias tests ─────────────────────────────────
+
+#[test]
+fn watch_entry_json_key_is_importance_multiplier() {
+    use super::WatchEntry;
+    let entry = WatchEntry {
+        path: "/tmp/test".to_string(),
+        importance: 1.5,
+        status: WatchStatus::Idle,
+        error: None,
+        last_event_age_secs: None,
+        total_files: 0,
+        total_bytes: 0,
+        backed_up: 0,
+        at_risk: 0,
+        lost: 0,
+        encoding: 0,
+        queued: 0,
+        rollup_age_secs: None,
+        traffic_light: "green".to_string(),
+    };
+    let json = serde_json::to_value(&entry).unwrap();
+    assert_eq!(json["importance_multiplier"], 1.5, "must serialize as importance_multiplier");
+    assert!(json.get("importance").is_none(), "legacy 'importance' key must not appear in output");
+}
+
+#[test]
+fn add_watch_request_accepts_legacy_importance_key() {
+    let json = r#"{"path": "/tmp", "importance": 0.7}"#;
+    let req: AddWatchRequest = serde_json::from_str(json).unwrap();
+    assert!((req.resolved_multiplier() - 0.7).abs() < 1e-9,
+        "legacy key must be accepted, got {}", req.resolved_multiplier());
+}
+
+#[test]
+fn add_watch_request_accepts_importance_multiplier_key() {
+    let json = r#"{"path": "/tmp", "importance_multiplier": 1.2}"#;
+    let req: AddWatchRequest = serde_json::from_str(json).unwrap();
+    assert!((req.resolved_multiplier() - 1.2).abs() < 1e-9,
+        "canonical key must be accepted, got {}", req.resolved_multiplier());
+}
+
+#[test]
+fn add_watch_request_importance_multiplier_wins_over_legacy() {
+    let json = r#"{"path": "/tmp", "importance": 0.5, "importance_multiplier": 1.8}"#;
+    let req: AddWatchRequest = serde_json::from_str(json).unwrap();
+    assert!((req.resolved_multiplier() - 1.8).abs() < 1e-9,
+        "canonical key must win over legacy, got {}", req.resolved_multiplier());
+}
+
+#[test]
+fn patch_watch_request_accepts_legacy_importance_key() {
+    let json = r#"{"importance": 0.9}"#;
+    let req: PatchWatchRequest = serde_json::from_str(json).unwrap();
+    assert_eq!(req.resolved_multiplier(), Some(0.9));
+}
+
+#[test]
+fn patch_watch_request_accepts_importance_multiplier_key() {
+    let json = r#"{"importance_multiplier": 0.9}"#;
+    let req: PatchWatchRequest = serde_json::from_str(json).unwrap();
+    assert_eq!(req.resolved_multiplier(), Some(0.9));
+}
+
+#[test]
+fn watch_defaults_json_key_is_importance_multiplier() {
+    use super::WatchDefaults;
+    let defaults = WatchDefaults {
+        importance_multiplier: DEFAULT_IMPORTANCE_MULTIPLIER,
+    };
+    let json = serde_json::to_value(&defaults).unwrap();
+    assert!(json.get("importance_multiplier").is_some(),
+        "must serialize as importance_multiplier");
+    assert!(json.get("importance").is_none(),
+        "legacy 'importance' must not appear in output");
 }

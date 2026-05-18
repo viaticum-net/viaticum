@@ -535,3 +535,25 @@ fn peer_record_is_device_revoked_with_multiple_keys() {
     assert!(peer.is_device_revoked(&DeviceId(key_b)));
     assert!(!peer.is_device_revoked(&DeviceId(key_c)));
 }
+
+// ============================================================
+// ImportanceBucketStats serialization (Wave 12)
+// ============================================================
+
+#[test]
+fn importance_bucket_stats_round_trips_via_cbor() {
+    let stats = ImportanceBucketStats {
+        bucket: "critical".to_string(),
+        block_count: 42,
+        mean_p_recoverable: 0.9876,
+        target_p: 0.99998,
+        status: "healthy".to_string(),
+    };
+    let bytes = to_cbor_bytes(&stats);
+    let decoded: ImportanceBucketStats = from_cbor_bytes(&bytes).unwrap();
+    assert_eq!(decoded.bucket, "critical");
+    assert_eq!(decoded.block_count, 42);
+    assert!((decoded.mean_p_recoverable - 0.9876).abs() < 1e-9);
+    assert!((decoded.target_p - 0.99998).abs() < 1e-9);
+    assert_eq!(decoded.status, "healthy");
+}

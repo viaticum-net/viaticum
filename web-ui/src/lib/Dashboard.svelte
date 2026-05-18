@@ -196,6 +196,56 @@
       </div>
     </section>
   {/if}
+
+  {#if status.by_importance && status.by_importance.length > 0}
+    <section class="table-section">
+      <h2>Backup by importance</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Bucket</th>
+              <th>Blocks</th>
+              <th>P(recoverable)</th>
+              <th>Target P</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each status.by_importance as entry}
+              {@const pct = entry.mean_p_recoverable}
+              {@const target = entry.target_p}
+              {@const color = entry.status === 'empty' ? 'muted'
+                : pct >= target * 0.99 ? 'green'
+                : pct >= target * 0.90 ? 'yellow'
+                : 'red'}
+              <tr>
+                <td>{entry.bucket.charAt(0).toUpperCase() + entry.bucket.slice(1)}</td>
+                <td>{entry.block_count}</td>
+                <td>
+                  {#if entry.status === 'empty'}
+                    <span class="muted">—</span>
+                  {:else}
+                    <span class="p-badge p-{color}">{entry.mean_p_recoverable.toFixed(5)}</span>
+                  {/if}
+                </td>
+                <td class="muted">{entry.target_p.toFixed(5)}</td>
+                <td>
+                  {#if entry.status === 'empty'}
+                    <span class="status-pill status-empty">empty</span>
+                  {:else if entry.status === 'healthy'}
+                    <span class="status-pill status-healthy">healthy</span>
+                  {:else}
+                    <span class="status-pill status-degraded">degraded</span>
+                  {/if}
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {/if}
 {/if}
 
 <style>
@@ -208,4 +258,28 @@
   }
   .link-auth { background: #1b3d2f; color: #3fb950; }
   .link-known { background: #2d2a1b; color: #d29922; }
+
+  /* Importance bucket table */
+  .p-badge {
+    display: inline-block;
+    font-size: 0.72rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: monospace;
+  }
+  .p-green  { background: #1b3d2f; color: #3fb950; }
+  .p-yellow { background: #2d2a1b; color: #d29922; }
+  .p-red    { background: #3d1b1b; color: #f85149; }
+  .p-muted  { color: #8b949e; }
+
+  .status-pill {
+    display: inline-block;
+    font-size: 0.72rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    line-height: 1;
+  }
+  .status-healthy  { background: #1b3d2f; color: #3fb950; }
+  .status-degraded { background: #3d1b1b; color: #f85149; }
+  .status-empty    { background: #21262d; color: #8b949e; }
 </style>

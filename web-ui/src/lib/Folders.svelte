@@ -14,7 +14,7 @@
 
   // Add dialog fields
   let addPath = $state('');
-  let addImportance = $state(0.5);
+  let addImportance = $state(1.0);
 
   // Inline folder picker
   let browse = $state(null);   // { path, parent, entries: [{name,is_dir}] } | null
@@ -53,7 +53,7 @@
 
   // Edit dialog
   let editEntry = $state(null);
-  let editImportance = $state(0.5);
+  let editImportance = $state(1.0);
 
   // Delete dialog
   let deleteEntry = $state(null);
@@ -78,7 +78,7 @@
       const res = await fetch('/api/watches', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: addPath, importance: addImportance }),
+        body: JSON.stringify({ path: addPath, importance_multiplier: addImportance }),
       });
       if (!res.ok) {
         const text = await res.text();
@@ -86,7 +86,7 @@
       }
       showAddDialog = false;
       addPath = '';
-      addImportance = 0.5;
+      addImportance = 1.0;
       await fetchFolders();
     } catch (e) {
       dialogError = e.message;
@@ -100,7 +100,7 @@
       const res = await fetch(`/api/watches/${b64}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ importance: editImportance }),
+        body: JSON.stringify({ importance_multiplier: editImportance }),
       });
       if (!res.ok) {
         const text = await res.text();
@@ -154,7 +154,7 @@
 
   function openEdit(entry) {
     editEntry = entry;
-    editImportance = entry.importance;
+    editImportance = entry.importance_multiplier;
     dialogError = null;
     showEditDialog = true;
   }
@@ -190,7 +190,7 @@
     <h1>Folders</h1>
     <div class="header-actions">
       <button onclick={refreshRollups} class="btn-secondary">Refresh stats</button>
-      <button onclick={() => { showAddDialog = true; dialogError = null; addPath = ''; addImportance = 0.5; }} class="btn-primary">
+      <button onclick={() => { showAddDialog = true; dialogError = null; addPath = ''; addImportance = 1.0; }} class="btn-primary">
         + Add folder
       </button>
     </div>
@@ -223,7 +223,7 @@
 
           <div class="folder-meta">
             <span class="badge badge-{entry.traffic_light}">{statusLabel(entry.status)}</span>
-            <span class="muted">importance: {(entry.importance * 100).toFixed(0)}%</span>
+            <span class="muted">importance: {(entry.importance_multiplier ?? entry.importance ?? 1.0).toFixed(1)}×</span>
             {#if entry.rollup_age_secs !== null}
               <span class="muted">stats {Math.round(entry.rollup_age_secs / 60)}m old</span>
             {/if}
@@ -294,11 +294,11 @@
         <p class="dialog-error">{browseError}</p>
       {/if}
       <label>
-        Importance: {(addImportance * 100).toFixed(0)}%
+        Importance: {addImportance.toFixed(1)}×
         <input
           type="range"
           bind:value={addImportance}
-          min="0" max="1" step="0.1"
+          min="0" max="2" step="0.1"
           class="input-full"
         />
       </label>
@@ -320,11 +320,11 @@
       <h2>Edit folder</h2>
       <p class="mono">{editEntry.path}</p>
       <label>
-        Importance: {(editImportance * 100).toFixed(0)}%
+        Importance: {editImportance.toFixed(1)}×
         <input
           type="range"
           bind:value={editImportance}
-          min="0" max="1" step="0.1"
+          min="0" max="2" step="0.1"
           class="input-full"
         />
       </label>

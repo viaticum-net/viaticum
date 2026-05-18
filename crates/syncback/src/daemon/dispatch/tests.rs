@@ -356,6 +356,294 @@ async fn restore_with_dest_returns_error() {
     );
 }
 
+// ============================================================
+// Wave 12 ATDD: importance bucket tests
+// ============================================================
+
+use syncback_core::types::{
+    SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, Timestamp as Ts,
+};
+
+fn make_block(id: u8, importance: f64, reliability: f64, status: SourceBlockStatus) -> SourceBlockRecord {
+    SourceBlockRecord {
+        block_id: SourceBlockId([id; 32]),
+        k: 10,
+        t: 64,
+        block_type: SourceBlockType::Single,
+        status,
+        created_at: Ts(0),
+        encrypted_size: None,
+        n: None,
+        overhead: None,
+        drop_notice_sent_at: None,
+        importance,
+        current_alive: 0,
+        current_reliability: reliability,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
+    }
+}
+
+use super::compute_importance_buckets;
+
+#[test]
+fn bucket_for_importance_critical() {
+    let block = make_block(1, 0.95, 0.99, SourceBlockStatus::Active);
+    let buckets = compute_importance_buckets(&[block]);
+    let crit = buckets.iter().find(|b| b.bucket == "critical").unwrap();
+    assert_eq!(crit.block_count, 1);
+}
+
+#[test]
+fn bucket_for_importance_high() {
+    let block = make_block(1, 0.75, 0.99, SourceBlockStatus::Active);
+    let buckets = compute_importance_buckets(&[block]);
+    let high = buckets.iter().find(|b| b.bucket == "high").unwrap();
+    assert_eq!(high.block_count, 1);
+    let crit = buckets.iter().find(|b| b.bucket == "critical").unwrap();
+    assert_eq!(crit.block_count, 0);
+}
+
+#[test]
+fn bucket_for_importance_medium() {
+    let block = make_block(1, 0.50, 0.99, SourceBlockStatus::Active);
+    let buckets = compute_importance_buckets(&[block]);
+    let med = buckets.iter().find(|b| b.bucket == "medium").unwrap();
+    assert_eq!(med.block_count, 1);
+}
+
+#[test]
+fn bucket_for_importance_low() {
+    let block = make_block(1, 0.20, 0.93, SourceBlockStatus::Active);
+    let buckets = compute_importance_buckets(&[block]);
+    let low = buckets.iter().find(|b| b.bucket == "low").unwrap();
+    assert_eq!(low.block_count, 1);
+}
+
+#[test]
+fn bucket_for_importance_trivial() {
+    let block = make_block(1, 0.05, 0.78, SourceBlockStatus::Active);
+    let buckets = compute_importance_buckets(&[block]);
+    let triv = buckets.iter().find(|b| b.bucket == "trivial").unwrap();
+    assert_eq!(triv.block_count, 1);
+}
+
+#[test]
+fn bucket_for_importance_boundary_critical() {
+    // importance = 0.90 exactly → critical (>= 0.90)
+    let block = make_block(1, 0.90, 0.99, SourceBlockStatus::Active);
+    let buckets = compute_importance_buckets(&[block]);
+    let crit = buckets.iter().find(|b| b.bucket == "critical").unwrap();
+    assert_eq!(crit.block_count, 1, "0.90 must be in critical");
+    let high = buckets.iter().find(|b| b.bucket == "high").unwrap();
+    assert_eq!(high.block_count, 0);
+}
+
+#[test]
+fn bucket_for_importance_boundary_high() {
+    // importance = 0.70 exactly → high (>= 0.70, < 0.90)
+    let block = make_block(1, 0.70, 0.99, SourceBlockStatus::Active);
+    let buckets = compute_importance_buckets(&[block]);
+    let high = buckets.iter().find(|b| b.bucket == "high").unwrap();
+    assert_eq!(high.block_count, 1, "0.70 must be in high");
+    let crit = buckets.iter().find(|b| b.bucket == "critical").unwrap();
+    assert_eq!(crit.block_count, 0);
+}
+
+#[test]
+fn bucket_for_importance_boundary_medium() {
+    // importance = 0.40 exactly → medium
+    let block = make_block(1, 0.40, 0.99, SourceBlockStatus::Active);
+    let buckets = compute_importance_buckets(&[block]);
+    let med = buckets.iter().find(|b| b.bucket == "medium").unwrap();
+    assert_eq!(med.block_count, 1, "0.40 must be in medium");
+    let high = buckets.iter().find(|b| b.bucket == "high").unwrap();
+    assert_eq!(high.block_count, 0);
+}
+
+#[test]
+fn bucket_for_importance_boundary_low() {
+    // importance = 0.10 exactly → low
+    let block = make_block(1, 0.10, 0.93, SourceBlockStatus::Active);
+    let buckets = compute_importance_buckets(&[block]);
+    let low = buckets.iter().find(|b| b.bucket == "low").unwrap();
+    assert_eq!(low.block_count, 1, "0.10 must be in low");
+    let triv = buckets.iter().find(|b| b.bucket == "trivial").unwrap();
+    assert_eq!(triv.block_count, 0);
+}
+
+#[test]
+fn bucket_for_importance_at_zero() {
+    // importance = 0.0 (pre-migration sentinel) → trivial
+    let block = make_block(1, 0.0, 0.0, SourceBlockStatus::Active);
+    let buckets = compute_importance_buckets(&[block]);
+    let triv = buckets.iter().find(|b| b.bucket == "trivial").unwrap();
+    assert_eq!(triv.block_count, 1, "0.0 must be in trivial");
+}
+
+#[test]
+fn aggregate_returns_all_five_buckets_even_when_empty() {
+    let buckets = compute_importance_buckets(&[]);
+    assert_eq!(buckets.len(), 5, "must always return 5 buckets");
+    let expected_order = ["critical", "high", "medium", "low", "trivial"];
+    for (i, name) in expected_order.iter().enumerate() {
+        assert_eq!(buckets[i].bucket, *name, "bucket order must be fixed");
+        assert_eq!(buckets[i].block_count, 0);
+        assert_eq!(buckets[i].status, "empty");
+        assert!((buckets[i].mean_p_recoverable - 0.0).abs() < 1e-12);
+        assert!(buckets[i].target_p > 0.0, "target_p must be non-zero even for empty bucket");
+    }
+}
+
+#[test]
+fn aggregate_sums_block_counts_to_active_total() {
+    let blocks = vec![
+        // 2 per bucket (Active)
+        make_block(1, 0.95, 0.99, SourceBlockStatus::Active),
+        make_block(2, 0.91, 0.99, SourceBlockStatus::Active),
+        make_block(3, 0.80, 0.99, SourceBlockStatus::Active),
+        make_block(4, 0.72, 0.99, SourceBlockStatus::Active),
+        make_block(5, 0.55, 0.99, SourceBlockStatus::Active),
+        make_block(6, 0.42, 0.99, SourceBlockStatus::Active),
+        make_block(7, 0.25, 0.93, SourceBlockStatus::Active),
+        make_block(8, 0.15, 0.93, SourceBlockStatus::Active),
+        make_block(9, 0.05, 0.78, SourceBlockStatus::Active),
+        make_block(10, 0.01, 0.78, SourceBlockStatus::Active),
+        // 3 Stale — should not count
+        make_block(11, 0.95, 0.0, SourceBlockStatus::Stale),
+        make_block(12, 0.50, 0.0, SourceBlockStatus::Stale),
+        make_block(13, 0.20, 0.0, SourceBlockStatus::Stale),
+    ];
+    let buckets = compute_importance_buckets(&blocks);
+    let total: u32 = buckets.iter().map(|b| b.block_count).sum();
+    assert_eq!(total, 10, "sum of block_count must equal Active block count");
+}
+
+#[test]
+fn aggregate_status_healthy_when_mean_p_above_target() {
+    // medium bucket: midpoint=0.55, target_p = target_reliability(0.55) ≈ 0.9987
+    // Use 0.9999 to ensure clearly above target → status = "healthy".
+    let blocks = vec![
+        make_block(1, 0.55, 0.9999, SourceBlockStatus::Active),
+        make_block(2, 0.55, 0.9999, SourceBlockStatus::Active),
+    ];
+    let buckets = compute_importance_buckets(&blocks);
+    let med = buckets.iter().find(|b| b.bucket == "medium").unwrap();
+    assert_eq!(med.status, "healthy", "mean 0.9999 should be >= target_p for medium bucket");
+}
+
+#[test]
+fn aggregate_status_degraded_when_mean_p_below_target() {
+    // critical bucket: midpoint=0.95, target_p ≈ 0.99998
+    // current_reliability=0.90 << 0.99998 → degraded
+    let blocks = vec![
+        make_block(1, 0.95, 0.90, SourceBlockStatus::Active),
+        make_block(2, 0.95, 0.90, SourceBlockStatus::Active),
+        make_block(3, 0.95, 0.90, SourceBlockStatus::Active),
+    ];
+    let buckets = compute_importance_buckets(&blocks);
+    let crit = buckets.iter().find(|b| b.bucket == "critical").unwrap();
+    assert_eq!(crit.status, "degraded");
+}
+
+#[test]
+fn aggregate_handles_zero_blocks_per_bucket_gracefully() {
+    // Only critical bucket has blocks
+    let blocks = vec![
+        make_block(1, 0.95, 0.99, SourceBlockStatus::Active),
+        make_block(2, 0.91, 0.99, SourceBlockStatus::Active),
+    ];
+    let buckets = compute_importance_buckets(&blocks);
+    let crit = buckets.iter().find(|b| b.bucket == "critical").unwrap();
+    assert_eq!(crit.block_count, 2);
+
+    for name in &["high", "medium", "low", "trivial"] {
+        let b = buckets.iter().find(|b| b.bucket == *name).unwrap();
+        assert_eq!(b.block_count, 0, "{name} should be empty");
+        assert_eq!(b.status, "empty");
+        // No NaN
+        assert!(!b.mean_p_recoverable.is_nan());
+        assert!(!b.target_p.is_nan());
+    }
+}
+
+#[test]
+fn aggregate_mean_is_arithmetic_mean_not_weighted() {
+    // low bucket: 2 blocks with reliabilities 0.90 and 0.80 → mean = 0.85
+    let blocks = vec![
+        make_block(1, 0.20, 0.90, SourceBlockStatus::Active),
+        make_block(2, 0.25, 0.80, SourceBlockStatus::Active),
+    ];
+    let buckets = compute_importance_buckets(&blocks);
+    let low = buckets.iter().find(|b| b.bucket == "low").unwrap();
+    assert!((low.mean_p_recoverable - 0.85).abs() < 1e-9,
+        "mean should be 0.85, got {}", low.mean_p_recoverable);
+}
+
+#[test]
+fn aggregate_excludes_stale_and_deleting_blocks() {
+    let blocks = vec![
+        make_block(1, 0.95, 0.99, SourceBlockStatus::Active),
+        make_block(2, 0.95, 0.99, SourceBlockStatus::Stale),
+        make_block(3, 0.95, 0.99, SourceBlockStatus::Deleting),
+    ];
+    let buckets = compute_importance_buckets(&blocks);
+    let crit = buckets.iter().find(|b| b.bucket == "critical").unwrap();
+    assert_eq!(crit.block_count, 1, "only Active block should be counted");
+}
+
+#[tokio::test]
+async fn api_status_response_includes_by_importance_field() {
+    let state = make_test_state().await;
+
+    // Insert 3 Active blocks with distinct importance values
+    let blocks = vec![
+        make_block(1, 0.95, 0.99, SourceBlockStatus::Active),
+        make_block(2, 0.50, 0.99, SourceBlockStatus::Active),
+        make_block(3, 0.20, 0.93, SourceBlockStatus::Active),
+    ];
+    for b in &blocks {
+        state.db.upsert_source_block(b).unwrap();
+    }
+
+    let response = dispatch(CliRequest::Status, &state).await;
+    let CliResponse::Status(data) = response else {
+        panic!("expected Status");
+    };
+    assert!(!data.by_importance.is_empty(), "by_importance must be present");
+    assert_eq!(data.by_importance.len(), 5, "must return exactly 5 buckets");
+}
+
+#[tokio::test]
+async fn api_status_backward_compat_existing_fields_preserved() {
+    let state = make_test_state().await;
+
+    let response = dispatch(CliRequest::Status, &state).await;
+    let CliResponse::Status(data) = response else {
+        panic!("expected Status");
+    };
+    // Existing fields must still be present and sensible
+    assert_eq!(data.peer_count, 0);
+    assert_eq!(data.backed_up_files, 0);
+    assert_eq!(data.blocks_ok, 0);
+    assert_eq!(data.blocks_at_risk, 0);
+    // by_importance must also be present
+    assert_eq!(data.by_importance.len(), 5);
+}
+
+#[tokio::test]
+async fn status_response_by_importance_has_five_buckets_in_fixed_order() {
+    let state = make_test_state().await;
+
+    let response = dispatch(CliRequest::Status, &state).await;
+    let CliResponse::Status(data) = response else {
+        panic!("expected Status");
+    };
+    let names: Vec<&str> = data.by_importance.iter().map(|b| b.bucket.as_str()).collect();
+    assert_eq!(names, ["critical", "high", "medium", "low", "trivial"]);
+}
+
 #[cfg(any())]
 async fn _removed_dispatch_connect_two_daemons_registers_peer() {
     use std::sync::Arc;

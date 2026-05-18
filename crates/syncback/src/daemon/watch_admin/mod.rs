@@ -113,8 +113,8 @@ pub struct WatchEntry {
     /// Absolute expanded path (tilde resolved).
     pub path: String,
     /// Importance multiplier [0.0, 2.0] from the watch config.
-    /// The JSON API field is named `importance` for backward compatibility.
-    /// The TOML config file uses `importance_multiplier` as the canonical key.
+    /// Serialized as `importance_multiplier` in JSON (canonical name since Wave 12).
+    #[serde(rename = "importance_multiplier")]
     pub importance: f64,
     /// "idle" | "scanning" | "working" | "error" — derived from WatcherStatusSignal + rollup.
     pub status: WatchStatus,
@@ -143,21 +143,45 @@ pub struct WatchEntry {
 }
 
 /// Request body for POST /api/watches.
+/// Accepts both `importance_multiplier` (canonical) and `importance` (legacy alias,
+/// one-release backward compat). If both present, `importance_multiplier` wins.
 #[derive(Debug, serde::Deserialize)]
 pub struct AddWatchRequest {
     pub path: String,
-    #[serde(default = "default_importance_fn")]
-    pub importance: f64,
+    /// Canonical field name (Wave 12+).
+    #[serde(default)]
+    pub importance_multiplier: Option<f64>,
+    /// Legacy alias — accepted if importance_multiplier absent.
+    #[serde(default, rename = "importance")]
+    pub importance_legacy: Option<f64>,
 }
 
-fn default_importance_fn() -> f64 {
-    DEFAULT_IMPORTANCE_MULTIPLIER
+impl AddWatchRequest {
+    /// Resolve the multiplier: canonical field wins, legacy alias fallback, default last.
+    pub fn resolved_multiplier(&self) -> f64 {
+        self.importance_multiplier
+            .or(self.importance_legacy)
+            .unwrap_or(DEFAULT_IMPORTANCE_MULTIPLIER)
+    }
 }
 
 /// Request body for PATCH /api/watches/{path_b64}.
+/// Accepts both `importance_multiplier` (canonical) and `importance` (legacy alias).
 #[derive(Debug, serde::Deserialize)]
 pub struct PatchWatchRequest {
-    pub importance: f64,
+    /// Canonical field name (Wave 12+).
+    #[serde(default)]
+    pub importance_multiplier: Option<f64>,
+    /// Legacy alias — accepted if importance_multiplier absent.
+    #[serde(default, rename = "importance")]
+    pub importance_legacy: Option<f64>,
+}
+
+impl PatchWatchRequest {
+    /// Resolve the multiplier: canonical field wins, legacy alias fallback.
+    pub fn resolved_multiplier(&self) -> Option<f64> {
+        self.importance_multiplier.or(self.importance_legacy)
+    }
 }
 
 /// Query parameters for DELETE /api/watches/{path_b64}.
@@ -170,7 +194,7 @@ pub struct DeleteWatchQuery {
 /// Defaults returned by GET /api/watches/defaults.
 #[derive(Debug, serde::Serialize)]
 pub struct WatchDefaults {
-    pub importance: f64,
+    pub importance_multiplier: f64,
 }
 
 // ─── Internal types ───────────────────────────────────────────────────────────
@@ -390,10 +414,12 @@ impl WatchAdmin {
             }
         }
 
+        let resolved = req.resolved_multiplier();
+
         // Build the new config entry.
         let mut new_wc = WatchConfig {
             path: expanded.to_string_lossy().into_owned(),
-            importance_multiplier: req.importance,
+            importance_multiplier: resolved,
             was_legacy_importance: false,
             classification: None,
             bursts: None,
@@ -427,13 +453,13 @@ impl WatchAdmin {
         self.control_tx
             .send(WatcherCommand::Add {
                 path: expanded.clone(),
-                importance: req.importance,
+                importance: resolved,
             })
             .await
             .map_err(|_| WatchAdminError::WatcherGone)?;
 
         // Build and return WatchEntry (rollup starts at 0).
-        let entry = self.build_watch_entry(&expanded, req.importance);
+        let entry = self.build_watch_entry(&expanded, resolved);
         Ok(entry)
     }
 
@@ -457,6 +483,7 @@ impl WatchAdmin {
         }
 
         // Build new list with updated multiplier, preserving classification.
+        let resolved = req.resolved_multiplier();
         let new_list = {
             let cfgs = self.live_configs.read().expect("live_configs lock poisoned");
             cfgs.iter()
@@ -464,7 +491,7 @@ impl WatchAdmin {
                     if expand_watch_path(&wc.path) == path {
                         WatchConfig {
                             path: wc.path.clone(),
-                            importance_multiplier: req.importance,
+                            importance_multiplier: resolved.unwrap_or(wc.importance_multiplier),
                             was_legacy_importance: false,
                             classification: wc.classification.clone(), // preserve existing classification
                             bursts: wc.bursts.clone(), // preserve existing burst sets
@@ -485,7 +512,15 @@ impl WatchAdmin {
             *cfgs = new_list;
         }
 
-        let entry = self.build_watch_entry(&path, req.importance);
+        // Find the updated multiplier from live_configs.
+        let actual_multiplier = {
+            let cfgs = self.live_configs.read().expect("live_configs lock poisoned");
+            cfgs.iter()
+                .find(|wc| expand_watch_path(&wc.path) == path)
+                .map(|wc| wc.importance_multiplier)
+                .unwrap_or(DEFAULT_IMPORTANCE_MULTIPLIER)
+        };
+        let entry = self.build_watch_entry(&path, actual_multiplier);
         Ok(entry)
     }
 

@@ -226,6 +226,8 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         None => (0, 0),
     };
 
+    let by_importance = compute_importance_buckets(&source_blocks);
+
     CliResponse::Status(StatusData {
         node_identity,
         device_id,
@@ -256,6 +258,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         blocks_ok,
         blocks_at_risk,
         table_stats: state.db.table_stats().ok(),
+        by_importance,
     })
 }
 
@@ -766,6 +769,89 @@ async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
 
     tracing::info!(addr = %addr, "dial initiated — peer will be registered on connection");
     CliResponse::Connected { peer_id: peer_id.to_string() }
+}
+
+// ============================================================
+// Importance bucket aggregation
+// ============================================================
+
+/// Bucket definition: name, inclusive lower bound, exclusive upper bound, midpoint.
+struct BucketDef {
+    name: &'static str,
+    lo: f64,
+    hi: f64,
+    midpoint: f64,
+}
+
+const BUCKET_DEFS: [BucketDef; 5] = [
+    BucketDef { name: "critical", lo: 0.90, hi: f64::INFINITY,    midpoint: 0.95 },
+    BucketDef { name: "high",     lo: 0.70, hi: 0.90,             midpoint: 0.80 },
+    BucketDef { name: "medium",   lo: 0.40, hi: 0.70,             midpoint: 0.55 },
+    BucketDef { name: "low",      lo: 0.10, hi: 0.40,             midpoint: 0.25 },
+    BucketDef { name: "trivial",  lo: f64::NEG_INFINITY, hi: 0.10, midpoint: 0.05 },
+];
+
+/// Compute per-importance-bucket reliability aggregates over all Active source blocks.
+///
+/// Returns exactly 5 entries in order: critical, high, medium, low, trivial.
+/// If a bucket has zero blocks, returns that bucket with block_count=0 and status="empty".
+///
+/// Receives the already-loaded source_blocks slice from dispatch_status — no second DB call.
+pub(crate) fn compute_importance_buckets(
+    source_blocks: &[syncback_core::types::SourceBlockRecord],
+) -> Vec<syncback_core::types::ImportanceBucketStats> {
+    use syncback_core::reliability::target_reliability;
+    use syncback_core::types::{ImportanceBucketStats, SourceBlockStatus};
+
+    // Accumulators: (count, sum_of_current_reliability)
+    let mut accum: [(u32, f64); 5] = [(0, 0.0); 5];
+
+    for block in source_blocks {
+        if block.status != SourceBlockStatus::Active {
+            continue;
+        }
+        let imp = block.importance;
+        // Assign to the FIRST matching bucket (critical first, trivial last).
+        // Boundary rules: >= lo (inclusive) AND < hi (exclusive).
+        for (i, def) in BUCKET_DEFS.iter().enumerate() {
+            if imp >= def.lo && imp < def.hi {
+                accum[i].0 += 1;
+                accum[i].1 += block.current_reliability;
+                break;
+            }
+        }
+    }
+
+    BUCKET_DEFS
+        .iter()
+        .enumerate()
+        .map(|(i, def)| {
+            let target_p = target_reliability(def.midpoint);
+            let (count, sum) = accum[i];
+            if count == 0 {
+                ImportanceBucketStats {
+                    bucket: def.name.to_string(),
+                    block_count: 0,
+                    mean_p_recoverable: 0.0,
+                    target_p,
+                    status: "empty".to_string(),
+                }
+            } else {
+                let mean = sum / count as f64;
+                ImportanceBucketStats {
+                    bucket: def.name.to_string(),
+                    block_count: count,
+                    mean_p_recoverable: mean,
+                    target_p,
+                    status: if mean >= target_p {
+                        "healthy".to_string()
+                    } else {
+                        "degraded".to_string()
+                    },
+                }
+            }
+        })
+        .collect()
 }
 
 // ============================================================

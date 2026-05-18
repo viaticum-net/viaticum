@@ -25,6 +25,7 @@ fn make_status(peers: Vec<PeerSummary>) -> StatusData {
         blocks_ok: 5,
         blocks_at_risk: 1,
         table_stats: None,
+        by_importance: vec![],
     }
 }
 

@@ -122,6 +122,11 @@ pub struct StatusData {
     /// DB table row counts (shown only in --json mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_stats: Option<syncback_core::db::TableStats>,
+    /// Per-importance-bucket reliability aggregate.
+    /// Always present with 5 entries (critical, high, medium, low, trivial).
+    /// Empty buckets have block_count=0, mean_p_recoverable=0.0, status="empty".
+    #[serde(default)]
+    pub by_importance: Vec<syncback_core::types::ImportanceBucketStats>,
 }
 
 /// Peer summary shown in `syncback status`.

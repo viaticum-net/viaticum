@@ -358,6 +358,29 @@ impl SourceBlockRecord {
     }
 }
 
+/// Aggregate reliability metrics for one named importance bucket.
+/// Used in StatusData.by_importance (5 entries, one per bucket, critical → trivial).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ImportanceBucketStats {
+    /// Bucket name: "critical" | "high" | "medium" | "low" | "trivial".
+    pub bucket: String,
+
+    /// Number of Active SourceBlockRecords with importance in this bucket's range.
+    pub block_count: u32,
+
+    /// Arithmetic mean of current_reliability across blocks in this bucket.
+    /// 0.0 if block_count == 0.
+    pub mean_p_recoverable: f64,
+
+    /// Representative target reliability: target_reliability(bucket_midpoint).
+    /// Constant per bucket; computed at call time, not hardcoded.
+    pub target_p: f64,
+
+    /// "healthy" if mean_p_recoverable >= target_p, "degraded" if below,
+    /// "empty" if block_count == 0.
+    pub status: String,
+}
+
 /// Symbol placement from owner's perspective. Key: (SourceBlockId, holder DeviceId).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SymbolPlacement {

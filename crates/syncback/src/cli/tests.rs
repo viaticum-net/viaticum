@@ -269,6 +269,7 @@ fn make_status_zero_peers() -> StatusData {
         blocks_ok: 0,
         blocks_at_risk: 0,
         table_stats: None,
+        by_importance: vec![],
     }
 }
 
@@ -347,6 +348,7 @@ fn format_status_top_peers_printed() {
         blocks_ok: 3,
         blocks_at_risk: 1,
         table_stats: None,
+        by_importance: vec![],
     };
     let rendered = output::render_status(&data);
     assert!(rendered.contains("a1b2c3d4"), "got: {rendered}");
@@ -818,6 +820,7 @@ fn cli_response_roundtrips_cbor() {
             blocks_ok: 0,
             blocks_at_risk: 0,
             table_stats: None,
+            by_importance: vec![],
         }),
         CliResponse::DeviceList(vec![]),
         CliResponse::Error("oops".into()),

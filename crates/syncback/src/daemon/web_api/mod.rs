@@ -52,7 +52,6 @@ use crate::daemon::watch_admin::{
     WatchEntry,
 };
 use crate::daemon::web_auth::{auth_start_handler, require_auth, AuthState};
-use syncback_core::config::DEFAULT_IMPORTANCE;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -336,8 +335,9 @@ async fn handle_watches_list(
 }
 
 async fn handle_watches_defaults() -> Json<WatchDefaults> {
+    use syncback_core::config::DEFAULT_IMPORTANCE_MULTIPLIER;
     Json(WatchDefaults {
-        importance: DEFAULT_IMPORTANCE,
+        importance_multiplier: DEFAULT_IMPORTANCE_MULTIPLIER,
     })
 }
 
