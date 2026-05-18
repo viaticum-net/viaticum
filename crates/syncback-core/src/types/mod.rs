@@ -292,6 +292,44 @@ pub struct SourceBlockRecord {
     /// Set on first send; prevents re-sending on subsequent scheduler ticks.
     #[serde(default)]
     pub drop_notice_sent_at: Option<Timestamp>,
+
+    // --- Wave 8: cached reliability fields ---
+
+    /// File importance in [0.0, 1.0]. Derived from overhead at migration; set directly at
+    /// block creation (Wave 9+). Legacy records get this from the inverse overhead formula or
+    /// DEFAULT_IMPORTANCE if overhead is absent.
+    /// Default: 0.0 (pre-migration sentinel; replaced by migration before workers start).
+    #[serde(default)]
+    pub importance: f64,
+
+    /// Count of SymbolPlacement rows with status Alive or Uncertain for this block.
+    /// Updated by migration at startup; updated by Wave 11 on state transitions.
+    /// Default: 0.
+    #[serde(default)]
+    pub current_alive: u32,
+
+    /// P(block recoverable) in [0.0, 1.0]. Cached from reliability::block_reliability.
+    /// Updated by migration at startup; updated by Wave 11 on state transitions.
+    /// Default: 0.0.
+    #[serde(default)]
+    pub current_reliability: f64,
+
+    /// P target from reliability::target_reliability(importance). Fixed at creation/migration.
+    /// Default: 0.0 (pre-migration sentinel).
+    #[serde(default)]
+    pub target_reliability: f64,
+
+    /// Timestamp of the last worker attempt on this block.
+    /// None = never attempted. Used for cooldown tiebreak.
+    /// Default: None.
+    #[serde(default)]
+    pub last_attempted_at: Option<Timestamp>,
+
+    /// XxHash64 of the sorted DeviceId set at the last attempt.
+    /// 0 = sentinel "never attempted / pool unknown". Populated by Wave 11.
+    /// Default: 0.
+    #[serde(default)]
+    pub last_pool_signature: u64,
 }
 
 impl SourceBlockRecord {

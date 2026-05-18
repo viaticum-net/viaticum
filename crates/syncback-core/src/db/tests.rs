@@ -39,6 +39,12 @@ fn make_source_block(seed: u8, status: SourceBlockStatus) -> SourceBlockRecord {
         n: None,
         overhead: None,
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     }
 }
 
@@ -521,6 +527,12 @@ fn committed_bytes_sums_active_blocks() {
         n: None,
         overhead: None,
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
 
     // Block B: Active, encrypted_size=None → fallback to k*t = 10*100 = 1000
@@ -535,6 +547,12 @@ fn committed_bytes_sums_active_blocks() {
         n: None,
         overhead: None,
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
 
     // Block C: Deleted, encrypted_size=Some(500) → must NOT be counted
@@ -549,6 +567,12 @@ fn committed_bytes_sums_active_blocks() {
         n: None,
         overhead: None,
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
 
     db.upsert_source_block(&block_a).unwrap();
@@ -560,6 +584,85 @@ fn committed_bytes_sums_active_blocks() {
     // B: 10 * 100 = 1000 (fallback k*t)
     // C: excluded (Deleted)
     assert_eq!(total, 2000, "expected 1000 + 1000 = 2000, got {total}");
+}
+
+// ============================================================
+// update_block_cached_fields (Wave 8)
+// ============================================================
+
+#[test]
+fn update_block_cached_fields_persists_to_db() {
+    let db = test_db();
+    let bid = block_id(20);
+
+    // Insert a block with default (zero) cached fields.
+    let initial = SourceBlockRecord {
+        block_id: bid,
+        k: 5,
+        t: 65535,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(500),
+        encrypted_size: Some(327_675),
+        n: Some(14),
+        overhead: Some(2.475),
+        drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
+    };
+    db.upsert_source_block(&initial).unwrap();
+
+    // Call update with non-zero values.
+    db.update_block_cached_fields(
+        &bid,
+        0.65,
+        3,
+        0.9996,
+        0.9996,
+        Some(Timestamp(1000)),
+        42,
+    ).unwrap();
+
+    // Read back and assert.
+    let record = db.get_source_block(&bid).unwrap().unwrap();
+    assert!((record.importance - 0.65).abs() < 1e-10,
+        "importance must be ~0.65, got {}", record.importance);
+    assert_eq!(record.current_alive, 3);
+    assert!((record.current_reliability - 0.9996).abs() < 1e-10,
+        "current_reliability must be ~0.9996, got {}", record.current_reliability);
+    assert!((record.target_reliability - 0.9996).abs() < 1e-10,
+        "target_reliability must be ~0.9996, got {}", record.target_reliability);
+    assert_eq!(record.last_attempted_at, Some(Timestamp(1000)));
+    assert_eq!(record.last_pool_signature, 42);
+
+    // Existing fields must be unchanged.
+    assert_eq!(record.k, 5);
+    assert_eq!(record.t, 65535);
+    assert_eq!(record.encrypted_size, Some(327_675));
+    assert_eq!(record.overhead, Some(2.475));
+    assert_eq!(record.status, SourceBlockStatus::Active);
+}
+
+#[test]
+fn update_block_cached_fields_returns_not_found_for_missing_block() {
+    let db = test_db();
+    let missing = block_id(99);
+
+    let result = db.update_block_cached_fields(&missing, 0.5, 0, 0.0, 0.0, None, 0);
+    assert!(
+        result.is_err(),
+        "must return Err for a block_id not in the DB"
+    );
+    // Check it's a NotFound variant.
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, crate::db::DbError::NotFound(_)),
+        "expected DbError::NotFound, got: {err:?}"
+    );
 }
 
 // ============================================================
@@ -1047,6 +1150,12 @@ fn refresh_peer_storage_bytes_updates_trust_s() {
         n: None,
         overhead: None,
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
     db.upsert_source_block(&sb_a).unwrap();
 
@@ -1116,6 +1225,12 @@ fn refresh_peer_storage_bytes_neutral_when_we_store_nothing() {
         n: None,
         overhead: None,
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
     db.upsert_source_block(&sb).unwrap();
     let p = SymbolPlacement {
@@ -1168,6 +1283,12 @@ fn refresh_peer_storage_bytes_only_alive_and_active_count() {
         n: None,
         overhead: None,
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
     db.upsert_source_block(&sb).unwrap();
 

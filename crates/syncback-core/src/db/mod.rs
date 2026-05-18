@@ -501,6 +501,39 @@ impl Db {
         Ok(())
     }
 
+    /// Update the Wave-8 cached fields on a SourceBlockRecord without touching other fields.
+    ///
+    /// Reads the record, applies the new values, and writes back. Returns `DbError::NotFound`
+    /// if no record exists for `block_id`.
+    ///
+    /// This is a read-modify-write inside a single logical operation but uses two separate
+    /// redb transactions (read then write) — the same pattern as
+    /// `transition_placement_offered_to_alive`.
+    /// Not atomic against concurrent writers, but the daemon is single-process and the migration
+    /// runs before any workers start, so no concurrent writes occur during migration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_block_cached_fields(
+        &self,
+        block_id: &SourceBlockId,
+        importance: f64,
+        current_alive: u32,
+        current_reliability: f64,
+        target_reliability: f64,
+        last_attempted_at: Option<Timestamp>,
+        last_pool_signature: u64,
+    ) -> Result<(), DbError> {
+        let mut record = self
+            .get_source_block(block_id)?
+            .ok_or_else(|| DbError::NotFound(format!("SourceBlockRecord {block_id}")))?;
+        record.importance = importance;
+        record.current_alive = current_alive;
+        record.current_reliability = current_reliability;
+        record.target_reliability = target_reliability;
+        record.last_attempted_at = last_attempted_at;
+        record.last_pool_signature = last_pool_signature;
+        self.upsert_source_block(&record)
+    }
+
     /// List all source blocks (any status).
     pub fn list_all_source_blocks(&self) -> Result<Vec<SourceBlockRecord>, DbError> {
         let tx = self.inner.begin_read()?;

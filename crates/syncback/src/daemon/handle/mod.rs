@@ -207,6 +207,28 @@ impl DaemonHandle {
             }
         }
 
+        // ── 3.7. Migrate Wave-8 cached reliability fields ─────────────────────
+        // Unconditionally populates importance, current_alive, current_reliability,
+        // target_reliability on every SourceBlockRecord. Idempotent. Runs before
+        // workers and scheduler start so the cached fields are consistent from boot.
+        match syncback_core::migration::migrate_block_records(&db) {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::info!(count, "block record cached fields migration complete");
+                }
+            }
+            Err(e) => {
+                // Spec wording said `list_all_source_blocks` failure is fatal, but we
+                // downgrade to WARN intentionally: daemon should boot even with stale
+                // cached fields. Trade-off: Wave 10's priority queue will treat all
+                // blocks as "needing work" (current_reliability defaults to 0.0 < target),
+                // resulting in O(N) spurious repair attempts on next worker tick. This is
+                // safe (over-send, not under-send) — and the worker self-recovers as it
+                // re-reads each block. Better than refusing to start the daemon entirely.
+                tracing::warn!(err = %e, "block record cached fields migration failed (non-fatal)");
+            }
+        }
+
         // ── 4. Derive keys ────────────────────────────────────────────────────
         // Epoch 0 is the initial epoch; epoch rotation happens on device revocation.
         let (master_key, device_key, epoch_key_bytes) = derive_keys(&keyfile, 0)?;

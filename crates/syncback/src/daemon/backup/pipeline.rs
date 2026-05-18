@@ -256,6 +256,14 @@ pub fn run_pipeline(
         n: Some(params.n),
         overhead: Some(params.overhead),
         drop_notice_sent_at: None,
+        // Wave 9 will set importance/target_reliability directly from pack.importance.
+        // For now, use sentinel defaults; migration will populate on next boot.
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
     // 8 & 9. DB: atomically write source block + all placements + all events.
     // Using a single write transaction ensures that on crash before commit,

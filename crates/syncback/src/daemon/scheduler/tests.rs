@@ -499,6 +499,12 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
         n: None,
         overhead: None,
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
     db.upsert_source_block(&sb).unwrap();
 
@@ -771,6 +777,12 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
         n: None,
         overhead: None,
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
     db.upsert_source_block(&sb).unwrap();
 
@@ -892,6 +904,12 @@ async fn cleanup_block_removes_files_from_disk() {
         n: None,
         overhead: None,
         drop_notice_sent_at: Some(Timestamp(0)), // already sent, skip SendDropNotice
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
     db.upsert_source_block(&sb).unwrap();
 

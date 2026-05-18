@@ -17,6 +17,12 @@ fn erasure_params_returns_stored_values() {
         n: Some(512),
         overhead: Some(3.0),
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
     let params = record.erasure_params();
     assert_eq!(params.k, 100);
@@ -42,6 +48,12 @@ fn erasure_params_legacy_fallback() {
         n: None,
         overhead: None,
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
     let params = record.erasure_params();
     let expected = ErasureParams::compute(k as u64 * t as u64, 0.0).unwrap();
@@ -65,6 +77,12 @@ fn source_block_record_roundtrips_n_and_overhead() {
         n: Some(930),
         overhead: Some(2.4),
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
     let bytes = to_cbor_bytes(&record);
     let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();
@@ -316,6 +334,12 @@ fn cbor_roundtrip_source_block_pack() {
         n: None,
         overhead: None,
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
     let bytes = to_cbor_bytes(&sb);
     let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();
@@ -325,6 +349,107 @@ fn cbor_roundtrip_source_block_pack() {
     } else {
         panic!("expected Pack");
     }
+}
+
+// ============================================================
+// Wave 8: new cached fields round-trip and legacy compat
+// ============================================================
+
+#[test]
+fn source_block_record_round_trip_with_all_new_fields() {
+    let original = SourceBlockRecord {
+        block_id: SourceBlockId([0xAB; 32]),
+        k: 100,
+        t: 65535,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(5000),
+        encrypted_size: Some(6_553_500),
+        n: Some(450),
+        overhead: Some(2.475),
+        drop_notice_sent_at: None,
+        // Wave 8 fields — all non-zero/non-default.
+        importance: 0.65,
+        current_alive: 3,
+        current_reliability: 0.9996,
+        target_reliability: 0.9996,
+        last_attempted_at: Some(Timestamp(9999)),
+        last_pool_signature: 0xDEADBEEF_CAFEBABE,
+    };
+
+    let bytes = to_cbor_bytes(&original);
+    let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();
+
+    // Existing fields unchanged.
+    assert_eq!(decoded.block_id, original.block_id);
+    assert_eq!(decoded.k, 100);
+    assert_eq!(decoded.t, 65535);
+    assert_eq!(decoded.n, Some(450));
+    assert!((decoded.overhead.unwrap() - 2.475).abs() < 1e-10);
+
+    // New fields survive round-trip.
+    assert!((decoded.importance - 0.65).abs() < 1e-10,
+        "importance round-trip, got {}", decoded.importance);
+    assert_eq!(decoded.current_alive, 3);
+    assert!((decoded.current_reliability - 0.9996).abs() < 1e-10,
+        "current_reliability round-trip, got {}", decoded.current_reliability);
+    assert!((decoded.target_reliability - 0.9996).abs() < 1e-10,
+        "target_reliability round-trip, got {}", decoded.target_reliability);
+    assert_eq!(decoded.last_attempted_at, Some(Timestamp(9999)));
+    assert_eq!(decoded.last_pool_signature, 0xDEADBEEF_CAFEBABE);
+}
+
+#[test]
+fn source_block_record_legacy_format_loads_with_defaults() {
+    // Simulate a record serialized by pre-Wave-8 code (no new fields).
+    #[derive(serde::Serialize)]
+    struct LegacySourceBlockRecordV2 {
+        block_id: SourceBlockId,
+        k: u32,
+        t: u16,
+        block_type: SourceBlockType,
+        status: SourceBlockStatus,
+        created_at: Timestamp,
+        encrypted_size: Option<u64>,
+        n: Option<u32>,
+        overhead: Option<f64>,
+        drop_notice_sent_at: Option<Timestamp>,
+    }
+    let legacy = LegacySourceBlockRecordV2 {
+        block_id: SourceBlockId([0xCC; 32]),
+        k: 50,
+        t: 65535,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(1000),
+        encrypted_size: Some(3_276_750),
+        n: Some(200),
+        overhead: Some(2.4),
+        drop_notice_sent_at: None,
+    };
+
+    let bytes = to_cbor_bytes(&legacy);
+    let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();
+
+    // Existing fields deserialize correctly.
+    assert_eq!(decoded.k, 50);
+    assert_eq!(decoded.n, Some(200));
+    assert!((decoded.overhead.unwrap() - 2.4).abs() < 1e-10);
+    assert_eq!(decoded.encrypted_size, Some(3_276_750));
+
+    // Wave-8 fields default to their zero values.
+    assert_eq!(decoded.importance, 0.0,
+        "legacy: importance must default to 0.0");
+    assert_eq!(decoded.current_alive, 0,
+        "legacy: current_alive must default to 0");
+    assert_eq!(decoded.current_reliability, 0.0,
+        "legacy: current_reliability must default to 0.0");
+    assert_eq!(decoded.target_reliability, 0.0,
+        "legacy: target_reliability must default to 0.0");
+    assert_eq!(decoded.last_attempted_at, None,
+        "legacy: last_attempted_at must default to None");
+    assert_eq!(decoded.last_pool_signature, 0,
+        "legacy: last_pool_signature must default to 0");
 }
 
 #[test]

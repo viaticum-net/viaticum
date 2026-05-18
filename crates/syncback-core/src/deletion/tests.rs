@@ -66,6 +66,12 @@ fn make_block(bid: SourceBlockId, status: SourceBlockStatus, block_type: SourceB
         n: None,
         overhead: None,
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     }
 }
 

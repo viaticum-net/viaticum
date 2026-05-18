@@ -13,6 +13,7 @@ pub mod erasure;
 pub mod escrow;
 pub mod importance;
 pub mod messages;
+pub mod migration;
 pub mod path_safety;
 pub mod placement;
 pub mod priority;

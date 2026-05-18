@@ -259,6 +259,12 @@ fn db_stores_and_retrieves_full_records() {
         n: None,
         overhead: None,
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
     db.upsert_source_block(&sbr).expect("upsert_source_block");
 
@@ -524,6 +530,12 @@ fn full_owner_flow() {
         n: None,
         overhead: None,
         drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+        last_attempted_at: None,
+        last_pool_signature: 0,
     };
     db.upsert_source_block(&sbr).expect("upsert_source_block");
 
