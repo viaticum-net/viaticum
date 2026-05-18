@@ -48,7 +48,7 @@ pub enum ImportanceClass {
 /// changes such that the media fraction crosses the 50% threshold, the value
 /// will change on the next call to `classify_folder`, causing all media files
 /// in the folder to be reclassified. This is expected behavior.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FolderClassification {
     /// True if more than or equal to 50% of the sampled files in this folder have
     /// media extensions (image, video, or audio).

@@ -1,7 +1,7 @@
 // Event processing: handle_deleted, handle_added_or_modified, get_or_create_file_id.
 // Called from BackupCoordinator::process_event (mod.rs).
 
-use syncback_core::config::lookup_importance;
+use syncback_core::config::derive_file_importance;
 use syncback_core::types::{
     FileId, FileRecord, FileVersion, LocalState, SourceBlockId, Timestamp,
 };
@@ -91,9 +91,9 @@ impl BackupCoordinator {
 
         let importance = if let Some(live) = &self.config.live_watch_configs {
             let guard = live.read().expect("live_watch_configs lock poisoned");
-            lookup_importance(&event.path, &*guard)
+            derive_file_importance(&event.path, &guard)
         } else {
-            lookup_importance(&event.path, &self.config.watch_configs)
+            derive_file_importance(&event.path, &self.config.watch_configs)
         };
 
         if size_bytes >= self.config.source_block_size {

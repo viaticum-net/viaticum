@@ -171,29 +171,147 @@ pub struct NetworkCfg {
 // Watch config
 // ============================================================
 
-/// Default importance value used when no watch config matches a path.
+/// Fallback importance returned when no watch config matches a file path.
+/// Preserved from pre-Wave-6 lookup_importance semantics.
 pub const DEFAULT_IMPORTANCE: f64 = 0.5;
 
-fn default_importance() -> f64 {
-    DEFAULT_IMPORTANCE
-}
+/// Default importance multiplier for a watch folder when none is configured.
+/// Range [0.0, 2.0]; 1.0 = no change to the derived base importance.
+pub const DEFAULT_IMPORTANCE_MULTIPLIER: f64 = 1.0;
 
-/// Per-directory watch configuration with importance override.
+/// Maximum number of file paths sampled when classifying a watched folder.
+pub const CLASSIFY_SCAN_CAP: usize = 200;
+
+/// Per-directory watch configuration.
 ///
 /// Listed under [[watch]] in config.toml. The daemon watches each configured
-/// path (and its subdirectories) for file changes. The importance value controls
-/// how many erasure symbols are allocated for files under this directory —
-/// higher importance means more redundancy.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+/// path (and its subdirectories) for file changes.
+///
+/// # Migration note (Wave 6)
+///
+/// The field `importance` has been renamed to `importance_multiplier`.
+/// The old name is accepted via TOML alias for backward compatibility.
+/// Semantics: a multiplier in [0.0, 2.0] applied to each file's derived
+/// base importance. Default 1.0 = no change.
+///
+/// If your old config had `importance = 0.5`, this is now interpreted as
+/// "halve the computed importance of all files in this folder".
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
 pub struct WatchConfig {
     /// Absolute or tilde-prefixed path to watch recursively.
     pub path: String,
 
-    /// Importance override for files under this directory. Range: [0.0, 1.0].
-    /// 0.0 = minimum redundancy, 1.0 = maximum redundancy.
-    /// Default: 0.5.
-    #[serde(default = "default_importance")]
-    pub importance: f64,
+    /// Multiplier applied to derived file importance. Range [0.0, 2.0], default 1.0.
+    /// Serialized as `importance_multiplier` in config.toml.
+    /// Legacy TOML `importance = X` is accepted and interpreted as this field.
+    pub importance_multiplier: f64,
+
+    /// True if this WatchConfig was loaded from a legacy `importance` TOML field.
+    /// Set by the custom Deserialize impl. Never serialized. Used to emit a
+    /// one-time deprecation warning at startup.
+    #[serde(skip)]
+    pub was_legacy_importance: bool,
+
+    /// Folder media classification, computed by populate_classification() at watch-start.
+    /// None until populate_classification() is called. Not serialized.
+    #[serde(skip)]
+    pub classification: Option<crate::importance::FolderClassification>,
+}
+
+/// Private intermediate struct for custom WatchConfig deserialization.
+#[derive(serde::Deserialize)]
+struct WatchConfigRaw {
+    pub path: String,
+    /// Canonical field name (Wave 6+).
+    #[serde(default)]
+    pub importance_multiplier: Option<f64>,
+    /// Legacy field name. If present and importance_multiplier absent → legacy mode.
+    #[serde(default)]
+    pub importance: Option<f64>,
+}
+
+impl<'de> serde::Deserialize<'de> for WatchConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = WatchConfigRaw::deserialize(d)?;
+        let (multiplier, was_legacy) = match (raw.importance_multiplier, raw.importance) {
+            (Some(m), _) => (m, false),         // canonical field present → not legacy
+            (None, Some(v)) => (v, true),        // only legacy field → legacy
+            (None, None) => (DEFAULT_IMPORTANCE_MULTIPLIER, false), // neither → default
+        };
+        Ok(WatchConfig {
+            path: raw.path,
+            importance_multiplier: multiplier,
+            was_legacy_importance: was_legacy,
+            classification: None,
+        })
+    }
+}
+
+impl WatchConfig {
+    /// Scan the directory at `self.path` and compute its FolderClassification.
+    ///
+    /// Walks up to CLASSIFY_SCAN_CAP (200) file paths using a stack-based DFS.
+    /// Skips hidden directories (names starting with '.').
+    /// Skips symlinks (both file and directory) to avoid loops.
+    /// Stores the result in `self.classification`.
+    ///
+    /// If the directory does not exist or is not accessible, stores
+    /// `FolderClassification::default()` (is_media_folder = false, multiplier = 1.0)
+    /// and logs a warning.
+    ///
+    /// The `importance_multiplier` of the returned FolderClassification is always 1.0
+    /// (classify_folder never has access to config). The user-configured multiplier
+    /// lives in `self.importance_multiplier`, NOT in `self.classification.importance_multiplier`.
+    pub fn populate_classification(&mut self) {
+        self.populate_classification_with_cap(CLASSIFY_SCAN_CAP);
+    }
+
+    /// Like populate_classification but with a configurable cap (used in tests).
+    pub(crate) fn populate_classification_with_cap(&mut self, cap: usize) {
+        use std::path::PathBuf;
+        let expanded = expand_watch_path(&self.path);
+        let mut paths_seen: Vec<PathBuf> = Vec::new();
+        let mut stack: Vec<PathBuf> = vec![expanded.clone()];
+
+        'outer: while let Some(current) = stack.pop() {
+            let entries = match std::fs::read_dir(&current) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        dir = %current.display(),
+                        error = %e,
+                        "populate_classification: cannot read directory; using default classification"
+                    );
+                    self.classification = Some(crate::importance::FolderClassification::default());
+                    return;
+                }
+            };
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else { continue };
+                // Skip symlinks to avoid loops.
+                if ft.is_symlink() {
+                    continue;
+                }
+                let path = entry.path();
+                if ft.is_dir() {
+                    // Skip hidden directories (starting with '.').
+                    if let Some(name) = path.file_name() {
+                        if name.to_string_lossy().starts_with('.') {
+                            continue;
+                        }
+                    }
+                    stack.push(path);
+                } else if ft.is_file() {
+                    paths_seen.push(path);
+                    if paths_seen.len() >= cap {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        self.classification = Some(crate::importance::classify_folder(&paths_seen));
+    }
 }
 
 impl Default for NetworkCfg {
@@ -359,7 +477,7 @@ pub struct AppConfig {
     pub reliability: ReliabilityConfig,
     /// Per-directory watch configuration.
     /// Listed as [[watch]] array in config.toml.
-    /// When empty, watch_dirs from CLI are used with DEFAULT_IMPORTANCE.
+    /// When empty, watch_dirs from CLI are used with DEFAULT_IMPORTANCE_MULTIPLIER.
     pub watch: Vec<WatchConfig>,
 }
 
@@ -618,29 +736,57 @@ pub fn expand_watch_path(s: &str) -> PathBuf {
     }
 }
 
-/// Look up the importance for a file path by matching against watch configs.
+/// Derive the effective importance for a file path from the watch configs.
 ///
-/// Iterates `watch_cfgs` in order. Returns the importance of the first entry
-/// whose `path` is a prefix of `file_path`. If no entry matches, returns
-/// `DEFAULT_IMPORTANCE` (0.5).
+/// Finds the first WatchConfig whose expanded path is a prefix of `file_path`,
+/// then computes:
+///   class = importance::classify_file(file_path, &wc.classification.unwrap_or_default())
+///   result = importance::effective_importance(class, wc.importance_multiplier)
 ///
-/// Matching is prefix-based on the string representation of the path.
-/// A trailing separator is added to the watch path before comparison so that
-/// `/home/user/docs` does not accidentally match `/home/user/documents/file.txt`.
-pub fn lookup_importance(file_path: &str, watch_cfgs: &[WatchConfig]) -> f64 {
+/// If no WatchConfig matches, returns DEFAULT_IMPORTANCE (0.5).
+///
+/// # Note on FolderClassification.importance_multiplier
+///
+/// The FolderClassification stored on WatchConfig (produced by classify_folder)
+/// always has importance_multiplier = 1.0. The user-configured multiplier is
+/// wc.importance_multiplier, which is what this function passes to effective_importance.
+/// Do NOT pass classification.importance_multiplier.
+///
+/// # Prefix matching
+///
+/// Same semantics as the replaced lookup_importance: a trailing '/' is appended
+/// to the watch path before comparison, so '/docs' does not match '/documents/file'.
+/// Tilde expansion is NOT applied to file_path (it is already absolute by the time
+/// it reaches this function from the watcher).
+pub fn derive_file_importance(file_path: &str, watch_cfgs: &[WatchConfig]) -> f64 {
+    if let Some(wc) = find_watch_config(file_path, watch_cfgs) {
+        let folder = wc.classification.clone().unwrap_or_default();
+        let class = crate::importance::classify_file(
+            std::path::Path::new(file_path),
+            &folder,
+        );
+        crate::importance::effective_importance(class, wc.importance_multiplier)
+    } else {
+        DEFAULT_IMPORTANCE
+    }
+}
+
+/// Find the first WatchConfig whose expanded path is a prefix of file_path.
+/// Returns None if no match.
+fn find_watch_config<'a>(file_path: &str, watch_cfgs: &'a [WatchConfig]) -> Option<&'a WatchConfig> {
     for wc in watch_cfgs {
-        // Normalise: the watch path might or might not end with '/'.
-        // We compare against "watch_path/" so `/docs` doesn't match `/documents`.
-        let prefix = if wc.path.ends_with('/') {
-            wc.path.clone()
+        let expanded = expand_watch_path(&wc.path);
+        let base = expanded.to_string_lossy();
+        let prefix = if base.ends_with('/') {
+            base.to_string()
         } else {
-            format!("{}/", wc.path)
+            format!("{}/", base)
         };
-        if file_path.starts_with(prefix.as_str()) || file_path == wc.path.as_str() {
-            return wc.importance;
+        if file_path.starts_with(prefix.as_str()) || file_path == base.as_ref() {
+            return Some(wc);
         }
     }
-    DEFAULT_IMPORTANCE
+    None
 }
 
 // ============================================================

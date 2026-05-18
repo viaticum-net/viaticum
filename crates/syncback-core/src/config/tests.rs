@@ -4,10 +4,12 @@ use std::io::Write;
 #[cfg(test)]
 use crate::config::{
     AppConfig, BackupCfg, ClusterCfg, ConfigError, EscrowCfg, MetricsCfg, NetworkCfg,
-    ReliabilityConfig, RestoreCfg, StorageCfg, WatchConfig, WebApiCfg, disk_reserve_bytes,
-    expand_data_dir, hard_quota_bytes, lookup_importance, soft_quota_bytes, source_block_size_bytes,
-    DEFAULT_IMPORTANCE,
+    ReliabilityConfig, RestoreCfg, StorageCfg, WatchConfig, WebApiCfg, derive_file_importance,
+    disk_reserve_bytes, expand_data_dir, hard_quota_bytes, soft_quota_bytes, source_block_size_bytes,
+    DEFAULT_IMPORTANCE, DEFAULT_IMPORTANCE_MULTIPLIER,
 };
+#[cfg(test)]
+use crate::importance::FolderClassification;
 #[cfg(test)]
 use crate::constants::{
     DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_K_FACTOR, DEFAULT_MAX_VERSIONS,
@@ -434,104 +436,70 @@ fn network_cfg_relay_url_missing_defaults_none() {
 }
 
 // ============================================================
-// WatchConfig / lookup_importance tests
+// WatchConfig / TOML deserialization tests
 // ============================================================
 
 #[test]
-fn watch_config_default_importance_is_half() {
+fn watch_config_default_multiplier_is_one() {
     let wc: WatchConfig = toml::from_str(r#"path = "/home/user/docs""#).unwrap();
-    assert_eq!(wc.importance, DEFAULT_IMPORTANCE);
+    assert!(
+        (wc.importance_multiplier - DEFAULT_IMPORTANCE_MULTIPLIER).abs() < 1e-9,
+        "expected {DEFAULT_IMPORTANCE_MULTIPLIER}, got {}",
+        wc.importance_multiplier
+    );
+    assert!(!wc.was_legacy_importance);
 }
 
 #[test]
-fn watch_config_explicit_importance_roundtrips() {
+fn legacy_importance_field_in_toml_loads_as_multiplier_with_warning() {
+    let toml_str = r#"path = "/home/user/photos"
+importance = 0.7"#;
+    let wc: WatchConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(wc.path, "/home/user/photos");
+    assert!((wc.importance_multiplier - 0.7).abs() < 1e-9);
+    assert!(wc.was_legacy_importance, "legacy flag should be set");
+    assert!(wc.classification.is_none());
+}
+
+#[test]
+fn current_importance_multiplier_field_loads_directly() {
+    let toml_str = r#"path = "/home/user/docs"
+importance_multiplier = 1.5"#;
+    let wc: WatchConfig = toml::from_str(toml_str).unwrap();
+    assert!((wc.importance_multiplier - 1.5).abs() < 1e-9);
+    assert!(!wc.was_legacy_importance);
+}
+
+#[test]
+fn both_fields_present_canonical_wins() {
+    let toml_str = r#"path = "/home/user/docs"
+importance = 0.3
+importance_multiplier = 0.9"#;
+    let wc: WatchConfig = toml::from_str(toml_str).unwrap();
+    assert!(
+        (wc.importance_multiplier - 0.9).abs() < 1e-9,
+        "canonical field should win; got {}",
+        wc.importance_multiplier
+    );
+    assert!(!wc.was_legacy_importance, "not legacy when canonical field is present");
+}
+
+#[test]
+fn watch_config_serializes_as_importance_multiplier_key() {
     let wc = WatchConfig {
-        path: "/home/user/photos".to_string(),
-        importance: 0.9,
+        path: "/home/user/docs".to_string(),
+        importance_multiplier: 0.8,
+        was_legacy_importance: false,
+        classification: None,
     };
-    let serialized = toml::to_string(&wc).unwrap();
-    let loaded: WatchConfig = toml::from_str(&serialized).unwrap();
-    assert_eq!(loaded.path, "/home/user/photos");
-    assert!((loaded.importance - 0.9).abs() < 1e-9);
+    let s = toml::to_string(&wc).unwrap();
+    assert!(s.contains("importance_multiplier"), "canonical key must be written");
+    assert!(!s.contains("was_legacy_importance"), "skip field must not be written");
+    assert!(!s.contains("classification"), "skip field must not be written");
 }
 
 #[test]
-fn lookup_importance_returns_default_when_no_watch_configs() {
-    let result = lookup_importance("/home/user/docs/file.txt", &[]);
-    assert_eq!(result, DEFAULT_IMPORTANCE);
-}
-
-#[test]
-fn lookup_importance_returns_default_when_no_match() {
-    let cfgs = vec![WatchConfig {
-        path: "/home/user/photos".to_string(),
-        importance: 0.9,
-    }];
-    let result = lookup_importance("/home/user/docs/file.txt", &cfgs);
-    assert_eq!(result, DEFAULT_IMPORTANCE);
-}
-
-#[test]
-fn lookup_importance_matches_exact_directory_prefix() {
-    let cfgs = vec![WatchConfig {
-        path: "/home/user/docs".to_string(),
-        importance: 0.8,
-    }];
-    let result = lookup_importance("/home/user/docs/report.pdf", &cfgs);
-    assert!((result - 0.8).abs() < 1e-9);
-}
-
-#[test]
-fn lookup_importance_does_not_match_partial_directory_name() {
-    // /home/user/docs should NOT match /home/user/documents/file.txt
-    let cfgs = vec![WatchConfig {
-        path: "/home/user/docs".to_string(),
-        importance: 0.8,
-    }];
-    let result = lookup_importance("/home/user/documents/file.txt", &cfgs);
-    assert_eq!(result, DEFAULT_IMPORTANCE);
-}
-
-#[test]
-fn lookup_importance_uses_first_matching_config() {
-    let cfgs = vec![
-        WatchConfig {
-            path: "/home/user".to_string(),
-            importance: 0.3,
-        },
-        WatchConfig {
-            path: "/home/user/photos".to_string(),
-            importance: 0.9,
-        },
-    ];
-    // /home/user/photos/img.jpg matches both; first match wins (0.3, not 0.9).
-    let result = lookup_importance("/home/user/photos/img.jpg", &cfgs);
-    assert!((result - 0.3).abs() < 1e-9);
-}
-
-#[test]
-fn lookup_importance_path_with_trailing_slash_in_config() {
-    let cfgs = vec![WatchConfig {
-        path: "/home/user/docs/".to_string(),
-        importance: 0.7,
-    }];
-    let result = lookup_importance("/home/user/docs/file.txt", &cfgs);
-    assert!((result - 0.7).abs() < 1e-9);
-}
-
-#[test]
-fn lookup_importance_exact_path_match() {
-    // file_path == wc.path (no trailing content): edge case for bare path match.
-    let cfgs = vec![WatchConfig {
-        path: "/home/user/docs".to_string(),
-        importance: 0.6,
-    }];
-    let result = lookup_importance("/home/user/docs", &cfgs);
-    assert!((result - 0.6).abs() < 1e-9);
-}
-
-#[test]
-fn app_config_watch_loads_from_toml() {
+fn app_config_watch_loads_from_toml_with_legacy_field() {
     let toml_str = r#"
 [[watch]]
 path = "/home/user/photos"
@@ -544,9 +512,25 @@ importance = 0.6
     let app: AppConfig = toml::from_str(toml_str).unwrap();
     assert_eq!(app.watch.len(), 2);
     assert_eq!(app.watch[0].path, "/home/user/photos");
-    assert!((app.watch[0].importance - 0.9).abs() < 1e-9);
+    assert!((app.watch[0].importance_multiplier - 0.9).abs() < 1e-9);
+    assert!(app.watch[0].was_legacy_importance);
     assert_eq!(app.watch[1].path, "/home/user/docs");
-    assert!((app.watch[1].importance - 0.6).abs() < 1e-9);
+    assert!((app.watch[1].importance_multiplier - 0.6).abs() < 1e-9);
+    assert!(app.watch[1].was_legacy_importance);
+}
+
+#[test]
+fn app_config_watch_loads_from_toml_with_canonical_field() {
+    let toml_str = r#"
+[[watch]]
+path = "/home/user/photos"
+importance_multiplier = 0.9
+"#;
+    let app: AppConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(app.watch.len(), 1);
+    assert_eq!(app.watch[0].path, "/home/user/photos");
+    assert!((app.watch[0].importance_multiplier - 0.9).abs() < 1e-9);
+    assert!(!app.watch[0].was_legacy_importance);
 }
 
 #[test]
@@ -556,14 +540,254 @@ fn app_config_watch_defaults_empty() {
 }
 
 #[test]
-fn app_config_watch_missing_importance_uses_default() {
+fn app_config_watch_missing_importance_uses_default_multiplier() {
     let toml_str = r#"
 [[watch]]
 path = "/home/user/videos"
 "#;
     let app: AppConfig = toml::from_str(toml_str).unwrap();
     assert_eq!(app.watch.len(), 1);
-    assert_eq!(app.watch[0].importance, DEFAULT_IMPORTANCE);
+    assert!(
+        (app.watch[0].importance_multiplier - DEFAULT_IMPORTANCE_MULTIPLIER).abs() < 1e-9,
+        "expected {DEFAULT_IMPORTANCE_MULTIPLIER}"
+    );
+    assert!(!app.watch[0].was_legacy_importance);
+}
+
+// ============================================================
+// derive_file_importance tests
+// ============================================================
+
+fn make_watch(path: &str, multiplier: f64, is_media: bool) -> WatchConfig {
+    WatchConfig {
+        path: path.to_string(),
+        importance_multiplier: multiplier,
+        was_legacy_importance: false,
+        classification: Some(FolderClassification { is_media_folder: is_media, importance_multiplier: 1.0 }),
+    }
+}
+
+#[test]
+fn derive_file_importance_returns_one_for_text_file_in_text_folder() {
+    let wc = make_watch("/home/user/docs", 1.0, false);
+    let result = derive_file_importance("/home/user/docs/notes.md", &[wc]);
+    assert!((result - 1.0).abs() < 1e-9, "TextOrCode × 1.0 = 1.0, got {result}");
+}
+
+#[test]
+fn derive_file_importance_returns_bucketed_value_for_media_in_media_folder() {
+    let wc = make_watch("/home/user/Photos", 1.0, true);
+    let result = derive_file_importance("/home/user/Photos/IMG_001.jpg", &[wc]);
+    // Media file in media folder → one of MediaHigh/Medium/Low
+    assert!(
+        result == 0.95 || result == 0.65 || result == 0.20,
+        "expected 0.95, 0.65, or 0.20, got {result}"
+    );
+}
+
+#[test]
+fn derive_file_importance_applies_watch_multiplier() {
+    let wc = make_watch("/home/user/docs", 0.5, false);
+    let result = derive_file_importance("/home/user/docs/budget.txt", &[wc]);
+    // TextOrCode 1.0 × 0.5 = 0.5
+    assert!((result - 0.5).abs() < 1e-9, "TextOrCode × 0.5 = 0.5, got {result}");
+}
+
+#[test]
+fn derive_file_importance_clamps_at_one_when_multiplier_above_one() {
+    let wc = make_watch("/home/user/docs", 2.0, false);
+    let result = derive_file_importance("/home/user/docs/main.rs", &[wc]);
+    // TextOrCode 1.0 × 2.0 = 2.0 → clamped to 1.0
+    assert!((result - 1.0).abs() < 1e-9, "expected clamped to 1.0, got {result}");
+}
+
+#[test]
+fn derive_file_importance_returns_zero_when_multiplier_is_zero() {
+    let wc = make_watch("/home/user/docs", 0.0, false);
+    let result = derive_file_importance("/home/user/docs/main.rs", &[wc]);
+    assert!((result - 0.0).abs() < 1e-9, "expected 0.0, got {result}");
+}
+
+#[test]
+fn derive_file_importance_returns_default_for_path_not_in_any_watch() {
+    let wc = make_watch("/home/user/docs", 0.9, false);
+    let result = derive_file_importance("/home/user/Downloads/file.zip", &[wc]);
+    assert!(
+        (result - DEFAULT_IMPORTANCE).abs() < 1e-9,
+        "expected DEFAULT_IMPORTANCE ({DEFAULT_IMPORTANCE}), got {result}"
+    );
+}
+
+#[test]
+fn derive_file_importance_returns_default_when_no_watch_configs() {
+    let result = derive_file_importance("/home/user/docs/file.txt", &[]);
+    assert_eq!(result, DEFAULT_IMPORTANCE);
+}
+
+#[test]
+fn derive_file_importance_does_not_match_partial_directory_name() {
+    // /home/user/docs should NOT match /home/user/documents/file.txt
+    let wc = make_watch("/home/user/docs", 0.9, false);
+    let result = derive_file_importance("/home/user/documents/file.txt", &[wc]);
+    assert!(
+        (result - DEFAULT_IMPORTANCE).abs() < 1e-9,
+        "expected DEFAULT_IMPORTANCE, got {result}"
+    );
+}
+
+#[test]
+fn derive_file_importance_path_with_trailing_slash_in_config() {
+    let wc = WatchConfig {
+        path: "/home/user/docs/".to_string(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: Some(FolderClassification { is_media_folder: false, importance_multiplier: 1.0 }),
+    };
+    let result = derive_file_importance("/home/user/docs/file.txt", &[wc]);
+    // TextOrCode × 1.0 = 1.0
+    assert!((result - 1.0).abs() < 1e-9, "expected 1.0, got {result}");
+}
+
+#[test]
+fn derive_file_importance_exact_path_match() {
+    // file_path == wc.path: edge case for bare path match.
+    let wc = make_watch("/home/user/docs", 1.0, false);
+    // file_path exactly equals watch path — should return importance for Unknown
+    // (no extension) type = 0.05 * 1.0 = 0.05. Actually "docs" has no extension.
+    // classify_file("/home/user/docs", non-media) → Unknown → 0.05
+    let result = derive_file_importance("/home/user/docs", &[wc]);
+    // Unknown × 1.0 = 0.05 (no extension, not special filename)
+    assert!((result - 0.05).abs() < 1e-9, "expected 0.05 for Unknown, got {result}");
+}
+
+#[test]
+fn derive_file_importance_uses_first_matching_config() {
+    // Two overlapping watches — first match wins
+    let wc1 = make_watch("/home/user", 0.5, false);
+    let wc2 = make_watch("/home/user/photos", 1.0, true);
+    // /home/user/photos/img.jpg matches both; first match (/home/user, 0.5) wins.
+    // classify_file with non-media folder + .jpg → Unknown → 0.05 * 0.5 = 0.025
+    let result = derive_file_importance("/home/user/photos/img.jpg", &[wc1, wc2]);
+    assert!((result - 0.025).abs() < 1e-9, "expected 0.025 (Unknown × 0.5), got {result}");
+}
+
+// ============================================================
+// populate_classification tests
+// ============================================================
+
+#[test]
+fn watch_config_classification_populated_at_watch_start() {
+    let dir = tempfile::TempDir::new().unwrap();
+    for i in 0..10 {
+        std::fs::write(dir.path().join(format!("photo{i}.jpg")), b"data").unwrap();
+    }
+    let mut wc = WatchConfig {
+        path: dir.path().to_string_lossy().into_owned(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+    };
+    wc.populate_classification();
+    assert!(wc.classification.is_some(), "classification should be set");
+    assert!(
+        wc.classification.as_ref().unwrap().is_media_folder,
+        "10/10 media files → is_media_folder = true"
+    );
+}
+
+#[test]
+fn watch_config_empty_folder_classification_defaults_to_non_media() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut wc = WatchConfig {
+        path: dir.path().to_string_lossy().into_owned(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+    };
+    wc.populate_classification();
+    assert_eq!(
+        wc.classification,
+        Some(FolderClassification { is_media_folder: false, importance_multiplier: 1.0 })
+    );
+}
+
+#[test]
+fn populate_classification_samples_up_to_200_paths() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Write 300 .txt files
+    for i in 0..300 {
+        std::fs::write(dir.path().join(format!("file{i:03}.txt")), b"content").unwrap();
+    }
+    let mut wc = WatchConfig {
+        path: dir.path().to_string_lossy().into_owned(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+    };
+    wc.populate_classification();
+    assert!(wc.classification.is_some());
+    // 300 text files → non-media
+    assert!(!wc.classification.as_ref().unwrap().is_media_folder);
+}
+
+#[test]
+fn populate_classification_cap_stops_at_cap_boundary() {
+    // Use a small cap. Create 5 txt + 5 jpg (alphabetically: jpg comes before txt).
+    // With cap=5 we expect to sample 5 files. Which ones depend on FS order.
+    // We can't predict the outcome precisely without knowing the OS order,
+    // but we can verify: result is_some and classification is set.
+    let dir = tempfile::TempDir::new().unwrap();
+    for i in 0..5 {
+        std::fs::write(dir.path().join(format!("a{i}.jpg")), b"fake").unwrap();
+        std::fs::write(dir.path().join(format!("z{i}.txt")), b"text").unwrap();
+    }
+    let mut wc = WatchConfig {
+        path: dir.path().to_string_lossy().into_owned(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+    };
+    wc.populate_classification_with_cap(5);
+    assert!(wc.classification.is_some(), "classification should be set with small cap");
+}
+
+#[cfg(unix)]
+#[test]
+fn populate_classification_excludes_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    // Create a real .jpg file.
+    std::fs::write(dir.path().join("real.jpg"), b"jpeg").unwrap();
+    // Create a subdirectory and symlink it back to the parent (would loop).
+    let subdir = dir.path().join("subdir");
+    std::fs::create_dir(&subdir).unwrap();
+    symlink(dir.path(), subdir.join("loop_link")).unwrap();
+
+    let mut wc = WatchConfig {
+        path: dir.path().to_string_lossy().into_owned(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+    };
+    // Should complete without infinite loop.
+    wc.populate_classification();
+    assert!(wc.classification.is_some());
+}
+
+#[test]
+fn populate_classification_missing_directory_sets_default() {
+    let mut wc = WatchConfig {
+        path: "/nonexistent/path/that/does/not/exist".to_string(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+    };
+    wc.populate_classification();
+    assert_eq!(
+        wc.classification,
+        Some(FolderClassification::default())
+    );
 }
 
 #[test]

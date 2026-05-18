@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use syncback_core::config::{expand_watch_path, WatchConfig, DEFAULT_IMPORTANCE};
+use syncback_core::config::{expand_watch_path, WatchConfig, DEFAULT_IMPORTANCE_MULTIPLIER};
 use syncback_core::db::Db;
 use syncback_core::types::{FileId, LocalState, PlacementStatus, Timestamp};
 use tokio::sync::mpsc;
@@ -112,7 +112,9 @@ impl WatchEntryState {
 pub struct WatchEntry {
     /// Absolute expanded path (tilde resolved).
     pub path: String,
-    /// Importance [0.0, 1.0].
+    /// Importance multiplier [0.0, 2.0] from the watch config.
+    /// The JSON API field is named `importance` for backward compatibility.
+    /// The TOML config file uses `importance_multiplier` as the canonical key.
     pub importance: f64,
     /// "idle" | "scanning" | "working" | "error" — derived from WatcherStatusSignal + rollup.
     pub status: WatchStatus,
@@ -149,7 +151,7 @@ pub struct AddWatchRequest {
 }
 
 fn default_importance_fn() -> f64 {
-    DEFAULT_IMPORTANCE
+    DEFAULT_IMPORTANCE_MULTIPLIER
 }
 
 /// Request body for PATCH /api/watches/{path_b64}.
@@ -389,10 +391,14 @@ impl WatchAdmin {
         }
 
         // Build the new config entry.
-        let new_wc = WatchConfig {
+        let mut new_wc = WatchConfig {
             path: expanded.to_string_lossy().into_owned(),
-            importance: req.importance,
+            importance_multiplier: req.importance,
+            was_legacy_importance: false,
+            classification: None,
         };
+        // Classify the folder synchronously (capped at CLASSIFY_SCAN_CAP paths, < 10ms typical).
+        new_wc.populate_classification();
 
         // Step 4: save_watches atomically (write config first).
         {
@@ -447,7 +453,7 @@ impl WatchAdmin {
             }
         }
 
-        // Build new list with updated importance.
+        // Build new list with updated multiplier, preserving classification.
         let new_list = {
             let cfgs = self.live_configs.read().expect("live_configs lock poisoned");
             cfgs.iter()
@@ -455,7 +461,9 @@ impl WatchAdmin {
                     if expand_watch_path(&wc.path) == path {
                         WatchConfig {
                             path: wc.path.clone(),
-                            importance: req.importance,
+                            importance_multiplier: req.importance,
+                            was_legacy_importance: false,
+                            classification: wc.classification.clone(), // preserve existing classification
                         }
                     } else {
                         wc.clone()
@@ -563,7 +571,7 @@ impl WatchAdmin {
         cfgs.iter()
             .map(|wc| {
                 let path = expand_watch_path(&wc.path);
-                self.build_watch_entry(&path, wc.importance)
+                self.build_watch_entry(&path, wc.importance_multiplier)
             })
             .collect()
     }
@@ -574,7 +582,7 @@ impl WatchAdmin {
         let cfgs = self.live_configs.read().expect("live_configs lock poisoned");
         for wc in cfgs.iter() {
             if expand_watch_path(&wc.path) == path {
-                return Ok(self.build_watch_entry(&path, wc.importance));
+                return Ok(self.build_watch_entry(&path, wc.importance_multiplier));
             }
         }
         Err(WatchAdminError::NotFound(path.to_string_lossy().into_owned()))
@@ -735,7 +743,7 @@ pub fn save_watches(
         for wc in configs {
             let mut t = toml_edit::Table::new();
             t.insert("path", toml_edit::value(wc.path.as_str()));
-            t.insert("importance", toml_edit::value(wc.importance));
+            t.insert("importance_multiplier", toml_edit::value(wc.importance_multiplier));
             aot.push(t);
         }
         doc.insert("watch", toml_edit::Item::ArrayOfTables(aot));

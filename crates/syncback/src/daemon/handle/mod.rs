@@ -383,10 +383,33 @@ impl DaemonHandle {
             }) {
                 initial_watch_configs.push(syncback_core::config::WatchConfig {
                     path: dir_str,
-                    importance: syncback_core::config::DEFAULT_IMPORTANCE,
+                    importance_multiplier: syncback_core::config::DEFAULT_IMPORTANCE_MULTIPLIER,
+                    was_legacy_importance: false,
+                    classification: None,
                 });
             }
         }
+
+        // Compute FolderClassification for each configured watch directory.
+        // This is a one-time synchronous scan (capped at CLASSIFY_SCAN_CAP paths).
+        // Must run BEFORE live_configs is published to BackupCoordinator.
+        for wc in &mut initial_watch_configs {
+            wc.populate_classification();
+        }
+        // Emit legacy field deprecation warnings once per legacy watch entry.
+        for wc in &initial_watch_configs {
+            if wc.was_legacy_importance {
+                let expanded = syncback_core::config::expand_watch_path(&wc.path);
+                tracing::warn!(
+                    target: "config",
+                    "watch[{}].importance is deprecated; field now interpreted as \
+                     importance_multiplier (range [0, 2], default 1.0). If you intended \
+                     this as a multiplier no action needed; otherwise update your config.",
+                    expanded.display()
+                );
+            }
+        }
+
         let live_configs: Arc<RwLock<Vec<syncback_core::config::WatchConfig>>> =
             Arc::new(RwLock::new(initial_watch_configs.clone()));
 

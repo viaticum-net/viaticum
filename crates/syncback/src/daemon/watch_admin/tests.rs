@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-use syncback_core::config::{WatchConfig, DEFAULT_IMPORTANCE};
+use syncback_core::config::{WatchConfig, DEFAULT_IMPORTANCE, DEFAULT_IMPORTANCE_MULTIPLIER};
 use syncback_core::db::Db;
 use syncback_core::types::{
     DeviceId, FileId, FileRecord, FileVersion, LocalState, PlacementStatus, SourceBlockId,
@@ -106,7 +106,9 @@ fn list_watches_returns_configured_entries_with_correct_path_and_importance() {
     let watch_dir = TempDir::new().unwrap();
     let configs = vec![WatchConfig {
         path: watch_dir.path().to_string_lossy().into_owned(),
-        importance: 0.7,
+        importance_multiplier: 0.7,
+        was_legacy_importance: false,
+        classification: None,
     }];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
 
@@ -120,8 +122,10 @@ fn list_watches_returns_configured_entries_with_correct_path_and_importance() {
 
 #[test]
 fn get_watches_defaults_returns_default_importance() {
-    // DEFAULT_IMPORTANCE is 0.5 per config module.
+    // DEFAULT_IMPORTANCE is 0.5 (fallback for unmatched paths).
     assert!((DEFAULT_IMPORTANCE - 0.5).abs() < 1e-9);
+    // DEFAULT_IMPORTANCE_MULTIPLIER is 1.0 (per-folder default).
+    assert!((DEFAULT_IMPORTANCE_MULTIPLIER - 1.0).abs() < 1e-9);
 }
 
 // ─── add_watch tests ──────────────────────────────────────────────────────────
@@ -219,7 +223,9 @@ async fn add_watch_fails_with_nested_when_path_is_child_of_existing_watch() {
 
     let existing = WatchConfig {
         path: parent_dir.path().to_string_lossy().into_owned(),
-        importance: 0.5,
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: None,
     };
     let (admin, _rx) = make_watch_admin_with_config(config_path, vec![existing], db);
 
@@ -250,7 +256,9 @@ async fn add_watch_fails_with_nested_when_existing_watch_is_child_of_new_path() 
 
     let existing = WatchConfig {
         path: child_path.to_string_lossy().into_owned(),
-        importance: 0.5,
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: None,
     };
     let (admin, _rx) = make_watch_admin_with_config(config_path, vec![existing], db);
 
@@ -280,7 +288,9 @@ async fn patch_watch_updates_importance_in_live_configs_and_toml() {
 
     let existing = WatchConfig {
         path: watch_dir.path().to_string_lossy().into_owned(),
-        importance: 0.5,
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: None,
     };
     // Write initial config.
     save_watches(&config_path, &[existing.clone()]).unwrap();
@@ -302,7 +312,7 @@ async fn patch_watch_updates_importance_in_live_configs_and_toml() {
     // Check live_configs.
     let cfgs = admin.live_configs.read().unwrap();
     assert_eq!(cfgs.len(), 1);
-    assert!((cfgs[0].importance - 0.9).abs() < 1e-9);
+    assert!((cfgs[0].importance_multiplier - 0.9).abs() < 1e-9);
 
     // Check config file.
     let written = std::fs::read_to_string(&config_path).unwrap();
@@ -340,7 +350,9 @@ async fn remove_watch_without_purge_removes_from_live_configs_and_toml() {
 
     let existing = WatchConfig {
         path: watch_dir.path().to_string_lossy().into_owned(),
-        importance: 0.5,
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: None,
     };
     save_watches(&config_path, &[existing.clone()]).unwrap();
 
@@ -378,7 +390,9 @@ async fn remove_watch_without_purge_does_not_touch_file_records() {
 
     let existing = WatchConfig {
         path: watch_dir.path().to_string_lossy().into_owned(),
-        importance: 0.5,
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: None,
     };
     save_watches(&config_path, &[existing.clone()]).unwrap();
 
@@ -414,7 +428,9 @@ async fn remove_watch_with_purge_marks_all_file_records_deleted() {
 
     let existing = WatchConfig {
         path: watch_dir.path().to_string_lossy().into_owned(),
-        importance: 0.5,
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: None,
     };
     save_watches(&config_path, &[existing.clone()]).unwrap();
 
@@ -467,7 +483,9 @@ async fn remove_watch_with_purge_marks_all_devices_deleted_for_each_file() {
 
     let existing = WatchConfig {
         path: watch_dir.path().to_string_lossy().into_owned(),
-        importance: 0.5,
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: None,
     };
     save_watches(&config_path, &[existing.clone()]).unwrap();
 
@@ -522,7 +540,9 @@ fn compute_rollup_counts_backed_up_files_correctly() {
 
     let configs = vec![WatchConfig {
         path: prefix,
-        importance: 0.5,
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: None,
     }];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
     admin.recompute_all_rollups().unwrap();
@@ -545,7 +565,12 @@ fn compute_rollup_counts_at_risk_when_any_placement_is_uncertain() {
     db.upsert_file(&record).unwrap();
     db.upsert_placement(&make_placement(1, 1, PlacementStatus::Uncertain)).unwrap();
 
-    let configs = vec![WatchConfig { path: prefix, importance: 0.5 }];
+    let configs = vec![WatchConfig {
+        path: prefix,
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: None,
+    }];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
     admin.recompute_all_rollups().unwrap();
 
@@ -570,7 +595,12 @@ fn compute_rollup_counts_lost_when_all_placements_are_lost() {
     // Second placement uses a different holder_id so it doesn't overwrite the first.
     // Actually they share the same source_block_id prefix — let me use distinct block IDs.
 
-    let configs = vec![WatchConfig { path: prefix, importance: 0.5 }];
+    let configs = vec![WatchConfig {
+        path: prefix,
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: None,
+    }];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
     admin.recompute_all_rollups().unwrap();
 
@@ -642,7 +672,9 @@ fn save_watches_preserves_existing_toml_sections_and_comments() {
     let watch_dir = TempDir::new().unwrap();
     let configs = vec![WatchConfig {
         path: watch_dir.path().to_string_lossy().into_owned(),
-        importance: 0.5,
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: None,
     }];
 
     save_watches(&config_path, &configs).unwrap();
@@ -664,6 +696,83 @@ fn save_watches_removes_watch_section_when_configs_empty() {
     let written = std::fs::read_to_string(&config_path).unwrap();
     assert!(!written.contains("[[watch]]"), "watch section should be removed");
     assert!(!written.contains("/tmp/old"), "old path should be gone");
+}
+
+// ─── save_watches writes importance_multiplier key ───────────────────────────
+
+#[test]
+fn save_watches_writes_importance_multiplier_key() {
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    let watch_dir = TempDir::new().unwrap();
+
+    let configs = vec![WatchConfig {
+        path: watch_dir.path().to_string_lossy().into_owned(),
+        importance_multiplier: 0.8,
+        was_legacy_importance: false,
+        classification: None,
+    }];
+    save_watches(&config_path, &configs).unwrap();
+
+    let written = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        written.contains("importance_multiplier"),
+        "save_watches must write canonical key, got: {written}"
+    );
+    assert!(
+        !written.contains("was_legacy_importance"),
+        "skip field must not be written"
+    );
+
+    // Round-trip: load full config from disk → assert no legacy flag fires.
+    // Catches regression where save_watches writes the legacy "importance" key.
+    let reloaded_app = syncback_core::config::AppConfig::load(&config_path).unwrap();
+    let reloaded = &reloaded_app.watch[0];
+    assert!(
+        !reloaded.was_legacy_importance,
+        "saved config must load without triggering legacy flag"
+    );
+    assert!(
+        (reloaded.importance_multiplier - 0.8).abs() < 1e-9,
+        "multiplier should round-trip exactly, got {}",
+        reloaded.importance_multiplier
+    );
+}
+
+// ─── patch_watch preserves classification ────────────────────────────────────
+
+#[tokio::test]
+async fn patch_watch_preserves_classification_when_changing_multiplier() {
+    use syncback_core::importance::FolderClassification;
+
+    let tmp = TempDir::new().unwrap();
+    let db = test_db();
+    let config_path = tmp.path().join("config.toml");
+    let watch_dir = TempDir::new().unwrap();
+
+    let existing = WatchConfig {
+        path: watch_dir.path().to_string_lossy().into_owned(),
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: Some(FolderClassification { is_media_folder: true, importance_multiplier: 1.0 }),
+    };
+    save_watches(&config_path, std::slice::from_ref(&existing)).unwrap();
+
+    let (admin, _rx) = make_watch_admin_with_config(config_path.clone(), vec![existing], db);
+
+    let path_b64 = encode_path_b64(watch_dir.path());
+    admin.patch_watch(&path_b64, PatchWatchRequest { importance: 0.9 }).await.unwrap();
+
+    let cfgs = admin.live_configs.read().unwrap();
+    assert_eq!(cfgs.len(), 1);
+    assert!(
+        cfgs[0].classification.as_ref().map(|c| c.is_media_folder).unwrap_or(false),
+        "classification should be preserved after patch"
+    );
+    assert!(
+        (cfgs[0].importance_multiplier - 0.9).abs() < 1e-9,
+        "multiplier should be updated"
+    );
 }
 
 // ─── path encoding tests ─────────────────────────────────────────────────────
@@ -699,8 +808,8 @@ fn recompute_all_rollups_single_scan_populates_all_watches() {
     db.upsert_file(&make_file_record(2, &format!("{}/b.txt", dir2.path().display()), 10, 64, false)).unwrap();
 
     let configs = vec![
-        WatchConfig { path: dir1.path().to_string_lossy().into_owned(), importance: 0.5 },
-        WatchConfig { path: dir2.path().to_string_lossy().into_owned(), importance: 0.5 },
+        WatchConfig { path: dir1.path().to_string_lossy().into_owned(), importance_multiplier: 0.5, was_legacy_importance: false, classification: None },
+        WatchConfig { path: dir2.path().to_string_lossy().into_owned(), importance_multiplier: 0.5, was_legacy_importance: false, classification: None },
     ];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
     admin.recompute_all_rollups().unwrap();
@@ -727,7 +836,9 @@ fn get_watches_reads_cached_rollup_without_db_scan() {
 
     let configs = vec![WatchConfig {
         path: watch_dir.path().to_string_lossy().into_owned(),
-        importance: 0.5,
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: None,
     }];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
 
@@ -769,7 +880,7 @@ fn post_refresh_triggers_recompute_and_updates_computed_at() {
 
     db.upsert_file(&make_file_record(1, &format!("{}/a.txt", prefix), 10, 64, true)).unwrap();
 
-    let configs = vec![WatchConfig { path: prefix, importance: 0.5 }];
+    let configs = vec![WatchConfig { path: prefix, importance_multiplier: 0.5, was_legacy_importance: false, classification: None }];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
 
     // First recompute.

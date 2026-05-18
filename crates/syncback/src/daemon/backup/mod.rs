@@ -111,7 +111,7 @@ pub struct BackupConfig {
     /// When None: symbols are encoded and written to disk but not delivered.
     pub swarm: Option<std::sync::Arc<crate::daemon::network::swarm::SwarmHandle>>,
     /// Live watch configs shared with WatchAdmin.
-    /// When Some: lookup_importance uses this instead of watch_configs.
+    /// When Some: derive_file_importance uses this instead of watch_configs.
     /// When None: falls back to watch_configs (static copy for backward compat).
     pub live_watch_configs: Option<Arc<RwLock<Vec<WatchConfig>>>>,
     /// Per-peer rejection backoff. Holders that recently rejected an offer

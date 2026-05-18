@@ -1058,7 +1058,12 @@ fn watch_config_importance_applied_to_queued_file() {
 
     let watch_cfgs = vec![syncback_core::config::WatchConfig {
         path: files_dir.path().to_string_lossy().into_owned(),
-        importance: 0.9,
+        importance_multiplier: 0.9,
+        was_legacy_importance: false,
+        classification: Some(syncback_core::importance::FolderClassification {
+            is_media_folder: false,
+            importance_multiplier: 1.0,
+        }),
     }];
     let mut coord = coord_with_watch(db, &symbols_dir, watch_cfgs);
 
@@ -1067,12 +1072,12 @@ fn watch_config_importance_applied_to_queued_file() {
 
     coord.process_event(added_event(&path)).unwrap();
 
-    // File should be queued (it's small) with importance 0.9.
+    // File should be queued (it's small). report.txt → TextOrCode × 0.9 = 0.9.
     let queued: Vec<_> = coord.queues.values().flat_map(|q| q.iter()).collect();
     assert_eq!(queued.len(), 1, "exactly one file should be queued");
     assert!(
         (queued[0].importance - 0.9).abs() < 1e-9,
-        "importance should be 0.9 from watch config, got {}",
+        "importance should be 0.9 (TextOrCode × 0.9), got {}",
         queued[0].importance
     );
 }
@@ -1087,7 +1092,9 @@ fn watch_config_default_importance_used_when_no_match() {
     // Watch config points to a different directory.
     let watch_cfgs = vec![syncback_core::config::WatchConfig {
         path: "/nonexistent/other/dir".to_string(),
-        importance: 0.9,
+        importance_multiplier: 0.9,
+        was_legacy_importance: false,
+        classification: None,
     }];
     let mut coord = coord_with_watch(db, &symbols_dir, watch_cfgs);
 
@@ -1125,6 +1132,106 @@ fn watch_config_empty_uses_default_importance() {
         (queued[0].importance - 0.5).abs() < 1e-9,
         "importance should default to 0.5 when watch_configs is empty, got {}",
         queued[0].importance
+    );
+}
+
+// ─── Phase 7.9 Wave 6: derive_file_importance integration ───────────────────
+
+#[test]
+fn derive_file_importance_integration_photo_and_text_files_in_correct_order() {
+    use syncback_core::config::WatchConfig;
+
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let media_dir = TempDir::new().unwrap();
+    let text_dir = TempDir::new().unwrap();
+
+    // Write .jpg files into media_dir so it classifies as a media folder.
+    for i in 0..10 {
+        std::fs::write(media_dir.path().join(format!("photo{i}.jpg")), b"fake jpeg").unwrap();
+    }
+    // Write .txt files into text_dir.
+    for i in 0..5 {
+        std::fs::write(text_dir.path().join(format!("doc{i}.txt")), b"text content").unwrap();
+    }
+
+    // Build WatchConfigs with classification pre-populated via populate_classification.
+    let mut wc_media = WatchConfig {
+        path: media_dir.path().to_string_lossy().into_owned(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+    };
+    wc_media.populate_classification();
+
+    let mut wc_text = WatchConfig {
+        path: text_dir.path().to_string_lossy().into_owned(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+    };
+    wc_text.populate_classification();
+
+    assert!(
+        wc_text.classification.as_ref().map(|c| !c.is_media_folder).unwrap_or(false),
+        "text folder should classify as non-media"
+    );
+    assert!(
+        wc_media.classification.as_ref().map(|c| c.is_media_folder).unwrap_or(false),
+        "media folder should classify as media"
+    );
+
+    let mut coord = coord_with_watch(
+        db,
+        &symbols_dir,
+        vec![wc_text.clone(), wc_media.clone()],
+    );
+
+    // Enqueue a text file.
+    let txt_path_buf = text_dir.path().join("notes.txt");
+    std::fs::write(&txt_path_buf, b"important doc content here xyz").unwrap();
+    let txt_path_str = txt_path_buf.to_string_lossy().into_owned();
+    let txt_event = syncback_core::types::DeviceId([1u8; 32]);
+    coord.process_event(super::DirtyEvent {
+        path: txt_path_str.clone(),
+        kind: super::DirtyKind::Added,
+        device_id: txt_event,
+    }).unwrap();
+
+    // Enqueue a media file.
+    let jpg_path_buf = media_dir.path().join("photo.jpg");
+    std::fs::write(&jpg_path_buf, b"fake jpeg content for testing purposes").unwrap();
+    let jpg_path_str = jpg_path_buf.to_string_lossy().into_owned();
+    coord.process_event(super::DirtyEvent {
+        path: jpg_path_str.clone(),
+        kind: super::DirtyKind::Added,
+        device_id: syncback_core::types::DeviceId([1u8; 32]),
+    }).unwrap();
+
+    let queued: Vec<_> = coord.queues.values().flat_map(|q| q.iter()).cloned().collect();
+    let txt = queued.iter().find(|f| f.path.ends_with(".txt")).expect("txt file should be queued");
+    let jpg = queued.iter().find(|f| f.path.ends_with("photo.jpg")).expect("jpg file should be queued");
+
+    // text file in text folder → TextOrCode × 1.0 = 1.0
+    assert!(
+        (txt.importance - 1.0).abs() < 1e-9,
+        "text file importance should be 1.0, got {}",
+        txt.importance
+    );
+
+    // jpg in media folder → one of MediaHigh/Medium/Low
+    assert!(
+        jpg.importance == 0.95 || jpg.importance == 0.65 || jpg.importance == 0.20,
+        "jpg importance should be 0.95/0.65/0.20, got {}",
+        jpg.importance
+    );
+
+    // text file must have strictly higher importance than jpg (since MediaHigh=0.95 < TextOrCode=1.0)
+    assert!(
+        txt.importance > jpg.importance,
+        "text ({}) should have higher importance than jpg ({})",
+        txt.importance,
+        jpg.importance
     );
 }
 
