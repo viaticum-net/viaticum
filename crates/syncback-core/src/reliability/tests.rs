@@ -1,9 +1,11 @@
 use super::{
     binomial_survival, block_reliability, build_report, commitment_to_survival_prob,
-    file_reliability, per_holder_impact, BlockReliabilityInput, HolderReliabilityInput,
+    file_reliability, per_holder_impact, solve_n_for_target, target_reliability,
+    weighted_mean_trust, BlockReliabilityInput, HolderCandidate, HolderReliabilityInput,
     ReliabilityError,
 };
 use crate::commitment::CommitmentScore;
+use crate::constants::{MAX_OVERHEAD_FACTOR, MIN_REDUNDANCY};
 use crate::types::{DeviceId, SourceBlockId};
 
 // ============================================================
@@ -666,4 +668,393 @@ fn binomial_survival_k_greater_than_n_returns_zero() {
             );
         }
     }
+}
+
+// ============================================================
+// Wave 3 helpers
+// ============================================================
+
+fn candidate(survival_prob: f64) -> HolderCandidate {
+    HolderCandidate { survival_prob }
+}
+
+fn pool(probs: &[f64]) -> Vec<HolderCandidate> {
+    probs.iter().copied().map(candidate).collect()
+}
+
+// ============================================================
+// Tests: target_reliability — formula correctness
+// ============================================================
+
+#[test]
+fn target_reliability_at_importance_zero_returns_half() {
+    let result = target_reliability(0.0);
+    let expected = 1.0 - 10f64.powf(-0.3);
+    assert!(
+        (result - expected).abs() < 1e-9,
+        "target_reliability(0.0) = {result}, expected {expected}"
+    );
+    assert!(
+        (result - 0.499).abs() < 0.001,
+        "target_reliability(0.0) = {result}, expected ~0.499"
+    );
+}
+
+#[test]
+fn target_reliability_at_importance_one_returns_five_nines() {
+    let result = target_reliability(1.0);
+    let expected = 1.0 - 1e-5;
+    assert!(
+        (result - expected).abs() < 1e-9,
+        "target_reliability(1.0) = {result}, expected {expected}"
+    );
+}
+
+#[test]
+fn target_reliability_known_anchors() {
+    // Tolerances account for rounding in the anchor table (values shown to 2 sig figs).
+    // Formula: 1 - 10^(-(0.3 + imp * 4.7)).
+    // imp=0.05: exact=0.7083, table≈0.71 (rounded to 2dp), tol=0.002
+    // imp=0.20: exact=0.9425, table≈0.94 (rounded to 2dp), tol=0.003
+    // imp=0.65: exact=0.99956, table≈0.9996, tol=0.0001
+    // imp=0.95: exact=0.999983, table≈0.99998, tol=0.00001
+    // imp=1.00: exact=0.99999, table=0.99999, tol=1e-9
+    let cases: &[(f64, f64, f64)] = &[
+        (0.05, 0.71, 0.002),
+        (0.20, 0.94, 0.003),
+        (0.65, 0.9996, 0.0001),
+        (0.95, 0.99998, 0.00001),
+        (1.00, 0.99999, 1e-9),
+    ];
+    for &(imp, expected, tol) in cases {
+        let got = target_reliability(imp);
+        assert!(
+            (got - expected).abs() <= tol,
+            "target_reliability({imp}) = {got}, expected {expected} ±{tol}"
+        );
+    }
+}
+
+#[test]
+fn target_reliability_monotonic_in_importance() {
+    let mut prev = target_reliability(0.0);
+    let steps = 100;
+    for i in 1..=steps {
+        let imp = i as f64 / steps as f64;
+        let curr = target_reliability(imp);
+        assert!(
+            curr >= prev - 1e-12,
+            "target_reliability not monotone: imp={imp:.2} gives {curr} < prev {prev}"
+        );
+        prev = curr;
+    }
+}
+
+#[test]
+fn target_reliability_clamps_below_zero_input() {
+    let below = target_reliability(-0.5);
+    let at_zero = target_reliability(0.0);
+    assert!(
+        (below - at_zero).abs() < 1e-9,
+        "target_reliability(-0.5) = {below}, expected same as target_reliability(0.0) = {at_zero}"
+    );
+}
+
+#[test]
+fn target_reliability_clamps_above_one_input() {
+    let above = target_reliability(1.5);
+    let at_one = target_reliability(1.0);
+    assert!(
+        (above - at_one).abs() < 1e-9,
+        "target_reliability(1.5) = {above}, expected same as target_reliability(1.0) = {at_one}"
+    );
+}
+
+#[test]
+fn target_reliability_output_always_in_zero_one() {
+    for imp in [-1.0_f64, -0.1, 0.0, 0.5, 1.0, 1.5, 2.0] {
+        let result = target_reliability(imp);
+        assert!(
+            result >= 0.0 && result <= 1.0,
+            "target_reliability({imp}) = {result} — out of [0, 1]"
+        );
+    }
+}
+
+// ============================================================
+// Tests: weighted_mean_trust
+// ============================================================
+
+#[test]
+fn weighted_mean_trust_equal_weights_single_holder() {
+    let p = pool(&[0.75]);
+    let result = weighted_mean_trust(&p).unwrap();
+    assert!(
+        (result - 0.75).abs() < 1e-9,
+        "expected 0.75, got {result}"
+    );
+}
+
+#[test]
+fn weighted_mean_trust_equal_weights_multiple_holders() {
+    // (0.9 + 0.5 + 0.7 + 0.8) / 4 = 2.9 / 4 = 0.725
+    // A symbol-weighted mean (if holders had symbol counts 10, 1, 1, 1) would give 0.877.
+    // Equal-weight must produce 0.725, not 0.877.
+    let p = pool(&[0.9, 0.5, 0.7, 0.8]);
+    let result = weighted_mean_trust(&p).unwrap();
+    assert!(
+        (result - 0.725).abs() < 1e-9,
+        "expected 0.725 (equal-weight), got {result}"
+    );
+}
+
+#[test]
+fn weighted_mean_trust_empty_holders_returns_error() {
+    let result = weighted_mean_trust(&[]);
+    assert!(
+        matches!(result, Err(ReliabilityError::EmptyHolderSlice)),
+        "expected EmptyHolderSlice, got {result:?}"
+    );
+}
+
+#[test]
+fn weighted_mean_trust_invalid_survival_prob_returns_error() {
+    let p = pool(&[1.5]);
+    let result = weighted_mean_trust(&p);
+    assert!(
+        matches!(result, Err(ReliabilityError::InvalidSurvivalProb(v)) if (v - 1.5).abs() < 1e-9),
+        "expected InvalidSurvivalProb(1.5), got {result:?}"
+    );
+}
+
+#[test]
+fn weighted_mean_trust_all_zero_survival() {
+    let p = pool(&[0.0, 0.0, 0.0]);
+    let result = weighted_mean_trust(&p).unwrap();
+    assert!(
+        (result - 0.0).abs() < 1e-9,
+        "expected 0.0, got {result}"
+    );
+}
+
+#[test]
+fn weighted_mean_trust_all_full_survival() {
+    let p = pool(&[1.0, 1.0, 1.0, 1.0]);
+    let result = weighted_mean_trust(&p).unwrap();
+    assert!(
+        (result - 1.0).abs() < 1e-9,
+        "expected 1.0, got {result}"
+    );
+}
+
+// ============================================================
+// Tests: solve_n_for_target — bounds and floor
+// ============================================================
+
+#[test]
+fn solve_n_for_target_min_redundancy_floor() {
+    // k_eff=10, all survival_prob=1.0, target_p=0.0
+    // Even with trivially satisfied target, floor = 10 + 2 = 12
+    let k_eff = 10u32;
+    let p = pool(&[1.0, 1.0, 1.0, 1.0]);
+    let result = solve_n_for_target(k_eff, &p, 0.0).unwrap();
+    assert_eq!(result, k_eff + MIN_REDUNDANCY, "expected floor n={}", k_eff + MIN_REDUNDANCY);
+}
+
+#[test]
+fn solve_n_for_target_respects_max_overhead_factor() {
+    // k_eff=5, all dead pool, target=0.99 — unachievable
+    // Must return k_eff * MAX_OVERHEAD_FACTOR = 50, never more
+    let k_eff = 5u32;
+    let max_n = k_eff * MAX_OVERHEAD_FACTOR;
+    let dead = pool(&[0.0, 0.0, 0.0]);
+    let result = solve_n_for_target(k_eff, &dead, 0.99).unwrap();
+    assert_eq!(result, max_n, "expected max_n={max_n}, got {result}");
+}
+
+#[test]
+fn solve_n_for_target_min_redundancy_never_below_floor_on_easy_target() {
+    // k_eff=8, high-trust pool, easy target → must return exactly 10 (floor)
+    let k_eff = 8u32;
+    let floor = k_eff + MIN_REDUNDANCY;
+    let high_trust = pool(&[0.99, 0.99, 0.99, 0.99, 0.99, 0.99]);
+    let n = solve_n_for_target(k_eff, &high_trust, 0.01).unwrap();
+    assert!(n >= floor, "n={n} is below floor={floor}");
+    assert_eq!(n, floor, "expected n=floor={floor} for trivially easy target, got n={n}");
+}
+
+// ============================================================
+// Tests: solve_n_for_target — minimum overhead selection
+// ============================================================
+
+#[test]
+fn solve_n_for_target_picks_min_overhead_for_target() {
+    let k_eff = 5u32;
+    let pool_v = pool(&[0.82, 0.82, 0.82, 0.82, 0.82, 0.82, 0.82, 0.82]);
+    let target_p = 0.94;
+    let n = solve_n_for_target(k_eff, &pool_v, target_p).unwrap();
+    let mean_p = 0.82;
+
+    assert!(n >= k_eff + MIN_REDUNDANCY, "n={n} below floor {}", k_eff + MIN_REDUNDANCY);
+    assert!(
+        binomial_survival(n, k_eff, mean_p).unwrap() >= target_p,
+        "n={n} does not satisfy target_p={target_p}"
+    );
+    if n > k_eff + MIN_REDUNDANCY {
+        assert!(
+            binomial_survival(n - 1, k_eff, mean_p).unwrap() < target_p,
+            "n-1={} also satisfies target_p — n={n} is not minimal",
+            n - 1
+        );
+    }
+}
+
+// ============================================================
+// Tests: solve_n_for_target — pool quality effects
+// ============================================================
+
+#[test]
+fn solve_n_for_target_grows_n_when_pool_is_weak() {
+    let k_eff = 5u32;
+    let target_p = 0.99999;
+    let strong = pool(&[0.85, 0.85, 0.85, 0.85, 0.85, 0.85, 0.85, 0.85]);
+    let weak = pool(&[0.40, 0.40, 0.40, 0.40, 0.40, 0.40, 0.40, 0.40]);
+    let n_strong = solve_n_for_target(k_eff, &strong, target_p).unwrap();
+    let n_weak = solve_n_for_target(k_eff, &weak, target_p).unwrap();
+    assert!(
+        n_weak >= n_strong,
+        "weaker pool should need >= n: n_weak={n_weak}, n_strong={n_strong}"
+    );
+}
+
+#[test]
+fn solve_n_for_target_returns_max_when_target_unachievable() {
+    let k_eff = 5u32;
+    let max_n = k_eff * MAX_OVERHEAD_FACTOR;
+    let dead_pool = pool(&[0.05, 0.05, 0.05]);
+    let result = solve_n_for_target(k_eff, &dead_pool, 0.99).unwrap();
+    assert_eq!(result, max_n, "expected max_n={max_n}, got {result}");
+}
+
+// ============================================================
+// Tests: solve_n_for_target — error cases
+// ============================================================
+
+#[test]
+fn solve_n_for_target_empty_holders_errors() {
+    let result = solve_n_for_target(5, &[], 0.9);
+    assert!(
+        matches!(result, Err(ReliabilityError::EmptyHolderSlice)),
+        "expected EmptyHolderSlice, got {result:?}"
+    );
+}
+
+#[test]
+fn solve_n_for_target_zero_k_eff_errors() {
+    let p = pool(&[0.8]);
+    let result = solve_n_for_target(0, &p, 0.9);
+    assert!(
+        matches!(result, Err(ReliabilityError::InvalidKEff(0))),
+        "expected InvalidKEff(0), got {result:?}"
+    );
+}
+
+#[test]
+fn solve_n_for_target_invalid_survival_prob_errors() {
+    let bad = pool(&[1.5]);
+    let result = solve_n_for_target(5, &bad, 0.9);
+    assert!(
+        matches!(result, Err(ReliabilityError::InvalidSurvivalProb(v)) if (v - 1.5).abs() < 1e-9),
+        "expected InvalidSurvivalProb(1.5), got {result:?}"
+    );
+}
+
+// ============================================================
+// Tests: solve_n_for_target — monotonicity (regression guard)
+// ============================================================
+
+#[test]
+fn solve_n_for_target_monotonic_in_target_p() {
+    let k_eff = 5u32;
+    let pool_v = pool(&[0.75, 0.75, 0.75, 0.75, 0.75, 0.75]);
+    let targets = [0.70, 0.80, 0.90, 0.95, 0.99, 0.9999, 0.99999];
+    let mut prev_n = 0u32;
+    for &target_p in &targets {
+        let n = solve_n_for_target(k_eff, &pool_v, target_p).unwrap();
+        assert!(
+            n >= prev_n,
+            "solve_n_for_target not monotone in target_p: target={target_p} gives n={n} < prev {prev_n}"
+        );
+        prev_n = n;
+    }
+}
+
+#[test]
+fn solve_n_for_target_monotonic_in_holder_trust() {
+    let k_eff = 5u32;
+    let target_p = 0.99;
+    let trust_levels: &[f64] = &[0.3, 0.5, 0.7, 0.85, 0.95, 1.0];
+
+    // Iterate high→low trust: each lower-trust pool must need n >= previous.
+    let mut prev_n = u32::MAX;
+    for &p in trust_levels.iter().rev() {
+        let pool_v = pool(&[p; 6]);
+        let n = solve_n_for_target(k_eff, &pool_v, target_p).unwrap();
+        assert!(
+            n >= prev_n || prev_n == u32::MAX,
+            "lower trust should need >= n: trust={p} gave n={n} < prev n={prev_n}"
+        );
+        prev_n = n;
+    }
+
+    // Iterate low→high trust: n must be non-increasing.
+    let mut prev_n = u32::MAX;
+    for &p in trust_levels {
+        let pool_v = pool(&[p; 6]);
+        let n = solve_n_for_target(k_eff, &pool_v, target_p).unwrap();
+        if prev_n != u32::MAX {
+            assert!(
+                n <= prev_n,
+                "higher trust should need <= n: trust={p} gave n={n} > prev n={prev_n}"
+            );
+        }
+        prev_n = n;
+    }
+}
+
+// ============================================================
+// Tests: integration anchor (matches R8 table end-to-end)
+// ============================================================
+
+#[test]
+fn solve_n_for_target_anchor_unknown_importance() {
+    // importance=0.05 → target_p ≈ 0.71, k_eff=5, pool at 0.7 survival
+    let k_eff = 5u32;
+    let target_p = target_reliability(0.05);
+    let pool_v = pool(&[0.7; 8]);
+    let n = solve_n_for_target(k_eff, &pool_v, target_p).unwrap();
+    let mean_p = 0.7;
+
+    assert!(n >= k_eff + MIN_REDUNDANCY, "n={n} below floor");
+    let achieved = binomial_survival(n, k_eff, mean_p).unwrap();
+    assert!(
+        achieved >= target_p || n == k_eff * MAX_OVERHEAD_FACTOR,
+        "n={n} achieves {achieved}, target={target_p}, and is not at cap"
+    );
+}
+
+#[test]
+fn solve_n_for_target_anchor_important_data() {
+    let k_eff = 5u32;
+    let target_p = target_reliability(1.0);
+    let pool_v = pool(&[0.7; 8]);
+    let n = solve_n_for_target(k_eff, &pool_v, target_p).unwrap();
+    let mean_p = 0.7;
+
+    assert!(n >= k_eff + MIN_REDUNDANCY, "below floor");
+    let achieved = binomial_survival(n, k_eff, mean_p).unwrap();
+    assert!(
+        achieved >= target_p || n == k_eff * MAX_OVERHEAD_FACTOR,
+        "n={n} achieves {achieved}, target={target_p}, and is not at cap"
+    );
 }

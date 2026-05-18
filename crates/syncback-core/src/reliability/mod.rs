@@ -11,7 +11,9 @@
 //   K_eff = minimum symbols required for decode.
 
 use crate::commitment::{eviction_risk, CommitmentScore};
-use crate::constants::{BINOMIAL_EXACT_THRESHOLD, RELIABILITY_REPAIR_THRESHOLD};
+use crate::constants::{
+    BINOMIAL_EXACT_THRESHOLD, MAX_OVERHEAD_FACTOR, MIN_REDUNDANCY, RELIABILITY_REPAIR_THRESHOLD,
+};
 use crate::types::{DeviceId, SourceBlockId};
 
 #[cfg(test)]
@@ -93,6 +95,8 @@ pub enum ReliabilityError {
     SymbolCountOverflow,
     #[error("holder {0} not found in block input")]
     HolderNotFound(DeviceId),
+    #[error("holders slice is empty; cannot compute weighted mean trust")]
+    EmptyHolderSlice,
 }
 
 // ============================================================
@@ -331,6 +335,151 @@ pub fn build_report(input: &BlockReliabilityInput) -> Result<ReliabilityReport, 
 /// This is intentionally pessimistic for low-commitment holders.
 pub fn commitment_to_survival_prob(score: CommitmentScore) -> f64 {
     1.0 - eviction_risk(score)
+}
+
+// ============================================================
+// Pre-placement solver types
+// ============================================================
+
+/// Minimal holder descriptor for pre-placement N computation.
+///
+/// Used by `solve_n_for_target` and `weighted_mean_trust`. Contains only the
+/// information needed by the N-solver: the estimated survival probability of
+/// each pool candidate.
+///
+/// Distinct from `HolderReliabilityInput` (post-placement, tracks alive symbols
+/// and holder identity). This type is deliberately minimal — no `holder_id`
+/// field because the solver does not use identity.
+///
+/// Callers derive `survival_prob` via `commitment_to_survival_prob(score)`.
+#[derive(Debug, Clone)]
+pub struct HolderCandidate {
+    /// Estimated probability that this holder's symbols survive over the
+    /// relevant time horizon. Derived from `CommitmentScore`.
+    /// Range: [0.0, 1.0].
+    pub survival_prob: f64,
+}
+
+// ============================================================
+// Public API: target_reliability
+// ============================================================
+
+/// Compute the target reliability for a source block given its importance.
+///
+/// Returns P(block survives) that the system aims to achieve, as a function of
+/// how important the data is. Uses the smooth formula from R8:
+///
+///   target_p = 1 - 10^(-(0.3 + importance × 4.7))
+///
+/// Anchor table (from unified_work_pipeline.md §R8):
+/// | importance | target_p  |
+/// |------------|-----------|
+/// | 0.00       | ≈ 0.499   |
+/// | 0.05       | ≈ 0.71    |
+/// | 0.20       | ≈ 0.94    |
+/// | 0.65       | ≈ 0.9996  |
+/// | 0.95       | ≈ 0.99998 |
+/// | 1.00       | = 0.99999 |
+///
+/// # Clamping
+///
+/// `importance` is clamped to [0.0, 1.0] before applying the formula.
+/// Callers are expected to pass already-clamped values, but defensive
+/// clamping is applied for safety.
+///
+/// # Range
+///
+/// Always returns a value in [0.499, 0.99999]. Never returns NaN or infinity.
+pub fn target_reliability(importance: f64) -> f64 {
+    let imp = importance.clamp(0.0, 1.0);
+    let log10_failure = -(0.3 + imp * 4.7);
+    1.0 - 10f64.powf(log10_failure)
+}
+
+// ============================================================
+// Public API: solve_n_for_target
+// ============================================================
+
+/// Find the smallest N such that `binomial_survival(N, k_eff, mean_p) >= target_p`.
+///
+/// Uses the pool's equal-weight mean survival probability (`weighted_mean_trust`)
+/// as the per-symbol survival proxy. Searches N in the range
+/// `[k_eff + MIN_REDUNDANCY, k_eff * MAX_OVERHEAD_FACTOR]`.
+///
+/// # Returns
+///
+/// - `Ok(n)` where n is the smallest satisfying N, or `Ok(k_eff * MAX_OVERHEAD_FACTOR)`
+///   if the target is unachievable within the overhead cap. Callers can detect
+///   the capped case by comparing `n == k_eff * MAX_OVERHEAD_FACTOR`.
+/// - `Err(EmptyHolderSlice)` if `holders` is empty.
+/// - `Err(InvalidKEff(0))` if `k_eff == 0`.
+/// - `Err(InvalidSurvivalProb(...))` if any `holder.survival_prob` is outside [0.0, 1.0].
+///
+/// # Caller contract
+///
+/// The returned N is a suggestion for initial block construction. After N is chosen
+/// and `compute_allocation` runs, the actual holder assignments may differ from the
+/// uniform-trust model used here. The caller is responsible for re-evaluating
+/// `block_reliability` once placements are live.
+///
+/// # Why Ok(max_n) instead of Err for unachievable target?
+///
+/// An unreachable target is a normal operational condition (small / low-trust pool).
+/// Returning `Ok(max_n)` lets the caller use best-effort N and decide independently
+/// whether to defer or proceed. An Err would require every call site to handle a
+/// non-exceptional condition as an exception.
+pub fn solve_n_for_target(
+    k_eff: u32,
+    holders: &[HolderCandidate],
+    target_p: f64,
+) -> Result<u32, ReliabilityError> {
+    if k_eff == 0 {
+        return Err(ReliabilityError::InvalidKEff(0));
+    }
+    if holders.is_empty() {
+        return Err(ReliabilityError::EmptyHolderSlice);
+    }
+
+    let mean_p = weighted_mean_trust(holders)?;
+    let min_n = k_eff + MIN_REDUNDANCY;
+    let max_n = k_eff * MAX_OVERHEAD_FACTOR;
+
+    for n in min_n..=max_n {
+        if binomial_survival(n, k_eff, mean_p)? >= target_p {
+            return Ok(n);
+        }
+    }
+
+    // Target unachievable within overhead cap — return cap, caller checks.
+    Ok(max_n)
+}
+
+// ============================================================
+// pub(crate) helper: weighted_mean_trust
+// ============================================================
+
+/// Compute the equal-weight arithmetic mean of `survival_prob` across all holders.
+///
+/// Used by `solve_n_for_target` before symbol allocation, when per-holder symbol
+/// counts are not yet known. Equal weighting is the only well-defined choice at
+/// this stage.
+///
+/// Returns `Err(EmptyHolderSlice)` if `holders` is empty.
+/// Returns `Err(InvalidSurvivalProb)` if any holder has `survival_prob` outside [0.0, 1.0].
+pub(crate) fn weighted_mean_trust(
+    holders: &[HolderCandidate],
+) -> Result<f64, ReliabilityError> {
+    if holders.is_empty() {
+        return Err(ReliabilityError::EmptyHolderSlice);
+    }
+    let mut sum = 0.0f64;
+    for h in holders {
+        if !(0.0..=1.0).contains(&h.survival_prob) {
+            return Err(ReliabilityError::InvalidSurvivalProb(h.survival_prob));
+        }
+        sum += h.survival_prob;
+    }
+    Ok(sum / holders.len() as f64)
 }
 
 // ============================================================

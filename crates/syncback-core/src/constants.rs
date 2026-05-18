@@ -265,6 +265,19 @@ pub const RELIABILITY_REPAIR_THRESHOLD: f64 = 0.99;
 /// approximation for N >= this value.
 pub const BINOMIAL_EXACT_THRESHOLD: u32 = 100;
 
+// === Dynamic N bounds ===
+
+/// Minimum extra symbols beyond k_eff: n >= k_eff + MIN_REDUNDANCY.
+/// Ensures at least 2 parity symbols regardless of trust or importance.
+/// Prevents n == k_eff which would give zero fault tolerance.
+pub const MIN_REDUNDANCY: u32 = 2;
+
+/// Maximum overhead factor: n <= k_eff * MAX_OVERHEAD_FACTOR.
+/// Caps symbol count to prevent runaway allocation on low-trust pools.
+/// If target_p cannot be reached within this cap, solve_n_for_target
+/// returns Ok(k_eff * MAX_OVERHEAD_FACTOR) and caller treats it as best-effort.
+pub const MAX_OVERHEAD_FACTOR: u32 = 10;
+
 // === Symbol offer handshake ===
 
 /// Timeout for awaiting SymbolAccept on a direct connection (seconds).
@@ -329,3 +342,5 @@ const _: () = assert!(OVERHEAD_BASE > 1.0);
 const _: () = assert!(DECODE_OVERHEAD > 0);
 const _: () = assert!(SYMBOL_OFFER_TIMEOUT_SECS < SYMBOL_OFFER_EXPIRY_SECS);
 const _: () = assert!(MAX_SYSTEM_STATE_BLOB_BYTES < MAX_MESSAGE_SIZE as usize);
+const _: () = assert!(MIN_REDUNDANCY >= 1);
+const _: () = assert!(MAX_OVERHEAD_FACTOR > 1);
