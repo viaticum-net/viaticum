@@ -4,6 +4,7 @@
 
 use crate::constants::{MAX_HOLDERS_PER_BLOCK, MIN_SYMBOLS_PER_HOLDER};
 use crate::types::{DeviceId, ErasureParams};
+use crate::reliability;
 
 #[cfg(test)]
 mod tests;
@@ -249,4 +250,84 @@ pub fn compute_allocation(
     }
 
     Ok(allocations)
+}
+
+/// Compute a symbol allocation using N derived dynamically from pool trust
+/// and block importance, rather than the static overhead formula.
+///
+/// Internally calls `reliability::target_reliability(importance)` and
+/// `reliability::solve_n_for_target(k_eff, pool, target_p)` to determine N,
+/// then delegates to `compute_allocation` with the resulting ErasureParams.
+///
+/// Falls back to static N (`ErasureParams::compute(source_size, importance)`)
+/// if the solver fails (empty pool, invalid k_eff).
+///
+/// # Parameters
+///
+/// - `candidates`: holder pool as used by `compute_allocation`. Must be non-empty
+///   for a non-NoCandidates result.
+/// - `source_size`: compressed+encrypted blob size in bytes. Used to derive `k`
+///   via the static formula. Must be > 0.
+/// - `importance`: block importance in [0.0, 1.0]. Clamped if out of range.
+/// - `esi_offset`: first ESI to assign (0 for single-device; namespace offset for cluster).
+///
+/// # Errors
+///
+/// Returns `PlacementError::NoCandidates` if `candidates` is empty.
+/// Returns `PlacementError::NTooSmall` if computed N < holder count (rare; may happen
+/// with very large pools and very small blocks).
+/// Other `PlacementError` variants per `compute_allocation`.
+pub fn compute_allocation_with_importance(
+    candidates: &[HolderCandidate],
+    source_size: u64,
+    importance: f64,
+    esi_offset: u32,
+) -> Result<Vec<HolderAllocation>, PlacementError> {
+    if candidates.is_empty() {
+        return Err(PlacementError::NoCandidates);
+    }
+
+    // Base ErasureParams from static formula (provides k, k_eff, t, overhead).
+    let base_params = ErasureParams::compute(source_size, importance)
+        .map_err(|_| PlacementError::NoCandidates)?;
+
+    let target_p = reliability::target_reliability(importance);
+
+    // Convert placement candidates to solver candidates.
+    // Trust is the combined survival proxy: trust ∈ [0, 1).
+    let solver_candidates: Vec<reliability::HolderCandidate> = candidates
+        .iter()
+        .map(|c| reliability::HolderCandidate {
+            survival_prob: c.trust.clamp(0.0, 0.999),
+        })
+        .collect();
+
+    let n_target = match reliability::solve_n_for_target(
+        base_params.k_eff,
+        &solver_candidates,
+        target_p,
+    ) {
+        Ok(n) => n,
+        Err(_) => {
+            // Empty pool or invalid k_eff — fall back to static N.
+            tracing::debug!(
+                k_eff = base_params.k_eff,
+                importance,
+                "compute_allocation_with_importance: solver failed, using static N"
+            );
+            base_params.n
+        }
+    };
+
+    // Build ErasureParams with dynamic N.
+    // We preserve k, k_eff, t, overhead from base_params; only n changes.
+    let params = ErasureParams {
+        k: base_params.k,
+        k_eff: base_params.k_eff,
+        t: base_params.t,
+        overhead: base_params.overhead,
+        n: n_target,
+    };
+
+    compute_allocation(candidates, &params, esi_offset)
 }

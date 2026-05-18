@@ -1,4 +1,4 @@
-use super::{compute_allocation, holder_weight, HolderCandidate, PlacementError};
+use super::{compute_allocation, compute_allocation_with_importance, holder_weight, HolderCandidate, PlacementError};
 use crate::types::{DeviceId, ErasureParams};
 
 fn device_id(byte: u8) -> DeviceId {
@@ -621,4 +621,125 @@ fn compute_allocation_with_esi_offset() {
         );
         cursor = alloc.start_esi + alloc.symbol_count;
     }
+}
+
+// ─── Wave 9: compute_allocation_with_importance tests ────────────────────────
+
+/// Helper: build N candidates all with the same trust score.
+fn uniform_candidates(count: usize, trust: f64) -> Vec<HolderCandidate> {
+    (0..count)
+        .map(|i| candidate((i % 255) as u8 + 1, trust))
+        .collect()
+}
+
+#[test]
+fn compute_with_holders_uses_target_reliability_of_importance() {
+    // 8 holders with trust=0.85, 10MB block, importance=1.0
+    // target_p = target_reliability(1.0) ≈ 0.99999 — very high target.
+    // The solver must produce a valid N with total symbols >= k_eff + MIN_REDUNDANCY.
+    let candidates = uniform_candidates(8, 0.85);
+    let source_size = 10 * 1024 * 1024u64;
+    let result = compute_allocation_with_importance(&candidates, source_size, 1.0, 0);
+    let allocs = result.expect("should succeed with 8 holders and high trust");
+    let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
+    let base = crate::types::ErasureParams::compute(source_size, 1.0).unwrap();
+    assert!(
+        total >= base.k_eff + crate::constants::MIN_REDUNDANCY,
+        "total={total} must be >= k_eff ({}) + MIN_REDUNDANCY ({})",
+        base.k_eff,
+        crate::constants::MIN_REDUNDANCY,
+    );
+}
+
+#[test]
+fn compute_with_holders_solves_n_via_solve_n_for_target() {
+    // Low-trust pool needs higher N to reach the same target than a high-trust pool.
+    let source_size = 5 * 1024 * 1024u64;
+    let importance = 0.8;
+
+    let high_trust = uniform_candidates(8, 0.9);
+    let low_trust = uniform_candidates(8, 0.3);
+
+    let allocs_a = compute_allocation_with_importance(&high_trust, source_size, importance, 0)
+        .expect("high-trust should succeed");
+    let allocs_b = compute_allocation_with_importance(&low_trust, source_size, importance, 0)
+        .expect("low-trust should succeed");
+
+    let total_a: u32 = allocs_a.iter().map(|a| a.symbol_count).sum();
+    let total_b: u32 = allocs_b.iter().map(|a| a.symbol_count).sum();
+
+    // `>=` not strict `>` because both pools may saturate at MAX_OVERHEAD_FACTOR for
+    // the chosen importance/target; we only assert the directionality (weak pool never
+    // gets fewer symbols than strong pool), not strict ascent.
+    assert!(
+        total_b >= total_a,
+        "low-trust pool (total={total_b}) should need >= symbols than high-trust ({total_a})"
+    );
+}
+
+#[test]
+fn compute_with_holders_falls_back_when_candidates_empty() {
+    let result = compute_allocation_with_importance(&[], 10 * 1024 * 1024, 0.5, 0);
+    assert!(
+        matches!(result, Err(PlacementError::NoCandidates)),
+        "empty candidates must return NoCandidates, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn compute_with_holders_zero_source_size_returns_err() {
+    // source_size=0 causes ErasureParams::compute to fail → mapped to NoCandidates.
+    let candidates = uniform_candidates(4, 0.7);
+    let result = compute_allocation_with_importance(&candidates, 0, 0.5, 0);
+    assert!(
+        matches!(result, Err(PlacementError::NoCandidates)),
+        "source_size=0 must return Err(NoCandidates), got {:?}",
+        result
+    );
+}
+
+#[test]
+fn compute_with_holders_n_satisfies_min_redundancy() {
+    // 3 holders with trust=0.5, 1MB block, low importance=0.05.
+    let candidates = uniform_candidates(3, 0.5);
+    let source_size = 1024 * 1024u64;
+    let allocs = compute_allocation_with_importance(&candidates, source_size, 0.05, 0)
+        .expect("should succeed");
+    let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
+    let base = crate::types::ErasureParams::compute(source_size, 0.05).unwrap();
+    assert!(
+        total >= base.k_eff + crate::constants::MIN_REDUNDANCY,
+        "total={total} must be >= k_eff ({}) + MIN_REDUNDANCY ({})",
+        base.k_eff,
+        crate::constants::MIN_REDUNDANCY,
+    );
+    assert!(
+        total <= base.k_eff * crate::constants::MAX_OVERHEAD_FACTOR,
+        "total={total} must be <= k_eff * MAX_OVERHEAD_FACTOR"
+    );
+}
+
+#[test]
+fn compute_with_holders_high_importance_higher_n_than_low_importance() {
+    // Same pool (5 holders, trust=0.7) and same source_size.
+    // importance=1.0 → higher target_p → solver picks higher or equal N vs importance=0.20.
+    let source_size = 5 * 1024 * 1024u64;
+    let candidates_high = uniform_candidates(5, 0.7);
+    let candidates_low = uniform_candidates(5, 0.7);
+
+    let allocs_high =
+        compute_allocation_with_importance(&candidates_high, source_size, 1.0, 0)
+            .expect("high importance should succeed");
+    let allocs_low =
+        compute_allocation_with_importance(&candidates_low, source_size, 0.20, 0)
+            .expect("low importance should succeed");
+
+    let total_high: u32 = allocs_high.iter().map(|a| a.symbol_count).sum();
+    let total_low: u32 = allocs_low.iter().map(|a| a.symbol_count).sum();
+
+    assert!(
+        total_high >= total_low,
+        "importance=1.0 (total={total_high}) should produce >= symbols than importance=0.20 ({total_low})"
+    );
 }

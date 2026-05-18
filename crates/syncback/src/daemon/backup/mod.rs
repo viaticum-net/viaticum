@@ -464,12 +464,21 @@ impl BackupCoordinator {
 
         let batch = syncback_core::budget::select_backup_batch(&candidates_input, offer_budget_gb);
 
-        // Split: selected files proceed, deferred files stay in queue.
-        let selected_paths: std::collections::HashSet<&str> =
-            batch.candidates.iter().map(|c| c.path.as_str()).collect();
+        // Split: selected files proceed in importance-DESC order; deferred files stay in queue.
+        // Build a lookup map from path → QueuedFile, then iterate batch.candidates (already
+        // in importance-DESC order from select_backup_batch) to reconstruct selected in order.
+        // This preserves the importance ordering that select_backup_batch computed (D1 fix).
+        let mut queue_map: std::collections::HashMap<String, QueuedFile> =
+            std::mem::take(queue).into_iter().map(|qf| (qf.path.clone(), qf)).collect();
 
-        let (selected, deferred): (Vec<QueuedFile>, Vec<QueuedFile>) =
-            std::mem::take(queue).into_iter().partition(|qf| selected_paths.contains(qf.path.as_str()));
+        let selected: Vec<QueuedFile> = batch
+            .candidates
+            .iter()
+            .filter_map(|c| queue_map.remove(&c.path))
+            .collect();
+
+        // Remaining entries in queue_map were not selected — defer them.
+        let deferred: Vec<QueuedFile> = queue_map.into_values().collect();
 
         // Put deferred files back.
         *queue = deferred;
@@ -564,6 +573,7 @@ impl BackupCoordinator {
             BlockTypeTag::Single,
             candidates,
             &[],
+            importance,
         )?;
         update_backed_up_at(&self.db, &batch, result.source_block_id, result.k, result.t)?;
         Ok(result)

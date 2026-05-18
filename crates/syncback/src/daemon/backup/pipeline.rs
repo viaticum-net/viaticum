@@ -11,7 +11,14 @@ use syncback_core::constants::MIN_BATCH_BYTES;
 use syncback_core::db::Db;
 use syncback_core::erasure::{binding_seed, ErasureEncoder, Symbol};
 use syncback_core::cluster::esi_namespace_start;
-use syncback_core::placement::{compute_allocation, HolderCandidate, PlacementError};
+use syncback_core::placement::{compute_allocation_with_importance, HolderCandidate, PlacementError};
+use syncback_core::reliability;
+
+/// Importance change threshold above which the pack accumulator flushes.
+/// Strict comparison: delta > IMPORTANCE_FLUSH_EPSILON triggers flush.
+/// Value 0.05 separates real bucket transitions (minimum gap 0.30) from
+/// within-bucket jitter (maximum ~0.02 from burst downweighting).
+const IMPORTANCE_FLUSH_EPSILON: f64 = 0.05;
 use syncback_core::types::{
     hex_encode, DeviceId, ErasureParams, Event, EventEntry, FileId, PlacementStatus,
     SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement,
@@ -104,7 +111,12 @@ pub fn decrypt_and_decompress(stored: &[u8], epoch_key: &[u8; 32]) -> anyhow::Re
 /// `file_id_for_single` is used when this is a Single-type block; for Pack blocks it is
 /// computed from the first file in `files`.
 /// `block_type` should be `Pack` or `Single`.
+/// `pack_importance`: explicit importance for this pack (first file's importance for Pack
+/// blocks; file's importance for Single blocks). Used to set `SourceBlockRecord.importance`
+/// and `target_reliability` at creation, and to drive `compute_allocation_with_importance`
+/// for dynamic N.
 /// Returns `PipelineResult` describing the outcome.
+#[allow(clippy::too_many_arguments)]
 pub fn run_pipeline(
     db: &Db,
     config: &BackupConfig,
@@ -113,6 +125,7 @@ pub fn run_pipeline(
     block_type_tag: BlockTypeTag,
     candidates: &[HolderCandidate],
     _file_ids_for_block: &[FileId], // which file_ids reference this block (for back-linking)
+    pack_importance: f64,
 ) -> anyhow::Result<PipelineResult> {
     assert!(!files.is_empty(), "run_pipeline called with empty files");
 
@@ -132,20 +145,16 @@ pub fn run_pipeline(
     let block_id_raw: [u8; 32] = *blake3::hash(&stored).as_bytes();
     let block_id = SourceBlockId(block_id_raw);
 
-    // 4. Compute ErasureParams
-    let avg_importance: f64 = {
-        let sum: f64 = files.iter().map(|(qf, _)| qf.importance).sum();
-        sum / files.len() as f64
-    };
+    // 4. Compute ErasureParams (for k, k_eff, t, overhead; n comes from dynamic solver)
     // Guard: compress_and_encrypt always produces at least 12 bytes (nonce) + auth
     // tag, so stored.len() > 0 in practice. The check is explicit for correctness.
     if stored.is_empty() {
         anyhow::bail!("compressed+encrypted block is empty — cannot compute erasure params");
     }
-    let params = ErasureParams::compute(stored.len() as u64, avg_importance)
+    let params = ErasureParams::compute(stored.len() as u64, pack_importance)
         .map_err(|e| anyhow::anyhow!("ErasureParams::compute failed: {e}"))?;
 
-    // 5. Placement allocation
+    // 5. Placement allocation with dynamic N from pool trust + importance.
     // Compute ESI offset from cluster state so each device gets a non-overlapping
     // ESI namespace. Falls back to 0 for single-device or when cluster unavailable.
     let esi_offset: u32 = config
@@ -160,7 +169,12 @@ pub fn run_pipeline(
         .unwrap_or(0);
 
     let allocations_result = if candidates.len() >= 2 {
-        match compute_allocation(candidates, &params, esi_offset) {
+        match compute_allocation_with_importance(
+            candidates,
+            stored.len() as u64,
+            pack_importance,
+            esi_offset,
+        ) {
             Ok(allocs) => allocs,
             Err(PlacementError::NTooSmall { .. }) => {
                 tracing::warn!(
@@ -245,6 +259,16 @@ pub fn run_pipeline(
         BlockTypeTag::Single => SourceBlockType::Single,
     };
 
+    // Effective N = sum of allocated symbol counts. If empty (< 2 candidates), fall back
+    // to the static params.n so the block record stores a meaningful N for future repair.
+    let effective_n: u32 = {
+        let sum: u32 = allocations_result.iter().map(|a| a.symbol_count).sum();
+        if sum == 0 { params.n } else { sum }
+    };
+
+    // Wave 9: set importance and target_reliability at creation from pack_importance.
+    let target_rel = reliability::target_reliability(pack_importance);
+
     let block_record = SourceBlockRecord {
         block_id,
         k: params.k,
@@ -253,15 +277,14 @@ pub fn run_pipeline(
         status: SourceBlockStatus::Active,
         created_at: Timestamp::now(),
         encrypted_size: Some(stored.len() as u64),
-        n: Some(params.n),
+        n: Some(effective_n),
         overhead: Some(params.overhead),
         drop_notice_sent_at: None,
-        // Wave 9 will set importance/target_reliability directly from pack.importance.
-        // For now, use sentinel defaults; migration will populate on next boot.
-        importance: 0.0,
+        // Wave 9: set at creation from pack importance.
+        importance: pack_importance,
+        target_reliability: target_rel,
         current_alive: 0,
         current_reliability: 0.0,
-        target_reliability: 0.0,
         last_attempted_at: None,
         last_pool_signature: 0,
     };
@@ -305,23 +328,24 @@ pub fn run_pipeline(
 
     txn.commit()?;
 
-    let n = params.n;
     tracing::info!(
         block_id = %block_id,
         k = params.k,
-        n,
+        n = effective_n,
         holders = allocations_result.len(),
+        importance = pack_importance,
+        target_reliability = target_rel,
         "backup: pipeline complete"
     );
 
     Ok(PipelineResult {
         source_block_id: block_id,
         k: params.k,
-        n,
+        n: effective_n,
         t: params.t,
         symbol_count_per_holder,
         stored_size: stored.len() as u64,
-        importance: avg_importance,
+        importance: pack_importance,
         raw_symbols,
         esi_offset,
     })
@@ -335,6 +359,10 @@ pub enum BlockTypeTag {
 }
 
 /// Flush a queue of files, grouping into batches up to source_block_size.
+///
+/// Files must be in importance-DESC order (as produced by select_backup_batch).
+/// Flushes on EITHER size threshold OR importance change > IMPORTANCE_FLUSH_EPSILON
+/// between consecutive files.
 ///
 /// Returns pipeline results for each emitted source block.
 /// If `force=false` and total bytes < MIN_BATCH_BYTES, returns empty vec.
@@ -364,6 +392,8 @@ pub fn flush_queue_inner(
     let mut results = Vec::new();
     let mut batch: Vec<(QueuedFile, Vec<u8>)> = Vec::new();
     let mut batch_bytes: u64 = 0;
+    // Track importance of the last file added to the current batch (A9: track last-added).
+    let mut prev_importance: Option<f64> = None;
     let drained: Vec<QueuedFile> = std::mem::take(queued);
 
     for qf in drained {
@@ -373,32 +403,51 @@ pub fn flush_queue_inner(
 
         let file_size = file_bytes.len() as u64;
 
-        // Check if adding this file would overflow the batch
+        // Importance-change flush (BEFORE size-overflow check, per D2).
+        // Fires when importance changes by more than IMPORTANCE_FLUSH_EPSILON (strict).
+        if let Some(prev) = prev_importance {
+            if (qf.importance - prev).abs() > IMPORTANCE_FLUSH_EPSILON && !batch.is_empty() {
+                let pack_importance = batch[0].0.importance;
+                let result = run_pipeline(db, config, encoder, &batch, BlockTypeTag::Pack, candidates, &[], pack_importance)?;
+                update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
+                results.push(result);
+                batch.clear();
+                batch_bytes = 0;
+                prev_importance = None;
+            }
+        }
+
+        // Size-overflow flush: adding this file would push batch over the limit.
         if !batch.is_empty() && batch_bytes + file_size > config.source_block_size {
-            // Flush current batch
-            let result = run_pipeline(db, config, encoder, &batch, BlockTypeTag::Pack, candidates, &[])?;
+            let pack_importance = batch[0].0.importance;
+            let result = run_pipeline(db, config, encoder, &batch, BlockTypeTag::Pack, candidates, &[], pack_importance)?;
             update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
             results.push(result);
             batch.clear();
             batch_bytes = 0;
+            prev_importance = None;
         }
 
+        prev_importance = Some(qf.importance);
         batch.push((qf, file_bytes));
         batch_bytes += file_size;
 
-        // If batch is now at or over limit, flush immediately
+        // Immediate size flush: batch is at or over limit after adding the file.
         if batch_bytes >= config.source_block_size {
-            let result = run_pipeline(db, config, encoder, &batch, BlockTypeTag::Pack, candidates, &[])?;
+            let pack_importance = batch[0].0.importance;
+            let result = run_pipeline(db, config, encoder, &batch, BlockTypeTag::Pack, candidates, &[], pack_importance)?;
             update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
             results.push(result);
             batch.clear();
             batch_bytes = 0;
+            prev_importance = None;
         }
     }
 
     // Flush remaining batch
     if !batch.is_empty() {
-        let result = run_pipeline(db, config, encoder, &batch, BlockTypeTag::Pack, candidates, &[])?;
+        let pack_importance = batch[0].0.importance;
+        let result = run_pipeline(db, config, encoder, &batch, BlockTypeTag::Pack, candidates, &[], pack_importance)?;
         update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
         results.push(result);
     }
