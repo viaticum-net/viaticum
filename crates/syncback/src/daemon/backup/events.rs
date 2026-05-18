@@ -113,7 +113,8 @@ impl BackupCoordinator {
             }
             let file_id =
                 self.get_or_create_file_id(&event.path, &event.device_id, content_hash)?;
-            let candidates = self.get_candidates()?;
+            // TODO(wave2): pass authenticated snapshot here (currently unfiltered for large files).
+            let candidates = self.get_candidates(&Default::default())?;
             let result =
                 self.process_large_file(&event.path, file_id, content_hash, importance, &candidates)?;
             // Tally offered holders for this single block.

@@ -159,7 +159,7 @@ async fn full_lifecycle_e2e() {
         })
         .unwrap();
 
-    let results = backup.flush_all(true).unwrap();
+    let results = backup.flush_all(true, &Default::default()).unwrap();
     assert!(!results.is_empty(), "at least one source block created");
 
     let all_files = db.list_all_files().unwrap();
@@ -188,7 +188,7 @@ async fn full_lifecycle_e2e() {
             device_id: device_a(),
         })
         .unwrap();
-    backup.flush_all(true).unwrap();
+    backup.flush_all(true, &Default::default()).unwrap();
 
     let photo_record = db
         .get_file(&photo_path)
@@ -326,7 +326,7 @@ async fn full_lifecycle_e2e() {
             device_id: device_b(),
         })
         .unwrap();
-    let results_b = backup_b.flush_all(true).unwrap();
+    let results_b = backup_b.flush_all(true, &Default::default()).unwrap();
 
     assert_eq!(
         results_b.len(),

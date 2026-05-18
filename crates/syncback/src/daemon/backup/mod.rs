@@ -243,7 +243,12 @@ impl BackupCoordinator {
     /// Get holder candidates: mock_holders if configured (tests only), else compute from DB peers.
     /// Soft-filters peers currently on rejection cooldown when peer_backoff is set
     /// (falls back to the unfiltered list if filtering would leave fewer than 2).
-    pub(crate) fn get_candidates(&self) -> anyhow::Result<Vec<HolderCandidate>> {
+    /// Then filters to only authenticated (online) peers; falls back to unfiltered
+    /// if fewer than 2 authenticated candidates remain.
+    pub(crate) fn get_candidates(
+        &self,
+        authenticated: &std::collections::HashSet<DeviceId>,
+    ) -> anyhow::Result<Vec<HolderCandidate>> {
         if !self.config.mock_holders.is_empty() {
             return Ok(self.config.mock_holders.clone());
         }
@@ -264,7 +269,7 @@ impl BackupCoordinator {
             })
             .collect();
 
-        if let Some(backoff) = self.config.peer_backoff.as_ref() {
+        let candidates = if let Some(backoff) = self.config.peer_backoff.as_ref() {
             let raw = candidates.clone();
             let filtered = backoff.filter(candidates, 2, |c| &c.device_id);
             if filtered.is_empty() {
@@ -272,11 +277,41 @@ impl BackupCoordinator {
                     "backup: all candidates on backoff, falling back to raw list ({})",
                     raw.len()
                 );
-                return Ok(raw);
+                raw
+            } else {
+                filtered
             }
-            return Ok(filtered);
+        } else {
+            candidates
+        };
+
+        // Online filter: restrict to authenticated peers only.
+        let auth_filtered: Vec<HolderCandidate> = candidates
+            .iter()
+            .filter(|c| authenticated.contains(&c.device_id))
+            .cloned()
+            .collect();
+
+        if auth_filtered.len() < 2 {
+            // Fallback: authenticated set is empty or too small (boot, unit test without swarm).
+            tracing::debug!(
+                total = candidates.len(),
+                authenticated = authenticated.len(),
+                "backup: authenticated set too small, using unfiltered candidates"
+            );
+            return Ok(candidates);
         }
-        Ok(candidates)
+
+        // Log skipped unauthenticated peers at DEBUG level.
+        for c in &candidates {
+            if !authenticated.contains(&c.device_id) {
+                tracing::debug!(
+                    peer_id = %c.device_id,
+                    "backup: peer skipped — not authenticated"
+                );
+            }
+        }
+        Ok(auth_filtered)
     }
 
     /// Process a single dirty event synchronously.
@@ -387,10 +422,13 @@ impl BackupCoordinator {
     /// Flushes when: total queue bytes >= source_block_size, OR force=true.
     /// Skips if total bytes across all categories < MIN_BATCH_BYTES and force=false.
     /// Applies budget check: files not selected by select_backup_batch stay in queue.
+    /// `authenticated`: snapshot of currently-authenticated peer IDs (from SwarmHandle).
+    /// Pass `&Default::default()` in tests that use mock_holders.
     pub fn flush_queue(
         &mut self,
         category: FileCategory,
         force: bool,
+        authenticated: &std::collections::HashSet<DeviceId>,
     ) -> anyhow::Result<Vec<PipelineResult>> {
         let total_all = self.total_queued_bytes();
         let queue_bytes: u64 = self
@@ -444,7 +482,7 @@ impl BackupCoordinator {
             return Ok(vec![]);
         }
 
-        let candidates = self.get_candidates()?;
+        let candidates = self.get_candidates(authenticated)?;
         let mut selected_queue = selected;
 
         let results = flush_queue_inner(
@@ -467,7 +505,13 @@ impl BackupCoordinator {
     }
 
     /// Flush all categories.
-    pub fn flush_all(&mut self, force: bool) -> anyhow::Result<Vec<PipelineResult>> {
+    /// `authenticated`: snapshot of currently-authenticated peer IDs passed through to
+    /// `flush_queue` and `get_candidates`. Taken before `block_in_place` in `run()`.
+    pub fn flush_all(
+        &mut self,
+        force: bool,
+        authenticated: &std::collections::HashSet<DeviceId>,
+    ) -> anyhow::Result<Vec<PipelineResult>> {
         let mut all_results = Vec::new();
         let categories = [
             FileCategory::Photo,
@@ -476,7 +520,7 @@ impl BackupCoordinator {
             FileCategory::Other,
         ];
         for cat in categories {
-            let mut results = self.flush_queue(cat, force)?;
+            let mut results = self.flush_queue(cat, force, authenticated)?;
             all_results.append(&mut results);
         }
         Ok(all_results)
@@ -519,6 +563,22 @@ impl BackupCoordinator {
         Ok(result)
     }
 
+    /// Snapshot the set of currently-authenticated peer IDs from the swarm.
+    ///
+    /// Returns an empty set if no swarm is configured (unit tests, offline).
+    /// Must be called from an async context; the result is then passed into
+    /// `flush_all` / `flush_queue` which run inside `block_in_place`.
+    async fn snapshot_authenticated_peers(&self) -> std::collections::HashSet<DeviceId> {
+        match self.config.swarm.as_ref() {
+            Some(swarm) => swarm
+                .peer_sets()
+                .await
+                .map(|(auth, _)| auth)
+                .unwrap_or_default(),
+            None => std::collections::HashSet::new(),
+        }
+    }
+
     /// Run the coordinator as a tokio task (Phase 3+).
     ///
     /// Reads DirtyEvent from rx channel. Exits when channel is closed.
@@ -555,11 +615,14 @@ impl BackupCoordinator {
                         }
                         None => {
                             tracing::info!("BackupCoordinator: channel closed, flushing and exiting");
+                            // Snapshot authenticated peers before entering block_in_place
+                            // (peer_sets() is async; cannot be called from sync context).
+                            let auth_snap = self.snapshot_authenticated_peers().await;
                             // Wrap the blocking flush in block_in_place so the tokio
                             // runtime can still make progress on other tasks while
                             // we compress, encrypt, encode and write to disk
                             // (review A1 / HIGH blocking-I/O).
-                            let flush_result = tokio::task::block_in_place(|| self.flush_all(true));
+                            let flush_result = tokio::task::block_in_place(|| self.flush_all(true, &auth_snap));
                             match flush_result {
                                 Ok(results) => self.deliver_symbols(&results).await,
                                 Err(e) => tracing::error!("final flush error: {e}"),
@@ -571,7 +634,8 @@ impl BackupCoordinator {
                 }
                 _ = idle_timer.tick() => {
                     tracing::debug!("idle flush triggered");
-                    let flush_result = tokio::task::block_in_place(|| self.flush_all(true));
+                    let auth_snap = self.snapshot_authenticated_peers().await;
+                    let flush_result = tokio::task::block_in_place(|| self.flush_all(true, &auth_snap));
                     match flush_result {
                         Ok(results) => {
                             if !results.is_empty() {
@@ -584,7 +648,8 @@ impl BackupCoordinator {
                 }
                 _ = fallback_timer.tick() => {
                     tracing::debug!("fallback flush triggered");
-                    let flush_result = tokio::task::block_in_place(|| self.flush_all(true));
+                    let auth_snap = self.snapshot_authenticated_peers().await;
+                    let flush_result = tokio::task::block_in_place(|| self.flush_all(true, &auth_snap));
                     match flush_result {
                         Ok(results) => {
                             if !results.is_empty() {

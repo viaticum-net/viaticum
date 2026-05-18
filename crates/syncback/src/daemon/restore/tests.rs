@@ -329,7 +329,7 @@ async fn restore_single_file_by_exact_path() {
     let path = write_file(&files_dir, "single.txt", content);
     let mut backup = test_backup_coord(db.clone(), &symbols_dir);
     backup.process_event(added_event(&path)).unwrap();
-    let results = backup.flush_all(true).unwrap();
+    let results = backup.flush_all(true, &Default::default()).unwrap();
     assert!(!results.is_empty(), "should have produced at least one block");
 
     // Restore
@@ -373,7 +373,7 @@ async fn restore_pack_multiple_files_roundtrip() {
         backup.process_event(added_event(&path)).unwrap();
         paths.push(path);
     }
-    let results = backup.flush_all(true).unwrap();
+    let results = backup.flush_all(true, &Default::default()).unwrap();
     assert!(!results.is_empty(), "should have produced blocks");
 
     // Restore all 3 using prefix (the files_dir path as prefix)
@@ -416,7 +416,7 @@ async fn restore_specific_version_by_index() {
     let path = write_file(&files_dir, path_name, b"version one content");
     let mut backup = test_backup_coord(db.clone(), &symbols_dir);
     backup.process_event(added_event(&path)).unwrap();
-    backup.flush_all(true).unwrap();
+    backup.flush_all(true, &Default::default()).unwrap();
 
     // Modify file, backup v2
     std::fs::write(&path, b"version two content").unwrap();
@@ -427,7 +427,7 @@ async fn restore_specific_version_by_index() {
             device_id: DeviceId([1u8; 32]),
         })
         .unwrap();
-    backup.flush_all(true).unwrap();
+    backup.flush_all(true, &Default::default()).unwrap();
 
     // Verify 2 versions exist in DB
     let record = db.get_file(&path).unwrap().unwrap();
@@ -493,7 +493,7 @@ async fn restore_prefix_matches_multiple_files() {
             .process_event(added_event(&p.to_string_lossy()))
             .unwrap();
     }
-    backup.flush_all(true).unwrap();
+    backup.flush_all(true, &Default::default()).unwrap();
 
     // Restore only photos prefix
     let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
@@ -550,7 +550,7 @@ async fn restore_updates_local_state_to_present() {
 
     let mut backup = test_backup_coord(db.clone(), &symbols_dir);
     backup.process_event(added_event(&path)).unwrap();
-    backup.flush_all(true).unwrap();
+    backup.flush_all(true, &Default::default()).unwrap();
 
     let restore_device = DeviceId([2u8; 32]);
     let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
@@ -592,7 +592,7 @@ async fn restore_deduplicates_source_blocks() {
     let mut backup = test_backup_coord(db.clone(), &symbols_dir);
     backup.process_event(added_event(&path_a)).unwrap();
     backup.process_event(added_event(&path_b)).unwrap();
-    let results = backup.flush_all(true).unwrap();
+    let results = backup.flush_all(true, &Default::default()).unwrap();
 
     // Both files should land in the same block (total size << SMALL_BLOCK_SIZE)
     assert_eq!(results.len(), 1, "should produce exactly 1 block");
@@ -1277,7 +1277,7 @@ async fn default_restore_writes_to_staging_not_origin() {
 
     let mut backup = test_backup_coord(db.clone(), &symbols_dir);
     backup.process_event(added_event(&original_path)).unwrap();
-    backup.flush_all(true).unwrap();
+    backup.flush_all(true, &Default::default()).unwrap();
 
     let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
     let request = super::RestoreRequest {
@@ -1460,7 +1460,7 @@ async fn restore_result_contains_staging_path() {
 
     let mut backup = test_backup_coord(db.clone(), &symbols_dir);
     backup.process_event(added_event(&path)).unwrap();
-    backup.flush_all(true).unwrap();
+    backup.flush_all(true, &Default::default()).unwrap();
 
     let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
     let request = super::RestoreRequest {

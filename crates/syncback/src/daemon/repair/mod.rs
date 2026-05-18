@@ -282,7 +282,9 @@ impl RepairAgent {
         // 6. Get candidates excluding old holder.
         //    Use full allocation: include surviving holders in candidates so compute_allocation
         //    can distribute correctly, then take only the new holder's allocation.
-        let candidates = self.get_candidates_excluding(old_holder_id)
+        //    Filter to authenticated (online) peers only; fallback to unfiltered if < 2 online.
+        let authenticated = self.snapshot_authenticated_peers().await;
+        let candidates = self.get_candidates_excluding(old_holder_id, &authenticated)
             .map_err(|e| RepairError::EncodeFailed(format!("get_candidates: {e}")))?;
 
         // compute_allocation needs at least 2 candidates.
@@ -510,9 +512,12 @@ impl RepairAgent {
     /// configured, soft-filters out peers currently on rejection cooldown
     /// (falls back to the unfiltered list when filtering would leave fewer
     /// than 2 candidates — compute_allocation needs at least 2).
+    /// Then filters to only authenticated (online) peers; falls back to
+    /// unfiltered if fewer than 2 authenticated candidates remain.
     fn get_candidates_excluding(
         &self,
         exclude: &DeviceId,
+        authenticated: &std::collections::HashSet<DeviceId>,
     ) -> anyhow::Result<Vec<HolderCandidate>> {
         let peers = self.db.list_all_peers()?;
         let candidates: Vec<HolderCandidate> = peers
@@ -532,7 +537,7 @@ impl RepairAgent {
             })
             .collect();
 
-        if let Some(backoff) = self.config.peer_backoff.as_ref() {
+        let candidates = if let Some(backoff) = self.config.peer_backoff.as_ref() {
             let raw = candidates.clone();
             let filtered = backoff.filter(candidates, 2, |c| &c.device_id);
             if filtered.is_empty() {
@@ -540,11 +545,55 @@ impl RepairAgent {
                     "repair: all candidates on backoff, falling back to raw list ({})",
                     raw.len()
                 );
-                return Ok(raw);
+                raw
+            } else {
+                filtered
             }
-            return Ok(filtered);
+        } else {
+            candidates
+        };
+
+        // Online filter: restrict to authenticated peers only.
+        let auth_filtered: Vec<HolderCandidate> = candidates
+            .iter()
+            .filter(|c| authenticated.contains(&c.device_id))
+            .cloned()
+            .collect();
+
+        if auth_filtered.len() < 2 {
+            // Fallback: authenticated set is empty or too small (boot, unit test without swarm).
+            tracing::debug!(
+                total = candidates.len(),
+                authenticated = authenticated.len(),
+                "repair: authenticated set too small, using unfiltered candidates"
+            );
+            return Ok(candidates);
         }
-        Ok(candidates)
+
+        // Log skipped unauthenticated peers at DEBUG level.
+        for c in &candidates {
+            if !authenticated.contains(&c.device_id) {
+                tracing::debug!(
+                    peer_id = %c.device_id,
+                    "repair: peer skipped — not authenticated"
+                );
+            }
+        }
+        Ok(auth_filtered)
+    }
+
+    /// Snapshot the set of currently-authenticated peer IDs from the swarm.
+    ///
+    /// Returns an empty set if no swarm is configured (unit tests, offline).
+    async fn snapshot_authenticated_peers(&self) -> std::collections::HashSet<DeviceId> {
+        match self.config.swarm.as_ref() {
+            Some(swarm) => swarm
+                .peer_sets()
+                .await
+                .map(|(auth, _)| auth)
+                .unwrap_or_default(),
+            None => std::collections::HashSet::new(),
+        }
     }
 
     /// Deliver symbols to a new holder using the SymbolOffer/Accept/Transfer flow.

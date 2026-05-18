@@ -125,7 +125,7 @@ async fn full_backup_restore_roundtrip() {
             device_id: DEVICE_A,
         })
         .unwrap();
-    let results = backup.flush_all(true).unwrap();
+    let results = backup.flush_all(true, &Default::default()).unwrap();
     assert!(!results.is_empty(), "backup should produce at least one block");
 
     // Restore phase
@@ -188,7 +188,7 @@ async fn backup_restore_pack_multiple_files() {
             .unwrap();
         paths.push(path);
     }
-    let results = backup.flush_all(true).unwrap();
+    let results = backup.flush_all(true, &Default::default()).unwrap();
     // All 3 small files fit in one block (total << SMALL_BLOCK_SIZE)
     assert_eq!(results.len(), 1, "all files should pack into one source block");
 

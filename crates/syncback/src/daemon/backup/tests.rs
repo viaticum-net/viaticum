@@ -189,7 +189,7 @@ fn flush_queue_below_min_batch_skips() {
     let path = write_file(&files_dir, "tiny.txt", &[0u8; 100]);
     coord.process_event(added_event(&path)).unwrap();
 
-    let results = coord.flush_queue(FileCategory::Document, false).unwrap();
+    let results = coord.flush_queue(FileCategory::Document, false, &Default::default()).unwrap();
     assert!(
         results.is_empty(),
         "should skip flush below MIN_BATCH_BYTES"
@@ -209,7 +209,7 @@ fn flush_queue_with_force_flushes_any_size() {
     let path = write_file(&files_dir, "tiny.txt", &[0u8; 100]);
     coord.process_event(added_event(&path)).unwrap();
 
-    let results = coord.flush_queue(FileCategory::Document, true).unwrap();
+    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
     assert!(!results.is_empty(), "force=true should flush any size");
 }
 
@@ -234,7 +234,7 @@ fn flush_queue_creates_source_block_record() {
         coord.process_event(added_event(&path)).unwrap();
     }
 
-    let results = coord.flush_queue(FileCategory::Document, false).unwrap();
+    let results = coord.flush_queue(FileCategory::Document, false, &Default::default()).unwrap();
     assert!(!results.is_empty(), "should produce results");
 
     for result in &results {
@@ -271,7 +271,7 @@ fn flush_queue_writes_symbol_files() {
         coord.process_event(added_event(&path)).unwrap();
     }
 
-    let results = coord.flush_queue(FileCategory::Document, true).unwrap();
+    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
     assert!(!results.is_empty());
 
     for result in &results {
@@ -311,7 +311,7 @@ fn flush_queue_updates_backed_up_at() {
     let before = db.get_file(&path).unwrap().unwrap();
     assert!(before.versions[0].backed_up_at.is_none());
 
-    coord.flush_queue(FileCategory::Document, true).unwrap();
+    coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
 
     let after = db.get_file(&path).unwrap().unwrap();
     assert!(
@@ -354,7 +354,7 @@ fn pipeline_roundtrip_can_decode() {
     let path = write_file(&files_dir, "data.txt", &repeated);
 
     coord.process_event(added_event(&path)).unwrap();
-    let results = coord.flush_queue(FileCategory::Document, true).unwrap();
+    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
     assert_eq!(results.len(), 1, "should produce one source block");
 
     let block_id = results[0].source_block_id;
@@ -476,7 +476,7 @@ fn flush_queue_appends_event_log() {
     let content = b"event log test document";
     let path = write_file(&files_dir, "eventlog.txt", content);
     coord.process_event(added_event(&path)).unwrap();
-    coord.flush_queue(FileCategory::Document, true).unwrap();
+    coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
 
     let events = db.events_after(0, 100).unwrap();
     let has_symbols_placed = events
@@ -1178,7 +1178,7 @@ fn same_content_two_devices_both_in_file_record() {
         })
         .unwrap();
     // Force flush so backed_up_at is set (dedup check requires backed_up_at=Some).
-    coord_a.flush_all(true).unwrap();
+    coord_a.flush_all(true, &Default::default()).unwrap();
 
     // Device B processes the same file with the same content.
     let config_b = BackupConfig {
@@ -1257,7 +1257,7 @@ fn flush_queue_deferred_files_remain_in_queue() {
     }
 
     // With budget=0, flush should defer all files and return empty.
-    let results = coord.flush_queue(FileCategory::Document, true).unwrap();
+    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
     assert!(results.is_empty(), "zero budget: no files should be processed");
 
     // All 3 files must remain in the queue.
@@ -1330,7 +1330,7 @@ fn flush_queue_budget_selects_highest_importance_first() {
         importance: 0.3,
     });
 
-    let results = coord.flush_queue(FileCategory::Document, true).unwrap();
+    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
 
     // At least one file should have been processed.
     assert!(!results.is_empty(), "at least one file should be processed");
@@ -1558,6 +1558,143 @@ fn compress_and_encrypt_roundtrip_with_deterministic_nonce() {
     assert_eq!(&decrypted, plaintext);
 }
 
+// ─── Wave-1 online filter tests ──────────────────────────────────────────────
+//
+// These tests exercise get_candidates() with a real DB (no mock_holders)
+// and explicit authenticated HashSets to verify the online filter logic.
+
+/// Build a coord that uses the real DB peer path (no mock_holders).
+fn test_coord_no_mock(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
+    use syncback_core::erasure::RaptorQEncoder;
+    let config = BackupConfig {
+        source_block_size: SMALL_BLOCK_SIZE,
+        symbols_dir: symbols_dir.path().to_path_buf(),
+        epoch_key: [42u8; 32],
+        device_id: DeviceId([1u8; 32]),
+        mock_holders: vec![], // empty → use DB path
+        cluster_state: None,
+        watch_configs: vec![],
+        time_scale: 1,
+        mock_offer_budget_gb: None,
+        master_signing_key: None,
+        swarm: None,
+        live_watch_configs: None,
+        peer_backoff: None,
+    };
+    BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
+}
+
+/// Insert a peer record with the given byte identity into the DB.
+fn insert_peer(db: &Db, byte: u8) -> DeviceId {
+    use syncback_core::types::{IdentityPub, PeerRecord, Timestamp};
+    let did = DeviceId([byte; 32]);
+    db.upsert_peer(&PeerRecord {
+        device_id: did,
+        master_identity: IdentityPub([byte; 32]),
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(1_700_000_000),
+        last_seen: Timestamp(1_700_000_000),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+    })
+    .unwrap();
+    did
+}
+
+/// Scenario 1: all 5 peers authenticated → get_candidates returns all 5.
+#[test]
+fn when_all_peers_authenticated_then_allocation_uses_all_candidates() {
+    use std::collections::HashSet;
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let coord = test_coord_no_mock(db.clone(), &symbols_dir);
+
+    let peer_ids: Vec<DeviceId> = (1u8..=5).map(|b| insert_peer(&db, b)).collect();
+    let authenticated: HashSet<DeviceId> = peer_ids.iter().cloned().collect();
+
+    let candidates = coord.get_candidates(&authenticated).unwrap();
+    assert_eq!(
+        candidates.len(),
+        5,
+        "all 5 authenticated peers must be returned as candidates"
+    );
+}
+
+/// Scenario 2: 3 of 5 peers authenticated → get_candidates returns only the 3.
+#[test]
+fn when_some_peers_unauthenticated_then_allocation_excludes_them() {
+    use std::collections::HashSet;
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let coord = test_coord_no_mock(db.clone(), &symbols_dir);
+
+    let peer_ids: Vec<DeviceId> = (1u8..=5).map(|b| insert_peer(&db, b)).collect();
+    // Only peers 1, 2, 3 are authenticated.
+    let authenticated: HashSet<DeviceId> = peer_ids[..3].iter().cloned().collect();
+
+    let candidates = coord.get_candidates(&authenticated).unwrap();
+    assert_eq!(candidates.len(), 3, "only 3 authenticated peers should be candidates");
+    let offline_ids: HashSet<DeviceId> = peer_ids[3..].iter().cloned().collect();
+    for c in &candidates {
+        assert!(
+            !offline_ids.contains(&c.device_id),
+            "unauthenticated peer {:?} must not appear in candidates",
+            c.device_id
+        );
+    }
+}
+
+/// Scenario 3: no peers authenticated → fallback to all 5 (no panic).
+#[test]
+fn when_all_peers_unauthenticated_then_fallback_to_raw_list() {
+    use std::collections::HashSet;
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let coord = test_coord_no_mock(db.clone(), &symbols_dir);
+
+    for b in 1u8..=5 {
+        insert_peer(&db, b);
+    }
+    let authenticated: HashSet<DeviceId> = HashSet::new(); // empty
+
+    let candidates = coord.get_candidates(&authenticated).unwrap();
+    assert_eq!(
+        candidates.len(),
+        5,
+        "fallback: all 5 peers must be returned when authenticated set is empty"
+    );
+}
+
+/// Scenario 4: peer comes online → next call with expanded authenticated set includes it.
+#[test]
+fn when_peer_comes_online_then_next_flush_includes_peer() {
+    use std::collections::HashSet;
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let coord = test_coord_no_mock(db.clone(), &symbols_dir);
+
+    let peer_ids: Vec<DeviceId> = (1u8..=4).map(|b| insert_peer(&db, b)).collect();
+
+    // First snapshot: only peers 1, 2, 3 online.
+    let auth_first: HashSet<DeviceId> = peer_ids[..3].iter().cloned().collect();
+    let candidates_first = coord.get_candidates(&auth_first).unwrap();
+    assert_eq!(candidates_first.len(), 3);
+    assert!(!candidates_first.iter().any(|c| c.device_id == peer_ids[3]),
+        "peer D must not be in candidates when not authenticated");
+
+    // Second snapshot: peer D comes online.
+    let auth_second: HashSet<DeviceId> = peer_ids.iter().cloned().collect();
+    let candidates_second = coord.get_candidates(&auth_second).unwrap();
+    assert_eq!(candidates_second.len(), 4);
+    assert!(candidates_second.iter().any(|c| c.device_id == peer_ids[3]),
+        "peer D must appear in candidates after coming online");
+}
+
 // AC-8, AC-9, AC-10 (pending_delivery signaling tests) removed in ε.5.
 // PendingDeliveries / OfferOutcome were iroh-era types; delivery now uses
 // libp2p SwarmHandle request-response. Network integration is tested in
@@ -1584,7 +1721,7 @@ fn pipeline_creates_offered_placements() {
         coord.process_event(added_event(&path)).unwrap();
     }
 
-    let results = coord.flush_queue(FileCategory::Document, true).unwrap();
+    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
     assert!(!results.is_empty(), "should produce at least one source block");
 
     for result in &results {

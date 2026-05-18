@@ -187,7 +187,7 @@ fn config_source_block_size_drives_backup() {
         .unwrap();
 
     // flush_all processes the pack queue → 1 Pack block result
-    let pack_results = backup.flush_all(true).unwrap();
+    let pack_results = backup.flush_all(true, &Default::default()).unwrap();
     assert_eq!(
         pack_results.len(),
         1,
@@ -570,7 +570,7 @@ async fn full_pipeline_with_phase4_integration() {
             device_id: DEVICE_A,
         })
         .unwrap();
-    let results = backup.flush_all(true).unwrap();
+    let results = backup.flush_all(true, &Default::default()).unwrap();
     assert!(!results.is_empty(), "backup must produce at least one source block");
 
     // Phase 2.5: mark first placement as Lost via PosNack

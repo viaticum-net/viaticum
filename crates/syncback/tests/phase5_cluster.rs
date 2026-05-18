@@ -133,7 +133,7 @@ fn two_devices_backup_then_dedup_on_second() {
             device_id: device_a_id(),
         })
         .unwrap();
-    let results_a = backup_a.flush_all(true).unwrap();
+    let results_a = backup_a.flush_all(true, &Default::default()).unwrap();
     assert_eq!(results_a.len(), 1, "device A creates one source block");
 
     // Verify backed_up_at is set in DB for the file backed up by A.
@@ -156,7 +156,7 @@ fn two_devices_backup_then_dedup_on_second() {
             device_id: device_b_id(),
         })
         .unwrap();
-    let results_b = backup_b.flush_all(true).unwrap();
+    let results_b = backup_b.flush_all(true, &Default::default()).unwrap();
     assert_eq!(
         results_b.len(),
         0,

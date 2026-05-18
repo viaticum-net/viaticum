@@ -647,3 +647,85 @@ async fn pos_fail_marks_lost_then_repair_restores_to_alive() {
     // Verify symbols_written is correct via the outcome (checked indirectly via placement ESI range).
     assert!(!new_p.esi_ranges.is_empty(), "new placement must have ESI ranges");
 }
+
+// ─── Wave-1 online filter tests for repair ───────────────────────────────────
+//
+// Coverage note: the async `repair_placement` path is not exercised end-to-end with a
+// non-empty authenticated set, because `snapshot_authenticated_peers()` reads from
+// `RepairAgentConfig::swarm` (`None` in tests) and falls back to an empty set —
+// hitting the `< 2` fallback. Filter logic is covered at the unit level by the tests
+// below. Full async coverage will arrive naturally in Wave 4 (unified worker) when
+// `authenticated` becomes an injectable parameter.
+
+/// Scenario 7: repair excludes offline peer (old holder) and picks authenticated alternative.
+/// peer_1 is old holder (offline, not in authenticated). peer_2, peer_3 are online.
+#[test]
+fn repair_placement_skips_offline_peer_and_picks_online_alternative() {
+    use std::collections::HashSet;
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let agent = make_agent(db.clone(), symbols_dir.path());
+
+    let p1 = holder_id(0xA1);
+    let p2 = holder_id(0xA2);
+    let p3 = holder_id(0xA3);
+
+    // Insert p2 and p3 as peers (not p1 — it's the excluded old holder).
+    for (byte, did) in [(0xA2, p2), (0xA3, p3)] {
+        db.upsert_peer(&PeerRecord {
+            device_id: did,
+            master_identity: IdentityPub([byte; 32]),
+            trust_p: 0.5,
+            trust_i: 0.5,
+            trust_s: 1.0,
+            bytes_we_store_for_peer: 0,
+            bytes_peer_stores_for_us: 0,
+            first_seen: now(),
+            last_seen: now(),
+            revoked_device_pub_keys: vec![],
+            addrs: vec![],
+            x25519_pub: None,
+        })
+        .unwrap();
+    }
+
+    // p2 and p3 are authenticated; p1 (old holder) is excluded by exclude param.
+    let authenticated: HashSet<DeviceId> = [p2, p3].iter().cloned().collect();
+    let candidates = agent.get_candidates_excluding(&p1, &authenticated).unwrap();
+
+    // Must contain exactly p2 and p3.
+    assert_eq!(candidates.len(), 2, "only 2 authenticated candidates expected");
+    for c in &candidates {
+        assert_ne!(c.device_id, p1, "old holder p1 must not be a candidate");
+        assert!(
+            authenticated.contains(&c.device_id),
+            "only authenticated peers must appear"
+        );
+    }
+}
+
+/// Scenario 8: all peers offline → fallback to raw list (no panic, no error on this level).
+#[test]
+fn repair_placement_falls_back_when_no_authenticated_candidates() {
+    use std::collections::HashSet;
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let agent = make_agent(db.clone(), symbols_dir.path());
+
+    let old_hid = holder_id(0xB0);
+    insert_candidate_peers(&db, 0xB1, 0xB2);
+
+    // Empty authenticated set.
+    let authenticated: HashSet<DeviceId> = HashSet::new();
+    let candidates = agent.get_candidates_excluding(&old_hid, &authenticated).unwrap();
+
+    // Fallback: should return all peers except old holder (2 peers).
+    assert_eq!(
+        candidates.len(),
+        2,
+        "fallback must return all non-excluded peers when authenticated set is empty"
+    );
+    for c in &candidates {
+        assert_ne!(c.device_id, old_hid, "old holder must still be excluded");
+    }
+}

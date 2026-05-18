@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use syncback_core::constants::{OFFERED_PLACEMENT_TIMEOUT_SECS, POS_TIMEOUT_SECS, S_CLAMP_MAX, S_CLAMP_MIN};
+use syncback_core::constants::{LONG_ABSENCE_SECS, POS_TIMEOUT_SECS, S_CLAMP_MAX, S_CLAMP_MIN};
 use syncback_core::trust::{compute_combined, compute_effective_trust, recalculate_trust};
 use syncback_core::db::Db;
 use syncback_core::deletion::{DeletionAction, DeletionEngine};
@@ -826,19 +826,20 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Sweep Offered placements that have exceeded the timeout threshold.
+    /// Sweep Offered placements that have exceeded the long-absence threshold.
     ///
     /// For each stale Offered placement:
     ///   1. Transition status to Lost via upsert_placement.
     ///   2. Send RepairTrigger::RepairNow { block_id, holder_id }.
     ///
     /// Called on the sweep_timer tick (same interval as accepted_offers pruning).
+    ///
+    /// Threshold: LONG_ABSENCE_SECS (14 days). Offered placements that receive a
+    /// real signal (PoS Fail/NotHeld, explicit Reject) transition independently.
+    /// This sweep is a safety net for peers that silently disappear for >14 days.
     pub async fn sweep_offered_placements(&self) -> anyhow::Result<()> {
         let now = Timestamp::now();
-        // Offered timeout is real-world network delivery time, NOT protocol time.
-        // Do NOT scale by time_scale — delivery takes real seconds regardless of
-        // how fast we run PoS/escrow timers.
-        let threshold = OFFERED_PLACEMENT_TIMEOUT_SECS;
+        let threshold = LONG_ABSENCE_SECS;
 
         let placements = self.db.list_all_placements()?;
         for p in &placements {
@@ -849,7 +850,7 @@ impl Scheduler {
             if age < threshold {
                 continue;
             }
-            // Transition Offered → Lost.
+            // Long absence: 14 days without any real signal.
             let mut updated = p.clone();
             updated.status = PlacementStatus::Lost;
             self.db.upsert_placement(&updated)?;
@@ -857,8 +858,8 @@ impl Scheduler {
             info!(
                 block_id = %p.source_block_id,
                 holder = %p.holder_id,
-                age_secs = age,
-                "scheduler: Offered placement timed out → Lost"
+                age_days = age / 86_400,
+                "scheduler: Offered placement absent > 14 days → Lost"
             );
 
             let _ = self

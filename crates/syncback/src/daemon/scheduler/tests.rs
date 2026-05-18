@@ -582,14 +582,14 @@ async fn deletion_tick_noop_when_no_eligible_files() {
 
 // ─── B3: sweep_offered_placements tests ──────────────────────────────────────
 
-/// An Offered placement past its timeout threshold is marked Lost and triggers repair.
+/// An Offered placement past the 14-day long-absence threshold is marked Lost and triggers repair.
 #[tokio::test]
-async fn offered_placement_timeout_marks_lost() {
+async fn scheduler_transitions_offered_to_lost_after_long_absence() {
     let db = Db::open_in_memory().unwrap();
     let block_id = make_block_id(20);
     let holder_id = make_identity(21);
 
-    // Place far in the past so it's definitely timed out.
+    // Place far in the past (Unix epoch 0) — age >> 14 days.
     let ancient = Timestamp(0);
     let placement = SymbolPlacement {
         source_block_id: block_id,
@@ -609,8 +609,8 @@ async fn offered_placement_timeout_marks_lost() {
     let pending = make_pending_challenges();
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
 
-    // Threshold = OFFERED_PLACEMENT_TIMEOUT_SECS = 300 s (not scaled).
-    // placed_at = 0 means age = now >> 300 s.
+    // Threshold = LONG_ABSENCE_SECS = 14 days.
+    // placed_at = 0 means age = now >> 14 days → must become Lost.
     let config = SchedulerConfig {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
@@ -641,7 +641,7 @@ async fn offered_placement_timeout_marks_lost() {
     assert_eq!(
         updated.status,
         PlacementStatus::Lost,
-        "timed-out Offered placement should become Lost"
+        "Offered placement absent > 14 days should become Lost"
     );
 
     // repair_tx should have received RepairNow.
@@ -658,14 +658,15 @@ async fn offered_placement_timeout_marks_lost() {
     }
 }
 
-/// An Offered placement that was just created is NOT swept.
+/// An Offered placement less than 14 days old is NOT swept.
 #[tokio::test]
-async fn offered_placement_not_swept_before_timeout() {
+async fn scheduler_does_not_transition_offered_to_lost_before_long_absence() {
     let db = Db::open_in_memory().unwrap();
     let block_id = make_block_id(22);
     let holder_id = make_identity(23);
 
-    // Created right now — age ≈ 0, far below SYMBOL_OFFER_TIMEOUT_SECS.
+    // 1 day ago — well below the 14-day LONG_ABSENCE_SECS threshold.
+    let one_day_ago = Timestamp(Timestamp::now().0.saturating_sub(86_400));
     let placement = SymbolPlacement {
         source_block_id: block_id,
         holder_id,
@@ -674,7 +675,7 @@ async fn offered_placement_not_swept_before_timeout() {
         binding_seed: [0u8; 32],
         status: PlacementStatus::Offered,
         last_verified: None,
-        placed_at: Timestamp::now(),
+        placed_at: one_day_ago,
         consecutive_misses: 0,
     };
     db.upsert_placement(&placement).unwrap();
@@ -706,7 +707,7 @@ async fn offered_placement_not_swept_before_timeout() {
 
     scheduler.sweep_offered_placements().await.unwrap();
 
-    // Placement should remain Offered — not yet expired.
+    // Placement should remain Offered — only 1 day old, threshold is 14 days.
     let updated = db
         .get_placement(&block_id, &holder_id)
         .unwrap()
@@ -714,13 +715,13 @@ async fn offered_placement_not_swept_before_timeout() {
     assert_eq!(
         updated.status,
         PlacementStatus::Offered,
-        "fresh Offered placement must not be swept"
+        "Offered placement younger than 14 days must not be swept"
     );
 
     // No repair triggered.
     assert!(
         repair_rx.try_recv().is_err(),
-        "no repair should be triggered for fresh Offered placement"
+        "no repair should be triggered for placement below long-absence threshold"
     );
 }
 

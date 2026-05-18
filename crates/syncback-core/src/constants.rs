@@ -276,6 +276,11 @@ pub const SYMBOL_OFFER_TIMEOUT_SECS: u64 = 30;
 /// 300s = 5 minutes — same as SYMBOL_OFFER_EXPIRY_SECS.
 pub const OFFERED_PLACEMENT_TIMEOUT_SECS: u64 = 300;
 
+/// Long-absence threshold for Offered placements (seconds).
+/// Offered → Lost only after this interval if no real signal received.
+/// Default: 14 days.
+pub const LONG_ABSENCE_SECS: u64 = 14 * 24 * 3600; // 1_209_600
+
 /// Stale accepted offer expiry (seconds). AcceptedOffers older than this are
 /// discarded on next access even if no Transfer arrived.
 pub const SYMBOL_OFFER_EXPIRY_SECS: u64 = 300;
