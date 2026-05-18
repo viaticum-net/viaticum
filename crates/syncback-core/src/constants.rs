@@ -265,6 +265,17 @@ pub const RELIABILITY_REPAIR_THRESHOLD: f64 = 0.99;
 /// approximation for N >= this value.
 pub const BINOMIAL_EXACT_THRESHOLD: u32 = 100;
 
+// === Priority scheduling ===
+
+/// Default completion bonus coefficient for the priority formula.
+/// `priority = importance × (1 + k × current_alive / n_target)`
+/// At k=1.5: a block at 90% completion has priority ≈ 2.35× its importance.
+pub const DEFAULT_COMPLETION_BONUS_COEFFICIENT: f64 = 1.5;
+
+/// Maximum allowed value for completion_bonus_coefficient in config.
+/// Above this the completion bonus dominates even large importance differences.
+pub const MAX_COMPLETION_BONUS_COEFFICIENT: f64 = 5.0;
+
 // === Dynamic N bounds ===
 
 /// Minimum extra symbols beyond k_eff: n >= k_eff + MIN_REDUNDANCY.

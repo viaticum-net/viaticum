@@ -14,6 +14,7 @@ pub mod escrow;
 pub mod messages;
 pub mod path_safety;
 pub mod placement;
+pub mod priority;
 pub mod reliability;
 pub mod pos;
 pub mod trust;

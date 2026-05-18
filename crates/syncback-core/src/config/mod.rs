@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::constants::{
-    DEFAULT_CLUSTER_SYNC_BATCH_SIZE, DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_K_FACTOR,
-    DEFAULT_MAX_VERSIONS, DEFAULT_MAX_VERSION_AGE_SECS, DEFAULT_SOURCE_BLOCK_SIZE,
-    MAX_BOARD_ENTRIES, MAX_BOARD_SIZE_BYTES, RELAY_TTL_SECS,
+    DEFAULT_CLUSTER_SYNC_BATCH_SIZE, DEFAULT_COMPLETION_BONUS_COEFFICIENT,
+    DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_K_FACTOR, DEFAULT_MAX_VERSIONS,
+    DEFAULT_MAX_VERSION_AGE_SECS, DEFAULT_SOURCE_BLOCK_SIZE, MAX_BOARD_ENTRIES,
+    MAX_BOARD_SIZE_BYTES, MAX_COMPLETION_BONUS_COEFFICIENT, RELAY_TTL_SECS,
 };
 
 #[cfg(test)]
@@ -311,6 +312,34 @@ impl Default for RestoreCfg {
 }
 
 // ============================================================
+// Reliability config
+// ============================================================
+
+/// [reliability] — scheduling and placement reliability parameters.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ReliabilityConfig {
+    /// Completion bonus coefficient for the priority formula.
+    ///
+    /// Formula: `priority = importance × (1 + k × current_alive / n_target)`
+    ///
+    /// * `0.0` — pure importance ordering; completion progress ignored.
+    /// * `1.5` (default) — near-done blocks at same importance beat new blocks.
+    /// * `5.0` (max) — strong preference for finishing blocks over starting new ones.
+    ///
+    /// Range: [0.0, 5.0]. Values outside range are clamped with a WARN log.
+    pub completion_bonus_coefficient: f64,
+}
+
+impl Default for ReliabilityConfig {
+    fn default() -> Self {
+        Self {
+            completion_bonus_coefficient: DEFAULT_COMPLETION_BONUS_COEFFICIENT,
+        }
+    }
+}
+
+// ============================================================
 // Top-level config
 // ============================================================
 
@@ -327,6 +356,7 @@ pub struct AppConfig {
     pub metrics: MetricsCfg,
     pub web_api: WebApiCfg,
     pub restore: RestoreCfg,
+    pub reliability: ReliabilityConfig,
     /// Per-directory watch configuration.
     /// Listed as [[watch]] array in config.toml.
     /// When empty, watch_dirs from CLI are used with DEFAULT_IMPORTANCE.
@@ -337,13 +367,32 @@ impl AppConfig {
     /// Load config from a TOML file at `path`.
     ///
     /// Missing fields in the file are filled with `Default::default()`.
-    /// After deserialization, `validate()` is called — returns Err if any
-    /// constraint is violated.
+    /// After deserialization, `normalize()` clamps out-of-range values, then
+    /// `validate()` is called — returns Err if any hard constraint is violated.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)?;
-        let cfg: AppConfig = toml::from_str(&contents)?;
+        let mut cfg: AppConfig = toml::from_str(&contents)?;
+        cfg.normalize();
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Clamp any out-of-range config values, emitting WARN logs for each clamp.
+    ///
+    /// Called by `load()` after deserialization and before `validate()`.
+    /// Absent fields are handled by `serde(default)` — no log for missing fields.
+    fn normalize(&mut self) {
+        let r = &mut self.reliability;
+        let original = r.completion_bonus_coefficient;
+        r.completion_bonus_coefficient =
+            r.completion_bonus_coefficient.clamp(0.0, MAX_COMPLETION_BONUS_COEFFICIENT);
+        if (r.completion_bonus_coefficient - original).abs() > f64::EPSILON {
+            tracing::warn!(
+                original,
+                clamped = r.completion_bonus_coefficient,
+                "reliability.completion_bonus_coefficient out of range; clamped"
+            );
+        }
     }
 
     /// Return a fully-populated config with all defaults.

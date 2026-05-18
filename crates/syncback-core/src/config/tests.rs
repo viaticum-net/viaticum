@@ -3,9 +3,10 @@ use std::io::Write;
 
 #[cfg(test)]
 use crate::config::{
-    AppConfig, BackupCfg, ClusterCfg, ConfigError, EscrowCfg, MetricsCfg, NetworkCfg, RestoreCfg, StorageCfg, WatchConfig, WebApiCfg,
-    disk_reserve_bytes, expand_data_dir, hard_quota_bytes, lookup_importance, soft_quota_bytes,
-    source_block_size_bytes, DEFAULT_IMPORTANCE,
+    AppConfig, BackupCfg, ClusterCfg, ConfigError, EscrowCfg, MetricsCfg, NetworkCfg,
+    ReliabilityConfig, RestoreCfg, StorageCfg, WatchConfig, WebApiCfg, disk_reserve_bytes,
+    expand_data_dir, hard_quota_bytes, lookup_importance, soft_quota_bytes, source_block_size_bytes,
+    DEFAULT_IMPORTANCE,
 };
 #[cfg(test)]
 use crate::constants::{
@@ -84,6 +85,7 @@ fn config_roundtrips_all_fields() {
         metrics: MetricsCfg::default(),
         web_api: WebApiCfg::default(),
         restore: RestoreCfg::default(),
+        reliability: ReliabilityConfig::default(),
         watch: vec![],
     };
 
@@ -632,5 +634,67 @@ fn restore_fetch_timeout_zero_is_rejected() {
     assert!(
         matches!(err, ConfigError::Validation { ref field, .. } if field == "restore.fetch_timeout_secs"),
         "expected Validation error for restore.fetch_timeout_secs, got: {err:?}"
+    );
+}
+
+// ============================================================
+// ReliabilityConfig tests
+// ============================================================
+
+#[test]
+fn config_completion_bonus_coefficient_defaults_to_1_5() {
+    use crate::constants::DEFAULT_COMPLETION_BONUS_COEFFICIENT;
+    let cfg = AppConfig::default();
+    assert!(
+        (cfg.reliability.completion_bonus_coefficient - DEFAULT_COMPLETION_BONUS_COEFFICIENT).abs() < 1e-9,
+        "expected {DEFAULT_COMPLETION_BONUS_COEFFICIENT}, got {}",
+        cfg.reliability.completion_bonus_coefficient
+    );
+    assert!(
+        (cfg.reliability.completion_bonus_coefficient - 1.5).abs() < 1e-9,
+        "expected 1.5, got {}",
+        cfg.reliability.completion_bonus_coefficient
+    );
+}
+
+#[test]
+fn config_completion_bonus_coefficient_clamps_above_max() {
+    use crate::constants::MAX_COMPLETION_BONUS_COEFFICIENT;
+    let toml_str = "[reliability]\ncompletion_bonus_coefficient = 7.0\n";
+    let f = write_toml(toml_str);
+    let cfg = AppConfig::load(f.path()).unwrap();
+    assert!(
+        (cfg.reliability.completion_bonus_coefficient - MAX_COMPLETION_BONUS_COEFFICIENT).abs() < 1e-9,
+        "expected clamped to {MAX_COMPLETION_BONUS_COEFFICIENT}, got {}",
+        cfg.reliability.completion_bonus_coefficient
+    );
+}
+
+#[test]
+fn config_completion_bonus_coefficient_clamps_below_zero() {
+    let toml_str = "[reliability]\ncompletion_bonus_coefficient = -1.0\n";
+    let f = write_toml(toml_str);
+    let cfg = AppConfig::load(f.path()).unwrap();
+    assert!(
+        (cfg.reliability.completion_bonus_coefficient - 0.0).abs() < 1e-9,
+        "expected clamped to 0.0, got {}",
+        cfg.reliability.completion_bonus_coefficient
+    );
+}
+
+#[test]
+fn config_completion_bonus_coefficient_round_trip_serialize_deserialize() {
+    let cfg = AppConfig {
+        reliability: ReliabilityConfig {
+            completion_bonus_coefficient: 3.0,
+        },
+        ..Default::default()
+    };
+    let toml_str = toml::to_string(&cfg).unwrap();
+    let cfg2: AppConfig = toml::from_str(&toml_str).unwrap();
+    assert!(
+        (cfg2.reliability.completion_bonus_coefficient - 3.0_f64).abs() < 1e-9,
+        "expected 3.0, got {}",
+        cfg2.reliability.completion_bonus_coefficient
     );
 }
