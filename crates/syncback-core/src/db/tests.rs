@@ -2222,3 +2222,395 @@ fn transition_non_offered_placement_is_noop() {
     assert_eq!(p.placed_at, Timestamp(500), "placed_at unchanged");
     assert_eq!(p.status, PlacementStatus::Alive);
 }
+
+// ============================================================
+// next_work_item tests
+// ============================================================
+
+#[allow(clippy::too_many_arguments)]
+fn make_block_with(
+    seed: u8,
+    status: SourceBlockStatus,
+    importance: f64,
+    current_alive: u32,
+    n: Option<u32>,
+    current_reliability: f64,
+    target_reliability: f64,
+    last_attempted_at: Option<Timestamp>,
+    last_pool_sig: u64,
+) -> SourceBlockRecord {
+    SourceBlockRecord {
+        block_id: SourceBlockId([seed; 32]),
+        k: 10,
+        t: 65535,
+        block_type: SourceBlockType::Single,
+        status,
+        created_at: Timestamp(1000),
+        encrypted_size: None,
+        n,
+        overhead: None,
+        drop_notice_sent_at: None,
+        importance,
+        current_alive,
+        current_reliability,
+        target_reliability,
+        last_attempted_at,
+        last_pool_signature: last_pool_sig,
+    }
+}
+
+#[test]
+fn next_work_item_returns_none_when_db_empty() {
+    let db = Db::open_in_memory().unwrap();
+    let result = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), Timestamp(9999), 0xABCD)
+        .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn next_work_item_returns_none_when_all_blocks_at_target_reliability() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(9999);
+
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.999, 0.999, None, 0);
+    let b = make_block_with(2, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.9999, 0.9996, None, 0);
+    let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 5, Some(10), 1.0, 0.9, None, 0);
+    db.upsert_source_block(&a).unwrap();
+    db.upsert_source_block(&b).unwrap();
+    db.upsert_source_block(&c).unwrap();
+
+    let result = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn next_work_item_returns_none_when_no_active_blocks_need_work() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(9999);
+
+    let a = make_block_with(1, SourceBlockStatus::Deleting, 0.8, 0, Some(10), 0.5, 0.999, None, 0);
+    let b = make_block_with(2, SourceBlockStatus::Stale, 0.8, 0, Some(10), 0.3, 0.999, None, 0);
+    db.upsert_source_block(&a).unwrap();
+    db.upsert_source_block(&b).unwrap();
+
+    let result = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn next_work_item_picks_highest_priority() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(9999);
+
+    // priority(A) = 0.5 * (1 + 1.5 * 12/14) ≈ 1.143
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.5, 12, Some(14), 0.5, 0.999, None, 0);
+    // priority(B) = 1.0 * (1 + 0) = 1.0
+    let b = make_block_with(2, SourceBlockStatus::Active, 1.0, 0, Some(12), 0.0, 0.999, None, 0);
+    // priority(C) = 0.8 * (1 + 1.5 * 0.5) = 0.8 * 1.75 = 1.4
+    let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 6, Some(12), 0.4, 0.999, None, 0);
+    db.upsert_source_block(&a).unwrap();
+    db.upsert_source_block(&b).unwrap();
+    db.upsert_source_block(&c).unwrap();
+
+    let result = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.block_id, SourceBlockId([3; 32]), "Block C has highest priority (1.4)");
+}
+
+#[test]
+fn next_work_item_uses_coef_from_param() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(9999);
+
+    // priority(A, coef=0) = 0.5, priority(A, coef=5) = 0.5 * (1 + 5*0.9) = 0.5 * 5.5 = 2.75
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.5, 9, Some(10), 0.4, 0.999, None, 0);
+    // priority(B, coef=0) = 0.6, priority(B, coef=5) = 0.6
+    let b = make_block_with(2, SourceBlockStatus::Active, 0.6, 0, Some(10), 0.3, 0.999, None, 0);
+    db.upsert_source_block(&a).unwrap();
+    db.upsert_source_block(&b).unwrap();
+
+    let result_coef0 = db
+        .next_work_item(0.0, std::time::Duration::from_secs(30), now, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result_coef0.block_id, SourceBlockId([2; 32]), "Block B wins when coef=0");
+
+    let result_coef5 = db
+        .next_work_item(5.0, std::time::Duration::from_secs(30), now, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result_coef5.block_id, SourceBlockId([1; 32]), "Block A wins when coef=5");
+}
+
+#[test]
+fn next_work_item_tiebreaks_by_last_attempted_at_ascending() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(99999);
+
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999, Some(Timestamp(1000)), 0);
+    let b = make_block_with(2, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999, Some(Timestamp(500)), 0);
+    let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999, Some(Timestamp(2000)), 0);
+    db.upsert_source_block(&a).unwrap();
+    db.upsert_source_block(&b).unwrap();
+    db.upsert_source_block(&c).unwrap();
+
+    let result = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.block_id, SourceBlockId([2; 32]), "Block B has earliest last_attempted_at=500");
+}
+
+#[test]
+fn next_work_item_never_attempted_beats_recently_attempted() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(99999);
+
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.7, 3, Some(10), 0.3, 0.999, Some(Timestamp(0)), 0);
+    let b = make_block_with(2, SourceBlockStatus::Active, 0.7, 3, Some(10), 0.3, 0.999, None, 0);
+    db.upsert_source_block(&a).unwrap();
+    db.upsert_source_block(&b).unwrap();
+
+    let result = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.block_id, SourceBlockId([2; 32]), "Block B (never attempted) wins over Block A");
+}
+
+#[test]
+fn next_work_item_deterministic_tiebreak_by_block_id() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(9999);
+
+    // Both blocks: same priority, last_attempted_at=None. Block B has seed=0x00 (smaller).
+    let a = make_block_with(0x01, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999, None, 0);
+    let b = make_block_with(0x00, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999, None, 0);
+    db.upsert_source_block(&a).unwrap();
+    db.upsert_source_block(&b).unwrap();
+
+    let result1 = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .unwrap()
+        .unwrap();
+    let result2 = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result1.block_id, SourceBlockId([0x00; 32]), "Block with smaller block_id wins");
+    assert_eq!(result1.block_id, result2.block_id, "Result is deterministic across two calls");
+}
+
+#[test]
+fn next_work_item_excludes_deleting_blocks() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(9999);
+
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.5, 0, Some(10), 0.0, 0.999, None, 0);
+    let b = make_block_with(2, SourceBlockStatus::Deleting, 1.0, 0, Some(10), 0.0, 0.999, None, 0);
+    db.upsert_source_block(&a).unwrap();
+    db.upsert_source_block(&b).unwrap();
+
+    let result = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.block_id, SourceBlockId([1; 32]), "Deleting block excluded despite higher importance");
+}
+
+#[test]
+fn next_work_item_excludes_blocks_in_cooldown() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(1000);
+
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999, Some(Timestamp(990)), 0xABCD);
+    db.upsert_source_block(&a).unwrap();
+
+    // Elapsed: 10s < 30s cooldown, same pool sig → in cooldown.
+    let result = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0xABCD)
+        .unwrap();
+    assert!(result.is_none(), "Block A is in cooldown");
+}
+
+#[test]
+fn next_work_item_includes_block_after_cooldown_expires() {
+    let db = Db::open_in_memory().unwrap();
+
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999, Some(Timestamp(1000)), 0xABCD);
+    db.upsert_source_block(&a).unwrap();
+
+    // 25s < 30s → still in cooldown.
+    let result_during = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), Timestamp(1025), 0xABCD)
+        .unwrap();
+    assert!(result_during.is_none(), "25s < 30s: still in cooldown");
+
+    // 31s >= 30s → cooldown expired.
+    let result_after = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), Timestamp(1031), 0xABCD)
+        .unwrap();
+    assert!(result_after.is_some(), "31s >= 30s: cooldown expired");
+    assert_eq!(result_after.unwrap().block_id, SourceBlockId([1; 32]));
+}
+
+#[test]
+fn next_work_item_includes_block_when_pool_signature_changes() {
+    let db = Db::open_in_memory().unwrap();
+
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999, Some(Timestamp(1000)), 0xABCD);
+    db.upsert_source_block(&a).unwrap();
+
+    // Same pool: 10s < 30s → in cooldown.
+    let result_same_pool = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), Timestamp(1010), 0xABCD)
+        .unwrap();
+    assert!(result_same_pool.is_none(), "Same pool: block in cooldown");
+
+    // Pool changed: cooldown bypassed.
+    let result_new_pool = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), Timestamp(1010), 0xDEAD)
+        .unwrap();
+    assert!(result_new_pool.is_some(), "Pool changed: cooldown bypassed");
+    assert_eq!(result_new_pool.unwrap().block_id, SourceBlockId([1; 32]));
+}
+
+#[test]
+fn next_work_item_skips_cooldown_when_current_pool_signature_zero() {
+    let db = Db::open_in_memory().unwrap();
+
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999, Some(Timestamp(1000)), 0xABCD);
+    db.upsert_source_block(&a).unwrap();
+
+    // 10s < 30s would be in cooldown, but current_pool_sig=0 bypasses it.
+    let result = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), Timestamp(1010), 0)
+        .unwrap();
+    assert!(result.is_some(), "Cooldown skipped when current_pool_sig=0");
+    assert_eq!(result.unwrap().block_id, SourceBlockId([1; 32]));
+}
+
+#[test]
+fn next_work_item_excludes_blocks_with_target_reliability_zero() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(9999);
+
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.0, None, 0);
+    let b = make_block_with(2, SourceBlockStatus::Active, 0.5, 0, Some(10), 0.0, 0.999, None, 0);
+    db.upsert_source_block(&a).unwrap();
+    db.upsert_source_block(&b).unwrap();
+
+    let result = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.block_id, SourceBlockId([2; 32]), "Block A excluded (target_reliability=0.0)");
+}
+
+#[test]
+fn next_work_item_excludes_blocks_at_or_above_target() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(9999);
+
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.999, 0.999, None, 0);
+    let b = make_block_with(2, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.9999, 0.999, None, 0);
+    let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.99, 0.999, None, 0);
+    db.upsert_source_block(&a).unwrap();
+    db.upsert_source_block(&b).unwrap();
+    db.upsert_source_block(&c).unwrap();
+
+    let result = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.block_id, SourceBlockId([3; 32]), "Only Block C is below target");
+}
+
+#[test]
+fn next_work_item_deterministic_for_given_state() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(9999);
+
+    for seed in 0u8..5 {
+        let b = make_block_with(seed, SourceBlockStatus::Active, 0.3 + seed as f64 * 0.1, seed as u32, Some(10), 0.0, 0.999, None, 0);
+        db.upsert_source_block(&b).unwrap();
+    }
+
+    let result1 = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0xABCD)
+        .unwrap();
+    let result2 = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0xABCD)
+        .unwrap();
+    assert_eq!(
+        result1.map(|b| b.block_id),
+        result2.map(|b| b.block_id),
+        "Two calls with identical state return identical result"
+    );
+}
+
+#[test]
+fn next_work_item_does_not_mutate_block_records() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(9999);
+
+    let block = make_block_with(1, SourceBlockStatus::Active, 0.8, 3, Some(10), 0.3, 0.999, Some(Timestamp(500)), 0xABCD);
+    db.upsert_source_block(&block).unwrap();
+
+    let before = db.get_source_block(&SourceBlockId([1; 32])).unwrap().unwrap();
+    db.next_work_item(1.5, std::time::Duration::from_secs(30), now, 0).unwrap();
+    let after = db.get_source_block(&SourceBlockId([1; 32])).unwrap().unwrap();
+
+    assert_eq!(before.last_attempted_at, after.last_attempted_at, "last_attempted_at unchanged");
+    assert_eq!(before.last_pool_signature, after.last_pool_signature, "last_pool_signature unchanged");
+    assert_eq!(before.current_alive, after.current_alive, "current_alive unchanged");
+    assert_eq!(before.current_reliability, after.current_reliability, "current_reliability unchanged");
+}
+
+#[test]
+fn next_work_item_handles_n_none_legacy_blocks() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(9999);
+
+    // n=None → priority = importance = 0.7 (no completion bonus)
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.7, 0, None, 0.3, 0.999, None, 0);
+    db.upsert_source_block(&a).unwrap();
+
+    let result = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .unwrap();
+    assert!(result.is_some(), "Legacy block (n=None) is returned");
+
+    // Add Block B with n=Some(10), current_alive=5: priority = 0.7 * 1.75 = 1.225 > 0.7
+    let b = make_block_with(2, SourceBlockStatus::Active, 0.7, 5, Some(10), 0.3, 0.999, None, 0);
+    db.upsert_source_block(&b).unwrap();
+
+    let result2 = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result2.block_id, SourceBlockId([2; 32]), "Block B wins: completion bonus applies");
+}
+
+#[test]
+fn next_work_item_with_only_non_active_blocks_returns_none() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(9999);
+
+    let a = make_block_with(1, SourceBlockStatus::Stale, 0.8, 0, Some(10), 0.0, 0.999, None, 0);
+    let b = make_block_with(2, SourceBlockStatus::Deleted, 0.8, 0, Some(10), 0.0, 0.999, None, 0);
+    db.upsert_source_block(&a).unwrap();
+    db.upsert_source_block(&b).unwrap();
+
+    let result = db
+        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .unwrap();
+    assert!(result.is_none(), "Non-Active blocks never returned");
+}

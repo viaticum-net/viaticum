@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use redb::{ReadableTable, ReadableTableMetadata, TableDefinition};
 
@@ -574,6 +575,85 @@ impl Db {
             .iter()
             .map(|b| b.encrypted_size.unwrap_or(b.k as u64 * b.t as u64))
             .sum())
+    }
+
+    /// Return the highest-priority source block that needs work, or `None` if nothing to do.
+    ///
+    /// "Needs work" means: `status == Active`, `target_reliability > 0.0`, and
+    /// `current_reliability < target_reliability`.
+    ///
+    /// Blocks in cooldown are excluded. A block is in cooldown when:
+    /// - it was attempted recently (`last_attempted_at` is `Some(t)` with `now - t < cooldown`), AND
+    /// - the authenticated peer pool has not changed (`last_pool_signature == current_pool_sig`).
+    ///
+    /// Cooldown is skipped entirely when `current_pool_sig == 0` (no authenticated peers).
+    ///
+    /// The returned block is the one with the highest `priority` among eligible blocks.
+    /// Priority formula: `importance × (1 + coef × (current_alive / n_target))`.
+    /// Ties are broken by `last_attempted_at ASC` (never-attempted wins), then `block_id ASC`.
+    ///
+    /// # Arguments
+    ///
+    /// * `coef` — completion bonus coefficient from `ReliabilityConfig`. Typically 1.5.
+    /// * `cooldown` — cooldown window. Typically `Duration::from_secs(cfg.reliability.cooldown_base_secs)`.
+    /// * `now` — current time. Pass `Timestamp::now()` in production; pass a fixed value in tests.
+    /// * `current_pool_sig` — XxHash64 of the sorted authenticated peer DeviceId set at this moment.
+    ///   `0` = no authenticated peers (cooldown bypassed).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some(record))` — the block to work on next.
+    /// `Ok(None)` — no block needs work (all at target, or all eligible are in cooldown).
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError` only if the underlying DB read fails.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    ///
+    /// # Read-only guarantee
+    ///
+    /// This function does NOT mutate any DB record. The caller (Wave 11 worker) is responsible
+    /// for writing `last_attempted_at` and `last_pool_signature` after dispatching work.
+    pub fn next_work_item(
+        &self,
+        coef: f64,
+        cooldown: Duration,
+        now: Timestamp,
+        current_pool_sig: u64,
+    ) -> Result<Option<SourceBlockRecord>, DbError> {
+        let all = self.list_all_source_blocks()?;
+        let cooldown_secs = cooldown.as_secs();
+
+        let eligible = all.into_iter().filter(|b| {
+            if b.status != SourceBlockStatus::Active {
+                return false;
+            }
+            if b.target_reliability <= 0.0 || b.current_reliability >= b.target_reliability {
+                return false;
+            }
+            if current_pool_sig != 0 {
+                if let Some(last_at) = b.last_attempted_at {
+                    let elapsed = now.0.saturating_sub(last_at.0);
+                    if elapsed < cooldown_secs && b.last_pool_signature == current_pool_sig {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+
+        let winner = eligible.max_by(|a, b| {
+            let pa = crate::priority::priority(a.importance, a.current_alive, a.n.unwrap_or(0), coef);
+            let pb = crate::priority::priority(b.importance, b.current_alive, b.n.unwrap_or(0), coef);
+            pa.total_cmp(&pb)
+                .then(a.last_attempted_at.cmp(&b.last_attempted_at).reverse())
+                .then(a.block_id.0.cmp(&b.block_id.0).reverse())
+        });
+
+        Ok(winner)
     }
 }
 
