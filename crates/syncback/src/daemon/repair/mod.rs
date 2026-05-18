@@ -37,8 +37,9 @@ pub struct RepairConfig {
     /// (same directory as symbols_dir in practice — the block lives alongside symbols).
     pub source_blocks_dir: std::path::PathBuf,
 
-    /// Directory for symbol files (`.bin` format, same as BackupCoordinator):
-    /// `{symbols_dir}/{hex(block_id)}/{esi}.bin`
+    /// Directory for raw symbol files (Wave 2 layout):
+    /// `{symbols_dir}/{hex(block_id)}/raw/{esi}.bin`
+    /// Used by repair to load raw symbols without re-encoding.
     pub symbols_dir: std::path::PathBuf,
 
     /// Epoch key for re-deriving binding keys (same as BackupCoordinator uses).
@@ -306,43 +307,55 @@ impl RepairAgent {
         let new_holder_id = new_alloc.device_id;
 
         // 7. Rebuild blob from source files (block.bin is normally absent after delivery).
-        let source_data = self.load_or_rebuild_blob(block_id).await?;
-
-        // 8. Encode symbols for the new holder (spawn_blocking for CPU-bound work).
-        let source_data_clone = source_data.clone();
-        let params_clone = params;
-        let block_id_clone = *block_id;
-        let new_holder_clone = new_holder_id;
+        //    Needed only if raw/ files are missing (fallback path).
         let start_esi = new_alloc.start_esi;
         let symbol_count = new_alloc.symbol_count;
-        let encoder = Arc::clone(&self.encoder);
 
-        let symbols = tokio::task::spawn_blocking(move || {
-            encoder.encode(
-                &source_data_clone,
-                &params_clone,
-                start_esi,
-                symbol_count,
-                &block_id_clone,
-                &new_holder_clone,
-            )
-        })
-        .await
-        .map_err(|e| RepairError::EncodeFailed(e.to_string()))?
-        .map_err(|e| RepairError::EncodeFailed(e.to_string()))?;
+        // 8. Load raw symbols from raw/ subdir; fall back to encode_raw if missing.
+        let raw_esi_range = vec![(start_esi, symbol_count)];
+        let raw_symbols =
+            match crate::daemon::backup::pipeline::read_raw_symbols_for_block(
+                &self.config.symbols_dir,
+                block_id,
+                &raw_esi_range,
+            ) {
+                Ok(raws) => {
+                    tracing::debug!(
+                        block_id = %block_id,
+                        start_esi,
+                        symbol_count,
+                        "repair: loaded raw symbols from disk (no re-encode)"
+                    );
+                    raws
+                }
+                Err(_) => {
+                    // Raw files missing: rebuild blob and encode_raw as fallback.
+                    let source_data = self.load_or_rebuild_blob(block_id).await?;
+                    let source_data_clone = source_data.clone();
+                    let params_clone = params;
+                    let encoder = Arc::clone(&self.encoder);
+                    tracing::debug!(
+                        block_id = %block_id,
+                        start_esi,
+                        symbol_count,
+                        "repair: raw files missing, encode_raw fallback"
+                    );
+                    tokio::task::spawn_blocking(move || {
+                        encoder.encode_raw(
+                            &source_data_clone,
+                            &params_clone,
+                            start_esi,
+                            symbol_count,
+                        )
+                    })
+                    .await
+                    .map_err(|e| RepairError::EncodeFailed(e.to_string()))?
+                    .map_err(|e| RepairError::EncodeFailed(e.to_string()))?
+                }
+            };
 
-        // 9. Write `{esi}.bin` files to `{symbols_dir}/{block_id_hex}/`
-        let block_hex = hex_encode(&block_id.0);
-        let block_dir = self.config.symbols_dir.join(&block_hex);
-        tokio::fs::create_dir_all(&block_dir).await.map_err(RepairError::Io)?;
-
-        let symbols_written = symbols.len() as u32;
-        for symbol in &symbols {
-            let sym_path = block_dir.join(format!("{}.bin", symbol.esi));
-            tokio::fs::write(&sym_path, &symbol.data)
-                .await
-                .map_err(RepairError::Io)?;
-        }
+        // Step 9 (old: write {esi}.bin to disk) is gone — binding is applied at send time.
+        let symbols_written = raw_symbols.len() as u32;
 
         // 10. Delete old placement from DB.
         self.db.delete_placement(block_id, old_holder_id)?;
@@ -363,9 +376,10 @@ impl RepairAgent {
         self.db.upsert_placement(&new_placement)?;
 
         // 12. Deliver repaired symbols via swarm (if configured).
+        //     Binding is applied inline in deliver_repaired_symbols_direct.
         //     Delivery failures are non-fatal: the Offered placement will be retried.
         if let Err(e) = self
-            .deliver_repaired_symbols(block_id, &new_placement, importance)
+            .deliver_repaired_symbols(block_id, &new_placement, &raw_symbols, importance)
             .await
         {
             tracing::warn!(
@@ -373,7 +387,6 @@ impl RepairAgent {
                 new_holder = %new_holder_id,
                 "repair: delivery failed (placement remains Offered for retry): {e}"
             );
-            // Do NOT clean up .bin files — delivery may be retried.
             return Ok(RepairOutcome {
                 job: RepairJob {
                     source_block_id: *block_id,
@@ -386,8 +399,7 @@ impl RepairAgent {
             });
         }
 
-        // 13. Clean up .bin files after successful delivery.
-        self.cleanup_repaired_symbols(block_id, &new_placement).await;
+        // Step 13 (old: cleanup .bin files) is gone — no bound files written to disk.
 
         Ok(RepairOutcome {
             job: RepairJob {
@@ -598,12 +610,13 @@ impl RepairAgent {
 
     /// Deliver symbols to a new holder using the SymbolOffer/Accept/Transfer flow.
     ///
-    /// Reuses backup pipeline delivery logic (read_symbols_for_holder + swarm).
+    /// Wave 2: binding is applied inline at send time from raw_symbols.
     /// Returns Ok(()) if no swarm is configured (no-op for unit tests).
     async fn deliver_repaired_symbols(
         &self,
         block_id: &SourceBlockId,
         placement: &SymbolPlacement,
+        raw_symbols: &[syncback_core::erasure::Symbol],
         importance: f64,
     ) -> anyhow::Result<()> {
         use syncback_core::messages::Message;
@@ -622,7 +635,7 @@ impl RepairAgent {
             None => {
                 // No signing key: fall back to direct SymbolTransfer.
                 return self
-                    .deliver_repaired_symbols_direct(&swarm, block_id, placement)
+                    .deliver_repaired_symbols_direct(&swarm, block_id, placement, raw_symbols)
                     .await;
             }
         };
@@ -651,7 +664,7 @@ impl RepairAgent {
                     backoff.record_accept(&placement.holder_id);
                 }
                 // Holder accepted — send SymbolTransfer.
-                self.deliver_repaired_symbols_direct(&swarm, block_id, placement)
+                self.deliver_repaired_symbols_direct(&swarm, block_id, placement, raw_symbols)
                     .await
             }
             Message::SymbolReject(reject) => {
@@ -676,33 +689,39 @@ impl RepairAgent {
     }
 
     /// Direct SymbolTransfer delivery via libp2p swarm.
+    ///
+    /// Wave 2: applies binding from raw_symbols inline; no disk read.
     async fn deliver_repaired_symbols_direct(
         &self,
         swarm: &crate::daemon::network::swarm::SwarmHandle,
         block_id: &SourceBlockId,
         placement: &SymbolPlacement,
+        raw_symbols: &[syncback_core::erasure::Symbol],
     ) -> anyhow::Result<()> {
         use syncback_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES;
-        use syncback_core::erasure::chunk_symbols_by_size;
+        use syncback_core::erasure::{chunk_symbols_by_size, Symbol};
         use syncback_core::messages::{Message, SymbolTransferMsg};
         use syncback_core::types::Timestamp;
 
-        let symbols = crate::daemon::backup::pipeline::read_symbols_for_holder(
-            &self.config.symbols_dir,
-            block_id,
-            &placement.esi_ranges,
-        )?;
+        // Build bound symbols by applying per-holder binding inline.
+        let bound: Vec<Symbol> = raw_symbols
+            .iter()
+            .map(|raw| {
+                self.encoder
+                    .apply_binding(raw.clone(), block_id, &placement.holder_id)
+            })
+            .collect();
 
-        if symbols.is_empty() {
+        if bound.is_empty() {
             anyhow::bail!(
-                "no symbol files found for block {} holder {}",
+                "no raw symbols to deliver for block {} holder {}",
                 block_id,
                 placement.holder_id
             );
         }
 
-        let symbol_count = symbols.len();
-        let chunks = chunk_symbols_by_size(symbols, SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES);
+        let symbol_count = bound.len();
+        let chunks = chunk_symbols_by_size(bound, SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES);
         let total_chunks = chunks.len();
         for (idx, chunk) in chunks.into_iter().enumerate() {
             let msg = SymbolTransferMsg {
@@ -729,32 +748,10 @@ impl RepairAgent {
             block_id = %block_id,
             symbols = symbol_count,
             chunks = total_chunks,
-            "repair: symbols delivered"
+            "repair: symbols delivered (bind-on-send)"
         );
 
         Ok(())
-    }
-
-    /// Clean up .bin files written during repair after successful delivery.
-    async fn cleanup_repaired_symbols(
-        &self,
-        block_id: &SourceBlockId,
-        placement: &SymbolPlacement,
-    ) {
-        let block_hex = hex_encode(&block_id.0);
-        let block_dir = self.config.symbols_dir.join(&block_hex);
-
-        for &(start_esi, count) in &placement.esi_ranges {
-            for i in 0..count {
-                let esi = start_esi + i;
-                let path = block_dir.join(format!("{esi}.bin"));
-                if let Err(e) = tokio::fs::remove_file(&path).await {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(path = %path.display(), "repair: failed to remove symbol file: {e}");
-                    }
-                }
-            }
-        }
     }
 
     /// Load block.bin from disk, or rebuild it from source files, or fetch it

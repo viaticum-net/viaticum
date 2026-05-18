@@ -9,7 +9,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use syncback_core::constants::MIN_BATCH_BYTES;
 use syncback_core::db::Db;
-use syncback_core::erasure::{binding_seed, ErasureEncoder};
+use syncback_core::erasure::{binding_seed, ErasureEncoder, Symbol};
 use syncback_core::cluster::esi_namespace_start;
 use syncback_core::placement::{compute_allocation, HolderCandidate, PlacementError};
 use syncback_core::types::{
@@ -182,7 +182,7 @@ pub fn run_pipeline(
         vec![]
     };
 
-    // 6. Encode symbols for each holder and write to disk
+    // 6. Encode raw symbols once and write to {block_dir}/raw/{esi}.bin
     let symbols_block_dir = config.symbols_dir.join(hex_encode(&block_id.0));
     std::fs::create_dir_all(&symbols_block_dir)
         .map_err(|e| anyhow::anyhow!("create symbols dir: {e}"))?;
@@ -195,22 +195,33 @@ pub fn run_pipeline(
 
     let mut symbol_count_per_holder: Vec<(DeviceId, u32)> = Vec::new();
 
-    for alloc in &allocations_result {
-        let symbols = encoder.encode(
-            &stored,
-            &params,
-            alloc.start_esi,
-            alloc.symbol_count,
-            &block_id,
-            &alloc.device_id,
-        )?;
+    // Compute total ESI span across all allocations.
+    // encode_raw requires a contiguous range: start_esi..start_esi+total_count.
+    // compute_allocation assigns contiguous ESI ranges starting at esi_offset.
+    let total_count: u32 = allocations_result.iter().map(|a| a.symbol_count).sum();
 
-        for symbol in &symbols {
-            let symbol_path = symbols_block_dir.join(format!("{}.bin", symbol.esi));
-            std::fs::write(&symbol_path, &symbol.data)
-                .map_err(|e| anyhow::anyhow!("write symbol {}: {e}", symbol.esi))?;
+    let raw_symbols: Vec<Symbol> = if total_count > 0 && !allocations_result.is_empty() {
+        let raw_dir = symbols_block_dir.join("raw");
+        std::fs::create_dir_all(&raw_dir)
+            .map_err(|e| anyhow::anyhow!("create raw dir: {e}"))?;
+
+        // One RaptorQ run for all holders combined.
+        let raws = encoder.encode_raw(&stored, &params, esi_offset, total_count)?;
+
+        // Write raw symbols to disk (holder-agnostic, used by repair).
+        for raw in &raws {
+            let raw_path = raw_dir.join(format!("{}.bin", raw.esi));
+            std::fs::write(&raw_path, &raw.data)
+                .map_err(|e| anyhow::anyhow!("write raw symbol {}: {e}", raw.esi))?;
         }
 
+        raws
+    } else {
+        vec![]
+    };
+
+    // Record per-holder counts (binding applied at delivery time, not here).
+    for alloc in &allocations_result {
         symbol_count_per_holder.push((alloc.device_id, alloc.symbol_count));
     }
 
@@ -303,6 +314,8 @@ pub fn run_pipeline(
         symbol_count_per_holder,
         stored_size: stored.len() as u64,
         importance: avg_importance,
+        raw_symbols,
+        esi_offset,
     })
 }
 
@@ -422,18 +435,50 @@ pub fn update_backed_up_at(
     Ok(())
 }
 
+/// Read raw (unbound) symbol files from the `raw/` subdirectory.
+///
+/// Path: `{symbols_dir}/{block_hex}/raw/{esi}.bin`
+/// Returns symbols in ESI order. Returns error if any file cannot be read.
+///
+/// Used by repair to load raw symbols without re-encoding.
+pub(crate) fn read_raw_symbols_for_block(
+    symbols_dir: &std::path::Path,
+    block_id: &syncback_core::types::SourceBlockId,
+    esi_ranges: &[(u32, u32)],
+) -> anyhow::Result<Vec<Symbol>> {
+    let raw_dir = symbols_dir
+        .join(hex_encode(&block_id.0))
+        .join("raw");
+    let mut symbols = Vec::new();
+
+    for &(start_esi, count) in esi_ranges {
+        for esi in start_esi..start_esi + count {
+            let path = raw_dir.join(format!("{esi}.bin"));
+            let data = std::fs::read(&path)
+                .map_err(|e| anyhow::anyhow!("read raw symbol {}: {e}", path.display()))?;
+            symbols.push(Symbol { esi, data });
+        }
+    }
+
+    Ok(symbols)
+}
+
 /// Read symbol files for a given holder from the symbols directory.
 ///
 /// Reads files named `{esi}.bin` for each ESI in `esi_ranges`.
 /// Returns `Vec<Symbol>` in ESI order.
 /// Returns error if any file cannot be read.
+///
+/// # Deprecated
+/// Wave 2 replaced per-holder bound symbol files with raw symbols in `raw/` subdir.
+/// Use `read_raw_symbols_for_block` instead. This function is kept for any
+/// legacy caller; will be removed in Wave 4.
+#[allow(dead_code)]
 pub(crate) fn read_symbols_for_holder(
     symbols_dir: &std::path::Path,
     block_id: &syncback_core::types::SourceBlockId,
     esi_ranges: &[(u32, u32)],
-) -> anyhow::Result<Vec<syncback_core::erasure::Symbol>> {
-    use syncback_core::erasure::Symbol;
-
+) -> anyhow::Result<Vec<Symbol>> {
     let block_dir = symbols_dir.join(hex_encode(&block_id.0));
     let mut symbols = Vec::new();
 
@@ -447,4 +492,75 @@ pub(crate) fn read_symbols_for_holder(
     }
 
     Ok(symbols)
+}
+
+/// Scan `symbols_dir` and remove any legacy flat `{esi}.bin` files
+/// (pre-Wave 2 bound symbol files) from block subdirectories.
+///
+/// Preserves: `block.bin` (source blob) and `raw/` subdirectory.
+/// Deletes: `*.bin` files directly under `{symbols_dir}/{block_hex}/`
+///          whose name is not `block.bin`.
+///
+/// This is idempotent and safe to run on every startup.
+pub fn cleanup_legacy_bound_symbol_files(symbols_dir: &std::path::Path) -> anyhow::Result<()> {
+    let entries = match std::fs::read_dir(symbols_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(anyhow::anyhow!("read symbols_dir {}: {e}", symbols_dir.display())),
+    };
+
+    for entry in entries {
+        let block_dir = entry?.path();
+        if !block_dir.is_dir() {
+            continue;
+        }
+
+        let block_entries = match std::fs::read_dir(&block_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(path = %block_dir.display(), "cleanup_legacy: cannot read block dir: {e}");
+                continue;
+            }
+        };
+
+        for file_entry in block_entries {
+            let file_path = match file_entry {
+                Ok(e) => e.path(),
+                Err(e) => {
+                    tracing::warn!("cleanup_legacy: dir entry error: {e}");
+                    continue;
+                }
+            };
+
+            if !file_path.is_file() {
+                // Skip subdirectories (including raw/).
+                continue;
+            }
+
+            let name = file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            if name.ends_with(".bin") && name != "block.bin" {
+                // Legacy bound symbol file — remove.
+                match std::fs::remove_file(&file_path) {
+                    Ok(()) => {
+                        tracing::debug!(
+                            path = %file_path.display(),
+                            "cleanup_legacy: removed legacy bound symbol file"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %file_path.display(),
+                            "cleanup_legacy: remove failed: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

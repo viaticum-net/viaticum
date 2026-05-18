@@ -154,6 +154,12 @@ pub struct PipelineResult {
     pub stored_size: u64,
     /// Average importance of files packed into this block (used for SymbolOffer).
     pub importance: f64,
+    /// Raw (unbound) symbols produced by encode_raw. ESI range spans all allocations.
+    /// Caller must apply per-holder binding before sending — these are never written to disk.
+    /// Dropped after deliver_symbols() completes — no on-disk spill.
+    pub raw_symbols: Vec<syncback_core::erasure::Symbol>,
+    /// ESI offset used for encode_raw. Needed to index into raw_symbols by ESI.
+    pub esi_offset: u32,
 }
 
 // ─── BackupCoordinator ────────────────────────────────────────────────────────
@@ -924,21 +930,34 @@ impl BackupCoordinator {
         placement: &syncback_core::types::SymbolPlacement,
     ) -> anyhow::Result<()> {
         use syncback_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES;
-        use syncback_core::erasure::chunk_symbols_by_size;
+        use syncback_core::erasure::{chunk_symbols_by_size, Symbol};
         use syncback_core::messages::{Message, SymbolTransferMsg};
         use syncback_core::types::Timestamp;
 
-        let symbols = pipeline::read_symbols_for_holder(
-            &self.config.symbols_dir,
-            &result.source_block_id,
-            &placement.esi_ranges,
-        )?;
+        // Bind raw symbols inline at send time — no disk read needed.
+        let symbols: Vec<Symbol> = placement
+            .esi_ranges
+            .iter()
+            .flat_map(|&(start_esi, count)| {
+                (start_esi..start_esi + count).filter_map(|esi| {
+                    let idx = esi.checked_sub(result.esi_offset)? as usize;
+                    let raw = result.raw_symbols.get(idx)?;
+                    Some(self.encoder.apply_binding(
+                        raw.clone(),
+                        &result.source_block_id,
+                        &placement.holder_id,
+                    ))
+                })
+            })
+            .collect();
 
         if symbols.is_empty() {
             anyhow::bail!(
-                "no symbol files found for block {:?} holder {}",
+                "no raw symbols available for block {:?} holder {} (esi_offset={}, raw_symbols={})",
                 result.source_block_id,
-                placement.holder_id
+                placement.holder_id,
+                result.esi_offset,
+                result.raw_symbols.len(),
             );
         }
 
@@ -1046,27 +1065,18 @@ impl BackupCoordinator {
             "backup: symbols delivered"
         );
 
-        // Clean up delivered symbol files from owner's disk.
-        let block_hex = syncback_core::types::hex_encode(&result.source_block_id.0);
-        let block_dir = self.config.symbols_dir.join(&block_hex);
-        for &(start_esi, count) in &placement.esi_ranges {
-            for i in 0..count {
-                let esi = start_esi + i;
-                let path = block_dir.join(format!("{esi}.bin"));
-                if let Err(e) = std::fs::remove_file(&path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(path = %path.display(), "cleanup: failed to remove symbol file: {e}");
-                    }
-                }
-            }
-        }
+        // Wave 2: raw symbols are in memory only; no per-esi .bin files to clean up here.
+        // Cleanup of block.bin and raw/ directory is handled by cleanup_block_dir()
+        // after all holders for this block have been delivered.
 
         Ok(())
     }
 
     /// Clean up block directory after all symbols have been delivered.
-    /// Encryption is deterministic (nonce derived from content), so block.bin
-    /// can be rebuilt from source files for PoS/repair. Safe to delete.
+    ///
+    /// Wave 2 layout: raw symbols are at `{block_dir}/raw/{esi}.bin`.
+    /// After all holders are delivered, we remove raw/ subdir, block.bin, and block_dir.
+    /// The raw symbols were the handoff medium; once delivery is done they're no longer needed.
     fn cleanup_block_dir(&self, block_id: &syncback_core::types::SourceBlockId) {
         let block_hex = syncback_core::types::hex_encode(&block_id.0);
         let block_dir = self.config.symbols_dir.join(&block_hex);
@@ -1075,31 +1085,28 @@ impl BackupCoordinator {
             return;
         }
 
-        // Check if any .bin symbol files remain (exclude block.bin).
-        let has_remaining_symbols = std::fs::read_dir(&block_dir)
-            .map(|entries| {
-                entries.filter_map(|e| e.ok()).any(|e| {
-                    let name = e.file_name();
-                    let name = name.to_string_lossy();
-                    name.ends_with(".bin") && name != "block.bin"
-                })
-            })
-            .unwrap_or(true);
-
-        if !has_remaining_symbols {
-            // Delete block.bin and the directory.
-            let block_bin = block_dir.join("block.bin");
-            if let Err(e) = std::fs::remove_file(&block_bin) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %block_bin.display(), "cleanup: failed to remove block.bin: {e}");
-                }
+        // Remove raw/ subdir and all its contents.
+        let raw_dir = block_dir.join("raw");
+        if raw_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&raw_dir) {
+                tracing::warn!(path = %raw_dir.display(), "cleanup: failed to remove raw/ dir: {e}");
+                // If raw/ removal fails, don't remove block_dir either.
+                return;
             }
-            if let Err(e) = std::fs::remove_dir(&block_dir) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %block_dir.display(), "cleanup: failed to remove block dir: {e}");
-                }
-            }
-            tracing::info!(block_id = %block_id, "backup: all symbols delivered, block dir cleaned up");
         }
+
+        // Delete block.bin and the directory itself.
+        let block_bin = block_dir.join("block.bin");
+        if let Err(e) = std::fs::remove_file(&block_bin) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %block_bin.display(), "cleanup: failed to remove block.bin: {e}");
+            }
+        }
+        if let Err(e) = std::fs::remove_dir(&block_dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %block_dir.display(), "cleanup: failed to remove block dir: {e}");
+            }
+        }
+        tracing::info!(block_id = %block_id, "backup: all symbols delivered, block dir cleaned up");
     }
 }

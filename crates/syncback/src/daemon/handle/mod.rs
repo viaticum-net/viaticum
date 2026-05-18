@@ -275,6 +275,15 @@ impl DaemonHandle {
         // ── 9. Ensure symbols and holdings directories exist ──────────────────
         let symbols_dir = cfg.data_dir.join("symbols");
         std::fs::create_dir_all(&symbols_dir)?;
+
+        // ── 9.0. Wave 2 migration: remove legacy flat {esi}.bin files (pre-Wave 2) ──
+        // These are bound-per-holder symbol files written by the old backup pipeline.
+        // After Wave 2, all symbols are raw and live in {block_hex}/raw/{esi}.bin.
+        // This cleanup is fast (metadata-only scan) and idempotent.
+        if let Err(e) = crate::daemon::backup::pipeline::cleanup_legacy_bound_symbol_files(&symbols_dir) {
+            tracing::warn!("startup: cleanup_legacy_bound_symbol_files failed: {e}");
+        }
+
         let holdings_dir = cfg.data_dir.join("holdings");
         std::fs::create_dir_all(&holdings_dir)?;
 

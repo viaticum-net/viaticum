@@ -144,17 +144,9 @@ async fn repair_placement_generates_symbol_files() {
     let new_holder = outcome.new_holder_id;
     assert_ne!(new_holder, old_hid, "new holder must differ from old");
 
-    // Symbol file must exist at {symbols_dir}/{hex(bid)}/{esi}.bin
-    let block_hex = hex_encode(&bid.0);
-    let block_dir = symbols_dir.path().join(&block_hex);
+    // Wave 2: no flat {esi}.bin files are written to disk for repair.
+    // Binding is applied inline at send time. Verify only the DB placement.
     let new_placement = db.get_placement(&bid, &new_holder).unwrap().unwrap();
-    let (start_esi, count) = new_placement.esi_ranges[0];
-    for i in 0..count {
-        let esi = start_esi + i;
-        let sym_path = block_dir.join(format!("{esi}.bin"));
-        // Files may have been cleaned up after delivery attempt; just check DB is correct.
-        let _ = sym_path; // path may or may not exist — delivery was no-op (no swarm)
-    }
 
     // Old placement must be deleted; new placement must be Offered
     assert!(
@@ -727,5 +719,184 @@ fn repair_placement_falls_back_when_no_authenticated_candidates() {
     );
     for c in &candidates {
         assert_ne!(c.device_id, old_hid, "old holder must still be excluded");
+    }
+}
+
+// ─── Wave 2 ATDD tests for repair ────────────────────────────────────────────
+//
+// S3: when repair triggered, no RaptorQ re-encode if raw/ files exist.
+// S4: multiple holders served from same raw files get distinct bound bytes.
+// S7: repair fallback re-encodes when raw/ missing (uses block.bin).
+// AC8: deliver_repaired_symbols_direct does not write {esi}.bin files.
+
+/// S3 / AC3: repair loads raw symbols from raw/ when available — no encode_raw call.
+///
+/// We test this indirectly: if raw/ files exist AND block.bin exists, repair succeeds
+/// without needing to call encode_raw. We verify the placement is updated and no
+/// flat {esi}.bin files appear in block_dir (they would only exist from encode_raw fallback
+/// write path — but Wave 2 repair doesn't write them either way).
+#[tokio::test]
+async fn repair_placement_reads_raw_files_when_available() {
+    use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
+
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+
+    let bid = block_id(0xA0);
+    let old_hid = holder_id(0xA1);
+
+    // Source data: 1 symbol (65535 bytes)
+    let source_data = vec![0x55u8; 65535];
+    write_source_block_file(symbols_dir.path(), &bid, &source_data);
+
+    db.upsert_source_block(&make_source_block_record(bid, 1, 65535)).unwrap();
+    db.upsert_placement(&make_placement(bid, old_hid, vec![(0, 1)], PlacementStatus::Lost))
+        .unwrap();
+    insert_candidate_peers(&db, 0xB0, 0xB1);
+
+    // Pre-populate raw/ directory (simulating a previous backup that wrote raw files).
+    // We need to write valid raw symbols so that repair can read them.
+    let encoder = RaptorQEncoder::new();
+    let block_hex = hex_encode(&bid.0);
+    let raw_dir = symbols_dir.path().join(&block_hex).join("raw");
+    std::fs::create_dir_all(&raw_dir).unwrap();
+
+    // We need the repair ESI range — it's next_free_esi_for_block after excluding old.
+    // Old placement is at ESI 0 (Lost, excluded). next_free = 0 (all Lost excluded).
+    // So new_alloc will start at esi_offset=0 (next_free.max(namespace_start)).
+    // Since old placement is Lost (excluded from max), next_free = 0.
+    // Write raw symbol for ESI 0 (the ESI repair will try to read).
+    use syncback_core::types::ErasureParams;
+    let params = ErasureParams { k: 1, k_eff: 4, t: 65535, overhead: 1.5, n: 4 };
+    let raw_syms = encoder.encode_raw(&source_data, &params, 0, 1).unwrap();
+    for sym in &raw_syms {
+        std::fs::write(raw_dir.join(format!("{}.bin", sym.esi)), &sym.data).unwrap();
+    }
+
+    let agent = make_agent(db.clone(), symbols_dir.path());
+    let outcome = agent.repair_placement(&bid, &old_hid).await.unwrap();
+
+    assert_eq!(outcome.symbols_written, 1, "should report 1 symbol written");
+    assert_eq!(outcome.new_placement_status, PlacementStatus::Offered);
+    assert_ne!(outcome.new_holder_id, old_hid);
+
+    // No flat {esi}.bin files in block_dir (Wave 2 never writes them for repair).
+    let block_dir = symbols_dir.path().join(&block_hex);
+    let flat_files: Vec<_> = std::fs::read_dir(&block_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy().to_string();
+            e.path().is_file() && name.ends_with(".bin") && name != "block.bin"
+        })
+        .collect();
+    assert!(
+        flat_files.is_empty(),
+        "repair must not write flat {{esi}}.bin files in block_dir, found: {:?}",
+        flat_files.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
+}
+
+/// S7 / AC3 (fallback): when raw/ missing, repair falls back to encode_raw via block.bin.
+#[tokio::test]
+async fn repair_placement_falls_back_to_encode_raw_when_raw_missing() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+
+    let bid = block_id(0xC0);
+    let old_hid = holder_id(0xC1);
+
+    // Source data + block.bin present; no raw/ files.
+    let source_data = vec![0x77u8; 65535];
+    write_source_block_file(symbols_dir.path(), &bid, &source_data);
+
+    db.upsert_source_block(&make_source_block_record(bid, 1, 65535)).unwrap();
+    db.upsert_placement(&make_placement(bid, old_hid, vec![(0, 1)], PlacementStatus::Lost))
+        .unwrap();
+    insert_candidate_peers(&db, 0xD0, 0xD1);
+
+    // No raw/ directory — should fall back to encode_raw from block.bin.
+    let agent = make_agent(db.clone(), symbols_dir.path());
+    let outcome = agent.repair_placement(&bid, &old_hid).await.unwrap();
+
+    assert_eq!(outcome.symbols_written, 1, "fallback encode_raw should produce 1 symbol");
+    assert_eq!(outcome.new_placement_status, PlacementStatus::Offered);
+
+    // Old placement deleted, new placement exists.
+    assert!(db.get_placement(&bid, &old_hid).unwrap().is_none());
+    let new_placements = db.list_placements_for_block(&bid).unwrap();
+    assert_eq!(new_placements.len(), 1);
+    assert_eq!(new_placements[0].status, PlacementStatus::Offered);
+}
+
+/// S4: multiple holders from same raw file get distinct bound bytes.
+#[test]
+fn repair_multiple_holders_from_same_raw_files_get_distinct_bound_bytes() {
+    use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
+    use syncback_core::types::{ErasureParams, SourceBlockId};
+
+    let encoder = RaptorQEncoder::new();
+    let block_id = SourceBlockId([0xE0u8; 32]);
+    let source = vec![0x42u8; 65535];
+    let params = ErasureParams { k: 1, k_eff: 4, t: 65535, overhead: 1.5, n: 4 };
+
+    let raw_syms = encoder.encode_raw(&source, &params, 0, 1).unwrap();
+    let raw = &raw_syms[0];
+
+    let h21 = holder_id(0x21);
+    let h22 = holder_id(0x22);
+
+    let bound_21 = encoder.apply_binding(raw.clone(), &block_id, &h21);
+    let bound_22 = encoder.apply_binding(raw.clone(), &block_id, &h22);
+
+    assert_ne!(
+        bound_21.data, bound_22.data,
+        "binding must differ per holder (holder-specific XOR keystream)"
+    );
+}
+
+/// AC8: deliver_repaired_symbols_direct does not write any {esi}.bin files to block_dir.
+///
+/// With swarm=None, deliver_repaired_symbols is a no-op. But we verify no disk write
+/// happens either — the old code wrote files then cleaned them up; Wave 2 never writes.
+#[tokio::test]
+async fn deliver_repaired_symbols_direct_does_not_write_esi_bin_files() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+
+    let bid = block_id(0xF0);
+    let old_hid = holder_id(0xF1);
+
+    let source_data = vec![0x33u8; 65535];
+    write_source_block_file(symbols_dir.path(), &bid, &source_data);
+
+    db.upsert_source_block(&make_source_block_record(bid, 1, 65535)).unwrap();
+    db.upsert_placement(&make_placement(bid, old_hid, vec![(0, 1)], PlacementStatus::Lost))
+        .unwrap();
+    insert_candidate_peers(&db, 0xE0, 0xE1);
+
+    let agent = make_agent(db.clone(), symbols_dir.path());
+    agent.repair_placement(&bid, &old_hid).await.unwrap();
+
+    // Check that no flat {esi}.bin files exist in block_dir.
+    let block_hex = hex_encode(&bid.0);
+    let block_dir = symbols_dir.path().join(&block_hex);
+
+    if block_dir.exists() {
+        let flat_files: Vec<_> = std::fs::read_dir(&block_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy().to_string();
+                e.path().is_file() && name.ends_with(".bin") && name != "block.bin"
+            })
+            .collect();
+        assert!(
+            flat_files.is_empty(),
+            "repair must not leave flat {{esi}}.bin files, found: {:?}",
+            flat_files.iter().map(|e| e.path()).collect::<Vec<_>>()
+        );
     }
 }

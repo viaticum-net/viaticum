@@ -366,27 +366,26 @@ fn pipeline_roundtrip_can_decode() {
     // Reconstruct ErasureParams using the actual stored_size.
     let params = ErasureParams::compute(stored_size as u64, 0.5).unwrap();
 
-    // Collect unbound symbols from all placements until we have k_eff.
-    let mut unbound_symbols: Vec<syncback_core::erasure::Symbol> = Vec::new();
+    // Wave 2: raw symbols are at {block_dir}/raw/{esi}.bin — no unbind needed.
+    let mut raw_symbols: Vec<syncback_core::erasure::Symbol> = Vec::new();
     let needed = params.k_eff as usize;
 
     'outer: for placement in &placements {
         let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
-        let block_dir = symbols_dir.path().join(&block_hex);
+        let raw_dir = symbols_dir.path().join(&block_hex).join("raw");
 
         for (start_esi, count) in &placement.esi_ranges {
             for i in 0..*count {
                 let esi = start_esi + i;
-                let sym_path = block_dir.join(format!("{esi}.bin"));
+                let sym_path = raw_dir.join(format!("{esi}.bin"));
                 if !sym_path.exists() {
                     continue;
                 }
                 let data = std::fs::read(&sym_path).unwrap();
-                let bound = syncback_core::erasure::Symbol { esi, data };
-                let unbound = encoder.unbind(bound, &block_id, &placement.holder_id);
-                unbound_symbols.push(unbound);
+                // Raw symbol: no unbind needed.
+                raw_symbols.push(syncback_core::erasure::Symbol { esi, data });
 
-                if unbound_symbols.len() >= needed {
+                if raw_symbols.len() >= needed {
                     break 'outer;
                 }
             }
@@ -394,14 +393,14 @@ fn pipeline_roundtrip_can_decode() {
     }
 
     assert!(
-        unbound_symbols.len() >= needed,
+        raw_symbols.len() >= needed,
         "not enough symbols: have {}, need {}",
-        unbound_symbols.len(),
+        raw_symbols.len(),
         needed
     );
 
     // Decode: returns k*t zero-padded bytes.
-    let decoded_padded = encoder.decode(&unbound_symbols, &params).unwrap();
+    let decoded_padded = encoder.decode(&raw_symbols, &params).unwrap();
 
     // Trim to exact stored_size (the decoder pads with zeros to k*t).
     assert!(
@@ -775,6 +774,8 @@ async fn deliver_symbols_no_op_when_network_none() {
         symbol_count_per_holder: vec![(DeviceId([0u8; 32]), 1)],
         stored_size: 0,
         importance: 0.5,
+        raw_symbols: vec![],
+        esi_offset: 0,
     };
     coordinator.deliver_symbols(&[fake_result]).await;
 }
@@ -1699,6 +1700,268 @@ fn when_peer_comes_online_then_next_flush_includes_peer() {
 // PendingDeliveries / OfferOutcome were iroh-era types; delivery now uses
 // libp2p SwarmHandle request-response. Network integration is tested in
 // swarm_tests.rs and the E2E test suite.
+
+// ─── Wave 2 ATDD tests ────────────────────────────────────────────────────────
+//
+// AC1: raw symbols written to symbols/{hex}/raw/{esi}.bin — no flat {esi}.bin
+// AC2: PipelineResult carries raw_symbols + esi_offset for inline binding at send time
+// AC3: block.bin still written
+// AC7: legacy cleanup removes flat {esi}.bin, preserves block.bin and raw/
+
+/// S1 / AC1: when backup runs, only raw/ files are written — no flat {esi}.bin.
+#[test]
+fn encode_raw_writes_to_raw_subdir_not_flat() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    // Use .txt so it classifies as Document
+    let content: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let path = write_file(&files_dir, "data.txt", &content);
+    coord.process_event(added_event(&path)).unwrap();
+    let results = coord.flush_all(true, &Default::default()).unwrap();
+    assert_eq!(results.len(), 1, "should produce one source block");
+
+    let block_hex: String = results[0].source_block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let block_dir = symbols_dir.path().join(&block_hex);
+    let raw_dir = block_dir.join("raw");
+
+    // raw/ subdir must exist.
+    assert!(raw_dir.exists(), "raw/ subdir must exist after backup");
+
+    // No flat {esi}.bin files in block_dir (only block.bin and raw/).
+    let flat_bin_files: Vec<_> = std::fs::read_dir(&block_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy().to_string();
+            name.ends_with(".bin") && name != "block.bin"
+        })
+        .collect();
+    assert!(
+        flat_bin_files.is_empty(),
+        "no flat {{esi}}.bin files should exist in block_dir after Wave 2, found: {:?}",
+        flat_bin_files.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
+
+    // At least one raw symbol file must exist.
+    let raw_files: Vec<_> = std::fs::read_dir(&raw_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(!raw_files.is_empty(), "raw/ must contain at least one symbol file");
+}
+
+/// S1 / AC5: block.bin is still written after Wave 2.
+#[test]
+fn block_bin_still_written_after_wave2() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    let content: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let path = write_file(&files_dir, "data2.txt", &content);
+    coord.process_event(added_event(&path)).unwrap();
+    let results = coord.flush_all(true, &Default::default()).unwrap();
+    assert_eq!(results.len(), 1);
+
+    let block_hex: String = results[0].source_block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let block_bin = symbols_dir.path().join(&block_hex).join("block.bin");
+    assert!(block_bin.exists(), "block.bin must still be written after Wave 2");
+    assert!(block_bin.metadata().unwrap().len() > 0, "block.bin must be non-empty");
+}
+
+/// AC2: PipelineResult contains raw_symbols with correct count and size.
+#[test]
+fn pipeline_result_contains_raw_symbols() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    let content: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let path = write_file(&files_dir, "data3.txt", &content);
+    coord.process_event(added_event(&path)).unwrap();
+    let results = coord.flush_all(true, &Default::default()).unwrap();
+    assert_eq!(results.len(), 1);
+
+    let result = &results[0];
+    // With mock_holders (5 holders), there should be raw symbols.
+    assert!(
+        !result.raw_symbols.is_empty(),
+        "PipelineResult must contain raw_symbols when holders are present"
+    );
+    // All raw symbols must have size == params.t
+    for sym in &result.raw_symbols {
+        assert_eq!(
+            sym.data.len(),
+            result.t as usize,
+            "raw symbol size must equal params.t"
+        );
+    }
+}
+
+/// S2 / AC2: apply_binding on pipeline raw symbol equals direct encode result.
+#[test]
+fn apply_binding_on_pipeline_raw_equals_direct_encode() {
+    use crate::daemon::backup::pipeline::compress_and_encrypt;
+    use syncback_core::erasure::RaptorQEncoder;
+    use syncback_core::placement::{compute_allocation, HolderCandidate};
+    use syncback_core::types::{ErasureParams, SourceBlockId};
+
+    let epoch_key = [42u8; 32];
+    let encoder = RaptorQEncoder::new();
+
+    let plaintext: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let stored = compress_and_encrypt(&plaintext, &epoch_key).unwrap();
+
+    let params = ErasureParams::compute(stored.len() as u64, 0.5).unwrap();
+    let block_id = SourceBlockId(*blake3::hash(&stored).as_bytes());
+
+    let holders = test_holders();
+    let allocations = compute_allocation(&holders, &params, 0).unwrap();
+
+    // Encode raw once.
+    let total: u32 = allocations.iter().map(|a| a.symbol_count).sum();
+    let raw_symbols = encoder.encode_raw(&stored, &params, 0, total).unwrap();
+
+    // For the first allocation and its first ESI:
+    let alloc = &allocations[0];
+    let first_esi = alloc.start_esi;
+    let idx = first_esi as usize; // esi_offset=0, so idx == esi
+    let raw = &raw_symbols[idx];
+
+    // Apply binding via encode path.
+    let bound_via_apply =
+        encoder.apply_binding(raw.clone(), &block_id, &alloc.device_id);
+
+    // Encode directly via the old path.
+    let bound_direct = encoder
+        .encode(&stored, &params, first_esi, 1, &block_id, &alloc.device_id)
+        .unwrap();
+
+    assert_eq!(
+        bound_via_apply.data, bound_direct[0].data,
+        "apply_binding on raw must equal direct encode"
+    );
+}
+
+/// read_raw_symbols_for_block: reads correct ESI range.
+#[test]
+fn read_raw_symbols_for_block_reads_correct_esi_range() {
+    use crate::daemon::backup::pipeline::read_raw_symbols_for_block;
+    use syncback_core::types::{hex_encode, SourceBlockId};
+    use syncback_core::erasure::Symbol;
+
+    let symbols_dir = TempDir::new().unwrap();
+    let block_id = SourceBlockId([0xAAu8; 32]);
+    let block_hex = hex_encode(&block_id.0);
+    let raw_dir = symbols_dir.path().join(&block_hex).join("raw");
+    std::fs::create_dir_all(&raw_dir).unwrap();
+
+    // Write 5 raw symbol files: ESI 0..4.
+    for esi in 0u32..5 {
+        std::fs::write(raw_dir.join(format!("{esi}.bin")), vec![esi as u8; 100]).unwrap();
+    }
+
+    let result = read_raw_symbols_for_block(
+        symbols_dir.path(),
+        &block_id,
+        &[(0, 5)],
+    ).unwrap();
+
+    assert_eq!(result.len(), 5, "must return 5 symbols");
+    for (i, sym) in result.iter().enumerate() {
+        assert_eq!(sym.esi, i as u32, "ESI must match");
+        assert_eq!(sym.data.len(), 100);
+        assert_eq!(sym.data[0], i as u8);
+    }
+}
+
+/// read_raw_symbols_for_block: missing file returns error.
+#[test]
+fn read_raw_symbols_for_block_missing_file_returns_error() {
+    use crate::daemon::backup::pipeline::read_raw_symbols_for_block;
+    use syncback_core::types::{hex_encode, SourceBlockId};
+
+    let symbols_dir = TempDir::new().unwrap();
+    let block_id = SourceBlockId([0xBBu8; 32]);
+    let block_hex = hex_encode(&block_id.0);
+    let raw_dir = symbols_dir.path().join(&block_hex).join("raw");
+    std::fs::create_dir_all(&raw_dir).unwrap();
+
+    // Write ESI 0,1,2,4 — ESI 3 missing.
+    for esi in [0u32, 1, 2, 4] {
+        std::fs::write(raw_dir.join(format!("{esi}.bin")), vec![esi as u8; 100]).unwrap();
+    }
+
+    // Reading 0..4 should fail on ESI=3.
+    let result = read_raw_symbols_for_block(
+        symbols_dir.path(),
+        &block_id,
+        &[(0, 5)],
+    );
+    assert!(result.is_err(), "must return Err when ESI file is missing");
+}
+
+/// S7/S8 / AC7: cleanup removes flat {esi}.bin files, preserves block.bin and raw/.
+#[test]
+fn cleanup_legacy_removes_flat_esi_bin_preserves_block_bin_and_raw_dir() {
+    use crate::daemon::backup::pipeline::cleanup_legacy_bound_symbol_files;
+    use syncback_core::types::{hex_encode, SourceBlockId};
+
+    let symbols_dir = TempDir::new().unwrap();
+    let block_id = SourceBlockId([0xCCu8; 32]);
+    let block_hex = hex_encode(&block_id.0);
+    let block_dir = symbols_dir.path().join(&block_hex);
+    let raw_dir = block_dir.join("raw");
+    std::fs::create_dir_all(&raw_dir).unwrap();
+
+    // Legacy flat files.
+    let flat_0 = block_dir.join("0.bin");
+    let flat_1 = block_dir.join("1.bin");
+    std::fs::write(&flat_0, b"bound0").unwrap();
+    std::fs::write(&flat_1, b"bound1").unwrap();
+
+    // Preserved files.
+    let block_bin = block_dir.join("block.bin");
+    std::fs::write(&block_bin, b"blob").unwrap();
+
+    let raw_0 = raw_dir.join("0.bin");
+    std::fs::write(&raw_0, b"raw0").unwrap();
+
+    cleanup_legacy_bound_symbol_files(symbols_dir.path()).unwrap();
+
+    assert!(!flat_0.exists(), "flat 0.bin must be removed");
+    assert!(!flat_1.exists(), "flat 1.bin must be removed");
+    assert!(block_bin.exists(), "block.bin must be preserved");
+    assert!(raw_0.exists(), "raw/0.bin must be preserved");
+}
+
+/// Cleanup is idempotent — running twice does not error.
+#[test]
+fn cleanup_legacy_is_idempotent() {
+    use crate::daemon::backup::pipeline::cleanup_legacy_bound_symbol_files;
+    use syncback_core::types::{hex_encode, SourceBlockId};
+
+    let symbols_dir = TempDir::new().unwrap();
+    let block_id = SourceBlockId([0xDDu8; 32]);
+    let block_hex = hex_encode(&block_id.0);
+    let block_dir = symbols_dir.path().join(&block_hex);
+    std::fs::create_dir_all(&block_dir).unwrap();
+    std::fs::write(block_dir.join("block.bin"), b"blob").unwrap();
+
+    // First run.
+    cleanup_legacy_bound_symbol_files(symbols_dir.path()).unwrap();
+    // Second run — must not error.
+    cleanup_legacy_bound_symbol_files(symbols_dir.path()).unwrap();
+
+    // block.bin still there.
+    assert!(block_dir.join("block.bin").exists());
+}
 
 // ─── B3 (Offered→Alive): pipeline creates Offered placements ─────────────────
 

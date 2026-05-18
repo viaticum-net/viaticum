@@ -176,8 +176,8 @@ pub struct RestoreConfig {
     pub identity: IdentityPub,
     /// This device's ID (for LocalState).
     pub device_id: DeviceId,
-    /// Directory where bound symbol files are stored (must match BackupConfig.symbols_dir).
-    /// Used for Phase 2 local restore.
+    /// Directory where raw symbol files are stored (must match BackupConfig.symbols_dir).
+    /// Wave 2 layout: raw symbols at `{symbols_dir}/{block_hex}/raw/{esi}.bin`.
     pub symbols_dir: PathBuf,
     /// libp2p swarm handle for remote restore.
     /// When Some: fetch_from_holders uses send_to_device (request-response).
@@ -417,35 +417,36 @@ impl RestoreCoordinator {
             .symbols_dir
             .join(pipeline::hex_encode(&block_id.0));
 
+        // Wave 2: raw symbols are at {block_dir}/raw/{esi}.bin.
+        // No unbind step needed — raw symbols decode directly.
+        let raw_dir = block_dir.join("raw");
+
         let k_eff = params.k_eff as usize;
 
         // Reading symbol files from disk is blocking I/O; wrap the entire
         // local-symbol scan in block_in_place so the tokio runtime keeps
         // making progress on other tasks (review A1).
-        let mut unbound_symbols: Vec<Symbol> = tokio::task::block_in_place(|| {
+        let mut raw_symbols: Vec<Symbol> = tokio::task::block_in_place(|| {
             let mut collected: Vec<Symbol> = Vec::new();
 
             'outer: for placement in &usable_placements {
                 for (start_esi, count) in &placement.esi_ranges {
                     for i in 0..*count {
                         let esi = start_esi + i;
-                        let symbol_path = block_dir.join(format!("{esi}.bin"));
+                        let symbol_path = raw_dir.join(format!("{esi}.bin"));
                         let data = match std::fs::read(&symbol_path) {
                             Ok(d) => d,
                             Err(e) => {
                                 debug!(
                                     block = %block_id,
                                     esi,
-                                    "symbol file missing or unreadable: {e}"
+                                    "raw symbol file missing or unreadable: {e}"
                                 );
                                 continue;
                             }
                         };
-                        let bound = Symbol { esi, data };
-                        let unbound = self
-                            .encoder
-                            .unbind(bound, block_id, &placement.holder_id);
-                        collected.push(unbound);
+                        // Raw symbol: no unbind needed.
+                        collected.push(Symbol { esi, data });
 
                         if collected.len() >= k_eff {
                             break 'outer;
@@ -457,13 +458,16 @@ impl RestoreCoordinator {
             collected
         });
 
-        if unbound_symbols.len() < k_eff {
+        if raw_symbols.len() < k_eff {
             // Not enough locally — try network fetch for the remainder.
+            // Network path: holders return bound symbols; fetch_from_holders unbinds them.
+            // The merged result (local raw + network unbound) are both raw/unbound and
+            // can be passed directly to decode().
             debug!(
                 block = %block_id,
-                local = unbound_symbols.len(),
+                local = raw_symbols.len(),
                 need = k_eff,
-                "decode: insufficient local symbols, trying network"
+                "decode: insufficient local raw symbols, trying network"
             );
 
             // Try network fetch for Alive, Uncertain, and PresumedLost placements.
@@ -489,20 +493,20 @@ impl RestoreCoordinator {
 
             // Merge: avoid duplicates by ESI.
             let existing_esis: HashSet<u32> =
-                unbound_symbols.iter().map(|s| s.esi).collect();
+                raw_symbols.iter().map(|s| s.esi).collect();
             for sym in network_symbols.drain(..) {
                 if !existing_esis.contains(&sym.esi) {
-                    unbound_symbols.push(sym);
-                    if unbound_symbols.len() >= k_eff {
+                    raw_symbols.push(sym);
+                    if raw_symbols.len() >= k_eff {
                         break;
                     }
                 }
             }
 
-            if unbound_symbols.len() < k_eff {
+            if raw_symbols.len() < k_eff {
                 return Err(RestoreError::InsufficientSymbols {
                     block: *block_id,
-                    got: unbound_symbols.len(),
+                    got: raw_symbols.len(),
                     need: k_eff,
                 });
             }
@@ -514,7 +518,7 @@ impl RestoreCoordinator {
         tokio::task::block_in_place(|| {
             let padded = self
                 .encoder
-                .decode(&unbound_symbols, params)
+                .decode(&raw_symbols, params)
                 .map_err(|e| RestoreError::DecodeFailed(*block_id, e.to_string()))?;
 
             if padded.len() < encrypted_size as usize {
