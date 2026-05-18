@@ -11,6 +11,7 @@ pub mod constants;
 pub mod db;
 pub mod erasure;
 pub mod escrow;
+pub mod importance;
 pub mod messages;
 pub mod path_safety;
 pub mod placement;
