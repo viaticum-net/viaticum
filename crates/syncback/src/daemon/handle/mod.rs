@@ -1018,10 +1018,16 @@ impl DaemonHandle {
 
 // ── DB open retry ────────────────────────────────────────────────────────────
 
-/// Wrap `Db::open` in a 1s/2s/4s/4s backoff (≤ 11s total) so a freshly
+/// Wrap `Db::open` in an exponential backoff (≤ ~60s total) so a freshly
 /// rexec'd child can wait for the parent to release the redb file lock.
+///
+/// Parent shutdown can be slow — `DaemonHandle::wait` joins every task
+/// sequentially, and a BackupCoordinator with an in-flight symbol-write
+/// cycle can hold the DB Arc for tens of seconds before exiting. The
+/// envelope must outlast the slowest realistic parent drain; 11s was
+/// observed to lose races under active backup load.
 async fn open_db_with_retry(path: &std::path::Path) -> Result<Db, anyhow::Error> {
-    let backoffs_ms = [0u64, 1000, 2000, 4000, 4000];
+    let backoffs_ms = [0u64, 500, 1000, 2000, 4000, 8000, 16000, 16000, 16000];
     let mut last_err: Option<anyhow::Error> = None;
     for (i, ms) in backoffs_ms.iter().enumerate() {
         if *ms > 0 {

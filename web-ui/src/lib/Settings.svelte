@@ -172,11 +172,16 @@
       // Connection drop is expected as the daemon goes down.
     }
 
-    // Poll /api/status up to 30s.
+    // Poll /api/status up to 60s. Parent shutdown can take 20s+ under
+    // active backup load (DB Arc held by BackupCoordinator until its
+    // current cycle drains); child's open_db_with_retry envelope matches.
     const start = Date.now();
     let online = false;
-    while (Date.now() - start < 30_000) {
+    while (Date.now() - start < 60_000) {
       await new Promise(r => setTimeout(r, 1000));
+      if (Date.now() - start > 15_000 && phaseMessage === 'Daemon restarting…') {
+        phaseMessage = 'Daemon restarting… (parent draining, can take up to 60s)';
+      }
       try {
         const s = await fetch('/api/status');
         if (s.ok) { online = true; break; }
@@ -192,9 +197,11 @@
     } else {
       phase = 'failed';
       phaseMessage =
-        'Daemon failed to restart within 30s. Check the daemon log ' +
-        '(typically ~/.viaticum/main/daemon.log). ' +
-        'To restore previous config: rename config.toml.bak → config.toml, then restart the daemon.';
+        'Daemon did not come back within 60s. The child may still be retrying ' +
+        'to acquire the DB lock from the parent — wait a few more seconds and ' +
+        'reload the page. If the daemon is truly stuck, check the daemon log ' +
+        '(typically ~/.viaticum/main/daemon.log). To restore previous config: ' +
+        'rename config.toml.bak → config.toml, then restart the daemon.';
     }
   }
 

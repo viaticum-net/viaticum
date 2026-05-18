@@ -1683,7 +1683,9 @@ fn emit_event(tx: &mpsc::Sender<ProtocolEvent>, event: ProtocolEvent) {
 async fn wait_for_tcp_port_free(host: &str, port: u16) {
     use std::net::TcpListener;
     let addr = format!("{host}:{port}");
-    let backoffs_ms = [0u64, 1000, 2000, 4000, 4000];
+    // Matches the DB-open retry envelope (~60s); parent's listener drop
+    // happens during the same slow shutdown that holds the DB lock.
+    let backoffs_ms = [0u64, 500, 1000, 2000, 4000, 8000, 16000, 16000, 16000];
     for (i, ms) in backoffs_ms.iter().enumerate() {
         if *ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
