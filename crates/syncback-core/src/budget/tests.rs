@@ -662,6 +662,66 @@ fn eviction_removes_lowest_priority_first() {
     );
 }
 
+/// W13: verify that `drop_notices` is non-empty when holdings exist in the buffer zone.
+///
+/// Scenario:
+/// - quota=1000, used=970 → free=30, free_ratio=0.03 → Hard
+/// - deficit = 0.15*1000 - 30 = 120 bytes; buffer = 0.05*1000 = 50 bytes
+/// - Holding A: 600 bytes, low priority (importance=0.1, trust=0.2)
+/// - Holding B: 350 bytes, medium priority (importance=0.5, trust=0.5)
+/// - Holding C: 20 bytes, high priority (importance=0.9, trust=0.9)
+///
+/// Phase 1 (evict): A(600 bytes) covers deficit(120 bytes) → A evicted immediately.
+/// Phase 2 (buffer): B(350) → phase2_freed ≥ buffer(50) → B gets drop notice.
+/// C is above the buffer threshold and is not touched.
+#[test]
+fn evaluate_pressure_hard_produces_drop_notice_for_buffer_zone() {
+    let now_secs = 0u64;
+    let holdings = vec![
+        // A: 600 bytes, lowest priority → immediately evicted
+        make_holding([0u8; 32], [1u8; 32], 0.1, 600, HoldingStatus::Active, Timestamp(now_secs)),
+        // B: 350 bytes, medium priority → buffer zone (DropNotice)
+        make_holding([1u8; 32], [2u8; 32], 0.5, 350, HoldingStatus::Active, Timestamp(now_secs)),
+        // C: 20 bytes, high priority → not touched
+        make_holding([2u8; 32], [3u8; 32], 0.9, 20, HoldingStatus::Active, Timestamp(now_secs)),
+    ];
+    let trust_fn = |id: &IdentityPub| -> f64 {
+        if id.0 == [1u8; 32] { 0.2 }
+        else if id.0 == [2u8; 32] { 0.5 }
+        else { 0.9 }
+    };
+
+    let result = evaluate_pressure(1000, 0, 970, &holdings, trust_fn, now_secs);
+
+    assert_eq!(result.pressure, DiskPressure::Hard);
+
+    // A must be immediately evicted.
+    assert_eq!(result.immediate_evictions.len(), 1);
+    assert_eq!(result.immediate_evictions[0].source_block_id, SourceBlockId([0u8; 32]));
+
+    // B must be in drop_notices (buffer zone).
+    assert!(
+        !result.drop_notices.is_empty(),
+        "drop_notices must be non-empty when buffer-zone holdings exist"
+    );
+    assert_eq!(
+        result.drop_notices[0].source_block_id,
+        SourceBlockId([1u8; 32]),
+        "B (medium priority) must receive a drop notice"
+    );
+    // Deadline must be now + DROP_NOTICE_WINDOW_SECS.
+    assert_eq!(
+        result.drop_notices[0].deadline_secs,
+        now_secs + DROP_NOTICE_WINDOW_SECS,
+    );
+
+    // C must NOT be evicted or notified.
+    let c_evicted = result.immediate_evictions.iter().any(|e| e.source_block_id == SourceBlockId([2u8; 32]));
+    let c_noticed = result.drop_notices.iter().any(|n| n.source_block_id == SourceBlockId([2u8; 32]));
+    assert!(!c_evicted, "C (highest priority) must not be evicted");
+    assert!(!c_noticed, "C (highest priority) must not receive a drop notice");
+}
+
 #[test]
 fn should_reject_offers_with_effective_quota() {
     // soft_quota=80 GiB, disk_free=50 GiB, reserve=20 GiB

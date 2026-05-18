@@ -39,7 +39,7 @@ use syncback_core::messages::{
 };
 use syncback_core::types::{
     DeviceId, FileId, HoldingRecord, HoldingStatus, IdentityPub, PlacementStatus, SourceBlockId,
-    SymbolPlacement, Timestamp,
+    SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
 };
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -2223,6 +2223,331 @@ async fn handle_symbol_drop_notice_does_not_panic() {
 
     // Should not panic — just logs.
     processor.handle_symbol_drop_notice(holder, notice);
+}
+
+// ─── W13 handle_symbol_drop_notice DB-state tests ────────────────────────────
+
+/// Build a minimal SourceBlockRecord suitable for tests. k=10, t=1, n=40.
+/// target_reliability > 0 ensures next_work_item can pick it up.
+fn make_source_block(block_id: SourceBlockId) -> SourceBlockRecord {
+    SourceBlockRecord {
+        block_id,
+        k: 10,
+        t: 1,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(0),
+        encrypted_size: Some(10),
+        n: Some(40),
+        overhead: Some(1.5),
+        drop_notice_sent_at: None,
+        importance: 0.5,
+        current_alive: 0,           // will be updated by handler
+        current_reliability: 0.0,   // will be updated by handler
+        target_reliability: 0.9,
+        last_attempted_at: None,
+        last_pool_signature: 0,
+    }
+}
+
+/// Register master→device mapping in DB so the handler can resolve identities.
+fn register_holder(db: &Db, master: IdentityPub, device: DeviceId) {
+    db.set_master_for_device(&device, &master).unwrap();
+}
+
+/// Build a SymbolDropNoticeMsg directed at a specific block.
+fn make_drop_notice(block_id: SourceBlockId, esi_ranges: Vec<(u32, u32)>) -> SymbolDropNoticeMsg {
+    SymbolDropNoticeMsg {
+        v: 1,
+        source_block_id: block_id,
+        esi_ranges,
+        deadline: Timestamp(Timestamp::now().0 + 604_800),
+        timestamp: Timestamp::now(),
+    }
+}
+
+/// Test: receiving a DropNotice for an Alive placement transitions it to Lost.
+#[tokio::test]
+async fn handle_symbol_drop_notice_transitions_placement_to_lost() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir).await;
+
+    let holder_master = make_identity(0xA1);
+    let holder_device = make_device_id(0xA1);
+    let block_id = make_block_id(0xB1);
+
+    register_holder(&db, holder_master, holder_device);
+    let block = make_source_block(block_id);
+    db.upsert_source_block(&block).unwrap();
+    let placement = make_symbol_placement(block_id, holder_device, vec![(0, 10)], PlacementStatus::Alive);
+    db.upsert_placement(&placement).unwrap();
+
+    processor.handle_symbol_drop_notice(holder_master, make_drop_notice(block_id, vec![(0, 10)]));
+
+    let updated = db.get_placement(&block_id, &holder_device).unwrap().unwrap();
+    assert_eq!(updated.status, PlacementStatus::Lost, "placement must transition to Lost");
+}
+
+/// Test: after DropNotice, current_alive is decremented from its pre-notice value.
+#[tokio::test]
+async fn handle_symbol_drop_notice_decrements_current_alive() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir).await;
+
+    let master_a = make_identity(0xA2);
+    let device_a = make_device_id(0xA2);
+    let master_b = make_identity(0xA3);
+    let device_b = make_device_id(0xA3);
+    let block_id = make_block_id(0xB2);
+
+    register_holder(&db, master_a, device_a);
+    register_holder(&db, master_b, device_b);
+
+    let mut block = make_source_block(block_id);
+    block.current_alive = 2; // two alive holders initially
+    db.upsert_source_block(&block).unwrap();
+    db.upsert_placement(&make_symbol_placement(block_id, device_a, vec![(0, 10)], PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_symbol_placement(block_id, device_b, vec![(10, 10)], PlacementStatus::Alive)).unwrap();
+
+    // Drop notice from holder A.
+    processor.handle_symbol_drop_notice(master_a, make_drop_notice(block_id, vec![(0, 10)]));
+
+    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(
+        updated_block.current_alive, 1,
+        "current_alive must decrement from 2 to 1 after one placement goes Lost"
+    );
+}
+
+/// Test: after DropNotice, current_reliability is recomputed and lower than before.
+#[tokio::test]
+async fn handle_symbol_drop_notice_recomputes_current_reliability() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir).await;
+
+    let master_a = make_identity(0xC1);
+    let device_a = make_device_id(0xC1);
+    let master_b = make_identity(0xC2);
+    let device_b = make_device_id(0xC2);
+    let block_id = make_block_id(0xC3);
+
+    register_holder(&db, master_a, device_a);
+    register_holder(&db, master_b, device_b);
+
+    let mut block = make_source_block(block_id);
+    block.current_alive = 2;
+    // Pre-set a high reliability so we can detect it drops.
+    block.current_reliability = 0.99;
+    db.upsert_source_block(&block).unwrap();
+    db.upsert_placement(&make_symbol_placement(block_id, device_a, vec![(0, 20)], PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_symbol_placement(block_id, device_b, vec![(20, 20)], PlacementStatus::Alive)).unwrap();
+
+    processor.handle_symbol_drop_notice(master_a, make_drop_notice(block_id, vec![(0, 20)]));
+
+    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
+    assert!(
+        updated_block.current_reliability < 0.99,
+        "current_reliability must decrease after one placement goes Lost (was 0.99, now {})",
+        updated_block.current_reliability
+    );
+    // With only one alive holder remaining, reliability should still be > 0
+    // (they have 20 symbols, k_eff = 13 for k=10).
+    assert!(
+        updated_block.current_reliability > 0.0,
+        "current_reliability must be > 0.0 when one holder still has 20 symbols"
+    );
+}
+
+/// Test: sending the same DropNotice twice does not double-decrement current_alive.
+#[tokio::test]
+async fn handle_symbol_drop_notice_idempotent_on_duplicate() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir).await;
+
+    let master_a = make_identity(0xD1);
+    let device_a = make_device_id(0xD1);
+    let master_b = make_identity(0xD2);
+    let device_b = make_device_id(0xD2);
+    let block_id = make_block_id(0xD3);
+
+    register_holder(&db, master_a, device_a);
+    register_holder(&db, master_b, device_b);
+
+    let mut block = make_source_block(block_id);
+    block.current_alive = 2;
+    db.upsert_source_block(&block).unwrap();
+    db.upsert_placement(&make_symbol_placement(block_id, device_a, vec![(0, 10)], PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_symbol_placement(block_id, device_b, vec![(10, 10)], PlacementStatus::Alive)).unwrap();
+
+    // Send the same notice twice.
+    let notice = make_drop_notice(block_id, vec![(0, 10)]);
+    processor.handle_symbol_drop_notice(master_a, notice.clone());
+    processor.handle_symbol_drop_notice(master_a, notice);
+
+    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(
+        updated_block.current_alive, 1,
+        "duplicate DropNotice must not double-decrement current_alive"
+    );
+}
+
+/// Test: DropNotice for unknown block logs WARN and returns without panicking.
+#[tokio::test]
+async fn handle_symbol_drop_notice_source_block_record_missing_logs_and_returns() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir).await;
+
+    // Register a holder device so the master-to-device resolution succeeds,
+    // but insert no SourceBlockRecord for this block_id.
+    let holder_master = make_identity(0xE1);
+    let holder_device = make_device_id(0xE1);
+    register_holder(&db, holder_master, holder_device);
+    let block_id = make_block_id(0xE2);
+    // Insert a placement so find_placement succeeds and mark_placement_lost is called,
+    // but no SourceBlockRecord exists — verifies the "block not found" warn path.
+    let placement = make_symbol_placement(block_id, holder_device, vec![(0, 10)], PlacementStatus::Alive);
+    db.upsert_placement(&placement).unwrap();
+
+    // Should not panic.
+    processor.handle_symbol_drop_notice(
+        holder_master,
+        make_drop_notice(block_id, vec![(0, 10)]),
+    );
+    // No assertion needed — the test passes if no panic occurs.
+}
+
+/// Test: DropNotice from a master that has no devices in DB logs WARN and returns.
+#[tokio::test]
+async fn handle_symbol_drop_notice_unknown_holder_logs_and_returns() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir).await;
+
+    let block_id = make_block_id(0xF1);
+    let mut block = make_source_block(block_id);
+    block.current_alive = 1;
+    db.upsert_source_block(&block).unwrap();
+
+    // holder_master has no registered devices — get_devices_for_master returns empty.
+    let holder_master = make_identity(0xF2);
+
+    // Should not panic. Placement state should be unchanged (no placement inserted).
+    processor.handle_symbol_drop_notice(
+        holder_master,
+        make_drop_notice(block_id, vec![(0, 10)]),
+    );
+
+    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(
+        updated_block.current_alive, 1,
+        "current_alive must be unchanged when holder is unknown"
+    );
+}
+
+/// Test: DropNotice for a placement that is already Lost is a no-op (no double-decrement).
+#[tokio::test]
+async fn handle_symbol_drop_notice_placement_already_lost_is_noop() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir).await;
+
+    let holder_master = make_identity(0x01);
+    let holder_device = make_device_id(0x01);
+    let other_master = make_identity(0x02);
+    let other_device = make_device_id(0x02);
+    let block_id = make_block_id(0x03);
+
+    register_holder(&db, holder_master, holder_device);
+    register_holder(&db, other_master, other_device);
+
+    let mut block = make_source_block(block_id);
+    block.current_alive = 1; // only the other placement is alive
+    db.upsert_source_block(&block).unwrap();
+    // Holder's placement is already Lost.
+    db.upsert_placement(&make_symbol_placement(block_id, holder_device, vec![(0, 10)], PlacementStatus::Lost)).unwrap();
+    // Other holder is Alive.
+    db.upsert_placement(&make_symbol_placement(block_id, other_device, vec![(10, 10)], PlacementStatus::Alive)).unwrap();
+
+    // DropNotice for the already-Lost placement.
+    processor.handle_symbol_drop_notice(holder_master, make_drop_notice(block_id, vec![(0, 10)]));
+
+    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(
+        updated_block.current_alive, 1,
+        "current_alive must stay 1 when placement was already Lost (no-op path)"
+    );
+}
+
+/// Test: after DropNotice drops reliability below target, next_work_item returns the block.
+#[tokio::test]
+async fn handle_symbol_drop_notice_block_becomes_eligible_for_worker() {
+    use std::time::Duration;
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir).await;
+
+    let master_a = make_identity(0x10);
+    let device_a = make_device_id(0x10);
+    let master_b = make_identity(0x11);
+    let device_b = make_device_id(0x11);
+    let block_id = make_block_id(0x12);
+
+    register_holder(&db, master_a, device_a);
+    register_holder(&db, master_b, device_b);
+
+    // Block with two alive holders, reliability set just above target.
+    let mut block = make_source_block(block_id);
+    block.current_alive = 2;
+    block.current_reliability = 0.95; // above target (0.9)
+    block.target_reliability = 0.9;
+    db.upsert_source_block(&block).unwrap();
+    // Each holder has exactly k symbols (10 symbols, k=10, k_eff=13).
+    // With one holder: alive_symbols=10 < k_eff=13 → reliability drops to near-zero.
+    db.upsert_placement(&make_symbol_placement(block_id, device_a, vec![(0, 10)], PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_symbol_placement(block_id, device_b, vec![(10, 10)], PlacementStatus::Alive)).unwrap();
+
+    // Confirm block is NOT eligible before DropNotice (reliability >= target).
+    let before = db
+        .next_work_item(1.0, Duration::from_secs(0), Timestamp::now(), 0)
+        .unwrap();
+    assert!(
+        before.is_none(),
+        "block must not be eligible before DropNotice (reliability >= target)"
+    );
+
+    // Send DropNotice for holder A.
+    processor.handle_symbol_drop_notice(master_a, make_drop_notice(block_id, vec![(0, 10)]));
+
+    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
+    assert!(
+        updated_block.current_reliability < updated_block.target_reliability,
+        "current_reliability ({}) must drop below target ({}) after DropNotice",
+        updated_block.current_reliability,
+        updated_block.target_reliability,
+    );
+
+    // Block must now be eligible for the worker.
+    let after = db
+        .next_work_item(1.0, Duration::from_secs(0), Timestamp::now(), 0)
+        .unwrap();
+    assert!(
+        after.is_some(),
+        "block must be eligible for worker after DropNotice drops reliability below target"
+    );
+    assert_eq!(after.unwrap().block_id, block_id);
 }
 
 // ─── dispatch_relay tests for new message types ───────────────────────────────
