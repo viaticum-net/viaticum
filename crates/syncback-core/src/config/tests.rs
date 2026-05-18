@@ -9,7 +9,11 @@ use crate::config::{
     DEFAULT_IMPORTANCE, DEFAULT_IMPORTANCE_MULTIPLIER,
 };
 #[cfg(test)]
-use crate::importance::FolderClassification;
+use crate::importance::{FolderClassification, burst::{self, apply_burst_downweight, burst_downweight_selects}};
+#[cfg(test)]
+use std::collections::HashSet;
+#[cfg(test)]
+use std::path::Path;
 #[cfg(test)]
 use crate::constants::{
     DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_K_FACTOR, DEFAULT_MAX_VERSIONS,
@@ -491,11 +495,13 @@ fn watch_config_serializes_as_importance_multiplier_key() {
         importance_multiplier: 0.8,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     let s = toml::to_string(&wc).unwrap();
     assert!(s.contains("importance_multiplier"), "canonical key must be written");
     assert!(!s.contains("was_legacy_importance"), "skip field must not be written");
     assert!(!s.contains("classification"), "skip field must not be written");
+    assert!(!s.contains("bursts"), "skip field must not be written");
 }
 
 #[test]
@@ -564,6 +570,7 @@ fn make_watch(path: &str, multiplier: f64, is_media: bool) -> WatchConfig {
         importance_multiplier: multiplier,
         was_legacy_importance: false,
         classification: Some(FolderClassification { is_media_folder: is_media, importance_multiplier: 1.0 }),
+        bursts: None,
     }
 }
 
@@ -642,6 +649,7 @@ fn derive_file_importance_path_with_trailing_slash_in_config() {
         importance_multiplier: 1.0,
         was_legacy_importance: false,
         classification: Some(FolderClassification { is_media_folder: false, importance_multiplier: 1.0 }),
+        bursts: None,
     };
     let result = derive_file_importance("/home/user/docs/file.txt", &[wc]);
     // TextOrCode × 1.0 = 1.0
@@ -686,6 +694,7 @@ fn watch_config_classification_populated_at_watch_start() {
         importance_multiplier: 1.0,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     wc.populate_classification();
     assert!(wc.classification.is_some(), "classification should be set");
@@ -703,6 +712,7 @@ fn watch_config_empty_folder_classification_defaults_to_non_media() {
         importance_multiplier: 1.0,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     wc.populate_classification();
     assert_eq!(
@@ -723,6 +733,7 @@ fn populate_classification_samples_up_to_200_paths() {
         importance_multiplier: 1.0,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     wc.populate_classification();
     assert!(wc.classification.is_some());
@@ -746,6 +757,7 @@ fn populate_classification_cap_stops_at_cap_boundary() {
         importance_multiplier: 1.0,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     wc.populate_classification_with_cap(5);
     assert!(wc.classification.is_some(), "classification should be set with small cap");
@@ -769,6 +781,7 @@ fn populate_classification_excludes_symlinks() {
         importance_multiplier: 1.0,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     // Should complete without infinite loop.
     wc.populate_classification();
@@ -782,6 +795,7 @@ fn populate_classification_missing_directory_sets_default() {
         importance_multiplier: 1.0,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     wc.populate_classification();
     assert_eq!(
@@ -920,5 +934,198 @@ fn config_completion_bonus_coefficient_round_trip_serialize_deserialize() {
         (cfg2.reliability.completion_bonus_coefficient - 3.0_f64).abs() < 1e-9,
         "expected 3.0, got {}",
         cfg2.reliability.completion_bonus_coefficient
+    );
+}
+
+// ============================================================
+// Wave 7: derive_file_importance with bursts
+// ============================================================
+
+fn make_watch_with_bursts(
+    path: &str,
+    is_media: bool,
+    bursts: Option<Vec<HashSet<std::path::PathBuf>>>,
+) -> WatchConfig {
+    WatchConfig {
+        path: path.to_string(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: Some(FolderClassification { is_media_folder: is_media, importance_multiplier: 1.0 }),
+        bursts,
+    }
+}
+
+#[test]
+fn derive_file_importance_applies_burst_downweight_when_path_in_burst() {
+    // Find a path for which burst_downweight_selects returns true.
+    let target_path = (0..200u32)
+        .map(|i| format!("/photos/img_{:04}.jpg", i))
+        .find(|p| burst_downweight_selects(Path::new(p)))
+        .expect("at least one of 200 paths must be selected");
+
+    let mut burst_set: HashSet<std::path::PathBuf> = HashSet::new();
+    burst_set.insert(std::path::PathBuf::from(&target_path));
+
+    let wc = make_watch_with_bursts("/photos", true, Some(vec![burst_set]));
+
+    // Compute what the non-downweighted importance would be.
+    let wc_no_burst = WatchConfig { bursts: Some(vec![]), ..wc.clone() };
+    let without_downweight = derive_file_importance(&target_path, &[wc_no_burst]);
+
+    // With burst set: downweight should be applied.
+    let result = derive_file_importance(&target_path, &[wc]);
+    let expected = apply_burst_downweight(without_downweight);
+    assert!(
+        (result - expected).abs() < 1e-9,
+        "burst downweight should halve importance (floor 0.05): result={result} expected={expected}"
+    );
+}
+
+#[test]
+fn derive_file_importance_no_downweight_when_path_not_in_burst() {
+    let mut burst_set: HashSet<std::path::PathBuf> = HashSet::new();
+    burst_set.insert(std::path::PathBuf::from("/photos/other.jpg"));
+
+    let wc = make_watch_with_bursts("/photos", true, Some(vec![burst_set]));
+
+    let target = "/photos/img_not_in_burst.jpg";
+    let result = derive_file_importance(target, &[wc.clone()]);
+
+    // Without burst, same result
+    let wc_no_burst = WatchConfig { bursts: Some(vec![]), ..wc };
+    let base = derive_file_importance(target, &[wc_no_burst]);
+    assert!((result - base).abs() < 1e-9, "no downweight for path not in burst");
+}
+
+#[test]
+fn derive_file_importance_no_downweight_when_bursts_empty() {
+    let wc = make_watch_with_bursts("/photos", true, Some(vec![]));
+    let target = "/photos/img_001.jpg";
+    let result = derive_file_importance(target, &[wc]);
+    // Should be one of the media bucket values.
+    assert!(
+        result == 0.95 || result == 0.65 || result == 0.20,
+        "expected media bucket value (no downweight), got {result}"
+    );
+}
+
+#[test]
+fn derive_file_importance_no_downweight_when_bursts_none() {
+    let wc = make_watch_with_bursts("/photos", true, None);
+    let target = "/photos/img_001.jpg";
+    let result = derive_file_importance(target, &[wc]);
+    assert!(
+        result == 0.95 || result == 0.65 || result == 0.20,
+        "expected media bucket value (bursts=None means no downweight), got {result}"
+    );
+}
+
+#[test]
+fn derive_file_importance_no_downweight_when_30pct_selection_excludes_path() {
+    // Find a path for which burst_downweight_selects returns FALSE (30% case).
+    let not_selected = (0..200u32)
+        .map(|i| format!("/photos/img_{:04}.jpg", i))
+        .find(|p| !burst_downweight_selects(Path::new(p)))
+        .expect("at least one of 200 paths must be in the 30% not-selected bucket");
+
+    let mut burst_set: HashSet<std::path::PathBuf> = HashSet::new();
+    burst_set.insert(std::path::PathBuf::from(&not_selected));
+
+    let wc = make_watch_with_bursts("/photos", true, Some(vec![burst_set]));
+    let result = derive_file_importance(&not_selected, &[wc.clone()]);
+
+    // Without burst check → same importance.
+    let wc_no_burst = WatchConfig { bursts: Some(vec![]), ..wc };
+    let base = derive_file_importance(&not_selected, &[wc_no_burst]);
+    assert!(
+        (result - base).abs() < 1e-9,
+        "path in burst but not selected (30%) → no downweight; result={result} base={base}"
+    );
+}
+
+// ============================================================
+// Wave 7: populate_bursts
+// ============================================================
+
+#[test]
+fn populate_bursts_finds_clusters_in_real_directory() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Write 1 .jpg file — not enough for a burst (< min_count=8), but wiring check.
+    std::fs::write(dir.path().join("photo.jpg"), b"fake jpg").unwrap();
+
+    let mut wc = WatchConfig {
+        path: dir.path().to_string_lossy().into_owned(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+        bursts: None,
+    };
+    wc.populate_bursts();
+
+    // Wiring check: populate_bursts ran and stored Some result.
+    assert!(wc.bursts.is_some(), "bursts should be populated after populate_bursts()");
+    // 1 file < min_count=8 → no burst detected.
+    assert!(
+        wc.bursts.as_ref().unwrap().is_empty(),
+        "1 file < min_count=8, no bursts expected"
+    );
+}
+
+#[test]
+fn populate_bursts_excludes_text_files() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("notes.txt"), b"text content").unwrap();
+    std::fs::write(dir.path().join("README.md"), b"readme").unwrap();
+    std::fs::write(dir.path().join("photo.jpg"), b"fake jpg").unwrap();
+
+    let mut wc = WatchConfig {
+        path: dir.path().to_string_lossy().into_owned(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+        bursts: None,
+    };
+    wc.populate_bursts();
+
+    // Only 1 media file (photo.jpg) found; text files excluded.
+    assert!(wc.bursts.is_some(), "bursts should be populated");
+    assert!(
+        wc.bursts.as_ref().unwrap().is_empty(),
+        "only 1 media file found, no burst"
+    );
+}
+
+#[test]
+fn populate_bursts_handles_empty_folder_gracefully() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut wc = WatchConfig {
+        path: dir.path().to_string_lossy().into_owned(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+        bursts: None,
+    };
+    wc.populate_bursts();
+    assert_eq!(
+        wc.bursts,
+        Some(vec![]),
+        "empty folder: bursts should be Some(empty vec)"
+    );
+}
+
+#[test]
+fn populate_bursts_handles_missing_directory() {
+    let mut wc = WatchConfig {
+        path: "/nonexistent/path/does/not/exist".to_string(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+        bursts: None,
+    };
+    wc.populate_bursts();
+    assert_eq!(
+        wc.bursts,
+        Some(vec![]),
+        "missing directory: bursts should be Some(empty vec)"
     );
 }

@@ -216,6 +216,18 @@ pub struct WatchConfig {
     /// None until populate_classification() is called. Not serialized.
     #[serde(skip)]
     pub classification: Option<crate::importance::FolderClassification>,
+
+    /// Burst groups detected at watch-start by populate_bursts().
+    ///
+    /// Each element is a set of paths that form a time-clustered media burst
+    /// (>= 8 files within a 60-second mtime window). None = not yet populated.
+    /// Empty vec = populated but no bursts detected.
+    ///
+    /// Not serialized -- regenerated at each daemon start by scanning the
+    /// filesystem. Files added after daemon start do not appear in burst sets
+    /// until the next restart.
+    #[serde(skip)]
+    pub bursts: Option<Vec<std::collections::HashSet<std::path::PathBuf>>>,
 }
 
 /// Private intermediate struct for custom WatchConfig deserialization.
@@ -243,6 +255,7 @@ impl<'de> serde::Deserialize<'de> for WatchConfig {
             importance_multiplier: multiplier,
             was_legacy_importance: was_legacy,
             classification: None,
+            bursts: None,
         })
     }
 }
@@ -311,6 +324,111 @@ impl WatchConfig {
         }
 
         self.classification = Some(crate::importance::classify_folder(&paths_seen));
+    }
+
+    /// Scan the watch directory and detect time-clustered media file bursts.
+    ///
+    /// Walks ALL files in the directory (no path count cap -- unlike
+    /// populate_classification which caps at 200). For each media-extension file,
+    /// reads its mtime via metadata(). Files with unreadable metadata are silently
+    /// skipped (logged at debug level).
+    ///
+    /// Calls detect_bursts(collected_pairs, BURST_WINDOW, BURST_MIN_COUNT).
+    /// Stores the result in self.bursts.
+    ///
+    /// On partial read errors (a subdirectory becomes inaccessible mid-walk):
+    /// continues with the paths collected so far. Files in the unreadable
+    /// subdirectory are not included in burst detection and will not be downweighted.
+    ///
+    /// If the directory does not exist or is not accessible, stores Some(vec![])
+    /// (no bursts) and logs a warning.
+    ///
+    /// # Lifecycle
+    ///
+    /// Called once per watch at daemon startup and at dynamic watch-add time,
+    /// immediately after populate_classification(). Never called again during the
+    /// daemon lifetime.
+    pub fn populate_bursts(&mut self) {
+        use crate::importance::{BURST_MIN_COUNT, BURST_WINDOW};
+        use std::path::PathBuf;
+        use std::time::SystemTime;
+
+        let expanded = expand_watch_path(&self.path);
+        let mut media_pairs: Vec<(PathBuf, SystemTime)> = Vec::new();
+        let mut stack: Vec<PathBuf> = vec![expanded.clone()];
+
+        while let Some(current) = stack.pop() {
+            let entries = match std::fs::read_dir(&current) {
+                Ok(r) => r,
+                Err(e) => {
+                    if current == expanded {
+                        // Root directory inaccessible: store empty bursts.
+                        tracing::warn!(
+                            dir = %current.display(),
+                            error = %e,
+                            "populate_bursts: cannot read root watch directory; no burst detection"
+                        );
+                        self.bursts = Some(vec![]);
+                        return;
+                    } else {
+                        // Subdirectory inaccessible: partial scan, continue.
+                        tracing::debug!(
+                            dir = %current.display(),
+                            error = %e,
+                            "populate_bursts: cannot read subdirectory; skipping"
+                        );
+                        continue;
+                    }
+                }
+            };
+
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else { continue };
+                // Skip symlinks to avoid loops.
+                if ft.is_symlink() {
+                    continue;
+                }
+                let path = entry.path();
+                if ft.is_dir() {
+                    // Skip hidden directories (names starting with '.').
+                    if let Some(name) = path.file_name() {
+                        if name.to_string_lossy().starts_with('.') {
+                            continue;
+                        }
+                    }
+                    stack.push(path);
+                } else if ft.is_file() {
+                    // Only include media-extension files in burst detection.
+                    let is_media = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| {
+                            crate::importance::burst::is_media_ext(&e.to_ascii_lowercase())
+                        })
+                        .unwrap_or(false);
+                    if !is_media {
+                        continue;
+                    }
+                    // Read mtime; skip file if unavailable.
+                    match entry.metadata().and_then(|m| m.modified()) {
+                        Ok(mtime) => media_pairs.push((path, mtime)),
+                        Err(e) => {
+                            tracing::debug!(
+                                path = %entry.path().display(),
+                                error = %e,
+                                "populate_bursts: cannot read mtime; skipping file"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        self.bursts = Some(crate::importance::detect_bursts(
+            &media_pairs,
+            BURST_WINDOW,
+            BURST_MIN_COUNT,
+        ));
     }
 }
 
@@ -739,9 +857,13 @@ pub fn expand_watch_path(s: &str) -> PathBuf {
 /// Derive the effective importance for a file path from the watch configs.
 ///
 /// Finds the first WatchConfig whose expanded path is a prefix of `file_path`,
-/// then computes:
-///   class = importance::classify_file(file_path, &wc.classification.unwrap_or_default())
-///   result = importance::effective_importance(class, wc.importance_multiplier)
+/// then computes importance in order:
+///
+/// 1. class = classify_file(path, wc.classification.unwrap_or_default())
+/// 2. base = effective_importance(class, wc.importance_multiplier)
+/// 3. Burst check: if is_in_any_burst(path, wc.bursts.as_deref().unwrap_or(&[]))
+///    AND burst_downweight_selects(path): return apply_burst_downweight(base)
+/// 4. Otherwise: return base
 ///
 /// If no WatchConfig matches, returns DEFAULT_IMPORTANCE (0.5).
 ///
@@ -752,6 +874,12 @@ pub fn expand_watch_path(s: &str) -> PathBuf {
 /// wc.importance_multiplier, which is what this function passes to effective_importance.
 /// Do NOT pass classification.importance_multiplier.
 ///
+/// # Ordering
+///
+/// The user-configured folder multiplier (step 2) is applied BEFORE burst downweight
+/// (step 3). Burst downweight is a per-file correction; it does not interact
+/// multiplicatively with the folder-level knob.
+///
 /// # Prefix matching
 ///
 /// Same semantics as the replaced lookup_importance: a trailing '/' is appended
@@ -761,11 +889,17 @@ pub fn expand_watch_path(s: &str) -> PathBuf {
 pub fn derive_file_importance(file_path: &str, watch_cfgs: &[WatchConfig]) -> f64 {
     if let Some(wc) = find_watch_config(file_path, watch_cfgs) {
         let folder = wc.classification.clone().unwrap_or_default();
-        let class = crate::importance::classify_file(
-            std::path::Path::new(file_path),
-            &folder,
-        );
-        crate::importance::effective_importance(class, wc.importance_multiplier)
+        let path = std::path::Path::new(file_path);
+        let class = crate::importance::classify_file(path, &folder);
+        let base = crate::importance::effective_importance(class, wc.importance_multiplier);
+        let bursts = wc.bursts.as_deref().unwrap_or(&[]);
+        if crate::importance::is_in_any_burst(path, bursts)
+            && crate::importance::burst_downweight_selects(path)
+        {
+            crate::importance::apply_burst_downweight(base)
+        } else {
+            base
+        }
     } else {
         DEFAULT_IMPORTANCE
     }

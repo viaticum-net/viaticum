@@ -1064,6 +1064,7 @@ fn watch_config_importance_applied_to_queued_file() {
             is_media_folder: false,
             importance_multiplier: 1.0,
         }),
+        bursts: None,
     }];
     let mut coord = coord_with_watch(db, &symbols_dir, watch_cfgs);
 
@@ -1095,6 +1096,7 @@ fn watch_config_default_importance_used_when_no_match() {
         importance_multiplier: 0.9,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     }];
     let mut coord = coord_with_watch(db, &symbols_dir, watch_cfgs);
 
@@ -1161,6 +1163,7 @@ fn derive_file_importance_integration_photo_and_text_files_in_correct_order() {
         importance_multiplier: 1.0,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     wc_media.populate_classification();
 
@@ -1169,6 +1172,7 @@ fn derive_file_importance_integration_photo_and_text_files_in_correct_order() {
         importance_multiplier: 1.0,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     wc_text.populate_classification();
 
@@ -2106,5 +2110,78 @@ fn pipeline_creates_offered_placements() {
                 p.holder_id
             );
         }
+    }
+}
+
+// ─── Phase 7.9 Wave 7: burst downweight integration ─────────────────────────
+
+#[test]
+fn derive_file_importance_burst_downweight_integration() {
+    use std::collections::HashSet;
+    use std::path::Path;
+    use syncback_core::config::WatchConfig;
+    use syncback_core::importance::burst::{apply_burst_downweight, burst_downweight_selects};
+
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let media_dir = TempDir::new().unwrap();
+
+    // Write 8 .jpg files into the media directory.
+    for i in 0..8u32 {
+        std::fs::write(
+            media_dir.path().join(format!("img_{:04}.jpg", i)),
+            format!("fake jpeg content {}", i).as_bytes(),
+        )
+        .unwrap();
+    }
+
+    let mut wc = WatchConfig {
+        path: media_dir.path().to_string_lossy().into_owned(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+        bursts: None,
+    };
+    wc.populate_classification();
+    wc.populate_bursts();
+
+    // Verify populate_bursts ran (burst sets may be empty due to FS mtime resolution).
+    assert!(wc.bursts.is_some(), "bursts should be populated after populate_bursts()");
+
+    // Manually inject a burst set containing img_0000.jpg to test the derive path.
+    let target_path = media_dir.path().join("img_0000.jpg");
+    let target_str = target_path.to_string_lossy().to_string();
+
+    let selected = burst_downweight_selects(Path::new(&target_str));
+
+    let mut manual_burst: HashSet<std::path::PathBuf> = HashSet::new();
+    manual_burst.insert(target_path.clone());
+
+    let mut wc_with_burst = wc.clone();
+    wc_with_burst.bursts = Some(vec![manual_burst]);
+
+    let importance_with_burst = syncback_core::config::derive_file_importance(
+        &target_str,
+        &[wc_with_burst.clone()],
+    );
+
+    let wc_without_burst = WatchConfig {
+        bursts: Some(vec![]),
+        ..wc_with_burst.clone()
+    };
+    let importance_without_burst =
+        syncback_core::config::derive_file_importance(&target_str, &[wc_without_burst]);
+
+    if selected {
+        let expected = apply_burst_downweight(importance_without_burst);
+        assert!(
+            (importance_with_burst - expected).abs() < 1e-9,
+            "selected path should be downweighted: got {importance_with_burst}, expected {expected}"
+        );
+    } else {
+        assert!(
+            (importance_with_burst - importance_without_burst).abs() < 1e-9,
+            "non-selected path should keep full importance: with={importance_with_burst} without={importance_without_burst}"
+        );
     }
 }

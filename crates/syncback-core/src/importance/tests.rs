@@ -1,5 +1,8 @@
 use super::*;
+use super::burst;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn non_media_folder() -> FolderClassification {
     FolderClassification {
@@ -404,4 +407,281 @@ fn effective_importance_media_low_boosted() {
     assert!((result - 0.60).abs() < 1e-10, "expected 0.60, got {}", result);
     // 0.20 * 6.0 = 1.20 → clamped to 1.0
     assert_eq!(effective_importance(ImportanceClass::MediaLow, 6.0), 1.0);
+}
+
+// ============================================================
+// ---- burst.rs tests ----
+// ============================================================
+
+/// Helper: make a SystemTime from seconds since UNIX_EPOCH.
+fn t(secs: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+/// Helper: make a (PathBuf, SystemTime) pair.
+fn file_at(name: &str, secs: u64) -> (PathBuf, SystemTime) {
+    (PathBuf::from(name), t(secs))
+}
+
+// ──────────────────────────────────────────────
+// detect_bursts
+// ──────────────────────────────────────────────
+
+#[test]
+fn detect_bursts_groups_eight_files_within_60s() {
+    let files: Vec<(PathBuf, SystemTime)> = (0..8u64)
+        .map(|i| file_at(&format!("/photos/img_{:04}.jpg", i), i * 5))
+        .collect();
+    let result = burst::detect_bursts(&files, Duration::from_secs(60), 8);
+    assert_eq!(result.len(), 1, "expected 1 burst, got {}", result.len());
+    assert_eq!(result[0].len(), 8, "burst should contain all 8 files");
+    for i in 0..8u64 {
+        let p = PathBuf::from(format!("/photos/img_{:04}.jpg", i));
+        assert!(result[0].contains(&p), "missing {}", p.display());
+    }
+}
+
+#[test]
+fn detect_bursts_ignores_seven_files_within_60s() {
+    let files: Vec<(PathBuf, SystemTime)> = (0..7u64)
+        .map(|i| file_at(&format!("/photos/img_{:04}.jpg", i), i * 5))
+        .collect();
+    let result = burst::detect_bursts(&files, Duration::from_secs(60), 8);
+    assert!(result.is_empty(), "7 < min_count=8, expected no burst");
+}
+
+#[test]
+fn detect_bursts_separates_two_clusters_separated_by_5_min() {
+    // group1: t=0,5,10,15,20,25,30,35
+    let mut files: Vec<(PathBuf, SystemTime)> = (0..8u64)
+        .map(|i| file_at(&format!("/photos/g1_{:04}.jpg", i), i * 5))
+        .collect();
+    // group2: t=360..395 (6 minutes later)
+    files.extend((0..8u64).map(|i| file_at(&format!("/photos/g2_{:04}.jpg", i), 360 + i * 5)));
+
+    let result = burst::detect_bursts(&files, Duration::from_secs(60), 8);
+    assert_eq!(result.len(), 2, "expected 2 bursts, got {}", result.len());
+
+    // Each burst should contain 8 paths.
+    assert_eq!(result[0].len(), 8);
+    assert_eq!(result[1].len(), 8);
+
+    // Algorithm sorts by mtime → group1 (earlier) → result[0]; group2 → result[1].
+    for i in 0..8u64 {
+        let g1 = PathBuf::from(format!("/photos/g1_{:04}.jpg", i));
+        assert!(result[0].contains(&g1), "g1 path {} should be in first burst", i);
+        assert!(!result[1].contains(&g1), "g1 path {} must NOT leak into second burst", i);
+
+        let g2 = PathBuf::from(format!("/photos/g2_{:04}.jpg", i));
+        assert!(result[1].contains(&g2), "g2 path {} should be in second burst", i);
+        assert!(!result[0].contains(&g2), "g2 path {} must NOT leak into first burst", i);
+    }
+}
+
+#[test]
+fn detect_bursts_empty_input_returns_empty() {
+    let result = burst::detect_bursts(&[], Duration::from_secs(60), 8);
+    assert!(result.is_empty());
+}
+
+#[test]
+fn detect_bursts_single_file_returns_empty() {
+    let files = vec![file_at("/photos/solo.jpg", 0)];
+    let result = burst::detect_bursts(&files, Duration::from_secs(60), 8);
+    assert!(result.is_empty(), "1 < min_count=8, expected no burst");
+}
+
+#[test]
+fn detect_bursts_sorts_input_internally() {
+    // Provide files in reverse mtime order.
+    let files: Vec<(PathBuf, SystemTime)> = (0..8u64)
+        .map(|i| file_at(&format!("/photos/img_{:04}.jpg", i), (7 - i) * 5))
+        .collect();
+    let result = burst::detect_bursts(&files, Duration::from_secs(60), 8);
+    assert_eq!(result.len(), 1, "should sort internally and detect burst");
+    assert_eq!(result[0].len(), 8);
+}
+
+#[test]
+fn detect_bursts_exactly_at_window_boundary() {
+    // 8 files: t=0,10,20,30,40,50,59,60 — last exactly 60s from first.
+    let times = [0u64, 10, 20, 30, 40, 50, 59, 60];
+    let files: Vec<(PathBuf, SystemTime)> = times
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| file_at(&format!("/photos/img_{:04}.jpg", i), s))
+        .collect();
+    let result = burst::detect_bursts(&files, Duration::from_secs(60), 8);
+    assert_eq!(result.len(), 1, "t[7]-t[0]=60 <= 60, should form a burst");
+}
+
+#[test]
+fn detect_bursts_just_outside_window() {
+    // 8 files: t=0,10,20,30,40,50,59,61 — last 61s from first.
+    let times = [0u64, 10, 20, 30, 40, 50, 59, 61];
+    let files: Vec<(PathBuf, SystemTime)> = times
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| file_at(&format!("/photos/img_{:04}.jpg", i), s))
+        .collect();
+    let result = burst::detect_bursts(&files, Duration::from_secs(60), 8);
+    assert!(result.is_empty(), "t[7]-t[0]=61 > 60, no 8-file window fits");
+}
+
+#[test]
+fn detect_bursts_large_cluster_beyond_min_emits_full_range() {
+    // 16 files at t=0,3,6,...,45
+    let files: Vec<(PathBuf, SystemTime)> = (0..16u64)
+        .map(|i| file_at(&format!("/photos/img_{:04}.jpg", i), i * 3))
+        .collect();
+    let result = burst::detect_bursts(&files, Duration::from_secs(60), 8);
+    assert_eq!(result.len(), 1, "all 16 fit in window");
+    assert_eq!(result[0].len(), 16, "all 16 should be in the burst");
+}
+
+#[test]
+fn detect_bursts_non_overlapping_greedy() {
+    // Design: first 8 files span 56s (≤ 60s window).
+    // The next file is at t=62 (62-0=62 > 60) → first burst ends at j=7.
+    // Then 9 more files starting at t=62 form the second burst (range 24s ≤ 60s).
+    //
+    // first8: t=0,8,16,24,32,40,48,56 (range=56 ≤ 60, count=8 ≥ 8 → first burst)
+    // second_group: t=62,65,68,71,74,77,80,83,86 (range=24 ≤ 60, count=9 ≥ 8 → second burst)
+    let first8 = [0u64, 8, 16, 24, 32, 40, 48, 56];
+    let second9 = [62u64, 65, 68, 71, 74, 77, 80, 83, 86];
+    let mut times: Vec<u64> = first8.to_vec();
+    times.extend_from_slice(&second9);
+
+    let files: Vec<(PathBuf, SystemTime)> = times
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| file_at(&format!("/photos/img_{:04}.jpg", i), s))
+        .collect();
+    let result = burst::detect_bursts(&files, Duration::from_secs(60), 8);
+    assert_eq!(result.len(), 2, "non-overlapping: first 8 then 9 = 2 bursts, got {}", result.len());
+
+    // Check sizes: order in result follows mtime order.
+    let sizes: Vec<usize> = result.iter().map(|s| s.len()).collect();
+    assert!(
+        sizes.contains(&8) && sizes.contains(&9),
+        "expected bursts of size 8 and 9, got {:?}",
+        sizes
+    );
+}
+
+// ──────────────────────────────────────────────
+// is_in_any_burst
+// ──────────────────────────────────────────────
+
+#[test]
+fn is_in_any_burst_finds_path_in_one_of_several_sets() {
+    let mut set_a: HashSet<PathBuf> = HashSet::new();
+    set_a.insert(PathBuf::from("/p/a"));
+    set_a.insert(PathBuf::from("/p/b"));
+    let mut set_b: HashSet<PathBuf> = HashSet::new();
+    set_b.insert(PathBuf::from("/q/c"));
+    let bursts = vec![set_a, set_b];
+    assert!(burst::is_in_any_burst(Path::new("/q/c"), &bursts));
+}
+
+#[test]
+fn is_in_any_burst_returns_false_for_path_not_in_any_set() {
+    let mut set_a: HashSet<PathBuf> = HashSet::new();
+    set_a.insert(PathBuf::from("/p/a"));
+    set_a.insert(PathBuf::from("/p/b"));
+    let mut set_b: HashSet<PathBuf> = HashSet::new();
+    set_b.insert(PathBuf::from("/q/c"));
+    let bursts = vec![set_a, set_b];
+    assert!(!burst::is_in_any_burst(Path::new("/p/z"), &bursts));
+}
+
+#[test]
+fn is_in_any_burst_empty_bursts_returns_false() {
+    assert!(!burst::is_in_any_burst(Path::new("/anything"), &[]));
+}
+
+// ──────────────────────────────────────────────
+// burst_downweight_selects
+// ──────────────────────────────────────────────
+
+#[test]
+fn burst_downweight_selects_seventy_percent_of_thousand_paths() {
+    let paths: Vec<PathBuf> = (0..1000u32)
+        .map(|i| PathBuf::from(format!("/photos/img_{:04}.jpg", i)))
+        .collect();
+    let count = paths
+        .iter()
+        .filter(|p| burst::burst_downweight_selects(p))
+        .count();
+    // Using u64 % 100 (8 bytes of blake3) reduces bias to ~5×10⁻¹⁸ — effectively
+    // exact 70%. Binomial(1000, 0.7): stdev ≈ 14.5; ±5σ ≈ ±73, so [627, 773] is safe.
+    assert!(
+        (627..=773).contains(&count),
+        "expected ~70% of 1000 selected (within ±5σ of binomial), got {}",
+        count
+    );
+}
+
+#[test]
+fn burst_downweight_deterministic_across_calls() {
+    let path = Path::new("/home/alice/Photos/IMG_0042.jpg");
+    let r1 = burst::burst_downweight_selects(path);
+    let r2 = burst::burst_downweight_selects(path);
+    assert_eq!(r1, r2, "pure function must be deterministic");
+}
+
+#[test]
+fn burst_downweight_different_paths_may_differ() {
+    // Assert non-constant: at least one pair of distinct paths in a small
+    // sample produces different selection results. Catches a regression where
+    // burst_downweight_selects starts returning the same value for all inputs.
+    let results: Vec<bool> = (0..32u32)
+        .map(|i| {
+            let p = PathBuf::from(format!("/photos/img_{:04}.jpg", i));
+            burst::burst_downweight_selects(&p)
+        })
+        .collect();
+    let trues = results.iter().filter(|&&b| b).count();
+    assert!(
+        trues > 0 && trues < results.len(),
+        "expected mixed true/false across 32 paths, got {} true",
+        trues
+    );
+}
+
+// ──────────────────────────────────────────────
+// apply_burst_downweight
+// ──────────────────────────────────────────────
+
+#[test]
+fn apply_burst_downweight_halves_value() {
+    let result = burst::apply_burst_downweight(0.65);
+    assert!((result - 0.325).abs() < 1e-9, "expected 0.325, got {}", result);
+}
+
+#[test]
+fn apply_burst_downweight_floors_at_005() {
+    // 0.05 * 0.5 = 0.025 → max(0.025, 0.05) = 0.05
+    let r1 = burst::apply_burst_downweight(0.05);
+    assert!((r1 - 0.05).abs() < 1e-9, "floor at 0.05: got {}", r1);
+
+    // 0.01 * 0.5 = 0.005 → max(0.005, 0.05) = 0.05
+    let r2 = burst::apply_burst_downweight(0.01);
+    assert!((r2 - 0.05).abs() < 1e-9, "floor at 0.05: got {}", r2);
+
+    // 0.0 * 0.5 = 0 → max(0, 0.05) = 0.05
+    let r3 = burst::apply_burst_downweight(0.0);
+    assert!((r3 - 0.05).abs() < 1e-9, "floor at 0.05: got {}", r3);
+}
+
+#[test]
+fn apply_burst_downweight_mediahigh() {
+    let result = burst::apply_burst_downweight(0.95);
+    assert!((result - 0.475).abs() < 1e-9, "0.95 * 0.5 = 0.475, got {}", result);
+}
+
+#[test]
+fn apply_burst_downweight_medialow() {
+    let result = burst::apply_burst_downweight(0.20);
+    assert!((result - 0.10).abs() < 1e-9, "0.20 * 0.5 = 0.10, got {}", result);
 }

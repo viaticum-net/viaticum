@@ -386,6 +386,7 @@ impl DaemonHandle {
                     importance_multiplier: syncback_core::config::DEFAULT_IMPORTANCE_MULTIPLIER,
                     was_legacy_importance: false,
                     classification: None,
+                    bursts: None,
                 });
             }
         }
@@ -395,6 +396,7 @@ impl DaemonHandle {
         // Must run BEFORE live_configs is published to BackupCoordinator.
         for wc in &mut initial_watch_configs {
             wc.populate_classification();
+            wc.populate_bursts(); // Wave 7: detect time-clustered media bursts
         }
         // Emit legacy field deprecation warnings once per legacy watch entry.
         for wc in &initial_watch_configs {

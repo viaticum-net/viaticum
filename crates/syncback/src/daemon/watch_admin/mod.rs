@@ -396,9 +396,12 @@ impl WatchAdmin {
             importance_multiplier: req.importance,
             was_legacy_importance: false,
             classification: None,
+            bursts: None,
         };
         // Classify the folder synchronously (capped at CLASSIFY_SCAN_CAP paths, < 10ms typical).
         new_wc.populate_classification();
+        // Detect media bursts (walks all media files; may be slower for large folders).
+        new_wc.populate_bursts();
 
         // Step 4: save_watches atomically (write config first).
         {
@@ -464,6 +467,7 @@ impl WatchAdmin {
                             importance_multiplier: req.importance,
                             was_legacy_importance: false,
                             classification: wc.classification.clone(), // preserve existing classification
+                            bursts: wc.bursts.clone(), // preserve existing burst sets
                         }
                     } else {
                         wc.clone()

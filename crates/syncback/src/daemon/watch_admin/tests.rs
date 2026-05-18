@@ -109,6 +109,7 @@ fn list_watches_returns_configured_entries_with_correct_path_and_importance() {
         importance_multiplier: 0.7,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     }];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
 
@@ -226,6 +227,7 @@ async fn add_watch_fails_with_nested_when_path_is_child_of_existing_watch() {
         importance_multiplier: 0.5,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     let (admin, _rx) = make_watch_admin_with_config(config_path, vec![existing], db);
 
@@ -259,6 +261,7 @@ async fn add_watch_fails_with_nested_when_existing_watch_is_child_of_new_path() 
         importance_multiplier: 0.5,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     let (admin, _rx) = make_watch_admin_with_config(config_path, vec![existing], db);
 
@@ -291,6 +294,7 @@ async fn patch_watch_updates_importance_in_live_configs_and_toml() {
         importance_multiplier: 0.5,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     // Write initial config.
     save_watches(&config_path, &[existing.clone()]).unwrap();
@@ -353,6 +357,7 @@ async fn remove_watch_without_purge_removes_from_live_configs_and_toml() {
         importance_multiplier: 0.5,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     save_watches(&config_path, &[existing.clone()]).unwrap();
 
@@ -393,6 +398,7 @@ async fn remove_watch_without_purge_does_not_touch_file_records() {
         importance_multiplier: 0.5,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     save_watches(&config_path, &[existing.clone()]).unwrap();
 
@@ -431,6 +437,7 @@ async fn remove_watch_with_purge_marks_all_file_records_deleted() {
         importance_multiplier: 0.5,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     save_watches(&config_path, &[existing.clone()]).unwrap();
 
@@ -486,6 +493,7 @@ async fn remove_watch_with_purge_marks_all_devices_deleted_for_each_file() {
         importance_multiplier: 0.5,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     };
     save_watches(&config_path, &[existing.clone()]).unwrap();
 
@@ -543,6 +551,7 @@ fn compute_rollup_counts_backed_up_files_correctly() {
         importance_multiplier: 0.5,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     }];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
     admin.recompute_all_rollups().unwrap();
@@ -570,6 +579,7 @@ fn compute_rollup_counts_at_risk_when_any_placement_is_uncertain() {
         importance_multiplier: 0.5,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     }];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
     admin.recompute_all_rollups().unwrap();
@@ -600,6 +610,7 @@ fn compute_rollup_counts_lost_when_all_placements_are_lost() {
         importance_multiplier: 0.5,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     }];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
     admin.recompute_all_rollups().unwrap();
@@ -675,6 +686,7 @@ fn save_watches_preserves_existing_toml_sections_and_comments() {
         importance_multiplier: 0.5,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     }];
 
     save_watches(&config_path, &configs).unwrap();
@@ -711,6 +723,7 @@ fn save_watches_writes_importance_multiplier_key() {
         importance_multiplier: 0.8,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     }];
     save_watches(&config_path, &configs).unwrap();
 
@@ -755,6 +768,7 @@ async fn patch_watch_preserves_classification_when_changing_multiplier() {
         importance_multiplier: 0.5,
         was_legacy_importance: false,
         classification: Some(FolderClassification { is_media_folder: true, importance_multiplier: 1.0 }),
+        bursts: None,
     };
     save_watches(&config_path, std::slice::from_ref(&existing)).unwrap();
 
@@ -808,8 +822,8 @@ fn recompute_all_rollups_single_scan_populates_all_watches() {
     db.upsert_file(&make_file_record(2, &format!("{}/b.txt", dir2.path().display()), 10, 64, false)).unwrap();
 
     let configs = vec![
-        WatchConfig { path: dir1.path().to_string_lossy().into_owned(), importance_multiplier: 0.5, was_legacy_importance: false, classification: None },
-        WatchConfig { path: dir2.path().to_string_lossy().into_owned(), importance_multiplier: 0.5, was_legacy_importance: false, classification: None },
+        WatchConfig { path: dir1.path().to_string_lossy().into_owned(), importance_multiplier: 0.5, was_legacy_importance: false, classification: None, bursts: None },
+        WatchConfig { path: dir2.path().to_string_lossy().into_owned(), importance_multiplier: 0.5, was_legacy_importance: false, classification: None, bursts: None },
     ];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
     admin.recompute_all_rollups().unwrap();
@@ -839,6 +853,7 @@ fn get_watches_reads_cached_rollup_without_db_scan() {
         importance_multiplier: 0.5,
         was_legacy_importance: false,
         classification: None,
+        bursts: None,
     }];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
 
@@ -880,7 +895,7 @@ fn post_refresh_triggers_recompute_and_updates_computed_at() {
 
     db.upsert_file(&make_file_record(1, &format!("{}/a.txt", prefix), 10, 64, true)).unwrap();
 
-    let configs = vec![WatchConfig { path: prefix, importance_multiplier: 0.5, was_legacy_importance: false, classification: None }];
+    let configs = vec![WatchConfig { path: prefix, importance_multiplier: 0.5, was_legacy_importance: false, classification: None, bursts: None }];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
 
     // First recompute.
