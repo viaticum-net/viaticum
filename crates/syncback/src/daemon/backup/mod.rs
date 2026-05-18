@@ -713,15 +713,21 @@ impl BackupCoordinator {
                                 error = %e,
                                 "failed to update placement after SymbolAccept"
                             );
-                        } else if let Err(e) = self.db.refresh_peer_storage_bytes(&holder_id) {
+                        } else {
                             // Counter is best-effort; failure here is logged but does not
                             // roll back the placement transition. Without this refresh the
                             // owner-side bytes_peer_stores_for_us stays at 0 until the
                             // first PoS round triggers it (could be 6 min in demo, ~1h prod).
-                            tracing::error!(
-                                holder = %holder_id,
-                                err = %e,
-                                "failed to refresh storage balance after SymbolAccept"
+                            if let Err(e) = self.db.refresh_peer_storage_bytes(&holder_id) {
+                                tracing::error!(
+                                    holder = %holder_id,
+                                    err = %e,
+                                    "failed to refresh storage balance after SymbolAccept"
+                                );
+                            }
+                            crate::daemon::processor::recompute_and_persist_block_cached_fields(
+                                &self.db,
+                                &source_block_id,
                             );
                         }
                     }
@@ -1038,6 +1044,10 @@ impl BackupCoordinator {
                         symbols = symbol_count,
                         chunks = total_chunks,
                         "backup: symbols confirmed stored, placement Offered→Alive"
+                    );
+                    crate::daemon::processor::recompute_and_persist_block_cached_fields(
+                        &self.db,
+                        &result.source_block_id,
                     );
                 }
                 Ok(false) => tracing::debug!(

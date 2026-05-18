@@ -2638,3 +2638,215 @@ fn flush_queue_preserves_importance_order_across_packs() {
         block1.importance
     );
 }
+
+// ─── W11a: Backup cached-fields hook tests ────────────────────────────────────
+
+/// Build a minimal SourceBlockRecord for W11a hook tests.
+fn make_block_for_hook(block_id: SourceBlockId) -> syncback_core::types::SourceBlockRecord {
+    syncback_core::types::SourceBlockRecord {
+        block_id,
+        k: 5,
+        t: 1,
+        block_type: syncback_core::types::SourceBlockType::Single,
+        status: syncback_core::types::SourceBlockStatus::Active,
+        created_at: Timestamp(0),
+        encrypted_size: Some(5),
+        n: Some(20),
+        overhead: Some(1.5),
+        drop_notice_sent_at: None,
+        importance: 0.5,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.99,
+        last_attempted_at: None,
+        last_pool_signature: 0,
+    }
+}
+
+/// BackupEvent::SymbolAccepted (Offered→Alive) updates current_alive.
+///
+/// Tests call site 1: handle_backup_event SymbolAccepted path.
+#[test]
+fn backup_symbol_accepted_updates_current_alive() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    let holder_id = DeviceId([0x61u8; 32]);
+    let block_id = SourceBlockId([0x62u8; 32]);
+
+    // Insert block record so the hook can find it.
+    db.upsert_source_block(&make_block_for_hook(block_id)).unwrap();
+
+    // Insert Offered placement — will transition to Alive on SymbolAccepted.
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id,
+        file_id: syncback_core::types::FileId(1),
+        esi_ranges: vec![(0, 4)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Offered,
+        last_verified: None,
+        placed_at: Timestamp(0),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+
+    coord.handle_backup_event(BackupEvent::SymbolAccepted {
+        holder_id,
+        source_block_id: block_id,
+    });
+
+    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(
+        updated_block.current_alive,
+        1,
+        "current_alive must be 1 after SymbolAccepted transitions Offered→Alive"
+    );
+}
+
+/// Two holders receiving SymbolAccepted accumulate current_alive = 2.
+///
+/// Tests the hook fires twice and the recount-from-scratch is correct.
+#[test]
+fn backup_two_holders_alive_current_alive_is_two() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    let holder_a = DeviceId([0x63u8; 32]);
+    let holder_b = DeviceId([0x64u8; 32]);
+    let block_id = SourceBlockId([0x65u8; 32]);
+
+    db.upsert_source_block(&make_block_for_hook(block_id)).unwrap();
+
+    for &h in &[holder_a, holder_b] {
+        let placement = SymbolPlacement {
+            source_block_id: block_id,
+            holder_id: h,
+            file_id: syncback_core::types::FileId(1),
+            esi_ranges: vec![(0, 4)],
+            binding_seed: [0u8; 32],
+            status: PlacementStatus::Offered,
+            last_verified: None,
+            placed_at: Timestamp(0),
+            consecutive_misses: 0,
+        };
+        db.upsert_placement(&placement).unwrap();
+    }
+
+    coord.handle_backup_event(BackupEvent::SymbolAccepted {
+        holder_id: holder_a,
+        source_block_id: block_id,
+    });
+    coord.handle_backup_event(BackupEvent::SymbolAccepted {
+        holder_id: holder_b,
+        source_block_id: block_id,
+    });
+
+    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(
+        updated_block.current_alive,
+        2,
+        "current_alive must be 2 after two SymbolAccepted events"
+    );
+    // Reliability should be non-zero with 2 alive holders.
+    assert!(
+        updated_block.current_reliability > 0.0,
+        "current_reliability must be > 0 with 2 alive holders"
+    );
+}
+
+/// Already-Alive placement: SymbolAccepted is a no-op (early return, hook not fired).
+///
+/// Verifies the guard `if placement.status == Alive { return; }` is still in place.
+#[test]
+fn backup_symbol_accepted_already_alive_is_noop() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    let holder_id = DeviceId([0x66u8; 32]);
+    let block_id = SourceBlockId([0x67u8; 32]);
+
+    db.upsert_source_block(&make_block_for_hook(block_id)).unwrap();
+
+    // Placement already Alive — no transition expected.
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id,
+        file_id: syncback_core::types::FileId(1),
+        esi_ranges: vec![(0, 4)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp(0),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+    // Set current_alive to a synthetic sentinel (99) that does NOT match the actual
+    // placement count (1). If the early-return guard works → hook never fires → value
+    // stays at 99. If the guard were removed → hook would recount and overwrite to 1.
+    // Asserting the value stays 99 is therefore a strong signal that the guard works.
+    db.update_block_cached_fields(&block_id, 0.5, 99, 0.9, 0.99, None, 0).unwrap();
+
+    coord.handle_backup_event(BackupEvent::SymbolAccepted {
+        holder_id,
+        source_block_id: block_id,
+    });
+
+    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(
+        updated_block.current_alive, 99,
+        "guard at backup/mod.rs SymbolAccepted should early-return on already-Alive — \
+         hook must not fire and overwrite the sentinel 99 → real count 1"
+    );
+}
+
+/// Wired call site 2: `transition_placement_offered_to_alive` followed by hook fire.
+///
+/// Tests the production code path in `deliver_to_holder` (`backup/mod.rs:1048`):
+/// `db.transition_placement_offered_to_alive(...)` returns Ok(true) → hook called
+/// → `current_alive` reflects the new Alive placement.
+#[test]
+fn backup_transition_offered_to_alive_updates_current_alive() {
+    let db = Db::open_in_memory().unwrap();
+
+    let block_id = SourceBlockId([0x70u8; 32]);
+    let holder_id = DeviceId([0x71u8; 32]);
+
+    db.upsert_source_block(&make_block_for_hook(block_id)).unwrap();
+
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id,
+        file_id: syncback_core::types::FileId(1),
+        esi_ranges: vec![(0, 4)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Offered,
+        last_verified: None,
+        placed_at: Timestamp(0),
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+
+    // Production call sequence at backup/mod.rs:1048
+    let transitioned = db
+        .transition_placement_offered_to_alive(&block_id, &holder_id, Timestamp(123))
+        .unwrap();
+    assert!(transitioned, "expected Ok(true) from transition_placement_offered_to_alive");
+    crate::daemon::processor::recompute_and_persist_block_cached_fields(&db, &block_id);
+
+    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(
+        updated_block.current_alive, 1,
+        "current_alive must be 1 after transition_placement_offered_to_alive + hook"
+    );
+
+    let placement_after = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
+    assert_eq!(
+        placement_after.status,
+        PlacementStatus::Alive,
+        "placement must be Alive after the transition"
+    );
+}

@@ -975,6 +975,13 @@ impl RepairAgent {
         updated.consecutive_misses = 0;
         self.db.upsert_placement(&updated)?;
 
+        // Recompute cached fields after successful upsert (best-effort).
+        // Placed after upsert so the idempotent early-return above does not fire the hook.
+        crate::daemon::processor::recompute_and_persist_block_cached_fields(
+            &self.db,
+            block_id,
+        );
+
         tracing::info!(
             block_id = %block_id,
             holder_id = %holder_id,

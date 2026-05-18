@@ -4272,3 +4272,482 @@ async fn handle_pos_hash_nack_unknown_challenge_id_silently_dropped() {
         "repair_rx must be empty for unknown challenge_id"
     );
 }
+
+// ─── W11a: recompute_and_persist_block_cached_fields unit tests ───────────────
+
+/// Helper to create a minimal SourceBlockRecord for cached-fields tests.
+fn make_source_block_for_hook(
+    block_id: SourceBlockId,
+    importance: f64,
+    last_attempted_at: Option<Timestamp>,
+    last_pool_signature: u64,
+) -> SourceBlockRecord {
+    SourceBlockRecord {
+        block_id,
+        k: 5,
+        t: 1,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(0),
+        encrypted_size: Some(5),
+        n: Some(20),
+        overhead: Some(1.5),
+        drop_notice_sent_at: None,
+        importance,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.99,
+        last_attempted_at,
+        last_pool_signature,
+    }
+}
+
+/// Helper to create an Alive or Uncertain placement.
+fn make_hook_placement(
+    block_id: SourceBlockId,
+    holder_id: DeviceId,
+    status: PlacementStatus,
+) -> SymbolPlacement {
+    SymbolPlacement {
+        source_block_id: block_id,
+        holder_id,
+        file_id: FileId(1),
+        esi_ranges: vec![(0, 4)],
+        binding_seed: [0u8; 32],
+        status,
+        last_verified: None,
+        placed_at: Timestamp(0),
+        consecutive_misses: 0,
+    }
+}
+
+/// Helper to create a PeerRecord for hook tests.
+fn make_hook_peer(device_id: DeviceId, trust_p: f64) -> syncback_core::types::PeerRecord {
+    let now = Timestamp(0);
+    syncback_core::types::PeerRecord {
+        device_id,
+        master_identity: IdentityPub(device_id.0),
+        trust_p,
+        trust_i: 0.0,
+        trust_s: 0.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: now,
+        last_seen: now,
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+    }
+}
+
+#[test]
+fn recompute_and_persist_when_two_alive_one_uncertain_counts_three() {
+    let db = Db::open_in_memory().unwrap();
+    let block_id = make_block_id(0xC1);
+    let holder_a = make_device_id(0xA1);
+    let holder_b = make_device_id(0xA2);
+    let holder_c = make_device_id(0xA3);
+
+    let block = make_source_block_for_hook(block_id, 0.5, None, 0);
+    db.upsert_source_block(&block).unwrap();
+
+    // Two Alive + one Uncertain = 3 expected current_alive.
+    db.upsert_placement(&make_hook_placement(block_id, holder_a, PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_hook_placement(block_id, holder_b, PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_hook_placement(block_id, holder_c, PlacementStatus::Uncertain)).unwrap();
+
+    // Insert peers for survival prob calculation.
+    db.upsert_peer(&make_hook_peer(holder_a, 0.8)).unwrap();
+    db.upsert_peer(&make_hook_peer(holder_b, 0.8)).unwrap();
+    db.upsert_peer(&make_hook_peer(holder_c, 0.6)).unwrap();
+
+    super::recompute_and_persist_block_cached_fields(&db, &block_id);
+
+    let updated = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(updated.current_alive, 3, "current_alive must be 3 (2 Alive + 1 Uncertain)");
+    assert!(updated.current_reliability > 0.0, "current_reliability must be > 0 with 3 holders");
+}
+
+#[test]
+fn recompute_and_persist_when_all_lost_sets_current_alive_zero_and_reliability_zero() {
+    let db = Db::open_in_memory().unwrap();
+    let block_id = make_block_id(0xC2);
+    let holder_a = make_device_id(0xB1);
+    let holder_b = make_device_id(0xB2);
+    let holder_c = make_device_id(0xB3);
+
+    let block = make_source_block_for_hook(block_id, 0.5, None, 0);
+    db.upsert_source_block(&block).unwrap();
+
+    db.upsert_placement(&make_hook_placement(block_id, holder_a, PlacementStatus::Lost)).unwrap();
+    db.upsert_placement(&make_hook_placement(block_id, holder_b, PlacementStatus::Lost)).unwrap();
+    db.upsert_placement(&make_hook_placement(block_id, holder_c, PlacementStatus::Lost)).unwrap();
+
+    super::recompute_and_persist_block_cached_fields(&db, &block_id);
+
+    let updated = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(updated.current_alive, 0, "current_alive must be 0 when all placements are Lost");
+    assert_eq!(updated.current_reliability, 0.0, "current_reliability must be 0.0 with no alive holders");
+}
+
+#[test]
+fn recompute_and_persist_for_unknown_block_logs_warn_and_does_not_panic() {
+    let db = Db::open_in_memory().unwrap();
+    let unknown_block_id = make_block_id(0xDE);
+
+    // No panic. DB should not have any source block written.
+    super::recompute_and_persist_block_cached_fields(&db, &unknown_block_id);
+
+    let result = db.get_source_block(&unknown_block_id).unwrap();
+    assert!(result.is_none(), "no block must be created for unknown block_id");
+}
+
+#[test]
+fn recompute_and_persist_preserves_last_attempted_at_and_pool_signature() {
+    let db = Db::open_in_memory().unwrap();
+    let block_id = make_block_id(0xC3);
+    let holder_a = make_device_id(0xC1);
+
+    let sentinel_time = Timestamp(1_700_000_042);
+    let sentinel_sig = 0xDEADBEEF_12345678u64;
+    let block = make_source_block_for_hook(block_id, 0.5, Some(sentinel_time), sentinel_sig);
+    db.upsert_source_block(&block).unwrap();
+
+    db.upsert_placement(&make_hook_placement(block_id, holder_a, PlacementStatus::Alive)).unwrap();
+    db.upsert_peer(&make_hook_peer(holder_a, 0.8)).unwrap();
+
+    super::recompute_and_persist_block_cached_fields(&db, &block_id);
+
+    let updated = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(
+        updated.last_attempted_at,
+        Some(sentinel_time),
+        "last_attempted_at must be preserved unchanged"
+    );
+    assert_eq!(
+        updated.last_pool_signature,
+        sentinel_sig,
+        "last_pool_signature must be preserved unchanged"
+    );
+}
+
+#[test]
+fn recompute_and_persist_is_idempotent_on_double_call() {
+    let db = Db::open_in_memory().unwrap();
+    let block_id = make_block_id(0xC4);
+    let holder_a = make_device_id(0xD1);
+    let holder_b = make_device_id(0xD2);
+
+    let block = make_source_block_for_hook(block_id, 0.5, None, 0);
+    db.upsert_source_block(&block).unwrap();
+
+    db.upsert_placement(&make_hook_placement(block_id, holder_a, PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_hook_placement(block_id, holder_b, PlacementStatus::Alive)).unwrap();
+    db.upsert_peer(&make_hook_peer(holder_a, 0.8)).unwrap();
+    db.upsert_peer(&make_hook_peer(holder_b, 0.8)).unwrap();
+
+    // Call twice — must not panic and must produce same result.
+    super::recompute_and_persist_block_cached_fields(&db, &block_id);
+    super::recompute_and_persist_block_cached_fields(&db, &block_id);
+
+    let updated = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(updated.current_alive, 2, "current_alive must be 2 after idempotent double call");
+}
+
+// ─── W11a: PoS outcome tests (apply_and_persist_pos_outcome) ─────────────────
+
+#[tokio::test]
+async fn pos_pass_on_uncertain_placement_keeps_current_alive_and_updates_status() {
+    // Alive→Alive (Pass on Alive): old_status == new_status → hook NOT called.
+    // Uncertain→Alive (Pass on Uncertain): old_status != new_status → hook IS called.
+    // Count stays the same (Uncertain counted before + after) but status becomes Alive.
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+
+    let holder_id = make_device_id(0xE1);
+    let block_id = make_block_id(0xE2);
+
+    let block = make_source_block_for_hook(block_id, 0.5, None, 0);
+    db.upsert_source_block(&block).unwrap();
+    db.upsert_peer(&make_hook_peer(holder_id, 0.8)).unwrap();
+
+    // Set initial current_alive to 1 (Uncertain counts).
+    db.update_block_cached_fields(&block_id, 0.5, 1, 0.5, 0.99, None, 0).unwrap();
+
+    // Uncertain placement — Pass will transition to Alive.
+    let mut placement = make_hook_placement(block_id, holder_id, PlacementStatus::Uncertain);
+    placement.consecutive_misses = 1;
+    db.upsert_placement(&placement).unwrap();
+
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor(db.clone(), &holdings_dir).await;
+    processor
+        .apply_and_persist_pos_outcome(block_id, holder_id, &syncback_core::pos::VerifyOutcome::Pass)
+        .await
+        .unwrap();
+
+    let updated_placement = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
+    assert_eq!(updated_placement.status, PlacementStatus::Alive, "placement must become Alive after Pass");
+
+    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
+    // Uncertain→Alive: hook fires, still counts as 1.
+    assert_eq!(updated_block.current_alive, 1, "current_alive must remain 1 (Uncertain→Alive)");
+}
+
+#[tokio::test]
+async fn pos_fail_on_alive_placement_decrements_current_alive() {
+    use std::collections::HashMap;
+    use crate::daemon::scheduler::PendingChallenges;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+
+    let holder_a = make_device_id(0xF1);
+    let holder_b = make_device_id(0xF2);
+    let block_id = make_block_id(0xF3);
+
+    let block = make_source_block_for_hook(block_id, 0.5, None, 0);
+    db.upsert_source_block(&block).unwrap();
+    db.upsert_peer(&make_hook_peer(holder_a, 0.8)).unwrap();
+    db.upsert_peer(&make_hook_peer(holder_b, 0.8)).unwrap();
+
+    db.upsert_placement(&make_hook_placement(block_id, holder_a, PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_hook_placement(block_id, holder_b, PlacementStatus::Alive)).unwrap();
+
+    // Set initial cached fields reflecting 2 alive.
+    db.update_block_cached_fields(&block_id, 0.5, 2, 0.9, 0.99, None, 0).unwrap();
+
+    // Need pending challenge for block_id/holder_a so apply_and_persist_pos_outcome
+    // can find the placement. Direct call doesn't need pending — just call directly.
+    let pending: PendingChallenges =
+        std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
+
+    let pre_reliability = db.get_source_block(&block_id).unwrap().unwrap().current_reliability;
+
+    // Fail holder_a → placement becomes Lost.
+    processor
+        .apply_and_persist_pos_outcome(block_id, holder_a, &syncback_core::pos::VerifyOutcome::Fail { esi: 0 })
+        .await
+        .unwrap();
+
+    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(updated_block.current_alive, 1, "current_alive must be 1 after one Fail");
+
+    let placement_a = db.get_placement(&block_id, &holder_a).unwrap().unwrap();
+    assert_eq!(placement_a.status, PlacementStatus::Lost, "holder_a placement must be Lost");
+
+    assert!(
+        updated_block.current_reliability < pre_reliability,
+        "reliability must decrease after a Fail (pre={pre_reliability}, post={post})",
+        post = updated_block.current_reliability,
+    );
+}
+
+// ─── W11a: PoS Nack test (handle_pos_hash_nack) ──────────────────────────────
+
+#[tokio::test]
+async fn pos_nack_decrements_current_alive_and_updates_reliability() {
+    use std::collections::HashMap;
+    use syncback_core::messages::build_pos_hash_nack;
+    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+
+    let holder_master_key = syncback_core::cluster::derive_master_key(&[0x30u8; 64])
+        .expect("holder master key");
+    let holder_master = syncback_core::cluster::master_identity(&holder_master_key);
+    let holder_device = make_device_id(0x88);
+    let block_id = make_block_id(0x89);
+
+    // Three alive holders: holder_device, extra_a, extra_b.
+    let extra_a = make_device_id(0x8A);
+    let extra_b = make_device_id(0x8B);
+
+    let block = make_source_block_for_hook(block_id, 0.5, None, 0);
+    db.upsert_source_block(&block).unwrap();
+    db.upsert_peer(&make_hook_peer(holder_device, 0.8)).unwrap();
+    db.upsert_peer(&make_hook_peer(extra_a, 0.8)).unwrap();
+    db.upsert_peer(&make_hook_peer(extra_b, 0.8)).unwrap();
+
+    db.upsert_placement(&make_hook_placement(block_id, holder_device, PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_hook_placement(block_id, extra_a, PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_hook_placement(block_id, extra_b, PlacementStatus::Alive)).unwrap();
+
+    // Set current_alive = 3.
+    db.update_block_cached_fields(&block_id, 0.5, 3, 0.9, 0.99, None, 0).unwrap();
+
+    // Register master→device so the processor can verify the nack signature.
+    db.set_master_for_device(&holder_device, &holder_master).unwrap();
+
+    let challenge_id = [0x77u8; 16];
+    let pending_map: HashMap<_, _> = [(
+        (block_id, holder_device),
+        PendingHashChallenge {
+            source_block_id: block_id,
+            holder_id: holder_device,
+            esi_ranges: vec![(0, 4)],
+            expected_chain_hash: [0u8; 32],
+            issued_at: Timestamp::now(),
+            challenge_id,
+        },
+    )]
+    .into_iter()
+    .collect();
+    let pending: PendingChallenges =
+        std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
+
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
+
+    // Build valid nack signed by holder's master key.
+    let nack = build_pos_hash_nack(
+        challenge_id,
+        block_id,
+        0,
+        Timestamp::now(),
+        Some(holder_device),
+        &holder_master_key,
+    );
+
+    processor.handle_pos_hash_nack(holder_device, nack).await.unwrap();
+
+    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(updated_block.current_alive, 2, "current_alive must be 2 after Nack");
+
+    let placement = db.get_placement(&block_id, &holder_device).unwrap().unwrap();
+    assert_eq!(placement.status, PlacementStatus::Lost, "placement must be Lost after Nack");
+}
+
+// ─── W11a: rapid transitions keep current_alive coherent ─────────────────────
+
+#[tokio::test]
+async fn rapid_alive_to_lost_transitions_keep_current_alive_coherent() {
+    use std::collections::HashMap;
+    use crate::daemon::scheduler::PendingChallenges;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+
+    let holders: Vec<DeviceId> = (0..5).map(|i| make_device_id(0x10 + i)).collect();
+    let block_id = make_block_id(0x20);
+
+    let block = make_source_block_for_hook(block_id, 0.5, None, 0);
+    db.upsert_source_block(&block).unwrap();
+
+    for &h in &holders {
+        db.upsert_peer(&make_hook_peer(h, 0.8)).unwrap();
+        db.upsert_placement(&make_hook_placement(block_id, h, PlacementStatus::Alive)).unwrap();
+    }
+    db.update_block_cached_fields(&block_id, 0.5, 5, 0.9999, 0.99, None, 0).unwrap();
+
+    let pending: PendingChallenges =
+        std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
+
+    // Transition A → Lost.
+    processor
+        .apply_and_persist_pos_outcome(block_id, holders[0], &syncback_core::pos::VerifyOutcome::Fail { esi: 0 })
+        .await.unwrap();
+    let b = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(b.current_alive, 4, "after 1st Fail: current_alive must be 4");
+    let r4 = b.current_reliability;
+
+    // Transition B → Lost.
+    processor
+        .apply_and_persist_pos_outcome(block_id, holders[1], &syncback_core::pos::VerifyOutcome::Fail { esi: 0 })
+        .await.unwrap();
+    let b = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(b.current_alive, 3, "after 2nd Fail: current_alive must be 3");
+    let r3 = b.current_reliability;
+
+    // Transition C → Lost.
+    processor
+        .apply_and_persist_pos_outcome(block_id, holders[2], &syncback_core::pos::VerifyOutcome::Fail { esi: 0 })
+        .await.unwrap();
+    let b = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(b.current_alive, 2, "after 3rd Fail: current_alive must be 2");
+    let r2 = b.current_reliability;
+
+    // Reliability decreases monotonically.
+    assert!(r4 >= r3, "reliability must not increase after Fail");
+    assert!(r3 >= r2, "reliability must not increase after Fail");
+}
+
+// ─── W11a: next_work_item integration — block eligible after PoS Fail ─────────
+
+#[tokio::test]
+async fn block_becomes_eligible_in_next_work_item_after_pos_fail() {
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use crate::daemon::scheduler::PendingChallenges;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+
+    // k=1 so reliability with 1 holder is very high, with 0 holders = 0.0.
+    let block_id = make_block_id(0x42);
+    let holder_a = make_device_id(0x43);
+    let holder_b = make_device_id(0x44);
+
+    // Use a block where target_reliability is 0.9.
+    let block = SourceBlockRecord {
+        block_id,
+        k: 1,
+        t: 1,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(0),
+        encrypted_size: Some(1),
+        n: Some(4),
+        overhead: Some(1.5),
+        drop_notice_sent_at: None,
+        importance: 0.5,
+        current_alive: 2,
+        current_reliability: 0.9999,
+        target_reliability: 0.9,
+        last_attempted_at: None,
+        last_pool_signature: 0,
+    };
+    db.upsert_source_block(&block).unwrap();
+    db.upsert_peer(&make_hook_peer(holder_a, 0.8)).unwrap();
+    db.upsert_peer(&make_hook_peer(holder_b, 0.8)).unwrap();
+    db.upsert_placement(&make_hook_placement(block_id, holder_a, PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_hook_placement(block_id, holder_b, PlacementStatus::Alive)).unwrap();
+
+    // Initially above target — next_work_item returns None.
+    let work_before = db.next_work_item(1.5, Duration::from_secs(0), Timestamp::now(), 0).unwrap();
+    assert!(work_before.is_none(), "block should not need work when reliability >= target");
+
+    let pending: PendingChallenges =
+        std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let (processor, _repair_rx, _relay_rx) =
+        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
+
+    // Fail both holders → current_alive = 0 → reliability drops to 0.0.
+    processor
+        .apply_and_persist_pos_outcome(block_id, holder_a, &syncback_core::pos::VerifyOutcome::Fail { esi: 0 })
+        .await.unwrap();
+    processor
+        .apply_and_persist_pos_outcome(block_id, holder_b, &syncback_core::pos::VerifyOutcome::Fail { esi: 0 })
+        .await.unwrap();
+
+    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
+    assert_eq!(updated_block.current_alive, 0, "current_alive must be 0 after both Fails");
+    assert!(
+        updated_block.current_reliability < updated_block.target_reliability,
+        "reliability must be below target after both Fails"
+    );
+
+    // Now next_work_item must return this block.
+    let work_after = db.next_work_item(1.5, Duration::from_secs(0), Timestamp::now(), 0).unwrap();
+    assert!(
+        work_after.is_some(),
+        "block must be eligible for work after reliability dropped below target"
+    );
+    let work_block = work_after.unwrap();
+    assert_eq!(work_block.block_id, block_id, "next_work_item must return the degraded block");
+}

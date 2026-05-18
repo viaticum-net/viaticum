@@ -218,6 +218,10 @@ impl Processor {
         // 5. Mark placement Lost.
         super::mark_placement_lost(&self.db, &block_id, &expected_holder_device)?;
 
+        // 5a. Recompute cached fields (best-effort, unconditional — mark_placement_lost
+        //     is idempotent and the hook recount is idempotent if already Lost).
+        super::recompute_and_persist_block_cached_fields(&self.db, &block_id);
+
         // 6. Refresh trust_s.
         if let Err(e) = self.db.refresh_peer_storage_bytes(&expected_holder_device) {
             error!(
@@ -254,6 +258,7 @@ impl Processor {
             None => return Ok(()),
         };
 
+        let old_status = placement.status;
         let transition = apply_pos_outcome(&placement, outcome);
         let mut updated = placement;
         updated.status = transition.new_status;
@@ -262,6 +267,12 @@ impl Processor {
             updated.last_verified = Some(Timestamp::now());
         }
         self.db.upsert_placement(&updated)?;
+
+        // Update cached fields only when placement status actually changed (avoids
+        // noise on Pass-on-Alive cycle where current_alive stays the same).
+        if updated.status != old_status {
+            super::recompute_and_persist_block_cached_fields(&self.db, &block_id);
+        }
 
         // Refresh trust_s: placement status changed, so bytes_peer_stores_for_us may differ.
         if let Err(e) = self.db.refresh_peer_storage_bytes(&holder_id) {

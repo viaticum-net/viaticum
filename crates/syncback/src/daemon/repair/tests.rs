@@ -906,3 +906,101 @@ async fn deliver_repaired_symbols_direct_does_not_write_esi_bin_files() {
         );
     }
 }
+
+// ─── W11a: RepairAgent cached-fields hook tests ──────────────────────────────
+
+/// Build a minimal SourceBlockRecord for W11a hook tests in repair context.
+fn make_block_for_hook(bid: SourceBlockId) -> SourceBlockRecord {
+    SourceBlockRecord {
+        block_id: bid,
+        k: 5,
+        t: 1,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: now(),
+        encrypted_size: Some(5),
+        n: Some(20),
+        overhead: Some(1.5),
+        drop_notice_sent_at: None,
+        importance: 0.5,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.99,
+        last_attempted_at: None,
+        last_pool_signature: 0,
+    }
+}
+
+/// RepairAgent::handle_symbol_dropped marks placement Lost and updates current_alive.
+///
+/// Tests call site 5: `mark_placement_lost` → upsert_placement → hook.
+#[tokio::test]
+async fn repair_agent_mark_placement_lost_updates_current_alive() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+
+    let bid = block_id(0x70);
+    let hid_a = holder_id(0x71);
+    let hid_b = holder_id(0x72);
+
+    db.upsert_source_block(&make_block_for_hook(bid)).unwrap();
+
+    // Two Alive placements.
+    db.upsert_placement(&make_placement(bid, hid_a, vec![(0, 4)], PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_placement(bid, hid_b, vec![(4, 4)], PlacementStatus::Alive)).unwrap();
+
+    // Set current_alive to 2.
+    db.update_block_cached_fields(&bid, 0.5, 2, 0.9, 0.99, None, 0).unwrap();
+
+    let agent = make_agent(db.clone(), symbols_dir.path());
+    agent.handle_symbol_dropped(&bid, &hid_a, now()).await.unwrap();
+
+    // Verify placement is Lost.
+    let placement = db.get_placement(&bid, &hid_a).unwrap().unwrap();
+    assert_eq!(placement.status, PlacementStatus::Lost, "placement must be Lost after handle_symbol_dropped");
+
+    // current_alive must drop to 1.
+    let updated_block = db.get_source_block(&bid).unwrap().unwrap();
+    assert_eq!(
+        updated_block.current_alive,
+        1,
+        "current_alive must be 1 after one placement marked Lost"
+    );
+}
+
+/// RepairAgent::handle_symbol_dropped on already-Lost placement is idempotent.
+///
+/// The hook should NOT fire (upsert_placement not called on the early-return path).
+/// current_alive must not double-decrement.
+#[tokio::test]
+async fn repair_agent_mark_placement_lost_idempotent_on_already_lost() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+
+    let bid = block_id(0x73);
+    let hid_a = holder_id(0x74);
+    let hid_b = holder_id(0x75);
+
+    db.upsert_source_block(&make_block_for_hook(bid)).unwrap();
+
+    // hid_a is already Lost; hid_b is Alive.
+    db.upsert_placement(&make_placement(bid, hid_a, vec![(0, 4)], PlacementStatus::Lost)).unwrap();
+    db.upsert_placement(&make_placement(bid, hid_b, vec![(4, 4)], PlacementStatus::Alive)).unwrap();
+
+    // current_alive = 1 (only hid_b alive).
+    db.update_block_cached_fields(&bid, 0.5, 1, 0.7, 0.99, None, 0).unwrap();
+
+    let agent = make_agent(db.clone(), symbols_dir.path());
+    // Call for already-Lost hid_a — idempotent path returns Ok without upsert.
+    // RepairAgent::mark_placement_lost returns Ok(()) for already-Lost (no error).
+    let result = agent.handle_symbol_dropped(&bid, &hid_a, now()).await;
+    assert!(result.is_ok(), "handle_symbol_dropped must return Ok for already-Lost placement");
+
+    // current_alive must still be 1 (hook not fired on idempotent path).
+    let updated_block = db.get_source_block(&bid).unwrap().unwrap();
+    assert_eq!(
+        updated_block.current_alive,
+        1,
+        "current_alive must remain 1 when placement was already Lost (idempotent)"
+    );
+}

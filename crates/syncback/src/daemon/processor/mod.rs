@@ -762,6 +762,121 @@ pub(crate) fn mark_placement_lost(
     Ok(true)
 }
 
+/// Recompute `current_alive` and `current_reliability` for a block from DB state,
+/// then persist via `update_block_cached_fields`.
+///
+/// Call this immediately after any placement-status transition that changes whether
+/// a placement counts as Alive/Uncertain. The function reads all placements for the
+/// block, counts Alive+Uncertain, assembles per-holder survival probabilities via
+/// `commitment_to_survival_prob(peer.trust_p)`, calls `block_reliability`, and
+/// writes back. Errors are logged and silently swallowed — the primary placement
+/// transition already succeeded before this is called.
+///
+/// `last_attempted_at` and `last_pool_signature` are preserved from the existing
+/// block record (not modified by this function).
+pub(crate) fn recompute_and_persist_block_cached_fields(db: &Db, block_id: &SourceBlockId) {
+    // 1. Load block record.
+    let block = match db.get_source_block(block_id) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            warn!(
+                block_id = %block_id,
+                "placement hook: source block not found, skipping cached-fields update"
+            );
+            return;
+        }
+        Err(e) => {
+            error!(
+                block_id = %block_id,
+                err = %e,
+                "placement hook: get_source_block failed"
+            );
+            return;
+        }
+    };
+
+    // 2. List all placements for block; count Alive+Uncertain.
+    let placements = match db.list_placements_for_block(block_id) {
+        Ok(p) => p,
+        Err(e) => {
+            error!(
+                block_id = %block_id,
+                err = %e,
+                "placement hook: list_placements_for_block failed"
+            );
+            return;
+        }
+    };
+
+    let new_current_alive: u32 = placements
+        .iter()
+        .filter(|p| {
+            p.status == PlacementStatus::Alive || p.status == PlacementStatus::Uncertain
+        })
+        .count() as u32;
+
+    // 3. Assemble HolderReliabilityInput for each Alive/Uncertain placement.
+    let k_eff = block.erasure_params().k_eff;
+    let holder_inputs: Vec<syncback_core::reliability::HolderReliabilityInput> = placements
+        .iter()
+        .filter(|p| {
+            p.status == PlacementStatus::Alive || p.status == PlacementStatus::Uncertain
+        })
+        .map(|p| {
+            let survival_prob = db
+                .get_peer(&p.holder_id)
+                .ok()
+                .flatten()
+                .map(|peer| {
+                    syncback_core::reliability::commitment_to_survival_prob(
+                        syncback_core::commitment::CommitmentScore::new(peer.trust_p),
+                    )
+                })
+                .unwrap_or(0.5); // neutral prior for unknown peers
+            syncback_core::reliability::HolderReliabilityInput {
+                holder_id: p.holder_id,
+                alive_symbols: p.symbol_count(),
+                survival_prob,
+            }
+        })
+        .collect();
+
+    // 4. Compute new_reliability.
+    let reliability_input = syncback_core::reliability::BlockReliabilityInput {
+        block_id: *block_id,
+        k_eff,
+        holders: holder_inputs,
+    };
+    let new_reliability = match syncback_core::reliability::block_reliability(&reliability_input) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                block_id = %block_id,
+                err = %e,
+                "placement hook: block_reliability failed, using 0.0"
+            );
+            0.0
+        }
+    };
+
+    // 5. Persist. Preserve last_attempted_at and last_pool_signature.
+    if let Err(e) = db.update_block_cached_fields(
+        block_id,
+        block.importance,
+        new_current_alive,
+        new_reliability,
+        block.target_reliability,
+        block.last_attempted_at,
+        block.last_pool_signature,
+    ) {
+        error!(
+            block_id = %block_id,
+            err = %e,
+            "placement hook: update_block_cached_fields failed"
+        );
+    }
+}
+
 /// Record PoS outcome in the weekly stats table (best-effort, logs on error).
 pub(crate) fn record_pos_weekly(db: &Db, device: DeviceId, outcome: syncback_core::trust::PosOutcome) {
     use syncback_core::db::WeeklyPosEntry;

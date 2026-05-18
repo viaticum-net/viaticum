@@ -624,6 +624,12 @@ impl Scheduler {
                 continue;
             }
 
+            // Recompute cached fields after successful placement update (best-effort).
+            crate::daemon::processor::recompute_and_persist_block_cached_fields(
+                &self.db,
+                &block_id,
+            );
+
             // Record timeout as a challenged-but-not-passed event for trust.
             let week = crate::daemon::processor::current_week_number_scaled(scale);
             let pos_outcome = outcome_from_verify(&VerifyOutcome::Timeout, week);
