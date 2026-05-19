@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
 ciborium = "0.2"
-toml = "0.8"
+toml = "1"
 
 # Crypto
 blake3 = "1"
@@ -45,7 +45,7 @@ raptorq = "2"
 zstd = "0.13"
 
 # Database
-redb = "2"
+redb = "4"
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -98,7 +98,7 @@ ignore = "0.4"
 libc = "0.2"
 
 # HTTP client (metrics push)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "json"] }
 
 # HTTP server (web API)
 axum = "0.8"

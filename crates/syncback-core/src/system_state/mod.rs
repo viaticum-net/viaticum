@@ -11,7 +11,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 use chacha20poly1305::aead::{AeadInPlace, NewAead};
 use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
-use redb::{ReadableTable, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use sha2::Sha256;
 use std::io::Cursor;
 
