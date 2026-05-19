@@ -599,6 +599,21 @@ impl Processor {
             "pos_hash_challenge" => {
                 match from_cbor::<PosHashChallengeMsg>(&msg.payload) {
                     Ok(challenge) => {
+                        // In cluster mode (shared mnemonic), relay broadcasts reach
+                        // every cluster device because they all share `master_pub`.
+                        // Only the targeted device should respond; otherwise non-holder
+                        // cluster members would emit valid-signed Nacks that the owner
+                        // would mis-attribute to the real holder.
+                        if let Some(target) = challenge.device_id {
+                            if target != self.swarm.device_id {
+                                debug!(
+                                    target = %target,
+                                    own = %self.swarm.device_id,
+                                    "processor: PoS challenge not addressed to us, ignoring"
+                                );
+                                return;
+                            }
+                        }
                         match self.handle_pos_hash_challenge_inner(msg.from, challenge).await {
                             Ok(reply) => {
                                 // Send response back via board (directed to challenger).

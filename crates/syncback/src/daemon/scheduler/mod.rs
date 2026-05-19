@@ -861,6 +861,15 @@ impl Scheduler {
             updated.status = PlacementStatus::Lost;
             self.db.upsert_placement(&updated)?;
 
+            // W11a hook: every placement-status transition must recompute the
+            // block's current_alive/current_reliability cached fields so the
+            // worker sees the block as needing work without waiting for the
+            // hourly reliability_scan. (Cross-wave review B2 fix.)
+            crate::daemon::processor::recompute_and_persist_block_cached_fields(
+                &self.db,
+                &p.source_block_id,
+            );
+
             info!(
                 block_id = %p.source_block_id,
                 holder = %p.holder_id,

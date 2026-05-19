@@ -124,9 +124,10 @@ impl WorkPipeline {
 
     /// Main worker loop. Runs until `WorkEvent::Shutdown` or `event_rx` is closed.
     pub async fn run(mut self) -> anyhow::Result<()> {
-        let tick_secs = (self.config.tick_interval.as_secs()
-            / self.config.time_scale.max(1))
-        .max(1);
+        // tick_interval is already pre-scaled by handle/mod.rs (it divides 60s by
+        // time_scale before passing). Don't divide again — that was the W11b
+        // shipping bug: cooldown→0 at extreme time_scale, worker spun unbounded.
+        let tick_secs = self.config.tick_interval.as_secs().max(1);
         let mut tick =
             tokio::time::interval(tokio::time::Duration::from_secs(tick_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -178,8 +179,8 @@ impl WorkPipeline {
     /// `pub` for testability — called from `run()` and from tests directly.
     pub async fn run_iteration(&mut self) -> anyhow::Result<bool> {
         let now = Timestamp::now();
-        let cooldown = self.config.cooldown
-            / self.config.time_scale.max(1) as u32;
+        // cooldown is already pre-scaled by handle/mod.rs. See note in `run()`.
+        let cooldown = self.config.cooldown;
 
         // Snapshot pool first (needed for pool_sig).
         let pool = pool::snapshot_pool(
