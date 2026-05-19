@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #9: Automatic Federation Emergence in P2P Backup
+Viaticum Simulation #9: Automatic Federation Emergence in P2P Backup
 
 Hypothesis: "nobody trusts us, let's be friends" — new peers are forced to partner
 with other newcomers because established peers reject low-trust partners. This

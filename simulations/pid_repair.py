@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #3: D-component as Early Warning for Repair
+Viaticum Simulation #3: D-component as Early Warning for Repair
 
 Question: Does monitoring the D (derivative/trend) component of peer reputation
 allow earlier repair initiation and improve data survival?

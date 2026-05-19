@@ -1,4 +1,4 @@
-# SyncBack Architecture
+# Viaticum Architecture
 
 *2026-03-22. Reflects actual code — all phases + δ.1 complete (716 tests, ~34K lines Rust).*
 
@@ -9,7 +9,7 @@
 ## Общая схема
 
 ```
-┌─────────────────────────── syncback-core ───────────────────────────────┐
+┌─────────────────────────── viaticum-core ───────────────────────────────┐
 │  (pure Rust, no async, no network)                                       │
 │                                                                          │
 │  types ──► db ──────────────────────────────────────────────────────    │
@@ -27,7 +27,7 @@
 │   └──► constants (все числовые параметры протокола)                 │    │
 └──────────────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────── syncback (daemon) ───────────────────────────┐
+┌─────────────────────────── viaticum (daemon) ───────────────────────────┐
 │  (tokio async, libp2p transport, координаторы)                          │
 │                                                                          │
 │  handle ────── DaemonHandle: owns & wires all subsystems                │
@@ -48,20 +48,20 @@
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-Crate разделён намеренно: `syncback-core` тестируется без tokio и без сети —
-юнит-тесты запускаются мгновенно. Daemon-кратный код в `syncback` использует
-`syncback-core` как библиотеку.
+Crate разделён намеренно: `viaticum-core` тестируется без tokio и без сети —
+юнит-тесты запускаются мгновенно. Daemon-кратный код в `viaticum` использует
+`viaticum-core` как библиотеку.
 
 ---
 
 ## Структура крейтов
 
-### syncback-core
+### viaticum-core
 
 Чистая логика. Никакого async, никаких сетевых вызовов, никакого tokio.
 
 ```
-crates/syncback-core/src/
+crates/viaticum-core/src/
   lib.rs          — pub mod на все модули
   constants.rs    — все числовые параметры в одном файле
   types/          — все shared типы и record-структуры
@@ -81,12 +81,12 @@ crates/syncback-core/src/
   system_state/   — SystemState struct, snapshot_db, restore_db, pack/unpack (CBOR+zstd+ChaCha20)
 ```
 
-### syncback
+### viaticum
 
-Daemon + CLI. Использует tokio. Импортирует `syncback-core`.
+Daemon + CLI. Использует tokio. Импортирует `viaticum-core`.
 
 ```
-crates/syncback/src/
+crates/viaticum/src/
   main.rs         — binary entry point: CLI dispatch, tracing setup
   lib.rs          — pub mod daemon
   cli/            — Clap CLI, CliRequest/CliResponse types, output formatting
@@ -110,7 +110,7 @@ crates/syncback/src/
 
 ---
 
-## Модули syncback-core
+## Модули viaticum-core
 
 ### types
 
@@ -291,7 +291,7 @@ Alive → Fail / NotHeld → Lost → immediate repair
 | `ClusterSyncResponseMsg` | device → device | Ответ с событиями |
 | `RevocationBroadcast` | relay broadcast | Трансляция revocation certificate |
 
-ALPN: `"syncback/1"`. HandshakeMsg подписывается Ed25519: `sign("handshake" || identity_pub || timestamp_be)`.
+ALPN: `"viaticum/1"`. HandshakeMsg подписывается Ed25519: `sign("handshake" || identity_pub || timestamp_be)`.
 
 ---
 
@@ -344,7 +344,7 @@ pub struct HotCache {
 
 ---
 
-## Модули daemon (syncback)
+## Модули daemon (viaticum)
 
 ### network
 
@@ -613,7 +613,7 @@ Only detects changes AFTER daemon start — pre-existing files not scanned.
 
 ### cli_server
 
-Unix socket server at `{data_dir}/syncback.sock`.
+Unix socket server at `{data_dir}/viaticum.sock`.
 
 **Commands:** status, files, versions, peers, restore, connect, device (add/revoke/list), backup (force flush)
 
@@ -626,9 +626,9 @@ Bridges CLI → DaemonState for reads, CLI → RestoreCoordinator for restores, 
 BIP39 mnemonic (24 words) → seed → HKDF key derivation.
 
 **Derived keys:**
-- master_key (Ed25519): `HKDF(seed, info="syncback-identity-ed25519")`
-- device_key (Ed25519): `HKDF(seed, salt=device_id, info="syncback-device-ed25519")`
-- epoch_key: `HKDF(seed, salt=epoch_counter, info="syncback-encryption")`
+- master_key (Ed25519): `HKDF(seed, info="viaticum-identity-ed25519")`
+- device_key (Ed25519): `HKDF(seed, salt=device_id, info="viaticum-device-ed25519")`
+- epoch_key: `HKDF(seed, salt=epoch_counter, info="viaticum-encryption")`
 Identity file: `{data_dir}/identity.key` (mode 0600), stores encrypted seed.
 
 ---
@@ -779,4 +779,4 @@ process_sync_response():
 | `escrow_k_factor` | 7.0 | `DEFAULT_ESCROW_K_FACTOR` — GB·days required per 1 GB restore credit |
 | `prune_interval_secs` | 3600 | Интервал очистки relay board |
 
-Все числовые протокольные параметры вынесены в `syncback-core/src/constants.rs`.
+Все числовые протокольные параметры вынесены в `viaticum-core/src/constants.rs`.

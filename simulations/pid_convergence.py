@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #1: PID Reputation Convergence
+Viaticum Simulation #1: PID Reputation Convergence
 
 Question: Does PID-style reputation correctly rank peers by reliability?
 Metric: Kendall's tau (PID-perceived rank vs true reliability rank)

@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #16: PI+S Under Threats
+Viaticum Simulation #16: PI+S Under Threats
 
 Question: Does adding the storage-balance term S to the trust formula
 break existing defenses against Sybil, free-rider, and spite attacks?
@@ -938,7 +938,7 @@ def run_scenario_c(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack Experiment 16: PI+S Trust Under Threat Scenarios"
+        description="Viaticum Experiment 16: PI+S Trust Under Threat Scenarios"
     )
     parser.add_argument(
         "--scenario", choices=["a", "b", "c"],
@@ -964,7 +964,7 @@ def main() -> None:
 
     output_dir = Path(args.output)
 
-    print("=== SYNCBACK EXPERIMENT 16: PI+S UNDER THREATS ===")
+    print("=== VIATICUM EXPERIMENT 16: PI+S UNDER THREATS ===")
     print(f"Trust formula: trust = {args.kp}*P_weekly + {args.ki}*I + {args.ks}*S")
     print(f"  P_weekly: rolling 4-week window of weekly checks")
     print(f"  I: cumulative mean of weekly scores")

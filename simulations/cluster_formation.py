@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #10: Emergent Cluster Formation in a Living P2P Network
+Viaticum Simulation #10: Emergent Cluster Formation in a Living P2P Network
 
 Question: Does a trust graph with reciprocity and churn naturally partition into
 stable, evolving communities over a 10-year network lifetime?

@@ -2,7 +2,7 @@
 # Remote test: run cargo test on server if available, locally otherwise.
 set -euo pipefail
 
-SERVER="${SYNCBACK_SERVER:-your-user@your-server}"
+SERVER="${VIATICUM_SERVER:-your-user@your-server}"
 REMOTE_DIR="projects/syncback"
 ARGS="${@:---workspace}"
 

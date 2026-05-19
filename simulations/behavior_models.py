@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #13: Behavior Models / Archetypes
+Viaticum Simulation #13: Behavior Models / Archetypes
 
 Question: What realistic node behavior models should we use?
 Does PI reputation correctly rank diverse behavioral archetypes?
@@ -661,7 +661,7 @@ def plot_results(results: dict, config: Config, output_dir: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack Experiment 13: Behavior Models / Archetypes"
+        description="Viaticum Experiment 13: Behavior Models / Archetypes"
     )
     parser.add_argument("--peers", type=int, default=200,
                         help="Total number of peers")
@@ -694,7 +694,7 @@ def main() -> None:
         p_window=args.window,
     )
 
-    print("=== SYNCBACK EXPERIMENT 13: BEHAVIOR MODELS / ARCHETYPES ===\n")
+    print("=== VIATICUM EXPERIMENT 13: BEHAVIOR MODELS / ARCHETYPES ===\n")
 
     results = run_experiment(config, n_jobs=args.jobs)
     print_summary(config, results)

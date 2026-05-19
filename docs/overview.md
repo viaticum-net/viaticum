@@ -1,4 +1,4 @@
-# SyncBack Overview
+# Viaticum Overview
 
 Decentralized P2P cold backup system. Peers store encrypted fragments of each other's files. Trust is earned through Proof-of-Storage over time. No tokens, no governance — GB-days as currency, reputation as credit limit.
 
@@ -20,7 +20,7 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 
 ### Restore
 
-1. CLI: `syncback restore <path>` (selective, by path/version/date)
+1. CLI: `viaticum restore <path>` (selective, by path/version/date)
 2. Look up FileRecord -> versions -> source_block_ids -> placements
 3. Fetch symbols from holders (RestoreRequest -> RestoreResponse) or local disk
 4. Need K_eff = K + 3 symbols to decode (any K_eff of N suffice — RaptorQ is rateless)
@@ -51,12 +51,12 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 
 ### Disaster Recovery
 
-1. `syncback dr --mnemonic "24 words" --peer <addr>` — standalone, no daemon needed
+1. `viaticum dr --mnemonic "24 words" --peer <addr>` — standalone, no daemon needed
 2. Derive identity from seed phrase, open fresh DB
 3. BFS over peers: SystemStateRequest + PeerDiscoveryRequest on each connection
 4. Limits: 500 peers, 10 blobs, 120s timeout
 5. Select freshest blob (max created_at), decrypt with identity key, restore DB
-6. Run `syncback daemon` then `syncback restore <path>` to recover files
+6. Run `viaticum daemon` then `viaticum restore <path>` to recover files
 
 ### Deletion
 
@@ -69,7 +69,7 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 
 ## Module Map
 
-### syncback-core (pure logic, no async, no network)
+### viaticum-core (pure logic, no async, no network)
 
 | Module | Description |
 |--------|-------------|
@@ -90,7 +90,7 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 | `reliability` | P(block recoverable) = P(Binomial(N,p) >= K_eff) |
 | `deletion` | Double cooldown (4wk+4wk), vacuum, multi-device coordination |
 
-### syncback (daemon + CLI)
+### viaticum (daemon + CLI)
 
 | Module | Description |
 |--------|-------------|

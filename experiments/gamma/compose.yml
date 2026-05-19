@@ -6,8 +6,8 @@ services:
     container_name: gamma-node-00
     hostname: node-00
     volumes:
-      - ../../target/release/syncback:/usr/local/bin/syncback:ro
-      - node-00-data:/home/syncback/.syncback
+      - ../../target/release/viaticum:/usr/local/bin/viaticum:ro
+      - node-00-data:/home/viaticum/.viaticum
       - node-00-files:/data/files
     networks:
       - gamma-net
@@ -19,8 +19,8 @@ services:
     container_name: gamma-node-01
     hostname: node-01
     volumes:
-      - ../../target/release/syncback:/usr/local/bin/syncback:ro
-      - node-01-data:/home/syncback/.syncback
+      - ../../target/release/viaticum:/usr/local/bin/viaticum:ro
+      - node-01-data:/home/viaticum/.viaticum
       - node-01-files:/data/files
     networks:
       - gamma-net
@@ -32,8 +32,8 @@ services:
     container_name: gamma-node-02
     hostname: node-02
     volumes:
-      - ../../target/release/syncback:/usr/local/bin/syncback:ro
-      - node-02-data:/home/syncback/.syncback
+      - ../../target/release/viaticum:/usr/local/bin/viaticum:ro
+      - node-02-data:/home/viaticum/.viaticum
       - node-02-files:/data/files
     networks:
       - gamma-net
@@ -45,8 +45,8 @@ services:
     container_name: gamma-node-03
     hostname: node-03
     volumes:
-      - ../../target/release/syncback:/usr/local/bin/syncback:ro
-      - node-03-data:/home/syncback/.syncback
+      - ../../target/release/viaticum:/usr/local/bin/viaticum:ro
+      - node-03-data:/home/viaticum/.viaticum
       - node-03-files:/data/files
     networks:
       - gamma-net
@@ -58,8 +58,8 @@ services:
     container_name: gamma-node-04
     hostname: node-04
     volumes:
-      - ../../target/release/syncback:/usr/local/bin/syncback:ro
-      - node-04-data:/home/syncback/.syncback
+      - ../../target/release/viaticum:/usr/local/bin/viaticum:ro
+      - node-04-data:/home/viaticum/.viaticum
       - node-04-files:/data/files
     networks:
       - gamma-net

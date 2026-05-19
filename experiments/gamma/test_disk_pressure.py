@@ -64,7 +64,7 @@ def compose(*args, timeout=120):
 
 
 def node_status(name):
-    raw = exec_node(name, "syncback", "status", "--json")
+    raw = exec_node(name, "viaticum", "status", "--json")
     return json.loads(raw)
 
 
@@ -99,18 +99,18 @@ disk_reserve_gb = 0.0
 enable_relay = false
 """
     exec_node(name, "sh", "-c",
-              f"cat > /home/syncback/.syncback/config.toml << 'EOFCFG'\n{config}EOFCFG")
+              f"cat > /home/viaticum/.viaticum/config.toml << 'EOFCFG'\n{config}EOFCFG")
 
 
 def start_daemon(name, ts):
     exec_node_bg(name, "sh", "-c",
-                 f"RUST_LOG=info syncback daemon --time-scale {ts} "
+                 f"RUST_LOG=info viaticum daemon --time-scale {ts} "
                  f"--watch-dir /data/files >/tmp/daemon.log 2>&1")
 
 
 def stop_daemon(name):
     """Kill the daemon process inside the container (not the container itself)."""
-    exec_node_quiet(name, "pkill", "-f", "syncback daemon", timeout=10)
+    exec_node_quiet(name, "pkill", "-f", "viaticum daemon", timeout=10)
     time.sleep(1)
 
 
@@ -150,7 +150,7 @@ def main():
         print("Phase 1: Init all nodes")
         for name in nodes:
             try:
-                exec_node(name, "syncback", "init")
+                exec_node(name, "viaticum", "init")
             except RuntimeError as e:
                 if "already initialized" not in str(e):
                     raise
@@ -171,9 +171,9 @@ def main():
 
         # ── Phase 4: Discovery ───────────────────────────────────────────
         print("Phase 4: Bootstrap peer discovery")
-        addr0 = json.loads(exec_node(owner, "syncback", "status", "--json")).get("node_addr", "")
+        addr0 = json.loads(exec_node(owner, "viaticum", "status", "--json")).get("node_addr", "")
         for name in nodes[1:]:
-            exec_node_quiet(name, "syncback", "connect", addr0, timeout=15)
+            exec_node_quiet(name, "viaticum", "connect", addr0, timeout=15)
 
         ok = wait_for(
             "All nodes discover peers",
@@ -244,7 +244,7 @@ def main():
         time.sleep(3)
 
         # Reconnect
-        exec_node_quiet(victim, "syncback", "connect", addr0, timeout=15)
+        exec_node_quiet(victim, "viaticum", "connect", addr0, timeout=15)
         print(f"    Victim restarted with tiny quota\n")
 
         # ── Phase 8: Wait for pressure check → eviction ─────────────────
@@ -309,7 +309,7 @@ def main():
         restore_dir = "/tmp/restored"
         try:
             src_path = "/data/files/pressure_a.dat"
-            exec_node(owner, "syncback", "restore", src_path,
+            exec_node(owner, "viaticum", "restore", src_path,
                       "--dest", restore_dir, timeout=60)
             restored_file = f"{restore_dir}{src_path}"
             orig_hash = exec_node(owner, "md5sum", src_path).split()[0]

@@ -52,7 +52,7 @@ def compose(*args, timeout=120):
 
 
 def node_status(name):
-    raw = exec_node(name, "syncback", "status", "--json")
+    raw = exec_node(name, "viaticum", "status", "--json")
     return json.loads(raw)
 
 
@@ -81,7 +81,7 @@ def main():
     for i in range(n):
         name = f"node-{i:02d}"
         try:
-            exec_node(name, "syncback", "init")
+            exec_node(name, "viaticum", "init")
         except RuntimeError as e:
             if "already initialized" not in str(e):
                 raise
@@ -96,9 +96,9 @@ def main():
 enable_relay = false
 """
         exec_node(name, "sh", "-c",
-                  f"cat > /home/syncback/.syncback/config.toml << 'EOF'\n{config}EOF")
+                  f"cat > /home/viaticum/.viaticum/config.toml << 'EOF'\n{config}EOF")
         exec_node_bg(name, "sh", "-c",
-                     "RUST_LOG=info syncback daemon --time-scale 1000 "
+                     "RUST_LOG=info viaticum daemon --time-scale 1000 "
                      "--watch-dir /data/files >/tmp/daemon.log 2>&1")
 
     time.sleep(5)
@@ -108,7 +108,7 @@ enable_relay = false
     addr_01 = node_status("node-01").get("node_addr", "")
     print(f"  node-00 addr: {addr_00[:40]}...")
     print(f"  node-01 addr: {addr_01[:40]}...")
-    exec_node("node-00", "syncback", "connect", addr_01, timeout=15)
+    exec_node("node-00", "viaticum", "connect", addr_01, timeout=15)
     print("  seeds connected\n")
 
     # Phase 3: Start remaining nodes with bootstrap_peers = [node-00, node-01]
@@ -121,9 +121,9 @@ enable_relay = false
 bootstrap_peers = ["{addr_00}", "{addr_01}"]
 """
         exec_node(name, "sh", "-c",
-                  f"cat > /home/syncback/.syncback/config.toml << 'EOF'\n{config}EOF")
+                  f"cat > /home/viaticum/.viaticum/config.toml << 'EOF'\n{config}EOF")
         exec_node_bg(name, "sh", "-c",
-                     "RUST_LOG=info syncback daemon --time-scale 1000 "
+                     "RUST_LOG=info viaticum daemon --time-scale 1000 "
                      "--watch-dir /data/files >/tmp/daemon.log 2>&1")
 
     print(f"  {n - 2} nodes started with bootstrap config")

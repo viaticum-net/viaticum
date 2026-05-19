@@ -87,7 +87,7 @@ def exec_node_bg(name, *args):
 
 
 def node_status(name):
-    raw = exec_node(name, "syncback", "status", "--json", timeout=15)
+    raw = exec_node(name, "viaticum", "status", "--json", timeout=15)
     return json.loads(raw)
 
 
@@ -123,17 +123,17 @@ disk_reserve_gb = 0.0
 enable_relay = true
 """
     exec_node(name, "sh", "-c",
-              f"cat > /home/syncback/.syncback/config.toml << 'EOFCFG'\n{config}EOFCFG")
+              f"cat > /home/viaticum/.viaticum/config.toml << 'EOFCFG'\n{config}EOFCFG")
 
 
 def start_daemon(name, ts):
     exec_node_bg(name, "sh", "-c",
-                 f"RUST_LOG=info syncback daemon --time-scale {ts} "
+                 f"RUST_LOG=info viaticum daemon --time-scale {ts} "
                  f"--watch-dir /data/files >/tmp/daemon.log 2>&1")
 
 
 def stop_daemon(name):
-    exec_node_quiet(name, "pkill", "-f", "syncback daemon")
+    exec_node_quiet(name, "pkill", "-f", "viaticum daemon")
     time.sleep(1)
 
 
@@ -199,7 +199,7 @@ def main():
         print("Phase 2: Init + config + start daemons")
         for name in ALL_NODES:
             try:
-                exec_node(name, "syncback", "init")
+                exec_node(name, "viaticum", "init")
             except RuntimeError as e:
                 if "already initialized" not in str(e):
                     raise
@@ -218,7 +218,7 @@ def main():
 
         # Connect all holders to owner
         for name in HOLDER_NODES:
-            out = exec_node_quiet(name, "syncback", "connect", owner_addr, timeout=30)
+            out = exec_node_quiet(name, "viaticum", "connect", owner_addr, timeout=30)
             print(f"  {name} connect: {out[:60] if out else 'ok'}")
         time.sleep(5)
 
@@ -226,7 +226,7 @@ def main():
         for name in NODES_NET_B:
             s = node_status_safe(name)
             if s and s.get("node_addr"):
-                exec_node_quiet(OWNER, "syncback", "connect",
+                exec_node_quiet(OWNER, "viaticum", "connect",
                                 s["node_addr"], timeout=30)
 
         # Wait longer for relay-based connections (can be slow)
@@ -289,7 +289,7 @@ def main():
         print("Phase 5: Restore across networks")
         restore_dir = "/tmp/restored_nat"
         try:
-            exec_node(OWNER, "syncback", "restore", "/data/files/nat_test.bin",
+            exec_node(OWNER, "viaticum", "restore", "/data/files/nat_test.bin",
                       "--dest", restore_dir, timeout=60)
             restored_hash = get_file_hash(OWNER,
                                           f"{restore_dir}/data/files/nat_test.bin")

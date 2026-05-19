@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #22: Multiplicative vs Additive S
+Viaticum Simulation #22: Multiplicative vs Additive S
 
 Question: Does a multiplicative or hybrid S formulation correctly rank archetypes
 (specifically fixing Hoarder > Nomad inversion) compared to the additive baseline?
@@ -829,7 +829,7 @@ def save_results(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack Experiment 22: Multiplicative vs Additive S formula"
+        description="Viaticum Experiment 22: Multiplicative vs Additive S formula"
     )
     parser.add_argument("--seeds", type=int, default=10,
                         help="Monte Carlo seeds per config")
@@ -843,7 +843,7 @@ def main() -> None:
                         help="Output directory")
     args = parser.parse_args()
 
-    print("=== SYNCBACK EXPERIMENT 22: MULTIPLICATIVE vs ADDITIVE S ===", flush=True)
+    print("=== VIATICUM EXPERIMENT 22: MULTIPLICATIVE vs ADDITIVE S ===", flush=True)
     print(f"Seeds per config: {args.seeds}  Jobs: {args.jobs}  "
           f"Max peers: {args.max_peers}  Years: {args.years}", flush=True)
 

@@ -31,7 +31,7 @@
 <div class="connect-form">
   <h2>Connect to Peer</h2>
   <p class="hint">
-    Paste a libp2p multiaddr. Copy it from <code>syncback status</code> on the remote node —
+    Paste a libp2p multiaddr. Copy it from <code>viaticum status</code> on the remote node —
     the line beginning with <code>addr:</code>.
   </p>
   <p class="hint">
@@ -63,8 +63,8 @@
       Both flows currently exist as CLI only:
     </p>
     <ul class="hint">
-      <li><code>syncback init --new-device --mnemonic "&lt;24 words&gt;"</code> — join an existing cluster as a new device.</li>
-      <li><code>syncback dr --mnemonic "&lt;24 words&gt;"</code> — disaster recovery: rebuild node state from the seed phrase.</li>
+      <li><code>viaticum init --new-device --mnemonic "&lt;24 words&gt;"</code> — join an existing cluster as a new device.</li>
+      <li><code>viaticum dr --mnemonic "&lt;24 words&gt;"</code> — disaster recovery: rebuild node state from the seed phrase.</li>
     </ul>
     <p class="hint">
       UI flows for both are tracked as a feature in <code>docs/features.md</code>.

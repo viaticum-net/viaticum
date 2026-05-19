@@ -87,7 +87,7 @@ def compose(*args, timeout=120):
 
 
 def node_status(name):
-    raw = exec_node(name, "syncback", "status", "--json")
+    raw = exec_node(name, "viaticum", "status", "--json")
     return json.loads(raw)
 
 
@@ -122,22 +122,22 @@ disk_reserve_gb = 0.0
 enable_relay = false
 """
     exec_node(name, "sh", "-c",
-              f"cat > /home/syncback/.syncback/config.toml << 'EOFCFG'\n{config}EOFCFG")
+              f"cat > /home/viaticum/.viaticum/config.toml << 'EOFCFG'\n{config}EOFCFG")
 
 
 def start_daemon(name, ts):
     exec_node_bg(name, "sh", "-c",
-                 f"RUST_LOG=info syncback daemon --time-scale {ts} "
+                 f"RUST_LOG=info viaticum daemon --time-scale {ts} "
                  f"--watch-dir /data/files >/tmp/daemon.log 2>&1")
 
 
 def stop_daemon(name):
-    exec_node_quiet(name, "pkill", "-f", "syncback daemon", timeout=10)
+    exec_node_quiet(name, "pkill", "-f", "viaticum daemon", timeout=10)
     time.sleep(1)
 
 
 def count_devices(dl_output):
-    """Count device entries in `syncback device list` output."""
+    """Count device entries in `viaticum device list` output."""
     count = 0
     for line in dl_output.split("\n"):
         if re.search(r'[0-9a-f]{8,}', line.lower()):
@@ -187,7 +187,7 @@ def main():
 
         # A1: Init devices
         print("A1: Init devices (A=primary, B=new-device)")
-        init_a = exec_node(dev_a, "syncback", "init")
+        init_a = exec_node(dev_a, "viaticum", "init")
 
         # Parse mnemonic
         lines = init_a.split("\n")
@@ -209,21 +209,21 @@ def main():
         results["passed"].append("mnemonic")
         print(f"    Mnemonic: {mnemonic[:40]}...")
 
-        init_b = exec_node(dev_b, "syncback", "init",
+        init_b = exec_node(dev_b, "viaticum", "init",
                             "--mnemonic", mnemonic, "--new-device")
         results["passed"].append("new_device_init")
         print(f"    B init OK")
 
         for name in storage:
             try:
-                exec_node(name, "syncback", "init")
+                exec_node(name, "viaticum", "init")
             except RuntimeError as e:
                 if "already initialized" not in str(e):
                     raise
 
         # A2: Verify identity match
         print("\nA2: Verify same master identity, different device")
-        # Use `syncback status --json` before daemon to get identity
+        # Use `viaticum status --json` before daemon to get identity
         # Actually need daemon running for status. Start daemons first.
         for name in nodes:
             write_config(name)
@@ -248,7 +248,7 @@ def main():
         print("\nA3: Discovery + cluster auto-add")
         # Storage nodes connect to both devices
         for name in storage:
-            exec_node_quiet(name, "syncback", "connect", addr_a, timeout=15)
+            exec_node_quiet(name, "viaticum", "connect", addr_a, timeout=15)
 
         wait_for("Storage peers found", lambda: all(
             (s := node_status_safe(h)) is not None and s.get("peer_count", 0) >= 1
@@ -256,11 +256,11 @@ def main():
         ), timeout_secs=30, poll_secs=5)
 
         # B connects to A → auto-add
-        exec_node_quiet(dev_b, "syncback", "connect", addr_a, timeout=15)
+        exec_node_quiet(dev_b, "viaticum", "connect", addr_a, timeout=15)
         time.sleep(5)
 
-        dl_a = exec_node_quiet(dev_a, "syncback", "device", "list")
-        dl_b = exec_node_quiet(dev_b, "syncback", "device", "list")
+        dl_a = exec_node_quiet(dev_a, "viaticum", "device", "list")
+        dl_b = exec_node_quiet(dev_b, "viaticum", "device", "list")
         da = count_devices(dl_a)
         db = count_devices(dl_b)
 
@@ -275,9 +275,9 @@ def main():
             results["failed"].append("auto_add")
 
         # A4: Idempotent re-connect
-        exec_node_quiet(dev_b, "syncback", "connect", addr_a, timeout=15)
+        exec_node_quiet(dev_b, "viaticum", "connect", addr_a, timeout=15)
         time.sleep(2)
-        dl_a2 = exec_node_quiet(dev_a, "syncback", "device", "list")
+        dl_a2 = exec_node_quiet(dev_a, "viaticum", "device", "list")
         if count_devices(dl_a2) == da:
             results["passed"].append("idempotent_add")
         else:
@@ -311,7 +311,7 @@ def main():
         # B needs storage peers connected
         addr_b = node_status(dev_b).get("node_addr", "")
         for name in storage:
-            exec_node_quiet(name, "syncback", "connect", addr_b, timeout=15)
+            exec_node_quiet(name, "viaticum", "connect", addr_b, timeout=15)
         time.sleep(3)
 
         exec_node(dev_b, "dd", "if=/dev/urandom",
@@ -335,7 +335,7 @@ def main():
             src = f"/data/files/{fname}"
             dst = f"/tmp/restored_{fname}"
             try:
-                exec_node(dev, "syncback", "restore", src, "--dest", dst, timeout=60)
+                exec_node(dev, "viaticum", "restore", src, "--dest", dst, timeout=60)
                 oh = exec_node(dev, "md5sum", src).split()[0]
                 rh = exec_node(dev, "md5sum", f"{dst}{src}").split()[0]
                 if oh == rh:
@@ -452,10 +452,10 @@ def main():
         # D2: Post-restart — re-connect and verify sync continues
         print("\nD2: Post-restart sync")
         # Reconnect A to peers
-        exec_node_quiet(dev_b, "syncback", "connect",
+        exec_node_quiet(dev_b, "viaticum", "connect",
                          node_status(dev_a).get("node_addr", ""), timeout=15)
         for name in storage:
-            exec_node_quiet(name, "syncback", "connect",
+            exec_node_quiet(name, "viaticum", "connect",
                              node_status(dev_a).get("node_addr", ""), timeout=15)
         time.sleep(sync_interval + 10)
 

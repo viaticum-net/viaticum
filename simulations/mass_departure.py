@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #6: Mass Departure (Shock Event)
+Viaticum Simulation #6: Mass Departure (Shock Event)
 
 Question: What happens when 30-50% of network leaves simultaneously?
 How does instant shock compare to gradual churn of the same magnitude?

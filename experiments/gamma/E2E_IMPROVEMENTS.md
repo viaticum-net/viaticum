@@ -17,7 +17,7 @@ Systematic review of all 13 gamma E2E tests identified and fixed several categor
 - Label: `blocks_not_at_risk`
 
 **Added Phase 10: Negative restore test**
-- Attempts `syncback restore /data/files/does_not_exist.txt`
+- Attempts `viaticum restore /data/files/does_not_exist.txt`
 - Verifies no output file is produced
 - Label: `negative_restore_no_output`
 - Finding: restore CLI returns exit 0 for unknown files (recorded in tech-debt.md)
@@ -74,7 +74,7 @@ Systematic review of all 13 gamma E2E tests identified and fixed several categor
 
 ### Restore CLI doesn't reject deleted or nonexistent files
 
-`syncback restore /path` returns exit 0 and prints "restore started" even when:
+`viaticum restore /path` returns exit 0 and prints "restore started" even when:
 - The file was never backed up
 - The file has been fully deleted (both cooldowns expired)
 
@@ -96,5 +96,5 @@ The restore coordinator starts but produces no output file. This is a CLI UX iss
 2. **test_board_transport.py**: Add actual board message count verification
 3. **test_dedup.py**: Verify `holdings_total` doesn't increase after dedup
 4. **test_dr.py**: Check `node_identity` matches pre/post DR
-5. **test_cluster_sync.py**: Verify B can see A's files via `syncback files`
+5. **test_cluster_sync.py**: Verify B can see A's files via `viaticum files`
 6. **All tests**: Add `no_crashes` check (grep for panic/SIGSEGV in logs)

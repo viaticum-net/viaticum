@@ -21,8 +21,8 @@ set -euo pipefail
 
 NUM_NODES=5
 TIME_SCALE=10000
-TEST_DIR="/tmp/syncback-unified-pipeline-$$"
-BINARY="${BINARY:-syncback}"
+TEST_DIR="/tmp/viaticum-unified-pipeline-$$"
+BINARY="${BINARY:-viaticum}"
 
 PASS=0; FAIL=0; SKIP=0
 PIDS=()
@@ -81,8 +81,8 @@ get_json_field() {
 }
 
 if ! command -v "$BINARY" &>/dev/null; then
-    BINARY="./target/release/syncback"
-    [ ! -x "$BINARY" ] && echo "ERROR: syncback binary not found. Run: cargo build --release" && exit 1
+    BINARY="./target/release/viaticum"
+    [ ! -x "$BINARY" ] && echo "ERROR: viaticum binary not found. Run: cargo build --release" && exit 1
 fi
 
 echo "============================================================"

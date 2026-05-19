@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #17: Long-term Mixed Network with PI+S Formula (pairwise S)
+Viaticum Simulation #17: Long-term Mixed Network with PI+S Formula (pairwise S)
 
 Question: Does the corrected trust formula trust = kp*P + ki*I + ks*S correctly
 rank diverse behavioral archetypes over a 10-year network lifetime with realistic
@@ -851,7 +851,7 @@ def save_results(result: dict, path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack Experiment 17: Long-term Mixed Network with PI+S (pairwise S)"
+        description="Viaticum Experiment 17: Long-term Mixed Network with PI+S (pairwise S)"
     )
     parser.add_argument("--kp", type=float, default=0.5)
     parser.add_argument("--ki", type=float, default=2.0)
@@ -888,7 +888,7 @@ def main() -> None:
         n_seeds=args.seeds,
     )
 
-    print("=== SYNCBACK EXPERIMENT 17: LONG-TERM MIXED NETWORK (PI+S, pairwise S) ===\n")
+    print("=== VIATICUM EXPERIMENT 17: LONG-TERM MIXED NETWORK (PI+S, pairwise S) ===\n")
 
     result = run_experiment(cfg, n_jobs=args.jobs)
     print_summary(result)

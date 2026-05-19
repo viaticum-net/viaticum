@@ -1,171 +1,171 @@
 x-node: &node-defaults
-  image: syncback-beta
+  image: viaticum-beta
   networks:
-    - syncback-net
+    - viaticum-net
 
 services:
   node-00:
     <<: *node-defaults
-    container_name: syncback-beta-node-00
+    container_name: viaticum-beta-node-00
     hostname: node-00
     volumes:
-      - node-00-data:/home/syncback/.syncback
+      - node-00-data:/home/viaticum/.viaticum
       - node-00-files:/data/files
 
   node-01:
     <<: *node-defaults
-    container_name: syncback-beta-node-01
+    container_name: viaticum-beta-node-01
     hostname: node-01
     volumes:
-      - node-01-data:/home/syncback/.syncback
+      - node-01-data:/home/viaticum/.viaticum
       - node-01-files:/data/files
 
   node-02:
     <<: *node-defaults
-    container_name: syncback-beta-node-02
+    container_name: viaticum-beta-node-02
     hostname: node-02
     volumes:
-      - node-02-data:/home/syncback/.syncback
+      - node-02-data:/home/viaticum/.viaticum
       - node-02-files:/data/files
 
   node-03:
     <<: *node-defaults
-    container_name: syncback-beta-node-03
+    container_name: viaticum-beta-node-03
     hostname: node-03
     volumes:
-      - node-03-data:/home/syncback/.syncback
+      - node-03-data:/home/viaticum/.viaticum
       - node-03-files:/data/files
 
   node-04:
     <<: *node-defaults
-    container_name: syncback-beta-node-04
+    container_name: viaticum-beta-node-04
     hostname: node-04
     volumes:
-      - node-04-data:/home/syncback/.syncback
+      - node-04-data:/home/viaticum/.viaticum
       - node-04-files:/data/files
 
   node-05:
     <<: *node-defaults
-    container_name: syncback-beta-node-05
+    container_name: viaticum-beta-node-05
     hostname: node-05
     volumes:
-      - node-05-data:/home/syncback/.syncback
+      - node-05-data:/home/viaticum/.viaticum
       - node-05-files:/data/files
 
   node-06:
     <<: *node-defaults
-    container_name: syncback-beta-node-06
+    container_name: viaticum-beta-node-06
     hostname: node-06
     volumes:
-      - node-06-data:/home/syncback/.syncback
+      - node-06-data:/home/viaticum/.viaticum
       - node-06-files:/data/files
 
   node-07:
     <<: *node-defaults
-    container_name: syncback-beta-node-07
+    container_name: viaticum-beta-node-07
     hostname: node-07
     volumes:
-      - node-07-data:/home/syncback/.syncback
+      - node-07-data:/home/viaticum/.viaticum
       - node-07-files:/data/files
 
   node-08:
     <<: *node-defaults
-    container_name: syncback-beta-node-08
+    container_name: viaticum-beta-node-08
     hostname: node-08
     volumes:
-      - node-08-data:/home/syncback/.syncback
+      - node-08-data:/home/viaticum/.viaticum
       - node-08-files:/data/files
 
   node-09:
     <<: *node-defaults
-    container_name: syncback-beta-node-09
+    container_name: viaticum-beta-node-09
     hostname: node-09
     volumes:
-      - node-09-data:/home/syncback/.syncback
+      - node-09-data:/home/viaticum/.viaticum
       - node-09-files:/data/files
 
   node-10:
     <<: *node-defaults
-    container_name: syncback-beta-node-10
+    container_name: viaticum-beta-node-10
     hostname: node-10
     volumes:
-      - node-10-data:/home/syncback/.syncback
+      - node-10-data:/home/viaticum/.viaticum
       - node-10-files:/data/files
 
   node-11:
     <<: *node-defaults
-    container_name: syncback-beta-node-11
+    container_name: viaticum-beta-node-11
     hostname: node-11
     volumes:
-      - node-11-data:/home/syncback/.syncback
+      - node-11-data:/home/viaticum/.viaticum
       - node-11-files:/data/files
 
   node-12:
     <<: *node-defaults
-    container_name: syncback-beta-node-12
+    container_name: viaticum-beta-node-12
     hostname: node-12
     volumes:
-      - node-12-data:/home/syncback/.syncback
+      - node-12-data:/home/viaticum/.viaticum
       - node-12-files:/data/files
 
   node-13:
     <<: *node-defaults
-    container_name: syncback-beta-node-13
+    container_name: viaticum-beta-node-13
     hostname: node-13
     volumes:
-      - node-13-data:/home/syncback/.syncback
+      - node-13-data:/home/viaticum/.viaticum
       - node-13-files:/data/files
 
   node-14:
     <<: *node-defaults
-    container_name: syncback-beta-node-14
+    container_name: viaticum-beta-node-14
     hostname: node-14
     volumes:
-      - node-14-data:/home/syncback/.syncback
+      - node-14-data:/home/viaticum/.viaticum
       - node-14-files:/data/files
 
   node-15:
     <<: *node-defaults
-    container_name: syncback-beta-node-15
+    container_name: viaticum-beta-node-15
     hostname: node-15
     volumes:
-      - node-15-data:/home/syncback/.syncback
+      - node-15-data:/home/viaticum/.viaticum
       - node-15-files:/data/files
 
   node-16:
     <<: *node-defaults
-    container_name: syncback-beta-node-16
+    container_name: viaticum-beta-node-16
     hostname: node-16
     volumes:
-      - node-16-data:/home/syncback/.syncback
+      - node-16-data:/home/viaticum/.viaticum
       - node-16-files:/data/files
 
   node-17:
     <<: *node-defaults
-    container_name: syncback-beta-node-17
+    container_name: viaticum-beta-node-17
     hostname: node-17
     volumes:
-      - node-17-data:/home/syncback/.syncback
+      - node-17-data:/home/viaticum/.viaticum
       - node-17-files:/data/files
 
   node-18:
     <<: *node-defaults
-    container_name: syncback-beta-node-18
+    container_name: viaticum-beta-node-18
     hostname: node-18
     volumes:
-      - node-18-data:/home/syncback/.syncback
+      - node-18-data:/home/viaticum/.viaticum
       - node-18-files:/data/files
 
   node-19:
     <<: *node-defaults
-    container_name: syncback-beta-node-19
+    container_name: viaticum-beta-node-19
     hostname: node-19
     volumes:
-      - node-19-data:/home/syncback/.syncback
+      - node-19-data:/home/viaticum/.viaticum
       - node-19-files:/data/files
 
 networks:
-  syncback-net:
+  viaticum-net:
     driver: bridge
 
 volumes:

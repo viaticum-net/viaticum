@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/syncback-core",
-    "crates/syncback",
+    "crates/viaticum-core",
+    "crates/viaticum",
 ]
 
 [workspace.package]
@@ -111,4 +111,4 @@ cap-std = "4"
 uuid = { version = "1", features = ["v4"] }
 
 # Internal
-syncback-core = { path = "crates/syncback-core" }
+viaticum-core = { path = "crates/viaticum-core" }

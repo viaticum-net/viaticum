@@ -1,5 +1,5 @@
 #!/bin/bash
-# SyncBack: PoS verification + Repair after block.bin cleanup
+# Viaticum: PoS verification + Repair after block.bin cleanup
 # Validates that deterministic nonce allows blob rebuild from source files.
 #
 # Scenarios:
@@ -15,8 +15,8 @@ set -euo pipefail
 
 NUM_NODES=5
 TIME_SCALE=100000   # PoS fires every ~3s, repair every ~1s
-TEST_DIR="/tmp/syncback-pos-repair-$$"
-BINARY="${BINARY:-syncback}"
+TEST_DIR="/tmp/viaticum-pos-repair-$$"
+BINARY="${BINARY:-viaticum}"
 
 PASS=0; FAIL=0; SKIP=0
 PIDS=()
@@ -73,12 +73,12 @@ get_json_field() {
 }
 
 if ! command -v "$BINARY" &>/dev/null; then
-    BINARY="./target/release/syncback"
+    BINARY="./target/release/viaticum"
     [ ! -x "$BINARY" ] && echo "ERROR: binary not found" && exit 1
 fi
 
 echo "============================================================"
-echo "  SyncBack: PoS + Repair After block.bin Cleanup"
+echo "  Viaticum: PoS + Repair After block.bin Cleanup"
 echo "  Nodes: ${NUM_NODES}, time_scale: ${TIME_SCALE}"
 echo "============================================================"
 

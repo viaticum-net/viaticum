@@ -8,7 +8,7 @@
 
 ## Контекст
 
-SyncBack использует iroh 0.96 как QUIC-транспорт. Проблемы:
+Viaticum использует iroh 0.96 как QUIC-транспорт. Проблемы:
 
 1. **Relay сломан** -- QUIC через iroh relay умирает после 6-7с, handshake не проходит
 2. **Двойная identity** -- iroh SecretKey + IdentityPub, маппинг через PeerAnnounce
@@ -45,7 +45,7 @@ libp2p v0.56 -- модульный P2P-фреймворк. Проверен в p
 
 ```
 +----------------------------------------------+
-|  SyncBack Protocol                           |
+|  Viaticum Protocol                           |
 |  Trust, PoS, Escrow, Backup, Restore         |
 |  Message enum (CBOR)                         |
 |  --- не меняется ---                         |
@@ -56,7 +56,7 @@ libp2p v0.56 -- модульный P2P-фреймворк. Проверен в p
 +----------------------------------------------+
 |  libp2p Swarm                                |
 |  +----------------------------------------+  |
-|  | SyncBackBehaviour (NetworkBehaviour)   |  |
+|  | ViaticumBehaviour (NetworkBehaviour)   |  |
 |  |                                       |  |
 |  |  request_response -- CBOR messages    |  |
 |  |  kademlia         -- peer discovery   |  |
@@ -248,14 +248,14 @@ escrow/budget:  keyed by IdentityPub -- экономика между людьм
 1. TCP connect
 2. Noise IX -- шифрование + аутентификация Ed25519 (forward secrecy, replay protection)
 3. Yamux negotiation
-4. DeviceCertExchange (первый request-response на `/syncback/1`)
+4. DeviceCertExchange (первый request-response на `/viaticum/1`)
 5. Проверка: cert.device_pub == authenticated PeerId's key
 
 `HandshakeMsg`, `build_handshake()`, `verify_handshake()` удаляются. Noise лучше.
 
 ### DeviceCertExchange
 
-Реализуется как обычный request-response на основном протоколе `/syncback/1`. Dialer отправляет первым:
+Реализуется как обычный request-response на основном протоколе `/viaticum/1`. Dialer отправляет первым:
 
 ```
 Dialer  -> Request(DeviceCertExchange { cert, x25519_pub })
@@ -295,16 +295,16 @@ Timeout 10s -> закрываем соединение
 - Privacy минимальная проблема (светим только provider-запросы, не данные)
 - Чужой DHT трафик ничтожен (десятки KiB/s routing)
 
-Когда количество SyncBack нод достаточно (~100+) -- переключиться на свой namespace `/syncback/kad/1.0.0` + свои bootstrap ноды. Одна строка в конфиге.
+Когда количество Viaticum нод достаточно (~100+) -- переключиться на свой namespace `/viaticum/kad/1.0.0` + свои bootstrap ноды. Одна строка в конфиге.
 
 ### Паттерн discovery
 
 ```rust
-// Публикация: "я -- SyncBack нода"
-let namespace_key = Key::from(sha256(b"/syncback/peers/v1"));
+// Публикация: "я -- Viaticum нода"
+let namespace_key = Key::from(sha256(b"/viaticum/peers/v1"));
 kademlia.start_providing(namespace_key)?;
 
-// Поиск SyncBack-нод:
+// Поиск Viaticum-нод:
 kademlia.get_providers(namespace_key);
 // -> список PeerId + Multiaddr
 
@@ -318,7 +318,7 @@ Republish каждые 30 мин. MemoryStore с лимитом **10240 запи
 ## NAT traversal: DCUtR + Circuit Relay v2
 
 ```
-A находит relay R (любой SyncBack пир с публичным IP)
+A находит relay R (любой Viaticum пир с публичным IP)
 A публикует в DHT relayed-адрес
 B -> R -> A: relay-соединение
 DCUtR holepunch -> ~70% прямое соединение A<->B
@@ -367,12 +367,12 @@ Source block 128 MB = 2048 символов
 
 ### MAX_MESSAGE_SIZE = 128 MB
 
-Ограничение на уровне SyncBackCodec. С запасом.
+Ограничение на уровне ViaticumCodec. С запасом.
 
 ### Кодек
 
 ```rust
-impl request_response::Codec for SyncBackCodec {
+impl request_response::Codec for ViaticumCodec {
     type Protocol = StreamProtocol;
     type Request = Message;
     type Response = Message;  // SymbolStored, SymbolAccept, RestoreResponse, Ack, etc.
@@ -382,7 +382,7 @@ impl request_response::Codec for SyncBackCodec {
 Wire format `[u32 BE length][CBOR]` не меняется. `frame_message()` и `from_cbor()` переиспользуются.
 
 ```rust
-const SYNCBACK_PROTOCOL: StreamProtocol = StreamProtocol::new("/syncback/1");
+const VIATICUM_PROTOCOL: StreamProtocol = StreamProtocol::new("/viaticum/1");
 ```
 
 ---
@@ -391,8 +391,8 @@ const SYNCBACK_PROTOCOL: StreamProtocol = StreamProtocol::new("/syncback/1");
 
 ```rust
 #[derive(NetworkBehaviour)]
-struct SyncBackBehaviour {
-    syncback: request_response::Behaviour<SyncBackCodec>,
+struct ViaticumBehaviour {
+    viaticum: request_response::Behaviour<ViaticumCodec>,
     kademlia: kad::Behaviour<MemoryStore>,
     dcutr: dcutr::Behaviour,
     relay_client: relay::client::Behaviour,
@@ -460,10 +460,10 @@ impl SwarmHandle {
 
 ```
 daemon/network/: connection.rs, handshake.rs, addr.rs
-syncback-core/messages/: HandshakeMsg, build_handshake, verify_handshake
-syncback-core/messages/: PeerDiscoveryRequestMsg, PeerDiscoveryResponseMsg (заменяет DHT)
-syncback-core/types/: NodeId
-syncback-core/constants/: ALPN
+viaticum-core/messages/: HandshakeMsg, build_handshake, verify_handshake
+viaticum-core/messages/: PeerDiscoveryRequestMsg, PeerDiscoveryResponseMsg (заменяет DHT)
+viaticum-core/types/: NodeId
+viaticum-core/constants/: ALPN
 ```
 
 ### Переписываем (10+ файлов)
@@ -478,10 +478,10 @@ daemon/restore/mod.rs      -- SwarmHandle
 daemon/cluster_sync/mod.rs -- SwarmHandle
 daemon/dr/mod.rs           -- полная переработка
 
-syncback-core/types/mod.rs    -- DeviceId: [u8;16] -> [u8;32], PeerRecord keyed by DeviceId
-syncback-core/messages/mod.rs -- PeerAnnounceMsg без node_id, убрать PeerDiscovery*
-syncback-core/cluster/        -- DeviceCertificate: device_id + device_pub_key -> одно поле
-syncback-core/trust/          -- двухуровневый trust (device + master)
+viaticum-core/types/mod.rs    -- DeviceId: [u8;16] -> [u8;32], PeerRecord keyed by DeviceId
+viaticum-core/messages/mod.rs -- PeerAnnounceMsg без node_id, убрать PeerDiscovery*
+viaticum-core/cluster/        -- DeviceCertificate: device_id + device_pub_key -> одно поле
+viaticum-core/trust/          -- двухуровневый trust (device + master)
 ```
 
 ### Тесты (~150 из ~895)
@@ -500,7 +500,7 @@ cluster/tests.rs      -- DeviceCertificate
 ### Не трогаем
 
 ```
-syncback-core/: pos/, escrow/, placement/, budget/, erasure/, db/, config/
+viaticum-core/: pos/, escrow/, placement/, budget/, erasure/, db/, config/
 daemon/: relay/ (board), backup/ (только send сигнатура), scheduler/, watcher/, identity/
 ```
 
@@ -531,7 +531,7 @@ Relay включён у всех по умолчанию, не настраив�
 ### Фаза 1: Скелет libp2p
 
 - `libp2p = "0.56"` в Cargo.toml
-- SwarmHandle, SyncBackCodec, SyncBackBehaviour
+- SwarmHandle, ViaticumCodec, ViaticumBehaviour
 - DeviceCertExchange (первый r-r после connect)
 - PendingCert state machine
 - Статический peer directory для тестирования без DHT
@@ -539,7 +539,7 @@ Relay включён у всех по умолчанию, не настраив�
 
 ### Фаза 1.5: Двухуровневый trust (core, без сети)
 
-- device_trust, master_trust, effective_trust в syncback-core
+- device_trust, master_trust, effective_trust в viaticum-core
 - DeviceId [u8;32], обновлённый DeviceCertificate
 - Тесты trust
 - Обновить `docs/logic.md` (алгоритм trust меняется)
@@ -589,7 +589,7 @@ Relay включён у всех по умолчанию, не настраив�
 
 2. **INHERITANCE_FACTOR (0.3-0.5).** Определить экспериментально. Слишком высокий -- sybil, слишком низкий -- медленный старт.
 
-3. **Переход на свой DHT namespace.** При ~100+ SyncBack нод перейти на `/syncback/kad/1.0.0` + свои bootstrap. Одна строка в конфиге.
+3. **Переход на свой DHT namespace.** При ~100+ Viaticum нод перейти на `/viaticum/kad/1.0.0` + свои bootstrap. Одна строка в конфиге.
 
 ---
 

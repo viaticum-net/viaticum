@@ -7,7 +7,7 @@
 //
 // Scenarios:
 //   1. K=761,  T=65528 — ~50 MB batch  (matches user's "50 MB" intent)
-//   2. K=4096, T=65528 — ~256 MB batch (main syncback scenario)
+//   2. K=4096, T=65528 — ~256 MB batch (main viaticum scenario)
 //   3. K=32000, T=65528 — ~1.95 GB     (large file scenario, ~2 GB intent)
 
 use raptorq::{Decoder, Encoder, ObjectTransmissionInformation};
@@ -167,7 +167,7 @@ fn bench_streaming(k: usize) {
     let block_encoders = encoder.get_block_encoders();
 
     // Generate 100 individual repair symbols by ESI (streaming scenario).
-    // In syncback: each holder gets one unique repair symbol (different ESI).
+    // In viaticum: each holder gets one unique repair symbol (different ESI).
     let num_to_gen = 100usize;
     let t0 = Instant::now();
     for block_enc in block_encoders {
@@ -279,7 +279,7 @@ fn main() {
     results.push(run_bench("50MB batch (K=761)", 761));
     println!();
 
-    // Scenario 2: 256 MB, K=4096 — main syncback scenario
+    // Scenario 2: 256 MB, K=4096 — main viaticum scenario
     // 4096 * 65528 = 268,402,688 bytes = 256.0 MB
     println!("[2/3] 256 MB batch  (K=4096, T={})", T);
     results.push(run_bench("256MB unit (K=4096)", 4096));

@@ -1,0 +1,71 @@
+[package]
+name = "viaticum"
+description = "Viaticum daemon and CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+viaticum-core = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+blake3 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+zstd = { workspace = true }
+ciborium = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+rand_core = { version = "0.6", features = ["getrandom"] }
+async-trait = { workspace = true }
+libp2p = { workspace = true }
+futures = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+thiserror = { workspace = true }
+bip39 = { workspace = true }
+notify = { workspace = true }
+ignore = { workspace = true }
+libc = { workspace = true }
+reqwest = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+toml_edit = "0.22"
+arc-swap = "1"
+base64 = "0.22"
+sysinfo = { version = "0.39", default-features = false, features = ["disk"] }
+dirs = "6"
+urlencoding = "2"
+rust-embed = { version = "8", features = ["mime-guess"] }
+mime_guess = "2"
+cap-std = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
+[[bin]]
+name = "viaticum"
+path = "src/main.rs"
+
+[[bin]]
+name = "bootstrap-trust"
+path = "src/bin/bootstrap_trust.rs"
+
+[dev-dependencies]
+viaticum-core = { workspace = true, features = ["testutil"] }
+tempfile = { workspace = true }
+tower = "0.5"

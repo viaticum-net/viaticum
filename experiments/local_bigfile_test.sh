@@ -1,5 +1,5 @@
 #!/bin/bash
-# SyncBack big-file stress test: realistic file sizes (10-100 MB).
+# Viaticum big-file stress test: realistic file sizes (10-100 MB).
 # Monitors RAM and disk usage per node during backup.
 #
 # Usage:
@@ -17,8 +17,8 @@ set -euo pipefail
 
 NUM_NODES=5
 TIME_SCALE=100
-TEST_DIR="/tmp/syncback-bigfile-$$"
-BINARY="${BINARY:-syncback}"
+TEST_DIR="/tmp/viaticum-bigfile-$$"
+BINARY="${BINARY:-viaticum}"
 
 PASS=0; FAIL=0
 PIDS=()
@@ -96,15 +96,15 @@ measure_all() {
 
 # Verify binary
 if ! command -v "$BINARY" &>/dev/null; then
-    BINARY="./target/release/syncback"
+    BINARY="./target/release/viaticum"
     if [ ! -x "$BINARY" ]; then
-        echo "ERROR: syncback binary not found"
+        echo "ERROR: viaticum binary not found"
         exit 1
     fi
 fi
 
 echo "============================================================"
-echo "  SyncBack Big File Test (${NUM_NODES} nodes)"
+echo "  Viaticum Big File Test (${NUM_NODES} nodes)"
 echo "  Binary: $BINARY"
 echo "  Test dir: $TEST_DIR"
 echo "============================================================"

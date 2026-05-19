@@ -1,5 +1,5 @@
 #!/bin/bash
-# SyncBack network resilience E2E test
+# Viaticum network resilience E2E test
 # Tests NET-09 (backoff reconnection), NET-14 (graceful shutdown)
 #
 # Usage:
@@ -16,8 +16,8 @@ set -euo pipefail
 
 NUM_NODES=3
 TIME_SCALE=1000
-TEST_DIR="/tmp/syncback-net-$$"
-BINARY="${BINARY:-syncback}"
+TEST_DIR="/tmp/viaticum-net-$$"
+BINARY="${BINARY:-viaticum}"
 
 PASS=0; FAIL=0; SKIP=0
 PIDS=()
@@ -90,15 +90,15 @@ start_node() {
 
 # Verify binary exists
 if ! command -v "$BINARY" &>/dev/null; then
-    BINARY="./target/release/syncback"
+    BINARY="./target/release/viaticum"
     if [ ! -x "$BINARY" ]; then
-        echo "ERROR: syncback binary not found. Run: cargo build --release"
+        echo "ERROR: viaticum binary not found. Run: cargo build --release"
         exit 1
     fi
 fi
 
 echo "============================================================"
-echo "  SyncBack Network Resilience Test (${NUM_NODES} nodes)"
+echo "  Viaticum Network Resilience Test (${NUM_NODES} nodes)"
 echo "  Binary: $BINARY"
 echo "  Test dir: $TEST_DIR"
 echo "============================================================"

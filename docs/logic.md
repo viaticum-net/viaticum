@@ -1,6 +1,6 @@
-# SyncBack Logic
+# Viaticum Logic
 
-All algorithms and formulas in one place. Constants are in `syncback-core::constants`.
+All algorithms and formulas in one place. Constants are in `viaticum-core::constants`.
 
 ## Trust
 
@@ -139,7 +139,7 @@ remaining_budget  = restore_budget_gb - already_restored_gb
 
 Where `stored_gb_days` is the cumulative GB·day contribution the owner earned by hosting symbols for other peers (integrated over time since each placement was `received_at`).
 
-**Constants:** `DEFAULT_ESCROW_K_FACTOR = 7.0` (i.e. store 1 GB for 7 days → earn 1 GB of restore credit). See `syncback-core/src/constants.rs`.
+**Constants:** `DEFAULT_ESCROW_K_FACTOR = 7.0` (i.e. store 1 GB for 7 days → earn 1 GB of restore credit). See `viaticum-core/src/constants.rs`.
 
 **Example:** hold 100 GB for 14 days → `stored_gb_days = 1400`, budget = `1400 / 7 = 200 GB`. After restoring 50 GB, `remaining_budget = 150 GB`.
 
@@ -210,7 +210,7 @@ Files queue in packing queues (one per watched directory).
 | Size | Queue >= source_block_size (128 MB default) | No (natural) |
 | Idle | No new events for 1 hour (FLUSH_IDLE_SECS) | Yes (flush any size >= MIN_BATCH) |
 | Fallback | 24 hours since last flush (FLUSH_FALLBACK_SECS) | Yes |
-| Manual | `syncback backup` CLI command | Yes |
+| Manual | `viaticum backup` CLI command | Yes |
 
 MIN_BATCH_BYTES = 1 MB. Force=true flushes any queue >= 1 MB regardless of source_block_size.
 
@@ -262,10 +262,10 @@ One identity (seed phrase) across multiple devices.
 ```
 BIP39 mnemonic (24 words)
   -> seed (HKDF-SHA256)
-    -> master_key (HKDF, domain "syncback-master")
-      -> device_key (HKDF, domain "syncback-device-{label}")
+    -> master_key (HKDF, domain "viaticum-master")
+      -> device_key (HKDF, domain "viaticum-device-{label}")
         -> device_id = BLAKE3(identity_pub + label)
-      -> epoch_key (HKDF, domain "syncback-epoch-{counter}")
+      -> epoch_key (HKDF, domain "viaticum-epoch-{counter}")
         -> file encryption keys
 
 ```

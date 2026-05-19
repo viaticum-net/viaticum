@@ -1,5 +1,5 @@
 """
-SyncBack Experiment 21: Adaptive Shard Count
+Viaticum Experiment 21: Adaptive Shard Count
 
 Question: Does adapting the erasure coding shard count (n in k-of-n) based on
 partner trust levels improve file survival rates while reducing storage overhead,
@@ -782,7 +782,7 @@ def _fmt_bootstrap(bw: float) -> str:
 
 
 def print_results(all_results: list[tuple[ScenarioCfg, list[dict]]]) -> None:
-    print("=== SYNCBACK EXPERIMENT 21: ADAPTIVE SHARD COUNT ===")
+    print("=== VIATICUM EXPERIMENT 21: ADAPTIVE SHARD COUNT ===")
     print()
 
     for sc_idx, (scenario, snaps) in enumerate(all_results, 1):
@@ -893,7 +893,7 @@ def save_results(results: list[tuple[ScenarioCfg, list[dict]]], out_dir: Path) -
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack Experiment 21: Adaptive Shard Count"
+        description="Viaticum Experiment 21: Adaptive Shard Count"
     )
     parser.add_argument("--seeds", type=int, default=10,
                         help="Monte Carlo seeds per scenario (default: 10)")
@@ -903,7 +903,7 @@ def main() -> None:
                         help="Output directory for JSON results")
     args = parser.parse_args()
 
-    print("=== SYNCBACK EXPERIMENT 21: ADAPTIVE SHARD COUNT ===")
+    print("=== VIATICUM EXPERIMENT 21: ADAPTIVE SHARD COUNT ===")
     print(f"Seeds: {args.seeds}, Jobs: {args.jobs}")
     print(
         f"Network: max={_MAX_ACTIVE} nodes, {_N_YEARS} years, "

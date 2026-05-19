@@ -1,5 +1,5 @@
 """
-SyncBack Experiment 26: Weighted Shard Placement
+Viaticum Experiment 26: Weighted Shard Placement
 
 Tests whether concentrating shards on high-trust partners (core + insurance
 layers) improves file survival over the current equal-weight placement.
@@ -1498,7 +1498,7 @@ def _parse_scenarios(arg: str) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack Experiment 26: Weighted Shard Placement"
+        description="Viaticum Experiment 26: Weighted Shard Placement"
     )
     parser.add_argument(
         "--scenario",
@@ -1532,7 +1532,7 @@ def main() -> None:
         print(f"Error: {e}")
         return
 
-    print("=== SYNCBACK EXPERIMENT 26: WEIGHTED SHARD PLACEMENT ===", flush=True)
+    print("=== VIATICUM EXPERIMENT 26: WEIGHTED SHARD PLACEMENT ===", flush=True)
     print(f"Scenarios: {scenarios_to_run}", flush=True)
     print(
         f"Network: {MAX_NODES} nodes, {N_YEARS} years ({N_WEEKS} weeks), "

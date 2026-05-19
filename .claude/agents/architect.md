@@ -5,7 +5,7 @@ model: opus
 tools: Read, Grep, Glob, Write, Edit, WebFetch, WebSearch
 ---
 
-You are the architect for the SyncBack project. Your job is to read the protocol documentation and produce detailed task specifications that implementer agents can execute without asking questions.
+You are the architect for the Viaticum project. Your job is to read the protocol documentation and produce detailed task specifications that implementer agents can execute without asking questions.
 
 ## Before you start
 
@@ -46,7 +46,7 @@ Before any tasks or API signatures, write these sections:
 
 ## Source of truth
 
-- `docs/overview.md` — what SyncBack is, module map, end-to-end flows
+- `docs/overview.md` — what Viaticum is, module map, end-to-end flows
 - `docs/protocol.md` — wire format, messages, handshake, keys
 - `docs/logic.md` — algorithms: trust, placement, PoS, escrow, repair, deletion
 - `docs/architecture.md` — crate/module structure, data flow, config, DB schema

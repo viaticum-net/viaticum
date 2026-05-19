@@ -74,7 +74,7 @@ def compose(*args, timeout=120):
     )
 
 def node_status(name: str) -> dict:
-    raw = exec_node(name, "syncback", "status", "--json")
+    raw = exec_node(name, "viaticum", "status", "--json")
     return json.loads(raw)
 
 def node_status_safe(name: str) -> dict | None:
@@ -204,7 +204,7 @@ def phase_init(nodes: list[dict], dc: DataCollector):
     print("\n=== Phase: Init ===")
     for n in nodes:
         try:
-            exec_node(n["name"], "syncback", "init")
+            exec_node(n["name"], "viaticum", "init")
             print(f"  {n['name']} ({n['archetype']}): init ok")
         except RuntimeError as e:
             if "already initialized" in str(e):
@@ -231,7 +231,7 @@ enable_relay = false
 kademlia_disable_ipfs_bootstrap = true
 """
         exec_node(n["name"], "sh", "-c",
-                  f"cat > /home/syncback/.syncback/config.toml << 'EOFCFG'\n{config}EOFCFG")
+                  f"cat > /home/viaticum/.viaticum/config.toml << 'EOFCFG'\n{config}EOFCFG")
     print(f"  config written to {len(nodes)} nodes")
     dc.event("config_complete", details=f"{len(nodes)} configs written")
 
@@ -241,7 +241,7 @@ def phase_start_daemons(nodes: list[dict], time_scale: int, dc: DataCollector):
     print(f"\n=== Phase: Start daemons (time_scale={time_scale}) ===")
     for n in nodes:
         exec_node_bg(n["name"], "sh", "-c",
-                     f"RUST_LOG=info syncback daemon --time-scale {time_scale} --watch-dir /data/files "
+                     f"RUST_LOG=info viaticum daemon --time-scale {time_scale} --watch-dir /data/files "
                      f">/tmp/daemon.log 2>&1")
     # Wait for all to be ready
     time.sleep(8)
@@ -285,7 +285,7 @@ def phase_connect_mesh(nodes: list[dict], dc: DataCollector):
         if not dst_addr:
             return False
         try:
-            exec_node(src_name, "syncback", "connect", dst_addr, timeout=15)
+            exec_node(src_name, "viaticum", "connect", dst_addr, timeout=15)
             connected_pairs.add(pair)
             return True
         except Exception:
@@ -467,7 +467,7 @@ def phase_behavior_loop(nodes: list[dict], duration_secs: int, time_scale: int,
                 if state[name]:
                     try:
                         exec_node(name, "sh", "-c",
-                                  "killall syncback 2>/dev/null || true")
+                                  "killall viaticum 2>/dev/null || true")
                     except Exception:
                         pass
                     state[name] = False
@@ -477,7 +477,7 @@ def phase_behavior_loop(nodes: list[dict], duration_secs: int, time_scale: int,
                              details=f"off for {off_time:.0f}s")
                 else:
                     exec_node_bg(name, "sh", "-c",
-                                 f"RUST_LOG=info syncback daemon --time-scale {time_scale} "
+                                 f"RUST_LOG=info viaticum daemon --time-scale {time_scale} "
                                  f"--watch-dir /data/files >>/tmp/daemon.log 2>&1")
                     state[name] = True
                     on_time = n.get("on_secs", 180) + random.uniform(-30, 30)
@@ -525,7 +525,7 @@ def _reconnect_flaky(name: str, nodes: list[dict]):
         try:
             addr = node_addr(t["name"])
             if addr:
-                exec_node(name, "syncback", "connect", addr, timeout=10)
+                exec_node(name, "viaticum", "connect", addr, timeout=10)
         except Exception:
             pass
 
@@ -788,9 +788,9 @@ def main():
         print(f"  {arch}: {count} nodes")
 
     if args.build:
-        print("\n=== Building syncback binary ===")
+        print("\n=== Building viaticum binary ===")
         r = subprocess.run(
-            ["cargo", "build", "--release", "-p", "syncback"],
+            ["cargo", "build", "--release", "-p", "viaticum"],
             cwd=PROJECT_DIR, timeout=600,
         )
         if r.returncode != 0:
@@ -802,7 +802,7 @@ def main():
             sys.exit(1)
 
     # Verify binary exists
-    binary = os.path.join(PROJECT_DIR, "target", "release", "syncback")
+    binary = os.path.join(PROJECT_DIR, "target", "release", "viaticum")
     if not os.path.isfile(binary):
         print(f"ERROR: {binary} not found. Run with --build first.")
         sys.exit(1)

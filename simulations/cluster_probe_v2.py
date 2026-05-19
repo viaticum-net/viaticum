@@ -660,7 +660,7 @@ def _print_partner_diversity(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Cluster/federation analysis of the FINAL SyncBack trust model."
+        description="Cluster/federation analysis of the FINAL Viaticum trust model."
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--years", type=int, default=10)

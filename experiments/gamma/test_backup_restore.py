@@ -58,7 +58,7 @@ def compose(*args, timeout=120):
 
 
 def node_status(name):
-    raw = exec_node(name, "syncback", "status", "--json")
+    raw = exec_node(name, "viaticum", "status", "--json")
     return json.loads(raw)
 
 
@@ -76,7 +76,7 @@ def node_addr(name):
 
 def node_files(name):
     """Get list of backed-up files via CLI."""
-    raw = exec_node(name, "syncback", "files")
+    raw = exec_node(name, "viaticum", "files")
     return raw
 
 
@@ -155,7 +155,7 @@ def main():
         print("Phase 1: Init all nodes")
         for name in nodes:
             try:
-                exec_node(name, "syncback", "init")
+                exec_node(name, "viaticum", "init")
             except RuntimeError as e:
                 if "already initialized" not in str(e):
                     raise
@@ -175,14 +175,14 @@ disk_reserve_gb = 0.0
 enable_relay = false
 """
             exec_node(name, "sh", "-c",
-                      f"cat > /home/syncback/.syncback/config.toml << 'EOFCFG'\n{config}EOFCFG")
+                      f"cat > /home/viaticum/.viaticum/config.toml << 'EOFCFG'\n{config}EOFCFG")
         print(f"  Config written (block_size=1MB, quota=100MB)\n")
 
         # ── Phase 3: Start daemons ───────────────────────────────────────
         print(f"Phase 3: Start daemons (time_scale={ts})")
         for name in nodes:
             exec_node_bg(name, "sh", "-c",
-                         f"RUST_LOG=info syncback daemon --time-scale {ts} "
+                         f"RUST_LOG=info viaticum daemon --time-scale {ts} "
                          f"--watch-dir /data/files >/tmp/daemon.log 2>&1")
         time.sleep(8)
 
@@ -208,7 +208,7 @@ enable_relay = false
             pair = tuple(sorted([nodes[i], nodes[j]]))
             if pair not in connected:
                 try:
-                    exec_node(nodes[i], "syncback", "connect", addrs[nodes[j]], timeout=15)
+                    exec_node(nodes[i], "viaticum", "connect", addrs[nodes[j]], timeout=15)
                     connected.add(pair)
                 except Exception:
                     pass
@@ -300,7 +300,7 @@ enable_relay = false
         restored_file = f"{early_restore_dir}/{src_path.lstrip('/')}"
 
         try:
-            exec_node(backup_node, "syncback", "restore", src_path,
+            exec_node(backup_node, "viaticum", "restore", src_path,
                       "--dest", early_restore_dir, timeout=30)
         except Exception:
             pass
@@ -341,7 +341,7 @@ enable_relay = false
             src_path = f"/data/files/{fname}"
             restored_file = f"{restore_dir}/{src_path.lstrip('/')}"
             try:
-                out = exec_node(backup_node, "syncback", "restore", src_path,
+                out = exec_node(backup_node, "viaticum", "restore", src_path,
                                 "--dest", restore_dir, timeout=60)
                 print(f"  restore {fname}: {out}")
 
@@ -389,7 +389,7 @@ enable_relay = false
         # ── Phase 12: Negative restore (nonexistent file) ────────────
         print("Phase 12: Negative test — restore nonexistent file")
         try:
-            out = exec_node(backup_node, "syncback", "restore",
+            out = exec_node(backup_node, "viaticum", "restore",
                             "/data/files/does_not_exist.txt",
                             "--dest", "/tmp/neg_restore", timeout=30)
             # CLI may return 0 even for unknown files (known issue).

@@ -19,7 +19,7 @@ You merge implemented modules into the main branch and verify everything works t
    b. `cargo test` — all tests pass
    c. `cargo clippy -- -D warnings` — clean
 4. Verify testing gate if completing a phase:
-   - Phase 1: cross-module integration tests in syncback-core exist and pass
+   - Phase 1: cross-module integration tests in viaticum-core exist and pass
    - Phase 2: 10 iroh integration scenarios pass
    - Phase 3: smoke tests pass
 

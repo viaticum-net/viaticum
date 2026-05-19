@@ -1,5 +1,5 @@
 #!/bin/bash
-# SyncBack scale test: 10-20 nodes with node archetypes
+# Viaticum scale test: 10-20 nodes with node archetypes
 # Tests system behavior under realistic conditions:
 #   - Reliable nodes (always on)
 #   - Unreliable nodes (killed and restarted)
@@ -13,8 +13,8 @@ set -euo pipefail
 
 NUM_NODES=${1:-10}
 TIME_SCALE=1000
-TEST_DIR="/tmp/syncback-scale-$$"
-BINARY="${BINARY:-syncback}"
+TEST_DIR="/tmp/viaticum-scale-$$"
+BINARY="${BINARY:-viaticum}"
 NUM_FILES=5
 
 PASS=0; FAIL=0; SKIP=0
@@ -73,12 +73,12 @@ get_json_field() {
 }
 
 if ! command -v "$BINARY" &>/dev/null; then
-    BINARY="./target/release/syncback"
+    BINARY="./target/release/viaticum"
     [ ! -x "$BINARY" ] && echo "ERROR: binary not found" && exit 1
 fi
 
 echo "============================================================"
-echo "  SyncBack Scale Test (${NUM_NODES} nodes, ${NUM_FILES} files)"
+echo "  Viaticum Scale Test (${NUM_NODES} nodes, ${NUM_FILES} files)"
 echo "============================================================"
 
 # ── PHASE 1: SETUP ──────────────────────────────────────────────

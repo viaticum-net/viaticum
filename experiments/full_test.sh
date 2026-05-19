@@ -15,7 +15,7 @@ skip() { echo "  SKIP: $1"; ((SKIP++)); }
 sock_cmd() {
     local NODE="$1"
     local JSON="$2"
-    echo "$JSON" | docker exec -i "syncback-$NODE" socat - UNIX-CONNECT:/home/syncback/.syncback/syncback.sock 2>/dev/null
+    echo "$JSON" | docker exec -i "viaticum-$NODE" socat - UNIX-CONNECT:/home/viaticum/.viaticum/viaticum.sock 2>/dev/null
 }
 
 get_node_addr() {
@@ -27,18 +27,18 @@ get_node_addr() {
 
 get_status_field() {
     # $1 = node, $2 = field name
-    docker exec "syncback-$1" syncback status 2>&1 | grep "$2" | awk '{print $NF}'
+    docker exec "viaticum-$1" viaticum status 2>&1 | grep "$2" | awk '{print $NF}'
 }
 
 connect_peer() {
     local NODE="$1"
     local ADDR="$2"
     python3 -c "import json,sys; print(json.dumps({'cmd':'connect_peer','node_addr':sys.argv[1]}))" "$ADDR" \
-        | docker exec -i "syncback-$NODE" socat - UNIX-CONNECT:/home/syncback/.syncback/syncback.sock 2>/dev/null
+        | docker exec -i "viaticum-$NODE" socat - UNIX-CONNECT:/home/viaticum/.viaticum/viaticum.sock 2>/dev/null
 }
 
 echo "============================================================"
-echo "  SyncBack Full E2E Test"
+echo "  Viaticum Full E2E Test"
 echo "============================================================"
 echo ""
 
@@ -52,18 +52,18 @@ $COMPOSE up -d 2>&1 | tail -1
 sleep 2
 
 echo "Initializing nodes..."
-docker exec syncback-node-a syncback init --mnemonic "cram muscle milk good case boil silver edge cram muscle milk good case boil silver edge cram muscle milk good case boil silver double" 2>/dev/null
-docker exec syncback-node-b syncback init --mnemonic "creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke knock" 2>/dev/null
-docker exec syncback-node-c syncback init --mnemonic "crouch payment artist half drive borrow speak make crouch payment artist half drive borrow speak make crouch payment artist half drive borrow speak off" 2>/dev/null
-docker exec syncback-node-d syncback init --mnemonic "cry predict essence heavy fashion once state pluck cry predict essence heavy fashion once state pluck cry predict essence heavy fashion once state rent" 2>/dev/null
-docker exec syncback-node-e syncback init --mnemonic "curtain random mirror hockey gloom brand sugar short curtain random mirror hockey gloom brand sugar short curtain random mirror hockey gloom brand sugar session" 2>/dev/null
+docker exec viaticum-node-a viaticum init --mnemonic "cram muscle milk good case boil silver edge cram muscle milk good case boil silver edge cram muscle milk good case boil silver double" 2>/dev/null
+docker exec viaticum-node-b viaticum init --mnemonic "creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke knock" 2>/dev/null
+docker exec viaticum-node-c viaticum init --mnemonic "crouch payment artist half drive borrow speak make crouch payment artist half drive borrow speak make crouch payment artist half drive borrow speak off" 2>/dev/null
+docker exec viaticum-node-d viaticum init --mnemonic "cry predict essence heavy fashion once state pluck cry predict essence heavy fashion once state pluck cry predict essence heavy fashion once state rent" 2>/dev/null
+docker exec viaticum-node-e viaticum init --mnemonic "curtain random mirror hockey gloom brand sugar short curtain random mirror hockey gloom brand sugar short curtain random mirror hockey gloom brand sugar session" 2>/dev/null
 
 echo "Starting daemons (time_scale=86400: 1 real sec = 1 virtual day)..."
 # All nodes: time_scale=86400 (1 real sec = 1 virtual day).
 # quota-gb is u64 so minimum is 1 GB.
-docker exec -d syncback-node-a sh -c 'syncback daemon --quota-gb 1 --include "/data/files:0.9" --time-scale 86400 2>/tmp/daemon.log'
+docker exec -d viaticum-node-a sh -c 'viaticum daemon --quota-gb 1 --include "/data/files:0.9" --time-scale 86400 2>/tmp/daemon.log'
 for node in node-b node-c node-d node-e; do
-    docker exec -d syncback-$node sh -c 'syncback daemon --quota-gb 10 --time-scale 86400 2>/tmp/daemon.log'
+    docker exec -d viaticum-$node sh -c 'viaticum daemon --quota-gb 10 --time-scale 86400 2>/tmp/daemon.log'
 done
 sleep 3
 
@@ -89,15 +89,15 @@ echo ""
 echo "=== Test 1: Backup small files ==="
 
 # Create 5 files with known content
-docker exec syncback-node-a sh -c 'echo "file_one_content_12345" > /data/files/test_1.txt'
-docker exec syncback-node-a sh -c 'echo "file_two_content_67890" > /data/files/test_2.txt'
-docker exec syncback-node-a sh -c 'dd if=/dev/urandom bs=1024 count=10 2>/dev/null > /data/files/test_3.bin'
-docker exec syncback-node-a sh -c 'dd if=/dev/urandom bs=1024 count=10 2>/dev/null > /data/files/test_4.bin'
-docker exec syncback-node-a sh -c 'dd if=/dev/urandom bs=1024 count=10 2>/dev/null > /data/files/test_5.bin'
+docker exec viaticum-node-a sh -c 'echo "file_one_content_12345" > /data/files/test_1.txt'
+docker exec viaticum-node-a sh -c 'echo "file_two_content_67890" > /data/files/test_2.txt'
+docker exec viaticum-node-a sh -c 'dd if=/dev/urandom bs=1024 count=10 2>/dev/null > /data/files/test_3.bin'
+docker exec viaticum-node-a sh -c 'dd if=/dev/urandom bs=1024 count=10 2>/dev/null > /data/files/test_4.bin'
+docker exec viaticum-node-a sh -c 'dd if=/dev/urandom bs=1024 count=10 2>/dev/null > /data/files/test_5.bin'
 
 # Save hashes for later comparison
-HASH1=$(docker exec syncback-node-a md5sum /data/files/test_1.txt | awk '{print $1}')
-HASH3=$(docker exec syncback-node-a md5sum /data/files/test_3.bin | awk '{print $1}')
+HASH1=$(docker exec viaticum-node-a md5sum /data/files/test_1.txt | awk '{print $1}')
+HASH3=$(docker exec viaticum-node-a md5sum /data/files/test_3.bin | awk '{print $1}')
 
 echo "Waiting for watcher debounce (30s)..."
 for i in $(seq 1 12); do
@@ -110,7 +110,7 @@ for i in $(seq 1 12); do
 done
 
 echo "Triggering backup..."
-docker exec syncback-node-a syncback backup 2>&1
+docker exec viaticum-node-a viaticum backup 2>&1
 
 # Poll for shards placed
 for i in $(seq 1 12); do
@@ -148,27 +148,27 @@ echo ""
 echo "=== Test 3: Restore file from multiple peers ==="
 
 # Save hash of test_3.bin before deleting
-HASH3_BEFORE=$(docker exec syncback-node-a md5sum /data/files/test_3.bin | awk '{print $1}')
+HASH3_BEFORE=$(docker exec viaticum-node-a md5sum /data/files/test_3.bin | awk '{print $1}')
 
 # Delete original files
-docker exec syncback-node-a sh -c 'rm -f /data/files/test_1.txt /data/files/test_3.bin'
+docker exec viaticum-node-a sh -c 'rm -f /data/files/test_1.txt /data/files/test_3.bin'
 
 # Restore test_1.txt (text file)
 echo "  Restoring /data/files/test_1.txt..."
-docker exec syncback-node-a syncback restore /data/files/test_1.txt 2>&1 || true
+docker exec viaticum-node-a viaticum restore /data/files/test_1.txt 2>&1 || true
 
 # Poll until file appears (async restore)
 RESTORED=false
 for i in $(seq 1 20); do
     sleep 2
-    if docker exec syncback-node-a test -f /data/files/test_1.txt 2>/dev/null; then
+    if docker exec viaticum-node-a test -f /data/files/test_1.txt 2>/dev/null; then
         RESTORED=true
         break
     fi
 done
 
 if $RESTORED; then
-    HASH1_AFTER=$(docker exec syncback-node-a md5sum /data/files/test_1.txt 2>/dev/null | awk '{print $1}')
+    HASH1_AFTER=$(docker exec viaticum-node-a md5sum /data/files/test_1.txt 2>/dev/null | awk '{print $1}')
     if [ "$HASH1" = "$HASH1_AFTER" ]; then
         pass "test_1.txt restored with correct content"
     else
@@ -178,24 +178,24 @@ else
     fail "test_1.txt did not appear after 40s"
     # Dump restore-related logs
     echo "  --- Node A restore log ---"
-    docker exec syncback-node-a cat /tmp/daemon.log 2>/dev/null | grep -iE 'restore|shard_data|denied|escrow' | tail -10
+    docker exec viaticum-node-a cat /tmp/daemon.log 2>/dev/null | grep -iE 'restore|shard_data|denied|escrow' | tail -10
 fi
 
 # Restore test_3.bin (binary file)
 echo "  Restoring /data/files/test_3.bin..."
-docker exec syncback-node-a syncback restore /data/files/test_3.bin 2>&1 || true
+docker exec viaticum-node-a viaticum restore /data/files/test_3.bin 2>&1 || true
 
 RESTORED=false
 for i in $(seq 1 20); do
     sleep 2
-    if docker exec syncback-node-a test -f /data/files/test_3.bin 2>/dev/null; then
+    if docker exec viaticum-node-a test -f /data/files/test_3.bin 2>/dev/null; then
         RESTORED=true
         break
     fi
 done
 
 if $RESTORED; then
-    HASH3_AFTER=$(docker exec syncback-node-a md5sum /data/files/test_3.bin 2>/dev/null | awk '{print $1}')
+    HASH3_AFTER=$(docker exec viaticum-node-a md5sum /data/files/test_3.bin 2>/dev/null | awk '{print $1}')
     if [ "$HASH3_BEFORE" = "$HASH3_AFTER" ]; then
         pass "test_3.bin restored with correct content"
     else
@@ -204,7 +204,7 @@ if $RESTORED; then
 else
     fail "test_3.bin did not appear after 40s"
     echo "  --- Node A restore log ---"
-    docker exec syncback-node-a cat /tmp/daemon.log 2>/dev/null | grep -iE 'restore|shard_data|denied|escrow' | tail -10
+    docker exec viaticum-node-a cat /tmp/daemon.log 2>/dev/null | grep -iE 'restore|shard_data|denied|escrow' | tail -10
 fi
 
 # ============================================================
@@ -216,8 +216,8 @@ echo "=== Test 4: File modification and re-backup ==="
 PLACED_BEFORE=$PLACED
 
 # Modify test_2.txt
-docker exec syncback-node-a sh -c 'echo "modified_content_99999" > /data/files/test_2.txt'
-HASH2_NEW=$(docker exec syncback-node-a md5sum /data/files/test_2.txt | awk '{print $1}')
+docker exec viaticum-node-a sh -c 'echo "modified_content_99999" > /data/files/test_2.txt'
+HASH2_NEW=$(docker exec viaticum-node-a md5sum /data/files/test_2.txt | awk '{print $1}')
 
 echo "  Waiting for watcher to detect modification (30s)..."
 for i in $(seq 1 12); do
@@ -236,7 +236,7 @@ else
 fi
 
 echo "  Triggering re-backup..."
-docker exec syncback-node-a syncback backup 2>&1
+docker exec viaticum-node-a viaticum backup 2>&1
 
 sleep 10
 
@@ -249,21 +249,21 @@ else
 fi
 
 # Restore modified file and verify new content
-docker exec syncback-node-a sh -c 'rm -f /data/files/test_2.txt'
+docker exec viaticum-node-a sh -c 'rm -f /data/files/test_2.txt'
 echo "  Restoring modified test_2.txt..."
-docker exec syncback-node-a syncback restore /data/files/test_2.txt 2>&1 || true
+docker exec viaticum-node-a viaticum restore /data/files/test_2.txt 2>&1 || true
 
 RESTORED=false
 for i in $(seq 1 20); do
     sleep 2
-    if docker exec syncback-node-a test -f /data/files/test_2.txt 2>/dev/null; then
+    if docker exec viaticum-node-a test -f /data/files/test_2.txt 2>/dev/null; then
         RESTORED=true
         break
     fi
 done
 
 if $RESTORED; then
-    HASH2_RESTORED=$(docker exec syncback-node-a md5sum /data/files/test_2.txt 2>/dev/null | awk '{print $1}')
+    HASH2_RESTORED=$(docker exec viaticum-node-a md5sum /data/files/test_2.txt 2>/dev/null | awk '{print $1}')
     if [ "$HASH2_NEW" = "$HASH2_RESTORED" ]; then
         pass "test_2.txt restored with NEW (modified) content"
     else
@@ -272,7 +272,7 @@ if $RESTORED; then
 else
     fail "test_2.txt did not appear after 40s"
     echo "  --- Node A restore log ---"
-    docker exec syncback-node-a cat /tmp/daemon.log 2>/dev/null | grep -iE 'restore|shard_data|denied|escrow' | tail -10
+    docker exec viaticum-node-a cat /tmp/daemon.log 2>/dev/null | grep -iE 'restore|shard_data|denied|escrow' | tail -10
 fi
 
 # ============================================================
@@ -286,12 +286,12 @@ echo "=== Test 5: Proof of Storage ==="
 # Check trust P values — should be > 0 if PoS passed.
 
 # Check node-A logs for PoS activity
-POS_CHALLENGES=$(docker exec syncback-node-a cat /tmp/daemon.log 2>/dev/null | grep -c "pos_challenge\|pos_response\|pos round\|pos_round" || true)
-POS_PASSES=$(docker exec syncback-node-a cat /tmp/daemon.log 2>/dev/null | grep -c "PoS pass\|pos.*pass\|verified" || true)
+POS_CHALLENGES=$(docker exec viaticum-node-a cat /tmp/daemon.log 2>/dev/null | grep -c "pos_challenge\|pos_response\|pos round\|pos_round" || true)
+POS_PASSES=$(docker exec viaticum-node-a cat /tmp/daemon.log 2>/dev/null | grep -c "PoS pass\|pos.*pass\|verified" || true)
 echo "  PoS log entries: challenges=$POS_CHALLENGES verifications=$POS_PASSES"
 
 # Check trust P values via peers command
-PEERS_OUTPUT=$(docker exec syncback-node-a syncback peers 2>&1)
+PEERS_OUTPUT=$(docker exec viaticum-node-a viaticum peers 2>&1)
 echo "  $PEERS_OUTPUT"
 
 # Parse P values — any peer with P > 0 means PoS passed
@@ -300,17 +300,17 @@ if [ "$P_NONZERO" -gt 0 ] 2>/dev/null; then
     pass "PoS verified: $P_NONZERO peers have trust P > 0"
 else
     # Check if PoS round actually fired
-    POS_FIRED=$(docker exec syncback-node-a cat /tmp/daemon.log 2>/dev/null | grep -c "pos round\|run_pos_round\|sample_pos" || true)
+    POS_FIRED=$(docker exec viaticum-node-a cat /tmp/daemon.log 2>/dev/null | grep -c "pos round\|run_pos_round\|sample_pos" || true)
     if [ "$POS_FIRED" -gt 0 ]; then
         fail "PoS rounds fired ($POS_FIRED) but no peer has P > 0"
-        docker exec syncback-node-a cat /tmp/daemon.log 2>/dev/null | grep -iE 'pos' | tail -10
+        docker exec viaticum-node-a cat /tmp/daemon.log 2>/dev/null | grep -iE 'pos' | tail -10
     else
         fail "PoS round never fired (time_scale issue?)"
     fi
 fi
 
 # Check holder side — did they receive challenges?
-POS_HOLDER=$(docker exec syncback-node-b cat /tmp/daemon.log 2>/dev/null | grep -c "pos_challenge\|answer_pos" || true)
+POS_HOLDER=$(docker exec viaticum-node-b cat /tmp/daemon.log 2>/dev/null | grep -c "pos_challenge\|answer_pos" || true)
 echo "  Node B PoS activity: $POS_HOLDER log entries"
 
 # ============================================================
@@ -325,10 +325,10 @@ echo "============================================================"
 if [ "$FAIL" -gt 0 ]; then
     echo ""
     echo "=== Node A daemon log (last 40 lines) ==="
-    docker exec syncback-node-a cat /tmp/daemon.log 2>/dev/null | grep -vE 'TRACE|cli_server.*request|cli_server.*response' | tail -40
+    docker exec viaticum-node-a cat /tmp/daemon.log 2>/dev/null | grep -vE 'TRACE|cli_server.*request|cli_server.*response' | tail -40
     echo ""
     echo "=== Node B daemon log (last 20 lines) ==="
-    docker exec syncback-node-b cat /tmp/daemon.log 2>/dev/null | grep -vE 'TRACE|cli_server' | tail -20
+    docker exec viaticum-node-b cat /tmp/daemon.log 2>/dev/null | grep -vE 'TRACE|cli_server' | tail -20
 fi
 
 echo ""

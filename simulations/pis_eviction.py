@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #23: Eviction Strategies
+Viaticum Simulation #23: Eviction Strategies
 
 Question: Does active partner eviction improve network quality, and what kind of
 eviction (economic/disk-pressure vs. threshold-based) works best?
@@ -904,7 +904,7 @@ def save_results(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack Experiment 23: Eviction Strategies"
+        description="Viaticum Experiment 23: Eviction Strategies"
     )
     parser.add_argument("--seeds", type=int, default=1,
                         help="Monte Carlo seeds per strategy (default: 1)")
@@ -918,7 +918,7 @@ def main() -> None:
                         help="Max active peers (default: 5000)")
     args = parser.parse_args()
 
-    print("=== SYNCBACK EXPERIMENT 23: EVICTION STRATEGIES ===\n")
+    print("=== VIATICUM EXPERIMENT 23: EVICTION STRATEGIES ===\n")
     print(
         f"Network: max={args.max_peers} nodes, {args.years} years, "
         f"25% annual churn, 6 archetypes"

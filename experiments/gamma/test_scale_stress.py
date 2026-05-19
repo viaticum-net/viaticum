@@ -82,7 +82,7 @@ def exec_node_bg(name, *args):
 
 
 def node_status(name):
-    raw = exec_node(name, "syncback", "status", "--json", timeout=15)
+    raw = exec_node(name, "viaticum", "status", "--json", timeout=15)
     return json.loads(raw)
 
 
@@ -261,7 +261,7 @@ def main():
         init_ok = 0
         for nd in nodes:
             try:
-                exec_node(nd.name, "syncback", "init")
+                exec_node(nd.name, "viaticum", "init")
                 init_ok += 1
             except RuntimeError as e:
                 if "already initialized" not in str(e):
@@ -274,7 +274,7 @@ def main():
         for nd in nodes:
             config = nd.config()
             exec_node(nd.name, "sh", "-c",
-                      f"cat > /home/syncback/.syncback/config.toml << 'EOFCFG'\n{config}EOFCFG")
+                      f"cat > /home/viaticum/.viaticum/config.toml << 'EOFCFG'\n{config}EOFCFG")
         print(f"  All {n} nodes configured")
         print()
 
@@ -284,7 +284,7 @@ def main():
         for nd in nodes:
             if nd.should_be_online(0, duration):
                 exec_node_bg(nd.name, "sh", "-c",
-                             f"RUST_LOG=info syncback daemon --time-scale {ts} "
+                             f"RUST_LOG=info viaticum daemon --time-scale {ts} "
                              f"--watch-dir /data/files >/tmp/daemon.log 2>&1")
                 started += 1
         print(f"  {started}/{n} daemons started (churners join later)")
@@ -307,7 +307,7 @@ def main():
             batch = online_nodes_to_connect[i:i+batch_size]
             for nd in batch:
                 try:
-                    exec_node(nd.name, "syncback", "connect", owner_addr, timeout=15)
+                    exec_node(nd.name, "viaticum", "connect", owner_addr, timeout=15)
                     connected += 1
                 except Exception:
                     pass
@@ -375,7 +375,7 @@ def main():
 
                 if was_online and not should_online:
                     # Take offline
-                    exec_node_quiet(nd.name, "pkill", "-f", "syncback daemon")
+                    exec_node_quiet(nd.name, "pkill", "-f", "viaticum daemon")
                     if nd.archetype == "churner":
                         print(f"    [{elapsed:.0f}s] {nd.name} (churner) left permanently")
                     else:
@@ -385,10 +385,10 @@ def main():
                 elif not was_online and should_online:
                     # Bring back online
                     exec_node_bg(nd.name, "sh", "-c",
-                                 f"RUST_LOG=info syncback daemon --time-scale {ts} "
+                                 f"RUST_LOG=info viaticum daemon --time-scale {ts} "
                                  f"--watch-dir /data/files >/tmp/daemon.log 2>&1")
                     time.sleep(2)
-                    exec_node_quiet(nd.name, "syncback", "connect", owner_addr, timeout=10)
+                    exec_node_quiet(nd.name, "viaticum", "connect", owner_addr, timeout=10)
                     print(f"    [{elapsed:.0f}s] {nd.name} (flaky) came back online")
                     node_online_state[nd.name] = True
 
@@ -500,7 +500,7 @@ def main():
         print("Phase 10: Restore test")
         restore_dir = "/tmp/restored_stress"
         try:
-            exec_node("node-00", "syncback", "restore",
+            exec_node("node-00", "viaticum", "restore",
                       "/data/files/stress_0.bin",
                       "--dest", restore_dir, timeout=60)
             orig_hash = exec_node("node-00", "sha256sum",

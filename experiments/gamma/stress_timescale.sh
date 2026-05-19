@@ -6,14 +6,14 @@
 
 set -euo pipefail
 
-BINARY="${1:-./target/release/syncback}"
+BINARY="${1:-./target/release/viaticum}"
 SCALES=(1000 5000 10000 25000 50000 100000)
 WAIT=90  # seconds to let the system work
 NUM_NODES=3
 
 if [ ! -x "$BINARY" ]; then
     echo "Binary not found: $BINARY"
-    echo "Build first: cargo build --release -p syncback"
+    echo "Build first: cargo build --release -p viaticum"
     exit 1
 fi
 
@@ -26,7 +26,7 @@ pass() { echo "    PASS: $1"; }
 fail() { echo "    FAIL: $1"; }
 
 for SCALE in "${SCALES[@]}"; do
-    TEST_DIR="/tmp/syncback-stress-$$-${SCALE}"
+    TEST_DIR="/tmp/viaticum-stress-$$-${SCALE}"
     PIDS=()
     SIM_WEEKS=$(echo "scale=1; $WAIT * $SCALE / 604800" | bc)
 

@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #15: PI+S Convergence
+Viaticum Simulation #15: PI+S Convergence
 
 Question: Can adding a storage-ratio term S fix the ranking failures of PI-only
 trust (Experiment 13), where Hoarder ranked #2 instead of #5?
@@ -849,7 +849,7 @@ def plot_results(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack Experiment 15: PI+S Convergence"
+        description="Viaticum Experiment 15: PI+S Convergence"
     )
     parser.add_argument("--peers", type=int, default=200,
                         help="Total number of peers (default: 200)")
@@ -876,7 +876,7 @@ def main() -> None:
         p_weeks_window=args.weeks_window,
     )
 
-    print("=== SYNCBACK EXPERIMENT 15: PI+S CONVERGENCE ===\n")
+    print("=== VIATICUM EXPERIMENT 15: PI+S CONVERGENCE ===\n")
     print("Testing: trust = kp * P_weekly + ki * I + ks * S")
     print(f"P_weekly: rolling {args.weeks_window}-week window of binary weekly scores")
     print("S: storage_ratio = gb_stored_for_others / gb_stored_by_others (clamped [0,2])")

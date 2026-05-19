@@ -1,0 +1,746 @@
+// RestoreCoordinator: orchestrate symbol fetch → decode → file write.
+//
+// Strategy: try local symbols first (symbols_dir); fall back to network fetch
+// from holders if insufficient. Network fetch is sequential per holder.
+//
+// Module layout:
+//   mod.rs      — RestoreCoordinator struct, public API, restore(), run()
+//   pipeline.rs — decode_block(), extract_from_pack()
+//   tests.rs    — all test scenarios
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use tracing::{debug, error, info, warn};
+use viaticum_core::db::Db;
+use viaticum_core::erasure::{ErasureEncoder, Symbol};
+use viaticum_core::types::{
+    DeviceId, ErasureParams, FileRecord, FileVersion, IdentityPub, LocalState, PlacementStatus,
+    SourceBlockId, SourceBlockType, SymbolPlacement, Timestamp,
+};
+
+use crate::daemon::restore::staging::{JobId, StagingError, StagingWriter};
+
+pub mod cleanup;
+pub mod pipeline;
+pub mod staging;
+
+#[cfg(test)]
+mod tests;
+
+// ─── Error type ───────────────────────────────────────────────────────────────
+
+/// Errors from restore operations.
+#[derive(Debug, thiserror::Error)]
+pub enum RestoreError {
+    #[error("file not found in catalog: {path}")]
+    FileNotFound { path: String },
+
+    #[error("version not found: {selector:?} for {path}")]
+    VersionNotFound { path: String, selector: String },
+
+    #[error("source block not found in DB: {0}")]
+    BlockNotFound(SourceBlockId),
+
+    #[error("no alive holders for block {0}")]
+    NoHolders(SourceBlockId),
+
+    #[error("insufficient symbols: collected {got}, need {need} for block {block}")]
+    InsufficientSymbols {
+        block: SourceBlockId,
+        got: usize,
+        need: usize,
+    },
+
+    #[error("decode failed for block {0}: {1}")]
+    DecodeFailed(SourceBlockId, String),
+
+    #[error("decryption failed for block {0}")]
+    DecryptionFailed(SourceBlockId),
+
+    #[error("decompression failed for block {0}: {1}")]
+    DecompressionFailed(SourceBlockId, String),
+
+    #[error("pack index parse failed for block {0}: {1}")]
+    PackIndexParseFailed(SourceBlockId, String),
+
+    #[error(
+        "restore denied by holder {holder}: trust {current_trust:.2}, budget {restore_budget_gb:.1} GB, requested {restore_gb:.1} GB"
+    )]
+    EscrowDenied {
+        holder: DeviceId,
+        current_trust: f64,
+        needed_trust: f64,
+        restore_budget_gb: f64,
+        restore_gb: f64,
+    },
+
+    #[error("swarm error: {0}")]
+    Swarm(String),
+
+    #[error("path safety error for {path:?}: {source}")]
+    PathUnsafe {
+        path: String,
+        source: viaticum_core::path_safety::PathSafetyError,
+    },
+
+    #[error("staging error: {0}")]
+    Staging(#[from] crate::daemon::restore::staging::StagingError),
+
+    #[error("db error: {0}")]
+    Db(#[from] viaticum_core::db::DbError),
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("fetch from holders timed out after {secs}s for block {block}")]
+    Timeout { block: SourceBlockId, secs: u64 },
+}
+
+impl RestoreError {
+    /// Wrap a shared `FetchError` as `RestoreError`, tagging `InsufficientSymbols`
+    /// with the requested `block` for the context caller operates in.
+    pub(crate) fn from_fetch(err: crate::daemon::symbol_fetch::FetchError) -> Self {
+        use crate::daemon::symbol_fetch::FetchError;
+        match err {
+            FetchError::InsufficientSymbols { block, got, need } => {
+                RestoreError::InsufficientSymbols { block, got, need }
+            }
+            FetchError::EscrowDenied {
+                holder,
+                current_trust,
+                needed_trust,
+                restore_budget_gb,
+            } => RestoreError::EscrowDenied {
+                holder,
+                current_trust,
+                needed_trust,
+                restore_budget_gb,
+                // RestoreDeniedMsg doesn't carry the requested size — we only
+                // know the holder's budget view. Report NaN so callers (and
+                // operators) don't mistake this number for a real measurement.
+                restore_gb: f64::NAN,
+            },
+            FetchError::Swarm(s) => RestoreError::Swarm(s),
+        }
+    }
+}
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+/// How to select which version of each file to restore.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VersionSelector {
+    /// Latest backed-up version (default).
+    Latest,
+    /// Specific version by 0-based index into FileRecord.versions.
+    Index(usize),
+    /// Nearest version with backed_up_at <= given timestamp.
+    BeforeDate(Timestamp),
+}
+
+/// A restore request from the user or daemon.
+#[derive(Debug, Clone)]
+pub struct RestoreRequest {
+    /// Path or prefix to restore. Trailing '/' treated as prefix query.
+    pub path: String,
+    /// Version selection for all matching files.
+    pub version_selector: VersionSelector,
+    /// Device ID performing the restore (for LocalState update).
+    pub device_id: DeviceId,
+    /// Unique identifier for this restore job, generated by dispatch.
+    pub job_id: JobId,
+}
+
+/// Result of a completed restore.
+#[derive(Debug)]
+pub struct RestoreResult {
+    /// Number of files successfully restored.
+    pub files_restored: usize,
+    /// Number of source blocks decoded.
+    pub blocks_fetched: usize,
+    /// Paths that failed to restore (path, reason).
+    pub failures: Vec<(String, String)>,
+    /// Absolute path to the per-job staging directory.
+    pub staging_path: PathBuf,
+}
+
+/// Configuration for RestoreCoordinator.
+#[derive(Debug, Clone)]
+pub struct RestoreConfig {
+    /// Epoch key for decryption. 32 bytes. Must match the key used during backup.
+    pub epoch_key: [u8; 32],
+    /// Max parallel holders to fetch symbols from for one block.
+    /// TODO: not yet used — fetch_from_holders iterates sequentially.
+    pub parallel_holders: usize,
+    /// This device's identity (for trust lookup and LocalState update).
+    pub identity: IdentityPub,
+    /// This device's ID (for LocalState).
+    pub device_id: DeviceId,
+    /// Directory where raw symbol files are stored (must match BackupConfig.symbols_dir).
+    /// Wave 2 layout: raw symbols at `{symbols_dir}/{block_hex}/raw/{esi}.bin`.
+    pub symbols_dir: PathBuf,
+    /// libp2p swarm handle for remote restore.
+    /// When Some: fetch_from_holders uses send_to_device (request-response).
+    /// When None: only local symbol files are used.
+    pub swarm: Option<std::sync::Arc<crate::daemon::network::swarm::SwarmHandle>>,
+    /// Root directory for per-job restore staging.
+    /// Each job writes to `staging_root/<job_id>/`.
+    /// Must be `data_dir/restore`.
+    pub staging_root: PathBuf,
+    /// `data_dir` — used to verify staging_root is inside it.
+    pub data_dir: PathBuf,
+    /// Timeout for the entire fetch_from_holders() call per source block.
+    /// Applied once per block decode attempt, across all holders for that block.
+    /// Default: 60 seconds.
+    pub fetch_timeout: std::time::Duration,
+}
+
+impl Default for RestoreConfig {
+    fn default() -> Self {
+        RestoreConfig {
+            epoch_key: [0u8; 32],
+            parallel_holders: 5,
+            identity: IdentityPub([0u8; 32]),
+            device_id: DeviceId([0u8; 32]),
+            symbols_dir: PathBuf::from("symbols"),
+            swarm: None,
+            staging_root: PathBuf::from("restore"),
+            data_dir: PathBuf::from("."),
+            fetch_timeout: std::time::Duration::from_secs(60),
+        }
+    }
+}
+
+// ─── RestoreCoordinator ───────────────────────────────────────────────────────
+
+/// Orchestrates: path resolution → symbol fetch → decode → file write.
+pub struct RestoreCoordinator {
+    db: Db,
+    config: RestoreConfig,
+    encoder: Arc<dyn ErasureEncoder>,
+    /// libp2p swarm handle for remote restore.
+    swarm: Option<Arc<crate::daemon::network::swarm::SwarmHandle>>,
+}
+
+impl RestoreCoordinator {
+    /// Create a new coordinator.
+    pub fn new(db: Db, config: RestoreConfig, encoder: Arc<dyn ErasureEncoder>) -> Self {
+        let swarm = config.swarm.clone();
+        RestoreCoordinator {
+            db,
+            config,
+            encoder,
+            swarm,
+        }
+    }
+
+    /// Execute a restore request.
+    ///
+    /// 1. Resolve path to FileRecords.
+    /// 2. Select version per file.
+    /// 3. Deduplicate source blocks.
+    /// 4. Decode each block.
+    /// 5. Extract + write files.
+    /// 6. Update LocalState in DB.
+    pub async fn restore(&self, request: RestoreRequest) -> Result<RestoreResult, RestoreError> {
+        info!(path = %request.path, "restore started");
+
+        // 1. Resolve path → FileRecords
+        let file_records = self.resolve_path(&request.path)?;
+        if file_records.is_empty() {
+            // Create a staging dir even for empty results so staging_path is valid.
+            let empty_writer = tokio::task::block_in_place(|| {
+                StagingWriter::open(
+                    &self.config.staging_root,
+                    &self.config.data_dir,
+                    request.job_id,
+                )
+            })?;
+            return Ok(RestoreResult {
+                files_restored: 0,
+                blocks_fetched: 0,
+                failures: vec![(request.path.clone(), "no matching files found".to_string())],
+                staging_path: empty_writer.staging_path().to_path_buf(),
+            });
+        }
+
+        // 2. Select version per file, collect (record, version) pairs
+        let mut resolved: Vec<(FileRecord, FileVersion)> = Vec::new();
+        let mut failures: Vec<(String, String)> = Vec::new();
+
+        for record in file_records {
+            // select_version borrows record; clone the version before moving record.
+            let version_opt = Self::select_version(&record, &request.version_selector).cloned();
+            match version_opt {
+                Some(version) => {
+                    resolved.push((record, version));
+                }
+                None => {
+                    failures.push((
+                        record.path.clone(),
+                        format!(
+                            "no matching version for selector {:?}",
+                            request.version_selector
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // 3. Deduplicate: source_block_id → Vec<(FileRecord, FileVersion)>
+        let mut block_map: HashMap<SourceBlockId, Vec<(FileRecord, FileVersion)>> = HashMap::new();
+        for (record, version) in resolved {
+            block_map
+                .entry(version.source_block_id)
+                .or_default()
+                .push((record, version));
+        }
+
+        // Create StagingWriter for this job (blocking I/O).
+        let writer = tokio::task::block_in_place(|| {
+            StagingWriter::open(
+                &self.config.staging_root,
+                &self.config.data_dir,
+                request.job_id,
+            )
+        })?;
+
+        // 4 & 5. For each unique block: decode → extract → write
+        let mut files_restored = 0usize;
+        let mut blocks_fetched = 0usize;
+
+        for (block_id, files_in_block) in &block_map {
+            // Get SourceBlockRecord for params
+            let block_record = match self.db.get_source_block(block_id)? {
+                Some(r) => r,
+                None => return Err(RestoreError::BlockNotFound(*block_id)),
+            };
+
+            let encrypted_size = match block_record.encrypted_size {
+                Some(s) => s,
+                None => {
+                    return Err(RestoreError::DecodeFailed(
+                        *block_id,
+                        "source block has no encrypted_size (legacy record)".to_string(),
+                    ));
+                }
+            };
+
+            let params = block_record.erasure_params();
+
+            // Decode the block (Phase 2: local symbols_dir)
+            let plaintext = self
+                .decode_block_local(block_id, &params, encrypted_size)
+                .await?;
+
+            blocks_fetched += 1;
+
+            // Extract each file from this block; create_dir_all + fs::write
+            // are blocking; wrap in block_in_place (review A1).
+            for (record, version) in files_in_block {
+                let result = tokio::task::block_in_place(|| {
+                    self.extract_and_write_file(
+                        record,
+                        version,
+                        &block_record.block_type,
+                        &plaintext,
+                        &writer,
+                    )
+                });
+                match result {
+                    Ok(()) => {
+                        if let Err(e) = self.update_local_state(&record.path, request.device_id) {
+                            warn!(path = %record.path, "failed to update local state: {e}");
+                        }
+                        files_restored += 1;
+                        info!(path = %record.path, "restored");
+                    }
+                    Err(e) => {
+                        error!(path = %record.path, "failed to write file: {e}");
+                        failures.push((record.path.clone(), e.to_string()));
+                    }
+                }
+            }
+        }
+
+        let staging_path = writer.staging_path().to_path_buf();
+
+        Ok(RestoreResult {
+            files_restored,
+            blocks_fetched,
+            failures,
+            staging_path,
+        })
+    }
+
+    /// Decode one source block.
+    ///
+    /// Strategy:
+    ///   1. Try local: read symbol files from symbols_dir.
+    ///   2. If insufficient local symbols (<k_eff), try network fetch for remaining.
+    ///   3. Combine local + network symbols, then decode.
+    ///
+    /// Decrypts and decompresses the decoded data before returning.
+    pub async fn decode_block_local(
+        &self,
+        block_id: &SourceBlockId,
+        params: &ErasureParams,
+        encrypted_size: u64,
+    ) -> Result<Vec<u8>, RestoreError> {
+        let placements = self.db.list_placements_for_block(block_id)?;
+        // For local symbol reads, use all non-deleted placements: the symbols
+        // are on the owner's disk regardless of holder reachability status.
+        // Lost means the holder's copy is gone, not the owner's local .bin files.
+        let usable_placements: Vec<_> = placements
+            .into_iter()
+            .filter(|p| p.status != PlacementStatus::Deleting)
+            .collect();
+
+        if usable_placements.is_empty() {
+            return Err(RestoreError::NoHolders(*block_id));
+        }
+
+        let block_dir = self
+            .config
+            .symbols_dir
+            .join(pipeline::hex_encode(&block_id.0));
+
+        // Wave 2: raw symbols are at {block_dir}/raw/{esi}.bin.
+        // No unbind step needed — raw symbols decode directly.
+        let raw_dir = block_dir.join("raw");
+
+        let k_eff = params.k_eff as usize;
+
+        // Reading symbol files from disk is blocking I/O; wrap the entire
+        // local-symbol scan in block_in_place so the tokio runtime keeps
+        // making progress on other tasks (review A1).
+        let mut raw_symbols: Vec<Symbol> = tokio::task::block_in_place(|| {
+            let mut collected: Vec<Symbol> = Vec::new();
+
+            'outer: for placement in &usable_placements {
+                for (start_esi, count) in &placement.esi_ranges {
+                    for i in 0..*count {
+                        let esi = start_esi + i;
+                        let symbol_path = raw_dir.join(format!("{esi}.bin"));
+                        let data = match std::fs::read(&symbol_path) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                debug!(
+                                    block = %block_id,
+                                    esi,
+                                    "raw symbol file missing or unreadable: {e}"
+                                );
+                                continue;
+                            }
+                        };
+                        // Raw symbol: no unbind needed.
+                        collected.push(Symbol { esi, data });
+
+                        if collected.len() >= k_eff {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+
+            collected
+        });
+
+        if raw_symbols.len() < k_eff {
+            // Wave 11b: raw/{esi}.bin files are no longer written by the pipeline.
+            // Try rebuilding the stored blob from source files directly.
+            // If that succeeds, we can skip the network fetch entirely.
+            let block_record = self.db.get_source_block(block_id)?;
+            if let Some(block_record) = block_record
+                && let Ok(stored_blob) = crate::daemon::backup::pipeline::rebuild_source_blob(
+                    &self.db,
+                    &block_record,
+                    &self.config.epoch_key,
+                )
+                .await
+            {
+                // Encode raw symbols from the rebuilt blob (enough to decode).
+                let params_for_encode = block_record.erasure_params();
+                let encoder_clone = Arc::clone(&self.encoder);
+                let needed = k_eff as u32;
+                match tokio::task::spawn_blocking(move || {
+                    encoder_clone.encode_raw(&stored_blob, &params_for_encode, 0, needed)
+                })
+                .await
+                {
+                    Ok(Ok(raws)) => {
+                        debug!(
+                            block = %block_id,
+                            symbols = raws.len(),
+                            "restore: rebuilt symbols from source files (Wave 11b path)"
+                        );
+                        return tokio::task::block_in_place(|| {
+                            let padded = self.encoder.decode(&raws, params).map_err(|e| {
+                                RestoreError::DecodeFailed(*block_id, e.to_string())
+                            })?;
+                            if padded.len() < encrypted_size as usize {
+                                return Err(RestoreError::DecodeFailed(
+                                    *block_id,
+                                    "decoded block too small".to_string(),
+                                ));
+                            }
+                            let stored = &padded[..encrypted_size as usize];
+                            pipeline::decrypt_and_decompress(stored, &self.config.epoch_key)
+                                .map_err(|_| RestoreError::DecryptionFailed(*block_id))
+                        });
+                    }
+                    _ => {
+                        debug!(block = %block_id, "restore: encode from rebuilt blob failed, falling back to network");
+                    }
+                }
+            }
+
+            // Not enough locally — try network fetch for the remainder.
+            // Network path: holders return bound symbols; fetch_from_holders unbinds them.
+            // The merged result (local raw + network unbound) are both raw/unbound and
+            // can be passed directly to decode().
+            debug!(
+                block = %block_id,
+                local = raw_symbols.len(),
+                need = k_eff,
+                "decode: insufficient local raw symbols, trying network"
+            );
+
+            // Try network fetch for Alive, Uncertain, and PresumedLost placements.
+            // PresumedLost holders may have returned after a temporary outage and
+            // still hold their symbols — worth asking before declaring restore failed.
+            let reachable_for_fetch: Vec<_> = usable_placements
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p.status,
+                        PlacementStatus::Alive
+                            | PlacementStatus::Uncertain
+                            | PlacementStatus::PresumedLost
+                    )
+                })
+                .cloned()
+                .collect();
+            let mut network_symbols = tokio::time::timeout(
+                self.config.fetch_timeout,
+                self.fetch_from_holders(block_id, &reachable_for_fetch, params),
+            )
+            .await
+            .map_err(|_elapsed| RestoreError::Timeout {
+                block: *block_id,
+                secs: self.config.fetch_timeout.as_secs(),
+            })??;
+
+            // Merge: avoid duplicates by ESI.
+            let existing_esis: HashSet<u32> = raw_symbols.iter().map(|s| s.esi).collect();
+            for sym in network_symbols.drain(..) {
+                if !existing_esis.contains(&sym.esi) {
+                    raw_symbols.push(sym);
+                    if raw_symbols.len() >= k_eff {
+                        break;
+                    }
+                }
+            }
+
+            if raw_symbols.len() < k_eff {
+                return Err(RestoreError::InsufficientSymbols {
+                    block: *block_id,
+                    got: raw_symbols.len(),
+                    need: k_eff,
+                });
+            }
+        }
+
+        // Erasure decode + decrypt + decompress are CPU-heavy; wrap in
+        // block_in_place so the tokio runtime keeps running while we work
+        // (review A1).
+        tokio::task::block_in_place(|| {
+            let padded = self
+                .encoder
+                .decode(&raw_symbols, params)
+                .map_err(|e| RestoreError::DecodeFailed(*block_id, e.to_string()))?;
+
+            if padded.len() < encrypted_size as usize {
+                return Err(RestoreError::DecodeFailed(
+                    *block_id,
+                    format!(
+                        "decoded block ({} bytes) smaller than encrypted_size ({})",
+                        padded.len(),
+                        encrypted_size
+                    ),
+                ));
+            }
+            let stored = &padded[..encrypted_size as usize];
+
+            pipeline::decrypt_and_decompress(stored, &self.config.epoch_key).map_err(|e| {
+                error!(block = %block_id, "decrypt_and_decompress failed: {e}");
+                RestoreError::DecryptionFailed(*block_id)
+            })
+        })
+    }
+
+    /// Fetch symbols for a source block from holders over the network.
+    ///
+    /// Thin wrapper around `symbol_fetch::fetch_unbound_symbols`; maps the
+    /// shared `FetchError` into `RestoreError`. Kept as a method so existing
+    /// integration tests continue to call `coordinator.fetch_from_holders(...)`.
+    pub async fn fetch_from_holders(
+        &self,
+        block_id: &SourceBlockId,
+        placements: &[SymbolPlacement],
+        params: &ErasureParams,
+    ) -> Result<Vec<Symbol>, RestoreError> {
+        // Without a swarm no holder is reachable; preserve the old behavior of
+        // returning InsufficientSymbols(got=0) rather than a Swarm error.
+        let swarm = match self.swarm.as_ref() {
+            Some(s) => s,
+            None => {
+                return Err(RestoreError::InsufficientSymbols {
+                    block: *block_id,
+                    got: 0,
+                    need: params.k_eff as usize,
+                });
+            }
+        };
+        crate::daemon::symbol_fetch::fetch_unbound_symbols(
+            swarm,
+            &self.encoder,
+            block_id,
+            placements,
+            params.k_eff as usize,
+        )
+        .await
+        .map_err(RestoreError::from_fetch)
+    }
+
+    /// Extract one file from decoded plaintext and write to staging directory.
+    ///
+    /// Validates the record path before writing (prevents path traversal from any
+    /// source — normal restore, DR blobs, or malicious peers).
+    pub(crate) fn extract_and_write_file(
+        &self,
+        record: &FileRecord,
+        version: &FileVersion,
+        block_type: &SourceBlockType,
+        plaintext: &[u8],
+        writer: &StagingWriter,
+    ) -> Result<(), RestoreError> {
+        let file_bytes = match block_type {
+            SourceBlockType::Pack { .. } => {
+                let extracted =
+                    pipeline::extract_from_pack(plaintext, record.file_id).map_err(|e| {
+                        RestoreError::PackIndexParseFailed(version.source_block_id, e.to_string())
+                    })?;
+                match extracted {
+                    Some(bytes) => bytes,
+                    None => {
+                        return Err(RestoreError::PackIndexParseFailed(
+                            version.source_block_id,
+                            format!("file_id {} not found in pack", record.file_id),
+                        ));
+                    }
+                }
+            }
+            SourceBlockType::Single => plaintext.to_vec(),
+        };
+
+        // Validate the record path from DB — must pass even for DR-sourced records.
+        let validated =
+            viaticum_core::path_safety::validate_record_path(&record.path).map_err(|e| {
+                RestoreError::PathUnsafe {
+                    path: record.path.clone(),
+                    source: e,
+                }
+            })?;
+
+        let out_path = writer
+            .write_file(&validated, &file_bytes)
+            .map_err(|e| match e {
+                StagingError::AlreadyExists(p) => {
+                    RestoreError::Staging(StagingError::AlreadyExists(p))
+                }
+                other => RestoreError::Staging(other),
+            })?;
+
+        debug!(src = %record.path, dst = ?out_path, "wrote restored file to staging");
+        Ok(())
+    }
+
+    /// Update FileRecord.devices for device_id → LocalState::Present.
+    fn update_local_state(&self, path: &str, device_id: DeviceId) -> Result<(), RestoreError> {
+        if let Some(mut record) = self.db.get_file(path)? {
+            match record.devices.iter_mut().find(|(d, _)| *d == device_id) {
+                Some((_, state)) => *state = LocalState::Present,
+                None => record.devices.push((device_id, LocalState::Present)),
+            }
+            self.db.upsert_file(&record)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve path to FileRecords.
+    ///
+    /// Trailing '/' → prefix query.
+    /// Otherwise: exact lookup, then prefix fallback for folder paths.
+    fn resolve_path(&self, path: &str) -> Result<Vec<FileRecord>, RestoreError> {
+        if path.ends_with('/') {
+            Ok(self.db.list_files_with_prefix(path)?)
+        } else {
+            match self.db.get_file(path)? {
+                Some(r) => Ok(vec![r]),
+                None => Ok(self.db.list_files_with_prefix(path)?),
+            }
+        }
+    }
+
+    /// Select which FileVersion to restore.
+    ///
+    /// - `Latest`:      last version with `backed_up_at.is_some()`
+    /// - `Index(n)`:    `versions[n]`
+    /// - `BeforeDate`:  last version with `backed_up_at.is_some() && backed_up_at <= ts`
+    pub fn select_version<'a>(
+        record: &'a FileRecord,
+        selector: &VersionSelector,
+    ) -> Option<&'a FileVersion> {
+        match selector {
+            VersionSelector::Latest => record
+                .versions
+                .iter()
+                .rev()
+                .find(|v| v.backed_up_at.is_some()),
+            VersionSelector::Index(n) => record.versions.get(*n),
+            VersionSelector::BeforeDate(ts) => record
+                .versions
+                .iter()
+                .rev()
+                .find(|v| v.backed_up_at.map(|t| t.0 <= ts.0).unwrap_or(false)),
+        }
+    }
+
+    /// Run the coordinator as a tokio task.
+    ///
+    /// Accepts (RestoreRequest, oneshot::Sender) from rx, processes sequentially.
+    pub async fn run(
+        self,
+        mut rx: tokio::sync::mpsc::Receiver<(
+            RestoreRequest,
+            tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
+        )>,
+    ) -> anyhow::Result<()> {
+        info!("RestoreCoordinator started");
+        while let Some((request, reply)) = rx.recv().await {
+            let result = self.restore(request).await;
+            let _ = reply.send(result);
+        }
+        info!("RestoreCoordinator: channel closed, exiting");
+        Ok(())
+    }
+}
+
+// ─── Free helpers ─────────────────────────────────────────────────────────────
+
+// Re-export shared helper from core (review A3).
+#[cfg(test)]
+pub(crate) use viaticum_core::types::ranges_to_esi_list as collect_esis_from_ranges;

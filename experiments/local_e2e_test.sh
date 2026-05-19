@@ -1,5 +1,5 @@
 #!/bin/bash
-# SyncBack comprehensive E2E test: backup pipeline, restore, trust, PoS
+# Viaticum comprehensive E2E test: backup pipeline, restore, trust, PoS
 # Local processes on one machine (no Docker).
 #
 # Usage:
@@ -18,8 +18,8 @@ set -euo pipefail
 
 NUM_NODES=${1:-3}
 TIME_SCALE=1000
-TEST_DIR="/tmp/syncback-e2e-$$"
-BINARY="${BINARY:-syncback}"
+TEST_DIR="/tmp/viaticum-e2e-$$"
+BINARY="${BINARY:-viaticum}"
 
 PASS=0; FAIL=0; SKIP=0
 PIDS=()
@@ -84,15 +84,15 @@ get_json_field() {
 
 # Verify binary exists
 if ! command -v "$BINARY" &>/dev/null; then
-    BINARY="./target/release/syncback"
+    BINARY="./target/release/viaticum"
     if [ ! -x "$BINARY" ]; then
-        echo "ERROR: syncback binary not found. Run: cargo build --release"
+        echo "ERROR: viaticum binary not found. Run: cargo build --release"
         exit 1
     fi
 fi
 
 echo "============================================================"
-echo "  SyncBack E2E Test (${NUM_NODES} nodes)"
+echo "  Viaticum E2E Test (${NUM_NODES} nodes)"
 echo "  Binary: $BINARY"
 echo "  Test dir: $TEST_DIR"
 echo "============================================================"

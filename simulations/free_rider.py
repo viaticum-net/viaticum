@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #5: Free-rider Detection
+Viaticum Simulation #5: Free-rider Detection
 
 Question: Does PI reputation automatically prevent free-riding?
 Can a free-rider game the system by storing just enough to maintain minimum reputation?

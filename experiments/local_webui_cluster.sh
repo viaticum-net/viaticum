@@ -1,5 +1,5 @@
 #!/bin/bash
-# Local cluster of N syncback daemons with web UI, real time scale.
+# Local cluster of N viaticum daemons with web UI, real time scale.
 # Run, open dashboards in browser, poke around, Ctrl-C to stop.
 #
 # Usage:
@@ -13,9 +13,9 @@ set -euo pipefail
 
 NUM_NODES=${1:-4}
 TIME_SCALE=1
-TEST_DIR="/tmp/syncback-cluster"
+TEST_DIR="/tmp/viaticum-cluster"
 WEB_PORT_BASE=8400
-BINARY="${BINARY:-/home/ilya/projects/syncback/target/release/syncback}"
+BINARY="${BINARY:-/home/ilya/projects/syncback/target/release/viaticum}"
 STATIC_DIR="/home/ilya/projects/syncback/web-ui/dist"
 
 PIDS=()
@@ -69,7 +69,7 @@ if ss -ltn 2>/dev/null | grep -q ':8384 '; then
 fi
 
 echo "============================================================"
-echo "  SyncBack web-UI cluster: $NUM_NODES nodes, time_scale=$TIME_SCALE"
+echo "  Viaticum web-UI cluster: $NUM_NODES nodes, time_scale=$TIME_SCALE"
 echo "  Data: $TEST_DIR"
 echo "============================================================"
 
@@ -142,7 +142,7 @@ echo "  $ok/$((NUM_NODES-1)) connected"
 # ── Seed demo files into node-00's watch dir ─────────────────────────────────
 seed_dir="$(node_dir 0)/files"
 echo "Seeding demo files into $seed_dir..."
-echo "Hello from SyncBack web-UI demo cluster." > "$seed_dir/readme.txt"
+echo "Hello from Viaticum web-UI demo cluster." > "$seed_dir/readme.txt"
 mkdir -p "$seed_dir/photos"
 dd if=/dev/urandom of="$seed_dir/photos/sample-1.bin" bs=1024 count=64  status=none
 dd if=/dev/urandom of="$seed_dir/photos/sample-2.bin" bs=1024 count=128 status=none

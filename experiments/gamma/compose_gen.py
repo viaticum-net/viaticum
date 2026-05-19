@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate Docker Compose file for gamma experiments with N nodes.
 
-Binary is bind-mounted from host (target/release/syncback), not built inside Docker.
-Build it first: cargo build --release -p syncback
+Binary is bind-mounted from host (target/release/viaticum), not built inside Docker.
+Build it first: cargo build --release -p viaticum
 """
 
 import argparse
@@ -21,8 +21,8 @@ def generate(n_nodes: int, out_path: str, include_metrics: bool = True) -> None:
     container_name: gamma-{name}
     hostname: {name}
     volumes:
-      - ../../target/release/syncback:/usr/local/bin/syncback:ro
-      - {name}-data:/home/syncback/.syncback
+      - ../../target/release/viaticum:/usr/local/bin/viaticum:ro
+      - {name}-data:/home/viaticum/.viaticum
       - {name}-files:/data/files
     networks:
       - gamma-net""")

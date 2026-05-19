@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #12: "Prison" Scenario — Captive / Small Network
+Viaticum Simulation #12: "Prison" Scenario — Captive / Small Network
 
 Question: What happens when a small group of users is trapped with only each other?
 What is the minimum viable network size? How does one malicious node in a small

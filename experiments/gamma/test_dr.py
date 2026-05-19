@@ -66,7 +66,7 @@ def compose(*args, timeout=120):
 
 
 def node_status(name):
-    raw = exec_node(name, "syncback", "status", "--json")
+    raw = exec_node(name, "viaticum", "status", "--json")
     return json.loads(raw)
 
 
@@ -101,17 +101,17 @@ disk_reserve_gb = 0.0
 enable_relay = false
 """
     exec_node(name, "sh", "-c",
-              f"cat > /home/syncback/.syncback/config.toml << 'EOFCFG'\n{config}EOFCFG")
+              f"cat > /home/viaticum/.viaticum/config.toml << 'EOFCFG'\n{config}EOFCFG")
 
 
 def start_daemon(name, ts):
     exec_node_bg(name, "sh", "-c",
-                 f"RUST_LOG=info syncback daemon --time-scale {ts} "
+                 f"RUST_LOG=info viaticum daemon --time-scale {ts} "
                  f"--watch-dir /data/files >/tmp/daemon.log 2>&1")
 
 
 def stop_daemon(name):
-    exec_node_quiet(name, "pkill", "-f", "syncback daemon", timeout=10)
+    exec_node_quiet(name, "pkill", "-f", "viaticum daemon", timeout=10)
     time.sleep(1)
 
 
@@ -149,7 +149,7 @@ def main():
     try:
         # -- Phase 1: Init all nodes, capture owner's mnemonic --
         print("Phase 1: Init all nodes (capture owner mnemonic)")
-        init_output = exec_node(owner, "syncback", "init")
+        init_output = exec_node(owner, "viaticum", "init")
         print(f"    Owner init output:\n    {init_output[:200]}")
 
         # Parse mnemonic from init output
@@ -181,7 +181,7 @@ def main():
 
         for name in nodes[1:]:
             try:
-                exec_node(name, "syncback", "init")
+                exec_node(name, "viaticum", "init")
             except RuntimeError as e:
                 if "already initialized" not in str(e):
                     raise
@@ -198,9 +198,9 @@ def main():
 
         # -- Phase 3: Discovery --
         print("Phase 3: Peer discovery")
-        addr0 = json.loads(exec_node(owner, "syncback", "status", "--json")).get("node_addr", "")
+        addr0 = json.loads(exec_node(owner, "viaticum", "status", "--json")).get("node_addr", "")
         for name in nodes[1:]:
-            exec_node_quiet(name, "syncback", "connect", addr0, timeout=15)
+            exec_node_quiet(name, "viaticum", "connect", addr0, timeout=15)
 
         ok = wait_for(
             "All nodes discover peers",
@@ -286,9 +286,9 @@ def main():
         # -- Phase 6: Destroy owner's DB --
         print("Phase 6: Destroy owner's DB (simulating data loss)")
         stop_daemon(owner)
-        exec_node(owner, "rm", "-f", "/home/syncback/.syncback/db.redb")
+        exec_node(owner, "rm", "-f", "/home/viaticum/.viaticum/db.redb")
         # Also remove keyfile so DR has to re-derive from mnemonic
-        exec_node(owner, "rm", "-f", "/home/syncback/.syncback/keyfile.json")
+        exec_node(owner, "rm", "-f", "/home/viaticum/.viaticum/keyfile.json")
         print(f"    DB and keyfile removed\n")
 
         # -- Phase 7: Run DR --
@@ -302,7 +302,7 @@ def main():
         for addr in peer_addrs[:3]:  # Use up to 3 peers
             peer_args.extend(["--peer", addr])
 
-        dr_cmd = ["syncback", "dr", "--mnemonic", mnemonic] + peer_args
+        dr_cmd = ["viaticum", "dr", "--mnemonic", mnemonic] + peer_args
         try:
             dr_output = exec_node(owner, *dr_cmd, timeout=120)
             print(f"    DR output:\n    " + "\n    ".join(dr_output.split("\n")[:10]))
@@ -328,12 +328,12 @@ def main():
         for name in nodes[1:]:
             s = node_status_safe(name)
             if s and s.get("node_addr"):
-                exec_node_quiet(owner, "syncback", "connect", s["node_addr"], timeout=15)
+                exec_node_quiet(owner, "viaticum", "connect", s["node_addr"], timeout=15)
         time.sleep(10)
 
         # Verify catalog is restored
         try:
-            files_output = exec_node(owner, "syncback", "files")
+            files_output = exec_node(owner, "viaticum", "files")
             if "dr_test" in files_output:
                 results["passed"].append("catalog_restored")
                 print(f"    File catalog restored")
@@ -352,7 +352,7 @@ def main():
         restore_dir = "/tmp/restored_dr"
         src_path = "/data/files/dr_test_1.dat"
         try:
-            exec_node(owner, "syncback", "restore", src_path,
+            exec_node(owner, "viaticum", "restore", src_path,
                       "--dest", restore_dir, timeout=60)
             restored_file = f"{restore_dir}{src_path}"
             orig_hash = exec_node(owner, "md5sum", src_path).split()[0]

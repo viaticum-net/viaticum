@@ -1,5 +1,5 @@
 // Quick script to generate fixed BIP39 mnemonics from entropy seeds.
-// Run: cargo run --example gen_mnemonics -p syncback
+// Run: cargo run --example gen_mnemonics -p viaticum
 // Or just copy-paste the output.
 fn main() {
     for seed in [50u8, 51, 52, 53, 54] {

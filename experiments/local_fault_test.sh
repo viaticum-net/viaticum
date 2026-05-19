@@ -1,5 +1,5 @@
 #!/bin/bash
-# SyncBack fault injection E2E test: K-of-N resilience
+# Viaticum fault injection E2E test: K-of-N resilience
 # Tests E2E-06 (holder death during backup) and E2E-07 (restore with dead holders).
 #
 # Usage:
@@ -16,8 +16,8 @@ set -euo pipefail
 
 NUM_NODES=7
 TIME_SCALE=1000
-TEST_DIR="/tmp/syncback-fault-$$"
-BINARY="${BINARY:-syncback}"
+TEST_DIR="/tmp/viaticum-fault-$$"
+BINARY="${BINARY:-viaticum}"
 
 PASS=0; FAIL=0; SKIP=0
 PIDS=()
@@ -80,15 +80,15 @@ get_json_field() {
 
 # Verify binary exists
 if ! command -v "$BINARY" &>/dev/null; then
-    BINARY="./target/release/syncback"
+    BINARY="./target/release/viaticum"
     if [ ! -x "$BINARY" ]; then
-        echo "ERROR: syncback binary not found. Run: cargo build --release"
+        echo "ERROR: viaticum binary not found. Run: cargo build --release"
         exit 1
     fi
 fi
 
 echo "============================================================"
-echo "  SyncBack Fault Injection Test (${NUM_NODES} nodes)"
+echo "  Viaticum Fault Injection Test (${NUM_NODES} nodes)"
 echo "  Binary: $BINARY"
 echo "  Test dir: $TEST_DIR"
 echo "============================================================"

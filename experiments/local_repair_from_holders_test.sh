@@ -1,5 +1,5 @@
 #!/bin/bash
-# SyncBack E2E test: "Repair from Holders" (W3)
+# Viaticum E2E test: "Repair from Holders" (W3)
 #
 # Scenario:
 #   1. 5 nodes: node-00 (owner), node-01 (Holder A — symbols deleted),
@@ -45,8 +45,8 @@ NUM_NODES=5
 #   holders with data. With 4 initial holders the placement algorithm can
 #   distribute across 3+ of them, so losing one still leaves >= 2 alive.
 TIME_SCALE=100000  # PoS fires ~3s wall-clock at pos_period_secs=2 virtual
-TEST_DIR="/tmp/syncback-repair-holders-$$"
-BINARY="${BINARY:-syncback}"
+TEST_DIR="/tmp/viaticum-repair-holders-$$"
+BINARY="${BINARY:-viaticum}"
 
 PASS=0; FAIL=0; SKIP=0
 PIDS=()
@@ -134,12 +134,12 @@ wait_for_alive_placements() {
 
 # Verify binary exists
 if ! command -v "$BINARY" &>/dev/null; then
-    BINARY="./target/release/syncback"
-    [ ! -x "$BINARY" ] && echo "ERROR: syncback binary not found. Run: cargo build --release" && exit 1
+    BINARY="./target/release/viaticum"
+    [ ! -x "$BINARY" ] && echo "ERROR: viaticum binary not found. Run: cargo build --release" && exit 1
 fi
 
 echo "============================================================"
-echo "  SyncBack: Repair from Holders E2E Test (W3)"
+echo "  Viaticum: Repair from Holders E2E Test (W3)"
 echo "  Nodes: ${NUM_NODES}, time_scale: ${TIME_SCALE}"
 echo "  Binary: $BINARY"
 echo "  Test dir: $TEST_DIR"

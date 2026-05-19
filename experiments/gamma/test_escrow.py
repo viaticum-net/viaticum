@@ -44,7 +44,7 @@ COMPOSE_FILE = "experiments/gamma/compose.yml"
 K_FACTOR = 200
 
 # File size just over 1 MB so each file maps to exactly one Single block
-# (syncback packs small files but creates Single blocks for files >block_size).
+# (viaticum packs small files but creates Single blocks for files >block_size).
 FILE_SIZE_KB = 1100
 
 
@@ -85,7 +85,7 @@ def compose(*args, timeout=120):
 
 
 def node_status(name):
-    raw = exec_node(name, "syncback", "status", "--json")
+    raw = exec_node(name, "viaticum", "status", "--json")
     return json.loads(raw)
 
 
@@ -124,12 +124,12 @@ enable_relay = false
 k_factor = {k_factor}
 """
     exec_node(name, "sh", "-c",
-              f"cat > /home/syncback/.syncback/config.toml << 'EOFCFG'\n{config}EOFCFG")
+              f"cat > /home/viaticum/.viaticum/config.toml << 'EOFCFG'\n{config}EOFCFG")
 
 
 def start_daemon(name, ts):
     exec_node_bg(name, "sh", "-c",
-                 f"RUST_LOG=info syncback daemon --time-scale {ts} "
+                 f"RUST_LOG=info viaticum daemon --time-scale {ts} "
                  f"--watch-dir /data/files >/tmp/daemon.log 2>&1")
 
 
@@ -144,7 +144,7 @@ def holder_denied_count(name):
 def try_restore(owner, src_path, restore_dir):
     """Attempt restore. Returns (success: bool, output: str)."""
     try:
-        out = exec_node(owner, "syncback", "restore", src_path,
+        out = exec_node(owner, "viaticum", "restore", src_path,
                         "--dest", restore_dir, timeout=90)
         return True, out
     except Exception as e:
@@ -201,7 +201,7 @@ def main():
         print("Phase 1: Init, configure, and start all nodes")
         for name in nodes:
             try:
-                exec_node(name, "syncback", "init")
+                exec_node(name, "viaticum", "init")
             except RuntimeError as e:
                 if "already initialized" not in str(e):
                     raise
@@ -215,9 +215,9 @@ def main():
 
         # -- Phase 2: peer_discovery --
         print("Phase 2: Peer discovery")
-        addr0 = json.loads(exec_node(owner, "syncback", "status", "--json")).get("node_addr", "")
+        addr0 = json.loads(exec_node(owner, "viaticum", "status", "--json")).get("node_addr", "")
         for name in holders:
-            exec_node_quiet(name, "syncback", "connect", addr0, timeout=15)
+            exec_node_quiet(name, "viaticum", "connect", addr0, timeout=15)
 
         ok = wait_for(
             "All nodes discover each other",

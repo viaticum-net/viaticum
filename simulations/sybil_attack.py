@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #4: Sybil Attack Against P2P Backup with PID Reputation
+Viaticum Simulation #4: Sybil Attack Against P2P Backup with PID Reputation
 
 Question: Can a Sybil attacker cause file loss by building reputation honestly
 then refusing to serve shards on restore?

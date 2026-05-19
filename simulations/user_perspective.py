@@ -1,7 +1,7 @@
 """
-SyncBack: User Perspective Simulation
+Viaticum: User Perspective Simulation
 
-Shows SyncBack from a single user's (protagonist's) perspective across
+Shows Viaticum from a single user's (protagonist's) perspective across
 realistic life scenarios. Network has 3000 background nodes; we track
 the protagonist in detail each week.
 
@@ -1154,7 +1154,7 @@ def _parse_scenario_list(s: str) -> list[int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack user perspective simulation"
+        description="Viaticum user perspective simulation"
     )
     parser.add_argument(
         "--scenario",

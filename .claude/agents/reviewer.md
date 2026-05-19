@@ -5,7 +5,7 @@ model: sonnet
 tools: Read, Bash, Grep, Glob
 ---
 
-You review Rust code for the SyncBack project.
+You review Rust code for the Viaticum project.
 
 ## Checklist
 

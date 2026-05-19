@@ -1,12 +1,12 @@
 #!/bin/bash
-# SyncBack δ.1 Verification: System State Push + Disaster Recovery
+# Viaticum δ.1 Verification: System State Push + Disaster Recovery
 # Local processes on one machine (no Docker).
 #
 # Usage:
 #   cargo build --release
 #   bash experiments/local_dr_test.sh [num_nodes]
 #
-# Defaults to 5 nodes. Each node gets its own data dir under /tmp/syncback-test-*.
+# Defaults to 5 nodes. Each node gets its own data dir under /tmp/viaticum-test-*.
 # Tests:
 #   1. Star connect — all nodes connect to node-00 via localhost
 #   2. System state push — node-00 pushes encrypted DB snapshot to peers
@@ -16,9 +16,9 @@ set -euo pipefail
 
 NUM_NODES=${1:-5}
 TIME_SCALE=1000   # system state push interval = max(6*3600/1000, 60) = 60s
-TEST_DIR="/tmp/syncback-test-$$"
+TEST_DIR="/tmp/viaticum-test-$$"
 MNEMONIC_00="cram muscle milk good case boil silver edge cram muscle milk good case boil silver edge cram muscle milk good case boil silver double"
-BINARY="${BINARY:-syncback}"
+BINARY="${BINARY:-viaticum}"
 
 PASS=0; FAIL=0; SKIP=0
 PIDS=()
@@ -87,15 +87,15 @@ get_peer_count() {
 # Verify binary exists
 if ! command -v "$BINARY" &>/dev/null; then
     # Try release build path
-    BINARY="./target/release/syncback"
+    BINARY="./target/release/viaticum"
     if [ ! -x "$BINARY" ]; then
-        echo "ERROR: syncback binary not found. Run: cargo build --release"
+        echo "ERROR: viaticum binary not found. Run: cargo build --release"
         exit 1
     fi
 fi
 
 echo "============================================================"
-echo "  SyncBack δ.1: Local DR Test (${NUM_NODES} nodes)"
+echo "  Viaticum δ.1: Local DR Test (${NUM_NODES} nodes)"
 echo "  Binary: $BINARY"
 echo "  Test dir: $TEST_DIR"
 echo "============================================================"
@@ -278,7 +278,7 @@ else
         rm -rf "$(node_dir 0)"/*
 
         # Run DR
-        echo "  Running: syncback dr --mnemonic '...' --peer <node-01> --peer <node-02>"
+        echo "  Running: viaticum dr --mnemonic '...' --peer <node-01> --peer <node-02>"
         echo ""
 
         DR_ARGS="--mnemonic \"$MNEMONIC_00\" --peer \"$ADDR_01\""

@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #18: Corrected Individual Node Perspective (PI+S formula)
+Viaticum Simulation #18: Corrected Individual Node Perspective (PI+S formula)
 
 Redo of Experiment 14 (node_perspective.py) with:
   - Corrected trust formula: trust = kp*P + ki*I + ks*S
@@ -1231,7 +1231,7 @@ def save_results(result: dict, path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack Exp 18: Corrected Individual Node Perspective (PI+S)"
+        description="Viaticum Exp 18: Corrected Individual Node Perspective (PI+S)"
     )
     parser.add_argument(
         "--scenario", type=int, choices=[1, 2, 3],

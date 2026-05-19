@@ -1,5 +1,5 @@
 """
-SyncBack Experiment 27 v2: Shard Placement in a Saturated Network
+Viaticum Experiment 27 v2: Shard Placement in a Saturated Network
 
 Two scenarios, four hysteresis strategies. The key fix from v1: the network
 starts pre-filled (85-95% utilization), so every placement attempt immediately
@@ -1497,7 +1497,7 @@ def _parse_offer_ratios(arg: str) -> list[float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack Experiment 27 v2: Shard Placement in Saturated Network"
+        description="Viaticum Experiment 27 v2: Shard Placement in Saturated Network"
     )
     parser.add_argument(
         "--scenario",
@@ -1552,7 +1552,7 @@ def main() -> None:
 
     output_dir = Path(args.output)
 
-    print("=== SYNCBACK EXPERIMENT 27 v2: SHARD PLACEMENT IN SATURATED NETWORK ===", flush=True)
+    print("=== VIATICUM EXPERIMENT 27 v2: SHARD PLACEMENT IN SATURATED NETWORK ===", flush=True)
     print(f"Scenarios: {scenarios} ({[SCENARIO_LABELS[s] for s in scenarios]})", flush=True)
     print(f"Strategies: {strategies}", flush=True)
     print(f"Offer ratios: {offer_ratios}", flush=True)

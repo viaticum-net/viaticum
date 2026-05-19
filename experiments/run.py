@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SyncBack experiment CLI.
+Viaticum experiment CLI.
 
 Usage:
     python experiments/run.py smoke          # run smoke test
@@ -26,7 +26,7 @@ SCENARIOS = {
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="SyncBack experiment runner")
+    parser = argparse.ArgumentParser(description="Viaticum experiment runner")
     parser.add_argument("scenario", nargs="?", help="Scenario to run")
     parser.add_argument("--build", action="store_true", help="Build Docker images first")
     parser.add_argument("--list", action="store_true", help="List available scenarios")

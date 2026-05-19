@@ -20,7 +20,7 @@
 
 <div class="app">
   <nav>
-    <div class="brand">SyncBack</div>
+    <div class="brand">Viaticum</div>
     <ul>
       {#each pages as page}
         <li>

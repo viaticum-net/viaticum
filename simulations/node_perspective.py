@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #14: Individual Node Perspective
+Viaticum Simulation #14: Individual Node Perspective
 
 Question: What does the system look like from one node's point of view?
 What are the UX-relevant events and timelines?
@@ -974,7 +974,7 @@ def save_results(result: dict, path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack Exp 14: Individual Node Perspective"
+        description="Viaticum Exp 14: Individual Node Perspective"
     )
     parser.add_argument(
         "--scenario", type=int, choices=[1, 2, 3],

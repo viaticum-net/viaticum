@@ -1,4 +1,4 @@
-# SyncBack: Wire Protocol Specification
+# Viaticum: Wire Protocol Specification
 
 *2026-03-21. Version β. Authoritative protocol spec.*
 
@@ -14,7 +14,7 @@
 | Transport | libp2p (TCP + Noise + Yamux, Kademlia DHT, DCUtR) | transport only |
 | Gossip / deferred | Epidemic relay (board-based) | НЕ pubsub |
 | Wire format | CBOR + u32 BE length-prefix | `ciborium` crate |
-| ALPN | `"syncback/1"` | строка байт |
+| ALPN | `"viaticum/1"` | строка байт |
 | File encryption | ChaCha20-Poly1305 | epoch-keyed |
 | Per-holder binding | ChaCha20 XOR stream | anti-collusion |
 | Подписи | Ed25519 | identity + device certs |
@@ -44,7 +44,7 @@
 
 ### Версионирование
 
-- ALPN уровень: `b"syncback/1"` — при смене версии протокола ALPN меняется
+- ALPN уровень: `b"viaticum/1"` — при смене версии протокола ALPN меняется
 - Уровень сообщений: поле `v: u8` в каждом сообщении. Текущая версия: `PROTOCOL_VERSION = 1`
 - Неизвестный вариант enum'а: сторона логирует и игнорирует, соединение не разрывается
 
@@ -99,15 +99,15 @@ pub enum Message {
 Seed phrase (BIP39, 24 слова)
 │
 ├─ Master identity key (Ed25519)
-│   HKDF-SHA256(ikm=seed_bytes, salt=b"", info=b"syncback-identity-ed25519")
+│   HKDF-SHA256(ikm=seed_bytes, salt=b"", info=b"viaticum-identity-ed25519")
 │   IdentityPub = master_key.verifying_key()  ←── стабильный ID владельца
 │
 ├─ Device key (Ed25519, per device)
-│   HKDF-SHA256(ikm=seed_bytes, salt=device_id.0, info=b"syncback-device-ed25519")
+│   HKDF-SHA256(ikm=seed_bytes, salt=device_id.0, info=b"viaticum-device-ed25519")
 │   DeviceId = device_key.verifying_key()  ←── transport identity (libp2p PeerId derived from this)
 │
 └─ Epoch encryption key (ChaCha20, per epoch)
-    HKDF-SHA256(ikm=seed_bytes, salt=epoch.0.to_be_bytes(), info=b"syncback-encryption")
+    HKDF-SHA256(ikm=seed_bytes, salt=epoch.0.to_be_bytes(), info=b"viaticum-encryption")
 ```
 
 - `DeviceId` = Ed25519 pubkey bytes of device signing key (32 bytes) — стабильный транспортный ID
@@ -145,7 +145,7 @@ pub struct RevocationCertificate {
 
 ### 1.2. Handshake (аутентификация соединения)
 
-Протокол SyncBack handshake выполняется поверх libp2p Noise IX слоя. После Noise-хэндшейка стороны обмениваются `DeviceCertExchangeMsg`, связывающим libp2p PeerId с `IdentityPub`.
+Протокол Viaticum handshake выполняется поверх libp2p Noise IX слоя. После Noise-хэндшейка стороны обмениваются `DeviceCertExchangeMsg`, связывающим libp2p PeerId с `IdentityPub`.
 
 #### Порядок обмена
 
@@ -231,13 +231,13 @@ Content-addressed: один и тот же файл на разных устро
 
 **Слой 1 — шифрование файла:**
 ```
-file_key = HKDF-SHA256(epoch_key, content_hash || b"syncback-file-encryption")
+file_key = HKDF-SHA256(epoch_key, content_hash || b"viaticum-file-encryption")
 ciphertext = ChaCha20-Poly1305_encrypt(key=file_key, plaintext=compressed_data)
 ```
 
 **Слой 2 — per-holder binding (anti-collusion):**
 ```
-binding_key = HKDF-SHA256(source_block_id || holder_id, b"syncback-binding")
+binding_key = HKDF-SHA256(source_block_id || holder_id, b"viaticum-binding")
 stored_symbol = symbol XOR ChaCha20_stream(binding_key)
 ```
 
@@ -429,7 +429,7 @@ pub struct DirectedEnvelope {
     pub ciphertext: Vec<u8>,           // encrypted CBOR payload
 }
 // KDF: HKDF-SHA256(ikm=ECDH_shared, salt=sender_pub||receiver_pub,
-//                  info=b"syncback-directed")
+//                  info=b"viaticum-directed")
 ```
 
 Ephemeral key генерируется заново для каждого сообщения (forward secrecy).
@@ -738,7 +738,7 @@ HandshakeMsg.device_cert  = DeviceCertificate   (master_key.sign(device_id.0 || 
 #### Device revocation
 
 ```
-1. syncback device revoke <device_id>
+1. viaticum device revoke <device_id>
 2. Создать RevocationCertificate = master_key.sign(b"revoke" || device_id || revoked_at || new_epoch)
 3. epoch_counter += 1, новый epoch_key
 4. Публикация через relay board: RevocationBroadcast { revocation_cert, device_cert }
@@ -840,7 +840,7 @@ pub struct SystemStateRequestMsg { pub v: u8, pub timestamp: Timestamp }
 pub struct SystemStateResponseMsg { pub v: u8, pub encrypted_blob: Vec<u8>, pub timestamp: Timestamp }
 ```
 
-**Encryption:** HKDF-SHA256(ikm=seed, salt=random_24, info=b"syncback-system-state") → ChaCha20-Poly1305. Wire format: `[salt(24)][nonce(12)][ciphertext+tag]`.
+**Encryption:** HKDF-SHA256(ikm=seed, salt=random_24, info=b"viaticum-system-state") → ChaCha20-Poly1305. Wire format: `[salt(24)][nonce(12)][ciphertext+tag]`.
 
 **Serialization:** SystemState → CBOR → zstd compress → encrypt.
 
@@ -947,7 +947,7 @@ Repair (triggered by PresumedLost / Lost):
 ### 3.3. Restore
 
 ```
-syncback restore <path> [--version N] [--date YYYY-MM-DD]
+viaticum restore <path> [--version N] [--date YYYY-MM-DD]
 
 1. DB lookup: path → FileRecord → FileVersion
 2. FileVersion → source_block_id
@@ -973,7 +973,7 @@ syncback restore <path> [--version N] [--date YYYY-MM-DD]
 ```
 Все устройства потеряны, остался только seed phrase:
 
-syncback dr --mnemonic "24 words" --peer <addr>
+viaticum dr --mnemonic "24 words" --peer <addr>
 
 1. Derive identity from seed → IdentityPub
 2. Open fresh DB (remove stale db.redb if any)
@@ -986,7 +986,7 @@ syncback dr --mnemonic "24 words" --peer <addr>
 5. Select freshest blob (max created_at)
 6. Decrypt (ChaCha20-Poly1305 with HKDF-derived key from seed)
 7. Restore DB: files, source blocks, placements, peers, pos_weekly, cluster_state
-8. "Run syncback daemon, then syncback restore <path>"
+8. "Run viaticum daemon, then viaticum restore <path>"
 
 DB snapshots pushed periodically (6h) by daemon → SystemStateBackup → peers store one blob per owner (TTL 365 days).
 ```
@@ -1097,7 +1097,7 @@ Threat model: "lazy not malicious". Для активного противник
 | `MAX_BOARD_SIZE_BYTES` | 8 МБ | Размер relay board |
 | `MAX_MESSAGE_SIZE` | 128 МБ | Максимальный фрейм |
 | `PROTOCOL_VERSION` | 1 | Версия протокола |
-| `ALPN` | `b"syncback/1"` | ALPN идентификатор |
+| `ALPN` | `b"viaticum/1"` | ALPN идентификатор |
 | `SYSTEM_STATE_TTL_SECS` | 31_536_000 (365 дней) | TTL stored system state blobs |
 | `HANDSHAKE_FRESHNESS_SECS` | 300 | Окно свежести handshake (±5 мин) |
 | `KP` | 0.4 | Вес P в trust формуле |

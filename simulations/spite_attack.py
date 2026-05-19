@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #7: Targeted Spite Attack ("Обиженка")
+Viaticum Simulation #7: Targeted Spite Attack ("Обиженка")
 
 Question: How many colluding nodes are needed to deny restore to a specific target?
 How long must they wait, and what is the ROI?

@@ -1,5 +1,5 @@
 #!/bin/bash
-# SyncBack δ.1 Verification: System State Push + Disaster Recovery
+# Viaticum δ.1 Verification: System State Push + Disaster Recovery
 # 20-node Docker network. Run from project root:
 #   bash experiments/docker-beta/dr_test.sh
 #
@@ -14,7 +14,7 @@
 set -euo pipefail
 
 COMPOSE="docker compose -f experiments/docker-beta/compose.yml"
-PREFIX="syncback-beta"
+PREFIX="viaticum-beta"
 NUM_NODES=${1:-5}    # pass node count as arg, default 5
 TIME_SCALE=1000   # system state push every max(6*3600/1000, 60) = 60s
 MNEMONIC_00="cram muscle milk good case boil silver edge cram muscle milk good case boil silver edge cram muscle milk good case boil silver double"
@@ -31,7 +31,7 @@ exec_node_q() { docker exec "$PREFIX-$1" "${@:2}" 2>/dev/null; }
 get_docker_addr() {
     local NODE="$1"
     local CONTAINER="$PREFIX-$NODE"
-    local RAW_ADDR=$(exec_node_q "$NODE" syncback status | grep "addr:" \
+    local RAW_ADDR=$(exec_node_q "$NODE" viaticum status | grep "addr:" \
         | awk '{for(i=1;i<=NF;i++) if($i ~ /@/) print $i}')
     local NODE_ID=$(echo "$RAW_ADDR" | cut -d@ -f1)
     local PORT=$(echo "$RAW_ADDR" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+' \
@@ -43,14 +43,14 @@ get_docker_addr() {
 }
 
 get_peer_count() {
-    exec_node_q "$1" syncback status | grep "peers:" | head -1 | awk '{print $2}'
+    exec_node_q "$1" viaticum status | grep "peers:" | head -1 | awk '{print $2}'
 }
 
 # Wait for daemon to respond (max 15s)
 wait_daemon() {
     local NODE="$1"
     for i in $(seq 1 15); do
-        if exec_node_q "$NODE" syncback status 2>/dev/null | grep -q "identity:"; then
+        if exec_node_q "$NODE" viaticum status 2>/dev/null | grep -q "identity:"; then
             return 0
         fi
         sleep 1
@@ -62,11 +62,11 @@ wait_daemon() {
 start_daemon() {
     local NODE="$1"
     docker exec -d -e RUST_LOG=info "$PREFIX-$NODE" sh -c \
-        "syncback daemon --time-scale $TIME_SCALE --watch-dir /data/files >/tmp/daemon.log 2>&1"
+        "viaticum daemon --time-scale $TIME_SCALE --watch-dir /data/files >/tmp/daemon.log 2>&1"
 }
 
 echo "============================================================"
-echo "  SyncBack δ.1: System State Push + DR Test (${NUM_NODES} nodes)"
+echo "  Viaticum δ.1: System State Push + DR Test (${NUM_NODES} nodes)"
 echo "============================================================"
 
 # ── PHASE 1: SETUP ──────────────────────────────────────────────
@@ -74,22 +74,22 @@ echo ""
 echo "=== Phase 1: Setup ==="
 
 $COMPOSE down -v 2>&1 | tail -1 || true
-# Image must be pre-built: docker build --no-cache -f experiments/docker-beta/Dockerfile -t syncback-beta .
-if ! docker image inspect syncback-beta > /dev/null 2>&1; then
-    echo "  ERROR: syncback-beta image not found. Build it first."
+# Image must be pre-built: docker build --no-cache -f experiments/docker-beta/Dockerfile -t viaticum-beta .
+if ! docker image inspect viaticum-beta > /dev/null 2>&1; then
+    echo "  ERROR: viaticum-beta image not found. Build it first."
     exit 1
 fi
-echo "  Using pre-built syncback-beta image"
+echo "  Using pre-built viaticum-beta image"
 echo "  Starting ${NUM_NODES} containers..."
 $COMPOSE up -d 2>&1 | tail -1
 sleep 3
 
 # Init all nodes
 echo "  Initializing nodes..."
-exec_node node-00 syncback init --mnemonic "$MNEMONIC_00" > /dev/null 2>&1
+exec_node node-00 viaticum init --mnemonic "$MNEMONIC_00" > /dev/null 2>&1
 for i in $(seq 1 $((NUM_NODES-1))); do
     NODE=$(printf "node-%02d" $i)
-    exec_node "$NODE" syncback init > /dev/null 2>&1 &
+    exec_node "$NODE" viaticum init > /dev/null 2>&1 &
 done
 wait
 echo "  ${NUM_NODES} nodes initialized."
@@ -142,7 +142,7 @@ CONNECT_OK=0
 CONNECT_FAIL=0
 for i in $(seq 1 $((NUM_NODES-1))); do
     NODE=$(printf "node-%02d" $i)
-    RESULT=$(exec_node_q "$NODE" syncback connect "$ADDR_00" 2>&1 || true)
+    RESULT=$(exec_node_q "$NODE" viaticum connect "$ADDR_00" 2>&1 || true)
     if echo "$RESULT" | grep -qi "connected"; then
         ((CONNECT_OK++)) || true
     else
@@ -176,7 +176,7 @@ exec_node node-00 sh -c 'dd if=/dev/urandom of=/data/files/test.bin bs=1024 coun
 echo "  Waiting for system state push to node-01 (interval=60s)..."
 BLOB_FOUND=0
 for attempt in $(seq 1 18); do
-    BLOB_LINE=$(exec_node_q node-01 syncback status --json 2>/dev/null \
+    BLOB_LINE=$(exec_node_q node-01 viaticum status --json 2>/dev/null \
         | grep -oE '"system_state_blobs":\s*[0-9]+' || true)
     BLOB_N=$(echo "$BLOB_LINE" | grep -oE '[0-9]+$' || true)
     if [ "${BLOB_N:-0}" -ge 1 ]; then
@@ -209,7 +209,7 @@ fi
 # Show node-00 status
 echo ""
 echo "  node-00 status:"
-exec_node_q node-00 syncback status | head -15
+exec_node_q node-00 viaticum status | head -15
 
 # ── PHASE 4: DISASTER RECOVERY ─────────────────────────────────
 echo ""
@@ -237,22 +237,22 @@ else
         echo "  Restarting container and wiping data..."
         docker start "$PREFIX-node-00" > /dev/null 2>&1
         sleep 2
-        exec_node node-00 sh -c "rm -rf /home/syncback/.syncback/*"
+        exec_node node-00 sh -c "rm -rf /home/viaticum/.viaticum/*"
 
         # Verify wipe
-        if exec_node node-00 test -f /home/syncback/.syncback/identity.key 2>/dev/null; then
+        if exec_node node-00 test -f /home/viaticum/.viaticum/identity.key 2>/dev/null; then
             fail "data wipe failed"
         else
             echo "  node-00 data wiped."
 
             # Run DR
-            echo "  Running: syncback dr --mnemonic '...' --peer <node-01> --peer <node-02>"
+            echo "  Running: viaticum dr --mnemonic '...' --peer <node-01> --peer <node-02>"
             echo ""
             set +e
             DR_ARGS="--mnemonic \"$MNEMONIC_00\" --peer \"$ADDR_01\""
             [ -n "$ADDR_02" ] && DR_ARGS="$DR_ARGS --peer \"$ADDR_02\""
             DR_OUTPUT=$(docker exec -e RUST_LOG=info "$PREFIX-node-00" \
-                sh -c "syncback dr $DR_ARGS" 2>&1)
+                sh -c "viaticum dr $DR_ARGS" 2>&1)
             DR_EXIT=$?
             set -e
 
@@ -282,7 +282,7 @@ else
         start_daemon node-00
         if wait_daemon node-00; then
             echo "  Post-DR status:"
-            exec_node_q node-00 syncback status
+            exec_node_q node-00 viaticum status
             POST_PEERS=$(get_peer_count node-00)
             echo ""
             [ "${POST_PEERS:-0}" -ge 1 ] \

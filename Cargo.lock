@@ -3779,81 +3779,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "syncback"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "async-trait",
- "axum",
- "base64",
- "bip39",
- "blake3",
- "cap-std",
- "chacha20poly1305",
- "ciborium",
- "clap",
- "dirs",
- "ed25519-dalek",
- "futures",
- "hkdf 0.13.0",
- "ignore",
- "libc",
- "libp2p",
- "mimalloc",
- "mime_guess",
- "notify",
- "rand 0.9.4",
- "rand_core 0.6.4",
- "reqwest",
- "rust-embed",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "syncback-core",
- "sysinfo",
- "tempfile",
- "thiserror 2.0.18",
- "tikv-jemallocator",
- "tokio",
- "tokio-util",
- "toml_edit",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "urlencoding",
- "uuid",
- "x25519-dalek",
- "zstd",
-]
-
-[[package]]
-name = "syncback-core"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "chacha20 0.10.0",
- "chacha20poly1305",
- "ciborium",
- "ed25519-dalek",
- "hkdf 0.13.0",
- "rand 0.9.4",
- "rand_core 0.6.4",
- "raptorq",
- "redb",
- "serde",
- "serde_bytes",
- "sha2 0.11.0",
- "tempfile",
- "thiserror 2.0.18",
- "toml",
- "tracing",
- "x25519-dalek",
- "zstd",
-]
-
-[[package]]
 name = "synstructure"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4417,6 +4342,81 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "viaticum"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "base64",
+ "bip39",
+ "blake3",
+ "cap-std",
+ "chacha20poly1305",
+ "ciborium",
+ "clap",
+ "dirs",
+ "ed25519-dalek",
+ "futures",
+ "hkdf 0.13.0",
+ "ignore",
+ "libc",
+ "libp2p",
+ "mimalloc",
+ "mime_guess",
+ "notify",
+ "rand 0.9.4",
+ "rand_core 0.6.4",
+ "reqwest",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tikv-jemallocator",
+ "tokio",
+ "tokio-util",
+ "toml_edit",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "uuid",
+ "viaticum-core",
+ "x25519-dalek",
+ "zstd",
+]
+
+[[package]]
+name = "viaticum-core"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chacha20 0.10.0",
+ "chacha20poly1305",
+ "ciborium",
+ "ed25519-dalek",
+ "hkdf 0.13.0",
+ "rand 0.9.4",
+ "rand_core 0.6.4",
+ "raptorq",
+ "redb",
+ "serde",
+ "serde_bytes",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+ "x25519-dalek",
+ "zstd",
+]
 
 [[package]]
 name = "walkdir"

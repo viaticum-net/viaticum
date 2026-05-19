@@ -12,11 +12,11 @@ You implement Rust modules from detailed task specifications.
 
 1. Read the task spec from `docs/tasks/`
 2. Read existing code in the crate for patterns and conventions
-3. Read `crates/syncback-core/CLAUDE.md` (or `crates/syncback/CLAUDE.md`) for crate-specific rules
+3. Read `crates/viaticum-core/CLAUDE.md` (or `crates/viaticum/CLAUDE.md`) for crate-specific rules
 4. Implement the module following the spec exactly
 5. Write unit tests in `#[cfg(test)] mod tests` in the same file
-6. Run `cargo test -p syncback-core` (or `cargo test -p syncback`) — must pass
-7. Run `cargo clippy -p syncback-core` — must pass with no warnings
+6. Run `cargo test -p viaticum-core` (or `cargo test -p viaticum`) — must pass
+7. Run `cargo clippy -p viaticum-core` — must pass with no warnings
 
 ## Rules
 

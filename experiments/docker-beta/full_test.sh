@@ -1,8 +1,8 @@
 #!/bin/bash
-# SyncBack β Full E2E Test — Phase 7 (P2P wired)
+# Viaticum β Full E2E Test — Phase 7 (P2P wired)
 # Run from project root: bash experiments/docker-beta/full_test.sh
 COMPOSE="docker compose -f experiments/docker-beta/compose.yml"
-PREFIX="syncback-beta"
+PREFIX="viaticum-beta"
 PASS=0
 FAIL=0
 SKIP=0
@@ -15,7 +15,7 @@ exec_node() { docker exec "$PREFIX-$1" "${@:2}"; }
 exec_node_q() { docker exec "$PREFIX-$1" "${@:2}" 2>/dev/null; }
 
 echo "============================================================"
-echo "  SyncBack β Full E2E Test (Phase 7: P2P wired)"
+echo "  Viaticum β Full E2E Test (Phase 7: P2P wired)"
 echo "============================================================"
 
 # ── SETUP ──────────────────────────────────────────────────────
@@ -28,17 +28,17 @@ sleep 2
 
 MNEMONIC_A="cram muscle milk good case boil silver edge cram muscle milk good case boil silver edge cram muscle milk good case boil silver double"
 
-exec_node node-a syncback init --mnemonic "$MNEMONIC_A" > /dev/null
-exec_node node-b syncback init --mnemonic "creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke knock" > /dev/null
-exec_node node-c syncback init --mnemonic "crouch payment artist half drive borrow speak make crouch payment artist half drive borrow speak make crouch payment artist half drive borrow speak off" > /dev/null
-exec_node node-d syncback init --mnemonic "cry predict essence heavy fashion once state pluck cry predict essence heavy fashion once state pluck cry predict essence heavy fashion once state rent" > /dev/null
+exec_node node-a viaticum init --mnemonic "$MNEMONIC_A" > /dev/null
+exec_node node-b viaticum init --mnemonic "creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke grid creek office smoke knock" > /dev/null
+exec_node node-c viaticum init --mnemonic "crouch payment artist half drive borrow speak make crouch payment artist half drive borrow speak make crouch payment artist half drive borrow speak off" > /dev/null
+exec_node node-d viaticum init --mnemonic "cry predict essence heavy fashion once state pluck cry predict essence heavy fashion once state pluck cry predict essence heavy fashion once state rent" > /dev/null
 echo "  4 nodes initialized"
 
 # ── TEST 1: Identity ──────────────────────────────────────────
 echo ""
 echo "=== Test 1: Identity initialization ==="
 
-if exec_node node-a test -f /home/syncback/.syncback/identity.key 2>/dev/null; then
+if exec_node node-a test -f /home/viaticum/.viaticum/identity.key 2>/dev/null; then
     pass "identity.key created"
 else
     fail "identity.key not created"
@@ -50,7 +50,7 @@ echo "=== Test 2: Deterministic identity (DR restore) ==="
 
 # Wipe node-e (not initialized above), init with A's mnemonic
 VPREFIX="docker-beta"
-exec_node node-d syncback init --mnemonic "$MNEMONIC_A" 2>&1 | grep -q "already" && {
+exec_node node-d viaticum init --mnemonic "$MNEMONIC_A" 2>&1 | grep -q "already" && {
     # node-d already initialized with different mnemonic — use node-e instead
     true
 }
@@ -60,7 +60,7 @@ docker volume rm "${VPREFIX}_node-e-data" "${VPREFIX}_node-e-files" > /dev/null 
 $COMPOSE up -d node-e > /dev/null 2>&1
 sleep 2
 
-INIT_E=$(exec_node node-e syncback init --mnemonic "$MNEMONIC_A" 2>&1 | grep "Public key:" | awk '{print $NF}')
+INIT_E=$(exec_node node-e viaticum init --mnemonic "$MNEMONIC_A" 2>&1 | grep "Public key:" | awk '{print $NF}')
 EXPECTED_A="6909f82c6424bc5b544b4b03a6e6d63d4c5a7e7c214e4e4790bf1a0d309025c8"
 
 echo "  Expected: ${EXPECTED_A:0:16}..."
@@ -76,10 +76,10 @@ fi
 echo ""
 echo "=== Test 3: Daemon startup ==="
 
-docker exec -d "$PREFIX-node-a" sh -c 'syncback daemon --watch-dir /data/files 2>/tmp/daemon.log'
+docker exec -d "$PREFIX-node-a" sh -c 'viaticum daemon --watch-dir /data/files 2>/tmp/daemon.log'
 sleep 3
 
-STATUS=$(exec_node_q node-a syncback status || true)
+STATUS=$(exec_node_q node-a viaticum status || true)
 if echo "$STATUS" | grep -q "identity:"; then
     pass "daemon responds to CLI"
     IDENTITY=$(echo "$STATUS" | grep "identity:" | awk '{print $2}')
@@ -103,7 +103,7 @@ echo ""
 echo "=== Test 4: Multiple daemons ==="
 
 for node in node-b node-c node-d; do
-    docker exec -d "$PREFIX-$node" sh -c 'syncback daemon --watch-dir /data/files 2>/tmp/daemon.log'
+    docker exec -d "$PREFIX-$node" sh -c 'viaticum daemon --watch-dir /data/files 2>/tmp/daemon.log'
 done
 sleep 5
 
@@ -112,14 +112,14 @@ ADDR_B=""
 ADDR_C=""
 ADDR_D=""
 for node in node-a node-b node-c node-d; do
-    if exec_node_q $node syncback status 2>/dev/null | grep -q "identity:"; then
+    if exec_node_q $node viaticum status 2>/dev/null | grep -q "identity:"; then
         ((UP_COUNT++)) || true
     fi
 done
 
 # Get addrs separately (more reliable than parsing multi-line status)
 get_addr() {
-    exec_node_q "$1" syncback status 2>/dev/null | grep "addr:" | awk '{for(i=1;i<=NF;i++) if($i ~ /@/) print $i}'
+    exec_node_q "$1" viaticum status 2>/dev/null | grep "addr:" | awk '{for(i=1;i<=NF;i++) if($i ~ /@/) print $i}'
 }
 ADDR_B=$(get_addr node-b)
 ADDR_C=$(get_addr node-c)
@@ -141,7 +141,7 @@ echo "=== Test 5: Peer connect ==="
 
 ADDR_B="${NODE_ADDRS[node-b]}"
 if [ -n "$ADDR_B" ]; then
-    CONNECT_RESULT=$(exec_node_q node-a syncback connect "$ADDR_B" 2>&1 || true)
+    CONNECT_RESULT=$(exec_node_q node-a viaticum connect "$ADDR_B" 2>&1 || true)
     echo "  connect result: $(echo "$CONNECT_RESULT" | head -1)"
     if echo "$CONNECT_RESULT" | grep -qi "connected\|peer"; then
         pass "node-a connected to node-b"
@@ -157,7 +157,7 @@ ADDR_C="${NODE_ADDRS[node-c]}"
 ADDR_D="${NODE_ADDRS[node-d]}"
 CONNECT_OK=1
 if [ -n "$ADDR_C" ]; then
-    RC=$(exec_node_q node-a syncback connect "$ADDR_C" 2>&1 || true)
+    RC=$(exec_node_q node-a viaticum connect "$ADDR_C" 2>&1 || true)
     echo "  A→C: $(echo "$RC" | head -1)"
     echo "$RC" | grep -qi "connected" || CONNECT_OK=0
 else
@@ -165,7 +165,7 @@ else
     CONNECT_OK=0
 fi
 if [ -n "$ADDR_D" ]; then
-    RD=$(exec_node_q node-a syncback connect "$ADDR_D" 2>&1 || true)
+    RD=$(exec_node_q node-a viaticum connect "$ADDR_D" 2>&1 || true)
     echo "  A→D: $(echo "$RD" | head -1)"
     echo "$RD" | grep -qi "connected" || CONNECT_OK=0
 else
@@ -180,7 +180,7 @@ fi
 
 # Verify peers show up in status
 sleep 2
-PEER_STATUS=$(exec_node_q node-a syncback status || true)
+PEER_STATUS=$(exec_node_q node-a viaticum status || true)
 PEER_COUNT=$(echo "$PEER_STATUS" | grep "peers:" | head -1 | sed 's/.*peers:[[:space:]]*//' | awk '{print $1}')
 echo "  peers after connect: $PEER_COUNT"
 if [ "${PEER_COUNT:-0}" -ge 3 ] 2>/dev/null; then
@@ -199,19 +199,19 @@ exec_node node-a sh -c 'echo "hello beta phase 7" > /data/files/test.txt'
 sleep 5
 
 # Check files command
-FILES_OUTPUT=$(exec_node_q node-a syncback files || true)
+FILES_OUTPUT=$(exec_node_q node-a viaticum files || true)
 echo "  files output: $(echo "$FILES_OUTPUT" | head -2)"
 if echo "$FILES_OUTPUT" | grep -q "test.txt"; then
     pass "file detected and tracked"
 else
-    skip "file not yet in syncback files (watcher timing)"
+    skip "file not yet in viaticum files (watcher timing)"
 fi
 
 # ── TEST 7: Status shows backed-up info ───────────────────────
 echo ""
 echo "=== Test 7: Status shows backup info ==="
 
-STATUS_FINAL=$(exec_node_q node-a syncback status || true)
+STATUS_FINAL=$(exec_node_q node-a viaticum status || true)
 echo "$STATUS_FINAL" | head -8
 
 BACKED_UP=$(echo "$STATUS_FINAL" | grep "backed up:" | head -1)

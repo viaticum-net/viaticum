@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #24: Escrow as Credit System
+Viaticum Simulation #24: Escrow as Credit System
 
 Question: Does escrow help when combined with adaptive redundancy? Is it needed?
 
@@ -912,7 +912,7 @@ def save_results(all_results: dict, output_dir: Path, n_seeds: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack Experiment 24: Escrow as Credit System"
+        description="Viaticum Experiment 24: Escrow as Credit System"
     )
     parser.add_argument("--seeds", type=int, default=10, help="Monte Carlo seeds per config")
     parser.add_argument("--jobs", type=int, default=1, help="Parallel jobs")
@@ -922,7 +922,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    print("=== SYNCBACK EXPERIMENT 24: ESCROW AS CREDIT SYSTEM ===")
+    print("=== VIATICUM EXPERIMENT 24: ESCROW AS CREDIT SYSTEM ===")
     print(f"Network: {MAX_NODES} nodes, {N_YEARS} years ({N_WEEKS} weeks)")
     print(f"Trust: multiplicative S -- (0.5*P + 2.0*I) * clamp(S, 0.1, 1.0)")
     print(f"7 archetypes including HitAndRun (15% of arrivals, 10GB file, 0% storage)")

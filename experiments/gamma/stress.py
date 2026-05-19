@@ -29,7 +29,7 @@ def run(cmd: list[str], check: bool = False, timeout: int = 30) -> subprocess.Co
 
 
 def node_status(name: str) -> dict | None:
-    r = run(["docker", "exec", f"gamma-{name}", "syncback", "status", "--json"])
+    r = run(["docker", "exec", f"gamma-{name}", "viaticum", "status", "--json"])
     if r.returncode != 0:
         return None
     try:
@@ -42,22 +42,22 @@ def node_alive(name: str) -> bool:
     # Match the full command line, not the exe name, so we don't count
     # <defunct> zombies (kernel keeps them in proc table until reaped, and
     # our PID 1 is `sleep infinity` which never reaps).
-    r = run(["docker", "exec", f"gamma-{name}", "pgrep", "-f", "syncback daemon"])
+    r = run(["docker", "exec", f"gamma-{name}", "pgrep", "-f", "viaticum daemon"])
     return r.returncode == 0
 
 
 def kill_node(name: str) -> None:
     # `killall` is psmisc, not installed in the minimal Ubuntu container; use pkill
-    # from procps. `-9 -f "syncback daemon"` avoids also killing short-lived CLI
-    # invocations like `syncback status` started by our own inspection commands.
+    # from procps. `-9 -f "viaticum daemon"` avoids also killing short-lived CLI
+    # invocations like `viaticum status` started by our own inspection commands.
     run(["docker", "exec", f"gamma-{name}", "sh", "-c",
-         "pkill -9 -f 'syncback daemon' 2>/dev/null || true"])
+         "pkill -9 -f 'viaticum daemon' 2>/dev/null || true"])
 
 
 def start_node(name: str, time_scale: int = 20000) -> None:
     subprocess.run(
         ["docker", "exec", "-d", f"gamma-{name}", "sh", "-c",
-         f"RUST_LOG=info syncback daemon --time-scale {time_scale} --watch-dir /data/files >>/tmp/daemon.log 2>&1"],
+         f"RUST_LOG=info viaticum daemon --time-scale {time_scale} --watch-dir /data/files >>/tmp/daemon.log 2>&1"],
         check=False,
     )
 
@@ -190,9 +190,9 @@ def scenario_restore_flood(args):
     print("[stress] Initiating concurrent restores on all 5 owners")
 
     for o in owners:
-        # Parse text output of `syncback files` — grab first path on a line
+        # Parse text output of `viaticum files` — grab first path on a line
         # starting with two spaces (indented file entries).
-        r = run(["docker", "exec", f"gamma-{o}", "syncback", "files"])
+        r = run(["docker", "exec", f"gamma-{o}", "viaticum", "files"])
         if r.returncode != 0:
             print(f"  {o}: files query failed")
             continue
@@ -210,7 +210,7 @@ def scenario_restore_flood(args):
         out = f"/tmp/restored_{o}.bin"
         subprocess.run(
             ["docker", "exec", "-d", f"gamma-{o}", "sh", "-c",
-             f"syncback restore '{first_path}' --dest {out} >/tmp/restore.log 2>&1"],
+             f"viaticum restore '{first_path}' --dest {out} >/tmp/restore.log 2>&1"],
             check=False,
         )
         print(f"  {o}: restore of {first_path} kicked off → {out}")
@@ -246,14 +246,14 @@ def scenario_bitrot(args):
 
     # Find a non-empty block directory on the holder
     r = run(["docker", "exec", f"gamma-{target_holder}", "sh", "-c",
-             "ls /home/syncback/.syncback/holdings/ 2>/dev/null | head -3"])
+             "ls /home/viaticum/.viaticum/holdings/ 2>/dev/null | head -3"])
     if not r.stdout.strip():
         print(f"[stress] {target_holder} has no holdings, skipping")
         return
     block_dir = r.stdout.strip().splitlines()[0]
 
     r = run(["docker", "exec", f"gamma-{target_holder}", "sh", "-c",
-             f"ls /home/syncback/.syncback/holdings/{block_dir}/*.bin 2>/dev/null | head -1"])
+             f"ls /home/viaticum/.viaticum/holdings/{block_dir}/*.bin 2>/dev/null | head -1"])
     if not r.stdout.strip():
         print(f"[stress] block dir {block_dir} empty, skipping")
         return

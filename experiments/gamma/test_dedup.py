@@ -63,7 +63,7 @@ def compose(*args, timeout=120):
 
 
 def node_status(name):
-    raw = exec_node(name, "syncback", "status", "--json")
+    raw = exec_node(name, "viaticum", "status", "--json")
     return json.loads(raw)
 
 
@@ -98,12 +98,12 @@ disk_reserve_gb = 0.0
 enable_relay = false
 """
     exec_node(name, "sh", "-c",
-              f"cat > /home/syncback/.syncback/config.toml << 'EOFCFG'\n{config}EOFCFG")
+              f"cat > /home/viaticum/.viaticum/config.toml << 'EOFCFG'\n{config}EOFCFG")
 
 
 def start_daemon(name, ts):
     exec_node_bg(name, "sh", "-c",
-                 f"RUST_LOG=info syncback daemon --time-scale {ts} "
+                 f"RUST_LOG=info viaticum daemon --time-scale {ts} "
                  f"--watch-dir /data/files >/tmp/daemon.log 2>&1")
 
 
@@ -141,7 +141,7 @@ def main():
         print("Phase 1: Init, configure, and start all nodes")
         for name in nodes:
             try:
-                exec_node(name, "syncback", "init")
+                exec_node(name, "viaticum", "init")
             except RuntimeError as e:
                 if "already initialized" not in str(e):
                     raise
@@ -153,9 +153,9 @@ def main():
 
         # -- Phase 2: Discovery --
         print("Phase 2: Peer discovery")
-        addr0 = json.loads(exec_node(owner, "syncback", "status", "--json")).get("node_addr", "")
+        addr0 = json.loads(exec_node(owner, "viaticum", "status", "--json")).get("node_addr", "")
         for name in nodes[1:]:
-            exec_node_quiet(name, "syncback", "connect", addr0, timeout=15)
+            exec_node_quiet(name, "viaticum", "connect", addr0, timeout=15)
 
         ok = wait_for(
             "All nodes discover peers",
@@ -198,7 +198,7 @@ def main():
 
         # -- Phase 4: Get file_a's source block ID --
         print("Phase 4: Record file_a's source block ID")
-        versions_a = exec_node(owner, "syncback", "versions", "/data/files/file_a.dat")
+        versions_a = exec_node(owner, "viaticum", "versions", "/data/files/file_a.dat")
         print(f"    versions output:\n    {versions_a[:200]}")
 
         # Parse source_block_id from versions output
@@ -272,7 +272,7 @@ def main():
             restore_dir = f"/tmp/restored_dedup_{fname}"
             src_path = f"/data/files/{fname}"
             try:
-                exec_node(owner, "syncback", "restore", src_path,
+                exec_node(owner, "viaticum", "restore", src_path,
                           "--dest", restore_dir, timeout=60)
                 orig_hash = exec_node(owner, "md5sum", src_path).split()[0]
                 restored_file = f"{restore_dir}{src_path}"

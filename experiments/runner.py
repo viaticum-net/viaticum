@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SyncBack experiment runner — manages Docker containers and sends CLI commands."""
+"""Viaticum experiment runner — manages Docker containers and sends CLI commands."""
 
 import json
 import subprocess
@@ -11,7 +11,7 @@ from datetime import datetime
 
 
 class Node:
-    """Represents a single syncback node running in Docker."""
+    """Represents a single viaticum node running in Docker."""
 
     def __init__(self, container_name: str):
         self.container = container_name
@@ -32,13 +32,13 @@ class Node:
 
     def init(self, mnemonic: str) -> str:
         """Initialize the node with a mnemonic. Returns identity hex."""
-        output = self.exec("syncback", "init", "--mnemonic", mnemonic)
+        output = self.exec("viaticum", "init", "--mnemonic", mnemonic)
         return output
 
     def start_daemon(self, time_scale: int = 1, quota_gb: int = 100,
                      includes: Optional[list[str]] = None) -> None:
         """Start the daemon in background."""
-        args = ["syncback", "daemon", "--time-scale", str(time_scale),
+        args = ["viaticum", "daemon", "--time-scale", str(time_scale),
                 "--quota-gb", str(quota_gb)]
         if includes:
             for inc in includes:
@@ -58,20 +58,20 @@ class Node:
 
     def status(self) -> dict:
         """Query daemon status via CLI JSON output."""
-        raw = self.exec("syncback", "status", "--json")
+        raw = self.exec("viaticum", "status", "--json")
         return json.loads(raw)
 
     def connect_peer(self, node_addr: str) -> str:
         """Connect to another peer by node address."""
-        return self.exec("syncback", "connect", node_addr)
+        return self.exec("viaticum", "connect", node_addr)
 
     def backup(self) -> str:
         """Trigger immediate backup."""
-        return self.exec("syncback", "backup")
+        return self.exec("viaticum", "backup")
 
     def stop(self) -> str:
         """Gracefully stop daemon."""
-        return self.exec("syncback", "stop")
+        return self.exec("viaticum", "stop")
 
     def get_node_addr(self) -> str:
         """Get this node's addr from status."""
@@ -102,7 +102,7 @@ class Node:
 
 
 class Cluster:
-    """Manages a cluster of syncback nodes via Docker Compose."""
+    """Manages a cluster of viaticum nodes via Docker Compose."""
 
     def __init__(self, compose_file: str = "experiments/docker/compose.yml",
                  project_dir: str = "."):

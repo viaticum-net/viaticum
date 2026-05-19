@@ -1,5 +1,5 @@
 """
-SyncBack Experiment 25: Full Model Integration
+Viaticum Experiment 25: Full Model Integration
 
 Acceptance test combining ALL best configurations from Experiments 21-24:
   - Multiplicative S: trust = (kp*P + ki*I) * clamp(S, 0.1, 1.0), kp=0.5, ki=2.0
@@ -1388,7 +1388,7 @@ def _parse_scenarios(arg: str) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack Experiment 25: Full Model Integration"
+        description="Viaticum Experiment 25: Full Model Integration"
     )
     parser.add_argument(
         "--scenario",
@@ -1422,7 +1422,7 @@ def main() -> None:
         print(f"Error: {e}")
         return
 
-    print("=== SYNCBACK EXPERIMENT 25: FULL MODEL INTEGRATION ===", flush=True)
+    print("=== VIATICUM EXPERIMENT 25: FULL MODEL INTEGRATION ===", flush=True)
     print(f"Scenarios: {scenarios_to_run}", flush=True)
     print(
         f"Network: {MAX_NODES} nodes, {N_YEARS} years ({N_WEEKS} weeks), "

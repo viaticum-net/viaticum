@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #2: Data Survival Under Churn
+Viaticum Simulation #2: Data Survival Under Churn
 
 Question: What fraction of files survive 1-5 years with 30-50% annual churn?
 How does erasure coding (k-of-n) affect survival?

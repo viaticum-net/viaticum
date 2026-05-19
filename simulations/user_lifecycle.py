@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #11: User Lifecycle
+Viaticum Simulation #11: User Lifecycle
 
 Question: How does a single user experience the system from day 0 to year N?
 
@@ -766,7 +766,7 @@ def save_results(result: dict, path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SyncBack Exp 11: User Lifecycle"
+        description="Viaticum Exp 11: User Lifecycle"
     )
     parser.add_argument("--bg-peers", type=int, default=200,
                         help="Number of background peers (default: 200)")

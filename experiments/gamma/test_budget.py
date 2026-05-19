@@ -81,7 +81,7 @@ def compose(*args, timeout=120):
 
 
 def node_status(name):
-    raw = exec_node(name, "syncback", "status", "--json")
+    raw = exec_node(name, "viaticum", "status", "--json")
     return json.loads(raw)
 
 
@@ -120,7 +120,7 @@ enable_relay = false
         for wc in watch_configs:
             config += f'\n[[watch]]\npath = "{wc["path"]}"\nimportance = {wc["importance"]}\n'
     exec_node(name, "sh", "-c",
-              f"cat > /home/syncback/.syncback/config.toml << 'EOFCFG'\n{config}EOFCFG")
+              f"cat > /home/viaticum/.viaticum/config.toml << 'EOFCFG'\n{config}EOFCFG")
 
 
 def write_holder_config(name):
@@ -136,12 +136,12 @@ disk_reserve_gb = 0.0
 enable_relay = false
 """
     exec_node(name, "sh", "-c",
-              f"cat > /home/syncback/.syncback/config.toml << 'EOFCFG'\n{config}EOFCFG")
+              f"cat > /home/viaticum/.viaticum/config.toml << 'EOFCFG'\n{config}EOFCFG")
 
 
 def start_daemon(name, ts):
     exec_node_bg(name, "sh", "-c",
-                 f"RUST_LOG=info syncback daemon --time-scale {ts} "
+                 f"RUST_LOG=info viaticum daemon --time-scale {ts} "
                  f"--watch-dir /data/files >/tmp/daemon.log 2>&1")
 
 
@@ -158,7 +158,7 @@ def create_files(owner, directory, prefix, count, size_kb=200):
 def count_backed_up_in_dir(owner, directory):
     """Count files from `directory` that are ACTUALLY backed up (have versions, not pending)."""
     try:
-        files_output = exec_node(owner, "syncback", "files")
+        files_output = exec_node(owner, "viaticum", "files")
         count = 0
         for line in files_output.split("\n"):
             # Only count lines that have the directory AND show a version (not "pending   0 B")
@@ -206,7 +206,7 @@ def main():
         print("Phase 1: Init, configure, and start")
         for name in nodes:
             try:
-                exec_node(name, "syncback", "init")
+                exec_node(name, "viaticum", "init")
             except RuntimeError as e:
                 if "already initialized" not in str(e):
                     raise
@@ -234,9 +234,9 @@ def main():
 
         # -- Phase 2: Discovery --
         print("Phase 2: Peer discovery")
-        addr0 = json.loads(exec_node(owner, "syncback", "status", "--json")).get("node_addr", "")
+        addr0 = json.loads(exec_node(owner, "viaticum", "status", "--json")).get("node_addr", "")
         for name in holders:
-            exec_node_quiet(name, "syncback", "connect", addr0, timeout=15)
+            exec_node_quiet(name, "viaticum", "connect", addr0, timeout=15)
 
         ok = wait_for(
             "Peer discovery",

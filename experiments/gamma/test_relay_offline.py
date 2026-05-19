@@ -70,7 +70,7 @@ def compose(*args, timeout=120):
 
 
 def node_status(name):
-    raw = exec_node(name, "syncback", "status", "--json")
+    raw = exec_node(name, "viaticum", "status", "--json")
     return json.loads(raw)
 
 
@@ -159,7 +159,7 @@ def main():
         print("Phase 1: Init all nodes")
         for name in nodes:
             try:
-                exec_node(name, "syncback", "init")
+                exec_node(name, "viaticum", "init")
             except RuntimeError as e:
                 if "already initialized" not in str(e):
                     raise
@@ -179,24 +179,24 @@ disk_reserve_gb = 0.0
 enable_relay = false
 """
             exec_node(name, "sh", "-c",
-                      f"cat > /home/syncback/.syncback/config.toml << 'EOFCFG'\n{config}EOFCFG")
+                      f"cat > /home/viaticum/.viaticum/config.toml << 'EOFCFG'\n{config}EOFCFG")
         print(f"  Config written\n")
 
         # ── Phase 3: Start daemons ───────────────────────────────────────
         print(f"Phase 3: Start daemons (time_scale={ts})")
         for name in nodes:
             exec_node_bg(name, "sh", "-c",
-                         f"RUST_LOG=info syncback daemon --time-scale {ts} "
+                         f"RUST_LOG=info viaticum daemon --time-scale {ts} "
                          f"--watch-dir /data/files >/tmp/daemon.log 2>&1")
         time.sleep(5)
         print(f"  Daemons started\n")
 
         # ── Phase 4: Bootstrap discovery ──────────────────────────────────
         print("Phase 4: Bootstrap peer discovery")
-        addr0 = exec_node(nodes[0], "syncback", "status", "--json")
+        addr0 = exec_node(nodes[0], "viaticum", "status", "--json")
         addr0 = json.loads(addr0).get("node_addr", "")
         for name in nodes[1:]:
-            exec_node_quiet(name, "syncback", "connect", addr0, timeout=15)
+            exec_node_quiet(name, "viaticum", "connect", addr0, timeout=15)
 
         ok = wait_for(
             "All nodes discover peers",
@@ -288,12 +288,12 @@ enable_relay = false
 
         # Restart daemon (container restart doesn't auto-start the daemon)
         exec_node_bg(offline_node, "sh", "-c",
-                     f"RUST_LOG=info syncback daemon --time-scale {ts} "
+                     f"RUST_LOG=info viaticum daemon --time-scale {ts} "
                      f"--watch-dir /data/files >/tmp/daemon.log 2>&1")
         time.sleep(5)
 
         # Re-connect to bootstrap so board sync can happen
-        exec_node_quiet(offline_node, "syncback", "connect", addr0, timeout=15)
+        exec_node_quiet(offline_node, "viaticum", "connect", addr0, timeout=15)
         print(f"    {offline_node} restarted and reconnected")
         print()
 
@@ -350,9 +350,9 @@ enable_relay = false
         # Force a reconnection by having offline_node connect to another peer
         if len(relay_nodes) > 0:
             # Get another node's address and connect offline_node to it
-            addr_relay = exec_node(relay_nodes[0], "syncback", "status", "--json")
+            addr_relay = exec_node(relay_nodes[0], "viaticum", "status", "--json")
             addr_relay = json.loads(addr_relay).get("node_addr", "")
-            exec_node_quiet(offline_node, "syncback", "connect", addr_relay, timeout=15)
+            exec_node_quiet(offline_node, "viaticum", "connect", addr_relay, timeout=15)
             time.sleep(10)
 
         # PoS should continue but NOT spike from duplicate old messages
@@ -374,7 +374,7 @@ enable_relay = false
         restore_dir = "/tmp/restored"
         try:
             src_path = "/data/files/relay_test_a.txt"
-            exec_node(backup_node, "syncback", "restore", src_path,
+            exec_node(backup_node, "viaticum", "restore", src_path,
                       "--dest", restore_dir, timeout=60)
             restored_file = f"{restore_dir}{src_path}"
             orig_hash = exec_node(backup_node, "md5sum", src_path).split()[0]

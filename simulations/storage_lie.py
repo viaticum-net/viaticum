@@ -1,5 +1,5 @@
 """
-SyncBack Simulation #8: Storage Lie + Proof-of-Storage
+Viaticum Simulation #8: Storage Lie + Proof-of-Storage
 
 Question: How quickly does proof-of-storage detect liars, and does repair
 outpace the lie?

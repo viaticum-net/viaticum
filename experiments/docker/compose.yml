@@ -3,64 +3,64 @@ services:
     build:
       context: ../..
       dockerfile: experiments/docker/Dockerfile
-    container_name: syncback-node-a
+    container_name: viaticum-node-a
     hostname: node-a
     volumes:
-      - node-a-data:/home/syncback/.syncback
+      - node-a-data:/home/viaticum/.viaticum
       - node-a-files:/data/files
     networks:
-      - syncback-net
+      - viaticum-net
 
   node-b:
     build:
       context: ../..
       dockerfile: experiments/docker/Dockerfile
-    container_name: syncback-node-b
+    container_name: viaticum-node-b
     hostname: node-b
     volumes:
-      - node-b-data:/home/syncback/.syncback
+      - node-b-data:/home/viaticum/.viaticum
       - node-b-files:/data/files
     networks:
-      - syncback-net
+      - viaticum-net
 
   node-c:
     build:
       context: ../..
       dockerfile: experiments/docker/Dockerfile
-    container_name: syncback-node-c
+    container_name: viaticum-node-c
     hostname: node-c
     volumes:
-      - node-c-data:/home/syncback/.syncback
+      - node-c-data:/home/viaticum/.viaticum
       - node-c-files:/data/files
     networks:
-      - syncback-net
+      - viaticum-net
 
   node-d:
     build:
       context: ../..
       dockerfile: experiments/docker/Dockerfile
-    container_name: syncback-node-d
+    container_name: viaticum-node-d
     hostname: node-d
     volumes:
-      - node-d-data:/home/syncback/.syncback
+      - node-d-data:/home/viaticum/.viaticum
       - node-d-files:/data/files
     networks:
-      - syncback-net
+      - viaticum-net
 
   node-e:
     build:
       context: ../..
       dockerfile: experiments/docker/Dockerfile
-    container_name: syncback-node-e
+    container_name: viaticum-node-e
     hostname: node-e
     volumes:
-      - node-e-data:/home/syncback/.syncback
+      - node-e-data:/home/viaticum/.viaticum
       - node-e-files:/data/files
     networks:
-      - syncback-net
+      - viaticum-net
 
 networks:
-  syncback-net:
+  viaticum-net:
     driver: bridge
 
 volumes:
