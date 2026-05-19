@@ -5,7 +5,8 @@ use crate::constants::{
 use crate::erasure::Symbol;
 use crate::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp, sig_serde};
 use chacha20poly1305::ChaCha20Poly1305;
-use chacha20poly1305::aead::{AeadInPlace, NewAead};
+use chacha20poly1305::KeyInit;
+use chacha20poly1305::aead::AeadInPlace;
 use ed25519_dalek::Signer;
 use hkdf::Hkdf;
 use sha2::Sha256;
