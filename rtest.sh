@@ -13,10 +13,15 @@ if ssh -o ConnectTimeout=2 -o BatchMode=yes "$SERVER" "echo ok" &>/dev/null; the
         --exclude .claude \
         --exclude '.git/objects' \
         . "$SERVER:~/$REMOTE_DIR/"
-    ssh "$SERVER" "source ~/.cargo/env && cd ~/$REMOTE_DIR && cargo test $ARGS"
+    ssh "$SERVER" "source ~/.cargo/env && cd ~/$REMOTE_DIR && \
+        cargo fmt --all --check && \
+        cargo test $ARGS && \
+        cargo clippy --workspace --all-targets -- -D warnings"
     echo "=== Done (remote) ==="
 else
     echo "=== Server offline, testing locally ==="
+    cargo fmt --all --check
     cargo test $ARGS
+    cargo clippy --workspace --all-targets -- -D warnings
     echo "=== Done (local) ==="
 fi

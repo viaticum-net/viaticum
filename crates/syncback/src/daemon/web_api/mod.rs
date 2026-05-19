@@ -17,41 +17,35 @@ pub(super) async fn add_security_headers(
     use axum::http::HeaderValue;
     let mut response = response;
     let headers = response.headers_mut();
-    headers.insert(
-        "referrer-policy",
-        HeaderValue::from_static("no-referrer"),
-    );
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     headers.insert(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    headers.insert(
-        "x-frame-options",
-        HeaderValue::from_static("DENY"),
-    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     response
 }
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
-use axum::Router;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::types::{
     CliRequest, CliResponse, DeviceEntry, FileEntry, StatusData, VersionEntry,
 };
+use crate::daemon::config_admin::{ConfigAdminError, EditableConfig};
 use crate::daemon::dispatch::dispatch;
 use crate::daemon::handle::DaemonState;
-use crate::daemon::config_admin::{ConfigAdminError, EditableConfig};
 use crate::daemon::watch_admin::{
     AddWatchRequest, DeleteWatchQuery, PatchWatchRequest, WatchAdminError, WatchDefaults,
     WatchEntry,
 };
-use crate::daemon::web_auth::{auth_start_handler, require_auth, AuthState};
+use crate::daemon::web_auth::{AuthState, auth_start_handler, require_auth};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -100,13 +94,22 @@ pub async fn start_with_listener(
             "/api/watches",
             axum::routing::get(handle_watches_list).post(handle_watches_add),
         )
-        .route("/api/watches/defaults", axum::routing::get(handle_watches_defaults))
-        .route("/api/watches/refresh", axum::routing::post(handle_watches_refresh))
+        .route(
+            "/api/watches/defaults",
+            axum::routing::get(handle_watches_defaults),
+        )
+        .route(
+            "/api/watches/refresh",
+            axum::routing::post(handle_watches_refresh),
+        )
         .route(
             "/api/watches/{path_b64}",
             axum::routing::patch(handle_watches_patch).delete(handle_watches_delete),
         )
-        .route("/api/watches/{path_b64}/scan", axum::routing::post(handle_watches_scan))
+        .route(
+            "/api/watches/{path_b64}/scan",
+            axum::routing::post(handle_watches_scan),
+        )
         .route("/api/browse", axum::routing::get(handle_browse))
         .route(
             "/api/config",
@@ -166,7 +169,10 @@ async fn handle_status(
     match dispatch(CliRequest::Status, &state).await {
         CliResponse::Status(data) => Ok(Json(data)),
         CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
-        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "unexpected response".into())),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected response".into(),
+        )),
     }
 }
 
@@ -179,10 +185,20 @@ async fn handle_files(
     State(state): State<Arc<DaemonState>>,
     Query(q): Query<FilesQuery>,
 ) -> Result<Json<Vec<FileEntry>>, (StatusCode, String)> {
-    match dispatch(CliRequest::Files { path_prefix: q.prefix }, &state).await {
+    match dispatch(
+        CliRequest::Files {
+            path_prefix: q.prefix,
+        },
+        &state,
+    )
+    .await
+    {
         CliResponse::Files(data) => Ok(Json(data)),
         CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
-        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "unexpected response".into())),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected response".into(),
+        )),
     }
 }
 
@@ -198,7 +214,10 @@ async fn handle_versions(
     match dispatch(CliRequest::Versions { path: q.path }, &state).await {
         CliResponse::Versions(data) => Ok(Json(data)),
         CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
-        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "unexpected response".into())),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected response".into(),
+        )),
     }
 }
 
@@ -249,7 +268,10 @@ async fn handle_devices(
     match dispatch(CliRequest::DeviceList, &state).await {
         CliResponse::DeviceList(data) => Ok(Json(data)),
         CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
-        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "unexpected response".into())),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected response".into(),
+        )),
     }
 }
 
@@ -265,7 +287,10 @@ async fn handle_device_add(
     match dispatch(CliRequest::DeviceAdd { label: body.label }, &state).await {
         CliResponse::DeviceAdded(entry) => Ok(Json(entry)),
         CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
-        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "unexpected response".into())),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected response".into(),
+        )),
     }
 }
 
@@ -276,7 +301,10 @@ async fn handle_device_revoke(
     match dispatch(CliRequest::DeviceRevoke { device_id_hex }, &state).await {
         CliResponse::DeviceRevoked { .. } => Ok(StatusCode::NO_CONTENT),
         CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
-        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "unexpected response".into())),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected response".into(),
+        )),
     }
 }
 
@@ -290,11 +318,12 @@ async fn handle_connect(
     Json(body): Json<ConnectBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match dispatch(CliRequest::Connect { addr: body.addr }, &state).await {
-        CliResponse::Connected { peer_id } => {
-            Ok(Json(serde_json::json!({ "peer_id": peer_id })))
-        }
+        CliResponse::Connected { peer_id } => Ok(Json(serde_json::json!({ "peer_id": peer_id }))),
         CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
-        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "unexpected response".into())),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected response".into(),
+        )),
     }
 }
 
@@ -308,9 +337,9 @@ fn watch_admin_err(e: WatchAdminError) -> (StatusCode, String) {
             StatusCode::BAD_REQUEST
         }
         WatchAdminError::Nested { .. } => StatusCode::CONFLICT,
-        WatchAdminError::ConfigSave(_)
-        | WatchAdminError::Db(_)
-        | WatchAdminError::WatcherGone => StatusCode::INTERNAL_SERVER_ERROR,
+        WatchAdminError::ConfigSave(_) | WatchAdminError::Db(_) | WatchAdminError::WatcherGone => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     };
     (status, e.to_string())
 }
@@ -356,7 +385,10 @@ async fn handle_watches_patch(
     Json(body): Json<PatchWatchRequest>,
 ) -> Result<Json<WatchEntry>, (StatusCode, String)> {
     let admin = require_watch_admin(&state)?;
-    let entry = admin.patch_watch(&path_b64, body).await.map_err(watch_admin_err)?;
+    let entry = admin
+        .patch_watch(&path_b64, body)
+        .await
+        .map_err(watch_admin_err)?;
     Ok(Json(entry))
 }
 
@@ -437,10 +469,7 @@ async fn handle_config_put(
         Ok(()) => (StatusCode::OK, Json(ConfigPutOk { ok: true })).into_response(),
         Err(ConfigAdminError::Validation { field, msg }) => (
             StatusCode::BAD_REQUEST,
-            Json(ConfigPutErr {
-                field,
-                error: msg,
-            }),
+            Json(ConfigPutErr { field, error: msg }),
         )
             .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -471,7 +500,10 @@ async fn handle_restart(
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         gate.trigger(&token);
     });
-    Ok((StatusCode::ACCEPTED, Json(RestartScheduled { scheduled: true })))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RestartScheduled { scheduled: true }),
+    ))
 }
 
 // ── Filesystem browser ────────────────────────────────────────────────────────
@@ -507,25 +539,34 @@ async fn handle_browse(
         PathBuf::from(&raw)
     };
     let canonical = expanded.canonicalize().map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("cannot resolve {}: {e}", expanded.display()))
+        (
+            StatusCode::BAD_REQUEST,
+            format!("cannot resolve {}: {e}", expanded.display()),
+        )
     })?;
     if !canonical.is_dir() {
-        return Err((StatusCode::BAD_REQUEST, format!("not a directory: {}", canonical.display())));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("not a directory: {}", canonical.display()),
+        ));
     }
-    let read = std::fs::read_dir(&canonical).map_err(|e| {
-        (StatusCode::FORBIDDEN, format!("cannot read directory: {e}"))
-    })?;
+    let read = std::fs::read_dir(&canonical)
+        .map_err(|e| (StatusCode::FORBIDDEN, format!("cannot read directory: {e}")))?;
     let mut entries: Vec<BrowseEntry> = read
         .filter_map(|res| res.ok())
         .filter_map(|d| {
             let name = d.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') { return None; }
+            if name.starts_with('.') {
+                return None;
+            }
             let is_dir = d.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if !is_dir { return None; }
+            if !is_dir {
+                return None;
+            }
             Some(BrowseEntry { name, is_dir })
         })
         .collect();
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    entries.sort_by_key(|a| a.name.to_lowercase());
     let parent = canonical.parent().map(|p| p.to_string_lossy().into_owned());
     Ok(Json(BrowseResponse {
         path: canonical.to_string_lossy().into_owned(),

@@ -9,8 +9,8 @@ use extensions::{MEDIA_EXTENSIONS, TEXT_OR_CODE_EXTENSIONS};
 
 pub mod burst;
 pub use burst::{
-    apply_burst_downweight, burst_downweight_selects, detect_bursts, is_in_any_burst,
-    BURST_MIN_COUNT, BURST_WINDOW,
+    BURST_MIN_COUNT, BURST_WINDOW, apply_burst_downweight, burst_downweight_selects, detect_bursts,
+    is_in_any_burst,
 };
 
 #[cfg(test)]
@@ -98,10 +98,7 @@ fn path_bucket(path: &Path) -> u8 {
 ///
 /// Only called when `path.extension() == None`.
 fn is_special_text_filename(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     matches!(
         name,
         "Dockerfile"

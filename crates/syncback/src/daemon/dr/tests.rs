@@ -3,7 +3,9 @@
 // Network-dependent BFS logic is exercised by integration tests only.
 // Unit tests here cover the decrypt_and_restore contract.
 
-use crate::daemon::system_state::{decrypt_and_restore, snapshot_and_encrypt, SYSTEM_STATE_VERSION};
+use crate::daemon::system_state::{
+    SYSTEM_STATE_VERSION, decrypt_and_restore, snapshot_and_encrypt,
+};
 
 #[test]
 fn dr_decrypt_and_restore_roundtrip() {
@@ -51,7 +53,7 @@ fn dr_freshest_blob_selected_by_created_at() {
     ];
 
     let mut sorted = blobs.clone();
-    sorted.sort_by(|a, b| b.0.cmp(&a.0));
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.0));
 
     assert_eq!(sorted[0].0, 3000);
     assert_eq!(sorted[0].1, vec![4, 5, 6]);
@@ -74,7 +76,9 @@ fn dr_no_blob_anywhere_returns_graceful_error() {
 
     // This is the exact condition from run_dr (mod.rs line ~100).
     let result: anyhow::Result<()> = if blobs.is_empty() {
-        Err(anyhow::anyhow!("no system state blobs found during BFS discovery"))
+        Err(anyhow::anyhow!(
+            "no system state blobs found during BFS discovery"
+        ))
     } else {
         Ok(())
     };

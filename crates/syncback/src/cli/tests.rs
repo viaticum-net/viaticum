@@ -17,7 +17,10 @@ fn parse(args: &[&str]) -> Command {
 
 #[test]
 fn command_status_parses_correctly() {
-    assert!(matches!(parse(&["syncback", "status"]), Command::Status { json: false }));
+    assert!(matches!(
+        parse(&["syncback", "status"]),
+        Command::Status { json: false }
+    ));
 }
 
 #[test]
@@ -380,7 +383,10 @@ fn format_files_single_entry_singular_version() {
     }];
     let rendered = output::render_files(&files);
     assert!(rendered.contains("1 version"), "got: {rendered}");
-    assert!(!rendered.contains("1 versions"), "should be singular: {rendered}");
+    assert!(
+        !rendered.contains("1 versions"),
+        "should be singular: {rendered}"
+    );
     // 250000 / 1024 = 244.14... → 244 KB
     assert!(rendered.contains("244 KB"), "got: {rendered}");
 }
@@ -515,7 +521,10 @@ fn format_device_list_device_id_truncated_to_16_chars() {
     let rendered = output::render_device_list(&devices);
     let expected_prefix = &full_id[..16];
     assert!(rendered.contains(expected_prefix), "got: {rendered}");
-    assert!(!rendered.contains(&full_id), "full id should be truncated: {rendered}");
+    assert!(
+        !rendered.contains(&full_id),
+        "full id should be truncated: {rendered}"
+    );
 }
 
 // ============================================================
@@ -563,7 +572,10 @@ fn format_restore_short_hash_not_truncated() {
     };
     let rendered = output::render_restore(&data);
     assert!(rendered.contains("aabb"), "got: {rendered}");
-    assert!(!rendered.contains("..."), "short hash should not have ellipsis: {rendered}");
+    assert!(
+        !rendered.contains("..."),
+        "short hash should not have ellipsis: {rendered}"
+    );
 }
 
 // ============================================================
@@ -596,7 +608,10 @@ fn format_device_added_short_id_not_truncated() {
     };
     let rendered = output::render_device_added(&device);
     assert!(rendered.contains("abcd"), "got: {rendered}");
-    assert!(!rendered.contains("..."), "short id should not have ellipsis: {rendered}");
+    assert!(
+        !rendered.contains("..."),
+        "short id should not have ellipsis: {rendered}"
+    );
 }
 
 // ============================================================
@@ -614,7 +629,10 @@ fn format_device_revoked_truncates_long_id() {
 #[test]
 fn format_device_revoked_short_id_shown_in_full() {
     let rendered = output::render_device_revoked("abcdef");
-    assert!(rendered.contains("device revoked: abcdef"), "got: {rendered}");
+    assert!(
+        rendered.contains("device revoked: abcdef"),
+        "got: {rendered}"
+    );
 }
 
 // ============================================================
@@ -745,7 +763,6 @@ fn build_auth_url_percent_encodes_special_chars() {
     let url = super::build_auth_start_url(&conn);
     assert_eq!(url, "http://127.0.0.1:1234/auth/start?token=a%20b%2Fc%2Bd");
 }
-
 
 // ============================================================
 // CBOR roundtrip tests

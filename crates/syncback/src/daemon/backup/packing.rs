@@ -2,7 +2,7 @@
 // plaintext = cbor_serialize(Vec<PackEntry>) + [file1_bytes] + [file2_bytes] + ...
 // PackEntry.offset is relative to the first byte AFTER the CBOR index.
 
-use syncback_core::types::{from_cbor_bytes, to_cbor_bytes, FileId, PackEntry};
+use syncback_core::types::{FileId, PackEntry, from_cbor_bytes, to_cbor_bytes};
 
 use super::QueuedFile;
 
@@ -56,7 +56,10 @@ pub fn parse_pack_index(data: &[u8]) -> anyhow::Result<ParsedPack> {
 /// Extract file bytes for a given FileId from decoded (decrypted + decompressed) plaintext.
 ///
 /// Returns `None` if `file_id` is not found in the pack.
-pub fn extract_file_from_pack(plaintext: &[u8], file_id: FileId) -> anyhow::Result<Option<Vec<u8>>> {
+pub fn extract_file_from_pack(
+    plaintext: &[u8],
+    file_id: FileId,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let parsed = parse_pack_index(plaintext)?;
     let file_data_start = parsed.index_len;
     let file_data = &plaintext[file_data_start..];

@@ -86,9 +86,8 @@ impl PeerBackoff {
         let filtered: Vec<T> = match self.cooldowns.lock() {
             Ok(map) => {
                 let now = Instant::now();
-                let in_backoff = |id: &DeviceId| {
-                    map.get(id).is_some_and(|deadline| *deadline > now)
-                };
+                let in_backoff =
+                    |id: &DeviceId| map.get(id).is_some_and(|deadline| *deadline > now);
                 let kept: Vec<T> = candidates
                     .into_iter()
                     .filter(|c| !in_backoff(key(c)))

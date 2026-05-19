@@ -7,28 +7,86 @@
 /// See D6 in the wave 5 spec for rationale.
 pub(crate) const TEXT_OR_CODE_EXTENSIONS: &[&str] = &[
     // Plain text and documents
-    "txt", "md", "rst", "tex", "org", "adoc",
+    "txt",
+    "md",
+    "rst",
+    "tex",
+    "org",
+    "adoc",
     // Source code — systems
-    "rs", "c", "h", "cpp", "hpp", "cc", "cxx", "hh",
+    "rs",
+    "c",
+    "h",
+    "cpp",
+    "hpp",
+    "cc",
+    "cxx",
+    "hh",
     // Source code — general purpose
-    "py", "js", "ts", "go",
-    "java", "cs", "rb", "php", "swift", "kt", "scala",
+    "py",
+    "js",
+    "ts",
+    "go",
+    "java",
+    "cs",
+    "rb",
+    "php",
+    "swift",
+    "kt",
+    "scala",
     // Shell
-    "sh", "bash", "zsh", "fish", "ps1",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "ps1",
     // Scripting
-    "lua", "pl", "r", "julia", "elm", "ex", "exs",
+    "lua",
+    "pl",
+    "r",
+    "julia",
+    "elm",
+    "ex",
+    "exs",
     // Functional
-    "hs", "ml", "mli", "clj", "cljs", "lisp", "scm",
+    "hs",
+    "ml",
+    "mli",
+    "clj",
+    "cljs",
+    "lisp",
+    "scm",
     // Web
-    "html", "htm", "css", "scss", "less", "sass",
-    "vue", "svelte", "jsx", "tsx",
+    "html",
+    "htm",
+    "css",
+    "scss",
+    "less",
+    "sass",
+    "vue",
+    "svelte",
+    "jsx",
+    "tsx",
     // Config and data
-    "json", "yaml", "yml", "toml", "xml",
-    "ini", "conf", "cfg", "env", "properties",
+    "json",
+    "yaml",
+    "yml",
+    "toml",
+    "xml",
+    "ini",
+    "conf",
+    "cfg",
+    "env",
+    "properties",
     // Tabular data
-    "sql", "csv", "tsv",
+    "sql",
+    "csv",
+    "tsv",
     // Notebooks and literate documents
-    "ipynb", "rmd", "rd", "qmd",
+    "ipynb",
+    "rmd",
+    "rd",
+    "qmd",
 ];
 
 /// Image, video, and audio file extensions.
@@ -36,17 +94,11 @@ pub(crate) const TEXT_OR_CODE_EXTENSIONS: &[&str] = &[
 /// Used to detect media folders and to hash-bucket files within them.
 pub(crate) const MEDIA_EXTENSIONS: &[&str] = &[
     // Images — common
-    "jpg", "jpeg", "png", "gif", "webp", "bmp",
-    // Images — Apple formats
-    "heic", "heif",
-    // Images — raw camera
-    "raw", "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2",
-    // Images — TIFF
-    "tiff", "tif",
-    // Video
-    "mp4", "mov", "avi", "mkv", "webm",
-    "m4v", "3gp", "flv", "wmv", "ts", "mts", "m2ts",
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", // Images — Apple formats
+    "heic", "heif", // Images — raw camera
+    "raw", "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2", // Images — TIFF
+    "tiff", "tif", // Video
+    "mp4", "mov", "avi", "mkv", "webm", "m4v", "3gp", "flv", "wmv", "ts", "mts", "m2ts",
     // Audio
-    "mp3", "wav", "flac", "ogg", "opus",
-    "m4a", "aac", "wma", "aiff", "alac",
+    "mp3", "wav", "flac", "ogg", "opus", "m4a", "aac", "wma", "aiff", "alac",
 ];

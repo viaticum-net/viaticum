@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use syncback_core::db::Db;
-use syncback_core::types::{hex_encode, HoldingRecord, HoldingStatus, IdentityPub, Timestamp};
+use syncback_core::types::{HoldingRecord, HoldingStatus, IdentityPub, Timestamp, hex_encode};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -29,6 +29,7 @@ mod tests;
 ///
 /// Scan interval: scan_interval_secs / time_scale (minimum 1 second).
 /// Skips holdings with status != Active (MarkedForDelete, Silent may legitimately be absent).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     db: Db,
     holdings_dir: PathBuf,
@@ -107,7 +108,9 @@ async fn scan_holdings(
                 owner = %holding.owner_id,
                 "holdings_integrity: symbol directory missing on disk"
             );
-            if let Err(e) = report_missing_holding(db, holding, relay_post_tx, master_signing_key).await {
+            if let Err(e) =
+                report_missing_holding(db, holding, relay_post_tx, master_signing_key).await
+            {
                 warn!(
                     block_id = %holding.source_block_id,
                     owner = %holding.owner_id,
@@ -139,7 +142,10 @@ async fn report_missing_holding(
     db.delete_holding(&holding.source_block_id, &holding.owner_id)?;
 
     // Refresh storage bytes for all devices of this owner's master identity.
-    for did in db.get_devices_for_master(&holding.owner_id).unwrap_or_default() {
+    for did in db
+        .get_devices_for_master(&holding.owner_id)
+        .unwrap_or_default()
+    {
         if let Err(e) = db.refresh_peer_storage_bytes(&did) {
             warn!(
                 owner = %holding.owner_id,

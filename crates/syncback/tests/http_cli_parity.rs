@@ -8,16 +8,16 @@
 //!   2. Valid bearer → 200 with decoded body.
 //!   3. Missing/wrong bearer → CliError::Unauthorized.
 
+use axum::Router;
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{delete, get, post};
-use axum::Router;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use syncback::cli::{self, Command, Connection, DeviceAction};
-use syncback::daemon::web_auth::{require_auth, AuthState};
+use syncback::daemon::web_auth::{AuthState, require_auth};
 
 const TOKEN: &str = "test-token-abc123";
 
@@ -77,10 +77,7 @@ fn mock_router(auth: AuthState) -> Router {
         .route("/api/files", get(mock_files))
         .route("/api/versions", get(mock_versions))
         .route("/api/restore", post(mock_restore))
-        .route(
-            "/api/devices",
-            get(mock_devices_list).post(mock_device_add),
-        )
+        .route("/api/devices", get(mock_devices_list).post(mock_device_add))
         .route("/api/devices/{device_id}", delete(mock_device_revoke))
         .route("/api/connect", post(mock_connect))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -99,7 +96,9 @@ async fn spawn_mock(token: String) -> (SocketAddr, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async { let _ = rx.await; })
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
             .await;
     });
     (addr, tx)
@@ -155,11 +154,7 @@ async fn all_commands_roundtrip_via_http() {
         let conn = conn.clone();
         let handle = tokio::task::spawn_blocking(move || cli::run_command(&cmd, &conn));
         let result = handle.await.expect("task panicked");
-        assert!(
-            result.is_ok(),
-            "run_command failed: {:?}",
-            result.err()
-        );
+        assert!(result.is_ok(), "run_command failed: {:?}", result.err());
     }
 }
 
@@ -170,7 +165,10 @@ async fn rejects_command_with_wrong_token() {
     let handle = tokio::task::spawn_blocking(move || {
         cli::run_command(&Command::Status { json: false }, &conn)
     });
-    let err = handle.await.expect("task panicked").expect_err("should reject");
+    let err = handle
+        .await
+        .expect("task panicked")
+        .expect_err("should reject");
     assert!(matches!(err, cli::CliError::Unauthorized), "got: {err:?}");
 }
 
@@ -181,6 +179,9 @@ async fn rejects_command_with_no_token() {
     let handle = tokio::task::spawn_blocking(move || {
         cli::run_command(&Command::Status { json: false }, &conn)
     });
-    let err = handle.await.expect("task panicked").expect_err("should reject");
+    let err = handle
+        .await
+        .expect("task panicked")
+        .expect_err("should reject");
     assert!(matches!(err, cli::CliError::Unauthorized), "got: {err:?}");
 }

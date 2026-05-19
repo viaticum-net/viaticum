@@ -104,9 +104,7 @@ pub fn validate_record_path(raw: &str) -> Result<ValidatedPath, PathSafetyError>
     };
 
     // Step 4: Split on both / and \ to handle cross-platform paths.
-    let raw_components: Vec<&str> = stripped
-        .split(['/', '\\'])
-        .collect();
+    let raw_components: Vec<&str> = stripped.split(['/', '\\']).collect();
 
     let mut components: Vec<String> = Vec::with_capacity(raw_components.len());
 

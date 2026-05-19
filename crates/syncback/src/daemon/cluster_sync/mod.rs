@@ -25,10 +25,12 @@ use tracing::{debug, info, warn};
 
 use syncback_core::cluster::ClusterState;
 use syncback_core::db::Db;
-use syncback_core::messages::{ClusterSyncRequestMsg, ClusterSyncResponseMsg, Message, RevocationBroadcast};
+use syncback_core::messages::{
+    ClusterSyncRequestMsg, ClusterSyncResponseMsg, Message, RevocationBroadcast,
+};
 use syncback_core::types::{DeviceId, IdentityPub, Timestamp};
 
-use crate::daemon::network::swarm::{device_id_to_peer_id, SwarmHandle};
+use crate::daemon::network::swarm::{SwarmHandle, device_id_to_peer_id};
 
 #[cfg(test)]
 mod tests;
@@ -86,11 +88,7 @@ pub struct ClusterSyncManager {
 
 impl ClusterSyncManager {
     /// Create a new ClusterSyncManager.
-    pub fn new(
-        db: Db,
-        config: ClusterSyncConfig,
-        cluster_state: Arc<Mutex<ClusterState>>,
-    ) -> Self {
+    pub fn new(db: Db, config: ClusterSyncConfig, cluster_state: Arc<Mutex<ClusterState>>) -> Self {
         ClusterSyncManager {
             db,
             config,
@@ -252,8 +250,7 @@ pub async fn run_periodic_sync(
     interval_secs: u64,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let mut interval =
-        tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
     // Skip the first (immediate) tick to avoid hammering peers on startup.
     interval.tick().await;
 

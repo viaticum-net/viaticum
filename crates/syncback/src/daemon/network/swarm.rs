@@ -30,7 +30,7 @@ use libp2p::swarm::SwarmEvent;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use sha2::{Digest, Sha256};
-use syncback_core::cluster::{verify_device_certificate, DeviceCertificate};
+use syncback_core::cluster::{DeviceCertificate, verify_device_certificate};
 use syncback_core::messages::Message;
 use syncback_core::types::{DeviceId, IdentityPub};
 use tokio::sync::{mpsc, oneshot};
@@ -376,7 +376,6 @@ pub struct SwarmConfig {
     pub cert_timeout_secs: u64,
 
     // ── Kademlia (ε.3) ────────────────────────────────────────────────────────
-
     /// Additional Kademlia bootstrap multiaddrs from config.
     /// Already parsed and validated by AppConfig::validate().
     pub kademlia_bootstrap_peers: Vec<Multiaddr>,
@@ -500,9 +499,9 @@ impl SwarmHandle {
                 use libp2p::core::upgrade::Version;
                 let noise = libp2p::noise::Config::new(key)?;
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
-                    super::no_port_reuse::NoPortReuse::new(
-                        libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default()),
-                    )
+                    super::no_port_reuse::NoPortReuse::new(libp2p::tcp::tokio::Transport::new(
+                        libp2p::tcp::Config::default(),
+                    ))
                     .upgrade(Version::V1Lazy)
                     .authenticate(noise)
                     .multiplex(libp2p::yamux::Config::default())
@@ -512,30 +511,26 @@ impl SwarmHandle {
             .map_err(|e| SwarmError::Transport(e.to_string()))?
             .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)
             .map_err(|e| SwarmError::Transport(e.to_string()))?
-            .with_behaviour(|key, relay_client| {
-                SyncBackBehaviour {
-                    syncback: request_response::Behaviour::new(
-                        [(SYNCBACK_PROTOCOL, ProtocolSupport::Full)],
-                        request_response::Config::default(),
-                    ),
-                    cert: request_response::Behaviour::new(
-                        [(CERT_PROTOCOL, ProtocolSupport::Full)],
-                        request_response::Config::default(),
-                    ),
-                    identify: libp2p::identify::Behaviour::new(
-                        libp2p::identify::Config::new(
-                            "/syncback/identify/1".to_string(),
-                            key.public(),
-                        ),
-                    ),
-                    kad: kademlia,
-                    relay_client,
-                    relay_server: libp2p::relay::Behaviour::new(
-                        peer_id,
-                        libp2p::relay::Config::default(),
-                    ),
-                    dcutr: libp2p::dcutr::Behaviour::new(peer_id),
-                }
+            .with_behaviour(|key, relay_client| SyncBackBehaviour {
+                syncback: request_response::Behaviour::new(
+                    [(SYNCBACK_PROTOCOL, ProtocolSupport::Full)],
+                    request_response::Config::default(),
+                ),
+                cert: request_response::Behaviour::new(
+                    [(CERT_PROTOCOL, ProtocolSupport::Full)],
+                    request_response::Config::default(),
+                ),
+                identify: libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
+                    "/syncback/identify/1".to_string(),
+                    key.public(),
+                )),
+                kad: kademlia,
+                relay_client,
+                relay_server: libp2p::relay::Behaviour::new(
+                    peer_id,
+                    libp2p::relay::Config::default(),
+                ),
+                dcutr: libp2p::dcutr::Behaviour::new(peer_id),
             })
             .map_err(|e| SwarmError::Transport(e.to_string()))?
             .with_swarm_config(|cfg| {
@@ -690,9 +685,7 @@ impl SwarmHandle {
 
     /// Snapshot of authenticated and connected DeviceId sets.
     /// authenticated ⊆ connected (cert exchange done implies live connection).
-    pub async fn peer_sets(
-        &self,
-    ) -> Result<(HashSet<DeviceId>, HashSet<DeviceId>), SwarmError> {
+    pub async fn peer_sets(&self) -> Result<(HashSet<DeviceId>, HashSet<DeviceId>), SwarmError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(SwarmCommand::PeerSets { reply: reply_tx })
@@ -821,7 +814,6 @@ struct EventLoopState {
     cert_timeout: Duration,
 
     // ── Kademlia (ε.3) ────────────────────────────────────────────────────────
-
     /// Interval for re-publishing our provider record to the DHT.
     kad_republish_timer: tokio::time::Interval,
 
@@ -839,7 +831,6 @@ struct EventLoopState {
     bootstrap_called: bool,
 
     // ── Relay (ε.4) ───────────────────────────────────────────────────────────
-
     /// PeerIds of relay servers for which we have an active reservation.
     /// Used for logging and diagnostics only; not required for correctness.
     relay_reservations: HashSet<PeerId>,
@@ -918,10 +909,7 @@ impl EventLoopState {
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 debug!(peer_id = %peer_id, "connection closed");
-                let device_id = self
-                    .authenticated
-                    .remove(&peer_id)
-                    .map(|(did, _, _)| did);
+                let device_id = self.authenticated.remove(&peer_id).map(|(did, _, _)| did);
                 if let Some(did) = device_id {
                     self.device_to_peer.remove(&did);
                 }
@@ -976,10 +964,7 @@ impl EventLoopState {
     }
 
     fn handle_identify_event(&mut self, event: libp2p::identify::Event) {
-        if let libp2p::identify::Event::Received {
-            peer_id, info, ..
-        } = event
-        {
+        if let libp2p::identify::Event::Received { peer_id, info, .. } = event {
             debug!(
                 peer_id = %peer_id,
                 protocols = ?info.protocols,
@@ -1154,7 +1139,8 @@ impl EventLoopState {
     ) {
         debug!(peer_id = %peer_id, "received cert request (listener side)");
 
-        if let Err(reason) = verify_cert_for_peer(&peer_id, &request.cert, &self.cluster_master_pub) {
+        if let Err(reason) = verify_cert_for_peer(&peer_id, &request.cert, &self.cluster_master_pub)
+        {
             warn!(
                 peer_id = %peer_id,
                 reason = %reason,
@@ -1186,7 +1172,9 @@ impl EventLoopState {
     async fn on_cert_response(&mut self, peer_id: PeerId, response: DeviceCertExchangeMsg) {
         debug!(peer_id = %peer_id, "received cert response (dialer side)");
 
-        if let Err(reason) = verify_cert_for_peer(&peer_id, &response.cert, &self.cluster_master_pub) {
+        if let Err(reason) =
+            verify_cert_for_peer(&peer_id, &response.cert, &self.cluster_master_pub)
+        {
             warn!(
                 peer_id = %peer_id,
                 reason = %reason,
@@ -1200,11 +1188,7 @@ impl EventLoopState {
     }
 
     /// Record a successfully verified peer in the authenticated maps.
-    async fn record_authenticated(
-        &mut self,
-        peer_id: PeerId,
-        msg: DeviceCertExchangeMsg,
-    ) {
+    async fn record_authenticated(&mut self, peer_id: PeerId, msg: DeviceCertExchangeMsg) {
         let device_id = msg.cert.device_id;
         let identity_pub = msg.cert.master_pub_key;
 
@@ -1231,8 +1215,8 @@ impl EventLoopState {
 
         // If we already saw this peer's identify before cert exchange, surface
         // those addrs now so they get persisted on the freshly created PeerRecord.
-        if let Some(addrs) = self.peer_addrs.get(&peer_id) {
-            if !addrs.is_empty() {
+        if let Some(addrs) = self.peer_addrs.get(&peer_id)
+            && !addrs.is_empty() {
                 emit_event(
                     &self.event_tx,
                     ProtocolEvent::PeerIdentified {
@@ -1241,13 +1225,9 @@ impl EventLoopState {
                     },
                 );
             }
-        }
     }
 
-    async fn handle_syncback_event(
-        &mut self,
-        event: request_response::Event<Message, Message>,
-    ) {
+    async fn handle_syncback_event(&mut self, event: request_response::Event<Message, Message>) {
         match event {
             request_response::Event::Message {
                 peer,
@@ -1278,7 +1258,11 @@ impl EventLoopState {
             }
             request_response::Event::Message {
                 peer,
-                message: request_response::Message::Response { request_id, response },
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
                 ..
             } => {
                 if let Some(reply) = self.pending_requests.remove(&request_id) {
@@ -1396,13 +1380,12 @@ impl EventLoopState {
 
         match event {
             Event::OutboundQueryProgressed { result, .. } => match result {
-                QueryResult::Bootstrap(Ok(bootstrap_ok)) => {
-                    if bootstrap_ok.num_remaining == 0 {
+                QueryResult::Bootstrap(Ok(bootstrap_ok))
+                    if bootstrap_ok.num_remaining == 0 => {
                         info!("kademlia bootstrap complete");
                         // Immediately start providing after successful bootstrap.
                         self.do_kad_republish();
                     }
-                }
                 QueryResult::Bootstrap(Err(e)) => {
                     warn!(error = ?e, "kademlia bootstrap failed");
                 }
@@ -1539,7 +1522,13 @@ impl EventLoopState {
                 let _ = reply.send(result);
             }
             SwarmCommand::SendResponse { channel, response } => {
-                if self.swarm.behaviour_mut().syncback.send_response(channel, *response).is_err() {
+                if self
+                    .swarm
+                    .behaviour_mut()
+                    .syncback
+                    .send_response(channel, *response)
+                    .is_err()
+                {
                     warn!("send_response failed: channel already closed");
                 }
             }
@@ -1566,7 +1555,10 @@ impl EventLoopState {
             sent += 1;
         }
         if sent > 0 {
-            info!(unauthenticated_connected = sent, "cert sweep: re-issued cert requests");
+            info!(
+                unauthenticated_connected = sent,
+                "cert sweep: re-issued cert requests"
+            );
         }
     }
 
@@ -1703,7 +1695,10 @@ async fn wait_for_tcp_port_free(host: &str, port: u16) {
             }
         }
     }
-    warn!(port, "listen port still held after retries; libp2p listen will likely fail");
+    warn!(
+        port,
+        "listen port still held after retries; libp2p listen will likely fail"
+    );
 }
 
 // ─── Helper functions ─────────────────────────────────────────────────────────

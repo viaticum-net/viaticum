@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use syncback_core::config::{expand_watch_path, WatchConfig, DEFAULT_IMPORTANCE_MULTIPLIER};
+use syncback_core::config::{DEFAULT_IMPORTANCE_MULTIPLIER, WatchConfig, expand_watch_path};
 use syncback_core::db::Db;
 use syncback_core::types::{FileId, LocalState, PlacementStatus, Timestamp};
 use tokio::sync::mpsc;
@@ -275,7 +275,10 @@ impl WatchAdmin {
     /// Full scan of DB, update cached_rollups for every watch path.
     /// Called by the 5-min background task and by POST /api/watches/refresh.
     pub fn recompute_all_rollups(&self) -> Result<(), WatchAdminError> {
-        let configs = self.live_configs.read().expect("live_configs lock poisoned");
+        let configs = self
+            .live_configs
+            .read()
+            .expect("live_configs lock poisoned");
         let all_files = self
             .db
             .list_all_files()
@@ -320,8 +323,7 @@ impl WatchAdmin {
                 // total_bytes: use k*t from the latest version as a proxy.
                 // TODO: add FileVersion.source_size to store original uncompressed file size.
                 if let Some(latest_version) = file_record.versions.last() {
-                    rollup.total_bytes +=
-                        latest_version.k as u64 * latest_version.t as u64;
+                    rollup.total_bytes += latest_version.k as u64 * latest_version.t as u64;
 
                     if latest_version.backed_up_at.is_some() {
                         rollup.backed_up += 1;
@@ -335,18 +337,16 @@ impl WatchAdmin {
                     .unwrap_or(&[]);
 
                 if !statuses.is_empty() {
-                    let has_encoding = statuses.iter().any(|s| {
-                        matches!(s, PlacementStatus::Offered | PlacementStatus::Accepted)
-                    });
+                    let has_encoding = statuses
+                        .iter()
+                        .any(|s| matches!(s, PlacementStatus::Offered | PlacementStatus::Accepted));
                     let has_uncertain = statuses.iter().any(|s| {
                         matches!(
                             s,
                             PlacementStatus::Uncertain | PlacementStatus::PresumedLost
                         )
                     });
-                    let all_lost = statuses
-                        .iter()
-                        .all(|s| matches!(s, PlacementStatus::Lost));
+                    let all_lost = statuses.iter().all(|s| matches!(s, PlacementStatus::Lost));
 
                     if has_encoding {
                         rollup.encoding += 1;
@@ -369,16 +369,16 @@ impl WatchAdmin {
             );
         }
 
-        let mut cache = self.cached_rollups.write().expect("cached_rollups lock poisoned");
+        let mut cache = self
+            .cached_rollups
+            .write()
+            .expect("cached_rollups lock poisoned");
         *cache = new_rollups;
         Ok(())
     }
 
     /// Validate and add a new watch directory.
-    pub async fn add_watch(
-        &self,
-        req: AddWatchRequest,
-    ) -> Result<WatchEntry, WatchAdminError> {
+    pub async fn add_watch(&self, req: AddWatchRequest) -> Result<WatchEntry, WatchAdminError> {
         let expanded = expand_watch_path(&req.path);
 
         if !expanded.is_absolute() {
@@ -394,7 +394,10 @@ impl WatchAdmin {
 
         // Check nesting against current live_configs (both directions).
         {
-            let cfgs = self.live_configs.read().expect("live_configs lock poisoned");
+            let cfgs = self
+                .live_configs
+                .read()
+                .expect("live_configs lock poisoned");
             for wc in cfgs.iter() {
                 let existing = expand_watch_path(&wc.path);
                 // new is child of existing
@@ -431,7 +434,10 @@ impl WatchAdmin {
 
         // Step 4: save_watches atomically (write config first).
         {
-            let cfgs = self.live_configs.read().expect("live_configs lock poisoned");
+            let cfgs = self
+                .live_configs
+                .read()
+                .expect("live_configs lock poisoned");
             let mut new_list = cfgs.clone();
             new_list.push(new_wc.clone());
             save_watches(&self.config_path, &new_list)?;
@@ -439,13 +445,19 @@ impl WatchAdmin {
 
         // Step 5+: mutate live_configs.
         {
-            let mut cfgs = self.live_configs.write().expect("live_configs lock poisoned");
+            let mut cfgs = self
+                .live_configs
+                .write()
+                .expect("live_configs lock poisoned");
             cfgs.push(new_wc.clone());
         }
 
         // Step 7: set scanning state.
         {
-            let mut states = self.watch_states.write().expect("watch_states lock poisoned");
+            let mut states = self
+                .watch_states
+                .write()
+                .expect("watch_states lock poisoned");
             states.insert(expanded.clone(), WatchEntryState::scanning());
         }
 
@@ -473,19 +485,24 @@ impl WatchAdmin {
 
         // Check exists.
         {
-            let cfgs = self.live_configs.read().expect("live_configs lock poisoned");
-            if !cfgs
-                .iter()
-                .any(|wc| expand_watch_path(&wc.path) == path)
-            {
-                return Err(WatchAdminError::NotFound(path.to_string_lossy().into_owned()));
+            let cfgs = self
+                .live_configs
+                .read()
+                .expect("live_configs lock poisoned");
+            if !cfgs.iter().any(|wc| expand_watch_path(&wc.path) == path) {
+                return Err(WatchAdminError::NotFound(
+                    path.to_string_lossy().into_owned(),
+                ));
             }
         }
 
         // Build new list with updated multiplier, preserving classification.
         let resolved = req.resolved_multiplier();
         let new_list = {
-            let cfgs = self.live_configs.read().expect("live_configs lock poisoned");
+            let cfgs = self
+                .live_configs
+                .read()
+                .expect("live_configs lock poisoned");
             cfgs.iter()
                 .map(|wc| {
                     if expand_watch_path(&wc.path) == path {
@@ -508,13 +525,19 @@ impl WatchAdmin {
 
         // Update live_configs.
         {
-            let mut cfgs = self.live_configs.write().expect("live_configs lock poisoned");
+            let mut cfgs = self
+                .live_configs
+                .write()
+                .expect("live_configs lock poisoned");
             *cfgs = new_list;
         }
 
         // Find the updated multiplier from live_configs.
         let actual_multiplier = {
-            let cfgs = self.live_configs.read().expect("live_configs lock poisoned");
+            let cfgs = self
+                .live_configs
+                .read()
+                .expect("live_configs lock poisoned");
             cfgs.iter()
                 .find(|wc| expand_watch_path(&wc.path) == path)
                 .map(|wc| wc.importance_multiplier)
@@ -525,27 +548,28 @@ impl WatchAdmin {
     }
 
     /// Remove a watch directory.
-    pub async fn remove_watch(
-        &self,
-        path_b64: &str,
-        purge: bool,
-    ) -> Result<(), WatchAdminError> {
+    pub async fn remove_watch(&self, path_b64: &str, purge: bool) -> Result<(), WatchAdminError> {
         let path = decode_path_b64(path_b64)?;
 
         // Find in live_configs.
         {
-            let cfgs = self.live_configs.read().expect("live_configs lock poisoned");
-            if !cfgs
-                .iter()
-                .any(|wc| expand_watch_path(&wc.path) == path)
-            {
-                return Err(WatchAdminError::NotFound(path.to_string_lossy().into_owned()));
+            let cfgs = self
+                .live_configs
+                .read()
+                .expect("live_configs lock poisoned");
+            if !cfgs.iter().any(|wc| expand_watch_path(&wc.path) == path) {
+                return Err(WatchAdminError::NotFound(
+                    path.to_string_lossy().into_owned(),
+                ));
             }
         }
 
         // Build new list without this entry.
         let new_list = {
-            let cfgs = self.live_configs.read().expect("live_configs lock poisoned");
+            let cfgs = self
+                .live_configs
+                .read()
+                .expect("live_configs lock poisoned");
             cfgs.iter()
                 .filter(|wc| expand_watch_path(&wc.path) != path)
                 .cloned()
@@ -557,13 +581,19 @@ impl WatchAdmin {
 
         // Remove from live_configs.
         {
-            let mut cfgs = self.live_configs.write().expect("live_configs lock poisoned");
+            let mut cfgs = self
+                .live_configs
+                .write()
+                .expect("live_configs lock poisoned");
             *cfgs = new_list;
         }
 
         // Remove from watch_states.
         {
-            let mut states = self.watch_states.write().expect("watch_states lock poisoned");
+            let mut states = self
+                .watch_states
+                .write()
+                .expect("watch_states lock poisoned");
             states.remove(&path);
         }
 
@@ -587,12 +617,14 @@ impl WatchAdmin {
 
         // Verify it's currently watched.
         {
-            let cfgs = self.live_configs.read().expect("live_configs lock poisoned");
-            if !cfgs
-                .iter()
-                .any(|wc| expand_watch_path(&wc.path) == path)
-            {
-                return Err(WatchAdminError::NotFound(path.to_string_lossy().into_owned()));
+            let cfgs = self
+                .live_configs
+                .read()
+                .expect("live_configs lock poisoned");
+            if !cfgs.iter().any(|wc| expand_watch_path(&wc.path) == path) {
+                return Err(WatchAdminError::NotFound(
+                    path.to_string_lossy().into_owned(),
+                ));
             }
         }
 
@@ -606,7 +638,10 @@ impl WatchAdmin {
 
     /// Return WatchEntry list with rollup counters.
     pub fn list_watches(&self) -> Vec<WatchEntry> {
-        let cfgs = self.live_configs.read().expect("live_configs lock poisoned");
+        let cfgs = self
+            .live_configs
+            .read()
+            .expect("live_configs lock poisoned");
         cfgs.iter()
             .map(|wc| {
                 let path = expand_watch_path(&wc.path);
@@ -618,13 +653,18 @@ impl WatchAdmin {
     /// Return a WatchEntry for a single path (or NotFound).
     pub fn get_watch(&self, path_b64: &str) -> Result<WatchEntry, WatchAdminError> {
         let path = decode_path_b64(path_b64)?;
-        let cfgs = self.live_configs.read().expect("live_configs lock poisoned");
+        let cfgs = self
+            .live_configs
+            .read()
+            .expect("live_configs lock poisoned");
         for wc in cfgs.iter() {
             if expand_watch_path(&wc.path) == path {
                 return Ok(self.build_watch_entry(&path, wc.importance_multiplier));
             }
         }
-        Err(WatchAdminError::NotFound(path.to_string_lossy().into_owned()))
+        Err(WatchAdminError::NotFound(
+            path.to_string_lossy().into_owned(),
+        ))
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -632,7 +672,10 @@ impl WatchAdmin {
     /// Build a WatchEntry for the given path using cached rollup and watch_states.
     fn build_watch_entry(&self, path: &Path, importance: f64) -> WatchEntry {
         let (signal, error, last_event_age_secs) = {
-            let states = self.watch_states.read().expect("watch_states lock poisoned");
+            let states = self
+                .watch_states
+                .read()
+                .expect("watch_states lock poisoned");
             if let Some(state) = states.get(path) {
                 let age = state.last_event_at.map(|t| t.elapsed().as_secs());
                 (state.status.clone(), state.error.clone(), age)
@@ -642,7 +685,10 @@ impl WatchAdmin {
         };
 
         let (rollup, rollup_age_secs) = {
-            let cache = self.cached_rollups.read().expect("cached_rollups lock poisoned");
+            let cache = self
+                .cached_rollups
+                .read()
+                .expect("cached_rollups lock poisoned");
             if let Some(cr) = cache.get(path) {
                 let age = cr.computed_at.elapsed().as_secs();
                 (cr.rollup.clone(), Some(age))
@@ -738,8 +784,7 @@ pub fn traffic_light(status: &WatchStatus, rollup: &FolderRollup) -> String {
 
 pub fn encode_path_b64(path: &Path) -> String {
     use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(path.to_string_lossy().as_bytes())
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(path.to_string_lossy().as_bytes())
 }
 
 pub fn decode_path_b64(s: &str) -> Result<PathBuf, WatchAdminError> {
@@ -759,10 +804,7 @@ pub fn decode_path_b64(s: &str) -> Result<PathBuf, WatchAdminError> {
 /// Preserves all other sections and comments.
 /// Replaces the entire [[watch]] array with the provided configs.
 /// Creates the file if it does not exist.
-pub fn save_watches(
-    config_path: &Path,
-    configs: &[WatchConfig],
-) -> Result<(), WatchAdminError> {
+pub fn save_watches(config_path: &Path, configs: &[WatchConfig]) -> Result<(), WatchAdminError> {
     let mut doc: toml_edit::DocumentMut = if config_path.exists() {
         let content = std::fs::read_to_string(config_path)
             .map_err(|e| WatchAdminError::ConfigSave(format!("read error: {e}")))?;
@@ -782,7 +824,10 @@ pub fn save_watches(
         for wc in configs {
             let mut t = toml_edit::Table::new();
             t.insert("path", toml_edit::value(wc.path.as_str()));
-            t.insert("importance_multiplier", toml_edit::value(wc.importance_multiplier));
+            t.insert(
+                "importance_multiplier",
+                toml_edit::value(wc.importance_multiplier),
+            );
             aot.push(t);
         }
         doc.insert("watch", toml_edit::Item::ArrayOfTables(aot));

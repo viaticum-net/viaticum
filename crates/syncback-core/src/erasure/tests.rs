@@ -1,7 +1,7 @@
 use rand::Rng;
 
 use super::{
-    chunk_symbols_by_size, binding_seed, ErasureEncoder, ErasureError, RaptorQEncoder, Symbol,
+    ErasureEncoder, ErasureError, RaptorQEncoder, Symbol, binding_seed, chunk_symbols_by_size,
 };
 use crate::types::{DeviceId, ErasureParams, SourceBlockId};
 
@@ -143,7 +143,10 @@ fn binding_unbinding_roundtrip() {
     assert_ne!(once.data, original_data, "unbind should change data");
 
     let twice = enc.unbind(once, &bid, &hid);
-    assert_eq!(twice.data, original_data, "double-unbind should restore original");
+    assert_eq!(
+        twice.data, original_data,
+        "double-unbind should restore original"
+    );
 }
 
 #[test]
@@ -279,9 +282,7 @@ fn decode_with_exactly_k_eff_symbols() {
 
     // Use source + repair ESIs to get exactly k_eff symbols
     // Take ESI 0..k_eff (first k source, then repair if needed)
-    let bound = enc
-        .encode(&source, &params, 0, k_eff, &bid, &hid)
-        .unwrap();
+    let bound = enc.encode(&source, &params, 0, k_eff, &bid, &hid).unwrap();
     let unbound: Vec<Symbol> = bound
         .into_iter()
         .map(|s| enc.unbind(s, &bid, &hid))
@@ -350,7 +351,10 @@ fn symbol_size_bytes_returns_zero_for_empty_data() {
 #[test]
 fn symbol_size_bytes_matches_data_len() {
     let data = vec![0xFFu8; 100];
-    let sym = Symbol { esi: 7, data: data.clone() };
+    let sym = Symbol {
+        esi: 7,
+        data: data.clone(),
+    };
     assert_eq!(sym.size_bytes(), data.len());
 }
 
@@ -372,9 +376,7 @@ fn large_source_block_encode_decode_succeeds() {
 
     let bound = enc
         .encode(&source, &params, 0, k_eff, &bid, &hid)
-        .unwrap_or_else(|e| {
-            panic!("encode failed for 16 MB block (k_eff={k_eff}): {e}")
-        });
+        .unwrap_or_else(|e| panic!("encode failed for 16 MB block (k_eff={k_eff}): {e}"));
     assert_eq!(bound.len(), k_eff as usize);
 
     let unbound: Vec<Symbol> = bound
@@ -413,7 +415,9 @@ fn decode_non_contiguous_esi_subset() {
 
     // Generate more symbols than needed (source + repair range)
     let total_gen = k_eff + 10;
-    let bound = enc.encode(&source, &params, 0, total_gen, &bid, &hid).unwrap();
+    let bound = enc
+        .encode(&source, &params, 0, total_gen, &bid, &hid)
+        .unwrap();
     let unbound: Vec<Symbol> = bound
         .into_iter()
         .map(|s| enc.unbind(s, &bid, &hid))
@@ -535,7 +539,9 @@ fn decode_with_exactly_k_symbols_may_fail() {
     assert!(k < k_eff, "test requires k < k_eff (overhead > 0)");
 
     // Encode k_eff symbols so we have enough to choose from.
-    let bound = enc.encode(&source, &params, 0, k_eff as u32, &bid, &hid).unwrap();
+    let bound = enc
+        .encode(&source, &params, 0, k_eff as u32, &bid, &hid)
+        .unwrap();
     let unbound: Vec<Symbol> = bound
         .into_iter()
         .map(|s| enc.unbind(s, &bid, &hid))
@@ -684,7 +690,13 @@ fn encode_deterministic_two_calls() {
 #[test]
 fn encode_empty_source_block_returns_error() {
     let enc = encoder();
-    let params = ErasureParams { k: 1, t: 65535, overhead: 55.0, n: 2, k_eff: 1 };
+    let params = ErasureParams {
+        k: 1,
+        t: 65535,
+        overhead: 55.0,
+        n: 2,
+        k_eff: 1,
+    };
     let result = enc.encode_raw(&[], &params, 0, 1);
     assert!(
         matches!(result, Err(ErasureError::EmptyBlock)),
@@ -698,18 +710,20 @@ fn encode_empty_source_block_returns_error() {
 fn encode_raw_deterministic_across_100_calls() {
     let enc = encoder();
     let source = vec![0xABu8; 65535 * 4]; // 4 source symbols
-    let params = ErasureParams { k: 4, t: 65535, overhead: 55.0, n: 8, k_eff: 4 };
+    let params = ErasureParams {
+        k: 4,
+        t: 65535,
+        overhead: 55.0,
+        n: 8,
+        k_eff: 4,
+    };
 
     let baseline = enc.encode_raw(&source, &params, 0, 8).unwrap();
     for _ in 0..100 {
         let result = enc.encode_raw(&source, &params, 0, 8).unwrap();
         for (a, b) in baseline.iter().zip(result.iter()) {
             assert_eq!(a.esi, b.esi);
-            assert_eq!(
-                a.data, b.data,
-                "non-deterministic encode at ESI {}",
-                a.esi
-            );
+            assert_eq!(a.data, b.data, "non-deterministic encode at ESI {}", a.esi);
         }
     }
 }
@@ -754,7 +768,10 @@ fn source_block_not_multiple_of_t_padding_trim() {
 // ─── chunk_symbols_by_size ──────────────────────────────────────────────────
 
 fn sym(esi: u32, size: usize) -> Symbol {
-    Symbol { esi, data: vec![0u8; size] }
+    Symbol {
+        esi,
+        data: vec![0u8; size],
+    }
 }
 
 #[test]
@@ -803,14 +820,18 @@ fn chunk_symbols_preserves_order() {
 fn chunk_symbols_realistic_scenario_2300_full_size_symbols() {
     use crate::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES;
     let symbols: Vec<Symbol> = (0..2300u32)
-        .map(|i| Symbol { esi: i, data: vec![0u8; 65535] })
+        .map(|i| Symbol {
+            esi: i,
+            data: vec![0u8; 65535],
+        })
         .collect();
     let out = chunk_symbols_by_size(symbols, SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES);
     // 2300 × 65535 = 150,730,500 bytes ≈ 143.7 MB > 100 MiB budget.
     // Expect the helper to split into at least two chunks.
     assert!(
         out.len() >= 2,
-        "2300 full-size symbols should produce >= 2 chunks; got {}", out.len()
+        "2300 full-size symbols should produce >= 2 chunks; got {}",
+        out.len()
     );
     for c in &out {
         let b: usize = c.iter().map(|s| s.data.len()).sum();

@@ -2,16 +2,19 @@
 //
 // Pattern: what_when_then
 // All tests are synchronous (no tokio runtime needed for unit tests).
+#![allow(clippy::cloned_ref_to_slice_refs)]
 
 use rand::rngs::OsRng;
-use syncback_core::constants::{MAX_BOARD_ENTRIES, MAX_BOARD_ENTRIES_PER_AUTHOR, MAX_BOARD_SIZE_BYTES, RELAY_TTL_SECS};
 use syncback_core::cluster::{
-    issue_device_certificate, issue_revocation, verify_device_certificate, verify_revocation,
-    EpochCounter,
+    EpochCounter, issue_device_certificate, issue_revocation, verify_device_certificate,
+    verify_revocation,
+};
+use syncback_core::constants::{
+    MAX_BOARD_ENTRIES, MAX_BOARD_ENTRIES_PER_AUTHOR, MAX_BOARD_SIZE_BYTES, RELAY_TTL_SECS,
 };
 use syncback_core::messages::{
-    build_broadcast_entry, build_directed_entry, encrypt_directed, from_cbor, to_cbor,
-    BoardEntryKind, RevocationBroadcast, StoredEntry,
+    BoardEntryKind, RevocationBroadcast, StoredEntry, build_broadcast_entry, build_directed_entry,
+    encrypt_directed, from_cbor, to_cbor,
 };
 use syncback_core::types::{DeviceId, IdentityPub, Timestamp};
 use tempfile::TempDir;
@@ -88,7 +91,12 @@ fn post_broadcast_persists_to_disk() {
     {
         let mut manager = RelayManager::new(config.clone()).unwrap();
         manager
-            .post_broadcast("peer_announce", [0u8; 16], b"data".to_vec(), Timestamp(1000))
+            .post_broadcast(
+                "peer_announce",
+                [0u8; 16],
+                b"data".to_vec(),
+                Timestamp(1000),
+            )
             .unwrap();
         assert_eq!(manager.stats().0, 1);
     }
@@ -147,7 +155,13 @@ fn process_remote_entries_accepts_valid_hop0_entry_as_hop1() {
     let mut manager = RelayManager::new(make_config(&dir)).unwrap();
 
     let (partner_key, partner_identity) = make_identity();
-    let remote = make_broadcast_entry(&partner_key, partner_identity, "peer_announce", [2u8; 16], Timestamp(500));
+    let remote = make_broadcast_entry(
+        &partner_key,
+        partner_identity,
+        "peer_announce",
+        [2u8; 16],
+        Timestamp(500),
+    );
 
     let count = manager
         .process_remote_entries(&[remote], Timestamp(1000))
@@ -165,7 +179,13 @@ fn process_remote_entries_deduplicates_known_msg_id() {
 
     let (partner_key, partner_identity) = make_identity();
     let msg_id = [3u8; 16];
-    let remote = make_broadcast_entry(&partner_key, partner_identity, "peer_announce", msg_id, Timestamp(500));
+    let remote = make_broadcast_entry(
+        &partner_key,
+        partner_identity,
+        "peer_announce",
+        msg_id,
+        Timestamp(500),
+    );
 
     let count1 = manager
         .process_remote_entries(&[remote.clone()], Timestamp(1000))
@@ -779,7 +799,9 @@ fn board_sync_exchange_fills_missing_entries() {
         ttl_secs: RELAY_TTL_SECS,
     };
     let mut manager_a = RelayManager::new(config_a).unwrap();
-    manager_a.process_remote_entries(&[e1.clone(), e2.clone()], now).unwrap();
+    manager_a
+        .process_remote_entries(&[e1.clone(), e2.clone()], now)
+        .unwrap();
     assert_eq!(manager_a.entries.len(), 2);
 
     // Node B: has E2, E3.
@@ -794,7 +816,9 @@ fn board_sync_exchange_fills_missing_entries() {
         ttl_secs: RELAY_TTL_SECS,
     };
     let mut manager_b = RelayManager::new(config_b).unwrap();
-    manager_b.process_remote_entries(&[e2.clone(), e3.clone()], now).unwrap();
+    manager_b
+        .process_remote_entries(&[e2.clone(), e3.clone()], now)
+        .unwrap();
     assert_eq!(manager_b.entries.len(), 2);
 
     // Exchange: A syncs from B, B syncs from A.
@@ -805,9 +829,15 @@ fn board_sync_exchange_fills_missing_entries() {
     let accepted_by_a = manager_a.process_remote_entries(&b_entries, now).unwrap();
 
     // A received E3 (the only entry from B it was missing).
-    assert_eq!(accepted_by_a, 1, "A should have accepted 1 new entry from B");
+    assert_eq!(
+        accepted_by_a, 1,
+        "A should have accepted 1 new entry from B"
+    );
     // B received E1 (the only entry from A it was missing); E2 deduped.
-    assert_eq!(accepted_by_b, 1, "B should have accepted 1 new entry from A");
+    assert_eq!(
+        accepted_by_b, 1,
+        "B should have accepted 1 new entry from A"
+    );
 
     // Both now have 3 entries.
     assert_eq!(manager_a.entries.len(), 3, "A should have E1, E2, E3");
@@ -863,7 +893,10 @@ fn scan_for_self_delivers_each_msg_once() {
     // Second scan: same entry is still on the board but must not be re-delivered.
     let count2 = manager.scan_for_self(&inbound_tx, future);
     assert_eq!(count2, 0);
-    assert!(inbound_rx.try_recv().is_err(), "no second delivery expected");
+    assert!(
+        inbound_rx.try_recv().is_err(),
+        "no second delivery expected"
+    );
 }
 
 #[test]
@@ -949,7 +982,10 @@ fn process_remote_entries_accepts_under_per_author_cap() {
     let entries = make_broadcast_entries(&key_a, identity_a, MAX_BOARD_ENTRIES_PER_AUTHOR, now);
     let count = manager.process_remote_entries(&entries, now).unwrap();
 
-    assert_eq!(count, MAX_BOARD_ENTRIES_PER_AUTHOR, "all entries at cap should be accepted");
+    assert_eq!(
+        count, MAX_BOARD_ENTRIES_PER_AUTHOR,
+        "all entries at cap should be accepted"
+    );
     assert_eq!(manager.stats().0, MAX_BOARD_ENTRIES_PER_AUTHOR);
 }
 
@@ -966,7 +1002,10 @@ fn process_remote_entries_truncates_over_per_author_cap() {
     let entries = make_broadcast_entries(&key_a, identity_a, MAX_BOARD_ENTRIES_PER_AUTHOR + 1, now);
     let count = manager.process_remote_entries(&entries, now).unwrap();
 
-    assert_eq!(count, MAX_BOARD_ENTRIES_PER_AUTHOR, "over-cap entry should be dropped");
+    assert_eq!(
+        count, MAX_BOARD_ENTRIES_PER_AUTHOR,
+        "over-cap entry should be dropped"
+    );
     assert_eq!(manager.stats().0, MAX_BOARD_ENTRIES_PER_AUTHOR);
 }
 
@@ -1028,7 +1067,10 @@ fn process_remote_entries_does_not_affect_local_entries() {
     let entries = make_broadcast_entries(&key_a, identity_a, MAX_BOARD_ENTRIES_PER_AUTHOR, future);
     let count = manager.process_remote_entries(&entries, future).unwrap();
 
-    assert_eq!(count, MAX_BOARD_ENTRIES_PER_AUTHOR, "remote entries should all be accepted");
+    assert_eq!(
+        count, MAX_BOARD_ENTRIES_PER_AUTHOR,
+        "remote entries should all be accepted"
+    );
     assert_eq!(
         manager.stats().0,
         MAX_BOARD_ENTRIES_PER_AUTHOR + 5,
@@ -1060,7 +1102,10 @@ fn process_remote_entries_cap_resets_between_calls() {
     // First batch: indices 0..MAX.
     let batch1 = make_broadcast_entries(&key_a, identity_a, MAX_BOARD_ENTRIES_PER_AUTHOR, future);
     let count1 = manager.process_remote_entries(&batch1, future).unwrap();
-    assert_eq!(count1, MAX_BOARD_ENTRIES_PER_AUTHOR, "first call: all entries accepted");
+    assert_eq!(
+        count1, MAX_BOARD_ENTRIES_PER_AUTHOR,
+        "first call: all entries accepted"
+    );
 
     // Second batch: indices MAX..2*MAX (new msg_ids — no dedup collision).
     let batch2: Vec<StoredEntry> = (MAX_BOARD_ENTRIES_PER_AUTHOR..2 * MAX_BOARD_ENTRIES_PER_AUTHOR)
@@ -1073,7 +1118,10 @@ fn process_remote_entries_cap_resets_between_calls() {
         })
         .collect();
     let count2 = manager.process_remote_entries(&batch2, future).unwrap();
-    assert_eq!(count2, MAX_BOARD_ENTRIES_PER_AUTHOR, "second call: counter reset, all accepted");
+    assert_eq!(
+        count2, MAX_BOARD_ENTRIES_PER_AUTHOR,
+        "second call: counter reset, all accepted"
+    );
 
     assert_eq!(
         manager.stats().0,
@@ -1113,7 +1161,13 @@ fn process_remote_entries_over_cap_does_not_block_other_authors() {
         let mut msg_id = [0u8; 16];
         msg_id[..8].copy_from_slice(&(i as u64).to_le_bytes());
         msg_id[8] = 0xAA;
-        entries.push(make_broadcast_entry(&key_a, identity_a, "peer_announce", msg_id, future));
+        entries.push(make_broadcast_entry(
+            &key_a,
+            identity_a,
+            "peer_announce",
+            msg_id,
+            future,
+        ));
     }
 
     // B: index 0
@@ -1121,7 +1175,13 @@ fn process_remote_entries_over_cap_does_not_block_other_authors() {
         let mut msg_id = [0u8; 16];
         msg_id[8] = 0xBB;
         msg_id[9] = 0x00;
-        entries.push(make_broadcast_entry(&key_b, identity_b, "peer_announce", msg_id, future));
+        entries.push(make_broadcast_entry(
+            &key_b,
+            identity_b,
+            "peer_announce",
+            msg_id,
+            future,
+        ));
     }
 
     // A: indices 10..205
@@ -1129,7 +1189,13 @@ fn process_remote_entries_over_cap_does_not_block_other_authors() {
         let mut msg_id = [0u8; 16];
         msg_id[..8].copy_from_slice(&(i as u64).to_le_bytes());
         msg_id[8] = 0xAA;
-        entries.push(make_broadcast_entry(&key_a, identity_a, "peer_announce", msg_id, future));
+        entries.push(make_broadcast_entry(
+            &key_a,
+            identity_a,
+            "peer_announce",
+            msg_id,
+            future,
+        ));
     }
 
     // B: indices 1..3
@@ -1138,7 +1204,13 @@ fn process_remote_entries_over_cap_does_not_block_other_authors() {
         msg_id[..8].copy_from_slice(&(i as u64).to_le_bytes());
         msg_id[8] = 0xBB;
         msg_id[9] = 0x01;
-        entries.push(make_broadcast_entry(&key_b, identity_b, "peer_announce", msg_id, future));
+        entries.push(make_broadcast_entry(
+            &key_b,
+            identity_b,
+            "peer_announce",
+            msg_id,
+            future,
+        ));
     }
 
     let count = manager.process_remote_entries(&entries, future).unwrap();
@@ -1156,5 +1228,8 @@ fn process_remote_entries_over_cap_does_not_block_other_authors() {
         .iter()
         .filter(|e| e.entry.author == identity_b)
         .count();
-    assert_eq!(b_on_board, 3, "all B entries must be present despite A overflow");
+    assert_eq!(
+        b_on_board, 3,
+        "all B entries must be present despite A overflow"
+    );
 }

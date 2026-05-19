@@ -22,8 +22,7 @@ use std::sync::Arc;
 use syncback_core::db::{Db, DbError};
 use syncback_core::erasure::ErasureEncoder;
 use syncback_core::types::{
-    hex_encode, DeviceId, IdentityPub, PlacementStatus, SourceBlockId,
-    SourceBlockStatus, Timestamp,
+    DeviceId, IdentityPub, PlacementStatus, SourceBlockId, SourceBlockStatus, Timestamp, hex_encode,
 };
 
 #[cfg(test)]
@@ -127,7 +126,11 @@ pub struct RepairAgent {
 impl RepairAgent {
     /// Create a new RepairAgent.
     pub fn new(db: Db, config: RepairConfig, encoder: Arc<dyn ErasureEncoder>) -> Self {
-        RepairAgent { db, config, encoder }
+        RepairAgent {
+            db,
+            config,
+            encoder,
+        }
     }
 
     /// Periodic reliability scan: corrects stale cached fields for all active blocks.
@@ -274,11 +277,9 @@ impl RepairAgent {
         block_id: &SourceBlockId,
         block_record: &syncback_core::types::SourceBlockRecord,
     ) -> Result<Vec<u8>, RepairError> {
-        let plaintext = crate::daemon::backup::packing::rebuild_plaintext_from_db(
-            &self.db,
-            block_record,
-        )
-        .map_err(|e| RepairError::EncodeFailed(format!("rebuild plaintext: {e}")))?;
+        let plaintext =
+            crate::daemon::backup::packing::rebuild_plaintext_from_db(&self.db, block_record)
+                .map_err(|e| RepairError::EncodeFailed(format!("rebuild plaintext: {e}")))?;
 
         let epoch_key = self.config.epoch_key;
         let expected_id = *block_id;
@@ -328,12 +329,14 @@ impl RepairAgent {
         let placements = self.db.list_placements_for_block(block_id)?;
         let reachable: Vec<_> = placements
             .into_iter()
-            .filter(|p| matches!(
-                p.status,
-                syncback_core::types::PlacementStatus::Alive
-                    | syncback_core::types::PlacementStatus::Uncertain
-                    | syncback_core::types::PlacementStatus::PresumedLost
-            ))
+            .filter(|p| {
+                matches!(
+                    p.status,
+                    syncback_core::types::PlacementStatus::Alive
+                        | syncback_core::types::PlacementStatus::Uncertain
+                        | syncback_core::types::PlacementStatus::PresumedLost
+                )
+            })
             .collect();
 
         if reachable.is_empty() {
@@ -419,10 +422,7 @@ impl RepairAgent {
         self.db.upsert_placement(&updated)?;
 
         // Recompute cached fields after successful upsert (best-effort).
-        crate::daemon::processor::recompute_and_persist_block_cached_fields(
-            &self.db,
-            block_id,
-        );
+        crate::daemon::processor::recompute_and_persist_block_cached_fields(&self.db, block_id);
 
         tracing::info!(
             block_id = %block_id,

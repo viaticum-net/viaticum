@@ -61,10 +61,7 @@ impl TrustEngine {
         }
     }
 
-    pub fn load(
-        peers: Vec<PeerRecord>,
-        pos_history: Vec<(DeviceId, u32, u32, u32)>,
-    ) -> Self {
+    pub fn load(peers: Vec<PeerRecord>, pos_history: Vec<(DeviceId, u32, u32, u32)>) -> Self {
         let mut engine = TrustEngine::new();
         for record in peers {
             engine.peers.insert(record.device_id, record);
@@ -282,13 +279,22 @@ impl TrustEngine {
                 (record, score)
             })
             .collect();
-        result.sort_by(|a, b| b.1.combined.partial_cmp(&a.1.combined).unwrap_or(std::cmp::Ordering::Equal));
+        result.sort_by(|a, b| {
+            b.1.combined
+                .partial_cmp(&a.1.combined)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         result
     }
 
     /// Returns (total_challenged, total_passed) for the last `weeks` weeks ending at `current_week`.
     /// If no data for the period, returns (0, 0).
-    pub fn recent_pos_stats(&self, device_id: &DeviceId, current_week: u32, weeks: u32) -> (u32, u32) {
+    pub fn recent_pos_stats(
+        &self,
+        device_id: &DeviceId,
+        current_week: u32,
+        weeks: u32,
+    ) -> (u32, u32) {
         let window_start = current_week.saturating_sub(weeks.saturating_sub(1));
         let mut total_challenged = 0u32;
         let mut total_passed = 0u32;
@@ -479,7 +485,9 @@ pub fn recalculate_trust(
 
     // Recompute master trust from all device trusts of this device's master.
     let master_identity = record.master_identity;
-    let devices_for_master = db.get_devices_for_master(&master_identity).unwrap_or_default();
+    let devices_for_master = db
+        .get_devices_for_master(&master_identity)
+        .unwrap_or_default();
     let device_data: Vec<(DeviceTrustRecord, u64)> = devices_for_master
         .iter()
         .filter_map(|did| {

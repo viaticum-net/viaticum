@@ -7,11 +7,13 @@ use chacha20poly1305::aead::{Aead, NewAead};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
+use syncback_core::cluster::esi_namespace_start;
 use syncback_core::constants::MIN_BATCH_BYTES;
 use syncback_core::db::Db;
-use syncback_core::erasure::{binding_seed, ErasureEncoder};
-use syncback_core::cluster::esi_namespace_start;
-use syncback_core::placement::{compute_allocation_with_importance, HolderCandidate, PlacementError};
+use syncback_core::erasure::{ErasureEncoder, binding_seed};
+use syncback_core::placement::{
+    HolderCandidate, PlacementError, compute_allocation_with_importance,
+};
 use syncback_core::reliability;
 
 /// Importance change threshold above which the pack accumulator flushes.
@@ -20,9 +22,8 @@ use syncback_core::reliability;
 /// within-bucket jitter (maximum ~0.02 from burst downweighting).
 const IMPORTANCE_FLUSH_EPSILON: f64 = 0.05;
 use syncback_core::types::{
-    DeviceId, ErasureParams, Event, EventEntry, FileId, PlacementStatus,
-    SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement,
-    Timestamp,
+    DeviceId, ErasureParams, Event, EventEntry, FileId, PlacementStatus, SourceBlockId,
+    SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
 };
 
 use super::packing::build_plaintext;
@@ -364,34 +365,49 @@ pub fn flush_queue_inner(
 
     for qf in drained {
         // Read file bytes from disk
-        let file_bytes = std::fs::read(&qf.path)
-            .map_err(|e| anyhow::anyhow!("read file {}: {e}", qf.path))?;
+        let file_bytes =
+            std::fs::read(&qf.path).map_err(|e| anyhow::anyhow!("read file {}: {e}", qf.path))?;
 
         let file_size = file_bytes.len() as u64;
 
         // Importance-change flush (BEFORE size-overflow check, per D2).
         // Fires when importance changes by more than IMPORTANCE_FLUSH_EPSILON (strict).
-        if let Some(prev) = prev_importance {
-            if (qf.importance - prev).abs() > IMPORTANCE_FLUSH_EPSILON && !batch.is_empty() {
+        if let Some(prev) = prev_importance
+            && (qf.importance - prev).abs() > IMPORTANCE_FLUSH_EPSILON && !batch.is_empty() {
                 let pack_importance = batch[0].0.importance;
-                let result = run_pipeline(db, config, encoder, &batch, BlockTypeTag::Pack, candidates, &[], pack_importance)?;
+                let result = run_pipeline(
+                    db,
+                    config,
+                    encoder,
+                    &batch,
+                    BlockTypeTag::Pack,
+                    candidates,
+                    &[],
+                    pack_importance,
+                )?;
                 update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
                 results.push(result);
                 batch.clear();
                 batch_bytes = 0;
-                prev_importance = None;
             }
-        }
 
         // Size-overflow flush: adding this file would push batch over the limit.
         if !batch.is_empty() && batch_bytes + file_size > config.source_block_size {
             let pack_importance = batch[0].0.importance;
-            let result = run_pipeline(db, config, encoder, &batch, BlockTypeTag::Pack, candidates, &[], pack_importance)?;
+            let result = run_pipeline(
+                db,
+                config,
+                encoder,
+                &batch,
+                BlockTypeTag::Pack,
+                candidates,
+                &[],
+                pack_importance,
+            )?;
             update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
             results.push(result);
             batch.clear();
             batch_bytes = 0;
-            prev_importance = None;
         }
 
         prev_importance = Some(qf.importance);
@@ -401,7 +417,16 @@ pub fn flush_queue_inner(
         // Immediate size flush: batch is at or over limit after adding the file.
         if batch_bytes >= config.source_block_size {
             let pack_importance = batch[0].0.importance;
-            let result = run_pipeline(db, config, encoder, &batch, BlockTypeTag::Pack, candidates, &[], pack_importance)?;
+            let result = run_pipeline(
+                db,
+                config,
+                encoder,
+                &batch,
+                BlockTypeTag::Pack,
+                candidates,
+                &[],
+                pack_importance,
+            )?;
             update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
             results.push(result);
             batch.clear();
@@ -413,7 +438,16 @@ pub fn flush_queue_inner(
     // Flush remaining batch
     if !batch.is_empty() {
         let pack_importance = batch[0].0.importance;
-        let result = run_pipeline(db, config, encoder, &batch, BlockTypeTag::Pack, candidates, &[], pack_importance)?;
+        let result = run_pipeline(
+            db,
+            config,
+            encoder,
+            &batch,
+            BlockTypeTag::Pack,
+            candidates,
+            &[],
+            pack_importance,
+        )?;
         update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
         results.push(result);
     }
@@ -479,12 +513,11 @@ pub async fn rebuild_source_blob(
         .map_err(|e| anyhow::anyhow!("rebuild plaintext: {e}"))?;
 
     let epoch_key_owned = *epoch_key;
-    let stored = tokio::task::spawn_blocking(move || {
-        compress_and_encrypt(&plaintext, &epoch_key_owned)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))?
-    .map_err(|e| anyhow::anyhow!("compress_and_encrypt: {e}"))?;
+    let stored =
+        tokio::task::spawn_blocking(move || compress_and_encrypt(&plaintext, &epoch_key_owned))
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))?
+            .map_err(|e| anyhow::anyhow!("compress_and_encrypt: {e}"))?;
 
     let hash: [u8; 32] = *blake3::hash(&stored).as_bytes();
     if hash != block_record.block_id.0 {
@@ -509,7 +542,12 @@ pub fn cleanup_legacy_bound_symbol_files(symbols_dir: &std::path::Path) -> anyho
     let entries = match std::fs::read_dir(symbols_dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(anyhow::anyhow!("read symbols_dir {}: {e}", symbols_dir.display())),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "read symbols_dir {}: {e}",
+                symbols_dir.display()
+            ));
+        }
     };
 
     for entry in entries {
@@ -540,10 +578,7 @@ pub fn cleanup_legacy_bound_symbol_files(symbols_dir: &std::path::Path) -> anyho
                 continue;
             }
 
-            let name = file_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             if name.ends_with(".bin") && name != "block.bin" {
                 // Legacy bound symbol file — remove.

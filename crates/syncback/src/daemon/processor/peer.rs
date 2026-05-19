@@ -3,11 +3,11 @@
 use libp2p::PeerId;
 use syncback_core::cluster::DeviceCertificate;
 use syncback_core::constants::{HANDSHAKE_FRESHNESS_SECS, INITIAL_TRUST_P};
-use syncback_core::messages::{verify_peer_announce, PeerAnnounceMsg};
+use syncback_core::messages::{PeerAnnounceMsg, verify_peer_announce};
 use syncback_core::types::{DeviceId, IdentityPub, PeerRecord, Timestamp};
 use tracing::{debug, error, info, warn};
 
-use super::{ProcessorError, Processor};
+use super::{Processor, ProcessorError};
 
 impl Processor {
     /// Called when DeviceCertExchange succeeds for a peer (AC-1, AC-2).
@@ -41,8 +41,8 @@ impl Processor {
                 return;
             }
         }
-        if let Ok(Some(existing_peer)) = self.db.get_peer(&device_id) {
-            if existing_peer.is_device_revoked(&device_id) {
+        if let Ok(Some(existing_peer)) = self.db.get_peer(&device_id)
+            && existing_peer.is_device_revoked(&device_id) {
                 warn!(
                     device = %device_id,
                     master = %identity_pub,
@@ -50,7 +50,6 @@ impl Processor {
                 );
                 return;
             }
-        }
 
         // 1. Store in peer_cert_map.
         {
@@ -113,7 +112,8 @@ impl Processor {
         }
 
         // 3. Auto-add cluster device if same master identity.
-        self.try_auto_add_cluster_device(Some(identity_pub), Some(device_cert)).await;
+        self.try_auto_add_cluster_device(Some(identity_pub), Some(device_cert))
+            .await;
 
         // 4. Send PeerAnnounce so the peer learns our identity ↔ DeviceId binding.
         let pa = self.swarm.build_peer_announce(Timestamp::now());
@@ -153,10 +153,7 @@ impl Processor {
         if listen_addrs.is_empty() {
             return;
         }
-        let addr_strings: Vec<String> = listen_addrs
-            .iter()
-            .map(|a| a.to_string())
-            .collect();
+        let addr_strings: Vec<String> = listen_addrs.iter().map(|a| a.to_string()).collect();
 
         match self.db.get_peer(&device_id) {
             Ok(Some(mut record)) => {
@@ -291,7 +288,10 @@ impl Processor {
         // PeerRecord is keyed by DeviceId. Look up all known devices for this master identity.
         // If we have device records — update x25519_pub and last_seen.
         // If no devices known yet — record is created later by on_peer_authenticated.
-        let devices = self.db.get_devices_for_master(&msg.identity_pub).unwrap_or_default();
+        let devices = self
+            .db
+            .get_devices_for_master(&msg.identity_pub)
+            .unwrap_or_default();
         for did in &devices {
             if let Some(mut existing) = self.db.get_peer(did)? {
                 existing.last_seen = now;

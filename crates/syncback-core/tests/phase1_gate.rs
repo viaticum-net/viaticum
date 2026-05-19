@@ -4,21 +4,20 @@
 use syncback_core::{
     budget::{estimate_budget, select_backup_batch},
     cluster::{
-        derive_device_key, derive_epoch_key, derive_master_key, issue_device_certificate,
-        issue_revocation, master_identity, next_epoch, verify_device_certificate, verify_revocation,
-        EpochCounter,
+        EpochCounter, derive_device_key, derive_epoch_key, derive_master_key,
+        issue_device_certificate, issue_revocation, master_identity, next_epoch,
+        verify_device_certificate, verify_revocation,
     },
     constants::DEFAULT_ESCROW_K_FACTOR,
     db::testutil::test_db,
     erasure::{ErasureEncoder, RaptorQEncoder},
-    escrow::{check_restore, RestoreDecision},
-    pos::{compute_chain_hash, outcome_from_verify, verify_hash_response, VerifyOutcome},
+    escrow::{RestoreDecision, check_restore},
+    pos::{VerifyOutcome, compute_chain_hash, outcome_from_verify, verify_hash_response},
     trust::{PosOutcome, TrustEngine},
     types::{
-        DeviceId, Event, EventEntry, ErasureParams, FileId, FileRecord, FileVersion,
-        IdentityPub, LocalState, PlacementStatus,
-        SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement,
-        Timestamp,
+        DeviceId, ErasureParams, Event, EventEntry, FileId, FileRecord, FileVersion, IdentityPub,
+        LocalState, PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus,
+        SourceBlockType, SymbolPlacement, Timestamp,
     },
 };
 
@@ -104,12 +103,20 @@ fn pos_hash_challenge_verify_roundtrip() {
         symbol_data.push((esi, bound[0].data.clone()));
     }
     let challenge_id = [0u8; 16];
-    let refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
-    let expected_hash = compute_chain_hash(&challenge_id, &refs).expect("compute_chain_hash must succeed");
+    let refs: Vec<(u32, &[u8])> = symbol_data
+        .iter()
+        .map(|(e, d)| (*e, d.as_slice()))
+        .collect();
+    let expected_hash =
+        compute_chain_hash(&challenge_id, &refs).expect("compute_chain_hash must succeed");
 
     // Holder side: reads same symbols and computes same chain hash.
-    let holder_refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
-    let holder_hash = compute_chain_hash(&challenge_id, &holder_refs).expect("holder compute_chain_hash");
+    let holder_refs: Vec<(u32, &[u8])> = symbol_data
+        .iter()
+        .map(|(e, d)| (*e, d.as_slice()))
+        .collect();
+    let holder_hash =
+        compute_chain_hash(&challenge_id, &holder_refs).expect("holder compute_chain_hash");
 
     // Verify.
     let first_esi = esi_ranges[0].0;
@@ -143,18 +150,24 @@ fn pos_hash_challenge_detect_corruption() {
         symbol_data.push((esi, bound[0].data.clone()));
     }
     let challenge_id = [0u8; 16];
-    let refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
-    let expected_hash = compute_chain_hash(&challenge_id, &refs).expect("compute expected chain hash");
+    let refs: Vec<(u32, &[u8])> = symbol_data
+        .iter()
+        .map(|(e, d)| (*e, d.as_slice()))
+        .collect();
+    let expected_hash =
+        compute_chain_hash(&challenge_id, &refs).expect("compute expected chain hash");
 
     // Holder has corrupted data: all zeros for each symbol.
     let corrupt_symbol_data: Vec<(u32, Vec<u8>)> = esis
         .iter()
         .map(|&esi| (esi, vec![0u8; params.t as usize]))
         .collect();
-    let corrupt_refs: Vec<(u32, &[u8])> = corrupt_symbol_data.iter()
+    let corrupt_refs: Vec<(u32, &[u8])> = corrupt_symbol_data
+        .iter()
         .map(|(e, d)| (*e, d.as_slice()))
         .collect();
-    let corrupt_hash = compute_chain_hash(&challenge_id, &corrupt_refs).expect("compute corrupt chain hash");
+    let corrupt_hash =
+        compute_chain_hash(&challenge_id, &corrupt_refs).expect("compute corrupt chain hash");
 
     // Verify: hash mismatch → Fail.
     let outcome = verify_hash_response(&corrupt_hash, &expected_hash, first_esi);
@@ -181,7 +194,14 @@ fn trust_records_pos_results() {
     // Record 10 passing outcomes in week 1.
     for _ in 0..10 {
         engine
-            .record_pos_result(peer, PosOutcome { week_number: 1, challenged: 1, passed: 1 })
+            .record_pos_result(
+                peer,
+                PosOutcome {
+                    week_number: 1,
+                    challenged: 1,
+                    passed: 1,
+                },
+            )
             .expect("record_pos_result");
     }
     let after_pass = engine
@@ -197,7 +217,14 @@ fn trust_records_pos_results() {
     // Record 20 failing outcomes in week 2.
     for _ in 0..20 {
         engine
-            .record_pos_result(peer, PosOutcome { week_number: 2, challenged: 1, passed: 0 })
+            .record_pos_result(
+                peer,
+                PosOutcome {
+                    week_number: 2,
+                    challenged: 1,
+                    passed: 0,
+                },
+            )
             .expect("record_pos_result");
     }
     let after_fail = engine
@@ -362,7 +389,7 @@ fn budget_selects_files_within_capacity() {
     // Candidates: one large low-importance, one small high-importance.
     // Use small enough sizes to fit within budget.
     let candidates: Vec<(String, f64, u64)> = vec![
-        ("big_low.bin".to_string(), 0.1, 100 * 1024 * 1024),   // 100 MB, low importance
+        ("big_low.bin".to_string(), 0.1, 100 * 1024 * 1024), // 100 MB, low importance
         ("small_high.pdf".to_string(), 0.9, 10 * 1024 * 1024), // 10 MB, high importance
         ("medium_mid.zip".to_string(), 0.5, 50 * 1024 * 1024), // 50 MB, medium
     ];
@@ -370,7 +397,10 @@ fn budget_selects_files_within_capacity() {
     let batch = select_backup_batch(&candidates, budget.total_gb);
 
     // High importance must come first.
-    assert!(!batch.candidates.is_empty(), "at least one file must be selected");
+    assert!(
+        !batch.candidates.is_empty(),
+        "at least one file must be selected"
+    );
     assert_eq!(
         batch.candidates[0].path, "small_high.pdf",
         "highest importance must be first"
@@ -446,16 +476,29 @@ fn db_event_log_append_and_replay() {
 
     let events = vec![
         Event::DeviceAdded { device_id: did },
-        Event::FileAdded { file_id: FileId(1), path: "/photos/a.jpg".to_string() },
+        Event::FileAdded {
+            file_id: FileId(1),
+            path: "/photos/a.jpg".to_string(),
+        },
         Event::EpochRotated { epoch: 1 },
-        Event::FileModified { file_id: FileId(1), content_hash: [0x11; 32] },
-        Event::FileDeleted { file_id: FileId(1), device_id: did },
+        Event::FileModified {
+            file_id: FileId(1),
+            content_hash: [0x11; 32],
+        },
+        Event::FileDeleted {
+            file_id: FileId(1),
+            device_id: did,
+        },
     ];
 
     let mut seqs = Vec::new();
     for event in &events {
         let seq = db
-            .append_event(&EventEntry { timestamp: t, device_id: did, event: event.clone() })
+            .append_event(&EventEntry {
+                timestamp: t,
+                device_id: did,
+                event: event.clone(),
+            })
             .expect("append_event");
         seqs.push(seq);
     }
@@ -583,14 +626,26 @@ fn full_owner_flow() {
         }
     }
     let challenge_id = [0u8; 16];
-    let refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
-    let expected_hash = compute_chain_hash(&challenge_id, &refs).expect("compute expected chain hash");
+    let refs: Vec<(u32, &[u8])> = symbol_data
+        .iter()
+        .map(|(e, d)| (*e, d.as_slice()))
+        .collect();
+    let expected_hash =
+        compute_chain_hash(&challenge_id, &refs).expect("compute expected chain hash");
 
     // Holder computes the same chain hash and returns it.
-    let holder_refs: Vec<(u32, &[u8])> = symbol_data.iter().map(|(e, d)| (*e, d.as_slice())).collect();
-    let holder_hash = compute_chain_hash(&challenge_id, &holder_refs).expect("holder compute chain hash");
+    let holder_refs: Vec<(u32, &[u8])> = symbol_data
+        .iter()
+        .map(|(e, d)| (*e, d.as_slice()))
+        .collect();
+    let holder_hash =
+        compute_chain_hash(&challenge_id, &holder_refs).expect("holder compute chain hash");
 
-    let first_esi = loaded_placement.esi_ranges.first().map(|&(s, _)| s).unwrap_or(0);
+    let first_esi = loaded_placement
+        .esi_ranges
+        .first()
+        .map(|&(s, _)| s)
+        .unwrap_or(0);
     let outcome = verify_hash_response(&holder_hash, &expected_hash, first_esi);
     assert_eq!(outcome, VerifyOutcome::Pass);
 
@@ -626,7 +681,10 @@ fn full_owner_flow() {
         .append_event(&EventEntry {
             timestamp: t,
             device_id: device_id(10),
-            event: Event::SymbolsVerified { source_block_id: bid, holder_id: holder },
+            event: Event::SymbolsVerified {
+                source_block_id: bid,
+                holder_id: holder,
+            },
         })
         .expect("append_event");
     assert_eq!(seq, 1);

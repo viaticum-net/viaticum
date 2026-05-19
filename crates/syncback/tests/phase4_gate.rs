@@ -23,9 +23,9 @@ use syncback::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, Dirt
 use syncback::daemon::repair::{RepairAgent, RepairConfig};
 use syncback_core::budget::{compute_effective_quota, should_reject_offers};
 use syncback_core::commitment::{
-    compute_commitment, flag_for_proactive_repair, CommitmentScore, CommitmentTier, HolderProfile,
+    CommitmentScore, CommitmentTier, HolderProfile, compute_commitment, flag_for_proactive_repair,
 };
-use syncback_core::config::{source_block_size_bytes, AppConfig, BackupCfg};
+use syncback_core::config::{AppConfig, BackupCfg, source_block_size_bytes};
 use syncback_core::constants::{
     DEFAULT_SOURCE_BLOCK_SIZE, HOLDER_DELETE_COOLDOWN_SECS, OWNER_DELETE_COOLDOWN_SECS,
 };
@@ -34,7 +34,7 @@ use syncback_core::deletion::{DeletionAction, DeletionEngine, MarkDeletedResult}
 use syncback_core::erasure::RaptorQEncoder;
 use syncback_core::placement::HolderCandidate;
 use syncback_core::reliability::{
-    build_report, commitment_to_survival_prob, BlockReliabilityInput, HolderReliabilityInput,
+    BlockReliabilityInput, HolderReliabilityInput, build_report, commitment_to_survival_prob,
 };
 use syncback_core::types::{
     DeviceId, FileId, FileRecord, FileVersion, IdentityPub, LocalState, PlacementStatus,
@@ -107,13 +107,19 @@ fn write_file(dir: &TempDir, name: &str, content: &[u8]) -> String {
 fn config_source_block_size_drives_backup() {
     // 1 MB config → source_block_size_bytes = 1_048_576
     let one_mb_cfg = AppConfig {
-        backup: BackupCfg { source_block_size_mb: 1, ..Default::default() },
+        backup: BackupCfg {
+            source_block_size_mb: 1,
+            ..Default::default()
+        },
         ..Default::default()
     };
     assert_eq!(source_block_size_bytes(&one_mb_cfg), 1_048_576);
 
     // Default config → DEFAULT_SOURCE_BLOCK_SIZE (128 MB)
-    assert_eq!(source_block_size_bytes(&AppConfig::default()), DEFAULT_SOURCE_BLOCK_SIZE);
+    assert_eq!(
+        source_block_size_bytes(&AppConfig::default()),
+        DEFAULT_SOURCE_BLOCK_SIZE
+    );
 
     // Backup two files with a small source_block_size (128 KB = SMALL_BLOCK_SIZE):
     //   - a "large" file (> source_block_size) → handled immediately by process_large_file,
@@ -198,7 +204,11 @@ fn config_source_block_size_drives_backup() {
     let all_blocks = db
         .list_source_blocks_by_status(syncback_core::types::SourceBlockStatus::Active)
         .unwrap();
-    assert_eq!(all_blocks.len(), 2, "DB must contain exactly 2 blocks total");
+    assert_eq!(
+        all_blocks.len(),
+        2,
+        "DB must contain exactly 2 blocks total"
+    );
 }
 
 // ─── Test 2: deletion_cooldown_full_lifecycle ─────────────────────────────────
@@ -306,7 +316,10 @@ fn deletion_cooldown_full_lifecycle() {
         before_owner,
         1,
     );
-    assert!(actions.is_empty(), "before owner cooldown, no actions expected");
+    assert!(
+        actions.is_empty(),
+        "before owner cooldown, no actions expected"
+    );
 
     // Phase 3 — after owner cooldown, before holder cooldown: 2 SendDropNotice
     let after_owner = Timestamp(now.0 + OWNER_DELETE_COOLDOWN_SECS + 1);
@@ -321,7 +334,12 @@ fn deletion_cooldown_full_lifecycle() {
         .iter()
         .filter(|a| matches!(a, DeletionAction::SendDropNotice { .. }))
         .collect();
-    assert_eq!(send_drops.len(), 2, "expected 2 SendDropNotice, got {}", send_drops.len());
+    assert_eq!(
+        send_drops.len(),
+        2,
+        "expected 2 SendDropNotice, got {}",
+        send_drops.len()
+    );
 
     // Phase 4 — after both cooldowns: CleanupPlacement × 2 + CleanupBlock × 1
     let after_both =
@@ -353,13 +371,23 @@ fn deletion_cooldown_full_lifecycle() {
         .iter()
         .filter(|a| matches!(a, DeletionAction::CleanupPlacement { .. }))
         .collect();
-    assert_eq!(cleanups.len(), 2, "expected 2 CleanupPlacement, got {}", cleanups.len());
+    assert_eq!(
+        cleanups.len(),
+        2,
+        "expected 2 CleanupPlacement, got {}",
+        cleanups.len()
+    );
 
     let block_cleanups: Vec<_> = actions
         .iter()
         .filter(|a| matches!(a, DeletionAction::CleanupBlock { .. }))
         .collect();
-    assert_eq!(block_cleanups.len(), 1, "expected 1 CleanupBlock, got {}", block_cleanups.len());
+    assert_eq!(
+        block_cleanups.len(),
+        1,
+        "expected 1 CleanupBlock, got {}",
+        block_cleanups.len()
+    );
 }
 
 // ─── Test 3: commitment_plus_reliability_flags_weak_holder ────────────────────
@@ -441,8 +469,14 @@ fn commitment_plus_reliability_flags_weak_holder() {
     let p_h1 = commitment_to_survival_prob(score_h1);
     let p_h2 = commitment_to_survival_prob(score_h2);
     let p_h3 = commitment_to_survival_prob(score_h3);
-    assert!(p_h1 > p_h3, "strong holder survival prob must exceed at-risk holder's");
-    assert!(p_h1 > p_h2, "high-tier holder has higher survival prob than medium");
+    assert!(
+        p_h1 > p_h3,
+        "strong holder survival prob must exceed at-risk holder's"
+    );
+    assert!(
+        p_h1 > p_h2,
+        "high-tier holder has higher survival prob than medium"
+    );
 
     // Build reliability report: H1=50, H2=30, H3=20 symbols
     // "Weakest" = removing which holder drops reliability most.
@@ -452,9 +486,21 @@ fn commitment_plus_reliability_flags_weak_holder() {
         block_id,
         k_eff,
         holders: vec![
-            HolderReliabilityInput { holder_id: h1, alive_symbols: 50, survival_prob: p_h1 },
-            HolderReliabilityInput { holder_id: h2, alive_symbols: 30, survival_prob: p_h2 },
-            HolderReliabilityInput { holder_id: h3, alive_symbols: 20, survival_prob: p_h3 },
+            HolderReliabilityInput {
+                holder_id: h1,
+                alive_symbols: 50,
+                survival_prob: p_h1,
+            },
+            HolderReliabilityInput {
+                holder_id: h2,
+                alive_symbols: 30,
+                survival_prob: p_h2,
+            },
+            HolderReliabilityInput {
+                holder_id: h3,
+                alive_symbols: 20,
+                survival_prob: p_h3,
+            },
         ],
     };
 
@@ -480,8 +526,14 @@ fn commitment_plus_reliability_flags_weak_holder() {
     //   - High commitment holders (H1) are never flagged
     let pairs = vec![(h1, score_h1), (h2, score_h2), (h3, score_h3)];
     let flagged = flag_for_proactive_repair(&pairs, 0.8);
-    assert!(flagged.contains(&h3), "AtRisk holder H3 must be flagged for proactive repair");
-    assert!(!flagged.contains(&h1), "High-commitment holder H1 must NOT be flagged");
+    assert!(
+        flagged.contains(&h3),
+        "AtRisk holder H3 must be flagged for proactive repair"
+    );
+    assert!(
+        !flagged.contains(&h1),
+        "High-commitment holder H1 must NOT be flagged"
+    );
 }
 
 // ─── Test 4: disk_pressure_effective_quota_blocks_over_soft_cap ───────────────
@@ -499,7 +551,10 @@ fn disk_pressure_effective_quota_blocks_over_soft_cap() {
     let disk_free = 200 * gb;
     let disk_reserve = 20 * gb;
     let effective = compute_effective_quota(soft_quota_bytes, disk_free, disk_reserve);
-    assert_eq!(effective, soft_quota_bytes, "soft_quota wins when disk has plenty of room");
+    assert_eq!(
+        effective, soft_quota_bytes,
+        "soft_quota wins when disk has plenty of room"
+    );
 
     // used = 47 GiB → free_ratio = 3/50 = 0.06 < 0.15 threshold → reject
     let used = 47 * gb;
@@ -577,12 +632,18 @@ async fn full_pipeline_with_phase4_integration() {
         })
         .unwrap();
     let results = backup.flush_all(true, &Default::default()).unwrap();
-    assert!(!results.is_empty(), "backup must produce at least one source block");
+    assert!(
+        !results.is_empty(),
+        "backup must produce at least one source block"
+    );
 
     // Phase 2.5: mark first placement as Lost via PosNack
     let block_id = results[0].source_block_id;
     let placements = db.list_placements_for_block(&block_id).unwrap();
-    assert!(!placements.is_empty(), "backup must produce at least one placement");
+    assert!(
+        !placements.is_empty(),
+        "backup must produce at least one placement"
+    );
     let victim = placements[0].clone();
 
     let repair_agent = RepairAgent::new(

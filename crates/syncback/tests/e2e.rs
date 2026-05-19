@@ -10,11 +10,13 @@ use std::sync::{Arc, Mutex};
 
 use syncback::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
 
-use syncback::daemon::restore::{RestoreConfig, RestoreCoordinator, RestoreRequest, VersionSelector};
 use syncback::daemon::restore::staging::JobId;
+use syncback::daemon::restore::{
+    RestoreConfig, RestoreCoordinator, RestoreRequest, VersionSelector,
+};
 use syncback_core::cluster::{
-    derive_device_key, derive_epoch_key, derive_master_key, issue_device_certificate,
-    issue_revocation, master_identity, ClusterState, EpochCounter,
+    ClusterState, EpochCounter, derive_device_key, derive_epoch_key, derive_master_key,
+    issue_device_certificate, issue_revocation, master_identity,
 };
 use syncback_core::constants::OWNER_DELETE_COOLDOWN_SECS;
 use syncback_core::db::Db;
@@ -83,14 +85,22 @@ fn write_file(dir: &TempDir, name: &str, content: &[u8]) -> String {
     path.to_string_lossy().into_owned()
 }
 
-
-
 fn device_a() -> DeviceId {
-    DeviceId(derive_device_key(SEED, &DEVICE_A_SEED).unwrap().verifying_key().to_bytes())
+    DeviceId(
+        derive_device_key(SEED, &DEVICE_A_SEED)
+            .unwrap()
+            .verifying_key()
+            .to_bytes(),
+    )
 }
 
 fn device_b() -> DeviceId {
-    DeviceId(derive_device_key(SEED, &DEVICE_B_SEED).unwrap().verifying_key().to_bytes())
+    DeviceId(
+        derive_device_key(SEED, &DEVICE_B_SEED)
+            .unwrap()
+            .verifying_key()
+            .to_bytes(),
+    )
 }
 
 fn init_cluster(db: Db) -> ClusterState {
@@ -173,23 +183,31 @@ async fn full_lifecycle_e2e() {
     }
 
     let blocks_after_step1 = db.list_all_source_blocks().unwrap().len();
-    eprintln!("[E2E] Step 1: 3 files backed up ({} source blocks)", blocks_after_step1);
+    eprintln!(
+        "[E2E] Step 1: 3 files backed up ({} source blocks)",
+        blocks_after_step1
+    );
 
     // Wave 11b: write raw symbol files for v0 blocks so version-specific restore works.
     // These simulate what holder nodes would store. The restore path reads raw/{esi}.bin
     // from symbols_dir if present (local fallback before network fetch).
     {
         use syncback_core::erasure::ErasureEncoder;
-        use syncback_core::types::{hex_encode, ErasureParams};
+        use syncback_core::types::{ErasureParams, hex_encode};
         let encoder = RaptorQEncoder::new();
         for block in db.list_all_source_blocks().unwrap() {
             if let Some(enc_size) = block.encrypted_size {
                 let blob = syncback::daemon::backup::pipeline::rebuild_source_blob(
                     &db, &block, &EPOCH_KEY,
-                ).await.unwrap();
+                )
+                .await
+                .unwrap();
                 let params = ErasureParams::compute(enc_size, 0.5).unwrap();
                 let raws = encoder.encode_raw(&blob, &params, 0, params.k_eff).unwrap();
-                let raw_dir = symbols_dir.path().join(hex_encode(&block.block_id.0)).join("raw");
+                let raw_dir = symbols_dir
+                    .path()
+                    .join(hex_encode(&block.block_id.0))
+                    .join("raw");
                 std::fs::create_dir_all(&raw_dir).unwrap();
                 for sym in &raws {
                     std::fs::write(raw_dir.join(format!("{}.bin", sym.esi)), &sym.data).unwrap();
@@ -200,8 +218,7 @@ async fn full_lifecycle_e2e() {
 
     // ── Step 2: Modify photo.jpg → creates second version ────────────────────
 
-    let new_photo_content: Vec<u8> =
-        (0..8192u32).map(|i| ((i * 13 + 5) % 256) as u8).collect();
+    let new_photo_content: Vec<u8> = (0..8192u32).map(|i| ((i * 13 + 5) % 256) as u8).collect();
     std::fs::write(&photo_path, &new_photo_content).unwrap();
 
     backup
@@ -224,7 +241,10 @@ async fn full_lifecycle_e2e() {
     );
     let v0_hash = photo_record.versions[0].content_hash;
     let v1_hash = photo_record.versions[1].content_hash;
-    assert_ne!(v0_hash, v1_hash, "versions must have different content hashes");
+    assert_ne!(
+        v0_hash, v1_hash,
+        "versions must have different content hashes"
+    );
 
     eprintln!("[E2E] Step 2: photo.jpg has 2 versions, content hashes differ");
 
@@ -248,8 +268,7 @@ async fn full_lifecycle_e2e() {
         .await
         .unwrap();
     assert_eq!(
-        result_latest.files_restored,
-        1,
+        result_latest.files_restored, 1,
         "Latest restore failures: {:?}",
         result_latest.failures
     );
@@ -274,8 +293,7 @@ async fn full_lifecycle_e2e() {
         .await
         .unwrap();
     assert_eq!(
-        result_v0.files_restored,
-        1,
+        result_v0.files_restored, 1,
         "Index(0) restore failures: {:?}",
         result_v0.failures
     );
@@ -300,8 +318,7 @@ async fn full_lifecycle_e2e() {
         .await
         .unwrap();
     assert_eq!(
-        result_all.files_restored,
-        3,
+        result_all.files_restored, 3,
         "directory restore failures: {:?}",
         result_all.failures
     );
@@ -334,8 +351,8 @@ async fn full_lifecycle_e2e() {
             mock_offer_budget_gb: None,
             master_signing_key: None,
             swarm: None,
-        live_watch_configs: None,
-        peer_backoff: None,
+            live_watch_configs: None,
+            peer_backoff: None,
         },
         Arc::new(RaptorQEncoder::new()),
     );
@@ -375,7 +392,10 @@ async fn full_lifecycle_e2e() {
         state.revoke_device(rev, NOW, NOW).unwrap();
 
         assert!(state.is_device_revoked(&device_b()), "B must be revoked");
-        assert!(!state.is_device_revoked(&device_a()), "A must not be revoked");
+        assert!(
+            !state.is_device_revoked(&device_a()),
+            "A must not be revoked"
+        );
         assert_eq!(state.current_epoch(), EpochCounter(1), "epoch must be 1");
     }
 
@@ -444,7 +464,9 @@ async fn full_lifecycle_e2e() {
         .get_file(&doc_path)
         .unwrap()
         .expect("document.txt must be in DB");
-    let del_result = engine.mark_deleted(&doc_record_fresh, device_a(), NOW).unwrap();
+    let del_result = engine
+        .mark_deleted(&doc_record_fresh, device_a(), NOW)
+        .unwrap();
     assert!(
         matches!(del_result, MarkDeletedResult::CooldownStarted { .. }),
         "all-devices-deleted must start cooldown: got {:?}",

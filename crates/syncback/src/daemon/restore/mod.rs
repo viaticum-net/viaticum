@@ -15,8 +15,8 @@ use std::sync::Arc;
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, Symbol};
 use syncback_core::types::{
-    DeviceId, ErasureParams, FileRecord, FileVersion, IdentityPub, LocalState,
-    PlacementStatus, SourceBlockId, SourceBlockType, SymbolPlacement, Timestamp,
+    DeviceId, ErasureParams, FileRecord, FileVersion, IdentityPub, LocalState, PlacementStatus,
+    SourceBlockId, SourceBlockType, SymbolPlacement, Timestamp,
 };
 use tracing::{debug, error, info, warn};
 
@@ -65,7 +65,9 @@ pub enum RestoreError {
     #[error("pack index parse failed for block {0}: {1}")]
     PackIndexParseFailed(SourceBlockId, String),
 
-    #[error("restore denied by holder {holder}: trust {current_trust:.2}, budget {restore_budget_gb:.1} GB, requested {restore_gb:.1} GB")]
+    #[error(
+        "restore denied by holder {holder}: trust {current_trust:.2}, budget {restore_budget_gb:.1} GB, requested {restore_gb:.1} GB"
+    )]
     EscrowDenied {
         holder: DeviceId,
         current_trust: f64,
@@ -224,11 +226,7 @@ pub struct RestoreCoordinator {
 
 impl RestoreCoordinator {
     /// Create a new coordinator.
-    pub fn new(
-        db: Db,
-        config: RestoreConfig,
-        encoder: Arc<dyn ErasureEncoder>,
-    ) -> Self {
+    pub fn new(db: Db, config: RestoreConfig, encoder: Arc<dyn ErasureEncoder>) -> Self {
         let swarm = config.swarm.clone();
         RestoreCoordinator {
             db,
@@ -238,7 +236,6 @@ impl RestoreCoordinator {
         }
     }
 
-
     /// Execute a restore request.
     ///
     /// 1. Resolve path to FileRecords.
@@ -247,10 +244,7 @@ impl RestoreCoordinator {
     /// 4. Decode each block.
     /// 5. Extract + write files.
     /// 6. Update LocalState in DB.
-    pub async fn restore(
-        &self,
-        request: RestoreRequest,
-    ) -> Result<RestoreResult, RestoreError> {
+    pub async fn restore(&self, request: RestoreRequest) -> Result<RestoreResult, RestoreError> {
         info!(path = %request.path, "restore started");
 
         // 1. Resolve path → FileRecords
@@ -267,10 +261,7 @@ impl RestoreCoordinator {
             return Ok(RestoreResult {
                 files_restored: 0,
                 blocks_fetched: 0,
-                failures: vec![(
-                    request.path.clone(),
-                    "no matching files found".to_string(),
-                )],
+                failures: vec![(request.path.clone(), "no matching files found".to_string())],
                 staging_path: empty_writer.staging_path().to_path_buf(),
             });
         }
@@ -281,8 +272,7 @@ impl RestoreCoordinator {
 
         for record in file_records {
             // select_version borrows record; clone the version before moving record.
-            let version_opt = Self::select_version(&record, &request.version_selector)
-                .cloned();
+            let version_opt = Self::select_version(&record, &request.version_selector).cloned();
             match version_opt {
                 Some(version) => {
                     resolved.push((record, version));
@@ -290,15 +280,17 @@ impl RestoreCoordinator {
                 None => {
                     failures.push((
                         record.path.clone(),
-                        format!("no matching version for selector {:?}", request.version_selector),
+                        format!(
+                            "no matching version for selector {:?}",
+                            request.version_selector
+                        ),
                     ));
                 }
             }
         }
 
         // 3. Deduplicate: source_block_id → Vec<(FileRecord, FileVersion)>
-        let mut block_map: HashMap<SourceBlockId, Vec<(FileRecord, FileVersion)>> =
-            HashMap::new();
+        let mut block_map: HashMap<SourceBlockId, Vec<(FileRecord, FileVersion)>> = HashMap::new();
         for (record, version) in resolved {
             block_map
                 .entry(version.source_block_id)
@@ -359,9 +351,7 @@ impl RestoreCoordinator {
                 });
                 match result {
                     Ok(()) => {
-                        if let Err(e) =
-                            self.update_local_state(&record.path, request.device_id)
-                        {
+                        if let Err(e) = self.update_local_state(&record.path, request.device_id) {
                             warn!(path = %record.path, "failed to update local state: {e}");
                         }
                         files_restored += 1;
@@ -463,8 +453,8 @@ impl RestoreCoordinator {
             // Try rebuilding the stored blob from source files directly.
             // If that succeeds, we can skip the network fetch entirely.
             let block_record = self.db.get_source_block(block_id)?;
-            if let Some(block_record) = block_record {
-                if let Ok(stored_blob) = crate::daemon::backup::pipeline::rebuild_source_blob(
+            if let Some(block_record) = block_record
+                && let Ok(stored_blob) = crate::daemon::backup::pipeline::rebuild_source_blob(
                     &self.db,
                     &block_record,
                     &self.config.epoch_key,
@@ -487,8 +477,9 @@ impl RestoreCoordinator {
                                 "restore: rebuilt symbols from source files (Wave 11b path)"
                             );
                             return tokio::task::block_in_place(|| {
-                                let padded = self.encoder.decode(&raws, params)
-                                    .map_err(|e| RestoreError::DecodeFailed(*block_id, e.to_string()))?;
+                                let padded = self.encoder.decode(&raws, params).map_err(|e| {
+                                    RestoreError::DecodeFailed(*block_id, e.to_string())
+                                })?;
                                 if padded.len() < encrypted_size as usize {
                                     return Err(RestoreError::DecodeFailed(
                                         *block_id,
@@ -505,7 +496,6 @@ impl RestoreCoordinator {
                         }
                     }
                 }
-            }
 
             // Not enough locally — try network fetch for the remainder.
             // Network path: holders return bound symbols; fetch_from_holders unbinds them.
@@ -523,10 +513,14 @@ impl RestoreCoordinator {
             // still hold their symbols — worth asking before declaring restore failed.
             let reachable_for_fetch: Vec<_> = usable_placements
                 .iter()
-                .filter(|p| matches!(
-                    p.status,
-                    PlacementStatus::Alive | PlacementStatus::Uncertain | PlacementStatus::PresumedLost
-                ))
+                .filter(|p| {
+                    matches!(
+                        p.status,
+                        PlacementStatus::Alive
+                            | PlacementStatus::Uncertain
+                            | PlacementStatus::PresumedLost
+                    )
+                })
                 .cloned()
                 .collect();
             let mut network_symbols = tokio::time::timeout(
@@ -540,8 +534,7 @@ impl RestoreCoordinator {
             })??;
 
             // Merge: avoid duplicates by ESI.
-            let existing_esis: HashSet<u32> =
-                raw_symbols.iter().map(|s| s.esi).collect();
+            let existing_esis: HashSet<u32> = raw_symbols.iter().map(|s| s.esi).collect();
             for sym in network_symbols.drain(..) {
                 if !existing_esis.contains(&sym.esi) {
                     raw_symbols.push(sym);
@@ -636,12 +629,9 @@ impl RestoreCoordinator {
     ) -> Result<(), RestoreError> {
         let file_bytes = match block_type {
             SourceBlockType::Pack { .. } => {
-                let extracted = pipeline::extract_from_pack(plaintext, record.file_id)
-                    .map_err(|e| {
-                        RestoreError::PackIndexParseFailed(
-                            version.source_block_id,
-                            e.to_string(),
-                        )
+                let extracted =
+                    pipeline::extract_from_pack(plaintext, record.file_id).map_err(|e| {
+                        RestoreError::PackIndexParseFailed(version.source_block_id, e.to_string())
                     })?;
                 match extracted {
                     Some(bytes) => bytes,
@@ -657,15 +647,20 @@ impl RestoreCoordinator {
         };
 
         // Validate the record path from DB — must pass even for DR-sourced records.
-        let validated = syncback_core::path_safety::validate_record_path(&record.path)
-            .map_err(|e| RestoreError::PathUnsafe {
-                path: record.path.clone(),
-                source: e,
+        let validated =
+            syncback_core::path_safety::validate_record_path(&record.path).map_err(|e| {
+                RestoreError::PathUnsafe {
+                    path: record.path.clone(),
+                    source: e,
+                }
             })?;
 
-        let out_path = writer.write_file(&validated, &file_bytes)
+        let out_path = writer
+            .write_file(&validated, &file_bytes)
             .map_err(|e| match e {
-                StagingError::AlreadyExists(p) => RestoreError::Staging(StagingError::AlreadyExists(p)),
+                StagingError::AlreadyExists(p) => {
+                    RestoreError::Staging(StagingError::AlreadyExists(p))
+                }
                 other => RestoreError::Staging(other),
             })?;
 
@@ -674,11 +669,7 @@ impl RestoreCoordinator {
     }
 
     /// Update FileRecord.devices for device_id → LocalState::Present.
-    fn update_local_state(
-        &self,
-        path: &str,
-        device_id: DeviceId,
-    ) -> Result<(), RestoreError> {
+    fn update_local_state(&self, path: &str, device_id: DeviceId) -> Result<(), RestoreError> {
         if let Some(mut record) = self.db.get_file(path)? {
             match record.devices.iter_mut().find(|(d, _)| *d == device_id) {
                 Some((_, state)) => *state = LocalState::Present,

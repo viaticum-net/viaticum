@@ -22,7 +22,7 @@ use syncback_core::erasure::ErasureEncoder;
 use syncback_core::placement::HolderCandidate;
 use syncback_core::types::{DeviceId, FileCategory, FileId, SourceBlockId};
 
-use pipeline::{flush_queue_inner, run_pipeline, update_backed_up_at, BlockTypeTag};
+use pipeline::{BlockTypeTag, flush_queue_inner, run_pipeline, update_backed_up_at};
 
 pub mod events;
 pub mod packing;
@@ -92,7 +92,8 @@ pub struct BackupConfig {
     pub mock_holders: Vec<HolderCandidate>,
     /// Optional cluster state for dedup check (multi-device).
     /// If None: use inline DB scan (single-device backward compat).
-    pub cluster_state: Option<std::sync::Arc<std::sync::Mutex<syncback_core::cluster::ClusterState>>>,
+    pub cluster_state:
+        Option<std::sync::Arc<std::sync::Mutex<syncback_core::cluster::ClusterState>>>,
     /// Per-directory importance overrides from config.
     /// Used to look up the importance of a file when creating a backup event.
     /// When empty, DEFAULT_IMPORTANCE (0.5) is used for all files.
@@ -352,10 +353,7 @@ impl BackupCoordinator {
     /// must still burn real disk on our side, and accepting requires passing
     /// quota/signature checks, so the cost is bounded. Future work: weight by
     /// `master_trust.combined` once bi-directional trust propagation lands.
-    fn earning_weight_for_master(
-        &self,
-        master: &syncback_core::types::IdentityPub,
-    ) -> f64 {
+    fn earning_weight_for_master(&self, master: &syncback_core::types::IdentityPub) -> f64 {
         use syncback_core::constants::MAX_COMBINED_TRUST;
         let devices = self.db.get_devices_for_master(master).unwrap_or_default();
         for did in devices {
@@ -465,8 +463,10 @@ impl BackupCoordinator {
         // Build a lookup map from path → QueuedFile, then iterate batch.candidates (already
         // in importance-DESC order from select_backup_batch) to reconstruct selected in order.
         // This preserves the importance ordering that select_backup_batch computed (D1 fix).
-        let mut queue_map: std::collections::HashMap<String, QueuedFile> =
-            std::mem::take(queue).into_iter().map(|qf| (qf.path.clone(), qf)).collect();
+        let mut queue_map: std::collections::HashMap<String, QueuedFile> = std::mem::take(queue)
+            .into_iter()
+            .map(|qf| (qf.path.clone(), qf))
+            .collect();
 
         let selected: Vec<QueuedFile> = batch
             .candidates
@@ -549,8 +549,8 @@ impl BackupCoordinator {
         importance: f64,
         candidates: &[HolderCandidate],
     ) -> anyhow::Result<PipelineResult> {
-        let file_bytes = std::fs::read(path)
-            .map_err(|e| anyhow::anyhow!("read large file {}: {e}", path))?;
+        let file_bytes =
+            std::fs::read(path).map_err(|e| anyhow::anyhow!("read large file {}: {e}", path))?;
 
         let qf = QueuedFile {
             path: path.to_string(),
@@ -606,15 +606,17 @@ impl BackupCoordinator {
         mut rx: tokio::sync::mpsc::Receiver<DirtyEvent>,
         mut backup_event_rx: tokio::sync::mpsc::Receiver<BackupEvent>,
     ) -> anyhow::Result<()> {
-        use tokio::time::{interval, Duration, MissedTickBehavior};
+        use tokio::time::{Duration, MissedTickBehavior, interval};
 
         let scale = self.config.time_scale.max(1);
-        let mut idle_timer =
-            interval(Duration::from_secs((syncback_core::constants::FLUSH_IDLE_SECS / scale).max(1)));
+        let mut idle_timer = interval(Duration::from_secs(
+            (syncback_core::constants::FLUSH_IDLE_SECS / scale).max(1),
+        ));
         idle_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-        let mut fallback_timer =
-            interval(Duration::from_secs((syncback_core::constants::FLUSH_FALLBACK_SECS / scale).max(1)));
+        let mut fallback_timer = interval(Duration::from_secs(
+            (syncback_core::constants::FLUSH_FALLBACK_SECS / scale).max(1),
+        ));
         fallback_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
@@ -801,7 +803,6 @@ impl BackupCoordinator {
         self.offered_this_cycle = 0;
         self.accepted_this_cycle = 0;
     }
-
 }
 // Note: deliver_symbols, deliver_to_holder, deliver_to_holder_direct, cleanup_block_dir
 // were removed in Wave 11b. Symbol delivery is now the WorkPipeline worker's responsibility.

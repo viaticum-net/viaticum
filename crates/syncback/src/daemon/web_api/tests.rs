@@ -21,9 +21,7 @@ use crate::daemon::restore::{RestoreError, RestoreRequest, RestoreResult};
 
 /// Build a minimal DaemonState for web API tests.
 /// The restore channel is set up so it immediately returns a synthetic result.
-async fn make_test_state_with_restore(
-    staging_path: std::path::PathBuf,
-) -> Arc<DaemonState> {
+async fn make_test_state_with_restore(staging_path: std::path::PathBuf) -> Arc<DaemonState> {
     let db = Db::open_in_memory().expect("in-memory db");
     let master_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     let identity_pub = IdentityPub(master_key.verifying_key().to_bytes());
@@ -72,11 +70,11 @@ async fn make_test_state_with_restore(
 
 /// Build a test router with auth bypass (no token check for unit tests).
 fn build_test_router(state: Arc<DaemonState>) -> axum::Router {
-    use axum::routing::post;
-    use axum::extract::{State, Json};
-    use axum::http::StatusCode;
-    use crate::daemon::dispatch::dispatch;
     use crate::cli::types::CliResponse;
+    use crate::daemon::dispatch::dispatch;
+    use axum::extract::{Json, State};
+    use axum::http::StatusCode;
+    use axum::routing::post;
 
     // Inline a minimal router that mirrors the real handle_restore handler,
     // bypassing auth middleware.
@@ -139,7 +137,9 @@ async fn restore_api_returns_staging_path() {
 
     assert_eq!(response.status(), StatusCode::OK, "expected 200 OK");
 
-    let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
     assert!(
@@ -147,7 +147,10 @@ async fn restore_api_returns_staging_path() {
         "response body must contain 'staging_path' field, got: {json}"
     );
     let sp = json["staging_path"].as_str().unwrap_or("");
-    assert!(!sp.is_empty(), "staging_path must be non-empty, got: {json}");
+    assert!(
+        !sp.is_empty(),
+        "staging_path must be non-empty, got: {json}"
+    );
 }
 
 // ─── Security header helpers ──────────────────────────────────────────────────
@@ -206,7 +209,12 @@ async fn security_headers_present_on_api_response() {
 async fn security_headers_present_on_401_response() {
     let app = build_full_router_for_header_test();
     let resp = app
-        .oneshot(Request::builder().uri("/api/dummy").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/dummy")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -237,9 +245,15 @@ async fn restore_api_with_dest_returns_400() {
 
     let response = app.oneshot(request).await.unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "expected 400 Bad Request");
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "expected 400 Bad Request"
+    );
 
-    let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
     let error_msg = json["error"].as_str().unwrap_or("");

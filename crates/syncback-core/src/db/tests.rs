@@ -2,10 +2,9 @@ use crate::db::testutil::{test_db, test_peer, test_peers};
 use crate::db::{Db, SystemStateBlobRecord, WeeklyPosEntry};
 use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
 use crate::types::{
-    BudgetRecord, DeviceId, EventEntry, Event, FileId, FileRecord,
-    HoldingRecord, HoldingStatus, IdentityPub, LocalState, PlacementStatus, PeerRecord,
-    SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement,
-    Timestamp,
+    BudgetRecord, DeviceId, Event, EventEntry, FileId, FileRecord, HoldingRecord, HoldingStatus,
+    IdentityPub, LocalState, PeerRecord, PlacementStatus, SourceBlockId, SourceBlockRecord,
+    SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
 };
 
 // ============================================================
@@ -153,8 +152,10 @@ fn file_get_by_id() {
 #[test]
 fn file_list_with_prefix() {
     let db = test_db();
-    db.upsert_file(&make_file_record("photos/a.jpg", 1)).unwrap();
-    db.upsert_file(&make_file_record("photos/b.jpg", 2)).unwrap();
+    db.upsert_file(&make_file_record("photos/a.jpg", 1))
+        .unwrap();
+    db.upsert_file(&make_file_record("photos/b.jpg", 2))
+        .unwrap();
     db.upsert_file(&make_file_record("docs/c.md", 3)).unwrap();
 
     let photos = db.list_files_with_prefix("photos/").unwrap();
@@ -224,9 +225,9 @@ fn placement_delete_cleans_hot_cache() {
     let _ = db.delete_placement(&block_id(2), &holder).unwrap();
 
     let hot = db.hot();
-    assert!(hot.placements.get(&(block_id(2), holder)).is_none());
+    assert!(!hot.placements.contains_key(&(block_id(2), holder)));
     // Block entry removed since total_alive_symbols dropped to 0.
-    assert!(hot.blocks.get(&block_id(2)).is_none());
+    assert!(!hot.blocks.contains_key(&block_id(2)));
 }
 
 // ============================================================
@@ -268,7 +269,13 @@ fn holder_files_scan_on_holder_departure() {
 
     // Place holder on 3 different files
     for i in 0..3u8 {
-        let p = make_placement(i + 10, holder, FileId(i as u64 + 100), PlacementStatus::Alive, 10);
+        let p = make_placement(
+            i + 10,
+            holder,
+            FileId(i as u64 + 100),
+            PlacementStatus::Alive,
+            10,
+        );
         db.upsert_placement(&p).unwrap();
     }
 
@@ -315,7 +322,9 @@ fn event_log_append_and_query() {
 #[test]
 fn event_log_sequence_monotonic() {
     let db = test_db();
-    let seqs: Vec<u64> = (0..5).map(|i| db.append_event(&make_event(i)).unwrap()).collect();
+    let seqs: Vec<u64> = (0..5)
+        .map(|i| db.append_event(&make_event(i)).unwrap())
+        .collect();
     assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
 }
 
@@ -407,11 +416,25 @@ fn pos_weekly_accumulate() {
     let db = test_db();
     let peer = test_peer();
 
-    db.upsert_pos_weekly(&peer, 5, &WeeklyPosEntry { challenged: 3, passed: 2 })
-        .unwrap();
+    db.upsert_pos_weekly(
+        &peer,
+        5,
+        &WeeklyPosEntry {
+            challenged: 3,
+            passed: 2,
+        },
+    )
+    .unwrap();
     // Overwrite with new values (last write wins)
-    db.upsert_pos_weekly(&peer, 5, &WeeklyPosEntry { challenged: 2, passed: 2 })
-        .unwrap();
+    db.upsert_pos_weekly(
+        &peer,
+        5,
+        &WeeklyPosEntry {
+            challenged: 2,
+            passed: 2,
+        },
+    )
+    .unwrap();
 
     let got = db.get_pos_weekly(&peer, 5).unwrap().unwrap();
     assert_eq!(got.challenged, 2);
@@ -445,7 +468,10 @@ fn hot_cache_rebuilt_after_reopen() {
     // Reopen and verify hot cache rebuilt correctly
     let db2 = crate::db::Db::open(&tmp_path).unwrap();
     let hot = db2.hot();
-    let agg = hot.blocks.get(&block_id(1)).expect("block agg must exist after rebuild");
+    let agg = hot
+        .blocks
+        .get(&block_id(1))
+        .expect("block agg must exist after rebuild");
     assert_eq!(agg.total_alive_symbols, 200);
 
     let pagg = hot
@@ -496,14 +522,21 @@ fn source_block_crud() {
 #[test]
 fn list_source_blocks_by_status() {
     let db = test_db();
-    db.upsert_source_block(&make_source_block(1, SourceBlockStatus::Active)).unwrap();
-    db.upsert_source_block(&make_source_block(2, SourceBlockStatus::Stale)).unwrap();
-    db.upsert_source_block(&make_source_block(3, SourceBlockStatus::Active)).unwrap();
+    db.upsert_source_block(&make_source_block(1, SourceBlockStatus::Active))
+        .unwrap();
+    db.upsert_source_block(&make_source_block(2, SourceBlockStatus::Stale))
+        .unwrap();
+    db.upsert_source_block(&make_source_block(3, SourceBlockStatus::Active))
+        .unwrap();
 
-    let active = db.list_source_blocks_by_status(SourceBlockStatus::Active).unwrap();
+    let active = db
+        .list_source_blocks_by_status(SourceBlockStatus::Active)
+        .unwrap();
     assert_eq!(active.len(), 2);
 
-    let stale = db.list_source_blocks_by_status(SourceBlockStatus::Stale).unwrap();
+    let stale = db
+        .list_source_blocks_by_status(SourceBlockStatus::Stale)
+        .unwrap();
     assert_eq!(stale.len(), 1);
 }
 
@@ -617,25 +650,27 @@ fn update_block_cached_fields_persists_to_db() {
     db.upsert_source_block(&initial).unwrap();
 
     // Call update with non-zero values.
-    db.update_block_cached_fields(
-        &bid,
-        0.65,
-        3,
-        0.9996,
-        0.9996,
-        Some(Timestamp(1000)),
-        42,
-    ).unwrap();
+    db.update_block_cached_fields(&bid, 0.65, 3, 0.9996, 0.9996, Some(Timestamp(1000)), 42)
+        .unwrap();
 
     // Read back and assert.
     let record = db.get_source_block(&bid).unwrap().unwrap();
-    assert!((record.importance - 0.65).abs() < 1e-10,
-        "importance must be ~0.65, got {}", record.importance);
+    assert!(
+        (record.importance - 0.65).abs() < 1e-10,
+        "importance must be ~0.65, got {}",
+        record.importance
+    );
     assert_eq!(record.current_alive, 3);
-    assert!((record.current_reliability - 0.9996).abs() < 1e-10,
-        "current_reliability must be ~0.9996, got {}", record.current_reliability);
-    assert!((record.target_reliability - 0.9996).abs() < 1e-10,
-        "target_reliability must be ~0.9996, got {}", record.target_reliability);
+    assert!(
+        (record.current_reliability - 0.9996).abs() < 1e-10,
+        "current_reliability must be ~0.9996, got {}",
+        record.current_reliability
+    );
+    assert!(
+        (record.target_reliability - 0.9996).abs() < 1e-10,
+        "target_reliability must be ~0.9996, got {}",
+        record.target_reliability
+    );
     assert_eq!(record.last_attempted_at, Some(Timestamp(1000)));
     assert_eq!(record.last_pool_signature, 42);
 
@@ -767,7 +802,14 @@ fn upsert_placement_updates_alive_count_on_status_change() {
     // Insert as Offered (not alive)
     let p1 = make_placement(8, holder, fid, PlacementStatus::Offered, 100);
     db.upsert_placement(&p1).unwrap();
-    assert_eq!(db.hot().blocks.get(&bid).map(|a| a.total_alive_symbols).unwrap_or(0), 0);
+    assert_eq!(
+        db.hot()
+            .blocks
+            .get(&bid)
+            .map(|a| a.total_alive_symbols)
+            .unwrap_or(0),
+        0
+    );
 
     // Upsert as Alive
     let p2 = make_placement(8, holder, fid, PlacementStatus::Alive, 100);
@@ -777,7 +819,14 @@ fn upsert_placement_updates_alive_count_on_status_change() {
     // Upsert as Lost (no longer alive)
     let p3 = make_placement(8, holder, fid, PlacementStatus::Lost, 100);
     db.upsert_placement(&p3).unwrap();
-    assert_eq!(db.hot().blocks.get(&bid).map(|a| a.total_alive_symbols).unwrap_or(0), 0);
+    assert_eq!(
+        db.hot()
+            .blocks
+            .get(&bid)
+            .map(|a| a.total_alive_symbols)
+            .unwrap_or(0),
+        0
+    );
 }
 
 // ============================================================
@@ -796,8 +845,15 @@ fn uncertain_placement_counts_as_alive_in_block_agg() {
     db.upsert_placement(&p).unwrap();
 
     let hot = db.hot();
-    let alive = hot.blocks.get(&bid).map(|a| a.total_alive_symbols).unwrap_or(0);
-    assert_eq!(alive, 80, "Uncertain must contribute to total_alive_symbols");
+    let alive = hot
+        .blocks
+        .get(&bid)
+        .map(|a| a.total_alive_symbols)
+        .unwrap_or(0);
+    assert_eq!(
+        alive, 80,
+        "Uncertain must contribute to total_alive_symbols"
+    );
 }
 
 #[test]
@@ -815,7 +871,14 @@ fn uncertain_to_lost_removes_alive_count() {
     // Transition to Lost — should drop to 0.
     let p2 = make_placement(15, holder, fid, PlacementStatus::Lost, 60);
     db.upsert_placement(&p2).unwrap();
-    assert_eq!(db.hot().blocks.get(&bid).map(|a| a.total_alive_symbols).unwrap_or(0), 0);
+    assert_eq!(
+        db.hot()
+            .blocks
+            .get(&bid)
+            .map(|a| a.total_alive_symbols)
+            .unwrap_or(0),
+        0
+    );
 }
 
 #[test]
@@ -875,8 +938,22 @@ fn list_placements_for_holder_does_not_return_other_holders() {
     let holder_b = DeviceId([0x02u8; 32]);
     let fid = FileId(30);
 
-    db.upsert_placement(&make_placement(20, holder_a, fid, PlacementStatus::Alive, 10)).unwrap();
-    db.upsert_placement(&make_placement(21, holder_b, fid, PlacementStatus::Alive, 10)).unwrap();
+    db.upsert_placement(&make_placement(
+        20,
+        holder_a,
+        fid,
+        PlacementStatus::Alive,
+        10,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_placement(
+        21,
+        holder_b,
+        fid,
+        PlacementStatus::Alive,
+        10,
+    ))
+    .unwrap();
 
     let a_placements = db.list_placements_for_holder(&holder_a).unwrap();
     assert_eq!(a_placements.len(), 1);
@@ -991,10 +1068,16 @@ fn store_overwrites_previous_blob() {
     let db = test_db();
     let owner = IdentityPub([2u8; 32]);
     let r1 = SystemStateBlobRecord {
-        owner, encrypted_blob: vec![1], created_at: Timestamp::now(), stored_at: Timestamp::now(),
+        owner,
+        encrypted_blob: vec![1],
+        created_at: Timestamp::now(),
+        stored_at: Timestamp::now(),
     };
     let r2 = SystemStateBlobRecord {
-        owner, encrypted_blob: vec![2, 3], created_at: Timestamp::now(), stored_at: Timestamp::now(),
+        owner,
+        encrypted_blob: vec![2, 3],
+        created_at: Timestamp::now(),
+        stored_at: Timestamp::now(),
     };
     db.store_system_state_blob(&owner, &r1).unwrap();
     db.store_system_state_blob(&owner, &r2).unwrap();
@@ -1014,7 +1097,10 @@ fn delete_system_state_blob_removes_it() {
     let db = test_db();
     let owner = IdentityPub([4u8; 32]);
     let record = SystemStateBlobRecord {
-        owner, encrypted_blob: vec![9, 8, 7], created_at: Timestamp::now(), stored_at: Timestamp::now(),
+        owner,
+        encrypted_blob: vec![9, 8, 7],
+        created_at: Timestamp::now(),
+        stored_at: Timestamp::now(),
     };
     db.store_system_state_blob(&owner, &record).unwrap();
     db.delete_system_state_blob(&owner).unwrap();
@@ -1027,7 +1113,8 @@ fn expired_blob_returns_none() {
     let owner = IdentityPub([5u8; 32]);
     let two_years_ago = Timestamp(Timestamp::now().0 - 2 * 365 * 24 * 3600);
     let record = SystemStateBlobRecord {
-        owner, encrypted_blob: vec![1, 2, 3],
+        owner,
+        encrypted_blob: vec![1, 2, 3],
         created_at: two_years_ago,
         stored_at: two_years_ago,
     };
@@ -1046,10 +1133,16 @@ fn table_stats_counts_rows() {
     let peer = PeerRecord {
         device_id: DeviceId([0u8; 32]),
         master_identity: IdentityPub([0u8; 32]),
-        trust_p: 0.0, trust_i: 0.0, trust_s: 0.0,
-        bytes_we_store_for_peer: 0, bytes_peer_stores_for_us: 0,
-        first_seen: Timestamp(0), last_seen: Timestamp(0),
-        revoked_device_pub_keys: vec![], addrs: vec![], x25519_pub: None,
+        trust_p: 0.0,
+        trust_i: 0.0,
+        trust_s: 0.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
     };
     db.upsert_peer(&peer).unwrap();
     let stats = db.table_stats().unwrap();
@@ -1095,16 +1188,30 @@ fn placement_upsert_updates_holder_indexes() {
 
     // file_holders index: file_id_2 must list only holder_a.
     let holders_2 = db.list_holders_for_file(file_id_2).unwrap();
-    assert_eq!(holders_2, vec![holder_a], "file_id_2 should list only holder_a");
+    assert_eq!(
+        holders_2,
+        vec![holder_a],
+        "file_id_2 should list only holder_a"
+    );
 
     // holder_files index: holder_a must list both file_id_1 and file_id_2.
     let files_a = db.list_files_for_holder(&holder_a).unwrap();
-    assert!(files_a.contains(&file_id_1), "holder_a should list file_id_1");
-    assert!(files_a.contains(&file_id_2), "holder_a should list file_id_2");
+    assert!(
+        files_a.contains(&file_id_1),
+        "holder_a should list file_id_1"
+    );
+    assert!(
+        files_a.contains(&file_id_2),
+        "holder_a should list file_id_2"
+    );
 
     // holder_files index: holder_b must list only file_id_1.
     let files_b = db.list_files_for_holder(&holder_b).unwrap();
-    assert_eq!(files_b, vec![file_id_1], "holder_b should list only file_id_1");
+    assert_eq!(
+        files_b,
+        vec![file_id_1],
+        "holder_b should list only file_id_1"
+    );
 
     // After upsert with updated symbol_count (re-insert), indexes must remain consistent.
     let mut p_a1_updated = p_a1.clone();
@@ -1191,8 +1298,14 @@ fn refresh_peer_storage_bytes_updates_trust_s() {
     db.refresh_peer_storage_bytes(&device).unwrap();
 
     let updated = db.get_peer(&device).unwrap().unwrap();
-    assert_eq!(updated.bytes_we_store_for_peer, 5000, "should equal holding.total_bytes");
-    assert_eq!(updated.bytes_peer_stores_for_us, 10_000, "should equal 10 symbols * t=1000");
+    assert_eq!(
+        updated.bytes_we_store_for_peer, 5000,
+        "should equal holding.total_bytes"
+    );
+    assert_eq!(
+        updated.bytes_peer_stores_for_us, 10_000,
+        "should equal 10 symbols * t=1000"
+    );
     // trust_s = 10_000 / 5_000 = 2.0
     let expected_trust_s = 10_000_f64 / 5_000_f64;
     assert!(
@@ -1323,9 +1436,18 @@ fn refresh_peer_storage_bytes_only_alive_and_active_count() {
     db.refresh_peer_storage_bytes(&device).unwrap();
 
     let updated = db.get_peer(&device).unwrap().unwrap();
-    assert_eq!(updated.bytes_we_store_for_peer, 0, "MarkedForDelete holdings must not count");
-    assert_eq!(updated.bytes_peer_stores_for_us, 0, "Lost placements must not count");
-    assert!((updated.trust_s - 1.0).abs() < 1e-9, "trust_s must be 1.0 when both counts are 0");
+    assert_eq!(
+        updated.bytes_we_store_for_peer, 0,
+        "MarkedForDelete holdings must not count"
+    );
+    assert_eq!(
+        updated.bytes_peer_stores_for_us, 0,
+        "Lost placements must not count"
+    );
+    assert!(
+        (updated.trust_s - 1.0).abs() < 1e-9,
+        "trust_s must be 1.0 when both counts are 0"
+    );
 }
 
 /// refresh_peer_storage_bytes must be a no-op when the peer is not in the DB.
@@ -1385,7 +1507,8 @@ fn max_esi_for_block_returns_high_watermark() {
         consecutive_misses: 0,
     };
 
-    db.upsert_source_block(&make_source_block(0xBB, SourceBlockStatus::Active)).unwrap();
+    db.upsert_source_block(&make_source_block(0xBB, SourceBlockStatus::Active))
+        .unwrap();
     db.upsert_placement(&p_a).unwrap();
     db.upsert_placement(&p_b).unwrap();
 
@@ -1414,7 +1537,8 @@ fn max_esi_for_block_multiple_ranges_in_one_placement() {
         consecutive_misses: 0,
     };
 
-    db.upsert_source_block(&make_source_block(0xCC, SourceBlockStatus::Active)).unwrap();
+    db.upsert_source_block(&make_source_block(0xCC, SourceBlockStatus::Active))
+        .unwrap();
     db.upsert_placement(&p).unwrap();
 
     let hwm = db.max_esi_for_block(&bid).unwrap();
@@ -1449,7 +1573,9 @@ fn make_holding_with_bytes(
 fn stored_for_peer_gb_days_empty_returns_zero() {
     let db = test_db();
     let owner = IdentityPub([0xAAu8; 32]);
-    let result = db.stored_for_peer_gb_days(&owner, Timestamp(1_000_000), 1).unwrap();
+    let result = db
+        .stored_for_peer_gb_days(&owner, Timestamp(1_000_000), 1)
+        .unwrap();
     assert_eq!(result, 0.0);
 }
 
@@ -1499,11 +1625,9 @@ fn stored_for_peer_gb_days_multiple_holdings() {
     let twenty_gb = 20 * 1_073_741_824u64;
 
     // First holding: received at t=0, now at 7 days → 7 day age
-    let h1 =
-        make_holding_with_bytes(0x01, owner, HoldingStatus::Active, ten_gb, Timestamp(0));
+    let h1 = make_holding_with_bytes(0x01, owner, HoldingStatus::Active, ten_gb, Timestamp(0));
     // Second holding: received at t=0, now at 14 days → 14 day age
-    let h2 =
-        make_holding_with_bytes(0x02, owner, HoldingStatus::Active, twenty_gb, Timestamp(0));
+    let h2 = make_holding_with_bytes(0x02, owner, HoldingStatus::Active, twenty_gb, Timestamp(0));
     db.upsert_holding(&h1).unwrap();
     db.upsert_holding(&h2).unwrap();
 
@@ -1602,7 +1726,10 @@ fn db_device_trust_roundtrip() {
     };
 
     db.set_device_trust(&record).unwrap();
-    let result = db.get_device_trust(&device_id).unwrap().expect("should be present");
+    let result = db
+        .get_device_trust(&device_id)
+        .unwrap()
+        .expect("should be present");
 
     assert_eq!(result.device_id, record.device_id);
     assert!((result.trust_p - record.trust_p).abs() < 1e-10);
@@ -1621,7 +1748,10 @@ fn db_master_trust_roundtrip() {
     };
 
     db.set_master_trust(&record).unwrap();
-    let result = db.get_master_trust(&identity).unwrap().expect("should be present");
+    let result = db
+        .get_master_trust(&identity)
+        .unwrap()
+        .expect("should be present");
 
     assert_eq!(result.identity, record.identity);
     assert!((result.combined - record.combined).abs() < 1e-10);
@@ -1635,7 +1765,10 @@ fn db_device_to_master_mapping() {
     let master = IdentityPub([0x22; 32]);
 
     db.set_master_for_device(&device, &master).unwrap();
-    let result = db.get_master_for_device(&device).unwrap().expect("should be present");
+    let result = db
+        .get_master_for_device(&device)
+        .unwrap()
+        .expect("should be present");
 
     assert_eq!(result, master);
 }
@@ -1683,7 +1816,9 @@ fn delete_placement_removes_record() {
     let _ = db.delete_placement(&block_id(0xD0), &holder).unwrap();
 
     assert!(
-        db.get_placement(&block_id(0xD0), &holder).unwrap().is_none(),
+        db.get_placement(&block_id(0xD0), &holder)
+            .unwrap()
+            .is_none(),
         "placement must be absent after delete"
     );
 }
@@ -1711,7 +1846,10 @@ fn delete_placement_nonexistent_returns_none() {
 
     let result = db.delete_placement(&block_id(0xD2), &holder).unwrap();
 
-    assert!(result.is_none(), "must return None when placement does not exist");
+    assert!(
+        result.is_none(),
+        "must return None when placement does not exist"
+    );
 }
 
 #[test]
@@ -1724,7 +1862,10 @@ fn delete_placement_updates_hot_cache() {
     {
         let hot = db.hot();
         assert_eq!(
-            hot.blocks.get(&block_id(0xD3)).map(|a| a.total_alive_symbols).unwrap_or(0),
+            hot.blocks
+                .get(&block_id(0xD3))
+                .map(|a| a.total_alive_symbols)
+                .unwrap_or(0),
             70,
             "alive count must be 70 before delete"
         );
@@ -1737,7 +1878,10 @@ fn delete_placement_updates_hot_cache() {
     {
         let hot = db.hot();
         assert_eq!(
-            hot.blocks.get(&block_id(0xD3)).map(|a| a.total_alive_symbols).unwrap_or(0),
+            hot.blocks
+                .get(&block_id(0xD3))
+                .map(|a| a.total_alive_symbols)
+                .unwrap_or(0),
             0,
             "alive count must drop to 0 after delete"
         );
@@ -1832,7 +1976,11 @@ fn write_txn_hot_cache_not_updated_before_commit() {
     let initial = make_placement(0xE3, bob, fid, PlacementStatus::Alive, 5);
     db.upsert_placement(&initial).unwrap();
     assert_eq!(
-        db.hot().blocks.get(&block_id(0xE3)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        db.hot()
+            .blocks
+            .get(&block_id(0xE3))
+            .map(|a| a.total_alive_symbols)
+            .unwrap_or(0),
         5,
         "initial hot cache: 5 alive"
     );
@@ -1844,7 +1992,10 @@ fn write_txn_hot_cache_not_updated_before_commit() {
 
     // Before commit: hot cache still shows Alive.
     assert_eq!(
-        db.hot().placements.get(&(block_id(0xE3), bob)).map(|a| a.status),
+        db.hot()
+            .placements
+            .get(&(block_id(0xE3), bob))
+            .map(|a| a.status),
         Some(PlacementStatus::Alive),
         "hot cache must NOT be updated before commit"
     );
@@ -1853,12 +2004,19 @@ fn write_txn_hot_cache_not_updated_before_commit() {
 
     // After commit: hot cache reflects Lost status (0 alive symbols).
     assert_eq!(
-        db.hot().placements.get(&(block_id(0xE3), bob)).map(|a| a.status),
+        db.hot()
+            .placements
+            .get(&(block_id(0xE3), bob))
+            .map(|a| a.status),
         Some(PlacementStatus::Lost),
         "hot cache must be updated after commit"
     );
     assert_eq!(
-        db.hot().blocks.get(&block_id(0xE3)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        db.hot()
+            .blocks
+            .get(&block_id(0xE3))
+            .map(|a| a.total_alive_symbols)
+            .unwrap_or(0),
         0,
         "alive symbols must drop to 0 after committing Lost placement"
     );
@@ -1876,13 +2034,20 @@ fn write_txn_hot_cache_updated_correctly_for_multiple_placements() {
     // First txn: insert three Alive placements (5 alive symbols each).
     {
         let mut txn = db.write_txn().unwrap();
-        txn.upsert_placement(&make_placement(0xE4, bob, fid, PlacementStatus::Alive, 5)).unwrap();
-        txn.upsert_placement(&make_placement(0xE4, carol, fid, PlacementStatus::Alive, 5)).unwrap();
-        txn.upsert_placement(&make_placement(0xE4, dave, fid, PlacementStatus::Alive, 5)).unwrap();
+        txn.upsert_placement(&make_placement(0xE4, bob, fid, PlacementStatus::Alive, 5))
+            .unwrap();
+        txn.upsert_placement(&make_placement(0xE4, carol, fid, PlacementStatus::Alive, 5))
+            .unwrap();
+        txn.upsert_placement(&make_placement(0xE4, dave, fid, PlacementStatus::Alive, 5))
+            .unwrap();
         txn.commit().unwrap();
     }
     assert_eq!(
-        db.hot().blocks.get(&block_id(0xE4)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        db.hot()
+            .blocks
+            .get(&block_id(0xE4))
+            .map(|a| a.total_alive_symbols)
+            .unwrap_or(0),
         15,
         "three placements of 5 each = 15 alive symbols"
     );
@@ -1890,11 +2055,16 @@ fn write_txn_hot_cache_updated_correctly_for_multiple_placements() {
     // Second txn: mark bob's placement Lost.
     {
         let mut txn = db.write_txn().unwrap();
-        txn.upsert_placement(&make_placement(0xE4, bob, fid, PlacementStatus::Lost, 5)).unwrap();
+        txn.upsert_placement(&make_placement(0xE4, bob, fid, PlacementStatus::Lost, 5))
+            .unwrap();
         txn.commit().unwrap();
     }
     assert_eq!(
-        db.hot().blocks.get(&block_id(0xE4)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        db.hot()
+            .blocks
+            .get(&block_id(0xE4))
+            .map(|a| a.total_alive_symbols)
+            .unwrap_or(0),
         10,
         "after bob goes Lost, alive symbols = 10"
     );
@@ -1917,7 +2087,11 @@ fn write_txn_event_sequence_numbers_are_contiguous() {
     let s6 = txn.append_event(&make_event(6)).unwrap();
     txn.commit().unwrap();
 
-    assert_eq!((s4, s5, s6), (4, 5, 6), "sequence numbers must be contiguous");
+    assert_eq!(
+        (s4, s5, s6),
+        (4, 5, 6),
+        "sequence numbers must be contiguous"
+    );
     assert_eq!(db.last_event_seq().unwrap(), 6);
     let after_3 = db.events_after(3, 10).unwrap();
     assert_eq!(after_3.len(), 3, "must have exactly 3 events after seq 3");
@@ -1933,25 +2107,33 @@ fn write_txn_and_single_operation_methods_interleave_correctly() {
     let fid = FileId(0xE7);
 
     // Step 1: single-operation write.
-    db.upsert_source_block(&make_source_block(0xE7, SourceBlockStatus::Active)).unwrap();
+    db.upsert_source_block(&make_source_block(0xE7, SourceBlockStatus::Active))
+        .unwrap();
 
     // Step 2: multi-operation txn.
     {
         let mut txn = db.write_txn().unwrap();
-        txn.upsert_placement(&make_placement(0xE7, bob, fid, PlacementStatus::Alive, 5)).unwrap();
-        txn.upsert_placement(&make_placement(0xE7, carol, fid, PlacementStatus::Alive, 5)).unwrap();
+        txn.upsert_placement(&make_placement(0xE7, bob, fid, PlacementStatus::Alive, 5))
+            .unwrap();
+        txn.upsert_placement(&make_placement(0xE7, carol, fid, PlacementStatus::Alive, 5))
+            .unwrap();
         txn.commit().unwrap();
     }
 
     // Step 3: another single-operation write.
-    db.upsert_placement(&make_placement(0xE7, dave, fid, PlacementStatus::Alive, 5)).unwrap();
+    db.upsert_placement(&make_placement(0xE7, dave, fid, PlacementStatus::Alive, 5))
+        .unwrap();
 
     // Verify all writes are visible.
     assert!(db.get_source_block(&block_id(0xE7)).unwrap().is_some());
     let placements = db.list_placements_for_block(&block_id(0xE7)).unwrap();
     assert_eq!(placements.len(), 3);
     assert_eq!(
-        db.hot().blocks.get(&block_id(0xE7)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        db.hot()
+            .blocks
+            .get(&block_id(0xE7))
+            .map(|a| a.total_alive_symbols)
+            .unwrap_or(0),
         15,
         "three placements of 5 each = 15 alive symbols"
     );
@@ -1965,33 +2147,50 @@ fn write_txn_rollback_leaves_hot_cache_unchanged() {
     let fid = FileId(0xEA);
 
     // Set up: Alive placement with 5 symbols.
-    db.upsert_placement(&make_placement(0xEA, bob, fid, PlacementStatus::Alive, 5)).unwrap();
+    db.upsert_placement(&make_placement(0xEA, bob, fid, PlacementStatus::Alive, 5))
+        .unwrap();
     assert_eq!(
-        db.hot().blocks.get(&block_id(0xEA)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        db.hot()
+            .blocks
+            .get(&block_id(0xEA))
+            .map(|a| a.total_alive_symbols)
+            .unwrap_or(0),
         5
     );
 
     // Open txn, queue a delta, then drop without commit.
     {
         let mut txn = db.write_txn().unwrap();
-        txn.upsert_placement(&make_placement(0xEA, bob, fid, PlacementStatus::Lost, 5)).unwrap();
+        txn.upsert_placement(&make_placement(0xEA, bob, fid, PlacementStatus::Lost, 5))
+            .unwrap();
         // Drop without commit — redb rolls back, hot cache must NOT be touched.
     }
 
     // Hot cache unchanged: still 5 alive, still Alive status.
     assert_eq!(
-        db.hot().blocks.get(&block_id(0xEA)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        db.hot()
+            .blocks
+            .get(&block_id(0xEA))
+            .map(|a| a.total_alive_symbols)
+            .unwrap_or(0),
         5,
         "hot cache alive count must be unchanged after rollback"
     );
     assert_eq!(
-        db.hot().placements.get(&(block_id(0xEA), bob)).map(|a| a.status),
+        db.hot()
+            .placements
+            .get(&(block_id(0xEA), bob))
+            .map(|a| a.status),
         Some(PlacementStatus::Alive),
         "hot cache placement status must be unchanged after rollback"
     );
     // DB record also unchanged.
     let rec = db.get_placement(&block_id(0xEA), &bob).unwrap().unwrap();
-    assert_eq!(rec.status, PlacementStatus::Alive, "DB record must be unchanged after rollback");
+    assert_eq!(
+        rec.status,
+        PlacementStatus::Alive,
+        "DB record must be unchanged after rollback"
+    );
 }
 
 // Test 8: delete_placement inside a txn queues correct delta and cleans indexes.
@@ -2002,30 +2201,42 @@ fn write_txn_delete_placement_queues_correct_delta() {
     let fid = FileId(0xEB);
 
     // Set up: Alive placement with 5 symbols.
-    db.upsert_placement(&make_placement(0xEB, bob, fid, PlacementStatus::Alive, 5)).unwrap();
+    db.upsert_placement(&make_placement(0xEB, bob, fid, PlacementStatus::Alive, 5))
+        .unwrap();
     assert_eq!(
-        db.hot().blocks.get(&block_id(0xEB)).map(|a| a.total_alive_symbols).unwrap_or(0),
+        db.hot()
+            .blocks
+            .get(&block_id(0xEB))
+            .map(|a| a.total_alive_symbols)
+            .unwrap_or(0),
         5
     );
 
     // Delete inside txn, then commit.
     let mut txn = db.write_txn().unwrap();
     let deleted = txn.delete_placement(&block_id(0xEB), &bob).unwrap();
-    assert!(deleted.is_some(), "delete_placement must return the old record");
+    assert!(
+        deleted.is_some(),
+        "delete_placement must return the old record"
+    );
     txn.commit().unwrap();
 
     // Hot cache: placement entry gone, block entry gone (no more alive symbols).
     assert!(
-        db.hot().placements.get(&(block_id(0xEB), bob)).is_none(),
+        !db.hot().placements.contains_key(&(block_id(0xEB), bob)),
         "placement must be removed from hot cache after txn delete"
     );
     assert!(
-        db.hot().blocks.get(&block_id(0xEB)).is_none(),
+        !db.hot().blocks.contains_key(&block_id(0xEB)),
         "block entry must be removed from hot cache when all placements deleted"
     );
 
     // DB: placement gone, indexes cleaned.
-    assert!(db.list_placements_for_block(&block_id(0xEB)).unwrap().is_empty());
+    assert!(
+        db.list_placements_for_block(&block_id(0xEB))
+            .unwrap()
+            .is_empty()
+    );
     assert!(db.list_holders_for_file(fid).unwrap().is_empty());
     assert!(db.list_files_for_holder(&bob).unwrap().is_empty());
 }
@@ -2089,7 +2300,10 @@ fn prune_pos_weekly_before_keeps_recent_weeks() {
     let db = crate::db::Db::open_in_memory().unwrap();
     let dev = DeviceId([1u8; 32]);
     for week in 0..20u32 {
-        let entry = WeeklyPosEntry { challenged: week, passed: week };
+        let entry = WeeklyPosEntry {
+            challenged: week,
+            passed: week,
+        };
         db.upsert_pos_weekly(&dev, week, &entry).unwrap();
     }
     // Prune anything with week < 10 — weeks 0..=9 should disappear.
@@ -2263,7 +2477,12 @@ fn make_block_with(
 fn next_work_item_returns_none_when_db_empty() {
     let db = Db::open_in_memory().unwrap();
     let result = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), Timestamp(9999), 0xABCD)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            Timestamp(9999),
+            0xABCD,
+        )
         .unwrap();
     assert!(result.is_none());
 }
@@ -2273,9 +2492,39 @@ fn next_work_item_returns_none_when_all_blocks_at_target_reliability() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(9999);
 
-    let a = make_block_with(1, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.999, 0.999, None, 0);
-    let b = make_block_with(2, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.9999, 0.9996, None, 0);
-    let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 5, Some(10), 1.0, 0.9, None, 0);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        0.8,
+        5,
+        Some(10),
+        0.999,
+        0.999,
+        None,
+        0,
+    );
+    let b = make_block_with(
+        2,
+        SourceBlockStatus::Active,
+        0.8,
+        5,
+        Some(10),
+        0.9999,
+        0.9996,
+        None,
+        0,
+    );
+    let c = make_block_with(
+        3,
+        SourceBlockStatus::Active,
+        0.8,
+        5,
+        Some(10),
+        1.0,
+        0.9,
+        None,
+        0,
+    );
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
     db.upsert_source_block(&c).unwrap();
@@ -2291,8 +2540,28 @@ fn next_work_item_returns_none_when_no_active_blocks_need_work() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(9999);
 
-    let a = make_block_with(1, SourceBlockStatus::Deleting, 0.8, 0, Some(10), 0.5, 0.999, None, 0);
-    let b = make_block_with(2, SourceBlockStatus::Stale, 0.8, 0, Some(10), 0.3, 0.999, None, 0);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Deleting,
+        0.8,
+        0,
+        Some(10),
+        0.5,
+        0.999,
+        None,
+        0,
+    );
+    let b = make_block_with(
+        2,
+        SourceBlockStatus::Stale,
+        0.8,
+        0,
+        Some(10),
+        0.3,
+        0.999,
+        None,
+        0,
+    );
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
 
@@ -2308,11 +2577,41 @@ fn next_work_item_picks_highest_priority() {
     let now = Timestamp(9999);
 
     // priority(A) = 0.5 * (1 + 1.5 * 12/14) ≈ 1.143
-    let a = make_block_with(1, SourceBlockStatus::Active, 0.5, 12, Some(14), 0.5, 0.999, None, 0);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        0.5,
+        12,
+        Some(14),
+        0.5,
+        0.999,
+        None,
+        0,
+    );
     // priority(B) = 1.0 * (1 + 0) = 1.0
-    let b = make_block_with(2, SourceBlockStatus::Active, 1.0, 0, Some(12), 0.0, 0.999, None, 0);
+    let b = make_block_with(
+        2,
+        SourceBlockStatus::Active,
+        1.0,
+        0,
+        Some(12),
+        0.0,
+        0.999,
+        None,
+        0,
+    );
     // priority(C) = 0.8 * (1 + 1.5 * 0.5) = 0.8 * 1.75 = 1.4
-    let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 6, Some(12), 0.4, 0.999, None, 0);
+    let c = make_block_with(
+        3,
+        SourceBlockStatus::Active,
+        0.8,
+        6,
+        Some(12),
+        0.4,
+        0.999,
+        None,
+        0,
+    );
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
     db.upsert_source_block(&c).unwrap();
@@ -2321,7 +2620,11 @@ fn next_work_item_picks_highest_priority() {
         .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
         .unwrap()
         .unwrap();
-    assert_eq!(result.block_id, SourceBlockId([3; 32]), "Block C has highest priority (1.4)");
+    assert_eq!(
+        result.block_id,
+        SourceBlockId([3; 32]),
+        "Block C has highest priority (1.4)"
+    );
 }
 
 #[test]
@@ -2330,9 +2633,29 @@ fn next_work_item_uses_coef_from_param() {
     let now = Timestamp(9999);
 
     // priority(A, coef=0) = 0.5, priority(A, coef=5) = 0.5 * (1 + 5*0.9) = 0.5 * 5.5 = 2.75
-    let a = make_block_with(1, SourceBlockStatus::Active, 0.5, 9, Some(10), 0.4, 0.999, None, 0);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        0.5,
+        9,
+        Some(10),
+        0.4,
+        0.999,
+        None,
+        0,
+    );
     // priority(B, coef=0) = 0.6, priority(B, coef=5) = 0.6
-    let b = make_block_with(2, SourceBlockStatus::Active, 0.6, 0, Some(10), 0.3, 0.999, None, 0);
+    let b = make_block_with(
+        2,
+        SourceBlockStatus::Active,
+        0.6,
+        0,
+        Some(10),
+        0.3,
+        0.999,
+        None,
+        0,
+    );
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
 
@@ -2340,13 +2663,21 @@ fn next_work_item_uses_coef_from_param() {
         .next_work_item(0.0, std::time::Duration::from_secs(30), now, 0)
         .unwrap()
         .unwrap();
-    assert_eq!(result_coef0.block_id, SourceBlockId([2; 32]), "Block B wins when coef=0");
+    assert_eq!(
+        result_coef0.block_id,
+        SourceBlockId([2; 32]),
+        "Block B wins when coef=0"
+    );
 
     let result_coef5 = db
         .next_work_item(5.0, std::time::Duration::from_secs(30), now, 0)
         .unwrap()
         .unwrap();
-    assert_eq!(result_coef5.block_id, SourceBlockId([1; 32]), "Block A wins when coef=5");
+    assert_eq!(
+        result_coef5.block_id,
+        SourceBlockId([1; 32]),
+        "Block A wins when coef=5"
+    );
 }
 
 #[test]
@@ -2354,9 +2685,39 @@ fn next_work_item_tiebreaks_by_last_attempted_at_ascending() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(99999);
 
-    let a = make_block_with(1, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999, Some(Timestamp(1000)), 0);
-    let b = make_block_with(2, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999, Some(Timestamp(500)), 0);
-    let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999, Some(Timestamp(2000)), 0);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        0.8,
+        5,
+        Some(10),
+        0.4,
+        0.999,
+        Some(Timestamp(1000)),
+        0,
+    );
+    let b = make_block_with(
+        2,
+        SourceBlockStatus::Active,
+        0.8,
+        5,
+        Some(10),
+        0.4,
+        0.999,
+        Some(Timestamp(500)),
+        0,
+    );
+    let c = make_block_with(
+        3,
+        SourceBlockStatus::Active,
+        0.8,
+        5,
+        Some(10),
+        0.4,
+        0.999,
+        Some(Timestamp(2000)),
+        0,
+    );
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
     db.upsert_source_block(&c).unwrap();
@@ -2365,7 +2726,11 @@ fn next_work_item_tiebreaks_by_last_attempted_at_ascending() {
         .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
         .unwrap()
         .unwrap();
-    assert_eq!(result.block_id, SourceBlockId([2; 32]), "Block B has earliest last_attempted_at=500");
+    assert_eq!(
+        result.block_id,
+        SourceBlockId([2; 32]),
+        "Block B has earliest last_attempted_at=500"
+    );
 }
 
 #[test]
@@ -2373,8 +2738,28 @@ fn next_work_item_never_attempted_beats_recently_attempted() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(99999);
 
-    let a = make_block_with(1, SourceBlockStatus::Active, 0.7, 3, Some(10), 0.3, 0.999, Some(Timestamp(0)), 0);
-    let b = make_block_with(2, SourceBlockStatus::Active, 0.7, 3, Some(10), 0.3, 0.999, None, 0);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        0.7,
+        3,
+        Some(10),
+        0.3,
+        0.999,
+        Some(Timestamp(0)),
+        0,
+    );
+    let b = make_block_with(
+        2,
+        SourceBlockStatus::Active,
+        0.7,
+        3,
+        Some(10),
+        0.3,
+        0.999,
+        None,
+        0,
+    );
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
 
@@ -2382,7 +2767,11 @@ fn next_work_item_never_attempted_beats_recently_attempted() {
         .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
         .unwrap()
         .unwrap();
-    assert_eq!(result.block_id, SourceBlockId([2; 32]), "Block B (never attempted) wins over Block A");
+    assert_eq!(
+        result.block_id,
+        SourceBlockId([2; 32]),
+        "Block B (never attempted) wins over Block A"
+    );
 }
 
 #[test]
@@ -2391,8 +2780,28 @@ fn next_work_item_deterministic_tiebreak_by_block_id() {
     let now = Timestamp(9999);
 
     // Both blocks: same priority, last_attempted_at=None. Block B has seed=0x00 (smaller).
-    let a = make_block_with(0x01, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999, None, 0);
-    let b = make_block_with(0x00, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999, None, 0);
+    let a = make_block_with(
+        0x01,
+        SourceBlockStatus::Active,
+        0.8,
+        5,
+        Some(10),
+        0.4,
+        0.999,
+        None,
+        0,
+    );
+    let b = make_block_with(
+        0x00,
+        SourceBlockStatus::Active,
+        0.8,
+        5,
+        Some(10),
+        0.4,
+        0.999,
+        None,
+        0,
+    );
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
 
@@ -2404,8 +2813,15 @@ fn next_work_item_deterministic_tiebreak_by_block_id() {
         .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
         .unwrap()
         .unwrap();
-    assert_eq!(result1.block_id, SourceBlockId([0x00; 32]), "Block with smaller block_id wins");
-    assert_eq!(result1.block_id, result2.block_id, "Result is deterministic across two calls");
+    assert_eq!(
+        result1.block_id,
+        SourceBlockId([0x00; 32]),
+        "Block with smaller block_id wins"
+    );
+    assert_eq!(
+        result1.block_id, result2.block_id,
+        "Result is deterministic across two calls"
+    );
 }
 
 #[test]
@@ -2413,8 +2829,28 @@ fn next_work_item_excludes_deleting_blocks() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(9999);
 
-    let a = make_block_with(1, SourceBlockStatus::Active, 0.5, 0, Some(10), 0.0, 0.999, None, 0);
-    let b = make_block_with(2, SourceBlockStatus::Deleting, 1.0, 0, Some(10), 0.0, 0.999, None, 0);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        0.5,
+        0,
+        Some(10),
+        0.0,
+        0.999,
+        None,
+        0,
+    );
+    let b = make_block_with(
+        2,
+        SourceBlockStatus::Deleting,
+        1.0,
+        0,
+        Some(10),
+        0.0,
+        0.999,
+        None,
+        0,
+    );
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
 
@@ -2422,7 +2858,11 @@ fn next_work_item_excludes_deleting_blocks() {
         .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
         .unwrap()
         .unwrap();
-    assert_eq!(result.block_id, SourceBlockId([1; 32]), "Deleting block excluded despite higher importance");
+    assert_eq!(
+        result.block_id,
+        SourceBlockId([1; 32]),
+        "Deleting block excluded despite higher importance"
+    );
 }
 
 #[test]
@@ -2430,7 +2870,17 @@ fn next_work_item_excludes_blocks_in_cooldown() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(1000);
 
-    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999, Some(Timestamp(990)), 0xABCD);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        0.9,
+        0,
+        Some(10),
+        0.0,
+        0.999,
+        Some(Timestamp(990)),
+        0xABCD,
+    );
     db.upsert_source_block(&a).unwrap();
 
     // Elapsed: 10s < 30s cooldown, same pool sig → in cooldown.
@@ -2444,18 +2894,38 @@ fn next_work_item_excludes_blocks_in_cooldown() {
 fn next_work_item_includes_block_after_cooldown_expires() {
     let db = Db::open_in_memory().unwrap();
 
-    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999, Some(Timestamp(1000)), 0xABCD);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        0.9,
+        0,
+        Some(10),
+        0.0,
+        0.999,
+        Some(Timestamp(1000)),
+        0xABCD,
+    );
     db.upsert_source_block(&a).unwrap();
 
     // 25s < 30s → still in cooldown.
     let result_during = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), Timestamp(1025), 0xABCD)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            Timestamp(1025),
+            0xABCD,
+        )
         .unwrap();
     assert!(result_during.is_none(), "25s < 30s: still in cooldown");
 
     // 31s >= 30s → cooldown expired.
     let result_after = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), Timestamp(1031), 0xABCD)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            Timestamp(1031),
+            0xABCD,
+        )
         .unwrap();
     assert!(result_after.is_some(), "31s >= 30s: cooldown expired");
     assert_eq!(result_after.unwrap().block_id, SourceBlockId([1; 32]));
@@ -2465,18 +2935,38 @@ fn next_work_item_includes_block_after_cooldown_expires() {
 fn next_work_item_includes_block_when_pool_signature_changes() {
     let db = Db::open_in_memory().unwrap();
 
-    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999, Some(Timestamp(1000)), 0xABCD);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        0.9,
+        0,
+        Some(10),
+        0.0,
+        0.999,
+        Some(Timestamp(1000)),
+        0xABCD,
+    );
     db.upsert_source_block(&a).unwrap();
 
     // Same pool: 10s < 30s → in cooldown.
     let result_same_pool = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), Timestamp(1010), 0xABCD)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            Timestamp(1010),
+            0xABCD,
+        )
         .unwrap();
     assert!(result_same_pool.is_none(), "Same pool: block in cooldown");
 
     // Pool changed: cooldown bypassed.
     let result_new_pool = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), Timestamp(1010), 0xDEAD)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            Timestamp(1010),
+            0xDEAD,
+        )
         .unwrap();
     assert!(result_new_pool.is_some(), "Pool changed: cooldown bypassed");
     assert_eq!(result_new_pool.unwrap().block_id, SourceBlockId([1; 32]));
@@ -2486,7 +2976,17 @@ fn next_work_item_includes_block_when_pool_signature_changes() {
 fn next_work_item_skips_cooldown_when_current_pool_signature_zero() {
     let db = Db::open_in_memory().unwrap();
 
-    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999, Some(Timestamp(1000)), 0xABCD);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        0.9,
+        0,
+        Some(10),
+        0.0,
+        0.999,
+        Some(Timestamp(1000)),
+        0xABCD,
+    );
     db.upsert_source_block(&a).unwrap();
 
     // 10s < 30s would be in cooldown, but current_pool_sig=0 bypasses it.
@@ -2502,8 +3002,28 @@ fn next_work_item_excludes_blocks_with_target_reliability_zero() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(9999);
 
-    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.0, None, 0);
-    let b = make_block_with(2, SourceBlockStatus::Active, 0.5, 0, Some(10), 0.0, 0.999, None, 0);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        0.9,
+        0,
+        Some(10),
+        0.0,
+        0.0,
+        None,
+        0,
+    );
+    let b = make_block_with(
+        2,
+        SourceBlockStatus::Active,
+        0.5,
+        0,
+        Some(10),
+        0.0,
+        0.999,
+        None,
+        0,
+    );
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
 
@@ -2511,7 +3031,11 @@ fn next_work_item_excludes_blocks_with_target_reliability_zero() {
         .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
         .unwrap()
         .unwrap();
-    assert_eq!(result.block_id, SourceBlockId([2; 32]), "Block A excluded (target_reliability=0.0)");
+    assert_eq!(
+        result.block_id,
+        SourceBlockId([2; 32]),
+        "Block A excluded (target_reliability=0.0)"
+    );
 }
 
 #[test]
@@ -2519,9 +3043,39 @@ fn next_work_item_excludes_blocks_at_or_above_target() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(9999);
 
-    let a = make_block_with(1, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.999, 0.999, None, 0);
-    let b = make_block_with(2, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.9999, 0.999, None, 0);
-    let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.99, 0.999, None, 0);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        0.8,
+        5,
+        Some(10),
+        0.999,
+        0.999,
+        None,
+        0,
+    );
+    let b = make_block_with(
+        2,
+        SourceBlockStatus::Active,
+        0.8,
+        5,
+        Some(10),
+        0.9999,
+        0.999,
+        None,
+        0,
+    );
+    let c = make_block_with(
+        3,
+        SourceBlockStatus::Active,
+        0.8,
+        5,
+        Some(10),
+        0.99,
+        0.999,
+        None,
+        0,
+    );
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
     db.upsert_source_block(&c).unwrap();
@@ -2530,7 +3084,11 @@ fn next_work_item_excludes_blocks_at_or_above_target() {
         .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
         .unwrap()
         .unwrap();
-    assert_eq!(result.block_id, SourceBlockId([3; 32]), "Only Block C is below target");
+    assert_eq!(
+        result.block_id,
+        SourceBlockId([3; 32]),
+        "Only Block C is below target"
+    );
 }
 
 #[test]
@@ -2539,7 +3097,17 @@ fn next_work_item_deterministic_for_given_state() {
     let now = Timestamp(9999);
 
     for seed in 0u8..5 {
-        let b = make_block_with(seed, SourceBlockStatus::Active, 0.3 + seed as f64 * 0.1, seed as u32, Some(10), 0.0, 0.999, None, 0);
+        let b = make_block_with(
+            seed,
+            SourceBlockStatus::Active,
+            0.3 + seed as f64 * 0.1,
+            seed as u32,
+            Some(10),
+            0.0,
+            0.999,
+            None,
+            0,
+        );
         db.upsert_source_block(&b).unwrap();
     }
 
@@ -2561,17 +3129,46 @@ fn next_work_item_does_not_mutate_block_records() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(9999);
 
-    let block = make_block_with(1, SourceBlockStatus::Active, 0.8, 3, Some(10), 0.3, 0.999, Some(Timestamp(500)), 0xABCD);
+    let block = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        0.8,
+        3,
+        Some(10),
+        0.3,
+        0.999,
+        Some(Timestamp(500)),
+        0xABCD,
+    );
     db.upsert_source_block(&block).unwrap();
 
-    let before = db.get_source_block(&SourceBlockId([1; 32])).unwrap().unwrap();
-    db.next_work_item(1.5, std::time::Duration::from_secs(30), now, 0).unwrap();
-    let after = db.get_source_block(&SourceBlockId([1; 32])).unwrap().unwrap();
+    let before = db
+        .get_source_block(&SourceBlockId([1; 32]))
+        .unwrap()
+        .unwrap();
+    db.next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .unwrap();
+    let after = db
+        .get_source_block(&SourceBlockId([1; 32]))
+        .unwrap()
+        .unwrap();
 
-    assert_eq!(before.last_attempted_at, after.last_attempted_at, "last_attempted_at unchanged");
-    assert_eq!(before.last_pool_signature, after.last_pool_signature, "last_pool_signature unchanged");
-    assert_eq!(before.current_alive, after.current_alive, "current_alive unchanged");
-    assert_eq!(before.current_reliability, after.current_reliability, "current_reliability unchanged");
+    assert_eq!(
+        before.last_attempted_at, after.last_attempted_at,
+        "last_attempted_at unchanged"
+    );
+    assert_eq!(
+        before.last_pool_signature, after.last_pool_signature,
+        "last_pool_signature unchanged"
+    );
+    assert_eq!(
+        before.current_alive, after.current_alive,
+        "current_alive unchanged"
+    );
+    assert_eq!(
+        before.current_reliability, after.current_reliability,
+        "current_reliability unchanged"
+    );
 }
 
 #[test]
@@ -2580,7 +3177,17 @@ fn next_work_item_handles_n_none_legacy_blocks() {
     let now = Timestamp(9999);
 
     // n=None → priority = importance = 0.7 (no completion bonus)
-    let a = make_block_with(1, SourceBlockStatus::Active, 0.7, 0, None, 0.3, 0.999, None, 0);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        0.7,
+        0,
+        None,
+        0.3,
+        0.999,
+        None,
+        0,
+    );
     db.upsert_source_block(&a).unwrap();
 
     let result = db
@@ -2589,14 +3196,28 @@ fn next_work_item_handles_n_none_legacy_blocks() {
     assert!(result.is_some(), "Legacy block (n=None) is returned");
 
     // Add Block B with n=Some(10), current_alive=5: priority = 0.7 * 1.75 = 1.225 > 0.7
-    let b = make_block_with(2, SourceBlockStatus::Active, 0.7, 5, Some(10), 0.3, 0.999, None, 0);
+    let b = make_block_with(
+        2,
+        SourceBlockStatus::Active,
+        0.7,
+        5,
+        Some(10),
+        0.3,
+        0.999,
+        None,
+        0,
+    );
     db.upsert_source_block(&b).unwrap();
 
     let result2 = db
         .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
         .unwrap()
         .unwrap();
-    assert_eq!(result2.block_id, SourceBlockId([2; 32]), "Block B wins: completion bonus applies");
+    assert_eq!(
+        result2.block_id,
+        SourceBlockId([2; 32]),
+        "Block B wins: completion bonus applies"
+    );
 }
 
 #[test]
@@ -2604,8 +3225,28 @@ fn next_work_item_with_only_non_active_blocks_returns_none() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(9999);
 
-    let a = make_block_with(1, SourceBlockStatus::Stale, 0.8, 0, Some(10), 0.0, 0.999, None, 0);
-    let b = make_block_with(2, SourceBlockStatus::Deleted, 0.8, 0, Some(10), 0.0, 0.999, None, 0);
+    let a = make_block_with(
+        1,
+        SourceBlockStatus::Stale,
+        0.8,
+        0,
+        Some(10),
+        0.0,
+        0.999,
+        None,
+        0,
+    );
+    let b = make_block_with(
+        2,
+        SourceBlockStatus::Deleted,
+        0.8,
+        0,
+        Some(10),
+        0.0,
+        0.999,
+        None,
+        0,
+    );
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
 

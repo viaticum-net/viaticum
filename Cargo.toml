@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/syncback-core",
     "crates/syncback",
@@ -9,7 +9,17 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.89"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+# unwrap_used/panic kept default (allow) for now — adding them as warn produced
+# 1000+ findings (mostly tests). Tighten in a follow-up sweep.
 
 [workspace.dependencies]
 # Serialization

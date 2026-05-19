@@ -195,8 +195,12 @@ pub fn validate(
     }
     // listen_port: allow 0 (meaning ephemeral, OS-chosen). Reject only obviously
     // invalid values — u16 already constrains the upper bound.
-    if let Some(web_bind) = current_web_bind {
-        if let Some(web_port) = web_bind.rsplit(':').next().and_then(|s| s.parse::<u16>().ok()) {
+    if let Some(web_bind) = current_web_bind
+        && let Some(web_port) = web_bind
+            .rsplit(':')
+            .next()
+            .and_then(|s| s.parse::<u16>().ok())
+        {
             // Only flag a collision when the user picked a real port (not 0).
             if cfg.network.listen_port != 0 && web_port == cfg.network.listen_port {
                 return Err(ConfigAdminError::Validation {
@@ -205,6 +209,5 @@ pub fn validate(
                 });
             }
         }
-    }
     Ok(())
 }

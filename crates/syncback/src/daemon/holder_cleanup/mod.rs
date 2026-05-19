@@ -6,10 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
-use syncback_core::budget::{evaluate_pressure, DiskPressure};
+use syncback_core::budget::{DiskPressure, evaluate_pressure};
 use syncback_core::constants::{KI, KP, S_CLAMP_MAX, S_CLAMP_MIN};
 use syncback_core::db::Db;
-use syncback_core::types::{hex_encode, IdentityPub, Timestamp}; // IdentityPub for HoldingRecord.owner_id
+use syncback_core::types::{IdentityPub, Timestamp, hex_encode}; // IdentityPub for HoldingRecord.owner_id
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -44,8 +44,9 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let mut cleanup_timer =
         tokio::time::interval(std::time::Duration::from_secs(cleanup_interval_secs.max(1)));
-    let mut pressure_timer =
-        tokio::time::interval(std::time::Duration::from_secs(pressure_interval_secs.max(1)));
+    let mut pressure_timer = tokio::time::interval(std::time::Duration::from_secs(
+        pressure_interval_secs.max(1),
+    ));
     // Drop-notice cleanup runs on the same interval as delete-cooldown cleanup.
     let mut drop_notice_timer =
         tokio::time::interval(std::time::Duration::from_secs(cleanup_interval_secs.max(1)));
@@ -103,21 +104,23 @@ async fn cleanup_expired(
         return Ok(());
     }
 
-    info!(count = expired.len(), "holder_cleanup: processing expired holdings");
+    info!(
+        count = expired.len(),
+        "holder_cleanup: processing expired holdings"
+    );
 
     for holding in &expired {
         // Delete symbol files.
         let block_hex = hex_encode(&holding.source_block_id.0);
         let block_dir = holdings_dir.join(&block_hex);
-        if block_dir.exists() {
-            if let Err(e) = tokio::fs::remove_dir_all(&block_dir).await {
+        if block_dir.exists()
+            && let Err(e) = tokio::fs::remove_dir_all(&block_dir).await {
                 warn!(
                     block_id = %holding.source_block_id,
                     err = %e,
                     "holder_cleanup: failed to remove symbol files (may already be gone)"
                 );
             }
-        }
 
         // Remove DB record.
         if let Err(e) = db.delete_holding(&holding.source_block_id, &holding.owner_id) {
@@ -137,10 +140,14 @@ async fn cleanup_expired(
             holding.source_block_id,
             &holding.esi_ranges,
             master_signing_key,
-        ).await;
+        )
+        .await;
 
         // Refresh storage bytes for all devices of this owner's master identity.
-        for did in db.get_devices_for_master(&holding.owner_id).unwrap_or_default() {
+        for did in db
+            .get_devices_for_master(&holding.owner_id)
+            .unwrap_or_default()
+        {
             if let Err(e) = db.refresh_peer_storage_bytes(&did) {
                 warn!(
                     owner = %holding.owner_id,
@@ -176,21 +183,23 @@ async fn cleanup_drop_notices(
         return Ok(());
     }
 
-    info!(count = expired.len(), "holder_cleanup: processing expired drop notices");
+    info!(
+        count = expired.len(),
+        "holder_cleanup: processing expired drop notices"
+    );
 
     for holding in &expired {
         // Delete symbol files.
         let block_hex = hex_encode(&holding.source_block_id.0);
         let block_dir = holdings_dir.join(&block_hex);
-        if block_dir.exists() {
-            if let Err(e) = tokio::fs::remove_dir_all(&block_dir).await {
+        if block_dir.exists()
+            && let Err(e) = tokio::fs::remove_dir_all(&block_dir).await {
                 warn!(
                     block_id = %holding.source_block_id,
                     err = %e,
                     "holder_cleanup: failed to remove symbol files for expired drop notice"
                 );
             }
-        }
 
         // Remove DB record.
         if let Err(e) = db.delete_holding(&holding.source_block_id, &holding.owner_id) {
@@ -210,10 +219,14 @@ async fn cleanup_drop_notices(
             holding.source_block_id,
             &holding.esi_ranges,
             master_signing_key,
-        ).await;
+        )
+        .await;
 
         // Refresh storage bytes for all devices of this owner's master identity.
-        for did in db.get_devices_for_master(&holding.owner_id).unwrap_or_default() {
+        for did in db
+            .get_devices_for_master(&holding.owner_id)
+            .unwrap_or_default()
+        {
             if let Err(e) = db.refresh_peer_storage_bytes(&did) {
                 warn!(
                     owner = %holding.owner_id,
@@ -253,7 +266,9 @@ async fn check_pressure(
     // Compute effective quota from config + actual disk space.
     let disk_free = crate::daemon::handle::disk_available_bytes(data_dir);
     let effective_quota = syncback_core::budget::compute_effective_quota(
-        soft_quota_bytes, disk_free, disk_reserve_bytes,
+        soft_quota_bytes,
+        disk_free,
+        disk_reserve_bytes,
     );
 
     let trust_fn = |owner: &IdentityPub| -> f64 {
@@ -285,8 +300,7 @@ async fn check_pressure(
         DiskPressure::Soft => {
             info!(
                 used_bytes,
-                effective_quota,
-                "holder_cleanup: soft disk pressure — not accepting new symbols"
+                effective_quota, "holder_cleanup: soft disk pressure — not accepting new symbols"
             );
         }
         DiskPressure::Hard => {
@@ -302,15 +316,14 @@ async fn check_pressure(
                 // Delete symbol files.
                 let block_hex = hex_encode(&target.source_block_id.0);
                 let block_dir = holdings_dir.join(&block_hex);
-                if block_dir.exists() {
-                    if let Err(e) = tokio::fs::remove_dir_all(&block_dir).await {
+                if block_dir.exists()
+                    && let Err(e) = tokio::fs::remove_dir_all(&block_dir).await {
                         warn!(
                             block_id = %target.source_block_id,
                             err = %e,
                             "holder_cleanup: failed to remove symbol files during eviction"
                         );
                     }
-                }
 
                 // Get ESI ranges before deleting.
                 let esi_ranges = match db.get_holding(&target.source_block_id, &target.owner_id) {
@@ -336,7 +349,8 @@ async fn check_pressure(
                     target.source_block_id,
                     &esi_ranges,
                     master_signing_key,
-                ).await;
+                )
+                .await;
             }
 
             // Post SymbolDropNotice for buffered drop notices and record sent_at.
@@ -355,12 +369,14 @@ async fn check_pressure(
                 if let Ok(payload) = syncback_core::messages::to_cbor(&notice_msg) {
                     let mut msg_id = [0u8; 16];
                     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut msg_id);
-                    let _ = relay_post_tx.send(RelayPost {
-                        msg_type: "symbol_drop_notice".to_string(),
-                        target: Some(notice.owner_id),
-                        payload,
-                        msg_id,
-                    }).await;
+                    let _ = relay_post_tx
+                        .send(RelayPost {
+                            msg_type: "symbol_drop_notice".to_string(),
+                            target: Some(notice.owner_id),
+                            payload,
+                            msg_id,
+                        })
+                        .await;
                 }
                 // Record when the notice was sent so cleanup_drop_notices can evict later.
                 if holding.drop_notice_sent_at.is_none() {
@@ -378,7 +394,10 @@ async fn check_pressure(
 
             // Refresh storage bytes for evicted owners (all devices of each master).
             for target in &result.immediate_evictions {
-                for did in db.get_devices_for_master(&target.owner_id).unwrap_or_default() {
+                for did in db
+                    .get_devices_for_master(&target.owner_id)
+                    .unwrap_or_default()
+                {
                     if let Err(e) = db.refresh_peer_storage_bytes(&did) {
                         warn!(
                             owner = %target.owner_id,
@@ -412,11 +431,13 @@ async fn post_symbol_dropped(
     if let Ok(payload) = syncback_core::messages::to_cbor(&msg) {
         let mut msg_id = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut msg_id);
-        let _ = relay_post_tx.send(RelayPost {
-            msg_type: "symbol_dropped".to_string(),
-            target: Some(owner_id),
-            payload,
-            msg_id,
-        }).await;
+        let _ = relay_post_tx
+            .send(RelayPost {
+                msg_type: "symbol_dropped".to_string(),
+                target: Some(owner_id),
+                payload,
+                msg_id,
+            })
+            .await;
     }
 }

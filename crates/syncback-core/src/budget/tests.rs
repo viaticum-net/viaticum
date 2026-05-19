@@ -1,6 +1,10 @@
 use super::*;
-use crate::constants::{DEFAULT_SUCCESS_RATE, SECS_PER_WEEK, UNKNOWN_OWNER_TRUST_FLOOR, WEEKLY_STATS_WINDOW};
-use crate::types::{BudgetRecord, HoldingRecord, HoldingStatus, IdentityPub, SourceBlockId, Timestamp};
+use crate::constants::{
+    DEFAULT_SUCCESS_RATE, SECS_PER_WEEK, UNKNOWN_OWNER_TRUST_FLOOR, WEEKLY_STATS_WINDOW,
+};
+use crate::types::{
+    BudgetRecord, HoldingRecord, HoldingStatus, IdentityPub, SourceBlockId, Timestamp,
+};
 
 fn gib(n: u64) -> u64 {
     n * 1024 * 1024 * 1024
@@ -240,7 +244,10 @@ fn select_backup_batch_importance_zero_excluded() {
     let batch = select_backup_batch(&candidates, 1000.0);
 
     assert_eq!(batch.candidates.len(), 0);
-    assert_eq!(batch.deferred_count, 0, "importance=0.0 must not be deferred");
+    assert_eq!(
+        batch.deferred_count, 0,
+        "importance=0.0 must not be deferred"
+    );
 }
 
 // ============================================================
@@ -261,7 +268,10 @@ fn record_placement_outcome_rolling_window() {
     );
     // The oldest entry (offered=10, accepted=0) should have been dropped.
     // Remaining: calls 1,2,3,4 → accepted = 1,2,3,4.
-    assert_eq!(r.weekly_stats[0].1, 1, "oldest remaining should be accepted=1");
+    assert_eq!(
+        r.weekly_stats[0].1, 1,
+        "oldest remaining should be accepted=1"
+    );
 }
 
 // ============================================================
@@ -391,9 +401,18 @@ fn evaluate_pressure_hard_evicts_lowest_priority() {
     );
 
     // Verify eviction order: A first, C second, B last
-    assert_eq!(result.immediate_evictions[0].source_block_id, SourceBlockId([0u8; 32]));
-    assert_eq!(result.immediate_evictions[1].source_block_id, SourceBlockId([2u8; 32]));
-    assert_eq!(result.immediate_evictions[2].source_block_id, SourceBlockId([1u8; 32]));
+    assert_eq!(
+        result.immediate_evictions[0].source_block_id,
+        SourceBlockId([0u8; 32])
+    );
+    assert_eq!(
+        result.immediate_evictions[1].source_block_id,
+        SourceBlockId([2u8; 32])
+    );
+    assert_eq!(
+        result.immediate_evictions[2].source_block_id,
+        SourceBlockId([1u8; 32])
+    );
 }
 
 // ============================================================
@@ -515,9 +534,7 @@ fn evaluate_pressure_hard_quota_partial_eviction() {
             Timestamp(now_secs),
         ),
     ];
-    let trust_fn = |id: &IdentityPub| -> f64 {
-        if id.0 == [1u8; 32] { 0.5 } else { 0.9 }
-    };
+    let trust_fn = |id: &IdentityPub| -> f64 { if id.0 == [1u8; 32] { 0.5 } else { 0.9 } };
     let result = evaluate_pressure(gib(100), gib(90), gib(97), &holdings, trust_fn, now_secs);
     assert_eq!(result.pressure, DiskPressure::Hard);
     assert_eq!(
@@ -565,9 +582,13 @@ fn evaluate_pressure_hard_quota_zero_disables_floor() {
         ),
     ];
     let trust_fn = |id: &IdentityPub| -> f64 {
-        if id.0 == [1u8; 32] { 0.5 }
-        else if id.0 == [2u8; 32] { 0.9 }
-        else { 0.5 }
+        if id.0 == [1u8; 32] {
+            0.5
+        } else if id.0 == [2u8; 32] {
+            0.9
+        } else {
+            0.5
+        }
     };
     let result = evaluate_pressure(gib(100), 0, gib(97), &holdings, trust_fn, now_secs);
     assert_eq!(result.pressure, DiskPressure::Hard);
@@ -635,10 +656,7 @@ fn eviction_removes_lowest_priority_first() {
     assert_eq!(result.pressure, DiskPressure::Hard);
 
     // H_low must be first (lowest priority evicted first)
-    assert!(
-        !result.immediate_evictions.is_empty(),
-        "expected evictions"
-    );
+    assert!(!result.immediate_evictions.is_empty(), "expected evictions");
     assert_eq!(
         result.immediate_evictions[0].source_block_id,
         SourceBlockId([10u8; 32]),
@@ -679,16 +697,41 @@ fn evaluate_pressure_hard_produces_drop_notice_for_buffer_zone() {
     let now_secs = 0u64;
     let holdings = vec![
         // A: 600 bytes, lowest priority → immediately evicted
-        make_holding([0u8; 32], [1u8; 32], 0.1, 600, HoldingStatus::Active, Timestamp(now_secs)),
+        make_holding(
+            [0u8; 32],
+            [1u8; 32],
+            0.1,
+            600,
+            HoldingStatus::Active,
+            Timestamp(now_secs),
+        ),
         // B: 350 bytes, medium priority → buffer zone (DropNotice)
-        make_holding([1u8; 32], [2u8; 32], 0.5, 350, HoldingStatus::Active, Timestamp(now_secs)),
+        make_holding(
+            [1u8; 32],
+            [2u8; 32],
+            0.5,
+            350,
+            HoldingStatus::Active,
+            Timestamp(now_secs),
+        ),
         // C: 20 bytes, high priority → not touched
-        make_holding([2u8; 32], [3u8; 32], 0.9, 20, HoldingStatus::Active, Timestamp(now_secs)),
+        make_holding(
+            [2u8; 32],
+            [3u8; 32],
+            0.9,
+            20,
+            HoldingStatus::Active,
+            Timestamp(now_secs),
+        ),
     ];
     let trust_fn = |id: &IdentityPub| -> f64 {
-        if id.0 == [1u8; 32] { 0.2 }
-        else if id.0 == [2u8; 32] { 0.5 }
-        else { 0.9 }
+        if id.0 == [1u8; 32] {
+            0.2
+        } else if id.0 == [2u8; 32] {
+            0.5
+        } else {
+            0.9
+        }
     };
 
     let result = evaluate_pressure(1000, 0, 970, &holdings, trust_fn, now_secs);
@@ -697,7 +740,10 @@ fn evaluate_pressure_hard_produces_drop_notice_for_buffer_zone() {
 
     // A must be immediately evicted.
     assert_eq!(result.immediate_evictions.len(), 1);
-    assert_eq!(result.immediate_evictions[0].source_block_id, SourceBlockId([0u8; 32]));
+    assert_eq!(
+        result.immediate_evictions[0].source_block_id,
+        SourceBlockId([0u8; 32])
+    );
 
     // B must be in drop_notices (buffer zone).
     assert!(
@@ -716,10 +762,19 @@ fn evaluate_pressure_hard_produces_drop_notice_for_buffer_zone() {
     );
 
     // C must NOT be evicted or notified.
-    let c_evicted = result.immediate_evictions.iter().any(|e| e.source_block_id == SourceBlockId([2u8; 32]));
-    let c_noticed = result.drop_notices.iter().any(|n| n.source_block_id == SourceBlockId([2u8; 32]));
+    let c_evicted = result
+        .immediate_evictions
+        .iter()
+        .any(|e| e.source_block_id == SourceBlockId([2u8; 32]));
+    let c_noticed = result
+        .drop_notices
+        .iter()
+        .any(|n| n.source_block_id == SourceBlockId([2u8; 32]));
     assert!(!c_evicted, "C (highest priority) must not be evicted");
-    assert!(!c_noticed, "C (highest priority) must not receive a drop notice");
+    assert!(
+        !c_noticed,
+        "C (highest priority) must not receive a drop notice"
+    );
 }
 
 #[test]
@@ -747,11 +802,7 @@ fn compute_earned_offer_gb_scales_with_gb_days_and_trust() {
 
     let peer = IdentityPub([1u8; 32]);
     // 300 gb_days × trust=MAX → weight=1 → 300 / 30 = 10 GB earned.
-    let earned = compute_earned_offer_gb(
-        &[(peer, 300.0)],
-        |_| MAX_COMBINED_TRUST,
-        30.0,
-    );
+    let earned = compute_earned_offer_gb(&[(peer, 300.0)], |_| MAX_COMBINED_TRUST, 30.0);
     assert!((earned - 10.0).abs() < 1e-6, "got {earned}");
 }
 
@@ -762,13 +813,12 @@ fn compute_earned_offer_gb_trust_weights_untrusted_low() {
 
     let peer = IdentityPub([2u8; 32]);
     // Untrusted peer (0.1 out of 2.15) → weight ≈ 0.0465 → earned ≈ 0.465 / 30
-    let earned = compute_earned_offer_gb(
-        &[(peer, 300.0)],
-        |_| 0.1,
-        30.0,
-    );
+    let earned = compute_earned_offer_gb(&[(peer, 300.0)], |_| 0.1, 30.0);
     let expected = 300.0 * (0.1 / MAX_COMBINED_TRUST) / 30.0;
-    assert!((earned - expected).abs() < 1e-6, "got {earned} vs {expected}");
+    assert!(
+        (earned - expected).abs() < 1e-6,
+        "got {earned} vs {expected}"
+    );
 }
 
 #[test]
@@ -778,11 +828,7 @@ fn compute_earned_offer_gb_sums_across_peers() {
 
     let a = IdentityPub([1u8; 32]);
     let b = IdentityPub([2u8; 32]);
-    let earned = compute_earned_offer_gb(
-        &[(a, 100.0), (b, 200.0)],
-        |_| MAX_COMBINED_TRUST,
-        30.0,
-    );
+    let earned = compute_earned_offer_gb(&[(a, 100.0), (b, 200.0)], |_| MAX_COMBINED_TRUST, 30.0);
     assert!((earned - (300.0 / 30.0)).abs() < 1e-6);
 }
 

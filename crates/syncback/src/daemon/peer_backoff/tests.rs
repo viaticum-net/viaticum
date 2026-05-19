@@ -1,4 +1,4 @@
-use super::{PeerBackoff, DEFAULT_COOLDOWN_SECS};
+use super::{DEFAULT_COOLDOWN_SECS, PeerBackoff};
 use syncback_core::types::DeviceId;
 
 fn dev(byte: u8) -> DeviceId {

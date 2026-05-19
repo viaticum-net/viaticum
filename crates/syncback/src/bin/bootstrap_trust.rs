@@ -68,7 +68,13 @@ fn parse_hex32(s: &str, what: &str) -> [u8; 32] {
                 .unwrap_or_else(|e| panic!("bad hex in {}: {}", what, e))
         })
         .collect::<Vec<_>>();
-    assert_eq!(v.len(), 32, "{} must be 32 bytes (64 hex chars), got {}", what, v.len());
+    assert_eq!(
+        v.len(),
+        32,
+        "{} must be 32 bytes (64 hex chars), got {}",
+        what,
+        v.len()
+    );
     let mut out = [0u8; 32];
     out.copy_from_slice(&v);
     out
@@ -90,11 +96,16 @@ fn main() {
                 hex32(&id.identity_pub),
             );
         }
-        Cmd::Seed { db, peers, score, skip_self } => {
+        Cmd::Seed {
+            db,
+            peers,
+            score,
+            skip_self,
+        } => {
             let peers_text = std::fs::read_to_string(&peers)
                 .unwrap_or_else(|e| panic!("read {}: {}", peers.display(), e));
-            let entries: Vec<PeerEntry> =
-                serde_json::from_str(&peers_text).unwrap_or_else(|e| panic!("parse peers.json: {}", e));
+            let entries: Vec<PeerEntry> = serde_json::from_str(&peers_text)
+                .unwrap_or_else(|e| panic!("parse peers.json: {}", e));
 
             let skip: Option<[u8; 32]> = skip_self.as_deref().map(|s| parse_hex32(s, "skip-self"));
 

@@ -1,3 +1,5 @@
+#![allow(clippy::cloned_ref_to_slice_refs)]
+
 use crate::constants::{HOLDER_DELETE_COOLDOWN_SECS, OWNER_DELETE_COOLDOWN_SECS};
 use crate::deletion::{DeletionAction, DeletionEngine, DeletionError, MarkDeletedResult};
 use crate::types::{
@@ -54,7 +56,11 @@ fn make_version(bid: SourceBlockId) -> FileVersion {
     }
 }
 
-fn make_block(bid: SourceBlockId, status: SourceBlockStatus, block_type: SourceBlockType) -> SourceBlockRecord {
+fn make_block(
+    bid: SourceBlockId,
+    status: SourceBlockStatus,
+    block_type: SourceBlockType,
+) -> SourceBlockRecord {
     SourceBlockRecord {
         block_id: bid,
         k: 1,
@@ -75,7 +81,12 @@ fn make_block(bid: SourceBlockId, status: SourceBlockStatus, block_type: SourceB
     }
 }
 
-fn make_placement(bid: SourceBlockId, hid: DeviceId, fid: FileId, status: PlacementStatus) -> SymbolPlacement {
+fn make_placement(
+    bid: SourceBlockId,
+    hid: DeviceId,
+    fid: FileId,
+    status: PlacementStatus,
+) -> SymbolPlacement {
     SymbolPlacement {
         source_block_id: bid,
         holder_id: hid,
@@ -406,10 +417,26 @@ fn process_cooldowns_vacuum_triggered_for_stale_pack() {
         SourceBlockStatus::Active,
         SourceBlockType::Pack {
             entries: vec![
-                PackEntry { file_id: fid1, offset: 0, size: 100 },
-                PackEntry { file_id: fid2, offset: 100, size: 100 },
-                PackEntry { file_id: fid3, offset: 200, size: 100 },
-                PackEntry { file_id: fid4, offset: 300, size: 100 },
+                PackEntry {
+                    file_id: fid1,
+                    offset: 0,
+                    size: 100,
+                },
+                PackEntry {
+                    file_id: fid2,
+                    offset: 100,
+                    size: 100,
+                },
+                PackEntry {
+                    file_id: fid3,
+                    offset: 200,
+                    size: 100,
+                },
+                PackEntry {
+                    file_id: fid4,
+                    offset: 300,
+                    size: 100,
+                },
             ],
         },
     );
@@ -443,7 +470,11 @@ fn process_cooldowns_no_vacuum_for_single_block_type() {
 
     let actions = engine.process_cooldowns(&[file], &[block], &[], now, 1);
 
-    assert!(!actions.iter().any(|a| matches!(a, DeletionAction::VacuumBlock { .. })));
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, DeletionAction::VacuumBlock { .. }))
+    );
 }
 
 #[test]
@@ -469,8 +500,16 @@ fn process_cooldowns_no_vacuum_for_stale_block() {
         SourceBlockStatus::Stale,
         SourceBlockType::Pack {
             entries: vec![
-                PackEntry { file_id: fid1, offset: 0, size: 100 },
-                PackEntry { file_id: fid2, offset: 100, size: 100 },
+                PackEntry {
+                    file_id: fid1,
+                    offset: 0,
+                    size: 100,
+                },
+                PackEntry {
+                    file_id: fid2,
+                    offset: 100,
+                    size: 100,
+                },
             ],
         },
     );
@@ -478,7 +517,11 @@ fn process_cooldowns_no_vacuum_for_stale_block() {
 
     let actions = engine.process_cooldowns(&[f1, f2], &[block], &[], now, 1);
 
-    assert!(!actions.iter().any(|a| matches!(a, DeletionAction::VacuumBlock { .. })));
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, DeletionAction::VacuumBlock { .. }))
+    );
 }
 
 #[test]
@@ -498,7 +541,8 @@ fn process_cooldowns_idempotent() {
     let p_a = make_placement(bid, holder_a, fid, PlacementStatus::Alive);
     let now = ts(OWNER_DELETE_COOLDOWN_SECS + 100);
 
-    let actions1 = engine.process_cooldowns(&[file.clone()], &[block.clone()], &[p_a.clone()], now, 1);
+    let actions1 =
+        engine.process_cooldowns(&[file.clone()], &[block.clone()], &[p_a.clone()], now, 1);
     let actions2 = engine.process_cooldowns(&[file], &[block], &[p_a], now, 1);
 
     assert_eq!(actions1, actions2);
@@ -535,7 +579,13 @@ fn single_device_deletion_cooldown_starts_immediately() {
 
     // Before owner cooldown: no actions
     let before = ts(deleted_at.0 + OWNER_DELETE_COOLDOWN_SECS - 1);
-    let actions = engine.process_cooldowns(&[file.clone()], &[block.clone()], &[placement.clone()], before, 1);
+    let actions = engine.process_cooldowns(
+        &[file.clone()],
+        &[block.clone()],
+        &[placement.clone()],
+        before,
+        1,
+    );
     assert!(
         actions.is_empty(),
         "cooldown not yet elapsed — no actions expected"
@@ -614,8 +664,13 @@ fn ransomware_protection_no_physical_delete_before_8_weeks() {
     let eight_weeks = OWNER_DELETE_COOLDOWN_SECS + HOLDER_DELETE_COOLDOWN_SECS;
     for weeks in 0..8 {
         let check_time = ts(ransomware_time.0 + weeks * 7 * 86_400);
-        let actions =
-            engine.process_cooldowns(&[file.clone()], &[block.clone()], &[placement.clone()], check_time, 1);
+        let actions = engine.process_cooldowns(
+            &[file.clone()],
+            &[block.clone()],
+            &[placement.clone()],
+            check_time,
+            1,
+        );
         assert!(
             !actions.iter().any(|a| matches!(
                 a,
@@ -629,10 +684,17 @@ fn ransomware_protection_no_physical_delete_before_8_weeks() {
     let delete_time = ts(ransomware_time.0 + eight_weeks);
     let block_deleting = make_block(bid, SourceBlockStatus::Deleting, SourceBlockType::Single);
     let placement_deleting = make_placement(bid, holder_a, fid, PlacementStatus::Deleting);
-    let actions =
-        engine.process_cooldowns(&[file], &[block_deleting], &[placement_deleting], delete_time, 1);
+    let actions = engine.process_cooldowns(
+        &[file],
+        &[block_deleting],
+        &[placement_deleting],
+        delete_time,
+        1,
+    );
     assert!(
-        actions.iter().any(|a| matches!(a, DeletionAction::CleanupPlacement { .. })),
+        actions
+            .iter()
+            .any(|a| matches!(a, DeletionAction::CleanupPlacement { .. })),
         "physical delete should happen at 8 weeks"
     );
 }
@@ -703,7 +765,13 @@ fn should_delete_now_monotone_in_time() {
 
     // Before owner cooldown: no actions.
     let before = ts(OWNER_DELETE_COOLDOWN_SECS - 1);
-    let actions_before = engine.process_cooldowns(&[file.clone()], &[block.clone()], &[placement.clone()], before, 1);
+    let actions_before = engine.process_cooldowns(
+        &[file.clone()],
+        &[block.clone()],
+        &[placement.clone()],
+        before,
+        1,
+    );
     assert!(
         actions_before.is_empty(),
         "expected no actions before owner cooldown, got {actions_before:?}"
@@ -722,7 +790,9 @@ fn should_delete_now_monotone_in_time() {
             1,
         );
         assert!(
-            actions.iter().any(|a| matches!(a, DeletionAction::SendDropNotice { .. })),
+            actions
+                .iter()
+                .any(|a| matches!(a, DeletionAction::SendDropNotice { .. })),
             "expected SendDropNotice at extra_weeks={extra_weeks}, got {actions:?}"
         );
     }

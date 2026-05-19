@@ -30,12 +30,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use syncback_core::cluster::{derive_master_key, master_identity, ClusterState};
+use syncback_core::cluster::{ClusterState, derive_master_key, master_identity};
 use syncback_core::db::Db;
 use syncback_core::messages::{
-    BoardSyncMsg, PeerAnnounceMsg, PosHashChallengeMsg,
-    RestoreRequestMsg, SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolRejectMsg,
-    SymbolTransferMsg,
+    BoardSyncMsg, PeerAnnounceMsg, PosHashChallengeMsg, RestoreRequestMsg, SymbolAcceptMsg,
+    SymbolDropNoticeMsg, SymbolRejectMsg, SymbolTransferMsg,
 };
 use syncback_core::types::{
     DeviceId, FileId, HoldingRecord, HoldingStatus, IdentityPub, PlacementStatus, SourceBlockId,
@@ -44,7 +43,7 @@ use syncback_core::types::{
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-use super::{esi_list_to_ranges, ranges_to_esi_list, AcceptedOffer, Processor};
+use super::{AcceptedOffer, Processor, esi_list_to_ranges, ranges_to_esi_list};
 use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
 use crate::daemon::network::swarm::{SwarmConfig, SwarmHandle};
 use crate::daemon::relay::{InboundMessage, RelayPost, SyncTrigger};
@@ -90,8 +89,7 @@ async fn make_swarm() -> Arc<SwarmHandle> {
         .expect("derive_device_key for swarm helper");
     let device_id = DeviceId(device_key.verifying_key().to_bytes());
     let now = Timestamp::now();
-    let device_cert =
-        syncback_core::cluster::issue_device_certificate(&master_key, device_id, now);
+    let device_cert = syncback_core::cluster::issue_device_certificate(&master_key, device_id, now);
     let cfg = SwarmConfig {
         device_signing_key: device_key,
         master_signing_key: master_key,
@@ -113,7 +111,11 @@ async fn make_swarm() -> Arc<SwarmHandle> {
 async fn make_processor(
     db: Db,
     holdings_dir: &TempDir,
-) -> (Processor, mpsc::Receiver<RepairTrigger>, mpsc::Receiver<SyncTrigger>) {
+) -> (
+    Processor,
+    mpsc::Receiver<RepairTrigger>,
+    mpsc::Receiver<SyncTrigger>,
+) {
     make_processor_with_quota(db, holdings_dir, u64::MAX, u64::MAX).await
 }
 
@@ -122,7 +124,11 @@ async fn make_processor_with_quota(
     holdings_dir: &TempDir,
     soft_quota_bytes: u64,
     hard_quota_bytes: u64,
-) -> (Processor, mpsc::Receiver<RepairTrigger>, mpsc::Receiver<SyncTrigger>) {
+) -> (
+    Processor,
+    mpsc::Receiver<RepairTrigger>,
+    mpsc::Receiver<SyncTrigger>,
+) {
     let (repair_tx, repair_rx) = mpsc::channel::<RepairTrigger>(16);
     let (relay_sync_tx, relay_sync_rx) = mpsc::channel::<SyncTrigger>(16);
 
@@ -135,11 +141,7 @@ async fn make_processor_with_quota(
     let device_id = DeviceId(device_signing_key.verifying_key().to_bytes());
     let now = Timestamp::now();
 
-    let cert = syncback_core::cluster::issue_device_certificate(
-        &master_key,
-        device_id,
-        now,
-    );
+    let cert = syncback_core::cluster::issue_device_certificate(&master_key, device_id, now);
     let cluster_state = ClusterState::init(db.clone(), own_identity, cert, now, now)
         .expect("ClusterState::init failed");
     let cluster_state = Arc::new(Mutex::new(cluster_state));
@@ -190,7 +192,11 @@ async fn make_processor_with_pending(
     db: Db,
     holdings_dir: &TempDir,
     pending: crate::daemon::scheduler::PendingChallenges,
-) -> (Processor, mpsc::Receiver<RepairTrigger>, mpsc::Receiver<SyncTrigger>) {
+) -> (
+    Processor,
+    mpsc::Receiver<RepairTrigger>,
+    mpsc::Receiver<SyncTrigger>,
+) {
     let (repair_tx, repair_rx) = mpsc::channel::<RepairTrigger>(16);
     let (relay_sync_tx, relay_sync_rx) = mpsc::channel::<SyncTrigger>(16);
 
@@ -202,11 +208,7 @@ async fn make_processor_with_pending(
     let device_id = DeviceId(device_signing_key.verifying_key().to_bytes());
     let now = Timestamp::now();
 
-    let cert = syncback_core::cluster::issue_device_certificate(
-        &master_key,
-        device_id,
-        now,
-    );
+    let cert = syncback_core::cluster::issue_device_certificate(&master_key, device_id, now);
     let cluster_state = ClusterState::init(db.clone(), own_identity, cert, now, now)
         .expect("ClusterState::init failed");
     let cluster_state = Arc::new(Mutex::new(cluster_state));
@@ -307,7 +309,8 @@ async fn symbol_accept_updates_backup_event() {
     let master_key = derive_master_key(&[42u8; 64]).unwrap();
     let own_identity = master_identity(&master_key);
     let device_seed = [1u8; 32];
-    let device_signing_key = syncback_core::cluster::derive_device_key(&[42u8; 64], &device_seed).unwrap();
+    let device_signing_key =
+        syncback_core::cluster::derive_device_key(&[42u8; 64], &device_seed).unwrap();
     let device_id = DeviceId(device_signing_key.verifying_key().to_bytes());
     let now = Timestamp::now();
     let cert = syncback_core::cluster::issue_device_certificate(&master_key, device_id, now);
@@ -315,7 +318,10 @@ async fn symbol_accept_updates_backup_event() {
     let cluster_state = Arc::new(Mutex::new(cluster_state));
     let cluster_sync = Arc::new(ClusterSyncManager::new(
         db.clone(),
-        ClusterSyncConfig { our_device_id: device_id, batch_size: 1000 },
+        ClusterSyncConfig {
+            our_device_id: device_id,
+            batch_size: 1000,
+        },
         cluster_state,
     ));
     let swarm = make_swarm().await;
@@ -356,7 +362,10 @@ async fn symbol_accept_updates_backup_event() {
         timestamp: Timestamp::now(),
     };
 
-    processor.handle_symbol_accept(holder, accept).await.unwrap();
+    processor
+        .handle_symbol_accept(holder, accept)
+        .await
+        .unwrap();
 
     let event = backup_event_rx
         .try_recv()
@@ -381,8 +390,7 @@ async fn symbol_accept_updates_backup_event() {
 async fn symbol_reject_does_not_create_placement() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_identity(8);
     let block_id = make_block_id(8);
@@ -623,7 +631,8 @@ async fn handle_pos_hash_challenge_responds_with_chain_hash_when_symbols_held() 
         received_at: Timestamp::now(),
         delete_requested_at: None,
         drop_notice_sent_at: None,
-    }).unwrap();
+    })
+    .unwrap();
 
     // Write the symbol file manually.
     let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
@@ -652,11 +661,15 @@ async fn handle_pos_hash_challenge_responds_with_chain_hash_when_symbols_held() 
             // Verify the chain hash is correct (challenge_id is [99u8; 16] from above).
             let expected_hash = syncback_core::pos::compute_chain_hash(
                 &challenge_id,
-                &[(esi, symbol_data.as_slice())]
-            ).expect("compute_chain_hash");
+                &[(esi, symbol_data.as_slice())],
+            )
+            .expect("compute_chain_hash");
             assert_eq!(resp.chain_hash, expected_hash);
         }
-        other => panic!("expected PosHashResponse, got {:?}", std::mem::discriminant(&other)),
+        other => panic!(
+            "expected PosHashResponse, got {:?}",
+            std::mem::discriminant(&other)
+        ),
     }
 }
 
@@ -683,7 +696,8 @@ async fn handle_pos_hash_challenge_sends_nack_when_symbol_not_held() {
         received_at: Timestamp::now(),
         delete_requested_at: None,
         drop_notice_sent_at: None,
-    }).unwrap();
+    })
+    .unwrap();
 
     let challenge = PosHashChallengeMsg {
         v: 1,
@@ -705,7 +719,10 @@ async fn handle_pos_hash_challenge_sends_nack_when_symbol_not_held() {
             assert_eq!(nack.first_missing_esi, esi);
             assert_eq!(nack.source_block_id, block_id);
         }
-        other => panic!("expected PosHashNack, got {:?}", std::mem::discriminant(&other)),
+        other => panic!(
+            "expected PosHashNack, got {:?}",
+            std::mem::discriminant(&other)
+        ),
     }
 }
 
@@ -713,10 +730,10 @@ async fn handle_pos_hash_challenge_sends_nack_when_symbol_not_held() {
 
 #[tokio::test]
 async fn handle_pos_hash_nack_marks_alive_placement_lost_and_triggers_repair() {
+    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
     use std::collections::HashMap;
     use syncback_core::cluster::{derive_master_key, master_identity};
     use syncback_core::messages::build_pos_hash_nack;
-    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
@@ -749,8 +766,7 @@ async fn handle_pos_hash_nack_marks_alive_placement_lost_and_triggers_repair() {
     )]
     .into_iter()
     .collect();
-    let pending: PendingChallenges =
-        std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
+    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
 
     let (processor, mut repair_rx, _relay_rx) =
         make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
@@ -792,8 +808,7 @@ async fn handle_pos_hash_nack_marks_alive_placement_lost_and_triggers_repair() {
 async fn handle_pos_hash_nack_is_noop_for_lost_placement() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_device_id(1);
     let block_id = make_block_id(2);
@@ -828,8 +843,7 @@ async fn handle_pos_hash_nack_is_noop_for_lost_placement() {
 async fn forged_symbol_dropped_is_rejected_and_no_repair_triggered() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, mut repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, mut repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let victim_key = ed25519_dalek::SigningKey::from_bytes(&[0x66u8; 32]);
     let victim = DeviceId(victim_key.verifying_key().to_bytes());
@@ -869,7 +883,7 @@ async fn forged_symbol_dropped_is_rejected_and_no_repair_triggered() {
 /// SYMBOL_OFFER_EXPIRY_SECS and leaves fresh entries alone.
 #[tokio::test]
 async fn prune_expired_accepted_offers_drops_stale_keeps_fresh() {
-    use super::{prune_expired_accepted_offers, AcceptedOffer};
+    use super::{AcceptedOffer, prune_expired_accepted_offers};
     use syncback_core::constants::SYMBOL_OFFER_EXPIRY_SECS;
 
     let map = super::make_empty_accepted_offers();
@@ -918,8 +932,7 @@ async fn prune_expired_accepted_offers_drops_stale_keeps_fresh() {
 async fn handle_symbol_dropped_marks_alive_placement_lost() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_device_id(3);
     let block_id = make_block_id(4);
@@ -948,18 +961,13 @@ async fn handle_symbol_dropped_marks_alive_placement_lost() {
 async fn handle_symbol_dropped_is_idempotent_for_deleting_placement() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_device_id(3);
     let block_id = make_block_id(4);
 
-    let placement = make_symbol_placement(
-        block_id,
-        holder,
-        vec![(10, 8)],
-        PlacementStatus::Deleting,
-    );
+    let placement =
+        make_symbol_placement(block_id, holder, vec![(10, 8)], PlacementStatus::Deleting);
     db.upsert_placement(&placement).unwrap();
 
     let dropped = syncback_core::messages::build_symbol_dropped(
@@ -979,8 +987,7 @@ async fn handle_symbol_dropped_is_idempotent_for_deleting_placement() {
 async fn handle_symbol_dropped_sends_repair_trigger() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, mut repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, mut repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     // Use a signing key whose public key equals the device_id, and register
     // the device → master mapping so signature verification can succeed.
@@ -1107,8 +1114,7 @@ async fn symbol_offer_accept_when_unlimited_quota() {
     // soft_quota=0 means "use disk-based limit" (effective = disk_free - reserve).
     // With reserve=0, any offer fitting in disk space is accepted.
     let (processor, _rx, _relay_rx) =
-        make_processor_with_quota(db.clone(), &holdings_dir, 0, 0)
-            .await;
+        make_processor_with_quota(db.clone(), &holdings_dir, 0, 0).await;
 
     let accept = processor
         .decide_symbol_offer(65_535) // one symbol — always fits
@@ -1250,8 +1256,7 @@ async fn restore_request_filters_by_esi_list() {
 async fn board_sync_forwards_to_relay_sync_tx() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, mut relay_sync_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _rx, mut relay_sync_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let from = make_identity(10);
     let msg = BoardSyncMsg {
@@ -1281,7 +1286,6 @@ fn make_signing_identity(seed: u8) -> (ed25519_dalek::SigningKey, IdentityPub) {
     let identity = IdentityPub(sk.verifying_key().to_bytes());
     (sk, identity)
 }
-
 
 fn make_signed_peer_announce(seed: u8) -> (PeerAnnounceMsg, IdentityPub) {
     use syncback_core::messages::build_peer_announce;
@@ -1428,7 +1432,6 @@ async fn symbol_reject_logs_without_error() {
 
 // ─── Phase 7.10: peer gossip on connect ───────────────────────────────────────
 
-
 #[tokio::test]
 async fn peer_announce_db_upsert_always_succeeds() {
     use syncback_core::messages::build_peer_announce;
@@ -1448,7 +1451,6 @@ async fn peer_announce_db_upsert_always_succeeds() {
     // New behavior: announce from unknown peer is silently ignored (no DeviceId registered).
     // We just verify the call succeeds without error.
 }
-
 
 #[tokio::test]
 async fn peer_announce_with_invalid_signature_is_rejected() {
@@ -1512,9 +1514,7 @@ async fn handle_system_state_backup_stores_blob_for_known_peer() {
         timestamp: now,
     };
 
-    processor
-        .handle_system_state_backup_inner(owner, msg)
-        .await;
+    processor.handle_system_state_backup_inner(owner, msg).await;
 
     let stored: Option<SystemStateBlobRecord> = db.get_system_state_blob(&owner).unwrap();
     assert!(stored.is_some(), "blob should have been stored in DB");
@@ -1542,7 +1542,10 @@ async fn handle_system_state_backup_rejects_unknown_peer() {
 
     // DB must remain empty — unknown peer must not be stored.
     let stored = db.get_system_state_blob(&stranger).unwrap();
-    assert!(stored.is_none(), "blob should not be stored for unknown peer");
+    assert!(
+        stored.is_none(),
+        "blob should not be stored for unknown peer"
+    );
 }
 
 #[tokio::test]
@@ -1580,9 +1583,7 @@ async fn handle_system_state_backup_ignores_empty_blob() {
         timestamp: now,
     };
 
-    processor
-        .handle_system_state_backup_inner(owner, msg)
-        .await;
+    processor.handle_system_state_backup_inner(owner, msg).await;
 
     // Empty blob must not be stored.
     let stored = db.get_system_state_blob(&owner).unwrap();
@@ -1724,7 +1725,10 @@ async fn system_state_backup_with_blob_over_cap_rejected() {
 
     let ack = processor.handle_system_state_backup_inner(owner, msg).await;
 
-    assert!(!ack.stored, "blob over cap should be rejected (stored=false)");
+    assert!(
+        !ack.stored,
+        "blob over cap should be rejected (stored=false)"
+    );
     let stored = db.get_system_state_blob(&owner).unwrap();
     assert!(stored.is_none(), "blob over cap must not be written to DB");
 }
@@ -1757,9 +1761,15 @@ async fn system_state_backup_unknown_peer_rejected_before_size_check() {
 
     let ack = processor.handle_system_state_backup_inner(owner, msg).await;
 
-    assert!(!ack.stored, "unknown peer must be rejected regardless of blob size");
+    assert!(
+        !ack.stored,
+        "unknown peer must be rejected regardless of blob size"
+    );
     let stored = db.get_system_state_blob(&owner).unwrap();
-    assert!(stored.is_none(), "unknown peer blob must not be written to DB");
+    assert!(
+        stored.is_none(),
+        "unknown peer blob must not be written to DB"
+    );
 }
 
 // ─── handle_system_state_request ──────────────────────────────────────────────
@@ -1793,7 +1803,6 @@ async fn handle_system_state_ack_logs_without_error() {
     );
 }
 
-
 // ─── handle_pos_hash_response ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1801,7 +1810,7 @@ async fn handle_pos_hash_response_pass_records_trust_and_updates_placement() {
     use std::collections::HashMap;
     use syncback_core::constants::INITIAL_TRUST_P;
     use syncback_core::messages::PosHashResponseMsg;
-    use syncback_core::pos::{compute_chain_hash, VerifyOutcome};
+    use syncback_core::pos::{VerifyOutcome, compute_chain_hash};
 
     use super::current_week_number_scaled;
     use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
@@ -1815,7 +1824,8 @@ async fn handle_pos_hash_response_pass_records_trust_and_updates_placement() {
 
     // Owner computes expected chain hash for ESI 0 with symbol data [0xAB; 64].
     let symbol_data = vec![0xABu8; 64];
-    let expected_hash = compute_chain_hash(&challenge_id, &[(0u32, symbol_data.as_slice())]).unwrap();
+    let expected_hash =
+        compute_chain_hash(&challenge_id, &[(0u32, symbol_data.as_slice())]).unwrap();
 
     // Build pending challenges map with one entry including the expected chain hash.
     let pending_map: HashMap<_, _> = [(
@@ -1831,8 +1841,7 @@ async fn handle_pos_hash_response_pass_records_trust_and_updates_placement() {
     )]
     .into_iter()
     .collect();
-    let pending: PendingChallenges =
-        std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
+    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
 
     let (processor, _repair_rx, _relay_rx) =
         make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
@@ -1841,7 +1850,8 @@ async fn handle_pos_hash_response_pass_records_trust_and_updates_placement() {
     db.upsert_peer(&make_peer_record(holder_id)).unwrap();
 
     // Insert Alive placement covering ESI 0.
-    let placement = make_symbol_placement(block_id, holder_id, vec![(0, 1)], PlacementStatus::Alive);
+    let placement =
+        make_symbol_placement(block_id, holder_id, vec![(0, 1)], PlacementStatus::Alive);
     db.upsert_placement(&placement).unwrap();
 
     // Holder sends correct chain hash.
@@ -1889,7 +1899,7 @@ async fn handle_pos_hash_response_pass_records_trust_and_updates_placement() {
 async fn handle_pos_hash_response_fail_marks_lost_and_triggers_repair() {
     use std::collections::HashMap;
     use syncback_core::messages::PosHashResponseMsg;
-    use syncback_core::pos::{compute_chain_hash, VerifyOutcome};
+    use syncback_core::pos::{VerifyOutcome, compute_chain_hash};
 
     use crate::daemon::repair::RepairTrigger;
     use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
@@ -1903,7 +1913,8 @@ async fn handle_pos_hash_response_fail_marks_lost_and_triggers_repair() {
 
     // Owner's expected chain hash for correct symbol data.
     let correct_symbol = vec![0xCCu8; 64];
-    let expected_hash = compute_chain_hash(&challenge_id, &[(0u32, correct_symbol.as_slice())]).unwrap();
+    let expected_hash =
+        compute_chain_hash(&challenge_id, &[(0u32, correct_symbol.as_slice())]).unwrap();
 
     let pending_map: HashMap<_, _> = [(
         (block_id, holder_id),
@@ -1918,8 +1929,7 @@ async fn handle_pos_hash_response_fail_marks_lost_and_triggers_repair() {
     )]
     .into_iter()
     .collect();
-    let pending: PendingChallenges =
-        std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
+    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
 
     let (processor, mut repair_rx, _relay_rx) =
         make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
@@ -1927,12 +1937,14 @@ async fn handle_pos_hash_response_fail_marks_lost_and_triggers_repair() {
     // Insert PeerRecord.
     db.upsert_peer(&make_peer_record(holder_id)).unwrap();
 
-    let placement = make_symbol_placement(block_id, holder_id, vec![(0, 1)], PlacementStatus::Alive);
+    let placement =
+        make_symbol_placement(block_id, holder_id, vec![(0, 1)], PlacementStatus::Alive);
     db.upsert_placement(&placement).unwrap();
 
     // Holder sends WRONG chain hash (corrupted symbol).
     let corrupt_symbol = vec![0x00u8; 64];
-    let wrong_hash = compute_chain_hash(&challenge_id, &[(0u32, corrupt_symbol.as_slice())]).unwrap();
+    let wrong_hash =
+        compute_chain_hash(&challenge_id, &[(0u32, corrupt_symbol.as_slice())]).unwrap();
 
     let response = PosHashResponseMsg {
         v: 1,
@@ -1991,8 +2003,7 @@ async fn handle_pos_hash_response_fail_marks_lost_and_triggers_repair() {
 async fn handle_delete_marks_holding_for_deletion() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2013,7 +2024,8 @@ async fn handle_delete_marks_holding_for_deletion() {
     db.upsert_holding(&holding).unwrap();
 
     // Build a valid delete message.
-    let delete_msg = syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
+    let delete_msg =
+        syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
     processor.handle_delete(owner_id, delete_msg).await.unwrap();
 
     let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
@@ -2025,8 +2037,7 @@ async fn handle_delete_marks_holding_for_deletion() {
 async fn handle_delete_ignores_non_active_holding() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2046,7 +2057,8 @@ async fn handle_delete_ignores_non_active_holding() {
     };
     db.upsert_holding(&holding).unwrap();
 
-    let delete_msg = syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
+    let delete_msg =
+        syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
     processor.handle_delete(owner_id, delete_msg).await.unwrap();
 
     // Status should not change.
@@ -2058,15 +2070,15 @@ async fn handle_delete_ignores_non_active_holding() {
 async fn handle_delete_ignores_no_holding() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
     let block_id = make_block_id(0xDF);
 
     // No holding in DB — should not panic.
-    let delete_msg = syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
+    let delete_msg =
+        syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
     processor.handle_delete(owner_id, delete_msg).await.unwrap();
 }
 
@@ -2074,8 +2086,7 @@ async fn handle_delete_ignores_no_holding() {
 async fn handle_delete_rejects_invalid_signature() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2096,7 +2107,8 @@ async fn handle_delete_rejects_invalid_signature() {
     db.upsert_holding(&holding).unwrap();
 
     // Sign with wrong key.
-    let delete_msg = syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &wrong_key);
+    let delete_msg =
+        syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &wrong_key);
     processor.handle_delete(owner_id, delete_msg).await.unwrap();
 
     // Holding should remain Active (bad sig rejected silently).
@@ -2110,8 +2122,7 @@ async fn handle_delete_rejects_invalid_signature() {
 async fn handle_cancel_delete_reverts_to_active() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2130,8 +2141,12 @@ async fn handle_cancel_delete_reverts_to_active() {
     };
     db.upsert_holding(&holding).unwrap();
 
-    let cancel_msg = syncback_core::messages::build_cancel_delete_msg(block_id, Timestamp::now(), &owner_key);
-    processor.handle_cancel_delete(owner_id, cancel_msg).await.unwrap();
+    let cancel_msg =
+        syncback_core::messages::build_cancel_delete_msg(block_id, Timestamp::now(), &owner_key);
+    processor
+        .handle_cancel_delete(owner_id, cancel_msg)
+        .await
+        .unwrap();
 
     let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
     assert_eq!(updated.status, HoldingStatus::Active);
@@ -2142,8 +2157,7 @@ async fn handle_cancel_delete_reverts_to_active() {
 async fn handle_cancel_delete_ignores_active_holding() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2162,8 +2176,12 @@ async fn handle_cancel_delete_ignores_active_holding() {
     };
     db.upsert_holding(&holding).unwrap();
 
-    let cancel_msg = syncback_core::messages::build_cancel_delete_msg(block_id, Timestamp::now(), &owner_key);
-    processor.handle_cancel_delete(owner_id, cancel_msg).await.unwrap();
+    let cancel_msg =
+        syncback_core::messages::build_cancel_delete_msg(block_id, Timestamp::now(), &owner_key);
+    processor
+        .handle_cancel_delete(owner_id, cancel_msg)
+        .await
+        .unwrap();
 
     // Should remain Active (no-op).
     let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
@@ -2174,8 +2192,7 @@ async fn handle_cancel_delete_ignores_active_holding() {
 async fn handle_cancel_delete_rejects_bad_sig() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2195,8 +2212,12 @@ async fn handle_cancel_delete_rejects_bad_sig() {
     };
     db.upsert_holding(&holding).unwrap();
 
-    let cancel_msg = syncback_core::messages::build_cancel_delete_msg(block_id, Timestamp::now(), &wrong_key);
-    processor.handle_cancel_delete(owner_id, cancel_msg).await.unwrap();
+    let cancel_msg =
+        syncback_core::messages::build_cancel_delete_msg(block_id, Timestamp::now(), &wrong_key);
+    processor
+        .handle_cancel_delete(owner_id, cancel_msg)
+        .await
+        .unwrap();
 
     // Should remain MarkedForDelete (bad sig).
     let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
@@ -2209,8 +2230,7 @@ async fn handle_cancel_delete_rejects_bad_sig() {
 async fn handle_symbol_drop_notice_does_not_panic() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_identity(0xF0);
     let notice = SymbolDropNoticeMsg {
@@ -2242,8 +2262,8 @@ fn make_source_block(block_id: SourceBlockId) -> SourceBlockRecord {
         overhead: Some(1.5),
         drop_notice_sent_at: None,
         importance: 0.5,
-        current_alive: 0,           // will be updated by handler
-        current_reliability: 0.0,   // will be updated by handler
+        current_alive: 0,         // will be updated by handler
+        current_reliability: 0.0, // will be updated by handler
         target_reliability: 0.9,
         last_attempted_at: None,
         last_pool_signature: 0,
@@ -2271,8 +2291,7 @@ fn make_drop_notice(block_id: SourceBlockId, esi_ranges: Vec<(u32, u32)>) -> Sym
 async fn handle_symbol_drop_notice_transitions_placement_to_lost() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let holder_master = make_identity(0xA1);
     let holder_device = make_device_id(0xA1);
@@ -2281,13 +2300,25 @@ async fn handle_symbol_drop_notice_transitions_placement_to_lost() {
     register_holder(&db, holder_master, holder_device);
     let block = make_source_block(block_id);
     db.upsert_source_block(&block).unwrap();
-    let placement = make_symbol_placement(block_id, holder_device, vec![(0, 10)], PlacementStatus::Alive);
+    let placement = make_symbol_placement(
+        block_id,
+        holder_device,
+        vec![(0, 10)],
+        PlacementStatus::Alive,
+    );
     db.upsert_placement(&placement).unwrap();
 
     processor.handle_symbol_drop_notice(holder_master, make_drop_notice(block_id, vec![(0, 10)]));
 
-    let updated = db.get_placement(&block_id, &holder_device).unwrap().unwrap();
-    assert_eq!(updated.status, PlacementStatus::Lost, "placement must transition to Lost");
+    let updated = db
+        .get_placement(&block_id, &holder_device)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        updated.status,
+        PlacementStatus::Lost,
+        "placement must transition to Lost"
+    );
 }
 
 /// Test: after DropNotice, current_alive is decremented from its pre-notice value.
@@ -2295,8 +2326,7 @@ async fn handle_symbol_drop_notice_transitions_placement_to_lost() {
 async fn handle_symbol_drop_notice_decrements_current_alive() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let master_a = make_identity(0xA2);
     let device_a = make_device_id(0xA2);
@@ -2310,8 +2340,20 @@ async fn handle_symbol_drop_notice_decrements_current_alive() {
     let mut block = make_source_block(block_id);
     block.current_alive = 2; // two alive holders initially
     db.upsert_source_block(&block).unwrap();
-    db.upsert_placement(&make_symbol_placement(block_id, device_a, vec![(0, 10)], PlacementStatus::Alive)).unwrap();
-    db.upsert_placement(&make_symbol_placement(block_id, device_b, vec![(10, 10)], PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_symbol_placement(
+        block_id,
+        device_a,
+        vec![(0, 10)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_symbol_placement(
+        block_id,
+        device_b,
+        vec![(10, 10)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
     // Drop notice from holder A.
     processor.handle_symbol_drop_notice(master_a, make_drop_notice(block_id, vec![(0, 10)]));
@@ -2328,8 +2370,7 @@ async fn handle_symbol_drop_notice_decrements_current_alive() {
 async fn handle_symbol_drop_notice_recomputes_current_reliability() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let master_a = make_identity(0xC1);
     let device_a = make_device_id(0xC1);
@@ -2345,8 +2386,20 @@ async fn handle_symbol_drop_notice_recomputes_current_reliability() {
     // Pre-set a high reliability so we can detect it drops.
     block.current_reliability = 0.99;
     db.upsert_source_block(&block).unwrap();
-    db.upsert_placement(&make_symbol_placement(block_id, device_a, vec![(0, 20)], PlacementStatus::Alive)).unwrap();
-    db.upsert_placement(&make_symbol_placement(block_id, device_b, vec![(20, 20)], PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_symbol_placement(
+        block_id,
+        device_a,
+        vec![(0, 20)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_symbol_placement(
+        block_id,
+        device_b,
+        vec![(20, 20)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
     processor.handle_symbol_drop_notice(master_a, make_drop_notice(block_id, vec![(0, 20)]));
 
@@ -2369,8 +2422,7 @@ async fn handle_symbol_drop_notice_recomputes_current_reliability() {
 async fn handle_symbol_drop_notice_idempotent_on_duplicate() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let master_a = make_identity(0xD1);
     let device_a = make_device_id(0xD1);
@@ -2384,8 +2436,20 @@ async fn handle_symbol_drop_notice_idempotent_on_duplicate() {
     let mut block = make_source_block(block_id);
     block.current_alive = 2;
     db.upsert_source_block(&block).unwrap();
-    db.upsert_placement(&make_symbol_placement(block_id, device_a, vec![(0, 10)], PlacementStatus::Alive)).unwrap();
-    db.upsert_placement(&make_symbol_placement(block_id, device_b, vec![(10, 10)], PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_symbol_placement(
+        block_id,
+        device_a,
+        vec![(0, 10)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_symbol_placement(
+        block_id,
+        device_b,
+        vec![(10, 10)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
     // Send the same notice twice.
     let notice = make_drop_notice(block_id, vec![(0, 10)]);
@@ -2404,8 +2468,7 @@ async fn handle_symbol_drop_notice_idempotent_on_duplicate() {
 async fn handle_symbol_drop_notice_source_block_record_missing_logs_and_returns() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     // Register a holder device so the master-to-device resolution succeeds,
     // but insert no SourceBlockRecord for this block_id.
@@ -2415,14 +2478,16 @@ async fn handle_symbol_drop_notice_source_block_record_missing_logs_and_returns(
     let block_id = make_block_id(0xE2);
     // Insert a placement so find_placement succeeds and mark_placement_lost is called,
     // but no SourceBlockRecord exists — verifies the "block not found" warn path.
-    let placement = make_symbol_placement(block_id, holder_device, vec![(0, 10)], PlacementStatus::Alive);
+    let placement = make_symbol_placement(
+        block_id,
+        holder_device,
+        vec![(0, 10)],
+        PlacementStatus::Alive,
+    );
     db.upsert_placement(&placement).unwrap();
 
     // Should not panic.
-    processor.handle_symbol_drop_notice(
-        holder_master,
-        make_drop_notice(block_id, vec![(0, 10)]),
-    );
+    processor.handle_symbol_drop_notice(holder_master, make_drop_notice(block_id, vec![(0, 10)]));
     // No assertion needed — the test passes if no panic occurs.
 }
 
@@ -2431,8 +2496,7 @@ async fn handle_symbol_drop_notice_source_block_record_missing_logs_and_returns(
 async fn handle_symbol_drop_notice_unknown_holder_logs_and_returns() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let block_id = make_block_id(0xF1);
     let mut block = make_source_block(block_id);
@@ -2443,10 +2507,7 @@ async fn handle_symbol_drop_notice_unknown_holder_logs_and_returns() {
     let holder_master = make_identity(0xF2);
 
     // Should not panic. Placement state should be unchanged (no placement inserted).
-    processor.handle_symbol_drop_notice(
-        holder_master,
-        make_drop_notice(block_id, vec![(0, 10)]),
-    );
+    processor.handle_symbol_drop_notice(holder_master, make_drop_notice(block_id, vec![(0, 10)]));
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
     assert_eq!(
@@ -2460,8 +2521,7 @@ async fn handle_symbol_drop_notice_unknown_holder_logs_and_returns() {
 async fn handle_symbol_drop_notice_placement_already_lost_is_noop() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let holder_master = make_identity(0x01);
     let holder_device = make_device_id(0x01);
@@ -2476,9 +2536,21 @@ async fn handle_symbol_drop_notice_placement_already_lost_is_noop() {
     block.current_alive = 1; // only the other placement is alive
     db.upsert_source_block(&block).unwrap();
     // Holder's placement is already Lost.
-    db.upsert_placement(&make_symbol_placement(block_id, holder_device, vec![(0, 10)], PlacementStatus::Lost)).unwrap();
+    db.upsert_placement(&make_symbol_placement(
+        block_id,
+        holder_device,
+        vec![(0, 10)],
+        PlacementStatus::Lost,
+    ))
+    .unwrap();
     // Other holder is Alive.
-    db.upsert_placement(&make_symbol_placement(block_id, other_device, vec![(10, 10)], PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_symbol_placement(
+        block_id,
+        other_device,
+        vec![(10, 10)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
     // DropNotice for the already-Lost placement.
     processor.handle_symbol_drop_notice(holder_master, make_drop_notice(block_id, vec![(0, 10)]));
@@ -2496,8 +2568,7 @@ async fn handle_symbol_drop_notice_block_becomes_eligible_for_worker() {
     use std::time::Duration;
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let master_a = make_identity(0x10);
     let device_a = make_device_id(0x10);
@@ -2516,8 +2587,20 @@ async fn handle_symbol_drop_notice_block_becomes_eligible_for_worker() {
     db.upsert_source_block(&block).unwrap();
     // Each holder has exactly k symbols (10 symbols, k=10, k_eff=13).
     // With one holder: alive_symbols=10 < k_eff=13 → reliability drops to near-zero.
-    db.upsert_placement(&make_symbol_placement(block_id, device_a, vec![(0, 10)], PlacementStatus::Alive)).unwrap();
-    db.upsert_placement(&make_symbol_placement(block_id, device_b, vec![(10, 10)], PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_symbol_placement(
+        block_id,
+        device_a,
+        vec![(0, 10)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_symbol_placement(
+        block_id,
+        device_b,
+        vec![(10, 10)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
     // Confirm block is NOT eligible before DropNotice (reliability >= target).
     let before = db
@@ -2563,15 +2646,21 @@ async fn dispatch_relay_pos_hash_challenge_sends_response_via_board() {
     let master_key = syncback_core::cluster::derive_master_key(&[42u8; 64]).unwrap();
     let own_identity = syncback_core::cluster::master_identity(&master_key);
     let relay_device_seed = [1u8; 32];
-    let relay_device_key = syncback_core::cluster::derive_device_key(&[42u8; 64], &relay_device_seed).unwrap();
+    let relay_device_key =
+        syncback_core::cluster::derive_device_key(&[42u8; 64], &relay_device_seed).unwrap();
     let device_id = DeviceId(relay_device_key.verifying_key().to_bytes());
     let now = Timestamp::now();
     let cert = syncback_core::cluster::issue_device_certificate(&master_key, device_id, now);
-    let cluster_state = syncback_core::cluster::ClusterState::init(db.clone(), own_identity, cert, now, now).unwrap();
+    let cluster_state =
+        syncback_core::cluster::ClusterState::init(db.clone(), own_identity, cert, now, now)
+            .unwrap();
     let cluster_state = Arc::new(std::sync::Mutex::new(cluster_state));
     let cluster_sync = Arc::new(ClusterSyncManager::new(
         db.clone(),
-        ClusterSyncConfig { our_device_id: device_id, batch_size: 1000 },
+        ClusterSyncConfig {
+            our_device_id: device_id,
+            batch_size: 1000,
+        },
         cluster_state,
     ));
     let swarm = make_swarm().await;
@@ -2581,12 +2670,21 @@ async fn dispatch_relay_pos_hash_challenge_sends_response_via_board() {
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let processor = Processor::new(
-        db.clone(), own_identity, repair_tx, cluster_sync,
+        db.clone(),
+        own_identity,
+        repair_tx,
+        cluster_sync,
         holdings_dir.path().to_path_buf(),
-        swarm, relay_sync_tx, u64::MAX, u64::MAX,
-        holdings_dir.path().to_path_buf(), 0,
-        backup_event_tx, 1,
-        pending, relay_post_tx,
+        swarm,
+        relay_sync_tx,
+        u64::MAX,
+        u64::MAX,
+        holdings_dir.path().to_path_buf(),
+        0,
+        backup_event_tx,
+        1,
+        pending,
+        relay_post_tx,
         None, // cluster_state: not needed for this test
         syncback_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
@@ -2612,7 +2710,8 @@ async fn dispatch_relay_pos_hash_challenge_sends_response_via_board() {
         received_at: Timestamp::now(),
         delete_requested_at: None,
         drop_notice_sent_at: None,
-    }).unwrap();
+    })
+    .unwrap();
     let challenge = PosHashChallengeMsg {
         v: 1,
         challenge_id: [0xCC; 16],
@@ -2634,7 +2733,9 @@ async fn dispatch_relay_pos_hash_challenge_sends_response_via_board() {
     processor.dispatch_relay(relay_msg).await;
 
     // Check that a pos_hash_response was posted to relay_post_tx.
-    let post = relay_post_rx.try_recv().expect("expected a RelayPost for pos_hash_response");
+    let post = relay_post_rx
+        .try_recv()
+        .expect("expected a RelayPost for pos_hash_response");
     assert_eq!(post.msg_type, "pos_hash_response");
     assert_eq!(post.target, Some(challenger));
 }
@@ -2643,8 +2744,7 @@ async fn dispatch_relay_pos_hash_challenge_sends_response_via_board() {
 async fn dispatch_relay_delete_marks_holding() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2663,7 +2763,8 @@ async fn dispatch_relay_delete_marks_holding() {
     };
     db.upsert_holding(&holding).unwrap();
 
-    let delete_msg = syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
+    let delete_msg =
+        syncback_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
     let payload = syncback_core::messages::to_cbor(&delete_msg).unwrap();
     let relay_msg = InboundMessage {
         from: owner_id,
@@ -2690,32 +2791,30 @@ async fn dispatch_relay_delete_marks_holding() {
 async fn make_processor_with_cluster_state(
     db: Db,
     holdings_dir: &TempDir,
-) -> (
-    Processor,
-    Arc<Mutex<ClusterState>>,
-    IdentityPub,
-) {
+) -> (Processor, Arc<Mutex<ClusterState>>, IdentityPub) {
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
     let (relay_sync_tx, _relay_sync_rx) = mpsc::channel::<SyncTrigger>(16);
 
     let master_key = derive_master_key(&[0xAAu8; 64]).expect("derive_master_key");
     let own_identity = master_identity(&master_key);
     let device_seed_a = [0x01u8; 32];
-    let device_signing_key_a = syncback_core::cluster::derive_device_key(&[0xAAu8; 64], &device_seed_a)
-        .expect("derive_device_key_a");
+    let device_signing_key_a =
+        syncback_core::cluster::derive_device_key(&[0xAAu8; 64], &device_seed_a)
+            .expect("derive_device_key_a");
     let device_id_a = DeviceId(device_signing_key_a.verifying_key().to_bytes());
     let now = Timestamp::now();
 
-    let cert_a = syncback_core::cluster::issue_device_certificate(
-        &master_key, device_id_a, now,
-    );
-    let cluster_state = ClusterState::init(db.clone(), own_identity, cert_a, now, now)
-        .expect("ClusterState::init");
+    let cert_a = syncback_core::cluster::issue_device_certificate(&master_key, device_id_a, now);
+    let cluster_state =
+        ClusterState::init(db.clone(), own_identity, cert_a, now, now).expect("ClusterState::init");
     let cluster_state = Arc::new(Mutex::new(cluster_state));
 
     let cluster_sync = Arc::new(ClusterSyncManager::new(
         db.clone(),
-        ClusterSyncConfig { our_device_id: device_id_a, batch_size: 1000 },
+        ClusterSyncConfig {
+            our_device_id: device_id_a,
+            batch_size: 1000,
+        },
         cluster_state.clone(),
     ));
 
@@ -2823,7 +2922,10 @@ async fn cluster_device_not_added_when_different_master_identity() {
         .try_auto_add_cluster_device(Some(other_identity), Some(cert_x))
         .await;
 
-    assert!(!added, "device from different master must not be auto-added");
+    assert!(
+        !added,
+        "device from different master must not be auto-added"
+    );
 
     // Only the original device_A (0x01*16) should be present.
     let devices = cluster_state.lock().unwrap();
@@ -2864,7 +2966,10 @@ async fn cluster_device_auto_add_idempotent_when_already_registered() {
     let second = processor
         .try_auto_add_cluster_device(Some(own_identity), Some(cert_b))
         .await;
-    assert!(!second, "second auto-add must return false (already registered)");
+    assert!(
+        !second,
+        "second auto-add must return false (already registered)"
+    );
 
     // Only 2 devices total: original device_A + device_B.
     let devices = cluster_state.lock().unwrap();
@@ -2917,8 +3022,7 @@ async fn revocation_broadcast_marks_device_key_revoked() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
 
-    let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     // Build peer master key and identity.
     let peer_master_key = derive_master_key(&[0x55u8; 64]).expect("derive_master_key");
@@ -2949,14 +3053,12 @@ async fn revocation_broadcast_marks_device_key_revoked() {
         x25519_pub: None,
     };
     db.upsert_peer(&peer_record).expect("upsert_peer");
-    db.set_master_for_device(&known_device_id, &peer_identity).unwrap();
+    db.set_master_for_device(&known_device_id, &peer_identity)
+        .unwrap();
 
     // Build a valid RevocationBroadcast.
-    let device_cert = syncback_core::cluster::issue_device_certificate(
-        &peer_master_key,
-        device_id,
-        now,
-    );
+    let device_cert =
+        syncback_core::cluster::issue_device_certificate(&peer_master_key, device_id, now);
     let new_epoch = syncback_core::cluster::EpochCounter(1);
     let revocation =
         syncback_core::cluster::issue_revocation(&peer_master_key, device_id, now, new_epoch);
@@ -2970,7 +3072,10 @@ async fn revocation_broadcast_marks_device_key_revoked() {
         .await
         .expect("handle_revocation_broadcast must succeed");
 
-    let updated = db.get_peer(&known_device_id).expect("get_peer").expect("peer must exist");
+    let updated = db
+        .get_peer(&known_device_id)
+        .expect("get_peer")
+        .expect("peer must exist");
     assert!(
         updated.revoked_device_pub_keys.contains(&device_id.0),
         "device pub key (= device_id.0) must be in revoked list"
@@ -2988,8 +3093,7 @@ async fn revocation_broadcast_idempotent_on_duplicate() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
 
-    let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0x66u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -3017,13 +3121,11 @@ async fn revocation_broadcast_idempotent_on_duplicate() {
     };
     peer_record.revoked_device_pub_keys.push(device_id.0);
     db.upsert_peer(&peer_record).expect("upsert_peer");
-    db.set_master_for_device(&known_device_id, &peer_identity).unwrap();
+    db.set_master_for_device(&known_device_id, &peer_identity)
+        .unwrap();
 
-    let device_cert = syncback_core::cluster::issue_device_certificate(
-        &peer_master_key,
-        device_id,
-        now,
-    );
+    let device_cert =
+        syncback_core::cluster::issue_device_certificate(&peer_master_key, device_id, now);
     let revocation = syncback_core::cluster::issue_revocation(
         &peer_master_key,
         device_id,
@@ -3040,9 +3142,16 @@ async fn revocation_broadcast_idempotent_on_duplicate() {
         .await
         .expect("duplicate broadcast must not error");
 
-    let updated = db.get_peer(&known_device_id).expect("get_peer").expect("peer must exist");
+    let updated = db
+        .get_peer(&known_device_id)
+        .expect("get_peer")
+        .expect("peer must exist");
     assert_eq!(
-        updated.revoked_device_pub_keys.iter().filter(|&&k| k == device_id.0).count(),
+        updated
+            .revoked_device_pub_keys
+            .iter()
+            .filter(|&&k| k == device_id.0)
+            .count(),
         1,
         "revoked key must appear exactly once"
     );
@@ -3059,8 +3168,7 @@ async fn revocation_broadcast_invalid_device_cert_rejected() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
 
-    let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0x77u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -3090,14 +3198,11 @@ async fn revocation_broadcast_invalid_device_cert_rejected() {
         x25519_pub: None,
     };
     db.upsert_peer(&peer_record).expect("upsert_peer");
-    db.set_master_for_device(&known_device_id_77, &peer_identity).unwrap();
+    db.set_master_for_device(&known_device_id_77, &peer_identity)
+        .unwrap();
 
     // DeviceCertificate signed by attacker, but from = real peer identity.
-    let bad_cert = syncback_core::cluster::issue_device_certificate(
-        &attacker_key,
-        device_id,
-        now,
-    );
+    let bad_cert = syncback_core::cluster::issue_device_certificate(&attacker_key, device_id, now);
     let revocation = syncback_core::cluster::issue_revocation(
         &peer_master_key,
         device_id,
@@ -3115,7 +3220,10 @@ async fn revocation_broadcast_invalid_device_cert_rejected() {
         .await
         .expect("invalid cert must not propagate error");
 
-    let updated = db.get_peer(&known_device_id_77).expect("get_peer").expect("peer must exist");
+    let updated = db
+        .get_peer(&known_device_id_77)
+        .expect("get_peer")
+        .expect("peer must exist");
     assert!(
         updated.revoked_device_pub_keys.is_empty(),
         "forged broadcast must not update revoked list"
@@ -3133,8 +3241,7 @@ async fn revocation_broadcast_device_id_mismatch_rejected() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
 
-    let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0x99u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -3165,14 +3272,12 @@ async fn revocation_broadcast_device_id_mismatch_rejected() {
         x25519_pub: None,
     };
     db.upsert_peer(&peer_record).expect("upsert_peer");
-    db.set_master_for_device(&known_device_id_99, &peer_identity).unwrap();
+    db.set_master_for_device(&known_device_id_99, &peer_identity)
+        .unwrap();
 
     // Cert for device_id_a, revocation for device_id_b — mismatch.
-    let device_cert = syncback_core::cluster::issue_device_certificate(
-        &peer_master_key,
-        device_id_a,
-        now,
-    );
+    let device_cert =
+        syncback_core::cluster::issue_device_certificate(&peer_master_key, device_id_a, now);
     let revocation = syncback_core::cluster::issue_revocation(
         &peer_master_key,
         device_id_b,
@@ -3189,7 +3294,10 @@ async fn revocation_broadcast_device_id_mismatch_rejected() {
         .await
         .expect("device_id mismatch must not propagate error");
 
-    let updated = db.get_peer(&known_device_id_99).expect("get_peer").expect("peer must exist");
+    let updated = db
+        .get_peer(&known_device_id_99)
+        .expect("get_peer")
+        .expect("peer must exist");
     assert!(
         updated.revoked_device_pub_keys.is_empty(),
         "mismatched device_id broadcast must not update revoked list"
@@ -3207,8 +3315,7 @@ async fn revocation_broadcast_unknown_peer_ignored() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
 
-    let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0xAAu8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -3219,11 +3326,8 @@ async fn revocation_broadcast_unknown_peer_ignored() {
     let now = Timestamp::now();
 
     // No upsert_peer — peer is unknown.
-    let device_cert = syncback_core::cluster::issue_device_certificate(
-        &peer_master_key,
-        device_id,
-        now,
-    );
+    let device_cert =
+        syncback_core::cluster::issue_device_certificate(&peer_master_key, device_id, now);
     let revocation = syncback_core::cluster::issue_revocation(
         &peer_master_key,
         device_id,
@@ -3242,7 +3346,10 @@ async fn revocation_broadcast_unknown_peer_ignored() {
 
     // Must not create a phantom PeerRecord — check by DeviceId(peer_identity.0) as proxy.
     let record = db.get_peer(&DeviceId(peer_identity.0)).expect("get_peer");
-    assert!(record.is_none(), "no PeerRecord must be created for unknown peer");
+    assert!(
+        record.is_none(),
+        "no PeerRecord must be created for unknown peer"
+    );
 }
 
 // ─── AC-1: transfer_without_offer_rejected ────────────────────────────────────
@@ -3281,11 +3388,17 @@ async fn transfer_without_offer_rejected() {
     // Symbol file must NOT exist on disk.
     let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
     let sym_path = holdings_dir.path().join(&block_hex).join("0.bin");
-    assert!(!sym_path.exists(), "symbol file must not be written without prior offer");
+    assert!(
+        !sym_path.exists(),
+        "symbol file must not be written without prior offer"
+    );
 
     // HoldingRecord must NOT exist in DB.
     let holding = db.get_holding(&block_id, &owner).unwrap();
-    assert!(holding.is_none(), "HoldingRecord must not be created without prior offer");
+    assert!(
+        holding.is_none(),
+        "HoldingRecord must not be created without prior offer"
+    );
 }
 
 // ─── AC-2: offer_accepted_stored_in_map ──────────────────────────────────────
@@ -3332,7 +3445,9 @@ async fn offer_accepted_stored_in_map() {
 
     // The map must have the entry.
     let map = processor.accepted_offers.lock().unwrap();
-    let entry = map.get(&(owner, block_id)).expect("accepted_offer must be stored");
+    let entry = map
+        .get(&(owner, block_id))
+        .expect("accepted_offer must be stored");
     assert_eq!(entry.esi_ranges, esi_ranges);
     assert_eq!(entry.importance, importance);
     assert_eq!(entry.owner_id, owner);
@@ -3364,9 +3479,18 @@ async fn transfer_stored_after_valid_offer() {
         v: 1,
         source_block_id: block_id,
         symbols: vec![
-            syncback_core::erasure::Symbol { esi: 0, data: vec![0x01u8; 64] },
-            syncback_core::erasure::Symbol { esi: 1, data: vec![0x02u8; 64] },
-            syncback_core::erasure::Symbol { esi: 2, data: vec![0x03u8; 64] },
+            syncback_core::erasure::Symbol {
+                esi: 0,
+                data: vec![0x01u8; 64],
+            },
+            syncback_core::erasure::Symbol {
+                esi: 1,
+                data: vec![0x02u8; 64],
+            },
+            syncback_core::erasure::Symbol {
+                esi: 2,
+                data: vec![0x03u8; 64],
+            },
         ],
         timestamp: Timestamp::now(),
     };
@@ -3377,8 +3501,14 @@ async fn transfer_stored_after_valid_offer() {
         .expect("handle_symbol_transfer failed");
 
     // HoldingRecord must exist with importance=0.7 (from AcceptedOffer, not default 0.5).
-    let holding = db.get_holding(&block_id, &owner).unwrap().expect("HoldingRecord must exist");
-    assert_eq!(holding.importance, importance, "importance must come from AcceptedOffer");
+    let holding = db
+        .get_holding(&block_id, &owner)
+        .unwrap()
+        .expect("HoldingRecord must exist");
+    assert_eq!(
+        holding.importance, importance,
+        "importance must come from AcceptedOffer"
+    );
     assert_eq!(holding.status, HoldingStatus::Active);
     assert_eq!(holding.esi_ranges, vec![(0u32, 3u32)]);
 
@@ -3417,9 +3547,18 @@ async fn transfer_partial_keeps_offer_and_second_transfer_completes_it() {
                 v: 1,
                 source_block_id: block_id,
                 symbols: vec![
-                    syncback_core::erasure::Symbol { esi: 0, data: vec![0xAAu8; 32] },
-                    syncback_core::erasure::Symbol { esi: 1, data: vec![0xAAu8; 32] },
-                    syncback_core::erasure::Symbol { esi: 2, data: vec![0xAAu8; 32] },
+                    syncback_core::erasure::Symbol {
+                        esi: 0,
+                        data: vec![0xAAu8; 32],
+                    },
+                    syncback_core::erasure::Symbol {
+                        esi: 1,
+                        data: vec![0xAAu8; 32],
+                    },
+                    syncback_core::erasure::Symbol {
+                        esi: 2,
+                        data: vec![0xAAu8; 32],
+                    },
                 ],
                 timestamp: Timestamp::now(),
             },
@@ -3444,8 +3583,14 @@ async fn transfer_partial_keeps_offer_and_second_transfer_completes_it() {
                 v: 1,
                 source_block_id: block_id,
                 symbols: vec![
-                    syncback_core::erasure::Symbol { esi: 3, data: vec![0xBBu8; 32] },
-                    syncback_core::erasure::Symbol { esi: 4, data: vec![0xBBu8; 32] },
+                    syncback_core::erasure::Symbol {
+                        esi: 3,
+                        data: vec![0xBBu8; 32],
+                    },
+                    syncback_core::erasure::Symbol {
+                        esi: 4,
+                        data: vec![0xBBu8; 32],
+                    },
                 ],
                 timestamp: Timestamp::now(),
             },
@@ -3454,12 +3599,14 @@ async fn transfer_partial_keeps_offer_and_second_transfer_completes_it() {
         .expect("second chunk");
 
     // Offer gone, holding covers all 5 ESIs.
-    assert!(processor
-        .accepted_offers
-        .lock()
-        .unwrap()
-        .get(&(owner, block_id))
-        .is_none());
+    assert!(
+        processor
+            .accepted_offers
+            .lock()
+            .unwrap()
+            .get(&(owner, block_id))
+            .is_none()
+    );
     let holding = db
         .get_holding(&block_id, &owner)
         .unwrap()
@@ -3506,11 +3653,17 @@ async fn transfer_rejected_esi_out_of_range() {
     // Symbol file must NOT exist.
     let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
     let sym_path = holdings_dir.path().join(&block_hex).join("999.bin");
-    assert!(!sym_path.exists(), "symbol file must not be written for ESI out of range");
+    assert!(
+        !sym_path.exists(),
+        "symbol file must not be written for ESI out of range"
+    );
 
     // HoldingRecord must NOT exist.
     let holding = db.get_holding(&block_id, &owner).unwrap();
-    assert!(holding.is_none(), "HoldingRecord must not be created for ESI out of range");
+    assert!(
+        holding.is_none(),
+        "HoldingRecord must not be created for ESI out of range"
+    );
 
     // Offer must be consumed (removed from map after first validation attempt).
     let map = processor.accepted_offers.lock().unwrap();
@@ -3551,11 +3704,17 @@ async fn offer_rejected_bad_signature() {
 
     // verify_symbol_offer must fail for the corrupted sig.
     let result = syncback_core::messages::verify_symbol_offer(&offer, &owner);
-    assert!(result.is_err(), "verify_symbol_offer must fail for tampered sig");
+    assert!(
+        result.is_err(),
+        "verify_symbol_offer must fail for tampered sig"
+    );
 
     // accepted_offers must remain empty (handle_symbol_offer would reject at sig check).
     let map = processor.accepted_offers.lock().unwrap();
-    assert!(map.is_empty(), "accepted_offers must be empty after rejected offer");
+    assert!(
+        map.is_empty(),
+        "accepted_offers must be empty after rejected offer"
+    );
 }
 
 // ─── AC-11: expired_accepted_offer_rejected ──────────────────────────────────
@@ -3616,11 +3775,17 @@ async fn expired_accepted_offer_rejected() {
     // Symbol file must NOT exist.
     let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
     let sym_path = holdings_dir.path().join(&block_hex).join("0.bin");
-    assert!(!sym_path.exists(), "symbol must not be stored when offer expired");
+    assert!(
+        !sym_path.exists(),
+        "symbol must not be stored when offer expired"
+    );
 
     // HoldingRecord must NOT exist.
     let holding = db.get_holding(&block_id, &owner).unwrap();
-    assert!(holding.is_none(), "HoldingRecord must not be created for expired offer");
+    assert!(
+        holding.is_none(),
+        "HoldingRecord must not be created for expired offer"
+    );
 
     // Offer must be removed from the map (lazy cleanup).
     let map = processor.accepted_offers.lock().unwrap();
@@ -3686,7 +3851,10 @@ async fn offer_rejected_when_quota_full() {
     let accept = processor
         .decide_symbol_offer(offer_bytes)
         .expect("decide_symbol_offer must not error");
-    assert!(!accept, "decide_symbol_offer must return false when quota=1 byte");
+    assert!(
+        !accept,
+        "decide_symbol_offer must return false when quota=1 byte"
+    );
 
     // accepted_offers must remain empty (handle_symbol_offer would not insert on reject).
     let map = processor.accepted_offers.lock().unwrap();
@@ -3711,8 +3879,7 @@ async fn offer_rejected_on_stale_timestamp() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let owner = IdentityPub(signing_key.verifying_key().to_bytes());
@@ -3767,16 +3934,14 @@ async fn offer_rejected_on_stale_timestamp() {
 async fn peer_authenticated_upserts_peer_record() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0xD1u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
 
     let device_seed = [0x11u8; 32];
-    let device_signing_key =
-        syncback_core::cluster::derive_device_key(&[0xD1u8; 64], &device_seed)
-            .expect("derive_device_key");
+    let device_signing_key = syncback_core::cluster::derive_device_key(&[0xD1u8; 64], &device_seed)
+        .expect("derive_device_key");
     let device_id = DeviceId(device_signing_key.verifying_key().to_bytes());
     let now = Timestamp::now();
     let device_cert =
@@ -3797,9 +3962,17 @@ async fn peer_authenticated_upserts_peer_record() {
     // peer_cert_map must contain the entry.
     {
         let map = processor.peer_cert_map.lock().unwrap();
-        let entry = map.get(&device_id).expect("peer_cert_map must have entry for device_id");
-        assert_eq!(entry.0, peer_identity, "identity_pub in cert_map must match");
-        assert_eq!(entry.1.device_id, device_id, "device_cert in cert_map must match");
+        let entry = map
+            .get(&device_id)
+            .expect("peer_cert_map must have entry for device_id");
+        assert_eq!(
+            entry.0, peer_identity,
+            "identity_pub in cert_map must match"
+        );
+        assert_eq!(
+            entry.1.device_id, device_id,
+            "device_cert in cert_map must match"
+        );
     }
 
     // DB must have a PeerRecord keyed by device_id.
@@ -3808,8 +3981,7 @@ async fn peer_authenticated_upserts_peer_record() {
         .expect("get_peer ok")
         .expect("PeerRecord must exist after on_peer_authenticated");
     assert_eq!(
-        record.device_id,
-        device_id,
+        record.device_id, device_id,
         "PeerRecord.device_id must be set after authentication"
     );
 }
@@ -3832,13 +4004,11 @@ async fn peer_authenticated_same_master_triggers_cluster_add() {
     // Peer uses the same master key (0xAAu8; 64 — matches make_processor_with_cluster_state).
     let master_key = derive_master_key(&[0xAAu8; 64]).expect("derive_master_key");
     let device_seed_b = [0x02u8; 32];
-    let device_key_b =
-        syncback_core::cluster::derive_device_key(&[0xAAu8; 64], &device_seed_b)
-            .expect("derive_device_key_b");
+    let device_key_b = syncback_core::cluster::derive_device_key(&[0xAAu8; 64], &device_seed_b)
+        .expect("derive_device_key_b");
     let device_id_b = DeviceId(device_key_b.verifying_key().to_bytes());
     let now = Timestamp::now();
-    let cert_b =
-        syncback_core::cluster::issue_device_certificate(&master_key, device_id_b, now);
+    let cert_b = syncback_core::cluster::issue_device_certificate(&master_key, device_id_b, now);
 
     let fake_peer_id = libp2p::PeerId::random();
 
@@ -3871,16 +4041,14 @@ async fn peer_authenticated_same_master_triggers_cluster_add() {
 async fn connection_closed_removes_from_peer_cert_map() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0xE3u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
 
     let device_seed = [0x33u8; 32];
-    let device_signing_key =
-        syncback_core::cluster::derive_device_key(&[0xE3u8; 64], &device_seed)
-            .expect("derive_device_key");
+    let device_signing_key = syncback_core::cluster::derive_device_key(&[0xE3u8; 64], &device_seed)
+        .expect("derive_device_key");
     let device_id = DeviceId(device_signing_key.verifying_key().to_bytes());
     let now = Timestamp::now();
     let device_cert =
@@ -3898,7 +4066,9 @@ async fn connection_closed_removes_from_peer_cert_map() {
     );
 
     let fake_peer_id = libp2p::PeerId::random();
-    processor.on_connection_closed(fake_peer_id, Some(device_id)).await;
+    processor
+        .on_connection_closed(fake_peer_id, Some(device_id))
+        .await;
 
     assert!(
         processor.peer_cert_map.lock().unwrap().is_empty(),
@@ -3915,8 +4085,7 @@ async fn connection_closed_removes_from_peer_cert_map() {
 async fn peer_authenticated_stores_device_to_master_mapping() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _sync_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0xF1u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -4010,7 +4179,10 @@ async fn recalculate_trust_updates_device_and_master_trust() {
         .expect("get_device_trust ok")
         .expect("DeviceTrustRecord must exist after recalculate_trust");
     assert!(dtr.trust_p > 0.0, "device trust_p must be set");
-    assert_eq!(dtr.last_week, 5, "device trust last_week must match current_week");
+    assert_eq!(
+        dtr.last_week, 5,
+        "device trust last_week must match current_week"
+    );
 
     // MasterTrustRecord must be updated.
     let mtr = db
@@ -4044,7 +4216,10 @@ async fn cluster_sync_response_from_non_cluster_peer_is_rejected() {
     // Foreign identity — different master key.
     let foreign_master_key = derive_master_key(&[0xABu8; 64]).expect("derive foreign master key");
     let foreign_identity = master_identity(&foreign_master_key);
-    assert_ne!(foreign_identity, own_identity, "test setup: identities must differ");
+    assert_ne!(
+        foreign_identity, own_identity,
+        "test setup: identities must differ"
+    );
 
     // Guard check: dispatch_libp2p rejects messages where from_master != own_identity.
     // We verify the guard condition directly.
@@ -4065,8 +4240,13 @@ async fn cluster_sync_response_from_non_cluster_peer_is_rejected() {
     let device_signing_key = syncback_core::cluster::derive_device_key(&[42u8; 64], &[1u8; 32])
         .expect("derive_device_key failed");
     let our_device_id = DeviceId(device_signing_key.verifying_key().to_bytes());
-    let result = processor.handle_cluster_sync_response(our_device_id, resp).await;
-    assert!(result.is_ok(), "handle_cluster_sync_response with cluster device must succeed");
+    let result = processor
+        .handle_cluster_sync_response(our_device_id, resp)
+        .await;
+    assert!(
+        result.is_ok(),
+        "handle_cluster_sync_response with cluster device must succeed"
+    );
 }
 
 // ─── Wave2 / Issue E: handle_pos_hash_nack signature verification ────────────
@@ -4074,11 +4254,11 @@ async fn cluster_sync_response_from_non_cluster_peer_is_rejected() {
 // AC-E4: valid nack from expected holder → placement marked Lost, repair enqueued
 #[tokio::test]
 async fn handle_pos_hash_nack_valid_from_expected_holder_marks_lost() {
+    use crate::daemon::repair::RepairTrigger;
+    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
     use std::collections::HashMap;
     use syncback_core::cluster::{derive_master_key, master_identity};
     use syncback_core::messages::build_pos_hash_nack;
-    use crate::daemon::repair::RepairTrigger;
-    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
@@ -4093,10 +4273,16 @@ async fn handle_pos_hash_nack_valid_from_expected_holder_marks_lost() {
 
     // Register holder in DB (PeerRecord + master mapping).
     db.upsert_peer(&make_peer_record(holder_device)).unwrap();
-    db.set_master_for_device(&holder_device, &holder_master).unwrap();
+    db.set_master_for_device(&holder_device, &holder_master)
+        .unwrap();
 
     // Insert Alive placement.
-    let placement = make_symbol_placement(block_id, holder_device, vec![(0, 1)], PlacementStatus::Alive);
+    let placement = make_symbol_placement(
+        block_id,
+        holder_device,
+        vec![(0, 1)],
+        PlacementStatus::Alive,
+    );
     db.upsert_placement(&placement).unwrap();
 
     // Set up pending challenges.
@@ -4113,8 +4299,7 @@ async fn handle_pos_hash_nack_valid_from_expected_holder_marks_lost() {
     )]
     .into_iter()
     .collect();
-    let pending: PendingChallenges =
-        std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
+    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
 
     let (processor, mut repair_rx, _relay_rx) =
         make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
@@ -4143,7 +4328,9 @@ async fn handle_pos_hash_nack_valid_from_expected_holder_marks_lost() {
     );
 
     // RepairTrigger::RepairNow must have been enqueued.
-    let trigger = repair_rx.try_recv().expect("repair trigger must be enqueued");
+    let trigger = repair_rx
+        .try_recv()
+        .expect("repair trigger must be enqueued");
     assert!(
         matches!(trigger, RepairTrigger::RepairNow { block_id: b, holder_id: h } if b == block_id && h == holder_device),
         "repair trigger must reference correct block and holder"
@@ -4156,10 +4343,10 @@ async fn handle_pos_hash_nack_valid_from_expected_holder_marks_lost() {
 // AC-E5: nack signed by wrong key → placement unchanged, no repair
 #[tokio::test]
 async fn handle_pos_hash_nack_from_wrong_signer_rejected() {
+    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
     use std::collections::HashMap;
     use syncback_core::cluster::{derive_master_key, master_identity};
     use syncback_core::messages::build_pos_hash_nack;
-    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
@@ -4177,10 +4364,16 @@ async fn handle_pos_hash_nack_from_wrong_signer_rejected() {
 
     // Register holder in DB.
     db.upsert_peer(&make_peer_record(holder_device)).unwrap();
-    db.set_master_for_device(&holder_device, &holder_master).unwrap();
+    db.set_master_for_device(&holder_device, &holder_master)
+        .unwrap();
 
     // Insert Alive placement.
-    let placement = make_symbol_placement(block_id, holder_device, vec![(0, 1)], PlacementStatus::Alive);
+    let placement = make_symbol_placement(
+        block_id,
+        holder_device,
+        vec![(0, 1)],
+        PlacementStatus::Alive,
+    );
     db.upsert_placement(&placement).unwrap();
 
     // Pending challenge for holder.
@@ -4197,8 +4390,7 @@ async fn handle_pos_hash_nack_from_wrong_signer_rejected() {
     )]
     .into_iter()
     .collect();
-    let pending: PendingChallenges =
-        std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
+    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
 
     let (processor, mut repair_rx, _relay_rx) =
         make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
@@ -4219,7 +4411,10 @@ async fn handle_pos_hash_nack_from_wrong_signer_rejected() {
         .expect("handle_pos_hash_nack must return Ok even when rejecting");
 
     // Placement must still be Alive (not modified).
-    let placement_after = db.get_placement(&block_id, &holder_device).unwrap().unwrap();
+    let placement_after = db
+        .get_placement(&block_id, &holder_device)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         placement_after.status,
         PlacementStatus::Alive,
@@ -4250,8 +4445,7 @@ async fn handle_pos_hash_nack_unknown_challenge_id_silently_dropped() {
     let unknown_challenge_id = [0x99u8; 16]; // not in pending_challenges
 
     // pending_challenges is empty (make_processor uses empty map).
-    let (processor, mut repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, mut repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     // Build a nack with an unknown challenge_id.
     let nack = build_pos_hash_nack(
@@ -4264,7 +4458,10 @@ async fn handle_pos_hash_nack_unknown_challenge_id_silently_dropped() {
     );
 
     let result = processor.handle_pos_hash_nack(holder_device, nack).await;
-    assert!(result.is_ok(), "handle_pos_hash_nack must return Ok for unknown challenge_id");
+    assert!(
+        result.is_ok(),
+        "handle_pos_hash_nack must return Ok for unknown challenge_id"
+    );
 
     // No repair trigger.
     assert!(
@@ -4352,9 +4549,24 @@ fn recompute_and_persist_when_two_alive_one_uncertain_counts_three() {
     db.upsert_source_block(&block).unwrap();
 
     // Two Alive + one Uncertain = 3 expected current_alive.
-    db.upsert_placement(&make_hook_placement(block_id, holder_a, PlacementStatus::Alive)).unwrap();
-    db.upsert_placement(&make_hook_placement(block_id, holder_b, PlacementStatus::Alive)).unwrap();
-    db.upsert_placement(&make_hook_placement(block_id, holder_c, PlacementStatus::Uncertain)).unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        holder_a,
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        holder_b,
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        holder_c,
+        PlacementStatus::Uncertain,
+    ))
+    .unwrap();
 
     // Insert peers for survival prob calculation.
     db.upsert_peer(&make_hook_peer(holder_a, 0.8)).unwrap();
@@ -4364,8 +4576,14 @@ fn recompute_and_persist_when_two_alive_one_uncertain_counts_three() {
     super::recompute_and_persist_block_cached_fields(&db, &block_id);
 
     let updated = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(updated.current_alive, 3, "current_alive must be 3 (2 Alive + 1 Uncertain)");
-    assert!(updated.current_reliability > 0.0, "current_reliability must be > 0 with 3 holders");
+    assert_eq!(
+        updated.current_alive, 3,
+        "current_alive must be 3 (2 Alive + 1 Uncertain)"
+    );
+    assert!(
+        updated.current_reliability > 0.0,
+        "current_reliability must be > 0 with 3 holders"
+    );
 }
 
 #[test]
@@ -4379,15 +4597,36 @@ fn recompute_and_persist_when_all_lost_sets_current_alive_zero_and_reliability_z
     let block = make_source_block_for_hook(block_id, 0.5, None, 0);
     db.upsert_source_block(&block).unwrap();
 
-    db.upsert_placement(&make_hook_placement(block_id, holder_a, PlacementStatus::Lost)).unwrap();
-    db.upsert_placement(&make_hook_placement(block_id, holder_b, PlacementStatus::Lost)).unwrap();
-    db.upsert_placement(&make_hook_placement(block_id, holder_c, PlacementStatus::Lost)).unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        holder_a,
+        PlacementStatus::Lost,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        holder_b,
+        PlacementStatus::Lost,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        holder_c,
+        PlacementStatus::Lost,
+    ))
+    .unwrap();
 
     super::recompute_and_persist_block_cached_fields(&db, &block_id);
 
     let updated = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(updated.current_alive, 0, "current_alive must be 0 when all placements are Lost");
-    assert_eq!(updated.current_reliability, 0.0, "current_reliability must be 0.0 with no alive holders");
+    assert_eq!(
+        updated.current_alive, 0,
+        "current_alive must be 0 when all placements are Lost"
+    );
+    assert_eq!(
+        updated.current_reliability, 0.0,
+        "current_reliability must be 0.0 with no alive holders"
+    );
 }
 
 #[test]
@@ -4399,7 +4638,10 @@ fn recompute_and_persist_for_unknown_block_logs_warn_and_does_not_panic() {
     super::recompute_and_persist_block_cached_fields(&db, &unknown_block_id);
 
     let result = db.get_source_block(&unknown_block_id).unwrap();
-    assert!(result.is_none(), "no block must be created for unknown block_id");
+    assert!(
+        result.is_none(),
+        "no block must be created for unknown block_id"
+    );
 }
 
 #[test]
@@ -4413,7 +4655,12 @@ fn recompute_and_persist_preserves_last_attempted_at_and_pool_signature() {
     let block = make_source_block_for_hook(block_id, 0.5, Some(sentinel_time), sentinel_sig);
     db.upsert_source_block(&block).unwrap();
 
-    db.upsert_placement(&make_hook_placement(block_id, holder_a, PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        holder_a,
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
     db.upsert_peer(&make_hook_peer(holder_a, 0.8)).unwrap();
 
     super::recompute_and_persist_block_cached_fields(&db, &block_id);
@@ -4425,8 +4672,7 @@ fn recompute_and_persist_preserves_last_attempted_at_and_pool_signature() {
         "last_attempted_at must be preserved unchanged"
     );
     assert_eq!(
-        updated.last_pool_signature,
-        sentinel_sig,
+        updated.last_pool_signature, sentinel_sig,
         "last_pool_signature must be preserved unchanged"
     );
 }
@@ -4441,8 +4687,18 @@ fn recompute_and_persist_is_idempotent_on_double_call() {
     let block = make_source_block_for_hook(block_id, 0.5, None, 0);
     db.upsert_source_block(&block).unwrap();
 
-    db.upsert_placement(&make_hook_placement(block_id, holder_a, PlacementStatus::Alive)).unwrap();
-    db.upsert_placement(&make_hook_placement(block_id, holder_b, PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        holder_a,
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        holder_b,
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
     db.upsert_peer(&make_hook_peer(holder_a, 0.8)).unwrap();
     db.upsert_peer(&make_hook_peer(holder_b, 0.8)).unwrap();
 
@@ -4451,7 +4707,10 @@ fn recompute_and_persist_is_idempotent_on_double_call() {
     super::recompute_and_persist_block_cached_fields(&db, &block_id);
 
     let updated = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(updated.current_alive, 2, "current_alive must be 2 after idempotent double call");
+    assert_eq!(
+        updated.current_alive, 2,
+        "current_alive must be 2 after idempotent double call"
+    );
 }
 
 // ─── W11a: PoS outcome tests (apply_and_persist_pos_outcome) ─────────────────
@@ -4472,32 +4731,43 @@ async fn pos_pass_on_uncertain_placement_keeps_current_alive_and_updates_status(
     db.upsert_peer(&make_hook_peer(holder_id, 0.8)).unwrap();
 
     // Set initial current_alive to 1 (Uncertain counts).
-    db.update_block_cached_fields(&block_id, 0.5, 1, 0.5, 0.99, None, 0).unwrap();
+    db.update_block_cached_fields(&block_id, 0.5, 1, 0.5, 0.99, None, 0)
+        .unwrap();
 
     // Uncertain placement — Pass will transition to Alive.
     let mut placement = make_hook_placement(block_id, holder_id, PlacementStatus::Uncertain);
     placement.consecutive_misses = 1;
     db.upsert_placement(&placement).unwrap();
 
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor(db.clone(), &holdings_dir).await;
+    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
     processor
-        .apply_and_persist_pos_outcome(block_id, holder_id, &syncback_core::pos::VerifyOutcome::Pass)
+        .apply_and_persist_pos_outcome(
+            block_id,
+            holder_id,
+            &syncback_core::pos::VerifyOutcome::Pass,
+        )
         .await
         .unwrap();
 
     let updated_placement = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
-    assert_eq!(updated_placement.status, PlacementStatus::Alive, "placement must become Alive after Pass");
+    assert_eq!(
+        updated_placement.status,
+        PlacementStatus::Alive,
+        "placement must become Alive after Pass"
+    );
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
     // Uncertain→Alive: hook fires, still counts as 1.
-    assert_eq!(updated_block.current_alive, 1, "current_alive must remain 1 (Uncertain→Alive)");
+    assert_eq!(
+        updated_block.current_alive, 1,
+        "current_alive must remain 1 (Uncertain→Alive)"
+    );
 }
 
 #[tokio::test]
 async fn pos_fail_on_alive_placement_decrements_current_alive() {
-    use std::collections::HashMap;
     use crate::daemon::scheduler::PendingChallenges;
+    use std::collections::HashMap;
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
@@ -4511,32 +4781,57 @@ async fn pos_fail_on_alive_placement_decrements_current_alive() {
     db.upsert_peer(&make_hook_peer(holder_a, 0.8)).unwrap();
     db.upsert_peer(&make_hook_peer(holder_b, 0.8)).unwrap();
 
-    db.upsert_placement(&make_hook_placement(block_id, holder_a, PlacementStatus::Alive)).unwrap();
-    db.upsert_placement(&make_hook_placement(block_id, holder_b, PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        holder_a,
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        holder_b,
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
     // Set initial cached fields reflecting 2 alive.
-    db.update_block_cached_fields(&block_id, 0.5, 2, 0.9, 0.99, None, 0).unwrap();
+    db.update_block_cached_fields(&block_id, 0.5, 2, 0.9, 0.99, None, 0)
+        .unwrap();
 
     // Need pending challenge for block_id/holder_a so apply_and_persist_pos_outcome
     // can find the placement. Direct call doesn't need pending — just call directly.
-    let pending: PendingChallenges =
-        std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let (processor, _repair_rx, _relay_rx) =
         make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
 
-    let pre_reliability = db.get_source_block(&block_id).unwrap().unwrap().current_reliability;
+    let pre_reliability = db
+        .get_source_block(&block_id)
+        .unwrap()
+        .unwrap()
+        .current_reliability;
 
     // Fail holder_a → placement becomes Lost.
     processor
-        .apply_and_persist_pos_outcome(block_id, holder_a, &syncback_core::pos::VerifyOutcome::Fail { esi: 0 })
+        .apply_and_persist_pos_outcome(
+            block_id,
+            holder_a,
+            &syncback_core::pos::VerifyOutcome::Fail { esi: 0 },
+        )
         .await
         .unwrap();
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(updated_block.current_alive, 1, "current_alive must be 1 after one Fail");
+    assert_eq!(
+        updated_block.current_alive, 1,
+        "current_alive must be 1 after one Fail"
+    );
 
     let placement_a = db.get_placement(&block_id, &holder_a).unwrap().unwrap();
-    assert_eq!(placement_a.status, PlacementStatus::Lost, "holder_a placement must be Lost");
+    assert_eq!(
+        placement_a.status,
+        PlacementStatus::Lost,
+        "holder_a placement must be Lost"
+    );
 
     assert!(
         updated_block.current_reliability < pre_reliability,
@@ -4549,15 +4844,15 @@ async fn pos_fail_on_alive_placement_decrements_current_alive() {
 
 #[tokio::test]
 async fn pos_nack_decrements_current_alive_and_updates_reliability() {
+    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
     use std::collections::HashMap;
     use syncback_core::messages::build_pos_hash_nack;
-    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
 
-    let holder_master_key = syncback_core::cluster::derive_master_key(&[0x30u8; 64])
-        .expect("holder master key");
+    let holder_master_key =
+        syncback_core::cluster::derive_master_key(&[0x30u8; 64]).expect("holder master key");
     let holder_master = syncback_core::cluster::master_identity(&holder_master_key);
     let holder_device = make_device_id(0x88);
     let block_id = make_block_id(0x89);
@@ -4572,15 +4867,32 @@ async fn pos_nack_decrements_current_alive_and_updates_reliability() {
     db.upsert_peer(&make_hook_peer(extra_a, 0.8)).unwrap();
     db.upsert_peer(&make_hook_peer(extra_b, 0.8)).unwrap();
 
-    db.upsert_placement(&make_hook_placement(block_id, holder_device, PlacementStatus::Alive)).unwrap();
-    db.upsert_placement(&make_hook_placement(block_id, extra_a, PlacementStatus::Alive)).unwrap();
-    db.upsert_placement(&make_hook_placement(block_id, extra_b, PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        holder_device,
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        extra_a,
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        extra_b,
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
     // Set current_alive = 3.
-    db.update_block_cached_fields(&block_id, 0.5, 3, 0.9, 0.99, None, 0).unwrap();
+    db.update_block_cached_fields(&block_id, 0.5, 3, 0.9, 0.99, None, 0)
+        .unwrap();
 
     // Register master→device so the processor can verify the nack signature.
-    db.set_master_for_device(&holder_device, &holder_master).unwrap();
+    db.set_master_for_device(&holder_device, &holder_master)
+        .unwrap();
 
     let challenge_id = [0x77u8; 16];
     let pending_map: HashMap<_, _> = [(
@@ -4596,8 +4908,7 @@ async fn pos_nack_decrements_current_alive_and_updates_reliability() {
     )]
     .into_iter()
     .collect();
-    let pending: PendingChallenges =
-        std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
+    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
 
     let (processor, _repair_rx, _relay_rx) =
         make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
@@ -4612,21 +4923,34 @@ async fn pos_nack_decrements_current_alive_and_updates_reliability() {
         &holder_master_key,
     );
 
-    processor.handle_pos_hash_nack(holder_device, nack).await.unwrap();
+    processor
+        .handle_pos_hash_nack(holder_device, nack)
+        .await
+        .unwrap();
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(updated_block.current_alive, 2, "current_alive must be 2 after Nack");
+    assert_eq!(
+        updated_block.current_alive, 2,
+        "current_alive must be 2 after Nack"
+    );
 
-    let placement = db.get_placement(&block_id, &holder_device).unwrap().unwrap();
-    assert_eq!(placement.status, PlacementStatus::Lost, "placement must be Lost after Nack");
+    let placement = db
+        .get_placement(&block_id, &holder_device)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        placement.status,
+        PlacementStatus::Lost,
+        "placement must be Lost after Nack"
+    );
 }
 
 // ─── W11a: rapid transitions keep current_alive coherent ─────────────────────
 
 #[tokio::test]
 async fn rapid_alive_to_lost_transitions_keep_current_alive_coherent() {
-    use std::collections::HashMap;
     use crate::daemon::scheduler::PendingChallenges;
+    use std::collections::HashMap;
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
@@ -4639,37 +4963,62 @@ async fn rapid_alive_to_lost_transitions_keep_current_alive_coherent() {
 
     for &h in &holders {
         db.upsert_peer(&make_hook_peer(h, 0.8)).unwrap();
-        db.upsert_placement(&make_hook_placement(block_id, h, PlacementStatus::Alive)).unwrap();
+        db.upsert_placement(&make_hook_placement(block_id, h, PlacementStatus::Alive))
+            .unwrap();
     }
-    db.update_block_cached_fields(&block_id, 0.5, 5, 0.9999, 0.99, None, 0).unwrap();
+    db.update_block_cached_fields(&block_id, 0.5, 5, 0.9999, 0.99, None, 0)
+        .unwrap();
 
-    let pending: PendingChallenges =
-        std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let (processor, _repair_rx, _relay_rx) =
         make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
 
     // Transition A → Lost.
     processor
-        .apply_and_persist_pos_outcome(block_id, holders[0], &syncback_core::pos::VerifyOutcome::Fail { esi: 0 })
-        .await.unwrap();
+        .apply_and_persist_pos_outcome(
+            block_id,
+            holders[0],
+            &syncback_core::pos::VerifyOutcome::Fail { esi: 0 },
+        )
+        .await
+        .unwrap();
     let b = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(b.current_alive, 4, "after 1st Fail: current_alive must be 4");
+    assert_eq!(
+        b.current_alive, 4,
+        "after 1st Fail: current_alive must be 4"
+    );
     let r4 = b.current_reliability;
 
     // Transition B → Lost.
     processor
-        .apply_and_persist_pos_outcome(block_id, holders[1], &syncback_core::pos::VerifyOutcome::Fail { esi: 0 })
-        .await.unwrap();
+        .apply_and_persist_pos_outcome(
+            block_id,
+            holders[1],
+            &syncback_core::pos::VerifyOutcome::Fail { esi: 0 },
+        )
+        .await
+        .unwrap();
     let b = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(b.current_alive, 3, "after 2nd Fail: current_alive must be 3");
+    assert_eq!(
+        b.current_alive, 3,
+        "after 2nd Fail: current_alive must be 3"
+    );
     let r3 = b.current_reliability;
 
     // Transition C → Lost.
     processor
-        .apply_and_persist_pos_outcome(block_id, holders[2], &syncback_core::pos::VerifyOutcome::Fail { esi: 0 })
-        .await.unwrap();
+        .apply_and_persist_pos_outcome(
+            block_id,
+            holders[2],
+            &syncback_core::pos::VerifyOutcome::Fail { esi: 0 },
+        )
+        .await
+        .unwrap();
     let b = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(b.current_alive, 2, "after 3rd Fail: current_alive must be 2");
+    assert_eq!(
+        b.current_alive, 2,
+        "after 3rd Fail: current_alive must be 2"
+    );
     let r2 = b.current_reliability;
 
     // Reliability decreases monotonically.
@@ -4681,9 +5030,9 @@ async fn rapid_alive_to_lost_transitions_keep_current_alive_coherent() {
 
 #[tokio::test]
 async fn block_becomes_eligible_in_next_work_item_after_pos_fail() {
+    use crate::daemon::scheduler::PendingChallenges;
     use std::collections::HashMap;
     use std::time::Duration;
-    use crate::daemon::scheduler::PendingChallenges;
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
@@ -4715,39 +5064,71 @@ async fn block_becomes_eligible_in_next_work_item_after_pos_fail() {
     db.upsert_source_block(&block).unwrap();
     db.upsert_peer(&make_hook_peer(holder_a, 0.8)).unwrap();
     db.upsert_peer(&make_hook_peer(holder_b, 0.8)).unwrap();
-    db.upsert_placement(&make_hook_placement(block_id, holder_a, PlacementStatus::Alive)).unwrap();
-    db.upsert_placement(&make_hook_placement(block_id, holder_b, PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        holder_a,
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_hook_placement(
+        block_id,
+        holder_b,
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
     // Initially above target — next_work_item returns None.
-    let work_before = db.next_work_item(1.5, Duration::from_secs(0), Timestamp::now(), 0).unwrap();
-    assert!(work_before.is_none(), "block should not need work when reliability >= target");
+    let work_before = db
+        .next_work_item(1.5, Duration::from_secs(0), Timestamp::now(), 0)
+        .unwrap();
+    assert!(
+        work_before.is_none(),
+        "block should not need work when reliability >= target"
+    );
 
-    let pending: PendingChallenges =
-        std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let (processor, _repair_rx, _relay_rx) =
         make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
 
     // Fail both holders → current_alive = 0 → reliability drops to 0.0.
     processor
-        .apply_and_persist_pos_outcome(block_id, holder_a, &syncback_core::pos::VerifyOutcome::Fail { esi: 0 })
-        .await.unwrap();
+        .apply_and_persist_pos_outcome(
+            block_id,
+            holder_a,
+            &syncback_core::pos::VerifyOutcome::Fail { esi: 0 },
+        )
+        .await
+        .unwrap();
     processor
-        .apply_and_persist_pos_outcome(block_id, holder_b, &syncback_core::pos::VerifyOutcome::Fail { esi: 0 })
-        .await.unwrap();
+        .apply_and_persist_pos_outcome(
+            block_id,
+            holder_b,
+            &syncback_core::pos::VerifyOutcome::Fail { esi: 0 },
+        )
+        .await
+        .unwrap();
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(updated_block.current_alive, 0, "current_alive must be 0 after both Fails");
+    assert_eq!(
+        updated_block.current_alive, 0,
+        "current_alive must be 0 after both Fails"
+    );
     assert!(
         updated_block.current_reliability < updated_block.target_reliability,
         "reliability must be below target after both Fails"
     );
 
     // Now next_work_item must return this block.
-    let work_after = db.next_work_item(1.5, Duration::from_secs(0), Timestamp::now(), 0).unwrap();
+    let work_after = db
+        .next_work_item(1.5, Duration::from_secs(0), Timestamp::now(), 0)
+        .unwrap();
     assert!(
         work_after.is_some(),
         "block must be eligible for work after reliability dropped below target"
     );
     let work_block = work_after.unwrap();
-    assert_eq!(work_block.block_id, block_id, "next_work_item must return the degraded block");
+    assert_eq!(
+        work_block.block_id, block_id,
+        "next_work_item must return the degraded block"
+    );
 }

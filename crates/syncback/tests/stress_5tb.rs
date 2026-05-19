@@ -35,12 +35,14 @@ const STRESS_RELIABILITY_SAMPLE: usize = 100; // sample every N_BLOCKS/STRESS_RE
 
 use syncback_core::constants::{MAX_HOLDERS_PER_BLOCK, MIN_SYMBOLS_PER_HOLDER};
 use syncback_core::db::Db;
-use syncback_core::placement::{compute_allocation, HolderCandidate};
-use syncback_core::reliability::{block_reliability, BlockReliabilityInput, HolderReliabilityInput};
+use syncback_core::placement::{HolderCandidate, compute_allocation};
+use syncback_core::reliability::{
+    BlockReliabilityInput, HolderReliabilityInput, block_reliability,
+};
 use syncback_core::types::{
-    DeviceId, ErasureParams, FileId, FileRecord, FileVersion, LocalState,
-    PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType,
-    SymbolPlacement, Timestamp,
+    DeviceId, ErasureParams, FileId, FileRecord, FileVersion, LocalState, PlacementStatus,
+    SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement,
+    Timestamp,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -131,11 +133,9 @@ fn stress_5tb_metadata_scale() {
     let blocks_per_file = N_BLOCKS.max(1) / N_FILES.max(1); // 0 if N_FILES > N_BLOCKS
     for (block_idx, &block_id) in block_ids.iter().enumerate() {
         // map each block to a file (many blocks per file for large libraries)
-        let file_idx = if blocks_per_file > 0 {
-            block_idx / blocks_per_file
-        } else {
-            block_idx % N_FILES
-        };
+        let file_idx = block_idx
+            .checked_div(blocks_per_file)
+            .unwrap_or(block_idx % N_FILES);
         let file_id = FileId(file_idx as u64);
 
         for holder_slot in 0..HOLDERS_PER_BLOCK {
@@ -183,7 +183,11 @@ fn stress_5tb_metadata_scale() {
 
         let record = FileRecord {
             file_id: FileId(file_idx as u64),
-            path: format!("/photos/year/{:06}/img_{:06}.jpg", file_idx / 1000, file_idx),
+            path: format!(
+                "/photos/year/{:06}/img_{:06}.jpg",
+                file_idx / 1000,
+                file_idx
+            ),
             importance: 0.5,
             devices: vec![(DEVICE_A, LocalState::Present)],
             versions: vec![FileVersion {
@@ -273,7 +277,11 @@ fn stress_5tb_metadata_scale() {
     // Use 128 MB block, importance = 0.5.
     let params = ErasureParams::compute(128 * 1024 * 1024, 0.5).unwrap();
     assert_eq!(params.k, K, "expected K={K}, got {}", params.k);
-    assert_eq!(params.k_eff, K_EFF, "expected K_eff={K_EFF}, got {}", params.k_eff);
+    assert_eq!(
+        params.k_eff, K_EFF,
+        "expected K_eff={K_EFF}, got {}",
+        params.k_eff
+    );
 
     let allocations = compute_allocation(&candidates, &params, 0)
         .expect("compute_allocation must succeed with 30 candidates");

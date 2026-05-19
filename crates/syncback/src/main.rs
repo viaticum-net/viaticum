@@ -30,9 +30,7 @@ async fn main() -> anyhow::Result<()> {
                     .with_env_filter(env_filter)
                     .init();
             } else {
-                tracing_subscriber::fmt()
-                    .with_env_filter(env_filter)
-                    .init();
+                tracing_subscriber::fmt().with_env_filter(env_filter).init();
             }
 
             let cfg = DaemonConfig {
@@ -56,12 +54,13 @@ async fn main() -> anyhow::Result<()> {
             handle.stop();
             handle.wait().await?;
         }
-        Command::Init { mnemonic, new_device } => {
+        Command::Init {
+            mnemonic,
+            new_device,
+        } => {
             let dir = global_dir.clone();
             let result = match (mnemonic, new_device) {
-                (Some(m), true) => {
-                    syncback::daemon::identity::init_identity_new_device(&dir, m)
-                }
+                (Some(m), true) => syncback::daemon::identity::init_identity_new_device(&dir, m),
                 (Some(m), false) => {
                     syncback::daemon::identity::init_identity_from_mnemonic(&dir, m)
                 }

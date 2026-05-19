@@ -15,15 +15,17 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use syncback::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
 use syncback::daemon::backup::pipeline::{compress_and_encrypt, decrypt_and_decompress};
+use syncback::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
 use syncback::daemon::relay::{RelayConfig, RelayManager};
-use syncback::daemon::restore::{RestoreConfig, RestoreCoordinator, RestoreRequest, VersionSelector};
 use syncback::daemon::restore::staging::JobId;
+use syncback::daemon::restore::{
+    RestoreConfig, RestoreCoordinator, RestoreRequest, VersionSelector,
+};
 use syncback_core::constants::MAX_BOARD_ENTRIES;
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder, Symbol};
-use syncback_core::placement::{compute_allocation, HolderCandidate};
+use syncback_core::placement::{HolderCandidate, compute_allocation};
 use syncback_core::types::{DeviceId, ErasureParams, IdentityPub, SourceBlockId, Timestamp};
 use tempfile::TempDir;
 
@@ -48,8 +50,14 @@ fn test_holders() -> Vec<HolderCandidate> {
 /// 2 holders for small-blob pure pipeline tests (avoids MIN_SYMBOLS_PER_HOLDER trimming).
 fn test_holders_small() -> Vec<HolderCandidate> {
     vec![
-        HolderCandidate { device_id: DeviceId([1u8; 32]), trust: 0.8 },
-        HolderCandidate { device_id: DeviceId([2u8; 32]), trust: 0.6 },
+        HolderCandidate {
+            device_id: DeviceId([1u8; 32]),
+            trust: 0.8,
+        },
+        HolderCandidate {
+            device_id: DeviceId([2u8; 32]),
+            trust: 0.6,
+        },
     ]
 }
 
@@ -126,7 +134,10 @@ async fn full_backup_restore_roundtrip() {
         })
         .unwrap();
     let results = backup.flush_all(true, &Default::default()).unwrap();
-    assert!(!results.is_empty(), "backup should produce at least one block");
+    assert!(
+        !results.is_empty(),
+        "backup should produce at least one block"
+    );
 
     // Restore phase
     let restore = RestoreCoordinator::new(
@@ -150,7 +161,10 @@ async fn full_backup_restore_roundtrip() {
     // Byte-for-byte verify — file is in staging_path
     let rel = path.trim_start_matches('/');
     let restored = std::fs::read(result.staging_path.join(rel)).unwrap();
-    assert_eq!(restored, content, "restored content must match original byte-for-byte");
+    assert_eq!(
+        restored, content,
+        "restored content must match original byte-for-byte"
+    );
 }
 
 // ─── Test 2: backup_restore_pack_multiple_files ───────────────────────────────
@@ -166,9 +180,18 @@ async fn backup_restore_pack_multiple_files() {
     let staging_dir = TempDir::new().unwrap();
 
     let test_files: Vec<(&str, Vec<u8>)> = vec![
-        ("alpha.txt", b"alpha content --- first file in the pack".to_vec()),
-        ("beta.txt",  b"beta content --- second file in the pack".to_vec()),
-        ("gamma.txt", b"gamma content --- third file in the pack".to_vec()),
+        (
+            "alpha.txt",
+            b"alpha content --- first file in the pack".to_vec(),
+        ),
+        (
+            "beta.txt",
+            b"beta content --- second file in the pack".to_vec(),
+        ),
+        (
+            "gamma.txt",
+            b"gamma content --- third file in the pack".to_vec(),
+        ),
     ];
 
     let mut backup = BackupCoordinator::new(
@@ -190,7 +213,11 @@ async fn backup_restore_pack_multiple_files() {
     }
     let results = backup.flush_all(true, &Default::default()).unwrap();
     // All 3 small files fit in one block (total << SMALL_BLOCK_SIZE)
-    assert_eq!(results.len(), 1, "all files should pack into one source block");
+    assert_eq!(
+        results.len(),
+        1,
+        "all files should pack into one source block"
+    );
 
     // Restore by prefix (the files_dir path)
     let restore = RestoreCoordinator::new(
@@ -261,13 +288,31 @@ async fn network_symbol_transfer_between_nodes() {
     let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(64);
 
     let handle_a = NetworkHandle::start(
-        NetworkConfig { signing_key: device_key_a, master_signing_key: master_key_a, master_identity: pk_a, known_peers: HashMap::new(), device_cert: Some(cert_a), iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled, x25519_pub: None },
+        NetworkConfig {
+            signing_key: device_key_a,
+            master_signing_key: master_key_a,
+            master_identity: pk_a,
+            known_peers: HashMap::new(),
+            device_cert: Some(cert_a),
+            iroh_secret_key: None,
+            relay_mode: iroh::RelayMode::Disabled,
+            x25519_pub: None,
+        },
         tx_a,
     )
     .await
     .unwrap();
     let handle_b = NetworkHandle::start(
-        NetworkConfig { signing_key: device_key_b, master_signing_key: master_key_b, master_identity: pk_b, known_peers: HashMap::new(), device_cert: Some(cert_b), iroh_secret_key: None, relay_mode: iroh::RelayMode::Disabled, x25519_pub: None },
+        NetworkConfig {
+            signing_key: device_key_b,
+            master_signing_key: master_key_b,
+            master_identity: pk_b,
+            known_peers: HashMap::new(),
+            device_cert: Some(cert_b),
+            iroh_secret_key: None,
+            relay_mode: iroh::RelayMode::Disabled,
+            x25519_pub: None,
+        },
         tx_b,
     )
     .await
@@ -277,13 +322,10 @@ async fn network_symbol_transfer_between_nodes() {
 
     // A connects to B and sends symbols
     let mut conn_a = handle_a.connect(addr_b, None).await.unwrap();
-    let mut conn_b = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        rx_b.recv(),
-    )
-    .await
-    .expect("timeout")
-    .expect("channel closed");
+    let mut conn_b = tokio::time::timeout(std::time::Duration::from_secs(5), rx_b.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
 
     // Build a SymbolTransferMsg with 3 real symbols (small data for speed)
     let block_id = SourceBlockId([42u8; 32]);
@@ -347,7 +389,10 @@ fn placement_produces_valid_allocation_for_pipeline() {
     let params = ErasureParams::compute(stored.len() as u64, 0.5).unwrap();
     let holders = test_holders_small();
     let allocations = compute_allocation(&holders, &params, 0).unwrap();
-    assert!(!allocations.is_empty(), "should allocate to at least one holder");
+    assert!(
+        !allocations.is_empty(),
+        "should allocate to at least one holder"
+    );
 
     let block_id = SourceBlockId(*blake3::hash(&stored).as_bytes());
 
@@ -389,7 +434,10 @@ fn placement_produces_valid_allocation_for_pipeline() {
 
     // Decrypt and decompress
     let recovered = decrypt_and_decompress(decoded_stored, &EPOCH_KEY).unwrap();
-    assert_eq!(recovered, plaintext, "recovered plaintext must match original");
+    assert_eq!(
+        recovered, plaintext,
+        "recovered plaintext must match original"
+    );
 }
 
 // ─── Test 5: relay_three_hop_message_delivery ────────────────────────────────
@@ -473,7 +521,10 @@ fn relay_three_hop_message_delivery() {
     // C scans board and decrypts the directed message
     let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel(16);
     let delivered = manager_c.scan_for_self(&inbound_tx, future);
-    assert_eq!(delivered, 1, "C should receive exactly one directed message");
+    assert_eq!(
+        delivered, 1,
+        "C should receive exactly one directed message"
+    );
 
     let msg = inbound_rx.try_recv().unwrap();
     assert_eq!(msg.payload, payload, "decrypted payload must match");
@@ -509,9 +560,7 @@ fn full_pipeline_backup_encode_decode_decrypt() {
     let encoder = RaptorQEncoder::new();
 
     // Step 1: arbitrary plaintext data
-    let plaintext: Vec<u8> = (0..4096u32)
-        .map(|i| ((i * 31 + 17) % 256) as u8)
-        .collect();
+    let plaintext: Vec<u8> = (0..4096u32).map(|i| ((i * 31 + 17) % 256) as u8).collect();
 
     // Step 2: compress + encrypt → stored blob [nonce][ciphertext]
     let stored = compress_and_encrypt(&plaintext, &EPOCH_KEY).unwrap();
@@ -570,15 +619,23 @@ fn full_pipeline_backup_encode_decode_decrypt() {
     // Trim to stored_size
     let stored_recovered = &padded[..stored.len()];
     assert_eq!(
-        stored_recovered, stored.as_slice(),
+        stored_recovered,
+        stored.as_slice(),
         "decoded stored blob must match original before decrypt"
     );
 
     // Step 6: decrypt + decompress → original plaintext
     let recovered = decrypt_and_decompress(stored_recovered, &EPOCH_KEY).unwrap();
-    assert_eq!(recovered, plaintext, "recovered plaintext must match original byte-for-byte");
+    assert_eq!(
+        recovered, plaintext,
+        "recovered plaintext must match original byte-for-byte"
+    );
 
     // Verify all params are internally consistent
-    assert_eq!(params.k_eff, params.k + 3, "k_eff must be k+3 (decode overhead)");
+    assert_eq!(
+        params.k_eff,
+        params.k + 3,
+        "k_eff must be k+3 (decode overhead)"
+    );
     assert!(params.n >= params.k_eff, "n must be at least k_eff");
 }

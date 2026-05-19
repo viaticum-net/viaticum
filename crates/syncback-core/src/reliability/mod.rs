@@ -10,7 +10,7 @@
 //       p = weighted mean per-symbol survival probability,
 //   K_eff = minimum symbols required for decode.
 
-use crate::commitment::{eviction_risk, CommitmentScore};
+use crate::commitment::{CommitmentScore, eviction_risk};
 use crate::constants::{
     BINOMIAL_EXACT_THRESHOLD, MAX_OVERHEAD_FACTOR, MIN_REDUNDANCY, RELIABILITY_REPAIR_THRESHOLD,
 };
@@ -262,13 +262,10 @@ pub fn per_holder_impact(
 pub fn build_report(input: &BlockReliabilityInput) -> Result<ReliabilityReport, ReliabilityError> {
     let current_reliability = block_reliability(input)?;
 
-    let symbols_alive = input
-        .holders
-        .iter()
-        .try_fold(0u32, |acc, h| {
-            acc.checked_add(h.alive_symbols)
-                .ok_or(ReliabilityError::SymbolCountOverflow)
-        })?;
+    let symbols_alive = input.holders.iter().try_fold(0u32, |acc, h| {
+        acc.checked_add(h.alive_symbols)
+            .ok_or(ReliabilityError::SymbolCountOverflow)
+    })?;
 
     let weakest_holder_impact = if input.holders.is_empty() {
         None
@@ -300,11 +297,13 @@ pub fn build_report(input: &BlockReliabilityInput) -> Result<ReliabilityReport, 
             }
         }
 
-        best.map(|(_, symbols_held, holder_id, reliability_without)| WeakestHolderImpact {
-            holder_id,
-            symbols_held,
-            reliability_without,
-        })
+        best.map(
+            |(_, symbols_held, holder_id, reliability_without)| WeakestHolderImpact {
+                holder_id,
+                symbols_held,
+                reliability_without,
+            },
+        )
     };
 
     let needs_repair = current_reliability < RELIABILITY_REPAIR_THRESHOLD;
@@ -466,9 +465,7 @@ pub fn solve_n_for_target(
 ///
 /// Returns `Err(EmptyHolderSlice)` if `holders` is empty.
 /// Returns `Err(InvalidSurvivalProb)` if any holder has `survival_prob` outside [0.0, 1.0].
-pub(crate) fn weighted_mean_trust(
-    holders: &[HolderCandidate],
-) -> Result<f64, ReliabilityError> {
+pub(crate) fn weighted_mean_trust(holders: &[HolderCandidate]) -> Result<f64, ReliabilityError> {
     if holders.is_empty() {
         return Err(ReliabilityError::EmptyHolderSlice);
     }
@@ -528,9 +525,10 @@ fn binomial_survival_normal_approx(n: u32, k: u32, p: f64) -> f64 {
 fn standard_normal_cdf(z: f64) -> f64 {
     let x = z.abs();
     let t = 1.0 / (1.0 + 0.2316419 * x);
-    let poly = t * (0.319_381_530
-        + t * (-0.356_563_782
-            + t * (1.781_477_937 + t * (-1.821_255_978 + t * 1.330_274_429))));
+    let poly = t
+        * (0.319_381_530
+            + t * (-0.356_563_782
+                + t * (1.781_477_937 + t * (-1.821_255_978 + t * 1.330_274_429))));
     let pdf = (-x * x / 2.0).exp() / std::f64::consts::TAU.sqrt();
     let upper_tail = pdf * poly;
     if z >= 0.0 {

@@ -1,8 +1,8 @@
 // Tests for daemon/identity module.
 
 use super::{
-    derive_keys, init_identity, init_identity_from_mnemonic, init_identity_new_device,
-    load_identity, IdentityError,
+    IdentityError, derive_keys, init_identity, init_identity_from_mnemonic,
+    init_identity_new_device, load_identity,
 };
 
 fn tmp_dir() -> tempfile::TempDir {
@@ -39,7 +39,10 @@ fn init_creates_keyfile_with_restricted_permissions() {
     let key_path = dir.path().join("identity.key");
     let metadata = std::fs::metadata(&key_path).expect("metadata");
     let mode = metadata.permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600, "identity.key must have mode 0600, got {mode:03o}");
+    assert_eq!(
+        mode, 0o600,
+        "identity.key must have mode 0600, got {mode:03o}"
+    );
 }
 
 #[test]
@@ -48,7 +51,10 @@ fn mnemonic_is_24_words() {
     let keyfile = init_identity(dir.path()).expect("init_identity");
 
     let word_count = keyfile.mnemonic.split_whitespace().count();
-    assert_eq!(word_count, 24, "mnemonic must be 24 words, got {word_count}");
+    assert_eq!(
+        word_count, 24,
+        "mnemonic must be 24 words, got {word_count}"
+    );
 }
 
 #[test]
@@ -80,7 +86,10 @@ fn init_from_mnemonic_is_deterministic() {
     let kf1 = init_identity_from_mnemonic(dir1.path(), mnemonic).expect("init1");
     let kf2 = init_identity_from_mnemonic(dir2.path(), mnemonic).expect("init2");
 
-    assert_eq!(kf1.identity_pub, kf2.identity_pub, "same mnemonic → same identity_pub");
+    assert_eq!(
+        kf1.identity_pub, kf2.identity_pub,
+        "same mnemonic → same identity_pub"
+    );
     assert_eq!(kf1.seed, kf2.seed, "same mnemonic → same seed");
 }
 
@@ -186,7 +195,10 @@ fn derive_keys_differ_per_epoch() {
     let (_, _, epoch_key_0) = derive_keys(&keyfile, 0).expect("derive epoch 0");
     let (_, _, epoch_key_1) = derive_keys(&keyfile, 1).expect("derive epoch 1");
 
-    assert_ne!(epoch_key_0, epoch_key_1, "different epochs must produce different epoch keys");
+    assert_ne!(
+        epoch_key_0, epoch_key_1,
+        "different epochs must produce different epoch keys"
+    );
 }
 
 #[test]
@@ -221,7 +233,11 @@ fn init_identity_creates_32byte_device_id() {
     let dir = tmp_dir();
     let keyfile = init_identity(dir.path()).expect("init_identity");
     assert_eq!(keyfile.device_id.len(), 32, "device_id must be 32 bytes");
-    assert_eq!(keyfile.device_seed.len(), 32, "device_seed must be 32 bytes");
+    assert_eq!(
+        keyfile.device_seed.len(),
+        32,
+        "device_seed must be 32 bytes"
+    );
 }
 
 #[test]
@@ -321,7 +337,10 @@ fn new_device_two_calls_produce_different_device_ids() {
     let kf1 = init_identity_new_device(dir1.path(), MNEMONIC_24).expect("call 1");
     let kf2 = init_identity_new_device(dir2.path(), MNEMONIC_24).expect("call 2");
 
-    assert_eq!(kf1.identity_pub, kf2.identity_pub, "same mnemonic → same identity_pub");
+    assert_eq!(
+        kf1.identity_pub, kf2.identity_pub,
+        "same mnemonic → same identity_pub"
+    );
     assert_ne!(
         kf1.device_id, kf2.device_id,
         "two new_device calls must produce different device_ids"

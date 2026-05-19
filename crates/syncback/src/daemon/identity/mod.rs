@@ -9,7 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
-use syncback_core::cluster::{derive_device_key, derive_epoch_key, derive_master_key, master_identity, EpochCounter};
+use syncback_core::cluster::{
+    EpochCounter, derive_device_key, derive_epoch_key, derive_master_key, master_identity,
+};
 
 #[cfg(test)]
 mod tests;
@@ -47,8 +49,10 @@ pub enum IdentityError {
     #[error("already initialized: {0}")]
     AlreadyInitialized(PathBuf),
 
-    #[error("identity file at {0} is corrupt or from an incompatible binary version: {1}. \
-            Delete the file and re-run 'syncback init', or restore it from a backup.")]
+    #[error(
+        "identity file at {0} is corrupt or from an incompatible binary version: {1}. \
+            Delete the file and re-run 'syncback init', or restore it from a backup."
+    )]
     Corrupt(PathBuf, String),
 
     #[error("not initialized: run 'syncback init' first")]
@@ -154,7 +158,14 @@ pub fn load_identity(data_dir: &Path) -> Result<IdentityKeyFile, IdentityError> 
 pub fn derive_keys(
     keyfile: &IdentityKeyFile,
     epoch: u32,
-) -> Result<(ed25519_dalek::SigningKey, ed25519_dalek::SigningKey, [u8; 32]), IdentityError> {
+) -> Result<
+    (
+        ed25519_dalek::SigningKey,
+        ed25519_dalek::SigningKey,
+        [u8; 32],
+    ),
+    IdentityError,
+> {
     let master_key = derive_master_key(&keyfile.seed)
         .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
     let device_key = derive_device_key(&keyfile.seed, &keyfile.device_seed)
@@ -203,8 +214,8 @@ fn create_keyfile(
     let seed = seed_arr.to_vec();
 
     // Derive identity public key.
-    let master_key = derive_master_key(&seed)
-        .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
+    let master_key =
+        derive_master_key(&seed).map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
     let identity_pub = master_identity(&master_key).0;
 
     // device_seed: deterministic from seed for DR restore, random for fresh init.

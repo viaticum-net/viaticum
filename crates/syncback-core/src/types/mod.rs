@@ -23,8 +23,6 @@ pub struct DeviceId(pub [u8; 32]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FileId(pub u64);
 
-
-
 // --- Display ---
 
 impl std::fmt::Display for SourceBlockId {
@@ -148,10 +146,7 @@ impl ErasureParams {
     ///
     /// Returns `Err(TooLarge)` if the resulting k would exceed `u32::MAX` — the
     /// silent `as u32` truncation would produce a wrong k value (review L-1).
-    pub fn compute(
-        source_block_size: u64,
-        importance: f64,
-    ) -> Result<Self, ErasureParamsError> {
+    pub fn compute(source_block_size: u64, importance: f64) -> Result<Self, ErasureParamsError> {
         if source_block_size == 0 {
             return Err(ErasureParamsError::EmptySourceBlock);
         }
@@ -294,7 +289,6 @@ pub struct SourceBlockRecord {
     pub drop_notice_sent_at: Option<Timestamp>,
 
     // --- Wave 8: cached reliability fields ---
-
     /// File importance in [0.0, 1.0]. Derived from overhead at migration; set directly at
     /// block creation (Wave 9+). Legacy records get this from the inverse overhead formula or
     /// DEFAULT_IMPORTANCE if overhead is absent.

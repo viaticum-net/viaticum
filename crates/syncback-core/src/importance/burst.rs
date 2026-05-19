@@ -120,8 +120,7 @@ pub fn burst_downweight_selects(path: &Path) -> bool {
     let hash = hasher.finalize();
     let bytes = hash.as_bytes();
     let head = u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]);
     (head % 100) < 70
 }

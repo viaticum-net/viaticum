@@ -92,12 +92,12 @@ async fn holder_pressure_sets_drop_notice_sent_at_on_first_send() {
 
     super::check_pressure(
         &db,
-        &holdings_dir.path().to_path_buf(),
+        holdings_dir.path(),
         &relay_post_tx,
-        1000,        // soft_quota_bytes
-        0,           // hard_quota_bytes = 0 (no floor)
-        &holdings_dir.path().to_path_buf(),
-        0,           // disk_reserve_bytes
+        1000, // soft_quota_bytes
+        0,    // hard_quota_bytes = 0 (no floor)
+        holdings_dir.path(),
+        0, // disk_reserve_bytes
         &test_key(),
     )
     .await
@@ -110,7 +110,10 @@ async fn holder_pressure_sets_drop_notice_sent_at_on_first_send() {
             drop_notice_found = true;
         }
     }
-    assert!(drop_notice_found, "check_pressure must post a symbol_drop_notice for the buffer-zone holding");
+    assert!(
+        drop_notice_found,
+        "check_pressure must post a symbol_drop_notice for the buffer-zone holding"
+    );
 
     // DB must have recorded drop_notice_sent_at for holding B.
     let updated_b = db
@@ -127,8 +130,10 @@ async fn holder_pressure_sets_drop_notice_sent_at_on_first_send() {
             // Holding B should be in the buffer zone — it must NOT be immediately
             // evicted. If it's gone, the test setup arithmetic is wrong and the
             // assertion above is silently skipped. Fail loud to surface this.
-            panic!("holding B was evicted instead of receiving DropNotice — \
-                    setup_hard_pressure_with_buffer_zone arithmetic is off");
+            panic!(
+                "holding B was evicted instead of receiving DropNotice — \
+                    setup_hard_pressure_with_buffer_zone arithmetic is off"
+            );
         }
     }
 }
@@ -188,12 +193,12 @@ async fn holder_drop_notice_sent_at_not_overwritten_on_second_send() {
 
     super::check_pressure(
         &db,
-        &holdings_dir.path().to_path_buf(),
+        holdings_dir.path(),
         &relay_post_tx,
-        100,         // soft_quota_bytes = 100 → effective_quota = min(100, disk_free) = 100
-        0,           // hard_quota_bytes = 0 (no floor)
-        &holdings_dir.path().to_path_buf(),
-        0,           // disk_reserve_bytes
+        100, // soft_quota_bytes = 100 → effective_quota = min(100, disk_free) = 100
+        0,   // hard_quota_bytes = 0 (no floor)
+        holdings_dir.path(),
+        0, // disk_reserve_bytes
         &test_key(),
     )
     .await
@@ -206,8 +211,10 @@ async fn holder_drop_notice_sent_at_not_overwritten_on_second_send() {
     let updated = db
         .get_holding(&holding.source_block_id, &holding.owner_id)
         .expect("db query failed")
-        .expect("holding was evicted instead of surviving in buffer zone — \
-                 setup_hard_pressure_with_buffer_zone arithmetic is off");
+        .expect(
+            "holding was evicted instead of surviving in buffer zone — \
+                 setup_hard_pressure_with_buffer_zone arithmetic is off",
+        );
     assert_eq!(
         updated.drop_notice_sent_at,
         Some(earlier_time),
@@ -276,9 +283,15 @@ async fn cleanup_expired_deletes_files_and_posts_symbol_dropped() {
     // cleanup_expired calls Timestamp::now() internally, so we rely on the
     // real wall-clock being >> HOLDER_DELETE_COOLDOWN_SECS (which is 4 weeks
     // in seconds, ~2.4 million). Any Unix timestamp past 2024 qualifies.
-    super::cleanup_expired(&db, &holdings_dir.path().to_path_buf(), &relay_post_tx, 1, &test_key())
-        .await
-        .unwrap();
+    super::cleanup_expired(
+        &db,
+        holdings_dir.path(),
+        &relay_post_tx,
+        1,
+        &test_key(),
+    )
+    .await
+    .unwrap();
 
     // DB record must be gone.
     assert!(
@@ -323,9 +336,15 @@ async fn cleanup_expired_tolerates_missing_files() {
     // Intentionally do NOT create any files on disk.
 
     // Should not error even though no files exist.
-    super::cleanup_expired(&db, &holdings_dir.path().to_path_buf(), &relay_post_tx, 1, &test_key())
-        .await
-        .unwrap();
+    super::cleanup_expired(
+        &db,
+        holdings_dir.path(),
+        &relay_post_tx,
+        1,
+        &test_key(),
+    )
+    .await
+    .unwrap();
 
     // DB record must still be gone.
     assert!(
@@ -369,11 +388,11 @@ async fn check_pressure_normal_does_nothing() {
     // data_dir = holdings_dir (any existing path for statvfs).
     super::check_pressure(
         &db,
-        &holdings_dir.path().to_path_buf(),
+        holdings_dir.path(),
         &relay_post_tx,
         u64::MAX,
         0,
-        &holdings_dir.path().to_path_buf(),
+        holdings_dir.path(),
         0,
         &test_key(),
     )

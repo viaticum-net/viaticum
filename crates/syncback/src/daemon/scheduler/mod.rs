@@ -15,12 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use syncback_core::constants::{LONG_ABSENCE_SECS, POS_TIMEOUT_SECS, S_CLAMP_MAX, S_CLAMP_MIN};
-use syncback_core::trust::{compute_combined, compute_effective_trust, recalculate_trust};
 use syncback_core::db::Db;
 use syncback_core::deletion::{DeletionAction, DeletionEngine};
-use syncback_core::pos::{apply_pos_outcome, due_challenges, outcome_from_verify, VerifyOutcome};
-use syncback_core::types::{DeviceId, IdentityPub, PlacementStatus, SourceBlockId, SourceBlockStatus, Timestamp};
-use tokio::sync::{mpsc, Mutex};
+use syncback_core::pos::{VerifyOutcome, apply_pos_outcome, due_challenges, outcome_from_verify};
+use syncback_core::trust::{compute_combined, compute_effective_trust, recalculate_trust};
+use syncback_core::types::{
+    DeviceId, IdentityPub, PlacementStatus, SourceBlockId, SourceBlockStatus, Timestamp,
+};
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -136,8 +138,7 @@ impl Scheduler {
     pub async fn run(self, cancel: CancellationToken) -> anyhow::Result<()> {
         let scale = self.config.time_scale.max(1);
         let pos_interval = Duration::from_secs((self.config.pos_interval_secs / scale).max(1));
-        let timeout_interval =
-            Duration::from_secs((self.config.timeout_check_secs / scale).max(1));
+        let timeout_interval = Duration::from_secs((self.config.timeout_check_secs / scale).max(1));
         // Deletion check: same interval as PoS (hourly, scaled).
         let deletion_interval = Duration::from_secs((3600 / scale).max(1));
         // accepted_offers sweep: 60 seconds / time_scale, min 1.
@@ -191,16 +192,14 @@ impl Scheduler {
 
                     // Opportunistic pruning of append-only tables (review BLOCK-4).
                     let event_log_retain_rows = self.config.event_log_retain_rows;
-                    if let Ok(last_seq) = self.db.last_event_seq() {
-                        if last_seq > event_log_retain_rows {
+                    if let Ok(last_seq) = self.db.last_event_seq()
+                        && last_seq > event_log_retain_rows {
                             let cutoff = last_seq - event_log_retain_rows;
-                            if let Ok(dropped) = self.db.truncate_event_log_before(cutoff) {
-                                if dropped > 0 {
+                            if let Ok(dropped) = self.db.truncate_event_log_before(cutoff)
+                                && dropped > 0 {
                                     debug!(dropped, cutoff, "scheduler: pruned event_log");
                                 }
-                            }
                         }
-                    }
                     // Current scaled week — must match the formula in
                     // processor::current_week_number_scaled. At time_scale > 1 the naive
                     // `now / (SECS_PER_WEEK/scale)` form diverges from `(now*scale)/SECS_PER_WEEK`
@@ -212,11 +211,10 @@ impl Scheduler {
                     let retain_weeks = self.config.pos_weekly_retain_weeks;
                     if current_week > retain_weeks {
                         let keep_after = current_week - retain_weeks;
-                        if let Ok(dropped) = self.db.prune_pos_weekly_before(keep_after) {
-                            if dropped > 0 {
+                        if let Ok(dropped) = self.db.prune_pos_weekly_before(keep_after)
+                            && dropped > 0 {
                                 debug!(dropped, keep_after, "scheduler: pruned pos_weekly");
                             }
-                        }
                     }
 
                     // Sweep stale Offered placements → Lost.
@@ -298,7 +296,13 @@ impl Scheduler {
             effective * s
         };
 
-        let due = due_challenges(&challengeable, &last_verified, now, trust_fn, self.config.time_scale);
+        let due = due_challenges(
+            &challengeable,
+            &last_verified,
+            now,
+            trust_fn,
+            self.config.time_scale,
+        );
 
         if due.is_empty() {
             debug!("scheduler: no challenges due at this interval");
@@ -314,14 +318,19 @@ impl Scheduler {
         info!(due = due.len(), "scheduler: issuing PoS hash challenges");
 
         // Group due entries by source_block_id so we encode each block's raw symbols once.
-        let mut by_block: HashMap<SourceBlockId, Vec<&syncback_core::pos::ChallengeScheduleEntry>> = HashMap::new();
+        let mut by_block: HashMap<SourceBlockId, Vec<&syncback_core::pos::ChallengeScheduleEntry>> =
+            HashMap::new();
         for entry in &due {
-            by_block.entry(entry.source_block_id).or_default().push(entry);
+            by_block
+                .entry(entry.source_block_id)
+                .or_default()
+                .push(entry);
         }
 
         for (block_id, block_entries) in by_block {
             // Filter out already-pending entries.
-            let block_entries: Vec<_> = block_entries.into_iter()
+            let block_entries: Vec<_> = block_entries
+                .into_iter()
                 .filter(|e| !already_pending.contains(&(e.source_block_id, e.holder_id)))
                 .collect();
             if block_entries.is_empty() {
@@ -329,7 +338,8 @@ impl Scheduler {
             }
 
             // Find corresponding SymbolPlacements.
-            let holder_placements: Vec<_> = block_entries.iter()
+            let holder_placements: Vec<_> = block_entries
+                .iter()
                 .filter_map(|e| {
                     challengeable.iter().find(|p| {
                         p.source_block_id == e.source_block_id && p.holder_id == e.holder_id
@@ -370,13 +380,15 @@ impl Scheduler {
             }
 
             // Per-holder data for the spawn_blocking closure.
-            let holder_data: Vec<(DeviceId, Vec<(u32, u32)>)> = holder_placements.iter()
+            let holder_data: Vec<(DeviceId, Vec<(u32, u32)>)> = holder_placements
+                .iter()
                 .map(|p| (p.holder_id, p.esi_ranges.clone()))
                 .collect();
 
             // Generate challenge_ids BEFORE spawn_blocking so the OsRng nonce is committed
             // before compute_chain_hash runs. This binds expected_hash to this challenge_id.
-            let challenge_ids: HashMap<DeviceId, [u8; 16]> = holder_data.iter()
+            let challenge_ids: HashMap<DeviceId, [u8; 16]> = holder_data
+                .iter()
                 .map(|(holder_id, _)| (*holder_id, random_challenge_id()))
                 .collect();
             let challenge_ids_clone = challenge_ids.clone();
@@ -385,84 +397,97 @@ impl Scheduler {
             let block_id_clone = block_id;
 
             // encode_raw once for the block, then compute per-holder chain hashes.
-            let hash_results = tokio::task::spawn_blocking(move || -> Vec<(DeviceId, [u8; 32], Vec<(u32, u32)>)> {
-                // Encode raw symbols for the union of all holders' ESI ranges.
-                let mut raw_symbols: HashMap<u32, Vec<u8>> = HashMap::new();
-                for &(start, count) in &all_esi_ranges {
-                    if count == 0 {
-                        continue;
-                    }
-                    match encoder.encode_raw(&source_data, &params, start, count) {
-                        Ok(syms) => {
-                            for sym in syms {
-                                raw_symbols.insert(sym.esi, sym.data);
+            #[allow(clippy::type_complexity)]
+            let hash_results = tokio::task::spawn_blocking(
+                move || -> Vec<(DeviceId, [u8; 32], Vec<(u32, u32)>)> {
+                    // Encode raw symbols for the union of all holders' ESI ranges.
+                    let mut raw_symbols: HashMap<u32, Vec<u8>> = HashMap::new();
+                    for &(start, count) in &all_esi_ranges {
+                        if count == 0 {
+                            continue;
+                        }
+                        match encoder.encode_raw(&source_data, &params, start, count) {
+                            Ok(syms) => {
+                                for sym in syms {
+                                    raw_symbols.insert(sym.esi, sym.data);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    block_id = %block_id_clone,
+                                    "scheduler: encode_raw failed: {e}"
+                                );
+                                return vec![];
                             }
                         }
-                        Err(e) => {
-                            tracing::error!(
-                                block_id = %block_id_clone,
-                                "scheduler: encode_raw failed: {e}"
-                            );
-                            return vec![];
-                        }
                     }
-                }
 
-                // Per-holder: apply binding, compute chain hash.
-                let mut results = Vec::new();
-                for (holder_id, esi_ranges) in &holder_data {
-                    // Expand ranges to sorted ESI list.
-                    let mut esis: Vec<u32> = esi_ranges.iter()
-                        .flat_map(|&(start, count)| start..start + count)
-                        .collect();
-                    esis.sort_unstable();
+                    // Per-holder: apply binding, compute chain hash.
+                    let mut results = Vec::new();
+                    for (holder_id, esi_ranges) in &holder_data {
+                        // Expand ranges to sorted ESI list.
+                        let mut esis: Vec<u32> = esi_ranges
+                            .iter()
+                            .flat_map(|&(start, count)| start..start + count)
+                            .collect();
+                        esis.sort_unstable();
 
-                    // Apply binding keystream and collect bound symbols.
-                    let bound_pairs: Vec<(u32, Vec<u8>)> = esis.iter()
-                        .filter_map(|&esi| {
-                            raw_symbols.get(&esi).map(|raw_data| {
-                                let mut data = raw_data.clone();
-                                let ks = syncback_core::erasure::binding_keystream(
-                                    &block_id_clone, holder_id, esi, data.len(),
-                                );
-                                for (d, k) in data.iter_mut().zip(ks.iter()) {
-                                    *d ^= k;
-                                }
-                                (esi, data)
+                        // Apply binding keystream and collect bound symbols.
+                        let bound_pairs: Vec<(u32, Vec<u8>)> = esis
+                            .iter()
+                            .filter_map(|&esi| {
+                                raw_symbols.get(&esi).map(|raw_data| {
+                                    let mut data = raw_data.clone();
+                                    let ks = syncback_core::erasure::binding_keystream(
+                                        &block_id_clone,
+                                        holder_id,
+                                        esi,
+                                        data.len(),
+                                    );
+                                    for (d, k) in data.iter_mut().zip(ks.iter()) {
+                                        *d ^= k;
+                                    }
+                                    (esi, data)
+                                })
                             })
-                        })
-                        .collect();
+                            .collect();
 
-                    let refs: Vec<(u32, &[u8])> = bound_pairs.iter()
-                        .map(|(esi, data)| (*esi, data.as_slice()))
-                        .collect();
+                        let refs: Vec<(u32, &[u8])> = bound_pairs
+                            .iter()
+                            .map(|(esi, data)| (*esi, data.as_slice()))
+                            .collect();
 
-                    // Use the pre-generated challenge_id to seed the chain hash.
-                    // Invariant: challenge_ids_clone is built from the same holder_data
-                    // iterated here, so the key is always present. Falling back to a
-                    // constant seed would silently bind chain_hash to a known value —
-                    // expect() surfaces any future invariant violation immediately.
-                    let cid = *challenge_ids_clone
-                        .get(holder_id)
-                        .expect("challenge_id always present: built from same holder_data");
-                    match syncback_core::pos::compute_chain_hash(&cid, &refs) {
-                        Ok(hash) => results.push((*holder_id, hash, esi_ranges.clone())),
-                        Err(e) => {
-                            tracing::error!(
-                                holder = %holder_id,
-                                block_id = %block_id_clone,
-                                "scheduler: chain hash failed: {e}"
-                            );
+                        // Use the pre-generated challenge_id to seed the chain hash.
+                        // Invariant: challenge_ids_clone is built from the same holder_data
+                        // iterated here, so the key is always present. Falling back to a
+                        // constant seed would silently bind chain_hash to a known value —
+                        // expect() surfaces any future invariant violation immediately.
+                        let cid = *challenge_ids_clone
+                            .get(holder_id)
+                            .expect("challenge_id always present: built from same holder_data");
+                        match syncback_core::pos::compute_chain_hash(&cid, &refs) {
+                            Ok(hash) => results.push((*holder_id, hash, esi_ranges.clone())),
+                            Err(e) => {
+                                tracing::error!(
+                                    holder = %holder_id,
+                                    block_id = %block_id_clone,
+                                    "scheduler: chain hash failed: {e}"
+                                );
+                            }
                         }
                     }
-                }
-                results
-            }).await.unwrap_or_default();
+                    results
+                },
+            )
+            .await
+            .unwrap_or_default();
 
             // Post a challenge for each holder we computed a hash for.
             for (holder_id, expected_hash, esi_ranges) in hash_results {
                 let challenge_id = challenge_ids[&holder_id];
-                let holder_master = self.db.get_master_for_device(&holder_id)
+                let holder_master = self
+                    .db
+                    .get_master_for_device(&holder_id)
                     .ok()
                     .flatten()
                     .map(|m| IdentityPub(m.0))
@@ -478,12 +503,15 @@ impl Scheduler {
                 };
 
                 if let Ok(payload) = syncback_core::messages::to_cbor(&challenge_msg) {
-                    let _ = self.relay_post_tx.send(crate::daemon::relay::RelayPost {
-                        msg_type: "pos_hash_challenge".to_string(),
-                        target: Some(holder_master),
-                        payload,
-                        msg_id: challenge_id,
-                    }).await;
+                    let _ = self
+                        .relay_post_tx
+                        .send(crate::daemon::relay::RelayPost {
+                            msg_type: "pos_hash_challenge".to_string(),
+                            target: Some(holder_master),
+                            payload,
+                            msg_id: challenge_id,
+                        })
+                        .await;
                 } else {
                     error!(
                         block_id = %block_id,
@@ -532,25 +560,26 @@ impl Scheduler {
             Err(e) => return Err(e.into()),
         }
 
-        let block_record = self.db.get_source_block(block_id)?
+        let block_record = self
+            .db
+            .get_source_block(block_id)?
             .ok_or_else(|| anyhow::anyhow!("source block record missing: {block_id}"))?;
         let db = self.db.clone();
         let epoch_key = self.epoch_key;
         let expected_id = *block_id;
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-            let plaintext = crate::daemon::backup::packing::rebuild_plaintext_from_db(
-                &db, &block_record,
-            )?;
-            let blob = crate::daemon::backup::pipeline::compress_and_encrypt(
-                &plaintext, &epoch_key,
-            )?;
+            let plaintext =
+                crate::daemon::backup::packing::rebuild_plaintext_from_db(&db, &block_record)?;
+            let blob =
+                crate::daemon::backup::pipeline::compress_and_encrypt(&plaintext, &epoch_key)?;
             let rebuilt_id: [u8; 32] = *blake3::hash(&blob).as_bytes();
             if rebuilt_id != expected_id.0 {
                 anyhow::bail!("rebuilt blob hash mismatch for {expected_id}");
             }
             Ok(blob)
-        }).await?
+        })
+        .await?
     }
 
     /// Check all pending challenges for timeout.
@@ -583,7 +612,10 @@ impl Scheduler {
             return Ok(());
         }
 
-        info!(count = timed_out.len(), "scheduler: processing timed-out challenges");
+        info!(
+            count = timed_out.len(),
+            "scheduler: processing timed-out challenges"
+        );
 
         for challenge in &timed_out {
             let block_id = challenge.source_block_id;
@@ -626,8 +658,7 @@ impl Scheduler {
 
             // Recompute cached fields after successful placement update (best-effort).
             crate::daemon::processor::recompute_and_persist_block_cached_fields(
-                &self.db,
-                &block_id,
+                &self.db, &block_id,
             );
 
             // Record timeout as a challenged-but-not-passed event for trust.
@@ -649,7 +680,10 @@ impl Scheduler {
             if transition.trigger_repair {
                 let _ = self
                     .repair_tx
-                    .send(RepairTrigger::RepairNow { block_id, holder_id })
+                    .send(RepairTrigger::RepairNow {
+                        block_id,
+                        holder_id,
+                    })
                     .await;
             }
 
@@ -669,19 +703,30 @@ impl Scheduler {
         let blocks = self.db.list_all_source_blocks().unwrap_or_default();
         let placements = self.db.list_all_placements().unwrap_or_default();
 
-        let actions = engine.process_cooldowns(&files, &blocks, &placements, now, self.config.time_scale);
+        let actions =
+            engine.process_cooldowns(&files, &blocks, &placements, now, self.config.time_scale);
         if actions.is_empty() {
             return Ok(());
         }
 
-        info!(count = actions.len(), "scheduler: processing deletion actions");
+        info!(
+            count = actions.len(),
+            "scheduler: processing deletion actions"
+        );
 
         for action in actions {
             match action {
-                DeletionAction::SendDropNotice { source_block_id, holder_id } => {
+                DeletionAction::SendDropNotice {
+                    source_block_id,
+                    holder_id,
+                } => {
                     // Dedup: only send once per source block.
                     let source_block = self.db.get_source_block(&source_block_id).ok().flatten();
-                    if source_block.as_ref().and_then(|sb| sb.drop_notice_sent_at).is_some() {
+                    if source_block
+                        .as_ref()
+                        .and_then(|sb| sb.drop_notice_sent_at)
+                        .is_some()
+                    {
                         debug!(
                             block_id = %source_block_id,
                             holder_id = %holder_id,
@@ -692,30 +737,43 @@ impl Scheduler {
 
                     // Build signed DeleteMsg, post to board, mark placement Deleting.
                     let delete_msg = syncback_core::messages::build_delete_msg(
-                        source_block_id, now, &self.signing_key,
+                        source_block_id,
+                        now,
+                        &self.signing_key,
                     );
                     // Relay board uses master IdentityPub as target.
-                    let holder_master = self.db.get_master_for_device(&holder_id)
+                    let holder_master = self
+                        .db
+                        .get_master_for_device(&holder_id)
                         .ok()
                         .flatten()
                         .unwrap_or(IdentityPub(holder_id.0));
                     if let Ok(payload) = syncback_core::messages::to_cbor(&delete_msg) {
                         let mut msg_id = [0u8; 16];
                         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut msg_id);
-                        let _ = self.relay_post_tx.send(RelayPost {
-                            msg_type: "delete".to_string(),
-                            target: Some(holder_master),
-                            payload,
-                            msg_id,
-                        }).await;
+                        let _ = self
+                            .relay_post_tx
+                            .send(RelayPost {
+                                msg_type: "delete".to_string(),
+                                target: Some(holder_master),
+                                payload,
+                                msg_id,
+                            })
+                            .await;
                     }
 
                     // Mark placement + source block Deleting, record drop_notice_sent_at atomically.
-                    let placement = self.db.get_placement(&source_block_id, &holder_id).ok().flatten();
+                    let placement = self
+                        .db
+                        .get_placement(&source_block_id, &holder_id)
+                        .ok()
+                        .flatten();
 
                     if placement.is_some() || source_block.is_some() {
                         match self.db.write_txn() {
-                            Err(e) => error!(block_id = %source_block_id, "deletion: failed to open write txn: {e}"),
+                            Err(e) => {
+                                error!(block_id = %source_block_id, "deletion: failed to open write txn: {e}")
+                            }
                             Ok(mut txn) => {
                                 let mut txn_ok = true;
                                 if let Some(mut p) = placement {
@@ -725,10 +783,12 @@ impl Scheduler {
                                         txn_ok = false;
                                     }
                                 }
-                                if txn_ok {
-                                    if let Some(mut sb) = source_block {
+                                if txn_ok
+                                    && let Some(mut sb) = source_block {
                                         sb.drop_notice_sent_at = Some(now);
-                                        if sb.status == SourceBlockStatus::Active || sb.status == SourceBlockStatus::Stale {
+                                        if sb.status == SourceBlockStatus::Active
+                                            || sb.status == SourceBlockStatus::Stale
+                                        {
                                             sb.status = SourceBlockStatus::Deleting;
                                         }
                                         if let Err(e) = txn.upsert_source_block(&sb) {
@@ -736,12 +796,10 @@ impl Scheduler {
                                             txn_ok = false;
                                         }
                                     }
-                                }
-                                if txn_ok {
-                                    if let Err(e) = txn.commit() {
+                                if txn_ok
+                                    && let Err(e) = txn.commit() {
                                         error!(block_id = %source_block_id, "deletion: failed to commit txn: {e}");
                                     }
-                                }
                             }
                         }
                     }
@@ -752,7 +810,10 @@ impl Scheduler {
                         "scheduler: sent DeleteMsg via board, placement → Deleting"
                     );
                 }
-                DeletionAction::CleanupPlacement { source_block_id, holder_id } => {
+                DeletionAction::CleanupPlacement {
+                    source_block_id,
+                    holder_id,
+                } => {
                     if let Err(e) = self.db.delete_placement(&source_block_id, &holder_id) {
                         error!(block_id = %source_block_id, holder_id = %holder_id, "deletion: failed to delete placement: {e}");
                     }
@@ -762,34 +823,42 @@ impl Scheduler {
                         "scheduler: cleaned up placement"
                     );
                 }
-                DeletionAction::CleanupBlock { source_block_id, file_id } => {
+                DeletionAction::CleanupBlock {
+                    source_block_id,
+                    file_id,
+                } => {
                     // Read the file record before opening the transaction (read-then-write pattern).
-                    let file_opt = self.db.get_file_by_id(file_id).ok().flatten().map(|mut file| {
-                        file.versions.retain(|v| v.source_block_id != source_block_id);
-                        file
-                    });
+                    let file_opt =
+                        self.db
+                            .get_file_by_id(file_id)
+                            .ok()
+                            .flatten()
+                            .map(|mut file| {
+                                file.versions
+                                    .retain(|v| v.source_block_id != source_block_id);
+                                file
+                            });
                     // Delete source block + update file record atomically.
                     match self.db.write_txn() {
-                        Err(e) => error!(block_id = %source_block_id, "deletion: failed to open write txn: {e}"),
+                        Err(e) => {
+                            error!(block_id = %source_block_id, "deletion: failed to open write txn: {e}")
+                        }
                         Ok(mut txn) => {
                             let mut txn_ok = true;
                             if let Err(e) = txn.delete_source_block(&source_block_id) {
                                 error!(block_id = %source_block_id, "deletion: failed to delete source block: {e}");
                                 txn_ok = false;
                             }
-                            if txn_ok {
-                                if let Some(file) = file_opt {
-                                    if let Err(e) = txn.upsert_file(&file) {
+                            if txn_ok
+                                && let Some(file) = file_opt
+                                    && let Err(e) = txn.upsert_file(&file) {
                                         error!(file_id = %file_id, "deletion: failed to update file after block cleanup: {e}");
                                         txn_ok = false;
                                     }
-                                }
-                            }
-                            if txn_ok {
-                                if let Err(e) = txn.commit() {
+                            if txn_ok
+                                && let Err(e) = txn.commit() {
                                     error!(block_id = %source_block_id, "deletion: failed to commit cleanup txn: {e}");
                                 }
-                            }
                         }
                     }
                     // Remove owner-side symbol files from disk (review B2 / Flow 7 BLOCK).
@@ -797,8 +866,8 @@ impl Scheduler {
                     // remained forever, leaking disk space.
                     let block_hex = syncback_core::types::hex_encode(&source_block_id.0);
                     let block_dir = self.source_blocks_dir.join(&block_hex);
-                    if block_dir.exists() {
-                        if let Err(e) = std::fs::remove_dir_all(&block_dir) {
+                    if block_dir.exists()
+                        && let Err(e) = std::fs::remove_dir_all(&block_dir) {
                             warn!(
                                 block_id = %source_block_id,
                                 path = %block_dir.display(),
@@ -806,14 +875,15 @@ impl Scheduler {
                                 "scheduler: failed to remove owner-side source block directory"
                             );
                         }
-                    }
                     info!(
                         block_id = %source_block_id,
                         file_id = %file_id,
                         "scheduler: cleaned up source block + file version + disk files"
                     );
                 }
-                DeletionAction::VacuumBlock { source_block_id, .. } => {
+                DeletionAction::VacuumBlock {
+                    source_block_id, ..
+                } => {
                     // Vacuum (repack) is complex — defer for now, just log.
                     debug!(
                         block_id = %source_block_id,

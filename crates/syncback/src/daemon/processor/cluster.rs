@@ -3,13 +3,13 @@
 use libp2p::request_response::ResponseChannel;
 use syncback_core::db::SystemStateBlobRecord;
 use syncback_core::messages::{
-    ClusterSyncRequestMsg, ClusterSyncResponseMsg, Message, RevocationBroadcast,
-    SystemStateAckMsg, SystemStateRequestMsg, SystemStateResponseMsg, SystemStateBackupMsg,
+    ClusterSyncRequestMsg, ClusterSyncResponseMsg, Message, RevocationBroadcast, SystemStateAckMsg,
+    SystemStateBackupMsg, SystemStateRequestMsg, SystemStateResponseMsg,
 };
 use syncback_core::types::{DeviceId, IdentityPub, Timestamp};
 use tracing::{debug, error, info, warn};
 
-use super::{ProcessorError, Processor};
+use super::{Processor, ProcessorError};
 
 impl Processor {
     /// Handle a ClusterSyncRequest via libp2p (AC-6).
@@ -62,7 +62,10 @@ impl Processor {
         from_device: DeviceId,
         response: ClusterSyncResponseMsg,
     ) -> Result<(), ProcessorError> {
-        match self.cluster_sync.process_sync_response(&from_device, response) {
+        match self
+            .cluster_sync
+            .process_sync_response(&from_device, response)
+        {
             Ok(n) => {
                 debug!(
                     device = %from_device,
@@ -170,16 +173,26 @@ impl Processor {
     ) -> SystemStateAckMsg {
         if backup.encrypted_blob.is_empty() {
             warn!(peer = %owner_id, "processor: SystemStateBackup: empty blob, ignoring");
-            return SystemStateAckMsg { v: 1, stored: false, timestamp: Timestamp::now() };
+            return SystemStateAckMsg {
+                v: 1,
+                stored: false,
+                timestamp: Timestamp::now(),
+            };
         }
         // Only accept from known peers (prevent storage spam from strangers).
         // PeerRecord is keyed by DeviceId; check if any device of this master is known.
-        let known = self.db.get_devices_for_master(&owner_id)
+        let known = self
+            .db
+            .get_devices_for_master(&owner_id)
             .map(|ds| !ds.is_empty())
             .unwrap_or(false);
         if !known {
             warn!(peer = %owner_id, "processor: SystemStateBackup: unknown peer, rejecting");
-            return SystemStateAckMsg { v: 1, stored: false, timestamp: Timestamp::now() };
+            return SystemStateAckMsg {
+                v: 1,
+                stored: false,
+                timestamp: Timestamp::now(),
+            };
         }
         // Enforce blob size cap to prevent disk DoS from authenticated peers.
         if backup.encrypted_blob.len() > syncback_core::constants::MAX_SYSTEM_STATE_BLOB_BYTES {
@@ -189,7 +202,11 @@ impl Processor {
                 max = syncback_core::constants::MAX_SYSTEM_STATE_BLOB_BYTES,
                 "processor: SystemStateBackup: blob exceeds size cap, dropping"
             );
-            return SystemStateAckMsg { v: 1, stored: false, timestamp: Timestamp::now() };
+            return SystemStateAckMsg {
+                v: 1,
+                stored: false,
+                timestamp: Timestamp::now(),
+            };
         }
         let record = SystemStateBlobRecord {
             owner: owner_id,
@@ -200,11 +217,19 @@ impl Processor {
         match self.db.store_system_state_blob(&owner_id, &record) {
             Ok(()) => {
                 info!(peer = %owner_id, "processor: SystemStateBackup: stored");
-                SystemStateAckMsg { v: 1, stored: true, timestamp: Timestamp::now() }
+                SystemStateAckMsg {
+                    v: 1,
+                    stored: true,
+                    timestamp: Timestamp::now(),
+                }
             }
             Err(e) => {
                 error!(peer = %owner_id, err = %e, "processor: SystemStateBackup: store failed");
-                SystemStateAckMsg { v: 1, stored: false, timestamp: Timestamp::now() }
+                SystemStateAckMsg {
+                    v: 1,
+                    stored: false,
+                    timestamp: Timestamp::now(),
+                }
             }
         }
     }

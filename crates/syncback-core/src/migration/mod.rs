@@ -4,11 +4,15 @@
 // Idempotent: running twice produces identical stored state because the computation
 // is deterministic given the same Placement and PeerRecord data.
 
-use crate::commitment::{compute_commitment, eviction_risk, HolderProfile};
+use crate::commitment::{HolderProfile, compute_commitment, eviction_risk};
 use crate::config::DEFAULT_IMPORTANCE;
-use crate::constants::{DECODE_OVERHEAD, OVERHEAD_BASE, OVERHEAD_SCALE, P_WINDOW_WEEKS, SECS_PER_WEEK};
+use crate::constants::{
+    DECODE_OVERHEAD, OVERHEAD_BASE, OVERHEAD_SCALE, P_WINDOW_WEEKS, SECS_PER_WEEK,
+};
 use crate::db::{Db, DbError};
-use crate::reliability::{block_reliability, target_reliability, BlockReliabilityInput, HolderReliabilityInput};
+use crate::reliability::{
+    BlockReliabilityInput, HolderReliabilityInput, block_reliability, target_reliability,
+};
 use crate::types::{PlacementStatus, Timestamp};
 
 #[cfg(test)]
@@ -45,7 +49,11 @@ pub fn migrate_block_records(db: &Db) -> Result<usize, MigrationError> {
     let total = blocks.len();
 
     if total == 0 {
-        tracing::info!(blocks = 0, elapsed_ms = 0, "migrated SourceBlockRecord cached fields (schema v2)");
+        tracing::info!(
+            blocks = 0,
+            elapsed_ms = 0,
+            "migrated SourceBlockRecord cached fields (schema v2)"
+        );
         return Ok(0);
     }
 
@@ -62,7 +70,8 @@ pub fn migrate_block_records(db: &Db) -> Result<usize, MigrationError> {
         // Derive importance from stored overhead (inverse of encode formula).
         // overhead = OVERHEAD_BASE + importance * OVERHEAD_SCALE
         // => importance = (overhead - OVERHEAD_BASE) / OVERHEAD_SCALE
-        let importance = block.overhead
+        let importance = block
+            .overhead
             .map(|ov| ((ov - OVERHEAD_BASE) / OVERHEAD_SCALE).clamp(0.0, 1.0))
             .unwrap_or(DEFAULT_IMPORTANCE);
 
@@ -80,8 +89,14 @@ pub fn migrate_block_records(db: &Db) -> Result<usize, MigrationError> {
         };
 
         // BR2: count Alive + Uncertain placements.
-        let current_alive = placements.iter()
-            .filter(|p| matches!(p.status, PlacementStatus::Alive | PlacementStatus::Uncertain))
+        let current_alive = placements
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.status,
+                    PlacementStatus::Alive | PlacementStatus::Uncertain
+                )
+            })
             .count() as u32;
 
         // Assemble per-holder inputs for block_reliability.
@@ -89,7 +104,10 @@ pub fn migrate_block_records(db: &Db) -> Result<usize, MigrationError> {
         let mut holder_inputs: Vec<HolderReliabilityInput> = Vec::new();
 
         for placement in &placements {
-            if !matches!(placement.status, PlacementStatus::Alive | PlacementStatus::Uncertain) {
+            if !matches!(
+                placement.status,
+                PlacementStatus::Alive | PlacementStatus::Uncertain
+            ) {
                 continue;
             }
 
@@ -145,7 +163,7 @@ pub fn migrate_block_records(db: &Db) -> Result<usize, MigrationError> {
 
         // BR7: log progress every 10 000 blocks. Use INFO so operators watching
         // startup at default log level see migration progress on large DBs.
-        if processed % 10_000 == 0 {
+        if processed.is_multiple_of(10_000) {
             tracing::info!(processed, total, "block record migration in progress");
         }
     }
@@ -189,25 +207,24 @@ fn compute_holder_survival_prob(
     };
 
     // Aggregate PoS stats from the weekly table for the last P_WINDOW_WEEKS weeks.
-    let (recent_challenges, recent_passes) =
-        match db.list_pos_weekly_for_peer(holder_id) {
-            Ok(entries) => {
-                let mut challenged = 0u32;
-                let mut passed = 0u32;
-                for (week, entry) in &entries {
-                    if *week >= window_start && *week <= current_week {
-                        challenged = challenged.saturating_add(entry.challenged);
-                        passed = passed.saturating_add(entry.passed);
-                    }
+    let (recent_challenges, recent_passes) = match db.list_pos_weekly_for_peer(holder_id) {
+        Ok(entries) => {
+            let mut challenged = 0u32;
+            let mut passed = 0u32;
+            for (week, entry) in &entries {
+                if *week >= window_start && *week <= current_week {
+                    challenged = challenged.saturating_add(entry.challenged);
+                    passed = passed.saturating_add(entry.passed);
                 }
-                (challenged, passed)
             }
-            Err(e) => {
-                tracing::warn!(holder = %holder_id, err = %e,
+            (challenged, passed)
+        }
+        Err(e) => {
+            tracing::warn!(holder = %holder_id, err = %e,
                     "migration: list_pos_weekly_for_peer failed, using neutral PoS stats");
-                (0, 0)
-            }
-        };
+            (0, 0)
+        }
+    };
 
     let profile = HolderProfile {
         holder_id: *holder_id,

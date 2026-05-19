@@ -1,8 +1,8 @@
 use crate::db::testutil::test_db;
 use crate::migration::migrate_block_records;
 use crate::types::{
-    DeviceId, FileId, IdentityPub, PlacementStatus, SourceBlockId, SourceBlockRecord,
-    SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp, PeerRecord,
+    DeviceId, FileId, IdentityPub, PeerRecord, PlacementStatus, SourceBlockId, SourceBlockRecord,
+    SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -36,7 +36,12 @@ fn make_block(seed: u8, overhead: Option<f64>) -> SourceBlockRecord {
     }
 }
 
-fn make_placement(bid: SourceBlockId, hid: DeviceId, status: PlacementStatus, count: u32) -> SymbolPlacement {
+fn make_placement(
+    bid: SourceBlockId,
+    hid: DeviceId,
+    status: PlacementStatus,
+    count: u32,
+) -> SymbolPlacement {
     SymbolPlacement {
         source_block_id: bid,
         holder_id: hid,
@@ -84,9 +89,27 @@ fn migrate_block_records_populates_current_alive_from_placement_table() {
     db.upsert_source_block(&make_block(1, Some(2.475))).unwrap();
 
     // 2 Alive, 1 Lost — only Alive count.
-    db.upsert_placement(&make_placement(bid, holder_id(10), PlacementStatus::Alive, 5)).unwrap();
-    db.upsert_placement(&make_placement(bid, holder_id(11), PlacementStatus::Alive, 5)).unwrap();
-    db.upsert_placement(&make_placement(bid, holder_id(12), PlacementStatus::Lost, 5)).unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        holder_id(10),
+        PlacementStatus::Alive,
+        5,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        holder_id(11),
+        PlacementStatus::Alive,
+        5,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        holder_id(12),
+        PlacementStatus::Lost,
+        5,
+    ))
+    .unwrap();
 
     migrate_block_records(&db).unwrap();
 
@@ -103,8 +126,10 @@ fn migrate_block_records_populates_current_reliability_from_holder_data() {
 
     let h1 = holder_id(20);
     let h2 = holder_id(21);
-    db.upsert_placement(&make_placement(bid, h1, PlacementStatus::Alive, 5)).unwrap();
-    db.upsert_placement(&make_placement(bid, h2, PlacementStatus::Alive, 5)).unwrap();
+    db.upsert_placement(&make_placement(bid, h1, PlacementStatus::Alive, 5))
+        .unwrap();
+    db.upsert_placement(&make_placement(bid, h2, PlacementStatus::Alive, 5))
+        .unwrap();
     db.upsert_peer(&make_peer(h1)).unwrap();
     db.upsert_peer(&make_peer(h2)).unwrap();
 
@@ -171,8 +196,20 @@ fn migrate_block_records_idempotent_across_calls() {
     let bid = block_id(5);
 
     db.upsert_source_block(&make_block(5, Some(2.475))).unwrap();
-    db.upsert_placement(&make_placement(bid, holder_id(50), PlacementStatus::Alive, 3)).unwrap();
-    db.upsert_placement(&make_placement(bid, holder_id(51), PlacementStatus::Alive, 3)).unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        holder_id(50),
+        PlacementStatus::Alive,
+        3,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        holder_id(51),
+        PlacementStatus::Alive,
+        3,
+    ))
+    .unwrap();
     db.upsert_peer(&make_peer(holder_id(50))).unwrap();
     db.upsert_peer(&make_peer(holder_id(51))).unwrap();
 
@@ -188,8 +225,10 @@ fn migrate_block_records_idempotent_across_calls() {
         (after_first.importance - after_second.importance).abs() < 1e-12,
         "importance must be identical across runs"
     );
-    assert_eq!(after_first.current_alive, after_second.current_alive,
-        "current_alive must be identical across runs");
+    assert_eq!(
+        after_first.current_alive, after_second.current_alive,
+        "current_alive must be identical across runs"
+    );
     assert!(
         (after_first.current_reliability - after_second.current_reliability).abs() < 1e-12,
         "current_reliability must be identical across runs"
@@ -198,8 +237,14 @@ fn migrate_block_records_idempotent_across_calls() {
         (after_first.target_reliability - after_second.target_reliability).abs() < 1e-12,
         "target_reliability must be identical across runs"
     );
-    assert_eq!(after_first.last_attempted_at, after_second.last_attempted_at);
-    assert_eq!(after_first.last_pool_signature, after_second.last_pool_signature);
+    assert_eq!(
+        after_first.last_attempted_at,
+        after_second.last_attempted_at
+    );
+    assert_eq!(
+        after_first.last_pool_signature,
+        after_second.last_pool_signature
+    );
 }
 
 /// Structural test: insert >10 000 blocks and assert the return value.
@@ -249,10 +294,19 @@ fn migrate_block_records_skips_block_with_no_peer_record_uses_fallback() {
 
     db.upsert_source_block(&make_block(6, Some(2.475))).unwrap();
     // Insert placement but NO matching PeerRecord.
-    db.upsert_placement(&make_placement(bid, holder_id(60), PlacementStatus::Alive, 5)).unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        holder_id(60),
+        PlacementStatus::Alive,
+        5,
+    ))
+    .unwrap();
 
     let count = migrate_block_records(&db).unwrap();
-    assert_eq!(count, 1, "block is still processed (not skipped) on missing peer");
+    assert_eq!(
+        count, 1,
+        "block is still processed (not skipped) on missing peer"
+    );
 
     let record = db.get_source_block(&bid).unwrap().unwrap();
     // current_alive must still be 1.
@@ -275,8 +329,14 @@ fn migrate_block_records_sets_last_attempted_at_none_and_pool_signature_zero() {
     migrate_block_records(&db).unwrap();
 
     let record = db.get_source_block(&bid).unwrap().unwrap();
-    assert_eq!(record.last_attempted_at, None, "last_attempted_at must be None after migration");
-    assert_eq!(record.last_pool_signature, 0, "last_pool_signature must be 0 after migration");
+    assert_eq!(
+        record.last_attempted_at, None,
+        "last_attempted_at must be None after migration"
+    );
+    assert_eq!(
+        record.last_pool_signature, 0,
+        "last_pool_signature must be 0 after migration"
+    );
 }
 
 #[test]
@@ -287,9 +347,27 @@ fn migrate_block_records_counts_uncertain_placements_as_alive() {
     db.upsert_source_block(&make_block(8, None)).unwrap();
 
     // 1 Alive + 1 Uncertain + 1 Offered — Alive+Uncertain counted, Offered excluded.
-    db.upsert_placement(&make_placement(bid, holder_id(80), PlacementStatus::Alive, 3)).unwrap();
-    db.upsert_placement(&make_placement(bid, holder_id(81), PlacementStatus::Uncertain, 3)).unwrap();
-    db.upsert_placement(&make_placement(bid, holder_id(82), PlacementStatus::Offered, 3)).unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        holder_id(80),
+        PlacementStatus::Alive,
+        3,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        holder_id(81),
+        PlacementStatus::Uncertain,
+        3,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        holder_id(82),
+        PlacementStatus::Offered,
+        3,
+    ))
+    .unwrap();
 
     migrate_block_records(&db).unwrap();
 

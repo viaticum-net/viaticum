@@ -7,19 +7,19 @@
 use std::time::Duration;
 
 use futures::io::Cursor;
-use libp2p::request_response::Codec;
 use libp2p::StreamProtocol;
+use libp2p::request_response::Codec;
 use syncback_core::cluster::issue_device_certificate;
-use syncback_core::messages::{
-    Message, PosHashChallengeMsg, SymbolTransferMsg,
-};
+use syncback_core::messages::{Message, PosHashChallengeMsg, SymbolTransferMsg};
 use syncback_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp};
 use tokio::time::timeout;
 
+use super::swarm_test_helpers::{
+    get_listen_addr, make_cert, make_signing_key, make_swarm_config, wait_for_authenticated,
+};
 use crate::daemon::network::swarm::{
     CertCodec, ProtocolEvent, SwarmConfig, SwarmHandle, SyncBackCodec,
 };
-use super::swarm_test_helpers::{get_listen_addr, make_cert, make_signing_key, make_swarm_config, wait_for_authenticated};
 
 /// Build a PosHashChallenge message for testing.
 fn make_pos_challenge() -> Message {
@@ -268,14 +268,14 @@ async fn send_to_device_round_trip() {
     // A sends to B. Since B drops the response channel, this will fail.
     // This is acceptable in ε.1 — full request/response wiring is ε.2.
     // Test verifies: send_to_device reaches event loop and gets a clean error.
-    let result = handle_a
-        .send_to_device(device_id_b, challenge)
-        .await;
+    let result = handle_a.send_to_device(device_id_b, challenge).await;
 
     // We expect either Ok (if B responded) or a clean error (RequestFailed/Timeout).
     // Either outcome is valid in ε.1.
     match result {
-        Ok(_) | Err(crate::daemon::network::swarm::SwarmError::RequestFailed(_)) | Err(crate::daemon::network::swarm::SwarmError::Timeout) => {}
+        Ok(_)
+        | Err(crate::daemon::network::swarm::SwarmError::RequestFailed(_))
+        | Err(crate::daemon::network::swarm::SwarmError::Timeout) => {}
         Err(e) => panic!("unexpected error: {e}"),
     }
 }
@@ -314,7 +314,9 @@ async fn cert_timeout_does_not_panic() {
                     {
                         return "authenticated";
                     }
-                    ProtocolEvent::ConnectionClosed { device_id: None, .. } => {
+                    ProtocolEvent::ConnectionClosed {
+                        device_id: None, ..
+                    } => {
                         return "timeout_closed";
                     }
                     _ => {}
@@ -347,11 +349,7 @@ async fn cert_mismatch_rejected() {
     // Create a cert for a DIFFERENT device (seed 71, not 70).
     let wrong_device_key = make_signing_key(71);
     let wrong_device_id = DeviceId(wrong_device_key.verifying_key().to_bytes());
-    let wrong_cert = issue_device_certificate(
-        &master_key_b,
-        wrong_device_id,
-        Timestamp(0),
-    );
+    let wrong_cert = issue_device_certificate(&master_key_b, wrong_device_id, Timestamp(0));
 
     // B's config has wrong cert (device_id != verifying_key).
     let config_b = SwarmConfig {

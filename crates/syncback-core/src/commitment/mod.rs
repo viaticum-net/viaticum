@@ -59,7 +59,6 @@ pub struct HolderProfile {
     pub holder_id: DeviceId,
 
     // --- PoS signals ---
-
     /// Number of PoS challenges issued to this holder in the last 4 weeks.
     /// 0 = no challenges yet (new peer or very quiet period).
     pub recent_challenges: u32,
@@ -72,7 +71,6 @@ pub struct HolderProfile {
     pub consecutive_misses: u32,
 
     // --- Disk pressure signals ---
-
     /// Has this holder rejected symbol offers in the last 7 days?
     pub offers_rejected_recently: bool,
 
@@ -80,7 +78,6 @@ pub struct HolderProfile {
     pub drop_notice_sent_recently: bool,
 
     // --- Eviction priority of our data at this holder ---
-
     /// Eviction priority of our data as computed by the holder's policy.
     /// Computed by the owner using `budget::eviction_priority(importance, holder_trust,
     /// placed_at, now_secs)`.
@@ -91,7 +88,6 @@ pub struct HolderProfile {
     pub max_known_eviction_priority: f64,
 
     // --- Relationship age ---
-
     /// When did we first interact with this holder (Unix seconds).
     pub first_seen: Timestamp,
 
@@ -102,7 +98,9 @@ pub struct HolderProfile {
 /// Error variants for the commitment module.
 #[derive(Debug, thiserror::Error)]
 pub enum CommitmentError {
-    #[error("holder profile has inconsistent data: recent_passes ({passes}) > recent_challenges ({challenges})")]
+    #[error(
+        "holder profile has inconsistent data: recent_passes ({passes}) > recent_challenges ({challenges})"
+    )]
     InconsistentPoSCounts { passes: u32, challenges: u32 },
 }
 

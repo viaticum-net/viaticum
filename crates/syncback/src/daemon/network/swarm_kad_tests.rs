@@ -10,10 +10,10 @@ use syncback_core::config::{AppConfig, NetworkCfg};
 use syncback_core::types::DeviceId;
 use tokio::time::timeout;
 
+use super::swarm_test_helpers::{get_listen_addr, make_cert, make_signing_key};
 use crate::daemon::network::swarm::{
-    ipfs_bootstrap_peers, peer_id_from_multiaddr, ProtocolEvent, SwarmConfig, SwarmHandle,
+    ProtocolEvent, SwarmConfig, SwarmHandle, ipfs_bootstrap_peers, peer_id_from_multiaddr,
 };
-use super::swarm_test_helpers::{get_listen_addr, make_signing_key, make_cert};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -49,7 +49,7 @@ fn make_kad_config(seed_byte: u8, bootstrap_peers: Vec<Multiaddr>) -> SwarmConfi
 
 /// Append /p2p/<peer_id> component to a Multiaddr.
 fn with_p2p(addr: Multiaddr, peer_id: libp2p::PeerId) -> Multiaddr {
-    addr.with(libp2p::multiaddr::Protocol::P2p(peer_id.into()))
+    addr.with(libp2p::multiaddr::Protocol::P2p(peer_id))
 }
 
 /// Collect the first PeerAuthenticated event for a specific device_id within timeout.
@@ -66,7 +66,7 @@ async fn wait_for_peer_authenticated(
                 {
                     return true;
                 }
-                Some(_) => {} // other events — keep waiting
+                Some(_) => {}         // other events — keep waiting
                 None => return false, // channel closed
             }
         }
@@ -107,7 +107,11 @@ fn namespace_key_is_sha256_of_canonical_string() {
     // The actual bytes depend on the sha256 implementation (stable across crates).
     let key_as_record = libp2p::kad::RecordKey::new(&computed);
     let key_bytes: Vec<u8> = key_as_record.to_vec();
-    assert_eq!(key_bytes.len(), 32, "RecordKey must preserve 32-byte length");
+    assert_eq!(
+        key_bytes.len(),
+        32,
+        "RecordKey must preserve 32-byte length"
+    );
 
     // Regression: different input must produce a different key.
     let other = Sha256::digest(b"/syncback/peers/v2");
@@ -232,7 +236,7 @@ async fn three_nodes_mesh_via_dht() {
 
     // Also drain A's events (don't block).
     let _ = timeout(Duration::from_millis(100), async {
-        while let Some(_) = events_a.recv().await {}
+        while events_a.recv().await.is_some() {}
     })
     .await;
 
@@ -253,6 +257,7 @@ async fn three_nodes_mesh_via_dht() {
 /// AppConfig::validate() must reject kademlia_bootstrap_peers entries that are
 /// not valid Multiaddr strings (do not start with '/').
 #[test]
+#[allow(clippy::field_reassign_with_default)]
 fn config_validation_rejects_invalid_multiaddr() {
     let mut cfg = AppConfig::default();
     cfg.network = NetworkCfg {
@@ -263,7 +268,10 @@ fn config_validation_rejects_invalid_multiaddr() {
 
     let result = cfg.validate();
 
-    assert!(result.is_err(), "validate() must fail for invalid multiaddr");
+    assert!(
+        result.is_err(),
+        "validate() must fail for invalid multiaddr"
+    );
     let err = result.unwrap_err();
     let err_str = err.to_string();
     assert!(
@@ -274,6 +282,7 @@ fn config_validation_rejects_invalid_multiaddr() {
 
 /// A valid Multiaddr entry (starts with '/') must pass config validation.
 #[test]
+#[allow(clippy::field_reassign_with_default)]
 fn config_validation_accepts_valid_multiaddr_prefix() {
     let mut cfg = AppConfig::default();
     cfg.network = NetworkCfg {
@@ -337,7 +346,10 @@ fn peer_id_from_multiaddr_extracts_peer_id() {
         "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ";
     let addr: Multiaddr = addr_str.parse().expect("valid multiaddr");
     let result = peer_id_from_multiaddr(&addr);
-    assert!(result.is_some(), "should extract PeerId from /p2p component");
+    assert!(
+        result.is_some(),
+        "should extract PeerId from /p2p component"
+    );
 }
 
 #[test]
@@ -345,7 +357,10 @@ fn peer_id_from_multiaddr_returns_none_without_p2p() {
     let addr_str = "/ip4/127.0.0.1/tcp/4001";
     let addr: Multiaddr = addr_str.parse().expect("valid multiaddr");
     let result = peer_id_from_multiaddr(&addr);
-    assert!(result.is_none(), "should return None when no /p2p component");
+    assert!(
+        result.is_none(),
+        "should return None when no /p2p component"
+    );
 }
 
 // ─── Unit test: ipfs_bootstrap_peers ─────────────────────────────────────────

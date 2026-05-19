@@ -56,7 +56,10 @@ fn read_editable_returns_defaults_when_file_missing() {
     let admin = ConfigAdmin::new(dir.path().join("nope.toml"));
     let cfg = admin.read_editable().unwrap();
     let defaults = syncback_core::config::AppConfig::default();
-    assert_eq!(cfg.storage.disk_reserve_gb, defaults.storage.disk_reserve_gb);
+    assert_eq!(
+        cfg.storage.disk_reserve_gb,
+        defaults.storage.disk_reserve_gb
+    );
     assert_eq!(cfg.storage.soft_quota_gb, defaults.storage.soft_quota_gb);
     assert_eq!(cfg.network.listen_port, defaults.network.listen_port);
 }
@@ -268,7 +271,11 @@ async fn concurrent_updates_are_serialised() {
     let _doc: toml_edit::DocumentMut = raw.parse().expect("file is still valid TOML");
     let final_cfg = admin.read_editable().unwrap();
     let port_ok = final_cfg.network.listen_port == 4501 || final_cfg.network.listen_port == 4502;
-    assert!(port_ok, "final listen_port = {}", final_cfg.network.listen_port);
+    assert!(
+        port_ok,
+        "final listen_port = {}",
+        final_cfg.network.listen_port
+    );
 }
 
 fn matches_validation(err: &ConfigAdminError, field: &str) {
@@ -337,8 +344,14 @@ async fn config_save_preflight_validation_rejects_invalid_no_bak_created() {
 
     // config.toml still has original values.
     let cfg = admin.read_editable().unwrap();
-    assert_eq!(cfg.storage.disk_reserve_gb, 5.0, "config.toml must be unchanged");
-    assert_eq!(cfg.network.listen_port, 4500, "config.toml must be unchanged");
+    assert_eq!(
+        cfg.storage.disk_reserve_gb, 5.0,
+        "config.toml must be unchanged"
+    );
+    assert_eq!(
+        cfg.network.listen_port, 4500,
+        "config.toml must be unchanged"
+    );
 }
 
 // T-J3: second save overwrites .bak with the pre-second-save state.
@@ -351,7 +364,10 @@ async fn config_save_overwrites_old_bak_with_pre_second_save_state() {
     // First save: port A → port B.
     admin
         .update(EditableConfig {
-            storage: StorageEditable { disk_reserve_gb: 5.0, soft_quota_gb: 50.0 },
+            storage: StorageEditable {
+                disk_reserve_gb: 5.0,
+                soft_quota_gb: 50.0,
+            },
             network: NetworkEditable { listen_port: 5000 }, // port B
         })
         .await
@@ -366,7 +382,10 @@ async fn config_save_overwrites_old_bak_with_pre_second_save_state() {
     // Second save: port B → port C.
     admin
         .update(EditableConfig {
-            storage: StorageEditable { disk_reserve_gb: 5.0, soft_quota_gb: 50.0 },
+            storage: StorageEditable {
+                disk_reserve_gb: 5.0,
+                soft_quota_gb: 50.0,
+            },
             network: NetworkEditable { listen_port: 6000 }, // port C
         })
         .await
@@ -407,14 +426,20 @@ async fn no_bak_created_when_config_file_is_missing() {
 
     admin
         .update(EditableConfig {
-            storage: StorageEditable { disk_reserve_gb: 3.0, soft_quota_gb: 100.0 },
+            storage: StorageEditable {
+                disk_reserve_gb: 3.0,
+                soft_quota_gb: 100.0,
+            },
             network: NetworkEditable { listen_port: 7777 },
         })
         .await
         .unwrap();
 
     let bak = bak_sibling(&p);
-    assert!(!bak.exists(), ".bak must NOT exist when config.toml did not exist before save");
+    assert!(
+        !bak.exists(),
+        ".bak must NOT exist when config.toml did not exist before save"
+    );
     assert!(p.exists(), "config.toml must be created");
     let cfg = admin.read_editable().unwrap();
     assert_eq!(cfg.network.listen_port, 7777);

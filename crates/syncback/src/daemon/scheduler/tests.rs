@@ -11,13 +11,15 @@ use syncback_core::db::Db;
 use syncback_core::types::{
     DeviceId, FileId, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use syncback_core::erasure::RaptorQEncoder;
 
 use crate::daemon::relay::RelayPost;
 use crate::daemon::repair::RepairTrigger;
-use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge, Scheduler, SchedulerConfig};
+use crate::daemon::scheduler::{
+    PendingChallenges, PendingHashChallenge, Scheduler, SchedulerConfig,
+};
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -102,7 +104,18 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
     // Since check_timeouts doesn't use network, we pass a real (but unused) handle.
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending.clone(),
+        relay_post_tx,
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+    );
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -115,7 +128,10 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
     // RepairNow should have been sent (3 misses → PresumedLost → trigger_repair=true).
     let trigger = repair_rx.try_recv().expect("repair trigger should be sent");
     match trigger {
-        RepairTrigger::RepairNow { block_id: bid, holder_id: hid } => {
+        RepairTrigger::RepairNow {
+            block_id: bid,
+            holder_id: hid,
+        } => {
             assert_eq!(bid, block_id);
             assert_eq!(hid, holder_id);
         }
@@ -170,7 +186,18 @@ async fn check_timeouts_ignores_fresh_challenges() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
+    let scheduler = Scheduler::new(
+        db,
+        config,
+        repair_tx,
+        pending.clone(),
+        relay_post_tx,
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+    );
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -270,7 +297,18 @@ async fn check_timeouts_respects_time_scale() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending.clone(),
+        relay_post_tx,
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+    );
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -328,7 +366,18 @@ async fn issue_due_challenges_skips_already_pending() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
+    let scheduler = Scheduler::new(
+        db,
+        config,
+        repair_tx,
+        pending.clone(),
+        relay_post_tx,
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+    );
 
     // issue_due_challenges should skip this holder because it's already pending.
     // The existing pending entry's esi_ranges should not be overwritten.
@@ -340,7 +389,11 @@ async fn issue_due_challenges_skips_already_pending() {
     let guard = pending.lock().await;
     assert_eq!(guard.len(), 1, "only the pre-existing entry should remain");
     let entry = guard.get(&(block_id, holder_id)).expect("entry present");
-    assert_eq!(entry.esi_ranges, vec![(5, 1)], "existing pending entry esi_ranges unchanged");
+    assert_eq!(
+        entry.esi_ranges,
+        vec![(5, 1)],
+        "existing pending entry esi_ranges unchanged"
+    );
 }
 
 // ─── SCHED-07: scheduler_skips_deleting_placements ───────────────────────────
@@ -372,9 +425,23 @@ async fn scheduler_skips_deleting_placements() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db, config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
+    let scheduler = Scheduler::new(
+        db,
+        config,
+        repair_tx,
+        pending.clone(),
+        relay_post_tx,
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+    );
 
-    scheduler.issue_due_challenges().await.expect("issue_due_challenges");
+    scheduler
+        .issue_due_challenges()
+        .await
+        .expect("issue_due_challenges");
 
     // Pending map must remain empty: Deleting placement was filtered out.
     assert!(
@@ -434,7 +501,18 @@ async fn time_scale_divides_intervals() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending.clone(), relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending.clone(),
+        relay_post_tx,
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+    );
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
@@ -540,7 +618,18 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
         event_log_retain_rows: 100_000,
         pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
-    let scheduler = Scheduler::new(db.clone(), config, repair_tx, pending, relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending,
+        relay_post_tx,
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+    );
 
     // Now = after owner cooldown. Deleted_at=0, cooldown=4 weeks.
     // process_deletion_tick uses Timestamp::now() internally. Since deleted_at=0,
@@ -548,10 +637,15 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
     scheduler.process_deletion_tick().await.unwrap();
 
     // Should have posted a "delete" message via relay.
-    let post = relay_post_rx.try_recv().expect("expected a delete RelayPost");
+    let post = relay_post_rx
+        .try_recv()
+        .expect("expected a delete RelayPost");
     assert_eq!(post.msg_type, "delete");
     // process_deletion_tick falls back to IdentityPub(holder_id.0) when no master mapping.
-    assert_eq!(post.target, Some(syncback_core::types::IdentityPub(holder_id.0)));
+    assert_eq!(
+        post.target,
+        Some(syncback_core::types::IdentityPub(holder_id.0))
+    );
 
     // Placement should be Deleting.
     let updated = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
@@ -578,7 +672,18 @@ async fn deletion_tick_noop_when_no_eligible_files() {
         event_log_retain_rows: 100_000,
         pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
-    let scheduler = Scheduler::new(db, config, repair_tx, pending, relay_post_tx, signing_key, std::path::PathBuf::from("/tmp/test_source_blocks"), crate::daemon::processor::make_empty_accepted_offers(), make_test_encoder(), TEST_EPOCH_KEY);
+    let scheduler = Scheduler::new(
+        db,
+        config,
+        repair_tx,
+        pending,
+        relay_post_tx,
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+    );
 
     scheduler.process_deletion_tick().await.unwrap();
 
@@ -833,7 +938,9 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
 
     // First tick: should send the drop notice.
     scheduler.process_deletion_tick().await.unwrap();
-    let first_post = relay_post_rx.try_recv().expect("first tick must send a delete msg");
+    let first_post = relay_post_rx
+        .try_recv()
+        .expect("first tick must send a delete msg");
     assert_eq!(first_post.msg_type, "delete");
 
     // drop_notice_sent_at must now be set.
@@ -879,7 +986,10 @@ async fn cleanup_block_removes_files_from_disk() {
         file_id: FileId(200),
         path: "cleanup_test.bin".to_string(),
         importance: 0.5,
-        devices: vec![(device_id, syncback_core::types::LocalState::Deleted(Timestamp(0)))],
+        devices: vec![(
+            device_id,
+            syncback_core::types::LocalState::Deleted(Timestamp(0)),
+        )],
         versions: vec![syncback_core::types::FileVersion {
             content_hash: [0; 32],
             source_block_id: block_id,
@@ -1041,7 +1151,8 @@ async fn scheduler_pos_timeout_alive_to_uncertain_preserves_current_alive() {
     let holder_b = make_identity(0xA2);
 
     // Insert block with 2 alive holders.
-    db.upsert_source_block(&make_block_for_hook(block_id, 2, 0.9)).unwrap();
+    db.upsert_source_block(&make_block_for_hook(block_id, 2, 0.9))
+        .unwrap();
 
     // Two Alive placements with consecutive_misses=0 (Timeout → Uncertain at miss=1).
     let mut p_a = make_placement(block_id, holder_a);
@@ -1075,12 +1186,15 @@ async fn scheduler_pos_timeout_alive_to_uncertain_preserves_current_alive() {
 
     // holder_a: Alive → Uncertain (1 miss); current_alive should remain 2 (Uncertain counts).
     let placement_a = db.get_placement(&block_id, &holder_a).unwrap().unwrap();
-    assert_eq!(placement_a.status, PlacementStatus::Uncertain, "holder_a must become Uncertain");
+    assert_eq!(
+        placement_a.status,
+        PlacementStatus::Uncertain,
+        "holder_a must become Uncertain"
+    );
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
     assert_eq!(
-        updated_block.current_alive,
-        2,
+        updated_block.current_alive, 2,
         "current_alive must remain 2 after Alive→Uncertain (Uncertain still counts)"
     );
 }
@@ -1096,7 +1210,8 @@ async fn scheduler_pos_timeout_uncertain_to_presumed_lost_decrements_current_ali
     let holder_b = make_identity(0xB2);
 
     // Insert block with 2 alive holders.
-    db.upsert_source_block(&make_block_for_hook(block_id, 2, 0.9)).unwrap();
+    db.upsert_source_block(&make_block_for_hook(block_id, 2, 0.9))
+        .unwrap();
 
     // holder_a at consecutive_misses = POS_CONSECUTIVE_MISS_PRESUMED_LOST - 1
     // so one more Timeout → PresumedLost.
@@ -1149,8 +1264,7 @@ async fn scheduler_pos_timeout_uncertain_to_presumed_lost_decrements_current_ali
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
     assert_eq!(
-        updated_block.current_alive,
-        1,
+        updated_block.current_alive, 1,
         "current_alive must be 1 after Uncertain→PresumedLost (PresumedLost not counted)"
     );
 

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use syncback_core::erasure::{ErasureEncoder, Symbol};
 use syncback_core::messages::{Message, RestoreRequestMsg};
 use syncback_core::types::{
-    ranges_to_esi_list, DeviceId, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
+    DeviceId, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp, ranges_to_esi_list,
 };
 use tracing::{debug, warn};
 

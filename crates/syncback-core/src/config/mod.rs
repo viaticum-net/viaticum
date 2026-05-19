@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use crate::constants::{
     DEFAULT_CLUSTER_SYNC_BATCH_SIZE, DEFAULT_COMPLETION_BONUS_COEFFICIENT,
-    DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_K_FACTOR, DEFAULT_MAX_VERSIONS,
-    DEFAULT_MAX_VERSION_AGE_SECS, DEFAULT_SOURCE_BLOCK_SIZE, MAX_BOARD_ENTRIES,
-    MAX_BOARD_SIZE_BYTES, MAX_COMPLETION_BONUS_COEFFICIENT, RELAY_TTL_SECS,
+    DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_K_FACTOR, DEFAULT_MAX_VERSION_AGE_SECS,
+    DEFAULT_MAX_VERSIONS, DEFAULT_SOURCE_BLOCK_SIZE, MAX_BOARD_ENTRIES, MAX_BOARD_SIZE_BYTES,
+    MAX_COMPLETION_BONUS_COEFFICIENT, RELAY_TTL_SECS,
 };
 
 #[cfg(test)]
@@ -246,8 +246,8 @@ impl<'de> serde::Deserialize<'de> for WatchConfig {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = WatchConfigRaw::deserialize(d)?;
         let (multiplier, was_legacy) = match (raw.importance_multiplier, raw.importance) {
-            (Some(m), _) => (m, false),         // canonical field present → not legacy
-            (None, Some(v)) => (v, true),        // only legacy field → legacy
+            (Some(m), _) => (m, false),   // canonical field present → not legacy
+            (None, Some(v)) => (v, true), // only legacy field → legacy
             (None, None) => (DEFAULT_IMPORTANCE_MULTIPLIER, false), // neither → default
         };
         Ok(WatchConfig {
@@ -308,11 +308,10 @@ impl WatchConfig {
                 let path = entry.path();
                 if ft.is_dir() {
                     // Skip hidden directories (starting with '.').
-                    if let Some(name) = path.file_name() {
-                        if name.to_string_lossy().starts_with('.') {
+                    if let Some(name) = path.file_name()
+                        && name.to_string_lossy().starts_with('.') {
                             continue;
                         }
-                    }
                     stack.push(path);
                 } else if ft.is_file() {
                     paths_seen.push(path);
@@ -391,20 +390,17 @@ impl WatchConfig {
                 let path = entry.path();
                 if ft.is_dir() {
                     // Skip hidden directories (names starting with '.').
-                    if let Some(name) = path.file_name() {
-                        if name.to_string_lossy().starts_with('.') {
+                    if let Some(name) = path.file_name()
+                        && name.to_string_lossy().starts_with('.') {
                             continue;
                         }
-                    }
                     stack.push(path);
                 } else if ft.is_file() {
                     // Only include media-extension files in burst detection.
                     let is_media = path
                         .extension()
                         .and_then(|e| e.to_str())
-                        .map(|e| {
-                            crate::importance::burst::is_media_ext(&e.to_ascii_lowercase())
-                        })
+                        .map(|e| crate::importance::burst::is_media_ext(&e.to_ascii_lowercase()))
                         .unwrap_or(false);
                     if !is_media {
                         continue;
@@ -620,8 +616,9 @@ impl AppConfig {
     fn normalize(&mut self) {
         let r = &mut self.reliability;
         let original = r.completion_bonus_coefficient;
-        r.completion_bonus_coefficient =
-            r.completion_bonus_coefficient.clamp(0.0, MAX_COMPLETION_BONUS_COEFFICIENT);
+        r.completion_bonus_coefficient = r
+            .completion_bonus_coefficient
+            .clamp(0.0, MAX_COMPLETION_BONUS_COEFFICIENT);
         if (r.completion_bonus_coefficient - original).abs() > f64::EPSILON {
             tracing::warn!(
                 original,
@@ -907,7 +904,10 @@ pub fn derive_file_importance(file_path: &str, watch_cfgs: &[WatchConfig]) -> f6
 
 /// Find the first WatchConfig whose expanded path is a prefix of file_path.
 /// Returns None if no match.
-fn find_watch_config<'a>(file_path: &str, watch_cfgs: &'a [WatchConfig]) -> Option<&'a WatchConfig> {
+fn find_watch_config<'a>(
+    file_path: &str,
+    watch_cfgs: &'a [WatchConfig],
+) -> Option<&'a WatchConfig> {
     for wc in watch_cfgs {
         let expanded = expand_watch_path(&wc.path);
         let base = expanded.to_string_lossy();

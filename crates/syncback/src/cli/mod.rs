@@ -86,15 +86,16 @@ pub fn resolve_connection(
             "--token without --server is not supported; omit both for local mode".into(),
         )),
         (None, None) => {
-            let (port, token) = crate::daemon::web_auth::read_port_and_token(data_dir).map_err(
-                |e| CliError::DaemonNotReachable {
-                    reason: format!(
-                        "cannot read {}/api-port or api-token: {}",
-                        data_dir.display(),
-                        e
-                    ),
-                },
-            )?;
+            let (port, token) =
+                crate::daemon::web_auth::read_port_and_token(data_dir).map_err(|e| {
+                    CliError::DaemonNotReachable {
+                        reason: format!(
+                            "cannot read {}/api-port or api-token: {}",
+                            data_dir.display(),
+                            e
+                        ),
+                    }
+                })?;
             Ok(Connection {
                 url: format!("http://127.0.0.1:{port}"),
                 token,
@@ -348,11 +349,10 @@ fn command_to_http(cmd: &Command) -> Result<(reqwest::Method, String, Option<Str
                     "cannot specify both --version and --date".into(),
                 ));
             }
-            if let Some(v) = *version {
-                if v == 0 {
+            if let Some(v) = *version
+                && v == 0 {
                     return Err(CliError::InvalidArgument("--version must be >= 1".into()));
                 }
-            }
             let body = serde_json::json!({
                 "path": path,
                 "version": version,
@@ -369,11 +369,7 @@ fn command_to_http(cmd: &Command) -> Result<(reqwest::Method, String, Option<Str
             }
             DeviceAction::Revoke { device_id } => {
                 validate_device_id_hex(device_id)?;
-                Ok((
-                    Method::DELETE,
-                    format!("/api/devices/{}", device_id),
-                    None,
-                ))
+                Ok((Method::DELETE, format!("/api/devices/{}", device_id), None))
             }
         },
         Command::Files { path_prefix } => {
@@ -398,7 +394,10 @@ fn command_to_http(cmd: &Command) -> Result<(reqwest::Method, String, Option<Str
 /// Decode the HTTP body into the `CliResponse` variant matching `cmd`.
 /// Endpoints return typed JSON (StatusData, Vec<FileEntry>, DeviceEntry, ...) —
 /// not a tagged CliResponse — so we rehydrate here based on the command.
-fn response_from_http(cmd: &Command, resp: reqwest::blocking::Response) -> Result<CliResponse, CliError> {
+fn response_from_http(
+    cmd: &Command,
+    resp: reqwest::blocking::Response,
+) -> Result<CliResponse, CliError> {
     use crate::cli::types::{DeviceEntry, FileEntry, RestoreData, StatusData, VersionEntry};
 
     match cmd {
@@ -415,7 +414,8 @@ fn response_from_http(cmd: &Command, resp: reqwest::blocking::Response) -> Resul
             Ok(CliResponse::Files(data))
         }
         Command::Versions { .. } => {
-            let data: Vec<VersionEntry> = resp.json().map_err(|e| CliError::Decode(e.to_string()))?;
+            let data: Vec<VersionEntry> =
+                resp.json().map_err(|e| CliError::Decode(e.to_string()))?;
             Ok(CliResponse::Versions(data))
         }
         Command::Device { action } => match action {
@@ -430,8 +430,7 @@ fn response_from_http(cmd: &Command, resp: reqwest::blocking::Response) -> Resul
             }
             DeviceAction::Revoke { .. } => {
                 // 204 path already handled in send_command_http
-                let data: serde_json::Value =
-                    resp.json().unwrap_or(serde_json::Value::Null);
+                let data: serde_json::Value = resp.json().unwrap_or(serde_json::Value::Null);
                 let device_id_hex = data
                     .get("device_id_hex")
                     .and_then(|v| v.as_str())
@@ -491,4 +490,3 @@ fn handle_response(response: CliResponse, json_output: bool) {
         CliResponse::Error(msg) => output::format_error(&msg),
     }
 }
-

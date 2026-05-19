@@ -71,9 +71,14 @@ async fn dispatch_status_identity_reflects_state() {
     // Identity = master_key.verifying_key() hex (64 chars for 32 bytes).
     assert_eq!(data.node_identity.len(), 64);
     // Must match state.identity_pub which equals network.identity_pub (both from master_key).
-    let expected = syncback_core::types::hex_encode(&IdentityPub(
-        ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key().to_bytes()
-    ).0);
+    let expected = syncback_core::types::hex_encode(
+        &IdentityPub(
+            ed25519_dalek::SigningKey::from_bytes(&[1u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .0,
+    );
     assert_eq!(data.node_identity, expected);
 }
 
@@ -128,7 +133,7 @@ async fn dispatch_restore_coordinator_not_running_returns_error() {
     // Either coordinator not running or db lookup returns empty:
     // both map to an error or valid Restore stub.
     match response {
-        CliResponse::Error(_) => {} // expected: coordinator not running
+        CliResponse::Error(_) => {}   // expected: coordinator not running
         CliResponse::Restore(_) => {} // also acceptable if db returned empty
         other => panic!("unexpected response: {other:?}"),
     }
@@ -151,8 +156,7 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
     use std::sync::{Arc, Mutex};
 
     use syncback_core::cluster::{
-        derive_device_key, issue_device_certificate, master_identity,
-        ClusterState,
+        ClusterState, derive_device_key, issue_device_certificate, master_identity,
     };
     use syncback_core::messages::RevocationBroadcast;
     use syncback_core::types::{DeviceId, Timestamp};
@@ -171,16 +175,8 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
     let _dev_key_b = derive_device_key(&seed_a, &device_id_b.0).unwrap();
 
     let now = Timestamp(1_000_000);
-    let cert_a = issue_device_certificate(
-        &master_key,
-        device_id_a,
-        now,
-    );
-    let cert_b = issue_device_certificate(
-        &master_key,
-        device_id_b,
-        now,
-    );
+    let cert_a = issue_device_certificate(&master_key, device_id_a, now);
+    let cert_b = issue_device_certificate(&master_key, device_id_b, now);
 
     let db = syncback_core::db::Db::open_in_memory().unwrap();
     let mut cs = ClusterState::init(db.clone(), identity_pub, cert_a.clone(), now, now).unwrap();
@@ -192,10 +188,9 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
 
     let (restore_tx, _restore_rx) = mpsc::channel::<(
         crate::daemon::restore::RestoreRequest,
-        tokio::sync::oneshot::Sender<Result<
-            crate::daemon::restore::RestoreResult,
-            crate::daemon::restore::RestoreError,
-        >>,
+        tokio::sync::oneshot::Sender<
+            Result<crate::daemon::restore::RestoreResult, crate::daemon::restore::RestoreError>,
+        >,
     )>(4);
 
     let state = Arc::new(DaemonState {
@@ -221,11 +216,7 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
     });
 
     // Revoke device B.
-    let device_b_hex: String = device_id_b
-        .0
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let device_b_hex: String = device_id_b.0.iter().map(|b| format!("{b:02x}")).collect();
     let response = dispatch(
         CliRequest::DeviceRevoke {
             device_id_hex: device_b_hex.clone(),
@@ -248,9 +239,8 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
     assert!(post.target.is_none(), "broadcast must have no target");
 
     // Decode and verify payload.
-    let broadcast: RevocationBroadcast =
-        syncback_core::messages::from_cbor(&post.payload)
-            .expect("payload must decode as RevocationBroadcast");
+    let broadcast: RevocationBroadcast = syncback_core::messages::from_cbor(&post.payload)
+        .expect("payload must decode as RevocationBroadcast");
     assert_eq!(
         broadcast.device_cert.device_id, device_id_b,
         "broadcast must reference the revoked device"
@@ -307,7 +297,9 @@ async fn dispatch_device_add_no_cluster_returns_error() {
 async fn dispatch_connect_invalid_addr_returns_error() {
     let state = make_test_state().await;
     let response = dispatch(
-        CliRequest::Connect { addr: "192.168.1.1:12345".to_string() },
+        CliRequest::Connect {
+            addr: "192.168.1.1:12345".to_string(),
+        },
         &state,
     )
     .await;
@@ -364,7 +356,12 @@ use syncback_core::types::{
     SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, Timestamp as Ts,
 };
 
-fn make_block(id: u8, importance: f64, reliability: f64, status: SourceBlockStatus) -> SourceBlockRecord {
+fn make_block(
+    id: u8,
+    importance: f64,
+    reliability: f64,
+    status: SourceBlockStatus,
+) -> SourceBlockRecord {
     SourceBlockRecord {
         block_id: SourceBlockId([id; 32]),
         k: 10,
@@ -492,7 +489,10 @@ fn aggregate_returns_all_five_buckets_even_when_empty() {
         assert_eq!(buckets[i].block_count, 0);
         assert_eq!(buckets[i].status, "empty");
         assert!((buckets[i].mean_p_recoverable - 0.0).abs() < 1e-12);
-        assert!(buckets[i].target_p > 0.0, "target_p must be non-zero even for empty bucket");
+        assert!(
+            buckets[i].target_p > 0.0,
+            "target_p must be non-zero even for empty bucket"
+        );
     }
 }
 
@@ -517,7 +517,10 @@ fn aggregate_sums_block_counts_to_active_total() {
     ];
     let buckets = compute_importance_buckets(&blocks);
     let total: u32 = buckets.iter().map(|b| b.block_count).sum();
-    assert_eq!(total, 10, "sum of block_count must equal Active block count");
+    assert_eq!(
+        total, 10,
+        "sum of block_count must equal Active block count"
+    );
 }
 
 #[test]
@@ -530,7 +533,10 @@ fn aggregate_status_healthy_when_mean_p_above_target() {
     ];
     let buckets = compute_importance_buckets(&blocks);
     let med = buckets.iter().find(|b| b.bucket == "medium").unwrap();
-    assert_eq!(med.status, "healthy", "mean 0.9999 should be >= target_p for medium bucket");
+    assert_eq!(
+        med.status, "healthy",
+        "mean 0.9999 should be >= target_p for medium bucket"
+    );
 }
 
 #[test]
@@ -577,8 +583,11 @@ fn aggregate_mean_is_arithmetic_mean_not_weighted() {
     ];
     let buckets = compute_importance_buckets(&blocks);
     let low = buckets.iter().find(|b| b.bucket == "low").unwrap();
-    assert!((low.mean_p_recoverable - 0.85).abs() < 1e-9,
-        "mean should be 0.85, got {}", low.mean_p_recoverable);
+    assert!(
+        (low.mean_p_recoverable - 0.85).abs() < 1e-9,
+        "mean should be 0.85, got {}",
+        low.mean_p_recoverable
+    );
 }
 
 #[test]
@@ -611,7 +620,10 @@ async fn api_status_response_includes_by_importance_field() {
     let CliResponse::Status(data) = response else {
         panic!("expected Status");
     };
-    assert!(!data.by_importance.is_empty(), "by_importance must be present");
+    assert!(
+        !data.by_importance.is_empty(),
+        "by_importance must be present"
+    );
     assert_eq!(data.by_importance.len(), 5, "must return exactly 5 buckets");
 }
 
@@ -640,14 +652,20 @@ async fn status_response_by_importance_has_five_buckets_in_fixed_order() {
     let CliResponse::Status(data) = response else {
         panic!("expected Status");
     };
-    let names: Vec<&str> = data.by_importance.iter().map(|b| b.bucket.as_str()).collect();
+    let names: Vec<&str> = data
+        .by_importance
+        .iter()
+        .map(|b| b.bucket.as_str())
+        .collect();
     assert_eq!(names, ["critical", "high", "medium", "low", "trivial"]);
 }
 
 #[cfg(any())]
 async fn _removed_dispatch_connect_two_daemons_registers_peer() {
     use std::sync::Arc;
-    use syncback_core::cluster::{derive_master_key, derive_device_key, master_identity, issue_device_certificate};
+    use syncback_core::cluster::{
+        derive_device_key, derive_master_key, issue_device_certificate, master_identity,
+    };
     use syncback_core::db::Db;
     use syncback_core::types::{DeviceId, Timestamp};
 
@@ -663,8 +681,18 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
     let device_a = derive_device_key(&seed_a, &did_a).unwrap();
     let device_b = derive_device_key(&seed_b, &did_b).unwrap();
 
-    let cert_a = issue_device_certificate(&master_a, did_a, device_a.verifying_key().to_bytes(), Timestamp::now());
-    let cert_b = issue_device_certificate(&master_b, did_b, device_b.verifying_key().to_bytes(), Timestamp::now());
+    let cert_a = issue_device_certificate(
+        &master_a,
+        did_a,
+        device_a.verifying_key().to_bytes(),
+        Timestamp::now(),
+    );
+    let cert_b = issue_device_certificate(
+        &master_b,
+        did_b,
+        device_b.verifying_key().to_bytes(),
+        Timestamp::now(),
+    );
 
     let (tx_b, _rx_b) = mpsc::channel::<crate::daemon::network::connection::Connection>(4);
     let handle_b = Arc::new(
@@ -690,7 +718,8 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
         .next()
         .copied()
         .expect("B must have a local IP addr");
-    let addr_b_str = crate::daemon::network::addr::format_node_addr(&handle_b.node_id, socket_addr_b, None);
+    let addr_b_str =
+        crate::daemon::network::addr::format_node_addr(&handle_b.node_id, socket_addr_b, None);
 
     let db_a = Db::open_in_memory().expect("db_a");
     let (tx_a, _rx_a) = mpsc::channel::<crate::daemon::network::connection::Connection>(4);
@@ -746,13 +775,21 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
     };
     // Connected peer_id should be B's master identity (from cert).
     let expected_hex: String = pk_b.0.iter().map(|b| format!("{b:02x}")).collect();
-    assert_eq!(peer_id, expected_hex, "peer_id should be B's master identity hex");
+    assert_eq!(
+        peer_id, expected_hex,
+        "peer_id should be B's master identity hex"
+    );
 
     // Peer should be stored under master identity.
-    let stored = db_a.get_peer(&pk_b).expect("db get_peer").expect("peer in db");
+    let stored = db_a
+        .get_peer(&pk_b)
+        .expect("db get_peer")
+        .expect("peer in db");
     assert_eq!(stored.identity, pk_b);
     assert!(!stored.addrs.is_empty(), "addr should be stored");
 
-    let _ = handle_a.get_connection(pk_b).await.expect("get_connection after connect");
+    let _ = handle_a
+        .get_connection(pk_b)
+        .await
+        .expect("get_connection after connect");
 }
-

@@ -41,15 +41,11 @@ use syncback_core::config::EscrowCfg;
 use syncback_core::constants::SYMBOL_OFFER_EXPIRY_SECS;
 use syncback_core::db::Db;
 use syncback_core::messages::{
-    AckMsg, CancelDeleteMsg, DeleteMsg, Message, PeerAnnounceMsg,
-    PosHashChallengeMsg, PosHashNackMsg, PosHashResponseMsg,
-    RestoreDeniedMsg, RevocationBroadcast,
-    SymbolDropNoticeMsg, SymbolDroppedMsg,
-    SymbolStoredMsg, SystemStateAckMsg,
+    AckMsg, CancelDeleteMsg, DeleteMsg, Message, PeerAnnounceMsg, PosHashChallengeMsg,
+    PosHashNackMsg, PosHashResponseMsg, RestoreDeniedMsg, RevocationBroadcast, SymbolDropNoticeMsg,
+    SymbolDroppedMsg, SymbolStoredMsg, SystemStateAckMsg,
 };
-use syncback_core::types::{
-    DeviceId, IdentityPub, PlacementStatus, SourceBlockId, Timestamp,
-};
+use syncback_core::types::{DeviceId, IdentityPub, PlacementStatus, SourceBlockId, Timestamp};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -244,10 +240,7 @@ impl Processor {
     /// Set the work event sender for the unified pipeline worker.
     ///
     /// Called from `handle/mod.rs::start()` after constructing both Processor and WorkPipeline.
-    pub fn set_work_event_tx(
-        &mut self,
-        tx: mpsc::Sender<crate::daemon::work_pipeline::WorkEvent>,
-    ) {
+    pub fn set_work_event_tx(&mut self, tx: mpsc::Sender<crate::daemon::work_pipeline::WorkEvent>) {
         self.work_event_tx = Some(tx);
     }
 
@@ -395,8 +388,7 @@ impl Processor {
             Message::SymbolTransfer(transfer) => {
                 let block_id = transfer.source_block_id;
                 // Extract ESI list before moving transfer into handle_symbol_transfer.
-                let mut esi_list: Vec<u32> =
-                    transfer.symbols.iter().map(|s| s.esi).collect();
+                let mut esi_list: Vec<u32> = transfer.symbols.iter().map(|s| s.esi).collect();
                 esi_list.sort_unstable();
                 match self.handle_symbol_transfer(from_master, transfer).await {
                     Ok(()) => {
@@ -421,7 +413,10 @@ impl Processor {
                 }
             }
             Message::PosHashChallenge(challenge) => {
-                match self.handle_pos_hash_challenge_inner(from_master, challenge).await {
+                match self
+                    .handle_pos_hash_challenge_inner(from_master, challenge)
+                    .await
+                {
                     Ok(reply) => {
                         let _ = self.swarm.respond(response_channel, reply);
                     }
@@ -468,12 +463,20 @@ impl Processor {
                 let _ = self.swarm.respond(response_channel, ack);
             }
             Message::SystemStateBackup(backup) => {
-                let ack = self.handle_system_state_backup_inner(from_master, backup).await;
-                let _ = self.swarm.respond(response_channel, Message::SystemStateAck(ack));
+                let ack = self
+                    .handle_system_state_backup_inner(from_master, backup)
+                    .await;
+                let _ = self
+                    .swarm
+                    .respond(response_channel, Message::SystemStateAck(ack));
             }
             Message::SystemStateRequest(req) => {
-                let resp = self.handle_system_state_request_inner(from_master, req).await;
-                let _ = self.swarm.respond(response_channel, Message::SystemStateResponse(resp));
+                let resp = self
+                    .handle_system_state_request_inner(from_master, req)
+                    .await;
+                let _ = self
+                    .swarm
+                    .respond(response_channel, Message::SystemStateResponse(resp));
             }
             Message::ClusterSyncRequest(req) => {
                 self.handle_cluster_sync_request_libp2p(
@@ -491,7 +494,9 @@ impl Processor {
                         own = %self.own_identity,
                         "processor: ClusterSyncResponse from non-cluster peer, ignoring"
                     );
-                    let _ = self.swarm.respond(response_channel, Message::Ack(AckMsg { v: 1 }));
+                    let _ = self
+                        .swarm
+                        .respond(response_channel, Message::Ack(AckMsg { v: 1 }));
                     return Ok(());
                 }
                 if let Err(e) = self.handle_cluster_sync_response(from_device, resp).await {
@@ -586,16 +591,14 @@ impl Processor {
     async fn dispatch_relay(&self, msg: InboundMessage) {
         use syncback_core::messages::from_cbor;
         match msg.msg_type.as_str() {
-            "peer_announce" => {
-                match from_cbor::<PeerAnnounceMsg>(&msg.payload) {
-                    Ok(pa) => {
-                        if let Err(e) = self.handle_peer_announce(pa).await {
-                            warn!(err = %e, "processor: PeerAnnounce via relay failed");
-                        }
+            "peer_announce" => match from_cbor::<PeerAnnounceMsg>(&msg.payload) {
+                Ok(pa) => {
+                    if let Err(e) = self.handle_peer_announce(pa).await {
+                        warn!(err = %e, "processor: PeerAnnounce via relay failed");
                     }
-                    Err(e) => warn!(err = %e, "processor: failed to decode PeerAnnounce from relay"),
                 }
-            }
+                Err(e) => warn!(err = %e, "processor: failed to decode PeerAnnounce from relay"),
+            },
             "pos_hash_challenge" => {
                 match from_cbor::<PosHashChallengeMsg>(&msg.payload) {
                     Ok(challenge) => {
@@ -604,8 +607,8 @@ impl Processor {
                         // Only the targeted device should respond; otherwise non-holder
                         // cluster members would emit valid-signed Nacks that the owner
                         // would mis-attribute to the real holder.
-                        if let Some(target) = challenge.device_id {
-                            if target != self.swarm.device_id {
+                        if let Some(target) = challenge.device_id
+                            && target != self.swarm.device_id {
                                 debug!(
                                     target = %target,
                                     own = %self.swarm.device_id,
@@ -613,38 +616,53 @@ impl Processor {
                                 );
                                 return;
                             }
-                        }
-                        match self.handle_pos_hash_challenge_inner(msg.from, challenge).await {
+                        match self
+                            .handle_pos_hash_challenge_inner(msg.from, challenge)
+                            .await
+                        {
                             Ok(reply) => {
                                 // Send response back via board (directed to challenger).
                                 let (reply_type, reply_payload) = match &reply {
                                     Message::PosHashResponse(r) => {
                                         match syncback_core::messages::to_cbor(r) {
                                             Ok(bytes) => ("pos_hash_response", bytes),
-                                            Err(e) => { warn!(err = %e, "processor: failed to encode PosHashResponse"); return; }
+                                            Err(e) => {
+                                                warn!(err = %e, "processor: failed to encode PosHashResponse");
+                                                return;
+                                            }
                                         }
                                     }
                                     Message::PosHashNack(n) => {
                                         match syncback_core::messages::to_cbor(n) {
                                             Ok(bytes) => ("pos_hash_nack", bytes),
-                                            Err(e) => { warn!(err = %e, "processor: failed to encode PosHashNack"); return; }
+                                            Err(e) => {
+                                                warn!(err = %e, "processor: failed to encode PosHashNack");
+                                                return;
+                                            }
                                         }
                                     }
                                     _ => return,
                                 };
                                 let mut reply_id = [0u8; 16];
                                 rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut reply_id);
-                                let _ = self.relay_post_tx.send(RelayPost {
-                                    msg_type: reply_type.to_string(),
-                                    target: Some(msg.from),
-                                    payload: reply_payload,
-                                    msg_id: reply_id,
-                                }).await;
+                                let _ = self
+                                    .relay_post_tx
+                                    .send(RelayPost {
+                                        msg_type: reply_type.to_string(),
+                                        target: Some(msg.from),
+                                        payload: reply_payload,
+                                        msg_id: reply_id,
+                                    })
+                                    .await;
                             }
-                            Err(e) => warn!(err = %e, "processor: PosHashChallenge via relay failed"),
+                            Err(e) => {
+                                warn!(err = %e, "processor: PosHashChallenge via relay failed")
+                            }
                         }
                     }
-                    Err(e) => warn!(err = %e, "processor: failed to decode PosHashChallenge from relay"),
+                    Err(e) => {
+                        warn!(err = %e, "processor: failed to decode PosHashChallenge from relay")
+                    }
                 }
             }
             "pos_hash_response" => {
@@ -652,15 +670,23 @@ impl Processor {
                     Ok(response) => {
                         // Resolve DeviceId: use device_id from message body if present,
                         // else fall back to first device for the master (msg.from).
-                        let holder_device = response.device_id
-                            .or_else(|| self.db.get_devices_for_master(&msg.from).ok()
-                                .and_then(|ds| ds.into_iter().next()))
+                        let holder_device = response
+                            .device_id
+                            .or_else(|| {
+                                self.db
+                                    .get_devices_for_master(&msg.from)
+                                    .ok()
+                                    .and_then(|ds| ds.into_iter().next())
+                            })
                             .unwrap_or(DeviceId(msg.from.0));
-                        if let Err(e) = self.handle_pos_hash_response(holder_device, response).await {
+                        if let Err(e) = self.handle_pos_hash_response(holder_device, response).await
+                        {
                             warn!(err = %e, "processor: PosHashResponse via relay failed");
                         }
                     }
-                    Err(e) => warn!(err = %e, "processor: failed to decode PosHashResponse from relay"),
+                    Err(e) => {
+                        warn!(err = %e, "processor: failed to decode PosHashResponse from relay")
+                    }
                 }
             }
             "pos_hash_nack" => {
@@ -668,9 +694,14 @@ impl Processor {
                     Ok(nack) => {
                         // Resolve DeviceId: use device_id from message body if present,
                         // else fall back to first device for the master (msg.from).
-                        let from_device = nack.device_id
-                            .or_else(|| self.db.get_devices_for_master(&msg.from).ok()
-                                .and_then(|ds| ds.into_iter().next()))
+                        let from_device = nack
+                            .device_id
+                            .or_else(|| {
+                                self.db
+                                    .get_devices_for_master(&msg.from)
+                                    .ok()
+                                    .and_then(|ds| ds.into_iter().next())
+                            })
                             .unwrap_or(DeviceId(msg.from.0));
                         if let Err(e) = self.handle_pos_hash_nack(from_device, nack).await {
                             warn!(err = %e, "processor: PosHashNack via relay failed");
@@ -679,58 +710,59 @@ impl Processor {
                     Err(e) => warn!(err = %e, "processor: failed to decode PosHashNack from relay"),
                 }
             }
-            "delete" => {
-                match from_cbor::<DeleteMsg>(&msg.payload) {
-                    Ok(delete) => {
-                        if let Err(e) = self.handle_delete(msg.from, delete).await {
-                            warn!(err = %e, "processor: Delete via relay failed");
-                        }
+            "delete" => match from_cbor::<DeleteMsg>(&msg.payload) {
+                Ok(delete) => {
+                    if let Err(e) = self.handle_delete(msg.from, delete).await {
+                        warn!(err = %e, "processor: Delete via relay failed");
                     }
-                    Err(e) => warn!(err = %e, "processor: failed to decode DeleteMsg from relay"),
                 }
-            }
-            "cancel_delete" => {
-                match from_cbor::<CancelDeleteMsg>(&msg.payload) {
-                    Ok(cancel) => {
-                        if let Err(e) = self.handle_cancel_delete(msg.from, cancel).await {
-                            warn!(err = %e, "processor: CancelDelete via relay failed");
-                        }
+                Err(e) => warn!(err = %e, "processor: failed to decode DeleteMsg from relay"),
+            },
+            "cancel_delete" => match from_cbor::<CancelDeleteMsg>(&msg.payload) {
+                Ok(cancel) => {
+                    if let Err(e) = self.handle_cancel_delete(msg.from, cancel).await {
+                        warn!(err = %e, "processor: CancelDelete via relay failed");
                     }
-                    Err(e) => warn!(err = %e, "processor: failed to decode CancelDeleteMsg from relay"),
                 }
-            }
+                Err(e) => warn!(err = %e, "processor: failed to decode CancelDeleteMsg from relay"),
+            },
             "symbol_dropped" => {
                 match from_cbor::<SymbolDroppedMsg>(&msg.payload) {
                     Ok(dropped) => {
                         // SymbolDropped comes from a holder — resolve DeviceId from master.
-                        let from_device = self.db.get_devices_for_master(&msg.from).ok()
+                        let from_device = self
+                            .db
+                            .get_devices_for_master(&msg.from)
+                            .ok()
                             .and_then(|ds| ds.into_iter().next())
                             .unwrap_or(DeviceId(msg.from.0));
                         if let Err(e) = self.handle_symbol_dropped(from_device, dropped).await {
                             warn!(err = %e, "processor: SymbolDropped via relay failed");
                         }
                     }
-                    Err(e) => warn!(err = %e, "processor: failed to decode SymbolDroppedMsg from relay"),
-                }
-            }
-            "symbol_drop_notice" => {
-                match from_cbor::<SymbolDropNoticeMsg>(&msg.payload) {
-                    Ok(notice) => {
-                        self.handle_symbol_drop_notice(msg.from, notice);
+                    Err(e) => {
+                        warn!(err = %e, "processor: failed to decode SymbolDroppedMsg from relay")
                     }
-                    Err(e) => warn!(err = %e, "processor: failed to decode SymbolDropNoticeMsg from relay"),
                 }
             }
-            "revocation_broadcast" => {
-                match from_cbor::<RevocationBroadcast>(&msg.payload) {
-                    Ok(broadcast) => {
-                        if let Err(e) = self.handle_revocation_broadcast(msg.from, broadcast).await {
-                            warn!(err = %e, "processor: RevocationBroadcast via relay failed");
-                        }
+            "symbol_drop_notice" => match from_cbor::<SymbolDropNoticeMsg>(&msg.payload) {
+                Ok(notice) => {
+                    self.handle_symbol_drop_notice(msg.from, notice);
+                }
+                Err(e) => {
+                    warn!(err = %e, "processor: failed to decode SymbolDropNoticeMsg from relay")
+                }
+            },
+            "revocation_broadcast" => match from_cbor::<RevocationBroadcast>(&msg.payload) {
+                Ok(broadcast) => {
+                    if let Err(e) = self.handle_revocation_broadcast(msg.from, broadcast).await {
+                        warn!(err = %e, "processor: RevocationBroadcast via relay failed");
                     }
-                    Err(e) => warn!(err = %e, "processor: failed to decode RevocationBroadcast from relay"),
                 }
-            }
+                Err(e) => {
+                    warn!(err = %e, "processor: failed to decode RevocationBroadcast from relay")
+                }
+            },
             "symbol_stored" => {
                 // Informational notification from a holder — Delta-era protocol
                 // surface kept for wire compatibility. No action taken: the owner
@@ -744,7 +776,11 @@ impl Processor {
                 debug!(from = %msg.from, "processor: storage_warning — informational, no-op");
             }
             other => {
-                let safe_type: String = other.chars().take(64).filter(|c| c.is_ascii_graphic() || *c == ' ').collect();
+                let safe_type: String = other
+                    .chars()
+                    .take(64)
+                    .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                    .collect();
                 debug!("dispatch_relay: unknown msg_type={safe_type}");
             }
         }
@@ -840,18 +876,14 @@ pub(crate) fn recompute_and_persist_block_cached_fields(db: &Db, block_id: &Sour
 
     let new_current_alive: u32 = placements
         .iter()
-        .filter(|p| {
-            p.status == PlacementStatus::Alive || p.status == PlacementStatus::Uncertain
-        })
+        .filter(|p| p.status == PlacementStatus::Alive || p.status == PlacementStatus::Uncertain)
         .count() as u32;
 
     // 3. Assemble HolderReliabilityInput for each Alive/Uncertain placement.
     let k_eff = block.erasure_params().k_eff;
     let holder_inputs: Vec<syncback_core::reliability::HolderReliabilityInput> = placements
         .iter()
-        .filter(|p| {
-            p.status == PlacementStatus::Alive || p.status == PlacementStatus::Uncertain
-        })
+        .filter(|p| p.status == PlacementStatus::Alive || p.status == PlacementStatus::Uncertain)
         .map(|p| {
             let survival_prob = db
                 .get_peer(&p.holder_id)
@@ -908,7 +940,11 @@ pub(crate) fn recompute_and_persist_block_cached_fields(db: &Db, block_id: &Sour
 }
 
 /// Record PoS outcome in the weekly stats table (best-effort, logs on error).
-pub(crate) fn record_pos_weekly(db: &Db, device: DeviceId, outcome: syncback_core::trust::PosOutcome) {
+pub(crate) fn record_pos_weekly(
+    db: &Db,
+    device: DeviceId,
+    outcome: syncback_core::trust::PosOutcome,
+) {
     use syncback_core::db::WeeklyPosEntry;
     let week = outcome.week_number;
     let existing = match db.get_pos_weekly(&device, week) {

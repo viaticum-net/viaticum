@@ -14,8 +14,8 @@ use libp2p::Multiaddr;
 use syncback_core::types::DeviceId;
 use tokio::time::timeout;
 
-use crate::daemon::network::swarm::{ProtocolEvent, SwarmHandle};
 use super::swarm_test_helpers::{get_listen_addr, make_swarm_config};
+use crate::daemon::network::swarm::{ProtocolEvent, SwarmHandle};
 
 /// Wait for a PeerAuthenticated event for the given DeviceId, up to `timeout_secs`.
 async fn wait_for_authenticated(
@@ -62,7 +62,10 @@ async fn swarm_starts_with_relay_and_dcutr_enabled() {
     let (handle, _events) = SwarmHandle::start(config).await.expect("start failed");
     tokio::time::sleep(Duration::from_millis(100)).await;
     let addrs = handle.listen_addrs().await.expect("listen_addrs failed");
-    assert!(!addrs.is_empty(), "swarm should have at least one listen address");
+    assert!(
+        !addrs.is_empty(),
+        "swarm should have at least one listen address"
+    );
 }
 
 /// Three-node scenario: A and B both connect to relay R.
@@ -136,10 +139,7 @@ async fn relay_reservation_is_logged_no_panic() {
     let r_peer_id = handle_r.peer_id;
 
     // A dials R. Relay client should automatically request a reservation.
-    handle_a
-        .dial(r_peer_id, r_addr)
-        .await
-        .expect("dial failed");
+    handle_a.dial(r_peer_id, r_addr).await.expect("dial failed");
 
     // Give the event loop time to process relay events.
     tokio::time::sleep(Duration::from_millis(500)).await;

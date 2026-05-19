@@ -1,7 +1,10 @@
 use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use hkdf::Hkdf;
-use raptorq::{EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockDecoder, SourceBlockEncoder};
+use raptorq::{
+    EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockDecoder,
+    SourceBlockEncoder,
+};
 use sha2::Sha256;
 
 use crate::types::{DeviceId, ErasureParams, SourceBlockId};
@@ -103,11 +106,7 @@ pub trait ErasureEncoder: Send + Sync {
     /// symbols must already be unbound (XOR'd back to raw RaptorQ output).
     /// Need at least params.k_eff symbols. May succeed with exactly k_eff.
     /// Returned block is padded to k * t bytes; caller trims to original size.
-    fn decode(
-        &self,
-        symbols: &[Symbol],
-        params: &ErasureParams,
-    ) -> Result<Vec<u8>, ErasureError>;
+    fn decode(&self, symbols: &[Symbol], params: &ErasureParams) -> Result<Vec<u8>, ErasureError>;
 
     /// Generate a single repair symbol for a new ESI, bound to a holder.
     ///
@@ -124,12 +123,7 @@ pub trait ErasureEncoder: Send + Sync {
 
     /// Unbind a received bound symbol: XOR ChaCha20 keystream back off.
     /// Returns raw RaptorQ symbol data, ready for decode().
-    fn unbind(
-        &self,
-        symbol: Symbol,
-        block_id: &SourceBlockId,
-        holder_id: &DeviceId,
-    ) -> Symbol;
+    fn unbind(&self, symbol: Symbol, block_id: &SourceBlockId, holder_id: &DeviceId) -> Symbol;
 
     /// Encode source_block into raw (unbound) RaptorQ symbols.
     /// No per-holder XOR is applied. ESI = start_esi..start_esi+count-1.
@@ -165,16 +159,13 @@ impl RaptorQEncoder {
         ObjectTransmissionInformation::new(
             k * t,
             params.t,
-            1,  // single source block
-            1,  // single sub-block (required when symbol_size % 8 != 0)
-            1,  // alignment=1 to accommodate symbol_size=65535
+            1, // single source block
+            1, // single sub-block (required when symbol_size % 8 != 0)
+            1, // alignment=1 to accommodate symbol_size=65535
         )
     }
 
-    fn make_block_encoder(
-        source_block: &[u8],
-        params: &ErasureParams,
-    ) -> SourceBlockEncoder {
+    fn make_block_encoder(source_block: &[u8], params: &ErasureParams) -> SourceBlockEncoder {
         let config = Self::make_config(params);
         let k = params.k as usize;
         let t = params.t as usize;
@@ -202,14 +193,13 @@ impl ErasureEncoder for RaptorQEncoder {
         holder_id: &DeviceId,
     ) -> Result<Vec<Symbol>, ErasureError> {
         let raw = self.encode_raw(source_block, params, start_esi, count)?;
-        Ok(raw.into_iter().map(|s| self.apply_binding(s, block_id, holder_id)).collect())
+        Ok(raw
+            .into_iter()
+            .map(|s| self.apply_binding(s, block_id, holder_id))
+            .collect())
     }
 
-    fn decode(
-        &self,
-        symbols: &[Symbol],
-        params: &ErasureParams,
-    ) -> Result<Vec<u8>, ErasureError> {
+    fn decode(&self, symbols: &[Symbol], params: &ErasureParams) -> Result<Vec<u8>, ErasureError> {
         let k_eff = params.k_eff as usize;
 
         if symbols.len() < k_eff {
@@ -243,12 +233,7 @@ impl ErasureEncoder for RaptorQEncoder {
         Ok(symbols.remove(0))
     }
 
-    fn unbind(
-        &self,
-        mut symbol: Symbol,
-        block_id: &SourceBlockId,
-        holder_id: &DeviceId,
-    ) -> Symbol {
+    fn unbind(&self, mut symbol: Symbol, block_id: &SourceBlockId, holder_id: &DeviceId) -> Symbol {
         let t = symbol.data.len();
         let keystream = binding_keystream(block_id, holder_id, symbol.esi, t);
         xor_inplace(&mut symbol.data, &keystream);
@@ -305,7 +290,10 @@ impl ErasureEncoder for RaptorQEncoder {
                 });
             }
 
-            symbols.push(Symbol { esi, data: raw_data });
+            symbols.push(Symbol {
+                esi,
+                data: raw_data,
+            });
         }
 
         Ok(symbols)

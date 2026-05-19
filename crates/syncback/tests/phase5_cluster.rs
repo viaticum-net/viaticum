@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use syncback::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
 use syncback::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
 use syncback_core::cluster::{
-    derive_device_key, derive_epoch_key, derive_master_key, issue_device_certificate,
-    issue_revocation, master_identity, ClusterState, EpochCounter,
+    ClusterState, EpochCounter, derive_device_key, derive_epoch_key, derive_master_key,
+    issue_device_certificate, issue_revocation, master_identity,
 };
 use syncback_core::db::Db;
 use syncback_core::erasure::RaptorQEncoder;
@@ -42,11 +42,21 @@ fn mk() -> ed25519_dalek::SigningKey {
 }
 
 fn device_a_id() -> DeviceId {
-    DeviceId(derive_device_key(SEED, &DEVICE_A_SEED).unwrap().verifying_key().to_bytes())
+    DeviceId(
+        derive_device_key(SEED, &DEVICE_A_SEED)
+            .unwrap()
+            .verifying_key()
+            .to_bytes(),
+    )
 }
 
 fn device_b_id() -> DeviceId {
-    DeviceId(derive_device_key(SEED, &DEVICE_B_SEED).unwrap().verifying_key().to_bytes())
+    DeviceId(
+        derive_device_key(SEED, &DEVICE_B_SEED)
+            .unwrap()
+            .verifying_key()
+            .to_bytes(),
+    )
 }
 
 /// Init ClusterState with both DEVICE_A and DEVICE_B registered.
@@ -164,7 +174,9 @@ fn two_devices_backup_then_dedup_on_second() {
     );
 
     // Only one source block in the DB: A's block (status = Active).
-    let blocks = db.list_source_blocks_by_status(SourceBlockStatus::Active).unwrap();
+    let blocks = db
+        .list_source_blocks_by_status(SourceBlockStatus::Active)
+        .unwrap();
     assert_eq!(blocks.len(), 1, "only one source block in DB after dedup");
 }
 
@@ -189,9 +201,19 @@ fn device_revocation_epoch_rotation_rejects_revoked_key() {
     state.revoke_device(rev.clone(), NOW, NOW).unwrap();
 
     // ClusterState: A revoked, epoch incremented.
-    assert!(state.is_device_revoked(&device_a_id()), "device A must be revoked");
-    assert!(!state.is_device_revoked(&device_b_id()), "device B must not be revoked");
-    assert_eq!(state.current_epoch(), EpochCounter(1), "epoch must be 1 after revocation");
+    assert!(
+        state.is_device_revoked(&device_a_id()),
+        "device A must be revoked"
+    );
+    assert!(
+        !state.is_device_revoked(&device_b_id()),
+        "device B must not be revoked"
+    );
+    assert_eq!(
+        state.current_epoch(),
+        EpochCounter(1),
+        "epoch must be 1 after revocation"
+    );
 
     // Only B remains active.
     let active = state.active_devices();
@@ -276,7 +298,10 @@ fn cluster_sync_propagates_file_deletion_event() {
     db_a.append_event(&EventEntry {
         timestamp: NOW,
         device_id: device_a_id(),
-        event: Event::FileDeleted { file_id: file_id_a, device_id: device_a_id() },
+        event: Event::FileDeleted {
+            file_id: file_id_a,
+            device_id: device_a_id(),
+        },
     })
     .unwrap();
 
@@ -300,7 +325,10 @@ fn cluster_sync_propagates_file_deletion_event() {
 
     let sync_a = ClusterSyncManager::new(
         db_a.clone(),
-        ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
+        ClusterSyncConfig {
+            our_device_id: device_a_id(),
+            batch_size: 100,
+        },
         Arc::new(Mutex::new(state_a)),
     );
 
@@ -310,7 +338,10 @@ fn cluster_sync_propagates_file_deletion_event() {
 
     let sync_b = ClusterSyncManager::new(
         db_b.clone(),
-        ClusterSyncConfig { our_device_id: device_b_id(), batch_size: 100 },
+        ClusterSyncConfig {
+            our_device_id: device_b_id(),
+            batch_size: 100,
+        },
         Arc::new(Mutex::new(state_b)),
     );
 
@@ -335,7 +366,10 @@ fn cluster_sync_propagates_file_deletion_event() {
     let has_deletion = response.events.iter().any(|(_, entry)| {
         matches!(&entry.event, Event::FileDeleted { file_id, .. } if *file_id == file_id_a)
     });
-    assert!(has_deletion, "FileDeleted event must be present in sync response");
+    assert!(
+        has_deletion,
+        "FileDeleted event must be present in sync response"
+    );
 
     // B applies the response.
     let applied = sync_b.process_sync_response(&a_device, response).unwrap();

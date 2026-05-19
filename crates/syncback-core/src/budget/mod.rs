@@ -3,11 +3,12 @@
 // All pure functions — no state, no DB, no async.
 
 use crate::constants::{
-    AGE_BONUS_CAP, AGE_BONUS_WEEKS, DEFAULT_SUCCESS_RATE, DROP_NOTICE_WINDOW_SECS,
-    FREE_TIER_GB, OVERHEAD_BASE, OVERHEAD_SCALE, SECS_PER_WEEK, WEEKLY_STATS_WINDOW,
-    WILLINGNESS_FACTOR,
+    AGE_BONUS_CAP, AGE_BONUS_WEEKS, DEFAULT_SUCCESS_RATE, DROP_NOTICE_WINDOW_SECS, FREE_TIER_GB,
+    OVERHEAD_BASE, OVERHEAD_SCALE, SECS_PER_WEEK, WEEKLY_STATS_WINDOW, WILLINGNESS_FACTOR,
 };
-use crate::types::{BudgetRecord, HoldingRecord, HoldingStatus, IdentityPub, SourceBlockId, Timestamp};
+use crate::types::{
+    BudgetRecord, HoldingRecord, HoldingStatus, IdentityPub, SourceBlockId, Timestamp,
+};
 
 #[cfg(test)]
 mod tests;
@@ -355,12 +356,8 @@ pub fn evaluate_pressure(
         .iter()
         .map(|record| {
             let trust = owner_trust(&record.owner_id);
-            let priority = eviction_priority(
-                record.importance,
-                trust,
-                record.received_at,
-                now_secs,
-            );
+            let priority =
+                eviction_priority(record.importance, trust, record.received_at, now_secs);
             // MarkedForDelete entries get priority 0.0 so they are evicted first.
             let priority = if record.status == HoldingStatus::MarkedForDelete {
                 0.0f64.min(priority)
@@ -386,7 +383,9 @@ pub fn evaluate_pressure(
     for candidate in &candidates {
         if !phase1_done {
             if freed_bytes < deficit_bytes {
-                let projected_used = used_bytes.saturating_sub(freed_bytes).saturating_sub(candidate.record.total_bytes);
+                let projected_used = used_bytes
+                    .saturating_sub(freed_bytes)
+                    .saturating_sub(candidate.record.total_bytes);
                 if hard_quota_bytes > 0 && projected_used < hard_quota_bytes {
                     continue;
                 }

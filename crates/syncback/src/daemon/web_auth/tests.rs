@@ -5,7 +5,11 @@ use std::fs;
 fn load_or_create_token_creates_file_if_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let token = load_or_create_token(tmp.path()).unwrap();
-    assert_eq!(token.len(), 43, "32 random bytes base64 (no padding) = 43 chars");
+    assert_eq!(
+        token.len(),
+        43,
+        "32 random bytes base64 (no padding) = 43 chars"
+    );
     let file_path = tmp.path().join("api-token");
     assert!(file_path.exists());
     let contents = fs::read_to_string(&file_path).unwrap();
@@ -58,7 +62,11 @@ fn api_token_is_unique_across_multiple_generations() {
         let token = load_or_create_token(tmp.path()).unwrap();
         tokens.insert(token);
     }
-    assert_eq!(tokens.len(), 100, "all 100 generated tokens must be distinct");
+    assert_eq!(
+        tokens.len(),
+        100,
+        "all 100 generated tokens must be distinct"
+    );
 }
 
 #[test]
@@ -80,9 +88,9 @@ fn write_port_file_sets_mode_0600_on_unix() {
 
 // ── Auth middleware + /auth/start ────────────────────────────────────────────
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
 use tower::ServiceExt;
 
 fn test_router(token: String) -> Router {
@@ -100,7 +108,12 @@ fn test_router(token: String) -> Router {
 async fn auth_middleware_rejects_missing_token() {
     let app = test_router("secret".to_string());
     let resp = app
-        .oneshot(Request::builder().uri("/api/echo").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/echo")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);

@@ -1,6 +1,6 @@
 use super::{
-    compute_combined, compute_effective_trust, recompute_master_trust, DeviceTrustRecord,
-    MasterTrustRecord, PosOutcome, TrustEngine,
+    DeviceTrustRecord, MasterTrustRecord, PosOutcome, TrustEngine, compute_combined,
+    compute_effective_trust, recompute_master_trust,
 };
 use crate::constants::{INITIAL_TRUST_P, KI, KP, MAX_COMBINED_TRUST};
 use crate::types::{DeviceId, IdentityPub, Timestamp};
@@ -25,7 +25,10 @@ fn ts(secs: u64) -> Timestamp {
 fn compute_combined_basic() {
     let result = compute_combined(0.8, 0.5, 0.7);
     let expected = (KP * 0.8 + KI * 0.5) * 0.7;
-    assert!((result - expected).abs() < 1e-10, "got {result}, expected {expected}");
+    assert!(
+        (result - expected).abs() < 1e-10,
+        "got {result}, expected {expected}"
+    );
     assert!((result - 0.8365).abs() < 1e-4);
 }
 
@@ -106,11 +109,7 @@ fn recalculate_p_rolling_window() {
 
     engine.upsert_peer_device(peer_a, master(0), now);
 
-    let records = vec![
-        (6u32, 5u32, 5u32),
-        (7u32, 5u32, 3u32),
-        (10u32, 2u32, 2u32),
-    ];
+    let records = vec![(6u32, 5u32, 5u32), (7u32, 5u32, 3u32), (10u32, 2u32, 2u32)];
     for (week, challenged, passed) in records {
         engine
             .record_pos_result(
@@ -130,11 +129,21 @@ fn recalculate_p_rolling_window() {
     // Window [7, 10]: weeks 7 and 10 are in range; week 6 is excluded.
     // P = (3 + 2) / (5 + 2) = 5/7
     let expected_p = 5.0 / 7.0;
-    assert!((score.p - expected_p).abs() < 1e-10, "p={} expected={}", score.p, expected_p);
+    assert!(
+        (score.p - expected_p).abs() < 1e-10,
+        "p={} expected={}",
+        score.p,
+        expected_p
+    );
 
     // I = mean of all active weeks: week6=1.0, week7=0.6, week10=1.0 → (1.0+0.6+1.0)/3
     let expected_i = (1.0 + 0.6 + 1.0) / 3.0;
-    assert!((score.i - expected_i).abs() < 1e-10, "i={} expected={}", score.i, expected_i);
+    assert!(
+        (score.i - expected_i).abs() < 1e-10,
+        "i={} expected={}",
+        score.i,
+        expected_i
+    );
 }
 
 #[test]
@@ -158,7 +167,10 @@ fn recalculate_p_is_initial_when_no_pos_data_in_window() {
     // current_week=10, window=[7,10] — week 3 is outside.
     let score = engine.recalculate(&peer_a, now, 10).unwrap();
 
-    assert_eq!(score.p, INITIAL_TRUST_P, "P should be INITIAL_TRUST_P when no data in window");
+    assert_eq!(
+        score.p, INITIAL_TRUST_P,
+        "P should be INITIAL_TRUST_P when no data in window"
+    );
     // I is still computed from all active weeks (week 3 passes 5/5 = 1.0)
     assert!((score.i - 1.0).abs() < 1e-10, "I should be 1.0");
 }
@@ -170,12 +182,13 @@ fn update_storage_bytes_s_neutral_when_we_store_nothing() {
     let now = ts(1_000_000);
 
     engine.upsert_peer_device(peer_a, master(0), now);
-    engine
-        .update_storage_bytes(peer_a, 0, 500_000)
-        .unwrap();
+    engine.update_storage_bytes(peer_a, 0, 500_000).unwrap();
 
     let record = engine.get_peer(&peer_a).unwrap();
-    assert_eq!(record.trust_s, 1.0, "S should be 1.0 (neutral) when we store nothing");
+    assert_eq!(
+        record.trust_s, 1.0,
+        "S should be 1.0 (neutral) when we store nothing"
+    );
 }
 
 #[test]
@@ -224,9 +237,7 @@ fn zero_trust_resets_p_and_i() {
     assert!(score_before.p > 0.0);
     assert!(score_before.i > 0.0);
 
-    engine
-        .update_storage_bytes(peer_a, 0, 1_000_000)
-        .unwrap();
+    engine.update_storage_bytes(peer_a, 0, 1_000_000).unwrap();
     let s_before = engine.get_peer(&peer_a).unwrap().trust_s;
 
     engine.zero_trust(&peer_a).unwrap();
@@ -236,7 +247,10 @@ fn zero_trust_resets_p_and_i() {
     assert_eq!(score_after.i, 0.0, "I should be 0.0 after zero_trust");
 
     let record = engine.get_peer(&peer_a).unwrap();
-    assert_eq!(record.trust_s, s_before, "S should be unchanged by zero_trust");
+    assert_eq!(
+        record.trust_s, s_before,
+        "S should be unchanged by zero_trust"
+    );
 }
 
 #[test]
@@ -286,8 +300,14 @@ fn load_round_trips_state() {
     let score_a2 = engine2.score(&peer_a).unwrap();
     let score_b2 = engine2.score(&peer_b).unwrap();
 
-    assert_eq!(score_a1, score_a2, "peer_a scores should match after round-trip");
-    assert_eq!(score_b1, score_b2, "peer_b scores should match after round-trip");
+    assert_eq!(
+        score_a1, score_a2,
+        "peer_a scores should match after round-trip"
+    );
+    assert_eq!(
+        score_b1, score_b2,
+        "peer_b scores should match after round-trip"
+    );
 
     // Verify recalculate produces same results after load
     engine2.recalculate(&peer_a, now, 5).unwrap();
@@ -448,7 +468,14 @@ fn recent_pos_stats_single_week_in_window() {
     let p = peer(1);
     engine.upsert_peer_device(p, master(0), ts(1_000_000));
     engine
-        .record_pos_result(p, PosOutcome { week_number: 10, challenged: 5, passed: 4 })
+        .record_pos_result(
+            p,
+            PosOutcome {
+                week_number: 10,
+                challenged: 5,
+                passed: 4,
+            },
+        )
         .unwrap();
     let (challenged, passed) = engine.recent_pos_stats(&p, 10, 4);
     assert_eq!(challenged, 5);
@@ -461,13 +488,34 @@ fn recent_pos_stats_multiple_weeks_summed() {
     let p = peer(1);
     engine.upsert_peer_device(p, master(0), ts(1_000_000));
     engine
-        .record_pos_result(p, PosOutcome { week_number: 8, challenged: 3, passed: 2 })
+        .record_pos_result(
+            p,
+            PosOutcome {
+                week_number: 8,
+                challenged: 3,
+                passed: 2,
+            },
+        )
         .unwrap();
     engine
-        .record_pos_result(p, PosOutcome { week_number: 9, challenged: 5, passed: 5 })
+        .record_pos_result(
+            p,
+            PosOutcome {
+                week_number: 9,
+                challenged: 5,
+                passed: 5,
+            },
+        )
         .unwrap();
     engine
-        .record_pos_result(p, PosOutcome { week_number: 10, challenged: 4, passed: 3 })
+        .record_pos_result(
+            p,
+            PosOutcome {
+                week_number: 10,
+                challenged: 4,
+                passed: 3,
+            },
+        )
         .unwrap();
     let (challenged, passed) = engine.recent_pos_stats(&p, 10, 4);
     assert_eq!(challenged, 12);
@@ -481,10 +529,24 @@ fn recent_pos_stats_excludes_weeks_outside_window() {
     engine.upsert_peer_device(p, master(0), ts(1_000_000));
     // week 5 is outside a 4-week window ending at week 10 (window: 7..=10)
     engine
-        .record_pos_result(p, PosOutcome { week_number: 5, challenged: 10, passed: 10 })
+        .record_pos_result(
+            p,
+            PosOutcome {
+                week_number: 5,
+                challenged: 10,
+                passed: 10,
+            },
+        )
         .unwrap();
     engine
-        .record_pos_result(p, PosOutcome { week_number: 9, challenged: 3, passed: 2 })
+        .record_pos_result(
+            p,
+            PosOutcome {
+                week_number: 9,
+                challenged: 3,
+                passed: 2,
+            },
+        )
         .unwrap();
     let (challenged, passed) = engine.recent_pos_stats(&p, 10, 4);
     assert_eq!(challenged, 3);
@@ -546,7 +608,11 @@ fn trust_converges_after_sustained_perfect_pos() {
         engine
             .record_pos_result(
                 p,
-                PosOutcome { week_number: week, challenged: 10, passed: 10 },
+                PosOutcome {
+                    week_number: week,
+                    challenged: 10,
+                    passed: 10,
+                },
             )
             .unwrap();
     }
@@ -638,7 +704,10 @@ fn compute_effective_trust_device_above_master() {
         "expected {expected}, got {result}"
     );
     // Effective can exceed master.combined — this is correct
-    assert!(result > 0.5, "effective should exceed low master trust when device is mature");
+    assert!(
+        result > 0.5,
+        "effective should exceed low master trust when device is mature"
+    );
 }
 
 #[test]

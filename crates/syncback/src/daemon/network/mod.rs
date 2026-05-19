@@ -16,12 +16,12 @@ pub mod addr;
 mod no_port_reuse;
 
 #[cfg(test)]
-pub(crate) mod swarm_test_helpers;
-#[cfg(test)]
-mod swarm_tests;
-#[cfg(test)]
 mod swarm_kad_tests;
 #[cfg(test)]
 mod swarm_nat_tests;
+#[cfg(test)]
+pub(crate) mod swarm_test_helpers;
+#[cfg(test)]
+mod swarm_tests;
 #[cfg(test)]
 mod tests;

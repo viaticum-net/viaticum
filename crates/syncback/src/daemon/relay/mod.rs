@@ -17,11 +17,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use syncback_core::constants::{MAX_BOARD_ENTRIES, MAX_BOARD_ENTRIES_PER_AUTHOR, MAX_BOARD_SIZE_BYTES, RELAY_TTL_SECS};
+use syncback_core::constants::{
+    MAX_BOARD_ENTRIES, MAX_BOARD_ENTRIES_PER_AUTHOR, MAX_BOARD_SIZE_BYTES, RELAY_TTL_SECS,
+};
 use syncback_core::messages::{
-    build_broadcast_entry, build_directed_entry, check_relay_hop, decrypt_directed,
-    encrypt_directed, from_cbor, relay_copy, to_cbor,
-    verify_board_entry_sig, BoardEntryKind, MessageError, StoredEntry,
+    BoardEntryKind, MessageError, StoredEntry, build_broadcast_entry, build_directed_entry,
+    check_relay_hop, decrypt_directed, encrypt_directed, from_cbor, relay_copy, to_cbor,
+    verify_board_entry_sig,
 };
 use syncback_core::types::{IdentityPub, Timestamp};
 use tracing::{debug, error, info, warn};
@@ -288,8 +290,7 @@ impl RelayManager {
             }
 
             // 4. Signature verification.
-            if let Err(e) =
-                verify_board_entry_sig(&remote.entry, &remote.msg_type, &remote.msg_id)
+            if let Err(e) = verify_board_entry_sig(&remote.entry, &remote.msg_type, &remote.msg_id)
             {
                 warn!(
                     msg_id = ?remote.msg_id,
@@ -451,11 +452,7 @@ impl RelayManager {
         }
 
         // Byte-size limit: approximate.
-        let mut total_bytes: usize = self
-            .entries
-            .iter()
-            .map(board::entry_size_bytes)
-            .sum();
+        let mut total_bytes: usize = self.entries.iter().map(board::entry_size_bytes).sum();
         while total_bytes > self.config.max_size_bytes && !self.entries.is_empty() {
             let removed = self.entries.remove(0);
             total_bytes = total_bytes.saturating_sub(board::entry_size_bytes(&removed));
@@ -477,7 +474,11 @@ impl RelayManager {
             // Atomic rewrite.
             board::rewrite_board(&self.config.board_path, &self.entries)?;
 
-            debug!(removed, remaining = self.entries.len(), "relay: pruned board");
+            debug!(
+                removed,
+                remaining = self.entries.len(),
+                "relay: pruned board"
+            );
         }
 
         Ok(removed)
@@ -518,11 +519,9 @@ impl RelayManager {
         board_sync_interval_secs: u64,
         swarm: Option<std::sync::Arc<crate::daemon::network::swarm::SwarmHandle>>,
     ) -> anyhow::Result<()> {
+        use tokio::time::{Duration, interval};
 
-        use tokio::time::{interval, Duration};
-
-        let prune_interval =
-            Duration::from_secs(self.config.prune_interval_secs);
+        let prune_interval = Duration::from_secs(self.config.prune_interval_secs);
         let mut prune_timer = interval(prune_interval);
         // First tick fires immediately; skip it so we don't double-prune
         // right after `new()` already pruned on startup.
@@ -532,10 +531,7 @@ impl RelayManager {
         // Skip first tick (entries are empty at startup anyway).
         board_push_timer.tick().await;
 
-        info!(
-            board_sync_interval_secs,
-            "relay manager running"
-        );
+        info!(board_sync_interval_secs, "relay manager running");
 
         loop {
             tokio::select! {
@@ -682,15 +678,23 @@ impl RelayManager {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 swarm.send_to_device(peer.device_id, Message::BoardSync(msg.clone())),
-            ).await;
+            )
+            .await;
             match result {
-                Ok(Ok(_)) => { ok += 1; }
-                _ => { fail += 1; }
+                Ok(Ok(_)) => {
+                    ok += 1;
+                }
+                _ => {
+                    fail += 1;
+                }
             }
         }
 
         if ok > 0 || fail > 0 {
-            debug!(entries = self.entries.len(), ok, fail, "relay: board push complete");
+            debug!(
+                entries = self.entries.len(),
+                ok, fail, "relay: board push complete"
+            );
         }
     }
 

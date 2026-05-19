@@ -26,35 +26,91 @@ pub(crate) fn format_prometheus(status: &StatusData, node_id: &str) -> String {
 
     // Node-level gauges
     let _ = writeln!(out, "# TYPE syncback_peer_count gauge");
-    let _ = writeln!(out, "syncback_peer_count{{node=\"{node_id}\"}} {}", status.peer_count);
+    let _ = writeln!(
+        out,
+        "syncback_peer_count{{node=\"{node_id}\"}} {}",
+        status.peer_count
+    );
     let _ = writeln!(out, "# TYPE syncback_avg_trust gauge");
-    let _ = writeln!(out, "syncback_avg_trust{{node=\"{node_id}\"}} {:.6}", status.avg_trust);
+    let _ = writeln!(
+        out,
+        "syncback_avg_trust{{node=\"{node_id}\"}} {:.6}",
+        status.avg_trust
+    );
     let _ = writeln!(out, "# TYPE syncback_holding_bytes gauge");
-    let _ = writeln!(out, "syncback_holding_bytes{{node=\"{node_id}\"}} {}", status.holding_bytes);
+    let _ = writeln!(
+        out,
+        "syncback_holding_bytes{{node=\"{node_id}\"}} {}",
+        status.holding_bytes
+    );
     let _ = writeln!(out, "# TYPE syncback_backed_up_files gauge");
-    let _ = writeln!(out, "syncback_backed_up_files{{node=\"{node_id}\"}} {}", status.backed_up_files);
+    let _ = writeln!(
+        out,
+        "syncback_backed_up_files{{node=\"{node_id}\"}} {}",
+        status.backed_up_files
+    );
     let _ = writeln!(out, "# TYPE syncback_backed_up_bytes gauge");
-    let _ = writeln!(out, "syncback_backed_up_bytes{{node=\"{node_id}\"}} {}", status.backed_up_bytes);
+    let _ = writeln!(
+        out,
+        "syncback_backed_up_bytes{{node=\"{node_id}\"}} {}",
+        status.backed_up_bytes
+    );
     let _ = writeln!(out, "# TYPE syncback_blocks_ok gauge");
-    let _ = writeln!(out, "syncback_blocks_ok{{node=\"{node_id}\"}} {}", status.blocks_ok);
+    let _ = writeln!(
+        out,
+        "syncback_blocks_ok{{node=\"{node_id}\"}} {}",
+        status.blocks_ok
+    );
     let _ = writeln!(out, "# TYPE syncback_blocks_at_risk gauge");
-    let _ = writeln!(out, "syncback_blocks_at_risk{{node=\"{node_id}\"}} {}", status.blocks_at_risk);
+    let _ = writeln!(
+        out,
+        "syncback_blocks_at_risk{{node=\"{node_id}\"}} {}",
+        status.blocks_at_risk
+    );
     let _ = writeln!(out, "# TYPE syncback_blocks_needing_repair gauge");
-    let _ = writeln!(out, "syncback_blocks_needing_repair{{node=\"{node_id}\"}} {}", status.blocks_needing_repair);
+    let _ = writeln!(
+        out,
+        "syncback_blocks_needing_repair{{node=\"{node_id}\"}} {}",
+        status.blocks_needing_repair
+    );
     let _ = writeln!(out, "# TYPE syncback_placement_alive gauge");
-    let _ = writeln!(out, "syncback_placement_alive{{node=\"{node_id}\"}} {}", status.placement_alive);
+    let _ = writeln!(
+        out,
+        "syncback_placement_alive{{node=\"{node_id}\"}} {}",
+        status.placement_alive
+    );
     let _ = writeln!(out, "# TYPE syncback_placement_lost gauge");
-    let _ = writeln!(out, "syncback_placement_lost{{node=\"{node_id}\"}} {}", status.placement_lost);
+    let _ = writeln!(
+        out,
+        "syncback_placement_lost{{node=\"{node_id}\"}} {}",
+        status.placement_lost
+    );
     let _ = writeln!(out, "# TYPE syncback_effective_quota_bytes gauge");
-    let _ = writeln!(out, "syncback_effective_quota_bytes{{node=\"{node_id}\"}} {}", status.effective_quota_bytes);
+    let _ = writeln!(
+        out,
+        "syncback_effective_quota_bytes{{node=\"{node_id}\"}} {}",
+        status.effective_quota_bytes
+    );
     let _ = writeln!(out, "# TYPE syncback_used_bytes gauge");
-    let _ = writeln!(out, "syncback_used_bytes{{node=\"{node_id}\"}} {}", status.used_bytes);
+    let _ = writeln!(
+        out,
+        "syncback_used_bytes{{node=\"{node_id}\"}} {}",
+        status.used_bytes
+    );
 
     // Counters
     let _ = writeln!(out, "# TYPE syncback_pos_challenges_total counter");
-    let _ = writeln!(out, "syncback_pos_challenges_total{{node=\"{node_id}\"}} {}", status.pos_total_challenges);
+    let _ = writeln!(
+        out,
+        "syncback_pos_challenges_total{{node=\"{node_id}\"}} {}",
+        status.pos_total_challenges
+    );
     let _ = writeln!(out, "# TYPE syncback_pos_passes_total counter");
-    let _ = writeln!(out, "syncback_pos_passes_total{{node=\"{node_id}\"}} {}", status.pos_total_passes);
+    let _ = writeln!(
+        out,
+        "syncback_pos_passes_total{{node=\"{node_id}\"}} {}",
+        status.pos_total_passes
+    );
 
     // Per-peer gauges
     if !status.peers.is_empty() {
@@ -67,12 +123,36 @@ pub(crate) fn format_prometheus(status: &StatusData, node_id: &str) -> String {
     }
     for p in &status.peers {
         let peer = &p.identity_hex;
-        let _ = writeln!(out, "syncback_trust_p{{node=\"{node_id}\",peer=\"{peer}\"}} {:.6}", p.trust_p);
-        let _ = writeln!(out, "syncback_trust_i{{node=\"{node_id}\",peer=\"{peer}\"}} {:.6}", p.trust_i);
-        let _ = writeln!(out, "syncback_trust_s{{node=\"{node_id}\",peer=\"{peer}\"}} {:.6}", p.trust_s);
-        let _ = writeln!(out, "syncback_trust_combined{{node=\"{node_id}\",peer=\"{peer}\"}} {:.6}", p.trust);
-        let _ = writeln!(out, "syncback_peer_bytes_we_store{{node=\"{node_id}\",peer=\"{peer}\"}} {}", p.bytes_we_store);
-        let _ = writeln!(out, "syncback_peer_bytes_stored_for_us{{node=\"{node_id}\",peer=\"{peer}\"}} {}", p.bytes_peer_stores);
+        let _ = writeln!(
+            out,
+            "syncback_trust_p{{node=\"{node_id}\",peer=\"{peer}\"}} {:.6}",
+            p.trust_p
+        );
+        let _ = writeln!(
+            out,
+            "syncback_trust_i{{node=\"{node_id}\",peer=\"{peer}\"}} {:.6}",
+            p.trust_i
+        );
+        let _ = writeln!(
+            out,
+            "syncback_trust_s{{node=\"{node_id}\",peer=\"{peer}\"}} {:.6}",
+            p.trust_s
+        );
+        let _ = writeln!(
+            out,
+            "syncback_trust_combined{{node=\"{node_id}\",peer=\"{peer}\"}} {:.6}",
+            p.trust
+        );
+        let _ = writeln!(
+            out,
+            "syncback_peer_bytes_we_store{{node=\"{node_id}\",peer=\"{peer}\"}} {}",
+            p.bytes_we_store
+        );
+        let _ = writeln!(
+            out,
+            "syncback_peer_bytes_stored_for_us{{node=\"{node_id}\",peer=\"{peer}\"}} {}",
+            p.bytes_peer_stores
+        );
     }
 
     out

@@ -10,7 +10,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use syncback_core::messages::{from_cbor, to_cbor, StoredEntry};
+use syncback_core::messages::{StoredEntry, from_cbor, to_cbor};
 use tracing::warn;
 
 /// Load all entries from the board file.
@@ -68,8 +68,8 @@ pub fn load_board(path: &Path) -> io::Result<Vec<StoredEntry>> {
 ///
 /// Opens the file in append mode (creates if absent).
 pub fn append_entry(path: &Path, entry: &StoredEntry) -> io::Result<()> {
-    let cbor = to_cbor(entry)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let cbor =
+        to_cbor(entry).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     let len = cbor.len() as u32;
     let len_bytes = len.to_be_bytes();

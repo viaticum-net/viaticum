@@ -3,9 +3,9 @@ use crate::constants::{
     PROTOCOL_VERSION, RELAY_TTL_SECS,
 };
 use crate::erasure::Symbol;
-use crate::types::{sig_serde, DeviceId, IdentityPub, SourceBlockId, Timestamp};
-use chacha20poly1305::aead::{AeadInPlace, NewAead};
+use crate::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp, sig_serde};
 use chacha20poly1305::ChaCha20Poly1305;
+use chacha20poly1305::aead::{AeadInPlace, NewAead};
 use ed25519_dalek::Signer;
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -445,7 +445,10 @@ pub enum MessageError {
     #[error("cbor decode error: {0}")]
     CborDecode(String),
 
-    #[error("message too large: {size} bytes, max {}", crate::constants::MAX_MESSAGE_SIZE)]
+    #[error(
+        "message too large: {size} bytes, max {}",
+        crate::constants::MAX_MESSAGE_SIZE
+    )]
     TooLarge { size: usize },
 
     #[error("frame length mismatch: prefix says {declared}, got {actual}")]
@@ -519,7 +522,9 @@ pub fn unframe_message(buf: &[u8]) -> Result<(Message, usize), MessageError> {
     }
     let declared = u32::from_be_bytes(buf[0..4].try_into().unwrap());
     if declared > MAX_MESSAGE_SIZE {
-        return Err(MessageError::TooLarge { size: declared as usize });
+        return Err(MessageError::TooLarge {
+            size: declared as usize,
+        });
     }
     let declared_usize = declared as usize;
     let available = buf.len() - 4;
@@ -617,7 +622,8 @@ pub fn verify_peer_announce(msg: &PeerAnnounceMsg) -> Result<(), MessageError> {
     let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&msg.identity_pub.0)
         .map_err(|_| MessageError::BadSignature)?;
     let signature = ed25519_dalek::Signature::from_bytes(&msg.sig);
-    let sig_input = peer_announce_sig_input(&msg.identity_pub, &msg.timestamp, msg.x25519_pub.as_ref());
+    let sig_input =
+        peer_announce_sig_input(&msg.identity_pub, &msg.timestamp, msg.x25519_pub.as_ref());
     verifying_key
         .verify_strict(&sig_input, &signature)
         .map_err(|_| MessageError::BadSignature)?;
@@ -778,9 +784,7 @@ pub fn verify_symbol_offer(msg: &SymbolOfferMsg, owner: &IdentityPub) -> Result<
 ///
 /// If no device_cert is present, returns Ok(None).
 /// If a cert is present, verifies it and returns Ok(Some(master_pub_key)) on success.
-pub fn extract_cluster_identity(
-    msg: &HandshakeMsg,
-) -> Result<Option<IdentityPub>, MessageError> {
+pub fn extract_cluster_identity(msg: &HandshakeMsg) -> Result<Option<IdentityPub>, MessageError> {
     let cert = match &msg.device_cert {
         None => return Ok(None),
         Some(c) => c,
@@ -1080,7 +1084,10 @@ pub fn build_symbol_dropped(
 /// Verify a SymbolDroppedMsg signature against the claimed holder identity.
 ///
 /// `holder` is the IdentityPub of the peer who sent this message.
-pub fn verify_symbol_dropped(msg: &SymbolDroppedMsg, holder: &IdentityPub) -> Result<(), MessageError> {
+pub fn verify_symbol_dropped(
+    msg: &SymbolDroppedMsg,
+    holder: &IdentityPub,
+) -> Result<(), MessageError> {
     let vk = ed25519_dalek::VerifyingKey::from_bytes(&holder.0)
         .map_err(|_| MessageError::BadSignature)?;
     let sig = ed25519_dalek::Signature::from_bytes(&msg.sig);

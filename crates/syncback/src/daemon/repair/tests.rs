@@ -13,8 +13,8 @@ use std::sync::Arc;
 use syncback_core::db::Db;
 use syncback_core::erasure::RaptorQEncoder;
 use syncback_core::types::{
-    DeviceId, FileId, IdentityPub, PlacementStatus, SourceBlockId,
-    SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
+    DeviceId, FileId, IdentityPub, PlacementStatus, SourceBlockId, SourceBlockRecord,
+    SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
 };
 use tempfile::TempDir;
 
@@ -90,7 +90,6 @@ fn make_agent(db: Db, symbols_dir: &std::path::Path) -> RepairAgent {
     )
 }
 
-
 // ─── test 16: handle_symbol_dropped_transitions_to_lost ──────────────────────
 
 #[tokio::test]
@@ -101,11 +100,19 @@ async fn handle_symbol_dropped_transitions_to_lost() {
     let bid = block_id(20);
     let hid = holder_id(21);
 
-    db.upsert_placement(&make_placement(bid, hid, vec![(0, 1)], PlacementStatus::Alive))
-        .unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        hid,
+        vec![(0, 1)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
     let agent = make_agent(db.clone(), symbols_dir.path());
-    agent.handle_symbol_dropped(&bid, &hid, now()).await.unwrap();
+    agent
+        .handle_symbol_dropped(&bid, &hid, now())
+        .await
+        .unwrap();
 
     let updated = db.get_placement(&bid, &hid).unwrap().unwrap();
     assert_eq!(updated.status, PlacementStatus::Lost);
@@ -122,8 +129,13 @@ async fn handle_pos_nack_transitions_to_lost() {
     let bid = block_id(30);
     let hid = holder_id(31);
 
-    db.upsert_placement(&make_placement(bid, hid, vec![(0, 1)], PlacementStatus::Alive))
-        .unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        hid,
+        vec![(0, 1)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
     let agent = make_agent(db.clone(), symbols_dir.path());
     agent.handle_pos_nack(&bid, &hid, now()).await.unwrap();
@@ -142,12 +154,20 @@ async fn handle_symbol_dropped_then_pos_nack_is_idempotent() {
     let bid = block_id(40);
     let hid = holder_id(41);
 
-    db.upsert_placement(&make_placement(bid, hid, vec![(0, 1)], PlacementStatus::Alive))
-        .unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        hid,
+        vec![(0, 1)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
     let agent = make_agent(db.clone(), symbols_dir.path());
 
-    agent.handle_symbol_dropped(&bid, &hid, now()).await.unwrap();
+    agent
+        .handle_symbol_dropped(&bid, &hid, now())
+        .await
+        .unwrap();
     let after_drop = db.get_placement(&bid, &hid).unwrap().unwrap();
     assert_eq!(after_drop.status, PlacementStatus::Lost);
 
@@ -166,13 +186,21 @@ async fn handle_pos_nack_then_symbol_dropped_is_idempotent() {
     let bid = block_id(50);
     let hid = holder_id(51);
 
-    db.upsert_placement(&make_placement(bid, hid, vec![(0, 1)], PlacementStatus::Alive))
-        .unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        hid,
+        vec![(0, 1)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
     let agent = make_agent(db.clone(), symbols_dir.path());
 
     agent.handle_pos_nack(&bid, &hid, now()).await.unwrap();
-    agent.handle_symbol_dropped(&bid, &hid, now()).await.unwrap();
+    agent
+        .handle_symbol_dropped(&bid, &hid, now())
+        .await
+        .unwrap();
 
     let final_placement = db.get_placement(&bid, &hid).unwrap().unwrap();
     assert_eq!(final_placement.status, PlacementStatus::Lost);
@@ -195,7 +223,13 @@ fn repair_multiple_holders_from_same_raw_files_get_distinct_bound_bytes() {
     let encoder = RaptorQEncoder::new();
     let block_id = SourceBlockId([0xE0u8; 32]);
     let source = vec![0x42u8; 65535];
-    let params = ErasureParams { k: 1, k_eff: 4, t: 65535, overhead: 1.5, n: 4 };
+    let params = ErasureParams {
+        k: 1,
+        k_eff: 4,
+        t: 65535,
+        overhead: 1.5,
+        n: 4,
+    };
 
     let raw_syms = encoder.encode_raw(&source, &params, 0, 1).unwrap();
     let raw = &raw_syms[0];
@@ -247,21 +281,40 @@ async fn repair_agent_mark_placement_lost_updates_current_alive() {
 
     db.upsert_source_block(&make_block_for_hook(bid)).unwrap();
 
-    db.upsert_placement(&make_placement(bid, hid_a, vec![(0, 4)], PlacementStatus::Alive)).unwrap();
-    db.upsert_placement(&make_placement(bid, hid_b, vec![(4, 4)], PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        hid_a,
+        vec![(0, 4)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        hid_b,
+        vec![(4, 4)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
-    db.update_block_cached_fields(&bid, 0.5, 2, 0.9, 0.99, None, 0).unwrap();
+    db.update_block_cached_fields(&bid, 0.5, 2, 0.9, 0.99, None, 0)
+        .unwrap();
 
     let agent = make_agent(db.clone(), symbols_dir.path());
-    agent.handle_symbol_dropped(&bid, &hid_a, now()).await.unwrap();
+    agent
+        .handle_symbol_dropped(&bid, &hid_a, now())
+        .await
+        .unwrap();
 
     let placement = db.get_placement(&bid, &hid_a).unwrap().unwrap();
-    assert_eq!(placement.status, PlacementStatus::Lost, "placement must be Lost after handle_symbol_dropped");
+    assert_eq!(
+        placement.status,
+        PlacementStatus::Lost,
+        "placement must be Lost after handle_symbol_dropped"
+    );
 
     let updated_block = db.get_source_block(&bid).unwrap().unwrap();
     assert_eq!(
-        updated_block.current_alive,
-        1,
+        updated_block.current_alive, 1,
         "current_alive must be 1 after one placement marked Lost"
     );
 }
@@ -278,19 +331,34 @@ async fn repair_agent_mark_placement_lost_idempotent_on_already_lost() {
 
     db.upsert_source_block(&make_block_for_hook(bid)).unwrap();
 
-    db.upsert_placement(&make_placement(bid, hid_a, vec![(0, 4)], PlacementStatus::Lost)).unwrap();
-    db.upsert_placement(&make_placement(bid, hid_b, vec![(4, 4)], PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        hid_a,
+        vec![(0, 4)],
+        PlacementStatus::Lost,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        hid_b,
+        vec![(4, 4)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
-    db.update_block_cached_fields(&bid, 0.5, 1, 0.7, 0.99, None, 0).unwrap();
+    db.update_block_cached_fields(&bid, 0.5, 1, 0.7, 0.99, None, 0)
+        .unwrap();
 
     let agent = make_agent(db.clone(), symbols_dir.path());
     let result = agent.handle_symbol_dropped(&bid, &hid_a, now()).await;
-    assert!(result.is_ok(), "handle_symbol_dropped must return Ok for already-Lost placement");
+    assert!(
+        result.is_ok(),
+        "handle_symbol_dropped must return Ok for already-Lost placement"
+    );
 
     let updated_block = db.get_source_block(&bid).unwrap().unwrap();
     assert_eq!(
-        updated_block.current_alive,
-        1,
+        updated_block.current_alive, 1,
         "current_alive must remain 1 when placement was already Lost (idempotent)"
     );
 }
@@ -309,17 +377,41 @@ async fn reliability_scan_corrects_stale_current_alive() {
     db.upsert_source_block(&record).unwrap();
 
     // 2 Alive placements.
-    db.upsert_placement(&make_placement(bid, holder_id(0x81), vec![(0, 4)], PlacementStatus::Alive)).unwrap();
-    db.upsert_placement(&make_placement(bid, holder_id(0x82), vec![(4, 4)], PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        holder_id(0x81),
+        vec![(0, 4)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        holder_id(0x82),
+        vec![(4, 4)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
     // 1 Lost placement.
-    db.upsert_placement(&make_placement(bid, holder_id(0x83), vec![(8, 4)], PlacementStatus::Lost)).unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        holder_id(0x83),
+        vec![(8, 4)],
+        PlacementStatus::Lost,
+    ))
+    .unwrap();
 
     let agent = make_agent(db.clone(), symbols_dir.path());
     let updated_count = agent.reliability_scan().await;
 
-    assert!(updated_count >= 1, "reliability_scan must update at least 1 block");
+    assert!(
+        updated_count >= 1,
+        "reliability_scan must update at least 1 block"
+    );
     let updated = db.get_source_block(&bid).unwrap().unwrap();
-    assert_eq!(updated.current_alive, 2, "reliability_scan must correct current_alive to 2");
+    assert_eq!(
+        updated.current_alive, 2,
+        "reliability_scan must correct current_alive to 2"
+    );
 }
 
 /// reliability_scan does not update blocks already at target_reliability.
@@ -336,7 +428,13 @@ async fn reliability_scan_skips_completed_blocks() {
 
     // 5 Alive placements.
     for i in 0..5u8 {
-        db.upsert_placement(&make_placement(bid, holder_id(0x91 + i), vec![(i as u32 * 4, 4)], PlacementStatus::Alive)).unwrap();
+        db.upsert_placement(&make_placement(
+            bid,
+            holder_id(0x91 + i),
+            vec![(i as u32 * 4, 4)],
+            PlacementStatus::Alive,
+        ))
+        .unwrap();
     }
 
     let agent = make_agent(db.clone(), symbols_dir.path());
@@ -356,7 +454,10 @@ async fn reliability_scan_returns_zero_when_empty() {
 
     let agent = make_agent(db, symbols_dir.path());
     let updated_count = agent.reliability_scan().await;
-    assert_eq!(updated_count, 0, "reliability_scan should return 0 when no blocks exist");
+    assert_eq!(
+        updated_count, 0,
+        "reliability_scan should return 0 when no blocks exist"
+    );
 }
 
 // ─── load_or_rebuild_blob fallback tests ────────────────────────────────────
@@ -368,10 +469,17 @@ async fn load_or_rebuild_blob_no_swarm_returns_encode_failed() {
     let symbols_dir = TempDir::new().unwrap();
 
     let bid = block_id(0xA0);
-    db.upsert_source_block(&make_source_block_record(bid, 1, 65535)).unwrap();
+    db.upsert_source_block(&make_source_block_record(bid, 1, 65535))
+        .unwrap();
 
     // Insert one Alive placement so it tries to fetch from network.
-    db.upsert_placement(&make_placement(bid, holder_id(0x99), vec![(0, 1)], PlacementStatus::Alive)).unwrap();
+    db.upsert_placement(&make_placement(
+        bid,
+        holder_id(0x99),
+        vec![(0, 1)],
+        PlacementStatus::Alive,
+    ))
+    .unwrap();
 
     let agent = make_agent(db, symbols_dir.path());
     let result = agent.load_or_rebuild_blob(&bid).await;

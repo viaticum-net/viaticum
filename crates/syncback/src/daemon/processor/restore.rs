@@ -2,12 +2,14 @@
 
 use syncback_core::constants::{BYTES_PER_GB, SYMBOL_SIZE};
 use syncback_core::erasure::Symbol;
-use syncback_core::escrow::{check_restore, RestoreDecision};
-use syncback_core::messages::{BoardSyncMsg, RestoreDeniedMsg, RestoreRequestMsg, RestoreResponseMsg};
-use syncback_core::types::{hex_encode, HoldingStatus, IdentityPub, Timestamp};
+use syncback_core::escrow::{RestoreDecision, check_restore};
+use syncback_core::messages::{
+    BoardSyncMsg, RestoreDeniedMsg, RestoreRequestMsg, RestoreResponseMsg,
+};
+use syncback_core::types::{HoldingStatus, IdentityPub, Timestamp, hex_encode};
 use tracing::{debug, info, warn};
 
-use super::{ProcessorError, Processor, ranges_to_esi_list};
+use super::{Processor, ProcessorError, ranges_to_esi_list};
 
 impl Processor {
     /// Load held symbols for owner and return a RestoreResponseMsg.
@@ -37,7 +39,9 @@ impl Processor {
 
         // Escrow check: verify owner has earned enough restore budget through storage contribution.
         let k_factor = self.escrow_cfg.k_factor;
-        let stored_gb_days = self.db.stored_for_peer_gb_days(&owner_id, Timestamp::now(), self.time_scale)?;
+        let stored_gb_days =
+            self.db
+                .stored_for_peer_gb_days(&owner_id, Timestamp::now(), self.time_scale)?;
         let already_restored_bytes = self.db.restored_total_bytes(&owner_id)?;
         let already_restored_gb = already_restored_bytes as f64 / BYTES_PER_GB;
         let this_request_gb = holding
@@ -46,9 +50,12 @@ impl Processor {
             .map(|&(_start, count)| count as f64 * SYMBOL_SIZE as f64)
             .sum::<f64>()
             / BYTES_PER_GB;
-        if let RestoreDecision::Denied(denial) =
-            check_restore(stored_gb_days, already_restored_gb, this_request_gb, k_factor)
-        {
+        if let RestoreDecision::Denied(denial) = check_restore(
+            stored_gb_days,
+            already_restored_gb,
+            this_request_gb,
+            k_factor,
+        ) {
             warn!(
                 owner = %owner_id,
                 block_id = %block_id,
@@ -58,10 +65,7 @@ impl Processor {
                 budget = denial.restore_budget_gb,
                 "processor: RestoreRequest denied by escrow check"
             );
-            return Err(ProcessorError::EscrowDenied {
-                block_id,
-                denial,
-            });
+            return Err(ProcessorError::EscrowDenied { block_id, denial });
         }
 
         // Determine which ESIs to send.
@@ -116,12 +120,11 @@ impl Processor {
 
         // Increment restore-served counter for this owner after successful symbol load.
         let bytes_served: u64 = symbols.iter().map(|s| s.data.len() as u64).sum();
-        if bytes_served > 0 {
-            if let Err(e) = self.db.record_restore_served(&owner_id, bytes_served) {
+        if bytes_served > 0
+            && let Err(e) = self.db.record_restore_served(&owner_id, bytes_served) {
                 // Non-fatal: log and continue. Worst case: budget is slightly over-estimated next time.
                 warn!(owner = %owner_id, err = %e, "processor: failed to record restore_served");
             }
-        }
 
         Ok(RestoreResponseMsg {
             v: 1,

@@ -1,7 +1,9 @@
-use crate::constants::{HOLDER_DELETE_COOLDOWN_SECS, OWNER_DELETE_COOLDOWN_SECS, VACUUM_INVALID_THRESHOLD};
+use crate::constants::{
+    HOLDER_DELETE_COOLDOWN_SECS, OWNER_DELETE_COOLDOWN_SECS, VACUUM_INVALID_THRESHOLD,
+};
 use crate::types::{
-    DeviceId, FileId, FileRecord, LocalState, PlacementStatus, SourceBlockId,
-    SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
+    DeviceId, FileId, FileRecord, LocalState, PlacementStatus, SourceBlockId, SourceBlockRecord,
+    SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
 };
 
 // ── Actions returned to the daemon ──────────────────────────────────────────
@@ -47,9 +49,7 @@ pub enum DeletionAction {
 
     /// File was deleted on one device but is still present on others.
     /// No action needed now; the engine will reconsider on next tick.
-    WaitForOtherDevices {
-        file_id: FileId,
-    },
+    WaitForOtherDevices { file_id: FileId },
 }
 
 // ── Result type for mark_deleted ─────────────────────────────────────────────
@@ -155,15 +155,13 @@ impl DeletionEngine {
             let owner_cooldown = OWNER_DELETE_COOLDOWN_SECS / scale;
             let holder_cooldown = HOLDER_DELETE_COOLDOWN_SECS / scale;
 
-            let owner_cooldown_elapsed =
-                all_deleted_at.0 + owner_cooldown <= now.0;
+            let owner_cooldown_elapsed = all_deleted_at.0 + owner_cooldown <= now.0;
             if !owner_cooldown_elapsed {
                 continue;
             }
 
             let drop_sent_at = all_deleted_at.0 + owner_cooldown;
-            let holder_cooldown_elapsed =
-                drop_sent_at + holder_cooldown <= now.0;
+            let holder_cooldown_elapsed = drop_sent_at + holder_cooldown <= now.0;
 
             for version in &file.versions {
                 let block = match blocks
@@ -248,8 +246,7 @@ impl DeletionEngine {
                 let is_invalid = match file_record {
                     None => true,
                     Some(f) => {
-                        let all_dev_deleted =
-                            all_devices_deleted_at(f).is_some();
+                        let all_dev_deleted = all_devices_deleted_at(f).is_some();
                         if all_dev_deleted {
                             true
                         } else {

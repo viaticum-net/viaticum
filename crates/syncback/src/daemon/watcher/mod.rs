@@ -10,16 +10,16 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
+use std::sync::mpsc as std_mpsc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap; // crate: arc-swap
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::event::{EventKind, ModifyKind, RemoveKind};
-use notify::{recommended_watcher, Event, RecursiveMode, Watcher};
+use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 use tokio_util::sync::CancellationToken;
 
 use crate::daemon::backup::{DirtyEvent, DirtyKind};
@@ -105,9 +105,9 @@ impl IgnoreSet {
                 // `add_line` only fails on truly malformed patterns — the
                 // constants above are hand-written, so this is effectively
                 // infallible. Surface any breakage loudly in tests.
-                builder
-                    .add_line(None, pat)
-                    .map_err(|e| WatcherError::IgnoreBuild(format!("default pattern {pat}: {e}")))?;
+                builder.add_line(None, pat).map_err(|e| {
+                    WatcherError::IgnoreBuild(format!("default pattern {pat}: {e}"))
+                })?;
             }
             let ignore_file = dir.join(SYNCBACKIGNORE_FILENAME);
             if ignore_file.is_file() {
@@ -132,7 +132,9 @@ impl IgnoreSet {
     /// Empty matcher — nothing is ignored. Used in tests that don't exercise
     /// the ignore path.
     pub fn empty() -> Self {
-        Self { matchers: Vec::new() }
+        Self {
+            matchers: Vec::new(),
+        }
     }
 
     /// Returns true if `path` should be skipped (not watched, not scanned).
@@ -207,9 +209,8 @@ pub async fn start_watcher(
     let mut watch_dirs: Vec<PathBuf> = config.watch_dirs.clone();
 
     // Build the ignore matcher; share via ArcSwap so notify callback always sees the latest.
-    let ignore_arc: Arc<ArcSwap<IgnoreSet>> = Arc::new(ArcSwap::new(Arc::new(
-        IgnoreSet::build(&watch_dirs)?,
-    )));
+    let ignore_arc: Arc<ArcSwap<IgnoreSet>> =
+        Arc::new(ArcSwap::new(Arc::new(IgnoreSet::build(&watch_dirs)?)));
 
     // Bridge: notify → std channel → tokio task.
     let (std_tx, std_rx) = std_mpsc::channel::<(PathBuf, DirtyKind)>();
@@ -217,13 +218,13 @@ pub async fn start_watcher(
     // Build the notify watcher. The closure runs in a thread managed by notify.
     let std_tx_clone = std_tx.clone();
     let ignore_for_notify = Arc::clone(&ignore_arc);
-    let mut watcher_inner = recommended_watcher(move |res: Result<Event, notify::Error>| {
-        match res {
+    let mut watcher_inner =
+        recommended_watcher(move |res: Result<Event, notify::Error>| match res {
             Ok(event) => {
                 if let Some(kind) = classify_event(&event.kind) {
                     for path in &event.paths {
                         let ig = ignore_for_notify.load();
-                        if should_watch_path(path, &**ig) {
+                        if should_watch_path(path, &ig) {
                             let _ = std_tx_clone.send((path.clone(), kind));
                         }
                     }
@@ -232,8 +233,7 @@ pub async fn start_watcher(
             Err(e) => {
                 tracing::warn!("watcher notify error: {e}");
             }
-        }
-    })?;
+        })?;
 
     // Register all directories (empty list = no-op).
     for dir in &watch_dirs {
@@ -246,16 +246,15 @@ pub async fn start_watcher(
     let needs_scan = should_run_scan(&scan_marker, config.rescan_interval_secs);
     if needs_scan && !watch_dirs.is_empty() {
         for dir in &watch_dirs {
-            set_status(&config.watch_states, dir, WatcherStatusSignal::Scanning, None);
+            set_status(
+                &config.watch_states,
+                dir,
+                WatcherStatusSignal::Scanning,
+                None,
+            );
         }
         let ig = ignore_arc.load();
-        let count = run_full_scan(
-            &watch_dirs,
-            config.device_id,
-            &dirty_tx,
-            &**ig,
-        )
-        .await;
+        let count = run_full_scan(&watch_dirs, config.device_id, &dirty_tx, &ig).await;
         // Write current timestamp as marker.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -310,7 +309,7 @@ pub async fn start_watcher(
                         &watch_dirs,
                         config.device_id,
                         &dirty_tx,
-                        &**ig,
+                        &ig,
                     ).await;
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -350,7 +349,7 @@ pub async fn start_watcher(
                                 WatcherStatusSignal::Scanning, None);
                             let ig = ignore_arc.load();
                             let count = run_full_scan_one(
-                                &path, config.device_id, &dirty_tx, &**ig
+                                &path, config.device_id, &dirty_tx, &ig
                             ).await;
                             tracing::info!(
                                 dir = %path.display(), files = count,
@@ -373,7 +372,7 @@ pub async fn start_watcher(
                             WatcherStatusSignal::Scanning, None);
                         let ig = ignore_arc.load();
                         let count = run_full_scan_one(
-                            &path, config.device_id, &dirty_tx, &**ig
+                            &path, config.device_id, &dirty_tx, &ig
                         ).await;
                         tracing::info!(
                             dir = %path.display(), files = count,
@@ -443,8 +442,8 @@ fn classify_event(kind: &EventKind) -> Option<DirtyKind> {
             Some(DirtyKind::Deleted)
         }
         EventKind::Modify(ModifyKind::Metadata(_)) => None, // metadata-only: ignore
-        EventKind::Access(_) => None,                        // reads: ignore
-        EventKind::Remove(RemoveKind::Folder) => None,       // directory removal: ignore
+        EventKind::Access(_) => None,                       // reads: ignore
+        EventKind::Remove(RemoveKind::Folder) => None,      // directory removal: ignore
         _ => None,
     }
 }
@@ -510,11 +509,10 @@ pub(crate) async fn run_full_scan_one(
             let path = entry.path();
             if path.is_dir() {
                 // Skip hidden directories.
-                if let Some(name) = path.file_name() {
-                    if name.to_string_lossy().starts_with('.') {
+                if let Some(name) = path.file_name()
+                    && name.to_string_lossy().starts_with('.') {
                         continue;
                     }
-                }
                 // Prune subtrees matched by .syncbackignore / defaults.
                 if ignore_set.is_ignored(&path, true) {
                     continue;

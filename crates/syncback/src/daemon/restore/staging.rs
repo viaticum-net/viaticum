@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
-use syncback_core::path_safety::{ValidatedPath};
+use syncback_core::path_safety::ValidatedPath;
 
 // ─── JobId ────────────────────────────────────────────────────────────────────
 
@@ -80,7 +80,9 @@ impl StagingWriter {
         let canonical_root = staging_root.canonicalize()?;
         let canonical_data = data_dir.canonicalize()?;
         if !canonical_root.starts_with(&canonical_data) {
-            return Err(StagingError::OutsideDataDir { root: canonical_root });
+            return Err(StagingError::OutsideDataDir {
+                root: canonical_root,
+            });
         }
 
         let job_dir = staging_root.join(job_id.to_string());
@@ -120,11 +122,10 @@ impl StagingWriter {
         let rel = validated.to_relative_path();
 
         // Create parent directories relative to the cap_std Dir.
-        if let Some(parent) = rel.parent() {
-            if parent != std::path::Path::new("") {
+        if let Some(parent) = rel.parent()
+            && parent != std::path::Path::new("") {
                 self.dir.create_dir_all(parent)?;
             }
-        }
 
         // Open with create_new — loud fail on collision.
         {

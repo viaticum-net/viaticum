@@ -1,14 +1,14 @@
 #[cfg(test)]
 mod cluster_state_tests {
     use crate::cluster::{
-        derive_device_key, derive_master_key, issue_device_certificate, issue_revocation,
-        master_identity, ClusterState, ClusterStateError, EpochCounter,
+        ClusterState, ClusterStateError, EpochCounter, derive_device_key, derive_master_key,
+        issue_device_certificate, issue_revocation, master_identity,
     };
     use crate::db::Db;
     use crate::messages::{build_handshake, extract_cluster_identity, verify_handshake};
     use crate::types::{
-        DeviceId, EventEntry, Event, FileId, FileRecord, FileVersion, IdentityPub,
-        LocalState, SourceBlockId, Timestamp,
+        DeviceId, Event, EventEntry, FileId, FileRecord, FileVersion, IdentityPub, LocalState,
+        SourceBlockId, Timestamp,
     };
 
     const SEED: [u8; 32] = [1u8; 32];
@@ -87,7 +87,10 @@ mod cluster_state_tests {
         // Re-issue the same cert for the same device_id
         let cert = issue_device_certificate(&master_key, device_id, NOW);
         let result = state.add_device(cert, NOW);
-        assert!(matches!(result, Err(ClusterStateError::DeviceAlreadyRegistered(_))));
+        assert!(matches!(
+            result,
+            Err(ClusterStateError::DeviceAlreadyRegistered(_))
+        ));
     }
 
     // 6. add device with wrong master fails
@@ -101,7 +104,10 @@ mod cluster_state_tests {
         let device_b_id = DeviceId(device_b_key.verifying_key().to_bytes());
         let cert = issue_device_certificate(&wrong_master, device_b_id, NOW);
         let result = state.add_device(cert, NOW);
-        assert!(matches!(result, Err(ClusterStateError::InvalidCertificate(_))));
+        assert!(matches!(
+            result,
+            Err(ClusterStateError::InvalidCertificate(_))
+        ));
     }
 
     // 7. max 16 devices enforced
@@ -250,7 +256,7 @@ mod cluster_state_tests {
         let hash = [0xBBu8; 32];
         let record = make_file_record_with_version(hash, Some(NOW));
         state.db.upsert_file(&record).unwrap();
-        assert_eq!(state.is_content_backed_up(&hash).unwrap(), true);
+        assert!(state.is_content_backed_up(&hash).unwrap());
     }
 
     // 15. is_content_backed_up false when backed_up_at is None
@@ -260,14 +266,14 @@ mod cluster_state_tests {
         let hash = [0xCCu8; 32];
         let record = make_file_record_with_version(hash, None);
         state.db.upsert_file(&record).unwrap();
-        assert_eq!(state.is_content_backed_up(&hash).unwrap(), false);
+        assert!(!state.is_content_backed_up(&hash).unwrap());
     }
 
     // 16. is_content_backed_up false when no file
     #[test]
     fn is_content_backed_up_false_when_no_file() {
         let state = make_cluster_state();
-        assert_eq!(state.is_content_backed_up(&[0u8; 32]).unwrap(), false);
+        assert!(!state.is_content_backed_up(&[0u8; 32]).unwrap());
     }
 
     // 17. esi_namespace correct for device
@@ -282,7 +288,10 @@ mod cluster_state_tests {
         state.add_device(cert1, NOW).unwrap();
 
         assert_eq!(state.esi_namespace(&device_0_id), Some((0, 1_048_576)));
-        assert_eq!(state.esi_namespace(&device_1_id), Some((1_048_576, 2_097_152)));
+        assert_eq!(
+            state.esi_namespace(&device_1_id),
+            Some((1_048_576, 2_097_152))
+        );
         let unknown = DeviceId([0xFF; 32]);
         assert_eq!(state.esi_namespace(&unknown), None);
     }
@@ -320,16 +329,14 @@ mod cluster_state_tests {
         state.add_device(certb, NOW).unwrap();
 
         // Fast-forward epoch manually via apply_events
-        let events = vec![
-            (
-                10u64,
-                EventEntry {
-                    timestamp: NOW,
-                    device_id: device_a_id,
-                    event: Event::EpochRotated { epoch: 3 },
-                },
-            ),
-        ];
+        let events = vec![(
+            10u64,
+            EventEntry {
+                timestamp: NOW,
+                device_id: device_a_id,
+                event: Event::EpochRotated { epoch: 3 },
+            },
+        )];
         state.apply_events(&events).unwrap();
         assert_eq!(state.current_epoch(), EpochCounter(3));
 
@@ -457,12 +464,14 @@ mod cluster_state_tests {
             timestamp: NOW,
             device_id,
             event: Event::EpochRotated { epoch: 1 },
-        }).unwrap();
+        })
+        .unwrap();
         db.append_event(&EventEntry {
             timestamp: NOW,
             device_id,
             event: Event::EpochRotated { epoch: 2 },
-        }).unwrap();
+        })
+        .unwrap();
 
         let seq = state.local_last_seq().unwrap();
         assert_eq!(seq, 3);
@@ -487,11 +496,18 @@ mod cluster_state_tests {
         let hs = build_handshake(device_identity_pub, NOW, &device_key, Some(cert.clone()));
 
         // Step 5: verify_handshake passes (signature is valid, timestamp is fresh)
-        assert!(verify_handshake(&hs, NOW).is_ok(), "handshake sig must be valid");
+        assert!(
+            verify_handshake(&hs, NOW).is_ok(),
+            "handshake sig must be valid"
+        );
 
         // Step 6: extract_cluster_identity passes (cert sig is valid)
         let extracted = extract_cluster_identity(&hs).unwrap();
-        assert_eq!(extracted, Some(master_pub), "cluster identity must resolve to master pub");
+        assert_eq!(
+            extracted,
+            Some(master_pub),
+            "cluster identity must resolve to master pub"
+        );
 
         // Step 7: issue revocation for the device
         let rev = issue_revocation(&master_key, device_id, NOW, EpochCounter(1));
@@ -525,12 +541,14 @@ mod cluster_state_tests {
         let cert = issue_device_certificate(&master_key, device_id, NOW);
         // payload = device_id.0 (32) || issued_at_be (8) = 40 bytes
         // We verify this indirectly: cert roundtrip verifies correctly
-        let result = crate::cluster::verify_device_certificate(&cert, &master_identity(&master_key));
+        let result =
+            crate::cluster::verify_device_certificate(&cert, &master_identity(&master_key));
         assert!(result.is_ok());
         // Also check that tampering issued_at breaks it
         let mut tampered = cert.clone();
         tampered.issued_at = Timestamp(99999);
-        let tampered_result = crate::cluster::verify_device_certificate(&tampered, &master_identity(&master_key));
+        let tampered_result =
+            crate::cluster::verify_device_certificate(&tampered, &master_identity(&master_key));
         assert!(tampered_result.is_err());
     }
 
@@ -541,7 +559,8 @@ mod cluster_state_tests {
         let device_key = derive_device_key(&SEED, &DEVICE_SEED_A).unwrap();
         let device_id = DeviceId(device_key.verifying_key().to_bytes());
         let cert = issue_device_certificate(&master_key, device_id, NOW);
-        let result = crate::cluster::verify_device_certificate(&cert, &master_identity(&master_key));
+        let result =
+            crate::cluster::verify_device_certificate(&cert, &master_identity(&master_key));
         assert!(result.is_ok());
     }
 
@@ -554,7 +573,10 @@ mod cluster_state_tests {
         let device_id = DeviceId(device_key.verifying_key().to_bytes());
         let cert = issue_device_certificate(&master_a, device_id, NOW);
         let result = crate::cluster::verify_device_certificate(&cert, &master_identity(&master_b));
-        assert!(matches!(result, Err(crate::cluster::ClusterError::InvalidSignature)));
+        assert!(matches!(
+            result,
+            Err(crate::cluster::ClusterError::InvalidSignature)
+        ));
     }
 
     // Task A: verify_device_certificate_uses_device_id_as_pubkey
@@ -567,8 +589,12 @@ mod cluster_state_tests {
         let mut cert = issue_device_certificate(&master_key, device_id, NOW);
         // Tamper device_id → changes the pubkey used to verify → sig invalid
         cert.device_id = DeviceId([0xFF; 32]);
-        let result = crate::cluster::verify_device_certificate(&cert, &master_identity(&master_key));
-        assert!(matches!(result, Err(crate::cluster::ClusterError::InvalidSignature)));
+        let result =
+            crate::cluster::verify_device_certificate(&cert, &master_identity(&master_key));
+        assert!(matches!(
+            result,
+            Err(crate::cluster::ClusterError::InvalidSignature)
+        ));
     }
 
     // Task A: revocation_payload_is_50_bytes
@@ -584,7 +610,8 @@ mod cluster_state_tests {
         assert!(result.is_ok());
         let mut tampered = cert.clone();
         tampered.new_epoch = EpochCounter(42);
-        let tampered_result = crate::cluster::verify_revocation(&tampered, &master_identity(&master_key));
+        let tampered_result =
+            crate::cluster::verify_revocation(&tampered, &master_identity(&master_key));
         assert!(tampered_result.is_err());
     }
 
@@ -645,12 +672,13 @@ mod cluster_state_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::cluster::{
-        derive_device_key, derive_epoch_key, derive_master_key, epoch_for_time,
-        esi_namespace_end, esi_namespace_start, issue_device_certificate, issue_revocation,
-        master_identity, next_epoch, verify_device_certificate, verify_revocation, ClusterError,
-        EpochCounter,
+        ClusterError, EpochCounter, derive_device_key, derive_epoch_key, derive_master_key,
+        epoch_for_time, esi_namespace_end, esi_namespace_start, issue_device_certificate,
+        issue_revocation, master_identity, next_epoch, verify_device_certificate,
+        verify_revocation,
     };
     use crate::types::{DeviceId, Timestamp};
 

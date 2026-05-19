@@ -6,7 +6,10 @@ use crate::daemon::identity::init_identity;
 #[test]
 fn disk_available_bytes_returns_positive_for_existing_path() {
     let bytes = disk_available_bytes(std::path::Path::new("/"));
-    assert!(bytes > 0, "root filesystem should report > 0 available bytes");
+    assert!(
+        bytes > 0,
+        "root filesystem should report > 0 available bytes"
+    );
 }
 
 #[test]
@@ -49,7 +52,10 @@ async fn daemon_starts_and_stops_cleanly() {
 
     // Signal shutdown immediately — just verify the lifecycle works.
     handle.stop();
-    handle.wait().await.expect("all subsystem tasks should exit cleanly");
+    handle
+        .wait()
+        .await
+        .expect("all subsystem tasks should exit cleanly");
 }
 
 /// Verifies that the inbound drain task consumes messages without blocking

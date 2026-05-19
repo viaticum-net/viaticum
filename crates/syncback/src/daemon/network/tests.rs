@@ -154,8 +154,7 @@ fn cert_verify_multi_device_joiner_accepts_cert_signed_by_founder() {
 
     // Also accept ANOTHER joiner's cert that was signed by the same founder.
     let other_device_key = ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]);
-    let (other_cert, other_peer_id) =
-        make_test_cert_for_device(&founder_master, &other_device_key);
+    let (other_cert, other_peer_id) = make_test_cert_for_device(&founder_master, &other_device_key);
     let result = verify_cert_for_peer(&other_peer_id, &other_cert, &founder_identity);
     assert!(
         result.is_ok(),
@@ -180,8 +179,7 @@ fn cert_verify_multi_device_rejects_self_signed_cert_from_joiner() {
     // were the cluster founder.
     let rogue_master = derive_master_key(&[0x11u8; 64]).unwrap();
     let rogue_device_key = ed25519_dalek::SigningKey::from_bytes(&[0x31u8; 32]);
-    let (rogue_cert, rogue_peer_id) =
-        make_test_cert_for_device(&rogue_master, &rogue_device_key);
+    let (rogue_cert, rogue_peer_id) = make_test_cert_for_device(&rogue_master, &rogue_device_key);
 
     let result = verify_cert_for_peer(&rogue_peer_id, &rogue_cert, &founder_identity);
     assert!(

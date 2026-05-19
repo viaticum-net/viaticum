@@ -6,7 +6,7 @@
 
 use syncback_core::trust::compute_combined;
 use syncback_core::types::{
-    hex_encode, FileVersion, LocalState, PlacementStatus, SourceBlockStatus, Timestamp,
+    FileVersion, LocalState, PlacementStatus, SourceBlockStatus, Timestamp, hex_encode,
 };
 
 use crate::cli::types::{
@@ -14,8 +14,8 @@ use crate::cli::types::{
     RestoreData, StatusData, VersionEntry,
 };
 use crate::daemon::handle::DaemonState;
-use crate::daemon::restore::{RestoreError, RestoreRequest, VersionSelector};
 use crate::daemon::restore::staging::JobId;
+use crate::daemon::restore::{RestoreError, RestoreRequest, VersionSelector};
 
 #[cfg(test)]
 mod tests;
@@ -140,7 +140,11 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
             }
         })
         .collect();
-    peer_summaries.sort_by(|a, b| b.trust.partial_cmp(&a.trust).unwrap_or(std::cmp::Ordering::Equal));
+    peer_summaries.sort_by(|a, b| {
+        b.trust
+            .partial_cmp(&a.trust)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     peer_summaries.truncate(20);
 
     // avg_trust across all peers.
@@ -173,25 +177,43 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
     let placement_count = placements.len() as u32;
     let placement_alive = placements
         .iter()
-        .filter(|p| matches!(p.status, PlacementStatus::Alive | PlacementStatus::Uncertain))
+        .filter(|p| {
+            matches!(
+                p.status,
+                PlacementStatus::Alive | PlacementStatus::Uncertain
+            )
+        })
         .count() as u32;
     let placement_lost = placements
         .iter()
-        .filter(|p| matches!(p.status, PlacementStatus::Lost | PlacementStatus::PresumedLost))
+        .filter(|p| {
+            matches!(
+                p.status,
+                PlacementStatus::Lost | PlacementStatus::PresumedLost
+            )
+        })
         .count() as u32;
 
     // Block health: per source block, count alive symbols vs k_eff (k + 3).
     use std::collections::HashMap;
     let mut alive_symbols_per_block: HashMap<[u8; 32], u32> = HashMap::new();
     for pl in &placements {
-        if matches!(pl.status, PlacementStatus::Alive | PlacementStatus::Uncertain) {
-            *alive_symbols_per_block.entry(pl.source_block_id.0).or_default() += pl.symbol_count();
+        if matches!(
+            pl.status,
+            PlacementStatus::Alive | PlacementStatus::Uncertain
+        ) {
+            *alive_symbols_per_block
+                .entry(pl.source_block_id.0)
+                .or_default() += pl.symbol_count();
         }
     }
     let mut blocks_ok = 0u32;
     let mut blocks_at_risk = 0u32;
     for sb in &source_blocks {
-        let alive = alive_symbols_per_block.get(&sb.block_id.0).copied().unwrap_or(0);
+        let alive = alive_symbols_per_block
+            .get(&sb.block_id.0)
+            .copied()
+            .unwrap_or(0);
         let k_eff = sb.k + 3;
         if alive >= k_eff {
             blocks_ok += 1;
@@ -207,7 +229,8 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         Some(swarm) => {
             let addrs = swarm.listen_addrs().await.unwrap_or_default();
             // Prefer non-loopback, fallback to any address.
-            let base = addrs.iter()
+            let base = addrs
+                .iter()
                 .find(|a| !a.to_string().contains("/127.0.0.1/"))
                 .or(addrs.first())
                 .map(|a| a.to_string())
@@ -302,11 +325,21 @@ fn compute_effective_status(state: &DaemonState, version: &FileVersion) -> Effec
     }
 
     if live_symbols >= target {
-        EffectiveStatus::Restorable { live: live_symbols, target }
+        EffectiveStatus::Restorable {
+            live: live_symbols,
+            target,
+        }
     } else if known_symbols >= target && lost_symbols > 0 {
-        EffectiveStatus::Degraded { live: live_symbols, lost: lost_symbols, target }
+        EffectiveStatus::Degraded {
+            live: live_symbols,
+            lost: lost_symbols,
+            target,
+        }
     } else {
-        EffectiveStatus::Replicating { live: live_symbols, target }
+        EffectiveStatus::Replicating {
+            live: live_symbols,
+            target,
+        }
     }
 }
 
@@ -330,9 +363,7 @@ fn dispatch_files(state: &DaemonState, path_prefix: Option<String>) -> CliRespon
                 .and_then(|v| v.backed_up_at)
                 .map(timestamp_to_iso)
                 .unwrap_or_else(|| "pending".to_string());
-            let size_bytes = latest
-                .map(|v| v.k as u64 * v.t as u64)
-                .unwrap_or(0);
+            let size_bytes = latest.map(|v| v.k as u64 * v.t as u64).unwrap_or(0);
             let local_state = f
                 .devices
                 .iter()
@@ -435,7 +466,9 @@ async fn dispatch_restore(
         match parse_iso_date(d) {
             Some(ts) => VersionSelector::BeforeDate(ts),
             None => {
-                return CliResponse::Error(format!("invalid date format: {d} (expected YYYY-MM-DD)"));
+                return CliResponse::Error(format!(
+                    "invalid date format: {d} (expected YYYY-MM-DD)"
+                ));
             }
         }
     } else {
@@ -626,7 +659,7 @@ fn dispatch_device_add(state: &DaemonState, label: String) -> CliResponse {
 // ── Device revoke ─────────────────────────────────────────────────────────────
 
 async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> CliResponse {
-    use syncback_core::cluster::{issue_revocation, EpochCounter};
+    use syncback_core::cluster::{EpochCounter, issue_revocation};
     use syncback_core::messages::to_cbor;
     use syncback_core::types::DeviceId;
 
@@ -650,12 +683,22 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
         let hi = match chunk[0] {
             b'0'..=b'9' => chunk[0] - b'0',
             b'a'..=b'f' => chunk[0] - b'a' + 10,
-            _ => return CliResponse::Error(format!("invalid hex char in device_id: {}", chunk[0] as char)),
+            _ => {
+                return CliResponse::Error(format!(
+                    "invalid hex char in device_id: {}",
+                    chunk[0] as char
+                ));
+            }
         };
         let lo = match chunk[1] {
             b'0'..=b'9' => chunk[1] - b'0',
             b'a'..=b'f' => chunk[1] - b'a' + 10,
-            _ => return CliResponse::Error(format!("invalid hex char in device_id: {}", chunk[1] as char)),
+            _ => {
+                return CliResponse::Error(format!(
+                    "invalid hex char in device_id: {}",
+                    chunk[1] as char
+                ));
+            }
         };
         device_id_bytes[i] = (hi << 4) | lo;
     }
@@ -756,9 +799,9 @@ async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
     let peer_id = match peer_id {
         Some(id) => id,
         None => {
-            return CliResponse::Error(
-                format!("multiaddr '{addr}' has no /p2p component — cannot identify peer")
-            );
+            return CliResponse::Error(format!(
+                "multiaddr '{addr}' has no /p2p component — cannot identify peer"
+            ));
         }
     };
 
@@ -768,7 +811,9 @@ async fn dispatch_connect(state: &DaemonState, addr: String) -> CliResponse {
     }
 
     tracing::info!(addr = %addr, "dial initiated — peer will be registered on connection");
-    CliResponse::Connected { peer_id: peer_id.to_string() }
+    CliResponse::Connected {
+        peer_id: peer_id.to_string(),
+    }
 }
 
 // ============================================================
@@ -784,11 +829,36 @@ struct BucketDef {
 }
 
 const BUCKET_DEFS: [BucketDef; 5] = [
-    BucketDef { name: "critical", lo: 0.90, hi: f64::INFINITY,    midpoint: 0.95 },
-    BucketDef { name: "high",     lo: 0.70, hi: 0.90,             midpoint: 0.80 },
-    BucketDef { name: "medium",   lo: 0.40, hi: 0.70,             midpoint: 0.55 },
-    BucketDef { name: "low",      lo: 0.10, hi: 0.40,             midpoint: 0.25 },
-    BucketDef { name: "trivial",  lo: f64::NEG_INFINITY, hi: 0.10, midpoint: 0.05 },
+    BucketDef {
+        name: "critical",
+        lo: 0.90,
+        hi: f64::INFINITY,
+        midpoint: 0.95,
+    },
+    BucketDef {
+        name: "high",
+        lo: 0.70,
+        hi: 0.90,
+        midpoint: 0.80,
+    },
+    BucketDef {
+        name: "medium",
+        lo: 0.40,
+        hi: 0.70,
+        midpoint: 0.55,
+    },
+    BucketDef {
+        name: "low",
+        lo: 0.10,
+        hi: 0.40,
+        midpoint: 0.25,
+    },
+    BucketDef {
+        name: "trivial",
+        lo: f64::NEG_INFINITY,
+        hi: 0.10,
+        midpoint: 0.05,
+    },
 ];
 
 /// Compute per-importance-bucket reliability aggregates over all Active source blocks.
@@ -919,7 +989,11 @@ fn parse_iso_date(s: &str) -> Option<Timestamp> {
     }
     // Days from 1970-01-01 to year-month-day.
     // Algorithm: days_from_civil from Hinnant.
-    let y = if month <= 2 { year as i64 - 1 } else { year as i64 };
+    let y = if month <= 2 {
+        year as i64 - 1
+    } else {
+        year as i64
+    };
     let m = month as i64;
     let d = day as i64;
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -932,4 +1006,3 @@ fn parse_iso_date(s: &str) -> Option<Timestamp> {
     }
     Some(Timestamp(days as u64 * 86400))
 }
-

@@ -2,7 +2,7 @@
 //! rebuild-marker: 2026-05-03-r2
 
 use axum::body::Body;
-use axum::http::{header, HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 

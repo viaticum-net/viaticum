@@ -1,12 +1,12 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use futures::future::{pending, Pending};
+use futures::future::{Pending, pending};
 use libp2p::Multiaddr;
+use libp2p::core::connection::Endpoint;
 use libp2p::core::transport::{
     DialOpts, ListenerId, PortUse, Transport, TransportError, TransportEvent,
 };
-use libp2p::core::connection::Endpoint;
 
 use super::NoPortReuse;
 

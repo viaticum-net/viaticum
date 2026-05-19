@@ -8,11 +8,13 @@ mod cluster_sync_tests {
     use std::sync::{Arc, Mutex};
 
     use syncback_core::cluster::{
-        derive_device_key, derive_master_key, issue_device_certificate, issue_revocation,
-        master_identity, ClusterState, EpochCounter,
+        ClusterState, EpochCounter, derive_device_key, derive_master_key, issue_device_certificate,
+        issue_revocation, master_identity,
     };
     use syncback_core::db::Db;
-    use syncback_core::messages::{from_cbor, to_cbor, ClusterSyncRequestMsg, ClusterSyncResponseMsg, RevocationBroadcast};
+    use syncback_core::messages::{
+        ClusterSyncRequestMsg, ClusterSyncResponseMsg, RevocationBroadcast, from_cbor, to_cbor,
+    };
     use syncback_core::types::{DeviceId, Event, EventEntry, Timestamp};
 
     use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncError, ClusterSyncManager};
@@ -38,7 +40,6 @@ mod cluster_sync_tests {
         let key = derive_device_key(&SEED, &DEVICE_SEED_B).unwrap();
         DeviceId(key.verifying_key().to_bytes())
     }
-
 
     /// Initialize a ClusterState with device_a as the first device.
     fn make_cluster_state(db: Db) -> ClusterState {
@@ -75,7 +76,6 @@ mod cluster_sync_tests {
         ClusterSyncManager::new(db, config, shared)
     }
 
-
     // ─── 1. build_sync_request_uses_cursor ───────────────────────────────────
 
     #[test]
@@ -93,7 +93,10 @@ mod cluster_sync_tests {
 
         let manager = ClusterSyncManager::new(
             db,
-            ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
+            ClusterSyncConfig {
+                our_device_id: device_a_id(),
+                batch_size: 100,
+            },
             shared,
         );
 
@@ -126,7 +129,10 @@ mod cluster_sync_tests {
         let shared = Arc::new(Mutex::new(state));
         let manager = ClusterSyncManager::new(
             db.clone(),
-            ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
+            ClusterSyncConfig {
+                our_device_id: device_a_id(),
+                batch_size: 100,
+            },
             shared.clone(),
         );
 
@@ -136,7 +142,9 @@ mod cluster_sync_tests {
             EventEntry {
                 timestamp: NOW,
                 device_id: device_a_id(),
-                event: Event::DeviceRevoked { device_id: device_b_id() },
+                event: Event::DeviceRevoked {
+                    device_id: device_b_id(),
+                },
             },
         )];
         let response = ClusterSyncResponseMsg {
@@ -146,7 +154,9 @@ mod cluster_sync_tests {
             timestamp: NOW,
         };
         let peer_device = device_b_id();
-        let applied = manager.process_sync_response(&peer_device, response).unwrap();
+        let applied = manager
+            .process_sync_response(&peer_device, response)
+            .unwrap();
         assert_eq!(applied, 1);
 
         // ClusterState should reflect the revocation.
@@ -163,7 +173,10 @@ mod cluster_sync_tests {
         let shared = Arc::new(Mutex::new(state));
         let manager = ClusterSyncManager::new(
             db.clone(),
-            ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
+            ClusterSyncConfig {
+                our_device_id: device_a_id(),
+                batch_size: 100,
+            },
             shared.clone(),
         );
 
@@ -171,13 +184,18 @@ mod cluster_sync_tests {
         // Cursor advances by event count (not responder_last_seq) to prevent
         // a malicious peer from skipping events by sending an inflated seq.
         let events: Vec<(u64, EventEntry)> = (0..3)
-            .map(|i| (i as u64 + 1, EventEntry {
-                event: Event::DeviceAdded {
-                    device_id: DeviceId([i as u8 + 10; 32]),
-                },
-                timestamp: NOW,
-                device_id: device_b_id(),
-            }))
+            .map(|i| {
+                (
+                    i as u64 + 1,
+                    EventEntry {
+                        event: Event::DeviceAdded {
+                            device_id: DeviceId([i as u8 + 10; 32]),
+                        },
+                        timestamp: NOW,
+                        device_id: device_b_id(),
+                    },
+                )
+            })
             .collect();
         let response = ClusterSyncResponseMsg {
             v: 1,
@@ -185,7 +203,9 @@ mod cluster_sync_tests {
             responder_last_seq: 100, // intentionally inflated — should be ignored
             timestamp: NOW,
         };
-        manager.process_sync_response(&peer_device, response).unwrap();
+        manager
+            .process_sync_response(&peer_device, response)
+            .unwrap();
 
         // Cursor = initial(0) + events.len(3), NOT responder_last_seq(100).
         let cursor = shared.lock().unwrap().sync_cursor(&peer_device);
@@ -201,7 +221,10 @@ mod cluster_sync_tests {
         let shared = Arc::new(Mutex::new(state));
         let manager = ClusterSyncManager::new(
             db.clone(),
-            ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
+            ClusterSyncConfig {
+                our_device_id: device_a_id(),
+                batch_size: 100,
+            },
             shared.clone(),
         );
 
@@ -211,7 +234,9 @@ mod cluster_sync_tests {
             EventEntry {
                 timestamp: NOW,
                 device_id: device_a_id(),
-                event: Event::DeviceRevoked { device_id: device_b_id() },
+                event: Event::DeviceRevoked {
+                    device_id: device_b_id(),
+                },
             },
         )];
 
@@ -228,8 +253,12 @@ mod cluster_sync_tests {
             responder_last_seq: 1,
             timestamp: NOW,
         };
-        let applied1 = manager.process_sync_response(&peer_device, response1).unwrap();
-        let applied2 = manager.process_sync_response(&peer_device, response2).unwrap();
+        let applied1 = manager
+            .process_sync_response(&peer_device, response1)
+            .unwrap();
+        let applied2 = manager
+            .process_sync_response(&peer_device, response2)
+            .unwrap();
 
         // Second apply should not double-add.
         assert_eq!(applied1, 1);
@@ -255,8 +284,11 @@ mod cluster_sync_tests {
             db.append_event(&EventEntry {
                 timestamp: Timestamp(NOW.0 + i),
                 device_id: device_a_id(),
-                event: Event::EpochRotated { epoch: (i + 1) as u32 },
-            }).unwrap();
+                event: Event::EpochRotated {
+                    epoch: (i + 1) as u32,
+                },
+            })
+            .unwrap();
         }
         let last_seq = db.last_event_seq().unwrap();
         assert_eq!(last_seq, base_seq + 3);
@@ -385,19 +417,11 @@ mod cluster_sync_tests {
 
         // Set up cluster with DEVICE_A as the sole active device.
         let master_pub = master_identity(&master_key);
-        let cert_a = issue_device_certificate(
-            &master_key,
-            device_a_id(),
-            NOW,
-        );
+        let cert_a = issue_device_certificate(&master_key, device_a_id(), NOW);
         let mut state = ClusterState::init(db.clone(), master_pub, cert_a, NOW, NOW).unwrap();
 
         // Add DEVICE_B, then immediately revoke it.
-        let cert_b = issue_device_certificate(
-            &master_key,
-            device_b_id(),
-            NOW,
-        );
+        let cert_b = issue_device_certificate(&master_key, device_b_id(), NOW);
         state.add_device(cert_b, NOW).unwrap();
 
         let rev = issue_revocation(&master_key, device_b_id(), NOW, EpochCounter(1));
@@ -437,7 +461,10 @@ mod cluster_sync_tests {
         let shared = Arc::new(Mutex::new(state));
         let manager = ClusterSyncManager::new(
             db,
-            ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
+            ClusterSyncConfig {
+                our_device_id: device_a_id(),
+                batch_size: 100,
+            },
             shared,
         );
 
@@ -460,7 +487,10 @@ mod cluster_sync_tests {
 
         let manager = ClusterSyncManager::new(
             db,
-            ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
+            ClusterSyncConfig {
+                our_device_id: device_a_id(),
+                batch_size: 100,
+            },
             shared,
         );
 
@@ -478,7 +508,10 @@ mod cluster_sync_tests {
         let shared = Arc::new(Mutex::new(state));
         let manager = ClusterSyncManager::new(
             db,
-            ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
+            ClusterSyncConfig {
+                our_device_id: device_a_id(),
+                batch_size: 100,
+            },
             shared.clone(),
         );
 
@@ -490,13 +523,18 @@ mod cluster_sync_tests {
 
         // Apply a response with 5 events (cursor advances by event count).
         let events: Vec<(u64, EventEntry)> = (0..5)
-            .map(|i| (i as u64 + 1, EventEntry {
-                event: Event::DeviceAdded {
-                    device_id: DeviceId([i as u8 + 20; 32]),
-                },
-                timestamp: NOW,
-                device_id: device_b_id(),
-            }))
+            .map(|i| {
+                (
+                    i as u64 + 1,
+                    EventEntry {
+                        event: Event::DeviceAdded {
+                            device_id: DeviceId([i as u8 + 20; 32]),
+                        },
+                        timestamp: NOW,
+                        device_id: device_b_id(),
+                    },
+                )
+            })
             .collect();
         let response = ClusterSyncResponseMsg {
             v: 1,
@@ -508,7 +546,10 @@ mod cluster_sync_tests {
 
         // After response, cursor advanced by event count (5), not responder_last_seq (15).
         let req_after = manager.build_sync_request(&did_b);
-        assert_eq!(req_after.last_known_seq, 5, "cursor must advance after process_sync_response");
+        assert_eq!(
+            req_after.last_known_seq, 5,
+            "cursor must advance after process_sync_response"
+        );
     }
 
     // ─── Message serialization round-trips ───────────────────────────────────

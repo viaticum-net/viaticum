@@ -1,7 +1,7 @@
 use super::{
-    age_component, compute_commitment, eviction_risk, flag_for_proactive_repair,
-    pos_component, pressure_component, priority_component, CommitmentError, CommitmentScore,
-    CommitmentTier, HolderProfile,
+    CommitmentError, CommitmentScore, CommitmentTier, HolderProfile, age_component,
+    compute_commitment, eviction_risk, flag_for_proactive_repair, pos_component,
+    pressure_component, priority_component,
 };
 use crate::constants::SECS_PER_WEEK;
 use crate::types::{DeviceId, Timestamp};
@@ -163,7 +163,11 @@ fn compute_commitment_reliable_holder() {
     // pos=1.0*0.50, pressure=1.0*0.25, age=min(30/26,1)*0.15, priority=1.0*0.10 → 1.0
     let profile = profile_reliable();
     let result = compute_commitment(&profile).unwrap();
-    assert!((result.value() - 1.0).abs() < 1e-9, "expected 1.0, got {}", result.value());
+    assert!(
+        (result.value() - 1.0).abs() < 1e-9,
+        "expected 1.0, got {}",
+        result.value()
+    );
     assert_eq!(result.tier(), CommitmentTier::High);
 }
 
@@ -187,7 +191,11 @@ fn compute_commitment_at_risk_holder() {
     // priority = 0.05*0.10 = 0.005
     // total ≈ 0.036
     let result = compute_commitment(&profile).unwrap();
-    assert!(result.value() < 0.10, "expected < 0.10, got {}", result.value());
+    assert!(
+        result.value() < 0.10,
+        "expected < 0.10, got {}",
+        result.value()
+    );
     assert_eq!(result.tier(), CommitmentTier::AtRisk);
 }
 
@@ -211,8 +219,11 @@ fn compute_commitment_medium_holder() {
     // priority = 0.6*0.10 = 0.06
     // total ≈ 0.554
     let result = compute_commitment(&profile).unwrap();
-    assert!(result.value() > 0.45 && result.value() < 0.75,
-        "expected Medium range, got {}", result.value());
+    assert!(
+        result.value() > 0.45 && result.value() < 0.75,
+        "expected Medium range, got {}",
+        result.value()
+    );
     assert_eq!(result.tier(), CommitmentTier::Medium);
 }
 
@@ -224,7 +235,10 @@ fn compute_commitment_error_on_inconsistent_counts() {
     let result = compute_commitment(&profile);
     assert!(matches!(
         result,
-        Err(CommitmentError::InconsistentPoSCounts { passes: 5, challenges: 3 })
+        Err(CommitmentError::InconsistentPoSCounts {
+            passes: 5,
+            challenges: 3
+        })
     ));
 }
 
@@ -446,10 +460,11 @@ fn commitment_score_in_zero_one() {
     ];
 
     for profile in &profiles {
-        let score = compute_commitment(profile).expect("compute_commitment must not fail for valid profile");
+        let score = compute_commitment(profile)
+            .expect("compute_commitment must not fail for valid profile");
         let v = score.value();
         assert!(
-            v >= 0.0 && v <= 1.0,
+            (0.0..=1.0).contains(&v),
             "commitment score must be in [0.0, 1.0], got {v} for holder {:?}",
             profile.holder_id
         );

@@ -1,10 +1,10 @@
 use super::*;
-use crate::db::testutil::test_db;
 use crate::db::WeeklyPosEntry;
+use crate::db::testutil::test_db;
 use crate::types::{
-    DeviceId, FileId, FileRecord, IdentityPub, LocalState, PeerRecord,
-    PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType,
-    SymbolPlacement, Timestamp,
+    DeviceId, FileId, FileRecord, IdentityPub, LocalState, PeerRecord, PlacementStatus,
+    SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement,
+    Timestamp,
 };
 
 // ============================================================
@@ -139,8 +139,15 @@ fn roundtrip_snapshot_pack_unpack_restore() {
     db.upsert_peer(&peer2).unwrap();
 
     // Insert a pos_weekly entry
-    db.upsert_pos_weekly(&DeviceId([10u8; 32]), 5, &WeeklyPosEntry { challenged: 3, passed: 2 })
-        .unwrap();
+    db.upsert_pos_weekly(
+        &DeviceId([10u8; 32]),
+        5,
+        &WeeklyPosEntry {
+            challenged: 3,
+            passed: 2,
+        },
+    )
+    .unwrap();
 
     // Snapshot + pack + unpack
     let state = snapshot_db(&db).unwrap();
@@ -212,7 +219,13 @@ fn blob_too_short_fails() {
 
     let result = unpack_system_state(&[0u8; 10], &key);
     assert!(
-        matches!(result, Err(SystemStateError::BlobTooShort { expected: 52, got: 10 })),
+        matches!(
+            result,
+            Err(SystemStateError::BlobTooShort {
+                expected: 52,
+                got: 10
+            })
+        ),
         "expected BlobTooShort, got: {result:?}"
     );
 
@@ -270,7 +283,10 @@ fn pack_produces_different_blobs() {
     unpack_system_state(&blob2, &key).unwrap();
 
     // But the blobs themselves must differ (random salt)
-    assert_ne!(blob1, blob2, "two packs of the same state should produce different blobs");
+    assert_ne!(
+        blob1, blob2,
+        "two packs of the same state should produce different blobs"
+    );
 }
 
 #[test]
@@ -301,9 +317,33 @@ fn multiple_pos_weekly_entries_roundtrip() {
     let peer_a = DeviceId([1u8; 32]);
     let peer_b = DeviceId([2u8; 32]);
 
-    db.upsert_pos_weekly(&peer_a, 1, &WeeklyPosEntry { challenged: 10, passed: 8 }).unwrap();
-    db.upsert_pos_weekly(&peer_a, 2, &WeeklyPosEntry { challenged: 20, passed: 18 }).unwrap();
-    db.upsert_pos_weekly(&peer_b, 1, &WeeklyPosEntry { challenged: 5, passed: 5 }).unwrap();
+    db.upsert_pos_weekly(
+        &peer_a,
+        1,
+        &WeeklyPosEntry {
+            challenged: 10,
+            passed: 8,
+        },
+    )
+    .unwrap();
+    db.upsert_pos_weekly(
+        &peer_a,
+        2,
+        &WeeklyPosEntry {
+            challenged: 20,
+            passed: 18,
+        },
+    )
+    .unwrap();
+    db.upsert_pos_weekly(
+        &peer_b,
+        1,
+        &WeeklyPosEntry {
+            challenged: 5,
+            passed: 5,
+        },
+    )
+    .unwrap();
 
     let state = snapshot_db(&db).unwrap();
     assert_eq!(state.pos_weekly.len(), 3);

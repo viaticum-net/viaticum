@@ -2,9 +2,7 @@
 // Called from BackupCoordinator::process_event (mod.rs).
 
 use syncback_core::config::derive_file_importance;
-use syncback_core::types::{
-    FileId, FileRecord, FileVersion, LocalState, SourceBlockId, Timestamp,
-};
+use syncback_core::types::{FileId, FileRecord, FileVersion, LocalState, SourceBlockId, Timestamp};
 
 use super::{BackupCoordinator, DirtyEvent, DirtyKind, QueuedFile};
 use syncback_core::types::FileCategory;
@@ -43,10 +41,7 @@ impl BackupCoordinator {
         Ok(())
     }
 
-    pub(super) fn handle_added_or_modified(
-        &mut self,
-        event: &DirtyEvent,
-    ) -> anyhow::Result<()> {
+    pub(super) fn handle_added_or_modified(&mut self, event: &DirtyEvent) -> anyhow::Result<()> {
         let file_bytes = std::fs::read(&event.path)
             .map_err(|e| anyhow::anyhow!("read file {}: {e}", event.path))?;
         let size_bytes = file_bytes.len() as u64;
@@ -115,16 +110,21 @@ impl BackupCoordinator {
                 self.get_or_create_file_id(&event.path, &event.device_id, content_hash)?;
             // TODO(wave2): pass authenticated snapshot here (currently unfiltered for large files).
             let candidates = self.get_candidates(&Default::default())?;
-            let result =
-                self.process_large_file(&event.path, file_id, content_hash, importance, &candidates)?;
+            let result = self.process_large_file(
+                &event.path,
+                file_id,
+                content_hash,
+                importance,
+                &candidates,
+            )?;
             // Tally offered holders for this single block.
-            self.offered_this_cycle = self.offered_this_cycle
+            self.offered_this_cycle = self
+                .offered_this_cycle
                 .saturating_add(result.symbol_count_per_holder.len() as u32);
             return Ok(());
         }
 
-        let file_id =
-            self.get_or_create_file_id(&event.path, &event.device_id, content_hash)?;
+        let file_id = self.get_or_create_file_id(&event.path, &event.device_id, content_hash)?;
 
         // Small videos go to Other queue; all other categories use their own queue.
         let queue_category = match category {
@@ -164,9 +164,7 @@ impl BackupCoordinator {
                 }
             }
             if !found {
-                record
-                    .devices
-                    .push((event.device_id, LocalState::Present));
+                record.devices.push((event.device_id, LocalState::Present));
             }
             self.db.upsert_file(&record)?;
         } else {

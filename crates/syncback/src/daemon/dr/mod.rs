@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use syncback_core::messages::{Message, SystemStateRequestMsg};
-use syncback_core::types::{hex_encode, Timestamp};
+use syncback_core::types::{Timestamp, hex_encode};
 
 use crate::daemon::identity::{derive_keys, init_identity_from_mnemonic, load_identity};
 use crate::daemon::network::swarm::{ProtocolEvent, SwarmConfig, SwarmHandle};
@@ -80,11 +80,8 @@ pub async fn run_dr(
 
     // ── 3. Start minimal SwarmHandle ─────────────────────────────────────────
     // Issue a device certificate so DeviceCertExchange succeeds.
-    let device_cert = syncback_core::cluster::issue_device_certificate(
-        &master_key,
-        device_id,
-        Timestamp::now(),
-    );
+    let device_cert =
+        syncback_core::cluster::issue_device_certificate(&master_key, device_id, Timestamp::now());
 
     let swarm_cfg = SwarmConfig {
         device_signing_key: device_key,
@@ -118,7 +115,7 @@ pub async fn run_dr(
 
     // Sort by created_at descending: freshest first.
     let mut blobs = blobs;
-    blobs.sort_by(|a, b| b.0.cmp(&a.0));
+    blobs.sort_by_key(|b| std::cmp::Reverse(b.0));
     let (ts, best_blob) = &blobs[0];
 
     println!(
@@ -300,7 +297,9 @@ async fn wait_for_auth(
     tokio::time::timeout(deadline, async {
         loop {
             match event_rx.recv().await {
-                Some(ProtocolEvent::PeerAuthenticated { peer_id, device_id, .. }) => {
+                Some(ProtocolEvent::PeerAuthenticated {
+                    peer_id, device_id, ..
+                }) => {
                     if peer_id == expected_peer_id {
                         return Some(device_id);
                     }

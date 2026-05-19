@@ -1,21 +1,18 @@
 // PoS handlers: holder responds to hash challenge, owner verifies hash response or receives nack.
 
 use syncback_core::messages::{
-    build_pos_hash_nack, verify_pos_hash_nack, Message, PosHashNackMsg, PosHashResponseMsg,
+    Message, PosHashNackMsg, PosHashResponseMsg, build_pos_hash_nack, verify_pos_hash_nack,
 };
 use syncback_core::pos::{
-    apply_pos_outcome, compute_chain_hash, outcome_from_verify, verify_hash_response,
-    VerifyOutcome,
+    VerifyOutcome, apply_pos_outcome, compute_chain_hash, outcome_from_verify, verify_hash_response,
 };
 use syncback_core::trust::{compute_combined, recalculate_trust};
-use syncback_core::types::{hex_encode, DeviceId, IdentityPub, SourceBlockId, Timestamp};
+use syncback_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp, hex_encode};
 use tracing::{debug, error, info, warn};
 
 use crate::daemon::repair::RepairTrigger;
 
-use super::{
-    current_week_number_scaled, record_pos_weekly, ProcessorError, Processor,
-};
+use super::{Processor, ProcessorError, current_week_number_scaled, record_pos_weekly};
 
 impl Processor {
     // ─── Hash-based PoS handlers ─────────────────────────────────────────────
@@ -50,7 +47,9 @@ impl Processor {
         }
 
         // Expand ESI ranges to a sorted ESI list.
-        let mut esis: Vec<u32> = challenge.esi_ranges.iter()
+        let mut esis: Vec<u32> = challenge
+            .esi_ranges
+            .iter()
             .flat_map(|&(start, count)| start..start + count)
             .collect();
         esis.sort_unstable();
@@ -84,7 +83,8 @@ impl Processor {
         }
 
         // Compute chain hash over bound symbol data.
-        let refs: Vec<(u32, &[u8])> = symbol_data.iter()
+        let refs: Vec<(u32, &[u8])> = symbol_data
+            .iter()
             .map(|(esi, data)| (*esi, data.as_slice()))
             .collect();
         let chain_hash = compute_chain_hash(&challenge.challenge_id, &refs)
@@ -109,7 +109,8 @@ impl Processor {
         // Find pending challenge by challenge_id (linear scan, bounded by active placements).
         let pending_key = {
             let guard = self.pending_challenges.lock().await;
-            guard.iter()
+            guard
+                .iter()
                 .find(|(_, v)| v.challenge_id == response.challenge_id)
                 .map(|(k, _)| *k)
         };
@@ -136,7 +137,11 @@ impl Processor {
         };
 
         let block_id = key.0;
-        let first_esi = pending.esi_ranges.first().map(|&(start, _)| start).unwrap_or(0);
+        let first_esi = pending
+            .esi_ranges
+            .first()
+            .map(|&(start, _)| start)
+            .unwrap_or(0);
 
         // Verify the chain hash.
         let outcome = verify_hash_response(
@@ -145,7 +150,8 @@ impl Processor {
             first_esi,
         );
 
-        self.apply_and_persist_pos_outcome(block_id, holder_id, &outcome).await?;
+        self.apply_and_persist_pos_outcome(block_id, holder_id, &outcome)
+            .await?;
 
         info!(
             block_id = %block_id,
@@ -168,7 +174,8 @@ impl Processor {
         // 1. Find pending challenge by challenge_id (linear scan, bounded by active placements).
         let pending_key = {
             let guard = self.pending_challenges.lock().await;
-            guard.iter()
+            guard
+                .iter()
                 .find(|(_, v)| v.challenge_id == nack.challenge_id)
                 .map(|(k, _)| *k)
         };
@@ -234,7 +241,10 @@ impl Processor {
         info!(block_id = %block_id, holder = %expected_holder_device, "repair: triggered by PosHashNack");
         let _ = self
             .repair_tx
-            .send(RepairTrigger::RepairNow { block_id, holder_id: expected_holder_device })
+            .send(RepairTrigger::RepairNow {
+                block_id,
+                holder_id: expected_holder_device,
+            })
             .await;
         Ok(())
     }
@@ -289,9 +299,7 @@ impl Processor {
         record_pos_weekly(&self.db, holder_id, pos_outcome);
 
         // Recalculate trust scores from accumulated PoS history.
-        if let Some((old_p, old_i, new_p, new_i)) =
-            recalculate_trust(&self.db, &holder_id, week)
-        {
+        if let Some((old_p, old_i, new_p, new_i)) = recalculate_trust(&self.db, &holder_id, week) {
             let old_combined = compute_combined(old_p, old_i, 1.0);
             let new_combined = compute_combined(new_p, new_i, 1.0);
             info!(
@@ -310,7 +318,10 @@ impl Processor {
             info!(block_id = %block_id, holder = %holder_id, "repair: triggered");
             let _ = self
                 .repair_tx
-                .send(RepairTrigger::RepairNow { block_id, holder_id })
+                .send(RepairTrigger::RepairNow {
+                    block_id,
+                    holder_id,
+                })
                 .await;
         }
 

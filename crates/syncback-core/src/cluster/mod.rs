@@ -1,4 +1,4 @@
-use crate::types::{sig_serde, DeviceId, IdentityPub, Timestamp};
+use crate::types::{DeviceId, IdentityPub, Timestamp, sig_serde};
 use ed25519_dalek::Signer;
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -11,7 +11,9 @@ mod tests;
 // ============================================================
 
 /// Counter for epoch rotation. Starts at 0; incremented on device revocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct EpochCounter(pub u32);
 
 /// Certificate issued by master key to authorize a device.
@@ -59,7 +61,10 @@ pub enum ClusterError {
     DeviceIdMismatch,
 
     #[error("certificate expired: issued {issued_at:?}, now {now:?}")]
-    CertificateExpired { issued_at: Timestamp, now: Timestamp },
+    CertificateExpired {
+        issued_at: Timestamp,
+        now: Timestamp,
+    },
 
     #[error("key derivation failed: {0}")]
     KeyDerivation(String),
@@ -105,7 +110,10 @@ pub fn derive_epoch_key(seed_bytes: &[u8], epoch: EpochCounter) -> Result<EpochK
     let mut okm = [0u8; 32];
     hk.expand(b"syncback-encryption", &mut okm)
         .map_err(|e| ClusterError::KeyDerivation(e.to_string()))?;
-    Ok(EpochKey { epoch, key_bytes: okm })
+    Ok(EpochKey {
+        epoch,
+        key_bytes: okm,
+    })
 }
 
 /// Extract IdentityPub from a master signing key.
@@ -254,7 +262,10 @@ pub fn epoch_for_time(
 /// ESI = device_index * 2^20 + local_counter.
 /// Max 16 devices (ESI space = 2^24, 2^20 per device).
 pub fn esi_namespace_start(device_index: u8) -> u32 {
-    debug_assert!(device_index <= 16, "max 16 devices supported (0..=15, 16 as exclusive end)");
+    debug_assert!(
+        device_index <= 16,
+        "max 16 devices supported (0..=15, 16 as exclusive end)"
+    );
     (device_index as u32) << 20
 }
 
@@ -450,7 +461,9 @@ impl ClusterState {
         let new_epoch = revocation_cert.new_epoch;
         self.state.revoked_devices.push(device_id);
         self.state.current_epoch = new_epoch;
-        self.state.epoch_history.push((new_epoch, epoch_activated_at));
+        self.state
+            .epoch_history
+            .push((new_epoch, epoch_activated_at));
 
         let caller_device_id = self
             .state
@@ -490,7 +503,10 @@ impl ClusterState {
 
     /// Get device entry by device_id.
     pub fn get_device(&self, device_id: &crate::types::DeviceId) -> Option<&DeviceEntry> {
-        self.state.devices.iter().find(|d| &d.device_id == device_id)
+        self.state
+            .devices
+            .iter()
+            .find(|d| &d.device_id == device_id)
     }
 
     /// Check if a device is revoked.
@@ -514,7 +530,12 @@ impl ClusterState {
         peer: IdentityPub,
         device_id: crate::types::DeviceId,
     ) -> Result<(), ClusterStateError> {
-        if let Some(entry) = self.state.peer_affinity.iter_mut().find(|(p, _)| p == &peer) {
+        if let Some(entry) = self
+            .state
+            .peer_affinity
+            .iter_mut()
+            .find(|(p, _)| p == &peer)
+        {
             entry.1 = device_id;
         } else {
             self.state.peer_affinity.push((peer, device_id));
@@ -543,10 +564,7 @@ impl ClusterState {
     }
 
     /// Check if a content_hash is already backed up.
-    pub fn is_content_backed_up(
-        &self,
-        content_hash: &[u8; 32],
-    ) -> Result<bool, ClusterStateError> {
+    pub fn is_content_backed_up(&self, content_hash: &[u8; 32]) -> Result<bool, ClusterStateError> {
         let files = self.db.list_all_files()?;
         for file in &files {
             for version in &file.versions {
@@ -582,8 +600,8 @@ impl ClusterState {
         let mut applied = 0;
         for (seq, entry) in events {
             match &entry.event {
-                crate::types::Event::DeviceAdded { device_id } => {
-                    if !self.state.devices.iter().any(|d| &d.device_id == device_id) {
+                crate::types::Event::DeviceAdded { device_id }
+                    if !self.state.devices.iter().any(|d| &d.device_id == device_id) => {
                         let device_index = self.state.devices.len() as u8;
                         self.state.devices.push(DeviceEntry {
                             device_id: *device_id,
@@ -597,13 +615,11 @@ impl ClusterState {
                         });
                         applied += 1;
                     }
-                }
-                crate::types::Event::DeviceRevoked { device_id } => {
-                    if !self.state.revoked_devices.contains(device_id) {
+                crate::types::Event::DeviceRevoked { device_id }
+                    if !self.state.revoked_devices.contains(device_id) => {
                         self.state.revoked_devices.push(*device_id);
                         applied += 1;
                     }
-                }
                 crate::types::Event::EpochRotated { epoch } => {
                     let new_epoch = EpochCounter(*epoch);
                     if new_epoch > self.state.current_epoch {
@@ -633,10 +649,7 @@ impl ClusterState {
     }
 
     /// ESI namespace for a device_id. Returns (start, end). None if device not registered.
-    pub fn esi_namespace(
-        &self,
-        device_id: &crate::types::DeviceId,
-    ) -> Option<(u32, u32)> {
+    pub fn esi_namespace(&self, device_id: &crate::types::DeviceId) -> Option<(u32, u32)> {
         let entry = self.get_device(device_id)?;
         Some((
             esi_namespace_start(entry.device_index),
@@ -647,11 +660,7 @@ impl ClusterState {
     /// Get the sync cursor (last received seq) for a peer device.
     /// Returns 0 if no cursor exists (meaning "start from beginning").
     pub fn sync_cursor(&self, device_id: &crate::types::DeviceId) -> u64 {
-        self.state
-            .sync_cursors
-            .get(device_id)
-            .copied()
-            .unwrap_or(0)
+        self.state.sync_cursors.get(device_id).copied().unwrap_or(0)
     }
 
     /// Update the sync cursor for a peer device and persist to DB.

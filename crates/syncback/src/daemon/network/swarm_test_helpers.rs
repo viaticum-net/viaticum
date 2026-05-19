@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use libp2p::Multiaddr;
-use syncback_core::cluster::{issue_device_certificate, DeviceCertificate};
+use syncback_core::cluster::{DeviceCertificate, issue_device_certificate};
 use syncback_core::types::{DeviceId, IdentityPub, Timestamp};
 use tokio::time::timeout;
 
@@ -99,11 +99,10 @@ pub(crate) async fn wait_for_authenticated(
     timeout(deadline, async {
         loop {
             let event = event_rx.recv().await.expect("event_rx closed");
-            if let ProtocolEvent::PeerAuthenticated { device_id, .. } = &event {
-                if *device_id == expected_device_id {
+            if let ProtocolEvent::PeerAuthenticated { device_id, .. } = &event
+                && *device_id == expected_device_id {
                     return event;
                 }
-            }
         }
     })
     .await

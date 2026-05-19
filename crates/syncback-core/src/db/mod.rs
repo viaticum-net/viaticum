@@ -9,13 +9,13 @@ use std::time::Duration;
 
 use redb::{ReadableTable, ReadableTableMetadata, TableDefinition};
 
-use crate::constants::{BYTES_PER_GB, DROP_NOTICE_WINDOW_SECS, HOLDER_DELETE_COOLDOWN_SECS};
 use crate::cluster::StoredClusterState;
+use crate::constants::{BYTES_PER_GB, DROP_NOTICE_WINDOW_SECS, HOLDER_DELETE_COOLDOWN_SECS};
 use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
 use crate::types::{
-    from_cbor_bytes, to_cbor_bytes, BlockAgg, BudgetRecord, DeviceId, EventEntry, FileId,
-    FileRecord, HoldingRecord, HoldingStatus, IdentityPub, PlacementAgg, PlacementStatus,
-    PeerRecord, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SymbolPlacement, Timestamp,
+    BlockAgg, BudgetRecord, DeviceId, EventEntry, FileId, FileRecord, HoldingRecord, HoldingStatus,
+    IdentityPub, PeerRecord, PlacementAgg, PlacementStatus, SourceBlockId, SourceBlockRecord,
+    SourceBlockStatus, SymbolPlacement, Timestamp, from_cbor_bytes, to_cbor_bytes,
 };
 
 // ============================================================
@@ -48,8 +48,7 @@ const BUDGET: TableDefinition<&str, &[u8]> = TableDefinition::new("budget");
 
 /// PoS weekly results. Key = [DeviceId(32) || week_number_BE(4)] = [u8;36].
 /// Value = CBOR(WeeklyPosEntry).
-pub(crate) const POS_WEEKLY: TableDefinition<&[u8; 36], &[u8]> =
-    TableDefinition::new("pos_weekly");
+pub(crate) const POS_WEEKLY: TableDefinition<&[u8; 36], &[u8]> = TableDefinition::new("pos_weekly");
 
 /// Cluster state singleton. Key = "cluster_state". Value = CBOR(StoredClusterState).
 const CLUSTER_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("cluster_state");
@@ -61,8 +60,7 @@ const SYSTEM_STATE_BLOBS: TableDefinition<&[u8; 32], &[u8]> =
 
 /// Total bytes restored per peer (cumulative, append-only counter).
 /// Key = owner IdentityPub [u8;32]. Value = CBOR(u64) — total bytes served.
-const RESTORE_SERVED: TableDefinition<&[u8; 32], &[u8]> =
-    TableDefinition::new("restore_served");
+const RESTORE_SERVED: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("restore_served");
 
 /// Device trust per DeviceId. Key = DeviceId [u8;32]. Value = CBOR(DeviceTrustRecord).
 const DEVICE_TRUST: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("device_trust");
@@ -188,7 +186,10 @@ impl HotCache {
             // Accumulate alive symbols per block.
             // Uncertain = 1 missed PoS (peer may be on vacation); symbols are
             // likely still held, so count it as alive — matching cli_server behaviour.
-            if matches!(placement.status, PlacementStatus::Alive | PlacementStatus::Uncertain) {
+            if matches!(
+                placement.status,
+                PlacementStatus::Alive | PlacementStatus::Uncertain
+            ) {
                 let agg = cache
                     .blocks
                     .entry(placement.source_block_id)
@@ -360,8 +361,8 @@ impl Db {
     /// Create in-memory database (for tests). Same table setup.
     #[cfg(any(test, feature = "testutil"))]
     pub fn open_in_memory() -> Result<Self, DbError> {
-        let db = redb::Database::builder()
-            .create_with_backend(redb::backends::InMemoryBackend::new())?;
+        let db =
+            redb::Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?;
         Self::create_tables(&db)?;
         let hot = HotCache::build_from_db(&db)?;
         Ok(Db {
@@ -634,20 +635,21 @@ impl Db {
             if b.target_reliability <= 0.0 || b.current_reliability >= b.target_reliability {
                 return false;
             }
-            if current_pool_sig != 0 {
-                if let Some(last_at) = b.last_attempted_at {
+            if current_pool_sig != 0
+                && let Some(last_at) = b.last_attempted_at {
                     let elapsed = now.0.saturating_sub(last_at.0);
                     if elapsed < cooldown_secs && b.last_pool_signature == current_pool_sig {
                         return false;
                     }
                 }
-            }
             true
         });
 
         let winner = eligible.max_by(|a, b| {
-            let pa = crate::priority::priority(a.importance, a.current_alive, a.n.unwrap_or(0), coef);
-            let pb = crate::priority::priority(b.importance, b.current_alive, b.n.unwrap_or(0), coef);
+            let pa =
+                crate::priority::priority(a.importance, a.current_alive, a.n.unwrap_or(0), coef);
+            let pb =
+                crate::priority::priority(b.importance, b.current_alive, b.n.unwrap_or(0), coef);
             pa.total_cmp(&pb)
                 .then(a.last_attempted_at.cmp(&b.last_attempted_at).reverse())
                 .then(a.block_id.0.cmp(&b.block_id.0).reverse())
@@ -695,17 +697,21 @@ impl Db {
                 old_alive = old
                     .as_ref()
                     .filter(|o| {
-                        matches!(o.status, PlacementStatus::Alive | PlacementStatus::Uncertain)
+                        matches!(
+                            o.status,
+                            PlacementStatus::Alive | PlacementStatus::Uncertain
+                        )
                     })
                     .map(|o| o.symbol_count())
                     .unwrap_or(0);
-                new_alive =
-                    if matches!(record.status, PlacementStatus::Alive | PlacementStatus::Uncertain)
-                    {
-                        count
-                    } else {
-                        0
-                    };
+                new_alive = if matches!(
+                    record.status,
+                    PlacementStatus::Alive | PlacementStatus::Uncertain
+                ) {
+                    count
+                } else {
+                    0
+                };
             }
             // Commit DB first — hot cache must only be updated after a successful commit.
             tx.commit()?;
@@ -1197,13 +1203,11 @@ impl Db {
         for item in table.iter()? {
             let (_, v) = item?;
             let record: HoldingRecord = from_cbor_bytes(v.value())?;
-            if record.status == HoldingStatus::MarkedForDelete {
-                if let Some(requested_at) = record.delete_requested_at {
-                    if requested_at.0.saturating_add(cooldown) <= now.0 {
+            if record.status == HoldingStatus::MarkedForDelete
+                && let Some(requested_at) = record.delete_requested_at
+                    && requested_at.0.saturating_add(cooldown) <= now.0 {
                         records.push(record);
                     }
-                }
-            }
         }
         Ok(records)
     }
@@ -1220,11 +1224,10 @@ impl Db {
         for item in table.iter()? {
             let (_, v) = item?;
             let record: HoldingRecord = from_cbor_bytes(v.value())?;
-            if let Some(sent_at) = record.drop_notice_sent_at {
-                if sent_at.0.saturating_add(DROP_NOTICE_WINDOW_SECS) <= now.0 {
+            if let Some(sent_at) = record.drop_notice_sent_at
+                && sent_at.0.saturating_add(DROP_NOTICE_WINDOW_SECS) <= now.0 {
                     records.push(record);
                 }
-            }
         }
         Ok(records)
     }
@@ -1518,10 +1521,7 @@ impl Db {
     }
 
     /// Delete stored blob for an owner. No-op if not found.
-    pub fn delete_system_state_blob(
-        &self,
-        owner: &IdentityPub,
-    ) -> Result<(), DbError> {
+    pub fn delete_system_state_blob(&self, owner: &IdentityPub) -> Result<(), DbError> {
         let tx = self.inner.begin_write()?;
         {
             let mut table = tx.open_table(SYSTEM_STATE_BLOBS)?;
@@ -1737,10 +1737,7 @@ impl Db {
     }
 
     /// Get the master IdentityPub for a device. None if mapping unknown.
-    pub fn get_master_for_device(
-        &self,
-        device: &DeviceId,
-    ) -> Result<Option<IdentityPub>, DbError> {
+    pub fn get_master_for_device(&self, device: &DeviceId) -> Result<Option<IdentityPub>, DbError> {
         let tx = self.inner.begin_read()?;
         let table = tx.open_table(DEVICE_TO_MASTER)?;
         match table.get(&device.0)? {
@@ -1766,10 +1763,7 @@ impl Db {
     }
 
     /// List all DeviceIds known to belong to a master identity.
-    pub fn get_devices_for_master(
-        &self,
-        master: &IdentityPub,
-    ) -> Result<Vec<DeviceId>, DbError> {
+    pub fn get_devices_for_master(&self, master: &IdentityPub) -> Result<Vec<DeviceId>, DbError> {
         let tx = self.inner.begin_read()?;
         let table = tx.open_table(DEVICE_TO_MASTER)?;
         let mut result = Vec::new();
@@ -1876,16 +1870,21 @@ impl<'db> DbWriteTxn<'db> {
             old_alive = old
                 .as_ref()
                 .filter(|o| {
-                    matches!(o.status, PlacementStatus::Alive | PlacementStatus::Uncertain)
+                    matches!(
+                        o.status,
+                        PlacementStatus::Alive | PlacementStatus::Uncertain
+                    )
                 })
                 .map(|o| o.symbol_count())
                 .unwrap_or(0);
-            new_alive =
-                if matches!(record.status, PlacementStatus::Alive | PlacementStatus::Uncertain) {
-                    count
-                } else {
-                    0
-                };
+            new_alive = if matches!(
+                record.status,
+                PlacementStatus::Alive | PlacementStatus::Uncertain
+            ) {
+                count
+            } else {
+                0
+            };
         }
         {
             let mut fh = self.txn.open_table(FILE_HOLDERS)?;

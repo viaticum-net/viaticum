@@ -2,20 +2,17 @@
 
 use syncback_core::constants::{HANDSHAKE_FRESHNESS_SECS, SYMBOL_OFFER_EXPIRY_SECS, SYMBOL_SIZE};
 use syncback_core::messages::{
-    verify_symbol_offer, CancelDeleteMsg, DeleteMsg, RejectReason, SymbolAcceptMsg,
-    SymbolDropNoticeMsg, SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg, SymbolTransferMsg,
+    CancelDeleteMsg, DeleteMsg, RejectReason, SymbolAcceptMsg, SymbolDropNoticeMsg,
+    SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg, SymbolTransferMsg, verify_symbol_offer,
 };
 use syncback_core::types::{
-    hex_encode, DeviceId, HoldingRecord, HoldingStatus, IdentityPub, Timestamp,
+    DeviceId, HoldingRecord, HoldingStatus, IdentityPub, Timestamp, hex_encode,
 };
 use tracing::{debug, error, info, warn};
 
 use crate::daemon::repair::RepairTrigger;
 
-use super::{
-    AcceptedOffer, ProcessorError, Processor,
-    esi_list_to_ranges, ranges_to_esi_list,
-};
+use super::{AcceptedOffer, Processor, ProcessorError, esi_list_to_ranges, ranges_to_esi_list};
 
 impl Processor {
     /// Store received symbols on disk and record a HoldingRecord in the DB.
@@ -85,7 +82,10 @@ impl Processor {
                     esi,
                     "processor: SymbolTransfer rejected — ESI out of accepted range"
                 );
-                self.accepted_offers.lock().unwrap().remove(&(owner_id, block_id));
+                self.accepted_offers
+                    .lock()
+                    .unwrap()
+                    .remove(&(owner_id, block_id));
                 return Ok(());
             }
         }
@@ -112,7 +112,10 @@ impl Processor {
                     expected = SYMBOL_SIZE,
                     "processor: SymbolTransfer rejected — oversized symbol"
                 );
-                self.accepted_offers.lock().unwrap().remove(&(owner_id, block_id));
+                self.accepted_offers
+                    .lock()
+                    .unwrap()
+                    .remove(&(owner_id, block_id));
                 return Ok(());
             }
             let sym_path = block_dir.join(format!("{}.bin", symbol.esi));
@@ -187,7 +190,11 @@ impl Processor {
         }
 
         // Refresh trust_s for all devices of this peer's master identity.
-        for did in self.db.get_devices_for_master(&owner_id).unwrap_or_default() {
+        for did in self
+            .db
+            .get_devices_for_master(&owner_id)
+            .unwrap_or_default()
+        {
             if let Err(e) = self.db.refresh_peer_storage_bytes(&did) {
                 error!(
                     peer = %owner_id,
@@ -215,10 +222,7 @@ impl Processor {
     ///
     /// Returns `true` = accept, `false` = reject.
     /// This is a sync helper used by `handle_symbol_offer` and tests.
-    pub(crate) fn decide_symbol_offer(
-        &self,
-        offer_bytes: u64,
-    ) -> Result<bool, ProcessorError> {
+    pub(crate) fn decide_symbol_offer(&self, offer_bytes: u64) -> Result<bool, ProcessorError> {
         let held_bytes = self.db.total_holding_bytes()?;
 
         // Hard quota: absolute ceiling — always reject above this.
@@ -373,17 +377,20 @@ impl Processor {
             "processor: SymbolAccept received"
         );
         // BackupEvent now uses DeviceId — resolve from master.
-        let holder_device = self.db.get_devices_for_master(&from_master)
+        let holder_device = self
+            .db
+            .get_devices_for_master(&from_master)
             .unwrap_or_default()
             .into_iter()
             .next()
             .unwrap_or(DeviceId(from_master.0));
-        let _ = self.backup_event_tx.send(
-            crate::daemon::backup::BackupEvent::SymbolAccepted {
+        let _ = self
+            .backup_event_tx
+            .send(crate::daemon::backup::BackupEvent::SymbolAccepted {
                 holder_id: holder_device,
                 source_block_id: accept.source_block_id,
-            },
-        ).await;
+            })
+            .await;
         Ok(())
     }
 
@@ -400,18 +407,21 @@ impl Processor {
             "processor: SymbolReject received"
         );
         // BackupEvent now uses DeviceId — resolve from master.
-        let holder_device = self.db.get_devices_for_master(&from_master)
+        let holder_device = self
+            .db
+            .get_devices_for_master(&from_master)
             .unwrap_or_default()
             .into_iter()
             .next()
             .unwrap_or(DeviceId(from_master.0));
-        let _ = self.backup_event_tx.send(
-            crate::daemon::backup::BackupEvent::SymbolRejected {
+        let _ = self
+            .backup_event_tx
+            .send(crate::daemon::backup::BackupEvent::SymbolRejected {
                 holder_id: holder_device,
                 source_block_id: reject.source_block_id,
                 reason: format!("{:?}", reject.reason),
-            },
-        ).await;
+            })
+            .await;
         Ok(())
     }
 
@@ -507,11 +517,7 @@ impl Processor {
     /// automatically via `next_work_item` once `current_reliability` drops
     /// below `target_reliability`. Repair latency is bounded by the worker
     /// poll interval — acceptable for cold backup (time constant = 1 week).
-    pub(crate) fn handle_symbol_drop_notice(
-        &self,
-        from: IdentityPub,
-        notice: SymbolDropNoticeMsg,
-    ) {
+    pub(crate) fn handle_symbol_drop_notice(&self, from: IdentityPub, notice: SymbolDropNoticeMsg) {
         let block_id = notice.source_block_id;
         info!(
             block_id = %block_id,
@@ -661,18 +667,18 @@ impl Processor {
             holders: holder_inputs,
         };
 
-        let new_reliability = match syncback_core::reliability::block_reliability(&reliability_input)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(
-                    block_id = %block_id,
-                    err = %e,
-                    "processor: DropNotice — block_reliability failed, using 0.0"
-                );
-                0.0
-            }
-        };
+        let new_reliability =
+            match syncback_core::reliability::block_reliability(&reliability_input) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        block_id = %block_id,
+                        err = %e,
+                        "processor: DropNotice — block_reliability failed, using 0.0"
+                    );
+                    0.0
+                }
+            };
 
         // Step 6: Write updated cached fields back to DB.
         // Preserve importance, target_reliability, last_attempted_at, last_pool_signature.

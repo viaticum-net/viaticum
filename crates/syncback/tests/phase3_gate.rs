@@ -15,13 +15,13 @@ use std::sync::{Arc, Mutex};
 
 use syncback::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
 use syncback_core::cluster::{
-    derive_device_key, derive_epoch_key, derive_master_key, issue_device_certificate,
-    issue_revocation, master_identity, ClusterState, EpochCounter,
+    ClusterState, EpochCounter, derive_device_key, derive_epoch_key, derive_master_key,
+    issue_device_certificate, issue_revocation, master_identity,
 };
 use syncback_core::db::Db;
 use syncback_core::messages::{
-    build_handshake, extract_cluster_identity, frame_message, from_cbor, to_cbor,
-    unframe_message, verify_handshake, Message, RevocationBroadcast,
+    Message, RevocationBroadcast, build_handshake, extract_cluster_identity, frame_message,
+    from_cbor, to_cbor, unframe_message, verify_handshake,
 };
 use syncback_core::types::{
     DeviceId, Event, EventEntry, FileId, FileRecord, FileVersion, IdentityPub, LocalState,
@@ -41,11 +41,21 @@ fn master_key() -> ed25519_dalek::SigningKey {
 }
 
 fn device_a_id() -> DeviceId {
-    DeviceId(derive_device_key(SEED, &DEVICE_A_SEED).unwrap().verifying_key().to_bytes())
+    DeviceId(
+        derive_device_key(SEED, &DEVICE_A_SEED)
+            .unwrap()
+            .verifying_key()
+            .to_bytes(),
+    )
 }
 
 fn device_b_id() -> DeviceId {
-    DeviceId(derive_device_key(SEED, &DEVICE_B_SEED).unwrap().verifying_key().to_bytes())
+    DeviceId(
+        derive_device_key(SEED, &DEVICE_B_SEED)
+            .unwrap()
+            .verifying_key()
+            .to_bytes(),
+    )
 }
 
 /// Init ClusterState with both DEVICE_A and DEVICE_B.
@@ -79,21 +89,25 @@ fn two_devices_shared_identity() {
     assert_eq!(mp, expected_mp, "master_pub must match derived identity");
 
     // Device indices: 0 and 1.
-    let dev_a = state.get_device(&device_a_id()).expect("device A must exist");
-    let dev_b = state.get_device(&device_b_id()).expect("device B must exist");
+    let dev_a = state
+        .get_device(&device_a_id())
+        .expect("device A must exist");
+    let dev_b = state
+        .get_device(&device_b_id())
+        .expect("device B must exist");
     assert_eq!(dev_a.device_index, 0);
     assert_eq!(dev_b.device_index, 1);
 
     // Device ids are distinct (different seeds → different pubkeys).
-    assert_ne!(
-        dev_a.device_id, dev_b.device_id,
-        "device ids must differ"
-    );
+    assert_ne!(dev_a.device_id, dev_b.device_id, "device ids must differ");
 
     // ESI namespaces do not overlap.
     let (_start_a, end_a) = state.esi_namespace(&device_a_id()).unwrap();
     let (start_b, end_b) = state.esi_namespace(&device_b_id()).unwrap();
-    assert_eq!(end_a, start_b, "A's namespace ends exactly where B's begins");
+    assert_eq!(
+        end_a, start_b,
+        "A's namespace ends exactly where B's begins"
+    );
     assert!(end_a <= start_b, "namespaces must not overlap");
     assert!(end_b > end_a, "B's namespace is after A's");
 }
@@ -126,7 +140,9 @@ fn cluster_sync_event_exchange() {
     db_a.append_event(&EventEntry {
         timestamp: NOW,
         device_id: device_a_id(),
-        event: Event::DeviceAdded { device_id: device_c_id },
+        event: Event::DeviceAdded {
+            device_id: device_c_id,
+        },
     })
     .unwrap();
     let a_last_seq = db_a.last_event_seq().unwrap();
@@ -134,7 +150,10 @@ fn cluster_sync_event_exchange() {
 
     let sync_a = ClusterSyncManager::new(
         db_a.clone(),
-        ClusterSyncConfig { our_device_id: device_a_id(), batch_size: 100 },
+        ClusterSyncConfig {
+            our_device_id: device_a_id(),
+            batch_size: 100,
+        },
         Arc::new(Mutex::new(state_a)),
     );
 
@@ -145,7 +164,10 @@ fn cluster_sync_event_exchange() {
 
     let sync_b = ClusterSyncManager::new(
         db_b.clone(),
-        ClusterSyncConfig { our_device_id: device_b_id(), batch_size: 100 },
+        ClusterSyncConfig {
+            our_device_id: device_b_id(),
+            batch_size: 100,
+        },
         Arc::new(Mutex::new(state_b)),
     );
 
@@ -288,10 +310,17 @@ fn device_revocation_rotates_epoch() {
     state.revoke_device(rev, NOW, NOW).unwrap();
 
     // Epoch incremented.
-    assert_eq!(state.current_epoch(), new_epoch, "epoch must increment after revocation");
+    assert_eq!(
+        state.current_epoch(),
+        new_epoch,
+        "epoch must increment after revocation"
+    );
 
     // A is now revoked.
-    assert!(state.is_device_revoked(&device_a_id()), "device A must be revoked");
+    assert!(
+        state.is_device_revoked(&device_a_id()),
+        "device A must be revoked"
+    );
 
     // Only B is active.
     let active = state.active_devices();
@@ -382,7 +411,8 @@ fn handshake_with_cluster_identity() {
     verify_handshake(&msg, Timestamp::now()).expect("handshake must verify");
 
     // extract_cluster_identity must return master pub.
-    let extracted = extract_cluster_identity(&msg).expect("extract_cluster_identity must not error");
+    let extracted =
+        extract_cluster_identity(&msg).expect("extract_cluster_identity must not error");
     assert_eq!(
         extracted,
         Some(mp),
@@ -440,12 +470,26 @@ fn peer_affinity_isolates_blast_radius() {
     let peers_b_after = state.peers_for_device(&device_b_id());
 
     // P2 no longer in A.
-    assert!(!peers_a_after.contains(&p2), "P2 must be removed from A after reassign");
-    assert_eq!(peers_a_after.len(), 2, "A must manage 2 peers after reassign");
+    assert!(
+        !peers_a_after.contains(&p2),
+        "P2 must be removed from A after reassign"
+    );
+    assert_eq!(
+        peers_a_after.len(),
+        2,
+        "A must manage 2 peers after reassign"
+    );
 
     // P2 now in B.
-    assert!(peers_b_after.contains(&p2), "P2 must be in B after reassign");
-    assert_eq!(peers_b_after.len(), 3, "B must manage 3 peers after reassign");
+    assert!(
+        peers_b_after.contains(&p2),
+        "P2 must be in B after reassign"
+    );
+    assert_eq!(
+        peers_b_after.len(),
+        3,
+        "B must manage 3 peers after reassign"
+    );
 
     // Peer → device routing via peer_device.
     assert_eq!(state.peer_device(&p2), Some(device_b_id()));

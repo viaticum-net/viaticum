@@ -15,17 +15,17 @@
 
 use std::sync::{Arc, Mutex};
 
-use syncback_core::cluster::{esi_namespace_start, ClusterState};
+use syncback_core::cluster::{ClusterState, esi_namespace_start};
 use syncback_core::constants::DECODE_OVERHEAD;
 use syncback_core::db::Db;
-use syncback_core::erasure::{binding_seed, ErasureEncoder};
-use syncback_core::placement::{compute_allocation_with_importance, HolderCandidate};
+use syncback_core::erasure::{ErasureEncoder, binding_seed};
+use syncback_core::placement::{HolderCandidate, compute_allocation_with_importance};
 use syncback_core::types::{
     DeviceId, ErasureParams, PlacementStatus, SourceBlockId, SourceBlockRecord, SymbolPlacement,
     Timestamp,
 };
 
-use super::{pool::PoolSnapshot, WorkPipelineConfig};
+use super::{WorkPipelineConfig, pool::PoolSnapshot};
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
 
@@ -67,13 +67,10 @@ pub(crate) async fn run_block_iteration(
     pool: &PoolSnapshot,
 ) -> anyhow::Result<WorkOutcome> {
     // 1. Rebuild source blob from source files (deterministic; no block.bin needed).
-    let source_data = crate::daemon::backup::pipeline::rebuild_source_blob(
-        db,
-        block,
-        &config.epoch_key,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("rebuild_source_blob: {e}"))?;
+    let source_data =
+        crate::daemon::backup::pipeline::rebuild_source_blob(db, block, &config.epoch_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("rebuild_source_blob: {e}"))?;
 
     // 2. Compute ErasureParams.
     let k = block.k;
@@ -95,7 +92,9 @@ pub(crate) async fn run_block_iteration(
     // 4. Compute allocations for available candidates.
     //    Filter out candidates that already hold symbols for this block.
     let existing_holders = get_existing_holder_ids(db, &block.block_id)?;
-    let candidates: Vec<HolderCandidate> = pool.candidates.iter()
+    let candidates: Vec<HolderCandidate> = pool
+        .candidates
+        .iter()
         .filter(|c| !existing_holders.contains(&c.device_id))
         .cloned()
         .collect();
@@ -105,7 +104,11 @@ pub(crate) async fn run_block_iteration(
             block_id = %block.block_id,
             "work_pipeline: no new candidates (all pool peers already holding)"
         );
-        return Ok(WorkOutcome { acked: 0, failed: 0, encoded: false });
+        return Ok(WorkOutcome {
+            acked: 0,
+            failed: 0,
+            encoded: false,
+        });
     }
 
     let allocations = match compute_allocation_with_importance(
@@ -120,14 +123,22 @@ pub(crate) async fn run_block_iteration(
                 block_id = %block.block_id,
                 "work_pipeline: compute_allocation returned empty (too few candidates)"
             );
-            return Ok(WorkOutcome { acked: 0, failed: 0, encoded: false });
+            return Ok(WorkOutcome {
+                acked: 0,
+                failed: 0,
+                encoded: false,
+            });
         }
         Err(e) => {
             tracing::warn!(
                 block_id = %block.block_id,
                 "work_pipeline: compute_allocation failed: {e}"
             );
-            return Ok(WorkOutcome { acked: 0, failed: 0, encoded: false });
+            return Ok(WorkOutcome {
+                acked: 0,
+                failed: 0,
+                encoded: false,
+            });
         }
     };
 
@@ -367,7 +378,7 @@ async fn deliver_transfer_worker(
     esi_offset: u32,
 ) -> anyhow::Result<bool> {
     use syncback_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES;
-    use syncback_core::erasure::{chunk_symbols_by_size, Symbol};
+    use syncback_core::erasure::{Symbol, chunk_symbols_by_size};
     use syncback_core::messages::{Message, SymbolTransferMsg};
 
     // Bind raw symbols inline at send time — no disk read.
@@ -378,11 +389,7 @@ async fn deliver_transfer_worker(
             (start_esi..start_esi + count).filter_map(|esi| {
                 let idx = esi.checked_sub(esi_offset)? as usize;
                 let raw = raw_symbols.get(idx)?;
-                Some(encoder.apply_binding(
-                    raw.clone(),
-                    block_id,
-                    &placement.holder_id,
-                ))
+                Some(encoder.apply_binding(raw.clone(), block_id, &placement.holder_id))
             })
         })
         .collect();
@@ -458,10 +465,7 @@ async fn deliver_transfer_worker(
                     symbols = symbol_count,
                     "work_pipeline: symbols confirmed stored, placement Offered→Alive"
                 );
-                crate::daemon::processor::recompute_and_persist_block_cached_fields(
-                    db,
-                    block_id,
-                );
+                crate::daemon::processor::recompute_and_persist_block_cached_fields(db, block_id);
                 return Ok(true);
             }
             Ok(false) => {
@@ -522,12 +526,7 @@ fn compute_esi_offset(
     let placements = db.list_placements_for_block(block_id)?;
     let max_end = placements
         .iter()
-        .filter(|p| {
-            !matches!(
-                p.status,
-                PlacementStatus::Lost | PlacementStatus::Deleting
-            )
-        })
+        .filter(|p| !matches!(p.status, PlacementStatus::Lost | PlacementStatus::Deleting))
         .flat_map(|p| p.esi_ranges.iter())
         .map(|(start, count)| start.saturating_add(*count))
         .max()
@@ -538,7 +537,10 @@ fn compute_esi_offset(
 
 /// Get the set of DeviceIds that currently hold symbols for this block
 /// (Alive or Offered status — exclude them from new allocations).
-fn get_existing_holder_ids(db: &Db, block_id: &SourceBlockId) -> anyhow::Result<std::collections::HashSet<DeviceId>> {
+fn get_existing_holder_ids(
+    db: &Db,
+    block_id: &SourceBlockId,
+) -> anyhow::Result<std::collections::HashSet<DeviceId>> {
     let placements = db.list_placements_for_block(block_id)?;
     Ok(placements
         .into_iter()

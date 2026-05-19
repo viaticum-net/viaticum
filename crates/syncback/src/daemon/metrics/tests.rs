@@ -1,5 +1,5 @@
-use crate::cli::types::{PeerSummary, StatusData};
 use super::format_prometheus;
+use crate::cli::types::{PeerSummary, StatusData};
 
 fn make_status(peers: Vec<PeerSummary>) -> StatusData {
     StatusData {
@@ -76,7 +76,9 @@ fn format_prometheus_includes_per_peer_metrics() {
     assert!(out.contains("syncback_trust_s{node=\"node01\",peer=\"aabbccdd\"}"));
     assert!(out.contains("syncback_trust_combined{node=\"node01\",peer=\"aabbccdd\"}"));
     assert!(out.contains("syncback_peer_bytes_we_store{node=\"node01\",peer=\"aabbccdd\"} 100"));
-    assert!(out.contains("syncback_peer_bytes_stored_for_us{node=\"node01\",peer=\"aabbccdd\"} 200"));
+    assert!(
+        out.contains("syncback_peer_bytes_stored_for_us{node=\"node01\",peer=\"aabbccdd\"} 200")
+    );
 }
 
 #[test]
@@ -90,10 +92,7 @@ fn format_prometheus_empty_peers_no_per_peer_lines() {
 
 #[test]
 fn format_prometheus_multiple_peers() {
-    let peers = vec![
-        make_peer("peer_aaa", 0.9),
-        make_peer("peer_bbb", 0.5),
-    ];
+    let peers = vec![make_peer("peer_aaa", 0.9), make_peer("peer_bbb", 0.5)];
     let status = make_status(peers);
     let out = format_prometheus(&status, "n1");
 

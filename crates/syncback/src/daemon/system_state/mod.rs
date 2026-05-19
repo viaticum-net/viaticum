@@ -14,10 +14,10 @@ use std::time::Duration;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use syncback_core::db::Db;
-use syncback_core::system_state::{pack_system_state, restore_db, snapshot_db, SystemState};
+use syncback_core::system_state::{SystemState, pack_system_state, restore_db, snapshot_db};
 // Re-exported so tests (and callers) can check the current format version.
-pub use syncback_core::system_state::SYSTEM_STATE_VERSION;
 use syncback_core::messages::{Message, SystemStateBackupMsg};
+pub use syncback_core::system_state::SYSTEM_STATE_VERSION;
 use syncback_core::types::Timestamp;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -56,8 +56,8 @@ pub(crate) fn identity_key_bytes_from_seed(seed: &[u8]) -> anyhow::Result<[u8; 3
 pub fn snapshot_and_encrypt(db: &Db, seed: &[u8]) -> anyhow::Result<Vec<u8>> {
     let key = identity_key_bytes_from_seed(seed)?;
     let state = snapshot_db(db).map_err(|e| anyhow::anyhow!("snapshot_db: {e}"))?;
-    let blob = pack_system_state(&state, &key)
-        .map_err(|e| anyhow::anyhow!("pack_system_state: {e}"))?;
+    let blob =
+        pack_system_state(&state, &key).map_err(|e| anyhow::anyhow!("pack_system_state: {e}"))?;
     Ok(blob)
 }
 
@@ -71,11 +71,7 @@ pub fn snapshot_and_encrypt(db: &Db, seed: &[u8]) -> anyhow::Result<Vec<u8>> {
 ///
 /// Returns the deserialized SystemState on success so callers can inspect what
 /// was restored without reading the DB again.
-pub fn decrypt_and_restore(
-    db: &Db,
-    blob: &[u8],
-    seed: &[u8],
-) -> anyhow::Result<SystemState> {
+pub fn decrypt_and_restore(db: &Db, blob: &[u8], seed: &[u8]) -> anyhow::Result<SystemState> {
     let key = identity_key_bytes_from_seed(seed)?;
     let state = syncback_core::system_state::unpack_system_state(blob, &key)
         .map_err(|e| anyhow::anyhow!("unpack_system_state: {e}"))?;
@@ -104,7 +100,10 @@ pub async fn run_periodic_push(
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let clamped = interval_secs.max(60);
-    info!(interval_secs = clamped, "system_state periodic push: started");
+    info!(
+        interval_secs = clamped,
+        "system_state periodic push: started"
+    );
     let period = Duration::from_secs(clamped);
     let mut ticker = tokio::time::interval(period);
     // The first tick fires immediately; skip it so we don't push on startup
@@ -173,5 +172,3 @@ pub async fn run_periodic_push(
 
     Ok(())
 }
-
-

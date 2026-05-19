@@ -105,22 +105,19 @@ pub async fn require_auth(
 }
 
 fn is_authenticated(auth: &AuthState, headers: &HeaderMap) -> bool {
-    if let Some(h) = headers.get("Authorization").and_then(|v| v.to_str().ok()) {
-        if let Some(tok) = h.strip_prefix("Bearer ") {
-            if auth.verify(tok) {
+    if let Some(h) = headers.get("Authorization").and_then(|v| v.to_str().ok())
+        && let Some(tok) = h.strip_prefix("Bearer ")
+            && auth.verify(tok) {
                 return true;
             }
-        }
-    }
     if let Some(cookies) = headers.get("Cookie").and_then(|v| v.to_str().ok()) {
         let prefix = format!("{SESSION_COOKIE_NAME}=");
         for part in cookies.split(';') {
             let part = part.trim();
-            if let Some(tok) = part.strip_prefix(&prefix) {
-                if auth.verify(tok) {
+            if let Some(tok) = part.strip_prefix(&prefix)
+                && auth.verify(tok) {
                     return true;
                 }
-            }
         }
     }
     false

@@ -2,7 +2,7 @@
 // Pattern: what_when_then.
 // All tests are unit tests, no I/O. Cover acceptance criteria A1-A8 plus edge cases.
 
-use super::{validate_record_path, PathSafetyError, MAX_COMPONENT_LEN};
+use super::{MAX_COMPONENT_LEN, PathSafetyError, validate_record_path};
 
 // ─── Group A: Path Traversal ──────────────────────────────────────────────────
 
@@ -45,21 +45,30 @@ fn unc_path_double_slash_is_rejected() {
 fn windows_reserved_name_is_rejected() {
     // A5: "docs/CON.txt" → Err(WindowsReserved)
     let result = validate_record_path("docs/CON.txt");
-    assert_eq!(result, Err(PathSafetyError::WindowsReserved("CON.txt".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::WindowsReserved("CON.txt".to_string()))
+    );
 }
 
 #[test]
 fn colon_in_component_is_rejected() {
     // A6: "docs/file:stream" → Err(ColonInComponent)
     let result = validate_record_path("docs/file:stream");
-    assert_eq!(result, Err(PathSafetyError::ColonInComponent("file:stream".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::ColonInComponent("file:stream".to_string()))
+    );
 }
 
 #[test]
 fn null_byte_in_component_is_rejected() {
     // A7: "docs/fi\x00le" → Err(ControlChar)
     let result = validate_record_path("docs/fi\x00le");
-    assert_eq!(result, Err(PathSafetyError::ControlChar("fi\x00le".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::ControlChar("fi\x00le".to_string()))
+    );
 }
 
 #[test]
@@ -96,14 +105,20 @@ fn dot_component_is_rejected() {
 fn trailing_space_in_component_is_rejected() {
     // "docs/file " (trailing space) → Err(TrailingSpaceOrDot)
     let result = validate_record_path("docs/file ");
-    assert_eq!(result, Err(PathSafetyError::TrailingSpaceOrDot("file ".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::TrailingSpaceOrDot("file ".to_string()))
+    );
 }
 
 #[test]
 fn trailing_dot_in_component_is_rejected() {
     // "docs/file." (trailing dot) → Err(TrailingSpaceOrDot)
     let result = validate_record_path("docs/file.");
-    assert_eq!(result, Err(PathSafetyError::TrailingSpaceOrDot("file.".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::TrailingSpaceOrDot("file.".to_string()))
+    );
 }
 
 #[test]
@@ -121,37 +136,55 @@ fn component_too_long_is_rejected() {
 #[test]
 fn windows_reserved_name_nul_is_rejected() {
     let result = validate_record_path("docs/NUL");
-    assert_eq!(result, Err(PathSafetyError::WindowsReserved("NUL".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::WindowsReserved("NUL".to_string()))
+    );
 }
 
 #[test]
 fn windows_reserved_name_com1_is_rejected() {
     let result = validate_record_path("docs/COM1");
-    assert_eq!(result, Err(PathSafetyError::WindowsReserved("COM1".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::WindowsReserved("COM1".to_string()))
+    );
 }
 
 #[test]
 fn windows_reserved_name_lpt9_is_rejected() {
     let result = validate_record_path("docs/LPT9");
-    assert_eq!(result, Err(PathSafetyError::WindowsReserved("LPT9".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::WindowsReserved("LPT9".to_string()))
+    );
 }
 
 #[test]
 fn windows_reserved_name_with_extension_is_rejected() {
     // "CON.txt" → stem is "CON" → Err(WindowsReserved)
     let result = validate_record_path("docs/CON.txt");
-    assert_eq!(result, Err(PathSafetyError::WindowsReserved("CON.txt".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::WindowsReserved("CON.txt".to_string()))
+    );
 }
 
 #[test]
 fn windows_reserved_name_case_insensitive() {
     // "con" → lowercase → still rejected
     let result = validate_record_path("docs/con");
-    assert_eq!(result, Err(PathSafetyError::WindowsReserved("con".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::WindowsReserved("con".to_string()))
+    );
 
     // "Con" → mixed case → still rejected
     let result2 = validate_record_path("docs/Con");
-    assert_eq!(result2, Err(PathSafetyError::WindowsReserved("Con".to_string())));
+    assert_eq!(
+        result2,
+        Err(PathSafetyError::WindowsReserved("Con".to_string()))
+    );
 }
 
 #[test]
@@ -179,7 +212,10 @@ fn relative_path_is_valid() {
 fn unicode_filename_is_valid() {
     // "документы/файл.txt" → Ok([...])
     let result = validate_record_path("документы/файл.txt");
-    assert!(result.is_ok(), "expected Ok for unicode path, got {result:?}");
+    assert!(
+        result.is_ok(),
+        "expected Ok for unicode path, got {result:?}"
+    );
     let validated = result.unwrap();
     assert_eq!(validated.components, vec!["документы", "файл.txt"]);
 }
@@ -214,13 +250,19 @@ fn single_component_path_is_valid() {
 #[test]
 fn control_char_x01_in_component_is_rejected() {
     let result = validate_record_path("docs/fi\x01le");
-    assert_eq!(result, Err(PathSafetyError::ControlChar("fi\x01le".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::ControlChar("fi\x01le".to_string()))
+    );
 }
 
 #[test]
 fn control_char_x1f_in_component_is_rejected() {
     let result = validate_record_path("docs/fi\x1fle");
-    assert_eq!(result, Err(PathSafetyError::ControlChar("fi\x1fle".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::ControlChar("fi\x1fle".to_string()))
+    );
 }
 
 #[test]
@@ -235,25 +277,37 @@ fn to_relative_path_joins_correctly() {
 #[test]
 fn prn_reserved_is_rejected() {
     let result = validate_record_path("docs/PRN");
-    assert_eq!(result, Err(PathSafetyError::WindowsReserved("PRN".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::WindowsReserved("PRN".to_string()))
+    );
 }
 
 #[test]
 fn aux_reserved_is_rejected() {
     let result = validate_record_path("docs/AUX");
-    assert_eq!(result, Err(PathSafetyError::WindowsReserved("AUX".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::WindowsReserved("AUX".to_string()))
+    );
 }
 
 #[test]
 fn com9_reserved_with_extension_is_rejected() {
     let result = validate_record_path("docs/com9.log");
-    assert_eq!(result, Err(PathSafetyError::WindowsReserved("com9.log".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::WindowsReserved("com9.log".to_string()))
+    );
 }
 
 #[test]
 fn lpt1_reserved_with_extension_is_rejected() {
     let result = validate_record_path("docs/lpt1.log");
-    assert_eq!(result, Err(PathSafetyError::WindowsReserved("lpt1.log".to_string())));
+    assert_eq!(
+        result,
+        Err(PathSafetyError::WindowsReserved("lpt1.log".to_string()))
+    );
 }
 
 #[test]

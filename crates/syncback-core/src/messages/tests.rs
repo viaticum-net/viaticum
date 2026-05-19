@@ -1,4 +1,7 @@
-use crate::cluster::{derive_device_key, derive_master_key, issue_device_certificate, master_identity, issue_revocation, EpochCounter};
+use crate::cluster::{
+    EpochCounter, derive_device_key, derive_master_key, issue_device_certificate, issue_revocation,
+    master_identity,
+};
 use crate::constants::{HANDSHAKE_FRESHNESS_SECS, MAX_RELAY_HOP, RELAY_TTL_SECS};
 use crate::erasure::Symbol;
 use crate::types::{DeviceId, Event, EventEntry, IdentityPub, SourceBlockId, Timestamp};
@@ -46,7 +49,14 @@ fn minimal_board_entry(signing_key: &SigningKey) -> (BoardEntry, [u8; 16]) {
     let author = IdentityPub(signing_key.verifying_key().to_bytes());
     let msg_id = [0u8; 16];
     let payload = b"test payload".to_vec();
-    let entry = build_broadcast_entry("peer_announce", msg_id, payload, author, Timestamp(1000), signing_key);
+    let entry = build_broadcast_entry(
+        "peer_announce",
+        msg_id,
+        payload,
+        author,
+        Timestamp(1000),
+        signing_key,
+    );
     (entry, msg_id)
 }
 
@@ -243,7 +253,10 @@ fn check_relay_hop_rejects_hop_two() {
     let (mut entry, _) = minimal_board_entry(&signing_key);
     entry.hop = MAX_RELAY_HOP;
     let result = check_relay_hop(&entry);
-    assert!(matches!(result, Err(MessageError::HopLimitExceeded { hop: 2 })));
+    assert!(matches!(
+        result,
+        Err(MessageError::HopLimitExceeded { hop: 2 })
+    ));
 }
 
 #[test]
@@ -402,7 +415,7 @@ fn make_device_cert_for_test() -> (
     ed25519_dalek::SigningKey, // master key
     ed25519_dalek::SigningKey, // device key
     crate::cluster::DeviceCertificate,
-    IdentityPub,               // master identity
+    IdentityPub, // master identity
     DeviceId,
 ) {
     let seed = [0xAAu8; 32];
@@ -500,8 +513,16 @@ fn revocation_broadcast_cbor_round_trip() {
     let device_key = derive_device_key(&seed, &device_seed).unwrap();
     let device_id = DeviceId(device_key.verifying_key().to_bytes());
     let cert = issue_device_certificate(&master_key, device_id, Timestamp(1_000_000));
-    let revocation = issue_revocation(&master_key, device_id, Timestamp(2_000_000), EpochCounter(1));
-    let broadcast = RevocationBroadcast { revocation, device_cert: cert };
+    let revocation = issue_revocation(
+        &master_key,
+        device_id,
+        Timestamp(2_000_000),
+        EpochCounter(1),
+    );
+    let broadcast = RevocationBroadcast {
+        revocation,
+        device_cert: cert,
+    };
     let bytes = to_cbor(&broadcast).unwrap();
     let decoded: RevocationBroadcast = from_cbor(&bytes).unwrap();
     assert_eq!(decoded, broadcast);
@@ -525,7 +546,9 @@ fn cluster_sync_response_msg_round_trip() {
     let event_entry = EventEntry {
         timestamp: Timestamp(1_000_000),
         device_id: DeviceId([0x04u8; 32]),
-        event: Event::DeviceAdded { device_id: DeviceId([0x05u8; 32]) },
+        event: Event::DeviceAdded {
+            device_id: DeviceId([0x05u8; 32]),
+        },
     };
     let msg = ClusterSyncResponseMsg {
         v: 1,
@@ -685,7 +708,10 @@ fn all_26_message_variants() -> Vec<Message> {
         Message::SymbolTransfer(SymbolTransferMsg {
             v: 1,
             source_block_id: sbid,
-            symbols: vec![crate::erasure::Symbol { esi: 0, data: vec![0u8; 8] }],
+            symbols: vec![crate::erasure::Symbol {
+                esi: 0,
+                data: vec![0u8; 8],
+            }],
             timestamp: ts,
         }),
         Message::Delete(DeleteMsg {
@@ -730,7 +756,10 @@ fn all_26_message_variants() -> Vec<Message> {
         Message::RestoreResponse(RestoreResponseMsg {
             v: 1,
             source_block_id: sbid,
-            symbols: vec![crate::erasure::Symbol { esi: 0, data: vec![0u8; 8] }],
+            symbols: vec![crate::erasure::Symbol {
+                esi: 0,
+                data: vec![0u8; 8],
+            }],
             timestamp: ts,
         }),
         Message::RestoreDenied(RestoreDeniedMsg {
@@ -760,7 +789,9 @@ fn all_26_message_variants() -> Vec<Message> {
                 EventEntry {
                     timestamp: ts,
                     device_id: DeviceId([0x04u8; 32]),
-                    event: Event::DeviceAdded { device_id: DeviceId([0x05u8; 32]) },
+                    event: Event::DeviceAdded {
+                        device_id: DeviceId([0x05u8; 32]),
+                    },
                 },
             )],
             responder_last_seq: 1,
@@ -776,7 +807,10 @@ fn all_26_message_variants() -> Vec<Message> {
             stored: true,
             timestamp: ts,
         }),
-        Message::SystemStateRequest(SystemStateRequestMsg { v: 1, timestamp: ts }),
+        Message::SystemStateRequest(SystemStateRequestMsg {
+            v: 1,
+            timestamp: ts,
+        }),
         Message::SystemStateResponse(SystemStateResponseMsg {
             v: 1,
             encrypted_blob: vec![],
@@ -803,10 +837,16 @@ fn all_message_variants_frame_unframe_roundtrip_sweep() {
     assert_eq!(variants.len(), 26, "expected 26 Message variants");
     for msg in &variants {
         let framed = frame_message(msg).expect("frame_message must not fail");
-        let (decoded, consumed) =
-            unframe_message(&framed).expect("unframe_message must not fail");
-        assert_eq!(decoded, *msg, "frame/unframe roundtrip mismatch for {msg:?}");
-        assert_eq!(consumed, framed.len(), "consumed != framed.len() for {msg:?}");
+        let (decoded, consumed) = unframe_message(&framed).expect("unframe_message must not fail");
+        assert_eq!(
+            decoded, *msg,
+            "frame/unframe roundtrip mismatch for {msg:?}"
+        );
+        assert_eq!(
+            consumed,
+            framed.len(),
+            "consumed != framed.len() for {msg:?}"
+        );
     }
 }
 
@@ -891,10 +931,8 @@ fn handshake_freshness_symmetric() {
     let hs_b = build_handshake(identity_b, shared_ts, &sk_b, None);
 
     // Both verify successfully when now == shared_ts (delta=0).
-    verify_handshake(&hs_a, shared_ts)
-        .expect("peer A handshake must verify at its own timestamp");
-    verify_handshake(&hs_b, shared_ts)
-        .expect("peer B handshake must verify at its own timestamp");
+    verify_handshake(&hs_a, shared_ts).expect("peer A handshake must verify at its own timestamp");
+    verify_handshake(&hs_b, shared_ts).expect("peer B handshake must verify at its own timestamp");
 
     // Also verify that both still verify within the freshness window.
     let within_window = Timestamp(shared_ts.0 + HANDSHAKE_FRESHNESS_SECS - 1);
@@ -906,11 +944,17 @@ fn handshake_freshness_symmetric() {
     // And both reject outside the freshness window.
     let outside_window = Timestamp(shared_ts.0 + HANDSHAKE_FRESHNESS_SECS + 1);
     assert!(
-        matches!(verify_handshake(&hs_a, outside_window), Err(MessageError::HandshakeStale { .. })),
+        matches!(
+            verify_handshake(&hs_a, outside_window),
+            Err(MessageError::HandshakeStale { .. })
+        ),
         "peer A handshake must be stale past freshness window"
     );
     assert!(
-        matches!(verify_handshake(&hs_b, outside_window), Err(MessageError::HandshakeStale { .. })),
+        matches!(
+            verify_handshake(&hs_b, outside_window),
+            Err(MessageError::HandshakeStale { .. })
+        ),
         "peer B handshake must be stale past freshness window"
     );
 }
@@ -982,7 +1026,8 @@ fn all_messages_have_version_one() {
             Message::Ack(m) => m.v,
         };
         assert_eq!(
-            v, 1,
+            v,
+            1,
             "message variant {:?} has v={v}, expected 1",
             std::mem::discriminant(msg)
         );
@@ -1116,7 +1161,11 @@ fn peer_announce_with_x25519_roundtrips_cbor() {
         Message::PeerAnnounce(m) => m,
         other => panic!("expected PeerAnnounce, got {other:?}"),
     };
-    assert_eq!(decoded.x25519_pub, Some(x25519_bytes), "x25519_pub must survive frame/unframe");
+    assert_eq!(
+        decoded.x25519_pub,
+        Some(x25519_bytes),
+        "x25519_pub must survive frame/unframe"
+    );
     assert_eq!(decoded.identity_pub, msg.identity_pub);
     // Signature still verifies after round-trip.
     super::verify_peer_announce(&decoded).expect("sig must verify after roundtrip");
@@ -1170,17 +1219,15 @@ fn peer_announce_without_x25519_deserializes_as_none() {
             Value::Text("timestamp".into()),
             Value::Integer(ts_u64.into()),
         ),
-        (
-            Value::Text("sig".into()),
-            Value::Bytes(sig_bytes),
-        ),
+        (Value::Text("sig".into()), Value::Bytes(sig_bytes)),
         // x25519_pub is intentionally absent.
     ]);
 
     let mut buf = Vec::new();
     ciborium::ser::into_writer(&cbor_map, &mut buf).expect("CBOR encode failed");
 
-    let decoded: PeerAnnounceMsg = from_cbor(&buf).expect("decode must succeed without x25519_pub field");
+    let decoded: PeerAnnounceMsg =
+        from_cbor(&buf).expect("decode must succeed without x25519_pub field");
     assert_eq!(
         decoded.x25519_pub, None,
         "x25519_pub must default to None when field is absent (backward compat)"
@@ -1392,7 +1439,11 @@ fn peer_announce_sig_input_includes_x25519_pub_at_known_offset() {
 
     assert_eq!(input.len(), 74, "sig_input must be 74 bytes");
     assert_eq!(&input[0..2], b"pa", "first 2 bytes must be b\"pa\"");
-    assert_eq!(&input[2..34], &identity_pub.0, "bytes 2..34 must be identity_pub");
+    assert_eq!(
+        &input[2..34],
+        &identity_pub.0,
+        "bytes 2..34 must be identity_pub"
+    );
     assert_eq!(
         &input[34..42],
         &ts.0.to_be_bytes(),
@@ -1408,7 +1459,11 @@ fn peer_announce_sig_input_uses_zeroes_for_none_x25519() {
     let ts = Timestamp(100);
 
     let input = super::peer_announce_sig_input(&identity_pub, &ts, None);
-    assert_eq!(&input[42..74], &[0u8; 32], "None x25519_pub must encode as [0u8;32]");
+    assert_eq!(
+        &input[42..74],
+        &[0u8; 32],
+        "None x25519_pub must encode as [0u8;32]"
+    );
 }
 
 // AC-D5: old-format sig (covering only identity_pub || timestamp, 40 bytes) fails
@@ -1493,8 +1548,7 @@ fn pos_hash_nack_with_correct_signature_verifies() {
 
     let msg = super::build_pos_hash_nack([0x20u8; 16], block_id, 10, ts, None, &sk);
     let holder = IdentityPub(sk.verifying_key().to_bytes());
-    super::verify_pos_hash_nack(&msg, &holder)
-        .expect("correctly built PosHashNack must verify");
+    super::verify_pos_hash_nack(&msg, &holder).expect("correctly built PosHashNack must verify");
 }
 
 // AC-E7: old-format message (no sig field in CBOR) deserializes with sig=[0u8;64]
@@ -1528,10 +1582,10 @@ fn pos_hash_nack_missing_sig_field_deserializes_to_zero() {
     let mut buf = Vec::new();
     ciborium::ser::into_writer(&cbor_map, &mut buf).expect("CBOR encode failed");
 
-    let decoded: PosHashNackMsg = from_cbor(&buf).expect("deserialization must succeed without sig field");
+    let decoded: PosHashNackMsg =
+        from_cbor(&buf).expect("deserialization must succeed without sig field");
     assert_eq!(
-        decoded.sig,
-        [0u8; 64],
+        decoded.sig, [0u8; 64],
         "missing sig field must default to [0u8; 64]"
     );
 

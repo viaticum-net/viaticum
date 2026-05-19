@@ -3,8 +3,8 @@
 // Weight formula: trust / sqrt(1 - trust)  (mean-variance optimum)
 
 use crate::constants::{MAX_HOLDERS_PER_BLOCK, MIN_SYMBOLS_PER_HOLDER};
-use crate::types::{DeviceId, ErasureParams};
 use crate::reliability;
+use crate::types::{DeviceId, ErasureParams};
 
 #[cfg(test)]
 mod tests;
@@ -109,11 +109,10 @@ pub fn compute_allocation(
     }
 
     // Step 1b: enforce holder limits
-    let max_by_symbols = if MIN_SYMBOLS_PER_HOLDER > 0 {
-        (params.n / MIN_SYMBOLS_PER_HOLDER) as usize
-    } else {
-        usize::MAX
-    };
+    let max_by_symbols = params
+        .n
+        .checked_div(MIN_SYMBOLS_PER_HOLDER)
+        .map_or(usize::MAX, |v| v as usize);
     let effective_max = (MAX_HOLDERS_PER_BLOCK as usize).min(max_by_symbols).max(2);
 
     if valid.len() > effective_max {
@@ -154,10 +153,7 @@ pub fn compute_allocation(
 
     // Step 7: redistribution loop (max 10 iterations)
     for _ in 0..10 {
-        let capped_excess: u32 = counts
-            .iter()
-            .map(|&c| c.saturating_sub(max_per))
-            .sum();
+        let capped_excess: u32 = counts.iter().map(|&c| c.saturating_sub(max_per)).sum();
         if capped_excess == 0 {
             break;
         }
@@ -302,22 +298,19 @@ pub fn compute_allocation_with_importance(
         })
         .collect();
 
-    let n_target = match reliability::solve_n_for_target(
-        base_params.k_eff,
-        &solver_candidates,
-        target_p,
-    ) {
-        Ok(n) => n,
-        Err(_) => {
-            // Empty pool or invalid k_eff — fall back to static N.
-            tracing::debug!(
-                k_eff = base_params.k_eff,
-                importance,
-                "compute_allocation_with_importance: solver failed, using static N"
-            );
-            base_params.n
-        }
-    };
+    let n_target =
+        match reliability::solve_n_for_target(base_params.k_eff, &solver_candidates, target_p) {
+            Ok(n) => n,
+            Err(_) => {
+                // Empty pool or invalid k_eff — fall back to static N.
+                tracing::debug!(
+                    k_eff = base_params.k_eff,
+                    importance,
+                    "compute_allocation_with_importance: solver failed, using static N"
+                );
+                base_params.n
+            }
+        };
 
     // Build ErasureParams with dynamic N.
     // We preserve k, k_eff, t, overhead from base_params; only n changes.

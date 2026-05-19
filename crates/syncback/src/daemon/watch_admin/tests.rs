@@ -1,4 +1,5 @@
 // Tests for WatchAdmin — all what_when_then naming convention.
+#![allow(clippy::cloned_ref_to_slice_refs)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -6,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-use syncback_core::config::{WatchConfig, DEFAULT_IMPORTANCE, DEFAULT_IMPORTANCE_MULTIPLIER};
+use syncback_core::config::{DEFAULT_IMPORTANCE, DEFAULT_IMPORTANCE_MULTIPLIER, WatchConfig};
 use syncback_core::db::Db;
 use syncback_core::types::{
     DeviceId, FileId, FileRecord, FileVersion, LocalState, PlacementStatus, SourceBlockId,
@@ -14,9 +15,9 @@ use syncback_core::types::{
 };
 
 use super::{
-    decode_path_b64, derive_status, encode_path_b64, save_watches, traffic_light,
-    AddWatchRequest, CachedRollup, FolderRollup, PatchWatchRequest, WatchAdmin,
-    WatchAdminError, WatchStatus, WatcherStatusSignal,
+    AddWatchRequest, CachedRollup, FolderRollup, PatchWatchRequest, WatchAdmin, WatchAdminError,
+    WatchStatus, WatcherStatusSignal, decode_path_b64, derive_status, encode_path_b64,
+    save_watches, traffic_light,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -33,7 +34,10 @@ fn make_watch_admin_with_config(
     config_path: PathBuf,
     configs: Vec<WatchConfig>,
     db: Db,
-) -> (WatchAdmin, mpsc::Receiver<super::super::watcher::WatcherCommand>) {
+) -> (
+    WatchAdmin,
+    mpsc::Receiver<super::super::watcher::WatcherCommand>,
+) {
     let live_configs = Arc::new(RwLock::new(configs));
     let (tx, rx) = mpsc::channel(64);
     let admin = WatchAdmin::new(config_path, live_configs, tx, db);
@@ -41,13 +45,7 @@ fn make_watch_admin_with_config(
 }
 
 /// Create a minimal FileRecord with one version.
-fn make_file_record(
-    file_id: u64,
-    path: &str,
-    k: u32,
-    t: u16,
-    backed_up: bool,
-) -> FileRecord {
+fn make_file_record(file_id: u64, path: &str, k: u32, t: u16, backed_up: bool) -> FileRecord {
     let now = Timestamp::now();
     FileRecord {
         file_id: FileId(file_id),
@@ -67,11 +65,7 @@ fn make_file_record(
 }
 
 /// Create a SymbolPlacement.
-fn make_placement(
-    file_id: u64,
-    block_id: u8,
-    status: PlacementStatus,
-) -> SymbolPlacement {
+fn make_placement(file_id: u64, block_id: u8, status: PlacementStatus) -> SymbolPlacement {
     SymbolPlacement {
         source_block_id: SourceBlockId([block_id; 32]),
         holder_id: DeviceId([99u8; 32]),
@@ -95,7 +89,11 @@ fn list_watches_returns_empty_when_no_configs() {
     let (admin, _rx) = make_watch_admin_with_config(config_path, vec![], db);
 
     let entries = admin.list_watches();
-    assert!(entries.is_empty(), "expected empty list, got {:?}", entries.len());
+    assert!(
+        entries.is_empty(),
+        "expected empty list, got {:?}",
+        entries.len()
+    );
 }
 
 #[test]
@@ -155,7 +153,11 @@ async fn add_watch_with_valid_dir_appends_to_live_configs() {
     // Verify it's now in live_configs.
     let configs = admin.live_configs.read().unwrap();
     assert_eq!(configs.len(), 1);
-    assert!(configs[0].path.contains(watch_dir.path().to_string_lossy().as_ref()));
+    assert!(
+        configs[0]
+            .path
+            .contains(watch_dir.path().to_string_lossy().as_ref())
+    );
 }
 
 #[tokio::test]
@@ -184,8 +186,14 @@ async fn add_watch_writes_entry_to_config_toml_preserving_other_sections() {
         .unwrap();
 
     let written = std::fs::read_to_string(&config_path).unwrap();
-    assert!(written.contains("relay_max_entries"), "network section should be preserved");
-    assert!(written.contains("[[watch]]"), "watch entry should be written");
+    assert!(
+        written.contains("relay_max_entries"),
+        "network section should be preserved"
+    );
+    assert!(
+        written.contains("[[watch]]"),
+        "watch entry should be written"
+    );
     assert!(
         written.contains(&watch_dir.path().to_string_lossy().as_ref().to_string()),
         "watch path should appear in config"
@@ -310,7 +318,10 @@ async fn patch_watch_updates_importance_in_live_configs_and_toml() {
     let result = admin
         .patch_watch(
             &path_b64,
-            PatchWatchRequest { importance_multiplier: Some(0.9), importance_legacy: None },
+            PatchWatchRequest {
+                importance_multiplier: Some(0.9),
+                importance_legacy: None,
+            },
         )
         .await;
 
@@ -325,7 +336,10 @@ async fn patch_watch_updates_importance_in_live_configs_and_toml() {
 
     // Check config file.
     let written = std::fs::read_to_string(&config_path).unwrap();
-    assert!(written.contains("0.9"), "new importance should appear in config.toml");
+    assert!(
+        written.contains("0.9"),
+        "new importance should appear in config.toml"
+    );
 }
 
 #[tokio::test]
@@ -338,7 +352,13 @@ async fn patch_watch_returns_not_found_for_unknown_path() {
     // Encode a path that is not watched.
     let path_b64 = encode_path_b64(&PathBuf::from("/not/a/watch"));
     let result = admin
-        .patch_watch(&path_b64, PatchWatchRequest { importance_multiplier: Some(0.5), importance_legacy: None })
+        .patch_watch(
+            &path_b64,
+            PatchWatchRequest {
+                importance_multiplier: Some(0.5),
+                importance_legacy: None,
+            },
+        )
         .await;
 
     assert!(
@@ -378,7 +398,10 @@ async fn remove_watch_without_purge_removes_from_live_configs_and_toml() {
 
     // Config file should have no [[watch]] entry.
     let written = std::fs::read_to_string(&config_path).unwrap();
-    assert!(!written.contains("[[watch]]"), "config should have no watch entries");
+    assert!(
+        !written.contains("[[watch]]"),
+        "config should have no watch entries"
+    );
 }
 
 #[tokio::test]
@@ -547,9 +570,30 @@ fn compute_rollup_counts_backed_up_files_correctly() {
     let prefix = watch_dir.path().to_string_lossy().to_string();
 
     // 2 backed-up, 1 not.
-    db.upsert_file(&make_file_record(1, &format!("{}/a.txt", prefix), 10, 64, true)).unwrap();
-    db.upsert_file(&make_file_record(2, &format!("{}/b.txt", prefix), 10, 64, true)).unwrap();
-    db.upsert_file(&make_file_record(3, &format!("{}/c.txt", prefix), 10, 64, false)).unwrap();
+    db.upsert_file(&make_file_record(
+        1,
+        &format!("{}/a.txt", prefix),
+        10,
+        64,
+        true,
+    ))
+    .unwrap();
+    db.upsert_file(&make_file_record(
+        2,
+        &format!("{}/b.txt", prefix),
+        10,
+        64,
+        true,
+    ))
+    .unwrap();
+    db.upsert_file(&make_file_record(
+        3,
+        &format!("{}/c.txt", prefix),
+        10,
+        64,
+        false,
+    ))
+    .unwrap();
 
     let configs = vec![WatchConfig {
         path: prefix,
@@ -577,7 +621,8 @@ fn compute_rollup_counts_at_risk_when_any_placement_is_uncertain() {
 
     let record = make_file_record(1, &format!("{}/a.txt", prefix), 10, 64, true);
     db.upsert_file(&record).unwrap();
-    db.upsert_placement(&make_placement(1, 1, PlacementStatus::Uncertain)).unwrap();
+    db.upsert_placement(&make_placement(1, 1, PlacementStatus::Uncertain))
+        .unwrap();
 
     let configs = vec![WatchConfig {
         path: prefix,
@@ -604,8 +649,10 @@ fn compute_rollup_counts_lost_when_all_placements_are_lost() {
 
     let record = make_file_record(1, &format!("{}/a.txt", prefix), 10, 64, true);
     db.upsert_file(&record).unwrap();
-    db.upsert_placement(&make_placement(1, 1, PlacementStatus::Lost)).unwrap();
-    db.upsert_placement(&make_placement(1, 2, PlacementStatus::Lost)).unwrap();
+    db.upsert_placement(&make_placement(1, 1, PlacementStatus::Lost))
+        .unwrap();
+    db.upsert_placement(&make_placement(1, 2, PlacementStatus::Lost))
+        .unwrap();
 
     // Second placement uses a different holder_id so it doesn't overwrite the first.
     // Actually they share the same source_block_id prefix — let me use distinct block IDs.
@@ -697,7 +744,10 @@ fn save_watches_preserves_existing_toml_sections_and_comments() {
     save_watches(&config_path, &configs).unwrap();
 
     let written = std::fs::read_to_string(&config_path).unwrap();
-    assert!(written.contains("relay_max_entries"), "network section preserved");
+    assert!(
+        written.contains("relay_max_entries"),
+        "network section preserved"
+    );
     assert!(written.contains("[[watch]]"), "watch section written");
 }
 
@@ -706,12 +756,19 @@ fn save_watches_removes_watch_section_when_configs_empty() {
     let tmp = TempDir::new().unwrap();
     let config_path = tmp.path().join("config.toml");
 
-    std::fs::write(&config_path, "[[watch]]\npath = \"/tmp/old\"\nimportance = 0.5\n").unwrap();
+    std::fs::write(
+        &config_path,
+        "[[watch]]\npath = \"/tmp/old\"\nimportance = 0.5\n",
+    )
+    .unwrap();
 
     save_watches(&config_path, &[]).unwrap();
 
     let written = std::fs::read_to_string(&config_path).unwrap();
-    assert!(!written.contains("[[watch]]"), "watch section should be removed");
+    assert!(
+        !written.contains("[[watch]]"),
+        "watch section should be removed"
+    );
     assert!(!written.contains("/tmp/old"), "old path should be gone");
 }
 
@@ -772,7 +829,10 @@ async fn patch_watch_preserves_classification_when_changing_multiplier() {
         path: watch_dir.path().to_string_lossy().into_owned(),
         importance_multiplier: 0.5,
         was_legacy_importance: false,
-        classification: Some(FolderClassification { is_media_folder: true, importance_multiplier: 1.0 }),
+        classification: Some(FolderClassification {
+            is_media_folder: true,
+            importance_multiplier: 1.0,
+        }),
         bursts: None,
     };
     save_watches(&config_path, std::slice::from_ref(&existing)).unwrap();
@@ -780,12 +840,25 @@ async fn patch_watch_preserves_classification_when_changing_multiplier() {
     let (admin, _rx) = make_watch_admin_with_config(config_path.clone(), vec![existing], db);
 
     let path_b64 = encode_path_b64(watch_dir.path());
-    admin.patch_watch(&path_b64, PatchWatchRequest { importance_multiplier: Some(0.9), importance_legacy: None }).await.unwrap();
+    admin
+        .patch_watch(
+            &path_b64,
+            PatchWatchRequest {
+                importance_multiplier: Some(0.9),
+                importance_legacy: None,
+            },
+        )
+        .await
+        .unwrap();
 
     let cfgs = admin.live_configs.read().unwrap();
     assert_eq!(cfgs.len(), 1);
     assert!(
-        cfgs[0].classification.as_ref().map(|c| c.is_media_folder).unwrap_or(false),
+        cfgs[0]
+            .classification
+            .as_ref()
+            .map(|c| c.is_media_folder)
+            .unwrap_or(false),
         "classification should be preserved after patch"
     );
     assert!(
@@ -823,12 +896,38 @@ fn recompute_all_rollups_single_scan_populates_all_watches() {
     let dir1 = TempDir::new().unwrap();
     let dir2 = TempDir::new().unwrap();
 
-    db.upsert_file(&make_file_record(1, &format!("{}/a.txt", dir1.path().display()), 10, 64, true)).unwrap();
-    db.upsert_file(&make_file_record(2, &format!("{}/b.txt", dir2.path().display()), 10, 64, false)).unwrap();
+    db.upsert_file(&make_file_record(
+        1,
+        &format!("{}/a.txt", dir1.path().display()),
+        10,
+        64,
+        true,
+    ))
+    .unwrap();
+    db.upsert_file(&make_file_record(
+        2,
+        &format!("{}/b.txt", dir2.path().display()),
+        10,
+        64,
+        false,
+    ))
+    .unwrap();
 
     let configs = vec![
-        WatchConfig { path: dir1.path().to_string_lossy().into_owned(), importance_multiplier: 0.5, was_legacy_importance: false, classification: None, bursts: None },
-        WatchConfig { path: dir2.path().to_string_lossy().into_owned(), importance_multiplier: 0.5, was_legacy_importance: false, classification: None, bursts: None },
+        WatchConfig {
+            path: dir1.path().to_string_lossy().into_owned(),
+            importance_multiplier: 0.5,
+            was_legacy_importance: false,
+            classification: None,
+            bursts: None,
+        },
+        WatchConfig {
+            path: dir2.path().to_string_lossy().into_owned(),
+            importance_multiplier: 0.5,
+            was_legacy_importance: false,
+            classification: None,
+            bursts: None,
+        },
     ];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
     admin.recompute_all_rollups().unwrap();
@@ -836,8 +935,14 @@ fn recompute_all_rollups_single_scan_populates_all_watches() {
     let entries = admin.list_watches();
     assert_eq!(entries.len(), 2);
 
-    let e1 = entries.iter().find(|e| e.path.contains(dir1.path().to_str().unwrap())).unwrap();
-    let e2 = entries.iter().find(|e| e.path.contains(dir2.path().to_str().unwrap())).unwrap();
+    let e1 = entries
+        .iter()
+        .find(|e| e.path.contains(dir1.path().to_str().unwrap()))
+        .unwrap();
+    let e2 = entries
+        .iter()
+        .find(|e| e.path.contains(dir2.path().to_str().unwrap()))
+        .unwrap();
     assert_eq!(e1.total_files, 1);
     assert_eq!(e1.backed_up, 1);
     assert_eq!(e2.total_files, 1);
@@ -884,7 +989,10 @@ fn get_watches_reads_cached_rollup_without_db_scan() {
 
     let entries = admin.list_watches();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].total_files, 42, "should read from cached_rollups");
+    assert_eq!(
+        entries[0].total_files, 42,
+        "should read from cached_rollups"
+    );
     assert_eq!(entries[0].backed_up, 40);
     assert_eq!(entries[0].at_risk, 1);
     assert_eq!(entries[0].lost, 1);
@@ -898,9 +1006,22 @@ fn post_refresh_triggers_recompute_and_updates_computed_at() {
     let watch_dir = TempDir::new().unwrap();
     let prefix = watch_dir.path().to_string_lossy().to_string();
 
-    db.upsert_file(&make_file_record(1, &format!("{}/a.txt", prefix), 10, 64, true)).unwrap();
+    db.upsert_file(&make_file_record(
+        1,
+        &format!("{}/a.txt", prefix),
+        10,
+        64,
+        true,
+    ))
+    .unwrap();
 
-    let configs = vec![WatchConfig { path: prefix, importance_multiplier: 0.5, was_legacy_importance: false, classification: None, bursts: None }];
+    let configs = vec![WatchConfig {
+        path: prefix,
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: None,
+        bursts: None,
+    }];
     let (admin, _rx) = make_watch_admin_with_config(config_path, configs, db);
 
     // First recompute.
@@ -927,7 +1048,10 @@ fn post_refresh_triggers_recompute_and_updates_computed_at() {
 
 #[test]
 fn derive_status_returns_working_when_signal_idle_and_encoding_positive() {
-    let rollup = FolderRollup { encoding: 3, ..FolderRollup::default() };
+    let rollup = FolderRollup {
+        encoding: 3,
+        ..FolderRollup::default()
+    };
     assert_eq!(
         derive_status(&WatcherStatusSignal::Idle, &rollup),
         WatchStatus::Working
@@ -945,7 +1069,10 @@ fn derive_status_returns_idle_when_signal_idle_and_no_encoding() {
 
 #[test]
 fn derive_status_returns_error_regardless_of_rollup_when_signal_error() {
-    let rollup = FolderRollup { encoding: 5, ..FolderRollup::default() };
+    let rollup = FolderRollup {
+        encoding: 5,
+        ..FolderRollup::default()
+    };
     assert_eq!(
         derive_status(&WatcherStatusSignal::Error, &rollup),
         WatchStatus::Error
@@ -974,32 +1101,47 @@ fn watch_entry_json_key_is_importance_multiplier() {
         traffic_light: "green".to_string(),
     };
     let json = serde_json::to_value(&entry).unwrap();
-    assert_eq!(json["importance_multiplier"], 1.5, "must serialize as importance_multiplier");
-    assert!(json.get("importance").is_none(), "legacy 'importance' key must not appear in output");
+    assert_eq!(
+        json["importance_multiplier"], 1.5,
+        "must serialize as importance_multiplier"
+    );
+    assert!(
+        json.get("importance").is_none(),
+        "legacy 'importance' key must not appear in output"
+    );
 }
 
 #[test]
 fn add_watch_request_accepts_legacy_importance_key() {
     let json = r#"{"path": "/tmp", "importance": 0.7}"#;
     let req: AddWatchRequest = serde_json::from_str(json).unwrap();
-    assert!((req.resolved_multiplier() - 0.7).abs() < 1e-9,
-        "legacy key must be accepted, got {}", req.resolved_multiplier());
+    assert!(
+        (req.resolved_multiplier() - 0.7).abs() < 1e-9,
+        "legacy key must be accepted, got {}",
+        req.resolved_multiplier()
+    );
 }
 
 #[test]
 fn add_watch_request_accepts_importance_multiplier_key() {
     let json = r#"{"path": "/tmp", "importance_multiplier": 1.2}"#;
     let req: AddWatchRequest = serde_json::from_str(json).unwrap();
-    assert!((req.resolved_multiplier() - 1.2).abs() < 1e-9,
-        "canonical key must be accepted, got {}", req.resolved_multiplier());
+    assert!(
+        (req.resolved_multiplier() - 1.2).abs() < 1e-9,
+        "canonical key must be accepted, got {}",
+        req.resolved_multiplier()
+    );
 }
 
 #[test]
 fn add_watch_request_importance_multiplier_wins_over_legacy() {
     let json = r#"{"path": "/tmp", "importance": 0.5, "importance_multiplier": 1.8}"#;
     let req: AddWatchRequest = serde_json::from_str(json).unwrap();
-    assert!((req.resolved_multiplier() - 1.8).abs() < 1e-9,
-        "canonical key must win over legacy, got {}", req.resolved_multiplier());
+    assert!(
+        (req.resolved_multiplier() - 1.8).abs() < 1e-9,
+        "canonical key must win over legacy, got {}",
+        req.resolved_multiplier()
+    );
 }
 
 #[test]
@@ -1023,8 +1165,12 @@ fn watch_defaults_json_key_is_importance_multiplier() {
         importance_multiplier: DEFAULT_IMPORTANCE_MULTIPLIER,
     };
     let json = serde_json::to_value(&defaults).unwrap();
-    assert!(json.get("importance_multiplier").is_some(),
-        "must serialize as importance_multiplier");
-    assert!(json.get("importance").is_none(),
-        "legacy 'importance' must not appear in output");
+    assert!(
+        json.get("importance_multiplier").is_some(),
+        "must serialize as importance_multiplier"
+    );
+    assert!(
+        json.get("importance").is_none(),
+        "legacy 'importance' must not appear in output"
+    );
 }

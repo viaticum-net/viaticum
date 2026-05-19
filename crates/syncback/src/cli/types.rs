@@ -46,7 +46,9 @@ pub enum CliResponse {
     RestoreBlocked(RestoreBlocker),
     DeviceList(Vec<DeviceEntry>),
     DeviceAdded(DeviceEntry),
-    DeviceRevoked { device_id_hex: String },
+    DeviceRevoked {
+        device_id_hex: String,
+    },
     Files(Vec<FileEntry>),
     Versions(Vec<VersionEntry>),
     /// Response to Connect: contains the peer's identity pubkey as hex.
@@ -165,7 +167,9 @@ pub struct PeerSummary {
     pub link: String,
 }
 
-fn default_link() -> String { "known".to_string() }
+fn default_link() -> String {
+    "known".to_string()
+}
 
 /// Data returned by `syncback restore`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -212,7 +216,11 @@ pub enum EffectiveStatus {
     /// `live >= target` but restore would be denied — escrow budget is below
     /// what this block needs. Common right after first replication when
     /// contribution hasn't accrued yet.
-    ReplicatedCold { live: u32, target: u32, est_seconds_to_restorable: Option<u64> },
+    ReplicatedCold {
+        live: u32,
+        target: u32,
+        est_seconds_to_restorable: Option<u64>,
+    },
     /// We had `target` Alive at some point; now `live < target` after losses.
     /// Repair pipeline is responsible for bringing it back.
     Degraded { live: u32, lost: u32, target: u32 },
@@ -225,11 +233,19 @@ pub enum EffectiveStatus {
 pub enum RestoreBlocker {
     /// `live < k_eff` — not enough Alive placements (some holders offline /
     /// repair pending). Auto-resolves when more come back.
-    InsufficientPlacements { have: u32, need: u32, holders_offline: u32 },
+    InsufficientPlacements {
+        have: u32,
+        need: u32,
+        holders_offline: u32,
+    },
     /// All holders refused via escrow because we haven't earned enough
     /// contribution yet. `est_seconds` is a rough wait-time estimate or None
     /// if we can't predict (e.g. nothing accruing).
-    EscrowLocked { budget_gb: f64, needed_gb: f64, est_seconds: Option<u64> },
+    EscrowLocked {
+        budget_gb: f64,
+        needed_gb: f64,
+        est_seconds: Option<u64>,
+    },
     /// All `Alive` holders are unreachable (last_seen too old).
     AllHoldersOffline { last_seen_secs_ago: u64 },
 }

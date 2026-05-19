@@ -3,10 +3,7 @@ use crate::constants::{
     POS_CONSECUTIVE_MISS_UNCERTAIN, POS_VOLUME_DIVISOR, SECS_PER_WEEK,
 };
 use crate::trust::PosOutcome;
-use crate::types::{
-    DeviceId, PlacementStatus, SourceBlockId, SymbolPlacement,
-    Timestamp,
-};
+use crate::types::{DeviceId, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp};
 
 /// Outcome of verifying a PoS response.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,9 +55,7 @@ pub enum PosError {
 ///
 /// Result is always >= POS_BASE_CHALLENGES_PER_WEEK (minimum 1).
 pub fn challenges_per_week(symbol_count: u32, trust_score: f64) -> u32 {
-    let volume_factor = symbol_count
-        .saturating_add(POS_VOLUME_DIVISOR - 1)
-        / POS_VOLUME_DIVISOR;
+    let volume_factor = symbol_count.saturating_add(POS_VOLUME_DIVISOR - 1) / POS_VOLUME_DIVISOR;
     let volume_factor = volume_factor.max(1) as f64;
 
     let trust_factor = 2.0 - trust_score.clamp(0.0, 1.0);
@@ -210,9 +205,7 @@ pub fn apply_pos_outcome(
     outcome: &VerifyOutcome,
 ) -> PlacementTransition {
     // Dead placements: no further transitions
-    if placement.status == PlacementStatus::Lost
-        || placement.status == PlacementStatus::Deleting
-    {
+    if placement.status == PlacementStatus::Lost || placement.status == PlacementStatus::Deleting {
         return PlacementTransition {
             new_status: placement.status,
             new_consecutive_misses: placement.consecutive_misses,

@@ -1,7 +1,7 @@
 use crate::constants::{DROP_NOTICE_WINDOW_SECS, HOLDER_DELETE_COOLDOWN_SECS};
 use crate::escrow::{
-    check_restore, compute_restore_budget, should_delete_now, should_drop_after_notice,
-    DeleteDecision, DropNoticeDecision, RestoreDecision,
+    DeleteDecision, DropNoticeDecision, RestoreDecision, check_restore, compute_restore_budget,
+    should_delete_now, should_drop_after_notice,
 };
 use crate::types::Timestamp;
 

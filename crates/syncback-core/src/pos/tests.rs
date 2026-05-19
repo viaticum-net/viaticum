@@ -1,13 +1,9 @@
 use crate::constants::POS_BASE_CHALLENGES_PER_WEEK;
 use crate::pos::{
-    apply_pos_outcome, challenges_per_week, compute_chain_hash, due_challenges,
-    outcome_from_verify, verify_hash_response,
-    PosError, VerifyOutcome,
+    PosError, VerifyOutcome, apply_pos_outcome, challenges_per_week, compute_chain_hash,
+    due_challenges, outcome_from_verify, verify_hash_response,
 };
-use crate::types::{
-    DeviceId, FileId, PlacementStatus, SourceBlockId, SymbolPlacement,
-    Timestamp,
-};
+use crate::types::{DeviceId, FileId, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp};
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -19,7 +15,11 @@ fn holder(byte: u8) -> DeviceId {
     DeviceId([byte; 32])
 }
 
-fn make_placement(block: SourceBlockId, h: DeviceId, esi_ranges: Vec<(u32, u32)>) -> SymbolPlacement {
+fn make_placement(
+    block: SourceBlockId,
+    h: DeviceId,
+    esi_ranges: Vec<(u32, u32)>,
+) -> SymbolPlacement {
     SymbolPlacement {
         source_block_id: block,
         holder_id: h,
@@ -96,8 +96,7 @@ fn due_challenges_returns_placement_with_no_last_verified() {
     let hid = holder(2);
     let placement = make_placement(bid, hid, vec![(0, 10)]);
     let now = Timestamp(1_000_000);
-    let last_verified: Vec<(SourceBlockId, DeviceId, Option<Timestamp>)> =
-        vec![(bid, hid, None)];
+    let last_verified: Vec<(SourceBlockId, DeviceId, Option<Timestamp>)> = vec![(bid, hid, None)];
 
     let entries = due_challenges(&[placement], &last_verified, now, |_| 0.5, 1);
     assert_eq!(entries.len(), 1);
@@ -142,8 +141,7 @@ fn due_challenges_available_esis_match_ranges() {
     let hid = holder(2);
     let placement = make_placement(bid, hid, vec![(100, 3)]);
     let now = Timestamp(1_000_000);
-    let last_verified: Vec<(SourceBlockId, DeviceId, Option<Timestamp>)> =
-        vec![(bid, hid, None)];
+    let last_verified: Vec<(SourceBlockId, DeviceId, Option<Timestamp>)> = vec![(bid, hid, None)];
 
     let entries = due_challenges(&[placement], &last_verified, now, |_| 0.5, 1);
     assert_eq!(entries.len(), 1);
@@ -183,8 +181,11 @@ fn outcome_from_verify_timeout_counts_as_challenged() {
 fn apply_pos_outcome_pass_resets_to_alive() {
     // Placement was Uncertain with consecutive_misses=2
     let placement = make_placement_with_status(
-        block_id(1), holder(2), vec![(0, 5)],
-        PlacementStatus::Uncertain, 2,
+        block_id(1),
+        holder(2),
+        vec![(0, 5)],
+        PlacementStatus::Uncertain,
+        2,
     );
     let result = apply_pos_outcome(&placement, &VerifyOutcome::Pass);
     assert_eq!(result.new_status, PlacementStatus::Alive);
@@ -224,8 +225,11 @@ fn apply_pos_outcome_first_timeout_gives_uncertain() {
 fn apply_pos_outcome_second_timeout_stays_uncertain() {
     // Uncertain, consecutive_misses=1: second timeout → Uncertain (misses=2)
     let placement = make_placement_with_status(
-        block_id(1), holder(2), vec![(0, 5)],
-        PlacementStatus::Uncertain, 1,
+        block_id(1),
+        holder(2),
+        vec![(0, 5)],
+        PlacementStatus::Uncertain,
+        1,
     );
     let result = apply_pos_outcome(&placement, &VerifyOutcome::Timeout);
     assert_eq!(result.new_status, PlacementStatus::Uncertain);
@@ -237,8 +241,11 @@ fn apply_pos_outcome_second_timeout_stays_uncertain() {
 fn apply_pos_outcome_third_timeout_gives_presumed_lost() {
     // Uncertain, consecutive_misses=2: third timeout → PresumedLost (misses=3)
     let placement = make_placement_with_status(
-        block_id(1), holder(2), vec![(0, 5)],
-        PlacementStatus::Uncertain, 2,
+        block_id(1),
+        holder(2),
+        vec![(0, 5)],
+        PlacementStatus::Uncertain,
+        2,
     );
     let result = apply_pos_outcome(&placement, &VerifyOutcome::Timeout);
     assert_eq!(result.new_status, PlacementStatus::PresumedLost);
@@ -249,8 +256,11 @@ fn apply_pos_outcome_third_timeout_gives_presumed_lost() {
 #[test]
 fn apply_pos_outcome_presumed_lost_pass_recovers_to_alive() {
     let placement = make_placement_with_status(
-        block_id(1), holder(2), vec![(0, 5)],
-        PlacementStatus::PresumedLost, 3,
+        block_id(1),
+        holder(2),
+        vec![(0, 5)],
+        PlacementStatus::PresumedLost,
+        3,
     );
     let result = apply_pos_outcome(&placement, &VerifyOutcome::Pass);
     assert_eq!(result.new_status, PlacementStatus::Alive);
@@ -261,8 +271,11 @@ fn apply_pos_outcome_presumed_lost_pass_recovers_to_alive() {
 #[test]
 fn apply_pos_outcome_lost_is_noop_for_all_outcomes() {
     let placement = make_placement_with_status(
-        block_id(1), holder(2), vec![(0, 5)],
-        PlacementStatus::Lost, 0,
+        block_id(1),
+        holder(2),
+        vec![(0, 5)],
+        PlacementStatus::Lost,
+        0,
     );
     let outcomes = [
         VerifyOutcome::Pass,
@@ -273,7 +286,12 @@ fn apply_pos_outcome_lost_is_noop_for_all_outcomes() {
     ];
     for outcome in &outcomes {
         let result = apply_pos_outcome(&placement, outcome);
-        assert_eq!(result.new_status, PlacementStatus::Lost, "outcome: {:?}", outcome);
+        assert_eq!(
+            result.new_status,
+            PlacementStatus::Lost,
+            "outcome: {:?}",
+            outcome
+        );
         assert!(!result.trigger_repair, "outcome: {:?}", outcome);
     }
 }
@@ -281,8 +299,11 @@ fn apply_pos_outcome_lost_is_noop_for_all_outcomes() {
 #[test]
 fn apply_pos_outcome_deleting_is_noop_for_all_outcomes() {
     let placement = make_placement_with_status(
-        block_id(1), holder(2), vec![(0, 5)],
-        PlacementStatus::Deleting, 0,
+        block_id(1),
+        holder(2),
+        vec![(0, 5)],
+        PlacementStatus::Deleting,
+        0,
     );
     let outcomes = [
         VerifyOutcome::Pass,
@@ -292,7 +313,12 @@ fn apply_pos_outcome_deleting_is_noop_for_all_outcomes() {
     ];
     for outcome in &outcomes {
         let result = apply_pos_outcome(&placement, outcome);
-        assert_eq!(result.new_status, PlacementStatus::Deleting, "outcome: {:?}", outcome);
+        assert_eq!(
+            result.new_status,
+            PlacementStatus::Deleting,
+            "outcome: {:?}",
+            outcome
+        );
         assert!(!result.trigger_repair, "outcome: {:?}", outcome);
     }
 }
@@ -319,7 +345,10 @@ fn verify_outcome_enum_has_not_held_variant() {
 fn outcome_from_verify_cannot_verify_produces_no_trust_event() {
     let outcome = outcome_from_verify(&VerifyOutcome::CannotVerify, 5);
     assert_eq!(outcome.week_number, 5);
-    assert_eq!(outcome.challenged, 0, "CannotVerify must not record a challenge");
+    assert_eq!(
+        outcome.challenged, 0,
+        "CannotVerify must not record a challenge"
+    );
     assert_eq!(outcome.passed, 0, "CannotVerify must not record a pass");
 }
 
@@ -335,8 +364,11 @@ fn apply_pos_outcome_cannot_verify_is_noop_on_alive() {
 #[test]
 fn apply_pos_outcome_cannot_verify_is_noop_on_uncertain() {
     let placement = make_placement_with_status(
-        block_id(1), holder(2), vec![(0, 5)],
-        PlacementStatus::Uncertain, 2,
+        block_id(1),
+        holder(2),
+        vec![(0, 5)],
+        PlacementStatus::Uncertain,
+        2,
     );
     let result = apply_pos_outcome(&placement, &VerifyOutcome::CannotVerify);
     assert_eq!(result.new_status, PlacementStatus::Uncertain);
@@ -351,8 +383,11 @@ fn pos_should_skip_deleting_placements_no_repair_on_fail() {
     // A Deleting placement that receives a Fail outcome must NOT trigger repair.
     // Deletion is in progress — repairing would be wasteful and incorrect.
     let placement = make_placement_with_status(
-        block_id(1), holder(2), vec![(0, 5)],
-        PlacementStatus::Deleting, 0,
+        block_id(1),
+        holder(2),
+        vec![(0, 5)],
+        PlacementStatus::Deleting,
+        0,
     );
     let result = apply_pos_outcome(&placement, &VerifyOutcome::Fail { esi: 3 });
     assert_eq!(
@@ -371,12 +406,18 @@ fn pos_should_skip_deleting_placements_no_repair_on_not_held() {
     // A Deleting placement where holder responds NotHeld must NOT trigger repair.
     // Holder correctly dropped the symbols per the delete protocol.
     let placement = make_placement_with_status(
-        block_id(1), holder(2), vec![(0, 5)],
-        PlacementStatus::Deleting, 0,
+        block_id(1),
+        holder(2),
+        vec![(0, 5)],
+        PlacementStatus::Deleting,
+        0,
     );
     let result = apply_pos_outcome(&placement, &VerifyOutcome::NotHeld { esi: 3 });
     assert_eq!(result.new_status, PlacementStatus::Deleting);
-    assert!(!result.trigger_repair, "Deleting placement must NOT trigger repair on NotHeld");
+    assert!(
+        !result.trigger_repair,
+        "Deleting placement must NOT trigger repair on NotHeld"
+    );
 }
 
 #[test]
@@ -391,8 +432,7 @@ fn pos_due_challenges_does_not_filter_by_status() {
     placement.status = PlacementStatus::Deleting;
 
     let now = Timestamp(1_000_000);
-    let last_verified: Vec<(SourceBlockId, DeviceId, Option<Timestamp>)> =
-        vec![(bid, hid, None)];
+    let last_verified: Vec<(SourceBlockId, DeviceId, Option<Timestamp>)> = vec![(bid, hid, None)];
 
     // due_challenges returns it — caller must filter before using
     let entries = due_challenges(&[placement], &last_verified, now, |_| 0.5, 1);
@@ -470,8 +510,16 @@ fn compute_chain_hash_order_dependent() {
     let challenge_id = [0u8; 16];
     let sym_a = vec![1u8; 32];
     let sym_b = vec![2u8; 32];
-    let hash_ab = compute_chain_hash(&challenge_id, &[(0, sym_a.as_slice()), (1, sym_b.as_slice())]).unwrap();
-    let hash_ba = compute_chain_hash(&challenge_id, &[(0, sym_b.as_slice()), (1, sym_a.as_slice())]).unwrap();
+    let hash_ab = compute_chain_hash(
+        &challenge_id,
+        &[(0, sym_a.as_slice()), (1, sym_b.as_slice())],
+    )
+    .unwrap();
+    let hash_ba = compute_chain_hash(
+        &challenge_id,
+        &[(0, sym_b.as_slice()), (1, sym_a.as_slice())],
+    )
+    .unwrap();
     assert_ne!(hash_ab, hash_ba);
 }
 
@@ -585,7 +633,10 @@ fn pos_chain_seed_is_sha256_of_challenge_id() {
     };
 
     let result = compute_chain_hash(&challenge_id, symbols).unwrap();
-    assert_eq!(result, h1, "chain hash seed must be SHA256(challenge_id), not raw challenge_id");
+    assert_eq!(
+        result, h1,
+        "chain hash seed must be SHA256(challenge_id), not raw challenge_id"
+    );
 }
 
 // ─── POS-32: trust_factor clamped when trust > 1.0 ───────────────────────────

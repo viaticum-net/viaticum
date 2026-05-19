@@ -1,4 +1,7 @@
-use super::{compute_allocation, compute_allocation_with_importance, holder_weight, HolderCandidate, PlacementError};
+use super::{
+    HolderCandidate, PlacementError, compute_allocation, compute_allocation_with_importance,
+    holder_weight,
+};
 use crate::types::{DeviceId, ErasureParams};
 
 fn device_id(byte: u8) -> DeviceId {
@@ -118,10 +121,19 @@ fn compute_allocation_many_candidates_truncated_by_max_holders() {
     // Verify highest-trust candidates were kept (not the low ones)
     let lowest_trust_in_result = allocs
         .iter()
-        .map(|a| candidates.iter().find(|c| c.device_id == a.device_id).unwrap().trust)
+        .map(|a| {
+            candidates
+                .iter()
+                .find(|c| c.device_id == a.device_id)
+                .unwrap()
+                .trust
+        })
         .fold(f64::INFINITY, f64::min);
     // The bottom 20 (trust 0.3..0.54) should be dropped; lowest kept >= ~0.54
-    assert!(lowest_trust_in_result > 0.5, "lowest trust = {lowest_trust_in_result}");
+    assert!(
+        lowest_trust_in_result > 0.5,
+        "lowest trust = {lowest_trust_in_result}"
+    );
 }
 
 // ─── basic correctness ───────────────────────────────────────────────────────
@@ -178,11 +190,7 @@ fn compute_allocation_esi_ranges_are_contiguous_non_overlapping() {
 #[test]
 fn compute_allocation_high_trust_holder_gets_more_symbols() {
     let p = params_large(0.5);
-    let candidates = vec![
-        candidate(1, 0.95),
-        candidate(2, 0.3),
-        candidate(3, 0.5),
-    ];
+    let candidates = vec![candidate(1, 0.95), candidate(2, 0.3), candidate(3, 0.5)];
     let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     let alloc_95 = allocs.iter().find(|a| a.device_id == device_id(1)).unwrap();
     let alloc_30 = allocs.iter().find(|a| a.device_id == device_id(2)).unwrap();
@@ -204,11 +212,7 @@ fn compute_allocation_equal_trust_distributes_evenly() {
 fn compute_allocation_cap_enforced_with_very_high_trust() {
     let p = params_large(0.5);
     let max = p.max_per_holder();
-    let candidates = vec![
-        candidate(1, 0.99),
-        candidate(2, 0.01),
-        candidate(3, 0.01),
-    ];
+    let candidates = vec![candidate(1, 0.99), candidate(2, 0.01), candidate(3, 0.01)];
     let allocs = compute_allocation(&candidates, &p, 0).unwrap();
     let alloc_99 = allocs.iter().find(|a| a.device_id == device_id(1)).unwrap();
     assert!(alloc_99.symbol_count <= max);
@@ -329,8 +333,8 @@ fn compute_allocation_100_candidates_trimmed_to_30() {
 #[test]
 fn holder_weight_at_half_is_sqrt_half() {
     let w = holder_weight(0.5);
-    // 0.5/sqrt(0.5) = 0.5/0.7071... ≈ 0.7071
-    assert!((w - 0.7071).abs() < 0.001);
+    // 0.5/sqrt(0.5) = sqrt(0.5) = FRAC_1_SQRT_2
+    assert!((w - std::f64::consts::FRAC_1_SQRT_2).abs() < 0.001);
 }
 
 // ─── PLACE-14: bootstrap problem ────────────────────────────────────────────
@@ -419,7 +423,10 @@ fn redistribution_excess_is_proportional() {
 
     // All uncapped holders must each receive at least 1 symbol
     for alloc in &[alloc_h2, alloc_h3, alloc_h4] {
-        assert!(alloc.symbol_count >= 1, "every holder must have >= 1 symbol");
+        assert!(
+            alloc.symbol_count >= 1,
+            "every holder must have >= 1 symbol"
+        );
     }
 }
 
@@ -478,15 +485,15 @@ fn placement_invariants_hold_across_configurations() {
     let configs: Vec<(usize, f64, u64, f64)> = vec![
         // (num_holders, base_trust, block_size, importance)
         (2, 0.5, 1024 * 1024, 0.5),
-        (3, 0.04, 1024 * 1024, 0.5),       // bootstrap trust
-        (5, 0.3, 8 * 1024 * 1024, 0.0),     // low importance
-        (5, 0.3, 8 * 1024 * 1024, 1.0),     // high importance
+        (3, 0.04, 1024 * 1024, 0.5),    // bootstrap trust
+        (5, 0.3, 8 * 1024 * 1024, 0.0), // low importance
+        (5, 0.3, 8 * 1024 * 1024, 1.0), // high importance
         (10, 0.5, 32 * 1024 * 1024, 0.5),
         (15, 0.2, 128 * 1024 * 1024, 0.6),
         (20, 0.7, 128 * 1024 * 1024, 0.5),
-        (30, 0.1, 128 * 1024 * 1024, 0.3),  // near MAX_HOLDERS_PER_BLOCK
-        (3, 0.99, 1024 * 1024, 0.5),        // very high trust
-        (5, 0.01, 8 * 1024 * 1024, 0.5),    // very low trust
+        (30, 0.1, 128 * 1024 * 1024, 0.3), // near MAX_HOLDERS_PER_BLOCK
+        (3, 0.99, 1024 * 1024, 0.5),       // very high trust
+        (5, 0.01, 8 * 1024 * 1024, 0.5),   // very low trust
     ];
 
     for (num_holders, base_trust, block_size, importance) in &configs {
@@ -517,11 +524,7 @@ fn placement_invariants_hold_across_configurations() {
             );
         } else {
             // Too few holders — sum = total_capacity (by design, concentration cap)
-            assert!(
-                total <= p.n,
-                "PROP-03: sum={total} exceeds N={}",
-                p.n
-            );
+            assert!(total <= p.n, "PROP-03: sum={total} exceeds N={}", p.n);
         }
 
         // PROP-04: max <= max_per_holder
@@ -553,7 +556,10 @@ fn placement_invariants_hold_across_configurations() {
             );
             next_esi = alloc.start_esi + alloc.symbol_count;
         }
-        assert_eq!(next_esi, total, "PROP-15 violated: ESI range doesn't cover total");
+        assert_eq!(
+            next_esi, total,
+            "PROP-15 violated: ESI range doesn't cover total"
+        );
     }
 }
 
@@ -581,7 +587,10 @@ fn holder_weight_positive_for_valid_trust() {
     for &trust in &[0.0f64, 0.001, 0.5, 0.9, 0.99, 0.999, 1.0, 1.5] {
         let w = holder_weight(trust);
         assert!(w > 0.0, "holder_weight({trust}) = {w} — must be > 0");
-        assert!(w.is_finite(), "holder_weight({trust}) = {w} — must be finite");
+        assert!(
+            w.is_finite(),
+            "holder_weight({trust}) = {w} — must be finite"
+        );
     }
 }
 
@@ -593,7 +602,9 @@ fn compute_allocation_with_esi_offset() {
     // The first allocation's start_esi == 1000, subsequent ones are larger.
     let offset: u32 = 1000;
     let p = params_large(0.5);
-    let candidates: Vec<_> = (1..=5).map(|b| candidate(b, 0.5 + (b as f64) * 0.05)).collect();
+    let candidates: Vec<_> = (1..=5)
+        .map(|b| candidate(b, 0.5 + (b as f64) * 0.05))
+        .collect();
     let allocs = compute_allocation(&candidates, &p, offset).unwrap();
 
     assert!(!allocs.is_empty());
@@ -728,12 +739,10 @@ fn compute_with_holders_high_importance_higher_n_than_low_importance() {
     let candidates_high = uniform_candidates(5, 0.7);
     let candidates_low = uniform_candidates(5, 0.7);
 
-    let allocs_high =
-        compute_allocation_with_importance(&candidates_high, source_size, 1.0, 0)
-            .expect("high importance should succeed");
-    let allocs_low =
-        compute_allocation_with_importance(&candidates_low, source_size, 0.20, 0)
-            .expect("low importance should succeed");
+    let allocs_high = compute_allocation_with_importance(&candidates_high, source_size, 1.0, 0)
+        .expect("high importance should succeed");
+    let allocs_low = compute_allocation_with_importance(&candidates_low, source_size, 0.20, 0)
+        .expect("low importance should succeed");
 
     let total_high: u32 = allocs_high.iter().map(|a| a.symbol_count).sum();
     let total_low: u32 = allocs_low.iter().map(|a| a.symbol_count).sum();

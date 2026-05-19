@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use syncback_core::types::DeviceId;
 
 use crate::daemon::backup::DirtyKind;
-use crate::daemon::watcher::{start_watcher, IgnoreSet, WatcherConfig, WatcherCommand};
+use crate::daemon::watcher::{IgnoreSet, WatcherCommand, WatcherConfig, start_watcher};
 
 const TEST_DEVICE_ID: DeviceId = DeviceId([1u8; 32]);
 const DEBOUNCE_MS: u64 = 50;
@@ -276,7 +276,7 @@ async fn debounce_multiple_changes_emit_one_event() {
 
     // Write the file 5 times in rapid succession — all within debounce window.
     for i in 0u8..5 {
-        std::fs::write(&file_path, &[i; 64]).unwrap();
+        std::fs::write(&file_path, [i; 64]).unwrap();
     }
 
     // Wait longer than the debounce window so the batch flushes.
@@ -350,8 +350,12 @@ async fn file_deleted_before_debounce_emits_deleted_event() {
             // The last write before debounce is the delete — expect Deleted.
             // (Some platforms may coalesce to Modified; either is acceptable.)
             assert!(
-                matches!(event.kind, DirtyKind::Deleted | DirtyKind::Modified | DirtyKind::Added),
-                "event kind must be a valid DirtyKind, got {:?}", event.kind
+                matches!(
+                    event.kind,
+                    DirtyKind::Deleted | DirtyKind::Modified | DirtyKind::Added
+                ),
+                "event kind must be a valid DirtyKind, got {:?}",
+                event.kind
             );
         }
         Ok(None) => {
@@ -372,6 +376,7 @@ async fn file_deleted_before_debounce_emits_deleted_event() {
 /// Skipped if the test is running as root (root bypasses permission checks).
 #[tokio::test]
 #[cfg(unix)]
+#[allow(unsafe_code)] // libc::getuid() is FFI, safe in practice
 async fn file_without_read_permission_no_panic() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -443,7 +448,7 @@ async fn rapid_changes_no_panic() {
 
     // Write 10 times in rapid succession (within ~200 ms total).
     for i in 0u8..10 {
-        std::fs::write(&file_path, &[i; 32]).unwrap();
+        std::fs::write(&file_path, [i; 32]).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
@@ -462,7 +467,10 @@ async fn rapid_changes_no_panic() {
     }
 
     // Debounce should have coalesced the writes; we expect at least 1 event.
-    assert!(count >= 1, "at least one event must arrive after 10 rapid writes");
+    assert!(
+        count >= 1,
+        "at least one event must arrive after 10 rapid writes"
+    );
 
     cancel.cancel();
 }
@@ -777,10 +785,7 @@ async fn watcher_remove_command_stops_watching_dir() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let got_event = dirty_rx.try_recv().is_ok();
-    assert!(
-        !got_event,
-        "should not receive events after Remove command"
-    );
+    assert!(!got_event, "should not receive events after Remove command");
 
     cancel.cancel();
 }
@@ -822,10 +827,7 @@ async fn watcher_scan_command_emits_added_events_for_all_files() {
     let mut paths: Vec<String> = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(50), dirty_rx.recv()).await {
-            Ok(Some(e)) => paths.push(e.path),
-            _ => {}
-        }
+        if let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(50), dirty_rx.recv()).await { paths.push(e.path) }
     }
 
     let has_a = paths.iter().any(|p| p.ends_with("a.txt"));

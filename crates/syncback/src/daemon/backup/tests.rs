@@ -9,19 +9,19 @@
 use std::sync::{Arc, Mutex};
 
 use syncback_core::cluster::{
-    derive_master_key, issue_device_certificate, master_identity, ClusterState,
+    ClusterState, derive_master_key, issue_device_certificate, master_identity,
 };
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
 use syncback_core::types::{
-    DeviceId, ErasureParams, Event, FileCategory, FileId, FileRecord, FileVersion,
-    LocalState, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
+    DeviceId, Event, FileCategory, FileId, FileRecord, FileVersion, LocalState,
+    PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
 };
 use tempfile::TempDir;
 
 use super::{BackupConfig, BackupCoordinator, BackupEvent, DirtyEvent, DirtyKind};
-use crate::daemon::backup::pipeline::decrypt_and_decompress;
 use crate::daemon::backup::packing::parse_pack_index;
+use crate::daemon::backup::pipeline::decrypt_and_decompress;
 
 /// Small source block size for fast tests (128 KB).
 const SMALL_BLOCK_SIZE: u64 = 128 * 1024;
@@ -189,7 +189,9 @@ fn flush_queue_below_min_batch_skips() {
     let path = write_file(&files_dir, "tiny.txt", &[0u8; 100]);
     coord.process_event(added_event(&path)).unwrap();
 
-    let results = coord.flush_queue(FileCategory::Document, false, &Default::default()).unwrap();
+    let results = coord
+        .flush_queue(FileCategory::Document, false, &Default::default())
+        .unwrap();
     assert!(
         results.is_empty(),
         "should skip flush below MIN_BATCH_BYTES"
@@ -209,7 +211,9 @@ fn flush_queue_with_force_flushes_any_size() {
     let path = write_file(&files_dir, "tiny.txt", &[0u8; 100]);
     coord.process_event(added_event(&path)).unwrap();
 
-    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
     assert!(!results.is_empty(), "force=true should flush any size");
 }
 
@@ -234,7 +238,9 @@ fn flush_queue_creates_source_block_record() {
         coord.process_event(added_event(&path)).unwrap();
     }
 
-    let results = coord.flush_queue(FileCategory::Document, false, &Default::default()).unwrap();
+    let results = coord
+        .flush_queue(FileCategory::Document, false, &Default::default())
+        .unwrap();
     assert!(!results.is_empty(), "should produce results");
 
     for result in &results {
@@ -249,7 +255,10 @@ fn flush_queue_creates_source_block_record() {
             ),
             "should be Pack type"
         );
-        assert_eq!(block.status, syncback_core::types::SourceBlockStatus::Active);
+        assert_eq!(
+            block.status,
+            syncback_core::types::SourceBlockStatus::Active
+        );
     }
 }
 
@@ -273,17 +282,27 @@ fn flush_queue_creates_db_records() {
         coord.process_event(added_event(&path)).unwrap();
     }
 
-    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
     assert!(!results.is_empty());
 
     for result in &results {
         // Wave 11b: no symbol files on disk. Verify DB records exist.
-        let block_record = db.get_source_block(&result.source_block_id).unwrap().unwrap();
+        let block_record = db
+            .get_source_block(&result.source_block_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(block_record.block_id, result.source_block_id);
-        assert!(block_record.encrypted_size.is_some(), "encrypted_size must be set");
+        assert!(
+            block_record.encrypted_size.is_some(),
+            "encrypted_size must be set"
+        );
 
         // Placement records should exist (Offered state).
-        let placements = db.list_placements_for_block(&result.source_block_id).unwrap();
+        let placements = db
+            .list_placements_for_block(&result.source_block_id)
+            .unwrap();
         // Placements may be empty if no candidates (test_coord has mock_holders=empty by default).
         // Just verify no panic and DB is consistent.
         for p in &placements {
@@ -291,9 +310,17 @@ fn flush_queue_creates_db_records() {
         }
 
         // Symbol files must NOT exist (Wave 11b invariant).
-        let block_hex: String = result.source_block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+        let block_hex: String = result
+            .source_block_id
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let block_dir = symbols_dir.path().join(&block_hex);
-        assert!(!block_dir.exists(), "block symbol dir must NOT exist after Wave 11b");
+        assert!(
+            !block_dir.exists(),
+            "block symbol dir must NOT exist after Wave 11b"
+        );
     }
 }
 
@@ -314,7 +341,9 @@ fn flush_queue_updates_backed_up_at() {
     let before = db.get_file(&path).unwrap().unwrap();
     assert!(before.versions[0].backed_up_at.is_none());
 
-    coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
+    coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
 
     let after = db.get_file(&path).unwrap().unwrap();
     assert!(
@@ -360,7 +389,9 @@ async fn pipeline_roundtrip_can_decode() {
     let path = write_file(&files_dir, "data.txt", &repeated);
 
     coord.process_event(added_event(&path)).unwrap();
-    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
     assert_eq!(results.len(), 1, "should produce one source block");
 
     let block_id = results[0].source_block_id;
@@ -370,15 +401,16 @@ async fn pipeline_roundtrip_can_decode() {
 
     // Wave 11b: no raw/ files on disk. Use rebuild_source_blob to get the stored blob.
     let block_record = db.get_source_block(&block_id).unwrap().unwrap();
-    let stored_blob = crate::daemon::backup::pipeline::rebuild_source_blob(
-        &db,
-        &block_record,
-        &epoch_key,
-    )
-    .await
-    .expect("rebuild_source_blob must succeed");
+    let stored_blob =
+        crate::daemon::backup::pipeline::rebuild_source_blob(&db, &block_record, &epoch_key)
+            .await
+            .expect("rebuild_source_blob must succeed");
 
-    assert_eq!(stored_blob.len(), stored_size, "rebuilt blob size must match stored_size");
+    assert_eq!(
+        stored_blob.len(),
+        stored_size,
+        "rebuilt blob size must match stored_size"
+    );
 
     // Verify hash == block_id.
     let hash: [u8; 32] = *blake3::hash(&stored_blob).as_bytes();
@@ -430,8 +462,7 @@ fn process_event_modified_adds_new_version() {
     let record = db.get_file(&path).unwrap().unwrap();
     assert_eq!(record.versions.len(), 2, "should have 2 versions");
     assert_ne!(
-        record.versions[0].content_hash,
-        record.versions[1].content_hash,
+        record.versions[0].content_hash, record.versions[1].content_hash,
         "versions should have different content hashes"
     );
 }
@@ -448,7 +479,9 @@ fn flush_queue_appends_event_log() {
     let content = b"event log test document";
     let path = write_file(&files_dir, "eventlog.txt", content);
     coord.process_event(added_event(&path)).unwrap();
-    coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
+    coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
 
     let events = db.events_after(0, 100).unwrap();
     let has_symbols_placed = events
@@ -747,7 +780,9 @@ async fn deliver_symbols_logs_warn_on_peer_not_found() {
 
     coordinator.deliver_symbols(&[result]).await;
 
-    Arc::try_unwrap(network).ok().map(|n| async move { n.shutdown().await });
+    Arc::try_unwrap(network)
+        .ok()
+        .map(|n| async move { n.shutdown().await });
 }
 
 // ─── Test 22: deliver_symbols_sends_to_reachable_holder (REMOVED) ────────────
@@ -878,21 +913,15 @@ async fn deliver_symbols_sends_to_reachable_holder() {
 
     coordinator.deliver_symbols(&[result]).await;
 
-    let mut conn = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        rx_holder.recv(),
-    )
-    .await
-    .expect("timeout waiting for connection")
-    .expect("channel closed");
+    let mut conn = tokio::time::timeout(std::time::Duration::from_secs(5), rx_holder.recv())
+        .await
+        .expect("timeout waiting for connection")
+        .expect("channel closed");
 
-    let msg = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        conn.recv_message(),
-    )
-    .await
-    .expect("timeout waiting for message")
-    .expect("recv_message failed");
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), conn.recv_message())
+        .await
+        .expect("timeout waiting for message")
+        .expect("recv_message failed");
 
     match msg {
         Message::SymbolTransfer(transfer) => {
@@ -904,8 +933,12 @@ async fn deliver_symbols_sends_to_reachable_holder() {
         other => panic!("expected SymbolTransfer, got {other:?}"),
     }
 
-    Arc::try_unwrap(network_owner).ok().map(|n| async move { n.shutdown().await });
-    Arc::try_unwrap(network_holder).ok().map(|n| async move { n.shutdown().await });
+    Arc::try_unwrap(network_owner)
+        .ok()
+        .map(|n| async move { n.shutdown().await });
+    Arc::try_unwrap(network_holder)
+        .ok()
+        .map(|n| async move { n.shutdown().await });
 }
 
 // ─── Phase 7.9 tests: watch_configs importance lookup ────────────────────────
@@ -1063,44 +1096,63 @@ fn derive_file_importance_integration_photo_and_text_files_in_correct_order() {
     wc_text.populate_classification();
 
     assert!(
-        wc_text.classification.as_ref().map(|c| !c.is_media_folder).unwrap_or(false),
+        wc_text
+            .classification
+            .as_ref()
+            .map(|c| !c.is_media_folder)
+            .unwrap_or(false),
         "text folder should classify as non-media"
     );
     assert!(
-        wc_media.classification.as_ref().map(|c| c.is_media_folder).unwrap_or(false),
+        wc_media
+            .classification
+            .as_ref()
+            .map(|c| c.is_media_folder)
+            .unwrap_or(false),
         "media folder should classify as media"
     );
 
-    let mut coord = coord_with_watch(
-        db,
-        &symbols_dir,
-        vec![wc_text.clone(), wc_media.clone()],
-    );
+    let mut coord = coord_with_watch(db, &symbols_dir, vec![wc_text.clone(), wc_media.clone()]);
 
     // Enqueue a text file.
     let txt_path_buf = text_dir.path().join("notes.txt");
     std::fs::write(&txt_path_buf, b"important doc content here xyz").unwrap();
     let txt_path_str = txt_path_buf.to_string_lossy().into_owned();
     let txt_event = syncback_core::types::DeviceId([1u8; 32]);
-    coord.process_event(super::DirtyEvent {
-        path: txt_path_str.clone(),
-        kind: super::DirtyKind::Added,
-        device_id: txt_event,
-    }).unwrap();
+    coord
+        .process_event(super::DirtyEvent {
+            path: txt_path_str.clone(),
+            kind: super::DirtyKind::Added,
+            device_id: txt_event,
+        })
+        .unwrap();
 
     // Enqueue a media file.
     let jpg_path_buf = media_dir.path().join("photo.jpg");
     std::fs::write(&jpg_path_buf, b"fake jpeg content for testing purposes").unwrap();
     let jpg_path_str = jpg_path_buf.to_string_lossy().into_owned();
-    coord.process_event(super::DirtyEvent {
-        path: jpg_path_str.clone(),
-        kind: super::DirtyKind::Added,
-        device_id: syncback_core::types::DeviceId([1u8; 32]),
-    }).unwrap();
+    coord
+        .process_event(super::DirtyEvent {
+            path: jpg_path_str.clone(),
+            kind: super::DirtyKind::Added,
+            device_id: syncback_core::types::DeviceId([1u8; 32]),
+        })
+        .unwrap();
 
-    let queued: Vec<_> = coord.queues.values().flat_map(|q| q.iter()).cloned().collect();
-    let txt = queued.iter().find(|f| f.path.ends_with(".txt")).expect("txt file should be queued");
-    let jpg = queued.iter().find(|f| f.path.ends_with("photo.jpg")).expect("jpg file should be queued");
+    let queued: Vec<_> = coord
+        .queues
+        .values()
+        .flat_map(|q| q.iter())
+        .cloned()
+        .collect();
+    let txt = queued
+        .iter()
+        .find(|f| f.path.ends_with(".txt"))
+        .expect("txt file should be queued");
+    let jpg = queued
+        .iter()
+        .find(|f| f.path.ends_with("photo.jpg"))
+        .expect("jpg file should be queued");
 
     // text file in text folder → TextOrCode × 1.0 = 1.0
     assert!(
@@ -1166,8 +1218,7 @@ fn same_content_two_devices_both_in_file_record() {
         live_watch_configs: None,
         peer_backoff: None,
     };
-    let mut coord_a =
-        BackupCoordinator::new(db.clone(), config_a, Arc::new(RaptorQEncoder::new()));
+    let mut coord_a = BackupCoordinator::new(db.clone(), config_a, Arc::new(RaptorQEncoder::new()));
     coord_a
         .process_event(DirtyEvent {
             path: path.clone(),
@@ -1194,8 +1245,7 @@ fn same_content_two_devices_both_in_file_record() {
         live_watch_configs: None,
         peer_backoff: None,
     };
-    let mut coord_b =
-        BackupCoordinator::new(db.clone(), config_b, Arc::new(RaptorQEncoder::new()));
+    let mut coord_b = BackupCoordinator::new(db.clone(), config_b, Arc::new(RaptorQEncoder::new()));
     coord_b
         .process_event(DirtyEvent {
             path: path.clone(),
@@ -1255,12 +1305,20 @@ fn flush_queue_deferred_files_remain_in_queue() {
     }
 
     // With budget=0, flush should defer all files and return empty.
-    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
-    assert!(results.is_empty(), "zero budget: no files should be processed");
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
+    assert!(
+        results.is_empty(),
+        "zero budget: no files should be processed"
+    );
 
     // All 3 files must remain in the queue.
     let queue_len: usize = coord.queues.values().map(|q| q.len()).sum();
-    assert_eq!(queue_len, 3, "all 3 files should remain in queue when budget=0");
+    assert_eq!(
+        queue_len, 3,
+        "all 3 files should remain in queue when budget=0"
+    );
 
     // No source blocks should have been written to DB.
     let blocks = db
@@ -1311,31 +1369,45 @@ fn flush_queue_budget_selects_highest_importance_first() {
     let hash_b: [u8; 32] = *blake3::hash(&content_b).as_bytes();
 
     // Directly push QueuedFile entries with specific importance values.
-    coord.queues.entry(FileCategory::Document).or_default().push(QueuedFile {
-        path: path_a.clone(),
-        file_id: syncback_core::types::FileId(1),
-        content_hash: hash_a,
-        size_bytes: 30_000,
-        category: FileCategory::Document,
-        importance: 0.9,
-    });
-    coord.queues.entry(FileCategory::Document).or_default().push(QueuedFile {
-        path: path_b.clone(),
-        file_id: syncback_core::types::FileId(2),
-        content_hash: hash_b,
-        size_bytes: 30_000,
-        category: FileCategory::Document,
-        importance: 0.3,
-    });
+    coord
+        .queues
+        .entry(FileCategory::Document)
+        .or_default()
+        .push(QueuedFile {
+            path: path_a.clone(),
+            file_id: syncback_core::types::FileId(1),
+            content_hash: hash_a,
+            size_bytes: 30_000,
+            category: FileCategory::Document,
+            importance: 0.9,
+        });
+    coord
+        .queues
+        .entry(FileCategory::Document)
+        .or_default()
+        .push(QueuedFile {
+            path: path_b.clone(),
+            file_id: syncback_core::types::FileId(2),
+            content_hash: hash_b,
+            size_bytes: 30_000,
+            category: FileCategory::Document,
+            importance: 0.3,
+        });
 
-    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
 
     // At least one file should have been processed.
     assert!(!results.is_empty(), "at least one file should be processed");
 
     // The low-importance file (path_b) must remain in queue.
     let doc_queue = coord.queues.get(&FileCategory::Document).unwrap();
-    assert_eq!(doc_queue.len(), 1, "exactly one file should remain deferred");
+    assert_eq!(
+        doc_queue.len(),
+        1,
+        "exactly one file should remain deferred"
+    );
     assert_eq!(
         doc_queue[0].path, path_b,
         "the low-importance file should be the deferred one"
@@ -1390,7 +1462,10 @@ fn large_file_skipped_when_budget_insufficient() {
     let blocks = db
         .list_source_blocks_by_status(syncback_core::types::SourceBlockStatus::Active)
         .unwrap();
-    assert!(blocks.is_empty(), "no blocks should exist when large file is skipped");
+    assert!(
+        blocks.is_empty(),
+        "no blocks should exist when large file is skipped"
+    );
 }
 
 // ─── B4 tests: placement outcome tracking ─────────────────────────────────────
@@ -1429,7 +1504,10 @@ fn handle_backup_event_increments_accepted_counter() {
         source_block_id: block_id,
     });
 
-    assert_eq!(coord.accepted_this_cycle, 1, "accepted_this_cycle should be 1 after one SymbolAccepted");
+    assert_eq!(
+        coord.accepted_this_cycle, 1,
+        "accepted_this_cycle should be 1 after one SymbolAccepted"
+    );
 }
 
 // ─── B4-T2: persist_cycle_budget_saves_stats_and_resets_counters ─────────────
@@ -1449,11 +1527,20 @@ fn persist_cycle_budget_saves_stats_and_resets_counters() {
     coord.persist_cycle_budget();
 
     // Counters must be reset.
-    assert_eq!(coord.offered_this_cycle, 0, "offered_this_cycle should be 0 after persist");
-    assert_eq!(coord.accepted_this_cycle, 0, "accepted_this_cycle should be 0 after persist");
+    assert_eq!(
+        coord.offered_this_cycle, 0,
+        "offered_this_cycle should be 0 after persist"
+    );
+    assert_eq!(
+        coord.accepted_this_cycle, 0,
+        "accepted_this_cycle should be 0 after persist"
+    );
 
     // DB must have a BudgetRecord with weekly_stats = [(10, 8)].
-    let record = db.get_budget().unwrap().expect("BudgetRecord must exist after persist");
+    let record = db
+        .get_budget()
+        .unwrap()
+        .expect("BudgetRecord must exist after persist");
     assert_eq!(record.weekly_stats, vec![(10u32, 8u32)]);
 
     // placement_success_rate should be 8/10 = 0.8.
@@ -1532,7 +1619,10 @@ fn compress_and_encrypt_is_deterministic() {
     let blob1 = compress_and_encrypt(plaintext, &epoch_key).unwrap();
     let blob2 = compress_and_encrypt(plaintext, &epoch_key).unwrap();
 
-    assert_eq!(blob1, blob2, "same plaintext + epoch_key must produce identical blob");
+    assert_eq!(
+        blob1, blob2,
+        "same plaintext + epoch_key must produce identical blob"
+    );
 
     // Different plaintext → different blob.
     let blob3 = compress_and_encrypt(b"different content", &epoch_key).unwrap();
@@ -1636,7 +1726,11 @@ fn when_some_peers_unauthenticated_then_allocation_excludes_them() {
     let authenticated: HashSet<DeviceId> = peer_ids[..3].iter().cloned().collect();
 
     let candidates = coord.get_candidates(&authenticated).unwrap();
-    assert_eq!(candidates.len(), 3, "only 3 authenticated peers should be candidates");
+    assert_eq!(
+        candidates.len(),
+        3,
+        "only 3 authenticated peers should be candidates"
+    );
     let offline_ids: HashSet<DeviceId> = peer_ids[3..].iter().cloned().collect();
     for c in &candidates {
         assert!(
@@ -1682,15 +1776,19 @@ fn when_peer_comes_online_then_next_flush_includes_peer() {
     let auth_first: HashSet<DeviceId> = peer_ids[..3].iter().cloned().collect();
     let candidates_first = coord.get_candidates(&auth_first).unwrap();
     assert_eq!(candidates_first.len(), 3);
-    assert!(!candidates_first.iter().any(|c| c.device_id == peer_ids[3]),
-        "peer D must not be in candidates when not authenticated");
+    assert!(
+        !candidates_first.iter().any(|c| c.device_id == peer_ids[3]),
+        "peer D must not be in candidates when not authenticated"
+    );
 
     // Second snapshot: peer D comes online.
     let auth_second: HashSet<DeviceId> = peer_ids.iter().cloned().collect();
     let candidates_second = coord.get_candidates(&auth_second).unwrap();
     assert_eq!(candidates_second.len(), 4);
-    assert!(candidates_second.iter().any(|c| c.device_id == peer_ids[3]),
-        "peer D must appear in candidates after coming online");
+    assert!(
+        candidates_second.iter().any(|c| c.device_id == peer_ids[3]),
+        "peer D must appear in candidates after coming online"
+    );
 }
 
 // AC-8, AC-9, AC-10 (pending_delivery signaling tests) removed in ε.5.
@@ -1711,7 +1809,7 @@ fn when_peer_comes_online_then_next_flush_includes_peer() {
 fn apply_binding_on_pipeline_raw_equals_direct_encode() {
     use crate::daemon::backup::pipeline::compress_and_encrypt;
     use syncback_core::erasure::RaptorQEncoder;
-    use syncback_core::placement::{compute_allocation, HolderCandidate};
+    use syncback_core::placement::compute_allocation;
     use syncback_core::types::{ErasureParams, SourceBlockId};
 
     let epoch_key = [42u8; 32];
@@ -1737,8 +1835,7 @@ fn apply_binding_on_pipeline_raw_equals_direct_encode() {
     let raw = &raw_symbols[idx];
 
     // Apply binding via encode path.
-    let bound_via_apply =
-        encoder.apply_binding(raw.clone(), &block_id, &alloc.device_id);
+    let bound_via_apply = encoder.apply_binding(raw.clone(), &block_id, &alloc.device_id);
 
     // Encode directly via the old path.
     let bound_direct = encoder
@@ -1765,7 +1862,7 @@ fn _placeholder_read_raw_removed() {
 #[test]
 fn cleanup_legacy_removes_flat_esi_bin_preserves_block_bin_and_raw_dir() {
     use crate::daemon::backup::pipeline::cleanup_legacy_bound_symbol_files;
-    use syncback_core::types::{hex_encode, SourceBlockId};
+    use syncback_core::types::{SourceBlockId, hex_encode};
 
     let symbols_dir = TempDir::new().unwrap();
     let block_id = SourceBlockId([0xCCu8; 32]);
@@ -1799,7 +1896,7 @@ fn cleanup_legacy_removes_flat_esi_bin_preserves_block_bin_and_raw_dir() {
 #[test]
 fn cleanup_legacy_is_idempotent() {
     use crate::daemon::backup::pipeline::cleanup_legacy_bound_symbol_files;
-    use syncback_core::types::{hex_encode, SourceBlockId};
+    use syncback_core::types::{SourceBlockId, hex_encode};
 
     let symbols_dir = TempDir::new().unwrap();
     let block_id = SourceBlockId([0xDDu8; 32]);
@@ -1838,11 +1935,18 @@ fn pipeline_creates_offered_placements() {
         coord.process_event(added_event(&path)).unwrap();
     }
 
-    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
-    assert!(!results.is_empty(), "should produce at least one source block");
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
+    assert!(
+        !results.is_empty(),
+        "should produce at least one source block"
+    );
 
     for result in &results {
-        let placements = db.list_placements_for_block(&result.source_block_id).unwrap();
+        let placements = db
+            .list_placements_for_block(&result.source_block_id)
+            .unwrap();
         assert!(!placements.is_empty(), "pipeline must create placements");
         for p in &placements {
             assert_eq!(
@@ -1865,8 +1969,8 @@ fn derive_file_importance_burst_downweight_integration() {
     use syncback_core::config::WatchConfig;
     use syncback_core::importance::burst::{apply_burst_downweight, burst_downweight_selects};
 
-    let db = Db::open_in_memory().unwrap();
-    let symbols_dir = TempDir::new().unwrap();
+    let _db = Db::open_in_memory().unwrap();
+    let _symbols_dir = TempDir::new().unwrap();
     let media_dir = TempDir::new().unwrap();
 
     // Write 8 .jpg files into the media directory.
@@ -1889,7 +1993,10 @@ fn derive_file_importance_burst_downweight_integration() {
     wc.populate_bursts();
 
     // Verify populate_bursts ran (burst sets may be empty due to FS mtime resolution).
-    assert!(wc.bursts.is_some(), "bursts should be populated after populate_bursts()");
+    assert!(
+        wc.bursts.is_some(),
+        "bursts should be populated after populate_bursts()"
+    );
 
     // Manually inject a burst set containing img_0000.jpg to test the derive path.
     let target_path = media_dir.path().join("img_0000.jpg");
@@ -1903,10 +2010,8 @@ fn derive_file_importance_burst_downweight_integration() {
     let mut wc_with_burst = wc.clone();
     wc_with_burst.bursts = Some(vec![manual_burst]);
 
-    let importance_with_burst = syncback_core::config::derive_file_importance(
-        &target_str,
-        &[wc_with_burst.clone()],
-    );
+    let importance_with_burst =
+        syncback_core::config::derive_file_importance(&target_str, &[wc_with_burst.clone()]);
 
     let wc_without_burst = WatchConfig {
         bursts: Some(vec![]),
@@ -1948,14 +2053,18 @@ fn push_queued(
     content_hash: [u8; 32],
 ) {
     use super::QueuedFile;
-    coord.queues.entry(FileCategory::Document).or_default().push(QueuedFile {
-        path,
-        file_id: syncback_core::types::FileId(file_id),
-        content_hash,
-        size_bytes,
-        category: FileCategory::Document,
-        importance,
-    });
+    coord
+        .queues
+        .entry(FileCategory::Document)
+        .or_default()
+        .push(QueuedFile {
+            path,
+            file_id: syncback_core::types::FileId(file_id),
+            content_hash,
+            size_bytes,
+            category: FileCategory::Document,
+            importance,
+        });
 }
 
 /// Build a test coordinator with unlimited budget so budget checks don't interfere.
@@ -1999,7 +2108,9 @@ fn pack_accumulator_flushes_on_importance_change_above_epsilon() {
     push_queued(&mut coord, path_high, 1.0, 1024, 1, hash_high);
     push_queued(&mut coord, path_low, 0.65, 1024, 2, hash_low);
 
-    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
 
     assert_eq!(
         results.len(),
@@ -2028,7 +2139,9 @@ fn pack_accumulator_does_not_flush_on_importance_change_below_epsilon() {
     push_queued(&mut coord, path_a, 0.95, 1024, 1, hash_a);
     push_queued(&mut coord, path_b, 0.94, 1024, 2, hash_b);
 
-    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
 
     assert_eq!(
         results.len(),
@@ -2067,7 +2180,9 @@ fn pack_accumulator_does_not_flush_on_importance_change_equal_to_epsilon() {
     push_queued(&mut coord, path_a, 0.70, 1024, 1, hash_a);
     push_queued(&mut coord, path_b, 0.65, 1024, 2, hash_b);
 
-    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
 
     assert_eq!(
         results.len(),
@@ -2091,7 +2206,9 @@ fn block_creation_stores_importance_and_target_reliability_byte_for_byte() {
     let hash: [u8; 32] = *blake3::hash(&content).as_bytes();
 
     push_queued(&mut coord, path, 0.65, 1024, 1, hash);
-    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
     assert_eq!(results.len(), 1, "should produce one block");
 
     let block = db
@@ -2128,7 +2245,9 @@ fn block_creation_initializes_cached_fields_to_zero() {
     let hash: [u8; 32] = *blake3::hash(&content).as_bytes();
 
     push_queued(&mut coord, path, 0.5, 1024, 1, hash);
-    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
     assert_eq!(results.len(), 1, "should produce one block");
 
     let block = db
@@ -2136,7 +2255,10 @@ fn block_creation_initializes_cached_fields_to_zero() {
         .unwrap()
         .expect("block must be in DB");
 
-    assert_eq!(block.current_alive, 0, "current_alive must be 0 at creation");
+    assert_eq!(
+        block.current_alive, 0,
+        "current_alive must be 0 at creation"
+    );
     assert!(
         block.current_reliability == 0.0,
         "current_reliability must be 0.0 at creation, got {}",
@@ -2187,10 +2309,16 @@ fn block_creation_when_no_holder_candidates_available_creates_block_with_zero_pl
     // Directly push to queue since we have no mock holders for peer auth.
     push_queued(&mut coord, path, 1.0, 1024, 1, hash);
 
-    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
 
     // Block IS created — not deferred. 0 placements is expected.
-    assert_eq!(results.len(), 1, "block must be created even with no holders (A6)");
+    assert_eq!(
+        results.len(),
+        1,
+        "block must be created even with no holders (A6)"
+    );
 
     let block = db
         .get_source_block(&results[0].source_block_id)
@@ -2213,10 +2341,15 @@ fn block_creation_when_no_holder_candidates_available_creates_block_with_zero_pl
     assert_eq!(block.current_alive, 0, "no holders → current_alive=0");
 
     // n must be set to static fallback (Some value, not None).
-    assert!(block.n.is_some(), "n must be Some (static fallback) even with no holders");
+    assert!(
+        block.n.is_some(),
+        "n must be Some (static fallback) even with no holders"
+    );
 
     // No placements should exist.
-    let placements = db.list_placements_for_block(&results[0].source_block_id).unwrap();
+    let placements = db
+        .list_placements_for_block(&results[0].source_block_id)
+        .unwrap();
     assert!(
         placements.is_empty(),
         "no placements expected with empty holder pool, got {}",
@@ -2276,7 +2409,9 @@ fn select_backup_batch_order_observable_in_resulting_block_records() {
     push_queued(&mut coord, path_mid.clone(), 0.65, 1024, 2, hash_mid);
     push_queued(&mut coord, path_high.clone(), 1.0, 1024, 3, hash_high);
 
-    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
 
     // Each file should get its own block due to importance-change flushes.
     assert_eq!(
@@ -2352,10 +2487,12 @@ fn flush_queue_preserves_importance_order_across_packs() {
     // Insertion order deliberately shuffled: low, high, low.
     // After D1 fix, select_backup_batch reorders to: high (1.0), low (0.65), low (0.65).
     push_queued(&mut coord, path_c.clone(), 0.65, 1024, 1, hash_c); // inserted first
-    push_queued(&mut coord, path_a.clone(), 1.0, 1024, 2, hash_a);  // inserted second
+    push_queued(&mut coord, path_a.clone(), 1.0, 1024, 2, hash_a); // inserted second
     push_queued(&mut coord, path_b.clone(), 0.65, 1024, 3, hash_b); // inserted third
 
-    let results = coord.flush_queue(FileCategory::Document, true, &Default::default()).unwrap();
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
 
     // Importance gap 1.0→0.65 = 0.35 > 0.05 → flush at boundary.
     // Gap 0.65→0.65 = 0.0 ≤ 0.05 → no flush.
@@ -2367,8 +2504,14 @@ fn flush_queue_preserves_importance_order_across_packs() {
         results.len()
     );
 
-    let block0 = db.get_source_block(&results[0].source_block_id).unwrap().unwrap();
-    let block1 = db.get_source_block(&results[1].source_block_id).unwrap().unwrap();
+    let block0 = db
+        .get_source_block(&results[0].source_block_id)
+        .unwrap()
+        .unwrap();
+    let block1 = db
+        .get_source_block(&results[1].source_block_id)
+        .unwrap()
+        .unwrap();
 
     assert!(
         (block0.importance - 1.0).abs() < 1e-9,
@@ -2419,7 +2562,8 @@ fn backup_symbol_accepted_updates_current_alive() {
     let block_id = SourceBlockId([0x62u8; 32]);
 
     // Insert block record so the hook can find it.
-    db.upsert_source_block(&make_block_for_hook(block_id)).unwrap();
+    db.upsert_source_block(&make_block_for_hook(block_id))
+        .unwrap();
 
     // Insert Offered placement — will transition to Alive on SymbolAccepted.
     let placement = SymbolPlacement {
@@ -2442,8 +2586,7 @@ fn backup_symbol_accepted_updates_current_alive() {
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
     assert_eq!(
-        updated_block.current_alive,
-        1,
+        updated_block.current_alive, 1,
         "current_alive must be 1 after SymbolAccepted transitions Offered→Alive"
     );
 }
@@ -2461,7 +2604,8 @@ fn backup_two_holders_alive_current_alive_is_two() {
     let holder_b = DeviceId([0x64u8; 32]);
     let block_id = SourceBlockId([0x65u8; 32]);
 
-    db.upsert_source_block(&make_block_for_hook(block_id)).unwrap();
+    db.upsert_source_block(&make_block_for_hook(block_id))
+        .unwrap();
 
     for &h in &[holder_a, holder_b] {
         let placement = SymbolPlacement {
@@ -2489,8 +2633,7 @@ fn backup_two_holders_alive_current_alive_is_two() {
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
     assert_eq!(
-        updated_block.current_alive,
-        2,
+        updated_block.current_alive, 2,
         "current_alive must be 2 after two SymbolAccepted events"
     );
     // Reliability should be non-zero with 2 alive holders.
@@ -2512,7 +2655,8 @@ fn backup_symbol_accepted_already_alive_is_noop() {
     let holder_id = DeviceId([0x66u8; 32]);
     let block_id = SourceBlockId([0x67u8; 32]);
 
-    db.upsert_source_block(&make_block_for_hook(block_id)).unwrap();
+    db.upsert_source_block(&make_block_for_hook(block_id))
+        .unwrap();
 
     // Placement already Alive — no transition expected.
     let placement = SymbolPlacement {
@@ -2531,7 +2675,8 @@ fn backup_symbol_accepted_already_alive_is_noop() {
     // placement count (1). If the early-return guard works → hook never fires → value
     // stays at 99. If the guard were removed → hook would recount and overwrite to 1.
     // Asserting the value stays 99 is therefore a strong signal that the guard works.
-    db.update_block_cached_fields(&block_id, 0.5, 99, 0.9, 0.99, None, 0).unwrap();
+    db.update_block_cached_fields(&block_id, 0.5, 99, 0.9, 0.99, None, 0)
+        .unwrap();
 
     coord.handle_backup_event(BackupEvent::SymbolAccepted {
         holder_id,
@@ -2558,7 +2703,8 @@ fn backup_transition_offered_to_alive_updates_current_alive() {
     let block_id = SourceBlockId([0x70u8; 32]);
     let holder_id = DeviceId([0x71u8; 32]);
 
-    db.upsert_source_block(&make_block_for_hook(block_id)).unwrap();
+    db.upsert_source_block(&make_block_for_hook(block_id))
+        .unwrap();
 
     let placement = SymbolPlacement {
         source_block_id: block_id,
@@ -2577,7 +2723,10 @@ fn backup_transition_offered_to_alive_updates_current_alive() {
     let transitioned = db
         .transition_placement_offered_to_alive(&block_id, &holder_id, Timestamp(123))
         .unwrap();
-    assert!(transitioned, "expected Ok(true) from transition_placement_offered_to_alive");
+    assert!(
+        transitioned,
+        "expected Ok(true) from transition_placement_offered_to_alive"
+    );
     crate::daemon::processor::recompute_and_persist_block_cached_fields(&db, &block_id);
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();

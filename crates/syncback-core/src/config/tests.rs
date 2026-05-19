@@ -1,24 +1,29 @@
+#![allow(clippy::cloned_ref_to_slice_refs)]
+
 #[cfg(test)]
 use std::io::Write;
 
 #[cfg(test)]
 use crate::config::{
-    AppConfig, BackupCfg, ClusterCfg, ConfigError, EscrowCfg, MetricsCfg, NetworkCfg,
-    ReliabilityConfig, RestoreCfg, StorageCfg, WatchConfig, WebApiCfg, derive_file_importance,
-    disk_reserve_bytes, expand_data_dir, hard_quota_bytes, soft_quota_bytes, source_block_size_bytes,
-    DEFAULT_IMPORTANCE, DEFAULT_IMPORTANCE_MULTIPLIER,
+    AppConfig, BackupCfg, ClusterCfg, ConfigError, DEFAULT_IMPORTANCE,
+    DEFAULT_IMPORTANCE_MULTIPLIER, EscrowCfg, MetricsCfg, NetworkCfg, ReliabilityConfig,
+    RestoreCfg, StorageCfg, WatchConfig, WebApiCfg, derive_file_importance, disk_reserve_bytes,
+    expand_data_dir, hard_quota_bytes, soft_quota_bytes, source_block_size_bytes,
 };
-#[cfg(test)]
-use crate::importance::{FolderClassification, burst::{self, apply_burst_downweight, burst_downweight_selects}};
-#[cfg(test)]
-use std::collections::HashSet;
-#[cfg(test)]
-use std::path::Path;
 #[cfg(test)]
 use crate::constants::{
     DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_K_FACTOR, DEFAULT_MAX_VERSIONS,
     DEFAULT_SOURCE_BLOCK_SIZE, MAX_BOARD_ENTRIES, MAX_BOARD_SIZE_BYTES,
 };
+#[cfg(test)]
+use crate::importance::{
+    FolderClassification,
+    burst::{apply_burst_downweight, burst_downweight_selects},
+};
+#[cfg(test)]
+use std::collections::HashSet;
+#[cfg(test)]
+use std::path::Path;
 
 #[cfg(test)]
 fn write_toml(content: &str) -> tempfile::NamedTempFile {
@@ -32,18 +37,36 @@ fn config_loads_defaults_when_file_is_empty() {
     let f = write_toml("");
     let cfg = AppConfig::load(f.path()).unwrap();
     let defaults = AppConfig::default();
-    assert_eq!(cfg.backup.source_block_size_mb, defaults.backup.source_block_size_mb);
+    assert_eq!(
+        cfg.backup.source_block_size_mb,
+        defaults.backup.source_block_size_mb
+    );
     assert_eq!(cfg.backup.max_versions, defaults.backup.max_versions);
-    assert_eq!(cfg.backup.max_version_age_days, defaults.backup.max_version_age_days);
+    assert_eq!(
+        cfg.backup.max_version_age_days,
+        defaults.backup.max_version_age_days
+    );
     assert_eq!(cfg.storage.soft_quota_gb, defaults.storage.soft_quota_gb);
     assert_eq!(cfg.storage.hard_quota_gb, defaults.storage.hard_quota_gb);
-    assert_eq!(cfg.storage.disk_reserve_gb, defaults.storage.disk_reserve_gb);
+    assert_eq!(
+        cfg.storage.disk_reserve_gb,
+        defaults.storage.disk_reserve_gb
+    );
     assert_eq!(cfg.storage.data_dir, defaults.storage.data_dir);
     assert_eq!(cfg.escrow.k_factor, defaults.escrow.k_factor);
-    assert_eq!(cfg.network.relay_max_entries, defaults.network.relay_max_entries);
-    assert_eq!(cfg.network.relay_max_size_mb, defaults.network.relay_max_size_mb);
+    assert_eq!(
+        cfg.network.relay_max_entries,
+        defaults.network.relay_max_entries
+    );
+    assert_eq!(
+        cfg.network.relay_max_size_mb,
+        defaults.network.relay_max_size_mb
+    );
     assert_eq!(cfg.network.relay_ttl_days, defaults.network.relay_ttl_days);
-    assert_eq!(cfg.cluster.sync_batch_size, defaults.cluster.sync_batch_size);
+    assert_eq!(
+        cfg.cluster.sync_batch_size,
+        defaults.cluster.sync_batch_size
+    );
 }
 
 #[test]
@@ -52,7 +75,10 @@ fn config_loads_partial_file_merging_with_defaults() {
     let cfg = AppConfig::load(f.path()).unwrap();
     assert_eq!(cfg.backup.source_block_size_mb, 32);
     assert_eq!(cfg.backup.max_versions, DEFAULT_MAX_VERSIONS);
-    assert_eq!(cfg.storage.disk_reserve_gb, DEFAULT_DISK_RESERVE_BYTES as f64 / 1_073_741_824.0);
+    assert_eq!(
+        cfg.storage.disk_reserve_gb,
+        DEFAULT_DISK_RESERVE_BYTES as f64 / 1_073_741_824.0
+    );
     assert_eq!(cfg.escrow.k_factor, DEFAULT_ESCROW_K_FACTOR);
     assert_eq!(cfg.cluster.sync_batch_size, 100);
 }
@@ -71,9 +97,7 @@ fn config_roundtrips_all_fields() {
             disk_reserve_gb: 50.0,
             data_dir: "/data/syncback".to_string(),
         },
-        escrow: EscrowCfg {
-            k_factor: 14.0,
-        },
+        escrow: EscrowCfg { k_factor: 14.0 },
         network: NetworkCfg {
             relay_max_entries: 1000,
             relay_max_size_mb: 4,
@@ -118,7 +142,9 @@ fn config_validate_rejects_source_block_size_zero() {
     let mut cfg = AppConfig::default();
     cfg.backup.source_block_size_mb = 0;
     let err = cfg.validate().unwrap_err();
-    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "backup.source_block_size_mb"));
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, .. } if field == "backup.source_block_size_mb")
+    );
 }
 
 #[test]
@@ -126,7 +152,9 @@ fn config_validate_rejects_source_block_size_not_power_of_two() {
     let mut cfg = AppConfig::default();
     cfg.backup.source_block_size_mb = 100;
     let err = cfg.validate().unwrap_err();
-    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "backup.source_block_size_mb"));
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, .. } if field == "backup.source_block_size_mb")
+    );
 }
 
 #[test]
@@ -134,7 +162,9 @@ fn config_validate_rejects_source_block_size_3mb() {
     let mut cfg = AppConfig::default();
     cfg.backup.source_block_size_mb = 3;
     let err = cfg.validate().unwrap_err();
-    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "backup.source_block_size_mb"));
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, .. } if field == "backup.source_block_size_mb")
+    );
 }
 
 #[test]
@@ -149,7 +179,9 @@ fn config_validate_rejects_max_versions_zero() {
     let mut cfg = AppConfig::default();
     cfg.backup.max_versions = 0;
     let err = cfg.validate().unwrap_err();
-    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "backup.max_versions"));
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, .. } if field == "backup.max_versions")
+    );
 }
 
 #[test]
@@ -157,7 +189,9 @@ fn config_validate_rejects_max_version_age_days_zero() {
     let mut cfg = AppConfig::default();
     cfg.backup.max_version_age_days = 0;
     let err = cfg.validate().unwrap_err();
-    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "backup.max_version_age_days"));
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, .. } if field == "backup.max_version_age_days")
+    );
 }
 
 #[test]
@@ -165,7 +199,9 @@ fn config_validate_rejects_negative_soft_quota() {
     let mut cfg = AppConfig::default();
     cfg.storage.soft_quota_gb = -1.0;
     let err = cfg.validate().unwrap_err();
-    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "storage.soft_quota_gb"));
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, .. } if field == "storage.soft_quota_gb")
+    );
 }
 
 #[test]
@@ -173,7 +209,9 @@ fn config_validate_rejects_negative_hard_quota() {
     let mut cfg = AppConfig::default();
     cfg.storage.hard_quota_gb = -5.0;
     let err = cfg.validate().unwrap_err();
-    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "storage.hard_quota_gb"));
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, .. } if field == "storage.hard_quota_gb")
+    );
 }
 
 #[test]
@@ -182,7 +220,9 @@ fn config_validate_rejects_hard_quota_above_soft_quota() {
     cfg.storage.soft_quota_gb = 100.0;
     cfg.storage.hard_quota_gb = 200.0;
     let err = cfg.validate().unwrap_err();
-    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "storage.hard_quota_gb"));
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, .. } if field == "storage.hard_quota_gb")
+    );
 }
 
 #[test]
@@ -206,7 +246,9 @@ fn config_validate_rejects_relay_max_entries_zero() {
     let mut cfg = AppConfig::default();
     cfg.network.relay_max_entries = 0;
     let err = cfg.validate().unwrap_err();
-    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "network.relay_max_entries"));
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, .. } if field == "network.relay_max_entries")
+    );
 }
 
 #[test]
@@ -214,7 +256,9 @@ fn config_validate_rejects_relay_ttl_days_zero() {
     let mut cfg = AppConfig::default();
     cfg.network.relay_ttl_days = 0;
     let err = cfg.validate().unwrap_err();
-    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "network.relay_ttl_days"));
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, .. } if field == "network.relay_ttl_days")
+    );
 }
 
 #[test]
@@ -222,7 +266,9 @@ fn config_validate_rejects_cluster_sync_batch_size_zero() {
     let mut cfg = AppConfig::default();
     cfg.cluster.sync_batch_size = 0;
     let err = cfg.validate().unwrap_err();
-    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "cluster.sync_batch_size"));
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, .. } if field == "cluster.sync_batch_size")
+    );
 }
 
 #[test]
@@ -290,6 +336,7 @@ fn disk_reserve_bytes_converts_correctly() {
 }
 
 #[test]
+#[allow(unsafe_code)] // single-threaded test mutating $HOME
 fn expand_data_dir_expands_tilde() {
     let mut cfg = AppConfig::default();
     cfg.storage.data_dir = "~/.syncback".to_string();
@@ -309,6 +356,7 @@ fn expand_data_dir_leaves_absolute_path_unchanged() {
 }
 
 #[test]
+#[allow(unsafe_code)] // single-threaded test mutating $HOME
 fn expand_data_dir_handles_bare_tilde() {
     let mut cfg = AppConfig::default();
     cfg.storage.data_dir = "~".to_string();
@@ -321,7 +369,10 @@ fn expand_data_dir_handles_bare_tilde() {
 #[test]
 fn config_defaults_match_constants() {
     let cfg = AppConfig::default();
-    assert_eq!(cfg.backup.source_block_size_mb, DEFAULT_SOURCE_BLOCK_SIZE / 1_048_576);
+    assert_eq!(
+        cfg.backup.source_block_size_mb,
+        DEFAULT_SOURCE_BLOCK_SIZE / 1_048_576
+    );
     assert_eq!(cfg.backup.max_versions, DEFAULT_MAX_VERSIONS);
     assert_eq!(
         cfg.storage.disk_reserve_gb,
@@ -329,7 +380,10 @@ fn config_defaults_match_constants() {
     );
     assert_eq!(cfg.escrow.k_factor, DEFAULT_ESCROW_K_FACTOR);
     assert_eq!(cfg.network.relay_max_entries, MAX_BOARD_ENTRIES);
-    assert_eq!(cfg.network.relay_max_size_mb, MAX_BOARD_SIZE_BYTES / 1_048_576);
+    assert_eq!(
+        cfg.network.relay_max_size_mb,
+        MAX_BOARD_SIZE_BYTES / 1_048_576
+    );
 }
 
 #[test]
@@ -382,7 +436,10 @@ fn network_cfg_toml_missing_field_defaults_true() {
 #[test]
 fn network_cfg_bootstrap_peers_defaults_empty() {
     let cfg = NetworkCfg::default();
-    assert!(cfg.bootstrap_peers.is_empty(), "bootstrap_peers must default to empty");
+    assert!(
+        cfg.bootstrap_peers.is_empty(),
+        "bootstrap_peers must default to empty"
+    );
 }
 
 #[test]
@@ -430,7 +487,10 @@ fn network_cfg_relay_url_loads_from_toml() {
 relay_url = "http://my-relay:3340"
 "#;
     let app: AppConfig = toml::from_str(toml).unwrap();
-    assert_eq!(app.network.relay_url.as_deref(), Some("http://my-relay:3340"));
+    assert_eq!(
+        app.network.relay_url.as_deref(),
+        Some("http://my-relay:3340")
+    );
 }
 
 #[test]
@@ -485,7 +545,10 @@ importance_multiplier = 0.9"#;
         "canonical field should win; got {}",
         wc.importance_multiplier
     );
-    assert!(!wc.was_legacy_importance, "not legacy when canonical field is present");
+    assert!(
+        !wc.was_legacy_importance,
+        "not legacy when canonical field is present"
+    );
 }
 
 #[test]
@@ -498,9 +561,18 @@ fn watch_config_serializes_as_importance_multiplier_key() {
         bursts: None,
     };
     let s = toml::to_string(&wc).unwrap();
-    assert!(s.contains("importance_multiplier"), "canonical key must be written");
-    assert!(!s.contains("was_legacy_importance"), "skip field must not be written");
-    assert!(!s.contains("classification"), "skip field must not be written");
+    assert!(
+        s.contains("importance_multiplier"),
+        "canonical key must be written"
+    );
+    assert!(
+        !s.contains("was_legacy_importance"),
+        "skip field must not be written"
+    );
+    assert!(
+        !s.contains("classification"),
+        "skip field must not be written"
+    );
     assert!(!s.contains("bursts"), "skip field must not be written");
 }
 
@@ -569,7 +641,10 @@ fn make_watch(path: &str, multiplier: f64, is_media: bool) -> WatchConfig {
         path: path.to_string(),
         importance_multiplier: multiplier,
         was_legacy_importance: false,
-        classification: Some(FolderClassification { is_media_folder: is_media, importance_multiplier: 1.0 }),
+        classification: Some(FolderClassification {
+            is_media_folder: is_media,
+            importance_multiplier: 1.0,
+        }),
         bursts: None,
     }
 }
@@ -578,7 +653,10 @@ fn make_watch(path: &str, multiplier: f64, is_media: bool) -> WatchConfig {
 fn derive_file_importance_returns_one_for_text_file_in_text_folder() {
     let wc = make_watch("/home/user/docs", 1.0, false);
     let result = derive_file_importance("/home/user/docs/notes.md", &[wc]);
-    assert!((result - 1.0).abs() < 1e-9, "TextOrCode × 1.0 = 1.0, got {result}");
+    assert!(
+        (result - 1.0).abs() < 1e-9,
+        "TextOrCode × 1.0 = 1.0, got {result}"
+    );
 }
 
 #[test]
@@ -597,7 +675,10 @@ fn derive_file_importance_applies_watch_multiplier() {
     let wc = make_watch("/home/user/docs", 0.5, false);
     let result = derive_file_importance("/home/user/docs/budget.txt", &[wc]);
     // TextOrCode 1.0 × 0.5 = 0.5
-    assert!((result - 0.5).abs() < 1e-9, "TextOrCode × 0.5 = 0.5, got {result}");
+    assert!(
+        (result - 0.5).abs() < 1e-9,
+        "TextOrCode × 0.5 = 0.5, got {result}"
+    );
 }
 
 #[test]
@@ -605,7 +686,10 @@ fn derive_file_importance_clamps_at_one_when_multiplier_above_one() {
     let wc = make_watch("/home/user/docs", 2.0, false);
     let result = derive_file_importance("/home/user/docs/main.rs", &[wc]);
     // TextOrCode 1.0 × 2.0 = 2.0 → clamped to 1.0
-    assert!((result - 1.0).abs() < 1e-9, "expected clamped to 1.0, got {result}");
+    assert!(
+        (result - 1.0).abs() < 1e-9,
+        "expected clamped to 1.0, got {result}"
+    );
 }
 
 #[test]
@@ -648,7 +732,10 @@ fn derive_file_importance_path_with_trailing_slash_in_config() {
         path: "/home/user/docs/".to_string(),
         importance_multiplier: 1.0,
         was_legacy_importance: false,
-        classification: Some(FolderClassification { is_media_folder: false, importance_multiplier: 1.0 }),
+        classification: Some(FolderClassification {
+            is_media_folder: false,
+            importance_multiplier: 1.0,
+        }),
         bursts: None,
     };
     let result = derive_file_importance("/home/user/docs/file.txt", &[wc]);
@@ -665,7 +752,10 @@ fn derive_file_importance_exact_path_match() {
     // classify_file("/home/user/docs", non-media) → Unknown → 0.05
     let result = derive_file_importance("/home/user/docs", &[wc]);
     // Unknown × 1.0 = 0.05 (no extension, not special filename)
-    assert!((result - 0.05).abs() < 1e-9, "expected 0.05 for Unknown, got {result}");
+    assert!(
+        (result - 0.05).abs() < 1e-9,
+        "expected 0.05 for Unknown, got {result}"
+    );
 }
 
 #[test]
@@ -676,7 +766,10 @@ fn derive_file_importance_uses_first_matching_config() {
     // /home/user/photos/img.jpg matches both; first match (/home/user, 0.5) wins.
     // classify_file with non-media folder + .jpg → Unknown → 0.05 * 0.5 = 0.025
     let result = derive_file_importance("/home/user/photos/img.jpg", &[wc1, wc2]);
-    assert!((result - 0.025).abs() < 1e-9, "expected 0.025 (Unknown × 0.5), got {result}");
+    assert!(
+        (result - 0.025).abs() < 1e-9,
+        "expected 0.025 (Unknown × 0.5), got {result}"
+    );
 }
 
 // ============================================================
@@ -717,7 +810,10 @@ fn watch_config_empty_folder_classification_defaults_to_non_media() {
     wc.populate_classification();
     assert_eq!(
         wc.classification,
-        Some(FolderClassification { is_media_folder: false, importance_multiplier: 1.0 })
+        Some(FolderClassification {
+            is_media_folder: false,
+            importance_multiplier: 1.0
+        })
     );
 }
 
@@ -760,7 +856,10 @@ fn populate_classification_cap_stops_at_cap_boundary() {
         bursts: None,
     };
     wc.populate_classification_with_cap(5);
-    assert!(wc.classification.is_some(), "classification should be set with small cap");
+    assert!(
+        wc.classification.is_some(),
+        "classification should be set with small cap"
+    );
 }
 
 #[cfg(unix)]
@@ -798,10 +897,7 @@ fn populate_classification_missing_directory_sets_default() {
         bursts: None,
     };
     wc.populate_classification();
-    assert_eq!(
-        wc.classification,
-        Some(FolderClassification::default())
-    );
+    assert_eq!(wc.classification, Some(FolderClassification::default()));
 }
 
 #[test]
@@ -884,7 +980,8 @@ fn config_completion_bonus_coefficient_defaults_to_1_5() {
     use crate::constants::DEFAULT_COMPLETION_BONUS_COEFFICIENT;
     let cfg = AppConfig::default();
     assert!(
-        (cfg.reliability.completion_bonus_coefficient - DEFAULT_COMPLETION_BONUS_COEFFICIENT).abs() < 1e-9,
+        (cfg.reliability.completion_bonus_coefficient - DEFAULT_COMPLETION_BONUS_COEFFICIENT).abs()
+            < 1e-9,
         "expected {DEFAULT_COMPLETION_BONUS_COEFFICIENT}, got {}",
         cfg.reliability.completion_bonus_coefficient
     );
@@ -902,7 +999,8 @@ fn config_completion_bonus_coefficient_clamps_above_max() {
     let f = write_toml(toml_str);
     let cfg = AppConfig::load(f.path()).unwrap();
     assert!(
-        (cfg.reliability.completion_bonus_coefficient - MAX_COMPLETION_BONUS_COEFFICIENT).abs() < 1e-9,
+        (cfg.reliability.completion_bonus_coefficient - MAX_COMPLETION_BONUS_COEFFICIENT).abs()
+            < 1e-9,
         "expected clamped to {MAX_COMPLETION_BONUS_COEFFICIENT}, got {}",
         cfg.reliability.completion_bonus_coefficient
     );
@@ -950,7 +1048,10 @@ fn make_watch_with_bursts(
         path: path.to_string(),
         importance_multiplier: 1.0,
         was_legacy_importance: false,
-        classification: Some(FolderClassification { is_media_folder: is_media, importance_multiplier: 1.0 }),
+        classification: Some(FolderClassification {
+            is_media_folder: is_media,
+            importance_multiplier: 1.0,
+        }),
         bursts,
     }
 }
@@ -969,7 +1070,10 @@ fn derive_file_importance_applies_burst_downweight_when_path_in_burst() {
     let wc = make_watch_with_bursts("/photos", true, Some(vec![burst_set]));
 
     // Compute what the non-downweighted importance would be.
-    let wc_no_burst = WatchConfig { bursts: Some(vec![]), ..wc.clone() };
+    let wc_no_burst = WatchConfig {
+        bursts: Some(vec![]),
+        ..wc.clone()
+    };
     let without_downweight = derive_file_importance(&target_path, &[wc_no_burst]);
 
     // With burst set: downweight should be applied.
@@ -992,9 +1096,15 @@ fn derive_file_importance_no_downweight_when_path_not_in_burst() {
     let result = derive_file_importance(target, &[wc.clone()]);
 
     // Without burst, same result
-    let wc_no_burst = WatchConfig { bursts: Some(vec![]), ..wc };
+    let wc_no_burst = WatchConfig {
+        bursts: Some(vec![]),
+        ..wc
+    };
     let base = derive_file_importance(target, &[wc_no_burst]);
-    assert!((result - base).abs() < 1e-9, "no downweight for path not in burst");
+    assert!(
+        (result - base).abs() < 1e-9,
+        "no downweight for path not in burst"
+    );
 }
 
 #[test]
@@ -1035,7 +1145,10 @@ fn derive_file_importance_no_downweight_when_30pct_selection_excludes_path() {
     let result = derive_file_importance(&not_selected, &[wc.clone()]);
 
     // Without burst check → same importance.
-    let wc_no_burst = WatchConfig { bursts: Some(vec![]), ..wc };
+    let wc_no_burst = WatchConfig {
+        bursts: Some(vec![]),
+        ..wc
+    };
     let base = derive_file_importance(&not_selected, &[wc_no_burst]);
     assert!(
         (result - base).abs() < 1e-9,
@@ -1063,7 +1176,10 @@ fn populate_bursts_finds_clusters_in_real_directory() {
     wc.populate_bursts();
 
     // Wiring check: populate_bursts ran and stored Some result.
-    assert!(wc.bursts.is_some(), "bursts should be populated after populate_bursts()");
+    assert!(
+        wc.bursts.is_some(),
+        "bursts should be populated after populate_bursts()"
+    );
     // 1 file < min_count=8 → no burst detected.
     assert!(
         wc.bursts.as_ref().unwrap().is_empty(),

@@ -18,9 +18,6 @@ pub use crate::daemon::backup::pipeline::decrypt_and_decompress;
 ///
 /// The plaintext starts with `CBOR(Vec<PackEntry>)` followed by raw file bytes.
 /// Returns `Ok(Some(bytes))` if found, `Ok(None)` if `file_id` not in pack.
-pub fn extract_from_pack(
-    plaintext: &[u8],
-    file_id: FileId,
-) -> anyhow::Result<Option<Vec<u8>>> {
+pub fn extract_from_pack(plaintext: &[u8], file_id: FileId) -> anyhow::Result<Option<Vec<u8>>> {
     crate::daemon::backup::packing::extract_file_from_pack(plaintext, file_id)
 }

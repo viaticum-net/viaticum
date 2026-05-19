@@ -28,7 +28,7 @@ mod worker;
 #[cfg(test)]
 mod tests;
 
-pub use pool::{pool_signature, PoolSnapshot};
+pub use pool::{PoolSnapshot, pool_signature};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -128,8 +128,7 @@ impl WorkPipeline {
         // time_scale before passing). Don't divide again — that was the W11b
         // shipping bug: cooldown→0 at extreme time_scale, worker spun unbounded.
         let tick_secs = self.config.tick_interval.as_secs().max(1);
-        let mut tick =
-            tokio::time::interval(tokio::time::Duration::from_secs(tick_secs));
+        let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(tick_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         tracing::info!("work_pipeline: started (tick={}s)", tick_secs);
@@ -312,7 +311,10 @@ impl WorkPipeline {
                 reset_count += 1;
             }
         }
-        tracing::debug!(reset = reset_count, "work_pipeline: reset_all_cooldowns complete");
+        tracing::debug!(
+            reset = reset_count,
+            "work_pipeline: reset_all_cooldowns complete"
+        );
     }
 
     /// Update cooldown fields for a block after an iteration.

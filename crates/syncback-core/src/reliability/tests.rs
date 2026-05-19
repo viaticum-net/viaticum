@@ -1,8 +1,8 @@
 use super::{
+    BlockReliabilityInput, HolderCandidate, HolderReliabilityInput, ReliabilityError,
     binomial_survival, block_reliability, build_report, commitment_to_survival_prob,
     file_reliability, per_holder_impact, solve_n_for_target, target_reliability,
-    weighted_mean_trust, BlockReliabilityInput, HolderCandidate, HolderReliabilityInput,
-    ReliabilityError,
+    weighted_mean_trust,
 };
 use crate::commitment::CommitmentScore;
 use crate::constants::{MAX_OVERHEAD_FACTOR, MIN_REDUNDANCY};
@@ -97,9 +97,7 @@ fn binomial_survival_known_value_k5_n20_p07() {
 #[test]
 fn binomial_survival_invalid_p_returns_error() {
     let r1 = binomial_survival(10, 5, 1.5);
-    assert!(
-        matches!(r1, Err(ReliabilityError::InvalidSurvivalProb(p)) if (p - 1.5).abs() < 1e-9)
-    );
+    assert!(matches!(r1, Err(ReliabilityError::InvalidSurvivalProb(p)) if (p - 1.5).abs() < 1e-9));
 
     let r2 = binomial_survival(10, 5, -0.1);
     assert!(
@@ -111,10 +109,7 @@ fn binomial_survival_invalid_p_returns_error() {
 fn binomial_survival_k_greater_than_n() {
     // P(Binomial(3, 0.7) >= 5) = 0 (impossible)
     let result = binomial_survival(3, 5, 0.7).unwrap();
-    assert!(
-        (result - 0.0).abs() < 1e-10,
-        "expected 0.0, got {result}"
-    );
+    assert!((result - 0.0).abs() < 1e-10, "expected 0.0, got {result}");
 }
 
 #[test]
@@ -134,10 +129,7 @@ fn binomial_survival_exact_vs_normal_approx_agrees() {
 fn binomial_survival_large_n_normal_approx() {
     // K=200, N=480, overhead=2.4x, p=0.7 → table says ~99.999%
     let result = binomial_survival(480, 200, 0.7).unwrap();
-    assert!(
-        result > 0.9999,
-        "expected > 0.9999, got {result}"
-    );
+    assert!(result > 0.9999, "expected > 0.9999, got {result}");
 }
 
 // ============================================================
@@ -277,7 +269,7 @@ fn file_reliability_two_blocks_multiply() {
 fn file_reliability_large_file_many_blocks() {
     // 16-block file, each (15, 5, 0.7) ≈ 0.9993 reliable
     // P(file) = 0.9993^16 ≈ 0.9893
-    let blocks: Vec<(u32, u32, f64)> = std::iter::repeat((15, 5, 0.7)).take(16).collect();
+    let blocks: Vec<(u32, u32, f64)> = std::iter::repeat_n((15, 5, 0.7), 16).collect();
     let result = file_reliability(&blocks).unwrap();
     assert!(
         (result - 0.9893).abs() < 0.005,
@@ -291,10 +283,7 @@ fn file_reliability_one_degraded_block_drags_down() {
     // Block 2: N=5, k_eff=10, p=0.7 → 0 (can't get 10 from 5 symbols)
     // The file should end up below 0.5
     let result = file_reliability(&[(5, 5, 0.7), (5, 10, 0.7)]).unwrap();
-    assert!(
-        result < 0.5,
-        "expected < 0.5, got {result}"
-    );
+    assert!(result < 0.5, "expected < 0.5, got {result}");
 }
 
 #[test]
@@ -318,8 +307,7 @@ fn multi_block_file_reliability_is_product_of_block_reliabilities() {
     let single_block_p = binomial_survival(alive_symbols, k_eff, survival_prob).unwrap();
     let expected_file_p = single_block_p.powi(block_count as i32);
 
-    let blocks: Vec<(u32, u32, f64)> = std::iter::repeat((alive_symbols, k_eff, survival_prob))
-        .take(block_count)
+    let blocks: Vec<(u32, u32, f64)> = std::iter::repeat_n((alive_symbols, k_eff, survival_prob), block_count)
         .collect();
     let file_p = file_reliability(&blocks).unwrap();
 
@@ -347,7 +335,7 @@ fn multi_block_file_reliability_decreases_as_block_count_increases() {
     let params = (15u32, 5u32, 0.9_f64);
     let p1 = file_reliability(&[params]).unwrap();
     let p2 = file_reliability(&[params, params]).unwrap();
-    let p8 = file_reliability(&vec![params; 8]).unwrap();
+    let p8 = file_reliability(&[params; 8]).unwrap();
 
     assert!(
         p1 > p2,
@@ -521,20 +509,14 @@ fn build_report_no_holders() {
 fn commitment_to_survival_prob_full_score() {
     let score = CommitmentScore::new(1.0);
     let result = commitment_to_survival_prob(score);
-    assert!(
-        (result - 1.0).abs() < 1e-9,
-        "expected 1.0, got {result}"
-    );
+    assert!((result - 1.0).abs() < 1e-9, "expected 1.0, got {result}");
 }
 
 #[test]
 fn commitment_to_survival_prob_zero_score() {
     let score = CommitmentScore::new(0.0);
     let result = commitment_to_survival_prob(score);
-    assert!(
-        (result - 0.0).abs() < 1e-9,
-        "expected 0.0, got {result}"
-    );
+    assert!((result - 0.0).abs() < 1e-9, "expected 0.0, got {result}");
 }
 
 #[test]
@@ -542,10 +524,7 @@ fn commitment_to_survival_prob_midpoint() {
     // score^2 = 0.5^2 = 0.25
     let score = CommitmentScore::new(0.5);
     let result = commitment_to_survival_prob(score);
-    assert!(
-        (result - 0.25).abs() < 1e-9,
-        "expected 0.25, got {result}"
-    );
+    assert!((result - 0.25).abs() < 1e-9, "expected 0.25, got {result}");
 }
 
 #[test]
@@ -553,10 +532,7 @@ fn commitment_to_survival_prob_default_churn() {
     // survival_prob = score^2 = 0.7 → score = sqrt(0.7) ≈ 0.8367
     let score = CommitmentScore::new(0.7_f64.sqrt());
     let result = commitment_to_survival_prob(score);
-    assert!(
-        (result - 0.7).abs() < 1e-6,
-        "expected ~0.7, got {result}"
-    );
+    assert!((result - 0.7).abs() < 1e-6, "expected ~0.7, got {result}");
 }
 
 #[test]
@@ -612,7 +588,7 @@ fn binomial_survival_in_zero_one_range() {
             for p in p_values {
                 let result = binomial_survival(n, k, p).unwrap();
                 assert!(
-                    result >= 0.0 && result <= 1.0,
+                    (0.0..=1.0).contains(&result),
                     "binomial_survival({n}, {k}, {p}) = {result} — out of [0, 1]"
                 );
             }
@@ -644,7 +620,7 @@ fn block_reliability_in_zero_one() {
                 };
                 let result = block_reliability(&input).unwrap();
                 assert!(
-                    result >= 0.0 && result <= 1.0,
+                    (0.0..=1.0).contains(&result),
                     "block_reliability(k_eff={k_eff}, alive={alive}, p={survival_prob}) = {result} — out of [0, 1]"
                 );
             }
@@ -775,7 +751,7 @@ fn target_reliability_output_always_in_zero_one() {
     for imp in [-1.0_f64, -0.1, 0.0, 0.5, 1.0, 1.5, 2.0] {
         let result = target_reliability(imp);
         assert!(
-            result >= 0.0 && result <= 1.0,
+            (0.0..=1.0).contains(&result),
             "target_reliability({imp}) = {result} — out of [0, 1]"
         );
     }
@@ -789,10 +765,7 @@ fn target_reliability_output_always_in_zero_one() {
 fn weighted_mean_trust_equal_weights_single_holder() {
     let p = pool(&[0.75]);
     let result = weighted_mean_trust(&p).unwrap();
-    assert!(
-        (result - 0.75).abs() < 1e-9,
-        "expected 0.75, got {result}"
-    );
+    assert!((result - 0.75).abs() < 1e-9, "expected 0.75, got {result}");
 }
 
 #[test]
@@ -831,20 +804,14 @@ fn weighted_mean_trust_invalid_survival_prob_returns_error() {
 fn weighted_mean_trust_all_zero_survival() {
     let p = pool(&[0.0, 0.0, 0.0]);
     let result = weighted_mean_trust(&p).unwrap();
-    assert!(
-        (result - 0.0).abs() < 1e-9,
-        "expected 0.0, got {result}"
-    );
+    assert!((result - 0.0).abs() < 1e-9, "expected 0.0, got {result}");
 }
 
 #[test]
 fn weighted_mean_trust_all_full_survival() {
     let p = pool(&[1.0, 1.0, 1.0, 1.0]);
     let result = weighted_mean_trust(&p).unwrap();
-    assert!(
-        (result - 1.0).abs() < 1e-9,
-        "expected 1.0, got {result}"
-    );
+    assert!((result - 1.0).abs() < 1e-9, "expected 1.0, got {result}");
 }
 
 // ============================================================
@@ -858,7 +825,12 @@ fn solve_n_for_target_min_redundancy_floor() {
     let k_eff = 10u32;
     let p = pool(&[1.0, 1.0, 1.0, 1.0]);
     let result = solve_n_for_target(k_eff, &p, 0.0).unwrap();
-    assert_eq!(result, k_eff + MIN_REDUNDANCY, "expected floor n={}", k_eff + MIN_REDUNDANCY);
+    assert_eq!(
+        result,
+        k_eff + MIN_REDUNDANCY,
+        "expected floor n={}",
+        k_eff + MIN_REDUNDANCY
+    );
 }
 
 #[test]
@@ -880,7 +852,10 @@ fn solve_n_for_target_min_redundancy_never_below_floor_on_easy_target() {
     let high_trust = pool(&[0.99, 0.99, 0.99, 0.99, 0.99, 0.99]);
     let n = solve_n_for_target(k_eff, &high_trust, 0.01).unwrap();
     assert!(n >= floor, "n={n} is below floor={floor}");
-    assert_eq!(n, floor, "expected n=floor={floor} for trivially easy target, got n={n}");
+    assert_eq!(
+        n, floor,
+        "expected n=floor={floor} for trivially easy target, got n={n}"
+    );
 }
 
 // ============================================================
@@ -895,7 +870,11 @@ fn solve_n_for_target_picks_min_overhead_for_target() {
     let n = solve_n_for_target(k_eff, &pool_v, target_p).unwrap();
     let mean_p = 0.82;
 
-    assert!(n >= k_eff + MIN_REDUNDANCY, "n={n} below floor {}", k_eff + MIN_REDUNDANCY);
+    assert!(
+        n >= k_eff + MIN_REDUNDANCY,
+        "n={n} below floor {}",
+        k_eff + MIN_REDUNDANCY
+    );
     assert!(
         binomial_survival(n, k_eff, mean_p).unwrap() >= target_p,
         "n={n} does not satisfy target_p={target_p}"

@@ -92,7 +92,10 @@ fn priority_clamps_importance_above_one_to_one() {
         "clamped should equal priority(1.0,...): clamped={clamped}, normal={normal}"
     );
     // priority(1.0, 5, 10, 1.5) = 1.0 * (1 + 1.5 * 0.5) = 1.0 * 1.75 = 1.75
-    assert!((clamped - 1.75).abs() < 1e-9, "expected 1.75, got {clamped}");
+    assert!(
+        (clamped - 1.75).abs() < 1e-9,
+        "expected 1.75, got {clamped}"
+    );
 }
 
 #[test]
@@ -120,7 +123,10 @@ fn priority_scenarios_match_unified_spec_table() {
         (row1_b - row1_b_expected).abs() < 1e-9,
         "Row1B: expected {row1_b_expected}, got {row1_b}"
     );
-    assert!(row1_a > row1_b, "Row1: important new should win (1.0 > {row1_b:.6})");
+    assert!(
+        row1_a > row1_b,
+        "Row1: important new should win (1.0 > {row1_b:.6})"
+    );
 
     // Row 2: Same-importance new (0.5) vs partial at halfway (current_alive=7, n=14)
     let row2_a = priority(0.5, 0, 14, 1.5);
@@ -134,7 +140,10 @@ fn priority_scenarios_match_unified_spec_table() {
         (row2_b - row2_b_expected).abs() < 1e-9,
         "Row2B: expected {row2_b_expected}, got {row2_b}"
     );
-    assert!(row2_b > row2_a, "Row2: partial should win over new at same importance ({row2_b:.6} > {row2_a:.6})");
+    assert!(
+        row2_b > row2_a,
+        "Row2: partial should win over new at same importance ({row2_b:.6} > {row2_a:.6})"
+    );
 
     // Row 3: Heavily degraded high (1.0 at current_alive=1, n=10) vs near-done lower (0.5 at 9/10)
     let row3_a = priority(1.0, 1, 10, 1.5);

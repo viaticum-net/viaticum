@@ -7,8 +7,8 @@
 // Wire format: [salt(24)][nonce(12)][ciphertext+tag(N+16)]
 // HKDF-SHA256(salt, identity_key) → ChaCha20-Poly1305 key
 
-use chacha20poly1305::aead::{AeadInPlace, NewAead};
 use chacha20poly1305::ChaCha20Poly1305;
+use chacha20poly1305::aead::{AeadInPlace, NewAead};
 use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
 use redb::{ReadableTable, TableDefinition};
@@ -17,7 +17,7 @@ use std::io::Cursor;
 
 use crate::cluster::StoredClusterState;
 use crate::types::{
-    to_cbor_bytes, FileRecord, PeerRecord, SourceBlockRecord, SymbolPlacement, Timestamp,
+    FileRecord, PeerRecord, SourceBlockRecord, SymbolPlacement, Timestamp, to_cbor_bytes,
 };
 
 // ============================================================

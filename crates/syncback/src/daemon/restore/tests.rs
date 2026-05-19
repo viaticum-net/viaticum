@@ -14,19 +14,17 @@ use std::sync::Arc;
 
 use syncback_core::db::Db;
 use syncback_core::erasure::RaptorQEncoder;
+use syncback_core::types::to_cbor_bytes;
 use syncback_core::types::{
     DeviceId, ErasureParams, FileId, FileRecord, FileVersion, IdentityPub, LocalState, PackEntry,
     PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType,
     SymbolPlacement, Timestamp,
 };
-use syncback_core::types::to_cbor_bytes;
 use tempfile::TempDir;
 
-use crate::daemon::backup::{
-    BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind,
-};
+use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
 
-use super::{collect_esis_from_ranges, RestoreConfig, RestoreCoordinator, VersionSelector};
+use super::{RestoreConfig, RestoreCoordinator, VersionSelector, collect_esis_from_ranges};
 use crate::daemon::restore::staging::JobId;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -68,11 +66,7 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
 /// Build a RestoreCoordinator for Phase 2 (local) tests (no network needed).
 /// `staging_dir`: the TempDir that will serve as both staging_root and data_dir
 /// (they're the same in tests — staging_root = staging_dir/restore, data_dir = staging_dir).
-fn test_restore_coord(
-    db: Db,
-    symbols_dir: &TempDir,
-    staging_dir: &TempDir,
-) -> RestoreCoordinator {
+fn test_restore_coord(db: Db, symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreCoordinator {
     // Create the restore staging subdirectory under staging_dir.
     let staging_root = staging_dir.path().join("restore");
     std::fs::create_dir_all(&staging_root).expect("create staging_root");
@@ -89,11 +83,7 @@ fn test_restore_coord(
         fetch_timeout: std::time::Duration::from_secs(60),
     };
 
-    RestoreCoordinator::new(
-        db,
-        restore_config,
-        Arc::new(RaptorQEncoder::new()),
-    )
+    RestoreCoordinator::new(db, restore_config, Arc::new(RaptorQEncoder::new()))
 }
 
 /// Write a file to a TempDir and return its absolute path string.
@@ -183,10 +173,8 @@ fn select_version_before_date_returns_correct_version() {
         make_version(Some(300)),
         make_version(Some(500)),
     ]);
-    let result = RestoreCoordinator::select_version(
-        &record,
-        &VersionSelector::BeforeDate(Timestamp(400)),
-    );
+    let result =
+        RestoreCoordinator::select_version(&record, &VersionSelector::BeforeDate(Timestamp(400)));
     assert!(result.is_some());
     assert_eq!(result.unwrap().backed_up_at, Some(Timestamp(300)));
 }
@@ -199,10 +187,8 @@ fn select_version_before_date_exact_match() {
         make_version(Some(700)),
     ]);
     // Timestamp(400) should match exactly.
-    let result = RestoreCoordinator::select_version(
-        &record,
-        &VersionSelector::BeforeDate(Timestamp(400)),
-    );
+    let result =
+        RestoreCoordinator::select_version(&record, &VersionSelector::BeforeDate(Timestamp(400)));
     assert!(result.is_some());
     assert_eq!(result.unwrap().backed_up_at, Some(Timestamp(400)));
 }
@@ -210,10 +196,8 @@ fn select_version_before_date_exact_match() {
 #[test]
 fn select_version_before_date_returns_none_when_all_after() {
     let record = make_record_with_versions(vec![make_version(Some(500)), make_version(Some(600))]);
-    let result = RestoreCoordinator::select_version(
-        &record,
-        &VersionSelector::BeforeDate(Timestamp(100)),
-    );
+    let result =
+        RestoreCoordinator::select_version(&record, &VersionSelector::BeforeDate(Timestamp(100)));
     assert!(result.is_none());
 }
 
@@ -248,8 +232,10 @@ fn prefix_restore_finds_multiple_files() {
         }
     };
 
-    db.upsert_file(&make_record("/data/photos/a.jpg", 1)).unwrap();
-    db.upsert_file(&make_record("/data/photos/b.jpg", 2)).unwrap();
+    db.upsert_file(&make_record("/data/photos/a.jpg", 1))
+        .unwrap();
+    db.upsert_file(&make_record("/data/photos/b.jpg", 2))
+        .unwrap();
     db.upsert_file(&make_record("/data/docs/c.txt", 3)).unwrap();
 
     let photos = db.list_files_with_prefix("/data/photos/").unwrap();
@@ -330,7 +316,10 @@ async fn restore_single_file_by_exact_path() {
     let mut backup = test_backup_coord(db.clone(), &symbols_dir);
     backup.process_event(added_event(&path)).unwrap();
     let results = backup.flush_all(true, &Default::default()).unwrap();
-    assert!(!results.is_empty(), "should have produced at least one block");
+    assert!(
+        !results.is_empty(),
+        "should have produced at least one block"
+    );
 
     // Restore
     let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
@@ -387,10 +376,7 @@ async fn restore_pack_multiple_files_roundtrip() {
     };
     let result = restore.restore(request).await.unwrap();
 
-    assert_eq!(
-        result.files_restored, 3,
-        "failures: {:?}", result.failures
-    );
+    assert_eq!(result.files_restored, 3, "failures: {:?}", result.failures);
     assert!(result.failures.is_empty());
 
     // Verify contents — files are in staging_path/<rel_path>
@@ -415,7 +401,7 @@ async fn restore_pack_multiple_files_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_specific_version_by_index() {
     use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
-    use syncback_core::types::{hex_encode, ErasureParams};
+    use syncback_core::types::{ErasureParams, hex_encode};
 
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
@@ -445,8 +431,11 @@ async fn restore_specific_version_by_index() {
         .unwrap();
         let stored_size = v1_blob.len() as u64;
         let params = ErasureParams::compute(stored_size, 0.5).unwrap();
-        let raws = encoder.encode_raw(&v1_blob, &params, 0, params.k_eff).unwrap();
-        let raw_dir = symbols_dir.path()
+        let raws = encoder
+            .encode_raw(&v1_blob, &params, 0, params.k_eff)
+            .unwrap();
+        let raw_dir = symbols_dir
+            .path()
             .join(hex_encode(&v1_block_id.0))
             .join("raw");
         std::fs::create_dir_all(&raw_dir).unwrap();
@@ -499,7 +488,11 @@ async fn restore_specific_version_by_index() {
         job_id: JobId::new(),
     };
     let result2 = restore.restore(request_latest).await.unwrap();
-    assert_eq!(result2.files_restored, 1, "failures: {:?}", result2.failures);
+    assert_eq!(
+        result2.files_restored, 1,
+        "failures: {:?}",
+        result2.failures
+    );
 
     let out_latest = std::fs::read(result2.staging_path.join(rel)).unwrap();
     assert_eq!(out_latest, b"version two content");
@@ -913,10 +906,8 @@ async fn fetch_skips_denied_holder_and_tries_next() {
                             for esi in &req.esi_list {
                                 let path = dir.join(format!("{esi}.bin"));
                                 if let Ok(data) = std::fs::read(&path) {
-                                    symbols.push(syncback_core::erasure::Symbol {
-                                        esi: *esi,
-                                        data,
-                                    });
+                                    symbols
+                                        .push(syncback_core::erasure::Symbol { esi: *esi, data });
                                 }
                             }
                             let resp = Message::RestoreResponse(RestoreResponseMsg {
@@ -1005,12 +996,7 @@ async fn fetch_skips_denied_holder_and_tries_next() {
         symbols_dir: symbols_dir.path().to_path_buf(),
         swarm: None,
     };
-    let coord = RestoreCoordinator::new(
-        db,
-        restore_config,
-        encoder.clone(),
-        Arc::new(owner_net),
-    );
+    let coord = RestoreCoordinator::new(db, restore_config, encoder.clone(), Arc::new(owner_net));
 
     let placements = vec![placement_a, placement_b];
     let result = coord
@@ -1344,12 +1330,18 @@ async fn default_restore_writes_to_staging_not_origin() {
 
     // Original file must be unchanged.
     let still_original = std::fs::read(&original_path).unwrap();
-    assert_eq!(still_original, content, "original file must not be modified");
+    assert_eq!(
+        still_original, content,
+        "original file must not be modified"
+    );
 
     // Restored file must exist in staging.
     let rel = original_path.trim_start_matches('/');
     let staged_file = result.staging_path.join(rel);
-    assert!(staged_file.exists(), "restored file must exist in staging at {staged_file:?}");
+    assert!(
+        staged_file.exists(),
+        "restored file must exist in staging at {staged_file:?}"
+    );
     let restored = std::fs::read(&staged_file).unwrap();
     assert_eq!(restored, content, "restored content must match original");
 }
@@ -1438,8 +1430,8 @@ async fn path_traversal_from_db_record_is_rejected() {
 /// assert will fail, making the regression immediately visible.
 #[test]
 fn extract_and_write_file_rejects_path_traversal() {
-    use syncback_core::types::{FileId, FileVersion, SourceBlockType, Timestamp};
     use crate::daemon::restore::staging::{JobId, StagingWriter};
+    use syncback_core::types::{FileId, FileVersion, SourceBlockType, Timestamp};
 
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
@@ -1522,7 +1514,10 @@ async fn restore_result_contains_staging_path() {
     let result = restore.restore(request).await.unwrap();
 
     assert_eq!(result.files_restored, 1);
-    assert!(!result.staging_path.as_os_str().is_empty(), "staging_path must be non-empty");
+    assert!(
+        !result.staging_path.as_os_str().is_empty(),
+        "staging_path must be non-empty"
+    );
     assert!(
         result.staging_path.is_dir(),
         "staging_path {:?} must be an existing directory",
@@ -1533,10 +1528,10 @@ async fn restore_result_contains_staging_path() {
 // ─── StagingWriter tests ───────────────────────────────────────────────────────
 
 mod staging_tests {
-    use std::path::Path;
-    use tempfile::TempDir;
     use crate::daemon::restore::staging::{JobId, StagingError, StagingWriter};
+    use std::path::Path;
     use syncback_core::path_safety::validate_record_path;
+    use tempfile::TempDir;
 
     /// G1: staging writer creates file at the correct relative path.
     #[test]
@@ -1557,7 +1552,10 @@ mod staging_tests {
         assert_eq!(content, b"report content");
 
         // Path must be rooted in staging_path.
-        assert!(out.starts_with(writer.staging_path()), "file must be inside staging dir");
+        assert!(
+            out.starts_with(writer.staging_path()),
+            "file must be inside staging dir"
+        );
     }
 
     /// Basic open test: job dir is created.
@@ -1572,11 +1570,16 @@ mod staging_tests {
 
         assert!(
             writer.staging_path().is_dir(),
-            "job staging dir must exist: {:?}", writer.staging_path()
+            "job staging dir must exist: {:?}",
+            writer.staging_path()
         );
         // Job dir name must be the UUID string.
         let dir_name = writer.staging_path().file_name().unwrap().to_string_lossy();
-        assert_eq!(dir_name, job_id.to_string(), "job dir name must be the UUID");
+        assert_eq!(
+            dir_name,
+            job_id.to_string(),
+            "job dir name must be the UUID"
+        );
     }
 
     /// Mode 0o600 on written files (Unix only).
@@ -1689,7 +1692,10 @@ mod staging_tests {
         match result {
             Err(_) => {
                 // Rejected by cap_std — the ideal outcome.
-                assert!(!Path::new("/tmp/attack_file").exists(), "/tmp/attack_file must not be created");
+                assert!(
+                    !Path::new("/tmp/attack_file").exists(),
+                    "/tmp/attack_file must not be created"
+                );
             }
             Ok(out_path) => {
                 // Allowed — but must not be at /tmp/attack_file.
@@ -1697,7 +1703,10 @@ mod staging_tests {
                     out_path.starts_with(job_dir),
                     "written file must be inside staging dir, not symlink target: {out_path:?}"
                 );
-                assert!(!Path::new("/tmp/attack_file").exists(), "/tmp/attack_file must not exist");
+                assert!(
+                    !Path::new("/tmp/attack_file").exists(),
+                    "/tmp/attack_file must not exist"
+                );
             }
         }
     }
@@ -1707,7 +1716,10 @@ mod staging_tests {
     fn two_restore_jobs_get_different_job_ids() {
         let id1 = JobId::new();
         let id2 = JobId::new();
-        assert_ne!(id1, id2, "two JobId::new() calls must produce different IDs");
+        assert_ne!(
+            id1, id2,
+            "two JobId::new() calls must produce different IDs"
+        );
     }
 }
 
@@ -1715,9 +1727,9 @@ mod staging_tests {
 // Moved here from cleanup.rs per convention (tests in separate files).
 
 mod cleanup_tests {
+    use crate::daemon::restore::cleanup::{check_staging_warn, should_warn, staging_total_bytes};
     use std::path::Path;
     use tempfile::TempDir;
-    use crate::daemon::restore::cleanup::{check_staging_warn, should_warn, staging_total_bytes};
 
     #[test]
     fn staging_total_bytes_returns_zero_for_missing_dir() {
@@ -1728,7 +1740,7 @@ mod cleanup_tests {
     #[test]
     fn staging_total_bytes_returns_correct_sum() {
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("a.bin"), b"hello").unwrap();   // 5 bytes
+        std::fs::write(dir.path().join("a.bin"), b"hello").unwrap(); // 5 bytes
         std::fs::write(dir.path().join("b.bin"), b"world!!").unwrap(); // 7 bytes
 
         let total = staging_total_bytes(dir.path());
@@ -1750,7 +1762,10 @@ mod cleanup_tests {
     /// W2: should_warn returns false when used <= threshold.
     #[test]
     fn should_warn_returns_false_when_under_threshold() {
-        assert!(!should_warn(4, 1_073_741_824), "4 bytes must not exceed 1 GB threshold");
+        assert!(
+            !should_warn(4, 1_073_741_824),
+            "4 bytes must not exceed 1 GB threshold"
+        );
     }
 
     /// W2: should_warn returns true when used > threshold.
@@ -1855,27 +1870,40 @@ async fn restore_reconstructs_from_source_when_raw_missing() {
     let staging_dir = TempDir::new().unwrap();
 
     // 1. Write a source file with known content.
-    let original_content = b"Wave 11b restore test: raw files must NOT exist, restore must work from source";
+    let original_content =
+        b"Wave 11b restore test: raw files must NOT exist, restore must work from source";
     let path = write_file(&files_dir, "w11b_restore.txt", original_content);
 
     // 2. Backup via BackupCoordinator — W11b guarantees no raw/ files are written.
     let mut backup = test_backup_coord(db.clone(), &symbols_dir);
     backup.process_event(added_event(&path)).unwrap();
     let results = backup.flush_all(true, &Default::default()).unwrap();
-    assert!(!results.is_empty(), "backup must produce at least one block");
+    assert!(
+        !results.is_empty(),
+        "backup must produce at least one block"
+    );
 
     // 3. Assert: NO raw/{esi}.bin files exist in symbols_dir (W11b invariant I5).
-    fn find_files_recursive<'a>(
+    fn find_files_recursive(
         root: &std::path::Path,
         pred: &dyn Fn(&std::path::Path) -> bool,
     ) -> Vec<std::path::PathBuf> {
         let mut found = Vec::new();
-        fn walk(dir: &std::path::Path, pred: &dyn Fn(&std::path::Path) -> bool, found: &mut Vec<std::path::PathBuf>) {
-            let Ok(entries) = std::fs::read_dir(dir) else { return };
+        fn walk(
+            dir: &std::path::Path,
+            pred: &dyn Fn(&std::path::Path) -> bool,
+            found: &mut Vec<std::path::PathBuf>,
+        ) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
             for entry in entries.flatten() {
                 let p = entry.path();
-                if p.is_dir() { walk(&p, pred, found); }
-                else if pred(&p) { found.push(p); }
+                if p.is_dir() {
+                    walk(&p, pred, found);
+                } else if pred(&p) {
+                    found.push(p);
+                }
             }
         }
         walk(root, pred, &mut found);
@@ -1919,8 +1947,8 @@ async fn restore_reconstructs_from_source_when_raw_missing() {
     // Verify content matches original.
     let rel = path.trim_start_matches('/');
     let restored_path = result.staging_path.join(rel);
-    let restored_bytes = std::fs::read(&restored_path)
-        .expect("restored file must exist in staging area");
+    let restored_bytes =
+        std::fs::read(&restored_path).expect("restored file must exist in staging area");
     assert_eq!(
         restored_bytes.as_slice(),
         original_content,

@@ -1,5 +1,5 @@
-use super::*;
 use super::burst;
+use super::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -169,10 +169,7 @@ fn classify_file_min_js_uses_js() {
 
 #[test]
 fn classify_file_jpg_in_media_folder_returns_one_of_three_buckets() {
-    let result = classify_file(
-        Path::new("/home/alice/Photos/IMG_001.jpg"),
-        &media_folder(),
-    );
+    let result = classify_file(Path::new("/home/alice/Photos/IMG_001.jpg"), &media_folder());
     assert!(
         matches!(
             result,
@@ -267,21 +264,24 @@ fn classify_file_bucket_distribution_in_media_folder() {
             ImportanceClass::MediaHigh => high += 1,
             ImportanceClass::MediaMedium => med += 1,
             ImportanceClass::MediaLow => low += 1,
-            other => panic!("unexpected class {:?} for media file in media folder", other),
+            other => panic!(
+                "unexpected class {:?} for media file in media folder",
+                other
+            ),
         }
     }
     assert!(
-        high >= 20 && high <= 80,
+        (20..=80).contains(&high),
         "MediaHigh out of expected range [20,80]: {}",
         high
     );
     assert!(
-        med >= 220 && med <= 280,
+        (220..=280).contains(&med),
         "MediaMedium out of expected range [220,280]: {}",
         med
     );
     assert!(
-        low >= 670 && low <= 730,
+        (670..=730).contains(&low),
         "MediaLow out of expected range [670,730]: {}",
         low
     );
@@ -293,30 +293,44 @@ fn classify_file_bucket_distribution_in_media_folder() {
 
 #[test]
 fn classify_folder_detects_media_folder_at_50_percent() {
-    let mut paths: Vec<PathBuf> = (0..50).map(|i| PathBuf::from(format!("img_{}.jpg", i))).collect();
+    let mut paths: Vec<PathBuf> = (0..50)
+        .map(|i| PathBuf::from(format!("img_{}.jpg", i)))
+        .collect();
     paths.extend((0..50).map(|i| PathBuf::from(format!("doc_{}.txt", i))));
     let result = classify_folder(&paths);
-    assert!(result.is_media_folder, "50% media fraction should be a media folder");
+    assert!(
+        result.is_media_folder,
+        "50% media fraction should be a media folder"
+    );
 }
 
 #[test]
 fn classify_folder_does_not_flag_below_threshold() {
-    let mut paths: Vec<PathBuf> = (0..49).map(|i| PathBuf::from(format!("img_{}.jpg", i))).collect();
+    let mut paths: Vec<PathBuf> = (0..49)
+        .map(|i| PathBuf::from(format!("img_{}.jpg", i)))
+        .collect();
     paths.extend((0..51).map(|i| PathBuf::from(format!("doc_{}.txt", i))));
     let result = classify_folder(&paths);
-    assert!(!result.is_media_folder, "49% media fraction should not be a media folder");
+    assert!(
+        !result.is_media_folder,
+        "49% media fraction should not be a media folder"
+    );
 }
 
 #[test]
 fn classify_folder_detects_pure_media_folder() {
-    let paths: Vec<PathBuf> = (0..200).map(|i| PathBuf::from(format!("img_{}.jpg", i))).collect();
+    let paths: Vec<PathBuf> = (0..200)
+        .map(|i| PathBuf::from(format!("img_{}.jpg", i)))
+        .collect();
     let result = classify_folder(&paths);
     assert!(result.is_media_folder);
 }
 
 #[test]
 fn classify_folder_mixed_below_half_is_not_media() {
-    let mut paths: Vec<PathBuf> = (0..30).map(|i| PathBuf::from(format!("img_{}.jpg", i))).collect();
+    let mut paths: Vec<PathBuf> = (0..30)
+        .map(|i| PathBuf::from(format!("img_{}.jpg", i)))
+        .collect();
     paths.extend((0..70).map(|i| PathBuf::from(format!("src_{}.rs", i))));
     let result = classify_folder(&paths);
     assert!(!result.is_media_folder);
@@ -331,7 +345,9 @@ fn classify_folder_empty_input_returns_non_media_default() {
 
 #[test]
 fn classify_folder_multiplier_is_always_1_0() {
-    let paths: Vec<PathBuf> = (0..100).map(|i| PathBuf::from(format!("img_{}.jpg", i))).collect();
+    let paths: Vec<PathBuf> = (0..100)
+        .map(|i| PathBuf::from(format!("img_{}.jpg", i)))
+        .collect();
     let result = classify_folder(&paths);
     assert_eq!(result.importance_multiplier, 1.0);
 }
@@ -339,7 +355,9 @@ fn classify_folder_multiplier_is_always_1_0() {
 #[test]
 fn classify_folder_counts_all_media_types() {
     // 30 mp4 + 20 mp3 + 50 rs = 100 total → 50% media → is_media_folder = true
-    let mut paths: Vec<PathBuf> = (0..30).map(|i| PathBuf::from(format!("video_{}.mp4", i))).collect();
+    let mut paths: Vec<PathBuf> = (0..30)
+        .map(|i| PathBuf::from(format!("video_{}.mp4", i)))
+        .collect();
     paths.extend((0..20).map(|i| PathBuf::from(format!("audio_{}.mp3", i))));
     paths.extend((0..50).map(|i| PathBuf::from(format!("src_{}.rs", i))));
     let result = classify_folder(&paths);
@@ -366,7 +384,11 @@ fn importance_value_anchors_match_spec() {
 #[test]
 fn effective_importance_applies_multiplier() {
     let result = effective_importance(ImportanceClass::TextOrCode, 0.5);
-    assert!((result - 0.50).abs() < 1e-10, "expected 0.50, got {}", result);
+    assert!(
+        (result - 0.50).abs() < 1e-10,
+        "expected 0.50, got {}",
+        result
+    );
 }
 
 #[test]
@@ -392,19 +414,19 @@ fn effective_importance_clamps_below_zero() {
 #[test]
 fn effective_importance_default_multiplier_is_identity() {
     assert_eq!(effective_importance(ImportanceClass::TextOrCode, 1.0), 1.0);
-    assert!(
-        (effective_importance(ImportanceClass::MediaLow, 1.0) - 0.20).abs() < 1e-10
-    );
-    assert!(
-        (effective_importance(ImportanceClass::Unknown, 1.0) - 0.05).abs() < 1e-10
-    );
+    assert!((effective_importance(ImportanceClass::MediaLow, 1.0) - 0.20).abs() < 1e-10);
+    assert!((effective_importance(ImportanceClass::Unknown, 1.0) - 0.05).abs() < 1e-10);
 }
 
 #[test]
 fn effective_importance_media_low_boosted() {
     // 0.20 * 3.0 = 0.60 → no clamp needed
     let result = effective_importance(ImportanceClass::MediaLow, 3.0);
-    assert!((result - 0.60).abs() < 1e-10, "expected 0.60, got {}", result);
+    assert!(
+        (result - 0.60).abs() < 1e-10,
+        "expected 0.60, got {}",
+        result
+    );
     // 0.20 * 6.0 = 1.20 → clamped to 1.0
     assert_eq!(effective_importance(ImportanceClass::MediaLow, 6.0), 1.0);
 }
@@ -469,12 +491,28 @@ fn detect_bursts_separates_two_clusters_separated_by_5_min() {
     // Algorithm sorts by mtime → group1 (earlier) → result[0]; group2 → result[1].
     for i in 0..8u64 {
         let g1 = PathBuf::from(format!("/photos/g1_{:04}.jpg", i));
-        assert!(result[0].contains(&g1), "g1 path {} should be in first burst", i);
-        assert!(!result[1].contains(&g1), "g1 path {} must NOT leak into second burst", i);
+        assert!(
+            result[0].contains(&g1),
+            "g1 path {} should be in first burst",
+            i
+        );
+        assert!(
+            !result[1].contains(&g1),
+            "g1 path {} must NOT leak into second burst",
+            i
+        );
 
         let g2 = PathBuf::from(format!("/photos/g2_{:04}.jpg", i));
-        assert!(result[1].contains(&g2), "g2 path {} should be in second burst", i);
-        assert!(!result[0].contains(&g2), "g2 path {} must NOT leak into first burst", i);
+        assert!(
+            result[1].contains(&g2),
+            "g2 path {} should be in second burst",
+            i
+        );
+        assert!(
+            !result[0].contains(&g2),
+            "g2 path {} must NOT leak into first burst",
+            i
+        );
     }
 }
 
@@ -525,7 +563,10 @@ fn detect_bursts_just_outside_window() {
         .map(|(i, &s)| file_at(&format!("/photos/img_{:04}.jpg", i), s))
         .collect();
     let result = burst::detect_bursts(&files, Duration::from_secs(60), 8);
-    assert!(result.is_empty(), "t[7]-t[0]=61 > 60, no 8-file window fits");
+    assert!(
+        result.is_empty(),
+        "t[7]-t[0]=61 > 60, no 8-file window fits"
+    );
 }
 
 #[test]
@@ -558,7 +599,12 @@ fn detect_bursts_non_overlapping_greedy() {
         .map(|(i, &s)| file_at(&format!("/photos/img_{:04}.jpg", i), s))
         .collect();
     let result = burst::detect_bursts(&files, Duration::from_secs(60), 8);
-    assert_eq!(result.len(), 2, "non-overlapping: first 8 then 9 = 2 bursts, got {}", result.len());
+    assert_eq!(
+        result.len(),
+        2,
+        "non-overlapping: first 8 then 9 = 2 bursts, got {}",
+        result.len()
+    );
 
     // Check sizes: order in result follows mtime order.
     let sizes: Vec<usize> = result.iter().map(|s| s.len()).collect();
@@ -656,7 +702,11 @@ fn burst_downweight_different_paths_may_differ() {
 #[test]
 fn apply_burst_downweight_halves_value() {
     let result = burst::apply_burst_downweight(0.65);
-    assert!((result - 0.325).abs() < 1e-9, "expected 0.325, got {}", result);
+    assert!(
+        (result - 0.325).abs() < 1e-9,
+        "expected 0.325, got {}",
+        result
+    );
 }
 
 #[test]
@@ -677,11 +727,19 @@ fn apply_burst_downweight_floors_at_005() {
 #[test]
 fn apply_burst_downweight_mediahigh() {
     let result = burst::apply_burst_downweight(0.95);
-    assert!((result - 0.475).abs() < 1e-9, "0.95 * 0.5 = 0.475, got {}", result);
+    assert!(
+        (result - 0.475).abs() < 1e-9,
+        "0.95 * 0.5 = 0.475, got {}",
+        result
+    );
 }
 
 #[test]
 fn apply_burst_downweight_medialow() {
     let result = burst::apply_burst_downweight(0.20);
-    assert!((result - 0.10).abs() < 1e-9, "0.20 * 0.5 = 0.10, got {}", result);
+    assert!(
+        (result - 0.10).abs() < 1e-9,
+        "0.20 * 0.5 = 0.10, got {}",
+        result
+    );
 }

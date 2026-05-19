@@ -1,7 +1,7 @@
 use super::*;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
 fn restart_gate_first_call_triggers_returns_true() {
@@ -73,7 +73,10 @@ fn restart_gate_concurrent_callers_only_one_wins() {
         })
         .collect();
 
-    let wins: usize = handles.into_iter().map(|h| h.join().unwrap() as usize).sum();
+    let wins: usize = handles
+        .into_iter()
+        .map(|h| h.join().unwrap() as usize)
+        .sum();
     assert_eq!(wins, 1);
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert!(token.is_cancelled());

@@ -16,20 +16,22 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use syncback_core::cluster::{
-    issue_device_certificate, master_identity, ClusterState, DeviceCertificate,
+    ClusterState, DeviceCertificate, issue_device_certificate, master_identity,
 };
 use syncback_core::config::AppConfig;
 use syncback_core::db::Db;
 use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
-use syncback_core::types::{hex_encode, DeviceId, IdentityPub, Timestamp};
+use syncback_core::types::{DeviceId, IdentityPub, Timestamp, hex_encode};
 
 use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent};
 use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
-use crate::daemon::identity::{derive_keys, load_identity, IdentityError};
+use crate::daemon::identity::{IdentityError, derive_keys, load_identity};
 use crate::daemon::processor::Processor;
 use crate::daemon::relay::{RelayConfig, RelayManager};
 use crate::daemon::repair::RepairTrigger;
-use crate::daemon::restore::{RestoreConfig, RestoreCoordinator, RestoreError, RestoreRequest, RestoreResult};
+use crate::daemon::restore::{
+    RestoreConfig, RestoreCoordinator, RestoreError, RestoreRequest, RestoreResult,
+};
 use crate::daemon::scheduler::{PendingChallenges, Scheduler, SchedulerConfig};
 use crate::daemon::watcher::{WatcherCommand, WatcherConfig};
 
@@ -236,50 +238,44 @@ impl DaemonHandle {
         let device_id = DeviceId(keyfile.device_id);
 
         // ── 5. Initialize or load ClusterState ────────────────────────────────
-        let cluster_state: Option<Arc<Mutex<ClusterState>>> =
-            match ClusterState::load(db.clone()) {
-                Ok(state) => Some(Arc::new(Mutex::new(state))),
-                Err(syncback_core::cluster::ClusterStateError::NotInitialized) => {
-                    // First-time startup: register this device as the sole cluster member.
-                    let now = Timestamp::now();
-                    let cert: DeviceCertificate = issue_device_certificate(
-                        &master_key,
-                        device_id,
-                        now,
-                    );
-                    match ClusterState::init(db.clone(), identity_pub, cert, now, now) {
-                        Ok(state) => {
-                            tracing::info!("cluster state initialized (first device)");
-                            Some(Arc::new(Mutex::new(state)))
-                        }
-                        Err(e) => {
-                            tracing::error!("failed to init cluster state: {e}");
-                            None
-                        }
+        let cluster_state: Option<Arc<Mutex<ClusterState>>> = match ClusterState::load(db.clone()) {
+            Ok(state) => Some(Arc::new(Mutex::new(state))),
+            Err(syncback_core::cluster::ClusterStateError::NotInitialized) => {
+                // First-time startup: register this device as the sole cluster member.
+                let now = Timestamp::now();
+                let cert: DeviceCertificate = issue_device_certificate(&master_key, device_id, now);
+                match ClusterState::init(db.clone(), identity_pub, cert, now, now) {
+                    Ok(state) => {
+                        tracing::info!("cluster state initialized (first device)");
+                        Some(Arc::new(Mutex::new(state)))
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to init cluster state: {e}");
+                        None
                     }
                 }
-                Err(e) => {
-                    tracing::error!("failed to load cluster state: {e}");
-                    None
-                }
-            };
+            }
+            Err(e) => {
+                tracing::error!("failed to load cluster state: {e}");
+                None
+            }
+        };
 
         // ── 6. Create inter-subsystem channels ────────────────────────────────
         let (dirty_tx, dirty_rx) = mpsc::channel::<DirtyEvent>(256);
         let (restore_tx, restore_rx) = mpsc::channel::<(
             RestoreRequest,
-            tokio::sync::oneshot::Sender<Result<RestoreResult, crate::daemon::restore::RestoreError>>,
+            tokio::sync::oneshot::Sender<
+                Result<RestoreResult, crate::daemon::restore::RestoreError>,
+            >,
         )>(16);
         let (repair_tx, repair_rx) = mpsc::channel::<RepairTrigger>(64);
         let (backup_event_tx, backup_event_rx) =
             mpsc::channel::<crate::daemon::backup::BackupEvent>(64);
-        let (relay_sync_tx, relay_sync_rx) =
-            mpsc::channel::<crate::daemon::relay::SyncTrigger>(64);
-        let (relay_post_tx, relay_post_rx) =
-            mpsc::channel::<crate::daemon::relay::RelayPost>(256);
+        let (relay_sync_tx, relay_sync_rx) = mpsc::channel::<crate::daemon::relay::SyncTrigger>(64);
+        let (relay_post_tx, relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(256);
         // relay inbound messages → Processor dispatch_relay
-        let (inbound_tx, inbound_rx) =
-            mpsc::channel::<crate::daemon::relay::InboundMessage>(128);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<crate::daemon::relay::InboundMessage>(128);
 
         // ── 7. Build erasure encoder ──────────────────────────────────────────
         let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
@@ -302,7 +298,9 @@ impl DaemonHandle {
         // These are bound-per-holder symbol files written by the old backup pipeline.
         // After Wave 2, all symbols are raw and live in {block_hex}/raw/{esi}.bin.
         // This cleanup is fast (metadata-only scan) and idempotent.
-        if let Err(e) = crate::daemon::backup::pipeline::cleanup_legacy_bound_symbol_files(&symbols_dir) {
+        if let Err(e) =
+            crate::daemon::backup::pipeline::cleanup_legacy_bound_symbol_files(&symbols_dir)
+        {
             tracing::warn!("startup: cleanup_legacy_bound_symbol_files failed: {e}");
         }
 
@@ -391,8 +389,7 @@ impl DaemonHandle {
         };
 
         // ── 10. Build subsystems ──────────────────────────────────────────────
-        let source_block_size =
-            syncback_core::config::source_block_size_bytes(&app_config);
+        let source_block_size = syncback_core::config::source_block_size_bytes(&app_config);
 
         // ── Step A: Build live_configs Arc ────────────────────────────────────
         // Merge CLI watch_dirs with [[watch]] entries from config.
@@ -400,9 +397,10 @@ impl DaemonHandle {
             app_config.watch.clone();
         for dir in &cfg.watch_dirs {
             let dir_str = dir.to_string_lossy().to_string();
-            if !initial_watch_configs.iter().any(|wc| {
-                syncback_core::config::expand_watch_path(&wc.path) == *dir
-            }) {
+            if !initial_watch_configs
+                .iter()
+                .any(|wc| syncback_core::config::expand_watch_path(&wc.path) == *dir)
+            {
                 initial_watch_configs.push(syncback_core::config::WatchConfig {
                     path: dir_str,
                     importance_multiplier: syncback_core::config::DEFAULT_IMPORTANCE_MULTIPLIER,
@@ -518,8 +516,9 @@ impl DaemonHandle {
         ));
 
         // ── Step D.1: Create ConfigAdmin and RestartGate ──────────────────────
-        let config_admin =
-            Arc::new(crate::daemon::config_admin::ConfigAdmin::new(config_path.clone()));
+        let config_admin = Arc::new(crate::daemon::config_admin::ConfigAdmin::new(
+            config_path.clone(),
+        ));
         let restart_gate = Arc::new(crate::daemon::restart::RestartGate::new());
 
         // ── 12. Build DaemonState (shared with CliServer) ─────────────────────
@@ -689,11 +688,9 @@ impl DaemonHandle {
             let cancel_for_redial = cancel.clone();
             // 5 min real time, scaled (30 s on time_scale=10); floor 30 s so we
             // don't re-dial-storm a single offline peer.
-            let redial_interval = std::time::Duration::from_secs(
-                (300 / time_scale).max(30),
-            );
+            let redial_interval = std::time::Duration::from_secs((300 / time_scale).max(30));
             tasks.push(tokio::spawn(async move {
-                use libp2p::{multiaddr::Protocol, Multiaddr};
+                use libp2p::{Multiaddr, multiaddr::Protocol};
                 use std::str::FromStr;
 
                 async fn redial_known_peers(
@@ -793,8 +790,7 @@ impl DaemonHandle {
             let admin_for_refresh = Arc::clone(admin);
             let cancel_refresh = cancel.clone();
             tasks.push(tokio::spawn(async move {
-                let mut ticker =
-                    tokio::time::interval(std::time::Duration::from_secs(300));
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
                 ticker.tick().await; // skip immediate tick (done in WatchAdmin::new)
                 loop {
                     tokio::select! {
@@ -815,7 +811,11 @@ impl DaemonHandle {
                 None
             } else {
                 let p = std::path::PathBuf::from(&app_config.web_api.static_dir);
-                Some(if p.is_absolute() { p } else { cfg.data_dir.join(p) })
+                Some(if p.is_absolute() {
+                    p
+                } else {
+                    cfg.data_dir.join(p)
+                })
             };
             let web_config = crate::daemon::web_api::WebApiConfig {
                 bind: app_config.web_api.bind.clone(),
@@ -913,13 +913,9 @@ impl DaemonHandle {
             {
                 let work_pipeline_config = crate::daemon::work_pipeline::WorkPipelineConfig {
                     // Cooldown: 30s in production. Scale with time_scale for demos/tests.
-                    cooldown: std::time::Duration::from_secs(
-                        (30 / time_scale).max(1),
-                    ),
+                    cooldown: std::time::Duration::from_secs((30 / time_scale).max(1)),
                     // Tick interval: 60s in production. Scale with time_scale.
-                    tick_interval: std::time::Duration::from_secs(
-                        (60 / time_scale).max(1),
-                    ),
+                    tick_interval: std::time::Duration::from_secs((60 / time_scale).max(1)),
                     completion_bonus_coef: app_config.reliability.completion_bonus_coefficient,
                     device_id,
                     epoch_key: epoch_key_bytes,
@@ -936,14 +932,14 @@ impl DaemonHandle {
                     cluster_state.clone(),
                     work_event_rx,
                 );
-                tasks.push(tokio::spawn(async move {
-                    worker.run().await
-                }));
+                tasks.push(tokio::spawn(async move { worker.run().await }));
             }
 
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {
-                processor.run(swarm_event_rx_for_processor, inbound_rx, cancel_processor).await
+                processor
+                    .run(swarm_event_rx_for_processor, inbound_rx, cancel_processor)
+                    .await
             }));
 
             // ── Cluster periodic sync ──────────────────────────────────────────
@@ -1062,8 +1058,14 @@ impl DaemonHandle {
             tasks.push(tokio::spawn(async move {
                 if let Some(swarm) = ss_swarm {
                     if let Err(e) = crate::daemon::system_state::run_periodic_push(
-                        ss_db, swarm, ss_seed, ss_interval, cancel_ss,
-                    ).await {
+                        ss_db,
+                        swarm,
+                        ss_seed,
+                        ss_interval,
+                        cancel_ss,
+                    )
+                    .await
+                    {
                         tracing::error!(error = %e, "system_state periodic push failed");
                     }
                 } else {
@@ -1097,7 +1099,8 @@ impl DaemonHandle {
                     time_scale,
                     cleanup_master_key,
                     cleanup_cancel,
-                ).await
+                )
+                .await
             }));
         }
 
@@ -1108,7 +1111,8 @@ impl DaemonHandle {
             let integrity_relay = relay_post_tx.clone();
             let integrity_cancel = cancel.clone();
             let integrity_master_key = master_key.clone();
-            let integrity_interval = syncback_core::constants::DEFAULT_HOLDINGS_INTEGRITY_INTERVAL_SECS;
+            let integrity_interval =
+                syncback_core::constants::DEFAULT_HOLDINGS_INTEGRITY_INTERVAL_SECS;
             tasks.push(tokio::spawn(async move {
                 crate::daemon::holdings_integrity::run(
                     integrity_db,
@@ -1191,8 +1195,8 @@ async fn open_db_with_retry(path: &std::path::Path) -> Result<Db, anyhow::Error>
             }
             Err(e) => {
                 let msg = e.to_string();
-                let is_lock = msg.contains("Database already open")
-                    || msg.contains("Cannot acquire lock");
+                let is_lock =
+                    msg.contains("Database already open") || msg.contains("Cannot acquire lock");
                 if !is_lock {
                     return Err(e.into());
                 }

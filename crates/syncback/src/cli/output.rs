@@ -135,12 +135,24 @@ pub fn format_restore(data: &RestoreData) {
 pub fn format_restore_blocked(b: &RestoreBlocker) {
     eprintln!("restore blocked:");
     match b {
-        RestoreBlocker::InsufficientPlacements { have, need, holders_offline } => {
-            eprintln!("  reason: not enough live holders ({have}/{need} symbols, ~{holders_offline} offline)");
+        RestoreBlocker::InsufficientPlacements {
+            have,
+            need,
+            holders_offline,
+        } => {
+            eprintln!(
+                "  reason: not enough live holders ({have}/{need} symbols, ~{holders_offline} offline)"
+            );
             eprintln!("  hint:   wait for offline peers to come back, or trigger repair");
         }
-        RestoreBlocker::EscrowLocked { budget_gb, needed_gb, est_seconds } => {
-            eprintln!("  reason: holders refused via escrow (budget {budget_gb:.2} GB, needed {needed_gb:.2} GB)");
+        RestoreBlocker::EscrowLocked {
+            budget_gb,
+            needed_gb,
+            est_seconds,
+        } => {
+            eprintln!(
+                "  reason: holders refused via escrow (budget {budget_gb:.2} GB, needed {needed_gb:.2} GB)"
+            );
             if let Some(s) = est_seconds {
                 eprintln!("  eta:    ~{} sec until budget catches up", s);
             } else {
