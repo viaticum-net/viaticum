@@ -175,6 +175,29 @@ async fn full_lifecycle_e2e() {
     let blocks_after_step1 = db.list_all_source_blocks().unwrap().len();
     eprintln!("[E2E] Step 1: 3 files backed up ({} source blocks)", blocks_after_step1);
 
+    // Wave 11b: write raw symbol files for v0 blocks so version-specific restore works.
+    // These simulate what holder nodes would store. The restore path reads raw/{esi}.bin
+    // from symbols_dir if present (local fallback before network fetch).
+    {
+        use syncback_core::erasure::ErasureEncoder;
+        use syncback_core::types::{hex_encode, ErasureParams};
+        let encoder = RaptorQEncoder::new();
+        for block in db.list_all_source_blocks().unwrap() {
+            if let Some(enc_size) = block.encrypted_size {
+                let blob = syncback::daemon::backup::pipeline::rebuild_source_blob(
+                    &db, &block, &EPOCH_KEY,
+                ).await.unwrap();
+                let params = ErasureParams::compute(enc_size, 0.5).unwrap();
+                let raws = encoder.encode_raw(&blob, &params, 0, params.k_eff).unwrap();
+                let raw_dir = symbols_dir.path().join(hex_encode(&block.block_id.0)).join("raw");
+                std::fs::create_dir_all(&raw_dir).unwrap();
+                for sym in &raws {
+                    std::fs::write(raw_dir.join(format!("{}.bin", sym.esi)), &sym.data).unwrap();
+                }
+            }
+        }
+    }
+
     // ── Step 2: Modify photo.jpg → creates second version ────────────────────
 
     let new_photo_content: Vec<u8> =

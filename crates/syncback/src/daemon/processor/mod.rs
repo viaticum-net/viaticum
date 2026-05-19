@@ -186,6 +186,10 @@ pub struct Processor {
     /// Used to sign PosHashNackMsg (holder side) and other protocol messages requiring
     /// master identity proof.
     master_signing_key: ed25519_dalek::SigningKey,
+    /// Channel to notify the WorkPipeline worker of peer authentication events.
+    /// When Some: `on_peer_authenticated` sends `WorkEvent::PeerAuthenticated`.
+    /// None in tests that do not wire the work pipeline.
+    pub(crate) work_event_tx: Option<mpsc::Sender<crate::daemon::work_pipeline::WorkEvent>>,
 }
 
 impl Processor {
@@ -233,7 +237,18 @@ impl Processor {
             accepted_offers,
             peer_cert_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             master_signing_key,
+            work_event_tx: None,
         }
+    }
+
+    /// Set the work event sender for the unified pipeline worker.
+    ///
+    /// Called from `handle/mod.rs::start()` after constructing both Processor and WorkPipeline.
+    pub fn set_work_event_tx(
+        &mut self,
+        tx: mpsc::Sender<crate::daemon::work_pipeline::WorkEvent>,
+    ) {
+        self.work_event_tx = Some(tx);
     }
 
     /// Main loop: receive ProtocolEvents from the libp2p swarm and relay-board messages.

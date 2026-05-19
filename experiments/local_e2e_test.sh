@@ -103,24 +103,35 @@ echo "=== Phase 1: Setup ==="
 
 mkdir -p "$TEST_DIR"
 
-# Init all nodes
-echo "  Initializing ${NUM_NODES} nodes..."
-for i in $(seq 0 $((NUM_NODES-1))); do
-    run_cli "$i" init > /dev/null 2>&1 &
-done
-wait
-echo "  ${NUM_NODES} nodes initialized."
+# Init node-00 first, capture mnemonic for shared cluster identity.
+# All nodes must share the same cluster master key to authenticate each other.
+echo "  Initializing node-00 (cluster master)..."
+mkdir -p "$(node_dir 0)"
+MNEMONIC=$("$BINARY" --data-dir "$(node_dir 0)" init 2>&1 | grep -A 2 "Mnemonic" | tail -1 | xargs)
+echo "  Mnemonic: ${MNEMONIC:0:20}..."
 
-# Set disk_reserve_gb=0 so tests work on low-disk machines.
+# Init other nodes as new devices in the same cluster (same master key, different device key).
+echo "  Initializing other nodes as cluster devices..."
+for i in $(seq 1 $((NUM_NODES-1))); do
+    mkdir -p "$(node_dir "$i")"
+    "$BINARY" --data-dir "$(node_dir "$i")" init --mnemonic "$MNEMONIC" --new-device > /dev/null 2>&1
+done
+echo "  ${NUM_NODES} nodes initialized (shared cluster master key)."
+
+# Write config for all nodes.
 for i in $(seq 0 $((NUM_NODES-1))); do
     cat > "$(node_dir "$i")/config.toml" << 'CFGEOF'
+[web_api]
+enabled = true
+bind = "127.0.0.1:0"
 [storage]
 disk_reserve_gb = 0.0
-
 [escrow]
 k_factor = 0.001
 CFGEOF
 done
+
+# Config already written during init (above). No additional config setup needed.
 
 # Start all daemons
 echo "  Starting daemons (time_scale=${TIME_SCALE})..."
@@ -156,10 +167,20 @@ for i in $(seq 1 $((NUM_NODES-1))); do
         ((CONNECT_OK++)) || true
     fi
 done
-sleep 2
+# Wait for peer authentication (libp2p cert exchange takes a few seconds).
+# Retry for up to 30s.
+CONNECT_PASS=0
+for attempt in $(seq 1 30); do
+    PC=$(get_json_field 0 peer_count)
+    if [ "${PC:-0}" -ge "$((NUM_NODES-1))" ]; then
+        CONNECT_PASS=1
+        break
+    fi
+    sleep 1
+done
 PC=$(get_json_field 0 peer_count)
 echo "  node-00 peers: ${PC:-0}/$((NUM_NODES-1))"
-[ "${PC:-0}" -ge "$((NUM_NODES-1))" ] \
+[ "$CONNECT_PASS" -eq 1 ] \
     && pass "star connect: ${PC} peers" \
     || fail "star connect: only ${PC:-0} peers"
 
@@ -195,9 +216,10 @@ else
 fi
 
 # Wait for placements (symbols sent to peers)
-echo "  Waiting for symbol placement (max 30s)..."
+# Wave 11b: worker runs on 1s tick (time_scale=1000); authentication needs ~10s.
+echo "  Waiting for symbol placement (max 60s)..."
 PLACED=0
-for attempt in $(seq 1 30); do
+for attempt in $(seq 1 60); do
     # Check table_stats for symbol_placements > 0
     PLACEMENTS=$(run_cli_q 0 status --json 2>/dev/null \
         | grep -oE '"symbol_placements":\s*[0-9]+' | grep -oE '[0-9]+$')
@@ -225,27 +247,26 @@ else
     # Wait a bit for symbols to be delivered
     sleep 5
 
-    RESTORE_DEST="$(node_dir 0)/restored"
-    mkdir -p "$RESTORE_DEST"
     RESTORE_PATH="$(node_dir 0)/files/backup_test.bin"
-    echo "  Restoring $RESTORE_PATH to $RESTORE_DEST..."
+    RESTORE_DIR="$(node_dir 0)"
+    echo "  Restoring $RESTORE_PATH (to staging dir)..."
 
     set +e
-    RESTORE_OUTPUT=$(run_cli 0 restore "$RESTORE_PATH" --dest "$RESTORE_DEST" 2>&1)
+    RESTORE_OUTPUT=$(run_cli 0 restore "$RESTORE_PATH" 2>&1)
     RESTORE_EXIT=$?
     set -e
 
     echo "$RESTORE_OUTPUT"
 
     if [ $RESTORE_EXIT -eq 0 ]; then
-        # Restore is async — wait for the file to appear (max 30s)
-        # File path in DB is absolute; restore strips leading '/' and joins with dest dir
-        RESTORED_FILE=$(find "$RESTORE_DEST" -name "backup_test.bin" -type f 2>/dev/null | head -1)
-        echo "  Waiting for restored file (async, max 30s)..."
+        # Restore writes to staging directory under data-dir/restore/
+        RESTORE_STAGING=$(find "$RESTORE_DIR/restore" -name "backup_test.bin" -type f 2>/dev/null | head -1)
+        echo "  Waiting for restored file in staging dir (max 30s)..."
         RESTORE_OK=0
         for attempt in $(seq 1 30); do
-            if [ -n "$RESTORED_FILE" ] && [ -f "$RESTORED_FILE" ]; then
-                RESTORED_MD5=$(md5sum "$RESTORED_FILE" | awk '{print $1}')
+            RESTORE_STAGING=$(find "$RESTORE_DIR/restore" -name "backup_test.bin" -type f 2>/dev/null | head -1)
+            if [ -n "$RESTORE_STAGING" ] && [ -f "$RESTORE_STAGING" ]; then
+                RESTORED_MD5=$(md5sum "$RESTORE_STAGING" | awk '{print $1}')
                 if [ "$ORIG_MD5" = "$RESTORED_MD5" ]; then
                     pass "file restored and verified (MD5 match, ${attempt}s)"
                     RESTORE_OK=1

@@ -28,7 +28,7 @@ use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
 use crate::daemon::identity::{derive_keys, load_identity, IdentityError};
 use crate::daemon::processor::Processor;
 use crate::daemon::relay::{RelayConfig, RelayManager};
-use crate::daemon::repair::{RepairAgent, RepairConfig, RepairTrigger};
+use crate::daemon::repair::RepairTrigger;
 use crate::daemon::restore::{RestoreConfig, RestoreCoordinator, RestoreError, RestoreRequest, RestoreResult};
 use crate::daemon::scheduler::{PendingChallenges, Scheduler, SchedulerConfig};
 use crate::daemon::watcher::{WatcherCommand, WatcherConfig};
@@ -490,19 +490,9 @@ impl DaemonHandle {
             encoder.clone(),
         );
 
-        let repair = RepairAgent::new(
-            db.clone(),
-            RepairConfig {
-                source_blocks_dir: symbols_dir.clone(),
-                symbols_dir: symbols_dir.clone(),
-                epoch_key: epoch_key_bytes,
-                own_identity: identity_pub,
-                master_signing_key: Some(master_key.clone()),
-                swarm: swarm_handle_arc.clone(),
-                peer_backoff: Some(Arc::clone(&peer_backoff)),
-            },
-            encoder.clone(),
-        );
+        // RepairAgent is now only used for periodic reliability_scan (Wave 11b).
+        // The repair instance is created in the reliability_scan task below.
+        // The old repair.run() task is replaced by the WorkPipeline worker.
 
         let board_path = cfg.data_dir.join("relay.board");
         let relay = RelayManager::new(RelayConfig {
@@ -586,14 +576,80 @@ impl DaemonHandle {
 
         // ── 14. Compute scan interval (scaled by time_scale) ──────────────────
         let time_scale = cfg.time_scale.max(1);
-        let repair_interval_secs = (3600 / time_scale).max(1);
+        let reliability_scan_interval_secs = (3600 / time_scale).max(1);
+
+        // ── 14.5. Create WorkPipeline channel ────────────────────────────────
+        let (work_event_tx, work_event_rx) =
+            tokio::sync::mpsc::channel::<crate::daemon::work_pipeline::WorkEvent>(64);
 
         // ── 15. Spawn subsystem tasks ─────────────────────────────────────────
         let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
 
         tasks.push(tokio::spawn(backup.run(dirty_rx, backup_event_rx)));
         tasks.push(tokio::spawn(restore.run(restore_rx)));
-        tasks.push(tokio::spawn(repair.run(repair_interval_secs, repair_rx)));
+
+        // Wave 11b: RepairAgent::run() replaced by WorkPipeline worker + periodic reliability_scan.
+        // RepairTrigger channel (repair_rx) is forwarded to work_event_tx to wake the worker.
+        {
+            let work_event_tx_relay = work_event_tx.clone();
+            let cancel_relay = cancel.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut repair_rx = repair_rx;
+                loop {
+                    tokio::select! {
+                        _ = cancel_relay.cancelled() => break,
+                        maybe_trigger = repair_rx.recv() => {
+                            match maybe_trigger {
+                                None => break,
+                                Some(_trigger) => {
+                                    // Wake the worker: a PoS failure or explicit trigger
+                                    // means a placement is now Lost — worker will pick it up.
+                                    let _ = work_event_tx_relay.try_send(
+                                        crate::daemon::work_pipeline::WorkEvent::DirtyFileEnqueued,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+
+        // Periodic reliability scan (keeps cached fields consistent as a safety net).
+        {
+            let repair_for_scan = crate::daemon::repair::RepairAgent::new(
+                db.clone(),
+                crate::daemon::repair::RepairConfig {
+                    source_blocks_dir: symbols_dir.clone(),
+                    symbols_dir: symbols_dir.clone(),
+                    epoch_key: epoch_key_bytes,
+                    own_identity: identity_pub,
+                    master_signing_key: Some(master_key.clone()),
+                    swarm: swarm_handle_arc.clone(),
+                    peer_backoff: Some(Arc::clone(&peer_backoff)),
+                },
+                encoder.clone(),
+            );
+            let cancel_scan = cancel.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(
+                    tokio::time::Duration::from_secs(reliability_scan_interval_secs),
+                );
+                ticker.tick().await; // skip immediate tick
+                loop {
+                    tokio::select! {
+                        _ = cancel_scan.cancelled() => break Ok(()),
+                        _ = ticker.tick() => {
+                            let updated = repair_for_scan.reliability_scan().await;
+                            if updated > 0 {
+                                tracing::info!(updated, "reliability_scan: background pass complete");
+                            }
+                        }
+                    }
+                }
+            }));
+        }
 
         // ── 9.2. Spawn staging cleanup checker (warn if staging dir is large) ──
         {
@@ -828,7 +884,7 @@ impl DaemonHandle {
                 }
             };
 
-            let processor = Processor::new(
+            let mut processor = Processor::new(
                 db.clone(),
                 identity_pub,
                 repair_tx_for_processor,
@@ -849,6 +905,42 @@ impl DaemonHandle {
                 accepted_offers.clone(),
                 master_key.clone(),
             );
+            // Wire WorkPipeline event channel to Processor so on_peer_authenticated
+            // sends WorkEvent::PeerAuthenticated to wake the worker.
+            processor.set_work_event_tx(work_event_tx.clone());
+
+            // ── Spawn WorkPipeline worker ──────────────────────────────────────
+            {
+                let work_pipeline_config = crate::daemon::work_pipeline::WorkPipelineConfig {
+                    // Cooldown: 30s in production. Scale with time_scale for demos/tests.
+                    cooldown: std::time::Duration::from_secs(
+                        (30 / time_scale).max(1),
+                    ),
+                    // Tick interval: 60s in production. Scale with time_scale.
+                    tick_interval: std::time::Duration::from_secs(
+                        (60 / time_scale).max(1),
+                    ),
+                    completion_bonus_coef: app_config.reliability.completion_bonus_coefficient,
+                    device_id,
+                    epoch_key: epoch_key_bytes,
+                    min_pool_size: 2,
+                    time_scale,
+                };
+                let worker = crate::daemon::work_pipeline::WorkPipeline::new(
+                    db.clone(),
+                    work_pipeline_config,
+                    encoder.clone(),
+                    swarm_handle_arc.clone(),
+                    Some(master_key.clone()),
+                    Some(Arc::clone(&peer_backoff)),
+                    cluster_state.clone(),
+                    work_event_rx,
+                );
+                tasks.push(tokio::spawn(async move {
+                    worker.run().await
+                }));
+            }
+
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {
                 processor.run(swarm_event_rx_for_processor, inbound_rx, cancel_processor).await
@@ -1043,6 +1135,7 @@ impl DaemonHandle {
             drop(repair_tx);
             drop(relay_sync_tx);
             drop(relay_post_tx);
+            drop(work_event_tx);
         });
 
         // ── 16. Log startup ───────────────────────────────────────────────────

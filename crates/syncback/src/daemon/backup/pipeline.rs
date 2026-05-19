@@ -9,7 +9,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use syncback_core::constants::MIN_BATCH_BYTES;
 use syncback_core::db::Db;
-use syncback_core::erasure::{binding_seed, ErasureEncoder, Symbol};
+use syncback_core::erasure::{binding_seed, ErasureEncoder};
 use syncback_core::cluster::esi_namespace_start;
 use syncback_core::placement::{compute_allocation_with_importance, HolderCandidate, PlacementError};
 use syncback_core::reliability;
@@ -20,7 +20,7 @@ use syncback_core::reliability;
 /// within-bucket jitter (maximum ~0.02 from burst downweighting).
 const IMPORTANCE_FLUSH_EPSILON: f64 = 0.05;
 use syncback_core::types::{
-    hex_encode, DeviceId, ErasureParams, Event, EventEntry, FileId, PlacementStatus,
+    DeviceId, ErasureParams, Event, EventEntry, FileId, PlacementStatus,
     SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement,
     Timestamp,
 };
@@ -120,7 +120,7 @@ pub fn decrypt_and_decompress(stored: &[u8], epoch_key: &[u8; 32]) -> anyhow::Re
 pub fn run_pipeline(
     db: &Db,
     config: &BackupConfig,
-    encoder: &Arc<dyn ErasureEncoder>,
+    _encoder: &Arc<dyn ErasureEncoder>,
     files: &[(QueuedFile, Vec<u8>)],
     block_type_tag: BlockTypeTag,
     candidates: &[HolderCandidate],
@@ -196,43 +196,11 @@ pub fn run_pipeline(
         vec![]
     };
 
-    // 6. Encode raw symbols once and write to {block_dir}/raw/{esi}.bin
-    let symbols_block_dir = config.symbols_dir.join(hex_encode(&block_id.0));
-    std::fs::create_dir_all(&symbols_block_dir)
-        .map_err(|e| anyhow::anyhow!("create symbols dir: {e}"))?;
-
-    // Also save the stored blob alongside symbols for RepairAgent use.
-    // Path: {symbols_dir}/{block_id_hex}/block.bin
-    let block_blob_path = symbols_block_dir.join("block.bin");
-    std::fs::write(&block_blob_path, &stored)
-        .map_err(|e| anyhow::anyhow!("write block.bin: {e}"))?;
+    // 6. (Wave 11b) No disk writes — raw symbols are not persisted.
+    // The WorkPipeline worker re-encodes from source on its next iteration.
+    // block.bin and raw/{esi}.bin are never written after Wave 11b.
 
     let mut symbol_count_per_holder: Vec<(DeviceId, u32)> = Vec::new();
-
-    // Compute total ESI span across all allocations.
-    // encode_raw requires a contiguous range: start_esi..start_esi+total_count.
-    // compute_allocation assigns contiguous ESI ranges starting at esi_offset.
-    let total_count: u32 = allocations_result.iter().map(|a| a.symbol_count).sum();
-
-    let raw_symbols: Vec<Symbol> = if total_count > 0 && !allocations_result.is_empty() {
-        let raw_dir = symbols_block_dir.join("raw");
-        std::fs::create_dir_all(&raw_dir)
-            .map_err(|e| anyhow::anyhow!("create raw dir: {e}"))?;
-
-        // One RaptorQ run for all holders combined.
-        let raws = encoder.encode_raw(&stored, &params, esi_offset, total_count)?;
-
-        // Write raw symbols to disk (holder-agnostic, used by repair).
-        for raw in &raws {
-            let raw_path = raw_dir.join(format!("{}.bin", raw.esi));
-            std::fs::write(&raw_path, &raw.data)
-                .map_err(|e| anyhow::anyhow!("write raw symbol {}: {e}", raw.esi))?;
-        }
-
-        raws
-    } else {
-        vec![]
-    };
 
     // Record per-holder counts (binding applied at delivery time, not here).
     for alloc in &allocations_result {
@@ -346,8 +314,6 @@ pub fn run_pipeline(
         symbol_count_per_holder,
         stored_size: stored.len() as u64,
         importance: pack_importance,
-        raw_symbols,
-        esi_offset,
     })
 }
 
@@ -492,63 +458,43 @@ pub fn update_backed_up_at(
     Ok(())
 }
 
-/// Read raw (unbound) symbol files from the `raw/` subdirectory.
-///
-/// Path: `{symbols_dir}/{block_hex}/raw/{esi}.bin`
-/// Returns symbols in ESI order. Returns error if any file cannot be read.
-///
-/// Used by repair to load raw symbols without re-encoding.
-pub(crate) fn read_raw_symbols_for_block(
-    symbols_dir: &std::path::Path,
-    block_id: &syncback_core::types::SourceBlockId,
-    esi_ranges: &[(u32, u32)],
-) -> anyhow::Result<Vec<Symbol>> {
-    let raw_dir = symbols_dir
-        .join(hex_encode(&block_id.0))
-        .join("raw");
-    let mut symbols = Vec::new();
+// Note: read_raw_symbols_for_block and read_symbols_for_holder were removed in
+// Wave 11b. Raw symbol files are no longer written after Wave 11b; the pipeline
+// produces only DB records. The WorkPipeline worker re-encodes from source on delivery.
 
-    for &(start_esi, count) in esi_ranges {
-        for esi in start_esi..start_esi + count {
-            let path = raw_dir.join(format!("{esi}.bin"));
-            let data = std::fs::read(&path)
-                .map_err(|e| anyhow::anyhow!("read raw symbol {}: {e}", path.display()))?;
-            symbols.push(Symbol { esi, data });
-        }
+/// Rebuild the encrypted blob for a SourceBlockRecord by reading source files,
+/// compressing, and re-encrypting with the epoch key. Verifies blake3(blob) == block_id.
+///
+/// This is the primary path for the unified worker (Wave 11b) to obtain the source
+/// blob without any on-disk block.bin cache. It is also used by the restore path
+/// as a fallback when fetching symbols from holders fails.
+///
+/// CPU-bound portion (`compress_and_encrypt`) runs inside `spawn_blocking`.
+pub async fn rebuild_source_blob(
+    db: &syncback_core::db::Db,
+    block_record: &syncback_core::types::SourceBlockRecord,
+    epoch_key: &[u8; 32],
+) -> anyhow::Result<Vec<u8>> {
+    let plaintext = crate::daemon::backup::packing::rebuild_plaintext_from_db(db, block_record)
+        .map_err(|e| anyhow::anyhow!("rebuild plaintext: {e}"))?;
+
+    let epoch_key_owned = *epoch_key;
+    let stored = tokio::task::spawn_blocking(move || {
+        compress_and_encrypt(&plaintext, &epoch_key_owned)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))?
+    .map_err(|e| anyhow::anyhow!("compress_and_encrypt: {e}"))?;
+
+    let hash: [u8; 32] = *blake3::hash(&stored).as_bytes();
+    if hash != block_record.block_id.0 {
+        anyhow::bail!(
+            "rebuilt blob hash {} != expected {}",
+            syncback_core::types::hex_encode(&hash),
+            block_record.block_id
+        );
     }
-
-    Ok(symbols)
-}
-
-/// Read symbol files for a given holder from the symbols directory.
-///
-/// Reads files named `{esi}.bin` for each ESI in `esi_ranges`.
-/// Returns `Vec<Symbol>` in ESI order.
-/// Returns error if any file cannot be read.
-///
-/// # Deprecated
-/// Wave 2 replaced per-holder bound symbol files with raw symbols in `raw/` subdir.
-/// Use `read_raw_symbols_for_block` instead. This function is kept for any
-/// legacy caller; will be removed in Wave 4.
-#[allow(dead_code)]
-pub(crate) fn read_symbols_for_holder(
-    symbols_dir: &std::path::Path,
-    block_id: &syncback_core::types::SourceBlockId,
-    esi_ranges: &[(u32, u32)],
-) -> anyhow::Result<Vec<Symbol>> {
-    let block_dir = symbols_dir.join(hex_encode(&block_id.0));
-    let mut symbols = Vec::new();
-
-    for &(start_esi, count) in esi_ranges {
-        for esi in start_esi..start_esi + count {
-            let path = block_dir.join(format!("{esi}.bin"));
-            let data = std::fs::read(&path)
-                .map_err(|e| anyhow::anyhow!("read symbol {}: {e}", path.display()))?;
-            symbols.push(Symbol { esi, data });
-        }
-    }
-
-    Ok(symbols)
+    Ok(stored)
 }
 
 /// Scan `symbols_dir` and remove any legacy flat `{esi}.bin` files

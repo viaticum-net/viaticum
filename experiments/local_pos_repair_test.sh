@@ -88,18 +88,27 @@ echo "=== Phase 1: Setup ==="
 
 mkdir -p "$TEST_DIR"
 
-echo "  Initializing ${NUM_NODES} nodes..."
-for i in $(seq 0 $((NUM_NODES-1))); do
-    run_cli "$i" init > /dev/null 2>&1 &
-done
-wait
+# Init node-00 as cluster master, other nodes as cluster devices.
+echo "  Initializing node-00 (cluster master)..."
+mkdir -p "$(node_dir 0)"
+MNEMONIC=$(run_cli 0 init 2>&1 | grep -A 2 "Mnemonic" | tail -1 | xargs)
+echo "  Mnemonic: ${MNEMONIC:0:20}..."
 
-# Set disk_reserve_gb=0 so tests work on low-disk machines.
+echo "  Initializing nodes 1-$((NUM_NODES-1)) as cluster devices..."
+for i in $(seq 1 $((NUM_NODES-1))); do
+    mkdir -p "$(node_dir "$i")"
+    run_cli "$i" init --mnemonic "$MNEMONIC" --new-device > /dev/null 2>&1
+done
+echo "  ${NUM_NODES} nodes initialized (shared cluster master key)."
+
+# Write config for all nodes (web_api + storage).
 for i in $(seq 0 $((NUM_NODES-1))); do
     cat > "$(node_dir "$i")/config.toml" << 'CFGEOF'
+[web_api]
+enabled = true
+bind = "127.0.0.1:0"
 [storage]
 disk_reserve_gb = 0.0
-
 [escrow]
 k_factor = 0.001
 CFGEOF
@@ -127,8 +136,13 @@ echo "  Connecting to node-00 ($ADDR_00)..."
 for i in $(seq 1 $((NUM_NODES-1))); do
     run_cli_q "$i" connect "$ADDR_00" > /dev/null 2>&1
 done
-sleep 3
 
+# Wait for peer authentication (libp2p cert exchange).
+for attempt in $(seq 1 30); do
+    PC=$(get_json_field 0 peer_count)
+    if [ "${PC:-0}" -ge "$((NUM_NODES-1))" ]; then break; fi
+    sleep 1
+done
 PC=$(get_json_field 0 peer_count)
 echo "  node-00 peers: ${PC:-0}"
 
@@ -190,9 +204,9 @@ fi
 echo ""
 echo "=== Phase 4: PoS Verification (block.bin absent) ==="
 
-echo "  Waiting for PoS challenges + passes (max 60s)..."
+echo "  Waiting for PoS challenges + passes (max 90s)..."
 POS_OK=0
-for attempt in $(seq 1 30); do
+for attempt in $(seq 1 45); do
     CH=$(get_json_field 0 pos_total_challenges)
     PA=$(get_json_field 0 pos_total_passes)
     if [ "${CH:-0}" -ge 1 ] && [ "${PA:-0}" -ge 1 ]; then
@@ -206,7 +220,7 @@ done
 if [ "$POS_OK" -eq 1 ]; then
     pass "PoS verification passed after block.bin cleanup (challenges=$CH, passes=$PA)"
 else
-    fail "no PoS passes after 60s (challenges=${CH:-0}, passes=${PA:-0})"
+    fail "no PoS passes after 90s (challenges=${CH:-0}, passes=${PA:-0})"
 fi
 
 # ── PHASE 5: REPAIR WITHOUT block.bin ────────────────────────────

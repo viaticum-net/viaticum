@@ -127,6 +127,14 @@ impl Processor {
         } else {
             debug!(device = %device_id, "processor: sent PeerAnnounce after authentication");
         }
+
+        // 5. Notify WorkPipeline worker (if wired) to reset cooldowns and wake.
+        if let Some(tx) = &self.work_event_tx {
+            let event = crate::daemon::work_pipeline::WorkEvent::PeerAuthenticated { device_id };
+            if let Err(e) = tx.try_send(event) {
+                debug!(device = %device_id, err = %e, "processor: work_event_tx send failed (pipeline busy or uninitialized)");
+            }
+        }
     }
 
     /// Called when libp2p identify delivers a peer's listen addresses for an

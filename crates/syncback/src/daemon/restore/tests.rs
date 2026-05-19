@@ -404,8 +404,19 @@ async fn restore_pack_multiple_files_roundtrip() {
     }
 }
 
+/// Wave 11b: restore_specific_version_by_index
+///
+/// After Wave 11b, restoring historical versions requires the source file to still exist
+/// (rebuild_source_blob path) or symbols in holders (network path).
+/// This test now verifies version selection logic using files that still exist on disk:
+/// v1 content is restored first, then v2 is backed up, and we restore v2 (still on disk).
+/// For v1 restore, we write raw symbol files manually to simulate what a holder would store,
+/// allowing the local raw symbol path to work as a test scaffold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_specific_version_by_index() {
+    use syncback_core::erasure::{ErasureEncoder, RaptorQEncoder};
+    use syncback_core::types::{hex_encode, ErasureParams};
+
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
     let files_dir = TempDir::new().unwrap();
@@ -416,9 +427,35 @@ async fn restore_specific_version_by_index() {
     let path = write_file(&files_dir, path_name, b"version one content");
     let mut backup = test_backup_coord(db.clone(), &symbols_dir);
     backup.process_event(added_event(&path)).unwrap();
-    backup.flush_all(true, &Default::default()).unwrap();
+    let v1_results = backup.flush_all(true, &Default::default()).unwrap();
+    assert_eq!(v1_results.len(), 1, "v1 should produce 1 block");
+    let v1_block_id = v1_results[0].source_block_id;
 
-    // Modify file, backup v2
+    // Write v1 raw symbols to disk manually (test scaffold for the local raw path).
+    // This simulates what the old pipeline wrote; after Wave 11b the pipeline doesn't
+    // write these, but we need them here to test version-specific restore without a swarm.
+    {
+        let encoder = RaptorQEncoder::new();
+        let v1_blob = crate::daemon::backup::pipeline::rebuild_source_blob(
+            &db,
+            &db.get_source_block(&v1_block_id).unwrap().unwrap(),
+            &TEST_EPOCH_KEY, // same epoch_key as test_backup_coord
+        )
+        .await
+        .unwrap();
+        let stored_size = v1_blob.len() as u64;
+        let params = ErasureParams::compute(stored_size, 0.5).unwrap();
+        let raws = encoder.encode_raw(&v1_blob, &params, 0, params.k_eff).unwrap();
+        let raw_dir = symbols_dir.path()
+            .join(hex_encode(&v1_block_id.0))
+            .join("raw");
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        for sym in &raws {
+            std::fs::write(raw_dir.join(format!("{}.bin", sym.esi)), &sym.data).unwrap();
+        }
+    }
+
+    // Modify file, backup v2 (source file now has different content)
     std::fs::write(&path, b"version two content").unwrap();
     backup
         .process_event(DirtyEvent {
@@ -438,7 +475,8 @@ async fn restore_specific_version_by_index() {
         .count();
     assert_eq!(backed_up_count, 2, "should have 2 backed-up versions");
 
-    // Restore version index 0 (the first)
+    // Restore version index 0 (the first — v1 with "version one content")
+    // Uses the raw/ files we wrote above.
     let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
     let request_v0 = super::RestoreRequest {
         path: path.clone(),
@@ -453,7 +491,7 @@ async fn restore_specific_version_by_index() {
     let out_v0 = std::fs::read(result.staging_path.join(rel)).unwrap();
     assert_eq!(out_v0, b"version one content");
 
-    // Restore latest (should be v2) — use a different job_id for separate staging dir
+    // Restore latest (v2, "version two content" — still on disk, rebuild works)
     let request_latest = super::RestoreRequest {
         path: path.clone(),
         version_selector: VersionSelector::Latest,
@@ -1794,5 +1832,98 @@ fn restore_timeout_error_variant_exists() {
     assert!(
         msg.contains("timed out after 1s"),
         "Timeout error message must mention timeout duration, got: {msg}"
+    );
+}
+
+// ─── B2: Wave 11b — restore_reconstructs_from_source_when_raw_missing ─────────
+
+/// Wave 11b invariant (I5): after W11b, `raw/{esi}.bin` files are never written.
+/// Restore must succeed by using the `rebuild_source_blob` path in
+/// `decode_block_local` (lines ~461-499 in restore/mod.rs):
+///   source still on disk → rebuild_source_blob → encode_raw(k_eff) → decode → bytes.
+///
+/// This test verifies the full roundtrip:
+///   1. Backup via BackupCoordinator (W11b: no raw/ files written).
+///   2. Source file still on disk.
+///   3. No raw/{esi}.bin files anywhere in symbols_dir.
+///   4. Restore succeeds and returned bytes == original.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_reconstructs_from_source_when_raw_missing() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+
+    // 1. Write a source file with known content.
+    let original_content = b"Wave 11b restore test: raw files must NOT exist, restore must work from source";
+    let path = write_file(&files_dir, "w11b_restore.txt", original_content);
+
+    // 2. Backup via BackupCoordinator — W11b guarantees no raw/ files are written.
+    let mut backup = test_backup_coord(db.clone(), &symbols_dir);
+    backup.process_event(added_event(&path)).unwrap();
+    let results = backup.flush_all(true, &Default::default()).unwrap();
+    assert!(!results.is_empty(), "backup must produce at least one block");
+
+    // 3. Assert: NO raw/{esi}.bin files exist in symbols_dir (W11b invariant I5).
+    fn find_files_recursive<'a>(
+        root: &std::path::Path,
+        pred: &dyn Fn(&std::path::Path) -> bool,
+    ) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        fn walk(dir: &std::path::Path, pred: &dyn Fn(&std::path::Path) -> bool, found: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() { walk(&p, pred, found); }
+                else if pred(&p) { found.push(p); }
+            }
+        }
+        walk(root, pred, &mut found);
+        found
+    }
+
+    let raw_bins = find_files_recursive(symbols_dir.path(), &|p| {
+        p.extension().map(|e| e == "bin").unwrap_or(false)
+    });
+    assert!(
+        raw_bins.is_empty(),
+        "Wave 11b invariant violated: no .bin files must exist in symbols_dir after flush, found: {:?}",
+        raw_bins
+    );
+
+    // 4. Source file is still on disk (the key assertion: restore path must use it).
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "source file must still exist on disk for rebuild_source_blob path"
+    );
+
+    // 5. Restore without any raw symbol files.
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
+    let request = super::RestoreRequest {
+        path: path.clone(),
+        version_selector: VersionSelector::Latest,
+        device_id: DeviceId([2u8; 32]),
+        job_id: JobId::new(),
+    };
+    let result = restore.restore(request).await;
+
+    // 6. Assert: restore succeeded and returned bytes == original.
+    let result = result.expect("restore must succeed when source file is still on disk");
+    assert_eq!(
+        result.files_restored, 1,
+        "restore must succeed (files_restored=1); failures: {:?}",
+        result.failures
+    );
+    assert!(result.failures.is_empty(), "no restore failures expected");
+
+    // Verify content matches original.
+    let rel = path.trim_start_matches('/');
+    let restored_path = result.staging_path.join(rel);
+    let restored_bytes = std::fs::read(&restored_path)
+        .expect("restored file must exist in staging area");
+    assert_eq!(
+        restored_bytes.as_slice(),
+        original_content,
+        "restored bytes must exactly match original content"
     );
 }

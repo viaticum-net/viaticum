@@ -459,6 +459,54 @@ impl RestoreCoordinator {
         });
 
         if raw_symbols.len() < k_eff {
+            // Wave 11b: raw/{esi}.bin files are no longer written by the pipeline.
+            // Try rebuilding the stored blob from source files directly.
+            // If that succeeds, we can skip the network fetch entirely.
+            let block_record = self.db.get_source_block(block_id)?;
+            if let Some(block_record) = block_record {
+                if let Ok(stored_blob) = crate::daemon::backup::pipeline::rebuild_source_blob(
+                    &self.db,
+                    &block_record,
+                    &self.config.epoch_key,
+                )
+                .await
+                {
+                    // Encode raw symbols from the rebuilt blob (enough to decode).
+                    let params_for_encode = block_record.erasure_params();
+                    let encoder_clone = Arc::clone(&self.encoder);
+                    let needed = k_eff as u32;
+                    match tokio::task::spawn_blocking(move || {
+                        encoder_clone.encode_raw(&stored_blob, &params_for_encode, 0, needed)
+                    })
+                    .await
+                    {
+                        Ok(Ok(raws)) => {
+                            debug!(
+                                block = %block_id,
+                                symbols = raws.len(),
+                                "restore: rebuilt symbols from source files (Wave 11b path)"
+                            );
+                            return tokio::task::block_in_place(|| {
+                                let padded = self.encoder.decode(&raws, params)
+                                    .map_err(|e| RestoreError::DecodeFailed(*block_id, e.to_string()))?;
+                                if padded.len() < encrypted_size as usize {
+                                    return Err(RestoreError::DecodeFailed(
+                                        *block_id,
+                                        "decoded block too small".to_string(),
+                                    ));
+                                }
+                                let stored = &padded[..encrypted_size as usize];
+                                pipeline::decrypt_and_decompress(stored, &self.config.epoch_key)
+                                    .map_err(|_| RestoreError::DecryptionFailed(*block_id))
+                            });
+                        }
+                        _ => {
+                            debug!(block = %block_id, "restore: encode from rebuilt blob failed, falling back to network");
+                        }
+                    }
+                }
+            }
+
             // Not enough locally — try network fetch for the remainder.
             // Network path: holders return bound symbols; fetch_from_holders unbinds them.
             // The merged result (local raw + network unbound) are both raw/unbound and

@@ -141,6 +141,9 @@ impl Default for BackupConfig {
 }
 
 /// Result of processing one source block through the pipeline.
+///
+/// Wave 11b: `raw_symbols` and `esi_offset` removed. The WorkPipeline worker
+/// re-encodes from source files on each iteration — no in-memory handoff.
 #[derive(Debug)]
 pub struct PipelineResult {
     pub source_block_id: SourceBlockId,
@@ -152,14 +155,8 @@ pub struct PipelineResult {
     /// Exact byte length of the stored blob ([nonce][ciphertext]).
     /// Required for restore: the decoded erasure block is zero-padded to k*t; trim to stored_size.
     pub stored_size: u64,
-    /// Average importance of files packed into this block (used for SymbolOffer).
+    /// Average importance of files packed into this block.
     pub importance: f64,
-    /// Raw (unbound) symbols produced by encode_raw. ESI range spans all allocations.
-    /// Caller must apply per-holder binding before sending — these are never written to disk.
-    /// Dropped after deliver_symbols() completes — no on-disk spill.
-    pub raw_symbols: Vec<syncback_core::erasure::Symbol>,
-    /// ESI offset used for encode_raw. Needed to index into raw_symbols by ESI.
-    pub esi_offset: u32,
 }
 
 // ─── BackupCoordinator ────────────────────────────────────────────────────────
@@ -595,10 +592,15 @@ impl BackupCoordinator {
         }
     }
 
-    /// Run the coordinator as a tokio task (Phase 3+).
+    /// Run the coordinator as a tokio task (Wave 11b: delivery-only stripped out).
     ///
     /// Reads DirtyEvent from rx channel. Exits when channel is closed.
     /// Runs idle flush (FLUSH_IDLE_SECS) and fallback flush (FLUSH_FALLBACK_SECS) timers.
+    ///
+    /// After Wave 11b: `flush_all` creates DB records only. The WorkPipeline worker
+    /// handles actual symbol delivery (encode → send → Offered→Alive transition).
+    /// `deliver_symbols` is removed; `backup_event_rx` is kept for SymbolAccepted/Rejected
+    /// events from the processor (used for budget tracking).
     pub async fn run(
         mut self,
         mut rx: tokio::sync::mpsc::Receiver<DirtyEvent>,
@@ -631,16 +633,13 @@ impl BackupCoordinator {
                         }
                         None => {
                             tracing::info!("BackupCoordinator: channel closed, flushing and exiting");
-                            // Snapshot authenticated peers before entering block_in_place
-                            // (peer_sets() is async; cannot be called from sync context).
                             let auth_snap = self.snapshot_authenticated_peers().await;
-                            // Wrap the blocking flush in block_in_place so the tokio
-                            // runtime can still make progress on other tasks while
-                            // we compress, encrypt, encode and write to disk
-                            // (review A1 / HIGH blocking-I/O).
                             let flush_result = tokio::task::block_in_place(|| self.flush_all(true, &auth_snap));
                             match flush_result {
-                                Ok(results) => self.deliver_symbols(&results).await,
+                                Ok(_results) => {
+                                    // Wave 11b: delivery is the worker's job.
+                                    // flush_all creates DB records; WorkPipeline picks up on next tick.
+                                }
                                 Err(e) => tracing::error!("final flush error: {e}"),
                             }
                             self.persist_cycle_budget();
@@ -653,10 +652,8 @@ impl BackupCoordinator {
                     let auth_snap = self.snapshot_authenticated_peers().await;
                     let flush_result = tokio::task::block_in_place(|| self.flush_all(true, &auth_snap));
                     match flush_result {
-                        Ok(results) => {
-                            if !results.is_empty() {
-                                self.deliver_symbols(&results).await;
-                            }
+                        Ok(_results) => {
+                            // Wave 11b: delivery is the worker's job.
                         }
                         Err(e) => tracing::error!("idle flush error: {e}"),
                     }
@@ -667,10 +664,8 @@ impl BackupCoordinator {
                     let auth_snap = self.snapshot_authenticated_peers().await;
                     let flush_result = tokio::task::block_in_place(|| self.flush_all(true, &auth_snap));
                     match flush_result {
-                        Ok(results) => {
-                            if !results.is_empty() {
-                                self.deliver_symbols(&results).await;
-                            }
+                        Ok(_results) => {
+                            // Wave 11b: delivery is the worker's job.
                         }
                         Err(e) => tracing::error!("fallback flush error: {e}"),
                     }
@@ -807,326 +802,6 @@ impl BackupCoordinator {
         self.accepted_this_cycle = 0;
     }
 
-    /// Deliver encoded symbols to their assigned holders over the network.
-    ///
-    /// For each `PipelineResult`:
-    ///   1. Load `SymbolPlacement` records for the source block from DB.
-    ///   2. For each placement, read symbol files from disk, build `SymbolTransferMsg`,
-    ///      and deliver via libp2p swarm.
-    ///
-    /// Errors are logged but not propagated — delivery failures do not abort the backup.
-    /// No-op when `config.swarm` is None.
-    async fn deliver_symbols(&self, results: &[PipelineResult]) {
-        if self.config.swarm.is_none() {
-            tracing::debug!("deliver_symbols: no swarm configured, skipping");
-            return;
-        }
-
-        tracing::info!(
-            blocks = results.len(),
-            "deliver_symbols: starting delivery"
-        );
-
-        for result in results {
-            let placements = match self.db.list_placements_for_block(&result.source_block_id) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!(
-                        block = ?result.source_block_id,
-                        error = %e,
-                        "deliver_symbols: failed to load placements from DB"
-                    );
-                    continue;
-                }
-            };
-
-            for placement in &placements {
-                if let Err(e) = self.deliver_to_holder(result, placement).await {
-                    tracing::warn!(
-                        block = ?result.source_block_id,
-                        holder = %placement.holder_id,
-                        error = %e,
-                        "deliver_symbols: failed to deliver to holder (will retry on repair)"
-                    );
-                }
-            }
-
-            // Clean up block.bin and directory if all symbol files were delivered.
-            self.cleanup_block_dir(&result.source_block_id);
-        }
-    }
-
-    /// Deliver symbols for one (block, holder) pair.
-    ///
-    /// When `master_signing_key` is configured:
-    ///   1. Build SymbolOffer (signed with master key).
-    ///   2. Send SymbolOffer via swarm.send_to_device (request-response).
-    ///   3. On SymbolAccept reply → send SymbolTransfer.
-    ///   4. On SymbolReject/error → log, return Err (caller logs + continues).
-    ///
-    /// When `master_signing_key` is None: fall back to direct SymbolTransfer.
-    async fn deliver_to_holder(
-        &self,
-        result: &PipelineResult,
-        placement: &syncback_core::types::SymbolPlacement,
-    ) -> anyhow::Result<()> {
-        use syncback_core::messages::Message;
-        use syncback_core::types::Timestamp;
-
-        let swarm = match self.config.swarm.as_ref() {
-            Some(s) => s.clone(),
-            None => {
-                tracing::debug!("deliver_to_holder: no swarm, skipping");
-                return Ok(());
-            }
-        };
-
-        let signing_key = match self.config.master_signing_key.as_ref() {
-            Some(k) => k,
-            None => {
-                // No signing key: fall back to direct SymbolTransfer.
-                return self.deliver_to_holder_direct(&swarm, result, placement).await;
-            }
-        };
-
-        let importance = result.importance;
-
-        // Build signed SymbolOffer.
-        let msg_id: [u8; 16] = rand::random();
-        let timestamp = Timestamp::now();
-        let offer = syncback_core::messages::build_symbol_offer(
-            msg_id,
-            result.source_block_id,
-            placement.esi_ranges.clone(),
-            importance,
-            timestamp,
-            signing_key,
-        );
-
-        // Send SymbolOffer and wait for reply (request-response via libp2p).
-        let reply = swarm
-            .send_to_device(placement.holder_id, Message::SymbolOffer(offer))
-            .await
-            .map_err(|e| anyhow::anyhow!("send SymbolOffer: {e}"))?;
-
-        match reply {
-            Message::SymbolAccept(_accept) => {
-                if let Some(backoff) = self.config.peer_backoff.as_ref() {
-                    backoff.record_accept(&placement.holder_id);
-                }
-                // Holder accepted — send SymbolTransfer.
-                self.deliver_to_holder_direct(&swarm, result, placement).await
-            }
-            Message::SymbolReject(reject) => {
-                if let Some(backoff) = self.config.peer_backoff.as_ref() {
-                    backoff.record_reject(placement.holder_id);
-                }
-                anyhow::bail!(
-                    "holder {} rejected offer for block {:?}: {:?}",
-                    placement.holder_id,
-                    result.source_block_id,
-                    reject.reason
-                )
-            }
-            other => {
-                anyhow::bail!(
-                    "unexpected reply to SymbolOffer from {}: {:?}",
-                    placement.holder_id,
-                    std::mem::discriminant(&other)
-                )
-            }
-        }
-    }
-
-    /// Direct SymbolTransfer delivery via libp2p swarm.
-    async fn deliver_to_holder_direct(
-        &self,
-        swarm: &crate::daemon::network::swarm::SwarmHandle,
-        result: &PipelineResult,
-        placement: &syncback_core::types::SymbolPlacement,
-    ) -> anyhow::Result<()> {
-        use syncback_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES;
-        use syncback_core::erasure::{chunk_symbols_by_size, Symbol};
-        use syncback_core::messages::{Message, SymbolTransferMsg};
-        use syncback_core::types::Timestamp;
-
-        // Bind raw symbols inline at send time — no disk read needed.
-        let symbols: Vec<Symbol> = placement
-            .esi_ranges
-            .iter()
-            .flat_map(|&(start_esi, count)| {
-                (start_esi..start_esi + count).filter_map(|esi| {
-                    let idx = esi.checked_sub(result.esi_offset)? as usize;
-                    let raw = result.raw_symbols.get(idx)?;
-                    Some(self.encoder.apply_binding(
-                        raw.clone(),
-                        &result.source_block_id,
-                        &placement.holder_id,
-                    ))
-                })
-            })
-            .collect();
-
-        if symbols.is_empty() {
-            anyhow::bail!(
-                "no raw symbols available for block {:?} holder {} (esi_offset={}, raw_symbols={})",
-                result.source_block_id,
-                placement.holder_id,
-                result.esi_offset,
-                result.raw_symbols.len(),
-            );
-        }
-
-        let symbol_count = symbols.len();
-        // A single holder's share of a block may exceed MAX_MESSAGE_SIZE, so
-        // we chunk into multiple SymbolTransfer frames. Holder accumulates and
-        // only transitions Offered→Alive once every ACK is in.
-        let chunks = chunk_symbols_by_size(symbols, SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES);
-        let total_chunks = chunks.len();
-        let mut stored_ok = 0usize;
-        let mut saw_old_protocol = false;
-
-        for (idx, chunk) in chunks.into_iter().enumerate() {
-            let chunk_len = chunk.len();
-            let msg = SymbolTransferMsg {
-                v: 1,
-                source_block_id: result.source_block_id,
-                symbols: chunk,
-                timestamp: Timestamp::now(),
-            };
-            let reply = swarm
-                .send_to_device(placement.holder_id, Message::SymbolTransfer(msg))
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "send SymbolTransfer chunk {}/{}: {}",
-                        idx + 1,
-                        total_chunks,
-                        e
-                    )
-                })?;
-            match reply {
-                Message::SymbolStored(_) => {
-                    stored_ok += 1;
-                    tracing::debug!(
-                        holder = %placement.holder_id,
-                        block_id = %result.source_block_id,
-                        chunk = idx + 1,
-                        total = total_chunks,
-                        symbols = chunk_len,
-                        "backup: chunk stored",
-                    );
-                }
-                Message::SystemStateAck(_) => {
-                    saw_old_protocol = true;
-                }
-                other => {
-                    tracing::warn!(
-                        holder = %placement.holder_id,
-                        "backup: unexpected reply to SymbolTransfer: {:?}",
-                        std::mem::discriminant(&other)
-                    );
-                }
-            }
-        }
-
-        if stored_ok == total_chunks {
-            let now = Timestamp::now();
-            match self.db.transition_placement_offered_to_alive(
-                &result.source_block_id,
-                &placement.holder_id,
-                now,
-            ) {
-                Ok(true) => {
-                    tracing::info!(
-                        holder = %placement.holder_id,
-                        block_id = %result.source_block_id,
-                        symbols = symbol_count,
-                        chunks = total_chunks,
-                        "backup: symbols confirmed stored, placement Offered→Alive"
-                    );
-                    crate::daemon::processor::recompute_and_persist_block_cached_fields(
-                        &self.db,
-                        &result.source_block_id,
-                    );
-                }
-                Ok(false) => tracing::debug!(
-                    holder = %placement.holder_id,
-                    "backup: placement transition skipped (not in Offered state)"
-                ),
-                Err(e) => tracing::error!(
-                    holder = %placement.holder_id,
-                    err = %e,
-                    "backup: DB error transitioning Offered→Alive"
-                ),
-            }
-        } else if saw_old_protocol {
-            tracing::debug!(
-                holder = %placement.holder_id,
-                chunks_ok = stored_ok,
-                chunks_total = total_chunks,
-                "backup: old-protocol holder (SystemStateAck); placement left Offered"
-            );
-        } else {
-            tracing::warn!(
-                holder = %placement.holder_id,
-                block_id = %result.source_block_id,
-                chunks_ok = stored_ok,
-                chunks_total = total_chunks,
-                "backup: not all chunks acked; placement left Offered"
-            );
-        }
-
-        tracing::info!(
-            holder = %placement.holder_id,
-            block_id = %result.source_block_id,
-            symbols = symbol_count,
-            chunks = total_chunks,
-            "backup: symbols delivered"
-        );
-
-        // Wave 2: raw symbols are in memory only; no per-esi .bin files to clean up here.
-        // Cleanup of block.bin and raw/ directory is handled by cleanup_block_dir()
-        // after all holders for this block have been delivered.
-
-        Ok(())
-    }
-
-    /// Clean up block directory after all symbols have been delivered.
-    ///
-    /// Wave 2 layout: raw symbols are at `{block_dir}/raw/{esi}.bin`.
-    /// After all holders are delivered, we remove raw/ subdir, block.bin, and block_dir.
-    /// The raw symbols were the handoff medium; once delivery is done they're no longer needed.
-    fn cleanup_block_dir(&self, block_id: &syncback_core::types::SourceBlockId) {
-        let block_hex = syncback_core::types::hex_encode(&block_id.0);
-        let block_dir = self.config.symbols_dir.join(&block_hex);
-
-        if !block_dir.exists() {
-            return;
-        }
-
-        // Remove raw/ subdir and all its contents.
-        let raw_dir = block_dir.join("raw");
-        if raw_dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&raw_dir) {
-                tracing::warn!(path = %raw_dir.display(), "cleanup: failed to remove raw/ dir: {e}");
-                // If raw/ removal fails, don't remove block_dir either.
-                return;
-            }
-        }
-
-        // Delete block.bin and the directory itself.
-        let block_bin = block_dir.join("block.bin");
-        if let Err(e) = std::fs::remove_file(&block_bin) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %block_bin.display(), "cleanup: failed to remove block.bin: {e}");
-            }
-        }
-        if let Err(e) = std::fs::remove_dir(&block_dir) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %block_dir.display(), "cleanup: failed to remove block dir: {e}");
-            }
-        }
-        tracing::info!(block_id = %block_id, "backup: all symbols delivered, block dir cleaned up");
-    }
 }
+// Note: deliver_symbols, deliver_to_holder, deliver_to_holder_direct, cleanup_block_dir
+// were removed in Wave 11b. Symbol delivery is now the WorkPipeline worker's responsibility.

@@ -99,20 +99,26 @@ echo "=== Phase 1: Setup (${NUM_NODES} nodes) ==="
 
 mkdir -p "$TEST_DIR"
 
-# Init all nodes
-echo "  Initializing ${NUM_NODES} nodes..."
-for i in $(seq 0 $((NUM_NODES-1))); do
-    run_cli "$i" init > /dev/null 2>&1 &
-done
-wait
-echo "  ${NUM_NODES} nodes initialized."
+# Init node-00 as cluster master, other nodes as cluster devices.
+echo "  Initializing node-00 (cluster master)..."
+mkdir -p "$(node_dir 0)"
+MNEMONIC=$(run_cli 0 init 2>&1 | grep -A 2 "Mnemonic" | tail -1 | xargs)
+echo "  Mnemonic: ${MNEMONIC:0:20}..."
 
-# Set disk_reserve_gb=0 so tests work on low-disk machines.
+echo "  Initializing nodes 1-$((NUM_NODES-1)) as cluster devices..."
+for i in $(seq 1 $((NUM_NODES-1))); do
+    mkdir -p "$(node_dir "$i")"
+    run_cli "$i" init --mnemonic "$MNEMONIC" --new-device > /dev/null 2>&1
+done
+echo "  ${NUM_NODES} nodes initialized (shared cluster master key)."
+
 for i in $(seq 0 $((NUM_NODES-1))); do
     cat > "$(node_dir "$i")/config.toml" << 'CFGEOF'
+[web_api]
+enabled = true
+bind = "127.0.0.1:0"
 [storage]
 disk_reserve_gb = 0.0
-
 [escrow]
 k_factor = 0.001
 CFGEOF
@@ -148,10 +154,16 @@ echo "  Connecting all to node-00..."
 for i in $(seq 1 $((NUM_NODES-1))); do
     run_cli_q "$i" connect "$ADDR_00" 2>&1 > /dev/null || true
 done
-sleep 3
+# Wait for peer authentication.
+CONNECT_PASS=0
+for attempt in $(seq 1 30); do
+    PC=$(get_json_field 0 peer_count)
+    if [ "${PC:-0}" -ge "$((NUM_NODES-1))" ]; then CONNECT_PASS=1; break; fi
+    sleep 1
+done
 PC=$(get_json_field 0 peer_count)
 echo "  node-00 peers: ${PC:-0}/$((NUM_NODES-1))"
-[ "${PC:-0}" -ge "$((NUM_NODES-1))" ] \
+[ "$CONNECT_PASS" -eq 1 ] \
     && pass "star connect: ${PC} peers" \
     || fail "star connect: only ${PC:-0} peers"
 
@@ -230,21 +242,20 @@ echo "=== Phase 4: Restore with Dead Holder (E2E-07) ==="
 if [ "$PLACED" -eq 0 ]; then
     skip "restore skipped (no placements)"
 else
-    RESTORE_DEST="$(node_dir 0)/restored"
-    mkdir -p "$RESTORE_DEST"
     RESTORE_PATH="$(node_dir 0)/files/fault_test.bin"
-    echo "  Restoring $RESTORE_PATH with 1 holder dead..."
+    RESTORE_STAGING_ROOT="$(node_dir 0)/restore"
+    echo "  Restoring $RESTORE_PATH with 1 holder dead (to staging dir)..."
 
     set +e
-    RESTORE_OUTPUT=$(run_cli 0 restore "$RESTORE_PATH" --dest "$RESTORE_DEST" 2>&1)
+    RESTORE_OUTPUT=$(run_cli 0 restore "$RESTORE_PATH" 2>&1)
     RESTORE_EXIT=$?
     set -e
 
     if [ $RESTORE_EXIT -eq 0 ]; then
-        RESTORED_FILE=$(find "$RESTORE_DEST" -name "fault_test.bin" -type f 2>/dev/null | head -1)
-        echo "  Waiting for restored file (max 30s)..."
+        echo "  Waiting for restored file in staging dir (max 30s)..."
         RESTORE_OK=0
         for attempt in $(seq 1 30); do
+            RESTORED_FILE=$(find "$RESTORE_STAGING_ROOT" -name "fault_test.bin" -type f 2>/dev/null | head -1)
             if [ -n "$RESTORED_FILE" ] && [ -f "$RESTORED_FILE" ]; then
                 RESTORED_MD5=$(md5sum "$RESTORED_FILE" | awk '{print $1}')
                 if [ "$ORIG_MD5" = "$RESTORED_MD5" ]; then
