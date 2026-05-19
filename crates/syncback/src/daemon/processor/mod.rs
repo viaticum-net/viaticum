@@ -644,7 +644,7 @@ impl Processor {
                                     _ => return,
                                 };
                                 let mut reply_id = [0u8; 16];
-                                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut reply_id);
+                                rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut reply_id);
                                 let _ = self
                                     .relay_post_tx
                                     .send(RelayPost {

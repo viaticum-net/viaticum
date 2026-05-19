@@ -6,7 +6,7 @@ use crate::constants::{HANDSHAKE_FRESHNESS_SECS, MAX_RELAY_HOP, RELAY_TTL_SECS};
 use crate::erasure::Symbol;
 use crate::types::{DeviceId, Event, EventEntry, IdentityPub, SourceBlockId, Timestamp};
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use super::*;
@@ -1062,7 +1062,7 @@ fn restore_denied_msg_fields_exist() {
 #[test]
 fn delete_msg_builds_and_verifies() {
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
+    use rand_core::OsRng;
 
     let key = SigningKey::generate(&mut OsRng);
     let identity = IdentityPub(key.verifying_key().to_bytes());
@@ -1079,7 +1079,7 @@ fn delete_msg_builds_and_verifies() {
 #[test]
 fn delete_msg_wrong_owner_fails_verify() {
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
+    use rand_core::OsRng;
 
     let key = SigningKey::generate(&mut OsRng);
     let other_key = SigningKey::generate(&mut OsRng);
@@ -1093,7 +1093,7 @@ fn delete_msg_wrong_owner_fails_verify() {
 #[test]
 fn cancel_delete_msg_builds_and_verifies() {
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
+    use rand_core::OsRng;
 
     let key = SigningKey::generate(&mut OsRng);
     let identity = IdentityPub(key.verifying_key().to_bytes());
@@ -1109,7 +1109,7 @@ fn cancel_delete_msg_builds_and_verifies() {
 #[test]
 fn cancel_delete_msg_wrong_owner_fails() {
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
+    use rand_core::OsRng;
 
     let key = SigningKey::generate(&mut OsRng);
     let other_key = SigningKey::generate(&mut OsRng);
@@ -1122,7 +1122,7 @@ fn cancel_delete_msg_wrong_owner_fails() {
 #[test]
 fn delete_sig_not_valid_as_cancel_delete() {
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
+    use rand_core::OsRng;
 
     let key = SigningKey::generate(&mut OsRng);
     let identity = IdentityPub(key.verifying_key().to_bytes());

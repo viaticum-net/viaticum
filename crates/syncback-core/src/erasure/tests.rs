@@ -443,12 +443,12 @@ fn encode_unbind_decode_roundtrip_sweep() {
     let sizes: &[u64] = &[1, 64, 256, 1024, 4096, 10_000, 65_536, 100_000];
     let redundancies: &[f64] = &[0.3, 0.5, 1.0];
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut idx: u8 = 30; // start above existing test bytes to avoid collision
 
     for &size in sizes {
         for &redundancy in redundancies {
-            let source: Vec<u8> = (0..size as usize).map(|_| rng.r#gen::<u8>()).collect();
+            let source: Vec<u8> = (0..size as usize).map(|_| rng.random::<u8>()).collect();
             let params = ErasureParams::compute(size, redundancy).unwrap();
             let bid = block_id(idx);
             let hid = holder(idx.wrapping_add(1));

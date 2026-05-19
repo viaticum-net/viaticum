@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 use syncback::daemon::backup::pipeline::{compress_and_encrypt, decrypt_and_decompress};
 use syncback::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
 use syncback::daemon::relay::{RelayConfig, RelayManager};

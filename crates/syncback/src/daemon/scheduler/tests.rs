@@ -103,7 +103,7 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
     // We need a NetworkHandle for the constructor. Build a no-op one via a stub.
     // Since check_timeouts doesn't use network, we pass a real (but unused) handle.
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let scheduler = Scheduler::new(
         db.clone(),
         config,
@@ -185,7 +185,7 @@ async fn check_timeouts_ignores_fresh_challenges() {
         pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let scheduler = Scheduler::new(
         db,
         config,
@@ -296,7 +296,7 @@ async fn check_timeouts_respects_time_scale() {
         pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let scheduler = Scheduler::new(
         db.clone(),
         config,
@@ -365,7 +365,7 @@ async fn issue_due_challenges_skips_already_pending() {
         pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let scheduler = Scheduler::new(
         db,
         config,
@@ -424,7 +424,7 @@ async fn scheduler_skips_deleting_placements() {
         pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let scheduler = Scheduler::new(
         db,
         config,
@@ -500,7 +500,7 @@ async fn time_scale_divides_intervals() {
         pos_weekly_retain_weeks: syncback_core::constants::P_WINDOW_WEEKS * 2,
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let scheduler = Scheduler::new(
         db.clone(),
         config,
@@ -609,7 +609,7 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
     let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<RelayPost>(16);
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let pending = make_pending_challenges();
     let config = SchedulerConfig {
         pos_interval_secs: 3600,
@@ -663,7 +663,7 @@ async fn deletion_tick_noop_when_no_eligible_files() {
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
     let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<RelayPost>(16);
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let pending = make_pending_challenges();
     let config = SchedulerConfig {
         pos_interval_secs: 3600,
@@ -718,7 +718,7 @@ async fn scheduler_transitions_offered_to_lost_after_long_absence() {
     let (repair_tx, mut repair_rx) = mpsc::channel::<RepairTrigger>(8);
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let pending = make_pending_challenges();
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
 
     // Threshold = LONG_ABSENCE_SECS = 14 days.
     // placed_at = 0 means age = now >> 14 days → must become Lost.
@@ -794,7 +794,7 @@ async fn scheduler_does_not_transition_offered_to_lost_before_long_absence() {
     let (repair_tx, mut repair_rx) = mpsc::channel::<RepairTrigger>(8);
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let pending = make_pending_challenges();
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
 
     let config = SchedulerConfig {
         pos_interval_secs: 3600,
@@ -914,7 +914,7 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
     let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<RelayPost>(64);
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let pending = make_pending_challenges();
     let config = SchedulerConfig {
         pos_interval_secs: 3600,
@@ -1046,7 +1046,7 @@ async fn cleanup_block_removes_files_from_disk() {
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let pending = make_pending_challenges();
     let config = SchedulerConfig {
         pos_interval_secs: 3600,
@@ -1118,7 +1118,7 @@ fn make_scheduler_for_hook(
     pending: PendingChallenges,
 ) -> Scheduler {
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let config = SchedulerConfig {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,

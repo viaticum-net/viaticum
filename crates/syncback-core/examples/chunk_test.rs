@@ -5,7 +5,7 @@ use syncback_core::messages::{Message, SymbolTransferMsg, to_cbor};
 use syncback_core::types::{SourceBlockId, Timestamp};
 
 fn run(label: &str, count: u32, fill_random: bool) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let symbols: Vec<Symbol> = (0..count)
         .map(|i| {
             let mut data = vec![0u8; 65535];

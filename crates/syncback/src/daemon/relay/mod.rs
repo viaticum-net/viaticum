@@ -75,7 +75,7 @@ pub struct RelayConfig {
 impl RelayConfig {
     /// Convenience constructor for tests.
     pub fn defaults_for_test(board_path: PathBuf) -> Self {
-        use rand::rngs::OsRng;
+        use rand_core::OsRng;
         let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
         let identity_pub = IdentityPub(signing_key.verifying_key().to_bytes());
         let x25519_priv = x25519_dalek::StaticSecret::random_from_rng(OsRng);

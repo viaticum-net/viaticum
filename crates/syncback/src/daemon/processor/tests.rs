@@ -2005,7 +2005,7 @@ async fn handle_delete_marks_holding_for_deletion() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
     let block_id = make_block_id(0xDD);
 
@@ -2039,7 +2039,7 @@ async fn handle_delete_ignores_non_active_holding() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
     let block_id = make_block_id(0xDE);
 
@@ -2072,7 +2072,7 @@ async fn handle_delete_ignores_no_holding() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
     let block_id = make_block_id(0xDF);
 
@@ -2088,9 +2088,9 @@ async fn handle_delete_rejects_invalid_signature() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
-    let wrong_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let wrong_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let block_id = make_block_id(0xE0);
 
     let holding = HoldingRecord {
@@ -2124,7 +2124,7 @@ async fn handle_cancel_delete_reverts_to_active() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
     let block_id = make_block_id(0xE1);
 
@@ -2159,7 +2159,7 @@ async fn handle_cancel_delete_ignores_active_holding() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
     let block_id = make_block_id(0xE2);
 
@@ -2194,9 +2194,9 @@ async fn handle_cancel_delete_rejects_bad_sig() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
-    let wrong_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let wrong_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let block_id = make_block_id(0xE3);
 
     let holding = HoldingRecord {
@@ -2746,7 +2746,7 @@ async fn dispatch_relay_delete_marks_holding() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
     let block_id = make_block_id(0xE5);
 
@@ -3415,7 +3415,7 @@ async fn offer_accepted_stored_in_map() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner = IdentityPub(signing_key.verifying_key().to_bytes());
     let block_id = make_block_id(0x22);
     let esi_ranges = vec![(0u32, 10u32)];
@@ -3686,7 +3686,7 @@ async fn offer_rejected_bad_signature() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner = IdentityPub(signing_key.verifying_key().to_bytes());
     let block_id = make_block_id(0x55);
 
@@ -3815,7 +3815,7 @@ async fn offer_rejected_when_quota_full() {
     let (processor, _repair_rx, _relay_rx) =
         make_processor_with_quota(db.clone(), &holdings_dir, 1, 1).await;
 
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner = IdentityPub(signing_key.verifying_key().to_bytes());
     let block_id = make_block_id(0x77);
     let esi_ranges = vec![(0u32, 5u32)];
@@ -3881,7 +3881,7 @@ async fn offer_rejected_on_stale_timestamp() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner = IdentityPub(signing_key.verifying_key().to_bytes());
     let block_id = make_block_id(0x88);
 

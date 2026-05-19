@@ -4,7 +4,7 @@
 // All tests are synchronous (no tokio runtime needed for unit tests).
 #![allow(clippy::cloned_ref_to_slice_refs)]
 
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 use syncback_core::cluster::{
     EpochCounter, issue_device_certificate, issue_revocation, verify_device_certificate,
     verify_revocation,
@@ -791,7 +791,7 @@ fn board_sync_exchange_fills_missing_entries() {
     let config_a = RelayConfig {
         board_path: dir_a.path().join("board.bin"),
         identity_pub: identity_a,
-        x25519_priv: x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng),
+        x25519_priv: x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng),
         signing_key: key_a,
         max_entries: 100,
         max_size_bytes: 1_000_000,
@@ -808,7 +808,7 @@ fn board_sync_exchange_fills_missing_entries() {
     let config_b = RelayConfig {
         board_path: dir_b.path().join("board.bin"),
         identity_pub: identity_b,
-        x25519_priv: x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng),
+        x25519_priv: x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng),
         signing_key: key_b,
         max_entries: 100,
         max_size_bytes: 1_000_000,

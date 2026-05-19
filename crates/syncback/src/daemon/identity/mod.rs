@@ -81,9 +81,9 @@ pub enum IdentityError {
 /// `<data_dir>/config.toml` (only if absent).
 /// Returns `IdentityError::AlreadyInitialized` if identity.key already exists.
 pub fn init_identity(data_dir: &Path) -> Result<IdentityKeyFile, IdentityError> {
-    use rand::RngCore;
+    use rand_core::RngCore;
     let mut entropy = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut entropy);
+    rand_core::OsRng.fill_bytes(&mut entropy);
     let mnemonic = bip39::Mnemonic::from_entropy(&entropy)
         .map_err(|e| IdentityError::InvalidMnemonic(e.to_string()))?;
     create_keyfile(data_dir, &mnemonic, false)

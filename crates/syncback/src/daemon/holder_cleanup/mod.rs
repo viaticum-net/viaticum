@@ -368,7 +368,7 @@ async fn check_pressure(
                 };
                 if let Ok(payload) = syncback_core::messages::to_cbor(&notice_msg) {
                     let mut msg_id = [0u8; 16];
-                    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut msg_id);
+                    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
                     let _ = relay_post_tx
                         .send(RelayPost {
                             msg_type: "symbol_drop_notice".to_string(),
@@ -430,7 +430,7 @@ async fn post_symbol_dropped(
     );
     if let Ok(payload) = syncback_core::messages::to_cbor(&msg) {
         let mut msg_id = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut msg_id);
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
         let _ = relay_post_tx
             .send(RelayPost {
                 msg_type: "symbol_dropped".to_string(),

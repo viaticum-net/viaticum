@@ -750,7 +750,7 @@ impl Scheduler {
                         .unwrap_or(IdentityPub(holder_id.0));
                     if let Ok(payload) = syncback_core::messages::to_cbor(&delete_msg) {
                         let mut msg_id = [0u8; 16];
-                        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut msg_id);
+                        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
                         let _ = self
                             .relay_post_tx
                             .send(RelayPost {
@@ -963,6 +963,6 @@ impl Scheduler {
 
 fn random_challenge_id() -> [u8; 16] {
     let mut id = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut id);
     id
 }

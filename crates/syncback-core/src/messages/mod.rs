@@ -848,7 +848,7 @@ pub fn encrypt_directed(
     plaintext: &[u8],
     target_x25519_pub: &x25519_dalek::PublicKey,
 ) -> Result<DirectedEnvelope, MessageError> {
-    use rand::rngs::OsRng;
+    use rand_core::OsRng;
     let ephemeral_priv = x25519_dalek::StaticSecret::random_from_rng(OsRng);
     let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral_priv);
     let shared = ephemeral_priv.diffie_hellman(target_x25519_pub);
