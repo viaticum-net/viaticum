@@ -256,11 +256,12 @@ echo "  Total holder disk: $((TOTAL_HOLDING / 1024)) MB across $((NUM_NODES-1)) 
 # ── PHASE 4: RESTORE 100 MB ─────────────────────────────────────
 echo ""
 echo "=== Phase 4: Restore 100 MB file ==="
-RESTORE_DIR="$TEST_DIR/restore-out"
-mkdir -p "$RESTORE_DIR"
-run_cli 0 restore "$(node_dir 0)/files/big100.bin" --output-dir "$RESTORE_DIR" 2>/dev/null &
+# Alpha: restore writes to <data_dir>/restore/<job_id>/<original_path>.
+# --dest is not yet supported (API returns "dest_not_supported_in_alpha").
+RESTORE_DIR="$(node_dir 0)/restore"
+run_cli 0 restore "$(node_dir 0)/files/big100.bin" 2>&1 | head -5 &
 
-echo "  Waiting for restored file (max 60s)..."
+echo "  Waiting for restored file (max 60s) under $RESTORE_DIR ..."
 for i in $(seq 1 60); do
     RESTORED=$(find "$RESTORE_DIR" -name "big100.bin" -size +1M 2>/dev/null | head -1)
     if [ -n "$RESTORED" ]; then

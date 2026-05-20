@@ -315,6 +315,21 @@ else
         echo ""
         echo "=== Phase 5: Post-DR Verification ==="
         mkdir -p "$(node_dir 0)/files"
+
+        # DR replaced config.toml with the default template (web_api commented out).
+        # The CLI needs web_api enabled to reach the daemon via api-port, so re-apply
+        # the test config (same pattern as Phase 1).
+        cat > "$(node_dir 0)/config.toml" << 'CFGEOF'
+[web_api]
+enabled = true
+bind = "127.0.0.1:0"
+[storage]
+disk_reserve_gb = 0.0
+
+[escrow]
+k_factor = 0.001
+CFGEOF
+
         RUST_LOG=info "$BINARY" --data-dir "$(node_dir 0)" daemon \
             --time-scale "$TIME_SCALE" \
             --watch-dir "$(node_dir 0)/files" \
