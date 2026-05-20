@@ -58,7 +58,7 @@ run_cli_q() { run_cli "$@" 2>/dev/null || true; }
 
 wait_daemon() {
     local idx="$1"
-    for i in $(seq 1 30); do
+    for i in $(seq 1 120); do
         if run_cli_q "$idx" status 2>/dev/null | grep -q "identity:"; then return 0; fi
         sleep 0.5
     done

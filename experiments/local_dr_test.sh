@@ -61,7 +61,7 @@ run_cli_q() {
 
 wait_daemon() {
     local idx="$1"
-    for i in $(seq 1 20); do
+    for i in $(seq 1 120); do
         if run_cli_q "$idx" status 2>/dev/null | grep -q "identity:"; then
             return 0
         fi
@@ -107,17 +107,20 @@ echo "=== Phase 1: Setup ==="
 mkdir -p "$TEST_DIR"
 
 # Init all nodes
-echo "  Initializing ${NUM_NODES} nodes..."
+echo "  Initializing ${NUM_NODES} nodes (shared cluster master key)..."
 run_cli 0 init --mnemonic "$MNEMONIC_00" > /dev/null 2>&1
 for i in $(seq 1 $((NUM_NODES-1))); do
-    run_cli "$i" init > /dev/null 2>&1 &
+    mkdir -p "$(node_dir "$i")"
+    run_cli "$i" init --mnemonic "$MNEMONIC_00" --new-device > /dev/null 2>&1
 done
-wait
 echo "  ${NUM_NODES} nodes initialized."
 
 # Set disk_reserve_gb=0 so tests work on low-disk machines.
 for i in $(seq 0 $((NUM_NODES-1))); do
     cat > "$(node_dir "$i")/config.toml" << 'CFGEOF'
+[web_api]
+enabled = true
+bind = "127.0.0.1:0"
 [storage]
 disk_reserve_gb = 0.0
 

@@ -87,7 +87,7 @@ run_cli_q() { run_cli "$@" 2>/dev/null || true; }
 
 wait_daemon() {
     local idx="$1"
-    for i in $(seq 1 40); do
+    for i in $(seq 1 120); do
         if run_cli_q "$idx" status 2>/dev/null | grep -q "identity:"; then return 0; fi
         sleep 0.5
     done
@@ -151,15 +151,20 @@ echo "[Phase 1] Setup: init ${NUM_NODES} nodes"
 
 mkdir -p "$TEST_DIR"
 
-echo "  Initializing ${NUM_NODES} nodes..."
-for i in $(seq 0 $((NUM_NODES-1))); do
-    run_cli "$i" init > /dev/null 2>&1 &
+echo "  Initializing ${NUM_NODES} nodes (shared cluster master key)..."
+mkdir -p "$(node_dir 0)"
+MNEMONIC=$(run_cli 0 init 2>&1 | grep -A 2 "Mnemonic" | tail -1 | xargs)
+for i in $(seq 1 $((NUM_NODES-1))); do
+    mkdir -p "$(node_dir "$i")"
+    run_cli "$i" init --mnemonic "$MNEMONIC" --new-device > /dev/null 2>&1
 done
-wait
 
 # Config: no disk reserve, escrow near-zero (A7 from spec)
 for i in $(seq 0 $((NUM_NODES-1))); do
     cat > "$(node_dir "$i")/config.toml" << 'CFGEOF'
+[web_api]
+enabled = true
+bind = "127.0.0.1:0"
 [storage]
 disk_reserve_gb = 0.0
 
