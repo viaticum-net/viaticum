@@ -535,16 +535,18 @@ fn compute_esi_offset(
     Ok(max_end.max(namespace_start))
 }
 
-/// Get the set of DeviceIds that currently hold symbols for this block
-/// (Alive or Offered status — exclude them from new allocations).
-fn get_existing_holder_ids(
+/// Get the set of DeviceIds with Alive symbols for this block.
+/// Offered placements are NOT excluded — the worker retries delivery to peers
+/// whose placement is Offered. See W11b spec Step 5:
+/// `n_attempt = n_target - current_alive`.
+pub(crate) fn get_existing_holder_ids(
     db: &Db,
     block_id: &SourceBlockId,
 ) -> anyhow::Result<std::collections::HashSet<DeviceId>> {
     let placements = db.list_placements_for_block(block_id)?;
     Ok(placements
         .into_iter()
-        .filter(|p| matches!(p.status, PlacementStatus::Alive | PlacementStatus::Offered))
+        .filter(|p| matches!(p.status, PlacementStatus::Alive))
         .map(|p| p.holder_id)
         .collect())
 }

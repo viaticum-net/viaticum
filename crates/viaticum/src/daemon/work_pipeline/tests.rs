@@ -1200,3 +1200,124 @@ async fn periodic_reliability_scan_updates_below_target_blocks() {
         "reliability_scan must correct current_alive to match actual Alive placements"
     );
 }
+
+// ─── W11b bugfix: worker retries delivery for Offered placements ───────────────
+//
+// ATDD scenario (bug regression test):
+//   Before fix: get_existing_holder_ids filtered Alive|Offered → peer-A with
+//   an Offered placement was excluded from candidates → acked=0 forever.
+//   After fix: only Alive is excluded → peer-A IS a candidate → delivery retried.
+
+#[test]
+fn worker_retries_delivery_for_offered_placement() {
+    // ATDD: a block with 1 Offered placement (no Alive yet) must have peer-A
+    // included in candidates returned by get_existing_holder_ids.
+    //
+    // Regression for W11b bug: backup pipeline created Offered placements but
+    // worker excluded Offered holders → no delivery retry → placement_alive=0 forever.
+    //
+    // We test the filter directly: given an Offered placement for peer-A,
+    // get_existing_holder_ids must NOT return peer-A (so peer-A remains a candidate).
+    use crate::daemon::work_pipeline::worker::get_existing_holder_ids;
+    use viaticum_core::types::{FileId, PlacementStatus, SymbolPlacement};
+
+    let db = make_db();
+    let bid = block_id(0xBB);
+    let peer_a = device_id(0xA0);
+
+    // Create block record.
+    let record = make_block_record(bid, 1.0, 0.99);
+    db.upsert_source_block(&record).unwrap();
+
+    // Insert 1 Offered placement for peer-A (no Alive placements exist yet).
+    db.upsert_placement(&SymbolPlacement {
+        source_block_id: bid,
+        holder_id: peer_a,
+        file_id: FileId(0),
+        esi_ranges: vec![(0, 1)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Offered,
+        last_verified: None,
+        placed_at: Timestamp::now(),
+        consecutive_misses: 0,
+    })
+    .unwrap();
+
+    // Assert: get_existing_holder_ids returns an empty set.
+    // peer-A has an Offered placement, which must NOT be excluded.
+    // An empty result means peer-A remains in candidates → delivery will be retried.
+    let holders = get_existing_holder_ids(&db, &bid).unwrap();
+    assert!(
+        holders.is_empty(),
+        "with only an Offered placement, get_existing_holder_ids must return empty \
+         (peer-A is NOT excluded → worker retries delivery). \
+         Regression: previously Offered was excluded, causing placement_alive=0 forever."
+    );
+    assert!(
+        !holders.contains(&peer_a),
+        "peer-A with Offered status must NOT be in the excluded set (it is a retry candidate)"
+    );
+}
+
+// ─── W11b bugfix: get_existing_holder_ids excludes only Alive ─────────────────
+
+#[test]
+fn worker_excludes_only_alive_peers_from_candidates() {
+    // Unit test for get_existing_holder_ids:
+    //   peer-A = Alive   → excluded (already fully delivered)
+    //   peer-B = Offered → NOT excluded (retry candidate)
+    //   peer-C = Lost    → NOT excluded (needs fresh delivery)
+    //
+    // Only peer-A must be in the returned set.
+    use crate::daemon::work_pipeline::worker::get_existing_holder_ids;
+    use viaticum_core::types::{FileId, PlacementStatus, SymbolPlacement};
+
+    let db = make_db();
+    let bid = block_id(0xCC);
+    let peer_a = device_id(0xA0); // Alive
+    let peer_b = device_id(0xB0); // Offered
+    let peer_c = device_id(0xC0); // Lost
+
+    let record = make_block_record(bid, 1.0, 0.99);
+    db.upsert_source_block(&record).unwrap();
+
+    for (holder, status, esi_start) in [
+        (peer_a, PlacementStatus::Alive, 0u32),
+        (peer_b, PlacementStatus::Offered, 1u32),
+        (peer_c, PlacementStatus::Lost, 2u32),
+    ] {
+        db.upsert_placement(&SymbolPlacement {
+            source_block_id: bid,
+            holder_id: holder,
+            file_id: FileId(0),
+            esi_ranges: vec![(esi_start, 1)],
+            binding_seed: [0u8; 32],
+            status,
+            last_verified: None,
+            placed_at: Timestamp::now(),
+            consecutive_misses: 0,
+        })
+        .unwrap();
+    }
+
+    let holders = get_existing_holder_ids(&db, &bid).unwrap();
+
+    assert_eq!(
+        holders.len(),
+        1,
+        "only 1 holder (Alive) must be excluded; got {:?}",
+        holders
+    );
+    assert!(
+        holders.contains(&peer_a),
+        "peer-A (Alive) must be in the excluded set"
+    );
+    assert!(
+        !holders.contains(&peer_b),
+        "peer-B (Offered) must NOT be in the excluded set — worker retries delivery"
+    );
+    assert!(
+        !holders.contains(&peer_c),
+        "peer-C (Lost) must NOT be in the excluded set — worker retries delivery"
+    );
+}
