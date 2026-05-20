@@ -514,11 +514,13 @@ impl SwarmHandle {
             .with_behaviour(|key, relay_client| ViaticumBehaviour {
                 viaticum: request_response::Behaviour::new(
                     [(VIATICUM_PROTOCOL, ProtocolSupport::Full)],
-                    request_response::Config::default(),
+                    request_response::Config::default()
+                        .with_request_timeout(std::time::Duration::from_secs(30)),
                 ),
                 cert: request_response::Behaviour::new(
                     [(CERT_PROTOCOL, ProtocolSupport::Full)],
-                    request_response::Config::default(),
+                    request_response::Config::default()
+                        .with_request_timeout(std::time::Duration::from_secs(30)),
                 ),
                 identify: libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
                     "/viaticum/identify/1".to_string(),

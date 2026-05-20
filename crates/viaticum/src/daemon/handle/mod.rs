@@ -361,7 +361,12 @@ impl DaemonHandle {
                     device_cert,
                     x25519_pub,
                     listen_port: app_config.network.listen_port,
-                    cert_timeout_secs: 10,
+                    // Must exceed libp2p request_response::Config.request_timeout (30s in
+                    // swarm.rs) so our retry layer fires AFTER RR's own timeout reports the
+                    // failure — otherwise both clocks race and a still-in-flight RR request
+                    // gets cancelled by the duplicate send, surfacing as
+                    // "Connection was closed before a response was received".
+                    cert_timeout_secs: 35,
                     kademlia_bootstrap_peers,
                     kademlia_disable_ipfs_bootstrap: app_config
                         .network
