@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 use viaticum::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
-use viaticum::daemon::repair::{RepairAgent, RepairConfig};
+use viaticum::daemon::repair::RepairAgent;
 use viaticum_core::budget::{compute_effective_quota, should_reject_offers};
 use viaticum_core::commitment::{
     CommitmentScore, CommitmentTier, HolderProfile, compute_commitment, flag_for_proactive_repair,
@@ -38,9 +38,8 @@ use viaticum_core::reliability::{
     BlockReliabilityInput, HolderReliabilityInput, build_report, commitment_to_survival_prob,
 };
 use viaticum_core::types::{
-    DeviceId, FileId, FileRecord, FileVersion, IdentityPub, LocalState, PlacementStatus,
-    SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement,
-    Timestamp,
+    DeviceId, FileId, FileRecord, FileVersion, LocalState, PlacementStatus, SourceBlockId,
+    SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
 };
 
 // ─── Shared fixtures ──────────────────────────────────────────────────────────
@@ -73,18 +72,6 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         master_signing_key: None,
         swarm: None,
         live_watch_configs: None,
-        peer_backoff: None,
-    }
-}
-
-fn repair_config(symbols_dir: &TempDir) -> RepairConfig {
-    RepairConfig {
-        source_blocks_dir: symbols_dir.path().to_path_buf(),
-        symbols_dir: symbols_dir.path().to_path_buf(),
-        epoch_key: EPOCH_KEY,
-        own_identity: IdentityPub([0x99u8; 32]),
-        master_signing_key: None,
-        swarm: None,
         peer_backoff: None,
     }
 }
@@ -646,11 +633,7 @@ async fn full_pipeline_with_phase4_integration() {
     );
     let victim = placements[0].clone();
 
-    let repair_agent = RepairAgent::new(
-        db.clone(),
-        repair_config(&symbols_dir),
-        Arc::new(RaptorQEncoder::new()),
-    );
+    let repair_agent = RepairAgent::new(db.clone());
     repair_agent
         .handle_pos_nack(&victim.source_block_id, &victim.holder_id, Timestamp::now())
         .await

@@ -1,24 +1,21 @@
 // Tests for RepairAgent (Wave 11b updated).
 //
-// Wave 11b removed: repair_placement(), scan_and_repair(), run(), deliver_repaired_symbols().
+// Wave 11b removed: repair_placement(), scan_and_repair(), run(), deliver_repaired_symbols(),
+// load_or_rebuild_blob() and blob-rebuild helpers.
 // Remaining functionality: handle_symbol_dropped, handle_pos_nack, mark_placement_lost,
-// get_candidates_excluding, load_or_rebuild_blob, reliability_scan.
+// reliability_scan.
 //
 // Tests for scan_and_repair / repair_placement are ported to work_pipeline/tests.rs
 // as worker_pos_lost_triggers_block_reappearing_in_queue and
 // periodic_reliability_scan_updates_below_target_blocks.
 
-use std::sync::Arc;
-
-use tempfile::TempDir;
 use viaticum_core::db::Db;
-use viaticum_core::erasure::RaptorQEncoder;
 use viaticum_core::types::{
-    DeviceId, FileId, IdentityPub, PlacementStatus, SourceBlockId, SourceBlockRecord,
-    SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
+    DeviceId, FileId, PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus,
+    SourceBlockType, SymbolPlacement, Timestamp,
 };
 
-use super::{RepairAgent, RepairConfig};
+use super::RepairAgent;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -32,27 +29,6 @@ fn holder_id(byte: u8) -> DeviceId {
 
 fn now() -> Timestamp {
     Timestamp(1_700_000_000)
-}
-
-fn make_source_block_record(bid: SourceBlockId, k: u32, t: u16) -> SourceBlockRecord {
-    SourceBlockRecord {
-        block_id: bid,
-        k,
-        t,
-        block_type: SourceBlockType::Single,
-        status: SourceBlockStatus::Active,
-        created_at: now(),
-        encrypted_size: Some(k as u64 * t as u64),
-        n: Some(k * 4),
-        overhead: None,
-        drop_notice_sent_at: None,
-        importance: 0.0,
-        current_alive: 0,
-        current_reliability: 0.0,
-        target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
-    }
 }
 
 fn make_placement(
@@ -74,20 +50,8 @@ fn make_placement(
     }
 }
 
-fn make_agent(db: Db, symbols_dir: &std::path::Path) -> RepairAgent {
-    RepairAgent::new(
-        db,
-        RepairConfig {
-            source_blocks_dir: symbols_dir.to_path_buf(),
-            symbols_dir: symbols_dir.to_path_buf(),
-            epoch_key: [0u8; 32],
-            own_identity: IdentityPub([9u8; 32]),
-            master_signing_key: None,
-            swarm: None,
-            peer_backoff: None,
-        },
-        Arc::new(RaptorQEncoder::new()),
-    )
+fn make_agent(db: Db) -> RepairAgent {
+    RepairAgent::new(db)
 }
 
 // ─── test 16: handle_symbol_dropped_transitions_to_lost ──────────────────────
@@ -95,8 +59,6 @@ fn make_agent(db: Db, symbols_dir: &std::path::Path) -> RepairAgent {
 #[tokio::test]
 async fn handle_symbol_dropped_transitions_to_lost() {
     let db = Db::open_in_memory().unwrap();
-    let symbols_dir = TempDir::new().unwrap();
-
     let bid = block_id(20);
     let hid = holder_id(21);
 
@@ -108,7 +70,7 @@ async fn handle_symbol_dropped_transitions_to_lost() {
     ))
     .unwrap();
 
-    let agent = make_agent(db.clone(), symbols_dir.path());
+    let agent = make_agent(db.clone());
     agent
         .handle_symbol_dropped(&bid, &hid, now())
         .await
@@ -124,8 +86,6 @@ async fn handle_symbol_dropped_transitions_to_lost() {
 #[tokio::test]
 async fn handle_pos_nack_transitions_to_lost() {
     let db = Db::open_in_memory().unwrap();
-    let symbols_dir = TempDir::new().unwrap();
-
     let bid = block_id(30);
     let hid = holder_id(31);
 
@@ -137,7 +97,7 @@ async fn handle_pos_nack_transitions_to_lost() {
     ))
     .unwrap();
 
-    let agent = make_agent(db.clone(), symbols_dir.path());
+    let agent = make_agent(db.clone());
     agent.handle_pos_nack(&bid, &hid, now()).await.unwrap();
 
     let updated = db.get_placement(&bid, &hid).unwrap().unwrap();
@@ -149,8 +109,6 @@ async fn handle_pos_nack_transitions_to_lost() {
 #[tokio::test]
 async fn handle_symbol_dropped_then_pos_nack_is_idempotent() {
     let db = Db::open_in_memory().unwrap();
-    let symbols_dir = TempDir::new().unwrap();
-
     let bid = block_id(40);
     let hid = holder_id(41);
 
@@ -162,7 +120,7 @@ async fn handle_symbol_dropped_then_pos_nack_is_idempotent() {
     ))
     .unwrap();
 
-    let agent = make_agent(db.clone(), symbols_dir.path());
+    let agent = make_agent(db.clone());
 
     agent
         .handle_symbol_dropped(&bid, &hid, now())
@@ -181,8 +139,6 @@ async fn handle_symbol_dropped_then_pos_nack_is_idempotent() {
 #[tokio::test]
 async fn handle_pos_nack_then_symbol_dropped_is_idempotent() {
     let db = Db::open_in_memory().unwrap();
-    let symbols_dir = TempDir::new().unwrap();
-
     let bid = block_id(50);
     let hid = holder_id(51);
 
@@ -194,7 +150,7 @@ async fn handle_pos_nack_then_symbol_dropped_is_idempotent() {
     ))
     .unwrap();
 
-    let agent = make_agent(db.clone(), symbols_dir.path());
+    let agent = make_agent(db.clone());
 
     agent.handle_pos_nack(&bid, &hid, now()).await.unwrap();
     agent
@@ -273,8 +229,6 @@ fn make_block_for_hook(bid: SourceBlockId) -> SourceBlockRecord {
 #[tokio::test]
 async fn repair_agent_mark_placement_lost_updates_current_alive() {
     let db = Db::open_in_memory().unwrap();
-    let symbols_dir = TempDir::new().unwrap();
-
     let bid = block_id(0x70);
     let hid_a = holder_id(0x71);
     let hid_b = holder_id(0x72);
@@ -299,7 +253,7 @@ async fn repair_agent_mark_placement_lost_updates_current_alive() {
     db.update_block_cached_fields(&bid, 0.5, 2, 0.9, 0.99, None, 0)
         .unwrap();
 
-    let agent = make_agent(db.clone(), symbols_dir.path());
+    let agent = make_agent(db.clone());
     agent
         .handle_symbol_dropped(&bid, &hid_a, now())
         .await
@@ -323,8 +277,6 @@ async fn repair_agent_mark_placement_lost_updates_current_alive() {
 #[tokio::test]
 async fn repair_agent_mark_placement_lost_idempotent_on_already_lost() {
     let db = Db::open_in_memory().unwrap();
-    let symbols_dir = TempDir::new().unwrap();
-
     let bid = block_id(0x73);
     let hid_a = holder_id(0x74);
     let hid_b = holder_id(0x75);
@@ -349,7 +301,7 @@ async fn repair_agent_mark_placement_lost_idempotent_on_already_lost() {
     db.update_block_cached_fields(&bid, 0.5, 1, 0.7, 0.99, None, 0)
         .unwrap();
 
-    let agent = make_agent(db.clone(), symbols_dir.path());
+    let agent = make_agent(db.clone());
     let result = agent.handle_symbol_dropped(&bid, &hid_a, now()).await;
     assert!(
         result.is_ok(),
@@ -369,8 +321,6 @@ async fn repair_agent_mark_placement_lost_idempotent_on_already_lost() {
 #[tokio::test]
 async fn reliability_scan_corrects_stale_current_alive() {
     let db = Db::open_in_memory().unwrap();
-    let symbols_dir = TempDir::new().unwrap();
-
     let bid = block_id(0x80);
     let mut record = make_block_for_hook(bid);
     record.current_alive = 5; // stale — only 2 Alive placements below
@@ -400,7 +350,7 @@ async fn reliability_scan_corrects_stale_current_alive() {
     ))
     .unwrap();
 
-    let agent = make_agent(db.clone(), symbols_dir.path());
+    let agent = make_agent(db.clone());
     let updated_count = agent.reliability_scan().await;
 
     assert!(
@@ -418,8 +368,6 @@ async fn reliability_scan_corrects_stale_current_alive() {
 #[tokio::test]
 async fn reliability_scan_skips_completed_blocks() {
     let db = Db::open_in_memory().unwrap();
-    let symbols_dir = TempDir::new().unwrap();
-
     let bid = block_id(0x90);
     let mut record = make_block_for_hook(bid);
     record.current_alive = 5;
@@ -437,7 +385,7 @@ async fn reliability_scan_skips_completed_blocks() {
         .unwrap();
     }
 
-    let agent = make_agent(db.clone(), symbols_dir.path());
+    let agent = make_agent(db.clone());
     let updated_count = agent.reliability_scan().await;
 
     // May update due to recalculation, but current_alive should match.
@@ -450,43 +398,10 @@ async fn reliability_scan_skips_completed_blocks() {
 #[tokio::test]
 async fn reliability_scan_returns_zero_when_empty() {
     let db = Db::open_in_memory().unwrap();
-    let symbols_dir = TempDir::new().unwrap();
-
-    let agent = make_agent(db, symbols_dir.path());
+    let agent = make_agent(db);
     let updated_count = agent.reliability_scan().await;
     assert_eq!(
         updated_count, 0,
         "reliability_scan should return 0 when no blocks exist"
-    );
-}
-
-// ─── load_or_rebuild_blob fallback tests ────────────────────────────────────
-
-/// load_or_rebuild_blob: no swarm and no source files → EncodeFailed.
-#[tokio::test]
-async fn load_or_rebuild_blob_no_swarm_returns_encode_failed() {
-    let db = Db::open_in_memory().unwrap();
-    let symbols_dir = TempDir::new().unwrap();
-
-    let bid = block_id(0xA0);
-    db.upsert_source_block(&make_source_block_record(bid, 1, 65535))
-        .unwrap();
-
-    // Insert one Alive placement so it tries to fetch from network.
-    db.upsert_placement(&make_placement(
-        bid,
-        holder_id(0x99),
-        vec![(0, 1)],
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-
-    let agent = make_agent(db, symbols_dir.path());
-    let result = agent.load_or_rebuild_blob(&bid).await;
-
-    // block.bin absent, source rebuild fails (no source files), network fallback fails (no swarm).
-    assert!(
-        matches!(result, Err(super::RepairError::EncodeFailed(_))),
-        "load_or_rebuild_blob must return EncodeFailed when no swarm and no source"
     );
 }

@@ -622,19 +622,7 @@ impl DaemonHandle {
 
         // Periodic reliability scan (keeps cached fields consistent as a safety net).
         {
-            let repair_for_scan = crate::daemon::repair::RepairAgent::new(
-                db.clone(),
-                crate::daemon::repair::RepairConfig {
-                    source_blocks_dir: symbols_dir.clone(),
-                    symbols_dir: symbols_dir.clone(),
-                    epoch_key: epoch_key_bytes,
-                    own_identity: identity_pub,
-                    master_signing_key: Some(master_key.clone()),
-                    swarm: swarm_handle_arc.clone(),
-                    peer_backoff: Some(Arc::clone(&peer_backoff)),
-                },
-                encoder.clone(),
-            );
+            let repair_for_scan = crate::daemon::repair::RepairAgent::new(db.clone());
             let cancel_scan = cancel.clone();
             tasks.push(tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(

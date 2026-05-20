@@ -1139,12 +1139,10 @@ async fn after_peer_authenticated_event_cooldowns_are_reset() {
 
 #[tokio::test]
 async fn periodic_reliability_scan_updates_below_target_blocks() {
-    use crate::daemon::repair::{RepairAgent, RepairConfig};
-    use viaticum_core::erasure::RaptorQEncoder;
+    use crate::daemon::repair::RepairAgent;
     use viaticum_core::types::{FileId, PlacementStatus, SymbolPlacement};
 
     let db = make_db();
-    let dir = tempdir().unwrap();
     let bid = block_id(30);
 
     // Block with current_alive=5 (stale) but only 3 Alive placements.
@@ -1170,21 +1168,7 @@ async fn periodic_reliability_scan_updates_below_target_blocks() {
         db.upsert_placement(&p).unwrap();
     }
 
-    let encoder =
-        Arc::new(RaptorQEncoder::new()) as Arc<dyn viaticum_core::erasure::ErasureEncoder>;
-    let repair = RepairAgent::new(
-        db.clone(),
-        RepairConfig {
-            source_blocks_dir: dir.path().to_path_buf(),
-            symbols_dir: dir.path().to_path_buf(),
-            epoch_key: [0u8; 32],
-            own_identity: viaticum_core::types::IdentityPub([0u8; 32]),
-            master_signing_key: None,
-            swarm: None,
-            peer_backoff: None,
-        },
-        encoder,
-    );
+    let repair = RepairAgent::new(db.clone());
 
     // reliability_scan() is added to RepairAgent in Step 10.
     let updated_count = repair.reliability_scan().await;
