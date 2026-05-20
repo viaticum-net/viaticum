@@ -15,9 +15,11 @@ if ssh -o ConnectTimeout=2 -o BatchMode=yes "$SERVER" "echo ok" &>/dev/null; the
         --exclude '.git/objects' \
         . "$SERVER:~/$REMOTE_DIR/"
     ssh "$SERVER" "source ~/.cargo/env && cd ~/$REMOTE_DIR && cargo build $ARGS"
-    echo "=== Copying binary ==="
+    echo "=== Copying binaries ==="
     mkdir -p target/release
-    scp "$SERVER:~/$REMOTE_DIR/target/release/viaticum" target/release/ 2>/dev/null || true
+    scp "$SERVER:~/$REMOTE_DIR/target/release/viaticum" \
+        "$SERVER:~/$REMOTE_DIR/target/release/bootstrap-trust" \
+        target/release/ 2>/dev/null || true
     echo "=== Done (remote) ==="
 else
     echo "=== Server offline, building locally ==="
