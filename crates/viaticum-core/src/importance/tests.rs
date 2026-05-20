@@ -83,6 +83,48 @@ fn classify_file_gz_extension_returns_unknown() {
 }
 
 // ============================================================
+// Extension classification — Document
+// ============================================================
+
+#[test]
+fn classify_file_pdf_returns_document() {
+    let result = classify_file(Path::new("taxes_2024.pdf"), &non_media_folder());
+    assert_eq!(result, ImportanceClass::Document);
+}
+
+#[test]
+fn classify_file_docx_returns_document() {
+    let result = classify_file(Path::new("contract.docx"), &non_media_folder());
+    assert_eq!(result, ImportanceClass::Document);
+}
+
+#[test]
+fn classify_file_xlsx_returns_document() {
+    let result = classify_file(Path::new("budget.xlsx"), &non_media_folder());
+    assert_eq!(result, ImportanceClass::Document);
+}
+
+#[test]
+fn importance_value_document_is_one() {
+    assert_eq!(importance_value(ImportanceClass::Document), 1.00);
+}
+
+#[test]
+fn pdf_in_media_folder_still_classifies_as_document() {
+    // PDF should not be captured by the media-bucket path even when
+    // the containing folder is a media folder.
+    let result = classify_file(
+        Path::new("/home/alice/Photos/scan_passport.pdf"),
+        &media_folder(),
+    );
+    assert_eq!(
+        result,
+        ImportanceClass::Document,
+        "pdf in a media folder must be Document, not a media bucket"
+    );
+}
+
+// ============================================================
 // Special filenames (no extension)
 // ============================================================
 

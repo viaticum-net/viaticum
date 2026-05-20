@@ -329,6 +329,16 @@ pub struct AckMsg {
 // ============================================================
 
 /// All direct-connection messages. Framed with [u32 BE len][CBOR].
+///
+/// The `Unknown` unit variant catches any unrecognised `"type"` tag value
+/// (via `#[serde(other)]`).  It is used for graceful rolling-upgrade
+/// compatibility: a node running an older protocol version decodes the
+/// message successfully as `Unknown` instead of returning an
+/// `io::Error`, so the libp2p stream is not closed and the peer is not
+/// disconnected.  `dispatch_libp2p` already has a catch-all `other =>`
+/// arm that logs a warning and sends an Ack for any unhandled variant.
+///
+/// `Unknown` is a decode-only sentinel and must never be *sent* on the wire.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
@@ -358,6 +368,11 @@ pub enum Message {
     SystemStateRequest(SystemStateRequestMsg),
     SystemStateResponse(SystemStateResponseMsg),
     Ack(AckMsg),
+    /// Decode-only sentinel: any unrecognised `"type"` tag value is decoded
+    /// as this variant instead of returning a deserialisation error.
+    /// Must never be constructed or sent.
+    #[serde(other)]
+    Unknown,
 }
 
 // ============================================================

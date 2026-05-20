@@ -1,10 +1,24 @@
 // Extension sets for importance classification.
 // All values are lowercase — callers must ASCII-lowercase the extension before lookup.
 
+/// Binary office document and e-book extensions.
+///
+/// PDF, Word, Excel, PowerPoint, OpenDocument, Apple iWork, EPUB, DjVu, RTF.
+/// These get `ImportanceClass::Document` (importance 1.0) — critical for DR
+/// use case (taxes, passports, contracts).
+pub(crate) const DOCUMENT_EXTENSIONS: &[&str] = &[
+    // PDF
+    "pdf", // Microsoft Office
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx", // OpenDocument
+    "odt", "ods", "odp", // Other text-like binary formats
+    "rtf", "epub", // Apple iWork
+    "pages", "numbers", "key", // DjVu
+    "djvu",
+];
+
 /// Plain text, source code, config, and data file extensions.
 ///
-/// Does NOT include binary document formats (pdf, doc, xls, ppt) — those are Unknown.
-/// See D6 in the wave 5 spec for rationale.
+/// Does NOT include binary document formats — see `DOCUMENT_EXTENSIONS`.
 pub(crate) const TEXT_OR_CODE_EXTENSIONS: &[&str] = &[
     // Plain text and documents
     "txt",

@@ -959,13 +959,21 @@ fn handshake_freshness_symmetric() {
     );
 }
 
-// ─── MSG-11: unknown_message_variant_returns_error_not_panic ─────────────────
+// ─── MSG-11: unknown_message_variant_decodes_as_unknown_not_error ────────────
+//
+// Rolling-upgrade compatibility: when a node receives a message whose "type"
+// tag is not recognised (e.g. a newer peer sends a variant that does not exist
+// yet in this binary), the decode must succeed as Message::Unknown rather than
+// returning an Err.  Returning Err would cause read_framed_message in swarm.rs
+// to propagate an io::Error, closing the libp2p stream and disconnecting the
+// peer — breaking mixed-version clusters during upgrades.
 
 #[test]
-fn unknown_message_variant_returns_error_not_panic() {
+fn unknown_message_variant_decodes_as_unknown_not_error() {
     // Build a CBOR map: {"type": "nonexistent_type", "v": 1}.
-    // Message uses #[serde(tag = "type", rename_all = "snake_case")], so an
-    // unknown "type" value must produce a deserialization error, not a panic.
+    // Message uses #[serde(tag = "type", rename_all = "snake_case")] with a
+    // #[serde(other)] Unknown unit variant, so an unrecognised "type" value
+    // must decode as Message::Unknown without error and without panic.
     let mut buf = Vec::new();
     ciborium::ser::into_writer(
         &ciborium::value::Value::Map(vec![
@@ -984,9 +992,32 @@ fn unknown_message_variant_returns_error_not_panic() {
 
     let result = from_cbor::<Message>(&buf);
     assert!(
-        result.is_err(),
-        "deserializing an unknown message type must return Err, not Ok or panic"
+        matches!(result, Ok(Message::Unknown)),
+        "deserializing an unknown message type must return Ok(Message::Unknown), got: {result:?}"
     );
+}
+
+#[test]
+fn unknown_message_variant_from_cbor_does_not_close_stream() {
+    // Complementary check: verify that multiple distinct unknown type strings
+    // all decode as Message::Unknown (not just one specific unknown type).
+    for unknown_type in &["new_feature_v2", "future_msg", "experimental_probe"] {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(
+            &ciborium::value::Value::Map(vec![(
+                ciborium::value::Value::Text("type".to_string()),
+                ciborium::value::Value::Text(unknown_type.to_string()),
+            )]),
+            &mut buf,
+        )
+        .expect("CBOR encode failed");
+
+        let result = from_cbor::<Message>(&buf);
+        assert!(
+            matches!(result, Ok(Message::Unknown)),
+            "type={unknown_type}: expected Ok(Message::Unknown), got: {result:?}"
+        );
+    }
 }
 
 // ─── MSG-12: all 26 message variants have v == 1 ─────────────────────────────
@@ -1024,6 +1055,8 @@ fn all_messages_have_version_one() {
             Message::SystemStateRequest(m) => m.v,
             Message::SystemStateResponse(m) => m.v,
             Message::Ack(m) => m.v,
+            // Unknown is a decode-only sentinel; it is never in all_26_message_variants().
+            Message::Unknown => unreachable!("Unknown must not appear in all_26_message_variants"),
         };
         assert_eq!(
             v,

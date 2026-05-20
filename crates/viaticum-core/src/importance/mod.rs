@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 mod extensions;
-use extensions::{MEDIA_EXTENSIONS, TEXT_OR_CODE_EXTENSIONS};
+use extensions::{DOCUMENT_EXTENSIONS, MEDIA_EXTENSIONS, TEXT_OR_CODE_EXTENSIONS};
 
 pub mod burst;
 pub use burst::{
@@ -29,6 +29,9 @@ pub enum ImportanceClass {
     /// Plain text, source code, config files — extension whitelist.
     /// Base importance: 1.0
     TextOrCode,
+    /// Binary office document — PDF, Word, Excel, etc.
+    /// Base importance: 1.0
+    Document,
     /// Media file in a media folder, top 5% bucket (deterministic hash).
     /// Base importance: 0.95
     MediaHigh,
@@ -126,10 +129,13 @@ fn is_special_text_filename(path: &Path) -> bool {
 ///    `TEXT_OR_CODE_EXTENSIONS` → `TextOrCode`.
 /// 2. If the file has no extension and the filename matches a known special
 ///    filename (Dockerfile, Makefile, .gitignore, etc.) → `TextOrCode`.
-/// 3. If `folder.is_media_folder` AND the extension is in `MEDIA_EXTENSIONS`
+/// 3. If the extension is in `DOCUMENT_EXTENSIONS` → `Document`.
+///    This takes priority over media-folder detection, so a PDF in a media
+///    folder is still classified as `Document`, not a media bucket.
+/// 4. If `folder.is_media_folder` AND the extension is in `MEDIA_EXTENSIONS`
 ///    → hash-bucket the full path: `[0,5)` → `MediaHigh`, `[5,30)` → `MediaMedium`,
 ///    `[30,100)` → `MediaLow`.
-/// 4. Otherwise → `Unknown`.
+/// 5. Otherwise → `Unknown`.
 ///
 /// Note: a media-extension file OUTSIDE a media folder returns `Unknown`.
 /// This is intentional: stray photos in a documents folder should not compete
@@ -157,6 +163,9 @@ pub fn classify_file(path: &Path, folder: &FolderClassification) -> ImportanceCl
             let ext_lower = ext.to_ascii_lowercase();
             if TEXT_OR_CODE_EXTENSIONS.contains(&ext_lower.as_str()) {
                 return ImportanceClass::TextOrCode;
+            }
+            if DOCUMENT_EXTENSIONS.contains(&ext_lower.as_str()) {
+                return ImportanceClass::Document;
             }
             if folder.is_media_folder && MEDIA_EXTENSIONS.contains(&ext_lower.as_str()) {
                 return match path_bucket(path) {
@@ -226,6 +235,7 @@ pub fn classify_folder(paths: &[PathBuf]) -> FolderClassification {
 /// | Class       | Value |
 /// |-------------|-------|
 /// | TextOrCode  | 1.00  |
+/// | Document    | 1.00  |
 /// | MediaHigh   | 0.95  |
 /// | MediaMedium | 0.65  |
 /// | MediaLow    | 0.20  |
@@ -233,6 +243,7 @@ pub fn classify_folder(paths: &[PathBuf]) -> FolderClassification {
 pub fn importance_value(class: ImportanceClass) -> f64 {
     match class {
         ImportanceClass::TextOrCode => 1.00,
+        ImportanceClass::Document => 1.00,
         ImportanceClass::MediaHigh => 0.95,
         ImportanceClass::MediaMedium => 0.65,
         ImportanceClass::MediaLow => 0.20,
