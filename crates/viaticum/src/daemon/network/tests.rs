@@ -146,7 +146,7 @@ fn cert_verify_multi_device_joiner_accepts_cert_signed_by_founder() {
 /// as a Cross stranger (trust=0 from trust formula) — this is correct behavior,
 /// not an attack success.
 #[test]
-fn cert_verify_multi_device_rejects_self_signed_cert_from_joiner() {
+fn cert_verify_multi_device_rogue_joiner_lands_in_cross_not_intra() {
     let founder_master = derive_master_key(&[0x10u8; 64]).unwrap();
     let founder_identity = master_identity(&founder_master);
 

@@ -1153,7 +1153,6 @@ impl EventLoopState {
                 return;
             }
         };
-        info!(peer_id = %peer_id, path = ?path, "peer authenticated (listener side)");
 
         // Send our own cert as response.
         let response = DeviceCertExchangeMsg {
@@ -1171,7 +1170,7 @@ impl EventLoopState {
             return;
         }
 
-        self.record_authenticated(peer_id, request).await;
+        self.record_authenticated(peer_id, request, path).await;
     }
 
     async fn on_cert_response(&mut self, peer_id: PeerId, response: DeviceCertExchangeMsg) {
@@ -1189,13 +1188,17 @@ impl EventLoopState {
                 return;
             }
         };
-        info!(peer_id = %peer_id, path = ?path, "peer authenticated (dialer side)");
 
-        self.record_authenticated(peer_id, response).await;
+        self.record_authenticated(peer_id, response, path).await;
     }
 
     /// Record a successfully verified peer in the authenticated maps.
-    async fn record_authenticated(&mut self, peer_id: PeerId, msg: DeviceCertExchangeMsg) {
+    async fn record_authenticated(
+        &mut self,
+        peer_id: PeerId,
+        msg: DeviceCertExchangeMsg,
+        path: CertTrustPath,
+    ) {
         let device_id = msg.cert.device_id;
         let identity_pub = msg.cert.master_pub_key;
 
@@ -1208,6 +1211,7 @@ impl EventLoopState {
             peer_id = %peer_id,
             device_id = %device_id,
             identity_pub = %identity_pub,
+            path = ?path,
             "peer authenticated"
         );
 
