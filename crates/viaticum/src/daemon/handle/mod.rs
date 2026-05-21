@@ -911,6 +911,7 @@ impl DaemonHandle {
                     tick_interval: std::time::Duration::from_secs((60 / time_scale).max(1)),
                     completion_bonus_coef: app_config.reliability.completion_bonus_coefficient,
                     device_id,
+                    own_master_pub_key: identity_pub,
                     epoch_key: epoch_key_bytes,
                     min_pool_size: 2,
                     time_scale,

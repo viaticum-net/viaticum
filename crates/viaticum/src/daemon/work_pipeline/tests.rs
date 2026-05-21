@@ -9,10 +9,13 @@ use viaticum_core::db::Db;
 use viaticum_core::erasure::RaptorQEncoder;
 use viaticum_core::placement::HolderCandidate;
 use viaticum_core::types::{
-    DeviceId, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, Timestamp,
+    DeviceId, IdentityPub, PeerRecord, SourceBlockId, SourceBlockRecord, SourceBlockStatus,
+    SourceBlockType, Timestamp,
 };
 
-use crate::daemon::work_pipeline::{WorkPipeline, WorkPipelineConfig, pool_signature};
+use crate::daemon::work_pipeline::{
+    WorkPipeline, WorkPipelineConfig, pool_signature, snapshot_pool,
+};
 
 // ─── Filesystem helpers ───────────────────────────────────────────────────────
 
@@ -132,6 +135,7 @@ fn make_config() -> WorkPipelineConfig {
         tick_interval: Duration::from_secs(60),
         completion_bonus_coef: 1.5,
         device_id: device_id(0),
+        own_master_pub_key: viaticum_core::types::IdentityPub([0u8; 32]),
         epoch_key: [0u8; 32],
         min_pool_size: 2,
         time_scale: 1,
@@ -1304,4 +1308,125 @@ fn worker_excludes_only_alive_peers_from_candidates() {
         !holders.contains(&peer_c),
         "peer-C (Lost) must NOT be in the excluded set — worker retries delivery"
     );
+}
+
+// ─── snapshot_pool: sibling exclusion tests ───────────────────────────────────
+
+fn master_pub(byte: u8) -> IdentityPub {
+    let mut b = [0u8; 32];
+    b[0] = byte;
+    IdentityPub(b)
+}
+
+fn make_peer_with_master(device_id: DeviceId, master: IdentityPub) -> PeerRecord {
+    PeerRecord {
+        device_id,
+        master_identity: master,
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(1000),
+        last_seen: Timestamp(2000),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+    }
+}
+
+/// E: snapshot_pool excludes siblings (same master, different device).
+#[tokio::test]
+async fn snapshot_pool_excludes_siblings_same_master() {
+    let db = make_db();
+    let own_device = device_id(0x01);
+    let own_master = master_pub(0xAA);
+
+    let sibling = device_id(0x02);
+    let foreign1 = device_id(0x03);
+    let foreign2 = device_id(0x04);
+
+    // own device: master A — registered but own_device_id will filter it
+    db.upsert_peer(&make_peer_with_master(own_device, own_master))
+        .unwrap();
+    // sibling: same master A, different device — must be filtered by master_identity
+    db.upsert_peer(&make_peer_with_master(sibling, own_master))
+        .unwrap();
+    // foreign peers with different masters — must pass
+    db.upsert_peer(&make_peer_with_master(foreign1, master_pub(0xBB)))
+        .unwrap();
+    db.upsert_peer(&make_peer_with_master(foreign2, master_pub(0xCC)))
+        .unwrap();
+
+    let pool = snapshot_pool(None, &db, None, &own_device, &own_master, 0).await;
+
+    let candidate_ids: Vec<DeviceId> = pool.candidates.iter().map(|c| c.device_id).collect();
+    assert!(
+        !candidate_ids.contains(&own_device),
+        "own device must be excluded"
+    );
+    assert!(
+        !candidate_ids.contains(&sibling),
+        "sibling (same master) must be excluded"
+    );
+    assert!(
+        candidate_ids.contains(&foreign1),
+        "foreign1 must be included"
+    );
+    assert!(
+        candidate_ids.contains(&foreign2),
+        "foreign2 must be included"
+    );
+}
+
+/// F: snapshot_pool excludes self via device_id even when master matches.
+#[tokio::test]
+async fn snapshot_pool_excludes_self_via_device_id() {
+    let db = make_db();
+    let own_device = device_id(0x10);
+    let own_master = master_pub(0xAA);
+
+    db.upsert_peer(&make_peer_with_master(own_device, own_master))
+        .unwrap();
+
+    let pool = snapshot_pool(None, &db, None, &own_device, &own_master, 0).await;
+
+    assert!(
+        pool.candidates.is_empty(),
+        "pool must be empty: only own device was in DB"
+    );
+}
+
+/// G: snapshot_pool includes cross-master peers only.
+#[tokio::test]
+async fn snapshot_pool_includes_cross_master_peers() {
+    let db = make_db();
+    let own_device = device_id(0x20);
+    let own_master = master_pub(0x01);
+
+    let peer_b = device_id(0x21);
+    let peer_c = device_id(0x22);
+    let peer_d = device_id(0x23);
+
+    db.upsert_peer(&make_peer_with_master(own_device, own_master))
+        .unwrap();
+    db.upsert_peer(&make_peer_with_master(peer_b, master_pub(0x02)))
+        .unwrap();
+    db.upsert_peer(&make_peer_with_master(peer_c, master_pub(0x03)))
+        .unwrap();
+    db.upsert_peer(&make_peer_with_master(peer_d, master_pub(0x04)))
+        .unwrap();
+
+    let pool = snapshot_pool(None, &db, None, &own_device, &own_master, 0).await;
+
+    assert_eq!(
+        pool.candidates.len(),
+        3,
+        "3 cross-master peers must be in the pool"
+    );
+    let ids: Vec<DeviceId> = pool.candidates.iter().map(|c| c.device_id).collect();
+    assert!(ids.contains(&peer_b));
+    assert!(ids.contains(&peer_c));
+    assert!(ids.contains(&peer_d));
+    assert!(!ids.contains(&own_device), "own device must not appear");
 }

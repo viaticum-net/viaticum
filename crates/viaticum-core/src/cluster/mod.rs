@@ -16,6 +16,18 @@ mod tests;
 )]
 pub struct EpochCounter(pub u32);
 
+/// Outcome of cert verification — tells the caller whether the peer belongs
+/// to our own cluster (intra) or is an authenticated stranger (cross-cluster).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertTrustPath {
+    /// `cert.master_pub_key == own cluster_master_pub`. HIGH-1 strict path.
+    Intra,
+    /// `cert.master_pub_key != own cluster_master_pub`. Self-signed accepted;
+    /// peer is authenticated as unknown stranger, trust formula handles isolation
+    /// (no MasterTrustRecord ⇒ effective trust ≈ 0).
+    Cross,
+}
+
 /// Certificate issued by master key to authorize a device.
 ///
 /// device_id.0 IS the Ed25519 public key of the device — no separate device_pub_key.

@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 
 use viaticum_core::db::Db;
 use viaticum_core::placement::HolderCandidate;
-use viaticum_core::types::DeviceId;
+use viaticum_core::types::{DeviceId, IdentityPub};
 
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
@@ -58,13 +58,15 @@ fn trust_bucket(trust: f64) -> u8 {
 
 /// Build a PoolSnapshot from the current swarm state + DB trust values.
 ///
-/// Excludes: self, peers not authenticated, peers on backoff.
+/// Excludes: self (by device_id), siblings (same master_identity), unauthenticated peers,
+/// peers on backoff.
 /// Falls back to unfiltered candidates if fewer than `min_size` authenticated peers.
 pub async fn snapshot_pool(
     swarm: Option<&SwarmHandle>,
     db: &Db,
     peer_backoff: Option<&PeerBackoff>,
     own_device_id: &DeviceId,
+    own_master_pub_key: &IdentityPub,
     min_size: usize,
 ) -> PoolSnapshot {
     // Get authenticated peer set.
@@ -91,7 +93,7 @@ pub async fn snapshot_pool(
 
     let all_candidates: Vec<HolderCandidate> = peers
         .into_iter()
-        .filter(|p| &p.device_id != own_device_id)
+        .filter(|p| &p.device_id != own_device_id && &p.master_identity != own_master_pub_key)
         .map(|p| {
             let trust_raw = (viaticum_core::constants::KP * p.trust_p
                 + viaticum_core::constants::KI * p.trust_i)

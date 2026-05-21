@@ -28,7 +28,7 @@ mod worker;
 #[cfg(test)]
 mod tests;
 
-pub use pool::{PoolSnapshot, pool_signature};
+pub use pool::{PoolSnapshot, pool_signature, snapshot_pool};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -57,6 +57,8 @@ pub struct WorkPipelineConfig {
     pub completion_bonus_coef: f64,
     /// This device's ID. Used for ESI namespace offset computation.
     pub device_id: DeviceId,
+    /// This node's own cluster master pub key. Used to exclude siblings from the placement pool.
+    pub own_master_pub_key: viaticum_core::types::IdentityPub,
     /// Epoch key (same as BackupCoordinator uses). For `rebuild_source_blob`.
     pub epoch_key: [u8; 32],
     /// Minimum pool size to attempt delivery. Below this, apply cooldown without encoding.
@@ -73,6 +75,7 @@ impl Default for WorkPipelineConfig {
             tick_interval: Duration::from_secs(60),
             completion_bonus_coef: 1.5,
             device_id: DeviceId([0u8; 32]),
+            own_master_pub_key: viaticum_core::types::IdentityPub([0u8; 32]),
             epoch_key: [0u8; 32],
             min_pool_size: 2,
             time_scale: 1,
@@ -187,6 +190,7 @@ impl WorkPipeline {
             &self.db,
             self.peer_backoff.as_deref(),
             &self.config.device_id,
+            &self.config.own_master_pub_key,
             self.config.min_pool_size,
         )
         .await;

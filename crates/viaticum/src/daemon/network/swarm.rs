@@ -32,7 +32,7 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
-use viaticum_core::cluster::{DeviceCertificate, verify_device_certificate};
+use viaticum_core::cluster::{CertTrustPath, DeviceCertificate, verify_device_certificate};
 use viaticum_core::messages::Message;
 use viaticum_core::types::{DeviceId, IdentityPub};
 
@@ -1141,16 +1141,19 @@ impl EventLoopState {
     ) {
         debug!(peer_id = %peer_id, "received cert request (listener side)");
 
-        if let Err(reason) = verify_cert_for_peer(&peer_id, &request.cert, &self.cluster_master_pub)
-        {
-            warn!(
-                peer_id = %peer_id,
-                reason = %reason,
-                "cert verification failed, closing connection"
-            );
-            self.swarm.disconnect_peer_id(peer_id).ok();
-            return;
-        }
+        let path = match verify_cert_for_peer(&peer_id, &request.cert, &self.cluster_master_pub) {
+            Ok(p) => p,
+            Err(reason) => {
+                warn!(
+                    peer_id = %peer_id,
+                    reason = %reason,
+                    "cert verification failed, closing connection"
+                );
+                self.swarm.disconnect_peer_id(peer_id).ok();
+                return;
+            }
+        };
+        info!(peer_id = %peer_id, path = ?path, "peer authenticated (listener side)");
 
         // Send our own cert as response.
         let response = DeviceCertExchangeMsg {
@@ -1174,17 +1177,19 @@ impl EventLoopState {
     async fn on_cert_response(&mut self, peer_id: PeerId, response: DeviceCertExchangeMsg) {
         debug!(peer_id = %peer_id, "received cert response (dialer side)");
 
-        if let Err(reason) =
-            verify_cert_for_peer(&peer_id, &response.cert, &self.cluster_master_pub)
-        {
-            warn!(
-                peer_id = %peer_id,
-                reason = %reason,
-                "cert response verification failed, closing connection"
-            );
-            self.swarm.disconnect_peer_id(peer_id).ok();
-            return;
-        }
+        let path = match verify_cert_for_peer(&peer_id, &response.cert, &self.cluster_master_pub) {
+            Ok(p) => p,
+            Err(reason) => {
+                warn!(
+                    peer_id = %peer_id,
+                    reason = %reason,
+                    "cert response verification failed, closing connection"
+                );
+                self.swarm.disconnect_peer_id(peer_id).ok();
+                return;
+            }
+        };
+        info!(peer_id = %peer_id, path = ?path, "peer authenticated (dialer side)");
 
         self.record_authenticated(peer_id, response).await;
     }
@@ -1634,8 +1639,8 @@ impl EventLoopState {
 pub(crate) fn verify_cert_for_peer(
     peer_id: &PeerId,
     cert: &DeviceCertificate,
-    cluster_master_pub: &IdentityPub,
-) -> Result<(), String> {
+    own_cluster_master_pub: &IdentityPub,
+) -> Result<CertTrustPath, String> {
     // Check 1: does cert.device_id match the Noise-authenticated PeerId?
     let expected_peer_id = device_id_to_peer_id(&cert.device_id)
         .map_err(|e| format!("cannot derive PeerId from cert.device_id: {e}"))?;
@@ -1645,16 +1650,23 @@ pub(crate) fn verify_cert_for_peer(
         ));
     }
 
-    // Check 2: cert is signed by the trusted cluster master.
+    // Check 2: split by master match.
     //
-    // `cluster_master_pub` is the founder's identity, loaded from
-    // `ClusterState.master_pub()` at startup. For a single-device cluster it
-    // happens to equal this node's own derived master; for a joined cluster
-    // it's the founder's master (different from our own).
-    verify_device_certificate(cert, cluster_master_pub)
-        .map_err(|e| format!("cert not signed by cluster master: {e}"))?;
-
-    Ok(())
+    // Intra path: cert is from our own cluster. Verify under own cluster master
+    // (HIGH-1 strict anchor — no impersonation possible).
+    //
+    // Cross path: cert is from a different cluster. Verify under cert.master_pub_key
+    // (self-signed). Peer is authenticated as a stranger; trust formula starts
+    // them at effective trust ≈ 0 (no MasterTrustRecord for their master).
+    if cert.master_pub_key == *own_cluster_master_pub {
+        verify_device_certificate(cert, own_cluster_master_pub)
+            .map_err(|e| format!("intra-cluster cert: {e}"))?;
+        Ok(CertTrustPath::Intra)
+    } else {
+        verify_device_certificate(cert, &cert.master_pub_key)
+            .map_err(|e| format!("cross-cluster cert self-signature: {e}"))?;
+        Ok(CertTrustPath::Cross)
+    }
 }
 
 /// Emit a ProtocolEvent to the consumer channel (best-effort, non-blocking).
