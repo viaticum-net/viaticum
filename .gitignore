@@ -1,7 +1,25 @@
+# Build / runtime
 data/
 .venv/
 results/
-__pycache__/
 target/
+__pycache__/
+
+# Claude Code workflow / agent state
 .claude/worktrees/
 .claude/scheduled_tasks.lock
+
+# Internal AI-workflow doc (locally only)
+CLAUDE.md
+
+# Internal work artifacts (locally only)
+IMPLEMENTATION_REPORT*.md
+
+# Private project workspace (grant docs, personal notes, drafts)
+private/
+docs/grant/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~
