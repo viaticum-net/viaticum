@@ -24,3 +24,4 @@ docs/grant/
 .DS_Store
 *.swp
 *~
+.git.private-backup/
