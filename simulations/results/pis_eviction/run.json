@@ -1,0 +1,731 @@
+{
+  "experiment": "23: Eviction Strategies",
+  "elapsed_sec": 51.47073698043823,
+  "strategies": [
+    {
+      "config": {
+        "kp": 0.5,
+        "ki": 2.0,
+        "p_window_weeks": 4,
+        "initial_peers": 50,
+        "max_active_peers": 1000,
+        "annual_churn": 0.25,
+        "target_partners": 15,
+        "acceptance_gate": 0.3,
+        "n_years": 5,
+        "n_seeds": 2,
+        "eviction_strategy": "none",
+        "eviction_threshold": 1.0,
+        "eviction_period_weeks": 4
+      },
+      "label": "Strategy A: No eviction",
+      "snapshots": [
+        {
+          "year": 1,
+          "kendall_tau": 0.9660917830792959,
+          "turnover_rate": 4.1264792784324325,
+          "same_arch_frac": {
+            "Reliable": 0.3599398383366407,
+            "Weekend": 0.2598775553623635,
+            "Seasonal": 0.1512624859024387,
+            "Nomad": 0.19404600811907985,
+            "Hoarder": 0.15186771440320698,
+            "Freeloader": 0.08725475331291507
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.5,
+            "Seasonal": 2.3882679377811127,
+            "Nomad": 1.2725945975934994,
+            "Hoarder": 0.9465776519549014,
+            "Freeloader": 0.5953755647875791
+          },
+          "n_active": 996,
+          "mean_partners": 14.973892531866959
+        },
+        {
+          "year": 2,
+          "kendall_tau": 0.9660917830792959,
+          "turnover_rate": 4.320051052341937,
+          "same_arch_frac": {
+            "Reliable": 0.3400074423388305,
+            "Weekend": 0.26089831384294304,
+            "Seasonal": 0.15996344896416786,
+            "Nomad": 0.15107665805340226,
+            "Hoarder": 0.14800969036263154,
+            "Freeloader": 0.09644512777505998
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.5,
+            "Seasonal": 2.387278580917031,
+            "Nomad": 1.2115667200338214,
+            "Hoarder": 0.9327261715497009,
+            "Freeloader": 0.6152159480047523
+          },
+          "n_active": 993,
+          "mean_partners": 14.97835958348277
+        },
+        {
+          "year": 3,
+          "kendall_tau": 0.9830458915396478,
+          "turnover_rate": 3.9112897227365764,
+          "same_arch_frac": {
+            "Reliable": 0.34175726365312475,
+            "Weekend": 0.26592735207290463,
+            "Seasonal": 0.14991390918629188,
+            "Nomad": 0.12012053960306684,
+            "Hoarder": 0.1697530864197531,
+            "Freeloader": 0.0949059829059829
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0006024096385542169,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.499966605443314,
+            "Seasonal": 2.390269449609153,
+            "Nomad": 1.2917217220777817,
+            "Hoarder": 0.9777777777777779,
+            "Freeloader": 0.616974358974359
+          },
+          "n_active": 989,
+          "mean_partners": 14.990898867214657
+        },
+        {
+          "year": 4,
+          "kendall_tau": 0.9830458915396478,
+          "turnover_rate": 4.115766694049311,
+          "same_arch_frac": {
+            "Reliable": 0.3571706479799874,
+            "Weekend": 0.25833333333333336,
+            "Seasonal": 0.15153798858146683,
+            "Nomad": 0.11987835308796008,
+            "Hoarder": 0.18052484860136497,
+            "Freeloader": 0.08938389831488613
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.4999767138599105,
+            "Seasonal": 2.391864978489494,
+            "Nomad": 1.2484523277120345,
+            "Hoarder": 1.0053478163350316,
+            "Freeloader": 0.6180950233047662
+          },
+          "n_active": 996,
+          "mean_partners": 14.973903541489417
+        },
+        {
+          "year": 5,
+          "kendall_tau": 0.9830458915396478,
+          "turnover_rate": 4.464305897737638,
+          "same_arch_frac": {
+            "Reliable": 0.36138688765659777,
+            "Weekend": 0.23989859702736493,
+            "Seasonal": 0.1521868365180467,
+            "Nomad": 0.10148446186824397,
+            "Hoarder": 0.1888313754782788,
+            "Freeloader": 0.10660377358490566
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.001201923076923077,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.4999685542502075,
+            "Seasonal": 2.3940534104690427,
+            "Nomad": 1.257319494340917,
+            "Hoarder": 1.0385083731615323,
+            "Freeloader": 0.6682032590051459
+          },
+          "n_active": 995,
+          "mean_partners": 14.981413089544105
+        }
+      ]
+    },
+    {
+      "config": {
+        "kp": 0.5,
+        "ki": 2.0,
+        "p_window_weeks": 4,
+        "initial_peers": 50,
+        "max_active_peers": 1000,
+        "annual_churn": 0.25,
+        "target_partners": 15,
+        "acceptance_gate": 0.3,
+        "n_years": 5,
+        "n_seeds": 2,
+        "eviction_strategy": "soft",
+        "eviction_threshold": 1.0,
+        "eviction_period_weeks": 4
+      },
+      "label": "Strategy B: Soft eviction (economic, at disk pressure)",
+      "snapshots": [
+        {
+          "year": 1,
+          "kendall_tau": 0.9660917830792959,
+          "turnover_rate": 4.1264792784324325,
+          "same_arch_frac": {
+            "Reliable": 0.3599398383366407,
+            "Weekend": 0.2598775553623635,
+            "Seasonal": 0.1512624859024387,
+            "Nomad": 0.19404600811907985,
+            "Hoarder": 0.15186771440320698,
+            "Freeloader": 0.08725475331291507
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.5,
+            "Seasonal": 2.3882679377811127,
+            "Nomad": 1.2725945975934994,
+            "Hoarder": 0.9465776519549014,
+            "Freeloader": 0.5953755647875791
+          },
+          "n_active": 996,
+          "mean_partners": 14.973892531866959
+        },
+        {
+          "year": 2,
+          "kendall_tau": 0.9660917830792959,
+          "turnover_rate": 4.320051052341937,
+          "same_arch_frac": {
+            "Reliable": 0.3400074423388305,
+            "Weekend": 0.26089831384294304,
+            "Seasonal": 0.15996344896416786,
+            "Nomad": 0.15107665805340226,
+            "Hoarder": 0.14800969036263154,
+            "Freeloader": 0.09644512777505998
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.5,
+            "Seasonal": 2.387278580917031,
+            "Nomad": 1.2115667200338214,
+            "Hoarder": 0.9327261715497009,
+            "Freeloader": 0.6152159480047523
+          },
+          "n_active": 993,
+          "mean_partners": 14.97835958348277
+        },
+        {
+          "year": 3,
+          "kendall_tau": 0.9830458915396478,
+          "turnover_rate": 3.9112897227365764,
+          "same_arch_frac": {
+            "Reliable": 0.34175726365312475,
+            "Weekend": 0.26592735207290463,
+            "Seasonal": 0.14991390918629188,
+            "Nomad": 0.12012053960306684,
+            "Hoarder": 0.1697530864197531,
+            "Freeloader": 0.0949059829059829
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0006024096385542169,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.499966605443314,
+            "Seasonal": 2.390269449609153,
+            "Nomad": 1.2917217220777817,
+            "Hoarder": 0.9777777777777779,
+            "Freeloader": 0.616974358974359
+          },
+          "n_active": 989,
+          "mean_partners": 14.990898867214657
+        },
+        {
+          "year": 4,
+          "kendall_tau": 0.9830458915396478,
+          "turnover_rate": 4.115766694049311,
+          "same_arch_frac": {
+            "Reliable": 0.3571706479799874,
+            "Weekend": 0.25833333333333336,
+            "Seasonal": 0.15153798858146683,
+            "Nomad": 0.11987835308796008,
+            "Hoarder": 0.18052484860136497,
+            "Freeloader": 0.08938389831488613
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.4999767138599105,
+            "Seasonal": 2.391864978489494,
+            "Nomad": 1.2484523277120345,
+            "Hoarder": 1.0053478163350316,
+            "Freeloader": 0.6180950233047662
+          },
+          "n_active": 996,
+          "mean_partners": 14.973903541489417
+        },
+        {
+          "year": 5,
+          "kendall_tau": 0.9830458915396478,
+          "turnover_rate": 4.464305897737638,
+          "same_arch_frac": {
+            "Reliable": 0.36138688765659777,
+            "Weekend": 0.23989859702736493,
+            "Seasonal": 0.1521868365180467,
+            "Nomad": 0.10148446186824397,
+            "Hoarder": 0.1888313754782788,
+            "Freeloader": 0.10660377358490566
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.001201923076923077,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.4999685542502075,
+            "Seasonal": 2.3940534104690427,
+            "Nomad": 1.257319494340917,
+            "Hoarder": 1.0385083731615323,
+            "Freeloader": 0.6682032590051459
+          },
+          "n_active": 995,
+          "mean_partners": 14.981413089544105
+        }
+      ]
+    },
+    {
+      "config": {
+        "kp": 0.5,
+        "ki": 2.0,
+        "p_window_weeks": 4,
+        "initial_peers": 50,
+        "max_active_peers": 1000,
+        "annual_churn": 0.25,
+        "target_partners": 15,
+        "acceptance_gate": 0.3,
+        "n_years": 5,
+        "n_seeds": 2,
+        "eviction_strategy": "hard",
+        "eviction_threshold": 0.5,
+        "eviction_period_weeks": 4
+      },
+      "label": "Strategy C: Hard eviction (threshold=0.5)",
+      "snapshots": [
+        {
+          "year": 1,
+          "kendall_tau": 0.6900655593423541,
+          "turnover_rate": 7.867463161198097,
+          "same_arch_frac": {
+            "Reliable": 0.3895776666612375,
+            "Weekend": 0.27695178695178696,
+            "Seasonal": 0.1666522220033637,
+            "Nomad": 0.17234555391795628,
+            "Hoarder": 0.13829154887683634,
+            "Freeloader": 0.6523982999392836
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0005889281507656066,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.5,
+            "Seasonal": 2.3857787740771284,
+            "Nomad": 1.2588925612009008,
+            "Hoarder": 1.0254004935367522,
+            "Freeloader": 1.974641393442623
+          },
+          "n_active": 995,
+          "mean_partners": 14.986440233294989
+        },
+        {
+          "year": 2,
+          "kendall_tau": 0.6900655593423541,
+          "turnover_rate": 5.162137395772792,
+          "same_arch_frac": {
+            "Reliable": 0.3918930325352977,
+            "Weekend": 0.27639136074923076,
+            "Seasonal": 0.16899015801019834,
+            "Nomad": 0.13439655172413795,
+            "Hoarder": 0.1391111978658338,
+            "Freeloader": 0.6208875128998967
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.5,
+            "Seasonal": 2.3964192848358437,
+            "Nomad": 1.232147736776863,
+            "Hoarder": 1.0338278352527817,
+            "Freeloader": 1.9735053319573446
+          },
+          "n_active": 992,
+          "mean_partners": 14.97027174089595
+        },
+        {
+          "year": 3,
+          "kendall_tau": 0.6900655593423541,
+          "turnover_rate": 4.928094234136753,
+          "same_arch_frac": {
+            "Reliable": 0.3836810758885687,
+            "Weekend": 0.27790333914272447,
+            "Seasonal": 0.15901242297598364,
+            "Nomad": 0.11743045547840517,
+            "Hoarder": 0.15335302828706524,
+            "Freeloader": 0.6023134163412658
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0005924170616113745,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.5,
+            "Seasonal": 2.394349481341899,
+            "Nomad": 1.2841021654859426,
+            "Hoarder": 1.0684568778236323,
+            "Freeloader": 1.9472580367887227
+          },
+          "n_active": 994,
+          "mean_partners": 14.985920539252152
+        },
+        {
+          "year": 4,
+          "kendall_tau": 0.6900655593423541,
+          "turnover_rate": 5.087749873244027,
+          "same_arch_frac": {
+            "Reliable": 0.36444806768781446,
+            "Weekend": 0.2779286202185792,
+            "Seasonal": 0.17000075125835776,
+            "Nomad": 0.12882718943014268,
+            "Hoarder": 0.16132669184006854,
+            "Freeloader": 0.5786280729579698
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0018028846153846155,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.5,
+            "Seasonal": 2.3936286036314947,
+            "Nomad": 1.255832591318545,
+            "Hoarder": 1.0891901663051338,
+            "Freeloader": 1.894994052339413
+          },
+          "n_active": 996,
+          "mean_partners": 14.972891538938423
+        },
+        {
+          "year": 5,
+          "kendall_tau": 0.6900655593423541,
+          "turnover_rate": 5.429907861177612,
+          "same_arch_frac": {
+            "Reliable": 0.3636787651251452,
+            "Weekend": 0.260298252257835,
+            "Seasonal": 0.1571062271062271,
+            "Nomad": 0.12826961770623743,
+            "Hoarder": 0.1737212121212121,
+            "Freeloader": 0.6357843137254902
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.5,
+            "Seasonal": 2.3927928293203546,
+            "Nomad": 1.2304534517055843,
+            "Hoarder": 1.114569696969697,
+            "Freeloader": 1.995669934640523
+          },
+          "n_active": 995,
+          "mean_partners": 14.98291457286432
+        }
+      ]
+    },
+    {
+      "config": {
+        "kp": 0.5,
+        "ki": 2.0,
+        "p_window_weeks": 4,
+        "initial_peers": 50,
+        "max_active_peers": 1000,
+        "annual_churn": 0.25,
+        "target_partners": 15,
+        "acceptance_gate": 0.3,
+        "n_years": 5,
+        "n_seeds": 2,
+        "eviction_strategy": "hard",
+        "eviction_threshold": 1.0,
+        "eviction_period_weeks": 4
+      },
+      "label": "Strategy C: Hard eviction (threshold=1.0)",
+      "snapshots": [
+        {
+          "year": 1,
+          "kendall_tau": 0.7116994463378437,
+          "turnover_rate": 15.804751823657021,
+          "same_arch_frac": {
+            "Reliable": 0.4228729665370241,
+            "Weekend": 0.2949549809422076,
+            "Seasonal": 0.18319947333772219,
+            "Nomad": 0.22895430793957822,
+            "Hoarder": 0.6853203313410926,
+            "Freeloader": 0.3535897435897436
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.4996081219014292,
+            "Seasonal": 2.394085580745022,
+            "Nomad": 1.2655866514104224,
+            "Hoarder": 2.3636908881199536,
+            "Freeloader": 1.639368131868132
+          },
+          "n_active": 995,
+          "mean_partners": 14.976410020443707
+        },
+        {
+          "year": 2,
+          "kendall_tau": 0.645032779671177,
+          "turnover_rate": 9.279088020560444,
+          "same_arch_frac": {
+            "Reliable": 0.4108974358974359,
+            "Weekend": 0.2860443178990376,
+            "Seasonal": 0.18494631017995505,
+            "Nomad": 0.16536338937001188,
+            "Hoarder": 0.6909087956346629,
+            "Freeloader": 0.3338527733769663
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0005834305717619603,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.499947476232996,
+            "Seasonal": 2.38999433201776,
+            "Nomad": 1.2595869263013233,
+            "Hoarder": 2.376903338963232,
+            "Freeloader": 1.5684254040810672
+          },
+          "n_active": 993,
+          "mean_partners": 14.977875136911281
+        },
+        {
+          "year": 3,
+          "kendall_tau": 0.645032779671177,
+          "turnover_rate": 8.097710519812477,
+          "same_arch_frac": {
+            "Reliable": 0.4022320258085109,
+            "Weekend": 0.29450884353741497,
+            "Seasonal": 0.18999004345993403,
+            "Nomad": 0.14058631857837756,
+            "Hoarder": 0.7023301119679908,
+            "Freeloader": 0.36060313929056975
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0017664208057021698,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.499869290482904,
+            "Seasonal": 2.3894440552258747,
+            "Nomad": 1.262340792707056,
+            "Hoarder": 2.379960714400955,
+            "Freeloader": 1.6483809170683474
+          },
+          "n_active": 992,
+          "mean_partners": 14.978346276838739
+        },
+        {
+          "year": 4,
+          "kendall_tau": 0.6666666666666666,
+          "turnover_rate": 8.517535019221803,
+          "same_arch_frac": {
+            "Reliable": 0.4150437164621562,
+            "Weekend": 0.2921980431848853,
+            "Seasonal": 0.19099452554744525,
+            "Nomad": 0.15964235409936497,
+            "Hoarder": 0.6731544712009415,
+            "Freeloader": 0.3690925426774483
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0005995203836930455,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.4998246249913905,
+            "Seasonal": 2.3890746519403123,
+            "Nomad": 1.2699090530475647,
+            "Hoarder": 2.3626736294636252,
+            "Freeloader": 1.6615363881401617
+          },
+          "n_active": 996,
+          "mean_partners": 14.9864553499857
+        },
+        {
+          "year": 5,
+          "kendall_tau": 0.7333333333333333,
+          "turnover_rate": 8.52809212512395,
+          "same_arch_frac": {
+            "Reliable": 0.40633486494610727,
+            "Weekend": 0.28491399007933266,
+            "Seasonal": 0.18350055741360088,
+            "Nomad": 0.145010395010395,
+            "Hoarder": 0.6599865047233469,
+            "Freeloader": 0.36944444444444446
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.499930624237014,
+            "Seasonal": 2.389092733628514,
+            "Nomad": 1.2262525312079844,
+            "Hoarder": 2.3661268556005397,
+            "Freeloader": 1.646990740740741
+          },
+          "n_active": 993,
+          "mean_partners": 14.976833714485647
+        }
+      ]
+    },
+    {
+      "config": {
+        "kp": 0.5,
+        "ki": 2.0,
+        "p_window_weeks": 4,
+        "initial_peers": 50,
+        "max_active_peers": 1000,
+        "annual_churn": 0.25,
+        "target_partners": 15,
+        "acceptance_gate": 0.3,
+        "n_years": 5,
+        "n_seeds": 2,
+        "eviction_strategy": "hard",
+        "eviction_threshold": 1.5,
+        "eviction_period_weeks": 4
+      },
+      "label": "Strategy C: Hard eviction (threshold=1.5)",
+      "snapshots": [
+        {
+          "year": 1,
+          "kendall_tau": 0.6900655593423541,
+          "turnover_rate": 26.30880635033244,
+          "same_arch_frac": {
+            "Reliable": 0.4323286817244521,
+            "Weekend": 0.3215176417678564,
+            "Seasonal": 0.19709194669580793,
+            "Nomad": 0.4484390592883447,
+            "Hoarder": 0.8638619934472684,
+            "Freeloader": 0.7940279569928095
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0005995203836930455,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.5,
+            "Seasonal": 2.392807740168225,
+            "Nomad": 1.2444543043310425,
+            "Hoarder": 2.290661687032518,
+            "Freeloader": 2.100590764027074
+          },
+          "n_active": 995,
+          "mean_partners": 14.834311768698687
+        },
+        {
+          "year": 2,
+          "kendall_tau": 0.6900655593423541,
+          "turnover_rate": 19.02102364499703,
+          "same_arch_frac": {
+            "Reliable": 0.44186668539556007,
+            "Weekend": 0.3362839134009318,
+            "Seasonal": 0.19321196789688455,
+            "Nomad": 0.5301406630990357,
+            "Hoarder": 0.8998577984616379,
+            "Freeloader": 0.8231554160125589
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.5,
+            "Seasonal": 2.390929343852414,
+            "Nomad": 1.2548924337821243,
+            "Hoarder": 2.3350688384719795,
+            "Freeloader": 2.14603814454776
+          },
+          "n_active": 991,
+          "mean_partners": 14.968238273978455
+        },
+        {
+          "year": 3,
+          "kendall_tau": 0.7333333333333333,
+          "turnover_rate": 18.422354794949023,
+          "same_arch_frac": {
+            "Reliable": 0.4563053883953684,
+            "Weekend": 0.31798006956447517,
+            "Seasonal": 0.19909941520467836,
+            "Nomad": 0.5143315936013131,
+            "Hoarder": 0.8848321489830924,
+            "Freeloader": 0.8526189236756649
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.4996961932573836,
+            "Seasonal": 2.39295921305379,
+            "Nomad": 1.2589703872852769,
+            "Hoarder": 2.3010332434860734,
+            "Freeloader": 2.2034080378237064
+          },
+          "n_active": 996,
+          "mean_partners": 14.976430247429533
+        },
+        {
+          "year": 4,
+          "kendall_tau": 0.7116994463378437,
+          "turnover_rate": 18.806939868168552,
+          "same_arch_frac": {
+            "Reliable": 0.4511117914343721,
+            "Weekend": 0.30997228658398074,
+            "Seasonal": 0.20086590899629492,
+            "Nomad": 0.5507940422456856,
+            "Hoarder": 0.8802884615384615,
+            "Freeloader": 0.8695806204519341
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.49997791860799,
+            "Seasonal": 2.396880568312623,
+            "Nomad": 1.2688797692163767,
+            "Hoarder": 2.290758547008547,
+            "Freeloader": 2.2347513048836776
+          },
+          "n_active": 996,
+          "mean_partners": 14.981428182999164
+        },
+        {
+          "year": 5,
+          "kendall_tau": 0.7116994463378437,
+          "turnover_rate": 18.766922182801423,
+          "same_arch_frac": {
+            "Reliable": 0.4420688368305881,
+            "Weekend": 0.319125159642401,
+            "Seasonal": 0.1952991452991453,
+            "Nomad": 0.5867720213661405,
+            "Hoarder": 0.8976780036612391,
+            "Freeloader": 0.8696603773584906
+          },
+          "newcomer_integ_weeks": 0.0,
+          "honest_trapped_frac": 0.0,
+          "arch_trust": {
+            "Reliable": 2.5,
+            "Weekend": 2.499983413776517,
+            "Seasonal": 2.389161182574086,
+            "Nomad": 1.2490024526259882,
+            "Hoarder": 2.32680412371134,
+            "Freeloader": 2.237755829704886
+          },
+          "n_active": 995,
+          "mean_partners": 14.982444314835856
+        }
+      ]
+    }
+  ]
+}

@@ -2,6 +2,7 @@
 data/
 .venv/
 results/
+!simulations/results/
 target/
 __pycache__/
 
