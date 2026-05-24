@@ -364,6 +364,20 @@ Holder с большим количеством символов проверя�
 - Прямые соединения (peer временно offline)
 - Cluster forwarding (challenge пришёл к device A, символы на device B)
 
+#### Способ доставки challenges (relay fallback)
+
+При отправке PoS challenge scheduler выбирает путь:
+
+1. **Прямой RR**: если holder online (есть authenticated connection), отправить через `send_to_device` (libp2p request-response). Owner ожидает ответ в пределах short timeout.
+
+2. **Relay board fallback**: если holder offline (нет live connection или `send_to_device` возвращает `PeerNotAuthenticated`), challenge кладётся в local relay board как directed message (encrypted via ECDH с holder's `x25519_pub`). Гарантия доставки — best-effort epidemic propagation в течение `RELAY_TTL_SECS = 7 дней`.
+
+3. **Без fallback на retry**: если relay board переполнен (`MAX_BOARD_ENTRIES`) или TTL истёк до доставки, challenge помечается Pending. Следующий tick scheduler'а пробует снова.
+
+Важно: `idle_connection_timeout = 600s` в libp2p означает что в нормальной работе peer-to-peer connections **эфемерны** — peers не держат постоянные соединения. Для cold backup большинство challenges идут через relay board (offline holders доминируют), это by design.
+
+При peer вернулся online после долгого отсутствия (>7 дней), все challenges за этот период считаются Lost (3+ Timeouts) → repair triggered. Это правильное поведение для cold backup с time constant = 1 week.
+
 #### Ограничения PoS
 
 - PoS не проводится для source blocks в статусе `Deleting` или `Deleted`

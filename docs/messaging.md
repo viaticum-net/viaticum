@@ -1,5 +1,12 @@
 # Messaging Policy
 
+> **SUPERSEDED (2026-05-24).** This document describes an earlier design
+> iteration. Two things have since changed: (1) the direct transport is now
+> libp2p (TCP + Noise + Yamux), not QUIC — QUIC is tracked as a future option;
+> (2) the relay-board epidemic-gossip model is being reworked toward a routed
+> mailbox approach that scales past small clusters. Kept for historical context;
+> do not treat the transport choices below as current.
+
 Два транспорта доставки сообщений: QUIC (прямое соединение) и Relay Board (epidemic gossip, hop <= 2, TTL 7 дней).
 
 ## Принцип выбора транспорта

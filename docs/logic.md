@@ -46,6 +46,19 @@ master_trust update:
 
 Constants: TRUST_INHERITANCE_FACTOR=0.3, MAX_COMBINED_TRUST=KP+KI=2.15
 
+### Partition healing
+
+Trust state is **per-node local** by design — there is no gossip protocol for trust reconciliation. After a network partition heals, nodes on each side hold divergent trust views for the same peer (one side saw PoS responses, the other side did not).
+
+**Behavior:** the side that saw the peer go silent treats it as Timeout/Lost; the side where the peer was active retains accumulated trust. After partition heals, the silent-side nodes:
+1. Challenge the peer aggressively (low trust → high PoS frequency)
+2. Trust rebuilds over P_WINDOW_WEEKS (4 weeks rolling window)
+3. Repair may have already migrated some symbols during the partition — duplicates are tolerated
+
+**Recovery time:** O(P_WINDOW_WEEKS) = 4 weeks. Acceptable for cold backup (time constant = 1 week). Repair guarantees data survival even in worst case.
+
+This is intentional: P2P trust by definition is pairwise and local. Cross-node trust reconciliation would require additional protocol surface (gossip, conflicts, weights) with marginal benefit for cold backup workload.
+
 ## Placement
 
 Distributes repair symbols across holders proportional to trust.
@@ -127,6 +140,28 @@ Lost / Deleting + any outcome → no-op
 ```
 
 **Timeout:** 7 days (POS_TIMEOUT_SECS).
+
+### Trust manipulation window (acceptable trade-off)
+
+Attacker can accumulate honest trust over 4+ weeks, then suddenly stop holding symbols. PoS state machine takes up to 3 consecutive Timeouts (3 weeks worst case) before placement transitions Lost → Repair. So worst-case data exposure = ~3 weeks × N blocks before repair triggers.
+
+This is acceptable for cold backup (time constant = 1 week):
+- Restore window in DR is days-to-weeks anyway
+- Repair starts well before critical loss
+- Tightening detection requires either expensive per-block heartbeats (defeating cold semantics) or randomized PoS challenges that don't compose with chain-hash binding
+
+If shortening this window becomes important: lower POS_TIMEOUT_SECS for high-importance blocks (e.g. 2 days for importance ≥ 0.8).
+
+### Outsourcing attack (documented limitation)
+
+Malicious holder can keep zero local storage and reconstruct symbols on demand: at challenge time, download K_eff symbols from other honest holders, decode source block, re-encode with own chain-hash binding, respond correctly. Chain hash prevents collusion-pooling but does not cryptographically force local storage.
+
+Economically irrational for cold backup target (home NAS, metered upload):
+- Storage saved per block ≈ K/N × block_size (~17 MB for 128 MB block, 274 symbols)
+- Bandwidth cost per week ≈ K_eff × symbol_size (~128 MB download to reconstruct)
+- Cost > savings, so honest behavior is the rational equilibrium
+
+Acknowledged limitation — not fixed in alpha. Would require either random ESI subset challenges (incompatible with current chain hash) or shorter timeouts forcing constant reconstruction.
 
 ## Escrow
 
