@@ -298,6 +298,30 @@ impl RestoreCoordinator {
                 .push((record, version));
         }
 
+        // Importance-ordered restore: when restore is interrupted (Ctrl-C, daemon
+        // shutdown), user gets high-importance files (documents, photos) before
+        // low-importance (cache). Implements DR triage promised in overview.md.
+        // HashMap iteration is undefined order; sort blocks by importance DESC.
+        let mut block_order: Vec<SourceBlockId> = block_map.keys().copied().collect();
+        let mut importance_by_block: HashMap<SourceBlockId, f64> = HashMap::new();
+        for block_id in &block_order {
+            let imp = self
+                .db
+                .get_source_block(block_id)?
+                .map(|r| r.importance)
+                .unwrap_or(0.0);
+            importance_by_block.insert(*block_id, imp);
+        }
+        block_order.sort_by(|a, b| {
+            importance_by_block
+                .get(b)
+                .copied()
+                .unwrap_or(0.0)
+                .partial_cmp(&importance_by_block.get(a).copied().unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
         // Create StagingWriter for this job (blocking I/O).
         let writer = tokio::task::block_in_place(|| {
             StagingWriter::open(
@@ -311,7 +335,10 @@ impl RestoreCoordinator {
         let mut files_restored = 0usize;
         let mut blocks_fetched = 0usize;
 
-        for (block_id, files_in_block) in &block_map {
+        for block_id in &block_order {
+            let files_in_block = block_map
+                .get(block_id)
+                .expect("block_id from block_map keys");
             // Get SourceBlockRecord for params
             let block_record = match self.db.get_source_block(block_id)? {
                 Some(r) => r,

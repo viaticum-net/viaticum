@@ -119,6 +119,10 @@ pub struct BackupConfig {
     /// are soft-filtered from candidate selection until cooldown expires.
     /// Optional: tests pass `None`.
     pub peer_backoff: Option<Arc<crate::daemon::peer_backoff::PeerBackoff>>,
+    /// Signal channel to wake WorkPipeline after flush. None in unit tests where
+    /// WorkPipeline is not running. Without this signal, worker would wait up to
+    /// 60s (tick_interval) before noticing new blocks.
+    pub work_event_tx: Option<tokio::sync::mpsc::Sender<crate::daemon::work_pipeline::WorkEvent>>,
 }
 
 impl Default for BackupConfig {
@@ -137,6 +141,7 @@ impl Default for BackupConfig {
             swarm: None,
             live_watch_configs: None,
             peer_backoff: None,
+            work_event_tx: None,
         }
     }
 }
@@ -655,7 +660,9 @@ impl BackupCoordinator {
                     let flush_result = tokio::task::block_in_place(|| self.flush_all(true, &auth_snap));
                     match flush_result {
                         Ok(_results) => {
-                            // Wave 11b: delivery is the worker's job.
+                            // Wave 11b: delivery is the worker's job. Wake it now
+                            // instead of waiting up to 60s (tick_interval).
+                            self.notify_work_pipeline();
                         }
                         Err(e) => tracing::error!("idle flush error: {e}"),
                     }
@@ -667,7 +674,7 @@ impl BackupCoordinator {
                     let flush_result = tokio::task::block_in_place(|| self.flush_all(true, &auth_snap));
                     match flush_result {
                         Ok(_results) => {
-                            // Wave 11b: delivery is the worker's job.
+                            self.notify_work_pipeline();
                         }
                         Err(e) => tracing::error!("fallback flush error: {e}"),
                     }
@@ -681,6 +688,16 @@ impl BackupCoordinator {
             }
         }
         Ok(())
+    }
+
+    /// Wake the WorkPipeline immediately after a flush creates new DB records.
+    /// No-op if work_event_tx not wired (tests).
+    fn notify_work_pipeline(&self) {
+        if let Some(tx) = &self.config.work_event_tx {
+            // try_send: non-blocking. If channel full, worker will pick up on
+            // next tick anyway — acceptable degradation.
+            let _ = tx.try_send(crate::daemon::work_pipeline::WorkEvent::DirtyFileEnqueued);
+        }
     }
 
     /// Handle a BackupEvent from the Processor.

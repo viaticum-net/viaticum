@@ -103,6 +103,7 @@ fn config_roundtrips_all_fields() {
             relay_max_size_mb: 4,
             relay_ttl_days: 14,
             enable_relay: false,
+            enable_relay_server: false,
             relay_url: None,
             bootstrap_peers: vec![],
             kademlia_bootstrap_peers: vec![],

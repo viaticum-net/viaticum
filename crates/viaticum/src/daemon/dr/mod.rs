@@ -100,6 +100,8 @@ pub async fn run_dr(
         kademlia_disable_ipfs_bootstrap: true,
         kad_republish_interval_override: None,
         kad_discovery_interval_override: None,
+        // DR mode is read-only / short-lived — never act as relay server.
+        enable_relay_server: false,
     };
 
     let (swarm_handle, mut event_rx) = SwarmHandle::start(swarm_cfg).await?;

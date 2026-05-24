@@ -144,7 +144,34 @@ pub const SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES: usize = 80 * 1024 * 1024;
 pub const PROTOCOL_VERSION: u8 = 1;
 
 /// Handshake timestamp freshness window (+-300 seconds).
+///
+/// Used ONLY for security-critical handshake replay prevention (Noise IX setup).
+/// For operational messages (SymbolOffer, PeerAnnounce, Delete, CancelDelete) use
+/// `MESSAGE_FRESHNESS_SECS` — wider window tolerates NTP-less NAS deployments.
 pub const HANDSHAKE_FRESHNESS_SECS: u64 = 300;
+
+/// Operational message freshness window (1 hour).
+///
+/// Used for SymbolOffer, PeerAnnounce, Delete, CancelDelete and similar
+/// operational messages. Wider than handshake window because clock skew on
+/// NAS without NTP can exceed 5 minutes; cold backup tolerates 1h skew safely
+/// since msg_id dedup + signature verify already prevent replay attacks.
+pub const MESSAGE_FRESHNESS_SECS: u64 = 3600;
+
+/// Target authenticated peer count.
+///
+/// When `authenticated.len() >= TARGET_PEERS`, Kademlia discovery skips new
+/// dial attempts to avoid unbounded connection growth. Cold backup needs
+/// only a small stable set of holders; more peers don't improve reliability
+/// beyond redundancy targets.
+pub const TARGET_PEERS: usize = 20;
+
+/// Max concurrent discovery dials per Kademlia `GetProviders` result.
+///
+/// libp2p Kademlia can return up to K=20 providers per query, and DHT walks
+/// aggregate across multiple hops. Without a cap we burst-dial every result,
+/// blowing `pending_cert` HashMap and saturating `check_cert_timeouts` ticker.
+pub const MAX_CONCURRENT_DISCOVERY_DIALS: usize = 5;
 
 /// Max relay hop count — drop entries with hop >= this.
 pub const MAX_RELAY_HOP: u8 = 2;

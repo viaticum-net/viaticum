@@ -103,6 +103,7 @@ async fn make_swarm() -> Arc<SwarmHandle> {
         kademlia_disable_ipfs_bootstrap: true,
         kad_republish_interval_override: None,
         kad_discovery_interval_override: None,
+        enable_relay_server: false,
     };
     let (handle, _events) = SwarmHandle::start(cfg).await.expect("swarm start");
     Arc::new(handle)

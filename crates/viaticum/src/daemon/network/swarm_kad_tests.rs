@@ -44,6 +44,7 @@ fn make_kad_config(seed_byte: u8, bootstrap_peers: Vec<Multiaddr>) -> SwarmConfi
         // Speed up republish and discovery for tests.
         kad_republish_interval_override: Some(Duration::from_millis(300)),
         kad_discovery_interval_override: Some(Duration::from_millis(200)),
+        enable_relay_server: false,
     }
 }
 

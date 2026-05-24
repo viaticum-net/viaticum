@@ -59,6 +59,7 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -1727,8 +1728,11 @@ mod staging_tests {
 // Moved here from cleanup.rs per convention (tests in separate files).
 
 mod cleanup_tests {
-    use crate::daemon::restore::cleanup::{check_staging_warn, should_warn, staging_total_bytes};
+    use crate::daemon::restore::cleanup::{
+        check_staging_warn, evict_stale_stagings, should_warn, staging_total_bytes,
+    };
     use std::path::Path;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     #[test]
@@ -1799,6 +1803,51 @@ mod cleanup_tests {
         assert!(should_warn(10, 5), "total must exceed threshold");
         // check_staging_warn runs without panic.
         check_staging_warn(dir.path(), 5);
+    }
+
+    #[test]
+    fn evict_stale_stagings_returns_zero_for_missing_root() {
+        let evicted = evict_stale_stagings(
+            Path::new("/nonexistent/staging/root"),
+            Duration::from_secs(1),
+        );
+        assert_eq!(evicted, 0);
+    }
+
+    #[test]
+    fn evict_stale_stagings_keeps_fresh_dirs() {
+        let root = TempDir::new().unwrap();
+        let job = root.path().join("job-fresh");
+        std::fs::create_dir_all(&job).unwrap();
+        std::fs::write(job.join("file.bin"), b"data").unwrap();
+
+        // TTL = 1 hour; dir just created → age << TTL → kept.
+        let evicted = evict_stale_stagings(root.path(), Duration::from_secs(3600));
+        assert_eq!(evicted, 0, "fresh dir must not be evicted");
+        assert!(job.exists(), "fresh dir must remain");
+    }
+
+    #[test]
+    fn evict_stale_stagings_removes_old_dirs() {
+        let root = TempDir::new().unwrap();
+        let job = root.path().join("job-stale");
+        std::fs::create_dir_all(&job).unwrap();
+        std::fs::write(job.join("file.bin"), b"data").unwrap();
+
+        // TTL = 0: any dir with age > 0 (created microseconds ago) is stale.
+        let evicted = evict_stale_stagings(root.path(), Duration::ZERO);
+        assert_eq!(evicted, 1, "stale dir must be evicted");
+        assert!(!job.exists(), "stale dir must be removed");
+    }
+
+    #[test]
+    fn evict_stale_stagings_ignores_files_at_root() {
+        let root = TempDir::new().unwrap();
+        // A loose file (not a job dir) at staging root must be left alone.
+        std::fs::write(root.path().join("loose.txt"), b"x").unwrap();
+        let evicted = evict_stale_stagings(root.path(), Duration::ZERO);
+        assert_eq!(evicted, 0, "files at root are not job dirs — never evicted");
+        assert!(root.path().join("loose.txt").exists());
     }
 }
 

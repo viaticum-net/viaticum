@@ -42,6 +42,7 @@ fn test_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -379,6 +380,7 @@ async fn pipeline_roundtrip_can_decode() {
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let mut coord = BackupCoordinator::new(db.clone(), config, encoder.clone());
@@ -668,6 +670,7 @@ fn dedup_via_cluster_state_skips_already_backed_up() {
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -963,6 +966,7 @@ fn coord_with_watch(
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -1217,6 +1221,7 @@ fn same_content_two_devices_both_in_file_record() {
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     let mut coord_a = BackupCoordinator::new(db.clone(), config_a, Arc::new(RaptorQEncoder::new()));
     coord_a
@@ -1244,6 +1249,7 @@ fn same_content_two_devices_both_in_file_record() {
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     let mut coord_b = BackupCoordinator::new(db.clone(), config_b, Arc::new(RaptorQEncoder::new()));
     coord_b
@@ -1294,6 +1300,7 @@ fn flush_queue_deferred_files_remain_in_queue() {
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1357,6 +1364,7 @@ fn flush_queue_budget_selects_highest_importance_first() {
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1439,6 +1447,7 @@ fn large_file_skipped_when_budget_insufficient() {
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1668,6 +1677,7 @@ fn test_coord_no_mock(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -2083,6 +2093,7 @@ fn test_coord_unlimited_budget(db: Db, symbols_dir: &TempDir) -> BackupCoordinat
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -2298,6 +2309,7 @@ fn block_creation_when_no_holder_candidates_available_creates_block_with_zero_pl
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -2386,6 +2398,7 @@ fn select_backup_batch_order_observable_in_resulting_block_records() {
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -2471,6 +2484,7 @@ fn flush_queue_preserves_importance_order_across_packs() {
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 

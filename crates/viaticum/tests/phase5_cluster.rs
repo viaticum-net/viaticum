@@ -100,6 +100,7 @@ fn backup_cfg_with_cluster(
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     }
 }
 

@@ -3,7 +3,7 @@
 use libp2p::PeerId;
 use tracing::{debug, error, info, warn};
 use viaticum_core::cluster::DeviceCertificate;
-use viaticum_core::constants::{HANDSHAKE_FRESHNESS_SECS, INITIAL_TRUST_P};
+use viaticum_core::constants::{INITIAL_TRUST_P, MESSAGE_FRESHNESS_SECS};
 use viaticum_core::messages::{PeerAnnounceMsg, verify_peer_announce};
 use viaticum_core::types::{DeviceId, IdentityPub, PeerRecord, Timestamp};
 
@@ -271,7 +271,7 @@ impl Processor {
 
         let now = Timestamp::now();
         let age = now.0.saturating_sub(msg.timestamp.0);
-        if age > HANDSHAKE_FRESHNESS_SECS {
+        if age > MESSAGE_FRESHNESS_SECS {
             warn!(
                 identity = %msg.identity_pub,
                 age_secs = age,
@@ -279,7 +279,7 @@ impl Processor {
             );
             return Ok(());
         }
-        if msg.timestamp.0 > now.0.saturating_add(HANDSHAKE_FRESHNESS_SECS) {
+        if msg.timestamp.0 > now.0.saturating_add(MESSAGE_FRESHNESS_SECS) {
             warn!(
                 identity = %msg.identity_pub,
                 "processor: PeerAnnounce rejected — timestamp is in the future"

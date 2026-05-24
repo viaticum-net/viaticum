@@ -77,6 +77,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         swarm: None,
         live_watch_configs: None,
         peer_backoff: None,
+        work_event_tx: None,
     }
 }
 

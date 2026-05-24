@@ -71,6 +71,7 @@ pub(crate) fn make_swarm_config(seed_byte: u8) -> SwarmConfig {
         kademlia_disable_ipfs_bootstrap: true,
         kad_republish_interval_override: None,
         kad_discovery_interval_override: None,
+        enable_relay_server: false,
     }
 }
 

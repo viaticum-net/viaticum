@@ -1,7 +1,16 @@
 // Cleanup warning: walk staging_root, warn if total size exceeds threshold.
 // Non-critical: read-only scan, errors are silently skipped at sub-dir level.
+//
+// Also: TTL-based deletion of stale staging directories. After a restore job
+// completes, the staging dir is left for user to inspect/move files. Without
+// cleanup, repeated restores accumulate copies indefinitely (S-5 finding).
 
 use std::path::Path;
+use std::time::{Duration, SystemTime};
+
+/// Default TTL for staging directories: 7 days.
+/// After this, the directory is deleted by `evict_stale_stagings`.
+pub const STAGING_TTL_SECS: u64 = 7 * 24 * 3600;
 
 /// Walk `staging_root` and return the total byte size of all files.
 /// Non-critical: errors in sub-walks are silently skipped (just log at DEBUG).
@@ -52,4 +61,54 @@ pub fn check_staging_warn(staging_root: &Path, warn_threshold_bytes: u64) {
             "restore staging directory is large; consider cleaning up old restore jobs manually"
         );
     }
+}
+
+/// Delete any staging subdirectory older than `ttl`. Returns the number of
+/// directories deleted. Errors are logged but do not propagate — best-effort.
+///
+/// Age is determined by directory modified time (mtime); since StagingWriter
+/// creates each subdir at job start and writes files into it, mtime tracks
+/// last write activity. After job completes, mtime stops advancing.
+pub fn evict_stale_stagings(staging_root: &Path, ttl: Duration) -> u64 {
+    let mut evicted = 0u64;
+    let rd = match std::fs::read_dir(staging_root) {
+        Ok(rd) => rd,
+        Err(_) => return 0,
+    };
+    let now = SystemTime::now();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let meta = match entry.metadata() {
+            Ok(m) if m.is_dir() => m,
+            _ => continue,
+        };
+        let mtime = match meta.modified() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let age = match now.duration_since(mtime) {
+            Ok(d) => d,
+            Err(_) => continue, // mtime in future — skip
+        };
+        if age > ttl {
+            match std::fs::remove_dir_all(&path) {
+                Ok(_) => {
+                    evicted += 1;
+                    tracing::info!(
+                        path = %path.display(),
+                        age_days = age.as_secs() / 86400,
+                        "cleanup: evicted stale staging dir"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        err = %e,
+                        "cleanup: failed to remove stale staging dir"
+                    );
+                }
+            }
+        }
+    }
+    evicted
 }

@@ -391,6 +391,13 @@ pub struct SwarmConfig {
     /// Override for KAD_DISCOVERY_INTERVAL and initial discovery delay.
     /// None = use the constants. Used in tests to speed up discovery.
     pub kad_discovery_interval_override: Option<Duration>,
+
+    /// Whether this node acts as a circuit relay server for other peers.
+    /// When false, relay server is created with `max_reservations: 0` and
+    /// `max_circuits: 0` so no peer can use us as a relay. Default config
+    /// flag is false (opt-in) — home NAS / laptop shouldn't relay traffic
+    /// for strangers without explicit consent.
+    pub enable_relay_server: bool,
 }
 
 // ─── SwarmHandle ──────────────────────────────────────────────────────────────
@@ -528,10 +535,21 @@ impl SwarmHandle {
                 )),
                 kad: kademlia,
                 relay_client,
-                relay_server: libp2p::relay::Behaviour::new(
-                    peer_id,
-                    libp2p::relay::Config::default(),
-                ),
+                relay_server: {
+                    let relay_cfg = if config.enable_relay_server {
+                        libp2p::relay::Config::default()
+                    } else {
+                        // Opt-out: refuse any relay reservation/circuit.
+                        // Behaviour is still instantiated to keep the type
+                        // unchanged; capacity zero prevents service.
+                        libp2p::relay::Config {
+                            max_reservations: 0,
+                            max_circuits: 0,
+                            ..libp2p::relay::Config::default()
+                        }
+                    };
+                    libp2p::relay::Behaviour::new(peer_id, relay_cfg)
+                },
                 dcutr: libp2p::dcutr::Behaviour::new(peer_id),
             })
             .map_err(|e| SwarmError::Transport(e.to_string()))?
@@ -553,6 +571,26 @@ impl SwarmHandle {
                     .expect("valid multiaddr"),
             )
             .map_err(|e| SwarmError::Transport(e.to_string()))?;
+
+        // IPv6 dual-stack listen. Best-effort: log warn but don't fail startup
+        // if IPv6 unavailable (Windows without IPv6, sandboxes, etc.).
+        match format!("/ip6/::/tcp/{}", config.listen_port).parse() {
+            Ok(addr) => {
+                if let Err(e) = swarm.listen_on(addr) {
+                    tracing::warn!(
+                        port = config.listen_port,
+                        err = %e,
+                        "swarm: IPv6 listen failed, continuing IPv4-only"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "swarm: failed to parse IPv6 multiaddr, continuing IPv4-only"
+                );
+            }
+        }
 
         // ── 5. Channels ───────────────────────────────────────────────────────
         // Capacity 4096: sized for burst of connections (e.g. 20-node cluster
@@ -1408,16 +1446,31 @@ impl EventLoopState {
                 }
                 QueryResult::GetProviders(Ok(ok)) => {
                     use libp2p::kad::GetProvidersOk;
+                    use viaticum_core::constants::{MAX_CONCURRENT_DISCOVERY_DIALS, TARGET_PEERS};
                     match ok {
                         GetProvidersOk::FoundProviders { providers, .. } => {
                             let count = providers.len();
-                            debug!(count, "dht: found providers");
-                            // Collect providers first to release the borrow on self.swarm.
-                            let provider_list: Vec<PeerId> = providers.into_iter().collect();
-                            for peer_id in provider_list {
-                                // Dial by PeerId only; the swarm resolves addresses from
-                                // the Kademlia routing table (populated via add_address calls).
-                                self.dial_discovered_peer(peer_id, vec![]);
+                            // Skip discovery if we already have enough authenticated peers.
+                            // Cold backup needs a stable small set, not unbounded growth.
+                            let auth_count = self.authenticated.len();
+                            if auth_count >= TARGET_PEERS {
+                                debug!(
+                                    count,
+                                    auth_count,
+                                    target = TARGET_PEERS,
+                                    "dht: skipping discovery — target peer count reached"
+                                );
+                            } else {
+                                debug!(count, "dht: found providers");
+                                // Cap concurrent dials to avoid burst saturating
+                                // pending_cert / check_cert_timeouts under heavy DHT.
+                                let provider_list: Vec<PeerId> = providers
+                                    .into_iter()
+                                    .take(MAX_CONCURRENT_DISCOVERY_DIALS)
+                                    .collect();
+                                for peer_id in provider_list {
+                                    self.dial_discovered_peer(peer_id, vec![]);
+                                }
                             }
                         }
                         GetProvidersOk::FinishedWithNoAdditionalRecord { .. } => {

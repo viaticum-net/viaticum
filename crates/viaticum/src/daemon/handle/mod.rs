@@ -373,6 +373,7 @@ impl DaemonHandle {
                         .kademlia_disable_ipfs_bootstrap,
                     kad_republish_interval_override: None,
                     kad_discovery_interval_override: None,
+                    enable_relay_server: app_config.network.enable_relay_server,
                 };
                 match crate::daemon::network::swarm::SwarmHandle::start(swarm_cfg).await {
                     Ok((handle, events)) => {
@@ -454,6 +455,11 @@ impl DaemonHandle {
             peer_backoff_secs,
         ));
 
+        // WorkPipeline event channel. Created here (earlier than the spawn site
+        // below) so BackupConfig can hold a sender to wake worker after flush.
+        let (work_event_tx, work_event_rx) =
+            tokio::sync::mpsc::channel::<crate::daemon::work_pipeline::WorkEvent>(64);
+
         let backup = BackupCoordinator::new(
             db.clone(),
             BackupConfig {
@@ -471,6 +477,7 @@ impl DaemonHandle {
                 // ── Step C: Pass live_watch_configs ──────────────────────────
                 live_watch_configs: Some(Arc::clone(&live_configs)),
                 peer_backoff: Some(Arc::clone(&peer_backoff)),
+                work_event_tx: Some(work_event_tx.clone()),
             },
             encoder.clone(),
         );
@@ -582,9 +589,7 @@ impl DaemonHandle {
         let time_scale = cfg.time_scale.max(1);
         let reliability_scan_interval_secs = (3600 / time_scale).max(1);
 
-        // ── 14.5. Create WorkPipeline channel ────────────────────────────────
-        let (work_event_tx, work_event_rx) =
-            tokio::sync::mpsc::channel::<crate::daemon::work_pipeline::WorkEvent>(64);
+        // ── 14.5. WorkPipeline channel created earlier (above BackupCoordinator). ──
 
         // ── 15. Spawn subsystem tasks ─────────────────────────────────────────
         let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
@@ -643,14 +648,17 @@ impl DaemonHandle {
             }));
         }
 
-        // ── 9.2. Spawn staging cleanup checker (warn if staging dir is large) ──
+        // ── 9.2. Spawn staging cleanup checker (warn + evict stale) ──
         {
             let staging_root_for_warn = staging_root.clone();
             let warn_bytes = (app_config.restore.staging_warn_gb * 1_073_741_824.0) as u64;
             let cancel_for_warn = cancel.clone();
+            let ttl =
+                std::time::Duration::from_secs(crate::daemon::restore::cleanup::STAGING_TTL_SECS);
             tasks.push(tokio::spawn(async move {
-                // Check immediately at startup.
+                // Check immediately at startup: evict stale dirs, then warn if still over.
                 tokio::task::block_in_place(|| {
+                    let _ = crate::daemon::restore::cleanup::evict_stale_stagings(&staging_root_for_warn, ttl);
                     crate::daemon::restore::cleanup::check_staging_warn(&staging_root_for_warn, warn_bytes);
                 });
                 // Then check every hour.
@@ -660,6 +668,7 @@ impl DaemonHandle {
                     tokio::select! {
                         _ = interval.tick() => {
                             tokio::task::block_in_place(|| {
+                                let _ = crate::daemon::restore::cleanup::evict_stale_stagings(&staging_root_for_warn, ttl);
                                 crate::daemon::restore::cleanup::check_staging_warn(&staging_root_for_warn, warn_bytes);
                             });
                         }

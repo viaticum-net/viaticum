@@ -217,6 +217,13 @@ impl Scheduler {
                             }
                     }
 
+                    // TODO(S-9): call redb::Database::compact() after pruning to
+                    // reclaim freed pages — redb is append-only MVCC, pruning
+                    // releases logical rows but physical pages stay allocated.
+                    // Blocked by Arc<Database> wrapper: compact() needs &mut self.
+                    // Refactoring Db to Arc<RwLock<Database>> is required —
+                    // deferred to Wave C as it's not a mechanical fix.
+
                     // Sweep stale Offered placements → Lost.
                     if let Err(e) = self.sweep_offered_placements().await {
                         error!("scheduler: sweep_offered_placements error: {e}");

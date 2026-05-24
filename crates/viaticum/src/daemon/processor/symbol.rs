@@ -1,7 +1,7 @@
 // Symbol handlers: offer/transfer (holder), dropped/drop_notice (owner), delete/cancel_delete (holder).
 
 use tracing::{debug, error, info, warn};
-use viaticum_core::constants::{HANDSHAKE_FRESHNESS_SECS, SYMBOL_OFFER_EXPIRY_SECS, SYMBOL_SIZE};
+use viaticum_core::constants::{MESSAGE_FRESHNESS_SECS, SYMBOL_OFFER_EXPIRY_SECS, SYMBOL_SIZE};
 use viaticum_core::messages::{
     CancelDeleteMsg, DeleteMsg, RejectReason, SymbolAcceptMsg, SymbolDropNoticeMsg,
     SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg, SymbolTransferMsg, verify_symbol_offer,
@@ -222,6 +222,11 @@ impl Processor {
     ///
     /// Returns `true` = accept, `false` = reject.
     /// This is a sync helper used by `handle_symbol_offer` and tests.
+    ///
+    /// Three-stage rejection (in order):
+    ///   1. Hard quota: held_bytes >= hard_quota → reject (absolute ceiling)
+    ///   2. Soft pressure: free_ratio < 15% → reject (prevent reaching hard pressure)
+    ///   3. Final fill: held_bytes + offer_bytes > effective → reject (would exceed cap)
     pub(crate) fn decide_symbol_offer(&self, offer_bytes: u64) -> Result<bool, ProcessorError> {
         let held_bytes = self.db.total_holding_bytes()?;
 
@@ -238,6 +243,14 @@ impl Processor {
             disk_free,
             self.disk_reserve_bytes,
         );
+
+        // Soft pressure: reject before we hit hard pressure threshold. Closes the
+        // gap where soft pressure was only logged in holder_cleanup but never
+        // actually rejected new offers.
+        if viaticum_core::budget::should_reject_offers(effective, held_bytes) {
+            return Ok(false);
+        }
+
         if held_bytes + offer_bytes > effective {
             return Ok(false);
         }
@@ -250,7 +263,7 @@ impl Processor {
     /// when symbols actually arrive.
     ///
     /// Security checks (in order):
-    ///   1. Freshness: |now - timestamp| <= HANDSHAKE_FRESHNESS_SECS
+    ///   1. Freshness: |now - timestamp| <= MESSAGE_FRESHNESS_SECS
     ///   2. Signature: verify_symbol_offer against owner_id (master identity from handshake)
     ///   3. Quota: decide_symbol_offer
     ///
@@ -265,7 +278,7 @@ impl Processor {
         let now = Timestamp::now().0;
         let ts = offer.timestamp.0;
         let delta = now.abs_diff(ts);
-        if delta > HANDSHAKE_FRESHNESS_SECS {
+        if delta > MESSAGE_FRESHNESS_SECS {
             warn!(
                 owner = %owner_id,
                 block_id = %offer.source_block_id,
@@ -726,10 +739,12 @@ impl Processor {
     ) -> Result<(), ProcessorError> {
         let block_id = delete.source_block_id;
 
-        // Reject stale/replayed messages (same freshness window as handshake).
+        // Reject stale/replayed messages. Use MESSAGE_FRESHNESS_SECS (1h) — wider
+        // than handshake window — because Delete is operational, msg_id dedup +
+        // signature already prevent replay attacks even with looser timestamp gate.
         let now = Timestamp::now();
         let age = now.0.saturating_sub(delete.timestamp.0);
-        if age > viaticum_core::constants::HANDSHAKE_FRESHNESS_SECS {
+        if age > MESSAGE_FRESHNESS_SECS {
             warn!(
                 block_id = %block_id,
                 owner = %from,
@@ -790,10 +805,10 @@ impl Processor {
     ) -> Result<(), ProcessorError> {
         let block_id = cancel.source_block_id;
 
-        // Reject stale/replayed messages.
+        // Reject stale/replayed messages. Use MESSAGE_FRESHNESS_SECS (operational).
         let now = Timestamp::now();
         let age = now.0.saturating_sub(cancel.timestamp.0);
-        if age > viaticum_core::constants::HANDSHAKE_FRESHNESS_SECS {
+        if age > MESSAGE_FRESHNESS_SECS {
             warn!(
                 block_id = %block_id,
                 owner = %from,

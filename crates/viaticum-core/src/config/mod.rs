@@ -134,6 +134,14 @@ pub struct NetworkCfg {
     /// Default: true.
     pub enable_relay: bool,
 
+    /// Act as a circuit relay server for other peers (relay traffic on their
+    /// behalf). When true, this node accepts relay reservations and forwards
+    /// circuits — costs CPU/bandwidth even when idle. Off by default: home
+    /// NAS / laptop users should opt in. VPS / always-on nodes with good
+    /// uplink should enable.
+    /// Default: false.
+    pub enable_relay_server: bool,
+
     /// Custom relay server URL. When set with enable_relay = true, connects
     /// to this relay server instead of bootstrap peers acting as relays.
     /// Format: "http://hostname:port" (dev mode) or "https://hostname" (production).
@@ -437,6 +445,7 @@ impl Default for NetworkCfg {
             relay_max_size_mb: MAX_BOARD_SIZE_BYTES / 1_048_576,
             relay_ttl_days: RELAY_TTL_SECS / 86400,
             enable_relay: true,
+            enable_relay_server: false,
             relay_url: None,
             bootstrap_peers: vec![],
             kademlia_bootstrap_peers: vec![],
