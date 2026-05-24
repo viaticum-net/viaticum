@@ -25,3 +25,6 @@ docs/grant/
 *.swp
 *~
 .git.private-backup/
+
+# Local environment config (real server address etc.) — never in public mirror
+.env

@@ -3,6 +3,10 @@
 # Server is faster (48 cores) and keeps laptop cool.
 set -euo pipefail
 
+# Load local-only config (real server address). .env is gitignored.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/.env" ] && set -a && . "$SCRIPT_DIR/.env" && set +a
+
 SERVER="${VIATICUM_SERVER:-your-user@your-server}"
 REMOTE_DIR="projects/syncback"
 ARGS="${@:---release -p viaticum}"
