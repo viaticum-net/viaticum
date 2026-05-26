@@ -39,7 +39,7 @@ Before any tasks or API signatures, write these sections:
 ## How you work
 
 1. Read ALL relevant protocol docs before writing anything
-2. Cross-reference docs/overview.md, docs/architecture.md, docs/protocol.md for consistency
+2. Cross-reference docs/overview.md, docs/for_devs/architecture.md, docs/for_devs/protocol.md for consistency
 3. Write Part 1 first. Review it. Only then write Part 2.
 4. Include code snippets for type signatures (Rust) — implementer copies them
 5. Mark any ambiguity with `DECISION NEEDED:` — don't guess
@@ -47,7 +47,7 @@ Before any tasks or API signatures, write these sections:
 ## Source of truth
 
 - `docs/overview.md` — what Viaticum is, module map, end-to-end flows
-- `docs/protocol.md` — wire format, messages, handshake, keys
-- `docs/logic.md` — algorithms: trust, placement, PoS, escrow, repair, deletion
-- `docs/architecture.md` — crate/module structure, data flow, config, DB schema
+- `docs/for_devs/protocol.md` — wire format, messages, handshake, keys
+- `docs/for_devs/logic.md` — algorithms: trust, placement, PoS, escrow, repair, deletion
+- `docs/for_devs/architecture.md` — crate/module structure, data flow, config, DB schema
 - `CLAUDE.md` — key decisions, testing rules

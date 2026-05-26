@@ -4,47 +4,57 @@ Decentralized peer-to-peer cold backup with trust-based reputation. No tokens. N
 
 ## What it is
 
-Peers store encrypted erasure-coded fragments of each other's files. Trust between peers is earned over weeks of verifiable Proof-of-Storage. The protocol is built as a PID-style control loop applied to peer reputation, validated through ~24 numerical experiments before production implementation began.
+Peers store encrypted, erasure-coded fragments of each other's files. You earn the right to be backed up by backing others up, and trust between peers grows over weeks of verified storage. There are no accounts and no subscription, and nobody runs a server in the middle.
 
-The deliberate week-scale time constant is what makes Viaticum work on user-grade hardware: residential connections, laptops that sleep, NAS boxes behind NAT. Most P2P storage projects compete with hot cloud and lose, because they need second-scale operations that user devices cannot reliably provide. Viaticum competes with "nothing" — the 98% of people with no offsite backup.
+It's a cold backup, not a cloud drive. Restores take days rather than seconds, and that is the point: it lets the network tolerate peers that sleep, sit behind NAT, or come online only a few hours a day, which is what ordinary home machines actually do. What it competes with is having no offsite backup at all.
 
-For the full picture: see `docs/overview.md`.
+See [`docs/overview.md`](docs/overview.md) for how it works and [`docs/why.md`](docs/why.md) for why it's built this way.
 
 ## Status
 
-**Pre-alpha.** Working prototype, not yet publicly released.
+Pre-release, and rough. It works: you can run the daemon, back up folders, and get them back, and it has been tested end to end across 20 nodes with node kills and recovery. It is not stable, though. Breaking changes are coming, including planned changes to the wire protocol, so don't point it at data you can't afford to lose.
 
-- ~73,000 lines of Rust across two crates (`viaticum-core`, `viaticum`)
-- ~1,400 unit and integration tests passing
-- E2E verified through 20-node fault-tolerance experiments (kill+recovery, repair-from-source, PoS under network partition); larger experiments (~100 nodes, ~1 year of simulated time) ongoing
-- Protocol and core daemon: feature-complete
-- Web UI prototype under [`web-ui/`](web-ui/): Svelte panels for connect / dashboard / folders / files / devices / settings, all wired to the daemon API; visual polish and a11y are Phase 3 work
-- Packaging, distribution, integration documentation, public release: in progress
+If you want to poke at it or help test, you're welcome. Today there's a web UI and a Linux daemon. Windows and macOS builds are work in progress.
 
-This is a research-grade prototype on its way to becoming infrastructure. If you are looking for something stable to back up your photos today, this is not yet that thing. If you are interested in the protocol design or want to participate as the project matures, read on.
+## Try it
+
+There's no prebuilt package yet, so you build from source. You need Rust (stable) and Node.js.
+
+```sh
+# build the web UI — the daemon embeds it at compile time
+cd web-ui && npm install && npm run build && cd ..
+
+# build the daemon and CLI
+cargo build --release --workspace
+
+# create an identity (writes a 24-word recovery phrase — keep it safe)
+./target/release/viaticum init
+
+# run the daemon and watch a folder
+./target/release/viaticum daemon --watch ~/Documents
+
+# open the web UI in your browser
+./target/release/viaticum open
+```
+
+To back up with a friend, swap node addresses (`viaticum status` prints yours) and run `viaticum connect <addr>` on each side.
 
 ## Documentation
 
 - [`docs/overview.md`](docs/overview.md) — what Viaticum is, module map, end-to-end flows
 - [`docs/why.md`](docs/why.md) — why Viaticum exists, where it sits in the field, the reasoning behind the design
-- [`docs/protocol.md`](docs/protocol.md) — wire format, message types, handshake, key derivation
-- [`docs/logic.md`](docs/logic.md) — algorithms: trust, placement, Proof-of-Storage, repair, deletion
-- [`docs/architecture.md`](docs/architecture.md) — crate structure, data flow, config, DB schema
-- [`docs/features.md`](docs/features.md) — prioritized future work
-- [`docs/tech-debt.md`](docs/tech-debt.md) — known issues and deferred improvements
-- [`docs/design/`](docs/design/) — design rationale for major decisions (RaptorQ choice, cluster mode, backup pipeline)
+- [`docs/for_devs/protocol.md`](docs/for_devs/protocol.md) — wire format, message types, handshake, key derivation
+- [`docs/for_devs/logic.md`](docs/for_devs/logic.md) — algorithms: trust, placement, Proof-of-Storage, repair, deletion
+- [`docs/for_devs/architecture.md`](docs/for_devs/architecture.md) — crate structure, data flow, config, DB schema
+- [`docs/for_devs/design/`](docs/for_devs/design/) — design rationale for major decisions (RaptorQ choice, cluster mode, backup pipeline)
 - [`docs/archive/research/`](docs/archive/research/) — research notes from the design phase
 - [`docs/archive/experiments/`](docs/archive/experiments/) — 24 documented numerical experiments validating the trust protocol
 - [`simulations/`](simulations/) — Python source for the experiments above (reproducible)
 
-## Where it sits
-
-Decentralized cold backup with trust earned over time, no token, owned and restored only by you. The projects that tried this exact thing — Wuala, CrashPlan's P2P backup, BuddyBackup — were proprietary and died with their companies; everything alive today (Tahoe-LAFS, Storj, Syncthing, Restic + B2) solves an adjacent problem. Why that niche stays empty, and the reasoning behind the design, is in [`docs/why.md`](docs/why.md).
-
 ## Maintainers
 
 - **Ilya Cheshkov** — author and lead: protocol design, architecture, core implementation
-- **Rostislav Snegirev** — contributor, learning the codebase and helping carry it toward release
+- **Rostislav Snegirev** — contributor: built the web-based UI, now learning the wider codebase while helping carry the project toward release
 
 ## License
 
@@ -52,4 +62,4 @@ Decentralized cold backup with trust earned over time, no token, owned and resto
 
 ## Acknowledgments
 
-The Phase 2 implementation used substantial assistance from generative AI (Claude / Claude Code) for boilerplate, test scaffolding, and refactoring. All architecture, protocol design, and final code review are human-authored. The Phase 1 research and simulation work (`docs/archive/research/`, `docs/archive/experiments/`) was conducted with conventional numerical tooling.
+Implementation used substantial assistance from generative AI (Claude / Claude Code) for boilerplate, test scaffolding, and refactoring. The architecture, protocol design, and final code review are human-authored. The earlier research and simulation work (`docs/archive/research/`, `docs/archive/experiments/`) used conventional numerical tooling.

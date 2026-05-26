@@ -1,83 +1,83 @@
-# Backup flow: подробная схема
+# Backup flow: detailed diagram
 
 ---
 
-## 1. Обнаружение изменений
+## 1. Change detection
 
-### Watcher (непрерывно)
+### Watcher (continuous)
 
-fs-notify следит за backup-директориями. Классифицирует события:
+fs-notify watches the backup directories and classifies events:
 
 ```
-Событие              Действие
+Event                Action
 ──────────           ──────────────────────────
-Файл создан          → dirty_files.insert(path, Added)
-Файл изменён         → dirty_files.insert(path, Modified)
-Файл удалён          → dirty_files.insert(path, Deleted)
+File created         → dirty_files.insert(path, Added)
+File modified        → dirty_files.insert(path, Modified)
+File deleted         → dirty_files.insert(path, Deleted)
 ```
 
-**Debounce:** 30 минут после последнего события для path. Редактор сохраняет 10 раз — одна dirty entry. Импорт 50 фото за 5 минут — ждём 30 мин после последнего, потом flush.
+**Debounce:** 30 minutes after the last event for a given path. If an editor saves a file 10 times, only one dirty entry is created. If 50 photos are imported over 5 minutes, we wait 30 minutes after the last one, then flush.
 
-**dirty_files** — set в RAM, периодически persist в DB (crash safety).
+**dirty_files** — an in-RAM set, periodically persisted to the DB for crash safety.
 
 ### Full scan (fallback)
 
-Watcher может пропустить события (restart daemon'а, sleep, overflow буфера fs-notify).
+The watcher may miss events (daemon restart, system sleep, fs-notify buffer overflow).
 
-При старте daemon'а: walk all backup dirs → content_hash каждого файла → сравнить с catalog → расхождения → добавить в dirty.
+On daemon startup: walk all backup dirs → compute content_hash for each file → compare with the catalog → any discrepancies → add to dirty.
 
-Не каждую неделю, только при restart.
+This runs only on restart, not every week.
 
 ---
 
 ## 2. Backup trigger
 
-**Event-driven, НЕ раз в неделю.** "Постоянная времени = 1 неделя" — это про PoS/repair/trust, не про backup.
+**Event-driven, NOT once a week.** "Time constant = 1 week" refers to PoS/repair/trust, not to backup scheduling.
 
 ### Packing queues
 
-Три очереди по типу данных:
+Three queues, one per data type:
 
 ```
 photo_queue:    [img1.jpg, img2.jpg, ...]
 document_queue: [report.docx, notes.md, ...]
-large_files:    [video.mp4]                    // ≥128 МБ (source_block_size), сразу отдельно
+large_files:    [video.mp4]                    // ≥128 MB (source_block_size), handled separately immediately
 ```
 
-### Flush условия (любое из)
+### Flush conditions (any one is sufficient)
 
 ```
-1. Очередь ≥ source_block_size (128 МБ) → flush сразу (полная пачка)
-2. Нет активности 1 час    → flush что есть (юзер закончил работу)
-3. Прошло 24 часа           → flush что есть (fallback)
+1. Queue ≥ source_block_size (128 MB) → flush immediately (full batch)
+2. No activity for 1 hour             → flush whatever is queued (user finished working)
+3. 24 hours have elapsed              → flush whatever is queued (fallback)
 
-Min batch size: 1 МБ. Меньше — ждём до следующего flush.
+Min batch size: 1 MB. Smaller than that — wait for the next flush.
 ```
 
 ---
 
-## 3. BackupCoordinator: обработка dirty
+## 3. BackupCoordinator: processing dirty entries
 
 ```
 for each (path, event) in dirty_files:
 
   DELETED:
-    → FileRecord.local_state = Deleted(ts) на этом device
-    → если ВСЕ devices = Deleted → start cooldown (4+4 = 8 недель)
-    → никакой сетевой активности
+    → FileRecord.local_state = Deleted(ts) on this device
+    → if ALL devices = Deleted → start cooldown (4+4 = 8 weeks)
+    → no network activity
     → done
 
   ADDED:
     → read file → content_hash = blake3(file)
-    → dedup: content_hash уже в catalog?
-      → да: добавить device/path в FileRecord → done (zero traffic)
-      → нет: classify file type → добавить в packing queue
+    → dedup: is content_hash already in catalog?
+      → yes: add device/path to FileRecord → done (zero traffic)
+      → no: classify file type → add to packing queue
 
   MODIFIED:
     → read file → new content_hash
-    → dedup: new content_hash уже в catalog?
-      → да: добавить как новую версию → done (zero traffic)
-      → нет: classify → packing queue
+    → dedup: is new content_hash already in catalog?
+      → yes: add as a new version → done (zero traffic)
+      → no: classify → packing queue
     → FileRecord.versions.push(new_version)
 ```
 
@@ -86,13 +86,13 @@ for each (path, event) in dirty_files:
 ## 4. Packing → source blocks
 
 ```
-Flush photo_queue (≥128 МБ или timer):
+Flush photo_queue (≥128 MB or timer):
   files = photo_queue.drain()
 
-  group into batches ~128 МБ:
-    batch_1: [img1(5MB), img2(8MB), img3(3MB), ...] = ~128 МБ
-    batch_2: [img11(10MB), img12(7MB), ...]          = ~128 МБ
-    last_batch: [img45(3MB), img46(5MB)]              = ~8 МБ (< 50, ок)
+  group into batches ~128 MB:
+    batch_1: [img1(5MB), img2(8MB), img3(3MB), ...] = ~128 MB
+    batch_2: [img11(10MB), img12(7MB), ...]          = ~128 MB
+    last_batch: [img45(3MB), img46(5MB)]              = ~8 MB (< 50, ok)
 
   for each batch:
     plaintext = [PackIndex (CBOR)] + [file1 bytes] + [file2 bytes] + ...
@@ -102,7 +102,7 @@ Flush photo_queue (≥128 МБ или timer):
     → source_block_id = blake3(ciphertext)
 
 Flush large_files:
-  for each file ≥ 128 МБ (source_block_size):
+  for each file ≥ 128 MB (source_block_size):
     → compress → encrypt → own source block
 ```
 
@@ -112,7 +112,7 @@ Flush large_files:
 
 ```
 for each source_block:
-  K = ceil(source_block_size / T)         // T = 64 КБ default
+  K = ceil(source_block_size / T)         // T = 64 KB default
   N = K × overhead(importance)            // overhead = 1.5 + imp × 1.5
 
   // Placement
@@ -137,29 +137,29 @@ for each source_block:
       bound = symbol XOR ChaCha20(HKDF(source_block_id, holder_id))
 
       try direct_connection(holder):
-        send(bound)                        // 64 КБ
+        send(bound)                        // 64 KB
       fail:
         queue symbol_offer via epidemic relay
-        // holder подберёт offer → direct connection позже → send
+        // holder picks up the offer → direct connection later → send
 ```
 
 ---
 
-## 6. Holder принимает символы
+## 6. Holder accepts symbols
 
 ```
-Holder получает symbol_offer:
-  → проверить: есть ли место? (effective_quota)
-  → проверить: eviction priority нового > min existing?
+Holder receives symbol_offer:
+  → check: is there space? (effective_quota)
+  → check: is eviction priority of the new symbol > min existing?
   → accept / reject
 
-Holder получает символы:
+Holder receives symbols:
   → verify: hash(received) matches expected
   → store to disk
   → update held_symbols DB
   → send symbol_stored confirmation
 
-Owner получает confirmation:
+Owner receives confirmation:
   → SymbolPlacement.status = Alive
   → RAM hot: total_alive += symbols_stored
   → EventLog: Placed { source_block_id, holder_id, esi_range }
@@ -170,12 +170,12 @@ Owner получает confirmation:
 ## 7. DB updates (summary)
 
 ```
-После успешного backup cycle:
+After a successful backup cycle:
 
 FileRecord:
   new: { path, importance, devices: [(this_device, Present)],
          versions: [{ content_hash, source_block_id, ts }] }
-  или: existing → добавить version / добавить device
+  or: existing → add version / add device
 
 SourceBlock:
   new: { block_id, K, T, type: Pack{index}/Single, status: Active }
@@ -193,7 +193,7 @@ RAM hot:
 
 ---
 
-## 8. Одна картинка
+## 8. Full picture
 
 ```
          Watcher (fs-notify, continuous)
@@ -201,7 +201,7 @@ RAM hot:
                   ▼
          dirty_files (RAM + persist)
                   │
-         debounce 30 мин
+         debounce 30 min
                   │
                   ▼
          BackupCoordinator
@@ -219,7 +219,7 @@ RAM hot:
                     │       │        │
               ──────┼───────┼────────┼──── flush trigger:
               │  ≥128MB / 1hr idle / 24hr fallback
-              │  min batch: 1 МБ
+              │  min batch: 1 MB
                     │       │        │
                     ▼       ▼        ▼
                   batch   batch   source
@@ -251,31 +251,31 @@ RAM hot:
 
 ---
 
-## 9. Timing примеры
+## 9. Timing examples
 
 ```
-Фотограф импортировал 50 фото (500 МБ):
-  17:00 — импорт
-  17:01 — watcher: 50 dirty
+Photographer imports 50 photos (500 MB):
+  17:00 — import
+  17:01 — watcher: 50 dirty entries
   17:30 — debounce expired
-  17:31 — flush: 4 batches × 128 МБ
+  17:31 — flush: 4 batches × 128 MB
   17:35 — encode + distribute done
-  Итого: 35 минут от импорта до backed up.
+  Total: 35 minutes from import to backed up.
 
-Один документ изменился (200 КБ):
+A single document changed (200 KB):
   10:00 — save
   10:30 — debounce expired
-  10:30 — < 1 МБ in queue → ждём
-  ... ещё 3 документа за день ...
-  18:00 — 1 час нет активности → flush (4 файла, 800 КБ < 1 МБ → ждём)
-  Следующий день 10:30 — 24hr fallback → flush что есть
-  Или: ещё файлы добавились → ≥ 1 МБ → flush.
+  10:30 — < 1 MB in queue → wait
+  ... 3 more documents during the day ...
+  18:00 — 1 hour of inactivity → flush (4 files, 800 KB < 1 MB → wait)
+  Next day 10:30 — 24hr fallback → flush whatever is queued
+  Or: more files added → ≥ 1 MB → flush.
 
-Видео 2 ГБ:
+2 GB video:
   20:00 — file created
   20:30 — debounce expired
-  20:31 — ≥ 128 МБ (source_block_size) → 16 source blocks
-  20:35 — encode (K=2048, N≈3999 при imp=0.3)
-  20:40 — distribute to 15 holders (~260 МБ each)
-  ~21:00 — backed up (зависит от upload speed)
+  20:31 — ≥ 128 MB (source_block_size) → 16 source blocks
+  20:35 — encode (K=2048, N≈3999 at imp=0.3)
+  20:40 — distribute to 15 holders (~260 MB each)
+  ~21:00 — backed up (depends on upload speed)
 ```

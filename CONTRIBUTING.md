@@ -6,7 +6,7 @@ Viaticum is in pre-alpha and the bulk of architectural decisions are still being
 
 - Check `docs/features.md` and `docs/tech-debt.md` for what is planned and what is known to be wrong.
 - For non-trivial changes, open an issue first to discuss approach. Substantial PRs without prior discussion may not be merged.
-- Read `docs/overview.md` for the system shape and `docs/logic.md` for the algorithms before touching protocol-level code.
+- Read `docs/overview.md` for the system shape and `docs/for_devs/logic.md` for the algorithms before touching protocol-level code.
 
 ## What we welcome
 

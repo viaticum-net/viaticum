@@ -1,4 +1,4 @@
-# SyncBack: технический обзор
+# Viaticum: технический обзор
 
 *Март 2026 · α complete, β в проектировании*
 
@@ -6,7 +6,7 @@
 
 ## 1. Задача и мотивация
 
-Личные данные обычного человека (документы, фото — 30-160 ГБ) не защищены от потери. Облачные сервисы требуют оплаты и доверия третьей стороне, второй диск требует денег и дисциплины, NAS требует экспертизы. SyncBack решает задачу иначе: участники сети хранят зашифрованные фрагменты данных друг друга, не платя за инфраструктуру и не зная содержимого чужих файлов.
+Личные данные обычного человека (документы, фото — 30-160 ГБ) не защищены от потери. Облачные сервисы требуют оплаты и доверия третьей стороне, второй диск требует денег и дисциплины, NAS требует экспертизы. Viaticum решает задачу иначе: участники сети хранят зашифрованные фрагменты данных друг друга, не платя за инфраструктуру и не зная содержимого чужих файлов.
 
 Ключевой тезис: erasure coding, шифрование, P2P-транспорт — всё это решённые задачи с production-grade библиотеками. **Единственная нерешённая проблема — механизм доверия:** как незнакомцы договариваются хранить данные друг друга без посредника, токенов и глобального консенсуса.
 
@@ -64,7 +64,7 @@ File catalog в DB независим от диска: удаление файл
 ### Restore flow
 
 ```
-syncback restore photos/vacation/ [--version N] [--date D]
+viaticum restore photos/vacation/ [--version N] [--date D]
 → DB lookup → collect K+ символов от holders → decode → decrypt → decompress → файл
 ```
 
@@ -146,10 +146,10 @@ iroh для direct connections и NAT traversal. **Без iroh-blobs, без iro
 
 ```
 Rust workspace, 2 crates:
-  syncback-core  — pure logic (trust, escrow, placement, budget, messages, db)
-  syncback       — daemon (5 tokio tasks: watcher, scheduler, network, processor, cli_server)
+  viaticum-core  — pure logic (trust, escrow, placement, budget, messages, db)
+  viaticum       — daemon (5 tokio tasks: watcher, scheduler, network, processor, cli_server)
 
-Storage: redb (embedded). Wire: CBOR, u32 BE framing, ALPN "syncback/1".
+Storage: redb (embedded). Wire: CBOR, u32 BE framing, ALPN "viaticum/1".
 Transport: iroh (direct connections, NAT traversal).
 Crypto: ChaCha20-Poly1305, BLAKE3, HKDF-SHA256, BIP39 seed.
 ```

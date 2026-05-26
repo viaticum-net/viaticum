@@ -1,4 +1,4 @@
-# SyncBack: Trust Protocol v2
+# Viaticum: Trust Protocol v2
 
 ## Обновлённая модель доверия PI+S
 
