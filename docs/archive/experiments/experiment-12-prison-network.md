@@ -1,19 +1,19 @@
 # Experiment 12: Prison Network (Captive Network)
 
-## Вопрос
+## Question
 
-Может ли изолированная сеть (без выхода в интернет, замкнутое сообщество) быть самодостаточной? Какой минимальный размер группы обеспечивает приемлемую надёжность хранения? Насколько сильно один «плохой» участник может навредить маленькой сети?
+Can an isolated network (no internet access, closed community) be self-sufficient? What is the minimum group size that provides acceptable storage reliability? How much damage can a single "bad" participant cause in a small network?
 
-## Модель
+## Model
 
-- **Изолированная сеть:** фиксированное число узлов N, нет внешней связности, нет новых участников в процессе симуляции.
-- **Адаптивный стирающий код:** малые сети используют `k-of-(n-1)` вместо фиксированного `5-of-15`. При N ≥ 20 применяется полная схема `5-of-15`.
-- **Churn:** случайные отказы узлов с вероятностью 0%, 10% или 25% за период симуляции.
-- **Сценарий A (минимальный размер):** 8 размеров сети × 3 уровня churn = 24 конфигурации, 30 seeds каждая, 24 ядра.
-- **Сценарий B (плохой участник):** 4 размера сети × 4 типа поведения = 16 конфигураций, 30 seeds каждая.
-- **Типы плохих участников (Scenario B):** `freerider` (не хранит чужие данные), `liar` (сообщает неверные метаданные), `spite` (намеренно портит чужие шарды), `none` (все честные, базовая линия).
+- **Isolated network:** fixed number of nodes N, no external connectivity, no new participants during the simulation.
+- **Adaptive erasure code:** small networks use `k-of-(n-1)` instead of the fixed `5-of-15`. At N ≥ 20 the full `5-of-15` scheme applies.
+- **Churn:** random node failures at a probability of 0%, 10%, or 25% per simulation period.
+- **Scenario A (minimum size):** 8 network sizes × 3 churn levels = 24 configurations, 30 seeds each, 24 cores.
+- **Scenario B (bad apple):** 4 network sizes × 4 behaviour types = 16 configurations, 30 seeds each.
+- **Bad-actor types (Scenario B):** `freerider` (does not store others' data), `liar` (reports incorrect metadata), `spite` (deliberately corrupts others' shards), `none` (all honest, baseline).
 
-## Конфигурация
+## Configuration
 
 **Scenario A — Minimum Viable Network:**
 
@@ -44,7 +44,7 @@
 |   30 |  25%  | 5-of-15 |   100.0%  | 100.0%|       1.00 |
 |   50 |  25%  | 5-of-15 |   100.0%  | 100.0%|       0.99 |
 
-**Минимальный жизнеспособный размер (Survival >= 95%):**
+**Minimum viable size (Survival >= 95%):**
 
 | Churn | Min N |
 |-------|-------|
@@ -70,31 +70,31 @@
 |   20 | spite     |    100.0% |     +0.0% |          0.0x |
 |   50+| all types |    100.0% |     +0.0% |          0.0x |
 
-## Ключевые выводы
+## Key findings
 
-1. **Минимальный размер зависит от churn.** При 0% churn достаточно 3 узлов. При 10% churn нужно 7. При 25% — 10. Это прямое следствие того, насколько адаптивный код может покрыть потери.
+1. **Minimum size depends on churn.** At 0% churn, 3 nodes suffice. At 10% churn, 7 are needed. At 25%, 10. This follows directly from how much the adaptive code can absorb.
 
-2. **Адаптивный стирающий код — ключевое решение.** Малые сети автоматически переключаются на `k-of-(n-1)` вместо `5-of-15`. Без этого сеть из 7 узлов просто не смогла бы разместить 15 шардов. Адаптация делает систему работоспособной в любом размере.
+2. **Adaptive erasure coding is the key design decision.** Small networks switch automatically to `k-of-(n-1)` instead of `5-of-15`. Without this, a 7-node network simply could not place 15 shards. The adaptation makes the system workable at any size.
 
-3. **Плохие участники безвредны при N >= 10.** Freerider, liar и spite дают 0% дополнительных потерь при N=10 и выше. Избыточность стирающего кода полностью поглощает их влияние.
+3. **Bad actors are harmless at N >= 10.** Freerider, liar, and spite each produce 0% additional losses at N=10 and above. The erasure code redundancy absorbs their impact entirely.
 
-4. **Плохой участник имеет значение только при N=5.** Freerider вызывает -6.7% выживаемости (90% вместо 96.7%). Но даже 90% — это приемлемый результат для группы из 5 человек без альтернатив.
+4. **A bad actor matters only at N=5.** Freerider causes -6.7% survival (90% instead of 96.7%). Even 90%, however, is an acceptable result for a group of 5 with no alternatives.
 
-5. **N=15 при 25% churn — слабое место.** 93.3% выживаемость, p5=45%. Схема `9-of-14` не имеет достаточного запаса избыточности: при потере 2+ узлов из 15 и высоком churn граница восстановления становится хрупкой. При N=20 система переходит на `5-of-15` и сразу даёт 100%.
+5. **N=15 at 25% churn is a weak point.** Survival 93.3%, p5=45%. The `9-of-14` scheme lacks sufficient redundancy margin: losing 2+ nodes out of 15 under high churn makes the recovery threshold fragile. At N=20 the system switches to `5-of-15` and immediately delivers 100%.
 
-6. **N >= 20 всегда безопасен.** 100% выживаемость во всех конфигурациях. Момент перехода на полную схему `5-of-15` — это и есть практический порог надёжности.
+6. **N >= 20 is always safe.** 100% survival across all configurations. The transition to the full `5-of-15` scheme is the practical reliability threshold.
 
-7. **Система деградирует плавно.** Даже при N=3 и 25% churn данные выживают в 51% случаев — это лучше, чем ничего. Нет резкого «обрыва», есть постепенное снижение надёжности по мере уменьшения сети.
+7. **The system degrades gracefully.** Even at N=3 with 25% churn, data survives in 51% of cases — better than nothing. There is no sharp cliff; reliability declines gradually as the network shrinks.
 
-## Импликации для дизайна
+## Design implications
 
-- **Семья или группа друзей из 7-10 человек может использовать систему в изоляции.** 7 узлов при низком churn (10%) дают 100% выживаемость. 10 узлов при умеренном churn (25%) — тоже.
-- **Минимальный жизнеспособный деплой:** 7 пиров при низком churn, 10 при умеренном, 20 для полной надёжности без ограничений.
-- **Плохие участники в малых сетях менее опасны, чем ожидалось.** Адаптивный стирающий код создаёт достаточный запас прочности даже при N=5.
-- **Для «тюремных» сценариев** (изолированные сообщества без внешней связности) система полностью жизнеспособна при 20+ узлах. Для экстремально малых групп (5-10 узлов) система работает, но требует понимания ограничений.
-- **Переход N=15→20 критичен.** Пользователей стоит предупреждать, что N=15 — зона повышенного риска при высоком churn. Рекомендованный минимум для изолированных сетей — 20 узлов.
-- **Мониторинг размера сети.** В изолированных сообществах система должна предупреждать, когда активных узлов становится меньше порогового значения (10 при умеренном churn, 7 при низком).
+- **A family or friend group of 7–10 people can use the system in isolation.** 7 nodes at low churn (10%) give 100% survival. 10 nodes at moderate churn (25%) do as well.
+- **Minimum viable deployment:** 7 peers at low churn, 10 at moderate, 20 for full reliability with no restrictions.
+- **Bad actors in small networks are less dangerous than expected.** Adaptive erasure coding provides sufficient margin even at N=5.
+- **For "prison" scenarios** (isolated communities with no external connectivity) the system is fully viable at 20+ nodes. For extremely small groups (5–10 nodes) it works, but with understood limitations.
+- **The N=15→20 transition is critical.** Users should be warned that N=15 is a higher-risk zone under high churn. The recommended minimum for isolated networks is 20 nodes.
+- **Network size monitoring.** In isolated communities the system should warn when the number of active nodes falls below the threshold (10 at moderate churn, 7 at low).
 
-## Код
+## Code
 
-`simulations/prison_network.py` — запуск с `--scenario A --jobs 24` и `--scenario B --jobs 24`
+`simulations/prison_network.py` — run with `--scenario A --jobs 24` and `--scenario B --jobs 24`

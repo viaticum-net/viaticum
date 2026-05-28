@@ -1,24 +1,24 @@
 # Experiment 26: Weighted Shard Placement
 
-## Вопрос
+## Question
 
-Решает ли взвешенное размещение шардов (core + insurance, w_i = p_i^α) проблему survival из Exp 25, где FULL model (tau=1.000) имела меньшую выживаемость (96.1%), чем S2 baseline (97.6%)?
+Does weighted shard placement (core + insurance, w_i = p_i^α) solve the survival problem from Exp 25, where the FULL model (tau=1.000) had lower survival (96.1%) than the S2 baseline (97.6%)?
 
-## Модель
+## Model
 
-Три конфигурации сравниваются:
+Three configurations are compared:
 
-| Модель | S-formula | n | Gate | Placement | Escrow |
+| Model | S-formula | n | Gate | Placement | Escrow |
 |--------|-----------|---|------|-----------|--------|
-| **EQUAL** | multiplicative | adaptive | OFF | пропорционально trust (1 shard/partner) | ON |
-| **WEIGHTED** | multiplicative | adaptive | OFF | w_i = p_i^2, до 6 shards/partner | ON |
-| **S2** | additive (0.3/1.5/0.3) | fixed n=15 | ON | равномерный (1 shard/partner) | ON |
+| **EQUAL** | multiplicative | adaptive | OFF | proportional to trust (1 shard/partner) | ON |
+| **WEIGHTED** | multiplicative | adaptive | OFF | w_i = p_i^2, up to 6 shards/partner | ON |
+| **S2** | additive (0.3/1.5/0.3) | fixed n=15 | ON | uniform (1 shard/partner) | ON |
 
-EQUAL = FULL model из Exp 25 (baseline для сравнения).
+EQUAL = FULL model from Exp 25 (baseline for comparison).
 
-Weighted placement: каждый партнёр получает n_i = round(n_total × w_i') шардов, где w_i = p_i^α (α=2.0), p_i = clip(trust_i / MAX_TRUST, 0.1, 1.0). Партнёр может держать до 6 шардов одного файла (MAX_SHARDS_PER_PARTNER=6).
+Weighted placement: each partner receives n_i = round(n_total × w_i') shards, where w_i = p_i^α (α=2.0), p_i = clip(trust_i / MAX_TRUST, 0.1, 1.0). A partner may hold up to 6 shards of the same file (MAX_SHARDS_PER_PARTNER=6).
 
-## Конфигурация
+## Configuration
 
 ```
 nodes             = 10000
@@ -30,7 +30,7 @@ jobs              = 24
 scenarios         = A (baseline), D (40% free-rider flood)
 ```
 
-## Результаты
+## Results
 
 ### Scenario A: Baseline
 
@@ -42,8 +42,8 @@ scenarios         = A (baseline), D (40% free-rider flood)
 | 7 | 97.03% | 98.52% | 98.08% | 1.00 | 1.00 |
 | 10 | 96.20% | **98.06%** | 97.69% | 0.99 | **1.00** |
 
-| Метрика | EQUAL | WEIGHTED | S2 |
-|---------|-------|----------|-----|
+| Metric | EQUAL | WEIGHTED | S2 |
+|--------|-------|----------|-----|
 | Storage overhead | 3.16x | 3.62x | 2.93x |
 | Bootstrap time | 13.94 wk | 13.78 wk | 14.01 wk |
 | Gini (shard concentration) | 0.00 | 0.12 | 0.00 |
@@ -60,34 +60,34 @@ scenarios         = A (baseline), D (40% free-rider flood)
 | 7 | 93.51% | 95.55% | 98.18% | 0.60 | 0.60 |
 | 10 | 91.63% | 93.96% | 97.74% | 0.60 | 0.60 |
 
-| Метрика | EQUAL | WEIGHTED | S2 |
-|---------|-------|----------|-----|
+| Metric | EQUAL | WEIGHTED | S2 |
+|--------|-------|----------|-----|
 | Honest node survival | 97.39% | **99.40%** | 97.60% |
 | Freeloader survival | 85.19% | 87.86% | 97.89% |
 | Storage overhead | 3.59x | 4.09x | 2.93x |
 | Gini (shard concentration) | 0.00 | 0.11 | 0.00 |
 
-## Ключевые выводы
+## Key findings
 
-1. **WEIGHTED решает проблему Exp 25.** В baseline (Scenario A): survival 98.06% vs S2 97.69% (+0.37pp) при tau=1.000 (vs 0.670). Впервые достигнуто одновременное улучшение И ранжирования И выживаемости.
+1. **WEIGHTED solves the Exp 25 problem.** In the baseline (Scenario A): survival 98.06% vs S2 97.69% (+0.37pp) at tau=1.000 (vs 0.670). For the first time, both ranking quality and survival are improved simultaneously.
 
-2. **Концентрация шардов работает.** Gini=0.12, mean 1.56 shards/partner, max 6. Надёжные партнёры получают 2-6 шардов, ненадёжные — 0-1. Потеря ненадёжного партнёра уносит мало шардов.
+2. **Shard concentration works.** Gini=0.12, mean 1.56 shards/partner, max 6. Reliable partners receive 2-6 shards; unreliable ones receive 0-1. Losing an unreliable partner costs few shards.
 
-3. **Honest survival в Scenario D: WEIGHTED лучший.** 99.40% — выше и EQUAL (97.39%) и S2 (97.60%). Weighted placement защищает честных, концентрируя их шарды на надёжных партнёрах.
+3. **Honest survival in Scenario D: WEIGHTED is best.** 99.40% — higher than both EQUAL (97.39%) and S2 (97.60%). Weighted placement protects honest nodes by concentrating their shards on reliable partners.
 
-4. **Общий survival в Scenario D: S2 всё ещё лучше.** 97.74% vs 93.96%. Причина: S2 gate не даёт free-rider'ам хранить шарды, их файлы "бесплатно" защищены fixed n=15. WEIGHTED честно даёт free-rider'ам меньше шардов → их файлы чаще теряются → общий survival ниже. Это **правильное** поведение: free-rider'ы ДОЛЖНЫ терять файлы.
+4. **Overall survival in Scenario D: S2 is still better.** 97.74% vs 93.96%. Reason: the S2 gate prevents free-riders from storing shards, so their files are "freely" protected at fixed n=15. WEIGHTED honestly gives free-riders fewer shards, so their files are lost more often, pulling overall survival down. This is the **correct** behaviour: free-riders SHOULD lose files.
 
-5. **Overhead WEIGHTED > S2.** 3.62x vs 2.93x в baseline. Плата за концентрацию: надёжные партнёры получают больше шардов, но n_total адаптивно не уменьшается (всё ещё Binom(n, avg_p)). Оптимизация: Poisson binomial вместо Binom(n, avg_p) снизит n_total для mixed-trust сценариев.
+5. **WEIGHTED overhead > S2.** 3.62x vs 2.93x in the baseline. The cost of concentration: reliable partners receive more shards, but n_total does not adapt downward (still Binom(n, avg_p)). Optimisation: replacing Binom(n, avg_p) with Poisson binomial will reduce n_total for mixed-trust scenarios.
 
-6. **Bootstrap time идентичен.** ~14 недель во всех моделях — weighted placement не влияет на скорость набора партнёров.
+6. **Bootstrap time is identical.** ~14 weeks across all models — weighted placement does not affect the rate at which partners are acquired.
 
-## Импликации для дизайна
+## Design implications
 
-- **Weighted placement — рекомендуемый default** для reference implementation. Survival ≥ S2 при tau=1.000.
-- **Gate не нужен.** WEIGHTED без gate даёт лучший honest survival чем S2 с gate.
-- **Overhead оптимизируем позже.** Poisson binomial вместо Binom(n, avg_p) должен снизить n_total с 3.62x ближе к 3.0x.
-- **Scenario D — design envelope.** 40% free-riders = экстремальное условие. Общий survival 94% приемлем, honest survival 99.4% — отлично.
+- **Weighted placement is the recommended default** for the reference implementation. Survival ≥ S2 at tau=1.000.
+- **Gate is not needed.** WEIGHTED without a gate achieves better honest survival than S2 with one.
+- **Overhead can be optimised later.** Replacing Binom(n, avg_p) with Poisson binomial should bring n_total from 3.62x closer to 3.0x.
+- **Scenario D is the design envelope.** 40% free-riders is an extreme condition. Overall survival of 94% is acceptable; honest survival of 99.4% is excellent.
 
-## Код
+## Code
 
-`simulations/pis_weighted_placement.py` — результаты в `results/pis_weighted_placement/pis_weighted_placement_results.json`
+`simulations/pis_weighted_placement.py` — results in `results/pis_weighted_placement/pis_weighted_placement_results.json`

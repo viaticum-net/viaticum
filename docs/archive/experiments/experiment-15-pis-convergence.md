@@ -1,37 +1,37 @@
 # Experiment 15: PI+S Convergence
 
-## Вопрос
+## Question
 
-Сходится ли расширенная формула PI+S к правильному ранжированию архетипов? Насколько быстро и при каких параметрах (kp, ki, ks) система достигает высокого Kendall's tau? Достаточен ли глобальный S-член для исправления слепого пятна по хранению, выявленного в Experiment 13?
+Does the extended PI+S formula converge to the correct archetype ranking? How quickly and at what parameters (kp, ki, ks) does the system reach high Kendall's tau? Is a global S term sufficient to correct the storage blind spot identified in Experiment 13?
 
-## Модель
+## Model
 
-Те же шесть архетипов из Experiment 13. Формула доверия расширена третьим компонентом:
+The same six archetypes from Experiment 13. The trust formula is extended with a third component:
 
 ```
 trust = kp × P_weekly + ki × I + ks × S
 ```
 
-| Компонент | Определение |
-|-----------|-------------|
-| P_weekly | Rolling 4-week window бинарных еженедельных проверок |
-| I | Cumulative mean — накопленная история без decay |
+| Component | Definition |
+|-----------|------------|
+| P_weekly | Rolling 4-week window of binary weekly checks |
+| I | Cumulative mean — accumulated history without decay |
 | S | storage_ratio = gb_stored_for_others / gb_stored_by_others, clamped [0, 2] |
 
-S здесь **глобальный**: считается как суммарный объём, отданный всем пирам, делённый на объём, полученный от всех. Пирwise вариант исследуется в Experiment 17+.
+S here is **global**: computed as the total volume given to all peers divided by the volume received from all peers. The pairwise variant is investigated in Experiment 17+.
 
-**Реальный ранг полезности** (из Experiment 13):
+**Actual utility rank** (from Experiment 13):
 
 | Actual rank | Archetype | Rationale |
 |-------------|-----------|-----------|
-| 1 | Reliable | Высокий uptime + полный объём |
-| 2 | Weekend | Полный объём + предсказуемый график |
-| 3 | Seasonal | Полный объём, предсказуемый паттерн |
-| 4 | Nomad | Полный объём, но непредсказуем |
-| 5 | Hoarder | Высокий uptime, но мало места |
-| 5 | Freeloader | Средний uptime, минимум места |
+| 1 | Reliable | High uptime + full volume |
+| 2 | Weekend | Full volume + predictable schedule |
+| 3 | Seasonal | Full volume, predictable pattern |
+| 4 | Nomad | Full volume, but unpredictable |
+| 5 | Hoarder | High uptime, but little space |
+| 5 | Freeloader | Average uptime, minimal space |
 
-## Конфигурация
+## Configuration
 
 ```
 peers             = 200
@@ -42,11 +42,11 @@ P-window          = 4 weeks (binary weekly checks)
 sweep             = 54 configs: kp∈{0.3,0.5,0.7} × ki∈{1.5,2.0,2.5} × ks∈{0.0,0.3,0.5,1.0,1.5,2.0}
 ```
 
-## Результаты
+## Results
 
-### Итоговое доверие (лучший конфиг, месяц 60)
+### Final trust (best config, month 60)
 
-Лучший конфиг: **kp=0.3, ki=1.5, ks=0.3**
+Best config: **kp=0.3, ki=1.5, ks=0.3**
 
 | Archetype | Trust_mean | PI+S_rank | Actual_rank | Delta |
 |-----------|-----------|-----------|-------------|-------|
@@ -57,9 +57,9 @@ sweep             = 54 configs: kp∈{0.3,0.5,0.7} × ki∈{1.5,2.0,2.5} × ks�
 | Hoarder | 1.850 | 5 | 5 | 0 |
 | Freeloader | 1.812 | 6 | 5/6 | 0 |
 
-**Kendall's tau = 0.97** — идеальное совпадение с реальным рангом полезности.
+**Kendall's tau = 0.97** — perfect match with the actual utility rank.
 
-### Сходимость по времени (лучший конфиг)
+### Convergence over time (best config)
 
 | Month | tau |
 |-------|-----|
@@ -70,12 +70,12 @@ sweep             = 54 configs: kp∈{0.3,0.5,0.7} × ki∈{1.5,2.0,2.5} × ks�
 | 48 | 0.970 |
 | 60 | 0.970 |
 
-Система достигает tau≥0.97 уже к месяцу 12 и остаётся стабильной до конца симуляции (60 месяцев).
+The system reaches tau≥0.97 by month 12 and remains stable to the end of the simulation (60 months).
 
-### Sweep по ks: влияние S-члена
+### Sweep over ks: effect of the S term
 
-| ks | tau (месяц 12) | tau (месяц 60) |
-|----|---------------|---------------|
+| ks | tau (month 12) | tau (month 60) |
+|----|----------------|----------------|
 | 0.0 (PI-only) | 0.00–0.14 | 0.14 |
 | 0.3 | **0.966** | 0.970 |
 | 0.5 | ≥0.83 | ≥0.83 |
@@ -83,43 +83,43 @@ sweep             = 54 configs: kp∈{0.3,0.5,0.7} × ki∈{1.5,2.0,2.5} × ks�
 | 1.5 | ≥0.83 | ≥0.83 |
 | 2.0 | ≥0.83 | ≥0.83 |
 
-Все конфиги с ks>0 достигают tau≥0.83 к месяцу 12. ks=0 (PI-only) даёт tau≈0.00–0.14 — подтверждение находки Experiment 13.
+All configs with ks>0 reach tau≥0.83 by month 12. ks=0 (PI-only) yields tau≈0.00–0.14 — confirming the Experiment 13 finding.
 
-### Сравнение PI+S vs PI-only (месяц 60)
+### PI+S vs PI-only comparison (month 60)
 
-| Метрика | PI+S | PI-only | Delta |
-|---------|------|---------|-------|
+| Metric | PI+S | PI-only | Delta |
+|--------|------|---------|-------|
 | Kendall's tau | **0.97** | 0.14 | **+0.83** |
-| Hoarder rank | 5 (верно) | 2 (неверно) | −3 |
-| Weekend rank | 2 (верно) | 5 (неверно) | +3 |
+| Hoarder rank | 5 (correct) | 2 (incorrect) | −3 |
+| Weekend rank | 2 (correct) | 5 (incorrect) | +3 |
 
-S-член исправил обе системные ошибки PI-only: Hoarder опустился с #2 на #5, Weekend поднялся с #5 на #2.
+The S term corrected both systematic errors of PI-only: Hoarder dropped from #2 to #5, Weekend rose from #5 to #2.
 
-### Робастность формулы
+### Formula robustness
 
-Система **робастна**: любой ks>0 работает. Более высокий ki ускоряет сходимость, но к месяцу 60 разница нивелируется. Параметр kp оказал минимальное влияние в исследованном диапазоне.
+The system is **robust**: any ks>0 works. Higher ki accelerates convergence, but by month 60 the difference levels out. The kp parameter had minimal effect across the range studied.
 
-## Ключевые выводы
+## Key findings
 
-1. **S-член необходим и достаточен.** Одного добавления члена storage_ratio достаточно для перехода от tau=0.14 к tau=0.97. Это подтверждает гипотезу Experiment 13: проблема была структурной (отсутствие учёта хранения), а не параметрической.
+1. **The S term is necessary and sufficient.** Adding the storage_ratio term alone is enough to move from tau=0.14 to tau=0.97. This confirms the Experiment 13 hypothesis: the problem was structural (storage not accounted for), not parametric.
 
-2. **Формула робастна.** Любой ks>0 работает — нет узкого «окна» допустимых значений. Для практической системы это важно: не нужна точная подстройка весов.
+2. **The formula is robust.** Any ks>0 works — there is no narrow acceptable window of values. For a production system this matters: precise weight tuning is not required.
 
-3. **Сходимость за 12 месяцев.** Система выходит на стабильное ранжирование через год работы — приемлемо для cold backup с temporal constant в 1 неделю.
+3. **Convergence within 12 months.** The system reaches stable ranking after one year of operation — acceptable for cold backup with a temporal constant of 1 week.
 
-4. **Hoarder и Weekend исправлены.** Главные аномалии PI-only устранены: Hoarder (высокий uptime, мало места) больше не переоценивается; Weekend (полный объём, периодичный график) больше не занижается.
+4. **Hoarder and Weekend are corrected.** The main PI-only anomalies are resolved: Hoarder (high uptime, little space) is no longer overrated; Weekend (full volume, periodic schedule) is no longer underrated.
 
-5. **Глобальный S — потенциальный вектор атаки.** Глобальный storage_ratio легко накрутить через сговор или фиктивные транзакции между несколькими пирами. Pairwise S (S_AB = r_B / r_A) закрывает эту уязвимость — исследуется в Experiment 17.
+5. **Global S is a potential attack vector.** A global storage_ratio can be inflated through collusion or circular transactions between a few peers. Pairwise S (S_AB = r_B / r_A) closes this vulnerability — investigated in Experiment 17.
 
-6. **Weekly check cadence решает проблему Weekend.** P_weekly (4-week window еженедельных проверок) вместо P_daily (30-day window ежедневных) — ключевое изменение модели относительно Experiment 13, которое само по себе улучшает ранжирование Weekend-архетипа.
+6. **Weekly check cadence resolves the Weekend problem.** P_weekly (4-week window of weekly checks) rather than P_daily (30-day window of daily checks) is a key model change relative to Experiment 13, and itself improves the Weekend archetype ranking.
 
-## Импликации для дизайна
+## Design implications
 
-- **S-член включить в финальную формулу.** tau=0.97 — достаточный результат для принятия решения. Вопрос теперь не «нужен ли S», а «каким должен быть S».
-- **Перейти на pairwise S.** Глобальный S создаёт incentive для кольцевых транзакций. S_AB = gb_stored_for_B / gb_stored_by_B (со стороны A) — устойчивее к манипуляциям. Experiment 17 проверяет, сохраняется ли tau≥0.97 при pairwise S.
-- **Малый ks предпочтителен.** ks=0.3 показал лучший результат. Большие ks (1.5–2.0) не улучшают качество, но усиливают чувствительность к манипуляциям с S.
-- **Kendall's tau = 0.97 как baseline.** Все последующие модификации (pairwise S, acceptance gate, adaptive redundancy) должны сохранять tau не ниже этого уровня.
+- **Include the S term in the final formula.** tau=0.97 is a sufficient result for a design decision. The question is no longer "is S needed" but "what form should S take".
+- **Switch to pairwise S.** Global S creates incentives for circular transactions. S_AB = gb_stored_for_B / gb_stored_by_B (from A's perspective) is more resistant to manipulation. Experiment 17 tests whether tau≥0.97 holds with pairwise S.
+- **Small ks is preferable.** ks=0.3 gave the best result. Larger ks (1.5–2.0) do not improve quality but increase sensitivity to S manipulation.
+- **Kendall's tau = 0.97 as baseline.** All subsequent modifications (pairwise S, acceptance gate, adaptive redundancy) should keep tau no lower than this level.
 
-## Код
+## Code
 
-`simulations/pis_convergence.py` — запуск с `--peers 200 --days 1825 --seeds 30`
+`simulations/pis_convergence.py` — run with `--peers 200 --days 1825 --seeds 30`

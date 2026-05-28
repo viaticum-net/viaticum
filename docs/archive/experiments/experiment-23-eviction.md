@@ -1,40 +1,40 @@
 # Experiment 23: Eviction Strategies
 
-## Вопрос
+## Question
 
-Нужен ли eviction (принудительное исключение партнёров) в протоколе доверия? Помогает ли механизм hard eviction очищать сеть от плохих акторов, или это контрпродуктивно? Какова безопасная реализация disk pressure eviction?
+Is eviction (forced removal of partners) necessary in the trust protocol? Does a hard eviction mechanism clean the network of bad actors, or is it counterproductive? What is a safe implementation of disk-pressure eviction?
 
-## Модель
+## Model
 
-Мультипликативная формула доверия (Experiment 17+):
+Multiplicative trust formula (Experiment 17+):
 
 ```
 trust_AB = (kp × P_B + ki × I_B) × clamp(S_AB, 0.1, 1.0)
 ```
 
-где S_AB = r_B / r_A — pairwise storage ratio (сколько B хранит для A относительно того, сколько A хранит для B).
+where S_AB = r_B / r_A is the pairwise storage ratio (how much B stores for A relative to how much A stores for B).
 
-Тестируются пять стратегий eviction:
+Five eviction strategies are tested:
 
-| Strategy | Описание |
-|----------|----------|
-| A: No eviction | Партнёрства заканчиваются только через churn (уход пира из сети) |
-| B: Soft eviction | Экономический: при disk pressure вытесняется партнёр с min(trust × importance) |
-| C: threshold=0.5 | Hard eviction: принудительный разрыв если trust < 0.5 |
-| C: threshold=1.0 | Hard eviction: принудительный разрыв если trust < 1.0 |
-| C: threshold=1.5 | Hard eviction: принудительный разрыв если trust < 1.5 |
+| Strategy | Description |
+|----------|-------------|
+| A: No eviction | Partnerships end only through churn (peer leaving the network) |
+| B: Soft eviction | Economic: under disk pressure, the partner with min(trust × importance) is evicted |
+| C: threshold=0.5 | Hard eviction: forced break if trust < 0.5 |
+| C: threshold=1.0 | Hard eviction: forced break if trust < 1.0 |
+| C: threshold=1.5 | Hard eviction: forced break if trust < 1.5 |
 
-Метрики оценки:
+Evaluation metrics:
 
-| Метрика | Что измеряет |
-|---------|-------------|
-| Kendall's tau | Качество ранжирования архетипов (1.0 = идеально) |
-| Partner turnover | Смен партнёров в год |
-| Newcomer integration time | Недель до принятия нового пира в партнёрство |
-| Honest trapped % | Доля честных пиров без доступа к качественным партнёрам |
-| Hoarder same-arch % | Доля партнёров Hoarder-архетипа среди Hoarder-архетипа (индикатор гетто) |
+| Metric | What it measures |
+|--------|-----------------|
+| Kendall's tau | Archetype ranking quality (1.0 = perfect) |
+| Partner turnover | Partner changes per year |
+| Newcomer integration time | Weeks until a new peer is accepted into a partnership |
+| Honest trapped % | Share of honest peers without access to quality partners |
+| Hoarder same-arch % | Share of Hoarder-archetype partners among Hoarder-archetype peers (ghetto indicator) |
 
-## Конфигурация
+## Configuration
 
 ```
 peers             = 5000
@@ -48,9 +48,9 @@ ki                = 2.0
 trust_formula     = multiplicative S
 ```
 
-## Результаты
+## Results
 
-### Итоговые метрики (год 5)
+### Summary metrics (year 5)
 
 | Strategy | tau | Turnover/yr | Newcomer integ | Honest trapped | Hoarder same-arch |
 |----------|-----|-------------|----------------|----------------|-------------------|
@@ -60,7 +60,7 @@ trust_formula     = multiplicative S
 | C: threshold=1.0 | 0.600 | 7.68 | — | — | **70%** |
 | C: threshold=1.5 | 0.427 | 19.65 | — | — | **97%** |
 
-### Доверие по архетипам (год 5)
+### Trust by archetype (year 5)
 
 | Archetype | A: No | B: Soft | C: 0.5 | C: 1.0 | C: 1.5 |
 |-----------|-------|---------|--------|--------|--------|
@@ -71,43 +71,43 @@ trust_formula     = multiplicative S
 | Hoarder | 1.088 | 1.088 | 1.166 | **2.458** | 2.440 |
 | Freeloader | 0.733 | 0.733 | **2.059** | 1.755 | 2.429 |
 
-### Сегрегация при hard eviction (threshold=0.5)
+### Segregation under hard eviction (threshold=0.5)
 
-При threshold=0.5 Freeloader segregation скачет до **67.2%**: фрилоадеры, выгнанные из качественных кластеров, начинают партнёриться друг с другом. Внутри гетто pairwise S становится симметричным (все одинаково плохо хранят), и trust инфлируется до 2.059 — почти как у Seasonal-архетипа.
+At threshold=0.5, Freeloader segregation jumps to **67.2%**: freeloaders expelled from quality clusters begin partnering with each other. Within the ghetto, pairwise S becomes symmetric (all store equally poorly), and trust inflates to 2.059 — nearly on par with the Seasonal archetype.
 
-### Полный коллапс при threshold=1.5
+### Full collapse at threshold=1.5
 
-- Hoarder same-arch: 97%, Freeloader same-arch: 97% — полная сегрегация
-- Turnover: 19.65/yr (+360% относительно baseline)
-- tau: 0.427 — система перестаёт различать архетипы
-- Newcomer integration: 1 неделя задержки
+- Hoarder same-arch: 97%, Freeloader same-arch: 97% — complete segregation
+- Turnover: 19.65/yr (+360% relative to baseline)
+- tau: 0.427 — the system can no longer distinguish archetypes
+- Newcomer integration: 1 week of delay
 
-## Ключевые выводы
+## Key findings
 
-1. **Eviction не нужен.** Мультипликативный S самостоятельно достигает tau≈1.0 без какого-либо механизма eviction. Честные пиры естественно предпочитают друг друга, плохие акторы получают низкий trust через низкий pairwise S.
+1. **Eviction is unnecessary.** Multiplicative S reaches tau≈1.0 on its own, without any eviction mechanism. Honest peers naturally prefer each other; bad actors receive low trust through low pairwise S.
 
-2. **Hard eviction активно вреден.** Создаёт самоусиливающийся цикл: плохие акторы вытесняются из хороших кластеров → объединяются в собственные → в рамках гетто pairwise S симметричен → trust инфлируется → ранжирование ломается. Чем выше порог — тем хуже (tau падает от 1.0 до 0.43).
+2. **Hard eviction is actively harmful.** It creates a self-reinforcing cycle: bad actors are expelled from good clusters, form their own, pairwise S becomes symmetric within the ghetto, trust inflates, and ranking breaks down. The higher the threshold, the worse the outcome (tau drops from 1.0 to 0.43).
 
-3. **Soft eviction = no-op.** Disk pressure в симуляции не возникает. Результаты полностью идентичны стратегии A. Безопасен к реализации как UI-фича.
+3. **Soft eviction is a no-op.** Disk pressure does not arise in the simulation. Results are identical to strategy A. Safe to implement as a UI feature.
 
-4. **Turnover взрывается с порогом.** 4.28 → 19.65 смен партнёров в год при переходе от no-eviction к threshold=1.5. Избыточный turnover повышает bootstrap overhead и снижает стабильность сети.
+4. **Turnover explodes with threshold.** 4.28 → 19.65 partner changes per year, moving from no-eviction to threshold=1.5. Excessive turnover raises bootstrap overhead and reduces network stability.
 
-5. **"Trapped honest node" не проблема.** Доля честных пиров без доступа к хорошим партнёрам < 0.5% во всех стратегиях — не требует специального механизма защиты.
+5. **"Trapped honest node" is not a problem.** The share of honest peers without access to good partners is below 0.5% in all strategies — no special protection mechanism is needed.
 
-6. **Механизм вреда от eviction.** Формула мультипликативного S предполагает, что S_AB корректен только в контексте смешанных кластеров. Гетто из однотипных плохих акторов разрушает этот инвариант: все хранят примерно поровну → S→1.0 → trust определяется только P и I → Freeloader/Hoarder получают незаслуженно высокий score.
+6. **The harm mechanism of eviction.** The multiplicative S formula assumes S_AB is meaningful only in mixed clusters. A ghetto of uniformly bad actors breaks this invariant: all store roughly equally, so S→1.0 and trust is determined only by P and I; Freeloader and Hoarder then receive an undeserved high score.
 
-## Импликации для дизайна
+## Design implications
 
-1. **Не реализовывать eviction как механизм доверия.** Ни hard, ни threshold-based eviction не должны быть частью протокола.
+1. **Do not implement eviction as a trust mechanism.** Neither hard nor threshold-based eviction should be part of the protocol.
 
-2. **Мультипликативный S самокорректирующийся.** Hoarder и Freeloader получают низкий trust через низкий pairwise S без дополнительного вмешательства.
+2. **Multiplicative S is self-correcting.** Hoarder and Freeloader receive low trust through low pairwise S without additional intervention.
 
-3. **Единственный "eviction" — natural churn.** Пиры уходят из сети по собственным причинам; этого достаточно.
+3. **The only "eviction" is natural churn.** Peers leave the network for their own reasons; that is sufficient.
 
-4. **Soft eviction при disk pressure — допустим.** Если фича disk pressure management нужна продукту, soft eviction безопасен в реализации: в практических условиях он является no-op с точки зрения влияния на распределение trust.
+4. **Soft eviction under disk pressure is acceptable.** If a disk-pressure management feature is needed for the product, soft eviction is safe to implement; under practical conditions it is a no-op in terms of its effect on trust distribution.
 
-5. **Совместно с Exp 21 (acceptance gate).** Оба фильтрующих механизма — и acceptance gate, и hard eviction — оказались вредными при мультипликативном S + adaptive n. Правильная формула trust устраняет необходимость в явных фильтрах.
+5. **In conjunction with Exp 21 (acceptance gate).** Both filtering mechanisms — acceptance gate and hard eviction — proved harmful with multiplicative S + adaptive n. The correct trust formula eliminates the need for explicit filters.
 
-## Код
+## Code
 
-`simulations/pis_eviction.py` — результаты в `results/pis_eviction/run.json`
+`simulations/pis_eviction.py` — results in `results/pis_eviction/run.json`

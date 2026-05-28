@@ -1,27 +1,27 @@
 # Experiment 17: Long-term Mixed Network
 
-## Вопрос
+## Question
 
-Стабильна ли сеть из 6 архетипов с PI+S (попарный S) за 10 лет? Сохраняется ли корреляция доверия с реальной полезностью на горизонте 10 лет, и решает ли попарный S проблему Hoarder/Freeloader, обнаруженную в Exp 13?
+Is a network of 6 archetypes with PI+S (pairwise S) stable over 10 years? Does the trust-to-utility correlation hold over a 10-year horizon, and does pairwise S resolve the Hoarder/Freeloader problem found in Exp 13?
 
-## Модель
+## Model
 
-Формула доверия: `trust = kp × P + ki × I + ks × S` (аддитивная, попарный S).
+Trust formula: `trust = kp × P + ki × I + ks × S` (additive, pairwise S).
 
-Попарный S: `S_AB = STORAGE_RATIOS[B] / max(STORAGE_RATIOS[A], eps)` — соотношение объёма хранения партнёра к собственному. Не глобальный рейтинг, а прямое сравнение двух конкретных пиров. Это предотвращает атаки через манипуляцию глобальным рейтингом.
+Pairwise S: `S_AB = STORAGE_RATIOS[B] / max(STORAGE_RATIOS[A], eps)` — the ratio of a partner's storage volume to one's own. Not a global ranking, but a direct comparison of two specific peers. This prevents attacks through manipulation of a global ranking.
 
-Архетипы (те же шесть, что в Exp 13/15):
+Archetypes (the same six as in Exp 13/15):
 
 | Archetype | Share | Uptime | Storage capacity |
 |-----------|-------|--------|-----------------|
 | Reliable | 40% | 99% | 100% |
-| Weekend | 20% | 95% вых. / 30% буд. | 100% |
-| Seasonal | 15% | 95% семестр / 20% лето | 100% |
-| Nomad | 10% | ~50% случайные блоки | 100% |
+| Weekend | 20% | 95% weekends / 30% weekdays | 100% |
+| Seasonal | 15% | 95% term-time / 20% summer | 100% |
+| Nomad | 10% | ~50% random blocks | 100% |
 | Hoarder | 10% | 90% | 20% |
 | Freeloader | 5% | 80% | 10% |
 
-**Ожидаемый ранг** (реальная полезность для сети):
+**Expected rank** (actual utility to the network):
 
 | Expected rank | Archetype |
 |---------------|-----------|
@@ -32,7 +32,7 @@
 | 5 | Hoarder |
 | 6 | Freeloader |
 
-## Конфигурация
+## Configuration
 
 ```
 formula          = trust = kp×P + ki×I + ks×S  (additive, pairwise S)
@@ -46,20 +46,20 @@ duration         = 10 years
 seeds            = 10
 ```
 
-## Результаты
+## Results
 
-### Kendall's tau за 10 лет
+### Kendall's tau over 10 years
 
 | Period | tau |
 |--------|-----|
-| Минимум (год 1) | 0.627 |
-| Максимум (год 3) | 0.720 |
-| Среднее | ~0.667 |
-| Год 10 | ~0.667 |
+| Minimum (year 1) | 0.627 |
+| Maximum (year 3) | 0.720 |
+| Mean | ~0.667 |
+| Year 10 | ~0.667 |
 
-Tau устойчиво колеблется в диапазоне 0.627–0.720 на всём горизонте 10 лет. Это значительно хуже, чем Exp 15 (tau=0.97, глобальный S), и объясняется инверсией Hoarder/Nomad при аддитивной формуле с попарным S.
+Tau holds steadily in the range 0.627–0.720 across the full 10-year horizon. This is considerably worse than Exp 15 (tau=0.97, global S), explained by the Hoarder/Nomad inversion under the additive formula with pairwise S.
 
-### Итоговое доверие (год 10)
+### Final trust (year 10)
 
 | Archetype | Trust_mean | PI+S_rank | Expected_rank | Delta |
 |-----------|-----------|-----------|---------------|-------|
@@ -70,63 +70,63 @@ Tau устойчиво колеблется в диапазоне 0.627–0.720 
 | Freeloader | 2.687 | 5 | 6 | +1 |
 | Nomad | 2.390 | 6 | 4 | **−2** ❌ |
 
-Reliable и Weekend практически tied (оба 3.648) — первые две позиции переставлены местами, но это не критично. Критическая проблема — инверсия Hoarder и Nomad: Hoarder (rank 4) выше Nomad (rank 6), хотя должно быть наоборот.
+Reliable and Weekend are nearly tied (both 3.648) — the top two positions are swapped, but this is not critical. The critical problem is the Hoarder/Nomad inversion: Hoarder (rank 4) sits above Nomad (rank 6), when it should be the other way around.
 
-### Механизм инверсии Hoarder/Nomad
+### Hoarder/Nomad inversion mechanism
 
-При аддитивной формуле P+I-компоненты, определяемые uptime, подавляют штраф S:
+Under the additive formula, the P+I components determined by uptime suppress the S penalty:
 
 | Archetype | Uptime | S (vs. 100%-storage partner) | P+I contribution | Net effect |
 |-----------|--------|------------------------------|-----------------|------------|
-| Nomad | ~50% | 1.0 (полный объём) | низкий | низкий trust |
-| Hoarder | 90% | 0.2 (20% storage) | высокий | **выше Nomad** |
+| Nomad | ~50% | 1.0 (full volume) | low | low trust |
+| Hoarder | 90% | 0.2 (20% storage) | high | **above Nomad** |
 
-`90% uptime × S=0.2` — P+I-вклад при 90% uptime настолько велик, что даже S=0.2 не снижает итоговое доверие ниже Nomad с S=1.0. Аддитивная схема не позволяет S эффективно штрафовать низкий объём хранения.
+`90% uptime × S=0.2` — the P+I contribution at 90% uptime is large enough that even S=0.2 does not pull the final trust below Nomad at S=1.0. The additive scheme prevents S from effectively penalising low storage volume.
 
-### Структура сообществ (год 10)
+### Community structure (year 10)
 
-| Метрика | Значение |
-|---------|----------|
-| Количество сообществ | 17 |
+| Metric | Value |
+|--------|-------|
+| Number of communities | 17 |
 | Modularity Q | 0.290 |
 | Cross-cluster edges | 59.5% |
 | Bridge nodes | 99.7% |
 | Isolated small communities | 3 |
 
-Сеть хорошо связана: 59.5% рёбер пересекают границы кластеров, 99.7% узлов являются мостами между сообществами. Три маленьких изолированных кластера — незначительный артефакт.
+The network is well-connected: 59.5% of edges cross cluster boundaries, and 99.7% of nodes act as bridges between communities. The three small isolated clusters are a minor artefact.
 
-### Состав кластеров
+### Cluster composition
 
-Кластеры **смешанные по архетипу** — нет «гетто хoardeров» или изоляции отдельных типов. Каждое сообщество содержит ~10% Hoarder и ~5% Freeloader, соответствующих их доле в общей популяции.
+Clusters are **mixed by archetype** — there are no "Hoarder ghettos" or isolation of individual types. Each community contains approximately 10% Hoarder and 5% Freeloader, matching their share of the overall population.
 
-### Анализ топологии vs. формулы (cluster_probe.py)
+### Topology vs. formula analysis (cluster_probe.py)
 
-| Метрика | Значение |
-|---------|----------|
-| tau (все партнёры) | 0.667 |
-| tau_honest (только честные партнёры) | 0.733 |
+| Metric | Value |
+|--------|-------|
+| tau (all partners) | 0.667 |
+| tau_honest (honest partners only) | 0.733 |
 
-Разница минимальна. Tau при фильтрации только честных партнёров (0.733) почти равен общему tau (0.667). Вывод: **проблема в формуле, а не в топологии**. Кластеры здоровы — недобросовестные пиры не искажают топологию настолько, чтобы это объясняло инверсию.
+The difference is minimal. Tau when filtering to honest partners only (0.733) is nearly equal to the overall tau (0.667). Conclusion: **the problem is in the formula, not the topology**. Clusters are healthy; dishonest peers do not distort the topology enough to account for the inversion.
 
-## Ключевые выводы
+## Key findings
 
-1. **Попарный S — верное решение для безопасности**, но аддитивная формула не позволяет ему эффективно работать. При additive PI+S uptime-доминирование нейтрализует S-штраф для Hoarder.
+1. **Pairwise S is the right choice for security**, but the additive formula prevents it from working effectively. With additive PI+S, uptime dominance neutralises the S penalty for Hoarder.
 
-2. **Инверсия Hoarder/Nomad — структурная, не параметрическая.** Никакой подбор kp/ki/ks в аддитивной схеме не устранит инверсию: при любых разумных весах Hoarder с 90% uptime будет опережать Nomad с 50% uptime, даже если у Nomad S=1.0.
+2. **The Hoarder/Nomad inversion is structural, not parametric.** No choice of kp/ki/ks within the additive scheme eliminates the inversion: at any reasonable weights, a Hoarder with 90% uptime will outrank a Nomad with 50% uptime, even when Nomad has S=1.0.
 
-3. **Топология сети здоровая.** Смешанные кластеры, высокая связность (59.5% cross-cluster), 99.7% bridge nodes. Анти-кластеризационные механизмы не нужны.
+3. **The network topology is healthy.** Mixed clusters, high connectivity (59.5% cross-cluster), 99.7% bridge nodes. Anti-clustering mechanisms are not needed.
 
-4. **Tau=0.667 стабильно за 10 лет** — система не деградирует, но и не исправляется со временем. Это плато, а не тренд.
+4. **Tau=0.667 is stable over 10 years** — the system does not degrade, but does not self-correct either. This is a plateau, not a trend.
 
-5. **tau_honest ≈ tau_all** подтверждает, что проблема в самой формуле, а не в атаках или плохой топологии.
+5. **tau_honest ≈ tau_all** confirms that the problem lies in the formula itself, not in attacks or poor topology.
 
-## Импликации для дизайна
+## Design implications
 
-- **Мультипликативный S вместо аддитивного.** Формула `trust = (kp×P + ki×I) × clamp(S, 0.1, 1.0)` принципиально меняет роль S: теперь это не слагаемое, а множитель, который может снизить любое uptime-преимущество. Hoarder с S=0.2 получит 20% от P+I, Nomad с S=1.0 — 100%. Тестируется в Exp 22.
-- **Нижний clamp для S важен.** Без `clamp(S, 0.1, 1.0)` новые пиры с S≈0 получат trust≈0, что заблокирует bootstrapping. Минимум 0.1 даёт новичкам шанс войти в сеть.
-- **Топологические механизмы не нужны.** Кластеры здоровы и смешаны — ресурсы лучше потратить на исправление формулы, а не на анти-кластеризацию.
-- **Kendall's tau 0.627–0.720 — недостаточно.** Целевой порог tau > 0.8 при мультипликативном S. Exp 22 проверяет эту гипотезу.
+- **Multiplicative S instead of additive.** The formula `trust = (kp×P + ki×I) × clamp(S, 0.1, 1.0)` changes the role of S fundamentally: it becomes a multiplier rather than a summand, able to reduce any uptime advantage. A Hoarder with S=0.2 receives 20% of P+I; a Nomad with S=1.0 receives 100%. Tested in Exp 22.
+- **A lower clamp for S matters.** Without `clamp(S, 0.1, 1.0)`, new peers with S≈0 receive trust≈0, which blocks bootstrapping. A minimum of 0.1 gives newcomers a chance to join the network.
+- **Topological mechanisms are not needed.** Clusters are healthy and mixed; resources are better spent fixing the formula than on anti-clustering.
+- **Kendall's tau 0.627–0.720 is insufficient.** The target threshold is tau > 0.8 with multiplicative S. Exp 22 tests this hypothesis.
 
-## Код
+## Code
 
-`simulations/pis_longterm.py`, `simulations/cluster_probe.py` — результаты в `results/pis_longterm/run.json`
+`simulations/pis_longterm.py`, `simulations/cluster_probe.py` — results in `results/pis_longterm/run.json`

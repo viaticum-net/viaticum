@@ -1,31 +1,31 @@
 # Experiment 11: User Lifecycle
 
-## Вопрос
+## Question
 
-Как ведёт себя система с точки зрения одного пользователя на протяжении всего жизненного цикла: вход в сеть, накопление доверия, давление на диск, уход и возвращение? Теряет ли пользователь данные или репутацию в любой из этих фаз?
+How does the system behave from a single user's perspective across the full lifecycle: joining the network, building trust, disk pressure, departure, and return? Does the user lose data or reputation in any of these phases?
 
-## Модель
+## Model
 
-- **Протагонист:** один новый пир, входящий в уже живую сеть
-- **Фоновая сеть:** 200 пиров, прогретых на 180 дней (реалистичная действующая сеть)
-- **Erasure:** 5-of-15 (нужно 5 шардов из 15 для восстановления)
-- **PID:** kp=0.5, ki=2.0, kd=0 (умолчание)
-- **Trust threshold:** 0.3 (порог для принятия партнёров)
-- **Уход:** graceful (пир уведомляет сеть перед отключением)
+- **Protagonist:** one new peer joining an already live network
+- **Background network:** 200 peers warm-started at 180 days (a realistic active network)
+- **Erasure:** 5-of-15 (5 shards out of 15 needed for recovery)
+- **PID:** kp=0.5, ki=2.0, kd=0 (defaults)
+- **Trust threshold:** 0.3 (threshold for accepting partners)
+- **Departure:** graceful (peer notifies the network before disconnecting)
 - **Seeds:** 50, runtime: 0.7s
 
-### Фазы симуляции
+### Simulation phases
 
 | Phase | Months | Description |
 |-------|--------|-------------|
-| bootstrap | 0–2 | Вход в сеть, первые партнёры |
-| trust_build | 3–11 | Накопление I-компоненты (GB·days) |
-| steady_state | 12–35 | Стабильная работа, 2 года |
-| disk_pressure | 36–41 | Нехватка диска, вытеснение чужих шардов |
-| departure | 42–47 | Пользователь ушёл из сети на 6 месяцев |
-| return | 48–53 | Возвращение и восстановление партнёрств |
+| bootstrap | 0–2 | Joining the network, first partners |
+| trust_build | 3–11 | Accumulating the I-component (GB·days) |
+| steady_state | 12–35 | Stable operation, 2 years |
+| disk_pressure | 36–41 | Disk shortage, evicting foreign shards |
+| departure | 42–47 | User offline for 6 months |
+| return | 48–53 | Return and partnership recovery |
 
-## Конфигурация
+## Configuration
 
 ```
 seeds             = 50
@@ -37,9 +37,9 @@ trust_threshold   = 0.3
 total_months      = 54
 ```
 
-## Результаты
+## Results
 
-### Помесячная динамика
+### Month-by-month dynamics
 
 | Month | Phase | Trust | Partners | Stored | Placed | Redund | P_restore |
 |-------|-------|-------|----------|--------|--------|--------|-----------|
@@ -59,38 +59,38 @@ total_months      = 54
 | 48 | return | 2.147 | 15.3 | 12.3 | 15.0 | 15/15 | 100.0% |
 | 53 | return | 2.162 | 55.9 | 55.9 | 15.0 | 15/15 | 100.0% |
 
-### Ключевые точки
+### Key milestones
 
 | Milestone | Month | Trust | Note |
 |-----------|-------|-------|------|
-| Join | 0 | 2.377 [p5=2.250, p95=2.500] | Порог 0.3 пройден сразу |
-| End bootstrap | 3 | 2.390 | Пик доверия |
+| Join | 0 | 2.377 [p5=2.250, p95=2.500] | Threshold 0.3 passed immediately |
+| End bootstrap | 3 | 2.390 | Trust peak |
 | End trust_build | 12 | 2.371 | |
 | Disk failure test | 18 | 2.379 | P(restore) = 100.0% |
 | Disk pressure start | 36 | 2.381 | |
-| Just departed | 42 | 1.859 | 77.8% от пика |
-| Return | 48 | 2.147 | 89.8% от пика |
-| 6 months back | 53 | 2.162 | 90.5% от пика |
+| Just departed | 42 | 1.859 | 77.8% of peak |
+| Return | 48 | 2.147 | 89.8% of peak |
+| 6 months back | 53 | 2.162 | 90.5% of peak |
 
-## Ключевые выводы
+## Key findings
 
-1. **Bootstrap мгновенный в тёплой сети.** Порог доверия (0.3) пройден в месяц 0 — потому что фоновые пиры уже имеют накопленное доверие и сразу принимают нового участника. Это модель реалистичного входа в живую сеть, не cold start.
+1. **Bootstrap is instant in a warm network.** The trust threshold (0.3) is passed in month 0, because background peers already have accumulated trust and accept the new participant immediately. This models realistic entry into a live network, not a cold start.
 
-2. **P(restore) = 100% во всех фазах без исключения.** Даже в период ухода (месяцы 42–47), когда у протагониста нет партнёров и он ничего не хранит, его собственные 15 шардов остаются размещёнными у других пиров и доступны для восстановления.
+2. **P(restore) = 100% in every phase without exception.** Even during departure (months 42–47), when the protagonist has no partners and holds nothing for others, their own 15 shards remain placed with other peers and are available for recovery.
 
-3. **Доверие "липкое" — восстанавливается быстро.** После 6 месяцев отсутствия: 77.8% → 90.5% от пика за следующие 6 месяцев. I-компонента (накопленные GB·days) сохраняет долгую историю и доминирует над P-компонентой при возвращении.
+3. **Trust is sticky — it recovers quickly.** After 6 months offline: 77.8% → 90.5% of peak over the following 6 months. The I-component (accumulated GB·days) retains a long history and dominates the P-component on return.
 
-4. **Давление на диск: вытеснение без потерь.** Протагонист вытесняет сначала чужие шарды (stored-for-others), собственные данные остаются защищёнными на всём протяжении фазы disk_pressure. Приоритет собственных данных соблюдается автоматически.
+4. **Disk pressure: eviction without data loss.** The protagonist evicts foreign shards (stored-for-others) first; own data remains protected throughout the disk_pressure phase. Priority for own data is enforced automatically.
 
-5. **Ограничение модели: нет cold start.** Мгновенный bootstrap возможен только потому, что сеть уже прогрета. В пустой сети (первые пользователи) картина была бы другой — это территория эксперимента 12.
+5. **Model limitation: no cold start.** Instant bootstrap is only possible because the network is already warm. In an empty network (first users), the picture would be different — that is the territory of Experiment 12.
 
-## Импликации для дизайна
+## Design implications
 
-- **Пользователь может безопасно уходить оффлайн на месяцы.** Ни данные, ни репутация не теряются необратимо. Для UX это означает: не нужно пугать пользователя предупреждениями о "потере данных" при отключении на разумный срок.
-- **I-компонента как долгосрочная "кредитная история".** Система не карает за паузы — это принципиально отличает её от систем с decay-based репутацией. Стоит явно зафиксировать это как свойство протокола.
-- **Graceful departure важен, но не критичен для данных.** Шарды остаются у партнёров в любом случае; graceful departure лишь ускоряет восстановление партнёрств при возвращении.
-- **Диск-менеджмент работает корректно.** Порядок вытеснения (чужие шарды раньше своих) не требует ручной настройки — вытекает из логики приоритетов. Можно закрепить это поведение как инвариант в спецификации протокола.
+- **A user can safely go offline for months.** Neither data nor reputation is lost irreversibly. For UX this means: no need to alarm the user with "data loss" warnings when they disconnect for a reasonable period.
+- **The I-component as a long-term credit history.** The system does not penalise pauses — this is a fundamental difference from systems with decay-based reputation. Worth explicitly recording as a protocol property.
+- **Graceful departure matters, but is not critical for data.** Shards remain with partners regardless; graceful departure only speeds up partnership recovery on return.
+- **Disk management works correctly.** The eviction order (foreign shards before own) requires no manual configuration — it follows from the priority logic. This behaviour can be fixed as an invariant in the protocol specification.
 
-## Код
+## Code
 
 `simulations/user_lifecycle.py` — run with `--seeds 50 --background 200 --warmup 180`

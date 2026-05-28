@@ -1,32 +1,32 @@
 # Experiment 16: PI+S Under Threats
 
-## Вопрос
+## Question
 
-Не ломает ли S-член существующие защиты от Sybil-атак, free-rider и spite? Ухудшает ли добавление storage_ratio в формулу доверия безопасность системы по сравнению с PI-only baseline?
+Does the S term break existing defences against Sybil attacks, free-riders, and spite? Does adding storage_ratio to the trust formula make the system less secure compared to the PI-only baseline?
 
-## Модель
+## Model
 
-Та же формула PI+S из Experiment 15, но с **глобальным S** (не pairwise):
+The same PI+S formula from Experiment 15, but with **global S** (not pairwise):
 
 ```
 trust = 0.5×P_weekly + 2.0×I + ks×S
 ```
 
-| Компонент | Определение |
-|-----------|-------------|
-| P_weekly | Rolling 4-week window бинарных еженедельных проверок |
-| I | Cumulative mean — накопленная история без decay |
+| Component | Definition |
+|-----------|------------|
+| P_weekly | Rolling 4-week window of binary weekly checks |
+| I | Cumulative mean — accumulated history without decay |
 | S | storage_ratio = gb_stored_for_others / max(gb_stored_by_others, 0.01), clamped [0, 2] |
 
-Каждый сценарий запускается дважды: с **ks=1.0** (PI+S) и **ks=0.0** (PI-only baseline) — для прямого сравнения влияния S-члена.
+Each scenario is run twice: with **ks=1.0** (PI+S) and **ks=0.0** (PI-only baseline) — for a direct comparison of the S term's effect.
 
-Три сценария угроз:
+Three threat scenarios:
 
-- **A: Sybil-атака** — множество фиктивных пиров с разным числом subnet и объёмом фиктивного хранения
-- **B: Free-rider** — пиры, потребляющие ресурсы без отдачи (S_fr << 1)
-- **C: Spite-атака** — реальные пиры, накапливающие доверие для последующего удаления шардов
+- **A: Sybil attack** — many fake peers with varying subnet counts and volumes of fake storage
+- **B: Free-rider** — peers that consume resources without contributing (S_fr << 1)
+- **C: Spite attack** — real peers that accumulate trust and then delete shards
 
-## Конфигурация
+## Configuration
 
 ```
 seeds             = 30
@@ -55,11 +55,11 @@ Scenario C (Spite):
   configs         = 9
 ```
 
-## Результаты
+## Results
 
-### Сценарий A: Sybil-атака
+### Scenario A: Sybil attack
 
-Sybil-атака с **фиктивным хранением** (S_ratio=0.1) — лучший случай для дифференциации через S-член:
+Sybil attack with **fake storage** (S_ratio=0.1) — the best case for differentiation through the S term:
 
 | Sybils | Subnets | Denial PI+S | Denial PI | Delta |
 |--------|---------|-------------|-----------|-------|
@@ -67,32 +67,32 @@ Sybil-атака с **фиктивным хранением** (S_ratio=0.1) — 
 | 500 | 5 | 0.33% | 1.07% | −0.73pp |
 | 200 | 10 | 0.18% | 0.60% | −0.42pp |
 | 100 | 10 | 0.04% | 0.19% | −0.15pp |
-| 50 | любое | ≈0% | ≈0% | ≈0 |
+| 50 | any | ≈0% | ≈0% | ≈0 |
 
-Sybil-атака с **реальным хранением** (S_ratio=1.0): delta ≈ 0 во всех конфигурациях — S не может отличить честный узел от sybil, который реально хранит данные.
+Sybil attack with **real storage** (S_ratio=1.0): delta ≈ 0 across all configurations — S cannot distinguish an honest node from a Sybil that genuinely stores data.
 
-Subnet rate-limiting остаётся основной защитой. S-член даёт дополнительное снижение denial до 2pp при максимальных условиях атаки.
+Subnet rate-limiting remains the primary defence. The S term provides an additional denial reduction of up to 2pp under the most extreme attack conditions.
 
-### Сценарий B: Free-rider
+### Scenario B: Free-rider
 
-| Конфигурация | File survival (PI+S) | File survival (PI) | Delta |
+| Configuration | File survival (PI+S) | File survival (PI) | Delta |
 |---|---|---|---|
-| Все 54 конфига | **100%** | **100%** | 0 |
+| All 54 configs | **100%** | **100%** | 0 |
 
-S-член не влияет на выживаемость файлов — она уже 100% при любых параметрах free-riding за счёт erasure coding 5-of-15.
+The S term has no effect on file survival — it is already 100% under any free-riding parameters, owing to 5-of-15 erasure coding.
 
-Доля free-rider'ов выше трастового threshold (FR_above_thr):
+Share of free-riders above the trust threshold (FR_above_thr):
 
 | Reliability | S_fr | Threshold | FR_above_thr |
 |------------|------|-----------|--------------|
 | 25% | 0.1 | 0.5 | **89.5%** |
 | 25% | 0.1 | 0.3 | 99.7% |
-| 25% | 0.3+ | любой | ≥99.7% |
-| 50%+ | любой | любой | 100% |
+| 25% | 0.3+ | any | ≥99.7% |
+| 50%+ | any | any | 100% |
 
-Даже при минимальном S_fr=0.1 и жёстком threshold=0.5 лишь 10.5% free-rider'ов падают ниже порога. Однако это не влияет на выживаемость файлов: 5-of-15 обеспечивает достаточную избыточность.
+Even at the minimum S_fr=0.1 with the strict threshold=0.5, only 10.5% of free-riders fall below the threshold. This does not affect file survival, however: 5-of-15 provides sufficient redundancy.
 
-### Сценарий C: Spite-атака
+### Scenario C: Spite attack
 
 | Attackers | Wait (years) | Denial PI+S | Denial PI | AtkTrust | AtkShards/target |
 |-----------|-------------|-------------|-----------|----------|-----------------|
@@ -106,28 +106,28 @@ S-член не влияет на выживаемость файлов — он
 | 100 | 3 | 0% | 0% | 3.38 | 2.47 |
 | 100 | 5 | 0% | 0% | 3.38 | 2.48 |
 
-0% denial во всех 9 конфигурациях. Злоумышленники имеют S=1.0 (реальные узлы) — S-член не может их идентифицировать. Subnet diversity предотвращает spite-атаку независимо от формулы доверия: даже 100 атакующих получают менее 5 шардов из 15 на целевой файл.
+0% denial in all 9 configurations. Attackers have S=1.0 (real nodes) — the S term cannot identify them. Subnet diversity prevents the spite attack independently of the trust formula: even 100 attackers acquire fewer than 5 shards out of 15 for a target file.
 
-## Ключевые выводы
+## Key findings
 
-1. **S-член не ломает существующие защиты.** Главный результат эксперимента: ни в одном из трёх сценариев добавление S-члена не ухудшило безопасность системы. Regression отсутствует.
+1. **The S term does not break existing defences.** The main result of the experiment: in none of the three scenarios did adding the S term make the system less secure. No regression.
 
-2. **S даёт незначительное улучшение против Sybil с фиктивным хранением.** Снижение denial до 1.98pp при 500 sybils/10 subnets — статистически заметный, но практически небольшой эффект. Subnet rate-limiting остаётся первичной защитой.
+2. **S gives a minor improvement against Sybil with fake storage.** A denial reduction of up to 1.98pp at 500 sybils/10 subnets is statistically visible but practically small. Subnet rate-limiting remains the primary defence.
 
-3. **Free-rider-защита определяется erasure coding, а не формулой.** 5-of-15 уже обеспечивает 100% выживаемость — S-член ничего не добавляет и ничего не отнимает.
+3. **Free-rider protection is determined by erasure coding, not the formula.** 5-of-15 already delivers 100% survival — the S term neither adds nor removes anything.
 
-4. **Spite-защита определяется subnet diversity, а не формулой.** Атакующие с реальным хранением неотличимы по S, и subnet-лимит не позволяет сосредоточить достаточно шардов для удаления файла.
+4. **Spite protection is determined by subnet diversity, not the formula.** Attackers with real storage are indistinguishable by S, and the subnet limit prevents concentrating enough shards to delete a file.
 
-5. **Важная оговорка.** Эксперимент использовал глобальный аддитивный S. Pairwise мультипликативный S (принятый в Exp 22) ведёт себя иначе для free-rider'ов, но ключевой вывод — S не регрессирует защиты — остаётся в силе.
+5. **An important caveat.** The experiment used global additive S. Pairwise multiplicative S (adopted in Exp 22) behaves differently for free-riders, but the key conclusion — S does not regress the defences — remains valid.
 
-## Импликации для дизайна
+## Design implications
 
-- **S-член безопасно добавить в формулу** — ни один из трёх протестированных threat-сценариев не показал ухудшения.
-- **Не опираться на S для Sybil-защиты.** Subnet rate-limiting — первичный механизм; S даёт лишь незначительный бонус при фиктивном хранении.
-- **Защита от free-rider — это erasure coding (5-of-15), не trust formula.** Менять erasure coding параметры нельзя без пересмотра этого вывода.
-- **Spite-защита — это subnet diversity, не trust formula.** Пока subnet_limit=1 активен, spite-атака невозможна независимо от формулы.
-- **Ценность S-члена — в РАНЖИРОВАНИИ (Exp 15, 22), а не в безопасности (этот эксперимент).** Это разделение важно при принятии дизайнерских решений: S оправдан как механизм ранжирования, не как security feature.
+- **The S term is safe to add to the formula** — none of the three threat scenarios tested showed any degradation.
+- **Do not rely on S for Sybil defence.** Subnet rate-limiting is the primary mechanism; S provides only a minor bonus against fake storage.
+- **Free-rider protection comes from erasure coding (5-of-15), not the trust formula.** Changing the erasure coding parameters requires revisiting this conclusion.
+- **Spite protection comes from subnet diversity, not the trust formula.** As long as subnet_limit=1 is active, a spite attack is impossible regardless of the formula.
+- **The value of the S term is in RANKING (Exp 15, 22), not in security (this experiment).** This distinction matters when making design decisions: S is justified as a ranking mechanism, not as a security feature.
 
-## Код
+## Code
 
-`simulations/pis_threats.py` — результаты в `results/pis_threats/scenario_a_sybil.json`, `scenario_b_freerider.json`, `scenario_c_spite.json`
+`simulations/pis_threats.py` — results in `results/pis_threats/scenario_a_sybil.json`, `scenario_b_freerider.json`, `scenario_c_spite.json`

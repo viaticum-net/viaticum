@@ -1,31 +1,31 @@
 # Experiment 25: Full Model Integration
 
-## Вопрос
+## Question
 
-Работает ли полная модель (adaptive n + multiplicative S + no gate + no eviction + escrow) против всех атак? Является ли она улучшением по сравнению с Series 2 baseline?
+Does the full model (adaptive n + multiplicative S + no gate + no eviction + escrow) hold up against all attacks? Is it an improvement over the Series 2 baseline?
 
-## Модель
+## Model
 
-Два варианта сравниваются на одних и тех же сценариях:
+Two variants are compared on identical scenarios:
 
-| Модель | S-formula | n | Gate | Eviction | Escrow |
-|--------|-----------|---|------|----------|--------|
+| Model | S-formula | n | Gate | Eviction | Escrow |
+|-------|-----------|---|------|----------|--------|
 | **FULL** | multiplicative `(kp×P + ki×I) × clamp(S, 0.1, 1.0)`, kp=0.5 ki=2.0 | adaptive | OFF | OFF | ON |
 | **S2** (Series 2 baseline) | additive `kp×P + ki×I + ks×S`, kp=0.3 ki=1.5 ks=0.3 | fixed n=15 | ON | ON | ON |
 
-Escrow включён в обоих вариантах — Exp 24 показал, что он всегда полезен.
+Escrow is enabled in both variants — Exp 24 showed it is always beneficial.
 
-**Сценарии атак:**
+**Attack scenarios:**
 
-| Сценарий | Описание |
+| Scenario | Description |
 |----------|----------|
-| A — Baseline | Без атак, 6 архетипов + HitAndRun 15% arrivals |
-| B — Sybil | 200 sybil-нод в 10 подсетях /24 |
-| C — Mass departure | 30% нод покидают сеть одновременно на год 5 |
-| D — Free-rider flood | 40% arrivals — free-riders |
+| A — Baseline | No attacks, 6 archetypes + HitAndRun 15% arrivals |
+| B — Sybil | 200 Sybil nodes across 10 /24 subnets |
+| C — Mass departure | 30% of nodes leave simultaneously at year 5 |
+| D — Free-rider flood | 40% of arrivals are free-riders |
 | E — Spite | 50 attackers, 3yr wait before attack |
 
-## Конфигурация
+## Configuration
 
 ```
 nodes             = 10000
@@ -39,9 +39,9 @@ metrics           = survival_y10, Kendall's tau, HAR rate, storage overhead,
                     bootstrap time, denial rate
 ```
 
-## Результаты
+## Results
 
-### Сводная таблица (год 10)
+### Summary table (year 10)
 
 | Scenario | FULL surv% | S2 surv% | FULL tau | S2 tau | FULL HAR | S2 HAR |
 |----------|-----------|---------|---------|--------|---------|--------|
@@ -51,7 +51,7 @@ metrics           = survival_y10, Kendall's tau, HAR rate, storage overhead,
 | D Free-rider flood | **91.7%** | 97.8% | 0.600 | 0.927 | 0% | 0% |
 | E Spite | 96.0% | 97.7% | 1.000 | 0.660 | 0% | 0% |
 
-### Динамика по годам — Scenario E (Spite, репрезентативный)
+### Year-by-year dynamics — Scenario E (Spite, representative)
 
 | Year | FULL surv | S2 surv | FULL tau | S2 tau |
 |------|-----------|---------|---------|--------|
@@ -61,44 +61,44 @@ metrics           = survival_y10, Kendall's tau, HAR rate, storage overhead,
 | 7 | 96.95% | 98.02% | 0.99 | 0.69 |
 | 10 | 96.00% | 97.69% | 1.00 | 0.66 |
 
-### Дополнительные метрики — Scenario E
+### Additional metrics — Scenario E
 
-| Метрика | FULL | S2 |
+| Metric | FULL | S2 |
 |---------|------|----|
 | Storage overhead | 3.16x | 2.93x |
 | Bootstrap time | 13.94 wk | 14.01 wk |
 | Denial rate | **0.67%** | 1.32% |
 
-## Ключевые выводы
+## Key findings
 
-1. **FULL model tau=1.000 в 4/5 сценариях.** Multiplicative S корректно ранжирует архетипы под всеми атаками, кроме свободного flood'а. Результат подтверждает Exp 22 на реальной attack surface.
+1. **FULL model tau=1.000 in 4/5 scenarios.** Multiplicative S correctly ranks archetypes under all attacks except the free-rider flood. This confirms Exp 22 against a realistic attack surface.
 
-2. **Escrow блокирует HAR на 100%.** HAR rate = 0% во всех 10 конфигурациях. Механизм работает независимо от формулы S и параметров adaptive n.
+2. **Escrow blocks HAR at 100%.** HAR rate = 0% in all 10 configurations. The mechanism works regardless of the S formula and adaptive n parameters.
 
-3. **FULL model имеет меньшую выживаемость, чем S2** (96% vs ~98%). Причина: adaptive n снижает избыточность — с multiplicative S ненадёжные партнёры получают низкий trust → высокий n → но шарды всё равно распределяются между ними → часть теряется.
+3. **FULL model has lower survival than S2** (96% vs ~98%). The reason: adaptive n reduces redundancy — with multiplicative S, unreliable partners receive low trust, which raises n, but shards are still distributed among them and some are lost.
 
-4. **Scenario D — проблемный случай.** При 40% free-rider arrivals: survival=91.7%, tau=0.600. Без gate free-riders заполняют партнёрские слоты; их низкий trust вызывает высокий n → парадоксально ухудшает coverage. Это граничное условие за пределами design envelope системы.
+4. **Scenario D is the problem case.** At 40% free-rider arrivals: survival=91.7%, tau=0.600. Without a gate, free-riders fill partner slots; their low trust triggers high n, which paradoxically worsens coverage. This is an edge condition outside the system's design envelope.
 
-5. **Spite resistance улучшилась.** FULL denial rate 0.67% против S2 1.32% — multiplicative S сильнее штрафует атакующих, что снижает вероятность успешного отказа в обслуживании.
+5. **Spite resistance improved.** FULL denial rate 0.67% versus S2 1.32% — multiplicative S penalises attackers more strongly, reducing the probability of a successful denial of service.
 
-6. **S2 имеет стабильно высокую выживаемость** (~97.7% во всех сценариях) несмотря на плохой tau. Fixed n=15 даёт постоянную избыточность независимо от точности ранжирования — это защита за счёт overprovisioning.
+6. **S2 has consistently high survival** (~97.7% across all scenarios) despite poor tau. Fixed n=15 provides constant redundancy regardless of ranking accuracy — protection through overprovisioning.
 
-## Нерешённые вопросы
+## Open questions
 
-1. **Почему FULL уступает S2 по выживаемости?** Гипотеза: adaptive n вычисляется на основе среднего trust партнёров. При multiplicative S ненадёжные ноды получают очень низкий trust → n растёт → но шарды всё равно попадают к ненадёжным партнёрам → потери сохраняются. Нужно проверить, помогает ли ограничение минимального trust при выборе партнёров.
+1. **Why does FULL underperform S2 on survival?** Hypothesis: adaptive n is computed from the mean trust of partners. With multiplicative S, unreliable nodes receive very low trust, so n rises, but shards still end up with unreliable partners and losses persist. It is worth testing whether imposing a minimum trust threshold for partner selection helps.
 
-2. **Scenario D:** 40% free-rider arrivals могут превышать design envelope. Необходимо протестировать, не слишком ли агрессивна таблица adaptive n для высокой доли ненадёжных нод.
+2. **Scenario D:** 40% free-rider arrivals may exceed the design envelope. The adaptive n table needs testing to determine whether it is too aggressive for a high fraction of unreliable nodes.
 
-3. **Overhead FULL (3.16x) > S2 (2.93x)** несмотря на adaptive n в scenario E. Adaptive n, вероятно, перекомпенсирует low-trust партнёров, создавая больше шардов, чем фиксированный n=15.
+3. **FULL overhead (3.16x) > S2 (2.93x)** despite adaptive n in Scenario E. Adaptive n likely over-compensates for low-trust partners by generating more shards than fixed n=15.
 
-## Импликации для дизайна
+## Design implications
 
-- **Multiplicative S + escrow подтверждены** как core механизмы: tau=1.000, HAR=0%.
-- **Adaptive n требует настройки.** Текущая таблица может быть слишком агрессивной: FULL overhead превышает S2, а survival ниже. Нужно исследовать более консервативные пороги.
-- **Fixed n=15 — безопасный default** для reference implementation: стабильная выживаемость и предсказуемое поведение без параметрической настройки.
-- **Gate removal приемлемо для 4/5 сценариев**, но уязвимо к free-rider flood. Возможные решения: conditional gate по доле ненадёжных нод, либо минимальный trust threshold для выделения шардов.
-- **Оптимизация tau (ранжирование) и survival (избыточность) частично конкурирующие цели.** Multiplicative S улучшает точность ранжирования, но adaptive n, реагируя на это, снижает фактическую избыточность. Дизайн должен явно фиксировать, что важнее в каждом сценарии.
+- **Multiplicative S + escrow are confirmed** as core mechanisms: tau=1.000, HAR=0%.
+- **Adaptive n needs tuning.** The current table may be too aggressive: FULL overhead exceeds S2 and survival is lower. More conservative thresholds need investigation.
+- **Fixed n=15 is the safe default** for the reference implementation: stable survival and predictable behaviour without parametric tuning.
+- **Gate removal is acceptable in 4/5 scenarios**, but is vulnerable to free-rider flooding. Possible mitigations: a conditional gate based on the fraction of unreliable nodes, or a minimum trust threshold for shard allocation.
+- **Optimising tau (ranking) and survival (redundancy) are partially competing goals.** Multiplicative S improves ranking accuracy, but adaptive n reacts to that by reducing actual redundancy. The design should explicitly specify which matters more in each scenario.
 
-## Код
+## Code
 
-`simulations/pis_integration.py` — результаты в `results/pis_integration/pis_integration_results.json`
+`simulations/pis_integration.py` — results in `results/pis_integration/pis_integration_results.json`

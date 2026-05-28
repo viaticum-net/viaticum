@@ -1,24 +1,24 @@
 # Experiment 14: Individual Node Perspective
 
-## Вопрос
+## Question
 
-Как система выглядит с точки зрения одного конкретного узла в трёх практически важных ситуациях: работа с ненадёжными партнёрами, длительное отсутствие (отпуск), и постепенное заполнение диска? Насколько система «тихая» в нормальном режиме? Что именно нужно показывать пользователю?
+How does the system look from the perspective of a single concrete node in three practically important situations: operating with unreliable partners, an extended absence (holiday), and gradual disk fill? How "quiet" is the system in normal operation? What exactly should be shown to the user?
 
-## Модель
+## Model
 
-Три независимых сценария, каждый моделирует одного протагониста в окружении 100 фоновых пиров. Общие параметры:
+Three independent scenarios, each modelling one protagonist surrounded by 100 background peers. Common parameters:
 
 - **Erasure:** 5-of-15 (k=5, n=15)
-- **PID:** kp=0.5, ki=2.0, kd=0 (умолчание)
-- **Seeds:** 50 на сценарий
+- **PID:** kp=0.5, ki=2.0, kd=0 (defaults)
+- **Seeds:** 50 per scenario
 
-**Сценарий 1 — Flaky Partners:** неоднородная сеть с разными уровнями надёжности, 12 месяцев, 30% годовой churn.
+**Scenario 1 — Flaky Partners:** heterogeneous network with varying reliability levels, 12 months, 30% annual churn.
 
-**Сценарий 2 — Vacation:** однородная сеть @0.90, три фазы: 6 месяцев до отъезда, 14 дней оффлайн, 3 месяца после возвращения.
+**Scenario 2 — Vacation:** homogeneous network @0.90, three phases: 6 months before departure, 14 days offline, 3 months after return.
 
-**Сценарий 3 — Disk Pressure:** однородная сеть @0.90, 18 месяцев, диск на 100 слотов, 50% свободно в начале, рост занятости 3.0 слота/месяц, 30 начальных партнёров.
+**Scenario 3 — Disk Pressure:** homogeneous network @0.90, 18 months, disk with 100 slots, 50% free at the start, occupancy growing at 3.0 slots/month, 30 initial partners.
 
-## Конфигурация
+## Configuration
 
 ```
 seeds             = 50
@@ -48,13 +48,13 @@ eviction_buffer   = 5%
 
 ---
 
-## Сценарий 1: Flaky Partners
+## Scenario 1: Flaky Partners
 
-### Условия
+### Conditions
 
-100 пиров с разной надёжностью: 60 надёжных (@0.95), 25 умеренных (@0.80), 15 ненадёжных (@0.50). Годовой churn 30% — ненадёжные пиры естественно выбывают быстрее. Симуляция 12 месяцев.
+100 peers with varying reliability: 60 reliable (@0.95), 25 moderate (@0.80), 15 flaky (@0.50). Annual churn of 30% — unreliable peers naturally drop out faster. Simulation runs for 12 months.
 
-### Результаты
+### Results
 
 | Month | OwnShards | AtRisk | Repairs | D-warns | P_restore |
 |-------|-----------|--------|---------|---------|-----------|
@@ -66,26 +66,26 @@ eviction_buffer   = 5%
 |    12 |      15.0 |    0.1 |    0.66 |    3.48 |    100.0% |
 
 D-warning events: avg 55.2/year [p5=42.4, p95=68.5]
-True positive rate: 9% (предупреждение до реального ухода в течение 30 дней)
+True positive rate: 9% (warning before an actual departure within 30 days)
 False positive rate: 91%
 
-### Ключевые выводы
+### Key findings
 
-1. **Система самовосстанавливается незаметно для пользователя.** Все 15/15 шардов удерживаются на протяжении всего года, P(restore) = 100% в каждый момент. Ремонты (~0.8/месяц) происходят автоматически без вмешательства.
+1. **The system self-heals invisibly.** All 15/15 shards are retained throughout the year; P(restore) = 100% at every point. Repairs (~0.8/month) happen automatically without intervention.
 
-2. **Качество хранения улучшается со временем.** AtRisk-шарды (размещённые у ненадёжных держателей) снижаются с 2.2 до 0.1 по мере того, как плохие пиры вытесняются churn'ом, а их место занимают проверенные партнёры.
+2. **Storage quality improves over time.** AtRisk shards (placed with unreliable holders) fall from 2.2 to 0.1 as bad peers are eliminated by churn and their slots are taken by proven partners.
 
-3. **D-предупреждения слишком шумные для прямого UX.** 55 событий в год при 91% ложных срабатываний — нельзя показывать это пользователю как есть. Нужна агрегация или фильтрация перед показом.
+3. **D-warnings are too noisy for direct UX.** 55 events per year at a 91% false-positive rate cannot be shown to the user as-is. Aggregation or filtering is required before display.
 
 ---
 
-## Сценарий 2: Vacation (14 дней оффлайн)
+## Scenario 2: Vacation (14 days offline)
 
-### Условия
+### Conditions
 
-Протагонист 6 месяцев активно работает в сети (накапливает доверие), затем уходит оффлайн на 14 дней, затем возвращается. Сеть 100 пиров @0.90 надёжности.
+The protagonist is active on the network for 6 months (accumulating trust), then goes offline for 14 days, then returns. Network of 100 peers @0.90 reliability.
 
-### Результаты
+### Results
 
 Pre-vacation trust: 2.367 [p5=2.283, p95=2.439]
 Trust loss during vacation: 0.357 [p5=0.334, p95=0.373]
@@ -100,25 +100,25 @@ Trust loss during vacation: 0.357 [p5=0.334, p95=0.373]
 | Post d7      |  200 | 2.014 |   0.504 |   0.881 |      14.6 |    100.0% |
 | Post d30     |  223 | 2.251 |   0.949 |   0.888 |      14.6 |    100.0% |
 
-### Ключевые выводы
+### Key findings
 
-1. **Данные в полной безопасности во время отпуска.** P(restore) = 100% на протяжении всего периода, включая 14 дней оффлайн. 14.6/15 шардов к концу отсутствия — небольшие естественные потери из-за churn в сети, но k=5 с большим запасом.
+1. **Data is completely safe during the holiday.** P(restore) = 100% throughout, including all 14 offline days. 14.6/15 shards remain at the end of the absence; natural losses from network churn, but k=5 provides ample margin.
 
-2. **P-компонента и I-компонента ведут себя по-разному.** P-score падает вдвое (0.945 → 0.503) — она отражает текущую активность и реагирует быстро. I-score снижается только на 7.2% (0.947 → 0.879) — накопленная история за 6 месяцев сглаживает короткое отсутствие.
+2. **The P-component and I-component behave differently.** P-score halves (0.945 → 0.503) — it reflects current activity and reacts quickly. I-score drops only 7.2% (0.947 → 0.879) — six months of accumulated history absorbs a short absence.
 
-3. **Доверие восстанавливается за 30 дней.** После возвращения trust 2.251 — это 95.1% от довакационного уровня (2.367). Не полное восстановление, но практически незначимое отличие.
+3. **Trust recovers within 30 days.** After returning, trust is 2.251 — 95.1% of the pre-holiday level (2.367). Not full recovery, but the difference is practically negligible.
 
-4. **UX-вывод: отпуск абсолютно безопасен.** Пользователю не нужно беспокоиться об отключении на 2 недели. Ни данные, ни репутация не теряются необратимо.
+4. **UX conclusion: a holiday is completely safe.** Users need not worry about disconnecting for two weeks. Neither data nor reputation is lost irreversibly.
 
 ---
 
-## Сценарий 3: Disk Pressure
+## Scenario 3: Disk Pressure
 
-### Условия
+### Conditions
 
-Протагонист начинает с 30 партнёрами и хранит их шарды. Диск заполняется на 3.0 слота/месяц. При достижении буфера в 5% свободного пространства система начинает вытеснять партнёров с наименьшим доверием.
+The protagonist starts with 30 partners and holds their shards. Disk fills at 3.0 slots/month. Once free space reaches the 5% buffer, the system begins evicting the lowest-trust partners.
 
-### Результаты
+### Results
 
 | Month | FreeSpace% | StoredFor | OwnShards |  Trust | Evictions | P_restore |
 |-------|------------|-----------|-----------|--------|-----------|-----------|
@@ -132,44 +132,44 @@ Trust loss during vacation: 0.357 [p5=0.334, p95=0.373]
 
 Total evictions: avg 17.0 [p5=17.0, p95=17.0]
 
-### Ключевые выводы
+### Key findings
 
-1. **Заполнение диска линейное, вытеснение начинается только на пороге.** 12 месяцев свободного падения (38% → 5%) без каких-либо вытеснений. Система ничего не делает, пока есть место.
+1. **Disk fill is linear; eviction only starts at the threshold.** 12 months of free fall (38% → 5%) with no evictions at all. The system does nothing while space is available.
 
-2. **Вытеснение постепенное и упорядоченное.** После достижения порога система убирает 3 партнёра в месяц (партнёры с наименьшим доверием идут первыми). 30 → 22 → 13 за 6 месяцев вытеснения. Итого 17 вытеснений из 30 начальных.
+2. **Eviction is gradual and ordered.** Once the threshold is reached, the system removes 3 partners per month (lowest-trust partners go first). 30 → 22 → 13 over 6 months of eviction; 17 total evictions out of 30 initial partners.
 
-3. **Собственные данные защищены всегда.** OwnShards = 15.0 на протяжении всех 18 месяцев, P(restore) = 100%. Вытеснение касается только «хранимых для других» — собственные шарды в приоритете.
+3. **Own data is always protected.** OwnShards = 15.0 throughout all 18 months; P(restore) = 100%. Eviction only affects shards held for others — own shards are always prioritised.
 
-4. **Доверие не страдает от вытеснения.** Trust стабилен на уровне 2.37–2.38 весь период, включая фазу активных вытеснений. Сокращение обязательств «хранить для других» не влияет на репутацию.
+4. **Trust is unaffected by eviction.** Trust remains stable at 2.37–2.38 throughout, including the active eviction phase. Reducing "store for others" commitments does not affect reputation.
 
-5. **UX-вывод: диск заполняется → система тихо освобождает место.** Пользователю достаточно знать, что место заканчивается. Что именно вытесняется — детали реализации, не UX.
+5. **UX conclusion: disk fills up and the system quietly frees space.** The user only needs to know that space is running low. What exactly gets evicted is an implementation detail, not a UX concern.
 
 ---
 
-## Ключевые выводы
+## Key findings
 
-1. **В нормальном режиме система невидима.** Ремонты, вытеснения, предупреждения — всё происходит автоматически. Пользователь не должен ни о чём знать, пока P(restore) = 100%.
+1. **In normal operation the system is invisible.** Repairs, evictions, warnings — all happen automatically. The user need not know anything as long as P(restore) = 100%.
 
-2. **14-дневный отпуск: -15.1% доверия, восстановление за 30 дней.** Данные в полной сохранности. I-компонента выступает буфером, поглощающим кратковременные паузы.
+2. **14-day holiday: −15.1% trust, recovery within 30 days.** Data is fully safe. The I-component acts as a buffer that absorbs brief pauses.
 
-3. **Давление на диск: плавная деградация через автоматическое вытеснение.** Нулевое влияние на собственные данные. Приоритет всегда на стороне пользователя.
+3. **Disk pressure: smooth degradation through automatic eviction.** Zero impact on own data. Priority is always with the user's own files.
 
-4. **D-предупреждения: 91% ложных срабатываний.** Ценная внутренняя метрика для решения о ремонте, но непригодная для прямого показа в интерфейсе без агрегации.
+4. **D-warnings: 91% false-positive rate.** A valuable internal metric for repair decisions, but unsuitable for direct display in the UI without aggregation.
 
-## Импликации для UX/дизайна
+## Design and UX implications
 
-- **Главные метрики для показа:** P(restore) — всегда (ключевая гарантия), тренд доверия (растёт/стабильно/падает), свободное место на диске. Всё остальное — в «расширенный» раздел.
+- **Primary metrics to display:** P(restore) — always (the core guarantee), trust trend (rising/stable/falling), free disk space. Everything else belongs in an "advanced" section.
 
-- **D-предупреждения — только за шторкой.** При 91% ложных срабатываний показывать их напрямую — засорять интерфейс. Применять агрегацию: показывать только если несколько D-событий за короткий период, или только для специфических партнёров.
+- **D-warnings only behind a disclosure.** At a 91% false-positive rate, showing them directly clutters the interface. Apply aggregation: show only when several D-events occur in a short window, or only for specific partners.
 
-- **Отпуск без предупреждений.** Если пользователь знает, что уходит оффлайн на 2 недели — никакого алармизма. Можно показать прогноз: «Вернётесь через 14 дней — доверие восстановится за месяц. Данные в безопасности.»
+- **No alarmism about holidays.** If the user knows they are going offline for two weeks, no scaremongering is needed. A forecast is appropriate: "Back in 14 days — trust will recover within a month. Data is safe."
 
-- **Диск: показывать заблаговременно.** При свободном месте < 15% — уведомление. При < 5% — предупреждение о начале вытеснений. Не требует действий от пользователя, просто информирование.
+- **Disk: notify early.** When free space drops below 15%, send a notification. Below 5%, warn that evictions are starting. No action required from the user; this is purely informational.
 
-- **Вытеснение прозрачно, но не страшно.** Если партнёр был вытеснен — можно показать в логе событий, но не как ошибку, а как нормальную работу системы («Диск заполнен, освободили место»).
+- **Eviction is transparent but not alarming.** If a partner was evicted, it can appear in the event log, but as normal system operation ("Disk full, space freed"), not as an error.
 
-- **Trust как дашборд, не как тревога.** Падение trust на 15% за 2 недели — не инцидент. Показывать trend-линию, не красные предупреждения, если P(restore) остаётся высоким.
+- **Trust as a dashboard, not an alert.** A 15% trust drop over two weeks is not an incident. Show a trend line, not red warnings, as long as P(restore) remains high.
 
-## Код
+## Code
 
-`simulations/node_perspective.py` — запуск с `--scenario flaky`, `--scenario vacation`, `--scenario disk` и `--seeds 50`
+`simulations/node_perspective.py` — run with `--scenario flaky`, `--scenario vacation`, `--scenario disk` and `--seeds 50`

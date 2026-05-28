@@ -1,14 +1,14 @@
 # Experiment 27: Shard Placement in Saturated Network
 
-## Вопрос
+## Question
 
-В насыщенной сети (все диски заполнены) каждое размещение шарда = вытеснение чего-то. Какая стратегия гистерезиса минимизирует eviction cascades и data loss? Помогает ли Budget Planner (не пытаться размещать если заведомо не получится)?
+In a saturated network (all disks full), every shard placement displaces something. Which hysteresis strategy minimises eviction cascades and data loss? Does the Budget Planner help (by skipping placement when success is unlikely)?
 
-## Мотивация
+## Motivation
 
-Рациональная стратегия любой ноды — реплицироваться максимально. Значит нормальное состояние зрелой сети — свободного места нет. Предыдущие эксперименты (1-26) моделировали растущую сеть, не насыщенную. Это другой режим.
+The rational strategy for any node is to replicate as much as possible. A fully mature network therefore tends to have no free space. Experiments 1-26 modelled a growing network, not a saturated one. This is a different regime.
 
-## Модель
+## Model
 
 ### Eviction priority (holder side)
 
@@ -17,26 +17,26 @@ eviction_priority = importance × trust_of_owner × (1 + age_bonus)
 age_bonus = min(weeks_stored / 26, 0.3)
 ```
 
-Шард с наименьшим priority вытесняется первым. Вытесненный шард пытается переместиться к другому партнёру (cascade).
+The shard with the lowest priority is evicted first. An evicted shard attempts to move to another partner (cascade).
 
-### Стратегии гистерезиса
+### Hysteresis strategies
 
-| Стратегия | Описание |
-|-----------|----------|
-| A | Без гистерезиса (evict если new_priority > min_priority) |
+| Strategy | Description |
+|----------|-------------|
+| A | No hysteresis (evict if new_priority > min_priority) |
 | B | Threshold H=0.2 (new_priority > min × 1.2) |
-| C | Time bonus +30% (старые шарды получают бонус до 30% за 26 недель) |
+| C | Time bonus +30% (old shards gain a bonus of up to 30% over 26 weeks) |
 | D | Combined (B+C) |
-| E | D + Budget Planner (skip placement если < K партнёров примут) |
+| E | D + Budget Planner (skip placement if fewer than K partners will accept) |
 
-### Сценарии
+### Scenarios
 
-| Сценарий | Описание |
-|----------|----------|
-| 1 | Saturated steady-state: 200 нод, pre-fill 90%, 52 недели dirty data |
-| 2 | Newcomer: та же сеть + новичок каждые 4 недели, bandwidth 30 GB/wk |
+| Scenario | Description |
+|----------|-------------|
+| 1 | Saturated steady-state: 200 nodes, pre-fill 90%, 52 weeks of dirty data |
+| 2 | Newcomer: same network + one newcomer every 4 weeks, bandwidth 30 GB/wk |
 
-### Конфигурация
+### Configuration
 
 ```
 nodes              = 200
@@ -55,7 +55,7 @@ importance         = beta(2, 1.5), mean ~0.57
 seeds              = 10
 ```
 
-## Результаты v2: Hysteresis Strategies (A-D)
+## Results v2: Hysteresis Strategies (A-D)
 
 ### Scenario 1: Saturated steady-state
 
@@ -83,7 +83,7 @@ seeds              = 10
 | C | 1.5 | 1.9 wk | 4.3 wk | 51.7% | 32857 |
 | **D** | **1.5** | **3.1 wk** | **5.9 wk** | **51.5%** | **31756** |
 
-## Результаты v3: Budget Planner (D vs E)
+## Results v3: Budget Planner (D vs E)
 
 ### Scenario 1
 
@@ -103,33 +103,33 @@ seeds              = 10
 | D | 1.5 | 3.1 wk | 67.9% | 31756 |
 | E | 1.5 | 2.0 wk | 73.1% | 30509 |
 
-## Выводы
+## Findings
 
-### 1. Coverage зависит от offer ratio, не от стратегии
+### 1. Coverage depends on offer ratio, not on strategy
 
-Все стратегии дают одинаковое покрытие при одном ratio (~36% при 1:1, ~70% при 3:1). Гистерезис не создаёт и не уничтожает место — только влияет на стабильность.
+All strategies produce the same coverage at a given ratio (~36% at 1:1, ~70% at 3:1). Hysteresis neither creates nor destroys space; it only affects stability.
 
-### 2. Strategy D (combined hysteresis) оптимальна
+### 2. Strategy D (combined hysteresis) is optimal
 
-- **-34% evictions** vs A (no hysteresis): 1398 vs 2128/wk при ratio 1.5
+- **-34% evictions** vs A (no hysteresis): 1398 vs 2128/wk at ratio 1.5
 - **-13% data loss** vs A: 34562 vs 39580 GB
-- Каскады неглубокие: 65-70% размещений без каскадов, mean depth 0.4-0.6
-- Cascades самозатухают: свежие шарды (age=0) легко вытесняются обратно
-- Newcomer entry чуть медленнее (3 vs 2 wk to 50%), но приемлемо
+- Cascades are shallow: 65-70% of placements require no cascade, mean depth 0.4-0.6
+- Cascades are self-dampening: fresh shards (age=0) are evicted back out easily
+- Newcomer entry is slightly slower (3 vs 2 wk to 50%), but acceptable
 
-### 3. Budget Planner помогает умеренно
+### 3. Budget Planner helps moderately
 
-E vs D при ratio 1.0 (самый жёсткий):
-- **+8.8pp success rate** (65.0% vs 56.2%) — главный эффект
+E vs D at ratio 1.0 (the tightest condition):
+- **+8.8pp success rate** (65.0% vs 56.2%) — the primary effect
 - **-6.2% evictions** (1263 vs 1347/wk)
 - **-7.4% data loss** (29594 vs 31952 GB)
-- Coverage не меняется — бюджет не создаёт места, только экономит bandwidth
+- Coverage unchanged — the budget does not create space, it only saves bandwidth
 
-### 4. Финальный выбор: Strategy E (D + Budget Planner)
+### 4. Final choice: Strategy E (D + Budget Planner)
 
-Combined hysteresis (threshold H=0.2 + time bonus +30%) + budget estimation перед размещением.
+Combined hysteresis (threshold H=0.2 + time bonus +30%) plus budget estimation before placement.
 
-## Файлы
+## Files
 
 - `simulations/shard_placement.py` — simulation code (strategies A-E)
 - `simulations/results/shard_placement/shard_placement_v2_results.json` — v2 raw results (A-D)

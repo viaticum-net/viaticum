@@ -1,4 +1,4 @@
-# Experiment 07: Targeted Spite Attack ("Обиженка")
+# Experiment 07: Targeted Spite Attack
 
 ## Question
 How many colluding nodes needed to deny restore to a specific target? What's the ROI?
@@ -71,7 +71,7 @@ Three factors combine:
 ## Design Implications
 
 - **No special defense needed against spite.** Standard erasure coding (5-of-15) is sufficient.
-- **This validates the RESEARCH.md "обиженка" analysis.** Years of honest investment for negligible ROI.
+- **This validates the RESEARCH.md spite analysis.** Years of honest investment for negligible ROI.
 - **For paranoid users:** recommend 5-of-15 or wider coding. 7-of-10 has marginal vulnerability at extreme attacker sizes.
 - **The real spite defense is the time cost.** The attacker must maintain nodes for months/years *hoping* the target's disk fails. Most will give up.
 

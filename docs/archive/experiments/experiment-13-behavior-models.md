@@ -1,34 +1,34 @@
 # Experiment 13: Behavior Models / Archetypes
 
-## Вопрос
+## Question
 
-Как реальные паттерны использования влияют на PI-репутацию? Насколько хорошо PI-ранжирование соответствует реальной «полезности» пира? Есть ли архетипы пользователей, которых система систематически переоценивает или недооценивает?
+How do real usage patterns affect PI reputation? How well does PI ranking match the actual "usefulness" of a peer? Are there user archetypes that the system systematically over- or underestimates?
 
-## Модель
+## Model
 
-Шесть архетипов пользователей, отражающих реальные паттерны доступности и хранения:
+Six user archetypes reflecting real availability and storage patterns:
 
 | Archetype | Share | Uptime | Storage capacity | Description |
 |-----------|-------|--------|-----------------|-------------|
-| Reliable | 40% | 99% | 100% | Всегда онлайн, полный объём |
-| Weekend | 20% | 95% вых. / 30% буд. | 100% | Онлайн по выходным, редко в будни |
-| Seasonal | 15% | 95% семестр / 20% лето | 100% | Студент: активен осень-весна, пропадает летом |
-| Nomad | 10% | ~50% случайные ON/OFF блоки | 100% | Непредсказуемые периоды онлайн/оффлайн |
-| Hoarder | 10% | 90% | 20% | Почти всегда онлайн, но отдаёт мало места |
-| Freeloader | 5% | 80% | 10% | Онлайн большую часть времени, отдаёт минимум |
+| Reliable | 40% | 99% | 100% | Always online, full capacity |
+| Weekend | 20% | 95% weekends / 30% weekdays | 100% | Online at weekends, rarely on weekdays |
+| Seasonal | 15% | 95% semester / 20% summer | 100% | Student: active autumn–spring, disappears in summer |
+| Nomad | 10% | ~50% random ON/OFF blocks | 100% | Unpredictable online/offline periods |
+| Hoarder | 10% | 90% | 20% | Almost always online but contributes little storage |
+| Freeloader | 5% | 80% | 10% | Online most of the time, contributes minimal storage |
 
-**Реальный ранг полезности** (оценка с точки зрения сети, чем выше — тем полезнее):
+**Actual usefulness rank** (from the network's perspective; higher = more useful):
 
 | Actual rank | Archetype | Rationale |
 |-------------|-----------|-----------|
-| 1 | Reliable | Высокий uptime + полный объём |
-| 2 | Weekend | Полный объём + предсказуемый график |
-| 3 | Seasonal | Полный объём, предсказуемый паттерн |
-| 4 | Nomad | Полный объём, но непредсказуем |
-| 5 | Hoarder | Высокий uptime, но мало места |
-| 5 | Freeloader | Средний uptime, минимум места |
+| 1 | Reliable | High uptime + full capacity |
+| 2 | Weekend | Full capacity + predictable schedule |
+| 3 | Seasonal | Full capacity, predictable pattern |
+| 4 | Nomad | Full capacity, but unpredictable |
+| 5 | Hoarder | High uptime, but little storage |
+| 5 | Freeloader | Moderate uptime, minimal storage |
 
-## Конфигурация
+## Configuration
 
 ```
 peers             = 200
@@ -40,9 +40,9 @@ kd                = 0
 erasure           = 5-of-15
 ```
 
-## Результаты
+## Results
 
-### Итоговое доверие (месяц 24)
+### Final trust (month 24)
 
 | Archetype | Trust_mean | PI_rank | Actual_rank | Delta |
 |-----------|-----------|---------|-------------|-------|
@@ -53,9 +53,9 @@ erasure           = 5-of-15
 | Weekend | 1.458 | 5 | 2 | **-3** |
 | Nomad | 1.248 | 6 | 4 | -2 |
 
-**Kendall's tau = 0.000** — PI-ранжирование не коррелирует с реальной полезностью.
+**Kendall's tau = 0.000** — PI ranking does not correlate with actual usefulness.
 
-### Kendall's tau по времени
+### Kendall's tau over time
 
 | Period | Months | tau |
 |--------|--------|-----|
@@ -64,9 +64,9 @@ erasure           = 5-of-15
 | Late-1 | 13–17 | 0.138 |
 | Late-2 | 18–24 | 0.000 |
 
-Максимум 0.276 — достигнут только в первые месяцы. В долгосрочной перспективе корреляция устойчиво около нуля.
+Maximum of 0.276 reached only in the first months. Over the long term the correlation is consistently near zero.
 
-### Сезонная динамика (Seasonal archetype)
+### Seasonal dynamics (Seasonal archetype)
 
 | Event | Month | Trust | Change |
 |-------|-------|-------|--------|
@@ -77,42 +77,42 @@ erasure           = 5-of-15
 | Year 2 summer drop | 18 | 2.105 → 1.560 | **−0.545** |
 | Year 2 Sep recovery | 21 | 1.560 → 1.837 | +0.277 |
 
-I-компонента смягчает летний провал во втором году: −0.545 против −0.927 в первом (на 41% меньше).
+The I-component softens the summer drop in year 2: −0.545 vs −0.927 in year 1 (41% smaller).
 
-### Слепое пятно по хранению
+### Storage blind spot
 
 | Archetype | Uptime | Storage | Trust | PI_rank | Actual_rank | Verdict |
 |-----------|--------|---------|-------|---------|-------------|---------|
-| Hoarder | 90% | 20% | 2.251 | 2 | 5 | Переоценён на 3 позиции |
-| Freeloader | 80% | 10% | 2.000 | 3 | 5 | Переоценён на 2 позиции |
-| Weekend | 95%/30% | 100% | 1.458 | 5 | 2 | Недооценён на 3 позиции |
+| Hoarder | 90% | 20% | 2.251 | 2 | 5 | Overrated by 3 positions |
+| Freeloader | 80% | 10% | 2.000 | 3 | 5 | Overrated by 2 positions |
+| Weekend | 95%/30% | 100% | 1.458 | 5 | 2 | Underrated by 3 positions |
 
-PI-контроллер измеряет только надёжность ответов на проверки (uptime). Объём хранения, предоставляемый другим, не входит в формулу.
+The PI controller only measures reliability of check responses (uptime). The volume of storage contributed to others is not part of the formula.
 
-## Ключевые выводы
+## Key findings
 
-1. **PI правильно определяет крайности.** Reliable (#1) и Nomad (#6) расставлены верно. Середина — перепутана.
+1. **PI correctly identifies the extremes.** Reliable (#1) and Nomad (#6) are placed correctly. The middle is scrambled.
 
-2. **Эксплойт Hoarder/Freeloader.** Высокий uptime + низкий объём хранения → высокое доверие. PI не видит дисбаланс хранения. Это наиболее серьёзная уязвимость: пир может паразитировать на сети, просто отвечая на проверки, не отдавая реального места.
+2. **Hoarder/Freeloader exploit.** High uptime + low storage contribution → high trust. PI does not see the storage imbalance. This is the most serious vulnerability: a peer can free-ride on the network simply by answering checks without contributing real space.
 
-3. **Weekend Warrior серьёзно недооценён.** Пир предоставляет 100% объём хранения и доступен 3 дня в неделю, но PI ставит его на #5 — потому что будничные проверки (70% дней) часто проваливаются. По реальному вкладу это второй лучший архетип.
+3. **Weekend Warrior is seriously underrated.** The peer contributes 100% storage capacity and is available 3 days a week, yet PI places it at #5 — because weekday checks (70% of days) frequently fail. By actual contribution this is the second-best archetype.
 
-4. **Сезонное восстановление работает хорошо.** I-компонента буферизует летний провал: в год 2 падение на 41% меньше, чем в год 1. «Память» доверия защищает сезонных пользователей, давая им время на восстановление.
+4. **Seasonal recovery works well.** The I-component buffers the summer drop: the fall in year 2 is 41% smaller than in year 1. Trust "memory" protects seasonal users, giving them time to recover.
 
-5. **Kendall's tau = 0.0 — это не проблема параметров.** Это структурная проблема формулы: PI измеряет не то, что нужно. Никакой подбор kp/ki не исправит то, что объём хранения вообще не входит в расчёт.
+5. **Kendall's tau = 0.0 is not a parameter problem.** It is a structural problem with the formula: PI measures the wrong thing. No tuning of kp/ki can fix the fact that storage volume does not enter the calculation at all.
 
-6. **Импликация для Experiment 05.** Необходим член баланса хранения: `GB stored for others / GB stored by others`. Без него Hoarder/Freeloader будут систематически переоцениваться.
+6. **Implication for Exp 05.** A storage-balance term is needed: `GB stored for others / GB stored by others`. Without it, Hoarder/Freeloader will be systematically overrated.
 
-7. **Weekend-пользователи нуждаются в другом окне.** P-окно в 30 дней (с дневными проверками) штрафует за регулярную, но периодическую доступность. Недельный цикл проверок или P-окно в 7 дней как единица устранили бы этот перекос.
+7. **Weekend users need a different window.** A P-window of 30 days (with daily checks) penalises regular but periodic availability. A weekly check cadence, or treating a 7-day window as the unit, would remove this bias.
 
-## Импликации для дизайна
+## Design implications
 
-- **Добавить член хранения в формулу доверия.** `trust += w_s × (gb_stored_for_others / gb_stored_by_others)` — это напрямую штрафует Hoarder/Freeloader и поощряет реальный вклад. Candidate для Experiment 14.
-- **Пересмотреть гранулярность P-окна.** Weekly check cadence вместо daily устранит систематическое занижение Weekend-архетипа без потери чувствительности к реальным проблемам.
-- **I-компонента достаточна для сезонных пользователей** — специальных механизмов «заморозки» не требуется. Буферизация на основе накопленной истории работает.
-- **Kendall's tau как метрика качества протокола.** Стоит включить в стандартный набор метрик симуляций: если tau < 0.5, формула доверия неадекватно отражает реальную полезность.
-- **Не доверять uptime как единственному сигналу.** Uptime необходим, но недостаточен. Hoarder с 90% uptime объективно менее полезен, чем Weekend-пользователь с полным объёмом, которого проверки застают оффлайн в будни.
+- **Add a storage term to the trust formula.** `trust += w_s × (gb_stored_for_others / gb_stored_by_others)` — this directly penalises Hoarder/Freeloader and rewards real contribution. Candidate for Exp 14.
+- **Reconsider P-window granularity.** A weekly check cadence instead of daily would eliminate the systematic underrating of the Weekend archetype without sacrificing sensitivity to real problems.
+- **The I-component is sufficient for seasonal users** — no special "freeze" mechanism is needed. Buffering based on accumulated history works.
+- **Kendall's tau as a protocol quality metric.** Worth including in the standard simulation metric set: if tau < 0.5, the trust formula inadequately reflects actual usefulness.
+- **Do not rely on uptime as the sole signal.** Uptime is necessary but not sufficient. A Hoarder with 90% uptime is objectively less useful than a Weekend user with full capacity who happens to be offline during weekday checks.
 
-## Код
+## Code
 
-`simulations/behavior_models.py` — запуск с `--peers 200 --days 730 --seeds 50`
+`simulations/behavior_models.py` — run with `--peers 200 --days 730 --seeds 50`

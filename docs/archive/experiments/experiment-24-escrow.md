@@ -1,34 +1,34 @@
 # Experiment 24: Escrow as Credit System
 
-## Вопрос
+## Question
 
-Эскроу как механизм кредитования — насколько эффективно он блокирует hit-and-run атаки? Как взаимодействуют эскроу и адаптивное n по метрикам bootstrap speed, overhead и file survival?
+Escrow as a credit mechanism — how effectively does it block hit-and-run attacks? How do escrow and adaptive n interact across the metrics of bootstrap speed, overhead, and file survival?
 
-## Модель
+## Model
 
-Четыре конфигурации: эскроу on/off × адаптивное n on/off. Сеть с 7 архетипами, включая HitAndRun (HAR) — пир, который загружает файл, хранит 0% чужих данных и уходит через 4 недели.
+Four configurations: escrow on/off × adaptive n on/off. A network with 7 archetypes, including HitAndRun (HAR) — a peer that uploads a file, stores 0% of others' data, and leaves after 4 weeks.
 
-**Архетип HitAndRun:**
+**HitAndRun archetype:**
 
-| Параметр | Значение |
-|----------|----------|
-| Доля arrivals | 15% |
-| Размер файла | 10 GB |
+| Parameter | Value |
+|-----------|-------|
+| Share of arrivals | 15% |
+| File size | 10 GB |
 | Storage capacity | 0% |
-| Время в сети | 4 недели, затем уход |
-| Цель | Получить файл, ничего не отдав |
+| Time in network | 4 weeks, then departure |
+| Goal | Retrieve a file without contributing anything |
 
-**Эскроу-пороги (по weeks_in_network, не по I-score):**
+**Escrow thresholds (by weeks_in_network, not by I-score):**
 
-| Tier | Размер файла | Задержка |
-|------|-------------|----------|
-| Tier 1 | ≤ 5 GB | 4 недели |
-| Tier 2 | ≤ 50 GB | 13 недель |
-| Tier 3 | > 50 GB | 26 недель |
+| Tier | File size | Delay |
+|------|-----------|-------|
+| Tier 1 | ≤ 5 GB | 4 weeks |
+| Tier 2 | ≤ 50 GB | 13 weeks |
+| Tier 3 | > 50 GB | 26 weeks |
 
-Механизм: шарды хранятся в сети с момента загрузки, но ключи для восстановления становятся доступны пиру только после истечения эскроу-периода. HAR-пир уходит через 4 недели, не успевая получить файл ни в Tier 2, ни в Tier 3.
+Mechanism: shards are stored in the network from the moment of upload, but the restore keys become available to the peer only after the escrow period expires. The HAR peer leaves after 4 weeks, never reaching the key-release point for Tier 2 or Tier 3.
 
-## Конфигурация
+## Configuration
 
 ```
 peers             = 3000
@@ -45,9 +45,9 @@ HAR storage       = 0%
 HAR lifetime      = 4 weeks
 ```
 
-## Результаты
+## Results
 
-### Сводная таблица по конфигурациям
+### Summary table by configuration
 
 | Config | HAR Success | HAR Cost | T1 Bootstrap | T2 Bootstrap | T3 Bootstrap | Survival Y3 | Overhead | Retention |
 |--------|-------------|----------|--------------|--------------|--------------|-------------|----------|-----------|
@@ -56,58 +56,58 @@ HAR lifetime      = 4 weeks
 | C: No escrow, adaptive n | 100% | 80 GB·wk | 0 wk | 0 wk | 0 wk | 100% | **2.13x** | 99.5% |
 | D: Escrow ON, adaptive n | **0%** | **317 GB·wk** | 4 wk | 13 wk | 26 wk | 100% | 2.19x | 99.4% |
 
-HAR Success = доля HAR-пиров, успешно восстановивших файл до ухода.
-HAR Cost = суммарная стоимость хранения шардов атакующего (GB·weeks) — ресурсы сети, потраченные впустую.
-Bootstrap = задержка до первого доступа к файлу для честных новых пиров соответствующего Tier.
+HAR Success = share of HAR peers that successfully retrieved the file before leaving.
+HAR Cost = total storage cost of the attacker's shards (GB·weeks) — network resources spent for nothing.
+Bootstrap = delay until first file access for honest new peers in the corresponding Tier.
 
-### Влияние эскроу на HAR-атаки
+### Effect of escrow on HAR attacks
 
-| Переход | HAR Success | HAR Cost | Эффект |
-|---------|-------------|----------|--------|
-| A → B (fixed n) | 100% → **0%** | 30 → 119 GB·wk | Блокировка + рост стоимости ×4 |
-| C → D (adaptive n) | 100% → **0%** | 80 → 317 GB·wk | Блокировка + рост стоимости ×4 |
+| Transition | HAR Success | HAR Cost | Effect |
+|------------|-------------|----------|--------|
+| A → B (fixed n) | 100% → **0%** | 30 → 119 GB·wk | Blocked + cost ×4 |
+| C → D (adaptive n) | 100% → **0%** | 80 → 317 GB·wk | Blocked + cost ×4 |
 
-### Влияние адаптивного n на overhead
+### Effect of adaptive n on overhead
 
-| Переход | Overhead | Экономия |
-|---------|----------|----------|
+| Transition | Overhead | Saving |
+|------------|----------|--------|
 | A → C (no escrow) | 3.00x → 2.13x | **−29%** |
 | B → D (escrow ON) | 3.00x → 2.19x | **−27%** |
 
-Адаптивное n экономит 27–29% overhead независимо от наличия эскроу.
+Adaptive n saves 27–29% overhead regardless of whether escrow is enabled.
 
 ### Bootstrap timing
 
-Bootstrap-задержки точно соответствуют заданным порогам: 4, 13, 26 недель. Таймер считается по weeks_in_network — calendar time в сети, не по накопленному I-score. Это делает поведение детерминированным и предсказуемым для пользователя.
+Bootstrap delays match the configured thresholds exactly: 4, 13, 26 weeks. The timer counts weeks_in_network — calendar time in the network, not accumulated I-score. This makes the behaviour deterministic and predictable for the user.
 
-## Ключевые выводы
+## Key findings
 
-1. **Эскроу блокирует 100% hit-and-run.** HAR-пир уходит через 4 недели — раньше любого Tier-порога для файлов ≥5 GB. Success rate: 100% → 0% в обеих конфигурациях (A→B и C→D).
+1. **Escrow blocks 100% of hit-and-run attacks.** The HAR peer leaves after 4 weeks — before any Tier threshold for files ≥5 GB. Success rate: 100% → 0% in both configurations (A→B and C→D).
 
-2. **Эскроу повышает стоимость атаки.** Шарды HAR-пира остаются в сети, занимают место, но атакующий не получает ничего. Стоимость: 30 → 119 GB·wk (fixed n) и 80 → 317 GB·wk (adaptive n). Атака становится убыточной.
+2. **Escrow raises the cost of the attack.** The HAR peer's shards remain in the network, consuming space, but the attacker receives nothing. Cost: 30 → 119 GB·wk (fixed n) and 80 → 317 GB·wk (adaptive n). The attack becomes unprofitable.
 
-3. **Адаптивное n экономит 29% overhead.** 3.00x → 2.13x без эскроу, 3.00x → 2.19x с эскроу. Комбинация эскроу + adaptive n (Config D) даёт оба преимущества.
+3. **Adaptive n saves 29% overhead.** 3.00x → 2.13x without escrow, 3.00x → 2.19x with escrow. The combination of escrow + adaptive n (Config D) delivers both benefits.
 
-4. **File survival 100% во всех конфигурациях.** При 3000 узлах и схеме 5-of-15 сеть достаточно устойчива, чтобы выжить даже при 15% HAR-доле arrivals.
+4. **File survival is 100% in all configurations.** With 3000 nodes and a 5-of-15 scheme the network is resilient enough to survive even a 15% HAR share of arrivals.
 
-5. **Retention честных пиров не страдает.** ~99.4% во всех конфигурациях — честные пользователи не покидают сеть из-за эскроу-задержек.
+5. **Retention of honest peers is unaffected.** ~99.4% across all configurations — honest users do not leave the network due to escrow delays.
 
-6. **Лучшая комбинация — Config D.** Escrow ON + adaptive n: 0% HAR success, 2.19x overhead, 100% survival.
+6. **The best combination is Config D.** Escrow ON + adaptive n: 0% HAR success, 2.19x overhead, 100% survival.
 
-## Импликации для дизайна
+## Design implications
 
-- **Эскроу — обязательный компонент протокола.** Единственный механизм, предотвращающий hit-and-run. Acceptance gate (Exp 21) оказался вреден: уменьшал пул партнёров. Эскроу лучше: данные уже безопасно хранятся в сети, ограничивается только восстановление.
+- **Escrow is a mandatory protocol component.** It is the only mechanism that prevents hit-and-run. The acceptance gate (Exp 21) proved harmful: it reduced the partner pool. Escrow is better — data is already safely stored in the network; only restore is gated.
 
-- **Эскроу — это кредит, не наказание.** Правильная формулировка для пользователя: «Ваши файлы уже защищены. Зарабатывайте право на доступ, внося вклад в сеть.»
+- **Escrow is credit, not punishment.** The right framing for the user: "Your files are already protected. Earn the right to access them by contributing to the network."
 
-- **Эскроу + adaptive n = рекомендуемый дефолт.** Config D объединяет защиту от злоупотреблений и экономию overhead без потери надёжности.
+- **Escrow + adaptive n = recommended default.** Config D combines abuse protection with overhead savings without sacrificing reliability.
 
-- **1 GB free demo credit** — возможное UX-улучшение для онбординга (не тестировалось). Позволило бы новым пользователям сразу убедиться в работе системы без ожидания.
+- **1 GB free demo credit** — a possible UX improvement for onboarding (not tested). It would allow new users to see the system working immediately, without waiting.
 
-- **Bootstrap timing должен быть виден пользователю.** Детерминированный таймер (4/13/26 недель) позволяет показывать progress bar: «Доступ к файлу через X недель». Это управляемое ожидание, не неопределённость.
+- **Bootstrap timing should be visible to the user.** The deterministic timer (4/13/26 weeks) allows showing a progress bar: "File access in X weeks." This is managed expectation, not uncertainty.
 
-- **Следующий шаг — Exp 25.** Протестировать 1 GB free demo credit и/или смешанные стратегии эскроу (частичный доступ по мере набора репутации).
+- **Next step — Exp 25.** Test 1 GB free demo credit and/or mixed escrow strategies (partial access as reputation accumulates).
 
-## Код
+## Code
 
-`simulations/pis_escrow.py` — результаты в `results/pis_escrow/pis_escrow_results.json`
+`simulations/pis_escrow.py` — results in `results/pis_escrow/pis_escrow_results.json`
