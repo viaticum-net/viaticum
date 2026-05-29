@@ -1,6 +1,6 @@
 # Viaticum Architecture
 
-*2026-03-22. Reflects actual code — all phases + δ.1 complete (716 tests, ~34K lines Rust).*
+*Reflects actual code through Wave 11b (unified work pipeline, hash-chain PoS, HTTP API). Some lower-level details (full config field list, exact DB-table set) drift between releases — when in doubt, the code is authoritative.*
 
 *See also: [overview.md](../overview.md) for end-to-end flows, [logic.md](logic.md) for algorithms, [protocol.md](protocol.md) for wire format.*
 
@@ -13,7 +13,7 @@
 │  (pure Rust, no async, no network)                                       │
 │                                                                          │
 │  types ──► db ──────────────────────────────────────────────────────    │
-│   │         (Db, HotCache, 12 redb tables)                          │    │
+│   │         (Db, HotCache, 17 redb tables)                          │    │
 │   │                                                                  │    │
 │   ├──► trust    (TrustEngine: P, I, S)                              │    │
 │   ├──► escrow   (EscrowChecker: trust-based budget gate)            │    │
@@ -36,15 +36,16 @@
 │     ├──► processor    (message router: dispatches all incoming msgs)     │
 │     ├──► backup       (BackupCoordinator: watcher → symbols)            │
 │     ├──► restore      (RestoreCoordinator: symbols → files)             │
-│     ├──► repair       (RepairAgent: Lost/PresumedLost → re-encode)      │
+│     ├──► work_pipeline(unified queue: backup, repair, PoS tasks)        │
+│     ├──► repair       (thin: reliability scan + placement events)       │
 │     ├──► scheduler    (PoS challenge scheduling, timeout detection)     │
 │     ├──► watcher      (fs-notify: recursive watch → DirtyEvent)         │
 │     ├──► relay        (RelayManager: epidemic board, hop≤2)             │
 │     ├──► cluster_sync (ClusterSyncManager: event log exchange)          │
-│     ├──► cli_server   (Unix socket: CLI commands → DaemonState)         │
+│     ├──► web_api      (HTTP+token API: CLI + web UI → DaemonState)      │
 │     ├──► identity     (BIP39 → HKDF → keys, identity file mgmt)        │
 │     ├──► system_state (periodic DB push, bootstrap discovery)           │
-│     └──► dr           (disaster recovery: BFS, standalone restore)      │
+│     └──► dr           (disaster recovery: seed-peer visit, restore)     │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -78,6 +79,10 @@ crates/viaticum-core/src/
   reliability/    — P(block recoverable) forecast (Binomial model)
   deletion/       — Double cooldown deletion flow + vacuum
   system_state/   — SystemState struct, snapshot_db, restore_db, pack/unpack (CBOR+zstd+ChaCha20)
+  importance/     — file-importance classification by type + burst (rare-moment) detection
+  migration/      — redb schema migrations
+  path_safety/    — path validation / traversal guards
+  priority/       — work prioritisation helpers
 ```
 
 ### viaticum
@@ -96,15 +101,23 @@ crates/viaticum/src/
     network/      — SwarmHandle (swarm.rs)
     backup/       — BackupCoordinator (+ events.rs, pipeline.rs, packing.rs)
     restore/      — RestoreCoordinator (+ pipeline.rs)
-    repair/       — RepairAgent
+    repair/       — thin: reliability scan + placement-event handlers (active repair lives in work_pipeline)
     scheduler/    — Scheduler: PoS challenge timing, PendingChallenges
     watcher/      — fs-notify watcher: recursive, debounce, DirtyEvent
     relay/        — RelayManager (+ board.rs)
     cluster_sync/ — ClusterSyncManager
-    cli_server/   — Unix socket server: bridges CLI to DaemonState
+    web_api/      — HTTP + token API server (axum/TCP): serves both CLI and web UI
+    web_auth/     — token auth for web_api
+    work_pipeline/— unified work queue: backup, repair and PoS tasks (+ worker.rs)
+    watch_admin/  — live add/remove of watched folders without restart
+    symbol_fetch/ — fetch unbound symbols from holders (restore + repair-from-peers)
+    holdings_integrity/ — periodic scan that held symbols still exist on disk
+    holder_cleanup/ — evict holdings after drop-notice window
+    dispatch/     — shared request dispatch (web_api + relay)
+    metrics/      — Prometheus metrics + status aggregation
     identity/     — BIP39/HKDF key derivation, identity.key file
     system_state/ — periodic DB push to peers, bootstrap discovery
-    dr/           — disaster recovery CLI: BFS peer discovery, standalone restore
+    dr/           — disaster recovery CLI: seed-peer visit, standalone restore
 ```
 
 ---
@@ -277,9 +290,9 @@ All wire messages + relay board helpers. Wire format: CBOR + u32 BE length prefi
 |------|-----------|-------------|
 | `HandshakeMsg` | ↔ | Mutual authentication on connection open |
 | `PeerAnnounceMsg` | broadcast relay | Peer address announcement (discovery) |
-| `PosChallengeMsg` | owner → holder | Request symbol data by ESI |
-| `PosResponseMsg` | holder → owner | Response: symbol data |
-| `PosNackMsg` | holder → owner | Symbol not held (evicted / missed) |
+| `PosHashChallengeMsg` | owner → holder | Challenge an ESI range (chain-hash PoS) |
+| `PosHashResponseMsg` | holder → owner | Response: SHA256 chain hash over bound symbols |
+| `PosHashNackMsg` | holder → owner | Symbol(s) not held (evicted / missed), signed |
 | `SymbolOfferMsg` | owner → holder | Offer to receive symbols |
 | `SymbolAcceptMsg` | holder → owner | Acceptance |
 | `SymbolRejectMsg` | holder → owner | Rejection (QuotaFull / LowPriority / ...) |
@@ -305,7 +318,7 @@ Opening: `Db::open(path)` — pre-open backup (.redb.bak), `DatabaseBuilder` wit
 
 **Two layers:**
 - **HOT (RAM, ~13 MB at 5 TB):** HashMap aggregates `BlockAgg` and `PlacementAgg` in `HotCache`
-- **WARM (redb, ~133 MB at 5 TB):** all 12 tables, CBOR values
+- **WARM (redb, ~133 MB at 5 TB):** all 17 tables, CBOR values
 
 ---
 
@@ -317,8 +330,8 @@ Opening: `Db::open(path)` — pre-open backup (.redb.bak), `DatabaseBuilder` wit
 |-------|-----|-------|-------------|
 | `files` | `&str` (path) | CBOR(`FileRecord`) | File catalog |
 | `source_blocks` | `&[u8; 32]` (block_id) | CBOR(`SourceBlockRecord`) | Source block metadata |
-| `symbol_placements` | `&[u8; 64]` (block_id ∥ holder_id) | CBOR(`SymbolPlacement`) | Symbol placements (owner side) |
-| `peers` | `&[u8; 32]` (identity_pub) | CBOR(`PeerRecord`) | Peer data |
+| `symbol_placements` | `&[u8; 64]` (block_id ∥ holder DeviceId) | CBOR(`SymbolPlacement`) | Symbol placements (owner side) |
+| `peers` | `&[u8; 32]` (device_id) | CBOR(`PeerRecord`) | Peer data, keyed by DeviceId |
 | `holdings` | `&[u8; 64]` (block_id ∥ owner_id) | CBOR(`HoldingRecord`) | Held symbols (holder side) |
 | `event_log` | `u64` (seq, 1-based monotonic) | CBOR(`EventEntry`) | Append-only event log for cluster sync |
 | `budget` | `"budget"` | CBOR(`BudgetRecord`) | Singleton: GB estimate |
@@ -327,6 +340,11 @@ Opening: `Db::open(path)` — pre-open backup (.redb.bak), `DatabaseBuilder` wit
 | `file_holders` | `&[u8; 40]` (file_id_BE8 ∥ holder_id) | `u32` (symbol_count) | Index file → holders |
 | `holder_files` | `&[u8; 40]` (holder_id ∥ file_id_BE8) | `u32` (symbol_count) | Index holder → files |
 | `system_state_blobs` | `&[u8; 32]` (owner identity_pub) | CBOR(`SystemStateBlobRecord`) | Encrypted DB snapshots from peers (1 per owner, TTL 365 days) |
+| `restore_served` | `&[u8; 32]` (requester identity_pub) | CBOR(`u64`) | Bytes served per requester (escrow accounting) |
+| `device_trust` | `&[u8; 32]` (device_id) | CBOR(`DeviceTrustRecord`) | Per-device trust |
+| `master_trust` | `&[u8; 32]` (master identity_pub) | CBOR(`MasterTrustRecord`) | Aggregated cluster trust |
+| `device_to_master` | `&[u8; 32]` (device_id) | CBOR(`IdentityPub`) | Device → master identity mapping |
+| `meta` | `&str` | CBOR | Misc singletons (e.g. next_file_id) |
 
 ### HotCache (RAM layer)
 
@@ -334,8 +352,8 @@ Opening: `Db::open(path)` — pre-open backup (.redb.bak), `DatabaseBuilder` wit
 pub struct HotCache {
     // source_block_id → { k, total_alive_symbols }
     pub blocks: HashMap<SourceBlockId, BlockAgg>,
-    // (source_block_id, holder IdentityPub) → { symbol_count, status, last_pos }
-    pub placements: HashMap<(SourceBlockId, IdentityPub), PlacementAgg>,
+    // (source_block_id, holder DeviceId) → { symbol_count, status, last_pos }
+    pub placements: HashMap<(SourceBlockId, DeviceId), PlacementAgg>,
 }
 ```
 
@@ -399,13 +417,13 @@ batch plaintext = [PackIndex CBOR] + [file1 bytes] + [file2 bytes] + ...
   → zstd compress (streaming)
   → ChaCha20-Poly1305 encrypt (epoch_key, random nonce prepended)
   → ciphertext = source block
-  → source_block_id = blake3(ciphertext)
-  → ErasureParams::compute(block_size, importance)
+  → source_block_id = blake3(nonce || ciphertext)
+  → ErasureParams (against target reliability + holder trust)
   → SymbolBudgetEngine.compute_allocation(candidates, params)
   → for each holder:
       encode(source_block, params, start_esi, count, block_id, holder_id)
       → bound symbols (per-holder XOR binding)
-      → write to symbols_dir/{hex(block_id)}/{esi}.bin
+      → held in RAM, sent to the holder, then dropped (no own-symbol disk writes since Wave 11b)
   → DB: upsert FileRecord, SourceBlockRecord, SymbolPlacement × N_holders
   → EventLog: append SymbolsPlaced events
   → RAM hot: update BlockAgg, PlacementAgg
@@ -432,7 +450,7 @@ RestoreRequest(path, VersionSelector, output_dir, device_id)
   → deduplicate by source_block_id
   → for each unique source block:
       list_placements_for_block → alive placements
-      → read symbol files: {symbols_dir}/{hex(block_id)}/{esi}.bin
+      → fetch symbols from holders, or read local cache at {symbols_dir}/{hex(block_id)}/raw/{esi}.bin
       → unbind: symbol XOR ChaCha20(HKDF(block_id, holder_id))
       → collect ≥ K_eff unbound symbols
       → ErasureEncoder.decode → padded block
@@ -454,27 +472,24 @@ Network restore: fetch from holders via NetworkHandle (`fetch_from_holder`).
 
 ### repair
 
-`RepairAgent` — monitors Lost/PresumedLost placements, regenerates symbols locally.
+Since Wave 11b, `RepairAgent` is thin: it runs a periodic reliability scan and handles placement events. The active repair loop (re-encode + deliver to new holders) lives in `work_pipeline/worker.rs`.
 
 **Triggers:**
-- Periodic scan (every `scan_interval_secs`)
-- `RepairTrigger::RepairNow { block_id, holder_id }` — immediate repair
-- `RepairTrigger::ScanAll` — full scan
+- Periodic reliability scan (flags blocks below the target)
+- Placement transitions to Lost/PresumedLost (PoS miss, SymbolDropped, PosHashNack)
 
-**Pipeline repair_placement:**
+**Repair (in the work pipeline):**
 ```
 1. Read SourceBlockRecord from DB → K, T
-2. Read SymbolPlacement → esi_ranges, binding_seed, holder_id
-3. Read source block file: {symbols_dir}/{hex(block_id)}/block.bin
-4. For each ESI in esi_ranges:
-     encode(source_data, params, esi, 1, block_id, holder_id)
-     → bound symbol → write to {symbols_dir}/{hex(block_id)}/{hex(holder_id)}/{esi}.sym
-5. Update placement.status = Alive, consecutive_misses = 0
+2. Rebuild the source blob from the source files (deterministic; no block.bin on disk)
+3. Re-encode the missing ESIs, apply per-holder binding
+4. Place on new holders via a fresh placement round
+5. Update placement.status = Alive
 ```
 
-**handle_symbol_dropped / handle_pos_nack:** both do the same thing — `mark_placement_lost` (idempotent: if already Lost/Deleting — no-op).
+If the source files are gone, the worker cannot rebuild and the placement stays Lost — recovery is then via `viaticum dr` + `viaticum restore` (the DR-only recovery model for source loss).
 
-Repair: local re-encode + network delivery to new holders.
+**handle_symbol_dropped / handle_pos_nack:** both `mark_placement_lost` (idempotent).
 
 ---
 
@@ -543,13 +558,13 @@ DaemonState {
 2. Open DB (with repair callback + pre-open backup)
 3. Start SwarmHandle (libp2p swarm + event loop)
 4. Spawn Processor (message router)
-5. Spawn BackupCoordinator, RestoreCoordinator, RepairAgent
+5. Spawn BackupCoordinator, RestoreCoordinator, WorkPipeline (+ thin RepairAgent)
 6. Spawn Scheduler (PoS), RelayManager, ClusterSyncManager
 7. Spawn SystemState periodic push (interval = 6h / time_scale, min 60s)
 8. Start Watcher (fs-notify) for configured directories
-9. Start CliServer (Unix socket)
+9. Start web_api (HTTP + token API for CLI and web UI)
 10. Load peers from DB → known_peers in network
-11. Bootstrap discovery: connect to bootstrap peers, PeerDiscoveryRequest (1-hop)
+11. Bootstrap: connect to bootstrap peers, join Kademlia DHT + relay board
 
 ---
 
@@ -560,9 +575,9 @@ DaemonState {
 **Dispatch table (26 message types):**
 - `Handshake` → auth (handled by network accept loop)
 - `PeerAnnounce` → upsert peer, add to known_peers, store addrs
-- `PosChallenge` → look up holding, re-read symbol, send PosResponse or PosNack
-- `PosResponse` → verify, update placement status + trust
-- `PosNack` → mark placement Lost, trigger repair
+- `PosHashChallenge` → compute the chain hash over held symbols, send PosHashResponse or PosHashNack
+- `PosHashResponse` → verify the chain hash, update placement status + trust
+- `PosHashNack` → mark placement Lost, trigger repair
 - `SymbolOffer` → check quota → SymbolAccept / SymbolReject
 - `SymbolAccept` → update placement to Alive (via BackupEvent channel)
 - `SymbolReject` → update placement, log
@@ -576,8 +591,9 @@ DaemonState {
 - `SystemStateBackup` → store blob (known peers only) → SystemStateAck
 - `SystemStateRequest` → return stored blob → SystemStateResponse
 - `SystemStateAck/Response` → log / forward to DR
-- `PeerDiscoveryRequest` → return peer list (any authenticated connection)
-- `PeerDiscoveryResponse` → forward to DR / bootstrap
+- `Ack` → generic ack for request-response streams
+
+(PeerDiscovery messages were removed in ε.2 — peers are found via the Kademlia DHT and the relay board.)
 
 **On new connection (PeerAuthenticated event):** upserts PeerRecord, sends PeerAnnounce, auto-adds cluster device.
 
@@ -604,19 +620,19 @@ Only detects changes AFTER daemon start — pre-existing files not scanned.
 `Scheduler` — periodic PoS challenge issuance.
 
 - Computes `due_challenges()` from placements + last_verified timestamps
-- Issues PosChallenge via network, stores in `PendingChallenges` (shared with Processor)
+- Issues PosHashChallenge via network, stores in `PendingChallenges` (shared with Processor)
 - On timeout (7 days): records as Timeout, updates placement status
 - Adaptive rate: `challenges/week = base * volume_factor * trust_factor`
 
 ---
 
-### cli_server
+### web_api
 
-Unix socket server at `{data_dir}/viaticum.sock`.
+HTTP + token API server (axum, TCP); port and token in `{data_dir}/api-port` + `{data_dir}/api-token`. Serves both the CLI and the web UI; `web_auth` checks the token. Replaced the old Unix-socket `cli_server` in the macOS HTTP-unification work.
 
-**Commands:** status, files, versions, peers, restore, connect, device (add/revoke/list), backup (force flush)
+**Endpoints (mirror the CLI):** status, files, versions, restore, connect, device (add/revoke/list), folders (watch admin), settings.
 
-Bridges CLI → DaemonState for reads, CLI → RestoreCoordinator for restores, CLI → NetworkHandle for connections.
+Bridges requests → DaemonState for reads, → RestoreCoordinator for restores, → SwarmHandle for connections.
 
 ---
 
@@ -698,13 +714,13 @@ PosEngine.compute_schedule(placements, now)
   → challenges_per_week = base × volume_factor × trust_factor
   │
   for each challenge:
-    PosChallengeMsg { challenge_id, source_block_id, esi } → holder
+    PosHashChallengeMsg { challenge_id, source_block_id, esi_ranges } → holder
     │
-    holder replies PosResponseMsg { data } or PosNackMsg
+    holder replies PosHashResponseMsg { chain_hash } or PosHashNackMsg
     │
     verify_response():
-      re-encode(source_block, params, esi, block_id, holder_id)
-      expected_bound_data == response.data?
+      re-encode + per-holder bind the esi_ranges from the local source block
+      chain_hash(seed = SHA256(challenge_id)) == response.chain_hash?
       │
     VerifyOutcome: Pass / Fail / Timeout / NotHeld
     │
@@ -723,22 +739,20 @@ PosEngine.compute_schedule(placements, now)
 ### Repair
 
 ```
-RepairAgent.scan_and_repair()
+WorkPipeline worker (repair task)
   │
-  DB: list_placements_needing_repair()  ← status=Lost/PresumedLost
+  DB: placements needing repair  ← status=Lost/PresumedLost
   │
-  for each placement:
-    read {symbols_dir}/{hex(block_id)}/block.bin  (source data)
-    SourceBlockRecord: K, T
-    SymbolPlacement: esi_ranges, holder_id
+  for each block:
+    rebuild source blob from the source files (deterministic; no block.bin on disk)
+    SourceBlockRecord: K, T;  SymbolPlacement: esi_ranges, holder_id
     │
-    for each ESI:
-      encode(source_data, params, esi, 1, block_id, holder_id)
-      write {symbols_dir}/{hex(block_id)}/{hex(holder_id)}/{esi}.sym
+    for each missing ESI:
+      encode + per-holder binding (held in RAM)
     │
+    place on new holders via a fresh placement round
+    network: send symbols to holder
     DB: upsert_placement(status=Alive, consecutive_misses=0)
-    │
-    [Phase 3] network: send symbols to holder
 ```
 
 ### Cluster sync

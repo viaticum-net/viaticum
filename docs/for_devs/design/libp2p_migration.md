@@ -1,5 +1,7 @@
 # Migration to libp2p
 
+> **Historical document.** This is the design record for the iroh → libp2p migration, which has since been completed and shipped. It captures *why* the switch was made and how it was planned, not the current state of the code. Forward-looking language ("we will remove", "Phase 1–5", file lists) describes the migration plan as written at the time. For the current network stack, see [`../protocol.md`](../protocol.md) and [`../architecture.md`](../architecture.md). Some details here diverged during implementation (the "Implementation clarifications" section at the end already records several); the doc is preserved as rationale, not synced to code.
+
 *Decision: iroh -> libp2p. Full design of the new network stack.*
 *Version 5 (final) -- after two rounds of review.*
 *No DB migration needed: no users yet.*

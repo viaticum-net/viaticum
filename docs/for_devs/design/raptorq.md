@@ -157,6 +157,8 @@ REPAIR (file deleted):
 
 ## PoS (Proof of Storage)
 
+> **Wire format superseded.** This section describes the original β design, where the holder returned the raw 64 KB symbol and the owner recomputed and byte-compared it. The shipped protocol uses a **Samsara-style chain hash** instead: the owner challenges an ESI range, the holder folds its stored symbols into a single chain hash (`h_i = SHA256(h_{i-1} ‖ symbol)`) and returns **only the hash** — no raw symbols on the wire. This closes an escrow-bypass (you could otherwise harvest restore data through PoS) and cuts bandwidth further. The trust/timeout reaction below (Pass / NotHeld / Fail / graduated Timeout) is unchanged and still current. For the authoritative PoS algorithm see [`../logic.md`](../logic.md); for the wire messages see [`../protocol.md`](../protocol.md).
+
 ```
 Once a week, per holder:
 

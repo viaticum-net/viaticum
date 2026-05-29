@@ -4,7 +4,7 @@ Viaticum is in pre-alpha and the bulk of architectural decisions are still being
 
 ## Before you start
 
-- Check `docs/features.md` and `docs/tech-debt.md` for what is planned and what is known to be wrong.
+- Check `docs/features.md` for the roadmap and `docs/usage.md` for what the tool can do today.
 - For non-trivial changes, open an issue first to discuss approach. Substantial PRs without prior discussion may not be merged.
 - Read `docs/overview.md` for the system shape and `docs/for_devs/logic.md` for the algorithms before touching protocol-level code.
 
@@ -52,4 +52,4 @@ By contributing, you agree that your contributions will be licensed under the pr
 
 Be civil. Disagree about technical things, not about people. Don't be a jerk.
 
-If you experience or witness behavior that violates this in any project space, contact the maintainer privately at `[your-email]`.
+If you experience or witness behavior that violates this in any project space, raise it privately with the maintainer.

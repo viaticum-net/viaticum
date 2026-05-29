@@ -1,6 +1,5 @@
 #!/bin/bash
 # Remote build: compile on server if available, locally otherwise.
-# Server is faster (48 cores) and keeps laptop cool.
 set -euo pipefail
 
 # Load local-only config (real server address). .env is gitignored.

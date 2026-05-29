@@ -10,6 +10,10 @@ It's a cold backup, not a cloud drive. Restores take days rather than seconds, a
 
 See [`docs/overview.md`](docs/overview.md) for how it works and [`docs/why.md`](docs/why.md) for why it's built this way.
 
+## Who it's for
+
+Self-hosters who would rather not hand their data to a cloud: people running TrueNAS, Unraid or OpenMediaVault, or apps like Immich and Nextcloud, and anyone whose backup today is `rsync` to a drive in the same room. And people for whom privacy is not negotiable, whose backups must stay encrypted and outside any single company's reach: journalists, activists, anyone holding sensitive data. And anyone who would rather not pay a monthly backup bill but has spare disk to trade — lend space to the network, get space back.
+
 ## Status
 
 Pre-release, and rough. It works: you can run the daemon, back up folders, and get them back, and it has been tested end to end across 20 nodes with node kills and recovery. It is not stable, though. Breaking changes are coming, including planned changes to the wire protocol, so don't point it at data you can't afford to lose.
@@ -42,7 +46,9 @@ To back up with a friend, swap node addresses (`viaticum status` prints yours) a
 ## Documentation
 
 - [`docs/overview.md`](docs/overview.md) — what Viaticum is, module map, end-to-end flows
+- [`docs/usage.md`](docs/usage.md) — how to use it: CLI and web UI, from first run to disaster recovery
 - [`docs/why.md`](docs/why.md) — why Viaticum exists, where it sits in the field, the reasoning behind the design
+- [`docs/features.md`](docs/features.md) — roadmap: what works today and where it's heading
 - [`docs/for_devs/protocol.md`](docs/for_devs/protocol.md) — wire format, message types, handshake, key derivation
 - [`docs/for_devs/logic.md`](docs/for_devs/logic.md) — algorithms: trust, placement, Proof-of-Storage, repair, deletion
 - [`docs/for_devs/architecture.md`](docs/for_devs/architecture.md) — crate structure, data flow, config, DB schema

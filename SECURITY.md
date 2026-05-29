@@ -4,9 +4,7 @@
 
 If you find a security issue in Viaticum, please report it privately rather than opening a public issue.
 
-**Preferred:** open a [GitHub security advisory](../../security/advisories/new) on this repository. This gives us a private channel to discuss the issue and coordinate disclosure.
-
-**Alternative:** email the maintainer directly at `[your-email]` with the subject line starting `SECURITY:`.
+Open a [GitHub security advisory](../../security/advisories/new) on this repository. This gives us a private channel to discuss the issue and coordinate disclosure.
 
 Please include:
 - A description of the issue

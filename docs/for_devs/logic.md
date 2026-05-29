@@ -16,10 +16,10 @@ trust = (KP * P + KI * I) * clamp(S, S_MIN, S_MAX)
 | I | Cumulative mean of all weekly pass rates | [0, 1] |
 | S | Pairwise storage ratio: `bytes_they_store_for_us / bytes_we_store_for_them` | clamped [0.1, 1.0] |
 
-**Constants:** KP=0.4, KI=1.75, P_WINDOW=4 weeks, INITIAL_P=0.1, S_MIN=0.1, S_MAX=1.0
+**Constants:** KP=0.4, KI=1.75, P_WINDOW=4 weeks, INITIAL_P=0.5, S_MIN=0.1, S_MAX=1.0
 
 **Behavior:**
-- New peer: P=0.1, I=0, S=1.0 -> trust = KP*0.1 = 0.04 (low but nonzero)
+- New peer: P=0.5, I=0, S=1.0 -> trust = KP*0.5 = 0.20 (low but nonzero — raised from 0.1 so a new peer can still win some holder slots)
 - After 4 weeks of perfect PoS: P=1.0, I=1.0 -> trust up to (0.4+1.75)*S = 2.15*S
 - Free-rider (S near 0): multiplied by 0.1 -> trust capped at ~10% of full value
 - P reacts to recent behavior (4-week window), I stabilizes long-term reputation
@@ -92,7 +92,7 @@ RaptorQ (RFC 6330) via `raptorq` crate.
 | K | block_size / T | 2048 at 128 MB |
 | K_eff | K + 3 | Decode overhead (conservative) |
 | Overhead | 1.5 + importance * 1.5 | Range 1.5x (importance=0) to 3.0x (importance=1) |
-| N (total symbols) | ceil(K * overhead) | Total repair symbols to generate |
+| N (total symbols) | ceil(K_eff * overhead) | Total repair symbols to generate |
 | Peak RAM | ~2x block_size | RaptorQ needs full block in memory |
 
 **Per-holder binding:** Each holder's symbols are XOR'd with `ChaCha20(HKDF(block_id, holder_id))`. Prevents collusion — two holders can't pool symbols because each has unique binding.
@@ -115,7 +115,7 @@ base = 1 challenge/week. Low-trust holders challenged more often. Large holders 
 
 ### Verification
 
-Owner picks random ESI (deterministic: FNV-1a hash of block_id + holder_id + nonce), sends PosChallenge. Holder returns bound symbol data. Owner re-encodes from local source block and compares byte-for-byte.
+Owner re-encodes the challenged symbols from its local source block, applies per-holder binding, and computes the expected Samsara chain hash (`h0 = SHA256(challenge_id)`, then `h_i = SHA256(h_{i-1} || symbol_data)` over the ESI range, ascending). It sends a PosChallenge covering that ESI range; the holder computes the same chain hash over its stored symbols and returns only the hash. Owner compares hashes — no raw symbol data crosses the wire.
 
 ### State Machine
 

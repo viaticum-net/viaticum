@@ -39,7 +39,7 @@ Each message = `[u32 BE length][CBOR payload]`.
 └──────────────────┴──────────────────────────────────────┘
 ```
 
-- Maximum frame size: `MAX_MESSAGE_SIZE = 64 MiB`
+- Maximum frame size: `MAX_MESSAGE_SIZE = 128 MiB`
 - CBOR enum tag: `{"type": "snake_case_variant_name", ...fields...}`
 
 ### Versioning
@@ -54,9 +54,9 @@ Each message = `[u32 BE length][CBOR payload]`.
 pub enum Message {
     Handshake(HandshakeMsg),
     PeerAnnounce(PeerAnnounceMsg),
-    PosChallenge(PosChallengeMsg),
-    PosResponse(PosResponseMsg),
-    PosNack(PosNackMsg),
+    PosHashChallenge(PosHashChallengeMsg),
+    PosHashResponse(PosHashResponseMsg),
+    PosHashNack(PosHashNackMsg),
     SymbolOffer(SymbolOfferMsg),
     SymbolAccept(SymbolAcceptMsg),
     SymbolReject(SymbolRejectMsg),
@@ -77,11 +77,13 @@ pub enum Message {
     SystemStateAck(SystemStateAckMsg),
     SystemStateRequest(SystemStateRequestMsg),
     SystemStateResponse(SystemStateResponseMsg),
-    PeerDiscoveryRequest(PeerDiscoveryRequestMsg),
-    PeerDiscoveryResponse(PeerDiscoveryResponseMsg),
-    Ack(AckMsg),  // generic ack for request-response streams that expect a reply
+    Ack(AckMsg),               // generic ack for request-response streams that expect a reply
+    #[serde(other)]
+    Unknown,                   // forward-compat: unknown variants decode here, logged and ignored
 }
 ```
+
+`DeviceCertExchange` is **not** in this enum — it runs on a separate libp2p protocol (`/viaticum/cert/1`) as the connection handshake (see 1.2). `PeerDiscoveryRequest`/`PeerDiscoveryResponse` were removed in ε.2 (peers are found via the Kademlia DHT and the relay board).
 
 ---
 
@@ -103,7 +105,8 @@ Seed phrase (BIP39, 24 words)
 │   IdentityPub = master_key.verifying_key()  ←── stable owner ID
 │
 ├─ Device key (Ed25519, per device)
-│   HKDF-SHA256(ikm=seed_bytes, salt=device_id.0, info=b"viaticum-device-ed25519")
+│   HKDF-SHA256(ikm=seed_bytes, salt=device_seed, info=b"viaticum-device-ed25519")
+│   device_seed = random 32 bytes, generated once per device and stored locally
 │   DeviceId = device_key.verifying_key()  ←── transport identity (libp2p PeerId derived from this)
 │
 └─ Epoch encryption key (ChaCha20, per epoch)
@@ -145,47 +148,38 @@ pub struct RevocationCertificate {
 
 ### 1.2. Handshake (connection authentication)
 
-The Viaticum handshake runs on top of the libp2p Noise IX layer. After the Noise handshake, both sides exchange a `DeviceCertExchangeMsg` that binds the libp2p PeerId to an `IdentityPub`.
+Connection authentication is not a `Message`-enum handshake. After the libp2p TCP+Noise+Yamux connection is up, both sides run a `DeviceCertExchange` on a separate libp2p protocol `/viaticum/cert/1` (request-response, CBOR). This is what proves cluster membership and binds the libp2p PeerId to a master identity. It runs automatically right after the connection establishes.
+
+#### DeviceCertExchangeMsg (on `/viaticum/cert/1`)
+
+```rust
+pub struct DeviceCertExchangeMsg {
+    pub cert: DeviceCertificate,        // signed by the cluster master key
+    pub x25519_pub: Option<[u8; 32]>,   // X25519 key for directed relay-board encryption
+}
+```
 
 #### Exchange order
 
 ```
-Initiator (A)          Acceptor (B)
-     │                      │
-     │── HandshakeMsg ──────>│   A sends first
-     │<─ HandshakeMsg ───────│   B reads, then replies
-     │                      │   both verify
-```
-
-#### HandshakeMsg
-
-```rust
-pub struct HandshakeMsg {
-    pub v: u8,                             // PROTOCOL_VERSION = 1
-    pub identity_pub: IdentityPub,         // Ed25519 pubkey (32 bytes)
-    pub timestamp: Timestamp,             // Unix seconds
-    pub sig: [u8; 64],                    // Ed25519 signature
-    pub device_cert: Option<DeviceCertificate>,  // only for multi-device
-}
-// sig covers: b"handshake" || identity_pub.0 (32) || timestamp.0.to_be_bytes() (8)
-// device_cert is NOT included in sig (cert is self-signed by master key, verified separately)
+Initiator (A)              Acceptor (B)
+     │                          │
+     │── DeviceCertExchange ───>│   sent automatically after TCP+Noise connects
+     │<─ DeviceCertExchange ────│   B replies with its own cert
+     │                          │   both verify
 ```
 
 #### Verification rules
 
-1. `|timestamp - now| <= HANDSHAKE_FRESHNESS_SECS` (300 seconds)
-2. Verify the Ed25519 signature `sig` against `identity_pub`
-3. If `device_cert` is present:
-   - `cert.device_id.0 == handshake.identity_pub.0` (device_id IS the pubkey)
-   - Verify `cert.signature` against `cert.master_pub_key`
-   - Return `master_pub_key` as the peer's cluster identity
-4. If a specific peer is expected: `received.identity_pub == expected_identity`
+1. Verify `cert.signature` against `cert.master_pub_key` (the cert is self-contained: the master key signs `device_id.0 (32) || issued_at (8)`).
+2. Anchor the cert against the expected cluster identity: the carried `master_pub_key` must match `ClusterState.master_pub`, not merely be internally consistent — so two independently bootstrapped peers correctly reject each other.
+3. On success the peer is authenticated and authorised for placement / restore / PoS traffic; `x25519_pub` (if present) is stored for directed board messages.
 
 #### Handshake result
 
-After a successful handshake the node knows:
-- `peer_identity: IdentityPub` — who signed the handshake (device key)
-- `peer_master_identity: Option<IdentityPub>` — master identity if multi-device
+After a successful exchange the node knows the peer's `master_pub_key` (cluster identity) and `DeviceId` (transport identity). All trust / escrow / placement operations key on the master identity.
+
+> A `HandshakeMsg` struct still exists in the message enum from the earlier design, but the live authentication path is the `DeviceCertExchange` above.
 
 ---
 
@@ -222,18 +216,21 @@ N = ceil(K_eff × overhead)           // total symbols to distribute
 #### Source block ID
 
 ```
-source_block_id = BLAKE3(ciphertext)
+source_block_id = BLAKE3(stored_blob)   // stored_blob = nonce (12) || ciphertext
 ```
 
-Content-addressed: the same file on different devices produces the same ciphertext, the same `source_block_id`, and therefore zero-traffic deduplication.
+Content-addressed: the same file produces the same compressed bytes, the same deterministic nonce, the same ciphertext and blob, hence the same `source_block_id` — therefore zero-traffic deduplication.
 
 #### Encryption (two layers)
 
-**Layer 1 — file encryption:**
+**Layer 1 — block encryption:**
 ```
-file_key = HKDF-SHA256(epoch_key, content_hash || b"viaticum-file-encryption")
-ciphertext = ChaCha20-Poly1305_encrypt(key=file_key, plaintext=compressed_data)
+block_key   = HKDF-SHA256(ikm=epoch_key, info=b"viaticum-block-key")
+nonce       = HKDF-SHA256(ikm=epoch_key, salt=BLAKE3(compressed_data), info=b"viaticum-block-nonce")[..12]
+ciphertext  = ChaCha20-Poly1305_encrypt(key=block_key, nonce=nonce, plaintext=compressed_data)
+stored_blob = nonce || ciphertext
 ```
+The nonce is derived deterministically from the compressed content, so identical content yields an identical blob — this is what makes dedup work.
 
 **Layer 2 — per-holder binding (anti-collusion):**
 ```
@@ -264,61 +261,68 @@ PoS is the mechanism for verifying that a holder is actually storing the assigne
 
 #### Messages
 
-**PosChallengeMsg** (Owner → Holder):
+A challenge covers an ESI **range** and is answered with a single chain hash over all the bound symbols in it — raw symbol bytes never cross the wire (this also closes an escrow-bypass: you cannot fetch your data back through PoS).
+
+**PosHashChallengeMsg** (Owner → Holder):
 ```rust
-pub struct PosChallengeMsg {
+pub struct PosHashChallengeMsg {
     pub v: u8,
-    pub challenge_id: [u8; 16],    // random nonce for response matching
+    pub challenge_id: [u8; 16],          // random nonce; seeds the chain hash and matches the response
     pub source_block_id: SourceBlockId,
-    pub esi: u32,                   // specific ESI to verify
+    pub esi_ranges: Vec<(u32, u32)>,     // (start_esi, count) — one challenge covers a whole range
     pub timestamp: Timestamp,
+    pub device_id: Option<DeviceId>,     // target device within a cluster
 }
 ```
 
-**PosResponseMsg** (Holder → Owner):
+**PosHashResponseMsg** (Holder → Owner):
 ```rust
-pub struct PosResponseMsg {
+pub struct PosHashResponseMsg {
     pub v: u8,
     pub challenge_id: [u8; 16],
-    pub esi: u32,
-    pub data: Vec<u8>,              // BOUND symbol, exactly T bytes (65_535)
+    pub chain_hash: [u8; 32],            // SHA256 chain over the bound symbols, not the symbols themselves
     pub timestamp: Timestamp,
+    pub device_id: Option<DeviceId>,
 }
 ```
 
-**PosNackMsg** (Holder → Owner):
+**PosHashNackMsg** (Holder → Owner):
 ```rust
-pub struct PosNackMsg {
+pub struct PosHashNackMsg {
     pub v: u8,
     pub challenge_id: [u8; 16],
     pub source_block_id: SourceBlockId,
-    pub esi: u32,
+    pub first_missing_esi: u32,          // first ESI in the range the holder does not have
     pub timestamp: Timestamp,
+    pub device_id: Option<DeviceId>,
+    pub sig: [u8; 64],                   // signed — a Nack cannot be forged
 }
 ```
 
-`PosNack` means: "I am not storing this symbol" (evicted under disk pressure, or never received). A holder must send `PosNack` instead of staying silent if it knows it does not hold the symbol.
+`PosHashNack` means: "I am not storing (some of) these symbols" (evicted under disk pressure, or never received). A holder must send `PosHashNack` instead of staying silent if it knows it does not hold them.
 
 #### Verification (Owner)
 
 ```
-Received PosResponse { esi, data }:
-  1. Confirm that the source block file exists on disk
-  2. Recompute RaptorQ symbol(esi) from the source block
-  3. Compute binding: XOR ChaCha20(HKDF(source_block_id, holder_id))
-  4. bound_expected = symbol XOR binding_stream
-  5. Compare data == bound_expected byte-for-byte
+On PosHashResponse { chain_hash }:
+  1. Re-encode the symbols in esi_ranges from the local source block
+  2. Apply per-holder binding to each: symbol XOR ChaCha20(HKDF(source_block_id, holder_id))
+  3. Compute the chain hash over the bound symbols, ESI ascending:
+       h0  = SHA256(challenge_id)
+       h_i = SHA256(h_{i-1} || bound_symbol_i)
+  4. Pass iff h_n == response.chain_hash
 
-Symbol hashes are NOT stored in the DB — verification is done on the fly.
+Only the 32-byte hash crosses the wire. Symbol hashes are not stored in the DB —
+the expected hash is recomputed on the fly per challenge.
 ```
 
 #### VerifyOutcome and response
 
 | Outcome | Condition | Action |
 |---------|-----------|--------|
-| `Pass` | data matches | trust P +1, all good |
-| `NotHeld` | PosNack received | do NOT penalise trust, immediate repair (holder is honest) |
-| `Fail` | data does not match | trust P −1, immediate repair (corruption or fraud) |
+| `Pass` | chain hash matches | trust P +1, all good |
+| `NotHeld` | PosHashNack received | do NOT penalise trust, immediate repair (holder is honest) |
+| `Fail` | chain hash mismatch | trust P −1, immediate repair (corruption or fraud) |
 | `Timeout` | no response within 7 days | trust P −1, graduated response (see below) |
 
 Penalising for NotHeld is wrong — it would reduce the incentive for holders to report honestly when they do not have a symbol.
@@ -615,11 +619,11 @@ pub struct RestoreDeniedMsg {
     pub v: u8,
     pub source_block_id: SourceBlockId,
     pub reason: String,
-    pub required_weeks: u32,   // DEPRECATED — kept for compatibility
-    pub current_weeks: u32,    // DEPRECATED — kept for compatibility
+    pub current_trust: f64,
+    pub needed_trust: f64,
+    pub restore_budget_gb: f64,
     pub timestamp: Timestamp,
 }
-// In β escrow is trust-based. required_weeks/current_weeks are not used in logic.
 ```
 
 #### Symbol deletion
@@ -645,8 +649,9 @@ pub struct DeleteMsg {
     pub v: u8,
     pub source_block_id: SourceBlockId,
     pub timestamp: Timestamp,
-    pub sig: [u8; 64],   // Ed25519 owner_key.sign(source_block_id || timestamp)
+    pub sig: [u8; 64],   // Ed25519 owner_key.sign(b"d" || source_block_id || timestamp)
 }
+// Domain-separated signatures: Delete uses prefix b"d", CancelDelete b"c", SymbolOffer b"so".
 ```
 
 #### Eviction (disk pressure)
@@ -814,12 +819,13 @@ pub enum Event {
 
 Content-addressed dedup is automatic:
 ```
-file_key = HKDF(epoch_key, content_hash, ...)
-ciphertext = ChaCha20-Poly1305(file_key, plaintext)
-source_block_id = BLAKE3(ciphertext)
+block_key = HKDF(epoch_key, info="viaticum-block-key")
+nonce     = HKDF(epoch_key, salt=BLAKE3(compressed), info="viaticum-block-nonce")
+ciphertext = ChaCha20-Poly1305(block_key, nonce, compressed)
+source_block_id = BLAKE3(nonce || ciphertext)
 ```
 
-The same file on two devices → same `content_hash` → same key → same `ciphertext` → same `source_block_id` → symbols already in the network → zero extra traffic.
+The same file on two devices → same compressed bytes → same deterministic nonce → same `ciphertext` → same `source_block_id` → symbols already in the network → zero extra traffic.
 
 #### Peer-to-device affinity
 
@@ -834,7 +840,7 @@ S-score: per (device, peer) pair — the protocol has no knowledge of clusters. 
 
 ---
 
-### 1.10. System State Backup and Peer Discovery (δ.1)
+### 1.10. System State Backup (δ.1)
 
 #### SystemState backup
 
@@ -865,28 +871,9 @@ pub struct SystemStateResponseMsg { pub v: u8, pub encrypted_blob: Vec<u8>, pub 
 
 **Table:** `system_state_blobs` — key: `[u8; 32]` (owner identity_pub), value: CBOR(`SystemStateBlobRecord`).
 
-#### Peer Discovery
+#### Peer discovery
 
-BFS discovery for DR and initial peer bootstrap.
-
-```rust
-// Requester → Peer. "Give me your peer list."
-pub struct PeerDiscoveryRequestMsg { pub v: u8, pub timestamp: Timestamp }
-
-// Peer → Requester. List of known peers.
-pub struct PeerDiscoveryResponseMsg {
-    pub v: u8,
-    pub peers: Vec<DiscoveredPeer>,
-    pub timestamp: Timestamp,
-}
-
-pub struct DiscoveredPeer {
-    pub identity_pub: IdentityPub,
-    pub addrs: Vec<String>,  // multiaddrs
-}
-```
-
-**Security:** `PeerDiscoveryRequest` — answered by **any authenticated connection** (handshake is sufficient). The peer list is not a secret in a P2P network. Works for both DR (old peer) and first bootstrap (new node).
+Peer discovery is no longer a protocol message. The `PeerDiscoveryRequest`/`PeerDiscoveryResponse` messages were removed in ε.2; peers are found through the Kademlia DHT and the relay board. Disaster recovery (3.4) visits explicitly provided seed peers and asks each for the SystemState blob — there is no BFS peer-list expansion.
 
 ---
 
@@ -925,7 +912,7 @@ The following parameters are recommended values, not interoperability requiremen
 7. issue_device_certificate(master_key, device_id, now) → save cert
 8. ClusterState::init(db, master_pub, first_device_cert, ...)
 9. PeerAnnounce via relay board: "I exist, my NodeId = ..."
-10. Bootstrap auto-connect: connect to bootstrap peers → PeerDiscoveryRequest → learn peer list (1-hop)
+10. Bootstrap auto-connect: connect to bootstrap peers → join the Kademlia DHT and the relay board → learn more peers
 ```
 
 ### 3.2. Normal Operation
@@ -934,24 +921,24 @@ The following parameters are recommended values, not interoperability requiremen
 Watcher: fs event → debounce 30 min → dirty_files
 
 Packing queue (per file category):
-  Flush if: ≥ 256 MB accumulated
+  Flush if: ≥ source-block size (default 128 MB, configurable)
          OR 1 hour idle
          OR 24 hours fallback
   Min batch: 1 MB
 
 Backup flow (per source block):
   1. Dedup check: content_hash already backed up? → skip
-  2. compress (zstd) + encrypt (ChaCha20-Poly1305 with epoch_key)
-  3. source_block_id = BLAKE3(ciphertext)
-  4. ErasureParams::compute(block_size, importance) → K, K_eff, N
+  2. compress (zstd) + encrypt (ChaCha20-Poly1305, key+nonce from epoch_key)
+  3. source_block_id = BLAKE3(stored_blob = nonce || ciphertext)
+  4. ErasureParams → K, K_eff, N (against target reliability + holder trust)
   5. SymbolBudgetEngine: distribute N symbols among holders
   6. Per holder: generate symbols, apply per-holder binding, send via SymbolOffer/Transfer
   7. SymbolStored received → PlacementStatus → Alive
 
 PoS: adaptive scheduler
   picks random ESI from holder's esi_ranges
-  → PosChallengeMsg (direct or via relay)
-  → verify PosResponse, update trust + PlacementStatus
+  → PosHashChallengeMsg (direct or via relay)
+  → verify PosHashResponse chain hash, update trust + PlacementStatus
 
 Repair (triggered by PresumedLost / Lost):
   File on disk → generate new symbols (new ESIs) → place at new holder
@@ -992,11 +979,10 @@ viaticum dr --mnemonic "24 words" --peer <addr>
 1. Derive identity from seed → IdentityPub
 2. Open fresh DB (remove stale db.redb if any)
 3. Start minimal SwarmHandle (libp2p, no Processor)
-4. BFS over peers:
-   - Connect to seed --peer addresses
+4. Visit the provided seed peers (no BFS expansion since ε.2):
+   - Connect to each seed --peer address
    - Send SystemStateRequest → collect encrypted DB snapshots
-   - Send PeerDiscoveryRequest → discover more peers (visited set)
-   - Limits: 500 peers, 10 blobs, 120s timeout
+   - Limits: 500 peers, 10 blobs; per-connection auth 15s, request 10s
 5. Select freshest blob (max created_at)
 6. Decrypt (ChaCha20-Poly1305 with HKDF-derived key from seed)
 7. Restore DB: files, source blocks, placements, peers, pos_weekly, cluster_state
@@ -1173,7 +1159,7 @@ Advantage vs α: ~3.4 MB per 1000 files vs ~50 MB (15x smaller). Fungible symbol
 | DB metadata | ~50 MB/1000 files | ~3.4 MB/1000 files (15x smaller) |
 | Multi-device | None | Personal Cluster, device certs |
 | PoS | Stub | Real (64 KB response + on-the-fly verify) |
-| PoS not held | Silence | PosNack (explicit response) |
+| PoS not held | Silence | PosHashNack (explicit response) |
 | Repair | Basic | Graduated (Uncertain→PresumedLost), NotHeld→immediate |
 | Relay | None | Epidemic relay (hop≤2, TTL 7d) |
 | Dedup | None | Content-addressed (same hash → zero traffic) |

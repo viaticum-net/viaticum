@@ -99,7 +99,7 @@ Flush photo_queue (≥128 MB or timer):
     → zstd compress (streaming)
     → ChaCha20-Poly1305 encrypt (streaming)
     → ciphertext = source block
-    → source_block_id = blake3(ciphertext)
+    → source_block_id = blake3(nonce ‖ ciphertext)
 
 Flush large_files:
   for each file ≥ 128 MB (source_block_size):
