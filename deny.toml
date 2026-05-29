@@ -1,0 +1,47 @@
+# cargo-deny configuration — license, ban and source gates.
+# Run: cargo deny check licenses bans sources
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[licenses]
+version = 2
+# Viaticum ships under AGPL-3.0-only. Every dependency must be under a license
+# that can legally be combined into an AGPL-3.0 work. The list below is the
+# permissive / GPL-compatible set actually present in the tree; a new dependency
+# under anything else (proprietary, CDDL, EPL, SSPL, 4-clause BSD, ...) fails CI.
+confidence-threshold = 0.9
+allow = [
+    "AGPL-3.0-only",                  # our own workspace crates
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+    "MPL-2.0",                        # weak copyleft, explicitly GPL/AGPL-compatible
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+# We carry a few duplicate versions (transitive). Warn, don't fail — this is
+# hygiene, not a license/security gate.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[advisories]
+version = 2
+# RUSTSEC advisory check. Kept here so `cargo deny check advisories` works;
+# the license gate (the compliance ask) does not depend on it.
+yanked = "warn"
+ignore = []

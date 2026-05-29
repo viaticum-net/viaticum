@@ -1,0 +1,31 @@
+name: License & dependency audit
+
+# Enforces that every dependency is under a license compatible with
+# AGPL-3.0-only (see deny.toml). A dependency under an incompatible or
+# proprietary license fails this job.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (licenses, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+
+  advisories:
+    name: cargo-deny (RUSTSEC advisories, informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

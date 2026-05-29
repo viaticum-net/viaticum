@@ -68,4 +68,4 @@ To back up with a friend, swap node addresses (`viaticum status` prints yours) a
 
 ## Acknowledgments
 
-Implementation used substantial assistance from generative AI (Claude / Claude Code) for boilerplate, test scaffolding, and refactoring. The architecture, protocol design, and final code review are human-authored. The earlier research and simulation work (`docs/archive/research/`, `docs/archive/experiments/`) used conventional numerical tooling.
+Implementation used substantial assistance from generative AI (Claude / Claude Code) for boilerplate, test scaffolding, and refactoring. The architecture, protocol design, and final code review are human-authored. Under Anthropic's terms of service, rights in the model's output pass to the user, so these AI-assisted contributions are ours to publish under AGPL-3.0; a human remains accountable for every line and can explain the design decisions behind it. The earlier research and simulation work (`docs/archive/research/`, `docs/archive/experiments/`) used conventional numerical tooling.
