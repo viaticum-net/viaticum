@@ -186,6 +186,17 @@ pub struct WatcherConfig {
     pub watch_states: Option<Arc<RwLock<HashMap<PathBuf, WatchEntryState>>>>,
 }
 
+/// Compute the watcher debounce window (ms) for a given `time_scale`.
+///
+/// Production (`time_scale == 1`) uses [`viaticum_core::constants::DEBOUNCE_SECS`]
+/// (30 min): a cold-backup workload coalesces rapid edits instead of re-encoding
+/// on every save. Higher `time_scale` values (experiments, tests) shrink the
+/// window proportionally, the same way every other time constant in the daemon is
+/// scaled. Floored at 1 ms so an extreme scale never yields a zero-length window.
+pub fn debounce_ms_for_time_scale(time_scale: u64) -> u64 {
+    (viaticum_core::constants::DEBOUNCE_SECS * 1000 / time_scale.max(1)).max(1)
+}
+
 // ─── start_watcher ────────────────────────────────────────────────────────────
 
 /// Start the filesystem watcher.

@@ -10,10 +10,40 @@ use tokio_util::sync::CancellationToken;
 use viaticum_core::types::DeviceId;
 
 use crate::daemon::backup::DirtyKind;
-use crate::daemon::watcher::{IgnoreSet, WatcherCommand, WatcherConfig, start_watcher};
+use crate::daemon::watcher::{
+    IgnoreSet, WatcherCommand, WatcherConfig, debounce_ms_for_time_scale, start_watcher,
+};
 
 const TEST_DEVICE_ID: DeviceId = DeviceId([1u8; 32]);
 const DEBOUNCE_MS: u64 = 50;
+
+#[test]
+fn debounce_ms_uses_debounce_secs_at_production_time_scale() {
+    // At time_scale=1 (production) the debounce window is the full DEBOUNCE_SECS
+    // (30 min) — a cold-backup workload coalesces edits instead of re-encoding on
+    // every save. (Was hardcoded to 200 ms, ignoring the constant.)
+    assert_eq!(
+        debounce_ms_for_time_scale(1),
+        viaticum_core::constants::DEBOUNCE_SECS * 1000
+    );
+}
+
+#[test]
+fn debounce_ms_scales_down_proportionally_with_time_scale() {
+    // Under an experiment time_scale the window shrinks proportionally, the same
+    // way every other time constant is scaled — not a fixed 200 ms.
+    let ts = 1_000;
+    assert_eq!(
+        debounce_ms_for_time_scale(ts),
+        viaticum_core::constants::DEBOUNCE_SECS * 1000 / ts
+    );
+}
+
+#[test]
+fn debounce_ms_floors_at_one() {
+    // Extreme time_scale must never yield a zero-length window.
+    assert_eq!(debounce_ms_for_time_scale(u64::MAX), 1);
+}
 
 /// Receive one DirtyEvent with a timeout.
 async fn recv_with_timeout(

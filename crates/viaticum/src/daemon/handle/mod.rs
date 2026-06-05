@@ -992,8 +992,9 @@ impl DaemonHandle {
             let watcher_config = WatcherConfig {
                 watch_dirs: all_watch_dirs,
                 device_id,
-                // Debounce 200 ms by default; scale by time_scale for testing.
-                debounce_ms: 200 / time_scale.max(1),
+                // Coalesce rapid edits over the cold-backup debounce window
+                // (DEBOUNCE_SECS, 30 min), scaled by time_scale for experiments/tests.
+                debounce_ms: crate::daemon::watcher::debounce_ms_for_time_scale(time_scale),
                 data_dir: cfg.data_dir.clone(),
                 // Rescan weekly; scale by time_scale for testing.
                 rescan_interval_secs: (604800 / time_scale).max(60),
