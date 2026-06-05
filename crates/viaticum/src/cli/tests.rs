@@ -380,6 +380,7 @@ fn format_files_single_entry_singular_version() {
         size_bytes: 250_000,
         local_state: "present".into(),
         effective_status: None,
+        is_safe_to_delete: false,
     }];
     let rendered = output::render_files(&files);
     assert!(rendered.contains("1 version"), "got: {rendered}");
@@ -400,6 +401,7 @@ fn format_files_multiple_versions_plural() {
         size_bytes: 1_048_576,
         local_state: "present".into(),
         effective_status: None,
+        is_safe_to_delete: false,
     }];
     let rendered = output::render_files(&files);
     assert!(rendered.contains("5 versions"), "got: {rendered}");

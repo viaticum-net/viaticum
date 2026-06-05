@@ -99,6 +99,100 @@ async fn dispatch_files_empty_db_returns_empty_list() {
     assert!(entries.is_empty());
 }
 
+/// Insert a single-version file backed by one source block with the given
+/// reliability fields. Used by the is_safe_to_delete tests.
+fn insert_file_with_block(
+    state: &DaemonState,
+    path: &str,
+    current_reliability: f64,
+    target_reliability: f64,
+    backed_up: bool,
+) {
+    use viaticum_core::types::{
+        FileId, FileRecord, FileVersion, LocalState, SourceBlockId, SourceBlockRecord,
+        SourceBlockStatus, SourceBlockType, Timestamp,
+    };
+    let block_id = SourceBlockId([7u8; 32]);
+    let block = SourceBlockRecord {
+        block_id,
+        k: 4,
+        t: 1024,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(0),
+        encrypted_size: Some(4096),
+        n: Some(8),
+        overhead: Some(1.5),
+        drop_notice_sent_at: None,
+        importance: 0.5,
+        current_alive: 8,
+        current_reliability,
+        target_reliability,
+        last_attempted_at: None,
+        last_pool_signature: 0,
+    };
+    state.db.upsert_source_block(&block).unwrap();
+    let file = FileRecord {
+        file_id: FileId(1),
+        path: path.to_string(),
+        importance: 0.5,
+        devices: vec![(DeviceId([0u8; 32]), LocalState::Present)],
+        versions: vec![FileVersion {
+            content_hash: [0u8; 32],
+            source_block_id: block_id,
+            k: 4,
+            t: 1024,
+            created_at: Timestamp(0),
+            backed_up_at: if backed_up { Some(Timestamp(1)) } else { None },
+        }],
+        first_seen: Timestamp(0),
+    };
+    state.db.upsert_file(&file).unwrap();
+}
+
+async fn safe_to_delete_flag(state: &DaemonState, path: &str) -> bool {
+    let CliResponse::Files(entries) =
+        dispatch(CliRequest::Files { path_prefix: None }, state).await
+    else {
+        panic!("expected Files");
+    };
+    entries
+        .iter()
+        .find(|e| e.path == path)
+        .expect("file entry present")
+        .is_safe_to_delete
+}
+
+#[tokio::test]
+async fn dispatch_files_is_safe_to_delete_when_block_at_target() {
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "doc.pdf", 0.99, 0.95, true);
+    assert!(
+        safe_to_delete_flag(&state, "doc.pdf").await,
+        "current_reliability >= target → safe to delete local copy"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_files_not_safe_to_delete_when_below_target() {
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "doc.pdf", 0.50, 0.95, true);
+    assert!(
+        !safe_to_delete_flag(&state, "doc.pdf").await,
+        "block below reliability target → not safe"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_files_not_safe_to_delete_when_not_backed_up() {
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "doc.pdf", 0.99, 0.95, false);
+    assert!(
+        !safe_to_delete_flag(&state, "doc.pdf").await,
+        "version not backed up yet → not safe"
+    );
+}
+
 #[tokio::test]
 async fn dispatch_versions_unknown_path_returns_empty_list() {
     let state = make_test_state().await;

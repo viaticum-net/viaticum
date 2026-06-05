@@ -265,6 +265,11 @@ pub struct FileEntry {
     pub local_state: String,
     /// Lifecycle state for the latest version. None for files with no version.
     pub effective_status: Option<EffectiveStatus>,
+    /// True when the latest version is backed up and its source block has reached
+    /// its reliability target — i.e. the network can reconstruct it without the
+    /// local source, so deleting the local copy is safe. Conservative: false when
+    /// not backed up, no block found, or below target.
+    pub is_safe_to_delete: bool,
 }
 
 /// Version entry for `viaticum versions <path>`.

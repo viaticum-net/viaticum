@@ -262,6 +262,13 @@
       <span class="badge badge-{b.kind}" title={b.tooltip}>
         {b.label}
       </span>
+      {#if f.local_state === 'present'}
+        {#if f.is_safe_to_delete}
+          <span class="badge badge-ok" title="Backed up to target — the network can restore this without your local copy.">safe to delete</span>
+        {:else if f.last_backed_up !== 'pending'}
+          <span class="badge badge-working" title="Not yet replicated to target — keep your local copy until this turns green.">keep local</span>
+        {/if}
+      {/if}
       {formatBytes(f.size_bytes)}
       <span class="muted">· {formatTime(f.last_backed_up)}</span>
     </span>

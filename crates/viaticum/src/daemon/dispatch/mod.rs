@@ -6,7 +6,7 @@
 
 use viaticum_core::trust::compute_combined;
 use viaticum_core::types::{
-    FileVersion, LocalState, PlacementStatus, SourceBlockStatus, Timestamp, hex_encode,
+    FileRecord, FileVersion, LocalState, PlacementStatus, SourceBlockStatus, Timestamp, hex_encode,
 };
 
 use crate::cli::types::{
@@ -292,6 +292,26 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
 /// `live` / `target` / `lost` are SYMBOL counts (not holder counts): we need
 /// k_eff symbols to decode, and each holder typically carries many symbols
 /// (an ESI range). Counting holders would give nonsensical "6/1195" displays.
+/// Whether the file's local copy is safe to delete: the latest version is backed
+/// up and its source block has reached its reliability target, so the network can
+/// reconstruct it without the local source. Conservative — returns false when the
+/// version is not backed up, the block record is missing, or it is below target
+/// (a target of 0.0 is the pre-migration sentinel and never counts as safe).
+fn compute_is_safe_to_delete(state: &DaemonState, file: &FileRecord) -> bool {
+    let Some(version) = file.versions.last() else {
+        return false;
+    };
+    if version.backed_up_at.is_none() {
+        return false;
+    }
+    match state.db.get_source_block(&version.source_block_id) {
+        Ok(Some(block)) => {
+            block.target_reliability > 0.0 && block.current_reliability >= block.target_reliability
+        }
+        _ => false,
+    }
+}
+
 fn compute_effective_status(state: &DaemonState, version: &FileVersion) -> EffectiveStatus {
     // backed_up_at == None means the encoder pipeline hasn't produced a block yet.
     if version.backed_up_at.is_none() {
@@ -375,6 +395,7 @@ fn dispatch_files(state: &DaemonState, path_prefix: Option<String>) -> CliRespon
                 .unwrap_or("unknown")
                 .to_string();
             let effective_status = latest.map(|v| compute_effective_status(state, v));
+            let is_safe_to_delete = compute_is_safe_to_delete(state, f);
             FileEntry {
                 path: f.path.clone(),
                 versions: f.versions.len() as u32,
@@ -382,6 +403,7 @@ fn dispatch_files(state: &DaemonState, path_prefix: Option<String>) -> CliRespon
                 size_bytes,
                 local_state,
                 effective_status,
+                is_safe_to_delete,
             }
         })
         .collect();
