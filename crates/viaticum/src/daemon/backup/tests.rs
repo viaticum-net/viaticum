@@ -2756,3 +2756,48 @@ fn backup_transition_offered_to_alive_updates_current_alive() {
         "placement must be Alive after the transition"
     );
 }
+
+#[test]
+fn find_file_for_block_prefers_present_over_stale_renamed_copy() {
+    // After a rename, the old path can linger as a Deleted record still
+    // referencing the same block. Its path sorts first, so naive iteration
+    // returns it — and reading its now-gone path would fail. find_file_for_block
+    // must prefer the locally-present copy.
+    use crate::daemon::backup::packing::find_file_for_block;
+    let db = Db::open_in_memory().unwrap();
+    let block_id = SourceBlockId([5u8; 32]);
+    let version = |bid| FileVersion {
+        content_hash: [0u8; 32],
+        source_block_id: bid,
+        k: 4,
+        t: 1024,
+        created_at: Timestamp(0),
+        backed_up_at: Some(Timestamp(1)),
+    };
+    // Stale record — path "a_old.txt" sorts BEFORE the live one in redb key order.
+    db.upsert_file(&FileRecord {
+        file_id: FileId(1),
+        path: "a_old.txt".into(),
+        importance: 0.5,
+        devices: vec![(DeviceId([1u8; 32]), LocalState::Deleted(Timestamp(0)))],
+        versions: vec![version(block_id)],
+        first_seen: Timestamp(0),
+    })
+    .unwrap();
+    // Live record — same block, locally present, path sorts later.
+    db.upsert_file(&FileRecord {
+        file_id: FileId(2),
+        path: "b_new.txt".into(),
+        importance: 0.5,
+        devices: vec![(DeviceId([1u8; 32]), LocalState::Present)],
+        versions: vec![version(block_id)],
+        first_seen: Timestamp(0),
+    })
+    .unwrap();
+
+    let found = find_file_for_block(&db, block_id).unwrap();
+    assert_eq!(
+        found.path, "b_new.txt",
+        "must return the locally-present copy, not the stale renamed one"
+    );
+}

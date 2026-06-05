@@ -136,20 +136,31 @@ pub fn rebuild_plaintext_from_db(
 }
 
 /// Find a FileRecord whose version references the given block_id.
-fn find_file_for_block(
+///
+/// Prefers a record with a locally-present device: after a rename the old path
+/// can linger as a `Deleted` record still referencing the same block, and reading
+/// its now-gone path would fail. Pick a present copy when one exists; only fall
+/// back to a non-present match if that's all there is.
+pub(crate) fn find_file_for_block(
     db: &viaticum_core::db::Db,
     block_id: viaticum_core::types::SourceBlockId,
 ) -> anyhow::Result<viaticum_core::types::FileRecord> {
-    // Scan all files to find one with a version referencing this block.
+    use viaticum_core::types::LocalState;
     let files = db.list_all_files()?;
+    let mut fallback: Option<viaticum_core::types::FileRecord> = None;
     for file in files {
-        for version in &file.versions {
-            if version.source_block_id == block_id {
+        if file.versions.iter().any(|v| v.source_block_id == block_id) {
+            let present = file
+                .devices
+                .iter()
+                .any(|(_, ls)| matches!(ls, LocalState::Present));
+            if present {
                 return Ok(file);
             }
+            fallback.get_or_insert(file);
         }
     }
-    anyhow::bail!("no file found referencing block_id {block_id}")
+    fallback.ok_or_else(|| anyhow::anyhow!("no file found referencing block_id {block_id}"))
 }
 
 /// Serialize PackEntry list using CBOR. Used by RestoreCoordinator.
