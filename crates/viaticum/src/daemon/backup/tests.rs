@@ -1801,6 +1801,79 @@ fn when_peer_comes_online_then_next_flush_includes_peer() {
     );
 }
 
+/// CL-5 T-10: a cluster sibling (a peer sharing our master_identity) must not
+/// be offered our own blocks — siblings are not an independent failure domain,
+/// so storing our data there gives no real redundancy. The sibling filter only
+/// applies when our own master identity is known (master_signing_key = Some).
+#[test]
+fn get_candidates_excludes_cluster_siblings() {
+    use std::collections::HashSet;
+    use viaticum_core::erasure::RaptorQEncoder;
+    use viaticum_core::types::{IdentityPub, PeerRecord, Timestamp};
+
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+
+    // Own master identity, derived from the configured signing key.
+    let own_master_sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let own_master = IdentityPub(own_master_sk.verifying_key().to_bytes());
+
+    let config = BackupConfig {
+        source_block_size: SMALL_BLOCK_SIZE,
+        symbols_dir: symbols_dir.path().to_path_buf(),
+        epoch_key: [42u8; 32],
+        device_id: DeviceId([1u8; 32]),
+        mock_holders: vec![],
+        cluster_state: None,
+        watch_configs: vec![],
+        time_scale: 1,
+        mock_offer_budget_gb: None,
+        master_signing_key: Some(own_master_sk.clone()),
+        swarm: None,
+        live_watch_configs: None,
+        peer_backoff: None,
+        work_event_tx: None,
+    };
+    let coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
+
+    let insert = |did_byte: u8, master: IdentityPub| {
+        let did = DeviceId([did_byte; 32]);
+        db.upsert_peer(&PeerRecord {
+            device_id: did,
+            master_identity: master,
+            trust_p: 0.5,
+            trust_i: 0.5,
+            trust_s: 1.0,
+            bytes_we_store_for_peer: 0,
+            bytes_peer_stores_for_us: 0,
+            first_seen: Timestamp(1_700_000_000),
+            last_seen: Timestamp(1_700_000_000),
+            revoked_device_pub_keys: vec![],
+            addrs: vec![],
+            x25519_pub: None,
+        })
+        .unwrap();
+        did
+    };
+
+    let sibling = insert(2, own_master); // same master → must be excluded
+    let foreign1 = insert(3, IdentityPub([30u8; 32]));
+    let foreign2 = insert(4, IdentityPub([40u8; 32]));
+
+    let authenticated: HashSet<DeviceId> = [sibling, foreign1, foreign2].into_iter().collect();
+    let candidates = coord.get_candidates(&authenticated).unwrap();
+    let ids: HashSet<DeviceId> = candidates.iter().map(|c| c.device_id).collect();
+
+    assert!(
+        !ids.contains(&sibling),
+        "cluster sibling (same master_identity) must be excluded from candidates"
+    );
+    assert!(
+        ids.contains(&foreign1) && ids.contains(&foreign2),
+        "foreign-master peers must remain candidates"
+    );
+}
+
 // AC-8, AC-9, AC-10 (pending_delivery signaling tests) removed in ε.5.
 // PendingDeliveries / OfferOutcome were iroh-era types; delivery now uses
 // libp2p SwarmHandle request-response. Network integration is tested in

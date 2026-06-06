@@ -262,8 +262,18 @@ impl BackupCoordinator {
             return Ok(self.config.mock_holders.clone());
         }
         let peers = self.db.list_all_peers()?;
+        // CL-5 T-10: exclude cluster siblings (peers sharing our master identity).
+        // Siblings are not an independent failure domain, so holding our blocks on
+        // them gives no real redundancy. Only applied when our own master identity
+        // is known (master_signing_key set in production; None in unit tests).
+        let own_master: Option<viaticum_core::types::IdentityPub> = self
+            .config
+            .master_signing_key
+            .as_ref()
+            .map(|sk| viaticum_core::types::IdentityPub(sk.verifying_key().to_bytes()));
         let candidates: Vec<HolderCandidate> = peers
             .into_iter()
+            .filter(|p| own_master.as_ref() != Some(&p.master_identity))
             .map(|p| {
                 let trust_raw = (viaticum_core::constants::KP * p.trust_p
                     + viaticum_core::constants::KI * p.trust_i)
