@@ -504,3 +504,110 @@ fn ordered_diffs_apply_in_sequence() {
     let result = apply_diffs(base.clone(), &[d1, d2]);
     assert_states_eq(&result, &s2);
 }
+
+// ============================================================
+// SelfPointer: sign / verify / CBOR
+// ============================================================
+
+fn master() -> ed25519_dalek::SigningKey {
+    crate::cluster::derive_master_key(&[3u8; 32]).unwrap()
+}
+
+fn sample_base_ref() -> BlockRef {
+    BlockRef {
+        block_id: SourceBlockId([1u8; 32]),
+        holders: vec![HolderHint {
+            holder_id: DeviceId([7u8; 32]),
+            addrs: vec!["/ip4/10.0.0.1/tcp/4001".to_string()],
+        }],
+    }
+}
+
+fn sample_diff_refs() -> Vec<BlockRef> {
+    vec![BlockRef {
+        block_id: SourceBlockId([2u8; 32]),
+        holders: vec![HolderHint {
+            holder_id: DeviceId([8u8; 32]),
+            addrs: vec![],
+        }],
+    }]
+}
+
+#[test]
+fn self_pointer_signs_and_verifies() {
+    let mk = master();
+    let id = crate::cluster::master_identity(&mk);
+    let p = sign_self_pointer(
+        &mk,
+        5,
+        sample_base_ref(),
+        sample_diff_refs(),
+        Timestamp(1234),
+    );
+    assert_eq!(p.generation, 5);
+    verify_self_pointer(&p, &id).expect("freshly signed pointer must verify");
+}
+
+#[test]
+fn self_pointer_tamper_fails_verify() {
+    let mk = master();
+    let id = crate::cluster::master_identity(&mk);
+    let p = sign_self_pointer(
+        &mk,
+        5,
+        sample_base_ref(),
+        sample_diff_refs(),
+        Timestamp(1234),
+    );
+
+    let mut t_gen = p.clone();
+    t_gen.generation = 6;
+    assert!(
+        verify_self_pointer(&t_gen, &id).is_err(),
+        "tampered generation must fail"
+    );
+
+    let mut t_base = p.clone();
+    t_base.base.block_id = SourceBlockId([0x99u8; 32]);
+    assert!(
+        verify_self_pointer(&t_base, &id).is_err(),
+        "tampered base block_id must fail"
+    );
+
+    let mut t_holder = p.clone();
+    t_holder.base.holders[0].holder_id = DeviceId([0xAAu8; 32]);
+    assert!(
+        verify_self_pointer(&t_holder, &id).is_err(),
+        "tampered holder hint must fail"
+    );
+}
+
+#[test]
+fn self_pointer_wrong_signer_fails() {
+    let mk = master();
+    let other = crate::cluster::derive_master_key(&[8u8; 32]).unwrap();
+    let other_id = crate::cluster::master_identity(&other);
+    let p = sign_self_pointer(&mk, 1, sample_base_ref(), vec![], Timestamp(1));
+    assert!(
+        verify_self_pointer(&p, &other_id).is_err(),
+        "pointer signed by a different master must not verify"
+    );
+}
+
+#[test]
+fn self_pointer_cbor_roundtrip() {
+    let mk = master();
+    let id = crate::cluster::master_identity(&mk);
+    let p = sign_self_pointer(
+        &mk,
+        7,
+        sample_base_ref(),
+        sample_diff_refs(),
+        Timestamp(9000),
+    );
+    let bytes = crate::types::to_cbor_bytes(&p);
+    let decoded: SelfPointer = crate::types::from_cbor_bytes(&bytes).unwrap();
+    assert_eq!(decoded.generation, 7);
+    assert_eq!(decoded.base.block_id, p.base.block_id);
+    verify_self_pointer(&decoded, &id).expect("decoded pointer must still verify");
+}

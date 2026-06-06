@@ -18,8 +18,8 @@ use std::io::Cursor;
 
 use crate::cluster::StoredClusterState;
 use crate::types::{
-    DeviceId, FileId, FileRecord, PeerRecord, SourceBlockId, SourceBlockRecord, SymbolPlacement,
-    Timestamp, to_cbor_bytes,
+    DeviceId, FileId, FileRecord, IdentityPub, PeerRecord, SourceBlockId, SourceBlockRecord,
+    SymbolPlacement, Timestamp, to_cbor_bytes,
 };
 
 // ============================================================
@@ -119,6 +119,9 @@ pub enum SystemStateError {
 
     #[error("database not empty: restore requires empty db")]
     DbNotEmpty,
+
+    #[error("invalid self-pointer signature")]
+    InvalidSignature,
 }
 
 // Convenience conversions from raw redb error types used in raw table access.
@@ -616,6 +619,98 @@ pub fn apply_diffs(base: SystemState, diffs: &[Vec<DiffOp>]) -> SystemState {
             .collect(),
         cluster_state,
     }
+}
+
+// ============================================================
+// Self-pointer (addressable index of the latest SystemState blocks)
+// ============================================================
+
+/// Best-effort dialing hint for a holder of a SystemState block.
+///
+/// At disaster recovery `symbol_placements` is empty (only loaded after a successful
+/// restore), so the self-pointer must carry holder identities directly — otherwise the
+/// owner cannot find who stores the base/diff blocks (the DR circular-dependency, Bug-A).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HolderHint {
+    pub holder_id: DeviceId,
+    /// Last-known dialable multiaddrs (best-effort; may be empty — re-resolved via discovery).
+    pub addrs: Vec<String>,
+}
+
+/// Reference to one SystemState block plus the holders to fetch it from at DR.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BlockRef {
+    pub block_id: SourceBlockId,
+    pub holders: Vec<HolderHint>,
+}
+
+/// Signed, addressable index to the owner's latest SystemState.
+///
+/// Physically tiny (KB). Stored/transported separately from the (large) base+diff blocks.
+/// `generation` is monotonic — DR picks the highest verified generation. Verified against the
+/// master identity derived from the mnemonic at DR; no master_pub is embedded (the verifier
+/// already knows the expected identity, and omitting it binds verification to that identity).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SelfPointer {
+    pub generation: u32,
+    pub base: BlockRef,
+    pub diffs: Vec<BlockRef>,
+    pub created_at: Timestamp,
+    #[serde(with = "crate::types::sig_serde")]
+    pub signature: [u8; 64],
+}
+
+const SELF_POINTER_DOMAIN: &[u8] = b"viaticum-self-pointer-v1";
+
+/// Canonical signing payload: domain tag || CBOR((generation, base, diffs, created_at)).
+fn self_pointer_payload(
+    generation: u32,
+    base: &BlockRef,
+    diffs: &[BlockRef],
+    created_at: Timestamp,
+) -> Vec<u8> {
+    let mut payload = SELF_POINTER_DOMAIN.to_vec();
+    payload.extend_from_slice(&to_cbor_bytes(&(generation, base, diffs, created_at)));
+    payload
+}
+
+/// Build and sign a SelfPointer with the master key.
+pub fn sign_self_pointer(
+    master_key: &ed25519_dalek::SigningKey,
+    generation: u32,
+    base: BlockRef,
+    diffs: Vec<BlockRef>,
+    created_at: Timestamp,
+) -> SelfPointer {
+    use ed25519_dalek::Signer;
+    let payload = self_pointer_payload(generation, &base, &diffs, created_at);
+    let sig = master_key.sign(&payload);
+    SelfPointer {
+        generation,
+        base,
+        diffs,
+        created_at,
+        signature: sig.to_bytes(),
+    }
+}
+
+/// Verify a SelfPointer against the expected master identity.
+pub fn verify_self_pointer(
+    pointer: &SelfPointer,
+    expected_master: &IdentityPub,
+) -> Result<(), SystemStateError> {
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&expected_master.0)
+        .map_err(|_| SystemStateError::InvalidSignature)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&pointer.signature);
+    let payload = self_pointer_payload(
+        pointer.generation,
+        &pointer.base,
+        &pointer.diffs,
+        pointer.created_at,
+    );
+    verifying_key
+        .verify_strict(&payload, &sig)
+        .map_err(|_| SystemStateError::InvalidSignature)
 }
 
 #[cfg(test)]
