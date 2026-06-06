@@ -447,10 +447,16 @@ pub fn diff_states(old: &SystemState, new: &SystemState) -> Vec<DiffOp> {
     }
 
     // ── source_blocks (key = SourceBlockId) ──
-    let old_sb: HashMap<[u8; 32], &SourceBlockRecord> =
-        old.source_blocks.iter().map(|s| (s.block_id.0, s)).collect();
-    let new_sb: HashMap<[u8; 32], &SourceBlockRecord> =
-        new.source_blocks.iter().map(|s| (s.block_id.0, s)).collect();
+    let old_sb: HashMap<[u8; 32], &SourceBlockRecord> = old
+        .source_blocks
+        .iter()
+        .map(|s| (s.block_id.0, s))
+        .collect();
+    let new_sb: HashMap<[u8; 32], &SourceBlockRecord> = new
+        .source_blocks
+        .iter()
+        .map(|s| (s.block_id.0, s))
+        .collect();
     for s in &new.source_blocks {
         match old_sb.get(&s.block_id.0) {
             Some(o) if to_cbor_bytes(*o) == to_cbor_bytes(s) => {}
@@ -550,8 +556,11 @@ pub fn apply_diffs(base: SystemState, diffs: &[Vec<DiffOp>]) -> SystemState {
 
     let mut files: HashMap<u64, FileRecord> =
         base.files.into_iter().map(|f| (f.file_id.0, f)).collect();
-    let mut blocks: HashMap<[u8; 32], SourceBlockRecord> =
-        base.source_blocks.into_iter().map(|s| (s.block_id.0, s)).collect();
+    let mut blocks: HashMap<[u8; 32], SourceBlockRecord> = base
+        .source_blocks
+        .into_iter()
+        .map(|s| (s.block_id.0, s))
+        .collect();
     let mut placements: HashMap<([u8; 32], [u8; 32]), SymbolPlacement> = base
         .symbol_placements
         .into_iter()
@@ -559,8 +568,11 @@ pub fn apply_diffs(base: SystemState, diffs: &[Vec<DiffOp>]) -> SystemState {
         .collect();
     let mut peers: HashMap<[u8; 32], PeerRecord> =
         base.peers.into_iter().map(|p| (p.device_id.0, p)).collect();
-    let mut pos_weekly: HashMap<Vec<u8>, Vec<u8>> =
-        base.pos_weekly.into_iter().map(|e| (e.key, e.value)).collect();
+    let mut pos_weekly: HashMap<Vec<u8>, Vec<u8>> = base
+        .pos_weekly
+        .into_iter()
+        .map(|e| (e.key, e.value))
+        .collect();
     let mut cluster_state = base.cluster_state;
 
     for batch in diffs {

@@ -17,8 +17,8 @@
 use std::path::{Path, PathBuf};
 
 use viaticum_core::types::{
-    ErasureParams, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType,
-    Timestamp, hex_encode,
+    ErasureParams, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, Timestamp,
+    hex_encode,
 };
 
 #[cfg(test)]

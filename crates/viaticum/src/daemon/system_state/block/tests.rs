@@ -89,5 +89,8 @@ fn ss_record_has_max_importance_and_high_overhead() {
     );
     assert_eq!(rec.encrypted_size, Some(blob.len() as u64));
     assert!(rec.n.unwrap() >= rec.k, "n must cover at least k symbols");
-    assert!(rec.target_reliability > 0.99, "SS target reliability very high");
+    assert!(
+        rec.target_reliability > 0.99,
+        "SS target reliability very high"
+    );
 }

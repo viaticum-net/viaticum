@@ -420,10 +420,16 @@ fn assert_states_eq(a: &SystemState, b: &SystemState) {
         .collect();
     assert_eq!(pa, pb, "placements differ");
 
-    let ra: BTreeMap<[u8; 32], Vec<u8>> =
-        a.peers.iter().map(|p| (p.device_id.0, to_cbor(p))).collect();
-    let rb: BTreeMap<[u8; 32], Vec<u8>> =
-        b.peers.iter().map(|p| (p.device_id.0, to_cbor(p))).collect();
+    let ra: BTreeMap<[u8; 32], Vec<u8>> = a
+        .peers
+        .iter()
+        .map(|p| (p.device_id.0, to_cbor(p)))
+        .collect();
+    let rb: BTreeMap<[u8; 32], Vec<u8>> = b
+        .peers
+        .iter()
+        .map(|p| (p.device_id.0, to_cbor(p)))
+        .collect();
     assert_eq!(ra, rb, "peers differ");
 
     let wa: BTreeMap<Vec<u8>, Vec<u8>> = a
