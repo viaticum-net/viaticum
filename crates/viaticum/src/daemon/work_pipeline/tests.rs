@@ -729,38 +729,10 @@ fn worker_picks_highest_priority_item() {
     );
 }
 
-// ─── cleanup_block_dir_removes_dir_unconditionally ────────────────────────────
-
-#[test]
-fn cleanup_block_dir_removes_dir_unconditionally() {
-    let dir = tempdir().unwrap();
-    let block_hex = "aabbccdd00000000000000000000000000000000000000000000000000000000";
-    let block_dir = dir.path().join(block_hex);
-    std::fs::create_dir_all(&block_dir).unwrap();
-    let leftover = block_dir.join("leftover.txt");
-    std::fs::write(&leftover, b"leftover data").unwrap();
-
-    // Simulate simplified cleanup: just remove_dir_all.
-    if block_dir.exists() {
-        std::fs::remove_dir_all(&block_dir).unwrap();
-    }
-
-    assert!(
-        !block_dir.exists(),
-        "block dir must be removed unconditionally"
-    );
-}
-
-#[test]
-fn cleanup_block_dir_idempotent_when_already_absent() {
-    let dir = tempdir().unwrap();
-    let block_dir = dir.path().join("nonexistent");
-    // Should not panic when directory doesn't exist.
-    if block_dir.exists() {
-        std::fs::remove_dir_all(&block_dir).unwrap();
-    }
-    // No panic → idempotent.
-}
+// W7: the former `cleanup_block_dir_*` tests here exercised std::fs::remove_dir_all
+// inline rather than any production function — the W11b "permissive cleanup" code
+// path they stood in for was removed. The real startup cleanup,
+// `cleanup_legacy_bound_symbol_files`, is covered in daemon::backup::tests.
 
 // ─── worker_includes_item_after_cooldown_expires ─────────────────────────────
 
