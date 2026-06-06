@@ -108,6 +108,24 @@ fn compute_allocation_n_too_small_returns_error() {
 }
 
 #[test]
+fn allocation_covers_k_eff_with_few_holders() {
+    // CL-1: a small block placed across only a couple of holders must still
+    // distribute at least k_eff symbols, otherwise the block is silently
+    // unrecoverable (decode needs k_eff). The concentration cap (max_per_holder)
+    // is tight for low-importance blocks, so with 2 holders it would otherwise
+    // cap the total below k_eff.
+    let p = params(0.0);
+    let candidates = vec![candidate(1, 0.5), candidate(2, 0.5)];
+    let allocs = compute_allocation(&candidates, &p, 0).unwrap();
+    let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
+    assert!(
+        total >= p.k_eff,
+        "placed {total} symbols but need k_eff={} to decode",
+        p.k_eff
+    );
+}
+
+#[test]
 fn compute_allocation_many_candidates_truncated_by_max_holders() {
     // 50 candidates but MAX_HOLDERS_PER_BLOCK = 30 → top-30 by weight kept
     let p = ErasureParams::compute(128 * 1024 * 1024, 0.5).unwrap();

@@ -53,6 +53,10 @@ pub enum PlacementError {
     /// N is less than number of holders (cannot assign 1 symbol per holder).
     #[error("N={n} is less than holder count={holders}, cannot assign minimum 1 per holder")]
     NTooSmall { n: u32, holders: usize },
+
+    /// Total placed symbols are below k_eff — the block would be undecodable.
+    #[error("placed {placed} symbols but {needed} (k_eff) are required to decode")]
+    InsufficientCapacity { placed: u32, needed: u32 },
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -127,7 +131,17 @@ pub fn compute_allocation(
     }
 
     let n = params.n;
-    let max_per = params.max_per_holder();
+    let mut max_per = params.max_per_holder();
+
+    // CL-1: the concentration cap can be tighter than k_eff / holders for small,
+    // low-importance blocks placed across few holders. If the cap cannot cover
+    // k_eff across the available holders, the block would be silently
+    // unrecoverable. Relax the cap to the minimum that still covers k_eff —
+    // only in that under-capacity case, so normal blocks are unaffected.
+    let holders = valid.len() as u32;
+    if (max_per as u64) * (holders as u64) < params.k_eff as u64 {
+        max_per = params.k_eff.div_ceil(holders);
+    }
 
     // Step 2: check N >= candidate count
     if (n as usize) < valid.len() {
@@ -219,6 +233,18 @@ pub fn compute_allocation(
             counts[idx] += add;
             deficit -= add;
         }
+    }
+
+    // CL-1 invariant: never emit a placement that cannot be decoded. With the
+    // relaxed cap above this is unreachable on valid input (holders >= 2, cap
+    // covers k_eff), but a future change to the redistribution logic could
+    // reintroduce under-placement — fail loud here rather than silently lose data.
+    let placed: u32 = counts.iter().sum();
+    if placed < params.k_eff {
+        return Err(PlacementError::InsufficientCapacity {
+            placed,
+            needed: params.k_eff,
+        });
     }
 
     // Step 9: assign ESI ranges sorted by descending symbol_count (ties by device_id bytes)

@@ -227,12 +227,12 @@ fn flush_queue_creates_source_block_record() {
     let files_dir = TempDir::new().unwrap();
     let mut coord = test_coord(db.clone(), &symbols_dir);
 
-    // Queue enough data to exceed MIN_BATCH_BYTES (1 MB).
+    // Queue enough data to exceed MIN_BATCH_BYTES (6 MB).
     // Files must be < SMALL_BLOCK_SIZE (128 KB) to go to the queue (not large-file path).
-    // 20 files x 60 KB = 1.2 MB > 1 MB (MIN_BATCH_BYTES).
-    for i in 0..20u8 {
+    // 100 files x 70 KB = 7 MB > 6 MB (MIN_BATCH_BYTES).
+    for i in 0..100u8 {
         // Use pseudo-random content to avoid trivial zstd compression.
-        let content: Vec<u8> = (0..60_000u32)
+        let content: Vec<u8> = (0..70_000u32)
             .map(|j| (i as u32 ^ (j % 251)) as u8)
             .collect();
         let path = write_file(&files_dir, &format!("doc{i}.txt"), &content);

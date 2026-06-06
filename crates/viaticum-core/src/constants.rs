@@ -194,7 +194,14 @@ pub const FLUSH_IDLE_SECS: u64 = 60 * 60; // 1 hour
 pub const FLUSH_FALLBACK_SECS: u64 = 24 * 60 * 60; // 24 hours
 
 /// Minimum batch size for flushing packing queue (bytes).
-pub const MIN_BATCH_BYTES: u64 = 1024 * 1024; // 1 MB
+///
+/// CL-1: packed blocks below a few MB produce a small k_eff, which combined with
+/// the concentration cap and a thin holder pool can leave a block with too few
+/// placed symbols to ever decode. Keeping batches at >= 6 MB ensures packed
+/// blocks have enough symbols to spread safely across the holder pool. (Single
+/// large files bypass packing; their placement is guarded by the CL-1 cap relax
+/// in `placement::compute_allocation`.)
+pub const MIN_BATCH_BYTES: u64 = 6 * 1024 * 1024; // 6 MB
 
 // === File versioning ===
 
