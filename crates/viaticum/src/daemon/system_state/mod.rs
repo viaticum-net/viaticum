@@ -24,6 +24,8 @@ use viaticum_core::types::Timestamp;
 
 use crate::daemon::network::swarm::SwarmHandle;
 
+pub mod block;
+
 #[cfg(test)]
 mod tests;
 
