@@ -349,6 +349,67 @@ fn holding_crud() {
     assert_eq!(db.total_holding_bytes().unwrap(), 0);
 }
 
+#[test]
+fn total_holding_bytes_tracks_upsert_replace_and_delete() {
+    // S-9: total_holding_bytes is served from a cached running aggregate, so the
+    // aggregate must stay exact across upserts (incl. in-place replacement that
+    // changes total_bytes) and deletes — over multiple owners.
+    let db = test_db();
+    let owner1 = IdentityPub([1u8; 32]);
+    let owner2 = IdentityPub([2u8; 32]);
+
+    db.upsert_holding(&make_holding(1, owner1, HoldingStatus::Active, 1000))
+        .unwrap();
+    db.upsert_holding(&make_holding(2, owner2, HoldingStatus::Active, 2000))
+        .unwrap();
+    assert_eq!(db.total_holding_bytes().unwrap(), 3000);
+
+    // Replace holding 1 with a larger size → delta must adjust, not double-count.
+    db.upsert_holding(&make_holding(1, owner1, HoldingStatus::Active, 1500))
+        .unwrap();
+    assert_eq!(db.total_holding_bytes().unwrap(), 3500);
+
+    // Status change keeps total_bytes → all statuses count, so total is unchanged.
+    db.upsert_holding(&make_holding(
+        1,
+        owner1,
+        HoldingStatus::MarkedForDelete,
+        1500,
+    ))
+    .unwrap();
+    assert_eq!(db.total_holding_bytes().unwrap(), 3500);
+
+    db.delete_holding(&block_id(1), &owner1).unwrap();
+    assert_eq!(db.total_holding_bytes().unwrap(), 2000);
+
+    db.delete_holding(&block_id(2), &owner2).unwrap();
+    assert_eq!(db.total_holding_bytes().unwrap(), 0);
+}
+
+#[test]
+fn total_holding_bytes_rebuilt_after_reopen() {
+    // S-9: the cached aggregate must be rebuilt from the WARM layer at Db::open().
+    let tmpfile = tempfile::NamedTempFile::new().unwrap();
+    let tmp_path = tmpfile.into_temp_path();
+    let owner1 = IdentityPub([1u8; 32]);
+    let owner2 = IdentityPub([2u8; 32]);
+
+    {
+        let db = crate::db::Db::open(&tmp_path).unwrap();
+        db.upsert_holding(&make_holding(1, owner1, HoldingStatus::Active, 1000))
+            .unwrap();
+        db.upsert_holding(&make_holding(2, owner2, HoldingStatus::Silent, 2500))
+            .unwrap();
+    }
+
+    let db2 = crate::db::Db::open(&tmp_path).unwrap();
+    assert_eq!(
+        db2.total_holding_bytes().unwrap(),
+        3500,
+        "cached aggregate must be rebuilt from holdings at open()"
+    );
+}
+
 // ============================================================
 // 12. holding_cooldown_expired
 // ============================================================

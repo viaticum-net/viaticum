@@ -155,6 +155,10 @@ pub struct SystemStateBlobRecord {
 pub struct HotCache {
     pub blocks: HashMap<SourceBlockId, BlockAgg>,
     pub placements: HashMap<(SourceBlockId, DeviceId), PlacementAgg>,
+    /// Running sum of `total_bytes` over ALL holdings (every status counts).
+    /// Maintained on holding upsert/delete so `total_holding_bytes` is O(1)
+    /// instead of a full HOLDINGS scan on every incoming SymbolOffer (S-9).
+    pub holding_bytes_total: u64,
 }
 
 impl HotCache {
@@ -162,6 +166,7 @@ impl HotCache {
         HotCache {
             blocks: HashMap::new(),
             placements: HashMap::new(),
+            holding_bytes_total: 0,
         }
     }
 
@@ -205,6 +210,16 @@ impl HotCache {
                 agg.total_alive_symbols += count;
             }
         }
+
+        // Running aggregate of holding bytes (all statuses count) — S-9.
+        let holdings = tx.open_table(HOLDINGS)?;
+        for item in holdings.iter()? {
+            let (_, v) = item?;
+            let record: HoldingRecord = from_cbor_bytes(v.value())?;
+            cache.holding_bytes_total =
+                cache.holding_bytes_total.saturating_add(record.total_bytes);
+        }
+
         Ok(cache)
     }
 }
@@ -1101,12 +1116,25 @@ impl Db {
     pub fn upsert_holding(&self, record: &HoldingRecord) -> Result<(), DbError> {
         let bytes = to_cbor_bytes(record);
         let key = holding_key(&record.source_block_id, &record.owner_id);
+        let old_bytes;
         let tx = self.inner.begin_write()?;
         {
             let mut holdings = tx.open_table(HOLDINGS)?;
+            // Read the old record (if any) to compute the aggregate delta (S-9).
+            old_bytes = match holdings.get(&key)? {
+                Some(v) => from_cbor_bytes::<HoldingRecord>(v.value())?.total_bytes,
+                None => 0,
+            };
             holdings.insert(&key, bytes.as_slice())?;
         }
         tx.commit()?;
+
+        // DB committed — adjust the cached holding-bytes aggregate.
+        let mut hot = self.hot.write().unwrap_or_else(|e| e.into_inner());
+        hot.holding_bytes_total = hot
+            .holding_bytes_total
+            .saturating_sub(old_bytes)
+            .saturating_add(record.total_bytes);
         Ok(())
     }
 
@@ -1130,12 +1158,21 @@ impl Db {
         owner_id: &IdentityPub,
     ) -> Result<(), DbError> {
         let key = holding_key(block_id, owner_id);
+        let old_bytes;
         let tx = self.inner.begin_write()?;
         {
             let mut holdings = tx.open_table(HOLDINGS)?;
+            old_bytes = match holdings.get(&key)? {
+                Some(v) => from_cbor_bytes::<HoldingRecord>(v.value())?.total_bytes,
+                None => 0,
+            };
             holdings.remove(&key)?;
         }
         tx.commit()?;
+
+        // DB committed — drop the removed holding's bytes from the cached aggregate.
+        let mut hot = self.hot.write().unwrap_or_else(|e| e.into_inner());
+        hot.holding_bytes_total = hot.holding_bytes_total.saturating_sub(old_bytes);
         Ok(())
     }
 
@@ -1178,17 +1215,11 @@ impl Db {
     }
 
     /// Total bytes across all holdings (Active + MarkedForDelete + Silent).
+    ///
+    /// O(1): served from the cached running aggregate (S-9), maintained by
+    /// `upsert_holding`/`delete_holding` and rebuilt at `Db::open()`.
     pub fn total_holding_bytes(&self) -> Result<u64, DbError> {
-        let tx = self.inner.begin_read()?;
-        let table = tx.open_table(HOLDINGS)?;
-        let mut total = 0u64;
-        for item in table.iter()? {
-            let (_, v) = item?;
-            let record: HoldingRecord = from_cbor_bytes(v.value())?;
-            // All statuses count towards held bytes.
-            total += record.total_bytes;
-        }
-        Ok(total)
+        Ok(self.hot().holding_bytes_total)
     }
 
     /// Holdings where delete_requested_at + HOLDER_DELETE_COOLDOWN_SECS/time_scale <= now.
@@ -1806,6 +1837,9 @@ enum HotCacheDelta {
         was_alive: bool,
         old_count: u32,
     },
+    /// A holding upsert/delete changed the total held bytes (S-9).
+    /// Signed delta to apply to `holding_bytes_total` after commit.
+    HoldingBytesDelta { delta: i64 },
 }
 
 /// Handle to an open, uncommitted write transaction.
@@ -2002,10 +2036,18 @@ impl<'db> DbWriteTxn<'db> {
     pub fn upsert_holding(&mut self, record: &HoldingRecord) -> Result<(), DbError> {
         let bytes = to_cbor_bytes(record);
         let key = holding_key(&record.source_block_id, &record.owner_id);
+        let old_bytes;
         {
             let mut holdings = self.txn.open_table(HOLDINGS)?;
+            old_bytes = match holdings.get(&key)? {
+                Some(v) => from_cbor_bytes::<HoldingRecord>(v.value())?.total_bytes,
+                None => 0,
+            };
             holdings.insert(&key, bytes.as_slice())?;
         }
+        self.deltas.push(HotCacheDelta::HoldingBytesDelta {
+            delta: record.total_bytes as i64 - old_bytes as i64,
+        });
         Ok(())
     }
 
@@ -2016,10 +2058,18 @@ impl<'db> DbWriteTxn<'db> {
         owner_id: &IdentityPub,
     ) -> Result<(), DbError> {
         let key = holding_key(block_id, owner_id);
+        let old_bytes;
         {
             let mut holdings = self.txn.open_table(HOLDINGS)?;
+            old_bytes = match holdings.get(&key)? {
+                Some(v) => from_cbor_bytes::<HoldingRecord>(v.value())?.total_bytes,
+                None => 0,
+            };
             holdings.remove(&key)?;
         }
+        self.deltas.push(HotCacheDelta::HoldingBytesDelta {
+            delta: -(old_bytes as i64),
+        });
         Ok(())
     }
 
@@ -2084,6 +2134,13 @@ impl<'db> DbWriteTxn<'db> {
                             hot.blocks.remove(&block_id);
                         }
                     }
+                }
+                HotCacheDelta::HoldingBytesDelta { delta } => {
+                    hot.holding_bytes_total = if delta >= 0 {
+                        hot.holding_bytes_total.saturating_add(delta as u64)
+                    } else {
+                        hot.holding_bytes_total.saturating_sub((-delta) as u64)
+                    };
                 }
             }
         }
