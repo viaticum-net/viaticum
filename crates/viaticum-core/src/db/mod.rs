@@ -92,6 +92,12 @@ const FILE_HOLDERS: TableDefinition<&[u8; 40], u32> = TableDefinition::new("file
 /// Value = symbol_count (u32).
 const HOLDER_FILES: TableDefinition<&[u8; 40], u32> = TableDefinition::new("holder_files");
 
+/// content_hash → path index (B-1). Key = content_hash[32] ++ path bytes (variable).
+/// Value = empty. A range-scan over the 32-byte content_hash prefix yields every
+/// path whose current versions include that hash, turning import dedup from an
+/// O(N) full FILES scan per event into a prefix lookup.
+const CONTENT_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("content_index");
+
 // ============================================================
 // Key helpers
 // ============================================================
@@ -114,6 +120,15 @@ fn placement_key(block_id: &SourceBlockId, holder: &DeviceId) -> [u8; 64] {
     let mut key = [0u8; 64];
     key[..32].copy_from_slice(&block_id.0);
     key[32..64].copy_from_slice(&holder.0);
+    key
+}
+
+/// CONTENT_INDEX key: content_hash (32 bytes) ++ path bytes. The fixed-width hash
+/// prefix lets a range scan select all paths for a given content hash.
+fn content_index_key(content_hash: &[u8; 32], path: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(32 + path.len());
+    key.extend_from_slice(content_hash);
+    key.extend_from_slice(path.as_bytes());
     key
 }
 
@@ -295,6 +310,7 @@ impl Db {
             tx.open_table(POS_WEEKLY)?;
             tx.open_table(FILE_HOLDERS)?;
             tx.open_table(HOLDER_FILES)?;
+            tx.open_table(CONTENT_INDEX)?;
             tx.open_table(CLUSTER_STATE)?;
             tx.open_table(SYSTEM_STATE_BLOBS)?;
             tx.open_table(RESTORE_SERVED)?;
@@ -367,10 +383,48 @@ impl Db {
 
         Self::create_tables(&db)?;
         let hot = HotCache::build_from_db(&db)?;
-        Ok(Db {
+        let db = Db {
             inner: Arc::new(db),
             hot: Arc::new(RwLock::new(hot)),
-        })
+        };
+        db.backfill_content_index()?;
+        Ok(db)
+    }
+
+    /// Rebuild the content_hash index (B-1) from FILES if it is empty but files
+    /// exist — i.e. a database created before the index was introduced. A no-op
+    /// once the index is populated (ongoing maintenance keeps it consistent).
+    fn backfill_content_index(&self) -> Result<(), DbError> {
+        use redb::ReadableTable;
+        let keys: Vec<Vec<u8>> = {
+            let rtx = self.inner.begin_read()?;
+            let idx = rtx.open_table(CONTENT_INDEX)?;
+            if idx.len()? > 0 {
+                return Ok(());
+            }
+            let files = rtx.open_table(FILES)?;
+            let mut keys = Vec::new();
+            for item in files.iter()? {
+                let (_, v) = item?;
+                let rec: FileRecord = from_cbor_bytes(v.value())?;
+                for ver in &rec.versions {
+                    keys.push(content_index_key(&ver.content_hash, &rec.path));
+                }
+            }
+            keys
+        };
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let tx = self.inner.begin_write()?;
+        {
+            let mut idx = tx.open_table(CONTENT_INDEX)?;
+            for k in &keys {
+                idx.insert(k.as_slice(), [].as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Create in-memory database (for tests). Same table setup.
@@ -403,13 +457,31 @@ impl Db {
 // ============================================================
 
 impl Db {
-    /// Insert or replace FileRecord.
+    /// Insert or replace FileRecord. Maintains the content_hash index (B-1).
     pub fn upsert_file(&self, record: &FileRecord) -> Result<(), DbError> {
         let bytes = to_cbor_bytes(record);
         let tx = self.inner.begin_write()?;
         {
             let mut files = tx.open_table(FILES)?;
+            let old: Option<FileRecord> = match files.get(record.path.as_str())? {
+                Some(v) => Some(from_cbor_bytes(v.value())?),
+                None => None,
+            };
             files.insert(record.path.as_str(), bytes.as_slice())?;
+
+            // CONTENT_INDEX: drop the old record's version-hash keys, add the new ones.
+            let mut idx = tx.open_table(CONTENT_INDEX)?;
+            if let Some(old) = &old {
+                for v in &old.versions {
+                    idx.remove(content_index_key(&v.content_hash, &old.path).as_slice())?;
+                }
+            }
+            for v in &record.versions {
+                idx.insert(
+                    content_index_key(&v.content_hash, &record.path).as_slice(),
+                    [].as_slice(),
+                )?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -439,12 +511,23 @@ impl Db {
         Ok(None)
     }
 
-    /// Delete by path. No-op if not found.
+    /// Delete by path. No-op if not found. Maintains the content_hash index (B-1).
     pub fn delete_file(&self, path: &str) -> Result<(), DbError> {
         let tx = self.inner.begin_write()?;
         {
             let mut files = tx.open_table(FILES)?;
+            let old: Option<FileRecord> = match files.get(path)? {
+                Some(v) => Some(from_cbor_bytes(v.value())?),
+                None => None,
+            };
             files.remove(path)?;
+
+            if let Some(old) = &old {
+                let mut idx = tx.open_table(CONTENT_INDEX)?;
+                for v in &old.versions {
+                    idx.remove(content_index_key(&v.content_hash, &old.path).as_slice())?;
+                }
+            }
         }
         tx.commit()?;
         Ok(())
@@ -461,6 +544,58 @@ impl Db {
             records.push(record);
         }
         Ok(records)
+    }
+
+    /// Paths whose current versions include `content_hash`, via the CONTENT_INDEX
+    /// prefix scan (B-1). Order follows key order; callers treat it as a candidate set.
+    fn paths_for_content_hash(&self, content_hash: &[u8; 32]) -> Result<Vec<String>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(CONTENT_INDEX)?;
+        let mut paths = Vec::new();
+        let lower: &[u8] = content_hash;
+        for item in table.range::<&[u8]>(lower..)? {
+            let (k, _) = item?;
+            let key = k.value();
+            if !key.starts_with(content_hash) {
+                break;
+            }
+            let path = std::str::from_utf8(&key[32..])
+                .map_err(|e| DbError::NotFound(format!("content_index path utf8: {e}")))?
+                .to_string();
+            paths.push(path);
+        }
+        Ok(paths)
+    }
+
+    /// True if any file has a backed-up version with this content hash (B-1 indexed).
+    /// Replaces an O(N) full FILES scan in the import dedup path.
+    pub fn is_content_backed_up(&self, content_hash: &[u8; 32]) -> Result<bool, DbError> {
+        for path in self.paths_for_content_hash(content_hash)? {
+            if let Some(rec) = self.get_file(&path)?
+                && rec
+                    .versions
+                    .iter()
+                    .any(|v| &v.content_hash == content_hash && v.backed_up_at.is_some())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// First file record holding a version with this content hash (B-1 indexed).
+    pub fn find_file_by_content_hash(
+        &self,
+        content_hash: &[u8; 32],
+    ) -> Result<Option<FileRecord>, DbError> {
+        for path in self.paths_for_content_hash(content_hash)? {
+            if let Some(rec) = self.get_file(&path)?
+                && rec.versions.iter().any(|v| &v.content_hash == content_hash)
+            {
+                return Ok(Some(rec));
+            }
+        }
+        Ok(None)
     }
 
     /// List files with path starting with prefix.
@@ -2013,21 +2148,49 @@ impl<'db> DbWriteTxn<'db> {
         Ok(seq)
     }
 
-    /// Insert or replace a FileRecord.
+    /// Insert or replace a FileRecord. Maintains the content_hash index (B-1).
     pub fn upsert_file(&mut self, record: &FileRecord) -> Result<(), DbError> {
         let bytes = to_cbor_bytes(record);
         {
             let mut files = self.txn.open_table(FILES)?;
+            let old: Option<FileRecord> = match files.get(record.path.as_str())? {
+                Some(v) => Some(from_cbor_bytes(v.value())?),
+                None => None,
+            };
             files.insert(record.path.as_str(), bytes.as_slice())?;
+
+            let mut idx = self.txn.open_table(CONTENT_INDEX)?;
+            if let Some(old) = &old {
+                for v in &old.versions {
+                    idx.remove(content_index_key(&v.content_hash, &old.path).as_slice())?;
+                }
+            }
+            for v in &record.versions {
+                idx.insert(
+                    content_index_key(&v.content_hash, &record.path).as_slice(),
+                    [].as_slice(),
+                )?;
+            }
         }
         Ok(())
     }
 
-    /// Delete a FileRecord by path.
+    /// Delete a FileRecord by path. Maintains the content_hash index (B-1).
     pub fn delete_file(&mut self, path: &str) -> Result<(), DbError> {
         {
             let mut files = self.txn.open_table(FILES)?;
+            let old: Option<FileRecord> = match files.get(path)? {
+                Some(v) => Some(from_cbor_bytes(v.value())?),
+                None => None,
+            };
             files.remove(path)?;
+
+            if let Some(old) = &old {
+                let mut idx = self.txn.open_table(CONTENT_INDEX)?;
+                for v in &old.versions {
+                    idx.remove(content_index_key(&v.content_hash, &old.path).as_slice())?;
+                }
+            }
         }
         Ok(())
     }

@@ -55,27 +55,19 @@ impl BackupCoordinator {
                 .is_content_backed_up(&content_hash)
                 .map_err(|e| anyhow::anyhow!("cluster dedup check: {e}"))?
         } else {
-            let all_files = self.db.list_all_files()?;
-            all_files.iter().any(|r| {
-                r.versions
-                    .iter()
-                    .any(|v| v.content_hash == content_hash && v.backed_up_at.is_some())
-            })
+            // B-1: indexed lookup instead of an O(N) full FILES scan.
+            self.db.is_content_backed_up(&content_hash)?
         };
 
         if is_backed_up {
             // Content is already fully backed up — update catalog without re-uploading.
-            let all_files = self.db.list_all_files()?;
-            if let Some(existing) = all_files
-                .iter()
-                .find(|r| r.versions.iter().any(|v| v.content_hash == content_hash))
-            {
+            // B-1: indexed lookup of the existing record (was a full FILES scan).
+            if let Some(existing) = self.db.find_file_by_content_hash(&content_hash)? {
                 tracing::debug!(
                     "dedup: {} matches existing record path={}",
                     event.path,
                     existing.path
                 );
-                let existing = existing.clone();
                 self.handle_dedup(event, &existing, content_hash)?;
                 return Ok(());
             }

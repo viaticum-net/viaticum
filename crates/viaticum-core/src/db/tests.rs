@@ -2,9 +2,9 @@ use crate::db::testutil::{test_db, test_peer, test_peers};
 use crate::db::{Db, SystemStateBlobRecord, WeeklyPosEntry};
 use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
 use crate::types::{
-    BudgetRecord, DeviceId, Event, EventEntry, FileId, FileRecord, HoldingRecord, HoldingStatus,
-    IdentityPub, LocalState, PeerRecord, PlacementStatus, SourceBlockId, SourceBlockRecord,
-    SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
+    BudgetRecord, DeviceId, Event, EventEntry, FileId, FileRecord, FileVersion, HoldingRecord,
+    HoldingStatus, IdentityPub, LocalState, PeerRecord, PlacementStatus, SourceBlockId,
+    SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
 };
 
 // ============================================================
@@ -24,6 +24,22 @@ fn make_file_record(path: &str, file_id: u64) -> FileRecord {
         versions: vec![],
         first_seen: Timestamp(1000),
     }
+}
+
+fn file_with_versions(path: &str, file_id: u64, versions: &[([u8; 32], bool)]) -> FileRecord {
+    let mut rec = make_file_record(path, file_id);
+    rec.versions = versions
+        .iter()
+        .map(|(hash, backed_up)| FileVersion {
+            content_hash: *hash,
+            source_block_id: SourceBlockId([0u8; 32]),
+            k: 1,
+            t: 65535,
+            created_at: Timestamp(1000),
+            backed_up_at: backed_up.then_some(Timestamp(2000)),
+        })
+        .collect();
+    rec
 }
 
 fn make_source_block(seed: u8, status: SourceBlockStatus) -> SourceBlockRecord {
@@ -326,6 +342,111 @@ fn event_log_sequence_monotonic() {
         .map(|i| db.append_event(&make_event(i)).unwrap())
         .collect();
     assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+}
+
+// ============================================================
+// content_hash index (B-1)
+// ============================================================
+
+#[test]
+fn content_index_finds_backed_up_file_by_hash() {
+    let db = test_db();
+    let h1 = [11u8; 32];
+    let h2 = [22u8; 32];
+    db.upsert_file(&file_with_versions("a.txt", 1, &[(h1, true)]))
+        .unwrap();
+    db.upsert_file(&file_with_versions("b.txt", 2, &[(h2, false)]))
+        .unwrap();
+
+    assert!(db.is_content_backed_up(&h1).unwrap());
+    assert!(
+        !db.is_content_backed_up(&h2).unwrap(),
+        "h2 version is not backed up"
+    );
+    assert!(
+        !db.is_content_backed_up(&[33u8; 32]).unwrap(),
+        "unknown hash"
+    );
+
+    assert_eq!(
+        db.find_file_by_content_hash(&h1).unwrap().map(|r| r.path),
+        Some("a.txt".to_string())
+    );
+    assert_eq!(
+        db.find_file_by_content_hash(&h2).unwrap().map(|r| r.path),
+        Some("b.txt".to_string())
+    );
+    assert!(db.find_file_by_content_hash(&[33u8; 32]).unwrap().is_none());
+}
+
+#[test]
+fn content_index_removed_on_delete() {
+    let db = test_db();
+    let h = [44u8; 32];
+    db.upsert_file(&file_with_versions("c.txt", 3, &[(h, true)]))
+        .unwrap();
+    assert!(db.is_content_backed_up(&h).unwrap());
+
+    db.delete_file("c.txt").unwrap();
+    assert!(
+        !db.is_content_backed_up(&h).unwrap(),
+        "index entry must be removed when the file is deleted"
+    );
+    assert!(db.find_file_by_content_hash(&h).unwrap().is_none());
+}
+
+#[test]
+fn content_index_drops_stale_hash_on_version_change() {
+    let db = test_db();
+    let h_old = [55u8; 32];
+    let h_new = [66u8; 32];
+    // First versioned with h_old.
+    db.upsert_file(&file_with_versions("d.txt", 4, &[(h_old, true)]))
+        .unwrap();
+    // Replace with a record whose only version is h_new (h_old no longer present).
+    db.upsert_file(&file_with_versions("d.txt", 4, &[(h_new, true)]))
+        .unwrap();
+
+    assert!(
+        !db.is_content_backed_up(&h_old).unwrap(),
+        "stale hash key must be removed when the version set changes"
+    );
+    assert!(db.is_content_backed_up(&h_new).unwrap());
+}
+
+#[test]
+fn content_index_backfilled_at_open_for_legacy_db() {
+    let tmpfile = tempfile::NamedTempFile::new().unwrap();
+    let tmp_path = tmpfile.into_temp_path();
+    let h = [77u8; 32];
+
+    {
+        let db = Db::open(&tmp_path).unwrap();
+        db.upsert_file(&file_with_versions("e.txt", 5, &[(h, true)]))
+            .unwrap();
+        // Simulate a database created before B-1: FILES populated, index empty.
+        use redb::ReadableTable;
+        let tx = db.inner.begin_write().unwrap();
+        {
+            let mut idx = tx.open_table(super::CONTENT_INDEX).unwrap();
+            let keys: Vec<Vec<u8>> = idx
+                .iter()
+                .unwrap()
+                .map(|i| i.unwrap().0.value().to_vec())
+                .collect();
+            for k in keys {
+                idx.remove(k.as_slice()).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    // Reopen → open() must backfill the index from FILES.
+    let db2 = Db::open(&tmp_path).unwrap();
+    assert!(
+        db2.is_content_backed_up(&h).unwrap(),
+        "content index must be backfilled at open for a pre-B1 database"
+    );
 }
 
 // ============================================================
