@@ -18,7 +18,8 @@ use std::io::Cursor;
 
 use crate::cluster::StoredClusterState;
 use crate::types::{
-    FileRecord, PeerRecord, SourceBlockRecord, SymbolPlacement, Timestamp, to_cbor_bytes,
+    DeviceId, FileId, FileRecord, PeerRecord, SourceBlockId, SourceBlockRecord, SymbolPlacement,
+    Timestamp, to_cbor_bytes,
 };
 
 // ============================================================
@@ -385,6 +386,236 @@ pub fn unpack_system_state(
     );
 
     Ok(state)
+}
+
+// ============================================================
+// Incremental diffs (base + diff blocks)
+// ============================================================
+
+/// One delta operation against a SystemState snapshot.
+///
+/// `Upserted` covers both add and modify (keyed insert-or-replace); `Deleted` removes by key.
+/// Diffs are applied in order on top of a base snapshot to reconstruct a later state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum DiffOp {
+    FileUpserted(FileRecord),
+    FileDeleted(FileId),
+    SourceBlockUpserted(SourceBlockRecord),
+    SourceBlockDeleted(SourceBlockId),
+    PlacementUpserted(SymbolPlacement),
+    PlacementDeleted {
+        source_block_id: SourceBlockId,
+        holder_id: DeviceId,
+    },
+    PeerUpserted(PeerRecord),
+    PeerDeleted(DeviceId),
+    PosWeeklySet {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    PosWeeklyDeleted {
+        key: Vec<u8>,
+    },
+    /// Cluster state is a singleton; carries the full new value (or None).
+    ClusterStateSet(Option<StoredClusterState>),
+}
+
+/// Compute the ordered set of diff ops that transforms `old` into `new`.
+///
+/// Change detection compares CBOR-encoded records (the records do not derive `PartialEq`).
+/// Output ops are: every key new-or-changed in `new` → `*Upserted`; every key removed → `*Deleted`.
+pub fn diff_states(old: &SystemState, new: &SystemState) -> Vec<DiffOp> {
+    use std::collections::HashMap;
+    let mut ops = Vec::new();
+
+    // ── files (key = FileId) ──
+    let old_files: HashMap<u64, &FileRecord> = old.files.iter().map(|f| (f.file_id.0, f)).collect();
+    let new_files: HashMap<u64, &FileRecord> = new.files.iter().map(|f| (f.file_id.0, f)).collect();
+    for f in &new.files {
+        match old_files.get(&f.file_id.0) {
+            Some(o) if to_cbor_bytes(*o) == to_cbor_bytes(f) => {}
+            _ => ops.push(DiffOp::FileUpserted(f.clone())),
+        }
+    }
+    for f in &old.files {
+        if !new_files.contains_key(&f.file_id.0) {
+            ops.push(DiffOp::FileDeleted(f.file_id));
+        }
+    }
+
+    // ── source_blocks (key = SourceBlockId) ──
+    let old_sb: HashMap<[u8; 32], &SourceBlockRecord> =
+        old.source_blocks.iter().map(|s| (s.block_id.0, s)).collect();
+    let new_sb: HashMap<[u8; 32], &SourceBlockRecord> =
+        new.source_blocks.iter().map(|s| (s.block_id.0, s)).collect();
+    for s in &new.source_blocks {
+        match old_sb.get(&s.block_id.0) {
+            Some(o) if to_cbor_bytes(*o) == to_cbor_bytes(s) => {}
+            _ => ops.push(DiffOp::SourceBlockUpserted(s.clone())),
+        }
+    }
+    for s in &old.source_blocks {
+        if !new_sb.contains_key(&s.block_id.0) {
+            ops.push(DiffOp::SourceBlockDeleted(s.block_id));
+        }
+    }
+
+    // ── placements (key = (SourceBlockId, DeviceId)) ──
+    let old_pl: HashMap<([u8; 32], [u8; 32]), &SymbolPlacement> = old
+        .symbol_placements
+        .iter()
+        .map(|p| ((p.source_block_id.0, p.holder_id.0), p))
+        .collect();
+    let new_pl: HashMap<([u8; 32], [u8; 32]), &SymbolPlacement> = new
+        .symbol_placements
+        .iter()
+        .map(|p| ((p.source_block_id.0, p.holder_id.0), p))
+        .collect();
+    for p in &new.symbol_placements {
+        match old_pl.get(&(p.source_block_id.0, p.holder_id.0)) {
+            Some(o) if to_cbor_bytes(*o) == to_cbor_bytes(p) => {}
+            _ => ops.push(DiffOp::PlacementUpserted(p.clone())),
+        }
+    }
+    for p in &old.symbol_placements {
+        if !new_pl.contains_key(&(p.source_block_id.0, p.holder_id.0)) {
+            ops.push(DiffOp::PlacementDeleted {
+                source_block_id: p.source_block_id,
+                holder_id: p.holder_id,
+            });
+        }
+    }
+
+    // ── peers (key = DeviceId) ──
+    let old_peers: HashMap<[u8; 32], &PeerRecord> =
+        old.peers.iter().map(|p| (p.device_id.0, p)).collect();
+    let new_peers: HashMap<[u8; 32], &PeerRecord> =
+        new.peers.iter().map(|p| (p.device_id.0, p)).collect();
+    for p in &new.peers {
+        match old_peers.get(&p.device_id.0) {
+            Some(o) if to_cbor_bytes(*o) == to_cbor_bytes(p) => {}
+            _ => ops.push(DiffOp::PeerUpserted(p.clone())),
+        }
+    }
+    for p in &old.peers {
+        if !new_peers.contains_key(&p.device_id.0) {
+            ops.push(DiffOp::PeerDeleted(p.device_id));
+        }
+    }
+
+    // ── pos_weekly (key = raw key bytes) ──
+    let old_pw: HashMap<&[u8], &[u8]> = old
+        .pos_weekly
+        .iter()
+        .map(|e| (e.key.as_slice(), e.value.as_slice()))
+        .collect();
+    let new_pw: HashMap<&[u8], &[u8]> = new
+        .pos_weekly
+        .iter()
+        .map(|e| (e.key.as_slice(), e.value.as_slice()))
+        .collect();
+    for e in &new.pos_weekly {
+        match old_pw.get(e.key.as_slice()) {
+            Some(v) if *v == e.value.as_slice() => {}
+            _ => ops.push(DiffOp::PosWeeklySet {
+                key: e.key.clone(),
+                value: e.value.clone(),
+            }),
+        }
+    }
+    for e in &old.pos_weekly {
+        if !new_pw.contains_key(e.key.as_slice()) {
+            ops.push(DiffOp::PosWeeklyDeleted { key: e.key.clone() });
+        }
+    }
+
+    // ── cluster_state (singleton) ──
+    if to_cbor_bytes(&old.cluster_state) != to_cbor_bytes(&new.cluster_state) {
+        ops.push(DiffOp::ClusterStateSet(new.cluster_state.clone()));
+    }
+
+    ops
+}
+
+/// Reconstruct a SystemState by applying ordered diff batches on top of `base`.
+///
+/// Each batch is applied in sequence; within a batch, ops apply in order.
+/// `version` and `created_at` are carried from `base` (the latest diff's logical
+/// timestamp is not tracked here; the self-pointer carries freshness via generation).
+pub fn apply_diffs(base: SystemState, diffs: &[Vec<DiffOp>]) -> SystemState {
+    use std::collections::HashMap;
+
+    let mut files: HashMap<u64, FileRecord> =
+        base.files.into_iter().map(|f| (f.file_id.0, f)).collect();
+    let mut blocks: HashMap<[u8; 32], SourceBlockRecord> =
+        base.source_blocks.into_iter().map(|s| (s.block_id.0, s)).collect();
+    let mut placements: HashMap<([u8; 32], [u8; 32]), SymbolPlacement> = base
+        .symbol_placements
+        .into_iter()
+        .map(|p| ((p.source_block_id.0, p.holder_id.0), p))
+        .collect();
+    let mut peers: HashMap<[u8; 32], PeerRecord> =
+        base.peers.into_iter().map(|p| (p.device_id.0, p)).collect();
+    let mut pos_weekly: HashMap<Vec<u8>, Vec<u8>> =
+        base.pos_weekly.into_iter().map(|e| (e.key, e.value)).collect();
+    let mut cluster_state = base.cluster_state;
+
+    for batch in diffs {
+        for op in batch {
+            match op {
+                DiffOp::FileUpserted(f) => {
+                    files.insert(f.file_id.0, f.clone());
+                }
+                DiffOp::FileDeleted(id) => {
+                    files.remove(&id.0);
+                }
+                DiffOp::SourceBlockUpserted(s) => {
+                    blocks.insert(s.block_id.0, s.clone());
+                }
+                DiffOp::SourceBlockDeleted(id) => {
+                    blocks.remove(&id.0);
+                }
+                DiffOp::PlacementUpserted(p) => {
+                    placements.insert((p.source_block_id.0, p.holder_id.0), p.clone());
+                }
+                DiffOp::PlacementDeleted {
+                    source_block_id,
+                    holder_id,
+                } => {
+                    placements.remove(&(source_block_id.0, holder_id.0));
+                }
+                DiffOp::PeerUpserted(p) => {
+                    peers.insert(p.device_id.0, p.clone());
+                }
+                DiffOp::PeerDeleted(id) => {
+                    peers.remove(&id.0);
+                }
+                DiffOp::PosWeeklySet { key, value } => {
+                    pos_weekly.insert(key.clone(), value.clone());
+                }
+                DiffOp::PosWeeklyDeleted { key } => {
+                    pos_weekly.remove(key);
+                }
+                DiffOp::ClusterStateSet(cs) => {
+                    cluster_state = cs.clone();
+                }
+            }
+        }
+    }
+
+    SystemState {
+        version: base.version,
+        created_at: base.created_at,
+        files: files.into_values().collect(),
+        source_blocks: blocks.into_values().collect(),
+        symbol_placements: placements.into_values().collect(),
+        peers: peers.into_values().collect(),
+        pos_weekly: pos_weekly
+            .into_iter()
+            .map(|(key, value)| PosWeeklyEntry { key, value })
+            .collect(),
+        cluster_state,
+    }
 }
 
 #[cfg(test)]

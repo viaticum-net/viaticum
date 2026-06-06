@@ -364,3 +364,143 @@ fn multiple_pos_weekly_entries_roundtrip() {
     assert_eq!(b1.challenged, 5);
     assert_eq!(b1.passed, 5);
 }
+
+// ============================================================
+// Diff: diff_states / apply_diffs
+// ============================================================
+
+fn base_state() -> SystemState {
+    SystemState {
+        version: SYSTEM_STATE_VERSION,
+        created_at: Timestamp(1000),
+        files: vec![make_file("a.txt", 1), make_file("b.txt", 2)],
+        source_blocks: vec![make_source_block(1)],
+        symbol_placements: vec![make_placement(1, DeviceId([7u8; 32]), FileId(1))],
+        peers: vec![make_peer(10)],
+        pos_weekly: vec![PosWeeklyEntry {
+            key: {
+                let mut k = vec![5u8; 32];
+                k.extend_from_slice(&7u32.to_be_bytes());
+                k
+            },
+            value: vec![1, 2, 3],
+        }],
+        cluster_state: None,
+    }
+}
+
+/// Order-independent structural equality of two SystemStates (ignores Vec ordering).
+fn assert_states_eq(a: &SystemState, b: &SystemState) {
+    use std::collections::BTreeMap;
+    let fa: BTreeMap<u64, Vec<u8>> = a.files.iter().map(|f| (f.file_id.0, to_cbor(f))).collect();
+    let fb: BTreeMap<u64, Vec<u8>> = b.files.iter().map(|f| (f.file_id.0, to_cbor(f))).collect();
+    assert_eq!(fa, fb, "files differ");
+
+    let ba: BTreeMap<[u8; 32], Vec<u8>> = a
+        .source_blocks
+        .iter()
+        .map(|s| (s.block_id.0, to_cbor(s)))
+        .collect();
+    let bb: BTreeMap<[u8; 32], Vec<u8>> = b
+        .source_blocks
+        .iter()
+        .map(|s| (s.block_id.0, to_cbor(s)))
+        .collect();
+    assert_eq!(ba, bb, "source_blocks differ");
+
+    let pa: BTreeMap<([u8; 32], [u8; 32]), Vec<u8>> = a
+        .symbol_placements
+        .iter()
+        .map(|p| ((p.source_block_id.0, p.holder_id.0), to_cbor(p)))
+        .collect();
+    let pb: BTreeMap<([u8; 32], [u8; 32]), Vec<u8>> = b
+        .symbol_placements
+        .iter()
+        .map(|p| ((p.source_block_id.0, p.holder_id.0), to_cbor(p)))
+        .collect();
+    assert_eq!(pa, pb, "placements differ");
+
+    let ra: BTreeMap<[u8; 32], Vec<u8>> =
+        a.peers.iter().map(|p| (p.device_id.0, to_cbor(p))).collect();
+    let rb: BTreeMap<[u8; 32], Vec<u8>> =
+        b.peers.iter().map(|p| (p.device_id.0, to_cbor(p))).collect();
+    assert_eq!(ra, rb, "peers differ");
+
+    let wa: BTreeMap<Vec<u8>, Vec<u8>> = a
+        .pos_weekly
+        .iter()
+        .map(|e| (e.key.clone(), e.value.clone()))
+        .collect();
+    let wb: BTreeMap<Vec<u8>, Vec<u8>> = b
+        .pos_weekly
+        .iter()
+        .map(|e| (e.key.clone(), e.value.clone()))
+        .collect();
+    assert_eq!(wa, wb, "pos_weekly differ");
+
+    assert_eq!(
+        to_cbor(&a.cluster_state),
+        to_cbor(&b.cluster_state),
+        "cluster_state differ"
+    );
+}
+
+fn to_cbor<T: serde::Serialize>(v: &T) -> Vec<u8> {
+    crate::types::to_cbor_bytes(v)
+}
+
+#[test]
+fn diff_then_apply_reconstructs_target() {
+    let base = base_state();
+    let mut target = base.clone();
+    // modify file 1, delete file 2, add file 3
+    target.files.retain(|f| f.file_id != FileId(2));
+    target.files.push(make_file("c.txt", 3));
+    if let Some(f) = target.files.iter_mut().find(|f| f.file_id == FileId(1)) {
+        f.importance = 0.9;
+    }
+    // replace the placement (delete old, add new with different holder)
+    target.symbol_placements = vec![make_placement(1, DeviceId([8u8; 32]), FileId(1))];
+    // add a peer
+    target.peers.push(make_peer(20));
+    // add a new source block
+    target.source_blocks.push(make_source_block(2));
+    // change a pos_weekly value
+    target.pos_weekly[0].value = vec![9, 9, 9];
+
+    let diff = diff_states(&base, &target);
+    assert!(!diff.is_empty(), "diff of changed states must be non-empty");
+
+    let result = apply_diffs(base.clone(), std::slice::from_ref(&diff));
+    assert_states_eq(&result, &target);
+}
+
+#[test]
+fn diff_of_identical_states_is_empty() {
+    let base = base_state();
+    assert!(diff_states(&base, &base).is_empty());
+}
+
+#[test]
+fn apply_empty_diff_list_is_identity() {
+    let base = base_state();
+    let result = apply_diffs(base.clone(), &[]);
+    assert_states_eq(&result, &base);
+}
+
+#[test]
+fn ordered_diffs_apply_in_sequence() {
+    let base = base_state();
+    let mut s1 = base.clone();
+    s1.files.push(make_file("new.txt", 99));
+    let d1 = diff_states(&base, &s1);
+
+    let mut s2 = s1.clone();
+    if let Some(f) = s2.files.iter_mut().find(|f| f.file_id == FileId(99)) {
+        f.importance = 0.123;
+    }
+    let d2 = diff_states(&s1, &s2);
+
+    let result = apply_diffs(base.clone(), &[d1, d2]);
+    assert_states_eq(&result, &s2);
+}
