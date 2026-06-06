@@ -531,6 +531,46 @@ fn total_holding_bytes_rebuilt_after_reopen() {
     );
 }
 
+#[test]
+fn holdings_migrated_from_block_first_to_owner_first_key() {
+    // S-4: a database written with the old block‖owner key layout must be
+    // re-keyed to owner‖block at open(), so lookups and the owner range-scan work.
+    let tmpfile = tempfile::NamedTempFile::new().unwrap();
+    let tmp_path = tmpfile.into_temp_path();
+    let owner = IdentityPub([7u8; 32]);
+    let h = make_holding(1, owner, HoldingStatus::Active, 4096);
+
+    {
+        let db = Db::open(&tmp_path).unwrap();
+        // Write with the OLD key order (block_id ++ owner) and clear the migration
+        // flag, simulating a pre-S4 database.
+        let mut old_key = [0u8; 64];
+        old_key[..32].copy_from_slice(&block_id(1).0);
+        old_key[32..].copy_from_slice(&owner.0);
+        let tx = db.inner.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(super::HOLDINGS).unwrap();
+            t.insert(&old_key, crate::types::to_cbor_bytes(&h).as_slice())
+                .unwrap();
+            let mut meta = tx.open_table(super::META).unwrap();
+            meta.remove(super::META_KEY_HOLDINGS_OWNER_KEYED).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    // Reopen → migration re-keys to owner‖block.
+    let db2 = Db::open(&tmp_path).unwrap();
+    let got = db2.get_holding(&block_id(1), &owner).unwrap();
+    assert!(got.is_some(), "holding must be found after key migration");
+    assert_eq!(got.unwrap().total_bytes, 4096);
+    assert_eq!(
+        db2.list_holdings_for_owner(&owner).unwrap().len(),
+        1,
+        "owner range-scan must find the migrated holding"
+    );
+    assert_eq!(db2.total_holding_bytes().unwrap(), 4096);
+}
+
 // ============================================================
 // 12. holding_cooldown_expired
 // ============================================================

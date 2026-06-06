@@ -79,6 +79,9 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// Meta key for persisted next_file_id.
 const META_KEY_NEXT_FILE_ID: &str = "next_file_id";
 
+/// Meta flag: HOLDINGS keys are owner-first (block‖owner → owner‖block migration done, S-4).
+const META_KEY_HOLDINGS_OWNER_KEYED: &str = "holdings_owner_keyed_v1";
+
 /// TTL for stored system state blobs: 365 days.
 pub const SYSTEM_STATE_TTL_SECS: u64 = 365 * 24 * 3600;
 
@@ -132,10 +135,13 @@ fn content_index_key(content_hash: &[u8; 32], path: &str) -> Vec<u8> {
     key
 }
 
+/// HOLDINGS key: owner IdentityPub (32) ++ block_id (32). Owner-first so all of
+/// one owner's holdings form a contiguous range (S-4: `list_holdings_for_owner`
+/// is a range scan, not a full-table filter).
 fn holding_key(block_id: &SourceBlockId, owner: &IdentityPub) -> [u8; 64] {
     let mut key = [0u8; 64];
-    key[..32].copy_from_slice(&block_id.0);
-    key[32..64].copy_from_slice(&owner.0);
+    key[..32].copy_from_slice(&owner.0);
+    key[32..64].copy_from_slice(&block_id.0);
     key
 }
 
@@ -388,7 +394,56 @@ impl Db {
             hot: Arc::new(RwLock::new(hot)),
         };
         db.backfill_content_index()?;
+        db.migrate_holdings_key_order()?;
         Ok(db)
+    }
+
+    /// One-time migration (S-4): re-key HOLDINGS from the old block‖owner layout to
+    /// owner‖block. The new key is reconstructed from each record's own fields, so a
+    /// record keyed in the old order is moved to its owner-first key. Gated by a META
+    /// flag so it runs at most once; a no-op on fresh and already-migrated databases.
+    fn migrate_holdings_key_order(&self) -> Result<(), DbError> {
+        use redb::ReadableTable;
+        {
+            let rtx = self.inner.begin_read()?;
+            let meta = rtx.open_table(META)?;
+            if meta.get(META_KEY_HOLDINGS_OWNER_KEYED)?.is_some() {
+                return Ok(());
+            }
+        }
+
+        // Collect (old_key, new_key, value) for every holding.
+        let mut moves: Vec<([u8; 64], [u8; 64], Vec<u8>)> = Vec::new();
+        {
+            let rtx = self.inner.begin_read()?;
+            let table = rtx.open_table(HOLDINGS)?;
+            for item in table.iter()? {
+                let (k, v) = item?;
+                let old_key = *k.value();
+                let value = v.value().to_vec();
+                let record: HoldingRecord = from_cbor_bytes(&value)?;
+                let new_key = holding_key(&record.source_block_id, &record.owner_id);
+                if old_key != new_key {
+                    moves.push((old_key, new_key, value));
+                }
+            }
+        }
+
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(HOLDINGS)?;
+            for (old_key, new_key, value) in &moves {
+                table.remove(old_key)?;
+                table.insert(new_key, value.as_slice())?;
+            }
+            let mut meta = tx.open_table(META)?;
+            meta.insert(
+                META_KEY_HOLDINGS_OWNER_KEYED,
+                to_cbor_bytes(&true).as_slice(),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Rebuild the content_hash index (B-1) from FILES if it is empty but files
@@ -1319,12 +1374,16 @@ impl Db {
         let tx = self.inner.begin_read()?;
         let table = tx.open_table(HOLDINGS)?;
         let mut records = Vec::new();
-        for item in table.iter()? {
+        // Keys are [owner(32) || block_id(32)] (S-4). Range over this owner's prefix.
+        let mut lo = [0u8; 64];
+        let mut hi = [0u8; 64];
+        lo[..32].copy_from_slice(&owner_id.0);
+        hi[..32].copy_from_slice(&owner_id.0);
+        hi[32..].fill(0xFF);
+        for item in table.range::<&[u8; 64]>(&lo..=&hi)? {
             let (_, v) = item?;
             let record: HoldingRecord = from_cbor_bytes(v.value())?;
-            if record.owner_id == *owner_id {
-                records.push(record);
-            }
+            records.push(record);
         }
         Ok(records)
     }
