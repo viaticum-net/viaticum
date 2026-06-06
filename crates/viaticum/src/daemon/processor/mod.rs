@@ -925,15 +925,14 @@ pub(crate) fn recompute_and_persist_block_cached_fields(db: &Db, block_id: &Sour
         }
     };
 
-    // 5. Persist. Preserve last_attempted_at and last_pool_signature.
+    // 5. Persist the cached reliability fields. Worker cooldown is RAM-only (B-4),
+    // so it is untouched by this recompute.
     if let Err(e) = db.update_block_cached_fields(
         block_id,
         block.importance,
         new_current_alive,
         new_reliability,
         block.target_reliability,
-        block.last_attempted_at,
-        block.last_pool_signature,
     ) {
         error!(
             block_id = %block_id,

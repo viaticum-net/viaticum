@@ -290,8 +290,6 @@ fn db_stores_and_retrieves_full_records() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
     db.upsert_source_block(&sbr).expect("upsert_source_block");
 
@@ -577,8 +575,6 @@ fn full_owner_flow() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
     db.upsert_source_block(&sbr).expect("upsert_source_block");
 

@@ -2266,8 +2266,6 @@ fn make_source_block(block_id: SourceBlockId) -> SourceBlockRecord {
         current_alive: 0,         // will be updated by handler
         current_reliability: 0.0, // will be updated by handler
         target_reliability: 0.9,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     }
 }
 
@@ -4474,12 +4472,7 @@ async fn handle_pos_hash_nack_unknown_challenge_id_silently_dropped() {
 // ─── W11a: recompute_and_persist_block_cached_fields unit tests ───────────────
 
 /// Helper to create a minimal SourceBlockRecord for cached-fields tests.
-fn make_source_block_for_hook(
-    block_id: SourceBlockId,
-    importance: f64,
-    last_attempted_at: Option<Timestamp>,
-    last_pool_signature: u64,
-) -> SourceBlockRecord {
+fn make_source_block_for_hook(block_id: SourceBlockId, importance: f64) -> SourceBlockRecord {
     SourceBlockRecord {
         block_id,
         k: 5,
@@ -4495,8 +4488,6 @@ fn make_source_block_for_hook(
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.99,
-        last_attempted_at,
-        last_pool_signature,
     }
 }
 
@@ -4546,7 +4537,7 @@ fn recompute_and_persist_when_two_alive_one_uncertain_counts_three() {
     let holder_b = make_device_id(0xA2);
     let holder_c = make_device_id(0xA3);
 
-    let block = make_source_block_for_hook(block_id, 0.5, None, 0);
+    let block = make_source_block_for_hook(block_id, 0.5);
     db.upsert_source_block(&block).unwrap();
 
     // Two Alive + one Uncertain = 3 expected current_alive.
@@ -4595,7 +4586,7 @@ fn recompute_and_persist_when_all_lost_sets_current_alive_zero_and_reliability_z
     let holder_b = make_device_id(0xB2);
     let holder_c = make_device_id(0xB3);
 
-    let block = make_source_block_for_hook(block_id, 0.5, None, 0);
+    let block = make_source_block_for_hook(block_id, 0.5);
     db.upsert_source_block(&block).unwrap();
 
     db.upsert_placement(&make_hook_placement(
@@ -4653,8 +4644,9 @@ fn recompute_and_persist_preserves_last_attempted_at_and_pool_signature() {
 
     let sentinel_time = Timestamp(1_700_000_042);
     let sentinel_sig = 0xDEADBEEF_12345678u64;
-    let block = make_source_block_for_hook(block_id, 0.5, Some(sentinel_time), sentinel_sig);
+    let block = make_source_block_for_hook(block_id, 0.5);
     db.upsert_source_block(&block).unwrap();
+    db.set_block_cooldown(&block_id, Some(sentinel_time), sentinel_sig);
 
     db.upsert_placement(&make_hook_placement(
         block_id,
@@ -4666,14 +4658,14 @@ fn recompute_and_persist_preserves_last_attempted_at_and_pool_signature() {
 
     super::recompute_and_persist_block_cached_fields(&db, &block_id);
 
-    let updated = db.get_source_block(&block_id).unwrap().unwrap();
+    let cooldown = db.block_cooldown(&block_id);
     assert_eq!(
-        updated.last_attempted_at,
+        cooldown.last_attempted_at,
         Some(sentinel_time),
         "last_attempted_at must be preserved unchanged"
     );
     assert_eq!(
-        updated.last_pool_signature, sentinel_sig,
+        cooldown.last_pool_signature, sentinel_sig,
         "last_pool_signature must be preserved unchanged"
     );
 }
@@ -4685,7 +4677,7 @@ fn recompute_and_persist_is_idempotent_on_double_call() {
     let holder_a = make_device_id(0xD1);
     let holder_b = make_device_id(0xD2);
 
-    let block = make_source_block_for_hook(block_id, 0.5, None, 0);
+    let block = make_source_block_for_hook(block_id, 0.5);
     db.upsert_source_block(&block).unwrap();
 
     db.upsert_placement(&make_hook_placement(
@@ -4727,12 +4719,12 @@ async fn pos_pass_on_uncertain_placement_keeps_current_alive_and_updates_status(
     let holder_id = make_device_id(0xE1);
     let block_id = make_block_id(0xE2);
 
-    let block = make_source_block_for_hook(block_id, 0.5, None, 0);
+    let block = make_source_block_for_hook(block_id, 0.5);
     db.upsert_source_block(&block).unwrap();
     db.upsert_peer(&make_hook_peer(holder_id, 0.8)).unwrap();
 
     // Set initial current_alive to 1 (Uncertain counts).
-    db.update_block_cached_fields(&block_id, 0.5, 1, 0.5, 0.99, None, 0)
+    db.update_block_cached_fields(&block_id, 0.5, 1, 0.5, 0.99)
         .unwrap();
 
     // Uncertain placement — Pass will transition to Alive.
@@ -4777,7 +4769,7 @@ async fn pos_fail_on_alive_placement_decrements_current_alive() {
     let holder_b = make_device_id(0xF2);
     let block_id = make_block_id(0xF3);
 
-    let block = make_source_block_for_hook(block_id, 0.5, None, 0);
+    let block = make_source_block_for_hook(block_id, 0.5);
     db.upsert_source_block(&block).unwrap();
     db.upsert_peer(&make_hook_peer(holder_a, 0.8)).unwrap();
     db.upsert_peer(&make_hook_peer(holder_b, 0.8)).unwrap();
@@ -4796,7 +4788,7 @@ async fn pos_fail_on_alive_placement_decrements_current_alive() {
     .unwrap();
 
     // Set initial cached fields reflecting 2 alive.
-    db.update_block_cached_fields(&block_id, 0.5, 2, 0.9, 0.99, None, 0)
+    db.update_block_cached_fields(&block_id, 0.5, 2, 0.9, 0.99)
         .unwrap();
 
     // Need pending challenge for block_id/holder_a so apply_and_persist_pos_outcome
@@ -4862,7 +4854,7 @@ async fn pos_nack_decrements_current_alive_and_updates_reliability() {
     let extra_a = make_device_id(0x8A);
     let extra_b = make_device_id(0x8B);
 
-    let block = make_source_block_for_hook(block_id, 0.5, None, 0);
+    let block = make_source_block_for_hook(block_id, 0.5);
     db.upsert_source_block(&block).unwrap();
     db.upsert_peer(&make_hook_peer(holder_device, 0.8)).unwrap();
     db.upsert_peer(&make_hook_peer(extra_a, 0.8)).unwrap();
@@ -4888,7 +4880,7 @@ async fn pos_nack_decrements_current_alive_and_updates_reliability() {
     .unwrap();
 
     // Set current_alive = 3.
-    db.update_block_cached_fields(&block_id, 0.5, 3, 0.9, 0.99, None, 0)
+    db.update_block_cached_fields(&block_id, 0.5, 3, 0.9, 0.99)
         .unwrap();
 
     // Register master→device so the processor can verify the nack signature.
@@ -4959,7 +4951,7 @@ async fn rapid_alive_to_lost_transitions_keep_current_alive_coherent() {
     let holders: Vec<DeviceId> = (0..5).map(|i| make_device_id(0x10 + i)).collect();
     let block_id = make_block_id(0x20);
 
-    let block = make_source_block_for_hook(block_id, 0.5, None, 0);
+    let block = make_source_block_for_hook(block_id, 0.5);
     db.upsert_source_block(&block).unwrap();
 
     for &h in &holders {
@@ -4967,7 +4959,7 @@ async fn rapid_alive_to_lost_transitions_keep_current_alive_coherent() {
         db.upsert_placement(&make_hook_placement(block_id, h, PlacementStatus::Alive))
             .unwrap();
     }
-    db.update_block_cached_fields(&block_id, 0.5, 5, 0.9999, 0.99, None, 0)
+    db.update_block_cached_fields(&block_id, 0.5, 5, 0.9999, 0.99)
         .unwrap();
 
     let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -5059,8 +5051,6 @@ async fn block_becomes_eligible_in_next_work_item_after_pos_fail() {
         current_alive: 2,
         current_reliability: 0.9999,
         target_reliability: 0.9,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
     db.upsert_source_block(&block).unwrap();
     db.upsert_peer(&make_hook_peer(holder_a, 0.8)).unwrap();

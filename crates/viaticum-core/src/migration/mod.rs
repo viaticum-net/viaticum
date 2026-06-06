@@ -145,15 +145,14 @@ pub fn migrate_block_records(db: &Db) -> Result<usize, MigrationError> {
             }
         };
 
-        // Write back. last_attempted_at=None, last_pool_signature=0 per BR6.
+        // Write back the cached reliability fields. Worker cooldown is RAM-only
+        // (B-4) and starts cleared, so there is nothing to migrate for it.
         if let Err(e) = db.update_block_cached_fields(
             block_id,
             importance,
             current_alive,
             current_reliability,
             computed_target,
-            None,
-            0,
         ) {
             tracing::warn!(block = %block_id, err = %e,
                 "migration: update_block_cached_fields failed, skipping");

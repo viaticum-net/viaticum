@@ -693,16 +693,14 @@ impl Processor {
                 }
             };
 
-        // Step 6: Write updated cached fields back to DB.
-        // Preserve importance, target_reliability, last_attempted_at, last_pool_signature.
+        // Step 6: Write updated cached reliability fields back to DB.
+        // Worker cooldown is RAM-only (B-4); not part of the persisted record.
         if let Err(e) = self.db.update_block_cached_fields(
             &block_id,
             block.importance,
             new_current_alive,
             new_reliability,
             block.target_reliability,
-            block.last_attempted_at,
-            block.last_pool_signature,
         ) {
             error!(
                 block_id = %block_id,

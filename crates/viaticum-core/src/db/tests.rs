@@ -58,8 +58,6 @@ fn make_source_block(seed: u8, status: SourceBlockStatus) -> SourceBlockRecord {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     }
 }
 
@@ -786,8 +784,6 @@ fn committed_bytes_sums_active_blocks() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
 
     // Block B: Active, encrypted_size=None → fallback to k*t = 10*100 = 1000
@@ -806,8 +802,6 @@ fn committed_bytes_sums_active_blocks() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
 
     // Block C: Deleted, encrypted_size=Some(500) → must NOT be counted
@@ -826,8 +820,6 @@ fn committed_bytes_sums_active_blocks() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
 
     db.upsert_source_block(&block_a).unwrap();
@@ -866,13 +858,11 @@ fn update_block_cached_fields_persists_to_db() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
     db.upsert_source_block(&initial).unwrap();
 
     // Call update with non-zero values.
-    db.update_block_cached_fields(&bid, 0.65, 3, 0.9996, 0.9996, Some(Timestamp(1000)), 42)
+    db.update_block_cached_fields(&bid, 0.65, 3, 0.9996, 0.9996)
         .unwrap();
 
     // Read back and assert.
@@ -893,9 +883,6 @@ fn update_block_cached_fields_persists_to_db() {
         "target_reliability must be ~0.9996, got {}",
         record.target_reliability
     );
-    assert_eq!(record.last_attempted_at, Some(Timestamp(1000)));
-    assert_eq!(record.last_pool_signature, 42);
-
     // Existing fields must be unchanged.
     assert_eq!(record.k, 5);
     assert_eq!(record.t, 65535);
@@ -909,7 +896,7 @@ fn update_block_cached_fields_returns_not_found_for_missing_block() {
     let db = test_db();
     let missing = block_id(99);
 
-    let result = db.update_block_cached_fields(&missing, 0.5, 0, 0.0, 0.0, None, 0);
+    let result = db.update_block_cached_fields(&missing, 0.5, 0, 0.0, 0.0);
     assert!(
         result.is_err(),
         "must return Err for a block_id not in the DB"
@@ -1483,8 +1470,6 @@ fn refresh_peer_storage_bytes_updates_trust_s() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
     db.upsert_source_block(&sb_a).unwrap();
 
@@ -1564,8 +1549,6 @@ fn refresh_peer_storage_bytes_neutral_when_we_store_nothing() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
     db.upsert_source_block(&sb).unwrap();
     let p = SymbolPlacement {
@@ -1622,8 +1605,6 @@ fn refresh_peer_storage_bytes_only_alive_and_active_count() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
     db.upsert_source_block(&sb).unwrap();
 
@@ -2672,8 +2653,6 @@ fn make_block_with(
     n: Option<u32>,
     current_reliability: f64,
     target_reliability: f64,
-    last_attempted_at: Option<Timestamp>,
-    last_pool_sig: u64,
 ) -> SourceBlockRecord {
     SourceBlockRecord {
         block_id: SourceBlockId([seed; 32]),
@@ -2690,9 +2669,28 @@ fn make_block_with(
         current_alive,
         current_reliability,
         target_reliability,
-        last_attempted_at,
-        last_pool_signature: last_pool_sig,
     }
+}
+
+#[test]
+fn block_cooldown_does_not_survive_reopen() {
+    // B-4: worker cooldown is RAM-only. A restart clears it, so every block is
+    // re-attempted after a restart — the intended behavior.
+    let tmpfile = tempfile::NamedTempFile::new().unwrap();
+    let tmp_path = tmpfile.into_temp_path();
+    let bid = block_id(1);
+    {
+        let db = Db::open(&tmp_path).unwrap();
+        db.set_block_cooldown(&bid, Some(Timestamp(5000)), 0xABCD);
+        assert_eq!(db.block_cooldown(&bid).last_pool_signature, 0xABCD);
+    }
+    let db2 = Db::open(&tmp_path).unwrap();
+    let cd = db2.block_cooldown(&bid);
+    assert_eq!(
+        cd.last_attempted_at, None,
+        "cooldown must not survive reopen (RAM-only)"
+    );
+    assert_eq!(cd.last_pool_signature, 0);
 }
 
 #[test]
@@ -2714,17 +2712,7 @@ fn next_work_item_returns_none_when_all_blocks_at_target_reliability() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(9999);
 
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Active,
-        0.8,
-        5,
-        Some(10),
-        0.999,
-        0.999,
-        None,
-        0,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.999, 0.999);
     let b = make_block_with(
         2,
         SourceBlockStatus::Active,
@@ -2733,20 +2721,8 @@ fn next_work_item_returns_none_when_all_blocks_at_target_reliability() {
         Some(10),
         0.9999,
         0.9996,
-        None,
-        0,
     );
-    let c = make_block_with(
-        3,
-        SourceBlockStatus::Active,
-        0.8,
-        5,
-        Some(10),
-        1.0,
-        0.9,
-        None,
-        0,
-    );
+    let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 5, Some(10), 1.0, 0.9);
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
     db.upsert_source_block(&c).unwrap();
@@ -2762,28 +2738,8 @@ fn next_work_item_returns_none_when_no_active_blocks_need_work() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(9999);
 
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Deleting,
-        0.8,
-        0,
-        Some(10),
-        0.5,
-        0.999,
-        None,
-        0,
-    );
-    let b = make_block_with(
-        2,
-        SourceBlockStatus::Stale,
-        0.8,
-        0,
-        Some(10),
-        0.3,
-        0.999,
-        None,
-        0,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Deleting, 0.8, 0, Some(10), 0.5, 0.999);
+    let b = make_block_with(2, SourceBlockStatus::Stale, 0.8, 0, Some(10), 0.3, 0.999);
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
 
@@ -2799,41 +2755,11 @@ fn next_work_item_picks_highest_priority() {
     let now = Timestamp(9999);
 
     // priority(A) = 0.5 * (1 + 1.5 * 12/14) ≈ 1.143
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Active,
-        0.5,
-        12,
-        Some(14),
-        0.5,
-        0.999,
-        None,
-        0,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.5, 12, Some(14), 0.5, 0.999);
     // priority(B) = 1.0 * (1 + 0) = 1.0
-    let b = make_block_with(
-        2,
-        SourceBlockStatus::Active,
-        1.0,
-        0,
-        Some(12),
-        0.0,
-        0.999,
-        None,
-        0,
-    );
+    let b = make_block_with(2, SourceBlockStatus::Active, 1.0, 0, Some(12), 0.0, 0.999);
     // priority(C) = 0.8 * (1 + 1.5 * 0.5) = 0.8 * 1.75 = 1.4
-    let c = make_block_with(
-        3,
-        SourceBlockStatus::Active,
-        0.8,
-        6,
-        Some(12),
-        0.4,
-        0.999,
-        None,
-        0,
-    );
+    let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 6, Some(12), 0.4, 0.999);
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
     db.upsert_source_block(&c).unwrap();
@@ -2855,29 +2781,9 @@ fn next_work_item_uses_coef_from_param() {
     let now = Timestamp(9999);
 
     // priority(A, coef=0) = 0.5, priority(A, coef=5) = 0.5 * (1 + 5*0.9) = 0.5 * 5.5 = 2.75
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Active,
-        0.5,
-        9,
-        Some(10),
-        0.4,
-        0.999,
-        None,
-        0,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.5, 9, Some(10), 0.4, 0.999);
     // priority(B, coef=0) = 0.6, priority(B, coef=5) = 0.6
-    let b = make_block_with(
-        2,
-        SourceBlockStatus::Active,
-        0.6,
-        0,
-        Some(10),
-        0.3,
-        0.999,
-        None,
-        0,
-    );
+    let b = make_block_with(2, SourceBlockStatus::Active, 0.6, 0, Some(10), 0.3, 0.999);
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
 
@@ -2907,42 +2813,15 @@ fn next_work_item_tiebreaks_by_last_attempted_at_ascending() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(99999);
 
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Active,
-        0.8,
-        5,
-        Some(10),
-        0.4,
-        0.999,
-        Some(Timestamp(1000)),
-        0,
-    );
-    let b = make_block_with(
-        2,
-        SourceBlockStatus::Active,
-        0.8,
-        5,
-        Some(10),
-        0.4,
-        0.999,
-        Some(Timestamp(500)),
-        0,
-    );
-    let c = make_block_with(
-        3,
-        SourceBlockStatus::Active,
-        0.8,
-        5,
-        Some(10),
-        0.4,
-        0.999,
-        Some(Timestamp(2000)),
-        0,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999);
+    let b = make_block_with(2, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999);
+    let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999);
     db.upsert_source_block(&a).unwrap();
+    db.set_block_cooldown(&a.block_id, Some(Timestamp(1000)), 0);
     db.upsert_source_block(&b).unwrap();
+    db.set_block_cooldown(&b.block_id, Some(Timestamp(500)), 0);
     db.upsert_source_block(&c).unwrap();
+    db.set_block_cooldown(&c.block_id, Some(Timestamp(2000)), 0);
 
     let result = db
         .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
@@ -2960,29 +2839,10 @@ fn next_work_item_never_attempted_beats_recently_attempted() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(99999);
 
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Active,
-        0.7,
-        3,
-        Some(10),
-        0.3,
-        0.999,
-        Some(Timestamp(0)),
-        0,
-    );
-    let b = make_block_with(
-        2,
-        SourceBlockStatus::Active,
-        0.7,
-        3,
-        Some(10),
-        0.3,
-        0.999,
-        None,
-        0,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.7, 3, Some(10), 0.3, 0.999);
+    let b = make_block_with(2, SourceBlockStatus::Active, 0.7, 3, Some(10), 0.3, 0.999);
     db.upsert_source_block(&a).unwrap();
+    db.set_block_cooldown(&a.block_id, Some(Timestamp(0)), 0);
     db.upsert_source_block(&b).unwrap();
 
     let result = db
@@ -3010,8 +2870,6 @@ fn next_work_item_deterministic_tiebreak_by_block_id() {
         Some(10),
         0.4,
         0.999,
-        None,
-        0,
     );
     let b = make_block_with(
         0x00,
@@ -3021,8 +2879,6 @@ fn next_work_item_deterministic_tiebreak_by_block_id() {
         Some(10),
         0.4,
         0.999,
-        None,
-        0,
     );
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
@@ -3051,28 +2907,8 @@ fn next_work_item_excludes_deleting_blocks() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(9999);
 
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Active,
-        0.5,
-        0,
-        Some(10),
-        0.0,
-        0.999,
-        None,
-        0,
-    );
-    let b = make_block_with(
-        2,
-        SourceBlockStatus::Deleting,
-        1.0,
-        0,
-        Some(10),
-        0.0,
-        0.999,
-        None,
-        0,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.5, 0, Some(10), 0.0, 0.999);
+    let b = make_block_with(2, SourceBlockStatus::Deleting, 1.0, 0, Some(10), 0.0, 0.999);
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
 
@@ -3092,18 +2928,9 @@ fn next_work_item_excludes_blocks_in_cooldown() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(1000);
 
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Active,
-        0.9,
-        0,
-        Some(10),
-        0.0,
-        0.999,
-        Some(Timestamp(990)),
-        0xABCD,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999);
     db.upsert_source_block(&a).unwrap();
+    db.set_block_cooldown(&a.block_id, Some(Timestamp(990)), 0xABCD);
 
     // Elapsed: 10s < 30s cooldown, same pool sig → in cooldown.
     let result = db
@@ -3116,18 +2943,9 @@ fn next_work_item_excludes_blocks_in_cooldown() {
 fn next_work_item_includes_block_after_cooldown_expires() {
     let db = Db::open_in_memory().unwrap();
 
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Active,
-        0.9,
-        0,
-        Some(10),
-        0.0,
-        0.999,
-        Some(Timestamp(1000)),
-        0xABCD,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999);
     db.upsert_source_block(&a).unwrap();
+    db.set_block_cooldown(&a.block_id, Some(Timestamp(1000)), 0xABCD);
 
     // 25s < 30s → still in cooldown.
     let result_during = db
@@ -3157,18 +2975,9 @@ fn next_work_item_includes_block_after_cooldown_expires() {
 fn next_work_item_includes_block_when_pool_signature_changes() {
     let db = Db::open_in_memory().unwrap();
 
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Active,
-        0.9,
-        0,
-        Some(10),
-        0.0,
-        0.999,
-        Some(Timestamp(1000)),
-        0xABCD,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999);
     db.upsert_source_block(&a).unwrap();
+    db.set_block_cooldown(&a.block_id, Some(Timestamp(1000)), 0xABCD);
 
     // Same pool: 10s < 30s → in cooldown.
     let result_same_pool = db
@@ -3198,18 +3007,9 @@ fn next_work_item_includes_block_when_pool_signature_changes() {
 fn next_work_item_skips_cooldown_when_current_pool_signature_zero() {
     let db = Db::open_in_memory().unwrap();
 
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Active,
-        0.9,
-        0,
-        Some(10),
-        0.0,
-        0.999,
-        Some(Timestamp(1000)),
-        0xABCD,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999);
     db.upsert_source_block(&a).unwrap();
+    db.set_block_cooldown(&a.block_id, Some(Timestamp(1000)), 0xABCD);
 
     // 10s < 30s would be in cooldown, but current_pool_sig=0 bypasses it.
     let result = db
@@ -3224,28 +3024,8 @@ fn next_work_item_excludes_blocks_with_target_reliability_zero() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(9999);
 
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Active,
-        0.9,
-        0,
-        Some(10),
-        0.0,
-        0.0,
-        None,
-        0,
-    );
-    let b = make_block_with(
-        2,
-        SourceBlockStatus::Active,
-        0.5,
-        0,
-        Some(10),
-        0.0,
-        0.999,
-        None,
-        0,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.0);
+    let b = make_block_with(2, SourceBlockStatus::Active, 0.5, 0, Some(10), 0.0, 0.999);
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
 
@@ -3265,17 +3045,7 @@ fn next_work_item_excludes_blocks_at_or_above_target() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(9999);
 
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Active,
-        0.8,
-        5,
-        Some(10),
-        0.999,
-        0.999,
-        None,
-        0,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.999, 0.999);
     let b = make_block_with(
         2,
         SourceBlockStatus::Active,
@@ -3284,20 +3054,8 @@ fn next_work_item_excludes_blocks_at_or_above_target() {
         Some(10),
         0.9999,
         0.999,
-        None,
-        0,
     );
-    let c = make_block_with(
-        3,
-        SourceBlockStatus::Active,
-        0.8,
-        5,
-        Some(10),
-        0.99,
-        0.999,
-        None,
-        0,
-    );
+    let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.99, 0.999);
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
     db.upsert_source_block(&c).unwrap();
@@ -3327,8 +3085,6 @@ fn next_work_item_deterministic_for_given_state() {
             Some(10),
             0.0,
             0.999,
-            None,
-            0,
         );
         db.upsert_source_block(&b).unwrap();
     }
@@ -3351,36 +3107,29 @@ fn next_work_item_does_not_mutate_block_records() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(9999);
 
-    let block = make_block_with(
-        1,
-        SourceBlockStatus::Active,
-        0.8,
-        3,
-        Some(10),
-        0.3,
-        0.999,
-        Some(Timestamp(500)),
-        0xABCD,
-    );
+    let block = make_block_with(1, SourceBlockStatus::Active, 0.8, 3, Some(10), 0.3, 0.999);
     db.upsert_source_block(&block).unwrap();
+    db.set_block_cooldown(&block.block_id, Some(Timestamp(500)), 0xABCD);
 
     let before = db
         .get_source_block(&SourceBlockId([1; 32]))
         .unwrap()
         .unwrap();
+    let cooldown_before = db.block_cooldown(&block.block_id);
     db.next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
         .unwrap();
     let after = db
         .get_source_block(&SourceBlockId([1; 32]))
         .unwrap()
         .unwrap();
+    let cooldown_after = db.block_cooldown(&block.block_id);
 
     assert_eq!(
-        before.last_attempted_at, after.last_attempted_at,
+        cooldown_before.last_attempted_at, cooldown_after.last_attempted_at,
         "last_attempted_at unchanged"
     );
     assert_eq!(
-        before.last_pool_signature, after.last_pool_signature,
+        cooldown_before.last_pool_signature, cooldown_after.last_pool_signature,
         "last_pool_signature unchanged"
     );
     assert_eq!(
@@ -3399,17 +3148,7 @@ fn next_work_item_handles_n_none_legacy_blocks() {
     let now = Timestamp(9999);
 
     // n=None → priority = importance = 0.7 (no completion bonus)
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Active,
-        0.7,
-        0,
-        None,
-        0.3,
-        0.999,
-        None,
-        0,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.7, 0, None, 0.3, 0.999);
     db.upsert_source_block(&a).unwrap();
 
     let result = db
@@ -3418,17 +3157,7 @@ fn next_work_item_handles_n_none_legacy_blocks() {
     assert!(result.is_some(), "Legacy block (n=None) is returned");
 
     // Add Block B with n=Some(10), current_alive=5: priority = 0.7 * 1.75 = 1.225 > 0.7
-    let b = make_block_with(
-        2,
-        SourceBlockStatus::Active,
-        0.7,
-        5,
-        Some(10),
-        0.3,
-        0.999,
-        None,
-        0,
-    );
+    let b = make_block_with(2, SourceBlockStatus::Active, 0.7, 5, Some(10), 0.3, 0.999);
     db.upsert_source_block(&b).unwrap();
 
     let result2 = db
@@ -3447,28 +3176,8 @@ fn next_work_item_with_only_non_active_blocks_returns_none() {
     let db = Db::open_in_memory().unwrap();
     let now = Timestamp(9999);
 
-    let a = make_block_with(
-        1,
-        SourceBlockStatus::Stale,
-        0.8,
-        0,
-        Some(10),
-        0.0,
-        0.999,
-        None,
-        0,
-    );
-    let b = make_block_with(
-        2,
-        SourceBlockStatus::Deleted,
-        0.8,
-        0,
-        Some(10),
-        0.0,
-        0.999,
-        None,
-        0,
-    );
+    let a = make_block_with(1, SourceBlockStatus::Stale, 0.8, 0, Some(10), 0.0, 0.999);
+    let b = make_block_with(2, SourceBlockStatus::Deleted, 0.8, 0, Some(10), 0.0, 0.999);
     db.upsert_source_block(&a).unwrap();
     db.upsert_source_block(&b).unwrap();
 

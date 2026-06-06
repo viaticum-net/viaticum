@@ -124,8 +124,6 @@ fn make_block_record(
         target_reliability,
         current_alive: 0,
         current_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     }
 }
 
@@ -286,9 +284,9 @@ async fn worker_resets_cooldowns_on_peer_authenticated() {
     let db = make_db();
     let bid = block_id(1);
     let mut record = make_block_record(bid, 1.0, 0.99);
-    record.last_pool_signature = 42; // some non-zero value
     record.current_reliability = 0.0; // below target
     db.upsert_source_block(&record).unwrap();
+    db.set_block_cooldown(&bid, None, 42); // some non-zero value
 
     let encoder =
         Arc::new(RaptorQEncoder::new()) as Arc<dyn viaticum_core::erasure::ErasureEncoder>;
@@ -306,23 +304,30 @@ async fn worker_resets_cooldowns_on_peer_authenticated() {
 
     pipeline.reset_all_cooldowns();
 
-    let updated = db.get_source_block(&bid).unwrap().unwrap();
+    let cooldown = db.block_cooldown(&bid);
     assert_eq!(
-        updated.last_pool_signature, 0,
+        cooldown.last_pool_signature, 0,
         "reset_all_cooldowns must set last_pool_signature = 0"
     );
 }
 
-// ─── reset_all_cooldowns does NOT reset blocks already at target ───────────────
+// ─── reset_all_cooldowns clears cooldowns for all blocks (including at target) ──
+// NOTE: reset_all_cooldowns previously skipped blocks already at target reliability.
+// With the RAM-cooldown refactor (B-4), it now calls clear_all_block_cooldowns()
+// unconditionally. This is harmless: next_work_item already excludes blocks at/above
+// target reliability regardless of their cooldown state.
 
 #[tokio::test]
-async fn worker_does_not_reset_cooldowns_for_completed_blocks() {
+async fn reset_all_cooldowns_clears_cooldown_even_for_completed_blocks() {
+    // B-4: reset_all_cooldowns clears the whole RAM cooldown map unconditionally.
+    // Clearing a completed (at-target) block's cooldown is harmless because
+    // next_work_item filters at-target blocks out before the cooldown check.
     let db = make_db();
     let bid = block_id(2);
     let mut record = make_block_record(bid, 1.0, 0.99);
-    record.last_pool_signature = 99;
     record.current_reliability = 0.999; // at target
     db.upsert_source_block(&record).unwrap();
+    db.set_block_cooldown(&bid, None, 99);
 
     let encoder =
         Arc::new(RaptorQEncoder::new()) as Arc<dyn viaticum_core::erasure::ErasureEncoder>;
@@ -340,10 +345,12 @@ async fn worker_does_not_reset_cooldowns_for_completed_blocks() {
 
     pipeline.reset_all_cooldowns();
 
-    let updated = db.get_source_block(&bid).unwrap().unwrap();
+    // clear_all_block_cooldowns clears ALL cooldowns unconditionally.
+    // Blocks at target are harmlessly cleared; next_work_item will still skip them.
+    let cooldown = db.block_cooldown(&bid);
     assert_eq!(
-        updated.last_pool_signature, 99,
-        "reset_all_cooldowns must NOT touch blocks at target reliability"
+        cooldown.last_pool_signature, 0,
+        "reset_all_cooldowns clears all cooldowns (including blocks at target)"
     );
 }
 
@@ -386,13 +393,12 @@ async fn worker_returns_false_when_queue_empty() {
 async fn worker_with_empty_pool_picks_block_because_sig_zero_bypasses_cooldown() {
     let db = make_db();
     let bid = block_id(3);
-    let mut record = make_block_record(bid, 1.0, 0.99);
+    let record = make_block_record(bid, 1.0, 0.99);
+    db.upsert_source_block(&record).unwrap();
     // Set last_attempted_at = now - 10s (well within 30s cooldown).
     let last_at = Timestamp(Timestamp::now().0 - 10);
-    record.last_attempted_at = Some(last_at);
     // last_pool_signature is non-zero (block was previously attempted).
-    record.last_pool_signature = 12345; // some non-zero value
-    db.upsert_source_block(&record).unwrap();
+    db.set_block_cooldown(&bid, Some(last_at), 12345); // some non-zero value
 
     // swarm=None → pool is always empty → pool_signature() of [] == 0 (sentinel).
     // pool_sig=0 bypasses the cooldown check in next_work_item (per spec Part 11).
@@ -451,9 +457,9 @@ async fn worker_applies_cooldown_when_pool_below_min_size() {
     );
 
     // After cooldown applied, last_attempted_at should be set.
-    let updated = db.get_source_block(&bid).unwrap().unwrap();
+    let cooldown = db.block_cooldown(&bid);
     assert!(
-        updated.last_attempted_at.is_some(),
+        cooldown.last_attempted_at.is_some(),
         "last_attempted_at should be set after pool_too_small"
     );
 }
@@ -740,12 +746,11 @@ fn worker_picks_highest_priority_item() {
 fn worker_includes_item_after_cooldown_expires() {
     let db = make_db();
     let bid = block_id(20);
-    let mut record = make_block_record(bid, 1.0, 0.99);
+    let record = make_block_record(bid, 1.0, 0.99);
+    db.upsert_source_block(&record).unwrap();
     // last_attempted = 60s ago, cooldown = 30s → cooldown expired.
     let old_time = Timestamp(Timestamp::now().0.saturating_sub(60));
-    record.last_attempted_at = Some(old_time);
-    record.last_pool_signature = 99999; // non-zero pool sig
-    db.upsert_source_block(&record).unwrap();
+    db.set_block_cooldown(&bid, Some(old_time), 99999); // non-zero pool sig
 
     // With current_pool_sig = 99999 and elapsed=60 > cooldown=30 → eligible.
     let item = db
@@ -763,12 +768,11 @@ fn worker_includes_item_after_cooldown_expires() {
 fn worker_includes_item_when_pool_signature_changes() {
     let db = make_db();
     let bid = block_id(21);
-    let mut record = make_block_record(bid, 1.0, 0.99);
+    let record = make_block_record(bid, 1.0, 0.99);
+    db.upsert_source_block(&record).unwrap();
     // last_attempted = 5s ago (within cooldown), pool_sig = X.
     let recent = Timestamp(Timestamp::now().0.saturating_sub(5));
-    record.last_attempted_at = Some(recent);
-    record.last_pool_signature = 11111; // X
-    db.upsert_source_block(&record).unwrap();
+    db.set_block_cooldown(&bid, Some(recent), 11111); // X
 
     // Different pool sig Y → cooldown bypassed.
     let item = db
@@ -809,14 +813,13 @@ async fn worker_skips_item_when_same_pool_sig_within_cooldown() {
     // This tests the DB-layer invariant that is the actual cooldown enforcement point.
     let db = make_db();
     let bid = block_id(40);
-    let mut record = make_block_record(bid, 1.0, 0.99);
+    let record = make_block_record(bid, 1.0, 0.99);
+    db.upsert_source_block(&record).unwrap();
 
     // Arrange: last_attempted_at = now - 5s (within 30s cooldown), pool_sig = S.
     let recent = Timestamp(Timestamp::now().0.saturating_sub(5));
-    record.last_attempted_at = Some(recent);
     let sig_s: u64 = 0xdeadbeef_cafebabe; // non-zero signature
-    record.last_pool_signature = sig_s;
-    db.upsert_source_block(&record).unwrap();
+    db.set_block_cooldown(&bid, Some(recent), sig_s);
 
     // First run with same signature S: next_work_item must return None (on cooldown).
     let item_first = db
@@ -1089,9 +1092,9 @@ async fn after_peer_authenticated_event_cooldowns_are_reset() {
 
     // Block with non-zero last_pool_signature (on "cooldown").
     let mut record = make_block_record(bid, 1.0, 0.99);
-    record.last_pool_signature = 0xfeedf00d;
     record.current_reliability = 0.0; // below target → eligible for reset
     db.upsert_source_block(&record).unwrap();
+    db.set_block_cooldown(&bid, None, 0xfeedf00d);
 
     // Create pipeline and call reset_all_cooldowns (simulates PeerAuthenticated handler).
     let encoder =
@@ -1110,9 +1113,9 @@ async fn after_peer_authenticated_event_cooldowns_are_reset() {
     pipeline.reset_all_cooldowns();
 
     // Assert: last_pool_signature reset to 0, making block eligible in next_work_item.
-    let updated = db.get_source_block(&bid).unwrap().unwrap();
+    let cooldown = db.block_cooldown(&bid);
     assert_eq!(
-        updated.last_pool_signature, 0,
+        cooldown.last_pool_signature, 0,
         "after PeerAuthenticated → reset_all_cooldowns, last_pool_signature must be 0 (sentinel)"
     );
 

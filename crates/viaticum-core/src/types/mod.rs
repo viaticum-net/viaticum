@@ -312,18 +312,9 @@ pub struct SourceBlockRecord {
     /// Default: 0.0 (pre-migration sentinel).
     #[serde(default)]
     pub target_reliability: f64,
-
-    /// Timestamp of the last worker attempt on this block.
-    /// None = never attempted. Used for cooldown tiebreak.
-    /// Default: None.
-    #[serde(default)]
-    pub last_attempted_at: Option<Timestamp>,
-
-    /// XxHash64 of the sorted DeviceId set at the last attempt.
-    /// 0 = sentinel "never attempted / pool unknown". Populated by Wave 11.
-    /// Default: 0.
-    #[serde(default)]
-    pub last_pool_signature: u64,
+    // B-4: worker cooldown (last_attempted_at / last_pool_signature) moved to the
+    // RAM-only HotCache::block_cooldown — never persisted, resets on restart.
+    // Old records may still carry these CBOR map keys; serde ignores them.
 }
 
 impl SourceBlockRecord {

@@ -2348,14 +2348,6 @@ fn block_creation_initializes_cached_fields_to_zero() {
         "current_reliability must be 0.0 at creation, got {}",
         block.current_reliability
     );
-    assert!(
-        block.last_attempted_at.is_none(),
-        "last_attempted_at must be None at creation"
-    );
-    assert_eq!(
-        block.last_pool_signature, 0,
-        "last_pool_signature must be 0 at creation"
-    );
 }
 
 /// A6: block creation proceeds even with empty holder pool.
@@ -2631,8 +2623,6 @@ fn make_block_for_hook(block_id: SourceBlockId) -> viaticum_core::types::SourceB
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.99,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     }
 }
 
@@ -2762,7 +2752,7 @@ fn backup_symbol_accepted_already_alive_is_noop() {
     // placement count (1). If the early-return guard works → hook never fires → value
     // stays at 99. If the guard were removed → hook would recount and overwrite to 1.
     // Asserting the value stays 99 is therefore a strong signal that the guard works.
-    db.update_block_cached_fields(&block_id, 0.5, 99, 0.9, 0.99, None, 0)
+    db.update_block_cached_fields(&block_id, 0.5, 99, 0.9, 0.99)
         .unwrap();
 
     coord.handle_backup_event(BackupEvent::SymbolAccepted {

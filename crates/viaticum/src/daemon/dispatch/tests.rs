@@ -128,8 +128,6 @@ fn insert_file_with_block(
         current_alive: 8,
         current_reliability,
         target_reliability,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
     state.db.upsert_source_block(&block).unwrap();
     let file = FileRecord {
@@ -471,8 +469,6 @@ fn make_block(
         current_alive: 0,
         current_reliability: reliability,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     }
 }
 

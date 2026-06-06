@@ -21,8 +21,6 @@ fn erasure_params_returns_stored_values() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
     let params = record.erasure_params();
     assert_eq!(params.k, 100);
@@ -52,8 +50,6 @@ fn erasure_params_legacy_fallback() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
     let params = record.erasure_params();
     let expected = ErasureParams::compute(k as u64 * t as u64, 0.0).unwrap();
@@ -81,8 +77,6 @@ fn source_block_record_roundtrips_n_and_overhead() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
     let bytes = to_cbor_bytes(&record);
     let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();
@@ -347,8 +341,6 @@ fn cbor_roundtrip_source_block_pack() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
     let bytes = to_cbor_bytes(&sb);
     let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();
@@ -382,8 +374,6 @@ fn source_block_record_round_trip_with_all_new_fields() {
         current_alive: 3,
         current_reliability: 0.9996,
         target_reliability: 0.9996,
-        last_attempted_at: Some(Timestamp(9999)),
-        last_pool_signature: 0xDEADBEEF_CAFEBABE,
     };
 
     let bytes = to_cbor_bytes(&original);
@@ -413,8 +403,6 @@ fn source_block_record_round_trip_with_all_new_fields() {
         "target_reliability round-trip, got {}",
         decoded.target_reliability
     );
-    assert_eq!(decoded.last_attempted_at, Some(Timestamp(9999)));
-    assert_eq!(decoded.last_pool_signature, 0xDEADBEEF_CAFEBABE);
 }
 
 #[test]
@@ -471,14 +459,6 @@ fn source_block_record_legacy_format_loads_with_defaults() {
     assert_eq!(
         decoded.target_reliability, 0.0,
         "legacy: target_reliability must default to 0.0"
-    );
-    assert_eq!(
-        decoded.last_attempted_at, None,
-        "legacy: last_attempted_at must default to None"
-    );
-    assert_eq!(
-        decoded.last_pool_signature, 0,
-        "legacy: last_pool_signature must default to 0"
     );
 }
 

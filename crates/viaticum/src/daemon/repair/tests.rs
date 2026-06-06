@@ -220,8 +220,6 @@ fn make_block_for_hook(bid: SourceBlockId) -> SourceBlockRecord {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.99,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     }
 }
 
@@ -250,7 +248,7 @@ async fn repair_agent_mark_placement_lost_updates_current_alive() {
     ))
     .unwrap();
 
-    db.update_block_cached_fields(&bid, 0.5, 2, 0.9, 0.99, None, 0)
+    db.update_block_cached_fields(&bid, 0.5, 2, 0.9, 0.99)
         .unwrap();
 
     let agent = make_agent(db.clone());
@@ -298,7 +296,7 @@ async fn repair_agent_mark_placement_lost_idempotent_on_already_lost() {
     ))
     .unwrap();
 
-    db.update_block_cached_fields(&bid, 0.5, 1, 0.7, 0.99, None, 0)
+    db.update_block_cached_fields(&bid, 0.5, 1, 0.7, 0.99)
         .unwrap();
 
     let agent = make_agent(db.clone());

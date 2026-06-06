@@ -248,8 +248,6 @@ fn deletion_cooldown_full_lifecycle() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
 
     // Two placements, both Alive

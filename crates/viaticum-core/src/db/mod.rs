@@ -173,6 +173,14 @@ pub struct SystemStateBlobRecord {
 }
 
 /// Hot layer: in-memory aggregates loaded at startup.
+/// Per-block worker cooldown (B-4). RAM-only: never persisted, so it resets on
+/// daemon restart — a restart is a fine moment to re-attempt every block.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BlockCooldown {
+    pub last_attempted_at: Option<Timestamp>,
+    pub last_pool_signature: u64,
+}
+
 pub struct HotCache {
     pub blocks: HashMap<SourceBlockId, BlockAgg>,
     pub placements: HashMap<(SourceBlockId, DeviceId), PlacementAgg>,
@@ -180,6 +188,8 @@ pub struct HotCache {
     /// Maintained on holding upsert/delete so `total_holding_bytes` is O(1)
     /// instead of a full HOLDINGS scan on every incoming SymbolOffer (S-9).
     pub holding_bytes_total: u64,
+    /// Worker cooldown per source block (B-4). RAM-only; not rebuilt at open().
+    pub block_cooldown: HashMap<SourceBlockId, BlockCooldown>,
 }
 
 impl HotCache {
@@ -188,6 +198,7 @@ impl HotCache {
             blocks: HashMap::new(),
             placements: HashMap::new(),
             holding_bytes_total: 0,
+            block_cooldown: HashMap::new(),
         }
     }
 
@@ -718,7 +729,6 @@ impl Db {
     /// `transition_placement_offered_to_alive`.
     /// Not atomic against concurrent writers, but the daemon is single-process and the migration
     /// runs before any workers start, so no concurrent writes occur during migration.
-    #[allow(clippy::too_many_arguments)]
     pub fn update_block_cached_fields(
         &self,
         block_id: &SourceBlockId,
@@ -726,8 +736,6 @@ impl Db {
         current_alive: u32,
         current_reliability: f64,
         target_reliability: f64,
-        last_attempted_at: Option<Timestamp>,
-        last_pool_signature: u64,
     ) -> Result<(), DbError> {
         let mut record = self
             .get_source_block(block_id)?
@@ -736,9 +744,42 @@ impl Db {
         record.current_alive = current_alive;
         record.current_reliability = current_reliability;
         record.target_reliability = target_reliability;
-        record.last_attempted_at = last_attempted_at;
-        record.last_pool_signature = last_pool_signature;
         self.upsert_source_block(&record)
+    }
+
+    /// Record a worker attempt on `block_id` (B-4). Cooldown lives only in RAM,
+    /// so this performs no disk write — it replaces the per-attempt fsync that
+    /// persisting `last_attempted_at`/`last_pool_signature` used to incur.
+    pub fn set_block_cooldown(
+        &self,
+        block_id: &SourceBlockId,
+        last_attempted_at: Option<Timestamp>,
+        last_pool_signature: u64,
+    ) {
+        let mut hot = self.hot.write().unwrap_or_else(|e| e.into_inner());
+        hot.block_cooldown.insert(
+            *block_id,
+            BlockCooldown {
+                last_attempted_at,
+                last_pool_signature,
+            },
+        );
+    }
+
+    /// Read a block's RAM cooldown (B-4). Default (never attempted) if absent.
+    pub fn block_cooldown(&self, block_id: &SourceBlockId) -> BlockCooldown {
+        self.hot()
+            .block_cooldown
+            .get(block_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Clear all worker cooldowns (B-4). Used on PeerAuthenticated to force every
+    /// below-target block to be re-evaluated immediately.
+    pub fn clear_all_block_cooldowns(&self) {
+        let mut hot = self.hot.write().unwrap_or_else(|e| e.into_inner());
+        hot.block_cooldown.clear();
     }
 
     /// List all source blocks (any status).
@@ -832,6 +873,11 @@ impl Db {
     ) -> Result<Option<SourceBlockRecord>, DbError> {
         let all = self.list_all_source_blocks()?;
         let cooldown_secs = cooldown.as_secs();
+        // Cooldown state is RAM-only (B-4); take one read lock for the whole pass.
+        let hot = self.hot();
+        let cooldown_of = |id: &SourceBlockId| -> BlockCooldown {
+            hot.block_cooldown.get(id).copied().unwrap_or_default()
+        };
 
         let eligible = all.into_iter().filter(|b| {
             if b.status != SourceBlockStatus::Active {
@@ -840,12 +886,13 @@ impl Db {
             if b.target_reliability <= 0.0 || b.current_reliability >= b.target_reliability {
                 return false;
             }
-            if current_pool_sig != 0
-                && let Some(last_at) = b.last_attempted_at
-            {
-                let elapsed = now.0.saturating_sub(last_at.0);
-                if elapsed < cooldown_secs && b.last_pool_signature == current_pool_sig {
-                    return false;
+            if current_pool_sig != 0 {
+                let cd = cooldown_of(&b.block_id);
+                if let Some(last_at) = cd.last_attempted_at {
+                    let elapsed = now.0.saturating_sub(last_at.0);
+                    if elapsed < cooldown_secs && cd.last_pool_signature == current_pool_sig {
+                        return false;
+                    }
                 }
             }
             true
@@ -856,8 +903,10 @@ impl Db {
                 crate::priority::priority(a.importance, a.current_alive, a.n.unwrap_or(0), coef);
             let pb =
                 crate::priority::priority(b.importance, b.current_alive, b.n.unwrap_or(0), coef);
+            let a_last = cooldown_of(&a.block_id).last_attempted_at;
+            let b_last = cooldown_of(&b.block_id).last_attempted_at;
             pa.total_cmp(&pb)
-                .then(a.last_attempted_at.cmp(&b.last_attempted_at).reverse())
+                .then(a_last.cmp(&b_last).reverse())
                 .then(a.block_id.0.cmp(&b.block_id.0).reverse())
         });
 

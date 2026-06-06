@@ -1203,8 +1203,6 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
     db.upsert_source_block(&block_record).unwrap();
 
@@ -1394,8 +1392,6 @@ async fn path_traversal_from_db_record_is_rejected() {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     };
     db.upsert_source_block(&source_block).unwrap();
 

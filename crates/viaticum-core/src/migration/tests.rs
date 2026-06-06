@@ -31,8 +31,6 @@ fn make_block(seed: u8, overhead: Option<f64>) -> SourceBlockRecord {
         current_alive: 0,
         current_reliability: 0.0,
         target_reliability: 0.0,
-        last_attempted_at: None,
-        last_pool_signature: 0,
     }
 }
 
@@ -237,14 +235,6 @@ fn migrate_block_records_idempotent_across_calls() {
         (after_first.target_reliability - after_second.target_reliability).abs() < 1e-12,
         "target_reliability must be identical across runs"
     );
-    assert_eq!(
-        after_first.last_attempted_at,
-        after_second.last_attempted_at
-    );
-    assert_eq!(
-        after_first.last_pool_signature,
-        after_second.last_pool_signature
-    );
 }
 
 /// Structural test: insert >10 000 blocks and assert the return value.
@@ -275,8 +265,6 @@ fn migrate_block_records_logs_progress_every_10000_blocks() {
             current_alive: 0,
             current_reliability: 0.0,
             target_reliability: 0.0,
-            last_attempted_at: None,
-            last_pool_signature: 0,
         };
         db.upsert_source_block(&block).unwrap();
     }
@@ -316,26 +304,6 @@ fn migrate_block_records_skips_block_with_no_peer_record_uses_fallback() {
         record.current_reliability >= 0.0 && record.current_reliability <= 1.0,
         "current_reliability must be in [0, 1], got {}",
         record.current_reliability
-    );
-}
-
-#[test]
-fn migrate_block_records_sets_last_attempted_at_none_and_pool_signature_zero() {
-    let db = test_db();
-    let bid = block_id(7);
-
-    db.upsert_source_block(&make_block(7, Some(2.475))).unwrap();
-
-    migrate_block_records(&db).unwrap();
-
-    let record = db.get_source_block(&bid).unwrap().unwrap();
-    assert_eq!(
-        record.last_attempted_at, None,
-        "last_attempted_at must be None after migration"
-    );
-    assert_eq!(
-        record.last_pool_signature, 0,
-        "last_pool_signature must be 0 after migration"
     );
 }
 

@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use viaticum_core::cluster::ClusterState;
 use viaticum_core::db::Db;
 use viaticum_core::erasure::ErasureEncoder;
-use viaticum_core::types::{DeviceId, SourceBlockRecord, SourceBlockStatus, Timestamp};
+use viaticum_core::types::{DeviceId, SourceBlockRecord, Timestamp};
 
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
@@ -273,49 +273,12 @@ impl WorkPipeline {
         Ok(true)
     }
 
-    /// Reset cooldowns on all blocks currently below target reliability.
-    ///
-    /// Sets `last_pool_signature = 0` (sentinel that bypasses cooldown in
-    /// `next_work_item`). Called on `PeerAuthenticated` to force re-evaluation.
+    /// Reset cooldowns on all blocks. Called on `PeerAuthenticated` to force
+    /// re-evaluation: with the cooldown map cleared, every below-target block is
+    /// immediately eligible again in `next_work_item`. RAM-only, no disk writes (B-4).
     pub(crate) fn reset_all_cooldowns(&self) {
-        let blocks = match self.db.list_all_source_blocks() {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!("reset_all_cooldowns: list_all_source_blocks failed: {e}");
-                return;
-            }
-        };
-        let mut reset_count = 0u32;
-        for block in &blocks {
-            if block.status != SourceBlockStatus::Active {
-                continue;
-            }
-            if block.current_reliability >= block.target_reliability {
-                continue;
-            }
-            // Set last_pool_signature = 0 to bypass cooldown.
-            if let Err(e) = self.db.update_block_cached_fields(
-                &block.block_id,
-                block.importance,
-                block.current_alive,
-                block.current_reliability,
-                block.target_reliability,
-                block.last_attempted_at,
-                0, // sentinel: force re-evaluation on next next_work_item call
-            ) {
-                tracing::error!(
-                    block_id = %block.block_id,
-                    err = %e,
-                    "reset_all_cooldowns: update_block_cached_fields failed"
-                );
-            } else {
-                reset_count += 1;
-            }
-        }
-        tracing::debug!(
-            reset = reset_count,
-            "work_pipeline: reset_all_cooldowns complete"
-        );
+        self.db.clear_all_block_cooldowns();
+        tracing::debug!("work_pipeline: reset_all_cooldowns complete");
     }
 
     /// Update cooldown fields for a block after an iteration.
@@ -328,15 +291,9 @@ impl WorkPipeline {
         pool: &PoolSnapshot,
         now: Timestamp,
     ) -> anyhow::Result<()> {
-        self.db.update_block_cached_fields(
-            &block.block_id,
-            block.importance,
-            block.current_alive,
-            block.current_reliability,
-            block.target_reliability,
-            Some(now),
-            pool.signature,
-        )?;
+        // B-4: cooldown is RAM-only — no disk write per attempt.
+        self.db
+            .set_block_cooldown(&block.block_id, Some(now), pool.signature);
         Ok(())
     }
 }
