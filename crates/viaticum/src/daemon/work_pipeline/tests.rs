@@ -166,6 +166,23 @@ fn pool_signature_non_empty_returns_nonzero() {
 }
 
 #[test]
+fn pool_signature_golden_value_locks_algorithm() {
+    // Golden value: locks the FNV-1a output for a known pool so an accidental
+    // change to the hashing (e.g. reverting to DefaultHasher) is caught. The
+    // signature is persisted, so its computation must stay stable across builds.
+    // Input: one candidate device_id(1) (bytes [1,0,...,0]), trust 0.7 (bucket 14).
+    let candidates = vec![HolderCandidate {
+        device_id: device_id(1),
+        trust: 0.7,
+    }];
+    assert_eq!(
+        pool_signature(&candidates),
+        13834821131375203934,
+        "FNV-1a golden value changed — pool_signature algorithm must stay stable"
+    );
+}
+
+#[test]
 fn pool_signature_same_peers_same_order_stable() {
     let candidates = vec![
         HolderCandidate {

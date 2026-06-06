@@ -3,8 +3,6 @@
 // pool_signature: stable hash of the current holder pool composition.
 // snapshot_pool: build pool from authenticated peers + DB trust.
 
-use std::hash::{Hash, Hasher};
-
 use viaticum_core::db::Db;
 use viaticum_core::placement::HolderCandidate;
 use viaticum_core::types::{DeviceId, IdentityPub};
@@ -22,10 +20,27 @@ pub struct PoolSnapshot {
     pub signature: u64,
 }
 
+/// FNV-1a 64-bit. Deterministic and stable across compiler/std versions, unlike
+/// `DefaultHasher` (SipHash), whose output is implementation-defined. The pool
+/// signature is persisted (`last_pool_signature`), so it must not silently change
+/// when the toolchain is upgraded.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 /// Compute pool_signature from a candidate list.
 ///
-/// Signature = DefaultHasher over sorted (device_id_bytes ++ trust_bucket_byte) pairs.
+/// Signature = FNV-1a over sorted (device_id_bytes ++ trust_bucket_byte) pairs.
 /// Trust is bucketed to nearest 0.05 to avoid micro-changes causing spurious re-encodes.
+/// FNV-1a is used (not `DefaultHasher`) because the signature is persisted and must
+/// stay stable across toolchain upgrades.
 ///
 /// Invariant: `pool_signature(&[]) == 0`.
 pub fn pool_signature(candidates: &[HolderCandidate]) -> u64 {
@@ -39,14 +54,14 @@ pub fn pool_signature(candidates: &[HolderCandidate]) -> u64 {
     // Sort by device_id bytes for stable ordering.
     pairs.sort_unstable_by_key(|(did, _)| *did);
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut buf = Vec::with_capacity(pairs.len() * 33);
     for (did, bucket) in &pairs {
-        did.hash(&mut hasher);
-        bucket.hash(&mut hasher);
+        buf.extend_from_slice(did);
+        buf.push(*bucket);
     }
+    let sig = fnv1a_64(&buf);
     // Reserve 0 as the sentinel for "empty pool".
     // In the astronomically unlikely case that the hash is 0, use 1.
-    let sig = Hasher::finish(&hasher);
     if sig == 0 { 1 } else { sig }
 }
 
