@@ -64,8 +64,6 @@ pub struct WorkPipelineConfig {
     /// Minimum pool size to attempt delivery. Below this, apply cooldown without encoding.
     /// Default: 2.
     pub min_pool_size: usize,
-    /// Time acceleration factor (1 = real time; tests use higher).
-    pub time_scale: u64,
 }
 
 impl Default for WorkPipelineConfig {
@@ -78,7 +76,6 @@ impl Default for WorkPipelineConfig {
             own_master_pub_key: viaticum_core::types::IdentityPub([0u8; 32]),
             epoch_key: [0u8; 32],
             min_pool_size: 2,
-            time_scale: 1,
         }
     }
 }

@@ -923,7 +923,6 @@ impl DaemonHandle {
                     own_master_pub_key: identity_pub,
                     epoch_key: epoch_key_bytes,
                     min_pool_size: 2,
-                    time_scale,
                 };
                 let worker = crate::daemon::work_pipeline::WorkPipeline::new(
                     db.clone(),

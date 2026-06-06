@@ -138,7 +138,6 @@ fn make_config() -> WorkPipelineConfig {
         own_master_pub_key: viaticum_core::types::IdentityPub([0u8; 32]),
         epoch_key: [0u8; 32],
         min_pool_size: 2,
-        time_scale: 1,
     }
 }
 
