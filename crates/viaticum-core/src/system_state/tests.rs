@@ -111,6 +111,45 @@ fn empty_db_roundtrip() {
 }
 
 #[test]
+fn snapshot_excludes_ss_blocks_and_their_placements() {
+    let db = test_db();
+
+    // A normal user block + its placement.
+    let normal = make_source_block(1);
+    db.upsert_source_block(&normal).unwrap();
+    db.upsert_placement(&make_placement(1, DeviceId([7u8; 32]), FileId(1)))
+        .unwrap();
+
+    // A SystemState block + its placement, marked in the SS ledger.
+    let ss = make_source_block(2);
+    db.upsert_source_block(&ss).unwrap();
+    db.upsert_placement(&make_placement(2, DeviceId([8u8; 32]), FileId(2)))
+        .unwrap();
+    db.mark_ss_block(&ss.block_id, 3).unwrap();
+
+    // Snapshot must contain ONLY the normal block + its placement.
+    let state = snapshot_db(&db).unwrap();
+    assert_eq!(
+        state.source_blocks.len(),
+        1,
+        "SS block excluded from snapshot"
+    );
+    assert_eq!(state.source_blocks[0].block_id, normal.block_id);
+    assert_eq!(state.symbol_placements.len(), 1, "SS placement excluded");
+    assert_eq!(state.symbol_placements[0].source_block_id, normal.block_id);
+
+    // Ledger queries.
+    assert!(db.is_ss_block(&ss.block_id).unwrap());
+    assert!(!db.is_ss_block(&normal.block_id).unwrap());
+    assert_eq!(db.list_ss_blocks().unwrap(), vec![(ss.block_id, 3)]);
+
+    // After unmarking, the block re-enters the snapshot (retire reversibility).
+    db.unmark_ss_block(&ss.block_id).unwrap();
+    assert!(!db.is_ss_block(&ss.block_id).unwrap());
+    assert_eq!(snapshot_db(&db).unwrap().source_blocks.len(), 2);
+}
+
+#[test]
 fn roundtrip_snapshot_pack_unpack_restore() {
     // Populate DB with test data, snapshot, pack, unpack, restore to new DB, verify.
     let db = test_db();

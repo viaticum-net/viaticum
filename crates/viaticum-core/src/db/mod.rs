@@ -58,6 +58,14 @@ const CLUSTER_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("cluste
 const SYSTEM_STATE_BLOBS: TableDefinition<&[u8; 32], &[u8]> =
     TableDefinition::new("system_state_blobs");
 
+/// Owner-side ledger of SystemState-as-block ids (the SS-as-block workstream).
+/// Key = block_id [u8;32]. Value = CBOR(u32) generation that produced the block.
+/// SS blocks live in SOURCE_BLOCKS (so the generic pipeline places/PoS them), but
+/// must be EXCLUDED from `snapshot_db` (else a snapshot self-references its own SS
+/// blocks → post-DR the recovered node maintains phantom records). This ledger is
+/// the SS-identity marker for that exclusion and drives retire/rotation.
+const SS_BLOCKS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("ss_blocks");
+
 /// Total bytes restored per peer (cumulative, append-only counter).
 /// Key = owner IdentityPub [u8;32]. Value = CBOR(u64) — total bytes served.
 const RESTORE_SERVED: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("restore_served");
@@ -330,6 +338,7 @@ impl Db {
             tx.open_table(CONTENT_INDEX)?;
             tx.open_table(CLUSTER_STATE)?;
             tx.open_table(SYSTEM_STATE_BLOBS)?;
+            tx.open_table(SS_BLOCKS)?;
             tx.open_table(RESTORE_SERVED)?;
             tx.open_table(DEVICE_TRUST)?;
             tx.open_table(MASTER_TRUST)?;
@@ -780,6 +789,67 @@ impl Db {
     pub fn clear_all_block_cooldowns(&self) {
         let mut hot = self.hot.write().unwrap_or_else(|e| e.into_inner());
         hot.block_cooldown.clear();
+    }
+
+    // ── SystemState-as-block ledger (SS_BLOCKS) ────────────────────────────
+    //
+    // Records which SOURCE_BLOCKS entries are SystemState blocks so `snapshot_db`
+    // can exclude them (avoid self-reference) and the push loop can retire old
+    // generations.
+
+    /// Mark `block_id` as a SystemState block produced at `generation`.
+    pub fn mark_ss_block(&self, block_id: &SourceBlockId, generation: u32) -> Result<(), DbError> {
+        let bytes = to_cbor_bytes(&generation);
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(SS_BLOCKS)?;
+            table.insert(&block_id.0, bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remove `block_id` from the SS ledger (used when retiring a superseded block).
+    pub fn unmark_ss_block(&self, block_id: &SourceBlockId) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(SS_BLOCKS)?;
+            table.remove(&block_id.0)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether `block_id` is a SystemState block (present in the SS ledger).
+    pub fn is_ss_block(&self, block_id: &SourceBlockId) -> Result<bool, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(SS_BLOCKS)?;
+        Ok(table.get(&block_id.0)?.is_some())
+    }
+
+    /// List all SS blocks as (block_id, generation). Used to retire old generations.
+    pub fn list_ss_blocks(&self) -> Result<Vec<(SourceBlockId, u32)>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(SS_BLOCKS)?;
+        let mut out = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            let generation: u32 = from_cbor_bytes(v.value())?;
+            out.push((SourceBlockId(*k.value()), generation));
+        }
+        Ok(out)
+    }
+
+    /// Set of SS block ids — for bulk exclusion in `snapshot_db`.
+    pub fn ss_block_id_set(&self) -> Result<std::collections::HashSet<[u8; 32]>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(SS_BLOCKS)?;
+        let mut out = std::collections::HashSet::new();
+        for item in table.iter()? {
+            let (k, _) = item?;
+            out.insert(*k.value());
+        }
+        Ok(out)
     }
 
     /// List all source blocks (any status).

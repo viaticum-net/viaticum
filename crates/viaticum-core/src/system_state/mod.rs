@@ -171,8 +171,22 @@ fn derive_system_state_key(identity_key: &[u8; 32], salt: &[u8]) -> [u8; 32] {
 /// Does NOT include: holdings (holder-specific), budget, event_log (secondary/ephemeral).
 pub fn snapshot_db(db: &crate::db::Db) -> Result<SystemState, SystemStateError> {
     let files = db.list_all_files()?;
-    let source_blocks = db.list_all_source_blocks()?;
-    let symbol_placements = db.list_all_placements()?;
+    // SystemState-as-block records live in SOURCE_BLOCKS so the generic pipeline
+    // places/PoS them, but they must NOT enter the snapshot: a snapshot that
+    // contained its own SS blocks would self-reference, and after DR the recovered
+    // node would try to maintain phantom SS records with no retained blob. Exclude
+    // SS blocks and their placements via the SS ledger.
+    let ss_ids = db.ss_block_id_set()?;
+    let source_blocks: Vec<_> = db
+        .list_all_source_blocks()?
+        .into_iter()
+        .filter(|b| !ss_ids.contains(&b.block_id.0))
+        .collect();
+    let symbol_placements: Vec<_> = db
+        .list_all_placements()?
+        .into_iter()
+        .filter(|p| !ss_ids.contains(&p.source_block_id.0))
+        .collect();
     let peers = db.list_all_peers()?;
 
     let pos_weekly = {
