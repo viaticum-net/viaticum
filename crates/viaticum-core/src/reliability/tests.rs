@@ -1,8 +1,8 @@
 use super::{
     BlockReliabilityInput, HolderCandidate, HolderReliabilityInput, ReliabilityError,
     binomial_survival, block_reliability, build_report, commitment_to_survival_prob,
-    file_reliability, per_holder_impact, solve_n_for_target, target_reliability,
-    weighted_mean_trust,
+    correlated_recovery_prob, file_reliability, per_holder_impact, solve_n_for_target,
+    target_reliability, weighted_mean_trust,
 };
 use crate::commitment::CommitmentScore;
 use crate::constants::{MAX_OVERHEAD_FACTOR, MIN_REDUNDANCY};
@@ -137,9 +137,10 @@ fn binomial_survival_large_n_normal_approx() {
 // ============================================================
 
 #[test]
-fn block_reliability_single_holder_exact() {
-    // One holder: 15 symbols, k_eff=5, survival_prob=0.7
-    // Expected: same as binomial_survival(15, 5, 0.7) ≈ 0.9993
+fn block_reliability_single_holder_is_holder_survival() {
+    // Holder-correlated model: one holder with ≥ k_eff symbols is alive-or-dead
+    // as a unit, so block reliability == that holder's survival probability.
+    // 15 symbols ≥ k_eff=5, survival_prob=0.7 → R = 0.7.
     let input = BlockReliabilityInput {
         block_id: block_id(1),
         k_eff: 5,
@@ -150,10 +151,7 @@ fn block_reliability_single_holder_exact() {
         }],
     };
     let result = block_reliability(&input).unwrap();
-    assert!(
-        (result - 0.9993).abs() < 0.001,
-        "expected ~0.9993, got {result}"
-    );
+    assert!((result - 0.7).abs() < 1e-9, "expected 0.7, got {result}");
 }
 
 #[test]
@@ -169,10 +167,11 @@ fn block_reliability_empty_holders_below_k_eff() {
 }
 
 #[test]
-fn block_reliability_multiple_holders_weighted_mean() {
-    // Holder A: 10 symbols, p=0.9
-    // Holder B: 5 symbols, p=0.5
-    // weighted mean p = (10 * 0.9 + 5 * 0.5) / 15 = 11.5 / 15 ≈ 0.7667
+fn block_reliability_multiple_holders_correlated() {
+    // Holder A: 10 symbols, p=0.9  (≥ k_eff=5 alone)
+    // Holder B: 5 symbols,  p=0.5  (≥ k_eff=5 alone)
+    // Each holder alone can decode, so the block survives iff either survives:
+    //   R = 1 − q_A·q_B = 1 − 0.1·0.5 = 0.95.
     let input = BlockReliabilityInput {
         block_id: block_id(1),
         k_eff: 5,
@@ -190,11 +189,7 @@ fn block_reliability_multiple_holders_weighted_mean() {
         ],
     };
     let result = block_reliability(&input).unwrap();
-    let expected = binomial_survival(15, 5, 11.5 / 15.0).unwrap();
-    assert!(
-        (result - expected).abs() < 1e-9,
-        "expected {expected}, got {result}"
-    );
+    assert!((result - 0.95).abs() < 1e-9, "expected 0.95, got {result}");
 }
 
 #[test]
@@ -228,6 +223,109 @@ fn block_reliability_invalid_survival_prob() {
         result,
         Err(ReliabilityError::InvalidSurvivalProb(p)) if (p - 1.5).abs() < 1e-9
     ));
+}
+
+// ============================================================
+// Tests: correlated_recovery_prob — holder-correlated DP
+// ============================================================
+
+#[test]
+fn correlated_degenerates_to_binomial_when_one_symbol_each() {
+    // All holders hold exactly 1 symbol with the same p → the correlated DP
+    // reduces to the per-symbol binomial survival.
+    let k_eff = 5u32;
+    let p = 0.7;
+    let h = 12u32;
+    let holders: Vec<(u32, f64)> = (0..h).map(|_| (1u32, p)).collect();
+    let got = correlated_recovery_prob(&holders, k_eff).unwrap();
+    let expected = binomial_survival(h, k_eff, p).unwrap();
+    assert!(
+        (got - expected).abs() < 1e-9,
+        "correlated={got}, binomial={expected}"
+    );
+}
+
+#[test]
+fn correlated_degenerates_to_replica_formula_when_full_copies() {
+    // Three full copies (sᵢ = k_eff each) → recoverable if ≥1 survives:
+    //   R = 1 − Π q = 1 − 0.3³.
+    let holders = [(5u32, 0.7), (5, 0.7), (5, 0.7)];
+    let got = correlated_recovery_prob(&holders, 5).unwrap();
+    let expected = 1.0 - 0.3_f64.powi(3);
+    assert!(
+        (got - expected).abs() < 1e-9,
+        "got {got}, expected {expected}"
+    );
+}
+
+#[test]
+fn two_full_copies_recoverable_from_either() {
+    // Two full copies → R = 1 − q² = 1 − 0.3² = 0.91.
+    let holders = [(5u32, 0.7), (5, 0.7)];
+    let got = correlated_recovery_prob(&holders, 5).unwrap();
+    assert!((got - 0.91).abs() < 1e-9, "got {got}, expected 0.91");
+}
+
+#[test]
+fn correlated_monotonic_adding_holder() {
+    // Adding a holder never decreases recovery probability.
+    let r1 = correlated_recovery_prob(&[(2, 0.7)], 5).unwrap();
+    let r2 = correlated_recovery_prob(&[(2, 0.7), (2, 0.7)], 5).unwrap();
+    let r3 = correlated_recovery_prob(&[(2, 0.7), (2, 0.7), (2, 0.7)], 5).unwrap();
+    assert!(r2 >= r1 - 1e-12, "r2={r2} < r1={r1}");
+    assert!(r3 >= r2 - 1e-12, "r3={r3} < r2={r2}");
+}
+
+#[test]
+fn correlated_monotonic_adding_symbols_to_holder() {
+    // Giving a single holder more symbols never decreases recovery probability.
+    let r_below = correlated_recovery_prob(&[(4, 0.7)], 5).unwrap(); // 4 < k_eff → 0
+    let r_at = correlated_recovery_prob(&[(5, 0.7)], 5).unwrap(); // 5 ≥ k_eff → p
+    assert!((r_below - 0.0).abs() < 1e-12, "r_below={r_below}");
+    assert!((r_at - 0.7).abs() < 1e-9, "r_at={r_at}");
+    assert!(r_at >= r_below - 1e-12);
+}
+
+#[test]
+fn correlated_empty_holders_is_zero() {
+    let got = correlated_recovery_prob(&[], 5).unwrap();
+    assert_eq!(got, 0.0);
+}
+
+#[test]
+fn correlated_k_eff_zero_is_one() {
+    // k_eff = 0 → block trivially recoverable, regardless of holders.
+    assert_eq!(correlated_recovery_prob(&[], 0).unwrap(), 1.0);
+    assert_eq!(correlated_recovery_prob(&[(3, 0.7)], 0).unwrap(), 1.0);
+}
+
+#[test]
+fn correlated_invalid_survival_prob_errors() {
+    let got = correlated_recovery_prob(&[(5, 1.5)], 5);
+    assert!(
+        matches!(got, Err(ReliabilityError::InvalidSurvivalProb(p)) if (p - 1.5).abs() < 1e-9),
+        "expected InvalidSurvivalProb(1.5), got {got:?}"
+    );
+}
+
+#[test]
+fn correlated_in_zero_one_range() {
+    // Sweep mixed holder sets — result must stay in [0, 1].
+    let cases: &[&[(u32, f64)]] = &[
+        &[(1, 0.5), (2, 0.8), (5, 0.3)],
+        &[(3, 0.0), (3, 1.0)],
+        &[(10, 0.9)],
+        &[],
+    ];
+    for k_eff in [1u32, 3, 5, 10] {
+        for holders in cases {
+            let r = correlated_recovery_prob(holders, k_eff).unwrap();
+            assert!(
+                (0.0..=1.0).contains(&r),
+                "out of range: holders={holders:?}, k_eff={k_eff}, r={r}"
+            );
+        }
+    }
 }
 
 // ============================================================
@@ -370,8 +468,9 @@ fn per_holder_impact_only_holder_removes_all() {
 
 #[test]
 fn per_holder_impact_redundant_holder() {
-    // Holder A: 15 symbols. Holder B: 3 symbols. k_eff=5.
-    // Removing B leaves 15 symbols — still highly reliable.
+    // Holder A: 15 symbols (≥ k_eff=5, decodes alone). Holder B: 3 symbols.
+    // Removing B leaves only A; in the holder-correlated model a single
+    // decode-capable holder yields exactly its own survival prob → R = 0.8.
     let input = BlockReliabilityInput {
         block_id: block_id(1),
         k_eff: 5,
@@ -390,8 +489,8 @@ fn per_holder_impact_redundant_holder() {
     };
     let r_without_b = per_holder_impact(&input, &holder_id(2)).unwrap();
     assert!(
-        r_without_b > 0.99,
-        "expected > 0.99 without redundant holder, got {r_without_b}"
+        (r_without_b - 0.8).abs() < 1e-9,
+        "expected 0.8 (holder A alone), got {r_without_b}"
     );
 }
 
@@ -409,7 +508,8 @@ fn per_holder_impact_holder_not_found() {
 
 #[test]
 fn build_report_healthy_block() {
-    // 2 holders, 15 symbols each, k_eff=5, survival_prob=0.9
+    // 2 holders, 15 symbols each (≥ k_eff=5, each decodes alone), survival_prob=0.95.
+    // Holder-correlated: R = 1 − q² = 1 − 0.05² = 0.9975 → above repair threshold.
     let input = BlockReliabilityInput {
         block_id: block_id(1),
         k_eff: 5,
@@ -417,12 +517,12 @@ fn build_report_healthy_block() {
             HolderReliabilityInput {
                 holder_id: holder_id(1),
                 alive_symbols: 15,
-                survival_prob: 0.9,
+                survival_prob: 0.95,
             },
             HolderReliabilityInput {
                 holder_id: holder_id(2),
                 alive_symbols: 15,
-                survival_prob: 0.9,
+                survival_prob: 0.95,
             },
         ],
     };
@@ -430,8 +530,8 @@ fn build_report_healthy_block() {
     assert_eq!(report.symbols_alive, 30);
     assert_eq!(report.symbols_needed, 5);
     assert!(
-        report.current_reliability > 0.999,
-        "expected > 0.999, got {}",
+        report.current_reliability > 0.99,
+        "expected > 0.99, got {}",
         report.current_reliability
     );
     assert!(!report.needs_repair);

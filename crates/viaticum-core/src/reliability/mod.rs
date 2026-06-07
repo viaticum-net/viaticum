@@ -3,12 +3,14 @@
 // All inputs are assembled by the caller (daemon scheduler) from DB records
 // and commitment scores.
 //
-// Core formula (from docs/beta/raptorq.md):
-//   P(block alive) = P(Binomial(N, p) >= K_eff)
+// Core model (holder-correlated, see `correlated_recovery_prob`):
+//   P(block alive) = P( Σ_{i : holder i survives} sᵢ  >=  K_eff )
 //
-// where N = total alive symbols across all holders,
-//       p = weighted mean per-symbol survival probability,
-//   K_eff = minimum symbols required for decode.
+// Each holder is alive-or-dead as a unit (all its sᵢ symbols survive together
+// with probability pᵢ); the block is recoverable iff the surviving holders hold
+// >= K_eff distinct symbols. ESI ranges are disjoint across holders (watermark),
+// so surviving holders' symbols sum as distinct. `binomial_survival` is retained
+// as the per-symbol special case (all sᵢ = 1) and for the pre-placement N-solver.
 
 use crate::commitment::{CommitmentScore, eviction_risk};
 use crate::constants::{
@@ -155,19 +157,74 @@ pub fn binomial_survival(n: u32, k: u32, p: f64) -> Result<f64, ReliabilityError
     }
 }
 
+/// Holder-correlated recovery probability for a block.
+///
+/// Each holder either survives — all of its `sᵢ` symbols present at once — or
+/// dies (all gone), surviving independently with probability `pᵢ`. The block is
+/// recoverable iff the surviving holders together hold ≥ `k_eff` *distinct*
+/// symbols. ESI ranges are disjoint across holders (guaranteed by the placement
+/// watermark), so surviving holders' symbols sum as distinct.
+///
+/// Computed exactly by a DP convolution over holders, capping the running
+/// "surviving symbol count" at `k_eff` (anything ≥ k_eff is already enough):
+///
+/// ```text
+/// dist[0] = 1
+/// for (s, p) in holders:
+///     new[x]               += dist[x] · (1−p)          // holder dies
+///     new[min(x+s, k_eff)] += dist[x] · p              // holder survives
+/// R = dist[k_eff]
+/// ```
+///
+/// Cost: O(H · k_eff), H ≤ MAX_HOLDERS_PER_BLOCK → trivial.
+///
+/// Degenerate cases (sanity-checked in tests):
+///   - all sᵢ = 1             → R = P(Binomial-like ≥ k_eff) (per-symbol model)
+///   - all sᵢ = k_eff         → R = 1 − Π(1−pᵢ) (replica model; any one holder recovers)
+///   - k_eff == 0             → R = 1.0 (trivially recoverable)
+///   - empty holders, k_eff>0 → R = 0.0
+///
+/// Each tuple is `(alive_symbols, survival_prob)`.
+/// Returns Err(InvalidSurvivalProb) if any `survival_prob` is outside [0.0, 1.0].
+pub fn correlated_recovery_prob(
+    holders: &[(u32, f64)],
+    k_eff: u32,
+) -> Result<f64, ReliabilityError> {
+    for &(_, p) in holders {
+        if !(0.0..=1.0).contains(&p) {
+            return Err(ReliabilityError::InvalidSurvivalProb(p));
+        }
+    }
+
+    // dist[x] = P(surviving holders so far hold exactly x distinct symbols),
+    // with x capped at k_eff (≥ k_eff is lumped into the top bucket — already enough).
+    let cap = k_eff as usize;
+    let mut dist = vec![0.0f64; cap + 1];
+    dist[0] = 1.0;
+
+    for &(s, p) in holders {
+        let q = 1.0 - p;
+        let s = (s as usize).min(cap);
+        let mut next = vec![0.0f64; cap + 1];
+        for (x, &mass) in dist.iter().enumerate() {
+            if mass == 0.0 {
+                continue;
+            }
+            next[x] += mass * q; // holder dies → 0 symbols added
+            next[(x + s).min(cap)] += mass * p; // holder survives → +s (capped)
+        }
+        dist = next;
+    }
+
+    Ok(dist[cap])
+}
+
 /// Compute the survival probability for a source block given its holder set.
 ///
-/// The model treats each symbol independently: each holder contributes
-/// `alive_symbols` independent symbols, each surviving with probability
-/// `survival_prob`. Total alive = sum of alive_symbols across all holders.
-/// Effective survival probability = weighted mean of per-holder survival_prob,
-/// weighted by alive_symbols count.
-///
-/// Then: reliability = binomial_survival(total_alive, k_eff, weighted_mean_p)
-///
-/// Rationale for weighted mean: symbols held by a high-commitment holder are
-/// more likely to survive. Weighting by symbol count correctly accounts for
-/// how many symbols benefit from that holder's reliability.
+/// Holder-correlated model (see `correlated_recovery_prob`): each holder is
+/// alive-or-dead as a unit, and the block is recoverable iff surviving holders
+/// together hold ≥ k_eff distinct symbols. A single holder with ≥ k_eff symbols
+/// therefore yields exactly its own survival probability `p`.
 ///
 /// Returns Err if k_eff == 0 or any holder has an invalid survival_prob.
 pub fn block_reliability(input: &BlockReliabilityInput) -> Result<f64, ReliabilityError> {
@@ -175,8 +232,12 @@ pub fn block_reliability(input: &BlockReliabilityInput) -> Result<f64, Reliabili
         return Err(ReliabilityError::InvalidKEff(0));
     }
 
-    let (total_alive, weighted_mean_p) = weighted_mean_survival(&input.holders)?;
-    binomial_survival(total_alive, input.k_eff, weighted_mean_p)
+    let holders: Vec<(u32, f64)> = input
+        .holders
+        .iter()
+        .map(|h| (h.alive_symbols, h.survival_prob))
+        .collect();
+    correlated_recovery_prob(&holders, input.k_eff)
 }
 
 /// Compute P(file recoverable) for a multi-block file.
@@ -211,10 +272,8 @@ pub fn file_reliability(blocks: &[(u32, u32, f64)]) -> Result<f64, ReliabilityEr
 /// Used to find single points of failure:
 ///   "If holder X leaves, what is the new reliability?"
 ///
-/// Algorithm:
-///   1. Remove holder's symbols from the total count.
-///   2. Recompute weighted mean survival prob without that holder.
-///   3. Call binomial_survival with the reduced inputs.
+/// Algorithm: drop the named holder, then recompute the holder-correlated
+/// recovery probability over the remaining holders.
 ///
 /// Returns Err if holder_id is not found in input.holders, or if k_eff == 0,
 /// or if any holder has an invalid survival_prob.
@@ -230,21 +289,13 @@ pub fn per_holder_impact(
         return Err(ReliabilityError::HolderNotFound(*holder_id));
     }
 
-    // Validate all survival probabilities upfront.
-    for h in &input.holders {
-        if !(0.0..=1.0).contains(&h.survival_prob) {
-            return Err(ReliabilityError::InvalidSurvivalProb(h.survival_prob));
-        }
-    }
-
-    let reduced: Vec<&HolderReliabilityInput> = input
+    let reduced: Vec<(u32, f64)> = input
         .holders
         .iter()
         .filter(|h| &h.holder_id != holder_id)
+        .map(|h| (h.alive_symbols, h.survival_prob))
         .collect();
-
-    let (total_alive, weighted_mean_p) = weighted_mean_survival_refs(&reduced)?;
-    binomial_survival(total_alive, input.k_eff, weighted_mean_p)
+    correlated_recovery_prob(&reduced, input.k_eff)
 }
 
 /// Build a full ReliabilityReport for a source block.
@@ -536,58 +587,4 @@ fn standard_normal_cdf(z: f64) -> f64 {
     } else {
         upper_tail
     }
-}
-
-/// Compute (total_alive, weighted_mean_p) from a slice of HolderReliabilityInput.
-/// Returns Err(InvalidSurvivalProb) for any holder with p outside [0.0, 1.0].
-/// Returns Err(SymbolCountOverflow) if total_alive overflows u32.
-fn weighted_mean_survival(
-    holders: &[HolderReliabilityInput],
-) -> Result<(u32, f64), ReliabilityError> {
-    let mut total_alive: u32 = 0;
-    let mut weighted_sum: f64 = 0.0;
-
-    for h in holders {
-        if !(0.0..=1.0).contains(&h.survival_prob) {
-            return Err(ReliabilityError::InvalidSurvivalProb(h.survival_prob));
-        }
-        total_alive = total_alive
-            .checked_add(h.alive_symbols)
-            .ok_or(ReliabilityError::SymbolCountOverflow)?;
-        weighted_sum += h.alive_symbols as f64 * h.survival_prob;
-    }
-
-    let weighted_mean_p = if total_alive == 0 {
-        0.0
-    } else {
-        weighted_sum / total_alive as f64
-    };
-
-    Ok((total_alive, weighted_mean_p))
-}
-
-/// Same as weighted_mean_survival but for a slice of references (used in per_holder_impact).
-fn weighted_mean_survival_refs(
-    holders: &[&HolderReliabilityInput],
-) -> Result<(u32, f64), ReliabilityError> {
-    let mut total_alive: u32 = 0;
-    let mut weighted_sum: f64 = 0.0;
-
-    for h in holders {
-        if !(0.0..=1.0).contains(&h.survival_prob) {
-            return Err(ReliabilityError::InvalidSurvivalProb(h.survival_prob));
-        }
-        total_alive = total_alive
-            .checked_add(h.alive_symbols)
-            .ok_or(ReliabilityError::SymbolCountOverflow)?;
-        weighted_sum += h.alive_symbols as f64 * h.survival_prob;
-    }
-
-    let weighted_mean_p = if total_alive == 0 {
-        0.0
-    } else {
-        weighted_sum / total_alive as f64
-    };
-
-    Ok((total_alive, weighted_mean_p))
 }
