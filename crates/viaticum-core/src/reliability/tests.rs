@@ -2,7 +2,7 @@ use super::{
     BlockReliabilityInput, HolderCandidate, HolderReliabilityInput, ReliabilityError,
     binomial_survival, block_reliability, build_report, commitment_to_survival_prob,
     correlated_recovery_prob, file_reliability, per_holder_impact, solve_n_for_target,
-    target_reliability, weighted_mean_trust,
+    solve_placement_for_target, target_reliability, weighted_mean_trust,
 };
 use crate::commitment::CommitmentScore;
 use crate::constants::{MAX_OVERHEAD_FACTOR, MIN_REDUNDANCY};
@@ -1136,4 +1136,158 @@ fn solve_n_for_target_anchor_important_data() {
         achieved >= target_p || n == k_eff * MAX_OVERHEAD_FACTOR,
         "n={n} achieves {achieved}, target={target_p}, and is not at cap"
     );
+}
+
+// ============================================================
+// Tests: solve_placement_for_target — emergent replica/spread
+// ============================================================
+
+fn used_count(plan: &super::PlacementPlan) -> usize {
+    plan.per_holder.iter().filter(|&&s| s > 0).count()
+}
+
+#[test]
+fn solver_few_holders_picks_replicas() {
+    // Pool of 2, max importance. With only 2 holders, the highest-R shape is two
+    // full copies — recoverable from either. (Old per-symbol model would have
+    // split into 2×(k_eff−1), both mandatory.)
+    let k_eff = 5u32;
+    let holders = pool(&[0.9, 0.9]);
+    let plan =
+        solve_placement_for_target(k_eff, &holders, target_reliability(1.0), 30, 10).unwrap();
+    assert_eq!(
+        plan.per_holder,
+        vec![k_eff, k_eff],
+        "expected two full copies"
+    );
+    // Recoverable from either single holder.
+    let r_either = correlated_recovery_prob(&[(k_eff, 0.9)], k_eff).unwrap();
+    assert!((r_either - 0.9).abs() < 1e-9);
+}
+
+#[test]
+fn solver_many_holders_picks_spread() {
+    // Pool of 30, max importance → thin spread reaches target; nobody holds a
+    // full set, and many holders are used.
+    let k_eff = 5u32;
+    let holders = pool(&[0.7; 30]);
+    let plan =
+        solve_placement_for_target(k_eff, &holders, target_reliability(1.0), 30, 10).unwrap();
+    assert!(
+        plan.reached_target,
+        "spread should reach target with 30 holders"
+    );
+    let max = *plan.per_holder.iter().max().unwrap();
+    assert!(
+        max < k_eff,
+        "no holder should hold a full set, got max={max}"
+    );
+    assert!(
+        used_count(&plan) > k_eff as usize,
+        "spread should use many holders, used={}",
+        used_count(&plan)
+    );
+}
+
+#[test]
+fn solver_low_target_single_holder_yields_one_copy() {
+    // One holder, low target (importance≈0 → ~0.499). A single full copy gives
+    // R = p = 0.7 ≥ target → one copy is enough; no error, no second holder.
+    let k_eff = 5u32;
+    let holders = pool(&[0.7]);
+    let plan =
+        solve_placement_for_target(k_eff, &holders, target_reliability(0.0), 30, 10).unwrap();
+    assert_eq!(
+        plan.per_holder,
+        vec![k_eff],
+        "expected exactly one full copy"
+    );
+    assert!(plan.reached_target);
+}
+
+#[test]
+fn solver_uses_two_when_target_requires_it() {
+    // 2 holders, target between a single copy (0.7) and two copies (1−0.3²=0.91):
+    // the solver must open the second holder to reach it.
+    let k_eff = 5u32;
+    let holders = pool(&[0.7, 0.7]);
+    let target = 0.85;
+    let plan = solve_placement_for_target(k_eff, &holders, target, 30, 10).unwrap();
+    assert_eq!(
+        used_count(&plan),
+        2,
+        "solver must use both holders to reach 0.85"
+    );
+    assert!(plan.reached_target);
+    assert_eq!(plan.per_holder, vec![k_eff, k_eff]);
+}
+
+#[test]
+fn solver_unreachable_target_returns_best_effort_flag() {
+    // Weak 2-holder pool can't reach five-nines; max R = 1−0.7² = 0.51.
+    // Solver returns best-effort placement (full copies) with reached_target=false.
+    let k_eff = 5u32;
+    let holders = pool(&[0.3, 0.3]);
+    let plan = solve_placement_for_target(k_eff, &holders, 0.99999, 30, 10).unwrap();
+    assert!(!plan.reached_target, "five-nines unreachable with p=0.3 ×2");
+    assert!(used_count(&plan) >= 1, "should still place best-effort");
+    let max = *plan.per_holder.iter().max().unwrap();
+    assert!(max <= k_eff);
+}
+
+#[test]
+fn solver_never_exceeds_k_eff_per_holder() {
+    // Tiny strong pool + high target forces concentration → cap at k_eff each.
+    let k_eff = 5u32;
+    let holders = pool(&[0.6, 0.6]);
+    let plan = solve_placement_for_target(k_eff, &holders, 0.99999, 30, 10).unwrap();
+    for &s in &plan.per_holder {
+        assert!(s <= k_eff, "per-holder {s} exceeds k_eff={k_eff}");
+    }
+}
+
+#[test]
+fn solver_respects_max_holders() {
+    // 30 candidates but max_holders=3 → at most 3 holders used (then replicas).
+    let k_eff = 5u32;
+    let holders = pool(&[0.7; 30]);
+    let plan = solve_placement_for_target(k_eff, &holders, 0.99999, 3, 10).unwrap();
+    assert!(
+        used_count(&plan) <= 3,
+        "must not exceed max_holders=3, used={}",
+        used_count(&plan)
+    );
+}
+
+#[test]
+fn solver_respects_max_overhead_budget() {
+    // max_overhead=1 caps total symbols at k_eff → can place at most one full
+    // copy's worth; weak unreachable target → best-effort within budget.
+    let k_eff = 5u32;
+    let holders = pool(&[0.5; 30]);
+    let plan = solve_placement_for_target(k_eff, &holders, 0.99999, 30, 1).unwrap();
+    let total: u32 = plan.per_holder.iter().sum();
+    assert!(total <= k_eff, "total {total} exceeds k_eff×max_overhead=5");
+    assert!(!plan.reached_target);
+}
+
+#[test]
+fn solver_zero_k_eff_errors() {
+    let holders = pool(&[0.7]);
+    let r = solve_placement_for_target(0, &holders, 0.9, 30, 10);
+    assert!(matches!(r, Err(ReliabilityError::InvalidKEff(0))));
+}
+
+#[test]
+fn solver_invalid_survival_prob_errors() {
+    let holders = pool(&[1.5]);
+    let r = solve_placement_for_target(5, &holders, 0.9, 30, 10);
+    assert!(matches!(r, Err(ReliabilityError::InvalidSurvivalProb(p)) if (p - 1.5).abs() < 1e-9));
+}
+
+#[test]
+fn solver_empty_pool_is_best_effort_not_panic() {
+    let plan = solve_placement_for_target(5, &[], 0.99, 30, 10).unwrap();
+    assert!(plan.per_holder.is_empty());
+    assert!(!plan.reached_target);
 }

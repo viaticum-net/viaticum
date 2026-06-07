@@ -505,6 +505,168 @@ pub fn solve_n_for_target(
 }
 
 // ============================================================
+// Public API: solve_placement_for_target (holder-correlated)
+// ============================================================
+
+/// A holder-correlated placement plan: how many symbols each pool candidate gets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacementPlan {
+    /// Symbols assigned to each input candidate, index-aligned with the `holders`
+    /// slice passed to `solve_placement_for_target`. `0` = candidate unused.
+    pub per_holder: Vec<u32>,
+    /// True if the achieved holder-correlated reliability reached `target_p`.
+    /// False = best-effort placement under the limits (caller flags under-target).
+    pub reached_target: bool,
+}
+
+/// Greedily choose a holder-correlated placement that reaches `target_p` with as
+/// few symbols as possible, within the given limits.
+///
+/// At each step it adds the single symbol that most raises the correlated recovery
+/// probability (`correlated_recovery_prob`) — to a *fresh* holder (diversity) or an
+/// existing partial holder (concentration), whichever raises R more. The shape is
+/// therefore **emergent**, not configured: few holders → full copies (replicas),
+/// many holders → thin spread. On the R=0 plateau (total symbols < k_eff, no
+/// surviving combination can decode yet) all single increments tie at ΔR=0; the
+/// tiebreak prefers opening a new holder, so spread builds where the pool allows.
+///
+/// Limits:
+///   - per holder ≤ `k_eff` — a full copy already decodes; more is pure waste,
+///   - at most `max_holders` distinct holders used,
+///   - at most `k_eff × max_overhead` symbols in total.
+///
+/// Stops when R ≥ `target_p` (`reached_target = true`) or no legal increment
+/// remains; on a small/weak pool it returns a best-effort plan with
+/// `reached_target = false` rather than erroring (DR doctrine: defer-not-refuse).
+///
+/// `target_p` is clamped to [0,1]. Returns `Err(InvalidKEff(0))` if `k_eff == 0`,
+/// `Err(InvalidSurvivalProb)` for an out-of-range candidate.
+///
+/// Cost: greedy single-symbol; each step re-evaluates the O(H·k_eff) DP per
+/// candidate. Bounded by `min(max_holders, H)·k_eff` placed symbols. Cheap for the
+/// small/moderate `k_eff` where replica-vs-spread matters; callers should gate very
+/// large `k_eff` blocks (which are erasure-spread regardless) to the weight-based path.
+pub fn solve_placement_for_target(
+    k_eff: u32,
+    holders: &[HolderCandidate],
+    target_p: f64,
+    max_holders: usize,
+    max_overhead: u32,
+) -> Result<PlacementPlan, ReliabilityError> {
+    if k_eff == 0 {
+        return Err(ReliabilityError::InvalidKEff(0));
+    }
+    for h in holders {
+        if !(0.0..=1.0).contains(&h.survival_prob) {
+            return Err(ReliabilityError::InvalidSurvivalProb(h.survival_prob));
+        }
+    }
+
+    let target_p = target_p.clamp(0.0, 1.0);
+    let n_holders = holders.len();
+    let max_total = (k_eff as u64).saturating_mul(max_overhead as u64);
+    let mut per_holder = vec![0u32; n_holders];
+
+    // R for the current placement (probs already validated → unwrap is safe).
+    let recovery = |per: &[u32]| -> f64 {
+        let pairs: Vec<(u32, f64)> = per
+            .iter()
+            .zip(holders.iter())
+            .filter(|&(&s, _)| s > 0)
+            .map(|(&s, h)| (s, h.survival_prob))
+            .collect();
+        correlated_recovery_prob(&pairs, k_eff).unwrap_or(0.0)
+    };
+
+    let mut current_r = recovery(&per_holder);
+
+    // Phase A — SPREAD: open fresh holders one symbol each, strongest first, until
+    // R reaches target or we run out of holders / budget. Spreading 1-each is the
+    // symbol-cheapest way to raise correlated recovery while distinct holders remain
+    // (each adds an independent survival path), so "many holders → thin spread"
+    // falls out naturally. Note: on a highly heterogeneous pool (a few strong + many
+    // near-zero holders) spreading onto weak holders can underperform deepening the
+    // strong ones — acceptable for the curated, trust-filtered candidate pool;
+    // revisit only if measurements show waste (design open question).
+    let mut order: Vec<usize> = (0..n_holders).collect();
+    order.sort_by(|&a, &b| {
+        holders[b]
+            .survival_prob
+            .partial_cmp(&holders[a].survival_prob)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+    // `take(max_holders)` opens at most `max_holders` distinct holders (one per
+    // non-broken iteration), so no separate counter is needed.
+    for &idx in order.iter().take(max_holders) {
+        if current_r >= target_p {
+            break;
+        }
+        let total: u64 = per_holder.iter().map(|&s| s as u64).sum();
+        if total >= max_total {
+            break;
+        }
+        per_holder[idx] = 1;
+        current_r = recovery(&per_holder);
+    }
+
+    // Phase B — DEEPEN: with no fresh holders left, add symbols to existing holders
+    // (up to k_eff each), taking the largest ΔR. Ties prefer the fuller holder so a
+    // full copy completes sooner; this is what turns a few holders into replicas.
+    while current_r < target_p {
+        let total: u64 = per_holder.iter().map(|&s| s as u64).sum();
+        if total >= max_total {
+            break;
+        }
+        let mut best: Option<(f64, usize)> = None;
+        for i in 0..n_holders {
+            let s = per_holder[i];
+            if s == 0 || s >= k_eff {
+                continue; // only deepen already-opened, not-yet-full holders
+            }
+            per_holder[i] += 1;
+            let r = recovery(&per_holder);
+            per_holder[i] -= 1;
+
+            let better = match best {
+                None => true,
+                Some((best_r, best_i)) => {
+                    if (r - best_r).abs() > 1e-12 {
+                        r > best_r
+                    } else if per_holder[i] != per_holder[best_i] {
+                        per_holder[i] > per_holder[best_i] // prefer the fuller holder
+                    } else {
+                        let pi = holders[i].survival_prob;
+                        let pb = holders[best_i].survival_prob;
+                        if (pi - pb).abs() > 1e-12 {
+                            pi > pb
+                        } else {
+                            i < best_i
+                        }
+                    }
+                }
+            };
+            if better {
+                best = Some((r, i));
+            }
+        }
+
+        match best {
+            Some((r, i)) => {
+                per_holder[i] += 1;
+                current_r = r;
+            }
+            None => break, // no holder left to deepen
+        }
+    }
+
+    Ok(PlacementPlan {
+        reached_target: current_r >= target_p,
+        per_holder,
+    })
+}
+
+// ============================================================
 // pub(crate) helper: weighted_mean_trust
 // ============================================================
 
