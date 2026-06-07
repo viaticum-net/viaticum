@@ -1035,6 +1035,7 @@ impl DaemonHandle {
             accepted_offers,
             encoder.clone(),
             epoch_key_bytes,
+            cfg.data_dir.clone(),
         );
         let cancel_scheduler = cancel.clone();
         tasks.push(tokio::spawn(async move {

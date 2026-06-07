@@ -75,6 +75,40 @@ fn remove_retained_is_idempotent() {
 }
 
 #[test]
+fn try_load_returns_none_when_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = SourceBlockId([0x11u8; 32]);
+    let got = try_load_retained_block(dir.path(), &missing).unwrap();
+    assert!(got.is_none(), "absent retained block must yield Ok(None)");
+}
+
+#[test]
+fn try_load_returns_some_when_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let (id, blob) = build_state_block(b"present state".repeat(10).as_slice(), &key()).unwrap();
+    store_retained_block(dir.path(), &id, &blob).unwrap();
+    let got = try_load_retained_block(dir.path(), &id).unwrap();
+    assert_eq!(got, Some(blob));
+}
+
+#[test]
+fn try_load_propagates_corruption_as_err() {
+    let dir = tempfile::tempdir().unwrap();
+    let (id, blob) = build_state_block(b"state".repeat(10).as_slice(), &key()).unwrap();
+    store_retained_block(dir.path(), &id, &blob).unwrap();
+    let path = retained_block_path(dir.path(), &id);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[0] ^= 0xFF;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let got = try_load_retained_block(dir.path(), &id);
+    assert!(
+        got.is_err(),
+        "corruption must propagate as Err, not be swallowed as None"
+    );
+}
+
+#[test]
 fn ss_record_has_max_importance_and_high_overhead() {
     let (id, blob) = build_state_block(&b"state".repeat(5000), &key()).unwrap();
     let rec = ss_source_block_record(id, blob.len()).unwrap();

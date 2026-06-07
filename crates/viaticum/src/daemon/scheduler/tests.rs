@@ -115,6 +115,7 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
+        std::env::temp_dir(),
     );
 
     scheduler.check_timeouts().await.expect("check_timeouts");
@@ -197,6 +198,7 @@ async fn check_timeouts_ignores_fresh_challenges() {
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
+        std::env::temp_dir(),
     );
 
     scheduler.check_timeouts().await.expect("check_timeouts");
@@ -308,6 +310,7 @@ async fn check_timeouts_respects_time_scale() {
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
+        std::env::temp_dir(),
     );
 
     scheduler.check_timeouts().await.expect("check_timeouts");
@@ -377,6 +380,7 @@ async fn issue_due_challenges_skips_already_pending() {
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
+        std::env::temp_dir(),
     );
 
     // issue_due_challenges should skip this holder because it's already pending.
@@ -436,6 +440,7 @@ async fn scheduler_skips_deleting_placements() {
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
+        std::env::temp_dir(),
     );
 
     scheduler
@@ -512,6 +517,7 @@ async fn time_scale_divides_intervals() {
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
+        std::env::temp_dir(),
     );
 
     scheduler.check_timeouts().await.expect("check_timeouts");
@@ -627,6 +633,7 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
+        std::env::temp_dir(),
     );
 
     // Now = after owner cooldown. Deleted_at=0, cooldown=4 weeks.
@@ -681,6 +688,7 @@ async fn deletion_tick_noop_when_no_eligible_files() {
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
+        std::env::temp_dir(),
     );
 
     scheduler.process_deletion_tick().await.unwrap();
@@ -738,6 +746,7 @@ async fn scheduler_transitions_offered_to_lost_after_long_absence() {
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
+        std::env::temp_dir(),
     );
 
     scheduler.sweep_offered_placements().await.unwrap();
@@ -812,6 +821,7 @@ async fn scheduler_does_not_transition_offered_to_lost_before_long_absence() {
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
+        std::env::temp_dir(),
     );
 
     scheduler.sweep_offered_placements().await.unwrap();
@@ -930,6 +940,7 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
+        std::env::temp_dir(),
     );
 
     // First tick: should send the drop notice.
@@ -1060,6 +1071,7 @@ async fn cleanup_block_removes_files_from_disk() {
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
+        std::env::temp_dir(),
     );
 
     scheduler.process_deletion_tick().await.unwrap();
@@ -1129,6 +1141,7 @@ fn make_scheduler_for_hook(
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
+        std::env::temp_dir(),
     )
 }
 

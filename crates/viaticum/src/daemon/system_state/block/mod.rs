@@ -78,6 +78,29 @@ pub fn load_retained_block(data_dir: &Path, block_id: &SourceBlockId) -> anyhow:
     Ok(blob)
 }
 
+/// Try to read a retained SystemState block blob.
+///
+/// Returns `Ok(None)` when no retained blob exists for `block_id` (so a caller
+/// like the PoS re-encode path can fall through to the file-rebuild branch), and
+/// `Err` when a blob exists but is corrupt (blake3 mismatch) — corruption must be
+/// loud, never silently treated as "absent".
+pub fn try_load_retained_block(
+    data_dir: &Path,
+    block_id: &SourceBlockId,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    match std::fs::read(retained_block_path(data_dir, block_id)) {
+        Ok(blob) => {
+            let computed = blake3::hash(&blob);
+            if computed.as_bytes() != &block_id.0 {
+                anyhow::bail!("retained SystemState block {block_id} corrupted: blake3 mismatch");
+            }
+            Ok(Some(blob))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Remove a retained SystemState block blob (used after rotation/compaction).
 /// Missing file is not an error.
 pub fn remove_retained_block(data_dir: &Path, block_id: &SourceBlockId) -> anyhow::Result<()> {

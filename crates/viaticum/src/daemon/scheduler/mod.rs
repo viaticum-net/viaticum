@@ -98,6 +98,10 @@ pub struct Scheduler {
     encoder: std::sync::Arc<dyn viaticum_core::erasure::ErasureEncoder>,
     /// Epoch encryption key for rebuilding source block blobs.
     epoch_key: [u8; 32],
+    /// Base data dir (`~/.viaticum`); SystemState retained block blobs live under
+    /// `<data_dir>/system_state/`. Used by `load_source_block_data` to serve PoS
+    /// challenges for SS blocks (which have no backing watch-dir file).
+    data_dir: std::path::PathBuf,
 }
 
 impl Scheduler {
@@ -114,6 +118,7 @@ impl Scheduler {
         accepted_offers: crate::daemon::processor::AcceptedOffers,
         encoder: std::sync::Arc<dyn viaticum_core::erasure::ErasureEncoder>,
         epoch_key: [u8; 32],
+        data_dir: std::path::PathBuf,
     ) -> Self {
         Scheduler {
             db,
@@ -126,6 +131,7 @@ impl Scheduler {
             accepted_offers,
             encoder,
             epoch_key,
+            data_dir,
         }
     }
 
@@ -553,9 +559,21 @@ impl Scheduler {
 
     /// Load source block data for PoS challenge computation.
     ///
-    /// First tries reading block.bin from disk; if not found, rebuilds from
-    /// source files using compress_and_encrypt (same path as Processor::rebuild_blob_for_pos).
+    /// Resolution order:
+    ///   1. SystemState retained blob (`<data_dir>/system_state/<hex>.bin`) — SS blocks
+    ///      have no backing watch-dir file; the owner retains the blob for PoS re-encode.
+    ///      Corruption is propagated loudly; absence falls through.
+    ///   2. `block.bin` cache on disk.
+    ///   3. Rebuild from source files via compress_and_encrypt (same path as
+    ///      Processor::rebuild_blob_for_pos).
     async fn load_source_block_data(&self, block_id: &SourceBlockId) -> anyhow::Result<Vec<u8>> {
+        // SystemState blocks: serve the owner-retained blob (verified blake3 == block_id).
+        if let Some(blob) =
+            crate::daemon::system_state::block::try_load_retained_block(&self.data_dir, block_id)?
+        {
+            return Ok(blob);
+        }
+
         let block_hex = viaticum_core::types::hex_encode(&block_id.0);
         let block_path = self.source_blocks_dir.join(&block_hex).join("block.bin");
 
