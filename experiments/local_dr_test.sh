@@ -72,9 +72,17 @@ wait_daemon() {
 
 get_addr() {
     local idx="$1"
-    # Status now shows a libp2p multiaddr: /ip4/0.0.0.0/tcp/PORT/p2p/PEERID
-    local RAW_ADDR=$(run_cli_q "$idx" status 2>/dev/null | grep "addr:" \
-        | grep -oE '/ip4/[^ ]+')
+    # Status shows a libp2p multiaddr: /ip4/0.0.0.0/tcp/PORT/p2p/PEERID.
+    # wait_daemon returns on "identity:" (available from the keyfile almost
+    # immediately), but the swarm listen address is reported ~1s later. Poll
+    # until the addr appears so a solo-started node (node-00) doesn't race.
+    local RAW_ADDR=""
+    for _ in $(seq 1 20); do
+        RAW_ADDR=$(run_cli_q "$idx" status 2>/dev/null | grep "addr:" \
+            | grep -oE '/ip4/[^ ]+' || true)
+        [ -n "$RAW_ADDR" ] && break
+        sleep 0.5
+    done
     if [ -z "$RAW_ADDR" ]; then return; fi
     # Replace 0.0.0.0 with 127.0.0.1 for local testing.
     echo "$RAW_ADDR" | sed 's|/ip4/0.0.0.0/|/ip4/127.0.0.1/|'
@@ -106,12 +114,16 @@ echo "=== Phase 1: Setup ==="
 
 mkdir -p "$TEST_DIR"
 
-# Init all nodes
-echo "  Initializing ${NUM_NODES} nodes (shared cluster master key)..."
+# Init all nodes. node-00 uses a FIXED mnemonic so the `dr` recovery command can
+# re-derive its identity after simulated loss. The other nodes are independent
+# owners with distinct masters: same-master siblings are excluded from the
+# placement pool by design, so node-00 needs non-sibling holders for its data.
+echo "  Initializing ${NUM_NODES} nodes (node-00 fixed mnemonic, others distinct masters)..."
+mkdir -p "$(node_dir 0)"
 run_cli 0 init --mnemonic "$MNEMONIC_00" > /dev/null 2>&1
 for i in $(seq 1 $((NUM_NODES-1))); do
     mkdir -p "$(node_dir "$i")"
-    run_cli "$i" init --mnemonic "$MNEMONIC_00" --new-device > /dev/null 2>&1
+    run_cli "$i" init > /dev/null 2>&1
 done
 echo "  ${NUM_NODES} nodes initialized."
 

@@ -66,9 +66,17 @@ wait_daemon() {
 
 get_addr() {
     local idx="$1"
-    # Status now shows a libp2p multiaddr: /ip4/0.0.0.0/tcp/PORT/p2p/PEERID
-    local RAW_ADDR=$(run_cli_q "$idx" status 2>/dev/null | grep "addr:" \
-        | grep -oE '/ip4/[^ ]+')
+    # Status shows a libp2p multiaddr: /ip4/0.0.0.0/tcp/PORT/p2p/PEERID.
+    # wait_daemon returns on "identity:" (available from the keyfile almost
+    # immediately), but the swarm listen address is reported ~1s later. Poll
+    # until it appears so a freshly/solo-started node does not race.
+    local RAW_ADDR=""
+    for _ in $(seq 1 20); do
+        RAW_ADDR=$(run_cli_q "$idx" status 2>/dev/null | grep "addr:" \
+            | grep -oE '/ip4/[^ ]+' || true)
+        [ -n "$RAW_ADDR" ] && break
+        sleep 0.5
+    done
     if [ -z "$RAW_ADDR" ]; then return; fi
     echo "$RAW_ADDR" | sed 's|/ip4/0.0.0.0/|/ip4/127.0.0.1/|'
 }
@@ -99,18 +107,15 @@ echo "=== Phase 1: Setup (${NUM_NODES} nodes) ==="
 
 mkdir -p "$TEST_DIR"
 
-# Init node-00 as cluster master, other nodes as cluster devices.
-echo "  Initializing node-00 (cluster master)..."
-mkdir -p "$(node_dir 0)"
-MNEMONIC=$(run_cli 0 init 2>&1 | grep -A 2 "Mnemonic" | tail -1 | xargs)
-echo "  Mnemonic: ${MNEMONIC:0:20}..."
-
-echo "  Initializing nodes 1-$((NUM_NODES-1)) as cluster devices..."
-for i in $(seq 1 $((NUM_NODES-1))); do
+# Init each node as an independent owner with its OWN master identity.
+# Same-master siblings are excluded from the placement pool by design, so distinct
+# owners are required to exercise the real backup/placement flow.
+echo "  Initializing ${NUM_NODES} nodes as independent owners (distinct masters)..."
+for i in $(seq 0 $((NUM_NODES-1))); do
     mkdir -p "$(node_dir "$i")"
-    run_cli "$i" init --mnemonic "$MNEMONIC" --new-device > /dev/null 2>&1
+    run_cli "$i" init > /dev/null 2>&1
 done
-echo "  ${NUM_NODES} nodes initialized (shared cluster master key)."
+echo "  ${NUM_NODES} nodes initialized (distinct master keys)."
 
 for i in $(seq 0 $((NUM_NODES-1))); do
     cat > "$(node_dir "$i")/config.toml" << 'CFGEOF'

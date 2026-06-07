@@ -66,8 +66,17 @@ wait_daemon() {
 
 get_addr() {
     local idx="$1"
-    local RAW_ADDR=$(timeout 5 "$BINARY" --data-dir "$(node_dir "$idx")" status 2>/dev/null \
-        | grep "addr:" | grep -oE '/ip4/[^ ]+' || true)
+    # Status shows a libp2p multiaddr: /ip4/0.0.0.0/tcp/PORT/p2p/PEERID.
+    # wait_daemon returns on "identity:" (available from the keyfile almost
+    # immediately), but the swarm listen address is reported ~1s later. Poll
+    # until it appears so a freshly/solo-started node does not race.
+    local RAW_ADDR=""
+    for _ in $(seq 1 20); do
+        RAW_ADDR=$(timeout 5 "$BINARY" --data-dir "$(node_dir "$idx")" status 2>/dev/null \
+            | grep "addr:" | grep -oE '/ip4/[^ ]+' || true)
+        [ -n "$RAW_ADDR" ] && break
+        sleep 0.5
+    done
     if [ -z "$RAW_ADDR" ]; then return; fi
     echo "$RAW_ADDR" | sed 's|/ip4/0.0.0.0/|/ip4/127.0.0.1/|'
 }
@@ -115,12 +124,12 @@ echo "=== Phase 1: Setup ==="
 
 mkdir -p "$TEST_DIR"
 
-echo "  Initializing ${NUM_NODES} nodes (shared cluster master key)..."
-mkdir -p "$(node_dir 0)"
-MNEMONIC=$(run_cli 0 init 2>&1 | grep -A 2 "Mnemonic" | tail -1 | xargs)
-for i in $(seq 1 $((NUM_NODES-1))); do
+# Distinct master per node: same-master siblings are excluded from the placement
+# pool by design, so independent owners are required to exercise backup/placement.
+echo "  Initializing ${NUM_NODES} nodes as independent owners (distinct masters)..."
+for i in $(seq 0 $((NUM_NODES-1))); do
     mkdir -p "$(node_dir "$i")"
-    run_cli "$i" init --mnemonic "$MNEMONIC" --new-device > /dev/null 2>&1
+    run_cli "$i" init > /dev/null 2>&1
 done
 
 for i in $(seq 0 $((NUM_NODES-1))); do
