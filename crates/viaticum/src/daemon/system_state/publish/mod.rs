@@ -74,6 +74,12 @@ fn register_ss_block(
 /// holder's PeerRecord. Blocks with no Alive placements yet yield an empty holder
 /// list — the pointer is eventually-consistent as placement completes.
 pub fn block_ref_from_placements(db: &Db, block_id: &SourceBlockId) -> anyhow::Result<BlockRef> {
+    let record = db
+        .get_source_block(block_id)?
+        .ok_or_else(|| anyhow::anyhow!("SS source block record missing: {block_id}"))?;
+    let encrypted_size = record
+        .encrypted_size
+        .ok_or_else(|| anyhow::anyhow!("SS source block {block_id} has no encrypted_size"))?;
     let placements = db.list_placements_for_block(block_id)?;
     let mut holders = Vec::new();
     for p in placements {
@@ -96,6 +102,7 @@ pub fn block_ref_from_placements(db: &Db, block_id: &SourceBlockId) -> anyhow::R
     Ok(BlockRef {
         block_id: *block_id,
         holders,
+        encrypted_size,
     })
 }
 

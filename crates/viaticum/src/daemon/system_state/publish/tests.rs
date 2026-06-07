@@ -147,8 +147,18 @@ fn block_ref_carries_alive_holders_with_esi_and_addrs() {
     ))
     .unwrap();
 
+    let expected_size = db
+        .get_source_block(&base_id)
+        .unwrap()
+        .unwrap()
+        .encrypted_size
+        .unwrap();
     let bref = block_ref_from_placements(&db, &base_id).unwrap();
     assert_eq!(bref.block_id, base_id);
+    assert_eq!(
+        bref.encrypted_size, expected_size,
+        "BlockRef must carry encrypted_size for DR param recompute"
+    );
     assert_eq!(bref.holders.len(), 1);
     assert_eq!(bref.holders[0].holder_id, holder);
     assert_eq!(bref.holders[0].esi_ranges, vec![(0, 12)]);

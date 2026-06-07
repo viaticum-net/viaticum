@@ -527,6 +527,7 @@ fn sample_base_ref() -> BlockRef {
             addrs: vec!["/ip4/10.0.0.1/tcp/4001".to_string()],
             esi_ranges: vec![(0, 16)],
         }],
+        encrypted_size: 4096,
     }
 }
 
@@ -538,6 +539,7 @@ fn sample_diff_refs() -> Vec<BlockRef> {
             addrs: vec![],
             esi_ranges: vec![(16, 24)],
         }],
+        encrypted_size: 512,
     }]
 }
 

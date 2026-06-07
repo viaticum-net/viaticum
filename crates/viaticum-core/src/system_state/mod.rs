@@ -659,6 +659,11 @@ pub struct HolderHint {
 pub struct BlockRef {
     pub block_id: SourceBlockId,
     pub holders: Vec<HolderHint>,
+    /// Encrypted blob length. DR has no SourceBlockRecord (it's inside the state
+    /// being recovered), so the size travels in the pointer: DR recomputes the
+    /// exact `ErasureParams` via `ErasureParams::compute(encrypted_size, SS_IMPORTANCE)`
+    /// and truncates the decoded buffer to this length before decrypt.
+    pub encrypted_size: u64,
 }
 
 /// Signed, addressable index to the owner's latest SystemState.
