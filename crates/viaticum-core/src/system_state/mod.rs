@@ -647,6 +647,11 @@ pub struct HolderHint {
     pub holder_id: DeviceId,
     /// Last-known dialable multiaddrs (best-effort; may be empty — re-resolved via discovery).
     pub addrs: Vec<String>,
+    /// ESI ranges this holder stores for the block, copied from the owner's
+    /// `SymbolPlacement` at pointer-build time. DR has no `symbol_placements`
+    /// yet (that's what it's recovering), so the ranges must travel inside the
+    /// signed pointer to let DR reconstruct a fetch request (closes Bug-A).
+    pub esi_ranges: Vec<(u32, u32)>,
 }
 
 /// Reference to one SystemState block plus the holders to fetch it from at DR.

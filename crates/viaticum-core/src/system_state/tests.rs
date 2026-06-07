@@ -525,6 +525,7 @@ fn sample_base_ref() -> BlockRef {
         holders: vec![HolderHint {
             holder_id: DeviceId([7u8; 32]),
             addrs: vec!["/ip4/10.0.0.1/tcp/4001".to_string()],
+            esi_ranges: vec![(0, 16)],
         }],
     }
 }
@@ -535,6 +536,7 @@ fn sample_diff_refs() -> Vec<BlockRef> {
         holders: vec![HolderHint {
             holder_id: DeviceId([8u8; 32]),
             addrs: vec![],
+            esi_ranges: vec![(16, 24)],
         }],
     }]
 }
@@ -585,6 +587,13 @@ fn self_pointer_tamper_fails_verify() {
     assert!(
         verify_self_pointer(&t_holder, &id).is_err(),
         "tampered holder hint must fail"
+    );
+
+    let mut t_esi = p.clone();
+    t_esi.base.holders[0].esi_ranges = vec![(99, 200)];
+    assert!(
+        verify_self_pointer(&t_esi, &id).is_err(),
+        "tampered holder esi_ranges must fail (ranges are inside the signed payload)"
     );
 }
 
