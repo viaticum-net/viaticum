@@ -610,53 +610,57 @@ pub fn solve_placement_for_target(
         current_r = recovery(&per_holder);
     }
 
-    // Phase B — DEEPEN: with no fresh holders left, add symbols to existing holders
-    // (up to k_eff each), taking the largest ΔR. Ties prefer the fuller holder so a
-    // full copy completes sooner; this is what turns a few holders into replicas.
-    while current_r < target_p {
-        let total: u64 = per_holder.iter().map(|&s| s as u64).sum();
-        if total >= max_total {
-            break;
-        }
-        let mut best: Option<(f64, usize)> = None;
-        for i in 0..n_holders {
-            let s = per_holder[i];
-            if s == 0 || s >= k_eff {
-                continue; // only deepen already-opened, not-yet-full holders
-            }
-            per_holder[i] += 1;
-            let r = recovery(&per_holder);
-            per_holder[i] -= 1;
-
-            let better = match best {
-                None => true,
-                Some((best_r, best_i)) => {
-                    if (r - best_r).abs() > 1e-12 {
-                        r > best_r
-                    } else if per_holder[i] != per_holder[best_i] {
-                        per_holder[i] > per_holder[best_i] // prefer the fuller holder
-                    } else {
-                        let pi = holders[i].survival_prob;
-                        let pb = holders[best_i].survival_prob;
-                        if (pi - pb).abs() > 1e-12 {
-                            pi > pb
-                        } else {
-                            i < best_i
-                        }
-                    }
+    // Phase B — DEEPEN: with no fresh holders left, thicken the opened holders'
+    // erasure shares *uniformly* (up to k_eff each) until R reaches target. This is
+    // what makes the shape track k_eff vs holder count: with a large k_eff and few
+    // holders it grows balanced erasure shares (~k_eff/m each, far cheaper than full
+    // copies); with a small k_eff it fills holders to k_eff, which is replicas.
+    //
+    // A per-symbol greedy here would be O(total · H² · k_eff) — far too slow for
+    // production k_eff (~2000 for a 128 MiB block). Instead: R is monotonic in the
+    // total symbol count T under an even split, so binary-search the smallest T whose
+    // even split reaches target. O(log(H·k_eff) · H·k_eff). Equivalent to the
+    // emptier-first per-symbol deepen (both keep holder counts within 1 of each other).
+    if current_r < target_p {
+        let opened: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|&i| per_holder[i] > 0)
+            .collect();
+        let h = opened.len() as u64;
+        if h > 0 {
+            // Even split of T symbols across the opened holders (strongest take the
+            // remainder); capped at k_eff each (guaranteed by T ≤ h·k_eff).
+            let apply_even = |per: &mut [u32], t: u64| {
+                let base = (t / h) as u32;
+                let rem = (t % h) as u32;
+                for (rank, &idx) in opened.iter().enumerate() {
+                    per[idx] = base + u32::from((rank as u64) < rem as u64);
                 }
             };
-            if better {
-                best = Some((r, i));
-            }
-        }
 
-        match best {
-            Some((r, i)) => {
-                per_holder[i] += 1;
-                current_r = r;
+            let lo_t = h; // current state: 1 symbol each
+            let hi_t = (h * k_eff as u64).min(max_total);
+
+            apply_even(&mut per_holder, hi_t);
+            if recovery(&per_holder) < target_p {
+                // Unreachable even at the cap — keep the best-effort max placement.
+                current_r = recovery(&per_holder);
+            } else {
+                let mut lo = lo_t;
+                let mut hi = hi_t;
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    apply_even(&mut per_holder, mid);
+                    if recovery(&per_holder) >= target_p {
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
+                    }
+                }
+                apply_even(&mut per_holder, lo);
+                current_r = recovery(&per_holder);
             }
-            None => break, // no holder left to deepen
         }
     }
 

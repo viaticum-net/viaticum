@@ -2,7 +2,7 @@
 // Pure logic — no DB, no async, no network.
 // Weight formula: trust / sqrt(1 - trust)  (mean-variance optimum)
 
-use crate::constants::{MAX_HOLDERS_PER_BLOCK, MIN_SYMBOLS_PER_HOLDER};
+use crate::constants::{MAX_HOLDERS_PER_BLOCK, MAX_OVERHEAD_FACTOR, MIN_SYMBOLS_PER_HOLDER};
 use crate::reliability;
 use crate::types::{DeviceId, ErasureParams};
 
@@ -274,31 +274,35 @@ pub fn compute_allocation(
     Ok(allocations)
 }
 
-/// Compute a symbol allocation using N derived dynamically from pool trust
-/// and block importance, rather than the static overhead formula.
+/// Compute a holder-correlated symbol allocation driven by block importance.
 ///
-/// Internally calls `reliability::target_reliability(importance)` and
-/// `reliability::solve_n_for_target(k_eff, pool, target_p)` to determine N,
-/// then delegates to `compute_allocation` with the resulting ErasureParams.
+/// This is the unified placement path (placement/reliability redesign). It derives
+/// the decode threshold `k_eff` from the block size, the reliability target from
+/// `importance` (`reliability::target_reliability`), then calls
+/// `reliability::solve_placement_for_target` to choose per-holder symbol counts that
+/// reach the target with as few symbols as possible under the holder-correlated
+/// model. The placement *shape* is emergent: few holders → full-copy replicas, many
+/// holders → thin erasure spread — no mode flag, no concentration cap, no minimum
+/// holder/redundancy floor. A single holder is a valid best-effort placement.
 ///
-/// Falls back to static N (`ErasureParams::compute(source_size, importance)`)
-/// if the solver fails (empty pool, invalid k_eff).
+/// Per-holder counts are capped at `k_eff` (a full copy already decodes), bounded by
+/// `MAX_HOLDERS_PER_BLOCK` distinct holders and `k_eff × MAX_OVERHEAD_FACTOR` total
+/// symbols. If the target is unreachable within those limits the placement is still
+/// returned best-effort (the caller detects under-target via a reliability check and
+/// schedules repair — DR doctrine: defer-not-refuse).
 ///
 /// # Parameters
 ///
-/// - `candidates`: holder pool as used by `compute_allocation`. Must be non-empty
-///   for a non-NoCandidates result.
-/// - `source_size`: compressed+encrypted blob size in bytes. Used to derive `k`
-///   via the static formula. Must be > 0.
+/// - `candidates`: trusted holder pool. `trust` is used as the per-holder survival
+///   proxy (clamped to [0, 0.999]). Must be non-empty for a non-NoCandidates result.
+/// - `source_size`: compressed+encrypted blob size in bytes. Drives `k`/`k_eff`. > 0.
 /// - `importance`: block importance in [0.0, 1.0]. Clamped if out of range.
 /// - `esi_offset`: first ESI to assign (0 for single-device; namespace offset for cluster).
 ///
 /// # Errors
 ///
-/// Returns `PlacementError::NoCandidates` if `candidates` is empty.
-/// Returns `PlacementError::NTooSmall` if computed N < holder count (rare; may happen
-/// with very large pools and very small blocks).
-/// Other `PlacementError` variants per `compute_allocation`.
+/// Returns `PlacementError::NoCandidates` if `candidates` is empty or `source_size`
+/// is 0 (an empty block cannot be erasure-coded).
 pub fn compute_allocation_with_importance(
     candidates: &[HolderCandidate],
     source_size: u64,
@@ -309,14 +313,15 @@ pub fn compute_allocation_with_importance(
         return Err(PlacementError::NoCandidates);
     }
 
-    // Base ErasureParams from static formula (provides k, k_eff, t, overhead).
+    // k_eff from the block size (k, t are derived; overhead/n are no longer used —
+    // redundancy is target-driven by the solver, not the static overhead formula).
     let base_params = ErasureParams::compute(source_size, importance)
         .map_err(|_| PlacementError::NoCandidates)?;
+    let k_eff = base_params.k_eff;
 
     let target_p = reliability::target_reliability(importance);
 
-    // Convert placement candidates to solver candidates.
-    // Trust is the combined survival proxy: trust ∈ [0, 1).
+    // Trust is the per-holder survival proxy: trust ∈ [0, 1).
     let solver_candidates: Vec<reliability::HolderCandidate> = candidates
         .iter()
         .map(|c| reliability::HolderCandidate {
@@ -324,29 +329,51 @@ pub fn compute_allocation_with_importance(
         })
         .collect();
 
-    let n_target =
-        match reliability::solve_n_for_target(base_params.k_eff, &solver_candidates, target_p) {
-            Ok(n) => n,
-            Err(_) => {
-                // Empty pool or invalid k_eff — fall back to static N.
-                tracing::debug!(
-                    k_eff = base_params.k_eff,
-                    importance,
-                    "compute_allocation_with_importance: solver failed, using static N"
-                );
-                base_params.n
-            }
-        };
-
-    // Build ErasureParams with dynamic N.
-    // We preserve k, k_eff, t, overhead from base_params; only n changes.
-    let params = ErasureParams {
-        k: base_params.k,
-        k_eff: base_params.k_eff,
-        t: base_params.t,
-        overhead: base_params.overhead,
-        n: n_target,
+    let plan = match reliability::solve_placement_for_target(
+        k_eff,
+        &solver_candidates,
+        target_p,
+        MAX_HOLDERS_PER_BLOCK as usize,
+        MAX_OVERHEAD_FACTOR,
+    ) {
+        Ok(plan) => plan,
+        Err(_) => {
+            // Invalid k_eff (0) — cannot place. Treated as no viable placement.
+            return Err(PlacementError::NoCandidates);
+        }
     };
 
-    compute_allocation(candidates, &params, esi_offset)
+    if !plan.reached_target {
+        tracing::debug!(
+            k_eff,
+            importance,
+            target_p,
+            "compute_allocation_with_importance: best-effort placement (under target)"
+        );
+    }
+
+    // Assign ESI ranges, largest share first (ties by device_id bytes) — matches the
+    // contiguous, non-overlapping ESI convention used elsewhere.
+    let mut order: Vec<usize> = (0..candidates.len())
+        .filter(|&i| plan.per_holder[i] > 0)
+        .collect();
+    order.sort_by(|&a, &b| {
+        plan.per_holder[b]
+            .cmp(&plan.per_holder[a])
+            .then_with(|| candidates[a].device_id.0.cmp(&candidates[b].device_id.0))
+    });
+
+    let mut allocations = Vec::with_capacity(order.len());
+    let mut esi_cursor = esi_offset;
+    for idx in order {
+        let count = plan.per_holder[idx];
+        allocations.push(HolderAllocation {
+            device_id: candidates[idx].device_id,
+            symbol_count: count,
+            start_esi: esi_cursor,
+        });
+        esi_cursor += count;
+    }
+
+    Ok(allocations)
 }

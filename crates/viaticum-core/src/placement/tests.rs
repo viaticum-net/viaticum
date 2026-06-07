@@ -665,7 +665,8 @@ fn uniform_candidates(count: usize, trust: f64) -> Vec<HolderCandidate> {
 fn compute_with_holders_uses_target_reliability_of_importance() {
     // 8 holders with trust=0.85, 10MB block, importance=1.0
     // target_p = target_reliability(1.0) ≈ 0.99999 — very high target.
-    // The solver must produce a valid N with total symbols >= k_eff + MIN_REDUNDANCY.
+    // The placement must be decodable (total >= k_eff), within the overhead cap,
+    // and no holder may exceed a full copy (k_eff).
     let candidates = uniform_candidates(8, 0.85);
     let source_size = 10 * 1024 * 1024u64;
     let result = compute_allocation_with_importance(&candidates, source_size, 1.0, 0);
@@ -673,16 +674,25 @@ fn compute_with_holders_uses_target_reliability_of_importance() {
     let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
     let base = crate::types::ErasureParams::compute(source_size, 1.0).unwrap();
     assert!(
-        total >= base.k_eff + crate::constants::MIN_REDUNDANCY,
-        "total={total} must be >= k_eff ({}) + MIN_REDUNDANCY ({})",
+        total >= base.k_eff,
+        "total={total} must be decodable (>= k_eff={})",
         base.k_eff,
-        crate::constants::MIN_REDUNDANCY,
+    );
+    assert!(
+        total <= base.k_eff * crate::constants::MAX_OVERHEAD_FACTOR,
+        "total={total} must be within k_eff × MAX_OVERHEAD_FACTOR"
+    );
+    assert!(
+        allocs.iter().all(|a| a.symbol_count <= base.k_eff),
+        "no holder may exceed a full copy (k_eff={})",
+        base.k_eff
     );
 }
 
 #[test]
-fn compute_with_holders_solves_n_via_solve_n_for_target() {
-    // Low-trust pool needs higher N to reach the same target than a high-trust pool.
+fn compute_with_holders_weak_pool_needs_more_symbols() {
+    // Low-trust pool needs more symbols to reach the same target than a high-trust
+    // pool (holder-correlated solver: weaker p ⇒ more redundancy).
     let source_size = 5 * 1024 * 1024u64;
     let importance = 0.8;
 
@@ -729,8 +739,9 @@ fn compute_with_holders_zero_source_size_returns_err() {
 }
 
 #[test]
-fn compute_with_holders_n_satisfies_min_redundancy() {
+fn compute_with_holders_total_within_bounds() {
     // 3 holders with trust=0.5, 1MB block, low importance=0.05.
+    // Placement must be decodable (>= k_eff) and within the overhead cap.
     let candidates = uniform_candidates(3, 0.5);
     let source_size = 1024 * 1024u64;
     let allocs = compute_allocation_with_importance(&candidates, source_size, 0.05, 0)
@@ -738,10 +749,9 @@ fn compute_with_holders_n_satisfies_min_redundancy() {
     let total: u32 = allocs.iter().map(|a| a.symbol_count).sum();
     let base = crate::types::ErasureParams::compute(source_size, 0.05).unwrap();
     assert!(
-        total >= base.k_eff + crate::constants::MIN_REDUNDANCY,
-        "total={total} must be >= k_eff ({}) + MIN_REDUNDANCY ({})",
+        total >= base.k_eff,
+        "total={total} must be decodable (>= k_eff={})",
         base.k_eff,
-        crate::constants::MIN_REDUNDANCY,
     );
     assert!(
         total <= base.k_eff * crate::constants::MAX_OVERHEAD_FACTOR,

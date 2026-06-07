@@ -1291,3 +1291,25 @@ fn solver_empty_pool_is_best_effort_not_panic() {
     assert!(plan.per_holder.is_empty());
     assert!(!plan.reached_target);
 }
+
+#[test]
+fn solver_large_k_eff_spreads_not_replicates() {
+    // Large block (k_eff ~ 2000, like a 128 MiB source block) across 30 holders →
+    // erasure spread: each holder gets a moderate share far below a full copy, not
+    // 30 full copies. Also a perf smoke: the binary-search deepen must finish fast.
+    let k_eff = 2051u32;
+    let holders = pool(&[0.85; 30]);
+    let plan =
+        solve_placement_for_target(k_eff, &holders, target_reliability(1.0), 30, 10).unwrap();
+    assert!(plan.reached_target, "should reach target with 30 holders");
+    let max = *plan.per_holder.iter().max().unwrap();
+    assert!(
+        max < k_eff,
+        "must spread, not full copies: max={max}, k_eff={k_eff}"
+    );
+    let total: u32 = plan.per_holder.iter().sum();
+    assert!(
+        total < k_eff * 3,
+        "spread overhead should be modest, total={total}"
+    );
+}
