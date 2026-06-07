@@ -228,12 +228,10 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
     let node_addr = match state.swarm_handle.as_ref() {
         Some(swarm) => {
             let addrs = swarm.listen_addrs().await.unwrap_or_default();
-            // Prefer non-loopback, fallback to any address.
-            let base = addrs
-                .iter()
-                .find(|a| !a.to_string().contains("/127.0.0.1/"))
-                .or(addrs.first())
-                .map(|a| a.to_string())
+            // Prefer a routable IPv4 address, then any routable, then anything.
+            // Excludes both IPv4 (127.0.0.1) and IPv6 (::1) loopback.
+            let addr_strings: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+            let base = crate::daemon::network::addr::select_display_base_addr(&addr_strings)
                 .unwrap_or_default();
             if base.is_empty() {
                 swarm.peer_id.to_string()

@@ -18,6 +18,33 @@ use std::net::SocketAddr;
 
 use viaticum_core::types::DeviceId;
 
+#[cfg(test)]
+mod tests;
+
+/// Pick the most useful listen address to display/share from a node's set of
+/// libp2p listen multiaddrs (string form, e.g. `/ip4/192.168.1.5/tcp/12345`).
+///
+/// Selection order:
+///   1. a routable IPv4 address (most broadly reachable; what local test
+///      harnesses dial and what a user can paste to a peer),
+///   2. otherwise any routable address,
+///   3. otherwise the first address (even loopback), as a last resort.
+///
+/// "Routable" excludes loopback: `/127.0.0.1/` (IPv4) **and** `/::1/` (IPv6).
+/// The previous inline filter only excluded the IPv4 loopback, so a node whose
+/// listen set happened to order `/ip6/::1/...` first would advertise that
+/// useless loopback address. Returns `None` only for an empty set.
+pub fn select_display_base_addr(addrs: &[String]) -> Option<String> {
+    let is_loopback = |a: &String| a.contains("/127.0.0.1/") || a.contains("/::1/");
+    let is_ip4 = |a: &String| a.contains("/ip4/");
+    addrs
+        .iter()
+        .find(|a| is_ip4(a) && !is_loopback(a))
+        .or_else(|| addrs.iter().find(|a| !is_loopback(a)))
+        .or_else(|| addrs.first())
+        .cloned()
+}
+
 /// Error returned by `parse_node_addr`.
 #[derive(Debug, thiserror::Error)]
 pub enum AddrParseError {
