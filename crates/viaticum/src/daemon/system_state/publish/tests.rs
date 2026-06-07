@@ -47,7 +47,7 @@ fn publish_base_block_persists_retains_and_registers() {
     let dir = tempfile::tempdir().unwrap();
     let state = snapshot_db(&db).unwrap();
 
-    let block_id = publish_base_block(&db, dir.path(), &dr_key(), &state).unwrap();
+    let block_id = publish_base_block(&db, dir.path(), &dr_key(), 1, &state).unwrap();
 
     // Retained blob decrypts back to the exact snapshot.
     let recovered: viaticum_core::system_state::SystemState =
@@ -83,7 +83,7 @@ fn publish_diff_block_roundtrips() {
     let diffs: Vec<DiffOp> = diff_states(&old, &new);
     assert!(!diffs.is_empty(), "adding a file must produce a diff");
 
-    let block_id = publish_diff_block(&db, dir.path(), &dr_key(), &diffs).unwrap();
+    let block_id = publish_diff_block(&db, dir.path(), &dr_key(), 1, &diffs).unwrap();
 
     let recovered: Vec<DiffOp> = decode_retained(dir.path(), &block_id);
     // DiffOp has no PartialEq; compare canonical CBOR (round-trip proxy).
@@ -136,7 +136,7 @@ fn block_ref_carries_alive_holders_with_esi_and_addrs() {
     let db = Db::open_in_memory().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let state = snapshot_db(&db).unwrap();
-    let base_id = publish_base_block(&db, dir.path(), &dr_key(), &state).unwrap();
+    let base_id = publish_base_block(&db, dir.path(), &dr_key(), 1, &state).unwrap();
 
     let holder = DeviceId([0x42u8; 32]);
     db.upsert_placement(&alive_placement(base_id, holder))
@@ -170,7 +170,7 @@ fn block_ref_skips_non_alive_placements() {
     let db = Db::open_in_memory().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let state = snapshot_db(&db).unwrap();
-    let base_id = publish_base_block(&db, dir.path(), &dr_key(), &state).unwrap();
+    let base_id = publish_base_block(&db, dir.path(), &dr_key(), 1, &state).unwrap();
 
     let holder = DeviceId([0x43u8; 32]);
     let mut p = alive_placement(base_id, holder);
@@ -189,7 +189,7 @@ fn built_pointer_verifies_against_master_identity() {
     let db = Db::open_in_memory().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let state = snapshot_db(&db).unwrap();
-    let base_id = publish_base_block(&db, dir.path(), &dr_key(), &state).unwrap();
+    let base_id = publish_base_block(&db, dir.path(), &dr_key(), 1, &state).unwrap();
 
     let master = viaticum_core::cluster::derive_master_key(&[9u8; 32]).unwrap();
     let id = viaticum_core::cluster::master_identity(&master);
@@ -202,16 +202,65 @@ fn built_pointer_verifies_against_master_identity() {
 }
 
 #[test]
+fn published_block_is_in_ledger_and_excluded_from_snapshot() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let state = snapshot_db(&db).unwrap();
+    let base_id = publish_base_block(&db, dir.path(), &dr_key(), 7, &state).unwrap();
+
+    assert!(
+        db.is_ss_block(&base_id).unwrap(),
+        "publish marks the SS ledger"
+    );
+    assert_eq!(db.list_ss_blocks().unwrap(), vec![(base_id, 7)]);
+
+    // The SS record lives in source_blocks but must not appear in a fresh snapshot.
+    assert!(db.get_source_block(&base_id).unwrap().is_some());
+    let snap = snapshot_db(&db).unwrap();
+    assert!(
+        !snap.source_blocks.iter().any(|b| b.block_id == base_id),
+        "SS block must be excluded from the snapshot (no self-reference)"
+    );
+}
+
+#[test]
+fn retire_removes_block_record_placements_blob_and_ledger() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let state = snapshot_db(&db).unwrap();
+    let base_id = publish_base_block(&db, dir.path(), &dr_key(), 1, &state).unwrap();
+    let holder = DeviceId([0x55u8; 32]);
+    db.upsert_placement(&alive_placement(base_id, holder))
+        .unwrap();
+
+    retire_ss_block(&db, dir.path(), &base_id);
+
+    assert!(!db.is_ss_block(&base_id).unwrap(), "ledger entry removed");
+    assert!(
+        db.get_source_block(&base_id).unwrap().is_none(),
+        "record deleted"
+    );
+    assert!(
+        db.list_placements_for_block(&base_id).unwrap().is_empty(),
+        "placements deleted"
+    );
+    assert!(
+        block::load_retained_block(dir.path(), &base_id).is_err(),
+        "retained blob removed"
+    );
+}
+
+#[test]
 fn distinct_states_yield_distinct_base_blocks() {
     let db = Db::open_in_memory().unwrap();
     let dir = tempfile::tempdir().unwrap();
 
     let s0 = snapshot_db(&db).unwrap();
-    let id0 = publish_base_block(&db, dir.path(), &dr_key(), &s0).unwrap();
+    let id0 = publish_base_block(&db, dir.path(), &dr_key(), 1, &s0).unwrap();
 
     sample_file(&db, 3, "c.txt");
     let s1 = snapshot_db(&db).unwrap();
-    let id1 = publish_base_block(&db, dir.path(), &dr_key(), &s1).unwrap();
+    let id1 = publish_base_block(&db, dir.path(), &dr_key(), 1, &s1).unwrap();
 
     assert_ne!(
         id0, id1,

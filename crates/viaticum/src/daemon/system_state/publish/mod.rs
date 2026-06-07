@@ -36,10 +36,11 @@ pub fn publish_base_block(
     db: &Db,
     data_dir: &Path,
     dr_key: &[u8; 32],
+    generation: u32,
     state: &SystemState,
 ) -> anyhow::Result<SourceBlockId> {
     let plaintext = to_cbor_bytes(state);
-    register_ss_block(db, data_dir, dr_key, &plaintext)
+    register_ss_block(db, data_dir, dr_key, generation, &plaintext)
 }
 
 /// Build, retain, and register a *diff* SystemState block (`Vec<DiffOp>` delta).
@@ -47,24 +48,50 @@ pub fn publish_diff_block(
     db: &Db,
     data_dir: &Path,
     dr_key: &[u8; 32],
+    generation: u32,
     diffs: &[DiffOp],
 ) -> anyhow::Result<SourceBlockId> {
     let plaintext = to_cbor_bytes(&diffs.to_vec());
-    register_ss_block(db, data_dir, dr_key, &plaintext)
+    register_ss_block(db, data_dir, dr_key, generation, &plaintext)
 }
 
-/// Shared: encrypt plaintext into an SS block, retain the blob, upsert the record.
+/// Shared: encrypt plaintext into an SS block, retain the blob, upsert the record,
+/// and record it in the SS ledger (so snapshot_db excludes it and retire can find it).
 fn register_ss_block(
     db: &Db,
     data_dir: &Path,
     dr_key: &[u8; 32],
+    generation: u32,
     plaintext: &[u8],
 ) -> anyhow::Result<SourceBlockId> {
     let (block_id, blob) = block::build_state_block(plaintext, dr_key)?;
     block::store_retained_block(data_dir, &block_id, &blob)?;
     let record = block::ss_source_block_record(block_id, blob.len())?;
     db.upsert_source_block(&record)?;
+    db.mark_ss_block(&block_id, generation)?;
     Ok(block_id)
+}
+
+/// Retire a superseded SS block: drop it from the ledger, delete its source-block
+/// record + placements, and remove the retained blob. Best-effort — logs but does
+/// not fail the publish if individual steps error (the block simply ages out).
+pub fn retire_ss_block(db: &Db, data_dir: &Path, block_id: &SourceBlockId) {
+    if let Err(e) = db.unmark_ss_block(block_id) {
+        tracing::warn!(block = %block_id, error = %e, "retire SS block: unmark failed");
+    }
+    if let Ok(placements) = db.list_placements_for_block(block_id) {
+        for p in placements {
+            if let Err(e) = db.delete_placement(block_id, &p.holder_id) {
+                tracing::warn!(block = %block_id, error = %e, "retire SS block: delete placement failed");
+            }
+        }
+    }
+    if let Err(e) = db.delete_source_block(block_id) {
+        tracing::warn!(block = %block_id, error = %e, "retire SS block: delete record failed");
+    }
+    if let Err(e) = block::remove_retained_block(data_dir, block_id) {
+        tracing::warn!(block = %block_id, error = %e, "retire SS block: remove retained blob failed");
+    }
 }
 
 /// Build a `BlockRef` for one SS block from its currently-Alive placements.
