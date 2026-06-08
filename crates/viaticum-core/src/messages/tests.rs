@@ -619,7 +619,7 @@ fn system_state_response_msg_roundtrip() {
 
 // ─── PROP-01: CBOR roundtrip sweep — all 26 Message variants ────────────────
 
-fn all_26_message_variants() -> Vec<Message> {
+fn all_31_message_variants() -> Vec<Message> {
     let sbid = make_source_block_id(1);
     let ts = Timestamp(1000);
 
@@ -817,13 +817,46 @@ fn all_26_message_variants() -> Vec<Message> {
             timestamp: ts,
         }),
         Message::Ack(AckMsg { v: 1 }),
+        Message::MailboxFetchRequest(MailboxFetchRequest {
+            v: 1,
+            target: make_identity_pub(0x10),
+            since_stored_at: None,
+        }),
+        Message::MailboxFetchResponse(MailboxFetchResponse {
+            v: 1,
+            entries: vec![],
+            served_msg_ids: vec![],
+        }),
+        Message::MailboxStoreRequest(MailboxStoreRequest {
+            v: 1,
+            target: make_identity_pub(0x11),
+            entry: crate::mailbox::MailboxEntry {
+                target: make_identity_pub(0x11),
+                msg_id: [0xABu8; 16],
+                class: crate::mailbox::MailboxClass::PosChallenge,
+                payload_version: 1,
+                payload: vec![1, 2, 3],
+                expires_at: 9_999_999,
+                stored_at: 1_000_000,
+                sender: None,
+            },
+        }),
+        Message::MailboxStoreResponse(MailboxStoreResponse::Ack {
+            msg_id: [0xCDu8; 16],
+        }),
+        // Reject is a structurally distinct variant (carries a reason enum) — its
+        // CBOR path differs from Ack, so sweep it too (WARN-2).
+        Message::MailboxStoreResponse(MailboxStoreResponse::Reject {
+            msg_id: [0xEFu8; 16],
+            reason: MailboxRejectReason::NotInCandidateSet,
+        }),
     ]
 }
 
 #[test]
 fn all_message_variants_cbor_roundtrip_sweep() {
-    let variants = all_26_message_variants();
-    assert_eq!(variants.len(), 26, "expected 26 Message variants");
+    let variants = all_31_message_variants();
+    assert_eq!(variants.len(), 31, "expected 31 Message variants");
     for msg in &variants {
         let bytes = to_cbor(msg).expect("to_cbor must not fail");
         let decoded: Message = from_cbor(&bytes).expect("from_cbor must not fail");
@@ -833,8 +866,8 @@ fn all_message_variants_cbor_roundtrip_sweep() {
 
 #[test]
 fn all_message_variants_frame_unframe_roundtrip_sweep() {
-    let variants = all_26_message_variants();
-    assert_eq!(variants.len(), 26, "expected 26 Message variants");
+    let variants = all_31_message_variants();
+    assert_eq!(variants.len(), 31, "expected 31 Message variants");
     for msg in &variants {
         let framed = frame_message(msg).expect("frame_message must not fail");
         let (decoded, consumed) = unframe_message(&framed).expect("unframe_message must not fail");
@@ -1024,8 +1057,8 @@ fn unknown_message_variant_from_cbor_does_not_close_stream() {
 
 #[test]
 fn all_messages_have_version_one() {
-    let variants = all_26_message_variants();
-    assert_eq!(variants.len(), 26, "expected 26 Message variants");
+    let variants = all_31_message_variants();
+    assert_eq!(variants.len(), 31, "expected 31 Message variants");
 
     for msg in &variants {
         let v = match msg {
@@ -1055,8 +1088,16 @@ fn all_messages_have_version_one() {
             Message::SystemStateRequest(m) => m.v,
             Message::SystemStateResponse(m) => m.v,
             Message::Ack(m) => m.v,
-            // Unknown is a decode-only sentinel; it is never in all_26_message_variants().
-            Message::Unknown => unreachable!("Unknown must not appear in all_26_message_variants"),
+            Message::MailboxFetchRequest(m) => m.v,
+            Message::MailboxFetchResponse(m) => m.v,
+            Message::MailboxStoreRequest(m) => m.v,
+            Message::MailboxStoreResponse(_) => {
+                // MailboxStoreResponse is an enum (not a struct), does not have a top-level v field.
+                // All instances produced by all_31_message_variants use v=1 semantics.
+                1
+            }
+            // Unknown is a decode-only sentinel; it is never in all_31_message_variants().
+            Message::Unknown => unreachable!("Unknown must not appear in all_31_message_variants"),
         };
         assert_eq!(
             v,

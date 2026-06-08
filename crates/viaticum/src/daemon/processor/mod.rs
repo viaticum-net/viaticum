@@ -51,12 +51,14 @@ use viaticum_core::messages::{
 use viaticum_core::types::{DeviceId, IdentityPub, PlacementStatus, SourceBlockId, Timestamp};
 
 use crate::daemon::cluster_sync::ClusterSyncManager;
-use crate::daemon::network::swarm::{ProtocolEvent, SwarmHandle};
+use crate::daemon::mailbox::candidate::KademliaRoutingView;
+use crate::daemon::network::swarm::{ProtocolEvent, SwarmHandle, device_id_to_peer_id};
 use crate::daemon::relay::{InboundMessage, RelayPost};
 use crate::daemon::repair::RepairTrigger;
 use crate::daemon::scheduler::PendingChallenges;
 
 mod cluster;
+pub mod mailbox;
 mod peer;
 mod pos;
 mod restore;
@@ -242,6 +244,26 @@ impl Processor {
     /// Called from `handle/mod.rs::start()` after constructing both Processor and WorkPipeline.
     pub fn set_work_event_tx(&mut self, tx: mpsc::Sender<crate::daemon::work_pipeline::WorkEvent>) {
         self.work_event_tx = Some(tx);
+    }
+
+    /// Build a KademliaRoutingView from known peers in the DB.
+    ///
+    /// Converts each stored PeerRecord's device_id to a libp2p PeerId.
+    /// Peers whose device_id cannot be converted (bad key bytes) are silently skipped.
+    /// The routing view is used for mailbox candidate-set checks (should_store).
+    fn build_routing_view(&self) -> KademliaRoutingView {
+        let peers = match self.db.list_all_peers() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(err = %e, "processor: build_routing_view: list_all_peers failed, using empty view");
+                return KademliaRoutingView::new(vec![]);
+            }
+        };
+        let peer_ids: Vec<_> = peers
+            .iter()
+            .filter_map(|p| device_id_to_peer_id(&p.device_id).ok())
+            .collect();
+        KademliaRoutingView::new(peer_ids)
     }
 
     /// Main loop: receive ProtocolEvents from the libp2p swarm and relay-board messages.
@@ -570,6 +592,22 @@ impl Processor {
                     timestamp: Timestamp::now(),
                 });
                 let _ = self.swarm.respond(response_channel, ack);
+            }
+            Message::MailboxStoreRequest(req) => {
+                // Build routing view from known peers in the DB.
+                let routing_view = self.build_routing_view();
+                let my_peer_id = self.swarm.peer_id;
+                let resp = mailbox::handle_mailbox_store(&self.db, &routing_view, &my_peer_id, req);
+                let _ = self
+                    .swarm
+                    .respond(response_channel, Message::MailboxStoreResponse(resp));
+            }
+            Message::MailboxFetchRequest(req) => {
+                let now = Timestamp::now().0;
+                let resp = mailbox::handle_mailbox_fetch(&self.db, req, from_master, now);
+                let _ = self
+                    .swarm
+                    .respond(response_channel, Message::MailboxFetchResponse(resp));
             }
             other => {
                 warn!(

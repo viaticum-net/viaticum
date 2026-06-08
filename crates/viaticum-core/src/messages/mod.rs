@@ -3,6 +3,7 @@ use crate::constants::{
     PROTOCOL_VERSION, RELAY_TTL_SECS,
 };
 use crate::erasure::Symbol;
+use crate::mailbox::{MailboxEntry, MailboxRejectReason};
 use crate::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp, sig_serde};
 use chacha20poly1305::ChaCha20Poly1305;
 use chacha20poly1305::KeyInit;
@@ -325,6 +326,50 @@ pub struct AckMsg {
 }
 
 // ============================================================
+// Mailbox wire types (T-3)
+// ============================================================
+
+/// Sender → Postman. Store a mailbox entry for `target`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MailboxStoreRequest {
+    pub v: u8,
+    pub target: IdentityPub,
+    pub entry: MailboxEntry,
+}
+
+/// Postman → Sender. Store response.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum MailboxStoreResponse {
+    Ack {
+        msg_id: [u8; 16],
+    },
+    Reject {
+        msg_id: [u8; 16],
+        reason: MailboxRejectReason,
+    },
+}
+
+/// Target → Postman. Fetch all entries addressed to me.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MailboxFetchRequest {
+    pub v: u8,
+    /// Target = my own master_pub (fetching my own mail).
+    pub target: IdentityPub,
+    /// Only return entries newer than this timestamp (optional, for incremental polling).
+    pub since_stored_at: Option<u64>,
+}
+
+/// Postman → Target. Fetch response.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MailboxFetchResponse {
+    pub v: u8,
+    pub entries: Vec<MailboxEntry>,
+    /// msg_ids of entries served. Field retained for future delivery-reward accounting;
+    /// no reward is computed in A2 (T-5 deferred).
+    pub served_msg_ids: Vec<[u8; 16]>,
+}
+
+// ============================================================
 // Top-level Message enum
 // ============================================================
 
@@ -362,6 +407,10 @@ pub enum Message {
     RestoreDenied(RestoreDeniedMsg),
     BoardSync(BoardSyncMsg),
     ClusterSyncRequest(ClusterSyncRequestMsg),
+    MailboxFetchRequest(MailboxFetchRequest),
+    MailboxFetchResponse(MailboxFetchResponse),
+    MailboxStoreRequest(MailboxStoreRequest),
+    MailboxStoreResponse(MailboxStoreResponse),
     ClusterSyncResponse(ClusterSyncResponseMsg),
     SystemStateBackup(SystemStateBackupMsg),
     SystemStateAck(SystemStateAckMsg),

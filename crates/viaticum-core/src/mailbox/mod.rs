@@ -96,7 +96,7 @@ fn default_payload_version() -> u8 {
 /// `payload_version` is a forward-compatibility field: SelfPointer entries
 /// have TTL = 5 years, so entries may survive until 2031+. Receivers MUST skip
 /// entries with unknown version (not error), to tolerate future format evolution.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MailboxEntry {
     /// Target (owner) identity this entry is addressed to.
     pub target: IdentityPub,
