@@ -6,6 +6,21 @@
 use crate::daemon::system_state::{
     SYSTEM_STATE_VERSION, decrypt_and_restore, snapshot_and_encrypt,
 };
+use viaticum_core::cluster::{derive_master_key, master_identity};
+use viaticum_core::system_state::{BlockRef, sign_self_pointer};
+use viaticum_core::types::{SourceBlockId, Timestamp, to_cbor_bytes};
+
+use super::select_freshest_valid_pointer;
+
+fn pointer_blob(master: &ed25519_dalek::SigningKey, generation: u32, created_at: u64) -> Vec<u8> {
+    let base = BlockRef {
+        block_id: SourceBlockId([generation as u8; 32]),
+        holders: vec![],
+        encrypted_size: 128,
+    };
+    let p = sign_self_pointer(master, generation, base, vec![], Timestamp(created_at));
+    to_cbor_bytes(&p)
+}
 
 #[test]
 fn dr_decrypt_and_restore_roundtrip() {
@@ -44,52 +59,72 @@ fn dr_fails_on_wrong_seed() {
 }
 
 #[test]
-fn dr_freshest_blob_selected_by_created_at() {
-    // Simulate what run_dr does: sort blobs by created_at desc, pick index 0.
+fn select_pointer_picks_freshest_created_at() {
+    let master = derive_master_key(&[5u8; 32]).unwrap();
+    let id = master_identity(&master);
     let blobs: Vec<(u64, Vec<u8>)> = vec![
-        (1000, vec![1, 2, 3]),
-        (3000, vec![4, 5, 6]), // freshest
-        (2000, vec![7, 8, 9]),
+        (1000, pointer_blob(&master, 1, 1000)),
+        (3000, pointer_blob(&master, 2, 3000)), // freshest by created_at
+        (2000, pointer_blob(&master, 3, 2000)),
     ];
-
-    let mut sorted = blobs.clone();
-    sorted.sort_by_key(|b| std::cmp::Reverse(b.0));
-
-    assert_eq!(sorted[0].0, 3000);
-    assert_eq!(sorted[0].1, vec![4, 5, 6]);
+    let picked = select_freshest_valid_pointer(&blobs, &id).expect("a valid pointer exists");
+    assert_eq!(picked.created_at, Timestamp(3000));
+    assert_eq!(picked.generation, 2);
 }
 
-// ─── SS-06 / DR-04: dr_no_blob_anywhere_returns_graceful_error ───────────────
-
-/// When BFS discovers no blobs (empty list), run_dr would call
-/// `anyhow::bail!("no system state blobs found...")`.
-/// This test directly exercises the selection logic to confirm an empty
-/// blob list produces a descriptive error rather than panicking.
-///
-/// Note: `bfs_collect_blobs` and `run_dr` require a live network and are
-/// integration-test territory. Here we validate the post-BFS logic in isolation
-/// by replicating the exact code path from run_dr.
 #[test]
-fn dr_no_blob_anywhere_returns_graceful_error() {
-    // Replicate the run_dr guard: if blobs is empty → bail, not panic.
-    let blobs: Vec<(u64, Vec<u8>)> = vec![];
+fn select_pointer_generation_breaks_created_at_tie() {
+    let master = derive_master_key(&[6u8; 32]).unwrap();
+    let id = master_identity(&master);
+    // Same created_at; higher generation wins the tiebreak.
+    let blobs: Vec<(u64, Vec<u8>)> = vec![
+        (5000, pointer_blob(&master, 4, 5000)),
+        (5000, pointer_blob(&master, 7, 5000)),
+    ];
+    let picked = select_freshest_valid_pointer(&blobs, &id).expect("a valid pointer exists");
+    assert_eq!(picked.generation, 7);
+}
 
-    // This is the exact condition from run_dr (mod.rs line ~100).
-    let result: anyhow::Result<()> = if blobs.is_empty() {
-        Err(anyhow::anyhow!(
-            "no system state blobs found during BFS discovery"
-        ))
-    } else {
-        Ok(())
-    };
+#[test]
+fn select_pointer_rejects_wrong_signer() {
+    let master = derive_master_key(&[7u8; 32]).unwrap();
+    let attacker = derive_master_key(&[8u8; 32]).unwrap();
+    let id = master_identity(&master);
+    // The only blob is a well-formed pointer signed by a DIFFERENT master → rejected.
+    let blobs: Vec<(u64, Vec<u8>)> = vec![(9000, pointer_blob(&attacker, 1, 9000))];
+    assert!(
+        select_freshest_valid_pointer(&blobs, &id).is_none(),
+        "a pointer signed by another master must not be selected"
+    );
+}
 
+#[test]
+fn select_pointer_none_when_empty_or_garbage() {
+    let master = derive_master_key(&[9u8; 32]).unwrap();
+    let id = master_identity(&master);
     assert!(
-        result.is_err(),
-        "empty blob list must return an error, not panic"
+        select_freshest_valid_pointer(&[], &id).is_none(),
+        "empty → None"
     );
-    let msg = result.unwrap_err().to_string();
+    let garbage: Vec<(u64, Vec<u8>)> = vec![(1, vec![1, 2, 3]), (2, vec![0xFF; 20])];
     assert!(
-        msg.contains("no system state blobs"),
-        "error message should describe the problem, got: {msg}"
+        select_freshest_valid_pointer(&garbage, &id).is_none(),
+        "non-pointer blobs → None"
     );
+}
+
+#[test]
+fn select_pointer_skips_invalid_keeps_valid() {
+    let master = derive_master_key(&[10u8; 32]).unwrap();
+    let attacker = derive_master_key(&[11u8; 32]).unwrap();
+    let id = master_identity(&master);
+    // A fresher attacker-signed pointer must NOT shadow the older valid one.
+    let blobs: Vec<(u64, Vec<u8>)> = vec![
+        (1000, pointer_blob(&master, 1, 1000)),   // valid, older
+        (9000, pointer_blob(&attacker, 9, 9000)), // invalid signer, fresher
+        (3, vec![0u8; 8]),                        // garbage
+    ];
+    let picked = select_freshest_valid_pointer(&blobs, &id).expect("the valid pointer survives");
+    assert_eq!(picked.created_at, Timestamp(1000));
+    assert_eq!(picked.generation, 1);
 }

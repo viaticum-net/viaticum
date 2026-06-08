@@ -4,14 +4,15 @@
 // Idempotent: running twice produces identical stored state because the computation
 // is deterministic given the same Placement and PeerRecord data.
 
-use crate::commitment::{HolderProfile, compute_commitment, eviction_risk};
+use crate::commitment::{CommitmentScore, HolderProfile, compute_commitment};
 use crate::config::DEFAULT_IMPORTANCE;
 use crate::constants::{
     DECODE_OVERHEAD, OVERHEAD_BASE, OVERHEAD_SCALE, P_WINDOW_WEEKS, SECS_PER_WEEK,
 };
 use crate::db::{Db, DbError};
 use crate::reliability::{
-    BlockReliabilityInput, HolderReliabilityInput, block_reliability, target_reliability,
+    BlockReliabilityInput, HolderReliabilityInput, block_reliability, commitment_to_survival_prob,
+    target_reliability,
 };
 use crate::types::{PlacementStatus, Timestamp};
 
@@ -180,9 +181,11 @@ pub fn migrate_block_records(db: &Db) -> Result<usize, MigrationError> {
 /// Compute the survival probability for one holder.
 ///
 /// Assembles a `HolderProfile` from the `PeerRecord` and PoS weekly history,
-/// then computes `1.0 - eviction_risk(commitment_score)`.
+/// then computes the survival probability via `commitment_to_survival_prob`
+/// (`BASELINE_HOLDER_SURVIVAL × score²` — the SAME canonical mapping placement and the
+/// repair-trigger use, so a migrated `current_reliability` matches a freshly recomputed one).
 ///
-/// Falls back to `0.5` (neutral prior) if the `PeerRecord` is missing.
+/// Falls back to the neutral-commitment prior if the `PeerRecord` is missing.
 fn compute_holder_survival_prob(
     db: &Db,
     holder_id: &crate::types::DeviceId,
@@ -191,17 +194,21 @@ fn compute_holder_survival_prob(
     current_week: u32,
     now: Timestamp,
 ) -> f64 {
+    // Neutral prior for unknown/erroring peers: a 0.5 commitment through the canonical
+    // mapping (≈0.225 under the physical ceiling), NOT a bare 0.5 — that would make an
+    // unknown peer look more durable than a mediocre known one post-ceiling.
+    let neutral = commitment_to_survival_prob(CommitmentScore::new(0.5));
     let peer = match db.get_peer(holder_id) {
         Ok(Some(p)) => p,
         Ok(None) => {
             tracing::warn!(holder = %holder_id,
-                "migration: PeerRecord missing, using survival_prob = 0.5");
-            return 0.5;
+                "migration: PeerRecord missing, using neutral survival prior");
+            return neutral;
         }
         Err(e) => {
             tracing::warn!(holder = %holder_id, err = %e,
-                "migration: get_peer failed, using survival_prob = 0.5");
-            return 0.5;
+                "migration: get_peer failed, using neutral survival prior");
+            return neutral;
         }
     };
 
@@ -241,14 +248,11 @@ fn compute_holder_survival_prob(
     };
 
     match compute_commitment(&profile) {
-        Ok(score) => {
-            let risk = eviction_risk(score);
-            (1.0 - risk).clamp(0.0, 1.0)
-        }
+        Ok(score) => commitment_to_survival_prob(score),
         Err(e) => {
             tracing::warn!(holder = %holder_id, err = %e,
-                "migration: compute_commitment failed, using survival_prob = 0.5");
-            0.5
+                "migration: compute_commitment failed, using neutral survival prior");
+            neutral
         }
     }
 }

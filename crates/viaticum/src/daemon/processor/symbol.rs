@@ -665,7 +665,13 @@ impl Processor {
                             viaticum_core::commitment::CommitmentScore::new(peer.trust_p),
                         )
                     })
-                    .unwrap_or(0.5); // neutral prior for unknown peers
+                    // Neutral prior for unknown peers: 0.5 commitment through the same
+                    // mapping (≈0.225 under the physical ceiling), not a bare 0.5.
+                    .unwrap_or_else(|| {
+                        viaticum_core::reliability::commitment_to_survival_prob(
+                            viaticum_core::commitment::CommitmentScore::new(0.5),
+                        )
+                    });
                 viaticum_core::reliability::HolderReliabilityInput {
                     holder_id: p.holder_id,
                     alive_symbols: p.symbol_count(),

@@ -117,23 +117,13 @@ pub async fn run_dr(
     }
 
     // ── 5. Parse + verify pointers; pick the freshest valid one ───────────────
-    let mut pointers: Vec<viaticum_core::system_state::SelfPointer> = blobs
-        .iter()
-        .filter_map(|(_, blob)| {
-            viaticum_core::types::from_cbor_bytes::<viaticum_core::system_state::SelfPointer>(blob)
-                .ok()
-        })
-        .filter(|p| viaticum_core::system_state::verify_self_pointer(p, &identity_pub).is_ok())
-        .collect();
-    if pointers.is_empty() {
-        anyhow::bail!(
+    let pointer = match select_freshest_valid_pointer(&blobs, &identity_pub) {
+        Some(p) => p,
+        None => anyhow::bail!(
             "collected {} blob(s) but none were valid signed self-pointers",
             blobs.len()
-        );
-    }
-    // Freshest first by created_at; generation breaks ties.
-    pointers.sort_by_key(|p| std::cmp::Reverse((p.created_at.0, p.generation)));
-    let pointer = &pointers[0];
+        ),
+    };
     println!(
         "Selected self-pointer: generation={}, base={}, diffs={}, created_at={}",
         pointer.generation,
@@ -150,7 +140,7 @@ pub async fn run_dr(
     //        were not in the seed list (the signed pointer carries dialable
     //        multiaddrs in each HolderHint). Without this, DR only works when the
     //        seed peers happen to be the block's holders.
-    dial_pointer_holders(&swarm_handle, &mut event_rx, pointer).await;
+    dial_pointer_holders(&swarm_handle, &mut event_rx, &pointer).await;
 
     // ── 6. Fetch base + diff blocks via holder hints, reassemble state ────────
     let dr_key = crate::daemon::system_state::identity_key_bytes_from_seed(&keyfile.seed)?;
@@ -191,6 +181,31 @@ pub async fn run_dr(
     println!("Run 'viaticum daemon' to start, then 'viaticum restore <path>' to recover files.");
 
     Ok(())
+}
+
+/// From the collected `(timestamp, blob)` pairs, deserialize each blob as a
+/// `SelfPointer`, keep only those whose signature verifies against the expected
+/// master identity, and return the freshest valid one.
+///
+/// Freshness = `created_at` primary, `generation` tiebreak (NOT generation-primary:
+/// the publisher's generation is RAM-only and resets on restart — see `SelfPointer`).
+/// Signature verification happens BEFORE any pointer content is trusted; an
+/// unverifiable or non-pointer blob is silently dropped. Returns `None` if no blob
+/// is a valid signed pointer.
+fn select_freshest_valid_pointer(
+    blobs: &[(u64, Vec<u8>)],
+    expected_master: &viaticum_core::types::IdentityPub,
+) -> Option<viaticum_core::system_state::SelfPointer> {
+    let mut pointers: Vec<viaticum_core::system_state::SelfPointer> = blobs
+        .iter()
+        .filter_map(|(_, blob)| {
+            viaticum_core::types::from_cbor_bytes::<viaticum_core::system_state::SelfPointer>(blob)
+                .ok()
+        })
+        .filter(|p| viaticum_core::system_state::verify_self_pointer(p, expected_master).is_ok())
+        .collect();
+    pointers.sort_by_key(|p| std::cmp::Reverse((p.created_at.0, p.generation)));
+    pointers.into_iter().next()
 }
 
 /// Dial the holders named in the selected pointer (base + diffs) so we can fetch

@@ -321,12 +321,14 @@ pub fn compute_allocation_with_importance(
 
     let target_p = reliability::target_reliability(importance);
 
-    // Per-holder survival probability: the SAME mapping the post-placement
-    // reliability recompute uses (processor::recompute_reliability), so placement
-    // and the repair trigger agree. `commitment_to_survival_prob` folds in the
-    // physical survival ceiling (BASELINE_HOLDER_SURVIVAL) — trust is NOT survival,
+    // Per-holder survival probability via `commitment_to_survival_prob`, the same
+    // function the post-placement reliability recompute uses — so both apply the
+    // physical survival ceiling (BASELINE_HOLDER_SURVIVAL): trust is NOT survival,
     // even a fully trusted node can vanish, so p never approaches 1 and critical
     // few-holder blocks earn full replicas instead of a thin spread.
+    // NOTE: the *input* still differs — placement feeds the combined trust score
+    // here, while the recompute feeds bare `trust_p`; both are capped+squared, but
+    // unifying the input is a tracked follow-up (see private tech-debt SS-DR-2).
     let solver_candidates: Vec<reliability::HolderCandidate> = candidates
         .iter()
         .map(|c| reliability::HolderCandidate {

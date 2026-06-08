@@ -563,8 +563,10 @@ pub fn diff_states(old: &SystemState, new: &SystemState) -> Vec<DiffOp> {
 /// Reconstruct a SystemState by applying ordered diff batches on top of `base`.
 ///
 /// Each batch is applied in sequence; within a batch, ops apply in order.
-/// `version` and `created_at` are carried from `base` (the latest diff's logical
-/// timestamp is not tracked here; the self-pointer carries freshness via generation).
+/// `version` and `created_at` are carried from `base`, NOT advanced to the latest diff.
+/// So after a base+diffs restore, `state.created_at` is the *base's* creation time, not
+/// "current as of" — do not treat it as freshness. The self-pointer carries the true
+/// freshness (its own `created_at`, see `SelfPointer`).
 pub fn apply_diffs(base: SystemState, diffs: &[Vec<DiffOp>]) -> SystemState {
     use std::collections::HashMap;
 
@@ -683,9 +685,18 @@ pub struct BlockRef {
 /// Signed, addressable index to the owner's latest SystemState.
 ///
 /// Physically tiny (KB). Stored/transported separately from the (large) base+diff blocks.
-/// `generation` is monotonic — DR picks the highest verified generation. Verified against the
-/// master identity derived from the mnemonic at DR; no master_pub is embedded (the verifier
-/// already knows the expected identity, and omitting it binds verification to that identity).
+/// Verified against the master identity derived from the mnemonic at DR; no master_pub is
+/// embedded (the verifier already knows the expected identity, and omitting it binds
+/// verification to that identity).
+///
+/// **Freshness ordering (DR):** select by `created_at` (wall clock at publish) primary,
+/// `generation` only as a same-timestamp tiebreak. `generation` is NOT a reliable global
+/// freshness key: the publisher holds it in RAM and it **resets to 1 on every owner restart**
+/// (see `run_periodic_push`), so a post-restart pointer legitimately has a *lower* generation
+/// than a pre-restart one. `created_at` keeps increasing across restarts and is the correct
+/// "which is newer" signal. (Its one weakness — a backward wall-clock jump between two
+/// publishes — is rare and bounded to one generation; persisting a monotonic generation would
+/// remove it, tracked as future hardening.)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SelfPointer {
     pub generation: u32,

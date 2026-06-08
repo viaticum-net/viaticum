@@ -75,7 +75,25 @@ fn register_ss_block(
 /// Retire a superseded SS block: drop it from the ledger, delete its source-block
 /// record + placements, and remove the retained blob. Best-effort — logs but does
 /// not fail the publish if individual steps error (the block simply ages out).
+///
+/// SAFETY GUARD: this deletes a source-block record + its placements, so it must only
+/// ever touch SS blocks. It refuses to act on a block_id that is not in the SS ledger —
+/// otherwise a caller mistake (or a content-address collision with a user block) could
+/// silently destroy user data. A non-SS id here is a bug; log loudly and do nothing.
 pub fn retire_ss_block(db: &Db, data_dir: &Path, block_id: &SourceBlockId) {
+    match db.is_ss_block(block_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::error!(block = %block_id,
+                "retire SS block: refusing — block_id is NOT in the SS ledger (would delete non-SS data)");
+            return;
+        }
+        Err(e) => {
+            tracing::error!(block = %block_id, error = %e,
+                "retire SS block: ledger check failed, refusing to delete");
+            return;
+        }
+    }
     if let Err(e) = db.unmark_ss_block(block_id) {
         tracing::warn!(block = %block_id, error = %e, "retire SS block: unmark failed");
     }
