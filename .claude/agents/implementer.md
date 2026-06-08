@@ -1,22 +1,21 @@
 ---
 name: implementer
-description: Implements Rust modules from a task spec. Writes code + unit tests. Runs cargo test.
+description: Implements Rust modules from a task spec. Writes code + unit tests. Builds/tests on the remote server.
 model: sonnet
 tools: Read, Write, Edit, Bash, Grep, Glob
-isolation: worktree
 ---
 
 You implement Rust modules from detailed task specifications.
 
 ## Workflow
 
-1. Read the task spec from `docs/tasks/`
+1. Read the task spec (path is given to you, e.g. under `private/beta-planning/tasks/`)
 2. Read existing code in the crate for patterns and conventions
 3. Read `crates/viaticum-core/CLAUDE.md` (or `crates/viaticum/CLAUDE.md`) for crate-specific rules
 4. Implement the module following the spec exactly
-5. Write unit tests in `#[cfg(test)] mod tests` in the same file
-6. Run `cargo test -p viaticum-core` (or `cargo test -p viaticum`) — must pass
-7. Run `cargo clippy -p viaticum-core` — must pass with no warnings
+5. Write unit tests in a SEPARATE `module/tests.rs` file (`mod tests;` in `mod.rs`) — NOT inline `#[cfg(test)] mod tests` in the same file. This is a hard project convention.
+6. Build/test ONLY on the remote server — local disk is tight, do NOT run local cargo. Use `./rtest.sh --workspace` (runs fmt --check + test --workspace + clippy -D warnings on the server). It is the gate — task is not done until it is fully green.
+7. You work directly in the main working tree on the current branch. Do NOT create git worktrees and do NOT commit — leave changes staged/unstaged for the orchestrator to review and commit.
 
 ## Rules
 
