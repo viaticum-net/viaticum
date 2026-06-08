@@ -78,6 +78,8 @@ fn make_peer_record(device_id: DeviceId) -> viaticum_core::types::PeerRecord {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     }
 }
 
@@ -1341,6 +1343,8 @@ async fn peer_announce_updates_existing_peer_last_seen() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     })
     .unwrap();
     // Register device→master mapping so handle_peer_announce can find the device.
@@ -1358,6 +1362,17 @@ async fn peer_announce_updates_existing_peer_last_seen() {
     assert_eq!(updated.first_seen, now, "first_seen should be unchanged");
     // trust values preserved
     assert_eq!(updated.trust_p, 0.5);
+    // PeerAnnounce is a positive availability observation: avail_ewma must rise
+    // above the pessimistic initial prior, and last_avail_sample must be set.
+    assert!(
+        updated.avail_ewma > viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        "PeerAnnounce should raise avail_ewma above initial; got {}",
+        updated.avail_ewma
+    );
+    assert!(
+        updated.last_avail_sample > 0,
+        "PeerAnnounce should set last_avail_sample"
+    );
 }
 
 #[tokio::test]
@@ -1503,6 +1518,8 @@ async fn handle_system_state_backup_stores_blob_for_known_peer() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     })
     .unwrap();
     // Register device→master mapping so handle_system_state_backup_inner can find the device.
@@ -1574,6 +1591,8 @@ async fn handle_system_state_backup_ignores_empty_blob() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     })
     .unwrap();
     db.set_master_for_device(&owner_device_id, &owner).unwrap();
@@ -1621,6 +1640,8 @@ async fn system_state_backup_with_blob_under_cap_accepted() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     })
     .unwrap();
     db.set_master_for_device(&owner_device_id, &owner).unwrap();
@@ -1668,6 +1689,8 @@ async fn system_state_backup_with_blob_at_cap_accepted() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     })
     .unwrap();
     db.set_master_for_device(&owner_device_id, &owner).unwrap();
@@ -1713,6 +1736,8 @@ async fn system_state_backup_with_blob_over_cap_rejected() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     })
     .unwrap();
     db.set_master_for_device(&owner_device_id, &owner).unwrap();
@@ -3050,6 +3075,8 @@ async fn revocation_broadcast_marks_device_key_revoked() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     };
     db.upsert_peer(&peer_record).expect("upsert_peer");
     db.set_master_for_device(&known_device_id, &peer_identity)
@@ -3117,6 +3144,8 @@ async fn revocation_broadcast_idempotent_on_duplicate() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     };
     peer_record.revoked_device_pub_keys.push(device_id.0);
     db.upsert_peer(&peer_record).expect("upsert_peer");
@@ -3195,6 +3224,8 @@ async fn revocation_broadcast_invalid_device_cert_rejected() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     };
     db.upsert_peer(&peer_record).expect("upsert_peer");
     db.set_master_for_device(&known_device_id_77, &peer_identity)
@@ -3269,6 +3300,8 @@ async fn revocation_broadcast_device_id_mismatch_rejected() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     };
     db.upsert_peer(&peer_record).expect("upsert_peer");
     db.set_master_for_device(&known_device_id_99, &peer_identity)
@@ -3983,6 +4016,32 @@ async fn peer_authenticated_upserts_peer_record() {
         record.device_id, device_id,
         "PeerRecord.device_id must be set after authentication"
     );
+    // Fresh peer starts at the pessimistic prior, but the contact itself is a
+    // positive observation so last_avail_sample is stamped.
+    assert!(
+        (record.avail_ewma - viaticum_core::constants::AVAIL_EWMA_INITIAL).abs() < 1e-12,
+        "new peer should start at AVAIL_EWMA_INITIAL; got {}",
+        record.avail_ewma
+    );
+    assert!(
+        record.last_avail_sample > 0,
+        "authentication should stamp last_avail_sample"
+    );
+
+    // A second authentication (existing-record path) is another positive
+    // observation: avail_ewma must rise above the initial prior.
+    processor
+        .on_peer_authenticated(fake_peer_id, device_id, peer_identity, device_cert, None)
+        .await;
+    let record2 = db
+        .get_peer(&device_id)
+        .expect("get_peer ok")
+        .expect("PeerRecord must still exist");
+    assert!(
+        record2.avail_ewma > viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        "repeated authentication should raise avail_ewma above initial; got {}",
+        record2.avail_ewma
+    );
 }
 
 // ─── AC-2: peer_authenticated_same_master_triggers_cluster_add ───────────────
@@ -4153,6 +4212,8 @@ async fn recalculate_trust_updates_device_and_master_trust() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     };
     db.upsert_peer(&peer_record).expect("upsert_peer");
 
@@ -4526,6 +4587,8 @@ fn make_hook_peer(device_id: DeviceId, trust_p: f64) -> viaticum_core::types::Pe
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     }
 }
 

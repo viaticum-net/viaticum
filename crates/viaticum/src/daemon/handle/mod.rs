@@ -231,6 +231,25 @@ impl DaemonHandle {
             }
         }
 
+        // ── 3.8. EWMA availability startup catch-up ───────────────────────────
+        // Apply any ticks missed while the daemon was offline, then reset
+        // last_avail_sample = now so the periodic decay task starts from a clean clock.
+        {
+            use viaticum_core::constants::{AVAIL_DECAY_TICK_SECS, AVAIL_EWMA_ALPHA};
+            let now_secs = Timestamp::now().0;
+            match db.apply_avail_decay_startup_catchup(
+                AVAIL_EWMA_ALPHA,
+                now_secs,
+                AVAIL_DECAY_TICK_SECS,
+            ) {
+                Ok(n) if n > 0 => tracing::info!(peers = n, "avail_ewma startup catch-up applied"),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(err = %e, "avail_ewma startup catch-up failed (non-fatal)")
+                }
+            }
+        }
+
         // ── 4. Derive keys ────────────────────────────────────────────────────
         // Epoch 0 is the initial epoch; epoch rotation happens on device revocation.
         let (master_key, device_key, epoch_key_bytes) = derive_keys(&keyfile, 0)?;
@@ -678,6 +697,23 @@ impl DaemonHandle {
                 Ok(())
             }));
         }
+        // ── 9.25. EWMA availability decay task (daily) ────────────────────────
+        {
+            use viaticum_core::constants::{AVAIL_DECAY_TICK_SECS, AVAIL_EWMA_ALPHA};
+            let avail_db = db.clone();
+            let avail_cancel = cancel.clone();
+            tasks.push(tokio::spawn(async move {
+                run_avail_decay_task(
+                    avail_db,
+                    avail_cancel,
+                    AVAIL_EWMA_ALPHA,
+                    AVAIL_DECAY_TICK_SECS,
+                )
+                .await;
+                Ok(())
+            }));
+        }
+
         // ── 9.3. Peer auto-dial: bootstrap from PeerRecord on startup,
         //         periodic re-dial of known peers we are not currently connected to.
         //         Without this, every daemon restart leaves the swarm isolated:
@@ -1175,6 +1211,31 @@ impl DaemonHandle {
             task.await??;
         }
         Ok(())
+    }
+}
+
+// ── EWMA availability decay task ─────────────────────────────────────────────
+
+/// Run alongside other periodic tasks. Applies EWMA decay for all peers that
+/// haven't been contacted in > tick_secs. Fires once per tick_secs interval.
+async fn run_avail_decay_task(
+    db: viaticum_core::db::Db,
+    cancel: tokio_util::sync::CancellationToken,
+    alpha: f64,
+    tick_secs: u64,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(tick_secs));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let now_secs = Timestamp::now().0;
+                if let Err(e) = db.apply_avail_decay_batch(alpha, now_secs, tick_secs) {
+                    tracing::warn!("avail_decay_batch failed: {e}");
+                }
+            }
+            _ = cancel.cancelled() => break,
+        }
     }
 }
 

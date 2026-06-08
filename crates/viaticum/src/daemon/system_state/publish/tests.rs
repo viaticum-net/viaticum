@@ -128,6 +128,8 @@ fn peer_with_addrs(holder: DeviceId, addrs: Vec<String>) -> PeerRecord {
         revoked_device_pub_keys: vec![],
         addrs,
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     }
 }
 

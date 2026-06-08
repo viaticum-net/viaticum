@@ -1441,6 +1441,81 @@ impl Db {
         self.upsert_peer(&record)?;
         Ok(())
     }
+
+    /// Batch decay: for each PeerRecord where (now - last_avail_sample) >= tick_secs,
+    /// apply EXACTLY 1 decay tick: avail = (1-alpha) * avail.
+    /// Updates avail_ewma + last_avail_sample in one write transaction.
+    /// Returns count of updated records.
+    pub fn apply_avail_decay_batch(
+        &self,
+        alpha: f64,
+        now_secs: u64,
+        tick_secs: u64,
+    ) -> Result<u64, DbError> {
+        use crate::types::ewma_decay_tick;
+        // Guard against a zero tick interval: `elapsed >= 0` is always true, so
+        // a zero tick_secs would decay every peer on every call. Never happens
+        // with AVAIL_DECAY_TICK_SECS (86400), but keep the invariant explicit.
+        if tick_secs == 0 {
+            return Ok(0);
+        }
+        let peers = self.list_all_peers()?;
+        let mut updated = 0u64;
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(PEERS)?;
+            for mut record in peers {
+                let elapsed = now_secs.saturating_sub(record.last_avail_sample);
+                if elapsed >= tick_secs {
+                    record.avail_ewma = ewma_decay_tick(record.avail_ewma, alpha);
+                    record.last_avail_sample = now_secs;
+                    let bytes = to_cbor_bytes(&record);
+                    table.insert(&record.device_id.0, bytes.as_slice())?;
+                    updated += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Startup catch-up: apply n missed ticks per peer, set last_avail_sample=now.
+    /// Called ONCE at daemon start before spawning run_avail_decay_task.
+    /// Returns the count of peers whose avail_ewma was actually decayed (n > 0),
+    /// consistent with `apply_avail_decay_batch`. Every peer's last_avail_sample
+    /// is advanced to `now_secs` regardless, to reset the decay clock.
+    pub fn apply_avail_decay_startup_catchup(
+        &self,
+        alpha: f64,
+        now_secs: u64,
+        tick_secs: u64,
+    ) -> Result<u64, DbError> {
+        use crate::types::ewma_decay_n_ticks;
+        // Guard against div-by-zero: `elapsed / tick_secs` panics when tick_secs
+        // is 0. Never happens with AVAIL_DECAY_TICK_SECS (86400), but explicit.
+        if tick_secs == 0 {
+            return Ok(0);
+        }
+        let peers = self.list_all_peers()?;
+        let mut decayed = 0u64;
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(PEERS)?;
+            for mut record in peers {
+                let elapsed = now_secs.saturating_sub(record.last_avail_sample);
+                let n = (elapsed / tick_secs) as u32;
+                if n > 0 {
+                    record.avail_ewma = ewma_decay_n_ticks(record.avail_ewma, alpha, n);
+                    decayed += 1;
+                }
+                record.last_avail_sample = now_secs;
+                let bytes = to_cbor_bytes(&record);
+                table.insert(&record.device_id.0, bytes.as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(decayed)
+    }
 }
 
 // ============================================================

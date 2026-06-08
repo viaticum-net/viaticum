@@ -443,6 +443,26 @@ pub struct PeerRecord {
     /// Received via PeerAnnounce; None for peers that have not sent it yet.
     #[serde(default)]
     pub x25519_pub: Option<[u8; 32]>,
+    /// Rolling EWMA availability score [0.0, 1.0].
+    /// Updated on each authenticated contact: avail = α·1.0 + (1-α)·avail
+    /// Decayed daily when no contact: avail = α·0.0 + (1-α)·avail
+    /// New peers start at AVAIL_EWMA_INITIAL = 0.1 (pessimistic prior).
+    /// Rationale: earn-it axis consistent with trust_i (starts at 0.0);
+    ///   slows Sybil write-fanout capture via always-online new nodes.
+    #[serde(default = "default_avail_ewma")]
+    pub avail_ewma: f64,
+    /// Unix secs of last positive availability observation (authenticated contact).
+    /// Used as the decay clock: decay applies strictly 1 tick when
+    ///   now - last_avail_sample >= AVAIL_DECAY_TICK_SECS (no double-decay).
+    /// Also advanced to `now` each time decay is applied (startup catch-up).
+    /// Separate from `last_seen` to avoid the proxy problem: long-lived TCP
+    ///   connections keep `last_seen` fresh without new observations.
+    #[serde(default)]
+    pub last_avail_sample: u64,
+}
+
+fn default_avail_ewma() -> f64 {
+    crate::constants::AVAIL_EWMA_INITIAL
 }
 
 impl PeerRecord {
@@ -450,6 +470,24 @@ impl PeerRecord {
     pub fn is_device_revoked(&self, device_id: &DeviceId) -> bool {
         self.revoked_device_pub_keys.contains(&device_id.0)
     }
+}
+
+/// Apply one positive observation (authenticated contact).
+/// avail = α·1.0 + (1-α)·avail
+pub fn ewma_contact_observed(avail: f64, alpha: f64) -> f64 {
+    alpha + (1.0 - alpha) * avail
+}
+
+/// Apply one negative observation (no-contact decay tick).
+/// avail = α·0.0 + (1-α)·avail  =  (1-α)·avail
+pub fn ewma_decay_tick(avail: f64, alpha: f64) -> f64 {
+    (1.0 - alpha) * avail
+}
+
+/// Apply N consecutive no-contact decay ticks (batch for missed days).
+/// avail = (1-α)^n · avail
+pub fn ewma_decay_n_ticks(avail: f64, alpha: f64, n: u32) -> f64 {
+    avail * (1.0 - alpha).powi(n as i32)
 }
 
 /// Symbols we hold for another owner. Key: (SourceBlockId, owner IdentityPub).

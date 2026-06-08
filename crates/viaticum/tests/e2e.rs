@@ -426,6 +426,8 @@ async fn full_lifecycle_e2e() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     };
     peer.revoked_device_pub_keys.push(b_device_pub);
 

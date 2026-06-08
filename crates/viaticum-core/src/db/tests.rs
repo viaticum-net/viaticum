@@ -114,6 +114,8 @@ fn make_peer(device_id: DeviceId) -> PeerRecord {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: crate::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     }
 }
 
@@ -1352,6 +1354,8 @@ fn table_stats_counts_rows() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: crate::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     };
     db.upsert_peer(&peer).unwrap();
     let stats = db.table_stats().unwrap();
@@ -3185,4 +3189,121 @@ fn next_work_item_with_only_non_active_blocks_returns_none() {
         .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
         .unwrap();
     assert!(result.is_none(), "Non-Active blocks never returned");
+}
+
+// ============================================================
+// T-4a: EWMA availability decay DB operations
+// ============================================================
+
+fn make_peer_with_avail(
+    device_id: DeviceId,
+    avail_ewma: f64,
+    last_avail_sample: u64,
+) -> PeerRecord {
+    PeerRecord {
+        device_id,
+        master_identity: IdentityPub([0xAAu8; 32]),
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(1000),
+        last_seen: Timestamp(2000),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma,
+        last_avail_sample,
+    }
+}
+
+#[test]
+fn startup_catchup_applies_missed_ticks_correctly() {
+    use crate::constants::{AVAIL_DECAY_TICK_SECS, AVAIL_EWMA_ALPHA};
+
+    let db = test_db();
+    let tick_secs = AVAIL_DECAY_TICK_SECS;
+    let now_secs = 7 * tick_secs + 1000; // 7 full ticks ago + offset
+    let last_sample = 1000u64; // exactly 7 ticks before now_secs
+
+    let peer = make_peer_with_avail(DeviceId([0x01u8; 32]), 1.0, last_sample);
+    db.upsert_peer(&peer).unwrap();
+
+    let updated = db
+        .apply_avail_decay_startup_catchup(AVAIL_EWMA_ALPHA, now_secs, tick_secs)
+        .unwrap();
+    assert_eq!(updated, 1, "exactly one peer should be updated");
+
+    let stored = db.get_peer(&DeviceId([0x01u8; 32])).unwrap().unwrap();
+    let expected = 0.95_f64.powi(7); // (1-alpha)^7 * 1.0
+    assert!(
+        (stored.avail_ewma - expected).abs() < 1e-9,
+        "7-tick decay from 1.0 should be ≈ {expected}; got {}",
+        stored.avail_ewma
+    );
+    assert_eq!(
+        stored.last_avail_sample, now_secs,
+        "last_avail_sample must be set to now_secs"
+    );
+}
+
+#[test]
+fn no_double_decay_for_long_lived_connection() {
+    use crate::constants::{AVAIL_DECAY_TICK_SECS, AVAIL_EWMA_ALPHA};
+
+    let db = test_db();
+    let tick_secs = AVAIL_DECAY_TICK_SECS;
+    let now_secs = 1_700_000_000u64;
+    // last_avail_sample = now - (tick_secs - 1): not yet eligible for decay
+    let last_sample = now_secs - (tick_secs - 1);
+
+    let peer = make_peer_with_avail(DeviceId([0x02u8; 32]), 0.8, last_sample);
+    db.upsert_peer(&peer).unwrap();
+
+    let updated = db
+        .apply_avail_decay_batch(AVAIL_EWMA_ALPHA, now_secs, tick_secs)
+        .unwrap();
+    assert_eq!(
+        updated, 0,
+        "peer contacted < tick_secs ago must not be decayed"
+    );
+
+    let stored = db.get_peer(&DeviceId([0x02u8; 32])).unwrap().unwrap();
+    assert!(
+        (stored.avail_ewma - 0.8).abs() < 1e-12,
+        "avail_ewma must remain 0.8 when decay not applied; got {}",
+        stored.avail_ewma
+    );
+}
+
+#[test]
+fn decay_applies_exactly_one_tick_after_tick_interval() {
+    use crate::constants::{AVAIL_DECAY_TICK_SECS, AVAIL_EWMA_ALPHA};
+
+    let db = test_db();
+    let tick_secs = AVAIL_DECAY_TICK_SECS;
+    let now_secs = 1_700_000_000u64;
+    // last_avail_sample = now - tick_secs - 1: eligible for exactly 1 tick
+    let last_sample = now_secs - tick_secs - 1;
+
+    let peer = make_peer_with_avail(DeviceId([0x03u8; 32]), 0.8, last_sample);
+    db.upsert_peer(&peer).unwrap();
+
+    let updated = db
+        .apply_avail_decay_batch(AVAIL_EWMA_ALPHA, now_secs, tick_secs)
+        .unwrap();
+    assert_eq!(updated, 1, "peer with elapsed >= tick_secs must be decayed");
+
+    let stored = db.get_peer(&DeviceId([0x03u8; 32])).unwrap().unwrap();
+    let expected = 0.95 * 0.8; // exactly 1 tick
+    assert!(
+        (stored.avail_ewma - expected).abs() < 1e-12,
+        "exactly 1 tick decay: expected {expected}, got {}",
+        stored.avail_ewma
+    );
+    assert_eq!(
+        stored.last_avail_sample, now_secs,
+        "last_avail_sample must be updated to now_secs"
+    );
 }

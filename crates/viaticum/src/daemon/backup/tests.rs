@@ -1699,6 +1699,8 @@ fn insert_peer(db: &Db, byte: u8) -> DeviceId {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     })
     .unwrap();
     did
@@ -1851,6 +1853,8 @@ fn get_candidates_excludes_cluster_siblings() {
             revoked_device_pub_keys: vec![],
             addrs: vec![],
             x25519_pub: None,
+            avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+            last_avail_sample: 0,
         })
         .unwrap();
         did

@@ -608,6 +608,8 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     };
     db.upsert_peer(&peer).unwrap();
 
@@ -915,6 +917,8 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     };
     db.upsert_peer(&peer).unwrap();
 

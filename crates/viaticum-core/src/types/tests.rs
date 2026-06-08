@@ -477,6 +477,8 @@ fn peer_record_is_device_revoked_returns_false_when_list_empty() {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: crate::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     };
     assert!(!peer.is_device_revoked(&DeviceId([1; 32])));
 }
@@ -497,6 +499,8 @@ fn peer_record_is_device_revoked_returns_true_when_key_present() {
         revoked_device_pub_keys: vec![revoked_key],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: crate::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     };
     assert!(peer.is_device_revoked(&DeviceId(revoked_key)));
 }
@@ -518,6 +522,8 @@ fn peer_record_is_device_revoked_does_not_match_different_key() {
         revoked_device_pub_keys: vec![revoked_key],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: crate::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     };
     assert!(!peer.is_device_revoked(&DeviceId(other_key)));
 }
@@ -540,10 +546,119 @@ fn peer_record_is_device_revoked_with_multiple_keys() {
         revoked_device_pub_keys: vec![key_a, key_b],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: crate::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     };
     assert!(peer.is_device_revoked(&DeviceId(key_a)));
     assert!(peer.is_device_revoked(&DeviceId(key_b)));
     assert!(!peer.is_device_revoked(&DeviceId(key_c)));
+}
+
+// ============================================================
+// EWMA availability formula tests (T-4a)
+// ============================================================
+
+#[test]
+fn ewma_formulas_are_pure_functions() {
+    let avail = 0.5_f64;
+    let alpha = 0.05_f64;
+
+    let observed = ewma_contact_observed(avail, alpha);
+    assert!(
+        (observed - (0.05 + 0.95 * 0.5)).abs() < 1e-12,
+        "ewma_contact_observed(0.5, 0.05) must equal 0.525; got {observed}"
+    );
+
+    let decayed = ewma_decay_tick(avail, alpha);
+    assert!(
+        (decayed - (0.95 * 0.5)).abs() < 1e-12,
+        "ewma_decay_tick(0.5, 0.05) must equal 0.475; got {decayed}"
+    );
+}
+
+#[test]
+fn avail_ewma_increases_on_repeated_contact() {
+    let alpha = crate::constants::AVAIL_EWMA_ALPHA;
+    let mut avail = crate::constants::AVAIL_EWMA_INITIAL;
+    for _ in 0..28 {
+        avail = ewma_contact_observed(avail, alpha);
+    }
+    assert!(
+        avail > 0.7,
+        "after 28 contacts from initial 0.1, avail_ewma should be > 0.7; got {avail}"
+    );
+}
+
+#[test]
+fn avail_ewma_decays_when_no_contact() {
+    let alpha = crate::constants::AVAIL_EWMA_ALPHA;
+    let avail = ewma_decay_n_ticks(1.0, alpha, 14);
+    let expected = 0.95_f64.powi(14);
+    assert!(
+        (avail - expected).abs() < 1e-9,
+        "ewma_decay_n_ticks(1.0, 0.05, 14) must be ≈ {expected}; got {avail}"
+    );
+    assert!(
+        (avail - 0.488).abs() < 0.01,
+        "14-tick decay from 1.0 should be ≈ 0.488; got {avail}"
+    );
+}
+
+#[test]
+fn new_peer_starts_at_pessimistic_value() {
+    // Simulate deserializing old CBOR that has no avail_ewma field.
+    // The serde(default = "default_avail_ewma") must inject 0.1.
+    use crate::types::{from_cbor_bytes, to_cbor_bytes};
+
+    // The serde(default) only fires during *deserialization* when the field
+    // key is absent. To exercise the real migration path we serialize a shadow
+    // struct that mirrors the pre-T-4a PeerRecord layout (no avail_ewma /
+    // last_avail_sample keys), then deserialize the bytes into the current
+    // PeerRecord. Field names and order match the real struct so CBOR (which
+    // serializes structs as maps keyed by field name) round-trips correctly.
+    #[derive(serde::Serialize)]
+    struct OldPeerRecord {
+        device_id: DeviceId,
+        master_identity: IdentityPub,
+        trust_p: f64,
+        trust_i: f64,
+        trust_s: f64,
+        bytes_we_store_for_peer: u64,
+        bytes_peer_stores_for_us: u64,
+        first_seen: Timestamp,
+        last_seen: Timestamp,
+        revoked_device_pub_keys: Vec<[u8; 32]>,
+        addrs: Vec<String>,
+        x25519_pub: Option<[u8; 32]>,
+        // NOTE: deliberately no avail_ewma / last_avail_sample — this is the
+        // on-disk shape of records written before T-4a.
+    }
+
+    let old = OldPeerRecord {
+        device_id: DeviceId([0; 32]),
+        master_identity: IdentityPub([0xAA; 32]),
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+    };
+    let bytes = to_cbor_bytes(&old);
+    let decoded: PeerRecord = from_cbor_bytes(&bytes).unwrap();
+    assert!(
+        (decoded.avail_ewma - crate::constants::AVAIL_EWMA_INITIAL).abs() < 1e-12,
+        "avail_ewma must default to AVAIL_EWMA_INITIAL (0.1) for old records; got {}",
+        decoded.avail_ewma
+    );
+    assert_eq!(
+        decoded.last_avail_sample, 0,
+        "last_avail_sample must default to 0 for old records"
+    );
 }
 
 // ============================================================

@@ -1324,6 +1324,8 @@ fn make_peer_with_master(device_id: DeviceId, master: IdentityPub) -> PeerRecord
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     }
 }
 

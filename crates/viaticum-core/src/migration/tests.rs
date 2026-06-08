@@ -67,6 +67,8 @@ fn make_peer(device_id: DeviceId) -> PeerRecord {
         revoked_device_pub_keys: vec![],
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: crate::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     }
 }
 

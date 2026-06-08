@@ -241,6 +241,8 @@ fn device_revocation_epoch_rotation_rejects_revoked_key() {
         revoked_device_pub_keys: Vec::new(),
         addrs: vec![],
         x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
     };
     peer_record.revoked_device_pub_keys.push(revoked_pub);
 

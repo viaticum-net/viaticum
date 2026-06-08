@@ -3,9 +3,11 @@
 use libp2p::PeerId;
 use tracing::{debug, error, info, warn};
 use viaticum_core::cluster::DeviceCertificate;
-use viaticum_core::constants::{INITIAL_TRUST_P, MESSAGE_FRESHNESS_SECS};
+use viaticum_core::constants::{
+    AVAIL_EWMA_ALPHA, AVAIL_EWMA_INITIAL, INITIAL_TRUST_P, MESSAGE_FRESHNESS_SECS,
+};
 use viaticum_core::messages::{PeerAnnounceMsg, verify_peer_announce};
-use viaticum_core::types::{DeviceId, IdentityPub, PeerRecord, Timestamp};
+use viaticum_core::types::{DeviceId, IdentityPub, PeerRecord, Timestamp, ewma_contact_observed};
 
 use super::{Processor, ProcessorError};
 
@@ -60,6 +62,7 @@ impl Processor {
 
         // 2. Upsert PeerRecord in DB (keyed by DeviceId).
         let now = Timestamp::now();
+        let now_secs = now.0;
         let record = match self.db.get_peer(&device_id) {
             Ok(Some(mut existing)) => {
                 existing.master_identity = identity_pub;
@@ -70,6 +73,8 @@ impl Processor {
                 if existing.trust_p == 0.0 && existing.trust_i == 0.0 {
                     existing.trust_p = INITIAL_TRUST_P;
                 }
+                existing.avail_ewma = ewma_contact_observed(existing.avail_ewma, AVAIL_EWMA_ALPHA);
+                existing.last_avail_sample = now_secs;
                 existing
             }
             Ok(None) => PeerRecord {
@@ -85,6 +90,8 @@ impl Processor {
                 revoked_device_pub_keys: vec![],
                 addrs: vec![],
                 x25519_pub,
+                avail_ewma: AVAIL_EWMA_INITIAL,
+                last_avail_sample: now_secs,
             },
             Err(e) => {
                 error!(
@@ -293,6 +300,7 @@ impl Processor {
             .db
             .get_devices_for_master(&msg.identity_pub)
             .unwrap_or_default();
+        let now_secs = now.0;
         for did in &devices {
             if let Some(mut existing) = self.db.get_peer(did)? {
                 existing.last_seen = now;
@@ -302,6 +310,8 @@ impl Processor {
                 if existing.trust_p == 0.0 && existing.trust_i == 0.0 {
                     existing.trust_p = INITIAL_TRUST_P;
                 }
+                existing.avail_ewma = ewma_contact_observed(existing.avail_ewma, AVAIL_EWMA_ALPHA);
+                existing.last_avail_sample = now_secs;
                 self.db.upsert_peer(&existing)?;
             }
         }
