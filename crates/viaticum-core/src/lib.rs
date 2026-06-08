@@ -12,6 +12,7 @@ pub mod deletion;
 pub mod erasure;
 pub mod escrow;
 pub mod importance;
+pub mod mailbox;
 pub mod messages;
 pub mod migration;
 pub mod path_safety;

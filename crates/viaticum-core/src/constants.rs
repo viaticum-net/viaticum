@@ -392,6 +392,56 @@ pub const BYTES_PER_GB: f64 = 1_073_741_824.0;
 /// Must be << MAX_MESSAGE_SIZE (128 MiB).
 pub const MAX_SYSTEM_STATE_BLOB_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
 
+// === Mailbox (A2) ===
+
+/// Candidate set size for mailbox write/read fanout (XOR-distance top-N).
+pub const MAILBOX_CANDIDATES_N: usize = 1000;
+
+/// Write fanout: top-30 peers by trust × avail_ewma.
+pub const MAILBOX_WRITE_FANOUT: usize = 30;
+
+/// Read fanout: broader overlap for fetch reliability.
+pub const MAILBOX_READ_FANOUT: usize = 300;
+
+/// DR walk batches: expanding search [100, 300, 1000].
+pub const MAILBOX_DR_WALK_BATCHES: &[usize] = &[100, 300, 1000];
+
+/// Mailbox poll interval: 1 hour.
+pub const MAILBOX_POLL_INTERVAL_SECS: u64 = 3600;
+
+/// Mailbox TTL-sweep interval: 6 hours.
+pub const MAILBOX_SWEEP_INTERVAL_SECS: u64 = 6 * 3600;
+
+/// Self-pointer republish interval: 30 days.
+pub const MAILBOX_POINTER_REPUBLISH_SECS: u64 = 30 * 24 * 3600;
+
+// ── EWMA availability constants (T-4a) ──────────────────────────────────────
+
+/// EWMA smoothing factor. α=0.05 → half-life ≈ 13.5 daily ticks (~2 weeks).
+/// Tuned so a node continuously online for 4 weeks converges to ≈0.76 from 0.1 start,
+/// and a node absent for 28 days decays from 1.0 to ≈0.25.
+pub const AVAIL_EWMA_ALPHA: f64 = 0.05;
+
+/// Pessimistic starting value for new peers: availability is earned by contact,
+/// consistent with trust_i=0.0 earn-it axis. Slows Sybil write-fanout capture.
+pub const AVAIL_EWMA_INITIAL: f64 = 0.1;
+
+/// Decay tick interval in seconds (24 hours). One "no-contact" observation per day.
+pub const AVAIL_DECAY_TICK_SECS: u64 = 24 * 3600;
+
+/// PoS challenge pending timeout: challenge_TTL + response_TTL + 2×poll_interval ≈ 14d 2h.
+/// Response lives in mailbox for response_TTL; owner needs time to poll and receive it.
+pub const POS_CHALLENGE_PENDING_TIMEOUT_SECS: u64 = 7 * 24 * 3600 + 7 * 24 * 3600 + 2 * 3600;
+
+/// Delivery reward weight for mailbox reads (starting value — refine on scale-test).
+/// Normal PoS pass = weight 1.0. Delivery reward = 0.05 (significantly less, but > 0).
+pub const MAILBOX_DELIVERY_REWARD_WEIGHT: f64 = 0.05; // starting value, refine on scale-test
+
+/// Per-postman mailbox trust ceiling (starting value — refine on scale-test).
+/// Prevents mailbox-accumulated trust_p from reaching storage-trust threshold alone.
+/// Per-postman in the LOCAL view of the fetcher node.
+pub const MAILBOX_REWARD_CEILING: f64 = 0.3; // starting value, refine on scale-test
+
 // === Compile-time sanity checks ===
 
 const _: () = assert!(S_CLAMP_MIN < S_CLAMP_MAX);

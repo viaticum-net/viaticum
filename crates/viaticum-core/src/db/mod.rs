@@ -11,6 +11,7 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 
 use crate::cluster::StoredClusterState;
 use crate::constants::{BYTES_PER_GB, DROP_NOTICE_WINDOW_SECS, HOLDER_DELETE_COOLDOWN_SECS};
+use crate::mailbox::{MailboxClass, MailboxEntry};
 use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
 use crate::types::{
     BlockAgg, BudgetRecord, DeviceId, EventEntry, FileId, FileRecord, HoldingRecord, HoldingStatus,
@@ -109,6 +110,16 @@ const HOLDER_FILES: TableDefinition<&[u8; 40], u32> = TableDefinition::new("hold
 /// O(N) full FILES scan per event into a prefix lookup.
 const CONTENT_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("content_index");
 
+/// Mailbox entries stored on behalf of other nodes.
+/// Key: target_pub[32] || msg_id[16] || class_u8[1] = 49 bytes.
+/// Sorted by target_pub prefix → efficient range-scan for MailboxFetch.
+const MAILBOX_ENTRIES: TableDefinition<&[u8; 49], &[u8]> = TableDefinition::new("mailbox_entries");
+
+/// Per-target mailbox byte counter. Key: target_pub[32]. Value: CBOR(u64).
+/// Updated on every insert/delete so quota checks are O(1) (no full scan).
+const MAILBOX_BYTES_BY_TARGET: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("mailbox_bytes_by_target");
+
 // ============================================================
 // Key helpers
 // ============================================================
@@ -157,6 +168,16 @@ fn pos_key(device: &DeviceId, week_number: u32) -> [u8; 36] {
     let mut key = [0u8; 36];
     key[..32].copy_from_slice(&device.0);
     key[32..36].copy_from_slice(&week_number.to_be_bytes());
+    key
+}
+
+/// MAILBOX_ENTRIES key: target_pub[32] || msg_id[16] || class_u8[1] = 49 bytes.
+/// Sorted by target_pub prefix so a range scan fetches all entries for one target.
+fn mailbox_entry_key(target: &IdentityPub, msg_id: [u8; 16], class: MailboxClass) -> [u8; 49] {
+    let mut key = [0u8; 49];
+    key[..32].copy_from_slice(&target.0);
+    key[32..48].copy_from_slice(&msg_id);
+    key[48] = class.as_u8();
     key
 }
 
@@ -293,6 +314,9 @@ pub enum DbError {
 
     #[error("record not found: {0}")]
     NotFound(String),
+
+    #[error("duplicate entry")]
+    Duplicate,
 }
 
 impl From<redb::Error> for DbError {
@@ -344,6 +368,8 @@ impl Db {
             tx.open_table(MASTER_TRUST)?;
             tx.open_table(DEVICE_TO_MASTER)?;
             tx.open_table(META)?;
+            tx.open_table(MAILBOX_ENTRIES)?;
+            tx.open_table(MAILBOX_BYTES_BY_TARGET)?;
         }
         tx.commit()?;
         Ok(())
@@ -2122,6 +2148,280 @@ impl Db {
             }
         }
         Ok(result)
+    }
+}
+
+// ============================================================
+// Mailbox table
+// ============================================================
+
+impl Db {
+    /// Store a mailbox entry. Fails with `DbError::Duplicate` if an entry with
+    /// the same (target, msg_id, class) key already exists.
+    ///
+    /// `now_secs` is used only for the `stored_at` field if the caller didn't set it
+    /// (the entry is stored as-is; this param is unused currently but kept for API symmetry
+    /// with sweep operations so callers pass a consistent clock).
+    pub fn mailbox_insert(&self, entry: &MailboxEntry, _now_secs: u64) -> Result<(), DbError> {
+        let key = mailbox_entry_key(&entry.target, entry.msg_id, entry.class);
+        let entry_bytes = to_cbor_bytes(entry);
+        let entry_size = entry_bytes.len() as u64;
+
+        let tx = self.inner.begin_write()?;
+        {
+            let mut entries = tx.open_table(MAILBOX_ENTRIES)?;
+            if entries.get(&key)?.is_some() {
+                return Err(DbError::Duplicate);
+            }
+            entries.insert(&key, entry_bytes.as_slice())?;
+
+            // Update per-target byte counter.
+            let mut bytes_table = tx.open_table(MAILBOX_BYTES_BY_TARGET)?;
+            let current: u64 = match bytes_table.get(&entry.target.0)? {
+                Some(v) => from_cbor_bytes(v.value())?,
+                None => 0,
+            };
+            let new_total = current.saturating_add(entry_size);
+            bytes_table.insert(&entry.target.0, to_cbor_bytes(&new_total).as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// List all non-expired entries for a target (for MailboxFetch).
+    /// Entries with `expires_at < now_secs` are excluded.
+    pub fn mailbox_list_for_target(
+        &self,
+        target: &IdentityPub,
+        now_secs: u64,
+    ) -> Result<Vec<MailboxEntry>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(MAILBOX_ENTRIES)?;
+
+        // Range scan: keys start with target_pub[32].
+        let mut lo = [0u8; 49];
+        let mut hi = [0u8; 49];
+        lo[..32].copy_from_slice(&target.0);
+        hi[..32].copy_from_slice(&target.0);
+        hi[32..].fill(0xFF);
+
+        let mut result = Vec::new();
+        for item in table.range::<&[u8; 49]>(&lo..=&hi)? {
+            let (_, v) = item?;
+            let entry: MailboxEntry = from_cbor_bytes(v.value())?;
+            if entry.expires_at >= now_secs {
+                result.push(entry);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Delete a single entry by (target, msg_id, class). No-op if not found.
+    pub fn mailbox_delete(
+        &self,
+        target: &IdentityPub,
+        msg_id: [u8; 16],
+        class: MailboxClass,
+    ) -> Result<(), DbError> {
+        let key = mailbox_entry_key(target, msg_id, class);
+
+        let tx = self.inner.begin_write()?;
+        {
+            let mut entries = tx.open_table(MAILBOX_ENTRIES)?;
+            let removed_size: u64 = match entries.get(&key)? {
+                Some(v) => v.value().len() as u64,
+                None => 0,
+            };
+            entries.remove(&key)?;
+
+            if removed_size > 0 {
+                let mut bytes_table = tx.open_table(MAILBOX_BYTES_BY_TARGET)?;
+                let current: u64 = match bytes_table.get(&target.0)? {
+                    Some(v) => from_cbor_bytes(v.value())?,
+                    None => 0,
+                };
+                let new_total = current.saturating_sub(removed_size);
+                if new_total == 0 {
+                    bytes_table.remove(&target.0)?;
+                } else {
+                    bytes_table.insert(&target.0, to_cbor_bytes(&new_total).as_slice())?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Sweep all expired entries (expires_at < now_secs) across all targets.
+    /// Updates the per-target byte counters accordingly.
+    /// Returns the count of entries removed.
+    pub fn mailbox_sweep_expired(&self, now_secs: u64) -> Result<u64, DbError> {
+        // Collect expired keys and their sizes in a read pass.
+        let to_delete: Vec<([u8; 49], [u8; 32], u64)> = {
+            let tx = self.inner.begin_read()?;
+            let table = tx.open_table(MAILBOX_ENTRIES)?;
+            let mut expired = Vec::new();
+            for item in table.iter()? {
+                let (k, v) = item?;
+                let entry: MailboxEntry = from_cbor_bytes(v.value())?;
+                if entry.expires_at < now_secs {
+                    expired.push((*k.value(), entry.target.0, v.value().len() as u64));
+                }
+            }
+            expired
+        };
+
+        if to_delete.is_empty() {
+            return Ok(0);
+        }
+
+        // Accumulate byte deltas per target.
+        let mut target_deltas: std::collections::HashMap<[u8; 32], u64> =
+            std::collections::HashMap::new();
+        for (_, target_bytes, size) in &to_delete {
+            *target_deltas.entry(*target_bytes).or_insert(0) += size;
+        }
+
+        let removed = to_delete.len() as u64;
+        let tx = self.inner.begin_write()?;
+        {
+            let mut entries = tx.open_table(MAILBOX_ENTRIES)?;
+            for (key, _, _) in &to_delete {
+                entries.remove(key)?;
+            }
+
+            let mut bytes_table = tx.open_table(MAILBOX_BYTES_BY_TARGET)?;
+            for (target_bytes, delta) in &target_deltas {
+                let current: u64 = match bytes_table.get(target_bytes)? {
+                    Some(v) => from_cbor_bytes(v.value())?,
+                    None => 0,
+                };
+                let new_total = current.saturating_sub(*delta);
+                if new_total == 0 {
+                    bytes_table.remove(target_bytes)?;
+                } else {
+                    bytes_table.insert(target_bytes, to_cbor_bytes(&new_total).as_slice())?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Bytes stored in mailbox for a given target.
+    /// Returns 0 if the target has no entries.
+    pub fn mailbox_bytes_for_target(&self, target: &IdentityPub) -> Result<u64, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(MAILBOX_BYTES_BY_TARGET)?;
+        match table.get(&target.0)? {
+            Some(v) => Ok(from_cbor_bytes(v.value())?),
+            None => Ok(0),
+        }
+    }
+
+    /// Total mailbox bytes across all targets (full scan of MAILBOX_BYTES_BY_TARGET).
+    pub fn mailbox_total_bytes(&self) -> Result<u64, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(MAILBOX_BYTES_BY_TARGET)?;
+        let mut total = 0u64;
+        for item in table.iter()? {
+            let (_, v) = item?;
+            let bytes: u64 = from_cbor_bytes(v.value())?;
+            total = total.saturating_add(bytes);
+        }
+        Ok(total)
+    }
+
+    /// Evict LRU non-high-trust entries for a target until bytes stored <= target_bytes.
+    /// Evicts non-high-trust (class.is_high_trust()==false) entries first ordered by
+    /// stored_at ascending. Falls through to high-trust entries only if still over quota.
+    ///
+    /// Returns the count of entries removed.
+    pub fn mailbox_evict_lru_for_target(
+        &self,
+        target: &IdentityPub,
+        target_bytes: u64,
+    ) -> Result<u64, DbError> {
+        // Collect all entries for target, sorted by (is_high_trust ASC, stored_at ASC).
+        let mut entries: Vec<([u8; 49], u64, bool)> = {
+            let tx = self.inner.begin_read()?;
+            let table = tx.open_table(MAILBOX_ENTRIES)?;
+            let mut lo = [0u8; 49];
+            let mut hi = [0u8; 49];
+            lo[..32].copy_from_slice(&target.0);
+            hi[..32].copy_from_slice(&target.0);
+            hi[32..].fill(0xFF);
+            let mut out = Vec::new();
+            for item in table.range::<&[u8; 49]>(&lo..=&hi)? {
+                let (k, v) = item?;
+                let entry: MailboxEntry = from_cbor_bytes(v.value())?;
+                out.push((*k.value(), entry.stored_at, entry.class.is_high_trust()));
+            }
+            out
+        };
+
+        // Sort: low-trust first, then by stored_at (oldest first).
+        entries.sort_by(|a, b| {
+            a.2.cmp(&b.2) // false (non-high-trust) sorts before true (high-trust)
+                .then_with(|| a.1.cmp(&b.1)) // older stored_at first
+        });
+
+        let current_bytes = self.mailbox_bytes_for_target(target)?;
+        if current_bytes <= target_bytes {
+            return Ok(0);
+        }
+        let to_free = current_bytes - target_bytes;
+
+        let mut freed = 0u64;
+        let mut keys_to_delete = Vec::new();
+
+        // Collect entries to evict by reading sizes from the already-fetched entries.
+        // We only need approximate size here (the CBOR-serialized bytes) — re-read from DB.
+        {
+            let tx = self.inner.begin_read()?;
+            let table = tx.open_table(MAILBOX_ENTRIES)?;
+            for (key, _, _) in &entries {
+                if freed >= to_free {
+                    break;
+                }
+                if let Some(v) = table.get(key)? {
+                    let size = v.value().len() as u64;
+                    keys_to_delete.push((*key, size));
+                    freed = freed.saturating_add(size);
+                }
+            }
+        }
+
+        if keys_to_delete.is_empty() {
+            return Ok(0);
+        }
+
+        let removed_count = keys_to_delete.len() as u64;
+        let tx = self.inner.begin_write()?;
+        {
+            let mut entries_table = tx.open_table(MAILBOX_ENTRIES)?;
+            let mut bytes_table = tx.open_table(MAILBOX_BYTES_BY_TARGET)?;
+
+            let mut total_freed = 0u64;
+            for (key, size) in &keys_to_delete {
+                entries_table.remove(key)?;
+                total_freed = total_freed.saturating_add(*size);
+            }
+
+            // Update per-target byte counter.
+            let current: u64 = match bytes_table.get(&target.0)? {
+                Some(v) => from_cbor_bytes(v.value())?,
+                None => 0,
+            };
+            let new_total = current.saturating_sub(total_freed);
+            if new_total == 0 {
+                bytes_table.remove(&target.0)?;
+            } else {
+                bytes_table.insert(&target.0, to_cbor_bytes(&new_total).as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed_count)
     }
 }
 
