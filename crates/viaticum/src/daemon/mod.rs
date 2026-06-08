@@ -7,6 +7,7 @@ pub mod handle;
 pub mod holder_cleanup;
 pub mod holdings_integrity;
 pub mod identity;
+pub mod mailbox;
 pub mod metrics;
 pub mod network;
 pub mod peer_backoff;
