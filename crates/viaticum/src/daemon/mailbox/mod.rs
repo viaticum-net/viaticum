@@ -1,9 +1,10 @@
 // Daemon-side mailbox module.
 //
 // T-2: candidate-set check (should_store).
-// Future: T-3 handlers, T-4 routing, T-8 self-pointer push.
+// T-4: MailboxRouter (publish / poll / dr_walk_for_pointer).
 
 pub mod candidate;
+pub mod routing;
 
 #[cfg(test)]
 mod tests;
