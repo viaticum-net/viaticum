@@ -66,11 +66,18 @@ pub(crate) async fn run_block_iteration(
     block: &SourceBlockRecord,
     pool: &PoolSnapshot,
 ) -> anyhow::Result<WorkOutcome> {
-    // 1. Rebuild source blob from source files (deterministic; no block.bin needed).
-    let source_data =
-        crate::daemon::backup::pipeline::rebuild_source_blob(db, block, &config.epoch_key)
+    // 1. Obtain the source blob. SystemState blocks have no backing watch-dir file:
+    //    their encoded blob is retained on disk (blake3 == block_id), so load it
+    //    directly. All other blocks rebuild from source files (deterministic).
+    let source_data = match crate::daemon::system_state::block::try_load_retained_block(
+        &config.data_dir,
+        &block.block_id,
+    )? {
+        Some(blob) => blob,
+        None => crate::daemon::backup::pipeline::rebuild_source_blob(db, block, &config.epoch_key)
             .await
-            .map_err(|e| anyhow::anyhow!("rebuild_source_blob: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("rebuild_source_blob: {e}"))?,
+    };
 
     // 2. Compute ErasureParams.
     let k = block.k;

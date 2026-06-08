@@ -61,6 +61,10 @@ pub struct WorkPipelineConfig {
     pub own_master_pub_key: viaticum_core::types::IdentityPub,
     /// Epoch key (same as BackupCoordinator uses). For `rebuild_source_blob`.
     pub epoch_key: [u8; 32],
+    /// Base data dir (`~/.viaticum`). SystemState blocks have no backing watch-dir
+    /// file; their encoded blob is retained under `<data_dir>/system_state/` and
+    /// loaded directly for the encode step instead of rebuilding from source files.
+    pub data_dir: std::path::PathBuf,
     /// Minimum pool size to attempt delivery. Below this, apply cooldown without encoding.
     /// Default: 2.
     pub min_pool_size: usize,
@@ -75,6 +79,7 @@ impl Default for WorkPipelineConfig {
             device_id: DeviceId([0u8; 32]),
             own_master_pub_key: viaticum_core::types::IdentityPub([0u8; 32]),
             epoch_key: [0u8; 32],
+            data_dir: std::path::PathBuf::new(),
             min_pool_size: 2,
         }
     }

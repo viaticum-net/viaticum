@@ -152,3 +152,41 @@ pub fn build_pointer(
         master_key, generation, base, diffs, created_at,
     ))
 }
+
+/// Build a pointer that references ONLY the placed prefix of [base, diff_0, diff_1, …].
+///
+/// SS blocks place asynchronously, so a freshly-created block has no Alive holders
+/// yet. A pointer referencing such a block would be unrecoverable at DR (no holder
+/// to fetch from). This builds the longest consistent prefix where every referenced
+/// block has ≥1 Alive holder:
+///   - if the base has no holders yet → `Ok(None)` (nothing useful to advertise — the
+///     caller skips publishing this tick; the base places within seconds);
+///   - otherwise include diffs in order, stopping at the first one without holders
+///     (the omitted tail becomes recoverable on a later tick once it places).
+///
+/// This keeps DR able to fetch everything the published pointer references.
+#[allow(clippy::too_many_arguments)]
+pub fn build_pointer_for_placed(
+    db: &Db,
+    master_key: &ed25519_dalek::SigningKey,
+    generation: u32,
+    base_id: &SourceBlockId,
+    diff_ids: &[SourceBlockId],
+    created_at: Timestamp,
+) -> anyhow::Result<Option<SelfPointer>> {
+    let base = block_ref_from_placements(db, base_id)?;
+    if base.holders.is_empty() {
+        return Ok(None);
+    }
+    let mut diffs = Vec::new();
+    for id in diff_ids {
+        let r = block_ref_from_placements(db, id)?;
+        if r.holders.is_empty() {
+            break;
+        }
+        diffs.push(r);
+    }
+    Ok(Some(sign_self_pointer(
+        master_key, generation, base, diffs, created_at,
+    )))
+}

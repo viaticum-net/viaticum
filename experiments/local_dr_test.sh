@@ -226,11 +226,14 @@ echo "=== Phase 3: System State Push ==="
 echo "  Creating test file on node-00..."
 dd if=/dev/urandom of="$(node_dir 0)/files/test.bin" bs=1024 count=256 2>/dev/null
 
-# Poll for system state blob on node-01 (max 90s)
-# Push fires 60s after daemon start, so blob should appear ~65s after start.
-echo "  Waiting for system state push to node-01 (interval=60s, max wait=90s)..."
+# Poll for system state pointer on node-01 (max 220s).
+# Push fires every 60s. With SS-as-block the pointer is only sent once the base
+# block is PLACED (placed-prefix invariant): tick 1 (~60s) builds the base but it
+# has no holders yet → no pointer; the base places over the next seconds; tick 2
+# (~120s) sends the first real pointer. So the blob appears ~120-130s after start.
+echo "  Waiting for system state pointer on node-01 (push=60s, base must place first, max wait=220s)..."
 BLOB_FOUND=0
-for attempt in $(seq 1 18); do
+for attempt in $(seq 1 44); do
     BLOB_LINE=$(run_cli_q 1 status --json 2>/dev/null \
         | grep -oE '"system_state_blobs":\s*[0-9]+' || true)
     BLOB_N=$(echo "$BLOB_LINE" | grep -oE '[0-9]+$')
@@ -272,12 +275,20 @@ echo "=== Phase 4: Disaster Recovery ==="
 if [ "$BLOB_FOUND" -eq 0 ]; then
     skip "DR skipped (no blob)"
 else
-    # Get peer addresses for DR
+    # Seed DR with ALL peers. SS-block symbols are spread across all holders, and
+    # DR fetches from holders it has dialed; with a tiny base (k_eff symbols spread
+    # 1-per-holder) it must reach every holder to collect k_eff. (Dialing holders
+    # directly from the pointer's holder hints is a separate follow-up.)
     ADDR_01=$(get_addr 1)
-    ADDR_02=$(get_addr 2)
+    DR_PEER_ARGS=""
     echo "  DR seed peers:"
-    echo "    node-01: $ADDR_01"
-    echo "    node-02: ${ADDR_02:-n/a}"
+    for i in $(seq 1 $((NUM_NODES-1))); do
+        A=$(get_addr "$i")
+        if [ -n "$A" ]; then
+            echo "    node-$(printf '%02d' "$i"): $A"
+            DR_PEER_ARGS="$DR_PEER_ARGS --peer \"$A\""
+        fi
+    done
 
     if [ -z "$ADDR_01" ]; then
         fail "cannot get node-01 addr for DR"
@@ -293,11 +304,10 @@ else
         rm -rf "$(node_dir 0)"/*
 
         # Run DR
-        echo "  Running: viaticum dr --mnemonic '...' --peer <node-01> --peer <node-02>"
+        echo "  Running: viaticum dr --mnemonic '...' (seeding all holders)"
         echo ""
 
-        DR_ARGS="--mnemonic \"$MNEMONIC_00\" --peer \"$ADDR_01\""
-        [ -n "${ADDR_02:-}" ] && DR_ARGS="$DR_ARGS --peer \"$ADDR_02\""
+        DR_ARGS="--mnemonic \"$MNEMONIC_00\"$DR_PEER_ARGS"
 
         set +e
         DR_OUTPUT=$(RUST_LOG=info eval "$BINARY" --data-dir "$(node_dir 0)" dr $DR_ARGS 2>&1)

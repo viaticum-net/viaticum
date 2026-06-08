@@ -107,25 +107,74 @@ pub async fn run_dr(
     let (swarm_handle, mut event_rx) = SwarmHandle::start(swarm_cfg).await?;
     println!("Network ready. Starting peer discovery...");
 
-    // ── 4. BFS: dial seed peers, collect SystemState blobs ───────────────────
+    // ── 4. BFS: dial seed peers (= the SS-block holders), collect pointer blobs ─
+    // Each SystemStateResponse blob now carries a CBOR SelfPointer (not a full
+    // state blob). The dialed seed peers stay authenticated in the swarm, so we
+    // reuse those connections below to fetch the base/diff blocks by holder hint.
     let blobs = bfs_collect_blobs(&swarm_handle, &mut event_rx, peer_addrs).await;
-
-    // ── 5. Select freshest blob and restore ───────────────────────────────────
     if blobs.is_empty() {
-        anyhow::bail!("no system state blobs found during BFS discovery");
+        anyhow::bail!("no system state pointers found during BFS discovery");
     }
 
-    // Sort by created_at descending: freshest first.
-    let mut blobs = blobs;
-    blobs.sort_by_key(|b| std::cmp::Reverse(b.0));
-    let (ts, best_blob) = &blobs[0];
-
+    // ── 5. Parse + verify pointers; pick the freshest valid one ───────────────
+    let mut pointers: Vec<viaticum_core::system_state::SelfPointer> = blobs
+        .iter()
+        .filter_map(|(_, blob)| {
+            viaticum_core::types::from_cbor_bytes::<viaticum_core::system_state::SelfPointer>(blob)
+                .ok()
+        })
+        .filter(|p| viaticum_core::system_state::verify_self_pointer(p, &identity_pub).is_ok())
+        .collect();
+    if pointers.is_empty() {
+        anyhow::bail!(
+            "collected {} blob(s) but none were valid signed self-pointers",
+            blobs.len()
+        );
+    }
+    // Freshest first by created_at; generation breaks ties.
+    pointers.sort_by_key(|p| std::cmp::Reverse((p.created_at.0, p.generation)));
+    let pointer = &pointers[0];
     println!(
-        "Restoring from blob (created_at={ts}, {} bytes)...",
-        best_blob.len()
+        "Selected self-pointer: generation={}, base={}, diffs={}, created_at={}",
+        pointer.generation,
+        hex_encode(&pointer.base.block_id.0),
+        pointer.diffs.len(),
+        pointer.created_at.0
     );
 
-    let state = crate::daemon::system_state::decrypt_and_restore(&db, best_blob, &keyfile.seed)?;
+    // The seed-peer connections stay authenticated in the swarm; reuse them (Arc)
+    // to fetch the base/diff blocks from their holders.
+    let swarm_handle = std::sync::Arc::new(swarm_handle);
+
+    // ── 6. Fetch base + diff blocks via holder hints, reassemble state ────────
+    let dr_key = crate::daemon::system_state::identity_key_bytes_from_seed(&keyfile.seed)?;
+    let encoder: std::sync::Arc<dyn viaticum_core::erasure::ErasureEncoder> =
+        std::sync::Arc::new(viaticum_core::erasure::RaptorQEncoder::new());
+
+    let base_bytes = fetch_ss_block(&swarm_handle, &encoder, &pointer.base, &dr_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fetch SS base block: {e}"))?;
+    let base_state: viaticum_core::system_state::SystemState =
+        viaticum_core::types::from_cbor_bytes(&base_bytes)
+            .map_err(|e| anyhow::anyhow!("decode base SystemState: {e}"))?;
+
+    let mut diffs: Vec<Vec<viaticum_core::system_state::DiffOp>> =
+        Vec::with_capacity(pointer.diffs.len());
+    for dref in &pointer.diffs {
+        let bytes = fetch_ss_block(&swarm_handle, &encoder, dref, &dr_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to fetch SS diff block: {e}"))?;
+        diffs.push(
+            viaticum_core::types::from_cbor_bytes(&bytes)
+                .map_err(|e| anyhow::anyhow!("decode diff block: {e}"))?,
+        );
+    }
+
+    let state = viaticum_core::system_state::apply_diffs(base_state, &diffs);
+
+    // ── 7. Restore into the fresh DB ──────────────────────────────────────────
+    viaticum_core::system_state::restore_db(&db, &state)
+        .map_err(|e| anyhow::anyhow!("restore_db: {e}"))?;
 
     println!("DR restore successful:");
     println!("  Files:         {}", state.files.len());
@@ -136,6 +185,68 @@ pub async fn run_dr(
     println!("Run 'viaticum daemon' to start, then 'viaticum restore <path>' to recover files.");
 
     Ok(())
+}
+
+/// Fetch one SystemState block (base or diff) from its holder hints and return the
+/// decrypted plaintext (CBOR of `SystemState` for a base, `Vec<DiffOp>` for a diff).
+///
+/// DR has no `SourceBlockRecord`/`symbol_placements`, so the params come from the
+/// pointer: `ErasureParams::compute(encrypted_size, SYSTEM_STATE_IMPORTANCE)` is
+/// deterministic and reproduces the exact placement params. Holders are reached via
+/// the authenticated-device map of the seed peers dialed above.
+async fn fetch_ss_block(
+    swarm: &std::sync::Arc<SwarmHandle>,
+    encoder: &std::sync::Arc<dyn viaticum_core::erasure::ErasureEncoder>,
+    bref: &viaticum_core::system_state::BlockRef,
+    dr_key: &[u8; 32],
+) -> anyhow::Result<Vec<u8>> {
+    use viaticum_core::types::{ErasureParams, FileId, PlacementStatus, SymbolPlacement};
+
+    let importance = crate::daemon::system_state::block::SYSTEM_STATE_IMPORTANCE;
+    let params = ErasureParams::compute(bref.encrypted_size, importance)
+        .map_err(|e| anyhow::anyhow!("erasure params for SS block: {e}"))?;
+
+    // Reconstruct placements from holder hints (holder_id + esi_ranges suffice;
+    // unbind derives the binding from block_id + holder_id, not binding_seed).
+    let placements: Vec<SymbolPlacement> = bref
+        .holders
+        .iter()
+        .map(|h| SymbolPlacement {
+            source_block_id: bref.block_id,
+            holder_id: h.holder_id,
+            file_id: FileId(0),
+            esi_ranges: h.esi_ranges.clone(),
+            binding_seed: [0u8; 32],
+            status: PlacementStatus::Alive,
+            last_verified: None,
+            placed_at: Timestamp::now(),
+            consecutive_misses: 0,
+        })
+        .collect();
+
+    let symbols = crate::daemon::symbol_fetch::fetch_unbound_symbols(
+        swarm,
+        encoder,
+        &bref.block_id,
+        &placements,
+        params.k_eff as usize,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("fetch_unbound_symbols: {e}"))?;
+
+    let padded = encoder
+        .decode(&symbols, &params)
+        .map_err(|e| anyhow::anyhow!("decode SS block: {e}"))?;
+    let size = bref.encrypted_size as usize;
+    if padded.len() < size {
+        anyhow::bail!(
+            "decoded SS block ({} bytes) smaller than encrypted_size ({size})",
+            padded.len()
+        );
+    }
+    let stored = &padded[..size];
+    crate::daemon::backup::pipeline::decrypt_and_decompress(stored, dr_key)
+        .map_err(|e| anyhow::anyhow!("decrypt SS block: {e}"))
 }
 
 // ─── BFS implementation ───────────────────────────────────────────────────────

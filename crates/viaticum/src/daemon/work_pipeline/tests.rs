@@ -135,6 +135,7 @@ fn make_config() -> WorkPipelineConfig {
         device_id: device_id(0),
         own_master_pub_key: viaticum_core::types::IdentityPub([0u8; 32]),
         epoch_key: [0u8; 32],
+        data_dir: std::path::PathBuf::new(),
         min_pool_size: 2,
     }
 }

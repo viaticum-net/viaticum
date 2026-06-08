@@ -8,19 +8,22 @@
 //   decrypt_and_restore     — decrypt blob → restore DB
 //   run_periodic_push       — tokio task: push blob to all known peers via swarm on interval
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hkdf::Hkdf;
 use sha2::Sha256;
 use viaticum_core::db::Db;
-use viaticum_core::system_state::{SystemState, pack_system_state, restore_db, snapshot_db};
+use viaticum_core::system_state::{
+    SystemState, diff_states, pack_system_state, restore_db, snapshot_db,
+};
 // Re-exported so tests (and callers) can check the current format version.
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use viaticum_core::messages::{Message, SystemStateBackupMsg};
 pub use viaticum_core::system_state::SYSTEM_STATE_VERSION;
-use viaticum_core::types::Timestamp;
+use viaticum_core::types::{SourceBlockId, Timestamp, to_cbor_bytes};
 
 use crate::daemon::network::swarm::SwarmHandle;
 
@@ -84,35 +87,52 @@ pub fn decrypt_and_restore(db: &Db, blob: &[u8], seed: &[u8]) -> anyhow::Result<
 
 // ─── run_periodic_push ───────────────────────────────────────────────────────
 
-/// Periodically snapshot the DB, encrypt the blob, and push it to all known peers.
+/// Periodically publish the SystemState as regular blocks + a signed self-pointer.
 ///
-/// Uses SwarmHandle.send_to_device (libp2p request-response, ε.2+).
-/// SystemStateBackup is sent as a request; the response (SystemStateAck or Ack) is logged.
+/// Replaces the legacy full-blob push (Bug #4: per-master overwrite, no quota, no
+/// PoS). The state now rides the normal block storage primitive:
+///   1. snapshot_db → if the snapshot changed since the last publish (or first run),
+///      build a new base SS block (`publish_base_block`, DR-stable key), retire the
+///      previous base, bump the generation. The work pipeline places the block and
+///      the scheduler PoS-challenges it like any block.
+///   2. Build + sign a `SelfPointer` over the current base (diffs dormant in v1 —
+///      DR already consumes them, so enabling diffs later is a push-loop-only change)
+///      and ride it in the EXISTING `SystemStateBackup` blob field. Recipients store
+///      it opaque; only DR interprets it.
 ///
-/// The minimum interval is clamped to 60 seconds to avoid hammering peers.
-/// On each tick:
-///   1. snapshot_and_encrypt
-///   2. db.list_all_peers() — get current peer list from DB
-///   3. For each peer: swarm.send_to_master(identity, SystemStateBackup)
-///   4. Log success count / failures
+/// The minimum interval is clamped to 60 seconds. The pointer is eventually-consistent:
+/// early pointers may reference a base with few/no Alive holders until placement completes.
 pub async fn run_periodic_push(
     db: Db,
     swarm: Arc<SwarmHandle>,
     seed: Vec<u8>,
+    master_key: ed25519_dalek::SigningKey,
+    data_dir: PathBuf,
     interval_secs: u64,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let clamped = interval_secs.max(60);
+    let dr_key = identity_key_bytes_from_seed(&seed)?;
     info!(
         interval_secs = clamped,
-        "system_state periodic push: started"
+        "system_state periodic push (SS-as-block): started"
     );
     let period = Duration::from_secs(clamped);
     let mut ticker = tokio::time::interval(period);
-    // The first tick fires immediately; skip it so we don't push on startup
-    // before the node has had time to learn its peers.
+    // The first tick fires immediately; skip it so we don't publish on startup
+    // before the node has had time to learn its peers / place blocks.
     ticker.tick().await;
     info!("system_state periodic push: first tick skipped, waiting for next");
+
+    // RAM state across ticks (rebuilt fresh on restart — a new base is published).
+    // The base is built ONCE and stays stable (so it places and remains fetchable);
+    // changes are captured as small diff blocks. Rebuilding the base every time the
+    // snapshot churns (peer last_seen / trust / PoS updates) would mean placement
+    // never catches up and the pointer would perpetually reference an unplaced base.
+    let mut generation: u32 = 0;
+    let mut base_id: Option<SourceBlockId> = None;
+    let mut last_published_state: Option<SystemState> = None;
+    let mut diff_ids: Vec<SourceBlockId> = Vec::new();
 
     loop {
         tokio::select! {
@@ -123,30 +143,112 @@ pub async fn run_periodic_push(
             }
         }
 
-        // 1. Snapshot + encrypt.
-        let blob = match snapshot_and_encrypt(&db, &seed) {
-            Ok(b) => b,
+        // 1. Snapshot (excludes our own SS blocks via the ledger — no self-reference).
+        let state = match snapshot_db(&db) {
+            Ok(s) => s,
             Err(e) => {
-                error!(error = %e, "system_state periodic push: snapshot failed");
+                error!(error = %e, "system_state push: snapshot failed");
                 continue;
             }
         };
 
-        // 2. Get peer list.
+        // 2. First publish → base. Subsequent changes → diff blocks; compaction
+        //    rebuilds the base when too many diffs accumulate.
+        if last_published_state.is_none() {
+            let next_gen = generation + 1;
+            match publish::publish_base_block(&db, &data_dir, &dr_key, next_gen, &state) {
+                Ok(id) => {
+                    base_id = Some(id);
+                    generation = next_gen;
+                    diff_ids.clear();
+                    last_published_state = Some(state);
+                    info!(generation, base = %id, "system_state push: base published");
+                }
+                Err(e) => {
+                    error!(error = %e, "system_state push: publish_base_block failed");
+                    continue;
+                }
+            }
+        } else {
+            let diffs = diff_states(last_published_state.as_ref().unwrap(), &state);
+            if !diffs.is_empty() {
+                if diff_ids.len() >= DIFF_COMPACTION_THRESHOLD {
+                    let next_gen = generation + 1;
+                    match publish::publish_base_block(&db, &data_dir, &dr_key, next_gen, &state) {
+                        Ok(new_base) => {
+                            if let Some(old) = base_id {
+                                publish::retire_ss_block(&db, &data_dir, &old);
+                            }
+                            for d in &diff_ids {
+                                publish::retire_ss_block(&db, &data_dir, d);
+                            }
+                            base_id = Some(new_base);
+                            generation = next_gen;
+                            diff_ids.clear();
+                            last_published_state = Some(state);
+                            info!(generation, base = %new_base, "system_state push: compacted to new base");
+                        }
+                        Err(e) => {
+                            error!(error = %e, "system_state push: compaction base failed");
+                            continue;
+                        }
+                    }
+                } else {
+                    match publish::publish_diff_block(&db, &data_dir, &dr_key, generation, &diffs) {
+                        Ok(id) => {
+                            diff_ids.push(id);
+                            last_published_state = Some(state);
+                            info!(generation, diff = %id, diffs = diff_ids.len(), "system_state push: diff published");
+                        }
+                        Err(e) => {
+                            error!(error = %e, "system_state push: publish_diff_block failed");
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        let base = match base_id {
+            Some(b) => b,
+            None => continue,
+        };
+
+        // 3. Build the self-pointer over the PLACED prefix of base + diffs. If the
+        //    base has not been placed yet, skip this tick (it places within seconds).
+        let pointer = match publish::build_pointer_for_placed(
+            &db,
+            &master_key,
+            generation,
+            &base,
+            &diff_ids,
+            Timestamp::now(),
+        ) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                debug!("system_state push: base not placed yet, skipping pointer");
+                continue;
+            }
+            Err(e) => {
+                error!(error = %e, "system_state push: build_pointer failed");
+                continue;
+            }
+        };
+        let blob = to_cbor_bytes(&pointer);
+
+        // 4. Ride the pointer in the existing SystemStateBackup blob field.
         let peers = match db.list_all_peers() {
             Ok(p) => p,
             Err(e) => {
-                error!(error = %e, "system_state periodic push: list_all_peers failed");
+                error!(error = %e, "system_state push: list_all_peers failed");
                 continue;
             }
         };
-
         if peers.is_empty() {
-            debug!("system_state periodic push: no peers, skipping");
+            debug!("system_state push: no peers, skipping pointer send");
             continue;
         }
 
-        // 3. Send to each peer via swarm.
         let msg = Message::SystemStateBackup(SystemStateBackupMsg {
             v: 1,
             encrypted_blob: blob.clone(),
@@ -166,12 +268,20 @@ pub async fn run_periodic_push(
             }
         }
         info!(
-            blob_bytes = blob.len(),
+            generation,
+            base = %base,
+            diffs = pointer.diffs.len(),
+            pointer_bytes = blob.len(),
+            base_holders = pointer.base.holders.len(),
             peers_ok = ok_count,
             peers_failed = fail_count,
-            "system_state periodic push: done"
+            "system_state push: pointer published"
         );
     }
 
     Ok(())
 }
+
+/// Rebuild the base (and discard accumulated diffs) once this many diff blocks
+/// pile up — keeps DR's apply chain short and bounds retained-blob count.
+const DIFF_COMPACTION_THRESHOLD: usize = 20;

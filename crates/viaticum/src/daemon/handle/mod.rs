@@ -922,6 +922,7 @@ impl DaemonHandle {
                     device_id,
                     own_master_pub_key: identity_pub,
                     epoch_key: epoch_key_bytes,
+                    data_dir: cfg.data_dir.clone(),
                     min_pool_size: 2,
                 };
                 let worker = crate::daemon::work_pipeline::WorkPipeline::new(
@@ -1057,6 +1058,8 @@ impl DaemonHandle {
             let ss_db = db.clone();
             let ss_swarm = swarm_handle_arc.clone();
             let ss_seed = keyfile.seed.clone();
+            let ss_master_key = master_key.clone();
+            let ss_data_dir = cfg.data_dir.clone();
             let ss_interval = (6 * 3600 / time_scale).max(60);
             let cancel_ss = cancel.clone();
             tasks.push(tokio::spawn(async move {
@@ -1065,6 +1068,8 @@ impl DaemonHandle {
                         ss_db,
                         swarm,
                         ss_seed,
+                        ss_master_key,
+                        ss_data_dir,
                         ss_interval,
                         cancel_ss,
                     )

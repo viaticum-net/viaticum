@@ -251,6 +251,54 @@ fn retire_removes_block_record_placements_blob_and_ledger() {
 }
 
 #[test]
+fn placed_prefix_pointer_is_none_until_base_placed() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let state = snapshot_db(&db).unwrap();
+    let base_id = publish_base_block(&db, dir.path(), &dr_key(), 1, &state).unwrap();
+
+    let master = viaticum_core::cluster::derive_master_key(&[3u8; 32]).unwrap();
+    // Base has no Alive holders yet → no useful pointer to advertise.
+    let p = build_pointer_for_placed(&db, &master, 1, &base_id, &[], Timestamp(1)).unwrap();
+    assert!(p.is_none(), "no pointer until the base is placed");
+}
+
+#[test]
+fn placed_prefix_pointer_stops_at_first_unplaced_diff() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let s0 = snapshot_db(&db).unwrap();
+    let base_id = publish_base_block(&db, dir.path(), &dr_key(), 1, &s0).unwrap();
+    sample_file(&db, 1, "a.txt");
+    let s1 = snapshot_db(&db).unwrap();
+    let d0 = publish_diff_block(&db, dir.path(), &dr_key(), 1, &diff_states(&s0, &s1)).unwrap();
+    sample_file(&db, 2, "b.txt");
+    let s2 = snapshot_db(&db).unwrap();
+    let d1 = publish_diff_block(&db, dir.path(), &dr_key(), 1, &diff_states(&s1, &s2)).unwrap();
+
+    // Place base and d0, but NOT d1.
+    let h = DeviceId([0x71u8; 32]);
+    db.upsert_placement(&alive_placement(base_id, h)).unwrap();
+    db.upsert_placement(&alive_placement(d0, h)).unwrap();
+
+    let master = viaticum_core::cluster::derive_master_key(&[4u8; 32]).unwrap();
+    let id = viaticum_core::cluster::master_identity(&master);
+    let p = build_pointer_for_placed(&db, &master, 2, &base_id, &[d0, d1], Timestamp(9))
+        .unwrap()
+        .expect("base placed → Some");
+
+    viaticum_core::system_state::verify_self_pointer(&p, &id).unwrap();
+    assert_eq!(p.base.block_id, base_id);
+    assert_eq!(
+        p.diffs.len(),
+        1,
+        "stops at the first unplaced diff (d1 omitted)"
+    );
+    assert_eq!(p.diffs[0].block_id, d0);
+}
+
+#[test]
 fn distinct_states_yield_distinct_base_blocks() {
     let db = Db::open_in_memory().unwrap();
     let dir = tempfile::tempdir().unwrap();
