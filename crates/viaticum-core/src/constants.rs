@@ -87,6 +87,18 @@ pub const OVERHEAD_SCALE: f64 = 1.5;
 /// gain is tiny while PoS/restore overhead grows linearly.
 pub const MAX_HOLDERS_PER_BLOCK: u32 = 30;
 
+/// Physical survival ceiling: the probability that even a *fully trusted* holder
+/// still has our data at the end of the repair horizon (~1 month), independent of
+/// trust. Trust measures behaviour/commitment (does the holder store honestly);
+/// it cannot capture involuntary loss — disk death, fire, theft, ISP/decommission,
+/// the operator simply walking away — which happens to any node, however trusted.
+/// So `p = BASELINE_HOLDER_SURVIVAL × f(trust)` caps p below 1: no holder is ever
+/// a certainty, and the most important blocks therefore earn real replication
+/// instead of a thin spread that assumed immortal holders. 0.90 ≈ "~10% of even
+/// good nodes vanish over a month" — deliberately conservative (under-estimating p
+/// over-places, the safe direction).
+pub const BASELINE_HOLDER_SURVIVAL: f64 = 0.90;
+
 /// Minimum symbols assigned per holder. Below this threshold the per-holder
 /// tracking overhead (PoS, repair) isn't justified. Protects small-block configs.
 pub const MIN_SYMBOLS_PER_HOLDER: u32 = 32; // 2 MB at T=64KB

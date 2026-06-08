@@ -717,6 +717,28 @@ fn compute_with_holders_weak_pool_needs_more_symbols() {
 }
 
 #[test]
+fn compute_critical_block_few_holders_gets_full_replicas() {
+    // SS-base-like: a tiny MAX-importance block with few holders, all max trust.
+    // With the physical survival ceiling (BASELINE_HOLDER_SURVIVAL), even max trust
+    // maps to p=0.90 — a thin 1-per-holder spread cannot reach target 0.99999, so
+    // each holder must hold a full decodable copy (k_eff symbols). That makes DR
+    // recoverable from ANY single surviving holder, instead of needing all of them.
+    let candidates = uniform_candidates(4, 1.0);
+    let source_size = 800u64; // tiny → small k_eff
+    let allocs =
+        compute_allocation_with_importance(&candidates, source_size, 1.0, 0).expect("should place");
+    let base = crate::types::ErasureParams::compute(source_size, 1.0).unwrap();
+    assert!(!allocs.is_empty(), "must place on at least one holder");
+    for a in &allocs {
+        assert_eq!(
+            a.symbol_count, base.k_eff,
+            "each holder must hold a full copy (k_eff={}) — recoverable from any one",
+            base.k_eff
+        );
+    }
+}
+
+#[test]
 fn compute_with_holders_falls_back_when_candidates_empty() {
     let result = compute_allocation_with_importance(&[], 10 * 1024 * 1024, 0.5, 0);
     assert!(

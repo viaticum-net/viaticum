@@ -606,10 +606,16 @@ fn build_report_no_holders() {
 // ============================================================
 
 #[test]
-fn commitment_to_survival_prob_full_score() {
+fn commitment_to_survival_prob_full_score_caps_at_baseline() {
+    // Even a fully-committed holder is not a certainty: p = BASELINE × 1² = 0.90,
+    // never 1.0 (nodes physically vanish regardless of trust).
     let score = CommitmentScore::new(1.0);
     let result = commitment_to_survival_prob(score);
-    assert!((result - 1.0).abs() < 1e-9, "expected 1.0, got {result}");
+    assert!(
+        (result - crate::constants::BASELINE_HOLDER_SURVIVAL).abs() < 1e-9,
+        "expected baseline {}, got {result}",
+        crate::constants::BASELINE_HOLDER_SURVIVAL
+    );
 }
 
 #[test]
@@ -621,33 +627,28 @@ fn commitment_to_survival_prob_zero_score() {
 
 #[test]
 fn commitment_to_survival_prob_midpoint() {
-    // score^2 = 0.5^2 = 0.25
+    // BASELINE × score² = 0.90 × 0.5² = 0.225
     let score = CommitmentScore::new(0.5);
     let result = commitment_to_survival_prob(score);
-    assert!((result - 0.25).abs() < 1e-9, "expected 0.25, got {result}");
+    assert!(
+        (result - 0.225).abs() < 1e-9,
+        "expected 0.225, got {result}"
+    );
 }
 
 #[test]
-fn commitment_to_survival_prob_default_churn() {
-    // survival_prob = score^2 = 0.7 → score = sqrt(0.7) ≈ 0.8367
-    let score = CommitmentScore::new(0.7_f64.sqrt());
-    let result = commitment_to_survival_prob(score);
-    assert!((result - 0.7).abs() < 1e-6, "expected ~0.7, got {result}");
-}
-
-#[test]
-fn survival_prob_round_trips_commitment() {
-    // survival_prob should equal 1.0 - eviction_risk(score)
-    use crate::commitment::eviction_risk;
+fn commitment_to_survival_prob_is_baseline_times_score_squared() {
+    use crate::constants::BASELINE_HOLDER_SURVIVAL;
     for score_val in [0.0_f64, 0.3, 0.5, 0.7, 0.9, 1.0] {
         let score = CommitmentScore::new(score_val);
         let sp = commitment_to_survival_prob(score);
-        let er = eviction_risk(score);
+        let expected = BASELINE_HOLDER_SURVIVAL * score_val * score_val;
         assert!(
-            ((sp + er) - 1.0).abs() < 1e-9,
-            "score={score_val}: sp={sp}, er={er}, sum={}",
-            sp + er
+            (sp - expected).abs() < 1e-9,
+            "score={score_val}: sp={sp}, expected={expected}"
         );
+        // p never exceeds the physical ceiling.
+        assert!(sp <= BASELINE_HOLDER_SURVIVAL + 1e-12);
     }
 }
 

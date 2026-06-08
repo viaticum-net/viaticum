@@ -275,22 +275,18 @@ echo "=== Phase 4: Disaster Recovery ==="
 if [ "$BLOB_FOUND" -eq 0 ]; then
     skip "DR skipped (no blob)"
 else
-    # Seed DR with all holders. DR also dials holders named in the pointer's hints
-    # (dr::dial_pointer_holders), but that only reaches holders whose dialable addrs
-    # the owner had recorded at pointer-build time — owner-side addr propagation
-    # (identify) is not yet reliable for inbound-dialing peers (A2 transport), so a
-    # partial seed can still miss a holder. Seed all here to keep the suite green;
-    # the holder-dialing path is exercised in real multi-hop scenarios.
+    # Seed DR with a SINGLE holder. With the physical survival ceiling, the SS base
+    # (max-importance, few holders) is placed as full replicas — each holder holds a
+    # full decodable copy — so DR must recover from ANY one reachable holder, without
+    # needing to reach the others. (Pre-ceiling this failed: the base was spread thin
+    # and one holder carried < k_eff symbols.)
     ADDR_01=$(get_addr 1)
     DR_PEER_ARGS=""
-    echo "  DR seed peers:"
-    for i in $(seq 1 $((NUM_NODES-1))); do
-        A=$(get_addr "$i")
-        if [ -n "$A" ]; then
-            echo "    node-$(printf '%02d' "$i"): $A"
-            DR_PEER_ARGS="$DR_PEER_ARGS --peer \"$A\""
-        fi
-    done
+    echo "  DR seed peers (single holder; SS base = full replicas):"
+    if [ -n "$ADDR_01" ]; then
+        echo "    node-01: $ADDR_01"
+        DR_PEER_ARGS=" --peer \"$ADDR_01\""
+    fi
 
     if [ -z "$ADDR_01" ]; then
         fail "cannot get node-01 addr for DR"

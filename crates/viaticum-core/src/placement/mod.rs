@@ -321,11 +321,18 @@ pub fn compute_allocation_with_importance(
 
     let target_p = reliability::target_reliability(importance);
 
-    // Trust is the per-holder survival proxy: trust ∈ [0, 1).
+    // Per-holder survival probability: the SAME mapping the post-placement
+    // reliability recompute uses (processor::recompute_reliability), so placement
+    // and the repair trigger agree. `commitment_to_survival_prob` folds in the
+    // physical survival ceiling (BASELINE_HOLDER_SURVIVAL) — trust is NOT survival,
+    // even a fully trusted node can vanish, so p never approaches 1 and critical
+    // few-holder blocks earn full replicas instead of a thin spread.
     let solver_candidates: Vec<reliability::HolderCandidate> = candidates
         .iter()
         .map(|c| reliability::HolderCandidate {
-            survival_prob: c.trust.clamp(0.0, 0.999),
+            survival_prob: reliability::commitment_to_survival_prob(
+                crate::commitment::CommitmentScore::new(c.trust),
+            ),
         })
         .collect();
 

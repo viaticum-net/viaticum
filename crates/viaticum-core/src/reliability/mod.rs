@@ -371,20 +371,24 @@ pub fn build_report(input: &BlockReliabilityInput) -> Result<ReliabilityReport, 
 
 /// Convert a CommitmentScore to a per-symbol survival probability.
 ///
-/// Bridges commitment telemetry → reliability forecast.
-/// survival_prob = 1.0 - eviction_risk(score)
-///               = 1.0 - (1.0 - score.value()^2)
-///               = score.value()^2
+/// Bridges commitment telemetry → reliability forecast. Two independent channels
+/// must BOTH hold for our data to survive the repair horizon:
 ///
-/// Rationale: commitment::eviction_risk uses 1 - score^2. Inverting gives
-/// p = score^2, which maps:
-///   score=1.0 (fully committed) → p=1.0 (will survive)
-///   score=0.5 (medium)         → p=0.25
-///   score=0.0 (at-risk)        → p=0.0
+/// - behavioural: the holder keeps storing honestly — `1 - eviction_risk(score) = score²`;
+/// - physical: the node doesn't involuntarily vanish (disk/fire/theft/ISP/departure) —
+///   capped by `BASELINE_HOLDER_SURVIVAL`, independent of trust.
 ///
-/// This is intentionally pessimistic for low-commitment holders.
+/// survival_prob = BASELINE_HOLDER_SURVIVAL × score²
+///
+///   score=1.0 (fully committed) → p = 0.90  (NOT 1.0 — no node is a certainty)
+///   score=0.5 (medium)          → p = 0.225
+///   score=0.0 (at-risk)         → p = 0.0
+///
+/// The trust ceiling is what makes the placement solver build real replication for
+/// critical/few-holder blocks instead of a thin spread that assumed immortal holders.
+/// Intentionally pessimistic (under-estimating p over-places — the safe direction).
 pub fn commitment_to_survival_prob(score: CommitmentScore) -> f64 {
-    1.0 - eviction_risk(score)
+    crate::constants::BASELINE_HOLDER_SURVIVAL * (1.0 - eviction_risk(score))
 }
 
 // ============================================================
