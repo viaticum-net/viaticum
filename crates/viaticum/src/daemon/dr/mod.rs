@@ -146,6 +146,12 @@ pub async fn run_dr(
     // to fetch the base/diff blocks from their holders.
     let swarm_handle = std::sync::Arc::new(swarm_handle);
 
+    // ── 5b. Dial the pointer's holders so we can fetch from them even when they
+    //        were not in the seed list (the signed pointer carries dialable
+    //        multiaddrs in each HolderHint). Without this, DR only works when the
+    //        seed peers happen to be the block's holders.
+    dial_pointer_holders(&swarm_handle, &mut event_rx, pointer).await;
+
     // ── 6. Fetch base + diff blocks via holder hints, reassemble state ────────
     let dr_key = crate::daemon::system_state::identity_key_bytes_from_seed(&keyfile.seed)?;
     let encoder: std::sync::Arc<dyn viaticum_core::erasure::ErasureEncoder> =
@@ -185,6 +191,60 @@ pub async fn run_dr(
     println!("Run 'viaticum daemon' to start, then 'viaticum restore <path>' to recover files.");
 
     Ok(())
+}
+
+/// Dial the holders named in the selected pointer (base + diffs) so we can fetch
+/// their symbols, even when they were not among the CLI seed peers. Each
+/// `HolderHint.addrs` carries full multiaddrs (with `/p2p/<peer_id>`), so this
+/// reuses the same parse + dial + wait-for-auth flow as the seed peers. Holders
+/// already authenticated (e.g. seed peers that are also holders) are skipped.
+/// Best-effort: dial/auth failures are logged and skipped (the fetch then just
+/// collects fewer symbols).
+async fn dial_pointer_holders(
+    swarm: &std::sync::Arc<SwarmHandle>,
+    event_rx: &mut tokio::sync::mpsc::Receiver<ProtocolEvent>,
+    pointer: &viaticum_core::system_state::SelfPointer,
+) {
+    let already_auth = swarm
+        .peer_sets()
+        .await
+        .map(|(auth, _)| auth)
+        .unwrap_or_default();
+
+    // Unique holders across base + diffs that we are not already connected to.
+    let mut seen: HashSet<viaticum_core::types::DeviceId> = HashSet::new();
+    let mut targets: Vec<(viaticum_core::types::DeviceId, Vec<String>)> = Vec::new();
+    for bref in std::iter::once(&pointer.base).chain(pointer.diffs.iter()) {
+        for h in &bref.holders {
+            if already_auth.contains(&h.holder_id) || !seen.insert(h.holder_id) {
+                continue;
+            }
+            if !h.addrs.is_empty() {
+                targets.push((h.holder_id, h.addrs.clone()));
+            }
+        }
+    }
+
+    for (device, addrs) in targets {
+        // Dial every advertised address for the holder (same PeerId, libp2p races
+        // them), then wait once for that peer to authenticate.
+        let mut peer_id = None;
+        for addr_str in &addrs {
+            match parse_multiaddr_with_peer_id(addr_str) {
+                Ok((pid, multiaddr)) => {
+                    peer_id = Some(pid);
+                    let _ = swarm.dial(pid, multiaddr).await;
+                }
+                Err(e) => tracing::debug!(%device, "dr: skip holder addr: {e}"),
+            }
+        }
+        if let Some(pid) = peer_id {
+            match wait_for_auth(event_rx, pid).await {
+                Some(_) => tracing::info!(%device, "dr: authenticated pointer holder"),
+                None => tracing::info!(%device, "dr: could not reach pointer holder"),
+            }
+        }
+    }
 }
 
 /// Fetch one SystemState block (base or diff) from its holder hints and return the

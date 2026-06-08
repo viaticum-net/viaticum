@@ -275,10 +275,12 @@ echo "=== Phase 4: Disaster Recovery ==="
 if [ "$BLOB_FOUND" -eq 0 ]; then
     skip "DR skipped (no blob)"
 else
-    # Seed DR with ALL peers. SS-block symbols are spread across all holders, and
-    # DR fetches from holders it has dialed; with a tiny base (k_eff symbols spread
-    # 1-per-holder) it must reach every holder to collect k_eff. (Dialing holders
-    # directly from the pointer's holder hints is a separate follow-up.)
+    # Seed DR with all holders. DR also dials holders named in the pointer's hints
+    # (dr::dial_pointer_holders), but that only reaches holders whose dialable addrs
+    # the owner had recorded at pointer-build time — owner-side addr propagation
+    # (identify) is not yet reliable for inbound-dialing peers (A2 transport), so a
+    # partial seed can still miss a holder. Seed all here to keep the suite green;
+    # the holder-dialing path is exercised in real multi-hop scenarios.
     ADDR_01=$(get_addr 1)
     DR_PEER_ARGS=""
     echo "  DR seed peers:"
