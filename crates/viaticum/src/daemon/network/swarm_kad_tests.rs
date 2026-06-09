@@ -387,3 +387,111 @@ fn ipfs_bootstrap_peers_nonempty() {
         );
     }
 }
+
+// ─── T-9a: get_closest_peers_returns_known_peers ──────────────────────────────
+
+/// Two nodes: A (bootstrap), B.
+/// After B authenticates with A via DHT, querying get_closest_peers from B
+/// should return A (or at least one known peer) with addrs populated.
+///
+/// This is the core T-9a capability: on-demand Kademlia FIND_NODE query
+/// exposed as SwarmHandle::get_closest_peers.
+#[tokio::test]
+async fn get_closest_peers_returns_known_peers() {
+    let config_a = make_kad_config(80, vec![]);
+    let device_id_a = DeviceId(make_signing_key(80).verifying_key().to_bytes());
+
+    let (handle_a, mut events_a) = SwarmHandle::start(config_a).await.expect("swarm A start");
+    let addr_a = get_listen_addr(&handle_a).await;
+
+    // B bootstraps against A.
+    let bootstrap_addr = with_p2p(addr_a, handle_a.peer_id);
+    let config_b = make_kad_config(81, vec![bootstrap_addr]);
+
+    let (handle_b, mut events_b) = SwarmHandle::start(config_b).await.expect("swarm B start");
+
+    // Wait until B authenticates A (ensures DHT routing table is populated).
+    let ok = wait_for_peer_authenticated(&mut events_b, device_id_a, Duration::from_secs(10)).await;
+    assert!(ok, "B must authenticate A before querying");
+
+    // Drain A's events (don't block the test).
+    let _ = timeout(Duration::from_millis(50), async {
+        while events_a.recv().await.is_some() {}
+    })
+    .await;
+
+    // Query: from B, find closest peers to some 32-byte key.
+    let target_key = vec![0xABu8; 32];
+    let result = timeout(
+        Duration::from_secs(10),
+        handle_b.get_closest_peers(target_key),
+    )
+    .await
+    .expect("get_closest_peers must not hang")
+    .expect("get_closest_peers must not error");
+
+    // The result must be non-empty — A is in the routing table.
+    assert!(
+        !result.is_empty(),
+        "get_closest_peers must return at least one peer (A is known)"
+    );
+
+    // Every returned (peer_id, addrs) pair: peer_id must be valid.
+    for (peer_id, addrs) in &result {
+        assert_ne!(*peer_id, handle_b.peer_id, "result must not include self");
+        // Addrs may be empty for peers only in the routing table without
+        // identify info; that is acceptable — the important thing is that
+        // the peer_id is returned.
+        let _ = addrs;
+    }
+
+    // A should be in the result (it is B's only peer).
+    let a_found = result.iter().any(|(pid, _)| *pid == handle_a.peer_id);
+    assert!(
+        a_found,
+        "A's peer_id must appear in get_closest_peers result"
+    );
+}
+
+// ─── T-9a: get_closest_peers_times_out_or_empty_gracefully ───────────────────
+
+/// A node with no peers: get_closest_peers should return Ok(empty) or
+/// at most a graceful error — no panic, no hang beyond the method's own timeout.
+///
+/// We wrap with a generous outer timeout just in case the method hangs.
+#[tokio::test]
+async fn get_closest_peers_times_out_or_empty_gracefully() {
+    let config = make_kad_config(82, vec![]);
+    let (handle, _events) = SwarmHandle::start(config).await.expect("swarm start");
+    let _addr = get_listen_addr(&handle).await;
+
+    // Target key is arbitrary.
+    let target_key = vec![0x42u8; 32];
+
+    // The method's internal timeout is shorter than this outer guard.
+    let outcome = timeout(
+        Duration::from_secs(35), // outer guard: must complete before this
+        handle.get_closest_peers(target_key),
+    )
+    .await
+    .expect("get_closest_peers must not hang beyond 35s");
+
+    // Either Ok(empty) or Err(Timeout) — both are acceptable.
+    // What is NOT acceptable: panic or hang.
+    match outcome {
+        Ok(peers) => {
+            // Isolated node: empty result is expected.
+            assert!(
+                peers.is_empty(),
+                "isolated node should return empty peer list, got {peers:?}"
+            );
+        }
+        Err(e) => {
+            // A timeout error is also acceptable (the kad query timed out).
+            assert!(
+                e.to_string().contains("timeout") || e.to_string().contains("Timeout"),
+                "unexpected error from isolated get_closest_peers: {e}"
+            );
+        }
+    }
+}

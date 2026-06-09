@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use libp2p::identity::ed25519;
+use libp2p::kad::QueryId;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport, ResponseChannel};
 use libp2p::swarm::SwarmEvent;
 use libp2p::swarm::dial_opts::DialOpts;
@@ -35,6 +36,16 @@ use tracing::{debug, info, warn};
 use viaticum_core::cluster::{CertTrustPath, DeviceCertificate, verify_device_certificate};
 use viaticum_core::messages::Message;
 use viaticum_core::types::{DeviceId, IdentityPub};
+
+// ─── Type aliases ────────────────────────────────────────────────────────────
+
+/// Result type for `SwarmHandle::get_closest_peers` (T-9a).
+///
+/// Each entry is a `(PeerId, listen_addrs)` pair — the peer's libp2p identity
+/// and the listen addresses known to the Kademlia routing table at query time.
+/// Addresses may be empty for peers that are in the routing table but for
+/// which the `identify` protocol has not yet run.
+pub type ClosestPeersResult = Vec<(PeerId, Vec<Multiaddr>)>;
 
 // ─── Wire protocol identifiers ────────────────────────────────────────────────
 
@@ -303,6 +314,15 @@ enum SwarmCommand {
     SendResponse {
         channel: ResponseChannel<Message>,
         response: Box<Message>,
+    },
+    /// Initiate a Kademlia FIND_NODE query and return the closest peers found.
+    ///
+    /// Used by T-9 (DR walk) to discover the write-fanout candidates for a
+    /// SelfPointer (closest peers to SHA256(owner_master_pub)) and to resolve
+    /// dial addresses for holders whose PeerRecord addrs are empty/stale.
+    GetClosestPeers {
+        key: Vec<u8>,
+        reply: oneshot::Sender<Result<ClosestPeersResult, SwarmError>>,
     },
 }
 
@@ -641,6 +661,7 @@ impl SwarmHandle {
             pending_cert: HashMap::new(),
             peer_addrs: HashMap::new(),
             pending_requests: HashMap::new(),
+            pending_closest_peers: HashMap::new(),
             our_cert: config.device_cert,
             our_x25519_pub: config.x25519_pub,
             cluster_master_pub: config.cluster_master_pub,
@@ -811,6 +832,41 @@ impl SwarmHandle {
             .map_err(|_| SwarmError::ChannelClosed)?;
         reply_rx.await.map_err(|_| SwarmError::ChannelClosed)?
     }
+
+    /// Query the Kademlia DHT for the peers closest to `key`.
+    ///
+    /// Issues a FIND_NODE query and returns the K closest peers found, each
+    /// paired with their known listen addresses (from the kad routing table).
+    ///
+    /// Used by T-9 (DR walk) to discover SelfPointer write-fanout candidates
+    /// (closest peers to SHA256(owner_master_pub)) and to resolve dial
+    /// addresses for holders whose PeerRecord addrs are empty or stale.
+    ///
+    /// # Timeout
+    /// The query times out after 30 seconds (matching the request-response
+    /// timeout). On timeout the method returns an error; callers should treat
+    /// an empty or error result as "fall back to known peer list".
+    ///
+    /// # Return type
+    /// `Vec<(PeerId, Vec<Multiaddr>)>` — each element is a peer known to the
+    /// routing table. Addrs come from the Kademlia routing table directly
+    /// (populated via identify events); they may be empty for peers that are
+    /// in the routing table but for which identify has not yet run.
+    pub async fn get_closest_peers(&self, key: Vec<u8>) -> Result<ClosestPeersResult, SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel::<Result<ClosestPeersResult, SwarmError>>();
+        self.cmd_tx
+            .send(SwarmCommand::GetClosestPeers {
+                key,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| SwarmError::ChannelClosed)?;
+
+        tokio::time::timeout(Duration::from_secs(30), reply_rx)
+            .await
+            .map_err(|_| SwarmError::Timeout)?
+            .map_err(|_| SwarmError::ChannelClosed)?
+    }
 }
 
 // ─── Event Loop ───────────────────────────────────────────────────────────────
@@ -840,6 +896,15 @@ struct EventLoopState {
 
     /// OutboundRequestId → oneshot sender for send_to_device responses.
     pending_requests: HashMap<OutboundRequestId, oneshot::Sender<Result<Message, SwarmError>>>,
+
+    /// QueryId → oneshot sender for get_closest_peers responses (T-9a).
+    ///
+    /// Populated when a GetClosestPeers command is received; fulfilled (and
+    /// removed) when the corresponding OutboundQueryProgressed{GetClosestPeers}
+    /// event fires with step.last == true. Stale entries (query completed or
+    /// timed out before the command arrived) are harmlessly absent.
+    pending_closest_peers:
+        HashMap<QueryId, oneshot::Sender<Result<ClosestPeersResult, SwarmError>>>,
 
     our_cert: DeviceCertificate,
     our_x25519_pub: Option<[u8; 32]>,
@@ -1429,7 +1494,9 @@ impl EventLoopState {
         use libp2p::kad::{Event, QueryResult};
 
         match event {
-            Event::OutboundQueryProgressed { result, .. } => match result {
+            Event::OutboundQueryProgressed {
+                id, result, step, ..
+            } => match result {
                 QueryResult::Bootstrap(Ok(bootstrap_ok)) if bootstrap_ok.num_remaining == 0 => {
                     info!("kademlia bootstrap complete");
                     // Immediately start providing after successful bootstrap.
@@ -1480,6 +1547,62 @@ impl EventLoopState {
                 }
                 QueryResult::GetProviders(Err(e)) => {
                     warn!(error = ?e, "dht: get_providers failed");
+                }
+                // T-9a: GetClosestPeers result — fulfill the pending oneshot.
+                //
+                // libp2p-kad emits GetClosestPeers with step.last == true in a
+                // single final event. We check step.last defensively; if a
+                // future library version emits intermediate steps, we skip them
+                // (only fulfill on final step to avoid double-send on the oneshot).
+                //
+                // Both Ok and Err(Timeout) variants include a peer list. On
+                // Timeout we return whatever peers the query collected, so
+                // callers get the best-effort result (DR callers treat a small
+                // list gracefully). If no pending oneshot exists for this id
+                // (e.g. the caller already timed out its own await), we simply
+                // drop the result.
+                QueryResult::GetClosestPeers(result) => {
+                    if !step.last {
+                        // Intermediate step — not expected for GetClosestPeers,
+                        // but skip rather than double-send just in case.
+                        return;
+                    }
+                    if let Some(reply) = self.pending_closest_peers.remove(&id) {
+                        let peer_list = match result {
+                            Ok(ok) => {
+                                debug!(
+                                    query_id = ?id,
+                                    count = ok.peers.len(),
+                                    "dht: get_closest_peers complete"
+                                );
+                                ok.peers
+                                    .into_iter()
+                                    .map(|pi| (pi.peer_id, pi.addrs))
+                                    .collect()
+                            }
+                            Err(e) => {
+                                // Timeout: return collected peers (best-effort).
+                                debug!(
+                                    query_id = ?id,
+                                    error = ?e,
+                                    "dht: get_closest_peers timeout, returning partial result"
+                                );
+                                match e {
+                                    libp2p::kad::GetClosestPeersError::Timeout {
+                                        peers, ..
+                                    } => {
+                                        peers.into_iter().map(|pi| (pi.peer_id, pi.addrs)).collect()
+                                    }
+                                }
+                            }
+                        };
+                        let _ = reply.send(Ok(peer_list));
+                    } else {
+                        debug!(
+                            query_id = ?id,
+                            "dht: get_closest_peers result with no pending caller (caller timed out?)"
+                        );
+                    }
                 }
                 _ => {} // GetRecord, PutRecord, RepublishProvider — ignore
             },
@@ -1595,6 +1718,17 @@ impl EventLoopState {
                 {
                     warn!("send_response failed: channel already closed");
                 }
+            }
+            // T-9a: Issue a Kademlia FIND_NODE query and register the pending reply.
+            //
+            // get_closest_peers accepts any K where K: Into<kbucket::Key<K>> + Into<Vec<u8>>
+            // + Clone. Vec<u8> satisfies this via the libp2p-kad blanket impl.
+            // The result arrives as Event::OutboundQueryProgressed{GetClosestPeers}
+            // and is handled in handle_kad_event.
+            SwarmCommand::GetClosestPeers { key, reply } => {
+                let query_id = self.swarm.behaviour_mut().kad.get_closest_peers(key);
+                debug!(query_id = ?query_id, "dht: get_closest_peers query issued");
+                self.pending_closest_peers.insert(query_id, reply);
             }
         }
     }
