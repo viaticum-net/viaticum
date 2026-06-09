@@ -406,6 +406,15 @@ pub const MAILBOX_READ_FANOUT: usize = 300;
 /// DR walk batches: expanding search [100, 300, 1000].
 pub const MAILBOX_DR_WALK_BATCHES: &[usize] = &[100, 300, 1000];
 
+/// Kademlia bootstrap stabilization timeout for DR (seconds).
+///
+/// After starting the swarm in DR mode, we wait up to this long for the
+/// Kademlia routing table to populate via bootstrap. 120 s is enough for a
+/// small-to-medium network with 2+ seed peers (assumption A5 from the spec).
+/// Best-effort: if fewer peers authenticate within this window we still proceed
+/// with whatever is known.
+pub const DR_KAD_STABILIZE_TIMEOUT_SECS: u64 = 120;
+
 /// Mailbox poll interval: 1 hour.
 pub const MAILBOX_POLL_INTERVAL_SECS: u64 = 3600;
 

@@ -1,7 +1,12 @@
-// Tests for DR module: snapshot/restore roundtrip without network.
+// Tests for DR module.
 //
-// Network-dependent BFS logic is exercised by integration tests only.
-// Unit tests here cover the decrypt_and_restore contract.
+// Unit tests: select_freshest_valid_pointer logic + wait_for_kad_bootstrap_stable
+// seam tests (multi-swarm auth counting + DB upsert, timeout/best-effort).
+//
+// Full happy-path run_dr is NOT cargo-testable (no in-process multi-node DR
+// harness) — covered by local_dr_test.sh E2E test instead.
+
+use std::time::Duration;
 
 use crate::daemon::system_state::{
     SYSTEM_STATE_VERSION, decrypt_and_restore, snapshot_and_encrypt,
@@ -127,4 +132,105 @@ fn select_pointer_skips_invalid_keeps_valid() {
     let picked = select_freshest_valid_pointer(&blobs, &id).expect("the valid pointer survives");
     assert_eq!(picked.created_at, Timestamp(1000));
     assert_eq!(picked.generation, 1);
+}
+
+// ─── wait_for_kad_bootstrap_stable tests ─────────────────────────────────────
+
+/// Verify that wait_for_kad_bootstrap_stable correctly counts PeerAuthenticated
+/// events and upserts each authenticated peer into the DB.
+///
+/// Scenario: spin 3 swarms (A, B, C). A dials B and C and waits for both to
+/// authenticate. We simulate the DB-upserting behavior of wait_for_kad_bootstrap_stable
+/// by calling it with A's event_rx and checking that:
+///   - the returned count == 2 (both B and C authenticated)
+///   - both peers appear in the DB after the call
+#[tokio::test]
+async fn wait_for_kad_bootstrap_stable_counts_authenticated_peers_and_upserts_db() {
+    use crate::daemon::network::swarm::SwarmHandle;
+    use crate::daemon::network::swarm_test_helpers::{get_listen_addr, make_swarm_config};
+
+    // Build 3 swarms (A, B, C) in the same test cluster.
+    let cfg_a = make_swarm_config(0x01);
+    let cfg_b = make_swarm_config(0x02);
+    let cfg_c = make_swarm_config(0x03);
+
+    let device_id_b =
+        viaticum_core::types::DeviceId(cfg_b.device_signing_key.verifying_key().to_bytes());
+    let device_id_c =
+        viaticum_core::types::DeviceId(cfg_c.device_signing_key.verifying_key().to_bytes());
+
+    let (handle_a, mut event_rx_a) = SwarmHandle::start(cfg_a).await.unwrap();
+    let (handle_b, _event_rx_b) = SwarmHandle::start(cfg_b).await.unwrap();
+    let (handle_c, _event_rx_c) = SwarmHandle::start(cfg_c).await.unwrap();
+
+    // Get B and C's listen addresses and peer_ids.
+    let addr_b = get_listen_addr(&handle_b).await;
+    let addr_c = get_listen_addr(&handle_c).await;
+    let pid_b = handle_b.peer_id;
+    let pid_c = handle_c.peer_id;
+
+    // Dial B and C from A.
+    handle_a.dial(pid_b, addr_b).await.unwrap();
+    handle_a.dial(pid_c, addr_c).await.unwrap();
+
+    // Run wait_for_kad_bootstrap_stable: should count 2 authenticated peers.
+    let db = viaticum_core::db::Db::open_in_memory().unwrap();
+    let count = super::wait_for_kad_bootstrap_stable(
+        &handle_a,
+        &mut event_rx_a,
+        &db,
+        10, // 10 second timeout — plenty for loopback
+        2,  // stop at 2 authenticated peers
+    )
+    .await;
+
+    assert_eq!(
+        count, 2,
+        "should have authenticated exactly 2 peers (B and C)"
+    );
+
+    // Both peers should now be in the DB.
+    let peer_b = db.get_peer(&device_id_b).unwrap();
+    let peer_c = db.get_peer(&device_id_c).unwrap();
+    assert!(
+        peer_b.is_some(),
+        "peer B must be upserted into DB after authentication"
+    );
+    assert!(
+        peer_c.is_some(),
+        "peer C must be upserted into DB after authentication"
+    );
+}
+
+/// Verify that wait_for_kad_bootstrap_stable returns 0 quickly when there are
+/// no peers (isolated node) — must NOT hang past the timeout.
+///
+/// Scenario: single swarm, no other peers. Call with timeout=3s, min_peers=1.
+/// Expect: returns 0 within ~3s (best-effort), no hang.
+#[tokio::test]
+async fn wait_for_kad_bootstrap_stable_returns_zero_on_timeout_no_hang() {
+    use crate::daemon::network::swarm::SwarmHandle;
+    use crate::daemon::network::swarm_test_helpers::make_swarm_config;
+
+    let cfg = make_swarm_config(0x10);
+    let (handle, mut event_rx) = SwarmHandle::start(cfg).await.unwrap();
+    let db = viaticum_core::db::Db::open_in_memory().unwrap();
+
+    let start = std::time::Instant::now();
+    // Use a short 3-second timeout.
+    let count = super::wait_for_kad_bootstrap_stable(
+        &handle,
+        &mut event_rx,
+        &db,
+        3, // 3 second timeout
+        1, // min_peers = 1 — will never be reached since no one connects
+    )
+    .await;
+
+    let elapsed = start.elapsed();
+    assert_eq!(count, 0, "isolated node should authenticate 0 peers");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "wait_for_kad_bootstrap_stable should not hang beyond timeout (elapsed={elapsed:?})"
+    );
 }

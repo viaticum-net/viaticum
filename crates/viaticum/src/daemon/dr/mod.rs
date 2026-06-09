@@ -1,26 +1,34 @@
-// Disaster recovery: restore node state from seed phrase via peer discovery.
+// Disaster recovery: restore node state from seed phrase via mailbox bus.
 //
 // Runs standalone (no daemon, no Processor). Connects to seed peers via libp2p
-// SwarmHandle, requests SystemState blobs, and restores the DB.
+// SwarmHandle, walks the mailbox candidate-set to find the freshest SelfPointer,
+// then fetches and restores the DB from the base+diff blocks.
 //
-// Flow:
+// A2 flow (T-9b):
 //   1. Init identity from mnemonic → IdentityKeyFile
 //   2. Open fresh DB (remove stale db.redb if present)
-//   3. Start minimal SwarmHandle (libp2p, no Processor)
-//   4. For each seed peer: dial → wait PeerAuthenticated → send SystemStateRequest
-//   5. Select freshest blob, decrypt and restore DB
-//
-// Note: PeerDiscovery (BFS expansion) is removed in ε.2. DHT-based discovery
-// comes in ε.3. For ε.2, only explicitly provided seed addresses are visited.
+//   3. Start SwarmHandle with seed peers as kademlia_bootstrap_peers
+//   4. wait_for_kad_bootstrap_stable: drain PeerAuthenticated events,
+//      upsert each peer to DB, return when min_peers reached or timeout
+//   5. get_closest_peers(hash(my_master_pub)) → dial + authenticate closest peers
+//      so MailboxRouter.dr_walk_for_pointer has a populated DB to work with
+//   6. MailboxRouter.dr_walk_for_pointer: expanding batches [100,300,1000]
+//      sends MailboxFetchRequest, verifies SelfPointer signatures, picks freshest
+//   7. dial_pointer_holders: try HolderHint.addrs first (fast); if empty or failed,
+//      fall back to get_closest_peers(holder_id) (B-1 Kademlia-first DR path)
+//   8. fetch_ss_block per base+diffs → apply_diffs → restore_db
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use viaticum_core::messages::{Message, SystemStateRequestMsg};
-use viaticum_core::types::{Timestamp, hex_encode};
+use viaticum_core::constants::DR_KAD_STABILIZE_TIMEOUT_SECS;
+use viaticum_core::types::{IdentityPub, PeerRecord, Timestamp, hex_encode};
 
 use crate::daemon::identity::{derive_keys, init_identity_from_mnemonic, load_identity};
+use crate::daemon::mailbox::candidate::KademliaRoutingView;
+use crate::daemon::mailbox::routing::MailboxRouter;
 use crate::daemon::network::swarm::{ProtocolEvent, SwarmConfig, SwarmHandle};
 
 #[cfg(test)]
@@ -30,20 +38,25 @@ mod tests;
 
 /// Per-connection timeout for dial + DeviceCertExchange.
 const AUTH_TIMEOUT_SECS: u64 = 15;
-/// Per-request timeout for waiting for a SystemStateResponse.
-const REQUEST_TIMEOUT_SECS: u64 = 10;
-/// Max peers to visit.
-const BFS_MAX_PEERS: usize = 500;
-/// Stop collecting blobs after finding this many.
-const BFS_MAX_BLOBS: usize = 10;
+
+/// Minimum authenticated peers before DR walk proceeds.
+///
+/// 5 peers is enough to seed the DB for dr_walk_for_pointer.  We still proceed
+/// even if fewer arrive within DR_KAD_STABILIZE_TIMEOUT_SECS (best-effort).
+/// Rationale: too low (1) = single-point-of-failure; too high (20) = long timeout
+/// on small networks. 5 is a reasonable middle ground for cold DR.
+const KAD_MIN_PEERS_FOR_DR: usize = 5;
+
+/// Per-peer timeout when dialing candidate peers discovered via get_closest_peers.
+const CANDIDATE_DIAL_TIMEOUT_SECS: u64 = 10;
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 /// Run disaster recovery: restore node state from mnemonic into data_dir.
 ///
-/// Connects to seed peers via libp2p SwarmHandle. DeviceCertExchange happens
-/// automatically. Collects SystemState blobs via request-response and restores
-/// the DB from the freshest blob found.
+/// Uses the mailbox bus (A2) to locate the freshest SelfPointer instead of the
+/// legacy SystemStateRequest/Response path. Seed peers are registered as Kademlia
+/// bootstrap peers so the routing table populates during bootstrap stabilization.
 pub async fn run_dr(
     mnemonic: String,
     peer_addrs: Vec<String>,
@@ -67,7 +80,7 @@ pub async fn run_dr(
     println!("Identity restored: {identity_pub_hex}");
 
     let (master_key, device_key, _epoch_key_bytes) = derive_keys(&keyfile, 0)?;
-    let identity_pub = viaticum_core::types::IdentityPub(keyfile.identity_pub);
+    let my_master_pub = viaticum_core::types::IdentityPub(keyfile.identity_pub);
     let device_id = viaticum_core::types::DeviceId(keyfile.device_id);
 
     // ── 2. Open fresh DB ──────────────────────────────────────────────────────
@@ -78,52 +91,96 @@ pub async fn run_dr(
     }
     let db = viaticum_core::db::Db::open(&db_path)?;
 
-    // ── 3. Start minimal SwarmHandle ─────────────────────────────────────────
-    // Issue a device certificate so DeviceCertExchange succeeds.
+    // ── 3. Start SwarmHandle with seed peers as Kademlia bootstrap peers ──────
+    // Parse seed addresses into Multiaddr for kademlia_bootstrap_peers so that
+    // kad.bootstrap() (fired on the first event-loop tick) actually reaches them.
     let device_cert =
         viaticum_core::cluster::issue_device_certificate(&master_key, device_id, Timestamp::now());
+
+    let bootstrap_multiaddrs: Vec<libp2p::Multiaddr> = peer_addrs
+        .iter()
+        .filter_map(|s| {
+            // Keep the full /p2p/... multiaddr for Kademlia (it needs the PeerId component).
+            match s.parse::<libp2p::Multiaddr>() {
+                Ok(ma) => Some(ma),
+                Err(e) => {
+                    tracing::warn!("dr: skip invalid multiaddr '{s}': {e}");
+                    None
+                }
+            }
+        })
+        .collect();
 
     let swarm_cfg = SwarmConfig {
         device_signing_key: device_key,
         master_signing_key: master_key,
-        identity_pub,
-        // DR recovers the founder's seed, so this node IS the cluster master.
-        // identity_pub == cluster_master_pub by construction here; peers we
-        // contact (former joiners) hold certs signed by this same master.
-        cluster_master_pub: identity_pub,
+        identity_pub: my_master_pub,
+        cluster_master_pub: my_master_pub,
         device_cert,
         x25519_pub: None,
         listen_port: 0,
         cert_timeout_secs: AUTH_TIMEOUT_SECS,
-        // DR mode: no Kademlia bootstrap — we dial explicit seed peers directly.
-        kademlia_bootstrap_peers: vec![],
+        // Seed peers as Kademlia bootstrap so DHT routing table populates.
+        kademlia_bootstrap_peers: bootstrap_multiaddrs.clone(),
         kademlia_disable_ipfs_bootstrap: true,
         kad_republish_interval_override: None,
         kad_discovery_interval_override: None,
-        // DR mode is read-only / short-lived — never act as relay server.
         enable_relay_server: false,
     };
 
     let (swarm_handle, mut event_rx) = SwarmHandle::start(swarm_cfg).await?;
-    println!("Network ready. Starting peer discovery...");
+    println!("Network ready. Waiting for Kademlia bootstrap...");
 
-    // ── 4. BFS: dial seed peers (= the SS-block holders), collect pointer blobs ─
-    // Each SystemStateResponse blob now carries a CBOR SelfPointer (not a full
-    // state blob). The dialed seed peers stay authenticated in the swarm, so we
-    // reuse those connections below to fetch the base/diff blocks by holder hint.
-    let blobs = bfs_collect_blobs(&swarm_handle, &mut event_rx, peer_addrs).await;
-    if blobs.is_empty() {
-        anyhow::bail!("no system state pointers found during BFS discovery");
+    // ── 4. Wait for Kademlia bootstrap to stabilize ───────────────────────────
+    // Drain PeerAuthenticated events, upsert each peer to the DB so that
+    // MailboxRouter.dr_walk_for_pointer has candidates to work with.
+    // Returns how many peers authenticated within the timeout.
+    let kad_peers = wait_for_kad_bootstrap_stable(
+        &swarm_handle,
+        &mut event_rx,
+        &db,
+        DR_KAD_STABILIZE_TIMEOUT_SECS,
+        KAD_MIN_PEERS_FOR_DR,
+    )
+    .await;
+
+    println!("Bootstrap stabilization: {kad_peers} peer(s) authenticated.");
+
+    // ── 5. Discover + authenticate closest peers via Kademlia ─────────────────
+    // The DR pointer is stored by nodes closest to hash(my_master_pub).
+    // get_closest_peers drives a live DHT query toward that key and returns
+    // the closest known peers with their addresses.  We dial them so they are
+    // authenticated and in the DB before dr_walk_for_pointer runs.
+    let target_key = KademliaRoutingView::target_key(&my_master_pub);
+    match swarm_handle.get_closest_peers(target_key.to_vec()).await {
+        Ok(closest) => {
+            tracing::info!(
+                count = closest.len(),
+                "dr: get_closest_peers returned candidate peers"
+            );
+            dial_and_authenticate_candidates(&swarm_handle, &mut event_rx, &db, closest).await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                "dr: get_closest_peers failed: {e}; proceeding with bootstrap-authenticated peers"
+            );
+        }
     }
 
-    // ── 5. Parse + verify pointers; pick the freshest valid one ───────────────
-    let pointer = match select_freshest_valid_pointer(&blobs, &identity_pub) {
+    // ── 6. Walk mailbox candidate-set for the freshest SelfPointer ───────────
+    let swarm_handle = Arc::new(swarm_handle);
+    let router = Arc::new(MailboxRouter::new(Arc::clone(&swarm_handle), db.clone()));
+
+    println!("Searching for SelfPointer via mailbox...");
+    let pointer = match router.dr_walk_for_pointer(&my_master_pub).await? {
         Some(p) => p,
-        None => anyhow::bail!(
-            "collected {} blob(s) but none were valid signed self-pointers",
-            blobs.len()
-        ),
+        None => {
+            anyhow::bail!(
+                "no SelfPointer found in the candidate-set; check seed peers / network connectivity"
+            );
+        }
     };
+
     println!(
         "Selected self-pointer: generation={}, base={}, diffs={}, created_at={}",
         pointer.generation,
@@ -132,20 +189,15 @@ pub async fn run_dr(
         pointer.created_at.0
     );
 
-    // The seed-peer connections stay authenticated in the swarm; reuse them (Arc)
-    // to fetch the base/diff blocks from their holders.
-    let swarm_handle = std::sync::Arc::new(swarm_handle);
+    // ── 7. Dial the pointer's holders so we can fetch from them ──────────────
+    // B-1: try HolderHint.addrs first (fast); if empty or all fail, use
+    // get_closest_peers(holder_id) as the primary DR path.
+    dial_pointer_holders(&swarm_handle, &mut event_rx, &db, &pointer).await;
 
-    // ── 5b. Dial the pointer's holders so we can fetch from them even when they
-    //        were not in the seed list (the signed pointer carries dialable
-    //        multiaddrs in each HolderHint). Without this, DR only works when the
-    //        seed peers happen to be the block's holders.
-    dial_pointer_holders(&swarm_handle, &mut event_rx, &pointer).await;
-
-    // ── 6. Fetch base + diff blocks via holder hints, reassemble state ────────
+    // ── 8. Fetch base + diff blocks, reassemble, restore DB ──────────────────
     let dr_key = crate::daemon::system_state::identity_key_bytes_from_seed(&keyfile.seed)?;
-    let encoder: std::sync::Arc<dyn viaticum_core::erasure::ErasureEncoder> =
-        std::sync::Arc::new(viaticum_core::erasure::RaptorQEncoder::new());
+    let encoder: Arc<dyn viaticum_core::erasure::ErasureEncoder> =
+        Arc::new(viaticum_core::erasure::RaptorQEncoder::new());
 
     let base_bytes = fetch_ss_block(&swarm_handle, &encoder, &pointer.base, &dr_key)
         .await
@@ -168,7 +220,7 @@ pub async fn run_dr(
 
     let state = viaticum_core::system_state::apply_diffs(base_state, &diffs);
 
-    // ── 7. Restore into the fresh DB ──────────────────────────────────────────
+    // ── 9. Restore into the fresh DB ──────────────────────────────────────────
     viaticum_core::system_state::restore_db(&db, &state)
         .map_err(|e| anyhow::anyhow!("restore_db: {e}"))?;
 
@@ -183,18 +235,278 @@ pub async fn run_dr(
     Ok(())
 }
 
+// ─── Kademlia bootstrap stabilization ────────────────────────────────────────
+
+/// Wait for Kademlia bootstrap to produce authenticated peers, upserting each
+/// one into `db` so that `MailboxRouter::dr_walk_for_pointer` has a populated
+/// candidate set when it queries `db.list_all_peers()`.
+///
+/// Returns as soon as `min_peers` have been authenticated OR the overall
+/// `timeout_secs` deadline elapses (best-effort: returns whatever was reached).
+/// Non-PeerAuthenticated events are ignored but not dropped — in DR mode there
+/// is no other consumer of `event_rx` at this stage.
+///
+/// min_peers rationale: 5 is enough to seed the candidate set for dr_walk.
+/// Too small (1) = single point of failure; too large = long waits on small nets.
+pub async fn wait_for_kad_bootstrap_stable(
+    swarm: &SwarmHandle,
+    event_rx: &mut tokio::sync::mpsc::Receiver<ProtocolEvent>,
+    db: &viaticum_core::db::Db,
+    timeout_secs: u64,
+    min_peers: usize,
+) -> usize {
+    use tokio::time::timeout;
+    use viaticum_core::constants::{AVAIL_EWMA_INITIAL, INITIAL_TRUST_P};
+
+    let mut count = 0usize;
+
+    let _ = timeout(Duration::from_secs(timeout_secs), async {
+        loop {
+            match event_rx.recv().await {
+                Some(ProtocolEvent::PeerAuthenticated {
+                    peer_id: _,
+                    device_id,
+                    identity_pub,
+                    device_cert: _,
+                    x25519_pub,
+                }) => {
+                    let now = Timestamp::now();
+                    // Build a minimal PeerRecord matching the pattern in processor/peer.rs
+                    // on_peer_authenticated (new peer branch).
+                    let record = match db.get_peer(&device_id) {
+                        Ok(Some(mut existing)) => {
+                            existing.master_identity = identity_pub;
+                            existing.last_seen = now;
+                            if x25519_pub.is_some() {
+                                existing.x25519_pub = x25519_pub;
+                            }
+                            existing.avail_ewma = viaticum_core::types::ewma_contact_observed(
+                                existing.avail_ewma,
+                                viaticum_core::constants::AVAIL_EWMA_ALPHA,
+                            );
+                            existing.last_avail_sample = now.0;
+                            existing
+                        }
+                        _ => PeerRecord {
+                            device_id,
+                            master_identity: identity_pub,
+                            trust_p: INITIAL_TRUST_P,
+                            trust_i: 0.0,
+                            trust_s: 1.0,
+                            bytes_we_store_for_peer: 0,
+                            bytes_peer_stores_for_us: 0,
+                            first_seen: now,
+                            last_seen: now,
+                            revoked_device_pub_keys: vec![],
+                            addrs: vec![],
+                            x25519_pub,
+                            avail_ewma: AVAIL_EWMA_INITIAL,
+                            last_avail_sample: now.0,
+                        },
+                    };
+
+                    if let Err(e) = db.upsert_peer(&record) {
+                        tracing::warn!(device = %device_id, "dr: upsert_peer failed: {e}");
+                    } else {
+                        count += 1;
+                        tracing::info!(
+                            device = %device_id,
+                            master = %identity_pub,
+                            count,
+                            "dr: bootstrap: peer authenticated and upserted"
+                        );
+                    }
+
+                    if count >= min_peers {
+                        tracing::info!(
+                            count,
+                            "dr: bootstrap: min_peers reached, stopping stabilization wait"
+                        );
+                        return;
+                    }
+                }
+                Some(ProtocolEvent::PeerIdentified {
+                    device_id,
+                    listen_addrs,
+                }) => {
+                    // Persist addresses to the already-upserted record.
+                    if let Ok(Some(mut record)) = db.get_peer(&device_id) {
+                        record.addrs = listen_addrs.iter().map(|a| a.to_string()).collect();
+                        let _ = db.upsert_peer(&record);
+                    }
+                }
+                Some(_) => {}
+                None => return, // channel closed
+            }
+        }
+    })
+    .await;
+
+    // Suppress "unused variable" from swarm borrow (swarm may be used later).
+    let _ = swarm;
+    count
+}
+
+// ─── Candidate peer dial (post-Kademlia walk) ─────────────────────────────────
+
+/// Dial and authenticate peers returned by `get_closest_peers`, upserting each
+/// into the DB so `dr_walk_for_pointer` has them as candidates.
+///
+/// Best-effort: dial / auth failures are logged at DEBUG level and skipped.
+async fn dial_and_authenticate_candidates(
+    swarm: &SwarmHandle,
+    event_rx: &mut tokio::sync::mpsc::Receiver<ProtocolEvent>,
+    db: &viaticum_core::db::Db,
+    closest: Vec<(libp2p::PeerId, Vec<libp2p::Multiaddr>)>,
+) {
+    let already_auth = swarm
+        .peer_sets()
+        .await
+        .map(|(auth, _)| auth)
+        .unwrap_or_default();
+
+    for (peer_id, addrs) in &closest {
+        // Derive DeviceId for this peer — needed to check already-auth.
+        // The check here is against PeerIds (what swarm.peer_sets returns is DeviceIds,
+        // but we filter by whether we already have a DB record after auth).
+        // Just attempt to dial; the wait_for_auth will skip if already done.
+        if addrs.is_empty() {
+            tracing::debug!(
+                %peer_id,
+                "dr: candidate peer has no addrs (identify not yet run) — skip for now"
+            );
+            continue;
+        }
+
+        let mut dialed_any = false;
+        for addr in addrs {
+            match swarm.dial(*peer_id, addr.clone()).await {
+                Ok(_) => {
+                    dialed_any = true;
+                }
+                Err(e) => {
+                    tracing::debug!(%peer_id, %addr, "dr: candidate dial failed: {e}");
+                }
+            }
+        }
+
+        if !dialed_any {
+            continue;
+        }
+
+        // Wait for PeerAuthenticated (short per-peer timeout).
+        match tokio::time::timeout(
+            Duration::from_secs(CANDIDATE_DIAL_TIMEOUT_SECS),
+            wait_for_auth_any(event_rx, *peer_id, db),
+        )
+        .await
+        {
+            Ok(Some(device_id)) => {
+                // already upserted inside wait_for_auth_any
+                tracing::info!(
+                    %peer_id,
+                    %device_id,
+                    "dr: candidate peer authenticated"
+                );
+            }
+            Ok(None) => {
+                tracing::debug!(%peer_id, "dr: candidate auth failed or connection closed");
+            }
+            Err(_) => {
+                tracing::debug!(%peer_id, "dr: candidate auth timed out");
+            }
+        }
+    }
+    let _ = already_auth; // suppress unused warning
+}
+
+/// Wait for a PeerAuthenticated event from the swarm for `expected_peer_id`.
+/// Unlike `wait_for_auth`, this also upserts the peer into `db` upon success.
+///
+/// Returns the DeviceId if authentication succeeds; None on channel close or
+/// connection closed for that peer. Intended to be wrapped in a per-peer timeout
+/// by the caller.
+async fn wait_for_auth_any(
+    event_rx: &mut tokio::sync::mpsc::Receiver<ProtocolEvent>,
+    expected_peer_id: libp2p::PeerId,
+    db: &viaticum_core::db::Db,
+) -> Option<viaticum_core::types::DeviceId> {
+    use viaticum_core::constants::{AVAIL_EWMA_INITIAL, INITIAL_TRUST_P};
+    loop {
+        match event_rx.recv().await {
+            Some(ProtocolEvent::PeerAuthenticated {
+                peer_id,
+                device_id,
+                identity_pub,
+                device_cert: _,
+                x25519_pub,
+            }) => {
+                // Upsert regardless of whether this is the expected peer.
+                let now = Timestamp::now();
+                let record = match db.get_peer(&device_id) {
+                    Ok(Some(mut existing)) => {
+                        existing.master_identity = identity_pub;
+                        existing.last_seen = now;
+                        if x25519_pub.is_some() {
+                            existing.x25519_pub = x25519_pub;
+                        }
+                        existing.avail_ewma = viaticum_core::types::ewma_contact_observed(
+                            existing.avail_ewma,
+                            viaticum_core::constants::AVAIL_EWMA_ALPHA,
+                        );
+                        existing.last_avail_sample = now.0;
+                        existing
+                    }
+                    _ => PeerRecord {
+                        device_id,
+                        master_identity: identity_pub,
+                        trust_p: INITIAL_TRUST_P,
+                        trust_i: 0.0,
+                        trust_s: 1.0,
+                        bytes_we_store_for_peer: 0,
+                        bytes_peer_stores_for_us: 0,
+                        first_seen: now,
+                        last_seen: now,
+                        revoked_device_pub_keys: vec![],
+                        addrs: vec![],
+                        x25519_pub,
+                        avail_ewma: AVAIL_EWMA_INITIAL,
+                        last_avail_sample: now.0,
+                    },
+                };
+                let _ = db.upsert_peer(&record);
+
+                if peer_id == expected_peer_id {
+                    return Some(device_id);
+                }
+                // Different peer — keep waiting for the expected one.
+            }
+            Some(ProtocolEvent::ConnectionClosed {
+                peer_id,
+                device_id: _,
+            }) => {
+                if peer_id == expected_peer_id {
+                    return None;
+                }
+            }
+            Some(_) => {}
+            None => return None,
+        }
+    }
+}
+
+// ─── Pointer holder dialing (B-1) ─────────────────────────────────────────────
+
 /// From the collected `(timestamp, blob)` pairs, deserialize each blob as a
 /// `SelfPointer`, keep only those whose signature verifies against the expected
 /// master identity, and return the freshest valid one.
 ///
-/// Freshness = `created_at` primary, `generation` tiebreak (NOT generation-primary:
-/// the publisher's generation is RAM-only and resets on restart — see `SelfPointer`).
-/// Signature verification happens BEFORE any pointer content is trusted; an
-/// unverifiable or non-pointer blob is silently dropped. Returns `None` if no blob
-/// is a valid signed pointer.
+/// Freshness = `created_at` primary, `generation` tiebreak.
+/// Retained for backwards-compatible unit tests.
+#[cfg(test)]
 fn select_freshest_valid_pointer(
     blobs: &[(u64, Vec<u8>)],
-    expected_master: &viaticum_core::types::IdentityPub,
+    expected_master: &IdentityPub,
 ) -> Option<viaticum_core::system_state::SelfPointer> {
     let mut pointers: Vec<viaticum_core::system_state::SelfPointer> = blobs
         .iter()
@@ -208,16 +520,21 @@ fn select_freshest_valid_pointer(
     pointers.into_iter().next()
 }
 
-/// Dial the holders named in the selected pointer (base + diffs) so we can fetch
-/// their symbols, even when they were not among the CLI seed peers. Each
-/// `HolderHint.addrs` carries full multiaddrs (with `/p2p/<peer_id>`), so this
-/// reuses the same parse + dial + wait-for-auth flow as the seed peers. Holders
-/// already authenticated (e.g. seed peers that are also holders) are skipped.
-/// Best-effort: dial/auth failures are logged and skipped (the fetch then just
-/// collects fewer symbols).
+/// Dial the holders named in the selected pointer so we can fetch their symbols.
+///
+/// B-1 strategy (spec §2.10 item 5):
+///   1. If `hint.addrs` is non-empty: try those addresses first (fast, if still valid).
+///   2. If addrs are empty OR all dials fail: fall back to
+///      `swarm.get_closest_peers(holder_id_bytes)` — the Kademlia-backed path.
+///      Empty addrs are normal (addr propagation is best-effort); log at INFO not WARN.
+///   3. For each discovered address from Kademlia, dial and wait for auth.
+///
+/// Best-effort throughout: a holder that cannot be reached means fewer symbols
+/// for that block (the erasure code tolerates this up to k_eff).
 async fn dial_pointer_holders(
-    swarm: &std::sync::Arc<SwarmHandle>,
+    swarm: &Arc<SwarmHandle>,
     event_rx: &mut tokio::sync::mpsc::Receiver<ProtocolEvent>,
+    db: &viaticum_core::db::Db,
     pointer: &viaticum_core::system_state::SelfPointer,
 ) {
     let already_auth = swarm
@@ -226,7 +543,7 @@ async fn dial_pointer_holders(
         .map(|(auth, _)| auth)
         .unwrap_or_default();
 
-    // Unique holders across base + diffs that we are not already connected to.
+    // Collect unique holders across base + diffs not already authenticated.
     let mut seen: HashSet<viaticum_core::types::DeviceId> = HashSet::new();
     let mut targets: Vec<(viaticum_core::types::DeviceId, Vec<String>)> = Vec::new();
     for bref in std::iter::once(&pointer.base).chain(pointer.diffs.iter()) {
@@ -234,44 +551,177 @@ async fn dial_pointer_holders(
             if already_auth.contains(&h.holder_id) || !seen.insert(h.holder_id) {
                 continue;
             }
-            if !h.addrs.is_empty() {
-                targets.push((h.holder_id, h.addrs.clone()));
-            }
+            targets.push((h.holder_id, h.addrs.clone()));
         }
     }
 
     for (device, addrs) in targets {
-        // Dial every advertised address for the holder (same PeerId, libp2p races
-        // them), then wait once for that peer to authenticate.
-        let mut peer_id = None;
-        for addr_str in &addrs {
-            match parse_multiaddr_with_peer_id(addr_str) {
-                Ok((pid, multiaddr)) => {
-                    peer_id = Some(pid);
-                    let _ = swarm.dial(pid, multiaddr).await;
-                }
-                Err(e) => tracing::debug!(%device, "dr: skip holder addr: {e}"),
-            }
-        }
-        if let Some(pid) = peer_id {
-            match wait_for_auth(event_rx, pid).await {
-                Some(_) => tracing::info!(%device, "dr: authenticated pointer holder"),
-                None => tracing::info!(%device, "dr: could not reach pointer holder"),
-            }
+        let authenticated = try_dial_holder_by_hints(swarm, event_rx, db, device, &addrs).await;
+
+        if !authenticated {
+            // B-1 Kademlia fallback: derive PeerId from DeviceId and look up
+            // current addresses from the DHT.
+            tracing::info!(
+                %device,
+                "dr: holder addrs empty or all failed — trying Kademlia get_closest_peers fallback"
+            );
+            try_dial_holder_via_kademlia(swarm, event_rx, db, device).await;
         }
     }
 }
 
-/// Fetch one SystemState block (base or diff) from its holder hints and return the
-/// decrypted plaintext (CBOR of `SystemState` for a base, `Vec<DiffOp>` for a diff).
+/// Try to dial a holder using the `HolderHint.addrs` list.
+/// Returns `true` if the peer was successfully authenticated.
+async fn try_dial_holder_by_hints(
+    swarm: &Arc<SwarmHandle>,
+    event_rx: &mut tokio::sync::mpsc::Receiver<ProtocolEvent>,
+    db: &viaticum_core::db::Db,
+    device: viaticum_core::types::DeviceId,
+    addrs: &[String],
+) -> bool {
+    if addrs.is_empty() {
+        // Empty addrs is normal — do not warn.
+        tracing::info!(
+            %device,
+            "dr: holder has no addr hints (normal — will use Kademlia fallback)"
+        );
+        return false;
+    }
+
+    let mut peer_id_opt = None;
+    for addr_str in addrs {
+        match parse_multiaddr_with_peer_id(addr_str) {
+            Ok((pid, multiaddr)) => {
+                peer_id_opt = Some(pid);
+                let _ = swarm.dial(pid, multiaddr).await;
+            }
+            Err(e) => tracing::debug!(%device, "dr: skip holder addr: {e}"),
+        }
+    }
+
+    if let Some(pid) = peer_id_opt {
+        match wait_for_auth(event_rx, pid).await {
+            Some(did) => {
+                tracing::info!(%did, "dr: authenticated pointer holder (via hints)");
+                // Upsert into DB so MailboxRouter can find this holder.
+                upsert_peer_minimal(db, did, viaticum_core::types::IdentityPub([0u8; 32]));
+                return true;
+            }
+            None => {
+                tracing::info!(%device, "dr: could not reach pointer holder via hints");
+            }
+        }
+    }
+    false
+}
+
+/// Try to dial a holder by looking up their current addresses via Kademlia.
 ///
-/// DR has no `SourceBlockRecord`/`symbol_placements`, so the params come from the
-/// pointer: `ErasureParams::compute(encrypted_size, SYSTEM_STATE_IMPORTANCE)` is
-/// deterministic and reproduces the exact placement params. Holders are reached via
-/// the authenticated-device map of the seed peers dialed above.
+/// Uses `get_closest_peers(holder_id_bytes)` — this drives a live DHT query
+/// toward the holder's peer_id key, which is effective at finding nodes whose
+/// listen addresses have changed since the SelfPointer was created.
+async fn try_dial_holder_via_kademlia(
+    swarm: &Arc<SwarmHandle>,
+    event_rx: &mut tokio::sync::mpsc::Receiver<ProtocolEvent>,
+    db: &viaticum_core::db::Db,
+    device: viaticum_core::types::DeviceId,
+) {
+    // Derive PeerId from DeviceId (Ed25519 pubkey → libp2p PeerId).
+    let peer_id = match crate::daemon::network::swarm::device_id_to_peer_id(&device) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(%device, "dr: cannot derive PeerId for Kademlia holder lookup: {e}");
+            return;
+        }
+    };
+
+    // Use the raw peer_id bytes as the Kademlia lookup key — this finds the
+    // node whose routing-table key is closest to the holder's own peer_id.
+    let key = peer_id.to_bytes();
+    match swarm.get_closest_peers(key).await {
+        Ok(closest) => {
+            // Look for the exact holder peer_id among the results.
+            let holder_addrs: Vec<libp2p::Multiaddr> = closest
+                .iter()
+                .filter(|(pid, _)| *pid == peer_id)
+                .flat_map(|(_, addrs)| addrs.iter().cloned())
+                .collect();
+
+            if holder_addrs.is_empty() {
+                tracing::debug!(
+                    %device,
+                    %peer_id,
+                    "dr: Kademlia did not return holder's own peer_id in closest set"
+                );
+                // Still try dialing any returned peers — one may route to holder.
+                for (cpid, caddrs) in &closest {
+                    for addr in caddrs {
+                        let _ = swarm.dial(*cpid, addr.clone()).await;
+                    }
+                }
+            } else {
+                for addr in &holder_addrs {
+                    let _ = swarm.dial(peer_id, addr.clone()).await;
+                }
+
+                match wait_for_auth(event_rx, peer_id).await {
+                    Some(did) => {
+                        tracing::info!(%did, "dr: authenticated pointer holder (via Kademlia)");
+                        upsert_peer_minimal(db, did, viaticum_core::types::IdentityPub([0u8; 32]));
+                    }
+                    None => {
+                        tracing::info!(%device, "dr: could not reach holder via Kademlia");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(%device, "dr: Kademlia holder lookup failed: {e}");
+        }
+    }
+}
+
+/// Upsert a minimal PeerRecord into `db` for a freshly authenticated holder.
+///
+/// Called when dial_pointer_holders authenticates a holder that may not yet
+/// have a DB record — ensures fetch_ss_block can use the authenticated connection.
+fn upsert_peer_minimal(
+    db: &viaticum_core::db::Db,
+    device_id: viaticum_core::types::DeviceId,
+    identity_pub: IdentityPub,
+) {
+    use viaticum_core::constants::{AVAIL_EWMA_INITIAL, INITIAL_TRUST_P};
+    let now = Timestamp::now();
+    let record = match db.get_peer(&device_id) {
+        Ok(Some(r)) => r, // already exists — leave it
+        _ => PeerRecord {
+            device_id,
+            master_identity: identity_pub,
+            trust_p: INITIAL_TRUST_P,
+            trust_i: 0.0,
+            trust_s: 1.0,
+            bytes_we_store_for_peer: 0,
+            bytes_peer_stores_for_us: 0,
+            first_seen: now,
+            last_seen: now,
+            revoked_device_pub_keys: vec![],
+            addrs: vec![],
+            x25519_pub: None,
+            avail_ewma: AVAIL_EWMA_INITIAL,
+            last_avail_sample: now.0,
+        },
+    };
+    // Only insert if newly created; don't clobber existing records.
+    if let Err(e) = db.upsert_peer(&record) {
+        tracing::warn!(%device_id, "dr: upsert_peer_minimal failed: {e}");
+    }
+}
+
+/// Fetch one SystemState block (base or diff) from its holder hints and return the
+/// decrypted plaintext.
 async fn fetch_ss_block(
-    swarm: &std::sync::Arc<SwarmHandle>,
-    encoder: &std::sync::Arc<dyn viaticum_core::erasure::ErasureEncoder>,
+    swarm: &Arc<SwarmHandle>,
+    encoder: &Arc<dyn viaticum_core::erasure::ErasureEncoder>,
     bref: &viaticum_core::system_state::BlockRef,
     dr_key: &[u8; 32],
 ) -> anyhow::Result<Vec<u8>> {
@@ -281,8 +731,6 @@ async fn fetch_ss_block(
     let params = ErasureParams::compute(bref.encrypted_size, importance)
         .map_err(|e| anyhow::anyhow!("erasure params for SS block: {e}"))?;
 
-    // Reconstruct placements from holder hints (holder_id + esi_ranges suffice;
-    // unbind derives the binding from block_id + holder_id, not binding_seed).
     let placements: Vec<SymbolPlacement> = bref
         .holders
         .iter()
@@ -324,11 +772,11 @@ async fn fetch_ss_block(
         .map_err(|e| anyhow::anyhow!("decrypt SS block: {e}"))
 }
 
-// ─── BFS implementation ───────────────────────────────────────────────────────
+// ─── Utility ─────────────────────────────────────────────────────────────────
 
 /// Parse a Multiaddr string that may contain a /p2p/<PeerId> component.
 ///
-/// Returns (PeerId, Multiaddr) if the p2p component is present, or an error.
+/// Returns (PeerId, Multiaddr-without-p2p) if the p2p component is present, or an error.
 fn parse_multiaddr_with_peer_id(
     addr_str: &str,
 ) -> anyhow::Result<(libp2p::PeerId, libp2p::Multiaddr)> {
@@ -338,10 +786,8 @@ fn parse_multiaddr_with_peer_id(
     let ma = libp2p::Multiaddr::from_str(addr_str)
         .map_err(|e| anyhow::anyhow!("invalid multiaddr '{addr_str}': {e}"))?;
 
-    // Extract /p2p/<PeerId> from the last protocol component.
     for proto in ma.iter() {
         if let Protocol::P2p(peer_id) = proto {
-            // Strip the /p2p/... suffix so we can dial the transport address.
             let transport_addr: libp2p::Multiaddr = ma
                 .iter()
                 .filter(|p| !matches!(p, Protocol::P2p(_)))
@@ -351,125 +797,6 @@ fn parse_multiaddr_with_peer_id(
     }
 
     anyhow::bail!("multiaddr '{addr_str}' has no /p2p/<PeerId> component")
-}
-
-/// BFS over seed peers, collecting (created_at, encrypted_blob) pairs.
-///
-/// For each seed address:
-///   1. Parse Multiaddr (must include /p2p/<PeerId> suffix).
-///   2. dial → wait for PeerAuthenticated event (AUTH_TIMEOUT_SECS).
-///   3. send SystemStateRequest via send_to_device.
-///   4. Collect blob if SystemStateResponse is non-empty.
-///
-/// In ε.2, BFS expansion via PeerDiscovery is not supported.
-/// Only the explicitly provided seed addresses are visited.
-async fn bfs_collect_blobs(
-    swarm: &SwarmHandle,
-    event_rx: &mut tokio::sync::mpsc::Receiver<ProtocolEvent>,
-    seed_addrs: Vec<String>,
-) -> Vec<(u64, Vec<u8>)> {
-    let mut visited: HashSet<[u8; 32]> = HashSet::new();
-    let mut blobs: Vec<(u64, Vec<u8>)> = Vec::new();
-
-    for addr_str in &seed_addrs {
-        if visited.len() >= BFS_MAX_PEERS {
-            tracing::info!("BFS peer limit reached ({BFS_MAX_PEERS}), stopping.");
-            break;
-        }
-        if blobs.len() >= BFS_MAX_BLOBS {
-            tracing::info!("BFS blob limit reached ({BFS_MAX_BLOBS}), stopping.");
-            break;
-        }
-
-        // Parse address.
-        let (peer_id, multiaddr) = match parse_multiaddr_with_peer_id(addr_str) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::info!("  skip '{addr_str}': {e}");
-                continue;
-            }
-        };
-
-        // De-duplicate by PeerId bytes.
-        let peer_id_bytes = peer_id.to_bytes();
-        // Use first 32 bytes as key (multihash is longer, but sufficient for dedup).
-        let key: [u8; 32] = {
-            let mut k = [0u8; 32];
-            let src = &peer_id_bytes[..peer_id_bytes.len().min(32)];
-            k[..src.len()].copy_from_slice(src);
-            k
-        };
-        if visited.contains(&key) {
-            continue;
-        }
-        visited.insert(key);
-
-        tracing::info!(
-            addr = &addr_str[..addr_str.len().min(80)],
-            visited = visited.len(),
-            blobs = blobs.len(),
-            "dr: dialing peer"
-        );
-
-        // Dial the peer.
-        if let Err(e) = swarm.dial(peer_id, multiaddr).await {
-            tracing::info!("dr: skip: dial failed ({e})");
-            continue;
-        }
-
-        // Wait for PeerAuthenticated event (with timeout).
-        let device_id = match wait_for_auth(event_rx, peer_id).await {
-            Some(did) => did,
-            None => {
-                tracing::info!("dr: skip: authentication timeout or connection closed");
-                continue;
-            }
-        };
-
-        tracing::info!(device = %device_id, "dr: authenticated");
-
-        // Send SystemStateRequest via libp2p request-response.
-        let req = Message::SystemStateRequest(SystemStateRequestMsg {
-            v: 1,
-            timestamp: Timestamp::now(),
-        });
-
-        match tokio::time::timeout(
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
-            swarm.send_to_device(device_id, req),
-        )
-        .await
-        {
-            Ok(Ok(Message::SystemStateResponse(resp))) => {
-                if !resp.encrypted_blob.is_empty() {
-                    tracing::info!(bytes = resp.encrypted_blob.len(), "dr: found blob");
-                    blobs.push((resp.timestamp.0, resp.encrypted_blob));
-                } else {
-                    tracing::info!("dr: peer has no blob stored for us");
-                }
-            }
-            Ok(Ok(other)) => {
-                tracing::info!(
-                    response = ?std::mem::discriminant(&other),
-                    "dr: unexpected response"
-                );
-            }
-            Ok(Err(e)) => {
-                tracing::info!("dr: SystemStateRequest failed: {e}");
-            }
-            Err(_) => {
-                tracing::info!("dr: SystemStateRequest timed out");
-            }
-        }
-    }
-
-    tracing::info!(
-        visited = visited.len(),
-        blobs = blobs.len(),
-        "dr: BFS complete"
-    );
-
-    blobs
 }
 
 /// Wait for a PeerAuthenticated event from the given peer_id.
@@ -491,19 +818,14 @@ async fn wait_for_auth(
                     if peer_id == expected_peer_id {
                         return Some(device_id);
                     }
-                    // Different peer authenticated — continue waiting.
                 }
                 Some(ProtocolEvent::ConnectionClosed { peer_id, .. }) => {
                     if peer_id == expected_peer_id {
                         return None;
                     }
                 }
-                Some(ProtocolEvent::InboundRequest { .. }) => {
-                    // Ignore inbound requests during DR — no Processor running.
-                }
-                Some(ProtocolEvent::PeerIdentified { .. }) => {
-                    // No DB to persist into during DR; just ignore.
-                }
+                Some(ProtocolEvent::InboundRequest { .. }) => {}
+                Some(ProtocolEvent::PeerIdentified { .. }) => {}
                 None => return None,
             }
         }
