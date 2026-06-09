@@ -204,6 +204,17 @@ pub async fn run_periodic_push(
                     let next_gen = generation + 1;
                     match publish::publish_base_block(&db, &data_dir, &dr_key, next_gen, &state) {
                         Ok(new_base) => {
+                            // Bug-G / T-10 rotation ordering: retire the old base and diffs
+                            // *before* publishing the new pointer. This is safe because:
+                            //   1. The old SelfPointer is still live in mailboxes (5y TTL) and
+                            //      points to the old block's HolderHints — DR can still fetch
+                            //      from those holders (retire only removes local metadata, not
+                            //      the remote holders' stored symbols).
+                            //   2. The new pointer is only published once `build_pointer_for_placed`
+                            //      returns Some (guarded below) — so we never publish a pointer
+                            //      that references an unplaced block.
+                            // No DropNotice is sent here — old holders keep their symbols until
+                            // the scheduled holder_cleanup pass (T-7).
                             if let Some(old) = base_id {
                                 publish::retire_ss_block(&db, &data_dir, &old);
                             }

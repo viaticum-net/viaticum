@@ -300,6 +300,64 @@ fn placed_prefix_pointer_stops_at_first_unplaced_diff() {
     assert_eq!(p.diffs[0].block_id, d0);
 }
 
+/// AC-7: Bug-G — staged rotation guard.
+///
+/// The pointer must NOT be published for a new base block until that base is
+/// DR-recoverable from its current alive holders.
+///
+/// For SS base blocks specifically: the placement solver (Phase-B DEEPEN) assigns
+/// `k_eff` symbols per holder when k_eff is small (typical SS block ≤ 10 KB →
+/// k_eff ≈ 4) and only a few holders are opened. Each holder therefore carries a
+/// full independently-decodable copy of the block. The DR-recoverability threshold
+/// is thus **≥1 alive holder with a non-empty ESI range** — verified by the
+/// `holders.is_empty()` guard in `build_pointer_for_placed`.
+///
+/// This test names the scenario explicitly (AC-7 coverage), transitions the base
+/// from 0 → 1 alive holder, and confirms the guard flips accordingly.
+#[test]
+fn pointer_not_updated_before_base_reaches_min_alive() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let state = snapshot_db(&db).unwrap();
+    let base_id = publish_base_block(&db, dir.path(), &dr_key(), 1, &state).unwrap();
+
+    let master = viaticum_core::cluster::derive_master_key(&[0xBBu8; 32]).unwrap();
+    let master_id = viaticum_core::cluster::master_identity(&master);
+
+    // Phase 1: base has 0 alive holders → pointer must be None (un-placed prefix).
+    let p = build_pointer_for_placed(&db, &master, 1, &base_id, &[], Timestamp(100)).unwrap();
+    assert!(
+        p.is_none(),
+        "pointer must be None when base has no alive holders (not DR-recoverable yet)"
+    );
+
+    // Phase 2: one alive holder with ESI ranges appears (full-replica copy).
+    // For SS blocks, k_eff is small and each holder gets k_eff symbols from the
+    // placement solver → single holder is independently decodable → DR-recoverable.
+    let holder = DeviceId([0xAAu8; 32]);
+    db.upsert_placement(&alive_placement(base_id, holder))
+        .unwrap();
+
+    let p = build_pointer_for_placed(&db, &master, 1, &base_id, &[], Timestamp(200))
+        .unwrap()
+        .expect("pointer must be Some once base has ≥1 alive holder (DR-recoverable)");
+
+    // Pointer references the correct base and is validly signed.
+    viaticum_core::system_state::verify_self_pointer(&p, &master_id)
+        .expect("pointer must verify against master identity");
+    assert_eq!(p.base.block_id, base_id);
+    assert_eq!(
+        p.base.holders.len(),
+        1,
+        "pointer base must list the one alive holder"
+    );
+    assert_eq!(p.base.holders[0].holder_id, holder);
+    assert!(
+        p.diffs.is_empty(),
+        "no diffs registered → pointer diffs must be empty"
+    );
+}
+
 #[test]
 fn distinct_states_yield_distinct_base_blocks() {
     let db = Db::open_in_memory().unwrap();

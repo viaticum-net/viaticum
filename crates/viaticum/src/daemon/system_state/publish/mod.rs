@@ -183,6 +183,17 @@ pub fn build_pointer(
 ///     (the omitted tail becomes recoverable on a later tick once it places).
 ///
 /// This keeps DR able to fetch everything the published pointer references.
+///
+/// # Guard correctness for SS base blocks (Bug-G / AC-7)
+///
+/// The recoverability threshold is `≥1 alive holder with non-empty ESI ranges`.
+/// This is correct because SS base blocks are small (typically ≤ 10 KB), giving a
+/// small `k_eff` (≈ 4 for ~1 KB). The placement solver (`solve_placement_for_target`
+/// Phase-B DEEPEN) fills each opened holder up to `k_eff` symbols when k_eff is
+/// small and holders are few — making every holder an independently decodable full
+/// replica. A single alive holder therefore satisfies DR recoverability. See
+/// `reliability::solve_placement_for_target` Phase-B comment: "with a small k_eff
+/// it fills holders to k_eff, which is replicas".
 #[allow(clippy::too_many_arguments)]
 pub fn build_pointer_for_placed(
     db: &Db,
