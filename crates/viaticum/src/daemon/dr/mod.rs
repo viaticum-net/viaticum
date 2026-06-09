@@ -41,11 +41,13 @@ const AUTH_TIMEOUT_SECS: u64 = 15;
 
 /// Minimum authenticated peers before DR walk proceeds.
 ///
-/// 5 peers is enough to seed the DB for dr_walk_for_pointer.  We still proceed
-/// even if fewer arrive within DR_KAD_STABILIZE_TIMEOUT_SECS (best-effort).
-/// Rationale: too low (1) = single-point-of-failure; too high (20) = long timeout
-/// on small networks. 5 is a reasonable middle ground for cold DR.
-const KAD_MIN_PEERS_FOR_DR: usize = 5;
+/// 1 peer is the minimum: a single authenticated peer gives us a DB entry and
+/// a live channel to send MailboxFetchRequest. We still drain more events until
+/// the timeout so the DB is as full as possible, but we don't burn 120s waiting
+/// for unreachable counts on small test networks. Rationale: in a 5-node cluster
+/// only 4 other peers exist; with min=5 the full DR_KAD_STABILIZE_TIMEOUT_SECS
+/// (120s) always fires, adding 120s to DR time unnecessarily.
+const KAD_MIN_PEERS_FOR_DR: usize = 1;
 
 /// Per-peer timeout when dialing candidate peers discovered via get_closest_peers.
 const CANDIDATE_DIAL_TIMEOUT_SECS: u64 = 10;
@@ -221,7 +223,10 @@ pub async fn run_dr(
     let state = viaticum_core::system_state::apply_diffs(base_state, &diffs);
 
     // ── 9. Restore into the fresh DB ──────────────────────────────────────────
-    viaticum_core::system_state::restore_db(&db, &state)
+    // Use restore_db_force: the DB is fresh but not fully empty — bootstrap
+    // upserted peer records during wait_for_kad_bootstrap_stable. The force
+    // variant skips the empty-DB guard and overlays the restored state on top.
+    viaticum_core::system_state::restore_db_force(&db, &state)
         .map_err(|e| anyhow::anyhow!("restore_db: {e}"))?;
 
     println!("DR restore successful:");
@@ -359,17 +364,33 @@ async fn dial_and_authenticate_candidates(
     db: &viaticum_core::db::Db,
     closest: Vec<(libp2p::PeerId, Vec<libp2p::Multiaddr>)>,
 ) {
-    let already_auth = swarm
+    use crate::daemon::network::swarm::device_id_to_peer_id;
+    use std::collections::HashSet;
+
+    // Build a set of already-authenticated PeerIds so we can skip re-dialing them.
+    // Re-dialing an already-connected peer hits PeerCondition::Disconnected guard
+    // in libp2p (silently dropped), and wait_for_auth_any then burns the full
+    // CANDIDATE_DIAL_TIMEOUT_SECS before giving up — ~10s wasted per peer.
+    let already_auth_peer_ids: HashSet<libp2p::PeerId> = swarm
         .peer_sets()
         .await
         .map(|(auth, _)| auth)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|dev| device_id_to_peer_id(dev).ok())
+        .collect();
 
     for (peer_id, addrs) in &closest {
-        // Derive DeviceId for this peer — needed to check already-auth.
-        // The check here is against PeerIds (what swarm.peer_sets returns is DeviceIds,
-        // but we filter by whether we already have a DB record after auth).
-        // Just attempt to dial; the wait_for_auth will skip if already done.
+        // Skip peers already authenticated during bootstrap — they are already
+        // in the DB and we have live connections to them.
+        if already_auth_peer_ids.contains(peer_id) {
+            tracing::debug!(
+                %peer_id,
+                "dr: candidate peer already authenticated — skip re-dial"
+            );
+            continue;
+        }
+
         if addrs.is_empty() {
             tracing::debug!(
                 %peer_id,
@@ -417,7 +438,6 @@ async fn dial_and_authenticate_candidates(
             }
         }
     }
-    let _ = already_auth; // suppress unused warning
 }
 
 /// Wait for a PeerAuthenticated event from the swarm for `expected_peer_id`.

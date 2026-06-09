@@ -1670,7 +1670,16 @@ impl EventLoopState {
             SwarmCommand::Dial { peer_id, addr } => {
                 let dial_opts = DialOpts::peer_id(peer_id).addresses(vec![addr]).build();
                 if let Err(e) = self.swarm.dial(dial_opts) {
-                    warn!(peer_id = %peer_id, error = %e, "dial failed");
+                    // "Already connected" is expected when DR re-dials bootstrap peers
+                    // before the already_auth skip check catches them all (race between
+                    // peer_sets snapshot and event-loop cert-exchange completion).
+                    // Log at DEBUG to avoid noise; other errors stay at WARN.
+                    let is_already_connected = e.to_string().contains("already connected");
+                    if is_already_connected {
+                        debug!(peer_id = %peer_id, error = %e, "dial skipped — already connected");
+                    } else {
+                        warn!(peer_id = %peer_id, error = %e, "dial failed");
+                    }
                 }
             }
             SwarmCommand::ListenAddrs { reply } => {

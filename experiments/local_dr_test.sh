@@ -226,22 +226,19 @@ echo "=== Phase 3: System State Push ==="
 echo "  Creating test file on node-00..."
 dd if=/dev/urandom of="$(node_dir 0)/files/test.bin" bs=1024 count=256 2>/dev/null
 
-# Poll for the SelfPointer to land in node-01's MAILBOX (max 220s).
-# A2 transport: the pointer is no longer push-to-all via SystemStateBackup — node-00
-# publishes it as a MailboxClass::SelfPointer entry to its candidate-set (T-8), and
-# each candidate (incl. node-01) stores it via handle_mailbox_store. So we gate on
-# node-01's mailbox_entries table count, not the retired system_state_blobs table.
-# Push fires every 60s; the pointer is only published once the base block is PLACED
-# (placed-prefix invariant): tick 1 (~60s) builds the base but it has no holders yet
-# → no pointer; the base places; tick 2 (~120s) publishes the first real pointer.
-echo "  Waiting for SelfPointer in node-01 mailbox (push=60s, base must place first, max wait=220s)..."
+# Poll for node-00 to publish its SelfPointer via mailbox (max 220s).
+# Gate on node-00's daemon log: "SelfPointer published via mailbox" with ack_count >= 1
+# means at least one candidate node has stored the pointer and will respond to DR fetch.
+#
+# Why not use node-01 mailbox_entries: that count includes PoS challenges and other
+# nodes' SelfPointers stored on node-01 (unrelated to node-00's pointer). It fires
+# false-positive at ~15s while node-00's SelfPointer requires ~120s (two 60s ticks:
+# tick-1 at 60s has no holders yet → skip; tick-2 at 120s base is placed → publish).
+echo "  Waiting for node-00 SelfPointer published via mailbox (push=60s, base must place first, max wait=220s)..."
 POINTER_FOUND=0
 for attempt in $(seq 1 44); do
-    MB_LINE=$(run_cli_q 1 status --json 2>/dev/null \
-        | grep -oE '"mailbox_entries":\s*[0-9]+' || true)
-    MB_N=$(echo "$MB_LINE" | grep -oE '[0-9]+$')
-    if [ "${MB_N:-0}" -ge 1 ]; then
-        echo "  SelfPointer found in node-01 mailbox after $((attempt * 5))s"
+    if grep -q "SelfPointer published via mailbox" "$(node_log 0)" 2>/dev/null; then
+        echo "  SelfPointer published by node-00 after $((attempt * 5))s"
         POINTER_FOUND=1
         break
     fi

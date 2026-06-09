@@ -420,6 +420,11 @@ impl MailboxRouter {
 
         let ranked = self.build_ranked_candidates(my_master_pub);
 
+        tracing::info!(
+            ranked_candidates = ranked.len(),
+            "dr_walk: candidates built from DB"
+        );
+
         let req = MailboxFetchRequest {
             v: 1,
             target: *my_master_pub,
@@ -430,11 +435,11 @@ impl MailboxRouter {
             let batch: Vec<DeviceId> = ranked.iter().take(batch_size).map(|(d, _)| *d).collect();
 
             if batch.is_empty() {
-                debug!("dr_walk: batch size {batch_size} — no candidates, stopping");
+                tracing::info!("dr_walk: batch size {batch_size} — no candidates in DB, stopping");
                 break;
             }
 
-            debug!(
+            tracing::info!(
                 batch_size,
                 peers = batch.len(),
                 "dr_walk: sending fetch to batch"
@@ -455,32 +460,45 @@ impl MailboxRouter {
             let mut pointer_candidates: Vec<SelfPointer> = Vec::new();
 
             for handle in handles {
-                if let Ok((device_id, Ok(resp))) = handle.await {
-                    self.record_avail_contact(device_id, now_secs);
-                    for entry in resp.entries {
-                        if entry.class != MailboxClass::SelfPointer {
-                            continue;
-                        }
-                        // Deserialize and verify.
-                        match from_cbor_bytes::<SelfPointer>(&entry.payload) {
-                            Ok(pointer) => {
-                                if verify_self_pointer(&pointer, my_master_pub).is_ok() {
-                                    pointer_candidates.push(pointer);
-                                } else {
+                match handle.await {
+                    Ok((device_id, Ok(resp))) => {
+                        tracing::info!(
+                            device = %device_id,
+                            entries = resp.entries.len(),
+                            "dr_walk: fetch response from peer"
+                        );
+                        self.record_avail_contact(device_id, now_secs);
+                        for entry in resp.entries {
+                            if entry.class != MailboxClass::SelfPointer {
+                                continue;
+                            }
+                            // Deserialize and verify.
+                            match from_cbor_bytes::<SelfPointer>(&entry.payload) {
+                                Ok(pointer) => {
+                                    if verify_self_pointer(&pointer, my_master_pub).is_ok() {
+                                        pointer_candidates.push(pointer);
+                                    } else {
+                                        debug!(
+                                            device = %device_id,
+                                            "dr_walk: pointer signature verification failed"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
                                     debug!(
                                         device = %device_id,
-                                        "dr_walk: pointer signature verification failed"
+                                        err = %e,
+                                        "dr_walk: failed to decode SelfPointer payload"
                                     );
                                 }
                             }
-                            Err(e) => {
-                                debug!(
-                                    device = %device_id,
-                                    err = %e,
-                                    "dr_walk: failed to decode SelfPointer payload"
-                                );
-                            }
                         }
+                    }
+                    Ok((device_id, Err(e))) => {
+                        tracing::info!(device = %device_id, err = %e, "dr_walk: fetch failed for peer");
+                    }
+                    Err(join_err) => {
+                        warn!("dr_walk: task panicked: {join_err}");
                     }
                 }
             }
