@@ -1181,6 +1181,63 @@ impl DaemonHandle {
             }));
         }
 
+        // ── T-11: Mailbox TTL sweep + membership-based self-cleanup ──────────
+        // Two housekeeping tasks running at MAILBOX_SWEEP_INTERVAL_SECS (6 hours):
+        //
+        // (a) run_mailbox_ttl_sweep — remove TTL-expired entries of ALL classes.
+        //     This is the ONLY eviction path for high-trust SelfPointers; without it
+        //     they would accumulate indefinitely.
+        //
+        // (b) run_mailbox_self_cleanup — for each target stored in our mailbox,
+        //     check membership (should_store). If we are no longer in the candidate set,
+        //     delete all non-high-trust entries for that target. SelfPointers are exempt
+        //     from membership eviction (AC-6 / Bug-D).
+        //
+        // Both tasks are unconditional (no swarm required for TTL sweep; self-cleanup
+        // builds routing view from DB on each tick).
+        {
+            use crate::daemon::mailbox::cleanup::{
+                run_mailbox_self_cleanup, run_mailbox_ttl_sweep,
+            };
+            use crate::daemon::network::swarm::device_id_to_peer_id;
+
+            // Derive own PeerId: prefer live swarm value (already computed), fall back
+            // to deriving from device_id. Failure is non-fatal: self-cleanup degrades
+            // to "only our own peer_id in routing view" → should_store=true for all
+            // targets → no evictions (safe default, no data loss).
+            let my_peer_id_for_cleanup = if let Some(ref swarm) = swarm_handle_arc {
+                swarm.peer_id
+            } else {
+                match device_id_to_peer_id(&device_id) {
+                    Ok(pid) => pid,
+                    Err(e) => {
+                        tracing::warn!(
+                            err = %e,
+                            "T-11: cannot derive PeerId for mailbox self-cleanup; \
+                             using random PeerId (no evictions will fire)"
+                        );
+                        libp2p::PeerId::random()
+                    }
+                }
+            };
+
+            // (a) TTL sweep.
+            let sweep_db = db.clone();
+            let sweep_cancel = cancel.clone();
+            tasks.push(tokio::spawn(async move {
+                run_mailbox_ttl_sweep(sweep_db, sweep_cancel).await;
+                Ok(())
+            }));
+
+            // (b) Membership-based self-cleanup.
+            let cleanup_db = db.clone();
+            let cleanup_cancel = cancel.clone();
+            tasks.push(tokio::spawn(async move {
+                run_mailbox_self_cleanup(cleanup_db, my_peer_id_for_cleanup, cleanup_cancel).await;
+                Ok(())
+            }));
+        }
+
         // ── Metrics pusher (optional) ──────────────────────────────────────
         if let Some(state_m) = state_for_metrics {
             let metrics_cfg = app_config.metrics.clone();

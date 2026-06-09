@@ -2411,8 +2411,14 @@ impl Db {
     }
 
     /// Evict LRU non-high-trust entries for a target until bytes stored <= target_bytes.
-    /// Evicts non-high-trust (class.is_high_trust()==false) entries first ordered by
-    /// stored_at ascending. Falls through to high-trust entries only if still over quota.
+    ///
+    /// Only non-high-trust entries (class.is_high_trust()==false) are candidates for
+    /// eviction, ordered by stored_at ascending (oldest first). High-trust entries
+    /// (SelfPointer) are NEVER selected for eviction here — their only removal path
+    /// is TTL expiry via `mailbox_sweep_expired`. If after dropping all non-high-trust
+    /// entries the target is still over quota, the function returns without evicting
+    /// the remaining high-trust entries. This is intentional: SelfPointers are DR-critical
+    /// and protected from disk-pressure eviction (Bug-D / AC-6).
     ///
     /// Returns the count of entries removed.
     pub fn mailbox_evict_lru_for_target(
@@ -2420,8 +2426,8 @@ impl Db {
         target: &IdentityPub,
         target_bytes: u64,
     ) -> Result<u64, DbError> {
-        // Collect all entries for target, sorted by (is_high_trust ASC, stored_at ASC).
-        let mut entries: Vec<([u8; 49], u64, bool)> = {
+        // Collect only non-high-trust entries for target, sorted by stored_at ASC (LRU).
+        let mut non_ht_entries: Vec<([u8; 49], u64)> = {
             let tx = self.inner.begin_read()?;
             let table = tx.open_table(MAILBOX_ENTRIES)?;
             let mut lo = [0u8; 49];
@@ -2433,16 +2439,16 @@ impl Db {
             for item in table.range::<&[u8; 49]>(&lo..=&hi)? {
                 let (k, v) = item?;
                 let entry: MailboxEntry = from_cbor_bytes(v.value())?;
-                out.push((*k.value(), entry.stored_at, entry.class.is_high_trust()));
+                // High-trust entries are excluded from LRU eviction entirely.
+                if !entry.class.is_high_trust() {
+                    out.push((*k.value(), entry.stored_at));
+                }
             }
             out
         };
 
-        // Sort: low-trust first, then by stored_at (oldest first).
-        entries.sort_by(|a, b| {
-            a.2.cmp(&b.2) // false (non-high-trust) sorts before true (high-trust)
-                .then_with(|| a.1.cmp(&b.1)) // older stored_at first
-        });
+        // Sort: oldest stored_at first (LRU order).
+        non_ht_entries.sort_by_key(|e| e.1);
 
         let current_bytes = self.mailbox_bytes_for_target(target)?;
         if current_bytes <= target_bytes {
@@ -2453,12 +2459,13 @@ impl Db {
         let mut freed = 0u64;
         let mut keys_to_delete = Vec::new();
 
-        // Collect entries to evict by reading sizes from the already-fetched entries.
-        // We only need approximate size here (the CBOR-serialized bytes) — re-read from DB.
+        // Select entries to evict (non-high-trust only) until we've freed enough.
+        // If all non-high-trust entries are exhausted but we're still over quota,
+        // stop — high-trust SelfPointers remain protected.
         {
             let tx = self.inner.begin_read()?;
             let table = tx.open_table(MAILBOX_ENTRIES)?;
-            for (key, _, _) in &entries {
+            for (key, _stored_at) in &non_ht_entries {
                 if freed >= to_free {
                     break;
                 }
@@ -2500,6 +2507,50 @@ impl Db {
         }
         tx.commit()?;
         Ok(removed_count)
+    }
+
+    /// List all unique targets (owner master_pub) that have at least one mailbox entry.
+    ///
+    /// Sourced from MAILBOX_BYTES_BY_TARGET (O(targets), not O(entries)).
+    /// Used by `run_mailbox_self_cleanup` to iterate targets for membership checks.
+    pub fn mailbox_list_all_targets(&self) -> Result<Vec<IdentityPub>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(MAILBOX_BYTES_BY_TARGET)?;
+        let mut targets = Vec::new();
+        for item in table.iter()? {
+            let (k, _) = item?;
+            targets.push(IdentityPub(*k.value()));
+        }
+        Ok(targets)
+    }
+
+    /// List all non-high-trust entries for a target (for membership-check eviction).
+    ///
+    /// Unlike `mailbox_list_for_target`, this does NOT filter by expiry — the cleanup
+    /// task handles all non-high-trust entries regardless of TTL status. High-trust
+    /// entries are excluded by definition (they are membership-check exempt).
+    pub fn mailbox_list_non_high_trust_for_target(
+        &self,
+        target: &IdentityPub,
+    ) -> Result<Vec<MailboxEntry>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(MAILBOX_ENTRIES)?;
+
+        let mut lo = [0u8; 49];
+        let mut hi = [0u8; 49];
+        lo[..32].copy_from_slice(&target.0);
+        hi[..32].copy_from_slice(&target.0);
+        hi[32..].fill(0xFF);
+
+        let mut result = Vec::new();
+        for item in table.range::<&[u8; 49]>(&lo..=&hi)? {
+            let (_, v) = item?;
+            let entry: MailboxEntry = from_cbor_bytes(v.value())?;
+            if !entry.class.is_high_trust() {
+                result.push(entry);
+            }
+        }
+        Ok(result)
     }
 }
 

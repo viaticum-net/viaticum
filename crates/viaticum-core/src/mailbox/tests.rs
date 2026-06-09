@@ -487,3 +487,248 @@ fn mailbox_total_bytes_sums_all_targets() {
     );
     assert!(total > 0);
 }
+
+// ============================================================
+// T-11 test scenarios: Bug-D high-trust TTL-only eviction policy
+// ============================================================
+
+/// AC-6 / T-11: eviction_prefers_non_high_trust_first
+///
+/// Under quota pressure with mixed entries, non-high-trust entries are always
+/// dropped before any high-trust (SelfPointer) entry is considered.
+#[test]
+fn eviction_prefers_non_high_trust_first() {
+    let db = test_db();
+    let engine = MailboxEngine::new(db.clone());
+    let target = make_target(20);
+    let now = 10_000_000u64;
+    let long_ttl = 5 * 365 * 24 * 3600u64;
+
+    // Insert SelfPointer (high-trust) — oldest stored_at (would be LRU if not protected).
+    let sp = make_entry(
+        target,
+        make_msg_id(1),
+        MailboxClass::SelfPointer,
+        vec![0u8; 200],
+        now,
+        long_ttl,
+    );
+    // Insert two DropNotice (non-high-trust) — newer stored_at.
+    let dn1 = make_entry(
+        target,
+        make_msg_id(2),
+        MailboxClass::DropNotice,
+        vec![0u8; 200],
+        now + 1,
+        14 * 24 * 3600,
+    );
+    let dn2 = make_entry(
+        target,
+        make_msg_id(3),
+        MailboxClass::DropNotice,
+        vec![0u8; 200],
+        now + 2,
+        14 * 24 * 3600,
+    );
+
+    engine.store(&sp, now).unwrap();
+    engine.store(&dn1, now + 1).unwrap();
+    engine.store(&dn2, now + 2).unwrap();
+
+    let total_bytes = db.mailbox_bytes_for_target(&target).unwrap();
+
+    // Set quota such that we need to evict all 3 entries but only 2 non-HT exist.
+    // Target = 0 bytes → evict as much as possible (non-HT only).
+    let removed = db.mailbox_evict_lru_for_target(&target, 0).unwrap();
+
+    // Both non-HT entries must be removed.
+    assert_eq!(removed, 2, "must evict exactly 2 non-high-trust entries");
+
+    // SelfPointer must survive.
+    let remaining = db.mailbox_list_for_target(&target, now).unwrap();
+    assert_eq!(remaining.len(), 1, "SelfPointer must survive eviction");
+    assert_eq!(remaining[0].class, MailboxClass::SelfPointer);
+
+    let _ = total_bytes; // used to trigger the insert
+}
+
+/// T-11 core (Bug-D): high_trust_not_evicted_under_pressure_even_when_still_over_quota
+///
+/// When a target's entries are ALL high-trust (or only high-trust remain), the
+/// eviction function must NOT remove them even if still over quota after exhausting
+/// non-high-trust candidates.
+#[test]
+fn high_trust_not_evicted_under_pressure_even_when_still_over_quota() {
+    let db = test_db();
+    let engine = MailboxEngine::new(db.clone());
+    let target = make_target(21);
+    let now = 11_000_000u64;
+    let long_ttl = 5 * 365 * 24 * 3600u64;
+
+    // Insert two SelfPointer entries (different msg_ids, both high-trust).
+    let sp1 = make_entry(
+        target,
+        make_msg_id(10),
+        MailboxClass::SelfPointer,
+        vec![0u8; 500],
+        now,
+        long_ttl,
+    );
+    let sp2 = make_entry(
+        target,
+        make_msg_id(11),
+        MailboxClass::SelfPointer,
+        vec![0u8; 500],
+        now + 1,
+        long_ttl,
+    );
+
+    engine.store(&sp1, now).unwrap();
+    engine.store(&sp2, now + 1).unwrap();
+
+    let total_bytes = db.mailbox_bytes_for_target(&target).unwrap();
+    assert!(total_bytes > 0, "bytes must be tracked");
+
+    // Attempt to evict with target_bytes=0 (maximum pressure).
+    let removed = db.mailbox_evict_lru_for_target(&target, 0).unwrap();
+
+    // Must remove 0 entries — all are high-trust, none eligible.
+    assert_eq!(
+        removed, 0,
+        "high-trust entries must NOT be evicted even under maximum disk pressure"
+    );
+
+    // Both SelfPointers must remain.
+    let remaining = db.mailbox_list_for_target(&target, now).unwrap();
+    assert_eq!(remaining.len(), 2, "both SelfPointers must survive");
+    assert!(
+        remaining
+            .iter()
+            .all(|e| e.class == MailboxClass::SelfPointer)
+    );
+
+    // Byte counter unchanged (both still present).
+    let bytes_after = db.mailbox_bytes_for_target(&target).unwrap();
+    assert_eq!(bytes_after, total_bytes, "byte counter must be unchanged");
+}
+
+/// T-11 / AC-6: self_pointer_evicted_after_ttl_expiry
+///
+/// TTL sweep removes a SelfPointer once expires_at < now_secs.
+/// This is the ONLY eviction path for high-trust entries.
+#[test]
+fn self_pointer_evicted_after_ttl_expiry() {
+    let db = test_db();
+    let engine = MailboxEngine::new(db.clone());
+    let target = make_target(22);
+    let now = 12_000_000u64;
+    // Short TTL for test speed.
+    let short_ttl = 1000u64;
+
+    let sp = make_entry(
+        target,
+        make_msg_id(1),
+        MailboxClass::SelfPointer,
+        b"pointer".to_vec(),
+        now,
+        short_ttl,
+    );
+    engine.store(&sp, now).unwrap();
+
+    // Before TTL: eviction does NOT remove it (LRU path is blocked for HT).
+    let removed_lru = db.mailbox_evict_lru_for_target(&target, 0).unwrap();
+    assert_eq!(removed_lru, 0, "LRU eviction must not remove SelfPointer");
+
+    // Before TTL: sweep does NOT remove it.
+    let removed_sweep = engine.sweep_expired(now + short_ttl - 1).unwrap();
+    assert_eq!(
+        removed_sweep, 0,
+        "sweep before TTL must not remove SelfPointer"
+    );
+
+    // After TTL: sweep removes it.
+    let removed_after = engine.sweep_expired(now + short_ttl + 1).unwrap();
+    assert_eq!(
+        removed_after, 1,
+        "sweep after TTL must remove the SelfPointer"
+    );
+
+    // Entry is gone.
+    let remaining = db
+        .mailbox_list_for_target(&target, now + short_ttl + 1)
+        .unwrap();
+    assert!(
+        remaining.is_empty(),
+        "SelfPointer must be gone after TTL sweep"
+    );
+}
+
+/// T-11: mailbox_list_all_targets returns correct set
+#[test]
+fn mailbox_list_all_targets_returns_targets_with_entries() {
+    let db = test_db();
+    let engine = MailboxEngine::new(db.clone());
+    let now = 13_000_000u64;
+
+    let target_a = make_target(30);
+    let target_b = make_target(31);
+
+    let ea = make_entry(
+        target_a,
+        make_msg_id(1),
+        MailboxClass::PosChallenge,
+        b"a".to_vec(),
+        now,
+        3600,
+    );
+    let eb = make_entry(
+        target_b,
+        make_msg_id(2),
+        MailboxClass::DropNotice,
+        b"b".to_vec(),
+        now,
+        3600,
+    );
+
+    engine.store(&ea, now).unwrap();
+    engine.store(&eb, now).unwrap();
+
+    let targets = db.mailbox_list_all_targets().unwrap();
+    let target_set: std::collections::HashSet<_> = targets.into_iter().collect();
+    assert!(target_set.contains(&target_a), "target_a must be listed");
+    assert!(target_set.contains(&target_b), "target_b must be listed");
+    assert_eq!(target_set.len(), 2, "exactly 2 targets expected");
+}
+
+/// T-11: mailbox_list_non_high_trust_for_target excludes SelfPointer
+#[test]
+fn mailbox_list_non_high_trust_for_target_excludes_self_pointer() {
+    let db = test_db();
+    let engine = MailboxEngine::new(db.clone());
+    let target = make_target(32);
+    let now = 14_000_000u64;
+
+    let sp = make_entry(
+        target,
+        make_msg_id(1),
+        MailboxClass::SelfPointer,
+        b"ptr".to_vec(),
+        now,
+        5 * 365 * 24 * 3600,
+    );
+    let pos = make_entry(
+        target,
+        make_msg_id(2),
+        MailboxClass::PosChallenge,
+        b"challenge".to_vec(),
+        now,
+        7 * 24 * 3600,
+    );
+
+    engine.store(&sp, now).unwrap();
+    engine.store(&pos, now).unwrap();
+
+    let non_ht = db.mailbox_list_non_high_trust_for_target(&target).unwrap();
+    assert_eq!(non_ht.len(), 1, "only non-HT entry expected");
+    assert_eq!(non_ht[0].class, MailboxClass::PosChallenge);
+}
