@@ -1129,12 +1129,21 @@ impl DaemonHandle {
             scheduler.run(pos_response_rx, cancel_scheduler).await
         }));
 
+        // ── T-8: Shared current_pointer handle ───────────────────────────────
+        // Shared between run_mailbox_poll (W-2: restart-recovery) and run_periodic_push
+        // (republish tracking). std::sync::Mutex: critical sections are tiny and must
+        // not be held across .await.
+        let current_pointer: std::sync::Arc<
+            std::sync::Mutex<Option<viaticum_core::system_state::SelfPointer>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+
         // ── T-6/T-7: Mailbox poll task ───────────────────────────────────────
         // Polls this node's mailbox every MAILBOX_POLL_INTERVAL_SECS.
         // Started alongside other periodic tasks (T-9 will add explicit Kademlia stabilize wait).
         //
         // T-6: PosResponder handles PosChallenge entries from mailbox (db/holdings_dir/master_key).
         // T-7: ProcessorDropHandler handles DropNotice batch entries (db only).
+        // T-8: current_pointer shared handle passed in for W-2 dispatch (restart-recovery).
         // No Arc<Processor> wrap needed: both handlers are standalone structs built from clones.
         {
             use crate::daemon::mailbox::poll::run_mailbox_poll;
@@ -1154,6 +1163,7 @@ impl DaemonHandle {
             let poll_router = std::sync::Arc::clone(&mailbox_router);
             let poll_pos_tx = pos_response_tx.clone();
             let poll_identity = identity_pub;
+            let poll_current_pointer = std::sync::Arc::clone(&current_pointer);
             let poll_cancel = cancel.clone();
             tasks.push(tokio::spawn(async move {
                 run_mailbox_poll(
@@ -1163,6 +1173,7 @@ impl DaemonHandle {
                     std::sync::Arc::new(pos_handler),
                     std::sync::Arc::new(drop_handler),
                     poll_identity,
+                    poll_current_pointer,
                     poll_cancel,
                 )
                 .await;
@@ -1179,7 +1190,9 @@ impl DaemonHandle {
             }));
         }
 
-        // ── System state periodic push ──────────────────────────────────────
+        // ── System state periodic push (T-8) ────────────────────────────────
+        // T-8: pointer is published via mailbox instead of push-to-all.
+        // Passes mailbox_router, identity_pub (my_master_pub), and current_pointer handle.
         // Uses SwarmHandle (ε.2+). Only started if swarm is available.
         {
             let ss_db = db.clone();
@@ -1188,6 +1201,9 @@ impl DaemonHandle {
             let ss_master_key = master_key.clone();
             let ss_data_dir = cfg.data_dir.clone();
             let ss_interval = (6 * 3600 / time_scale).max(60);
+            let ss_mailbox_router = std::sync::Arc::clone(&mailbox_router);
+            let ss_my_master_pub = identity_pub;
+            let ss_current_pointer = std::sync::Arc::clone(&current_pointer);
             let cancel_ss = cancel.clone();
             tasks.push(tokio::spawn(async move {
                 if let Some(swarm) = ss_swarm {
@@ -1199,6 +1215,9 @@ impl DaemonHandle {
                         ss_data_dir,
                         ss_interval,
                         cancel_ss,
+                        ss_mailbox_router,
+                        ss_my_master_pub,
+                        ss_current_pointer,
                     )
                     .await
                     {

@@ -79,14 +79,18 @@ async fn poll_pos_response_bad_payload_does_not_panic() {
 /// SelfPointer with target == my_master_pub is NOT stored in the DB (W-2).
 #[tokio::test]
 async fn poll_self_pointer_own_not_stored_in_db() {
+    use std::sync::{Arc, Mutex};
+    use viaticum_core::system_state::SelfPointer;
+
     let db = Db::open_in_memory().expect("db");
     let my_master = make_identity(0xAA);
+    let current_pointer: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
 
     // Build a trivial payload (not a real SelfPointer; verify_self_pointer will fail gracefully).
     let entry = make_entry(MailboxClass::SelfPointer, my_master, vec![0x01]);
     let now_secs = Timestamp::now().0;
 
-    super::dispatch_self_pointer(&db, &my_master, entry, now_secs);
+    super::dispatch_self_pointer(&db, &my_master, &current_pointer, entry, now_secs);
 
     // Mailbox DB should have no entries for my_master.
     let entries = db
@@ -101,14 +105,18 @@ async fn poll_self_pointer_own_not_stored_in_db() {
 /// SelfPointer with target != my_master_pub IS stored in the DB (postman role).
 #[tokio::test]
 async fn poll_foreign_self_pointer_is_stored() {
+    use std::sync::{Arc, Mutex};
+    use viaticum_core::system_state::SelfPointer;
+
     let db = Db::open_in_memory().expect("db");
     let my_master = make_identity(0xAA);
     let foreign_target = make_identity(0xBB);
+    let current_pointer: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
 
     let entry = make_entry(MailboxClass::SelfPointer, foreign_target, vec![0x01, 0x02]);
     let now_secs = Timestamp::now().0;
 
-    super::dispatch_self_pointer(&db, &my_master, entry, now_secs);
+    super::dispatch_self_pointer(&db, &my_master, &current_pointer, entry, now_secs);
 
     // Mailbox DB should have the entry stored for foreign_target.
     let entries = db

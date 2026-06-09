@@ -13,7 +13,7 @@
 //   DropNotice     → DropNoticeHandler::handle_drop_notice (T-7: decode batch, apply each notice)
 //   Generic/other  → ignore
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use tokio::sync::mpsc;
@@ -44,7 +44,10 @@ use super::routing::MailboxRouter;
 ///   PosChallenge and return an optional PosHashResponseMsg + owner_master for publishing
 /// - `drop_handler`: called for each DropNotice decoded from a SymbolDropNoticeBatchMsg entry
 /// - `my_master_pub`: this node's master identity (used to detect own SelfPointers)
+/// - `current_pointer`: shared handle with run_periodic_push. On receiving our own verified
+///   SelfPointer, update this handle (W-2: restart-recovery — re-learn latest published pointer).
 /// - `cancel`: cancellation token
+#[allow(clippy::too_many_arguments)]
 pub async fn run_mailbox_poll(
     db: Db,
     router: Arc<MailboxRouter>,
@@ -52,6 +55,7 @@ pub async fn run_mailbox_poll(
     challenge_handler: Arc<dyn PosMailboxChallengeHandler>,
     drop_handler: Arc<dyn DropNoticeHandler>,
     my_master_pub: IdentityPub,
+    current_pointer: Arc<Mutex<Option<SelfPointer>>>,
     cancel: CancellationToken,
 ) {
     // Poll immediately on startup (first tick = no delay).
@@ -95,6 +99,7 @@ pub async fn run_mailbox_poll(
                         &challenge_handler,
                         &drop_handler,
                         &my_master_pub,
+                        &current_pointer,
                         entry,
                         now_secs,
                     )
@@ -114,6 +119,7 @@ pub(crate) async fn dispatch_entry(
     challenge_handler: &Arc<dyn PosMailboxChallengeHandler>,
     drop_handler: &Arc<dyn DropNoticeHandler>,
     my_master_pub: &IdentityPub,
+    current_pointer: &Arc<Mutex<Option<SelfPointer>>>,
     entry: MailboxEntry,
     now_secs: u64,
 ) {
@@ -125,7 +131,7 @@ pub(crate) async fn dispatch_entry(
             dispatch_pos_response(pos_response_tx, entry);
         }
         MailboxClass::SelfPointer => {
-            dispatch_self_pointer(db, my_master_pub, entry, now_secs);
+            dispatch_self_pointer(db, my_master_pub, current_pointer, entry, now_secs);
         }
         MailboxClass::DropNotice => {
             dispatch_drop_notice(drop_handler, entry);
@@ -266,11 +272,19 @@ pub(crate) fn dispatch_pos_response(
 
 /// Handle a SelfPointer entry.
 ///
-/// W-2: if entry.target == my_master_pub, verify and update in-memory; do NOT store in mailbox DB.
+/// W-2: if entry.target == my_master_pub, verify and update in-memory current_pointer;
+/// do NOT store in mailbox DB.
 /// If entry.target != my_master_pub, we are the postman — store in mailbox DB.
+///
+/// T-8: The `current_pointer` handle is shared with `run_periodic_push`. When the node
+/// re-learns its own pointer from the candidate-set (restart-recovery), we update the
+/// handle so that the periodic push loop doesn't re-publish unchanged state. Only update
+/// if the incoming generation is strictly greater than what we have, preventing regression
+/// to an older pointer.
 pub(crate) fn dispatch_self_pointer(
     db: &Db,
     my_master_pub: &IdentityPub,
+    current_pointer: &Arc<Mutex<Option<SelfPointer>>>,
     entry: MailboxEntry,
     now_secs: u64,
 ) {
@@ -279,13 +293,29 @@ pub(crate) fn dispatch_self_pointer(
         match from_cbor_bytes::<SelfPointer>(&entry.payload) {
             Ok(pointer) => {
                 if verify_self_pointer(&pointer, my_master_pub).is_ok() {
-                    debug!(
-                        generation = pointer.generation,
-                        created_at = pointer.created_at.0,
-                        "mailbox_poll: own SelfPointer verified (W-2: not stored in DB)"
-                    );
-                    // NOTE(T-8): update in-memory current_pointer for periodic push.
-                    // T-8 wires this into run_periodic_push; for T-6 the hook is here (log only).
+                    // T-8: update in-memory current_pointer for restart-recovery.
+                    // Only store if None OR incoming.generation > current.generation.
+                    let mut guard = current_pointer.lock().expect("current_pointer lock");
+                    let should_update = match guard.as_ref() {
+                        None => true,
+                        Some(existing) => pointer.generation > existing.generation,
+                    };
+                    if should_update {
+                        let prev_gen = guard.as_ref().map(|p| p.generation);
+                        debug!(
+                            generation = pointer.generation,
+                            prev_generation = ?prev_gen,
+                            created_at = pointer.created_at.0,
+                            "mailbox_poll: own SelfPointer updated in-memory (W-2: not stored in DB)"
+                        );
+                        *guard = Some(pointer);
+                    } else {
+                        debug!(
+                            generation = pointer.generation,
+                            created_at = pointer.created_at.0,
+                            "mailbox_poll: own SelfPointer received but generation not newer — not updating (W-2)"
+                        );
+                    }
                 } else {
                     warn!(msg_id = ?entry.msg_id, "mailbox_poll: own SelfPointer signature verification failed");
                 }
