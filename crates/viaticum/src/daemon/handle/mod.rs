@@ -1129,24 +1129,26 @@ impl DaemonHandle {
             scheduler.run(pos_response_rx, cancel_scheduler).await
         }));
 
-        // ── T-6: Mailbox poll task ────────────────────────────────────────────
+        // ── T-6/T-7: Mailbox poll task ───────────────────────────────────────
         // Polls this node's mailbox every MAILBOX_POLL_INTERVAL_SECS.
         // Started alongside other periodic tasks (T-9 will add explicit Kademlia stabilize wait).
         //
-        // The poll loop responds to mailbox PoS challenges via PosResponder — a small struct
-        // that owns only the three Processor fields needed (db, holdings_dir, master_signing_key).
-        // No Arc<Processor> wrap is needed: PosResponder is constructed here from clones of the
-        // same locals that are passed into Processor, before Processor is moved into its task.
-        // Nack-over-mailbox delivery is the only remaining A2 follow-up (needs a new MailboxClass).
+        // T-6: PosResponder handles PosChallenge entries from mailbox (db/holdings_dir/master_key).
+        // T-7: ProcessorDropHandler handles DropNotice batch entries (db only).
+        // No Arc<Processor> wrap needed: both handlers are standalone structs built from clones.
         {
             use crate::daemon::mailbox::poll::run_mailbox_poll;
-            use crate::daemon::processor::{PosResponder, ProcessorPosHandler};
+            use crate::daemon::processor::{
+                PosResponder, ProcessorDropHandler, ProcessorPosHandler,
+            };
 
             let pos_handler = ProcessorPosHandler::new(PosResponder::new(
                 db.clone(),
                 holdings_dir.clone(),
                 master_key.clone(),
             ));
+
+            let drop_handler = ProcessorDropHandler::new(db.clone());
 
             let poll_db = db.clone();
             let poll_router = std::sync::Arc::clone(&mailbox_router);
@@ -1159,6 +1161,7 @@ impl DaemonHandle {
                     poll_router,
                     poll_pos_tx,
                     std::sync::Arc::new(pos_handler),
+                    std::sync::Arc::new(drop_handler),
                     poll_identity,
                     poll_cancel,
                 )
@@ -1213,6 +1216,7 @@ impl DaemonHandle {
             let cleanup_db = db.clone();
             let cleanup_holdings = holdings_dir.clone();
             let cleanup_relay = relay_post_tx.clone();
+            let cleanup_router = std::sync::Arc::clone(&mailbox_router);
             let cleanup_cancel = cancel.clone();
             let cleanup_data_dir = cfg.data_dir.clone();
             let cleanup_master_key = master_key.clone();
@@ -1223,6 +1227,7 @@ impl DaemonHandle {
                     cleanup_db,
                     cleanup_holdings,
                     cleanup_relay,
+                    cleanup_router,
                     soft_quota_bytes,
                     hard_quota_bytes,
                     cleanup_data_dir,

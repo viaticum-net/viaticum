@@ -1,4 +1,4 @@
-// T-6: Mailbox poll loop — periodic mailbox polling and entry dispatch.
+// T-6/T-7: Mailbox poll loop — periodic mailbox polling and entry dispatch.
 //
 // Polls this node's mailbox from read-fanout candidates every MAILBOX_POLL_INTERVAL_SECS.
 // Also polls immediately on startup (per spec §2.17: "poll on startup after Kademlia stabilize";
@@ -10,7 +10,7 @@
 //   PosResponse    → pos_response_tx.try_send (scheduler resolves pending challenge)
 //   SelfPointer    → if entry.target == my_master_pub: verify + update in-memory (W-2, no DB store)
 //                    if entry.target != my_master_pub:  store in mailbox DB (we are postman)
-//   DropNotice     → handle_symbol_drop_notice_from_mailbox stub (completed in T-7)
+//   DropNotice     → DropNoticeHandler::handle_drop_notice (T-7: decode batch, apply each notice)
 //   Generic/other  → ignore
 
 use std::sync::Arc;
@@ -22,7 +22,9 @@ use tracing::{debug, error, info, warn};
 use viaticum_core::constants::MAILBOX_POLL_INTERVAL_SECS;
 use viaticum_core::db::Db;
 use viaticum_core::mailbox::{MailboxClass, MailboxEngine, MailboxEntry};
-use viaticum_core::messages::{PosHashResponseMsg, to_cbor};
+use viaticum_core::messages::{
+    PosHashResponseMsg, SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, to_cbor,
+};
 use viaticum_core::system_state::{SelfPointer, verify_self_pointer};
 use viaticum_core::types::IdentityPub;
 use viaticum_core::types::from_cbor_bytes;
@@ -35,11 +37,12 @@ use super::routing::MailboxRouter;
 /// Dispatches entries to the appropriate handlers.
 ///
 /// Parameters:
-/// - `db`: redb handle for mailbox DB operations (SelfPointer store, DropNotice stub)
+/// - `db`: redb handle for mailbox DB operations (SelfPointer store)
 /// - `router`: the MailboxRouter used to poll and publish responses
 /// - `pos_response_tx`: bounded channel (capacity 256) to scheduler for PosResponse entries
 /// - `challenge_handler`: called with (owner_master, challenge_payload_bytes) to process a
 ///   PosChallenge and return an optional PosHashResponseMsg + owner_master for publishing
+/// - `drop_handler`: called for each DropNotice decoded from a SymbolDropNoticeBatchMsg entry
 /// - `my_master_pub`: this node's master identity (used to detect own SelfPointers)
 /// - `cancel`: cancellation token
 pub async fn run_mailbox_poll(
@@ -47,6 +50,7 @@ pub async fn run_mailbox_poll(
     router: Arc<MailboxRouter>,
     pos_response_tx: mpsc::Sender<PosHashResponseMsg>,
     challenge_handler: Arc<dyn PosMailboxChallengeHandler>,
+    drop_handler: Arc<dyn DropNoticeHandler>,
     my_master_pub: IdentityPub,
     cancel: CancellationToken,
 ) {
@@ -89,6 +93,7 @@ pub async fn run_mailbox_poll(
                         &router,
                         &pos_response_tx,
                         &challenge_handler,
+                        &drop_handler,
                         &my_master_pub,
                         entry,
                         now_secs,
@@ -101,11 +106,13 @@ pub async fn run_mailbox_poll(
 }
 
 /// Dispatch a single polled MailboxEntry to the appropriate handler.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_entry(
     db: &Db,
     router: &Arc<MailboxRouter>,
     pos_response_tx: &mpsc::Sender<PosHashResponseMsg>,
     challenge_handler: &Arc<dyn PosMailboxChallengeHandler>,
+    drop_handler: &Arc<dyn DropNoticeHandler>,
     my_master_pub: &IdentityPub,
     entry: MailboxEntry,
     now_secs: u64,
@@ -121,7 +128,7 @@ pub(crate) async fn dispatch_entry(
             dispatch_self_pointer(db, my_master_pub, entry, now_secs);
         }
         MailboxClass::DropNotice => {
-            dispatch_drop_notice(entry);
+            dispatch_drop_notice(drop_handler, entry);
         }
         MailboxClass::Generic => {
             debug!(msg_id = ?entry.msg_id, "mailbox_poll: ignoring Generic entry");
@@ -314,18 +321,60 @@ pub(crate) fn dispatch_self_pointer(
     }
 }
 
-/// Handle a DropNotice entry.
+/// Handle a DropNotice entry (T-7).
 ///
-/// T-7 stub: DropNotice publishing (holder → owner) is implemented in T-7.
-/// T-6 only adds the receive-side dispatch arm here.
-fn dispatch_drop_notice(entry: MailboxEntry) {
-    // TODO(T-7): route to handle_symbol_drop_notice_from_mailbox when T-7 is implemented.
-    // T-7 completes the owner-side receive path (mark placement Lost, trigger repair).
-    debug!(
-        msg_id = ?entry.msg_id,
-        target = %entry.target,
-        "mailbox_poll: DropNotice received — T-7 stub (implement in T-7)"
-    );
+/// Decodes the entry payload as `SymbolDropNoticeBatchMsg` (a batch of one or more
+/// single-block drop notices for the same owner). For each notice in the batch,
+/// calls `drop_handler.handle_drop_notice(sender, notice)`.
+///
+/// Requires `entry.sender` to identify the holder. Warns and returns if absent.
+pub(crate) fn dispatch_drop_notice(drop_handler: &Arc<dyn DropNoticeHandler>, entry: MailboxEntry) {
+    let sender = match entry.sender {
+        Some(s) => s,
+        None => {
+            warn!(
+                msg_id = ?entry.msg_id,
+                target = %entry.target,
+                "mailbox_poll: DropNotice has no sender — cannot identify holder, dropping"
+            );
+            return;
+        }
+    };
+
+    match from_cbor_bytes::<SymbolDropNoticeBatchMsg>(&entry.payload) {
+        Ok(batch) => {
+            debug!(
+                msg_id = ?entry.msg_id,
+                target = %entry.target,
+                notice_count = batch.notices.len(),
+                "mailbox_poll: dispatching DropNotice batch"
+            );
+            for notice in batch.notices {
+                drop_handler.handle_drop_notice(sender, notice);
+            }
+        }
+        Err(e) => {
+            warn!(
+                msg_id = ?entry.msg_id,
+                target = %entry.target,
+                err = %e,
+                "mailbox_poll: failed to decode SymbolDropNoticeBatchMsg — dropping entry"
+            );
+        }
+    }
+}
+
+// ─── DropNoticeHandler trait ──────────────────────────────────────────────────
+
+/// Abstraction for handling a DropNotice batch from the mailbox (T-7).
+///
+/// Called once per individual `SymbolDropNoticeMsg` decoded from a
+/// `SymbolDropNoticeBatchMsg` mailbox entry. Each call processes one block's notice.
+///
+/// Production impl: `ProcessorDropHandler` wraps `SymbolDropHandler::apply`.
+/// Exists as a trait seam for testing without a full Processor.
+pub trait DropNoticeHandler: Send + Sync {
+    fn handle_drop_notice(&self, from: IdentityPub, notice: SymbolDropNoticeMsg);
 }
 
 // ─── PosMailboxChallengeHandler trait ────────────────────────────────────────

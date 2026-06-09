@@ -2,6 +2,7 @@
 
 use tracing::{debug, error, info, warn};
 use viaticum_core::constants::{MESSAGE_FRESHNESS_SECS, SYMBOL_OFFER_EXPIRY_SECS, SYMBOL_SIZE};
+use viaticum_core::db::Db;
 use viaticum_core::messages::{
     CancelDeleteMsg, DeleteMsg, RejectReason, SymbolAcceptMsg, SymbolDropNoticeMsg,
     SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg, SymbolTransferMsg, verify_symbol_offer,
@@ -13,6 +14,235 @@ use viaticum_core::types::{
 use crate::daemon::repair::RepairTrigger;
 
 use super::{AcceptedOffer, Processor, ProcessorError, esi_list_to_ranges, ranges_to_esi_list};
+
+// ─── SymbolDropHandler: standalone owner-side DropNotice handler ──────────────
+
+/// Standalone handler for `SymbolDropNoticeMsg` entries received from the mailbox or relay.
+///
+/// Extracted from `Processor::handle_symbol_drop_notice` so the mailbox poll loop
+/// can call it without holding an `Arc<Processor>` (mirrors `PosResponder` from T-6).
+///
+/// Only requires `db` — confirmed: the original method uses `self.db` only.
+pub struct SymbolDropHandler {
+    db: Db,
+}
+
+impl SymbolDropHandler {
+    pub fn new(db: Db) -> Self {
+        SymbolDropHandler { db }
+    }
+
+    /// Apply a single DropNotice: mark placement Lost, recompute block cached fields.
+    ///
+    /// Semantics are identical to `Processor::handle_symbol_drop_notice`.
+    /// Idempotent: if placement is already Lost/Deleting, returns without error.
+    /// On unknown holder or block, logs WARN and returns (not a panic path).
+    pub fn apply(&self, from: IdentityPub, notice: SymbolDropNoticeMsg) {
+        let block_id = notice.source_block_id;
+        info!(
+            block_id = %block_id,
+            holder = %from,
+            deadline = notice.deadline.0,
+            "processor: received SymbolDropNotice — transitioning placement to Lost"
+        );
+
+        let devices = self.db.get_devices_for_master(&from).unwrap_or_default();
+        if devices.is_empty() {
+            warn!(
+                block_id = %block_id,
+                holder = %from,
+                "processor: DropNotice from unknown master — no devices in DB, ignoring"
+            );
+            return;
+        }
+
+        let holder_device_id = devices.iter().find(|did| {
+            self.db
+                .get_placement(&block_id, did)
+                .ok()
+                .flatten()
+                .is_some()
+        });
+
+        let holder_device_id = match holder_device_id {
+            Some(id) => *id,
+            None => {
+                warn!(
+                    block_id = %block_id,
+                    holder = %from,
+                    "processor: DropNotice — no placement found for any device of this master, ignoring"
+                );
+                return;
+            }
+        };
+
+        let changed = match super::mark_placement_lost(&self.db, &block_id, &holder_device_id) {
+            Ok(c) => c,
+            Err(e) => {
+                error!(
+                    block_id = %block_id,
+                    holder = %holder_device_id,
+                    err = %e,
+                    "processor: DropNotice — mark_placement_lost failed"
+                );
+                return;
+            }
+        };
+
+        if !changed {
+            debug!(
+                block_id = %block_id,
+                holder = %holder_device_id,
+                "processor: DropNotice — placement already Lost/Deleting, skipping block update"
+            );
+            return;
+        }
+
+        let block = match self.db.get_source_block(&block_id) {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                warn!(
+                    block_id = %block_id,
+                    "processor: DropNotice — source block not found after placement update"
+                );
+                return;
+            }
+            Err(e) => {
+                error!(
+                    block_id = %block_id,
+                    err = %e,
+                    "processor: DropNotice — get_source_block failed"
+                );
+                return;
+            }
+        };
+
+        let placements = match self.db.list_placements_for_block(&block_id) {
+            Ok(p) => p,
+            Err(e) => {
+                error!(
+                    block_id = %block_id,
+                    err = %e,
+                    "processor: DropNotice — list_placements_for_block failed"
+                );
+                return;
+            }
+        };
+
+        let new_current_alive: u32 = placements
+            .iter()
+            .filter(|p| {
+                p.status == viaticum_core::types::PlacementStatus::Alive
+                    || p.status == viaticum_core::types::PlacementStatus::Uncertain
+            })
+            .count() as u32;
+
+        let k_eff = block.erasure_params().k_eff;
+        let holder_inputs: Vec<viaticum_core::reliability::HolderReliabilityInput> = placements
+            .iter()
+            .filter(|p| {
+                p.status == viaticum_core::types::PlacementStatus::Alive
+                    || p.status == viaticum_core::types::PlacementStatus::Uncertain
+            })
+            .map(|p| {
+                let survival_prob = self
+                    .db
+                    .get_peer(&p.holder_id)
+                    .ok()
+                    .flatten()
+                    .map(|peer| {
+                        viaticum_core::reliability::commitment_to_survival_prob(
+                            viaticum_core::commitment::CommitmentScore::new(peer.trust_p),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        viaticum_core::reliability::commitment_to_survival_prob(
+                            viaticum_core::commitment::CommitmentScore::new(0.5),
+                        )
+                    });
+                viaticum_core::reliability::HolderReliabilityInput {
+                    holder_id: p.holder_id,
+                    alive_symbols: p.symbol_count(),
+                    survival_prob,
+                }
+            })
+            .collect();
+
+        let reliability_input = viaticum_core::reliability::BlockReliabilityInput {
+            block_id,
+            k_eff,
+            holders: holder_inputs,
+        };
+
+        let new_reliability =
+            match viaticum_core::reliability::block_reliability(&reliability_input) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        block_id = %block_id,
+                        err = %e,
+                        "processor: DropNotice — block_reliability failed, using 0.0"
+                    );
+                    0.0
+                }
+            };
+
+        if let Err(e) = self.db.update_block_cached_fields(
+            &block_id,
+            block.importance,
+            new_current_alive,
+            new_reliability,
+            block.target_reliability,
+        ) {
+            error!(
+                block_id = %block_id,
+                err = %e,
+                "processor: DropNotice — update_block_cached_fields failed"
+            );
+            return;
+        }
+
+        info!(
+            block_id = %block_id,
+            holder = %holder_device_id,
+            new_current_alive,
+            new_reliability,
+            "processor: DropNotice — block cached fields updated, repair will be scheduled"
+        );
+
+        if let Err(e) = self.db.refresh_peer_storage_bytes(&holder_device_id) {
+            error!(
+                device = %holder_device_id,
+                err = %e,
+                "processor: DropNotice — failed to refresh storage balance"
+            );
+        }
+    }
+}
+
+// ─── ProcessorDropHandler: bridges poll loop → SymbolDropHandler ──────────────
+
+/// Production impl of `DropNoticeHandler` that delegates to `SymbolDropHandler`.
+///
+/// Constructed from the same `db` clone passed into `Processor` —
+/// no `Arc<Processor>` wrap is needed (mirrors `ProcessorPosHandler` / `PosResponder`).
+pub struct ProcessorDropHandler {
+    inner: SymbolDropHandler,
+}
+
+impl ProcessorDropHandler {
+    pub fn new(db: viaticum_core::db::Db) -> Self {
+        ProcessorDropHandler {
+            inner: SymbolDropHandler::new(db),
+        }
+    }
+}
+
+impl crate::daemon::mailbox::poll::DropNoticeHandler for ProcessorDropHandler {
+    fn handle_drop_notice(&self, from: IdentityPub, notice: SymbolDropNoticeMsg) {
+        self.inner.apply(from, notice);
+    }
+}
 
 impl Processor {
     /// Store received symbols on disk and record a HoldingRecord in the DB.
@@ -515,15 +745,8 @@ impl Processor {
 
     /// Handle advance eviction notice from a holder.
     ///
-    /// Transitions the placement to Lost (if not already), recomputes
-    /// `current_alive` and `current_reliability` for the block, and writes
-    /// the updated cached fields via `update_block_cached_fields`.
-    ///
-    /// Idempotent: if the placement is already Lost or Deleting,
-    /// `mark_placement_lost` returns false and the block update is skipped.
-    ///
-    /// On unknown block or unknown holder, logs WARN and returns without
-    /// panicking — the authoritative repair path is the later SymbolDropped.
+    /// Delegates to `SymbolDropHandler::apply` — extracted so the mailbox poll
+    /// loop (T-7) can call the same logic without an `Arc<Processor>`.
     ///
     /// Unlike `handle_symbol_dropped`, this handler does NOT send a
     /// `RepairTrigger::RepairNow`. The block re-enters the worker queue
@@ -531,207 +754,7 @@ impl Processor {
     /// below `target_reliability`. Repair latency is bounded by the worker
     /// poll interval — acceptable for cold backup (time constant = 1 week).
     pub(crate) fn handle_symbol_drop_notice(&self, from: IdentityPub, notice: SymbolDropNoticeMsg) {
-        let block_id = notice.source_block_id;
-        info!(
-            block_id = %block_id,
-            holder = %from,
-            deadline = notice.deadline.0,
-            "processor: received SymbolDropNotice — transitioning placement to Lost"
-        );
-
-        // Step 1: Resolve master identity → DeviceId(s). The DropNotice arrives
-        // with the holder's master IdentityPub (board session layer, no per-message
-        // sig). Iterate all known devices for this master; use the first one that
-        // has a placement for this block.
-        let devices = self.db.get_devices_for_master(&from).unwrap_or_default();
-        if devices.is_empty() {
-            warn!(
-                block_id = %block_id,
-                holder = %from,
-                "processor: DropNotice from unknown master — no devices in DB, ignoring"
-            );
-            return;
-        }
-
-        let holder_device_id = devices.iter().find(|did| {
-            self.db
-                .get_placement(&block_id, did)
-                .ok()
-                .flatten()
-                .is_some()
-        });
-
-        let holder_device_id = match holder_device_id {
-            Some(id) => *id,
-            None => {
-                warn!(
-                    block_id = %block_id,
-                    holder = %from,
-                    "processor: DropNotice — no placement found for any device of this master, ignoring"
-                );
-                return;
-            }
-        };
-
-        // Step 2: Mark placement Lost (idempotent — returns false if already Lost/Deleting).
-        let changed = match super::mark_placement_lost(&self.db, &block_id, &holder_device_id) {
-            Ok(c) => c,
-            Err(e) => {
-                error!(
-                    block_id = %block_id,
-                    holder = %holder_device_id,
-                    err = %e,
-                    "processor: DropNotice — mark_placement_lost failed"
-                );
-                return;
-            }
-        };
-
-        if !changed {
-            // Placement was already Lost or Deleting — idempotent no-op.
-            debug!(
-                block_id = %block_id,
-                holder = %holder_device_id,
-                "processor: DropNotice — placement already Lost/Deleting, skipping block update"
-            );
-            return;
-        }
-
-        // Step 3: Look up the block. If absent (pre-Wave-8 or already deleted), log
-        // a warning and return — the placement update already happened.
-        let block = match self.db.get_source_block(&block_id) {
-            Ok(Some(b)) => b,
-            Ok(None) => {
-                warn!(
-                    block_id = %block_id,
-                    "processor: DropNotice — source block not found after placement update"
-                );
-                return;
-            }
-            Err(e) => {
-                error!(
-                    block_id = %block_id,
-                    err = %e,
-                    "processor: DropNotice — get_source_block failed"
-                );
-                return;
-            }
-        };
-
-        // Step 4: Recompute current_alive by counting Alive/Uncertain placements.
-        // We recount from scratch (Rule 3) rather than decrementing the cached
-        // counter — this handles legacy blocks where current_alive == 0 (sentinel)
-        // and is resilient to any prior inconsistency (I6).
-        let placements = match self.db.list_placements_for_block(&block_id) {
-            Ok(p) => p,
-            Err(e) => {
-                error!(
-                    block_id = %block_id,
-                    err = %e,
-                    "processor: DropNotice — list_placements_for_block failed"
-                );
-                return;
-            }
-        };
-
-        let new_current_alive: u32 = placements
-            .iter()
-            .filter(|p| {
-                p.status == viaticum_core::types::PlacementStatus::Alive
-                    || p.status == viaticum_core::types::PlacementStatus::Uncertain
-            })
-            .count() as u32;
-
-        // Step 5: Recompute current_reliability using per-holder survival probs.
-        // Assemble HolderReliabilityInput for each Alive/Uncertain placement.
-        // Survival probability is a simplified proxy from peer.trust_p only;
-        // the migration module uses a richer commitment (PoS history, etc.).
-        // Match unknown-peer fallback (0.5 neutral prior).
-        let k_eff = block.erasure_params().k_eff;
-        let holder_inputs: Vec<viaticum_core::reliability::HolderReliabilityInput> = placements
-            .iter()
-            .filter(|p| {
-                p.status == viaticum_core::types::PlacementStatus::Alive
-                    || p.status == viaticum_core::types::PlacementStatus::Uncertain
-            })
-            .map(|p| {
-                let survival_prob = self
-                    .db
-                    .get_peer(&p.holder_id)
-                    .ok()
-                    .flatten()
-                    .map(|peer| {
-                        viaticum_core::reliability::commitment_to_survival_prob(
-                            viaticum_core::commitment::CommitmentScore::new(peer.trust_p),
-                        )
-                    })
-                    // Neutral prior for unknown peers: 0.5 commitment through the same
-                    // mapping (≈0.225 under the physical ceiling), not a bare 0.5.
-                    .unwrap_or_else(|| {
-                        viaticum_core::reliability::commitment_to_survival_prob(
-                            viaticum_core::commitment::CommitmentScore::new(0.5),
-                        )
-                    });
-                viaticum_core::reliability::HolderReliabilityInput {
-                    holder_id: p.holder_id,
-                    alive_symbols: p.symbol_count(),
-                    survival_prob,
-                }
-            })
-            .collect();
-
-        let reliability_input = viaticum_core::reliability::BlockReliabilityInput {
-            block_id,
-            k_eff,
-            holders: holder_inputs,
-        };
-
-        let new_reliability =
-            match viaticum_core::reliability::block_reliability(&reliability_input) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(
-                        block_id = %block_id,
-                        err = %e,
-                        "processor: DropNotice — block_reliability failed, using 0.0"
-                    );
-                    0.0
-                }
-            };
-
-        // Step 6: Write updated cached reliability fields back to DB.
-        // Worker cooldown is RAM-only (B-4); not part of the persisted record.
-        if let Err(e) = self.db.update_block_cached_fields(
-            &block_id,
-            block.importance,
-            new_current_alive,
-            new_reliability,
-            block.target_reliability,
-        ) {
-            error!(
-                block_id = %block_id,
-                err = %e,
-                "processor: DropNotice — update_block_cached_fields failed"
-            );
-            return;
-        }
-
-        info!(
-            block_id = %block_id,
-            holder = %holder_device_id,
-            new_current_alive,
-            new_reliability,
-            "processor: DropNotice — block cached fields updated, repair will be scheduled"
-        );
-
-        // Step 7: Refresh storage bytes for the holder (consistent with handle_symbol_dropped).
-        if let Err(e) = self.db.refresh_peer_storage_bytes(&holder_device_id) {
-            error!(
-                device = %holder_device_id,
-                err = %e,
-                "processor: DropNotice — failed to refresh storage balance"
-            );
-        }
+        SymbolDropHandler::new(self.db.clone()).apply(from, notice);
     }
 
     /// Handle a Delete request from the owner. Verify signature, then mark

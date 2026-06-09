@@ -228,6 +228,18 @@ pub struct SymbolDropNoticeMsg {
     pub timestamp: Timestamp,
 }
 
+/// Holder → Owner. Batched advance drop notices for one owner.
+///
+/// Multiple `SymbolDropNoticeMsg` entries for the same owner are grouped into a single
+/// mailbox entry to prevent fan-out storms during mass eviction.
+/// Max payload size: `class_config::MAX_ENTRY_BYTES` (256 KB) per batch.
+/// If an owner has more notices than fit in one entry, multiple entries are sent.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolDropNoticeBatchMsg {
+    pub v: u8,
+    pub notices: Vec<SymbolDropNoticeMsg>,
+}
+
 /// Owner → Holder. Request symbols for restore.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RestoreRequestMsg {

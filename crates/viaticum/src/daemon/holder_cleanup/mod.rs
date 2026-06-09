@@ -3,17 +3,24 @@
 // Responsibilities:
 //   - Scan for holdings where MarkedForDelete cooldown has expired → delete files + DB record → post SymbolDropped.
 //   - Evaluate disk pressure periodically → evict lowest-priority holdings → post SymbolDropped.
+//   - T-7: send DropNotice (advance notice) via mailbox instead of relay, batched per owner.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use viaticum_core::budget::{DiskPressure, evaluate_pressure};
+use viaticum_core::cluster::master_identity;
 use viaticum_core::constants::{KI, KP, S_CLAMP_MAX, S_CLAMP_MIN};
 use viaticum_core::db::Db;
-use viaticum_core::types::{IdentityPub, Timestamp, hex_encode}; // IdentityPub for HoldingRecord.owner_id
+use viaticum_core::mailbox::{MailboxClass, MailboxEntry, class_config};
+use viaticum_core::messages::{SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, to_cbor};
+use viaticum_core::types::{IdentityPub, Timestamp, hex_encode};
 
+use crate::daemon::mailbox::routing::MailboxRouter;
 use crate::daemon::relay::RelayPost;
 
 #[cfg(test)]
@@ -27,11 +34,16 @@ mod tests;
 ///    post SymbolDropped to the board (directed to the owner).
 /// 2. **Pressure tick** (every `pressure_interval_secs`): evaluate disk pressure.
 ///    On hard pressure, evict lowest-priority holdings and post SymbolDropped.
+///
+/// T-7: advance DropNotice (before physical delete) is routed through the mailbox bus,
+/// batched per owner (one `SymbolDropNoticeBatchMsg` entry per owner per chunk ≤ MAX_ENTRY_BYTES).
+/// The `SymbolDropped` (immediate eviction) path remains on relay (scope fence: T-13 retires relay).
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     db: Db,
     holdings_dir: PathBuf,
     relay_post_tx: mpsc::Sender<RelayPost>,
+    mailbox_router: Arc<MailboxRouter>,
     soft_quota_bytes: u64,
     hard_quota_bytes: u64,
     data_dir: PathBuf,
@@ -57,6 +69,9 @@ pub async fn run(
 
     info!("holder_cleanup: started");
 
+    // Derive holder's own master IdentityPub for use as `sender` in mailbox entries.
+    let holder_master_pub = master_identity(&master_signing_key);
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -70,7 +85,7 @@ pub async fn run(
             }
             _ = pressure_timer.tick() => {
                 if let Err(e) = check_pressure(
-                    &db, &holdings_dir, &relay_post_tx,
+                    &db, &holdings_dir, &relay_post_tx, &mailbox_router, holder_master_pub,
                     soft_quota_bytes, hard_quota_bytes,
                     &data_dir, disk_reserve_bytes,
                     &master_signing_key,
@@ -250,11 +265,16 @@ async fn cleanup_drop_notices(
 }
 
 /// Evaluate disk pressure and evict if necessary.
+///
+/// T-7: advance DropNotice entries are routed through the mailbox bus (batched per owner).
+/// The `SymbolDropped` (immediate eviction) path remains on relay (T-13 retires relay).
 #[allow(clippy::too_many_arguments)]
 async fn check_pressure(
     db: &Db,
     holdings_dir: &Path,
     relay_post_tx: &mpsc::Sender<RelayPost>,
+    mailbox_router: &Arc<MailboxRouter>,
+    holder_master_pub: IdentityPub,
     soft_quota_bytes: u64,
     hard_quota_bytes: u64,
     data_dir: &Path,
@@ -356,44 +376,20 @@ async fn check_pressure(
                 .await;
             }
 
-            // Post SymbolDropNotice for buffered drop notices and record sent_at.
-            for notice in &result.drop_notices {
-                let mut holding = match db.get_holding(&notice.source_block_id, &notice.owner_id) {
-                    Ok(Some(h)) => h,
-                    _ => continue,
-                };
-                let notice_msg = viaticum_core::messages::SymbolDropNoticeMsg {
-                    v: 1,
-                    source_block_id: notice.source_block_id,
-                    esi_ranges: holding.esi_ranges.clone(),
-                    deadline: Timestamp(notice.deadline_secs),
-                    timestamp: now,
-                };
-                if let Ok(payload) = viaticum_core::messages::to_cbor(&notice_msg) {
-                    let mut msg_id = [0u8; 16];
-                    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
-                    let _ = relay_post_tx
-                        .send(RelayPost {
-                            msg_type: "symbol_drop_notice".to_string(),
-                            target: Some(notice.owner_id),
-                            payload,
-                            msg_id,
-                        })
-                        .await;
-                }
-                // Record when the notice was sent so cleanup_drop_notices can evict later.
-                if holding.drop_notice_sent_at.is_none() {
-                    holding.drop_notice_sent_at = Some(now);
-                    if let Err(e) = db.upsert_holding(&holding) {
-                        warn!(
-                            block_id = %notice.source_block_id,
-                            owner = %notice.owner_id,
-                            err = %e,
-                            "holder_cleanup: failed to record drop_notice_sent_at"
-                        );
-                    }
-                }
-            }
+            // T-7: send DropNotice via mailbox, batched per owner.
+            // Group notices by owner_id, then publish each group as one or more
+            // SymbolDropNoticeBatchMsg entries (chunked to ≤ MAX_ENTRY_BYTES each).
+            //
+            // Scope fence: `SymbolDropped` (immediate eviction) stays on relay;
+            // only the advance-notice path moves here.
+            publish_drop_notices_via_mailbox(
+                db,
+                &result.drop_notices,
+                mailbox_router,
+                holder_master_pub,
+                now,
+            )
+            .await;
 
             // Refresh storage bytes for evicted owners (all devices of each master).
             for target in &result.immediate_evictions {
@@ -415,6 +411,231 @@ async fn check_pressure(
     }
 
     Ok(())
+}
+
+/// T-7: Publish DropNotice entries via the mailbox bus, batched per owner.
+///
+/// Groups `DropNoticeTarget` list by `owner_id`. For each owner:
+///   1. Builds `Vec<SymbolDropNoticeMsg>` (reading ESI ranges from DB for each notice).
+///   2. Chunks into `SymbolDropNoticeBatchMsg` entries ≤ `MAX_ENTRY_BYTES` each.
+///   3. Publishes each chunk via `mailbox_router.publish`.
+///   4. W-4 (best-effort): if publish returns 0 acks, retries once; logs WARN on second 0.
+///   5. Records `drop_notice_sent_at` on each holding (once, idempotent).
+///
+/// `SymbolDropped` (immediate-eviction relay path) is NOT touched — scope fence: T-13.
+async fn publish_drop_notices_via_mailbox(
+    db: &Db,
+    drop_notices: &[viaticum_core::budget::DropNoticeTarget],
+    mailbox_router: &Arc<MailboxRouter>,
+    holder_master_pub: IdentityPub,
+    now: Timestamp,
+) {
+    if drop_notices.is_empty() {
+        return;
+    }
+
+    // Step 1: Group notices by owner_id and resolve ESI ranges from DB.
+    let mut by_owner: HashMap<IdentityPub, Vec<SymbolDropNoticeMsg>> = HashMap::new();
+    for notice in drop_notices {
+        let holding = match db.get_holding(&notice.source_block_id, &notice.owner_id) {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                warn!(
+                    block_id = %notice.source_block_id,
+                    owner = %notice.owner_id,
+                    "holder_cleanup: drop notice holding not found in DB, skipping"
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    block_id = %notice.source_block_id,
+                    owner = %notice.owner_id,
+                    err = %e,
+                    "holder_cleanup: failed to get holding for drop notice, skipping"
+                );
+                continue;
+            }
+        };
+
+        let notice_msg = SymbolDropNoticeMsg {
+            v: 1,
+            source_block_id: notice.source_block_id,
+            esi_ranges: holding.esi_ranges.clone(),
+            deadline: Timestamp(notice.deadline_secs),
+            timestamp: now,
+        };
+        by_owner
+            .entry(notice.owner_id)
+            .or_default()
+            .push(notice_msg);
+    }
+
+    let now_secs = now.0;
+    let ttl_secs = class_config::DROP_NOTICE_TTL.as_secs();
+
+    // Step 2: For each owner, chunk and publish.
+    for (owner_id, notices) in &by_owner {
+        // Chunk notices so each SymbolDropNoticeBatchMsg CBOR payload ≤ MAX_ENTRY_BYTES.
+        // Estimate: probe-serialize the batch to check; if too large, bisect.
+        // Simple approach: start with all, if over cap, split in half recursively.
+        let chunks = chunk_notices_to_fit(notices);
+
+        for chunk in chunks {
+            let batch = SymbolDropNoticeBatchMsg {
+                v: 1,
+                notices: chunk,
+            };
+            let payload = match to_cbor(&batch) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        owner = %owner_id,
+                        err = %e,
+                        "holder_cleanup: failed to serialize DropNotice batch, skipping chunk"
+                    );
+                    continue;
+                }
+            };
+
+            if payload.len() > class_config::MAX_ENTRY_BYTES {
+                // Should not happen after chunking, but guard defensively.
+                warn!(
+                    owner = %owner_id,
+                    size = payload.len(),
+                    max = class_config::MAX_ENTRY_BYTES,
+                    "holder_cleanup: DropNotice chunk still too large after split, skipping"
+                );
+                continue;
+            }
+
+            let mut msg_id = [0u8; 16];
+            rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
+
+            let entry = MailboxEntry {
+                target: *owner_id,
+                msg_id,
+                class: MailboxClass::DropNotice,
+                payload_version: 1,
+                payload,
+                expires_at: now_secs + ttl_secs,
+                stored_at: now_secs,
+                sender: Some(holder_master_pub),
+            };
+
+            // W-4: best-effort publish — retry once on 0 acks.
+            let ack_count = match mailbox_router.publish(owner_id, entry.clone()).await {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(
+                        owner = %owner_id,
+                        err = %e,
+                        "holder_cleanup: DropNotice mailbox publish failed (best-effort, continuing)"
+                    );
+                    continue;
+                }
+            };
+
+            if ack_count == 0 {
+                // W-4: retry once on 0 acks.
+                let mut retry_msg_id = [0u8; 16];
+                rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut retry_msg_id);
+                let retry_entry = MailboxEntry {
+                    msg_id: retry_msg_id,
+                    ..entry
+                };
+                match mailbox_router.publish(owner_id, retry_entry).await {
+                    Ok(0) => {
+                        // W-4 documented known limitation: notice may be lost.
+                        // Owner detects via next PoS miss (N-6: notice TTL = 14d).
+                        warn!(
+                            owner = %owner_id,
+                            "holder_cleanup: DropNotice retry also got 0 acks \
+                             — notice may be lost (W-4 known limitation; \
+                             owner detects via next PoS, TTL=14d)"
+                        );
+                    }
+                    Ok(n) => {
+                        info!(
+                            owner = %owner_id,
+                            ack_count = n,
+                            "holder_cleanup: DropNotice published on retry"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            owner = %owner_id,
+                            err = %e,
+                            "holder_cleanup: DropNotice retry publish failed (W-4)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 3: Record drop_notice_sent_at on each holding (idempotent — only set if not already set).
+    for notice in drop_notices {
+        let holding = match db.get_holding(&notice.source_block_id, &notice.owner_id) {
+            Ok(Some(h)) => h,
+            _ => continue,
+        };
+        if holding.drop_notice_sent_at.is_none() {
+            let mut updated = holding;
+            updated.drop_notice_sent_at = Some(now);
+            if let Err(e) = db.upsert_holding(&updated) {
+                warn!(
+                    block_id = %notice.source_block_id,
+                    owner = %notice.owner_id,
+                    err = %e,
+                    "holder_cleanup: failed to record drop_notice_sent_at"
+                );
+            }
+        }
+    }
+}
+
+/// Chunk `notices` into groups where each group's CBOR serialized size ≤ MAX_ENTRY_BYTES.
+///
+/// Strategy: try all at once; if over the cap, bisect recursively.
+/// In practice `~100 bytes/notice × 2560 notices ≤ 256KB`, so a single chunk covers
+/// most mass-eviction scenarios. Explicit cap enforcement prevents edge cases.
+fn chunk_notices_to_fit(notices: &[SymbolDropNoticeMsg]) -> Vec<Vec<SymbolDropNoticeMsg>> {
+    if notices.is_empty() {
+        return vec![];
+    }
+
+    // Try serializing the full batch to check size.
+    let batch = SymbolDropNoticeBatchMsg {
+        v: 1,
+        notices: notices.to_vec(),
+    };
+    match to_cbor(&batch) {
+        Ok(bytes) if bytes.len() <= class_config::MAX_ENTRY_BYTES => {
+            // Fits in one chunk.
+            vec![notices.to_vec()]
+        }
+        _ => {
+            // Too large or serialization failed: bisect.
+            if notices.len() == 1 {
+                // Single notice still over the cap — cannot split further.
+                // Return it as-is; the caller's post-chunk size guard (~publish loop)
+                // will reject it with a warn and skip it. The holding then falls through
+                // to the SymbolDropped relay fallback after the drop window expires
+                // (scope fence: T-13 retires relay). The receiver never sees this entry.
+                warn!(
+                    "holder_cleanup: single DropNotice entry exceeds MAX_ENTRY_BYTES \
+                     (esi_ranges list unusually large) — will be skipped by size guard"
+                );
+                return vec![notices.to_vec()];
+            }
+            let mid = notices.len() / 2;
+            let mut left = chunk_notices_to_fit(&notices[..mid]);
+            let right = chunk_notices_to_fit(&notices[mid..]);
+            left.extend(right);
+            left
+        }
+    }
 }
 
 /// Post a SymbolDropped message to the board (directed to owner).

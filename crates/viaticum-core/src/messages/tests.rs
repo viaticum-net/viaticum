@@ -1245,6 +1245,62 @@ fn peer_announce_with_x25519_roundtrips_cbor() {
     super::verify_peer_announce(&decoded).expect("sig must verify after roundtrip");
 }
 
+// ─── SymbolDropNoticeBatchMsg roundtrip ──────────────────────────────────────
+
+#[test]
+fn symbol_drop_notice_batch_msg_roundtrips_cbor() {
+    use super::{SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg};
+
+    let ts = Timestamp(2_000_000);
+    let sbid1 = make_source_block_id(1);
+    let sbid2 = make_source_block_id(2);
+
+    let batch = SymbolDropNoticeBatchMsg {
+        v: 1,
+        notices: vec![
+            SymbolDropNoticeMsg {
+                v: 1,
+                source_block_id: sbid1,
+                esi_ranges: vec![(0, 3), (5, 8)],
+                deadline: Timestamp(ts.0 + 86400 * 14),
+                timestamp: ts,
+            },
+            SymbolDropNoticeMsg {
+                v: 1,
+                source_block_id: sbid2,
+                esi_ranges: vec![(1, 4)],
+                deadline: Timestamp(ts.0 + 86400 * 14),
+                timestamp: ts,
+            },
+        ],
+    };
+
+    let bytes = to_cbor(&batch).expect("to_cbor must not fail");
+    let decoded: SymbolDropNoticeBatchMsg = from_cbor(&bytes).expect("from_cbor must not fail");
+    assert_eq!(
+        decoded, batch,
+        "CBOR roundtrip mismatch for SymbolDropNoticeBatchMsg"
+    );
+    assert_eq!(decoded.notices.len(), 2);
+    assert_eq!(decoded.notices[0].source_block_id, sbid1);
+    assert_eq!(decoded.notices[0].esi_ranges, vec![(0, 3), (5, 8)]);
+    assert_eq!(decoded.notices[1].source_block_id, sbid2);
+}
+
+#[test]
+fn symbol_drop_notice_batch_msg_empty_notices_roundtrips() {
+    use super::SymbolDropNoticeBatchMsg;
+
+    let batch = SymbolDropNoticeBatchMsg {
+        v: 1,
+        notices: vec![],
+    };
+    let bytes = to_cbor(&batch).expect("to_cbor");
+    let decoded: SymbolDropNoticeBatchMsg = from_cbor(&bytes).expect("from_cbor");
+    assert_eq!(decoded, batch);
+    assert!(decoded.notices.is_empty());
+}
+
 // ─── AckMsg ───────────────────────────────────────────────────────────────────
 
 #[test]
