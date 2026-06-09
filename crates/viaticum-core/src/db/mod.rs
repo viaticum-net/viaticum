@@ -2108,6 +2108,8 @@ pub struct TableStats {
     pub system_state_blobs: u64,
     pub file_holders: u64,
     pub holder_files: u64,
+    #[serde(default)]
+    pub mailbox_entries: u64,
 }
 
 impl Db {
@@ -2125,6 +2127,7 @@ impl Db {
             system_state_blobs: tx.open_table(SYSTEM_STATE_BLOBS)?.len()?,
             file_holders: tx.open_table(FILE_HOLDERS)?.len()?,
             holder_files: tx.open_table(HOLDER_FILES)?.len()?,
+            mailbox_entries: tx.open_table(MAILBOX_ENTRIES)?.len()?,
         })
     }
 }

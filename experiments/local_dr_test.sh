@@ -226,35 +226,38 @@ echo "=== Phase 3: System State Push ==="
 echo "  Creating test file on node-00..."
 dd if=/dev/urandom of="$(node_dir 0)/files/test.bin" bs=1024 count=256 2>/dev/null
 
-# Poll for system state pointer on node-01 (max 220s).
-# Push fires every 60s. With SS-as-block the pointer is only sent once the base
-# block is PLACED (placed-prefix invariant): tick 1 (~60s) builds the base but it
-# has no holders yet → no pointer; the base places over the next seconds; tick 2
-# (~120s) sends the first real pointer. So the blob appears ~120-130s after start.
-echo "  Waiting for system state pointer on node-01 (push=60s, base must place first, max wait=220s)..."
-BLOB_FOUND=0
+# Poll for the SelfPointer to land in node-01's MAILBOX (max 220s).
+# A2 transport: the pointer is no longer push-to-all via SystemStateBackup — node-00
+# publishes it as a MailboxClass::SelfPointer entry to its candidate-set (T-8), and
+# each candidate (incl. node-01) stores it via handle_mailbox_store. So we gate on
+# node-01's mailbox_entries table count, not the retired system_state_blobs table.
+# Push fires every 60s; the pointer is only published once the base block is PLACED
+# (placed-prefix invariant): tick 1 (~60s) builds the base but it has no holders yet
+# → no pointer; the base places; tick 2 (~120s) publishes the first real pointer.
+echo "  Waiting for SelfPointer in node-01 mailbox (push=60s, base must place first, max wait=220s)..."
+POINTER_FOUND=0
 for attempt in $(seq 1 44); do
-    BLOB_LINE=$(run_cli_q 1 status --json 2>/dev/null \
-        | grep -oE '"system_state_blobs":\s*[0-9]+' || true)
-    BLOB_N=$(echo "$BLOB_LINE" | grep -oE '[0-9]+$')
-    if [ "${BLOB_N:-0}" -ge 1 ]; then
-        echo "  System state blob found on node-01 after $((attempt * 5))s"
-        BLOB_FOUND=1
+    MB_LINE=$(run_cli_q 1 status --json 2>/dev/null \
+        | grep -oE '"mailbox_entries":\s*[0-9]+' || true)
+    MB_N=$(echo "$MB_LINE" | grep -oE '[0-9]+$')
+    if [ "${MB_N:-0}" -ge 1 ]; then
+        echo "  SelfPointer found in node-01 mailbox after $((attempt * 5))s"
+        POINTER_FOUND=1
         break
     fi
     if [ $attempt -eq 12 ]; then
-        echo "    attempt $attempt/18 — checking node-00 log..."
+        echo "    attempt $attempt/44 — checking node-00 log..."
         tail -5 "$(node_log 0)"
     else
-        printf "    attempt $attempt/18...\r"
+        printf "    attempt $attempt/44...\r"
     fi
     sleep 5
 done
 
-if [ "$BLOB_FOUND" -eq 1 ]; then
-    pass "system state pushed to node-01"
+if [ "$POINTER_FOUND" -eq 1 ]; then
+    pass "SelfPointer published to node-01 mailbox"
 else
-    fail "system state blob not found on node-01 after 90s"
+    fail "SelfPointer not found in node-01 mailbox after 220s"
     echo ""
     echo "  === node-00 log (last 30 lines) ==="
     tail -30 "$(node_log 0)"
@@ -272,8 +275,8 @@ run_cli_q 0 status | head -15
 echo ""
 echo "=== Phase 4: Disaster Recovery ==="
 
-if [ "$BLOB_FOUND" -eq 0 ]; then
-    skip "DR skipped (no blob)"
+if [ "$POINTER_FOUND" -eq 0 ]; then
+    skip "DR skipped (no pointer in mailbox)"
 else
     # Seed DR with a SINGLE holder. With the physical survival ceiling, the SS base
     # (max-importance, few holders) is placed as full replicas — each holder holds a
