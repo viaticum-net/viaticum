@@ -1424,3 +1424,81 @@ async fn snapshot_pool_includes_cross_master_peers() {
     assert!(ids.contains(&peer_d));
     assert!(!ids.contains(&own_device), "own device must not appear");
 }
+
+// ─── T-12: SymbolStored safety net — holder addr learning ────────────────────
+
+fn make_peer_record_no_addrs(device_id: DeviceId) -> PeerRecord {
+    let now = Timestamp::now();
+    PeerRecord {
+        device_id,
+        master_identity: IdentityPub([0u8; 32]),
+        trust_p: 0.1,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: now,
+        last_seen: now,
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
+    }
+}
+
+/// T-12 AC: when the owner processes a SymbolStored ack (safety net path),
+/// the holder's addr strings are persisted to the PeerRecord in DB.
+///
+/// Tests `persist_holder_addrs_to_db` — the inner DB-update function extracted
+/// from `persist_holder_addrs_from_swarm` for testability (avoids needing a
+/// real libp2p connection for identify protocol to run).
+#[test]
+fn symbol_stored_handler_learns_holder_addr() {
+    use crate::daemon::work_pipeline::worker::persist_holder_addrs_to_db;
+
+    let db = make_db();
+    let holder = device_id(0xB1);
+
+    // Pre-insert PeerRecord with no addrs (cert-exchange done, identify pending).
+    db.upsert_peer(&make_peer_record_no_addrs(holder)).unwrap();
+
+    let addr = "/ip4/10.0.0.5/tcp/4001".to_string();
+
+    // Simulate the safety net: SymbolStored arrived, swarm returned addrs.
+    persist_holder_addrs_to_db(&db, holder, vec![addr.clone()]);
+
+    let record = db
+        .get_peer(&holder)
+        .unwrap()
+        .expect("PeerRecord must exist");
+    assert_eq!(
+        record.addrs,
+        vec![addr],
+        "holder addr must be persisted after SymbolStored safety net"
+    );
+}
+
+/// T-12: no-op when swarm returns empty addrs (identify not yet done).
+/// PeerRecord must remain unchanged.
+#[test]
+fn symbol_stored_safety_net_is_noop_when_addrs_empty() {
+    use crate::daemon::work_pipeline::worker::persist_holder_addrs_to_db;
+
+    let db = make_db();
+    let holder = device_id(0xB2);
+
+    db.upsert_peer(&make_peer_record_no_addrs(holder)).unwrap();
+
+    // Empty addr list — no-op.
+    persist_holder_addrs_to_db(&db, holder, vec![]);
+
+    let record = db
+        .get_peer(&holder)
+        .unwrap()
+        .expect("PeerRecord must exist");
+    assert!(
+        record.addrs.is_empty(),
+        "PeerRecord addrs must remain empty when swarm returns no addrs"
+    );
+}

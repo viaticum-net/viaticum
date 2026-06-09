@@ -358,6 +358,76 @@ fn pointer_not_updated_before_base_reaches_min_alive() {
     );
 }
 
+// ─── T-12: HolderHint addr propagation ───────────────────────────────────────
+
+/// T-12 AC: `build_pointer_for_placed` populates `HolderHint.addrs` when the
+/// holder's PeerRecord contains dialable addrs.
+///
+/// This is the path that DR uses for fast dialing (B-1): addrs = acceleration,
+/// not a condition for recoverability.
+#[test]
+fn holder_hint_includes_addr_when_peer_record_has_addr() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let state = viaticum_core::system_state::snapshot_db(&db).unwrap();
+    let base_id = publish_base_block(&db, dir.path(), &dr_key(), 1, &state).unwrap();
+
+    let holder = DeviceId([0xC1u8; 32]);
+    let expected_addr = "/ip4/10.20.30.40/tcp/4001".to_string();
+
+    db.upsert_placement(&alive_placement(base_id, holder))
+        .unwrap();
+    db.upsert_peer(&peer_with_addrs(holder, vec![expected_addr.clone()]))
+        .unwrap();
+
+    let master = viaticum_core::cluster::derive_master_key(&[0xEEu8; 32]).unwrap();
+    let pointer = build_pointer_for_placed(&db, &master, 1, &base_id, &[], Timestamp(1))
+        .unwrap()
+        .expect("pointer must be Some with an alive holder");
+
+    assert_eq!(
+        pointer.base.holders.len(),
+        1,
+        "pointer must list the one alive holder"
+    );
+    assert_eq!(
+        pointer.base.holders[0].addrs,
+        vec![expected_addr],
+        "HolderHint.addrs must carry the holder's stored dialable addr"
+    );
+}
+
+/// T-12 AC: `build_pointer_for_placed` returns `Some` even when the holder's
+/// PeerRecord has no addrs (empty Vec). DR recoverability must NOT depend on
+/// addrs; empty HolderHint.addrs is a normal INFO/DEBUG case, never an error.
+///
+/// B-1 invariant: DR falls back to Kademlia `get_closest_peers(holder_id)`.
+#[test]
+fn holder_hint_empty_addr_is_ok() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let state = viaticum_core::system_state::snapshot_db(&db).unwrap();
+    let base_id = publish_base_block(&db, dir.path(), &dr_key(), 1, &state).unwrap();
+
+    let holder = DeviceId([0xC2u8; 32]);
+
+    db.upsert_placement(&alive_placement(base_id, holder))
+        .unwrap();
+    // Insert PeerRecord with empty addrs.
+    db.upsert_peer(&peer_with_addrs(holder, vec![])).unwrap();
+
+    let master = viaticum_core::cluster::derive_master_key(&[0xFFu8; 32]).unwrap();
+    let pointer = build_pointer_for_placed(&db, &master, 1, &base_id, &[], Timestamp(1))
+        .unwrap()
+        .expect("pointer must be Some even with empty HolderHint.addrs (B-1: Kademlia fallback)");
+
+    assert_eq!(pointer.base.holders.len(), 1);
+    assert!(
+        pointer.base.holders[0].addrs.is_empty(),
+        "empty addrs must be propagated as-is (not an error, not gated)"
+    );
+}
+
 #[test]
 fn distinct_states_yield_distinct_base_blocks() {
     let db = Db::open_in_memory().unwrap();

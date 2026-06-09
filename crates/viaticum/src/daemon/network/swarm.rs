@@ -324,6 +324,18 @@ enum SwarmCommand {
         key: Vec<u8>,
         reply: oneshot::Sender<Result<ClosestPeersResult, SwarmError>>,
     },
+    /// Return the most recently identify-received listen addrs for a DeviceId.
+    ///
+    /// Used by T-12 (owner-addr propagation safety net): after receiving a
+    /// SymbolStored ack, the owner queries the holder's known addrs so they can
+    /// be persisted on the PeerRecord for later inclusion in HolderHint.addrs.
+    ///
+    /// Returns an empty Vec if the peer has not yet been identified (identify
+    /// protocol not completed) — this is normal; the caller handles it gracefully.
+    GetPeerAddrs {
+        device: DeviceId,
+        reply: oneshot::Sender<Vec<Multiaddr>>,
+    },
 }
 
 // ─── Error type ───────────────────────────────────────────────────────────────
@@ -866,6 +878,30 @@ impl SwarmHandle {
             .await
             .map_err(|_| SwarmError::Timeout)?
             .map_err(|_| SwarmError::ChannelClosed)?
+    }
+
+    /// Return the most recently identify-received listen addrs for a DeviceId.
+    ///
+    /// T-12 (owner-addr propagation safety net): called after receiving a
+    /// SymbolStored ack so the owner can persist the holder's dialable addrs.
+    ///
+    /// Returns an empty Vec if the device is not authenticated or the identify
+    /// protocol has not yet completed for that peer — the caller handles this
+    /// gracefully (empty addrs → skip DB write, DR falls back to Kademlia).
+    pub async fn get_peer_addrs(&self, device: DeviceId) -> Vec<Multiaddr> {
+        let (reply_tx, reply_rx) = oneshot::channel::<Vec<Multiaddr>>();
+        if self
+            .cmd_tx
+            .send(SwarmCommand::GetPeerAddrs {
+                device,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return vec![];
+        }
+        reply_rx.await.unwrap_or_default()
     }
 }
 
@@ -1738,6 +1774,21 @@ impl EventLoopState {
                 let query_id = self.swarm.behaviour_mut().kad.get_closest_peers(key);
                 debug!(query_id = ?query_id, "dht: get_closest_peers query issued");
                 self.pending_closest_peers.insert(query_id, reply);
+            }
+            // T-12: Return identify-received addrs for a DeviceId.
+            //
+            // Looks up the PeerId for the device via device_to_peer, then returns
+            // the cached listen_addrs from peer_addrs if present.
+            // Returns empty Vec if the device is not authenticated or identify
+            // has not yet completed — callers handle this gracefully.
+            SwarmCommand::GetPeerAddrs { device, reply } => {
+                let addrs = self
+                    .device_to_peer
+                    .get(&device)
+                    .and_then(|peer_id| self.peer_addrs.get(peer_id))
+                    .cloned()
+                    .unwrap_or_default();
+                let _ = reply.send(addrs);
             }
         }
     }

@@ -448,6 +448,19 @@ async fn deliver_transfer_worker(
                     symbols = chunk_len,
                     "work_pipeline: chunk stored",
                 );
+                // T-12 safety net: persist holder's dialable addrs learned from the
+                // authenticated SymbolTransfer connection. This closes the window where
+                // identify hasn't yet propagated the holder's addrs to the PeerRecord,
+                // so on the next build_pointer_for_placed call the HolderHint.addrs
+                // field will be populated for faster DR dialing.
+                //
+                // on_peer_identified is the primary source; this is the secondary
+                // safety net for the case where identify fires after this point.
+                //
+                // If addrs are empty (identify not yet done) → skip: on_peer_identified
+                // will update the record when identify completes. Empty addrs are fine:
+                // DR falls back to Kademlia get_closest_peers(holder_id) per B-1.
+                persist_holder_addrs_from_swarm(db, swarm, placement.holder_id).await;
             }
             Message::SystemStateAck(_) => {
                 saw_old_protocol = true;
@@ -540,6 +553,73 @@ fn compute_esi_offset(
         .unwrap_or(0);
 
     Ok(max_end.max(namespace_start))
+}
+
+/// T-12 safety net: query the swarm for a holder's identify-received listen addrs
+/// and persist them to the PeerRecord if non-empty.
+///
+/// Called after the owner receives a `SymbolStored` ack from a holder. This
+/// ensures the PeerRecord carries dialable addrs even when identify hasn't yet
+/// propagated them through `on_peer_identified`.
+///
+/// If the swarm returns an empty addr list (identify not yet complete for this
+/// peer), the function is a no-op — `on_peer_identified` will update the record
+/// later when identify completes. Empty addrs are fine: DR uses Kademlia fallback.
+pub(crate) async fn persist_holder_addrs_from_swarm(
+    db: &Db,
+    swarm: &SwarmHandle,
+    holder_id: DeviceId,
+) {
+    let addrs = swarm.get_peer_addrs(holder_id).await;
+    if addrs.is_empty() {
+        return;
+    }
+    let addr_strings: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+    persist_holder_addrs_to_db(db, holder_id, addr_strings);
+}
+
+/// T-12 inner: persist holder addr strings to the PeerRecord in DB.
+///
+/// Extracted for testability — callers provide pre-resolved addr strings.
+/// No-op if addrs are empty or already match the stored value.
+pub(crate) fn persist_holder_addrs_to_db(db: &Db, holder_id: DeviceId, addr_strings: Vec<String>) {
+    if addr_strings.is_empty() {
+        return;
+    }
+    match db.get_peer(&holder_id) {
+        Ok(Some(mut record)) => {
+            if record.addrs == addr_strings {
+                return; // no-op: already up to date
+            }
+            record.addrs = addr_strings;
+            if let Err(e) = db.upsert_peer(&record) {
+                tracing::warn!(
+                    holder = %holder_id,
+                    err = %e,
+                    "T-12: failed to persist holder addrs after SymbolStored"
+                );
+            } else {
+                tracing::debug!(
+                    holder = %holder_id,
+                    "T-12: persisted holder addrs from SymbolStored connection"
+                );
+            }
+        }
+        Ok(None) => {
+            // Peer record not yet in DB (rare: delivery happened before on_peer_authenticated).
+            tracing::debug!(
+                holder = %holder_id,
+                "T-12: PeerRecord not found after SymbolStored — on_peer_identified will update later"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                holder = %holder_id,
+                err = %e,
+                "T-12: db.get_peer failed in persist_holder_addrs_to_db"
+            );
+        }
+    }
 }
 
 /// Get the set of DeviceIds with Alive symbols for this block.

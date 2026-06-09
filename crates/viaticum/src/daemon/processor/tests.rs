@@ -5316,3 +5316,41 @@ async fn pos_responder_returns_none_when_block_not_held() {
         "handler must return None (nack) when block is not held"
     );
 }
+
+// ─── T-12: Owner-addr propagation (Bug-A remainder) ──────────────────────────
+
+/// T-12 AC: `on_peer_identified` persists listen_addrs to the PeerRecord for an
+/// inbound (or any authenticated) peer.
+///
+/// Primary addr-propagation path. The swarm emits `PeerIdentified` after the
+/// identify protocol completes for any peer; the processor dispatches it to
+/// `on_peer_identified` regardless of connection direction.
+#[tokio::test]
+async fn on_peer_identified_persists_addrs_for_inbound_peer() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+
+    let device_id = make_device_id(0xA1);
+
+    // Pre-insert PeerRecord without addrs (simulates state after cert-exchange but
+    // before identify has completed — i.e., the inbound case).
+    db.upsert_peer(&make_peer_record(device_id)).unwrap();
+
+    // Simulate identify protocol delivering listen addrs for the peer.
+    let addr: libp2p::Multiaddr = "/ip4/192.168.1.100/tcp/4001".parse().unwrap();
+    processor
+        .on_peer_identified(device_id, vec![addr.clone()])
+        .await;
+
+    // Verify the addrs are now persisted on the PeerRecord.
+    let record = db
+        .get_peer(&device_id)
+        .unwrap()
+        .expect("PeerRecord must exist");
+    assert_eq!(
+        record.addrs,
+        vec![addr.to_string()],
+        "on_peer_identified must persist listen_addrs to the PeerRecord"
+    );
+}
