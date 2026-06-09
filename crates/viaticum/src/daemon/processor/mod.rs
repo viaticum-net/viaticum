@@ -64,6 +64,9 @@ mod pos;
 mod restore;
 mod symbol;
 
+// Re-export for handle/mod.rs wiring (T-6: mailbox poll → PosResponder bridge).
+pub use pos::{PosResponder, ProcessorPosHandler};
+
 #[cfg(test)]
 mod tests;
 

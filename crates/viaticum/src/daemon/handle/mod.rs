@@ -1052,9 +1052,57 @@ impl DaemonHandle {
                 .map_err(|e| anyhow::anyhow!("watcher error: {e}"))
             }));
         }
-        // ── Phase 6.5: Scheduler ──────────────────────────────────────────────
+        // ── Phase 6.5: Scheduler + Mailbox poll (T-6) ────────────────────────
         // Pass the same PendingChallenges Arc created for Processor above.
         // Scheduler writes to it; Processor reads it when verifying PosResponse.
+
+        // T-6: Build MailboxRouter and pos_response channel.
+        // pos_response_tx: poll loop → scheduler (bounded 256, try_send + WARN on full).
+        let (pos_response_tx, pos_response_rx) =
+            mpsc::channel::<viaticum_core::messages::PosHashResponseMsg>(256);
+
+        // mailbox_router: requires a live swarm. If swarm is unavailable, use a
+        // no-network router (will always get 0 acks, scheduler logs warn + retries).
+        // In practice this branch is rare: swarm=None + reaching scheduler = cluster_state=None path.
+        let mailbox_router: std::sync::Arc<crate::daemon::mailbox::routing::MailboxRouter> =
+            if let Some(swarm) = swarm_handle_arc.clone() {
+                std::sync::Arc::new(crate::daemon::mailbox::routing::MailboxRouter::new(
+                    swarm,
+                    db.clone(),
+                ))
+            } else {
+                // No swarm: build router with a dummy/isolated sender.
+                // This is a degraded path — no challenges will be delivered.
+                // Using the with_sender constructor with a no-op mock.
+                struct NoNetworkSender;
+                #[async_trait::async_trait]
+                impl crate::daemon::mailbox::routing::MailboxNetworkSender for NoNetworkSender {
+                    async fn send_store(
+                        &self,
+                        _device: viaticum_core::types::DeviceId,
+                        _req: viaticum_core::messages::MailboxStoreRequest,
+                    ) -> anyhow::Result<viaticum_core::messages::MailboxStoreResponse>
+                    {
+                        anyhow::bail!("no network available (swarm not started)")
+                    }
+                    async fn send_fetch(
+                        &self,
+                        _device: viaticum_core::types::DeviceId,
+                        _req: viaticum_core::messages::MailboxFetchRequest,
+                    ) -> anyhow::Result<viaticum_core::messages::MailboxFetchResponse>
+                    {
+                        anyhow::bail!("no network available (swarm not started)")
+                    }
+                }
+                tracing::warn!(
+                    "T-6: swarm unavailable — MailboxRouter in no-network mode (0 acks expected)"
+                );
+                std::sync::Arc::new(crate::daemon::mailbox::routing::MailboxRouter::with_sender(
+                    std::sync::Arc::new(NoNetworkSender),
+                    db.clone(),
+                ))
+            };
+
         let scheduler = Scheduler::new(
             db.clone(),
             SchedulerConfig {
@@ -1067,6 +1115,8 @@ impl DaemonHandle {
             repair_tx.clone(),
             pending_challenges,
             relay_post_tx.clone(),
+            std::sync::Arc::clone(&mailbox_router),
+            identity_pub,
             master_key.clone(),
             symbols_dir.clone(),
             accepted_offers,
@@ -1076,8 +1126,46 @@ impl DaemonHandle {
         );
         let cancel_scheduler = cancel.clone();
         tasks.push(tokio::spawn(async move {
-            scheduler.run(cancel_scheduler).await
+            scheduler.run(pos_response_rx, cancel_scheduler).await
         }));
+
+        // ── T-6: Mailbox poll task ────────────────────────────────────────────
+        // Polls this node's mailbox every MAILBOX_POLL_INTERVAL_SECS.
+        // Started alongside other periodic tasks (T-9 will add explicit Kademlia stabilize wait).
+        //
+        // The poll loop responds to mailbox PoS challenges via PosResponder — a small struct
+        // that owns only the three Processor fields needed (db, holdings_dir, master_signing_key).
+        // No Arc<Processor> wrap is needed: PosResponder is constructed here from clones of the
+        // same locals that are passed into Processor, before Processor is moved into its task.
+        // Nack-over-mailbox delivery is the only remaining A2 follow-up (needs a new MailboxClass).
+        {
+            use crate::daemon::mailbox::poll::run_mailbox_poll;
+            use crate::daemon::processor::{PosResponder, ProcessorPosHandler};
+
+            let pos_handler = ProcessorPosHandler::new(PosResponder::new(
+                db.clone(),
+                holdings_dir.clone(),
+                master_key.clone(),
+            ));
+
+            let poll_db = db.clone();
+            let poll_router = std::sync::Arc::clone(&mailbox_router);
+            let poll_pos_tx = pos_response_tx.clone();
+            let poll_identity = identity_pub;
+            let poll_cancel = cancel.clone();
+            tasks.push(tokio::spawn(async move {
+                run_mailbox_poll(
+                    poll_db,
+                    poll_router,
+                    poll_pos_tx,
+                    std::sync::Arc::new(pos_handler),
+                    poll_identity,
+                    poll_cancel,
+                )
+                .await;
+                Ok(())
+            }));
+        }
 
         // ── Metrics pusher (optional) ──────────────────────────────────────
         if let Some(state_m) = state_for_metrics {

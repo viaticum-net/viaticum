@@ -5186,3 +5186,133 @@ async fn block_becomes_eligible_in_next_work_item_after_pos_fail() {
         "next_work_item must return the degraded block"
     );
 }
+
+// ─── PosResponder: standalone compute tests ──────────────────────────────────
+//
+// These tests exercise the non-mock production path: PosResponder is built
+// directly (real redb + temp holdings dir) and driven either via
+// compute_response or via ProcessorPosHandler::handle_pos_challenge with a
+// CBOR-encoded payload.  This closes the "tests green but prod hollow" gap
+// that existed when ProcessorPosHandler held Arc<Processor> (which could not
+// be constructed in production because Processor had already been moved into
+// its task).
+
+#[tokio::test]
+async fn pos_responder_computes_response_for_held_block() {
+    use viaticum_core::messages::PosHashChallengeMsg;
+    use viaticum_core::pos::compute_chain_hash;
+    use viaticum_core::types::hex_encode;
+
+    use super::pos::PosResponder;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+
+    let owner = make_identity(0x11);
+    let block_id = make_block_id(0x22);
+    let esi = 3u32;
+    let symbol_data = b"test-symbol-data-for-pos-responder".to_vec();
+    let master_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
+
+    // Insert HoldingRecord so ownership check passes.
+    db.upsert_holding(&HoldingRecord {
+        source_block_id: block_id,
+        owner_id: owner,
+        esi_ranges: vec![(esi, 1)],
+        importance: 0.5,
+        total_bytes: symbol_data.len() as u64,
+        status: HoldingStatus::Active,
+        received_at: Timestamp::now(),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    })
+    .unwrap();
+
+    // Write symbol file at {holdings_dir}/{block_hex}/{esi}.bin.
+    let block_hex: String = hex_encode(&block_id.0);
+    let block_dir = holdings_dir.path().join(&block_hex);
+    std::fs::create_dir_all(&block_dir).unwrap();
+    std::fs::write(block_dir.join(format!("{esi}.bin")), &symbol_data).unwrap();
+
+    let responder = PosResponder::new(db, holdings_dir.path().to_path_buf(), master_signing_key);
+
+    let challenge_id = [0xCCu8; 16];
+    let challenge = PosHashChallengeMsg {
+        v: 1,
+        challenge_id,
+        source_block_id: block_id,
+        esi_ranges: vec![(esi, 1)],
+        timestamp: Timestamp::now(),
+        device_id: None,
+    };
+
+    let reply = responder
+        .compute_response(owner, challenge)
+        .await
+        .expect("compute_response must succeed");
+
+    match reply {
+        viaticum_core::messages::Message::PosHashResponse(resp) => {
+            assert_eq!(
+                resp.challenge_id, challenge_id,
+                "challenge_id must round-trip"
+            );
+            let expected =
+                compute_chain_hash(&challenge_id, &[(esi, symbol_data.as_slice())]).unwrap();
+            assert_eq!(
+                resp.chain_hash, expected,
+                "chain_hash must match expected value"
+            );
+        }
+        other => panic!(
+            "expected PosHashResponse, got discriminant {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+}
+
+#[tokio::test]
+async fn pos_responder_returns_none_when_block_not_held() {
+    use viaticum_core::messages::{PosHashChallengeMsg, to_cbor};
+
+    use super::pos::PosResponder;
+    use crate::daemon::mailbox::poll::PosMailboxChallengeHandler;
+    use crate::daemon::processor::ProcessorPosHandler;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let master_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xBBu8; 32]);
+
+    // No HoldingRecord, no symbol file — expect Nack path → handler returns None.
+    let handler = ProcessorPosHandler::new(PosResponder::new(
+        db,
+        holdings_dir.path().to_path_buf(),
+        master_signing_key,
+    ));
+
+    let owner = make_identity(0x33);
+    let block_id = make_block_id(0x44);
+    let esi = 0u32;
+    let challenge_id = [0xDDu8; 16];
+
+    let challenge = PosHashChallengeMsg {
+        v: 1,
+        challenge_id,
+        source_block_id: block_id,
+        esi_ranges: vec![(esi, 1)],
+        timestamp: Timestamp::now(),
+        device_id: None,
+    };
+    let payload = to_cbor(&challenge).expect("cbor encode challenge");
+
+    // Drive via the PosMailboxChallengeHandler interface (the same path the poll loop uses).
+    let result = handler
+        .handle_pos_challenge(owner, payload)
+        .await
+        .expect("handle_pos_challenge must not error");
+
+    assert!(
+        result.is_none(),
+        "handler must return None (nack) when block is not held"
+    );
+}

@@ -17,15 +17,20 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use viaticum_core::constants::{LONG_ABSENCE_SECS, POS_TIMEOUT_SECS, S_CLAMP_MAX, S_CLAMP_MIN};
+use viaticum_core::constants::{
+    LONG_ABSENCE_SECS, POS_CHALLENGE_PENDING_TIMEOUT_SECS, S_CLAMP_MAX, S_CLAMP_MIN,
+};
 use viaticum_core::db::Db;
 use viaticum_core::deletion::{DeletionAction, DeletionEngine};
+use viaticum_core::mailbox::{MailboxClass, MailboxEntry};
+use viaticum_core::messages::{PosHashResponseMsg, to_cbor};
 use viaticum_core::pos::{VerifyOutcome, apply_pos_outcome, due_challenges, outcome_from_verify};
 use viaticum_core::trust::{compute_combined, compute_effective_trust, recalculate_trust};
 use viaticum_core::types::{
     DeviceId, IdentityPub, PlacementStatus, SourceBlockId, SourceBlockStatus, Timestamp,
 };
 
+use crate::daemon::mailbox::routing::MailboxRouter;
 use crate::daemon::relay::RelayPost;
 use crate::daemon::repair::RepairTrigger;
 
@@ -86,7 +91,14 @@ pub struct Scheduler {
     /// Shared with Processor for response matching.
     pending: PendingChallenges,
     /// Channel to post messages to the relay board.
+    /// Still used for delete/drop-notice relay messages (T-13 removes it).
     relay_post_tx: mpsc::Sender<RelayPost>,
+    /// Mailbox router for publishing PoS challenges via the mailbox bus (T-6).
+    /// Replaces the relay path for PosHashChallengeMsg.
+    mailbox_router: Arc<MailboxRouter>,
+    /// This node's master identity public key (sent as MailboxEntry.sender so holder
+    /// knows where to publish the response).
+    my_master_pub: IdentityPub,
     /// Signing key for building DeleteMsg signatures.
     signing_key: ed25519_dalek::SigningKey,
     /// Directory containing owner-side source block files (`{block_id_hex}/*.bin`).
@@ -113,6 +125,8 @@ impl Scheduler {
         repair_tx: mpsc::Sender<RepairTrigger>,
         pending: PendingChallenges,
         relay_post_tx: mpsc::Sender<RelayPost>,
+        mailbox_router: Arc<MailboxRouter>,
+        my_master_pub: IdentityPub,
         signing_key: ed25519_dalek::SigningKey,
         source_blocks_dir: std::path::PathBuf,
         accepted_offers: crate::daemon::processor::AcceptedOffers,
@@ -126,6 +140,8 @@ impl Scheduler {
             repair_tx,
             pending,
             relay_post_tx,
+            mailbox_router,
+            my_master_pub,
             signing_key,
             source_blocks_dir,
             accepted_offers,
@@ -141,7 +157,14 @@ impl Scheduler {
     ///
     /// Both intervals are divided by time_scale before use.
     /// Exits cleanly when cancel fires.
-    pub async fn run(self, cancel: CancellationToken) -> anyhow::Result<()> {
+    ///
+    /// `pos_response_rx`: receives polled PosHashResponseMsg from run_mailbox_poll.
+    /// On receipt, resolves the matching pending challenge (owner side).
+    pub async fn run(
+        self,
+        mut pos_response_rx: mpsc::Receiver<PosHashResponseMsg>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
         let scale = self.config.time_scale.max(1);
         let pos_interval = Duration::from_secs((self.config.pos_interval_secs / scale).max(1));
         let timeout_interval = Duration::from_secs((self.config.timeout_check_secs / scale).max(1));
@@ -235,7 +258,144 @@ impl Scheduler {
                         error!("scheduler: sweep_offered_placements error: {e}");
                     }
                 }
+                // PosResponse arrived via mailbox poll → resolve pending challenge.
+                maybe_response = pos_response_rx.recv() => {
+                    match maybe_response {
+                        None => {
+                            // Channel closed: poll loop shut down (cancel propagated).
+                            debug!("scheduler: pos_response_rx closed");
+                        }
+                        Some(response) => {
+                            if let Err(e) = self.handle_pos_response_from_mailbox(response).await {
+                                error!("scheduler: handle_pos_response_from_mailbox: {e}");
+                            }
+                        }
+                    }
+                }
             }
+        }
+
+        Ok(())
+    }
+
+    /// Owner side: resolve a PosHashResponse received via the mailbox poll channel.
+    ///
+    /// Finds the matching pending challenge by challenge_id, verifies the hash,
+    /// and applies the PoS outcome to the placement.
+    async fn handle_pos_response_from_mailbox(
+        &self,
+        response: PosHashResponseMsg,
+    ) -> anyhow::Result<()> {
+        // Find pending challenge by challenge_id (linear scan, bounded by active placements).
+        let pending_key = {
+            let guard = self.pending.lock().await;
+            guard
+                .iter()
+                .find(|(_, v)| v.challenge_id == response.challenge_id)
+                .map(|(k, _)| *k)
+        };
+
+        let key = match pending_key {
+            Some(k) => k,
+            None => {
+                warn!(
+                    "scheduler: PosHashResponse from mailbox with unknown challenge_id (stale or duplicate)"
+                );
+                return Ok(());
+            }
+        };
+
+        // Consume the entry — challenge lifecycle ends here.
+        let pending = {
+            let mut guard = self.pending.lock().await;
+            guard.remove(&key)
+        };
+        let pending = match pending {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let block_id = key.0;
+        let holder_id = key.1;
+        let first_esi = pending
+            .esi_ranges
+            .first()
+            .map(|&(start, _)| start)
+            .unwrap_or(0);
+
+        let outcome = viaticum_core::pos::verify_hash_response(
+            &response.chain_hash,
+            &pending.expected_chain_hash,
+            first_esi,
+        );
+
+        // Apply outcome to DB.
+        let placement = match self.db.get_placement(&block_id, &holder_id)? {
+            Some(p) => p,
+            None => {
+                warn!(block_id = %block_id, holder_id = %holder_id,
+                    "scheduler: mailbox PosResponse — placement missing");
+                return Ok(());
+            }
+        };
+
+        let old_status = placement.status;
+        let transition = viaticum_core::pos::apply_pos_outcome(&placement, &outcome);
+        let mut updated = placement;
+        updated.status = transition.new_status;
+        updated.consecutive_misses = transition.new_consecutive_misses;
+        if matches!(outcome, viaticum_core::pos::VerifyOutcome::Pass) {
+            updated.last_verified = Some(Timestamp::now());
+        }
+        self.db.upsert_placement(&updated)?;
+
+        if updated.status != old_status {
+            crate::daemon::processor::recompute_and_persist_block_cached_fields(
+                &self.db, &block_id,
+            );
+        }
+
+        if let Err(e) = self.db.refresh_peer_storage_bytes(&holder_id) {
+            error!(peer = %holder_id, err = %e,
+                "scheduler: failed to refresh storage bytes after mailbox PosResponse");
+        }
+
+        let scale = self.config.time_scale.max(1);
+        let week = crate::daemon::processor::current_week_number_scaled(scale);
+        let pos_outcome = outcome_from_verify(&outcome, week);
+        crate::daemon::processor::record_pos_weekly(&self.db, holder_id, pos_outcome);
+        if let Some((old_p, old_i, new_p, new_i)) =
+            viaticum_core::trust::recalculate_trust(&self.db, &holder_id, week)
+        {
+            let old_combined = compute_combined(old_p, old_i, 1.0);
+            let new_combined = compute_combined(new_p, new_i, 1.0);
+            info!(
+                peer = %holder_id,
+                trust_p_before = format!("{old_p:.4}"),
+                trust_p_after = format!("{new_p:.4}"),
+                trust_i_before = format!("{old_i:.4}"),
+                trust_i_after = format!("{new_i:.4}"),
+                trust_combined_before = format!("{old_combined:.4}"),
+                trust_combined_after = format!("{new_combined:.4}"),
+                "trust: score updated after PoS (mailbox)"
+            );
+        }
+
+        info!(
+            block_id = %block_id,
+            holder = %holder_id,
+            outcome = ?outcome,
+            "scheduler: mailbox PosResponse resolved"
+        );
+
+        if transition.trigger_repair {
+            let _ = self
+                .repair_tx
+                .send(crate::daemon::repair::RepairTrigger::RepairNow {
+                    block_id,
+                    holder_id,
+                })
+                .await;
         }
 
         Ok(())
@@ -246,12 +406,14 @@ impl Scheduler {
     /// Steps:
     ///   1. Get current timestamp.
     ///   2. List all placements from DB; filter to challengeable statuses.
-    ///   3. Use due_challenges() to find which holders are overdue.
-    ///   4. Skip placements that already have a pending challenge (avoid double-issue).
-    ///   5. Group due entries by source_block_id.
-    ///   6. For each block: encode_raw once (union of all holders' ESI ranges), then
+    ///   3. Filter out SS-blocks (Bug-B: hash-PoS for SS-blocks is a separate near-term task).
+    ///   4. Use due_challenges() to find which holders are overdue.
+    ///   5. Skip placements that already have a pending challenge (avoid double-issue).
+    ///   6. Group due entries by source_block_id.
+    ///   7. For each block: encode_raw once (union of all holders' ESI ranges), then
     ///      per-holder apply binding + compute chain hash in spawn_blocking.
-    ///   7. Post PosHashChallengeMsg to relay board and insert into pending map.
+    ///   8. Publish PosHashChallengeMsg to holder via mailbox_router (T-6).
+    ///      W-3: insert into pending ONLY after ≥1 MailboxStoreAck; 0 acks = retry next tick.
     pub async fn issue_due_challenges(&self) -> anyhow::Result<()> {
         let now = Timestamp::now();
 
@@ -263,7 +425,20 @@ impl Scheduler {
             }
         };
 
-        // Only challenge placements in a challengeable state.
+        // Bug-B: SS-blocks are excluded from due_challenges until hash-PoS for SS-blocks
+        // is implemented (separate near-term task, high priority). See TODO(bug-b) in pos/mod.rs.
+        // publish() enforces per-peer ack window (PEER_REQUEST_TIMEOUT in MailboxRouter); the >=1-ack count gate is the W-3 check.
+        let ss_ids = match self.db.ss_block_id_set() {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!(
+                    "scheduler: ss_block_id_set failed: {e}; treating as empty (may challenge SS blocks)"
+                );
+                std::collections::HashSet::new()
+            }
+        };
+
+        // Only challenge placements in a challengeable state, excluding SS-blocks.
         let challengeable: Vec<_> = placements
             .into_iter()
             .filter(|p| {
@@ -272,7 +447,7 @@ impl Scheduler {
                     PlacementStatus::Alive
                         | PlacementStatus::Uncertain
                         | PlacementStatus::PresumedLost
-                )
+                ) && !ss_ids.contains(&p.source_block_id.0)
             })
             .collect();
 
@@ -495,7 +670,7 @@ impl Scheduler {
             .await
             .unwrap_or_default();
 
-            // Post a challenge for each holder we computed a hash for.
+            // Publish a challenge for each holder we computed a hash for via mailbox (T-6).
             for (holder_id, expected_hash, esi_ranges) in hash_results {
                 let challenge_id = challenge_ids[&holder_id];
                 let holder_master = self
@@ -515,25 +690,66 @@ impl Scheduler {
                     device_id: Some(holder_id),
                 };
 
-                if let Ok(payload) = viaticum_core::messages::to_cbor(&challenge_msg) {
-                    let _ = self
-                        .relay_post_tx
-                        .send(crate::daemon::relay::RelayPost {
-                            msg_type: "pos_hash_challenge".to_string(),
-                            target: Some(holder_master),
-                            payload,
-                            msg_id: challenge_id,
-                        })
-                        .await;
-                } else {
-                    error!(
-                        block_id = %block_id,
-                        holder_id = %holder_id,
-                        "scheduler: failed to encode PosHashChallenge"
-                    );
-                    continue;
+                let payload = match to_cbor(&challenge_msg) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!(
+                            block_id = %block_id,
+                            holder_id = %holder_id,
+                            err = %e,
+                            "scheduler: failed to encode PosHashChallenge"
+                        );
+                        continue;
+                    }
+                };
+
+                let ttl_secs = viaticum_core::mailbox::class_config::POS_CHALLENGE_TTL.as_secs();
+                let expires_at = now.0 + ttl_secs;
+                let entry = MailboxEntry {
+                    target: holder_master,
+                    msg_id: challenge_id,
+                    class: MailboxClass::PosChallenge,
+                    payload_version: 1,
+                    payload,
+                    expires_at,
+                    stored_at: now.0,
+                    // W-3: sender is our master_pub so holder knows where to publish the response.
+                    sender: Some(self.my_master_pub),
+                };
+
+                // W-3: publish via mailbox and gate pending-challenge creation on ≥1 Ack.
+                // If 0 acks returned, the challenge is treated as unsent — retry on next tick.
+                // MAILBOX_STORE_TIMEOUT_SECS is the per-peer request timeout (enforced in routing.rs).
+                match self.mailbox_router.publish(&holder_master, entry).await {
+                    Ok(0) => {
+                        warn!(
+                            block_id = %block_id,
+                            holder_id = %holder_id,
+                            "scheduler: PoS challenge: 0 acks — treating as unsent, will retry next tick"
+                        );
+                        // Do NOT insert into pending — no confirmed delivery.
+                        continue;
+                    }
+                    Ok(ack_count) => {
+                        debug!(
+                            block_id = %block_id,
+                            holder_id = %holder_id,
+                            ack_count,
+                            "scheduler: PoS challenge published via mailbox"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            block_id = %block_id,
+                            holder_id = %holder_id,
+                            err = %e,
+                            "scheduler: PoS challenge publish error — will retry next tick"
+                        );
+                        continue;
+                    }
                 }
 
+                // Insert into pending ONLY after confirmed ack (W-3 requirement).
                 self.pending.lock().await.insert(
                     (block_id, holder_id),
                     PendingHashChallenge {
@@ -549,7 +765,7 @@ impl Scheduler {
                 info!(
                     block_id = %block_id,
                     holder_id = %holder_id,
-                    "scheduler: PoS hash challenge issued"
+                    "scheduler: PoS hash challenge issued via mailbox"
                 );
             }
         }
@@ -621,7 +837,11 @@ impl Scheduler {
     pub async fn check_timeouts(&self) -> anyhow::Result<()> {
         let now = Timestamp::now();
         let scale = self.config.time_scale.max(1);
-        let threshold = POS_TIMEOUT_SECS / scale;
+        // T-6: use POS_CHALLENGE_PENDING_TIMEOUT_SECS (≈14d 2h) instead of POS_TIMEOUT_SECS (7d).
+        // The extended window accounts for: challenge_TTL (7d) + response_TTL (7d) + 2×poll_interval (2h).
+        // A holder offline for up to challenge_TTL can still respond; the response lives in mailbox
+        // for response_TTL; the owner needs up to 2 poll intervals to collect it.
+        let threshold = POS_CHALLENGE_PENDING_TIMEOUT_SECS / scale;
 
         // Collect timed-out entries without holding the lock during DB calls.
         let timed_out: Vec<PendingHashChallenge> = {

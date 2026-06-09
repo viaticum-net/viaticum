@@ -1,3 +1,6 @@
+// TODO(bug-b): hash-PoS for SS-blocks — separate near-term task, high priority.
+// SS-blocks excluded from due_challenges via ss_block_id_set filter until implemented.
+
 use crate::constants::{
     POS_BASE_CHALLENGES_PER_WEEK, POS_CONSECUTIVE_MISS_PRESUMED_LOST,
     POS_CONSECUTIVE_MISS_UNCERTAIN, POS_VOLUME_DIVISOR, SECS_PER_WEEK,

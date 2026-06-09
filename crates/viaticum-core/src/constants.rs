@@ -409,6 +409,12 @@ pub const MAILBOX_DR_WALK_BATCHES: &[usize] = &[100, 300, 1000];
 /// Mailbox poll interval: 1 hour.
 pub const MAILBOX_POLL_INTERVAL_SECS: u64 = 3600;
 
+/// Per-peer request timeout window for collecting the first MailboxStoreAck
+/// before treating the challenge as unsent.
+/// The MailboxRouter already enforces this as a per-peer network timeout (PEER_REQUEST_TIMEOUT).
+/// This constant is referenced for the W-3 acked-wait comment; actual enforcement is in routing.rs.
+pub const MAILBOX_STORE_TIMEOUT_SECS: u64 = 30;
+
 /// Mailbox TTL-sweep interval: 6 hours.
 pub const MAILBOX_SWEEP_INTERVAL_SECS: u64 = 6 * 3600;
 

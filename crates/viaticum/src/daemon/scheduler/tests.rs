@@ -9,12 +9,16 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, mpsc};
 use viaticum_core::db::Db;
+use viaticum_core::messages::{
+    MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
+};
 use viaticum_core::types::{
-    DeviceId, FileId, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
+    DeviceId, FileId, IdentityPub, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
 };
 
 use viaticum_core::erasure::RaptorQEncoder;
 
+use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
 use crate::daemon::relay::RelayPost;
 use crate::daemon::repair::RepairTrigger;
 use crate::daemon::scheduler::{
@@ -22,6 +26,39 @@ use crate::daemon::scheduler::{
 };
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
+
+/// No-op mailbox sender for scheduler tests that do not exercise mailbox delivery.
+struct NoOpMailboxSender;
+
+#[async_trait::async_trait]
+impl MailboxNetworkSender for NoOpMailboxSender {
+    async fn send_store(
+        &self,
+        _device: DeviceId,
+        _req: MailboxStoreRequest,
+    ) -> anyhow::Result<MailboxStoreResponse> {
+        // Simulate 0 acks: always returns an error so scheduler treats as undelivered.
+        anyhow::bail!("no-op sender: no network in tests")
+    }
+    async fn send_fetch(
+        &self,
+        _device: DeviceId,
+        _req: MailboxFetchRequest,
+    ) -> anyhow::Result<MailboxFetchResponse> {
+        anyhow::bail!("no-op sender: no network in tests")
+    }
+}
+
+fn make_test_router(db: &Db) -> Arc<MailboxRouter> {
+    Arc::new(MailboxRouter::with_sender(
+        Arc::new(NoOpMailboxSender),
+        db.clone(),
+    ))
+}
+
+fn dummy_master_pub() -> IdentityPub {
+    IdentityPub([0u8; 32])
+}
 
 fn make_block_id(seed: u8) -> SourceBlockId {
     SourceBlockId([seed; 32])
@@ -95,7 +132,7 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
     let config = SchedulerConfig {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
-        time_scale: 1, // real-time scale, threshold = POS_TIMEOUT_SECS
+        time_scale: 1, // real-time scale, threshold = POS_CHALLENGE_PENDING_TIMEOUT_SECS
         event_log_retain_rows: 100_000,
         pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
     };
@@ -110,6 +147,8 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
         repair_tx,
         pending.clone(),
         relay_post_tx,
+        make_test_router(&db),
+        dummy_master_pub(),
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
@@ -181,18 +220,21 @@ async fn check_timeouts_ignores_fresh_challenges() {
     let config = SchedulerConfig {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
-        time_scale: 1, // POS_TIMEOUT_SECS = 604_800 s — fresh challenge won't expire
+        time_scale: 1, // POS_CHALLENGE_PENDING_TIMEOUT_SECS ≈ 1_213_200 s — fresh challenge won't expire
         event_log_retain_rows: 100_000,
         pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let test_router = make_test_router(&db);
     let scheduler = Scheduler::new(
         db,
         config,
         repair_tx,
         pending.clone(),
         relay_post_tx,
+        test_router,
+        dummy_master_pub(),
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
@@ -270,7 +312,7 @@ async fn check_timeouts_respects_time_scale() {
     let pending = make_pending_challenges();
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
 
-    // time_scale = POS_TIMEOUT_SECS so threshold = 1 second.
+    // time_scale = POS_CHALLENGE_PENDING_TIMEOUT_SECS so threshold = 1 second.
     // issued_at = 10 seconds ago → clearly timed out at threshold=1.
     let now = Timestamp::now();
     let issued_at = Timestamp(now.0.saturating_sub(10));
@@ -293,7 +335,7 @@ async fn check_timeouts_respects_time_scale() {
     let config = SchedulerConfig {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
-        time_scale: viaticum_core::constants::POS_TIMEOUT_SECS, // threshold = 1 second
+        time_scale: viaticum_core::constants::POS_CHALLENGE_PENDING_TIMEOUT_SECS, // threshold = 1 second
         event_log_retain_rows: 100_000,
         pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
     };
@@ -305,6 +347,8 @@ async fn check_timeouts_respects_time_scale() {
         repair_tx,
         pending.clone(),
         relay_post_tx,
+        make_test_router(&db),
+        dummy_master_pub(),
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
@@ -369,12 +413,15 @@ async fn issue_due_challenges_skips_already_pending() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let test_router = make_test_router(&db);
     let scheduler = Scheduler::new(
         db,
         config,
         repair_tx,
         pending.clone(),
         relay_post_tx,
+        test_router,
+        dummy_master_pub(),
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
@@ -429,12 +476,15 @@ async fn scheduler_skips_deleting_placements() {
     };
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let test_router = make_test_router(&db);
     let scheduler = Scheduler::new(
         db,
         config,
         repair_tx,
         pending.clone(),
         relay_post_tx,
+        test_router,
+        dummy_master_pub(),
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
@@ -458,12 +508,12 @@ async fn scheduler_skips_deleting_placements() {
 // ─── SCHED-08: time_scale_divides_intervals ───────────────────────────────────
 
 /// With time_scale=N, the timeout threshold is divided by N.
-/// A challenge issued `POS_TIMEOUT_SECS / N + 1` seconds ago must be treated
-/// as timed out when time_scale=N, but the same challenge would NOT be timed
-/// out with time_scale=1 (which needs 7 days).
+/// A challenge issued `POS_CHALLENGE_PENDING_TIMEOUT_SECS / N + 1` seconds ago
+/// must be treated as timed out when time_scale=N, but the same challenge would
+/// NOT be timed out with time_scale=1 (which needs ~14 days + 2h).
 #[tokio::test]
 async fn time_scale_divides_intervals() {
-    use viaticum_core::constants::POS_TIMEOUT_SECS;
+    use viaticum_core::constants::POS_CHALLENGE_PENDING_TIMEOUT_SECS;
 
     let db = Db::open_in_memory().expect("db open");
     let block_id = make_block_id(60);
@@ -476,9 +526,9 @@ async fn time_scale_divides_intervals() {
     let pending = make_pending_challenges();
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
 
-    // time_scale = POS_TIMEOUT_SECS means threshold = 1 second.
-    // Issue challenge 5 seconds in the past.
-    let scale = POS_TIMEOUT_SECS;
+    // time_scale = POS_CHALLENGE_PENDING_TIMEOUT_SECS means threshold = 1 second.
+    // Issue challenge 5 seconds in the past — clearly timed out at threshold=1s.
+    let scale = POS_CHALLENGE_PENDING_TIMEOUT_SECS;
     let now = Timestamp::now();
     let issued_at = Timestamp(now.0.saturating_sub(5));
 
@@ -512,6 +562,8 @@ async fn time_scale_divides_intervals() {
         repair_tx,
         pending.clone(),
         relay_post_tx,
+        make_test_router(&db),
+        dummy_master_pub(),
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
@@ -522,7 +574,7 @@ async fn time_scale_divides_intervals() {
 
     scheduler.check_timeouts().await.expect("check_timeouts");
 
-    // With time_scale=POS_TIMEOUT_SECS, threshold = 1 second.
+    // With time_scale=POS_CHALLENGE_PENDING_TIMEOUT_SECS, threshold = 1 second.
     // Challenge issued 5 seconds ago must have been processed (removed from pending).
     assert!(
         pending.lock().await.is_empty(),
@@ -630,6 +682,8 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
         repair_tx,
         pending,
         relay_post_tx,
+        make_test_router(&db),
+        dummy_master_pub(),
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
@@ -679,12 +733,15 @@ async fn deletion_tick_noop_when_no_eligible_files() {
         event_log_retain_rows: 100_000,
         pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
     };
+    let test_router = make_test_router(&db);
     let scheduler = Scheduler::new(
         db,
         config,
         repair_tx,
         pending,
         relay_post_tx,
+        test_router,
+        dummy_master_pub(),
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
@@ -743,6 +800,8 @@ async fn scheduler_transitions_offered_to_lost_after_long_absence() {
         repair_tx,
         pending,
         relay_post_tx,
+        make_test_router(&db),
+        dummy_master_pub(),
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
@@ -818,6 +877,8 @@ async fn scheduler_does_not_transition_offered_to_lost_before_long_absence() {
         repair_tx,
         pending,
         relay_post_tx,
+        make_test_router(&db),
+        dummy_master_pub(),
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
@@ -939,6 +1000,8 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
         repair_tx,
         pending,
         relay_post_tx,
+        make_test_router(&db),
+        dummy_master_pub(),
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
@@ -1070,6 +1133,8 @@ async fn cleanup_block_removes_files_from_disk() {
         repair_tx,
         pending,
         relay_post_tx,
+        make_test_router(&db),
+        dummy_master_pub(),
         signing_key,
         source_blocks_tmp.path().to_path_buf(),
         crate::daemon::processor::make_empty_accepted_offers(),
@@ -1127,6 +1192,7 @@ fn make_scheduler_for_hook(
 ) -> Scheduler {
     let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let router = make_test_router(&db);
     let config = SchedulerConfig {
         pos_interval_secs: 3600,
         timeout_check_secs: 3600,
@@ -1140,6 +1206,8 @@ fn make_scheduler_for_hook(
         repair_tx,
         pending,
         relay_post_tx,
+        router,
+        dummy_master_pub(),
         signing_key,
         std::path::PathBuf::from("/tmp/sched_hook_test"),
         crate::daemon::processor::make_empty_accepted_offers(),
@@ -1290,6 +1358,888 @@ async fn scheduler_pos_timeout_uncertain_to_presumed_lost_decrements_current_ali
         "current_reliability must be in [0.0, 1.0], got {}",
         updated_block.current_reliability
     );
+}
+
+// ─── T-6 spec-required scenarios ─────────────────────────────────────────────
+
+/// Recording mailbox sender: records every MailboxStoreRequest it receives
+/// and returns Ack for each. Used to verify scheduler publishes to mailbox.
+struct RecordingMailboxSender {
+    captured: std::sync::Mutex<Vec<viaticum_core::messages::MailboxStoreRequest>>,
+}
+
+impl RecordingMailboxSender {
+    fn new() -> Self {
+        RecordingMailboxSender {
+            captured: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn captured_requests(&self) -> Vec<viaticum_core::messages::MailboxStoreRequest> {
+        self.captured.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl MailboxNetworkSender for RecordingMailboxSender {
+    async fn send_store(
+        &self,
+        _device: DeviceId,
+        req: viaticum_core::messages::MailboxStoreRequest,
+    ) -> anyhow::Result<viaticum_core::messages::MailboxStoreResponse> {
+        let msg_id = req.entry.msg_id;
+        self.captured.lock().unwrap().push(req);
+        Ok(viaticum_core::messages::MailboxStoreResponse::Ack { msg_id })
+    }
+    async fn send_fetch(
+        &self,
+        _device: DeviceId,
+        _req: MailboxFetchRequest,
+    ) -> anyhow::Result<MailboxFetchResponse> {
+        anyhow::bail!("recording sender: fetch not used in store tests")
+    }
+}
+
+/// Ack mailbox sender: always returns Ack. Used to verify W-3 gate when acks ARE received.
+struct AckMailboxSender;
+
+#[async_trait::async_trait]
+impl MailboxNetworkSender for AckMailboxSender {
+    async fn send_store(
+        &self,
+        _device: DeviceId,
+        req: viaticum_core::messages::MailboxStoreRequest,
+    ) -> anyhow::Result<viaticum_core::messages::MailboxStoreResponse> {
+        Ok(viaticum_core::messages::MailboxStoreResponse::Ack {
+            msg_id: req.entry.msg_id,
+        })
+    }
+    async fn send_fetch(
+        &self,
+        _device: DeviceId,
+        _req: MailboxFetchRequest,
+    ) -> anyhow::Result<MailboxFetchResponse> {
+        anyhow::bail!("ack sender: fetch not used")
+    }
+}
+
+// ─── Minimal source block setup for PoS hash tests ───────────────────────────
+//
+// To exercise issue_due_challenges() end-to-end we need:
+//   1. A SourceBlockRecord with valid erasure params (k, t, n, overhead).
+//   2. A block.bin on disk with exactly k*t bytes.
+//   3. A SymbolPlacement for a holder with known ESI ranges.
+//   4. A PeerRecord for the holder (so trust lookup doesn't panic).
+//
+// Minimal params: k=10, t=64 → block size = 640 bytes; k_eff=13, n=20, overhead=1.5.
+
+const TEST_K: u32 = 10;
+const TEST_T: u16 = 64;
+
+fn make_source_block_record(block_id: SourceBlockId) -> viaticum_core::types::SourceBlockRecord {
+    use viaticum_core::types::{SourceBlockRecord, SourceBlockStatus, SourceBlockType};
+    let k_eff = TEST_K + viaticum_core::constants::DECODE_OVERHEAD;
+    let n = (k_eff as f64 * 1.5).ceil() as u32;
+    SourceBlockRecord {
+        block_id,
+        k: TEST_K,
+        t: TEST_T,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(0),
+        encrypted_size: Some((TEST_K as u64) * (TEST_T as u64)),
+        n: Some(n),
+        overhead: Some(1.5),
+        drop_notice_sent_at: None,
+        importance: 0.5,
+        current_alive: 1,
+        current_reliability: 0.9,
+        target_reliability: 0.99,
+    }
+}
+
+fn make_peer_record(holder_id: DeviceId) -> viaticum_core::types::PeerRecord {
+    viaticum_core::types::PeerRecord {
+        device_id: holder_id,
+        master_identity: viaticum_core::types::IdentityPub(holder_id.0),
+        trust_p: 0.5,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
+    }
+}
+
+/// Write a block.bin of exactly k*t bytes under `source_blocks_dir/{block_hex}/block.bin`.
+/// Returns the data written (so tests can use it for verification if needed).
+fn write_block_bin(source_blocks_dir: &std::path::Path, block_id: SourceBlockId) -> Vec<u8> {
+    let block_hex = viaticum_core::types::hex_encode(&block_id.0);
+    let block_dir = source_blocks_dir.join(&block_hex);
+    std::fs::create_dir_all(&block_dir).unwrap();
+    // Block data: deterministic bytes (seed from block_id[0]) to avoid all-zero edge cases.
+    let data: Vec<u8> = (0..(TEST_K as usize * TEST_T as usize))
+        .map(|i| ((i.wrapping_add(block_id.0[0] as usize)) & 0xFF) as u8)
+        .collect();
+    std::fs::write(block_dir.join("block.bin"), &data).unwrap();
+    data
+}
+
+// ─── T-6 test: challenge goes via mailbox, not relay ─────────────────────────
+
+/// A due PoS challenge is published via MailboxRouter, NOT via relay_post_tx.
+///
+/// Asserts:
+/// - At least one MailboxStoreRequest was captured by the recording sender.
+/// - The captured entry has class == PosChallenge, sender == Some(owner master_pub).
+/// - The payload decodes as a valid PosHashChallengeMsg.
+/// - No RelayPost was sent on the relay_post_tx channel.
+#[tokio::test]
+async fn scheduler_issues_challenge_via_mailbox_not_relay() {
+    use viaticum_core::mailbox::MailboxClass;
+    use viaticum_core::messages::PosHashChallengeMsg;
+    use viaticum_core::types::from_cbor_bytes;
+
+    let db = Db::open_in_memory().expect("db open");
+    let source_blocks_tmp = tempfile::TempDir::new().unwrap();
+    let block_id = make_block_id(0xA1);
+    let holder_id = make_identity(0xA2);
+
+    // Insert source block record + block.bin + placement + peer.
+    let sbr = make_source_block_record(block_id);
+    db.upsert_source_block(&sbr).unwrap();
+    write_block_bin(source_blocks_tmp.path(), block_id);
+
+    let placement = make_placement(block_id, holder_id);
+    db.upsert_placement(&placement).unwrap();
+    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
+
+    let recording_sender = Arc::new(RecordingMailboxSender::new());
+    let router = Arc::new(MailboxRouter::with_sender(
+        Arc::clone(&recording_sender) as Arc<dyn MailboxNetworkSender>,
+        db.clone(),
+    ));
+
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let pending = make_pending_challenges();
+    let my_master = dummy_master_pub();
+
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending.clone(),
+        relay_post_tx,
+        router,
+        my_master,
+        signing_key,
+        source_blocks_tmp.path().to_path_buf(),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    );
+
+    scheduler
+        .issue_due_challenges()
+        .await
+        .expect("issue_due_challenges");
+
+    // At least one store request must have been sent via the mailbox sender.
+    let requests = recording_sender.captured_requests();
+    assert!(
+        !requests.is_empty(),
+        "expected at least one MailboxStoreRequest to be sent for the due challenge"
+    );
+
+    // Find the PosChallenge entry.
+    let pos_req = requests
+        .iter()
+        .find(|r| r.entry.class == MailboxClass::PosChallenge)
+        .expect("expected a PosChallenge entry in captured requests");
+
+    // Entry target = holder's master (which is IdentityPub(holder_id.0) since no device cert in DB).
+    assert_eq!(
+        pos_req.entry.target,
+        viaticum_core::types::IdentityPub(holder_id.0),
+        "PosChallenge entry target must be holder's master pub"
+    );
+
+    // sender = Some(owner master_pub) so holder knows where to publish the response.
+    assert_eq!(
+        pos_req.entry.sender,
+        Some(my_master),
+        "PosChallenge entry sender must be Some(owner master_pub)"
+    );
+
+    // Payload decodes as a valid PosHashChallengeMsg.
+    let decoded = from_cbor_bytes::<PosHashChallengeMsg>(&pos_req.entry.payload)
+        .expect("entry payload must decode as PosHashChallengeMsg");
+    assert_eq!(
+        decoded.source_block_id, block_id,
+        "decoded challenge source_block_id must match"
+    );
+
+    // NO relay post was sent for a PoS challenge.
+    assert!(
+        relay_post_rx.try_recv().is_err(),
+        "PoS challenge must NOT go via relay_post_tx — mailbox only"
+    );
+}
+
+// ─── T-6 test: PosChallenge entry has correct TTL ────────────────────────────
+
+/// The published MailboxEntry.expires_at - stored_at equals POS_CHALLENGE_TTL (7 days).
+#[tokio::test]
+async fn pos_challenge_stored_in_mailbox_with_correct_ttl() {
+    use viaticum_core::mailbox::{MailboxClass, class_config::POS_CHALLENGE_TTL};
+
+    let db = Db::open_in_memory().expect("db open");
+    let source_blocks_tmp = tempfile::TempDir::new().unwrap();
+    let block_id = make_block_id(0xB1);
+    let holder_id = make_identity(0xB2);
+
+    let sbr = make_source_block_record(block_id);
+    db.upsert_source_block(&sbr).unwrap();
+    write_block_bin(source_blocks_tmp.path(), block_id);
+
+    let placement = make_placement(block_id, holder_id);
+    db.upsert_placement(&placement).unwrap();
+    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
+
+    let recording_sender = Arc::new(RecordingMailboxSender::new());
+    let router = Arc::new(MailboxRouter::with_sender(
+        Arc::clone(&recording_sender) as Arc<dyn MailboxNetworkSender>,
+        db.clone(),
+    ));
+
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let pending = make_pending_challenges();
+
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending.clone(),
+        relay_post_tx,
+        router,
+        dummy_master_pub(),
+        signing_key,
+        source_blocks_tmp.path().to_path_buf(),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    );
+
+    scheduler
+        .issue_due_challenges()
+        .await
+        .expect("issue_due_challenges");
+
+    let requests = recording_sender.captured_requests();
+    let pos_req = requests
+        .iter()
+        .find(|r| r.entry.class == MailboxClass::PosChallenge)
+        .expect("expected a PosChallenge entry");
+
+    let entry = &pos_req.entry;
+    let actual_ttl_secs = entry.expires_at.saturating_sub(entry.stored_at);
+    let expected_ttl_secs = POS_CHALLENGE_TTL.as_secs();
+
+    assert_eq!(
+        actual_ttl_secs, expected_ttl_secs,
+        "PosChallenge entry TTL must equal POS_CHALLENGE_TTL ({expected_ttl_secs} s); \
+         got {actual_ttl_secs} s"
+    );
+}
+
+// ─── T-6 test: PosResponse via mailbox resolves pending challenge ─────────────
+
+/// Owner side: handle_pos_response_from_mailbox resolves a pending challenge.
+///
+/// Pass case: matching chain hash → placement transitions to last_verified set, status updated.
+/// Fail case: wrong chain hash → Fail path, repair trigger sent.
+#[tokio::test]
+async fn pos_response_via_mailbox_resolves_pending_challenge() {
+    use viaticum_core::pos::compute_chain_hash;
+
+    let db = Db::open_in_memory().expect("db open");
+    let block_id = make_block_id(0xC1);
+    let holder_id = make_identity(0xC2);
+    let challenge_id = [0x42u8; 16];
+
+    // Insert placement and peer record.
+    let mut placement = make_placement(block_id, holder_id);
+    placement.status = viaticum_core::types::PlacementStatus::Alive;
+    db.upsert_placement(&placement).unwrap();
+    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
+
+    // Compute a known expected_chain_hash using an arbitrary symbol.
+    // We don't need real erasure data here — just a hash that the response can match.
+    let dummy_esi: u32 = 0;
+    let dummy_symbol = b"dummy_symbol_data_for_pos_hash_test".as_slice();
+    let expected_chain_hash =
+        compute_chain_hash(&challenge_id, &[(dummy_esi, dummy_symbol)]).unwrap();
+
+    let pending = make_pending_challenges();
+    {
+        let mut guard = pending.lock().await;
+        guard.insert(
+            (block_id, holder_id),
+            PendingHashChallenge {
+                source_block_id: block_id,
+                holder_id,
+                esi_ranges: vec![(dummy_esi, 1)],
+                expected_chain_hash,
+                issued_at: Timestamp::now(),
+                challenge_id,
+            },
+        );
+    }
+
+    let (repair_tx, mut repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending.clone(),
+        relay_post_tx,
+        make_test_router(&db),
+        dummy_master_pub(),
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    );
+
+    // ── Pass case: correct chain_hash ────────────────────────────────────────
+    let pass_response = viaticum_core::messages::PosHashResponseMsg {
+        v: 1,
+        challenge_id,
+        chain_hash: expected_chain_hash, // correct hash = Pass
+        timestamp: Timestamp::now(),
+        device_id: Some(holder_id),
+    };
+
+    scheduler
+        .handle_pos_response_from_mailbox(pass_response)
+        .await
+        .expect("handle_pos_response_from_mailbox failed");
+
+    // Pending map must be empty after resolution.
+    assert!(
+        pending.lock().await.is_empty(),
+        "pending map must be empty after Pass response is consumed"
+    );
+
+    // Placement must have last_verified set (Pass outcome).
+    let updated = db
+        .get_placement(&block_id, &holder_id)
+        .unwrap()
+        .expect("placement exists after Pass");
+    assert!(
+        updated.last_verified.is_some(),
+        "Pass outcome must set last_verified on the placement"
+    );
+    // Status must not have degraded (was Alive, Pass → stays Alive).
+    assert_eq!(
+        updated.status,
+        PlacementStatus::Alive,
+        "Alive placement after Pass must remain Alive"
+    );
+    // No repair triggered for Pass.
+    assert!(
+        repair_rx.try_recv().is_err(),
+        "Pass outcome must NOT trigger repair"
+    );
+
+    // ── Fail case: wrong chain_hash ──────────────────────────────────────────
+    // Set up a fresh DB/pending state for the Fail variant.
+    let db2 = Db::open_in_memory().expect("db2 open");
+    let block_id2 = make_block_id(0xD1);
+    let holder_id2 = make_identity(0xD2);
+    let challenge_id2 = [0x99u8; 16];
+
+    let mut placement2 = make_placement(block_id2, holder_id2);
+    placement2.consecutive_misses = 2; // any Fail → Lost directly (misses reset to 0, repair=true)
+    placement2.status = PlacementStatus::Uncertain;
+    db2.upsert_placement(&placement2).unwrap();
+    db2.upsert_peer(&make_peer_record(holder_id2)).unwrap();
+
+    let expected_hash2 =
+        compute_chain_hash(&challenge_id2, &[(0u32, b"correct".as_slice())]).unwrap();
+    let pending2 = make_pending_challenges();
+    {
+        let mut guard = pending2.lock().await;
+        guard.insert(
+            (block_id2, holder_id2),
+            PendingHashChallenge {
+                source_block_id: block_id2,
+                holder_id: holder_id2,
+                esi_ranges: vec![(0, 1)],
+                expected_chain_hash: expected_hash2,
+                issued_at: Timestamp::now(),
+                challenge_id: challenge_id2,
+            },
+        );
+    }
+
+    let (repair_tx2, mut repair_rx2) = mpsc::channel::<RepairTrigger>(8);
+    let (relay_post_tx2, _relay_post_rx2) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
+    let signing_key2 = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let config2 = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+    };
+    let scheduler2 = Scheduler::new(
+        db2.clone(),
+        config2,
+        repair_tx2,
+        pending2.clone(),
+        relay_post_tx2,
+        make_test_router(&db2),
+        dummy_master_pub(),
+        signing_key2,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    );
+
+    // Send a response with the WRONG chain_hash → Fail outcome.
+    let wrong_hash = [0xFFu8; 32]; // definitely not expected_hash2
+    let fail_response = viaticum_core::messages::PosHashResponseMsg {
+        v: 1,
+        challenge_id: challenge_id2,
+        chain_hash: wrong_hash,
+        timestamp: Timestamp::now(),
+        device_id: Some(holder_id2),
+    };
+
+    scheduler2
+        .handle_pos_response_from_mailbox(fail_response)
+        .await
+        .expect("handle_pos_response_from_mailbox (fail) failed");
+
+    // Pending must be consumed.
+    assert!(
+        pending2.lock().await.is_empty(),
+        "pending map must be empty after Fail response is consumed"
+    );
+
+    // Placement must have degraded: Fail (wrong hash) → Lost directly (any Fail → Lost, misses=0).
+    // From apply_pos_outcome docstring: "Any + Fail → Lost, misses=0, repair=true".
+    let updated2 = db2
+        .get_placement(&block_id2, &holder_id2)
+        .unwrap()
+        .expect("placement2 exists after Fail");
+    assert_eq!(
+        updated2.status,
+        PlacementStatus::Lost,
+        "Fail (wrong chain hash) must → Lost regardless of consecutive_misses"
+    );
+
+    // Repair trigger must have been sent.
+    let trigger = repair_rx2
+        .try_recv()
+        .expect("Fail outcome must trigger repair (trigger_repair=true)");
+    match trigger {
+        RepairTrigger::RepairNow {
+            block_id: bid,
+            holder_id: hid,
+        } => {
+            assert_eq!(bid, block_id2);
+            assert_eq!(hid, holder_id2);
+        }
+        other => panic!("expected RepairNow after Fail, got {other:?}"),
+    }
+}
+
+// ─── T-6 test: pending timeout boundary is 14d2h not 7d1h ───────────────────
+
+/// Pins the POS_CHALLENGE_PENDING_TIMEOUT_SECS (14d2h) boundary.
+///
+/// A challenge issued `POS_CHALLENGE_PENDING_TIMEOUT_SECS - small` ago is NOT expired.
+/// A challenge issued `POS_CHALLENGE_PENDING_TIMEOUT_SECS + small` ago IS expired.
+///
+/// Uses time_scale = POS_CHALLENGE_PENDING_TIMEOUT_SECS so threshold = 1 second,
+/// then issues challenges at 0s ago (fresh) vs 5s ago (stale).
+#[tokio::test]
+async fn pos_pending_timeout_is_14d_2h_not_7d_1h() {
+    use viaticum_core::constants::POS_CHALLENGE_PENDING_TIMEOUT_SECS;
+
+    let db = Db::open_in_memory().expect("db open");
+    let block_id_fresh = make_block_id(0xE1);
+    let block_id_stale = make_block_id(0xE2);
+    let holder_fresh = make_identity(0xE3);
+    let holder_stale = make_identity(0xE4);
+
+    let placement_fresh = make_placement(block_id_fresh, holder_fresh);
+    let mut placement_stale = make_placement(block_id_stale, holder_stale);
+    placement_stale.consecutive_misses = 0;
+    db.upsert_placement(&placement_fresh).unwrap();
+    db.upsert_placement(&placement_stale).unwrap();
+
+    let pending = make_pending_challenges();
+    let now = Timestamp::now();
+
+    {
+        let mut guard = pending.lock().await;
+        // Fresh: issued right now (0s ago) — at threshold=1s, this is NOT timed out.
+        guard.insert(
+            (block_id_fresh, holder_fresh),
+            PendingHashChallenge {
+                source_block_id: block_id_fresh,
+                holder_id: holder_fresh,
+                esi_ranges: vec![(0, 1)],
+                expected_chain_hash: [0u8; 32],
+                issued_at: now,
+                challenge_id: [0xE1u8; 16],
+            },
+        );
+        // Stale: issued 5 seconds ago — at threshold=1s, this IS timed out.
+        guard.insert(
+            (block_id_stale, holder_stale),
+            PendingHashChallenge {
+                source_block_id: block_id_stale,
+                holder_id: holder_stale,
+                esi_ranges: vec![(0, 1)],
+                expected_chain_hash: [0u8; 32],
+                issued_at: Timestamp(now.0.saturating_sub(5)),
+                challenge_id: [0xE2u8; 16],
+            },
+        );
+    }
+
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+
+    // time_scale = POS_CHALLENGE_PENDING_TIMEOUT_SECS → threshold = 1 second.
+    // This directly pins the 14d2h constant: if code ever reverts to POS_TIMEOUT_SECS (7d),
+    // POS_TIMEOUT_SECS / POS_CHALLENGE_PENDING_TIMEOUT_SECS < 1 → threshold rounds to 1s still,
+    // but the constant used in the impl would differ. We verify POS_CHALLENGE_PENDING_TIMEOUT_SECS
+    // equals the expected 14d2h value (= 7d + 7d + 2h) explicitly below.
+    let expected_14d2h: u64 = 7 * 24 * 3600 + 7 * 24 * 3600 + 2 * 3600;
+    assert_eq!(
+        POS_CHALLENGE_PENDING_TIMEOUT_SECS, expected_14d2h,
+        "POS_CHALLENGE_PENDING_TIMEOUT_SECS must equal 14d2h ({expected_14d2h}s); \
+         if this fails, someone changed the constant — verify the design decision"
+    );
+
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: POS_CHALLENGE_PENDING_TIMEOUT_SECS,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending.clone(),
+        relay_post_tx,
+        make_test_router(&db),
+        dummy_master_pub(),
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    );
+
+    scheduler.check_timeouts().await.expect("check_timeouts");
+
+    let guard = pending.lock().await;
+
+    // Fresh challenge (0s old) must NOT have been timed out.
+    assert!(
+        guard.contains_key(&(block_id_fresh, holder_fresh)),
+        "fresh challenge (0s old) must NOT be expired at threshold=1s \
+         (boundary: POS_CHALLENGE_PENDING_TIMEOUT_SECS=14d2h)"
+    );
+
+    // Stale challenge (5s old) MUST have been timed out.
+    assert!(
+        !guard.contains_key(&(block_id_stale, holder_stale)),
+        "stale challenge (5s old) MUST be expired at threshold=1s \
+         (boundary: POS_CHALLENGE_PENDING_TIMEOUT_SECS=14d2h)"
+    );
+}
+
+// ─── T-6 test: SS blocks excluded from due challenges ────────────────────────
+
+/// SS blocks (registered in ss_block_id_set) must not receive PoS challenges.
+/// Normal blocks placed alongside them must still be challenged.
+#[tokio::test]
+async fn ss_blocks_excluded_from_due_challenges_via_existing_ss_block_id_set() {
+    let db = Db::open_in_memory().expect("db open");
+    let source_blocks_tmp = tempfile::TempDir::new().unwrap();
+
+    // Two blocks: one normal, one SS.
+    let normal_block_id = make_block_id(0xF1);
+    let ss_block_id = make_block_id(0xF2);
+    let normal_holder = make_identity(0xF3);
+    let ss_holder = make_identity(0xF4);
+
+    // Insert source block records + block.bin for both.
+    let normal_sbr = make_source_block_record(normal_block_id);
+    let ss_sbr = make_source_block_record(ss_block_id);
+    db.upsert_source_block(&normal_sbr).unwrap();
+    db.upsert_source_block(&ss_sbr).unwrap();
+    write_block_bin(source_blocks_tmp.path(), normal_block_id);
+    write_block_bin(source_blocks_tmp.path(), ss_block_id);
+
+    // Insert placements for both holders.
+    db.upsert_placement(&make_placement(normal_block_id, normal_holder))
+        .unwrap();
+    db.upsert_placement(&make_placement(ss_block_id, ss_holder))
+        .unwrap();
+    db.upsert_peer(&make_peer_record(normal_holder)).unwrap();
+    db.upsert_peer(&make_peer_record(ss_holder)).unwrap();
+
+    // Register ss_block_id in the SS ledger (generation=1).
+    db.mark_ss_block(&ss_block_id, 1).unwrap();
+
+    let recording_sender = Arc::new(RecordingMailboxSender::new());
+    let router = Arc::new(MailboxRouter::with_sender(
+        Arc::clone(&recording_sender) as Arc<dyn MailboxNetworkSender>,
+        db.clone(),
+    ));
+
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let pending = make_pending_challenges();
+
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending.clone(),
+        relay_post_tx,
+        router,
+        dummy_master_pub(),
+        signing_key,
+        source_blocks_tmp.path().to_path_buf(),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    );
+
+    scheduler
+        .issue_due_challenges()
+        .await
+        .expect("issue_due_challenges");
+
+    let requests = recording_sender.captured_requests();
+
+    // The normal block's holder must have received a challenge.
+    let normal_challenged = requests
+        .iter()
+        .any(|r| r.target == viaticum_core::types::IdentityPub(normal_holder.0));
+    assert!(
+        normal_challenged,
+        "normal block holder must be challenged via mailbox"
+    );
+
+    // The SS block's holder must NOT have received a challenge.
+    let ss_challenged = requests
+        .iter()
+        .any(|r| r.target == viaticum_core::types::IdentityPub(ss_holder.0));
+    assert!(
+        !ss_challenged,
+        "SS block holder must NOT be challenged (SS blocks excluded via ss_block_id_set)"
+    );
+
+    // Pending: normal block holder must be in pending, SS block holder must not be.
+    let guard = pending.lock().await;
+    let normal_pending = guard.contains_key(&(normal_block_id, normal_holder));
+    let ss_pending = guard.contains_key(&(ss_block_id, ss_holder));
+    assert!(
+        normal_pending,
+        "normal block placement must be in pending after challenge"
+    );
+    assert!(!ss_pending, "SS block placement must NOT be in pending");
+}
+
+// ─── T-6 test: W-3 — pending not created before mailbox store ack ─────────────
+
+/// W-3 invariant: pending entry is created ONLY after ≥1 MailboxStoreAck.
+///
+/// With NoOpMailboxSender (returns errors = 0 acks): no pending entry is created.
+/// With AckMailboxSender (returns Ack): pending entry IS created.
+#[tokio::test]
+async fn pending_challenge_not_created_before_mailbox_store_ack() {
+    let source_blocks_tmp = tempfile::TempDir::new().unwrap();
+    let block_id = make_block_id(0x77);
+    let holder_id = make_identity(0x78);
+
+    // ── Case 1: NoOpMailboxSender → 0 acks → no pending entry ────────────────
+    {
+        let db = Db::open_in_memory().expect("db open");
+        let sbr = make_source_block_record(block_id);
+        db.upsert_source_block(&sbr).unwrap();
+        write_block_bin(source_blocks_tmp.path(), block_id);
+        db.upsert_placement(&make_placement(block_id, holder_id))
+            .unwrap();
+        db.upsert_peer(&make_peer_record(holder_id)).unwrap();
+
+        let router = Arc::new(MailboxRouter::with_sender(
+            Arc::new(NoOpMailboxSender) as Arc<dyn MailboxNetworkSender>,
+            db.clone(),
+        ));
+
+        let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+        let (relay_post_tx, _relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let pending = make_pending_challenges();
+
+        let config = SchedulerConfig {
+            pos_interval_secs: 3600,
+            timeout_check_secs: 3600,
+            time_scale: 1,
+            event_log_retain_rows: 100_000,
+            pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+        };
+        let scheduler = Scheduler::new(
+            db.clone(),
+            config,
+            repair_tx,
+            pending.clone(),
+            relay_post_tx,
+            router,
+            dummy_master_pub(),
+            ed25519_dalek::SigningKey::from_bytes(&signing_key.to_bytes()),
+            source_blocks_tmp.path().to_path_buf(),
+            crate::daemon::processor::make_empty_accepted_offers(),
+            make_test_encoder(),
+            TEST_EPOCH_KEY,
+            std::env::temp_dir(),
+        );
+
+        scheduler
+            .issue_due_challenges()
+            .await
+            .expect("issue_due_challenges (0 acks)");
+
+        assert!(
+            pending.lock().await.is_empty(),
+            "W-3: with 0 acks, pending map must remain empty — challenge is not confirmed delivered"
+        );
+    }
+
+    // ── Case 2: AckMailboxSender → ≥1 ack → pending entry IS created ─────────
+    {
+        let db = Db::open_in_memory().expect("db open (ack case)");
+        let sbr = make_source_block_record(block_id);
+        db.upsert_source_block(&sbr).unwrap();
+        write_block_bin(source_blocks_tmp.path(), block_id);
+        db.upsert_placement(&make_placement(block_id, holder_id))
+            .unwrap();
+        db.upsert_peer(&make_peer_record(holder_id)).unwrap();
+
+        let router = Arc::new(MailboxRouter::with_sender(
+            Arc::new(AckMailboxSender) as Arc<dyn MailboxNetworkSender>,
+            db.clone(),
+        ));
+
+        let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+        let (relay_post_tx, _relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let pending = make_pending_challenges();
+
+        let config = SchedulerConfig {
+            pos_interval_secs: 3600,
+            timeout_check_secs: 3600,
+            time_scale: 1,
+            event_log_retain_rows: 100_000,
+            pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+        };
+        let scheduler = Scheduler::new(
+            db.clone(),
+            config,
+            repair_tx,
+            pending.clone(),
+            relay_post_tx,
+            router,
+            dummy_master_pub(),
+            signing_key,
+            source_blocks_tmp.path().to_path_buf(),
+            crate::daemon::processor::make_empty_accepted_offers(),
+            make_test_encoder(),
+            TEST_EPOCH_KEY,
+            std::env::temp_dir(),
+        );
+
+        scheduler
+            .issue_due_challenges()
+            .await
+            .expect("issue_due_challenges (ack)");
+
+        assert!(
+            !pending.lock().await.is_empty(),
+            "W-3: with ≥1 ack, pending map must contain the challenge entry"
+        );
+
+        // Verify the pending entry has the right block/holder.
+        let guard = pending.lock().await;
+        assert!(
+            guard.contains_key(&(block_id, holder_id)),
+            "pending entry must be keyed by (block_id, holder_id)"
+        );
+    }
 }
 
 // ─── Stub network helper ──────────────────────────────────────────────────────
