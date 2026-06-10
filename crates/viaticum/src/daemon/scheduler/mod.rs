@@ -1278,6 +1278,11 @@ fn random_challenge_id() -> [u8; 16] {
 /// Derived from SHA256(block_id || holder_master || domain), truncated to 16 bytes.
 /// The holder's apply is idempotent on (block_id, owner) + status-guard, not on
 /// msg_id, so a stable id does not change holder-side behaviour.
+///
+/// LOAD-BEARING dependency: the stored-but-ack-lost retry relies on the postman
+/// returning **Ack** on a duplicate store (`processor/mailbox::handle_mailbox_store`),
+/// since `MailboxRouter::publish` counts only Acks. If that ever becomes
+/// `Reject{Duplicate}`, this retry path would starve until TTL/sweep.
 fn stable_delete_msg_id(block: &SourceBlockId, holder_master: &IdentityPub) -> [u8; 16] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

@@ -1344,8 +1344,10 @@ async fn multi_holder_delete_retries_only_unacked_holder() {
 }
 
 /// H3 completion: once all placements are Deleting, after the holder cooldown the
-/// engine emits CleanupPlacement for each and then CleanupBlock — the block is no
-/// longer stuck; its row is removed.
+/// engine emits CleanupPlacement for each and then CleanupBlock — proving the block
+/// is no longer stuck. This asserts the engine ACTIONS (CleanupPlacement ×n then
+/// CleanupBlock); actual row removal by the scheduler arm is covered by
+/// `cleanup_block_removes_files_from_disk`.
 #[tokio::test]
 async fn multi_holder_block_reaches_cleanup_when_all_holders_deleting() {
     use viaticum_core::constants::{HOLDER_DELETE_COOLDOWN_SECS, OWNER_DELETE_COOLDOWN_SECS};

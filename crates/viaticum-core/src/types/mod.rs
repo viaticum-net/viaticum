@@ -283,8 +283,10 @@ pub struct SourceBlockRecord {
     /// None for records created before this field was added (legacy).
     #[serde(default)]
     pub overhead: Option<f64>,
-    /// Timestamp when SymbolDropNotice was first sent to holders for this block.
-    /// Set on first send; prevents re-sending on subsequent scheduler ticks.
+    /// DEAD since H3 (2026-06-10): was a per-block dedup gate that wrongly skipped
+    /// holders 2..n of a multi-holder block. Deletion dedup is now per-(block,holder)
+    /// via the engine's `status != Deleting` filter; this field is no longer written
+    /// or read. Kept for serde compatibility (drop at the next wire-format break).
     #[serde(default)]
     pub drop_notice_sent_at: Option<Timestamp>,
 
