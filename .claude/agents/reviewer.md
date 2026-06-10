@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: Reviews implemented code for correctness, convention compliance, and protocol conformance.
-model: sonnet
+model: fable
 tools: Read, Bash, Grep, Glob
 ---
 

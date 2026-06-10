@@ -1,7 +1,7 @@
 ---
 name: implementer
 description: Implements Rust modules from a task spec. Writes code + unit tests. Builds/tests on the remote server.
-model: sonnet
+model: opus
 tools: Read, Write, Edit, Bash, Grep, Glob
 ---
 
