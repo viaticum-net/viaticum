@@ -788,10 +788,16 @@ async fn delete_request_forged_signature_rejected() {
     );
 }
 
-/// delete_request_stale_timestamp_rejected:
-/// Freshness check still applies — entry older than MESSAGE_FRESHNESS_SECS is dropped.
+/// delete_request_stale_timestamp_still_honored (T-13 H1(b) regression):
+/// A DeleteMsg older than MESSAGE_FRESHNESS_SECS must STILL be honored via the
+/// mailbox dispatch path. DeleteRequest entries live in the mailbox for
+/// DELETE_REQUEST_TTL (14d) and the design time-constant is one WEEK, so a holder
+/// offline for hours/days is the normal cold-backup case. The previous 1h wall-clock
+/// freshness gate (removed in H1) wrongly rejected these legitimately-delayed Deletes
+/// as "replay" and the owner's erasure request was silently lost. Replay protection
+/// is now the signature + the entry TTL + the Active→MarkedForDelete status-guard.
 #[tokio::test]
-async fn delete_request_stale_timestamp_rejected() {
+async fn delete_request_stale_timestamp_still_honored() {
     use viaticum_core::constants::MESSAGE_FRESHNESS_SECS;
     use viaticum_core::mailbox::DeleteRequestPayload;
     use viaticum_core::types::HoldingStatus;
@@ -804,7 +810,8 @@ async fn delete_request_stale_timestamp_rejected() {
     // Insert an Active holding.
     make_holding(&db, block_id, owner_master, HoldingStatus::Active);
 
-    // Build a DeleteMsg with a stale timestamp (way in the past).
+    // Build a DeleteMsg with a stale timestamp (way beyond the old 1h window) but
+    // well within the 14d DELETE_REQUEST_TTL.
     let stale_timestamp = Timestamp(
         Timestamp::now()
             .0
@@ -837,8 +844,12 @@ async fn delete_request_stale_timestamp_rejected() {
         .expect("exists");
     assert_eq!(
         holding.status,
-        HoldingStatus::Active,
-        "delete_request_stale_timestamp_rejected: holding must remain Active (stale msg rejected)"
+        HoldingStatus::MarkedForDelete,
+        "delete_request_stale_timestamp_still_honored: stale-but-signed Delete must mark holding for deletion"
+    );
+    assert!(
+        holding.delete_requested_at.is_some(),
+        "delete_request_stale_timestamp_still_honored: delete_requested_at must be set"
     );
 }
 

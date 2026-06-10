@@ -438,31 +438,27 @@ impl DeleteMailboxHandler for ProcessorDeleteHandler {
     }
 }
 
-/// Core Delete logic: freshness check → sig verify → Active→MarkedForDelete.
+/// Core Delete logic: sig verify → Active→MarkedForDelete.
 ///
-/// Extracted from `Processor::handle_delete` for reuse by the mailbox path.
-/// Both relay and mailbox paths call this so logic is never duplicated.
+/// Reached ONLY via the mailbox poll dispatch (`ProcessorDeleteHandler`) after the
+/// T-13 relay cut-over. There is no wall-clock freshness gate here on purpose:
+/// the DeleteRequest is a store-and-forward mailbox entry with `DELETE_REQUEST_TTL`
+/// (14d) and the system time-constant is one WEEK, so a holder that was offline for
+/// hours/days is the NORMAL cold-backup case — a 1h `MESSAGE_FRESHNESS_SECS` gate
+/// here wrongly rejected legitimately-delayed Deletes as "replay" and the holding
+/// was never marked for deletion. Replay is harmless without the gate: the signature
+/// (`verify_delete_msg` against the entry sender) prevents forgery; the entry's own
+/// TTL bounds re-delivery (postmen drop it after 14d); and the `Active→MarkedForDelete`
+/// status-guard makes re-application idempotent (no-op when already MarkedForDelete /
+/// Deleted / absent).
 pub(crate) fn apply_delete(
     db: &Db,
     from: viaticum_core::types::IdentityPub,
     delete: viaticum_core::messages::DeleteMsg,
 ) {
-    use viaticum_core::constants::MESSAGE_FRESHNESS_SECS;
     use viaticum_core::types::{HoldingStatus, Timestamp};
 
     let block_id = delete.source_block_id;
-
-    let now = Timestamp::now();
-    let age = now.0.saturating_sub(delete.timestamp.0);
-    if age > MESSAGE_FRESHNESS_SECS {
-        warn!(
-            block_id = %block_id,
-            owner = %from,
-            age_secs = age,
-            "processor: Delete rejected — timestamp too old (possible replay)"
-        );
-        return;
-    }
 
     if let Err(e) = viaticum_core::messages::verify_delete_msg(&delete, &from) {
         warn!(
@@ -520,30 +516,23 @@ pub(crate) fn apply_delete(
     }
 }
 
-/// Core CancelDelete logic: freshness check → sig verify → MarkedForDelete→Active.
+/// Core CancelDelete logic: sig verify → MarkedForDelete→Active.
 ///
-/// Extracted from `Processor::handle_cancel_delete` for reuse by the mailbox path.
+/// Same mailbox store-and-forward path as `apply_delete`; the wall-clock
+/// `MESSAGE_FRESHNESS_SECS` gate is removed here for the same reason (14d TTL vs
+/// 1h window, legitimately-delayed entries are the normal case). Replay is bounded
+/// by the signature, the entry TTL, and the `MarkedForDelete→Active` status-guard
+/// idempotency. (Cross-message Delete-vs-CancelDelete ordering — last-writer-wins
+/// by timestamp — is a SEPARATE latent followup, not addressed here; CancelDelete
+/// has no producer yet.)
 pub(crate) fn apply_cancel_delete(
     db: &Db,
     from: viaticum_core::types::IdentityPub,
     cancel: viaticum_core::messages::CancelDeleteMsg,
 ) {
-    use viaticum_core::constants::MESSAGE_FRESHNESS_SECS;
-    use viaticum_core::types::{HoldingStatus, Timestamp};
+    use viaticum_core::types::HoldingStatus;
 
     let block_id = cancel.source_block_id;
-
-    let now = Timestamp::now();
-    let age = now.0.saturating_sub(cancel.timestamp.0);
-    if age > MESSAGE_FRESHNESS_SECS {
-        warn!(
-            block_id = %block_id,
-            owner = %from,
-            age_secs = age,
-            "processor: CancelDelete rejected — timestamp too old (possible replay)"
-        );
-        return;
-    }
 
     if let Err(e) = viaticum_core::messages::verify_cancel_delete_msg(&cancel, &from) {
         warn!(

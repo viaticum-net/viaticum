@@ -920,7 +920,11 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
 
     let db = Db::open_in_memory().unwrap();
     let block_id = make_block_id(0xE1);
-    let holder_id = make_identity(0xE2);
+    // Real Ed25519 key so device_id_to_peer_id succeeds and the Ack-returning sender
+    // is actually reached (H1: drop_notice_sent_at is now gated on ≥1 ack, so the
+    // dedup behaviour can only be asserted when the first tick actually delivers).
+    let holder_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xE2u8; 32]);
+    let holder_id = DeviceId(holder_signing_key.verifying_key().to_bytes());
     let device_id = DeviceId([0x01; 32]);
 
     // File: all devices deleted, deleted_at = 0 (well past owner cooldown).
@@ -993,12 +997,18 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
         event_log_retain_rows: 100_000,
         pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
     };
+    // Ack-returning recording sender: first tick delivers (≥1 ack) → state advances.
+    let recording_sender = Arc::new(RecordingMailboxSender::new());
+    let router = Arc::new(MailboxRouter::with_sender(
+        Arc::clone(&recording_sender) as Arc<dyn MailboxNetworkSender>,
+        db.clone(),
+    ));
     let scheduler = Scheduler::new(
         db.clone(),
         config,
         repair_tx,
         pending,
-        make_test_router(&db),
+        router,
         dummy_master_pub(),
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
@@ -1008,18 +1018,207 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
         std::env::temp_dir(),
     );
 
-    // First tick: should publish a DeleteRequest via mailbox.
+    // First tick: should publish a DeleteRequest via mailbox (Ack → state advances).
     scheduler.process_deletion_tick().await.unwrap();
 
-    // drop_notice_sent_at must now be set.
+    // drop_notice_sent_at must now be set (publish got ≥1 ack).
     let updated_sb = db.get_source_block(&block_id).unwrap().unwrap();
     assert!(
         updated_sb.drop_notice_sent_at.is_some(),
         "drop_notice_sent_at must be set after first tick"
     );
+    let publishes_after_first = recording_sender
+        .captured_requests()
+        .iter()
+        .filter(|r| r.entry.class == viaticum_core::mailbox::MailboxClass::DeleteRequest)
+        .count();
+    assert_eq!(
+        publishes_after_first, 1,
+        "exactly one DeleteRequest publish on the first tick"
+    );
 
     // Second tick: must NOT send another message (dedup via drop_notice_sent_at).
     scheduler.process_deletion_tick().await.unwrap();
+    let publishes_after_second = recording_sender
+        .captured_requests()
+        .iter()
+        .filter(|r| r.entry.class == viaticum_core::mailbox::MailboxClass::DeleteRequest)
+        .count();
+    assert_eq!(
+        publishes_after_second, 1,
+        "second tick must dedup — no additional DeleteRequest publish"
+    );
+}
+
+/// Counting mailbox sender that records every send_store attempt and always fails
+/// (0 acks). Used to assert the ack-gate retry path: the scheduler must re-attempt
+/// the publish on a subsequent tick when delivery failed.
+struct CountingFailMailboxSender {
+    store_attempts: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingFailMailboxSender {
+    fn new() -> Self {
+        CountingFailMailboxSender {
+            store_attempts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn attempts(&self) -> usize {
+        self.store_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl MailboxNetworkSender for CountingFailMailboxSender {
+    async fn send_store(
+        &self,
+        _device: DeviceId,
+        _req: MailboxStoreRequest,
+    ) -> anyhow::Result<MailboxStoreResponse> {
+        self.store_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::bail!("counting-fail sender: simulated undelivered store (0 acks)")
+    }
+    async fn send_fetch(
+        &self,
+        _device: DeviceId,
+        _req: MailboxFetchRequest,
+    ) -> anyhow::Result<MailboxFetchResponse> {
+        anyhow::bail!("counting-fail sender: fetch not used")
+    }
+}
+
+/// T-13 H1(a) regression: when the DeleteMsg publish yields 0 acks, the scheduler
+/// must NOT mark the block as "drop notice sent" and must NOT transition
+/// placement/source_block to Deleting — otherwise the dedup gate skips the block
+/// forever and the owner's erasure request is silently lost. The block must remain
+/// eligible so a subsequent tick re-attempts delivery (natural retry).
+#[tokio::test]
+async fn delete_not_marked_sent_when_publish_zero_acks() {
+    use viaticum_core::types::{
+        DeviceId, FileRecord, FileVersion, LocalState, SourceBlockRecord, SourceBlockStatus,
+        SourceBlockType,
+    };
+
+    let db = Db::open_in_memory().unwrap();
+    let block_id = make_block_id(0xF3);
+    // Real Ed25519 key so device_id_to_peer_id yields a candidate and publish
+    // actually attempts a send_store (which the counting sender fails → 0 acks).
+    let holder_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xF4u8; 32]);
+    let holder_id = DeviceId(holder_signing_key.verifying_key().to_bytes());
+    let device_id = DeviceId([0x01; 32]);
+
+    let file = FileRecord {
+        file_id: FileId(303),
+        path: "zero_acks.txt".to_string(),
+        importance: 0.5,
+        devices: vec![(device_id, LocalState::Deleted(Timestamp(0)))],
+        versions: vec![FileVersion {
+            content_hash: [0; 32],
+            source_block_id: block_id,
+            k: 100,
+            t: 65535,
+            created_at: Timestamp(0),
+            backed_up_at: Some(Timestamp(0)),
+        }],
+        first_seen: Timestamp(0),
+    };
+    db.upsert_file(&file).unwrap();
+
+    let sb = SourceBlockRecord {
+        block_id,
+        k: 100,
+        t: 65535,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(0),
+        encrypted_size: None,
+        n: None,
+        overhead: None,
+        drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+    };
+    db.upsert_source_block(&sb).unwrap();
+
+    let placement = make_placement(block_id, holder_id);
+    db.upsert_placement(&placement).unwrap();
+
+    let peer = make_peer_record(holder_id);
+    db.upsert_peer(&peer).unwrap();
+
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
+    let counting_sender = Arc::new(CountingFailMailboxSender::new());
+    let router = Arc::new(MailboxRouter::with_sender(
+        Arc::clone(&counting_sender) as Arc<dyn MailboxNetworkSender>,
+        db.clone(),
+    ));
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let pending = make_pending_challenges();
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending,
+        router,
+        dummy_master_pub(),
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    );
+
+    // First tick: publish fails (0 acks).
+    scheduler.process_deletion_tick().await.unwrap();
+    assert!(
+        counting_sender.attempts() >= 1,
+        "first tick must attempt to publish the DeleteMsg"
+    );
+
+    // State must NOT have advanced — block stays eligible for retry.
+    let sb_after = db.get_source_block(&block_id).unwrap().unwrap();
+    assert!(
+        sb_after.drop_notice_sent_at.is_none(),
+        "drop_notice_sent_at must stay None when publish got 0 acks"
+    );
+    assert_eq!(
+        sb_after.status,
+        SourceBlockStatus::Active,
+        "source block must stay Active (not transitioned to Deleting) on 0 acks"
+    );
+    let placement_after = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
+    assert_eq!(
+        placement_after.status,
+        PlacementStatus::Alive,
+        "placement must stay Alive (not Deleting) on 0 acks"
+    );
+
+    // Second tick: the block is still eligible, so the scheduler must re-attempt.
+    let attempts_before_second = counting_sender.attempts();
+    scheduler.process_deletion_tick().await.unwrap();
+    assert!(
+        counting_sender.attempts() > attempts_before_second,
+        "second tick must re-attempt publish (block not skipped by dedup gate after 0-ack failure)"
+    );
+    // Still not advanced (still 0 acks).
+    let sb_after2 = db.get_source_block(&block_id).unwrap().unwrap();
+    assert!(
+        sb_after2.drop_notice_sent_at.is_none(),
+        "drop_notice_sent_at must remain None across repeated 0-ack ticks"
+    );
 }
 
 // ─── D4: cleanup_block_removes_files_from_disk ───────────────────────────────

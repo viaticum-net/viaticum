@@ -1208,6 +1208,86 @@ async fn handle_delete_rejects_invalid_signature() {
     assert_eq!(updated.status, HoldingStatus::Active);
 }
 
+/// T-13 H1(b) regression: a DeleteMsg whose timestamp is far older than
+/// MESSAGE_FRESHNESS_SECS (1h) must STILL be honored. DeleteRequest entries live
+/// in the mailbox for DELETE_REQUEST_TTL (14d) and the design time-constant is one
+/// WEEK — a holder offline for hours/days is the normal cold-backup case. The old
+/// 1h wall-clock gate wrongly rejected these as "replay" so the holding was never
+/// marked for deletion. Replay protection is the signature + entry TTL + status-guard.
+#[tokio::test]
+async fn delete_applied_even_when_older_than_message_freshness() {
+    let db = Db::open_in_memory().unwrap();
+
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0xE5);
+
+    let holding = HoldingRecord {
+        source_block_id: block_id,
+        owner_id,
+        esi_ranges: vec![(0, 10)],
+        importance: 0.5,
+        total_bytes: 1000,
+        status: HoldingStatus::Active,
+        received_at: Timestamp(100),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&holding).unwrap();
+
+    // Timestamp 8 days in the past — well beyond MESSAGE_FRESHNESS_SECS (3600s),
+    // but well within DELETE_REQUEST_TTL (14d). 8 days = 8 * 86400s.
+    let stale_ts = Timestamp(Timestamp::now().0.saturating_sub(8 * 86_400));
+    let age = Timestamp::now().0.saturating_sub(stale_ts.0);
+    assert!(
+        age > viaticum_core::constants::MESSAGE_FRESHNESS_SECS,
+        "test setup: timestamp must be older than MESSAGE_FRESHNESS_SECS \
+         (age={age} must exceed {})",
+        viaticum_core::constants::MESSAGE_FRESHNESS_SECS
+    );
+
+    let delete_msg = viaticum_core::messages::build_delete_msg(block_id, stale_ts, &owner_key);
+    super::symbol::apply_delete(&db, owner_id, delete_msg);
+
+    // Despite the stale timestamp, the holding must transition Active→MarkedForDelete.
+    let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
+    assert_eq!(updated.status, HoldingStatus::MarkedForDelete);
+    assert!(updated.delete_requested_at.is_some());
+}
+
+/// Forged-signature DeleteMsg is still rejected even with a fresh timestamp — sig
+/// enforcement is unaffected by removing the freshness gate.
+#[tokio::test]
+async fn delete_rejects_forged_signature_after_freshness_removed() {
+    let db = Db::open_in_memory().unwrap();
+
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
+    let attacker_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let block_id = make_block_id(0xE6);
+
+    let holding = HoldingRecord {
+        source_block_id: block_id,
+        owner_id,
+        esi_ranges: vec![(0, 10)],
+        importance: 0.5,
+        total_bytes: 1000,
+        status: HoldingStatus::Active,
+        received_at: Timestamp(100),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&holding).unwrap();
+
+    // Signed by the attacker but attributed to owner_id → sig must fail.
+    let delete_msg =
+        viaticum_core::messages::build_delete_msg(block_id, Timestamp::now(), &attacker_key);
+    super::symbol::apply_delete(&db, owner_id, delete_msg);
+
+    let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
+    assert_eq!(updated.status, HoldingStatus::Active);
+}
+
 // ─── handle_cancel_delete tests ───────────────────────────────────────────────
 
 #[tokio::test]
@@ -1299,6 +1379,48 @@ async fn handle_cancel_delete_rejects_bad_sig() {
     // Should remain MarkedForDelete (bad sig).
     let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
     assert_eq!(updated.status, HoldingStatus::MarkedForDelete);
+}
+
+/// T-13 H1(b) regression (cancel path): a CancelDeleteMsg older than
+/// MESSAGE_FRESHNESS_SECS must STILL be honored — same mailbox store-and-forward
+/// rationale as `delete_applied_even_when_older_than_message_freshness`.
+#[tokio::test]
+async fn cancel_delete_applied_even_when_older_than_message_freshness() {
+    let db = Db::open_in_memory().unwrap();
+
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0xE7);
+
+    let holding = HoldingRecord {
+        source_block_id: block_id,
+        owner_id,
+        esi_ranges: vec![(0, 10)],
+        importance: 0.5,
+        total_bytes: 1000,
+        status: HoldingStatus::MarkedForDelete,
+        received_at: Timestamp(100),
+        delete_requested_at: Some(Timestamp(200)),
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&holding).unwrap();
+
+    // 8 days old — beyond the 1h freshness window, within the 14d TTL.
+    let stale_ts = Timestamp(Timestamp::now().0.saturating_sub(8 * 86_400));
+    assert!(
+        Timestamp::now().0.saturating_sub(stale_ts.0)
+            > viaticum_core::constants::MESSAGE_FRESHNESS_SECS,
+        "test setup: timestamp must be older than MESSAGE_FRESHNESS_SECS"
+    );
+
+    let cancel_msg =
+        viaticum_core::messages::build_cancel_delete_msg(block_id, stale_ts, &owner_key);
+    super::symbol::apply_cancel_delete(&db, owner_id, cancel_msg);
+
+    // Despite the stale timestamp, the holding must revert MarkedForDelete→Active.
+    let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
+    assert_eq!(updated.status, HoldingStatus::Active);
+    assert!(updated.delete_requested_at.is_none());
 }
 
 // ─── handle_symbol_drop_notice test ───────────────────────────────────────────

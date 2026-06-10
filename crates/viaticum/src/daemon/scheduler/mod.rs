@@ -987,6 +987,14 @@ impl Scheduler {
                         .flatten()
                         .unwrap_or(IdentityPub(holder_id.0));
                     let delete_payload = DeleteRequestPayload::Delete(delete_msg);
+                    // Publish FIRST, then gate the state-change txn on delivery success.
+                    // mailbox publish is REMOTE (unlike the relay-era guaranteed local
+                    // board store) and can genuinely yield 0 acks / Err — in that case
+                    // we must NOT advance state (which would set drop_notice_sent_at and
+                    // make the dedup gate above skip this block forever). Leave the block
+                    // in its prior state so the deletion engine re-emits SendDropNotice on
+                    // the next tick — natural retry.
+                    let mut publish_ok = false;
                     if let Ok(payload_bytes) = to_cbor(&delete_payload) {
                         let mut msg_id = [0u8; 16];
                         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
@@ -1007,21 +1015,36 @@ impl Scheduler {
                             Ok(0) => warn!(
                                 block_id = %source_block_id,
                                 holder = %holder_master,
-                                "scheduler: DeleteMsg publish got 0 acks — will retry on next tick"
+                                "scheduler: DeleteMsg publish got 0 acks — deletion not sent, will retry next tick"
                             ),
-                            Ok(ack_count) => debug!(
-                                block_id = %source_block_id,
-                                holder = %holder_master,
-                                ack_count,
-                                "scheduler: DeleteMsg published via mailbox"
-                            ),
+                            Ok(ack_count) => {
+                                publish_ok = true;
+                                debug!(
+                                    block_id = %source_block_id,
+                                    holder = %holder_master,
+                                    ack_count,
+                                    "scheduler: DeleteMsg published via mailbox"
+                                );
+                            }
                             Err(e) => warn!(
                                 block_id = %source_block_id,
                                 holder = %holder_master,
                                 err = %e,
-                                "scheduler: DeleteMsg mailbox publish failed"
+                                "scheduler: DeleteMsg mailbox publish failed — deletion not sent, will retry next tick"
                             ),
                         }
+                    } else {
+                        error!(
+                            block_id = %source_block_id,
+                            "deletion: failed to encode DeleteMsg payload — will retry next tick"
+                        );
+                    }
+
+                    // Only advance state if the DeleteMsg was actually delivered (≥1 ack).
+                    // On 0 acks / Err / encode failure leave the block untouched so the
+                    // next tick re-attempts (no drop_notice_sent_at, no Deleting transition).
+                    if !publish_ok {
+                        continue;
                     }
 
                     // Mark placement + source block Deleting, record drop_notice_sent_at atomically.
