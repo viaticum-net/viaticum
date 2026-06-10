@@ -907,12 +907,15 @@ async fn scheduler_does_not_transition_offered_to_lost_before_long_absence() {
     );
 }
 
-// ─── D3: drop_notice dedup tests ──────────────────────────────────────────────
+// ─── D3: per-(block,holder) delete dedup tests ───────────────────────────────
 
-/// Drop notice is sent only once even when process_deletion_tick is called twice.
-/// On the second tick, drop_notice_sent_at is Some → skip sending.
+/// H3 rework of the former per-BLOCK dedup test. The dedup is now per-(block,
+/// holder): once a holder's placement is Deleting (it acked on the first tick),
+/// the engine no longer emits SendDropNotice for it, so the scheduler does NOT
+/// re-publish to that holder on later ticks. (The old test asserted a per-block
+/// `drop_notice_sent_at` gate; that gate was the H3 bug and has been removed.)
 #[tokio::test]
-async fn drop_notice_sent_only_once_when_tick_called_twice() {
+async fn already_deleting_holder_is_not_republished() {
     use viaticum_core::types::{
         DeviceId, FileRecord, FileVersion, LocalState, SourceBlockRecord, SourceBlockStatus,
         SourceBlockType,
@@ -921,8 +924,7 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
     let db = Db::open_in_memory().unwrap();
     let block_id = make_block_id(0xE1);
     // Real Ed25519 key so device_id_to_peer_id succeeds and the Ack-returning sender
-    // is actually reached (H1: drop_notice_sent_at is now gated on ≥1 ack, so the
-    // dedup behaviour can only be asserted when the first tick actually delivers).
+    // is actually reached (delivery gated on ≥1 ack).
     let holder_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xE2u8; 32]);
     let holder_id = DeviceId(holder_signing_key.verifying_key().to_bytes());
     let device_id = DeviceId([0x01; 32]);
@@ -945,7 +947,7 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
     };
     db.upsert_file(&file).unwrap();
 
-    // Source block: Active, drop_notice_sent_at = None.
+    // Source block: Active.
     let sb = SourceBlockRecord {
         block_id,
         k: 10,
@@ -969,23 +971,7 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
     db.upsert_placement(&placement).unwrap();
 
     // Peer record.
-    let peer = viaticum_core::types::PeerRecord {
-        device_id: holder_id,
-        master_identity: viaticum_core::types::IdentityPub(holder_id.0),
-        trust_p: 0.5,
-        trust_i: 0.0,
-        trust_s: 1.0,
-        bytes_we_store_for_peer: 0,
-        bytes_peer_stores_for_us: 0,
-        first_seen: Timestamp(0),
-        last_seen: Timestamp(0),
-        revoked_device_pub_keys: vec![],
-        addrs: vec![],
-        x25519_pub: None,
-        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
-        last_avail_sample: 0,
-    };
-    db.upsert_peer(&peer).unwrap();
+    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
@@ -1018,14 +1004,21 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
         std::env::temp_dir(),
     );
 
-    // First tick: should publish a DeleteRequest via mailbox (Ack → state advances).
+    // First tick: should publish a DeleteRequest via mailbox (Ack → placement → Deleting).
     scheduler.process_deletion_tick().await.unwrap();
 
-    // drop_notice_sent_at must now be set (publish got ≥1 ack).
+    // The holder's placement must now be Deleting and the block promoted to Deleting.
+    let updated_p = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
+    assert_eq!(
+        updated_p.status,
+        PlacementStatus::Deleting,
+        "holder placement must transition to Deleting after a successful publish"
+    );
     let updated_sb = db.get_source_block(&block_id).unwrap().unwrap();
-    assert!(
-        updated_sb.drop_notice_sent_at.is_some(),
-        "drop_notice_sent_at must be set after first tick"
+    assert_eq!(
+        updated_sb.status,
+        SourceBlockStatus::Deleting,
+        "source block must be promoted to Deleting after the first holder acks"
     );
     let publishes_after_first = recording_sender
         .captured_requests()
@@ -1037,7 +1030,8 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
         "exactly one DeleteRequest publish on the first tick"
     );
 
-    // Second tick: must NOT send another message (dedup via drop_notice_sent_at).
+    // Second tick: the (single) holder is already Deleting, so the engine emits no
+    // SendDropNotice for it → no additional publish (per-(block,holder) dedup).
     scheduler.process_deletion_tick().await.unwrap();
     let publishes_after_second = recording_sender
         .captured_requests()
@@ -1046,7 +1040,416 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
         .count();
     assert_eq!(
         publishes_after_second, 1,
-        "second tick must dedup — no additional DeleteRequest publish"
+        "an already-Deleting placement must not be re-published"
+    );
+}
+
+// ─── H3: multi-holder deletion reaches every holder ──────────────────────────
+
+/// Recording sender that returns Ack for every target EXCEPT those in `fail_targets`
+/// (for which it records the request but returns an Err → 0 acks). Used to assert
+/// per-holder retry: the unacked holder stays Active and is re-attempted next tick.
+struct SelectiveMailboxSender {
+    captured: std::sync::Mutex<Vec<viaticum_core::messages::MailboxStoreRequest>>,
+    fail_targets: std::sync::Mutex<std::collections::HashSet<IdentityPub>>,
+}
+
+impl SelectiveMailboxSender {
+    fn new() -> Self {
+        SelectiveMailboxSender {
+            captured: std::sync::Mutex::new(Vec::new()),
+            fail_targets: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    fn fail_for(&self, target: IdentityPub) {
+        self.fail_targets.lock().unwrap().insert(target);
+    }
+
+    fn captured_requests(&self) -> Vec<viaticum_core::messages::MailboxStoreRequest> {
+        self.captured.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl MailboxNetworkSender for SelectiveMailboxSender {
+    async fn send_store(
+        &self,
+        _device: DeviceId,
+        req: viaticum_core::messages::MailboxStoreRequest,
+    ) -> anyhow::Result<viaticum_core::messages::MailboxStoreResponse> {
+        let target = req.entry.target;
+        let msg_id = req.entry.msg_id;
+        self.captured.lock().unwrap().push(req);
+        if self.fail_targets.lock().unwrap().contains(&target) {
+            anyhow::bail!("selective sender: simulated 0-ack for target {target}")
+        }
+        Ok(viaticum_core::messages::MailboxStoreResponse::Ack { msg_id })
+    }
+    async fn send_fetch(
+        &self,
+        _device: DeviceId,
+        _req: MailboxFetchRequest,
+    ) -> anyhow::Result<MailboxFetchResponse> {
+        anyhow::bail!("selective sender: fetch not used")
+    }
+}
+
+/// Make a holder identity backed by a REAL Ed25519 key (so device_id_to_peer_id
+/// succeeds and the holder is a usable mailbox candidate) plus its peer record.
+fn make_real_holder(seed: u8) -> (DeviceId, IdentityPub) {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let device_id = DeviceId(sk.verifying_key().to_bytes());
+    let master = IdentityPub(device_id.0);
+    (device_id, master)
+}
+
+fn make_multi_holder_file(
+    fid: FileId,
+    block_id: SourceBlockId,
+) -> viaticum_core::types::FileRecord {
+    use viaticum_core::types::{FileRecord, FileVersion, LocalState};
+    let owner_device = DeviceId([0x01; 32]);
+    FileRecord {
+        file_id: fid,
+        path: "multi_holder_delete.txt".to_string(),
+        importance: 0.5,
+        devices: vec![(owner_device, LocalState::Deleted(Timestamp(0)))],
+        versions: vec![FileVersion {
+            content_hash: [0; 32],
+            source_block_id: block_id,
+            k: 10,
+            t: 65535,
+            created_at: Timestamp(0),
+            backed_up_at: Some(Timestamp(0)),
+        }],
+        first_seen: Timestamp(0),
+    }
+}
+
+fn make_active_block(block_id: SourceBlockId) -> viaticum_core::types::SourceBlockRecord {
+    use viaticum_core::types::{SourceBlockRecord, SourceBlockStatus, SourceBlockType};
+    SourceBlockRecord {
+        block_id,
+        k: 10,
+        t: 65535,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(0),
+        encrypted_size: None,
+        n: None,
+        overhead: None,
+        drop_notice_sent_at: None,
+        importance: 0.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+    }
+}
+
+fn make_deletion_scheduler(
+    db: &Db,
+    router: Arc<MailboxRouter>,
+) -> (Scheduler, mpsc::Receiver<RepairTrigger>) {
+    let (repair_tx, repair_rx) = mpsc::channel::<RepairTrigger>(16);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let pending = make_pending_challenges();
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending,
+        router,
+        dummy_master_pub(),
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    );
+    (scheduler, repair_rx)
+}
+
+/// H3 core: a multi-holder block's Delete must reach EVERY holder's master, and
+/// all placements must transition to Deleting. (Fails on the old per-block
+/// `drop_notice_sent_at` gate, which delivered to only the first holder.)
+#[tokio::test]
+async fn delete_sent_to_every_holder_of_multi_holder_block() {
+    let db = Db::open_in_memory().unwrap();
+    let block_id = make_block_id(0xA0);
+    let fid = FileId(701);
+
+    db.upsert_file(&make_multi_holder_file(fid, block_id))
+        .unwrap();
+    db.upsert_source_block(&make_active_block(block_id))
+        .unwrap();
+
+    // Three holders, each a real Ed25519 identity → distinct master targets.
+    let holders = [
+        make_real_holder(0xB1),
+        make_real_holder(0xB2),
+        make_real_holder(0xB3),
+    ];
+    for (device_id, _master) in &holders {
+        let mut p = make_placement(block_id, *device_id);
+        p.file_id = fid;
+        db.upsert_placement(&p).unwrap();
+        db.upsert_peer(&make_peer_record(*device_id)).unwrap();
+    }
+
+    let recording_sender = Arc::new(RecordingMailboxSender::new());
+    let router = Arc::new(MailboxRouter::with_sender(
+        Arc::clone(&recording_sender) as Arc<dyn MailboxNetworkSender>,
+        db.clone(),
+    ));
+    let (scheduler, _repair_rx) = make_deletion_scheduler(&db, router);
+
+    scheduler.process_deletion_tick().await.unwrap();
+
+    // Every holder master must have received a DeleteRequest.
+    let delete_targets: std::collections::HashSet<IdentityPub> = recording_sender
+        .captured_requests()
+        .iter()
+        .filter(|r| r.entry.class == viaticum_core::mailbox::MailboxClass::DeleteRequest)
+        .map(|r| r.entry.target)
+        .collect();
+    for (_device_id, master) in &holders {
+        assert!(
+            delete_targets.contains(master),
+            "DeleteRequest must be published to holder master {master}"
+        );
+    }
+    assert_eq!(
+        delete_targets.len(),
+        holders.len(),
+        "DeleteRequest must reach exactly the {} holder masters, got {:?}",
+        holders.len(),
+        delete_targets
+    );
+
+    // All placements must now be Deleting.
+    for (device_id, _master) in &holders {
+        let p = db.get_placement(&block_id, device_id).unwrap().unwrap();
+        assert_eq!(
+            p.status,
+            PlacementStatus::Deleting,
+            "every holder placement must transition to Deleting"
+        );
+    }
+}
+
+/// H3 per-holder retry: if one holder's publish gets 0 acks, only that holder stays
+/// Active and is re-attempted on the next tick; the acked holders go Deleting and
+/// are NOT re-published.
+#[tokio::test]
+async fn multi_holder_delete_retries_only_unacked_holder() {
+    let db = Db::open_in_memory().unwrap();
+    let block_id = make_block_id(0xA5);
+    let fid = FileId(702);
+
+    db.upsert_file(&make_multi_holder_file(fid, block_id))
+        .unwrap();
+    db.upsert_source_block(&make_active_block(block_id))
+        .unwrap();
+
+    let holders = [
+        make_real_holder(0xC1),
+        make_real_holder(0xC2),
+        make_real_holder(0xC3),
+    ];
+    for (device_id, _master) in &holders {
+        let mut p = make_placement(block_id, *device_id);
+        p.file_id = fid;
+        db.upsert_placement(&p).unwrap();
+        db.upsert_peer(&make_peer_record(*device_id)).unwrap();
+    }
+
+    // Holder n (last) will 0-ack.
+    let (failing_device, failing_master) = holders[holders.len() - 1];
+    let sender = Arc::new(SelectiveMailboxSender::new());
+    sender.fail_for(failing_master);
+    let router = Arc::new(MailboxRouter::with_sender(
+        Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>,
+        db.clone(),
+    ));
+    let (scheduler, _repair_rx) = make_deletion_scheduler(&db, router);
+
+    // First tick: holders 1..n-1 ack → Deleting; holder n 0-acks → stays Alive.
+    scheduler.process_deletion_tick().await.unwrap();
+
+    for (device_id, _master) in &holders[..holders.len() - 1] {
+        let p = db.get_placement(&block_id, device_id).unwrap().unwrap();
+        assert_eq!(
+            p.status,
+            PlacementStatus::Deleting,
+            "acked holder must be Deleting after first tick"
+        );
+    }
+    let failing_p = db
+        .get_placement(&block_id, &failing_device)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        failing_p.status,
+        PlacementStatus::Alive,
+        "unacked holder must stay Alive after first tick"
+    );
+
+    // Capture the per-target publish counts after the first tick.
+    let publishes_to = |s: &SelectiveMailboxSender, target: IdentityPub| -> usize {
+        s.captured_requests()
+            .iter()
+            .filter(|r| {
+                r.entry.class == viaticum_core::mailbox::MailboxClass::DeleteRequest
+                    && r.entry.target == target
+            })
+            .count()
+    };
+    let failing_publishes_first = publishes_to(&sender, failing_master);
+    let acked_publishes_first: Vec<usize> = holders[..holders.len() - 1]
+        .iter()
+        .map(|(_d, m)| publishes_to(&sender, *m))
+        .collect();
+    assert!(
+        failing_publishes_first >= 1,
+        "failing holder must have been published to on the first tick"
+    );
+
+    // Second tick: only the unacked holder is re-attempted (engine no longer emits
+    // for the Deleting holders).
+    scheduler.process_deletion_tick().await.unwrap();
+
+    assert!(
+        publishes_to(&sender, failing_master) > failing_publishes_first,
+        "the unacked holder must be re-published on the second tick"
+    );
+    for ((_device_id, master), first_count) in holders[..holders.len() - 1]
+        .iter()
+        .zip(acked_publishes_first.iter())
+    {
+        assert_eq!(
+            publishes_to(&sender, *master),
+            *first_count,
+            "an already-Deleting holder must NOT be re-published"
+        );
+    }
+}
+
+/// H3 completion: once all placements are Deleting, after the holder cooldown the
+/// engine emits CleanupPlacement for each and then CleanupBlock — the block is no
+/// longer stuck; its row is removed.
+#[tokio::test]
+async fn multi_holder_block_reaches_cleanup_when_all_holders_deleting() {
+    use viaticum_core::constants::{HOLDER_DELETE_COOLDOWN_SECS, OWNER_DELETE_COOLDOWN_SECS};
+    use viaticum_core::deletion::{DeletionAction, DeletionEngine};
+    use viaticum_core::types::{SourceBlockStatus, SourceBlockType};
+
+    // Drive the engine directly with all placements already Deleting and the block
+    // Deleting; advance now past owner + holder cooldown.
+    let engine = DeletionEngine::new();
+    let block_id = make_block_id(0xA9);
+    let fid = FileId(703);
+
+    let mut block = make_active_block(block_id);
+    block.block_type = SourceBlockType::Single;
+    block.status = SourceBlockStatus::Deleting;
+
+    let holders = [
+        make_real_holder(0xD1),
+        make_real_holder(0xD2),
+        make_real_holder(0xD3),
+    ];
+    let placements: Vec<SymbolPlacement> = holders
+        .iter()
+        .map(|(device_id, _master)| {
+            let mut p = make_placement(block_id, *device_id);
+            p.file_id = fid;
+            p.status = PlacementStatus::Deleting;
+            p
+        })
+        .collect();
+
+    let file = make_multi_holder_file(fid, block_id);
+    let now = Timestamp(OWNER_DELETE_COOLDOWN_SECS + HOLDER_DELETE_COOLDOWN_SECS);
+
+    let actions = engine.process_cooldowns(&[file], &[block], &placements, now, 1);
+
+    // CleanupPlacement for every holder.
+    for (device_id, _master) in &holders {
+        assert!(
+            actions.contains(&DeletionAction::CleanupPlacement {
+                source_block_id: block_id,
+                holder_id: *device_id,
+            }),
+            "CleanupPlacement must be emitted for every holder"
+        );
+    }
+    // CleanupBlock fires (block not stuck).
+    assert!(
+        actions.contains(&DeletionAction::CleanupBlock {
+            source_block_id: block_id,
+            file_id: fid,
+        }),
+        "CleanupBlock must fire once all holders are Deleting and cooldown elapsed"
+    );
+}
+
+/// H3 retry-dedup: two publishes of the same (block, holder) Delete must use the
+/// same stable msg_id so candidate postmen dedup re-stores as Duplicate.
+#[tokio::test]
+async fn delete_republish_uses_stable_msg_id_for_dedup() {
+    let db = Db::open_in_memory().unwrap();
+    let block_id = make_block_id(0xAB);
+    let fid = FileId(704);
+
+    db.upsert_file(&make_multi_holder_file(fid, block_id))
+        .unwrap();
+    db.upsert_source_block(&make_active_block(block_id))
+        .unwrap();
+
+    // Single holder that always 0-acks → block stays eligible, scheduler re-publishes.
+    let (device_id, master) = make_real_holder(0xE5);
+    let mut p = make_placement(block_id, device_id);
+    p.file_id = fid;
+    db.upsert_placement(&p).unwrap();
+    db.upsert_peer(&make_peer_record(device_id)).unwrap();
+
+    let sender = Arc::new(SelectiveMailboxSender::new());
+    sender.fail_for(master); // force re-publish across ticks
+    let router = Arc::new(MailboxRouter::with_sender(
+        Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>,
+        db.clone(),
+    ));
+    let (scheduler, _repair_rx) = make_deletion_scheduler(&db, router);
+
+    scheduler.process_deletion_tick().await.unwrap();
+    scheduler.process_deletion_tick().await.unwrap();
+
+    let msg_ids: std::collections::HashSet<[u8; 16]> = sender
+        .captured_requests()
+        .iter()
+        .filter(|r| {
+            r.entry.class == viaticum_core::mailbox::MailboxClass::DeleteRequest
+                && r.entry.target == master
+        })
+        .map(|r| r.entry.msg_id)
+        .collect();
+    assert!(
+        !msg_ids.is_empty(),
+        "expected ≥1 DeleteRequest publish to the holder"
+    );
+    assert_eq!(
+        msg_ids.len(),
+        1,
+        "all re-publishes of the same (block, holder) Delete must share one stable msg_id, got {msg_ids:?}"
     );
 }
 

@@ -959,20 +959,15 @@ impl Scheduler {
                     source_block_id,
                     holder_id,
                 } => {
-                    // Dedup: only send once per source block.
+                    // H3 fix: dedup is PER (block, holder), enforced upstream by the
+                    // deletion engine (it only emits SendDropNotice for a placement whose
+                    // status != Deleting). There is NO per-BLOCK skip gate here — a block
+                    // is erasure-coded across many holders, and the old
+                    // `source_block.drop_notice_sent_at.is_some()` gate skipped holders
+                    // 2..n forever once the first holder's publish set it, leaving their
+                    // data un-deleted and the block stuck in Deleting. Each action that
+                    // reaches this arm corresponds to a holder that still needs the notice.
                     let source_block = self.db.get_source_block(&source_block_id).ok().flatten();
-                    if source_block
-                        .as_ref()
-                        .and_then(|sb| sb.drop_notice_sent_at)
-                        .is_some()
-                    {
-                        debug!(
-                            block_id = %source_block_id,
-                            holder_id = %holder_id,
-                            "scheduler: drop notice already sent for this block, skipping"
-                        );
-                        continue;
-                    }
 
                     // Build signed DeleteMsg and publish via mailbox bus (T-13b-1).
                     let delete_msg = viaticum_core::messages::build_delete_msg(
@@ -987,17 +982,22 @@ impl Scheduler {
                         .flatten()
                         .unwrap_or(IdentityPub(holder_id.0));
                     let delete_payload = DeleteRequestPayload::Delete(delete_msg);
-                    // Publish FIRST, then gate the state-change txn on delivery success.
-                    // mailbox publish is REMOTE (unlike the relay-era guaranteed local
-                    // board store) and can genuinely yield 0 acks / Err — in that case
-                    // we must NOT advance state (which would set drop_notice_sent_at and
-                    // make the dedup gate above skip this block forever). Leave the block
-                    // in its prior state so the deletion engine re-emits SendDropNotice on
-                    // the next tick — natural retry.
+                    // Publish FIRST, then gate the per-holder state-change txn on delivery
+                    // success. mailbox publish is REMOTE (unlike the relay-era guaranteed
+                    // local board store) and can genuinely yield 0 acks / Err — in that
+                    // case we must NOT transition THIS holder's placement to Deleting, so
+                    // the engine re-emits SendDropNotice for it on the next tick (per-holder
+                    // retry). The other holders are unaffected — each is its own action.
                     let mut publish_ok = false;
                     if let Ok(payload_bytes) = to_cbor(&delete_payload) {
-                        let mut msg_id = [0u8; 16];
-                        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
+                        // Stable msg_id derived from (block, holder_master, domain) so
+                        // re-publishes of the same Delete dedup as `Duplicate` at candidate
+                        // postmen that still hold the entry (instead of piling up a fresh
+                        // random entry every tick for the full 14d TTL). A fresh holder still
+                        // receives it once; the holder's apply keys idempotency on
+                        // (block_id, owner) + the Active→MarkedForDelete status-guard, not on
+                        // msg_id, so a stable id does not change holder-side behaviour.
+                        let msg_id = stable_delete_msg_id(&source_block_id, &holder_master);
                         let ttl_secs =
                             viaticum_core::mailbox::class_config::DELETE_REQUEST_TTL.as_secs();
                         let entry = MailboxEntry {
@@ -1041,19 +1041,22 @@ impl Scheduler {
                     }
 
                     // Only advance state if the DeleteMsg was actually delivered (≥1 ack).
-                    // On 0 acks / Err / encode failure leave the block untouched so the
-                    // next tick re-attempts (no drop_notice_sent_at, no Deleting transition).
+                    // On 0 acks / Err / encode failure leave this holder's placement
+                    // untouched so the next tick re-attempts it (no Deleting transition).
                     if !publish_ok {
                         continue;
                     }
 
-                    // Mark placement + source block Deleting, record drop_notice_sent_at atomically.
+                    // Transition THIS holder's placement → Deleting; promote the source
+                    // block Active/Stale → Deleting (so the engine's Deleting-branch keeps
+                    // emitting SendDropNotice for the remaining non-Deleting placements).
                     let placement = self
                         .db
                         .get_placement(&source_block_id, &holder_id)
                         .ok()
                         .flatten();
 
+                    let mut committed = false;
                     if placement.is_some() || source_block.is_some() {
                         match self.db.write_txn() {
                             Err(e) => {
@@ -1069,7 +1072,12 @@ impl Scheduler {
                                     }
                                 }
                                 if txn_ok && let Some(mut sb) = source_block {
-                                    sb.drop_notice_sent_at = Some(now);
+                                    // Promote the block to Deleting only — drop_notice_sent_at
+                                    // is intentionally NOT written: it was a per-block dedup
+                                    // gate (now removed) and has no other consumer for
+                                    // SourceBlockRecord, so it is left dead. Holder-cooldown
+                                    // timing derives from all_devices_deleted_at + cooldown in
+                                    // the engine, not from this field.
                                     if sb.status == SourceBlockStatus::Active
                                         || sb.status == SourceBlockStatus::Stale
                                     {
@@ -1080,18 +1088,28 @@ impl Scheduler {
                                         txn_ok = false;
                                     }
                                 }
-                                if txn_ok && let Err(e) = txn.commit() {
-                                    error!(block_id = %source_block_id, "deletion: failed to commit txn: {e}");
+                                if txn_ok {
+                                    match txn.commit() {
+                                        Ok(()) => committed = true,
+                                        Err(e) => {
+                                            error!(block_id = %source_block_id, "deletion: failed to commit txn: {e}")
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
 
-                    info!(
-                        block_id = %source_block_id,
-                        holder_id = %holder_id,
-                        "scheduler: sent DeleteMsg via mailbox, placement → Deleting"
-                    );
+                    // NOTE-twin fix: only log the transition once the txn actually
+                    // committed — otherwise the log claims a Deleting transition that was
+                    // never persisted.
+                    if committed {
+                        info!(
+                            block_id = %source_block_id,
+                            holder_id = %holder_id,
+                            "scheduler: sent DeleteMsg via mailbox, placement → Deleting"
+                        );
+                    }
                 }
                 DeletionAction::CleanupPlacement {
                     source_block_id,
@@ -1248,5 +1266,26 @@ impl Scheduler {
 fn random_challenge_id() -> [u8; 16] {
     let mut id = [0u8; 16];
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut id);
+    id
+}
+
+/// Deterministic 16-byte mailbox msg_id for a Delete addressed to `holder_master`
+/// for `block`. Stable across re-publishes so that retries (the per-holder retry
+/// after a 0-ack tick, or the engine re-emitting until the holder acks) dedup as
+/// `Duplicate` at candidate postmen that already hold the entry, rather than piling
+/// up a fresh random entry every tick for the full DELETE_REQUEST_TTL (14d).
+///
+/// Derived from SHA256(block_id || holder_master || domain), truncated to 16 bytes.
+/// The holder's apply is idempotent on (block_id, owner) + status-guard, not on
+/// msg_id, so a stable id does not change holder-side behaviour.
+fn stable_delete_msg_id(block: &SourceBlockId, holder_master: &IdentityPub) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(block.0);
+    hasher.update(holder_master.0);
+    hasher.update(b"viaticum-mailbox-delete-v1");
+    let digest = hasher.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest[..16]);
     id
 }
