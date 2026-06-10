@@ -4,9 +4,7 @@ use tracing::{debug, info, warn};
 use viaticum_core::constants::{BYTES_PER_GB, SYMBOL_SIZE};
 use viaticum_core::erasure::Symbol;
 use viaticum_core::escrow::{RestoreDecision, check_restore};
-use viaticum_core::messages::{
-    BoardSyncMsg, RestoreDeniedMsg, RestoreRequestMsg, RestoreResponseMsg,
-};
+use viaticum_core::messages::{RestoreDeniedMsg, RestoreRequestMsg, RestoreResponseMsg};
 use viaticum_core::types::{HoldingStatus, IdentityPub, Timestamp, hex_encode};
 
 use super::{Processor, ProcessorError, ranges_to_esi_list};
@@ -149,22 +147,6 @@ impl Processor {
             restore_budget_gb = denied.restore_budget_gb,
             "processor: RestoreDenied received"
         );
-        Ok(())
-    }
-
-    /// Peer sent us board entries. Forward to RelayManager via relay_sync_tx.
-    pub(crate) async fn handle_board_sync(
-        &self,
-        from: IdentityPub,
-        msg: BoardSyncMsg,
-    ) -> Result<(), ProcessorError> {
-        let trigger = crate::daemon::relay::SyncTrigger {
-            partner_identity: from,
-            partner_entries: msg.entries,
-        };
-        if self.relay_sync_tx.send(trigger).await.is_err() {
-            warn!(peer = %from, "processor: relay_sync_tx closed, dropping BoardSync");
-        }
         Ok(())
     }
 }

@@ -15,7 +15,6 @@
 //   SymbolReject received   → we are the owner   → log
 //   RestoreRequest received → we are the holder  → load symbols, send RestoreResponse
 //   RestoreDenied received  → we are the owner   → log warning
-//   BoardSync received      → forward to RelayManager via relay_sync_tx
 //   PeerAnnounce received   → upsert peer record in DB
 //   ClusterSyncRequest      → we are cluster peer → serve event log entries
 //   ClusterSyncResponse     → we are cluster peer → apply received events
@@ -25,7 +24,11 @@
 //   PeerAuthenticated → upsert PeerRecord, auto-add cluster device, send PeerAnnounce.
 //   InboundRequest    → dispatch_libp2p: match Message variant, call handler, send via ResponseChannel.
 //   ConnectionClosed  → remove from peer_cert_map.
-//   One-way messages (PosHash, Delete, Drop) still arrive via relay board (dispatch_relay).
+//
+// A2 (T-13b-3) — relay board retired. One-way directed messages (PoS, Delete,
+//   CancelDelete, DropNotice, Revocation) now arrive via the mailbox poll loop;
+//   their handler bodies live in pos.rs / symbol.rs and are reached through the
+//   mailbox dispatch handlers, not through this Processor's inbound path.
 //
 // Design note: PosHashResponseMsg on the wire does not carry source_block_id.
 // We recover it by looking up the challenge_id in the shared PendingChallenges
@@ -38,24 +41,17 @@ use std::sync::{Arc, Mutex};
 use libp2p::request_response::ResponseChannel;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use viaticum_core::cluster::DeviceCertificate;
 use viaticum_core::config::EscrowCfg;
 use viaticum_core::constants::SYMBOL_OFFER_EXPIRY_SECS;
 use viaticum_core::db::Db;
-use viaticum_core::messages::{
-    AckMsg, CancelDeleteMsg, DeleteMsg, Message, PeerAnnounceMsg, PosHashChallengeMsg,
-    PosHashNackMsg, PosHashResponseMsg, RestoreDeniedMsg, RevocationBroadcast, SymbolDropNoticeMsg,
-    SymbolDroppedMsg, SymbolStoredMsg, SystemStateAckMsg,
-};
+use viaticum_core::messages::{AckMsg, Message, RestoreDeniedMsg, SymbolStoredMsg};
 use viaticum_core::types::{DeviceId, IdentityPub, PlacementStatus, SourceBlockId, Timestamp};
 
 use crate::daemon::cluster_sync::ClusterSyncManager;
 use crate::daemon::mailbox::candidate::KademliaRoutingView;
 use crate::daemon::network::swarm::{ProtocolEvent, SwarmHandle, device_id_to_peer_id};
-use crate::daemon::relay::{InboundMessage, RelayPost};
-use crate::daemon::repair::RepairTrigger;
-use crate::daemon::scheduler::PendingChallenges;
 
 mod cluster;
 pub mod mailbox;
@@ -153,14 +149,11 @@ pub struct Processor {
     db: Db,
     /// Our identity.
     pub(crate) own_identity: IdentityPub,
-    repair_tx: mpsc::Sender<RepairTrigger>,
     cluster_sync: Arc<ClusterSyncManager>,
     /// Directory where we store symbols held for others: `{holdings_dir}/{block_id_hex}/{esi}.bin`
     holdings_dir: PathBuf,
     /// libp2p swarm handle.
     swarm: Arc<SwarmHandle>,
-    /// Channel to relay manager: push BoardSync entries from incoming connections.
-    relay_sync_tx: mpsc::Sender<crate::daemon::relay::SyncTrigger>,
     /// Raw soft quota in bytes from config. 0 = use disk-based limit.
     soft_quota_bytes: u64,
     /// Raw hard quota in bytes. 0 = no hard floor.
@@ -173,11 +166,6 @@ pub struct Processor {
     backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
     /// Time acceleration factor (1 = real time). Scales week numbers for trust.
     time_scale: u64,
-    /// Shared map of in-flight PoS challenges. Written by Scheduler, read here
-    /// to resolve challenge_id → source_block_id without scanning placements.
-    pending_challenges: PendingChallenges,
-    /// Channel to post messages to the relay board (for board-based responses).
-    relay_post_tx: mpsc::Sender<RelayPost>,
     /// Cluster state for auto-add on same-identity handshake. None if not initialized.
     cluster_state: Option<Arc<std::sync::Mutex<viaticum_core::cluster::ClusterState>>>,
     /// Escrow configuration for contribution-based restore budget checks.
@@ -205,19 +193,15 @@ impl Processor {
     pub fn new(
         db: Db,
         own_identity: IdentityPub,
-        repair_tx: mpsc::Sender<RepairTrigger>,
         cluster_sync: Arc<ClusterSyncManager>,
         holdings_dir: PathBuf,
         swarm: Arc<SwarmHandle>,
-        relay_sync_tx: mpsc::Sender<crate::daemon::relay::SyncTrigger>,
         soft_quota_bytes: u64,
         hard_quota_bytes: u64,
         data_dir: PathBuf,
         disk_reserve_bytes: u64,
         backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
         time_scale: u64,
-        pending_challenges: PendingChallenges,
-        relay_post_tx: mpsc::Sender<RelayPost>,
         cluster_state: Option<Arc<std::sync::Mutex<viaticum_core::cluster::ClusterState>>>,
         escrow_cfg: EscrowCfg,
         accepted_offers: AcceptedOffers,
@@ -226,19 +210,15 @@ impl Processor {
         Processor {
             db,
             own_identity,
-            repair_tx,
             cluster_sync,
             holdings_dir,
             swarm,
-            relay_sync_tx,
             soft_quota_bytes,
             hard_quota_bytes,
             data_dir,
             disk_reserve_bytes,
             backup_event_tx,
             time_scale,
-            pending_challenges,
-            relay_post_tx,
             cluster_state,
             escrow_cfg,
             accepted_offers,
@@ -275,15 +255,13 @@ impl Processor {
         KademliaRoutingView::new(peer_ids)
     }
 
-    /// Main loop: receive ProtocolEvents from the libp2p swarm and relay-board messages.
+    /// Main loop: receive ProtocolEvents from the libp2p swarm.
     ///
     /// Dispatches each event to its handler in a new tokio::spawn task (I4 preserved).
     /// - swarm_rx: ProtocolEvent stream from SwarmHandle (PeerAuthenticated, InboundRequest, ConnectionClosed)
-    /// - inbound_rx: relay board one-way messages (PoS, Delete, Drop, PeerAnnounce, etc.)
     pub async fn run(
         self,
         mut swarm_rx: mpsc::Receiver<ProtocolEvent>,
-        mut inbound_rx: mpsc::Receiver<InboundMessage>,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let this = Arc::new(self);
@@ -383,21 +361,6 @@ impl Processor {
                         }
                     }
                 }
-
-                maybe_relay = inbound_rx.recv() => {
-                    match maybe_relay {
-                        None => {
-                            info!("processor: inbound_rx closed");
-                            // Not a fatal condition; relay may be disabled.
-                        }
-                        Some(relay_msg) => {
-                            let this2 = this.clone();
-                            tokio::spawn(async move {
-                                this2.dispatch_relay(relay_msg).await;
-                            });
-                        }
-                    }
-                }
             }
         }
 
@@ -434,11 +397,7 @@ impl Processor {
                     }
                     Err(e) => {
                         warn!(device = %from_device, err = %e, "processor: SymbolTransfer failed");
-                        let ack = Message::SystemStateAck(SystemStateAckMsg {
-                            v: 1,
-                            stored: false,
-                            timestamp: Timestamp::now(),
-                        });
+                        let ack = Message::Ack(AckMsg { v: 1 });
                         let _ = self.swarm.respond(response_channel, ack);
                     }
                 }
@@ -482,33 +441,6 @@ impl Processor {
                 };
                 let _ = self.swarm.respond(response_channel, reply);
             }
-            Message::BoardSync(msg) => {
-                if let Err(e) = self.handle_board_sync(from_master, msg).await {
-                    warn!(device = %from_device, err = %e, "processor: BoardSync handler failed");
-                }
-                let ack = Message::SystemStateAck(SystemStateAckMsg {
-                    v: 1,
-                    stored: true,
-                    timestamp: Timestamp::now(),
-                });
-                let _ = self.swarm.respond(response_channel, ack);
-            }
-            Message::SystemStateBackup(backup) => {
-                let ack = self
-                    .handle_system_state_backup_inner(from_master, backup)
-                    .await;
-                let _ = self
-                    .swarm
-                    .respond(response_channel, Message::SystemStateAck(ack));
-            }
-            Message::SystemStateRequest(req) => {
-                let resp = self
-                    .handle_system_state_request_inner(from_master, req)
-                    .await;
-                let _ = self
-                    .swarm
-                    .respond(response_channel, Message::SystemStateResponse(resp));
-            }
             Message::ClusterSyncRequest(req) => {
                 self.handle_cluster_sync_request_libp2p(
                     from_device,
@@ -533,74 +465,41 @@ impl Processor {
                 if let Err(e) = self.handle_cluster_sync_response(from_device, resp).await {
                     warn!(device = %from_device, err = %e, "processor: ClusterSyncResponse handler failed");
                 }
-                let ack = Message::SystemStateAck(SystemStateAckMsg {
-                    v: 1,
-                    stored: true,
-                    timestamp: Timestamp::now(),
-                });
-                let _ = self.swarm.respond(response_channel, ack);
+                let _ = self
+                    .swarm
+                    .respond(response_channel, Message::Ack(AckMsg { v: 1 }));
             }
             Message::SymbolAccept(accept) => {
                 if let Err(e) = self.handle_symbol_accept(from_master, accept).await {
                     warn!(device = %from_device, err = %e, "processor: SymbolAccept handler failed");
                 }
-                let ack = Message::SystemStateAck(SystemStateAckMsg {
-                    v: 1,
-                    stored: true,
-                    timestamp: Timestamp::now(),
-                });
-                let _ = self.swarm.respond(response_channel, ack);
+                let _ = self
+                    .swarm
+                    .respond(response_channel, Message::Ack(AckMsg { v: 1 }));
             }
             Message::SymbolReject(reject) => {
                 if let Err(e) = self.handle_symbol_reject(from_master, reject).await {
                     warn!(device = %from_device, err = %e, "processor: SymbolReject handler failed");
                 }
-                let ack = Message::SystemStateAck(SystemStateAckMsg {
-                    v: 1,
-                    stored: true,
-                    timestamp: Timestamp::now(),
-                });
-                let _ = self.swarm.respond(response_channel, ack);
+                let _ = self
+                    .swarm
+                    .respond(response_channel, Message::Ack(AckMsg { v: 1 }));
             }
             Message::RestoreDenied(denied) => {
                 if let Err(e) = self.handle_restore_denied(from_master, denied).await {
                     warn!(device = %from_device, err = %e, "processor: RestoreDenied handler failed");
                 }
-                let ack = Message::SystemStateAck(SystemStateAckMsg {
-                    v: 1,
-                    stored: true,
-                    timestamp: Timestamp::now(),
-                });
-                let _ = self.swarm.respond(response_channel, ack);
+                let _ = self
+                    .swarm
+                    .respond(response_channel, Message::Ack(AckMsg { v: 1 }));
             }
             Message::PeerAnnounce(pa) => {
                 if let Err(e) = self.handle_peer_announce(pa).await {
                     warn!(device = %from_device, err = %e, "processor: PeerAnnounce handler failed");
                 }
-                let ack = Message::SystemStateAck(SystemStateAckMsg {
-                    v: 1,
-                    stored: true,
-                    timestamp: Timestamp::now(),
-                });
-                let _ = self.swarm.respond(response_channel, ack);
-            }
-            Message::SystemStateAck(ack) => {
-                self.handle_system_state_ack(from_master, ack);
-                let resp = Message::SystemStateAck(SystemStateAckMsg {
-                    v: 1,
-                    stored: true,
-                    timestamp: Timestamp::now(),
-                });
-                let _ = self.swarm.respond(response_channel, resp);
-            }
-            Message::SystemStateResponse(resp) => {
-                self.handle_system_state_response(from_master, resp).await;
-                let ack = Message::SystemStateAck(SystemStateAckMsg {
-                    v: 1,
-                    stored: true,
-                    timestamp: Timestamp::now(),
-                });
-                let _ = self.swarm.respond(response_channel, ack);
+                let _ = self
+                    .swarm
+                    .respond(response_channel, Message::Ack(AckMsg { v: 1 }));
             }
             Message::MailboxStoreRequest(req) => {
                 // Build routing view from known peers in the DB.
@@ -624,217 +523,12 @@ impl Processor {
                     "processor: dispatch_libp2p: unhandled message variant {:?}",
                     std::mem::discriminant(&other)
                 );
-                let ack = Message::SystemStateAck(SystemStateAckMsg {
-                    v: 1,
-                    stored: false,
-                    timestamp: Timestamp::now(),
-                });
-                let _ = self.swarm.respond(response_channel, ack);
+                let _ = self
+                    .swarm
+                    .respond(response_channel, Message::Ack(AckMsg { v: 1 }));
             }
         }
         Ok(())
-    }
-
-    async fn dispatch_relay(&self, msg: InboundMessage) {
-        use viaticum_core::messages::from_cbor;
-        match msg.msg_type.as_str() {
-            "peer_announce" => match from_cbor::<PeerAnnounceMsg>(&msg.payload) {
-                Ok(pa) => {
-                    if let Err(e) = self.handle_peer_announce(pa).await {
-                        warn!(err = %e, "processor: PeerAnnounce via relay failed");
-                    }
-                }
-                Err(e) => warn!(err = %e, "processor: failed to decode PeerAnnounce from relay"),
-            },
-            "pos_hash_challenge" => {
-                match from_cbor::<PosHashChallengeMsg>(&msg.payload) {
-                    Ok(challenge) => {
-                        // In cluster mode (shared mnemonic), relay broadcasts reach
-                        // every cluster device because they all share `master_pub`.
-                        // Only the targeted device should respond; otherwise non-holder
-                        // cluster members would emit valid-signed Nacks that the owner
-                        // would mis-attribute to the real holder.
-                        if let Some(target) = challenge.device_id
-                            && target != self.swarm.device_id
-                        {
-                            debug!(
-                                target = %target,
-                                own = %self.swarm.device_id,
-                                "processor: PoS challenge not addressed to us, ignoring"
-                            );
-                            return;
-                        }
-                        match self
-                            .handle_pos_hash_challenge_inner(msg.from, challenge)
-                            .await
-                        {
-                            Ok(reply) => {
-                                // Send response back via board (directed to challenger).
-                                let (reply_type, reply_payload) = match &reply {
-                                    Message::PosHashResponse(r) => {
-                                        match viaticum_core::messages::to_cbor(r) {
-                                            Ok(bytes) => ("pos_hash_response", bytes),
-                                            Err(e) => {
-                                                warn!(err = %e, "processor: failed to encode PosHashResponse");
-                                                return;
-                                            }
-                                        }
-                                    }
-                                    Message::PosHashNack(n) => {
-                                        match viaticum_core::messages::to_cbor(n) {
-                                            Ok(bytes) => ("pos_hash_nack", bytes),
-                                            Err(e) => {
-                                                warn!(err = %e, "processor: failed to encode PosHashNack");
-                                                return;
-                                            }
-                                        }
-                                    }
-                                    _ => return,
-                                };
-                                let mut reply_id = [0u8; 16];
-                                rand_core::RngCore::fill_bytes(
-                                    &mut rand_core::OsRng,
-                                    &mut reply_id,
-                                );
-                                let _ = self
-                                    .relay_post_tx
-                                    .send(RelayPost {
-                                        msg_type: reply_type.to_string(),
-                                        target: Some(msg.from),
-                                        payload: reply_payload,
-                                        msg_id: reply_id,
-                                    })
-                                    .await;
-                            }
-                            Err(e) => {
-                                warn!(err = %e, "processor: PosHashChallenge via relay failed")
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(err = %e, "processor: failed to decode PosHashChallenge from relay")
-                    }
-                }
-            }
-            "pos_hash_response" => {
-                match from_cbor::<PosHashResponseMsg>(&msg.payload) {
-                    Ok(response) => {
-                        // Resolve DeviceId: use device_id from message body if present,
-                        // else fall back to first device for the master (msg.from).
-                        let holder_device = response
-                            .device_id
-                            .or_else(|| {
-                                self.db
-                                    .get_devices_for_master(&msg.from)
-                                    .ok()
-                                    .and_then(|ds| ds.into_iter().next())
-                            })
-                            .unwrap_or(DeviceId(msg.from.0));
-                        if let Err(e) = self.handle_pos_hash_response(holder_device, response).await
-                        {
-                            warn!(err = %e, "processor: PosHashResponse via relay failed");
-                        }
-                    }
-                    Err(e) => {
-                        warn!(err = %e, "processor: failed to decode PosHashResponse from relay")
-                    }
-                }
-            }
-            "pos_hash_nack" => {
-                match from_cbor::<PosHashNackMsg>(&msg.payload) {
-                    Ok(nack) => {
-                        // Resolve DeviceId: use device_id from message body if present,
-                        // else fall back to first device for the master (msg.from).
-                        let from_device = nack
-                            .device_id
-                            .or_else(|| {
-                                self.db
-                                    .get_devices_for_master(&msg.from)
-                                    .ok()
-                                    .and_then(|ds| ds.into_iter().next())
-                            })
-                            .unwrap_or(DeviceId(msg.from.0));
-                        if let Err(e) = self.handle_pos_hash_nack(from_device, nack).await {
-                            warn!(err = %e, "processor: PosHashNack via relay failed");
-                        }
-                    }
-                    Err(e) => warn!(err = %e, "processor: failed to decode PosHashNack from relay"),
-                }
-            }
-            "delete" => match from_cbor::<DeleteMsg>(&msg.payload) {
-                Ok(delete) => {
-                    if let Err(e) = self.handle_delete(msg.from, delete).await {
-                        warn!(err = %e, "processor: Delete via relay failed");
-                    }
-                }
-                Err(e) => warn!(err = %e, "processor: failed to decode DeleteMsg from relay"),
-            },
-            "cancel_delete" => match from_cbor::<CancelDeleteMsg>(&msg.payload) {
-                Ok(cancel) => {
-                    if let Err(e) = self.handle_cancel_delete(msg.from, cancel).await {
-                        warn!(err = %e, "processor: CancelDelete via relay failed");
-                    }
-                }
-                Err(e) => warn!(err = %e, "processor: failed to decode CancelDeleteMsg from relay"),
-            },
-            "symbol_dropped" => {
-                match from_cbor::<SymbolDroppedMsg>(&msg.payload) {
-                    Ok(dropped) => {
-                        // SymbolDropped comes from a holder — resolve DeviceId from master.
-                        let from_device = self
-                            .db
-                            .get_devices_for_master(&msg.from)
-                            .ok()
-                            .and_then(|ds| ds.into_iter().next())
-                            .unwrap_or(DeviceId(msg.from.0));
-                        if let Err(e) = self.handle_symbol_dropped(from_device, dropped).await {
-                            warn!(err = %e, "processor: SymbolDropped via relay failed");
-                        }
-                    }
-                    Err(e) => {
-                        warn!(err = %e, "processor: failed to decode SymbolDroppedMsg from relay")
-                    }
-                }
-            }
-            "symbol_drop_notice" => match from_cbor::<SymbolDropNoticeMsg>(&msg.payload) {
-                Ok(notice) => {
-                    self.handle_symbol_drop_notice(msg.from, notice);
-                }
-                Err(e) => {
-                    warn!(err = %e, "processor: failed to decode SymbolDropNoticeMsg from relay")
-                }
-            },
-            "revocation_broadcast" => match from_cbor::<RevocationBroadcast>(&msg.payload) {
-                Ok(broadcast) => {
-                    if let Err(e) = self.handle_revocation_broadcast(msg.from, broadcast).await {
-                        warn!(err = %e, "processor: RevocationBroadcast via relay failed");
-                    }
-                }
-                Err(e) => {
-                    warn!(err = %e, "processor: failed to decode RevocationBroadcast from relay")
-                }
-            },
-            "symbol_stored" => {
-                // Informational notification from a holder — Delta-era protocol
-                // surface kept for wire compatibility. No action taken: the owner
-                // already tracks placement state via SymbolAccept/SymbolTransfer.
-                debug!(from = %msg.from, "processor: symbol_stored — informational, no-op");
-            }
-            "storage_warning" => {
-                // Informational bit-rot / PoS pre-warning. No-op for now; the
-                // authoritative signal is PosNack / SymbolDropped which are
-                // already handled and trigger repair.
-                debug!(from = %msg.from, "processor: storage_warning — informational, no-op");
-            }
-            other => {
-                let safe_type: String = other
-                    .chars()
-                    .take(64)
-                    .filter(|c| c.is_ascii_graphic() || *c == ' ')
-                    .collect();
-                debug!("dispatch_relay: unknown msg_type={safe_type}");
-            }
-        }
     }
 }
 // PeerDiscoveryRequest and PeerDiscoveryResponse removed in ε.2 (AC-12).

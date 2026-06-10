@@ -1,8 +1,8 @@
 // DaemonHandle: wires all subsystems and manages their lifecycle.
 //
 // All subsystems are started here: BackupCoordinator, RestoreCoordinator,
-// RepairAgent, RelayManager, SwarmHandle, Processor, Watcher, Scheduler,
-// and CliServer.
+// RepairAgent, SwarmHandle, Processor, Watcher, Scheduler, the mailbox poll/sweep
+// tasks, and CliServer.
 
 #[cfg(test)]
 mod tests;
@@ -27,7 +27,6 @@ use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent};
 use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
 use crate::daemon::identity::{IdentityError, derive_keys, load_identity};
 use crate::daemon::processor::Processor;
-use crate::daemon::relay::{RelayConfig, RelayManager};
 use crate::daemon::repair::RepairTrigger;
 use crate::daemon::restore::{
     RestoreConfig, RestoreCoordinator, RestoreError, RestoreRequest, RestoreResult,
@@ -82,9 +81,6 @@ pub struct DaemonState {
     pub hard_quota_bytes: u64,
     /// Time acceleration factor (1 = real time).
     pub time_scale: u64,
-    /// Channel to post messages to the relay board (e.g. RevocationBroadcast).
-    /// None in tests that do not wire up a RelayManager.
-    pub relay_post_tx: Option<mpsc::Sender<crate::daemon::relay::RelayPost>>,
     /// libp2p swarm handle.
     pub swarm_handle: Option<std::sync::Arc<crate::daemon::network::swarm::SwarmHandle>>,
     /// Watch admin — manages dynamic folder add/remove/status.
@@ -295,23 +291,8 @@ impl DaemonHandle {
         let (repair_tx, repair_rx) = mpsc::channel::<RepairTrigger>(64);
         let (backup_event_tx, backup_event_rx) =
             mpsc::channel::<crate::daemon::backup::BackupEvent>(64);
-        let (relay_sync_tx, relay_sync_rx) = mpsc::channel::<crate::daemon::relay::SyncTrigger>(64);
-        let (relay_post_tx, relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(256);
-        // relay inbound messages → Processor dispatch_relay
-        let (inbound_tx, inbound_rx) = mpsc::channel::<crate::daemon::relay::InboundMessage>(128);
-
         // ── 7. Build erasure encoder ──────────────────────────────────────────
         let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
-
-        // ── 8. Derive x25519 key for relay encryption ────────────────────────
-        // HKDF-SHA256(ikm=seed, salt=b"", info=b"viaticum-x25519") → 32 bytes.
-        let x25519_priv = {
-            let hk = Hkdf::<Sha256>::new(Some(b""), &keyfile.seed);
-            let mut okm = [0u8; 32];
-            hk.expand(b"viaticum-x25519", &mut okm)
-                .expect("HKDF expand for x25519 cannot fail with valid length");
-            x25519_dalek::StaticSecret::from(okm)
-        };
 
         // ── 9. Ensure symbols and holdings directories exist ──────────────────
         let symbols_dir = cfg.data_dir.join("symbols");
@@ -527,18 +508,6 @@ impl DaemonHandle {
         // The repair instance is created in the reliability_scan task below.
         // The old repair.run() task is replaced by the WorkPipeline worker.
 
-        let board_path = cfg.data_dir.join("relay.board");
-        let relay = RelayManager::new(RelayConfig {
-            board_path,
-            identity_pub,
-            x25519_priv,
-            signing_key: master_key.clone(),
-            max_entries: app_config.network.relay_max_entries,
-            max_size_bytes: app_config.network.relay_max_size_mb * 1_048_576,
-            prune_interval_secs: (3600 / cfg.time_scale.max(1)).max(5),
-            ttl_secs: (viaticum_core::constants::RELAY_TTL_SECS / cfg.time_scale.max(1)).max(60),
-        })?;
-
         // ── 11. CancellationToken ─────────────────────────────────────────────
         let cancel = CancellationToken::new();
 
@@ -610,7 +579,6 @@ impl DaemonHandle {
             disk_reserve_bytes: viaticum_core::config::disk_reserve_bytes(&app_config),
             hard_quota_bytes: viaticum_core::config::hard_quota_bytes(&app_config),
             time_scale: cfg.time_scale.max(1),
-            relay_post_tx: Some(relay_post_tx.clone()),
             swarm_handle: swarm_handle_arc.clone(),
             // ── Step E: Add watch_admin to DaemonState ────────────────────────
             watch_admin: if app_config.web_api.enabled {
@@ -849,24 +817,6 @@ impl DaemonHandle {
             }));
         }
 
-        // Board sync must be faster than PoS timeout so challenges arrive before
-        // they expire (POS_TIMEOUT_SECS/time_scale → sync at ~1/3 of that), AND
-        // it must be fast enough to propagate SymbolDropped notices so owners
-        // can repair freed-up placements promptly. We cap at 10 min (scaled by
-        // time_scale, so 1 min at scale=10), floor 2s.
-        let pos_timeout_scaled = (viaticum_core::constants::POS_TIMEOUT_SECS / time_scale).max(1);
-        let drop_notice_cap = (600 / time_scale).max(2);
-        let board_sync_interval = (pos_timeout_scaled / 3).min(drop_notice_cap).max(2);
-        let swarm_for_relay = state.swarm_handle.clone();
-        tasks.push(tokio::spawn(relay.run(
-            relay_sync_rx,
-            inbound_tx,
-            relay_post_rx,
-            db.clone(),
-            board_sync_interval,
-            swarm_for_relay,
-        )));
-
         // ── Step E.5: Background rollup refresh task (every 5 min) ────────────
         if let Some(admin) = state.watch_admin.as_ref() {
             let admin_for_refresh = Arc::clone(admin);
@@ -922,12 +872,11 @@ impl DaemonHandle {
         }
 
         // ── Phase 7.2: spawn Processor ────────────────────────────────────────
-        // Create the PendingChallenges map here so both Processor and Scheduler
-        // share the same Arc. Scheduler is wired below; Processor consumes its clone.
+        // PendingChallenges map: owned by the Scheduler (it both writes challenges
+        // and resolves mailbox PoS responses against them). Wired below.
         let pending_challenges: PendingChallenges =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-        let repair_tx_for_processor = repair_tx.clone();
         // Raw quota values from config. 0 = "not configured" (use disk-based limit).
         // Processor and holder_cleanup compute effective_quota from disk_free at runtime.
         let soft_quota_bytes = viaticum_core::config::soft_quota_bytes(&app_config);
@@ -951,8 +900,6 @@ impl DaemonHandle {
                 Some(s) => s,
                 None => {
                     tracing::warn!("swarm unavailable — Processor not started");
-                    drop(inbound_rx);
-                    drop(repair_tx_for_processor);
                     return Ok(DaemonHandle { cancel, tasks });
                 }
             };
@@ -960,8 +907,6 @@ impl DaemonHandle {
                 Some(rx) => rx,
                 None => {
                     tracing::warn!("swarm events unavailable — Processor not started");
-                    drop(inbound_rx);
-                    drop(repair_tx_for_processor);
                     return Ok(DaemonHandle { cancel, tasks });
                 }
             };
@@ -969,19 +914,15 @@ impl DaemonHandle {
             let mut processor = Processor::new(
                 db.clone(),
                 identity_pub,
-                repair_tx_for_processor,
                 cluster_sync,
                 holdings_dir.clone(),
                 swarm_for_processor,
-                relay_sync_tx.clone(),
                 soft_quota_bytes,
                 hard_quota_bytes,
                 cfg.data_dir.clone(),
                 disk_reserve_bytes,
                 backup_event_tx,
                 time_scale,
-                pending_challenges.clone(),
-                relay_post_tx.clone(),
                 Some(cs.clone()),
                 app_config.escrow.clone(),
                 accepted_offers.clone(),
@@ -1021,7 +962,7 @@ impl DaemonHandle {
             let cancel_processor = cancel.clone();
             tasks.push(tokio::spawn(async move {
                 processor
-                    .run(swarm_event_rx_for_processor, inbound_rx, cancel_processor)
+                    .run(swarm_event_rx_for_processor, cancel_processor)
                     .await
             }));
 
@@ -1055,8 +996,6 @@ impl DaemonHandle {
             }
         } else {
             tracing::warn!("cluster state unavailable — Processor not started");
-            drop(inbound_rx);
-            drop(repair_tx_for_processor);
         }
 
         // ── Step F: Spawn watcher — ALWAYS (even with empty dir list) ────────
@@ -1121,7 +1060,6 @@ impl DaemonHandle {
             },
             repair_tx.clone(),
             pending_challenges,
-            relay_post_tx.clone(),
             std::sync::Arc::clone(&mailbox_router),
             identity_pub,
             master_key.clone(),
@@ -1313,7 +1251,6 @@ impl DaemonHandle {
         {
             let cleanup_db = db.clone();
             let cleanup_holdings = holdings_dir.clone();
-            let cleanup_relay = relay_post_tx.clone();
             let cleanup_router = std::sync::Arc::clone(&mailbox_router);
             let cleanup_cancel = cancel.clone();
             let cleanup_data_dir = cfg.data_dir.clone();
@@ -1324,7 +1261,6 @@ impl DaemonHandle {
                 crate::daemon::holder_cleanup::run(
                     cleanup_db,
                     cleanup_holdings,
-                    cleanup_relay,
                     cleanup_router,
                     soft_quota_bytes,
                     hard_quota_bytes,
@@ -1341,13 +1277,11 @@ impl DaemonHandle {
         }
 
         // ── Holdings integrity scan task ───────────────────────────────────
-        // T-13a: pass mailbox_router so the task can publish immediate-drop DropNotice
-        // via mailbox (replaces SymbolDropped-via-relay). relay_post_tx kept for
-        // signature compat; T-13b removes relay entirely.
+        // Publishes immediate-drop DropNotice via mailbox when a held symbol
+        // directory has vanished from disk (T-13a).
         {
             let integrity_db = db.clone();
             let integrity_holdings = holdings_dir.clone();
-            let integrity_relay = relay_post_tx.clone();
             let integrity_router = std::sync::Arc::clone(&mailbox_router);
             let integrity_cancel = cancel.clone();
             let integrity_master_key = master_key.clone();
@@ -1357,7 +1291,6 @@ impl DaemonHandle {
                 crate::daemon::holdings_integrity::run(
                     integrity_db,
                     integrity_holdings,
-                    integrity_relay,
                     integrity_router,
                     identity_pub,
                     integrity_interval,
@@ -1378,8 +1311,6 @@ impl DaemonHandle {
             drop(dirty_tx);
             drop(restore_tx);
             drop(repair_tx);
-            drop(relay_sync_tx);
-            drop(relay_post_tx);
             drop(work_event_tx);
         });
 

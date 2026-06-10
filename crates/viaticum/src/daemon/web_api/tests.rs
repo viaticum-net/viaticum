@@ -58,7 +58,6 @@ async fn make_test_state_with_restore(staging_path: std::path::PathBuf) -> Arc<D
         disk_reserve_bytes: 0,
         hard_quota_bytes: 0,
         time_scale: 1,
-        relay_post_tx: None,
         swarm_handle: None,
         watch_admin: None,
         config_admin: None,

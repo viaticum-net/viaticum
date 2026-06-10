@@ -13,7 +13,7 @@ use crate::config::{
 #[cfg(test)]
 use crate::constants::{
     DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_K_FACTOR, DEFAULT_MAX_VERSIONS,
-    DEFAULT_SOURCE_BLOCK_SIZE, MAX_BOARD_ENTRIES, MAX_BOARD_SIZE_BYTES,
+    DEFAULT_SOURCE_BLOCK_SIZE,
 };
 #[cfg(test)]
 use crate::importance::{
@@ -54,15 +54,7 @@ fn config_loads_defaults_when_file_is_empty() {
     );
     assert_eq!(cfg.storage.data_dir, defaults.storage.data_dir);
     assert_eq!(cfg.escrow.k_factor, defaults.escrow.k_factor);
-    assert_eq!(
-        cfg.network.relay_max_entries,
-        defaults.network.relay_max_entries
-    );
-    assert_eq!(
-        cfg.network.relay_max_size_mb,
-        defaults.network.relay_max_size_mb
-    );
-    assert_eq!(cfg.network.relay_ttl_days, defaults.network.relay_ttl_days);
+    assert_eq!(cfg.network.enable_relay, defaults.network.enable_relay);
     assert_eq!(
         cfg.cluster.sync_batch_size,
         defaults.cluster.sync_batch_size
@@ -99,9 +91,6 @@ fn config_roundtrips_all_fields() {
         },
         escrow: EscrowCfg { k_factor: 14.0 },
         network: NetworkCfg {
-            relay_max_entries: 1000,
-            relay_max_size_mb: 4,
-            relay_ttl_days: 14,
             enable_relay: false,
             enable_relay_server: false,
             relay_url: None,
@@ -132,9 +121,7 @@ fn config_roundtrips_all_fields() {
     assert_eq!(loaded.storage.disk_reserve_gb, 50.0);
     assert_eq!(loaded.storage.data_dir, "/data/viaticum");
     assert_eq!(loaded.escrow.k_factor, 14.0);
-    assert_eq!(loaded.network.relay_max_entries, 1000);
-    assert_eq!(loaded.network.relay_max_size_mb, 4);
-    assert_eq!(loaded.network.relay_ttl_days, 14);
+    assert!(!loaded.network.enable_relay);
     assert_eq!(loaded.cluster.sync_batch_size, 200);
 }
 
@@ -240,26 +227,6 @@ fn config_validate_allows_both_quotas_zero() {
     cfg.storage.soft_quota_gb = 0.0;
     cfg.storage.hard_quota_gb = 0.0;
     cfg.validate().unwrap();
-}
-
-#[test]
-fn config_validate_rejects_relay_max_entries_zero() {
-    let mut cfg = AppConfig::default();
-    cfg.network.relay_max_entries = 0;
-    let err = cfg.validate().unwrap_err();
-    assert!(
-        matches!(err, ConfigError::Validation { ref field, .. } if field == "network.relay_max_entries")
-    );
-}
-
-#[test]
-fn config_validate_rejects_relay_ttl_days_zero() {
-    let mut cfg = AppConfig::default();
-    cfg.network.relay_ttl_days = 0;
-    let err = cfg.validate().unwrap_err();
-    assert!(
-        matches!(err, ConfigError::Validation { ref field, .. } if field == "network.relay_ttl_days")
-    );
 }
 
 #[test]
@@ -380,11 +347,7 @@ fn config_defaults_match_constants() {
         DEFAULT_DISK_RESERVE_BYTES as f64 / 1_073_741_824.0
     );
     assert_eq!(cfg.escrow.k_factor, DEFAULT_ESCROW_K_FACTOR);
-    assert_eq!(cfg.network.relay_max_entries, MAX_BOARD_ENTRIES);
-    assert_eq!(
-        cfg.network.relay_max_size_mb,
-        MAX_BOARD_SIZE_BYTES / 1_048_576
-    );
+    assert!(cfg.network.enable_relay);
 }
 
 #[test]

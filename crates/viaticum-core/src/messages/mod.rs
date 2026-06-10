@@ -1,16 +1,8 @@
-use crate::constants::{
-    DIRECTED_ENCRYPTION_INFO, HANDSHAKE_FRESHNESS_SECS, MAX_MESSAGE_SIZE, MAX_RELAY_HOP,
-    PROTOCOL_VERSION, RELAY_TTL_SECS,
-};
+use crate::constants::{HANDSHAKE_FRESHNESS_SECS, MAX_MESSAGE_SIZE, PROTOCOL_VERSION};
 use crate::erasure::Symbol;
 use crate::mailbox::{MailboxEntry, MailboxRejectReason};
 use crate::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp, sig_serde};
-use chacha20poly1305::ChaCha20Poly1305;
-use chacha20poly1305::KeyInit;
-use chacha20poly1305::aead::AeadInPlace;
 use ed25519_dalek::Signer;
-use hkdf::Hkdf;
-use sha2::Sha256;
 
 // ============================================================
 // Message structs
@@ -305,39 +297,6 @@ pub struct ClusterSyncResponseMsg {
     pub timestamp: Timestamp,
 }
 
-/// Owner → Holder. Push encrypted DB snapshot for safekeeping.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct SystemStateBackupMsg {
-    pub v: u8,
-    #[serde(with = "serde_bytes")]
-    pub encrypted_blob: Vec<u8>,
-    pub timestamp: Timestamp,
-}
-
-/// Holder → Owner. Acknowledge receipt of system state backup.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct SystemStateAckMsg {
-    pub v: u8,
-    pub stored: bool,
-    pub timestamp: Timestamp,
-}
-
-/// Requester → Holder. Request stored system state blob. Identity from handshake.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct SystemStateRequestMsg {
-    pub v: u8,
-    pub timestamp: Timestamp,
-}
-
-/// Holder → Requester. Return stored blob (empty vec = not found).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct SystemStateResponseMsg {
-    pub v: u8,
-    #[serde(with = "serde_bytes")]
-    pub encrypted_blob: Vec<u8>,
-    pub timestamp: Timestamp,
-}
-
 /// Generic acknowledgement. Sent as a response to one-way messages delivered
 /// via libp2p request-response when the sender expects a reply to close the
 /// stream (Assumption A4 in ε.2 spec).
@@ -426,97 +385,18 @@ pub enum Message {
     RestoreRequest(RestoreRequestMsg),
     RestoreResponse(RestoreResponseMsg),
     RestoreDenied(RestoreDeniedMsg),
-    BoardSync(BoardSyncMsg),
     ClusterSyncRequest(ClusterSyncRequestMsg),
     MailboxFetchRequest(MailboxFetchRequest),
     MailboxFetchResponse(MailboxFetchResponse),
     MailboxStoreRequest(MailboxStoreRequest),
     MailboxStoreResponse(MailboxStoreResponse),
     ClusterSyncResponse(ClusterSyncResponseMsg),
-    SystemStateBackup(SystemStateBackupMsg),
-    SystemStateAck(SystemStateAckMsg),
-    SystemStateRequest(SystemStateRequestMsg),
-    SystemStateResponse(SystemStateResponseMsg),
     Ack(AckMsg),
     /// Decode-only sentinel: any unrecognised `"type"` tag value is decoded
     /// as this variant instead of returning a deserialisation error.
     /// Must never be constructed or sent.
     #[serde(other)]
     Unknown,
-}
-
-// ============================================================
-// Relay board types
-// ============================================================
-
-/// One entry stored in the board file (on disk) or exchanged during board sync.
-///
-/// Wraps a [`BoardEntry`] with its identifying metadata so the board file and
-/// wire format carry a self-contained, independently verifiable record.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct StoredEntry {
-    /// Type string (e.g. "pos_challenge", "peer_announce").
-    pub msg_type: String,
-    /// 16-byte unique ID.
-    pub msg_id: [u8; 16],
-    /// The board entry itself.
-    pub entry: BoardEntry,
-}
-
-/// Batch of relay board entries exchanged on connection setup.
-///
-/// Sent as the first message after handshake to let each peer populate its
-/// board with entries it may have missed while offline. Old nodes that do not
-/// recognise the `BoardSync` variant will log an unknown-variant decode error
-/// and skip it — no connection is terminated.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct BoardSyncMsg {
-    pub v: u8,
-    pub entries: Vec<StoredEntry>,
-    pub timestamp: Timestamp,
-}
-
-/// One entry on a relay board (append-only file).
-/// key: "{type}/{msg_id}"
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct BoardEntry {
-    /// "broadcast" or "directed".
-    pub kind: BoardEntryKind,
-    /// Only present for directed entries.
-    pub target_pub: Option<IdentityPub>,
-    /// For broadcast: raw CBOR of the inner message.
-    /// For directed: encrypted CBOR (ECDH + ChaCha20-Poly1305), see DirectedEnvelope.
-    #[serde(with = "serde_bytes")]
-    pub payload: Vec<u8>,
-    /// Ed25519 sig over: type_str || msg_id || kind_str || target_pub_or_empty || payload.
-    /// Signed by original author (preserved by relay nodes — never re-signed).
-    #[serde(with = "sig_serde")]
-    pub sig_author: [u8; 64],
-    /// Author's identity_pub (needed to verify sig_author).
-    pub author: IdentityPub,
-    /// Hop count. Original entry = 0. Each relay copy increments by 1.
-    pub hop: u8,
-    /// When this entry was created (for TTL = RELAY_TTL_SECS).
-    pub created_at: Timestamp,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BoardEntryKind {
-    Broadcast,
-    Directed,
-}
-
-/// Encrypted envelope for directed payloads.
-/// Inner payload is CBOR-serialized directed message struct.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct DirectedEnvelope {
-    /// Sender's X25519 ephemeral public key (32 bytes).
-    pub sender_x25519_pub: [u8; 32],
-    /// ChaCha20-Poly1305 nonce (12 bytes).
-    pub nonce: [u8; 12],
-    /// Encrypted + authenticated CBOR payload.
-    pub ciphertext: Vec<u8>,
 }
 
 // ============================================================
@@ -548,12 +428,6 @@ pub enum MessageError {
 
     #[error("handshake timestamp too old or future: delta {delta_secs}s")]
     HandshakeStale { delta_secs: i64 },
-
-    #[error("directed encryption error: {0}")]
-    EncryptionError(String),
-
-    #[error("relay hop limit exceeded: hop={hop}")]
-    HopLimitExceeded { hop: u8 },
 }
 
 // ============================================================
@@ -920,208 +794,6 @@ pub fn verify_handshake(msg: &HandshakeMsg, now: Timestamp) -> Result<(), Messag
         .map_err(|_| MessageError::BadSignature)?;
 
     Ok(())
-}
-
-// ============================================================
-// Directed encryption
-// ============================================================
-
-/// Encrypt a directed payload for target_pub.
-///
-/// Generates an ephemeral X25519 keypair internally for forward secrecy.
-/// The ephemeral public key is embedded in the envelope for the recipient.
-pub fn encrypt_directed(
-    plaintext: &[u8],
-    target_x25519_pub: &x25519_dalek::PublicKey,
-) -> Result<DirectedEnvelope, MessageError> {
-    use rand_core::OsRng;
-    let ephemeral_priv = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-    let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral_priv);
-    let shared = ephemeral_priv.diffie_hellman(target_x25519_pub);
-
-    let chacha_key = derive_chacha_key(
-        shared.as_bytes(),
-        &ephemeral_pub.to_bytes(),
-        &target_x25519_pub.to_bytes(),
-    )?;
-    let cipher = ChaCha20Poly1305::new(&chacha_key.into());
-
-    let nonce_bytes: [u8; 12] = rand::random();
-    let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
-
-    let mut buffer = plaintext.to_vec();
-    cipher
-        .encrypt_in_place(&nonce, b"", &mut buffer)
-        .map_err(|e| MessageError::EncryptionError(e.to_string()))?;
-
-    Ok(DirectedEnvelope {
-        sender_x25519_pub: ephemeral_pub.to_bytes(),
-        nonce: nonce_bytes,
-        ciphertext: buffer,
-    })
-}
-
-/// Decrypt a directed payload.
-pub fn decrypt_directed(
-    envelope: &DirectedEnvelope,
-    own_x25519_priv: &x25519_dalek::StaticSecret,
-) -> Result<Vec<u8>, MessageError> {
-    let sender_pub = x25519_dalek::PublicKey::from(envelope.sender_x25519_pub);
-    let own_pub = x25519_dalek::PublicKey::from(own_x25519_priv);
-    let shared = own_x25519_priv.diffie_hellman(&sender_pub);
-
-    let chacha_key = derive_chacha_key(
-        shared.as_bytes(),
-        &envelope.sender_x25519_pub,
-        &own_pub.to_bytes(),
-    )?;
-    let cipher = ChaCha20Poly1305::new(&chacha_key.into());
-
-    let nonce = chacha20poly1305::Nonce::from(envelope.nonce);
-
-    let mut buffer = envelope.ciphertext.clone();
-    cipher
-        .decrypt_in_place(&nonce, b"", &mut buffer)
-        .map_err(|e| MessageError::EncryptionError(e.to_string()))?;
-
-    Ok(buffer)
-}
-
-/// HKDF with salt = sender_pub || receiver_pub for standard ECIES security.
-fn derive_chacha_key(
-    shared_bytes: &[u8],
-    sender_pub: &[u8; 32],
-    receiver_pub: &[u8; 32],
-) -> Result<[u8; 32], MessageError> {
-    let mut salt = [0u8; 64];
-    salt[..32].copy_from_slice(sender_pub);
-    salt[32..].copy_from_slice(receiver_pub);
-    let hk = Hkdf::<Sha256>::new(Some(&salt), shared_bytes);
-    let mut okm = [0u8; 32];
-    hk.expand(DIRECTED_ENCRYPTION_INFO, &mut okm)
-        .map_err(|e| MessageError::EncryptionError(e.to_string()))?;
-    Ok(okm)
-}
-
-// ============================================================
-// Board entry helpers
-// ============================================================
-
-fn board_entry_sig_input(
-    msg_type: &str,
-    msg_id: &[u8; 16],
-    kind: BoardEntryKind,
-    target_pub: Option<&IdentityPub>,
-    payload: &[u8],
-) -> Vec<u8> {
-    let kind_str: &[u8] = match kind {
-        BoardEntryKind::Broadcast => b"broadcast",
-        BoardEntryKind::Directed => b"directed",
-    };
-    let mut input = Vec::new();
-    input.extend_from_slice(msg_type.as_bytes());
-    input.extend_from_slice(msg_id);
-    input.extend_from_slice(kind_str);
-    if let Some(tp) = target_pub {
-        input.extend_from_slice(&tp.0);
-    }
-    input.extend_from_slice(payload);
-    input
-}
-
-/// Build and sign a broadcast BoardEntry.
-pub fn build_broadcast_entry(
-    msg_type: &str,
-    msg_id: [u8; 16],
-    payload: Vec<u8>,
-    author: IdentityPub,
-    now: Timestamp,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> BoardEntry {
-    let sig_input =
-        board_entry_sig_input(msg_type, &msg_id, BoardEntryKind::Broadcast, None, &payload);
-    let signature = signing_key.sign(&sig_input);
-    BoardEntry {
-        kind: BoardEntryKind::Broadcast,
-        target_pub: None,
-        payload,
-        sig_author: signature.to_bytes(),
-        author,
-        hop: 0,
-        created_at: now,
-    }
-}
-
-/// Build and sign a directed BoardEntry (payload already encrypted by caller).
-pub fn build_directed_entry(
-    msg_type: &str,
-    msg_id: [u8; 16],
-    target_pub: IdentityPub,
-    encrypted_payload: Vec<u8>,
-    author: IdentityPub,
-    now: Timestamp,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> BoardEntry {
-    let sig_input = board_entry_sig_input(
-        msg_type,
-        &msg_id,
-        BoardEntryKind::Directed,
-        Some(&target_pub),
-        &encrypted_payload,
-    );
-    let signature = signing_key.sign(&sig_input);
-    BoardEntry {
-        kind: BoardEntryKind::Directed,
-        target_pub: Some(target_pub),
-        payload: encrypted_payload,
-        sig_author: signature.to_bytes(),
-        author,
-        hop: 0,
-        created_at: now,
-    }
-}
-
-/// Verify a board entry's signature.
-pub fn verify_board_entry_sig(
-    entry: &BoardEntry,
-    msg_type: &str,
-    msg_id: &[u8; 16],
-) -> Result<(), MessageError> {
-    let sig_input = board_entry_sig_input(
-        msg_type,
-        msg_id,
-        entry.kind,
-        entry.target_pub.as_ref(),
-        &entry.payload,
-    );
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&entry.author.0)
-        .map_err(|_| MessageError::BadSignature)?;
-    let signature = ed25519_dalek::Signature::from_bytes(&entry.sig_author);
-    verifying_key
-        .verify_strict(&sig_input, &signature)
-        .map_err(|_| MessageError::BadSignature)?;
-    Ok(())
-}
-
-/// Check if a board entry has expired (created_at + RELAY_TTL_SECS <= now).
-pub fn is_board_entry_expired(entry: &BoardEntry, now: Timestamp) -> bool {
-    entry.created_at.0.saturating_add(RELAY_TTL_SECS) <= now.0
-}
-
-/// Check if this entry can be relayed further (hop < MAX_RELAY_HOP).
-pub fn check_relay_hop(entry: &BoardEntry) -> Result<(), MessageError> {
-    if entry.hop >= MAX_RELAY_HOP {
-        return Err(MessageError::HopLimitExceeded { hop: entry.hop });
-    }
-    Ok(())
-}
-
-/// Produce a relay copy of an entry with hop incremented by 1.
-pub fn relay_copy(entry: &BoardEntry) -> BoardEntry {
-    BoardEntry {
-        hop: entry.hop + 1,
-        ..entry.clone()
-    }
 }
 
 // ============================================================

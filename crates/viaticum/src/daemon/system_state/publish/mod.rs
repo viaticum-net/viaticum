@@ -9,7 +9,7 @@
 //
 // On top of the placed blocks the owner publishes a tiny signed SelfPointer
 // (W-F) telling disaster recovery which blocks make up the latest state and who
-// holds them. The pointer rides the existing SystemStateBackup blob field.
+// holds them. The pointer is carried by the mailbox bus (A2), not by any blob field.
 
 use std::path::Path;
 

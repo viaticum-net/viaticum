@@ -5,15 +5,12 @@ use tracing::{debug, error, info, warn};
 use viaticum_core::constants::{MESSAGE_FRESHNESS_SECS, SYMBOL_OFFER_EXPIRY_SECS, SYMBOL_SIZE};
 use viaticum_core::db::Db;
 use viaticum_core::messages::{
-    CancelDeleteMsg, DeleteMsg, RejectReason, RevocationBroadcast, SymbolAcceptMsg,
-    SymbolDropNoticeMsg, SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg, SymbolTransferMsg,
-    verify_symbol_drop_notice, verify_symbol_offer,
+    RejectReason, RevocationBroadcast, SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolOfferMsg,
+    SymbolRejectMsg, SymbolTransferMsg, verify_symbol_drop_notice, verify_symbol_offer,
 };
 use viaticum_core::types::{
     DeviceId, HoldingRecord, HoldingStatus, IdentityPub, Timestamp, hex_encode,
 };
-
-use crate::daemon::repair::RepairTrigger;
 
 use super::{AcceptedOffer, Processor, ProcessorError, esi_list_to_ranges, ranges_to_esi_list};
 
@@ -609,8 +606,9 @@ pub(crate) fn apply_cancel_delete(
 /// Abstraction for handling a Revocation mailbox entry.
 ///
 /// Called by the mailbox poll loop when a `MailboxClass::Revocation` entry is received.
-/// Production impl: `RevocationHandler` delegates to the same logic as
-/// `Processor::handle_revocation_broadcast`.
+/// Production impl: `RevocationHandler` carries the device-revocation apply logic that
+/// formerly lived in the relay-board `Processor::handle_revocation_broadcast` (removed
+/// in A2 / T-13b-3 along with the relay board).
 ///
 /// Parameters to `handle_revocation`:
 /// - `from`: revoking master pub (from `MailboxEntry.sender`).
@@ -1163,122 +1161,6 @@ impl Processor {
                 reason: format!("{:?}", reject.reason),
             })
             .await;
-        Ok(())
-    }
-
-    /// Mark a placement Lost (holder evicted the symbols).
-    ///
-    /// Idempotent: no-op if already Lost or Deleting.
-    /// Returns true if the placement was actually modified.
-    pub(crate) fn handle_symbol_dropped_sync(
-        &self,
-        holder_id: DeviceId,
-        dropped: &SymbolDroppedMsg,
-    ) -> Result<bool, ProcessorError> {
-        let block_id = dropped.source_block_id;
-        super::mark_placement_lost(&self.db, &block_id, &holder_id)
-    }
-
-    pub(crate) async fn handle_symbol_dropped(
-        &self,
-        from: DeviceId,
-        dropped: SymbolDroppedMsg,
-    ) -> Result<(), ProcessorError> {
-        let block_id = dropped.source_block_id;
-
-        // Verify the per-message signature using the claimant holder's master
-        // identity. Without this, any peer knowing the victim's IdentityPub could
-        // forge a SymbolDropped and trigger a repair storm (review S2).
-        match self.db.get_master_for_device(&from) {
-            Ok(Some(master)) => {
-                if let Err(e) = viaticum_core::messages::verify_symbol_dropped(&dropped, &master) {
-                    warn!(
-                        device = %from,
-                        block_id = %block_id,
-                        err = %e,
-                        "processor: SymbolDropped signature verification failed — ignoring"
-                    );
-                    return Ok(());
-                }
-            }
-            Ok(None) => {
-                warn!(
-                    device = %from,
-                    block_id = %block_id,
-                    "processor: SymbolDropped from unknown device — ignoring"
-                );
-                return Ok(());
-            }
-            Err(e) => {
-                error!(
-                    device = %from,
-                    err = %e,
-                    "processor: SymbolDropped — DB lookup failed"
-                );
-                return Ok(());
-            }
-        }
-
-        self.handle_symbol_dropped_sync(from, &dropped)?;
-
-        // Refresh trust_s: holder evicted our symbols, bytes_peer_stores_for_us decreased.
-        if let Err(e) = self.db.refresh_peer_storage_bytes(&from) {
-            error!(
-                device = %from,
-                err = %e,
-                "processor: failed to refresh storage balance after SymbolDropped"
-            );
-        }
-
-        info!(block_id = %block_id, holder = %from, "repair: triggered");
-        let _ = self
-            .repair_tx
-            .send(RepairTrigger::RepairNow {
-                block_id,
-                holder_id: from,
-            })
-            .await;
-        Ok(())
-    }
-
-    /// Handle advance eviction notice from a holder.
-    ///
-    /// Delegates to `SymbolDropHandler::apply` — extracted so the mailbox poll
-    /// loop (T-7) can call the same logic without an `Arc<Processor>`.
-    ///
-    /// Unlike `handle_symbol_dropped`, this handler does NOT send a
-    /// `RepairTrigger::RepairNow`. The block re-enters the worker queue
-    /// automatically via `next_work_item` once `current_reliability` drops
-    /// below `target_reliability`. Repair latency is bounded by the worker
-    /// poll interval — acceptable for cold backup (time constant = 1 week).
-    pub(crate) fn handle_symbol_drop_notice(&self, from: IdentityPub, notice: SymbolDropNoticeMsg) {
-        SymbolDropHandler::new(self.db.clone()).apply(from, notice);
-    }
-
-    /// Handle a Delete request from the owner. Verify signature, then mark
-    /// the holding as MarkedForDelete so the cleanup task can process it later.
-    ///
-    /// Delegates to `apply_delete` (shared with mailbox path) so logic is never duplicated.
-    /// The relay dispatch arm calls this; the mailbox path calls `apply_delete` directly
-    /// via `ProcessorDeleteHandler`.
-    pub(crate) async fn handle_delete(
-        &self,
-        from: IdentityPub,
-        delete: DeleteMsg,
-    ) -> Result<(), ProcessorError> {
-        apply_delete(&self.db, from, delete);
-        Ok(())
-    }
-
-    /// Handle a CancelDelete from the owner. Revert MarkedForDelete → Active.
-    ///
-    /// Delegates to `apply_cancel_delete` (shared with mailbox path).
-    pub(crate) async fn handle_cancel_delete(
-        &self,
-        from: IdentityPub,
-        cancel: CancelDeleteMsg,
-    ) -> Result<(), ProcessorError> {
-        apply_cancel_delete(&self.db, from, cancel);
         Ok(())
     }
 }

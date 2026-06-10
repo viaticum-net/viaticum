@@ -54,11 +54,6 @@ pub(crate) const POS_WEEKLY: TableDefinition<&[u8; 36], &[u8]> = TableDefinition
 /// Cluster state singleton. Key = "cluster_state". Value = CBOR(StoredClusterState).
 const CLUSTER_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("cluster_state");
 
-/// System state blobs stored for other nodes (holder-side).
-/// Key = owner IdentityPub [u8;32]. Value = CBOR(SystemStateBlobRecord).
-const SYSTEM_STATE_BLOBS: TableDefinition<&[u8; 32], &[u8]> =
-    TableDefinition::new("system_state_blobs");
-
 /// Owner-side ledger of SystemState-as-block ids (the SS-as-block workstream).
 /// Key = block_id [u8;32]. Value = CBOR(u32) generation that produced the block.
 /// SS blocks live in SOURCE_BLOCKS (so the generic pipeline places/PoS them), but
@@ -90,9 +85,6 @@ const META_KEY_NEXT_FILE_ID: &str = "next_file_id";
 
 /// Meta flag: HOLDINGS keys are owner-first (block‖owner → owner‖block migration done, S-4).
 const META_KEY_HOLDINGS_OWNER_KEYED: &str = "holdings_owner_keyed_v1";
-
-/// TTL for stored system state blobs: 365 days.
-pub const SYSTEM_STATE_TTL_SECS: u64 = 365 * 24 * 3600;
 
 // --- Indices ---
 
@@ -190,15 +182,6 @@ fn mailbox_entry_key(target: &IdentityPub, msg_id: [u8; 16], class: MailboxClass
 pub struct WeeklyPosEntry {
     pub challenged: u32,
     pub passed: u32,
-}
-
-/// One stored system state blob. Stored by holder on behalf of an owner.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SystemStateBlobRecord {
-    pub owner: IdentityPub,
-    pub encrypted_blob: Vec<u8>,
-    pub created_at: Timestamp,
-    pub stored_at: Timestamp,
 }
 
 /// Hot layer: in-memory aggregates loaded at startup.
@@ -361,7 +344,6 @@ impl Db {
             tx.open_table(HOLDER_FILES)?;
             tx.open_table(CONTENT_INDEX)?;
             tx.open_table(CLUSTER_STATE)?;
-            tx.open_table(SYSTEM_STATE_BLOBS)?;
             tx.open_table(SS_BLOCKS)?;
             tx.open_table(RESTORE_SERVED)?;
             tx.open_table(DEVICE_TRUST)?;
@@ -434,6 +416,10 @@ impl Db {
         }
 
         Self::create_tables(&db)?;
+        // A2 (T-13b-3): the relay-board SystemState blob transport is retired.
+        // Drop the legacy `system_state_blobs` table if a pre-A2 database still
+        // carries it, so the stale blobs are reclaimed. No-op on fresh DBs.
+        Self::drop_legacy_system_state_blobs(&db)?;
         let hot = HotCache::build_from_db(&db)?;
         let db = Db {
             inner: Arc::new(db),
@@ -442,6 +428,21 @@ impl Db {
         db.backfill_content_index()?;
         db.migrate_holdings_key_order()?;
         Ok(db)
+    }
+
+    /// One-time cleanup (A2 / T-13b-3): drop the retired `system_state_blobs`
+    /// table. `delete_table` returns `Ok(false)` when the table is absent, so this
+    /// is a safe no-op on fresh or already-migrated databases.
+    fn drop_legacy_system_state_blobs(db: &redb::Database) -> Result<(), DbError> {
+        const LEGACY_SYSTEM_STATE_BLOBS: TableDefinition<&[u8; 32], &[u8]> =
+            TableDefinition::new("system_state_blobs");
+        let tx = db.begin_write()?;
+        let dropped = tx.delete_table(LEGACY_SYSTEM_STATE_BLOBS)?;
+        tx.commit()?;
+        if dropped {
+            tracing::info!("db: dropped retired system_state_blobs table (A2 cut-over)");
+        }
+        Ok(())
     }
 
     /// One-time migration (S-4): re-key HOLDINGS from the old block‖owner layout to
@@ -1923,64 +1924,6 @@ impl Db {
 }
 
 // ============================================================
-// System state blobs table
-// ============================================================
-
-impl Db {
-    /// Store a system state blob from an owner. Overwrites any previous blob.
-    pub fn store_system_state_blob(
-        &self,
-        owner: &IdentityPub,
-        record: &SystemStateBlobRecord,
-    ) -> Result<(), DbError> {
-        let val = to_cbor_bytes(record);
-        let tx = self.inner.begin_write()?;
-        {
-            let mut table = tx.open_table(SYSTEM_STATE_BLOBS)?;
-            table.insert(&owner.0, val.as_slice())?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Get a stored system state blob for an owner.
-    /// Returns None if not found or expired (stored_at older than TTL).
-    pub fn get_system_state_blob(
-        &self,
-        owner: &IdentityPub,
-    ) -> Result<Option<SystemStateBlobRecord>, DbError> {
-        let tx = self.inner.begin_read()?;
-        let table = tx.open_table(SYSTEM_STATE_BLOBS)?;
-        match table.get(&owner.0)? {
-            None => Ok(None),
-            Some(guard) => {
-                let record: SystemStateBlobRecord = from_cbor_bytes(guard.value())?;
-                let now = Timestamp::now();
-                if now.0.saturating_sub(record.stored_at.0) > SYSTEM_STATE_TTL_SECS {
-                    drop(guard);
-                    drop(table);
-                    drop(tx);
-                    let _ = self.delete_system_state_blob(owner);
-                    return Ok(None);
-                }
-                Ok(Some(record))
-            }
-        }
-    }
-
-    /// Delete stored blob for an owner. No-op if not found.
-    pub fn delete_system_state_blob(&self, owner: &IdentityPub) -> Result<(), DbError> {
-        let tx = self.inner.begin_write()?;
-        {
-            let mut table = tx.open_table(SYSTEM_STATE_BLOBS)?;
-            table.remove(&owner.0)?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-}
-
-// ============================================================
 // Restore served table
 // ============================================================
 
@@ -2105,7 +2048,6 @@ pub struct TableStats {
     pub holdings: u64,
     pub event_log: u64,
     pub pos_weekly: u64,
-    pub system_state_blobs: u64,
     pub file_holders: u64,
     pub holder_files: u64,
     #[serde(default)]
@@ -2124,7 +2066,6 @@ impl Db {
             holdings: tx.open_table(HOLDINGS)?.len()?,
             event_log: tx.open_table(EVENT_LOG)?.len()?,
             pos_weekly: tx.open_table(POS_WEEKLY)?.len()?,
-            system_state_blobs: tx.open_table(SYSTEM_STATE_BLOBS)?.len()?,
             file_holders: tx.open_table(FILE_HOLDERS)?.len()?,
             holder_files: tx.open_table(HOLDER_FILES)?.len()?,
             mailbox_entries: tx.open_table(MAILBOX_ENTRIES)?.len()?,

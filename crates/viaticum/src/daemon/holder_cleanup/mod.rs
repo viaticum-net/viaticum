@@ -4,18 +4,14 @@
 //   - Scan for holdings where MarkedForDelete cooldown has expired → delete files + DB record → publish DropNotice via mailbox.
 //   - Evaluate disk pressure periodically → evict lowest-priority holdings → publish DropNotice via mailbox.
 //   - T-7: advance DropNotice (before physical delete) via mailbox, batched per owner.
-//   - T-13a: immediate-drop DropNotice (deadline=now) via mailbox (replaces SymbolDropped-via-relay).
-//            relay_post_tx kept in run() signature — T-13b removes relay entirely.
+//   - T-13a: immediate-drop DropNotice (deadline=now) via mailbox.
 //
-// Relay-board status: T-13a removed the SymbolDropped relay producers.
-// DeleteMsg + RevocationBroadcast + the legacy PoS relay arm still use the board;
-// their migration/removal is a separate T-13b scope decision.
+// A2 (T-13b-3): relay board fully retired; all DropNotice transport is via the mailbox bus.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use viaticum_core::budget::{DiskPressure, evaluate_pressure};
@@ -29,7 +25,6 @@ use viaticum_core::messages::{
 use viaticum_core::types::{IdentityPub, Timestamp, hex_encode};
 
 use crate::daemon::mailbox::routing::MailboxRouter;
-use crate::daemon::relay::RelayPost;
 
 #[cfg(test)]
 mod tests;
@@ -44,13 +39,11 @@ mod tests;
 ///    On hard pressure, evict lowest-priority holdings and publish immediate DropNotice.
 ///
 /// T-7: advance DropNotice (before physical delete) via mailbox, batched per owner.
-/// T-13a: immediate-drop DropNotice (deadline=now) via mailbox (replaces SymbolDropped-via-relay).
-/// `relay_post_tx` is kept in the signature; T-13b removes relay entirely.
+/// T-13a: immediate-drop DropNotice (deadline=now) via mailbox.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     db: Db,
     holdings_dir: PathBuf,
-    relay_post_tx: mpsc::Sender<RelayPost>,
     mailbox_router: Arc<MailboxRouter>,
     soft_quota_bytes: u64,
     hard_quota_bytes: u64,
@@ -62,9 +55,6 @@ pub async fn run(
     master_signing_key: ed25519_dalek::SigningKey,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    // relay_post_tx is kept for signature compat; T-13b removes relay entirely.
-    let _relay_post_tx = relay_post_tx;
-
     let mut cleanup_timer =
         tokio::time::interval(std::time::Duration::from_secs(cleanup_interval_secs.max(1)));
     let mut pressure_timer = tokio::time::interval(std::time::Duration::from_secs(

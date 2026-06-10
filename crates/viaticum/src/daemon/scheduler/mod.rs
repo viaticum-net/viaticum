@@ -31,7 +31,6 @@ use viaticum_core::types::{
 };
 
 use crate::daemon::mailbox::routing::MailboxRouter;
-use crate::daemon::relay::RelayPost;
 use crate::daemon::repair::RepairTrigger;
 
 #[cfg(test)]
@@ -90,10 +89,6 @@ pub struct Scheduler {
     repair_tx: mpsc::Sender<RepairTrigger>,
     /// Shared with Processor for response matching.
     pending: PendingChallenges,
-    /// Channel to post messages to the relay board.
-    /// Kept for T-13b-3 (full relay board removal) — inert after T-13b-1 migrated Delete.
-    #[allow(dead_code)]
-    relay_post_tx: mpsc::Sender<RelayPost>,
     /// Mailbox router for publishing PoS challenges via the mailbox bus (T-6).
     /// Replaces the relay path for PosHashChallengeMsg.
     mailbox_router: Arc<MailboxRouter>,
@@ -125,7 +120,6 @@ impl Scheduler {
         config: SchedulerConfig,
         repair_tx: mpsc::Sender<RepairTrigger>,
         pending: PendingChallenges,
-        relay_post_tx: mpsc::Sender<RelayPost>,
         mailbox_router: Arc<MailboxRouter>,
         my_master_pub: IdentityPub,
         signing_key: ed25519_dalek::SigningKey,
@@ -140,7 +134,6 @@ impl Scheduler {
             config,
             repair_tx,
             pending,
-            relay_post_tx,
             mailbox_router,
             my_master_pub,
             signing_key,

@@ -7,16 +7,13 @@
 // Test coverage:
 //   handle_symbol_transfer               — writes files, upserts HoldingRecord
 //   handle_pos_hash_challenge_inner      — responds with chain hash or PosHashNack
-//   handle_pos_hash_response             — verifies chain hash, updates trust/placement
-//   handle_symbol_dropped_sync           — marks placement Lost
 //   esi_list_to_ranges / ranges_to_esi_list — round-trip helpers
 //   decide_symbol_offer                  — quota check logic
 //   handle_restore_request_inner         — returns symbols or empty response
-//   handle_board_sync                    — forwards to relay_sync_tx
 //   handle_peer_announce                 — upserts PeerRecord in DB
-//   dispatch_relay                       — PeerAnnounce via relay
+//   SymbolDropHandler / apply_delete / apply_cancel_delete / RevocationHandler —
+//     standalone mailbox handlers (A2): DropNotice, Delete/CancelDelete, revocation
 //   build_peer_announce                  — SwarmHandle helper builds a signed message
-//   handle_revocation_broadcast          — verifies certs and marks device key revoked
 //   on_peer_authenticated                — AC-1, AC-2: upserts PeerRecord, auto-adds cluster device
 //   on_connection_closed                 — AC-13: removes from peer_cert_map
 //   AC-1: transfer_without_offer_rejected
@@ -35,8 +32,8 @@ use tokio::sync::mpsc;
 use viaticum_core::cluster::{ClusterState, derive_master_key, master_identity};
 use viaticum_core::db::Db;
 use viaticum_core::messages::{
-    BoardSyncMsg, PeerAnnounceMsg, PosHashChallengeMsg, RestoreRequestMsg, SymbolAcceptMsg,
-    SymbolDropNoticeMsg, SymbolRejectMsg, SymbolTransferMsg, build_signed_symbol_drop_notice,
+    PeerAnnounceMsg, PosHashChallengeMsg, RestoreRequestMsg, SymbolAcceptMsg, SymbolDropNoticeMsg,
+    SymbolRejectMsg, SymbolTransferMsg, build_signed_symbol_drop_notice,
 };
 use viaticum_core::types::{
     DeviceId, FileId, HoldingRecord, HoldingStatus, IdentityPub, PlacementStatus, SourceBlockId,
@@ -46,8 +43,6 @@ use viaticum_core::types::{
 use super::{AcceptedOffer, Processor, esi_list_to_ranges, ranges_to_esi_list};
 use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
 use crate::daemon::network::swarm::{SwarmConfig, SwarmHandle};
-use crate::daemon::relay::{InboundMessage, RelayPost, SyncTrigger};
-use crate::daemon::repair::RepairTrigger;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -134,14 +129,7 @@ async fn make_swarm() -> Arc<SwarmHandle> {
     Arc::new(handle)
 }
 
-async fn make_processor(
-    db: Db,
-    holdings_dir: &TempDir,
-) -> (
-    Processor,
-    mpsc::Receiver<RepairTrigger>,
-    mpsc::Receiver<SyncTrigger>,
-) {
+async fn make_processor(db: Db, holdings_dir: &TempDir) -> Processor {
     make_processor_with_quota(db, holdings_dir, u64::MAX, u64::MAX).await
 }
 
@@ -150,14 +138,7 @@ async fn make_processor_with_quota(
     holdings_dir: &TempDir,
     soft_quota_bytes: u64,
     hard_quota_bytes: u64,
-) -> (
-    Processor,
-    mpsc::Receiver<RepairTrigger>,
-    mpsc::Receiver<SyncTrigger>,
-) {
-    let (repair_tx, repair_rx) = mpsc::channel::<RepairTrigger>(16);
-    let (relay_sync_tx, relay_sync_rx) = mpsc::channel::<SyncTrigger>(16);
-
+) -> Processor {
     let master_key = derive_master_key(&[42u8; 64]).expect("derive_master_key failed");
     let own_identity = master_identity(&master_key);
     // device_id = pubkey derived from device_seed
@@ -185,98 +166,24 @@ async fn make_processor_with_quota(
 
     let (backup_event_tx, _backup_event_rx) =
         tokio::sync::mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
-    let pending_challenges: crate::daemon::scheduler::PendingChallenges =
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let accepted_offers = super::make_empty_accepted_offers();
-    let processor = Processor::new(
+    Processor::new(
         db,
         own_identity,
-        repair_tx,
         cluster_sync,
         holdings_dir.path().to_path_buf(),
         swarm,
-        relay_sync_tx,
         soft_quota_bytes,
         hard_quota_bytes,
         holdings_dir.path().to_path_buf(), // data_dir (for disk space queries in tests)
         0,                                 // disk_reserve_bytes (no reserve in tests)
         backup_event_tx,
-        1, // time_scale
-        pending_challenges,
-        relay_post_tx,
+        1,    // time_scale
         None, // cluster_state: not needed for handler unit tests
         viaticum_core::config::EscrowCfg::default(),
         accepted_offers,
         ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
-    );
-
-    (processor, repair_rx, relay_sync_rx)
-}
-
-async fn make_processor_with_pending(
-    db: Db,
-    holdings_dir: &TempDir,
-    pending: crate::daemon::scheduler::PendingChallenges,
-) -> (
-    Processor,
-    mpsc::Receiver<RepairTrigger>,
-    mpsc::Receiver<SyncTrigger>,
-) {
-    let (repair_tx, repair_rx) = mpsc::channel::<RepairTrigger>(16);
-    let (relay_sync_tx, relay_sync_rx) = mpsc::channel::<SyncTrigger>(16);
-
-    let master_key = derive_master_key(&[42u8; 64]).expect("derive_master_key failed");
-    let own_identity = master_identity(&master_key);
-    let device_seed = [1u8; 32];
-    let device_signing_key = viaticum_core::cluster::derive_device_key(&[42u8; 64], &device_seed)
-        .expect("derive_device_key failed");
-    let device_id = DeviceId(device_signing_key.verifying_key().to_bytes());
-    let now = Timestamp::now();
-
-    let cert = viaticum_core::cluster::issue_device_certificate(&master_key, device_id, now);
-    let cluster_state = ClusterState::init(db.clone(), own_identity, cert, now, now)
-        .expect("ClusterState::init failed");
-    let cluster_state = Arc::new(Mutex::new(cluster_state));
-
-    let cluster_sync = Arc::new(ClusterSyncManager::new(
-        db.clone(),
-        ClusterSyncConfig {
-            our_device_id: device_id,
-            batch_size: 1000,
-        },
-        cluster_state,
-    ));
-
-    let swarm = make_swarm().await;
-
-    let (backup_event_tx, _backup_event_rx) =
-        tokio::sync::mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
-    let accepted_offers = super::make_empty_accepted_offers();
-    let processor = Processor::new(
-        db,
-        own_identity,
-        repair_tx,
-        cluster_sync,
-        holdings_dir.path().to_path_buf(),
-        swarm,
-        relay_sync_tx,
-        u64::MAX,
-        u64::MAX,
-        holdings_dir.path().to_path_buf(),
-        0,
-        backup_event_tx,
-        1, // time_scale
-        pending,
-        relay_post_tx,
-        None, // cluster_state: not needed for handler unit tests
-        viaticum_core::config::EscrowCfg::default(),
-        accepted_offers,
-        ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
-    );
-
-    (processor, repair_rx, relay_sync_rx)
+    )
 }
 
 /// Insert an accepted offer into the processor's accepted_offers map.
@@ -330,8 +237,6 @@ async fn symbol_accept_updates_backup_event() {
     let holdings_dir = TempDir::new().unwrap();
 
     // Build processor manually so we can keep backup_event_rx alive.
-    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
-    let (relay_sync_tx, _relay_sync_rx) = mpsc::channel::<SyncTrigger>(16);
     let master_key = derive_master_key(&[42u8; 64]).unwrap();
     let own_identity = master_identity(&master_key);
     let device_seed = [1u8; 32];
@@ -353,25 +258,18 @@ async fn symbol_accept_updates_backup_event() {
     let swarm = make_swarm().await;
     let (backup_event_tx, mut backup_event_rx) =
         mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
-    let pending: crate::daemon::scheduler::PendingChallenges =
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let processor = Processor::new(
         db.clone(),
         own_identity,
-        repair_tx,
         cluster_sync,
         holdings_dir.path().to_path_buf(),
         swarm,
-        relay_sync_tx,
         u64::MAX,
         u64::MAX,
         holdings_dir.path().to_path_buf(),
         0,
         backup_event_tx,
         1,
-        pending,
-        relay_post_tx,
         None, // cluster_state: not needed for handler unit tests
         viaticum_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
@@ -416,7 +314,7 @@ async fn symbol_accept_updates_backup_event() {
 async fn symbol_reject_does_not_create_placement() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_identity(8);
     let block_id = make_block_id(8);
@@ -451,8 +349,7 @@ async fn symbol_offer_reject_quota_full_no_placement() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
     // Quota of 1 byte: any offer will be rejected.
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor_with_quota(db.clone(), &holdings_dir, 1, 1).await;
+    let processor = make_processor_with_quota(db.clone(), &holdings_dir, 1, 1).await;
 
     let offer_bytes: u64 = 10 * 65_535; // ~640 KB
     let accept = processor
@@ -513,7 +410,7 @@ fn esi_ranges_single_element() {
 async fn handle_symbol_transfer_writes_files_to_disk() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(1);
     let block_id = make_block_id(2);
@@ -549,7 +446,7 @@ async fn handle_symbol_transfer_writes_files_to_disk() {
 async fn handle_symbol_transfer_creates_holding_record_in_db() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(1);
     let block_id = make_block_id(2);
@@ -587,7 +484,7 @@ async fn handle_symbol_transfer_creates_holding_record_in_db() {
 async fn handle_symbol_transfer_merges_with_existing_holding() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(1);
     let block_id = make_block_id(2);
@@ -639,7 +536,7 @@ async fn handle_symbol_transfer_merges_with_existing_holding() {
 async fn handle_pos_hash_challenge_responds_with_chain_hash_when_symbols_held() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(1);
     let block_id = make_block_id(2);
@@ -703,7 +600,7 @@ async fn handle_pos_hash_challenge_responds_with_chain_hash_when_symbols_held() 
 async fn handle_pos_hash_challenge_sends_nack_when_symbol_not_held() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(1);
     let block_id = make_block_id(2);
@@ -750,159 +647,6 @@ async fn handle_pos_hash_challenge_sends_nack_when_symbol_not_held() {
             std::mem::discriminant(&other)
         ),
     }
-}
-
-// ─── handle_pos_hash_nack triggers repair ────────────────────────────────────
-
-#[tokio::test]
-async fn handle_pos_hash_nack_marks_alive_placement_lost_and_triggers_repair() {
-    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
-    use std::collections::HashMap;
-    use viaticum_core::cluster::{derive_master_key, master_identity};
-    use viaticum_core::messages::build_pos_hash_nack;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    // Use a proper key pair so we can sign the nack.
-    let holder_master_key = derive_master_key(&[0x01u8; 64]).expect("derive_master_key");
-    let holder_master = master_identity(&holder_master_key);
-    let holder = DeviceId(holder_master.0);
-    let block_id = make_block_id(2);
-    let challenge_id = [0x01u8; 16];
-
-    // Register holder in DB so get_master_for_device succeeds.
-    db.upsert_peer(&make_peer_record(holder)).unwrap();
-    db.set_master_for_device(&holder, &holder_master).unwrap();
-
-    let placement = make_symbol_placement(block_id, holder, vec![(0, 5)], PlacementStatus::Alive);
-    db.upsert_placement(&placement).unwrap();
-
-    // Set up a pending challenge for this holder.
-    let pending_map: HashMap<_, _> = [(
-        (block_id, holder),
-        PendingHashChallenge {
-            source_block_id: block_id,
-            holder_id: holder,
-            esi_ranges: vec![(0, 5)],
-            expected_chain_hash: [0u8; 32],
-            issued_at: Timestamp::now(),
-            challenge_id,
-        },
-    )]
-    .into_iter()
-    .collect();
-    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
-
-    let (processor, mut repair_rx, _relay_rx) =
-        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
-
-    // Build a properly signed nack.
-    let nack = build_pos_hash_nack(
-        challenge_id,
-        block_id,
-        0,
-        Timestamp::now(),
-        None,
-        &holder_master_key,
-    );
-
-    processor
-        .handle_pos_hash_nack(holder, nack)
-        .await
-        .expect("handle_pos_hash_nack failed");
-
-    let updated = db.get_placement(&block_id, &holder).unwrap().unwrap();
-    assert_eq!(updated.status, PlacementStatus::Lost);
-
-    let trigger = repair_rx
-        .try_recv()
-        .expect("expected RepairTrigger in channel");
-    match trigger {
-        RepairTrigger::RepairNow {
-            block_id: bid,
-            holder_id: hid,
-        } => {
-            assert_eq!(bid, block_id);
-            assert_eq!(hid, holder);
-        }
-        other => panic!("expected RepairNow, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn handle_pos_hash_nack_is_noop_for_lost_placement() {
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    let holder = make_device_id(1);
-    let block_id = make_block_id(2);
-
-    let placement = make_symbol_placement(block_id, holder, vec![(0, 5)], PlacementStatus::Lost);
-    db.upsert_placement(&placement).unwrap();
-
-    // Nack with unknown challenge_id (no pending challenge) → silently dropped.
-    // Placement stays Lost — already Lost, no change (either via early exit or mark_placement_lost).
-    let nack = viaticum_core::messages::PosHashNackMsg {
-        v: 1,
-        challenge_id: [0u8; 16],
-        source_block_id: block_id,
-        first_missing_esi: 0,
-        timestamp: Timestamp::now(),
-        device_id: None,
-        sig: [0u8; 64],
-    };
-
-    processor
-        .handle_pos_hash_nack(holder, nack)
-        .await
-        .expect("handle_pos_hash_nack failed");
-
-    // Placement stays Lost — dropped early due to no pending challenge.
-    let updated = db.get_placement(&block_id, &holder).unwrap().unwrap();
-    assert_eq!(updated.status, PlacementStatus::Lost);
-}
-
-/// Review S2: a forged SymbolDropped signed by the wrong key must be rejected.
-#[tokio::test]
-async fn forged_symbol_dropped_is_rejected_and_no_repair_triggered() {
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, mut repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    let victim_key = ed25519_dalek::SigningKey::from_bytes(&[0x66u8; 32]);
-    let victim = DeviceId(victim_key.verifying_key().to_bytes());
-    let victim_master = IdentityPub(victim_key.verifying_key().to_bytes());
-    db.set_master_for_device(&victim, &victim_master).unwrap();
-
-    let block_id = make_block_id(8);
-    let placement = make_symbol_placement(block_id, victim, vec![(0, 4)], PlacementStatus::Alive);
-    db.upsert_placement(&placement).unwrap();
-
-    let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0xDDu8; 32]);
-    let forged = viaticum_core::messages::build_symbol_dropped(
-        block_id,
-        vec![(0, 4)],
-        Timestamp::now(),
-        &attacker_key,
-    );
-
-    processor
-        .handle_symbol_dropped(victim, forged)
-        .await
-        .expect("handle_symbol_dropped must not propagate an error");
-
-    let updated = db.get_placement(&block_id, &victim).unwrap().unwrap();
-    assert_eq!(
-        updated.status,
-        PlacementStatus::Alive,
-        "forged SymbolDropped must not change placement state"
-    );
-    assert!(
-        repair_rx.try_recv().is_err(),
-        "forged SymbolDropped must not enqueue a repair trigger"
-    );
 }
 
 /// Review B1 / H-1: prune_expired_accepted_offers evicts entries older than
@@ -952,107 +696,6 @@ async fn prune_expired_accepted_offers_drops_stale_keeps_fresh() {
     assert!(!m.contains_key(&(owner_old, block_a)));
 }
 
-// ─── handle_symbol_dropped_sync ───────────────────────────────────────────────
-
-#[tokio::test]
-async fn handle_symbol_dropped_marks_alive_placement_lost() {
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    let holder = make_device_id(3);
-    let block_id = make_block_id(4);
-
-    let placement =
-        make_symbol_placement(block_id, holder, vec![(10, 8)], PlacementStatus::Uncertain);
-    db.upsert_placement(&placement).unwrap();
-
-    let dropped = viaticum_core::messages::build_symbol_dropped(
-        block_id,
-        vec![(10, 8)],
-        Timestamp::now(),
-        &ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]),
-    );
-
-    let changed = processor
-        .handle_symbol_dropped_sync(holder, &dropped)
-        .expect("handle_symbol_dropped_sync failed");
-    assert!(changed);
-
-    let updated = db.get_placement(&block_id, &holder).unwrap().unwrap();
-    assert_eq!(updated.status, PlacementStatus::Lost);
-}
-
-#[tokio::test]
-async fn handle_symbol_dropped_is_idempotent_for_deleting_placement() {
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    let holder = make_device_id(3);
-    let block_id = make_block_id(4);
-
-    let placement =
-        make_symbol_placement(block_id, holder, vec![(10, 8)], PlacementStatus::Deleting);
-    db.upsert_placement(&placement).unwrap();
-
-    let dropped = viaticum_core::messages::build_symbol_dropped(
-        block_id,
-        vec![(10, 8)],
-        Timestamp::now(),
-        &ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]),
-    );
-
-    let changed = processor
-        .handle_symbol_dropped_sync(holder, &dropped)
-        .expect("handle_symbol_dropped_sync failed");
-    assert!(!changed, "Deleting placement should not be modified");
-}
-
-#[tokio::test]
-async fn handle_symbol_dropped_sends_repair_trigger() {
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, mut repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    // Use a signing key whose public key equals the device_id, and register
-    // the device → master mapping so signature verification can succeed.
-    let holder_key = ed25519_dalek::SigningKey::from_bytes(&[0x43u8; 32]);
-    let holder = DeviceId(holder_key.verifying_key().to_bytes());
-    let master = IdentityPub(holder_key.verifying_key().to_bytes());
-    db.set_master_for_device(&holder, &master).unwrap();
-    let block_id = make_block_id(4);
-
-    let placement = make_symbol_placement(block_id, holder, vec![(0, 4)], PlacementStatus::Alive);
-    db.upsert_placement(&placement).unwrap();
-
-    let dropped = viaticum_core::messages::build_symbol_dropped(
-        block_id,
-        vec![(0, 4)],
-        Timestamp::now(),
-        &holder_key,
-    );
-
-    processor
-        .handle_symbol_dropped(holder, dropped)
-        .await
-        .expect("handle_symbol_dropped failed");
-
-    let trigger = repair_rx
-        .try_recv()
-        .expect("expected RepairTrigger in channel");
-    match trigger {
-        RepairTrigger::RepairNow {
-            block_id: bid,
-            holder_id: hid,
-        } => {
-            assert_eq!(bid, block_id);
-            assert_eq!(hid, holder);
-        }
-        other => panic!("expected RepairNow, got {other:?}"),
-    }
-}
-
 // ─── decide_symbol_offer ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1061,8 +704,7 @@ async fn symbol_offer_accept_when_quota_not_exceeded() {
     let holdings_dir = TempDir::new().unwrap();
     // 1 GB soft quota, no hard quota
     let soft = 1_073_741_824u64; // 1 GB
-    let (processor, _rx, _relay_rx) =
-        make_processor_with_quota(db.clone(), &holdings_dir, soft, u64::MAX).await;
+    let processor = make_processor_with_quota(db.clone(), &holdings_dir, soft, u64::MAX).await;
 
     // 10 symbols * 65535 bytes = ~640 KB — well under 1 GB
     let offer_bytes: u64 = 10 * 65_535;
@@ -1078,8 +720,7 @@ async fn symbol_offer_reject_when_hard_quota_exceeded() {
     let holdings_dir = TempDir::new().unwrap();
     // Hard quota of 100 bytes — already exceeded because we'll store a holding record
     let hard = 100u64;
-    let (processor, _rx, _relay_rx) =
-        make_processor_with_quota(db.clone(), &holdings_dir, u64::MAX, hard).await;
+    let processor = make_processor_with_quota(db.clone(), &holdings_dir, u64::MAX, hard).await;
 
     // Insert a holding with total_bytes = 200 > 100 (hard floor)
     let owner = make_identity(1);
@@ -1109,8 +750,7 @@ async fn symbol_offer_reject_when_soft_quota_would_overflow() {
     let holdings_dir = TempDir::new().unwrap();
     // Soft quota 1000 bytes, held 900 bytes, offer 200 bytes → would exceed
     let soft = 1000u64;
-    let (processor, _rx, _relay_rx) =
-        make_processor_with_quota(db.clone(), &holdings_dir, soft, u64::MAX).await;
+    let processor = make_processor_with_quota(db.clone(), &holdings_dir, soft, u64::MAX).await;
 
     let owner = make_identity(2);
     let block_id = make_block_id(2);
@@ -1139,8 +779,7 @@ async fn symbol_offer_accept_when_unlimited_quota() {
     let holdings_dir = TempDir::new().unwrap();
     // soft_quota=0 means "use disk-based limit" (effective = disk_free - reserve).
     // With reserve=0, any offer fitting in disk space is accepted.
-    let (processor, _rx, _relay_rx) =
-        make_processor_with_quota(db.clone(), &holdings_dir, 0, 0).await;
+    let processor = make_processor_with_quota(db.clone(), &holdings_dir, 0, 0).await;
 
     let accept = processor
         .decide_symbol_offer(65_535) // one symbol — always fits
@@ -1154,7 +793,7 @@ async fn symbol_offer_accept_when_unlimited_quota() {
 async fn restore_request_returns_empty_when_no_holding() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(5);
     let block_id = make_block_id(5);
@@ -1182,7 +821,7 @@ async fn restore_request_returns_empty_when_no_holding() {
 async fn restore_request_returns_held_symbols() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(6);
     let block_id = make_block_id(6);
@@ -1230,7 +869,7 @@ async fn restore_request_returns_held_symbols() {
 async fn restore_request_filters_by_esi_list() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(7);
     let block_id = make_block_id(7);
@@ -1276,33 +915,6 @@ async fn restore_request_filters_by_esi_list() {
     assert!(esis.contains(&3), "missing ESI 3");
 }
 
-// ─── handle_board_sync ───────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn board_sync_forwards_to_relay_sync_tx() {
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, mut relay_sync_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    let from = make_identity(10);
-    let msg = BoardSyncMsg {
-        v: 1,
-        entries: vec![], // entries are StoredEntry; empty is fine for routing test
-        timestamp: Timestamp::now(),
-    };
-
-    processor
-        .handle_board_sync(from, msg)
-        .await
-        .expect("handle_board_sync failed");
-
-    let trigger = relay_sync_rx
-        .try_recv()
-        .expect("expected SyncTrigger in channel");
-    assert_eq!(trigger.partner_identity, from);
-    assert!(trigger.partner_entries.is_empty());
-}
-
 // ─── handle_peer_announce ────────────────────────────────────────────────────
 
 /// Create a signing key + identity pair from a seed byte.
@@ -1326,7 +938,7 @@ async fn peer_announce_for_unknown_peer_is_ignored() {
     // An announce from a peer with no registered DeviceId creates nothing.
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let (msg, _identity) = make_signed_peer_announce(20);
 
@@ -1344,7 +956,7 @@ async fn peer_announce_updates_existing_peer_last_seen() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let (sk, identity) = make_signing_identity(21);
     let now = Timestamp::now();
@@ -1398,39 +1010,13 @@ async fn peer_announce_updates_existing_peer_last_seen() {
     );
 }
 
-#[tokio::test]
-async fn peer_announce_via_relay_dispatch() {
-    use viaticum_core::messages::to_cbor;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    let (announce_msg, identity) = make_signed_peer_announce(22);
-    let payload = to_cbor(&announce_msg).expect("cbor encode failed");
-
-    let relay_msg = InboundMessage {
-        from: identity,
-        payload,
-        msg_type: "peer_announce".to_string(),
-        msg_id: [0u8; 16],
-        created_at: Timestamp::now(),
-    };
-
-    processor.dispatch_relay(relay_msg).await;
-
-    // New behavior: announce only updates existing device records.
-    // For unknown peers (no DeviceId registered), the announce is silently ignored.
-    // Verify no error was produced (implicit — we just reached here without panic).
-}
-
 // ─── handle_symbol_accept / handle_symbol_reject (log-only handlers) ─────────
 
 #[tokio::test]
 async fn symbol_accept_logs_without_error() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_identity(30);
     let accept = SymbolAcceptMsg {
@@ -1452,7 +1038,7 @@ async fn symbol_reject_logs_without_error() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_identity(31);
     let reject = SymbolRejectMsg {
@@ -1477,7 +1063,7 @@ async fn peer_announce_db_upsert_always_succeeds() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let (sk, identity) = make_signing_identity(51);
     let msg = build_peer_announce(identity, Timestamp::now(), &sk, None);
@@ -1495,7 +1081,7 @@ async fn peer_announce_db_upsert_always_succeeds() {
 async fn peer_announce_with_invalid_signature_is_rejected() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     // Create a signed message, then corrupt the signature.
     let (mut msg, identity) = make_signed_peer_announce(60);
@@ -1511,548 +1097,11 @@ async fn peer_announce_with_invalid_signature_is_rejected() {
     let _ = identity; // identity is IdentityPub; get_peer now takes DeviceId — just verify no panic.
 }
 
-// ─── handle_system_state_backup ───────────────────────────────────────────────
-
-#[tokio::test]
-async fn handle_system_state_backup_stores_blob_for_known_peer() {
-    use viaticum_core::db::SystemStateBlobRecord;
-    use viaticum_core::messages::SystemStateBackupMsg;
-    use viaticum_core::types::PeerRecord;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    let owner = make_identity(60);
-    let now = Timestamp::now();
-
-    // Register owner as a known peer so the handler accepts the backup.
-    let owner_device_id = DeviceId(owner.0);
-    db.upsert_peer(&PeerRecord {
-        device_id: owner_device_id,
-        master_identity: owner,
-        trust_p: 0.5,
-        trust_i: 0.5,
-        trust_s: 1.0,
-        bytes_we_store_for_peer: 0,
-        bytes_peer_stores_for_us: 0,
-        first_seen: now,
-        last_seen: now,
-        revoked_device_pub_keys: vec![],
-        addrs: vec![],
-        x25519_pub: None,
-        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
-        last_avail_sample: 0,
-    })
-    .unwrap();
-    // Register device→master mapping so handle_system_state_backup_inner can find the device.
-    db.set_master_for_device(&owner_device_id, &owner).unwrap();
-
-    let blob = vec![0xBEu8; 128];
-    let msg = SystemStateBackupMsg {
-        v: 1,
-        encrypted_blob: blob.clone(),
-        timestamp: now,
-    };
-
-    processor.handle_system_state_backup_inner(owner, msg).await;
-
-    let stored: Option<SystemStateBlobRecord> = db.get_system_state_blob(&owner).unwrap();
-    assert!(stored.is_some(), "blob should have been stored in DB");
-    assert_eq!(stored.unwrap().encrypted_blob, blob);
-}
-
-#[tokio::test]
-async fn handle_system_state_backup_rejects_unknown_peer() {
-    use viaticum_core::messages::SystemStateBackupMsg;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    let stranger = make_identity(61);
-    let msg = SystemStateBackupMsg {
-        v: 1,
-        encrypted_blob: vec![0xFFu8; 64],
-        timestamp: Timestamp::now(),
-    };
-
-    processor
-        .handle_system_state_backup_inner(stranger, msg)
-        .await;
-
-    // DB must remain empty — unknown peer must not be stored.
-    let stored = db.get_system_state_blob(&stranger).unwrap();
-    assert!(
-        stored.is_none(),
-        "blob should not be stored for unknown peer"
-    );
-}
-
-#[tokio::test]
-async fn handle_system_state_backup_ignores_empty_blob() {
-    use viaticum_core::messages::SystemStateBackupMsg;
-    use viaticum_core::types::PeerRecord;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    let owner = make_identity(62);
-    let now = Timestamp::now();
-    let owner_device_id = DeviceId(owner.0);
-    db.upsert_peer(&PeerRecord {
-        device_id: owner_device_id,
-        master_identity: owner,
-        trust_p: 0.5,
-        trust_i: 0.5,
-        trust_s: 1.0,
-        bytes_we_store_for_peer: 0,
-        bytes_peer_stores_for_us: 0,
-        first_seen: now,
-        last_seen: now,
-        revoked_device_pub_keys: vec![],
-        addrs: vec![],
-        x25519_pub: None,
-        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
-        last_avail_sample: 0,
-    })
-    .unwrap();
-    db.set_master_for_device(&owner_device_id, &owner).unwrap();
-
-    let msg = SystemStateBackupMsg {
-        v: 1,
-        encrypted_blob: vec![],
-        timestamp: now,
-    };
-
-    processor.handle_system_state_backup_inner(owner, msg).await;
-
-    // Empty blob must not be stored.
-    let stored = db.get_system_state_blob(&owner).unwrap();
-    assert!(stored.is_none(), "empty blob should not be stored");
-}
-
-// ─── Issue F (H-1): SystemStateBackup blob size cap ──────────────────────────
-
-/// AC-F1: blob below the size cap is stored normally.
-#[tokio::test]
-async fn system_state_backup_with_blob_under_cap_accepted() {
-    use viaticum_core::constants::MAX_SYSTEM_STATE_BLOB_BYTES;
-    use viaticum_core::db::SystemStateBlobRecord;
-    use viaticum_core::messages::SystemStateBackupMsg;
-    use viaticum_core::types::PeerRecord;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    let owner = make_identity(70);
-    let now = Timestamp::now();
-    let owner_device_id = DeviceId(owner.0);
-    db.upsert_peer(&PeerRecord {
-        device_id: owner_device_id,
-        master_identity: owner,
-        trust_p: 0.5,
-        trust_i: 0.5,
-        trust_s: 1.0,
-        bytes_we_store_for_peer: 0,
-        bytes_peer_stores_for_us: 0,
-        first_seen: now,
-        last_seen: now,
-        revoked_device_pub_keys: vec![],
-        addrs: vec![],
-        x25519_pub: None,
-        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
-        last_avail_sample: 0,
-    })
-    .unwrap();
-    db.set_master_for_device(&owner_device_id, &owner).unwrap();
-
-    let blob = vec![0xAAu8; MAX_SYSTEM_STATE_BLOB_BYTES - 1];
-    let msg = SystemStateBackupMsg {
-        v: 1,
-        encrypted_blob: blob.clone(),
-        timestamp: now,
-    };
-
-    let ack = processor.handle_system_state_backup_inner(owner, msg).await;
-
-    assert!(ack.stored, "blob under cap should be stored");
-    let stored: Option<SystemStateBlobRecord> = db.get_system_state_blob(&owner).unwrap();
-    assert!(stored.is_some(), "blob under cap should be written to DB");
-    assert_eq!(stored.unwrap().encrypted_blob, blob);
-}
-
-/// AC-F2: blob exactly at the size cap is stored (boundary inclusive).
-#[tokio::test]
-async fn system_state_backup_with_blob_at_cap_accepted() {
-    use viaticum_core::constants::MAX_SYSTEM_STATE_BLOB_BYTES;
-    use viaticum_core::db::SystemStateBlobRecord;
-    use viaticum_core::messages::SystemStateBackupMsg;
-    use viaticum_core::types::PeerRecord;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    let owner = make_identity(71);
-    let now = Timestamp::now();
-    let owner_device_id = DeviceId(owner.0);
-    db.upsert_peer(&PeerRecord {
-        device_id: owner_device_id,
-        master_identity: owner,
-        trust_p: 0.5,
-        trust_i: 0.5,
-        trust_s: 1.0,
-        bytes_we_store_for_peer: 0,
-        bytes_peer_stores_for_us: 0,
-        first_seen: now,
-        last_seen: now,
-        revoked_device_pub_keys: vec![],
-        addrs: vec![],
-        x25519_pub: None,
-        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
-        last_avail_sample: 0,
-    })
-    .unwrap();
-    db.set_master_for_device(&owner_device_id, &owner).unwrap();
-
-    let blob = vec![0xBBu8; MAX_SYSTEM_STATE_BLOB_BYTES];
-    let msg = SystemStateBackupMsg {
-        v: 1,
-        encrypted_blob: blob.clone(),
-        timestamp: now,
-    };
-
-    let ack = processor.handle_system_state_backup_inner(owner, msg).await;
-
-    assert!(ack.stored, "blob at cap boundary should be stored");
-    let stored: Option<SystemStateBlobRecord> = db.get_system_state_blob(&owner).unwrap();
-    assert!(stored.is_some(), "blob at cap should be written to DB");
-}
-
-/// AC-F3: blob one byte over the size cap is dropped with stored=false; no DB write.
-#[tokio::test]
-async fn system_state_backup_with_blob_over_cap_rejected() {
-    use viaticum_core::constants::MAX_SYSTEM_STATE_BLOB_BYTES;
-    use viaticum_core::messages::SystemStateBackupMsg;
-    use viaticum_core::types::PeerRecord;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    let owner = make_identity(72);
-    let now = Timestamp::now();
-    let owner_device_id = DeviceId(owner.0);
-    db.upsert_peer(&PeerRecord {
-        device_id: owner_device_id,
-        master_identity: owner,
-        trust_p: 0.5,
-        trust_i: 0.5,
-        trust_s: 1.0,
-        bytes_we_store_for_peer: 0,
-        bytes_peer_stores_for_us: 0,
-        first_seen: now,
-        last_seen: now,
-        revoked_device_pub_keys: vec![],
-        addrs: vec![],
-        x25519_pub: None,
-        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
-        last_avail_sample: 0,
-    })
-    .unwrap();
-    db.set_master_for_device(&owner_device_id, &owner).unwrap();
-
-    let blob = vec![0xCCu8; MAX_SYSTEM_STATE_BLOB_BYTES + 1];
-    let msg = SystemStateBackupMsg {
-        v: 1,
-        encrypted_blob: blob,
-        timestamp: now,
-    };
-
-    let ack = processor.handle_system_state_backup_inner(owner, msg).await;
-
-    assert!(
-        !ack.stored,
-        "blob over cap should be rejected (stored=false)"
-    );
-    let stored = db.get_system_state_blob(&owner).unwrap();
-    assert!(stored.is_none(), "blob over cap must not be written to DB");
-}
-
-/// AC-F5: unknown peer is rejected before the size check (existing gate preserved).
-///
-/// If an unknown peer sends a giant blob, the known-peer check fires first.
-/// stored=false without writing to DB — same result as AC-F3 but via a different
-/// code path (the unknown-peer gate, not the size gate).
-#[tokio::test]
-async fn system_state_backup_unknown_peer_rejected_before_size_check() {
-    use viaticum_core::constants::MAX_SYSTEM_STATE_BLOB_BYTES;
-    use viaticum_core::messages::SystemStateBackupMsg;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    // owner_id NOT registered in DB → unknown peer.
-    let owner = make_identity(73);
-    let now = Timestamp::now();
-
-    // Send an oversized blob to confirm ordering: unknown-peer check fires, not size check.
-    let blob = vec![0xDDu8; MAX_SYSTEM_STATE_BLOB_BYTES + 1];
-    let msg = SystemStateBackupMsg {
-        v: 1,
-        encrypted_blob: blob,
-        timestamp: now,
-    };
-
-    let ack = processor.handle_system_state_backup_inner(owner, msg).await;
-
-    assert!(
-        !ack.stored,
-        "unknown peer must be rejected regardless of blob size"
-    );
-    let stored = db.get_system_state_blob(&owner).unwrap();
-    assert!(
-        stored.is_none(),
-        "unknown peer blob must not be written to DB"
-    );
-}
-
-// ─── handle_system_state_request ──────────────────────────────────────────────
-
-#[tokio::test]
-async fn handle_system_state_ack_logs_without_error() {
-    use viaticum_core::messages::SystemStateAckMsg;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    let peer = make_identity(63);
-
-    // Both stored=true and stored=false should be handled without panic.
-    processor.handle_system_state_ack(
-        peer,
-        SystemStateAckMsg {
-            v: 1,
-            stored: true,
-            timestamp: Timestamp::now(),
-        },
-    );
-    processor.handle_system_state_ack(
-        peer,
-        SystemStateAckMsg {
-            v: 1,
-            stored: false,
-            timestamp: Timestamp::now(),
-        },
-    );
-}
-
-// ─── handle_pos_hash_response ────────────────────────────────────────────────
-
-#[tokio::test]
-async fn handle_pos_hash_response_pass_records_trust_and_updates_placement() {
-    use std::collections::HashMap;
-    use viaticum_core::constants::INITIAL_TRUST_P;
-    use viaticum_core::messages::PosHashResponseMsg;
-    use viaticum_core::pos::{VerifyOutcome, compute_chain_hash};
-
-    use super::current_week_number_scaled;
-    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    let holder_id = make_device_id(10);
-    let block_id = make_block_id(20);
-    let challenge_id = [0xAAu8; 16];
-
-    // Owner computes expected chain hash for ESI 0 with symbol data [0xAB; 64].
-    let symbol_data = vec![0xABu8; 64];
-    let expected_hash =
-        compute_chain_hash(&challenge_id, &[(0u32, symbol_data.as_slice())]).unwrap();
-
-    // Build pending challenges map with one entry including the expected chain hash.
-    let pending_map: HashMap<_, _> = [(
-        (block_id, holder_id),
-        PendingHashChallenge {
-            source_block_id: block_id,
-            holder_id,
-            esi_ranges: vec![(0, 1)],
-            expected_chain_hash: expected_hash,
-            issued_at: Timestamp::now(),
-            challenge_id,
-        },
-    )]
-    .into_iter()
-    .collect();
-    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
-
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
-
-    // Insert PeerRecord with initial trust.
-    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
-
-    // Insert Alive placement covering ESI 0.
-    let placement =
-        make_symbol_placement(block_id, holder_id, vec![(0, 1)], PlacementStatus::Alive);
-    db.upsert_placement(&placement).unwrap();
-
-    // Holder sends correct chain hash.
-    let response = PosHashResponseMsg {
-        v: 1,
-        challenge_id,
-        chain_hash: expected_hash,
-        timestamp: Timestamp::now(),
-        device_id: None,
-    };
-
-    let outcome = processor
-        .handle_pos_hash_response(holder_id, response)
-        .await
-        .expect("handle_pos_hash_response failed");
-
-    assert_eq!(outcome, VerifyOutcome::Pass, "outcome must be Pass");
-
-    // Placement last_verified is set.
-    let updated_placement = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
-    assert!(
-        updated_placement.last_verified.is_some(),
-        "last_verified must be Some after Pass"
-    );
-
-    // PoS weekly: challenged=1, passed=1.
-    let week = current_week_number_scaled(1);
-    let weekly = db.get_pos_weekly(&holder_id, week).unwrap();
-    assert!(weekly.is_some(), "pos_weekly entry must exist");
-    let weekly = weekly.unwrap();
-    assert_eq!(weekly.challenged, 1, "challenged must be 1");
-    assert_eq!(weekly.passed, 1, "passed must be 1");
-
-    // Trust P must have been recalculated upward.
-    let peer = db.get_peer(&holder_id).unwrap().unwrap();
-    assert!(
-        peer.trust_p > INITIAL_TRUST_P,
-        "trust_p={} must exceed INITIAL_TRUST_P={} after Pass",
-        peer.trust_p,
-        INITIAL_TRUST_P,
-    );
-}
-
-#[tokio::test]
-async fn handle_pos_hash_response_fail_marks_lost_and_triggers_repair() {
-    use std::collections::HashMap;
-    use viaticum_core::messages::PosHashResponseMsg;
-    use viaticum_core::pos::{VerifyOutcome, compute_chain_hash};
-
-    use crate::daemon::repair::RepairTrigger;
-    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    let holder_id = make_device_id(11);
-    let block_id = make_block_id(21);
-    let challenge_id = [0xBBu8; 16];
-
-    // Owner's expected chain hash for correct symbol data.
-    let correct_symbol = vec![0xCCu8; 64];
-    let expected_hash =
-        compute_chain_hash(&challenge_id, &[(0u32, correct_symbol.as_slice())]).unwrap();
-
-    let pending_map: HashMap<_, _> = [(
-        (block_id, holder_id),
-        PendingHashChallenge {
-            source_block_id: block_id,
-            holder_id,
-            esi_ranges: vec![(0, 1)],
-            expected_chain_hash: expected_hash,
-            issued_at: Timestamp::now(),
-            challenge_id,
-        },
-    )]
-    .into_iter()
-    .collect();
-    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
-
-    let (processor, mut repair_rx, _relay_rx) =
-        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
-
-    // Insert PeerRecord.
-    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
-
-    let placement =
-        make_symbol_placement(block_id, holder_id, vec![(0, 1)], PlacementStatus::Alive);
-    db.upsert_placement(&placement).unwrap();
-
-    // Holder sends WRONG chain hash (corrupted symbol).
-    let corrupt_symbol = vec![0x00u8; 64];
-    let wrong_hash =
-        compute_chain_hash(&challenge_id, &[(0u32, corrupt_symbol.as_slice())]).unwrap();
-
-    let response = PosHashResponseMsg {
-        v: 1,
-        challenge_id,
-        chain_hash: wrong_hash,
-        timestamp: Timestamp::now(),
-        device_id: None,
-    };
-
-    let outcome = processor
-        .handle_pos_hash_response(holder_id, response)
-        .await
-        .expect("handle_pos_hash_response failed");
-
-    assert!(
-        matches!(outcome, VerifyOutcome::Fail { esi: 0 }),
-        "outcome must be Fail{{esi:0}}, got {outcome:?}"
-    );
-
-    // Placement must be Lost.
-    let updated_placement = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
-    assert_eq!(
-        updated_placement.status,
-        PlacementStatus::Lost,
-        "placement must be Lost after Fail"
-    );
-
-    // PoS weekly: challenged=1, passed=0.
-    use super::current_week_number_scaled;
-    let week = current_week_number_scaled(1);
-    let weekly = db.get_pos_weekly(&holder_id, week).unwrap();
-    assert!(weekly.is_some(), "pos_weekly entry must exist");
-    let weekly = weekly.unwrap();
-    assert_eq!(weekly.challenged, 1, "challenged must be 1");
-    assert_eq!(weekly.passed, 0, "passed must be 0");
-
-    // Repair trigger must be sent.
-    let trigger = repair_rx
-        .try_recv()
-        .expect("RepairTrigger must be sent after Fail");
-    match trigger {
-        RepairTrigger::RepairNow {
-            block_id: bid,
-            holder_id: hid,
-        } => {
-            assert_eq!(bid, block_id, "RepairNow block_id mismatch");
-            assert_eq!(hid, holder_id, "RepairNow holder_id mismatch");
-        }
-        other => panic!("expected RepairNow, got {other:?}"),
-    }
-}
-
 // ─── handle_delete tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn handle_delete_marks_holding_for_deletion() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2075,7 +1124,7 @@ async fn handle_delete_marks_holding_for_deletion() {
     // Build a valid delete message.
     let delete_msg =
         viaticum_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
-    processor.handle_delete(owner_id, delete_msg).await.unwrap();
+    super::symbol::apply_delete(&db, owner_id, delete_msg);
 
     let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
     assert_eq!(updated.status, HoldingStatus::MarkedForDelete);
@@ -2085,8 +1134,6 @@ async fn handle_delete_marks_holding_for_deletion() {
 #[tokio::test]
 async fn handle_delete_ignores_non_active_holding() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2108,7 +1155,7 @@ async fn handle_delete_ignores_non_active_holding() {
 
     let delete_msg =
         viaticum_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
-    processor.handle_delete(owner_id, delete_msg).await.unwrap();
+    super::symbol::apply_delete(&db, owner_id, delete_msg);
 
     // Status should not change.
     let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
@@ -2118,8 +1165,6 @@ async fn handle_delete_ignores_non_active_holding() {
 #[tokio::test]
 async fn handle_delete_ignores_no_holding() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2128,14 +1173,12 @@ async fn handle_delete_ignores_no_holding() {
     // No holding in DB — should not panic.
     let delete_msg =
         viaticum_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
-    processor.handle_delete(owner_id, delete_msg).await.unwrap();
+    super::symbol::apply_delete(&db, owner_id, delete_msg);
 }
 
 #[tokio::test]
 async fn handle_delete_rejects_invalid_signature() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2158,7 +1201,7 @@ async fn handle_delete_rejects_invalid_signature() {
     // Sign with wrong key.
     let delete_msg =
         viaticum_core::messages::build_delete_msg(block_id, Timestamp::now(), &wrong_key);
-    processor.handle_delete(owner_id, delete_msg).await.unwrap();
+    super::symbol::apply_delete(&db, owner_id, delete_msg);
 
     // Holding should remain Active (bad sig rejected silently).
     let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
@@ -2170,8 +1213,6 @@ async fn handle_delete_rejects_invalid_signature() {
 #[tokio::test]
 async fn handle_cancel_delete_reverts_to_active() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2192,10 +1233,7 @@ async fn handle_cancel_delete_reverts_to_active() {
 
     let cancel_msg =
         viaticum_core::messages::build_cancel_delete_msg(block_id, Timestamp::now(), &owner_key);
-    processor
-        .handle_cancel_delete(owner_id, cancel_msg)
-        .await
-        .unwrap();
+    super::symbol::apply_cancel_delete(&db, owner_id, cancel_msg);
 
     let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
     assert_eq!(updated.status, HoldingStatus::Active);
@@ -2205,8 +1243,6 @@ async fn handle_cancel_delete_reverts_to_active() {
 #[tokio::test]
 async fn handle_cancel_delete_ignores_active_holding() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2227,10 +1263,7 @@ async fn handle_cancel_delete_ignores_active_holding() {
 
     let cancel_msg =
         viaticum_core::messages::build_cancel_delete_msg(block_id, Timestamp::now(), &owner_key);
-    processor
-        .handle_cancel_delete(owner_id, cancel_msg)
-        .await
-        .unwrap();
+    super::symbol::apply_cancel_delete(&db, owner_id, cancel_msg);
 
     // Should remain Active (no-op).
     let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
@@ -2240,8 +1273,6 @@ async fn handle_cancel_delete_ignores_active_holding() {
 #[tokio::test]
 async fn handle_cancel_delete_rejects_bad_sig() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
@@ -2263,10 +1294,7 @@ async fn handle_cancel_delete_rejects_bad_sig() {
 
     let cancel_msg =
         viaticum_core::messages::build_cancel_delete_msg(block_id, Timestamp::now(), &wrong_key);
-    processor
-        .handle_cancel_delete(owner_id, cancel_msg)
-        .await
-        .unwrap();
+    super::symbol::apply_cancel_delete(&db, owner_id, cancel_msg);
 
     // Should remain MarkedForDelete (bad sig).
     let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
@@ -2278,8 +1306,6 @@ async fn handle_cancel_delete_rejects_bad_sig() {
 #[tokio::test]
 async fn handle_symbol_drop_notice_does_not_panic() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_identity(0xF0);
     // sig: [0u8; 64] — verification fails, handler returns early with a warn log.
@@ -2295,7 +1321,7 @@ async fn handle_symbol_drop_notice_does_not_panic() {
     };
 
     // Should not panic — handler returns early on bad sig, logs WARN.
-    processor.handle_symbol_drop_notice(holder, notice);
+    let _ = super::SymbolDropHandler::new(db.clone()).apply(holder, notice);
 }
 
 // ─── W13 handle_symbol_drop_notice DB-state tests ────────────────────────────
@@ -2344,8 +1370,6 @@ fn make_drop_notice(block_id: SourceBlockId, esi_ranges: Vec<(u32, u32)>) -> Sym
 #[tokio::test]
 async fn handle_symbol_drop_notice_transitions_placement_to_lost() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let holder_key = make_signing_key(0xA1);
     let holder_master = master_identity(&holder_key);
@@ -2363,7 +1387,7 @@ async fn handle_symbol_drop_notice_transitions_placement_to_lost() {
     );
     db.upsert_placement(&placement).unwrap();
 
-    processor.handle_symbol_drop_notice(
+    let _ = super::SymbolDropHandler::new(db.clone()).apply(
         holder_master,
         make_signed_drop_notice(block_id, vec![(0, 10)], &holder_key),
     );
@@ -2383,8 +1407,6 @@ async fn handle_symbol_drop_notice_transitions_placement_to_lost() {
 #[tokio::test]
 async fn handle_symbol_drop_notice_decrements_current_alive() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let key_a = make_signing_key(0xA2);
     let master_a = master_identity(&key_a);
@@ -2415,7 +1437,7 @@ async fn handle_symbol_drop_notice_decrements_current_alive() {
     .unwrap();
 
     // Drop notice from holder A — signed with key_a so signature verification passes.
-    processor.handle_symbol_drop_notice(
+    let _ = super::SymbolDropHandler::new(db.clone()).apply(
         master_a,
         make_signed_drop_notice(block_id, vec![(0, 10)], &key_a),
     );
@@ -2431,8 +1453,6 @@ async fn handle_symbol_drop_notice_decrements_current_alive() {
 #[tokio::test]
 async fn handle_symbol_drop_notice_recomputes_current_reliability() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let key_a = make_signing_key(0xC1);
     let master_a = master_identity(&key_a);
@@ -2464,7 +1484,7 @@ async fn handle_symbol_drop_notice_recomputes_current_reliability() {
     ))
     .unwrap();
 
-    processor.handle_symbol_drop_notice(
+    let _ = super::SymbolDropHandler::new(db.clone()).apply(
         master_a,
         make_signed_drop_notice(block_id, vec![(0, 20)], &key_a),
     );
@@ -2487,8 +1507,6 @@ async fn handle_symbol_drop_notice_recomputes_current_reliability() {
 #[tokio::test]
 async fn handle_symbol_drop_notice_idempotent_on_duplicate() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let key_a = make_signing_key(0xD1);
     let master_a = master_identity(&key_a);
@@ -2520,8 +1538,8 @@ async fn handle_symbol_drop_notice_idempotent_on_duplicate() {
 
     // Send the same notice twice — signed so both passes verify correctly.
     let notice = make_signed_drop_notice(block_id, vec![(0, 10)], &key_a);
-    processor.handle_symbol_drop_notice(master_a, notice.clone());
-    processor.handle_symbol_drop_notice(master_a, notice);
+    let _ = super::SymbolDropHandler::new(db.clone()).apply(master_a, notice.clone());
+    let _ = super::SymbolDropHandler::new(db.clone()).apply(master_a, notice);
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
     assert_eq!(
@@ -2534,8 +1552,6 @@ async fn handle_symbol_drop_notice_idempotent_on_duplicate() {
 #[tokio::test]
 async fn handle_symbol_drop_notice_source_block_record_missing_logs_and_returns() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     // Register a holder device so the master-to-device resolution succeeds,
     // but insert no SourceBlockRecord for this block_id.
@@ -2554,7 +1570,8 @@ async fn handle_symbol_drop_notice_source_block_record_missing_logs_and_returns(
     db.upsert_placement(&placement).unwrap();
 
     // Should not panic.
-    processor.handle_symbol_drop_notice(holder_master, make_drop_notice(block_id, vec![(0, 10)]));
+    let _ = super::SymbolDropHandler::new(db.clone())
+        .apply(holder_master, make_drop_notice(block_id, vec![(0, 10)]));
     // No assertion needed — the test passes if no panic occurs.
 }
 
@@ -2562,8 +1579,6 @@ async fn handle_symbol_drop_notice_source_block_record_missing_logs_and_returns(
 #[tokio::test]
 async fn handle_symbol_drop_notice_unknown_holder_logs_and_returns() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let block_id = make_block_id(0xF1);
     let mut block = make_source_block(block_id);
@@ -2574,7 +1589,8 @@ async fn handle_symbol_drop_notice_unknown_holder_logs_and_returns() {
     let holder_master = make_identity(0xF2);
 
     // Should not panic. Placement state should be unchanged (no placement inserted).
-    processor.handle_symbol_drop_notice(holder_master, make_drop_notice(block_id, vec![(0, 10)]));
+    let _ = super::SymbolDropHandler::new(db.clone())
+        .apply(holder_master, make_drop_notice(block_id, vec![(0, 10)]));
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
     assert_eq!(
@@ -2587,8 +1603,6 @@ async fn handle_symbol_drop_notice_unknown_holder_logs_and_returns() {
 #[tokio::test]
 async fn handle_symbol_drop_notice_placement_already_lost_is_noop() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let holder_key = make_signing_key(0x01);
     let holder_master = master_identity(&holder_key);
@@ -2622,7 +1636,7 @@ async fn handle_symbol_drop_notice_placement_already_lost_is_noop() {
 
     // DropNotice for the already-Lost placement — signed so sig verification passes.
     // After sig check, mark_placement_lost sees Lost placement → no-op.
-    processor.handle_symbol_drop_notice(
+    let _ = super::SymbolDropHandler::new(db.clone()).apply(
         holder_master,
         make_signed_drop_notice(block_id, vec![(0, 10)], &holder_key),
     );
@@ -2639,8 +1653,6 @@ async fn handle_symbol_drop_notice_placement_already_lost_is_noop() {
 async fn handle_symbol_drop_notice_block_becomes_eligible_for_worker() {
     use std::time::Duration;
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let key_a = make_signing_key(0x10);
     let master_a = master_identity(&key_a);
@@ -2685,7 +1697,7 @@ async fn handle_symbol_drop_notice_block_becomes_eligible_for_worker() {
     );
 
     // Send DropNotice for holder A — signed so signature verification passes.
-    processor.handle_symbol_drop_notice(
+    let _ = super::SymbolDropHandler::new(db.clone()).apply(
         master_a,
         make_signed_drop_notice(block_id, vec![(0, 10)], &key_a),
     );
@@ -2709,153 +1721,6 @@ async fn handle_symbol_drop_notice_block_becomes_eligible_for_worker() {
     assert_eq!(after.unwrap().block_id, block_id);
 }
 
-// ─── dispatch_relay tests for new message types ───────────────────────────────
-
-#[tokio::test]
-async fn dispatch_relay_pos_hash_challenge_sends_response_via_board() {
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    // Build processor manually to keep relay_post_rx alive.
-    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
-    let (relay_sync_tx, _relay_sync_rx) = mpsc::channel::<SyncTrigger>(16);
-    let master_key = viaticum_core::cluster::derive_master_key(&[42u8; 64]).unwrap();
-    let own_identity = viaticum_core::cluster::master_identity(&master_key);
-    let relay_device_seed = [1u8; 32];
-    let relay_device_key =
-        viaticum_core::cluster::derive_device_key(&[42u8; 64], &relay_device_seed).unwrap();
-    let device_id = DeviceId(relay_device_key.verifying_key().to_bytes());
-    let now = Timestamp::now();
-    let cert = viaticum_core::cluster::issue_device_certificate(&master_key, device_id, now);
-    let cluster_state =
-        viaticum_core::cluster::ClusterState::init(db.clone(), own_identity, cert, now, now)
-            .unwrap();
-    let cluster_state = Arc::new(std::sync::Mutex::new(cluster_state));
-    let cluster_sync = Arc::new(ClusterSyncManager::new(
-        db.clone(),
-        ClusterSyncConfig {
-            our_device_id: device_id,
-            batch_size: 1000,
-        },
-        cluster_state,
-    ));
-    let swarm = make_swarm().await;
-    let (backup_event_tx, _backup_event_rx) =
-        mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
-    let pending: crate::daemon::scheduler::PendingChallenges =
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<RelayPost>(16);
-    let processor = Processor::new(
-        db.clone(),
-        own_identity,
-        repair_tx,
-        cluster_sync,
-        holdings_dir.path().to_path_buf(),
-        swarm,
-        relay_sync_tx,
-        u64::MAX,
-        u64::MAX,
-        holdings_dir.path().to_path_buf(),
-        0,
-        backup_event_tx,
-        1,
-        pending,
-        relay_post_tx,
-        None, // cluster_state: not needed for this test
-        viaticum_core::config::EscrowCfg::default(),
-        super::make_empty_accepted_offers(),
-        ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
-    );
-
-    // Create a symbol file so PoS can respond.
-    let block_id = make_block_id(0xA1);
-    let block_hex = viaticum_core::types::hex_encode(&block_id.0);
-    let block_dir = holdings_dir.path().join(&block_hex);
-    std::fs::create_dir_all(&block_dir).unwrap();
-    std::fs::write(block_dir.join("42.bin"), b"test_symbol_data").unwrap();
-
-    // Create HoldingRecord so ownership check passes.
-    let challenger = make_identity(0xB1);
-    db.upsert_holding(&HoldingRecord {
-        source_block_id: block_id,
-        owner_id: challenger,
-        esi_ranges: vec![(42, 1)],
-        importance: 0.5,
-        total_bytes: 16,
-        status: HoldingStatus::Active,
-        received_at: Timestamp::now(),
-        delete_requested_at: None,
-        drop_notice_sent_at: None,
-    })
-    .unwrap();
-    let challenge = PosHashChallengeMsg {
-        v: 1,
-        challenge_id: [0xCC; 16],
-        source_block_id: block_id,
-        esi_ranges: vec![(42, 1)],
-        timestamp: now,
-        device_id: None,
-    };
-    let payload = viaticum_core::messages::to_cbor(&challenge).unwrap();
-    let relay_msg = InboundMessage {
-        from: challenger,
-        payload,
-        msg_type: "pos_hash_challenge".to_string(),
-        msg_id: [0xAA; 16],
-        created_at: now,
-    };
-
-    // Dispatch the relay message.
-    processor.dispatch_relay(relay_msg).await;
-
-    // Check that a pos_hash_response was posted to relay_post_tx.
-    let post = relay_post_rx
-        .try_recv()
-        .expect("expected a RelayPost for pos_hash_response");
-    assert_eq!(post.msg_type, "pos_hash_response");
-    assert_eq!(post.target, Some(challenger));
-}
-
-#[tokio::test]
-async fn dispatch_relay_delete_marks_holding() {
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-    let owner_id = IdentityPub(owner_key.verifying_key().to_bytes());
-    let block_id = make_block_id(0xE5);
-
-    let holding = HoldingRecord {
-        source_block_id: block_id,
-        owner_id,
-        esi_ranges: vec![(0, 10)],
-        importance: 0.5,
-        total_bytes: 1000,
-        status: HoldingStatus::Active,
-        received_at: Timestamp(100),
-        delete_requested_at: None,
-        drop_notice_sent_at: None,
-    };
-    db.upsert_holding(&holding).unwrap();
-
-    let delete_msg =
-        viaticum_core::messages::build_delete_msg(block_id, Timestamp::now(), &owner_key);
-    let payload = viaticum_core::messages::to_cbor(&delete_msg).unwrap();
-    let relay_msg = InboundMessage {
-        from: owner_id,
-        payload,
-        msg_type: "delete".to_string(),
-        msg_id: [0xBB; 16],
-        created_at: Timestamp::now(),
-    };
-
-    processor.dispatch_relay(relay_msg).await;
-
-    let updated = db.get_holding(&block_id, &owner_id).unwrap().unwrap();
-    assert_eq!(updated.status, HoldingStatus::MarkedForDelete);
-}
-
 // ─── C2: cluster device auto-add tests ───────────────────────────────────────
 //
 // These tests drive try_auto_add_cluster_device directly, bypassing the
@@ -2868,9 +1733,6 @@ async fn make_processor_with_cluster_state(
     db: Db,
     holdings_dir: &TempDir,
 ) -> (Processor, Arc<Mutex<ClusterState>>, IdentityPub) {
-    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
-    let (relay_sync_tx, _relay_sync_rx) = mpsc::channel::<SyncTrigger>(16);
-
     let master_key = derive_master_key(&[0xAAu8; 64]).expect("derive_master_key");
     let own_identity = master_identity(&master_key);
     let device_seed_a = [0x01u8; 32];
@@ -2897,26 +1759,19 @@ async fn make_processor_with_cluster_state(
     let swarm = make_swarm().await;
     let (backup_event_tx, _backup_event_rx) =
         mpsc::channel::<crate::daemon::backup::BackupEvent>(16);
-    let pending: crate::daemon::scheduler::PendingChallenges =
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
 
     let processor = Processor::new(
         db,
         own_identity,
-        repair_tx,
         cluster_sync,
         holdings_dir.path().to_path_buf(),
         swarm,
-        relay_sync_tx,
         u64::MAX,
         u64::MAX,
         holdings_dir.path().to_path_buf(),
         0,
         backup_event_tx,
         1,
-        pending,
-        relay_post_tx,
         Some(cluster_state.clone()),
         viaticum_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
@@ -3096,9 +1951,6 @@ async fn cluster_device_not_added_when_no_cert() {
 #[tokio::test]
 async fn revocation_broadcast_marks_device_key_revoked() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     // Build peer master key and identity.
     let peer_master_key = derive_master_key(&[0x55u8; 64]).expect("derive_master_key");
@@ -3145,9 +1997,8 @@ async fn revocation_broadcast_marks_device_key_revoked() {
         device_cert,
     };
 
-    processor
-        .handle_revocation_broadcast(peer_identity, broadcast)
-        .await
+    super::RevocationHandler::new(db.clone())
+        .apply(peer_identity, broadcast)
         .expect("handle_revocation_broadcast must succeed");
 
     let updated = db
@@ -3169,9 +2020,6 @@ async fn revocation_broadcast_marks_device_key_revoked() {
 #[tokio::test]
 async fn revocation_broadcast_idempotent_on_duplicate() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0x66u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -3217,9 +2065,8 @@ async fn revocation_broadcast_idempotent_on_duplicate() {
         device_cert,
     };
 
-    processor
-        .handle_revocation_broadcast(peer_identity, broadcast)
-        .await
+    super::RevocationHandler::new(db.clone())
+        .apply(peer_identity, broadcast)
         .expect("duplicate broadcast must not error");
 
     let updated = db
@@ -3246,9 +2093,6 @@ async fn revocation_broadcast_idempotent_on_duplicate() {
 #[tokio::test]
 async fn revocation_broadcast_invalid_device_cert_rejected() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0x77u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -3297,9 +2141,8 @@ async fn revocation_broadcast_invalid_device_cert_rejected() {
     };
 
     // Must not error, but must silently ignore the forged broadcast.
-    processor
-        .handle_revocation_broadcast(peer_identity, broadcast)
-        .await
+    super::RevocationHandler::new(db.clone())
+        .apply(peer_identity, broadcast)
         .expect("invalid cert must not propagate error");
 
     let updated = db
@@ -3321,9 +2164,6 @@ async fn revocation_broadcast_invalid_device_cert_rejected() {
 #[tokio::test]
 async fn revocation_broadcast_device_id_mismatch_rejected() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0x99u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -3373,9 +2213,8 @@ async fn revocation_broadcast_device_id_mismatch_rejected() {
         device_cert,
     };
 
-    processor
-        .handle_revocation_broadcast(peer_identity, broadcast)
-        .await
+    super::RevocationHandler::new(db.clone())
+        .apply(peer_identity, broadcast)
         .expect("device_id mismatch must not propagate error");
 
     let updated = db
@@ -3397,9 +2236,6 @@ async fn revocation_broadcast_device_id_mismatch_rejected() {
 #[tokio::test]
 async fn revocation_broadcast_unknown_peer_ignored() {
     let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0xAAu8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -3423,9 +2259,8 @@ async fn revocation_broadcast_unknown_peer_ignored() {
         device_cert,
     };
 
-    processor
-        .handle_revocation_broadcast(peer_identity, broadcast)
-        .await
+    super::RevocationHandler::new(db.clone())
+        .apply(peer_identity, broadcast)
         .expect("unknown peer broadcast must not error");
 
     // Must not create a phantom PeerRecord — check by DeviceId(peer_identity.0) as proxy.
@@ -3447,7 +2282,7 @@ async fn revocation_broadcast_unknown_peer_ignored() {
 async fn transfer_without_offer_rejected() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(0x11);
     let block_id = make_block_id(0x11);
@@ -3497,7 +2332,7 @@ async fn transfer_without_offer_rejected() {
 async fn offer_accepted_stored_in_map() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner = IdentityPub(signing_key.verifying_key().to_bytes());
@@ -3549,7 +2384,7 @@ async fn offer_accepted_stored_in_map() {
 async fn transfer_stored_after_valid_offer() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(0x33);
     let block_id = make_block_id(0x33);
@@ -3615,7 +2450,7 @@ async fn transfer_stored_after_valid_offer() {
 async fn transfer_partial_keeps_offer_and_second_transfer_completes_it() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(0x55);
     let block_id = make_block_id(0x55);
@@ -3710,7 +2545,7 @@ async fn transfer_partial_keeps_offer_and_second_transfer_completes_it() {
 async fn transfer_rejected_esi_out_of_range() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(0x44);
     let block_id = make_block_id(0x44);
@@ -3768,7 +2603,7 @@ async fn transfer_rejected_esi_out_of_range() {
 async fn offer_rejected_bad_signature() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner = IdentityPub(signing_key.verifying_key().to_bytes());
@@ -3815,7 +2650,7 @@ async fn expired_accepted_offer_rejected() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let owner = make_identity(0x66);
     let block_id = make_block_id(0x66);
@@ -3896,8 +2731,7 @@ async fn offer_rejected_when_quota_full() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
     // Quota of 1 byte: any realistic offer exceeds it and is rejected.
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor_with_quota(db.clone(), &holdings_dir, 1, 1).await;
+    let processor = make_processor_with_quota(db.clone(), &holdings_dir, 1, 1).await;
 
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner = IdentityPub(signing_key.verifying_key().to_bytes());
@@ -3963,7 +2797,7 @@ async fn offer_rejected_on_stale_timestamp() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let owner = IdentityPub(signing_key.verifying_key().to_bytes());
@@ -4018,7 +2852,7 @@ async fn offer_rejected_on_stale_timestamp() {
 async fn peer_authenticated_upserts_peer_record() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0xD1u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -4151,7 +2985,7 @@ async fn peer_authenticated_same_master_triggers_cluster_add() {
 async fn connection_closed_removes_from_peer_cert_map() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0xE3u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -4195,7 +3029,7 @@ async fn connection_closed_removes_from_peer_cert_map() {
 async fn peer_authenticated_stores_device_to_master_mapping() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _repair_rx, _sync_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let peer_master_key = derive_master_key(&[0xF1u8; 64]).expect("derive_master_key");
     let peer_identity = master_identity(&peer_master_key);
@@ -4321,7 +3155,7 @@ async fn cluster_sync_response_from_non_cluster_peer_is_rejected() {
 
     let db = Db::open_in_memory().unwrap();
     let holdings = TempDir::new().unwrap();
-    let (processor, _repair_rx, _relay_rx) = make_processor(db, &holdings).await;
+    let processor = make_processor(db, &holdings).await;
 
     let own_identity = processor.own_identity;
 
@@ -4358,227 +3192,6 @@ async fn cluster_sync_response_from_non_cluster_peer_is_rejected() {
     assert!(
         result.is_ok(),
         "handle_cluster_sync_response with cluster device must succeed"
-    );
-}
-
-// ─── Wave2 / Issue E: handle_pos_hash_nack signature verification ────────────
-
-// AC-E4: valid nack from expected holder → placement marked Lost, repair enqueued
-#[tokio::test]
-async fn handle_pos_hash_nack_valid_from_expected_holder_marks_lost() {
-    use crate::daemon::repair::RepairTrigger;
-    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
-    use std::collections::HashMap;
-    use viaticum_core::cluster::{derive_master_key, master_identity};
-    use viaticum_core::messages::build_pos_hash_nack;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    // Holder identity: separate key pair for the holder.
-    let holder_master_key = derive_master_key(&[0x10u8; 64]).expect("holder master key");
-    let holder_master = master_identity(&holder_master_key);
-    let holder_device = DeviceId(holder_master.0); // device_id == master pub for single-device
-
-    let block_id = make_block_id(50);
-    let challenge_id = [0x50u8; 16];
-
-    // Register holder in DB (PeerRecord + master mapping).
-    db.upsert_peer(&make_peer_record(holder_device)).unwrap();
-    db.set_master_for_device(&holder_device, &holder_master)
-        .unwrap();
-
-    // Insert Alive placement.
-    let placement = make_symbol_placement(
-        block_id,
-        holder_device,
-        vec![(0, 1)],
-        PlacementStatus::Alive,
-    );
-    db.upsert_placement(&placement).unwrap();
-
-    // Set up pending challenges.
-    let pending_map: HashMap<_, _> = [(
-        (block_id, holder_device),
-        PendingHashChallenge {
-            source_block_id: block_id,
-            holder_id: holder_device,
-            esi_ranges: vec![(0, 1)],
-            expected_chain_hash: [0u8; 32],
-            issued_at: Timestamp::now(),
-            challenge_id,
-        },
-    )]
-    .into_iter()
-    .collect();
-    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
-
-    let (processor, mut repair_rx, _relay_rx) =
-        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
-
-    // Build a valid signed nack from the holder.
-    let nack = build_pos_hash_nack(
-        challenge_id,
-        block_id,
-        0,
-        Timestamp::now(),
-        Some(holder_device),
-        &holder_master_key,
-    );
-
-    processor
-        .handle_pos_hash_nack(holder_device, nack)
-        .await
-        .expect("handle_pos_hash_nack must succeed");
-
-    // Placement must be Lost.
-    let updated = db.get_placement(&block_id, &holder_device).unwrap();
-    assert!(
-        matches!(updated, Some(ref p) if p.status == PlacementStatus::Lost),
-        "placement must be Lost after valid PosHashNack, got: {:?}",
-        updated
-    );
-
-    // RepairTrigger::RepairNow must have been enqueued.
-    let trigger = repair_rx
-        .try_recv()
-        .expect("repair trigger must be enqueued");
-    assert!(
-        matches!(trigger, RepairTrigger::RepairNow { block_id: b, holder_id: h } if b == block_id && h == holder_device),
-        "repair trigger must reference correct block and holder"
-    );
-
-    // Pending challenge must have been consumed.
-    // (verified indirectly — a second call with same challenge_id would get "unknown challenge_id")
-}
-
-// AC-E5: nack signed by wrong key → placement unchanged, no repair
-#[tokio::test]
-async fn handle_pos_hash_nack_from_wrong_signer_rejected() {
-    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
-    use std::collections::HashMap;
-    use viaticum_core::cluster::{derive_master_key, master_identity};
-    use viaticum_core::messages::build_pos_hash_nack;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    // Holder identity.
-    let holder_master_key = derive_master_key(&[0x20u8; 64]).expect("holder master key");
-    let holder_master = master_identity(&holder_master_key);
-    let holder_device = DeviceId(holder_master.0);
-
-    // Attacker identity (different key).
-    let attacker_master_key = derive_master_key(&[0x21u8; 64]).expect("attacker master key");
-
-    let block_id = make_block_id(51);
-    let challenge_id = [0x51u8; 16];
-
-    // Register holder in DB.
-    db.upsert_peer(&make_peer_record(holder_device)).unwrap();
-    db.set_master_for_device(&holder_device, &holder_master)
-        .unwrap();
-
-    // Insert Alive placement.
-    let placement = make_symbol_placement(
-        block_id,
-        holder_device,
-        vec![(0, 1)],
-        PlacementStatus::Alive,
-    );
-    db.upsert_placement(&placement).unwrap();
-
-    // Pending challenge for holder.
-    let pending_map: HashMap<_, _> = [(
-        (block_id, holder_device),
-        PendingHashChallenge {
-            source_block_id: block_id,
-            holder_id: holder_device,
-            esi_ranges: vec![(0, 1)],
-            expected_chain_hash: [0u8; 32],
-            issued_at: Timestamp::now(),
-            challenge_id,
-        },
-    )]
-    .into_iter()
-    .collect();
-    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
-
-    let (processor, mut repair_rx, _relay_rx) =
-        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
-
-    // Build a nack signed by the ATTACKER key (not the holder).
-    let forged_nack = build_pos_hash_nack(
-        challenge_id,
-        block_id,
-        0,
-        Timestamp::now(),
-        Some(holder_device),
-        &attacker_master_key, // wrong key — attacker's
-    );
-
-    processor
-        .handle_pos_hash_nack(holder_device, forged_nack)
-        .await
-        .expect("handle_pos_hash_nack must return Ok even when rejecting");
-
-    // Placement must still be Alive (not modified).
-    let placement_after = db
-        .get_placement(&block_id, &holder_device)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        placement_after.status,
-        PlacementStatus::Alive,
-        "placement must remain Alive when forged nack is rejected"
-    );
-
-    // No repair trigger.
-    assert!(
-        repair_rx.try_recv().is_err(),
-        "repair_rx must be empty when forged nack is rejected"
-    );
-}
-
-// AC-E6: unknown challenge_id → silent drop, no placement change, no repair
-#[tokio::test]
-async fn handle_pos_hash_nack_unknown_challenge_id_silently_dropped() {
-    use viaticum_core::cluster::{derive_master_key, master_identity};
-    use viaticum_core::messages::build_pos_hash_nack;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    let holder_master_key = derive_master_key(&[0x30u8; 64]).expect("holder master key");
-    let holder_master = master_identity(&holder_master_key);
-    let holder_device = DeviceId(holder_master.0);
-
-    let block_id = make_block_id(52);
-    let unknown_challenge_id = [0x99u8; 16]; // not in pending_challenges
-
-    // pending_challenges is empty (make_processor uses empty map).
-    let (processor, mut repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-
-    // Build a nack with an unknown challenge_id.
-    let nack = build_pos_hash_nack(
-        unknown_challenge_id,
-        block_id,
-        0,
-        Timestamp::now(),
-        Some(holder_device),
-        &holder_master_key,
-    );
-
-    let result = processor.handle_pos_hash_nack(holder_device, nack).await;
-    assert!(
-        result.is_ok(),
-        "handle_pos_hash_nack must return Ok for unknown challenge_id"
-    );
-
-    // No repair trigger.
-    assert!(
-        repair_rx.try_recv().is_err(),
-        "repair_rx must be empty for unknown challenge_id"
     );
 }
 
@@ -4821,424 +3434,6 @@ fn recompute_and_persist_is_idempotent_on_double_call() {
     );
 }
 
-// ─── W11a: PoS outcome tests (apply_and_persist_pos_outcome) ─────────────────
-
-#[tokio::test]
-async fn pos_pass_on_uncertain_placement_keeps_current_alive_and_updates_status() {
-    // Alive→Alive (Pass on Alive): old_status == new_status → hook NOT called.
-    // Uncertain→Alive (Pass on Uncertain): old_status != new_status → hook IS called.
-    // Count stays the same (Uncertain counted before + after) but status becomes Alive.
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    let holder_id = make_device_id(0xE1);
-    let block_id = make_block_id(0xE2);
-
-    let block = make_source_block_for_hook(block_id, 0.5);
-    db.upsert_source_block(&block).unwrap();
-    db.upsert_peer(&make_hook_peer(holder_id, 0.8)).unwrap();
-
-    // Set initial current_alive to 1 (Uncertain counts).
-    db.update_block_cached_fields(&block_id, 0.5, 1, 0.5, 0.99)
-        .unwrap();
-
-    // Uncertain placement — Pass will transition to Alive.
-    let mut placement = make_hook_placement(block_id, holder_id, PlacementStatus::Uncertain);
-    placement.consecutive_misses = 1;
-    db.upsert_placement(&placement).unwrap();
-
-    let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
-    processor
-        .apply_and_persist_pos_outcome(
-            block_id,
-            holder_id,
-            &viaticum_core::pos::VerifyOutcome::Pass,
-        )
-        .await
-        .unwrap();
-
-    let updated_placement = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
-    assert_eq!(
-        updated_placement.status,
-        PlacementStatus::Alive,
-        "placement must become Alive after Pass"
-    );
-
-    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
-    // Uncertain→Alive: hook fires, still counts as 1.
-    assert_eq!(
-        updated_block.current_alive, 1,
-        "current_alive must remain 1 (Uncertain→Alive)"
-    );
-}
-
-#[tokio::test]
-async fn pos_fail_on_alive_placement_decrements_current_alive() {
-    use crate::daemon::scheduler::PendingChallenges;
-    use std::collections::HashMap;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    let holder_a = make_device_id(0xF1);
-    let holder_b = make_device_id(0xF2);
-    let block_id = make_block_id(0xF3);
-
-    let block = make_source_block_for_hook(block_id, 0.5);
-    db.upsert_source_block(&block).unwrap();
-    db.upsert_peer(&make_hook_peer(holder_a, 0.8)).unwrap();
-    db.upsert_peer(&make_hook_peer(holder_b, 0.8)).unwrap();
-
-    db.upsert_placement(&make_hook_placement(
-        block_id,
-        holder_a,
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-    db.upsert_placement(&make_hook_placement(
-        block_id,
-        holder_b,
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-
-    // Set initial cached fields reflecting 2 alive.
-    db.update_block_cached_fields(&block_id, 0.5, 2, 0.9, 0.99)
-        .unwrap();
-
-    // Need pending challenge for block_id/holder_a so apply_and_persist_pos_outcome
-    // can find the placement. Direct call doesn't need pending — just call directly.
-    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
-
-    let pre_reliability = db
-        .get_source_block(&block_id)
-        .unwrap()
-        .unwrap()
-        .current_reliability;
-
-    // Fail holder_a → placement becomes Lost.
-    processor
-        .apply_and_persist_pos_outcome(
-            block_id,
-            holder_a,
-            &viaticum_core::pos::VerifyOutcome::Fail { esi: 0 },
-        )
-        .await
-        .unwrap();
-
-    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(
-        updated_block.current_alive, 1,
-        "current_alive must be 1 after one Fail"
-    );
-
-    let placement_a = db.get_placement(&block_id, &holder_a).unwrap().unwrap();
-    assert_eq!(
-        placement_a.status,
-        PlacementStatus::Lost,
-        "holder_a placement must be Lost"
-    );
-
-    assert!(
-        updated_block.current_reliability < pre_reliability,
-        "reliability must decrease after a Fail (pre={pre_reliability}, post={post})",
-        post = updated_block.current_reliability,
-    );
-}
-
-// ─── W11a: PoS Nack test (handle_pos_hash_nack) ──────────────────────────────
-
-#[tokio::test]
-async fn pos_nack_decrements_current_alive_and_updates_reliability() {
-    use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
-    use std::collections::HashMap;
-    use viaticum_core::messages::build_pos_hash_nack;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    let holder_master_key =
-        viaticum_core::cluster::derive_master_key(&[0x30u8; 64]).expect("holder master key");
-    let holder_master = viaticum_core::cluster::master_identity(&holder_master_key);
-    let holder_device = make_device_id(0x88);
-    let block_id = make_block_id(0x89);
-
-    // Three alive holders: holder_device, extra_a, extra_b.
-    let extra_a = make_device_id(0x8A);
-    let extra_b = make_device_id(0x8B);
-
-    let block = make_source_block_for_hook(block_id, 0.5);
-    db.upsert_source_block(&block).unwrap();
-    db.upsert_peer(&make_hook_peer(holder_device, 0.8)).unwrap();
-    db.upsert_peer(&make_hook_peer(extra_a, 0.8)).unwrap();
-    db.upsert_peer(&make_hook_peer(extra_b, 0.8)).unwrap();
-
-    db.upsert_placement(&make_hook_placement(
-        block_id,
-        holder_device,
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-    db.upsert_placement(&make_hook_placement(
-        block_id,
-        extra_a,
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-    db.upsert_placement(&make_hook_placement(
-        block_id,
-        extra_b,
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-
-    // Set current_alive = 3.
-    db.update_block_cached_fields(&block_id, 0.5, 3, 0.9, 0.99)
-        .unwrap();
-
-    // Register master→device so the processor can verify the nack signature.
-    db.set_master_for_device(&holder_device, &holder_master)
-        .unwrap();
-
-    let challenge_id = [0x77u8; 16];
-    let pending_map: HashMap<_, _> = [(
-        (block_id, holder_device),
-        PendingHashChallenge {
-            source_block_id: block_id,
-            holder_id: holder_device,
-            esi_ranges: vec![(0, 4)],
-            expected_chain_hash: [0u8; 32],
-            issued_at: Timestamp::now(),
-            challenge_id,
-        },
-    )]
-    .into_iter()
-    .collect();
-    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(pending_map));
-
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
-
-    // Build valid nack signed by holder's master key.
-    let nack = build_pos_hash_nack(
-        challenge_id,
-        block_id,
-        0,
-        Timestamp::now(),
-        Some(holder_device),
-        &holder_master_key,
-    );
-
-    processor
-        .handle_pos_hash_nack(holder_device, nack)
-        .await
-        .unwrap();
-
-    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(
-        updated_block.current_alive, 2,
-        "current_alive must be 2 after Nack"
-    );
-
-    let placement = db
-        .get_placement(&block_id, &holder_device)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        placement.status,
-        PlacementStatus::Lost,
-        "placement must be Lost after Nack"
-    );
-}
-
-// ─── W11a: rapid transitions keep current_alive coherent ─────────────────────
-
-#[tokio::test]
-async fn rapid_alive_to_lost_transitions_keep_current_alive_coherent() {
-    use crate::daemon::scheduler::PendingChallenges;
-    use std::collections::HashMap;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    let holders: Vec<DeviceId> = (0..5).map(|i| make_device_id(0x10 + i)).collect();
-    let block_id = make_block_id(0x20);
-
-    let block = make_source_block_for_hook(block_id, 0.5);
-    db.upsert_source_block(&block).unwrap();
-
-    for &h in &holders {
-        db.upsert_peer(&make_hook_peer(h, 0.8)).unwrap();
-        db.upsert_placement(&make_hook_placement(block_id, h, PlacementStatus::Alive))
-            .unwrap();
-    }
-    db.update_block_cached_fields(&block_id, 0.5, 5, 0.9999, 0.99)
-        .unwrap();
-
-    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
-
-    // Transition A → Lost.
-    processor
-        .apply_and_persist_pos_outcome(
-            block_id,
-            holders[0],
-            &viaticum_core::pos::VerifyOutcome::Fail { esi: 0 },
-        )
-        .await
-        .unwrap();
-    let b = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(
-        b.current_alive, 4,
-        "after 1st Fail: current_alive must be 4"
-    );
-    let r4 = b.current_reliability;
-
-    // Transition B → Lost.
-    processor
-        .apply_and_persist_pos_outcome(
-            block_id,
-            holders[1],
-            &viaticum_core::pos::VerifyOutcome::Fail { esi: 0 },
-        )
-        .await
-        .unwrap();
-    let b = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(
-        b.current_alive, 3,
-        "after 2nd Fail: current_alive must be 3"
-    );
-    let r3 = b.current_reliability;
-
-    // Transition C → Lost.
-    processor
-        .apply_and_persist_pos_outcome(
-            block_id,
-            holders[2],
-            &viaticum_core::pos::VerifyOutcome::Fail { esi: 0 },
-        )
-        .await
-        .unwrap();
-    let b = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(
-        b.current_alive, 2,
-        "after 3rd Fail: current_alive must be 2"
-    );
-    let r2 = b.current_reliability;
-
-    // Reliability decreases monotonically.
-    assert!(r4 >= r3, "reliability must not increase after Fail");
-    assert!(r3 >= r2, "reliability must not increase after Fail");
-}
-
-// ─── W11a: next_work_item integration — block eligible after PoS Fail ─────────
-
-#[tokio::test]
-async fn block_becomes_eligible_in_next_work_item_after_pos_fail() {
-    use crate::daemon::scheduler::PendingChallenges;
-    use std::collections::HashMap;
-    use std::time::Duration;
-
-    let db = Db::open_in_memory().unwrap();
-    let holdings_dir = TempDir::new().unwrap();
-
-    // k=1 so reliability with 1 holder is very high, with 0 holders = 0.0.
-    let block_id = make_block_id(0x42);
-    let holder_a = make_device_id(0x43);
-    let holder_b = make_device_id(0x44);
-
-    // Use a block where target_reliability is 0.9.
-    let block = SourceBlockRecord {
-        block_id,
-        k: 1,
-        t: 1,
-        block_type: SourceBlockType::Single,
-        status: SourceBlockStatus::Active,
-        created_at: Timestamp(0),
-        encrypted_size: Some(1),
-        n: Some(4),
-        overhead: Some(1.5),
-        drop_notice_sent_at: None,
-        importance: 0.5,
-        current_alive: 2,
-        current_reliability: 0.9999,
-        target_reliability: 0.9,
-    };
-    db.upsert_source_block(&block).unwrap();
-    db.upsert_peer(&make_hook_peer(holder_a, 0.8)).unwrap();
-    db.upsert_peer(&make_hook_peer(holder_b, 0.8)).unwrap();
-    db.upsert_placement(&make_hook_placement(
-        block_id,
-        holder_a,
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-    db.upsert_placement(&make_hook_placement(
-        block_id,
-        holder_b,
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-
-    // Initially above target — next_work_item returns None.
-    let work_before = db
-        .next_work_item(1.5, Duration::from_secs(0), Timestamp::now(), 0)
-        .unwrap();
-    assert!(
-        work_before.is_none(),
-        "block should not need work when reliability >= target"
-    );
-
-    let pending: PendingChallenges = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let (processor, _repair_rx, _relay_rx) =
-        make_processor_with_pending(db.clone(), &holdings_dir, pending).await;
-
-    // Fail both holders → current_alive = 0 → reliability drops to 0.0.
-    processor
-        .apply_and_persist_pos_outcome(
-            block_id,
-            holder_a,
-            &viaticum_core::pos::VerifyOutcome::Fail { esi: 0 },
-        )
-        .await
-        .unwrap();
-    processor
-        .apply_and_persist_pos_outcome(
-            block_id,
-            holder_b,
-            &viaticum_core::pos::VerifyOutcome::Fail { esi: 0 },
-        )
-        .await
-        .unwrap();
-
-    let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
-    assert_eq!(
-        updated_block.current_alive, 0,
-        "current_alive must be 0 after both Fails"
-    );
-    assert!(
-        updated_block.current_reliability < updated_block.target_reliability,
-        "reliability must be below target after both Fails"
-    );
-
-    // Now next_work_item must return this block.
-    let work_after = db
-        .next_work_item(1.5, Duration::from_secs(0), Timestamp::now(), 0)
-        .unwrap();
-    assert!(
-        work_after.is_some(),
-        "block must be eligible for work after reliability dropped below target"
-    );
-    let work_block = work_after.unwrap();
-    assert_eq!(
-        work_block.block_id, block_id,
-        "next_work_item must return the degraded block"
-    );
-}
-
 // ─── PosResponder: standalone compute tests ──────────────────────────────────
 //
 // These tests exercise the non-mock production path: PosResponder is built
@@ -5381,7 +3576,7 @@ async fn pos_responder_returns_none_when_block_not_held() {
 async fn on_peer_identified_persists_addrs_for_inbound_peer() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (processor, _rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
+    let processor = make_processor(db.clone(), &holdings_dir).await;
 
     let device_id = make_device_id(0xA1);
 

@@ -462,7 +462,9 @@ async fn deliver_transfer_worker(
                 // DR falls back to Kademlia get_closest_peers(holder_id) per B-1.
                 persist_holder_addrs_from_swarm(db, swarm, placement.holder_id).await;
             }
-            Message::SystemStateAck(_) => {
+            Message::Ack(_) => {
+                // Holder did not confirm storage with SymbolStored (transfer handler
+                // failed, or an older/unhandled path replied with a generic Ack).
                 saw_old_protocol = true;
             }
             other => {
@@ -507,7 +509,7 @@ async fn deliver_transfer_worker(
             holder = %placement.holder_id,
             chunks_ok = stored_ok,
             chunks_total = total_chunks,
-            "work_pipeline: old-protocol holder (SystemStateAck); placement left Offered"
+            "work_pipeline: holder replied Ack without SymbolStored; placement left Offered"
         );
     } else {
         tracing::warn!(

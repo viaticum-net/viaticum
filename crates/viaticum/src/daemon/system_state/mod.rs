@@ -91,7 +91,7 @@ pub fn decrypt_and_restore(db: &Db, blob: &[u8], seed: &[u8]) -> anyhow::Result<
 
 /// Periodically publish the SystemState as regular blocks + a signed self-pointer.
 ///
-/// T-8: replaces push-to-all (SystemStateBackup fanout) with mailbox publish.
+/// T-8: replaces the former push-to-all pointer fanout with mailbox publish.
 /// The SelfPointer is published to `mailbox_router.publish(&my_master_pub, entry)` with
 /// class=SelfPointer and TTL=5 years. Republish policy (store-and-forward — not every tick):
 ///   - Publish when (a) the pointer structurally changed (generation or block_ids differ), OR
@@ -106,9 +106,9 @@ pub fn decrypt_and_restore(db: &Db, blob: &[u8], seed: &[u8]) -> anyhow::Result<
 /// so poll dispatch (W-2 own-pointer arm) can see the latest pointer. On startup, we seed
 /// `last_published` from this handle (restart-recovery: avoids re-publishing generation 0).
 ///
-/// Staged transient (T-9): after T-8 the pointer lives only in the mailbox candidate-set.
-/// Legacy DR via `SystemStateRequest` is not fed until T-9 cuts DR over to
-/// `mailbox_router.dr_walk_for_pointer`. This in-session window is by design.
+/// The pointer lives only in the mailbox candidate-set; DR finds it via
+/// `mailbox_router.dr_walk_for_pointer` (the relay-board / SystemState blob path was
+/// retired in A2 / T-13b-3).
 ///
 /// The minimum interval is clamped to 60 seconds.
 #[allow(clippy::too_many_arguments)]

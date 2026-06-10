@@ -19,7 +19,6 @@ use viaticum_core::types::{
 use viaticum_core::erasure::RaptorQEncoder;
 
 use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
-use crate::daemon::relay::RelayPost;
 use crate::daemon::repair::RepairTrigger;
 use crate::daemon::scheduler::{
     PendingChallenges, PendingHashChallenge, Scheduler, SchedulerConfig,
@@ -139,14 +138,12 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
 
     // We need a NetworkHandle for the constructor. Build a no-op one via a stub.
     // Since check_timeouts doesn't use network, we pass a real (but unused) handle.
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let scheduler = Scheduler::new(
         db.clone(),
         config,
         repair_tx,
         pending.clone(),
-        relay_post_tx,
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
@@ -224,7 +221,6 @@ async fn check_timeouts_ignores_fresh_challenges() {
         event_log_retain_rows: 100_000,
         pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
     };
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let test_router = make_test_router(&db);
     let scheduler = Scheduler::new(
@@ -232,7 +228,6 @@ async fn check_timeouts_ignores_fresh_challenges() {
         config,
         repair_tx,
         pending.clone(),
-        relay_post_tx,
         test_router,
         dummy_master_pub(),
         signing_key,
@@ -339,14 +334,12 @@ async fn check_timeouts_respects_time_scale() {
         event_log_retain_rows: 100_000,
         pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
     };
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let scheduler = Scheduler::new(
         db.clone(),
         config,
         repair_tx,
         pending.clone(),
-        relay_post_tx,
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
@@ -411,7 +404,6 @@ async fn issue_due_challenges_skips_already_pending() {
         event_log_retain_rows: 100_000,
         pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
     };
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let test_router = make_test_router(&db);
     let scheduler = Scheduler::new(
@@ -419,7 +411,6 @@ async fn issue_due_challenges_skips_already_pending() {
         config,
         repair_tx,
         pending.clone(),
-        relay_post_tx,
         test_router,
         dummy_master_pub(),
         signing_key,
@@ -474,7 +465,6 @@ async fn scheduler_skips_deleting_placements() {
         event_log_retain_rows: 100_000,
         pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
     };
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let test_router = make_test_router(&db);
     let scheduler = Scheduler::new(
@@ -482,7 +472,6 @@ async fn scheduler_skips_deleting_placements() {
         config,
         repair_tx,
         pending.clone(),
-        relay_post_tx,
         test_router,
         dummy_master_pub(),
         signing_key,
@@ -554,14 +543,12 @@ async fn time_scale_divides_intervals() {
         event_log_retain_rows: 100_000,
         pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
     };
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let scheduler = Scheduler::new(
         db.clone(),
         config,
         repair_tx,
         pending.clone(),
-        relay_post_tx,
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
@@ -658,7 +645,6 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
     db.upsert_peer(&peer).unwrap();
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
-    let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<RelayPost>(16);
     // T-13b-1: use RecordingMailboxSender to capture mailbox publishes.
     let recording_sender = Arc::new(RecordingMailboxSender::new());
     let router = Arc::new(MailboxRouter::with_sender(
@@ -680,7 +666,6 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
         config,
         repair_tx,
         pending,
-        relay_post_tx,
         router,
         dummy_master_pub(),
         signing_key,
@@ -695,12 +680,6 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
     // process_deletion_tick uses Timestamp::now() internally. Since deleted_at=0,
     // any now > OWNER_DELETE_COOLDOWN_SECS will trigger.
     scheduler.process_deletion_tick().await.unwrap();
-
-    // T-13b-1 acceptance: Must NOT have posted to relay board.
-    assert!(
-        relay_post_rx.try_recv().is_err(),
-        "delete_published_via_mailbox_not_relay: relay board must NOT receive a delete post"
-    );
 
     // T-13b-1 acceptance: Must have published via mailbox with class = DeleteRequest.
     let captured = recording_sender.captured_requests();
@@ -751,7 +730,6 @@ async fn deletion_tick_noop_when_no_eligible_files() {
     let db = Db::open_in_memory().unwrap();
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
-    let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let pending = make_pending_challenges();
     let config = SchedulerConfig {
@@ -767,7 +745,6 @@ async fn deletion_tick_noop_when_no_eligible_files() {
         config,
         repair_tx,
         pending,
-        relay_post_tx,
         test_router,
         dummy_master_pub(),
         signing_key,
@@ -781,7 +758,6 @@ async fn deletion_tick_noop_when_no_eligible_files() {
     scheduler.process_deletion_tick().await.unwrap();
 
     // No messages should be posted.
-    assert!(relay_post_rx.try_recv().is_err());
 }
 
 // ─── B3: sweep_offered_placements tests ──────────────────────────────────────
@@ -809,7 +785,6 @@ async fn scheduler_transitions_offered_to_lost_after_long_absence() {
     db.upsert_placement(&placement).unwrap();
 
     let (repair_tx, mut repair_rx) = mpsc::channel::<RepairTrigger>(8);
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let pending = make_pending_challenges();
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
 
@@ -827,7 +802,6 @@ async fn scheduler_transitions_offered_to_lost_after_long_absence() {
         config,
         repair_tx,
         pending,
-        relay_post_tx,
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
@@ -888,7 +862,6 @@ async fn scheduler_does_not_transition_offered_to_lost_before_long_absence() {
     db.upsert_placement(&placement).unwrap();
 
     let (repair_tx, mut repair_rx) = mpsc::channel::<RepairTrigger>(8);
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let pending = make_pending_challenges();
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
 
@@ -904,7 +877,6 @@ async fn scheduler_does_not_transition_offered_to_lost_before_long_absence() {
         config,
         repair_tx,
         pending,
-        relay_post_tx,
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
@@ -1012,7 +984,6 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
     db.upsert_peer(&peer).unwrap();
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
-    let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<RelayPost>(64);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let pending = make_pending_challenges();
     let config = SchedulerConfig {
@@ -1027,7 +998,6 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
         config,
         repair_tx,
         pending,
-        relay_post_tx,
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
@@ -1040,11 +1010,6 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
 
     // First tick: should publish a DeleteRequest via mailbox.
     scheduler.process_deletion_tick().await.unwrap();
-    // No relay post should occur (T-13b-1: migrated to mailbox).
-    assert!(
-        relay_post_rx.try_recv().is_err(),
-        "first tick: relay board must NOT receive a delete post (migrated to mailbox)"
-    );
 
     // drop_notice_sent_at must now be set.
     let updated_sb = db.get_source_block(&block_id).unwrap().unwrap();
@@ -1055,10 +1020,6 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
 
     // Second tick: must NOT send another message (dedup via drop_notice_sent_at).
     scheduler.process_deletion_tick().await.unwrap();
-    assert!(
-        relay_post_rx.try_recv().is_err(),
-        "second tick must not send another drop notice (dedup)"
-    );
 }
 
 // ─── D4: cleanup_block_removes_files_from_disk ───────────────────────────────
@@ -1146,7 +1107,6 @@ async fn cleanup_block_removes_files_from_disk() {
     assert!(block_dir.exists(), "block dir must exist before the tick");
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let pending = make_pending_challenges();
     let config = SchedulerConfig {
@@ -1161,7 +1121,6 @@ async fn cleanup_block_removes_files_from_disk() {
         config,
         repair_tx,
         pending,
-        relay_post_tx,
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
@@ -1219,7 +1178,6 @@ fn make_scheduler_for_hook(
     repair_tx: mpsc::Sender<RepairTrigger>,
     pending: PendingChallenges,
 ) -> Scheduler {
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let router = make_test_router(&db);
     let config = SchedulerConfig {
@@ -1234,7 +1192,6 @@ fn make_scheduler_for_hook(
         config,
         repair_tx,
         pending,
-        relay_post_tx,
         router,
         dummy_master_pub(),
         signing_key,
@@ -1522,13 +1479,12 @@ fn write_block_bin(source_blocks_dir: &std::path::Path, block_id: SourceBlockId)
 
 // ─── T-6 test: challenge goes via mailbox, not relay ─────────────────────────
 
-/// A due PoS challenge is published via MailboxRouter, NOT via relay_post_tx.
+/// A due PoS challenge is published via MailboxRouter (the mailbox bus).
 ///
 /// Asserts:
 /// - At least one MailboxStoreRequest was captured by the recording sender.
 /// - The captured entry has class == PosChallenge, sender == Some(owner master_pub).
 /// - The payload decodes as a valid PosHashChallengeMsg.
-/// - No RelayPost was sent on the relay_post_tx channel.
 #[tokio::test]
 async fn scheduler_issues_challenge_via_mailbox_not_relay() {
     use viaticum_core::mailbox::MailboxClass;
@@ -1556,7 +1512,6 @@ async fn scheduler_issues_challenge_via_mailbox_not_relay() {
     ));
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
-    let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let pending = make_pending_challenges();
     let my_master = dummy_master_pub();
@@ -1573,7 +1528,6 @@ async fn scheduler_issues_challenge_via_mailbox_not_relay() {
         config,
         repair_tx,
         pending.clone(),
-        relay_post_tx,
         router,
         my_master,
         signing_key,
@@ -1623,12 +1577,6 @@ async fn scheduler_issues_challenge_via_mailbox_not_relay() {
         decoded.source_block_id, block_id,
         "decoded challenge source_block_id must match"
     );
-
-    // NO relay post was sent for a PoS challenge.
-    assert!(
-        relay_post_rx.try_recv().is_err(),
-        "PoS challenge must NOT go via relay_post_tx — mailbox only"
-    );
 }
 
 // ─── T-6 test: PosChallenge entry has correct TTL ────────────────────────────
@@ -1658,7 +1606,6 @@ async fn pos_challenge_stored_in_mailbox_with_correct_ttl() {
     ));
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let pending = make_pending_challenges();
 
@@ -1674,7 +1621,6 @@ async fn pos_challenge_stored_in_mailbox_with_correct_ttl() {
         config,
         repair_tx,
         pending.clone(),
-        relay_post_tx,
         router,
         dummy_master_pub(),
         signing_key,
@@ -1752,7 +1698,6 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
     }
 
     let (repair_tx, mut repair_rx) = mpsc::channel::<RepairTrigger>(8);
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
 
     let config = SchedulerConfig {
@@ -1767,7 +1712,6 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
         config,
         repair_tx,
         pending.clone(),
-        relay_post_tx,
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
@@ -1851,7 +1795,6 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
     }
 
     let (repair_tx2, mut repair_rx2) = mpsc::channel::<RepairTrigger>(8);
-    let (relay_post_tx2, _relay_post_rx2) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
     let signing_key2 = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let config2 = SchedulerConfig {
         pos_interval_secs: 3600,
@@ -1865,7 +1808,6 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
         config2,
         repair_tx2,
         pending2.clone(),
-        relay_post_tx2,
         make_test_router(&db2),
         dummy_master_pub(),
         signing_key2,
@@ -1982,7 +1924,6 @@ async fn pos_pending_timeout_is_14d_2h_not_7d_1h() {
     }
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
 
     // time_scale = POS_CHALLENGE_PENDING_TIMEOUT_SECS → threshold = 1 second.
@@ -2009,7 +1950,6 @@ async fn pos_pending_timeout_is_14d_2h_not_7d_1h() {
         config,
         repair_tx,
         pending.clone(),
-        relay_post_tx,
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
@@ -2080,7 +2020,6 @@ async fn ss_blocks_excluded_from_due_challenges_via_existing_ss_block_id_set() {
     ));
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
-    let (relay_post_tx, _relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let pending = make_pending_challenges();
 
@@ -2096,7 +2035,6 @@ async fn ss_blocks_excluded_from_due_challenges_via_existing_ss_block_id_set() {
         config,
         repair_tx,
         pending.clone(),
-        relay_post_tx,
         router,
         dummy_master_pub(),
         signing_key,
@@ -2171,7 +2109,6 @@ async fn pending_challenge_not_created_before_mailbox_store_ack() {
         ));
 
         let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
-        let (relay_post_tx, _relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
         let pending = make_pending_challenges();
 
@@ -2187,7 +2124,6 @@ async fn pending_challenge_not_created_before_mailbox_store_ack() {
             config,
             repair_tx,
             pending.clone(),
-            relay_post_tx,
             router,
             dummy_master_pub(),
             ed25519_dalek::SigningKey::from_bytes(&signing_key.to_bytes()),
@@ -2225,7 +2161,6 @@ async fn pending_challenge_not_created_before_mailbox_store_ack() {
         ));
 
         let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
-        let (relay_post_tx, _relay_post_rx) = mpsc::channel::<crate::daemon::relay::RelayPost>(16);
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
         let pending = make_pending_challenges();
 
@@ -2241,7 +2176,6 @@ async fn pending_challenge_not_created_before_mailbox_store_ack() {
             config,
             repair_tx,
             pending.clone(),
-            relay_post_tx,
             router,
             dummy_master_pub(),
             signing_key,

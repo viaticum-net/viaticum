@@ -9,17 +9,13 @@
 // DropNotice for every holding (avoids false mass-reports on temporary unmount).
 //
 // T-13a: migrated from relay (SymbolDropped) to mailbox (DropNotice, deadline=now).
-// relay_post_tx is kept in run() signature; T-13b removes relay entirely.
 //
-// Relay-board status: T-13a removed the SymbolDropped relay producers here.
-// DeleteMsg + RevocationBroadcast + the legacy PoS relay arm still use the board;
-// their migration/removal is a separate T-13b scope decision.
+// A2 (T-13b-3): relay board fully retired; all DropNotice transport is via the mailbox bus.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use viaticum_core::cluster::master_identity;
@@ -29,7 +25,6 @@ use viaticum_core::messages::{SymbolDropNoticeBatchMsg, build_signed_symbol_drop
 use viaticum_core::types::{HoldingRecord, HoldingStatus, IdentityPub, Timestamp, hex_encode};
 
 use crate::daemon::mailbox::routing::MailboxRouter;
-use crate::daemon::relay::RelayPost;
 
 #[cfg(test)]
 mod tests;
@@ -41,7 +36,6 @@ mod tests;
 /// (deadline=now) via the mailbox bus and removes the DB holding record immediately.
 ///
 /// T-13a: migrated from relay (SymbolDropped) to mailbox (DropNotice, deadline=now).
-/// `relay_post_tx` is kept in the signature; T-13b removes relay entirely.
 ///
 /// Scan interval: scan_interval_secs / time_scale (minimum 1 second).
 /// Skips holdings with status != Active (MarkedForDelete, Silent may legitimately be absent).
@@ -49,7 +43,6 @@ mod tests;
 pub async fn run(
     db: Db,
     holdings_dir: PathBuf,
-    relay_post_tx: mpsc::Sender<RelayPost>,
     mailbox_router: Arc<MailboxRouter>,
     my_identity: IdentityPub,
     scan_interval_secs: u64,
@@ -57,9 +50,6 @@ pub async fn run(
     master_signing_key: ed25519_dalek::SigningKey,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    // relay_post_tx is kept for signature compat; T-13b removes relay entirely.
-    let _relay_post_tx = relay_post_tx;
-
     let interval_secs = (scan_interval_secs / time_scale.max(1)).max(1);
     let mut timer = tokio::time::interval(Duration::from_secs(interval_secs));
     timer.tick().await;

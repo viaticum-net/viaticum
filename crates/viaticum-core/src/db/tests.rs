@@ -1,5 +1,5 @@
 use crate::db::testutil::{test_db, test_peer, test_peers};
-use crate::db::{Db, SystemStateBlobRecord, WeeklyPosEntry};
+use crate::db::{Db, WeeklyPosEntry};
 use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
 use crate::types::{
     BudgetRecord, DeviceId, Event, EventEntry, FileId, FileRecord, FileVersion, HoldingRecord,
@@ -1253,84 +1253,6 @@ fn db_crash_recovery_backup_preserves_data() {
     let files = bak_db.list_all_files().unwrap();
     assert_eq!(files.len(), 1, ".bak must contain the pre-corruption data");
     assert_eq!(files[0].file_id, FileId(999));
-}
-
-// ============================================================
-// System state blobs
-// ============================================================
-
-#[test]
-fn store_and_retrieve_system_state_blob() {
-    let db = test_db();
-    let owner = IdentityPub([1u8; 32]);
-    let record = SystemStateBlobRecord {
-        owner,
-        encrypted_blob: vec![1, 2, 3, 4, 5],
-        created_at: Timestamp::now(),
-        stored_at: Timestamp::now(),
-    };
-    db.store_system_state_blob(&owner, &record).unwrap();
-    let retrieved = db.get_system_state_blob(&owner).unwrap().unwrap();
-    assert_eq!(retrieved.encrypted_blob, vec![1, 2, 3, 4, 5]);
-}
-
-#[test]
-fn store_overwrites_previous_blob() {
-    let db = test_db();
-    let owner = IdentityPub([2u8; 32]);
-    let r1 = SystemStateBlobRecord {
-        owner,
-        encrypted_blob: vec![1],
-        created_at: Timestamp::now(),
-        stored_at: Timestamp::now(),
-    };
-    let r2 = SystemStateBlobRecord {
-        owner,
-        encrypted_blob: vec![2, 3],
-        created_at: Timestamp::now(),
-        stored_at: Timestamp::now(),
-    };
-    db.store_system_state_blob(&owner, &r1).unwrap();
-    db.store_system_state_blob(&owner, &r2).unwrap();
-    let retrieved = db.get_system_state_blob(&owner).unwrap().unwrap();
-    assert_eq!(retrieved.encrypted_blob, vec![2, 3]);
-}
-
-#[test]
-fn get_system_state_blob_not_found() {
-    let db = test_db();
-    let owner = IdentityPub([3u8; 32]);
-    assert!(db.get_system_state_blob(&owner).unwrap().is_none());
-}
-
-#[test]
-fn delete_system_state_blob_removes_it() {
-    let db = test_db();
-    let owner = IdentityPub([4u8; 32]);
-    let record = SystemStateBlobRecord {
-        owner,
-        encrypted_blob: vec![9, 8, 7],
-        created_at: Timestamp::now(),
-        stored_at: Timestamp::now(),
-    };
-    db.store_system_state_blob(&owner, &record).unwrap();
-    db.delete_system_state_blob(&owner).unwrap();
-    assert!(db.get_system_state_blob(&owner).unwrap().is_none());
-}
-
-#[test]
-fn expired_blob_returns_none() {
-    let db = test_db();
-    let owner = IdentityPub([5u8; 32]);
-    let two_years_ago = Timestamp(Timestamp::now().0 - 2 * 365 * 24 * 3600);
-    let record = SystemStateBlobRecord {
-        owner,
-        encrypted_blob: vec![1, 2, 3],
-        created_at: two_years_ago,
-        stored_at: two_years_ago,
-    };
-    db.store_system_state_blob(&owner, &record).unwrap();
-    assert!(db.get_system_state_blob(&owner).unwrap().is_none());
 }
 
 #[test]

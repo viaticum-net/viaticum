@@ -684,7 +684,6 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
     use viaticum_core::types::DeviceId;
 
     use crate::daemon::cluster_sync::ClusterSyncManager;
-    // relay_post_tx kept inert (T-13b-3 will remove relay entirely).
 
     let cluster_state = match &state.cluster_state {
         Some(cs) => cs,
@@ -757,8 +756,6 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
     // Target-master set = { get_master_for_device(p.holder_id) ∀ our placements }
     //                   ∪ { h.owner_id ∀ our holdings }
     // deduplicated, excluding our own master (cluster siblings learn via cluster_sync epoch path).
-    //
-    // relay_post_tx is intentionally kept inert here (scope fence: T-13b-3 removes relay entirely).
     if let (Some(cert), Some(mailbox_router)) = (device_cert, state.mailbox_router.as_ref()) {
         let broadcast = ClusterSyncManager::build_revocation_broadcast(&revocation, &cert);
         match to_cbor(&broadcast) {

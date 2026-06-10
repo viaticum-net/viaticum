@@ -12,7 +12,6 @@ pub mod metrics;
 pub mod network;
 pub mod peer_backoff;
 pub mod processor;
-pub mod relay;
 pub mod repair;
 pub mod restart;
 pub mod restore;

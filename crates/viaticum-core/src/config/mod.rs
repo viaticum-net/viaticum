@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::constants::{
     DEFAULT_CLUSTER_SYNC_BATCH_SIZE, DEFAULT_COMPLETION_BONUS_COEFFICIENT,
     DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_K_FACTOR, DEFAULT_MAX_VERSION_AGE_SECS,
-    DEFAULT_MAX_VERSIONS, DEFAULT_SOURCE_BLOCK_SIZE, MAX_BOARD_ENTRIES, MAX_BOARD_SIZE_BYTES,
-    MAX_COMPLETION_BONUS_COEFFICIENT, RELAY_TTL_SECS,
+    DEFAULT_MAX_VERSIONS, DEFAULT_SOURCE_BLOCK_SIZE, MAX_COMPLETION_BONUS_COEFFICIENT,
 };
 
 #[cfg(test)]
@@ -112,22 +111,10 @@ impl Default for EscrowCfg {
     }
 }
 
-/// [network] — epidemic relay board limits.
+/// [network] — libp2p transport / NAT-traversal settings.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct NetworkCfg {
-    /// Maximum number of entries on the local relay board.
-    /// Default: 2000 (from protocol.md §1.5).
-    pub relay_max_entries: usize,
-
-    /// Maximum total relay board size in megabytes.
-    /// Default: 8.
-    pub relay_max_size_mb: usize,
-
-    /// Relay entry time-to-live in days.
-    /// Default: 7.
-    pub relay_ttl_days: u64,
-
     /// Enable libp2p circuit relay for NAT traversal. When true, the swarm
     /// uses relay servers to connect nodes behind NAT.
     /// When false, only direct connections (LAN or port-forwarded setups).
@@ -441,9 +428,6 @@ impl WatchConfig {
 impl Default for NetworkCfg {
     fn default() -> Self {
         Self {
-            relay_max_entries: MAX_BOARD_ENTRIES,
-            relay_max_size_mb: MAX_BOARD_SIZE_BYTES / 1_048_576,
-            relay_ttl_days: RELAY_TTL_SECS / 86400,
             enable_relay: true,
             enable_relay_server: false,
             relay_url: None,
@@ -708,24 +692,6 @@ impl AppConfig {
             return Err(ConfigError::Validation {
                 field: "escrow.k_factor".to_string(),
                 reason: "must be > 0.0".to_string(),
-            });
-        }
-        if n.relay_max_entries < 1 {
-            return Err(ConfigError::Validation {
-                field: "network.relay_max_entries".to_string(),
-                reason: "must be >= 1".to_string(),
-            });
-        }
-        if n.relay_max_size_mb < 1 {
-            return Err(ConfigError::Validation {
-                field: "network.relay_max_size_mb".to_string(),
-                reason: "must be >= 1".to_string(),
-            });
-        }
-        if n.relay_ttl_days < 1 {
-            return Err(ConfigError::Validation {
-                field: "network.relay_ttl_days".to_string(),
-                reason: "must be >= 1".to_string(),
             });
         }
         if c.sync_batch_size < 1 {

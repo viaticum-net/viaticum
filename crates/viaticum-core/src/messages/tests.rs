@@ -2,12 +2,11 @@ use crate::cluster::{
     EpochCounter, derive_device_key, derive_master_key, issue_device_certificate, issue_revocation,
     master_identity,
 };
-use crate::constants::{HANDSHAKE_FRESHNESS_SECS, MAX_RELAY_HOP, RELAY_TTL_SECS};
+use crate::constants::HANDSHAKE_FRESHNESS_SECS;
 use crate::erasure::Symbol;
 use crate::types::{DeviceId, Event, EventEntry, IdentityPub, SourceBlockId, Timestamp};
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
-use x25519_dalek::{PublicKey, StaticSecret};
 
 use super::*;
 
@@ -43,21 +42,6 @@ fn minimal_peer_announce() -> Message {
         sig: [0u8; 64],
         x25519_pub: None,
     })
-}
-
-fn minimal_board_entry(signing_key: &SigningKey) -> (BoardEntry, [u8; 16]) {
-    let author = IdentityPub(signing_key.verifying_key().to_bytes());
-    let msg_id = [0u8; 16];
-    let payload = b"test payload".to_vec();
-    let entry = build_broadcast_entry(
-        "peer_announce",
-        msg_id,
-        payload,
-        author,
-        Timestamp(1000),
-        signing_key,
-    );
-    (entry, msg_id)
 }
 
 // ─── tests ──────────────────────────────────────────────────────────────────
@@ -148,126 +132,6 @@ fn verify_handshake_fails_stale_timestamp() {
     let msg = build_handshake(identity_pub, old_ts, &signing_key, None);
     let result = verify_handshake(&msg, now);
     assert!(matches!(result, Err(MessageError::HandshakeStale { .. })));
-}
-
-#[test]
-fn encrypt_decrypt_directed_roundtrip() {
-    let their_priv = StaticSecret::random_from_rng(OsRng);
-    let their_pub = PublicKey::from(&their_priv);
-    let plaintext = b"hello world directed message";
-    let envelope = encrypt_directed(plaintext, &their_pub).unwrap();
-    let recovered = decrypt_directed(&envelope, &their_priv).unwrap();
-    assert_eq!(recovered, plaintext);
-}
-
-#[test]
-fn decrypt_directed_fails_with_wrong_key() {
-    let wrong_priv = StaticSecret::random_from_rng(OsRng);
-    let their_pub = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
-    let envelope = encrypt_directed(b"secret", &their_pub).unwrap();
-    let result = decrypt_directed(&envelope, &wrong_priv);
-    assert!(result.is_err());
-}
-
-#[test]
-fn build_broadcast_entry_verify_sig_passes() {
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let author = IdentityPub(signing_key.verifying_key().to_bytes());
-    let msg_id = [0u8; 16];
-    let payload = b"test broadcast payload".to_vec();
-    let entry = build_broadcast_entry(
-        "peer_announce",
-        msg_id,
-        payload,
-        author,
-        Timestamp(1000),
-        &signing_key,
-    );
-    assert_eq!(entry.hop, 0);
-    assert_eq!(entry.kind, BoardEntryKind::Broadcast);
-    let result = verify_board_entry_sig(&entry, "peer_announce", &msg_id);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn build_directed_entry_verify_sig_passes() {
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let author = IdentityPub(signing_key.verifying_key().to_bytes());
-    let target = IdentityPub([2u8; 32]);
-    let msg_id = [1u8; 16];
-    let encrypted_payload = vec![0u8; 32];
-    let entry = build_directed_entry(
-        "pos_challenge",
-        msg_id,
-        target,
-        encrypted_payload,
-        author,
-        Timestamp(1000),
-        &signing_key,
-    );
-    assert_eq!(entry.target_pub, Some(target));
-    let result = verify_board_entry_sig(&entry, "pos_challenge", &msg_id);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn verify_board_entry_sig_fails_corrupted_payload() {
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let (mut entry, msg_id) = minimal_board_entry(&signing_key);
-    entry.payload[0] ^= 0xFF;
-    let result = verify_board_entry_sig(&entry, "peer_announce", &msg_id);
-    assert!(matches!(result, Err(MessageError::BadSignature)));
-}
-
-#[test]
-fn is_board_entry_expired_false_before_ttl() {
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let (mut entry, _) = minimal_board_entry(&signing_key);
-    entry.created_at = Timestamp(1_000_000);
-    let now = Timestamp(1_000_000 + RELAY_TTL_SECS - 1);
-    assert!(!is_board_entry_expired(&entry, now));
-}
-
-#[test]
-fn is_board_entry_expired_true_at_ttl() {
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let (mut entry, _) = minimal_board_entry(&signing_key);
-    entry.created_at = Timestamp(1_000_000);
-    let now = Timestamp(1_000_000 + RELAY_TTL_SECS);
-    assert!(is_board_entry_expired(&entry, now));
-}
-
-#[test]
-fn check_relay_hop_allows_hop_zero_and_one() {
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let (mut entry, _) = minimal_board_entry(&signing_key);
-    entry.hop = 0;
-    assert!(check_relay_hop(&entry).is_ok());
-    entry.hop = 1;
-    assert!(check_relay_hop(&entry).is_ok());
-}
-
-#[test]
-fn check_relay_hop_rejects_hop_two() {
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let (mut entry, _) = minimal_board_entry(&signing_key);
-    entry.hop = MAX_RELAY_HOP;
-    let result = check_relay_hop(&entry);
-    assert!(matches!(
-        result,
-        Err(MessageError::HopLimitExceeded { hop: 2 })
-    ));
-}
-
-#[test]
-fn relay_copy_increments_hop() {
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let (mut entry, _) = minimal_board_entry(&signing_key);
-    entry.hop = 0;
-    let copy = relay_copy(&entry);
-    assert_eq!(copy.hop, 1);
-    assert_eq!(copy.sig_author, entry.sig_author);
-    assert_eq!(copy.author, entry.author);
 }
 
 #[test]
@@ -565,79 +429,11 @@ fn cluster_sync_response_msg_round_trip() {
     assert_eq!(decoded.events[0].0, 1u64);
 }
 
-// ─── SystemState + PeerDiscovery roundtrips ──────────────────────────────────
+// ─── PROP-01: CBOR roundtrip sweep — all live Message variants ──────────────
 
-#[test]
-fn system_state_backup_msg_roundtrip() {
-    let msg = Message::SystemStateBackup(SystemStateBackupMsg {
-        v: 1,
-        encrypted_blob: vec![0xDE, 0xAD, 0xBE, 0xEF],
-        timestamp: Timestamp(1_000_000),
-    });
-    let framed = frame_message(&msg).unwrap();
-    let (decoded, consumed) = unframe_message(&framed).unwrap();
-    assert_eq!(decoded, msg);
-    assert_eq!(consumed, framed.len());
-}
-
-#[test]
-fn system_state_ack_msg_roundtrip() {
-    let msg = Message::SystemStateAck(SystemStateAckMsg {
-        v: 1,
-        stored: true,
-        timestamp: Timestamp(1_000_001),
-    });
-    let framed = frame_message(&msg).unwrap();
-    let (decoded, consumed) = unframe_message(&framed).unwrap();
-    assert_eq!(decoded, msg);
-    assert_eq!(consumed, framed.len());
-}
-
-#[test]
-fn system_state_request_msg_roundtrip() {
-    let msg = Message::SystemStateRequest(SystemStateRequestMsg {
-        v: 1,
-        timestamp: Timestamp(1_000_002),
-    });
-    let framed = frame_message(&msg).unwrap();
-    let (decoded, consumed) = unframe_message(&framed).unwrap();
-    assert_eq!(decoded, msg);
-    assert_eq!(consumed, framed.len());
-}
-
-#[test]
-fn system_state_response_msg_roundtrip() {
-    let msg = Message::SystemStateResponse(SystemStateResponseMsg {
-        v: 1,
-        encrypted_blob: vec![],
-        timestamp: Timestamp(1_000_003),
-    });
-    let framed = frame_message(&msg).unwrap();
-    let (decoded, consumed) = unframe_message(&framed).unwrap();
-    assert_eq!(decoded, msg);
-    assert_eq!(consumed, framed.len());
-}
-
-// ─── PROP-01: CBOR roundtrip sweep — all 26 Message variants ────────────────
-
-fn all_31_message_variants() -> Vec<Message> {
+fn all_message_variants() -> Vec<Message> {
     let sbid = make_source_block_id(1);
     let ts = Timestamp(1000);
-
-    let board_entry = BoardEntry {
-        kind: BoardEntryKind::Broadcast,
-        target_pub: None,
-        payload: vec![0xAA, 0xBB],
-        sig_author: [0u8; 64],
-        author: make_identity_pub(7),
-        hop: 0,
-        created_at: ts,
-    };
-    let stored_entry = StoredEntry {
-        msg_type: "peer_announce".to_string(),
-        msg_id: [0u8; 16],
-        entry: board_entry,
-    };
 
     vec![
         Message::Handshake(HandshakeMsg {
@@ -773,11 +569,6 @@ fn all_31_message_variants() -> Vec<Message> {
             restore_budget_gb: 11.0,
             timestamp: ts,
         }),
-        Message::BoardSync(BoardSyncMsg {
-            v: 1,
-            entries: vec![stored_entry],
-            timestamp: ts,
-        }),
         Message::ClusterSyncRequest(ClusterSyncRequestMsg {
             v: 1,
             from_device_id: DeviceId([0x03u8; 32]),
@@ -797,25 +588,6 @@ fn all_31_message_variants() -> Vec<Message> {
                 },
             )],
             responder_last_seq: 1,
-            timestamp: ts,
-        }),
-        Message::SystemStateBackup(SystemStateBackupMsg {
-            v: 1,
-            encrypted_blob: vec![0xDE, 0xAD, 0xBE, 0xEF],
-            timestamp: ts,
-        }),
-        Message::SystemStateAck(SystemStateAckMsg {
-            v: 1,
-            stored: true,
-            timestamp: ts,
-        }),
-        Message::SystemStateRequest(SystemStateRequestMsg {
-            v: 1,
-            timestamp: ts,
-        }),
-        Message::SystemStateResponse(SystemStateResponseMsg {
-            v: 1,
-            encrypted_blob: vec![],
             timestamp: ts,
         }),
         Message::Ack(AckMsg { v: 1 }),
@@ -857,8 +629,8 @@ fn all_31_message_variants() -> Vec<Message> {
 
 #[test]
 fn all_message_variants_cbor_roundtrip_sweep() {
-    let variants = all_31_message_variants();
-    assert_eq!(variants.len(), 31, "expected 31 Message variants");
+    let variants = all_message_variants();
+    assert_eq!(variants.len(), 26, "expected 26 Message variants");
     for msg in &variants {
         let bytes = to_cbor(msg).expect("to_cbor must not fail");
         let decoded: Message = from_cbor(&bytes).expect("from_cbor must not fail");
@@ -868,8 +640,8 @@ fn all_message_variants_cbor_roundtrip_sweep() {
 
 #[test]
 fn all_message_variants_frame_unframe_roundtrip_sweep() {
-    let variants = all_31_message_variants();
-    assert_eq!(variants.len(), 31, "expected 31 Message variants");
+    let variants = all_message_variants();
+    assert_eq!(variants.len(), 26, "expected 26 Message variants");
     for msg in &variants {
         let framed = frame_message(msg).expect("frame_message must not fail");
         let (decoded, consumed) = unframe_message(&framed).expect("unframe_message must not fail");
@@ -1059,8 +831,8 @@ fn unknown_message_variant_from_cbor_does_not_close_stream() {
 
 #[test]
 fn all_messages_have_version_one() {
-    let variants = all_31_message_variants();
-    assert_eq!(variants.len(), 31, "expected 31 Message variants");
+    let variants = all_message_variants();
+    assert_eq!(variants.len(), 26, "expected 26 Message variants");
 
     for msg in &variants {
         let v = match msg {
@@ -1082,24 +854,19 @@ fn all_messages_have_version_one() {
             Message::RestoreRequest(m) => m.v,
             Message::RestoreResponse(m) => m.v,
             Message::RestoreDenied(m) => m.v,
-            Message::BoardSync(m) => m.v,
             Message::ClusterSyncRequest(m) => m.v,
             Message::ClusterSyncResponse(m) => m.v,
-            Message::SystemStateBackup(m) => m.v,
-            Message::SystemStateAck(m) => m.v,
-            Message::SystemStateRequest(m) => m.v,
-            Message::SystemStateResponse(m) => m.v,
             Message::Ack(m) => m.v,
             Message::MailboxFetchRequest(m) => m.v,
             Message::MailboxFetchResponse(m) => m.v,
             Message::MailboxStoreRequest(m) => m.v,
             Message::MailboxStoreResponse(_) => {
                 // MailboxStoreResponse is an enum (not a struct), does not have a top-level v field.
-                // All instances produced by all_31_message_variants use v=1 semantics.
+                // All instances produced by all_message_variants use v=1 semantics.
                 1
             }
-            // Unknown is a decode-only sentinel; it is never in all_31_message_variants().
-            Message::Unknown => unreachable!("Unknown must not appear in all_31_message_variants"),
+            // Unknown is a decode-only sentinel; it is never in all_message_variants().
+            Message::Unknown => unreachable!("Unknown must not appear in all_message_variants"),
         };
         assert_eq!(
             v,

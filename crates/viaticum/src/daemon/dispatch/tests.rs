@@ -40,7 +40,6 @@ async fn make_test_state() -> Arc<DaemonState> {
         disk_reserve_bytes: 0,
         hard_quota_bytes: 0,
         time_scale: 1,
-        relay_post_tx: None,
         swarm_handle: None,
         watch_admin: None,
         config_admin: None,
@@ -244,20 +243,18 @@ async fn dispatch_device_revoke_no_cluster_returns_error() {
     assert!(matches!(response, CliResponse::Error(_)));
 }
 
-/// T-13b-2: relay board is inert after migration — revocation via mailbox only.
+/// Revocation via mailbox only (relay board retired in T-13b-3).
 ///
-/// With no storage-relationship peers (no placements, no holdings), revocation succeeds
-/// but publishes to 0 mailbox targets. relay_post_tx receives nothing (inert).
+/// With no storage-relationship peers (no placements, no holdings) and no router,
+/// revocation still succeeds but publishes to 0 mailbox targets (best-effort).
 #[tokio::test]
-async fn dispatch_device_revoke_relay_is_inert_and_returns_device_revoked() {
+async fn dispatch_device_revoke_returns_device_revoked_with_no_router() {
     use std::sync::{Arc, Mutex};
 
     use viaticum_core::cluster::{
         ClusterState, derive_device_key, issue_device_certificate, master_identity,
     };
     use viaticum_core::types::{DeviceId, Timestamp};
-
-    use crate::daemon::relay::RelayPost;
 
     // Build two devices: A (this device), B (to be revoked).
     let seed_a = [10u8; 32];
@@ -279,9 +276,6 @@ async fn dispatch_device_revoke_relay_is_inert_and_returns_device_revoked() {
     cs.add_device(cert_b.clone(), now).unwrap();
     let cluster_state = Arc::new(Mutex::new(cs));
 
-    // Wire up relay_post_tx (inert: T-13b-2 does NOT send to relay board anymore).
-    let (relay_post_tx, mut relay_post_rx) = tokio::sync::mpsc::channel::<RelayPost>(4);
-
     let (restore_tx, _restore_rx) = mpsc::channel::<(
         crate::daemon::restore::RestoreRequest,
         tokio::sync::oneshot::Sender<
@@ -302,7 +296,6 @@ async fn dispatch_device_revoke_relay_is_inert_and_returns_device_revoked() {
         disk_reserve_bytes: 0,
         hard_quota_bytes: 0,
         time_scale: 1,
-        relay_post_tx: Some(relay_post_tx),
         swarm_handle: None,
         watch_admin: None,
         config_admin: None,
@@ -325,12 +318,6 @@ async fn dispatch_device_revoke_relay_is_inert_and_returns_device_revoked() {
     assert!(
         matches!(response, CliResponse::DeviceRevoked { .. }),
         "expected DeviceRevoked, got {response:?}"
-    );
-
-    // T-13b-2: relay post must NOT have been sent (relay is inert).
-    assert!(
-        relay_post_rx.try_recv().is_err(),
-        "T-13b-2: relay board must be inert — no RevocationBroadcast should be posted via relay"
     );
 }
 
@@ -936,8 +923,6 @@ async fn revocation_published_only_to_storage_relationship_peers() {
         db.set_master_for_device(&u1_device, &u1_master).unwrap();
     }
 
-    let (relay_post_tx, mut relay_post_rx) =
-        tokio::sync::mpsc::channel::<crate::daemon::relay::RelayPost>(4);
     let (restore_tx, _restore_rx) = mpsc::channel::<(
         crate::daemon::restore::RestoreRequest,
         tokio::sync::oneshot::Sender<
@@ -960,7 +945,6 @@ async fn revocation_published_only_to_storage_relationship_peers() {
         disk_reserve_bytes: 0,
         hard_quota_bytes: 0,
         time_scale: 1,
-        relay_post_tx: Some(relay_post_tx),
         swarm_handle: None,
         watch_admin: None,
         config_admin: None,
@@ -986,12 +970,6 @@ async fn revocation_published_only_to_storage_relationship_peers() {
     assert!(
         matches!(response, CliResponse::DeviceRevoked { .. }),
         "must be DeviceRevoked"
-    );
-
-    // No relay post (relay is inert).
-    assert!(
-        relay_post_rx.try_recv().is_err(),
-        "relay must be inert after T-13b-2"
     );
 
     // Drain all mailbox store requests.
@@ -1102,7 +1080,6 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
     };
     db.upsert_holding(&holding).unwrap();
 
-    let (_relay_tx, _relay_rx) = tokio::sync::mpsc::channel::<crate::daemon::relay::RelayPost>(4);
     let (restore_tx, _restore_rx) = mpsc::channel::<(
         crate::daemon::restore::RestoreRequest,
         tokio::sync::oneshot::Sender<
@@ -1125,7 +1102,6 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
         disk_reserve_bytes: 0,
         hard_quota_bytes: 0,
         time_scale: 1,
-        relay_post_tx: None,
         swarm_handle: None,
         watch_admin: None,
         config_admin: None,
@@ -1273,7 +1249,6 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
         disk_reserve_bytes: 0,
         hard_quota_bytes: 0,
         time_scale: 1,
-        relay_post_tx: None,
         swarm_handle: None,
         watch_admin: None,
         config_admin: None,

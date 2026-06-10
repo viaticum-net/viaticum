@@ -5,29 +5,26 @@
 //   2. backup_restore_pack_multiple_files        — multi-file pack, byte-for-byte verify
 //   3. network_symbol_transfer_between_nodes     — removed in ε.5 (iroh removed)
 //   4. placement_produces_valid_allocation_for_pipeline — placement + erasure integration
-//   5. relay_three_hop_message_delivery          — A→B(hop1)→C(hop2) directed message
+//   5. (removed) relay_three_hop_message_delivery — relay board retired in A2 / T-13b-3
 //   6. full_pipeline_backup_encode_decode_decrypt — pure data path, no file I/O
 //
-// GATE CRITERIA: tests 1, 2, 4, 5, 6 pass → Phase 2 is complete.
+// GATE CRITERIA: tests 1, 2, 4, 6 pass → Phase 2 is complete.
 // Test 3 (QUIC symbol transfer) was iroh-era; libp2p equivalent in swarm_tests.rs.
+// Test 5 (relay board) removed: the relay board was retired by the A2 mailbox bus.
 
 use std::sync::Arc;
 
-use ed25519_dalek::SigningKey;
-use rand_core::OsRng;
 use tempfile::TempDir;
 use viaticum::daemon::backup::pipeline::{compress_and_encrypt, decrypt_and_decompress};
 use viaticum::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
-use viaticum::daemon::relay::{RelayConfig, RelayManager};
 use viaticum::daemon::restore::staging::JobId;
 use viaticum::daemon::restore::{
     RestoreConfig, RestoreCoordinator, RestoreRequest, VersionSelector,
 };
-use viaticum_core::constants::MAX_BOARD_ENTRIES;
 use viaticum_core::db::Db;
 use viaticum_core::erasure::{ErasureEncoder, RaptorQEncoder, Symbol};
 use viaticum_core::placement::{HolderCandidate, compute_allocation};
-use viaticum_core::types::{DeviceId, ErasureParams, IdentityPub, SourceBlockId, Timestamp};
+use viaticum_core::types::{DeviceId, ErasureParams, IdentityPub, SourceBlockId};
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -439,115 +436,6 @@ fn placement_produces_valid_allocation_for_pipeline() {
         recovered, plaintext,
         "recovered plaintext must match original"
     );
-}
-
-// ─── Test 5: relay_three_hop_message_delivery ────────────────────────────────
-//
-// A posts directed message to C → B relays (hop 0→1) → C syncs from B (hop 1→2).
-// C decrypts and reads the payload. Validates full epidemic relay chain.
-
-#[test]
-fn relay_three_hop_message_delivery() {
-    let dir_a = TempDir::new().unwrap();
-    let dir_b = TempDir::new().unwrap();
-    let dir_c = TempDir::new().unwrap();
-
-    // Use timestamps far in the future to avoid TTL expiry during the test.
-    let future = Timestamp(Timestamp::now().0 + 10_000_000);
-
-    // ── C: generate identity and X25519 keypair ──────────────────────────
-    let c_signing_key = SigningKey::generate(&mut OsRng);
-    let c_identity = IdentityPub(c_signing_key.verifying_key().to_bytes());
-    let c_x25519_priv = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-    let c_x25519_pub = x25519_dalek::PublicKey::from(&c_x25519_priv);
-
-    // ── A: post a directed message to C ─────────────────────────────────
-    let config_a = RelayConfig::defaults_for_test(dir_a.path().join("board_a.bin"));
-    let a_identity = config_a.identity_pub;
-    let a_signing_key = SigningKey::from_bytes(&config_a.signing_key.to_bytes());
-    let mut manager_a = RelayManager::new(config_a).unwrap();
-
-    let msg_id = [0xABu8; 16];
-    let payload = b"phase2 gate: relay message payload";
-    manager_a
-        .post_directed_with_key(
-            "pos_challenge",
-            msg_id,
-            c_identity,
-            &c_x25519_pub,
-            payload,
-            future,
-        )
-        .unwrap();
-
-    assert_eq!(manager_a.entries.len(), 1);
-    assert_eq!(manager_a.entries[0].entry.hop, 0);
-
-    // ── B: sync from A (hop 0 → 1) ───────────────────────────────────────
-    let config_b = RelayConfig::defaults_for_test(dir_b.path().join("board_b.bin"));
-    let mut manager_b = RelayManager::new(config_b).unwrap();
-
-    let a_entries = manager_a.entries_for_sync(future);
-    assert_eq!(a_entries.len(), 1);
-
-    let accepted = manager_b
-        .process_remote_entries(&a_entries, future)
-        .unwrap();
-    assert_eq!(accepted, 1, "B must accept A's entry");
-    assert_eq!(manager_b.entries[0].entry.hop, 1);
-
-    // ── C: sync from B (hop 1 → 2) and decrypt ───────────────────────────
-    let config_c = RelayConfig {
-        board_path: dir_c.path().join("board_c.bin"),
-        identity_pub: c_identity,
-        x25519_priv: c_x25519_priv,
-        signing_key: c_signing_key,
-        max_entries: MAX_BOARD_ENTRIES,
-        max_size_bytes: viaticum_core::constants::MAX_BOARD_SIZE_BYTES,
-        prune_interval_secs: 3600,
-        ttl_secs: viaticum_core::constants::RELAY_TTL_SECS,
-    };
-    let mut manager_c = RelayManager::new(config_c).unwrap();
-
-    let b_entries = manager_b.entries_for_sync(future);
-    assert_eq!(b_entries.len(), 1);
-    assert_eq!(b_entries[0].entry.hop, 1);
-
-    let accepted = manager_c
-        .process_remote_entries(&b_entries, future)
-        .unwrap();
-    assert_eq!(accepted, 1, "C must accept B's relayed entry");
-    assert_eq!(manager_c.entries[0].entry.hop, 2);
-
-    // C scans board and decrypts the directed message
-    let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel(16);
-    let delivered = manager_c.scan_for_self(&inbound_tx, future);
-    assert_eq!(
-        delivered, 1,
-        "C should receive exactly one directed message"
-    );
-
-    let msg = inbound_rx.try_recv().unwrap();
-    assert_eq!(msg.payload, payload, "decrypted payload must match");
-    assert_eq!(msg.from, a_identity, "author must be A");
-    assert_eq!(msg.msg_id, msg_id);
-
-    // Verify hop=2 entry is not relayed further (gate: hop limit enforced)
-    let dir_d = TempDir::new().unwrap();
-    let config_d = RelayConfig::defaults_for_test(dir_d.path().join("board_d.bin"));
-    let mut manager_d = RelayManager::new(config_d).unwrap();
-
-    let c_entries = manager_c.entries_for_sync(future);
-    assert_eq!(c_entries[0].entry.hop, 2);
-
-    let accepted_d = manager_d
-        .process_remote_entries(&c_entries, future)
-        .unwrap();
-    assert_eq!(accepted_d, 0, "hop=2 must not propagate further");
-    assert_eq!(manager_d.stats().0, 0);
-
-    // Suppress unused-variable warnings from the captures above
-    let _ = a_signing_key;
 }
 
 // ─── Test 6: full_pipeline_backup_encode_decode_decrypt ──────────────────────
