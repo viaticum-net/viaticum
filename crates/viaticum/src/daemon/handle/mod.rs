@@ -1157,7 +1157,9 @@ impl DaemonHandle {
                 master_key.clone(),
             ));
 
-            let drop_handler = ProcessorDropHandler::new(db.clone());
+            // T-13a: pass repair_tx so ProcessorDropHandler can trigger RepairNow
+            // for immediate-drop DropNotice entries (deadline ≈ now).
+            let drop_handler = ProcessorDropHandler::new(db.clone(), repair_tx.clone());
 
             let poll_db = db.clone();
             let poll_router = std::sync::Arc::clone(&mailbox_router);
@@ -1319,10 +1321,14 @@ impl DaemonHandle {
         }
 
         // ── Holdings integrity scan task ───────────────────────────────────
+        // T-13a: pass mailbox_router so the task can publish immediate-drop DropNotice
+        // via mailbox (replaces SymbolDropped-via-relay). relay_post_tx kept for
+        // signature compat; T-13b removes relay entirely.
         {
             let integrity_db = db.clone();
             let integrity_holdings = holdings_dir.clone();
             let integrity_relay = relay_post_tx.clone();
+            let integrity_router = std::sync::Arc::clone(&mailbox_router);
             let integrity_cancel = cancel.clone();
             let integrity_master_key = master_key.clone();
             let integrity_interval =
@@ -1332,6 +1338,7 @@ impl DaemonHandle {
                     integrity_db,
                     integrity_holdings,
                     integrity_relay,
+                    integrity_router,
                     identity_pub,
                     integrity_interval,
                     time_scale,

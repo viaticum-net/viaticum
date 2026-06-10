@@ -1,9 +1,11 @@
 // HolderCleanupTask: periodic cleanup of expired holdings + disk pressure evaluation.
 //
 // Responsibilities:
-//   - Scan for holdings where MarkedForDelete cooldown has expired → delete files + DB record → post SymbolDropped.
-//   - Evaluate disk pressure periodically → evict lowest-priority holdings → post SymbolDropped.
-//   - T-7: send DropNotice (advance notice) via mailbox instead of relay, batched per owner.
+//   - Scan for holdings where MarkedForDelete cooldown has expired → delete files + DB record → publish DropNotice via mailbox.
+//   - Evaluate disk pressure periodically → evict lowest-priority holdings → publish DropNotice via mailbox.
+//   - T-7: advance DropNotice (before physical delete) via mailbox, batched per owner.
+//   - T-13a: immediate-drop DropNotice (deadline=now) via mailbox (replaces SymbolDropped-via-relay).
+//            relay_post_tx kept in run() signature — T-13b removes relay entirely.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,13 +33,13 @@ mod tests;
 /// Two periodic actions:
 /// 1. **Cleanup tick** (every `cleanup_interval_secs`): scan for holdings where
 ///    MarkedForDelete cooldown has expired. Delete symbol files, remove DB record,
-///    post SymbolDropped to the board (directed to the owner).
+///    publish DropNotice (deadline=now) via mailbox to notify the owner.
 /// 2. **Pressure tick** (every `pressure_interval_secs`): evaluate disk pressure.
-///    On hard pressure, evict lowest-priority holdings and post SymbolDropped.
+///    On hard pressure, evict lowest-priority holdings and publish immediate DropNotice.
 ///
-/// T-7: advance DropNotice (before physical delete) is routed through the mailbox bus,
-/// batched per owner (one `SymbolDropNoticeBatchMsg` entry per owner per chunk ≤ MAX_ENTRY_BYTES).
-/// The `SymbolDropped` (immediate eviction) path remains on relay (scope fence: T-13 retires relay).
+/// T-7: advance DropNotice (before physical delete) via mailbox, batched per owner.
+/// T-13a: immediate-drop DropNotice (deadline=now) via mailbox (replaces SymbolDropped-via-relay).
+/// `relay_post_tx` is kept in the signature; T-13b removes relay entirely.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     db: Db,
@@ -54,6 +56,9 @@ pub async fn run(
     master_signing_key: ed25519_dalek::SigningKey,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    // relay_post_tx is kept for signature compat; T-13b removes relay entirely.
+    let _relay_post_tx = relay_post_tx;
+
     let mut cleanup_timer =
         tokio::time::interval(std::time::Duration::from_secs(cleanup_interval_secs.max(1)));
     let mut pressure_timer = tokio::time::interval(std::time::Duration::from_secs(
@@ -79,13 +84,13 @@ pub async fn run(
                 break;
             }
             _ = cleanup_timer.tick() => {
-                if let Err(e) = cleanup_expired(&db, &holdings_dir, &relay_post_tx, time_scale, &master_signing_key).await {
+                if let Err(e) = cleanup_expired(&db, &holdings_dir, &mailbox_router, holder_master_pub, time_scale).await {
                     error!("holder_cleanup: cleanup_expired error: {e}");
                 }
             }
             _ = pressure_timer.tick() => {
                 if let Err(e) = check_pressure(
-                    &db, &holdings_dir, &relay_post_tx, &mailbox_router, holder_master_pub,
+                    &db, &holdings_dir, &mailbox_router, holder_master_pub,
                     soft_quota_bytes, hard_quota_bytes,
                     &data_dir, disk_reserve_bytes,
                     &master_signing_key,
@@ -94,7 +99,7 @@ pub async fn run(
                 }
             }
             _ = drop_notice_timer.tick() => {
-                if let Err(e) = cleanup_drop_notices(&db, &holdings_dir, &relay_post_tx, &master_signing_key).await {
+                if let Err(e) = cleanup_drop_notices(&db, &holdings_dir, &mailbox_router, holder_master_pub, &master_signing_key).await {
                     error!("holder_cleanup: cleanup_drop_notices error: {e}");
                 }
             }
@@ -105,12 +110,13 @@ pub async fn run(
 }
 
 /// Delete holdings whose MarkedForDelete cooldown has expired.
+/// T-13a: publishes immediate-drop DropNotice via mailbox (deadline=now).
 async fn cleanup_expired(
     db: &Db,
     holdings_dir: &Path,
-    relay_post_tx: &mpsc::Sender<RelayPost>,
+    mailbox_router: &Arc<MailboxRouter>,
+    holder_master_pub: IdentityPub,
     time_scale: u64,
-    master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
     let now = Timestamp::now();
     let expired = db.list_holdings_cooldown_expired(now, time_scale)?;
@@ -149,13 +155,13 @@ async fn cleanup_expired(
             continue;
         }
 
-        // Post SymbolDropped to the owner via board.
-        post_symbol_dropped(
-            relay_post_tx,
+        // T-13a: publish immediate-drop DropNotice via mailbox (deadline=now).
+        post_symbol_dropped_via_mailbox(
+            mailbox_router,
+            holder_master_pub,
             holding.owner_id,
             holding.source_block_id,
             &holding.esi_ranges,
-            master_signing_key,
         )
         .await;
 
@@ -177,7 +183,7 @@ async fn cleanup_expired(
         info!(
             block_id = %holding.source_block_id,
             owner = %holding.owner_id,
-            "holder_cleanup: expired holding cleaned up, SymbolDropped sent"
+            "holder_cleanup: expired holding cleaned up, immediate-drop DropNotice sent via mailbox"
         );
     }
 
@@ -186,12 +192,17 @@ async fn cleanup_expired(
 
 /// Evict holdings whose drop-notice window (7 days) has expired.
 /// The owner was notified via SymbolDropNotice; now we actually delete.
+/// T-13a: publishes immediate-drop DropNotice via mailbox (deadline=now).
 async fn cleanup_drop_notices(
     db: &Db,
     holdings_dir: &Path,
-    relay_post_tx: &mpsc::Sender<RelayPost>,
+    mailbox_router: &Arc<MailboxRouter>,
+    holder_master_pub: IdentityPub,
     master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
+    // master_signing_key not used now (was used for build_symbol_dropped); kept for
+    // potential future use and to avoid a larger signature change in this task.
+    let _ = master_signing_key;
     let now = Timestamp::now();
     let expired = db.list_holdings_drop_notice_expired(now)?;
 
@@ -229,13 +240,13 @@ async fn cleanup_drop_notices(
             continue;
         }
 
-        // Post SymbolDropped to the owner.
-        post_symbol_dropped(
-            relay_post_tx,
+        // T-13a: publish immediate-drop DropNotice via mailbox (deadline=now).
+        post_symbol_dropped_via_mailbox(
+            mailbox_router,
+            holder_master_pub,
             holding.owner_id,
             holding.source_block_id,
             &holding.esi_ranges,
-            master_signing_key,
         )
         .await;
 
@@ -257,7 +268,7 @@ async fn cleanup_drop_notices(
         info!(
             block_id = %holding.source_block_id,
             owner = %holding.owner_id,
-            "holder_cleanup: drop notice expired, holding evicted"
+            "holder_cleanup: drop notice expired, holding evicted, immediate-drop DropNotice sent via mailbox"
         );
     }
 
@@ -266,13 +277,12 @@ async fn cleanup_drop_notices(
 
 /// Evaluate disk pressure and evict if necessary.
 ///
-/// T-7: advance DropNotice entries are routed through the mailbox bus (batched per owner).
-/// The `SymbolDropped` (immediate eviction) path remains on relay (T-13 retires relay).
+/// T-7: advance DropNotice entries via mailbox, batched per owner.
+/// T-13a: immediate-drop DropNotice (deadline=now) via mailbox (replaces SymbolDropped-via-relay).
 #[allow(clippy::too_many_arguments)]
 async fn check_pressure(
     db: &Db,
     holdings_dir: &Path,
-    relay_post_tx: &mpsc::Sender<RelayPost>,
     mailbox_router: &Arc<MailboxRouter>,
     holder_master_pub: IdentityPub,
     soft_quota_bytes: u64,
@@ -281,6 +291,9 @@ async fn check_pressure(
     disk_reserve_bytes: u64,
     master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
+    // master_signing_key not used (was used for build_symbol_dropped); kept for
+    // potential future use and to avoid a larger signature change in this task.
+    let _ = master_signing_key;
     let now = Timestamp::now();
     let holdings = db.list_all_holdings()?;
     let used_bytes: u64 = holdings.iter().map(|h| h.total_bytes).sum();
@@ -365,13 +378,13 @@ async fn check_pressure(
                     continue;
                 }
 
-                // Post SymbolDropped.
-                post_symbol_dropped(
-                    relay_post_tx,
+                // T-13a: publish immediate-drop DropNotice via mailbox (deadline=now).
+                post_symbol_dropped_via_mailbox(
+                    mailbox_router,
+                    holder_master_pub,
                     target.owner_id,
                     target.source_block_id,
                     &esi_ranges,
-                    master_signing_key,
                 )
                 .await;
             }
@@ -379,9 +392,6 @@ async fn check_pressure(
             // T-7: send DropNotice via mailbox, batched per owner.
             // Group notices by owner_id, then publish each group as one or more
             // SymbolDropNoticeBatchMsg entries (chunked to ≤ MAX_ENTRY_BYTES each).
-            //
-            // Scope fence: `SymbolDropped` (immediate eviction) stays on relay;
-            // only the advance-notice path moves here.
             publish_drop_notices_via_mailbox(
                 db,
                 &result.drop_notices,
@@ -413,7 +423,7 @@ async fn check_pressure(
     Ok(())
 }
 
-/// T-7: Publish DropNotice entries via the mailbox bus, batched per owner.
+/// T-7: Publish advance DropNotice entries via the mailbox bus, batched per owner.
 ///
 /// Groups `DropNoticeTarget` list by `owner_id`. For each owner:
 ///   1. Builds `Vec<SymbolDropNoticeMsg>` (reading ESI ranges from DB for each notice).
@@ -422,7 +432,8 @@ async fn check_pressure(
 ///   4. W-4 (best-effort): if publish returns 0 acks, retries once; logs WARN on second 0.
 ///   5. Records `drop_notice_sent_at` on each holding (once, idempotent).
 ///
-/// `SymbolDropped` (immediate-eviction relay path) is NOT touched — scope fence: T-13.
+/// T-13a: immediate-drop path is now also via mailbox (`post_symbol_dropped_via_mailbox`);
+/// this function only handles the advance-notice (buffer-zone) path.
 async fn publish_drop_notices_via_mailbox(
     db: &Db,
     drop_notices: &[viaticum_core::budget::DropNoticeTarget],
@@ -638,30 +649,90 @@ fn chunk_notices_to_fit(notices: &[SymbolDropNoticeMsg]) -> Vec<Vec<SymbolDropNo
     }
 }
 
-/// Post a SymbolDropped message to the board (directed to owner).
-async fn post_symbol_dropped(
-    relay_post_tx: &mpsc::Sender<RelayPost>,
+/// T-13a: Publish an immediate-drop DropNotice via the mailbox bus.
+///
+/// Replaces the former `post_symbol_dropped` relay path. Uses the same
+/// `SymbolDropNoticeBatchMsg` wire format as the advance-notice path (T-7),
+/// but with `deadline = Timestamp::now()` to signal "already dropped".
+///
+/// The owner's `ProcessorDropHandler` checks deadline ≤ now + epsilon and
+/// triggers `RepairNow` immediately, preserving the former SymbolDropped semantics.
+///
+/// `relay_post_tx` is kept in scope (T-13b removes relay entirely); this function
+/// no longer sends to it.
+async fn post_symbol_dropped_via_mailbox(
+    mailbox_router: &Arc<MailboxRouter>,
+    holder_master_pub: IdentityPub,
     owner_id: IdentityPub,
     source_block_id: viaticum_core::types::SourceBlockId,
     esi_ranges: &[(u32, u32)],
-    master_signing_key: &ed25519_dalek::SigningKey,
 ) {
-    let msg = viaticum_core::messages::build_symbol_dropped(
+    let now = Timestamp::now();
+    let now_secs = now.0;
+
+    // Build a single-notice batch with deadline = now (immediate drop).
+    let notice = SymbolDropNoticeMsg {
+        v: 1,
         source_block_id,
-        esi_ranges.to_vec(),
-        Timestamp::now(),
-        master_signing_key,
-    );
-    if let Ok(payload) = viaticum_core::messages::to_cbor(&msg) {
-        let mut msg_id = [0u8; 16];
-        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
-        let _ = relay_post_tx
-            .send(RelayPost {
-                msg_type: "symbol_dropped".to_string(),
-                target: Some(owner_id),
-                payload,
-                msg_id,
-            })
-            .await;
+        esi_ranges: esi_ranges.to_vec(),
+        deadline: now,
+        timestamp: now,
+    };
+    let batch = viaticum_core::messages::SymbolDropNoticeBatchMsg {
+        v: 1,
+        notices: vec![notice],
+    };
+    let payload = match viaticum_core::messages::to_cbor(&batch) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                block_id = %source_block_id,
+                owner = %owner_id,
+                err = %e,
+                "holder_cleanup: immediate-drop — failed to serialize DropNotice"
+            );
+            return;
+        }
+    };
+
+    let ttl_secs = class_config::DROP_NOTICE_TTL.as_secs();
+    let mut msg_id = [0u8; 16];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
+
+    let entry = MailboxEntry {
+        target: owner_id,
+        msg_id,
+        class: MailboxClass::DropNotice,
+        payload_version: 1,
+        payload,
+        expires_at: now_secs + ttl_secs,
+        stored_at: now_secs,
+        sender: Some(holder_master_pub),
+    };
+
+    match mailbox_router.publish(&owner_id, entry).await {
+        Ok(0) => {
+            warn!(
+                block_id = %source_block_id,
+                owner = %owner_id,
+                "holder_cleanup: immediate-drop DropNotice got 0 acks (best-effort, W-4)"
+            );
+        }
+        Ok(n) => {
+            info!(
+                block_id = %source_block_id,
+                owner = %owner_id,
+                ack_count = n,
+                "holder_cleanup: immediate-drop DropNotice published via mailbox"
+            );
+        }
+        Err(e) => {
+            warn!(
+                block_id = %source_block_id,
+                owner = %owner_id,
+                err = %e,
+                "holder_cleanup: immediate-drop DropNotice publish failed (best-effort)"
+            );
+        }
     }
 }

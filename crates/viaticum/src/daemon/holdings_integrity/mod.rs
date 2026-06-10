@@ -1,21 +1,30 @@
 // HoldingsIntegrityTask: periodic scan verifying that held symbol directories exist on disk.
 //
 // For each Active holding in the DB, checks that holdings_dir/{block_hex}/ exists.
-// If missing: removes the DB record immediately and posts SymbolDropped to the owner.
+// If missing: removes the DB record immediately and publishes an immediate-drop DropNotice
+// (deadline=now) via the mailbox bus to notify the owner.
 // Skips MarkedForDelete and Silent holdings — they may legitimately be absent.
 //
 // Guard: if holdings_dir itself is missing, logs ERROR and returns 0 without firing
-// SymbolDropped for every holding (avoids false mass-reports on temporary unmount).
+// DropNotice for every holding (avoids false mass-reports on temporary unmount).
+//
+// T-13a: migrated from relay (SymbolDropped) to mailbox (DropNotice, deadline=now).
+// relay_post_tx is kept in run() signature; T-13b removes relay entirely.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use viaticum_core::cluster::master_identity;
 use viaticum_core::db::Db;
+use viaticum_core::mailbox::{MailboxClass, MailboxEntry, class_config};
+use viaticum_core::messages::{SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, to_cbor};
 use viaticum_core::types::{HoldingRecord, HoldingStatus, IdentityPub, Timestamp, hex_encode};
 
+use crate::daemon::mailbox::routing::MailboxRouter;
 use crate::daemon::relay::RelayPost;
 
 #[cfg(test)]
@@ -24,8 +33,11 @@ mod tests;
 /// Run the holdings integrity scan task.
 ///
 /// Periodically scans all Active holdings in DB and verifies that the corresponding
-/// symbol directory exists on disk. If missing: posts SymbolDropped to the board
-/// and removes the DB holding record immediately.
+/// symbol directory exists on disk. If missing: publishes an immediate-drop DropNotice
+/// (deadline=now) via the mailbox bus and removes the DB holding record immediately.
+///
+/// T-13a: migrated from relay (SymbolDropped) to mailbox (DropNotice, deadline=now).
+/// `relay_post_tx` is kept in the signature; T-13b removes relay entirely.
 ///
 /// Scan interval: scan_interval_secs / time_scale (minimum 1 second).
 /// Skips holdings with status != Active (MarkedForDelete, Silent may legitimately be absent).
@@ -34,15 +46,21 @@ pub async fn run(
     db: Db,
     holdings_dir: PathBuf,
     relay_post_tx: mpsc::Sender<RelayPost>,
+    mailbox_router: Arc<MailboxRouter>,
     my_identity: IdentityPub,
     scan_interval_secs: u64,
     time_scale: u64,
     master_signing_key: ed25519_dalek::SigningKey,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    // relay_post_tx is kept for signature compat; T-13b removes relay entirely.
+    let _relay_post_tx = relay_post_tx;
+
     let interval_secs = (scan_interval_secs / time_scale.max(1)).max(1);
     let mut timer = tokio::time::interval(Duration::from_secs(interval_secs));
     timer.tick().await;
+
+    let holder_master_pub = master_identity(&master_signing_key);
 
     info!(
         interval_secs,
@@ -57,7 +75,7 @@ pub async fn run(
                 break;
             }
             _ = timer.tick() => {
-                match scan_holdings(&db, &holdings_dir, &relay_post_tx, &master_signing_key).await {
+                match scan_holdings(&db, &holdings_dir, &mailbox_router, holder_master_pub, &master_signing_key).await {
                     Ok(missing) if missing > 0 => {
                         warn!(missing, "holdings_integrity: found missing holdings");
                     }
@@ -80,7 +98,8 @@ pub async fn run(
 async fn scan_holdings(
     db: &Db,
     holdings_dir: &Path,
-    relay_post_tx: &mpsc::Sender<RelayPost>,
+    mailbox_router: &Arc<MailboxRouter>,
+    holder_master_pub: IdentityPub,
     master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<usize> {
     if !holdings_dir.exists() {
@@ -108,8 +127,14 @@ async fn scan_holdings(
                 owner = %holding.owner_id,
                 "holdings_integrity: symbol directory missing on disk"
             );
-            if let Err(e) =
-                report_missing_holding(db, holding, relay_post_tx, master_signing_key).await
+            if let Err(e) = report_missing_holding(
+                db,
+                holding,
+                mailbox_router,
+                holder_master_pub,
+                master_signing_key,
+            )
+            .await
             {
                 warn!(
                     block_id = %holding.source_block_id,
@@ -132,13 +157,19 @@ fn check_holding_on_disk(holding: &HoldingRecord, holdings_dir: &Path) -> bool {
     block_dir.exists()
 }
 
-/// Post SymbolDropped for a missing holding and remove it from DB.
+/// T-13a: Publish an immediate-drop DropNotice (deadline=now) for a missing holding,
+/// and remove it from DB. Replaces the former SymbolDropped-via-relay path.
 async fn report_missing_holding(
     db: &Db,
     holding: &HoldingRecord,
-    relay_post_tx: &mpsc::Sender<RelayPost>,
+    mailbox_router: &Arc<MailboxRouter>,
+    holder_master_pub: IdentityPub,
     master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
+    // master_signing_key not used now (was used for build_symbol_dropped); kept for
+    // potential future use and to avoid a larger signature change in this task.
+    let _ = master_signing_key;
+
     db.delete_holding(&holding.source_block_id, &holding.owner_id)?;
 
     // Refresh storage bytes for all devices of this owner's master identity.
@@ -156,29 +187,65 @@ async fn report_missing_holding(
         }
     }
 
-    let msg = viaticum_core::messages::build_symbol_dropped(
-        holding.source_block_id,
-        holding.esi_ranges.clone(),
-        Timestamp::now(),
-        master_signing_key,
-    );
-    if let Ok(payload) = viaticum_core::messages::to_cbor(&msg) {
+    // Publish immediate-drop DropNotice via mailbox (deadline=now).
+    let now = Timestamp::now();
+    let now_secs = now.0;
+    let notice = SymbolDropNoticeMsg {
+        v: 1,
+        source_block_id: holding.source_block_id,
+        esi_ranges: holding.esi_ranges.clone(),
+        deadline: now,
+        timestamp: now,
+    };
+    let batch = SymbolDropNoticeBatchMsg {
+        v: 1,
+        notices: vec![notice],
+    };
+    if let Ok(payload) = to_cbor(&batch) {
+        let ttl_secs = class_config::DROP_NOTICE_TTL.as_secs();
         let mut msg_id = [0u8; 16];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
-        relay_post_tx
-            .send(RelayPost {
-                msg_type: "symbol_dropped".to_string(),
-                target: Some(holding.owner_id),
-                payload,
-                msg_id,
-            })
-            .await?;
+        let entry = MailboxEntry {
+            target: holding.owner_id,
+            msg_id,
+            class: MailboxClass::DropNotice,
+            payload_version: 1,
+            payload,
+            expires_at: now_secs + ttl_secs,
+            stored_at: now_secs,
+            sender: Some(holder_master_pub),
+        };
+        match mailbox_router.publish(&holding.owner_id, entry).await {
+            Ok(0) => {
+                warn!(
+                    block_id = %holding.source_block_id,
+                    owner = %holding.owner_id,
+                    "holdings_integrity: immediate-drop DropNotice got 0 acks (best-effort)"
+                );
+            }
+            Ok(n) => {
+                debug!(
+                    block_id = %holding.source_block_id,
+                    owner = %holding.owner_id,
+                    ack_count = n,
+                    "holdings_integrity: immediate-drop DropNotice published via mailbox"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    block_id = %holding.source_block_id,
+                    owner = %holding.owner_id,
+                    err = %e,
+                    "holdings_integrity: immediate-drop DropNotice publish failed (best-effort)"
+                );
+            }
+        }
     }
 
     info!(
         block_id = %holding.source_block_id,
         owner = %holding.owner_id,
-        "holdings_integrity: missing holding removed from DB, SymbolDropped sent"
+        "holdings_integrity: missing holding removed from DB, immediate-drop DropNotice sent via mailbox"
     );
     Ok(())
 }

@@ -156,9 +156,11 @@ async fn poll_pos_response_channel_full_does_not_panic() {
 /// DropNotice entry with no sender is dropped gracefully (no panic).
 #[tokio::test]
 async fn poll_drop_notice_no_sender_does_not_panic() {
+    use crate::daemon::repair::RepairTrigger;
     let db = Db::open_in_memory().expect("db");
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
     let handler: Arc<dyn super::DropNoticeHandler> =
-        Arc::new(ProcessorDropHandler::new(db.clone()));
+        Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
 
     let batch = SymbolDropNoticeBatchMsg {
         v: 1,
@@ -192,9 +194,11 @@ async fn poll_drop_notice_no_sender_does_not_panic() {
 /// DropNotice entry with invalid payload is dropped gracefully (no panic).
 #[tokio::test]
 async fn poll_drop_notice_bad_payload_does_not_panic() {
+    use crate::daemon::repair::RepairTrigger;
     let db = Db::open_in_memory().expect("db");
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
     let handler: Arc<dyn super::DropNoticeHandler> =
-        Arc::new(ProcessorDropHandler::new(db.clone()));
+        Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
 
     let now_secs = Timestamp::now().0;
     let entry = MailboxEntry {
@@ -333,8 +337,10 @@ async fn drop_notice_batch_dispatch_marks_each_placement_lost() {
         sender: Some(holder_master), // sender = holder's master_pub
     };
 
+    use crate::daemon::repair::RepairTrigger;
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
     let handler: Arc<dyn super::DropNoticeHandler> =
-        Arc::new(ProcessorDropHandler::new(db.clone()));
+        Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
 
     super::dispatch_drop_notice(&handler, entry);
 

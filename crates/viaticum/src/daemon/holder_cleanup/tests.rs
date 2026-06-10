@@ -1,17 +1,16 @@
 // Tests for the holder cleanup module.
 //
-// T-7 changes:
-//   - check_pressure now requires mailbox_router + holder_master_pub parameters.
-//   - DropNotice (advance notice) is published via mailbox, NOT relay.
-//   - SymbolDropped (immediate eviction) stays on relay.
-//   - Existing relay-channel tests updated; new mailbox tests added.
+// T-7 + T-13a changes:
+//   - check_pressure now uses mailbox for both immediate-drop and advance DropNotice.
+//   - DropNotice (advance notice) published via mailbox, NOT relay.
+//   - T-13a: immediate-drop DropNotice (deadline=now) also via mailbox, NOT relay.
+//   - relay_post_tx removed from inner fn calls; relay_channel helper removed.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use tempfile::TempDir;
-use tokio::sync::mpsc;
 use viaticum_core::db::Db;
 use viaticum_core::mailbox::MailboxRejectReason;
 use viaticum_core::messages::{
@@ -24,7 +23,6 @@ use viaticum_core::types::{
 };
 
 use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
-use crate::daemon::relay::RelayPost;
 
 // ─── Mock MailboxNetworkSender that records store requests ────────────────────
 
@@ -220,22 +218,19 @@ fn expired_holding(block_seed: u8, owner: IdentityPub) -> HoldingRecord {
     }
 }
 
-/// Build an mpsc channel pair sized for the tests (capacity 16).
-fn relay_channel() -> (mpsc::Sender<RelayPost>, mpsc::Receiver<RelayPost>) {
-    mpsc::channel(16)
-}
-
 fn test_key() -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32])
 }
 
-// ─── test 1: cleanup_expired_deletes_files_and_posts_symbol_dropped ─────────
+// ─── test 1: cleanup_expired_deletes_files_and_publishes_drop_notice ─────────
+//
+// T-13a: immediate-drop DropNotice goes via mailbox (not relay).
 
 #[tokio::test]
-async fn cleanup_expired_deletes_files_and_posts_symbol_dropped() {
+async fn cleanup_expired_deletes_files_and_publishes_drop_notice() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (relay_post_tx, mut relay_post_rx) = relay_channel();
+    let (router, sender) = make_router_and_sender(&db);
 
     let owner = owner_id(0xBB);
     let block = block_id(0xAA);
@@ -254,7 +249,7 @@ async fn cleanup_expired_deletes_files_and_posts_symbol_dropped() {
     // cleanup_expired calls Timestamp::now() internally, so we rely on the
     // real wall-clock being >> HOLDER_DELETE_COOLDOWN_SECS (which is 4 weeks
     // in seconds, ~2.4 million). Any Unix timestamp past 2024 qualifies.
-    super::cleanup_expired(&db, holdings_dir.path(), &relay_post_tx, 1, &test_key())
+    super::cleanup_expired(&db, holdings_dir.path(), &router, holder_master_pub(), 1)
         .await
         .unwrap();
 
@@ -270,18 +265,33 @@ async fn cleanup_expired_deletes_files_and_posts_symbol_dropped() {
         "symbol directory should be deleted from disk"
     );
 
-    // A SymbolDropped message must have been posted.
-    let post = relay_post_rx
-        .try_recv()
-        .expect("relay_post_tx should have received a SymbolDropped message");
-    assert_eq!(
-        post.msg_type, "symbol_dropped",
-        "posted message type should be symbol_dropped"
+    // T-13a: immediate-drop DropNotice must be published via mailbox (not relay).
+    let mailbox_reqs = sender.drain().await;
+    assert!(
+        !mailbox_reqs.is_empty(),
+        "cleanup_expired must publish an immediate-drop DropNotice via mailbox"
     );
+    let drop_req = mailbox_reqs
+        .iter()
+        .find(|r| r.entry.target == owner)
+        .expect("mailbox DropNotice must target the owner");
     assert_eq!(
-        post.target,
-        Some(owner),
-        "SymbolDropped should be directed at the owner"
+        drop_req.entry.class,
+        viaticum_core::mailbox::MailboxClass::DropNotice,
+        "mailbox entry class must be DropNotice"
+    );
+    // T-13a: deadline = now → immediate drop signal.
+    use viaticum_core::messages::SymbolDropNoticeBatchMsg;
+    use viaticum_core::types::from_cbor_bytes;
+    let batch: SymbolDropNoticeBatchMsg = from_cbor_bytes(&drop_req.entry.payload).unwrap();
+    assert_eq!(batch.notices.len(), 1, "one notice per holding");
+    let notice = &batch.notices[0];
+    let now_secs = viaticum_core::types::Timestamp::now().0;
+    assert!(
+        notice.deadline.0 <= now_secs,
+        "deadline must be ≤ now for immediate drop (got deadline={}, now={})",
+        notice.deadline.0,
+        now_secs
     );
 }
 
@@ -291,7 +301,7 @@ async fn cleanup_expired_deletes_files_and_posts_symbol_dropped() {
 async fn cleanup_expired_tolerates_missing_files() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (relay_post_tx, mut relay_post_rx) = relay_channel();
+    let (router, sender) = make_router_and_sender(&db);
 
     let owner = owner_id(0xCC);
     let block = block_id(0xDD);
@@ -301,7 +311,7 @@ async fn cleanup_expired_tolerates_missing_files() {
     // Intentionally do NOT create any files on disk.
 
     // Should not error even though no files exist.
-    super::cleanup_expired(&db, holdings_dir.path(), &relay_post_tx, 1, &test_key())
+    super::cleanup_expired(&db, holdings_dir.path(), &router, holder_master_pub(), 1)
         .await
         .unwrap();
 
@@ -311,12 +321,17 @@ async fn cleanup_expired_tolerates_missing_files() {
         "holding should be removed from DB even when files were absent"
     );
 
-    // A SymbolDropped message must still be posted.
-    let post = relay_post_rx
-        .try_recv()
-        .expect("relay_post_tx should have received a SymbolDropped message");
-    assert_eq!(post.msg_type, "symbol_dropped");
-    assert_eq!(post.target, Some(owner));
+    // T-13a: immediate-drop DropNotice must be published via mailbox.
+    let mailbox_reqs = sender.drain().await;
+    assert!(
+        !mailbox_reqs.is_empty(),
+        "cleanup_expired must publish an immediate-drop DropNotice via mailbox even when files absent"
+    );
+    let drop_req = mailbox_reqs.iter().find(|r| r.entry.target == owner);
+    assert!(
+        drop_req.is_some(),
+        "mailbox DropNotice must target the owner"
+    );
 }
 
 // ─── test 3: check_pressure_normal_does_nothing ─────────────────────────────
@@ -325,7 +340,6 @@ async fn cleanup_expired_tolerates_missing_files() {
 async fn check_pressure_normal_does_nothing() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (relay_post_tx, mut relay_post_rx) = relay_channel();
     let (router, sender) = make_router_and_sender(&db);
 
     // Insert a few active holdings so the DB is not empty.
@@ -348,7 +362,6 @@ async fn check_pressure_normal_does_nothing() {
     super::check_pressure(
         &db,
         holdings_dir.path(),
-        &relay_post_tx,
         &router,
         holder_master_pub(),
         u64::MAX,
@@ -360,13 +373,7 @@ async fn check_pressure_normal_does_nothing() {
     .await
     .unwrap();
 
-    // No evictions should occur — relay_post_tx must remain empty (SymbolDropped path).
-    assert!(
-        relay_post_rx.try_recv().is_err(),
-        "no messages should be posted when disk pressure is Normal"
-    );
-
-    // No mailbox publish should happen either.
+    // No mailbox publish should happen (neither immediate-drop nor advance notice).
     let mailbox_reqs = sender.drain().await;
     assert!(
         mailbox_reqs.is_empty(),
@@ -384,15 +391,16 @@ async fn check_pressure_normal_does_nothing() {
     }
 }
 
-// ─── T-7 tests ────────────────────────────────────────────────────────────────
+// ─── T-7 + T-13a tests ────────────────────────────────────────────────────────
 
-/// T-7: Under hard pressure with a buffer-zone holding, `check_pressure` publishes
-/// a DropNotice via mailbox (NOT relay) and records `drop_notice_sent_at`.
+/// T-7 / T-13a: Under hard pressure, `check_pressure` publishes BOTH:
+/// - Immediate-drop DropNotice (deadline=now) via mailbox for holding A (immediate eviction).
+/// - Advance DropNotice (deadline=future) via mailbox for holding B (buffer zone).
+/// Neither goes via relay.
 #[tokio::test]
 async fn drop_notice_published_to_mailbox_on_eviction() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (relay_post_tx, mut relay_post_rx) = relay_channel();
     let (router, sender) = make_router_and_sender(&db);
 
     let owner_a = owner_id(0x01);
@@ -410,7 +418,7 @@ async fn drop_notice_published_to_mailbox_on_eviction() {
         delete_requested_at: None,
         drop_notice_sent_at: None,
     };
-    // Holding B: higher priority, will receive DropNotice (buffer zone).
+    // Holding B: higher priority, will receive advance DropNotice (buffer zone).
     let holding_b = HoldingRecord {
         source_block_id: block_id(0xBB),
         owner_id: owner_b,
@@ -442,7 +450,6 @@ async fn drop_notice_published_to_mailbox_on_eviction() {
     super::check_pressure(
         &db,
         holdings_dir.path(),
-        &relay_post_tx,
         &router,
         holder_master_pub(),
         1000, // soft_quota_bytes
@@ -454,35 +461,34 @@ async fn drop_notice_published_to_mailbox_on_eviction() {
     .await
     .unwrap();
 
-    // SymbolDropped (immediate eviction of holding A) must go via relay.
-    let mut symbol_dropped_found = false;
-    while let Ok(post) = relay_post_rx.try_recv() {
-        if post.msg_type == "symbol_dropped" {
-            symbol_dropped_found = true;
-        }
-        // DropNotice must NOT appear on relay (scope fence: moved to mailbox in T-7).
-        assert_ne!(
-            post.msg_type, "symbol_drop_notice",
-            "DropNotice must NOT be sent via relay in T-7 (must go via mailbox)"
-        );
-    }
-    assert!(
-        symbol_dropped_found,
-        "SymbolDropped for immediately-evicted holding A must still go via relay"
-    );
-
-    // DropNotice for holding B must be published via mailbox.
+    // ALL drop notices go via mailbox — no relay involved.
     let mailbox_reqs = sender.drain().await;
     assert!(
         !mailbox_reqs.is_empty(),
         "at least one MailboxStoreRequest should be sent for DropNotice"
     );
 
-    // Find the DropNotice entry for owner_b.
+    // T-13a: immediate-drop DropNotice for owner_a (was immediately evicted).
+    let immediate_req = mailbox_reqs
+        .iter()
+        .find(|req| req.entry.target == owner_a)
+        .expect("a MailboxStoreRequest targeting owner_a (immediate eviction) should exist");
+    assert_eq!(
+        immediate_req.entry.class,
+        viaticum_core::mailbox::MailboxClass::DropNotice,
+        "immediate eviction mailbox entry class must be DropNotice"
+    );
+    assert_eq!(
+        immediate_req.entry.sender,
+        Some(holder_master_pub()),
+        "sender must be the holder's own master_pub"
+    );
+
+    // Find the advance DropNotice entry for owner_b.
     let drop_notice_req = mailbox_reqs
         .iter()
         .find(|req| req.entry.target == owner_b)
-        .expect("a MailboxStoreRequest targeting owner_b should exist");
+        .expect("a MailboxStoreRequest targeting owner_b (buffer zone) should exist");
 
     assert_eq!(
         drop_notice_req.entry.class,
@@ -520,7 +526,6 @@ async fn drop_notice_published_to_mailbox_on_eviction() {
 async fn drop_notice_has_correct_ttl() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (relay_post_tx, _relay_post_rx) = relay_channel();
     let (router, sender) = make_router_and_sender(&db);
 
     let owner = owner_id(0x10);
@@ -564,7 +569,6 @@ async fn drop_notice_has_correct_ttl() {
     super::check_pressure(
         &db,
         holdings_dir.path(),
-        &relay_post_tx,
         &router,
         holder_master_pub(),
         1000,
@@ -599,7 +603,6 @@ async fn drop_notice_has_correct_ttl() {
 async fn mass_eviction_batches_into_single_mailbox_entry() {
     let db = Db::open_in_memory().unwrap();
     let _holdings_dir = TempDir::new().unwrap();
-    let (_relay_post_tx, _relay_post_rx) = relay_channel();
     let (router, sender) = make_router_and_sender(&db);
 
     let owner = owner_id(0x20);
@@ -755,7 +758,6 @@ async fn drop_notices_for_different_owners_go_to_separate_entries() {
 async fn holder_drop_notice_sent_at_not_overwritten_on_second_send() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (relay_post_tx, _relay_post_rx) = relay_channel();
     let (router, _sender) = make_router_and_sender(&db);
 
     let earlier_time = Timestamp(1_000_000); // a past timestamp
@@ -792,7 +794,6 @@ async fn holder_drop_notice_sent_at_not_overwritten_on_second_send() {
     super::check_pressure(
         &db,
         holdings_dir.path(),
-        &relay_post_tx,
         &router,
         holder_master_pub(),
         100, // soft_quota_bytes = 100
@@ -827,20 +828,17 @@ async fn holder_drop_notice_sent_at_not_overwritten_on_second_send() {
 /// - Holdings A (600 bytes, low priority) covers deficit; B (350 bytes, medium
 ///   priority) falls into the buffer zone and receives a DropNotice.
 ///
-/// Returns (db, holdings_dir, relay_post_tx, relay_post_rx, holding_b)
+/// Returns (db, holdings_dir, holding_b)
 /// where holding_b is the buffer-zone holding that should receive a drop notice.
 async fn setup_hard_pressure_with_buffer_zone() -> (
     Db,
     TempDir,
-    mpsc::Sender<RelayPost>,
-    mpsc::Receiver<RelayPost>,
     HoldingRecord,
     Arc<MailboxRouter>,
     Arc<RecordingMailboxSender>,
 ) {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let (relay_post_tx, relay_post_rx) = mpsc::channel::<RelayPost>(16);
     let (router, sender) = make_router_and_sender(&db);
 
     // Holding A: 600 bytes, importance=0.1, received at T=0 (old → low priority).
@@ -882,28 +880,19 @@ async fn setup_hard_pressure_with_buffer_zone() -> (
     db.upsert_holding(&holding_b).unwrap();
     db.upsert_holding(&top_up).unwrap();
 
-    (
-        db,
-        holdings_dir,
-        relay_post_tx,
-        relay_post_rx,
-        holding_b,
-        router,
-        sender,
-    )
+    (db, holdings_dir, holding_b, router, sender)
 }
 
 /// Test: under hard pressure with a buffer zone holding, check_pressure sends a
 /// DropNotice via MAILBOX (not relay) and records `drop_notice_sent_at` in the DB.
 #[tokio::test]
 async fn holder_pressure_sets_drop_notice_sent_at_on_first_send() {
-    let (db, holdings_dir, relay_post_tx, _relay_post_rx, holding_b, router, sender) =
+    let (db, holdings_dir, holding_b, router, sender) =
         setup_hard_pressure_with_buffer_zone().await;
 
     super::check_pressure(
         &db,
         holdings_dir.path(),
-        &relay_post_tx,
         &router,
         holder_master_pub(),
         1000, // soft_quota_bytes

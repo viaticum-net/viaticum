@@ -224,23 +224,109 @@ impl SymbolDropHandler {
 
 /// Production impl of `DropNoticeHandler` that delegates to `SymbolDropHandler`.
 ///
+/// T-13a: extended to trigger `RepairTrigger::RepairNow` for immediate drops
+/// (deadline ≤ now + IMMEDIATE_DROP_EPSILON_SECS). This handles the former
+/// `SymbolDropped`-via-relay path which is now folded into the DropNotice mailbox
+/// path with `deadline = Timestamp::now()`.
+///
 /// Constructed from the same `db` clone passed into `Processor` —
 /// no `Arc<Processor>` wrap is needed (mirrors `ProcessorPosHandler` / `PosResponder`).
+///
+/// `repair_tx`: mpsc sender to the repair worker. Used to trigger immediate repair
+/// for already-dropped symbols (deadline ≤ now). May be None in tests that only
+/// exercise the advance-notice path.
 pub struct ProcessorDropHandler {
     inner: SymbolDropHandler,
+    db: viaticum_core::db::Db,
+    repair_tx: tokio::sync::mpsc::Sender<crate::daemon::repair::RepairTrigger>,
 }
 
+/// If a DropNotice deadline is within this many seconds of now (or in the past),
+/// treat it as an immediate drop and trigger RepairNow instead of lazy repair.
+/// 5 minutes: generous for clock skew + publish latency.
+const IMMEDIATE_DROP_EPSILON_SECS: u64 = 300;
+
 impl ProcessorDropHandler {
-    pub fn new(db: viaticum_core::db::Db) -> Self {
+    pub fn new(
+        db: viaticum_core::db::Db,
+        repair_tx: tokio::sync::mpsc::Sender<crate::daemon::repair::RepairTrigger>,
+    ) -> Self {
         ProcessorDropHandler {
-            inner: SymbolDropHandler::new(db),
+            inner: SymbolDropHandler::new(db.clone()),
+            db,
+            repair_tx,
         }
     }
 }
 
 impl crate::daemon::mailbox::poll::DropNoticeHandler for ProcessorDropHandler {
     fn handle_drop_notice(&self, from: IdentityPub, notice: SymbolDropNoticeMsg) {
+        let block_id = notice.source_block_id;
+        let deadline = notice.deadline.0;
+
+        // Apply DropNotice: mark placement Lost, recompute reliability.
         self.inner.apply(from, notice);
+
+        // T-13a: if this is an immediate drop (deadline ≈ now), trigger RepairNow
+        // so that repair happens urgently rather than waiting for the next scheduled scan.
+        // This preserves the semantics of the former SymbolDropped-via-relay path.
+        let now = viaticum_core::types::Timestamp::now().0;
+        let is_immediate = deadline <= now.saturating_add(IMMEDIATE_DROP_EPSILON_SECS);
+        if is_immediate {
+            // Resolve DeviceId for the holder master pub (same lookup as handle_symbol_dropped).
+            let holder_device_opt = self
+                .db
+                .get_devices_for_master(&from)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|did| {
+                    // Use the first device that has a placement for this block.
+                    // If none found, fall back to first known device.
+                    self.db
+                        .get_placement(&block_id, did)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                })
+                .or_else(|| {
+                    self.db
+                        .get_devices_for_master(&from)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .next()
+                });
+
+            if let Some(holder_device) = holder_device_opt {
+                let trigger = crate::daemon::repair::RepairTrigger::RepairNow {
+                    block_id,
+                    holder_id: holder_device,
+                };
+                // try_send: non-blocking; if channel is full, the lazy scan
+                // will eventually cover it (same degradation as T-6 pos_response_tx).
+                if let Err(e) = self.repair_tx.try_send(trigger) {
+                    tracing::warn!(
+                        block_id = %block_id,
+                        holder = %from,
+                        err = %e,
+                        "processor: DropNotice immediate drop — repair_tx full or closed, \
+                         repair will be scheduled lazily"
+                    );
+                } else {
+                    tracing::info!(
+                        block_id = %block_id,
+                        holder = %from,
+                        "processor: DropNotice immediate drop — RepairNow triggered"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    block_id = %block_id,
+                    holder = %from,
+                    "processor: DropNotice immediate drop — could not resolve DeviceId for holder, \
+                     repair will be scheduled lazily"
+                );
+            }
+        }
     }
 }
 
