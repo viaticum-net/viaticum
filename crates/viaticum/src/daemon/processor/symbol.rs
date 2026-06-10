@@ -369,6 +369,240 @@ impl crate::daemon::mailbox::poll::DropNoticeHandler for ProcessorDropHandler {
     }
 }
 
+// ─── DeleteRequestHandler: standalone holder-side Delete/CancelDelete handler ──
+
+/// Abstraction for handling a DeleteRequest mailbox entry on the holder side.
+///
+/// Called by the mailbox poll loop when a `MailboxClass::DeleteRequest` entry is received.
+/// Production impl: `ProcessorDeleteHandler` delegates to the same logic as
+/// `Processor::handle_delete` / `Processor::handle_cancel_delete`.
+///
+/// Parameters to `handle_delete_request`:
+/// - `from`: owner master pub (from `MailboxEntry.sender`) — used as `owner` in sig verification.
+/// - `payload`: raw CBOR-encoded `DeleteRequestPayload` bytes.
+#[async_trait::async_trait]
+pub trait DeleteMailboxHandler: Send + Sync {
+    async fn handle_delete_request(
+        &self,
+        from: viaticum_core::types::IdentityPub,
+        payload: Vec<u8>,
+    ) -> anyhow::Result<()>;
+}
+
+/// Standalone handler for `MailboxClass::DeleteRequest` entries.
+///
+/// Extracted from `Processor::handle_delete` / `Processor::handle_cancel_delete` so the
+/// mailbox poll loop can call it without holding an `Arc<Processor>`.
+///
+/// Only requires `db` — confirmed: `handle_delete` / `handle_cancel_delete` use only
+/// `self.db`, `self.db.get_holding`, `self.db.upsert_holding`.
+pub struct ProcessorDeleteHandler {
+    db: Db,
+}
+
+impl ProcessorDeleteHandler {
+    pub fn new(db: Db) -> Self {
+        ProcessorDeleteHandler { db }
+    }
+}
+
+#[async_trait::async_trait]
+impl DeleteMailboxHandler for ProcessorDeleteHandler {
+    async fn handle_delete_request(
+        &self,
+        from: viaticum_core::types::IdentityPub,
+        payload: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        use viaticum_core::mailbox::DeleteRequestPayload;
+        use viaticum_core::types::from_cbor_bytes;
+
+        let request = match from_cbor_bytes::<DeleteRequestPayload>(&payload) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    owner = %from,
+                    err = %e,
+                    "processor: failed to decode DeleteRequestPayload from mailbox"
+                );
+                return Ok(());
+            }
+        };
+
+        match request {
+            DeleteRequestPayload::Delete(delete) => {
+                apply_delete(&self.db, from, delete);
+            }
+            DeleteRequestPayload::CancelDelete(cancel) => {
+                apply_cancel_delete(&self.db, from, cancel);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Core Delete logic: freshness check → sig verify → Active→MarkedForDelete.
+///
+/// Extracted from `Processor::handle_delete` for reuse by the mailbox path.
+/// Both relay and mailbox paths call this so logic is never duplicated.
+pub(crate) fn apply_delete(
+    db: &Db,
+    from: viaticum_core::types::IdentityPub,
+    delete: viaticum_core::messages::DeleteMsg,
+) {
+    use viaticum_core::constants::MESSAGE_FRESHNESS_SECS;
+    use viaticum_core::types::{HoldingStatus, Timestamp};
+
+    let block_id = delete.source_block_id;
+
+    let now = Timestamp::now();
+    let age = now.0.saturating_sub(delete.timestamp.0);
+    if age > MESSAGE_FRESHNESS_SECS {
+        warn!(
+            block_id = %block_id,
+            owner = %from,
+            age_secs = age,
+            "processor: Delete rejected — timestamp too old (possible replay)"
+        );
+        return;
+    }
+
+    if let Err(e) = viaticum_core::messages::verify_delete_msg(&delete, &from) {
+        warn!(
+            block_id = %block_id,
+            owner = %from,
+            err = %e,
+            "processor: Delete signature verification failed"
+        );
+        return;
+    }
+
+    match db.get_holding(&block_id, &from) {
+        Ok(Some(mut holding)) => {
+            if holding.status == HoldingStatus::Active {
+                holding.status = HoldingStatus::MarkedForDelete;
+                holding.delete_requested_at = Some(Timestamp::now());
+                if let Err(e) = db.upsert_holding(&holding) {
+                    error!(
+                        block_id = %block_id,
+                        owner = %from,
+                        err = %e,
+                        "processor: failed to mark holding for deletion"
+                    );
+                } else {
+                    info!(
+                        block_id = %block_id,
+                        owner = %from,
+                        "processor: holding marked for deletion (via mailbox)"
+                    );
+                }
+            } else {
+                debug!(
+                    block_id = %block_id,
+                    owner = %from,
+                    status = ?holding.status,
+                    "processor: Delete ignored — holding not Active"
+                );
+            }
+        }
+        Ok(None) => {
+            debug!(
+                block_id = %block_id,
+                owner = %from,
+                "processor: Delete ignored — no holding for this block"
+            );
+        }
+        Err(e) => {
+            error!(
+                block_id = %block_id,
+                owner = %from,
+                err = %e,
+                "processor: db error looking up holding for Delete"
+            );
+        }
+    }
+}
+
+/// Core CancelDelete logic: freshness check → sig verify → MarkedForDelete→Active.
+///
+/// Extracted from `Processor::handle_cancel_delete` for reuse by the mailbox path.
+pub(crate) fn apply_cancel_delete(
+    db: &Db,
+    from: viaticum_core::types::IdentityPub,
+    cancel: viaticum_core::messages::CancelDeleteMsg,
+) {
+    use viaticum_core::constants::MESSAGE_FRESHNESS_SECS;
+    use viaticum_core::types::{HoldingStatus, Timestamp};
+
+    let block_id = cancel.source_block_id;
+
+    let now = Timestamp::now();
+    let age = now.0.saturating_sub(cancel.timestamp.0);
+    if age > MESSAGE_FRESHNESS_SECS {
+        warn!(
+            block_id = %block_id,
+            owner = %from,
+            age_secs = age,
+            "processor: CancelDelete rejected — timestamp too old (possible replay)"
+        );
+        return;
+    }
+
+    if let Err(e) = viaticum_core::messages::verify_cancel_delete_msg(&cancel, &from) {
+        warn!(
+            block_id = %block_id,
+            owner = %from,
+            err = %e,
+            "processor: CancelDelete signature verification failed"
+        );
+        return;
+    }
+
+    match db.get_holding(&block_id, &from) {
+        Ok(Some(mut holding)) => {
+            if holding.status == HoldingStatus::MarkedForDelete {
+                holding.status = HoldingStatus::Active;
+                holding.delete_requested_at = None;
+                if let Err(e) = db.upsert_holding(&holding) {
+                    error!(
+                        block_id = %block_id,
+                        owner = %from,
+                        err = %e,
+                        "processor: failed to revert holding to Active on CancelDelete"
+                    );
+                } else {
+                    info!(
+                        block_id = %block_id,
+                        owner = %from,
+                        "processor: cancel delete — holding reverted to Active (via mailbox)"
+                    );
+                }
+            } else {
+                debug!(
+                    block_id = %block_id,
+                    owner = %from,
+                    status = ?holding.status,
+                    "processor: CancelDelete ignored — holding not MarkedForDelete"
+                );
+            }
+        }
+        Ok(None) => {
+            debug!(
+                block_id = %block_id,
+                owner = %from,
+                "processor: CancelDelete ignored — no holding for this block"
+            );
+        }
+        Err(e) => {
+            error!(
+                block_id = %block_id,
+                owner = %from,
+                err = %e,
+                "processor: db error looking up holding for CancelDelete"
+            );
+        }
+    }
+}
+
 impl Processor {
     /// Store received symbols on disk and record a HoldingRecord in the DB.
     ///
@@ -884,130 +1118,28 @@ impl Processor {
 
     /// Handle a Delete request from the owner. Verify signature, then mark
     /// the holding as MarkedForDelete so the cleanup task can process it later.
+    ///
+    /// Delegates to `apply_delete` (shared with mailbox path) so logic is never duplicated.
+    /// The relay dispatch arm calls this; the mailbox path calls `apply_delete` directly
+    /// via `ProcessorDeleteHandler`.
     pub(crate) async fn handle_delete(
         &self,
         from: IdentityPub,
         delete: DeleteMsg,
     ) -> Result<(), ProcessorError> {
-        let block_id = delete.source_block_id;
-
-        // Reject stale/replayed messages. Use MESSAGE_FRESHNESS_SECS (1h) — wider
-        // than handshake window — because Delete is operational, msg_id dedup +
-        // signature already prevent replay attacks even with looser timestamp gate.
-        let now = Timestamp::now();
-        let age = now.0.saturating_sub(delete.timestamp.0);
-        if age > MESSAGE_FRESHNESS_SECS {
-            warn!(
-                block_id = %block_id,
-                owner = %from,
-                age_secs = age,
-                "processor: Delete rejected — timestamp too old (possible replay)"
-            );
-            return Ok(());
-        }
-
-        // Verify signature against the sender's identity (the owner).
-        if let Err(e) = viaticum_core::messages::verify_delete_msg(&delete, &from) {
-            warn!(
-                block_id = %block_id,
-                owner = %from,
-                err = %e,
-                "processor: Delete signature verification failed"
-            );
-            return Ok(());
-        }
-
-        // Look up the holding — only Active holdings can be marked for deletion.
-        match self.db.get_holding(&block_id, &from)? {
-            Some(mut holding) => {
-                if holding.status == HoldingStatus::Active {
-                    holding.status = HoldingStatus::MarkedForDelete;
-                    holding.delete_requested_at = Some(Timestamp::now());
-                    self.db.upsert_holding(&holding)?;
-                    info!(
-                        block_id = %block_id,
-                        owner = %from,
-                        "processor: holding marked for deletion"
-                    );
-                } else {
-                    debug!(
-                        block_id = %block_id,
-                        owner = %from,
-                        status = ?holding.status,
-                        "processor: Delete ignored — holding not Active"
-                    );
-                }
-            }
-            None => {
-                debug!(
-                    block_id = %block_id,
-                    owner = %from,
-                    "processor: Delete ignored — no holding for this block"
-                );
-            }
-        }
+        apply_delete(&self.db, from, delete);
         Ok(())
     }
 
     /// Handle a CancelDelete from the owner. Revert MarkedForDelete → Active.
+    ///
+    /// Delegates to `apply_cancel_delete` (shared with mailbox path).
     pub(crate) async fn handle_cancel_delete(
         &self,
         from: IdentityPub,
         cancel: CancelDeleteMsg,
     ) -> Result<(), ProcessorError> {
-        let block_id = cancel.source_block_id;
-
-        // Reject stale/replayed messages. Use MESSAGE_FRESHNESS_SECS (operational).
-        let now = Timestamp::now();
-        let age = now.0.saturating_sub(cancel.timestamp.0);
-        if age > MESSAGE_FRESHNESS_SECS {
-            warn!(
-                block_id = %block_id,
-                owner = %from,
-                age_secs = age,
-                "processor: CancelDelete rejected — timestamp too old (possible replay)"
-            );
-            return Ok(());
-        }
-
-        if let Err(e) = viaticum_core::messages::verify_cancel_delete_msg(&cancel, &from) {
-            warn!(
-                block_id = %block_id,
-                owner = %from,
-                err = %e,
-                "processor: CancelDelete signature verification failed"
-            );
-            return Ok(());
-        }
-
-        match self.db.get_holding(&block_id, &from)? {
-            Some(mut holding) => {
-                if holding.status == HoldingStatus::MarkedForDelete {
-                    holding.status = HoldingStatus::Active;
-                    holding.delete_requested_at = None;
-                    self.db.upsert_holding(&holding)?;
-                    info!(
-                        block_id = %block_id,
-                        owner = %from,
-                        "processor: cancel delete — holding reverted to Active"
-                    );
-                } else {
-                    debug!(
-                        block_id = %block_id,
-                        owner = %from,
-                        status = ?holding.status,
-                        "processor: CancelDelete ignored — holding not MarkedForDelete"
-                    );
-                }
-            }
-            None => {
-                debug!(
-                    block_id = %block_id,
-                    owner = %from,
-                    "processor: CancelDelete ignored — no holding for this block"
-                );
-            }
-        }
+        apply_cancel_delete(&self.db, from, cancel);
         Ok(())
     }
 }

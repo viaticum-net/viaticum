@@ -68,6 +68,8 @@ mod symbol;
 pub use pos::{PosResponder, ProcessorPosHandler};
 // Re-export for handle/mod.rs wiring (T-7: mailbox poll → SymbolDropHandler bridge).
 pub use symbol::{ProcessorDropHandler, SymbolDropHandler};
+// Re-export for handle/mod.rs wiring (T-13b-1: mailbox poll → Delete/CancelDelete bridge).
+pub use symbol::{DeleteMailboxHandler, ProcessorDeleteHandler};
 
 #[cfg(test)]
 mod tests;

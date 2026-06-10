@@ -592,9 +592,13 @@ async fn time_scale_divides_intervals() {
 // ─── process_deletion_tick tests ──────────────────────────────────────────────
 
 /// When a file has all devices deleted and owner cooldown has elapsed,
-/// process_deletion_tick sends DeleteMsg via board and marks placement Deleting.
+/// process_deletion_tick publishes DeleteMsg via mailbox (T-13b-1) — NOT relay —
+/// and marks placement Deleting.
+///
+/// Acceptance: delete_published_via_mailbox_not_relay
 #[tokio::test]
 async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
+    use viaticum_core::mailbox::{DeleteRequestPayload, MailboxClass};
     use viaticum_core::types::{
         DeviceId, FileRecord, FileVersion, LocalState, SourceBlockRecord, SourceBlockStatus,
         SourceBlockType,
@@ -602,7 +606,10 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
 
     let db = Db::open_in_memory().unwrap();
     let block_id = make_block_id(0xD1);
-    let holder_id = make_identity(0xD2);
+    // Use a real Ed25519 key so device_id_to_peer_id succeeds and mailbox publish
+    // actually tries candidates (same pattern as scheduler_issues_challenge_via_mailbox_not_relay).
+    let holder_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xA2u8; 32]);
+    let holder_id = DeviceId(holder_signing_key.verifying_key().to_bytes());
     let device_id = DeviceId([0x01; 32]);
 
     // File: all devices deleted, deleted_at = 0 (very old).
@@ -647,26 +654,18 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
     db.upsert_placement(&placement).unwrap();
 
     // Peer record (needed for trust lookup in due_challenges, also for deletion signing).
-    let peer = viaticum_core::types::PeerRecord {
-        device_id: holder_id,
-        master_identity: viaticum_core::types::IdentityPub(holder_id.0),
-        trust_p: 0.5,
-        trust_i: 0.0,
-        trust_s: 1.0,
-        bytes_we_store_for_peer: 0,
-        bytes_peer_stores_for_us: 0,
-        first_seen: Timestamp(0),
-        last_seen: Timestamp(0),
-        revoked_device_pub_keys: vec![],
-        addrs: vec![],
-        x25519_pub: None,
-        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
-        last_avail_sample: 0,
-    };
+    let peer = make_peer_record(holder_id);
     db.upsert_peer(&peer).unwrap();
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
     let (relay_post_tx, mut relay_post_rx) = mpsc::channel::<RelayPost>(16);
+    // T-13b-1: use RecordingMailboxSender to capture mailbox publishes.
+    let recording_sender = Arc::new(RecordingMailboxSender::new());
+    let router = Arc::new(MailboxRouter::with_sender(
+        Arc::clone(&recording_sender) as Arc<dyn MailboxNetworkSender>,
+        db.clone(),
+    ));
+
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let pending = make_pending_challenges();
     let config = SchedulerConfig {
@@ -682,7 +681,7 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
         repair_tx,
         pending,
         relay_post_tx,
-        make_test_router(&db),
+        router,
         dummy_master_pub(),
         signing_key,
         std::path::PathBuf::from("/tmp/test_source_blocks"),
@@ -697,15 +696,44 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
     // any now > OWNER_DELETE_COOLDOWN_SECS will trigger.
     scheduler.process_deletion_tick().await.unwrap();
 
-    // Should have posted a "delete" message via relay.
-    let post = relay_post_rx
-        .try_recv()
-        .expect("expected a delete RelayPost");
-    assert_eq!(post.msg_type, "delete");
-    // process_deletion_tick falls back to IdentityPub(holder_id.0) when no master mapping.
+    // T-13b-1 acceptance: Must NOT have posted to relay board.
+    assert!(
+        relay_post_rx.try_recv().is_err(),
+        "delete_published_via_mailbox_not_relay: relay board must NOT receive a delete post"
+    );
+
+    // T-13b-1 acceptance: Must have published via mailbox with class = DeleteRequest.
+    let captured = recording_sender.captured_requests();
+    assert!(
+        !captured.is_empty(),
+        "delete_published_via_mailbox_not_relay: expected ≥1 MailboxStoreRequest to be captured"
+    );
+    let delete_req = captured
+        .iter()
+        .find(|r| r.entry.class == MailboxClass::DeleteRequest)
+        .expect("expected a DeleteRequest-class mailbox entry");
+
+    // Target = holder master (falls back to IdentityPub(holder_id.0) when no master mapping).
     assert_eq!(
-        post.target,
-        Some(viaticum_core::types::IdentityPub(holder_id.0))
+        delete_req.entry.target,
+        viaticum_core::types::IdentityPub(holder_id.0),
+        "delete_published_via_mailbox_not_relay: entry target must be holder master"
+    );
+
+    // Sender = owner master (my_master_pub passed to scheduler).
+    assert_eq!(
+        delete_req.entry.sender,
+        Some(dummy_master_pub()),
+        "delete_published_via_mailbox_not_relay: entry sender must be owner master"
+    );
+
+    // Payload must decode as DeleteRequestPayload::Delete.
+    let payload: DeleteRequestPayload =
+        viaticum_core::types::from_cbor_bytes(&delete_req.entry.payload)
+            .expect("payload must be valid DeleteRequestPayload CBOR");
+    assert!(
+        matches!(payload, DeleteRequestPayload::Delete(_)),
+        "delete_published_via_mailbox_not_relay: payload kind must be Delete, got {payload:?}"
     );
 
     // Placement should be Deleting.
@@ -1010,12 +1038,13 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
         std::env::temp_dir(),
     );
 
-    // First tick: should send the drop notice.
+    // First tick: should publish a DeleteRequest via mailbox.
     scheduler.process_deletion_tick().await.unwrap();
-    let first_post = relay_post_rx
-        .try_recv()
-        .expect("first tick must send a delete msg");
-    assert_eq!(first_post.msg_type, "delete");
+    // No relay post should occur (T-13b-1: migrated to mailbox).
+    assert!(
+        relay_post_rx.try_recv().is_err(),
+        "first tick: relay board must NOT receive a delete post (migrated to mailbox)"
+    );
 
     // drop_notice_sent_at must now be set.
     let updated_sb = db.get_source_block(&block_id).unwrap().unwrap();
@@ -1024,7 +1053,7 @@ async fn drop_notice_sent_only_once_when_tick_called_twice() {
         "drop_notice_sent_at must be set after first tick"
     );
 
-    // Second tick: must NOT send another message.
+    // Second tick: must NOT send another message (dedup via drop_notice_sent_at).
     scheduler.process_deletion_tick().await.unwrap();
     assert!(
         relay_post_rx.try_recv().is_err(),

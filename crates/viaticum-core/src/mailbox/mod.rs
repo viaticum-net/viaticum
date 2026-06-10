@@ -21,6 +21,13 @@ pub mod class_config {
     pub const DROP_NOTICE_TTL: Duration = Duration::from_secs(14 * 24 * 3600);
     pub const SELF_POINTER_TTL: Duration = Duration::from_secs(5 * 365 * 24 * 3600);
     pub const UNKNOWN_SENDER_TTL: Duration = Duration::from_secs(90 * 24 * 3600);
+    /// Delete/CancelDelete request TTL = 14 days.
+    ///
+    /// Deletion is not time-critical (owner has already started its cooldown clock)
+    /// but the holder must see it before the holder-side cooldown window closes.
+    /// 14 days matches DROP_NOTICE_TTL; both are bounded by the same deletion
+    /// cooldown clocks (OWNER_DELETE_COOLDOWN_SECS + HOLDER_DELETE_COOLDOWN_SECS).
+    pub const DELETE_REQUEST_TTL: Duration = Duration::from_secs(14 * 24 * 3600);
     /// Hard cap per entry: 256 KB.
     pub const MAX_ENTRY_BYTES: usize = 256 * 1024;
     /// Global mailbox quota per target: 100 MB.
@@ -45,6 +52,11 @@ pub enum MailboxClass {
     DropNotice = 3,
     /// Generic directed message (future use). TTL = unknown_sender_ttl.
     Generic = 4,
+    /// Delete or CancelDelete request: owner→holder. TTL = 14 days.
+    ///
+    /// Payload is CBOR-encoded `DeleteRequestPayload` (tagged union distinguishing
+    /// Delete from CancelDelete). Not high-trust: membership-evictable.
+    DeleteRequest = 5,
 }
 
 impl MailboxClass {
@@ -56,6 +68,7 @@ impl MailboxClass {
             MailboxClass::PosResponse => 7 * 24 * 3600,
             MailboxClass::DropNotice => 14 * 24 * 3600,
             MailboxClass::Generic => 90 * 24 * 3600,
+            MailboxClass::DeleteRequest => 14 * 24 * 3600,
         }
     }
 
@@ -78,9 +91,28 @@ impl MailboxClass {
             2 => Some(MailboxClass::PosResponse),
             3 => Some(MailboxClass::DropNotice),
             4 => Some(MailboxClass::Generic),
+            5 => Some(MailboxClass::DeleteRequest),
             _ => None,
         }
     }
+}
+
+// ============================================================
+// DeleteRequestPayload: tagged union for DeleteMsg / CancelDeleteMsg
+// ============================================================
+
+/// Tagged payload for `MailboxClass::DeleteRequest` entries.
+///
+/// Distinguishes `Delete` (owner instructs holder to delete) from `CancelDelete`
+/// (owner rescinds a previously sent delete). Both are signed by the owner master key
+/// and self-authenticating (see `verify_delete_msg` / `verify_cancel_delete_msg`).
+///
+/// Encoding: CBOR. `payload_version = 1`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DeleteRequestPayload {
+    Delete(crate::messages::DeleteMsg),
+    CancelDelete(crate::messages::CancelDeleteMsg),
 }
 
 // ============================================================

@@ -22,7 +22,7 @@ use viaticum_core::constants::{
 };
 use viaticum_core::db::Db;
 use viaticum_core::deletion::{DeletionAction, DeletionEngine};
-use viaticum_core::mailbox::{MailboxClass, MailboxEntry};
+use viaticum_core::mailbox::{DeleteRequestPayload, MailboxClass, MailboxEntry};
 use viaticum_core::messages::{PosHashResponseMsg, to_cbor};
 use viaticum_core::pos::{VerifyOutcome, apply_pos_outcome, due_challenges, outcome_from_verify};
 use viaticum_core::trust::{compute_combined, compute_effective_trust, recalculate_trust};
@@ -91,7 +91,8 @@ pub struct Scheduler {
     /// Shared with Processor for response matching.
     pending: PendingChallenges,
     /// Channel to post messages to the relay board.
-    /// Still used for delete/drop-notice relay messages (T-13 removes it).
+    /// Kept for T-13b-3 (full relay board removal) — inert after T-13b-1 migrated Delete.
+    #[allow(dead_code)]
     relay_post_tx: mpsc::Sender<RelayPost>,
     /// Mailbox router for publishing PoS challenges via the mailbox bus (T-6).
     /// Replaces the relay path for PosHashChallengeMsg.
@@ -980,31 +981,54 @@ impl Scheduler {
                         continue;
                     }
 
-                    // Build signed DeleteMsg, post to board, mark placement Deleting.
+                    // Build signed DeleteMsg and publish via mailbox bus (T-13b-1).
                     let delete_msg = viaticum_core::messages::build_delete_msg(
                         source_block_id,
                         now,
                         &self.signing_key,
                     );
-                    // Relay board uses master IdentityPub as target.
                     let holder_master = self
                         .db
                         .get_master_for_device(&holder_id)
                         .ok()
                         .flatten()
                         .unwrap_or(IdentityPub(holder_id.0));
-                    if let Ok(payload) = viaticum_core::messages::to_cbor(&delete_msg) {
+                    let delete_payload = DeleteRequestPayload::Delete(delete_msg);
+                    if let Ok(payload_bytes) = to_cbor(&delete_payload) {
                         let mut msg_id = [0u8; 16];
                         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
-                        let _ = self
-                            .relay_post_tx
-                            .send(RelayPost {
-                                msg_type: "delete".to_string(),
-                                target: Some(holder_master),
-                                payload,
-                                msg_id,
-                            })
-                            .await;
+                        let ttl_secs =
+                            viaticum_core::mailbox::class_config::DELETE_REQUEST_TTL.as_secs();
+                        let entry = MailboxEntry {
+                            target: holder_master,
+                            msg_id,
+                            class: MailboxClass::DeleteRequest,
+                            payload_version: 1,
+                            payload: payload_bytes,
+                            expires_at: now.0 + ttl_secs,
+                            stored_at: now.0,
+                            // sender = owner master so holder knows who owns the block
+                            sender: Some(self.my_master_pub),
+                        };
+                        match self.mailbox_router.publish(&holder_master, entry).await {
+                            Ok(0) => warn!(
+                                block_id = %source_block_id,
+                                holder = %holder_master,
+                                "scheduler: DeleteMsg publish got 0 acks — will retry on next tick"
+                            ),
+                            Ok(ack_count) => debug!(
+                                block_id = %source_block_id,
+                                holder = %holder_master,
+                                ack_count,
+                                "scheduler: DeleteMsg published via mailbox"
+                            ),
+                            Err(e) => warn!(
+                                block_id = %source_block_id,
+                                holder = %holder_master,
+                                err = %e,
+                                "scheduler: DeleteMsg mailbox publish failed"
+                            ),
+                        }
                     }
 
                     // Mark placement + source block Deleting, record drop_notice_sent_at atomically.
@@ -1050,7 +1074,7 @@ impl Scheduler {
                     info!(
                         block_id = %source_block_id,
                         holder_id = %holder_id,
-                        "scheduler: sent DeleteMsg via board, placement → Deleting"
+                        "scheduler: sent DeleteMsg via mailbox, placement → Deleting"
                     );
                 }
                 DeletionAction::CleanupPlacement {

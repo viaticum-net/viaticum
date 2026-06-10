@@ -1,4 +1,4 @@
-// T-6/T-7: Mailbox poll loop — periodic mailbox polling and entry dispatch.
+// T-6/T-7/T-13b-1: Mailbox poll loop — periodic mailbox polling and entry dispatch.
 //
 // Polls this node's mailbox from read-fanout candidates every MAILBOX_POLL_INTERVAL_SECS.
 // Also polls immediately on startup (per spec §2.17: "poll on startup after Kademlia stabilize";
@@ -11,6 +11,7 @@
 //   SelfPointer    → if entry.target == my_master_pub: verify + update in-memory (W-2, no DB store)
 //                    if entry.target != my_master_pub:  store in mailbox DB (we are postman)
 //   DropNotice     → DropNoticeHandler::handle_drop_notice (T-7: decode batch, apply each notice)
+//   DeleteRequest  → DeleteMailboxHandler::handle_delete_request (T-13b-1: Delete/CancelDelete)
 //   Generic/other  → ignore
 
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,7 @@ use viaticum_core::types::IdentityPub;
 use viaticum_core::types::from_cbor_bytes;
 
 use super::routing::MailboxRouter;
+use crate::daemon::processor::DeleteMailboxHandler;
 
 /// Run the periodic mailbox poll loop.
 ///
@@ -43,6 +45,7 @@ use super::routing::MailboxRouter;
 /// - `challenge_handler`: called with (owner_master, challenge_payload_bytes) to process a
 ///   PosChallenge and return an optional PosHashResponseMsg + owner_master for publishing
 /// - `drop_handler`: called for each DropNotice decoded from a SymbolDropNoticeBatchMsg entry
+/// - `delete_handler`: called for each DeleteRequest entry (T-13b-1)
 /// - `my_master_pub`: this node's master identity (used to detect own SelfPointers)
 /// - `current_pointer`: shared handle with run_periodic_push. On receiving our own verified
 ///   SelfPointer, update this handle (W-2: restart-recovery — re-learn latest published pointer).
@@ -54,6 +57,7 @@ pub async fn run_mailbox_poll(
     pos_response_tx: mpsc::Sender<PosHashResponseMsg>,
     challenge_handler: Arc<dyn PosMailboxChallengeHandler>,
     drop_handler: Arc<dyn DropNoticeHandler>,
+    delete_handler: Arc<dyn DeleteMailboxHandler>,
     my_master_pub: IdentityPub,
     current_pointer: Arc<Mutex<Option<SelfPointer>>>,
     cancel: CancellationToken,
@@ -98,6 +102,7 @@ pub async fn run_mailbox_poll(
                         &pos_response_tx,
                         &challenge_handler,
                         &drop_handler,
+                        &delete_handler,
                         &my_master_pub,
                         &current_pointer,
                         entry,
@@ -118,6 +123,7 @@ pub(crate) async fn dispatch_entry(
     pos_response_tx: &mpsc::Sender<PosHashResponseMsg>,
     challenge_handler: &Arc<dyn PosMailboxChallengeHandler>,
     drop_handler: &Arc<dyn DropNoticeHandler>,
+    delete_handler: &Arc<dyn DeleteMailboxHandler>,
     my_master_pub: &IdentityPub,
     current_pointer: &Arc<Mutex<Option<SelfPointer>>>,
     entry: MailboxEntry,
@@ -138,6 +144,9 @@ pub(crate) async fn dispatch_entry(
         }
         MailboxClass::Generic => {
             debug!(msg_id = ?entry.msg_id, "mailbox_poll: ignoring Generic entry");
+        }
+        MailboxClass::DeleteRequest => {
+            dispatch_delete_request(delete_handler, entry).await;
         }
     }
 }
@@ -391,6 +400,39 @@ pub(crate) fn dispatch_drop_notice(drop_handler: &Arc<dyn DropNoticeHandler>, en
                 "mailbox_poll: failed to decode SymbolDropNoticeBatchMsg — dropping entry"
             );
         }
+    }
+}
+
+/// Handle a DeleteRequest entry (T-13b-1).
+///
+/// Requires `entry.sender` to identify the owner (whose key is verified against the
+/// payload sig). Warns and returns if absent — cannot authenticate without it.
+pub(crate) async fn dispatch_delete_request(
+    delete_handler: &Arc<dyn DeleteMailboxHandler>,
+    entry: MailboxEntry,
+) {
+    let owner_master = match entry.sender {
+        Some(s) => s,
+        None => {
+            warn!(
+                msg_id = ?entry.msg_id,
+                target = %entry.target,
+                "mailbox_poll: DeleteRequest has no sender — cannot authenticate, dropping"
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = delete_handler
+        .handle_delete_request(owner_master, entry.payload)
+        .await
+    {
+        error!(
+            msg_id = ?entry.msg_id,
+            owner = %owner_master,
+            err = %e,
+            "mailbox_poll: DeleteRequest handler error"
+        );
     }
 }
 

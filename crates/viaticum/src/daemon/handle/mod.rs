@@ -1137,18 +1137,19 @@ impl DaemonHandle {
             std::sync::Mutex<Option<viaticum_core::system_state::SelfPointer>>,
         > = std::sync::Arc::new(std::sync::Mutex::new(None));
 
-        // ── T-6/T-7: Mailbox poll task ───────────────────────────────────────
+        // ── T-6/T-7/T-13b-1: Mailbox poll task ─────────────────────────────
         // Polls this node's mailbox every MAILBOX_POLL_INTERVAL_SECS.
         // Started alongside other periodic tasks (T-9 will add explicit Kademlia stabilize wait).
         //
-        // T-6: PosResponder handles PosChallenge entries from mailbox (db/holdings_dir/master_key).
-        // T-7: ProcessorDropHandler handles DropNotice batch entries (db only).
-        // T-8: current_pointer shared handle passed in for W-2 dispatch (restart-recovery).
-        // No Arc<Processor> wrap needed: both handlers are standalone structs built from clones.
+        // T-6:     PosResponder handles PosChallenge entries from mailbox.
+        // T-7:     ProcessorDropHandler handles DropNotice batch entries (db only).
+        // T-8:     current_pointer shared handle passed in for W-2 dispatch (restart-recovery).
+        // T-13b-1: ProcessorDeleteHandler handles DeleteRequest entries (Delete/CancelDelete).
+        // No Arc<Processor> wrap needed: all handlers are standalone structs built from clones.
         {
             use crate::daemon::mailbox::poll::run_mailbox_poll;
             use crate::daemon::processor::{
-                PosResponder, ProcessorDropHandler, ProcessorPosHandler,
+                PosResponder, ProcessorDeleteHandler, ProcessorDropHandler, ProcessorPosHandler,
             };
 
             let pos_handler = ProcessorPosHandler::new(PosResponder::new(
@@ -1160,6 +1161,10 @@ impl DaemonHandle {
             // T-13a: pass repair_tx so ProcessorDropHandler can trigger RepairNow
             // for immediate-drop DropNotice entries (deadline ≈ now).
             let drop_handler = ProcessorDropHandler::new(db.clone(), repair_tx.clone());
+
+            // T-13b-1: ProcessorDeleteHandler handles Delete/CancelDelete via mailbox.
+            // Only requires db — same as SymbolDropHandler.
+            let delete_handler = ProcessorDeleteHandler::new(db.clone());
 
             let poll_db = db.clone();
             let poll_router = std::sync::Arc::clone(&mailbox_router);
@@ -1174,6 +1179,7 @@ impl DaemonHandle {
                     poll_pos_tx,
                     std::sync::Arc::new(pos_handler),
                     std::sync::Arc::new(drop_handler),
+                    std::sync::Arc::new(delete_handler),
                     poll_identity,
                     poll_current_pointer,
                     poll_cancel,

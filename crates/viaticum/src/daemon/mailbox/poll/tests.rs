@@ -12,10 +12,13 @@ use viaticum_core::messages::{
     PosHashResponseMsg, SymbolDropNoticeBatchMsg, build_signed_symbol_drop_notice, to_cbor,
 };
 use viaticum_core::types::{
-    DeviceId, IdentityPub, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
+    DeviceId, HoldingRecord, HoldingStatus, IdentityPub, PlacementStatus, SourceBlockId,
+    SymbolPlacement, Timestamp,
 };
 
-use crate::daemon::processor::ProcessorDropHandler;
+use crate::daemon::processor::{
+    DeleteMailboxHandler, ProcessorDeleteHandler, ProcessorDropHandler,
+};
 use crate::daemon::repair::RepairTrigger;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
@@ -656,4 +659,222 @@ async fn drop_notice_forged_signature_is_rejected() {
         repair_rx.try_recv().is_err(),
         "no RepairNow should be triggered for a forged DropNotice"
     );
+}
+
+// ─── T-13b-1: DeleteRequest dispatch tests ───────────────────────────────────
+
+/// Helper: build a holding in the DB with the given status.
+fn make_holding(db: &Db, block_id: SourceBlockId, owner: IdentityPub, status: HoldingStatus) {
+    let holding = HoldingRecord {
+        source_block_id: block_id,
+        owner_id: owner,
+        esi_ranges: vec![(0, 5)],
+        importance: 0.5,
+        total_bytes: 512,
+        status,
+        received_at: Timestamp::now(),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&holding).expect("upsert holding");
+}
+
+/// Helper: build a DeleteRequest entry carrying a signed DeleteMsg.
+fn make_delete_entry(
+    target: IdentityPub,
+    owner: IdentityPub,
+    owner_key: &ed25519_dalek::SigningKey,
+    block_id: SourceBlockId,
+) -> MailboxEntry {
+    use viaticum_core::mailbox::DeleteRequestPayload;
+    let delete_msg =
+        viaticum_core::messages::build_delete_msg(block_id, Timestamp::now(), owner_key);
+    let payload_obj = DeleteRequestPayload::Delete(delete_msg);
+    let payload = to_cbor(&payload_obj).expect("encode");
+    let now = Timestamp::now().0;
+    MailboxEntry {
+        target,
+        msg_id: [0xDAu8; 16],
+        class: MailboxClass::DeleteRequest,
+        payload_version: 1,
+        payload,
+        expires_at: now + 86400 * 14,
+        stored_at: now,
+        sender: Some(owner),
+    }
+}
+
+/// delete_request_dispatch_marks_holding_for_delete:
+/// Poll dispatch of a signed DeleteMsg entry → holding goes Active→MarkedForDelete (real DB).
+#[tokio::test]
+async fn delete_request_dispatch_marks_holding_for_delete() {
+    let db = Db::open_in_memory().expect("db");
+    let owner_key = make_signing_key(0x11);
+    let owner_master = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = SourceBlockId([0xAB; 32]);
+
+    // Insert an Active holding for this block+owner.
+    make_holding(&db, block_id, owner_master, HoldingStatus::Active);
+
+    let entry = make_delete_entry(make_identity(0xFF), owner_master, &owner_key, block_id);
+
+    let handler =
+        Arc::new(ProcessorDeleteHandler::new(db.clone())) as Arc<dyn DeleteMailboxHandler>;
+
+    super::dispatch_delete_request(&handler, entry).await;
+
+    let holding = db
+        .get_holding(&block_id, &owner_master)
+        .expect("db ok")
+        .expect("exists");
+    assert_eq!(
+        holding.status,
+        HoldingStatus::MarkedForDelete,
+        "delete_request_dispatch_marks_holding_for_delete: holding must be MarkedForDelete"
+    );
+    assert!(
+        holding.delete_requested_at.is_some(),
+        "delete_request_dispatch_marks_holding_for_delete: delete_requested_at must be set"
+    );
+}
+
+/// delete_request_forged_signature_rejected:
+/// Entry whose DeleteMsg sig doesn't verify against entry.sender → holding NOT marked.
+#[tokio::test]
+async fn delete_request_forged_signature_rejected() {
+    use viaticum_core::mailbox::DeleteRequestPayload;
+    use viaticum_core::types::HoldingStatus;
+
+    let db = Db::open_in_memory().expect("db");
+    let real_owner_key = make_signing_key(0x22);
+    let real_owner = IdentityPub(real_owner_key.verifying_key().to_bytes());
+    let attacker_key = make_signing_key(0x33); // different key — forged sig
+    let block_id = SourceBlockId([0xBC; 32]);
+
+    // Insert an Active holding for the real owner.
+    make_holding(&db, block_id, real_owner, HoldingStatus::Active);
+
+    // Build a DeleteMsg signed by attacker key, but claimed to be from real_owner.
+    let forged_delete =
+        viaticum_core::messages::build_delete_msg(block_id, Timestamp::now(), &attacker_key);
+    let payload_obj = DeleteRequestPayload::Delete(forged_delete);
+    let payload = to_cbor(&payload_obj).expect("encode");
+    let now = Timestamp::now().0;
+    // entry.sender = real_owner, but sig is from attacker_key → mismatch.
+    let entry = MailboxEntry {
+        target: make_identity(0xFF),
+        msg_id: [0xBCu8; 16],
+        class: MailboxClass::DeleteRequest,
+        payload_version: 1,
+        payload,
+        expires_at: now + 86400 * 14,
+        stored_at: now,
+        sender: Some(real_owner),
+    };
+
+    let handler =
+        Arc::new(ProcessorDeleteHandler::new(db.clone())) as Arc<dyn DeleteMailboxHandler>;
+
+    super::dispatch_delete_request(&handler, entry).await;
+
+    let holding = db
+        .get_holding(&block_id, &real_owner)
+        .expect("db ok")
+        .expect("exists");
+    assert_eq!(
+        holding.status,
+        HoldingStatus::Active,
+        "delete_request_forged_signature_rejected: holding must remain Active"
+    );
+}
+
+/// delete_request_stale_timestamp_rejected:
+/// Freshness check still applies — entry older than MESSAGE_FRESHNESS_SECS is dropped.
+#[tokio::test]
+async fn delete_request_stale_timestamp_rejected() {
+    use viaticum_core::constants::MESSAGE_FRESHNESS_SECS;
+    use viaticum_core::mailbox::DeleteRequestPayload;
+    use viaticum_core::types::HoldingStatus;
+
+    let db = Db::open_in_memory().expect("db");
+    let owner_key = make_signing_key(0x44);
+    let owner_master = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = SourceBlockId([0xCD; 32]);
+
+    // Insert an Active holding.
+    make_holding(&db, block_id, owner_master, HoldingStatus::Active);
+
+    // Build a DeleteMsg with a stale timestamp (way in the past).
+    let stale_timestamp = Timestamp(
+        Timestamp::now()
+            .0
+            .saturating_sub(MESSAGE_FRESHNESS_SECS + 3600),
+    );
+    let stale_delete =
+        viaticum_core::messages::build_delete_msg(block_id, stale_timestamp, &owner_key);
+    let payload_obj = DeleteRequestPayload::Delete(stale_delete);
+    let payload = to_cbor(&payload_obj).expect("encode");
+    let now = Timestamp::now().0;
+    let entry = MailboxEntry {
+        target: make_identity(0xFF),
+        msg_id: [0xCDu8; 16],
+        class: MailboxClass::DeleteRequest,
+        payload_version: 1,
+        payload,
+        expires_at: now + 86400 * 14,
+        stored_at: now,
+        sender: Some(owner_master),
+    };
+
+    let handler =
+        Arc::new(ProcessorDeleteHandler::new(db.clone())) as Arc<dyn DeleteMailboxHandler>;
+
+    super::dispatch_delete_request(&handler, entry).await;
+
+    let holding = db
+        .get_holding(&block_id, &owner_master)
+        .expect("db ok")
+        .expect("exists");
+    assert_eq!(
+        holding.status,
+        HoldingStatus::Active,
+        "delete_request_stale_timestamp_rejected: holding must remain Active (stale msg rejected)"
+    );
+}
+
+/// delete_request_no_sender_is_dropped_gracefully:
+/// Entry with no sender field: dispatch must warn and return without panicking.
+#[tokio::test]
+async fn delete_request_no_sender_is_dropped_gracefully() {
+    let db = Db::open_in_memory().expect("db");
+    let owner_key = make_signing_key(0x55);
+    let owner_master = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = SourceBlockId([0xDE; 32]);
+
+    make_holding(&db, block_id, owner_master, HoldingStatus::Active);
+
+    let now = Timestamp::now().0;
+    let entry = MailboxEntry {
+        target: make_identity(0xFF),
+        msg_id: [0xDEu8; 16],
+        class: MailboxClass::DeleteRequest,
+        payload_version: 1,
+        payload: vec![0x01, 0x02], // junk payload — never reached anyway
+        expires_at: now + 86400,
+        stored_at: now,
+        sender: None, // no sender
+    };
+
+    let handler =
+        Arc::new(ProcessorDeleteHandler::new(db.clone())) as Arc<dyn DeleteMailboxHandler>;
+
+    // Should not panic.
+    super::dispatch_delete_request(&handler, entry).await;
+
+    // Holding should remain Active — early-exit path taken.
+    let holding = db
+        .get_holding(&block_id, &owner_master)
+        .expect("db ok")
+        .expect("exists");
+    assert_eq!(holding.status, HoldingStatus::Active);
 }
