@@ -5,7 +5,8 @@ use viaticum_core::constants::{MESSAGE_FRESHNESS_SECS, SYMBOL_OFFER_EXPIRY_SECS,
 use viaticum_core::db::Db;
 use viaticum_core::messages::{
     CancelDeleteMsg, DeleteMsg, RejectReason, SymbolAcceptMsg, SymbolDropNoticeMsg,
-    SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg, SymbolTransferMsg, verify_symbol_offer,
+    SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg, SymbolTransferMsg,
+    verify_symbol_drop_notice, verify_symbol_offer,
 };
 use viaticum_core::types::{
     DeviceId, HoldingRecord, HoldingStatus, IdentityPub, Timestamp, hex_encode,
@@ -32,13 +33,37 @@ impl SymbolDropHandler {
         SymbolDropHandler { db }
     }
 
-    /// Apply a single DropNotice: mark placement Lost, recompute block cached fields.
+    /// Apply a single DropNotice: verify signature, mark placement Lost, recompute cached fields.
+    ///
+    /// Returns `true` if the notice passed verification and the placement was updated (or was
+    /// already Lost/Deleting — idempotent). Returns `false` if the signature failed or the
+    /// holder/block is unknown. Callers (e.g. `ProcessorDropHandler`) gate side-effects like
+    /// `RepairNow` on the return value — prevents repair storms from forged notices.
+    ///
+    /// Security: verifies `notice.sig` against `from` (holder master identity) before acting.
+    /// An attacker controlling a mailbox postman cannot forge a drop for a block they do not hold:
+    /// - A valid sig requires the private key of the holder master.
+    /// - `mark_placement_lost(block, holder_device)` is a no-op when that holder has no placement
+    ///   for this block — so a signed notice can only drop placements the signer actually holds.
     ///
     /// Semantics are identical to `Processor::handle_symbol_drop_notice`.
-    /// Idempotent: if placement is already Lost/Deleting, returns without error.
-    /// On unknown holder or block, logs WARN and returns (not a panic path).
-    pub fn apply(&self, from: IdentityPub, notice: SymbolDropNoticeMsg) {
+    /// Idempotent: if placement is already Lost/Deleting, returns `true` (sig passed, no-op).
+    /// On unknown holder or block, logs WARN and returns `false` (not a panic path).
+    pub fn apply(&self, from: IdentityPub, notice: SymbolDropNoticeMsg) -> bool {
         let block_id = notice.source_block_id;
+
+        // Verify holder signature before marking any placement Lost.
+        // This closes the forge vector that existed in T-13a (unauthenticated notices).
+        if let Err(e) = verify_symbol_drop_notice(&notice, &from) {
+            warn!(
+                block_id = %block_id,
+                holder = %from,
+                err = %e,
+                "processor: DropNotice signature verification failed — ignoring (forge attempt or legacy unsigned notice)"
+            );
+            return false;
+        }
+
         info!(
             block_id = %block_id,
             holder = %from,
@@ -53,7 +78,7 @@ impl SymbolDropHandler {
                 holder = %from,
                 "processor: DropNotice from unknown master — no devices in DB, ignoring"
             );
-            return;
+            return false;
         }
 
         let holder_device_id = devices.iter().find(|did| {
@@ -72,7 +97,7 @@ impl SymbolDropHandler {
                     holder = %from,
                     "processor: DropNotice — no placement found for any device of this master, ignoring"
                 );
-                return;
+                return false;
             }
         };
 
@@ -85,7 +110,7 @@ impl SymbolDropHandler {
                     err = %e,
                     "processor: DropNotice — mark_placement_lost failed"
                 );
-                return;
+                return false;
             }
         };
 
@@ -95,7 +120,9 @@ impl SymbolDropHandler {
                 holder = %holder_device_id,
                 "processor: DropNotice — placement already Lost/Deleting, skipping block update"
             );
-            return;
+            // Sig passed and no-op (idempotent): return true so RepairNow is
+            // still triggered for immediate drops even on re-delivery.
+            return true;
         }
 
         let block = match self.db.get_source_block(&block_id) {
@@ -105,7 +132,8 @@ impl SymbolDropHandler {
                     block_id = %block_id,
                     "processor: DropNotice — source block not found after placement update"
                 );
-                return;
+                // Placement was updated successfully; return true so RepairNow is still triggered.
+                return true;
             }
             Err(e) => {
                 error!(
@@ -113,7 +141,7 @@ impl SymbolDropHandler {
                     err = %e,
                     "processor: DropNotice — get_source_block failed"
                 );
-                return;
+                return true;
             }
         };
 
@@ -125,7 +153,7 @@ impl SymbolDropHandler {
                     err = %e,
                     "processor: DropNotice — list_placements_for_block failed"
                 );
-                return;
+                return true;
             }
         };
 
@@ -199,7 +227,7 @@ impl SymbolDropHandler {
                 err = %e,
                 "processor: DropNotice — update_block_cached_fields failed"
             );
-            return;
+            return true;
         }
 
         info!(
@@ -217,6 +245,8 @@ impl SymbolDropHandler {
                 "processor: DropNotice — failed to refresh storage balance"
             );
         }
+
+        true
     }
 }
 
@@ -264,8 +294,14 @@ impl crate::daemon::mailbox::poll::DropNoticeHandler for ProcessorDropHandler {
         let block_id = notice.source_block_id;
         let deadline = notice.deadline.0;
 
-        // Apply DropNotice: mark placement Lost, recompute reliability.
-        self.inner.apply(from, notice);
+        // Apply DropNotice: verify sig, mark placement Lost, recompute reliability.
+        // Returns false if sig verification failed or holder/block unknown.
+        // Gate all side-effects (RepairNow) on a successful apply to prevent repair storms
+        // from forged notices that pass `is_immediate` but fail sig verification.
+        let applied = self.inner.apply(from, notice);
+        if !applied {
+            return;
+        }
 
         // T-13a: if this is an immediate drop (deadline ≈ now), trigger RepairNow
         // so that repair happens urgently rather than waiting for the next scheduled scan.
@@ -301,8 +337,11 @@ impl crate::daemon::mailbox::poll::DropNoticeHandler for ProcessorDropHandler {
                     block_id,
                     holder_id: holder_device,
                 };
-                // try_send: non-blocking; if channel is full, the lazy scan
-                // will eventually cover it (same degradation as T-6 pos_response_tx).
+                // W-1: try_send is non-blocking. Under burst eviction the channel (cap 64)
+                // may be full, silently dropping the RepairNow trigger. This is an accepted
+                // trade-off for cold backup: the periodic reliability scan (hourly) is the
+                // backstop. Worst-case repair latency under burst = reliability-scan interval
+                // (≤ 1 hour), which is within the cold-backup time constant of 1 week.
                 if let Err(e) = self.repair_tx.try_send(trigger) {
                     tracing::warn!(
                         block_id = %block_id,

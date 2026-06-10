@@ -359,6 +359,7 @@ fn all_message_variants_frame_roundtrip() {
             esi_ranges: vec![(0, 3)],
             deadline: Timestamp(2000),
             timestamp: ts,
+            sig: [0u8; 64],
         }),
         Message::RestoreRequest(RestoreRequestMsg {
             v: 1,
@@ -746,6 +747,7 @@ fn all_31_message_variants() -> Vec<Message> {
             esi_ranges: vec![(0, 3)],
             deadline: Timestamp(2000),
             timestamp: ts,
+            sig: [0u8; 64],
         }),
         Message::RestoreRequest(RestoreRequestMsg {
             v: 1,
@@ -1264,6 +1266,7 @@ fn symbol_drop_notice_batch_msg_roundtrips_cbor() {
                 esi_ranges: vec![(0, 3), (5, 8)],
                 deadline: Timestamp(ts.0 + 86400 * 14),
                 timestamp: ts,
+                sig: [0u8; 64],
             },
             SymbolDropNoticeMsg {
                 v: 1,
@@ -1271,6 +1274,7 @@ fn symbol_drop_notice_batch_msg_roundtrips_cbor() {
                 esi_ranges: vec![(1, 4)],
                 deadline: Timestamp(ts.0 + 86400 * 14),
                 timestamp: ts,
+                sig: [0u8; 64],
             },
         ],
     };
@@ -1728,4 +1732,111 @@ fn pos_hash_nack_missing_sig_field_deserializes_to_zero() {
         matches!(result, Err(super::MessageError::BadSignature)),
         "zero sig (old format) must fail verify_pos_hash_nack"
     );
+}
+
+// ─── SymbolDropNotice sign / verify ──────────────────────────────────────────
+
+#[test]
+fn symbol_drop_notice_build_and_verify_passes() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let holder = IdentityPub(sk.verifying_key().to_bytes());
+    let block_id = SourceBlockId([0x42u8; 32]);
+    let esi_ranges = vec![(0u32, 5u32), (10u32, 3u32)];
+    let deadline = Timestamp(9_000_000);
+    let ts = Timestamp(8_000_000);
+
+    let msg =
+        super::build_signed_symbol_drop_notice(block_id, esi_ranges.clone(), deadline, ts, &sk);
+
+    assert_eq!(msg.v, 1);
+    assert_eq!(msg.source_block_id, block_id);
+    assert_eq!(msg.esi_ranges, esi_ranges);
+    assert_eq!(msg.deadline, deadline);
+    assert_eq!(msg.timestamp, ts);
+
+    super::verify_symbol_drop_notice(&msg, &holder)
+        .expect("correctly built SymbolDropNotice must verify");
+}
+
+#[test]
+fn symbol_drop_notice_verify_fails_for_wrong_holder() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let other_sk = SigningKey::generate(&mut OsRng);
+    let wrong_holder = IdentityPub(other_sk.verifying_key().to_bytes());
+
+    let msg = super::build_signed_symbol_drop_notice(
+        SourceBlockId([0x11u8; 32]),
+        vec![(0u32, 10u32)],
+        Timestamp(1_000_000),
+        Timestamp(900_000),
+        &sk,
+    );
+
+    assert!(
+        super::verify_symbol_drop_notice(&msg, &wrong_holder).is_err(),
+        "verify must fail when checked against wrong holder identity"
+    );
+}
+
+#[test]
+fn symbol_drop_notice_tampered_block_id_fails_verify() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let holder = IdentityPub(sk.verifying_key().to_bytes());
+
+    let mut msg = super::build_signed_symbol_drop_notice(
+        SourceBlockId([0xAAu8; 32]),
+        vec![(0u32, 5u32)],
+        Timestamp(2_000_000),
+        Timestamp(1_500_000),
+        &sk,
+    );
+    // Tamper with source_block_id after signing.
+    msg.source_block_id = SourceBlockId([0xBBu8; 32]);
+
+    assert!(
+        super::verify_symbol_drop_notice(&msg, &holder).is_err(),
+        "tampered source_block_id must fail verification"
+    );
+}
+
+#[test]
+fn symbol_drop_notice_zero_sig_fails_verify() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let holder = IdentityPub(sk.verifying_key().to_bytes());
+
+    let msg = super::SymbolDropNoticeMsg {
+        v: 1,
+        source_block_id: SourceBlockId([0x33u8; 32]),
+        esi_ranges: vec![(0, 5)],
+        deadline: Timestamp(3_000_000),
+        timestamp: Timestamp(2_900_000),
+        sig: [0u8; 64], // legacy/missing sig defaults to zeroes
+    };
+
+    assert!(
+        super::verify_symbol_drop_notice(&msg, &holder).is_err(),
+        "all-zero sig (unsigned legacy notice) must fail verification"
+    );
+}
+
+#[test]
+fn symbol_drop_notice_cbor_roundtrip_preserves_sig() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let holder = IdentityPub(sk.verifying_key().to_bytes());
+    let block_id = SourceBlockId([0x55u8; 32]);
+
+    let msg = super::build_signed_symbol_drop_notice(
+        block_id,
+        vec![(0u32, 8u32)],
+        Timestamp(5_000_000),
+        Timestamp(4_800_000),
+        &sk,
+    );
+
+    let bytes = to_cbor(&msg).expect("CBOR encode");
+    let decoded: super::SymbolDropNoticeMsg = from_cbor(&bytes).expect("CBOR decode");
+
+    assert_eq!(decoded.sig, msg.sig, "sig must survive CBOR roundtrip");
+    super::verify_symbol_drop_notice(&decoded, &holder)
+        .expect("sig must verify after CBOR roundtrip");
 }

@@ -6,6 +6,10 @@
 //   - T-7: advance DropNotice (before physical delete) via mailbox, batched per owner.
 //   - T-13a: immediate-drop DropNotice (deadline=now) via mailbox (replaces SymbolDropped-via-relay).
 //            relay_post_tx kept in run() signature — T-13b removes relay entirely.
+//
+// Relay-board status: T-13a removed the SymbolDropped relay producers.
+// DeleteMsg + RevocationBroadcast + the legacy PoS relay arm still use the board;
+// their migration/removal is a separate T-13b scope decision.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,7 +23,9 @@ use viaticum_core::cluster::master_identity;
 use viaticum_core::constants::{KI, KP, S_CLAMP_MAX, S_CLAMP_MIN};
 use viaticum_core::db::Db;
 use viaticum_core::mailbox::{MailboxClass, MailboxEntry, class_config};
-use viaticum_core::messages::{SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, to_cbor};
+use viaticum_core::messages::{
+    SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, build_signed_symbol_drop_notice, to_cbor,
+};
 use viaticum_core::types::{IdentityPub, Timestamp, hex_encode};
 
 use crate::daemon::mailbox::routing::MailboxRouter;
@@ -84,7 +90,7 @@ pub async fn run(
                 break;
             }
             _ = cleanup_timer.tick() => {
-                if let Err(e) = cleanup_expired(&db, &holdings_dir, &mailbox_router, holder_master_pub, time_scale).await {
+                if let Err(e) = cleanup_expired(&db, &holdings_dir, &mailbox_router, holder_master_pub, time_scale, &master_signing_key).await {
                     error!("holder_cleanup: cleanup_expired error: {e}");
                 }
             }
@@ -117,6 +123,7 @@ async fn cleanup_expired(
     mailbox_router: &Arc<MailboxRouter>,
     holder_master_pub: IdentityPub,
     time_scale: u64,
+    master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
     let now = Timestamp::now();
     let expired = db.list_holdings_cooldown_expired(now, time_scale)?;
@@ -162,6 +169,7 @@ async fn cleanup_expired(
             holding.owner_id,
             holding.source_block_id,
             &holding.esi_ranges,
+            master_signing_key,
         )
         .await;
 
@@ -200,9 +208,6 @@ async fn cleanup_drop_notices(
     holder_master_pub: IdentityPub,
     master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
-    // master_signing_key not used now (was used for build_symbol_dropped); kept for
-    // potential future use and to avoid a larger signature change in this task.
-    let _ = master_signing_key;
     let now = Timestamp::now();
     let expired = db.list_holdings_drop_notice_expired(now)?;
 
@@ -247,6 +252,7 @@ async fn cleanup_drop_notices(
             holding.owner_id,
             holding.source_block_id,
             &holding.esi_ranges,
+            master_signing_key,
         )
         .await;
 
@@ -291,9 +297,6 @@ async fn check_pressure(
     disk_reserve_bytes: u64,
     master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
-    // master_signing_key not used (was used for build_symbol_dropped); kept for
-    // potential future use and to avoid a larger signature change in this task.
-    let _ = master_signing_key;
     let now = Timestamp::now();
     let holdings = db.list_all_holdings()?;
     let used_bytes: u64 = holdings.iter().map(|h| h.total_bytes).sum();
@@ -385,6 +388,7 @@ async fn check_pressure(
                     target.owner_id,
                     target.source_block_id,
                     &esi_ranges,
+                    master_signing_key,
                 )
                 .await;
             }
@@ -398,6 +402,7 @@ async fn check_pressure(
                 mailbox_router,
                 holder_master_pub,
                 now,
+                master_signing_key,
             )
             .await;
 
@@ -426,7 +431,7 @@ async fn check_pressure(
 /// T-7: Publish advance DropNotice entries via the mailbox bus, batched per owner.
 ///
 /// Groups `DropNoticeTarget` list by `owner_id`. For each owner:
-///   1. Builds `Vec<SymbolDropNoticeMsg>` (reading ESI ranges from DB for each notice).
+///   1. Builds `Vec<SymbolDropNoticeMsg>` signed with holder's master key.
 ///   2. Chunks into `SymbolDropNoticeBatchMsg` entries ≤ `MAX_ENTRY_BYTES` each.
 ///   3. Publishes each chunk via `mailbox_router.publish`.
 ///   4. W-4 (best-effort): if publish returns 0 acks, retries once; logs WARN on second 0.
@@ -440,6 +445,7 @@ async fn publish_drop_notices_via_mailbox(
     mailbox_router: &Arc<MailboxRouter>,
     holder_master_pub: IdentityPub,
     now: Timestamp,
+    master_signing_key: &ed25519_dalek::SigningKey,
 ) {
     if drop_notices.is_empty() {
         return;
@@ -469,13 +475,16 @@ async fn publish_drop_notices_via_mailbox(
             }
         };
 
-        let notice_msg = SymbolDropNoticeMsg {
-            v: 1,
-            source_block_id: notice.source_block_id,
-            esi_ranges: holding.esi_ranges.clone(),
-            deadline: Timestamp(notice.deadline_secs),
-            timestamp: now,
-        };
+        // Sign each notice with the holder's master key.
+        // Security: the owner verifies this signature before marking placements Lost.
+        // An attacker with no private key cannot forge a valid signed DropNotice.
+        let notice_msg = build_signed_symbol_drop_notice(
+            notice.source_block_id,
+            holding.esi_ranges.clone(),
+            Timestamp(notice.deadline_secs),
+            now,
+            master_signing_key,
+        );
         by_owner
             .entry(notice.owner_id)
             .or_default()
@@ -658,26 +667,28 @@ fn chunk_notices_to_fit(notices: &[SymbolDropNoticeMsg]) -> Vec<Vec<SymbolDropNo
 /// The owner's `ProcessorDropHandler` checks deadline ≤ now + epsilon and
 /// triggers `RepairNow` immediately, preserving the former SymbolDropped semantics.
 ///
-/// `relay_post_tx` is kept in scope (T-13b removes relay entirely); this function
-/// no longer sends to it.
+/// Each notice is signed with the holder's `master_signing_key` so the owner
+/// can verify authenticity before marking placements Lost.
 async fn post_symbol_dropped_via_mailbox(
     mailbox_router: &Arc<MailboxRouter>,
     holder_master_pub: IdentityPub,
     owner_id: IdentityPub,
     source_block_id: viaticum_core::types::SourceBlockId,
     esi_ranges: &[(u32, u32)],
+    master_signing_key: &ed25519_dalek::SigningKey,
 ) {
     let now = Timestamp::now();
     let now_secs = now.0;
 
-    // Build a single-notice batch with deadline = now (immediate drop).
-    let notice = SymbolDropNoticeMsg {
-        v: 1,
+    // Build a signed single-notice batch with deadline = now (immediate drop).
+    // Security: owner verifies sig before marking placement Lost.
+    let notice = build_signed_symbol_drop_notice(
         source_block_id,
-        esi_ranges: esi_ranges.to_vec(),
-        deadline: now,
-        timestamp: now,
-    };
+        esi_ranges.to_vec(),
+        now,
+        now,
+        master_signing_key,
+    );
     let batch = viaticum_core::messages::SymbolDropNoticeBatchMsg {
         v: 1,
         notices: vec![notice],

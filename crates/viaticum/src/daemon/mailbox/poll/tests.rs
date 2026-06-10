@@ -9,13 +9,14 @@ use tokio::sync::mpsc;
 use viaticum_core::db::Db;
 use viaticum_core::mailbox::{MailboxClass, MailboxEntry};
 use viaticum_core::messages::{
-    PosHashResponseMsg, SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, to_cbor,
+    PosHashResponseMsg, SymbolDropNoticeBatchMsg, build_signed_symbol_drop_notice, to_cbor,
 };
 use viaticum_core::types::{
     DeviceId, IdentityPub, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
 };
 
 use crate::daemon::processor::ProcessorDropHandler;
+use crate::daemon::repair::RepairTrigger;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -162,20 +163,22 @@ async fn poll_drop_notice_no_sender_does_not_panic() {
     let handler: Arc<dyn super::DropNoticeHandler> =
         Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
 
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+    let now = Timestamp::now();
     let batch = SymbolDropNoticeBatchMsg {
         v: 1,
-        notices: vec![SymbolDropNoticeMsg {
-            v: 1,
-            source_block_id: SourceBlockId([0x01; 32]),
-            esi_ranges: vec![(0, 1)],
-            deadline: Timestamp(Timestamp::now().0 + 86400 * 14),
-            timestamp: Timestamp::now(),
-        }],
+        notices: vec![build_signed_symbol_drop_notice(
+            SourceBlockId([0x01; 32]),
+            vec![(0, 1)],
+            Timestamp(now.0 + 86400 * 14),
+            now,
+            &sk,
+        )],
     };
     let payload = to_cbor(&batch).expect("encode");
-    let now_secs = Timestamp::now().0;
+    let now_secs = now.0;
 
-    // Entry with no sender.
+    // Entry with no sender — dispatch_drop_notice exits early before verifying.
     let entry = MailboxEntry {
         target: make_identity(0xAA),
         msg_id: [2u8; 16],
@@ -216,22 +219,29 @@ async fn poll_drop_notice_bad_payload_does_not_panic() {
     super::dispatch_drop_notice(&handler, entry);
 }
 
+/// Helper: create a deterministic Ed25519 signing key from a seed byte.
+fn make_signing_key(seed: u8) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+}
+
 /// T-7: Feeding a SymbolDropNoticeBatchMsg through dispatch_drop_notice with a
 /// prod ProcessorDropHandler marks each referenced placement Lost and updates
 /// block cached fields (recomputes current_alive).
 ///
 /// Setup: 2 holdings of holder H for blocks B1 and B2. Owner O has Alive placements
-/// with holder H on both blocks. We feed a 2-notice batch → both placements become Lost.
+/// with holder H on both blocks. We feed a 2-notice batch with valid signatures →
+/// both placements become Lost.
 #[tokio::test]
 async fn drop_notice_batch_dispatch_marks_each_placement_lost() {
     use viaticum_core::types::{PeerRecord, SourceBlockRecord, SourceBlockStatus, SourceBlockType};
 
     let db = Db::open_in_memory().expect("db");
 
-    // Owner and holder identities.
+    // Owner and holder identities. Use a real signing key for the holder so notices can be signed.
     let owner_master = IdentityPub([0xAA; 32]);
-    let holder_master = IdentityPub([0xBB; 32]);
-    let holder_device = DeviceId([0xBB; 32]);
+    let holder_signing_key = make_signing_key(0xBB);
+    let holder_master = IdentityPub(holder_signing_key.verifying_key().to_bytes());
+    let holder_device = DeviceId(holder_signing_key.verifying_key().to_bytes());
 
     // Register holder device → master mapping so get_devices_for_master finds it.
     let now = Timestamp::now();
@@ -303,25 +313,25 @@ async fn drop_notice_batch_dispatch_marks_each_placement_lost() {
     db.upsert_placement(&placement1).expect("upsert placement1");
     db.upsert_placement(&placement2).expect("upsert placement2");
 
-    // Build a 2-notice batch from holder H to owner O.
+    // Build a 2-notice batch from holder H to owner O, signed with holder's key.
     let now = Timestamp::now();
     let batch = SymbolDropNoticeBatchMsg {
         v: 1,
         notices: vec![
-            SymbolDropNoticeMsg {
-                v: 1,
-                source_block_id: block_id_1,
-                esi_ranges: vec![(0, 5)],
-                deadline: Timestamp(now.0 + 86400 * 14),
-                timestamp: now,
-            },
-            SymbolDropNoticeMsg {
-                v: 1,
-                source_block_id: block_id_2,
-                esi_ranges: vec![(0, 5)],
-                deadline: Timestamp(now.0 + 86400 * 14),
-                timestamp: now,
-            },
+            build_signed_symbol_drop_notice(
+                block_id_1,
+                vec![(0, 5)],
+                Timestamp(now.0 + 86400 * 14),
+                now,
+                &holder_signing_key,
+            ),
+            build_signed_symbol_drop_notice(
+                block_id_2,
+                vec![(0, 5)],
+                Timestamp(now.0 + 86400 * 14),
+                now,
+                &holder_signing_key,
+            ),
         ],
     };
     let payload = to_cbor(&batch).expect("encode batch");
@@ -383,5 +393,267 @@ async fn drop_notice_batch_dispatch_marks_each_placement_lost() {
     assert_eq!(
         updated_block2.current_alive, 0,
         "block2 current_alive must be 0 after sole holder went Lost"
+    );
+}
+
+// ─── W-3: DropNotice security tests ──────────────────────────────────────────
+
+/// W-3: A DropNotice with deadline ≤ now triggers RepairNow on the repair channel.
+///
+/// Setup: holder H has a placement on block B. Owner receives a DropNotice with
+/// deadline = now (immediate drop). ProcessorDropHandler must:
+///   1. Mark placement Lost (via SymbolDropHandler::apply).
+///   2. Send RepairTrigger::RepairNow on repair_tx.
+#[tokio::test]
+async fn drop_notice_immediate_deadline_triggers_repair_now() {
+    use viaticum_core::types::{PeerRecord, SourceBlockRecord, SourceBlockStatus, SourceBlockType};
+
+    let db = Db::open_in_memory().expect("db");
+
+    let holder_signing_key = make_signing_key(0xCC);
+    let holder_master = IdentityPub(holder_signing_key.verifying_key().to_bytes());
+    let holder_device = DeviceId(holder_signing_key.verifying_key().to_bytes());
+    let owner_master = IdentityPub([0xAA; 32]);
+
+    let now = Timestamp::now();
+
+    // Register holder device → master mapping.
+    let peer = PeerRecord {
+        device_id: holder_device,
+        master_identity: holder_master,
+        trust_p: 0.5,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: now,
+        last_seen: now,
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: 0.1,
+        last_avail_sample: 0,
+    };
+    db.upsert_peer(&peer).expect("upsert peer");
+    db.set_master_for_device(&holder_device, &holder_master)
+        .expect("set master");
+
+    let block_id = SourceBlockId([0xCC; 32]);
+
+    // Insert source block.
+    let block = SourceBlockRecord {
+        block_id,
+        k: 6,
+        t: 512,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: now,
+        encrypted_size: None,
+        n: Some(10),
+        overhead: Some(1.5),
+        drop_notice_sent_at: None,
+        importance: 1.0,
+        current_alive: 1,
+        current_reliability: 0.9,
+        target_reliability: 0.99,
+    };
+    db.upsert_source_block(&block).expect("insert block");
+
+    // Create Alive placement.
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id: holder_device,
+        file_id: viaticum_core::types::FileId(1),
+        esi_ranges: vec![(0, 5)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: now,
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).expect("upsert placement");
+
+    // Build a signed immediate-drop notice (deadline = now).
+    let notice = build_signed_symbol_drop_notice(
+        block_id,
+        vec![(0, 5)],
+        now, // deadline = now → immediate drop
+        now,
+        &holder_signing_key,
+    );
+    let batch = SymbolDropNoticeBatchMsg {
+        v: 1,
+        notices: vec![notice],
+    };
+    let payload = to_cbor(&batch).expect("encode");
+
+    let entry = MailboxEntry {
+        target: owner_master,
+        msg_id: [0xCCu8; 16],
+        class: MailboxClass::DropNotice,
+        payload_version: 1,
+        payload,
+        expires_at: now.0 + 3600,
+        stored_at: now.0,
+        sender: Some(holder_master),
+    };
+
+    let (repair_tx, mut repair_rx) = mpsc::channel::<RepairTrigger>(16);
+    let handler: Arc<dyn super::DropNoticeHandler> =
+        Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
+
+    super::dispatch_drop_notice(&handler, entry);
+
+    // Placement must be Lost.
+    let p = db
+        .get_placement(&block_id, &holder_device)
+        .expect("db ok")
+        .expect("exists");
+    assert_eq!(
+        p.status,
+        PlacementStatus::Lost,
+        "placement must be Lost after immediate drop"
+    );
+
+    // RepairNow must have been sent.
+    let trigger = repair_rx
+        .try_recv()
+        .expect("RepairNow must be in channel after immediate drop");
+    match trigger {
+        RepairTrigger::RepairNow {
+            block_id: bid,
+            holder_id,
+        } => {
+            assert_eq!(bid, block_id, "RepairNow block_id must match");
+            assert_eq!(holder_id, holder_device, "RepairNow holder_id must match");
+        }
+        other => panic!("expected RepairNow, got {other:?}"),
+    }
+}
+
+/// W-3: A DropNotice whose signature does NOT verify against the claimed sender
+/// is rejected: placement NOT marked Lost, NO RepairNow triggered.
+///
+/// Threat: a malicious postman inserts a DropNotice claiming to be from holder H,
+/// but the sig was made with a different key (or is all-zero). The owner must reject it.
+#[tokio::test]
+async fn drop_notice_forged_signature_is_rejected() {
+    use viaticum_core::types::{PeerRecord, SourceBlockRecord, SourceBlockStatus, SourceBlockType};
+
+    let db = Db::open_in_memory().expect("db");
+
+    // Legitimate holder key and a different attacker key.
+    let holder_signing_key = make_signing_key(0xDD);
+    let holder_master = IdentityPub(holder_signing_key.verifying_key().to_bytes());
+    let holder_device = DeviceId(holder_signing_key.verifying_key().to_bytes());
+    let attacker_key = make_signing_key(0xEE); // different key — forged sig
+    let owner_master = IdentityPub([0xAA; 32]);
+
+    let now = Timestamp::now();
+
+    // Register holder device → master mapping.
+    let peer = PeerRecord {
+        device_id: holder_device,
+        master_identity: holder_master,
+        trust_p: 0.5,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: now,
+        last_seen: now,
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: 0.1,
+        last_avail_sample: 0,
+    };
+    db.upsert_peer(&peer).expect("upsert peer");
+    db.set_master_for_device(&holder_device, &holder_master)
+        .expect("set master");
+
+    let block_id = SourceBlockId([0xDD; 32]);
+
+    // Insert source block.
+    let block = SourceBlockRecord {
+        block_id,
+        k: 6,
+        t: 512,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: now,
+        encrypted_size: None,
+        n: Some(10),
+        overhead: Some(1.5),
+        drop_notice_sent_at: None,
+        importance: 1.0,
+        current_alive: 1,
+        current_reliability: 0.9,
+        target_reliability: 0.99,
+    };
+    db.upsert_source_block(&block).expect("insert block");
+
+    // Create Alive placement for the legitimate holder.
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id: holder_device,
+        file_id: viaticum_core::types::FileId(2),
+        esi_ranges: vec![(0, 5)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: now,
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).expect("upsert placement");
+
+    // Build a DropNotice signed by the ATTACKER key, but claiming to come from the holder.
+    // The sig will not verify against holder_master → must be rejected.
+    let forged_notice = build_signed_symbol_drop_notice(
+        block_id,
+        vec![(0, 5)],
+        now,
+        now,
+        &attacker_key, // attacker's key, not holder's
+    );
+    let batch = SymbolDropNoticeBatchMsg {
+        v: 1,
+        notices: vec![forged_notice],
+    };
+    let payload = to_cbor(&batch).expect("encode");
+
+    // entry.sender = holder_master, but sig is from attacker_key → mismatch.
+    let entry = MailboxEntry {
+        target: owner_master,
+        msg_id: [0xDDu8; 16],
+        class: MailboxClass::DropNotice,
+        payload_version: 1,
+        payload,
+        expires_at: now.0 + 3600,
+        stored_at: now.0,
+        sender: Some(holder_master), // claimed sender = legitimate holder
+    };
+
+    let (repair_tx, mut repair_rx) = mpsc::channel::<RepairTrigger>(16);
+    let handler: Arc<dyn super::DropNoticeHandler> =
+        Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
+
+    super::dispatch_drop_notice(&handler, entry);
+
+    // Placement must remain Alive — forged notice must be rejected.
+    let p = db
+        .get_placement(&block_id, &holder_device)
+        .expect("db ok")
+        .expect("exists");
+    assert_eq!(
+        p.status,
+        PlacementStatus::Alive,
+        "placement must remain Alive when DropNotice has forged signature"
+    );
+
+    // No RepairNow must have been triggered.
+    assert!(
+        repair_rx.try_recv().is_err(),
+        "no RepairNow should be triggered for a forged DropNotice"
     );
 }

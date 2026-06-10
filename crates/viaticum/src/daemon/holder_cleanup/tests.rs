@@ -249,9 +249,16 @@ async fn cleanup_expired_deletes_files_and_publishes_drop_notice() {
     // cleanup_expired calls Timestamp::now() internally, so we rely on the
     // real wall-clock being >> HOLDER_DELETE_COOLDOWN_SECS (which is 4 weeks
     // in seconds, ~2.4 million). Any Unix timestamp past 2024 qualifies.
-    super::cleanup_expired(&db, holdings_dir.path(), &router, holder_master_pub(), 1)
-        .await
-        .unwrap();
+    super::cleanup_expired(
+        &db,
+        holdings_dir.path(),
+        &router,
+        holder_master_pub(),
+        1,
+        &test_key(),
+    )
+    .await
+    .unwrap();
 
     // DB record must be gone.
     assert!(
@@ -311,9 +318,16 @@ async fn cleanup_expired_tolerates_missing_files() {
     // Intentionally do NOT create any files on disk.
 
     // Should not error even though no files exist.
-    super::cleanup_expired(&db, holdings_dir.path(), &router, holder_master_pub(), 1)
-        .await
-        .unwrap();
+    super::cleanup_expired(
+        &db,
+        holdings_dir.path(),
+        &router,
+        holder_master_pub(),
+        1,
+        &test_key(),
+    )
+    .await
+    .unwrap();
 
     // DB record must still be gone.
     assert!(
@@ -639,8 +653,15 @@ async fn mass_eviction_batches_into_single_mailbox_entry() {
         })
         .collect();
 
-    super::publish_drop_notices_via_mailbox(&db, &drop_notices, &router, holder_master_pub(), now)
-        .await;
+    super::publish_drop_notices_via_mailbox(
+        &db,
+        &drop_notices,
+        &router,
+        holder_master_pub(),
+        now,
+        &test_key(),
+    )
+    .await;
 
     let reqs = sender.drain().await;
 
@@ -713,7 +734,15 @@ async fn drop_notices_for_different_owners_go_to_separate_entries() {
     })
     .collect();
 
-    super::publish_drop_notices_via_mailbox(&db, &notices, &router, holder_master_pub(), now).await;
+    super::publish_drop_notices_via_mailbox(
+        &db,
+        &notices,
+        &router,
+        holder_master_pub(),
+        now,
+        &test_key(),
+    )
+    .await;
 
     let reqs = sender.drain().await;
 
@@ -971,8 +1000,15 @@ async fn drop_notice_zero_ack_retries_once_then_continues() {
     }];
 
     // Must complete without panic.
-    super::publish_drop_notices_via_mailbox(&db, &drop_notices, &router, holder_master_pub(), now)
-        .await;
+    super::publish_drop_notices_via_mailbox(
+        &db,
+        &drop_notices,
+        &router,
+        holder_master_pub(),
+        now,
+        &test_key(),
+    )
+    .await;
 
     // (a) No panic above; function completed.
 

@@ -218,6 +218,11 @@ pub struct SymbolDroppedMsg {
 }
 
 /// Holder → Owner. Advance notice: will drop these symbols by deadline.
+///
+/// sig covers: SYMBOL_DROP_NOTICE_DOMAIN || CBOR((source_block_id, esi_ranges, deadline, timestamp))
+/// Signed by the holder's master identity key.
+/// Defaults to [0u8; 64] on deserialization (legacy/missing sig) which will
+/// fail verify_symbol_drop_notice — old unsigned messages are silently rejected.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SymbolDropNoticeMsg {
     pub v: u8,
@@ -226,6 +231,10 @@ pub struct SymbolDropNoticeMsg {
     /// Absolute unix timestamp when drop will occur.
     pub deadline: Timestamp,
     pub timestamp: Timestamp,
+    /// Ed25519 signature by the holder's master identity key. 64 bytes.
+    #[serde(with = "sig_serde")]
+    #[serde(default = "default_sig")]
+    pub sig: [u8; 64],
 }
 
 /// Holder → Owner. Batched advance drop notices for one owner.
@@ -1233,6 +1242,80 @@ pub fn verify_pos_hash_nack(
     let sig = ed25519_dalek::Signature::from_bytes(&msg.sig);
     let input = pos_hash_nack_sig_input(&msg.challenge_id, &msg.source_block_id, &msg.timestamp);
     vk.verify_strict(&input, &sig)
+        .map_err(|_| MessageError::BadSignature)?;
+    Ok(())
+}
+
+// ============================================================
+// SymbolDropNotice signature
+// ============================================================
+
+/// Domain tag for SymbolDropNoticeMsg signing. Distinguishes this signature from
+/// other Ed25519 signatures in the protocol.
+const SYMBOL_DROP_NOTICE_DOMAIN: &[u8] = b"viaticum-drop-notice-v1";
+
+/// Compute the signing payload for SymbolDropNoticeMsg.
+///
+/// Payload: SYMBOL_DROP_NOTICE_DOMAIN || CBOR((source_block_id, esi_ranges, deadline, timestamp))
+fn symbol_drop_notice_sig_payload(
+    source_block_id: &SourceBlockId,
+    esi_ranges: &[(u32, u32)],
+    deadline: &Timestamp,
+    timestamp: &Timestamp,
+) -> Vec<u8> {
+    let mut payload = SYMBOL_DROP_NOTICE_DOMAIN.to_vec();
+    let cbor_tuple = (source_block_id, esi_ranges, deadline, timestamp);
+    let mut cbor_bytes = Vec::new();
+    ciborium::ser::into_writer(&cbor_tuple, &mut cbor_bytes)
+        .expect("CBOR encode of drop-notice payload is infallible");
+    payload.extend_from_slice(&cbor_bytes);
+    payload
+}
+
+/// Build a signed SymbolDropNoticeMsg.
+///
+/// `signing_key` must be the holder's master identity key.
+/// Sig covers: SYMBOL_DROP_NOTICE_DOMAIN || CBOR((source_block_id, esi_ranges, deadline, timestamp)).
+pub fn build_signed_symbol_drop_notice(
+    source_block_id: SourceBlockId,
+    esi_ranges: Vec<(u32, u32)>,
+    deadline: Timestamp,
+    timestamp: Timestamp,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> SymbolDropNoticeMsg {
+    let payload =
+        symbol_drop_notice_sig_payload(&source_block_id, &esi_ranges, &deadline, &timestamp);
+    let sig = signing_key.sign(&payload).to_bytes();
+    SymbolDropNoticeMsg {
+        v: PROTOCOL_VERSION,
+        source_block_id,
+        esi_ranges,
+        deadline,
+        timestamp,
+        sig,
+    }
+}
+
+/// Verify a SymbolDropNoticeMsg signature against the expected holder's master identity.
+///
+/// Returns Err(BadSignature) if the signature is invalid or all-zero (unsigned legacy message).
+/// An all-zero signature is the `#[serde(default)]` value that deserialization inserts for
+/// messages that predate this field — those are unconditionally rejected, which is correct:
+/// A2 is a hard cut-over with no rolling upgrade.
+pub fn verify_symbol_drop_notice(
+    msg: &SymbolDropNoticeMsg,
+    holder_master: &IdentityPub,
+) -> Result<(), MessageError> {
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&holder_master.0)
+        .map_err(|_| MessageError::BadSignature)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&msg.sig);
+    let payload = symbol_drop_notice_sig_payload(
+        &msg.source_block_id,
+        &msg.esi_ranges,
+        &msg.deadline,
+        &msg.timestamp,
+    );
+    vk.verify_strict(&payload, &sig)
         .map_err(|_| MessageError::BadSignature)?;
     Ok(())
 }

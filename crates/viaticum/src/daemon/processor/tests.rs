@@ -36,7 +36,7 @@ use viaticum_core::cluster::{ClusterState, derive_master_key, master_identity};
 use viaticum_core::db::Db;
 use viaticum_core::messages::{
     BoardSyncMsg, PeerAnnounceMsg, PosHashChallengeMsg, RestoreRequestMsg, SymbolAcceptMsg,
-    SymbolDropNoticeMsg, SymbolRejectMsg, SymbolTransferMsg,
+    SymbolDropNoticeMsg, SymbolRejectMsg, SymbolTransferMsg, build_signed_symbol_drop_notice,
 };
 use viaticum_core::types::{
     DeviceId, FileId, HoldingRecord, HoldingStatus, IdentityPub, PlacementStatus, SourceBlockId,
@@ -61,6 +61,29 @@ fn make_device_id(seed: u8) -> DeviceId {
 
 fn make_block_id(seed: u8) -> SourceBlockId {
     SourceBlockId([seed; 32])
+}
+
+/// Build a real Ed25519 signing key deterministically from a seed byte.
+/// Use this when the DropNotice signature must be verifiable by `SymbolDropHandler::apply`.
+fn make_signing_key(seed: u8) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+}
+
+/// Build a signed SymbolDropNoticeMsg using `build_signed_symbol_drop_notice`.
+/// The `signing_key` must correspond to the holder master identity passed to
+/// `handle_symbol_drop_notice` (use `master_identity(&key)` to derive it).
+fn make_signed_drop_notice(
+    block_id: SourceBlockId,
+    esi_ranges: Vec<(u32, u32)>,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> SymbolDropNoticeMsg {
+    build_signed_symbol_drop_notice(
+        block_id,
+        esi_ranges,
+        viaticum_core::types::Timestamp(viaticum_core::types::Timestamp::now().0 + 604_800),
+        viaticum_core::types::Timestamp::now(),
+        signing_key,
+    )
 }
 
 fn make_peer_record(device_id: DeviceId) -> viaticum_core::types::PeerRecord {
@@ -2259,15 +2282,19 @@ async fn handle_symbol_drop_notice_does_not_panic() {
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
     let holder = make_identity(0xF0);
+    // sig: [0u8; 64] — verification fails, handler returns early with a warn log.
+    // This test only checks that no panic occurs; DB-state correctness is in the
+    // tests below that use make_signed_drop_notice / make_signing_key.
     let notice = SymbolDropNoticeMsg {
         v: 1,
         source_block_id: make_block_id(0xF0),
         esi_ranges: vec![(0, 100)],
         deadline: Timestamp(Timestamp::now().0 + 604_800),
         timestamp: Timestamp::now(),
+        sig: [0u8; 64],
     };
 
-    // Should not panic — just logs.
+    // Should not panic — handler returns early on bad sig, logs WARN.
     processor.handle_symbol_drop_notice(holder, notice);
 }
 
@@ -2299,7 +2326,9 @@ fn register_holder(db: &Db, master: IdentityPub, device: DeviceId) {
     db.set_master_for_device(&device, &master).unwrap();
 }
 
-/// Build a SymbolDropNoticeMsg directed at a specific block.
+/// Build an *unsigned* SymbolDropNoticeMsg (sig = all-zeros).
+/// Use only for "no panic" and "unchanged state" tests where the handler's early return on bad sig
+/// is acceptable. For DB-state assertions use `make_signed_drop_notice` instead.
 fn make_drop_notice(block_id: SourceBlockId, esi_ranges: Vec<(u32, u32)>) -> SymbolDropNoticeMsg {
     SymbolDropNoticeMsg {
         v: 1,
@@ -2307,6 +2336,7 @@ fn make_drop_notice(block_id: SourceBlockId, esi_ranges: Vec<(u32, u32)>) -> Sym
         esi_ranges,
         deadline: Timestamp(Timestamp::now().0 + 604_800),
         timestamp: Timestamp::now(),
+        sig: [0u8; 64],
     }
 }
 
@@ -2317,7 +2347,8 @@ async fn handle_symbol_drop_notice_transitions_placement_to_lost() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let holder_master = make_identity(0xA1);
+    let holder_key = make_signing_key(0xA1);
+    let holder_master = master_identity(&holder_key);
     let holder_device = make_device_id(0xA1);
     let block_id = make_block_id(0xB1);
 
@@ -2332,7 +2363,10 @@ async fn handle_symbol_drop_notice_transitions_placement_to_lost() {
     );
     db.upsert_placement(&placement).unwrap();
 
-    processor.handle_symbol_drop_notice(holder_master, make_drop_notice(block_id, vec![(0, 10)]));
+    processor.handle_symbol_drop_notice(
+        holder_master,
+        make_signed_drop_notice(block_id, vec![(0, 10)], &holder_key),
+    );
 
     let updated = db
         .get_placement(&block_id, &holder_device)
@@ -2352,7 +2386,8 @@ async fn handle_symbol_drop_notice_decrements_current_alive() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let master_a = make_identity(0xA2);
+    let key_a = make_signing_key(0xA2);
+    let master_a = master_identity(&key_a);
     let device_a = make_device_id(0xA2);
     let master_b = make_identity(0xA3);
     let device_b = make_device_id(0xA3);
@@ -2379,8 +2414,11 @@ async fn handle_symbol_drop_notice_decrements_current_alive() {
     ))
     .unwrap();
 
-    // Drop notice from holder A.
-    processor.handle_symbol_drop_notice(master_a, make_drop_notice(block_id, vec![(0, 10)]));
+    // Drop notice from holder A — signed with key_a so signature verification passes.
+    processor.handle_symbol_drop_notice(
+        master_a,
+        make_signed_drop_notice(block_id, vec![(0, 10)], &key_a),
+    );
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
     assert_eq!(
@@ -2396,7 +2434,8 @@ async fn handle_symbol_drop_notice_recomputes_current_reliability() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let master_a = make_identity(0xC1);
+    let key_a = make_signing_key(0xC1);
+    let master_a = master_identity(&key_a);
     let device_a = make_device_id(0xC1);
     let master_b = make_identity(0xC2);
     let device_b = make_device_id(0xC2);
@@ -2425,7 +2464,10 @@ async fn handle_symbol_drop_notice_recomputes_current_reliability() {
     ))
     .unwrap();
 
-    processor.handle_symbol_drop_notice(master_a, make_drop_notice(block_id, vec![(0, 20)]));
+    processor.handle_symbol_drop_notice(
+        master_a,
+        make_signed_drop_notice(block_id, vec![(0, 20)], &key_a),
+    );
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
     assert!(
@@ -2448,7 +2490,8 @@ async fn handle_symbol_drop_notice_idempotent_on_duplicate() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let master_a = make_identity(0xD1);
+    let key_a = make_signing_key(0xD1);
+    let master_a = master_identity(&key_a);
     let device_a = make_device_id(0xD1);
     let master_b = make_identity(0xD2);
     let device_b = make_device_id(0xD2);
@@ -2475,8 +2518,8 @@ async fn handle_symbol_drop_notice_idempotent_on_duplicate() {
     ))
     .unwrap();
 
-    // Send the same notice twice.
-    let notice = make_drop_notice(block_id, vec![(0, 10)]);
+    // Send the same notice twice — signed so both passes verify correctly.
+    let notice = make_signed_drop_notice(block_id, vec![(0, 10)], &key_a);
     processor.handle_symbol_drop_notice(master_a, notice.clone());
     processor.handle_symbol_drop_notice(master_a, notice);
 
@@ -2547,7 +2590,8 @@ async fn handle_symbol_drop_notice_placement_already_lost_is_noop() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let holder_master = make_identity(0x01);
+    let holder_key = make_signing_key(0x01);
+    let holder_master = master_identity(&holder_key);
     let holder_device = make_device_id(0x01);
     let other_master = make_identity(0x02);
     let other_device = make_device_id(0x02);
@@ -2576,8 +2620,12 @@ async fn handle_symbol_drop_notice_placement_already_lost_is_noop() {
     ))
     .unwrap();
 
-    // DropNotice for the already-Lost placement.
-    processor.handle_symbol_drop_notice(holder_master, make_drop_notice(block_id, vec![(0, 10)]));
+    // DropNotice for the already-Lost placement — signed so sig verification passes.
+    // After sig check, mark_placement_lost sees Lost placement → no-op.
+    processor.handle_symbol_drop_notice(
+        holder_master,
+        make_signed_drop_notice(block_id, vec![(0, 10)], &holder_key),
+    );
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
     assert_eq!(
@@ -2594,7 +2642,8 @@ async fn handle_symbol_drop_notice_block_becomes_eligible_for_worker() {
     let holdings_dir = TempDir::new().unwrap();
     let (processor, _repair_rx, _relay_rx) = make_processor(db.clone(), &holdings_dir).await;
 
-    let master_a = make_identity(0x10);
+    let key_a = make_signing_key(0x10);
+    let master_a = master_identity(&key_a);
     let device_a = make_device_id(0x10);
     let master_b = make_identity(0x11);
     let device_b = make_device_id(0x11);
@@ -2635,8 +2684,11 @@ async fn handle_symbol_drop_notice_block_becomes_eligible_for_worker() {
         "block must not be eligible before DropNotice (reliability >= target)"
     );
 
-    // Send DropNotice for holder A.
-    processor.handle_symbol_drop_notice(master_a, make_drop_notice(block_id, vec![(0, 10)]));
+    // Send DropNotice for holder A — signed so signature verification passes.
+    processor.handle_symbol_drop_notice(
+        master_a,
+        make_signed_drop_notice(block_id, vec![(0, 10)], &key_a),
+    );
 
     let updated_block = db.get_source_block(&block_id).unwrap().unwrap();
     assert!(

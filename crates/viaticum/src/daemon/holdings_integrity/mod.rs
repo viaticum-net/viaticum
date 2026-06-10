@@ -10,6 +10,10 @@
 //
 // T-13a: migrated from relay (SymbolDropped) to mailbox (DropNotice, deadline=now).
 // relay_post_tx is kept in run() signature; T-13b removes relay entirely.
+//
+// Relay-board status: T-13a removed the SymbolDropped relay producers here.
+// DeleteMsg + RevocationBroadcast + the legacy PoS relay arm still use the board;
+// their migration/removal is a separate T-13b scope decision.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use viaticum_core::cluster::master_identity;
 use viaticum_core::db::Db;
 use viaticum_core::mailbox::{MailboxClass, MailboxEntry, class_config};
-use viaticum_core::messages::{SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, to_cbor};
+use viaticum_core::messages::{SymbolDropNoticeBatchMsg, build_signed_symbol_drop_notice, to_cbor};
 use viaticum_core::types::{HoldingRecord, HoldingStatus, IdentityPub, Timestamp, hex_encode};
 
 use crate::daemon::mailbox::routing::MailboxRouter;
@@ -166,10 +170,6 @@ async fn report_missing_holding(
     holder_master_pub: IdentityPub,
     master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
-    // master_signing_key not used now (was used for build_symbol_dropped); kept for
-    // potential future use and to avoid a larger signature change in this task.
-    let _ = master_signing_key;
-
     db.delete_holding(&holding.source_block_id, &holding.owner_id)?;
 
     // Refresh storage bytes for all devices of this owner's master identity.
@@ -188,15 +188,16 @@ async fn report_missing_holding(
     }
 
     // Publish immediate-drop DropNotice via mailbox (deadline=now).
+    // Sign with the holder's master key so the owner can verify authenticity.
     let now = Timestamp::now();
     let now_secs = now.0;
-    let notice = SymbolDropNoticeMsg {
-        v: 1,
-        source_block_id: holding.source_block_id,
-        esi_ranges: holding.esi_ranges.clone(),
-        deadline: now,
-        timestamp: now,
-    };
+    let notice = build_signed_symbol_drop_notice(
+        holding.source_block_id,
+        holding.esi_ranges.clone(),
+        now,
+        now,
+        master_signing_key,
+    );
     let batch = SymbolDropNoticeBatchMsg {
         v: 1,
         notices: vec![notice],
