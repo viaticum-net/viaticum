@@ -1,11 +1,12 @@
 // Symbol handlers: offer/transfer (holder), dropped/drop_notice (owner), delete/cancel_delete (holder).
+// Also: RevocationHandler (T-13b-2) — apply revocation received via mailbox.
 
 use tracing::{debug, error, info, warn};
 use viaticum_core::constants::{MESSAGE_FRESHNESS_SECS, SYMBOL_OFFER_EXPIRY_SECS, SYMBOL_SIZE};
 use viaticum_core::db::Db;
 use viaticum_core::messages::{
-    CancelDeleteMsg, DeleteMsg, RejectReason, SymbolAcceptMsg, SymbolDropNoticeMsg,
-    SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg, SymbolTransferMsg,
+    CancelDeleteMsg, DeleteMsg, RejectReason, RevocationBroadcast, SymbolAcceptMsg,
+    SymbolDropNoticeMsg, SymbolDroppedMsg, SymbolOfferMsg, SymbolRejectMsg, SymbolTransferMsg,
     verify_symbol_drop_notice, verify_symbol_offer,
 };
 use viaticum_core::types::{
@@ -600,6 +601,144 @@ pub(crate) fn apply_cancel_delete(
                 "processor: db error looking up holding for CancelDelete"
             );
         }
+    }
+}
+
+// ─── RevocationMailboxHandler: trait + standalone impl ───────────────────────
+
+/// Abstraction for handling a Revocation mailbox entry.
+///
+/// Called by the mailbox poll loop when a `MailboxClass::Revocation` entry is received.
+/// Production impl: `RevocationHandler` delegates to the same logic as
+/// `Processor::handle_revocation_broadcast`.
+///
+/// Parameters to `handle_revocation`:
+/// - `from`: revoking master pub (from `MailboxEntry.sender`).
+/// - `payload`: raw CBOR-encoded `RevocationBroadcast` bytes.
+#[async_trait::async_trait]
+pub trait RevocationMailboxHandler: Send + Sync {
+    async fn handle_revocation(&self, from: IdentityPub, payload: Vec<u8>) -> anyhow::Result<()>;
+}
+
+/// Standalone handler for `MailboxClass::Revocation` entries.
+///
+/// Extracted from `Processor::handle_revocation_broadcast` body so the mailbox poll
+/// loop can call it without holding an `Arc<Processor>`.
+///
+/// Verifies both certs against `from` (revoking master), cross-checks device_id,
+/// and appends the revoked pub key to all known PeerRecords for that master.
+/// Unknown masters (no PeerRecord in DB) are silently ignored.
+///
+/// Only requires `db` — identical to the original Processor method.
+pub struct RevocationHandler {
+    db: Db,
+}
+
+impl RevocationHandler {
+    pub fn new(db: Db) -> Self {
+        RevocationHandler { db }
+    }
+
+    /// Core revocation logic (extracted from `Processor::handle_revocation_broadcast`).
+    /// Returns Ok(()) on success or benign ignore; Err only for unexpected DB errors.
+    pub fn apply(&self, from: IdentityPub, broadcast: RevocationBroadcast) -> anyhow::Result<()> {
+        // Verify DeviceCertificate: signed by the revoking master key.
+        if let Err(e) =
+            viaticum_core::cluster::verify_device_certificate(&broadcast.device_cert, &from)
+        {
+            warn!(
+                peer = %from,
+                err = %e,
+                "processor: Revocation (mailbox) — invalid DeviceCertificate, ignoring"
+            );
+            return Ok(());
+        }
+
+        // Verify RevocationCertificate: signed by the revoking master key.
+        if let Err(e) = viaticum_core::cluster::verify_revocation(&broadcast.revocation, &from) {
+            warn!(
+                peer = %from,
+                err = %e,
+                "processor: Revocation (mailbox) — invalid RevocationCertificate, ignoring"
+            );
+            return Ok(());
+        }
+
+        // Cross-check: both certs must refer to the same device_id.
+        if broadcast.revocation.device_id != broadcast.device_cert.device_id {
+            warn!(
+                peer = %from,
+                revocation_device = ?broadcast.revocation.device_id,
+                cert_device = ?broadcast.device_cert.device_id,
+                "processor: Revocation (mailbox) — device_id mismatch, ignoring"
+            );
+            return Ok(());
+        }
+
+        // device_id.0 IS the device pub key.
+        let revoked_pub = broadcast.device_cert.device_id.0;
+
+        // Only update PeerRecords we already know about. Unknown masters are ignored.
+        let devices = self.db.get_devices_for_master(&from).unwrap_or_default();
+        if devices.is_empty() {
+            debug!(
+                peer = %from,
+                "processor: Revocation (mailbox) — unknown peer, ignoring"
+            );
+            return Ok(());
+        }
+        for did in &devices {
+            let mut record = match self.db.get_peer(did)? {
+                Some(r) => r,
+                None => continue,
+            };
+            if !record.revoked_device_pub_keys.contains(&revoked_pub) {
+                record.revoked_device_pub_keys.push(revoked_pub);
+                self.db.upsert_peer(&record)?;
+            }
+        }
+
+        info!(
+            peer = %from,
+            device_id = ?broadcast.revocation.device_id,
+            "processor: Revocation (mailbox) applied — device key marked revoked"
+        );
+
+        Ok(())
+    }
+}
+
+/// Production impl of `RevocationMailboxHandler` wrapping `RevocationHandler`.
+pub struct ProcessorRevocationHandler {
+    inner: RevocationHandler,
+}
+
+impl ProcessorRevocationHandler {
+    pub fn new(db: Db) -> Self {
+        ProcessorRevocationHandler {
+            inner: RevocationHandler::new(db),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RevocationMailboxHandler for ProcessorRevocationHandler {
+    async fn handle_revocation(&self, from: IdentityPub, payload: Vec<u8>) -> anyhow::Result<()> {
+        use viaticum_core::types::from_cbor_bytes;
+
+        let broadcast = match from_cbor_bytes::<RevocationBroadcast>(&payload) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    peer = %from,
+                    err = %e,
+                    "processor: failed to decode RevocationBroadcast from mailbox"
+                );
+                return Ok(());
+            }
+        };
+
+        self.inner.apply(from, broadcast)
     }
 }
 

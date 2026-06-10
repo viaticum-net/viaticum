@@ -47,6 +47,7 @@ async fn make_test_state() -> Arc<DaemonState> {
         restart_gate: None,
         shutdown_token: tokio_util::sync::CancellationToken::new(),
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
+        mailbox_router: None,
     })
 }
 
@@ -243,14 +244,17 @@ async fn dispatch_device_revoke_no_cluster_returns_error() {
     assert!(matches!(response, CliResponse::Error(_)));
 }
 
+/// T-13b-2: relay board is inert after migration — revocation via mailbox only.
+///
+/// With no storage-relationship peers (no placements, no holdings), revocation succeeds
+/// but publishes to 0 mailbox targets. relay_post_tx receives nothing (inert).
 #[tokio::test]
-async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
+async fn dispatch_device_revoke_relay_is_inert_and_returns_device_revoked() {
     use std::sync::{Arc, Mutex};
 
     use viaticum_core::cluster::{
         ClusterState, derive_device_key, issue_device_certificate, master_identity,
     };
-    use viaticum_core::messages::RevocationBroadcast;
     use viaticum_core::types::{DeviceId, Timestamp};
 
     use crate::daemon::relay::RelayPost;
@@ -275,7 +279,7 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
     cs.add_device(cert_b.clone(), now).unwrap();
     let cluster_state = Arc::new(Mutex::new(cs));
 
-    // Wire up a relay_post channel so we can observe the broadcast.
+    // Wire up relay_post_tx (inert: T-13b-2 does NOT send to relay board anymore).
     let (relay_post_tx, mut relay_post_rx) = tokio::sync::mpsc::channel::<RelayPost>(4);
 
     let (restore_tx, _restore_rx) = mpsc::channel::<(
@@ -305,6 +309,7 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
         restart_gate: None,
         shutdown_token: tokio_util::sync::CancellationToken::new(),
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
+        mailbox_router: None, // no router → revocation goes nowhere (best-effort)
     });
 
     // Revoke device B.
@@ -322,24 +327,10 @@ async fn dispatch_device_revoke_sends_broadcast_to_relay_post_tx() {
         "expected DeviceRevoked, got {response:?}"
     );
 
-    // Relay post channel must have received a RevocationBroadcast.
-    let post = relay_post_rx
-        .try_recv()
-        .expect("relay_post_rx must have a message after revoke");
-
-    assert_eq!(post.msg_type, "revocation_broadcast");
-    assert!(post.target.is_none(), "broadcast must have no target");
-
-    // Decode and verify payload.
-    let broadcast: RevocationBroadcast = viaticum_core::messages::from_cbor(&post.payload)
-        .expect("payload must decode as RevocationBroadcast");
-    assert_eq!(
-        broadcast.device_cert.device_id, device_id_b,
-        "broadcast must reference the revoked device"
-    );
-    assert_eq!(
-        broadcast.revocation.device_id, device_id_b,
-        "revocation cert must target device B"
+    // T-13b-2: relay post must NOT have been sent (relay is inert).
+    assert!(
+        relay_post_rx.try_recv().is_err(),
+        "T-13b-2: relay board must be inert — no RevocationBroadcast should be posted via relay"
     );
 }
 
@@ -748,6 +739,438 @@ async fn status_response_by_importance_has_five_buckets_in_fixed_order() {
         .map(|b| b.bucket.as_str())
         .collect();
     assert_eq!(names, ["critical", "high", "medium", "low", "trivial"]);
+}
+
+// ─── T-13b-2: Revocation producer tests ──────────────────────────────────────
+//
+// These tests verify that dispatch_device_revoke:
+//   1. Sends directed Revocation entries ONLY to storage-relationship peers
+//      (our holders ∪ owners we hold for), NOT to unrelated known peers.
+//   2. Deduplicates targets (peer both holder and owner → 1 publish, not 2).
+//   3. Does NOT post to the relay board (relay is inert after T-13b-2).
+
+use async_trait::async_trait;
+use viaticum_core::messages::{
+    MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
+};
+use viaticum_core::types::{HoldingRecord, HoldingStatus, PeerRecord, SymbolPlacement, Timestamp};
+
+use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
+
+struct RecordingMailboxSenderD {
+    stored: tokio::sync::Mutex<Vec<MailboxStoreRequest>>,
+}
+
+impl RecordingMailboxSenderD {
+    fn new() -> Self {
+        RecordingMailboxSenderD {
+            stored: tokio::sync::Mutex::new(vec![]),
+        }
+    }
+}
+
+#[async_trait]
+impl MailboxNetworkSender for RecordingMailboxSenderD {
+    async fn send_store(
+        &self,
+        _device: DeviceId,
+        req: MailboxStoreRequest,
+    ) -> anyhow::Result<MailboxStoreResponse> {
+        self.stored.lock().await.push(req.clone());
+        Ok(MailboxStoreResponse::Ack {
+            msg_id: req.entry.msg_id,
+        })
+    }
+
+    async fn send_fetch(
+        &self,
+        _device: DeviceId,
+        _req: MailboxFetchRequest,
+    ) -> anyhow::Result<MailboxFetchResponse> {
+        Ok(MailboxFetchResponse {
+            v: 1,
+            entries: vec![],
+            served_msg_ids: vec![],
+        })
+    }
+}
+
+fn gen_libp2p_device_id() -> DeviceId {
+    use libp2p::identity::Keypair;
+    let kp = Keypair::generate_ed25519();
+    let ed = kp.try_into_ed25519().unwrap();
+    DeviceId(ed.public().to_bytes())
+}
+
+fn make_router_for_revocation(db: &Db) -> (Arc<MailboxRouter>, Arc<RecordingMailboxSenderD>) {
+    // Insert one peer with a valid libp2p DeviceId so candidate set is non-empty.
+    let device_id = gen_libp2p_device_id();
+    let peer = PeerRecord {
+        device_id,
+        master_identity: IdentityPub([0xCAu8; 32]),
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: 0.5,
+        last_avail_sample: 0,
+    };
+    db.upsert_peer(&peer).unwrap();
+    let sender = Arc::new(RecordingMailboxSenderD::new());
+    let router = Arc::new(MailboxRouter::with_sender(
+        Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>,
+        db.clone(),
+    ));
+    (router, sender)
+}
+
+/// revocation_published_only_to_storage_relationship_peers:
+/// Set up M with: a placement on holder H1, a holding owned by O1, AND an
+/// unrelated known peer U1 in the peers table with NO storage relationship.
+/// Revoke a device → assert directed Revocation entries published to H1's master
+/// and O1, but NOT to U1, and NOT to our own master; no relay post.
+#[tokio::test]
+async fn revocation_published_only_to_storage_relationship_peers() {
+    use std::sync::{Arc as StdArc, Mutex};
+    use viaticum_core::cluster::{ClusterState, issue_device_certificate, master_identity};
+    use viaticum_core::mailbox::MailboxClass;
+
+    // Build our master and a device to revoke.
+    let seed = [0xA1u8; 32];
+    let master_key = viaticum_core::cluster::derive_master_key(&seed).unwrap();
+    let our_master = master_identity(&master_key);
+    let our_device_id = DeviceId([0xA1u8; 32]);
+    let revoked_device_id = DeviceId([0xA2u8; 32]);
+
+    let now = Timestamp(1_000_000);
+    let cert_a = issue_device_certificate(&master_key, our_device_id, now);
+    let cert_r = issue_device_certificate(&master_key, revoked_device_id, now);
+
+    let db = Db::open_in_memory().expect("db");
+
+    let mut cs = ClusterState::init(db.clone(), our_master, cert_a.clone(), now, now).unwrap();
+    cs.add_device(cert_r.clone(), now).unwrap();
+    let cluster_state = StdArc::new(Mutex::new(cs));
+
+    // H1: holder master + device. We have a placement on H1.
+    let h1_key = ed25519_dalek::SigningKey::from_bytes(&[0xB1u8; 32]);
+    let h1_master = IdentityPub(h1_key.verifying_key().to_bytes());
+    let h1_device = gen_libp2p_device_id();
+    {
+        let h1_peer = PeerRecord {
+            device_id: h1_device,
+            master_identity: h1_master,
+            trust_p: 0.5,
+            trust_i: 0.0,
+            trust_s: 1.0,
+            bytes_we_store_for_peer: 0,
+            bytes_peer_stores_for_us: 0,
+            first_seen: Timestamp(0),
+            last_seen: Timestamp(0),
+            revoked_device_pub_keys: vec![],
+            addrs: vec![],
+            x25519_pub: None,
+            avail_ewma: 0.5,
+            last_avail_sample: 0,
+        };
+        db.upsert_peer(&h1_peer).unwrap();
+        db.set_master_for_device(&h1_device, &h1_master).unwrap();
+    }
+    // Insert placement: our data held by H1.
+    let placement = SymbolPlacement {
+        source_block_id: SourceBlockId([0x01u8; 32]),
+        holder_id: h1_device,
+        file_id: viaticum_core::types::FileId(1),
+        esi_ranges: vec![(0, 5)],
+        binding_seed: [0u8; 32],
+        status: viaticum_core::types::PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: now,
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+
+    // O1: owner master. We hold O1's data.
+    let o1_master = IdentityPub([0xC1u8; 32]);
+    let o1_holding = HoldingRecord {
+        source_block_id: SourceBlockId([0x02u8; 32]),
+        owner_id: o1_master,
+        esi_ranges: vec![(0, 5)],
+        importance: 0.5,
+        total_bytes: 512,
+        status: HoldingStatus::Active,
+        received_at: now,
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&o1_holding).unwrap();
+
+    // U1: unrelated peer, NOT a holder and NOT an owner.
+    // Insert it just as a known peer (no placements, no holdings).
+    let u1_master = IdentityPub([0xD1u8; 32]);
+    let u1_device = gen_libp2p_device_id();
+    {
+        let u1_peer = PeerRecord {
+            device_id: u1_device,
+            master_identity: u1_master,
+            trust_p: 0.5,
+            trust_i: 0.0,
+            trust_s: 1.0,
+            bytes_we_store_for_peer: 0,
+            bytes_peer_stores_for_us: 0,
+            first_seen: Timestamp(0),
+            last_seen: Timestamp(0),
+            revoked_device_pub_keys: vec![],
+            addrs: vec![],
+            x25519_pub: None,
+            avail_ewma: 0.5,
+            last_avail_sample: 0,
+        };
+        db.upsert_peer(&u1_peer).unwrap();
+        db.set_master_for_device(&u1_device, &u1_master).unwrap();
+    }
+
+    let (relay_post_tx, mut relay_post_rx) =
+        tokio::sync::mpsc::channel::<crate::daemon::relay::RelayPost>(4);
+    let (restore_tx, _restore_rx) = mpsc::channel::<(
+        crate::daemon::restore::RestoreRequest,
+        tokio::sync::oneshot::Sender<
+            Result<crate::daemon::restore::RestoreResult, crate::daemon::restore::RestoreError>,
+        >,
+    )>(4);
+
+    let (router, sender) = make_router_for_revocation(&db);
+
+    let state = Arc::new(DaemonState {
+        db,
+        identity_pub: our_master,
+        device_id: our_device_id,
+        restore_tx,
+        cluster_state: Some(cluster_state),
+        master_key,
+        seed: seed.to_vec(),
+        data_dir: std::path::PathBuf::from("/tmp"),
+        soft_quota_bytes: 0,
+        disk_reserve_bytes: 0,
+        hard_quota_bytes: 0,
+        time_scale: 1,
+        relay_post_tx: Some(relay_post_tx),
+        swarm_handle: None,
+        watch_admin: None,
+        config_admin: None,
+        restart_gate: None,
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
+        peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
+        mailbox_router: Some(router),
+    });
+
+    // Revoke device.
+    let revoked_hex: String = revoked_device_id
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let response = dispatch(
+        CliRequest::DeviceRevoke {
+            device_id_hex: revoked_hex.clone(),
+        },
+        &state,
+    )
+    .await;
+    assert!(
+        matches!(response, CliResponse::DeviceRevoked { .. }),
+        "must be DeviceRevoked"
+    );
+
+    // No relay post (relay is inert).
+    assert!(
+        relay_post_rx.try_recv().is_err(),
+        "relay must be inert after T-13b-2"
+    );
+
+    // Drain all mailbox store requests.
+    let stored = sender.stored.lock().await;
+    let targets: std::collections::HashSet<_> = stored.iter().map(|r| r.entry.target).collect();
+
+    // Must include H1's master and O1's master.
+    assert!(
+        targets.contains(&h1_master),
+        "H1 master must be a revocation target"
+    );
+    assert!(
+        targets.contains(&o1_master),
+        "O1 master must be a revocation target"
+    );
+    // Must NOT include U1 (no storage relationship).
+    assert!(
+        !targets.contains(&u1_master),
+        "U1 must NOT be a revocation target (no storage relationship)"
+    );
+    // Must NOT include our own master.
+    assert!(
+        !targets.contains(&our_master),
+        "our own master must NOT be a revocation target"
+    );
+
+    // All entries must have Revocation class.
+    for req in stored.iter() {
+        assert_eq!(
+            req.entry.class,
+            MailboxClass::Revocation,
+            "all entries must be Revocation class"
+        );
+    }
+}
+
+/// revocation_dedup_peer_is_holder_and_owner:
+/// A peer that is BOTH a holder (we have a placement) AND an owner-we-hold-for
+/// must result in exactly one Revocation publish, not two.
+#[tokio::test]
+async fn revocation_dedup_peer_is_holder_and_owner() {
+    use std::sync::{Arc as StdArc, Mutex};
+    use viaticum_core::cluster::{ClusterState, issue_device_certificate, master_identity};
+
+    let seed = [0xF1u8; 32];
+    let master_key = viaticum_core::cluster::derive_master_key(&seed).unwrap();
+    let our_master = master_identity(&master_key);
+    let our_device_id = DeviceId([0xF1u8; 32]);
+    let revoked_device_id = DeviceId([0xF2u8; 32]);
+
+    let now = Timestamp(1_000_000);
+    let cert_a = issue_device_certificate(&master_key, our_device_id, now);
+    let cert_r = issue_device_certificate(&master_key, revoked_device_id, now);
+
+    let db = Db::open_in_memory().expect("db");
+    let mut cs = ClusterState::init(db.clone(), our_master, cert_a.clone(), now, now).unwrap();
+    cs.add_device(cert_r.clone(), now).unwrap();
+    let cluster_state = StdArc::new(Mutex::new(cs));
+
+    // Dual peer P: BOTH a holder of our data AND an owner we hold for.
+    let p_key = ed25519_dalek::SigningKey::from_bytes(&[0xE1u8; 32]);
+    let p_master = IdentityPub(p_key.verifying_key().to_bytes());
+    let p_device = gen_libp2p_device_id();
+    {
+        let p_peer = PeerRecord {
+            device_id: p_device,
+            master_identity: p_master,
+            trust_p: 0.5,
+            trust_i: 0.0,
+            trust_s: 1.0,
+            bytes_we_store_for_peer: 0,
+            bytes_peer_stores_for_us: 0,
+            first_seen: Timestamp(0),
+            last_seen: Timestamp(0),
+            revoked_device_pub_keys: vec![],
+            addrs: vec![],
+            x25519_pub: None,
+            avail_ewma: 0.5,
+            last_avail_sample: 0,
+        };
+        db.upsert_peer(&p_peer).unwrap();
+        db.set_master_for_device(&p_device, &p_master).unwrap();
+    }
+    // Placement: our data held by P.
+    let placement = SymbolPlacement {
+        source_block_id: SourceBlockId([0xF3u8; 32]),
+        holder_id: p_device,
+        file_id: viaticum_core::types::FileId(1),
+        esi_ranges: vec![(0, 5)],
+        binding_seed: [0u8; 32],
+        status: viaticum_core::types::PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: now,
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+    // Holding: P's data held by us.
+    let holding = HoldingRecord {
+        source_block_id: SourceBlockId([0xF4u8; 32]),
+        owner_id: p_master,
+        esi_ranges: vec![(0, 5)],
+        importance: 0.5,
+        total_bytes: 512,
+        status: HoldingStatus::Active,
+        received_at: now,
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    };
+    db.upsert_holding(&holding).unwrap();
+
+    let (_relay_tx, _relay_rx) = tokio::sync::mpsc::channel::<crate::daemon::relay::RelayPost>(4);
+    let (restore_tx, _restore_rx) = mpsc::channel::<(
+        crate::daemon::restore::RestoreRequest,
+        tokio::sync::oneshot::Sender<
+            Result<crate::daemon::restore::RestoreResult, crate::daemon::restore::RestoreError>,
+        >,
+    )>(4);
+
+    let (router, sender) = make_router_for_revocation(&db);
+
+    let state = Arc::new(DaemonState {
+        db,
+        identity_pub: our_master,
+        device_id: our_device_id,
+        restore_tx,
+        cluster_state: Some(cluster_state),
+        master_key,
+        seed: seed.to_vec(),
+        data_dir: std::path::PathBuf::from("/tmp"),
+        soft_quota_bytes: 0,
+        disk_reserve_bytes: 0,
+        hard_quota_bytes: 0,
+        time_scale: 1,
+        relay_post_tx: None,
+        swarm_handle: None,
+        watch_admin: None,
+        config_admin: None,
+        restart_gate: None,
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
+        peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
+        mailbox_router: Some(router),
+    });
+
+    let revoked_hex: String = revoked_device_id
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let response = dispatch(
+        CliRequest::DeviceRevoke {
+            device_id_hex: revoked_hex,
+        },
+        &state,
+    )
+    .await;
+    assert!(matches!(response, CliResponse::DeviceRevoked { .. }));
+
+    // Collect unique targets published to.
+    let stored = sender.stored.lock().await;
+    let targets: Vec<_> = stored.iter().map(|r| r.entry.target).collect();
+    let target_count = targets.iter().filter(|&&t| t == p_master).count();
+
+    // The router may send to multiple postman devices but with same target in each publish call.
+    // We care that unique target masters = 1 (only p_master, not p_master twice from two source paths).
+    let unique_masters: std::collections::HashSet<_> = targets.iter().copied().collect();
+    assert!(
+        unique_masters.contains(&p_master),
+        "dual-role peer p_master must be in unique targets"
+    );
+    // Dedup means p_master appears as a single publish batch target, not twice.
+    // The router internally fans out to N postmen per target call — we check that
+    // all store requests share the same msg_id (one publish call, not two separate ones).
+    let msg_ids: std::collections::HashSet<_> = stored.iter().map(|r| r.entry.msg_id).collect();
+    assert_eq!(
+        msg_ids.len(),
+        1,
+        "dedup: dual-role peer should produce exactly 1 unique msg_id publish (1 target, not 2)"
+    );
+    let _ = target_count; // suppress unused warning
 }
 
 #[cfg(any())]

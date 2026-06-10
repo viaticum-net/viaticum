@@ -70,6 +70,8 @@ pub use pos::{PosResponder, ProcessorPosHandler};
 pub use symbol::{ProcessorDropHandler, SymbolDropHandler};
 // Re-export for handle/mod.rs wiring (T-13b-1: mailbox poll → Delete/CancelDelete bridge).
 pub use symbol::{DeleteMailboxHandler, ProcessorDeleteHandler};
+// Re-export for handle/mod.rs wiring (T-13b-2: mailbox poll → Revocation bridge).
+pub use symbol::{ProcessorRevocationHandler, RevocationHandler, RevocationMailboxHandler};
 
 #[cfg(test)]
 mod tests;

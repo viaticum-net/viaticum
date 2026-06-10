@@ -28,6 +28,17 @@ pub mod class_config {
     /// 14 days matches DROP_NOTICE_TTL; both are bounded by the same deletion
     /// cooldown clocks (OWNER_DELETE_COOLDOWN_SECS + HOLDER_DELETE_COOLDOWN_SECS).
     pub const DELETE_REQUEST_TTL: Duration = Duration::from_secs(14 * 24 * 3600);
+    /// Device revocation notice TTL = 30 days.
+    ///
+    /// Delivery window for currently-offline storage peers. 30 days is generous
+    /// relative to the cold-backup time constant (1 week), so peers that come back
+    /// within a month learn about the revocation before doing any sensitive work.
+    ///
+    /// Known limitation: a storage-peer offline > 30 days misses the revocation.
+    /// This is the same gap that the old relay broadcast had past RELAY_TTL.
+    /// Complete fix = future pull-on-verify (receiver queries sender's revocation list
+    /// on connection), tracked as a separate future task.
+    pub const REVOCATION_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
     /// Hard cap per entry: 256 KB.
     pub const MAX_ENTRY_BYTES: usize = 256 * 1024;
     /// Global mailbox quota per target: 100 MB.
@@ -57,6 +68,13 @@ pub enum MailboxClass {
     /// Payload is CBOR-encoded `DeleteRequestPayload` (tagged union distinguishing
     /// Delete from CancelDelete). Not high-trust: membership-evictable.
     DeleteRequest = 5,
+    /// Device revocation notice: revoking master → storage-relationship peers. TTL = 30 days.
+    ///
+    /// Payload is CBOR-encoded `RevocationBroadcast` (revocation + device_cert, both
+    /// signed by the revoking master). Sent ONLY to peers with a storage relationship
+    /// (our holders + owners we hold for); not broadcast to all known peers.
+    /// Not high-trust: membership-evictable.
+    Revocation = 6,
 }
 
 impl MailboxClass {
@@ -69,11 +87,13 @@ impl MailboxClass {
             MailboxClass::DropNotice => 14 * 24 * 3600,
             MailboxClass::Generic => 90 * 24 * 3600,
             MailboxClass::DeleteRequest => 14 * 24 * 3600,
+            MailboxClass::Revocation => 30 * 24 * 3600,
         }
     }
 
     /// SelfPointer is high-trust: evicted only on TTL expiry, never on membership check failure.
     /// Used by Bug-D eviction policy (T-11): high-trust entries survive candidate-set changes.
+    /// All other classes (including Revocation) are membership-evictable.
     pub fn is_high_trust(self) -> bool {
         matches!(self, MailboxClass::SelfPointer)
     }
@@ -92,6 +112,7 @@ impl MailboxClass {
             3 => Some(MailboxClass::DropNotice),
             4 => Some(MailboxClass::Generic),
             5 => Some(MailboxClass::DeleteRequest),
+            6 => Some(MailboxClass::Revocation),
             _ => None,
         }
     }

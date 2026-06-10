@@ -878,3 +878,199 @@ async fn delete_request_no_sender_is_dropped_gracefully() {
         .expect("exists");
     assert_eq!(holding.status, HoldingStatus::Active);
 }
+
+// ─── T-13b-2: Revocation dispatch tests ──────────────────────────────────────
+
+use crate::daemon::processor::{ProcessorRevocationHandler, RevocationMailboxHandler};
+use viaticum_core::cluster::{EpochCounter, issue_device_certificate, issue_revocation};
+use viaticum_core::messages::RevocationBroadcast;
+use viaticum_core::types::PeerRecord;
+
+/// Build a valid RevocationBroadcast signed by `master_key` revoking `device_id`.
+fn make_revocation_broadcast(
+    master_key: &ed25519_dalek::SigningKey,
+    device_id: viaticum_core::types::DeviceId,
+) -> RevocationBroadcast {
+    let now = Timestamp::now();
+    let cert = issue_device_certificate(master_key, device_id, now);
+    let revocation = issue_revocation(master_key, device_id, now, EpochCounter(1));
+    RevocationBroadcast {
+        revocation,
+        device_cert: cert,
+    }
+}
+
+/// Insert a PeerRecord + device→master mapping into DB.
+fn register_peer(db: &Db, device_id: viaticum_core::types::DeviceId, master: IdentityPub) {
+    let peer = PeerRecord {
+        device_id,
+        master_identity: master,
+        trust_p: 0.5,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp::now(),
+        last_seen: Timestamp::now(),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: 0.1,
+        last_avail_sample: 0,
+    };
+    db.upsert_peer(&peer).expect("upsert peer");
+    db.set_master_for_device(&device_id, &master)
+        .expect("set master");
+}
+
+/// revocation_dispatch_marks_device_revoked:
+/// Poll dispatch of a signed Revocation entry → revoked device key in the relevant
+/// PeerRecord.revoked_device_pub_keys (real DB), matching the old handler.
+#[tokio::test]
+async fn revocation_dispatch_marks_device_revoked() {
+    let db = Db::open_in_memory().expect("db");
+
+    // Build a revoking master + a device to revoke.
+    let master_key = ed25519_dalek::SigningKey::from_bytes(&[0x10u8; 32]);
+    let master_pub = IdentityPub(master_key.verifying_key().to_bytes());
+    let device_id = viaticum_core::types::DeviceId([0x11u8; 32]);
+
+    // Register the peer device in DB so the handler can find it.
+    register_peer(&db, device_id, master_pub);
+
+    let broadcast = make_revocation_broadcast(&master_key, device_id);
+    let payload = to_cbor(&broadcast).expect("encode");
+    let now = Timestamp::now().0;
+    let entry = MailboxEntry {
+        target: make_identity(0xFF), // target = us (the receiving peer)
+        msg_id: [0xE0u8; 16],
+        class: MailboxClass::Revocation,
+        payload_version: 1,
+        payload,
+        expires_at: now + 86400 * 30,
+        stored_at: now,
+        sender: Some(master_pub), // sender = revoking master
+    };
+
+    let handler =
+        Arc::new(ProcessorRevocationHandler::new(db.clone())) as Arc<dyn RevocationMailboxHandler>;
+
+    super::dispatch_revocation(&handler, entry).await;
+
+    // PeerRecord for device_id must now have the revoked pub key.
+    let peer = db
+        .get_peer(&device_id)
+        .expect("db ok")
+        .expect("peer exists");
+    assert!(
+        peer.revoked_device_pub_keys.contains(&device_id.0),
+        "revocation_dispatch_marks_device_revoked: device pub key must be in revoked list"
+    );
+}
+
+/// revocation_forged_signature_rejected:
+/// Certs signed by the wrong key → verify_device_certificate fails → no revocation applied.
+#[tokio::test]
+async fn revocation_forged_signature_rejected() {
+    let db = Db::open_in_memory().expect("db");
+
+    let legitimate_key = ed25519_dalek::SigningKey::from_bytes(&[0x20u8; 32]);
+    let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0x21u8; 32]);
+    let legitimate_pub = IdentityPub(legitimate_key.verifying_key().to_bytes());
+    let device_id = viaticum_core::types::DeviceId([0x22u8; 32]);
+
+    register_peer(&db, device_id, legitimate_pub);
+
+    // Build a broadcast signed by attacker_key but claimed to be from legitimate_pub.
+    let broadcast = make_revocation_broadcast(&attacker_key, device_id);
+    let payload = to_cbor(&broadcast).expect("encode");
+    let now = Timestamp::now().0;
+    let entry = MailboxEntry {
+        target: make_identity(0xFF),
+        msg_id: [0xE1u8; 16],
+        class: MailboxClass::Revocation,
+        payload_version: 1,
+        payload,
+        expires_at: now + 86400 * 30,
+        stored_at: now,
+        sender: Some(legitimate_pub), // claimed from legitimate, but sig is from attacker
+    };
+
+    let handler =
+        Arc::new(ProcessorRevocationHandler::new(db.clone())) as Arc<dyn RevocationMailboxHandler>;
+
+    super::dispatch_revocation(&handler, entry).await;
+
+    // PeerRecord must have NO revoked keys — forged cert must be rejected.
+    let peer = db
+        .get_peer(&device_id)
+        .expect("db ok")
+        .expect("peer exists");
+    assert!(
+        peer.revoked_device_pub_keys.is_empty(),
+        "revocation_forged_signature_rejected: no device key must be revoked for forged cert"
+    );
+}
+
+/// revocation_unknown_master_ignored:
+/// Revocation for a master with no known devices → silently ignored, no panic.
+#[tokio::test]
+async fn revocation_unknown_master_ignored() {
+    let db = Db::open_in_memory().expect("db");
+
+    let master_key = ed25519_dalek::SigningKey::from_bytes(&[0x30u8; 32]);
+    let master_pub = IdentityPub(master_key.verifying_key().to_bytes());
+    let device_id = viaticum_core::types::DeviceId([0x31u8; 32]);
+
+    // Do NOT register any device for this master — unknown master scenario.
+
+    let broadcast = make_revocation_broadcast(&master_key, device_id);
+    let payload = to_cbor(&broadcast).expect("encode");
+    let now = Timestamp::now().0;
+    let entry = MailboxEntry {
+        target: make_identity(0xFF),
+        msg_id: [0xE2u8; 16],
+        class: MailboxClass::Revocation,
+        payload_version: 1,
+        payload,
+        expires_at: now + 86400 * 30,
+        stored_at: now,
+        sender: Some(master_pub),
+    };
+
+    let handler =
+        Arc::new(ProcessorRevocationHandler::new(db.clone())) as Arc<dyn RevocationMailboxHandler>;
+
+    // Must not panic — unknown master is silently ignored.
+    super::dispatch_revocation(&handler, entry).await;
+
+    // No peer record should have been created.
+    assert!(
+        db.get_peer(&device_id).expect("db ok").is_none(),
+        "revocation_unknown_master_ignored: no PeerRecord should exist for unknown master"
+    );
+}
+
+/// revocation_no_sender_is_dropped_gracefully:
+/// Entry with no sender field: dispatch warns and returns without panic.
+#[tokio::test]
+async fn revocation_no_sender_is_dropped_gracefully() {
+    let db = Db::open_in_memory().expect("db");
+    let now = Timestamp::now().0;
+    let entry = MailboxEntry {
+        target: make_identity(0xFF),
+        msg_id: [0xE3u8; 16],
+        class: MailboxClass::Revocation,
+        payload_version: 1,
+        payload: vec![0x01, 0x02],
+        expires_at: now + 86400 * 30,
+        stored_at: now,
+        sender: None, // no sender
+    };
+
+    let handler =
+        Arc::new(ProcessorRevocationHandler::new(db.clone())) as Arc<dyn RevocationMailboxHandler>;
+
+    // Must not panic.
+    super::dispatch_revocation(&handler, entry).await;
+}

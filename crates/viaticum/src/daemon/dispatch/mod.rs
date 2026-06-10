@@ -684,7 +684,7 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
     use viaticum_core::types::DeviceId;
 
     use crate::daemon::cluster_sync::ClusterSyncManager;
-    use crate::daemon::relay::RelayPost;
+    // relay_post_tx kept inert (T-13b-3 will remove relay entirely).
 
     let cluster_state = match &state.cluster_state {
         Some(cs) => cs,
@@ -752,27 +752,141 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
         "device revoked, epoch rotated"
     );
 
-    // Post RevocationBroadcast to relay board so peers learn about the revocation.
-    if let (Some(cert), Some(relay_tx)) = (device_cert, &state.relay_post_tx) {
+    // T-13b-2: Publish directed Revocation entries to storage-relationship peers only.
+    //
+    // Target-master set = { get_master_for_device(p.holder_id) ∀ our placements }
+    //                   ∪ { h.owner_id ∀ our holdings }
+    // deduplicated, excluding our own master (cluster siblings learn via cluster_sync epoch path).
+    //
+    // relay_post_tx is intentionally kept inert here (scope fence: T-13b-3 removes relay entirely).
+    if let (Some(cert), Some(mailbox_router)) = (device_cert, state.mailbox_router.as_ref()) {
         let broadcast = ClusterSyncManager::build_revocation_broadcast(&revocation, &cert);
         match to_cbor(&broadcast) {
             Ok(payload) => {
-                let msg_id: [u8; 16] = rand::random();
-                let post = RelayPost {
-                    msg_type: "revocation_broadcast".to_string(),
-                    target: None, // broadcast — no specific target
-                    payload,
-                    msg_id,
-                };
-                if relay_tx.send(post).await.is_err() {
-                    tracing::warn!(
+                // Build storage-relationship target-master set.
+                use std::collections::HashSet;
+                use viaticum_core::mailbox::{MailboxClass, MailboxEntry};
+                use viaticum_core::types::IdentityPub;
+
+                let my_master: IdentityPub =
+                    IdentityPub(state.master_key.verifying_key().to_bytes());
+
+                let mut target_masters: HashSet<IdentityPub> = HashSet::new();
+
+                // (1) Holders of our data: placements → holder_id → holder master.
+                match state.db.list_all_placements() {
+                    Ok(placements) => {
+                        for placement in &placements {
+                            match state.db.get_master_for_device(&placement.holder_id) {
+                                Ok(Some(master)) => {
+                                    if master != my_master {
+                                        target_masters.insert(master);
+                                    }
+                                }
+                                Ok(None) => {
+                                    tracing::debug!(
+                                        holder = %placement.holder_id,
+                                        "dispatch_device_revoke: no master for holder device, skipping"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        holder = %placement.holder_id,
+                                        err = %e,
+                                        "dispatch_device_revoke: db error resolving holder master"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            err = %e,
+                            "dispatch_device_revoke: list_all_placements failed, skipping holder targets"
+                        );
+                    }
+                }
+
+                // (2) Owners we hold for: holdings → owner_id (already a master IdentityPub).
+                match state.db.list_all_holdings() {
+                    Ok(holdings) => {
+                        for holding in &holdings {
+                            if holding.owner_id != my_master {
+                                target_masters.insert(holding.owner_id);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            err = %e,
+                            "dispatch_device_revoke: list_all_holdings failed, skipping owner targets"
+                        );
+                    }
+                }
+
+                let target_count = target_masters.len();
+                if target_count == 0 {
+                    tracing::info!(
                         device_id = %device_id_hex,
-                        "relay channel closed — revocation broadcast not delivered"
+                        "dispatch_device_revoke: no storage-relationship peers — revocation not published (no targets)"
                     );
                 } else {
                     tracing::info!(
                         device_id = %device_id_hex,
-                        "revocation broadcast posted to relay board"
+                        target_masters = target_count,
+                        "dispatch_device_revoke: publishing directed revocation to storage-relationship peers"
+                    );
+
+                    let ttl_secs = viaticum_core::mailbox::class_config::REVOCATION_TTL.as_secs();
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let mut total_acks: usize = 0;
+                    let mut zero_ack_targets: usize = 0;
+
+                    for target_master in &target_masters {
+                        let msg_id: [u8; 16] = rand::random();
+                        let entry = MailboxEntry {
+                            target: *target_master,
+                            msg_id,
+                            class: MailboxClass::Revocation,
+                            payload_version: 1,
+                            payload: payload.clone(),
+                            expires_at: now_secs + ttl_secs,
+                            stored_at: now_secs,
+                            sender: Some(my_master),
+                        };
+                        match mailbox_router.publish(target_master, entry).await {
+                            Ok(0) => {
+                                zero_ack_targets += 1;
+                                tracing::warn!(
+                                    device_id = %device_id_hex,
+                                    target = %target_master,
+                                    "dispatch_device_revoke: 0 acks for revocation target (best-effort)"
+                                );
+                            }
+                            Ok(acks) => {
+                                total_acks += acks;
+                            }
+                            Err(e) => {
+                                zero_ack_targets += 1;
+                                tracing::warn!(
+                                    device_id = %device_id_hex,
+                                    target = %target_master,
+                                    err = %e,
+                                    "dispatch_device_revoke: revocation publish failed for target"
+                                );
+                            }
+                        }
+                    }
+
+                    tracing::info!(
+                        device_id = %device_id_hex,
+                        targets = target_count,
+                        total_acks,
+                        zero_ack_targets,
+                        "dispatch_device_revoke: directed revocation publish complete (best-effort)"
                     );
                 }
             }
@@ -780,7 +894,7 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
                 tracing::error!(
                     device_id = %device_id_hex,
                     err = %e,
-                    "failed to CBOR-encode revocation broadcast"
+                    "dispatch_device_revoke: failed to CBOR-encode RevocationBroadcast"
                 );
             }
         }

@@ -1,4 +1,4 @@
-// T-6/T-7/T-13b-1: Mailbox poll loop — periodic mailbox polling and entry dispatch.
+// T-6/T-7/T-13b-1/T-13b-2: Mailbox poll loop — periodic mailbox polling and entry dispatch.
 //
 // Polls this node's mailbox from read-fanout candidates every MAILBOX_POLL_INTERVAL_SECS.
 // Also polls immediately on startup (per spec §2.17: "poll on startup after Kademlia stabilize";
@@ -12,6 +12,7 @@
 //                    if entry.target != my_master_pub:  store in mailbox DB (we are postman)
 //   DropNotice     → DropNoticeHandler::handle_drop_notice (T-7: decode batch, apply each notice)
 //   DeleteRequest  → DeleteMailboxHandler::handle_delete_request (T-13b-1: Delete/CancelDelete)
+//   Revocation     → RevocationMailboxHandler::handle_revocation (T-13b-2: device revocation)
 //   Generic/other  → ignore
 
 use std::sync::{Arc, Mutex};
@@ -31,7 +32,7 @@ use viaticum_core::types::IdentityPub;
 use viaticum_core::types::from_cbor_bytes;
 
 use super::routing::MailboxRouter;
-use crate::daemon::processor::DeleteMailboxHandler;
+use crate::daemon::processor::{DeleteMailboxHandler, RevocationMailboxHandler};
 
 /// Run the periodic mailbox poll loop.
 ///
@@ -46,6 +47,7 @@ use crate::daemon::processor::DeleteMailboxHandler;
 ///   PosChallenge and return an optional PosHashResponseMsg + owner_master for publishing
 /// - `drop_handler`: called for each DropNotice decoded from a SymbolDropNoticeBatchMsg entry
 /// - `delete_handler`: called for each DeleteRequest entry (T-13b-1)
+/// - `revocation_handler`: called for each Revocation entry (T-13b-2)
 /// - `my_master_pub`: this node's master identity (used to detect own SelfPointers)
 /// - `current_pointer`: shared handle with run_periodic_push. On receiving our own verified
 ///   SelfPointer, update this handle (W-2: restart-recovery — re-learn latest published pointer).
@@ -58,6 +60,7 @@ pub async fn run_mailbox_poll(
     challenge_handler: Arc<dyn PosMailboxChallengeHandler>,
     drop_handler: Arc<dyn DropNoticeHandler>,
     delete_handler: Arc<dyn DeleteMailboxHandler>,
+    revocation_handler: Arc<dyn RevocationMailboxHandler>,
     my_master_pub: IdentityPub,
     current_pointer: Arc<Mutex<Option<SelfPointer>>>,
     cancel: CancellationToken,
@@ -103,6 +106,7 @@ pub async fn run_mailbox_poll(
                         &challenge_handler,
                         &drop_handler,
                         &delete_handler,
+                        &revocation_handler,
                         &my_master_pub,
                         &current_pointer,
                         entry,
@@ -124,6 +128,7 @@ pub(crate) async fn dispatch_entry(
     challenge_handler: &Arc<dyn PosMailboxChallengeHandler>,
     drop_handler: &Arc<dyn DropNoticeHandler>,
     delete_handler: &Arc<dyn DeleteMailboxHandler>,
+    revocation_handler: &Arc<dyn RevocationMailboxHandler>,
     my_master_pub: &IdentityPub,
     current_pointer: &Arc<Mutex<Option<SelfPointer>>>,
     entry: MailboxEntry,
@@ -147,6 +152,9 @@ pub(crate) async fn dispatch_entry(
         }
         MailboxClass::DeleteRequest => {
             dispatch_delete_request(delete_handler, entry).await;
+        }
+        MailboxClass::Revocation => {
+            dispatch_revocation(revocation_handler, entry).await;
         }
     }
 }
@@ -432,6 +440,39 @@ pub(crate) async fn dispatch_delete_request(
             owner = %owner_master,
             err = %e,
             "mailbox_poll: DeleteRequest handler error"
+        );
+    }
+}
+
+/// Handle a Revocation entry (T-13b-2).
+///
+/// Requires `entry.sender` to identify the revoking master. Warns and returns if absent —
+/// cannot authenticate without a sender identity.
+pub(crate) async fn dispatch_revocation(
+    revocation_handler: &Arc<dyn RevocationMailboxHandler>,
+    entry: MailboxEntry,
+) {
+    let revoking_master = match entry.sender {
+        Some(s) => s,
+        None => {
+            warn!(
+                msg_id = ?entry.msg_id,
+                target = %entry.target,
+                "mailbox_poll: Revocation has no sender — cannot authenticate, dropping"
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = revocation_handler
+        .handle_revocation(revoking_master, entry.payload)
+        .await
+    {
+        error!(
+            msg_id = ?entry.msg_id,
+            revoking_master = %revoking_master,
+            err = %e,
+            "mailbox_poll: Revocation handler error"
         );
     }
 }

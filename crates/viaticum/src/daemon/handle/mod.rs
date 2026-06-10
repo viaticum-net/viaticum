@@ -102,6 +102,10 @@ pub struct DaemonState {
     /// Per-peer rejection backoff. Shared by repair + backup pipelines so a
     /// QuotaFull from peer X in one path is also visible to the other.
     pub peer_backoff: std::sync::Arc<crate::daemon::peer_backoff::PeerBackoff>,
+    /// Mailbox router — used by dispatch_device_revoke (T-13b-2) to publish directed
+    /// revocation entries to storage-relationship peers instead of relay broadcast.
+    /// None in tests that do not wire up a MailboxRouter.
+    pub mailbox_router: Option<std::sync::Arc<crate::daemon::mailbox::routing::MailboxRouter>>,
 }
 
 // ─── DaemonHandle ─────────────────────────────────────────────────────────────
@@ -552,6 +556,44 @@ impl DaemonHandle {
         ));
         let restart_gate = Arc::new(crate::daemon::restart::RestartGate::new());
 
+        // ── 11.5. Build MailboxRouter (needed by DaemonState for dispatch_device_revoke) ──
+        // Built here (before DaemonState) because DaemonState carries mailbox_router for
+        // dispatch_device_revoke (T-13b-2). Mirrors the construction in Phase 6.5 below.
+        //
+        // Safety: swarm_handle_arc and db are both available here. The same Arc is reused
+        // below in Phase 6.5 (scheduler + mailbox poll wiring) — no double-construction.
+        let early_mailbox_router: std::sync::Arc<crate::daemon::mailbox::routing::MailboxRouter> = {
+            struct NoNetworkSenderEarly;
+            #[async_trait::async_trait]
+            impl crate::daemon::mailbox::routing::MailboxNetworkSender for NoNetworkSenderEarly {
+                async fn send_store(
+                    &self,
+                    _device: viaticum_core::types::DeviceId,
+                    _req: viaticum_core::messages::MailboxStoreRequest,
+                ) -> anyhow::Result<viaticum_core::messages::MailboxStoreResponse> {
+                    anyhow::bail!("no network available (swarm not started)")
+                }
+                async fn send_fetch(
+                    &self,
+                    _device: viaticum_core::types::DeviceId,
+                    _req: viaticum_core::messages::MailboxFetchRequest,
+                ) -> anyhow::Result<viaticum_core::messages::MailboxFetchResponse> {
+                    anyhow::bail!("no network available (swarm not started)")
+                }
+            }
+            if let Some(swarm) = swarm_handle_arc.clone() {
+                std::sync::Arc::new(crate::daemon::mailbox::routing::MailboxRouter::new(
+                    swarm,
+                    db.clone(),
+                ))
+            } else {
+                std::sync::Arc::new(crate::daemon::mailbox::routing::MailboxRouter::with_sender(
+                    std::sync::Arc::new(NoNetworkSenderEarly),
+                    db.clone(),
+                ))
+            }
+        };
+
         // ── 12. Build DaemonState (shared with CliServer) ─────────────────────
         // Clone restore_tx so CliServer can forward requests to RestoreCoordinator.
         // The original is held by the cancel task (dropped on shutdown to close channel).
@@ -588,6 +630,8 @@ impl DaemonHandle {
             },
             shutdown_token: cancel.clone(),
             peer_backoff: Arc::clone(&peer_backoff),
+            // T-13b-2: router shared with dispatch_device_revoke for directed revocation publish.
+            mailbox_router: Some(std::sync::Arc::clone(&early_mailbox_router)),
         });
 
         // Clone state for web API and metrics pusher.
@@ -1056,52 +1100,15 @@ impl DaemonHandle {
         // Pass the same PendingChallenges Arc created for Processor above.
         // Scheduler writes to it; Processor reads it when verifying PosResponse.
 
-        // T-6: Build MailboxRouter and pos_response channel.
+        // T-6: MailboxRouter already built in step 11.5 (early_mailbox_router).
+        // Reuse the same Arc here for scheduler + mailbox poll wiring.
         // pos_response_tx: poll loop → scheduler (bounded 256, try_send + WARN on full).
         let (pos_response_tx, pos_response_rx) =
             mpsc::channel::<viaticum_core::messages::PosHashResponseMsg>(256);
 
-        // mailbox_router: requires a live swarm. If swarm is unavailable, use a
-        // no-network router (will always get 0 acks, scheduler logs warn + retries).
-        // In practice this branch is rare: swarm=None + reaching scheduler = cluster_state=None path.
-        let mailbox_router: std::sync::Arc<crate::daemon::mailbox::routing::MailboxRouter> =
-            if let Some(swarm) = swarm_handle_arc.clone() {
-                std::sync::Arc::new(crate::daemon::mailbox::routing::MailboxRouter::new(
-                    swarm,
-                    db.clone(),
-                ))
-            } else {
-                // No swarm: build router with a dummy/isolated sender.
-                // This is a degraded path — no challenges will be delivered.
-                // Using the with_sender constructor with a no-op mock.
-                struct NoNetworkSender;
-                #[async_trait::async_trait]
-                impl crate::daemon::mailbox::routing::MailboxNetworkSender for NoNetworkSender {
-                    async fn send_store(
-                        &self,
-                        _device: viaticum_core::types::DeviceId,
-                        _req: viaticum_core::messages::MailboxStoreRequest,
-                    ) -> anyhow::Result<viaticum_core::messages::MailboxStoreResponse>
-                    {
-                        anyhow::bail!("no network available (swarm not started)")
-                    }
-                    async fn send_fetch(
-                        &self,
-                        _device: viaticum_core::types::DeviceId,
-                        _req: viaticum_core::messages::MailboxFetchRequest,
-                    ) -> anyhow::Result<viaticum_core::messages::MailboxFetchResponse>
-                    {
-                        anyhow::bail!("no network available (swarm not started)")
-                    }
-                }
-                tracing::warn!(
-                    "T-6: swarm unavailable — MailboxRouter in no-network mode (0 acks expected)"
-                );
-                std::sync::Arc::new(crate::daemon::mailbox::routing::MailboxRouter::with_sender(
-                    std::sync::Arc::new(NoNetworkSender),
-                    db.clone(),
-                ))
-            };
+        // Reuse early_mailbox_router built above (step 11.5). Same instance used in
+        // DaemonState.mailbox_router (for dispatch_device_revoke / T-13b-2).
+        let mailbox_router = std::sync::Arc::clone(&early_mailbox_router);
 
         let scheduler = Scheduler::new(
             db.clone(),
@@ -1145,11 +1152,13 @@ impl DaemonHandle {
         // T-7:     ProcessorDropHandler handles DropNotice batch entries (db only).
         // T-8:     current_pointer shared handle passed in for W-2 dispatch (restart-recovery).
         // T-13b-1: ProcessorDeleteHandler handles DeleteRequest entries (Delete/CancelDelete).
+        // T-13b-2: ProcessorRevocationHandler handles Revocation entries (device revocation).
         // No Arc<Processor> wrap needed: all handlers are standalone structs built from clones.
         {
             use crate::daemon::mailbox::poll::run_mailbox_poll;
             use crate::daemon::processor::{
                 PosResponder, ProcessorDeleteHandler, ProcessorDropHandler, ProcessorPosHandler,
+                ProcessorRevocationHandler,
             };
 
             let pos_handler = ProcessorPosHandler::new(PosResponder::new(
@@ -1166,6 +1175,10 @@ impl DaemonHandle {
             // Only requires db — same as SymbolDropHandler.
             let delete_handler = ProcessorDeleteHandler::new(db.clone());
 
+            // T-13b-2: ProcessorRevocationHandler handles Revocation entries via mailbox.
+            // Only requires db — mirrors the relay-board revocation_broadcast handler.
+            let revocation_handler = ProcessorRevocationHandler::new(db.clone());
+
             let poll_db = db.clone();
             let poll_router = std::sync::Arc::clone(&mailbox_router);
             let poll_pos_tx = pos_response_tx.clone();
@@ -1180,6 +1193,7 @@ impl DaemonHandle {
                     std::sync::Arc::new(pos_handler),
                     std::sync::Arc::new(drop_handler),
                     std::sync::Arc::new(delete_handler),
+                    std::sync::Arc::new(revocation_handler),
                     poll_identity,
                     poll_current_pointer,
                     poll_cancel,
