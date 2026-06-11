@@ -29,6 +29,25 @@ use crate::daemon::mailbox::candidate::{KademliaRoutingView, should_store};
 use crate::daemon::network::swarm::device_id_to_peer_id;
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Sweep cadence
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Mailbox housekeeping sweep cadence in seconds, scaled by `time_scale`.
+///
+/// Mirrors the scheduler and the mailbox poll loop (`poll::poll_interval_secs`),
+/// which divide every cadence by `time_scale`. Under time acceleration the producers
+/// scale their entry TTLs (`scaled_ttl_secs`) so entries expire in accelerated time;
+/// if the sweep kept ticking at a fixed wall-clock 6 hours while TTLs shrank to
+/// seconds, expired entries would pile up and the membership-cleanup would lag the
+/// candidate-set churn — the whole housekeeping path would be untestable under
+/// acceleration. Production (`time_scale = 1`) keeps the full
+/// `MAILBOX_SWEEP_INTERVAL_SECS` cadence. Floored at 1s so `tokio::time::interval`
+/// never gets a 0s period (which panics); `time_scale = 0` is treated as 1.
+pub(crate) fn sweep_interval_secs(time_scale: u64) -> u64 {
+    (MAILBOX_SWEEP_INTERVAL_SECS / time_scale.max(1)).max(1)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // TTL sweep task
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -37,11 +56,14 @@ use crate::daemon::network::swarm::device_id_to_peer_id;
 /// Removes all entries whose `expires_at < now_secs`, including high-trust
 /// SelfPointer entries. This is the ONLY eviction path for SelfPointers.
 ///
-/// Interval: MAILBOX_SWEEP_INTERVAL_SECS (6 hours). First sweep fires immediately
-/// on startup to collect any entries that expired while the daemon was offline.
-pub async fn run_mailbox_ttl_sweep(db: Db, cancel: CancellationToken) {
-    let mut interval =
-        tokio::time::interval(std::time::Duration::from_secs(MAILBOX_SWEEP_INTERVAL_SECS));
+/// Interval: `sweep_interval_secs(time_scale)` — MAILBOX_SWEEP_INTERVAL_SECS
+/// (6 hours) in production, divided by `time_scale` under acceleration. First sweep
+/// fires immediately on startup to collect any entries that expired while the daemon
+/// was offline.
+pub async fn run_mailbox_ttl_sweep(db: Db, time_scale: u64, cancel: CancellationToken) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(sweep_interval_secs(
+        time_scale,
+    )));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -89,10 +111,17 @@ pub async fn run_mailbox_ttl_sweep(db: Db, cancel: CancellationToken) {
 /// Routing view sourcing: built on-demand per sweep from the DB, no live swarm needed.
 /// `my_peer_id` is derived from the device signing key (stable, precomputed by caller).
 ///
-/// Interval: MAILBOX_SWEEP_INTERVAL_SECS (same as TTL sweep — one housekeeping cadence).
-pub async fn run_mailbox_self_cleanup(db: Db, my_peer_id: PeerId, cancel: CancellationToken) {
-    let mut interval =
-        tokio::time::interval(std::time::Duration::from_secs(MAILBOX_SWEEP_INTERVAL_SECS));
+/// Interval: `sweep_interval_secs(time_scale)` (same as TTL sweep — one housekeeping
+/// cadence, scaled by `time_scale`).
+pub async fn run_mailbox_self_cleanup(
+    db: Db,
+    my_peer_id: PeerId,
+    time_scale: u64,
+    cancel: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(sweep_interval_secs(
+        time_scale,
+    )));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {

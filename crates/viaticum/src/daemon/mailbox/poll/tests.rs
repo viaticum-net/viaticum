@@ -1,7 +1,8 @@
 // Tests for the mailbox poll dispatch logic.
 //
-// Strategy: test dispatch_entry directly using the MockPosMailboxChallengeHandler
-// (no live network needed). Verify routing decisions for each MailboxClass.
+// Strategy: exercise the per-class dispatch_* fns directly with an in-memory DB and
+// stub handlers / a recording MailboxNetworkSender (no live network needed). Verify
+// routing and effects for each MailboxClass.
 
 use std::sync::Arc;
 
@@ -1111,4 +1112,154 @@ fn poll_interval_scales_with_time_scale() {
     assert_eq!(poll_interval_secs(MAILBOX_POLL_INTERVAL_SECS), 1);
     // Zero time_scale must not divide-by-zero; treated as 1 (production cadence).
     assert_eq!(poll_interval_secs(0), MAILBOX_POLL_INTERVAL_SECS);
+}
+
+// ─── A2: PosResponse entry TTL is scaled by time_scale ─────────────────────────
+// dispatch_pos_challenge is the ONLY site that constructs a PosResponse MailboxEntry.
+// Its TTL must be scaled by time_scale (scaled_ttl_secs), mirroring the scheduler's
+// scaled pending-challenge timeout — under acceleration a late response must not
+// outlive the timeout window. The implementing agent for A2 died mid-flight (its TDD
+// RED observation was lost), and this publish site had NO test coverage (reviewer
+// WARN-1), so this behavioral test pins the scaling. expires_at and stored_at are
+// both derived from one `now_secs` inside dispatch, so their delta equals ttl_secs
+// exactly (no clock tolerance needed).
+
+use viaticum_core::mailbox::class_config::POS_CHALLENGE_TTL;
+use viaticum_core::mailbox::scaled_ttl_secs;
+use viaticum_core::messages::{
+    MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
+};
+
+use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
+
+/// Stub PosMailboxChallengeHandler: returns a canned response regardless of payload,
+/// so dispatch_pos_challenge proceeds to build + publish the PosResponse entry.
+struct StubChallengeHandler {
+    response: PosHashResponseMsg,
+}
+
+#[async_trait::async_trait]
+impl super::PosMailboxChallengeHandler for StubChallengeHandler {
+    async fn handle_pos_challenge(
+        &self,
+        _owner_master_pub: IdentityPub,
+        _payload: Vec<u8>,
+    ) -> anyhow::Result<Option<PosHashResponseMsg>> {
+        Ok(Some(self.response.clone()))
+    }
+}
+
+/// Records every MailboxStoreRequest the router publishes, so the test can inspect
+/// the published entry's TTL.
+struct RecordingSender {
+    stored: tokio::sync::Mutex<Vec<MailboxStoreRequest>>,
+}
+
+#[async_trait::async_trait]
+impl MailboxNetworkSender for RecordingSender {
+    async fn send_store(
+        &self,
+        _device: DeviceId,
+        req: MailboxStoreRequest,
+    ) -> anyhow::Result<MailboxStoreResponse> {
+        let msg_id = req.entry.msg_id;
+        self.stored.lock().await.push(req);
+        Ok(MailboxStoreResponse::Ack { msg_id })
+    }
+
+    async fn send_fetch(
+        &self,
+        _device: DeviceId,
+        _req: MailboxFetchRequest,
+    ) -> anyhow::Result<MailboxFetchResponse> {
+        Ok(MailboxFetchResponse {
+            v: 1,
+            entries: vec![],
+            served_msg_ids: vec![],
+        })
+    }
+}
+
+/// Real Ed25519 DeviceId so device_id_to_peer_id succeeds and the router has a
+/// publish candidate.
+fn gen_device_id() -> DeviceId {
+    use libp2p::identity::Keypair;
+    let kp = Keypair::generate_ed25519();
+    DeviceId(kp.try_into_ed25519().unwrap().public().to_bytes())
+}
+
+#[tokio::test]
+async fn pos_response_entry_ttl_is_scaled_by_time_scale() {
+    let db = Db::open_in_memory().expect("db");
+
+    // One valid peer so the router has at least one publish candidate.
+    let peer = PeerRecord {
+        device_id: gen_device_id(),
+        master_identity: IdentityPub([0xAB; 32]),
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: 0.5,
+        last_avail_sample: 0,
+    };
+    db.upsert_peer(&peer).expect("upsert peer");
+
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = Arc::new(MailboxRouter::with_sender(
+        Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>,
+        db.clone(),
+    ));
+
+    let response = PosHashResponseMsg {
+        v: 1,
+        challenge_id: [7u8; 16],
+        source_block_id: SourceBlockId([8u8; 32]),
+        chain_hash: [9u8; 32],
+        timestamp: Timestamp::now(),
+        device_id: None,
+        sig: [0u8; 64],
+    };
+    let handler: Arc<dyn super::PosMailboxChallengeHandler> =
+        Arc::new(StubChallengeHandler { response });
+
+    let owner_master = make_identity(0x42);
+    let my_master = make_identity(0xAA);
+    // Payload is opaque to the stub handler; entry.sender = the challenging owner.
+    let base = make_entry(MailboxClass::PosChallenge, my_master, vec![0x00]);
+    let entry = MailboxEntry {
+        sender: Some(owner_master),
+        ..base
+    };
+
+    let time_scale = 60;
+    super::dispatch_pos_challenge(&router, &handler, &my_master, entry, time_scale).await;
+
+    let stored = sender.stored.lock().await;
+    assert_eq!(stored.len(), 1, "exactly one PosResponse must be published");
+    let published = &stored[0].entry;
+    assert_eq!(
+        published.class,
+        MailboxClass::PosResponse,
+        "published entry must be a PosResponse"
+    );
+
+    let ttl = published.expires_at - published.stored_at;
+    assert_eq!(
+        ttl,
+        scaled_ttl_secs(POS_CHALLENGE_TTL.as_secs(), time_scale),
+        "PosResponse TTL must be the challenge TTL scaled by time_scale"
+    );
+    assert!(
+        ttl < POS_CHALLENGE_TTL.as_secs(),
+        "scaled TTL must be strictly less than the full unscaled TTL"
+    );
 }

@@ -119,6 +119,7 @@ pub async fn run_periodic_push(
     master_key: ed25519_dalek::SigningKey,
     data_dir: PathBuf,
     interval_secs: u64,
+    time_scale: u64,
     cancel: CancellationToken,
     mailbox_router: Arc<MailboxRouter>,
     my_master_pub: IdentityPub,
@@ -267,6 +268,7 @@ pub async fn run_periodic_push(
             last_pointer_struct_key.as_ref(),
             last_publish_at,
             now_secs,
+            time_scale,
         )
         .await;
         last_pointer_struct_key = new_key;
@@ -307,6 +309,7 @@ pub(crate) async fn publish_pointer_step(
     last_key: Option<&PointerStructKey>,
     last_publish_at: u64,
     now_secs: u64,
+    time_scale: u64,
 ) -> (Option<PointerStructKey>, u64) {
     // Build the self-pointer over the PLACED prefix of base + diffs.
     // If the base has not been placed yet, skip this tick.
@@ -340,7 +343,11 @@ pub(crate) async fn publish_pointer_step(
     }
 
     let blob = to_cbor_bytes(&pointer);
-    let expires_at = now_secs + class_config::SELF_POINTER_TTL.as_secs();
+    let expires_at = now_secs
+        + viaticum_core::mailbox::scaled_ttl_secs(
+            class_config::SELF_POINTER_TTL.as_secs(),
+            time_scale,
+        );
 
     let mut msg_id = [0u8; 16];
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);

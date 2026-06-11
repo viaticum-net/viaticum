@@ -736,7 +736,10 @@ impl Scheduler {
                     }
                 };
 
-                let ttl_secs = viaticum_core::mailbox::class_config::POS_CHALLENGE_TTL.as_secs();
+                let ttl_secs = viaticum_core::mailbox::scaled_ttl_secs(
+                    viaticum_core::mailbox::class_config::POS_CHALLENGE_TTL.as_secs(),
+                    self.config.time_scale,
+                );
                 let expires_at = now.0 + ttl_secs;
                 let entry = MailboxEntry {
                     target: holder_master,
@@ -1037,8 +1040,10 @@ impl Scheduler {
                         // (block_id, owner) + the Active→MarkedForDelete status-guard, not on
                         // msg_id, so a stable id does not change holder-side behaviour.
                         let msg_id = stable_delete_msg_id(&source_block_id, &holder_master);
-                        let ttl_secs =
-                            viaticum_core::mailbox::class_config::DELETE_REQUEST_TTL.as_secs();
+                        let ttl_secs = viaticum_core::mailbox::scaled_ttl_secs(
+                            viaticum_core::mailbox::class_config::DELETE_REQUEST_TTL.as_secs(),
+                            self.config.time_scale,
+                        );
                         let entry = MailboxEntry {
                             target: holder_master,
                             msg_id,

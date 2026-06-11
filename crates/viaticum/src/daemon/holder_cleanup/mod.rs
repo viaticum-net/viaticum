@@ -89,13 +89,14 @@ pub async fn run(
                     &db, &holdings_dir, &mailbox_router, holder_master_pub,
                     soft_quota_bytes, hard_quota_bytes,
                     &data_dir, disk_reserve_bytes,
+                    time_scale,
                     &master_signing_key,
                 ).await {
                     error!("holder_cleanup: check_pressure error: {e}");
                 }
             }
             _ = drop_notice_timer.tick() => {
-                if let Err(e) = cleanup_drop_notices(&db, &holdings_dir, &mailbox_router, holder_master_pub, &master_signing_key).await {
+                if let Err(e) = cleanup_drop_notices(&db, &holdings_dir, &mailbox_router, holder_master_pub, time_scale, &master_signing_key).await {
                     error!("holder_cleanup: cleanup_drop_notices error: {e}");
                 }
             }
@@ -159,6 +160,7 @@ async fn cleanup_expired(
             holding.owner_id,
             holding.source_block_id,
             &holding.esi_ranges,
+            time_scale,
             master_signing_key,
         )
         .await;
@@ -196,6 +198,7 @@ async fn cleanup_drop_notices(
     holdings_dir: &Path,
     mailbox_router: &Arc<MailboxRouter>,
     holder_master_pub: IdentityPub,
+    time_scale: u64,
     master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
     let now = Timestamp::now();
@@ -242,6 +245,7 @@ async fn cleanup_drop_notices(
             holding.owner_id,
             holding.source_block_id,
             &holding.esi_ranges,
+            time_scale,
             master_signing_key,
         )
         .await;
@@ -285,6 +289,7 @@ async fn check_pressure(
     hard_quota_bytes: u64,
     data_dir: &Path,
     disk_reserve_bytes: u64,
+    time_scale: u64,
     master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
     let now = Timestamp::now();
@@ -378,6 +383,7 @@ async fn check_pressure(
                     target.owner_id,
                     target.source_block_id,
                     &esi_ranges,
+                    time_scale,
                     master_signing_key,
                 )
                 .await;
@@ -392,6 +398,7 @@ async fn check_pressure(
                 mailbox_router,
                 holder_master_pub,
                 now,
+                time_scale,
                 master_signing_key,
             )
             .await;
@@ -435,6 +442,7 @@ async fn publish_drop_notices_via_mailbox(
     mailbox_router: &Arc<MailboxRouter>,
     holder_master_pub: IdentityPub,
     now: Timestamp,
+    time_scale: u64,
     master_signing_key: &ed25519_dalek::SigningKey,
 ) {
     if drop_notices.is_empty() {
@@ -482,7 +490,10 @@ async fn publish_drop_notices_via_mailbox(
     }
 
     let now_secs = now.0;
-    let ttl_secs = class_config::DROP_NOTICE_TTL.as_secs();
+    let ttl_secs = viaticum_core::mailbox::scaled_ttl_secs(
+        class_config::DROP_NOTICE_TTL.as_secs(),
+        time_scale,
+    );
 
     // Step 2: For each owner, chunk and publish.
     for (owner_id, notices) in &by_owner {
@@ -665,6 +676,7 @@ async fn post_symbol_dropped_via_mailbox(
     owner_id: IdentityPub,
     source_block_id: viaticum_core::types::SourceBlockId,
     esi_ranges: &[(u32, u32)],
+    time_scale: u64,
     master_signing_key: &ed25519_dalek::SigningKey,
 ) {
     let now = Timestamp::now();
@@ -696,7 +708,10 @@ async fn post_symbol_dropped_via_mailbox(
         }
     };
 
-    let ttl_secs = class_config::DROP_NOTICE_TTL.as_secs();
+    let ttl_secs = viaticum_core::mailbox::scaled_ttl_secs(
+        class_config::DROP_NOTICE_TTL.as_secs(),
+        time_scale,
+    );
     let mut msg_id = [0u8; 16];
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
 

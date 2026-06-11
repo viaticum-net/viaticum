@@ -834,7 +834,10 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
                         "dispatch_device_revoke: publishing directed revocation to storage-relationship peers"
                     );
 
-                    let ttl_secs = viaticum_core::mailbox::class_config::REVOCATION_TTL.as_secs();
+                    let ttl_secs = viaticum_core::mailbox::scaled_ttl_secs(
+                        viaticum_core::mailbox::class_config::REVOCATION_TTL.as_secs(),
+                        state.time_scale,
+                    );
                     let now_secs = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()

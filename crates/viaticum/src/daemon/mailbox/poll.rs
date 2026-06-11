@@ -129,6 +129,7 @@ pub async fn run_mailbox_poll(
                         &current_pointer,
                         entry,
                         now_secs,
+                        time_scale,
                     )
                     .await;
                 }
@@ -151,10 +152,12 @@ pub(crate) async fn dispatch_entry(
     current_pointer: &Arc<Mutex<Option<SelfPointer>>>,
     entry: MailboxEntry,
     now_secs: u64,
+    time_scale: u64,
 ) {
     match entry.class {
         MailboxClass::PosChallenge => {
-            dispatch_pos_challenge(router, challenge_handler, my_master_pub, entry).await;
+            dispatch_pos_challenge(router, challenge_handler, my_master_pub, entry, time_scale)
+                .await;
         }
         MailboxClass::PosResponse => {
             dispatch_pos_response(pos_response_tx, entry);
@@ -189,6 +192,7 @@ async fn dispatch_pos_challenge(
     challenge_handler: &Arc<dyn PosMailboxChallengeHandler>,
     my_master_pub: &IdentityPub,
     entry: MailboxEntry,
+    time_scale: u64,
 ) {
     let owner_master = match entry.sender {
         Some(s) => s,
@@ -217,8 +221,13 @@ async fn dispatch_pos_challenge(
                 }
             };
 
-            // PosResponse TTL = same as challenge TTL (7 days).
-            let ttl_secs = viaticum_core::mailbox::class_config::POS_CHALLENGE_TTL.as_secs();
+            // PosResponse TTL = same as challenge TTL (7 days), scaled by time_scale
+            // so it matches the scheduler's scaled pending-challenge timeout — a late
+            // response must not outlive (or be outlived by) the timeout window.
+            let ttl_secs = viaticum_core::mailbox::scaled_ttl_secs(
+                viaticum_core::mailbox::class_config::POS_CHALLENGE_TTL.as_secs(),
+                time_scale,
+            );
             let now_secs = SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

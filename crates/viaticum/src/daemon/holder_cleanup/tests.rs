@@ -382,6 +382,7 @@ async fn check_pressure_normal_does_nothing() {
         0,
         holdings_dir.path(),
         0,
+        1, // time_scale
         &test_key(),
     )
     .await
@@ -470,6 +471,7 @@ async fn drop_notice_published_to_mailbox_on_eviction() {
         0,    // hard_quota_bytes = 0 (no floor)
         holdings_dir.path(),
         0, // disk_reserve_bytes
+        1, // time_scale
         &test_key(),
     )
     .await
@@ -589,6 +591,7 @@ async fn drop_notice_has_correct_ttl() {
         0,
         holdings_dir.path(),
         0,
+        1, // time_scale
         &test_key(),
     )
     .await
@@ -659,6 +662,7 @@ async fn mass_eviction_batches_into_single_mailbox_entry() {
         &router,
         holder_master_pub(),
         now,
+        1,
         &test_key(),
     )
     .await;
@@ -740,6 +744,7 @@ async fn drop_notices_for_different_owners_go_to_separate_entries() {
         &router,
         holder_master_pub(),
         now,
+        1,
         &test_key(),
     )
     .await;
@@ -829,6 +834,7 @@ async fn holder_drop_notice_sent_at_not_overwritten_on_second_send() {
         0,
         holdings_dir.path(),
         0,
+        1, // time_scale
         &test_key(),
     )
     .await
@@ -928,6 +934,7 @@ async fn holder_pressure_sets_drop_notice_sent_at_on_first_send() {
         0,    // hard_quota_bytes = 0 (no floor)
         holdings_dir.path(),
         0, // disk_reserve_bytes
+        1, // time_scale
         &test_key(),
     )
     .await
@@ -1006,6 +1013,7 @@ async fn drop_notice_zero_ack_retries_once_then_continues() {
         &router,
         holder_master_pub(),
         now,
+        1,
         &test_key(),
     )
     .await;

@@ -218,6 +218,7 @@ mod t8 {
             None,
             0,
             now_secs,
+            1, // time_scale = 1 (production): TTL unscaled
         )
         .await;
 
@@ -282,6 +283,62 @@ mod t8 {
         );
     }
 
+    /// P1-3 / PL-3: publishing under an accelerated `time_scale` bakes a SCALED TTL
+    /// into the SelfPointer entry's `expires_at` (not the full 5-year wall-clock TTL),
+    /// so the entry expires within accelerated test/demo time and the sweep can reclaim
+    /// it. With `time_scale = 60`, `expires_at - stored_at == SELF_POINTER_TTL / 60`.
+    #[tokio::test]
+    async fn publish_pointer_step_scales_ttl_by_time_scale() {
+        let db = test_db();
+        let (_pointer, master_key, my_master_pub, block_id, _holder) = build_placed_pointer(&db);
+
+        let sender = MockSender::new();
+        let peer_d = gen_device_id();
+        db.upsert_peer(&make_peer(peer_d)).unwrap();
+        let sender_dyn: Arc<dyn MailboxNetworkSender> =
+            sender.clone() as Arc<dyn MailboxNetworkSender>;
+        let router = MailboxRouter::with_sender(sender_dyn, db.clone());
+
+        let current_pointer: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
+        let now_secs = Timestamp::now().0;
+
+        let time_scale = 60u64;
+        let _ = publish_pointer_step(
+            &db,
+            &router,
+            &master_key,
+            &my_master_pub,
+            &current_pointer,
+            1,
+            &block_id,
+            &[],
+            None,
+            0,
+            now_secs,
+            time_scale,
+        )
+        .await;
+
+        let calls = sender.store_calls();
+        assert!(!calls.is_empty(), "at least one store call must have fired");
+
+        let (_, stored_entry) = &calls[0];
+        let ttl_actual = stored_entry
+            .expires_at
+            .saturating_sub(stored_entry.stored_at);
+        let ttl_expected = class_config::SELF_POINTER_TTL.as_secs() / time_scale;
+        assert!(
+            ttl_actual.abs_diff(ttl_expected) <= 2,
+            "expires_at-stored_at must equal SELF_POINTER_TTL/time_scale, \
+             got {ttl_actual} vs {ttl_expected}"
+        );
+        // Sanity: the scaled TTL is far below the full wall-clock TTL.
+        assert!(
+            ttl_actual < class_config::SELF_POINTER_TTL.as_secs(),
+            "scaled TTL must be strictly less than the full SELF_POINTER_TTL"
+        );
+    }
+
     /// T-8 spec (Fix 1, WARN-2): second call with same structural key and now within
     /// 30d window → NO new publish (mock call count unchanged), current_pointer unchanged.
     #[tokio::test]
@@ -312,6 +369,7 @@ mod t8 {
             None,
             0,
             now_secs,
+            1,
         )
         .await;
 
@@ -332,6 +390,7 @@ mod t8 {
             first_key.as_ref(),
             first_publish_at,
             now_secs2,
+            1,
         )
         .await;
 
@@ -383,6 +442,7 @@ mod t8 {
             Some(&fake_key),
             last_publish_at,
             now_secs,
+            1,
         )
         .await;
 
@@ -608,6 +668,7 @@ mod t8 {
             None, // no prior key — would normally force publish if placed
             0,
             now_secs,
+            1,
         )
         .await;
 

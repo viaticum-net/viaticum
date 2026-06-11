@@ -1182,19 +1182,25 @@ impl DaemonHandle {
                 }
             };
 
-            // (a) TTL sweep.
+            // (a) TTL sweep. Cadence scaled by time_scale (same as scheduler / poll).
             let sweep_db = db.clone();
             let sweep_cancel = cancel.clone();
             tasks.push(tokio::spawn(async move {
-                run_mailbox_ttl_sweep(sweep_db, sweep_cancel).await;
+                run_mailbox_ttl_sweep(sweep_db, time_scale, sweep_cancel).await;
                 Ok(())
             }));
 
-            // (b) Membership-based self-cleanup.
+            // (b) Membership-based self-cleanup. Cadence scaled by time_scale.
             let cleanup_db = db.clone();
             let cleanup_cancel = cancel.clone();
             tasks.push(tokio::spawn(async move {
-                run_mailbox_self_cleanup(cleanup_db, my_peer_id_for_cleanup, cleanup_cancel).await;
+                run_mailbox_self_cleanup(
+                    cleanup_db,
+                    my_peer_id_for_cleanup,
+                    time_scale,
+                    cleanup_cancel,
+                )
+                .await;
                 Ok(())
             }));
         }
@@ -1232,6 +1238,7 @@ impl DaemonHandle {
                         ss_master_key,
                         ss_data_dir,
                         ss_interval,
+                        time_scale,
                         cancel_ss,
                         ss_mailbox_router,
                         ss_my_master_pub,

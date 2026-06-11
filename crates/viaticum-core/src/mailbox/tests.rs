@@ -732,3 +732,44 @@ fn mailbox_list_non_high_trust_for_target_excludes_self_pointer() {
     assert_eq!(non_ht.len(), 1, "only non-HT entry expected");
     assert_eq!(non_ht[0].class, MailboxClass::PosChallenge);
 }
+
+// ============================================================
+// scaled_ttl_secs (time_scale scaling — P1-3 / PL-3)
+// ============================================================
+
+use crate::mailbox::scaled_ttl_secs;
+
+/// scale=1 (production) → TTL unchanged.
+#[test]
+fn scaled_ttl_is_unchanged_when_time_scale_is_one() {
+    let pos_ttl = 7 * 24 * 3600;
+    let delete_ttl = 14 * 24 * 3600;
+    let pointer_ttl = 5 * 365 * 24 * 3600;
+    assert_eq!(scaled_ttl_secs(pos_ttl, 1), pos_ttl);
+    assert_eq!(scaled_ttl_secs(delete_ttl, 1), delete_ttl);
+    assert_eq!(scaled_ttl_secs(pointer_ttl, 1), pointer_ttl);
+}
+
+/// scale=N → TTL divided by N.
+#[test]
+fn scaled_ttl_is_divided_when_time_scale_is_above_one() {
+    let pos_ttl = 7 * 24 * 3600; // 604_800
+    assert_eq!(scaled_ttl_secs(pos_ttl, 60), pos_ttl / 60);
+    assert_eq!(scaled_ttl_secs(pos_ttl, 3600), pos_ttl / 3600);
+}
+
+/// time_scale larger than the TTL → floored at 1 second, not 0.
+#[test]
+fn scaled_ttl_is_floored_at_one_when_time_scale_exceeds_ttl() {
+    let pos_ttl = 7 * 24 * 3600;
+    assert_eq!(scaled_ttl_secs(pos_ttl, 10_000_000), 1);
+    // Exactly equal divisor would give 1 too; one-greater divisor still floors to 1.
+    assert_eq!(scaled_ttl_secs(pos_ttl, pos_ttl + 1), 1);
+}
+
+/// time_scale=0 is guarded (treated as 1) — no panic, no division by zero.
+#[test]
+fn scaled_ttl_treats_zero_time_scale_as_one() {
+    let pos_ttl = 7 * 24 * 3600;
+    assert_eq!(scaled_ttl_secs(pos_ttl, 0), pos_ttl);
+}

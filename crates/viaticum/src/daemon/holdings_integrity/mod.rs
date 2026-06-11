@@ -69,7 +69,7 @@ pub async fn run(
                 break;
             }
             _ = timer.tick() => {
-                match scan_holdings(&db, &holdings_dir, &mailbox_router, holder_master_pub, &master_signing_key).await {
+                match scan_holdings(&db, &holdings_dir, &mailbox_router, holder_master_pub, time_scale, &master_signing_key).await {
                     Ok(missing) if missing > 0 => {
                         warn!(missing, "holdings_integrity: found missing holdings");
                     }
@@ -94,6 +94,7 @@ async fn scan_holdings(
     holdings_dir: &Path,
     mailbox_router: &Arc<MailboxRouter>,
     holder_master_pub: IdentityPub,
+    time_scale: u64,
     master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<usize> {
     if !holdings_dir.exists() {
@@ -126,6 +127,7 @@ async fn scan_holdings(
                 holding,
                 mailbox_router,
                 holder_master_pub,
+                time_scale,
                 master_signing_key,
             )
             .await
@@ -158,6 +160,7 @@ async fn report_missing_holding(
     holding: &HoldingRecord,
     mailbox_router: &Arc<MailboxRouter>,
     holder_master_pub: IdentityPub,
+    time_scale: u64,
     master_signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<()> {
     db.delete_holding(&holding.source_block_id, &holding.owner_id)?;
@@ -193,7 +196,10 @@ async fn report_missing_holding(
         notices: vec![notice],
     };
     if let Ok(payload) = to_cbor(&batch) {
-        let ttl_secs = class_config::DROP_NOTICE_TTL.as_secs();
+        let ttl_secs = viaticum_core::mailbox::scaled_ttl_secs(
+            class_config::DROP_NOTICE_TTL.as_secs(),
+            time_scale,
+        );
         let mut msg_id = [0u8; 16];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
         let entry = MailboxEntry {

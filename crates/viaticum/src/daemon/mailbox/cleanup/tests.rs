@@ -296,3 +296,37 @@ fn should_store_returns_false_with_enough_closer_peers() {
         "should_store must return false when 1001 peers are closer (rank > 1000)"
     );
 }
+
+// ─── sweep_interval_secs (time_scale scaling — P1-3 / PL-3) ──────────────────
+
+use super::sweep_interval_secs;
+use viaticum_core::constants::MAILBOX_SWEEP_INTERVAL_SECS;
+
+/// scale=1 (production) → full 6-hour sweep cadence, unchanged.
+#[test]
+fn sweep_interval_is_full_when_time_scale_is_one() {
+    assert_eq!(sweep_interval_secs(1), MAILBOX_SWEEP_INTERVAL_SECS);
+}
+
+/// scale=N → sweep cadence divided by N.
+#[test]
+fn sweep_interval_is_divided_when_time_scale_is_above_one() {
+    assert_eq!(sweep_interval_secs(60), MAILBOX_SWEEP_INTERVAL_SECS / 60);
+    assert_eq!(
+        sweep_interval_secs(3600),
+        MAILBOX_SWEEP_INTERVAL_SECS / 3600
+    );
+}
+
+/// time_scale larger than the interval → floored at 1s (never a 0s tokio interval).
+#[test]
+fn sweep_interval_is_floored_at_one_when_time_scale_exceeds_interval() {
+    assert_eq!(sweep_interval_secs(MAILBOX_SWEEP_INTERVAL_SECS + 1), 1);
+    assert_eq!(sweep_interval_secs(u64::MAX), 1);
+}
+
+/// time_scale=0 guarded (treated as 1) — no panic / no division by zero.
+#[test]
+fn sweep_interval_treats_zero_time_scale_as_one() {
+    assert_eq!(sweep_interval_secs(0), MAILBOX_SWEEP_INTERVAL_SECS);
+}

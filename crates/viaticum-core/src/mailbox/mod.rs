@@ -45,6 +45,33 @@ pub mod class_config {
     pub const MAX_MAILBOX_BYTES_PER_PEER: u64 = 100 * 1024 * 1024;
 }
 
+/// Scale a mailbox-entry TTL by `time_scale`, mirroring the daemon scheduler.
+///
+/// The daemon divides every wall-clock cadence (PoS interval, deletion interval,
+/// timeouts, sweep, mailbox poll) by `time_scale`: `time_scale = 1` is production
+/// (real time), `> 1` is accelerated demos/tests. Mailbox-entry TTLs are baked into
+/// `expires_at = now + ttl` at publish time; if they were NOT scaled while the
+/// producers fire challenges/deletes/drop-notices every few accelerated seconds, the
+/// entries would not expire within a test (a 7-day TTL is 7 *real* days regardless of
+/// acceleration) and would accumulate, and late PoS responses arriving after the
+/// scaled pending-timeout would race a never-shrinking TTL. So the publishing side
+/// scales the TTL the same way the scheduler scales everything else.
+///
+/// Correctness:
+/// - `time_scale = 1` → `ttl / 1 = ttl` exactly: production is untouched.
+/// - `time_scale = 0` is treated as 1 (guard against division by zero).
+/// - Floored at 1 second so an entry never gets `expires_at == stored_at` (which the
+///   sweep/poll `<= now` checks would treat as already-expired) even when the divisor
+///   exceeds the raw TTL.
+///
+/// Note: the receiving side (sweep, poll) compares `now` against the absolute
+/// `expires_at` and needs NO `time_scale` — the scaling is already baked into the
+/// stored `expires_at`. All nodes in a given demo/test run share one `time_scale`,
+/// so absolute timestamps stay consistent across publisher and sweeper.
+pub fn scaled_ttl_secs(ttl_secs: u64, time_scale: u64) -> u64 {
+    (ttl_secs / time_scale.max(1)).max(1)
+}
+
 // ============================================================
 // MailboxClass
 // ============================================================

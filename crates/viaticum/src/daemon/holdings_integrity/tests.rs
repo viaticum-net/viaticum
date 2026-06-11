@@ -188,9 +188,16 @@ async fn scan_holdings_reports_missing_active_holding() {
     db.upsert_holding(&holding).unwrap();
     // No directory on disk.
 
-    let count = super::scan_holdings(&db, tmp.path(), &router, holder_master_pub(), &test_key())
-        .await
-        .unwrap();
+    let count = super::scan_holdings(
+        &db,
+        tmp.path(),
+        &router,
+        holder_master_pub(),
+        1,
+        &test_key(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(count, 1, "should report 1 missing holding");
     assert!(
@@ -230,9 +237,16 @@ async fn scan_holdings_does_not_report_present_holding() {
     db.upsert_holding(&holding).unwrap();
     make_block_dir(tmp.path(), 0xBB);
 
-    let count = super::scan_holdings(&db, tmp.path(), &router, holder_master_pub(), &test_key())
-        .await
-        .unwrap();
+    let count = super::scan_holdings(
+        &db,
+        tmp.path(),
+        &router,
+        holder_master_pub(),
+        1,
+        &test_key(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(count, 0);
     assert!(
@@ -268,9 +282,16 @@ async fn scan_holdings_skips_marked_for_delete_holdings() {
     db.upsert_holding(&holding).unwrap();
     // No directory on disk.
 
-    let count = super::scan_holdings(&db, tmp.path(), &router, holder_master_pub(), &test_key())
-        .await
-        .unwrap();
+    let count = super::scan_holdings(
+        &db,
+        tmp.path(),
+        &router,
+        holder_master_pub(),
+        1,
+        &test_key(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(count, 0);
     let stored = sender.drain().await;
@@ -298,9 +319,16 @@ async fn scan_holdings_skips_silent_holdings() {
     db.upsert_holding(&holding).unwrap();
     // No directory on disk.
 
-    let count = super::scan_holdings(&db, tmp.path(), &router, holder_master_pub(), &test_key())
-        .await
-        .unwrap();
+    let count = super::scan_holdings(
+        &db,
+        tmp.path(),
+        &router,
+        holder_master_pub(),
+        1,
+        &test_key(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(count, 0);
     let stored = sender.drain().await;
@@ -322,9 +350,16 @@ async fn scan_holdings_handles_mix_of_present_and_missing() {
     make_block_dir(tmp.path(), 0x20);
     // 0x30 has no directory.
 
-    let count = super::scan_holdings(&db, tmp.path(), &router, holder_master_pub(), &test_key())
-        .await
-        .unwrap();
+    let count = super::scan_holdings(
+        &db,
+        tmp.path(),
+        &router,
+        holder_master_pub(),
+        1,
+        &test_key(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(count, 1, "exactly 1 missing");
     // Holdings 0x10 and 0x20 should still be present.
@@ -373,6 +408,7 @@ async fn scan_holdings_does_not_fire_when_holdings_dir_missing() {
         &non_existent,
         &router,
         holder_master_pub(),
+        1,
         &test_key(),
     )
     .await
@@ -398,7 +434,7 @@ async fn report_missing_holding_removes_from_db_and_posts_symbol_dropped() {
     let holding = active_holding(0x60, owner);
     db.upsert_holding(&holding).unwrap();
 
-    super::report_missing_holding(&db, &holding, &router, holder_master_pub(), &test_key())
+    super::report_missing_holding(&db, &holding, &router, holder_master_pub(), 1, &test_key())
         .await
         .unwrap();
 
@@ -435,7 +471,7 @@ async fn report_missing_holding_drop_notice_fields_correct() {
     };
     db.upsert_holding(&holding).unwrap();
 
-    super::report_missing_holding(&db, &holding, &router, holder_master_pub(), &test_key())
+    super::report_missing_holding(&db, &holding, &router, holder_master_pub(), 1, &test_key())
         .await
         .unwrap();
 
