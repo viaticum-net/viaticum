@@ -1085,3 +1085,26 @@ async fn revocation_no_sender_is_dropped_gracefully() {
     // Must not panic.
     super::dispatch_revocation(&handler, entry).await;
 }
+
+// ─── E1: poll cadence scales with time_scale ──────────────────────────────────
+// run_mailbox_poll must divide MAILBOX_POLL_INTERVAL_SECS by time_scale, exactly
+// like the scheduler scales every cadence (scheduler/mod.rs:162-168). Without this,
+// accelerated demos/tests poll the mailbox once per real hour while challenges /
+// deletes fire every few seconds, so no mailbox round-trip (PoS / Delete /
+// DropNotice / SelfPointer) can complete under time acceleration. Production
+// (time_scale=1) keeps the full hourly cadence.
+#[test]
+fn poll_interval_scales_with_time_scale() {
+    use super::poll_interval_secs;
+    use viaticum_core::constants::MAILBOX_POLL_INTERVAL_SECS;
+
+    // Production: full hourly cadence, unchanged.
+    assert_eq!(poll_interval_secs(1), MAILBOX_POLL_INTERVAL_SECS);
+    // Moderate scale divides cleanly.
+    assert_eq!(poll_interval_secs(60), MAILBOX_POLL_INTERVAL_SECS / 60);
+    // High scale floors at 1s so the loop never busy-spins on a 0s interval.
+    assert_eq!(poll_interval_secs(100_000), 1);
+    assert_eq!(poll_interval_secs(MAILBOX_POLL_INTERVAL_SECS), 1);
+    // Zero time_scale must not divide-by-zero; treated as 1 (production cadence).
+    assert_eq!(poll_interval_secs(0), MAILBOX_POLL_INTERVAL_SECS);
+}

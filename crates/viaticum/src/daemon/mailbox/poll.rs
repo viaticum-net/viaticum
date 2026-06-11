@@ -34,9 +34,23 @@ use viaticum_core::types::from_cbor_bytes;
 use super::routing::MailboxRouter;
 use crate::daemon::processor::{DeleteMailboxHandler, RevocationMailboxHandler};
 
+/// Mailbox poll cadence in seconds, scaled by `time_scale`.
+///
+/// Mirrors the scheduler, which divides every cadence by `time_scale`
+/// (`scheduler/mod.rs`: pos_interval / deletion_interval / timeout / sweep). The
+/// mailbox is the bus for PoS / Delete / DropNotice / SelfPointer round-trips, so
+/// if the poll loop ran at a fixed wall-clock hour while the scheduler fired
+/// challenges/deletes every few accelerated seconds, no round-trip could ever
+/// complete under time acceleration (demos/tests). Production (`time_scale = 1`)
+/// keeps the full `MAILBOX_POLL_INTERVAL_SECS` cadence. Floored at 1s so the loop
+/// never busy-spins on a 0s interval; `time_scale = 0` is treated as 1.
+pub(crate) fn poll_interval_secs(time_scale: u64) -> u64 {
+    (MAILBOX_POLL_INTERVAL_SECS / time_scale.max(1)).max(1)
+}
+
 /// Run the periodic mailbox poll loop.
 ///
-/// Polls immediately on first tick, then every MAILBOX_POLL_INTERVAL_SECS.
+/// Polls immediately on first tick, then every `poll_interval_secs(time_scale)`.
 /// Dispatches entries to the appropriate handlers.
 ///
 /// Parameters:
@@ -51,6 +65,8 @@ use crate::daemon::processor::{DeleteMailboxHandler, RevocationMailboxHandler};
 /// - `my_master_pub`: this node's master identity (used to detect own SelfPointers)
 /// - `current_pointer`: shared handle with run_periodic_push. On receiving our own verified
 ///   SelfPointer, update this handle (W-2: restart-recovery — re-learn latest published pointer).
+/// - `time_scale`: time-acceleration factor; the poll cadence is divided by it
+///   (see `poll_interval_secs`). Production passes 1.
 /// - `cancel`: cancellation token
 #[allow(clippy::too_many_arguments)]
 pub async fn run_mailbox_poll(
@@ -63,11 +79,13 @@ pub async fn run_mailbox_poll(
     revocation_handler: Arc<dyn RevocationMailboxHandler>,
     my_master_pub: IdentityPub,
     current_pointer: Arc<Mutex<Option<SelfPointer>>>,
+    time_scale: u64,
     cancel: CancellationToken,
 ) {
-    // Poll immediately on startup (first tick = no delay).
-    let mut interval =
-        tokio::time::interval(std::time::Duration::from_secs(MAILBOX_POLL_INTERVAL_SECS));
+    // Poll immediately on startup (first tick = no delay), then every
+    // poll_interval_secs(time_scale) — scaled like the scheduler's cadences.
+    let poll_secs = poll_interval_secs(time_scale);
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {

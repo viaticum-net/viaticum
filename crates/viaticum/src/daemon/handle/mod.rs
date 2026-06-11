@@ -1134,6 +1134,7 @@ impl DaemonHandle {
                     std::sync::Arc::new(revocation_handler),
                     poll_identity,
                     poll_current_pointer,
+                    time_scale,
                     poll_cancel,
                 )
                 .await;
