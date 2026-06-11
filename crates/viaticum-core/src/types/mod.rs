@@ -634,10 +634,15 @@ pub fn esi_list_to_ranges(esis: &[u32]) -> Vec<(u32, u32)> {
 }
 
 /// Expand `(start, count)` ESI ranges back to a flat sorted list of ESIs.
+///
+/// Uses checked arithmetic for `start + count` (defense-in-depth, same helper
+/// family as the SM-1/SM-7 guards): a corrupt or hostile range whose end would
+/// overflow `u32` is clamped to `u32::MAX` rather than wrapping and producing
+/// an empty/garbage range.
 pub fn ranges_to_esi_list(ranges: &[(u32, u32)]) -> Vec<u32> {
     ranges
         .iter()
-        .flat_map(|&(start, count)| start..start + count)
+        .flat_map(|&(start, count)| start..start.saturating_add(count))
         .collect()
 }
 

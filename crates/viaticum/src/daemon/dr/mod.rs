@@ -620,11 +620,12 @@ async fn try_dial_holder_by_hints(
     }
 
     if let Some(pid) = peer_id_opt {
-        match wait_for_auth(event_rx, pid).await {
-            Some(did) => {
+        match wait_for_auth(event_rx, db, pid).await {
+            Some((did, identity_pub)) => {
                 tracing::info!(%did, "dr: authenticated pointer holder (via hints)");
                 // Upsert into DB so MailboxRouter can find this holder.
-                upsert_peer_minimal(db, did, viaticum_core::types::IdentityPub([0u8; 32]));
+                // CS-DR-12: use the real identity from the auth event, not zeros.
+                upsert_peer_minimal(db, did, identity_pub);
                 return true;
             }
             None => {
@@ -684,10 +685,11 @@ async fn try_dial_holder_via_kademlia(
                     let _ = swarm.dial(peer_id, addr.clone()).await;
                 }
 
-                match wait_for_auth(event_rx, peer_id).await {
-                    Some(did) => {
+                match wait_for_auth(event_rx, db, peer_id).await {
+                    Some((did, identity_pub)) => {
                         tracing::info!(%did, "dr: authenticated pointer holder (via Kademlia)");
-                        upsert_peer_minimal(db, did, viaticum_core::types::IdentityPub([0u8; 32]));
+                        // CS-DR-12: use the real identity from the auth event.
+                        upsert_peer_minimal(db, did, identity_pub);
                     }
                     None => {
                         tracing::info!(%device, "dr: could not reach holder via Kademlia");
@@ -713,7 +715,16 @@ fn upsert_peer_minimal(
     use viaticum_core::constants::{AVAIL_EWMA_INITIAL, INITIAL_TRUST_P};
     let now = Timestamp::now();
     let record = match db.get_peer(&device_id) {
-        Ok(Some(r)) => r, // already exists — leave it
+        Ok(Some(mut r)) => {
+            // Already exists — leave it, except: CS-DR-12, if this record was
+            // created earlier with a zero (placeholder) identity and we now have
+            // the real one from the auth event, fill it in so no zero-identity
+            // zombie survives DR. Never clobber an already-real identity.
+            if r.master_identity.0 == [0u8; 32] && identity_pub.0 != [0u8; 32] {
+                r.master_identity = identity_pub;
+            }
+            r
+        }
         _ => PeerRecord {
             device_id,
             master_identity: identity_pub,
@@ -731,7 +742,9 @@ fn upsert_peer_minimal(
             last_avail_sample: now.0,
         },
     };
-    // Only insert if newly created; don't clobber existing records.
+    // Persist: a freshly-built minimal record, or an existing one (unchanged,
+    // except a zero-identity placeholder repaired above per CS-DR-12). Trust /
+    // counters / addrs of an existing record are never overwritten.
     if let Err(e) = db.upsert_peer(&record) {
         tracing::warn!(%device_id, "dr: upsert_peer_minimal failed: {e}");
     }
@@ -772,7 +785,7 @@ async fn fetch_ss_block(
         encoder,
         &bref.block_id,
         &placements,
-        params.k_eff as usize,
+        &params,
     )
     .await
     .map_err(|e| anyhow::anyhow!("fetch_unbound_symbols: {e}"))?;
@@ -821,23 +834,38 @@ fn parse_multiaddr_with_peer_id(
 
 /// Wait for a PeerAuthenticated event from the given peer_id.
 ///
-/// Returns the DeviceId if authentication succeeds within AUTH_TIMEOUT_SECS.
-/// Returns None on timeout, channel close, or ConnectionClosed.
+/// Returns `(DeviceId, IdentityPub)` of the expected peer if authentication
+/// succeeds within AUTH_TIMEOUT_SECS. Returns None on timeout, channel close,
+/// or ConnectionClosed for the expected peer.
+///
+/// CS-DR-12: surfaces the authenticated peer's real `identity_pub` so the caller
+/// upserts a correct master_identity instead of all-zeros.
+///
+/// CS-DR-13: like `wait_for_auth_any`, this also upserts OTHER peers that
+/// authenticate while we wait, so a peer that authenticated during the window is
+/// not lost to a later 15 s timeout + Kademlia fallback.
 async fn wait_for_auth(
     event_rx: &mut tokio::sync::mpsc::Receiver<ProtocolEvent>,
+    db: &viaticum_core::db::Db,
     expected_peer_id: libp2p::PeerId,
-) -> Option<viaticum_core::types::DeviceId> {
+) -> Option<(viaticum_core::types::DeviceId, IdentityPub)> {
     let deadline = Duration::from_secs(AUTH_TIMEOUT_SECS);
 
     tokio::time::timeout(deadline, async {
         loop {
             match event_rx.recv().await {
                 Some(ProtocolEvent::PeerAuthenticated {
-                    peer_id, device_id, ..
+                    peer_id,
+                    device_id,
+                    identity_pub,
+                    ..
                 }) => {
                     if peer_id == expected_peer_id {
-                        return Some(device_id);
+                        return Some((device_id, identity_pub));
                     }
+                    // CS-DR-13: a different peer authenticated while we waited —
+                    // persist it so it isn't lost when we move on to the next holder.
+                    upsert_peer_minimal(db, device_id, identity_pub);
                 }
                 Some(ProtocolEvent::ConnectionClosed { peer_id, .. }) => {
                     if peer_id == expected_peer_id {

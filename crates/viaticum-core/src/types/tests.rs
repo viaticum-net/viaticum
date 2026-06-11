@@ -682,3 +682,31 @@ fn importance_bucket_stats_round_trips_via_cbor() {
     assert!((decoded.target_p - 0.99998).abs() < 1e-9);
     assert_eq!(decoded.status, "healthy");
 }
+
+// ============================================================
+// ranges_to_esi_list checked arithmetic (CS-DR-15)
+// ============================================================
+
+#[test]
+fn ranges_to_esi_list_expands_normal_ranges() {
+    let ranges = vec![(0u32, 3u32), (10u32, 2u32)];
+    assert_eq!(ranges_to_esi_list(&ranges), vec![0, 1, 2, 10, 11]);
+}
+
+#[test]
+fn ranges_to_esi_list_saturates_instead_of_wrapping_on_overflow() {
+    // A corrupt/hostile range whose start+count overflows u32 must NOT wrap to a
+    // smaller value (which would invert the range or yield garbage ESIs). With
+    // saturating math the end clamps to u32::MAX: the range expands to its valid
+    // prefix only, and the helper never panics.
+    let ranges = vec![(u32::MAX - 2, 10u32)];
+    assert_eq!(
+        ranges_to_esi_list(&ranges),
+        vec![u32::MAX - 2, u32::MAX - 1],
+        "end clamps to u32::MAX (exclusive), yielding only the valid prefix"
+    );
+
+    // The extreme case start == u32::MAX yields an empty range (start == end)
+    // rather than panicking or wrapping — still safe.
+    assert_eq!(ranges_to_esi_list(&[(u32::MAX, 5u32)]), Vec::<u32>::new());
+}

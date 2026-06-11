@@ -2821,3 +2821,30 @@ fn find_file_for_block_prefers_present_over_stale_renamed_copy() {
         "must return the locally-present copy, not the stale renamed one"
     );
 }
+
+/// CS-DR-11: a corrupt pack entry whose `offset + size` overflows must return a
+/// clear Err rather than wrapping past the bounds check and slice-panicking.
+#[test]
+fn extract_file_from_pack_rejects_overflowing_entry_without_panic() {
+    use crate::daemon::backup::packing::extract_file_from_pack;
+    use viaticum_core::types::{PackEntry, to_cbor_bytes};
+
+    // Build a pack index whose single entry has offset+size overflowing usize.
+    let entries = vec![PackEntry {
+        file_id: FileId(1),
+        offset: u64::MAX,
+        size: u64::MAX,
+    }];
+    let mut plaintext = to_cbor_bytes(&entries);
+    plaintext.extend_from_slice(b"some file bytes");
+
+    let result = extract_file_from_pack(&plaintext, FileId(1));
+    assert!(
+        result.is_err(),
+        "overflowing pack entry must error, not panic; got {result:?}"
+    );
+    assert!(
+        result.unwrap_err().to_string().contains("overflow"),
+        "error should name the overflow condition"
+    );
+}

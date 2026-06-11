@@ -10,7 +10,7 @@
 //   pipeline.rs — decode_block(), extract_from_pack()
 //   tests.rs    — all test scenarios
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -330,32 +330,55 @@ impl RestoreCoordinator {
         let mut files_restored = 0usize;
         let mut blocks_fetched = 0usize;
 
+        // CS-DR-3: restore is partial-tolerant by design (importance-DESC triage +
+        // `failures` list). A single unrecoverable block (BlockNotFound, legacy
+        // record, decode/timeout/insufficient-symbols) must NOT abort the whole
+        // job — it is recorded against every file that references it, and we move
+        // on to the next (lower-importance) block. Already-restored files stay in
+        // staging; the job returns Ok with the staging path and the failures list.
         for block_id in &block_order {
             let files_in_block = block_map
                 .get(block_id)
                 .expect("block_id from block_map keys");
+
             // Get SourceBlockRecord for params
             let block_record = match self.db.get_source_block(block_id)? {
                 Some(r) => r,
-                None => return Err(RestoreError::BlockNotFound(*block_id)),
+                None => {
+                    let err = RestoreError::BlockNotFound(*block_id);
+                    error!(block = %block_id, "restore: {err}");
+                    Self::record_block_failure(files_in_block, &err, &mut failures);
+                    continue;
+                }
             };
 
             let encrypted_size = match block_record.encrypted_size {
                 Some(s) => s,
                 None => {
-                    return Err(RestoreError::DecodeFailed(
+                    let err = RestoreError::DecodeFailed(
                         *block_id,
                         "source block has no encrypted_size (legacy record)".to_string(),
-                    ));
+                    );
+                    error!(block = %block_id, "restore: {err}");
+                    Self::record_block_failure(files_in_block, &err, &mut failures);
+                    continue;
                 }
             };
 
             let params = block_record.erasure_params();
 
             // Decode the block (rebuild-from-source, then network fallback)
-            let plaintext = self
+            let plaintext = match self
                 .decode_block_local(block_id, &params, encrypted_size)
-                .await?;
+                .await
+            {
+                Ok(p) => p,
+                Err(err) => {
+                    error!(block = %block_id, "restore: block decode failed: {err}");
+                    Self::record_block_failure(files_in_block, &err, &mut failures);
+                    continue;
+                }
+            };
 
             blocks_fetched += 1;
 
@@ -431,9 +454,9 @@ impl RestoreCoordinator {
 
         // Wave 11b: no symbols live on disk anymore (the old
         // `{symbols_dir}/{block_hex}/raw/{esi}.bin` tier-1 cache was removed — the
-        // pipeline never writes those files). Start with no local symbols and rebuild
-        // from source.
-        let mut raw_symbols: Vec<Symbol> = Vec::new();
+        // pipeline never writes those files). The rebuild-from-source path below
+        // either decodes and early-returns, or we fetch entirely from holders.
+        let raw_symbols: Vec<Symbol>;
 
         {
             // Try rebuilding the stored blob from source files directly.
@@ -508,7 +531,13 @@ impl RestoreCoordinator {
                 })
                 .cloned()
                 .collect();
-            let mut network_symbols = tokio::time::timeout(
+            // CS-DR-5: `fetch_from_holders` already validates each symbol's form,
+            // restricts ESIs to those requested, dedups by ESI globally, and caps
+            // per holder — so the returned symbols are distinct-ESI and ready to
+            // decode. No on-disk symbols exist to merge with anymore (Wave 11b), so
+            // we use the fetched set directly; the old `existing_esis` merge over an
+            // always-empty `raw_symbols` was a dead no-op.
+            raw_symbols = tokio::time::timeout(
                 self.config.fetch_timeout,
                 self.fetch_from_holders(block_id, &reachable_for_fetch, params),
             )
@@ -517,17 +546,6 @@ impl RestoreCoordinator {
                 block: *block_id,
                 secs: self.config.fetch_timeout.as_secs(),
             })??;
-
-            // Merge: avoid duplicates by ESI.
-            let existing_esis: HashSet<u32> = raw_symbols.iter().map(|s| s.esi).collect();
-            for sym in network_symbols.drain(..) {
-                if !existing_esis.contains(&sym.esi) {
-                    raw_symbols.push(sym);
-                    if raw_symbols.len() >= k_eff {
-                        break;
-                    }
-                }
-            }
 
             if raw_symbols.len() < k_eff {
                 return Err(RestoreError::InsufficientSymbols {
@@ -594,7 +612,7 @@ impl RestoreCoordinator {
             &self.encoder,
             block_id,
             placements,
-            params.k_eff as usize,
+            params,
         )
         .await
         .map_err(RestoreError::from_fetch)
@@ -653,6 +671,20 @@ impl RestoreCoordinator {
         Ok(())
     }
 
+    /// CS-DR-3: record an unrecoverable-block error against every file that
+    /// references that block, so the partial-restore `failures` list names each
+    /// affected path rather than aborting the whole job.
+    fn record_block_failure(
+        files_in_block: &[(FileRecord, FileVersion)],
+        err: &RestoreError,
+        failures: &mut Vec<(String, String)>,
+    ) {
+        let msg = err.to_string();
+        for (record, _version) in files_in_block {
+            failures.push((record.path.clone(), msg.clone()));
+        }
+    }
+
     /// Update FileRecord.devices for device_id → LocalState::Present.
     fn update_local_state(&self, path: &str, device_id: DeviceId) -> Result<(), RestoreError> {
         if let Some(mut record) = self.db.get_file(path)? {
@@ -683,8 +715,12 @@ impl RestoreCoordinator {
     /// Select which FileVersion to restore.
     ///
     /// - `Latest`:      last version with `backed_up_at.is_some()`
-    /// - `Index(n)`:    `versions[n]`
+    /// - `Index(n)`:    `versions[n]`, but only if it has `backed_up_at.is_some()`
     /// - `BeforeDate`:  last version with `backed_up_at.is_some() && backed_up_at <= ts`
+    ///
+    /// CS-DR-14: `Index` applies the same `backed_up_at.is_some()` filter as the
+    /// other selectors — a never-backed-up (queued-only) version has no symbols
+    /// placed, so selecting it would only produce a loud `BlockNotFound`.
     pub fn select_version<'a>(
         record: &'a FileRecord,
         selector: &VersionSelector,
@@ -695,7 +731,9 @@ impl RestoreCoordinator {
                 .iter()
                 .rev()
                 .find(|v| v.backed_up_at.is_some()),
-            VersionSelector::Index(n) => record.versions.get(*n),
+            VersionSelector::Index(n) => {
+                record.versions.get(*n).filter(|v| v.backed_up_at.is_some())
+            }
             VersionSelector::BeforeDate(ts) => record
                 .versions
                 .iter()

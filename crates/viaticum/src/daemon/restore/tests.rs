@@ -170,6 +170,26 @@ fn select_version_index_out_of_range_returns_none() {
 }
 
 #[test]
+fn select_version_index_skips_never_backed_up_version() {
+    // CS-DR-14: Index must apply the same backed_up_at filter as Latest/BeforeDate.
+    // Version 1 is queued-only (backed_up_at = None) → no symbols placed → selecting
+    // it would only yield a loud BlockNotFound. select_version must return None.
+    let record = make_record_with_versions(vec![
+        make_version(Some(100)),
+        make_version(None), // queued but never backed up
+    ]);
+    let result = RestoreCoordinator::select_version(&record, &VersionSelector::Index(1));
+    assert!(
+        result.is_none(),
+        "Index(1) points at a never-backed-up version and must be filtered out"
+    );
+
+    // A backed-up version at the same index path still selects normally.
+    let result0 = RestoreCoordinator::select_version(&record, &VersionSelector::Index(0));
+    assert_eq!(result0.unwrap().backed_up_at, Some(Timestamp(100)));
+}
+
+#[test]
 fn select_version_before_date_returns_correct_version() {
     let record = make_record_with_versions(vec![
         make_version(Some(100)),
@@ -600,6 +620,107 @@ async fn restore_deduplicates_source_blocks() {
     assert_eq!(result.files_restored, 2, "failures: {:?}", result.failures);
     assert_eq!(result.blocks_fetched, 1, "should decode exactly 1 block");
     assert!(result.failures.is_empty());
+}
+
+/// CS-DR-3: one unrecoverable block must not abort the whole restore job. The bad
+/// block is recorded in `failures`; the recoverable block is still restored, and
+/// the job returns Ok with the staging path. The bad block is given higher
+/// importance so it is attempted FIRST — proving the loop does not bail on the
+/// first failure but continues to the lower-importance, recoverable block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_unrecoverable_block_does_not_abort_remaining_blocks() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+
+    // 1. Back up a real file in its own subdir → its own recoverable single block.
+    let good_dir = files_dir.path().join("data");
+    std::fs::create_dir_all(&good_dir).unwrap();
+    let good_content = b"recoverable block content";
+    let good_path = good_dir.join("good.txt");
+    std::fs::write(&good_path, good_content).unwrap();
+    let good_path_str = good_path.to_string_lossy().to_string();
+
+    let mut backup = test_backup_coord(db.clone(), &symbols_dir);
+    backup.process_event(added_event(&good_path_str)).unwrap();
+    let results = backup.flush_all(true, &Default::default()).unwrap();
+    assert_eq!(results.len(), 1, "good file must produce one block");
+
+    // 2. Inject a second file referencing a DISTINCT, unrecoverable block: the
+    //    SourceBlockRecord has encrypted_size = None (legacy), which fails the
+    //    per-block decode path. Give it HIGH importance so it is tried first.
+    let bad_block = SourceBlockId([0xBAu8; 32]);
+    let bad_path = good_dir.join("bad.txt");
+    let bad_path_str = bad_path.to_string_lossy().to_string();
+    db.upsert_file(&FileRecord {
+        file_id: FileId(777),
+        path: bad_path_str.clone(),
+        importance: 0.99, // higher than the good file → sorts first
+        devices: vec![],
+        versions: vec![FileVersion {
+            content_hash: [0u8; 32],
+            source_block_id: bad_block,
+            k: 2,
+            t: 65_535,
+            created_at: Timestamp(100),
+            backed_up_at: Some(Timestamp(200)),
+        }],
+        first_seen: Timestamp(0),
+    })
+    .unwrap();
+    db.upsert_source_block(&SourceBlockRecord {
+        block_id: bad_block,
+        k: 2,
+        t: 65_535,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(100),
+        encrypted_size: None, // legacy record → unrecoverable
+        n: None,
+        overhead: None,
+        drop_notice_sent_at: None,
+        importance: 0.99,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.0,
+    })
+    .unwrap();
+
+    // 3. Restore the shared prefix covering BOTH files.
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
+    let prefix = good_dir.to_string_lossy().to_string() + "/";
+    let request = super::RestoreRequest {
+        path: prefix,
+        version_selector: VersionSelector::Latest,
+        device_id: DeviceId([2u8; 32]),
+        job_id: JobId::new(),
+    };
+
+    // The job must COMPLETE (Ok), not abort on the bad block.
+    let result = restore
+        .restore(request)
+        .await
+        .expect("restore must not abort on one unrecoverable block");
+
+    // The recoverable block was restored.
+    assert_eq!(
+        result.files_restored, 1,
+        "the recoverable file must still be restored; failures: {:?}",
+        result.failures
+    );
+    let good_rel = good_path_str.trim_start_matches('/');
+    let restored = std::fs::read(result.staging_path.join(good_rel))
+        .expect("recoverable file must exist in staging");
+    assert_eq!(restored.as_slice(), good_content);
+
+    // The bad block is recorded in failures (error still detected/recorded — the
+    // underlying decode error is NOT swallowed, just contained per-block).
+    assert!(
+        result.failures.iter().any(|(p, _)| p == &bad_path_str),
+        "the unrecoverable block's file must appear in failures, got: {:?}",
+        result.failures
+    );
 }
 
 // ─── collect_esis_from_ranges unit tests ──────────────────────────────────────
@@ -1351,9 +1472,10 @@ async fn path_traversal_from_db_record_is_rejected() {
 
     let _restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
 
-    // The restore will try to decode a block — it will fail because there are no symbols.
-    // But before that, if extract_and_write_file is called, path validation must reject it.
-    // Since there are no symbols, the restore returns InsufficientSymbols before writing.
+    // The restore would try to decode this block and fail (no symbols); post
+    // CS-DR-3 that failure is recorded in `failures` and the job continues rather
+    // than aborting. Either way the path is never written: if decode ever did
+    // succeed, extract_and_write_file must still reject the malicious record.path.
     // Test the validation directly via validate_record_path to confirm the E1 invariant.
     let validation_result = viaticum_core::path_safety::validate_record_path(malicious_path);
     assert_eq!(

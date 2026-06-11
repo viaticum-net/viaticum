@@ -234,3 +234,58 @@ async fn wait_for_kad_bootstrap_stable_returns_zero_on_timeout_no_hang() {
         "wait_for_kad_bootstrap_stable should not hang beyond timeout (elapsed={elapsed:?})"
     );
 }
+
+// ─── CS-DR-12: upsert_peer_minimal must not plant a zero-identity zombie ───────
+
+#[test]
+fn upsert_peer_minimal_stores_real_identity_for_new_peer() {
+    use viaticum_core::types::{DeviceId, IdentityPub};
+    let db = viaticum_core::db::Db::open_in_memory().unwrap();
+    let device = DeviceId([7u8; 32]);
+    let identity = IdentityPub([0x42u8; 32]);
+
+    super::upsert_peer_minimal(&db, device, identity);
+
+    let stored = db.get_peer(&device).unwrap().expect("peer was upserted");
+    assert_eq!(
+        stored.master_identity, identity,
+        "new peer must keep the real identity from the auth event, not zeros"
+    );
+}
+
+#[test]
+fn upsert_peer_minimal_fills_in_zero_identity_on_existing_record() {
+    use viaticum_core::types::{DeviceId, IdentityPub};
+    let db = viaticum_core::db::Db::open_in_memory().unwrap();
+    let device = DeviceId([8u8; 32]);
+
+    // First, a record lands with a placeholder (zero) identity.
+    super::upsert_peer_minimal(&db, device, IdentityPub([0u8; 32]));
+    // Later, we learn the real identity from a PeerAuthenticated event.
+    let real = IdentityPub([0x99u8; 32]);
+    super::upsert_peer_minimal(&db, device, real);
+
+    let stored = db.get_peer(&device).unwrap().expect("peer exists");
+    assert_eq!(
+        stored.master_identity, real,
+        "a zero-identity zombie must be repaired once the real identity is known"
+    );
+}
+
+#[test]
+fn upsert_peer_minimal_does_not_clobber_existing_real_identity() {
+    use viaticum_core::types::{DeviceId, IdentityPub};
+    let db = viaticum_core::db::Db::open_in_memory().unwrap();
+    let device = DeviceId([9u8; 32]);
+
+    let original = IdentityPub([0x11u8; 32]);
+    super::upsert_peer_minimal(&db, device, original);
+    // A later call with a different identity must NOT overwrite the established one.
+    super::upsert_peer_minimal(&db, device, IdentityPub([0x22u8; 32]));
+
+    let stored = db.get_peer(&device).unwrap().expect("peer exists");
+    assert_eq!(
+        stored.master_identity, original,
+        "an established real identity must not be clobbered"
+    );
+}

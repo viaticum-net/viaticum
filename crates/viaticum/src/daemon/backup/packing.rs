@@ -67,7 +67,20 @@ pub fn extract_file_from_pack(
     for entry in &parsed.entries {
         if entry.file_id == file_id {
             let start = entry.offset as usize;
-            let end = start + entry.size as usize;
+            // CS-DR-11: use checked_add — a corrupt pack index (behind AEAD, own
+            // data) with offset+size near usize::MAX would otherwise wrap, pass
+            // the bounds check below, and slice-panic. On overflow, error out.
+            let end = match start.checked_add(entry.size as usize) {
+                Some(e) => e,
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "pack entry range overflow: file_id={}, offset={}, size={}",
+                        entry.file_id,
+                        entry.offset,
+                        entry.size
+                    ));
+                }
+            };
             if end > file_data.len() {
                 return Err(anyhow::anyhow!(
                     "pack entry out of bounds: file_id={}, offset={}, size={}",
