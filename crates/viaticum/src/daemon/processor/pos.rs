@@ -76,9 +76,10 @@ impl PosResponder {
             return Err(ProcessorError::UnauthenticatedChallenge);
         }
 
-        // Verify we hold symbols for this owner+block.
-        match self.db.get_holding(&block_id, &owner_id)? {
-            Some(_) => {}
+        // Verify we hold symbols for this owner+block. Capture the holding — its
+        // `symbol_count()` bounds the legitimate challenge size (SM-1 guard below).
+        let holding = match self.db.get_holding(&block_id, &owner_id)? {
+            Some(holding) => holding,
             None => {
                 warn!(
                     block_id = %block_id,
@@ -94,9 +95,60 @@ impl PosResponder {
                     &self.master_signing_key,
                 )));
             }
+        };
+
+        // SM-1: bound the ESI-range expansion BEFORE allocating.
+        //
+        // `esi_ranges` is attacker-shaped on the wire: a malicious-but-authenticated owner
+        // (it passed the signature + holding checks above) can send `[(0, u32::MAX)]`, which
+        // the old `flat_map(start..start+count).collect()` expanded into a ~4.29-billion-
+        // element Vec<u32> (~16 GB) BEFORE the per-symbol existence check — OOM. The companion
+        // bug: `start + count` near u32::MAX overflows → debug panic.
+        //
+        // A legitimate owner builds the challenge from `placement.esi_ranges`, which equals the
+        // holding's coverage, so a legit challenge always has `sum(counts) <= symbol_count()`.
+        // We REJECT (not clamp) an abusive challenge: the owner computes its expected chain_hash
+        // over the exact `esi_ranges` it sent, so responding over a shrunk set would record a
+        // false Fail for an honest holder. Reject → silent drop (no Nack = no signed-reply
+        // amplification), matching the `UnauthenticatedChallenge` drop pattern above.
+        let held = holding.symbol_count();
+        let mut requested: u64 = 0;
+        for &(start, count) in &challenge.esi_ranges {
+            if start.checked_add(count).is_none() {
+                warn!(
+                    block_id = %block_id,
+                    challenger = %owner_id,
+                    start,
+                    count,
+                    "processor: PosHashChallenge ESI range overflows u32 — dropping (malformed/abusive)"
+                );
+                return Err(ProcessorError::OversizedChallenge {
+                    block_id,
+                    requested: u64::from(start) + u64::from(count),
+                    held,
+                });
+            }
+            requested = requested.saturating_add(u64::from(count));
+        }
+        if requested > u64::from(held) {
+            warn!(
+                block_id = %block_id,
+                challenger = %owner_id,
+                requested,
+                held,
+                "processor: PosHashChallenge requests more ESIs than we hold — dropping (abusive/malformed)"
+            );
+            return Err(ProcessorError::OversizedChallenge {
+                block_id,
+                requested,
+                held,
+            });
         }
 
-        // Expand ESI ranges to a sorted ESI list.
+        // Expand ESI ranges to a sorted ESI list — now bounded by `symbol_count()` (small,
+        // real). The legit path (requested <= held) is unchanged: it expands exactly the
+        // requested ESIs and the per-ESI file-read + Nack-on-missing logic below is untouched,
+        // so chain-hash matching for honest holders is preserved.
         let mut esis: Vec<u32> = challenge
             .esi_ranges
             .iter()
@@ -245,6 +297,11 @@ impl PosMailboxChallengeHandler for ProcessorPosHandler {
                     // logged inside compute_response. Treat it as a clean drop — no response is
                     // published and the poll loop must NOT surface it as a handler error.
                     Err(ProcessorError::UnauthenticatedChallenge) => Ok(None),
+                    // SM-1: an oversized/malformed challenge (sum of counts > what we hold, or a
+                    // range overflowing u32) was already warn-logged inside compute_response.
+                    // Same clean-drop treatment as UnauthenticatedChallenge — no Nack, no
+                    // response, not surfaced as a handler error.
+                    Err(ProcessorError::OversizedChallenge { .. }) => Ok(None),
                     Err(e) => Err(anyhow::anyhow!("pos challenge handler error: {e}")),
                 }
             }

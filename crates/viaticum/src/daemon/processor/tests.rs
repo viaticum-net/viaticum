@@ -3755,6 +3755,179 @@ async fn pos_responder_returns_none_when_block_not_held() {
     );
 }
 
+// ─── SM-1: oversized / overflowing ESI-range challenge is rejected ────────────
+//
+// A PoS challenge is a SIGNED message from a real owner the holder stores for, but
+// `esi_ranges: Vec<(u32,u32)>` is attacker-shaped on the wire. A malicious-but-
+// authenticated owner can send `esi_ranges = [(0, u32::MAX)]`; the old
+// `flat_map(start..start+count).collect()` would expand that into a ~4.29-billion-
+// element Vec<u32> (~16 GB) BEFORE the per-symbol existence check — OOM. The guard
+// rejects any challenge whose total requested count exceeds what the holder actually
+// holds (`HoldingRecord::symbol_count()`), or whose `start + count` overflows, BEFORE
+// the expansion. Honest, in-bounds challenges are untouched (chain-hash preserved).
+
+/// SM-1 core regression: a VALID, signed challenge with an oversized ESI range
+/// (`[(0, u32::MAX)]`, vs a holding of only 3 symbols) is rejected with
+/// `OversizedChallenge` — NOT a multi-GB allocation, NOT a panic, NOT a Nack.
+/// The signature is valid (the guard, not the sig check, must reject it).
+#[tokio::test]
+async fn pos_challenge_with_oversized_esi_range_is_rejected_without_huge_alloc() {
+    use viaticum_core::messages::build_pos_hash_challenge;
+
+    use super::pos::PosResponder;
+    use crate::daemon::processor::ProcessorError;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+
+    let owner_key = ed25519_dalek::SigningKey::from_bytes(&[0x12u8; 32]);
+    let owner = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0x34);
+
+    // Holding covers only 3 symbols → symbol_count() == 3.
+    db.upsert_holding(&HoldingRecord {
+        source_block_id: block_id,
+        owner_id: owner,
+        esi_ranges: vec![(0, 3)],
+        importance: 0.5,
+        total_bytes: 3,
+        status: HoldingStatus::Active,
+        received_at: Timestamp::now(),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    })
+    .unwrap();
+
+    let master_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
+    let responder = PosResponder::new(db, holdings_dir.path().to_path_buf(), master_signing_key);
+
+    // VALID signature from the real owner, but an oversized range. Before the fix,
+    // `flat_map((0..u32::MAX)).collect()` would try to allocate ~16 GB here → OOM.
+    let challenge = build_pos_hash_challenge(
+        [0x56u8; 16],
+        block_id,
+        vec![(0, u32::MAX)],
+        Timestamp::now(),
+        None,
+        &owner_key,
+    );
+
+    let result = responder.compute_response(owner, challenge).await;
+    assert!(
+        matches!(result, Err(ProcessorError::OversizedChallenge { .. })),
+        "oversized challenge (sum of counts > symbol_count) must be rejected with \
+         OversizedChallenge — no huge alloc, no panic, no Nack; got {result:?}"
+    );
+}
+
+/// SM-1: a challenge whose range overflows `u32` (`[(u32::MAX, 5)]`) is rejected via
+/// checked_add — no debug-build panic from `start + count`.
+#[tokio::test]
+async fn pos_challenge_with_overflowing_range_is_rejected() {
+    use viaticum_core::messages::build_pos_hash_challenge;
+
+    use super::pos::PosResponder;
+    use crate::daemon::processor::ProcessorError;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+
+    let owner_key = ed25519_dalek::SigningKey::from_bytes(&[0x13u8; 32]);
+    let owner = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0x35);
+
+    db.upsert_holding(&HoldingRecord {
+        source_block_id: block_id,
+        owner_id: owner,
+        esi_ranges: vec![(0, 3)],
+        importance: 0.5,
+        total_bytes: 3,
+        status: HoldingStatus::Active,
+        received_at: Timestamp::now(),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    })
+    .unwrap();
+
+    let master_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
+    let responder = PosResponder::new(db, holdings_dir.path().to_path_buf(), master_signing_key);
+
+    // u32::MAX + 5 overflows; old `start + count` panics in debug.
+    let challenge = build_pos_hash_challenge(
+        [0x57u8; 16],
+        block_id,
+        vec![(u32::MAX, 5)],
+        Timestamp::now(),
+        None,
+        &owner_key,
+    );
+
+    let result = responder.compute_response(owner, challenge).await;
+    assert!(
+        matches!(result, Err(ProcessorError::OversizedChallenge { .. })),
+        "overflowing range (start + count > u32::MAX) must be rejected via checked_add \
+         — no debug panic; got {result:?}"
+    );
+}
+
+/// SM-1: a challenge whose total exactly equals the holding's `symbol_count()` is
+/// NOT caught by the guard — it proceeds into the normal expansion + file-read path.
+/// In this unit test the symbol files do not exist on disk, so the legit path returns
+/// a Nack (not OversizedChallenge), proving the guard let a legit-sized challenge through.
+#[tokio::test]
+async fn pos_challenge_within_holding_bounds_is_not_rejected() {
+    use viaticum_core::messages::{Message, build_pos_hash_challenge};
+
+    use super::pos::PosResponder;
+    use crate::daemon::processor::ProcessorError;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+
+    let owner_key = ed25519_dalek::SigningKey::from_bytes(&[0x14u8; 32]);
+    let owner = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0x36);
+
+    // Holding covers 3 symbols; challenge requests exactly those 3 (sum == symbol_count).
+    db.upsert_holding(&HoldingRecord {
+        source_block_id: block_id,
+        owner_id: owner,
+        esi_ranges: vec![(0, 3)],
+        importance: 0.5,
+        total_bytes: 3,
+        status: HoldingStatus::Active,
+        received_at: Timestamp::now(),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    })
+    .unwrap();
+
+    let master_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
+    let responder = PosResponder::new(db, holdings_dir.path().to_path_buf(), master_signing_key);
+
+    let challenge = build_pos_hash_challenge(
+        [0x58u8; 16],
+        block_id,
+        vec![(0, 3)],
+        Timestamp::now(),
+        None,
+        &owner_key,
+    );
+
+    let result = responder.compute_response(owner, challenge).await;
+    // Must NOT hit the SM-1 guard. The symbol files don't exist on disk → legit Nack path.
+    assert!(
+        !matches!(result, Err(ProcessorError::OversizedChallenge { .. })),
+        "an in-bounds challenge (sum == symbol_count) must NOT be rejected by the SM-1 \
+         guard; got {result:?}"
+    );
+    assert!(
+        matches!(result, Ok(Message::PosHashNack(_))),
+        "in-bounds challenge with missing symbol files must take the normal path and \
+         produce a Nack; got {result:?}"
+    );
+}
+
 // ─── T-12: Owner-addr propagation (Bug-A remainder) ──────────────────────────
 
 /// T-12 AC: `on_peer_identified` persists listen_addrs to the PeerRecord for an

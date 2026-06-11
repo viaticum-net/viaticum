@@ -93,6 +93,18 @@ pub enum ProcessorError {
     #[error("unauthenticated PoS challenge (bad/absent owner signature)")]
     UnauthenticatedChallenge,
 
+    /// SM-1: a signed-but-abusive PoS challenge requested more (or malformed) ESIs than
+    /// the holder actually holds — rejected BEFORE the unbounded `esi_ranges` expansion so a
+    /// malicious-but-authenticated owner cannot OOM the holder with `[(0, u32::MAX)]`.
+    #[error(
+        "oversized/malformed PoS challenge for block {block_id} (requested {requested} ESIs, hold {held})"
+    )]
+    OversizedChallenge {
+        block_id: viaticum_core::types::SourceBlockId,
+        requested: u64,
+        held: u32,
+    },
+
     #[error("cluster sync error: {0}")]
     ClusterSync(#[from] crate::daemon::cluster_sync::ClusterSyncError),
 
