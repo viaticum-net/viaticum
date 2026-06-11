@@ -448,15 +448,6 @@ pub const AVAIL_DECAY_TICK_SECS: u64 = 24 * 3600;
 /// Response lives in mailbox for response_TTL; owner needs time to poll and receive it.
 pub const POS_CHALLENGE_PENDING_TIMEOUT_SECS: u64 = 7 * 24 * 3600 + 7 * 24 * 3600 + 2 * 3600;
 
-/// Delivery reward weight for mailbox reads (starting value — refine on scale-test).
-/// Normal PoS pass = weight 1.0. Delivery reward = 0.05 (significantly less, but > 0).
-pub const MAILBOX_DELIVERY_REWARD_WEIGHT: f64 = 0.05; // starting value, refine on scale-test
-
-/// Per-postman mailbox trust ceiling (starting value — refine on scale-test).
-/// Prevents mailbox-accumulated trust_p from reaching storage-trust threshold alone.
-/// Per-postman in the LOCAL view of the fetcher node.
-pub const MAILBOX_REWARD_CEILING: f64 = 0.3; // starting value, refine on scale-test
-
 // === Compile-time sanity checks ===
 
 const _: () = assert!(S_CLAMP_MIN < S_CLAMP_MAX);

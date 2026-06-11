@@ -1,7 +1,9 @@
 // RestoreCoordinator: orchestrate symbol fetch → decode → file write.
 //
-// Strategy: try local symbols first (symbols_dir); fall back to network fetch
-// from holders if insufficient. Network fetch is sequential per holder.
+// Strategy (post-Wave-11b, 2-tier): rebuild the block from the owner's own source
+// files and re-encode the needed symbols locally; if that is unavailable, fall back
+// to fetching symbols from holders over the network (sequential per holder). No
+// symbols are cached on disk anymore — the old local `raw/{esi}.bin` tier is gone.
 //
 // Module layout:
 //   mod.rs      — RestoreCoordinator struct, public API, restore(), run()
@@ -42,9 +44,6 @@ pub enum RestoreError {
 
     #[error("source block not found in DB: {0}")]
     BlockNotFound(SourceBlockId),
-
-    #[error("no alive holders for block {0}")]
-    NoHolders(SourceBlockId),
 
     #[error("insufficient symbols: collected {got}, need {need} for block {block}")]
     InsufficientSymbols {
@@ -178,9 +177,6 @@ pub struct RestoreConfig {
     pub identity: IdentityPub,
     /// This device's ID (for LocalState).
     pub device_id: DeviceId,
-    /// Directory where raw symbol files are stored (must match BackupConfig.symbols_dir).
-    /// Wave 2 layout: raw symbols at `{symbols_dir}/{block_hex}/raw/{esi}.bin`.
-    pub symbols_dir: PathBuf,
     /// libp2p swarm handle for remote restore.
     /// When Some: fetch_from_holders uses send_to_device (request-response).
     /// When None: only local symbol files are used.
@@ -204,7 +200,6 @@ impl Default for RestoreConfig {
             parallel_holders: 5,
             identity: IdentityPub([0u8; 32]),
             device_id: DeviceId([0u8; 32]),
-            symbols_dir: PathBuf::from("symbols"),
             swarm: None,
             staging_root: PathBuf::from("restore"),
             data_dir: PathBuf::from("."),
@@ -357,7 +352,7 @@ impl RestoreCoordinator {
 
             let params = block_record.erasure_params();
 
-            // Decode the block (Phase 2: local symbols_dir)
+            // Decode the block (rebuild-from-source, then network fallback)
             let plaintext = self
                 .decode_block_local(block_id, &params, encrypted_size)
                 .await?;
@@ -404,10 +399,11 @@ impl RestoreCoordinator {
 
     /// Decode one source block.
     ///
-    /// Strategy:
-    ///   1. Try local: read symbol files from symbols_dir.
-    ///   2. If insufficient local symbols (<k_eff), try network fetch for remaining.
-    ///   3. Combine local + network symbols, then decode.
+    /// Strategy (2-tier, post-Wave-11b):
+    ///   1. Rebuild the stored blob from the owner's own source files and re-encode
+    ///      the symbols we need locally. No symbols are persisted on disk anymore.
+    ///   2. If the rebuild path is unavailable (e.g. a source file is gone), fall back
+    ///      to fetching symbols from holders over the network.
     ///
     /// Decrypts and decompresses the decoded data before returning.
     pub async fn decode_block_local(
@@ -417,73 +413,29 @@ impl RestoreCoordinator {
         encrypted_size: u64,
     ) -> Result<Vec<u8>, RestoreError> {
         let placements = self.db.list_placements_for_block(block_id)?;
-        // For local symbol reads, use all non-deleted placements: the symbols
-        // are on the owner's disk regardless of holder reachability status.
-        // Lost means the holder's copy is gone, not the owner's local .bin files.
+        // Use all non-deleted placements as the network-fetch candidate set: a
+        // placement's status describes the holder's copy, not anything owner-local.
         let usable_placements: Vec<_> = placements
             .into_iter()
             .filter(|p| p.status != PlacementStatus::Deleting)
             .collect();
 
-        // A4 / Wave 11b: do NOT early-return NoHolders on an empty placement set.
-        // Post-A4 the WorkPipeline worker is the sole creator of placements, so a
-        // freshly-backed-up block has the SourceBlockRecord but no placements yet.
-        // The owner can still restore it from its own source files via the
-        // `rebuild_source_blob` path below — that path needs no placement at all.
-        // We therefore fall through: an empty placement set yields zero local raw
-        // symbols, which triggers the rebuild-from-source fallback. Only if rebuild
-        // AND the (possibly empty) network fetch both fail do we surface an error
-        // (InsufficientSymbols from the network branch). The pre-W11b `NoHolders`
-        // guard here predated source-rebuild and is no longer correct.
-
-        let block_dir = self
-            .config
-            .symbols_dir
-            .join(pipeline::hex_encode(&block_id.0));
-
-        // Wave 2: raw symbols are at {block_dir}/raw/{esi}.bin.
-        // No unbind step needed — raw symbols decode directly.
-        let raw_dir = block_dir.join("raw");
+        // A4 / Wave 11b: an empty placement set is NOT an error. Post-A4 the
+        // WorkPipeline worker is the sole creator of placements, so a freshly-backed-up
+        // block has a SourceBlockRecord but no placements yet. The owner can still
+        // restore it from its own source files via the `rebuild_source_blob` path
+        // below — that path needs no placement at all. Only if rebuild AND the
+        // (possibly empty) network fetch both fail do we surface an error.
 
         let k_eff = params.k_eff as usize;
 
-        // Reading symbol files from disk is blocking I/O; wrap the entire
-        // local-symbol scan in block_in_place so the tokio runtime keeps
-        // making progress on other tasks (review A1).
-        let mut raw_symbols: Vec<Symbol> = tokio::task::block_in_place(|| {
-            let mut collected: Vec<Symbol> = Vec::new();
+        // Wave 11b: no symbols live on disk anymore (the old
+        // `{symbols_dir}/{block_hex}/raw/{esi}.bin` tier-1 cache was removed — the
+        // pipeline never writes those files). Start with no local symbols and rebuild
+        // from source.
+        let mut raw_symbols: Vec<Symbol> = Vec::new();
 
-            'outer: for placement in &usable_placements {
-                for (start_esi, count) in &placement.esi_ranges {
-                    for i in 0..*count {
-                        let esi = start_esi + i;
-                        let symbol_path = raw_dir.join(format!("{esi}.bin"));
-                        let data = match std::fs::read(&symbol_path) {
-                            Ok(d) => d,
-                            Err(e) => {
-                                debug!(
-                                    block = %block_id,
-                                    esi,
-                                    "raw symbol file missing or unreadable: {e}"
-                                );
-                                continue;
-                            }
-                        };
-                        // Raw symbol: no unbind needed.
-                        collected.push(Symbol { esi, data });
-
-                        if collected.len() >= k_eff {
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-
-            collected
-        });
-
-        if raw_symbols.len() < k_eff {
-            // Wave 11b: raw/{esi}.bin files are no longer written by the pipeline.
+        {
             // Try rebuilding the stored blob from source files directly.
             // If that succeeds, we can skip the network fetch entirely.
             let block_record = self.db.get_source_block(block_id)?;
@@ -531,15 +483,14 @@ impl RestoreCoordinator {
                 }
             }
 
-            // Not enough locally — try network fetch for the remainder.
-            // Network path: holders return bound symbols; fetch_from_holders unbinds them.
-            // The merged result (local raw + network unbound) are both raw/unbound and
-            // can be passed directly to decode().
+            // Rebuild-from-source was unavailable (missing source files, etc.) —
+            // fall back to fetching from holders over the network. Holders return
+            // bound symbols; fetch_from_holders unbinds them into raw symbols that
+            // decode() can consume directly.
             debug!(
                 block = %block_id,
-                local = raw_symbols.len(),
                 need = k_eff,
-                "decode: insufficient local raw symbols, trying network"
+                "decode: source rebuild unavailable, fetching symbols from holders"
             );
 
             // Try network fetch for Alive, Uncertain, and PresumedLost placements.

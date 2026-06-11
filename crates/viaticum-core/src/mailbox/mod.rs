@@ -43,6 +43,18 @@ pub mod class_config {
     pub const MAX_ENTRY_BYTES: usize = 256 * 1024;
     /// Global mailbox quota per target: 100 MB.
     pub const MAX_MAILBOX_BYTES_PER_PEER: u64 = 100 * 1024 * 1024;
+
+    // P1-5: pin each named TTL to its intended value at compile time. These guard
+    // the source-of-truth constants themselves: `MailboxClass::default_ttl_secs`
+    // delegates here, so if a literal below is changed by accident the named
+    // contract (e.g. "SelfPointer = 5 years") is enforced rather than silently
+    // drifting.
+    const _: () = assert!(SELF_POINTER_TTL.as_secs() == 5 * 365 * 24 * 3600);
+    const _: () = assert!(POS_CHALLENGE_TTL.as_secs() == 7 * 24 * 3600);
+    const _: () = assert!(DROP_NOTICE_TTL.as_secs() == 14 * 24 * 3600);
+    const _: () = assert!(DELETE_REQUEST_TTL.as_secs() == 14 * 24 * 3600);
+    const _: () = assert!(REVOCATION_TTL.as_secs() == 30 * 24 * 3600);
+    const _: () = assert!(UNKNOWN_SENDER_TTL.as_secs() == 90 * 24 * 3600);
 }
 
 /// Scale a mailbox-entry TTL by `time_scale`, mirroring the daemon scheduler.
@@ -106,15 +118,20 @@ pub enum MailboxClass {
 
 impl MailboxClass {
     /// Default TTL in seconds for this class.
+    ///
+    /// P1-5: `class_config` is the single source of truth for per-class TTLs. This
+    /// method delegates to those `Duration` constants rather than re-stating the
+    /// literals, so the two can never drift. `Generic` has no producer (see the
+    /// poll-loop guard) and maps to the conservative `UNKNOWN_SENDER_TTL`.
     pub fn default_ttl_secs(self) -> u64 {
         match self {
-            MailboxClass::SelfPointer => 5 * 365 * 24 * 3600,
-            MailboxClass::PosChallenge => 7 * 24 * 3600,
-            MailboxClass::PosResponse => 7 * 24 * 3600,
-            MailboxClass::DropNotice => 14 * 24 * 3600,
-            MailboxClass::Generic => 90 * 24 * 3600,
-            MailboxClass::DeleteRequest => 14 * 24 * 3600,
-            MailboxClass::Revocation => 30 * 24 * 3600,
+            MailboxClass::SelfPointer => class_config::SELF_POINTER_TTL.as_secs(),
+            MailboxClass::PosChallenge => class_config::POS_CHALLENGE_TTL.as_secs(),
+            MailboxClass::PosResponse => class_config::POS_CHALLENGE_TTL.as_secs(),
+            MailboxClass::DropNotice => class_config::DROP_NOTICE_TTL.as_secs(),
+            MailboxClass::Generic => class_config::UNKNOWN_SENDER_TTL.as_secs(),
+            MailboxClass::DeleteRequest => class_config::DELETE_REQUEST_TTL.as_secs(),
+            MailboxClass::Revocation => class_config::REVOCATION_TTL.as_secs(),
         }
     }
 

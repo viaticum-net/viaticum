@@ -67,7 +67,10 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
 /// Build a RestoreCoordinator for Phase 2 (local) tests (no network needed).
 /// `staging_dir`: the TempDir that will serve as both staging_root and data_dir
 /// (they're the same in tests — staging_root = staging_dir/restore, data_dir = staging_dir).
-fn test_restore_coord(db: Db, symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreCoordinator {
+// `_symbols_dir` is retained in the signature (callers share one TempDir with the
+// backup coord) but is unused: Wave 11b removed the on-disk symbol tier, so the
+// restore coord no longer reads from symbols_dir (PL-2).
+fn test_restore_coord(db: Db, _symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreCoordinator {
     // Create the restore staging subdirectory under staging_dir.
     let staging_root = staging_dir.path().join("restore");
     std::fs::create_dir_all(&staging_root).expect("create staging_root");
@@ -77,7 +80,6 @@ fn test_restore_coord(db: Db, symbols_dir: &TempDir, staging_dir: &TempDir) -> R
         parallel_holders: 5,
         identity: IdentityPub([9u8; 32]),
         device_id: DeviceId([2u8; 32]),
-        symbols_dir: symbols_dir.path().to_path_buf(),
         swarm: None,
         staging_root,
         data_dir: staging_dir.path().to_path_buf(),
@@ -391,19 +393,17 @@ async fn restore_pack_multiple_files_roundtrip() {
     }
 }
 
-/// Wave 11b: restore_specific_version_by_index
+/// Wave 11b / PL-2: end-to-end restore of the LATEST version via rebuild-from-source.
 ///
-/// After Wave 11b, restoring historical versions requires the source file to still exist
-/// (rebuild_source_blob path) or symbols in holders (network path).
-/// This test now verifies version selection logic using files that still exist on disk:
-/// v1 content is restored first, then v2 is backed up, and we restore v2 (still on disk).
-/// For v1 restore, we write raw symbol files manually to simulate what a holder would store,
-/// allowing the local raw symbol path to work as a test scaffold.
+/// After Wave 11b there is no on-disk symbol cache, so an end-to-end restore is only
+/// possible for a version whose source content still exists on disk (rebuild path) or
+/// whose symbols live in holders (network path). This test backs up two versions and
+/// restores the latest (still on disk) via `rebuild_source_blob`. Restoring a historical
+/// version whose source content was overwritten now requires holders — covered by the
+/// network-restore tests. Pure version-selection logic (Index/BeforeDate/Latest) is
+/// covered by the `select_version_*` unit tests above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restore_specific_version_by_index() {
-    use viaticum_core::erasure::{ErasureEncoder, RaptorQEncoder};
-    use viaticum_core::types::{ErasureParams, hex_encode};
-
+async fn restore_latest_version_via_source_rebuild() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
     let files_dir = TempDir::new().unwrap();
@@ -416,54 +416,6 @@ async fn restore_specific_version_by_index() {
     backup.process_event(added_event(&path)).unwrap();
     let v1_results = backup.flush_all(true, &Default::default()).unwrap();
     assert_eq!(v1_results.len(), 1, "v1 should produce 1 block");
-    let v1_block_id = v1_results[0].source_block_id;
-
-    // Write v1 raw symbols to disk manually (test scaffold for the local raw path).
-    // This simulates what the old pipeline wrote; after Wave 11b the pipeline doesn't
-    // write these, but we need them here to test version-specific restore without a swarm.
-    {
-        let encoder = RaptorQEncoder::new();
-        let v1_blob = crate::daemon::backup::pipeline::rebuild_source_blob(
-            &db,
-            &db.get_source_block(&v1_block_id).unwrap().unwrap(),
-            &TEST_EPOCH_KEY, // same epoch_key as test_backup_coord
-        )
-        .await
-        .unwrap();
-        let stored_size = v1_blob.len() as u64;
-        let params = ErasureParams::compute(stored_size, 0.5).unwrap();
-        let raws = encoder
-            .encode_raw(&v1_blob, &params, 0, params.k_eff)
-            .unwrap();
-        let raw_dir = symbols_dir
-            .path()
-            .join(hex_encode(&v1_block_id.0))
-            .join("raw");
-        std::fs::create_dir_all(&raw_dir).unwrap();
-        for sym in &raws {
-            std::fs::write(raw_dir.join(format!("{}.bin", sym.esi)), &sym.data).unwrap();
-        }
-
-        // A4: backup no longer creates placements (the WorkPipeline worker does).
-        // The local-raw-symbol restore path in decode_block_local iterates over a
-        // block's placements to learn which ESIs to read from raw/{esi}.bin. To
-        // exercise that scaffold for v1 (whose source content is overwritten by v2
-        // below, so rebuild_source_blob can't reproduce it), insert an explicit
-        // placement covering the ESIs we just wrote. This stands in for what backup
-        // previously created and what the worker would create in production.
-        let v1_placement = SymbolPlacement {
-            source_block_id: v1_block_id,
-            holder_id: DeviceId([0xA1u8; 32]),
-            file_id: FileId(1),
-            esi_ranges: vec![(0, params.k_eff)],
-            binding_seed: [0u8; 32],
-            status: PlacementStatus::Alive,
-            last_verified: None,
-            placed_at: Timestamp::now(),
-            consecutive_misses: 0,
-        };
-        db.upsert_placement(&v1_placement).unwrap();
-    }
 
     // Modify file, backup v2 (source file now has different content)
     std::fs::write(&path, b"version two content").unwrap();
@@ -485,23 +437,8 @@ async fn restore_specific_version_by_index() {
         .count();
     assert_eq!(backed_up_count, 2, "should have 2 backed-up versions");
 
-    // Restore version index 0 (the first — v1 with "version one content")
-    // Uses the raw/ files we wrote above.
-    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
-    let request_v0 = super::RestoreRequest {
-        path: path.clone(),
-        version_selector: VersionSelector::Index(0),
-        device_id: DeviceId([2u8; 32]),
-        job_id: JobId::new(),
-    };
-    let result = restore.restore(request_v0).await.unwrap();
-    assert_eq!(result.files_restored, 1, "failures: {:?}", result.failures);
-
-    let rel = path.trim_start_matches('/');
-    let out_v0 = std::fs::read(result.staging_path.join(rel)).unwrap();
-    assert_eq!(out_v0, b"version one content");
-
     // Restore latest (v2, "version two content" — still on disk, rebuild works)
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
     let request_latest = super::RestoreRequest {
         path: path.clone(),
         version_selector: VersionSelector::Latest,
@@ -515,6 +452,7 @@ async fn restore_specific_version_by_index() {
         result2.failures
     );
 
+    let rel = path.trim_start_matches('/');
     let out_latest = std::fs::read(result2.staging_path.join(rel)).unwrap();
     assert_eq!(out_latest, b"version two content");
 }
@@ -1014,7 +952,6 @@ async fn fetch_skips_denied_holder_and_tries_next() {
         parallel_holders: 5,
         identity: owner_master,
         device_id: owner_did,
-        symbols_dir: symbols_dir.path().to_path_buf(),
         swarm: None,
     };
     let coord = RestoreCoordinator::new(db, restore_config, encoder.clone(), Arc::new(owner_net));
@@ -1283,20 +1220,17 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
     owner_net.add_peer(master_h1, addr_h1).await;
     owner_net.add_peer(master_h2, addr_h2).await;
 
-    // Owner symbols_dir is EMPTY.
-    let symbols_dir = TempDir::new().unwrap();
-
+    // Owner has no local source rebuild available in this scenario.
     let restore_config = RestoreConfig {
         epoch_key,
         parallel_holders: 5,
         identity: owner_master,
         device_id: owner_did,
-        symbols_dir: symbols_dir.path().to_path_buf(),
         swarm: None,
     };
     let coord = RestoreCoordinator::new(db, restore_config, encoder, Arc::new(owner_net));
 
-    // decode_block_local: empty local symbols_dir → falls back to network.
+    // decode_block_local: no local rebuild → falls back to network.
     let plaintext = coord
         .decode_block_local(&block_id, &params, encrypted_size)
         .await

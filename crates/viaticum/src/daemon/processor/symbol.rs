@@ -36,7 +36,7 @@ impl SymbolDropHandler {
     /// Returns `true` if the notice passed verification and the placement was updated (or was
     /// already Lost/Deleting — idempotent). Returns `false` if the signature failed or the
     /// holder/block is unknown. Callers (e.g. `ProcessorDropHandler`) gate side-effects like
-    /// `RepairNow` on the return value — prevents repair storms from forged notices.
+    /// the repair wake on the return value — prevents repair storms from forged notices.
     ///
     /// Security: verifies `notice.sig` against `from` (holder master identity) before acting.
     /// An attacker controlling a mailbox postman cannot forge a drop for a block they do not hold:
@@ -118,7 +118,7 @@ impl SymbolDropHandler {
                 holder = %holder_device_id,
                 "processor: DropNotice — placement already Lost/Deleting, skipping block update"
             );
-            // Sig passed and no-op (idempotent): return true so RepairNow is
+            // Sig passed and no-op (idempotent): return true so the repair wake is
             // still triggered for immediate drops even on re-delivery.
             return true;
         }
@@ -130,7 +130,7 @@ impl SymbolDropHandler {
                     block_id = %block_id,
                     "processor: DropNotice — source block not found after placement update"
                 );
-                // Placement was updated successfully; return true so RepairNow is still triggered.
+                // Placement was updated successfully; return true so the repair wake is still triggered.
                 return true;
             }
             Err(e) => {
@@ -252,7 +252,7 @@ impl SymbolDropHandler {
 
 /// Production impl of `DropNoticeHandler` that delegates to `SymbolDropHandler`.
 ///
-/// T-13a: extended to trigger `RepairTrigger::RepairNow` for immediate drops
+/// T-13a: extended to trigger `RepairTrigger::Wake` for immediate drops
 /// (deadline ≤ now + IMMEDIATE_DROP_EPSILON_SECS). This handles the former
 /// `SymbolDropped`-via-relay path which is now folded into the DropNotice mailbox
 /// path with `deadline = Timestamp::now()`.
@@ -265,13 +265,12 @@ impl SymbolDropHandler {
 /// exercise the advance-notice path.
 pub struct ProcessorDropHandler {
     inner: SymbolDropHandler,
-    db: viaticum_core::db::Db,
     repair_tx: tokio::sync::mpsc::Sender<crate::daemon::repair::RepairTrigger>,
 }
 
 /// If a DropNotice deadline is within this many seconds of now (or in the past),
-/// treat it as an immediate drop and trigger RepairNow instead of lazy repair.
-/// 5 minutes: generous for clock skew + publish latency.
+/// treat it as an immediate drop and wake the repair worker instead of relying on
+/// the next scheduled scan. 5 minutes: generous for clock skew + publish latency.
 const IMMEDIATE_DROP_EPSILON_SECS: u64 = 300;
 
 impl ProcessorDropHandler {
@@ -280,8 +279,7 @@ impl ProcessorDropHandler {
         repair_tx: tokio::sync::mpsc::Sender<crate::daemon::repair::RepairTrigger>,
     ) -> Self {
         ProcessorDropHandler {
-            inner: SymbolDropHandler::new(db.clone()),
-            db,
+            inner: SymbolDropHandler::new(db),
             repair_tx,
         }
     }
@@ -294,53 +292,33 @@ impl crate::daemon::mailbox::poll::DropNoticeHandler for ProcessorDropHandler {
 
         // Apply DropNotice: verify sig, mark placement Lost, recompute reliability.
         // Returns false if sig verification failed or holder/block unknown.
-        // Gate all side-effects (RepairNow) on a successful apply to prevent repair storms
+        // Gate all side-effects (the repair wake) on a successful apply to prevent repair storms
         // from forged notices that pass `is_immediate` but fail sig verification.
         let applied = self.inner.apply(from, notice);
         if !applied {
             return;
         }
 
-        // T-13a: if this is an immediate drop (deadline ≈ now), trigger RepairNow
+        // T-13a: if this is an immediate drop (deadline ≈ now), wake the repair worker
         // so that repair happens urgently rather than waiting for the next scheduled scan.
         // This preserves the semantics of the former SymbolDropped-via-relay path.
+        //
+        // PL-8c: the wake carries no addressing — `inner.apply` has already marked the
+        // placement Lost in the DB, and the worker derives all work from the DB on the
+        // next tick. We therefore no longer resolve the holder's DeviceId here.
         let now = viaticum_core::types::Timestamp::now().0;
         let is_immediate = deadline <= now.saturating_add(IMMEDIATE_DROP_EPSILON_SECS);
         if is_immediate {
-            // Resolve DeviceId for the holder master pub (same lookup as handle_symbol_dropped).
-            let holder_device_opt = self
-                .db
-                .get_devices_for_master(&from)
-                .unwrap_or_default()
-                .into_iter()
-                .find(|did| {
-                    // Use the first device that has a placement for this block.
-                    // If none found, fall back to first known device.
-                    self.db
-                        .get_placement(&block_id, did)
-                        .ok()
-                        .flatten()
-                        .is_some()
-                })
-                .or_else(|| {
-                    self.db
-                        .get_devices_for_master(&from)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .next()
-                });
-
-            if let Some(holder_device) = holder_device_opt {
-                let trigger = crate::daemon::repair::RepairTrigger::RepairNow {
-                    block_id,
-                    holder_id: holder_device,
-                };
-                // W-1: try_send is non-blocking. Under burst eviction the channel (cap 64)
-                // may be full, silently dropping the RepairNow trigger. This is an accepted
-                // trade-off for cold backup: the periodic reliability scan (hourly) is the
-                // backstop. Worst-case repair latency under burst = reliability-scan interval
-                // (≤ 1 hour), which is within the cold-backup time constant of 1 week.
-                if let Err(e) = self.repair_tx.try_send(trigger) {
+            // W-1: try_send is non-blocking. Under burst eviction the channel (cap 64)
+            // may be full, silently dropping the wake. This is an accepted trade-off for
+            // cold backup: the periodic reliability scan (hourly) is the backstop.
+            // Worst-case repair latency under burst = reliability-scan interval (≤ 1 hour),
+            // which is within the cold-backup time constant of 1 week.
+            match self
+                .repair_tx
+                .try_send(crate::daemon::repair::RepairTrigger::Wake)
+            {
+                Err(e) => {
                     tracing::warn!(
                         block_id = %block_id,
                         holder = %from,
@@ -348,20 +326,14 @@ impl crate::daemon::mailbox::poll::DropNoticeHandler for ProcessorDropHandler {
                         "processor: DropNotice immediate drop — repair_tx full or closed, \
                          repair will be scheduled lazily"
                     );
-                } else {
+                }
+                Ok(()) => {
                     tracing::info!(
                         block_id = %block_id,
                         holder = %from,
-                        "processor: DropNotice immediate drop — RepairNow triggered"
+                        "processor: DropNotice immediate drop — repair worker woken"
                     );
                 }
-            } else {
-                tracing::warn!(
-                    block_id = %block_id,
-                    holder = %from,
-                    "processor: DropNotice immediate drop — could not resolve DeviceId for holder, \
-                     repair will be scheduled lazily"
-                );
             }
         }
     }

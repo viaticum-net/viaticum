@@ -1,8 +1,8 @@
-// RepairAgent: handles placement state transitions and periodic reliability scanning.
+// RepairAgent: periodic reliability scanning.
 //
-// Wave 11b: RepairAgent is retained as a thin wrapper around:
-//   - Periodic reliability scanning (`reliability_scan`): corrects stale cached fields.
-//   - Placement event handlers: `handle_symbol_dropped`, `handle_pos_nack`.
+// Wave 11b: RepairAgent is a thin wrapper around periodic reliability scanning
+// (`reliability_scan`): it corrects stale `current_alive` / `current_reliability`
+// cached fields so the WorkPipeline worker sees blocks that drifted below target.
 //
 // Removed in Wave 11b:
 //   - `run()`: the active repair loop (replaced by WorkPipeline worker).
@@ -13,15 +13,18 @@
 //     `fetch_and_rebuild_blob`): worker re-encodes from source files;
 //     restore path calls `symbol_fetch::fetch_unbound_symbols` directly.
 //
-// The `RepairTrigger` channel is kept for backward compat with the Scheduler's
-// PoS-failure notification path. `RepairAgent` no longer processes triggers directly;
-// the trigger channel is forwarded by a relay task in `handle/mod.rs` to the
-// WorkPipeline worker as a wake event.
+// Removed in bucket C (PL-8a): `handle_symbol_dropped`, `handle_pos_nack`,
+// `mark_placement_lost`. They duplicated the live `processor::mark_placement_lost`
+// path (a drift risk) and had only test callers — every production mark-Lost goes
+// through the processor.
+//
+// The `RepairTrigger` channel is kept as a wake signal. `RepairAgent` does not
+// process triggers; the channel is drained by a relay task in `handle/mod.rs` that
+// forwards every `RepairTrigger::Wake` to the WorkPipeline worker as a
+// `WorkEvent::DirtyFileEnqueued`.
 
-use viaticum_core::db::{Db, DbError};
-use viaticum_core::types::{
-    DeviceId, PlacementStatus, SourceBlockId, SourceBlockStatus, Timestamp,
-};
+use viaticum_core::db::Db;
+use viaticum_core::types::SourceBlockStatus;
 
 #[cfg(test)]
 mod tests;
@@ -30,42 +33,34 @@ mod tests;
 // Public types
 // ============================================================
 
-/// Trigger message for the Scheduler → WorkPipeline relay.
+/// Wake signal for the Scheduler/processor → WorkPipeline relay.
 ///
-/// The Scheduler sends these when PoS fails (placement Lost). In Wave 11b, these
-/// are forwarded by a relay task in `handle/mod.rs` to the WorkPipeline worker
-/// as a `WorkEvent::DirtyFileEnqueued` wake signal.
+/// Producers send this when a placement transitions to Lost (PoS fail/timeout,
+/// long-absence sweep, immediate DropNotice). The relay task in `handle/mod.rs`
+/// forwards every `Wake` to the WorkPipeline worker as a single
+/// `WorkEvent::DirtyFileEnqueued` — the worker then rescans the DB and re-encodes
+/// whatever is below target.
+///
+/// PL-8c: this is a unit variant on purpose. The earlier `RepairNow { block_id,
+/// holder_id }` addressing was a dead contract — the consumer discarded the fields
+/// and always sent a generic wake — and `ScanAll` (PL-8b) had no producer. The
+/// trigger carries no payload because the worker is the sole repair authority and
+/// derives all work from the DB, not from the wake.
 #[derive(Debug)]
 pub enum RepairTrigger {
-    /// Immediate repair of a specific placement.
-    RepairNow {
-        block_id: SourceBlockId,
-        holder_id: DeviceId,
-    },
-    /// Full scan (same as periodic).
-    ScanAll,
-}
-
-/// Error type for repair operations.
-#[derive(Debug, thiserror::Error)]
-pub enum RepairError {
-    #[error("placement record missing from DB: block={0} holder={1}")]
-    PlacementMissing(SourceBlockId, DeviceId),
-
-    #[error("db error: {0}")]
-    Db(#[from] DbError),
+    /// A placement became Lost somewhere — wake the worker to rescan + re-encode.
+    Wake,
 }
 
 // ============================================================
 // RepairAgent
 // ============================================================
 
-/// RepairAgent: thin wrapper around periodic reliability scanning and event handlers.
+/// RepairAgent: thin wrapper around periodic reliability scanning.
 ///
 /// In Wave 11b, active repair (encode + deliver to new holder) is handled by
-/// the WorkPipeline worker. RepairAgent retains:
-///   - `reliability_scan()`: corrects stale `current_alive` / `current_reliability` cached fields.
-///   - `handle_symbol_dropped`, `handle_pos_nack`: mark placement Lost + W11a hook.
+/// the WorkPipeline worker. RepairAgent retains only `reliability_scan()`, which
+/// corrects stale `current_alive` / `current_reliability` cached fields.
 pub struct RepairAgent {
     db: Db,
 }
@@ -137,67 +132,5 @@ impl RepairAgent {
             tracing::info!(updated, "reliability_scan: corrected {} blocks", updated);
         }
         updated
-    }
-
-    /// Process an incoming SymbolDropped message — mark placement Lost.
-    ///
-    /// Idempotent: if placement is already Lost or Deleting, no-op.
-    pub async fn handle_symbol_dropped(
-        &self,
-        block_id: &SourceBlockId,
-        holder_id: &DeviceId,
-        now: Timestamp,
-    ) -> Result<(), RepairError> {
-        self.mark_placement_lost(block_id, holder_id, now).await
-    }
-
-    /// Process an incoming PosNack message — mark placement Lost.
-    ///
-    /// Equivalent to handle_symbol_dropped from the owner's perspective.
-    /// Idempotent: if placement is already Lost or Deleting, no-op.
-    pub async fn handle_pos_nack(
-        &self,
-        block_id: &SourceBlockId,
-        holder_id: &DeviceId,
-        now: Timestamp,
-    ) -> Result<(), RepairError> {
-        self.mark_placement_lost(block_id, holder_id, now).await
-    }
-
-    // ── Private helpers ───────────────────────────────────────────────────────
-
-    /// Mark a placement as Lost. Idempotent: no-op if already Lost or Deleting.
-    async fn mark_placement_lost(
-        &self,
-        block_id: &SourceBlockId,
-        holder_id: &DeviceId,
-        _now: Timestamp,
-    ) -> Result<(), RepairError> {
-        let placement = self
-            .db
-            .get_placement(block_id, holder_id)?
-            .ok_or(RepairError::PlacementMissing(*block_id, *holder_id))?;
-
-        if placement.status == PlacementStatus::Lost
-            || placement.status == PlacementStatus::Deleting
-        {
-            return Ok(());
-        }
-
-        let mut updated = placement;
-        updated.status = PlacementStatus::Lost;
-        updated.consecutive_misses = 0;
-        self.db.upsert_placement(&updated)?;
-
-        // Recompute cached fields after successful upsert (best-effort).
-        crate::daemon::processor::recompute_and_persist_block_cached_fields(&self.db, block_id);
-
-        tracing::info!(
-            block_id = %block_id,
-            holder_id = %holder_id,
-            "placement marked Lost (explicit drop/nack)"
-        );
-
-        Ok(())
     }
 }

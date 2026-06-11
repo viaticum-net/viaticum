@@ -80,7 +80,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
 
 /// Restore config pointing at the same symbols_dir.
 /// `staging_dir` is used as both data_dir and parent for restore/.
-fn restore_config(symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreConfig {
+fn restore_config(_symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreConfig {
     let staging_root = staging_dir.path().join("restore");
     std::fs::create_dir_all(&staging_root).expect("create staging_root");
     RestoreConfig {
@@ -88,7 +88,6 @@ fn restore_config(symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreConfig
         parallel_holders: 5,
         identity: IdentityPub([9u8; 32]),
         device_id: DEVICE_B,
-        symbols_dir: symbols_dir.path().to_path_buf(),
         swarm: None,
         staging_root,
         data_dir: staging_dir.path().to_path_buf(),

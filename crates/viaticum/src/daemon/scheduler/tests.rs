@@ -147,7 +147,6 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -162,18 +161,12 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
         "pending map should be cleared after timeout processing"
     );
 
-    // RepairNow should have been sent (3 misses → PresumedLost → trigger_repair=true).
+    // A repair wake should have been sent (3 misses → PresumedLost → trigger_repair=true).
     let trigger = repair_rx.try_recv().expect("repair trigger should be sent");
-    match trigger {
-        RepairTrigger::RepairNow {
-            block_id: bid,
-            holder_id: hid,
-        } => {
-            assert_eq!(bid, block_id);
-            assert_eq!(hid, holder_id);
-        }
-        other => panic!("expected RepairNow, got {other:?}"),
-    }
+    assert!(
+        matches!(trigger, RepairTrigger::Wake),
+        "expected RepairTrigger::Wake, got {trigger:?}"
+    );
 
     // Verify placement was updated to PresumedLost in DB.
     let updated = db
@@ -231,7 +224,6 @@ async fn check_timeouts_ignores_fresh_challenges() {
         test_router,
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -343,7 +335,6 @@ async fn check_timeouts_respects_time_scale() {
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -414,7 +405,6 @@ async fn issue_due_challenges_skips_already_pending() {
         test_router,
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -475,7 +465,6 @@ async fn scheduler_skips_deleting_placements() {
         test_router,
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -552,7 +541,6 @@ async fn time_scale_divides_intervals() {
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -669,7 +657,6 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
         router,
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -748,7 +735,6 @@ async fn deletion_tick_noop_when_no_eligible_files() {
         test_router,
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -805,7 +791,6 @@ async fn scheduler_transitions_offered_to_lost_after_long_absence() {
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -825,18 +810,12 @@ async fn scheduler_transitions_offered_to_lost_after_long_absence() {
         "Offered placement absent > 14 days should become Lost"
     );
 
-    // repair_tx should have received RepairNow.
+    // repair_tx should have received a repair wake.
     let trigger = repair_rx.try_recv().expect("repair trigger must be sent");
-    match trigger {
-        RepairTrigger::RepairNow {
-            block_id: bid,
-            holder_id: hid,
-        } => {
-            assert_eq!(bid, block_id);
-            assert_eq!(hid, holder_id);
-        }
-        other => panic!("expected RepairNow, got {other:?}"),
-    }
+    assert!(
+        matches!(trigger, RepairTrigger::Wake),
+        "expected RepairTrigger::Wake, got {trigger:?}"
+    );
 }
 
 /// An Offered placement less than 14 days old is NOT swept.
@@ -880,7 +859,6 @@ async fn scheduler_does_not_transition_offered_to_lost_before_long_absence() {
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -997,7 +975,6 @@ async fn already_deleting_holder_is_not_republished() {
         router,
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -1169,7 +1146,6 @@ fn make_deletion_scheduler(
         router,
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -1347,7 +1323,7 @@ async fn multi_holder_delete_retries_only_unacked_holder() {
 /// engine emits CleanupPlacement for each and then CleanupBlock — proving the block
 /// is no longer stuck. This asserts the engine ACTIONS (CleanupPlacement ×n then
 /// CleanupBlock); actual row removal by the scheduler arm is covered by
-/// `cleanup_block_removes_files_from_disk`.
+/// `cleanup_block_removes_db_record`.
 #[tokio::test]
 async fn multi_holder_block_reaches_cleanup_when_all_holders_deleting() {
     use viaticum_core::constants::{HOLDER_DELETE_COOLDOWN_SECS, OWNER_DELETE_COOLDOWN_SECS};
@@ -1579,7 +1555,6 @@ async fn delete_not_marked_sent_when_publish_zero_acks() {
         router,
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -1626,24 +1601,27 @@ async fn delete_not_marked_sent_when_publish_zero_acks() {
     );
 }
 
-// ─── D4: cleanup_block_removes_files_from_disk ───────────────────────────────
+// ─── D4: cleanup_block_removes_db_record ─────────────────────────────────────
 
-/// CleanupBlock must call remove_dir_all on the owner-side source block directory.
+/// PL-6: CleanupBlock removes the source block + file version from the DB.
+///
+/// Post-Wave-11b there are no owner-side symbol files on disk to remove — the
+/// pipeline persists nothing, so `{source_blocks_dir}/{block_hex}` is never created
+/// and the old disk-cleanup was a dead no-op. The remaining observable effect of
+/// CleanupBlock is the DB row removal.
 ///
 /// Setup:
 ///   - File: single device, deleted_at = 0 (well past owner + holder cooldowns).
 ///   - Source block: Deleting.
 ///   - Placement: Deleting.
-///   - source_blocks_dir contains {block_hex}/block.bin.
 ///
-/// After process_deletion_tick the directory must be gone.
+/// After process_deletion_tick the source block record must be gone from the DB.
 #[tokio::test]
-async fn cleanup_block_removes_files_from_disk() {
-    use tempfile::TempDir;
+async fn cleanup_block_removes_db_record() {
     use viaticum_core::types::DeviceId;
 
     let db = Db::open_in_memory().unwrap();
-    let source_blocks_tmp = TempDir::new().expect("tempdir");
+    let data_dir = tempfile::TempDir::new().expect("tempdir");
 
     let block_id = make_block_id(0xC1);
     let holder_id = make_identity(0xC2);
@@ -1703,13 +1681,6 @@ async fn cleanup_block_removes_files_from_disk() {
     };
     db.upsert_placement(&placement).unwrap();
 
-    // Create the owner-side directory with a fake block.bin.
-    let block_hex = viaticum_core::types::hex_encode(&block_id.0);
-    let block_dir = source_blocks_tmp.path().join(&block_hex);
-    std::fs::create_dir_all(&block_dir).unwrap();
-    std::fs::write(block_dir.join("block.bin"), b"fake content").unwrap();
-    assert!(block_dir.exists(), "block dir must exist before the tick");
-
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let pending = make_pending_challenges();
@@ -1728,22 +1699,15 @@ async fn cleanup_block_removes_files_from_disk() {
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
-        source_blocks_tmp.path().to_path_buf(),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
-        std::env::temp_dir(),
+        data_dir.path().to_path_buf(),
     );
 
     scheduler.process_deletion_tick().await.unwrap();
 
-    // The block directory must have been removed.
-    assert!(
-        !block_dir.exists(),
-        "CleanupBlock must remove the source block directory from disk"
-    );
-
-    // Source block record must also be gone from DB.
+    // Source block record must be gone from DB.
     let sb_after = db.get_source_block(&block_id).unwrap();
     assert!(
         sb_after.is_none(),
@@ -1799,7 +1763,6 @@ fn make_scheduler_for_hook(
         router,
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/sched_hook_test"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -2017,11 +1980,17 @@ impl MailboxNetworkSender for AckMailboxSender {
 //
 // To exercise issue_due_challenges() end-to-end we need:
 //   1. A SourceBlockRecord with valid erasure params (k, t, n, overhead).
-//   2. A block.bin on disk with exactly k*t bytes.
+//   2. The block's source bytes available to `load_source_block_data`.
 //   3. A SymbolPlacement for a holder with known ESI ranges.
 //   4. A PeerRecord for the holder (so trust lookup doesn't panic).
 //
 // Minimal params: k=10, t=64 → block size = 640 bytes; k_eff=13, n=20, overhead=1.5.
+//
+// PL-6: the on-disk `block.bin` tier of `load_source_block_data` was removed. These
+// tests now serve the block's bytes via the SystemState retained-blob tier
+// (`<data_dir>/system_state/<hex>.bin`, verified blake3(blob) == block_id), which is a
+// live tier. Because that tier is content-addressed, the block_id is DERIVED from the
+// bytes (see `seed_retained_pos_block`) rather than an arbitrary `make_block_id`.
 
 const TEST_K: u32 = 10;
 const TEST_T: u16 = 64;
@@ -2048,6 +2017,30 @@ fn make_source_block_record(block_id: SourceBlockId) -> viaticum_core::types::So
     }
 }
 
+/// Deterministic k*t-byte block body for PoS tests, seeded so different blocks differ.
+fn pos_block_bytes(seed: u8) -> Vec<u8> {
+    (0..(TEST_K as usize * TEST_T as usize))
+        .map(|i| ((i.wrapping_add(seed as usize)) & 0xFF) as u8)
+        .collect()
+}
+
+/// Seed a content-addressed source block for PoS tests: write the block bytes as a
+/// retained blob under `data_dir` (the live tier `load_source_block_data` reads first)
+/// and upsert a matching `SourceBlockRecord`. Returns the derived block_id.
+///
+/// Replaces the old `write_block_bin` (which exploited the now-removed on-disk
+/// `block.bin` tier, hence could use arbitrary block_ids). The retained-blob tier
+/// verifies blake3(blob) == block_id, so the id is derived from the bytes here.
+fn seed_retained_pos_block(data_dir: &std::path::Path, db: &Db, seed: u8) -> SourceBlockId {
+    let blob = pos_block_bytes(seed);
+    let block_id = SourceBlockId(*blake3::hash(&blob).as_bytes());
+    crate::daemon::system_state::block::store_retained_block(data_dir, &block_id, &blob)
+        .expect("store retained block");
+    db.upsert_source_block(&make_source_block_record(block_id))
+        .expect("upsert source block");
+    block_id
+}
+
 fn make_peer_record(holder_id: DeviceId) -> viaticum_core::types::PeerRecord {
     viaticum_core::types::PeerRecord {
         device_id: holder_id,
@@ -2067,20 +2060,6 @@ fn make_peer_record(holder_id: DeviceId) -> viaticum_core::types::PeerRecord {
     }
 }
 
-/// Write a block.bin of exactly k*t bytes under `source_blocks_dir/{block_hex}/block.bin`.
-/// Returns the data written (so tests can use it for verification if needed).
-fn write_block_bin(source_blocks_dir: &std::path::Path, block_id: SourceBlockId) -> Vec<u8> {
-    let block_hex = viaticum_core::types::hex_encode(&block_id.0);
-    let block_dir = source_blocks_dir.join(&block_hex);
-    std::fs::create_dir_all(&block_dir).unwrap();
-    // Block data: deterministic bytes (seed from block_id[0]) to avoid all-zero edge cases.
-    let data: Vec<u8> = (0..(TEST_K as usize * TEST_T as usize))
-        .map(|i| ((i.wrapping_add(block_id.0[0] as usize)) & 0xFF) as u8)
-        .collect();
-    std::fs::write(block_dir.join("block.bin"), &data).unwrap();
-    data
-}
-
 // ─── T-6 test: challenge goes via mailbox, not relay ─────────────────────────
 
 /// A due PoS challenge is published via MailboxRouter (the mailbox bus).
@@ -2096,14 +2075,11 @@ async fn scheduler_issues_challenge_via_mailbox_not_relay() {
     use viaticum_core::types::from_cbor_bytes;
 
     let db = Db::open_in_memory().expect("db open");
-    let source_blocks_tmp = tempfile::TempDir::new().unwrap();
-    let block_id = make_block_id(0xA1);
+    let data_dir = tempfile::TempDir::new().unwrap();
     let holder_id = make_identity(0xA2);
 
-    // Insert source block record + block.bin + placement + peer.
-    let sbr = make_source_block_record(block_id);
-    db.upsert_source_block(&sbr).unwrap();
-    write_block_bin(source_blocks_tmp.path(), block_id);
+    // Insert source block record + retained blob + placement + peer.
+    let block_id = seed_retained_pos_block(data_dir.path(), &db, 0xA1);
 
     let placement = make_placement(block_id, holder_id);
     db.upsert_placement(&placement).unwrap();
@@ -2135,11 +2111,10 @@ async fn scheduler_issues_challenge_via_mailbox_not_relay() {
         router,
         my_master,
         signing_key,
-        source_blocks_tmp.path().to_path_buf(),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
-        std::env::temp_dir(),
+        data_dir.path().to_path_buf(),
     );
 
     scheduler
@@ -2191,13 +2166,10 @@ async fn pos_challenge_stored_in_mailbox_with_correct_ttl() {
     use viaticum_core::mailbox::{MailboxClass, class_config::POS_CHALLENGE_TTL};
 
     let db = Db::open_in_memory().expect("db open");
-    let source_blocks_tmp = tempfile::TempDir::new().unwrap();
-    let block_id = make_block_id(0xB1);
+    let data_dir = tempfile::TempDir::new().unwrap();
     let holder_id = make_identity(0xB2);
 
-    let sbr = make_source_block_record(block_id);
-    db.upsert_source_block(&sbr).unwrap();
-    write_block_bin(source_blocks_tmp.path(), block_id);
+    let block_id = seed_retained_pos_block(data_dir.path(), &db, 0xB1);
 
     let placement = make_placement(block_id, holder_id);
     db.upsert_placement(&placement).unwrap();
@@ -2228,11 +2200,10 @@ async fn pos_challenge_stored_in_mailbox_with_correct_ttl() {
         router,
         dummy_master_pub(),
         signing_key,
-        source_blocks_tmp.path().to_path_buf(),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
-        std::env::temp_dir(),
+        data_dir.path().to_path_buf(),
     );
 
     scheduler
@@ -2327,7 +2298,6 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -2430,7 +2400,6 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
         make_test_router(&db2),
         dummy_master_pub(),
         signing_key2,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -2477,16 +2446,10 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
     let trigger = repair_rx2
         .try_recv()
         .expect("Fail outcome must trigger repair (trigger_repair=true)");
-    match trigger {
-        RepairTrigger::RepairNow {
-            block_id: bid,
-            holder_id: hid,
-        } => {
-            assert_eq!(bid, block_id2);
-            assert_eq!(hid, holder_id2);
-        }
-        other => panic!("expected RepairNow after Fail, got {other:?}"),
-    }
+    assert!(
+        matches!(trigger, RepairTrigger::Wake),
+        "expected RepairTrigger::Wake after Fail, got {trigger:?}"
+    );
 }
 
 // ─── A3 (P1-4 / M1): owner-side idempotency for a re-delivered PosResponse ──────
@@ -2552,7 +2515,6 @@ async fn pos_response_duplicate_after_consume_is_dropped() {
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -2682,7 +2644,6 @@ async fn pos_response_from_wrong_identity_is_ignored() {
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -2842,7 +2803,6 @@ async fn pos_pending_timeout_is_14d_2h_not_7d_1h() {
         make_test_router(&db),
         dummy_master_pub(),
         signing_key,
-        std::path::PathBuf::from("/tmp/test_source_blocks"),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
@@ -2875,21 +2835,14 @@ async fn pos_pending_timeout_is_14d_2h_not_7d_1h() {
 #[tokio::test]
 async fn ss_blocks_excluded_from_due_challenges_via_existing_ss_block_id_set() {
     let db = Db::open_in_memory().expect("db open");
-    let source_blocks_tmp = tempfile::TempDir::new().unwrap();
+    let data_dir = tempfile::TempDir::new().unwrap();
 
-    // Two blocks: one normal, one SS.
-    let normal_block_id = make_block_id(0xF1);
-    let ss_block_id = make_block_id(0xF2);
     let normal_holder = make_identity(0xF3);
     let ss_holder = make_identity(0xF4);
 
-    // Insert source block records + block.bin for both.
-    let normal_sbr = make_source_block_record(normal_block_id);
-    let ss_sbr = make_source_block_record(ss_block_id);
-    db.upsert_source_block(&normal_sbr).unwrap();
-    db.upsert_source_block(&ss_sbr).unwrap();
-    write_block_bin(source_blocks_tmp.path(), normal_block_id);
-    write_block_bin(source_blocks_tmp.path(), ss_block_id);
+    // Two content-addressed blocks (retained blobs + records): one normal, one SS.
+    let normal_block_id = seed_retained_pos_block(data_dir.path(), &db, 0xF1);
+    let ss_block_id = seed_retained_pos_block(data_dir.path(), &db, 0xF2);
 
     // Insert placements for both holders.
     db.upsert_placement(&make_placement(normal_block_id, normal_holder))
@@ -2927,11 +2880,10 @@ async fn ss_blocks_excluded_from_due_challenges_via_existing_ss_block_id_set() {
         router,
         dummy_master_pub(),
         signing_key,
-        source_blocks_tmp.path().to_path_buf(),
         crate::daemon::processor::make_empty_accepted_offers(),
         make_test_encoder(),
         TEST_EPOCH_KEY,
-        std::env::temp_dir(),
+        data_dir.path().to_path_buf(),
     );
 
     scheduler
@@ -2978,16 +2930,13 @@ async fn ss_blocks_excluded_from_due_challenges_via_existing_ss_block_id_set() {
 /// With AckMailboxSender (returns Ack): pending entry IS created.
 #[tokio::test]
 async fn pending_challenge_not_created_before_mailbox_store_ack() {
-    let source_blocks_tmp = tempfile::TempDir::new().unwrap();
-    let block_id = make_block_id(0x77);
     let holder_id = make_identity(0x78);
 
     // ── Case 1: NoOpMailboxSender → 0 acks → no pending entry ────────────────
     {
         let db = Db::open_in_memory().expect("db open");
-        let sbr = make_source_block_record(block_id);
-        db.upsert_source_block(&sbr).unwrap();
-        write_block_bin(source_blocks_tmp.path(), block_id);
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let block_id = seed_retained_pos_block(data_dir.path(), &db, 0x77);
         db.upsert_placement(&make_placement(block_id, holder_id))
             .unwrap();
         db.upsert_peer(&make_peer_record(holder_id)).unwrap();
@@ -3016,11 +2965,10 @@ async fn pending_challenge_not_created_before_mailbox_store_ack() {
             router,
             dummy_master_pub(),
             ed25519_dalek::SigningKey::from_bytes(&signing_key.to_bytes()),
-            source_blocks_tmp.path().to_path_buf(),
             crate::daemon::processor::make_empty_accepted_offers(),
             make_test_encoder(),
             TEST_EPOCH_KEY,
-            std::env::temp_dir(),
+            data_dir.path().to_path_buf(),
         );
 
         scheduler
@@ -3037,9 +2985,8 @@ async fn pending_challenge_not_created_before_mailbox_store_ack() {
     // ── Case 2: AckMailboxSender → ≥1 ack → pending entry IS created ─────────
     {
         let db = Db::open_in_memory().expect("db open (ack case)");
-        let sbr = make_source_block_record(block_id);
-        db.upsert_source_block(&sbr).unwrap();
-        write_block_bin(source_blocks_tmp.path(), block_id);
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let block_id = seed_retained_pos_block(data_dir.path(), &db, 0x77);
         db.upsert_placement(&make_placement(block_id, holder_id))
             .unwrap();
         db.upsert_peer(&make_peer_record(holder_id)).unwrap();
@@ -3068,11 +3015,10 @@ async fn pending_challenge_not_created_before_mailbox_store_ack() {
             router,
             dummy_master_pub(),
             signing_key,
-            source_blocks_tmp.path().to_path_buf(),
             crate::daemon::processor::make_empty_accepted_offers(),
             make_test_encoder(),
             TEST_EPOCH_KEY,
-            std::env::temp_dir(),
+            data_dir.path().to_path_buf(),
         );
 
         scheduler

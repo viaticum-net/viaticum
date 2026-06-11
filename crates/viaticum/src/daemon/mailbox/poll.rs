@@ -169,7 +169,18 @@ pub(crate) async fn dispatch_entry(
             dispatch_drop_notice(drop_handler, entry);
         }
         MailboxClass::Generic => {
-            debug!(msg_id = ?entry.msg_id, "mailbox_poll: ignoring Generic entry");
+            // P1-10: Generic has NO dispatch handler by design — there is currently no
+            // producer of `MailboxClass::Generic` entries anywhere in the codebase, so
+            // any Generic entry we receive is unexpected. We deliberately drop it (no
+            // effect), but log loudly so this is not a *silent* no-op: if a Generic
+            // producer is ever added, wire its handler in this arm — otherwise its
+            // entries will be discarded here. The entry still expires via its TTL.
+            warn!(
+                msg_id = ?entry.msg_id,
+                target = ?entry.target,
+                "mailbox_poll: received a Generic mailbox entry but no Generic handler is \
+                 wired (no producer exists by design) — dropping with no effect"
+            );
         }
         MailboxClass::DeleteRequest => {
             dispatch_delete_request(delete_handler, entry).await;
@@ -194,6 +205,22 @@ async fn dispatch_pos_challenge(
     entry: MailboxEntry,
     time_scale: u64,
 ) {
+    // CS-ID-6 / SM-8 (defense-in-depth): we only ever poll our own mailbox
+    // (`router.poll(&my_master_pub, ...)`), so a PosChallenge that reaches dispatch
+    // must be addressed to us. Effects are already gated by signature verification
+    // (the holding lookup keys on owner_master from `entry.sender`), but this guard
+    // documents and enforces the routing invariant: a buggy or hostile postman that
+    // returns a mis-targeted entry is rejected here rather than processed.
+    // `dispatch_self_pointer` makes the same own-vs-postman distinction.
+    if &entry.target != my_master_pub {
+        warn!(
+            msg_id = ?entry.msg_id,
+            entry_target = ?entry.target,
+            "mailbox_poll: PosChallenge not addressed to this node — dropping (routing invariant)"
+        );
+        return;
+    }
+
     let owner_master = match entry.sender {
         Some(s) => s,
         None => {

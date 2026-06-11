@@ -97,9 +97,6 @@ pub struct Scheduler {
     my_master_pub: IdentityPub,
     /// Signing key for building DeleteMsg signatures.
     signing_key: ed25519_dalek::SigningKey,
-    /// Directory containing owner-side source block files (`{block_id_hex}/*.bin`).
-    /// Used by CleanupBlock to remove leftover symbol files from disk.
-    source_blocks_dir: std::path::PathBuf,
     /// Shared accepted-offers map, periodically swept to evict stale entries.
     accepted_offers: crate::daemon::processor::AcceptedOffers,
     /// Erasure encoder for computing raw symbols during hash challenge issuance.
@@ -123,7 +120,6 @@ impl Scheduler {
         mailbox_router: Arc<MailboxRouter>,
         my_master_pub: IdentityPub,
         signing_key: ed25519_dalek::SigningKey,
-        source_blocks_dir: std::path::PathBuf,
         accepted_offers: crate::daemon::processor::AcceptedOffers,
         encoder: std::sync::Arc<dyn viaticum_core::erasure::ErasureEncoder>,
         epoch_key: [u8; 32],
@@ -137,7 +133,6 @@ impl Scheduler {
             mailbox_router,
             my_master_pub,
             signing_key,
-            source_blocks_dir,
             accepted_offers,
             encoder,
             epoch_key,
@@ -422,10 +417,7 @@ impl Scheduler {
         if transition.trigger_repair {
             let _ = self
                 .repair_tx
-                .send(crate::daemon::repair::RepairTrigger::RepairNow {
-                    block_id,
-                    holder_id,
-                })
+                .send(crate::daemon::repair::RepairTrigger::Wake)
                 .await;
         }
 
@@ -570,7 +562,7 @@ impl Scheduler {
                 continue;
             }
 
-            // Load source block data (from block.bin or rebuild).
+            // Load source block data (retained SS blob, else rebuild from source files).
             let source_data = match self.load_source_block_data(&block_id).await {
                 Ok(d) => d,
                 Err(e) => {
@@ -811,30 +803,23 @@ impl Scheduler {
 
     /// Load source block data for PoS challenge computation.
     ///
-    /// Resolution order:
+    /// Resolution order (2-tier, post-Wave-11b):
     ///   1. SystemState retained blob (`<data_dir>/system_state/<hex>.bin`) — SS blocks
     ///      have no backing watch-dir file; the owner retains the blob for PoS re-encode.
     ///      Corruption is propagated loudly; absence falls through.
-    ///   2. `block.bin` cache on disk.
-    ///   3. Rebuild from source files via compress_and_encrypt (same path as
-    ///      Processor::rebuild_blob_for_pos).
+    ///   2. Rebuild from the owner's source files via compress_and_encrypt (same path as
+    ///      `Processor::rebuild_blob_for_pos`).
+    ///
+    /// PL-6: the old on-disk `{source_blocks_dir}/{block_hex}/block.bin` middle tier was
+    /// removed. Wave 11b never writes `block.bin` (the symbol pipeline persists nothing
+    /// to disk), so that `tokio::fs::read` was always NotFound and always fell through to
+    /// the rebuild path below — a dead tier.
     async fn load_source_block_data(&self, block_id: &SourceBlockId) -> anyhow::Result<Vec<u8>> {
         // SystemState blocks: serve the owner-retained blob (verified blake3 == block_id).
         if let Some(blob) =
             crate::daemon::system_state::block::try_load_retained_block(&self.data_dir, block_id)?
         {
             return Ok(blob);
-        }
-
-        let block_hex = viaticum_core::types::hex_encode(&block_id.0);
-        let block_path = self.source_blocks_dir.join(&block_hex).join("block.bin");
-
-        match tokio::fs::read(&block_path).await {
-            Ok(data) => return Ok(data),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Rebuild from source files.
-            }
-            Err(e) => return Err(e.into()),
         }
 
         let block_record = self
@@ -868,7 +853,7 @@ impl Scheduler {
     ///   1. Look up the current placement from DB.
     ///   2. Apply Timeout outcome → get PlacementTransition.
     ///   3. Persist updated placement status/misses to DB.
-    ///   4. If transition.trigger_repair: send RepairNow to repair_tx.
+    ///   4. If transition.trigger_repair: send RepairTrigger::Wake to repair_tx.
     ///   5. Remove from pending_challenges.
     pub async fn check_timeouts(&self) -> anyhow::Result<()> {
         let now = Timestamp::now();
@@ -959,13 +944,7 @@ impl Scheduler {
 
             // Trigger repair if the transition requires it.
             if transition.trigger_repair {
-                let _ = self
-                    .repair_tx
-                    .send(RepairTrigger::RepairNow {
-                        block_id,
-                        holder_id,
-                    })
-                    .await;
+                let _ = self.repair_tx.send(RepairTrigger::Wake).await;
             }
 
             // Remove from pending map — challenge lifecycle is over.
@@ -1206,25 +1185,17 @@ impl Scheduler {
                             }
                         }
                     }
-                    // Remove owner-side symbol files from disk (review B2 / Flow 7 BLOCK).
-                    // Previously the DB record was cleaned up but `{source_blocks_dir}/{block_id}/*.bin`
-                    // remained forever, leaking disk space.
-                    let block_hex = viaticum_core::types::hex_encode(&source_block_id.0);
-                    let block_dir = self.source_blocks_dir.join(&block_hex);
-                    if block_dir.exists()
-                        && let Err(e) = std::fs::remove_dir_all(&block_dir)
-                    {
-                        warn!(
-                            block_id = %source_block_id,
-                            path = %block_dir.display(),
-                            err = %e,
-                            "scheduler: failed to remove owner-side source block directory"
-                        );
-                    }
+                    // PL-6: there are NO owner-side symbol files to remove. Wave 11b
+                    // never writes `{source_blocks_dir}/{block_hex}/*` — the symbol
+                    // pipeline persists nothing to disk and re-encodes from source on
+                    // demand — so that directory is never created. The earlier disk
+                    // cleanup here (review B2 / Flow 7) guarded a never-existing path and
+                    // was a dead no-op; it has been removed. The DB record + file version
+                    // are the only owner-side state, cleaned up in the txn above.
                     info!(
                         block_id = %source_block_id,
                         file_id = %file_id,
-                        "scheduler: cleaned up source block + file version + disk files"
+                        "scheduler: cleaned up source block + file version"
                     );
                 }
                 DeletionAction::VacuumBlock {
@@ -1252,7 +1223,7 @@ impl Scheduler {
     ///
     /// For each stale Offered placement:
     ///   1. Transition status to Lost via upsert_placement.
-    ///   2. Send RepairTrigger::RepairNow { block_id, holder_id }.
+    ///   2. Send RepairTrigger::Wake (worker rescans + re-encodes below-target blocks).
     ///
     /// Called on the sweep_timer tick (same interval as accepted_offers pruning).
     ///
@@ -1293,13 +1264,7 @@ impl Scheduler {
                 "scheduler: Offered placement absent > 14 days → Lost"
             );
 
-            let _ = self
-                .repair_tx
-                .send(RepairTrigger::RepairNow {
-                    block_id: p.source_block_id,
-                    holder_id: p.holder_id,
-                })
-                .await;
+            let _ = self.repair_tx.send(RepairTrigger::Wake).await;
         }
         Ok(())
     }

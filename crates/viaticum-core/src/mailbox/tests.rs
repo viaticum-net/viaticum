@@ -310,6 +310,42 @@ fn mailbox_class_ttl_values_are_correct() {
     );
 }
 
+/// P1-5: `default_ttl_secs` must agree with the `class_config` source-of-truth
+/// constants for every class — they are no longer duplicated literals, so this
+/// pins the delegation (and covers DeleteRequest/Revocation, absent above).
+#[test]
+fn default_ttl_secs_agrees_with_class_config() {
+    use crate::mailbox::class_config;
+    assert_eq!(
+        MailboxClass::SelfPointer.default_ttl_secs(),
+        class_config::SELF_POINTER_TTL.as_secs()
+    );
+    assert_eq!(
+        MailboxClass::PosChallenge.default_ttl_secs(),
+        class_config::POS_CHALLENGE_TTL.as_secs()
+    );
+    assert_eq!(
+        MailboxClass::PosResponse.default_ttl_secs(),
+        class_config::POS_CHALLENGE_TTL.as_secs()
+    );
+    assert_eq!(
+        MailboxClass::DropNotice.default_ttl_secs(),
+        class_config::DROP_NOTICE_TTL.as_secs()
+    );
+    assert_eq!(
+        MailboxClass::Generic.default_ttl_secs(),
+        class_config::UNKNOWN_SENDER_TTL.as_secs()
+    );
+    assert_eq!(
+        MailboxClass::DeleteRequest.default_ttl_secs(),
+        class_config::DELETE_REQUEST_TTL.as_secs()
+    );
+    assert_eq!(
+        MailboxClass::Revocation.default_ttl_secs(),
+        class_config::REVOCATION_TTL.as_secs()
+    );
+}
+
 #[test]
 fn mailbox_class_is_high_trust_only_self_pointer() {
     assert!(MailboxClass::SelfPointer.is_high_trust());

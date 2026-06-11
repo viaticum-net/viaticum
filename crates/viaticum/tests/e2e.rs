@@ -64,7 +64,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
     }
 }
 
-fn restore_config(symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreConfig {
+fn restore_config(_symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreConfig {
     let staging_root = staging_dir.path().join("restore");
     std::fs::create_dir_all(&staging_root).expect("create staging_root");
     RestoreConfig {
@@ -72,7 +72,6 @@ fn restore_config(symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreConfig
         parallel_holders: 5,
         identity: IdentityPub([0x99u8; 32]),
         device_id: device_b(),
-        symbols_dir: symbols_dir.path().to_path_buf(),
         swarm: None,
         staging_root,
         data_dir: staging_dir.path().to_path_buf(),
@@ -189,51 +188,32 @@ async fn full_lifecycle_e2e() {
         blocks_after_step1
     );
 
-    // Wave 11b: write raw symbol files for v0 blocks so version-specific restore works.
-    // These simulate what holder nodes would store. The restore path reads raw/{esi}.bin
-    // from symbols_dir if present (local fallback before network fetch).
+    // PL-2 / Wave 11b: there is no on-disk symbol cache anymore. A version whose
+    // source content is still on disk restores via rebuild-from-source; a version
+    // that was overwritten (v0 below, after the Step 2 modification) is no longer
+    // locally restorable and would require holders. This E2E exercises the
+    // still-supported local paths (Latest + directory restore via rebuild). Pure
+    // version-selection logic is covered by the `select_version_*` unit tests.
     //
-    // A4: backup no longer creates placements (the WorkPipeline worker does), and the
-    // local-raw-read path in decode_block_local needs a placement to learn which ESIs
-    // to read. So alongside each block's raw files we insert a placement covering the
-    // ESIs we wrote — standing in for what the worker would create in production.
+    // A4: backup no longer creates placements (the WorkPipeline worker does). The
+    // later deletion step asserts a SendDropNotice per holder, which needs a placement
+    // per block. We insert one placement per block here — standing in for what the
+    // worker would create in production. (No on-disk symbols are written: PL-2.)
     {
-        use viaticum_core::erasure::ErasureEncoder;
-        use viaticum_core::types::{
-            ErasureParams, FileId, PlacementStatus, SymbolPlacement, hex_encode,
-        };
-        let encoder = RaptorQEncoder::new();
+        use viaticum_core::types::{FileId, PlacementStatus, SymbolPlacement};
         for block in db.list_all_source_blocks().unwrap() {
-            if let Some(enc_size) = block.encrypted_size {
-                let blob = viaticum::daemon::backup::pipeline::rebuild_source_blob(
-                    &db, &block, &EPOCH_KEY,
-                )
-                .await
-                .unwrap();
-                let params = ErasureParams::compute(enc_size, 0.5).unwrap();
-                let raws = encoder.encode_raw(&blob, &params, 0, params.k_eff).unwrap();
-                let raw_dir = symbols_dir
-                    .path()
-                    .join(hex_encode(&block.block_id.0))
-                    .join("raw");
-                std::fs::create_dir_all(&raw_dir).unwrap();
-                for sym in &raws {
-                    std::fs::write(raw_dir.join(format!("{}.bin", sym.esi)), &sym.data).unwrap();
-                }
-
-                let placement = SymbolPlacement {
-                    source_block_id: block.block_id,
-                    holder_id: DeviceId([0xA1u8; 32]),
-                    file_id: FileId(1),
-                    esi_ranges: vec![(0, params.k_eff)],
-                    binding_seed: [0u8; 32],
-                    status: PlacementStatus::Alive,
-                    last_verified: None,
-                    placed_at: Timestamp::now(),
-                    consecutive_misses: 0,
-                };
-                db.upsert_placement(&placement).unwrap();
-            }
+            let placement = SymbolPlacement {
+                source_block_id: block.block_id,
+                holder_id: DeviceId([0xA1u8; 32]),
+                file_id: FileId(1),
+                esi_ranges: vec![(0, 4)],
+                binding_seed: [0u8; 32],
+                status: PlacementStatus::Alive,
+                last_verified: None,
+                placed_at: Timestamp::now(),
+                consecutive_misses: 0,
+            };
+            db.upsert_placement(&placement).unwrap();
         }
     }
 
@@ -302,30 +282,6 @@ async fn full_lifecycle_e2e() {
     );
 
     eprintln!("[E2E] Step 3a: Latest restore — byte-for-byte match (v1)");
-
-    // 3b — restore photo.jpg at Index(0) → must be v0 (original_photo)
-    let result_v0 = restore
-        .restore(RestoreRequest {
-            path: photo_path.clone(),
-            version_selector: VersionSelector::Index(0),
-            device_id: device_b(),
-            job_id: JobId::new(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        result_v0.files_restored, 1,
-        "Index(0) restore failures: {:?}",
-        result_v0.failures
-    );
-    assert!(result_v0.failures.is_empty());
-    let restored_v0 = std::fs::read(result_v0.staging_path.join(rel)).unwrap();
-    assert_eq!(
-        restored_v0, original_photo,
-        "Index(0) restore must return v0 (original) content"
-    );
-
-    eprintln!("[E2E] Step 3b: Version(0) restore — byte-for-byte match (v0)");
 
     // 3c — restore by directory prefix → all 3 files
     let prefix = files_dir.path().to_string_lossy().to_string() + "/";

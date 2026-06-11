@@ -568,9 +568,8 @@ fn restore_error_to_blocker(e: &RestoreError) -> Option<RestoreBlocker> {
                 holders_offline: (*need as u32).saturating_sub(*got as u32),
             })
         }
-        RestoreError::NoHolders(_) => Some(RestoreBlocker::AllHoldersOffline {
-            last_seen_secs_ago: 0, // owner doesn't know per-holder last_seen here
-        }),
+        // NOTE-1: `RestoreError::NoHolders` was removed (A4 removed its only constructor;
+        // the empty-placement case now surfaces as InsufficientPlacements/InsufficientSymbols).
         RestoreError::EscrowDenied {
             restore_budget_gb,
             restore_gb,

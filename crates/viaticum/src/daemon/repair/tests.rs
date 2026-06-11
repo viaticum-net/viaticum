@@ -1,9 +1,10 @@
-// Tests for RepairAgent (Wave 11b updated).
+// Tests for RepairAgent (bucket C updated).
 //
 // Wave 11b removed: repair_placement(), scan_and_repair(), run(), deliver_repaired_symbols(),
 // load_or_rebuild_blob() and blob-rebuild helpers.
-// Remaining functionality: handle_symbol_dropped, handle_pos_nack, mark_placement_lost,
-// reliability_scan.
+// Bucket C (PL-8a) removed: handle_symbol_dropped, handle_pos_nack, mark_placement_lost
+// (duplicated processor::mark_placement_lost; only test callers).
+// Remaining functionality: reliability_scan.
 //
 // Tests for scan_and_repair / repair_placement are ported to work_pipeline/tests.rs
 // as worker_pos_lost_triggers_block_reappearing_in_queue and
@@ -52,114 +53,6 @@ fn make_placement(
 
 fn make_agent(db: Db) -> RepairAgent {
     RepairAgent::new(db)
-}
-
-// ─── test 16: handle_symbol_dropped_transitions_to_lost ──────────────────────
-
-#[tokio::test]
-async fn handle_symbol_dropped_transitions_to_lost() {
-    let db = Db::open_in_memory().unwrap();
-    let bid = block_id(20);
-    let hid = holder_id(21);
-
-    db.upsert_placement(&make_placement(
-        bid,
-        hid,
-        vec![(0, 1)],
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-
-    let agent = make_agent(db.clone());
-    agent
-        .handle_symbol_dropped(&bid, &hid, now())
-        .await
-        .unwrap();
-
-    let updated = db.get_placement(&bid, &hid).unwrap().unwrap();
-    assert_eq!(updated.status, PlacementStatus::Lost);
-    assert_eq!(updated.consecutive_misses, 0);
-}
-
-// ─── test 17: handle_pos_nack_transitions_to_lost ────────────────────────────
-
-#[tokio::test]
-async fn handle_pos_nack_transitions_to_lost() {
-    let db = Db::open_in_memory().unwrap();
-    let bid = block_id(30);
-    let hid = holder_id(31);
-
-    db.upsert_placement(&make_placement(
-        bid,
-        hid,
-        vec![(0, 1)],
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-
-    let agent = make_agent(db.clone());
-    agent.handle_pos_nack(&bid, &hid, now()).await.unwrap();
-
-    let updated = db.get_placement(&bid, &hid).unwrap().unwrap();
-    assert_eq!(updated.status, PlacementStatus::Lost);
-}
-
-// ─── test 18: handle_symbol_dropped_then_pos_nack_is_idempotent ──────────────
-
-#[tokio::test]
-async fn handle_symbol_dropped_then_pos_nack_is_idempotent() {
-    let db = Db::open_in_memory().unwrap();
-    let bid = block_id(40);
-    let hid = holder_id(41);
-
-    db.upsert_placement(&make_placement(
-        bid,
-        hid,
-        vec![(0, 1)],
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-
-    let agent = make_agent(db.clone());
-
-    agent
-        .handle_symbol_dropped(&bid, &hid, now())
-        .await
-        .unwrap();
-    let after_drop = db.get_placement(&bid, &hid).unwrap().unwrap();
-    assert_eq!(after_drop.status, PlacementStatus::Lost);
-
-    agent.handle_pos_nack(&bid, &hid, now()).await.unwrap();
-    let after_nack = db.get_placement(&bid, &hid).unwrap().unwrap();
-    assert_eq!(after_nack.status, PlacementStatus::Lost);
-}
-
-// ─── test 19: handle_pos_nack_then_symbol_dropped_is_idempotent ──────────────
-
-#[tokio::test]
-async fn handle_pos_nack_then_symbol_dropped_is_idempotent() {
-    let db = Db::open_in_memory().unwrap();
-    let bid = block_id(50);
-    let hid = holder_id(51);
-
-    db.upsert_placement(&make_placement(
-        bid,
-        hid,
-        vec![(0, 1)],
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-
-    let agent = make_agent(db.clone());
-
-    agent.handle_pos_nack(&bid, &hid, now()).await.unwrap();
-    agent
-        .handle_symbol_dropped(&bid, &hid, now())
-        .await
-        .unwrap();
-
-    let final_placement = db.get_placement(&bid, &hid).unwrap().unwrap();
-    assert_eq!(final_placement.status, PlacementStatus::Lost);
 }
 
 // Note: Wave-1 online filter tests (repair_placement_skips_offline_peer_and_picks_online_alternative,
@@ -221,96 +114,6 @@ fn make_block_for_hook(bid: SourceBlockId) -> SourceBlockRecord {
         current_reliability: 0.0,
         target_reliability: 0.99,
     }
-}
-
-/// RepairAgent::handle_symbol_dropped marks placement Lost and updates current_alive.
-#[tokio::test]
-async fn repair_agent_mark_placement_lost_updates_current_alive() {
-    let db = Db::open_in_memory().unwrap();
-    let bid = block_id(0x70);
-    let hid_a = holder_id(0x71);
-    let hid_b = holder_id(0x72);
-
-    db.upsert_source_block(&make_block_for_hook(bid)).unwrap();
-
-    db.upsert_placement(&make_placement(
-        bid,
-        hid_a,
-        vec![(0, 4)],
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-    db.upsert_placement(&make_placement(
-        bid,
-        hid_b,
-        vec![(4, 4)],
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-
-    db.update_block_cached_fields(&bid, 0.5, 2, 0.9, 0.99)
-        .unwrap();
-
-    let agent = make_agent(db.clone());
-    agent
-        .handle_symbol_dropped(&bid, &hid_a, now())
-        .await
-        .unwrap();
-
-    let placement = db.get_placement(&bid, &hid_a).unwrap().unwrap();
-    assert_eq!(
-        placement.status,
-        PlacementStatus::Lost,
-        "placement must be Lost after handle_symbol_dropped"
-    );
-
-    let updated_block = db.get_source_block(&bid).unwrap().unwrap();
-    assert_eq!(
-        updated_block.current_alive, 1,
-        "current_alive must be 1 after one placement marked Lost"
-    );
-}
-
-/// RepairAgent::handle_symbol_dropped on already-Lost placement is idempotent.
-#[tokio::test]
-async fn repair_agent_mark_placement_lost_idempotent_on_already_lost() {
-    let db = Db::open_in_memory().unwrap();
-    let bid = block_id(0x73);
-    let hid_a = holder_id(0x74);
-    let hid_b = holder_id(0x75);
-
-    db.upsert_source_block(&make_block_for_hook(bid)).unwrap();
-
-    db.upsert_placement(&make_placement(
-        bid,
-        hid_a,
-        vec![(0, 4)],
-        PlacementStatus::Lost,
-    ))
-    .unwrap();
-    db.upsert_placement(&make_placement(
-        bid,
-        hid_b,
-        vec![(4, 4)],
-        PlacementStatus::Alive,
-    ))
-    .unwrap();
-
-    db.update_block_cached_fields(&bid, 0.5, 1, 0.7, 0.99)
-        .unwrap();
-
-    let agent = make_agent(db.clone());
-    let result = agent.handle_symbol_dropped(&bid, &hid_a, now()).await;
-    assert!(
-        result.is_ok(),
-        "handle_symbol_dropped must return Ok for already-Lost placement"
-    );
-
-    let updated_block = db.get_source_block(&bid).unwrap().unwrap();
-    assert_eq!(
-        updated_block.current_alive, 1,
-        "current_alive must remain 1 when placement was already Lost (idempotent)"
-    );
 }
 
 // ─── reliability_scan tests ──────────────────────────────────────────────────

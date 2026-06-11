@@ -666,7 +666,7 @@ fn chunk_notices_to_fit(notices: &[SymbolDropNoticeMsg]) -> Vec<Vec<SymbolDropNo
 /// but with `deadline = Timestamp::now()` to signal "already dropped".
 ///
 /// The owner's `ProcessorDropHandler` checks deadline ≤ now + epsilon and
-/// triggers `RepairNow` immediately, preserving the former SymbolDropped semantics.
+/// wakes the repair worker immediately, preserving the former SymbolDropped semantics.
 ///
 /// Each notice is signed with the holder's `master_signing_key` so the owner
 /// can verify authenticity before marking placements Lost.

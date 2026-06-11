@@ -493,7 +493,6 @@ impl DaemonHandle {
                 parallel_holders: 5,
                 identity: identity_pub,
                 device_id,
-                symbols_dir: symbols_dir.clone(),
                 swarm: swarm_handle_arc.clone(),
                 staging_root: staging_root.clone(),
                 data_dir: cfg.data_dir.clone(),
@@ -630,6 +629,9 @@ impl DaemonHandle {
 
         // Wave 11b: RepairAgent::run() replaced by WorkPipeline worker + periodic reliability_scan.
         // RepairTrigger channel (repair_rx) is forwarded to work_event_tx to wake the worker.
+        // PL-8c: RepairTrigger is a unit `Wake` — every trigger means "some placement
+        // became Lost; rescan the DB and re-encode". We forward each one to a single
+        // generic worker wake; there is no per-placement addressing to preserve.
         {
             let work_event_tx_relay = work_event_tx.clone();
             let cancel_relay = cancel.clone();
@@ -641,9 +643,8 @@ impl DaemonHandle {
                         maybe_trigger = repair_rx.recv() => {
                             match maybe_trigger {
                                 None => break,
-                                Some(_trigger) => {
-                                    // Wake the worker: a PoS failure or explicit trigger
-                                    // means a placement is now Lost — worker will pick it up.
+                                Some(crate::daemon::repair::RepairTrigger::Wake) => {
+                                    // A placement is now Lost — worker will pick it up.
                                     let _ = work_event_tx_relay.try_send(
                                         crate::daemon::work_pipeline::WorkEvent::DirtyFileEnqueued,
                                     );
@@ -1063,7 +1064,6 @@ impl DaemonHandle {
             std::sync::Arc::clone(&mailbox_router),
             identity_pub,
             master_key.clone(),
-            symbols_dir.clone(),
             accepted_offers,
             encoder.clone(),
             epoch_key_bytes,
@@ -1105,7 +1105,7 @@ impl DaemonHandle {
                 master_key.clone(),
             ));
 
-            // T-13a: pass repair_tx so ProcessorDropHandler can trigger RepairNow
+            // T-13a: pass repair_tx so ProcessorDropHandler can wake the repair worker
             // for immediate-drop DropNotice entries (deadline ≈ now).
             let drop_handler = ProcessorDropHandler::new(db.clone(), repair_tx.clone());
 

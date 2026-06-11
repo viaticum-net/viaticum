@@ -406,12 +406,12 @@ async fn drop_notice_batch_dispatch_marks_each_placement_lost() {
 
 // ─── W-3: DropNotice security tests ──────────────────────────────────────────
 
-/// W-3: A DropNotice with deadline ≤ now triggers RepairNow on the repair channel.
+/// W-3: A DropNotice with deadline ≤ now wakes the repair worker on the repair channel.
 ///
 /// Setup: holder H has a placement on block B. Owner receives a DropNotice with
 /// deadline = now (immediate drop). ProcessorDropHandler must:
 ///   1. Mark placement Lost (via SymbolDropHandler::apply).
-///   2. Send RepairTrigger::RepairNow on repair_tx.
+///   2. Send RepairTrigger::Wake on repair_tx.
 #[tokio::test]
 async fn drop_notice_immediate_deadline_triggers_repair_now() {
     use viaticum_core::types::{PeerRecord, SourceBlockRecord, SourceBlockStatus, SourceBlockType};
@@ -523,20 +523,15 @@ async fn drop_notice_immediate_deadline_triggers_repair_now() {
         "placement must be Lost after immediate drop"
     );
 
-    // RepairNow must have been sent.
+    // A repair wake must have been sent (PL-8c: unit Wake — no addressing; the
+    // placement is already marked Lost in the DB, asserted above).
     let trigger = repair_rx
         .try_recv()
-        .expect("RepairNow must be in channel after immediate drop");
-    match trigger {
-        RepairTrigger::RepairNow {
-            block_id: bid,
-            holder_id,
-        } => {
-            assert_eq!(bid, block_id, "RepairNow block_id must match");
-            assert_eq!(holder_id, holder_device, "RepairNow holder_id must match");
-        }
-        other => panic!("expected RepairNow, got {other:?}"),
-    }
+        .expect("repair wake must be in channel after immediate drop");
+    assert!(
+        matches!(trigger, RepairTrigger::Wake),
+        "expected RepairTrigger::Wake, got {trigger:?}"
+    );
 }
 
 /// W-3: A DropNotice whose signature does NOT verify against the claimed sender
@@ -1261,6 +1256,118 @@ async fn pos_response_entry_ttl_is_scaled_by_time_scale() {
     assert!(
         ttl < POS_CHALLENGE_TTL.as_secs(),
         "scaled TTL must be strictly less than the full unscaled TTL"
+    );
+}
+
+/// CS-ID-6 / SM-8: a PosChallenge whose `target` is NOT this node's master_pub is
+/// dropped by `dispatch_pos_challenge` — no PosResponse is published. We only poll
+/// our own mailbox, so a mis-targeted entry can only come from a buggy/hostile
+/// postman; the routing guard rejects it before any effect.
+#[tokio::test]
+async fn pos_challenge_not_addressed_to_us_is_dropped() {
+    let db = Db::open_in_memory().expect("db");
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+
+    let response = PosHashResponseMsg {
+        v: 1,
+        challenge_id: [7u8; 16],
+        source_block_id: SourceBlockId([8u8; 32]),
+        chain_hash: [9u8; 32],
+        timestamp: Timestamp::now(),
+        device_id: None,
+        sig: [0u8; 64],
+    };
+    let handler: Arc<dyn super::PosMailboxChallengeHandler> =
+        Arc::new(StubChallengeHandler { response });
+
+    let owner_master = make_identity(0x42);
+    let my_master = make_identity(0xAA);
+    let someone_else = make_identity(0xBB);
+    // Entry addressed to `someone_else`, not us. sender is a valid owner so the only
+    // thing stopping a publish is the target guard.
+    let base = make_entry(MailboxClass::PosChallenge, someone_else, vec![0x00]);
+    let entry = MailboxEntry {
+        sender: Some(owner_master),
+        ..base
+    };
+
+    super::dispatch_pos_challenge(&router, &handler, &my_master, entry, 1).await;
+
+    let stored = sender.stored.lock().await;
+    assert!(
+        stored.is_empty(),
+        "a PosChallenge not addressed to this node must be dropped — no PosResponse published"
+    );
+}
+
+/// P1-10: a `MailboxClass::Generic` entry has no handler by design — `dispatch_entry`
+/// drops it with no effect (no panic, no publish, no channel send). This pins the
+/// "loud no-op" guard so a future Generic producer cannot be silently dropped.
+#[tokio::test]
+async fn generic_entry_is_ignored_without_effect() {
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    use viaticum_core::system_state::SelfPointer;
+
+    let db = Db::open_in_memory().expect("db");
+    let sender = StdArc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, StdArc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+
+    let (pos_tx, mut pos_rx) = mpsc::channel::<PosHashResponseMsg>(8);
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let challenge_handler: Arc<dyn super::PosMailboxChallengeHandler> =
+        Arc::new(StubChallengeHandler {
+            response: PosHashResponseMsg {
+                v: 1,
+                challenge_id: [0u8; 16],
+                source_block_id: SourceBlockId([0u8; 32]),
+                chain_hash: [0u8; 32],
+                timestamp: Timestamp::now(),
+                device_id: None,
+                sig: [0u8; 64],
+            },
+        });
+    let drop_handler: Arc<dyn super::DropNoticeHandler> =
+        Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
+    let delete_handler: Arc<dyn DeleteMailboxHandler> =
+        Arc::new(ProcessorDeleteHandler::new(db.clone()));
+    let revocation_handler: Arc<dyn crate::daemon::processor::RevocationMailboxHandler> = Arc::new(
+        crate::daemon::processor::ProcessorRevocationHandler::new(db.clone()),
+    );
+    let my_master = make_identity(0xAA);
+    let current_pointer: Arc<StdMutex<Option<SelfPointer>>> = Arc::new(StdMutex::new(None));
+
+    let entry = make_entry(MailboxClass::Generic, my_master, vec![0xDE, 0xAD]);
+    let now_secs = entry.stored_at;
+
+    // Must not panic, must not publish, must not forward anything.
+    super::dispatch_entry(
+        &db,
+        &router,
+        &pos_tx,
+        &challenge_handler,
+        &drop_handler,
+        &delete_handler,
+        &revocation_handler,
+        &my_master,
+        &current_pointer,
+        entry,
+        now_secs,
+        1,
+    )
+    .await;
+
+    assert!(
+        sender.stored.lock().await.is_empty(),
+        "Generic entry must not publish anything"
+    );
+    assert!(
+        pos_rx.try_recv().is_err(),
+        "Generic entry must not forward to the PoS channel"
     );
 }
 

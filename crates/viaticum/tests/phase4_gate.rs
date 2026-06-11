@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 use viaticum::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
-use viaticum::daemon::repair::RepairAgent;
 use viaticum_core::budget::{compute_effective_quota, should_reject_offers};
 use viaticum_core::commitment::{
     CommitmentScore, CommitmentTier, HolderProfile, compute_commitment, flag_for_proactive_repair,
@@ -654,7 +653,7 @@ async fn full_pipeline_with_phase4_integration() {
     })
     .unwrap();
 
-    // Phase 2.5: mark first placement as Lost via PosNack
+    // Phase 2.5: mark first placement as Lost (PoS failure outcome).
     let placements = db.list_placements_for_block(&block_id).unwrap();
     assert!(!placements.is_empty(), "placement substrate must exist");
     let victim = placements
@@ -663,11 +662,13 @@ async fn full_pipeline_with_phase4_integration() {
         .expect("victim placement must exist")
         .clone();
 
-    let repair_agent = RepairAgent::new(db.clone());
-    repair_agent
-        .handle_pos_nack(&victim.source_block_id, &victim.holder_id, Timestamp::now())
-        .await
-        .unwrap();
+    // PL-8a removed RepairAgent::handle_pos_nack (the live mark-Lost path is
+    // processor-internal, pub(crate)); from an integration test we apply the same
+    // status transition directly through the public DB API.
+    let mut lost = victim.clone();
+    lost.status = PlacementStatus::Lost;
+    lost.consecutive_misses = 0;
+    db.upsert_placement(&lost).unwrap();
 
     // Verify victim placement is now Lost
     let updated_victim = db
