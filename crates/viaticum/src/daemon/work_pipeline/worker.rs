@@ -175,11 +175,7 @@ pub(crate) async fn run_block_iteration(
 
     // 6. Insert placements as Offered, then deliver to each holder.
     let now = Timestamp::now();
-    let primary_file_id = db
-        .list_placements_for_block(&block.block_id)?
-        .first()
-        .map(|p| p.file_id)
-        .unwrap_or(viaticum_core::types::FileId(0));
+    let primary_file_id = resolve_primary_file_id(db, block)?;
 
     // Insert all Offered placements before delivery (so retries see them).
     let mut txn = db.write_txn()?;
@@ -622,6 +618,49 @@ pub(crate) fn persist_holder_addrs_to_db(db: &Db, holder_id: DeviceId, addr_stri
             );
         }
     }
+}
+
+/// Resolve the `file_id` to stamp on placements this worker creates.
+///
+/// Fast path: if any placement already exists for the block (repair iterations,
+/// or a re-run after partial delivery), reuse its `file_id` — cheap and keeps
+/// every placement for the block attributed consistently.
+///
+/// A4: a freshly-backed-up block has the `SourceBlockRecord` but ZERO placements
+/// (backup is no longer a placement creator — the worker is the sole creator).
+/// In that case derive the primary `file_id` from the block record itself, NOT
+/// from a missing placement. Falling back to `FileId(0)` here (the pre-fix
+/// behaviour) silently breaks the FILE_HOLDERS / HOLDER_FILES indices and the
+/// watch-admin folder rollups for every initial-backup block, since those index
+/// `placement.file_id`. Pack blocks carry their files in `entries` (built in file
+/// order, so `entries[0]` is the same file backup used pre-A4); a Single block
+/// has no file_id in the record, so reverse-look it up via its file versions.
+pub(crate) fn resolve_primary_file_id(
+    db: &Db,
+    block: &SourceBlockRecord,
+) -> anyhow::Result<viaticum_core::types::FileId> {
+    use viaticum_core::types::{FileId, SourceBlockType};
+
+    if let Some(p) = db.list_placements_for_block(&block.block_id)?.first() {
+        return Ok(p.file_id);
+    }
+    Ok(match &block.block_type {
+        SourceBlockType::Pack { entries } => {
+            entries.first().map(|e| e.file_id).unwrap_or(FileId(0))
+        }
+        SourceBlockType::Single => crate::daemon::backup::packing::find_file_for_block(
+            db,
+            block.block_id,
+        )
+        .map(|f| f.file_id)
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                block_id = %block.block_id,
+                "resolve_primary_file_id: no file references Single block ({e}); using FileId(0)"
+            );
+            FileId(0)
+        }),
+    })
 }
 
 /// Get the set of DeviceIds with Alive symbols for this block.

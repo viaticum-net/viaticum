@@ -623,15 +623,45 @@ async fn full_pipeline_with_phase4_integration() {
         !results.is_empty(),
         "backup must produce at least one source block"
     );
+    let block_id = results[0].source_block_id;
+
+    // A4: backup no longer creates placements (the WorkPipeline worker does). This
+    // test exercises the repair + reliability pipeline downstream of placement
+    // creation, so we insert the placement substrate the worker would create:
+    // a victim holder (to be marked Lost via PosNack) and a healthy Alive holder.
+    db.upsert_placement(&SymbolPlacement {
+        source_block_id: block_id,
+        holder_id: DeviceId([1u8; 32]),
+        file_id: FileId(1),
+        esi_ranges: vec![(0, 3)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Offered,
+        last_verified: None,
+        placed_at: Timestamp::now(),
+        consecutive_misses: 0,
+    })
+    .unwrap();
+    db.upsert_placement(&SymbolPlacement {
+        source_block_id: block_id,
+        holder_id: DeviceId([2u8; 32]),
+        file_id: FileId(1),
+        esi_ranges: vec![(3, 3)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp::now(),
+        consecutive_misses: 0,
+    })
+    .unwrap();
 
     // Phase 2.5: mark first placement as Lost via PosNack
-    let block_id = results[0].source_block_id;
     let placements = db.list_placements_for_block(&block_id).unwrap();
-    assert!(
-        !placements.is_empty(),
-        "backup must produce at least one placement"
-    );
-    let victim = placements[0].clone();
+    assert!(!placements.is_empty(), "placement substrate must exist");
+    let victim = placements
+        .iter()
+        .find(|p| p.holder_id == DeviceId([1u8; 32]))
+        .expect("victim placement must exist")
+        .clone();
 
     let repair_agent = RepairAgent::new(db.clone());
     repair_agent

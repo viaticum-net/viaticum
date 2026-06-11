@@ -425,9 +425,16 @@ impl RestoreCoordinator {
             .filter(|p| p.status != PlacementStatus::Deleting)
             .collect();
 
-        if usable_placements.is_empty() {
-            return Err(RestoreError::NoHolders(*block_id));
-        }
+        // A4 / Wave 11b: do NOT early-return NoHolders on an empty placement set.
+        // Post-A4 the WorkPipeline worker is the sole creator of placements, so a
+        // freshly-backed-up block has the SourceBlockRecord but no placements yet.
+        // The owner can still restore it from its own source files via the
+        // `rebuild_source_blob` path below — that path needs no placement at all.
+        // We therefore fall through: an empty placement set yields zero local raw
+        // symbols, which triggers the rebuild-from-source fallback. Only if rebuild
+        // AND the (possibly empty) network fetch both fail do we surface an error
+        // (InsufficientSymbols from the network branch). The pre-W11b `NoHolders`
+        // guard here predated source-rebuild and is no longer correct.
 
         let block_dir = self
             .config

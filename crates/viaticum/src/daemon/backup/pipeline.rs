@@ -7,13 +7,10 @@ use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use viaticum_core::cluster::esi_namespace_start;
 use viaticum_core::constants::MIN_BATCH_BYTES;
 use viaticum_core::db::Db;
-use viaticum_core::erasure::{ErasureEncoder, binding_seed};
-use viaticum_core::placement::{
-    HolderCandidate, PlacementError, compute_allocation_with_importance,
-};
+use viaticum_core::erasure::ErasureEncoder;
+use viaticum_core::placement::HolderCandidate;
 use viaticum_core::reliability;
 
 /// Importance change threshold above which the pack accumulator flushes.
@@ -22,8 +19,8 @@ use viaticum_core::reliability;
 /// within-bucket jitter (maximum ~0.02 from burst downweighting).
 const IMPORTANCE_FLUSH_EPSILON: f64 = 0.05;
 use viaticum_core::types::{
-    DeviceId, ErasureParams, Event, EventEntry, FileId, PlacementStatus, SourceBlockId,
-    SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
+    ErasureParams, FileId, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType,
+    Timestamp,
 };
 
 use super::packing::build_plaintext;
@@ -114,8 +111,11 @@ pub fn decrypt_and_decompress(stored: &[u8], epoch_key: &[u8; 32]) -> anyhow::Re
 /// `block_type` should be `Pack` or `Single`.
 /// `pack_importance`: explicit importance for this pack (first file's importance for Pack
 /// blocks; file's importance for Single blocks). Used to set `SourceBlockRecord.importance`
-/// and `target_reliability` at creation, and to drive `compute_allocation_with_importance`
-/// for dynamic N.
+/// and `target_reliability` at creation, and to drive the target-based N solver.
+///
+/// A4: backup creates ONLY the `SourceBlockRecord` — no placements, no delivery. The
+/// `candidates` pool is used solely to solve a principled target-based N for the record;
+/// the WorkPipeline worker is the sole creator of placements and the sole deliverer.
 /// Returns `PipelineResult` describing the outcome.
 #[allow(clippy::too_many_arguments)]
 pub fn run_pipeline(
@@ -155,58 +155,17 @@ pub fn run_pipeline(
     let params = ErasureParams::compute(stored.len() as u64, pack_importance)
         .map_err(|e| anyhow::anyhow!("ErasureParams::compute failed: {e}"))?;
 
-    // 5. Placement allocation with dynamic N from pool trust + importance.
-    // Compute ESI offset from cluster state so each device gets a non-overlapping
-    // ESI namespace. Falls back to 0 for single-device or when cluster unavailable.
-    let esi_offset: u32 = config
-        .cluster_state
-        .as_ref()
-        .and_then(|cs| {
-            cs.lock()
-                .ok()
-                .and_then(|guard| guard.get_device(&config.device_id).map(|e| e.device_index))
-        })
-        .map(esi_namespace_start)
-        .unwrap_or(0);
-
-    let allocations_result = if candidates.len() >= 2 {
-        match compute_allocation_with_importance(
-            candidates,
-            stored.len() as u64,
-            pack_importance,
-            esi_offset,
-        ) {
-            Ok(allocs) => allocs,
-            Err(PlacementError::NTooSmall { .. }) => {
-                tracing::warn!(
-                    "N too small for {} candidates, encoding without placement",
-                    candidates.len()
-                );
-                vec![]
-            }
-            Err(e) => {
-                tracing::warn!("placement error: {e}, encoding without placement");
-                vec![]
-            }
-        }
-    } else {
-        tracing::debug!(
-            "fewer than 2 candidates ({}), encoding without placement",
-            candidates.len()
-        );
-        vec![]
-    };
+    // 5. (Wave 11b / A4) Backup does NOT place or deliver. It only records the
+    // SourceBlockRecord. The WorkPipeline worker is the sole creator of placements
+    // and the sole deliverer — it re-encodes from source on its next iteration and
+    // owns the ESI namespace. Backup therefore needs neither an ESI offset nor a
+    // placement allocation here. The `candidates` slice is used only to derive a
+    // principled target-based N (below) so the stored record carries a meaningful
+    // redundancy target for the worker and for future repair.
 
     // 6. (Wave 11b) No disk writes — raw symbols are not persisted.
     // The WorkPipeline worker re-encodes from source on its next iteration.
     // block.bin and raw/{esi}.bin are never written after Wave 11b.
-
-    let mut symbol_count_per_holder: Vec<(DeviceId, u32)> = Vec::new();
-
-    // Record per-holder counts (binding applied at delivery time, not here).
-    for alloc in &allocations_result {
-        symbol_count_per_holder.push((alloc.device_id, alloc.symbol_count));
-    }
 
     // 7. DB: upsert SourceBlockRecord
     let block_type = match block_type_tag {
@@ -228,15 +187,45 @@ pub fn run_pipeline(
         BlockTypeTag::Single => SourceBlockType::Single,
     };
 
-    // Effective N = sum of allocated symbol counts. If empty (< 2 candidates), fall back
-    // to the static params.n so the block record stores a meaningful N for future repair.
-    let effective_n: u32 = {
-        let sum: u32 = allocations_result.iter().map(|a| a.symbol_count).sum();
-        if sum == 0 { params.n } else { sum }
-    };
-
     // Wave 9: set importance and target_reliability at creation from pack_importance.
     let target_rel = reliability::target_reliability(pack_importance);
+
+    // Effective N: principled, target-based redundancy target from the current pool.
+    // Backup no longer derives N from a phantom allocation it never delivers (A4).
+    // Instead it solves for the smallest N reaching `target_rel` using a binomial
+    // mean-survival-probability model (`solve_n_for_target`). NOTE: this is an
+    // *approximation*, not a prediction of what the worker delivers — the worker
+    // places via the holder-correlated `solve_placement_for_target` (live-or-die per
+    // holder, capped at full replicas), which diverges from the independent-binomial
+    // assumption in small / heterogeneous pools. The survival-prob bridge and `k_eff`
+    // below DO match the worker exactly; only the solver model differs. `record.n`
+    // is a redundancy target / priority heuristic (not a correctness input — repair
+    // eligibility is reliability-gated, not n-gated), so the approximation is benign.
+    // With no candidates we fall back to the static params.n.
+    let k_eff = params.k + viaticum_core::constants::DECODE_OVERHEAD; // mirror worker.rs
+    let effective_n: u32 = if candidates.is_empty() {
+        params.n
+    } else {
+        // Convert placement candidates → reliability candidates via the same
+        // commitment_to_survival_prob bridge compute_allocation_with_importance uses,
+        // so the per-holder survival probability feeding the solver matches the
+        // worker's placement model (the solver *aggregation* still differs — see above).
+        let solver_candidates: Vec<reliability::HolderCandidate> = candidates
+            .iter()
+            .map(|c| reliability::HolderCandidate {
+                survival_prob: reliability::commitment_to_survival_prob(
+                    viaticum_core::commitment::CommitmentScore::new(c.trust),
+                ),
+            })
+            .collect();
+        match reliability::solve_n_for_target(k_eff, &solver_candidates, target_rel) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("solve_n_for_target failed ({e}); falling back to params.n");
+                params.n
+            }
+        }
+    };
 
     let block_record = SourceBlockRecord {
         block_id,
@@ -255,54 +244,21 @@ pub fn run_pipeline(
         current_alive: 0,
         current_reliability: 0.0,
     };
-    // 8 & 9. DB: atomically write source block + all placements + all events.
-    // Using a single write transaction ensures that on crash before commit,
-    // neither the source block nor any placement is visible — no orphaned state.
-    let primary_file_id = files[0].0.file_id;
-    let now = Timestamp::now();
-
+    // 8. DB: write the source block record only (A4). Backup creates no placements
+    // and emits no SymbolsPlaced events — those belong to the WorkPipeline worker,
+    // the sole creator of placements. A single write transaction keeps block-record
+    // creation atomic.
     let mut txn = db.write_txn()?;
     txn.upsert_source_block(&block_record)?;
-
-    for alloc in &allocations_result {
-        let seed = binding_seed(&block_id, &alloc.device_id);
-        let placement = SymbolPlacement {
-            source_block_id: block_id,
-            holder_id: alloc.device_id,
-            file_id: primary_file_id,
-            esi_ranges: vec![alloc.esi_range()],
-            binding_seed: seed,
-            status: PlacementStatus::Offered, // Offered; transitions to Alive after SymbolStored confirmation
-            last_verified: None,
-            placed_at: now,
-            consecutive_misses: 0,
-        };
-        txn.upsert_placement(&placement)?;
-    }
-
-    for alloc in &allocations_result {
-        let entry = EventEntry {
-            timestamp: now,
-            device_id: config.device_id,
-            event: Event::SymbolsPlaced {
-                source_block_id: block_id,
-                holder_id: alloc.device_id,
-                esi_range: alloc.esi_range(),
-            },
-        };
-        txn.append_event(&entry)?;
-    }
-
     txn.commit()?;
 
     tracing::info!(
         block_id = %block_id,
         k = params.k,
         n = effective_n,
-        holders = allocations_result.len(),
         importance = pack_importance,
         target_reliability = target_rel,
-        "backup: pipeline complete"
+        "backup: pipeline complete (block record only; worker places)"
     );
 
     Ok(PipelineResult {
@@ -310,7 +266,6 @@ pub fn run_pipeline(
         k: params.k,
         n: effective_n,
         t: params.t,
-        symbol_count_per_holder,
         stored_size: stored.len() as u64,
         importance: pack_importance,
     })

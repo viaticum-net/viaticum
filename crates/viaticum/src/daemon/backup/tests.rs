@@ -300,15 +300,16 @@ fn flush_queue_creates_db_records() {
             "encrypted_size must be set"
         );
 
-        // Placement records should exist (Offered state).
+        // A4: backup creates ONLY the block record — never placements. The
+        // WorkPipeline worker is the sole creator of placements (even though
+        // test_coord supplies 5 mock holders, backup offers nothing).
         let placements = db
             .list_placements_for_block(&result.source_block_id)
             .unwrap();
-        // Placements may be empty if no candidates (test_coord has mock_holders=empty by default).
-        // Just verify no panic and DB is consistent.
-        for p in &placements {
-            assert_eq!(p.source_block_id, result.source_block_id);
-        }
+        assert!(
+            placements.is_empty(),
+            "A4: backup must not create placements; the worker is the sole creator"
+        );
 
         // Symbol files must NOT exist (Wave 11b invariant).
         let block_hex: String = result
@@ -398,8 +399,13 @@ async fn pipeline_roundtrip_can_decode() {
 
     let block_id = results[0].source_block_id;
     let stored_size = results[0].stored_size as usize;
+    // A4: backup creates the block record only — no placements. The roundtrip
+    // below (rebuild blob → decrypt → decode) does not depend on placements.
     let placements = db.list_placements_for_block(&block_id).unwrap();
-    assert!(!placements.is_empty(), "should have placements");
+    assert!(
+        placements.is_empty(),
+        "A4: backup must not create placements"
+    );
 
     // Wave 11b: no raw/ files on disk. Use rebuild_source_blob to get the stored blob.
     let block_record = db.get_source_block(&block_id).unwrap().unwrap();
@@ -469,10 +475,13 @@ fn process_event_modified_adds_new_version() {
     );
 }
 
-// ─── Test 11: flush_queue_appends_event_log ───────────────────────────────────
+// ─── Test 11: flush_queue_emits_no_symbols_placed_event ──────────────────────
+// A4: backup no longer places, so it no longer emits SymbolsPlaced events.
+// The WorkPipeline worker is the sole emitter of SymbolsPlaced (it owns
+// placement creation). See work_pipeline/tests.rs for the SymbolsPlaced path.
 
 #[test]
-fn flush_queue_appends_event_log() {
+fn flush_queue_emits_no_symbols_placed_event() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
     let files_dir = TempDir::new().unwrap();
@@ -490,8 +499,8 @@ fn flush_queue_appends_event_log() {
         .iter()
         .any(|(_, e)| matches!(e.event, Event::SymbolsPlaced { .. }));
     assert!(
-        has_symbols_placed,
-        "should have at least one SymbolsPlaced event"
+        !has_symbols_placed,
+        "A4: backup must not emit SymbolsPlaced — the worker is the sole placer"
     );
 }
 
@@ -706,243 +715,6 @@ fn backup_config_default_swarm_is_none() {
 // iroh NetworkHandle replaced by libp2p SwarmHandle; network delivery is
 // tested in swarm_tests.rs and E2E suite.
 //
-// ─── Test 21: deliver_symbols_logs_warn_on_peer_not_found (REMOVED) ──────────
-#[cfg(any())]
-async fn deliver_symbols_logs_warn_on_peer_not_found() {
-    use std::collections::HashMap;
-
-    use ed25519_dalek::SigningKey;
-    use viaticum_core::types::{PlacementStatus, SymbolPlacement};
-
-    use crate::daemon::network::{NetworkConfig, NetworkHandle};
-
-    use super::PipelineResult;
-
-    let sk_owner = SigningKey::from_bytes(&[10u8; 32]);
-    let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let network = std::sync::Arc::new(
-        NetworkHandle::start(
-            NetworkConfig {
-                signing_key: sk_owner.clone(),
-                master_signing_key: sk_owner.clone(),
-                master_identity: IdentityPub(sk_owner.verifying_key().to_bytes()),
-                known_peers: HashMap::new(),
-                device_cert: None,
-                iroh_secret_key: None,
-                relay_mode: iroh::RelayMode::Disabled,
-                x25519_pub: None,
-            },
-            tx,
-        )
-        .await
-        .unwrap(),
-    );
-
-    let db = Db::open_in_memory().unwrap();
-    let dir = TempDir::new().unwrap();
-
-    let block_id = SourceBlockId([0xAAu8; 32]);
-    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
-    let block_dir = dir.path().join(&block_hex);
-    std::fs::create_dir_all(&block_dir).unwrap();
-    std::fs::write(block_dir.join("0.bin"), vec![0u8; 64]).unwrap();
-
-    let unknown_holder = IdentityPub([0xFFu8; 32]);
-    let placement = SymbolPlacement {
-        source_block_id: block_id,
-        holder_id: unknown_holder,
-        file_id: FileId(1),
-        esi_ranges: vec![(0, 1)],
-        binding_seed: [0u8; 32],
-        status: PlacementStatus::Alive,
-        last_verified: None,
-        placed_at: Timestamp::now(),
-        consecutive_misses: 0,
-    };
-    db.upsert_placement(&placement).unwrap();
-
-    let coordinator = BackupCoordinator::new(
-        db,
-        BackupConfig {
-            symbols_dir: dir.path().to_path_buf(),
-            network: Some(network.clone()),
-            ..BackupConfig::default()
-        },
-        Arc::new(RaptorQEncoder::new()),
-    );
-
-    let result = PipelineResult {
-        source_block_id: block_id,
-        k: 1,
-        n: 2,
-        t: 65535,
-        symbol_count_per_holder: vec![(unknown_holder, 1)],
-        stored_size: 64,
-        importance: 0.5,
-    };
-
-    coordinator.deliver_symbols(&[result]).await;
-
-    Arc::try_unwrap(network)
-        .ok()
-        .map(|n| async move { n.shutdown().await });
-}
-
-// ─── Test 22: deliver_symbols_sends_to_reachable_holder (REMOVED) ────────────
-#[cfg(any())]
-async fn deliver_symbols_sends_to_reachable_holder() {
-    use std::collections::HashMap;
-
-    use viaticum_core::messages::Message;
-    use viaticum_core::types::{PlacementStatus, SymbolPlacement};
-
-    use crate::daemon::network::{NetworkConfig, NetworkHandle};
-
-    use super::PipelineResult;
-
-    // Owner: seed [20u8; 32]
-    let owner_seed = [20u8; 32];
-    let owner_master_key = derive_master_key(&owner_seed).unwrap();
-    let owner_master = master_identity(&owner_master_key);
-    let owner_did = DeviceId([20u8; 32]);
-    let owner_device_key = derive_device_key(&owner_seed, &owner_did).unwrap();
-    let owner_cert = issue_device_certificate(
-        &owner_master_key,
-        owner_did,
-        owner_device_key.verifying_key().to_bytes(),
-        Timestamp::now(),
-    );
-
-    // Holder: seed [21u8; 32]
-    let holder_seed = [21u8; 32];
-    let holder_master_key = derive_master_key(&holder_seed).unwrap();
-    let holder_master = master_identity(&holder_master_key);
-    let holder_did = DeviceId([21u8; 32]);
-    let holder_device_key = derive_device_key(&holder_seed, &holder_did).unwrap();
-    let holder_cert = issue_device_certificate(
-        &holder_master_key,
-        holder_did,
-        holder_device_key.verifying_key().to_bytes(),
-        Timestamp::now(),
-    );
-
-    let (tx_owner, _rx_owner) = tokio::sync::mpsc::channel(4);
-    let (tx_holder, mut rx_holder) = tokio::sync::mpsc::channel(4);
-
-    let network_holder = std::sync::Arc::new(
-        NetworkHandle::start(
-            NetworkConfig {
-                signing_key: holder_device_key.clone(),
-                master_signing_key: holder_device_key,
-                master_identity: holder_master,
-                known_peers: HashMap::new(),
-                device_cert: Some(holder_cert),
-                iroh_secret_key: None,
-                relay_mode: iroh::RelayMode::Disabled,
-                x25519_pub: None,
-            },
-            tx_holder,
-        )
-        .await
-        .unwrap(),
-    );
-
-    let holder_addr = network_holder.local_addr().unwrap();
-
-    let mut known_peers = HashMap::new();
-    known_peers.insert(holder_master, holder_addr);
-
-    let network_owner = std::sync::Arc::new(
-        NetworkHandle::start(
-            NetworkConfig {
-                signing_key: owner_device_key.clone(),
-                master_signing_key: owner_device_key,
-                master_identity: owner_master,
-                known_peers,
-                device_cert: Some(owner_cert),
-                iroh_secret_key: None,
-                relay_mode: iroh::RelayMode::Disabled,
-                x25519_pub: None,
-            },
-            tx_owner,
-        )
-        .await
-        .unwrap(),
-    );
-
-    let db = Db::open_in_memory().unwrap();
-    let dir = TempDir::new().unwrap();
-    let block_id = SourceBlockId([0x99u8; 32]);
-    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
-    let block_dir = dir.path().join(&block_hex);
-    std::fs::create_dir_all(&block_dir).unwrap();
-
-    for esi in 0u32..2 {
-        std::fs::write(block_dir.join(format!("{esi}.bin")), vec![esi as u8; 64]).unwrap();
-    }
-
-    let placement = SymbolPlacement {
-        source_block_id: block_id,
-        holder_id: holder_master,
-        file_id: FileId(1),
-        esi_ranges: vec![(0, 2)],
-        binding_seed: [0u8; 32],
-        status: PlacementStatus::Alive,
-        last_verified: None,
-        placed_at: Timestamp::now(),
-        consecutive_misses: 0,
-    };
-    db.upsert_placement(&placement).unwrap();
-
-    let coordinator = BackupCoordinator::new(
-        db,
-        BackupConfig {
-            symbols_dir: dir.path().to_path_buf(),
-            network: Some(network_owner.clone()),
-            ..BackupConfig::default()
-        },
-        Arc::new(RaptorQEncoder::new()),
-    );
-
-    let result = PipelineResult {
-        source_block_id: block_id,
-        k: 2,
-        n: 4,
-        t: 65535,
-        symbol_count_per_holder: vec![(holder_master, 2)],
-        stored_size: 128,
-        importance: 0.5,
-    };
-
-    coordinator.deliver_symbols(&[result]).await;
-
-    let mut conn = tokio::time::timeout(std::time::Duration::from_secs(5), rx_holder.recv())
-        .await
-        .expect("timeout waiting for connection")
-        .expect("channel closed");
-
-    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), conn.recv_message())
-        .await
-        .expect("timeout waiting for message")
-        .expect("recv_message failed");
-
-    match msg {
-        Message::SymbolTransfer(transfer) => {
-            assert_eq!(transfer.source_block_id, block_id);
-            assert_eq!(transfer.symbols.len(), 2);
-            assert_eq!(transfer.symbols[0].esi, 0);
-            assert_eq!(transfer.symbols[1].esi, 1);
-        }
-        other => panic!("expected SymbolTransfer, got {other:?}"),
-    }
-
-    Arc::try_unwrap(network_owner)
-        .ok()
-        .map(|n| async move { n.shutdown().await });
-    Arc::try_unwrap(network_holder)
-        .ok()
-        .map(|n| async move { n.shutdown().await });
-}
 
 // ─── Phase 7.9 tests: watch_configs importance lookup ────────────────────────
 
@@ -2001,12 +1773,14 @@ fn cleanup_legacy_is_idempotent() {
     assert!(block_dir.join("block.bin").exists());
 }
 
-// ─── B3 (Offered→Alive): pipeline creates Offered placements ─────────────────
+// ─── A4: backup creates no placements (worker is sole placement creator) ──────
 
-/// After flush_queue(), placements must be Offered (not Alive).
-/// They transition to Alive only after SymbolStored confirmation from the holder.
+/// A4 (was B3 `pipeline_creates_offered_placements`): post-W11b the WorkPipeline
+/// worker — not backup — is the sole creator of placements. After flush_queue(),
+/// the block record exists but there are NO placements (Offered or otherwise).
+/// The Offered→Alive path is now exercised in work_pipeline/tests.rs.
 #[test]
-fn pipeline_creates_offered_placements() {
+fn worker_is_sole_placement_creator() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
     let files_dir = TempDir::new().unwrap();
@@ -2031,20 +1805,199 @@ fn pipeline_creates_offered_placements() {
     );
 
     for result in &results {
+        // Block record must exist.
+        assert!(
+            db.get_source_block(&result.source_block_id)
+                .unwrap()
+                .is_some(),
+            "backup must create the block record"
+        );
+        // But backup creates NO placements — the worker does (test_coord supplies
+        // 5 mock holders, yet backup offers nothing).
         let placements = db
             .list_placements_for_block(&result.source_block_id)
             .unwrap();
-        assert!(!placements.is_empty(), "pipeline must create placements");
-        for p in &placements {
-            assert_eq!(
-                p.status,
-                PlacementStatus::Offered,
-                "pipeline must create Offered placements (not Alive), got {:?} for holder {}",
-                p.status,
-                p.holder_id
-            );
-        }
+        assert!(
+            placements.is_empty(),
+            "A4: backup must not create placements; got {} for block {}",
+            placements.len(),
+            result.source_block_id
+        );
     }
+}
+
+// ─── A4: backup creates block record only, N from the target-based solver ────
+
+/// A4: a single flush_queue() with a healthy candidate pool creates the
+/// `SourceBlockRecord` and ZERO placements. This is the minimal statement of
+/// the post-W11b contract: backup records, the worker places.
+#[test]
+fn backup_creates_block_record_without_placements() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    // test_coord supplies 5 mock holders → candidates is non-empty.
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+
+    let content = b"a4 block-record-without-placements document body";
+    let repeated: Vec<u8> = content.iter().cycle().take(8192).cloned().collect();
+    let path = write_file(&files_dir, "doc.txt", &repeated);
+    coord.process_event(added_event(&path)).unwrap();
+
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
+    assert_eq!(results.len(), 1, "should produce one source block");
+    let block_id = results[0].source_block_id;
+
+    assert!(
+        db.get_source_block(&block_id).unwrap().is_some(),
+        "backup must create the SourceBlockRecord"
+    );
+    assert!(
+        db.list_placements_for_block(&block_id).unwrap().is_empty(),
+        "A4: backup must create no placements"
+    );
+}
+
+/// A4: the block record's N is the principled target-based solver output, NOT a
+/// phantom allocation sum. We recompute the expected N with the exact same
+/// public functions the pipeline uses (k_eff = block.k + DECODE_OVERHEAD; the
+/// commitment→survival bridge; target_reliability from importance) and assert
+/// equality. This pins N to `solve_n_for_target` and would break if backup
+/// reverted to summing an ephemeral allocation it never delivers.
+#[test]
+fn backup_block_record_n_comes_from_solver() {
+    use viaticum_core::commitment::CommitmentScore;
+    use viaticum_core::constants::DECODE_OVERHEAD;
+    use viaticum_core::reliability;
+
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let holders = test_holders(); // trust 0.3, 0.4, 0.5, 0.6, 0.7
+
+    let config = BackupConfig {
+        source_block_size: SMALL_BLOCK_SIZE,
+        symbols_dir: symbols_dir.path().to_path_buf(),
+        epoch_key: [42u8; 32],
+        device_id: DeviceId([1u8; 32]),
+        mock_holders: holders.clone(),
+        cluster_state: None,
+        watch_configs: vec![],
+        time_scale: 1,
+        mock_offer_budget_gb: Some(1000.0),
+        master_signing_key: None,
+        swarm: None,
+        live_watch_configs: None,
+        peer_backoff: None,
+        work_event_tx: None,
+    };
+    let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
+
+    // Importance 1.0 → high target_reliability → solver picks a non-floor N for
+    // this 5-holder pool, distinguishable from the static params.n fallback.
+    let importance = 1.0;
+    let content: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let hash: [u8; 32] = *blake3::hash(&content).as_bytes();
+    let path = write_file(&files_dir, "critical.rs", &content);
+    push_queued(&mut coord, path, importance, content.len() as u64, 1, hash);
+
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
+    assert_eq!(results.len(), 1, "should produce one source block");
+    let block = db
+        .get_source_block(&results[0].source_block_id)
+        .unwrap()
+        .unwrap();
+
+    // Recompute the expected solver N from the same inputs the pipeline used.
+    let k_eff = block.k + DECODE_OVERHEAD;
+    let target_rel = reliability::target_reliability(importance);
+    let solver_candidates: Vec<reliability::HolderCandidate> = holders
+        .iter()
+        .map(|c| reliability::HolderCandidate {
+            survival_prob: reliability::commitment_to_survival_prob(CommitmentScore::new(c.trust)),
+        })
+        .collect();
+    let expected_n =
+        reliability::solve_n_for_target(k_eff, &solver_candidates, target_rel).unwrap();
+
+    assert_eq!(
+        block.n,
+        Some(expected_n),
+        "A4: block.n must equal solve_n_for_target output, not a phantom allocation sum"
+    );
+    // And still no placements.
+    assert!(
+        db.list_placements_for_block(&block.block_id)
+            .unwrap()
+            .is_empty(),
+        "A4: no placements from backup"
+    );
+}
+
+/// A4: with no candidates, the block record is still created with N falling back
+/// to the static `params.n` (the `candidates.is_empty()` guard), no placements,
+/// and no panic.
+#[test]
+fn backup_block_record_falls_back_to_params_n_when_no_candidates() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+
+    let config = BackupConfig {
+        source_block_size: SMALL_BLOCK_SIZE,
+        symbols_dir: symbols_dir.path().to_path_buf(),
+        epoch_key: [42u8; 32],
+        device_id: DeviceId([1u8; 32]),
+        mock_holders: vec![], // empty → candidates empty → static fallback
+        cluster_state: None,
+        watch_configs: vec![],
+        time_scale: 1,
+        mock_offer_budget_gb: Some(1000.0),
+        master_signing_key: None,
+        swarm: None,
+        live_watch_configs: None,
+        peer_backoff: None,
+        work_event_tx: None,
+    };
+    let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
+
+    let content: Vec<u8> = (0..2048u32).map(|i| (i % 67) as u8).collect();
+    let hash: [u8; 32] = *blake3::hash(&content).as_bytes();
+    let path = write_file(&files_dir, "noholders.rs", &content);
+    push_queued(&mut coord, path, 1.0, content.len() as u64, 1, hash);
+
+    let results = coord
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "block must still be created with no candidates"
+    );
+
+    let block = db
+        .get_source_block(&results[0].source_block_id)
+        .unwrap()
+        .expect("block record must exist with empty holder pool");
+
+    // Static fallback: ErasureParams::compute's params.n. Distinct from the
+    // solver path; assert it equals the params.n recomputed from stored_size.
+    let params = viaticum_core::types::ErasureParams::compute(results[0].stored_size, 1.0).unwrap();
+    assert_eq!(
+        block.n,
+        Some(params.n),
+        "A4: with no candidates, N must fall back to the static params.n"
+    );
+    assert!(
+        db.list_placements_for_block(&block.block_id)
+            .unwrap()
+            .is_empty(),
+        "A4: no placements with empty holder pool"
+    );
 }
 
 // ─── Phase 7.9 Wave 7: burst downweight integration ─────────────────────────

@@ -443,6 +443,26 @@ async fn restore_specific_version_by_index() {
         for sym in &raws {
             std::fs::write(raw_dir.join(format!("{}.bin", sym.esi)), &sym.data).unwrap();
         }
+
+        // A4: backup no longer creates placements (the WorkPipeline worker does).
+        // The local-raw-symbol restore path in decode_block_local iterates over a
+        // block's placements to learn which ESIs to read from raw/{esi}.bin. To
+        // exercise that scaffold for v1 (whose source content is overwritten by v2
+        // below, so rebuild_source_blob can't reproduce it), insert an explicit
+        // placement covering the ESIs we just wrote. This stands in for what backup
+        // previously created and what the worker would create in production.
+        let v1_placement = SymbolPlacement {
+            source_block_id: v1_block_id,
+            holder_id: DeviceId([0xA1u8; 32]),
+            file_id: FileId(1),
+            esi_ranges: vec![(0, params.k_eff)],
+            binding_seed: [0u8; 32],
+            status: PlacementStatus::Alive,
+            last_verified: None,
+            placed_at: Timestamp::now(),
+            consecutive_misses: 0,
+        };
+        db.upsert_placement(&v1_placement).unwrap();
     }
 
     // Modify file, backup v2 (source file now has different content)

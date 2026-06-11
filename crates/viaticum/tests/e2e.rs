@@ -192,9 +192,16 @@ async fn full_lifecycle_e2e() {
     // Wave 11b: write raw symbol files for v0 blocks so version-specific restore works.
     // These simulate what holder nodes would store. The restore path reads raw/{esi}.bin
     // from symbols_dir if present (local fallback before network fetch).
+    //
+    // A4: backup no longer creates placements (the WorkPipeline worker does), and the
+    // local-raw-read path in decode_block_local needs a placement to learn which ESIs
+    // to read. So alongside each block's raw files we insert a placement covering the
+    // ESIs we wrote — standing in for what the worker would create in production.
     {
         use viaticum_core::erasure::ErasureEncoder;
-        use viaticum_core::types::{ErasureParams, hex_encode};
+        use viaticum_core::types::{
+            ErasureParams, FileId, PlacementStatus, SymbolPlacement, hex_encode,
+        };
         let encoder = RaptorQEncoder::new();
         for block in db.list_all_source_blocks().unwrap() {
             if let Some(enc_size) = block.encrypted_size {
@@ -213,6 +220,19 @@ async fn full_lifecycle_e2e() {
                 for sym in &raws {
                     std::fs::write(raw_dir.join(format!("{}.bin", sym.esi)), &sym.data).unwrap();
                 }
+
+                let placement = SymbolPlacement {
+                    source_block_id: block.block_id,
+                    holder_id: DeviceId([0xA1u8; 32]),
+                    file_id: FileId(1),
+                    esi_ranges: vec![(0, params.k_eff)],
+                    binding_seed: [0u8; 32],
+                    status: PlacementStatus::Alive,
+                    last_verified: None,
+                    placed_at: Timestamp::now(),
+                    consecutive_misses: 0,
+                };
+                db.upsert_placement(&placement).unwrap();
             }
         }
     }

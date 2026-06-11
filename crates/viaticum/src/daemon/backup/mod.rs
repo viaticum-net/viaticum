@@ -150,6 +150,11 @@ impl Default for BackupConfig {
 ///
 /// Wave 11b: `raw_symbols` and `esi_offset` removed. The WorkPipeline worker
 /// re-encodes from source files on each iteration — no in-memory handoff.
+///
+/// A4: `symbol_count_per_holder` removed. Backup no longer offers symbols — it
+/// creates only the `SourceBlockRecord`. The WorkPipeline worker is the sole
+/// creator of placements and the sole deliverer, so backup has no per-holder
+/// offer counts to report.
 #[derive(Debug)]
 pub struct PipelineResult {
     pub source_block_id: SourceBlockId,
@@ -157,7 +162,6 @@ pub struct PipelineResult {
     pub n: u32,
     /// Symbol size in bytes (SYMBOL_SIZE).
     pub t: u16,
-    pub symbol_count_per_holder: Vec<(DeviceId, u32)>,
     /// Exact byte length of the stored blob ([nonce][ciphertext]).
     /// Required for restore: the decoded erasure block is zero-padded to k*t; trim to stored_size.
     pub stored_size: u64,
@@ -177,8 +181,21 @@ pub struct BackupCoordinator {
     /// Monotonically increasing FileId counter.
     pub(crate) next_file_id: u64,
     /// Holders offered symbols this flush cycle (reset after persist).
+    ///
+    /// NOTE (post-W11b/A4): backup no longer offers symbols — the WorkPipeline
+    /// worker is the sole offerer. This counter is no longer fed by backup;
+    /// offer→accept success-rate accounting must be re-homed to the worker.
+    /// Tracked for the phase-4R economy redesign. Left in place (not deleted)
+    /// because `persist_cycle_budget` / `record_placement_outcome` still
+    /// reference it and tests set it directly.
     pub(crate) offered_this_cycle: u32,
     /// Holders that accepted symbols this flush cycle (reset after persist).
+    ///
+    /// NOTE (post-W11b/A4): a companion to `offered_this_cycle`. It still
+    /// increments on `BackupEvent::SymbolAccept`, but since `offered_this_cycle`
+    /// is now permanently 0, `persist_cycle_budget` early-returns before resetting
+    /// it — so it accumulates (saturating) and is never read. Harmless zombie until
+    /// the offer→accept accounting is re-homed to the worker in phase-4R.
     pub(crate) accepted_this_cycle: u32,
 }
 
@@ -522,11 +539,9 @@ impl BackupCoordinator {
             &candidates,
         )?;
 
-        // Tally the number of distinct holders offered to in this batch.
-        for result in &results {
-            let holder_count = result.symbol_count_per_holder.len() as u32;
-            self.offered_this_cycle = self.offered_this_cycle.saturating_add(holder_count);
-        }
+        // A4: backup no longer offers symbols (the WorkPipeline worker is the sole
+        // offerer), so there is no per-holder offer count to tally here. See the
+        // doc on `offered_this_cycle`.
 
         Ok(results)
     }

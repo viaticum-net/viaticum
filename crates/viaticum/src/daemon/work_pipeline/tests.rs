@@ -1502,3 +1502,105 @@ fn symbol_stored_safety_net_is_noop_when_addrs_empty() {
         "PeerRecord addrs must remain empty when swarm returns no addrs"
     );
 }
+
+// ─── resolve_primary_file_id (A4 / PL-1: backup creates no placements) ─────────
+
+#[test]
+fn resolve_primary_file_id_uses_existing_placement_when_present() {
+    // Fast path: a block that already has placements (repair / re-run) reuses the
+    // existing placement's file_id.
+    use viaticum_core::types::{FileId, PlacementStatus, SymbolPlacement};
+    let db = make_db();
+    let bid = block_id(0x11);
+    let record = make_block_record(bid, 0.5, 0.99);
+    db.upsert_source_block(&record).unwrap();
+    db.upsert_placement(&SymbolPlacement {
+        source_block_id: bid,
+        holder_id: device_id(0xA1),
+        file_id: FileId(42),
+        esi_ranges: vec![(0, 1)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: Timestamp::now(),
+        consecutive_misses: 0,
+    })
+    .unwrap();
+
+    let got = super::worker::resolve_primary_file_id(&db, &record).unwrap();
+    assert_eq!(
+        got,
+        FileId(42),
+        "must reuse the existing placement's file_id"
+    );
+}
+
+#[test]
+fn resolve_primary_file_id_pack_block_without_placements_uses_first_entry() {
+    // A4: a freshly-backed-up Pack block has NO placements. The primary file_id
+    // must come from the block record's first pack entry — NOT FileId(0), which
+    // would silently break the FILE_HOLDERS / watch-admin folder indices.
+    use viaticum_core::types::{FileId, PackEntry, SourceBlockType};
+    let db = make_db();
+    let bid = block_id(0x12);
+    let mut record = make_block_record(bid, 0.5, 0.99);
+    record.block_type = SourceBlockType::Pack {
+        entries: vec![
+            PackEntry {
+                file_id: FileId(7),
+                offset: 0,
+                size: 100,
+            },
+            PackEntry {
+                file_id: FileId(8),
+                offset: 100,
+                size: 50,
+            },
+        ],
+    };
+    db.upsert_source_block(&record).unwrap();
+
+    let got = super::worker::resolve_primary_file_id(&db, &record).unwrap();
+    assert_eq!(
+        got,
+        FileId(7),
+        "Pack block with no placements must use entries[0].file_id, not FileId(0)"
+    );
+}
+
+#[test]
+fn resolve_primary_file_id_single_block_without_placements_reverse_looks_up_file() {
+    // A4: a freshly-backed-up Single block has NO placements and no file_id in the
+    // record. The primary file_id must be reverse-looked-up via the file version
+    // that references the block — NOT FileId(0).
+    use viaticum_core::types::{FileId, FileRecord, FileVersion, LocalState, SourceBlockType};
+    let db = make_db();
+    let bid = block_id(0x13);
+    let mut record = make_block_record(bid, 0.5, 0.99);
+    record.block_type = SourceBlockType::Single;
+    db.upsert_source_block(&record).unwrap();
+
+    let file = FileRecord {
+        file_id: FileId(99),
+        path: "/watch/photo.jpg".to_string(),
+        importance: 0.5,
+        devices: vec![(device_id(0), LocalState::Present)],
+        versions: vec![FileVersion {
+            content_hash: [3u8; 32],
+            source_block_id: bid,
+            k: 5,
+            t: 1024,
+            created_at: Timestamp::now(),
+            backed_up_at: Some(Timestamp::now()),
+        }],
+        first_seen: Timestamp::now(),
+    };
+    db.upsert_file(&file).unwrap();
+
+    let got = super::worker::resolve_primary_file_id(&db, &record).unwrap();
+    assert_eq!(
+        got,
+        FileId(99),
+        "Single block with no placements must reverse-look-up the owning file_id"
+    );
+}
