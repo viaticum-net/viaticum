@@ -30,6 +30,7 @@ fn make_pos_challenge() -> Message {
         esi_ranges: vec![(42, 1)],
         timestamp: Timestamp(1000),
         device_id: None,
+        sig: [0u8; 64],
     })
 }
 

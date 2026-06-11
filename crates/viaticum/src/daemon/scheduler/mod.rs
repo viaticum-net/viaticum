@@ -281,7 +281,7 @@ impl Scheduler {
         response: PosHashResponseMsg,
     ) -> anyhow::Result<()> {
         // Find pending challenge by challenge_id (linear scan, bounded by active placements).
-        let pending_key = {
+        let key = {
             let guard = self.pending.lock().await;
             guard
                 .iter()
@@ -289,7 +289,7 @@ impl Scheduler {
                 .map(|(k, _)| *k)
         };
 
-        let key = match pending_key {
+        let key = match key {
             Some(k) => k,
             None => {
                 warn!(
@@ -299,7 +299,47 @@ impl Scheduler {
             }
         };
 
-        // Consume the entry — challenge lifecycle ends here.
+        let block_id = key.0;
+        let holder_id = key.1;
+
+        // CS-ID-1 / P1-1 / P1-7: authenticate the response BEFORE consuming the pending entry
+        // or applying any outcome. The holder signs the response with its master key; we verify
+        // against the master of the challenged holder (`pending.holder_id`). A positioned postman
+        // forging a wrong-hash response cannot sign for the holder's master → verification fails,
+        // we DROP the response and LEAVE the pending entry intact so the honest holder's real
+        // response can still resolve it (and so the forge does not frame the holder with a Fail).
+        let holder_master = self
+            .db
+            .get_master_for_device(&holder_id)
+            .ok()
+            .flatten()
+            .unwrap_or(IdentityPub(holder_id.0));
+        if let Err(e) = viaticum_core::messages::verify_pos_hash_response(&response, &holder_master)
+        {
+            warn!(
+                block_id = %block_id,
+                holder_id = %holder_id,
+                err = %e,
+                "scheduler: PosHashResponse signature verification failed — ignoring (forge attempt or unsigned), pending left intact"
+            );
+            return Ok(());
+        }
+
+        // Defence-in-depth: the signed response binds source_block_id, and the challenge_id
+        // maps 1:1 to this (block, holder). A valid signature for a different block would only
+        // arise from a holder mis-stamping its own response; reject the mismatch rather than
+        // apply an outcome to the wrong placement.
+        if response.source_block_id != block_id {
+            warn!(
+                block_id = %block_id,
+                holder_id = %holder_id,
+                response_block = %response.source_block_id,
+                "scheduler: PosHashResponse source_block_id mismatch — ignoring, pending left intact"
+            );
+            return Ok(());
+        }
+
+        // Authenticated — consume the entry; the challenge lifecycle ends here.
         let pending = {
             let mut guard = self.pending.lock().await;
             guard.remove(&key)
@@ -308,9 +348,6 @@ impl Scheduler {
             Some(p) => p,
             None => return Ok(()),
         };
-
-        let block_id = key.0;
-        let holder_id = key.1;
         let first_esi = pending
             .esi_ranges
             .first()
@@ -675,14 +712,16 @@ impl Scheduler {
                     .map(|m| IdentityPub(m.0))
                     .unwrap_or_else(|| IdentityPub(holder_id.0));
 
-                let challenge_msg = viaticum_core::messages::PosHashChallengeMsg {
-                    v: 1,
+                // CS-ID-5 / P1-2: sign the challenge with our master key so the holder can
+                // authenticate it against MailboxEntry.sender before doing any disk work.
+                let challenge_msg = viaticum_core::messages::build_pos_hash_challenge(
                     challenge_id,
-                    source_block_id: block_id,
-                    esi_ranges: esi_ranges.clone(),
-                    timestamp: now,
-                    device_id: Some(holder_id),
-                };
+                    block_id,
+                    esi_ranges.clone(),
+                    now,
+                    Some(holder_id),
+                    &self.signing_key,
+                );
 
                 let payload = match to_cbor(&challenge_msg) {
                     Ok(p) => p,

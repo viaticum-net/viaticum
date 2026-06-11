@@ -45,6 +45,12 @@ pub struct PeerAnnounceMsg {
 /// Owner → Holder. Block-level chain hash challenge.
 /// Covers all ESI ranges for this holder for this source block.
 /// Response: holder computes SHA256-chain over all bound symbols (ESIs sorted ascending).
+///
+/// sig covers: b"pc" (2) || challenge_id (16) || source_block_id (32)
+///   || CBOR(esi_ranges) || timestamp_be (8). Signed by the OWNER's master identity key.
+/// The holder verifies the sig against `MailboxEntry.sender` (the claimed owner) before
+/// doing any re-encode / disk work. An all-zero sig is the `#[serde(default)]` value for
+/// messages that predate this field and is unconditionally rejected (A2 = hard cut-over).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PosHashChallengeMsg {
     pub v: u8,
@@ -56,20 +62,41 @@ pub struct PosHashChallengeMsg {
     pub timestamp: Timestamp,
     #[serde(default)]
     pub device_id: Option<DeviceId>,
+    /// Ed25519 signature by the owner's master identity key. 64 bytes.
+    /// Defaults to [0u8; 64] on deserialization (old unsigned messages) which will
+    /// fail verify_pos_hash_challenge — old messages are silently rejected.
+    #[serde(with = "sig_serde")]
+    #[serde(default = "default_sig")]
+    pub sig: [u8; 64],
 }
 
 /// Holder → Owner. Response to PosHashChallengeMsg.
 /// chain_hash = SHA256-chain over bound symbol data for all assigned ESIs (sorted ascending):
 ///   h0 = [0u8; 32], h_i = SHA256(h_{i-1} || symbol[esi_i]), chain_hash = h_n
+///
+/// sig covers: b"pr" (2) || challenge_id (16) || source_block_id (32) || chain_hash (32)
+///   || timestamp_be (8) = 90 bytes. Signed by the HOLDER's master identity key.
+/// The owner verifies the sig against the master of `pending.holder_id` before applying any
+/// Pass/Fail outcome (closes the forged-response framing vector). An all-zero sig is the
+/// `#[serde(default)]` value for old unsigned messages and is unconditionally rejected.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PosHashResponseMsg {
     pub v: u8,
     pub challenge_id: [u8; 16],
+    /// Source block this response is for. Bound by the signature so a postman cannot
+    /// retarget a captured response to a different block.
+    pub source_block_id: SourceBlockId,
     /// Chain hash over all assigned ESIs.
     pub chain_hash: [u8; 32],
     pub timestamp: Timestamp,
     #[serde(default)]
     pub device_id: Option<DeviceId>,
+    /// Ed25519 signature by the holder's master identity key. 64 bytes.
+    /// Defaults to [0u8; 64] on deserialization (old unsigned messages) which will
+    /// fail verify_pos_hash_response — old messages are silently rejected.
+    #[serde(with = "sig_serde")]
+    #[serde(default = "default_sig")]
+    pub sig: [u8; 64],
 }
 
 /// Holder → Owner. Cannot serve the chain hash challenge (symbols missing).
@@ -913,6 +940,162 @@ pub fn verify_pos_hash_nack(
         .map_err(|_| MessageError::BadSignature)?;
     let sig = ed25519_dalek::Signature::from_bytes(&msg.sig);
     let input = pos_hash_nack_sig_input(&msg.challenge_id, &msg.source_block_id, &msg.timestamp);
+    vk.verify_strict(&input, &sig)
+        .map_err(|_| MessageError::BadSignature)?;
+    Ok(())
+}
+
+// ============================================================
+// PosHashChallenge signature (owner-authenticated)
+// ============================================================
+
+/// Compute the signing input for PosHashChallengeMsg.
+///
+/// Input: b"pc" (2) || challenge_id (16) || source_block_id (32)
+///   || CBOR(esi_ranges) || timestamp_be (8)
+///
+/// `esi_ranges` is encoded as canonical CBOR (deterministic for a given Vec), binding the
+/// exact set of ESIs the holder is asked to compute over so a postman cannot widen the
+/// work / retarget the challenge.
+fn pos_hash_challenge_sig_input(
+    challenge_id: &[u8; 16],
+    source_block_id: &SourceBlockId,
+    esi_ranges: &[(u32, u32)],
+    timestamp: &Timestamp,
+) -> Vec<u8> {
+    let mut input = Vec::with_capacity(2 + 16 + 32 + 8 + 8 * esi_ranges.len());
+    input.extend_from_slice(b"pc");
+    input.extend_from_slice(challenge_id);
+    input.extend_from_slice(&source_block_id.0);
+    let mut cbor_ranges = Vec::new();
+    ciborium::ser::into_writer(&esi_ranges, &mut cbor_ranges)
+        .expect("CBOR encode of esi_ranges is infallible");
+    input.extend_from_slice(&cbor_ranges);
+    input.extend_from_slice(&timestamp.0.to_be_bytes());
+    input
+}
+
+/// Build a signed PosHashChallengeMsg.
+///
+/// `signing_key` must be the OWNER's master identity key.
+/// Sig covers: b"pc" || challenge_id || source_block_id || CBOR(esi_ranges) || timestamp_be.
+#[allow(clippy::too_many_arguments)]
+pub fn build_pos_hash_challenge(
+    challenge_id: [u8; 16],
+    source_block_id: SourceBlockId,
+    esi_ranges: Vec<(u32, u32)>,
+    timestamp: Timestamp,
+    device_id: Option<DeviceId>,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> PosHashChallengeMsg {
+    let sig_input =
+        pos_hash_challenge_sig_input(&challenge_id, &source_block_id, &esi_ranges, &timestamp);
+    let sig = signing_key.sign(&sig_input).to_bytes();
+    PosHashChallengeMsg {
+        v: PROTOCOL_VERSION,
+        challenge_id,
+        source_block_id,
+        esi_ranges,
+        timestamp,
+        device_id,
+        sig,
+    }
+}
+
+/// Verify a PosHashChallengeMsg signature against the claimed owner's master identity.
+///
+/// `owner_master` is the IdentityPub of the peer who published the challenge
+/// (`MailboxEntry.sender`). Returns Err(BadSignature) if the signature is invalid or
+/// all-zero (unsigned legacy message). The holder MUST call this before any re-encode /
+/// disk work — a forged challenge with a `sender` the holder does not have the key of
+/// cannot produce a valid signature.
+pub fn verify_pos_hash_challenge(
+    msg: &PosHashChallengeMsg,
+    owner_master: &IdentityPub,
+) -> Result<(), MessageError> {
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&owner_master.0)
+        .map_err(|_| MessageError::BadSignature)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&msg.sig);
+    let input = pos_hash_challenge_sig_input(
+        &msg.challenge_id,
+        &msg.source_block_id,
+        &msg.esi_ranges,
+        &msg.timestamp,
+    );
+    vk.verify_strict(&input, &sig)
+        .map_err(|_| MessageError::BadSignature)?;
+    Ok(())
+}
+
+// ============================================================
+// PosHashResponse signature (holder-authenticated)
+// ============================================================
+
+/// Compute the signing input for PosHashResponseMsg.
+///
+/// Input: b"pr" (2) || challenge_id (16) || source_block_id (32) || chain_hash (32)
+///   || timestamp_be (8). Total: 90 bytes.
+fn pos_hash_response_sig_input(
+    challenge_id: &[u8; 16],
+    source_block_id: &SourceBlockId,
+    chain_hash: &[u8; 32],
+    timestamp: &Timestamp,
+) -> Vec<u8> {
+    let mut input = Vec::with_capacity(2 + 16 + 32 + 32 + 8);
+    input.extend_from_slice(b"pr");
+    input.extend_from_slice(challenge_id);
+    input.extend_from_slice(&source_block_id.0);
+    input.extend_from_slice(chain_hash);
+    input.extend_from_slice(&timestamp.0.to_be_bytes());
+    input
+}
+
+/// Build a signed PosHashResponseMsg.
+///
+/// `signing_key` must be the HOLDER's master identity key.
+/// Sig covers: b"pr" || challenge_id || source_block_id || chain_hash || timestamp_be (90 bytes).
+pub fn build_pos_hash_response(
+    challenge_id: [u8; 16],
+    source_block_id: SourceBlockId,
+    chain_hash: [u8; 32],
+    timestamp: Timestamp,
+    device_id: Option<DeviceId>,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> PosHashResponseMsg {
+    let sig_input =
+        pos_hash_response_sig_input(&challenge_id, &source_block_id, &chain_hash, &timestamp);
+    let sig = signing_key.sign(&sig_input).to_bytes();
+    PosHashResponseMsg {
+        v: PROTOCOL_VERSION,
+        challenge_id,
+        source_block_id,
+        chain_hash,
+        timestamp,
+        device_id,
+        sig,
+    }
+}
+
+/// Verify a PosHashResponseMsg signature against the expected holder's master identity.
+///
+/// `expected_holder_master` is the IdentityPub of the holder the owner challenged
+/// (resolved from `pending.holder_id`). Returns Err(BadSignature) if the signature is
+/// invalid or all-zero (unsigned legacy message). The owner MUST call this before applying
+/// any Pass/Fail outcome — a forged response from a positioned postman cannot carry a valid
+/// signature for the challenged holder's master key.
+pub fn verify_pos_hash_response(
+    msg: &PosHashResponseMsg,
+    expected_holder_master: &IdentityPub,
+) -> Result<(), MessageError> {
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&expected_holder_master.0)
+        .map_err(|_| MessageError::BadSignature)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&msg.sig);
+    let input = pos_hash_response_sig_input(
+        &msg.challenge_id,
+        &msg.source_block_id,
+        &msg.chain_hash,
+        &msg.timestamp,
+    );
     vk.verify_strict(&input, &sig)
         .map_err(|_| MessageError::BadSignature)?;
     Ok(())

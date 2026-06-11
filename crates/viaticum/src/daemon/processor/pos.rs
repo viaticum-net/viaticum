@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use tracing::{debug, info, warn};
 use viaticum_core::db::Db;
 use viaticum_core::messages::{
-    Message, PosHashChallengeMsg, PosHashResponseMsg, build_pos_hash_nack,
+    Message, PosHashChallengeMsg, PosHashResponseMsg, build_pos_hash_nack, build_pos_hash_response,
+    verify_pos_hash_challenge,
 };
 use viaticum_core::pos::compute_chain_hash;
 use viaticum_core::types::from_cbor_bytes;
@@ -58,6 +59,22 @@ impl PosResponder {
         challenge: PosHashChallengeMsg,
     ) -> Result<Message, ProcessorError> {
         let block_id = challenge.source_block_id;
+
+        // CS-ID-5 / P1-2: authenticate the challenge BEFORE any disk work or re-encode.
+        // The owner signs the challenge with its master key; `owner_id` is the claimed owner
+        // (MailboxEntry.sender on the mailbox path, the handshake-verified master on direct-RR).
+        // A forged challenge whose `sender` the attacker does not hold the key for cannot carry
+        // a valid signature → drop with UnauthenticatedChallenge (no Nack, no compute). The
+        // holding-check below stays: it binds the signer to a real owner we actually store for.
+        if let Err(e) = verify_pos_hash_challenge(&challenge, &owner_id) {
+            warn!(
+                block_id = %block_id,
+                challenger = %owner_id,
+                err = %e,
+                "processor: PosHashChallenge signature verification failed — dropping (forge attempt or legacy unsigned challenge)"
+            );
+            return Err(ProcessorError::UnauthenticatedChallenge);
+        }
 
         // Verify we hold symbols for this owner+block.
         match self.db.get_holding(&block_id, &owner_id)? {
@@ -124,13 +141,16 @@ impl PosResponder {
             .map_err(ProcessorError::PosVerify)?;
 
         debug!(block_id = %block_id, "processor: PosHashChallenge — responding with chain hash");
-        Ok(Message::PosHashResponse(PosHashResponseMsg {
-            v: 1,
-            challenge_id: challenge.challenge_id,
+        // CS-ID-1 / P1-1: sign the response with our master key so the owner can verify it
+        // came from the challenged holder (not a positioned postman forging a wrong hash).
+        Ok(Message::PosHashResponse(build_pos_hash_response(
+            challenge.challenge_id,
+            block_id,
             chain_hash,
-            timestamp: Timestamp::now(),
-            device_id: challenge.device_id,
-        }))
+            Timestamp::now(),
+            challenge.device_id,
+            &self.master_signing_key,
+        )))
     }
 }
 
@@ -221,6 +241,10 @@ impl PosMailboxChallengeHandler for ProcessorPosHandler {
                         );
                         Ok(None)
                     }
+                    // CS-ID-5 / P1-2: an unauthenticated (forged/unsigned) challenge was already
+                    // logged inside compute_response. Treat it as a clean drop — no response is
+                    // published and the poll loop must NOT surface it as a handler error.
+                    Err(ProcessorError::UnauthenticatedChallenge) => Ok(None),
                     Err(e) => Err(anyhow::anyhow!("pos challenge handler error: {e}")),
                 }
             }

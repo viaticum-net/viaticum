@@ -2278,6 +2278,14 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
     db.upsert_placement(&placement).unwrap();
     db.upsert_peer(&make_peer_record(holder_id)).unwrap();
 
+    // CS-ID-1: the owner now verifies the response signature against the master of
+    // pending.holder_id. Register a holder master keypair and the device→master mapping so
+    // the owner resolves a real verifying key, and sign the response with that key.
+    let holder_master_key = ed25519_dalek::SigningKey::from_bytes(&[0xC3u8; 32]);
+    let holder_master = IdentityPub(holder_master_key.verifying_key().to_bytes());
+    db.set_master_for_device(&holder_id, &holder_master)
+        .unwrap();
+
     // Compute a known expected_chain_hash using an arbitrary symbol.
     // We don't need real erasure data here — just a hash that the response can match.
     let dummy_esi: u32 = 0;
@@ -2327,13 +2335,14 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
     );
 
     // ── Pass case: correct chain_hash ────────────────────────────────────────
-    let pass_response = viaticum_core::messages::PosHashResponseMsg {
-        v: 1,
+    let pass_response = viaticum_core::messages::build_pos_hash_response(
         challenge_id,
-        chain_hash: expected_chain_hash, // correct hash = Pass
-        timestamp: Timestamp::now(),
-        device_id: Some(holder_id),
-    };
+        block_id,
+        expected_chain_hash, // correct hash = Pass
+        Timestamp::now(),
+        Some(holder_id),
+        &holder_master_key,
+    );
 
     scheduler
         .handle_pos_response_from_mailbox(pass_response)
@@ -2380,6 +2389,12 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
     db2.upsert_placement(&placement2).unwrap();
     db2.upsert_peer(&make_peer_record(holder_id2)).unwrap();
 
+    // CS-ID-1: register holder2's master mapping + key for response signing/verify.
+    let holder2_master_key = ed25519_dalek::SigningKey::from_bytes(&[0xD3u8; 32]);
+    let holder2_master = IdentityPub(holder2_master_key.verifying_key().to_bytes());
+    db2.set_master_for_device(&holder_id2, &holder2_master)
+        .unwrap();
+
     let expected_hash2 =
         compute_chain_hash(&challenge_id2, &[(0u32, b"correct".as_slice())]).unwrap();
     let pending2 = make_pending_challenges();
@@ -2422,15 +2437,18 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
         std::env::temp_dir(),
     );
 
-    // Send a response with the WRONG chain_hash → Fail outcome.
+    // Send a response with the WRONG chain_hash → Fail outcome. The response is correctly
+    // SIGNED by the honest holder (a holder can produce a valid sig over a wrong hash, e.g.
+    // if its symbols are corrupted) — the Fail must still be applied.
     let wrong_hash = [0xFFu8; 32]; // definitely not expected_hash2
-    let fail_response = viaticum_core::messages::PosHashResponseMsg {
-        v: 1,
-        challenge_id: challenge_id2,
-        chain_hash: wrong_hash,
-        timestamp: Timestamp::now(),
-        device_id: Some(holder_id2),
-    };
+    let fail_response = viaticum_core::messages::build_pos_hash_response(
+        challenge_id2,
+        block_id2,
+        wrong_hash,
+        Timestamp::now(),
+        Some(holder_id2),
+        &holder2_master_key,
+    );
 
     scheduler2
         .handle_pos_response_from_mailbox(fail_response)
@@ -2469,6 +2487,143 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
         }
         other => panic!("expected RepairNow after Fail, got {other:?}"),
     }
+}
+
+// ─── CS-ID-1 / P1-1 / P1-7: forged PosResponse is ignored, pending left intact ──
+
+/// A forged response from a positioned postman — valid `challenge_id` but signed by an
+/// identity that is NOT the challenged holder's master (or unsigned) — must be IGNORED:
+/// the pending challenge is LEFT INTACT (so the honest holder's real response can still
+/// resolve it) and NO Fail outcome is applied to the honest holder's placement.
+#[tokio::test]
+async fn pos_response_from_wrong_identity_is_ignored() {
+    use viaticum_core::pos::compute_chain_hash;
+
+    let db = Db::open_in_memory().expect("db open");
+    let block_id = make_block_id(0xF1);
+    let holder_id = make_identity(0xF2);
+    let challenge_id = [0x55u8; 16];
+
+    let mut placement = make_placement(block_id, holder_id);
+    placement.consecutive_misses = 2; // any Fail would → Lost (so a wrong outcome is observable)
+    placement.status = PlacementStatus::Alive;
+    db.upsert_placement(&placement).unwrap();
+    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
+
+    // Register the honest holder's master mapping.
+    let holder_master_key = ed25519_dalek::SigningKey::from_bytes(&[0xF3u8; 32]);
+    let holder_master = IdentityPub(holder_master_key.verifying_key().to_bytes());
+    db.set_master_for_device(&holder_id, &holder_master)
+        .unwrap();
+
+    let expected_chain_hash =
+        compute_chain_hash(&challenge_id, &[(0u32, b"honest".as_slice())]).unwrap();
+
+    let pending = make_pending_challenges();
+    {
+        let mut guard = pending.lock().await;
+        guard.insert(
+            (block_id, holder_id),
+            PendingHashChallenge {
+                source_block_id: block_id,
+                holder_id,
+                esi_ranges: vec![(0, 1)],
+                expected_chain_hash,
+                issued_at: Timestamp::now(),
+                challenge_id,
+            },
+        );
+    }
+
+    let (repair_tx, mut repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending.clone(),
+        make_test_router(&db),
+        dummy_master_pub(),
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    );
+
+    // Forge: correct challenge_id + garbage chain_hash, signed by an ATTACKER master key
+    // (not the holder's). This is the postman's framing attack.
+    let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
+    let forged = viaticum_core::messages::build_pos_hash_response(
+        challenge_id,
+        block_id,
+        [0xFFu8; 32], // wrong hash — would be Fail → Lost if applied
+        Timestamp::now(),
+        Some(holder_id),
+        &attacker_key,
+    );
+
+    scheduler
+        .handle_pos_response_from_mailbox(forged)
+        .await
+        .expect("handler must not error on a forged response");
+
+    // Pending MUST remain — the forge must not consume it (P1-7).
+    assert!(
+        !pending.lock().await.is_empty(),
+        "forged response must NOT consume the pending challenge (pending left intact)"
+    );
+
+    // Placement MUST NOT have degraded — no Fail applied to the honest holder.
+    let updated = db
+        .get_placement(&block_id, &holder_id)
+        .unwrap()
+        .expect("placement still exists");
+    assert_eq!(
+        updated.status,
+        PlacementStatus::Alive,
+        "forged response must NOT apply a Fail to the honest holder's placement"
+    );
+
+    // No repair triggered.
+    assert!(
+        repair_rx.try_recv().is_err(),
+        "forged response must NOT trigger repair against the honest holder"
+    );
+
+    // And the honest holder's correctly-signed response STILL resolves the pending challenge.
+    let honest = viaticum_core::messages::build_pos_hash_response(
+        challenge_id,
+        block_id,
+        expected_chain_hash, // correct hash = Pass
+        Timestamp::now(),
+        Some(holder_id),
+        &holder_master_key,
+    );
+    scheduler
+        .handle_pos_response_from_mailbox(honest)
+        .await
+        .expect("handler must not error on the honest response");
+    assert!(
+        pending.lock().await.is_empty(),
+        "honest signed response must resolve (consume) the pending challenge"
+    );
+    let resolved = db
+        .get_placement(&block_id, &holder_id)
+        .unwrap()
+        .expect("placement still exists after honest Pass");
+    assert!(
+        resolved.last_verified.is_some(),
+        "honest Pass must set last_verified"
+    );
 }
 
 // ─── T-6 test: pending timeout boundary is 14d2h not 7d1h ───────────────────

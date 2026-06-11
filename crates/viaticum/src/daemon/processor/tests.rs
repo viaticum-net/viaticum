@@ -32,8 +32,8 @@ use tokio::sync::mpsc;
 use viaticum_core::cluster::{ClusterState, derive_master_key, master_identity};
 use viaticum_core::db::Db;
 use viaticum_core::messages::{
-    PeerAnnounceMsg, PosHashChallengeMsg, RestoreRequestMsg, SymbolAcceptMsg, SymbolDropNoticeMsg,
-    SymbolRejectMsg, SymbolTransferMsg, build_signed_symbol_drop_notice,
+    PeerAnnounceMsg, RestoreRequestMsg, SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolRejectMsg,
+    SymbolTransferMsg, build_signed_symbol_drop_notice,
 };
 use viaticum_core::types::{
     DeviceId, FileId, HoldingRecord, HoldingStatus, IdentityPub, PlacementStatus, SourceBlockId,
@@ -538,7 +538,9 @@ async fn handle_pos_hash_challenge_responds_with_chain_hash_when_symbols_held() 
     let holdings_dir = TempDir::new().unwrap();
     let processor = make_processor(db.clone(), &holdings_dir).await;
 
-    let owner = make_identity(1);
+    // Owner signs the challenge with its master key; `owner` must be that key's pub.
+    let owner_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let owner = IdentityPub(owner_key.verifying_key().to_bytes());
     let block_id = make_block_id(2);
     let esi = 7u32;
     let symbol_data = vec![0xDEu8; 64];
@@ -564,14 +566,14 @@ async fn handle_pos_hash_challenge_responds_with_chain_hash_when_symbols_held() 
     std::fs::write(block_dir.join(format!("{esi}.bin")), &symbol_data).unwrap();
 
     let challenge_id = [99u8; 16];
-    let challenge = PosHashChallengeMsg {
-        v: 1,
+    let challenge = viaticum_core::messages::build_pos_hash_challenge(
         challenge_id,
-        source_block_id: block_id,
-        esi_ranges: vec![(esi, 1)],
-        timestamp: Timestamp::now(),
-        device_id: None,
-    };
+        block_id,
+        vec![(esi, 1)],
+        Timestamp::now(),
+        None,
+        &owner_key,
+    );
 
     let reply = processor
         .handle_pos_hash_challenge_inner(owner, challenge)
@@ -602,7 +604,8 @@ async fn handle_pos_hash_challenge_sends_nack_when_symbol_not_held() {
     let holdings_dir = TempDir::new().unwrap();
     let processor = make_processor(db.clone(), &holdings_dir).await;
 
-    let owner = make_identity(1);
+    let owner_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let owner = IdentityPub(owner_key.verifying_key().to_bytes());
     let block_id = make_block_id(2);
     let esi = 99u32;
     let challenge_id = [77u8; 16];
@@ -622,14 +625,14 @@ async fn handle_pos_hash_challenge_sends_nack_when_symbol_not_held() {
     })
     .unwrap();
 
-    let challenge = PosHashChallengeMsg {
-        v: 1,
+    let challenge = viaticum_core::messages::build_pos_hash_challenge(
         challenge_id,
-        source_block_id: block_id,
-        esi_ranges: vec![(esi, 1)],
-        timestamp: Timestamp::now(),
-        device_id: None,
-    };
+        block_id,
+        vec![(esi, 1)],
+        Timestamp::now(),
+        None,
+        &owner_key,
+    );
 
     let reply = processor
         .handle_pos_hash_challenge_inner(owner, challenge)
@@ -3568,7 +3571,7 @@ fn recompute_and_persist_is_idempotent_on_double_call() {
 
 #[tokio::test]
 async fn pos_responder_computes_response_for_held_block() {
-    use viaticum_core::messages::PosHashChallengeMsg;
+    use viaticum_core::messages::build_pos_hash_challenge;
     use viaticum_core::pos::compute_chain_hash;
     use viaticum_core::types::hex_encode;
 
@@ -3577,7 +3580,8 @@ async fn pos_responder_computes_response_for_held_block() {
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
 
-    let owner = make_identity(0x11);
+    let owner_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+    let owner = IdentityPub(owner_key.verifying_key().to_bytes());
     let block_id = make_block_id(0x22);
     let esi = 3u32;
     let symbol_data = b"test-symbol-data-for-pos-responder".to_vec();
@@ -3606,14 +3610,14 @@ async fn pos_responder_computes_response_for_held_block() {
     let responder = PosResponder::new(db, holdings_dir.path().to_path_buf(), master_signing_key);
 
     let challenge_id = [0xCCu8; 16];
-    let challenge = PosHashChallengeMsg {
-        v: 1,
+    let challenge = build_pos_hash_challenge(
         challenge_id,
-        source_block_id: block_id,
-        esi_ranges: vec![(esi, 1)],
-        timestamp: Timestamp::now(),
-        device_id: None,
-    };
+        block_id,
+        vec![(esi, 1)],
+        Timestamp::now(),
+        None,
+        &owner_key,
+    );
 
     let reply = responder
         .compute_response(owner, challenge)
@@ -3640,9 +3644,71 @@ async fn pos_responder_computes_response_for_held_block() {
     }
 }
 
+/// CS-ID-5 / P1-2: a forged challenge — `owner_id` (claimed sender) is a real owner the
+/// holder stores for, but the signature was produced by a DIFFERENT key — is dropped with
+/// `UnauthenticatedChallenge` and produces NO response (no re-encode / disk-read amplification).
+#[tokio::test]
+async fn pos_responder_drops_challenge_with_bad_owner_signature() {
+    use viaticum_core::messages::build_pos_hash_challenge;
+    use viaticum_core::types::hex_encode;
+
+    use super::pos::PosResponder;
+    use crate::daemon::processor::ProcessorError;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+
+    // The holder genuinely holds this block for `owner` (so the holding-check alone would
+    // pass) — the only thing stopping a forge is the signature check.
+    let owner_key = ed25519_dalek::SigningKey::from_bytes(&[0x55u8; 32]);
+    let owner = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0x66);
+    let esi = 2u32;
+    let symbol_data = b"held-symbol-data".to_vec();
+
+    db.upsert_holding(&HoldingRecord {
+        source_block_id: block_id,
+        owner_id: owner,
+        esi_ranges: vec![(esi, 1)],
+        importance: 0.5,
+        total_bytes: symbol_data.len() as u64,
+        status: HoldingStatus::Active,
+        received_at: Timestamp::now(),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    })
+    .unwrap();
+
+    let block_hex: String = hex_encode(&block_id.0);
+    let block_dir = holdings_dir.path().join(&block_hex);
+    std::fs::create_dir_all(&block_dir).unwrap();
+    std::fs::write(block_dir.join(format!("{esi}.bin")), &symbol_data).unwrap();
+
+    let master_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
+    let responder = PosResponder::new(db, holdings_dir.path().to_path_buf(), master_signing_key);
+
+    // Forge: sign the challenge with an ATTACKER key, but present it as if from `owner`.
+    let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0x99u8; 32]);
+    let forged = build_pos_hash_challenge(
+        [0x77u8; 16],
+        block_id,
+        vec![(esi, 1)],
+        Timestamp::now(),
+        None,
+        &attacker_key,
+    );
+
+    let result = responder.compute_response(owner, forged).await;
+    assert!(
+        matches!(result, Err(ProcessorError::UnauthenticatedChallenge)),
+        "forged challenge (sig by attacker, sender claims owner) must be dropped as \
+         UnauthenticatedChallenge — no response, no re-encode"
+    );
+}
+
 #[tokio::test]
 async fn pos_responder_returns_none_when_block_not_held() {
-    use viaticum_core::messages::{PosHashChallengeMsg, to_cbor};
+    use viaticum_core::messages::{build_pos_hash_challenge, to_cbor};
 
     use super::pos::PosResponder;
     use crate::daemon::mailbox::poll::PosMailboxChallengeHandler;
@@ -3659,19 +3725,22 @@ async fn pos_responder_returns_none_when_block_not_held() {
         master_signing_key,
     ));
 
-    let owner = make_identity(0x33);
+    // Sign the challenge with a real owner key so it passes authentication and reaches the
+    // "block not held → Nack → None" path (not an UnauthenticatedChallenge short-circuit).
+    let owner_key = ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]);
+    let owner = IdentityPub(owner_key.verifying_key().to_bytes());
     let block_id = make_block_id(0x44);
     let esi = 0u32;
     let challenge_id = [0xDDu8; 16];
 
-    let challenge = PosHashChallengeMsg {
-        v: 1,
+    let challenge = build_pos_hash_challenge(
         challenge_id,
-        source_block_id: block_id,
-        esi_ranges: vec![(esi, 1)],
-        timestamp: Timestamp::now(),
-        device_id: None,
-    };
+        block_id,
+        vec![(esi, 1)],
+        Timestamp::now(),
+        None,
+        &owner_key,
+    );
     let payload = to_cbor(&challenge).expect("cbor encode challenge");
 
     // Drive via the PosMailboxChallengeHandler interface (the same path the poll loop uses).

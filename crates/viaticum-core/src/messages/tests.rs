@@ -457,13 +457,16 @@ fn all_message_variants() -> Vec<Message> {
             esi_ranges: vec![(0, 5)],
             timestamp: ts,
             device_id: None,
+            sig: [0u8; 64],
         }),
         Message::PosHashResponse(PosHashResponseMsg {
             v: 1,
             challenge_id: [0x02u8; 16],
+            source_block_id: sbid,
             chain_hash: [0x03u8; 32],
             timestamp: ts,
             device_id: None,
+            sig: [0u8; 64],
         }),
         Message::PosHashNack(PosHashNackMsg {
             v: 1,
@@ -1214,6 +1217,7 @@ fn pos_hash_challenge_cbor_roundtrip() {
         esi_ranges: vec![(0, 5), (10, 3)],
         timestamp: Timestamp(1234567890),
         device_id: None,
+        sig: [0u8; 64],
     };
     let bytes = to_cbor(&msg).unwrap();
     let decoded: PosHashChallengeMsg = from_cbor(&bytes).unwrap();
@@ -1225,9 +1229,11 @@ fn pos_hash_response_cbor_roundtrip() {
     let msg = PosHashResponseMsg {
         v: 1,
         challenge_id: [0xCC; 16],
+        source_block_id: SourceBlockId([0xEE; 32]),
         chain_hash: [0xDD; 32],
         timestamp: Timestamp(1234567890),
         device_id: None,
+        sig: [0u8; 64],
     };
     let bytes = to_cbor(&msg).unwrap();
     let decoded: PosHashResponseMsg = from_cbor(&bytes).unwrap();
@@ -1259,6 +1265,7 @@ fn message_enum_pos_hash_challenge_roundtrip() {
         esi_ranges: vec![(0, 10)],
         timestamp: Timestamp(999),
         device_id: Some(DeviceId([0x33; 32])),
+        sig: [0u8; 64],
     };
     let msg = Message::PosHashChallenge(inner);
     let bytes = to_cbor(&msg).unwrap();
@@ -1605,5 +1612,288 @@ fn symbol_drop_notice_cbor_roundtrip_preserves_sig() {
 
     assert_eq!(decoded.sig, msg.sig, "sig must survive CBOR roundtrip");
     super::verify_symbol_drop_notice(&decoded, &holder)
+        .expect("sig must verify after CBOR roundtrip");
+}
+
+// ─── PosHashChallenge signature (CS-ID-5 / P1-2) ──────────────────────────────
+
+// A correctly built challenge verifies against the signing (owner) master key.
+#[test]
+fn pos_hash_challenge_with_correct_signature_verifies() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let owner = IdentityPub(sk.verifying_key().to_bytes());
+    let block_id = SourceBlockId([0x11u8; 32]);
+
+    let msg = super::build_pos_hash_challenge(
+        [0x01u8; 16],
+        block_id,
+        vec![(0, 5), (10, 3)],
+        Timestamp(1_000_000),
+        None,
+        &sk,
+    );
+
+    super::verify_pos_hash_challenge(&msg, &owner)
+        .expect("correctly built PosHashChallenge must verify");
+}
+
+// A challenge signed by owner A does NOT verify against a different identity B —
+// a postman that copies a challenge and re-stamps `sender` cannot pass verification.
+#[test]
+fn pos_hash_challenge_signed_by_wrong_key_is_rejected() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let other = SigningKey::generate(&mut OsRng);
+    let other_pub = IdentityPub(other.verifying_key().to_bytes());
+    let block_id = SourceBlockId([0x22u8; 32]);
+
+    let msg = super::build_pos_hash_challenge(
+        [0x02u8; 16],
+        block_id,
+        vec![(0, 4)],
+        Timestamp(2_000_000),
+        None,
+        &sk,
+    );
+
+    assert!(
+        matches!(
+            super::verify_pos_hash_challenge(&msg, &other_pub),
+            Err(super::MessageError::BadSignature)
+        ),
+        "challenge signed by owner A must not verify against identity B"
+    );
+}
+
+// The signature covers source_block_id — flipping it after signing fails verify.
+#[test]
+fn pos_hash_challenge_signature_covers_source_block_id() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let owner = IdentityPub(sk.verifying_key().to_bytes());
+
+    let mut msg = super::build_pos_hash_challenge(
+        [0x03u8; 16],
+        SourceBlockId([0x30u8; 32]),
+        vec![(0, 6)],
+        Timestamp(3_000_000),
+        None,
+        &sk,
+    );
+    msg.source_block_id = SourceBlockId([0x31u8; 32]);
+
+    assert!(
+        matches!(
+            super::verify_pos_hash_challenge(&msg, &owner),
+            Err(super::MessageError::BadSignature)
+        ),
+        "tampered source_block_id must fail verification"
+    );
+}
+
+// The signature covers esi_ranges — widening the work after signing fails verify.
+#[test]
+fn pos_hash_challenge_signature_covers_esi_ranges() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let owner = IdentityPub(sk.verifying_key().to_bytes());
+
+    let mut msg = super::build_pos_hash_challenge(
+        [0x04u8; 16],
+        SourceBlockId([0x40u8; 32]),
+        vec![(0, 2)],
+        Timestamp(4_000_000),
+        None,
+        &sk,
+    );
+    msg.esi_ranges = vec![(0, 1000)];
+
+    assert!(
+        matches!(
+            super::verify_pos_hash_challenge(&msg, &owner),
+            Err(super::MessageError::BadSignature)
+        ),
+        "tampered esi_ranges must fail verification"
+    );
+}
+
+// An unsigned (all-zero sig, the serde default for old messages) challenge is rejected.
+#[test]
+fn pos_hash_challenge_unsigned_is_rejected() {
+    let owner = IdentityPub([0x50u8; 32]);
+    let msg = PosHashChallengeMsg {
+        v: 1,
+        challenge_id: [0x05u8; 16],
+        source_block_id: SourceBlockId([0x51u8; 32]),
+        esi_ranges: vec![(0, 5)],
+        timestamp: Timestamp(5_000_000),
+        device_id: None,
+        sig: [0u8; 64],
+    };
+
+    assert!(
+        super::verify_pos_hash_challenge(&msg, &owner).is_err(),
+        "unsigned (zero-sig) challenge must fail verify"
+    );
+}
+
+// The sig survives a CBOR roundtrip and still verifies.
+#[test]
+fn pos_hash_challenge_cbor_roundtrip_preserves_sig() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let owner = IdentityPub(sk.verifying_key().to_bytes());
+
+    let msg = super::build_pos_hash_challenge(
+        [0x06u8; 16],
+        SourceBlockId([0x60u8; 32]),
+        vec![(0, 7), (20, 2)],
+        Timestamp(6_000_000),
+        Some(DeviceId([0x61u8; 32])),
+        &sk,
+    );
+
+    let bytes = to_cbor(&msg).expect("CBOR encode");
+    let decoded: PosHashChallengeMsg = from_cbor(&bytes).expect("CBOR decode");
+    assert_eq!(decoded.sig, msg.sig, "sig must survive CBOR roundtrip");
+    super::verify_pos_hash_challenge(&decoded, &owner)
+        .expect("sig must verify after CBOR roundtrip");
+}
+
+// ─── PosHashResponse signature (CS-ID-1 / P1-1 / P1-7) ────────────────────────
+
+// A correctly built response verifies against the signing (holder) master key.
+#[test]
+fn pos_hash_response_with_correct_signature_verifies() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let holder = IdentityPub(sk.verifying_key().to_bytes());
+
+    let msg = super::build_pos_hash_response(
+        [0x07u8; 16],
+        SourceBlockId([0x70u8; 32]),
+        [0x71u8; 32],
+        Timestamp(7_000_000),
+        None,
+        &sk,
+    );
+
+    super::verify_pos_hash_response(&msg, &holder)
+        .expect("correctly built PosHashResponse must verify");
+}
+
+// A response signed by holder A does NOT verify against a different identity B —
+// a positioned postman forging a response cannot pass verification against the
+// challenged holder's master key.
+#[test]
+fn pos_hash_response_signed_by_wrong_key_is_rejected() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let other = SigningKey::generate(&mut OsRng);
+    let other_pub = IdentityPub(other.verifying_key().to_bytes());
+
+    let msg = super::build_pos_hash_response(
+        [0x08u8; 16],
+        SourceBlockId([0x80u8; 32]),
+        [0x81u8; 32],
+        Timestamp(8_000_000),
+        None,
+        &sk,
+    );
+
+    assert!(
+        matches!(
+            super::verify_pos_hash_response(&msg, &other_pub),
+            Err(super::MessageError::BadSignature)
+        ),
+        "response signed by holder A must not verify against identity B"
+    );
+}
+
+// The signature covers chain_hash — flipping the hash after signing fails verify
+// (this is the exact forge a postman would attempt: valid challenge_id, garbage hash).
+#[test]
+fn pos_hash_response_signature_covers_chain_hash() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let holder = IdentityPub(sk.verifying_key().to_bytes());
+
+    let mut msg = super::build_pos_hash_response(
+        [0x09u8; 16],
+        SourceBlockId([0x90u8; 32]),
+        [0x91u8; 32],
+        Timestamp(9_000_000),
+        None,
+        &sk,
+    );
+    msg.chain_hash = [0xFFu8; 32];
+
+    assert!(
+        matches!(
+            super::verify_pos_hash_response(&msg, &holder),
+            Err(super::MessageError::BadSignature)
+        ),
+        "tampered chain_hash must fail verification"
+    );
+}
+
+// The signature covers source_block_id — a postman cannot retarget a captured
+// response to a different block.
+#[test]
+fn pos_hash_response_signature_covers_source_block_id() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let holder = IdentityPub(sk.verifying_key().to_bytes());
+
+    let mut msg = super::build_pos_hash_response(
+        [0x0Au8; 16],
+        SourceBlockId([0xA0u8; 32]),
+        [0xA1u8; 32],
+        Timestamp(10_000_000),
+        None,
+        &sk,
+    );
+    msg.source_block_id = SourceBlockId([0xA2u8; 32]);
+
+    assert!(
+        matches!(
+            super::verify_pos_hash_response(&msg, &holder),
+            Err(super::MessageError::BadSignature)
+        ),
+        "tampered source_block_id must fail verification"
+    );
+}
+
+// An unsigned (all-zero sig, the serde default for old messages) response is rejected.
+#[test]
+fn pos_hash_response_unsigned_is_rejected() {
+    let holder = IdentityPub([0xB0u8; 32]);
+    let msg = PosHashResponseMsg {
+        v: 1,
+        challenge_id: [0x0Bu8; 16],
+        source_block_id: SourceBlockId([0xB1u8; 32]),
+        chain_hash: [0xB2u8; 32],
+        timestamp: Timestamp(11_000_000),
+        device_id: None,
+        sig: [0u8; 64],
+    };
+
+    assert!(
+        super::verify_pos_hash_response(&msg, &holder).is_err(),
+        "unsigned (zero-sig) response must fail verify"
+    );
+}
+
+// The sig survives a CBOR roundtrip and still verifies.
+#[test]
+fn pos_hash_response_cbor_roundtrip_preserves_sig() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let holder = IdentityPub(sk.verifying_key().to_bytes());
+
+    let msg = super::build_pos_hash_response(
+        [0x0Cu8; 16],
+        SourceBlockId([0xC0u8; 32]),
+        [0xC1u8; 32],
+        Timestamp(12_000_000),
+        Some(DeviceId([0xC2u8; 32])),
+        &sk,
+    );
+
+    let bytes = to_cbor(&msg).expect("CBOR encode");
+    let decoded: PosHashResponseMsg = from_cbor(&bytes).expect("CBOR decode");
+    assert_eq!(decoded.sig, msg.sig, "sig must survive CBOR roundtrip");
+    super::verify_pos_hash_response(&decoded, &holder)
         .expect("sig must verify after CBOR roundtrip");
 }

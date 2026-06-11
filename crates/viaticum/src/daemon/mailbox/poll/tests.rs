@@ -50,9 +50,11 @@ async fn poll_dispatches_pos_response_to_channel() {
     let expected_response = PosHashResponseMsg {
         v: 1,
         challenge_id: [7u8; 16],
+        source_block_id: SourceBlockId([8u8; 32]),
         chain_hash: [99u8; 32],
         timestamp: Timestamp::now(),
         device_id: None,
+        sig: [0u8; 64],
     };
     let payload = to_cbor(&expected_response).expect("encode");
     let entry = make_entry(MailboxClass::PosResponse, make_identity(1), payload);
@@ -141,9 +143,11 @@ async fn poll_pos_response_channel_full_does_not_panic() {
     let response = PosHashResponseMsg {
         v: 1,
         challenge_id: [1u8; 16],
+        source_block_id: SourceBlockId([3u8; 32]),
         chain_hash: [2u8; 32],
         timestamp: Timestamp::now(),
         device_id: None,
+        sig: [0u8; 64],
     };
     let payload = to_cbor(&response).expect("encode");
     // Fill the channel.

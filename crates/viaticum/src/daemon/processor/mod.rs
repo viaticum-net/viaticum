@@ -30,9 +30,11 @@
 //   their handler bodies live in pos.rs / symbol.rs and are reached through the
 //   mailbox dispatch handlers, not through this Processor's inbound path.
 //
-// Design note: PosHashResponseMsg on the wire does not carry source_block_id.
-// We recover it by looking up the challenge_id in the shared PendingChallenges
-// map (written by Scheduler when the challenge was issued).
+// Design note: PosHashResponseMsg carries source_block_id (bound by the holder's
+// signature so a postman cannot retarget a captured response). The owner still locates
+// the matching pending challenge by challenge_id in the shared PendingChallenges map
+// (written by Scheduler when the challenge was issued), then verifies the response
+// signature against the master of pending.holder_id before applying any outcome (CS-ID-1).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -87,6 +89,9 @@ pub enum ProcessorError {
 
     #[error("pos verify error: {0}")]
     PosVerify(#[from] viaticum_core::pos::PosError),
+
+    #[error("unauthenticated PoS challenge (bad/absent owner signature)")]
+    UnauthenticatedChallenge,
 
     #[error("cluster sync error: {0}")]
     ClusterSync(#[from] crate::daemon::cluster_sync::ClusterSyncError),

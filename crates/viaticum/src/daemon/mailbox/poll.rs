@@ -154,7 +154,7 @@ pub(crate) async fn dispatch_entry(
 ) {
     match entry.class {
         MailboxClass::PosChallenge => {
-            dispatch_pos_challenge(router, challenge_handler, entry).await;
+            dispatch_pos_challenge(router, challenge_handler, my_master_pub, entry).await;
         }
         MailboxClass::PosResponse => {
             dispatch_pos_response(pos_response_tx, entry);
@@ -181,9 +181,13 @@ pub(crate) async fn dispatch_entry(
 ///
 /// The owner's master_pub comes from `entry.sender` (set by the scheduler when publishing
 /// the challenge — see scheduler::issue_due_challenges).
+///
+/// `my_master_pub` is this (holder) node's master identity. It is stamped as the response
+/// `sender` so the owner can resolve who to verify the response signature against (CS-ID-1).
 async fn dispatch_pos_challenge(
     router: &Arc<MailboxRouter>,
     challenge_handler: &Arc<dyn PosMailboxChallengeHandler>,
+    my_master_pub: &IdentityPub,
     entry: MailboxEntry,
 ) {
     let owner_master = match entry.sender {
@@ -231,8 +235,10 @@ async fn dispatch_pos_challenge(
                 payload: response_payload,
                 expires_at: now_secs + ttl_secs,
                 stored_at: now_secs,
-                // sender: None — not needed for PosResponse routing
-                sender: None,
+                // CS-ID-1: stamp our (holder) master so the owner can resolve and verify
+                // the response signature. The owner does not trust this hint blindly — it
+                // verifies the payload sig against the master of its own pending.holder_id.
+                sender: Some(*my_master_pub),
             };
 
             match router.publish(&owner_master, response_entry).await {
