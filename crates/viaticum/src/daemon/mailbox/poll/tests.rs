@@ -1263,3 +1263,233 @@ async fn pos_response_entry_ttl_is_scaled_by_time_scale() {
         "scaled TTL must be strictly less than the full unscaled TTL"
     );
 }
+
+// ─── A3: PosResponse delivery is reliable (deterministic msg_id + retry) ───────
+//
+// P1-4: a PosResponse must not be lost on a single 0-ack publish. The PoS challenge
+// entry stays in the holder's mailbox until TTL, so dispatch_pos_challenge re-runs on
+// every poll — that re-run is the retry. M1: re-published responses must dedup, not
+// pile up; the msg_id must therefore be deterministic — derived from
+// (challenge_id ‖ chain_hash) so it is stable across re-dispatch yet unpredictable to a
+// postman that lacks the symbols (WARN-1), not a fresh random value each poll.
+
+/// A sender that fails (network error → 0 acks) for the first N store attempts, then
+/// records and Acks every store after that. Captures the entry of every attempt
+/// (failed and succeeded) so the test can compare msg_ids across re-dispatch.
+struct FlakyRecordingSender {
+    fail_first: tokio::sync::Mutex<usize>,
+    attempts: tokio::sync::Mutex<Vec<MailboxStoreRequest>>,
+    acked: tokio::sync::Mutex<Vec<MailboxStoreRequest>>,
+}
+
+#[async_trait::async_trait]
+impl MailboxNetworkSender for FlakyRecordingSender {
+    async fn send_store(
+        &self,
+        _device: DeviceId,
+        req: MailboxStoreRequest,
+    ) -> anyhow::Result<MailboxStoreResponse> {
+        self.attempts.lock().await.push(req.clone());
+        let mut remaining = self.fail_first.lock().await;
+        if *remaining > 0 {
+            *remaining -= 1;
+            anyhow::bail!("simulated postman unreachable");
+        }
+        let msg_id = req.entry.msg_id;
+        self.acked.lock().await.push(req);
+        Ok(MailboxStoreResponse::Ack { msg_id })
+    }
+
+    async fn send_fetch(
+        &self,
+        _device: DeviceId,
+        _req: MailboxFetchRequest,
+    ) -> anyhow::Result<MailboxFetchResponse> {
+        Ok(MailboxFetchResponse {
+            v: 1,
+            entries: vec![],
+            served_msg_ids: vec![],
+        })
+    }
+}
+
+/// Build a router whose single publish candidate is a real Ed25519 peer, backed by
+/// the given sender. Shared setup for the A3 retry/idempotency tests.
+fn router_with_one_peer(db: &Db, sender: Arc<dyn MailboxNetworkSender>) -> Arc<MailboxRouter> {
+    let peer = PeerRecord {
+        device_id: gen_device_id(),
+        master_identity: IdentityPub([0xAB; 32]),
+        trust_p: 0.5,
+        trust_i: 0.5,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: 0.5,
+        last_avail_sample: 0,
+    };
+    db.upsert_peer(&peer).expect("upsert peer");
+    Arc::new(MailboxRouter::with_sender(sender, db.clone()))
+}
+
+/// A3 (M1 + WARN-1): the PosResponse msg_id is deterministic-but-UNPREDICTABLE —
+/// derived from the chain_hash (which only a symbol-holder can compute), NOT the
+/// plaintext challenge_id. It is STABLE across re-dispatch of the same challenge (so
+/// postmen dedup re-published responses instead of piling up a row per poll — M1), yet
+/// it is NOT the challenge_id, so a postman that has only seen the challenge cannot
+/// predict the response key and pre-squat a forged response under it (WARN-1).
+#[tokio::test]
+async fn pos_response_msg_id_is_derived_from_chain_hash_and_stable_across_redispatch() {
+    let db = Db::open_in_memory().expect("db");
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+
+    let challenge_id = [0x5Au8; 16];
+    let response = PosHashResponseMsg {
+        v: 1,
+        challenge_id,
+        source_block_id: SourceBlockId([8u8; 32]),
+        chain_hash: [9u8; 32],
+        timestamp: Timestamp::now(),
+        device_id: None,
+        sig: [0u8; 64],
+    };
+    let handler: Arc<dyn super::PosMailboxChallengeHandler> =
+        Arc::new(StubChallengeHandler { response });
+
+    let owner_master = make_identity(0x42);
+    let my_master = make_identity(0xAA);
+    let base = make_entry(MailboxClass::PosChallenge, my_master, vec![0x00]);
+    let entry = MailboxEntry {
+        sender: Some(owner_master),
+        ..base
+    };
+
+    // Two re-dispatches of the SAME challenge entry (simulating two polls while the
+    // challenge is still alive in our mailbox).
+    super::dispatch_pos_challenge(&router, &handler, &my_master, entry.clone(), 1).await;
+    super::dispatch_pos_challenge(&router, &handler, &my_master, entry, 1).await;
+
+    let stored = sender.stored.lock().await;
+    assert_eq!(stored.len(), 2, "two re-dispatches must publish twice");
+    let msg_id = stored[0].entry.msg_id;
+    assert_eq!(
+        msg_id, stored[1].entry.msg_id,
+        "re-dispatching the same challenge must reuse the same msg_id (idempotent, dedupable — M1)"
+    );
+    assert_ne!(
+        msg_id, challenge_id,
+        "msg_id must NOT be the plaintext challenge_id — a postman that has seen the \
+         challenge could otherwise predict the key and squat a forged response (WARN-1)"
+    );
+}
+
+/// A3 (WARN-1): the PosResponse msg_id DEPENDS on the chain_hash — two responses to the
+/// same challenge_id but with different chain_hashes get different msg_ids. A postman that
+/// cannot compute the chain_hash (it lacks the symbols) therefore cannot predict the key.
+#[tokio::test]
+async fn pos_response_msg_id_depends_on_chain_hash() {
+    let db = Db::open_in_memory().expect("db");
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let my_master = make_identity(0xAA);
+    let owner_master = make_identity(0x42);
+
+    let mk = |chain_hash: [u8; 32]| PosHashResponseMsg {
+        v: 1,
+        challenge_id: [0x5Au8; 16],
+        source_block_id: SourceBlockId([8u8; 32]),
+        chain_hash,
+        timestamp: Timestamp::now(),
+        device_id: None,
+        sig: [0u8; 64],
+    };
+    let base = make_entry(MailboxClass::PosChallenge, my_master, vec![0x00]);
+    let entry = MailboxEntry {
+        sender: Some(owner_master),
+        ..base
+    };
+
+    let h1: Arc<dyn super::PosMailboxChallengeHandler> = Arc::new(StubChallengeHandler {
+        response: mk([9u8; 32]),
+    });
+    super::dispatch_pos_challenge(&router, &h1, &my_master, entry.clone(), 1).await;
+    let h2: Arc<dyn super::PosMailboxChallengeHandler> = Arc::new(StubChallengeHandler {
+        response: mk([0xA5u8; 32]),
+    });
+    super::dispatch_pos_challenge(&router, &h2, &my_master, entry, 1).await;
+
+    let stored = sender.stored.lock().await;
+    assert_eq!(stored.len(), 2);
+    assert_ne!(
+        stored[0].entry.msg_id, stored[1].entry.msg_id,
+        "different chain_hash must yield a different msg_id (a postman without the symbols \
+         cannot compute chain_hash, so cannot predict the response key)"
+    );
+}
+
+/// A3 (P1-4): a single 0-ack publish does NOT lose the response. The first dispatch
+/// gets 0 acks (its only postman is unreachable); the next dispatch (the next poll's
+/// re-run) delivers. The honest holder thus delivers with the SAME msg_id — no false
+/// Timeout from a one-shot publish failure.
+#[tokio::test]
+async fn pos_response_zero_ack_is_recovered_by_redispatch() {
+    let db = Db::open_in_memory().expect("db");
+    let sender = Arc::new(FlakyRecordingSender {
+        fail_first: tokio::sync::Mutex::new(1), // first store attempt fails (0 acks)
+        attempts: tokio::sync::Mutex::new(vec![]),
+        acked: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+
+    let challenge_id = [0x3Cu8; 16];
+    let response = PosHashResponseMsg {
+        v: 1,
+        challenge_id,
+        source_block_id: SourceBlockId([8u8; 32]),
+        chain_hash: [9u8; 32],
+        timestamp: Timestamp::now(),
+        device_id: None,
+        sig: [0u8; 64],
+    };
+    let handler: Arc<dyn super::PosMailboxChallengeHandler> =
+        Arc::new(StubChallengeHandler { response });
+
+    let owner_master = make_identity(0x42);
+    let my_master = make_identity(0xAA);
+    let base = make_entry(MailboxClass::PosChallenge, my_master, vec![0x00]);
+    let entry = MailboxEntry {
+        sender: Some(owner_master),
+        ..base
+    };
+
+    // First poll: publish gets 0 acks (postman unreachable). No panic, response not lost.
+    super::dispatch_pos_challenge(&router, &handler, &my_master, entry.clone(), 1).await;
+    assert!(
+        sender.acked.lock().await.is_empty(),
+        "first dispatch must get 0 acks (simulated unreachable postman)"
+    );
+
+    // Next poll: the challenge is still alive in our mailbox, so dispatch re-runs and
+    // this time the publish is acked — the honest holder delivers.
+    super::dispatch_pos_challenge(&router, &handler, &my_master, entry, 1).await;
+
+    let acked = sender.acked.lock().await;
+    assert_eq!(
+        acked.len(),
+        1,
+        "re-dispatch must eventually deliver the PosResponse (no false Timeout)"
+    );
+    assert_ne!(
+        acked[0].entry.msg_id, challenge_id,
+        "the recovered delivery carries the derived (not plaintext-challenge_id) msg_id"
+    );
+}

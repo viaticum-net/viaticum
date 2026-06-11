@@ -2489,6 +2489,136 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
     }
 }
 
+// ─── A3 (P1-4 / M1): owner-side idempotency for a re-delivered PosResponse ──────
+
+/// A3: under the reliable-delivery design the holder re-publishes the SAME PosResponse
+/// while the challenge entry lives in its mailbox (deterministic msg_id derived from
+/// challenge_id ‖ chain_hash — stable across re-dispatch, unpredictable to a postman).
+/// A duplicate of an already-resolved response can therefore reach the owner after its
+/// pending entry was consumed by the first valid response. That duplicate must be a
+/// no-op: unknown challenge_id → silent drop, no panic, no double-apply of the outcome.
+#[tokio::test]
+async fn pos_response_duplicate_after_consume_is_dropped() {
+    use viaticum_core::pos::compute_chain_hash;
+
+    let db = Db::open_in_memory().expect("db open");
+    let block_id = make_block_id(0xA1);
+    let holder_id = make_identity(0xA2);
+    let challenge_id = [0x77u8; 16];
+
+    let mut placement = make_placement(block_id, holder_id);
+    placement.status = PlacementStatus::Alive;
+    db.upsert_placement(&placement).unwrap();
+    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
+
+    let holder_master_key = ed25519_dalek::SigningKey::from_bytes(&[0xA3u8; 32]);
+    let holder_master = IdentityPub(holder_master_key.verifying_key().to_bytes());
+    db.set_master_for_device(&holder_id, &holder_master)
+        .unwrap();
+
+    let dummy_symbol = b"dummy_symbol_data_for_dup_test".as_slice();
+    let expected_chain_hash = compute_chain_hash(&challenge_id, &[(0u32, dummy_symbol)]).unwrap();
+
+    let pending = make_pending_challenges();
+    {
+        let mut guard = pending.lock().await;
+        guard.insert(
+            (block_id, holder_id),
+            PendingHashChallenge {
+                source_block_id: block_id,
+                holder_id,
+                esi_ranges: vec![(0, 1)],
+                expected_chain_hash,
+                issued_at: Timestamp::now(),
+                challenge_id,
+            },
+        );
+    }
+
+    let (repair_tx, mut repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending.clone(),
+        make_test_router(&db),
+        dummy_master_pub(),
+        signing_key,
+        std::path::PathBuf::from("/tmp/test_source_blocks"),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    );
+
+    // The same signed Pass response is delivered twice (the holder re-published it).
+    let response = viaticum_core::messages::build_pos_hash_response(
+        challenge_id,
+        block_id,
+        expected_chain_hash, // correct hash = Pass
+        Timestamp::now(),
+        Some(holder_id),
+        &holder_master_key,
+    );
+
+    // First delivery: resolves and consumes the pending challenge.
+    scheduler
+        .handle_pos_response_from_mailbox(response.clone())
+        .await
+        .expect("first PosResponse must resolve cleanly");
+    assert!(
+        pending.lock().await.is_empty(),
+        "pending must be empty after the first valid response is consumed"
+    );
+
+    let after_first = db
+        .get_placement(&block_id, &holder_id)
+        .unwrap()
+        .expect("placement exists after first response");
+    assert!(
+        after_first.last_verified.is_some(),
+        "first Pass must set last_verified"
+    );
+    let first_verified = after_first.last_verified;
+
+    // Second delivery of the SAME response: pending is gone → unknown challenge_id →
+    // must be a silent no-op (Ok, no panic), no double-apply, no repair.
+    scheduler
+        .handle_pos_response_from_mailbox(response)
+        .await
+        .expect("duplicate PosResponse after consume must NOT error or panic");
+
+    assert!(
+        pending.lock().await.is_empty(),
+        "pending must remain empty after the duplicate"
+    );
+    let after_dup = db
+        .get_placement(&block_id, &holder_id)
+        .unwrap()
+        .expect("placement exists after duplicate");
+    assert_eq!(
+        after_dup.status,
+        PlacementStatus::Alive,
+        "duplicate response must not change placement status"
+    );
+    assert_eq!(
+        after_dup.last_verified, first_verified,
+        "duplicate must not re-apply the outcome (last_verified unchanged)"
+    );
+    assert!(
+        repair_rx.try_recv().is_err(),
+        "duplicate response must not trigger repair"
+    );
+}
+
 // ─── CS-ID-1 / P1-1 / P1-7: forged PosResponse is ignored, pending left intact ──
 
 /// A forged response from a positioned postman — valid `challenge_id` but signed by an

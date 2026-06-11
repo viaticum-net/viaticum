@@ -233,8 +233,47 @@ async fn dispatch_pos_challenge(
                 .unwrap_or_default()
                 .as_secs();
 
-            let mut msg_id = [0u8; 16];
-            rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
+            // A3 (P1-4 / M1 / WARN-1): deterministic-but-UNPREDICTABLE msg_id.
+            //
+            // The PoS challenge entry stays in our (holder's) mailbox until its TTL, so
+            // `dispatch_pos_challenge` re-runs on every poll while the challenge is alive
+            // — this IS the retry: if a publish gets 0 acks (all of the owner's write-
+            // fanout postmen were unreachable), the next poll re-publishes the same
+            // response. The owner's pending lives longer (POS_CHALLENGE_PENDING ≈14d2h)
+            // than the challenge TTL (7d), so a late retry is still accepted.
+            //
+            // The msg_id must be (a) STABLE across re-dispatch so postmen dedup re-
+            // published responses (closes M1 pile-up), and (b) UNPREDICTABLE to a third
+            // party so a postman that has merely seen the challenge cannot pre-occupy the
+            // response key. We derive it from the chain_hash — which only a node that
+            // actually holds the symbols can compute:
+            //
+            //     msg_id = BLAKE3("viaticum-pos-resp-msgid-v1" ‖ challenge_id ‖ chain_hash)[..16]
+            //
+            // Stable: the same challenge yields the same chain_hash, hence the same msg_id
+            // on every re-dispatch. Unpredictable: a postman storing the challenge sees
+            // `challenge_id` (plaintext in the challenge entry) but NOT the symbols, so it
+            // cannot compute chain_hash → cannot predict this key. Using the raw
+            // `challenge_id` would let any postman pre-store garbage under (owner_master,
+            // challenge_id, PosResponse); the honest store would then collide → keep-first
+            // Duplicate→Ack (we believe we delivered) while the postman keeps the garbage,
+            // the owner's signature verify fails, and the pending dies at Timeout — re-
+            // creating the very P1-4 false-penalty this fix prevents (WARN-1).
+            //
+            // Store dedup is KEEP-FIRST: an existing (target, msg_id, class) key returns
+            // Duplicate→Ack (mailbox_insert / handle_mailbox_store), so a re-dispatch is an
+            // idempotent no-op Ack, not an overwrite. No cross-class collision: this entry
+            // is keyed under (owner_master, msg_id, PosResponse) while the challenge sits
+            // under (holder_master, challenge_id, PosChallenge).
+            let msg_id: [u8; 16] = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"viaticum-pos-resp-msgid-v1");
+                hasher.update(&response.challenge_id);
+                hasher.update(&response.chain_hash);
+                hasher.finalize().as_bytes()[..16]
+                    .try_into()
+                    .expect("blake3 digest is 32 bytes, slice of 16 always fits")
+            };
 
             let response_entry = MailboxEntry {
                 target: owner_master,
