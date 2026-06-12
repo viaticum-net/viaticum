@@ -276,21 +276,21 @@ impl Scheduler {
         response: PosHashResponseMsg,
     ) -> anyhow::Result<()> {
         // Find pending challenge by challenge_id (linear scan, bounded by active placements).
-        let key = {
+        // Capture its key + the holder_master we resolved AT ISSUE TIME (CS-POS-3) without
+        // consuming the entry — the verify below must leave the pending intact on failure.
+        let (key, holder_master) = {
             let guard = self.pending.lock().await;
-            guard
+            match guard
                 .iter()
                 .find(|(_, v)| v.challenge_id == response.challenge_id)
-                .map(|(k, _)| *k)
-        };
-
-        let key = match key {
-            Some(k) => k,
-            None => {
-                warn!(
-                    "scheduler: PosHashResponse from mailbox with unknown challenge_id (stale or duplicate)"
-                );
-                return Ok(());
+            {
+                Some((k, v)) => (*k, v.holder_master),
+                None => {
+                    warn!(
+                        "scheduler: PosHashResponse from mailbox with unknown challenge_id (stale or duplicate)"
+                    );
+                    return Ok(());
+                }
             }
         };
 
@@ -299,16 +299,13 @@ impl Scheduler {
 
         // CS-ID-1 / P1-1 / P1-7: authenticate the response BEFORE consuming the pending entry
         // or applying any outcome. The holder signs the response with its master key; we verify
-        // against the master of the challenged holder (`pending.holder_id`). A positioned postman
-        // forging a wrong-hash response cannot sign for the holder's master → verification fails,
-        // we DROP the response and LEAVE the pending entry intact so the honest holder's real
-        // response can still resolve it (and so the forge does not frame the holder with a Fail).
-        let holder_master = self
-            .db
-            .get_master_for_device(&holder_id)
-            .ok()
-            .flatten()
-            .unwrap_or(IdentityPub(holder_id.0));
+        // against the holder_master captured when this challenge was issued (CS-POS-3) — the
+        // SAME key the challenge was addressed to. A positioned postman forging a wrong-hash
+        // response cannot sign for that master → verification fails, we DROP the response and
+        // LEAVE the pending entry intact so the honest holder's real response can still resolve
+        // it (and so the forge does not frame the holder with a Fail). Verifying against the
+        // captured master (rather than a re-resolve here) means a peer-record change between
+        // issue and response can no longer flip an honest holder's response to unverifiable.
         if let Err(e) = viaticum_core::messages::verify_pos_hash_response(&response, &holder_master)
         {
             warn!(
@@ -690,8 +687,24 @@ impl Scheduler {
                     results
                 },
             )
-            .await
-            .unwrap_or_default();
+            .await;
+
+            // CS-POS-8: a JoinError here means the blocking task panicked (e.g. the
+            // `expect` inside it). `unwrap_or_default()` would silently swallow that and
+            // skip the whole block with zero logs. Log it loudly and degrade gracefully —
+            // treat it as "no hashes for this block this tick" rather than re-panicking the
+            // scheduler task.
+            let hash_results = match hash_results {
+                Ok(results) => results,
+                Err(join_err) => {
+                    error!(
+                        block_id = %block_id,
+                        err = %join_err,
+                        "scheduler: PoS hash compute task failed (panicked or cancelled) — skipping block this tick"
+                    );
+                    continue;
+                }
+            };
 
             // Publish a challenge for each holder we computed a hash for via mailbox (T-6).
             for (holder_id, expected_hash, esi_ranges) in hash_results {
@@ -778,6 +791,9 @@ impl Scheduler {
                 }
 
                 // Insert into pending ONLY after confirmed ack (W-3 requirement).
+                // CS-POS-3: capture the holder_master we resolved above so the response
+                // is later verified against the SAME key the challenge was addressed to —
+                // not a re-resolve that may have degraded to device-pub by then.
                 self.pending.lock().await.insert(
                     (block_id, holder_id),
                     PendingHashChallenge {
@@ -787,6 +803,7 @@ impl Scheduler {
                         expected_chain_hash: expected_hash,
                         issued_at: now,
                         challenge_id,
+                        holder_master,
                     },
                 );
 
@@ -847,7 +864,7 @@ impl Scheduler {
     /// Check all pending challenges for timeout.
     ///
     /// A challenge is considered timed out when:
-    ///   `now.0 - issued_at.0 >= POS_TIMEOUT_SECS / time_scale`
+    ///   `now.0 - issued_at.0 >= POS_CHALLENGE_PENDING_TIMEOUT_SECS / time_scale`
     ///
     /// For each timed-out challenge:
     ///   1. Look up the current placement from DB.
@@ -862,7 +879,10 @@ impl Scheduler {
         // The extended window accounts for: challenge_TTL (7d) + response_TTL (7d) + 2×poll_interval (2h).
         // A holder offline for up to challenge_TTL can still respond; the response lives in mailbox
         // for response_TTL; the owner needs up to 2 poll intervals to collect it.
-        let threshold = POS_CHALLENGE_PENDING_TIMEOUT_SECS / scale;
+        // CS-POS-11: floor at 1s so an extreme time_scale (> ~1.2M) cannot collapse the
+        // threshold to 0 — which would time out every fresh challenge instantly. Mirrors the
+        // established `(x / time_scale.max(1)).max(1)` cadence pattern used elsewhere.
+        let threshold = (POS_CHALLENGE_PENDING_TIMEOUT_SECS / scale).max(1);
 
         // Collect timed-out entries without holding the lock during DB calls.
         let timed_out: Vec<PendingHashChallenge> = {

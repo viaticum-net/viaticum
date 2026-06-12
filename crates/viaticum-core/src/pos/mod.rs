@@ -6,7 +6,9 @@ use crate::constants::{
     POS_CONSECUTIVE_MISS_UNCERTAIN, POS_VOLUME_DIVISOR, SECS_PER_WEEK,
 };
 use crate::trust::PosOutcome;
-use crate::types::{DeviceId, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp};
+use crate::types::{
+    DeviceId, IdentityPub, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
+};
 
 /// Outcome of verifying a PoS response.
 #[derive(Debug, Clone, PartialEq)]
@@ -24,15 +26,18 @@ pub enum VerifyOutcome {
     CannotVerify,
 }
 
-/// One holder's challenge schedule entry.
+/// One holder's challenge schedule entry — identifies a (block, holder) placement
+/// that is due for a PoS challenge this cycle.
+///
+/// CS-POS-9: the former `challenges_due` (per-week count) and `available_esis` (a full
+/// `Vec<u32>` expansion of the placement's ESI ranges, built per due-placement per tick)
+/// were dead weight — no production consumer ever read them. The scheduler builds the
+/// challenge from the placement's own `esi_ranges`, not from these fields. Removing
+/// `available_esis` also drops an unchecked `start..start + count` expansion.
 #[derive(Debug, Clone)]
 pub struct ChallengeScheduleEntry {
     pub holder_id: DeviceId,
     pub source_block_id: SourceBlockId,
-    /// How many challenges to issue this week for this holder.
-    pub challenges_due: u32,
-    /// Candidate ESIs the caller can select from (computed from esi_ranges).
-    pub available_esis: Vec<u32>,
 }
 
 /// Error type for PoS engine operations.
@@ -117,17 +122,9 @@ where
                 return None;
             }
 
-            let available_esis: Vec<u32> = p
-                .esi_ranges
-                .iter()
-                .flat_map(|&(start, count)| start..start + count)
-                .collect();
-
             Some(ChallengeScheduleEntry {
                 holder_id: p.holder_id,
                 source_block_id: p.source_block_id,
-                challenges_due: cpw,
-                available_esis,
             })
         })
         .collect()
@@ -337,6 +334,16 @@ pub struct PendingHashChallenge {
     pub issued_at: Timestamp,
     /// Raw challenge_id from the wire message.
     pub challenge_id: [u8; 16],
+    /// Holder's master identity, resolved AT ISSUE TIME and captured here (CS-POS-3).
+    ///
+    /// The challenge is addressed to this master (it is the mailbox `target`), and the
+    /// holder signs its response with the corresponding master key. The owner verifies
+    /// the response against THIS captured value rather than re-resolving the holder's
+    /// master at response time: a peer-record change/degradation between issue and
+    /// response (peer cleanup, DR-restored minimal DB, a 14-day gap) could make the
+    /// re-resolve fall back to the device-pub, which would reject the master-signed
+    /// response of an honest holder and wrongly time it out.
+    pub holder_master: IdentityPub,
 }
 
 /// Shared map of in-flight hash challenges keyed by (SourceBlockId, DeviceId).

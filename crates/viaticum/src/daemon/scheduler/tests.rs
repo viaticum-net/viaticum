@@ -123,6 +123,7 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp(0), // ancient — definitely timed out
                 challenge_id: [0u8; 16],
+                holder_master: IdentityPub(holder_id.0),
             },
         );
     }
@@ -203,6 +204,7 @@ async fn check_timeouts_ignores_fresh_challenges() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: now,
                 challenge_id: [1u8; 16],
+                holder_master: IdentityPub(holder_id.0),
             },
         );
     }
@@ -268,6 +270,7 @@ async fn pending_challenges_shared_between_tasks() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp::now(),
                 challenge_id: [7u8; 16],
+                holder_master: IdentityPub(holder_id.0),
             },
         );
     });
@@ -315,6 +318,7 @@ async fn check_timeouts_respects_time_scale() {
                 expected_chain_hash: [0u8; 32],
                 issued_at,
                 challenge_id: [0u8; 16],
+                holder_master: IdentityPub(holder_id.0),
             },
         );
     }
@@ -384,6 +388,7 @@ async fn issue_due_challenges_skips_already_pending() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp::now(),
                 challenge_id: [2u8; 16],
+                holder_master: IdentityPub(holder_id.0),
             },
         );
     }
@@ -521,6 +526,7 @@ async fn time_scale_divides_intervals() {
                 expected_chain_hash: [0u8; 32],
                 issued_at,
                 challenge_id: [0u8; 16],
+                holder_master: IdentityPub(holder_id.0),
             },
         );
     }
@@ -1805,6 +1811,7 @@ async fn scheduler_pos_timeout_alive_to_uncertain_preserves_current_alive() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp(0), // ancient → timed out
                 challenge_id: [0xA0u8; 16],
+                holder_master: IdentityPub(holder_a.0),
             },
         );
     }
@@ -1866,6 +1873,7 @@ async fn scheduler_pos_timeout_uncertain_to_presumed_lost_decrements_current_ali
                 expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp(0), // ancient → timed out
                 challenge_id: [0xB0u8; 16],
+                holder_master: IdentityPub(holder_a.0),
             },
         );
     }
@@ -2276,6 +2284,7 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
                 expected_chain_hash,
                 issued_at: Timestamp::now(),
                 challenge_id,
+                holder_master,
             },
         );
     }
@@ -2379,6 +2388,7 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
                 expected_chain_hash: expected_hash2,
                 issued_at: Timestamp::now(),
                 challenge_id: challenge_id2,
+                holder_master: holder2_master,
             },
         );
     }
@@ -2452,6 +2462,120 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
     );
 }
 
+// ─── CS-POS-3: response verified against holder_master captured at issue time ──
+
+/// CS-POS-3: the owner resolves the holder's master AT ISSUE TIME and stores it in
+/// the PendingHashChallenge. The response is verified against THAT captured value, not
+/// a re-resolve at response time. If the device→master mapping is lost/degraded between
+/// issue and response (peer cleanup, DR-restored minimal DB, a 14-day gap), the old
+/// re-resolve would fall back to the device-pub and reject the honest holder's
+/// master-signed response → unearned Timeout. Here the DB has NO device→master mapping
+/// (simulating that loss), yet a correctly master-signed response still verifies and
+/// resolves the pending challenge.
+#[tokio::test]
+async fn pos_response_verified_against_master_captured_at_issue_time() {
+    use viaticum_core::pos::compute_chain_hash;
+
+    let db = Db::open_in_memory().expect("db open");
+    let block_id = make_block_id(0xE7);
+    let holder_id = make_identity(0xE8);
+    let challenge_id = [0x5Au8; 16];
+
+    let mut placement = make_placement(block_id, holder_id);
+    placement.status = PlacementStatus::Alive;
+    db.upsert_placement(&placement).unwrap();
+    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
+
+    // The holder's real master key. The owner resolved this at issue time and captured
+    // it in the pending. Critically we do NOT call set_master_for_device — the DB has
+    // NO device→master mapping, so a response-time re-resolve would fall back to the
+    // device-pub and the master-signed response below would fail to verify.
+    let holder_master_key = ed25519_dalek::SigningKey::from_bytes(&[0xE9u8; 32]);
+    let holder_master = IdentityPub(holder_master_key.verifying_key().to_bytes());
+    assert!(
+        db.get_master_for_device(&holder_id).unwrap().is_none(),
+        "precondition: device→master mapping is absent (degraded peer record)"
+    );
+
+    let dummy_symbol = b"dummy_symbol_data_for_captured_master_test".as_slice();
+    let expected_chain_hash = compute_chain_hash(&challenge_id, &[(0u32, dummy_symbol)]).unwrap();
+
+    let pending = make_pending_challenges();
+    {
+        let mut guard = pending.lock().await;
+        guard.insert(
+            (block_id, holder_id),
+            PendingHashChallenge {
+                source_block_id: block_id,
+                holder_id,
+                esi_ranges: vec![(0, 1)],
+                expected_chain_hash,
+                issued_at: Timestamp::now(),
+                challenge_id,
+                // Captured at issue time — the master the challenge was addressed to.
+                holder_master,
+            },
+        );
+    }
+
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: 1,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending.clone(),
+        make_test_router(&db),
+        dummy_master_pub(),
+        signing_key,
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    );
+
+    // Correctly master-signed Pass response. Despite the missing device→master mapping,
+    // verification against the captured holder_master succeeds and the pending resolves.
+    let pass_response = viaticum_core::messages::build_pos_hash_response(
+        challenge_id,
+        block_id,
+        expected_chain_hash,
+        Timestamp::now(),
+        Some(holder_id),
+        &holder_master_key,
+    );
+
+    scheduler
+        .handle_pos_response_from_mailbox(pass_response)
+        .await
+        .expect("handle_pos_response_from_mailbox failed");
+
+    // Pending consumed → the response was accepted, NOT dropped as unverifiable.
+    assert!(
+        pending.lock().await.is_empty(),
+        "response signed by the captured holder_master must resolve the pending even \
+         with no device→master mapping in the DB"
+    );
+
+    // Pass outcome applied: last_verified set, status stays Alive.
+    let updated = db
+        .get_placement(&block_id, &holder_id)
+        .unwrap()
+        .expect("placement exists after Pass");
+    assert!(
+        updated.last_verified.is_some(),
+        "Pass outcome must set last_verified — proving the response was verified, not dropped"
+    );
+    assert_eq!(updated.status, PlacementStatus::Alive);
+}
+
 // ─── A3 (P1-4 / M1): owner-side idempotency for a re-delivered PosResponse ──────
 
 /// A3: under the reliable-delivery design the holder re-publishes the SAME PosResponse
@@ -2494,6 +2618,7 @@ async fn pos_response_duplicate_after_consume_is_dropped() {
                 expected_chain_hash,
                 issued_at: Timestamp::now(),
                 challenge_id,
+                holder_master,
             },
         );
     }
@@ -2623,6 +2748,7 @@ async fn pos_response_from_wrong_identity_is_ignored() {
                 expected_chain_hash,
                 issued_at: Timestamp::now(),
                 challenge_id,
+                holder_master,
             },
         );
     }
@@ -2757,6 +2883,7 @@ async fn pos_pending_timeout_is_14d_2h_not_7d_1h() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: now,
                 challenge_id: [0xE1u8; 16],
+                holder_master: IdentityPub(holder_fresh.0),
             },
         );
         // Stale: issued 5 seconds ago — at threshold=1s, this IS timed out.
@@ -2769,6 +2896,7 @@ async fn pos_pending_timeout_is_14d_2h_not_7d_1h() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp(now.0.saturating_sub(5)),
                 challenge_id: [0xE2u8; 16],
+                holder_master: IdentityPub(holder_stale.0),
             },
         );
     }
@@ -2777,10 +2905,9 @@ async fn pos_pending_timeout_is_14d_2h_not_7d_1h() {
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
 
     // time_scale = POS_CHALLENGE_PENDING_TIMEOUT_SECS → threshold = 1 second.
-    // This directly pins the 14d2h constant: if code ever reverts to POS_TIMEOUT_SECS (7d),
-    // POS_TIMEOUT_SECS / POS_CHALLENGE_PENDING_TIMEOUT_SECS < 1 → threshold rounds to 1s still,
-    // but the constant used in the impl would differ. We verify POS_CHALLENGE_PENDING_TIMEOUT_SECS
-    // equals the expected 14d2h value (= 7d + 7d + 2h) explicitly below.
+    // This directly pins the 14d2h constant: the impl divides POS_CHALLENGE_PENDING_TIMEOUT_SECS
+    // by time_scale (floored at 1s), so at this scale the threshold is exactly 1s. We verify
+    // POS_CHALLENGE_PENDING_TIMEOUT_SECS equals the expected 14d2h value (= 7d + 7d + 2h) below.
     let expected_14d2h: u64 = 7 * 24 * 3600 + 7 * 24 * 3600 + 2 * 3600;
     assert_eq!(
         POS_CHALLENGE_PENDING_TIMEOUT_SECS, expected_14d2h,

@@ -3928,6 +3928,62 @@ async fn pos_challenge_within_holding_bounds_is_not_rejected() {
     );
 }
 
+/// CS-POS-4: a signed challenge with empty `esi_ranges` (requested == 0) must be rejected
+/// by the SM-1 guard. Without the reject, `0 <= held` passes the bound check and the
+/// empty expansion reaches `compute_chain_hash`, which returns `ChainHashEmptyInput` →
+/// an Err that the poll loop logs at error level on EVERY re-serve until the entry's TTL.
+/// The guard now drops it cleanly (`OversizedChallenge`) — no compute, no error spam.
+#[tokio::test]
+async fn pos_challenge_with_empty_esi_ranges_is_rejected() {
+    use viaticum_core::messages::build_pos_hash_challenge;
+
+    use super::pos::PosResponder;
+    use crate::daemon::processor::ProcessorError;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+
+    let owner_key = ed25519_dalek::SigningKey::from_bytes(&[0x15u8; 32]);
+    let owner = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0x37);
+
+    db.upsert_holding(&HoldingRecord {
+        source_block_id: block_id,
+        owner_id: owner,
+        esi_ranges: vec![(0, 3)],
+        importance: 0.5,
+        total_bytes: 3,
+        status: HoldingStatus::Active,
+        received_at: Timestamp::now(),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    })
+    .unwrap();
+
+    let master_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
+    let responder = PosResponder::new(db, holdings_dir.path().to_path_buf(), master_signing_key);
+
+    // VALID signature, but empty esi_ranges → requested == 0.
+    let challenge = build_pos_hash_challenge(
+        [0x59u8; 16],
+        block_id,
+        vec![],
+        Timestamp::now(),
+        None,
+        &owner_key,
+    );
+
+    let result = responder.compute_response(owner, challenge).await;
+    assert!(
+        matches!(
+            result,
+            Err(ProcessorError::OversizedChallenge { requested: 0, .. })
+        ),
+        "empty esi_ranges (requested == 0) must be rejected as malformed (clean drop), \
+         not feed an empty input to compute_chain_hash; got {result:?}"
+    );
+}
+
 // ─── T-12: Owner-addr propagation (Bug-A remainder) ──────────────────────────
 
 /// T-12 AC: `on_peer_identified` persists listen_addrs to the PeerRecord for an

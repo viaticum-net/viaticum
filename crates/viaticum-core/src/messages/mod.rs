@@ -72,7 +72,7 @@ pub struct PosHashChallengeMsg {
 
 /// Holder → Owner. Response to PosHashChallengeMsg.
 /// chain_hash = SHA256-chain over bound symbol data for all assigned ESIs (sorted ascending):
-///   h0 = [0u8; 32], h_i = SHA256(h_{i-1} || symbol[esi_i]), chain_hash = h_n
+///   h0 = SHA256(challenge_id), h_i = SHA256(h_{i-1} || symbol[esi_i]), chain_hash = h_n
 ///
 /// sig covers: b"pr" (2) || challenge_id (16) || source_block_id (32) || chain_hash (32)
 ///   || timestamp_be (8) = 90 bytes. Signed by the HOLDER's master identity key.

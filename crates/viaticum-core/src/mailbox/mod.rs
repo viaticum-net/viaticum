@@ -276,7 +276,21 @@ impl MailboxEngine {
     /// Returns `MailboxError::TooLarge` if serialized entry exceeds MAX_ENTRY_BYTES.
     /// Returns `MailboxError::QuotaExceeded` if target is already at MAX_MAILBOX_BYTES_PER_PEER.
     /// Returns `MailboxError::Duplicate` if msg_id already stored for this target+class.
+    ///
+    /// CS-POS-2: `expires_at` is sender-controlled. A signed challenge with
+    /// `expires_at = u64::MAX` would otherwise be stored forever (the sweep only
+    /// compares against `now`) and re-served to the holder on EVERY poll → unbounded
+    /// recompute + a permanent store squat. The postman clamps `expires_at` to at most
+    /// `now + class.default_ttl_secs()` (the per-class RAW TTL). Clamping by the raw TTL
+    /// is safe under time-scale acceleration: the publisher already scales the TTL DOWN,
+    /// so a scaled `expires_at` is always below the raw cap and `min()` leaves it
+    /// unchanged — the clamp only caps the MAXIMUM, never shortens a legitimate entry.
     pub fn store(&self, entry: &MailboxEntry, now_secs: u64) -> Result<(), MailboxError> {
+        let mut entry = entry.clone();
+        let max_expires_at = now_secs.saturating_add(entry.class.default_ttl_secs());
+        entry.expires_at = entry.expires_at.min(max_expires_at);
+        let entry = &entry;
+
         let size = entry.serialized_size();
         if size > class_config::MAX_ENTRY_BYTES {
             return Err(MailboxError::TooLarge {

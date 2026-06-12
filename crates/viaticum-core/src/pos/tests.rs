@@ -135,8 +135,11 @@ fn due_challenges_returns_overdue_placement() {
     assert_eq!(entries.len(), 1);
 }
 
+/// CS-POS-9: a due placement yields one entry identifying its (block, holder). The
+/// entry no longer carries an expanded ESI list — the scheduler builds the challenge
+/// from the placement's own `esi_ranges`.
 #[test]
-fn due_challenges_available_esis_match_ranges() {
+fn due_challenges_entry_identifies_block_and_holder() {
     let bid = block_id(1);
     let hid = holder(2);
     let placement = make_placement(bid, hid, vec![(100, 3)]);
@@ -145,8 +148,8 @@ fn due_challenges_available_esis_match_ranges() {
 
     let entries = due_challenges(&[placement], &last_verified, now, |_| 0.5, 1);
     assert_eq!(entries.len(), 1);
-    let available = &entries[0].available_esis;
-    assert_eq!(available, &[100, 101, 102]);
+    assert_eq!(entries[0].source_block_id, bid);
+    assert_eq!(entries[0].holder_id, hid);
 }
 
 // ─── outcome_from_verify ─────────────────────────────────────────────────────

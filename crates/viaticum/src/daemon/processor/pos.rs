@@ -130,6 +130,24 @@ impl PosResponder {
             }
             requested = requested.saturating_add(u64::from(count));
         }
+        // CS-POS-4: an empty/zero esi_ranges (requested == 0) passes the `requested > held`
+        // check below (0 <= held) but would then feed `compute_chain_hash` an empty input →
+        // `ChainHashEmptyInput` Err on EVERY poll until the entry's TTL (~168 re-serves) from
+        // one signed junk challenge. A legitimate challenge always covers ≥1 ESI, so reject
+        // it here as malformed — same clean-drop treatment as the oversized case (no Nack, no
+        // response, surfaced as `OversizedChallenge` which the poll handler drops cleanly).
+        if requested == 0 {
+            warn!(
+                block_id = %block_id,
+                challenger = %owner_id,
+                "processor: PosHashChallenge has empty esi_ranges (0 ESIs) — dropping (malformed)"
+            );
+            return Err(ProcessorError::OversizedChallenge {
+                block_id,
+                requested,
+                held,
+            });
+        }
         if requested > u64::from(held) {
             warn!(
                 block_id = %block_id,

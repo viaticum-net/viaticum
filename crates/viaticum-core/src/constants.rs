@@ -128,8 +128,10 @@ pub const DEFAULT_DISK_RESERVE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 // === PoS (Proof of Storage) ===
 
-/// PoS response timeout (7 days, also relay TTL).
-pub const POS_TIMEOUT_SECS: u64 = 7 * 24 * 3600;
+// CS-POS-11: the former `POS_TIMEOUT_SECS` (7d) is removed. The pending-challenge
+// timeout is `POS_CHALLENGE_PENDING_TIMEOUT_SECS` (≈14d 2h, defined below); the
+// per-class mailbox TTL is `mailbox::class_config::POS_CHALLENGE_TTL` (7d). Nothing
+// referenced `POS_TIMEOUT_SECS` in code — only stale doc comments.
 
 /// Base PoS challenges per holder per week.
 pub const POS_BASE_CHALLENGES_PER_WEEK: u32 = 1;

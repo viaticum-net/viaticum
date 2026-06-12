@@ -809,3 +809,84 @@ fn scaled_ttl_treats_zero_time_scale_as_one() {
     let pos_ttl = 7 * 24 * 3600;
     assert_eq!(scaled_ttl_secs(pos_ttl, 0), pos_ttl);
 }
+
+// ============================================================
+// CS-POS-2: store clamps sender-controlled expires_at to the class TTL
+// ============================================================
+
+/// A signed entry with an over-long `expires_at` (e.g. `u64::MAX`) must be capped at
+/// `now + class.default_ttl_secs()` at store time, so a postman cannot be forced to
+/// keep + re-serve it forever (unbounded recompute + permanent store squat). A normal
+/// in-bounds `expires_at` (whether unscaled or time-scale-scaled) must round-trip
+/// unchanged — the clamp only caps the MAXIMUM.
+#[test]
+fn store_clamps_expires_at_to_class_ttl() {
+    let db = test_db();
+    let engine = MailboxEngine::new(db);
+    let target = make_target(7);
+    let now = 1_000_000u64;
+    let class = MailboxClass::PosChallenge;
+    let raw_ttl = class.default_ttl_secs();
+
+    // 1) Over-long expires_at (u64::MAX) → clamped to now + raw class TTL.
+    let mut forever = make_entry(target, make_msg_id(1), class, b"forever".to_vec(), now, 0);
+    forever.expires_at = u64::MAX;
+    engine.store(&forever, now).expect("store forever failed");
+    let fetched = engine.fetch(&target, now).expect("fetch failed");
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(
+        fetched[0].expires_at,
+        now + raw_ttl,
+        "over-long expires_at must be clamped to now + class TTL"
+    );
+
+    // 2) A normal (unscaled, in-bounds) entry round-trips unchanged.
+    let normal_ttl = raw_ttl / 2;
+    let normal = make_entry(
+        target,
+        make_msg_id(2),
+        class,
+        b"normal".to_vec(),
+        now,
+        normal_ttl,
+    );
+    let normal_expires = normal.expires_at;
+    engine.store(&normal, now).expect("store normal failed");
+    let fetched = engine.fetch(&target, now).expect("fetch failed");
+    let got = fetched
+        .iter()
+        .find(|e| e.msg_id == make_msg_id(2))
+        .expect("normal entry present");
+    assert_eq!(
+        got.expires_at, normal_expires,
+        "in-bounds expires_at must be left unchanged by the clamp"
+    );
+
+    // 3) A scaled (smaller-than-raw) entry — as the publisher produces under
+    //    time-scale acceleration — also round-trips unchanged: scaled < raw, so the
+    //    `min()` keeps the scaled value.
+    let scaled_ttl = scaled_ttl_secs(raw_ttl, 3600);
+    let scaled = make_entry(
+        target,
+        make_msg_id(3),
+        class,
+        b"scaled".to_vec(),
+        now,
+        scaled_ttl,
+    );
+    let scaled_expires = scaled.expires_at;
+    assert!(
+        scaled_expires < now + raw_ttl,
+        "scaled must be below raw cap"
+    );
+    engine.store(&scaled, now).expect("store scaled failed");
+    let fetched = engine.fetch(&target, now).expect("fetch failed");
+    let got = fetched
+        .iter()
+        .find(|e| e.msg_id == make_msg_id(3))
+        .expect("scaled entry present");
+    assert_eq!(
+        got.expires_at, scaled_expires,
+        "scaled (in-bounds) expires_at must be left unchanged by the clamp"
+    );
+}
