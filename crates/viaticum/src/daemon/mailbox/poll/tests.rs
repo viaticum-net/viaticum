@@ -109,9 +109,14 @@ async fn poll_self_pointer_own_not_stored_in_db() {
     );
 }
 
-/// SelfPointer with target != my_master_pub IS stored in the DB (postman role).
+/// CS-MBX-3: a SelfPointer whose `target != my_master_pub` arriving in a poll response
+/// is NEVER stored. A poll only returns OUR own mail, so a foreign-target SelfPointer is
+/// a misrouted/hostile postman reply. The old code stored it directly (bypassing the
+/// candidate-set admission gate and signature verification), letting a hostile read-fanout
+/// postman inject arbitrary unverified entries for third-party targets into our DB. The
+/// fix drops it with a warn, writing nothing.
 #[tokio::test]
-async fn poll_foreign_self_pointer_is_stored() {
+async fn poll_does_not_store_foreign_self_pointer() {
     use std::sync::{Arc, Mutex};
     use viaticum_core::system_state::SelfPointer;
 
@@ -125,14 +130,14 @@ async fn poll_foreign_self_pointer_is_stored() {
 
     super::dispatch_self_pointer(&db, &my_master, &current_pointer, entry, now_secs);
 
-    // Mailbox DB should have the entry stored for foreign_target.
+    // Mailbox DB must have NOTHING stored for the foreign target — the foreign-store
+    // path was removed (CS-MBX-3).
     let entries = db
         .mailbox_list_for_target(&foreign_target, now_secs)
         .expect("list");
-    assert_eq!(
-        entries.len(),
-        1,
-        "foreign SelfPointer should be stored in mailbox DB"
+    assert!(
+        entries.is_empty(),
+        "foreign-target SelfPointer must NOT be stored from the poll path (CS-MBX-3)"
     );
 }
 
@@ -187,8 +192,9 @@ async fn poll_drop_notice_no_sender_does_not_panic() {
     let now_secs = now.0;
 
     // Entry with no sender — dispatch_drop_notice exits early before verifying.
+    let my_master = make_identity(0xAA);
     let entry = MailboxEntry {
-        target: make_identity(0xAA),
+        target: my_master,
         msg_id: [2u8; 16],
         class: MailboxClass::DropNotice,
         payload_version: 1,
@@ -199,7 +205,7 @@ async fn poll_drop_notice_no_sender_does_not_panic() {
     };
 
     // Should not panic.
-    super::dispatch_drop_notice(&handler, entry);
+    super::dispatch_drop_notice(&handler, &my_master, entry);
 }
 
 /// DropNotice entry with invalid payload is dropped gracefully (no panic).
@@ -212,8 +218,9 @@ async fn poll_drop_notice_bad_payload_does_not_panic() {
         Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
 
     let now_secs = Timestamp::now().0;
+    let my_master = make_identity(0xAA);
     let entry = MailboxEntry {
-        target: make_identity(0xAA),
+        target: my_master,
         msg_id: [3u8; 16],
         class: MailboxClass::DropNotice,
         payload_version: 1,
@@ -224,7 +231,7 @@ async fn poll_drop_notice_bad_payload_does_not_panic() {
     };
 
     // Should not panic.
-    super::dispatch_drop_notice(&handler, entry);
+    super::dispatch_drop_notice(&handler, &my_master, entry);
 }
 
 /// Helper: create a deterministic Ed25519 signing key from a seed byte.
@@ -360,7 +367,7 @@ async fn drop_notice_batch_dispatch_marks_each_placement_lost() {
     let handler: Arc<dyn super::DropNoticeHandler> =
         Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
 
-    super::dispatch_drop_notice(&handler, entry);
+    super::dispatch_drop_notice(&handler, &owner_master, entry);
 
     // Both placements must now be Lost.
     let p1 = db
@@ -510,7 +517,7 @@ async fn drop_notice_immediate_deadline_triggers_repair_now() {
     let handler: Arc<dyn super::DropNoticeHandler> =
         Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
 
-    super::dispatch_drop_notice(&handler, entry);
+    super::dispatch_drop_notice(&handler, &owner_master, entry);
 
     // Placement must be Lost.
     let p = db
@@ -641,7 +648,7 @@ async fn drop_notice_forged_signature_is_rejected() {
     let handler: Arc<dyn super::DropNoticeHandler> =
         Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
 
-    super::dispatch_drop_notice(&handler, entry);
+    super::dispatch_drop_notice(&handler, &owner_master, entry);
 
     // Placement must remain Alive — forged notice must be rejected.
     let p = db
@@ -721,7 +728,7 @@ async fn delete_request_dispatch_marks_holding_for_delete() {
     let handler =
         Arc::new(ProcessorDeleteHandler::new(db.clone())) as Arc<dyn DeleteMailboxHandler>;
 
-    super::dispatch_delete_request(&handler, entry).await;
+    super::dispatch_delete_request(&handler, &make_identity(0xFF), entry).await;
 
     let holding = db
         .get_holding(&block_id, &owner_master)
@@ -775,7 +782,7 @@ async fn delete_request_forged_signature_rejected() {
     let handler =
         Arc::new(ProcessorDeleteHandler::new(db.clone())) as Arc<dyn DeleteMailboxHandler>;
 
-    super::dispatch_delete_request(&handler, entry).await;
+    super::dispatch_delete_request(&handler, &make_identity(0xFF), entry).await;
 
     let holding = db
         .get_holding(&block_id, &real_owner)
@@ -836,7 +843,7 @@ async fn delete_request_stale_timestamp_still_honored() {
     let handler =
         Arc::new(ProcessorDeleteHandler::new(db.clone())) as Arc<dyn DeleteMailboxHandler>;
 
-    super::dispatch_delete_request(&handler, entry).await;
+    super::dispatch_delete_request(&handler, &make_identity(0xFF), entry).await;
 
     let holding = db
         .get_holding(&block_id, &owner_master)
@@ -880,7 +887,7 @@ async fn delete_request_no_sender_is_dropped_gracefully() {
         Arc::new(ProcessorDeleteHandler::new(db.clone())) as Arc<dyn DeleteMailboxHandler>;
 
     // Should not panic.
-    super::dispatch_delete_request(&handler, entry).await;
+    super::dispatch_delete_request(&handler, &make_identity(0xFF), entry).await;
 
     // Holding should remain Active — early-exit path taken.
     let holding = db
@@ -966,7 +973,7 @@ async fn revocation_dispatch_marks_device_revoked() {
     let handler =
         Arc::new(ProcessorRevocationHandler::new(db.clone())) as Arc<dyn RevocationMailboxHandler>;
 
-    super::dispatch_revocation(&handler, entry).await;
+    super::dispatch_revocation(&handler, &make_identity(0xFF), entry).await;
 
     // PeerRecord for device_id must now have the revoked pub key.
     let peer = db
@@ -1010,7 +1017,7 @@ async fn revocation_forged_signature_rejected() {
     let handler =
         Arc::new(ProcessorRevocationHandler::new(db.clone())) as Arc<dyn RevocationMailboxHandler>;
 
-    super::dispatch_revocation(&handler, entry).await;
+    super::dispatch_revocation(&handler, &make_identity(0xFF), entry).await;
 
     // PeerRecord must have NO revoked keys — forged cert must be rejected.
     let peer = db
@@ -1053,7 +1060,7 @@ async fn revocation_unknown_master_ignored() {
         Arc::new(ProcessorRevocationHandler::new(db.clone())) as Arc<dyn RevocationMailboxHandler>;
 
     // Must not panic — unknown master is silently ignored.
-    super::dispatch_revocation(&handler, entry).await;
+    super::dispatch_revocation(&handler, &make_identity(0xFF), entry).await;
 
     // No peer record should have been created.
     assert!(
@@ -1083,7 +1090,201 @@ async fn revocation_no_sender_is_dropped_gracefully() {
         Arc::new(ProcessorRevocationHandler::new(db.clone())) as Arc<dyn RevocationMailboxHandler>;
 
     // Must not panic.
-    super::dispatch_revocation(&handler, entry).await;
+    super::dispatch_revocation(&handler, &make_identity(0xFF), entry).await;
+}
+
+// ─── CS-DEL-7 / SM-8: foreign-target poll-dispatch guards ─────────────────────
+// A poll only ever returns OUR own mail, so any entry whose target != my_master_pub
+// is a misrouted/hostile postman reply. The per-class dispatch arms drop it with a
+// warn and apply no effect (defense-in-depth; effects are already sig+relationship
+// gated, but the routing invariant is now enforced consistently with PosChallenge).
+
+/// CS-DEL-7: a DeleteRequest addressed to a DIFFERENT master is dropped — the holding
+/// is never marked for deletion even though the signature would verify.
+#[tokio::test]
+async fn delete_request_dispatch_drops_entry_not_addressed_to_us() {
+    let db = Db::open_in_memory().expect("db");
+    let owner_key = make_signing_key(0x66);
+    let owner_master = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = SourceBlockId([0xEF; 32]);
+
+    make_holding(&db, block_id, owner_master, HoldingStatus::Active);
+
+    // Entry target is a foreign master (0xBB), but we are 0xAA.
+    let foreign_target = make_identity(0xBB);
+    let my_master = make_identity(0xAA);
+    let entry = make_delete_entry(foreign_target, owner_master, &owner_key, block_id);
+
+    let handler =
+        Arc::new(ProcessorDeleteHandler::new(db.clone())) as Arc<dyn DeleteMailboxHandler>;
+
+    super::dispatch_delete_request(&handler, &my_master, entry).await;
+
+    // Holding must remain Active — the foreign-target entry was dropped before handling.
+    let holding = db
+        .get_holding(&block_id, &owner_master)
+        .expect("db ok")
+        .expect("exists");
+    assert_eq!(
+        holding.status,
+        HoldingStatus::Active,
+        "DeleteRequest not addressed to us must be dropped (CS-DEL-7)"
+    );
+}
+
+/// CS-DEL-7: a Revocation addressed to a DIFFERENT master is dropped — no device key is
+/// revoked even though the certs would verify.
+#[tokio::test]
+async fn revocation_dispatch_drops_entry_not_addressed_to_us() {
+    let db = Db::open_in_memory().expect("db");
+
+    let master_key = ed25519_dalek::SigningKey::from_bytes(&[0x40u8; 32]);
+    let master_pub = IdentityPub(master_key.verifying_key().to_bytes());
+    let device_id = viaticum_core::types::DeviceId([0x41u8; 32]);
+
+    register_peer(&db, device_id, master_pub);
+
+    let broadcast = make_revocation_broadcast(&master_key, device_id);
+    let payload = to_cbor(&broadcast).expect("encode");
+    let now = Timestamp::now().0;
+    // Entry target is a foreign master (0xBB), but we are 0xAA.
+    let entry = MailboxEntry {
+        target: make_identity(0xBB),
+        msg_id: [0xE4u8; 16],
+        class: MailboxClass::Revocation,
+        payload_version: 1,
+        payload,
+        expires_at: now + 86400 * 30,
+        stored_at: now,
+        sender: Some(master_pub),
+    };
+
+    let handler =
+        Arc::new(ProcessorRevocationHandler::new(db.clone())) as Arc<dyn RevocationMailboxHandler>;
+
+    super::dispatch_revocation(&handler, &make_identity(0xAA), entry).await;
+
+    // No device key must be revoked — the foreign-target entry was dropped.
+    let peer = db
+        .get_peer(&device_id)
+        .expect("db ok")
+        .expect("peer exists");
+    assert!(
+        peer.revoked_device_pub_keys.is_empty(),
+        "Revocation not addressed to us must be dropped (CS-DEL-7)"
+    );
+}
+
+/// CS-DEL-7: a DropNotice addressed to a DIFFERENT master is dropped — the placement is
+/// never marked Lost even though the holder signature would verify.
+#[tokio::test]
+async fn drop_notice_dispatch_drops_entry_not_addressed_to_us() {
+    use viaticum_core::types::{PeerRecord, SourceBlockRecord, SourceBlockStatus, SourceBlockType};
+
+    let db = Db::open_in_memory().expect("db");
+
+    let holder_signing_key = make_signing_key(0xF1);
+    let holder_master = IdentityPub(holder_signing_key.verifying_key().to_bytes());
+    let holder_device = DeviceId(holder_signing_key.verifying_key().to_bytes());
+    let owner_master = make_identity(0xAA);
+
+    let now = Timestamp::now();
+    let peer = PeerRecord {
+        device_id: holder_device,
+        master_identity: holder_master,
+        trust_p: 0.5,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: now,
+        last_seen: now,
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: 0.1,
+        last_avail_sample: 0,
+    };
+    db.upsert_peer(&peer).expect("upsert peer");
+    db.set_master_for_device(&holder_device, &holder_master)
+        .expect("set master");
+
+    let block_id = SourceBlockId([0xF1; 32]);
+    let block = SourceBlockRecord {
+        block_id,
+        k: 6,
+        t: 512,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: now,
+        encrypted_size: None,
+        n: Some(10),
+        overhead: Some(1.5),
+        drop_notice_sent_at: None,
+        importance: 1.0,
+        current_alive: 1,
+        current_reliability: 0.9,
+        target_reliability: 0.99,
+    };
+    db.upsert_source_block(&block).expect("insert block");
+
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id: holder_device,
+        file_id: viaticum_core::types::FileId(1),
+        esi_ranges: vec![(0, 5)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Alive,
+        last_verified: None,
+        placed_at: now,
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).expect("upsert placement");
+
+    let batch = SymbolDropNoticeBatchMsg {
+        v: 1,
+        notices: vec![build_signed_symbol_drop_notice(
+            block_id,
+            vec![(0, 5)],
+            Timestamp(now.0 + 86400 * 14),
+            now,
+            &holder_signing_key,
+        )],
+    };
+    let payload = to_cbor(&batch).expect("encode");
+
+    // Entry target is the owner (0xAA), but we dispatch as a DIFFERENT master (0xBB).
+    let entry = MailboxEntry {
+        target: owner_master,
+        msg_id: [0xF1u8; 16],
+        class: MailboxClass::DropNotice,
+        payload_version: 1,
+        payload,
+        expires_at: now.0 + 86400 * 14,
+        stored_at: now.0,
+        sender: Some(holder_master),
+    };
+
+    let (repair_tx, mut repair_rx) = mpsc::channel::<RepairTrigger>(16);
+    let handler: Arc<dyn super::DropNoticeHandler> =
+        Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
+
+    super::dispatch_drop_notice(&handler, &make_identity(0xBB), entry);
+
+    // Placement must remain Alive and no repair wake fired — entry dropped as misrouted.
+    let p = db
+        .get_placement(&block_id, &holder_device)
+        .expect("db ok")
+        .expect("exists");
+    assert_eq!(
+        p.status,
+        PlacementStatus::Alive,
+        "DropNotice not addressed to us must be dropped (CS-DEL-7)"
+    );
+    assert!(
+        repair_rx.try_recv().is_err(),
+        "no repair wake for a misrouted DropNotice (CS-DEL-7)"
+    );
 }
 
 // ─── E1: poll cadence scales with time_scale ──────────────────────────────────

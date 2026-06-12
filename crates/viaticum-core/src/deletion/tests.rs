@@ -377,6 +377,14 @@ fn should_vacuum_one_invalid_of_two() {
 }
 
 #[test]
+fn should_vacuum_returns_false_for_zero_files() {
+    // CS-DEL-9: should_vacuum is a public API; total_files == 0 must return false,
+    // not panic (an empty pack has nothing to vacuum).
+    let engine = DeletionEngine::new();
+    assert!(!engine.should_vacuum(0, 0));
+}
+
+#[test]
 fn process_cooldowns_vacuum_triggered_for_stale_pack() {
     let engine = DeletionEngine::new();
     let bid1 = block_id(1);

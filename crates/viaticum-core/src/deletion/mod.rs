@@ -286,9 +286,14 @@ impl DeletionEngine {
     ///
     /// Formula: `invalid_files as f64 / total_files as f64 > VACUUM_INVALID_THRESHOLD`
     ///
-    /// Panics if `total_files == 0`.
+    /// CS-DEL-9: returns `false` for `total_files == 0` (an empty pack has nothing to
+    /// vacuum) rather than asserting. Callers already `continue` on a zero-entry pack,
+    /// so this branch is unreachable in the current flow, but a public API should not
+    /// panic on its input.
     pub fn should_vacuum(&self, total_files: u32, invalid_files: u32) -> bool {
-        assert!(total_files > 0, "should_vacuum called with total_files=0");
+        if total_files == 0 {
+            return false;
+        }
         invalid_files as f64 / total_files as f64 > VACUUM_INVALID_THRESHOLD
     }
 }

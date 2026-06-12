@@ -1008,7 +1008,6 @@ impl Scheduler {
                     // 2..n forever once the first holder's publish set it, leaving their
                     // data un-deleted and the block stuck in Deleting. Each action that
                     // reaches this arm corresponds to a holder that still needs the notice.
-                    let source_block = self.db.get_source_block(&source_block_id).ok().flatten();
 
                     // Build signed DeleteMsg and publish via mailbox bus (T-13b-1).
                     let delete_msg = viaticum_core::messages::build_delete_msg(
@@ -1093,11 +1092,17 @@ impl Scheduler {
                     // Transition THIS holder's placement → Deleting; promote the source
                     // block Active/Stale → Deleting (so the engine's Deleting-branch keeps
                     // emitting SendDropNotice for the remaining non-Deleting placements).
+                    //
+                    // CS-DEL-6 (N13): both reads happen AFTER the awaited publish, so the
+                    // txn below rewrites a fresh copy. Reading source_block before the
+                    // publish would let a concurrent writer (e.g. current_alive recompute)
+                    // during the publish RTT be clobbered by this stale-then-rewritten copy.
                     let placement = self
                         .db
                         .get_placement(&source_block_id, &holder_id)
                         .ok()
                         .flatten();
+                    let source_block = self.db.get_source_block(&source_block_id).ok().flatten();
 
                     let mut committed = false;
                     if placement.is_some() || source_block.is_some() {

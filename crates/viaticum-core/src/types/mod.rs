@@ -94,7 +94,10 @@ impl Timestamp {
     }
 
     pub fn add_secs(self, secs: u64) -> Self {
-        Timestamp(self.0 + secs)
+        // CS-DEL-8: saturating add (defense-in-depth). Operands are wall-clock plus
+        // bounded cooldowns/TTLs, so overflow is not realistic and not attacker-
+        // controlled, but a saturating add cannot silently wrap past u64::MAX.
+        Timestamp(self.0.saturating_add(secs))
     }
 
     pub fn add_weeks(self, weeks: u64) -> Self {

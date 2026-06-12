@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use viaticum_core::constants::MAILBOX_POLL_INTERVAL_SECS;
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::{MailboxClass, MailboxEngine, MailboxEntry};
+use viaticum_core::mailbox::{MailboxClass, MailboxEntry};
 use viaticum_core::messages::{
     PosHashResponseMsg, SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, to_cbor,
 };
@@ -166,7 +166,7 @@ pub(crate) async fn dispatch_entry(
             dispatch_self_pointer(db, my_master_pub, current_pointer, entry, now_secs);
         }
         MailboxClass::DropNotice => {
-            dispatch_drop_notice(drop_handler, entry);
+            dispatch_drop_notice(drop_handler, my_master_pub, entry);
         }
         MailboxClass::Generic => {
             // P1-10: Generic has NO dispatch handler by design — there is currently no
@@ -183,10 +183,10 @@ pub(crate) async fn dispatch_entry(
             );
         }
         MailboxClass::DeleteRequest => {
-            dispatch_delete_request(delete_handler, entry).await;
+            dispatch_delete_request(delete_handler, my_master_pub, entry).await;
         }
         MailboxClass::Revocation => {
-            dispatch_revocation(revocation_handler, entry).await;
+            dispatch_revocation(revocation_handler, my_master_pub, entry).await;
         }
     }
 }
@@ -390,7 +390,14 @@ pub(crate) fn dispatch_pos_response(
 ///
 /// W-2: if entry.target == my_master_pub, verify and update in-memory current_pointer;
 /// do NOT store in mailbox DB.
-/// If entry.target != my_master_pub, we are the postman — store in mailbox DB.
+///
+/// CS-MBX-3: a poll only ever returns OUR own mail (`router.poll(&my_master_pub, ...)`),
+/// so a SelfPointer with `target != my_master_pub` in a poll response is never legitimately
+/// ours to store. We drop it with a warn. The previous code stored such foreign-target
+/// entries DIRECTLY via `MailboxEngine::store`, bypassing both the candidate-set
+/// `should_store()` gate (the real postman path's admission check) AND `verify_self_pointer`
+/// — letting a hostile read-fanout postman inject arbitrary unverified entries for
+/// third-party targets into our local mailbox DB (disk/quota amplification + pollution).
 ///
 /// T-8: The `current_pointer` handle is shared with `run_periodic_push`. When the node
 /// re-learns its own pointer from the candidate-set (restart-recovery), we update the
@@ -398,11 +405,14 @@ pub(crate) fn dispatch_pos_response(
 /// if the incoming generation is strictly greater than what we have, preventing regression
 /// to an older pointer.
 pub(crate) fn dispatch_self_pointer(
-    db: &Db,
+    // CS-MBX-3: `db`/`now_secs` were only used by the removed foreign-store branch.
+    // Kept in the signature (prefixed `_`) so the poll-loop's resource threading and
+    // the call sites stay unchanged; a poll never yields a foreign-target entry to store.
+    _db: &Db,
     my_master_pub: &IdentityPub,
     current_pointer: &Arc<Mutex<Option<SelfPointer>>>,
     entry: MailboxEntry,
-    now_secs: u64,
+    _now_secs: u64,
 ) {
     if &entry.target == my_master_pub {
         // Own SelfPointer returned from candidate-set — verify, do NOT store (W-2).
@@ -445,25 +455,15 @@ pub(crate) fn dispatch_self_pointer(
             }
         }
     } else {
-        // Foreign SelfPointer — we are the postman. Store in mailbox DB (T-1 ops).
-        let engine = MailboxEngine::new(db.clone());
-        match engine.store(&entry, now_secs) {
-            Ok(()) | Err(viaticum_core::mailbox::MailboxError::Duplicate) => {
-                debug!(
-                    target = %entry.target,
-                    msg_id = ?entry.msg_id,
-                    "mailbox_poll: foreign SelfPointer stored"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    target = %entry.target,
-                    msg_id = ?entry.msg_id,
-                    err = %e,
-                    "mailbox_poll: failed to store foreign SelfPointer"
-                );
-            }
-        }
+        // CS-MBX-3: foreign-target SelfPointer in a poll response — never legitimately
+        // ours. Drop with warn instead of storing it (the old foreign-store path bypassed
+        // candidate-set admission and signature verification). The postman storage path
+        // is the dedicated `handle_mailbox_store`, not this poll-dispatch arm.
+        warn!(
+            msg_id = ?entry.msg_id,
+            entry_target = ?entry.target,
+            "mailbox_poll: SelfPointer not addressed to this node — dropping (routing invariant, CS-MBX-3)"
+        );
     }
 }
 
@@ -474,7 +474,25 @@ pub(crate) fn dispatch_self_pointer(
 /// calls `drop_handler.handle_drop_notice(sender, notice)`.
 ///
 /// Requires `entry.sender` to identify the holder. Warns and returns if absent.
-pub(crate) fn dispatch_drop_notice(drop_handler: &Arc<dyn DropNoticeHandler>, entry: MailboxEntry) {
+pub(crate) fn dispatch_drop_notice(
+    drop_handler: &Arc<dyn DropNoticeHandler>,
+    my_master_pub: &IdentityPub,
+    entry: MailboxEntry,
+) {
+    // SM-8 / CS-DEL-7 (defense-in-depth): we only ever poll our own mailbox, so a
+    // DropNotice that reaches dispatch must be addressed to us. Effects are already
+    // gated by holder-sig verification + a placement check, but this guard enforces
+    // the routing invariant — a buggy or hostile postman that returns a mis-targeted
+    // entry is rejected here. Mirrors `dispatch_pos_challenge`.
+    if &entry.target != my_master_pub {
+        warn!(
+            msg_id = ?entry.msg_id,
+            entry_target = ?entry.target,
+            "mailbox_poll: DropNotice not addressed to this node — dropping (routing invariant)"
+        );
+        return;
+    }
+
     let sender = match entry.sender {
         Some(s) => s,
         None => {
@@ -516,8 +534,22 @@ pub(crate) fn dispatch_drop_notice(drop_handler: &Arc<dyn DropNoticeHandler>, en
 /// payload sig). Warns and returns if absent — cannot authenticate without it.
 pub(crate) async fn dispatch_delete_request(
     delete_handler: &Arc<dyn DeleteMailboxHandler>,
+    my_master_pub: &IdentityPub,
     entry: MailboxEntry,
 ) {
+    // SM-8 / CS-DEL-7 (defense-in-depth): we only ever poll our own mailbox, so a
+    // DeleteRequest that reaches dispatch must be addressed to us. The handler already
+    // re-authenticates (owner-sig verify + holding lookup keyed on owner), but this
+    // guard enforces the routing invariant. Mirrors `dispatch_pos_challenge`.
+    if &entry.target != my_master_pub {
+        warn!(
+            msg_id = ?entry.msg_id,
+            entry_target = ?entry.target,
+            "mailbox_poll: DeleteRequest not addressed to this node — dropping (routing invariant)"
+        );
+        return;
+    }
+
     let owner_master = match entry.sender {
         Some(s) => s,
         None => {
@@ -549,8 +581,22 @@ pub(crate) async fn dispatch_delete_request(
 /// cannot authenticate without a sender identity.
 pub(crate) async fn dispatch_revocation(
     revocation_handler: &Arc<dyn RevocationMailboxHandler>,
+    my_master_pub: &IdentityPub,
     entry: MailboxEntry,
 ) {
+    // SM-8 / CS-DEL-7 (defense-in-depth): we only ever poll our own mailbox, so a
+    // Revocation that reaches dispatch must be addressed to us. The handler already
+    // verifies both certs against the revoking master, but this guard enforces the
+    // routing invariant. Mirrors `dispatch_pos_challenge`.
+    if &entry.target != my_master_pub {
+        warn!(
+            msg_id = ?entry.msg_id,
+            entry_target = ?entry.target,
+            "mailbox_poll: Revocation not addressed to this node — dropping (routing invariant)"
+        );
+        return;
+    }
+
     let revoking_master = match entry.sender {
         Some(s) => s,
         None => {
