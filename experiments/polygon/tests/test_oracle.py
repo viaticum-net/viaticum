@@ -263,5 +263,36 @@ class OracleSelfTest(unittest.TestCase):
                              "a node that never reached healthy replication must be flagged")
 
 
+    def test_rss_oscillation_not_flagged(self):
+        """RSS that bounces around a stable mean (no sustained growth) is NOT a leak,
+        even if a back-half linear fit is spuriously positive. Reproduces steady_real1
+        node-05 (RSS oscillated 57-83 MB)."""
+        wobble = [73, 74, 82, 84, 65, 66, 61, 57, 75, 70, 72, 79, 60, 68, 71, 64,
+                  77, 69, 73, 58, 80, 67, 70, 75]
+        rows = []
+        for t in range(N_TICKS):
+            rss_mb = wobble[t % len(wobble)]
+            rows.append(_healthy_row(t, "node-W", "reliable", status_ok=True, up_state="up",
+                                     ext_rss_kb=rss_mb * 1024))
+        restore = [{"label": "node-W", "name": "w0.bin", "want_hash": "h", "got_hash": "h", "status": "ok"}]
+        with tempfile.TemporaryDirectory() as d:
+            _write_fixture(d, rows, [], restore)
+            ch = _verdict(d)
+            self.assertTrue(_passed(ch["BUG-rss-bounded"]),
+                            f"oscillating RSS wrongly flagged as a leak: {ch['BUG-rss-bounded']}")
+
+    def test_rss_real_leak_flagged(self):
+        """RSS that climbs monotonically (e.g. doubles over the run) IS a leak."""
+        rows = [_healthy_row(t, "node-L", "reliable", status_ok=True, up_state="up",
+                             ext_rss_kb=200_000 + t * 8000)  # 200 MB -> ~660 MB, monotonic
+                for t in range(N_TICKS)]
+        restore = [{"label": "node-L", "name": "l0.bin", "want_hash": "h", "got_hash": "h", "status": "ok"}]
+        with tempfile.TemporaryDirectory() as d:
+            _write_fixture(d, rows, [], restore)
+            ch = _verdict(d)
+            self.assertFalse(_passed(ch["BUG-rss-bounded"]),
+                             "a monotonically climbing RSS must be flagged as a leak")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -566,17 +566,36 @@ def _backhalf_for(ctx: _Ctx, label_rows: list, attr: str, up_only: bool) -> floa
 
 
 def check_rss_bounded(ctx: _Ctx) -> CheckResult:
-    """Per-node resident memory does not grow without bound late in the run."""
+    """Per-node resident memory does not grow without bound late in the run.
+
+    A noisy RSS series oscillating around a stable mean can show a spuriously positive
+    back-half linear slope (a single upward bounce in the back half). A genuine leak
+    grows monotonically. So we require BOTH a back-half slope over threshold AND a
+    sustained magnitude trend (last-quarter mean meaningfully above first-quarter mean) —
+    oscillation around a flat mean passes, real growth fails.
+    """
     thr = float(ctx.thresholds["rss_leak_slope_kb_per_tick"])
     leaks = {}
     for label, rows in ctx.by_node.items():
+        up = [r for r in rows if r.status_ok == 1]
+        if len(up) < 8:
+            continue  # too few reachable samples to judge a trend
         slope = _backhalf_for(ctx, rows, "ext_rss_kb", up_only=True)
-        if slope > thr:
-            leaks[label] = round(slope, 2)
+        vals = [float(getattr(r, "ext_rss_kb", 0) or 0) for r in up]
+        q = max(1, len(vals) // 4)
+        first_q = sum(vals[:q]) / q
+        last_q = sum(vals[-q:]) / q
+        grew = first_q > 0 and last_q > first_q * 1.25  # >25% sustained quarter-to-quarter
+        if slope > thr and grew:
+            leaks[label] = {
+                "slope_kb_per_tick": round(slope, 2),
+                "first_q_mb": round(first_q / 1024, 1),
+                "last_q_mb": round(last_q / 1024, 1),
+            }
     return CheckResult(
         "BUG-rss-bounded",
         len(leaks) == 0,
-        "ext_rss_kb back-half slope (KB/tick)",
+        "ext_rss_kb back-half slope + sustained quarter-to-quarter growth",
         {"threshold": thr, "leaking_nodes": leaks},
     )
 

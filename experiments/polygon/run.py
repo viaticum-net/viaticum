@@ -485,6 +485,14 @@ def _run_scenario(scenario: dict, rdir: Path, binary_arg, log) -> dict:
     ok = fleet.star_connect(seed_label, members)
     log(f"[run] star-connect: {ok}/{len(members)} members reached seed {seed_label}")
 
+    # A star-connect only authenticates the SEED on each spoke. Placement needs each node
+    # to know several HOLDER candidates, which the daemon discovers + dials via Kademlia
+    # (dial_discovered_peer) — but that takes time. Without waiting, spokes start backup
+    # knowing ~1 peer and place NOTHING (only the hub, which sees everyone, places) → the
+    # whole run is degenerate. Block until every day-0 node authenticates a quorum.
+    _wait_for_discovery(fleet, [p.label for p in day0_plans],
+                        target=min(8, len(day0_plans) - 1), timeout_s=240.0, log=log)
+
     # ── 5. drive loop ────────────────────────────────────────────────────────
     fleet_start_wall = time.time()
     churn_queue = churn.build_event_queue(plans, scenario, fleet_start_wall)
@@ -572,6 +580,35 @@ def _run_scenario(scenario: dict, rdir: Path, binary_arg, log) -> dict:
         },
         "teardown": {k: td[k] for k in ("terminated", "killed") if k in td},
     }
+
+
+def _wait_for_discovery(fleet, labels, target, timeout_s, log):
+    """Block until every node authenticates >= target peers (enough holder candidates to
+    place), or timeout. A star-connect authenticates only the seed; the daemon learns +
+    dials the rest via Kademlia, which needs time. Polls peer_count_authenticated."""
+    target = max(1, int(target))
+    start = time.time()
+    while True:
+        counts = {}
+        for lab in labels:
+            st = fleet.status_json(lab) or {}
+            counts[lab] = int(st.get("peer_count_authenticated",
+                                    st.get("peer_count", 0)) or 0)
+        worst = min(counts.values()) if counts else 0
+        n_ok = sum(1 for v in counts.values() if v >= target)
+        elapsed = time.time() - start
+        if worst >= target:
+            log(f"[discovery] all {len(labels)} nodes >= {target} authenticated peers "
+                f"(worst={worst}) in {elapsed:.0f}s")
+            return
+        if elapsed >= timeout_s:
+            laggards = {k: v for k, v in sorted(counts.items()) if v < target}
+            log(f"[discovery] WARN timeout {timeout_s:.0f}s: {n_ok}/{len(labels)} nodes "
+                f"reached {target} authenticated peers; laggards={laggards}")
+            return
+        log(f"[discovery] {n_ok}/{len(labels)} nodes >= {target} peers "
+            f"(worst={worst}); waiting... ({elapsed:.0f}s)")
+        time.sleep(8.0)
 
 
 def _apply_churn_event(fleet, ev, late_plans, seed_label, content_rng,
