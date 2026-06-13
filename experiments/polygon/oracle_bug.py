@@ -593,9 +593,20 @@ def check_disk_bounded(ctx: _Ctx) -> CheckResult:
     hold_leaks = {}
     db_leaks = {}
     for label, rows in ctx.by_node.items():
-        hslope = _backhalf_for(ctx, rows, "ext_du_holdings_kb", up_only=True)
-        if hslope > hold_thr:
-            hold_leaks[label] = round(hslope, 2)
+        # Holdings only "leak" if eviction should be holding them flat — i.e. the node is
+        # AT/NEAR its quota (under pressure). Below quota there is no pressure and filling
+        # allowed space is legitimate growth, not a leak; flagging it would false-fail any
+        # no-pressure run that is still filling. db.redb is bounded by vacuum/cap
+        # regardless of pressure, so it is always checked. (A real eviction failure is
+        # caught here only once a node is at quota — exercised by the disk-pressure run.)
+        reach = [r for r in rows if r.status_ok == 1]
+        lastr = reach[-1] if reach else (rows[-1] if rows else None)
+        at_quota = bool(lastr) and lastr.effective_quota_bytes > 0 and \
+            lastr.holding_bytes >= 0.9 * lastr.effective_quota_bytes
+        if at_quota:
+            hslope = _backhalf_for(ctx, rows, "ext_du_holdings_kb", up_only=True)
+            if hslope > hold_thr:
+                hold_leaks[label] = round(hslope, 2)
         dslope = _backhalf_for(ctx, rows, "ext_du_db_redb_bytes", up_only=True)
         if dslope > db_thr:
             db_leaks[label] = round(dslope, 2)
@@ -654,16 +665,23 @@ def check_backup_liveness(ctx: _Ctx) -> CheckResult:
         if not had_own:
             continue
         owners += 1
-        # Final reachable sample (status_ok=1), else the last sample.
+        # Liveness = the backup pipeline reached healthy replication at SOME point. A node
+        # can show blocks_ok/placement_alive=0 in its FINAL reachable sample purely because
+        # its holders were churned-down at that instant (the owner's view of placement
+        # liveness drops while holders are transiently offline) — yet its data exists and
+        # restores (the no-data-loss gate proves it). We flag only a node that NEVER reached
+        # healthy replication despite owning data = a genuinely wedged backup/placement path.
         reachable = [r for r in rows if r.status_ok == 1]
-        last = reachable[-1] if reachable else (rows[-1] if rows else None)
-        if last is None:
+        if not reachable:
             continue
-        if not (last.blocks_ok > 0 and last.placement_alive > 0):
+        ever_ok = any(r.blocks_ok > 0 and r.placement_alive > 0 for r in reachable)
+        if not ever_ok:
+            last = reachable[-1]
             failures[label] = {
                 "blocks_ok": last.blocks_ok,
                 "placement_alive": last.placement_alive,
                 "backed_up_files": last.backed_up_files,
+                "note": "never reached blocks_ok>0 & placement_alive>0 in any reachable sample",
             }
     # If literally no node ever backed anything up, the run did not exercise backup —
     # that is a setup failure, not a pass.

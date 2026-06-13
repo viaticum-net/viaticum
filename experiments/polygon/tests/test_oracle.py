@@ -41,9 +41,9 @@ def _vday_at(tick):
     return (tick * SAMPLE_INTERVAL * TIME_SCALE) / 86400.0
 
 
-def _healthy_row(tick, label, archetype, status_ok, up_state):
+def _healthy_row(tick, label, archetype, status_ok, up_state, **over):
     """A TimeseriesRow with healthy values when up; daemon fields zeroed when down
-    (exactly how the collector records a down node)."""
+    (exactly how the collector records a down node). **over sets per-field overrides."""
     vday = _vday_at(tick)
     r = common.TimeseriesRow(
         tick=tick,
@@ -78,6 +78,8 @@ def _healthy_row(tick, label, archetype, status_ok, up_state):
         r.ext_du_holdings_kb = 48_000          # FLAT -> disk-bounded slope ~0
         r.ext_du_db_redb_bytes = 4_000_000
         r.ext_du_datadir_kb = 60_000
+    for k, v in over.items():
+        setattr(r, k, v)
     return r
 
 
@@ -193,6 +195,72 @@ class OracleSelfTest(unittest.TestCase):
             ch = _verdict(d)
             self.assertFalse(_passed(ch["BUG-no-data-loss"]),
                              "a hash mismatch must fail the no-data-loss gate")
+
+
+    def test_holdings_filling_under_quota_not_flagged(self):
+        """A node whose holdings du climbs steadily but stays UNDER its quota is FILLING
+        allowed space (no disk pressure) — not a leak. Eviction only acts at quota, so
+        disk-bounded must NOT flag it. (Reproduces the steady_real1 'fill vs leak' false
+        positive: holdings grew because the network kept placing, far under a 2 GB quota.)"""
+        rows = []
+        for t in range(N_TICKS):
+            rows.append(_healthy_row(t, "node-F", "reliable", status_ok=True, up_state="up",
+                                     ext_du_holdings_kb=40_000 + t * 3000,          # +3000 KB/tick
+                                     holding_bytes=30_000_000 + t * 2_000_000,      # ~148 MB at end
+                                     effective_quota_bytes=2_000_000_000))          # 2 GB — stays far under
+        restore = [{"label": "node-F", "name": "f0.bin", "want_hash": "h", "got_hash": "h", "status": "ok"}]
+        with tempfile.TemporaryDirectory() as d:
+            _write_fixture(d, rows, [], restore)
+            ch = _verdict(d)
+            self.assertTrue(_passed(ch["BUG-disk-bounded"]),
+                            f"holdings filling under quota wrongly flagged a leak: {ch['BUG-disk-bounded']}")
+
+    def test_disk_leak_at_quota_still_flagged(self):
+        """A node AT its quota whose holdings keep climbing = eviction is NOT running =
+        a real leak the check must still catch (proves the fill-vs-leak fix didn't
+        defang the real signal)."""
+        rows = []
+        for t in range(N_TICKS):
+            rows.append(_healthy_row(t, "node-Q", "reliable", status_ok=True, up_state="up",
+                                     ext_du_holdings_kb=1_900_000 + t * 3000,       # climbing
+                                     holding_bytes=1_950_000_000 + t * 1_000_000,   # AT/over the 2 GB quota
+                                     effective_quota_bytes=2_000_000_000))
+        restore = [{"label": "node-Q", "name": "q0.bin", "want_hash": "h", "got_hash": "h", "status": "ok"}]
+        with tempfile.TemporaryDirectory() as d:
+            _write_fixture(d, rows, [], restore)
+            ch = _verdict(d)
+            self.assertFalse(_passed(ch["BUG-disk-bounded"]),
+                             "holdings growing while AT quota (eviction broken) must be flagged")
+
+    def test_backup_live_if_ever_reached_healthy(self):
+        """A node that reached healthy replication mid-run but whose holders are down at
+        the churn-disrupted final sample (blocks_ok/placement_alive read 0) is NOT a
+        wedged pipeline — its data exists and restores. Liveness = EVER reached healthy."""
+        rows = []
+        for t in range(N_TICKS):
+            healthy = t < 40
+            rows.append(_healthy_row(t, "node-D", "reliable", status_ok=True, up_state="up",
+                                     blocks_ok=4 if healthy else 0,
+                                     placement_alive=10 if healthy else 0,
+                                     backed_up_files=4))
+        restore = [{"label": "node-D", "name": "d0.bin", "want_hash": "h", "got_hash": "h", "status": "ok"}]
+        with tempfile.TemporaryDirectory() as d:
+            _write_fixture(d, rows, [], restore)
+            ch = _verdict(d)
+            self.assertTrue(_passed(ch["BUG-backup-liveness"]),
+                            f"node that reached healthy then dipped at end wrongly flagged: {ch['BUG-backup-liveness']}")
+
+    def test_backup_never_placed_is_flagged(self):
+        """A node with own data that NEVER reaches healthy replication = wedged pipeline."""
+        rows = [_healthy_row(t, "node-N", "reliable", status_ok=True, up_state="up",
+                             blocks_ok=0, placement_alive=0, backed_up_files=4)
+                for t in range(N_TICKS)]
+        restore = [{"label": "node-N", "name": "n0.bin", "want_hash": "h", "got_hash": "h", "status": "ok"}]
+        with tempfile.TemporaryDirectory() as d:
+            _write_fixture(d, rows, [], restore)
+            ch = _verdict(d)
+            self.assertFalse(_passed(ch["BUG-backup-liveness"]),
+                             "a node that never reached healthy replication must be flagged")
 
 
 if __name__ == "__main__":
