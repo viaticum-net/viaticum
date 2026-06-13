@@ -1,0 +1,26 @@
+{
+  "id": "churn_departure",
+  "archetype_mix": {
+    "reliable": 0.4,
+    "nomad": 0.2,
+    "seasonal": 0.25,
+    "weekend": 0.1,
+    "freeloader": 0.05
+  },
+  "requested_nodes": 50,
+  "time_scale": 2000,
+  "duration_virtual_days": 360,
+  "warmup_virtual_days": 15,
+  "sample_interval_secs": 8,
+  "churn": [
+    {
+      "kind": "mass_depart",
+      "virtual_day": 240,
+      "fraction": 0.3,
+      "gradual": false
+    }
+  ],
+  "seed": 2026,
+  "escrow_k_factor": 0.001,
+  "source_block_size_mb": 32
+}

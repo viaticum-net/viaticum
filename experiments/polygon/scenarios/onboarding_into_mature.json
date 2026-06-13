@@ -1,0 +1,18 @@
+{
+  "id": "onboarding_into_mature",
+  "archetype_mix": {
+    "reliable": 0.7,
+    "weekend": 0.2,
+    "seasonal": 0.05,
+    "newcomer": 0.05
+  },
+  "requested_nodes": 40,
+  "time_scale": 2000,
+  "duration_virtual_days": 300,
+  "warmup_virtual_days": 60,
+  "sample_interval_secs": 8,
+  "churn": [],
+  "seed": 7,
+  "escrow_k_factor": 0.001,
+  "source_block_size_mb": 32
+}

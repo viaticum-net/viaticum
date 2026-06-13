@@ -1,0 +1,17 @@
+{
+  "id": "observational_dos_freerider",
+  "archetype_mix": {
+    "reliable": 0.6,
+    "weekend": 0.2,
+    "free_rider": 0.2
+  },
+  "requested_nodes": 50,
+  "time_scale": 2000,
+  "duration_virtual_days": 300,
+  "warmup_virtual_days": 10,
+  "sample_interval_secs": 8,
+  "churn": [],
+  "seed": 5,
+  "escrow_k_factor": 0.001,
+  "source_block_size_mb": 32
+}

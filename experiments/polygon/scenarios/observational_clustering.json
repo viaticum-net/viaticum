@@ -1,0 +1,26 @@
+{
+  "id": "observational_clustering",
+  "archetype_mix": {
+    "reliable": 0.45,
+    "weekend": 0.2,
+    "seasonal": 0.15,
+    "newcomer": 0.2
+  },
+  "requested_nodes": 90,
+  "time_scale": 2000,
+  "duration_virtual_days": 360,
+  "warmup_virtual_days": 20,
+  "sample_interval_secs": 10,
+  "churn": [
+    {
+      "kind": "mass_depart",
+      "virtual_day": 200,
+      "fraction": 0.15,
+      "gradual": true,
+      "window_virtual_days": 120
+    }
+  ],
+  "seed": 42,
+  "escrow_k_factor": 0.001,
+  "source_block_size_mb": 32
+}

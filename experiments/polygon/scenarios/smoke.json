@@ -1,0 +1,17 @@
+{
+  "id": "smoke",
+  "archetype_mix": {
+    "reliable": 0.6,
+    "weekend": 0.2,
+    "free_rider": 0.2
+  },
+  "requested_nodes": 5,
+  "time_scale": 50000,
+  "duration_virtual_days": 4,
+  "warmup_virtual_days": 1,
+  "sample_interval_secs": 4,
+  "churn": [],
+  "seed": 99,
+  "escrow_k_factor": 0.001,
+  "source_block_size_mb": 1
+}

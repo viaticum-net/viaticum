@@ -1,0 +1,19 @@
+{
+  "id": "disk_pressure_eviction",
+  "archetype_mix": {
+    "reliable": 0.45,
+    "freeloader": 0.2,
+    "hoarder": 0.2,
+    "free_rider": 0.05,
+    "nomad": 0.1
+  },
+  "requested_nodes": 50,
+  "time_scale": 2000,
+  "duration_virtual_days": 360,
+  "warmup_virtual_days": 15,
+  "sample_interval_secs": 6,
+  "churn": [],
+  "seed": 23,
+  "escrow_k_factor": 0.001,
+  "source_block_size_mb": 32
+}

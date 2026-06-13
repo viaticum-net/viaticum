@@ -1,0 +1,20 @@
+{
+  "id": "steady_fairness",
+  "archetype_mix": {
+    "reliable": 0.55,
+    "weekend": 0.15,
+    "seasonal": 0.1,
+    "nomad": 0.1,
+    "freeloader": 0.05,
+    "free_rider": 0.05
+  },
+  "requested_nodes": 60,
+  "time_scale": 2000,
+  "duration_virtual_days": 300,
+  "warmup_virtual_days": 10,
+  "sample_interval_secs": 8,
+  "churn": [],
+  "seed": 1337,
+  "escrow_k_factor": 0.001,
+  "source_block_size_mb": 32
+}
