@@ -72,6 +72,22 @@ pub const KAD_STORE_LIMIT: usize = 10240;
 /// Grace period after startup before first get_providers (allow bootstrap to complete).
 pub const KAD_INITIAL_DISCOVERY_DELAY: Duration = Duration::from_secs(15);
 
+/// Scale a real-time Kademlia cadence by the daemon's `time_scale` so peer discovery keeps
+/// pace under an accelerated (`time_scale>1`) test clock. Without this, the 5-minute
+/// real-time discovery interval fires only ~once in a minutes-long accelerated run, so
+/// non-seed nodes never discover holders and place nothing (the whole run degenerates).
+/// Floored at 1s so discovery still fires (never a zero interval). `time_scale<=1`
+/// (production) returns the base unchanged. Mirrors the scheduler/redial cadence scaling —
+/// the project's time_scale contract.
+pub fn scaled_kad_cadence(base: Duration, time_scale: u64) -> Duration {
+    let ts = time_scale.max(1);
+    if ts <= 1 {
+        base
+    } else {
+        Duration::from_secs((base.as_secs() / ts).max(1))
+    }
+}
+
 // ─── ViaticumCodec ────────────────────────────────────────────────────────────
 
 /// CBOR codec for libp2p request-response (main protocol).

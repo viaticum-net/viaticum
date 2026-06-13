@@ -13,6 +13,7 @@ use viaticum_core::types::DeviceId;
 use super::swarm_test_helpers::{get_listen_addr, make_cert, make_signing_key};
 use crate::daemon::network::swarm::{
     ProtocolEvent, SwarmConfig, SwarmHandle, ipfs_bootstrap_peers, peer_id_from_multiaddr,
+    scaled_kad_cadence,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -494,4 +495,37 @@ async fn get_closest_peers_times_out_or_empty_gracefully() {
             );
         }
     }
+}
+
+// ─── scaled_kad_cadence (discovery time_scale contract) ─────────────────────────
+
+#[test]
+fn scaled_kad_cadence_unchanged_at_production_time_scale() {
+    // Production runs at time_scale 1 (or 0, clamped to 1): discovery cadence is the base.
+    assert_eq!(
+        scaled_kad_cadence(Duration::from_secs(300), 1),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        scaled_kad_cadence(Duration::from_secs(300), 0),
+        Duration::from_secs(300)
+    );
+}
+
+#[test]
+fn scaled_kad_cadence_divides_by_time_scale() {
+    // 5-min discovery at time_scale 10 -> 30 s, so discovery keeps pace under acceleration.
+    assert_eq!(
+        scaled_kad_cadence(Duration::from_secs(300), 10),
+        Duration::from_secs(30)
+    );
+}
+
+#[test]
+fn scaled_kad_cadence_floored_at_one_second() {
+    // Heavy acceleration (300 / 30000 = 0) floors to 1 s — discovery still fires, never 0.
+    assert_eq!(
+        scaled_kad_cadence(Duration::from_secs(300), 30000),
+        Duration::from_secs(1)
+    );
 }

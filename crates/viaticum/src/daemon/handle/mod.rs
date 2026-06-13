@@ -376,7 +376,20 @@ impl DaemonHandle {
                         .network
                         .kademlia_disable_ipfs_bootstrap,
                     kad_republish_interval_override: None,
-                    kad_discovery_interval_override: None,
+                    // Under an accelerated test clock (time_scale>1) the 5-min real-time
+                    // discovery interval fires only ~once in a minutes-long run, so non-seed
+                    // nodes never discover holders and place nothing. Scale it with time_scale
+                    // so discovery keeps pace (the time_scale contract; this override also
+                    // shortens the initial discovery delay). Production (time_scale=1) = None,
+                    // unchanged.
+                    kad_discovery_interval_override: if cfg.time_scale > 1 {
+                        Some(crate::daemon::network::swarm::scaled_kad_cadence(
+                            crate::daemon::network::swarm::KAD_DISCOVERY_INTERVAL,
+                            cfg.time_scale,
+                        ))
+                    } else {
+                        None
+                    },
                     enable_relay_server: app_config.network.enable_relay_server,
                 };
                 match crate::daemon::network::swarm::SwarmHandle::start(swarm_cfg).await {
