@@ -309,11 +309,18 @@ def _print_node_plan(plans: list, log) -> None:
 def _final_restore_ledger(fleet: Fleet, ledger: list, log) -> dict:
     """At end of run, restore every honest backed-up file and compare its hash.
 
+    WEAKER SIGNAL — tier-1/local-restore sanity, NOT the no-data-loss gate. The daemon's
+    restore is by-design 2-tier (restore/mod.rs): it rebuilds a file from the owner's
+    LOCAL source first and only fetches from holders if the source is gone. In the polygon
+    the watch-dir source is ALWAYS present, so this path ALWAYS uses tier-1 (local) and
+    never validates the network copy — a node that placed zero blocks still "restores ok".
+    The TRUE no-data-loss ground truth is _dr_recover_subset (wipe + recover from holders);
+    this function only confirms the local restore pipeline + staging works end to end.
+
     `ledger` entries are dicts {label, path, hash, name}. For each, request a restore on
     the owning node, poll for the staged file under <data_dir>/restore/, hash it, and
     compare to the pre-backup original. A node that is DOWN at end of run is restarted
-    first (a restore needs a live daemon). Returns a restore-results dict the bug oracle
-    reads for the NO-DATA-LOSS hard check.
+    first (a restore needs a live daemon). Returns a restore-results dict.
 
     Data loss is judged against the recorded content hash — never the owner's optimistic
     view (mirrors local_delete_test.sh's ground-truth assertion style).
@@ -382,6 +389,160 @@ def _hash_file(path: Path, hasher_factory) -> str:
 
 
 # ----------------------------------------------------------------------------
+# DR-subset network-recoverability check (the TRUE no-data-loss ground truth).
+# ----------------------------------------------------------------------------
+
+
+def _dr_recover_subset(fleet: Fleet, ledger: list, seed_label: str, log, k: int = 2) -> dict:
+    """Wipe k nodes entirely and recover their files FROM HOLDERS via disaster recovery.
+
+    This is the load-bearing no-data-loss ground truth. `_final_restore_ledger` is a
+    WEAKER signal: the daemon's restore is by-design 2-tier (restore/mod.rs) — it rebuilds
+    a file from the owner's LOCAL source first and only fetches from holders if the source
+    is gone. In the polygon the watch-dir source is ALWAYS present, so a plain restore
+    always uses tier-1 (local) and never validates the network copy; a node that placed
+    ZERO blocks still "restores ok". A full data-dir wipe deletes the source too, so the
+    post-DR restore is FORCED down tier-2 (fetch symbols from holders, decode) — true
+    network recovery.
+
+    Victim choice (so there is something on holders to recover): HONEST (archetype !=
+    free_rider), NON-seed (the seed stays live as the DR --peer bootstrap), currently UP,
+    not churned-down, and actually placed (placement_alive > 0 in a fresh status sample).
+    We pick up to k such victims, preferring those with the most live placements.
+
+    For each victim: collect its ledger files' original hashes, dr_recover() (wipe + dr +
+    relaunch), then request a restore per file (now forced to fetch from holders), locate
+    the recovered bytes, hash (md5, same as seeding/_final_restore_ledger), compare. Writes
+    a dr_results dict shaped like restore_results PLUS a dr_victims list.
+    """
+    import hashlib
+
+    results = {
+        "dr_victims": [],
+        "total": 0,
+        "restored_ok": 0,
+        "hash_mismatch": 0,
+        "not_found": 0,
+        "entries": [],
+    }
+
+    # Group ledger entries by owning node (only owners with files are recoverable).
+    by_owner: dict[str, list] = {}
+    for e in ledger:
+        by_owner.setdefault(e["label"], []).append(e)
+
+    seed_addr = fleet.get_addr(seed_label)
+    if not seed_addr:
+        log(f"[dr] cannot resolve seed {seed_label} addr — DR subset skipped")
+        return results
+
+    # Candidate victims: honest, non-seed, up, with files, that actually placed.
+    index = fleet.node_index()
+    candidates = []
+    plans = getattr(fleet, "_plans", {})
+    for label, entries in by_owner.items():
+        if label == seed_label:
+            continue
+        # Archetype from node_index, falling back to the launch plan (free-riders hold
+        # ~nothing for others, so wiping one would prove nothing — skip them).
+        archetype = (index.get(label) or {}).get("archetype", "")
+        if not archetype:
+            archetype = getattr(plans.get(label), "archetype", "")
+        if archetype == "free_rider":
+            continue
+        if not fleet.is_up(label):
+            continue
+        st = fleet.status_json(label) or {}
+        placement_alive = int(st.get("placement_alive", 0) or 0)
+        blocks_ok = int(st.get("blocks_ok", 0) or 0)
+        if placement_alive <= 0 and blocks_ok <= 0:
+            continue  # nothing on holders to recover — DR would prove nothing
+        candidates.append((placement_alive, blocks_ok, label, entries))
+
+    # Prefer the most-placed victims (strongest ground truth), deterministic on label.
+    candidates.sort(key=lambda c: (c[0], c[1], c[2]), reverse=True)
+    victims = candidates[: max(0, int(k))]
+
+    if not victims:
+        log("[dr] no eligible DR victim (honest, up, non-seed, with live placements) — "
+            "DR subset produced no ground truth")
+        return results
+
+    log(f"[dr] DR subset: wiping + recovering {len(victims)} node(s) from holders via "
+        f"seed {seed_label} ({seed_addr})")
+
+    # NOTE (known limitation, low-risk at k=2): victims are wiped+recovered sequentially.
+    # In the polygon every node holds symbols for every other node, and `dr` restores only
+    # a node's OWN pointer/metadata — NOT the foreign symbols it was holding. So once
+    # victim #1 is wiped it no longer holds victim #2's symbols, shrinking #2's holder set
+    # by one. With erasure redundancy (multiple holders/block) and k=2 this is tolerable;
+    # under a churned/low-redundancy holder set it could turn a recoverable file into a
+    # spurious not_found. If k grows or runs get churn-heavy, pick victims that are not
+    # each other's holders, or wipe-recover-verify strictly one at a time before the next.
+    for placement_alive, blocks_ok, label, entries in victims:
+        results["dr_victims"].append(
+            {"label": label, "placement_alive": placement_alive, "blocks_ok": blocks_ok}
+        )
+        log(f"[dr] victim {label}: placement_alive={placement_alive} blocks_ok={blocks_ok}, "
+            f"{len(entries)} file(s)")
+
+        ok = fleet.dr_recover(label, peer_addr=seed_addr)
+        if not ok:
+            # DR itself failed: every file of this victim is unrecoverable from the network.
+            for entry in entries:
+                results["total"] += 1
+                results["not_found"] += 1
+                results["entries"].append(
+                    {
+                        "label": label,
+                        "name": entry["name"],
+                        "want_hash": entry["hash"],
+                        "status": "not_found",
+                        "detail": "dr command failed",
+                    }
+                )
+            log(f"[dr] FAIL {label}: disaster recovery did not complete — files unrecoverable")
+            continue
+
+        for entry in entries:
+            results["total"] += 1
+            name = entry["name"]
+            want_hash = entry["hash"]
+            # Source file is GONE (wiped) -> this restore is forced down tier-2 (holders).
+            fleet.request_restore(label, entry["path"])
+
+            recovered = None
+            for _ in range(90):
+                recovered = fleet.find_dr_recovered(label, name)
+                if recovered is not None:
+                    break
+                time.sleep(2.0)
+
+            rec = {"label": label, "name": name, "want_hash": want_hash}
+            if recovered is None:
+                results["not_found"] += 1
+                rec["status"] = "not_found"
+                log(f"[dr] FAIL {label}/{name}: file never recovered from holders")
+            else:
+                got_hash = _hash_file(recovered, hashlib.md5)
+                rec["got_hash"] = got_hash
+                if got_hash == want_hash:
+                    results["restored_ok"] += 1
+                    rec["status"] = "ok"
+                else:
+                    results["hash_mismatch"] += 1
+                    rec["status"] = "hash_mismatch"
+                    log(f"[dr] FAIL {label}/{name}: hash mismatch after DR "
+                        f"want={want_hash[:12]} got={got_hash[:12]}")
+            results["entries"].append(rec)
+
+    log(f"[dr] DR subset: {results['restored_ok']}/{results['total']} recovered from holders "
+        f"& hash-matched, {results['hash_mismatch']} mismatch, {results['not_found']} not found "
+        f"(victims: {[v['label'] for v in results['dr_victims']]})")
+    return results
+
+
+# ----------------------------------------------------------------------------
 # The run.
 # ----------------------------------------------------------------------------
 
@@ -398,7 +559,10 @@ def _run_scenario(scenario: dict, rdir: Path, binary_arg, log) -> dict:
       5. star settle, then the drive loop: every sample_interval the collector samples
          all nodes while the churn engine applies due kill/restart/join events; the
          orchestrator's wall clock maps to virtual time via common.virtual_to_wall
-      6. end-of-run restore ledger (ground-truth data-loss oracle input)
+      6. end-of-run restore ledger (tier-1/local restore sanity — NOT the data-loss gate)
+      6b. DR subset: wipe a few honest nodes and recover FROM HOLDERS (the TRUE no-data-loss
+          ground truth — forces the daemon's tier-2 network fetch, which the watch-dir-source
+          tier-1 restore in step 6 never exercises)
       7. teardown (stderr panic scan BEFORE any -9), keeping the results dir
     """
     time_scale = float(scenario["time_scale"])
@@ -558,10 +722,19 @@ def _run_scenario(scenario: dict, rdir: Path, binary_arg, log) -> dict:
     collector.finalize()
     log(f"[run] drive loop complete: {tick + 1} sample tick(s)")
 
-    # ── 6. end-of-run restore ledger (ground-truth) ──────────────────────────
-    log("[run] requesting end-of-run restores for the ground-truth data-loss oracle...")
+    # ── 6. end-of-run restore ledger (tier-1 local-restore sanity, NOT the gate) ─
+    log("[run] requesting end-of-run restores (tier-1/local sanity signal)...")
     restore_results = _final_restore_ledger(fleet, restore_ledger, log)
     save_json(rdir / "restore_results.json", restore_results)
+
+    # ── 6b. DR subset (TRUE no-data-loss ground truth: recover FROM HOLDERS) ──
+    # Must run while the seed + holders are still UP (before teardown). A few honest
+    # nodes lose their whole data-dir and rebuild from the network — the only signal
+    # that proves the network copy is real (tier-1 above never touches holders).
+    log("[run] DR subset: wiping a few honest nodes and recovering FROM HOLDERS "
+        "(the true no-data-loss ground truth)...")
+    dr_results = _dr_recover_subset(fleet, restore_ledger, seed_label, log, k=2)
+    save_json(rdir / "dr_results.json", dr_results)
 
     # ── 7. teardown (panic scan BEFORE any -9) ───────────────────────────────
     td = fleet.teardown(scan_first=True)
@@ -580,6 +753,13 @@ def _run_scenario(scenario: dict, rdir: Path, binary_arg, log) -> dict:
             "restored_ok": restore_results["restored_ok"],
             "hash_mismatch": restore_results["hash_mismatch"],
             "not_found": restore_results["not_found"],
+        },
+        "dr": {
+            "victims": [v["label"] for v in dr_results.get("dr_victims", [])],
+            "total": dr_results["total"],
+            "restored_ok": dr_results["restored_ok"],
+            "hash_mismatch": dr_results["hash_mismatch"],
+            "not_found": dr_results["not_found"],
         },
         "teardown": {k: td[k] for k in ("terminated", "killed") if k in td},
     }
@@ -764,6 +944,7 @@ def main() -> int:
     if run_error is not None:
         log(f"  RUN ERROR: {run_error}")
     _summarize_verdict(verdict_path, fairness_path, bugfree, log)
+    _summarize_dr(rdir / "dr_results.json", log)
     log(f"  results dir: {rdir}")
     log("============================================================")
     log.close()
@@ -789,6 +970,18 @@ def _summarize_verdict(verdict_path: Path, fairness_path: Path, bugfree: bool, l
     except Exception:
         checks_line = ""
     log(f"  BUG-FREENESS: {'PASS' if bugfree else 'FAIL'}{checks_line}")
+    # Surface any check that PASSED its boolean but could not actually prove its property
+    # (e.g. no-data-loss with no DR ground truth → tier-1 fallback). A "PASS but
+    # inconclusive" run must not read as a clean green to whoever scans this summary.
+    try:
+        from common import load_json
+
+        if verdict_path.is_file():
+            incon = (load_json(verdict_path).get("bugfree") or {}).get("inconclusive") or []
+            if incon:
+                log(f"  ⚠ INCONCLUSIVE (passed but unproven): {', '.join(incon)}")
+    except Exception:
+        pass
 
     findings_line = "report not written"
     try:
@@ -806,6 +999,35 @@ def _summarize_verdict(verdict_path: Path, fairness_path: Path, bugfree: bool, l
     except Exception:
         findings_line = "report unreadable"
     log(f"  FAIRNESS: {findings_line} (see {fairness_path.name})")
+
+
+def _summarize_dr(dr_path: Path, log) -> None:
+    """Print the DR-subset (true network recoverability) one-liner for the operator.
+
+    This is the load-bearing no-data-loss signal: a SAMPLE of k nodes that lost their
+    whole data-dir and recovered every file FROM HOLDERS. Tier-1 local restore
+    (restore_results.json) is the separate, weaker signal.
+    """
+    try:
+        from common import load_json
+
+        if not dr_path.is_file():
+            log("  DR-RECOVERY: not run (no dr_results.json)")
+            return
+        dr = load_json(dr_path)
+        victims = [v.get("label") for v in (dr.get("dr_victims") or [])]
+        total = int(dr.get("total", 0) or 0)
+        ok = int(dr.get("restored_ok", 0) or 0)
+        mism = int(dr.get("hash_mismatch", 0) or 0)
+        nf = int(dr.get("not_found", 0) or 0)
+        if total == 0:
+            log(f"  DR-RECOVERY: INCONCLUSIVE (no eligible victim; victims={victims})")
+            return
+        status = "PASS" if (mism == 0 and nf == 0) else "FAIL"
+        log(f"  DR-RECOVERY: {status} — {ok}/{total} files recovered from holders "
+            f"({mism} mismatch, {nf} not found); victims={victims}")
+    except Exception:
+        log("  DR-RECOVERY: report unreadable")
 
 
 if __name__ == "__main__":

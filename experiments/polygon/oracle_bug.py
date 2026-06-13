@@ -34,10 +34,20 @@ WHY THIS MODULE EXISTS (intent / acceptance criteria — fixed before the code):
                           mailbox path was genuinely exercised (the polygon only ever
                           runs under time_scale>1, so a permanently-empty mailbox means
                           the scaled poll never delivered anything = E1 signature).
-    BUG-no-data-loss    : every honest backed-up file restored at end of run to its
-                          exact pre-backup content hash (the ground-truth ledger, same
-                          method local_delete_test.sh uses). This is the load-bearing
-                          product property; a single mismatch fails the run.
+    BUG-no-data-loss    : the DR subset recovered every file FROM THE NETWORK — a SAMPLE
+                          of k honest nodes lost their ENTIRE data-dir and rebuilt every
+                          file from holders via disaster recovery (the daemon's tier-2
+                          network fetch + decode). This is the load-bearing product
+                          property and the ONLY true ground truth: it gates on
+                          dr_results.json and HARD-fails if any DR-victim file mismatched
+                          or was not recovered. Tier-1 LOCAL restore (restore_results.json)
+                          is a separate, weaker signal — the daemon rebuilds from the
+                          owner's local source file first and only fetches from holders if
+                          the source is gone (restore/mod.rs), so in the polygon (watch-dir
+                          source always present) it never touches the network and a node
+                          that placed zero blocks still "restores ok". If no DR subset ran,
+                          the check falls back to that weaker tier-1 signal but marks itself
+                          INCONCLUSIVE rather than falsely passing.
     BUG-db-integrity    : every node that was UP at teardown answered status --json (a
                           corrupt redb after a -9 would fail to open) — the two-pass
                           TERM->grace->KILL teardown is supposed to make this impossible.
@@ -56,7 +66,9 @@ WHY THIS MODULE EXISTS (intent / acceptance criteria — fixed before the code):
   Inputs (read-only, all under results_dir):
     timeseries.csv     — per (tick,node) StatusData + table_stats + by_importance + ext_*
     edges.csv          — per (tick,node,peer) PeerSummary (read for completeness only)
-    restore_ledger.json— ground-truth file-hash ledger (see _load_restore_ledger)
+    restore_ledger.json— tier-1 local-restore hash ledger (weaker; see _load_restore_ledger)
+    dr_results.json    — DR-subset network-recovery ground truth (authoritative no-data-loss
+                          signal; see _load_dr_results)
     stderr_scan.json   — per-node panic/ERROR scan from teardown (see _load_stderr_scan)
     churn_log.json     — resolved ChurnEvent queue (intended up/down per node per wall)
     node_index.json    — label <-> identity/device_id/archetype/join_virtual_day
@@ -172,6 +184,8 @@ class _Ctx:
 
         self.stderr_scan = _load_stderr_scan(self.results_dir)
         self.restore_ledger = _load_restore_ledger(self.results_dir)
+        # DR-subset network-recoverability ground truth (authoritative when present).
+        self.dr_results = _load_dr_results(self.results_dir)
         self.node_index = _load_node_index(self.results_dir)
         self.churn = _load_churn_log(self.results_dir)
 
@@ -275,18 +289,23 @@ def _load_stderr_scan(results_dir: Path) -> dict:
 
 
 def _load_restore_ledger(results_dir: Path) -> list:
-    """Load the ground-truth restore ledger, normalized to a list of entries:
+    """Load the TIER-1 local-restore ledger, normalized to a list of entries:
 
         {label, filename, original_hash, restored_hash, ok}
+
+    This is the WEAKER no-data-loss signal (tier-1 local restore — the daemon rebuilds
+    from the owner's local source file, which the polygon always has present, so the
+    network copy is never validated). The authoritative no-data-loss ground truth is
+    dr_results.json via _load_dr_results; this ledger is only the fallback / sanity signal.
 
     Accepts a list of such dicts, or {"entries": [...]}, or a mapping keyed by a file
     id. `ok` is honored if present; otherwise it is derived from original_hash ==
     restored_hash (case-insensitive). A missing/empty restored_hash means the restore
     never landed -> not ok (data loss / stuck restore). Returns [] if the file is absent.
 
-    Prefers restore_results.json (run.py's authoritative per-file restore OUTCOMES:
+    Prefers restore_results.json (run.py's per-file tier-1 restore OUTCOMES:
     {entries:[{label,name,want_hash,got_hash,status}]}); falls back to
-    restore_ledger.json (original-hash-only ground truth) when results are absent.
+    restore_ledger.json (original-hash-only) when results are absent.
     """
     pr = results_dir / "restore_results.json"
     if pr.is_file():
@@ -346,6 +365,33 @@ def _load_restore_ledger(results_dir: Path) -> list:
             }
         )
     return out
+
+
+def _load_dr_results(results_dir: Path) -> dict | None:
+    """Load dr_results.json — the TRUE network-recoverability ground truth.
+
+    Written by run.py's _dr_recover_subset: a SAMPLE of k honest nodes that lost their
+    whole data-dir and recovered every file FROM HOLDERS via `viaticum dr` + a network
+    (tier-2) restore. Shape mirrors restore_results.json plus a "dr_victims" list:
+
+        {dr_victims:[{label,...}], total, restored_ok, hash_mismatch, not_found,
+         entries:[{label, name, want_hash, got_hash?, status: ok|hash_mismatch|not_found}]}
+
+    Returns the parsed dict, or None if the file is absent / unreadable / not a dict
+    (the no-data-loss check then falls back to the weaker tier-1 local-restore signal,
+    clearly marked INCONCLUSIVE). A present-but-empty result (no eligible victim) is
+    returned as-is so the check can report it as inconclusive rather than a false pass.
+    """
+    p = results_dir / "dr_results.json"
+    if not p.is_file():
+        return None
+    try:
+        obj = load_json(p)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    return obj
 
 
 def _load_node_index(results_dir: Path) -> dict:
@@ -798,18 +844,74 @@ def check_mailbox_exercised(ctx: _Ctx) -> CheckResult:
 
 
 def check_no_data_loss(ctx: _Ctx) -> CheckResult:
-    """Every honest backed-up file restored to its exact pre-backup content hash.
+    """No-data-loss = the DR subset recovered EVERY file FROM THE NETWORK.
 
-    The ground-truth product property. A single mismatch (or a restore that never
-    landed -> empty restored_hash) fails the run. An empty ledger means the restore
-    ground-truth was not collected — that cannot prove no-data-loss, so it FAILS loudly.
+    NO-DATA-LOSS now means: a SAMPLE of k honest nodes lost their ENTIRE data-dir and
+    recovered every one of their files from holders via disaster recovery (the daemon's
+    tier-2 network fetch + decode). This is true ground truth — the only path that
+    validates the network copy. It gates on dr_results.json: HARD-fail if ANY DR-victim
+    file mismatched or was not recovered.
+
+    Tier-1 local restore (restore_results.json / the restore ledger) is a SEPARATE,
+    WEAKER signal: the daemon's restore rebuilds from the owner's LOCAL source file first
+    and only fetches from holders if the source is gone (restore/mod.rs). In the polygon
+    the watch-dir source is always present, so that path NEVER touches the network — a
+    node that placed zero blocks still "restores ok". It cannot prove no-data-loss.
+
+    Fallback: if dr_results.json is absent (a scenario with no DR subset), we fall back to
+    the tier-1 ledger ONLY as a degraded signal and mark the check INCONCLUSIVE in detail
+    — it still catches a gross tier-1 failure, but it does NOT constitute the strong
+    network-recovery proof. A present-but-empty DR result (no eligible victim) is likewise
+    inconclusive, not a false pass.
     """
+    dr = ctx.dr_results
+
+    # --- authoritative path: DR subset present with at least one recovered file ---
+    if dr is not None and int(dr.get("total", 0) or 0) > 0:
+        entries = dr.get("entries") or []
+        failures = [
+            {
+                "label": e.get("label", ""),
+                "filename": e.get("name", ""),
+                "want_hash": str(e.get("want_hash", "") or ""),
+                "got_hash": str(e.get("got_hash", "") or ""),
+                "status": str(e.get("status", "")),
+            }
+            for e in entries
+            if str(e.get("status", "")).lower() != "ok"
+        ]
+        return CheckResult(
+            "BUG-no-data-loss",
+            len(failures) == 0,
+            "DR-subset network recovery (true ground truth)",
+            {
+                "source": "dr_results.json",
+                "dr_victims": [v.get("label") for v in (dr.get("dr_victims") or [])],
+                "files_checked": int(dr.get("total", 0) or 0),
+                "recovered_ok": int(dr.get("restored_ok", 0) or 0),
+                "failures": failures,
+                "note": "no-data-loss = every DR-victim file recovered FROM HOLDERS; "
+                        "tier-1 local restore is a separate weaker signal",
+            },
+        )
+
+    # --- fallback: no DR ground truth -> degraded, INCONCLUSIVE tier-1 signal ---
+    dr_state = (
+        "dr_results.json present but no eligible victim (total=0)"
+        if dr is not None
+        else "dr_results.json absent — DR subset did not run"
+    )
     if not ctx.restore_ledger:
         return CheckResult(
             "BUG-no-data-loss",
             False,
-            "restore content-hash match",
-            {"reason": "restore_ledger.json missing/empty — no-data-loss not proven"},
+            "restore content-hash match (INCONCLUSIVE: no DR ground truth)",
+            {
+                "inconclusive": True,
+                "reason": "no DR ground truth AND restore ledger missing/empty — "
+                          "no-data-loss not proven",
+                "dr_state": dr_state,
+            },
         )
     mismatches = [
         {
@@ -824,10 +926,14 @@ def check_no_data_loss(ctx: _Ctx) -> CheckResult:
     return CheckResult(
         "BUG-no-data-loss",
         len(mismatches) == 0,
-        "restore content-hash match",
+        "restore content-hash match (INCONCLUSIVE: tier-1 local-restore only)",
         {
+            "inconclusive": True,
+            "dr_state": dr_state,
             "files_checked": len(ctx.restore_ledger),
             "mismatches": mismatches,
+            "note": "tier-1 LOCAL restore only (source files still present) — does NOT "
+                    "validate the network copy; run a DR subset for true ground truth",
         },
     )
 
@@ -978,12 +1084,23 @@ def run(results_dir) -> bool:
 
     overall = all(c.passed for c in checks)
     passed_n = sum(1 for c in checks if c.passed)
+    # A check may PASS its boolean yet be unable to actually prove its property (e.g.
+    # no-data-loss with no DR ground truth falls back to the weaker tier-1 signal). Such
+    # a check sets detail["inconclusive"]=True. We surface those names at the TOP level so
+    # a consumer reading only bugfree.pass / the exit code is not fooled into trusting a
+    # green it cannot stand behind — "PASS but inconclusive" is distinct from a real PASS.
+    inconclusive = [
+        c.name
+        for c in checks
+        if isinstance(c.detail, dict) and c.detail.get("inconclusive")
+    ]
 
     verdict = {
         "bugfree": {
             "pass": overall,
             "passed": passed_n,
             "total": len(checks),
+            "inconclusive": inconclusive,
             "checks": [asdict(c) for c in checks],
         },
         "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
@@ -1023,8 +1140,12 @@ if __name__ == "__main__":
     bf = v["bugfree"]
     print(f"BUG-FREENESS: {'PASS' if bf['pass'] else 'FAIL'} "
           f"({bf['passed']}/{bf['total']} hard checks)")
+    incon = bf.get("inconclusive") or []
+    if incon:
+        print(f"  ⚠ INCONCLUSIVE (passed but unproven): {', '.join(incon)}")
     for c in bf["checks"]:
-        mark = "ok  " if c["passed"] else "FAIL"
+        is_incon = isinstance(c.get("detail"), dict) and c["detail"].get("inconclusive")
+        mark = "??  " if (c["passed"] and is_incon) else ("ok  " if c["passed"] else "FAIL")
         print(f"  [{mark}] {c['name']:<26} ({c['observable']})")
     # Reference the otherwise-unused imports kept for the documented dependency surface.
     _ = (wall_to_virtual,)

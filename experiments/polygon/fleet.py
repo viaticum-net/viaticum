@@ -60,6 +60,11 @@ from common import save_json
 _ADDR_RE = re.compile(r"/ip4/[^\s]+")
 # `identity:` line from text status — readiness signal.
 _IDENTITY_RE = re.compile(r"identity:")
+# `viaticum init` prints "Mnemonic (SAVE THIS):" then the 24-word phrase on the
+# NEXT line, indented (main.rs:74 -> `println!("\nMnemonic (SAVE THIS):\n  {}", ...)`).
+_MNEMONIC_HDR = "Mnemonic (SAVE THIS):"
+# `viaticum dr` success line (mirrors local_dr_test.sh grep "restore successful|restored").
+_DR_OK_RE = re.compile(r"restore successful|restored", re.IGNORECASE)
 
 DEFAULT_BINARY = "./target/release/viaticum"
 
@@ -82,6 +87,11 @@ class Fleet:
         self.binary: Optional[str] = None
         # label -> Popen (or None when intentionally down).
         self._procs: dict[str, Optional[subprocess.Popen]] = {}
+        # label -> the 24-word mnemonic `viaticum init` GENERATED for this node,
+        # captured from init stdout. Needed to re-derive the node's identity in a
+        # disaster-recovery (`viaticum dr --mnemonic ...`) — the only way to prove
+        # the network copy is recoverable after a full data-dir wipe.
+        self._mnemonics: dict[str, Optional[str]] = {}
         # label -> last known pid (kept even after a node is killed, for measure()).
         self._pids: dict[str, Optional[int]] = {}
         # label -> NodePlan (set by join_node / recorded by the orchestrator via
@@ -173,6 +183,34 @@ class Fleet:
         res = self._cli(label, ["init"], timeout=60.0)
         if res.returncode != 0:
             self.log(f"[fleet] WARN init {label} rc={res.returncode}: {res.stderr.strip()[:200]}")
+        # Capture the generated mnemonic so this node can be DR-recovered later
+        # (the seed phrase is the ONLY way to re-derive the identity after a wipe).
+        self._mnemonics[label] = self._parse_mnemonic(res.stdout or "")
+        if self._mnemonics[label] is None:
+            self.log(f"[fleet] WARN init {label}: could not capture mnemonic from stdout "
+                     "(DR recovery for this node will be unavailable)")
+
+    @staticmethod
+    def _parse_mnemonic(stdout: str) -> Optional[str]:
+        """Extract the 24-word phrase printed by `viaticum init`.
+
+        main.rs prints `\\nMnemonic (SAVE THIS):\\n  {phrase}` — the header line
+        followed by the indented phrase on the NEXT non-empty line. We find the
+        header, then return the first subsequent non-empty line, stripped.
+        """
+        lines = stdout.splitlines()
+        for i, line in enumerate(lines):
+            if _MNEMONIC_HDR in line:
+                for nxt in lines[i + 1:]:
+                    phrase = nxt.strip()
+                    if phrase:
+                        return phrase
+                return None
+        return None
+
+    def mnemonic(self, label: str) -> Optional[str]:
+        """The mnemonic `viaticum init` generated for this label, or None."""
+        return self._mnemonics.get(label)
 
     def write_config(self, label: str, toml_text: str) -> None:
         """Write the per-node config.toml (rendered by config_gen)."""
@@ -451,6 +489,121 @@ class Fleet:
             if p.is_file() and p.name == base:
                 return p
         return None
+
+    # ------------------------------------------------------------- disaster recovery
+    def dr_recover(self, label: str, peer_addr: str, timeout_s: int = 240) -> bool:
+        """TRUE network-recoverability: wipe a node's whole data-dir and rebuild its
+        metadata FROM HOLDERS via `viaticum dr`, then relaunch the daemon.
+
+        This is the only honest no-data-loss ground truth in the polygon. The daemon's
+        restore is by-design 2-tier (restore/mod.rs): it rebuilds a file from the owner's
+        LOCAL source first and only fetches from holders if the source is gone. In a live
+        polygon node the watch-dir source is always present, so a plain `restore` ALWAYS
+        uses tier-1 and never touches the network — a node that placed zero blocks still
+        "restores ok". A full data-dir wipe deletes the source files too, so after DR the
+        subsequent `restore` is FORCED down tier-2 (fetch symbols from holders, decode),
+        which is the property we actually want to prove.
+
+        Steps (mirror local_dr_test.sh Phase 4/5):
+          1. stop the node's daemon (graceful, reuse kill_node);
+          2. `rm -rf <node_dir>/*` — FULL wipe (identity is re-derived from the mnemonic);
+          3. `viaticum --data-dir <node_dir> dr --mnemonic '<phrase>' --peer <peer_addr>`
+             (capture output; success iff exit 0 AND output says "restore successful"/
+             "restored" — same grep local_dr_test.sh uses);
+          4. on success, re-apply the node's polygon config (dr writes a default config
+             with web_api disabled, so the CLI could not reach the daemon otherwise) and
+             relaunch the daemon + reconnect to the seed, so the caller can then drive
+             per-file `request_restore` / `find_restored` (tier-2 network fetch).
+
+        Returns True iff the dr command itself succeeded (a recovered daemon is then live);
+        the per-file hash comparison is the caller's job (run.py), exactly as the local
+        restore ledger separates the restore request from the hash check.
+        """
+        phrase = self._mnemonics.get(label)
+        if not phrase:
+            self.log(f"[dr] {label}: no captured mnemonic — cannot DR-recover")
+            return False
+        if not peer_addr:
+            self.log(f"[dr] {label}: no peer addr for DR bootstrap")
+            return False
+
+        d = self.node_dir(label)
+        # 1. stop the daemon (keeps the dir; we wipe its contents next).
+        self.kill_node(label)
+        # 2. full wipe of the data-dir contents (dir kept, identity re-derived from phrase).
+        try:
+            for child in d.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    try:
+                        child.unlink()
+                    except OSError:
+                        pass
+        except OSError as exc:
+            self.log(f"[dr] {label}: wipe failed: {exc}")
+            return False
+
+        # 3. run `dr` — re-derive identity from the phrase, discover the SelfPointer via
+        #    the --peer bootstrap, fetch SS blocks from holders, restore the DB metadata.
+        cmd = [
+            self._bin(),
+            "--data-dir",
+            str(d),
+            "dr",
+            "--mnemonic",
+            phrase,
+            "--peer",
+            peer_addr,
+        ]
+        env = dict(os.environ)
+        env.setdefault("RUST_LOG", "info")
+        try:
+            res = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=float(timeout_s), env=env
+            )
+        except subprocess.TimeoutExpired as e:
+            self.log(f"[dr] {label}: dr command timed out after {timeout_s}s")
+            res = subprocess.CompletedProcess(cmd, 124, e.stdout or "", e.stderr or "timeout")
+
+        out = (res.stdout or "") + (res.stderr or "")
+        # Persist the dr transcript next to the node for post-mortem.
+        try:
+            (d / "dr.log").write_text(out)
+        except OSError:
+            pass
+        ok = res.returncode == 0 and bool(_DR_OK_RE.search(out))
+        if not ok:
+            self.log(f"[dr] {label}: dr FAILED rc={res.returncode}; tail: "
+                     f"{out.strip()[-300:]}")
+            return False
+        self.log(f"[dr] {label}: dr restore successful (metadata recovered from holders)")
+
+        # 4. dr wrote a DEFAULT config (web_api disabled) — re-apply the node's polygon
+        #    config so the CLI can reach the relaunched daemon, then relaunch + reconnect.
+        plan = self._plans.get(label)
+        toml_text = getattr(plan, "config_toml", None) if plan is not None else None
+        if toml_text:
+            self.write_config(label, toml_text)
+        watch_dirs = [str(self.files_dir(label))]
+        importance = getattr(plan, "importance_multiplier", 1.0) != 1.0 if plan is not None else False
+        self.launch_node(label, watch_dirs, importance_via_watchblock=importance)
+        if not self.wait_ready(label, timeout_s=90):
+            self.log(f"[dr] {label}: daemon not ready after DR relaunch")
+            return False
+        self._reconnect_to_seed(label)
+        return True
+
+    def find_dr_recovered(self, label: str, filename: str) -> Optional[Path]:
+        """Locate a file recovered AFTER a DR + per-file restore.
+
+        After dr_recover() rebuilt the metadata and the caller drove `request_restore`,
+        the recovered bytes land in the SAME staging area as any restore
+        (<data_dir>/restore/<job_id>/<rel_path>), so this just reuses find_restored.
+        Kept as a distinctly-named entry point so run.py's DR flow reads clearly and a
+        future DR-specific landing path is a single-line change here.
+        """
+        return self.find_restored(label, filename)
 
     # ------------------------------------------------------------- stderr scan
     def scan_stderr(self, label: str) -> dict:

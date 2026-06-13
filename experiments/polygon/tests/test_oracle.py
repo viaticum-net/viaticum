@@ -83,7 +83,8 @@ def _healthy_row(tick, label, archetype, status_ok, up_state, **over):
     return r
 
 
-def _write_fixture(rdir, rows, events, restore_entries, panic=False):
+def _write_fixture(rdir, rows, events, restore_entries, panic=False, dr_entries=None,
+                   dr_victims=None):
     rdir = Path(rdir)
     # timeseries.csv (real writer -> canonical schema)
     fh, _ = common.open_timeseries_writer(rdir / "timeseries.csv")
@@ -109,6 +110,20 @@ def _write_fixture(rdir, rows, events, restore_entries, panic=False):
         "hash_mismatch": sum(1 for e in restore_entries if e["status"] == "hash_mismatch"),
         "not_found": sum(1 for e in restore_entries if e["status"] == "not_found"),
     }))
+    # dr_results.json (DR-subset network-recovery ground truth — the authoritative
+    # no-data-loss signal). Only written when dr_entries is provided; absence exercises
+    # the oracle's INCONCLUSIVE tier-1 fallback path.
+    if dr_entries is not None:
+        if dr_victims is None:
+            dr_victims = [{"label": lab} for lab in sorted({e["label"] for e in dr_entries})]
+        (rdir / "dr_results.json").write_text(json.dumps({
+            "dr_victims": dr_victims,
+            "total": len(dr_entries),
+            "restored_ok": sum(1 for e in dr_entries if e["status"] == "ok"),
+            "hash_mismatch": sum(1 for e in dr_entries if e["status"] == "hash_mismatch"),
+            "not_found": sum(1 for e in dr_entries if e["status"] == "not_found"),
+            "entries": dr_entries,
+        }))
     # stderr_scans.json (per-label panic/error scan)
     scans = {lab: {"panicked": panic, "error_lines": 0, "first_error": None} for lab in labels}
     (rdir / "stderr_scans.json").write_text(json.dumps(scans))
@@ -186,7 +201,8 @@ class OracleSelfTest(unittest.TestCase):
                              "a node up-but-unreachable-throughout must be flagged dead")
 
     def test_data_loss_is_flagged(self):
-        """A restored file whose hash != original MUST fail no-data-loss."""
+        """A restored file whose hash != original MUST fail no-data-loss (tier-1
+        fallback path: no dr_results.json present)."""
         rows = [_healthy_row(t, "node-B", "reliable", status_ok=True, up_state="up")
                 for t in range(N_TICKS)]
         restore = [{"label": "node-B", "name": "b0.bin", "want_hash": "h2", "got_hash": "DIFFERENT", "status": "hash_mismatch"}]
@@ -196,6 +212,81 @@ class OracleSelfTest(unittest.TestCase):
             self.assertFalse(_passed(ch["BUG-no-data-loss"]),
                              "a hash mismatch must fail the no-data-loss gate")
 
+    def test_dr_all_ok_passes_no_data_loss(self):
+        """The AUTHORITATIVE path: a DR subset that recovered every file from holders
+        (all status=ok) PASSES no-data-loss — even if the tier-1 ledger were absent."""
+        rows = [_healthy_row(t, "node-B", "reliable", status_ok=True, up_state="up")
+                for t in range(N_TICKS)]
+        restore = [{"label": "node-B", "name": "b0.bin", "want_hash": "h2", "got_hash": "h2", "status": "ok"}]
+        dr = [{"label": "node-B", "name": "b0.bin", "want_hash": "h2", "got_hash": "h2", "status": "ok"}]
+        with tempfile.TemporaryDirectory() as d:
+            _write_fixture(d, rows, [], restore, dr_entries=dr)
+            ch = _verdict(d)
+            chk = ch["BUG-no-data-loss"]
+            self.assertTrue(_passed(chk),
+                            f"all-ok DR recovery must pass no-data-loss: {chk}")
+            self.assertEqual(chk["detail"].get("source"), "dr_results.json",
+                             "no-data-loss must gate on the DR ground truth when present")
+
+    def test_dr_hash_mismatch_fails_no_data_loss(self):
+        """A DR-recovered file whose hash != original MUST hard-fail no-data-loss,
+        even when the WEAKER tier-1 local restore reported ok (the exact false-positive
+        the DR gate exists to catch)."""
+        rows = [_healthy_row(t, "node-B", "reliable", status_ok=True, up_state="up")
+                for t in range(N_TICKS)]
+        # Tier-1 LIES (local source still present -> ok); DR (network) catches the loss.
+        restore = [{"label": "node-B", "name": "b0.bin", "want_hash": "h2", "got_hash": "h2", "status": "ok"}]
+        dr = [{"label": "node-B", "name": "b0.bin", "want_hash": "h2", "got_hash": "WRONG", "status": "hash_mismatch"}]
+        with tempfile.TemporaryDirectory() as d:
+            _write_fixture(d, rows, [], restore, dr_entries=dr)
+            ch = _verdict(d)
+            self.assertFalse(_passed(ch["BUG-no-data-loss"]),
+                             "a DR network-recovery hash mismatch must fail no-data-loss")
+
+    def test_dr_not_found_fails_no_data_loss(self):
+        """A DR-victim file that was NEVER recovered from holders MUST fail no-data-loss
+        (the network copy did not exist / was unreachable)."""
+        rows = [_healthy_row(t, "node-B", "reliable", status_ok=True, up_state="up")
+                for t in range(N_TICKS)]
+        restore = [{"label": "node-B", "name": "b0.bin", "want_hash": "h2", "got_hash": "h2", "status": "ok"}]
+        dr = [{"label": "node-B", "name": "b0.bin", "want_hash": "h2", "status": "not_found"}]
+        with tempfile.TemporaryDirectory() as d:
+            _write_fixture(d, rows, [], restore, dr_entries=dr)
+            ch = _verdict(d)
+            self.assertFalse(_passed(ch["BUG-no-data-loss"]),
+                             "a DR file never recovered from holders must fail no-data-loss")
+
+    def test_dr_empty_is_inconclusive_not_false_pass(self):
+        """A present-but-empty DR result (no eligible victim) must NOT be silently
+        treated as the strong proof: the check falls back to the tier-1 signal and marks
+        itself INCONCLUSIVE in detail (rather than claiming network recovery succeeded)."""
+        rows = [_healthy_row(t, "node-B", "reliable", status_ok=True, up_state="up")
+                for t in range(N_TICKS)]
+        restore = [{"label": "node-B", "name": "b0.bin", "want_hash": "h2", "got_hash": "h2", "status": "ok"}]
+        with tempfile.TemporaryDirectory() as d:
+            _write_fixture(d, rows, [], restore, dr_entries=[])  # empty DR result on disk
+            ch = _verdict(d)
+            chk = ch["BUG-no-data-loss"]
+            self.assertTrue(chk["detail"].get("inconclusive"),
+                            f"empty DR result must mark the check INCONCLUSIVE: {chk}")
+            self.assertNotEqual(chk["detail"].get("source"), "dr_results.json",
+                                "empty DR result must not be reported as authoritative")
+
+    def test_inconclusive_surfaces_at_top_level_verdict(self):
+        """An inconclusive check (passed boolean, but property unproven) must be listed in
+        the TOP-LEVEL bugfree.inconclusive — not buried in per-check detail — so a consumer
+        reading only bugfree.pass / the exit code is not fooled by a green it can't prove.
+        (Reviewer finding C: empty-DR fell back to tier-1 with passed=True; the operator
+        must see the inconclusiveness without inspecting each check's detail.)"""
+        rows = [_healthy_row(t, "node-B", "reliable", status_ok=True, up_state="up")
+                for t in range(N_TICKS)]
+        restore = [{"label": "node-B", "name": "b0.bin", "want_hash": "h2", "got_hash": "h2", "status": "ok"}]
+        with tempfile.TemporaryDirectory() as d:
+            _write_fixture(d, rows, [], restore, dr_entries=[])  # empty DR -> inconclusive
+            oracle_bug.run(str(d))
+            bf = json.loads((Path(d) / "verdict.json").read_text())["bugfree"]
+            self.assertIn("BUG-no-data-loss", bf.get("inconclusive", []),
+                          f"inconclusive no-data-loss must surface at top level: {bf.get('inconclusive')}")
 
     def test_holdings_filling_under_quota_not_flagged(self):
         """A node whose holdings du climbs steadily but stays UNDER its quota is FILLING
