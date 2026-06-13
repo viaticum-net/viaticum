@@ -490,8 +490,11 @@ def _run_scenario(scenario: dict, rdir: Path, binary_arg, log) -> dict:
     # (dial_discovered_peer) — but that takes time. Without waiting, spokes start backup
     # knowing ~1 peer and place NOTHING (only the hub, which sees everyone, places) → the
     # whole run is degenerate. Block until every day-0 node authenticates a quorum.
+    # Kademlia bootstrap + per-peer cert-exchange is REAL-time work (~4 min for ~40 nodes)
+    # that time_scale does NOT compress, so the gate must out-wait it before the (compressed)
+    # virtual-time drive begins — otherwise the drive runs against an unconverged network.
     _wait_for_discovery(fleet, [p.label for p in day0_plans],
-                        target=min(8, len(day0_plans) - 1), timeout_s=240.0, log=log)
+                        target=min(8, len(day0_plans) - 1), timeout_s=600.0, log=log)
 
     # ── 5. drive loop ────────────────────────────────────────────────────────
     fleet_start_wall = time.time()
