@@ -208,17 +208,19 @@ def due_events(queue, now_wall, last_wall):
     return [e for e in queue if last_wall < e.wall_secs <= now_wall]
 
 
-def up_state_at(label, queue, now_wall):
-    """Return 'up' or 'down' for `label` at wall time now_wall by replaying its events.
+def up_state_at(label, queue, at_virtual_day):
+    """Return 'up' or 'down' for `label` at scenario virtual_day by replaying its events.
 
-    Logic: walk this node's kill/restart/join/mass_depart events in time order up to
-    now_wall; the LAST one wins. If the node has no events at all, it is 'up' (an
-    always-on node). If its first-ever event is a 'join' (a late-joiner that has not
-    yet joined), it is 'down' until that join fires.
+    Keyed on virtual_day, NOT wall_secs: event wall_secs are ABSOLUTE epoch while a
+    caller's clock may be relative-to-fleet-start, so a wall_secs comparison mixed bases
+    and silently returned the initial state forever (every node read 'up'). virtual_day is
+    base-independent and present on every event. Walk this node's kill/restart/join/
+    mass_depart events in virtual-time order up to at_virtual_day; the LAST one wins. No
+    events -> 'up' (always-on). First-ever event a 'join' -> 'down' until that join fires.
     """
     relevant = sorted(
         (e for e in queue if label in e.targets),
-        key=lambda e: e.wall_secs,
+        key=lambda e: e.virtual_day,
     )
     if not relevant:
         return "up"
@@ -228,7 +230,7 @@ def up_state_at(label, queue, now_wall):
     state = "down" if relevant[0].event_type in UP_EVENTS else "up"
 
     for e in relevant:
-        if e.wall_secs > now_wall:
+        if e.virtual_day > at_virtual_day:
             break
         if e.event_type in DOWN_EVENTS:
             state = "down"

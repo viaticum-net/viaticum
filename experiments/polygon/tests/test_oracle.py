@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Self-test for the polygon oracle ("проверка проверки").
+
+The oracle is the code that judges a run PASS/FAIL — but it is itself untested
+code that can lie (it produced false-positives on the first real run: churn-killed
+nodes counted as "unexpected death" / "unreadable DB"). This test pins the oracle's
+OWN intent with controlled fixtures whose verdict is known by construction:
+
+  - a node taken offline by the CHURN SCHEDULE (intended-down) must NOT be flagged
+    as an unexpected death or a corrupt DB (the churn-awareness fix);
+  - a node intended UP but unreachable throughout MUST be flagged (a real crash);
+  - a restored file whose hash != original MUST fail the no-data-loss gate.
+
+Fixtures are written with the REAL common/churn writers so the on-disk format
+matches production exactly. Run: python3 -m unittest tests.test_oracle  (from the
+polygon dir) or python3 tests/test_oracle.py.
+"""
+
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+_POLY = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_POLY))
+
+import common  # noqa: E402
+import churn  # noqa: E402
+import oracle_bug  # noqa: E402
+
+TIME_SCALE = 30000
+SAMPLE_INTERVAL = 6.0
+N_TICKS = 60
+FLEET_START_ABS = 1_700_000_000.0  # absolute epoch — mimics churn_log's absolute wall
+
+
+def _vday_at(tick):
+    # virtual_day at this tick: wall is RELATIVE (tick*interval), scaled by time_scale.
+    return (tick * SAMPLE_INTERVAL * TIME_SCALE) / 86400.0
+
+
+def _healthy_row(tick, label, archetype, status_ok, up_state):
+    """A TimeseriesRow with healthy values when up; daemon fields zeroed when down
+    (exactly how the collector records a down node)."""
+    vday = _vday_at(tick)
+    r = common.TimeseriesRow(
+        tick=tick,
+        wall_secs=tick * SAMPLE_INTERVAL,   # RELATIVE wall (as the collector writes)
+        virtual_day=vday,
+        label=label,
+        archetype=archetype,
+        up_state=up_state,
+        status_ok=1 if status_ok else 0,
+        device_id=label.replace("node-", "dev")[:16],
+    )
+    if status_ok:
+        r.peer_count = 39
+        r.peer_count_connected = 39
+        r.peer_count_authenticated = 39
+        r.avg_trust = 1.0
+        r.holding_bytes = 50_000_000
+        r.backed_up_files = 4
+        r.backed_up_bytes = 40_000_000
+        r.effective_quota_bytes = 2_000_000_000
+        r.used_bytes = 50_000_000
+        r.pos_total_challenges = tick          # climbing
+        r.pos_total_passes = tick              # climbing in lock-step
+        r.placement_count = 10
+        r.placement_alive = 10
+        r.placement_lost = 0
+        r.blocks_ok = 4
+        r.blocks_at_risk = 0
+        r.tbl_event_log = 100                  # FLAT -> db-bounded slope ~0
+        r.tbl_files = 4
+        r.ext_rss_kb = 200_000                 # FLAT -> rss-bounded slope ~0
+        r.ext_du_holdings_kb = 48_000          # FLAT -> disk-bounded slope ~0
+        r.ext_du_db_redb_bytes = 4_000_000
+        r.ext_du_datadir_kb = 60_000
+    return r
+
+
+def _write_fixture(rdir, rows, events, restore_entries, panic=False):
+    rdir = Path(rdir)
+    # timeseries.csv (real writer -> canonical schema)
+    fh, _ = common.open_timeseries_writer(rdir / "timeseries.csv")
+    for r in rows:
+        common.write_timeseries_row(fh, r)
+    fh.close()
+    # edges.csv (empty but present)
+    efh, _ = common.open_edges_writer(rdir / "edges.csv")
+    efh.close()
+    # churn_log.json (real writer; ChurnEvent carries absolute wall + virtual_day)
+    churn.write_churn_log(rdir / "churn_log.json", events)
+    # node_index.json
+    labels = sorted({r.label for r in rows})
+    idx = {lab: {"label": lab, "archetype": next(r.archetype for r in rows if r.label == lab),
+                 "device_id": lab.replace("node-", "dev")[:16], "join_virtual_day": 0}
+           for lab in labels}
+    (rdir / "node_index.json").write_text(json.dumps(idx))
+    # restore_results.json (authoritative outcomes the no-data-loss oracle reads)
+    (rdir / "restore_results.json").write_text(json.dumps({
+        "entries": restore_entries,
+        "total": len(restore_entries),
+        "restored_ok": sum(1 for e in restore_entries if e["status"] == "ok"),
+        "hash_mismatch": sum(1 for e in restore_entries if e["status"] == "hash_mismatch"),
+        "not_found": sum(1 for e in restore_entries if e["status"] == "not_found"),
+    }))
+    # stderr_scans.json (per-label panic/error scan)
+    scans = {lab: {"panicked": panic, "error_lines": 0, "first_error": None} for lab in labels}
+    (rdir / "stderr_scans.json").write_text(json.dumps(scans))
+    # scenario.json (provenance + thresholds source)
+    (rdir / "scenario.json").write_text(json.dumps({
+        "id": "fixture", "time_scale": TIME_SCALE, "sample_interval_secs": SAMPLE_INTERVAL,
+        "warmup_virtual_days": 0, "requested_nodes": len(labels),
+    }))
+
+
+def _ev(event_type, vday, targets):
+    """A ChurnEvent with an ABSOLUTE wall_secs (as churn.build_event_queue produces)
+    and the matching virtual_day — so a wall-based oracle reads it wrong and a
+    virtual_day-based oracle reads it right."""
+    return common.ChurnEvent(
+        virtual_day=float(vday),
+        wall_secs=FLEET_START_ABS + (vday * 86400.0 / TIME_SCALE),
+        event_type=event_type,
+        targets=list(targets),
+    )
+
+
+def _verdict(rdir):
+    oracle_bug.run(str(rdir))
+    v = json.loads((Path(rdir) / "verdict.json").read_text())
+    bf = v.get("bugfree", v)
+    return {c.get("name") or c.get("id"): c for c in bf.get("checks", [])}
+
+
+def _passed(check):
+    return check.get("passed", check.get("pass"))
+
+
+class OracleSelfTest(unittest.TestCase):
+    def test_churned_node_not_flagged_as_death_or_corruption(self):
+        """node-A is killed@vday2, restarted@vday40, killed@vday80 (and NOT restarted),
+        so it is intended-DOWN for the MAJORITY of the run AND at its final sample.
+        Every such status_ok=0 sample is PLANNED churn, not a crash/corruption. This
+        reproduces the steady_real1 false-positive (node down >50% of eligible samples
+        + down at teardown); a churn-aware oracle must NOT flag it. node-B is always up."""
+        rows = []
+        for t in range(N_TICKS):
+            vday = _vday_at(t)
+            a_down = (2.0 < vday < 40.0) or (vday > 80.0)
+            rows.append(_healthy_row(t, "node-A", "nomad",
+                                     status_ok=not a_down,
+                                     up_state="down" if a_down else "up"))
+            rows.append(_healthy_row(t, "node-B", "reliable", status_ok=True, up_state="up"))
+        events = [_ev("kill", 2.0, ["node-A"]), _ev("restart", 40.0, ["node-A"]),
+                  _ev("kill", 80.0, ["node-A"])]
+        restore = [{"label": "node-A", "name": "a0.bin", "want_hash": "h1", "got_hash": "h1", "status": "ok"},
+                   {"label": "node-B", "name": "b0.bin", "want_hash": "h2", "got_hash": "h2", "status": "ok"}]
+        with tempfile.TemporaryDirectory() as d:
+            _write_fixture(d, rows, events, restore)
+            ch = _verdict(d)
+            self.assertTrue(_passed(ch["BUG-no-unexpected-death"]),
+                            f"churn-killed node wrongly flagged dead: {ch['BUG-no-unexpected-death']}")
+            self.assertTrue(_passed(ch["BUG-db-integrity"]),
+                            f"churn-killed node wrongly flagged corrupt: {ch['BUG-db-integrity']}")
+            self.assertTrue(_passed(ch["BUG-no-data-loss"]),
+                            f"clean restore wrongly failed: {ch['BUG-no-data-loss']}")
+
+    def test_real_crash_is_flagged(self):
+        """node-C is intended UP the whole run (no churn events) but unreachable
+        throughout -> a real death the oracle MUST catch."""
+        rows = []
+        for t in range(N_TICKS):
+            rows.append(_healthy_row(t, "node-C", "reliable", status_ok=False, up_state="up"))
+            rows.append(_healthy_row(t, "node-B", "reliable", status_ok=True, up_state="up"))
+        restore = [{"label": "node-B", "name": "b0.bin", "want_hash": "h2", "got_hash": "h2", "status": "ok"}]
+        with tempfile.TemporaryDirectory() as d:
+            _write_fixture(d, rows, [], restore)
+            ch = _verdict(d)
+            self.assertFalse(_passed(ch["BUG-no-unexpected-death"]),
+                             "a node up-but-unreachable-throughout must be flagged dead")
+
+    def test_data_loss_is_flagged(self):
+        """A restored file whose hash != original MUST fail no-data-loss."""
+        rows = [_healthy_row(t, "node-B", "reliable", status_ok=True, up_state="up")
+                for t in range(N_TICKS)]
+        restore = [{"label": "node-B", "name": "b0.bin", "want_hash": "h2", "got_hash": "DIFFERENT", "status": "hash_mismatch"}]
+        with tempfile.TemporaryDirectory() as d:
+            _write_fixture(d, rows, [], restore)
+            ch = _verdict(d)
+            self.assertFalse(_passed(ch["BUG-no-data-loss"]),
+                             "a hash mismatch must fail the no-data-loss gate")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

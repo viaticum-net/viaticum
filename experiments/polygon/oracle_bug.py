@@ -395,19 +395,23 @@ _DOWN_EVENTS = frozenset({"kill", "mass_depart"})
 _UP_EVENTS = frozenset({"restart", "join"})
 
 
-def _intended_up(label: str, churn: dict, now_wall: float) -> bool:
-    """Reconstruct whether `label` was intended UP at wall time now_wall.
+def _intended_up(label: str, churn: dict, at_virtual_day: float) -> bool:
+    """Reconstruct whether `label` was intended UP at scenario virtual_day.
 
-    Same logic as churn.up_state_at: a node with no events is UP for the whole run; a
-    node whose first event is an UP event (a late-joiner) starts DOWN until that event.
+    Keyed on virtual_day, NOT wall_secs: churn_log event wall_secs are ABSOLUTE epoch
+    while the timeseries wall_secs are RELATIVE-to-fleet-start, so a wall_secs comparison
+    mixed bases and always returned the initial state (every node read 'up' -> churn-down
+    samples wrongly counted as deaths). virtual_day is base-independent and present on
+    every event + sample. Mirrors churn.up_state_at: no events -> UP the whole run; a
+    node whose first event is an UP event (late-joiner) starts DOWN until that event.
     """
     events = [e for e in churn.get("events", []) if label in (e.get("targets") or [])]
-    events.sort(key=lambda e: float(e.get("wall_secs", 0)))
+    events.sort(key=lambda e: float(e.get("virtual_day", 0)))
     if not events:
         return True
     state_up = events[0].get("event_type") not in _UP_EVENTS
     for e in events:
-        if float(e.get("wall_secs", 0)) > now_wall:
+        if float(e.get("virtual_day", 0)) > at_virtual_day:
             break
         et = e.get("event_type")
         if et in _DOWN_EVENTS:
@@ -417,26 +421,27 @@ def _intended_up(label: str, churn: dict, now_wall: float) -> bool:
     return state_up
 
 
-def _last_up_transition_wall(label: str, churn: dict, now_wall: float) -> float:
-    """Wall time of the most recent UP transition for `label` at/<= now_wall.
+def _last_up_transition_vday(label: str, churn: dict, at_virtual_day: float) -> float:
+    """virtual_day of the most recent UP transition for `label` at/<= at_virtual_day.
 
     Used to apply the re-auth/discovery settle window: a node that only just came UP is
-    not yet expected to have re-authenticated peers or finished discovery.
-    Returns 0.0 (fleet start) if the node was UP from the beginning.
+    not yet expected to have re-authenticated peers or finished discovery. Returns 0.0
+    if UP from the beginning, or +inf if currently down / not-yet-joined. Keyed on
+    virtual_day (see _intended_up for why wall_secs is unusable here).
     """
     events = [e for e in churn.get("events", []) if label in (e.get("targets") or [])]
-    events.sort(key=lambda e: float(e.get("wall_secs", 0)))
+    events.sort(key=lambda e: float(e.get("virtual_day", 0)))
     last_up = 0.0
     started_up = not events or events[0].get("event_type") not in _UP_EVENTS
     if not started_up:
         # Stays "not yet up" until the first UP event lands.
         last_up = float("inf")
     for e in events:
-        w = float(e.get("wall_secs", 0))
-        if w > now_wall:
+        v = float(e.get("virtual_day", 0))
+        if v > at_virtual_day:
             break
         if e.get("event_type") in _UP_EVENTS:
-            last_up = w
+            last_up = v
         elif e.get("event_type") in _DOWN_EVENTS:
             last_up = float("inf")  # currently down; no valid "up since"
     return last_up
@@ -507,7 +512,10 @@ def check_no_unexpected_death(ctx: _Ctx) -> CheckResult:
     against it, so a node mid-onboarding is not penalized.
     """
     settle_ticks = int(ctx.thresholds["reauth_settle_ticks"])
-    settle_wall = settle_ticks * ctx.sample_interval
+    # Settle window in VIRTUAL days (intended-state is keyed on virtual_day; see
+    # _intended_up). settle_ticks samples * real interval * time_scale / secs-per-day.
+    _ts = float(ctx.scenario.get("time_scale", 1) or 1)
+    settle_vdays = (settle_ticks * ctx.sample_interval * _ts) / 86400.0
     min_up = int(ctx.thresholds["min_up_ticks_for_liveness"])
 
     dead = {}
@@ -518,12 +526,12 @@ def check_no_unexpected_death(ctx: _Ctx) -> CheckResult:
         for r in rows:
             if r.wall_secs < ctx.warmup_wall:
                 continue
-            if not _intended_up(label, ctx.churn, r.wall_secs):
+            if not _intended_up(label, ctx.churn, r.virtual_day):
                 continue
-            up_since = _last_up_transition_wall(label, ctx.churn, r.wall_secs)
+            up_since = _last_up_transition_vday(label, ctx.churn, r.virtual_day)
             if up_since == float("inf"):
                 continue
-            if r.wall_secs < up_since + settle_wall:
+            if r.virtual_day < up_since + settle_vdays:
                 continue  # still settling after a (re)start
             eligible_total += 1
             if r.status_ok == 0:
@@ -799,13 +807,14 @@ def check_db_integrity(ctx: _Ctx) -> CheckResult:
     corrupt = {}
     checked = 0
     for label, last in last_rows.items():
-        if not _intended_up(label, ctx.churn, last.wall_secs):
+        if not _intended_up(label, ctx.churn, last.virtual_day):
             continue
-        up_since = _last_up_transition_wall(label, ctx.churn, last.wall_secs)
+        up_since = _last_up_transition_vday(label, ctx.churn, last.virtual_day)
         if up_since == float("inf"):
             continue
-        settle_wall = int(ctx.thresholds["reauth_settle_ticks"]) * ctx.sample_interval
-        if last.wall_secs < up_since + settle_wall:
+        _ts = float(ctx.scenario.get("time_scale", 1) or 1)
+        settle_vdays = (int(ctx.thresholds["reauth_settle_ticks"]) * ctx.sample_interval * _ts) / 86400.0
+        if last.virtual_day < up_since + settle_vdays:
             continue
         checked += 1
         if last.status_ok != 1:

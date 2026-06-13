@@ -122,7 +122,7 @@ class Collector:
 
         for label in self._fleet_labels():
             archetype = self._archetype_of(label)
-            up_state = self._up_state(label, now_wall)
+            up_state = self._up_state(label, virtual_day)
 
             status = self._safe_status(label)
             measured = self._safe_measure(label)
@@ -280,9 +280,11 @@ class Collector:
         plan = self.fleet._plans.get(label) if hasattr(self.fleet, "_plans") else None
         return str(getattr(plan, "archetype", "") or "")
 
-    def _up_state(self, label: str, now_wall: float) -> str:
+    def _up_state(self, label: str, virtual_day: float) -> str:
+        # Keyed on virtual_day: up_state_at replays event virtual_day (base-independent);
+        # passing a relative wall here would mix bases against absolute event wall_secs.
         try:
-            return up_state_at(label, self.churn_queue, now_wall)
+            return up_state_at(label, self.churn_queue, virtual_day)
         except Exception:
             return ""
 
