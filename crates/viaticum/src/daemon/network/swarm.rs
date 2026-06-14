@@ -88,6 +88,26 @@ pub fn scaled_kad_cadence(base: Duration, time_scale: u64) -> Duration {
     }
 }
 
+/// Select which discovered peers to dial this round. Mirrors the provider-path
+/// gating: skip entirely once we already have TARGET_PEERS authenticated peers
+/// (cold backup wants a stable small set, not unbounded growth), and cap the
+/// number of concurrent dials to MAX_CONCURRENT_DISCOVERY_DIALS to avoid bursting
+/// the cert-exchange pipeline. Peers with empty addrs are kept (dial_discovered_peer
+/// still guards self/already-connected/dialing and falls back to peerid-only dial).
+pub fn discovery_dial_candidates(
+    peer_list: Vec<(PeerId, Vec<Multiaddr>)>,
+    auth_count: usize,
+) -> Vec<(PeerId, Vec<Multiaddr>)> {
+    use viaticum_core::constants::{MAX_CONCURRENT_DISCOVERY_DIALS, TARGET_PEERS};
+    if auth_count >= TARGET_PEERS {
+        return Vec::new();
+    }
+    peer_list
+        .into_iter()
+        .take(MAX_CONCURRENT_DISCOVERY_DIALS)
+        .collect()
+}
+
 // ─── ViaticumCodec ────────────────────────────────────────────────────────────
 
 /// CBOR codec for libp2p request-response (main protocol).
@@ -690,6 +710,7 @@ impl SwarmHandle {
             peer_addrs: HashMap::new(),
             pending_requests: HashMap::new(),
             pending_closest_peers: HashMap::new(),
+            discovery_queries: HashSet::new(),
             our_cert: config.device_cert,
             our_x25519_pub: config.x25519_pub,
             cluster_master_pub: config.cluster_master_pub,
@@ -957,6 +978,11 @@ struct EventLoopState {
     /// timed out before the command arrived) are harmlessly absent.
     pending_closest_peers:
         HashMap<QueryId, oneshot::Sender<Result<ClosestPeersResult, SwarmError>>>,
+
+    /// QueryId set for get_closest_peers queries issued by DISCOVERY (do_kad_discovery),
+    /// as opposed to the SwarmHandle API (pending_closest_peers). A discovery query's
+    /// result is dialed (with addresses) rather than returned to a caller.
+    discovery_queries: HashSet<QueryId>,
 
     our_cert: DeviceCertificate,
     our_x25519_pub: Option<[u8; 32]>,
@@ -1503,6 +1529,16 @@ impl EventLoopState {
         let key = self.viaticum_namespace_key.clone();
         let query_id = self.swarm.behaviour_mut().kad.get_providers(key);
         debug!(query_id = ?query_id, "kademlia get_providers issued");
+
+        // Address-carrying discovery: get_closest_peers returns PeerInfo{peer_id, addrs},
+        // unlike get_providers (PeerIds only). Querying our OWN id fills our DHT
+        // neighborhood with addresses learned from the bootstrap seed, so a star-spoke
+        // that only knows the seed can reach siblings. The seed answers with the closest
+        // peers to our id INCLUDING their addresses (it knows everyone who dialed it).
+        let self_key = self.swarm.local_peer_id().to_bytes();
+        let qid = self.swarm.behaviour_mut().kad.get_closest_peers(self_key);
+        self.discovery_queries.insert(qid);
+        debug!(query_id = ?qid, "kademlia get_closest_peers (discovery) issued");
     }
 
     /// Dial a peer discovered via DHT if not already connected or dialing.
@@ -1619,40 +1655,55 @@ impl EventLoopState {
                         // but skip rather than double-send just in case.
                         return;
                     }
-                    if let Some(reply) = self.pending_closest_peers.remove(&id) {
-                        let peer_list = match result {
-                            Ok(ok) => {
-                                debug!(
-                                    query_id = ?id,
-                                    count = ok.peers.len(),
-                                    "dht: get_closest_peers complete"
-                                );
-                                ok.peers
-                                    .into_iter()
-                                    .map(|pi| (pi.peer_id, pi.addrs))
-                                    .collect()
-                            }
-                            Err(e) => {
-                                // Timeout: return collected peers (best-effort).
-                                debug!(
-                                    query_id = ?id,
-                                    error = ?e,
-                                    "dht: get_closest_peers timeout, returning partial result"
-                                );
-                                match e {
-                                    libp2p::kad::GetClosestPeersError::Timeout {
-                                        peers, ..
-                                    } => {
-                                        peers.into_iter().map(|pi| (pi.peer_id, pi.addrs)).collect()
-                                    }
+                    // Extract the peer list once (shared by both routes). Both Ok and
+                    // Err(Timeout) carry a peer list; on Timeout we keep whatever the
+                    // query collected (best-effort).
+                    let peer_list: Vec<(PeerId, Vec<Multiaddr>)> = match result {
+                        Ok(ok) => {
+                            debug!(
+                                query_id = ?id,
+                                count = ok.peers.len(),
+                                "dht: get_closest_peers complete"
+                            );
+                            ok.peers
+                                .into_iter()
+                                .map(|pi| (pi.peer_id, pi.addrs))
+                                .collect()
+                        }
+                        Err(e) => {
+                            debug!(
+                                query_id = ?id,
+                                error = ?e,
+                                "dht: get_closest_peers timeout, returning partial result"
+                            );
+                            match e {
+                                libp2p::kad::GetClosestPeersError::Timeout { peers, .. } => {
+                                    peers.into_iter().map(|pi| (pi.peer_id, pi.addrs)).collect()
                                 }
                             }
-                        };
+                        }
+                    };
+
+                    // Route by query origin: SwarmHandle API vs DISCOVERY.
+                    if let Some(reply) = self.pending_closest_peers.remove(&id) {
+                        // SwarmHandle API path (unchanged behavior — DR walk depends
+                        // on the oneshot receiving exactly this list).
                         let _ = reply.send(Ok(peer_list));
+                    } else if self.discovery_queries.remove(&id) {
+                        // Discovery path: dial the discovered peers WITH their addresses.
+                        let dials = discovery_dial_candidates(peer_list, self.authenticated.len());
+                        debug!(
+                            query_id = ?id,
+                            count = dials.len(),
+                            "dht: dialing discovered peers (address-carrying)"
+                        );
+                        for (peer_id, addrs) in dials {
+                            self.dial_discovered_peer(peer_id, addrs);
+                        }
                     } else {
                         debug!(
                             query_id = ?id,
-                            "dht: get_closest_peers result with no pending caller (caller timed out?)"
+                            "dht: get_closest_peers result with no pending caller"
                         );
                     }
                 }

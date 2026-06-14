@@ -12,8 +12,8 @@ use viaticum_core::types::DeviceId;
 
 use super::swarm_test_helpers::{get_listen_addr, make_cert, make_signing_key};
 use crate::daemon::network::swarm::{
-    ProtocolEvent, SwarmConfig, SwarmHandle, ipfs_bootstrap_peers, peer_id_from_multiaddr,
-    scaled_kad_cadence,
+    ProtocolEvent, SwarmConfig, SwarmHandle, discovery_dial_candidates, ipfs_bootstrap_peers,
+    peer_id_from_multiaddr, scaled_kad_cadence,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -528,4 +528,80 @@ fn scaled_kad_cadence_floored_at_one_second() {
         scaled_kad_cadence(Duration::from_secs(300), 30000),
         Duration::from_secs(1)
     );
+}
+
+// ─── discovery_dial_candidates (address-carrying discovery gating) ──────────────
+
+/// Build a synthetic peer list of `n` entries, each with one distinct address.
+fn fake_peer_list(n: usize) -> Vec<(libp2p::PeerId, Vec<Multiaddr>)> {
+    (0..n)
+        .map(|i| {
+            let peer_id = libp2p::PeerId::random();
+            let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", 4000 + i)
+                .parse()
+                .expect("valid multiaddr");
+            (peer_id, vec![addr])
+        })
+        .collect()
+}
+
+#[test]
+fn discovery_dial_candidates_returns_empty_when_target_reached() {
+    use viaticum_core::constants::{MAX_CONCURRENT_DISCOVERY_DIALS, TARGET_PEERS};
+    // We already have TARGET_PEERS authenticated → no further dials.
+    let peers = fake_peer_list(MAX_CONCURRENT_DISCOVERY_DIALS + 2);
+    let out = discovery_dial_candidates(peers, TARGET_PEERS);
+    assert!(
+        out.is_empty(),
+        "must skip discovery once auth_count >= TARGET_PEERS"
+    );
+
+    // Also empty when above the target.
+    let peers = fake_peer_list(3);
+    let out = discovery_dial_candidates(peers, TARGET_PEERS + 5);
+    assert!(
+        out.is_empty(),
+        "must skip discovery when above TARGET_PEERS"
+    );
+}
+
+#[test]
+fn discovery_dial_candidates_caps_to_max_concurrent_dials() {
+    use viaticum_core::constants::MAX_CONCURRENT_DISCOVERY_DIALS;
+    // Far below TARGET_PEERS, but given more peers than the dial cap.
+    let peers = fake_peer_list(MAX_CONCURRENT_DISCOVERY_DIALS + 10);
+    let out = discovery_dial_candidates(peers, 0);
+    assert_eq!(
+        out.len(),
+        MAX_CONCURRENT_DISCOVERY_DIALS,
+        "must cap concurrent dials to MAX_CONCURRENT_DISCOVERY_DIALS"
+    );
+}
+
+#[test]
+fn discovery_dial_candidates_returns_all_when_under_both_limits() {
+    use viaticum_core::constants::MAX_CONCURRENT_DISCOVERY_DIALS;
+    // Fewer peers than the dial cap, auth_count under the target.
+    let n = MAX_CONCURRENT_DISCOVERY_DIALS.saturating_sub(2).max(1);
+    let peers = fake_peer_list(n);
+    let out = discovery_dial_candidates(peers, 1);
+    assert_eq!(
+        out.len(),
+        n,
+        "must return all peers when under both the dial cap and the peer target"
+    );
+}
+
+#[test]
+fn discovery_dial_candidates_preserves_addresses() {
+    // The addrs vec must pass through unchanged for each surviving entry.
+    let peers = fake_peer_list(2);
+    let expected: Vec<(libp2p::PeerId, Vec<Multiaddr>)> = peers.clone();
+    let out = discovery_dial_candidates(peers, 0);
+    assert_eq!(out.len(), expected.len());
+    for (got, want) in out.iter().zip(expected.iter()) {
+        assert_eq!(got.0, want.0, "peer_id must be preserved");
+        assert_eq!(got.1, want.1, "addresses must be preserved unchanged");
+        assert!(!got.1.is_empty(), "addresses must not be dropped");
+    }
 }
