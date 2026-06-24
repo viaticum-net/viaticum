@@ -45,6 +45,16 @@
 //!   (robust to dials): the forecast is conservative (≤ actual), high-ι symbols
 //!   actually survive more, and the per-symbol forecast beats the
 //!   aggregate-per-holder-average it replaces.
+//!
+//! ## Dynamic harness (Experiment-1 — honest convergence over time)
+//!
+//! * [`sim_dynamic`] — the DYNAMIC time-loop harness (the §10 buildable spec of
+//!   `sim_dynamic_design.md`). Stateful agent nodes with hidden archetypes drive
+//!   behaviour over weekly ticks (place / PoS / capital / eviction / repair /
+//!   churn), all through the observer boundary. Experiment-1 measures honest
+//!   convergence (earned-G gap + Spearman ρ), reciprocity on god-view served
+//!   volumes, DR sanity, and newcomer bootstrap — un-poisoned by the storage-oracle
+//!   that inflated the Phase-1 Python sims.
 
 pub mod engine;
 pub mod evaluator;
@@ -55,5 +65,6 @@ pub mod sim12;
 pub mod sim12b;
 pub mod sim2;
 pub mod sim6;
+pub mod sim_dynamic;
 pub mod sim_r1;
 pub mod surface_fit;

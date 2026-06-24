@@ -29,6 +29,10 @@ path = "src/bin/sim12b.rs"
 name = "sim_r1"
 path = "src/bin/sim_r1.rs"
 
+[[bin]]
+name = "sim_dynamic"
+path = "src/bin/sim_dynamic.rs"
+
 [dependencies]
 # The sim depends on core; core NEVER depends on sim. This one-directional edge
 # is the structural anti-oracle guarantee: a kernel function in viaticum-core

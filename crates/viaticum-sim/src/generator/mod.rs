@@ -28,6 +28,33 @@ impl Rng {
         }
     }
 
+    /// Derive an INDEPENDENT, deterministically-keyed stream from a base seed and
+    /// up to four mixing coordinates (e.g. owner, holder, symbol, tick). The same
+    /// `(base, k0..k3)` always yields the same stream; different coordinates yield
+    /// (with overwhelming probability) independent streams. This is the load-bearing
+    /// `Rng::derive(run_seed, o, h, s, tick)` of `sim_dynamic` (design §10.B): every
+    /// PoS draw is keyed by its (pair, symbol, tick) so the whole run is bit-
+    /// reproducible AND no draw correlates with a neighbour by accident.
+    ///
+    /// The coordinates are folded in with distinct large odd multipliers (a SplitMix-
+    /// style avalanche), so permuting them does not collide. NOT cryptographic — it
+    /// only spreads the synthetic draws deterministically.
+    pub fn derive(base: u64, k0: u64, k1: u64, k2: u64, k3: u64) -> Self {
+        let mut z = base;
+        for (i, &k) in [k0, k1, k2, k3].iter().enumerate() {
+            // Mix each coordinate with a distinct odd multiplier, then avalanche.
+            let salt =
+                0x9E37_79B9_7F4A_7C15u64.wrapping_mul((i as u64).wrapping_mul(2).wrapping_add(1));
+            z = z.wrapping_add(k.wrapping_mul(0xBF58_476D_1CE4_E5B9 ^ salt));
+            z ^= z >> 30;
+            z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z ^= z >> 27;
+            z = z.wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+        }
+        Rng::new(z)
+    }
+
     fn next_u64(&mut self) -> u64 {
         self.state = self
             .state
