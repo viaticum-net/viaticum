@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/viaticum-core",
     "crates/viaticum",
+    "crates/viaticum-sim",
 ]
 
 [workspace.package]

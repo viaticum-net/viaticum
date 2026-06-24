@@ -1,0 +1,38 @@
+[package]
+name = "viaticum-sim"
+description = "4R trust-model design-verification simulator (offline harness; not the daemon)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sim2"
+path = "src/bin/sim2.rs"
+
+[[bin]]
+name = "sim6"
+path = "src/bin/sim6.rs"
+
+[[bin]]
+name = "sim12"
+path = "src/bin/sim12.rs"
+
+[[bin]]
+name = "sim12b"
+path = "src/bin/sim12b.rs"
+
+[[bin]]
+name = "sim_r1"
+path = "src/bin/sim_r1.rs"
+
+[dependencies]
+# The sim depends on core; core NEVER depends on sim. This one-directional edge
+# is the structural anti-oracle guarantee: a kernel function in viaticum-core
+# physically cannot reference the hidden GroundTruth defined in this crate.
+viaticum-core = { workspace = true }
+# No RNG crate: the sim uses a tiny deterministic LCG (see generator::Rng) so
+# runs are fully reproducible from a seed and the binary has zero extra deps.

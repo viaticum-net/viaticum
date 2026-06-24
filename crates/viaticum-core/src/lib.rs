@@ -11,6 +11,7 @@ pub mod db;
 pub mod deletion;
 pub mod erasure;
 pub mod escrow;
+pub mod four_r;
 pub mod importance;
 pub mod mailbox;
 pub mod messages;
