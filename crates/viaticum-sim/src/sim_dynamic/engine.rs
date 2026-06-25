@@ -78,6 +78,13 @@ pub struct DynParams {
     /// baseline (for A/B). Strength is set by the canon `RetentionPrior`, not a magic
     /// weight — the old ad-hoc `recip_weight` bonus is GONE.
     pub reciprocal_placement: bool,
+    /// Preemptive-accept margin (§2 / эталон §2, g_ho units). Under contention a holder
+    /// admits a new owner `O` ONLY by displacing its LEAST-reciprocal current holding
+    /// `O_min`, and ONLY if `g_ho(O,h) > g_ho(O_min,h) + preempt_margin` — a monotone
+    /// worse→better swap (φ-neutral, so it bypasses the NEW-2 freeze without thrash).
+    /// `< 0` (e.g. `f64::NEG_INFINITY`) disables preemption (the old freeze-on-
+    /// contention behaviour) for A/B. A small positive value avoids churn on near-ties.
+    pub preempt_margin: f64,
 }
 
 impl Default for DynParams {
@@ -122,6 +129,10 @@ impl Default for DynParams {
             // ON). Ranks by surface · retained_depth(obs); reciprocity enters through
             // the canon RetentionPrior, no magic weight. false = pure-surface baseline.
             reciprocal_placement: true,
+            // Preemptive accept ON by default with a small margin to avoid near-tie
+            // churn (§2). The margin is in g_ho units (leaky gb·days); a few units is a
+            // small fraction of one symbol's steady-state capital.
+            preempt_margin: 2.0,
         }
     }
 }
@@ -317,19 +328,82 @@ fn place_own_data(
                     (tick << 8) ^ bi as u64,
                 );
                 let willing = rng.unit() < world.nodes[holder].archetype.willing_accept_rate();
+                if !willing {
+                    continue; // unwilling = behavioural hard reject (archetype §10.A)
+                }
                 let has_room = world.nodes[holder].free_disk() >= v_per_symbol;
                 // Hysteresis ACCEPT-GATE (kernel §6½/§10, NEW-2 damper): a holder only
-                // accepts new foreign data when it is ABOVE the accept threshold AND
-                // not currently evicting — `accept_ok = φ > s_soft ∧ ¬evicting`. This
-                // is what FORBIDS "drop to s_target then immediately re-accept and fall
-                // below s_hard again" (the NEW-2 accept↔evict cycle). Without it the
-                // greedy cream re-offers every evicted symbol next tick and the relay
-                // thrashes. The upper gap (s_soft) is the §A.3 reciprocal admission
-                // headroom; the latch bit is threaded through `Node::evict_phase`.
+                // FREELY accepts new foreign data when ABOVE the accept threshold AND not
+                // evicting — `accept_ok = φ > s_soft ∧ ¬evicting`. This forbids the
+                // NEW-2 accept↔evict cycle for NET accepts (which lower φ).
                 let accept_ok = world.nodes[holder].phi_free_ratio() > params.hyst.s_soft
                     && !world.nodes[holder].evict_phase.evicting;
-                if !willing || !has_room || !accept_ok {
-                    continue; // reject: unwilling, full (quota §A.3), or hysteresis gate
+
+                // §2 PREEMPTION + UNFREEZE (эталон §2). Above the gate with room → accept
+                // freely (bootstrap). Otherwise (contended/frozen) the holder may STILL
+                // admit `owner` by DISPLACING its least-reciprocal current holding — but
+                // ONLY if `owner` is more reciprocal than that victim by `preempt_margin`.
+                // The swap is φ-NEUTRAL (one out + one in ≈ equal volume), so it does NOT
+                // fight the NEW-2 latch (which guards NET accepts) and safely bypasses the
+                // freeze. Monotone (worse→better) ⇒ no thrash. A parasite (g_ho≈0 with all)
+                // can never satisfy `0 > g_min + margin`, so it cannot preempt in and its
+                // holdings are displaced by reciprocal owners — the core densifies.
+                let admit = if has_room && accept_ok {
+                    true
+                } else if !params.preempt_margin.is_finite() {
+                    false // preemption disabled (A/B): the old freeze-on-contention
+                } else {
+                    // §2 preemptive swap. `g_new` = "has this owner served me (the
+                    // holder)?" = the new owner's reciprocity toward this holder (the
+                    // holder's OWN ledger).
+                    let g_new = world.capital[owner][holder].g_ho;
+                    // The holder's LEAST-reciprocal alive holding owned by a DIFFERENT
+                    // owner (don't cannibalise `owner`'s own data). First-hand: each
+                    // victim's reciprocity is `capital[O'][holder].g_ho`.
+                    let victim = world.nodes[holder]
+                        .holdings
+                        .iter()
+                        .filter(|s| s.alive && s.owner != owner)
+                        .map(|s| (s.owner, s.block, s.volume, world.capital[s.owner][holder].g_ho))
+                        .min_by(|a, b| a.3.total_cmp(&b.3));
+                    match victim {
+                        Some((v_owner, v_block, v_vol, g_min))
+                            if g_new > g_min + params.preempt_margin
+                                && world.nodes[holder].free_disk() + v_vol >= v_per_symbol =>
+                        {
+                            // Evict the victim (φ-neutral swap). Mark dead, log the drop
+                            // (g_ho_at_drop = g_min, the displaced reciprocity), and remove
+                            // the victim owner's placement.
+                            if let Some(hs) = world.nodes[holder]
+                                .holdings
+                                .iter_mut()
+                                .find(|s| s.alive && s.owner == v_owner && s.block == v_block)
+                            {
+                                hs.alive = false;
+                            }
+                            world
+                                .eviction_log
+                                .push(crate::sim_dynamic::generator::EvictionEvent {
+                                    tick,
+                                    holder,
+                                    owner: v_owner,
+                                    g_ho_at_drop: g_min,
+                                });
+                            if let Some(b) = world.nodes[v_owner]
+                                .own_blocks
+                                .iter_mut()
+                                .find(|b| b.id == v_block)
+                                && let Some(pos) = b.placements.iter().position(|p| p.holder == holder)
+                            {
+                                b.placements.remove(pos);
+                            }
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if !admit {
+                    continue; // reject: full/frozen and no admissible preemptive swap
                 }
                 // Record the god-view holding on the holder.
                 world.nodes[holder].holdings.push(HeldSymbol {
@@ -344,8 +418,8 @@ fn place_own_data(
                     .placements
                     .push(BlockPlacement { holder });
                 // Reciprocity (g_ho / g_oh) is threaded in pos_and_capital on a PoS
-                // pass — the eviction-by-G self-balancing (§C.3) plus the quota reject
-                // above ARE the reciprocity mechanism (§A.1: NOT a separate accept-gate).
+                // pass — eviction-by-G + the §2 preemptive swap ARE the reciprocity
+                // mechanism (§A.1: NOT a separate accept-gate).
             }
         }
     }

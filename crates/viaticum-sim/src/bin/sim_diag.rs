@@ -61,13 +61,21 @@ fn main() {
         .next()
         .map(|s| s != "0" && !s.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
+    // 5th arg: §2 preemptive-accept margin (g_ho units). "off" = preemption DISABLED
+    // (the old freeze-on-contention baseline); a number = the margin; default = model.
+    let preempt_margin: f64 = match args.next() {
+        Some(s) if s.eq_ignore_ascii_case("off") => f64::NEG_INFINITY,
+        Some(s) => s.parse().unwrap_or_else(|_| DynParams::default().preempt_margin),
+        None => DynParams::default().preempt_margin,
+    };
 
     let params = DynParams {
         block_volume,
         reciprocal_placement,
+        preempt_margin,
         ..DynParams::default()
     };
-    println!("[reciprocal_placement = {reciprocal_placement}]");
+    println!("[reciprocal_placement = {reciprocal_placement}  preempt_margin = {preempt_margin}]");
     let prior = SurfacePrior::default();
     let policy = PlacementPolicy::default();
 
