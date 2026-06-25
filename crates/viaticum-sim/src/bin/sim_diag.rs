@@ -353,4 +353,54 @@ fn main() {
         n / 2,
         100.0 * low_half as f64 / total_ev as f64
     );
+
+    // --- (5) TRUTHFUL durability by owner-archetype (god-view, NO broken §5 logistic).
+    // The real pillar-1 question: does the parasite's data end up LESS durable? For each
+    // owner's block, count holders that CURRENTLY hold an alive symbol of it (recomputed
+    // god-view, not the placements list). Report mean alive-holders/block and the share
+    // of blocks UNDER-replicated (< k_eff alive) and LOST (0 alive). If reciprocity-
+    // eviction penalises the parasite, Freeloader/Hoarder should sit WORSE than Reliable.
+    let k_eff = params.k_eff;
+    println!(
+        "\n-- (5) TRUTHFUL durability by owner-archetype (alive holders/block; k_eff={k_eff}) --"
+    );
+    println!(
+        "  {:<10} {:>7}  {:>11}  {:>13}  {:>9}",
+        "owner", "blocks", "mean alive", "under-repl <k", "lost =0"
+    );
+    for &a in &ARCHES {
+        let mut counts: Vec<usize> = Vec::new();
+        for o in 0..n {
+            if !world.nodes[o].present || world.nodes[o].archetype != a {
+                continue;
+            }
+            for b in &world.nodes[o].own_blocks {
+                let alive = (0..n)
+                    .filter(|&h| {
+                        world.nodes[h].present
+                            && world.nodes[h]
+                                .holdings
+                                .iter()
+                                .any(|s| s.alive && s.owner == o && s.block == b.id)
+                    })
+                    .count();
+                counts.push(alive);
+            }
+        }
+        if counts.is_empty() {
+            continue;
+        }
+        let blocks = counts.len();
+        let mean_alive = counts.iter().sum::<usize>() as f64 / blocks as f64;
+        let under = counts.iter().filter(|&&c| c < k_eff).count();
+        let lost = counts.iter().filter(|&&c| c == 0).count();
+        println!(
+            "  {:<10} {:>7} {:>11.2}  {:>11.1}%  {:>7.1}%",
+            aname(a),
+            blocks,
+            mean_alive,
+            100.0 * under as f64 / blocks as f64,
+            100.0 * lost as f64 / blocks as f64
+        );
+    }
 }
