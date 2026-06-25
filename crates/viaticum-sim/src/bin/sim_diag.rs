@@ -55,19 +55,19 @@ fn main() {
     let seed: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0x00E1_5EED);
     let n_nodes: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(200);
     let block_volume: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(20.0);
-    // 4th arg: reciprocity-aware placement weight (canon §9.5 / эталон §1 main lever).
-    // 0.0 = pure-surface baseline; default = the model value. A/B the g_ho-population.
-    let recip_weight: f64 = args
+    // 4th arg: reciprocity-aware placement (canon retention forecast, эталон §1 main
+    // lever). "0" = pure-surface baseline; "1"/default = canon retained_depth ranking.
+    let reciprocal_placement: bool = args
         .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| DynParams::default().recip_weight);
+        .map(|s| s != "0" && !s.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
 
     let params = DynParams {
         block_volume,
-        recip_weight,
+        reciprocal_placement,
         ..DynParams::default()
     };
-    println!("[recip_weight = {recip_weight}]");
+    println!("[reciprocal_placement = {reciprocal_placement}]");
     let prior = SurfacePrior::default();
     let policy = PlacementPolicy::default();
 

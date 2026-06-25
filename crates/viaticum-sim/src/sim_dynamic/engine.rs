@@ -20,8 +20,8 @@
 //! uses them only to drive BEHAVIOUR (accept/reject, online, evict-aggression).
 
 use viaticum_core::four_r::{
-    BlockReq, Hysteresis, NodeLocal, PlacementPolicy, SurfacePrior, capital_steady_state,
-    estimate_surface, eviction_order,
+    BlockReq, Hysteresis, NodeLocal, PlacementPolicy, RetentionPrior, SurfacePrior,
+    estimate_surface, eviction_order, retained_depth,
 };
 
 use crate::generator::Rng;
@@ -67,16 +67,17 @@ pub struct DynParams {
     pub disk_cap_base: f64,
     /// Per-node uniform spread (gb) added to `disk_cap_base` (heterogeneous disks).
     pub disk_cap_spread: f64,
-    /// Reciprocity-aware placement weight (canon §9.5 / эталон §1). A SOFT, ι-scoped
-    /// bonus the owner adds to a candidate holder's surface score in proportion to its
-    /// OWN first-hand `capital[owner][h].g_ho` ("I have served h"). `0.0` ⇒ pure
-    /// surface (the kernel `place` behaviour); the bonus is `recip_weight · ι ·
-    /// g_ho/(g_ho+G*)` so a fully-reciprocal max-ι holder gains at most `recip_weight`
-    /// of r_hat — surface stays PRIMARY, reciprocity only tilts among comparable
-    /// candidates (no hard "reciprocal-only" rule → newcomers not frozen out). This is
-    /// the lever that POPULATES g_ho so §4 eviction can drop the non-reciprocal
-    /// parasite first (эталон §8 main lever).
-    pub recip_weight: f64,
+    /// Reciprocity-aware placement via the CANON retention forecast (canon §9.5 /
+    /// эталон §1, поправка Ильи 2026-06-26). When `true`, placement ranks candidates by
+    /// the canon two-route keep-probability `surface · retained_depth(obs)` instead of
+    /// surface alone — `retained_depth` (mod.rs:1134) folds in the owner's first-hand
+    /// `g_holder_from_owner` (= `capital[owner][h].g_ho` = "how much h stores at us"),
+    /// so a holder that already stores at us forecasts a HIGHER survival for our symbol
+    /// and is preferred. This is the canon mechanism that forces reciprocity (the
+    /// dynamic `place` used surface-only K2 and ignored it). `false` ⇒ pure-surface
+    /// baseline (for A/B). Strength is set by the canon `RetentionPrior`, not a magic
+    /// weight — the old ad-hoc `recip_weight` bonus is GONE.
+    pub reciprocal_placement: bool,
 }
 
 impl Default for DynParams {
@@ -117,13 +118,10 @@ impl Default for DynParams {
             // the world into contention where eviction rations the cream margin.
             disk_cap_base: 160.0,
             disk_cap_spread: 60.0,
-            // Soft reciprocity-aware placement (canon §9.5). A fully-reciprocal
-            // max-ι holder gains at most 0.15 of r_hat — enough to tilt the choice
-            // among surface-comparable candidates (concentrating high-ι data on
-            // holders the owner reciprocally serves → populates g_ho), too small to
-            // override a materially better-surface stranger (durability floor stays
-            // surface-driven). Calibratable; 0.0 recovers the pure-surface baseline.
-            recip_weight: 0.15,
+            // Reciprocity-aware placement via the canon retention forecast (default
+            // ON). Ranks by surface · retained_depth(obs); reciprocity enters through
+            // the canon RetentionPrior, no magic weight. false = pure-surface baseline.
+            reciprocal_placement: true,
         }
     }
 }
@@ -202,6 +200,10 @@ fn place_own_data(
     prior: &SurfacePrior,
     policy: &PlacementPolicy,
 ) {
+    // `policy` is kept on the placement API for symmetry with the kernel, but the
+    // contention placement spreads by `addr_subnet` (the AddrCorrelate default the
+    // sim always uses); the cap_mode switch is not exercised here.
+    let _ = policy;
     let n = world.nodes.len();
     let dt = DAYS_PER_TICK;
     let tick = world.tick;
@@ -282,19 +284,15 @@ fn place_own_data(
                 r_target: params.r_target,
             };
 
-            // The owner's OWN first-hand reciprocity toward each candidate h:
-            // `capital[owner][h].g_ho` = "I (owner) have served h" (PairCapital doc;
-            // bilaterally observable, never a peer's private cell — anti-oracle legal).
-            let recip_g_ho: Vec<f64> = caps.iter().map(|c| c.g_ho).collect();
+            // Reciprocity enters through the canon retention forecast inside
+            // place_reciprocal: each candidate's `obs.g_holder_from_owner` (built from
+            // `capital[owner][h].g_ho` by the observer) feeds `retained_depth`. No
+            // separate g_ho plumbing — the reciprocity is already in `cand_obs`.
             let chosen_local: Vec<usize> = place_reciprocal(
                 &cand_obs,
-                &recip_g_ho,
                 &req,
                 prior,
-                policy,
-                block_iota,
-                params.recip_weight,
-                params.lambda,
+                params.reciprocal_placement,
                 want,
             );
 
@@ -353,55 +351,54 @@ fn place_own_data(
     }
 }
 
-/// Reciprocity-aware placement (canon §9.5 / эталон §1, the main lever of §8). Picks
-/// holders by a BLENDED key — surface `r_hat` PRIMARY plus a SOFT, ι-scoped
-/// reciprocity bonus — then greedily admits them (≤1 per observable address bucket,
-/// the §7 spread) until the `r_target` floor is reached (durability: the SAME survival
-/// stop the kernel `place` uses) and on up to `want` holders (the greedy ι-cream
-/// margin, §A.1 / foundation §5½). Returns the chosen LOCAL candidate indices.
+/// Reciprocity-aware placement via the CANON retention forecast (canon §9.5 / эталон
+/// §1, the main lever of §8; поправка Ильи 2026-06-26). Ranks holders by the canon
+/// two-route keep-probability and greedily admits them (≤1 per observable address
+/// bucket, the §7 spread), filling to `want` (the floor `R̂ ≥ r_target` is reached
+/// along the surface-dominated order the same way the kernel `place` stops, plus the
+/// greedy ι-cream margin §A.1). Returns the chosen LOCAL candidate indices.
 ///
-/// **Why blended, not a hard reciprocal rule.** The owner's score for candidate `h`
-/// is `r_hat(h) + recip_weight · ι · g_ho/(g_ho+G*)`, where `g_ho =
-/// capital[owner][h].g_ho` is the owner's OWN first-hand record of storage it has
-/// performed for `h` ("I have served h"), `G* = capital_steady_state(v_per_symbol, λ)`
-/// is one symbol's steady-state capital (so "served ≈ one symbol's worth" → bonus
-/// half-saturated), and `ι ∈ [0,1]` scopes the preference to the high-ι core
-/// (marginal/low-ι blocks stay opportunistic, §9.5). The bonus is at most
-/// `recip_weight` of an `r_hat` ∈ [0,1], so a materially better-surface stranger still
-/// wins (durability floor stays surface-driven) — reciprocity only tilts the choice
-/// among comparable candidates. Concentrating the owner's data on holders it
-/// reciprocally serves POPULATES `g_ho`, so the holder's §4 eviction (which ranks
-/// owners ascending by `g_ho`) keeps this owner and drops the non-reciprocal parasite
-/// first. `recip_weight = 0` recovers the pure-surface kernel behaviour exactly.
+/// **Reciprocity IS the canon retention forecast — NOT an ad-hoc bonus.** Each
+/// candidate's per-symbol keep-prob is `surface · retained_depth(obs)` — the rank-
+/// marginalized form of the canon K3 `estimate_block_survival_per_symbol` (mod.rs:1269)
+/// keep-prob `surface · s(rank; φ_O)`. `retained_depth` (mod.rs:1134) reads
+/// `obs.g_holder_from_owner` = the owner's OWN first-hand `capital[owner][h].g_ho`
+/// ("how much h stores at us" / "my service to h") and maps it through
+/// `sigmoid(standing − pressure − conservatism)` to `φ_O ∈ [~0.18 stranger, ~0.62
+/// deeply-reciprocal]`. So a holder that already stores at us forecasts a HIGHER
+/// survival for our symbol → it is preferred. This is the canon mechanism that forces
+/// reciprocity; the dynamic `place` was using surface-only K2 and IGNORING it (the
+/// drift Ilya caught). The ~3.4× multiplicative range keeps surface primary (a far-
+/// better-surface stranger still wins) yet concentrates data on reciprocal holders,
+/// POPULATING g_ho so §4 eviction drops the non-reciprocal parasite first.
+/// `reciprocal = false` recovers the pure-surface kernel behaviour exactly (A/B).
 ///
-/// **Anti-oracle.** Reads only the same first-hand `cand_obs` the kernel sees and the
-/// owner's own `capital[owner][*].g_ho` ledger — never a peer's private cell.
-#[allow(clippy::too_many_arguments)]
+/// **Anti-oracle.** Reads only the first-hand `cand_obs` the kernel sees — `surface`
+/// and `g_holder_from_owner` are first-hand `FirstHandObs` fields; no peer's private
+/// cell, no god-view. Strength is the canon `RetentionPrior`, not a magic weight.
 fn place_reciprocal(
     cand_obs: &[viaticum_core::four_r::FirstHandObs],
-    recip_g_ho: &[f64],
     req: &BlockReq,
     prior: &SurfacePrior,
-    policy: &PlacementPolicy,
-    block_iota: f64,
-    recip_weight: f64,
-    lambda: f64,
+    reciprocal: bool,
     want: usize,
 ) -> Vec<usize> {
     let v_per_symbol = req.volume_per_symbol();
     let tau = req.tau.max(0.0);
-    let iota = block_iota.clamp(0.0, 1.0);
-    // Reciprocity normalization scale: one symbol's steady-state capital G* = V/λ, so
-    // the soft bonus saturates at the actual per-symbol volume (not a magic constant).
-    let g_ref = capital_steady_state(v_per_symbol, lambda);
+    let retention = RetentionPrior::default();
 
-    // Blended score per candidate: surface primary, soft ι-scoped reciprocity bonus.
-    let score: Vec<f64> = (0..cand_obs.len())
-        .map(|i| {
-            let r_hat = estimate_surface(&cand_obs[i], prior, v_per_symbol, tau).r_hat;
-            let g = recip_g_ho[i].max(0.0);
-            let recip_norm = if g_ref > 0.0 { g / (g + g_ref) } else { 0.0 };
-            r_hat + recip_weight * iota * recip_norm
+    // Per-candidate keep-prob = surface × retained_depth(obs) (canon two-route, rank-
+    // marginalized). retained_depth folds in reciprocity via g_holder_from_owner; with
+    // `reciprocal = false` it is surface alone (the pure-surface baseline).
+    let score: Vec<f64> = cand_obs
+        .iter()
+        .map(|obs| {
+            let surface = estimate_surface(obs, prior, v_per_symbol, tau).r_hat;
+            if reciprocal {
+                surface * retained_depth(obs, &retention)
+            } else {
+                surface
+            }
         })
         .collect();
     let mut order: Vec<usize> = (0..cand_obs.len()).collect();
@@ -409,22 +406,18 @@ fn place_reciprocal(
 
     // Greedy admit with the §7 spread (≤1 per addr_subnet bucket — AddrCorrelate, the
     // harness default that matches `place`). Fill to `want`; the floor (R̂ ≥ r_target)
-    // is reached along the way by the surface-dominated order, identical stop to the
-    // kernel `place`.
+    // is reached along the surface-dominated order, the same stop as the kernel `place`.
     let mut chosen: Vec<usize> = Vec::new();
-    let mut chosen_obs: Vec<viaticum_core::four_r::FirstHandObs> = Vec::new();
     let mut occupied: Vec<u32> = Vec::new();
     for &cand in &order {
         if chosen.len() >= want {
             break;
         }
-        let _ = policy; // spread by addr_subnet (the §7 default; matches `place`).
         let bucket = cand_obs[cand].addr_subnet;
         if occupied.contains(&bucket) {
             continue;
         }
         chosen.push(cand);
-        chosen_obs.push(cand_obs[cand].clone());
         occupied.push(bucket);
     }
     chosen
