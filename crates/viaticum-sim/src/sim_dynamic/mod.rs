@@ -44,11 +44,13 @@ use viaticum_core::four_r::{EvictPhase, PlacementPolicy, SurfacePrior};
 use crate::generator::Rng;
 use crate::sim_dynamic::engine::{DynParams, fresh_capital, step};
 use crate::sim_dynamic::evaluator::{
-    DrMetric, NewcomerMetric, RankMetric, ReciprocityMetric, dr_metric, node_summaries,
-    rank_metric, reciprocity_metric,
+    ContentionMetric, DrMetric, DropRankingMetric, NewcomerMetric, Pillar1Metric, RankMetric,
+    ReciprocityMetric, contention_metric, dr_metric, drop_ranking_metric, node_summaries,
+    pillar1_metric, rank_metric, reciprocity_metric,
 };
 use crate::sim_dynamic::generator::{
-    Archetype, Node, OwnBlock, SERVED_SAMPLE_EVERY, World, population_mix,
+    Archetype, DiskProfile, GiverTier, Node, OwnBlock, SERVED_SAMPLE_EVERY, World, giver_tier_mix,
+    population_mix,
 };
 
 /// Build a fresh dynamic world of `n` nodes with the design §3 archetype mix.
@@ -58,14 +60,45 @@ use crate::sim_dynamic::generator::{
 /// a zeroed pair-capital matrix. Bandwidth is abstracted: a node backs up its
 /// blocks over successive ticks (one `place` attempt per block per tick).
 pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
-    let mix = population_mix(n);
+    // Shuffle the archetype→index assignment (BUGFIX: tie-break artifact). The
+    // eviction tie-break, when the reciprocity key g_ho ties (the ~98% g_ho=0 mass
+    // under sparse reciprocity), falls through observed_tau (constant) to a STABLE
+    // sort by owner node-index — so the LOWEST-index owners are dropped first.
+    // `population_mix` is block-ordered (Reliable at indices 0..0.4n, Freeloader
+    // last), so without this shuffle the artifact systematically over-evicts
+    // Reliable and NEVER evicts Freeloader (measured: 91% of evictions hit the
+    // low-index half), FABRICATING the "parasite wins" inversion. A seeded shuffle
+    // decorrelates archetype from index; the among-tie order is then archetype-
+    // neutral. (Deterministic: separate salted stream, leaves the disk draws below
+    // bit-identical.)
+    let mix = {
+        let mut m = population_mix(n);
+        let mut shuf = Rng::new(seed ^ 0x5EED_A53C_7112_BB01);
+        for i in (1..m.len()).rev() {
+            let j = ((shuf.unit() * (i as f64 + 1.0)) as usize).min(i);
+            m.swap(i, j);
+        }
+        m
+    };
+    let tiers = giver_tier_mix(n, seed);
     let mut rng = Rng::new(seed ^ WORLD_SALT);
     let mut nodes = Vec::with_capacity(n);
     for (i, &arch) in mix.iter().enumerate() {
-        // Disk cap: enough to hold a healthy multiple of its own backup load, so
-        // Regime-1 fills before contention bites. Hoarders advertise a normal disk
-        // but reject — that is behaviour, not capacity.
-        let disk_cap = 200.0 + rng.range(0.0, 100.0);
+        let tier = tiers[i];
+        // Disk cap: a modest physical disk SHARED between own data and foreign
+        // holdings. It is deliberately NOT a huge multiple of the backup load — under
+        // own-data growth (§A.2) the disk fills and the world contends (utilization→1),
+        // which is the whole point. Hoarders advertise a normal disk but reject — that
+        // is behaviour (will), not capacity.
+        let disk_cap = params.disk_cap_base + rng.range(0.0, params.disk_cap_spread);
+        // God-view disk profile (§A layer-2): own data sized from the tier's own:free
+        // band, growing each tick. Own:free = r ⇒ own = cap·r/(1+r) leaves free = cap/(1+r).
+        // A seeded ±15% jitter per node so a tier is a BAND, not a single point.
+        let ratio_jitter = 1.0 + rng.range(-0.15, 0.15);
+        let own_to_free = (tier.own_to_free_centre() * ratio_jitter).max(0.05);
+        let own_data = disk_cap * own_to_free / (1.0 + own_to_free);
+        // Seeded growth (gb/tick) = fractional rate × initial own data (§A.2 linear).
+        let own_growth_per_tick = own_data * tier.own_growth_frac_per_tick();
         let own_blocks: Vec<OwnBlock> = (0..params.blocks_per_node)
             .map(|b| OwnBlock {
                 id: b,
@@ -80,6 +113,11 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
             id: i as u64,
             archetype: arch,
             disk_cap,
+            disk: DiskProfile {
+                tier,
+                own_data,
+                own_growth_per_tick,
+            },
             holdings: Vec::new(),
             own_blocks,
             addr_subnet: i as u32,
@@ -98,6 +136,8 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
         served: vec![vec![0.0; n]; n],
         served_series: Vec::new(),
         served_regime1_snapshot: None,
+        eviction_log: Vec::new(),
+        ticks_with_eviction: 0,
     }
 }
 
@@ -119,6 +159,27 @@ pub struct Experiment1Report {
     pub dr: DrMetric,
     /// Newcomer probe.
     pub newcomer: NewcomerMetric,
+    /// Phase-1 §A acceptance: did the world REACH contention (utilization→1)?
+    pub contention: ContentionMetric,
+    /// Phase-1 §D.1: pillar-1 efficiency (R_actual / own-disk per archetype).
+    pub pillar1: Pillar1Metric,
+    /// Phase-1 §D.1: drop-ranking (evicted owner correlates with low served).
+    pub drop_ranking: DropRankingMetric,
+}
+
+impl Experiment1Report {
+    /// Phase-1 §A acceptance: did the world REACH contention (utilization→1)? TRUE
+    /// iff mean end-of-run utilization > 0.80 AND eviction fired on > 25% of ticks.
+    /// This is the make-or-break gate Exp-1 failed (permanent abundance, no eviction).
+    pub fn contention_reached(&self) -> bool {
+        let c = &self.contention;
+        let pct_ticks = if c.total_ticks > 0 {
+            c.ticks_with_eviction as f64 / c.total_ticks as f64
+        } else {
+            0.0
+        };
+        c.mean_utilization_end > 0.80 && pct_ticks > 0.25
+    }
 }
 
 /// Configuration of an Experiment-1 run.
@@ -131,6 +192,10 @@ pub struct Experiment1Config {
     pub regime2_ticks: u64,
     /// DR victims sampled at the end of Regime-2.
     pub dr_victims: usize,
+    /// Monte-Carlo samples per block for the `R_actual(T)` estimator (design §D.1).
+    pub mc_samples: usize,
+    /// Monte-Carlo survival horizon `T` in ticks (design §D.1 / W10).
+    pub mc_horizon_ticks: u64,
     pub seed: u64,
 }
 
@@ -142,6 +207,8 @@ impl Default for Experiment1Config {
             regime1_ticks: 40,
             regime2_ticks: 90,
             dr_victims: 30,
+            mc_samples: 400,
+            mc_horizon_ticks: 26, // ~6 months — cold-backup loyalty horizon (W10)
             seed: 0x00E1_5EED,
         }
     }
@@ -190,6 +257,18 @@ pub fn run_experiment_1(cfg: Experiment1Config) -> Experiment1Report {
     let reciprocity = reciprocity_metric(&world, regime1_end_tick);
     let dr = dr_metric(&world, params.k_eff, cfg.dr_victims, cfg.seed ^ 0xD11);
 
+    // --- Phase-1 §A/§D.1: contention reached? pillar-1 efficiency? drop-ranking? ---
+    // Computed on the MATURE contended network BEFORE the newcomer probe mutates it.
+    let contention = contention_metric(&world, params.hyst.s_hard);
+    let pillar1 = pillar1_metric(
+        &world,
+        params.k_eff,
+        cfg.mc_horizon_ticks,
+        cfg.mc_samples,
+        cfg.seed ^ 0x9C_11,
+    );
+    let drop_ranking = drop_ranking_metric(&world);
+
     // --- Newcomer probe (§10.I): inject ONE reliable newcomer, measure T_boot ---
     let newcomer = run_newcomer_probe(&mut world, &params, &prior, &policy, 30);
 
@@ -201,6 +280,9 @@ pub fn run_experiment_1(cfg: Experiment1Config) -> Experiment1Report {
         reciprocity,
         dr,
         newcomer,
+        contention,
+        pillar1,
+        drop_ranking,
     }
 }
 
@@ -244,10 +326,19 @@ fn run_newcomer_probe(
         iota: 0.9,
         placements: Vec::new(),
     }];
+    // A T1-loose newcomer (plenty of free disk to lend) so the bootstrap probe is
+    // about TRUST accrual, not the newcomer's own disk being full.
+    let nc_cap = 250.0;
+    let nc_own_to_free = GiverTier::T1.own_to_free_centre();
     world.nodes.push(Node {
         id: newcomer_idx as u64,
         archetype: Archetype::Reliable,
-        disk_cap: 250.0,
+        disk_cap: nc_cap,
+        disk: DiskProfile {
+            tier: GiverTier::T1,
+            own_data: nc_cap * nc_own_to_free / (1.0 + nc_own_to_free),
+            own_growth_per_tick: 0.0,
+        },
         holdings: Vec::new(),
         own_blocks,
         addr_subnet: newcomer_idx as u32,
@@ -331,25 +422,21 @@ pub fn print_experiment_1(report: &Experiment1Report) {
         report.rank.spearman_rho
     );
     println!();
-    println!("  INTERPRETATION (honest, FIX 1):");
-    println!("    The SUM gap (1) is large and POSITIVE, but it is BREADTH-DRIVEN: the breadth");
+    println!("  INTERPRETATION (Phase-1 contention regime):");
+    println!("    Metric (a)'s earned-G SUM/breadth framing is RETIRED (design §G supersede): it");
+    println!("    was an ABUNDANCE artifact — the reject-breadth headline re-measured the accept");
+    println!("    dial, and the per-pair selection effect made it a tautology. Under contention");
     println!(
-        "    ratio (3) = {:.2}× tracks the accept_rate dial (Reliable 1.0 vs Hoarder 0.2 /",
-        report.rank.breadth_ratio
+        "    the SUM gap even INVERTS (exploiters accumulate more raw G per pair from the few"
     );
-    println!("    Freeloader 0.1) almost exactly, so SUM ≈ breadth × per-pair predominantly re-");
-    println!("    measures the input accept dial via served-pair COUNT (total foregone service /");
-    println!("    reject-breadth). The per-pair surface QUALITY (2) — what the kernel actually");
     println!(
-        "    ranks — goes the WRONG way (gap {:+.2} < 0, confirmed by ρ = {:.2} < 0): a",
-        report.rank.gap_per_pair, report.rank.spearman_rho
+        "    deep partners they keep), which is exactly why we do NOT headline it. The Phase-1"
     );
-    println!("    SELECTION EFFECT — a node only forms a surface estimate for holders that");
-    println!("    ACCEPTED its data, so per-pair surface cannot see accept-breadth and even anti-");
     println!(
-        "    correlates. The kernel separates exploiters via total foregone service / reject-"
+        "    headline is the PILLAR-1 efficiency (R_actual / own-disk) + drop-ranking below —"
     );
-    println!("    breadth, NOT per-pair surface quality.");
+    println!("    the MECHANISM under contention, not the input accept dial. (Numbers shown for");
+    println!("    continuity only; do not read a ranking into the metric-(a) sign.)");
     println!();
     println!(
         "-- Metric (b): reciprocity on god-view served-volume TIME-INTEGRAL (design §10.E) --"
@@ -390,6 +477,74 @@ pub fn print_experiment_1(report: &Experiment1Report) {
     println!(
         "  T_boot (first chosen as a holder)          = {}",
         fmt_opt(report.newcomer.t_boot_chosen)
+    );
+    println!();
+    print_phase1(report);
+}
+
+/// Print the Phase-1 §A/§D.1 results: contention reached, pillar-1 efficiency,
+/// drop-ranking. This is the make-or-break section (design §A: utilization→1).
+fn print_phase1(report: &Experiment1Report) {
+    let c = &report.contention;
+    println!("=== PHASE-1 (§A/§D.1): CONTENTION + PILLAR-1 EFFICIENCY ===");
+    println!();
+    println!("-- §A acceptance: did the world REACH contention (utilization→1)? --");
+    println!(
+        "  mean φ (free-ratio) at end   = {:.4}   (→0 ⇒ contended)",
+        c.mean_phi_end
+    );
+    println!(
+        "  mean utilization (1−φ) at end = {:.4}   (→1 ⇒ contended; THE make-or-break)",
+        c.mean_utilization_end
+    );
+    println!(
+        "  nodes in eviction band (φ<s_hard) = {:.1}%",
+        c.frac_nodes_in_eviction_band * 100.0
+    );
+    let pct_ticks = if c.total_ticks > 0 {
+        c.ticks_with_eviction as f64 / c.total_ticks as f64 * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "  eviction fired on {}/{} ticks ({:.1}%), {} total eviction events",
+        c.ticks_with_eviction, c.total_ticks, pct_ticks, c.total_evictions
+    );
+    let contended = report.contention_reached();
+    println!(
+        "  VERDICT: {} (utilization > 0.80 AND eviction fired on > 25% of ticks)",
+        if contended {
+            "CONTENTION REACHED"
+        } else {
+            "NOT CONTENDED (still abundance — make-or-break FAILED)"
+        }
+    );
+    println!();
+    let p = &report.pillar1;
+    println!("-- §D.1 pillar-1 efficiency: R_actual(T) of own data / own-disk given --");
+    println!(
+        "  Reliable   : R_actual = {:.4}   own-disk-given = {:.2}   efficiency = {:.6}",
+        p.mean_r_actual_reliable, p.mean_given_reliable, p.efficiency_reliable
+    );
+    println!(
+        "  Hoarder    : R_actual = {:.4}   own-disk-given = {:.2}   efficiency = {:.6}",
+        p.mean_r_actual_hoarder, p.mean_given_hoarder, p.efficiency_hoarder
+    );
+    println!(
+        "  Freeloader : R_actual = {:.4}   own-disk-given = {:.2}   efficiency = {:.6}",
+        p.mean_r_actual_freeloader, p.mean_given_freeloader, p.efficiency_freeloader
+    );
+    println!("  EXPECTED: Reliable achieves HIGHER R_actual/own-disk than Freeloader/Hoarder");
+    println!();
+    let d = &report.drop_ranking;
+    println!("-- §D.1 drop-ranking: does eviction drop LOW-served owners first? --");
+    println!(
+        "  eviction events scored = {}   mean evicted served-rank = {:.4}   (<0.5 ⇒ working)",
+        d.events_scored, d.mean_evicted_served_rank
+    );
+    println!(
+        "  fraction of drops hitting bottom-half served owners = {:.1}%   (>50% ⇒ working)",
+        d.frac_below_median * 100.0
     );
     println!();
     println!("HONEST FRAME (design §7): the gap/ρ may be LOWER than Phase-1's oracle-inflated");

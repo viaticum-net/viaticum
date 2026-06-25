@@ -76,6 +76,17 @@ impl Archetype {
         }
     }
 
+    /// Whether this archetype is WILLING to accept a foreign symbol offer at all
+    /// (the behavioural will gate, design §A.3). The Hoarder/Freeloader withhold
+    /// their disk by a low willingness; cooperative archetypes are willing. This is
+    /// the BEHAVIOUR half of acceptance — the other half is physical room (`φ`/quota,
+    /// the `SymbolReject{QuotaExceeded}`-equivalent): a node accepts iff WILLING AND
+    /// HAS ROOM. Splitting the two is the §A.3 fidelity fix: the old engine had only
+    /// the Bernoulli will and no disk check, so it never produced a quota reject.
+    pub fn willing_accept_rate(self) -> f64 {
+        self.accept_rate()
+    }
+
     /// Baseline (calendar-independent) uptime probability, used by [`online`] for
     /// the archetypes whose schedule is a flat Bernoulli (Reliable, Hoarder,
     /// Freeloader). Weekend/Seasonal/Nomad override this with their calendar.
@@ -89,6 +100,134 @@ impl Archetype {
             Archetype::Freeloader => 0.80,
         }
     }
+}
+
+/// Giver tier (audience tier P7, design §A layer-2). ORTHOGONAL to [`Archetype`]:
+/// the archetype is BEHAVIOUR (uptime + accept/evict strategy), the giver tier is
+/// the node's DISK SHAPE (how much own data it has relative to free space it can
+/// lend, and how fast its own data grows). A Freeloader×T1-loose is a pure parasite
+/// (lots of free disk, withholds it); a Reliable×T4-tight is honest-but-poor (full
+/// disk, would lend but cannot) — and the two are MORALLY INDISTINGUISHABLE (design
+/// §A: motive-blind). The tier is GOD-VIEW ONLY: it drives behaviour/contention and
+/// must NEVER reach a kernel input (no field for it on `FirstHandObs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GiverTier {
+    /// T1 — self-hosters / NAS / multi-device geeks. Loose own:free ratio (~2-3 free
+    /// per own), slow own-data growth. The backbone givers (P7 core).
+    T1,
+    /// T2 — photo/video makers. Growing own data (own:free ~1-1.5), FAST growth (the
+    /// main contention driver: media accumulates).
+    T2,
+    /// T3 — ordinary laptop users with some free space. Moderate own:free (~1.5-2),
+    /// slow growth.
+    T3,
+    /// T4 — periphery: a single near-full device. Tight own:free (<1), ~static own
+    /// data. May not fit its own backups → W11 triage (honest-parasite owner-side).
+    T4,
+}
+
+impl GiverTier {
+    /// All four, in canonical order (for population construction / iteration).
+    pub const ALL: [GiverTier; 4] = [GiverTier::T1, GiverTier::T2, GiverTier::T3, GiverTier::T4];
+
+    /// Centre of the own:LENDABLE-free ratio band for this tier (design §A): the
+    /// ratio of OWN data to the disk a node leaves FREE to lend to others. Lower ⇒
+    /// MORE lendable disk (a generous giver). The lendable free is where foreign
+    /// holdings accumulate and contend; own-data growth slowly shrinks it. We keep
+    /// own data a MINORITY of the disk so the contention plays out on the HOLDINGS
+    /// budget (the reciprocal-storage economy), not by own-data drowning the disk.
+    /// God-view: this shapes the disk, it is NOT a kernel input.
+    pub fn own_to_free_centre(self) -> f64 {
+        match self {
+            // own:free = r ⇒ own = cap·r/(1+r). r=0.18 ⇒ own≈15% of cap (T1: lots to
+            // lend); r=0.25 ⇒ own≈20%; r=0.22 ⇒ own≈18%; r=0.5 ⇒ own≈33% (T4: tight).
+            // Own data starts a SMALL minority of the disk so Regime-1 has ample room
+            // to establish the placement floor (≥ k_eff holders per block); own-data
+            // GROWTH (below) then expands it and tightens the world into contention.
+            GiverTier::T1 => 0.18,
+            GiverTier::T2 => 0.25,
+            GiverTier::T3 => 0.22,
+            GiverTier::T4 => 0.50,
+        }
+    }
+
+    /// Per-tick own-data linear growth rate as a FRACTION of the node's initial own
+    /// data (design §A.2 growth law). T2 (media) grows fast; T1/T3 slow; T4 ~static.
+    /// God-view calibration dial — sets the onset of contention. Sized so that over
+    /// the ~130-tick run own data grows enough to push total utilization from the
+    /// accept-gate parking level (≈1−s_soft) DOWN through the eviction band (φ<s_hard),
+    /// firing eviction (the W9/W11 dynamic: growing own data rations foreign holdings).
+    pub fn own_growth_frac_per_tick(self) -> f64 {
+        match self {
+            GiverTier::T1 => 0.010,
+            GiverTier::T2 => 0.022,
+            GiverTier::T3 => 0.013,
+            GiverTier::T4 => 0.004,
+        }
+    }
+}
+
+/// Giver-tier mix over a population of `n` (design §A / P7 shares): T1 35%, T2 30%,
+/// T3 25%, T4 10%. Deterministic in `n`; the last tier absorbs the rounding
+/// remainder so the counts sum to exactly `n`.
+///
+/// Assigned INDEPENDENTLY of the archetype mix (the two layers are orthogonal): we
+/// stride the tiers across the node index so a given archetype is spread across
+/// tiers rather than correlated with one (a Reliable can be any tier).
+pub fn giver_tier_mix(n: usize, seed: u64) -> Vec<GiverTier> {
+    let shares = [
+        (GiverTier::T1, 0.35),
+        (GiverTier::T2, 0.30),
+        (GiverTier::T3, 0.25),
+        (GiverTier::T4, 0.10),
+    ];
+    let mut pool: Vec<GiverTier> = Vec::with_capacity(n);
+    for (t, frac) in shares.iter().take(shares.len() - 1) {
+        let count = (frac * n as f64).round() as usize;
+        for _ in 0..count {
+            pool.push(*t);
+        }
+    }
+    while pool.len() < n {
+        pool.push(shares[shares.len() - 1].0);
+    }
+    pool.truncate(n);
+    // Deterministically shuffle so tier is uncorrelated with the archetype index
+    // (the archetype mix is laid out in blocks; an unshuffled tier pool would
+    // correlate tier with archetype). Reproducible in the seed.
+    let mut rng = Rng::derive(seed, TIER_SHUFFLE_TAG, n as u64, 0, 0);
+    for i in (1..pool.len()).rev() {
+        let j = (rng.unit() * (i as f64 + 1.0)) as usize;
+        pool.swap(i, j.min(i));
+    }
+    pool
+}
+
+/// Tag for the giver-tier shuffle RNG stream (kept off the PoS/online streams).
+const TIER_SHUFFLE_TAG: u64 = 0x71E7_5A17_DEAD_BEEF;
+
+/// Hard ceiling on own-data as a fraction of the physical disk (design §A.2): even
+/// the fastest-growing tier keeps `1 − OWN_DATA_DISK_FRACTION` of the disk as a
+/// lendable floor, so contention is on the HOLDINGS budget (the reciprocal-storage
+/// economy eviction rations), not own data flooding the disk into a death-spiral.
+pub const OWN_DATA_DISK_FRACTION: f64 = 0.62;
+
+/// God-view disk profile of a node (design §A layer-2). Drives own-data growth and
+/// the physical disk split; NEVER reaches a kernel input. The kernel only ever sees
+/// the resulting scalar `φ = 1 − (own+holdings)/cap` (a legal `NodeLocal` field, my
+/// own first-hand disk), never the tier / growth-rate / own:free target here.
+#[derive(Debug, Clone, Copy)]
+pub struct DiskProfile {
+    /// The node's giver tier (god-view: shapes the disk, not a kernel input).
+    pub tier: GiverTier,
+    /// Current OWN-data volume on disk (gb). Grows over ticks (design §A.2). Own data
+    /// consumes the SAME physical disk as foreign holdings — so as it grows, free
+    /// space (`φ`) shrinks, driving the world toward contention.
+    pub own_data: f64,
+    /// Per-tick additive own-data growth (gb/tick), seeded from the tier's fractional
+    /// rate at build time. Linear law (design §A.2: start linear, complicate only if
+    /// the onset is unrealistic).
+    pub own_growth_per_tick: f64,
 }
 
 /// Population mix (design §3 shares): how many of each archetype in a population of
@@ -262,8 +401,13 @@ pub struct Node {
     pub id: u64,
     /// Hidden archetype (god-view — drives behaviour, NEVER a kernel input).
     pub archetype: Archetype,
-    /// Disk capacity (gb) for FOREIGN holdings.
+    /// Total physical disk capacity (gb). SHARED between this node's own data and
+    /// the foreign symbols it holds — `φ = 1 − (own+holdings)/cap`. Own-data growth
+    /// eating into this is the load-bearing contention driver (design §A.2).
     pub disk_cap: f64,
+    /// God-view disk profile (design §A layer-2): giver tier + own-data + growth
+    /// rate. NEVER a kernel input — the kernel sees only the resulting `φ` scalar.
+    pub disk: DiskProfile,
     /// Symbols this node currently stores for OTHERS (its holdings).
     pub holdings: Vec<HeldSymbol>,
     /// This node's OWN data blocks to back up.
@@ -283,7 +427,8 @@ pub struct Node {
 }
 
 impl Node {
-    /// Used foreign-holdings disk (gb): sum of ALIVE held-symbol volumes.
+    /// Used FOREIGN-holdings disk (gb): sum of ALIVE held-symbol volumes. (Own data
+    /// is tracked separately in [`DiskProfile::own_data`].)
     pub fn used_disk(&self) -> f64 {
         self.holdings
             .iter()
@@ -292,12 +437,26 @@ impl Node {
             .sum()
     }
 
-    /// `φ_node = 1 − used/cap` ∈ [0,1] (design §10.G; = `NodeLocal::phi_free_ratio`).
+    /// Total physical occupancy (gb): own data + alive foreign holdings. This is
+    /// what fills the shared disk (design §A.2: own-data growth shrinks free space).
+    pub fn used_total(&self) -> f64 {
+        self.disk.own_data + self.used_disk()
+    }
+
+    /// Free physical disk (gb): `cap − (own + holdings)`, floored at 0. The room a
+    /// new foreign offer needs (design §A.3: accept iff willing AND this ≥ offered).
+    pub fn free_disk(&self) -> f64 {
+        (self.disk_cap - self.used_total()).max(0.0)
+    }
+
+    /// `φ_node = 1 − (own+holdings)/cap` ∈ [0,1] (design §10.G / §A.2; the legal
+    /// `NodeLocal::phi_free_ratio` field — my OWN first-hand disk free-ratio). As own
+    /// data grows this falls, driving the world toward contention (utilization→1).
     pub fn phi_free_ratio(&self) -> f64 {
         if self.disk_cap <= 0.0 {
             return 0.0;
         }
-        (1.0 - self.used_disk() / self.disk_cap).clamp(0.0, 1.0)
+        (1.0 - self.used_total() / self.disk_cap).clamp(0.0, 1.0)
     }
 }
 
@@ -334,6 +493,31 @@ pub struct World {
     /// (`served_now − served_regime1_end`), so the fill regime's accumulation does
     /// not swamp the steady-state signal. `None` until the boundary is reached.
     pub served_regime1_snapshot: Option<Vec<Vec<f64>>>,
+    /// Log of every eviction event (design §A / §D.1 drop-ranking + §E contention
+    /// observability): each time a holder drops a foreign symbol under disk pressure,
+    /// record `(tick, holder, evicted_owner)`. The drop-ranking metric correlates the
+    /// evicted owner with LOW god-view `served(holder←owner)` (NOT the G-ledger — that
+    /// would be tautological). Also the headline "eviction actually fired" signal.
+    pub eviction_log: Vec<EvictionEvent>,
+    /// Count of ticks on which ≥1 eviction fired anywhere in the network (design §E /
+    /// §A acceptance: the % of ticks with eviction firing is a contention signal).
+    pub ticks_with_eviction: u64,
+}
+
+/// One god-view eviction event (design §D.1 drop-ranking / §E observability).
+#[derive(Debug, Clone, Copy)]
+pub struct EvictionEvent {
+    /// The tick the drop happened.
+    pub tick: u64,
+    /// The holder that dropped a symbol under disk pressure.
+    pub holder: usize,
+    /// The owner whose symbol was dropped (the "victim" of the eviction).
+    pub owner: usize,
+    /// The reciprocity key `capital[owner][holder].g_ho` AT DROP TIME (the owner's
+    /// service to this holder). Diagnostic only: lets a god-view tool check whether
+    /// drops concentrate on `g_ho≈0` placements (the mechanism singling out
+    /// non-reciprocal data) vs falling on reciprocal placements too.
+    pub g_ho_at_drop: f64,
 }
 
 /// One sample of the Freeloader-vs-Reliable inbound served-volume time-series
@@ -372,6 +556,48 @@ impl World {
             cnt += 1;
         }
         if cnt == 0 { f64::NAN } else { sum / cnt as f64 }
+    }
+
+    /// Mean free-ratio `φ` over present nodes (design §A contention-front
+    /// observability). As own-data growth + greedy accept fill disks this falls
+    /// toward 0 (utilization→1). NaN if no present nodes.
+    pub fn mean_phi(&self) -> f64 {
+        let mut sum = 0.0;
+        let mut cnt = 0usize;
+        for node in &self.nodes {
+            if node.present {
+                sum += node.phi_free_ratio();
+                cnt += 1;
+            }
+        }
+        if cnt == 0 { f64::NAN } else { sum / cnt as f64 }
+    }
+
+    /// Mean utilization `1 − φ = (own+holdings)/cap` over present nodes — the direct
+    /// "utilization→1" reading (design §A acceptance: the world must reach this).
+    pub fn mean_utilization(&self) -> f64 {
+        let phi = self.mean_phi();
+        if phi.is_nan() { f64::NAN } else { 1.0 - phi }
+    }
+
+    /// Grow every present node's OWN data by its seeded per-tick rate (design §A.2
+    /// growth law). Own data shares the physical disk with foreign holdings, so this
+    /// monotonically shrinks free space (`φ`) and is the load-bearing driver of the
+    /// drift to contention (utilization→1). Linear, deterministic, god-view only.
+    ///
+    /// Own data is capped at [`OWN_DATA_DISK_FRACTION`] of the physical disk so a
+    /// node — even a fast-growing T2 — always retains SOME lendable disk floor (the
+    /// contention plays out on the HOLDINGS budget, not by own data drowning the
+    /// whole disk). Past the cap the node is simply at its own-data ceiling.
+    pub fn grow_own_data(&mut self) {
+        for node in &mut self.nodes {
+            if !node.present {
+                continue;
+            }
+            let ceiling = node.disk_cap * OWN_DATA_DISK_FRACTION;
+            let next = node.disk.own_data + node.disk.own_growth_per_tick;
+            node.disk.own_data = next.min(ceiling.max(node.disk.own_data));
+        }
     }
 
     /// Append a [`ServedSample`] of the current Freeloader-vs-Reliable inbound served

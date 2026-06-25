@@ -20,8 +20,8 @@
 //! uses them only to drive BEHAVIOUR (accept/reject, online, evict-aggression).
 
 use viaticum_core::four_r::{
-    BlockReq, Hysteresis, NodeLocal, PlacementPolicy, PlacementResult, SurfacePrior,
-    eviction_order, place,
+    BlockReq, Hysteresis, NodeLocal, PlacementPolicy, SurfacePrior, capital_steady_state,
+    estimate_surface, eviction_order,
 };
 
 use crate::generator::Rng;
@@ -52,6 +52,31 @@ pub struct DynParams {
     /// Per-tick probability a present cooperative node departs (churn out). Hoarder
     /// / Freeloader churn at a higher multiple (they are less committed).
     pub churn_out_prob: f64,
+    /// Cream margin (design §A.1, W9): extra redundant symbols an owner greedily
+    /// places ABOVE the `r_target` floor, ι-prioritized. `R_target(ι)` is a
+    /// FLOOR/setpoint, NOT a ceiling — once the core `n_symbols` reach the floor, the
+    /// owner keeps adding symbols (cream) up to `n_symbols + ⌈cream_max·ι⌉`, filling
+    /// free holder capacity (utilization→1). The ι-weighting makes redundancy ∝ ι at
+    /// every capacity level. This is the holder-greed driver that, combined with
+    /// own-data growth (§A.2), pushes the world to contention. Limited only by
+    /// physical disk + reciprocal capacity (holders reject when full, §A.3).
+    pub cream_max: usize,
+    /// Base physical disk capacity (gb), SHARED between own data and foreign holdings
+    /// (design §A.2). Deliberately modest relative to the aggregate backup+cream
+    /// demand so own-data growth fills it and the world contends (utilization→1).
+    pub disk_cap_base: f64,
+    /// Per-node uniform spread (gb) added to `disk_cap_base` (heterogeneous disks).
+    pub disk_cap_spread: f64,
+    /// Reciprocity-aware placement weight (canon §9.5 / эталон §1). A SOFT, ι-scoped
+    /// bonus the owner adds to a candidate holder's surface score in proportion to its
+    /// OWN first-hand `capital[owner][h].g_ho` ("I have served h"). `0.0` ⇒ pure
+    /// surface (the kernel `place` behaviour); the bonus is `recip_weight · ι ·
+    /// g_ho/(g_ho+G*)` so a fully-reciprocal max-ι holder gains at most `recip_weight`
+    /// of r_hat — surface stays PRIMARY, reciprocity only tilts among comparable
+    /// candidates (no hard "reciprocal-only" rule → newcomers not frozen out). This is
+    /// the lever that POPULATES g_ho so §4 eviction can drop the non-reciprocal
+    /// parasite first (эталон §8 main lever).
+    pub recip_weight: f64,
 }
 
 impl Default for DynParams {
@@ -59,17 +84,46 @@ impl Default for DynParams {
         DynParams {
             // 1/λ ≈ 60 days (two months) of capital memory; λ·dt = (1/60)·7 ≈ 0.117 ≪ 1.
             lambda: 1.0 / 60.0,
-            n_symbols: 6,
-            k_eff: 3,
+            n_symbols: 5,
+            // k_eff=2: under contention the equilibrium per-block holder count is a
+            // few (the lendable budget is rationed), so a k_eff of 2 is the realistic
+            // reconstruction threshold — a well-reciprocating node clears it, an
+            // exploiter does not (the pillar-1 separation).
+            k_eff: 2,
             r_target: 0.90,
-            block_volume: 60.0, // ⇒ 10 gb/symbol = the canonical observed V0
+            block_volume: 50.0, // ⇒ 10 gb/symbol = the canonical observed V0
             blocks_per_node: 3,
+            // Accept band: greedy accept parks holdings near φ≈s_soft; own-data growth
+            // then pushes φ down through the band into contention where eviction
+            // rations the cream margin (low-G owners' symbols first). Both gaps
+            // non-zero (NEW-2 anti-chatter): Δ_evict = 0.10, Δ_accept = 0.10.
             hyst: Hysteresis {
                 s_hard: 0.10,
                 s_target: 0.20,
                 s_soft: 0.30,
             },
             churn_out_prob: 0.002,
+            // Greedy cream above the r_target floor (design §A.1): a high-ι block can
+            // pull up to n_symbols + cream_max extra redundant symbols, a low-ι one
+            // far fewer. Sized so aggregate demand MODERATELY oversubscribes the
+            // lendable budget (≈1.3-1.6×) — enough to fill disks and keep eviction
+            // firing (utilization→1), but NOT a 3-4× flood that pins every disk to the
+            // wall and makes eviction thrash indiscriminately (it must stay SELECTIVE
+            // by G so the drop-ranking signal is real). A top-ι block seeks ~9 holders.
+            cream_max: 2,
+            // Modest SHARED disk (design §A.2). Lendable budget (~70-90gb/node) ×
+            // 200 nodes ≈ 15-18 Tb; aggregate floor+cream demand moderately exceeds
+            // it (~1.5-2×), so Regime-1 establishes the floor and own-data growth tips
+            // the world into contention where eviction rations the cream margin.
+            disk_cap_base: 160.0,
+            disk_cap_spread: 60.0,
+            // Soft reciprocity-aware placement (canon §9.5). A fully-reciprocal
+            // max-ι holder gains at most 0.15 of r_hat — enough to tilt the choice
+            // among surface-comparable candidates (concentrating high-ι data on
+            // holders the owner reciprocally serves → populates g_ho), too small to
+            // override a materially better-surface stranger (durability floor stays
+            // surface-driven). Calibratable; 0.0 recovers the pure-surface baseline.
+            recip_weight: 0.15,
         }
     }
 }
@@ -100,7 +154,12 @@ pub fn step(world: &mut World, params: &DynParams, prior: &SurfacePrior, policy:
     let tick = world.tick;
     let n = world.nodes.len();
 
-    // ---- (1) own-data → place (kernel, greedy) + (2) holder accept/reject ----
+    // ---- (0) own-data growth (design §A.2): own data grows each tick, shrinking
+    //          free disk (φ) and driving the drift to contention (utilization→1). ----
+    world.grow_own_data();
+
+    // ---- (1) own-data → place (kernel, greedy cream above r_target floor §A.1)
+    //          + (2) holder accept/reject (willing AND has room §A.3) ----
     place_own_data(world, params, prior, policy);
 
     // ---- (3) PoS-challenge sampling + (4) update_capital ----
@@ -119,10 +178,24 @@ pub fn step(world: &mut World, params: &DynParams, prior: &SurfacePrior, policy:
     world.tick = tick + 1;
 }
 
-/// (1)+(2): each present owner attempts to back up its own blocks that are not yet
-/// at `r_target`, via the kernel `place`, then the chosen holders accept/reject by
-/// their archetype `accept_rate` (seeded Bernoulli, §10.A). Accepted symbols are
-/// recorded both as god-view holdings on the holder AND as the block's placements.
+/// The greedy per-block placement target (design §A.1, W9): the `r_target` FLOOR
+/// (`n_symbols`) plus an ι-prioritized CREAM margin. `R_target(ι)` is a FLOOR, NOT a
+/// ceiling — above it the owner greedily adds redundant symbols ∝ ι, filling free
+/// holder capacity (utilization→1). A top-ι block (ι≈1) pulls the full `cream_max`
+/// extra; a low-ι one (ι≈0) pulls ~none. This greed, combined with own-data growth,
+/// is what drives the world to contention.
+fn target_symbols(n_symbols: usize, cream_max: usize, iota: f64) -> usize {
+    let iota = iota.clamp(0.0, 1.0);
+    let cream = (cream_max as f64 * iota).round() as usize;
+    n_symbols + cream
+}
+
+/// (1)+(2): each present owner greedily backs up its own blocks toward the
+/// ι-prioritized cream target (design §A.1: `r_target` floor + greedy margin), via
+/// the kernel `place`, then the chosen holders accept/reject by WILL (archetype
+/// `willing_accept_rate`, seeded Bernoulli §10.A) AND ROOM (`free_disk ≥ v_per_symbol`
+/// — the SymbolReject-on-quota fidelity fix, §A.3). Accepted symbols are recorded
+/// both as god-view holdings on the holder AND as the block's placements.
 fn place_own_data(
     world: &mut World,
     params: &DynParams,
@@ -137,12 +210,16 @@ fn place_own_data(
         if !world.nodes[owner].present {
             continue;
         }
-        // Snapshot the owner's blocks that still need holders (placements below n).
+        // Snapshot the owner's blocks still BELOW their greedy cream target (design
+        // §A.1: greed to fill, not stop at the r_target floor). A block at/above its
+        // ι-cream target is satisfied THIS tick.
         let needy: Vec<usize> = world.nodes[owner]
             .own_blocks
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.placements.len() < params.n_symbols)
+            .filter(|(_, b)| {
+                b.placements.len() < target_symbols(params.n_symbols, params.cream_max, b.iota)
+            })
             .map(|(i, _)| i)
             .collect();
         if needy.is_empty() {
@@ -183,24 +260,57 @@ fn place_own_data(
                 cand_idx.iter().map(|&h| &world.capital[owner][h]).collect();
             let cand_obs = observer::observe_candidates(&cand_nodes, &caps, dt);
 
+            // The greedy cream target for THIS block (floor + ι-margin, §A.1).
+            let want = target_symbols(params.n_symbols, params.cream_max, block_iota);
+            let have = already.len();
+            let still_need = want.saturating_sub(have);
+            if still_need == 0 {
+                continue;
+            }
+
+            // `place_reciprocal` reaches the r_target FLOOR (durability, same r_target
+            // stop as the kernel `place`) then greedily fills the cream up to `want`,
+            // ranking candidates by a BLENDED key: surface r_hat PRIMARY + a SOFT
+            // ι-scoped reciprocity bonus (canon §9.5 / эталон §1). Drive it with a req
+            // whose n_symbols is the cream target so the floor logic earns the floor
+            // and the harness adds the greedy ι-margin (§A.1).
             let req = BlockReq {
                 volume: block_volume,
-                n_symbols: params.n_symbols,
+                n_symbols: want,
                 k_eff: params.k_eff,
                 tau: DAYS_PER_TICK,
                 r_target: params.r_target,
             };
 
-            let result = place(&req, &cand_obs, prior, policy);
-            let chosen_local: Vec<usize> = match result {
-                PlacementResult::Placed { holders, .. } => holders,
-                PlacementResult::Insufficient { holders, .. } => holders,
-            };
+            // The owner's OWN first-hand reciprocity toward each candidate h:
+            // `capital[owner][h].g_ho` = "I (owner) have served h" (PairCapital doc;
+            // bilaterally observable, never a peer's private cell — anti-oracle legal).
+            let recip_g_ho: Vec<f64> = caps.iter().map(|c| c.g_ho).collect();
+            let chosen_local: Vec<usize> = place_reciprocal(
+                &cand_obs,
+                &recip_g_ho,
+                &req,
+                prior,
+                policy,
+                block_iota,
+                params.recip_weight,
+                params.lambda,
+                want,
+            );
 
             let v_per_symbol = req.volume_per_symbol();
             for &local in &chosen_local {
+                if world.nodes[owner].own_blocks[bi].placements.len() >= want {
+                    break; // reached the greedy cream target for this block
+                }
                 let holder = cand_idx[local];
-                // (2) holder accept/reject — seeded Bernoulli on accept_rate (§10.A).
+                // (2) holder accept/reject — WILL × ROOM (§A.3 fidelity).
+                //  * WILL: seeded Bernoulli on the archetype's willingness (§10.A).
+                //  * ROOM: the holder must physically have free disk ≥ v_per_symbol —
+                //    a full disk yields a SymbolReject{QuotaExceeded}-equivalent. The
+                //    old engine had ONLY the will draw and no room check (engine.rs:211),
+                //    so a "full" disk still accepted — no quota reject ever fired and
+                //    the world could not contend. This is the fidelity fix.
                 let mut rng = Rng::derive(
                     world.seed,
                     0xACCE_7711,
@@ -208,9 +318,20 @@ fn place_own_data(
                     holder as u64,
                     (tick << 8) ^ bi as u64,
                 );
-                let accept = rng.unit() < world.nodes[holder].archetype.accept_rate();
-                if !accept {
-                    continue;
+                let willing = rng.unit() < world.nodes[holder].archetype.willing_accept_rate();
+                let has_room = world.nodes[holder].free_disk() >= v_per_symbol;
+                // Hysteresis ACCEPT-GATE (kernel §6½/§10, NEW-2 damper): a holder only
+                // accepts new foreign data when it is ABOVE the accept threshold AND
+                // not currently evicting — `accept_ok = φ > s_soft ∧ ¬evicting`. This
+                // is what FORBIDS "drop to s_target then immediately re-accept and fall
+                // below s_hard again" (the NEW-2 accept↔evict cycle). Without it the
+                // greedy cream re-offers every evicted symbol next tick and the relay
+                // thrashes. The upper gap (s_soft) is the §A.3 reciprocal admission
+                // headroom; the latch bit is threaded through `Node::evict_phase`.
+                let accept_ok = world.nodes[holder].phi_free_ratio() > params.hyst.s_soft
+                    && !world.nodes[holder].evict_phase.evicting;
+                if !willing || !has_room || !accept_ok {
+                    continue; // reject: unwilling, full (quota §A.3), or hysteresis gate
                 }
                 // Record the god-view holding on the holder.
                 world.nodes[holder].holdings.push(HeldSymbol {
@@ -224,18 +345,89 @@ fn place_own_data(
                 world.nodes[owner].own_blocks[bi]
                     .placements
                     .push(BlockPlacement { holder });
-                // The owner accrues g_holder_from_owner (its service to the holder):
-                // it just stored a symbol FOR... no — it stored ON the holder, so the
-                // HOLDER's g_holder_from_owner toward THIS owner rises (the holder is
-                // serving the owner). We accrue the holder's service-to-owner as the
-                // owner's g_oh-side later via PoS; the owner's service TO the holder
-                // (g_ho) accrues when the holder backs up ON the owner. Here the owner
-                // is the data SOURCE, the holder is storing — so from the holder's
-                // perspective g_holder_from_owner(holder←... ) — we model reciprocity
-                // symmetrically below in pos_and_capital. Nothing to add here.
+                // Reciprocity (g_ho / g_oh) is threaded in pos_and_capital on a PoS
+                // pass — the eviction-by-G self-balancing (§C.3) plus the quota reject
+                // above ARE the reciprocity mechanism (§A.1: NOT a separate accept-gate).
             }
         }
     }
+}
+
+/// Reciprocity-aware placement (canon §9.5 / эталон §1, the main lever of §8). Picks
+/// holders by a BLENDED key — surface `r_hat` PRIMARY plus a SOFT, ι-scoped
+/// reciprocity bonus — then greedily admits them (≤1 per observable address bucket,
+/// the §7 spread) until the `r_target` floor is reached (durability: the SAME survival
+/// stop the kernel `place` uses) and on up to `want` holders (the greedy ι-cream
+/// margin, §A.1 / foundation §5½). Returns the chosen LOCAL candidate indices.
+///
+/// **Why blended, not a hard reciprocal rule.** The owner's score for candidate `h`
+/// is `r_hat(h) + recip_weight · ι · g_ho/(g_ho+G*)`, where `g_ho =
+/// capital[owner][h].g_ho` is the owner's OWN first-hand record of storage it has
+/// performed for `h` ("I have served h"), `G* = capital_steady_state(v_per_symbol, λ)`
+/// is one symbol's steady-state capital (so "served ≈ one symbol's worth" → bonus
+/// half-saturated), and `ι ∈ [0,1]` scopes the preference to the high-ι core
+/// (marginal/low-ι blocks stay opportunistic, §9.5). The bonus is at most
+/// `recip_weight` of an `r_hat` ∈ [0,1], so a materially better-surface stranger still
+/// wins (durability floor stays surface-driven) — reciprocity only tilts the choice
+/// among comparable candidates. Concentrating the owner's data on holders it
+/// reciprocally serves POPULATES `g_ho`, so the holder's §4 eviction (which ranks
+/// owners ascending by `g_ho`) keeps this owner and drops the non-reciprocal parasite
+/// first. `recip_weight = 0` recovers the pure-surface kernel behaviour exactly.
+///
+/// **Anti-oracle.** Reads only the same first-hand `cand_obs` the kernel sees and the
+/// owner's own `capital[owner][*].g_ho` ledger — never a peer's private cell.
+#[allow(clippy::too_many_arguments)]
+fn place_reciprocal(
+    cand_obs: &[viaticum_core::four_r::FirstHandObs],
+    recip_g_ho: &[f64],
+    req: &BlockReq,
+    prior: &SurfacePrior,
+    policy: &PlacementPolicy,
+    block_iota: f64,
+    recip_weight: f64,
+    lambda: f64,
+    want: usize,
+) -> Vec<usize> {
+    let v_per_symbol = req.volume_per_symbol();
+    let tau = req.tau.max(0.0);
+    let iota = block_iota.clamp(0.0, 1.0);
+    // Reciprocity normalization scale: one symbol's steady-state capital G* = V/λ, so
+    // the soft bonus saturates at the actual per-symbol volume (not a magic constant).
+    let g_ref = capital_steady_state(v_per_symbol, lambda);
+
+    // Blended score per candidate: surface primary, soft ι-scoped reciprocity bonus.
+    let score: Vec<f64> = (0..cand_obs.len())
+        .map(|i| {
+            let r_hat = estimate_surface(&cand_obs[i], prior, v_per_symbol, tau).r_hat;
+            let g = recip_g_ho[i].max(0.0);
+            let recip_norm = if g_ref > 0.0 { g / (g + g_ref) } else { 0.0 };
+            r_hat + recip_weight * iota * recip_norm
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..cand_obs.len()).collect();
+    order.sort_by(|&a, &b| score[b].total_cmp(&score[a]));
+
+    // Greedy admit with the §7 spread (≤1 per addr_subnet bucket — AddrCorrelate, the
+    // harness default that matches `place`). Fill to `want`; the floor (R̂ ≥ r_target)
+    // is reached along the way by the surface-dominated order, identical stop to the
+    // kernel `place`.
+    let mut chosen: Vec<usize> = Vec::new();
+    let mut chosen_obs: Vec<viaticum_core::four_r::FirstHandObs> = Vec::new();
+    let mut occupied: Vec<u32> = Vec::new();
+    for &cand in &order {
+        if chosen.len() >= want {
+            break;
+        }
+        let _ = policy; // spread by addr_subnet (the §7 default; matches `place`).
+        let bucket = cand_obs[cand].addr_subnet;
+        if occupied.contains(&bucket) {
+            continue;
+        }
+        chosen.push(cand);
+        chosen_obs.push(cand_obs[cand].clone());
+        occupied.push(bucket);
+    }
+    chosen
 }
 
 /// (3)+(4): for every alive placed symbol, sample the PoS outcome from the hidden
@@ -381,29 +573,29 @@ fn pos_and_capital(world: &mut World, params: &DynParams) {
         }
         cap.push_outcome(passed);
 
-        // Reciprocity: the HOLDER's service to the owner means the holder accrues
-        // g_holder_from_owner toward the owner — i.e. the pair (holder, owner)'s
-        // g_ho rises (the holder is the one storing). We model g_ho as the mirror:
-        // when O challenges h and h passes, h has demonstrably served O, so from h's
-        // OWN ledger g_holder_from_owner(h, O) — which the holder reads as the
-        // eviction key — rises. We store that on capital[holder][owner].g_ho? No:
-        // g_ho on capital[o][h] is "owner o's service to holder h". The eviction key
-        // the holder ranks owners by is g_holder_from_owner = capital[h][o].g_ho is
-        // not it either. The kernel reads obs.g_holder_from_owner; the observer fills
-        // it from capital[owner][holder].g_ho. For the HOLDER's eviction decision,
-        // owner = the data owner, holder = self; the obs.g_holder_from_owner must be
-        // the holder's record of ITS service to that owner. Symmetric model: a pass
-        // means BOTH directions served each other this round (the owner confirmed
-        // storage = the holder served the owner). So we bump g_ho on the same pair
-        // state, representing the holder's service-to-owner that the holder will read
-        // when it later ranks this owner for eviction.
-        if passed {
-            let cap = cap_mut(&mut world.capital, c.owner, c.holder);
-            cap.g_ho = viaticum_core::four_r::update_capital(cap.g_ho, v_conf, params.lambda, dt);
-        } else {
-            let cap = cap_mut(&mut world.capital, c.owner, c.holder);
-            cap.g_ho = viaticum_core::four_r::update_capital(cap.g_ho, 0.0, params.lambda, dt);
-        }
+        // Reciprocal direction (g_ho) — the eviction-priority key, maintained on the
+        // SERVER's OWN first-hand books. This challenge is "holder c.holder served
+        // owner c.owner" (G(c.owner ← c.holder), the g_oh just bumped above). The
+        // SAME physical service is, from the server c.holder's own ledger, "I
+        // (c.holder) stored for c.owner" = `capital[c.holder][c.owner].g_ho`
+        // (PairCapital doc: g_ho accrues "when [a node] itself stores for the
+        // peer"). So the pass bumps the TRANSPOSE cell's g_ho — NOT
+        // capital[c.owner][c.holder].g_ho.
+        //
+        // Why the transpose, not the same cell (the bug this replaces): the old code
+        // bumped capital[c.owner][c.holder].g_ho symmetrically, making g_ho a MIRROR
+        // of g_oh (both = holder-served-owner). That inverted the eviction key — a
+        // holder h ranking owner O read capital[O][h].g_ho = "h served O" (its OWN
+        // service to O) instead of "O served h" (O's reciprocal service to h). It
+        // squeezed the owners it had served LEAST rather than the owners who had
+        // served IT least, so a free-rider (serves nobody) was NOT dropped first.
+        // Maintaining g_ho on the server's-own cell makes capital[O][h].g_ho =
+        // "O served h" = the reciprocity key both the placement forecast
+        // (retained_depth) and eviction_order read first-hand. Anti-oracle: this is
+        // c.holder's OWN record of storage it performed — not a peer's private cell.
+        let v_recip = if passed { v_conf } else { 0.0 };
+        let cap_t = cap_mut(&mut world.capital, c.holder, c.owner);
+        cap_t.g_ho = viaticum_core::four_r::update_capital(cap_t.g_ho, v_recip, params.lambda, dt);
     }
 }
 
@@ -436,6 +628,8 @@ fn iota_rank_of(ladder: &[f64], iota: f64) -> f64 {
 fn run_eviction(world: &mut World, params: &DynParams) {
     let n = world.nodes.len();
     let dt = DAYS_PER_TICK;
+    let tick = world.tick;
+    let mut any_eviction_this_tick = false;
 
     for holder in 0..n {
         if !world.nodes[holder].present {
@@ -453,10 +647,41 @@ fn run_eviction(world: &mut World, params: &DynParams) {
                 present: world.nodes[owner_idx].present,
             }
         };
-        // Capture caps by owner: capital[owner][holder].g_ho is the holder's service
-        // to that owner — the inter-owner eviction key.
+        // The distinct alive-symbol owners on this holder, in a DETERMINISTIC SHUFFLE
+        // (keyed by seed, holder, tick) — NOT ascending node-index. `eviction_order`
+        // sorts STABLY, so this input order is the tie-break among equal-`g_ho` owners.
+        // With ~90% of g_ho still tied at 0 (reciprocity is sparse, эталон §0/§9.13a),
+        // an ascending-index order makes the relay sacrifice low-index owners first
+        // EVERY tick — a pure node-index artifact that swamps the reciprocity signal
+        // and is archetype-correlated whenever the population layout is. The shuffle
+        // makes ties index-neutral and spreads them fairly across tied owners over
+        // ticks, so only the REAL `g_ho` differences drive who is dropped (эталон §4
+        // deeper fix). This SAME slice maps the drop slots back below.
+        let owner_of_view: Vec<usize> = {
+            let mut owners: Vec<usize> = Vec::new();
+            for s in world.nodes[holder].holdings.iter().filter(|s| s.alive) {
+                if !owners.contains(&s.owner) {
+                    owners.push(s.owner);
+                }
+            }
+            shuffle(
+                &mut owners,
+                world.seed,
+                holder as u64,
+                tick,
+                0x00E7_1C7B_12A4_u64,
+            );
+            owners
+        };
+
+        // Capture caps by owner: capital[owner][holder].g_ho is THAT OWNER's service
+        // to THIS holder ("has the owner stored my data?") — the inter-owner eviction
+        // key. The holder ranks owners ASCENDING by it, so an owner that never served
+        // this holder (a parasite, g_ho≈0) is squeezed first. (PairCapital doc: g_ho
+        // accrues when the owner itself stores for the holder.)
         let views = observer::observe_eviction_views(
             &world.nodes[holder],
+            &owner_of_view,
             |owner_idx| &world.capital[owner_idx][holder],
             owner_addr,
             dt,
@@ -471,19 +696,8 @@ fn run_eviction(world: &mut World, params: &DynParams) {
 
         // Apply drops one slot at a time until φ recovers to s_target. Map each
         // SymbolSlot (owner_idx into views, symbol_idx into that owner's symbols)
-        // back to the god-view HeldSymbol and mark it dead.
-        // Reconstruct the owner each view-slot refers to: the observer grouped owners
-        // ascending, so reproduce exactly that grouping.
-        let owner_of_view: Vec<usize> = {
-            let mut owners: Vec<usize> = Vec::new();
-            for s in world.nodes[holder].holdings.iter().filter(|s| s.alive) {
-                if !owners.contains(&s.owner) {
-                    owners.push(s.owner);
-                }
-            }
-            owners.sort_unstable();
-            owners
-        };
+        // back to the god-view HeldSymbol and mark it dead. `owner_of_view` (the
+        // shuffled slice above) is the single source of truth for the view order.
 
         for slot in &decision.drop_order {
             if world.nodes[holder].phi_free_ratio() >= params.hyst.s_target {
@@ -497,12 +711,26 @@ fn run_eviction(world: &mut World, params: &DynParams) {
             // order; map symbol_idx to the matching god-view holding and kill it.
             let block = nth_alive_block(&world.nodes[holder], owner_idx, slot.symbol_idx);
             if let Some(block) = block {
+                // The reciprocity key at drop time (diagnostic): did this drop land on
+                // a non-reciprocal (g_ho≈0) placement or a reciprocal one?
+                let g_ho_at_drop = world.capital[owner_idx][holder].g_ho;
                 if let Some(hs) = world.nodes[holder]
                     .holdings
                     .iter_mut()
                     .find(|s| s.alive && s.owner == owner_idx && s.block == block)
                 {
                     hs.alive = false;
+                    // Log the eviction event (design §D.1 drop-ranking + §E): which
+                    // holder dropped which owner's symbol, this tick.
+                    any_eviction_this_tick = true;
+                    world
+                        .eviction_log
+                        .push(crate::sim_dynamic::generator::EvictionEvent {
+                            tick,
+                            holder,
+                            owner: owner_idx,
+                            g_ho_at_drop,
+                        });
                 }
                 // The owner loses this placement (god-view block bookkeeping).
                 if let Some(b) = world.nodes[owner_idx]
@@ -515,6 +743,9 @@ fn run_eviction(world: &mut World, params: &DynParams) {
                 }
             }
         }
+    }
+    if any_eviction_this_tick {
+        world.ticks_with_eviction += 1;
     }
 }
 

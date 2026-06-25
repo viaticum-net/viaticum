@@ -93,24 +93,24 @@ pub fn observe_pair(cap: &PairCapital, h_node: &Node, dt: f64) -> FirstHandObs {
 /// (`g_holder_from_owner` is the holder's OWN service-rendered record — first-hand,
 /// unfakeable by the owner). `owner_node(owner_idx)` gives the owner's observable
 /// address for the obs (the holder observes the OWNER's connection facts).
+///
+/// `owners` is the caller-supplied owner ORDER (the distinct alive-symbol owners on
+/// `h`). The caller owns the order so the SAME slice can map the resulting drop
+/// slots back (single source of truth) AND so the order can be a deterministic
+/// shuffle rather than ascending node-index — `eviction_order` sorts STABLY, so the
+/// input order is the tie-break among equal-`g_ho` owners; an ascending-index input
+/// would systematically sacrifice low-index owners first (an artifact, not the
+/// reciprocity signal). See `run_eviction`.
 pub fn observe_eviction_views<'a>(
     h: &Node,
+    owners: &[usize],
     mut cap_of: impl FnMut(usize) -> &'a PairCapital,
     mut owner_node: impl FnMut(usize) -> ObsAddr,
     dt: f64,
 ) -> Vec<OwnerEvictionView> {
-    // Group this holder's ALIVE symbols by owner.
-    let mut owners: Vec<usize> = Vec::new();
-    for hs in h.holdings.iter().filter(|s| s.alive) {
-        if !owners.contains(&hs.owner) {
-            owners.push(hs.owner);
-        }
-    }
-    owners.sort_unstable();
-
     owners
-        .into_iter()
-        .map(|owner_idx| {
+        .iter()
+        .map(|&owner_idx| {
             let cap = cap_of(owner_idx);
             let addr = owner_node(owner_idx);
             let obs = observe_pair_from_addr(cap, &addr, dt);

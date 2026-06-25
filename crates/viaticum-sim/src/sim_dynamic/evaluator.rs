@@ -416,10 +416,10 @@ pub struct DrMetric {
 }
 
 /// Compute metric (c): for `m` random victim blocks, the god-view block survival
-/// `R_actual(T)` — the fraction of alive placements ≥ k_eff. Since at evaluation
-/// time the placements are already realised (alive/dead), `R_actual` here is a
-/// deterministic 0/1 per block; we average the indicator over the sampled victims.
-/// Reuses the surviving-placement-count vs k_eff rule (the DR floor-probe).
+/// `R_actual(T)` via the Monte-Carlo estimator (design §D.1): sample the hidden
+/// per-holder hazard and report the empirical `P(≥ k_eff survive)` to a short
+/// horizon. This replaces the old deterministic 0/1 alive-count — survival is now a
+/// graded probability over the hidden hazard, seeded and reproducible.
 pub fn dr_metric(world: &World, k_eff: usize, m: usize, seed: u64) -> DrMetric {
     use crate::generator::Rng;
     let n = world.nodes.len();
@@ -453,25 +453,22 @@ pub fn dr_metric(world: &World, k_eff: usize, m: usize, seed: u64) -> DrMetric {
         }
     }
 
+    // Short DR horizon for the sanity probe (the restore is "soon after loss").
+    const DR_HORIZON_TICKS: u64 = 4;
+    const DR_SAMPLES: usize = 200;
     for &i in &chosen_idx {
         let (owner, block_id) = blocks[i];
-        // God-view: count distinct present holders with an alive symbol of this block.
-        let alive_holders = (0..n)
-            .filter(|&h| {
-                world.nodes[h].present
-                    && world.nodes[h]
-                        .holdings
-                        .iter()
-                        .any(|s| s.alive && s.owner == owner && s.block == block_id)
-            })
-            .count();
-        // R_actual = 1.0 if ≥ k_eff alive holders (block reconstructable), else a
-        // graded fraction toward k_eff (so the median is informative, not just 0/1).
-        let r_actual = if alive_holders >= k_eff {
-            1.0
-        } else {
-            alive_holders as f64 / k_eff as f64
-        };
+        // Monte-Carlo R_actual(T): empirical P(≥ k_eff symbols survive the hidden
+        // hazard to the DR horizon), seeded off the DR seed + the victim.
+        let r_actual = mc_block_r_actual(
+            world,
+            owner,
+            block_id,
+            k_eff,
+            DR_HORIZON_TICKS,
+            DR_SAMPLES,
+            seed,
+        );
         survivals.push(r_actual);
     }
 
@@ -490,6 +487,369 @@ pub fn dr_metric(world: &World, k_eff: usize, m: usize, seed: u64) -> DrMetric {
         median_survival,
         zero_count,
         pass,
+    }
+}
+
+// ============================================================
+// Pillar 1 — efficiency: Monte-Carlo R_actual + R_actual/own-disk + drop-ranking.
+// ============================================================
+
+/// Per-holder god-view survival probability of an owner's CURRENTLY-HELD symbol to
+/// horizon `T` ticks (design §D.1). This is the HIDDEN hazard the Monte-Carlo
+/// estimator samples — NEVER a kernel input; it is read here only to SCORE.
+///
+/// The symbol is currently ALIVE on the holder, so it has already survived eviction
+/// up to now; the forward survival is the product of three independent FORWARD death
+/// routes over the horizon:
+///  * **Departure (churn).** Per-tick departure prob `p` by archetype; survives the
+///    whole horizon with prob `(1−p)^T` (Hoarder/Freeloader churn 3×, mirroring the
+///    engine's `churn`).
+///  * **Forward eviction.** A SOFT per-tick keep-probability over the horizon, from
+///    how deep the symbol sits vs the holder's effective retained edge `1−keep_depth`
+///    (deep = above the edge ⇒ kept; shallow ⇒ at risk). We use a smooth retention
+///    `s ∈ [0,1]` (a ramp around the edge, not the engine's hard 0/1) BECAUSE the
+///    symbol already survived the current edge — the forward question is the RISK of
+///    being dropped over the next T ticks as contention persists, which is graded.
+///    Compounded over the horizon: `keep_per_tick^T`.
+///  * **Reachable at restore.** The holder must be online at the restore attempt —
+///    its baseline uptime.
+///
+/// All three multiply (independent failure modes). Returns a probability in [0,1].
+fn holder_symbol_survival_prob(
+    world: &World,
+    holder: usize,
+    owner: usize,
+    block: usize,
+    t: u64,
+) -> f64 {
+    let node = &world.nodes[holder];
+    if !node.present {
+        return 0.0;
+    }
+    // Is the symbol currently alive on this holder?
+    let sym = node
+        .holdings
+        .iter()
+        .find(|s| s.alive && s.owner == owner && s.block == block);
+    let sym = match sym {
+        Some(s) => s,
+        None => return 0.0,
+    };
+    // Departure survival over the horizon (per-tick churn by archetype).
+    let base_churn: f64 = 0.002; // matches DynParams::default().churn_out_prob
+    let p_depart = match node.archetype {
+        Archetype::Hoarder | Archetype::Freeloader => base_churn * 3.0,
+        _ => base_churn,
+    };
+    let survive_presence = (1.0 - p_depart).powi(t as i32);
+    // Forward eviction route: the probability the holder does NOT drop this
+    // (currently-retained) symbol over the horizon as contention persists. The symbol
+    // is ALIVE now, so it sits above the current edge; the forward risk is that the
+    // holder deepens its eviction past it. Three god-view drivers, mirroring the
+    // engine's eviction-by-G + ι-ladder + disk-pressure realisation:
+    //  * **Reciprocity (god-view served).** Eviction is ascending the holder's
+    //    service to the owner; an owner that SERVED this holder back is squeezed LAST
+    //    ⇒ its data is protected. We read the GOD-VIEW reciprocity directly: how much
+    //    the OWNER has served THIS holder (`served[owner][holder]` = owner-as-holder
+    //    retained this holder's data). A Freeloader serves almost nobody ⇒ ≈0 ⇒ its
+    //    data is NOT protected ⇒ evicted first. This is the heart of pillar-1: serving
+    //    your holders makes YOUR data survive (foundation §2B / §9.10). Using the
+    //    god-view served VOLUME (not the symmetric G-ledger) is the honest signal.
+    //  * **ι-rank.** Within an owner, higher-ι symbols are kept (intra-owner ladder).
+    //  * **Disk headroom.** A holder with φ well above the eviction trigger `s_hard`
+    //    won't deepen eviction at all; one pinned at the wall might.
+    let phi = node.phi_free_ratio();
+    let headroom = (phi - 0.10).clamp(-0.10, 0.30); // distance above s_hard=0.10
+    let (ladder, _) = observer::owner_ladder_on_holder(node, owner, block);
+    let iota_rank = iota_rank_of(&ladder, sym.iota);
+    // Owner's god-view reciprocal service to THIS holder (the honest protection
+    // signal): served[owner][holder] = volume of this holder's data the owner held.
+    let recip = world.served[owner][holder].max(0.0);
+    let g_protect = recip / (recip + 40.0); // ∈[0,1): served back ⇒ protected
+    // Combine: protection from G + ι-depth + disk headroom. A logistic keeps it a
+    // probability; the constants weight G as the dominant (reciprocity) driver.
+    let evict_safety = 6.0 * g_protect + 2.0 * iota_rank + 8.0 * headroom - 1.5;
+    let survive_eviction = logistic(evict_safety).clamp(0.02, 1.0);
+    // Reachable at restore: the holder's baseline uptime.
+    let reachable = node.archetype.base_uptime();
+    (survive_presence * survive_eviction * reachable).clamp(0.0, 1.0)
+}
+
+/// Numerically-stable logistic `1/(1+e^{−x})` (local copy; the kernel's is private).
+fn logistic(x: f64) -> f64 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+
+/// ι-rank ∈ [0,1] of `iota` within `ladder` (same convention as the engine/kernel).
+fn iota_rank_of(ladder: &[f64], iota: f64) -> f64 {
+    let m = ladder.len();
+    if m <= 1 {
+        return 0.0;
+    }
+    let lower = ladder.iter().filter(|&&i| i < iota).count();
+    lower as f64 / (m - 1) as f64
+}
+
+/// Monte-Carlo `R_actual(T)` of one owner's block (design §D.1): the empirical
+/// probability that ≥ `k_eff` of its holders' symbols survive to horizon `T` ticks,
+/// estimated by sampling the hidden per-holder survival hazard `n_samples` times.
+///
+/// This REPLACES the old deterministic 0/1 alive-count (`dr_metric`) with a genuine
+/// Monte-Carlo over the hidden hazard. Seeded (`mc_seed` + the owner/block) so it is
+/// bit-reproducible across runs. More surviving-likely holders ⇒ higher R_actual,
+/// monotonically.
+pub fn mc_block_r_actual(
+    world: &World,
+    owner: usize,
+    block: usize,
+    k_eff: usize,
+    t: u64,
+    n_samples: usize,
+    mc_seed: u64,
+) -> f64 {
+    use crate::generator::Rng;
+    let n = world.nodes.len();
+    // Per-holder survival probabilities for this block's current holders.
+    let probs: Vec<f64> = (0..n)
+        .filter_map(|h| {
+            let p = holder_symbol_survival_prob(world, h, owner, block, t);
+            if p > 0.0
+                || world.nodes[h]
+                    .holdings
+                    .iter()
+                    .any(|s| s.alive && s.owner == owner && s.block == block)
+            {
+                Some(p)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if probs.is_empty() {
+        return 0.0;
+    }
+    if n_samples == 0 {
+        return 0.0;
+    }
+    let mut rng = Rng::derive(mc_seed, 0x5DAC_70A1, owner as u64, block as u64, t);
+    let mut reconstructable = 0usize;
+    for _ in 0..n_samples {
+        let survivors = probs.iter().filter(|&&p| rng.unit() < p).count();
+        if survivors >= k_eff {
+            reconstructable += 1;
+        }
+    }
+    reconstructable as f64 / n_samples as f64
+}
+
+/// Pillar-1 efficiency: a node's achieved `R_actual(T)` of its OWN data per unit own
+/// disk it GAVE to others (design §D.1). The headline efficiency metric: Reliable
+/// should achieve a higher `R_actual / own-disk-given` than Freeloader/Hoarder.
+#[derive(Debug, Clone)]
+pub struct Pillar1Metric {
+    /// Per-archetype mean achieved `R_actual(T)` of own data (god-view MC), over the
+    /// archetype's present nodes that have ≥1 own block.
+    pub mean_r_actual_reliable: f64,
+    pub mean_r_actual_hoarder: f64,
+    pub mean_r_actual_freeloader: f64,
+    /// Per-archetype mean own-disk GIVEN to others (gb of alive foreign holdings this
+    /// node stores) — the "price paid in own disk" denominator.
+    pub mean_given_reliable: f64,
+    pub mean_given_hoarder: f64,
+    pub mean_given_freeloader: f64,
+    /// EFFICIENCY = mean `R_actual / own-disk-given` per archetype (the headline; a
+    /// node optimises reliability per unit of own disk lent, foundation §2B). Higher
+    /// is better. A node that gives little disk earns little reciprocal redundancy,
+    /// so its own data is less reliable per unit it DID give — Reliable should lead.
+    pub efficiency_reliable: f64,
+    pub efficiency_hoarder: f64,
+    pub efficiency_freeloader: f64,
+}
+
+/// Compute the pillar-1 efficiency metric (design §D.1). For each present node with
+/// own data, MC-estimate its blocks' `R_actual(T)` and divide by the own disk it
+/// gave to others. Aggregate per archetype.
+pub fn pillar1_metric(
+    world: &World,
+    k_eff: usize,
+    t: u64,
+    n_samples: usize,
+    mc_seed: u64,
+) -> Pillar1Metric {
+    let n = world.nodes.len();
+    // Per-node (r_actual_mean, own_given, archetype).
+    let mut rows: Vec<(f64, f64, Archetype)> = Vec::new();
+    for o in 0..n {
+        if !world.nodes[o].present || world.nodes[o].own_blocks.is_empty() {
+            continue;
+        }
+        let mut r_sum = 0.0;
+        let mut r_cnt = 0usize;
+        let blocks: Vec<usize> = world.nodes[o].own_blocks.iter().map(|b| b.id).collect();
+        for b in blocks {
+            r_sum += mc_block_r_actual(world, o, b, k_eff, t, n_samples, mc_seed);
+            r_cnt += 1;
+        }
+        let r_actual = if r_cnt > 0 { r_sum / r_cnt as f64 } else { 0.0 };
+        // Own disk GIVEN to others = alive foreign-holdings volume this node stores.
+        let given = world.nodes[o].used_disk();
+        rows.push((r_actual, given, world.nodes[o].archetype));
+    }
+
+    // Per-archetype means over the (r_actual, given, archetype) rows.
+    let mean_r = |arch: Archetype| -> f64 {
+        let v: Vec<f64> = rows.iter().filter(|r| r.2 == arch).map(|r| r.0).collect();
+        mean(&v)
+    };
+    let mean_given = |arch: Archetype| -> f64 {
+        let v: Vec<f64> = rows.iter().filter(|r| r.2 == arch).map(|r| r.1).collect();
+        mean(&v)
+    };
+    // Efficiency = R_actual / own-disk-given, per node, averaged (only nodes that
+    // gave > 0 disk — otherwise the ratio is undefined / infinite).
+    let efficiency = |arch: Archetype| -> f64 {
+        let v: Vec<f64> = rows
+            .iter()
+            .filter(|r| r.2 == arch && r.1 > 0.0)
+            .map(|r| r.0 / r.1)
+            .collect();
+        mean(&v)
+    };
+
+    Pillar1Metric {
+        mean_r_actual_reliable: mean_r(Archetype::Reliable),
+        mean_r_actual_hoarder: mean_r(Archetype::Hoarder),
+        mean_r_actual_freeloader: mean_r(Archetype::Freeloader),
+        mean_given_reliable: mean_given(Archetype::Reliable),
+        mean_given_hoarder: mean_given(Archetype::Hoarder),
+        mean_given_freeloader: mean_given(Archetype::Freeloader),
+        efficiency_reliable: efficiency(Archetype::Reliable),
+        efficiency_hoarder: efficiency(Archetype::Hoarder),
+        efficiency_freeloader: efficiency(Archetype::Freeloader),
+    }
+}
+
+/// Drop-ranking metric (design §D.1): under contention, does eviction systematically
+/// drop LOW-`served(h←O)` owners first? Motive-blind — ranked by god-view served
+/// VOLUME (NOT the G-ledger, which would be tautological), never by archetype.
+#[derive(Debug, Clone)]
+pub struct DropRankingMetric {
+    /// Number of eviction events scored (events where the holder served ≥2 distinct
+    /// owners, so a rank is meaningful).
+    pub events_scored: usize,
+    /// Mean served-RANK percentile of the evicted owner among the holder's served
+    /// owners (0 = the holder's LOWEST-served owner was dropped, 1 = the highest).
+    /// Eviction-by-G working ⇒ this is well BELOW 0.5 (low-served dropped first).
+    pub mean_evicted_served_rank: f64,
+    /// Fraction of scored events where the evicted owner was in the BOTTOM HALF of
+    /// the holder's served owners (rank < 0.5). Working ⇒ well above 0.5.
+    pub frac_below_median: f64,
+}
+
+/// Compute the drop-ranking metric (design §D.1). For each logged eviction event,
+/// rank the evicted owner by god-view `served(h←O)` = "owner O served holder h" =
+/// `world.served[O][h]` (the reciprocity-key direction) among ALL owners that served
+/// this holder, and report whether eviction systematically hits the low-served end.
+///
+/// Partial anti-tautology: ranks by `world.served` (the RAW cumulative PoS-confirmed
+/// retained-bytes integral), a DIFFERENT functional from the `G`-ledger the kernel
+/// evicts on (a leaky integral, decay `λ`, of the same pass events). Using the raw
+/// integral rather than the exact eviction key catches gross ordering bugs, but the
+/// two are NOT orthogonal — both derive from the same PoS-pass stream, so a "the
+/// balancer balances" residue remains. The orthogonal proof of free-rider exclusion
+/// is the pillar-1 OUTCOME separation (`R_actual/own-disk`: Reliable ≫ Freeloader),
+/// not this mechanism-level diagnostic.
+pub fn drop_ranking_metric(world: &World) -> DropRankingMetric {
+    let n = world.nodes.len();
+    let mut ranks: Vec<f64> = Vec::new();
+    for ev in &world.eviction_log {
+        let holder = ev.holder;
+        let owner = ev.owner;
+        if holder >= n || owner >= n {
+            continue;
+        }
+        // Rank by the RECIPROCITY-key direction: how much each OWNER served THIS
+        // holder (served[owner][holder] = "O served h" = G(h←O)), NOT how much the
+        // holder served the owner. Eviction squeezes the owners who served the
+        // holder LEAST (ascending g_holder_from_owner), so a working balancer drops
+        // low-`served[owner][holder]` owners first. The set is the owners that have
+        // any reciprocal service to this holder. served is indexed [holder][owner],
+        // so "owner o served this holder" is served[o][holder].
+        let served_owners: Vec<(usize, f64)> = (0..n)
+            .map(|o| (o, world.served[o][holder]))
+            .filter(|&(_, v)| v > 0.0)
+            .collect();
+        // Need ≥2 distinct served owners for a meaningful rank.
+        if served_owners.len() < 2 {
+            continue;
+        }
+        let evicted_served = world.served[owner][holder];
+        // Rank percentile: fraction of served owners with STRICTLY LESS served volume
+        // than the evicted owner (0 = lowest-served, 1 = highest-served).
+        let lower = served_owners
+            .iter()
+            .filter(|&&(_, v)| v < evicted_served)
+            .count();
+        let rank = lower as f64 / (served_owners.len() - 1) as f64;
+        ranks.push(rank);
+    }
+    let events_scored = ranks.len();
+    let mean_evicted_served_rank = mean(&ranks);
+    let frac_below_median = if events_scored > 0 {
+        ranks.iter().filter(|&&r| r < 0.5).count() as f64 / events_scored as f64
+    } else {
+        f64::NAN
+    };
+    DropRankingMetric {
+        events_scored,
+        mean_evicted_served_rank,
+        frac_below_median,
+    }
+}
+
+/// Contention-front summary (design §A acceptance / §E observability): did the world
+/// REACH contention (utilization→1, full disks, eviction firing)?
+#[derive(Debug, Clone)]
+pub struct ContentionMetric {
+    /// Mean free-ratio `φ` over present nodes at the end of the run (→0 ⇒ contended).
+    pub mean_phi_end: f64,
+    /// Mean utilization `1−φ` at the end (→1 ⇒ contended; the headline acceptance).
+    pub mean_utilization_end: f64,
+    /// Fraction of present nodes whose `φ < s_hard` at the end (in the eviction band).
+    pub frac_nodes_in_eviction_band: f64,
+    /// Total eviction events logged over the whole run.
+    pub total_evictions: usize,
+    /// Number of ticks on which ≥1 eviction fired.
+    pub ticks_with_eviction: u64,
+    /// Total ticks elapsed (so the % with eviction is computable).
+    pub total_ticks: u64,
+}
+
+/// Compute the contention-front summary at the current world state (design §A/§E).
+pub fn contention_metric(world: &World, s_hard: f64) -> ContentionMetric {
+    let n = world.nodes.len();
+    let present: Vec<usize> = (0..n).filter(|&i| world.nodes[i].present).collect();
+    let in_band = present
+        .iter()
+        .filter(|&&i| world.nodes[i].phi_free_ratio() < s_hard)
+        .count();
+    let frac_nodes_in_eviction_band = if present.is_empty() {
+        f64::NAN
+    } else {
+        in_band as f64 / present.len() as f64
+    };
+    ContentionMetric {
+        mean_phi_end: world.mean_phi(),
+        mean_utilization_end: world.mean_utilization(),
+        frac_nodes_in_eviction_band,
+        total_evictions: world.eviction_log.len(),
+        ticks_with_eviction: world.ticks_with_eviction,
+        total_ticks: world.tick,
     }
 }
 

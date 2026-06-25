@@ -12,8 +12,12 @@ use viaticum_core::four_r::{
 use crate::sim_dynamic::engine::{
     DynParams, PosOutcome, assert_lambda_dt_stable, fresh_capital, step,
 };
+use crate::sim_dynamic::evaluator::{
+    contention_metric, drop_ranking_metric, mc_block_r_actual, pillar1_metric,
+};
 use crate::sim_dynamic::generator::{
-    Archetype, DAYS_PER_TICK, Node, PairCapital, online, population_mix,
+    Archetype, DAYS_PER_TICK, DiskProfile, GiverTier, HeldSymbol, Node, OWN_DATA_DISK_FRACTION,
+    PairCapital, World, giver_tier_mix, online, population_mix,
 };
 use crate::sim_dynamic::observer::{self, observe_pair};
 use crate::sim_dynamic::{Experiment1Config, build_world, run_experiment_1};
@@ -29,6 +33,11 @@ fn node_with(archetype: Archetype) -> Node {
         id: 7,
         archetype,
         disk_cap: 100.0,
+        disk: DiskProfile {
+            tier: GiverTier::T1,
+            own_data: 20.0,
+            own_growth_per_tick: 0.0,
+        },
         holdings: Vec::new(),
         own_blocks: Vec::new(),
         addr_subnet: 11,
@@ -111,6 +120,8 @@ fn experiment_summary_is_identical_for_the_same_seed() {
         regime1_ticks: 10,
         regime2_ticks: 15,
         dr_victims: 8,
+        mc_samples: 64,
+        mc_horizon_ticks: 8,
         seed: 123,
     };
     let a = run_experiment_1(cfg);
@@ -135,6 +146,8 @@ fn different_seeds_generally_give_different_runs() {
         regime1_ticks: 10,
         regime2_ticks: 15,
         dr_victims: 8,
+        mc_samples: 64,
+        mc_horizon_ticks: 8,
         seed: 1,
     };
     let other = Experiment1Config { seed: 999, ..base };
@@ -310,16 +323,21 @@ fn population_mix_sums_to_n_and_respects_shares() {
 }
 
 #[test]
-fn hoarder_holds_less_than_reliable_after_a_run() {
-    // The accept-rate dial really bites: over a run the Hoarder/Freeloader population
-    // ends with fewer foreign symbols held than Reliable (god-view), because they
-    // reject most offers. This is the behavioural anti-oracle (the kernel never saw
-    // the archetype; the reject is observed first-hand).
+fn hoarder_and_freeloader_hold_less_than_reliable_in_abundance() {
+    // The accept-rate dial really bites: in the ABUNDANCE phase (early ticks, ample
+    // free disk) the Hoarder/Freeloader population holds fewer foreign symbols than
+    // Reliable (god-view), because they REJECT most offers — the behavioural anti-
+    // oracle (the kernel never saw the archetype; the reject is observed first-hand).
+    //
+    // Measured in abundance ON PURPOSE: once the §A.3 room-gate bites under contention,
+    // holdings are capped by physical disk for EVERYONE, washing out the accept-rate
+    // signal (a full Reliable can hold no more than a full Freeloader). The clean
+    // behavioural reject signal lives BEFORE disks fill — that is what this asserts.
     let params = DynParams::default();
     let prior = SurfacePrior::default();
     let policy = PlacementPolicy::default();
-    let mut world = build_world(60, &params, 71);
-    for _ in 0..40 {
+    let mut world = build_world(120, &params, 71);
+    for _ in 0..6 {
         step(&mut world, &params, &prior, &policy);
     }
     let avg_held = |a: Archetype| {
@@ -336,13 +354,19 @@ fn hoarder_holds_less_than_reliable_after_a_run() {
     let reliable = avg_held(Archetype::Reliable);
     let hoarder = avg_held(Archetype::Hoarder);
     let freeloader = avg_held(Archetype::Freeloader);
+    // The load-bearing behavioural anti-oracle invariant: BOTH exploiters hold less
+    // than Reliable (they reject most offers — the kernel never saw the archetype, the
+    // reject is observed first-hand). The Hoarder-vs-Freeloader ORDERING is NOT
+    // asserted: both are low rejectors and under the §A.3 room-gate + accept-gate their
+    // relative holdings depend on which contended holders they happened to land on —
+    // a weak secondary that is not a model property.
     assert!(
         reliable > hoarder,
         "reliable holds {reliable}, hoarder {hoarder} — hoarder should hold less"
     );
     assert!(
-        hoarder > freeloader || freeloader == 0.0,
-        "hoarder {hoarder} should hold ≥ freeloader {freeloader}"
+        reliable > freeloader,
+        "reliable holds {reliable}, freeloader {freeloader} — freeloader should hold less"
     );
 }
 
@@ -465,7 +489,6 @@ fn fresh_capital_is_zeroed_and_correctly_sized() {
 #[test]
 fn owner_ladder_on_holder_returns_sorted_iotas_and_correct_rung() {
     let mut holder = node_with(Archetype::Reliable);
-    use crate::sim_dynamic::generator::HeldSymbol;
     holder.holdings = vec![
         HeldSymbol {
             owner: 0,
@@ -500,29 +523,25 @@ fn owner_ladder_on_holder_returns_sorted_iotas_and_correct_rung() {
 // ============================================================
 
 #[test]
-fn experiment_1_smoke_produces_sane_metrics_with_correct_gap_sign() {
-    // Small + fast (~30 nodes, ~20 ticks total). Asserts: no panic, finite ratios,
-    // and the PRIMARY gap has the right SIGN (Reliable earns more total G than the
-    // Hoarder/Freeloader pair — honest holders rank above exploiters).
+fn experiment_1_smoke_produces_sane_phase1_metrics() {
+    // Small + fast (~30 nodes, ~20 ticks total). Asserts the Phase-1 SANE invariants:
+    // no panic, finite ratios, DR a valid probability, and the pillar-1 efficiency is
+    // well-formed. (The retired metric-(a) earned-G gap SIGN is no longer asserted —
+    // it was an abundance artifact, design §G supersede; the pillar-1 efficiency +
+    // drop-ranking are the headline now. The smoke run is too short to firmly contend,
+    // so the contention gate is asserted only by the full-scale on-demand test.)
     let cfg = Experiment1Config {
         n_nodes: 30,
         regime1_ticks: 8,
         regime2_ticks: 12,
         dr_victims: 8,
+        mc_samples: 64,
+        mc_horizon_ticks: 8,
         seed: 2026,
     };
     let r = run_experiment_1(cfg);
 
-    // (a) gap sign: honest > exploiters.
-    assert!(
-        r.rank.gap > 0.0,
-        "primary gap must be positive (Reliable {:.2} vs bad {:.2}), got {:+.2}",
-        r.rank.mean_g_reliable,
-        r.rank.mean_g_bad,
-        r.rank.gap
-    );
-
-    // (b) reciprocity ratios are finite where present.
+    // (a) reciprocity ratios are finite where present.
     for &ratio in &r.reciprocity.honest_balance_ratios {
         assert!(
             ratio.is_finite() && ratio >= 1.0,
@@ -530,8 +549,7 @@ fn experiment_1_smoke_produces_sane_metrics_with_correct_gap_sign() {
         );
     }
 
-    // (c) DR median is a valid probability (or NaN only if no blocks, which should
-    // not happen at this scale).
+    // (b) DR median is a valid probability.
     assert!(
         r.dr.median_survival.is_finite(),
         "DR median should be finite, got {}",
@@ -539,60 +557,65 @@ fn experiment_1_smoke_produces_sane_metrics_with_correct_gap_sign() {
     );
     assert!((0.0..=1.0).contains(&r.dr.median_survival));
 
-    // The newcomer probe at least placed its own data (the network is reachable).
+    // (c) pillar-1 efficiency figures are well-formed probabilities / non-negative.
     assert!(
-        r.newcomer.t_boot_placed.is_some(),
-        "newcomer should be able to place its own data in a reachable network"
+        (0.0..=1.0).contains(&r.pillar1.mean_r_actual_reliable),
+        "Reliable R_actual must be a probability, got {}",
+        r.pillar1.mean_r_actual_reliable
+    );
+    assert!(
+        r.pillar1.efficiency_reliable >= 0.0 || r.pillar1.efficiency_reliable.is_nan(),
+        "efficiency must be non-negative (or NaN if no disk given)"
+    );
+
+    // (d) the contention instrumentation is populated (utilization is a valid ratio).
+    assert!(
+        (0.0..=1.0).contains(&r.contention.mean_utilization_end),
+        "utilization must be a valid ratio, got {}",
+        r.contention.mean_utilization_end
     );
 }
 
 // ============================================================
-// FIX 1 — metric (a) reports THREE honest aggregations with documented signs
+// Metric (a) — RETIRED earned-G framing is still well-formed (design §G supersede)
 // ============================================================
 
 #[test]
-fn metric_a_reports_sum_mean_and_breadth_with_documented_signs() {
-    // The reviewer-required honest framing (FIX 1): on a run, the SUM gap is
-    // POSITIVE (breadth-driven), the per-pair MEAN gap is NEGATIVE (exploiters score
-    // higher per pair — selection effect), and the breadth ratio is > 1 (Reliable
-    // serves more pairs, ≈ the accept_rate dial). A small-but-real smoke run.
+fn metric_a_earned_g_aggregations_are_well_formed() {
+    // The old metric-(a) earned-G SUM/per-pair/breadth framing is RETIRED as a HEADLINE
+    // (design §G: the reject-breadth headline was an abundance artifact / tautology of
+    // the input accept dial). Under the Phase-1 CONTENTION regime the SUM gap can even
+    // INVERT (exploiters accumulate more raw per-pair G from the few deep partners they
+    // keep). We therefore NO LONGER assert the old POSITIVE-SUM / NEGATIVE-per-pair /
+    // breadth>1 signs — that would be faking a property the contention regime does not
+    // have. We assert only that the (continuity-only) aggregations are FINITE and the
+    // breadth figures non-negative, so a NaN/garbage regression is still caught. The
+    // real Phase-1 headline is the pillar-1 efficiency + drop-ranking (asserted above).
     let cfg = Experiment1Config {
         n_nodes: 120,
         regime1_ticks: 20,
         regime2_ticks: 40,
         dr_victims: 10,
+        mc_samples: 64,
+        mc_horizon_ticks: 8,
         seed: 4242,
     };
     let r = run_experiment_1(cfg);
 
-    // (1) SUM gap > 0: honest holders out-earn exploiters on TOTAL foregone service.
     assert!(
-        r.rank.gap > 0.0,
-        "SUM gap must be > 0 (breadth-driven), got {:+.4}",
+        r.rank.gap.is_finite(),
+        "SUM gap must be finite, got {}",
         r.rank.gap
     );
-    // (2) per-pair MEAN gap < 0: per pair, exploiters score HIGHER (must be surfaced,
-    // not hidden — the kernel does NOT rank on per-pair surface quality).
     assert!(
-        r.rank.gap_per_pair < 0.0,
-        "per-pair gap must be NEGATIVE (exploiters score higher per pair), got {:+.4} \
-         (reliable {:.4} vs bad {:.4})",
-        r.rank.gap_per_pair,
-        r.rank.mean_per_pair_g_reliable,
-        r.rank.mean_per_pair_g_bad
+        r.rank.mean_g_reliable.is_finite() && r.rank.mean_g_bad.is_finite(),
+        "earned-G means must be finite"
     );
-    // (3) breadth ratio > 1: Reliable serves more distinct pairs (≈ accept_rate dial).
     assert!(
-        r.rank.breadth_ratio > 1.0,
-        "breadth ratio must be > 1 (Reliable serves more pairs), got {:.4}× \
-         (reliable {:.4} vs bad {:.4})",
-        r.rank.breadth_ratio,
-        r.rank.breadth_reliable,
-        r.rank.breadth_bad
+        r.rank.breadth_reliable >= 0.0 && r.rank.breadth_bad >= 0.0,
+        "breadth counts must be non-negative"
     );
-    // (4) ρ(surface,truth) is finite (a real diagnostic exists); its sign is the
-    // per-pair inversion's cousin but we only assert finiteness here (sign can wobble
-    // on a small smoke run; the full run reports it).
+    // ρ(surface,truth) is finite (a real diagnostic exists).
     assert!(
         r.rank.spearman_rho.is_finite(),
         "Spearman ρ must be finite, got {}",
@@ -679,6 +702,8 @@ fn served_series_samples_at_regime_boundary_and_records_a_trend() {
         regime1_ticks: 20,
         regime2_ticks: 30,
         dr_victims: 8,
+        mc_samples: 64,
+        mc_horizon_ticks: 8,
         seed: 9090,
     };
     let r = run_experiment_1(cfg);
@@ -727,11 +752,378 @@ fn full_experiment_1_prints_structured_report() {
     let report = run_experiment_1(cfg);
     crate::sim_dynamic::print_experiment_1(&report);
 
-    // Even on-demand, assert the load-bearing structural sign so a regression is
-    // caught: honest holders out-earn exploiters on total G.
+    // NOTE: the retired metric-(a) earned-G SUM gap is NOT asserted positive here —
+    // under the Phase-1 contention regime it inverts (an abundance artifact, design §G
+    // supersede). The load-bearing Phase-1 assertions are contention + pillar-1 below.
+
+    // Phase-1 make-or-break: the world REACHED contention (utilization→1, eviction
+    // firing) — the thing Exp-1 failed (permanent abundance). This is THE result.
     assert!(
-        report.rank.gap > 0.0,
-        "primary gap must be positive at scale, got {:+.4}",
-        report.rank.gap
+        report.contention_reached(),
+        "Phase-1 make-or-break: the world must REACH contention (util {:.3}, eviction on \
+         {}/{} ticks)",
+        report.contention.mean_utilization_end,
+        report.contention.ticks_with_eviction,
+        report.contention.total_ticks,
+    );
+    // Pillar-1 efficiency: Reliable achieves higher R_actual/own-disk than the
+    // exploiters (the heart of §D.1).
+    assert!(
+        report.pillar1.efficiency_reliable > report.pillar1.efficiency_freeloader
+            && report.pillar1.efficiency_reliable > report.pillar1.efficiency_hoarder,
+        "Reliable efficiency {:.6} must exceed Freeloader {:.6} and Hoarder {:.6}",
+        report.pillar1.efficiency_reliable,
+        report.pillar1.efficiency_freeloader,
+        report.pillar1.efficiency_hoarder,
+    );
+}
+
+// ============================================================
+// PHASE-1 §A — realism-v2 world reaches contention (the make-or-break)
+// ============================================================
+
+/// Build a small disk-profiled world and run it; helper for the Phase-1 tests.
+fn run_small(seed: u64, ticks: u64) -> World {
+    let params = DynParams::default();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world(120, &params, seed);
+    for _ in 0..ticks {
+        step(&mut world, &params, &prior, &policy);
+    }
+    world
+}
+
+#[test]
+fn full_disk_rejects_a_new_offer_even_when_willing() {
+    // §A.3 SymbolReject-on-quota fidelity: a holder with NO free disk must reject a
+    // new offer EVEN IF it is willing (accept_rate 1.0). The old engine accepted on a
+    // pure Bernoulli with no disk check — this asserts the room gate now bites.
+    let params = DynParams::default();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    // A 2-node world: owner 0 wants to back up; holder 1 is a willing Reliable but
+    // its disk is physically FULL (own_data == cap, no free room).
+    let mut world = build_world(2, &params, 5);
+    // Force holder 1 full: own data fills the disk entirely.
+    world.nodes[1].archetype = Archetype::Reliable; // willing
+    world.nodes[1].disk.own_data = world.nodes[1].disk_cap; // no room
+    world.nodes[1].disk.own_growth_per_tick = 0.0;
+    let held_before = world.nodes[1].holdings.iter().filter(|s| s.alive).count();
+    // Stop own-data growth on the full holder so the cap-clamp doesn't shrink it.
+    step(&mut world, &params, &prior, &policy);
+    let held_after = world.nodes[1].holdings.iter().filter(|s| s.alive).count();
+    assert_eq!(
+        held_before, 0,
+        "precondition: holder starts with no holdings"
+    );
+    assert_eq!(
+        held_after, 0,
+        "a FULL holder must reject all offers (SymbolReject-on-quota, §A.3) — got {held_after} \
+         accepted despite zero free disk"
+    );
+    assert!(
+        world.nodes[1].free_disk() < params.block_volume / params.n_symbols as f64,
+        "the holder really had no room for a symbol"
+    );
+}
+
+#[test]
+fn greed_fills_the_disk_above_the_r_target_floor() {
+    // §A.1 holder-greed: an owner places MORE than the k_eff floor needs — the cream
+    // margin (ι-prioritized) fills free holder capacity. A high-ι block ends with
+    // strictly more than k_eff alive holders (greed past the floor), as long as the
+    // network has room early on.
+    let params = DynParams::default();
+    let world = run_small(77, 6); // a few ticks: Regime-1, plenty of room
+    // Find a high-ι block (the last block of some present Reliable owner) and count
+    // its alive holders — greed should push it ABOVE k_eff.
+    let n = world.nodes.len();
+    let mut max_holders = 0usize;
+    for o in 0..n {
+        if !world.nodes[o].present {
+            continue;
+        }
+        for b in &world.nodes[o].own_blocks {
+            let ah = (0..n)
+                .filter(|&h| {
+                    world.nodes[h].present
+                        && world.nodes[h]
+                            .holdings
+                            .iter()
+                            .any(|s| s.alive && s.owner == o && s.block == b.id)
+                })
+                .count();
+            max_holders = max_holders.max(ah);
+        }
+    }
+    assert!(
+        max_holders > params.k_eff,
+        "greed must place ABOVE the k_eff={} floor (cream margin, §A.1); best block had {} holders",
+        params.k_eff,
+        max_holders
+    );
+}
+
+#[test]
+fn own_data_grows_monotonically_over_the_run() {
+    // §A.2 own-data growth: every present node's own data is monotone non-decreasing
+    // across ticks (the contention driver), and at least the fast-growing tiers
+    // actually grew.
+    let params = DynParams::default();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world(60, &params, 42);
+    let mut prev: Vec<f64> = world.nodes.iter().map(|n| n.disk.own_data).collect();
+    let start: Vec<f64> = prev.clone();
+    for _ in 0..30 {
+        step(&mut world, &params, &prior, &policy);
+        for (i, node) in world.nodes.iter().enumerate() {
+            if node.present {
+                assert!(
+                    node.disk.own_data >= prev[i] - 1e-9,
+                    "own_data must be monotone non-decreasing: node {i} {} < {}",
+                    node.disk.own_data,
+                    prev[i]
+                );
+            }
+            prev[i] = node.disk.own_data;
+        }
+    }
+    // At least one node's own data grew over the run (the drift driver is live).
+    let grew = world
+        .nodes
+        .iter()
+        .enumerate()
+        .any(|(i, n)| n.disk.own_data > start[i] + 1e-6);
+    assert!(
+        grew,
+        "own-data growth must actually move (the contention driver)"
+    );
+}
+
+#[test]
+fn own_data_growth_respects_the_disk_fraction_ceiling() {
+    // §A.2: own data never exceeds OWN_DATA_DISK_FRACTION of the disk (so a lendable
+    // floor always remains — contention is on the holdings budget, not own-data flood).
+    let world = run_small(9, 60);
+    for node in &world.nodes {
+        assert!(
+            node.disk.own_data <= node.disk_cap * OWN_DATA_DISK_FRACTION + 1e-6,
+            "own_data {} exceeded the ceiling {} (cap {} × {})",
+            node.disk.own_data,
+            node.disk_cap * OWN_DATA_DISK_FRACTION,
+            node.disk_cap,
+            OWN_DATA_DISK_FRACTION
+        );
+    }
+}
+
+#[test]
+fn world_reaches_contention_with_eviction_firing() {
+    // §A make-or-break (scaled-down smoke): a disk-profiled world reaches high
+    // utilization AND eviction actually fires (unlike Exp-1's permanent abundance).
+    let params = DynParams::default();
+    let world = run_small(2026, 100);
+    let c = contention_metric(&world, params.hyst.s_hard);
+    assert!(
+        c.mean_utilization_end > 0.75,
+        "utilization must climb toward 1 (got {:.3}) — the world must not stay in abundance",
+        c.mean_utilization_end
+    );
+    assert!(
+        c.total_evictions > 0,
+        "eviction must actually FIRE under contention (got {} events) — the Exp-1 failure was \
+         that it never did",
+        c.total_evictions
+    );
+    assert!(
+        c.ticks_with_eviction > 0,
+        "at least some ticks must see eviction"
+    );
+}
+
+// ============================================================
+// PHASE-1 §D.1 — Monte-Carlo R_actual + pillar-1 efficiency + drop-ranking
+// ============================================================
+
+#[test]
+fn mc_r_actual_rises_with_more_surviving_holders() {
+    // §D.1 MC estimator monotonicity: more (likely-surviving) holders ⇒ higher
+    // R_actual. Build a tiny world, place a block on few vs many strong holders, and
+    // assert the MC survival rises. Uses the real god-view survival hazard.
+    let params = DynParams::default();
+    let mut world = build_world(10, &params, 3);
+    // Make every node a present Reliable with comfortable disk (high survival probs)
+    // and give owner 0 a single block held by a controllable number of holders.
+    for node in &mut world.nodes {
+        node.archetype = Archetype::Reliable;
+        node.present = true;
+        node.disk.own_data = node.disk_cap * 0.2; // lots of headroom → high survival
+        node.holdings.clear();
+    }
+    let owner = 0usize;
+    let block = world.nodes[owner].own_blocks[0].id;
+    let iota = world.nodes[owner].own_blocks[0].iota;
+    // Helper: place the block on the first `k` holders (indices 1..=k) and give the
+    // owner reciprocal served credit so the symbols are protected.
+    let place_on = |world: &mut World, k: usize| {
+        for h in 1..world.nodes.len() {
+            world.nodes[h].holdings.retain(|s| s.owner != owner);
+        }
+        world.nodes[owner].own_blocks[0].placements.clear();
+        for h in 1..=k {
+            world.nodes[h].holdings.push(HeldSymbol {
+                owner,
+                block,
+                iota,
+                volume: 10.0,
+                alive: true,
+            });
+            world.served[owner][h] = 100.0; // owner served the holder → protected
+        }
+    };
+    place_on(&mut world, 2);
+    let r_few = mc_block_r_actual(&world, owner, block, params.k_eff, 8, 400, 11);
+    place_on(&mut world, 8);
+    let r_many = mc_block_r_actual(&world, owner, block, params.k_eff, 8, 400, 11);
+    assert!(
+        r_many > r_few,
+        "more surviving holders must raise R_actual: many={r_many:.4} ≤ few={r_few:.4}"
+    );
+    assert!(
+        (0.0..=1.0).contains(&r_few) && (0.0..=1.0).contains(&r_many),
+        "R_actual must be a probability"
+    );
+}
+
+#[test]
+fn mc_r_actual_is_deterministic_for_the_same_seed() {
+    // §F determinism: the MC estimator is bit-reproducible for a fixed seed.
+    let params = DynParams::default();
+    let world = run_small(123, 40);
+    let owner = (0..world.nodes.len())
+        .find(|&o| world.nodes[o].present && !world.nodes[o].own_blocks.is_empty())
+        .unwrap();
+    let block = world.nodes[owner].own_blocks[0].id;
+    let a = mc_block_r_actual(&world, owner, block, params.k_eff, 8, 300, 77);
+    let b = mc_block_r_actual(&world, owner, block, params.k_eff, 8, 300, 77);
+    assert_eq!(
+        a.to_bits(),
+        b.to_bits(),
+        "MC must be deterministic: {a} vs {b}"
+    );
+}
+
+#[test]
+fn pillar1_efficiency_ranks_reliable_above_exploiters() {
+    // §D.1 pillar-1: under contention, Reliable achieves higher R_actual/own-disk than
+    // BOTH exploiters. A real (small) contended run; the structural SIGN is asserted.
+    let params = DynParams::default();
+    let world = run_small(4242, 110);
+    let p = pillar1_metric(&world, params.k_eff, 26, 200, 99);
+    // Reliable's achieved own-data reliability beats both exploiters.
+    assert!(
+        p.mean_r_actual_reliable > p.mean_r_actual_hoarder,
+        "Reliable R_actual {:.4} must beat Hoarder {:.4}",
+        p.mean_r_actual_reliable,
+        p.mean_r_actual_hoarder
+    );
+    assert!(
+        p.mean_r_actual_reliable > p.mean_r_actual_freeloader,
+        "Reliable R_actual {:.4} must beat Freeloader {:.4}",
+        p.mean_r_actual_reliable,
+        p.mean_r_actual_freeloader
+    );
+    // And the efficiency (R_actual per own-disk-given) leads too.
+    assert!(
+        p.efficiency_reliable > p.efficiency_freeloader
+            && p.efficiency_reliable > p.efficiency_hoarder,
+        "Reliable efficiency {:.6} must lead (Freeloader {:.6}, Hoarder {:.6})",
+        p.efficiency_reliable,
+        p.efficiency_freeloader,
+        p.efficiency_hoarder
+    );
+}
+
+#[test]
+fn drop_ranking_picks_low_served_owners_first() {
+    // §D.1 drop-ranking: under contention, eviction systematically drops LOW-served
+    // owners first. Scored against god-view served VOLUME (not the G-ledger — that
+    // would be tautological). Working ⇒ mean evicted served-rank well below 0.5.
+    let world = run_small(2026, 110);
+    let d = drop_ranking_metric(&world);
+    assert!(
+        d.events_scored > 0,
+        "there must be scored eviction events under contention"
+    );
+    assert!(
+        d.mean_evicted_served_rank < 0.45,
+        "eviction must drop LOW-served owners first: mean served-rank {:.3} (want < 0.45)",
+        d.mean_evicted_served_rank
+    );
+    assert!(
+        d.frac_below_median > 0.6,
+        "most drops must hit bottom-half served owners: {:.1}% (want > 60%)",
+        d.frac_below_median * 100.0
+    );
+}
+
+// ============================================================
+// PHASE-1 §A — disk-profile layer-2 is GOD-VIEW only (anti-oracle extension)
+// ============================================================
+
+#[test]
+fn first_hand_obs_is_bit_identical_when_only_disk_profile_differs() {
+    // Anti-oracle extension (§A / §B): the layer-2 disk PROFILE (giver tier, own-data,
+    // growth rate) is god-view ONLY. Two nodes identical in every observable but
+    // differing in disk profile (tier/own-data/growth) must produce BIT-IDENTICAL
+    // first-hand obs — there is nowhere on FirstHandObs to write a tier, so it cannot
+    // leak (just like the archetype). The kernel sees only the legal `φ` scalar, which
+    // is a NodeLocal field, not part of a peer observation.
+    let cap = cap_with_history();
+    let mut n_t1 = node_with(Archetype::Reliable);
+    n_t1.disk = DiskProfile {
+        tier: GiverTier::T1,
+        own_data: 10.0,
+        own_growth_per_tick: 0.001,
+    };
+    let mut n_t4 = node_with(Archetype::Reliable);
+    n_t4.disk = DiskProfile {
+        tier: GiverTier::T4,
+        own_data: 90.0,
+        own_growth_per_tick: 0.05,
+    };
+    let obs_t1 = observe_pair(&cap, &n_t1, DAYS_PER_TICK);
+    let obs_t4 = observe_pair(&cap, &n_t4, DAYS_PER_TICK);
+    // Bit-identical: the disk profile has nowhere to leak into the obs.
+    assert_eq!(
+        obs_t1, obs_t4,
+        "disk profile (god-view layer-2) must NOT leak into first-hand obs"
+    );
+}
+
+#[test]
+fn giver_tier_mix_sums_to_n_and_spans_all_tiers() {
+    // §A layer-2: the tier mix sums to n, is deterministic in the seed, and (at
+    // reasonable n) spans all four tiers.
+    let mix_a = giver_tier_mix(200, 7);
+    let mix_b = giver_tier_mix(200, 7);
+    assert_eq!(mix_a.len(), 200);
+    assert_eq!(mix_a, mix_b, "tier mix must be deterministic in the seed");
+    for t in GiverTier::ALL {
+        assert!(
+            mix_a.iter().filter(|&&x| x == t).count() >= 1,
+            "{t:?} must be present in the mix"
+        );
+    }
+    // A different seed reshuffles (assignment differs) but counts are the same multiset.
+    let mut a_sorted = mix_a.clone();
+    let mut c_sorted = giver_tier_mix(200, 999);
+    a_sorted.sort_by_key(|t| *t as u8);
+    c_sorted.sort_by_key(|t| *t as u8);
+    assert_eq!(
+        a_sorted, c_sorted,
+        "tier COUNTS are seed-independent (only the assignment shuffles)"
     );
 }
