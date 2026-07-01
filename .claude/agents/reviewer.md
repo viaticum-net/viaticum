@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: Reviews implemented code for correctness, convention compliance, and protocol conformance.
-model: fable
+model: opus
 tools: Read, Bash, Grep, Glob
 ---
 
