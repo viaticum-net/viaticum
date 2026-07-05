@@ -396,6 +396,19 @@ pub struct OwnBlock {
     /// God-view: the holders currently storing a symbol of this block, as
     /// `(holder_node_idx, symbol_alive)`. Repair refills this toward `r_target`.
     pub placements: Vec<BlockPlacement>,
+    /// Repair-storm bookkeeping (§7): has this block EVER reached its `n_symbols`
+    /// floor? Distinguishes an INITIAL backup (never met floor → no detection latency,
+    /// the owner knows it must place) from a REPAIR (met floor, then a holder death
+    /// dropped it below → the owner learns of the loss only via the PoS cadence, so
+    /// under a latent-detection run the refill is delayed). God-view only.
+    pub floor_ever_met: bool,
+    /// Repair-storm bookkeeping (§7): the tick this block was first OBSERVED below its
+    /// `n_symbols` floor in the CURRENT deficit episode (`None` when at/above floor).
+    /// Under latent detection the owner does not act on the deficit until a seeded,
+    /// per-block cadence offset has elapsed since this tick — that phase spread is
+    /// exactly what smears a synchronous holder-death shock across time. Reset to
+    /// `None` the moment the floor is restored. Inert when detection is instant.
+    pub floor_deficit_since: Option<u64>,
 }
 
 /// One symbol of an owner's block placed on a holder (god-view bookkeeping).
@@ -531,6 +544,29 @@ pub struct World {
     /// A.12-2). The bootstrap-world value was ~0 ("starved, not frozen"); this counts
     /// whether the world-v2 physics lets preemption actually engage.
     pub preempt_count: usize,
+    /// Repair-storm instrumentation (§7): the LAST tick's repair activity, overwritten
+    /// by `engine::place_own_data` each tick. Lets a god-view diagnostic read the
+    /// per-tick repair concurrency / demand the engine actually acted on (detection-
+    /// gated), which the correlated-holder-death sweep compares against bandwidth.
+    /// Inert for the other experiments (they never read it).
+    pub repair_stat: RepairStat,
+}
+
+/// Per-tick repair activity the engine records during placement (repair-storm §7).
+/// Reset at the start of each tick's placement pass and filled as the FLOOR phase
+/// walks below-floor blocks. God-view instrumentation ONLY — never a kernel input.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RepairStat {
+    /// Distinct present owners that had ≥1 mature, below-floor, DETECTED block this
+    /// tick (i.e. actively repairing). The per-tick maximum of this over a run is the
+    /// "peak concurrent repairers" — the synchronisation the storm hypothesis is about.
+    pub owners_repairing: usize,
+    /// Total symbols owed to restore all detected below-floor mature blocks to their
+    /// `n_symbols` floor this tick (the detection-gated repair DEMAND, in symbols).
+    pub detected_deficit_symbols: usize,
+    /// Repair symbols actually PLACED this tick (a floor placement onto a block that
+    /// had already met its floor before — a genuine repair, not an initial backup).
+    pub symbols_repaired: usize,
 }
 
 /// One god-view eviction event (design §D.1 drop-ranking / §E observability).

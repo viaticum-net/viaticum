@@ -27,8 +27,8 @@ use viaticum_core::four_r::{
 
 use crate::generator::Rng;
 use crate::sim_dynamic::generator::{
-    BlockPlacement, DAYS_PER_TICK, EvictionEvent, HeldSymbol, Node, OwnBlock, PairCapital, World,
-    online,
+    BlockPlacement, DAYS_PER_TICK, EvictionEvent, HeldSymbol, Node, OwnBlock, PairCapital,
+    RepairStat, World, online,
 };
 use crate::sim_dynamic::observer::{self, ObsAddr};
 
@@ -117,6 +117,16 @@ pub struct DynParams {
     /// Measured separately from the world change (its contribution to the share-A>0
     /// trajectory).
     pub recalibrated_retention: bool,
+    /// Repair-storm §7 detection latency: the PoS-cadence window (ticks) over which an
+    /// owner notices that one of its ALREADY-BACKED-UP blocks has dropped below its
+    /// `n_symbols` floor. `0` ⇒ INSTANT detection (the owner refills the very next tick,
+    /// the previous behaviour — bit-identical, no RNG drawn). `> 0` ⇒ LATENT: each
+    /// (owner, block) deficit episode gets a SEEDED uniform offset in `[0, max]` ticks
+    /// before the owner acts, so a synchronous correlated-holder-death shock is
+    /// discovered at spread-out ticks (the crux of the "latency smears the shock"
+    /// hypothesis). Applies only to REPAIR (a block that met its floor then lost
+    /// holders), never to an initial backup (`floor_ever_met == false`).
+    pub repair_detection_delay_max: u64,
 }
 
 impl Default for DynParams {
@@ -152,6 +162,9 @@ impl Default for DynParams {
             cream_enabled: true,
             giver_priority_order: true,
             recalibrated_retention: false,
+            // Instant repair detection = the previous behaviour (owner refills next tick).
+            // The repair-storm §7 sweep raises this to model the PoS-cadence detection lag.
+            repair_detection_delay_max: 0,
         }
     }
 }
@@ -202,6 +215,13 @@ fn symbols_per_tick(u: f64, v_per_symbol: f64) -> usize {
     ((u / v_per_symbol).floor() as usize).max(1)
 }
 
+/// World-v2 §9.2 per-node upload budget (symbols/tick) for these params. The repair-
+/// storm §7 aggregate-bandwidth ceiling is this × the present-node count (`usize::MAX`
+/// for the unlimited one-shot world — the storm always runs the finite-`U` v2 regime).
+pub fn per_node_upload_budget(params: &DynParams) -> usize {
+    symbols_per_tick(params.bandwidth_u, v_per_symbol_of(params))
+}
+
 /// World-v2 §9.1: is the block at position `block_pos` of a node that joined at
 /// `joined_tick` eligible for placement at `tick`? (demand appears in portions).
 fn block_mature(joined_tick: u64, block_pos: usize, tick: u64, params: &DynParams) -> bool {
@@ -216,6 +236,50 @@ fn preempt_enabled(params: &DynParams) -> bool {
     params.preempt_theta.is_finite() && params.preempt_theta >= 0.0
 }
 
+/// Repair-storm §7 detection: has the owner NOTICED (via its PoS cadence) that a
+/// below-floor block needs repair, given the deficit was first observed at
+/// `deficit_since`? Detection fires at `deficit_since + offset`, where `offset` is a
+/// SEEDED uniform integer in `[0, delay_max]` per deficit episode — spreading the
+/// discovery of a synchronous correlated-holder-death shock across the cadence window
+/// (the "latency smears the shock" mechanism under test). `delay_max = 0` ⇒ instant.
+fn repair_detected(
+    seed: u64,
+    owner_id: u64,
+    block_id: usize,
+    deficit_since: u64,
+    tick: u64,
+    delay_max: u64,
+) -> bool {
+    tick >= deficit_since + detection_offset(seed, owner_id, block_id, deficit_since, delay_max)
+}
+
+/// The seeded detection offset (ticks) for one deficit episode: a uniform integer in
+/// `[0, max]`, stable within the episode (keyed on `deficit_since`). `max = 0` ⇒ 0.
+/// A dedicated salted stream so it never perturbs the placement / PoS / churn draws.
+fn detection_offset(
+    seed: u64,
+    owner_id: u64,
+    block_id: usize,
+    deficit_since: u64,
+    max: u64,
+) -> u64 {
+    if max == 0 {
+        return 0;
+    }
+    let r = Rng::derive(
+        seed ^ REPAIR_DETECT_SALT,
+        owner_id,
+        block_id as u64,
+        deficit_since,
+        0,
+    )
+    .unit();
+    ((r * (max as f64 + 1.0)).floor() as u64).min(max)
+}
+
+/// Salt for the repair-detection RNG stream (kept off the placement/PoS/churn streams).
+const REPAIR_DETECT_SALT: u64 = 0x5E17_D37E_C7ED_10AD;
+
 /// Run ONE tick of the dynamic loop (design §6 + §10 + world-v2 §9). Mutates in place.
 pub fn step(world: &mut World, params: &DynParams, prior: &SurfacePrior, policy: &PlacementPolicy) {
     assert_lambda_dt_stable(params.lambda, DAYS_PER_TICK);
@@ -229,6 +293,9 @@ pub fn step(world: &mut World, params: &DynParams, prior: &SurfacePrior, policy:
     // (1a) resync placements (drop dead) + (1b) bandwidth-limited place (floor + cream).
     resync_placements(world);
     let retention = retention_prior(params);
+    // Repair-storm §7: reset the per-tick repair instrument before the placement pass
+    // fills it (owners repairing, detected deficit, symbols repaired this tick).
+    world.repair_stat = RepairStat::default();
     place_own_data(world, params, prior, &retention);
 
     // (2) PoS-challenge sampling + capital update, A.1 decay on all pairs (§9.4).
@@ -324,23 +391,65 @@ fn place_own_data(
         });
 
         // FLOOR phase: fill each mature block to n_symbols, ι-priority, within budget.
+        // Repair-storm §7 detection gate: a block that ALREADY met its floor but has now
+        // dropped below it (a REPAIR after a holder death) is only refilled once the
+        // owner has NOTICED the loss — instantly (delay_max=0) or after a seeded per-block
+        // cadence offset (latent). An INITIAL backup (never met floor) has no latency.
+        let owner_id = world.nodes[owner].id;
+        let mut owner_repaired = false;
         for &bp in &border {
-            if budget == 0 {
-                break;
-            }
             if !block_mature(world.nodes[owner].joined_tick, bp, tick, params) {
                 continue;
             }
             let block_id = world.nodes[owner].own_blocks[bp].id;
-            let (mut floor, _) = alive_block_counts(world, owner, block_id);
-            while budget > 0 && floor < params.n_symbols {
+            let (floor, _) = alive_block_counts(world, owner, block_id);
+            if floor >= params.n_symbols {
+                // Floor met (or over): mark reached, clear any deficit episode.
+                let b = &mut world.nodes[owner].own_blocks[bp];
+                b.floor_ever_met = true;
+                b.floor_deficit_since = None;
+                continue;
+            }
+            // Below floor. Repair (met floor before) is detection-gated; a first backup
+            // (floor_ever_met == false) is always eligible (no PoS-detection latency).
+            let is_repair = world.nodes[owner].own_blocks[bp].floor_ever_met;
+            let detected = if is_repair && params.repair_detection_delay_max > 0 {
+                let since = *world.nodes[owner].own_blocks[bp]
+                    .floor_deficit_since
+                    .get_or_insert(tick);
+                repair_detected(
+                    world.seed,
+                    owner_id,
+                    block_id,
+                    since,
+                    tick,
+                    params.repair_detection_delay_max,
+                )
+            } else {
+                true
+            };
+            if is_repair && detected {
+                world.repair_stat.detected_deficit_symbols += params.n_symbols - floor;
+                owner_repaired = true;
+            }
+            if !detected || budget == 0 {
+                continue; // loss not yet noticed, or no upload budget left this tick
+            }
+            let mut cur = floor;
+            while budget > 0 && cur < params.n_symbols {
                 if try_place_one_symbol(world, owner, bp, false, params, prior, retention) {
                     budget -= 1;
-                    floor += 1;
+                    cur += 1;
+                    if is_repair {
+                        world.repair_stat.symbols_repaired += 1;
+                    }
                 } else {
                     break; // no admissible holder this tick for this block
                 }
             }
+        }
+        if owner_repaired {
+            world.repair_stat.owners_repairing += 1;
         }
 
         // CREAM phase: leftover bandwidth → over-the-floor redundancy (§9.3).
@@ -962,6 +1071,8 @@ pub fn fresh_block(world: &mut World, owner: usize, volume: f64, iota: f64) -> O
         volume,
         iota,
         placements: Vec::new(),
+        floor_ever_met: false,
+        floor_deficit_since: None,
     }
 }
 
@@ -1028,4 +1139,16 @@ pub fn block_mature_for_test(
 #[cfg(test)]
 pub fn alive_block_counts_for_test(world: &World, owner: usize, block_id: usize) -> (usize, usize) {
     alive_block_counts(world, owner, block_id)
+}
+
+#[cfg(test)]
+pub fn repair_detected_for_test(
+    seed: u64,
+    owner_id: u64,
+    block_id: usize,
+    deficit_since: u64,
+    tick: u64,
+    delay_max: u64,
+) -> bool {
+    repair_detected(seed, owner_id, block_id, deficit_since, tick, delay_max)
 }

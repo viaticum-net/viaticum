@@ -38,6 +38,7 @@ pub mod engine;
 pub mod evaluator;
 pub mod generator;
 pub mod observer;
+pub mod repair_storm;
 
 use viaticum_core::four_r::{EvictPhase, PlacementPolicy, SurfacePrior};
 
@@ -107,6 +108,8 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
                 // non-trivial on each holder.
                 iota: 0.2 + 0.6 * (b as f64) / (params.blocks_per_node.max(2) - 1) as f64,
                 placements: Vec::new(),
+                floor_ever_met: false,
+                floor_deficit_since: None,
             })
             .collect();
         // World-v2 §9.1 incremental arrival: in the ONE-SHOT world (`incremental =
@@ -152,6 +155,7 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
         first_earned_g: vec![None; n],
         first_own_accept: vec![None; n],
         preempt_count: 0,
+        repair_stat: crate::sim_dynamic::generator::RepairStat::default(),
     }
 }
 
@@ -364,6 +368,8 @@ fn run_newcomer_probe(
         volume: params.block_volume,
         iota: 0.9,
         placements: Vec::new(),
+        floor_ever_met: false,
+        floor_deficit_since: None,
     }];
     // A T1-loose newcomer (plenty of free disk to lend) so the bootstrap probe is
     // about TRUST accrual, not the newcomer's own disk being full.

@@ -23,7 +23,12 @@ use crate::sim_dynamic::generator::{
     PairCapital, World, giver_tier_mix, online, population_mix,
 };
 use crate::sim_dynamic::observer::{self, observe_pair};
+use crate::sim_dynamic::repair_storm::{
+    RepairStormConfig, holder_popularity, inject_shock, run_repair_storm, select_top_holders,
+};
 use crate::sim_dynamic::{Experiment1Config, build_world, run_experiment_1};
+
+use crate::sim_dynamic::engine::{per_node_upload_budget, repair_detected_for_test};
 
 // ============================================================
 // Helpers
@@ -1690,4 +1695,212 @@ fn cream_symbols_are_excluded_from_the_floor_and_do_not_trigger_floor_repair() {
         floor1, params.n_symbols,
         "the floor demand (n_symbols − floor) stays 0 ⇒ cream death triggers no floor repair"
     );
+}
+
+// ============================================================
+// §7 — repair-storm (correlated holder death) diagnostic
+// ============================================================
+
+/// Give `holder` exactly `count` alive foreign holdings (distinct owners) so its
+/// god-view popularity is deterministic and known for the selection tests.
+fn give_holdings(world: &mut World, holder: usize, count: usize) {
+    let n = world.nodes.len();
+    for j in 0..count {
+        let mut owner = (holder + 1 + j) % n;
+        if owner == holder {
+            owner = (owner + 1) % n;
+        }
+        world.nodes[holder].holdings.push(HeldSymbol {
+            owner,
+            block: j,
+            iota: 0.5,
+            volume: 1.0,
+            alive: true,
+            cream: false,
+        });
+    }
+}
+
+/// A modest, fast repair-storm config for the behaviour tests (n=120, warm-up 60).
+fn storm_config(seed: u64, delay: u64, k: f64) -> RepairStormConfig {
+    RepairStormConfig {
+        base_params: DynParams {
+            block_volume: 20.0,
+            ..DynParams::default()
+        },
+        n_nodes: 120,
+        seed,
+        warmup_ticks: 60,
+        post_ticks: 30,
+        k_percent: k,
+        detection_delay_max: delay,
+    }
+}
+
+#[test]
+fn holder_popularity_counts_alive_foreign_symbols() {
+    let params = DynParams::default();
+    let mut world = build_world(8, &params, 0xABC);
+    give_holdings(&mut world, 2, 5);
+    // Killing one leaves four alive; a bare node has zero.
+    world.nodes[2].holdings[0].alive = false;
+    assert_eq!(holder_popularity(&world, 2), 4);
+    assert_eq!(holder_popularity(&world, 3), 0);
+}
+
+#[test]
+fn shock_selects_exactly_top_k_holders_by_popularity_deterministically() {
+    // Non-incremental so every node is present at t=0 (the selection is over present nodes).
+    let params = DynParams {
+        incremental: false,
+        ..DynParams::default()
+    };
+    let mut world = build_world(20, &params, 0xDEED);
+    // A known popularity ladder over an otherwise-empty world.
+    give_holdings(&mut world, 3, 10); // most popular
+    give_holdings(&mut world, 7, 8);
+    give_holdings(&mut world, 2, 6); // ties with node 5 → lower index wins
+    give_holdings(&mut world, 5, 6);
+    give_holdings(&mut world, 1, 4);
+    // top-10% of 20 present = ceil(2) = the two most popular: 3 then 7.
+    assert_eq!(select_top_holders(&world, 10.0), vec![3, 7]);
+    // top-25% = ceil(5): the 6-6 tie between 2 and 5 breaks by ascending index.
+    let top5 = select_top_holders(&world, 25.0);
+    assert_eq!(top5, vec![3, 7, 2, 5, 1]);
+    // Deterministic re-selection, and K=0 (control) selects nothing.
+    assert_eq!(select_top_holders(&world, 25.0), top5);
+    assert!(select_top_holders(&world, 0.0).is_empty());
+}
+
+#[test]
+fn inject_shock_marks_victims_absent_and_kills_their_holdings() {
+    let params = DynParams {
+        incremental: false,
+        ..DynParams::default()
+    };
+    let mut world = build_world(10, &params, 0x5);
+    give_holdings(&mut world, 1, 3);
+    give_holdings(&mut world, 4, 2);
+    let killed = inject_shock(&mut world, &[1, 4]);
+    assert_eq!(killed, 5, "3 + 2 alive symbols must be destroyed");
+    assert!(!world.nodes[1].present && !world.nodes[4].present);
+    assert!(world.nodes[1].holdings.iter().all(|s| !s.alive));
+    assert!(world.nodes[4].holdings.iter().all(|s| !s.alive));
+    assert!(world.nodes[2].present, "a non-victim must be untouched");
+}
+
+#[test]
+fn repair_detected_is_instant_when_delay_zero() {
+    // delay_max = 0 ⇒ offset 0 ⇒ detected as soon as the tick reaches the deficit tick.
+    assert!(repair_detected_for_test(0xF00D, 3, 1, 40, 40, 0));
+    assert!(repair_detected_for_test(0xF00D, 3, 1, 40, 45, 0));
+    // Never before the deficit was even observed.
+    assert!(!repair_detected_for_test(0xF00D, 3, 1, 41, 40, 0));
+}
+
+#[test]
+fn repair_detected_staggers_across_the_cadence_window_when_latent() {
+    // With delay_max = 3 the per-(owner,block) first-detection offset must span [0,3]
+    // across many blocks (the smearing) and never exceed it.
+    let delay = 3u64;
+    let since = 100u64;
+    let mut offsets = std::collections::BTreeSet::new();
+    for block_id in 0..200usize {
+        let mut first = None;
+        for d in 0..=(delay + 2) {
+            if repair_detected_for_test(0x1234, 9, block_id, since, since + d, delay) {
+                first = Some(d);
+                break;
+            }
+        }
+        let off = first.expect("must detect within the window");
+        assert!(off <= delay, "offset {off} must be within [0,{delay}]");
+        offsets.insert(off);
+    }
+    assert!(
+        offsets.len() >= 3,
+        "detection offsets should span the cadence window, got {offsets:?}"
+    );
+    // Deterministic per (owner, block, episode).
+    assert_eq!(
+        repair_detected_for_test(0x1234, 9, 5, since, since + 1, delay),
+        repair_detected_for_test(0x1234, 9, 5, since, since + 1, delay)
+    );
+}
+
+#[test]
+fn latent_detection_lowers_peak_repair_concurrency_after_a_shock() {
+    let seed = 14_769_901;
+    let inst = run_repair_storm(&storm_config(seed, 0, 10.0));
+    let lat = run_repair_storm(&storm_config(seed, 3, 10.0));
+    // The same seed kills the same holders in both modes.
+    assert_eq!(inst.victims_killed, lat.victims_killed);
+    assert!(inst.victims_killed > 0);
+    // Latency staggers the repairs ⇒ a strictly lower synchronous peak (the hypothesis).
+    assert!(
+        lat.peak_owners_repairing < inst.peak_owners_repairing,
+        "latent peak {} should be below instant peak {}",
+        lat.peak_owners_repairing,
+        inst.peak_owners_repairing
+    );
+}
+
+#[test]
+fn repair_storm_demand_never_exceeds_aggregate_bandwidth() {
+    // At realistic upload speeds even the synchronous instant spike stays under the
+    // aggregate bandwidth ceiling — no bandwidth cascade.
+    let r = run_repair_storm(&storm_config(14_769_901, 0, 10.0));
+    assert_eq!(
+        r.demand_exceeds_bandwidth_ticks, 0,
+        "no tick's detected repair demand should exceed aggregate bandwidth"
+    );
+    assert!(
+        r.max_demand_bandwidth_ratio < 1.0,
+        "peak demand/bandwidth ratio {} should stay below 1",
+        r.max_demand_bandwidth_ratio
+    );
+}
+
+#[test]
+fn repair_storm_report_is_deterministic_for_the_same_config() {
+    let cfg = storm_config(777, 3, 5.0);
+    let a = run_repair_storm(&cfg);
+    let b = run_repair_storm(&cfg);
+    assert_eq!(a.victims_killed, b.victims_killed);
+    assert_eq!(a.victim_symbols_killed, b.victim_symbols_killed);
+    assert_eq!(a.peak_owners_repairing, b.peak_owners_repairing);
+    assert_eq!(a.peak_under_k, b.peak_under_k);
+    assert_eq!(a.blocks_orphaned_lost, b.blocks_orphaned_lost);
+    assert_eq!(a.blocks_victim_owned_lost, b.blocks_victim_owned_lost);
+    assert_eq!(a.trajectory.len(), b.trajectory.len());
+    for (x, y) in a.trajectory.iter().zip(b.trajectory.iter()) {
+        assert_eq!(x.under_k_blocks, y.under_k_blocks);
+        assert_eq!(x.owners_repairing, y.owners_repairing);
+        assert_eq!(x.detected_demand_symbols, y.detected_demand_symbols);
+        assert_eq!(x.outstanding_demand_symbols, y.outstanding_demand_symbols);
+    }
+}
+
+#[test]
+fn default_params_use_instant_repair_detection() {
+    // The bit-identity contract: the shared engine defaults to instant detection, so the
+    // other experiments are unchanged (no RNG drawn on the repair-detection stream).
+    assert_eq!(DynParams::default().repair_detection_delay_max, 0);
+}
+
+#[test]
+fn per_node_upload_budget_is_floor_u_over_v_symbol() {
+    // block_volume 20, n_symbols 5 ⇒ v_per_symbol 4; U=20 ⇒ ⌊20/4⌋ = 5.
+    let p = DynParams {
+        block_volume: 20.0,
+        bandwidth_u: 20.0,
+        ..DynParams::default()
+    };
+    assert_eq!(per_node_upload_budget(&p), 5);
+    // Infinite U (the one-shot world) ⇒ unbounded.
+    let inf = DynParams {
+        bandwidth_u: f64::INFINITY,
+        ..DynParams::default()
+    };
+    assert_eq!(per_node_upload_budget(&inf), usize::MAX);
 }
