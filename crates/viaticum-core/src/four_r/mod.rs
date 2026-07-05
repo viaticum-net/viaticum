@@ -596,9 +596,10 @@ pub enum PlacementResult {
     Placed {
         /// Indices (into the candidate slice) of chosen holders.
         holders: Vec<usize>,
-        /// Estimated block survival `R̂(T)` of the chosen set — the independent
-        /// Poisson-binomial over the per-bucket survival probs (independence earned
-        /// by the §7 address-spread); NOT the evaluator's true `R(T)`.
+        /// Estimated block survival `R̂_wc(T)` of the chosen set — the A.9
+        /// worst-case bound ([`estimate_block_survival`]). `place` spreads ≤1 symbol
+        /// per bucket, so this reduces to the independent Poisson-binomial over the
+        /// per-bucket probs (the degenerate case); NOT the evaluator's true `R(T)`.
         r_hat_block: f64,
     },
     /// `r_target` is unreachable under the §7 spread with the given candidates.
@@ -616,8 +617,12 @@ pub enum PlacementResult {
 /// Which OBSERVABLE address bucket holders are SPREAD across (≤1 symbol per
 /// bucket) — the §7 spread rule. A bucket is the unit that, worst-case, fails
 /// together; spreading one symbol per bucket *earns* the independence the block
-/// survival estimate then assumes (holders in distinct buckets are treated
-/// independent), so no correlation-penalty is needed.
+/// survival estimate assumes BETWEEN buckets. The estimate itself does NOT rely on
+/// the spread having happened: [`group_min_survival`] takes the worst-case
+/// `min(comonotone-within-bucket, independent)` for any number of symbols per
+/// bucket (A.9), so multiple symbols in one bucket get NO free independence. Hidden
+/// BETWEEN-bucket correlation is not on the formula — it is carried by the ι-margin
+/// (§6 cream) and repair, not by a per-symbol penalty.
 ///
 /// Both variants key on FIRST-HAND observables only (§1): `master_id` is a
 /// crypto-id, `addr_subnet` is a connection fact. NEITHER variant ever sees the
@@ -874,39 +879,41 @@ pub fn cluster_count(holders: &[FirstHandObs], policy: &PlacementPolicy) -> usiz
     seen.len()
 }
 
-/// Node-side estimate of a block's survival `R̂(T)`: the probability that at least
-/// `k_eff` of the chosen holders keep their symbol intact to `tau`, computed as a
-/// simple INDEPENDENT Poisson-binomial over the per-holder survival probs — the §7
-/// spread-by-address design.
+/// Node-side estimate of a block's survival `R̂_wc(T)`: the CORRELATION-AWARE
+/// worst-case probability that at least `k_eff` of the chosen holders keep their
+/// symbol intact to `tau` (A.9 / decision_model §5, canon §5½ B1).
 ///
 /// Construction:
-/// 1. **Spread by observable address (≤1 symbol per bucket).** Holders are bucketed
-///    by their first-hand `addr_subnet` (the §7 default) or `master_id` (per
-///    [`PlacementPolicy::cap_mode`]); per bucket, ONLY the BEST (highest `r_hat`)
-///    holder contributes a position. A farm minting N master-ids on one subnet is
-///    ONE subnet bucket → ONE position, no matter how many keys it mints. The
-///    address-spread is what *earns* the independence the next step assumes:
-///    distinct subnets are distinct operators / failure domains, treated
-///    independent — so no correlation-penalty is needed.
-/// 2. **Independent Poisson-binomial.** The surviving per-bucket probs `p_i` are
-///    fed straight to [`poisson_binomial_at_least`] for `P(≥ k_eff survive)`. The
-///    `p_i` are heterogeneous (each holder's own `estimate_surface(...).r_hat`,
-///    the conservative off-sample-inflated lower bound from Phase 2a).
+/// 1. **Per-symbol surface prob for ALL holders.** Every holder in `placement`
+///    contributes ONE position, labelled by its first-hand correlate group
+///    ([`bucket_key`]: `addr_subnet` by the §7 default, or `master_id`). Its
+///    survival prob is `estimate_surface(...).r_hat` — the conservative
+///    off-sample-inflated lower bound from Phase 2a. The estimator does NOT collapse
+///    same-group holders to one best position (that is the job of [`place`], not of
+///    the estimate); it honestly carries every symbol in the group.
+/// 2. **A.9 worst-case convolution** ([`group_min_survival`]):
+///    `R̂_wc = min(comonotone-within-groups, independent-over-all-symbols)`. Symbols
+///    sharing an observable correlate are treated as worst-case positively coupled
+///    (comonotone) INSIDE the group and independent BETWEEN groups (the independence
+///    the §7 spread earns on the observable correlate); the `min` with the plain
+///    Poisson-binomial keeps the bound conservative even where thin within-group
+///    redundancy makes comonotone non-worst-case (audit B-2).
 ///
-/// **Why no cluster-collapse penalty / geo-radius / n−k_eff cap (§7, §9½).** The
-/// old estimator collapsed addr-correlated holders into a risk-cluster taking the
-/// WORST member, plus a geo-radius union-find and an `n−k_eff` concentration cap.
-/// All three are removed: the penalty was only conservative against *observable*
-/// correlation — which the address-spread already neutralizes (≤1 symbol per
-/// observable bucket) — and the geo machinery required a non-calibratable
-/// "geo-radius" magic number we do not have (`sim_plan.md §5.1`). Spreading by the
-/// observable `addr_subnet` is the §7 design; the independence is earned, not
-/// assumed.
+/// **Why worst-case, not the point independent Poisson-binomial (§7, §9½).** The
+/// bare independent estimate errs to the DANGEROUS side (over-estimating `R̂` ⇒
+/// under-placement) under unobserved within-correlate coupling. The old estimator
+/// also carried a geo-radius union-find and an `n−k_eff` concentration cap; both are
+/// gone — the geo machinery needed a non-calibratable "geo-radius" magic number we
+/// do not have (`sim_plan.md §5.1`), and the observable-correlate risk is now
+/// handled honestly by the comonotone-within construction. Hidden BETWEEN-group
+/// correlation is not on the formula — it is carried by the ι-margin (§6 cream) and
+/// repair.
 ///
-/// If the number of distinct buckets is `< k_eff`, even all buckets surviving
-/// cannot reach the threshold → `R̂ = 0` (the block is structurally undeliverable —
-/// e.g. every holder is one subnet farm). NOT the evaluator's true `R(T)` (that is
-/// god-view, from the hidden hazards; this is the node's decision input).
+/// In the ≤1-symbol-per-group regime (what [`place`] produces) `R̂_wc` is
+/// bit-identical to the pre-A.9 independent Poisson-binomial (the degenerate
+/// identity in [`group_min_survival`]). If fewer than `k_eff` symbols exist in
+/// total, `R̂_wc = 0` (structurally undeliverable). NOT the evaluator's true `R(T)`
+/// (that is god-view, from the hidden hazards; this is the node's decision input).
 ///
 /// Anti-oracle: inputs are first-hand `placement` observations + the offline
 /// `prior` + the `req`/`policy`. No hidden hazard or farm-truth is reachable — the
@@ -925,32 +932,20 @@ pub fn estimate_block_survival(
     let v_per_symbol = req.volume_per_symbol();
     let tau = req.tau.max(0.0);
 
-    // 1. Spread by observable address bucket: keep at most ONE position per bucket,
-    //    the BEST-surface holder in it. A same-subnet farm of N master-ids collapses
-    //    to one subnet bucket → one position. (Best, not worst: under the spread we
-    //    place a single symbol per bucket and we would place it on the strongest
-    //    holder there; the independence across buckets is earned by the spread.)
-    let mut bucket_probs: Vec<(BucketKey, f64)> = Vec::new();
-    for obs in placement {
-        let p = estimate_surface(obs, prior, v_per_symbol, tau)
-            .r_hat
-            .clamp(0.0, 1.0);
-        let key = bucket_key(obs, policy);
-        match bucket_probs.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, best)) => *best = best.max(p),
-            None => bucket_probs.push((key, p)),
-        }
-    }
+    // One position per holder, labelled by its observable correlate group. NO
+    // best-per-bucket collapse — the A.9 convolution handles any number of symbols
+    // per group; the ≤1/group spread is enforced by `place`, not here.
+    let positions: Vec<(BucketKey, f64)> = placement
+        .iter()
+        .map(|obs| {
+            let p = estimate_surface(obs, prior, v_per_symbol, tau)
+                .r_hat
+                .clamp(0.0, 1.0);
+            (bucket_key(obs, policy), p)
+        })
+        .collect();
 
-    // If fewer distinct buckets than k_eff, the threshold is unreachable even if
-    // every bucket survives — R̂ is 0 (structurally undeliverable).
-    if bucket_probs.len() < req.k_eff {
-        return 0.0;
-    }
-
-    // 2. Independent Poisson-binomial over the per-bucket survival probs `p_i`.
-    let probs: Vec<f64> = bucket_probs.iter().map(|(_, p)| *p).collect();
-    poisson_binomial_at_least(&probs, req.k_eff)
+    group_min_survival(&positions, req.k_eff)
 }
 
 /// `P(≥ k successes)` for independent Bernoulli trials with the given success
@@ -979,6 +974,144 @@ fn poisson_binomial_at_least(probs: &[f64], k: usize) -> f64 {
         filled = upper;
     }
     dp[k..=m].iter().sum::<f64>().clamp(0.0, 1.0)
+}
+
+/// Construction A of the A.9 worst-case bound: **comonotone WITHIN each observable
+/// correlate group, independent BETWEEN groups** (decision_model §5 / A.9).
+///
+/// Symbols of the block are partitioned by their [`BucketKey`] (subnet / master,
+/// per the spread policy). Within one group `c` a SINGLE shared uniform `U_c`
+/// drives every symbol — the perfectly-positively-correlated (comonotone) coupling
+/// that models "these symbols share an observable risk correlate, so worst-case
+/// they fail together". A symbol with survival prob `p_i` survives iff `U_c ≤ p_i`,
+/// so with the group's probs sorted DESCENDING `p₍₁₎ ≥ … ≥ p₍g₎` the number of
+/// survivors `N_c = #{i : U_c ≤ p_i}` has the CLOSED-FORM law (no sampling —
+/// analytic, hence bit-deterministic):
+///
+/// ```text
+/// P(N_c = 0) = 1 − p₍₁₎
+/// P(N_c = j) = p₍ⱼ₎ − p₍ⱼ₊₁₎     (1 ≤ j < g)
+/// P(N_c = g) = p₍g₎
+/// ```
+///
+/// (convention `p₍₀₎ = 1`, `p₍g₊₁₎ = 0`; the terms telescope to 1 and are all
+/// non-negative because the sorted probs are non-increasing). The survivors are
+/// NESTED: whenever the weaker symbol survives so does every stronger one, so a
+/// single-symbol group is exactly a `Bernoulli(p)` and the whole construction
+/// degenerates to the independent Poisson-binomial (the load-bearing degenerate
+/// identity below).
+///
+/// Between groups the coupling is INDEPENDENCE (exactly the independence the §7
+/// spread EARNS on the observable correlate), so the total survivor count
+/// `N = Σ_c N_c` is the convolution of the per-group laws. We DP-convolve the group
+/// laws in INSERTION order (deterministic — no `HashMap`) and return
+/// `R̂_A = P(N ≥ k_eff)`.
+///
+/// Determinism: grouping preserves insertion order via a linear `Vec` scan, the
+/// per-group sort is `total_cmp`, and `U_c` is handled analytically (never sampled)
+/// — two runs are byte-identical.
+fn comonotone_within_groups_at_least(positions: &[(BucketKey, f64)], k_eff: usize) -> f64 {
+    if k_eff == 0 {
+        return 1.0;
+    }
+    // Partition into insertion-ordered groups (no HashMap — deterministic order).
+    let mut groups: Vec<(BucketKey, Vec<f64>)> = Vec::new();
+    for &(key, p) in positions {
+        let p = p.clamp(0.0, 1.0);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, ps)) => ps.push(p),
+            None => groups.push((key, vec![p])),
+        }
+    }
+
+    // DP over the total survivor count N = Σ_c N_c. `dp[n] = P(total survivors = n)`.
+    let mut dp = vec![1.0f64]; // N = 0 with probability 1 before any group.
+    for (_, ps) in &groups {
+        // Per-group comonotone law over {0..g}, from the DESCENDING-sorted probs.
+        let mut q = ps.clone();
+        q.sort_by(|a, b| b.total_cmp(a));
+        let g = q.len();
+        let mut group_law = vec![0.0f64; g + 1];
+        group_law[0] = 1.0 - q[0]; // P(N_c = 0) = 1 − p₍₁₎
+        for j in 1..g {
+            group_law[j] = q[j - 1] - q[j]; // P(N_c = j) = p₍ⱼ₎ − p₍ⱼ₊₁₎
+        }
+        group_law[g] = q[g - 1]; // P(N_c = g) = p₍g₎
+
+        // Convolve dp with this group's law (groups independent).
+        let mut next = vec![0.0f64; dp.len() + g];
+        for (n, &pn) in dp.iter().enumerate() {
+            if pn == 0.0 {
+                continue;
+            }
+            for (j, &pj) in group_law.iter().enumerate() {
+                next[n + j] += pn * pj;
+            }
+        }
+        dp = next;
+    }
+
+    dp.iter().skip(k_eff).sum::<f64>().clamp(0.0, 1.0)
+}
+
+/// The A.9 correlation-aware worst-case block survival `R̂_wc` (decision_model §5,
+/// canon §5½ B1). Replaces the naïve independent Poisson-binomial (a POINT estimate
+/// that errs to the DANGEROUS side — over-estimating `R̂` ⇒ under-placement) with a
+/// conservative lower bound under the unobserved within-correlate coupling.
+///
+/// `R̂_wc = min(R̂_A, R̂_B)` of two GLOBAL constructions (both: independence BETWEEN
+/// groups):
+///
+/// * **A — comonotone within groups** ([`comonotone_within_groups_at_least`]):
+///   worst-case positive dependence inside each observable correlate.
+/// * **B — independent within and between**: the plain Poisson-binomial over ALL
+///   symbols ([`poisson_binomial_at_least`]), grouping irrelevant.
+///
+/// **Why `min`, not "comonotone is always worst-case" (audit B-2).** Comonotone is
+/// worst-case only when `k_eff` is LOW relative to a group's size (our spread
+/// regime, ≤1 symbol/group); for THIN within-group redundancy (`k_eff` near the
+/// group size) it FLIPS and independence is the more conservative of the two — e.g.
+/// 3 symbols `p=0.9` in one group, `k_eff=3`: comonotone `P = 0.9` > independent
+/// `0.9³ = 0.729`. So "`R̂_wc ≤ independent` always" would be FALSE for pure
+/// comonotone; taking the per-construction `min` restores conservatism cheaply.
+/// This is NOT the true Fréchet lower bound (which is harder and NOT needed —
+/// placement spreads ≤1 symbol/group so multi-per-group is off the operating path);
+/// the hidden BETWEEN-group correlation the formula cannot see is carried by the
+/// ι-margin (§6 cream) and repair, not by this bound.
+///
+/// **Degenerate case (≤1 symbol per group) — load-bearing.** A single-symbol group
+/// is its own comonotone coupling, so construction A is analytically IDENTICAL to B
+/// (and bit-identical too: both walk the same symbols in the same order through the
+/// same `stay·(1−p) + gain·p` recurrence, and IEEE-754 addition is commutative), so
+/// `R̂_wc` reduces to exactly the pre-A.9 independent Poisson-binomial. This is what
+/// keeps [`place`] — which spreads ≤1 symbol/bucket — and the whole sim UNCHANGED.
+///
+/// **Structural zero.** `R̂_wc = 0` exactly when fewer than `k_eff` symbols exist in
+/// total (`positions.len() < k_eff`): even all-survive cannot reach the threshold,
+/// so both constructions vanish (max `Σ N_c` = the symbol count). NOTE this is
+/// SYMBOL count, not DISTINCT-GROUP count: A.9 no longer collapses a group to one
+/// position, so `g` symbols in one correlate CAN deliver up to `g` survivors
+/// together (comonotone) — the old "distinct buckets < k_eff ⇒ 0" gate was the
+/// collapse-model artefact this transche removes. In the ≤1/group regime the two
+/// conditions coincide, so `place`/sim see no change.
+fn group_min_survival(positions: &[(BucketKey, f64)], k_eff: usize) -> f64 {
+    if k_eff == 0 {
+        return 1.0;
+    }
+    // Structural zero: fewer symbols than k_eff ⇒ the threshold is unreachable even
+    // if every symbol survives (max Σ N_c = the symbol count).
+    if positions.len() < k_eff {
+        return 0.0;
+    }
+
+    // Construction B: independent over ALL symbols (grouping irrelevant).
+    let all_probs: Vec<f64> = positions.iter().map(|(_, p)| *p).collect();
+    let r_b = poisson_binomial_at_least(&all_probs, k_eff);
+
+    // Construction A: comonotone within groups, independent between.
+    let r_a = comonotone_within_groups_at_least(positions, k_eff);
+
+    r_a.min(r_b)
 }
 
 // ============================================================
@@ -1249,21 +1382,22 @@ impl HolderPlacement {
 /// genuinely heterogeneous per-symbol Poisson-binomial.
 ///
 /// Construction (composes K1/K2):
-/// 1. **§7 address-spread (K2).** Holders are bucketed by their first-hand
-///    `addr_subnet` (default) or `master_id` ([`PlacementPolicy::cap_mode`]); per
-///    bucket only the BEST per-symbol `p` contributes a position (≤1 symbol per
-///    observable address bucket → the independence the Poisson-binomial assumes is
-///    earned by the spread). A same-subnet farm of N master-ids is ONE bucket.
-/// 2. **Per-symbol keep-probability (K3).** For each placement, `p = surface · s`,
+/// 1. **Per-symbol keep-probability (K3).** For each placement, `p = surface · s`,
 ///    with `surface = estimate_surface(obs, prior, v_per_symbol, τ).r_hat` (Route
 ///    A, conservative off-sample lower bound) and
 ///    `s = eviction_retention(iota_rank, retained_depth(obs), retention)` (Route
-///    B, the eviction ladder). Both routes are first-hand.
-/// 3. **Heterogeneous Poisson-binomial.** The per-bucket best `p_i` are fed to
-///    [`poisson_binomial_at_least`] for `P(≥ k_eff survive)`.
+///    B, the eviction ladder). Both routes are first-hand. Every placement
+///    contributes ONE position, labelled by its observable correlate group
+///    ([`bucket_key`]); the estimator does NOT collapse same-group symbols to one
+///    best position (that is [`place`]'s job).
+/// 2. **A.9 worst-case convolution** ([`group_min_survival`]):
+///    `R̂_wc = min(comonotone-within-groups, independent-over-all-symbols)`,
+///    correlated inside an observable group and independent between (the same B1
+///    worst-case bound the K2 aggregate uses).
 ///
-/// If the number of distinct buckets is `< k_eff`, even all buckets surviving
-/// cannot reach the threshold → `R̂ = 0` (structurally undeliverable).
+/// In the ≤1-symbol-per-group regime (what [`place`] produces) `R̂_wc` is
+/// bit-identical to the pre-A.9 heterogeneous Poisson-binomial. If fewer than
+/// `k_eff` symbols exist in total, `R̂ = 0` (structurally undeliverable).
 ///
 /// Anti-oracle: every input is first-hand `placement` observations + the offline
 /// `prior`/`retention` + the owner-private `req`/`policy`. No hidden hazard,
@@ -1289,33 +1423,26 @@ pub fn estimate_block_survival_per_symbol(
     let v_per_symbol = req.volume_per_symbol();
     let tau = req.tau.max(0.0);
 
-    // §7 spread: keep at most ONE position per observable address bucket, the one
-    // with the BEST per-symbol keep-prob in it.
-    let mut bucket_probs: Vec<(BucketKey, f64)> = Vec::new();
-    for hp in placement {
-        // Route A: holder reliability surface (importance-independent).
-        let surface = estimate_surface(&hp.obs, prior, v_per_symbol, tau)
-            .r_hat
-            .clamp(0.0, 1.0);
-        // Route B: eviction-retention at this symbol's ι-rank within my ladder.
-        let phi_o = retained_depth(&hp.obs, retention);
-        let s = eviction_retention(hp.iota_rank(), phi_o, retention);
-        // Independent death routes multiply.
-        let p = (surface * s).clamp(0.0, 1.0);
+    // One position per placement, labelled by its observable correlate group. NO
+    // best-per-bucket collapse — the A.9 convolution handles any number of symbols
+    // per group; the ≤1/group spread is enforced by `place`, not here.
+    let positions: Vec<(BucketKey, f64)> = placement
+        .iter()
+        .map(|hp| {
+            // Route A: holder reliability surface (importance-independent).
+            let surface = estimate_surface(&hp.obs, prior, v_per_symbol, tau)
+                .r_hat
+                .clamp(0.0, 1.0);
+            // Route B: eviction-retention at this symbol's ι-rank within my ladder.
+            let phi_o = retained_depth(&hp.obs, retention);
+            let s = eviction_retention(hp.iota_rank(), phi_o, retention);
+            // Independent death routes multiply.
+            let p = (surface * s).clamp(0.0, 1.0);
+            (bucket_key(&hp.obs, policy), p)
+        })
+        .collect();
 
-        let key = bucket_key(&hp.obs, policy);
-        match bucket_probs.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, best)) => *best = best.max(p),
-            None => bucket_probs.push((key, p)),
-        }
-    }
-
-    if bucket_probs.len() < req.k_eff {
-        return 0.0;
-    }
-
-    let probs: Vec<f64> = bucket_probs.iter().map(|(_, p)| *p).collect();
-    poisson_binomial_at_least(&probs, req.k_eff)
+    group_min_survival(&positions, req.k_eff)
 }
 
 /// Place a block: greedily select holders (best conservative surface first) until

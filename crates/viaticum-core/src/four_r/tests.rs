@@ -707,7 +707,15 @@ fn block_survival_rises_when_independent_holders_are_added() {
 }
 
 #[test]
-fn block_survival_does_not_rise_when_added_holders_share_a_correlate() {
+fn block_survival_wc_discounts_same_correlate_additions_vs_independent() {
+    // A.9 (Р-4): the estimator no longer COLLAPSES same-subnet holders to one best
+    // position — it carries every symbol and treats a shared correlate as WORST-CASE
+    // coupled (comonotone) inside the group, independent between. So adding
+    // same-subnet holders is worth STRICTLY LESS than adding independent ones (the §7
+    // discrimination survives), though — unlike the old hard collapse — it is not
+    // exactly zero: a comonotone group that crosses k_eff can meet the threshold
+    // together, a small honest benefit. The hard §7 spread (≤1 symbol/bucket) is
+    // enforced by `place`, not by this estimate.
     let prior = SurfacePrior::default();
     let policy = PlacementPolicy::default(); // spread by addr_subnet
     let r = req(6, 2, 0.99);
@@ -715,23 +723,28 @@ fn block_survival_does_not_rise_when_added_holders_share_a_correlate() {
     let base: Vec<FirstHandObs> = (0..3).map(|i| holder(i as u8, i, 10.0, 30.0)).collect();
     let r_base = estimate_block_survival(&base, &prior, &r, &policy);
 
-    // Add 2 MORE holders that share subnet 0 with holder 0 (distinct master-ids,
-    // i.e. a farm minting fresh keys on one subnet) → they fall INTO holder 0's
-    // subnet bucket, contributing no new position, so R̂ must NOT rise.
+    // Add 2 MORE holders that share subnet 0 with holder 0 (a farm minting fresh
+    // keys on one subnet) → they join holder 0's comonotone group.
     let mut correlated = base.clone();
     correlated.push(holder(50, 0, 10.0, 30.0)); // subnet 0 (== holder 0)
     correlated.push(holder(51, 0, 10.0, 30.0)); // subnet 0 (== holder 0)
     let r_corr = estimate_block_survival(&correlated, &prior, &r, &policy);
 
-    // For contrast: adding 2 INDEPENDENT holders DOES raise it strictly.
+    // For contrast: adding 2 INDEPENDENT holders (distinct subnets) raises it much more.
     let mut independent = base.clone();
     independent.push(holder(60, 60, 10.0, 30.0));
     independent.push(holder(61, 61, 10.0, 30.0));
     let r_indep = estimate_block_survival(&independent, &prior, &r, &policy);
 
     assert!(
-        (r_corr - r_base).abs() < 1e-9,
-        "adding correlated holders (same subnet) must NOT raise R̂: base={r_base} corr={r_corr}"
+        r_corr >= r_base - 1e-12,
+        "comonotone within a group never LOWERS R̂ below the no-addition baseline: \
+         base={r_base} corr={r_corr}"
+    );
+    assert!(
+        r_corr < r_indep - 1e-6,
+        "same-correlate additions must be worth STRICTLY LESS than independent ones: \
+         corr={r_corr} indep={r_indep}"
     );
     assert!(
         r_indep > r_base + 1e-6,
@@ -821,6 +834,123 @@ fn block_survival_collapse_is_master_blind_under_master_only_cap() {
         r_farm > r_base + 1e-6,
         "MasterIdOnly does NOT collapse a same-subnet farm ⇒ R̂ rises (the weak policy): \
          base={r_base} farm={r_farm}"
+    );
+}
+
+// ============================================================
+// A.9 (Р-4) — correlation-aware worst-case block survival R̂_wc =
+//   min(comonotone-within-groups, independent-over-all-symbols).
+// These key the private `group_min_survival` / `comonotone_within_groups_at_least`
+// helpers directly (accessible via `use super::*`) with hand-picked probs so the
+// exact A.9 arithmetic is asserted, not the surface-derived probs.
+// ============================================================
+
+#[test]
+fn block_survival_wc_is_not_always_below_independent_pb() {
+    // B-2 counterexample. 3 symbols in ONE group, p=0.9, k_eff=3. Comonotone (A) =
+    // P(N≥3) = p₍₃₎ = 0.9; independent (B) = 0.9³ = 0.729. Since A (0.9) > B (0.729),
+    // a naïve "comonotone is the worst-case" bound would OVER-estimate at 0.9 — so
+    // "R̂_wc ≤ independent-PB always" is only rescued by the min, which binds to B.
+    let pos = vec![(BucketKey::Subnet(0), 0.9); 3];
+    let a = comonotone_within_groups_at_least(&pos, 3);
+    let b = poisson_binomial_at_least(&[0.9, 0.9, 0.9], 3);
+    let wc = group_min_survival(&pos, 3);
+    assert!((a - 0.9).abs() < 1e-12, "comonotone A must be 0.9, got {a}");
+    assert!(
+        (b - 0.729).abs() < 1e-12,
+        "independent B must be 0.9³=0.729, got {b}"
+    );
+    assert!(
+        a > b,
+        "here comonotone {a} > independent {b} (min must take indep)"
+    );
+    assert!((wc - 0.729).abs() < 1e-12, "R̂_wc = min = 0.729, got {wc}");
+}
+
+#[test]
+fn block_survival_wc_comonotone_binds_when_k_is_one() {
+    // 3 symbols in one group, p=0.9, k_eff=1. Comonotone (A) = P(N≥1) = p₍₁₎ = 0.9
+    // (the max p — they survive together); independent (B) = 1−0.1³ = 0.999. Here
+    // comonotone is the CONSERVATIVE one, so the min binds to A = 0.9.
+    let pos = vec![(BucketKey::Subnet(0), 0.9); 3];
+    let a = comonotone_within_groups_at_least(&pos, 1);
+    let b = poisson_binomial_at_least(&[0.9, 0.9, 0.9], 1);
+    let wc = group_min_survival(&pos, 1);
+    assert!((a - 0.9).abs() < 1e-12, "comonotone A must be 0.9, got {a}");
+    assert!(
+        (b - 0.999).abs() < 1e-12,
+        "independent B must be 0.999, got {b}"
+    );
+    assert!(
+        a < b,
+        "here comonotone {a} < independent {b} (min must take comonotone)"
+    );
+    assert!((wc - 0.9).abs() < 1e-12, "R̂_wc = min = 0.9, got {wc}");
+}
+
+#[test]
+fn block_survival_wc_degenerates_to_independent_when_one_per_group() {
+    // ≤1 symbol per group ⇒ comonotone-within is a single Bernoulli ⇒ construction A
+    // is analytically identical to B ⇒ R̂_wc equals the plain independent
+    // Poisson-binomial. This is the guarantee that A.9 does not shift `place` / the
+    // sim, which always spread ≤1 symbol per bucket.
+    let probs = [0.9, 0.8, 0.7, 0.95];
+    let pos: Vec<(BucketKey, f64)> = probs
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| (BucketKey::Subnet(i as u32), p))
+        .collect();
+    for k in 1..=probs.len() {
+        let wc = group_min_survival(&pos, k);
+        let pb = poisson_binomial_at_least(&probs, k);
+        assert!(
+            (wc - pb).abs() < 1e-9,
+            "≤1/group must equal the independent PB at k={k}: wc={wc} pb={pb}"
+        );
+    }
+}
+
+#[test]
+fn block_survival_wc_zero_only_when_fewer_symbols_than_k_eff() {
+    // Structural-zero semantics under A.9 (decision_model §5): R̂_wc = 0 iff the
+    // SYMBOL count < k_eff (max Σ N_c = symbol count) — NOT "distinct GROUPS < k_eff".
+    // (a) 1 group of 3 symbols, k_eff=2 (< group size): NOT zero. Comonotone lets the
+    //     group deliver ≥2 survivors together: A = p₍₂₎ = 0.9; independent
+    //     PB(≥2 of 3) = 0.972; min = 0.9.
+    let one_group = vec![(BucketKey::Subnet(0), 0.9); 3];
+    let wc_a = group_min_survival(&one_group, 2);
+    assert!(
+        (wc_a - 0.9).abs() < 1e-12,
+        "1 group, k_eff (2) < group size (3) is NOT structural zero: {wc_a}"
+    );
+    // (b) 2 symbols in TWO groups, k_eff=3: fewer symbols than k_eff ⇒ 0.
+    let too_few = vec![(BucketKey::Subnet(0), 0.9), (BucketKey::Subnet(1), 0.9)];
+    assert_eq!(
+        group_min_survival(&too_few, 3),
+        0.0,
+        "fewer symbols than k_eff ⇒ structural zero"
+    );
+    // (c) 2 symbols in ONE group, k_eff=3: still 0 — same SYMBOL-count trigger, not
+    //     a group-count trigger.
+    let too_few_one_group = vec![(BucketKey::Subnet(0), 0.9), (BucketKey::Subnet(0), 0.9)];
+    assert_eq!(group_min_survival(&too_few_one_group, 3), 0.0);
+}
+
+#[test]
+fn block_survival_wc_two_groups_are_independent() {
+    // Sanity of the BETWEEN-group independence: two groups of one symbol each are two
+    // independent Bernoullis. k_eff=2 ⇒ both must survive ⇒ 0.9·0.8 = 0.72; k_eff=1 ⇒
+    // at least one ⇒ 1 − 0.1·0.2 = 0.98.
+    let pos = vec![(BucketKey::Subnet(0), 0.9), (BucketKey::Subnet(1), 0.8)];
+    let wc2 = group_min_survival(&pos, 2);
+    assert!(
+        (wc2 - 0.72).abs() < 1e-12,
+        "k=2 ⇒ 0.9·0.8 = 0.72, got {wc2}"
+    );
+    let wc1 = group_min_survival(&pos, 1);
+    assert!(
+        (wc1 - 0.98).abs() < 1e-12,
+        "k=1 ⇒ 1−(1−0.9)(1−0.8) = 0.98, got {wc1}"
     );
 }
 
@@ -1277,19 +1407,45 @@ fn per_symbol_block_survival_is_at_most_the_surface_only_estimate() {
 }
 
 #[test]
-fn per_symbol_block_survival_is_zero_when_fewer_buckets_than_k_eff() {
-    // All placements on ONE subnet ⇒ one bucket ⇒ buckets (1) < k_eff (3) ⇒ R̂ = 0,
-    // exactly as in the K2 estimator — the §7 spread is inherited.
+fn per_symbol_block_survival_is_zero_when_fewer_symbols_than_k_eff() {
+    // A.9 (Р-4): the structural zero is now on the SYMBOL count, not the
+    // distinct-GROUP count. Fewer symbols than k_eff ⇒ even all-survive cannot reach
+    // the threshold (max Σ N_c = the symbol count) ⇒ R̂ = 0. Here 2 placements
+    // (one subnet) with k_eff=3: 2 < 3 ⇒ 0, inherited by the K3 path.
     let prior = SurfacePrior::default();
     let retention = RetentionPrior::default();
     let policy = PlacementPolicy::default(); // spread by subnet
+    let r = req(6, 3, 0.99);
+    let ladder = [0.5];
+    let placements: Vec<HolderPlacement> = (0..2)
+        .map(|i| placement_on(holder_with_standing(i as u8, 0, 1.0, 50, 0, 0), &ladder, 0))
+        .collect();
+    let r_hat = estimate_block_survival_per_symbol(&placements, &prior, &retention, &r, &policy);
+    assert_eq!(r_hat, 0.0, "fewer symbols than k_eff ⇒ R̂ = 0");
+}
+
+#[test]
+fn per_symbol_block_survival_is_not_structurally_zero_when_group_meets_k_eff() {
+    // A.9 (Р-4) contrast to the old collapse model: 6 placements on ONE subnet with
+    // k_eff=3 is NO LONGER structurally zero. The estimator keeps all 6 symbols, and
+    // a single correlate group CAN deliver ≥ k_eff survivors together (comonotone),
+    // so R̂ > 0 (the min(comonotone, independent) worst-case bound, not the old
+    // "distinct buckets (1) < k_eff (3) ⇒ 0"). Only the symbol count gates the
+    // structural zero — see the sibling test above.
+    let prior = SurfacePrior::default();
+    let retention = RetentionPrior::default();
+    let policy = PlacementPolicy::default();
     let r = req(6, 3, 0.99);
     let ladder = [0.5];
     let placements: Vec<HolderPlacement> = (0..6)
         .map(|i| placement_on(holder_with_standing(i as u8, 0, 1.0, 50, 0, 0), &ladder, 0))
         .collect();
     let r_hat = estimate_block_survival_per_symbol(&placements, &prior, &retention, &r, &policy);
-    assert_eq!(r_hat, 0.0, "fewer buckets than k_eff ⇒ R̂ = 0");
+    assert!(
+        r_hat > 0.0,
+        "6 symbols in one group with k_eff=3 (≤ group size) is NOT structurally zero \
+         under A.9: R̂={r_hat}"
+    );
 }
 
 #[test]
