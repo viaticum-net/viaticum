@@ -1128,18 +1128,92 @@ fn eviction_retention_keeps_more_when_retained_depth_is_larger() {
 }
 
 #[test]
-fn iota_rank_is_zero_for_singleton_ladder_and_orders_by_importance() {
-    // A single-symbol ladder is rank 0 (bottom == top of a one-rung ladder; the
-    // conservative choice for the eviction route).
+fn iota_rank_is_midpoint_for_singleton_and_orders_by_importance() {
+    // Р-3 midpoint: a single-symbol ladder is the MIDPOINT 0.5 (not 0) — the earlier
+    // singleton→0 degeneracy collapsed the K3 per-symbol keep to ≤0.05 even for an
+    // ideal partner (A.8).
     let single = placement_on(holder_with_standing(0, 0, 0.0, 50, 0, 0), &[0.7], 0);
-    assert_eq!(single.iota_rank(), 0.0);
+    assert!((single.iota_rank() - 0.5).abs() < 1e-12);
 
-    // A three-rung ladder: lowest-ι ⇒ 0.0, middle ⇒ 0.5, highest ⇒ 1.0.
+    // Р-3 midpoint: a three-rung ladder ⇒ rank (i+0.5)/3: lowest-ι ⇒ 0.5/3 ≈ 0.1667,
+    // middle ⇒ 1.5/3 = 0.5, highest ⇒ 2.5/3 ≈ 0.8333.
     let ladder = [0.1, 0.5, 0.9];
     let obs = holder_with_standing(0, 0, 0.0, 50, 0, 0);
-    assert_eq!(placement_on(obs.clone(), &ladder, 0).iota_rank(), 0.0);
+    assert!((placement_on(obs.clone(), &ladder, 0).iota_rank() - 0.5 / 3.0).abs() < 1e-12);
     assert!((placement_on(obs.clone(), &ladder, 1).iota_rank() - 0.5).abs() < 1e-12);
-    assert_eq!(placement_on(obs, &ladder, 2).iota_rank(), 1.0);
+    assert!((placement_on(obs, &ladder, 2).iota_rank() - 2.5 / 3.0).abs() < 1e-12);
+}
+
+#[test]
+fn retention_ceiling_is_about_0_9_for_deep_partner_on_default_prior() {
+    // Р-2 / A.7: a deeply-served partner (large G(h←O), clean PoS record) on the
+    // recalibrated default prior reaches φ_O ≈ 0.90 — the ceiling sigmoid(c_s − c_0)
+    // = sigmoid(3.7 − 1.5) = sigmoid(2.2) ≈ 0.900 (was 0.622 under c_s=2.0).
+    let r = RetentionPrior::default();
+    let deep = holder_with_standing(0, 0, 1000.0, 50, 0, 0);
+    let phi = retained_depth(&deep, &r);
+    assert!(
+        (0.88..=0.91).contains(&phi),
+        "deep partner must reach the ≈0.9 ceiling on the default prior: {phi}"
+    );
+}
+
+#[test]
+fn retention_discriminates_deep_from_stranger_on_default_prior() {
+    // Р-2 / A.7: with the raised ceiling, a deep reciprocal partner is clearly
+    // distinguishable from a stranger (the 0.622 ceiling made deep ≈ "a bit above
+    // average"). φ_O(deep) must dominate φ_O(stranger) by a wide margin.
+    let r = RetentionPrior::default();
+    let deep = retained_depth(&holder_with_standing(0, 0, 1000.0, 50, 0, 0), &r);
+    let stranger = retained_depth(&holder_with_standing(0, 0, 0.0, 50, 0, 0), &r);
+    assert!(
+        deep > stranger,
+        "deep partner must outrank a stranger: deep={deep} stranger={stranger}"
+    );
+    assert!(
+        deep / stranger > 3.0,
+        "discrimination must be wide (>3×): deep={deep} stranger={stranger}"
+    );
+}
+
+#[test]
+fn iota_rank_is_midpoint_half_for_singleton() {
+    // Р-3 / A.8: a one-rung ladder maps to the midpoint 0.5, never the degenerate 0.
+    let single = placement_on(holder_with_standing(0, 0, 0.0, 50, 0, 0), &[0.42], 0);
+    assert!((single.iota_rank() - 0.5).abs() < 1e-12);
+}
+
+#[test]
+fn iota_rank_midpoint_is_monotone_and_bounded() {
+    // Р-3 / A.8: for an m-rung ladder the midpoint ranks (i+0.5)/m strictly increase
+    // with ι, all lie in (0,1), the bottom sits at 0.5/m and the top at (m−0.5)/m.
+    let ladder = [0.1, 0.2, 0.3, 0.4, 0.5];
+    let m = ladder.len();
+    let obs = holder_with_standing(0, 0, 0.0, 50, 0, 0);
+    let ranks: Vec<f64> = (0..m)
+        .map(|i| placement_on(obs.clone(), &ladder, i).iota_rank())
+        .collect();
+    for &rk in &ranks {
+        assert!(rk > 0.0 && rk < 1.0, "rank must lie in (0,1): {rk}");
+    }
+    for w in ranks.windows(2) {
+        assert!(
+            w[1] > w[0],
+            "ranks must strictly increase with ι: {} !> {}",
+            w[1],
+            w[0]
+        );
+    }
+    assert!(
+        (ranks[0] - 0.5 / m as f64).abs() < 1e-12,
+        "bottom rung must sit at 0.5/m: {}",
+        ranks[0]
+    );
+    assert!(
+        (ranks[m - 1] - (m as f64 - 0.5) / m as f64).abs() < 1e-12,
+        "top rung must sit at (m−0.5)/m: {}",
+        ranks[m - 1]
+    );
 }
 
 #[test]

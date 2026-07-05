@@ -20,8 +20,8 @@
 //! * `world` — `v2` (default) = incremental arrival + bandwidth `U` + cream (the living
 //!   network); `v1` = one-shot залп, `U=∞`, no cream (the degenerate baseline, for A/B).
 //! * `preempt` — `off` disables preemption; a number sets `θ_p` (default 0.2).
-//! * `recalibrated` — 1 = recalibrated RetentionPrior (ceiling φ_O 0.62→0.90, A.7);
-//!   0/default = RetentionPrior::default(). Measured separately.
+//! * `recalibrated` — 1/default = canon RetentionPrior (ceiling φ_O 0.900, Р-2 accepted,
+//!   = kernel default); `0` = A/B baseline (pre-Р-2 ceiling 0.622). Measured separately.
 //! * `T_shock` — the tick the repair-storm shock fires at (default 80).
 //! * `K_csv` — comma-separated top-K% holder-kill fractions for section 7 (default
 //!   `1,5,10`). A `0` control (background baseline) is always prepended.
@@ -110,10 +110,11 @@ fn main() {
             .unwrap_or_else(|_| DynParams::default().preempt_theta),
         None => DynParams::default().preempt_theta,
     };
+    // Р-2 accepted ⇒ canon 0.900 is the DEFAULT; pass `0`/`false` for the A/B baseline 0.622.
     let recalibrated: bool = args
         .next()
         .map(|s| s != "0" && !s.eq_ignore_ascii_case("false"))
-        .unwrap_or(false);
+        .unwrap_or(true);
     // Section-7 (repair-storm) args: shock tick, K% list, latent detection cadence.
     let t_shock: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(80);
     let k_list: Vec<f64> = args

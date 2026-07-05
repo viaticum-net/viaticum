@@ -110,12 +110,12 @@ pub struct DynParams {
     /// without a full matching pass. In abundance it barely changes anything; it bites only
     /// for scarce slots under contention.
     pub giver_priority_order: bool,
-    /// World-v2 §9 sixth toggle (phase-A decision Р-2 / A.7): pass a RECALIBRATED
-    /// `RetentionPrior` to `retained_depth` so the retained-depth ceiling rises from the
-    /// default `sigmoid(2.0−1.5)=0.622` to `sigmoid(3.7−1.5)=0.900`. The KERNEL is NOT
-    /// touched — the prior is an INPUT parameter. `false` ⇒ `RetentionPrior::default()`.
-    /// Measured separately from the world change (its contribution to the share-A>0
-    /// trajectory).
+    /// World-v2 §9 A/B toggle (phase-A decision Р-2 / A.7). Р-2 is ACCEPTED: the
+    /// recalibrated ceiling `sigmoid(3.7−1.5)=0.900` is now CANON and lives in
+    /// `RetentionPrior::default()` (the kernel, Phase-B transcription). `true` (the
+    /// DEFAULT) ⇒ canon 0.900. `false` ⇒ A/B CONTROL only: pins `standing_scale=2.0` to
+    /// reproduce the pre-Р-2 baseline `sigmoid(2.0−1.5)=0.622`, for measuring the
+    /// recalibration's separate contribution to the share-A>0 trajectory.
     pub recalibrated_retention: bool,
     /// Repair-storm §7 detection latency: the PoS-cadence window (ticks) over which an
     /// owner notices that one of its ALREADY-BACKED-UP blocks has dropped below its
@@ -161,7 +161,9 @@ impl Default for DynParams {
             bandwidth_u: 20.0, // 2 symbols/tick at the default 10 gb/symbol
             cream_enabled: true,
             giver_priority_order: true,
-            recalibrated_retention: false,
+            // Р-2 ACCEPTED ⇒ recalibrated ceiling 0.900 is canon (default kernel prior).
+            // `false` is the A/B control that dials back to the pre-Р-2 0.622 baseline.
+            recalibrated_retention: true,
             // Instant repair detection = the previous behaviour (owner refills next tick).
             // The repair-storm §7 sweep raises this to model the PoS-cadence detection lag.
             repair_detection_delay_max: 0,
@@ -178,22 +180,24 @@ pub fn assert_lambda_dt_stable(lambda: f64, dt_days: f64) {
     );
 }
 
-/// The retention prior fed to `retained_depth` (world-v2 §9 sixth toggle / A.7). When
-/// `recalibrated_retention` is set, `standing_scale` is raised to 3.7 (keeping the
-/// default `depth_conservatism = 1.5` stranger floor) so the ceiling reaches
-/// `sigmoid(3.7−1.5) = 0.900` while the stranger floor stays `sigmoid(−1.5) = 0.182` —
-/// the known-vs-stranger multiplier grows ~3.4× → ~4.9×. (This differs from the coord
-/// example `standing_scale=2.7, depth_conservatism=0.5`, which reaches the same ceiling
-/// but RAISES the stranger floor to 0.378 and so LOWERS the multiplier to ~2.4× — the
-/// opposite of the stated "~5×" goal; keeping the default floor honours both A.7 targets.)
+/// The retention prior fed to `retained_depth` (world-v2 §9 A/B toggle / A.7). Р-2 is
+/// ACCEPTED, so the recalibrated ceiling `sigmoid(3.7−1.5)=0.900` is CANON and is exactly
+/// what `RetentionPrior::default()` (the kernel, Phase-B transcription) now encodes — the
+/// DEFAULT path returns it unchanged. `recalibrated_retention == false` is an A/B CONTROL
+/// that pins `standing_scale=2.0` to reproduce the pre-Р-2 baseline `sigmoid(2.0−1.5)=0.622`
+/// (the stranger floor stays `sigmoid(−1.5)=0.182` in both; the known-vs-stranger
+/// multiplier is ~4.9× at canon vs ~3.4× at baseline). The KERNEL is not toggled — the
+/// prior is an INPUT parameter.
 pub fn retention_prior(params: &DynParams) -> RetentionPrior {
     if params.recalibrated_retention {
+        // Canon (Р-2): ceiling 0.900 — the recalibrated prior IS the kernel default now.
+        RetentionPrior::default()
+    } else {
+        // A/B control ONLY: pre-Р-2 baseline (standing_scale 2.0 ⇒ ceiling 0.622).
         RetentionPrior {
-            standing_scale: 3.7,
+            standing_scale: 2.0,
             ..RetentionPrior::default()
         }
-    } else {
-        RetentionPrior::default()
     }
 }
 

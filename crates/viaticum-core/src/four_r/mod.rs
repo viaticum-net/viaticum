@@ -1070,10 +1070,12 @@ impl Default for RetentionPrior {
         // weakly trusted by default (the conservatism floor stays), but standing
         // raises the retained depth as proven service accrues.
         //  * step_beta = 8.0 → a fairly sharp ι-rank step a few ranks wide.
-        //  * standing_scale = 2.0, standing_ref = 6.0 → standing rises from the
-        //    stranger floor toward sigmoid(2.0 − 1.5) ≈ 0.62 as G(h←O) grows past the
-        //    half-saturation reference, so a well-served partner keeps more of the
-        //    ladder than a stranger.
+        //  * standing_scale = 3.7, standing_ref = 6.0 → standing rises from the
+        //    stranger floor toward sigmoid(3.7 − 1.5) = sigmoid(2.2) ≈ 0.90 as
+        //    G(h←O) grows past the half-saturation reference (Р-2 / A.7: the earlier
+        //    0.62 ceiling made deep reciprocity indistinguishable from "a bit above
+        //    average"; the requirement is φ_O(deep) ≈ 0.9 ⇒ c_s − c_0 ≈ 2.2), so a
+        //    well-served partner keeps much more of the ladder than a stranger.
         //  * pressure_scale = 6.0 → observed drops/timeouts pull φ_O down hard.
         //  * depth_conservatism = 1.5 → the KEPT stranger floor (variant A): with
         //    zero standing and no observed drops, φ_O = sigmoid(−1.5) ≈ 0.18 — a
@@ -1081,7 +1083,7 @@ impl Default for RetentionPrior {
         //    back over this floor.
         RetentionPrior {
             step_beta: 8.0,
-            standing_scale: 2.0,
+            standing_scale: 3.7,
             standing_ref: 6.0,
             pressure_scale: 6.0,
             depth_conservatism: 1.5,
@@ -1209,21 +1211,23 @@ pub struct HolderPlacement {
 }
 
 impl HolderPlacement {
-    /// The ι-RANK `r ∈ [0,1]` of this block's symbol within the owner's ladder on
-    /// this holder: the fraction of the owner's symbols on this holder that have a
-    /// ι strictly LOWER than this symbol's (ties share the lower fraction). `r = 0`
-    /// for the lowest-ι symbol, `r → 1` for the highest. A single-symbol ladder is
-    /// rank 0 (it is the bottom AND top of a one-rung ladder — the conservative
-    /// choice for the eviction route, matching "one symbol = first to go if the
-    /// holder squeezes me at all").
+    /// The ι-RANK `r ∈ (0,1)` of this block's symbol within the owner's ladder on
+    /// this holder, MIDPOINT convention `r = (lower + 0.5) / m` (Р-3 / A.8), where
+    /// `lower` is the count of the owner's symbols on this holder with a ι strictly
+    /// LOWER than this symbol's (ties share the lower fraction). The bottom rung sits
+    /// at `0.5/m`, the top at `(m − 0.5)/m`, and a single-symbol ladder is the
+    /// MIDPOINT `0.5` (not `0`). This replaces the earlier `lower/(m−1)` convention,
+    /// whose singleton degeneracy (`m=1 → 0`) collapsed the K3 per-symbol keep to
+    /// ≤ 0.05 even for an ideal partner, making the K2→K3 replacement numerically
+    /// impossible.
     ///
     /// This is the ladder coordinate the eviction-retention route keys on; it is
     /// the owner's own first-hand bookkeeping (its declared ι), never a hidden
     /// field.
     pub fn iota_rank(&self) -> f64 {
         let m = self.ladder_iotas.len();
-        if m <= 1 {
-            return 0.0;
+        if m == 0 {
+            return 0.5; // empty ladder is degenerate ⇒ the midpoint
         }
         let my_iota = self
             .ladder_iotas
@@ -1231,9 +1235,10 @@ impl HolderPlacement {
             .copied()
             .unwrap_or(f64::NEG_INFINITY); // out-of-range ⇒ treat as lowest
         let lower = self.ladder_iotas.iter().filter(|&&i| i < my_iota).count();
-        // Rank in [0,1]: fraction of the ladder strictly below me. Denominator is
-        // (m−1) so the top symbol reaches 1.0 and the bottom sits at 0.0.
-        lower as f64 / (m - 1) as f64
+        // Midpoint rank in (0,1): the fraction of the ladder strictly below me,
+        // shifted by half a rung so the bottom sits at 0.5/m and the top at
+        // (m−0.5)/m, and a one-rung ladder lands on 0.5.
+        (lower as f64 + 0.5) / m as f64
     }
 }
 
