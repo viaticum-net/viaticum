@@ -164,23 +164,25 @@ else
     fail "star connect: node-00 has only ${PC_00:-0}/$EXPECTED peers"
 fi
 
-# ── PHASE 3: FILE BACKUP + SYSTEM STATE PUSH ───────────────────
+# ── PHASE 3: FILE BACKUP + SELF-POINTER PUSH ───────────────────
 echo ""
-echo "=== Phase 3: File Backup + System State Push ==="
+echo "=== Phase 3: File Backup + Self-Pointer Push ==="
 
 # Create test file on node-00
 echo "  Creating 256 KB test file on node-00..."
 exec_node node-00 sh -c 'dd if=/dev/urandom of=/data/files/test.bin bs=1024 count=256 2>/dev/null'
 
-# Poll for system state blob on node-01 (max 180s)
-echo "  Waiting for system state push to node-01 (interval=60s)..."
+# Poll for the DR self-pointer landing on node-01's mailbox (max 180s).
+# A2 cut-over: the system_state_blobs table was retired; the DR pointer now
+# travels as a high-trust SelfPointer mailbox entry (node-01 is a postman).
+echo "  Waiting for self-pointer push to node-01's mailbox (interval=60s)..."
 BLOB_FOUND=0
 for attempt in $(seq 1 18); do
     BLOB_LINE=$(exec_node_q node-01 viaticum status --json 2>/dev/null \
-        | grep -oE '"system_state_blobs":\s*[0-9]+' || true)
+        | grep -oE '"mailbox_entries":\s*[0-9]+' || true)
     BLOB_N=$(echo "$BLOB_LINE" | grep -oE '[0-9]+$' || true)
     if [ "${BLOB_N:-0}" -ge 1 ]; then
-        echo "  System state blob found on node-01 after $((attempt * 10))s"
+        echo "  Mailbox entry (self-pointer) found on node-01 after $((attempt * 10))s"
         BLOB_FOUND=1
         break
     fi
@@ -195,9 +197,9 @@ for attempt in $(seq 1 18); do
 done
 
 if [ "$BLOB_FOUND" -eq 1 ]; then
-    pass "system state pushed to node-01"
+    pass "self-pointer pushed to node-01's mailbox"
 else
-    fail "system state blob not found on node-01 after 180s"
+    fail "no mailbox entry (self-pointer) on node-01 after 180s"
     echo ""
     echo "  === node-00 daemon log (last 30 lines) ==="
     docker exec "$PREFIX-node-00" tail -30 /tmp/daemon.log 2>/dev/null || true
@@ -216,8 +218,8 @@ echo ""
 echo "=== Phase 4: Disaster Recovery ==="
 
 if [ "$BLOB_FOUND" -eq 0 ]; then
-    echo "  SKIP: system state blob not found, DR impossible"
-    skip "DR skipped (no blob)"
+    echo "  SKIP: no self-pointer in node-01's mailbox, DR impossible"
+    skip "DR skipped (no self-pointer)"
 else
     # Save peer addrs for DR
     ADDR_01=$(get_docker_addr node-01)

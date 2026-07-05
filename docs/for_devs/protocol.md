@@ -12,17 +12,18 @@
 |-----------|--------|-------|
 | Erasure coding | RaptorQ (RFC 6330), crate `raptorq` | NOT Reed-Solomon |
 | Transport | libp2p (TCP + Noise + Yamux, Kademlia DHT, DCUtR) | transport only |
-| Gossip / deferred | Epidemic relay (board-based) | NOT pubsub |
+| Store-and-forward | Directed mailbox bus | NOT gossip/pubsub |
 | Wire format | CBOR + u32 BE length-prefix | `ciborium` crate |
 | ALPN | `"viaticum/1"` | byte string |
 | File encryption | ChaCha20-Poly1305 | epoch-keyed |
 | Per-holder binding | ChaCha20 XOR stream | anti-collusion |
 | Signatures | Ed25519 | identity + device certs |
-| ECDH (relay) | X25519 | ephemeral per message |
 | KDF | HKDF-SHA256 | domain-separated |
 | Hashes | BLAKE3 | content-addressed IDs |
 
-Direct connections + epidemic relay fully cover the needs of cold backup.
+Direct connections + a directed mailbox bus fully cover the needs of cold backup.
+Deferred messages (holder offline) are stored by a handful of Kademlia-close
+"postman" peers and polled by the addressee — there is no epidemic gossip.
 
 ---
 
@@ -70,20 +71,19 @@ pub enum Message {
     RestoreRequest(RestoreRequestMsg),
     RestoreResponse(RestoreResponseMsg),
     RestoreDenied(RestoreDeniedMsg),
-    BoardSync(BoardSyncMsg),
     ClusterSyncRequest(ClusterSyncRequestMsg),
+    MailboxFetchRequest(MailboxFetchRequest),      // poll my own mail from a postman
+    MailboxFetchResponse(MailboxFetchResponse),    // entries addressed to the requester
+    MailboxStoreRequest(MailboxStoreRequest),      // deposit an entry with a postman
+    MailboxStoreResponse(MailboxStoreResponse),    // Ack | Reject{reason}
     ClusterSyncResponse(ClusterSyncResponseMsg),
-    SystemStateBackup(SystemStateBackupMsg),
-    SystemStateAck(SystemStateAckMsg),
-    SystemStateRequest(SystemStateRequestMsg),
-    SystemStateResponse(SystemStateResponseMsg),
     Ack(AckMsg),               // generic ack for request-response streams that expect a reply
     #[serde(other)]
     Unknown,                   // forward-compat: unknown variants decode here, logged and ignored
 }
 ```
 
-`DeviceCertExchange` is **not** in this enum — it runs on a separate libp2p protocol (`/viaticum/cert/1`) as the connection handshake (see 1.2). `PeerDiscoveryRequest`/`PeerDiscoveryResponse` were removed in ε.2 (peers are found via the Kademlia DHT and the relay board).
+`DeviceCertExchange` is **not** in this enum — it runs on a separate libp2p protocol (`/viaticum/cert/1`) as the connection handshake (see 1.2). `PeerDiscoveryRequest`/`PeerDiscoveryResponse` were removed in ε.2 (peers are found via the Kademlia DHT). The `BoardSync` and `SystemState{Backup,Ack,Request,Response}` variants were removed when the epidemic relay board and the push-to-all SystemState blob were replaced by the mailbox bus (see 1.5); deferred delivery now rides `MailboxStore*`/`MailboxFetch*`.
 
 ---
 
@@ -155,9 +155,15 @@ Connection authentication is not a `Message`-enum handshake. After the libp2p TC
 ```rust
 pub struct DeviceCertExchangeMsg {
     pub cert: DeviceCertificate,        // signed by the cluster master key
-    pub x25519_pub: Option<[u8; 32]>,   // X25519 key for directed relay-board encryption
+    pub x25519_pub: Option<[u8; 32]>,   // legacy: relay-board ECDH key, no longer consumed
 }
 ```
+
+> `x25519_pub` is a vestige of the epidemic-relay era, when directed board entries
+> were sealed with per-message ECDH. The mailbox bus (1.5) delivers point-to-point
+> over Noise IX and authenticates each entry with an Ed25519 signature *inside* the
+> payload, so no per-message ECDH is performed. The key is still derived, advertised
+> and stored in `PeerRecord`, but no code path consumes it today. Treat it as reserved.
 
 #### Exchange order
 
@@ -173,7 +179,7 @@ Initiator (A)              Acceptor (B)
 
 1. Verify `cert.signature` against `cert.master_pub_key` (the cert is self-contained: the master key signs `device_id.0 (32) || issued_at (8)`).
 2. Anchor the cert against the expected cluster identity: the carried `master_pub_key` must match `ClusterState.master_pub`, not merely be internally consistent — so two independently bootstrapped peers correctly reject each other.
-3. On success the peer is authenticated and authorised for placement / restore / PoS traffic; `x25519_pub` (if present) is stored for directed board messages.
+3. On success the peer is authenticated and authorised for placement / restore / PoS traffic; `x25519_pub` (if present) is stored on the peer record but not currently used (see the note above).
 
 #### Handshake result
 
@@ -368,19 +374,19 @@ A holder with more symbols is challenged more often. A holder with lower trust i
 - Direct connections (peer temporarily offline)
 - Cluster forwarding (challenge arrived at device A, symbols are on device B)
 
-#### Challenge delivery (relay fallback)
+#### Challenge delivery (via mailbox)
 
-When sending a PoS challenge the scheduler chooses a path:
+Both legs of a PoS round-trip travel over the mailbox bus (1.5) — there is no
+direct-vs-relay branching. The holder is usually offline (cold backup), so the
+challenge is always deposited, not delivered synchronously:
 
-1. **Direct RR**: if the holder is online (an authenticated connection exists), send via `send_to_device` (libp2p request-response). The owner waits for a response within a short timeout.
+1. **Challenge**: the scheduler publishes a `PosChallenge` mailbox entry addressed to the holder's master identity (`target = holder_master`, `sender = owner_master`), carrying the signed `PosHashChallengeMsg`. `publish` deposits it with the holder's Kademlia-close postmen; the placement is only moved to Pending once at least one postman Acks (challenge is durably stored before the owner starts its timeout).
 
-2. **Relay board fallback**: if the holder is offline (no live connection or `send_to_device` returns `PeerNotAuthenticated`), the challenge is placed on the local relay board as a directed message (encrypted via ECDH with the holder's `x25519_pub`). Delivery guarantee: best-effort epidemic propagation within `RELAY_TTL_SECS = 7 days`.
+2. **Response**: when the holder next polls its mailbox it finds the challenge, recomputes the chain hash and publishes a `PosResponse` entry back (`target = owner_master`, `sender = holder_master`). The response uses a stable `msg_id` derived from the chain hash, so a retried response is idempotent.
 
-3. **No retry fallback**: if the relay board is full (`MAX_BOARD_ENTRIES`) or the TTL expired before delivery, the challenge is marked Pending. The next scheduler tick tries again.
+3. **No live connection required**: `idle_connection_timeout = 600s` in libp2p means peer-to-peer connections are **ephemeral** — peers do not hold persistent links. The mailbox absorbs this: challenge and response each wait in postman storage (TTL 7 days, `POS_CHALLENGE_TTL`) until the addressee polls.
 
-Note: `idle_connection_timeout = 600s` in libp2p means that in normal operation peer-to-peer connections are **ephemeral** — peers do not maintain persistent connections. For cold backup, most challenges go through the relay board (offline holders dominate), and this is by design.
-
-When a peer comes back online after a long absence (>7 days), all challenges from that period are treated as Lost (3+ Timeouts) → repair triggered. This is the correct behaviour for a cold backup system with a time constant of 1 week.
+When a peer stays offline past the PoS timeout (7 days), the outstanding challenges are treated as Lost (3+ Timeouts) → repair triggered. This is the correct behaviour for a cold backup system with a time constant of 1 week.
 
 #### PoS limitations
 
@@ -390,101 +396,106 @@ When a peer comes back online after a long absence (>7 days), all challenges fro
 
 ---
 
-### 1.5. Epidemic Relay (gossip board)
+### 1.5. Mailbox Bus
 
-The epidemic relay is the mechanism for delivering messages when a direct connection is not possible (peer offline).
+The mailbox bus is the mechanism for delivering messages when a direct connection is not possible (the addressee is offline — the normal case for cold backup). It replaced the epidemic relay board and the push-to-all SystemState blob wholesale (see `decisions/ADR-004-mailbox-bus.md`).
 
 #### How it works
 
+Every entry is **directed** to a single addressee (its master identity). There is no gossip, no hop counter, no epidemic propagation:
+
 ```
-Sender: publishes an entry to the relay board (append-only file)
-  → hop=0
+Sender (write-fanout):
+  MailboxRouter::publish(target, entry)
+  → rank all known peers by XOR distance to SHA256(target_pub)
+  → deposit the entry with the MAILBOX_WRITE_FANOUT (30) closest "postman" peers
+  → count Acks; the send is durable once ≥1 postman Acks
 
-On sync with a partner:
-  → BoardSync: exchange entries the partner does not have
-  → partner stores entries with hop+1
-
-hop=0 → hop=1 → hop=2 → DROP (MAX_RELAY_HOP = 2)
+Addressee (read-fanout):
+  MailboxRouter::poll(my_master_pub, since_stored_at)
+  → fetch from the MAILBOX_READ_FANOUT (300) closest postman peers
+  → dedup entries by msg_id (highest stored_at wins)
+  → dispatch each entry by class
 ```
 
-With 2 hops and 15 partners: coverage reaches ~100 nodes within a few days.
+Postmen store entries **on behalf of** the target; the target — and only the target — polls to collect them. Write-fanout to 30 and read-fanout to 300 gives redundancy against churn without any peer-to-peer flooding.
 
-#### Entry types
+#### Mailbox entry
 
 ```rust
-pub enum BoardEntryKind { Broadcast, Directed }
-
-pub struct BoardEntry {
-    pub kind: BoardEntryKind,
-    pub target_pub: Option<IdentityPub>,  // only for directed
-    pub payload: Vec<u8>,                  // CBOR (broadcast) or encrypted (directed)
-    pub sig_author: [u8; 64],             // Ed25519, signed by original author
-    pub author: IdentityPub,
-    pub hop: u8,                           // 0..MAX_RELAY_HOP
-    pub created_at: Timestamp,            // for TTL
+pub struct MailboxEntry {
+    pub target: IdentityPub,          // owner the entry is addressed to
+    pub msg_id: [u8; 16],             // sender-chosen; dedup + idempotent retry
+    pub class: MailboxClass,
+    pub payload_version: u8,          // receivers skip unknown versions
+    pub payload: Vec<u8>,             // CBOR of the inner (signed) message
+    pub expires_at: u64,              // unix secs (absolute TTL)
+    pub stored_at: u64,              // LRU / poll cursor ordering
+    pub sender: Option<IdentityPub>,
 }
 ```
 
-Relay nodes do NOT re-sign entries. `sig_author` is the original author's signature and remains unchanged.
+The envelope itself is **not signed**. Authenticity is carried by the Ed25519 signature *inside* each payload (e.g. `PosHashChallengeMsg.sig`, `DeleteMsg.sig`), verified against `entry.sender`. Point-to-point delivery over Noise IX plus per-payload signatures replace the old relay-era per-message ECDH.
 
-#### TTL and limits
-
-- `RELAY_TTL_SECS = 7 × 24 × 3600` (7 days)
-- `MAX_RELAY_HOP = 2`
-- `MAX_BOARD_ENTRIES = 2000`
-- `MAX_BOARD_SIZE_BYTES = 8 MiB`
-
-Entries older than the TTL are removed during periodic cleanup.
-
-#### Directed messages
-
-Messages addressed to a specific recipient are encrypted via ephemeral ECDH:
+#### Entry classes and TTLs
 
 ```rust
-pub struct DirectedEnvelope {
-    pub sender_x25519_pub: [u8; 32],   // ephemeral public key
-    pub nonce: [u8; 12],               // ChaCha20-Poly1305 nonce
-    pub ciphertext: Vec<u8>,           // encrypted CBOR payload
+#[repr(u8)]
+pub enum MailboxClass {
+    SelfPointer  = 0,   // DR pointer, self-addressed        TTL 5 years
+    PosChallenge = 1,   // owner → holder                    TTL 7 days
+    PosResponse  = 2,   // holder → owner                    TTL 7 days
+    DropNotice   = 3,   // holder → owner (eviction)         TTL 14 days
+    Generic      = 4,   // no producer; polled + dropped     TTL 90 days
+    DeleteRequest = 5,  // owner → holder (Delete/Cancel)    TTL 14 days
+    Revocation   = 6,   // revoking master → storage peers   TTL 30 days
 }
-// KDF: HKDF-SHA256(ikm=ECDH_shared, salt=sender_pub||receiver_pub,
-//                  info=b"viaticum-directed")
 ```
 
-An ephemeral key is generated fresh for every message (forward secrecy).
+Only `SelfPointer` is **high-trust** (`is_high_trust()`): it is the DR lifeline and is never dropped by membership or LRU eviction, only by TTL. `store()` clamps a sender-supplied `expires_at` down to `now + class TTL` so a sender cannot squat a postman's storage indefinitely.
 
-#### Board entry signature
+#### Transport
 
-```
-sig_input = msg_type_bytes || msg_id (16) || kind_str || target_pub_or_empty || payload
-sig_author = author_signing_key.sign(sig_input)
-```
-
-#### BoardSync message
+Mailbox messages ride the main `/viaticum/1` protocol as ordinary request-response `Message` variants — there is no separate mailbox protocol path:
 
 ```rust
-pub struct BoardSyncMsg {
-    pub v: u8,
-    pub entries: Vec<StoredEntry>,   // entries the partner does not have
-    pub timestamp: Timestamp,
-}
+pub struct MailboxStoreRequest  { pub v: u8, pub target: IdentityPub, pub entry: MailboxEntry }
+pub enum   MailboxStoreResponse { Ack { msg_id }, Reject { msg_id, reason } }
+pub struct MailboxFetchRequest  { pub v: u8, pub target: IdentityPub, pub since_stored_at: Option<u64> }
+pub struct MailboxFetchResponse { pub v: u8, pub entries: Vec<MailboxEntry>, pub served_msg_ids: Vec<[u8;16]> }
 
-pub struct StoredEntry {
-    pub msg_type: String,    // "peer_announce", "pos_challenge", etc.
-    pub msg_id: [u8; 16],
-    pub entry: BoardEntry,
-}
+pub enum MailboxRejectReason { NotInCandidateSet, QuotaExceeded, EntryTooLarge, Duplicate }
 ```
 
-`BoardSync` is sent as the first message after the handshake. Older nodes that do not recognise this variant log and ignore it (the connection is not dropped).
+(`served_msg_ids` is reserved for a future delivery-reward accounting; nothing consumes it today.)
 
-#### Relay usage
+Postman-side rules:
+- **Store**: accept iff this node is within the target's candidate set (`should_store`: top-`MAILBOX_CANDIDATES_N` = 1000 closest known peers to `SHA256(target_pub)`); a redb-duplicate `msg_id` returns an idempotent `Ack`.
+- **Fetch**: `req.target` must equal the requester's own master identity — you may only poll your own mail.
 
-| Purpose | Entry type |
-|---------|------------|
-| PeerAnnounce (discovery) | broadcast |
-| PoS challenge (peer offline) | directed |
-| DeviceRevocation | broadcast (`RevocationBroadcast`) |
-| ClusterSync events | via direct connection (not relay) |
+#### Limits
+
+- `MAILBOX_CANDIDATES_N = 1000` — how close a peer must rank to store for a target
+- `MAILBOX_WRITE_FANOUT = 30`, `MAILBOX_READ_FANOUT = 300`
+- `MAX_ENTRY_BYTES = 256 KiB` — per-entry cap
+- `MAX_MAILBOX_BYTES_PER_PEER = 100 MiB` — per-target quota; overflow → `Reject{QuotaExceeded}`
+
+#### Sweeping and eviction
+
+- **TTL sweep** (`mailbox_sweep_expired`, every 6h + on startup): deletes `expires_at < now` for **all** classes, including high-trust. This is the only path that removes a `SelfPointer`.
+- **Membership self-cleanup**: if a postman drifts out of a target's candidate set (routing table changed), it deletes that target's **non-high-trust** entries. `SelfPointer` is exempt (its 5-year TTL is the DR guarantee).
+
+#### Mailbox usage
+
+| Purpose | Class | Direction |
+|---------|-------|-----------|
+| DR pointer (self-backup location) | `SelfPointer` | self → own postmen |
+| PoS challenge | `PosChallenge` | owner → holder |
+| PoS response | `PosResponse` | holder → owner |
+| Symbol drop / eviction notice | `DropNotice` | holder → owner |
+| Delete (and CancelDelete) | `DeleteRequest` | owner → holder |
+| Device revocation | `Revocation` | revoking master → storage peers |
+| ClusterSync events | — | direct connection (not mailbox) |
 
 ---
 
@@ -656,13 +667,17 @@ pub struct DeleteMsg {
 
 #### Eviction (disk pressure)
 
-```
-Holder → Owner: SymbolDropNotice (advance warning, deadline)
-  deadline DROP_NOTICE_WINDOW_SECS (7 days) before the drop
+Both advance warnings and confirmed drops travel as `DropNotice` mailbox entries (1.5); the `deadline` field distinguishes them:
 
-Holder → Owner: SymbolDropped (eviction confirmed)
-  → owner: PlacementStatus → Lost → trigger repair
 ```
+Holder → Owner: DropNotice mailbox entry, deadline = now + DROP_NOTICE_WINDOW_SECS (7 days)
+  advance warning — owner has a window to pre-repair
+
+Holder → Owner: DropNotice mailbox entry, deadline = now (immediate eviction)
+  → owner (on poll): PlacementStatus → Lost → trigger repair
+```
+
+Notices for the same owner are batched into one mailbox entry (`SymbolDropNoticeBatchMsg`) to avoid fan-out storms during mass eviction; a batch that exceeds `MAX_ENTRY_BYTES` (256 KiB) is split across entries. Each notice is **signed by the holder's master key** and verified on receipt (`verify_symbol_drop_notice`) — an unsigned or forged drop notice is rejected, so it cannot be used to trigger spurious repair storms.
 
 **SymbolDropNoticeMsg**:
 ```rust
@@ -670,8 +685,9 @@ pub struct SymbolDropNoticeMsg {
     pub v: u8,
     pub source_block_id: SourceBlockId,
     pub esi_ranges: Vec<(u32, u32)>,
-    pub deadline: Timestamp,   // when the drop will occur
+    pub deadline: Timestamp,   // when the drop will occur (now = immediate)
     pub timestamp: Timestamp,
+    pub sig: [u8; 64],         // Ed25519 holder_master_key.sign(...) — forgery-proof
 }
 ```
 
@@ -747,7 +763,7 @@ Upon receiving such a handshake, the partner extracts `master_pub_key` from `dev
 1. New device enters seed phrase → derive device_key
 2. device_id = DeviceId(device_key.verifying_key().to_bytes())  // 32 bytes Ed25519 pubkey
 3. Create DeviceCertificate = master_key.sign(device_id.0 || issued_at)
-4. Publish cert via relay board → partners accept the device as part of the identity
+4. Present the cert on connect via DeviceCertExchange (1.2) → partners accept the device as part of the identity (learned lazily on first contact, not broadcast)
 5. Seed is erased from RAM
 6. Sync state (file catalog, placements) via ClusterSync
 ```
@@ -760,12 +776,12 @@ Device limit: 16 (`MAX_DEVICES = 16`). Determined by the ESI namespace: `ESI spa
 1. viaticum device revoke <device_id>
 2. Create RevocationCertificate = master_key.sign(b"revoke" || device_id || revoked_at || new_epoch)
 3. epoch_counter += 1, new epoch_key
-4. Publish via relay board: RevocationBroadcast { revocation_cert, device_cert }
+4. Publish `Revocation` mailbox entries carrying RevocationBroadcast { revocation_cert, device_cert }, addressed to the master's **storage-relationship peers only** (holders of our data ∪ owners we hold for), not broadcast to everyone
 5. Partners: add device to revoked list, deny restore/PoS for revoked device key
 6. Owner: gradually re-encrypt old files with the new epoch
 ```
 
-**RevocationBroadcast** (broadcast relay entry):
+**RevocationBroadcast** (payload of a `Revocation` mailbox entry):
 ```rust
 pub struct RevocationBroadcast {
     pub revocation: RevocationCertificate,
@@ -773,7 +789,7 @@ pub struct RevocationBroadcast {
 }
 ```
 
-Revocation delivery is eventual consistency via gossip (hop≤2, TTL 7 days). Threat model: "lazy not malicious" — a thief is unlikely to actively interfere.
+Revocation is delivered as directed mailbox entries (`Revocation` class, TTL 30 days) to the peers with which the master has an actual storage relationship — the set that needs to deny the stolen device. This is narrower than the old epidemic broadcast by design: the parties who must act are our holders and the owners we hold for; other peers learn the revocation lazily if they ever transact with the master. Threat model: "lazy not malicious" — a thief is unlikely to actively interfere.
 
 #### ClusterSync
 
@@ -840,40 +856,72 @@ S-score: per (device, peer) pair — the protocol has no knowledge of clusters. 
 
 ---
 
-### 1.10. System State Backup (δ.1)
+### 1.10. System State Backup (self-pointer)
 
-#### SystemState backup
+The daemon backs up its own metadata DB so a total-loss owner can recover it from
+the mnemonic alone. The δ.1 design — one encrypted blob per owner, pushed to every
+peer and stored in a `system_state_blobs` table — was replaced (see 1.5 / ADR-004).
+The blob push does not scale and duplicated the redundancy machinery the backup
+pipeline already has. The current design reuses that machinery:
 
-Periodic push of an encrypted DB snapshot to all peers. One blob per owner, overwritten on each push.
+#### How it works
 
-```rust
-// Owner → Holder. Push encrypted DB snapshot.
-pub struct SystemStateBackupMsg { pub v: u8, pub encrypted_blob: Vec<u8>, pub timestamp: Timestamp }
-
-// Holder → Owner. Acknowledge storage.
-pub struct SystemStateAckMsg { pub v: u8, pub stored: bool, pub timestamp: Timestamp }
-
-// Requester → Holder. Request stored blob (identity from handshake).
-pub struct SystemStateRequestMsg { pub v: u8, pub timestamp: Timestamp }
-
-// Holder → Requester. Return blob (empty vec = not found).
-pub struct SystemStateResponseMsg { pub v: u8, pub encrypted_blob: Vec<u8>, pub timestamp: Timestamp }
+```
+1. Snapshot the DB → SystemState (CBOR → zstd → ChaCha20-Poly1305, key derived
+   from the seed so DR can decrypt with only the mnemonic)
+2. Erasure-code the encrypted snapshot as an ordinary "SS-block" (base + diffs),
+   place its symbols with holders exactly like user data (SS_IMPORTANCE)
+3. Build a SelfPointer: a tiny (KB) signed index naming the SS-block(s) and, for
+   each, the holders to fetch it from — then publish it as a self-addressed
+   `SelfPointer` mailbox entry (1.5) to the owner's own postmen
 ```
 
-**Encryption:** HKDF-SHA256(ikm=seed, salt=random_24, info=b"viaticum-system-state") → ChaCha20-Poly1305. Wire format: `[salt(24)][nonce(12)][ciphertext+tag]`.
+The DB is thus protected by the same erasure coding, per-holder binding and PoS as
+the user's files. The only thing that must be found "from nothing" at DR is the
+pointer — and that lives in the mailbox under the owner's own identity.
 
-**Serialization:** SystemState → CBOR → zstd compress → encrypt.
+```rust
+pub struct HolderHint {
+    pub holder_id: DeviceId,
+    pub addrs: Vec<String>,         // best-effort dial hints; re-resolved via Kademlia if stale
+    pub esi_ranges: Vec<(u32, u32)>, // carried in-pointer: DR has no placements table yet
+}
 
-**Security:**
-- `SystemStateBackup` — accepted only from **known peers** (prevents storage spam)
-- `SystemStateRequest/Response` — responds to anyone (blob is encrypted, useless without the owner's key)
-- TTL = 365 days, expired blobs are auto-deleted on read
+pub struct BlockRef {
+    pub block_id: SourceBlockId,
+    pub holders: Vec<HolderHint>,
+    pub encrypted_size: u64,        // DR recomputes ErasureParams from this
+}
 
-**Table:** `system_state_blobs` — key: `[u8; 32]` (owner identity_pub), value: CBOR(`SystemStateBlobRecord`).
+pub struct SelfPointer {
+    pub generation: u32,            // resets to 1 per owner restart — NOT a global freshness key
+    pub base: BlockRef,
+    pub diffs: Vec<BlockRef>,
+    pub created_at: Timestamp,      // primary freshness key at DR
+    pub signature: [u8; 64],        // Ed25519 master_key.sign(domain || cbor(gen,base,diffs,created_at))
+}
+```
+
+The pointer carries holder identities and ESI ranges directly because at DR the
+`symbol_placements` table does not exist yet — it is part of what is being recovered
+(the DR circular dependency, Bug-A). No `master_pub` is embedded: the verifier already
+knows the expected identity from the mnemonic, and omitting it binds verification to
+that identity.
+
+#### Publish cadence
+
+`run_periodic_push` republishes the pointer when the state changes structurally, or
+every 30 days otherwise. The `SelfPointer` mailbox entry is **high-trust**: postmen
+never evict it under membership churn or disk pressure — only its 5-year TTL removes
+it. Freshness at DR is decided by `created_at` (wall clock), with `generation` only as
+a same-timestamp tiebreak, because generation resets on restart.
 
 #### Peer discovery
 
-Peer discovery is no longer a protocol message. The `PeerDiscoveryRequest`/`PeerDiscoveryResponse` messages were removed in ε.2; peers are found through the Kademlia DHT and the relay board. Disaster recovery (3.4) visits explicitly provided seed peers and asks each for the SystemState blob — there is no BFS peer-list expansion.
+Peer discovery is no longer a protocol message. `PeerDiscoveryRequest`/`PeerDiscoveryResponse`
+were removed in ε.2; peers are found through the Kademlia DHT. Disaster recovery (3.4)
+uses Kademlia `get_closest_peers` to populate its peer set, then polls the mailbox for
+the self-pointer — there is no blob request and no BFS peer-list expansion.
 
 ---
 
@@ -911,8 +959,8 @@ The following parameters are recommended values, not interoperability requiremen
 6. Erase seed phrase from RAM
 7. issue_device_certificate(master_key, device_id, now) → save cert
 8. ClusterState::init(db, master_pub, first_device_cert, ...)
-9. PeerAnnounce via relay board: "I exist, my NodeId = ..."
-10. Bootstrap auto-connect: connect to bootstrap peers → join the Kademlia DHT and the relay board → learn more peers
+9. Bootstrap auto-connect: connect to bootstrap peers → join the Kademlia DHT → learn more peers
+10. On each authenticated connection, exchange DeviceCertExchange (1.2) and PeerAnnounce (address + keys)
 ```
 
 ### 3.2. Normal Operation
@@ -937,7 +985,7 @@ Backup flow (per source block):
 
 PoS: adaptive scheduler
   picks random ESI from holder's esi_ranges
-  → PosHashChallengeMsg (direct or via relay)
+  → PosHashChallengeMsg (via mailbox)
   → verify PosHashResponse chain hash, update trust + PlacementStatus
 
 Repair (triggered by PresumedLost / Lost):
@@ -977,18 +1025,18 @@ All devices lost, only the seed phrase remains:
 viaticum dr --mnemonic "24 words" --peer <addr>
 
 1. Derive identity from seed → IdentityPub
-2. Open fresh DB (remove stale db.redb if any)
+2. Open a fresh DB, seeded with the provided --peer addresses (restore_db_force)
 3. Start minimal SwarmHandle (libp2p, no Processor)
-4. Visit the provided seed peers (no BFS expansion since ε.2):
-   - Connect to each seed --peer address
-   - Send SystemStateRequest → collect encrypted DB snapshots
-   - Limits: 500 peers, 10 blobs; per-connection auth 15s, request 10s
-5. Select freshest blob (max created_at)
-6. Decrypt (ChaCha20-Poly1305 with HKDF-derived key from seed)
-7. Restore DB: files, source blocks, placements, peers, pos_weekly, cluster_state
-8. "Run viaticum daemon, then viaticum restore <path>"
+4. wait_for_kad_bootstrap_stable: join the DHT, drain PeerAuthenticated, upsert discovered peers into the DB
+5. get_closest_peers(SHA256(master_pub)) → dial + authenticate candidates → the postmen closest to our own identity are now known
+6. dr_walk_for_pointer: poll the mailbox in expanding batches [100, 300, 1000], keep SelfPointer entries, verify each signature against the mnemonic identity, select the freshest by created_at
+7. From the pointer's base + diffs, dial each HolderHint (its addrs first, else get_closest_peers(holder_id)) → fetch the SS-block symbols
+8. RaptorQ decode → decrypt (ChaCha20-Poly1305, key derived from seed) → SystemState
+9. Restore DB: files, source blocks, placements, peers, pos_weekly, cluster_state
+10. "Run viaticum daemon, then viaticum restore <path>"
 
-DB snapshots pushed periodically (6h) by daemon → SystemStateBackup → peers store one blob per owner (TTL 365 days).
+The self-pointer is published periodically by the daemon (1.10) as a high-trust mailbox
+entry under the owner's own identity (5-year TTL), so it outlives long owner outages.
 ```
 
 ### 3.5. File Deletion
@@ -1057,11 +1105,11 @@ No complete defence: VPN/VPS can simulate geographic diversity. Acceptable for c
 
 - Handshake: `HANDSHAKE_FRESHNESS_SECS = 300`
 - PoS: `challenge_id = [u8; 16]` — random nonce, response matched by challenge_id
-- Relay entries: `created_at + TTL <= now → expired`
+- Mailbox entries: `expires_at < now → swept`; `store()` clamps sender-supplied TTL to the per-class maximum
 
 ### 4.6. Device Theft
 
-- Revoke device key → partners receive `RevocationBroadcast` via gossip
+- Revoke device key → storage-relationship partners receive `RevocationBroadcast` via directed mailbox (1.9)
 - New epoch → new files are encrypted with a key the stolen device does not have
 - Old files: partners block restore for the revoked device key
 - Owner gradually re-encrypts old files
@@ -1091,14 +1139,22 @@ Threat model: "lazy not malicious". For an active adversary (with `epoch_key` co
 | `HOLDER_DELETE_COOLDOWN_SECS` | 2_419_200 (4 wk) | Holder cooldown after delete |
 | `DROP_NOTICE_WINDOW_SECS` | 604_800 (7 days) | Advance notice before drop |
 | `DEFAULT_ESCROW_K_FACTOR` | 7.0 | Storage days per 1 GB restore |
-| `MAX_RELAY_HOP` | 2 | Maximum relay hops |
-| `RELAY_TTL_SECS` | 604_800 (7 days) | Relay entry TTL |
-| `MAX_BOARD_ENTRIES` | 2000 | Entries on relay board |
-| `MAX_BOARD_SIZE_BYTES` | 8 MB | Relay board size |
+| `MAILBOX_CANDIDATES_N` | 1000 | Closest peers that store for a target (postman set) |
+| `MAILBOX_WRITE_FANOUT` | 30 | Postmen an entry is deposited with on publish |
+| `MAILBOX_READ_FANOUT` | 300 | Postmen polled when fetching own mail |
+| `MAILBOX_POLL_INTERVAL_SECS` | 3600 (1 h) | Base mailbox poll cadence (÷ time_scale) |
+| `MAILBOX_SWEEP_INTERVAL_SECS` | 21_600 (6 h) | Base TTL/membership sweep cadence (÷ time_scale) |
+| `MAX_ENTRY_BYTES` | 262_144 (256 KiB) | Per mailbox-entry cap |
+| `MAX_MAILBOX_BYTES_PER_PEER` | 104_857_600 (100 MiB) | Per-target mailbox quota |
+| `SELF_POINTER_TTL` | 157_680_000 (5 years) | DR self-pointer TTL (high-trust) |
+| `POS_CHALLENGE_TTL` | 604_800 (7 days) | PoS challenge/response mailbox TTL |
+| `DROP_NOTICE_TTL` | 1_209_600 (14 days) | Drop-notice mailbox TTL |
+| `DELETE_REQUEST_TTL` | 1_209_600 (14 days) | Delete/CancelDelete mailbox TTL |
+| `REVOCATION_TTL` | 2_592_000 (30 days) | Device-revocation mailbox TTL |
+| `UNKNOWN_SENDER_TTL` | 7_776_000 (90 days) | Generic-class mailbox TTL |
 | `MAX_MESSAGE_SIZE` | 128 MB | Maximum frame size |
 | `PROTOCOL_VERSION` | 1 | Protocol version |
 | `ALPN` | `b"viaticum/1"` | ALPN identifier |
-| `SYSTEM_STATE_TTL_SECS` | 31_536_000 (365 days) | TTL for stored system state blobs |
 | `HANDSHAKE_FRESHNESS_SECS` | 300 | Handshake freshness window (±5 min) |
 | `KP` | 0.4 | Weight of P in trust formula |
 | `KI` | 1.75 | Weight of I in trust formula |
@@ -1137,8 +1193,12 @@ WARM (redb):
   EventLog (append-only): Vec<(seq: u64, EventEntry)>
   Indices: file→holders, holder→files (double index)
   ClusterState (singleton): StoredClusterState
-  SystemStateBlobRecord { owner, encrypted_blob, created_at, stored_at } — 1 per owner, TTL 365d
+  mailbox_entries       key = target_pub(32) || msg_id(16) || class(1) → CBOR(MailboxEntry)
+  mailbox_bytes_by_target  key = target_pub(32) → u64 (per-target quota accounting)
+  ss_blocks             key = block_id(32) → generation — marks which source blocks are SystemState replicas
 ```
+
+(The δ.1 `system_state_blobs` table was removed; a one-time `drop_legacy_system_state_blobs` migration deletes it on DB open.)
 
 Values = CBOR (`ciborium`). DB = `Arc<redb::Database>`.
 
@@ -1161,7 +1221,7 @@ Advantage vs α: ~3.4 MB per 1000 files vs ~50 MB (15x smaller). Fungible symbol
 | PoS | Stub | Real (64 KB response + on-the-fly verify) |
 | PoS not held | Silence | PosHashNack (explicit response) |
 | Repair | Basic | Graduated (Uncertain→PresumedLost), NotHeld→immediate |
-| Relay | None | Epidemic relay (hop≤2, TTL 7d) |
+| Deferred delivery | None | Directed mailbox bus (postman store-and-forward) |
 | Dedup | None | Content-addressed (same hash → zero traffic) |
 | Backup trigger | Weekly | Event-driven + flush conditions |
 | File versioning | None | Vec\<FileVersion\>, restore by version/date |

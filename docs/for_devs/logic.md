@@ -224,17 +224,18 @@ Double cooldown protects against ransomware and accidental deletion.
 
 Pack-type source blocks with > 50% invalid files -> repack valid files into new block, mark old block Stale -> enters deletion flow.
 
-## Epidemic Relay
+## Mailbox Bus
 
-Store-and-forward gossip for offline peers.
+Directed store-and-forward for offline peers (replaced the epidemic relay board — see
+[protocol.md §1.5](protocol.md), [ADR-004](decisions/ADR-004-mailbox-bus.md)).
 
-- Board: append-only file, entries with hop count and TTL
-- Hop limit: <= 2 (MAX_RELAY_HOP). Each forward increments hop.
-- TTL: 7 days (RELAY_TTL_SECS). Expired entries pruned.
-- Directed entries: encrypted with ECDH(sender, recipient) -> ChaCha20-Poly1305
-- Broadcast entries: signed but unencrypted
-- Board limits: max 2000 entries, max 8 MB total
-- Exchange: BoardSync message on peer connect
+- Directed, not gossip: every entry is addressed to one recipient's master identity. No hops, no flooding.
+- Postmen: the peers Kademlia-closest to SHA256(target_pub) store entries for that target.
+- Publish: deposit with the closest MAILBOX_WRITE_FANOUT (30); durable once >=1 Acks.
+- Poll: the addressee fetches from the closest MAILBOX_READ_FANOUT (300), dedups by msg_id.
+- Classes + TTL: SelfPointer 5y, PosChallenge/PosResponse 7d, DropNotice/DeleteRequest 14d, Revocation 30d, Generic 90d.
+- Authenticity: envelope unsigned; each payload carries an Ed25519 sig verified against the sender (Noise IX gives confidentiality — no per-message ECDH).
+- Limits: 256 KB per entry, 100 MB per target; TTL sweep + membership sweep reclaim storage; SelfPointer is high-trust (TTL-only eviction).
 
 ## Backup Flush Triggers
 

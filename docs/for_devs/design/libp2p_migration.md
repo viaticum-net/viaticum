@@ -1,6 +1,8 @@
 # Migration to libp2p
 
 > **Historical document.** This is the design record for the iroh → libp2p migration, which has since been completed and shipped. It captures *why* the switch was made and how it was planned, not the current state of the code. Forward-looking language ("we will remove", "Phase 1–5", file lists) describes the migration plan as written at the time. For the current network stack, see [`../protocol.md`](../protocol.md) and [`../architecture.md`](../architecture.md). Some details here diverged during implementation (the "Implementation clarifications" section at the end already records several); the doc is preserved as rationale, not synced to code.
+>
+> **Superseded: the "Board".** This doc makes the store-and-forward **Board** (a.k.a. epidemic relay) the primary transport for deferred protocol messages. That design was later replaced wholesale by the directed **mailbox bus** — see [`../protocol.md` §1.5](../protocol.md) and [ADR-004](../decisions/ADR-004-mailbox-bus.md). Wherever this doc says "Board", "board sync", or "x25519 for board encryption", read it as the *former* mechanism. **Note the two unrelated senses of "relay" below:** the **Board/epidemic relay** is gone; **libp2p Circuit Relay v2 + DCUtR** (NAT-traversal holepunch coordination) remain current and are unaffected.
 
 *Decision: iroh -> libp2p. Full design of the new network stack.*
 *Version 5 (final) -- after two rounds of review.*

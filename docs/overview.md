@@ -32,7 +32,7 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 2. Owner computes the expected Samsara chain hash from its local source block (re-encode + per-holder binding), sends PosChallenge over an ESI range
 3. Holder computes the same chain hash over its stored symbols and returns only the hash -> owner compares (no raw symbols on the wire)
 4. Pass -> trust grows. Timeout: Alive -> Uncertain (1 miss) -> PresumedLost (3 misses, triggers Repair). Explicit Fail/NotHeld -> Lost directly (skips the chain)
-5. PoS timeout: 7 days (covers relay forwarding)
+5. PoS timeout: 7 days (covers mailbox store-and-forward latency)
 
 ### Repair
 
@@ -43,19 +43,18 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 ### Peer Discovery
 
 1. Bootstrap peers from config: `[network] bootstrap_peers = ["DeviceId@ip:port"]`
-2. **Bootstrap auto-connect:** on daemon startup, connect to bootstrap peers and send PeerDiscoveryRequest to learn their peer lists (1-hop)
-3. On connect: PeerAnnounce exchange (identity, node_id, addresses)
-4. PeerDiscoveryRequest/Response: request peer list from any authenticated connection
-5. Epidemic relay: BoardSync messages gossip peer info (hop <= 2, TTL 7 days)
-6. libp2p (TCP+Noise+Yamux) transport with NAT traversal (relay + DCUtR)
+2. **Bootstrap auto-connect:** on daemon startup, connect to bootstrap peers and join the Kademlia DHT
+3. On connect: DeviceCertExchange + PeerAnnounce (identity, addresses, keys)
+4. Kademlia DHT: discover further peers via `get_closest_peers` (PeerDiscoveryRequest/Response were removed in ε.2)
+5. libp2p (TCP+Noise+Yamux) transport with NAT traversal (Circuit Relay v2 + DCUtR)
 
 ### Disaster Recovery
 
 1. `viaticum dr --mnemonic "24 words" --peer <addr>` — standalone, no daemon needed
-2. Derive identity from seed phrase, open fresh DB
-3. Visit the provided seed peers, send SystemStateRequest to each (no peer-discovery expansion since ε.2)
-4. Limits: 500 peers, 10 blobs; per-connection auth timeout 15s, request timeout 10s
-5. Select freshest blob (max created_at), decrypt with identity key, restore DB
+2. Derive identity from seed phrase, open fresh DB seeded with the --peer addresses
+3. Join the Kademlia DHT, `get_closest_peers(SHA256(master))` → dial and authenticate the postmen closest to our own identity
+4. Poll the mailbox in expanding batches [100, 300, 1000] for the signed SelfPointer; verify each signature against the mnemonic identity, pick the freshest by created_at
+5. Dial the holders named in the pointer, fetch the SystemState SS-block symbols, RaptorQ-decode, decrypt with the seed-derived key, restore DB
 6. Run `viaticum daemon` then `viaticum restore <path>` to recover files
 
 ### Deletion
@@ -104,11 +103,11 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 | `watcher` | Filesystem watcher (notify): recursive, debounce, DirtyEvent emission |
 | `scheduler` | PoS challenge scheduling, timeout detection |
 | `web_api` | HTTP + token API: serves both the CLI and the web UI (status, files, restore, etc.) |
-| `relay` | Epidemic relay board: store-and-forward, hop-limited gossip |
+| `mailbox` | Directed store-and-forward bus: postman routing (publish/poll), candidate selection, TTL/membership sweeps |
 | `cluster_sync` | Event log exchange between devices of same cluster |
 | `identity` | BIP39 mnemonic -> seed -> HKDF key derivation, identity file management |
-| `system_state` | Daemon wrappers: snapshot+encrypt, periodic push to peers, bootstrap discovery |
-| `dr` | Disaster recovery CLI: seed-peer visit, blob collection, DB restore from seed phrase |
+| `system_state` | Daemon wrappers: snapshot+encrypt -> erasure-coded SS-block, publish/refresh the DR self-pointer via mailbox |
+| `dr` | Disaster recovery CLI: Kademlia discovery -> mailbox self-pointer walk -> SS-block fetch -> DB restore from seed phrase |
 | `work_pipeline` | Unified work queue: backup, repair and PoS tasks scheduled and run together |
 | `watch_admin` | Live add/remove of watched folders without restarting the daemon |
 | `symbol_fetch` | Fetch unbound symbols from holders (shared by restore and repair-from-peers) |

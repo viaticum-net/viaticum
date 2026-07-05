@@ -350,26 +350,28 @@ else
     skip "second version not detected yet (may need more time)"
 fi
 
-# ── PHASE 6: SYSTEM STATE PUSH ──────────────────────────────────
+# ── PHASE 6: MAILBOX DELIVERY (SelfPointer / deferred messages) ──
 echo ""
-echo "=== Phase 6: System State Push ==="
+echo "=== Phase 6: Mailbox Delivery ==="
 
-# Check if system state blobs exist on any peer
-BLOB_FOUND=0
+# The δ.1 system_state_blobs table was retired (A2 cut-over). Deferred delivery —
+# including the DR SelfPointer and PoS challenges — now rides the mailbox bus.
+# Proxy: a peer acting as a postman holds ≥1 mailbox entry for some target.
+MAILBOX_FOUND=0
 for i in $(seq 1 $((NUM_NODES-1))); do
-    BLOBS=$(run_cli_q "$i" status --json 2>/dev/null \
-        | grep -oE '"system_state_blobs":\s*[0-9]+' | grep -oE '[0-9]+$')
-    if [ "${BLOBS:-0}" -ge 1 ]; then
-        echo "  node-$(printf '%02d' "$i") has ${BLOBS} system_state blob(s)"
-        BLOB_FOUND=1
+    ENTRIES=$(run_cli_q "$i" status --json 2>/dev/null \
+        | grep -oE '"mailbox_entries":\s*[0-9]+' | grep -oE '[0-9]+$')
+    if [ "${ENTRIES:-0}" -ge 1 ]; then
+        echo "  node-$(printf '%02d' "$i") holds ${ENTRIES} mailbox entry(ies) as postman"
+        MAILBOX_FOUND=1
     fi
 done
 
-if [ "$BLOB_FOUND" -eq 1 ]; then
-    pass "system state blobs stored on peers"
+if [ "$MAILBOX_FOUND" -eq 1 ]; then
+    pass "mailbox entries stored on postman peers"
 else
-    echo "  No blobs found yet (push fires 60s after daemon start)"
-    skip "system state push not yet fired"
+    echo "  No mailbox entries found yet (self-pointer push fires 60s after daemon start)"
+    skip "mailbox delivery not yet fired"
 fi
 
 # ── PHASE 7: STATUS SUMMARY ─────────────────────────────────────

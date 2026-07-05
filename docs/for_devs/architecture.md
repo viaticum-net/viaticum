@@ -40,12 +40,12 @@
 │     ├──► repair       (thin: reliability scan + placement events)       │
 │     ├──► scheduler    (PoS challenge scheduling, timeout detection)     │
 │     ├──► watcher      (fs-notify: recursive watch → DirtyEvent)         │
-│     ├──► relay        (RelayManager: epidemic board, hop≤2)             │
+│     ├──► mailbox      (MailboxRouter: postman store-and-forward)        │
 │     ├──► cluster_sync (ClusterSyncManager: event log exchange)          │
 │     ├──► web_api      (HTTP+token API: CLI + web UI → DaemonState)      │
 │     ├──► identity     (BIP39 → HKDF → keys, identity file mgmt)        │
-│     ├──► system_state (periodic DB push, bootstrap discovery)           │
-│     └──► dr           (disaster recovery: seed-peer visit, restore)     │
+│     ├──► system_state (SS-block encode + self-pointer publish)          │
+│     └──► dr           (disaster recovery: Kademlia + self-pointer walk) │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -73,7 +73,7 @@ crates/viaticum-core/src/
   erasure/        — ErasureEncoder trait + RaptorQ impl + per-holder binding
   cluster/        — DeviceCertificate, RevocationCertificate, ClusterState, epochs
   pos/            — PosEngine (challenge selection, verify, adaptive schedule)
-  messages/       — all wire messages + relay board helpers
+  messages/       — all wire messages + mailbox entry types (MailboxEntry, MailboxClass)
   config/         — TOML config loading and validation (AppConfig)
   commitment/     — Holder eviction risk estimation (CommitmentScore)
   reliability/    — P(block recoverable) forecast (Binomial model)
@@ -104,7 +104,7 @@ crates/viaticum/src/
     repair/       — thin: reliability scan + placement-event handlers (active repair lives in work_pipeline)
     scheduler/    — Scheduler: PoS challenge timing, PendingChallenges
     watcher/      — fs-notify watcher: recursive, debounce, DirtyEvent
-    relay/        — RelayManager (+ board.rs)
+    mailbox/      — MailboxRouter: routing (publish/poll/dr_walk), candidate selection, poll dispatch, TTL/membership cleanup
     cluster_sync/ — ClusterSyncManager
     web_api/      — HTTP + token API server (axum/TCP): serves both CLI and web UI
     web_auth/     — token auth for web_api
@@ -113,11 +113,11 @@ crates/viaticum/src/
     symbol_fetch/ — fetch unbound symbols from holders (restore + repair-from-peers)
     holdings_integrity/ — periodic scan that held symbols still exist on disk
     holder_cleanup/ — evict holdings after drop-notice window
-    dispatch/     — shared request dispatch (web_api + relay)
+    dispatch/     — shared request dispatch (web_api + mailbox)
     metrics/      — Prometheus metrics + status aggregation
     identity/     — BIP39/HKDF key derivation, identity.key file
-    system_state/ — periodic DB push to peers, bootstrap discovery
-    dr/           — disaster recovery CLI: seed-peer visit, standalone restore
+    system_state/ — snapshot+encrypt → erasure-coded SS-block, publish/refresh the DR self-pointer via mailbox
+    dr/           — disaster recovery CLI: Kademlia discovery → mailbox self-pointer walk → standalone restore
 ```
 
 ---
@@ -282,14 +282,14 @@ Alive → Fail / NotHeld → Lost → immediate repair
 
 ### messages
 
-All wire messages + relay board helpers. Wire format: CBOR + u32 BE length prefix.
+All wire messages + mailbox entry types. Wire format: CBOR + u32 BE length prefix.
 
-**Direct-connection messages:**
+**Direct request-response messages** (all ride `/viaticum/1`):
 
 | Type | Direction | Description |
 |------|-----------|-------------|
 | `HandshakeMsg` | ↔ | Mutual authentication on connection open |
-| `PeerAnnounceMsg` | broadcast relay | Peer address announcement (discovery) |
+| `PeerAnnounceMsg` | on connect | Peer address + key announcement (discovery) |
 | `PosHashChallengeMsg` | owner → holder | Challenge an ESI range (chain-hash PoS) |
 | `PosHashResponseMsg` | holder → owner | Response: SHA256 chain hash over bound symbols |
 | `PosHashNackMsg` | holder → owner | Symbol(s) not held (evicted / missed), signed |
@@ -301,7 +301,12 @@ All wire messages + relay board helpers. Wire format: CBOR + u32 BE length prefi
 | `SymbolDroppedMsg` | holder → owner | Holder dropped symbols (disk pressure) |
 | `ClusterSyncRequestMsg` | device → device | Request event log after cursor |
 | `ClusterSyncResponseMsg` | device → device | Response with events |
-| `RevocationBroadcast` | relay broadcast | Broadcast of a revocation certificate |
+| `MailboxStoreRequest` | sender → postman | Deposit a mailbox entry for a target |
+| `MailboxStoreResponse` | postman → sender | Ack / Reject{reason} |
+| `MailboxFetchRequest` | target → postman | Poll own mailbox |
+| `MailboxFetchResponse` | postman → target | Entries addressed to the requester |
+
+**Deferred payloads** (holder offline) do not have their own top-level message: they travel *inside* mailbox entries (see [protocol.md §1.5](protocol.md)). Classes: `SelfPointer`, `PosChallenge`, `PosResponse`, `DropNotice` (carries `SymbolDropNoticeBatchMsg`), `DeleteRequest` (Delete/CancelDelete), `Revocation` (carries `RevocationBroadcast`).
 
 ALPN: `"viaticum/1"`. HandshakeMsg is Ed25519-signed: `sign("handshake" || identity_pub || timestamp_be)`.
 
@@ -318,7 +323,7 @@ Opening: `Db::open(path)` — pre-open backup (.redb.bak), `DatabaseBuilder` wit
 
 **Two layers:**
 - **HOT (RAM, ~13 MB at 5 TB):** HashMap aggregates `BlockAgg` and `PlacementAgg` in `HotCache`
-- **WARM (redb, ~133 MB at 5 TB):** all 17 tables, CBOR values
+- **WARM (redb, ~133 MB at 5 TB):** all redb tables (see DB Schema below), CBOR values
 
 ---
 
@@ -339,7 +344,9 @@ Opening: `Db::open(path)` — pre-open backup (.redb.bak), `DatabaseBuilder` wit
 | `cluster_state` | `"cluster_state"` | CBOR(`StoredClusterState`) | Singleton: cluster state |
 | `file_holders` | `&[u8; 40]` (file_id_BE8 ∥ holder_id) | `u32` (symbol_count) | Index file → holders |
 | `holder_files` | `&[u8; 40]` (holder_id ∥ file_id_BE8) | `u32` (symbol_count) | Index holder → files |
-| `system_state_blobs` | `&[u8; 32]` (owner identity_pub) | CBOR(`SystemStateBlobRecord`) | Encrypted DB snapshots from peers (1 per owner, TTL 365 days) |
+| `mailbox_entries` | `&[u8; 49]` (target ∥ msg_id ∥ class) | CBOR(`MailboxEntry`) | Stored mailbox entries (postman side) |
+| `mailbox_bytes_by_target` | `&[u8; 32]` (target identity_pub) | `u64` | Per-target mailbox byte accounting (quota) |
+| `ss_blocks` | `&[u8; 32]` (block_id) | `u32` (generation) | Marks which source blocks are SystemState replicas |
 | `restore_served` | `&[u8; 32]` (requester identity_pub) | CBOR(`u64`) | Bytes served per requester (escrow accounting) |
 | `device_trust` | `&[u8; 32]` (device_id) | CBOR(`DeviceTrustRecord`) | Per-device trust |
 | `master_trust` | `&[u8; 32]` (master identity_pub) | CBOR(`MasterTrustRecord`) | Aggregated cluster trust |
@@ -503,7 +510,7 @@ If the source files are gone, the worker cannot rebuild and the placement stays 
 - `build_sync_request(peer_identity)` → `ClusterSyncRequestMsg` with cursor
 - `process_sync_response(peer_identity, response)` → applies events, updates cursor
 - `handle_sync_request(request)` → returns events from the event log, checks membership
-- `build_revocation_broadcast(revocation, device_cert)` → payload for relay board
+- `build_revocation_broadcast(revocation, device_cert)` → `RevocationBroadcast` payload for the `Revocation` mailbox class
 
 **Cursor persistence:** sync cursors are stored in `ClusterState` (in-memory) and persisted to the `CLUSTER_STATE` redb table via `ClusterState::update_sync_cursor`.
 
@@ -511,32 +518,22 @@ Incoming request validation: `device_id` must be in the cluster and not revoked.
 
 ---
 
-### relay
+### mailbox
 
-`RelayManager` — epidemic gossip board for deferred messaging.
+`MailboxRouter` — directed store-and-forward bus for deferred messaging (replaced the epidemic relay board; see [protocol.md §1.5](protocol.md), [ADR-004](decisions/ADR-004-mailbox-bus.md)).
 
-**Model:** each node maintains an append-only board file. When two peers connect, they exchange board entries. Messages propagate hop=0 → hop=1 → hop=2 and are not relayed further.
+**Model:** every entry is addressed to one recipient's master identity. The peers Kademlia-closest to `SHA256(target_pub)` act as **postmen** and store entries on the target's behalf. No hops, no gossip, no per-message ECDH — Noise IX + a per-payload Ed25519 signature provide confidentiality and authenticity.
 
-**Entry types:**
-- `Broadcast` — open payload (PeerAnnounce, RevocationBroadcast)
-- `Directed` — encrypted for a specific recipient (ECDH ChaCha20-Poly1305)
+**Router methods** (`routing.rs`):
+- `publish(target, entry)` — deposit with the `MAILBOX_WRITE_FANOUT` (30) closest postmen; durable once ≥1 Acks
+- `poll(my_master_pub, since)` — fetch from the `MAILBOX_READ_FANOUT` (300) closest postmen, dedup by msg_id
+- `dr_walk_for_pointer(my_master_pub)` — expanding-batch [100, 300, 1000] search for the freshest signed `SelfPointer` (disaster recovery)
 
-**Entry lifecycle:**
-```
-post_broadcast / post_directed_with_key  → hop=0, write to disk
-process_remote_entries (from peer):
-  → dedup by msg_id
-  → TTL check (RELAY_TTL_SECS = 7 days)
-  → hop check (MAX_RELAY_HOP = 2)
-  → verify Ed25519 signature
-  → relay_copy: hop+1, append
-scan_for_self → decrypt directed → inbound_tx channel
-prune: TTL + size limits (MAX_BOARD_ENTRIES=2000, MAX_BOARD_SIZE_BYTES=8MB)
-```
+**Postman side** (`processor/mailbox`): `handle_mailbox_store` runs the candidate-set `should_store` check then persists (idempotent on duplicate msg_id); `handle_mailbox_fetch` returns entries only to their own target.
 
-**Board file:** append-only, periodically rewritten during prune.
+**Cleanup loops** (`cleanup/`): `run_mailbox_ttl_sweep` (every 6h / time_scale) deletes expired entries for all classes; `run_mailbox_self_cleanup` drops non-high-trust entries for targets this node no longer serves. `SelfPointer` is high-trust — only TTL removes it.
 
-**Async run():** listens on `SyncTrigger` (incoming connections), periodic prune timer.
+**Poll loop** (`poll.rs`): `poll_interval_secs` (1h / time_scale) fetches own mail and dispatches each entry by class to its handler.
 
 ---
 
@@ -559,12 +556,12 @@ DaemonState {
 3. Start SwarmHandle (libp2p swarm + event loop)
 4. Spawn Processor (message router)
 5. Spawn BackupCoordinator, RestoreCoordinator, WorkPipeline (+ thin RepairAgent)
-6. Spawn Scheduler (PoS), RelayManager, ClusterSyncManager
-7. Spawn SystemState periodic push (interval = 6h / time_scale, min 60s)
+6. Spawn Scheduler (PoS), MailboxRouter poll + cleanup loops, ClusterSyncManager
+7. Spawn SystemState periodic self-pointer publish (interval = 6h / time_scale, min 60s)
 8. Start Watcher (fs-notify) for configured directories
 9. Start web_api (HTTP + token API for CLI and web UI)
 10. Load peers from DB → known_peers in network
-11. Bootstrap: connect to bootstrap peers, join Kademlia DHT + relay board
+11. Bootstrap: connect to bootstrap peers, join Kademlia DHT
 
 ---
 
@@ -572,9 +569,9 @@ DaemonState {
 
 `Processor` — thin message router. Receives incoming connections from network, dispatches messages to appropriate handlers.
 
-**Dispatch table (26 message types):**
+**Dispatch table:**
 - `Handshake` → auth (handled by network accept loop)
-- `PeerAnnounce` → upsert peer, add to known_peers, store addrs
+- `PeerAnnounce` → upsert peer, add to known_peers, store addrs + keys
 - `PosHashChallenge` → compute the chain hash over held symbols, send PosHashResponse or PosHashNack
 - `PosHashResponse` → verify the chain hash, update placement status + trust
 - `PosHashNack` → mark placement Lost, trigger repair
@@ -584,16 +581,15 @@ DaemonState {
 - `SymbolTransfer` → write symbols to disk, update HoldingRecord
 - `SymbolStored` → log confirmation
 - `RestoreRequest` → escrow check → read symbols → RestoreResponse or RestoreDenied
-- `BoardSync` → relay_sync_tx (forwarded to RelayManager)
 - `ClusterSync*` → forwarded to ClusterSyncManager
 - `Delete/CancelDelete` → update HoldingRecord status
 - `StorageWarning/SymbolDropped/SymbolDropNotice` → log, update placements
-- `SystemStateBackup` → store blob (known peers only) → SystemStateAck
-- `SystemStateRequest` → return stored blob → SystemStateResponse
-- `SystemStateAck/Response` → log / forward to DR
+- `MailboxStoreRequest` → `should_store` check → persist entry → Ack / Reject
+- `MailboxFetchRequest` → return this requester's own entries
+- `MailboxStoreResponse/MailboxFetchResponse` → routed to the MailboxRouter's publish/poll waiters
 - `Ack` → generic ack for request-response streams
 
-(PeerDiscovery messages were removed in ε.2 — peers are found via the Kademlia DHT and the relay board.)
+Deferred payloads (PoS, Delete, DropNotice, Revocation, SelfPointer) arrive as `MailboxFetchResponse` entries and are dispatched by the mailbox poll loop, not here. (PeerDiscovery messages were removed in ε.2 — peers are found via the Kademlia DHT.)
 
 **On new connection (PeerAuthenticated event):** upserts PeerRecord, sends PeerAnnounce, auto-adds cluster device.
 
@@ -790,6 +786,5 @@ process_sync_response():
 | `max_version_age` | 90 days | Maximum age of old versions |
 | `parallel_holders` | 5 | Parallel connections during restore |
 | `escrow_k_factor` | 7.0 | `DEFAULT_ESCROW_K_FACTOR` — GB·days required per 1 GB restore credit |
-| `prune_interval_secs` | 3600 | Relay board cleanup interval |
 
 All numeric protocol parameters are defined in `viaticum-core/src/constants.rs`.

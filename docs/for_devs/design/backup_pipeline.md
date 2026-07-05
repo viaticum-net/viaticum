@@ -139,8 +139,9 @@ for each source_block:
       try direct_connection(holder):
         send(bound)                        // 64 KB
       fail:
-        queue symbol_offer via epidemic relay
-        // holder picks up the offer → direct connection later → send
+        skip this holder for now — the symbol transfer needs the holder online
+        // not offered via the mailbox (heavy data ≠ deferred): a later placement
+        // round retries, or repair re-places the symbols on an online holder
 ```
 
 ---
