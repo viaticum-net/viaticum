@@ -1,26 +1,28 @@
-//! `sim_diag` — god-view diagnostic for the "parasite wins" puzzle (NOT a gate).
+//! `sim_diag` — god-view diagnostic for the dynamic 4R world (NOT a gate).
 //!
-//! The experiment harness reports OUTCOMES (R_actual by archetype) but is BLIND to
-//! the mechanism internals that explain them. This binary opens that box by
-//! tabulating, on a contended run, three god-view diagnostics:
-//!   1. φ (free-ratio) distribution by archetype — is contention BIMODAL (a filled
-//!      always-on core + an under-filled periphery)?
-//!   2. WHERE each owner-archetype's ALIVE symbols live — the holder-archetype
-//!      distribution + mean holder φ + mean holder base-uptime. This directly tests
-//!      the hypothesis "free-rider data just lives on OTHER free-riders" (fragile,
-//!      self-contained, not subsidised by the cooperative core).
-//!   3. Eviction counts by owner-archetype (from the god-view eviction log).
+//! Sections 1-5 open the "parasite wins" box on a contended run (φ distribution,
+//! where symbols live, per-pair reciprocity, drop discrimination, truthful durability).
+//! Section 6 is the world-v2 §9 "живая сеть" (living network) instrument: the share-A>0
+//! trajectory, concentration, newcomer-entry chain vs the θ_p/λ prediction, the
+//! preemption counter, and a Sybil sanity read.
 //!
-//! Headroom regime via `block_volume` alone (floor = blocks(3)×20 = 60 gb < lendable
-//! end-state ≈72 gb at the 0.62 own-ceiling) — reproduces the parasite-wins regime
-//! WITHOUT touching the OWN_DATA_DISK_FRACTION const.
+//! Usage: `sim_diag [seed] [n_nodes] [block_volume] [reciprocal 0|1] [world v1|v2]
+//! [preempt off|θ_p] [recalibrated 0|1]` — all positional, all optional:
 //!
-//! Usage: `cargo run -p viaticum-sim --bin sim_diag [seed] [n_nodes] [block_volume]`
+//! * `seed` — run seed (default 0x00E15EED).
+//! * `n_nodes` — node count (default 200).
+//! * `block_volume` — gb per block (default 20 ⇒ 4 gb/symbol).
+//! * `reciprocal` — 1/default = canon retained_depth ranking; 0 = pure surface.
+//! * `world` — `v2` (default) = incremental arrival + bandwidth `U` + cream (the living
+//!   network); `v1` = one-shot залп, `U=∞`, no cream (the degenerate baseline, for A/B).
+//! * `preempt` — `off` disables preemption; a number sets `θ_p` (default 0.2).
+//! * `recalibrated` — 1 = recalibrated RetentionPrior (ceiling φ_O 0.62→0.90, A.7);
+//!   0/default = RetentionPrior::default(). Measured separately.
 
 use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
-use viaticum_sim::sim_dynamic::engine::{DynParams, step};
-use viaticum_sim::sim_dynamic::generator::Archetype;
 use viaticum_sim::sim_dynamic::build_world;
+use viaticum_sim::sim_dynamic::engine::{DynParams, step};
+use viaticum_sim::sim_dynamic::generator::{Archetype, DAYS_PER_TICK, World};
 
 const ARCHES: [Archetype; 6] = [
     Archetype::Reliable,
@@ -50,41 +52,92 @@ fn mean(xs: &[f64]) -> f64 {
     }
 }
 
+/// Gini coefficient of a non-negative distribution (0 = perfectly even, →1 = all mass on
+/// one). Returns NaN for an empty / all-zero distribution.
+fn gini(xs: &[f64]) -> f64 {
+    let n = xs.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    let sum: f64 = xs.iter().sum();
+    if sum <= 0.0 {
+        return f64::NAN;
+    }
+    let mut v = xs.to_vec();
+    v.sort_by(|a, b| a.total_cmp(b));
+    // G = (2·Σ i·x_i)/(n·Σ x_i) − (n+1)/n  (1-based i).
+    let mut weighted = 0.0;
+    for (i, &x) in v.iter().enumerate() {
+        weighted += (i as f64 + 1.0) * x;
+    }
+    (2.0 * weighted) / (n as f64 * sum) - (n as f64 + 1.0) / n as f64
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
-    let seed: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0x00E1_5EED);
+    let seed: u64 = args
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0x00E1_5EED);
     let n_nodes: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(200);
     let block_volume: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(20.0);
-    // 4th arg: reciprocity-aware placement (canon retention forecast, эталон §1 main
-    // lever). "0" = pure-surface baseline; "1"/default = canon retained_depth ranking.
     let reciprocal_placement: bool = args
         .next()
         .map(|s| s != "0" && !s.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
-    // 5th arg: §2 preemptive-accept margin (g_ho units). "off" = preemption DISABLED
-    // (the old freeze-on-contention baseline); a number = the margin; default = model.
-    let preempt_margin: f64 = match args.next() {
-        Some(s) if s.eq_ignore_ascii_case("off") => f64::NEG_INFINITY,
-        Some(s) => s.parse().unwrap_or_else(|_| DynParams::default().preempt_margin),
-        None => DynParams::default().preempt_margin,
+    // World preset (§9 A/B): v1 = one-shot залп + U=∞ + no cream; v2 = living network.
+    let world_v2: bool = match args.next().as_deref() {
+        Some("v1") | Some("V1") => false,
+        _ => true, // "v2"/default
     };
+    // Preemption: "off" disables; a number sets θ_p.
+    let preempt_theta: f64 = match args.next() {
+        Some(s) if s.eq_ignore_ascii_case("off") => f64::NEG_INFINITY,
+        Some(s) => s
+            .parse()
+            .unwrap_or_else(|_| DynParams::default().preempt_theta),
+        None => DynParams::default().preempt_theta,
+    };
+    let recalibrated: bool = args
+        .next()
+        .map(|s| s != "0" && !s.eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
 
+    let base = DynParams::default();
     let params = DynParams {
         block_volume,
         reciprocal_placement,
-        preempt_margin,
-        ..DynParams::default()
+        preempt_theta,
+        recalibrated_retention: recalibrated,
+        // World preset.
+        incremental: world_v2,
+        bandwidth_u: if world_v2 {
+            base.bandwidth_u
+        } else {
+            f64::INFINITY
+        },
+        cream_enabled: world_v2,
+        ..base
     };
-    println!("[reciprocal_placement = {reciprocal_placement}  preempt_margin = {preempt_margin}]");
+    println!(
+        "[world = {}  reciprocal = {reciprocal_placement}  preempt θ_p = {preempt_theta}  \
+         recalibrated_prior = {recalibrated}  U = {}  cream = {}]",
+        if world_v2 {
+            "v2 (living)"
+        } else {
+            "v1 (one-shot)"
+        },
+        params.bandwidth_u,
+        params.cream_enabled,
+    );
     let prior = SurfacePrior::default();
     let policy = PlacementPolicy::default();
 
     let mut world = build_world(n_nodes, &params, seed);
     let nn = world.nodes.len();
 
-    // Helper: over all ALIVE symbols, (count, share with reciprocal A=g_ho>0, total
-    // alive holdings volume). Tests "does reciprocity BUILD over time or freeze flat?"
-    let snapshot = |w: &viaticum_sim::sim_dynamic::generator::World| -> (usize, f64, f64) {
+    // Over all ALIVE symbols: (count, share with reciprocal A=g_ho>0, total alive vol).
+    let snapshot = |w: &World| -> (usize, f64, f64) {
         let mut total = 0usize;
         let mut a_pos = 0usize;
         let mut vol = 0.0;
@@ -108,23 +161,26 @@ fn main() {
         (total, share, vol)
     };
 
-    // ~130 ticks (Regime-1 fill + Regime-2 steady) — matches the experiment horizon.
+    // ~130 ticks — the experiment horizon. Track the share-A>0 TRAJECTORY (§9 gate a).
     println!("=== sim_diag time-series (n={nn} block_volume={block_volume}) ===");
     println!(
-        "  {:>4}  {:>10} {:>12}  {:>11} {:>11}",
-        "tick", "alive syms", "alive vol gb", "share A>0", "evicts cum"
+        "  {:>4}  {:>10} {:>12}  {:>11} {:>10} {:>9} {:>7}",
+        "tick", "alive syms", "alive vol gb", "share A>0", "present", "evicts", "preempt"
     );
     for t in 0..130u64 {
         step(&mut world, &params, &prior, &policy);
         if (t + 1) % 20 == 0 || t == 9 {
             let (cnt, share, vol) = snapshot(&world);
+            let present = world.nodes.iter().filter(|n| n.present).count();
             println!(
-                "  {:>4}  {:>10} {:>12.0}  {:>10.1}% {:>11}",
+                "  {:>4}  {:>10} {:>12.0}  {:>10.1}% {:>10} {:>9} {:>7}",
                 t + 1,
                 cnt,
                 vol,
                 share,
-                world.eviction_log.len()
+                present,
+                world.eviction_log.len(),
+                world.preempt_count,
             );
         }
     }
@@ -163,12 +219,12 @@ fn main() {
     }
 
     // --- (2) WHERE alive symbols live: holder-archetype distribution per owner-archetype ---
-    // For each owner-archetype, over ALL its alive symbols across the network, count
-    // how many sit on a holder of each archetype, and the mean holder φ / base-uptime.
     println!("\n-- (2) WHERE alive symbols live (holder-archetype share per owner-archetype) --");
-    for &owner_a in &[Archetype::Reliable, Archetype::Freeloader, Archetype::Hoarder] {
-        // Collect (holder_archetype, holder_phi, holder_uptime) for every alive symbol
-        // whose OWNER is of archetype owner_a.
+    for &owner_a in &[
+        Archetype::Reliable,
+        Archetype::Freeloader,
+        Archetype::Hoarder,
+    ] {
         let mut by_holder: Vec<(Archetype, f64, f64)> = Vec::new();
         for h in 0..n {
             if !world.nodes[h].present {
@@ -211,16 +267,7 @@ fn main() {
         }
     }
 
-    // --- (2b) The ACTUAL eviction key: capital[owner][holder].g_ho ("owner served
-    // holder") over alive symbol placements, by owner-archetype. This is the value
-    // eviction_order ranks owners ASCENDING by — low g_ho should be dropped FIRST.
-    // If Freeloader g_ho is NOT the lowest, that explains why it is not evicted.
-    // For each alive symbol (O's data on holder h, so B>0 by definition), read BOTH
-    // per-pair quantities from the N×N capital matrix:
-    //   B = g_oh(O,h) = capital[O][h].g_oh = "h holds O's blocks" (mine at his place)
-    //   A = g_ho(O,h) = capital[O][h].g_ho = "O holds h's blocks" (his at my place) = the eviction key
-    // Reciprocal pair ⇔ A>0. If the harness tracked an AGGREGATE, A could not vary
-    // per (O,h); the per-pair joint below proves it is a genuine N×N matrix.
+    // --- (2b) per-pair reciprocity over ALIVE symbols (B=h-holds-O, A=O-holds-h) ---
     println!("\n-- (2b) per-pair reciprocity over ALIVE symbols (B=h-holds-O, A=O-holds-h) --");
     println!(
         "  {:<10} {:>8}  {:>8} {:>8}  {:>11}  {:>11}",
@@ -234,8 +281,8 @@ fn main() {
             }
             for s in world.nodes[h].holdings.iter().filter(|s| s.alive) {
                 if world.nodes[s.owner].archetype == owner_a {
-                    let b = world.capital[s.owner][h].g_oh; // h holds O
-                    let a = world.capital[s.owner][h].g_ho; // O holds h (eviction key)
+                    let b = world.capital[s.owner][h].g_oh;
+                    let a = world.capital[s.owner][h].g_ho;
                     ab.push((a, b));
                 }
             }
@@ -258,12 +305,7 @@ fn main() {
         );
     }
 
-    // --- (2c) DECISIVE mechanism test: do drops concentrate on g_ho≈0 placements? ---
-    // The eviction ranks owners ascending by g_ho, so if the mechanism bites, the
-    // DROPPED placements should be far MORE g_ho≈0 than the live population. If drops'
-    // share-g_ho>0 ≈ the population's share A>0, the relay is NOT discriminating by
-    // reciprocity (it is dropping g_ho>0 and g_ho=0 placements alike — the signal is
-    // drowned in the tied-at-zero crowd).
+    // --- (2c) do drops concentrate on g_ho≈0 placements? ---
     {
         let drops = world.eviction_log.len();
         let drops_recip = world
@@ -293,9 +335,6 @@ fn main() {
             mean_drop_g,
             pop_share
         );
-        println!(
-            "  → drops' share-g_ho>0 MUCH below population ⇒ relay protects reciprocal data (mechanism works, sparsity is the limit)"
-        );
     }
 
     // --- (3) Eviction counts by owner-archetype (whose data got dropped) ---
@@ -310,8 +349,6 @@ fn main() {
     }
     let total_ev = world.eviction_log.len().max(1);
     for (i, &a) in ARCHES.iter().enumerate() {
-        // Normalise per node-count so we can compare drop-RATE, not raw (Reliable has
-        // 8× more nodes than Freeloader).
         let node_cnt = (0..n)
             .filter(|&j| world.nodes[j].archetype == a)
             .count()
@@ -325,44 +362,10 @@ fn main() {
         );
     }
 
-    // --- (4) NODE-INDEX tie-break artifact check: when g_ho ties (98% at 0), eviction
-    // breaks ties by ascending owner node-index. population_mix is block-ordered
-    // (Reliable=low indices, Freeloader=high), so if eviction is index-biased the
-    // evicted owners cluster at LOW indices regardless of reciprocity. ---
-    let evicted_idx: Vec<f64> = world
-        .eviction_log
-        .iter()
-        .filter(|ev| ev.owner < n)
-        .map(|ev| ev.owner as f64)
-        .collect();
-    let all_owner_idx: Vec<f64> = (0..n).map(|i| i as f64).collect();
-    println!("\n-- (4) node-index tie-break artifact check --");
-    println!(
-        "  mean node-index of EVICTED owner = {:.1}   (vs mean of all nodes = {:.1}, n={})",
-        mean(&evicted_idx),
-        mean(&all_owner_idx),
-        n
-    );
-    let low_half = world
-        .eviction_log
-        .iter()
-        .filter(|ev| ev.owner < n / 2)
-        .count();
-    println!(
-        "  evictions hitting LOW-index half (0..{}) = {:.1}%   (uniform would be ~50%)",
-        n / 2,
-        100.0 * low_half as f64 / total_ev as f64
-    );
-
-    // --- (5) TRUTHFUL durability by owner-archetype (god-view, NO broken §5 logistic).
-    // The real pillar-1 question: does the parasite's data end up LESS durable? For each
-    // owner's block, count holders that CURRENTLY hold an alive symbol of it (recomputed
-    // god-view, not the placements list). Report mean alive-holders/block and the share
-    // of blocks UNDER-replicated (< k_eff alive) and LOST (0 alive). If reciprocity-
-    // eviction penalises the parasite, Freeloader/Hoarder should sit WORSE than Reliable.
+    // --- (5) TRUTHFUL durability by owner-archetype (FLOOR symbols only, §9.3 cream not counted) ---
     let k_eff = params.k_eff;
     println!(
-        "\n-- (5) TRUTHFUL durability by owner-archetype (alive holders/block; k_eff={k_eff}) --"
+        "\n-- (5) TRUTHFUL durability by owner-archetype (FLOOR alive holders/block; k_eff={k_eff}) --"
     );
     println!(
         "  {:<10} {:>7}  {:>11}  {:>13}  {:>9}",
@@ -375,13 +378,14 @@ fn main() {
                 continue;
             }
             for b in &world.nodes[o].own_blocks {
+                // FLOOR (non-cream) alive holders only — cream is not a durability guarantee.
                 let alive = (0..n)
                     .filter(|&h| {
                         world.nodes[h].present
                             && world.nodes[h]
                                 .holdings
                                 .iter()
-                                .any(|s| s.alive && s.owner == o && s.block == b.id)
+                                .any(|s| s.alive && !s.cream && s.owner == o && s.block == b.id)
                     })
                     .count();
                 counts.push(alive);
@@ -403,4 +407,200 @@ fn main() {
             100.0 * lost as f64 / blocks as f64
         );
     }
+
+    // --- (6) WORLD-v2 §9 "живая сеть" (living network) ---
+    print_section6(&world, &params);
+}
+
+/// Section 6 (world-v2 §9): share-A>0 final, concentration, newcomer-entry chain vs the
+/// θ_p/λ prediction, the preemption counter, and a Sybil sanity read.
+fn print_section6(world: &World, params: &DynParams) {
+    let n = world.nodes.len();
+    println!("\n=== (6) WORLD-v2 §9 living-network diagnostics ===");
+
+    // (6a) final share A>0 over alive symbols (the P8 gate-a headline).
+    let mut total = 0usize;
+    let mut a_pos = 0usize;
+    for h in 0..n {
+        if !world.nodes[h].present {
+            continue;
+        }
+        for s in world.nodes[h].holdings.iter().filter(|s| s.alive) {
+            total += 1;
+            if world.capital[s.owner][h].g_ho > 1e-12 {
+                a_pos += 1;
+            }
+        }
+    }
+    let share = if total > 0 {
+        100.0 * a_pos as f64 / total as f64
+    } else {
+        0.0
+    };
+    println!(
+        "  (6a) FINAL share A>0 (reciprocal alive symbols) = {share:.1}%   over {total} alive symbols"
+    );
+
+    // (6b) concentration: symbols per active (owner,holder) pair + Gini of holdings/holder.
+    let mut pair_counts: std::collections::BTreeMap<(usize, usize), usize> =
+        std::collections::BTreeMap::new();
+    let mut holder_load: Vec<f64> = vec![0.0; n];
+    for (h, node) in world.nodes.iter().enumerate() {
+        if !node.present {
+            continue;
+        }
+        for s in node.holdings.iter().filter(|s| s.alive) {
+            *pair_counts.entry((s.owner, h)).or_insert(0) += 1;
+            holder_load[h] += 1.0;
+        }
+    }
+    let mean_per_pair = if pair_counts.is_empty() {
+        f64::NAN
+    } else {
+        pair_counts.values().map(|&c| c as f64).sum::<f64>() / pair_counts.len() as f64
+    };
+    let present_load: Vec<f64> = (0..n)
+        .filter(|&i| world.nodes[i].present)
+        .map(|i| holder_load[i])
+        .collect();
+    println!(
+        "  (6b) concentration: active pairs = {}   mean symbols/pair = {:.2}   Gini(holdings/holder) = {:.3}",
+        pair_counts.len(),
+        mean_per_pair,
+        gini(&present_load),
+    );
+
+    // (6c) newcomer-entry chain (nodes joined after t=0): joined → first_earned_g →
+    // first_own_accept, compared with the θ_p/λ prediction.
+    let lambda_dt = params.lambda * DAYS_PER_TICK;
+    let pred_ticks = if params.preempt_theta.is_finite() && params.preempt_theta >= 0.0 {
+        params.preempt_theta / lambda_dt
+    } else {
+        f64::NAN
+    };
+    let mut earn_gap: Vec<f64> = Vec::new(); // first_earned_g − joined
+    let mut serve_to_accept: Vec<f64> = Vec::new(); // first_own_accept − first_earned_g
+    let mut joined_after0 = 0usize;
+    let mut ever_earned = 0usize;
+    let mut ever_own = 0usize;
+    let mut accept_before_earn = 0usize; // own data accepted BEFORE any earned g (free slot)
+    for i in 0..n {
+        if world.nodes[i].joined_tick == 0 {
+            continue;
+        }
+        joined_after0 += 1;
+        let j = world.nodes[i].joined_tick;
+        if let Some(e) = world.first_earned_g[i] {
+            ever_earned += 1;
+            earn_gap.push(e.saturating_sub(j) as f64);
+            if let Some(o) = world.first_own_accept[i] {
+                ever_own += 1;
+                if o >= e {
+                    serve_to_accept.push((o - e) as f64);
+                } else {
+                    accept_before_earn += 1; // entered via a FREE slot before serving
+                }
+            }
+        }
+    }
+    println!("  (6c) newcomer entry (nodes joined after t=0 = {joined_after0}):");
+    println!(
+        "       earned g (served someone) : {}/{} nodes, mean (first_earned_g − joined) = {:.2} ticks",
+        ever_earned,
+        joined_after0,
+        mean(&earn_gap)
+    );
+    println!(
+        "       own data accepted         : {}/{} nodes ({} entered via a FREE slot BEFORE earning g)",
+        ever_own, joined_after0, accept_before_earn
+    );
+    println!(
+        "       serve→accept gap          : mean {:.2} ticks over {} nodes that served THEN placed",
+        mean(&serve_to_accept),
+        serve_to_accept.len()
+    );
+    println!(
+        "       θ_p/λ prediction for the serve→accept gap = {:.2} ticks  (θ_p={:.3}, λ·dt={:.4})",
+        pred_ticks, params.preempt_theta, lambda_dt
+    );
+    // Small histogram of the serve→accept gap.
+    if !serve_to_accept.is_empty() {
+        let mut buckets = [0usize; 6]; // 0,1,2,3,4,5+
+        for &g in &serve_to_accept {
+            let b = (g as usize).min(5);
+            buckets[b] += 1;
+        }
+        print!("       serve→accept gap histogram [ticks]:");
+        for (b, &c) in buckets.iter().enumerate() {
+            let label = if b == 5 {
+                "5+".to_string()
+            } else {
+                b.to_string()
+            };
+            print!("  {label}:{c}");
+        }
+        println!();
+    }
+
+    // (6d) preemption counter (was ~0 in the degenerate "starved, not frozen" world).
+    println!("  (6d) preemptive swaps fired = {}", world.preempt_count);
+
+    // (6e) Sybil sanity: late-joining Freeloaders (zero-giving farm) must NOT enter their
+    // own data faster than late-joining Reliable (honest) newcomers.
+    let mut rel_entry: Vec<f64> = Vec::new();
+    let mut free_entry: Vec<f64> = Vec::new();
+    let mut rel_late = 0usize;
+    let mut free_late = 0usize;
+    let mut rel_got = 0usize;
+    let mut free_got = 0usize;
+    for i in 0..n {
+        if world.nodes[i].joined_tick == 0 {
+            continue;
+        }
+        let j = world.nodes[i].joined_tick;
+        match world.nodes[i].archetype {
+            Archetype::Reliable => {
+                rel_late += 1;
+                if let Some(o) = world.first_own_accept[i] {
+                    rel_got += 1;
+                    rel_entry.push(o.saturating_sub(j) as f64);
+                }
+            }
+            Archetype::Freeloader => {
+                free_late += 1;
+                if let Some(o) = world.first_own_accept[i] {
+                    free_got += 1;
+                    free_entry.push(o.saturating_sub(j) as f64);
+                }
+            }
+            _ => {}
+        }
+    }
+    println!("  (6e) Sybil sanity (late joiners; entry = first_own_accept − joined):");
+    println!(
+        "       Reliable   : {}/{} placed own data, mean entry = {:.2} ticks",
+        rel_got,
+        rel_late,
+        mean(&rel_entry)
+    );
+    println!(
+        "       Freeloader : {}/{} placed own data, mean entry = {:.2} ticks",
+        free_got,
+        free_late,
+        mean(&free_entry)
+    );
+    let rel_rate = if rel_late > 0 {
+        rel_got as f64 / rel_late as f64
+    } else {
+        f64::NAN
+    };
+    let free_rate = if free_late > 0 {
+        free_got as f64 / free_late as f64
+    } else {
+        f64::NAN
+    };
+    println!(
+        "       → honest entry-rate {:.2} vs zero-giving farm {:.2} (farm ≤ honest ⇒ Sybil-priced)",
+        rel_rate, free_rate
+    );
 }

@@ -109,6 +109,12 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
                 placements: Vec::new(),
             })
             .collect();
+        // World-v2 §9.1 incremental arrival: in the ONE-SHOT world (`incremental =
+        // false`) every node is live at t=0 (the old degenerate = infinite-bandwidth
+        // random graph). In the STREAM world a fraction `n0_frac` is live at t=0 and
+        // the rest join per a seeded schedule uniformly over `[1, T_join]`
+        // (T_join = join_horizon·t_join_frac). Deterministic: one salted draw per node.
+        let joined_tick = join_schedule(i, params, seed);
         nodes.push(Node {
             id: i as u64,
             archetype: arch,
@@ -123,8 +129,13 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
             addr_subnet: i as u32,
             master_byte: i as u8,
             evict_phase: EvictPhase::default(),
-            present: true,
-            joined_tick: 0,
+            // A not-yet-joined node starts ABSENT and is activated at its `joined_tick`
+            // by `engine::step`. Departure (churn) only fires on PRESENT nodes, so a
+            // node that is absent at tick T with `joined_tick == T` can only be a
+            // not-yet-joined node (never a departed one) — the activation is unambiguous
+            // without a separate "has joined" flag.
+            present: joined_tick == 0,
+            joined_tick,
         });
     }
     World {
@@ -138,8 +149,36 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
         served_regime1_snapshot: None,
         eviction_log: Vec::new(),
         ticks_with_eviction: 0,
+        first_earned_g: vec![None; n],
+        first_own_accept: vec![None; n],
+        preempt_count: 0,
     }
 }
+
+/// World-v2 §9.1 incremental-arrival schedule: the tick node `i` JOINS the network.
+///
+/// One salted uniform draw `r ∈ [0,1)` per node. If `r < n0_frac` the node is live at
+/// t=0 (the `~n0` bootstrap set); otherwise it joins uniformly over `[1, T_join]` where
+/// `T_join = round(join_horizon_ticks · t_join_frac)`. When `incremental = false`
+/// every node joins at t=0 (the one-shot world, for A/B). Deterministic in the seed.
+pub fn join_schedule(i: usize, params: &DynParams, seed: u64) -> u64 {
+    if !params.incremental {
+        return 0;
+    }
+    let r = Rng::derive(seed ^ JOIN_SALT, i as u64, 0, 0, 0).unit();
+    let n0 = params.n0_frac.clamp(0.0, 1.0);
+    if r < n0 {
+        return 0;
+    }
+    let t_join_max = (params.join_horizon_ticks as f64 * params.t_join_frac)
+        .round()
+        .max(1.0);
+    let frac = if n0 < 1.0 { (r - n0) / (1.0 - n0) } else { 0.0 };
+    1 + (frac * (t_join_max - 1.0)).round() as u64
+}
+
+/// Stable salt for the incremental-join RNG stream (kept off the disk/PoS streams).
+const JOIN_SALT: u64 = 0x101_7A17_3011_1EDA;
 
 /// Stable salt for the world-build RNG (kept out of the PoS/online streams).
 const WORLD_SALT: u64 = 0x0B07_57AB_1E5E_EDED;
@@ -348,6 +387,9 @@ fn run_newcomer_probe(
         joined_tick: join_tick,
     });
     world.next_block_id.push(1);
+    // Grow the world-v2 §9 newcomer-trace vectors in lock-step with the node count.
+    world.first_earned_g.push(None);
+    world.first_own_accept.push(None);
 
     let mut t_boot_placed: Option<u64> = None;
     let mut t_boot_chosen: Option<u64> = None;

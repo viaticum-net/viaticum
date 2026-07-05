@@ -3,7 +3,9 @@
 //! This is the ONLY place ground-truth lives in the dynamic harness: the hidden
 //! [`Archetype`] (drives behaviour, NEVER a kernel input), the per-node disk /
 //! holdings / own-data state, and the per-`(owner, holder)` capital state the
-//! harness threads through `update_capital`.
+//! harness evolves by the A.1 leaky law inline (per-tick N² decay + on-challenge
+//! accrual, see `engine::pos_and_capital`; the kernel `update_capital` is unit-tested
+//! separately, not called from the harness loop).
 //!
 //! Anti-oracle (design §1, §10): `archetype` is god-view only — it gates BEHAVIOUR
 //! (a Hoarder really rejects offers, a Freeloader really withholds), and the
@@ -33,8 +35,8 @@ pub enum Archetype {
     Seasonal,
     /// Unpredictable seeded ON/OFF (~50%), but reliable while online.
     Nomad,
-    /// High uptime, but accepts ≤0.2 and quickly evicts others' data
-    /// (exploits its position — takes a slot, stores little).
+    /// High uptime, but accepts ≤0.2 (exploits its position — advertises a normal disk
+    /// but takes few holdings) and departs at a higher rate (aggression → churn, §9.4).
     Hoarder,
     /// Takes, does not give: accepts ≤0.1, near-zero outbound service.
     Freeloader,
@@ -64,10 +66,11 @@ impl Archetype {
         }
     }
 
-    /// Eviction aggression (design §10.A): the fraction of an alive holder's
-    /// retained-depth that this archetype shaves off — Hoarder/Freeloader drop
-    /// others' symbols early, so their EFFECTIVE keep-depth is reduced. Cooperative
-    /// archetypes keep what they accepted (aggression 0).
+    /// Eviction aggression ∈ [0,1] (world-v2 §9.4). Post-§3-fix this NO LONGER touches
+    /// the PoS outcome (the old `retained_edge` shave is gone — PoS-pass ⟺ alive ∧
+    /// online). Aggression now lives ONLY in churn: an aggressive archetype
+    /// (Hoarder/Freeloader) departs at a higher rate, so its held symbols die sooner.
+    /// Cooperative archetypes have aggression 0 (base churn, no PoS effect).
     pub fn evict_aggression(self) -> f64 {
         match self {
             Archetype::Hoarder => 0.7,
@@ -297,9 +300,10 @@ pub fn online(archetype: Archetype, node_id: u64, tick: u64, run_seed: u64) -> b
 /// (which uses a different first key — the owner index).
 const ONLINE_TAG: u64 = 0x0C0A_1E11_0A1D_0E11;
 
-/// Per-`(owner, holder)` capital state the harness threads through `update_capital`
-/// (design §10.C). The kernel's `update_capital` is one Euler step; the STATE
-/// (the running `G` and the recent-outcome window) lives here.
+/// Per-`(owner, holder)` capital state the harness evolves by the A.1 leaky law
+/// inline (design §10.C): per-tick N² decay `g ← g·(1−λΔt)` + on-challenge accrual
+/// `+v_conf·Δt` in `engine::pos_and_capital`. The STATE (running `G`, recent-outcome
+/// window) lives here; the kernel `update_capital` (one Euler step) is unit-tested only.
 #[derive(Debug, Clone)]
 pub struct PairCapital {
     /// `G(O←h)`: this holder's service TO the owner (leaky integral of PoS-confirmed
@@ -371,6 +375,13 @@ pub struct HeldSymbol {
     /// God-view: is this symbol still alive on the holder? Set false when the
     /// holder evicts it OR when the holder leaves the network (churn).
     pub alive: bool,
+    /// God-view: is this a CREAM (over-the-floor) symbol (world-v2 §9.3 / A.11)?
+    /// Cream symbols are placed with the owner's LEFTOVER per-tick bandwidth once the
+    /// block's `n_symbols` FLOOR is met; they are NOT counted in the floor-durability
+    /// metric and their death does NOT trigger repair (the cream-no-mandatory-repair
+    /// invariant). A cream symbol is the entry channel for a new pair: a stranger with
+    /// an empty disk can be handed cream even before it has earned reciprocity.
+    pub cream: bool,
 }
 
 /// One of an owner's OWN data blocks to back up (god-view).
@@ -392,6 +403,10 @@ pub struct OwnBlock {
 pub struct BlockPlacement {
     /// God-view holder node index.
     pub holder: usize,
+    /// Whether this placement is a CREAM (over-the-floor) symbol (world-v2 §9.3).
+    /// Mirrors [`HeldSymbol::cream`]; the floor-vs-cream split lets repair count only
+    /// FLOOR placements toward `n_symbols` (cream deaths never trigger repair).
+    pub cream: bool,
 }
 
 /// A node in the dynamic world — god-view state.
@@ -502,6 +517,20 @@ pub struct World {
     /// Count of ticks on which ≥1 eviction fired anywhere in the network (design §E /
     /// §A acceptance: the % of ticks with eviction firing is a contention signal).
     pub ticks_with_eviction: u64,
+    /// World-v2 §9 newcomer-entry trace, indexed by node. `first_earned_g[i]` = the
+    /// FIRST tick node `i` earned reciprocity as a HOLDER (its `g_ho` with some peer
+    /// first became > 0, i.e. it served someone and passed PoS). `None` until then.
+    /// The newcomer-entry chain (§9 metric) is `joined_tick → first_earned_g →
+    /// first_own_accept`; the middle→last gap is the θ_p/λ prediction.
+    pub first_earned_g: Vec<Option<u64>>,
+    /// World-v2 §9 newcomer-entry trace, indexed by node: the FIRST tick node `i` had
+    /// one of its OWN symbols accepted by any holder. `None` until then.
+    pub first_own_accept: Vec<Option<u64>>,
+    /// World-v2 §9 counter: how many times a PREEMPTIVE swap fired (a contended holder
+    /// admitted a higher-`g_ho` owner by displacing its least-reciprocal victim, §2 /
+    /// A.12-2). The bootstrap-world value was ~0 ("starved, not frozen"); this counts
+    /// whether the world-v2 physics lets preemption actually engage.
+    pub preempt_count: usize,
 }
 
 /// One god-view eviction event (design §D.1 drop-ranking / §E observability).
