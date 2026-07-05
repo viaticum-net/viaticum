@@ -9,6 +9,7 @@ __pycache__/
 # Claude Code workflow / agent state
 .claude/worktrees/
 .claude/scheduled_tasks.lock
+.claude/agents
 
 # Internal AI-workflow doc (locally only)
 CLAUDE.md
