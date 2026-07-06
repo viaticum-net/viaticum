@@ -212,6 +212,9 @@ fn probe_dial(dial: Dial, seed: u64) -> DialResult {
         k_eff,
         tau: 30.0, // = observed τ0 (in-sample ⇒ surface route non-degenerate)
         r_target: 0.99,
+        // Unused here: SIM-R1 calls estimate_block_survival_per_symbol, not place;
+        // r_min only feeds the A.13 credit cap inside place().
+        r_min: 0.5,
     };
 
     let bottom = 0usize; // lowest-ι rung

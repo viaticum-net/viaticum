@@ -433,7 +433,18 @@ impl Default for CreditPolicy {
     }
 }
 
-/// Credit limit `L(G, V_dem)` for a pair.
+/// Credit limit `L(G, V_dem)` for a pair — the CLOSED-FORM APPROXIMATION.
+///
+/// **This is a documented approximation of the canonical surface read
+/// [`credit_limit_from_surface`] (A.13 / decision_model §7), valid under the default
+/// prior only.** The canonical definition is `L(O→h) = max{V : r̂_h(V, T_horizon) ≥
+/// r_min(ι)}` — the largest volume at which the holder still meets the required
+/// reliability on the horizon, read straight off the surface. The closed form below
+/// captures the same SHAPE (`L ≥ V_dem`, ratcheting smoothly with proven capital)
+/// without a surface inversion; when using it, `g_ref` should be read in units of
+/// `g*(V_dem)` (the steady-state capital of retaining `V_dem`), NOT the bare `1.0`
+/// default. Kept because it is cheap and self-documenting; `place` uses the exact
+/// surface read, not this. (Grep-verified 2026-07-06: zero production/sim consumers.)
 ///
 /// Guarantees `L ≥ V_dem` (W4: you may always be trusted up to the largest barrel
 /// you have proven). The headroom above `V_dem` ratchets up ONLY with proven
@@ -460,6 +471,71 @@ pub fn credit_limit(g: f64, v_dem: f64, policy: &CreditPolicy) -> f64 {
     };
 
     v_dem * (1.0 + margin * confidence)
+}
+
+/// Number of bisection halvings for the surface credit read. A FIXED count (no
+/// data-dependent loop bound) so two runs are byte-identical — determinism is
+/// load-bearing here (the kernel drives a deterministic sim). 60 halvings shrink the
+/// `[0, v_max]` bracket by `2⁻⁶⁰ ≈ 9e-19` of its width, far below any meaningful
+/// volume, so the returned `L` is exact for every practical purpose.
+const CREDIT_SURFACE_BISECTION_ITERS: u32 = 60;
+
+/// Credit limit `L(O→h)` READ FROM THE RELIABILITY SURFACE — the canonical A.13 /
+/// decision_model §7 definition:
+///
+/// ```text
+/// L(O→h) = max{ V ∈ [0, v_max] : r̂_h(V, t_horizon) ≥ r_min }
+/// ```
+///
+/// the largest per-holder volume at which the holder still meets the required
+/// per-holder reliability `r_min` on the horizon `t_horizon`. The closed-form
+/// [`credit_limit`] is only a documented approximation of THIS read.
+///
+/// **Why a bisection inverts it exactly.** `r̂` from [`estimate_surface`] is MONOTONE
+/// NON-INCREASING in `V` (the volume-hazard multiplier only rises with volume; the
+/// off-sample inflation only grows the excess `(V − v_dem)/v_dem`). So the feasible
+/// set `{V : r̂(V, t_horizon) ≥ r_min}` is an interval `[0, L]`, and bisecting on `V`
+/// with the invariant "`lo` feasible, `hi` infeasible" converges to `L`.
+///
+/// Boundary cases short-circuit: if even the ceiling `v_max` meets `r_min` the whole
+/// range is feasible (`L = v_max`); if `V = 0` already fails, the holder cannot be
+/// trusted with any volume at this floor (`L = 0`). Both `r_min` and `v_max` are
+/// clamped defensively.
+///
+/// Anti-oracle: inputs are the first-hand `obs` + the offline `prior` + the
+/// owner-private `r_min`/`t_horizon`/`v_max`. No hidden hazard/archetype is reachable
+/// — it flows entirely through [`estimate_surface`], which has no such field.
+pub fn credit_limit_from_surface(
+    obs: &FirstHandObs,
+    prior: &SurfacePrior,
+    r_min: f64,
+    t_horizon: f64,
+    v_max: f64,
+) -> f64 {
+    let r_min = r_min.clamp(0.0, 1.0);
+    let v_max = v_max.max(0.0);
+
+    // Ceiling already meets the floor ⇒ the whole range is feasible.
+    if estimate_surface(obs, prior, v_max, t_horizon).r_hat >= r_min {
+        return v_max;
+    }
+    // Even a vanishing volume fails the floor ⇒ no volume can be trusted.
+    if estimate_surface(obs, prior, 0.0, t_horizon).r_hat < r_min {
+        return 0.0;
+    }
+
+    // Bisect: `lo` always feasible (r̂ ≥ r_min), `hi` always infeasible (r̂ < r_min).
+    let mut lo = 0.0f64;
+    let mut hi = v_max;
+    for _ in 0..CREDIT_SURFACE_BISECTION_ITERS {
+        let mid = 0.5 * (lo + hi);
+        if estimate_surface(obs, prior, mid, t_horizon).r_hat >= r_min {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 // ============================================================
@@ -566,10 +642,22 @@ pub struct BlockReq {
     pub n_symbols: usize,
     /// Reconstruction threshold `k_eff`: this many surviving symbols suffice.
     pub k_eff: usize,
-    /// Horizon `τ` (days) the block must survive.
+    /// Horizon `τ` (days) the block must survive. Doubles as the credit horizon
+    /// `T_horizon` the per-holder cap (A.13) reads the surface at.
     pub tau: f64,
-    /// Target reliability `R_target(ι)` derived from owner-private importance.
+    /// Target reliability `R_target(ι)` derived from owner-private importance. This
+    /// is the BLOCK floor `place` places up to (decision_model §6 / A.10).
     pub r_target: f64,
+    /// Per-holder reliability floor `r_min(ι)` for the credit cap (A.13 /
+    /// decision_model §7): the minimum INDIVIDUAL reliability a holder must still
+    /// meet at `tau` to be handed one symbol. It is a SEPARATE, MUCH LOWER knob than
+    /// `r_target` — a single holder is never asked to reach the whole-block target;
+    /// that is what erasure across many holders is for. The per-holder credit limit
+    /// `L(O→h) = max{V : r̂_h(V, tau) ≥ r_min}` ([`credit_limit_from_surface`]) reads
+    /// off this floor, and [`place`] skips any candidate whose `L < volume_per_symbol`
+    /// (Р-5). Setting `r_min = 0` disables the credit cap (used where a scenario
+    /// isolates a different mechanism, e.g. SIM-6's §7 spread).
+    pub r_min: f64,
 }
 
 impl BlockReq {
@@ -1445,41 +1533,79 @@ pub fn estimate_block_survival_per_symbol(
     group_min_survival(&positions, req.k_eff)
 }
 
-/// Place a block: greedily select holders (best conservative surface first) until
-/// the block's `R̂(T)` reaches `req.r_target`, SPREAD ≤1 symbol per observable
-/// address bucket (§7).
+/// Headroom factor for the per-holder credit ceiling in [`place`]. The A.13 credit
+/// read [`credit_limit_from_surface`] needs a finite `v_max`; the cap only ever
+/// tests `L < volume_per_symbol`, so any ceiling `≥ volume_per_symbol` is decision-
+/// equivalent. We probe up to `4×` the per-symbol ask so the returned `L` also
+/// carries a little headroom (useful for diagnostics) without affecting the skip
+/// decision. A holder that reliably retains ≥ `volume_per_symbol` at `r_min` is
+/// uncapped; one that cannot is skipped (Р-5).
+const CREDIT_PLACE_HEADROOM: f64 = 4.0;
+
+/// Place a block: greedily add each symbol to the candidate that MAXIMISES the
+/// marginal gain in worst-case block survival `ΔR̂_wc` (A.10 / decision_model §6),
+/// SPREAD ≤1 symbol per observable address bucket (§7), under the per-holder credit
+/// cap `L(O→h) ≥ volume_per_symbol` (Р-5 / A.13). Stops once `R̂_wc ≥ req.r_target`.
 ///
-/// ## Greedy selection
+/// ## argmax marginal ΔR̂_wc (A.10)
 ///
-/// Candidates are sorted by descending per-symbol reliability `r_h =
-/// estimate_surface(...).r_hat` (best surface first — reciprocity-aware refinement
-/// is a later concern). Holders are added one at a time; after each addition,
-/// [`estimate_block_survival`] is recomputed on the selected set. Selection stops
-/// as soon as `R̂ ≥ req.r_target`.
+/// At every step we pick, among the still-admissible candidates, the one whose
+/// addition raises the block's worst-case survival [`estimate_block_survival`] the
+/// most. Because the survival of the CURRENT chosen set is a constant at that step,
+/// `argmax ΔR̂_wc = argmax R̂_wc(chosen ∪ {cand})`, so we compare the full A.9
+/// convolution of `chosen ∪ {cand}` per candidate and keep the best. Ties break to
+/// the SMALLEST candidate index — a deterministic rule (no `HashMap`, no clock) that
+/// also preserves the worst-case input ordering an adversary scenario (SIM-6)
+/// constructs by presenting farm holders first.
 ///
-/// ## Spread by address (§7)
+/// This single principle ABSORBS the old surface-rank sort: with all surfaces equal
+/// and ≤1 symbol per independent bucket the marginal gain is identical across fresh
+/// buckets, so argmax degenerates to input order and the result is bit-identical to
+/// the pre-A.10 "sort by surface, greedily add" path (this is why SIM-6 does not
+/// move). Where surfaces DIFFER **and the block already holds ≥ k_eff−1 fresh
+/// buckets**, argmax genuinely tracks the block-survival gain rather than a raw
+/// per-holder surface — the intended §6 unification.
 ///
-/// At most ONE symbol per observable bucket (defined by `policy.cap_mode`:
-/// `addr_subnet` by default, or `master_id`). A candidate whose bucket is already
-/// occupied in the chosen set is SKIPPED. This is the §7 spread: spreading by the
-/// first-hand `addr_subnet` confines a hidden same-subnet farm to ONE position no
-/// matter how many master-ids it mints — so the survival estimate's independence
-/// is *earned* by the spread, not assumed. Under [`CapMode::MasterIdOnly`] the same
-/// farm presents N master-ids → N buckets → N positions → the spread is bypassed
-/// (the SIM-6 sign: subnet-spread beats master-spread).
+/// CAVEAT (reviewer NOTE-1, транш 2b): while `chosen.len() < k_eff` for `k_eff > 1`,
+/// `estimate_block_survival` is a STRUCTURAL ZERO for every candidate (fewer than
+/// `k_eff` symbols can never meet the threshold), so all marginals are identically 0
+/// and the first `k_eff−1` picks fall to the index tie-break, NOT surface. This is
+/// SAFE (the `r_target` floor is still reached whenever the admissible set is feasible;
+/// the ≤1/bucket and credit caps hold) but mildly SUB-OPTIMAL: an index-first pick can
+/// pull a weaker holder into the mandatory `k_eff` set, costing an extra redundancy
+/// slot versus a surface-first pick. Left as the faithful greedy-argmax transcription;
+/// revisit if транш 3 layers reciprocity/cream on placement.
+///
+/// ## Spread by address (§7) — the ≤1/bucket cap stays HARD (NOTE-1)
+///
+/// At most ONE symbol per observable bucket (`policy.cap_mode`: `addr_subnet` by
+/// default, or `master_id`). A candidate whose bucket is already occupied is SKIPPED.
+/// This is load-bearing: since the A.9 estimator (транш 2a) no longer refuses
+/// same-subnet concentration (it honestly credits the comonotone group), the ≤1/group
+/// spread is the ONLY structural barrier against "pile everything into one strong
+/// subnet, reach R̂ ≥ r_target with no spread" (§7 safety). Under
+/// [`CapMode::MasterIdOnly`] a same-subnet farm presents N master-ids → N buckets →
+/// the spread is bypassed (the SIM-6 sign: subnet-spread beats master-spread).
+///
+/// ## Per-holder credit cap (Р-5 / A.13)
+///
+/// A candidate whose credit limit `L(O→h) = credit_limit_from_surface(obs, prior,
+/// req.r_min, req.tau, v_max)` is below `volume_per_symbol` cannot reliably hold even
+/// one symbol at the required per-holder floor `r_min` on the horizon — it is SKIPPED
+/// before it can be selected. This is the mandatory consumer A.13 was missing: it
+/// stops the owner from asking a holder to keep a per-symbol volume its demonstrated
+/// scale cannot vouch for. Setting `req.r_min = 0` disables the cap.
 ///
 /// ## Result
 ///
-/// Returns [`PlacementResult::Placed`] once `R̂ ≥ r_target`. If the
-/// spread-admissible candidates are exhausted before reaching the target, returns
-/// [`PlacementResult::Insufficient`] with the best `R̂` achieved — e.g. when every
-/// candidate is in one subnet bucket, only one symbol can be placed and (if
-/// `k_eff > 1`) the target is unreachable.
+/// Returns [`PlacementResult::Placed`] once `R̂_wc ≥ r_target`. If the admissible
+/// candidates (fresh bucket AND credit-uncapped) are exhausted first, returns
+/// [`PlacementResult::Insufficient`] with the best `R̂` achieved.
 ///
-/// Anti-oracle litmus: the arguments to selection and to the spread are ⊆ {surface
-/// `r_hat` (from `estimate_surface(F^O)`), `addr_subnet`, `master_id`} plus the
-/// owner-private `req` (which carries `ι_own` only as `r_target`). No hidden
-/// farm-identity is reachable — it is not a field on [`FirstHandObs`].
+/// Anti-oracle litmus: the arguments to selection, spread and credit cap are ⊆
+/// {surface `r_hat` (from `estimate_surface(F^O)`), `addr_subnet`, `master_id`} plus
+/// the owner-private `req` (which carries `ι_own` only as `r_target`/`r_min`). No
+/// hidden farm-identity is reachable — it is not a field on [`FirstHandObs`].
 pub fn place(
     req: &BlockReq,
     candidates: &[FirstHandObs],
@@ -1488,41 +1614,74 @@ pub fn place(
 ) -> PlacementResult {
     let v_per_symbol = req.volume_per_symbol();
     let tau = req.tau.max(0.0);
+    // Ceiling for the A.13 credit read: only `L < v_per_symbol` matters, so a finite
+    // multiple of the per-symbol ask suffices (see CREDIT_PLACE_HEADROOM).
+    let credit_v_max = v_per_symbol * CREDIT_PLACE_HEADROOM;
 
-    // Rank candidates by descending conservative reliability (best surface first).
-    let mut order: Vec<usize> = (0..candidates.len()).collect();
-    let rel: Vec<f64> = candidates
+    // Р-5 per-holder credit cap, computed ONCE per candidate: `L(O→h)` depends only on
+    // the holder's own observation, not on the chosen set, so a holder that cannot be
+    // trusted with even one symbol's volume at the floor `r_min` on the horizon is
+    // inadmissible for the whole placement.
+    let credit_ok: Vec<bool> = candidates
         .iter()
-        .map(|obs| estimate_surface(obs, prior, v_per_symbol, tau).r_hat)
+        .map(|obs| {
+            credit_limit_from_surface(obs, prior, req.r_min, tau, credit_v_max) >= v_per_symbol
+        })
         .collect();
-    order.sort_by(|&a, &b| rel[b].total_cmp(&rel[a]));
 
     let mut chosen: Vec<usize> = Vec::new();
     let mut chosen_obs: Vec<FirstHandObs> = Vec::new();
-    // Buckets already occupied by the chosen set: the §7 spread allows ≤1 symbol
-    // per observable address bucket.
+    // Buckets already occupied by the chosen set: the §7 spread allows ≤1 symbol per
+    // observable address bucket (NOTE-1: kept HARD).
     let mut occupied: Vec<BucketKey> = Vec::new();
     let mut best_r_hat = if req.k_eff == 0 { 1.0 } else { 0.0 };
 
-    for &cand in &order {
-        // §7 spread: skip a candidate whose observable bucket already holds a symbol
-        // (a same-subnet farm of N master-ids is one subnet bucket → one position).
-        let key = bucket_key(&candidates[cand], policy);
-        if occupied.contains(&key) {
-            continue;
+    loop {
+        // Pick the admissible candidate maximising R̂_wc(chosen ∪ {cand}) — i.e. the
+        // largest marginal ΔR̂_wc (A.10). Admissible = not already chosen, in a FRESH
+        // bucket (§7 hard spread), and credit-uncapped (Р-5). Tie-break: smallest
+        // index (deterministic; preserves adversary-first ordering).
+        let mut best_cand: Option<usize> = None;
+        let mut best_cand_r = f64::NEG_INFINITY;
+        for cand in 0..candidates.len() {
+            if chosen.contains(&cand) {
+                continue;
+            }
+            // Р-5 per-holder credit cap (precomputed).
+            if !credit_ok[cand] {
+                continue;
+            }
+            // §7 spread: a candidate whose observable bucket already holds a symbol is
+            // one subnet position already claimed → skip (hard ≤1/bucket).
+            if occupied.contains(&bucket_key(&candidates[cand], policy)) {
+                continue;
+            }
+            // Marginal argmax: R̂_wc of the chosen set WITH this candidate added.
+            chosen_obs.push(candidates[cand].clone());
+            let r = estimate_block_survival(&chosen_obs, prior, req, policy);
+            chosen_obs.pop();
+            // Strict `>` with ascending `cand` ⇒ ties keep the smallest index.
+            if r > best_cand_r {
+                best_cand_r = r;
+                best_cand = Some(cand);
+            }
         }
 
-        chosen.push(cand);
-        chosen_obs.push(candidates[cand].clone());
-        occupied.push(key);
-
-        let r_hat = estimate_block_survival(&chosen_obs, prior, req, policy);
-        best_r_hat = r_hat;
-        if r_hat >= req.r_target {
-            return PlacementResult::Placed {
-                holders: chosen,
-                r_hat_block: r_hat,
-            };
+        match best_cand {
+            Some(cand) => {
+                chosen.push(cand);
+                chosen_obs.push(candidates[cand].clone());
+                occupied.push(bucket_key(&candidates[cand], policy));
+                best_r_hat = best_cand_r;
+                if best_r_hat >= req.r_target {
+                    return PlacementResult::Placed {
+                        holders: chosen,
+                        r_hat_block: best_r_hat,
+                    };
+                }
+            }
+            // No admissible candidate left → cannot improve further.
+            None => break,
         }
     }
 

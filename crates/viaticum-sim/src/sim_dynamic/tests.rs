@@ -1308,6 +1308,8 @@ fn place_reciprocal_prefers_reciprocal_holder_and_caps_one_per_bucket() {
         k_eff: 2,
         tau: DAYS_PER_TICK,
         r_target: 0.9,
+        // Inert here: place_reciprocal (not core place) is exercised.
+        r_min: 0.5,
     };
     // reciprocal ON ⇒ the reciprocal holder (idx 1) ranks first.
     let chosen = place_reciprocal_for_test(&obs, &req, &prior, true, &retention, 3, &[]);

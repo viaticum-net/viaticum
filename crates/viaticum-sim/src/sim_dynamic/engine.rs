@@ -550,6 +550,9 @@ fn try_place_one_symbol(
         k_eff: params.k_eff,
         tau: DAYS_PER_TICK,
         r_target: params.r_target,
+        // sim_dynamic uses place_reciprocal (its own placement), NOT the core place();
+        // r_min feeds only the core credit cap, so it is inert here.
+        r_min: 0.5,
     };
     let ranked = place_reciprocal(
         &cand_obs,

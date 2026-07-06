@@ -96,6 +96,8 @@ fn sim_r1_forecast_is_bit_identical_for_holders_differing_only_in_hidden_archety
         k_eff: 3,
         tau: 30.0,
         r_target: 0.99,
+        // Unused: this test drives estimate_block_survival_per_symbol, not place().
+        r_min: 0.5,
     };
 
     let plc_a: Vec<HolderPlacement> = observer::observe_all(&pop_a, 1);

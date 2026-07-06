@@ -679,7 +679,11 @@ fn holder(master: u8, subnet: u32, v0: f64, tau0: f64) -> FirstHandObs {
 }
 
 /// A block request: erasure (n, k_eff), volume, horizon close to the observed
-/// window (so per-holder r_hat is high), and a reliability target.
+/// window (so per-holder r_hat is high), and a reliability target. `r_min = 0.5` is
+/// a per-holder floor comfortably BELOW the ≈0.87 in-sample surface of the standard
+/// `holder(...)` (v0=10, τ0=30, clean PoS), so the Р-5 credit cap does NOT bite an
+/// in-sample holder asked to keep its demonstrated volume; it only bites a holder
+/// asked to keep far MORE than it has proven (see the credit-cap test).
 fn req(n: usize, k_eff: usize, r_target: f64) -> BlockReq {
     BlockReq {
         volume: 10.0 * n as f64, // per-symbol volume = 10.0 (= observed v0)
@@ -687,6 +691,7 @@ fn req(n: usize, k_eff: usize, r_target: f64) -> BlockReq {
         k_eff,
         tau: 30.0, // = observed τ0 (in-sample ⇒ high, non-degenerate r_hat)
         r_target,
+        r_min: 0.5,
     }
 }
 
@@ -1063,6 +1068,230 @@ fn place_under_master_only_cap_lets_a_one_subnet_farm_fill_the_block() {
     assert!(
         matches!(under_weak, PlacementResult::Placed { .. }),
         "master-spread lets the same farm fill the block (bypassed): {under_weak:?}"
+    );
+}
+
+// ============================================================
+// A.10 (place = argmax marginal ΔR̂_wc) + Р-5 (per-holder credit cap).
+// ============================================================
+
+#[test]
+fn place_reaches_r_target_by_argmax_marginal() {
+    // A.10: place must add each symbol to the candidate that maximises the marginal
+    // ΔR̂_wc — i.e. argmax R̂_wc(chosen ∪ {cand}) at every step. We give candidates
+    // with DIFFERENT surfaces (varying PoS records) so argmax genuinely discriminates
+    // (with equal surfaces it degenerates to input order), then verify the chosen
+    // sequence against a hand brute-force: at each prefix, no admissible candidate
+    // would have produced a strictly higher R̂ than the one place picked.
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let r = req(4, 1, 0.9); // k_eff=1, per-symbol volume 10 = observed scale
+
+    // Three independent (distinct-subnet) holders with strong / medium / weak PoS.
+    let strong = holder_with_standing(0, 0, 0.0, 50, 0, 0);
+    let medium = holder_with_standing(1, 1, 0.0, 40, 10, 0);
+    let weak = holder_with_standing(2, 2, 0.0, 20, 30, 0);
+    let cands = vec![strong, medium, weak];
+
+    let result = place(&r, &cands, &prior, &policy);
+    let holders = match &result {
+        PlacementResult::Placed {
+            holders,
+            r_hat_block,
+        } => {
+            assert!(
+                *r_hat_block >= r.r_target,
+                "placed R̂ must reach the target: {r_hat_block} < {}",
+                r.r_target
+            );
+            holders.clone()
+        }
+        other => panic!("expected Placed, got {other:?}"),
+    };
+    assert!(!holders.is_empty(), "must choose at least one holder");
+
+    // Brute-force argmax check: replay the selection and assert each pick was the
+    // marginal-maximiser among the candidates admissible at that step.
+    let v_per = r.volume_per_symbol();
+    let cvmax = v_per * 4.0;
+    let mut prefix: Vec<FirstHandObs> = Vec::new();
+    let mut used_subnets: Vec<u32> = Vec::new();
+    for (step, &ch) in holders.iter().enumerate() {
+        // R̂ with the actually-chosen candidate at this step.
+        let mut with_ch = prefix.clone();
+        with_ch.push(cands[ch].clone());
+        let r_ch = estimate_block_survival(&with_ch, &prior, &r, &policy);
+
+        // No admissible OTHER candidate may beat r_ch (argmax property).
+        for (c, cand_c) in cands.iter().enumerate() {
+            if holders[..step].contains(&c) {
+                continue; // already chosen before this step
+            }
+            if used_subnets.contains(&cand_c.addr_subnet) {
+                continue; // §7 spread: bucket taken
+            }
+            let l = credit_limit_from_surface(cand_c, &prior, r.r_min, r.tau, cvmax);
+            if l < v_per {
+                continue; // Р-5 credit-capped
+            }
+            let mut with_c = prefix.clone();
+            with_c.push(cand_c.clone());
+            let r_c = estimate_block_survival(&with_c, &prior, &r, &policy);
+            assert!(
+                r_ch >= r_c - 1e-9,
+                "step {step}: chosen holder {ch} (R̂={r_ch}) is NOT the marginal argmax — \
+                 candidate {c} would give R̂={r_c}"
+            );
+        }
+        prefix.push(cands[ch].clone());
+        used_subnets.push(cands[ch].addr_subnet);
+    }
+
+    // With k_eff=1 the marginal argmax is the highest per-holder prob → the strong
+    // holder (index 0) must be picked FIRST.
+    assert_eq!(holders[0], 0, "argmax must pick the strongest holder first");
+}
+
+#[test]
+fn place_never_puts_two_symbols_in_one_bucket() {
+    // NOTE-1: the ≤1-symbol-per-bucket spread stays HARD under argmax. Candidates
+    // with DUPLICATE addr_subnet must never both be chosen — every chosen holder
+    // sits in a distinct bucket.
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default(); // spread by addr_subnet
+    // Unreachably high target ⇒ place keeps adding every admissible candidate.
+    let r = req(6, 2, 0.999_999);
+    // Two crowded subnets (0 and 1, three holders each) + two lone subnets.
+    let mut cands: Vec<FirstHandObs> = Vec::new();
+    for m in 0..3 {
+        cands.push(holder(m, 0, 10.0, 30.0)); // subnet 0
+    }
+    for m in 3..6 {
+        cands.push(holder(m, 1, 10.0, 30.0)); // subnet 1
+    }
+    cands.push(holder(100, 100, 10.0, 30.0));
+    cands.push(holder(101, 101, 10.0, 30.0));
+
+    let holders = match place(&r, &cands, &prior, &policy) {
+        PlacementResult::Placed { holders, .. } => holders,
+        PlacementResult::Insufficient { holders, .. } => holders,
+    };
+    let chosen_subnets: Vec<u32> = holders.iter().map(|&i| cands[i].addr_subnet).collect();
+    let mut sorted = chosen_subnets.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        chosen_subnets.len(),
+        "no two chosen symbols may share a subnet bucket: {chosen_subnets:?}"
+    );
+    // Exactly four distinct buckets exist (subnets 0,1,100,101) ⇒ at most four picks.
+    assert!(
+        holders.len() <= 4,
+        "cannot place more symbols than distinct buckets: {}",
+        holders.len()
+    );
+}
+
+#[test]
+fn place_skips_holder_whose_credit_below_symbol_volume() {
+    // Р-5: a holder that is highly RELIABLE at its own demonstrated scale but has a
+    // SMALL demonstrated volume must be skipped when asked to keep a per-symbol volume
+    // far above its credit limit L(O→h) < v_per_symbol — even though it would improve
+    // R̂. An adequately-scaled holder on another bucket is still selected.
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    // per-symbol volume = 10; low target so a single adequate holder can be Placed.
+    let r = req(3, 1, 0.5);
+    let v_per = r.volume_per_symbol();
+    let cvmax = v_per * 4.0;
+
+    // small: proven only at v0=1 (clean PoS) → high surface AT its point, tiny credit.
+    let small = holder(0, 5, 1.0, 30.0);
+    // ok: proven at the full per-symbol volume v0=10 → credit ≥ v_per_symbol.
+    let ok = holder(1, 6, 10.0, 30.0);
+
+    // Precondition (1): small IS highly reliable at its demonstrated point (high surface).
+    assert!(
+        estimate_surface(&small, &prior, 1.0, 30.0).r_hat > 0.8,
+        "small holder must be high-surface at its own proven scale"
+    );
+    // Precondition (2): but its credit at the per-symbol ask is below v_per_symbol.
+    let l_small = credit_limit_from_surface(&small, &prior, r.r_min, r.tau, cvmax);
+    assert!(
+        l_small < v_per,
+        "small holder's credit L={l_small} must be below v_per_symbol={v_per}"
+    );
+    // And the adequate holder's credit clears the bar.
+    let l_ok = credit_limit_from_surface(&ok, &prior, r.r_min, r.tau, cvmax);
+    assert!(
+        l_ok >= v_per,
+        "adequate holder's credit L={l_ok} must clear v_per_symbol={v_per}"
+    );
+
+    // place must SKIP small (index 0) and keep ok (index 1).
+    let cands = vec![small, ok];
+    let holders = match place(&r, &cands, &prior, &policy) {
+        PlacementResult::Placed { holders, .. } => holders,
+        PlacementResult::Insufficient { holders, .. } => holders,
+    };
+    assert!(
+        !holders.contains(&0),
+        "credit-capped small holder must NOT be chosen: {holders:?}"
+    );
+    assert!(
+        holders.contains(&1),
+        "adequate holder must be chosen: {holders:?}"
+    );
+}
+
+#[test]
+fn credit_limit_from_surface_is_monotone_and_matches_closed_form_approx() {
+    // A.13: L falls as the required per-holder floor r_min rises (a stricter floor
+    // admits less volume). And under the default prior the surface read sits in the
+    // same order of magnitude as the closed-form approximation credit_limit(...).
+    let prior = SurfacePrior::default();
+    let holder = obs_observed_at(10.0, 30.0, 50, 0); // v_dem=10, clean PoS, τ0=30
+    let t_horizon = 30.0;
+    let v_max = 200.0;
+
+    // Monotone non-increasing in r_min.
+    let mut prev = f64::INFINITY;
+    for &r_min in &[0.1, 0.3, 0.5, 0.7, 0.85] {
+        let l = credit_limit_from_surface(&holder, &prior, r_min, t_horizon, v_max);
+        assert!(
+            l <= prev + 1e-9,
+            "L must be non-increasing in r_min: r_min={r_min} L={l} prev={prev}"
+        );
+        assert!((0.0..=v_max).contains(&l), "L in [0, v_max]: {l}");
+        prev = l;
+    }
+
+    // Order-of-magnitude match to the closed form at a floor just under the in-sample
+    // surface (where the closed form is anchored ≈ V_dem). r̂(10,30) ≈ 0.87.
+    let r_min = 0.85;
+    let l_surface = credit_limit_from_surface(&holder, &prior, r_min, t_horizon, v_max);
+    let l_closed = credit_limit(1.0, 10.0, &CreditPolicy::default()); // ≈ 11.25
+    let ratio = l_surface / l_closed;
+    assert!(
+        (0.3..=3.0).contains(&ratio),
+        "surface read L={l_surface} must be within an order of magnitude of the closed \
+         form L={l_closed} (ratio={ratio})"
+    );
+}
+
+#[test]
+fn credit_limit_from_surface_binary_search_is_deterministic() {
+    // Determinism (hard frame): the fixed-iteration bisection has no clock/rng and no
+    // data-dependent loop bound, so two calls are BIT-identical.
+    let prior = SurfacePrior::default();
+    let holder = obs_observed_at(10.0, 30.0, 37, 3);
+    let a = credit_limit_from_surface(&holder, &prior, 0.6, 45.0, 128.0);
+    let b = credit_limit_from_surface(&holder, &prior, 0.6, 45.0, 128.0);
+    assert_eq!(
+        a.to_bits(),
+        b.to_bits(),
+        "credit surface read must be bit-deterministic: {a} vs {b}"
     );
 }
 
@@ -1525,4 +1754,52 @@ fn per_symbol_forecast_is_bit_identical_for_owners_differing_only_in_hidden_arch
         "forecast must be bit-identical when only a HIDDEN archetype differs: \
          generous={r_generous} freeloader={r_freeloader}"
     );
+}
+
+#[test]
+fn place_below_k_eff_first_pick_is_index_tiebreak_not_surface() {
+    // Reviewer NOTE-1 (транш 2b): while `chosen.len() < k_eff` for k_eff > 1, the block
+    // survival is a STRUCTURAL ZERO for every candidate — fewer than k_eff symbols can
+    // never meet the threshold — so all marginal ΔR̂ are identically 0 and the first
+    // k_eff−1 picks fall to the index tie-break, NOT surface. This test DOCUMENTS (does
+    // not endorse) that behaviour: it is SAFE (r_target still reached) but index-ordered
+    // below k_eff. See the `place` doc-comment caveat.
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let r = req(4, 2, 0.5); // k_eff = 2 ⇒ the first pick sits in the structural-zero region
+
+    // Mechanism: a SINGLE strong holder gives R̂ = 0 at k_eff = 2 (one symbol can never
+    // reach a 2-of threshold) ⇒ the first marginal is 0 regardless of its surface.
+    let strong_solo = vec![holder_with_standing(1, 1, 0.0, 60, 0, 0)];
+    assert_eq!(
+        estimate_block_survival(&strong_solo, &prior, &r, &policy),
+        0.0,
+        "one holder is a structural zero at k_eff=2 ⇒ zero marginal below k_eff"
+    );
+
+    // idx 0 = MEDIUM surface (40/10), idx 1 = STRONG surface (60/0), distinct buckets,
+    // both credit-uncapped. A surface-driven first pick would take STRONG (idx 1); the
+    // zero-marginal region falls to the index tie-break and takes idx 0 (medium).
+    let cands = vec![
+        holder_with_standing(0, 0, 0.0, 40, 10, 0),
+        holder_with_standing(1, 1, 0.0, 60, 0, 0),
+    ];
+    match place(&r, &cands, &prior, &policy) {
+        PlacementResult::Placed {
+            holders,
+            r_hat_block,
+        } => {
+            assert_eq!(
+                holders[0], 0,
+                "below k_eff the first pick is the index tie-break (medium, idx 0), \
+                 NOT the higher-surface strong holder at idx 1"
+            );
+            assert!(
+                r_hat_block >= r.r_target,
+                "safety: r_target floor still reached ({r_hat_block} ≥ {})",
+                r.r_target
+            );
+        }
+        other => panic!("expected Placed, got {other:?}"),
+    }
 }

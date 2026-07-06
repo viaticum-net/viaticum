@@ -115,6 +115,9 @@ fn min_subnets_to_deny(dial: Dial, policy: &PlacementPolicy, seed: u64) -> usize
         k_eff: dial.k_eff,
         tau: 30.0,
         r_target: 0.999,
+        // SIM-6 isolates the §7 address-spread; r_min = 0 disables the Р-5 credit cap
+        // so an unrelated mechanism cannot perturb the spread measurement.
+        r_min: 0.0,
     };
 
     // WORST-CASE adversary. The farm is surface-INDISTINGUISHABLE from an honest
@@ -266,6 +269,8 @@ fn one_subnet_farm_contrast(dial: Dial, seed: u64) -> bool {
         k_eff: dial.k_eff,
         tau: 30.0,
         r_target: 0.999,
+        // See min_subnets_to_deny: r_min = 0 disables the Р-5 credit cap (SIM-6 tests §7 spread only).
+        r_min: 0.0,
     };
     let pop = Sim6Pop::build(dial, 1, seed); // farm on ONE subnet
     let candidates = observer::observe_all(&pop);
