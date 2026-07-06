@@ -125,6 +125,9 @@ pub fn observe_eviction_views<'a>(
                     // Opaque, first-hand id: (block, owner) folded deterministically.
                     id: SymbolId(((owner_idx as u64) << 32) ^ s.block as u64),
                     importance: s.iota,
+                    // Per-symbol volume the holder physically stores — the Р-7 cap trims
+                    // V_parked(O) = Σ volume down to V_ret (A.14).
+                    volume: s.volume,
                 })
                 .collect();
             // A.4 loyalty depth of THIS owner→holder direction ("O served me"), the

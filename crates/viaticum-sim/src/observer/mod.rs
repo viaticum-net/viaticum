@@ -91,6 +91,9 @@ pub fn observe_eviction_views(owners: &[OwnerGt]) -> Vec<OwnerEvictionView> {
             symbols: vec![SymbolDecl {
                 id: SymbolId(i as u64),
                 importance: o.declared_iota,
+                // SIM-2 predates the Р-7 volume cap; volume is inert here (the harness
+                // passes RetentionCap::disabled()). Uniform unit volume keeps it simple.
+                volume: 1.0,
             }],
         })
         .collect()

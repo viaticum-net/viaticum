@@ -12,8 +12,8 @@ use viaticum_core::four_r::{
 
 use crate::sim_dynamic::engine::{
     DynParams, PosOutcome, admit_offer_for_test, alive_block_counts_for_test,
-    assert_lambda_dt_stable, block_mature_for_test, fresh_capital, place_reciprocal_for_test, step,
-    symbols_per_tick_for_test,
+    assert_lambda_dt_stable, block_mature_for_test, fresh_capital, place_reciprocal_for_test,
+    run_eviction_for_test, step, symbols_per_tick_for_test,
 };
 use crate::sim_dynamic::evaluator::{
     contention_metric, drop_ranking_metric, mc_block_r_actual, pillar1_metric,
@@ -1583,6 +1583,219 @@ fn preemption_admits_reciprocal_owner_drops_low_iota_victim_and_blocks_parasite(
     assert_eq!(
         world2.preempt_count, 0,
         "no swap when preemption is disabled"
+    );
+}
+
+// ============================================================
+// Транш 3b — unified κ_O preemption (A.12-2) + Р-7 volume cap V_ret (A.14)
+// ============================================================
+
+/// Build a 6-node world with every node present, willing (Reliable) and its holdings
+/// cleared — the shared setup the 3b holder-side tests start from.
+fn mk_clean_world(params: &DynParams, seed: u64) -> World {
+    let mut w = build_world(6, params, seed);
+    for node in &mut w.nodes {
+        node.present = true;
+        node.holdings.clear();
+        node.archetype = Archetype::Reliable;
+        node.disk.own_growth_per_tick = 0.0;
+    }
+    w
+}
+
+#[test]
+fn preemption_ranks_victims_by_unified_kappa_not_bare_g_ho() {
+    // A.12-2 / ADV2-D2 closed: the preemption victim is the min-κ_O owner, NOT the min
+    // bare-g_ho owner. A silent-but-DEEP loyal partner (g_ho≈0, D≥d_ref) is NOT evicted
+    // while a stranger (g_ho≈0, D=0) with lower κ_O exists — even though their bare g_ho
+    // is identical (both ≈0). Bare-g_ho ranking would have wrongly dropped the deep one.
+    let params = DynParams::default();
+    let holder = 1usize;
+    let v = params.block_volume / params.n_symbols as f64; // 10 gb
+    let mut world = mk_clean_world(&params, 99);
+
+    // Holder holds owner 2 (DEEP, listed FIRST so bare-g_ho tie would pick it) and owner
+    // 3 (STRANGER). Fill the disk so the free-accept path is closed (contention).
+    world.nodes[holder].holdings.push(HeldSymbol {
+        owner: 2,
+        block: 0,
+        iota: 0.5,
+        volume: v,
+        alive: true,
+        cream: false,
+    });
+    world.nodes[holder].holdings.push(HeldSymbol {
+        owner: 3,
+        block: 0,
+        iota: 0.5,
+        volume: v,
+        alive: true,
+        cream: false,
+    });
+    world.nodes[holder].disk.own_data = world.nodes[holder].disk_cap - 2.0 * v;
+    assert!(
+        world.nodes[holder].free_disk() < v,
+        "precondition: holder is full"
+    );
+
+    // Both victims have g_ho = 0 (identical bare capital). Owner 2 is DEEP (D = d_ref in
+    // kernel units = depth_ref_days·v_per_symbol), owner 3 is a stranger (D = 0).
+    world.capital[2][holder].g_ho = 0.0;
+    world.capital[2][holder].depth_ho = params.depth_ref_days * v; // κ_O = w_d·g* (high)
+    world.capital[3][holder].g_ho = 0.0;
+    world.capital[3][holder].depth_ho = 0.0; // κ_O = 0 (lowest)
+    // Offering owner 4: reciprocal, clears the margin.
+    world.capital[4][holder].g_ho = 500.0;
+    world.capital[4][holder].depth_ho = 0.0;
+
+    assert!(
+        admit_offer_for_test(&mut world, 4, holder, v, &params, 0),
+        "the reciprocal owner clears the κ margin and preempts"
+    );
+    let alive = |o: usize| {
+        world.nodes[holder]
+            .holdings
+            .iter()
+            .any(|s| s.alive && s.owner == o)
+    };
+    assert!(!alive(3), "the STRANGER (min κ_O) is the victim");
+    assert!(
+        alive(2),
+        "the silent-DEEP partner is NOT evicted (κ_O floor protects it — ADV2-D2 closed)"
+    );
+}
+
+#[test]
+fn preemption_rejects_offer_beyond_owners_v_ret() {
+    // Accept-guard (B-1): an owner already parked at its own V_ret cannot preempt in a
+    // FURTHER symbol (it would only be cap-trimmed next eviction). A control with a
+    // lighter parked load DOES preempt — proving the guard, not some other reject, blocks it.
+    let params = DynParams::default();
+    let holder = 1usize;
+    let v = params.block_volume / params.n_symbols as f64; // 10 gb
+    // κ_O(offer) with g_ho=500, D=0 ⇒ V_ret = V_free + 500/c_recip = 2·10 + 500/30 ≈ 36.67.
+    // Parking 3 symbols (30) ⇒ 30 + 10 > 36.67 ⇒ guard REJECTS. Parking 1 (10) ⇒ passes.
+
+    let build = |offer_parked: usize| -> World {
+        let mut w = mk_clean_world(&params, 7);
+        // Offering owner 4's already-parked symbols.
+        for b in 0..offer_parked {
+            w.nodes[holder].holdings.push(HeldSymbol {
+                owner: 4,
+                block: b,
+                iota: 0.5,
+                volume: v,
+                alive: true,
+                cream: false,
+            });
+        }
+        // A stranger victim (owner 3, κ_O = 0) so a swap is otherwise available.
+        w.nodes[holder].holdings.push(HeldSymbol {
+            owner: 3,
+            block: 0,
+            iota: 0.5,
+            volume: v,
+            alive: true,
+            cream: false,
+        });
+        let held = (offer_parked + 1) as f64 * v;
+        w.nodes[holder].disk.own_data = w.nodes[holder].disk_cap - held; // full
+        w.capital[4][holder].g_ho = 500.0;
+        w.capital[4][holder].depth_ho = 0.0;
+        w.capital[3][holder].g_ho = 0.0;
+        w.capital[3][holder].depth_ho = 0.0;
+        w
+    };
+
+    // (1) owner 4 already parked 3 symbols (30 gb) — at/over V_ret ⇒ guard REJECTS.
+    let mut over = build(3);
+    assert!(over.nodes[holder].free_disk() < v, "precondition: full");
+    assert!(
+        !admit_offer_for_test(&mut over, 4, holder, v, &params, 0),
+        "an owner beyond its V_ret must be refused the preemption (accept-guard)"
+    );
+    assert_eq!(over.preempt_count, 0, "no swap fired");
+    assert!(
+        over.nodes[holder]
+            .holdings
+            .iter()
+            .filter(|s| s.alive)
+            .count()
+            == 4,
+        "nothing evicted on the rejected offer"
+    );
+
+    // (2) CONTROL: owner 4 parked only 1 symbol (10 gb) — under V_ret ⇒ guard PASSES,
+    // and the stranger victim is preempted. Same κ, same margin: only V_parked differs.
+    let mut under = build(1);
+    assert!(under.nodes[holder].free_disk() < v, "precondition: full");
+    assert!(
+        admit_offer_for_test(&mut under, 4, holder, v, &params, 0),
+        "under V_ret the same owner DOES preempt (guard is the only difference)"
+    );
+    assert_eq!(under.preempt_count, 1, "the swap fired in the control");
+}
+
+#[test]
+fn contended_whale_ends_at_v_ret_envelope() {
+    // Sim-level P1b: an ε-give whale that piles 100 gb on a holder is trimmed, under
+    // contention, down to V_ret = V_free + κ_O/c_recip ≈ V_free — bounded, not unbounded.
+    let params = DynParams::default();
+    let holder = 1usize;
+    let whale = 2usize;
+    let v = params.block_volume / params.n_symbols as f64; // 10 gb
+    let mut world = mk_clean_world(&params, 5);
+
+    // A controlled disk: cap 200, own 100, plus 100 gb of whale holdings ⇒ φ = 0 (evicting).
+    world.nodes[holder].disk_cap = 200.0;
+    world.nodes[holder].disk.own_data = 100.0;
+    for b in 0..10 {
+        world.nodes[holder].holdings.push(HeldSymbol {
+            owner: whale,
+            block: b,
+            iota: (b + 1) as f64, // ascending ι ⇒ lowest-ι trimmed first
+            volume: v,
+            alive: true,
+            cream: false,
+        });
+    }
+    // ε-give: κ_O = g_ho = 0.5 (NOT zero-give), D = 0.
+    world.capital[whale][holder].g_ho = 0.5;
+    world.capital[whale][holder].depth_ho = 0.0;
+
+    let whale_vol_before: f64 = world.nodes[holder]
+        .holdings
+        .iter()
+        .filter(|s| s.alive && s.owner == whale)
+        .map(|s| s.volume)
+        .sum();
+    assert_eq!(whale_vol_before, 100.0, "precondition: whale parked 100 gb");
+    assert!(
+        world.nodes[holder].phi_free_ratio() < params.hyst.s_hard,
+        "precondition: holder is under contention (evicting)"
+    );
+
+    run_eviction_for_test(&mut world, &params);
+
+    // V_ret = V_free(=2·v) + κ_O/c_recip = 20 + 0.5/30 ≈ 20.017.
+    let v_ret = params.v_free_symbols * v + 0.5 / params.c_recip_days;
+    let whale_vol_after: f64 = world.nodes[holder]
+        .holdings
+        .iter()
+        .filter(|s| s.alive && s.owner == whale)
+        .map(|s| s.volume)
+        .sum();
+    assert!(
+        whale_vol_after <= v_ret + 1e-9,
+        "ε-whale parked volume {whale_vol_after} must be capped at V_ret ≈ {v_ret} (P1b)"
+    );
+    assert_eq!(
+        whale_vol_after, 20.0,
+        "the whale keeps its V_free floor (2 symbols), no more"
+    );
+    assert_eq!(
+        world.cap_trim_count, 8,
+        "the cap fired: 8 excess symbols trimmed"
     );
 }
 

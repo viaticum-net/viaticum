@@ -190,8 +190,15 @@ fn main() {
     // ~130 ticks — the experiment horizon. Track the share-A>0 TRAJECTORY (§9 gate a).
     println!("=== sim_diag time-series (n={nn} block_volume={block_volume}) ===");
     println!(
-        "  {:>4}  {:>10} {:>12}  {:>11} {:>10} {:>9} {:>7}",
-        "tick", "alive syms", "alive vol gb", "share A>0", "present", "evicts", "preempt"
+        "  {:>4}  {:>10} {:>12}  {:>11} {:>10} {:>9} {:>7} {:>9}",
+        "tick",
+        "alive syms",
+        "alive vol gb",
+        "share A>0",
+        "present",
+        "evicts",
+        "preempt",
+        "cap_trim"
     );
     for t in 0..130u64 {
         step(&mut world, &params, &prior, &policy);
@@ -199,7 +206,7 @@ fn main() {
             let (cnt, share, vol) = snapshot(&world);
             let present = world.nodes.iter().filter(|n| n.present).count();
             println!(
-                "  {:>4}  {:>10} {:>12.0}  {:>10.1}% {:>10} {:>9} {:>7}",
+                "  {:>4}  {:>10} {:>12.0}  {:>10.1}% {:>10} {:>9} {:>7} {:>9}",
                 t + 1,
                 cnt,
                 vol,
@@ -207,6 +214,7 @@ fn main() {
                 present,
                 world.eviction_log.len(),
                 world.preempt_count,
+                world.cap_trim_count,
             );
         }
     }
@@ -573,6 +581,8 @@ fn print_section6(world: &World, params: &DynParams) {
 
     // (6d) preemption counter (was ~0 in the degenerate "starved, not frozen" world).
     println!("  (6d) preemptive swaps fired = {}", world.preempt_count);
+    // (6d) Р-7 holder-side volume-cap trims (транш 3b): excess parked above V_ret dropped.
+    println!("       cap_trims = {}", world.cap_trim_count);
 
     // (6e) Sybil sanity: late-joining Freeloaders (zero-giving farm) must NOT enter their
     // own data faster than late-joining Reliable (honest) newcomers.

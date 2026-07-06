@@ -46,7 +46,7 @@
 //! re-accepted so the evaluator can count *short-period* chatter cycles.
 
 use viaticum_core::four_r::{
-    DepthParams, EvictPhase, Hysteresis, OwnerEvictionView, eviction_order,
+    DepthParams, EvictPhase, Hysteresis, OwnerEvictionView, RetentionCap, eviction_order,
 };
 
 /// Tunable rates and tick for the φ-dynamics (formula_phase.md §10 `a`, `b`,
@@ -196,7 +196,16 @@ pub fn run(owners: &[OwnerEvictionView], hyst: Hysteresis, params: EngineParams)
 
     for t in 0..params.ticks {
         // Relay senses φ directly (first-hand). No hidden global signal.
-        let dec = eviction_order(owners, phi, hyst, phase, &depth_params);
+        // SIM-2 predates the Р-7 volume cap (транш 3b): pass a disabled cap so
+        // `eviction_order` produces no `cap_drops` and the pre-3b behaviour is exact.
+        let dec = eviction_order(
+            owners,
+            phi,
+            hyst,
+            phase,
+            &depth_params,
+            &RetentionCap::disabled(),
+        );
         phase = dec.phase;
 
         if dec.accept_ok {

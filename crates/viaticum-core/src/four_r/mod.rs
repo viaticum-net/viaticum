@@ -334,6 +334,12 @@ pub struct SymbolDecl {
     /// holder received with the symbol). Higher ι ⇒ the owner wants it kept
     /// longer; it orders symbols WITHIN this one owner only — see [`eviction_order`].
     pub importance: f64,
+    /// Per-symbol volume `V` (gb) the holder physically stores for this symbol —
+    /// first-hand (the size of the symbol on disk). The Р-7 volume cap
+    /// ([`RetentionCap`]) trims an owner's parked volume `V_parked(O) = Σ volume`
+    /// (over that owner's symbols) down to `V_ret`; the kernel does NOT assume
+    /// symbols are uniform in size, so each carries its own `volume`.
+    pub volume: f64,
 }
 
 /// The holder's eviction view of ONE owner: the pairwise capital that sets this
@@ -394,13 +400,88 @@ pub struct EvictPhase {
     pub evicting: bool,
 }
 
+/// Р-7 (A.14): the holder-side VOLUME cap `V_ret` — the ι-envelope a holder keeps
+/// for ONE owner under contention. It is NOT an independent limit: it reads the SAME
+/// single reciprocity key κ_O ([`kappa_key`]) that the inter-owner eviction rank and
+/// the preemption gate use (audit B-1: a cap "independent of κ" would neutralise the
+/// W10 depth floor, so P5 would be unmeetable).
+///
+/// ```text
+/// V_ret(O у h) = v_free + κ_O(O) / c_recip
+/// ```
+///
+/// with κ_O in gb·days and `V_ret`/`v_free` in gb, so `c_recip` MUST be a DURATION
+/// [days] (WARN-1) — "for every `c_recip` gb·days of lived service the holder keeps
+/// +1 gb of your data above `v_free`". Under contention a holder trims each owner's
+/// parked volume down to its `V_ret`, dropping that owner's LOWEST-ι symbols first
+/// ([`eviction_order`]'s `cap_drops`).
+///
+/// **One formula, three properties** (decision_model §8):
+/// 1. **ε-give whale (Р-7 tariff).** κ_O ≈ ε ⇒ V_ret ≈ v_free: a peer that barely
+///    reciprocates cannot park unbounded volume — "I keep your data ∝ how much you
+///    served me" (§2B ENFORCED; the owner-side credit limit is NOT enforcement).
+/// 2. **W10 loyalty = ι-envelope that MELTS with D.** A silent-but-deep partner
+///    (`g_ho → 0`, `D ≥ d_ref`) still keeps `v_free + w_d·sat(D/d_ref)·g*/c_recip`,
+///    and that floor fades with `D` over `τ_slow` (no permanent free floor, A.4).
+/// 3. **V_free floor = cream (holder-side).** Every owner — even a zero-service
+///    stranger — keeps a little (`v_free`) for free: the newcomer entry channel
+///    (bootstrap by storage), no mandatory repair. The owner-side cream ceiling
+///    (A.11, транш 3c) is the dual of this floor.
+///
+/// There is NO separate `V_floor` envelope beside this cap: the old per-pair floor
+/// and the Р-7 cap collapsed into this ONE `V_ret` (B-1) — do not code a second limit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RetentionCap {
+    /// `V_free` (gb): the free retention floor every owner gets (property 3 above).
+    pub v_free: f64,
+    /// `c_recip` (DAYS): the reciprocity price — gb·days of κ_O bought per +1 gb of
+    /// retention above `v_free`. Guard: `c_recip ≤ 0` DISABLES the cap entirely
+    /// ([`RetentionCap::disabled`]) — a misconfigured (zero / negative) price must NOT
+    /// divide-by-zero nor silently evict everything (mirror of the `preempt_enabled`
+    /// WARN-2 guard).
+    pub c_recip: f64,
+}
+
+impl RetentionCap {
+    /// A disabled cap (`c_recip = 0` ⇒ the cap is OFF). Used by callers that predate
+    /// Р-7 (e.g. SIM-2) or scenarios isolating a different mechanism: [`eviction_order`]
+    /// then produces NO `cap_drops` and behaves exactly as before 3b.
+    pub fn disabled() -> Self {
+        RetentionCap {
+            v_free: 0.0,
+            c_recip: 0.0,
+        }
+    }
+
+    /// Whether the cap is active (`c_recip > 0`). When false, `V_ret` is unbounded and
+    /// no volume is cap-trimmed (the WARN-1 divide-by-zero / evict-all guard).
+    pub fn active(&self) -> bool {
+        self.c_recip > 0.0
+    }
+
+    /// `V_ret(O) = v_free + κ_O/c_recip` for an owner whose reciprocity key is `kappa`.
+    /// Only meaningful when [`RetentionCap::active`]; callers guard on that first (an
+    /// inactive cap has an unbounded `V_ret`, not `v_free + κ/0`).
+    pub fn v_ret(&self, kappa: f64) -> f64 {
+        self.v_free + kappa / self.c_recip
+    }
+}
+
 /// Result of one eviction tick.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvictionDecision {
-    /// Per-symbol drop order ([`SymbolSlot`]s), ordered by eviction priority:
-    /// first the lowest-`G(h←O)` owner's lowest-ι symbol, then upward. Empty when
-    /// the relay is not in the evicting state this tick. See [`eviction_order`]
-    /// for the exact two-level rule.
+    /// **MANDATORY** Р-7 cap trims ([`RetentionCap`]): symbols that MUST be dropped to
+    /// bring each owner's parked volume down to its `V_ret`, applied by the caller
+    /// UNCONDITIONALLY (no φ-target stop — this is tariff enforcement, not pressure
+    /// relief). Ordered inter-owner by ascending κ_O (tie `observed_tau`) and
+    /// intra-owner by ascending ι (tie [`SymbolId`]). Empty when not evicting or when
+    /// the cap is disabled. Disjoint from `drop_order` (no symbol appears in both).
+    pub cap_drops: Vec<SymbolSlot>,
+    /// Per-symbol PRESSURE drop order ([`SymbolSlot`]s), ordered by eviction priority:
+    /// first the lowest-κ_O owner's lowest-ι symbol, then upward. Applied by the caller
+    /// only until `φ ≥ s_target`. Empty when the relay is not in the evicting state
+    /// this tick. EXCLUDES every symbol already in `cap_drops` (no double-drop). See
+    /// [`eviction_order`] for the exact two-level rule.
     pub drop_order: Vec<SymbolSlot>,
     /// Whether new foreign data may be accepted this tick (`φ > s_soft` and not
     /// currently evicting).
@@ -460,12 +541,24 @@ pub struct EvictionDecision {
 ///   ascending `ι` with a [`SymbolId`] tie-breaker for determinism.
 /// * `accept_ok` is true only when `φ > s_soft` AND we are not evicting (the
 ///   `Δ_accept` gap), which forbids "drop and immediately re-accept".
+///
+/// **Р-7 volume cap (A.14 ⭐, транш 3b).** When the `cap` is active (`c_recip > 0`)
+/// and the relay is evicting, each owner's parked volume is trimmed down to its
+/// `V_ret = v_free + κ_O/c_recip` ([`RetentionCap`]) by dropping that owner's
+/// LOWEST-ι symbols first. Those MANDATORY trims come back in `cap_drops` (applied by
+/// the caller WITHOUT the φ-target stop — tariff enforcement) and are EXCLUDED from
+/// the pressure `drop_order`. Both lists key ι strictly WITHIN an owner (H2 holds in
+/// both). In abundance (not evicting) the cap does nothing (W9 greed: the disk would
+/// otherwise idle; a whale parks freely, but its excess goes FIRST at the next
+/// contention). A disabled cap ([`RetentionCap::disabled`]) yields empty `cap_drops`
+/// and the exact pre-3b behaviour.
 pub fn eviction_order(
     owners: &[OwnerEvictionView],
     phi: f64,
     hyst: Hysteresis,
     prev: EvictPhase,
     depth_params: &DepthParams,
+    cap: &RetentionCap,
 ) -> EvictionDecision {
     // --- Relay latch with hysteresis on the lower (evict) gap. ---
     let mut evicting = prev.evicting;
@@ -476,10 +569,11 @@ pub fn eviction_order(
     }
     // (s_hard ≤ φ < s_target ⇒ hold previous state: this is the Δ_evict deadband.)
 
-    let drop_order = if evicting {
-        // INTER-owner: rank owners by ascending κ_O (kappa_key: the fast reciprocal
-        // capital `g_ho` plus the slow W10 depth floor) — the owner that has served
-        // ME least loses disk first — with the `observed_tau` retention tie-breaker.
+    let (cap_drops, drop_order) = if evicting {
+        // INTER-owner rank (SHARED by both lists): ascending κ_O (kappa_key: the fast
+        // reciprocal capital `g_ho` plus the slow W10 depth floor) — the owner that has
+        // served ME least loses disk first — with the `observed_tau` retention
+        // tie-breaker (longer-held owner-pair dropped LAST).
         let kappa =
             |v: &OwnerEvictionView| kappa_key(v.obs.g_holder_from_owner, v.depth, depth_params);
         let mut owner_idx: Vec<usize> = (0..owners.len()).collect();
@@ -492,35 +586,80 @@ pub fn eviction_order(
             )
         });
 
-        // Flatten: for each owner in that order, emit ITS symbols ascending by ι.
-        // ι is sorted ONLY within this owner — never compared across owners — so a
-        // high-ι symbol of a low-G owner still drops before any symbol of a
-        // higher-G owner. This is the structural ban on cross-owner ×ι.
+        // INTRA-owner ladder (per owner): ascending ι, [`SymbolId`] tie-break. Computed
+        // ONCE and reused by BOTH lists — ι is sorted ONLY within an owner, never across
+        // owners, so a high-ι symbol of a low-κ owner still drops before any symbol of a
+        // higher-κ owner. This is the structural ban on cross-owner ×ι (H2).
+        let sorted_syms: Vec<Vec<usize>> = owners
+            .iter()
+            .map(|o| {
+                let mut idx: Vec<usize> = (0..o.symbols.len()).collect();
+                idx.sort_by(|&a, &b| {
+                    o.symbols[a]
+                        .importance
+                        .total_cmp(&o.symbols[b].importance)
+                        .then(o.symbols[a].id.cmp(&o.symbols[b].id))
+                });
+                idx
+            })
+            .collect();
+
+        // Р-7 cap_drops (A.14 ⭐): MANDATORY tariff enforcement. For each owner in κ_O
+        // order, trim its parked volume down to V_ret = v_free + κ_O/c_recip by dropping
+        // its LOWEST-ι symbols first (the excess V_parked − V_ret is evicted first).
+        // Only when the cap is active (c_recip > 0 — else V_ret is unbounded).
+        let mut capped: Vec<Vec<bool>> = owners
+            .iter()
+            .map(|o| vec![false; o.symbols.len()])
+            .collect();
+        let mut cap_drops: Vec<SymbolSlot> = Vec::new();
+        if cap.active() {
+            for &oi in &owner_idx {
+                let v_ret = cap.v_ret(kappa(&owners[oi]));
+                let mut parked: f64 = owners[oi].symbols.iter().map(|s| s.volume).sum();
+                if parked <= v_ret {
+                    continue;
+                }
+                for &si in &sorted_syms[oi] {
+                    if parked <= v_ret {
+                        break;
+                    }
+                    cap_drops.push(SymbolSlot {
+                        owner_idx: oi,
+                        symbol_idx: si,
+                    });
+                    capped[oi][si] = true;
+                    parked -= owners[oi].symbols[si].volume;
+                }
+            }
+        }
+
+        // Pressure drop_order: every REMAINING (non-cap-trimmed) symbol, same two-level
+        // order. The caller stops at φ ≥ s_target; cap_drops are already excluded here
+        // so no symbol is dropped twice.
         let mut slots: Vec<SymbolSlot> = Vec::new();
         for &oi in &owner_idx {
-            let mut sym_idx: Vec<usize> = (0..owners[oi].symbols.len()).collect();
-            sym_idx.sort_by(|&a, &b| {
-                owners[oi].symbols[a]
-                    .importance
-                    .total_cmp(&owners[oi].symbols[b].importance)
-                    .then(owners[oi].symbols[a].id.cmp(&owners[oi].symbols[b].id))
-            });
-            for si in sym_idx {
+            for &si in &sorted_syms[oi] {
+                if capped[oi][si] {
+                    continue;
+                }
                 slots.push(SymbolSlot {
                     owner_idx: oi,
                     symbol_idx: si,
                 });
             }
         }
-        slots
+
+        (cap_drops, slots)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
     // Accept only above the upper gap and only when not evicting (Δ_accept).
     let accept_ok = phi > hyst.s_soft && !evicting;
 
     EvictionDecision {
+        cap_drops,
         drop_order,
         accept_ok,
         phase: EvictPhase { evicting },

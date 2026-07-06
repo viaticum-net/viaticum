@@ -35,6 +35,8 @@ fn obs(g_holder_from_owner: f64, tau: f64) -> OwnerEvictionView {
         symbols: vec![SymbolDecl {
             id: SymbolId(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
             importance: 1.0,
+            // SIM-2 predates the Р-7 volume cap (RetentionCap::disabled()); volume inert.
+            volume: 1.0,
         }],
     }
 }

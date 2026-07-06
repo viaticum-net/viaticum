@@ -21,8 +21,9 @@
 //! kernel function — it uses them only to drive BEHAVIOUR.
 
 use viaticum_core::four_r::{
-    BlockReq, DepthParams, Hysteresis, NodeLocal, PlacementPolicy, RetentionPrior, SurfacePrior,
-    capital_steady_state, estimate_surface, eviction_order, retained_depth, update_depth,
+    BlockReq, DepthParams, Hysteresis, NodeLocal, PlacementPolicy, RetentionCap, RetentionPrior,
+    SurfacePrior, capital_steady_state, estimate_surface, eviction_order, kappa_key,
+    retained_depth, update_depth,
 };
 
 use crate::generator::Rng;
@@ -51,6 +52,18 @@ pub struct DynParams {
     /// the loyalty floor saturates. The kernel `DepthParams.d_ref` is this ×
     /// `v_per_symbol` gb·days. §13 default 365 (≈ one year of a single symbol).
     pub depth_ref_days: f64,
+    /// Р-7 (A.14) reciprocity price `c_recip` in DAYS: the holder-side volume cap is
+    /// `V_ret(O) = V_free + κ_O/c_recip` ([`RetentionCap`]). κ_O is in gb·days and
+    /// V_ret in gb, so `c_recip` MUST be a DURATION (WARN-1 — a dimensionless value
+    /// would drift with λ). §13 default ≈ 30 days ("+1 gb of retention per 30 gb·days
+    /// of lived service above V_free"). `≤ 0` DISABLES the cap (WARN-1 guard).
+    pub c_recip_days: f64,
+    /// Р-7 (A.14) free retention floor `V_free`, in UNITS of `v_per_symbol`: the
+    /// kernel `RetentionCap.v_free` is this × `v_per_symbol` gb. Every owner keeps this
+    /// much for free (bootstrap-by-storage entry; the newcomer's first backup survives).
+    /// **OPEN calibration guess (spec 3b): `2.0` = 2 symbols' worth** — flagged for
+    /// review, NOT a settled canon value.
+    pub v_free_symbols: f64,
     /// Per-symbol erasure count `n` for own-data blocks.
     pub n_symbols: usize,
     /// Reconstruction threshold `k_eff`.
@@ -150,6 +163,10 @@ impl Default for DynParams {
             lambda_slow: 1.0 / 180.0,
             depth_w_d: 0.5,
             depth_ref_days: 365.0,
+            // Р-7 (A.14 / §13): c_recip ≈ 30 days (Ilya); V_free = 2·v_per_symbol is an
+            // OPEN calibration guess (spec 3b) — "first backup of a newcomer survives".
+            c_recip_days: 30.0,
+            v_free_symbols: 2.0,
             n_symbols: 5,
             k_eff: 2,
             r_target: 0.90,
@@ -215,6 +232,28 @@ pub fn retention_prior(params: &DynParams) -> RetentionPrior {
             standing_scale: 2.0,
             ..RetentionPrior::default()
         }
+    }
+}
+
+/// The A.14 κ_O depth params (holder-independent): the kernel does not know λ/V_sym,
+/// so the caller carries `g*` and the days→gb·days `d_ref` conversion. SHARED by
+/// `run_eviction` (inter-owner rank + Р-7 cap) and `admit_offer` (preemption + accept
+/// guard) so all three holder-side mechanisms read the SAME κ_O (B-1, fix ADV2-D2).
+fn depth_params_of(params: &DynParams, v_per_symbol: f64) -> DepthParams {
+    DepthParams {
+        w_d: params.depth_w_d,
+        d_ref: params.depth_ref_days * v_per_symbol,
+        g_star: capital_steady_state(v_per_symbol, params.lambda),
+    }
+}
+
+/// The Р-7 (A.14) holder-side volume cap `V_ret = V_free + κ_O/c_recip` in kernel
+/// units: `V_free = v_free_symbols·v_per_symbol` gb, `c_recip = c_recip_days` days.
+/// `c_recip ≤ 0` DISABLES the cap ([`RetentionCap::disabled`], WARN-1 guard).
+fn retention_cap(params: &DynParams, v_per_symbol: f64) -> RetentionCap {
+    RetentionCap {
+        v_free: params.v_free_symbols * v_per_symbol,
+        c_recip: params.c_recip_days,
     }
 }
 
@@ -613,16 +652,28 @@ fn try_place_one_symbol(
     false
 }
 
-/// The holder accept/preemption gate (§9 / A.12). Returns whether `holder` admits a new
-/// symbol from `owner`. In abundance: accept freely (willing ∧ room ∧ above the accept
-/// gate). Under contention: a PREEMPTIVE swap — displace the holder's least-reciprocal
-/// current owner `O_min` (its LOW-ι symbol, WARN-4) iff `g_ho(owner) > g_ho(O_min) +
-/// θ_p·g*` (WARN-1). The swap is φ-neutral (one out + one in ≈ equal volume), so it
-/// bypasses the accept freeze without thrash. A parasite (g_ho≈0 with all) can never
-/// satisfy the margin, so it cannot preempt in. Side effects (eviction of the victim,
-/// logging, counters) happen here; the caller records the accepted holding.
+/// The holder accept/preemption gate (§9 / A.12-2). Returns whether `holder` admits a
+/// new symbol from `owner`. In abundance: accept freely (willing ∧ room ∧ above the
+/// accept gate). Under contention: a PREEMPTIVE swap — displace the holder's
+/// least-reciprocal current owner `O_min` by the SINGLE key κ_O (its LOW-ι symbol,
+/// WARN-4) iff `κ_O(owner) > κ_O(O_min) + θ_p·g*` (WARN-1). The swap is φ-neutral (one
+/// out + one in ≈ equal volume), so it bypasses the accept freeze without thrash.
 ///
-// TODO 3b: unify κ (preemption still ranks by bare g_ho — ADV2-D2 window open until 3b)
+/// **Unified κ_O (транш 3b, closes ADV2-D2).** Both the victim rank and the offering
+/// owner's key read the SAME `kappa_key` (`g_ho + w_d·sat(D/d_ref)·g*`) that the
+/// eviction inter-owner rank and the Р-7 cap use — NOT bare `g_ho`. A bare-`g_ho`
+/// preemption would evict a silent-but-DEEP loyal partner (`g_ho→0`, `D≥d_ref`) while a
+/// shallow stranger with more fast capital survived (W10 broke under contention); on κ_O
+/// the deep partner ranks above the stranger, so it is not the victim. A parasite
+/// (κ_O≈0 with all) still can never clear the margin, so it cannot preempt in.
+///
+/// **Accept-guard (B-1 consistency, spec-3b decision above the model letter).** The
+/// preemption path REJECTS the offer if the OWNER's own V_ret cannot hold it
+/// (`V_parked(owner) + v_per_symbol > V_ret(owner)`), so we never "admit then instantly
+/// cap-trim". The free-accept (abundance) path is deliberately NOT gated by the cap.
+///
+/// Side effects (eviction of the victim, logging, counters) happen here; the caller
+/// records the accepted holding.
 fn admit_offer(
     world: &mut World,
     owner: usize,
@@ -648,12 +699,38 @@ fn admit_offer(
         return false;
     }
     let margin = params.preempt_theta * capital_steady_state(v_per_symbol, params.lambda);
-    let g_new = world.capital[owner][holder].g_ho;
 
-    // Victim OWNER = the holder's least-reciprocal DISTINCT alive foreign owner (min g_ho,
-    // excluding `owner` — don't cannibalise the offering owner's own data).
+    // SINGLE key κ_O (B-1): the same kappa_key the eviction rank + Р-7 cap read.
+    let depth_params = depth_params_of(params, v_per_symbol);
+    let cap = retention_cap(params, v_per_symbol);
+    let kappa_of = |o: usize| {
+        kappa_key(
+            world.capital[o][holder].g_ho,
+            world.capital[o][holder].depth_ho,
+            &depth_params,
+        )
+    };
+    let kappa_new = kappa_of(owner);
+
+    // Accept-guard (B-1): don't admit a symbol the OWNER's own V_ret cannot hold (it would
+    // just be cap-trimmed next eviction). Free-accept path above is NOT gated by the cap.
+    if cap.active() {
+        let v_parked: f64 = world.nodes[holder]
+            .holdings
+            .iter()
+            .filter(|s| s.alive && s.owner == owner)
+            .map(|s| s.volume)
+            .sum();
+        if v_parked + v_per_symbol > cap.v_ret(kappa_new) {
+            return false;
+        }
+    }
+
+    // Victim OWNER = the holder's least-reciprocal DISTINCT alive foreign owner by κ_O
+    // (min κ, NOT bare g_ho — the ADV2-D2 fix), excluding `owner` (don't cannibalise the
+    // offering owner's own data).
     let mut victim_owner: Option<usize> = None;
-    let mut g_min = f64::INFINITY;
+    let mut kappa_min = f64::INFINITY;
     let mut seen: Vec<usize> = Vec::new();
     for s in world.nodes[holder]
         .holdings
@@ -664,9 +741,9 @@ fn admit_offer(
             continue;
         }
         seen.push(s.owner);
-        let g = world.capital[s.owner][holder].g_ho;
-        if g < g_min {
-            g_min = g;
+        let k = kappa_of(s.owner);
+        if k < kappa_min {
+            kappa_min = k;
             victim_owner = Some(s.owner);
         }
     }
@@ -674,8 +751,8 @@ fn admit_offer(
         Some(v) => v,
         None => return false,
     };
-    if g_new <= g_min + margin {
-        return false; // parasite (g_new≈0) can never clear this
+    if kappa_new <= kappa_min + margin {
+        return false; // parasite (κ_new≈0) can never clear this
     }
     // WARN-4: the victim symbol is O_min's LOWEST-ι symbol on this holder (intra-owner
     // ladder), not the first in storage order.
@@ -693,13 +770,16 @@ fn admit_offer(
     if world.nodes[holder].free_disk() + v_vol < v_per_symbol {
         return false; // swap would not actually free enough room
     }
-    // Evict the victim (φ-neutral swap): mark dead, log, drop the owner's placement.
+    // Evict the victim (φ-neutral swap): mark dead, log, drop the owner's placement. The
+    // logged `g_ho_at_drop` is the victim's BARE g_ho (diagnostic continuity §2c — the
+    // rank now uses κ_O, but the drop-reciprocity metric still reads the raw g_ho).
+    let g_ho_at_drop = world.capital[vo][holder].g_ho;
     world.nodes[holder].holdings[v_idx].alive = false;
     world.eviction_log.push(EvictionEvent {
         tick,
         holder,
         owner: vo,
-        g_ho_at_drop: g_min,
+        g_ho_at_drop,
     });
     world.preempt_count += 1;
     if let Some(b) = world.nodes[vo]
@@ -895,14 +975,12 @@ fn run_eviction(world: &mut World, params: &DynParams) {
     let tick = world.tick;
     let mut any_eviction_this_tick = false;
 
-    // A.14 κ_O depth params — computed once (holder-independent): the kernel does not
-    // know λ/V_sym, so the caller carries g* and the days→gb·days d_ref conversion.
+    // A.14 κ_O depth params + Р-7 volume cap — computed once (holder-independent). The
+    // kernel does not know λ/V_sym, so the caller carries g*, the days→gb·days d_ref
+    // conversion, and V_free/c_recip. SHARED with `admit_offer` (same κ_O — B-1).
     let v_per_symbol = v_per_symbol_of(params);
-    let depth_params = DepthParams {
-        w_d: params.depth_w_d,
-        d_ref: params.depth_ref_days * v_per_symbol,
-        g_star: capital_steady_state(v_per_symbol, params.lambda),
-    };
+    let depth_params = depth_params_of(params, v_per_symbol);
+    let cap = retention_cap(params, v_per_symbol);
 
     for holder in 0..n {
         if !world.nodes[holder].present {
@@ -945,59 +1023,100 @@ fn run_eviction(world: &mut World, params: &DynParams) {
             dt,
         );
 
-        let decision = eviction_order(&views, phi, params.hyst, prev, &depth_params);
+        let decision = eviction_order(&views, phi, params.hyst, prev, &depth_params, &cap);
         world.nodes[holder].evict_phase = decision.phase;
 
-        if !decision.phase.evicting || decision.drop_order.is_empty() {
+        if !decision.phase.evicting {
             continue;
         }
 
-        // NOTE1: resolve ALL (owner_idx, block) drop targets from the PRE-mutation
-        // holdings BEFORE killing any symbol (a holder holds ≤1 symbol per (owner, block)
-        // by the §7 spread, so (owner, block) is a unique symbol key on this holder).
-        let mut targets: Vec<(usize, usize)> = Vec::new();
-        for slot in &decision.drop_order {
-            let owner_idx = match owner_of_view.get(slot.owner_idx) {
-                Some(&o) => o,
-                None => continue,
-            };
-            if let Some(block) = nth_alive_block(&world.nodes[holder], owner_idx, slot.symbol_idx) {
-                targets.push((owner_idx, block));
+        // NOTE1: resolve ALL (owner_idx, block) drop targets — for BOTH the Р-7
+        // cap_drops AND the pressure drop_order — from ONE PRE-mutation snapshot before
+        // killing any symbol (a holder holds ≤1 symbol per (owner, block) by the §7
+        // spread, so (owner, block) is a unique symbol key; killing one must not renumber
+        // the `nth_alive` mapping of the others). The two lists are disjoint (the kernel
+        // excludes cap_drops from drop_order), so the resolved targets are disjoint too.
+        let resolve = |slots: &[viaticum_core::four_r::SymbolSlot]| -> Vec<(usize, usize)> {
+            let mut out: Vec<(usize, usize)> = Vec::new();
+            for slot in slots {
+                let owner_idx = match owner_of_view.get(slot.owner_idx) {
+                    Some(&o) => o,
+                    None => continue,
+                };
+                if let Some(block) =
+                    nth_alive_block(&world.nodes[holder], owner_idx, slot.symbol_idx)
+                {
+                    out.push((owner_idx, block));
+                }
+            }
+            out
+        };
+        let cap_targets = resolve(&decision.cap_drops);
+        let pressure_targets = resolve(&decision.drop_order);
+
+        // Р-7 cap_drops FIRST, UNCONDITIONALLY (tariff enforcement — NOT gated on the
+        // φ-target; the excess above V_ret leaves regardless of how much room it frees).
+        for (owner_idx, block) in cap_targets {
+            if evict_symbol(world, holder, owner_idx, block, tick) {
+                any_eviction_this_tick = true;
+                world.cap_trim_count += 1;
             }
         }
 
-        for (owner_idx, block) in targets {
+        // THEN the pressure drops, stopping once φ has recovered to s_target.
+        for (owner_idx, block) in pressure_targets {
             if world.nodes[holder].phi_free_ratio() >= params.hyst.s_target {
                 break;
             }
-            let g_ho_at_drop = world.capital[owner_idx][holder].g_ho;
-            if let Some(hs) = world.nodes[holder]
-                .holdings
-                .iter_mut()
-                .find(|s| s.alive && s.owner == owner_idx && s.block == block)
-            {
-                hs.alive = false;
+            if evict_symbol(world, holder, owner_idx, block, tick) {
                 any_eviction_this_tick = true;
-                world.eviction_log.push(EvictionEvent {
-                    tick,
-                    holder,
-                    owner: owner_idx,
-                    g_ho_at_drop,
-                });
-            }
-            if let Some(b) = world.nodes[owner_idx]
-                .own_blocks
-                .iter_mut()
-                .find(|b| b.id == block)
-                && let Some(pos) = b.placements.iter().position(|p| p.holder == holder)
-            {
-                b.placements.remove(pos);
             }
         }
     }
     if any_eviction_this_tick {
         world.ticks_with_eviction += 1;
     }
+}
+
+/// Kill one alive symbol `(owner, block)` on `holder` (god-view): mark it dead, log the
+/// [`EvictionEvent`] with the victim's BARE `g_ho` (`g_ho_at_drop` — diagnostic
+/// continuity §2c), and drop the owner's placement bookkeeping. Returns whether a symbol
+/// was actually killed (it may already be dead if resolved-then-superseded). Shared by
+/// the Р-7 cap trims and the pressure drops so both apply identically.
+fn evict_symbol(
+    world: &mut World,
+    holder: usize,
+    owner_idx: usize,
+    block: usize,
+    tick: u64,
+) -> bool {
+    let g_ho_at_drop = world.capital[owner_idx][holder].g_ho;
+    let killed = if let Some(hs) = world.nodes[holder]
+        .holdings
+        .iter_mut()
+        .find(|s| s.alive && s.owner == owner_idx && s.block == block)
+    {
+        hs.alive = false;
+        world.eviction_log.push(EvictionEvent {
+            tick,
+            holder,
+            owner: owner_idx,
+            g_ho_at_drop,
+        });
+        true
+    } else {
+        false
+    };
+    if killed
+        && let Some(b) = world.nodes[owner_idx]
+            .own_blocks
+            .iter_mut()
+            .find(|b| b.id == block)
+        && let Some(pos) = b.placements.iter().position(|p| p.holder == holder)
+    {
+        b.placements.remove(pos);
+    }
+    killed
 }
 
 /// The `idx`-th alive block of `owner` on `holder`, in the observer's symbol order
@@ -1165,6 +1284,11 @@ pub fn admit_offer_for_test(
 #[cfg(test)]
 pub fn pos_and_capital_for_test(world: &mut World, params: &DynParams) {
     pos_and_capital(world, params);
+}
+
+#[cfg(test)]
+pub fn run_eviction_for_test(world: &mut World, params: &DynParams) {
+    run_eviction(world, params);
 }
 
 #[cfg(test)]

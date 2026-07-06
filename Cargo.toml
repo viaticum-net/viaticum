@@ -14,6 +14,12 @@ rust-version = "1.89"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+# Surface pub items never used cross-crate → candidates for pub(crate)/dead-code.
+# Started as "warn" for a one-time harvest sweep (2026-07-06); promote to "deny"
+# after the inventory is triaged and cleaned. dead_code (warn by default) then
+# catches the truly-unused once visibility is narrowed. Class-2 wiring-gaps
+# (test-only-reachable) are NOT caught by any lint — see arch machinery review.
+unreachable_pub = "warn"
 
 [workspace.lints.clippy]
 todo = "deny"

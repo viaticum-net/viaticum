@@ -155,6 +155,7 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
         first_earned_g: vec![None; n],
         first_own_accept: vec![None; n],
         preempt_count: 0,
+        cap_trim_count: 0,
         repair_stat: crate::sim_dynamic::generator::RepairStat::default(),
     }
 }

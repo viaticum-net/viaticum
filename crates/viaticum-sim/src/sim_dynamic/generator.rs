@@ -551,6 +551,12 @@ pub struct World {
     /// A.12-2). The bootstrap-world value was ~0 ("starved, not frozen"); this counts
     /// whether the world-v2 physics lets preemption actually engage.
     pub preempt_count: usize,
+    /// World-v2 §9 / Р-7 (A.14) counter: how many times a HOLDER-SIDE VOLUME-CAP trim
+    /// fired (a holder dropped an owner's excess parked volume above `V_ret = V_free +
+    /// κ_O/c_recip`, транш 3b). Distinct from `preempt_count` (an accept-time swap) and
+    /// from the pressure-relief drops; the cap trims are ALSO counted in `eviction_log`,
+    /// so this is a SEPARATE tally of just the tariff-enforcement subset.
+    pub cap_trim_count: usize,
     /// Repair-storm instrumentation (§7): the LAST tick's repair activity, overwritten
     /// by `engine::place_own_data` each tick. Lets a god-view diagnostic read the
     /// per-tick repair concurrency / demand the engine actually acted on (detection-

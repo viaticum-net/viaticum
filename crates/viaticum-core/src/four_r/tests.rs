@@ -43,6 +43,9 @@ fn owner_view(
         symbols: vec![SymbolDecl {
             id: SymbolId(sym_id),
             importance,
+            // Unit volume: the legacy eviction tests pass RetentionCap::disabled(), so
+            // the Р-7 cap never reads `volume` (it is inert here).
+            volume: 1.0,
         }],
     }
 }
@@ -62,6 +65,7 @@ fn owner_view_depth(
         symbols: vec![SymbolDecl {
             id: SymbolId(sym_id),
             importance,
+            volume: 1.0, // inert under RetentionCap::disabled() (see owner_view).
         }],
     }
 }
@@ -94,6 +98,7 @@ fn owner_view_multi(
             .map(|(i, &importance)| SymbolDecl {
                 id: SymbolId(base + i as u64),
                 importance,
+                volume: 1.0, // inert under RetentionCap::disabled() (see owner_view).
             })
             .collect(),
     }
@@ -191,7 +196,14 @@ fn eviction_orders_net_debtors_before_net_creditors() {
         s_target: 0.2,
         s_soft: 0.3,
     };
-    let dec = eviction_order(&owners, 0.05, hyst, EvictPhase::default(), &dp_zero());
+    let dec = eviction_order(
+        &owners,
+        0.05,
+        hyst,
+        EvictPhase::default(),
+        &dp_zero(),
+        &RetentionCap::disabled(),
+    );
     assert_eq!(
         owner_seq(&dec),
         vec![2, 1, 0],
@@ -210,7 +222,14 @@ fn eviction_returns_empty_drop_order_when_not_under_pressure() {
         s_soft: 0.3,
     };
     // φ well above s_soft, not previously evicting ⇒ nothing dropped, accept ok.
-    let dec = eviction_order(&owners, 0.9, hyst, EvictPhase::default(), &dp_zero());
+    let dec = eviction_order(
+        &owners,
+        0.9,
+        hyst,
+        EvictPhase::default(),
+        &dp_zero(),
+        &RetentionCap::disabled(),
+    );
     assert!(dec.drop_order.is_empty());
     assert!(!dec.phase.evicting);
     assert!(dec.accept_ok);
@@ -228,7 +247,14 @@ fn eviction_retention_tiebreak_drops_shorter_held_first_among_equal_capital() {
         s_target: 0.2,
         s_soft: 0.3,
     };
-    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default(), &dp_zero());
+    let dec = eviction_order(
+        &owners,
+        0.0,
+        hyst,
+        EvictPhase::default(),
+        &dp_zero(),
+        &RetentionCap::disabled(),
+    );
     assert_eq!(
         owner_seq(&dec),
         vec![1, 0],
@@ -246,7 +272,14 @@ fn eviction_orders_symbols_within_an_owner_by_ascending_importance() {
         s_target: 0.2,
         s_soft: 0.3,
     };
-    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default(), &dp_zero());
+    let dec = eviction_order(
+        &owners,
+        0.0,
+        hyst,
+        EvictPhase::default(),
+        &dp_zero(),
+        &RetentionCap::disabled(),
+    );
     // symbol_idx order: index 1 (ι=0.1) first, index 2 (ι=0.5), index 0 (ι=0.9) last.
     let sym_seq: Vec<usize> = dec.drop_order.iter().map(|s| s.symbol_idx).collect();
     assert!(
@@ -273,7 +306,14 @@ fn eviction_is_two_level_g_dominates_importance_across_owners() {
         s_target: 0.2,
         s_soft: 0.3,
     };
-    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default(), &dp_zero());
+    let dec = eviction_order(
+        &owners,
+        0.0,
+        hyst,
+        EvictPhase::default(),
+        &dp_zero(),
+        &RetentionCap::disabled(),
+    );
     assert_eq!(
         owner_seq(&dec),
         vec![0, 1],
@@ -291,14 +331,35 @@ fn eviction_latch_holds_state_inside_the_deadband() {
         s_soft: 0.3,
     };
     // Enter evicting below s_hard.
-    let d1 = eviction_order(&owners, 0.05, hyst, EvictPhase::default(), &dp_zero());
+    let d1 = eviction_order(
+        &owners,
+        0.05,
+        hyst,
+        EvictPhase::default(),
+        &dp_zero(),
+        &RetentionCap::disabled(),
+    );
     assert!(d1.phase.evicting);
     // φ rises into the deadband (s_hard ≤ φ < s_target): latch HOLDS → still evicting.
-    let d2 = eviction_order(&owners, 0.15, hyst, d1.phase, &dp_zero());
+    let d2 = eviction_order(
+        &owners,
+        0.15,
+        hyst,
+        d1.phase,
+        &dp_zero(),
+        &RetentionCap::disabled(),
+    );
     assert!(d2.phase.evicting, "deadband must hold the evicting latch");
     assert!(!d2.drop_order.is_empty());
     // φ reaches s_target: latch releases.
-    let d3 = eviction_order(&owners, 0.2, hyst, d2.phase, &dp_zero());
+    let d3 = eviction_order(
+        &owners,
+        0.2,
+        hyst,
+        d2.phase,
+        &dp_zero(),
+        &RetentionCap::disabled(),
+    );
     assert!(!d3.phase.evicting, "reaching s_target releases the latch");
 }
 
@@ -332,8 +393,22 @@ fn inflating_own_importance_does_not_steal_share_from_other_owner() {
     let a_liar = owner_view_multi(2.0, 10.0, &[1.0, 1.0, 1.0], 10);
     let lying = vec![a_liar, b];
 
-    let dec_honest = eviction_order(&honest, 0.0, hyst, EvictPhase::default(), &dp_zero());
-    let dec_lying = eviction_order(&lying, 0.0, hyst, EvictPhase::default(), &dp_zero());
+    let dec_honest = eviction_order(
+        &honest,
+        0.0,
+        hyst,
+        EvictPhase::default(),
+        &dp_zero(),
+        &RetentionCap::disabled(),
+    );
+    let dec_lying = eviction_order(
+        &lying,
+        0.0,
+        hyst,
+        EvictPhase::default(),
+        &dp_zero(),
+        &RetentionCap::disabled(),
+    );
 
     // Owner A is index 0 in both. Helper: which owner each drop slot belongs to.
     let owners_honest = owner_seq(&dec_honest);
@@ -512,7 +587,14 @@ fn eviction_drops_stranger_before_silent_deep_partner() {
         s_target: 0.2,
         s_soft: 0.3,
     };
-    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default(), &p);
+    let dec = eviction_order(
+        &owners,
+        0.0,
+        hyst,
+        EvictPhase::default(),
+        &p,
+        &RetentionCap::disabled(),
+    );
     assert_eq!(
         owner_seq(&dec),
         vec![1, 0],
@@ -553,7 +635,14 @@ fn eviction_deep_floor_fades_after_years_of_silence() {
         s_target: 0.2,
         s_soft: 0.3,
     };
-    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default(), &p);
+    let dec = eviction_order(
+        &owners,
+        0.0,
+        hyst,
+        EvictPhase::default(),
+        &p,
+        &RetentionCap::disabled(),
+    );
     let seq = owner_seq(&dec);
     assert_eq!(seq.last(), Some(&2), "the still-deep partner drops LAST");
     let pos = |o: usize| seq.iter().position(|&x| x == o).unwrap();
@@ -579,7 +668,14 @@ fn eviction_cross_owner_iota_ban_still_holds() {
         s_target: 0.2,
         s_soft: 0.3,
     };
-    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default(), &p);
+    let dec = eviction_order(
+        &owners,
+        0.0,
+        hyst,
+        EvictPhase::default(),
+        &p,
+        &RetentionCap::disabled(),
+    );
     assert_eq!(
         owner_seq(&dec),
         vec![0, 1],
@@ -610,8 +706,16 @@ fn eviction_kappa_reads_only_first_hand_no_archetype_channel() {
         hyst,
         EvictPhase::default(),
         &p,
+        &RetentionCap::disabled(),
     );
-    let dec_ba = eviction_order(&[b, a], 0.0, hyst, EvictPhase::default(), &p);
+    let dec_ba = eviction_order(
+        &[b, a],
+        0.0,
+        hyst,
+        EvictPhase::default(),
+        &p,
+        &RetentionCap::disabled(),
+    );
     assert_eq!(
         owner_seq(&dec_ab),
         vec![0, 1],
@@ -621,6 +725,437 @@ fn eviction_kappa_reads_only_first_hand_no_archetype_channel() {
         owner_seq(&dec_ba),
         vec![0, 1],
         "swapping the two equal-κ owners swaps their drop positions symmetrically"
+    );
+}
+
+// ============================================================
+// eviction_order — Р-7 holder-side volume cap V_ret (A.14 ⭐, transaction 3b).
+// ============================================================
+
+/// An [`OwnerEvictionView`] with explicit per-symbol `(id, importance, volume)` tuples,
+/// a loyalty depth `D`, and pairwise capital `g_ho` — the shape the Р-7 cap tests need
+/// (they must set real volumes, unlike the legacy unit-volume helpers).
+fn owner_view_vols(g_ho: f64, depth: f64, tau: f64, syms: &[(u64, f64, f64)]) -> OwnerEvictionView {
+    OwnerEvictionView {
+        obs: obs_with(g_ho, tau),
+        depth,
+        symbols: syms
+            .iter()
+            .map(|&(id, importance, volume)| SymbolDecl {
+                id: SymbolId(id),
+                importance,
+                volume,
+            })
+            .collect(),
+    }
+}
+
+/// A `n` unit-volume symbols list with ascending ι and ids `base..base+n`.
+fn unit_syms(base: u64, n: u64) -> Vec<(u64, f64, f64)> {
+    (0..n).map(|i| (base + i, (i + 1) as f64, 1.0)).collect()
+}
+
+/// The standard evicting band; a φ of 0 is well below `s_hard` (the cap only bites
+/// while the relay is in the evicting state).
+fn evicting_band() -> Hysteresis {
+    Hysteresis {
+        s_hard: 0.1,
+        s_target: 0.2,
+        s_soft: 0.3,
+    }
+}
+
+/// True iff every owner-0 slot precedes every owner-1 slot in a flat slot sequence
+/// (the H2 property: ι orders only WITHIN an owner, never across owners).
+fn owner0_before_owner1(seq: &[usize]) -> bool {
+    match seq.iter().position(|&x| x == 1) {
+        None => true,
+        Some(p) => seq[p..].iter().all(|&x| x == 1),
+    }
+}
+
+#[test]
+fn retention_cap_trims_excess_lowest_iota_first_within_owner() {
+    // One owner, κ_O = 0 (g_ho = 0, depth = 0) ⇒ V_ret = v_free = 2. It parks 5
+    // unit-volume symbols (V_parked = 5) ⇒ the excess 3 gb is trimmed, LOWEST-ι first.
+    let p = dp_canon();
+    let cap = RetentionCap {
+        v_free: 2.0,
+        c_recip: 30.0,
+    };
+    // (id, ι, volume): ι deliberately out of id order to prove the sort is on ι.
+    let owner = owner_view_vols(
+        0.0,
+        0.0,
+        5.0,
+        &[
+            (10, 5.0, 1.0),
+            (11, 1.0, 1.0),
+            (12, 4.0, 1.0),
+            (13, 2.0, 1.0),
+            (14, 3.0, 1.0),
+        ],
+    );
+    let owners = vec![owner];
+    let dec = eviction_order(
+        &owners,
+        0.0,
+        evicting_band(),
+        EvictPhase::default(),
+        &p,
+        &cap,
+    );
+
+    // Trimmed the three lowest-ι symbols, ascending ι: ι=1 (id11), ι=2 (id13), ι=3 (id14).
+    let cap_ids: Vec<u64> = dec
+        .cap_drops
+        .iter()
+        .map(|s| owners[s.owner_idx].symbols[s.symbol_idx].id.0)
+        .collect();
+    assert_eq!(
+        cap_ids,
+        vec![11, 13, 14],
+        "lowest-ι symbols are trimmed first"
+    );
+
+    // The remaining parked volume is ≤ V_ret (= 2.0): the two HIGH-ι symbols survive.
+    let capped: Vec<usize> = dec.cap_drops.iter().map(|s| s.symbol_idx).collect();
+    let remaining: f64 = owners[0]
+        .symbols
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !capped.contains(i))
+        .map(|(_, s)| s.volume)
+        .sum();
+    assert!(
+        remaining <= 2.0 + 1e-9,
+        "remaining parked {remaining} must be ≤ V_ret"
+    );
+    assert_eq!(
+        remaining, 2.0,
+        "exactly the top-2 ι symbols (ι=4,5) are kept"
+    );
+}
+
+#[test]
+fn retention_cap_epsilon_whale_parks_at_most_v_free_plus_margin() {
+    // P1b: an ε-GIVE whale (κ_O ≈ ε > 0, NOT zero-give) that piles 10 symbols on a
+    // holder is capped near V_free — its parked volume is BOUNDED, not unbounded.
+    let p = dp_canon();
+    let cap = RetentionCap {
+        v_free: 2.0,
+        c_recip: 30.0,
+    };
+    let eps = 0.03; // κ_O = g_ho = ε ⇒ V_ret = 2 + 0.03/30 = 2.001 (barely above V_free).
+    let owner = owner_view_vols(eps, 0.0, 5.0, &unit_syms(100, 10));
+    let owners = vec![owner];
+    let dec = eviction_order(
+        &owners,
+        0.0,
+        evicting_band(),
+        EvictPhase::default(),
+        &p,
+        &cap,
+    );
+
+    let v_ret = cap.v_ret(kappa_key(eps, 0.0, &p));
+    assert!(
+        (v_ret - 2.001).abs() < 1e-9,
+        "ε-give lifts V_ret only by ε/c_recip"
+    );
+    let remaining: f64 = (0..10usize)
+        .filter(|i| !dec.cap_drops.iter().any(|s| s.symbol_idx == *i))
+        .map(|i| owners[0].symbols[i].volume)
+        .sum();
+    // Parked ≤ V_ret ≈ V_free, and FAR below the 10 gb it tried to park (P1b bound).
+    assert!(
+        remaining <= v_ret + 1e-9,
+        "ε-whale parks ≤ V_ret ≈ V_free, got {remaining}"
+    );
+    assert_eq!(
+        remaining, 2.0,
+        "keeps 2 unit symbols (2.0 ≤ 2.001); the other 8 are trimmed"
+    );
+    assert_eq!(
+        dec.cap_drops.len(),
+        8,
+        "8 of the whale's 10 symbols are cap-trimmed"
+    );
+}
+
+#[test]
+fn retention_cap_deep_silent_partner_keeps_depth_floor_volume() {
+    // P5: a silent-but-DEEP partner (g_ho ≈ 0, D ≥ d_ref) gets a ROOMIER V_ret than a
+    // stranger — the W10 depth floor (κ_O = w_d·g*) buys retention capacity.
+    let p = dp_canon(); // g_star = 600, d_ref = 3650, w_d = 0.5.
+    let cap = RetentionCap {
+        v_free: 2.0,
+        c_recip: 30.0,
+    };
+    // Deep: κ_O = 0 + 0.5·1·600 = 300 ⇒ V_ret = 2 + 300/30 = 12.
+    let v_ret_deep = cap.v_ret(kappa_key(0.0, p.d_ref, &p));
+    assert!(
+        (v_ret_deep - 12.0).abs() < 1e-9,
+        "deep V_ret = V_free + w_d·g*/c_recip = 12"
+    );
+    // Stranger: κ_O = 0 ⇒ V_ret = 2.
+    let v_ret_str = cap.v_ret(kappa_key(0.0, 0.0, &p));
+    assert!((v_ret_str - 2.0).abs() < 1e-9);
+
+    // Each parks 20 unit symbols; measure how much each KEEPS after the cap.
+    let deep = owner_view_vols(0.0, p.d_ref, 5.0, &unit_syms(200, 20));
+    let stranger = owner_view_vols(0.0, 0.0, 5.0, &unit_syms(300, 20));
+    let kept = |ov: OwnerEvictionView| -> usize {
+        let owners = vec![ov];
+        let dec = eviction_order(
+            &owners,
+            0.0,
+            evicting_band(),
+            EvictPhase::default(),
+            &p,
+            &cap,
+        );
+        owners[0].symbols.len() - dec.cap_drops.len()
+    };
+    let kept_deep = kept(deep);
+    let kept_str = kept(stranger);
+    assert_eq!(
+        kept_deep, 12,
+        "deep partner keeps its 12 gb depth-floor envelope"
+    );
+    assert_eq!(kept_str, 2, "stranger keeps only V_free = 2 gb");
+    assert!(
+        kept_deep > kept_str,
+        "the depth floor makes the deep partner's V_ret roomier"
+    );
+}
+
+#[test]
+fn retention_cap_disabled_when_c_recip_nonpositive() {
+    // WARN-1 guard: c_recip ≤ 0 DISABLES the cap (no /0, no evict-all). Behaviour then
+    // reduces to the pre-3b pressure list (regress-equivalence).
+    let p = dp_canon();
+    // Two HUGE-volume symbols; an active cap would trim them, a disabled one must not.
+    let owner = owner_view_vols(0.0, 0.0, 5.0, &[(1, 1.0, 100.0), (2, 2.0, 100.0)]);
+    let owners = vec![owner];
+
+    let dec0 = eviction_order(
+        &owners,
+        0.0,
+        evicting_band(),
+        EvictPhase::default(),
+        &p,
+        &RetentionCap::disabled(),
+    );
+    assert!(dec0.cap_drops.is_empty(), "c_recip = 0 ⇒ no cap_drops");
+    let seq0: Vec<usize> = dec0.drop_order.iter().map(|s| s.symbol_idx).collect();
+    assert_eq!(
+        seq0,
+        vec![0, 1],
+        "drop_order is the full pre-3b ascending-ι list"
+    );
+
+    // Negative price must ALSO disable (not merely weaken) the cap.
+    let neg = RetentionCap {
+        v_free: 2.0,
+        c_recip: -5.0,
+    };
+    let dec_neg = eviction_order(
+        &owners,
+        0.0,
+        evicting_band(),
+        EvictPhase::default(),
+        &p,
+        &neg,
+    );
+    assert!(
+        dec_neg.cap_drops.is_empty(),
+        "c_recip < 0 also disables the cap (no evict-all)"
+    );
+    assert_eq!(dec_neg.drop_order.len(), 2);
+}
+
+#[test]
+fn retention_cap_active_iff_c_recip_positive() {
+    // Direct contract of the WARN-1 guard predicate (reviewer 3b NOTE-3).
+    assert!(!RetentionCap::disabled().active());
+    assert!(
+        !RetentionCap {
+            v_free: 2.0,
+            c_recip: -5.0
+        }
+        .active()
+    );
+    assert!(
+        RetentionCap {
+            v_free: 0.0,
+            c_recip: 30.0
+        }
+        .active()
+    );
+}
+
+#[test]
+fn cap_drops_and_pressure_drops_do_not_overlap() {
+    // The two lists partition the owner's symbols: every symbol appears in EXACTLY one
+    // (no double-drop). κ_O = 0 ⇒ V_ret = 2 ⇒ 3 of 5 symbols are cap-trimmed.
+    let p = dp_canon();
+    let cap = RetentionCap {
+        v_free: 2.0,
+        c_recip: 30.0,
+    };
+    let owner = owner_view_vols(0.0, 0.0, 5.0, &unit_syms(1, 5));
+    let owners = vec![owner];
+    let dec = eviction_order(
+        &owners,
+        0.0,
+        evicting_band(),
+        EvictPhase::default(),
+        &p,
+        &cap,
+    );
+
+    let cap_set: Vec<(usize, usize)> = dec
+        .cap_drops
+        .iter()
+        .map(|s| (s.owner_idx, s.symbol_idx))
+        .collect();
+    let pres_set: Vec<(usize, usize)> = dec
+        .drop_order
+        .iter()
+        .map(|s| (s.owner_idx, s.symbol_idx))
+        .collect();
+    for c in &cap_set {
+        assert!(
+            !pres_set.contains(c),
+            "cap_drops and drop_order must be disjoint: {c:?}"
+        );
+    }
+    assert_eq!(dec.cap_drops.len(), 3, "3 excess symbols trimmed");
+    assert_eq!(
+        dec.drop_order.len(),
+        2,
+        "the other 2 stay in the pressure list"
+    );
+    assert_eq!(
+        cap_set.len() + pres_set.len(),
+        5,
+        "every symbol appears exactly once"
+    );
+}
+
+#[test]
+fn cap_drops_empty_when_not_evicting() {
+    // In abundance (φ above s_target ⇒ not evicting) the cap does NOT bite, even though
+    // V_parked (100) massively exceeds V_ret (1) — W9 greed: the disk parks freely, the
+    // excess only leaves at the NEXT contention.
+    let p = dp_canon();
+    let cap = RetentionCap {
+        v_free: 1.0,
+        c_recip: 30.0,
+    };
+    let owner = owner_view_vols(0.0, 0.0, 5.0, &[(1, 1.0, 100.0)]);
+    let owners = vec![owner];
+    let dec = eviction_order(
+        &owners,
+        0.9,
+        evicting_band(),
+        EvictPhase::default(),
+        &p,
+        &cap,
+    );
+    assert!(!dec.phase.evicting, "φ above s_target ⇒ relay not evicting");
+    assert!(
+        dec.cap_drops.is_empty(),
+        "the cap does not trim in abundance"
+    );
+    assert!(dec.drop_order.is_empty());
+}
+
+#[test]
+fn eviction_cross_owner_iota_ban_still_holds_with_cap() {
+    // H2 in BOTH lists: a LOW-κ owner's symbols (even with MAXIMAL ι) all precede a
+    // HIGH-κ owner's symbols (even with minimal ι) — ι never jumps owners, in cap_drops
+    // AND in drop_order.
+    let p = dp_canon();
+    let cap = RetentionCap {
+        v_free: 2.0,
+        c_recip: 30.0,
+    };
+    // Owner 0: κ_O = 0 (V_ret = 2), 5 unit symbols all ι = 1000 (very important).
+    let low_kappa_high_iota = owner_view_vols(
+        0.0,
+        0.0,
+        5.0,
+        &(0..5).map(|i| (i, 1000.0, 1.0)).collect::<Vec<_>>(),
+    );
+    // Owner 1: κ_O = 600 (V_ret = 22), 30 unit symbols all ι = 0.001 (worthless).
+    let high_kappa_low_iota = owner_view_vols(
+        600.0,
+        0.0,
+        5.0,
+        &(0..30).map(|i| (100 + i, 0.001, 1.0)).collect::<Vec<_>>(),
+    );
+    let owners = vec![low_kappa_high_iota, high_kappa_low_iota];
+    let dec = eviction_order(
+        &owners,
+        0.0,
+        evicting_band(),
+        EvictPhase::default(),
+        &p,
+        &cap,
+    );
+
+    // Both owners are trimmed (owner 0: 5−2 = 3; owner 1: 30−22 = 8).
+    assert_eq!(dec.cap_drops.iter().filter(|s| s.owner_idx == 0).count(), 3);
+    assert_eq!(dec.cap_drops.iter().filter(|s| s.owner_idx == 1).count(), 8);
+
+    // H2 in cap_drops: all of owner 0's trims precede owner 1's (low-κ owner first),
+    // even though owner 0's ι (1000) dwarfs owner 1's (0.001).
+    let cap_owners: Vec<usize> = dec.cap_drops.iter().map(|s| s.owner_idx).collect();
+    assert!(
+        owner0_before_owner1(&cap_owners),
+        "cap_drops: ι does not jump owners (H2)"
+    );
+
+    // H2 in drop_order: same — owner 0's surviving symbols precede owner 1's.
+    let pres_owners: Vec<usize> = dec.drop_order.iter().map(|s| s.owner_idx).collect();
+    assert!(
+        owner0_before_owner1(&pres_owners),
+        "drop_order: ι does not jump owners (H2)"
+    );
+}
+
+#[test]
+fn disabled_cap_leaves_full_two_level_drop_order() {
+    // Explicit regress: with the cap disabled the full two-level order (κ_O across
+    // owners, ι within) is exactly the pre-3b result, and cap_drops is empty — legacy
+    // callers pass RetentionCap::disabled() and see no behavioural change.
+    let p = dp_zero();
+    let owners = vec![
+        owner_view_multi(0.1, 1.0, &[0.9, 0.1], 100), // owner 0: lowest g_ho (drops first)
+        owner_view_multi(9.0, 1.0, &[0.5], 200),      // owner 1: highest g_ho (drops last)
+        owner_view_multi(3.0, 1.0, &[0.2, 0.8], 300), // owner 2: middle
+    ];
+    let dec = eviction_order(
+        &owners,
+        0.0,
+        evicting_band(),
+        EvictPhase::default(),
+        &p,
+        &RetentionCap::disabled(),
+    );
+    assert!(dec.cap_drops.is_empty(), "disabled cap ⇒ no cap_drops");
+    // Owner order ascending g_ho: 0, 2, 1. Within: ascending ι.
+    let seq: Vec<(usize, usize)> = dec
+        .drop_order
+        .iter()
+        .map(|s| (s.owner_idx, s.symbol_idx))
+        .collect();
+    assert_eq!(
+        seq,
+        vec![(0, 1), (0, 0), (2, 0), (2, 1), (1, 0)],
+        "two-level order intact: owner 0 (ι 0.1,0.9) → owner 2 (ι 0.2,0.8) → owner 1"
     );
 }
 
