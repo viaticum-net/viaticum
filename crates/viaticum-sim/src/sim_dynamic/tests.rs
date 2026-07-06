@@ -618,6 +618,121 @@ fn depth_fades_for_a_departed_partner_no_fossil() {
 }
 
 // ============================================================
+// A.3 demonstrated-scale ratchet V_dem (transaction 3c) — snaps UP on a confirmed
+// pass, fades slowly for a silent pair over τ_dem ≈ 1 year (W2, no fossil scale)
+// ============================================================
+
+#[test]
+fn v_dem_rises_only_on_confirmed_pass() {
+    // A.3 / §9.4 ONE physics: the demonstrated-scale ratchet V_dem snaps up only on the
+    // SAME signal as g_ho — a live symbol confirmed by PoS on an ONLINE holder. A pair
+    // with no confirmed service stays at V_dem = 0 (no phantom demonstrated scale). This
+    // is the sim twin of the kernel test `v_dem_takes_max_of_confirmed_and_decayed`.
+    let params = DynParams::default();
+    let mut world = build_world(4, &params, 616161);
+    for node in &mut world.nodes {
+        node.archetype = Archetype::Reliable; // ~always online
+        node.present = true;
+        node.holdings.clear();
+    }
+    let owner = 0usize;
+    let holder = 1usize;
+    let block = world.nodes[owner].own_blocks[0].id;
+    world.nodes[holder].holdings.push(HeldSymbol {
+        owner,
+        block,
+        iota: 0.5,
+        volume: 10.0,
+        alive: true,
+        cream: false,
+    });
+
+    for t in 0..8u64 {
+        world.tick = t;
+        crate::sim_dynamic::engine::pos_and_capital_for_test(&mut world, &params);
+    }
+
+    // V_dem lives on the owner's record of the holder (the `[owner][holder]` cell, the
+    // G(O←h) direction the owner measures by its own PoS). It ratcheted UP to the served
+    // per-symbol volume (10 gb) and stays pinned near it under continued service (a rare
+    // offline tick — Reliable uptime 0.99 — only eases it by one slow λ_dem step).
+    let v = world.capital[owner][holder].v_dem;
+    assert!(
+        v > 9.0 && v <= 10.0 + 1e-9,
+        "confirmed live service must ratchet V_dem up to the served volume (~10): got {v}"
+    );
+    // A pair that never rendered service stays at V_dem = 0 (no fossil scale).
+    assert_eq!(
+        world.capital[2][3].v_dem, 0.0,
+        "a pair with no confirmed service must have zero demonstrated scale"
+    );
+}
+
+#[test]
+fn v_dem_fades_for_silent_pair_over_tau_dem() {
+    // W2 anti-fossil (A.3): V_dem is decayed for EVERY pair each tick (v_conf = 0 in the
+    // sweep), so a pair that goes silent sees its demonstrated scale FADE over τ_dem ≈ 1
+    // year — never freeze. The ratchet composes to max(V_conf, V_dem·(1−λ_dem·Δt)); with
+    // no confirmed service only the slow leak remains. Sim twin of the kernel test
+    // `v_dem_ratchets_up_instantly_and_decays_slowly`.
+    let params = DynParams::default();
+    let mut world = build_world(4, &params, 929292);
+    for node in &mut world.nodes {
+        node.archetype = Archetype::Reliable;
+        node.present = true;
+        node.holdings.clear();
+    }
+    let owner = 0usize;
+    let holder = 1usize;
+    let block = world.nodes[owner].own_blocks[0].id;
+    world.nodes[holder].holdings.push(HeldSymbol {
+        owner,
+        block,
+        iota: 0.5,
+        volume: 10.0,
+        alive: true,
+        cream: false,
+    });
+
+    // Ratchet V_dem up via live service.
+    for t in 0..12u64 {
+        world.tick = t;
+        crate::sim_dynamic::engine::pos_and_capital_for_test(&mut world, &params);
+    }
+    let v_peak = world.capital[owner][holder].v_dem;
+    assert!(
+        v_peak > 0.0,
+        "precondition: the pair demonstrated some scale"
+    );
+
+    // The serving partner DEPARTS: its held symbol dies and it is absent. No more
+    // confirmed service ⇒ only the per-tick A.3 decay remains.
+    world.nodes[holder].present = false;
+    for hs in world.nodes[holder].holdings.iter_mut() {
+        hs.alive = false;
+    }
+    let mut v_prev = v_peak;
+    for t in 12..72u64 {
+        world.tick = t;
+        crate::sim_dynamic::engine::pos_and_capital_for_test(&mut world, &params);
+        let v_now = world.capital[owner][holder].v_dem;
+        assert!(
+            v_now < v_prev,
+            "a silent pair's demonstrated scale must strictly FADE each tick (no fossil): {v_now} < {v_prev}"
+        );
+        v_prev = v_now;
+    }
+    // After ~1.15·τ_dem of silence the scale has eased to a fraction — still positive
+    // (the leak is SLOW), but well below the peak: a demonstrated scale is real only
+    // while it keeps being demonstrated.
+    let v_end = world.capital[owner][holder].v_dem;
+    assert!(
+        v_end > 0.0 && v_end < 0.5 * v_peak,
+        "V_dem must fade toward 0 over a year of silence: {v_end} vs peak {v_peak}"
+    );
+}
+
+// ============================================================
 // Capital threading (design §10.C) — grows on pass, NOT on fail/timeout
 // ============================================================
 

@@ -199,6 +199,45 @@ pub fn capital_steady_state(v_conf: f64, lambda: f64) -> f64 {
     v_conf / lambda
 }
 
+/// A.3: the demonstrated-scale `V_dem` **ratchet** — one explicit step of
+///
+/// ```text
+/// V_dem ← max( V_conf, V_dem·(1 − λ_dem·Δt) )          [gb]
+/// ```
+///
+/// (decision_model A.3 / §2). Unlike the leaky INTEGRATOR of the fast capital `g`
+/// [`update_capital`], this is a MAX (not a sum): the ratchet snaps UP instantly to
+/// any freshly-confirmed retained volume `V_conf`, and only ever eases DOWN through
+/// the slow leak `λ_dem·Δt`. So a pair that has proven it can hold `V` keeps a
+/// demonstrated scale near `V` for a long time, and it fades only if the pair goes
+/// silent (no confirmed service) for many time constants — there is no fossil scale
+/// that survives forever with zero recent proof.
+///
+/// **Why a slow leak at all (not a pure non-decaying max).** A pure `max` never
+/// forgets: one lucky large retention would pin `V_dem` — and hence the credit limit
+/// `L ≥ V_dem` (A.13) — at that peak permanently, a farmable free floor. The leak is
+/// the fix: the demonstrated scale is only real while it keeps being demonstrated.
+///
+/// **`λ_dem` is the SLOWEST leak in the model** — `λ_dem ≪ λ` (`= 1/60`) and
+/// `≪ λ_slow` (`= 1/180`, the loyalty depth). The default guess is
+/// **`λ_dem = 1/365 day⁻¹`** (`τ_dem ≈ 1 year`: "a demonstrated scale lives about a
+/// year without re-confirmation"). This is an **OPEN calibration** — like every
+/// constant in §13, it is a starting guess to be tuned in the field, NOT a settled
+/// canon value.
+///
+/// Inputs are clamped like the sibling ratchets: negative `v_dem`/`v_conf` are floored
+/// at 0 (a negative demonstrated scale is meaningless), and `λ_dem`/`Δt` are floored at
+/// 0; the decayed term is itself floored at 0 so a degenerate `λ_dem·Δt > 1` cannot
+/// drive it negative. The caller owns the tick; it is not silently re-scaled here.
+pub fn update_v_dem(v_dem: f64, v_conf: f64, dt_days: f64, lambda_dem: f64) -> f64 {
+    let v_dem = v_dem.max(0.0);
+    let v_conf = v_conf.max(0.0);
+    let lambda_dem = lambda_dem.max(0.0);
+    let dt_days = dt_days.max(0.0);
+    let decayed = (v_dem * (1.0 - lambda_dem * dt_days)).max(0.0);
+    v_conf.max(decayed)
+}
+
 // ============================================================
 // S1b — pairwise DEPTH: the SLOW-leaky loyalty carrier (A.4) and the single
 //        holder-side reciprocity key κ_O (A.14).
@@ -1956,4 +1995,122 @@ pub fn place(
         best_r_hat_block: best_r_hat,
         holders: chosen,
     }
+}
+
+/// A.11: place **cream** — surplus symbols ABOVE the `R_target` floor (decision_model
+/// §6 A.11, W9 greed + pair probation).
+///
+/// Cream is the owner-side twin of the holder-side `V_free` floor (A.14): a node with
+/// spare disk/bandwidth greedily backs up EXTRA redundancy beyond what `R_target`
+/// requires, because storing more of others' data grows its own reciprocal capacity
+/// and because the physics of backup wants maximum redundancy. It is driven by free
+/// resources, NOT by a discretionary "budget B" (the §5.3 externality dissolves).
+///
+/// **Structural guarantees (H4↓ / A.15).** The returned indices are a SEPARATE list,
+/// DISJOINT from `chosen_core` — cream is NEVER folded into the core placement. That
+/// type-level separation is the guarantee that:
+/// * cream is **NOT counted toward `R_target`** (block survival `R̂_wc` and the repair
+///   trigger [A.15] read the CORE set only);
+/// * **cream deaths MUST NOT trigger repair** (a lost cream symbol is best-effort
+///   surplus; the block still meets its floor on the core set).
+///
+/// **Caps are the SAME as core-place, NOT weakened for cream:**
+/// * the §7 address spread is enforced ACROSS core+cream: buckets already occupied by
+///   `chosen_core` are CLOSED to cream, and cream itself keeps ≤1 symbol per bucket —
+///   the ≤1/risk-group cap is end-to-end;
+/// * the per-holder credit cap `L(O→h) ≥ volume_per_symbol` (Р-5 / A.13,
+///   [`credit_limit_from_surface`]) gates every cream candidate exactly as in [`place`].
+///
+/// **Candidate order — TWO ARMS (decision_model §6 A.11).** Cream does not run the
+/// core argmax; it fills surplus slots in a deterministic order:
+/// * **arm (a): probationary STRANGERS** — candidates with NO pair history at all
+///   (`pos_pass + pos_fail + pos_timeout == 0`), in input-index order;
+/// * **arm (b): the rest**, in DESCENDING canonical quality (the surface reliability
+///   `estimate_surface(...).r_hat` at the per-symbol ask on the horizon — the SAME
+///   per-holder signal core's argmax rewards; the kernel `place` folds NO reciprocity,
+///   so neither does cream), index tie-break.
+///
+/// **Strangers-first is a §5½ design decision, NOT formalized by the model** (flagged
+/// for reviewer adjudication). It is the ENTRY channel for a NEW pair: cream is how an
+/// established node `E` places a symbol onto a newcomer `N`'s empty disk, letting `N`
+/// earn reciprocal capital `g_ho` and bootstrap into the network (P3 liveness). A
+/// mature, fully-utilised network that always probed its deepest partners first would
+/// never probe a stranger, and the P3 entry chain would be dead — so cream deliberately
+/// probes strangers BEFORE established partners. A stranger's surface `r̂ → 0`, so
+/// WITHOUT this rule arm (b)'s descending-quality sort would place strangers LAST; the
+/// two-arm order is what pulls them to the front.
+///
+/// `want_cream == 0` or empty `candidates` ⇒ an empty `Vec` (never a panic).
+///
+/// Anti-oracle: identical to [`place`] — selection reads only surface `r̂`, the
+/// observable `addr_subnet`/`master_id` bucket, and owner-private `req` fields. No
+/// hidden farm-identity is reachable.
+pub fn place_cream(
+    req: &BlockReq,
+    candidates: &[FirstHandObs],
+    prior: &SurfacePrior,
+    policy: &PlacementPolicy,
+    chosen_core: &[usize],
+    want_cream: usize,
+) -> Vec<usize> {
+    if want_cream == 0 || candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let v_per_symbol = req.volume_per_symbol();
+    let tau = req.tau.max(0.0);
+    let credit_v_max = v_per_symbol * CREDIT_PLACE_HEADROOM;
+
+    // Buckets already claimed by the CORE placement are CLOSED to cream: the §7 ≤1/bucket
+    // spread is enforced end-to-end across core+cream (cap NOT weakened for cream).
+    let mut occupied: Vec<BucketKey> = chosen_core
+        .iter()
+        .filter_map(|&i| candidates.get(i))
+        .map(|obs| bucket_key(obs, policy))
+        .collect();
+
+    // Two-arm candidate order (A.11 / §6): (a) probationary strangers (zero pair history)
+    // in input-index order, then (b) the rest by DESCENDING canon quality. Cream is
+    // disjoint from `chosen_core` — core indices are excluded from BOTH arms.
+    let mut strangers: Vec<usize> = Vec::new();
+    let mut established: Vec<usize> = Vec::new();
+    for (i, obs) in candidates.iter().enumerate() {
+        if chosen_core.contains(&i) {
+            continue; // disjoint with core (structural "not counted toward R_target")
+        }
+        let no_history = obs.pos_pass == 0 && obs.pos_fail == 0 && obs.pos_timeout == 0;
+        if no_history {
+            strangers.push(i);
+        } else {
+            established.push(i);
+        }
+    }
+    // Arm (b): descending canonical quality (surface r̂), smallest-index tie-break —
+    // deterministic (`total_cmp`, no `HashMap`, no clock).
+    established.sort_by(|&a, &b| {
+        let qa = estimate_surface(&candidates[a], prior, v_per_symbol, tau).r_hat;
+        let qb = estimate_surface(&candidates[b], prior, v_per_symbol, tau).r_hat;
+        qb.total_cmp(&qa).then(a.cmp(&b))
+    });
+
+    let mut cream: Vec<usize> = Vec::new();
+    for &i in strangers.iter().chain(established.iter()) {
+        if cream.len() >= want_cream {
+            break;
+        }
+        let obs = &candidates[i];
+        // Р-5 per-holder credit cap (same as core; `req.r_min == 0` disables it).
+        if credit_limit_from_surface(obs, prior, req.r_min, tau, credit_v_max) < v_per_symbol {
+            continue;
+        }
+        // §7 spread: skip a candidate whose bucket is already occupied (by core or by an
+        // already-chosen cream symbol).
+        let bucket = bucket_key(obs, policy);
+        if occupied.contains(&bucket) {
+            continue;
+        }
+        cream.push(i);
+        occupied.push(bucket);
+    }
+    cream
 }

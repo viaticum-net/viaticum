@@ -2602,3 +2602,214 @@ fn place_below_k_eff_first_pick_is_index_tiebreak_not_surface() {
         other => panic!("expected Placed, got {other:?}"),
     }
 }
+
+// ============================================================
+// A.3 — demonstrated-scale ratchet `update_v_dem`.
+// ============================================================
+
+#[test]
+fn v_dem_ratchets_up_instantly_and_decays_slowly() {
+    let lambda_dem = 1.0 / 365.0;
+    // Instant up: a fresh pair (v_dem = 0) that confirms retaining 100 gb snaps to 100
+    // in ONE step (max arm), not a slow charge-up.
+    let up = update_v_dem(0.0, 100.0, 7.0, lambda_dem);
+    assert!(
+        (up - 100.0).abs() < 1e-12,
+        "ratchet must snap UP instantly to the confirmed volume, got {up}"
+    );
+
+    // Decays slowly: 100 gb demonstrated, then ONE YEAR of silence (v_conf = 0) in
+    // 1-day steps at λ_dem = 1/365 leaves ≈ e⁻¹·100 ≈ 36.8 (one time constant).
+    let mut v = 100.0;
+    for _ in 0..365 {
+        v = update_v_dem(v, 0.0, 1.0, lambda_dem);
+    }
+    let e_inv = 100.0 * (-1.0f64).exp();
+    assert!(
+        (v - e_inv).abs() < 1.0,
+        "one τ_dem of silence must leave ≈ e⁻¹·100 = {e_inv:.3}, got {v:.3}"
+    );
+    // Still a LONG-lived scale: after one year it is well above 30 (slow leak).
+    assert!(
+        v > 30.0,
+        "τ_dem ≈ 1 year is slow: v={v} should stay > 30 after a year"
+    );
+}
+
+#[test]
+fn v_dem_takes_max_of_confirmed_and_decayed() {
+    let lambda_dem = 1.0 / 365.0;
+    // v_conf BELOW the decayed scale ⇒ keep the (slightly) decayed value — NOT the
+    // confirmed one (no reset) and NOT their sum (no double-count).
+    let decayed = 100.0 * (1.0 - lambda_dem * 7.0);
+    let got = update_v_dem(100.0, 50.0, 7.0, lambda_dem);
+    assert!(
+        (got - decayed).abs() < 1e-12,
+        "below the decayed scale the ratchet holds the decayed value {decayed}, got {got}"
+    );
+    assert!(
+        got > 50.0,
+        "must NOT reset down to the confirmed 50: got {got}"
+    );
+    assert!(got < 150.0, "must NOT be the SUM 100+50: got {got}");
+
+    // v_conf ABOVE the decayed scale ⇒ snap up to the confirmed volume.
+    let up = update_v_dem(100.0, 200.0, 7.0, lambda_dem);
+    assert!(
+        (up - 200.0).abs() < 1e-12,
+        "above the decayed scale the ratchet snaps up to confirmed 200, got {up}"
+    );
+}
+
+#[test]
+fn v_dem_guards_negative_inputs() {
+    let lambda_dem = 1.0 / 365.0;
+    // Negative demonstrated scale / confirmed volume are meaningless ⇒ floored at 0.
+    assert_eq!(update_v_dem(-5.0, -3.0, 7.0, lambda_dem), 0.0);
+    // Negative λ_dem / dt are floored at 0 ⇒ no decay, no NaN (result = the input scale).
+    assert_eq!(update_v_dem(100.0, 0.0, -7.0, -1.0), 100.0);
+    // Degenerate λ_dem·dt > 1 would drive the decayed term negative — it is clamped at 0,
+    // so the result is a well-defined 0, never a negative scale.
+    assert_eq!(update_v_dem(100.0, 0.0, 100.0, 1.0), 0.0);
+}
+
+// ============================================================
+// A.11 — cream placement `place_cream` (surplus above R_target).
+// ============================================================
+
+/// A probationary STRANGER: a candidate with NO pair history at all (all PoS counters
+/// zero). Same observable scale as [`holder`] so the ONLY difference from an
+/// established candidate is the empty history (what arm (a) keys on).
+fn stranger(master: u8, subnet: u32) -> FirstHandObs {
+    FirstHandObs {
+        pos_pass: 0,
+        pos_fail: 0,
+        pos_timeout: 0,
+        ..holder(master, subnet, 10.0, 30.0)
+    }
+}
+
+#[test]
+fn place_cream_returns_disjoint_extra_holders() {
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let r = req(6, 2, 0.99);
+    // Five established holders on DISTINCT subnets (all admissible under the credit cap).
+    let cands: Vec<FirstHandObs> = (0..5).map(|i| holder(i as u8, i, 10.0, 30.0)).collect();
+    // Core already placed onto holders 0 and 1; cream must draw ONLY from the rest.
+    let core = vec![0usize, 1usize];
+    let cream = place_cream(&r, &cands, &prior, &policy, &core, 2);
+    assert_eq!(
+        cream.len(),
+        2,
+        "want=2 extra holders exist ⇒ 2 returned: {cream:?}"
+    );
+    for &i in &cream {
+        assert!(
+            !core.contains(&i),
+            "cream must be DISJOINT from the core set (structural: not counted toward R_target); {i} is in core"
+        );
+        assert!(
+            (2..5).contains(&i),
+            "cream index {i} must be a non-core candidate"
+        );
+    }
+    // Distinct indices (no double-return).
+    assert_ne!(
+        cream[0], cream[1],
+        "cream holders must be distinct: {cream:?}"
+    );
+}
+
+#[test]
+fn place_cream_respects_spread_cap_including_core_buckets() {
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default(); // spread by addr_subnet
+    let r = req(6, 2, 0.99);
+    // Candidate 0 (core) is on subnet 7. Candidate 1 is ALSO on subnet 7 — the SAME
+    // bucket the core already occupies, so cream must NOT place a second symbol there.
+    // Candidates 2 and 3 sit on fresh distinct subnets and ARE cream-eligible.
+    let cands = vec![
+        holder(0, 7, 10.0, 30.0),  // core, subnet 7
+        holder(1, 7, 10.0, 30.0),  // same bucket as core ⇒ closed
+        holder(2, 20, 10.0, 30.0), // fresh
+        holder(3, 21, 10.0, 30.0), // fresh
+    ];
+    let core = vec![0usize];
+    let cream = place_cream(&r, &cands, &prior, &policy, &core, 3);
+    assert!(
+        !cream.contains(&1),
+        "the core-occupied subnet 7 is CLOSED to cream (≤1/bucket across core+cream): {cream:?}"
+    );
+    // The two fresh-bucket candidates are taken; no bucket is used twice.
+    let mut subnets: Vec<u32> = cream.iter().map(|&i| cands[i].addr_subnet).collect();
+    subnets.push(7); // the core bucket
+    let mut dedup = subnets.clone();
+    dedup.sort_unstable();
+    dedup.dedup();
+    assert_eq!(
+        dedup.len(),
+        subnets.len(),
+        "no bucket may carry two symbols across core+cream: {subnets:?}"
+    );
+    assert!(
+        cream.contains(&2) && cream.contains(&3),
+        "fresh-bucket holders must be creamed: {cream:?}"
+    );
+}
+
+#[test]
+fn place_cream_respects_per_holder_credit_cap() {
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    // per-symbol volume = 10; r_min = 0.5 (the default req floor) makes the cap BITE a
+    // holder proven only at a tiny volume, exactly as in the core-place credit test.
+    let r = req(3, 1, 0.5);
+    // small: proven only at v0=1 → credit L(O→h) < 10 = v_per_symbol ⇒ inadmissible.
+    let small = holder(0, 5, 1.0, 30.0);
+    // ok: proven at the full per-symbol volume v0=10 → credit ≥ 10 ⇒ admissible.
+    let ok = holder(1, 6, 10.0, 30.0);
+    let cands = vec![small, ok];
+    let cream = place_cream(&r, &cands, &prior, &policy, &[], 2);
+    assert!(
+        !cream.contains(&0),
+        "the under-scaled holder must be credit-capped OUT of cream (cap NOT weakened for cream): {cream:?}"
+    );
+    assert!(
+        cream.contains(&1),
+        "the adequately-scaled holder must be creamed: {cream:?}"
+    );
+}
+
+#[test]
+fn place_cream_probes_stranger_before_established() {
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    // r_min = 0 DISABLES the credit cap so a zero-history stranger is admissible — cream
+    // is the ENTRY channel for a new pair (§5½). Both candidates sit on fresh distinct
+    // buckets, so ONLY the two-arm order decides who is probed with the single cream slot.
+    let mut r = req(3, 1, 0.99);
+    r.r_min = 0.0;
+    // Established at the LOWER index (0) AND higher canon quality; stranger at index 1.
+    // Pure index-order OR pure descending-quality would both pick the established (0).
+    // Strangers-first (arm a before arm b) must pick the stranger (1) instead.
+    let cands = vec![holder(0, 0, 10.0, 30.0), stranger(1, 1)];
+    let cream = place_cream(&r, &cands, &prior, &policy, &[], 1);
+    assert_eq!(
+        cream,
+        vec![1usize],
+        "cream must probe the STRANGER (idx 1) before the established (idx 0) — §5½ entry channel"
+    );
+}
+
+#[test]
+fn place_cream_empty_when_no_want_or_no_candidates() {
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let r = req(6, 2, 0.99);
+    let cands: Vec<FirstHandObs> = (0..3).map(|i| holder(i as u8, i, 10.0, 30.0)).collect();
+    // want_cream = 0 ⇒ empty (no greed asked).
+    assert!(place_cream(&r, &cands, &prior, &policy, &[0], 0).is_empty());
+    // No candidates ⇒ empty (never a panic).
+    assert!(place_cream(&r, &[], &prior, &policy, &[], 5).is_empty());
+}

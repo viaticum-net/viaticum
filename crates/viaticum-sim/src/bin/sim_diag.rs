@@ -666,6 +666,23 @@ fn print_section6(world: &World, params: &DynParams) {
         d_vals.len(),
         mean(&d_vals),
     );
+    // (6f') transaction-3c diagnostic: the A.3 demonstrated-scale ratchet V_dem over the
+    // SAME alive-symbol pairs. With uniform per-symbol volume it stays pinned near the
+    // served volume for active pairs and eases down only on silent ones (τ_dem ≈ 1 year).
+    let mut vdem_vals: Vec<f64> = Vec::new();
+    for h in 0..n {
+        if !world.nodes[h].present {
+            continue;
+        }
+        for s in world.nodes[h].holdings.iter().filter(|s| s.alive) {
+            vdem_vals.push(world.capital[s.owner][h].v_dem);
+        }
+    }
+    println!(
+        "  (6f') mean demonstrated-scale V_dem over {} alive pairs = {:.3} gb   (A.3 ratchet, λ_dem=1/365)",
+        vdem_vals.len(),
+        mean(&vdem_vals),
+    );
 }
 
 /// Section 7 (aggregate review §5.2): the correlated-holder-death "repair-storm" sweep.

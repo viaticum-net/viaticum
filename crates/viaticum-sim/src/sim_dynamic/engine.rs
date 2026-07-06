@@ -23,7 +23,7 @@
 use viaticum_core::four_r::{
     BlockReq, DepthParams, Hysteresis, NodeLocal, PlacementPolicy, RetentionCap, RetentionPrior,
     SurfacePrior, capital_steady_state, estimate_surface, eviction_order, kappa_key,
-    retained_depth, update_depth,
+    retained_depth, update_depth, update_v_dem,
 };
 
 use crate::generator::Rng;
@@ -44,6 +44,12 @@ pub struct DynParams {
     /// the fast capital `λ` so a deep partner's floor decays over months, not weeks.
     /// With weekly `dt`, `λ_slow·dt = 7/180 ≈ 0.039 < 1`.
     pub lambda_slow: f64,
+    /// A.3 demonstrated-scale ratchet leak `λ_dem` (per day) for `V_dem` — the SLOWEST
+    /// leak in the model, `λ_dem ≪ λ` and `≪ λ_slow`. `1/λ_dem` is how long a
+    /// demonstrated scale survives with no re-confirmation. §13 default `1/365`
+    /// (`τ_dem ≈ 1 year`), an OPEN calibration guess. With weekly `dt`,
+    /// `λ_dem·dt = 7/365 ≈ 0.019 < 1`.
+    pub lambda_dem: f64,
     /// A.14 depth-floor weight `w_d`: the W10 loyalty floor in the κ_O eviction key is
     /// `w_d·min(D/d_ref, 1)·g*` — a silent-but-deep partner ranks as if it carried
     /// `w_d·g*` of fast capital. §13 default 0.5.
@@ -161,6 +167,8 @@ impl Default for DynParams {
             lambda: 1.0 / 60.0,
             // A.4 / §13: τ_slow ≈ 6 months, w_d = 0.5, d_ref ≈ 1 year·V_sym.
             lambda_slow: 1.0 / 180.0,
+            // A.3 / §13: τ_dem ≈ 1 year (the slowest leak; OPEN calibration guess).
+            lambda_dem: 1.0 / 365.0,
             depth_w_d: 0.5,
             depth_ref_days: 365.0,
             // Р-7 (A.14 / §13): c_recip ≈ 30 days (Ilya); V_free = 2·v_per_symbol is an
@@ -345,6 +353,8 @@ pub fn step(world: &mut World, params: &DynParams, prior: &SurfacePrior, policy:
     assert_lambda_dt_stable(params.lambda, DAYS_PER_TICK);
     // The slow loyalty-depth leak (A.4) obeys the SAME stability guard.
     assert_lambda_dt_stable(params.lambda_slow, DAYS_PER_TICK);
+    // The A.3 demonstrated-scale ratchet leak `λ_dem` (slowest of the three).
+    assert_lambda_dt_stable(params.lambda_dem, DAYS_PER_TICK);
     let _ = policy; // kept on the API for symmetry; the sim always spreads by addr_subnet
     let tick = world.tick;
 
@@ -860,9 +870,12 @@ fn place_reciprocal(
 /// A DEPARTED owner runs no PoS: challenges (and `served`) are gated on the owner being
 /// present, so a churned-out owner no longer "confirms" its ghost data.
 ///
-/// `v_dem` is a demonstrated-scale ratchet (A.3, `λ_dem ≪ λ`), NOT the λ-capital, so it
-/// is not decayed here; with uniform per-symbol volume it is pinned at the observed V0
-/// regardless, so its persistence is inert.
+/// `v_dem` is the demonstrated-scale RATCHET (A.3, `λ_dem ≪ λ`), NOT the λ-capital. It
+/// follows the SAME W2 split as `g_ho`/`depth` — the slow leak `V_dem·(1−λ_dem·Δt)` is
+/// applied to EVERY pair in the sweep below, and a confirmed pass snaps it UP to the
+/// served volume via a MAX (not a `+=`, since A.3 is a ratchet). The two steps compose
+/// EXACTLY to A.3 `V_dem ← max(V_conf, V_dem·(1−λ_dem·Δt))` per tick (see the event loop),
+/// with no double decay: the sweep decays once (`dt`), the event max takes `dt = 0`.
 fn pos_and_capital(world: &mut World, params: &DynParams) {
     let n = world.nodes.len();
     let tick = world.tick;
@@ -882,6 +895,10 @@ fn pos_and_capital(world: &mut World, params: &DynParams) {
             cell.g_oh *= decay;
             cell.g_ho *= decay;
             cell.depth_ho = update_depth(cell.depth_ho, 0.0, dt, params.lambda_slow);
+            // A.3 ratchet leak: decay `V_dem` on EVERY pair (v_conf = 0). A silent pair's
+            // demonstrated scale fades over `τ_dem ≈ 1 year` — no fossil scale survives
+            // forever; a confirmed pass re-snaps it up in the challenge loop below.
+            cell.v_dem = update_v_dem(cell.v_dem, 0.0, dt, params.lambda_dem);
         }
     }
 
@@ -931,7 +948,11 @@ fn pos_and_capital(world: &mut World, params: &DynParams) {
         let cap = cap_mut(&mut world.capital, c.owner, c.holder);
         cap.g_oh += accrual;
         if passed {
-            cap.v_dem = cap.v_dem.max(c.volume);
+            // A.3 ratchet UP on a confirmed pass. `dt = 0` here — the slow decay was already
+            // applied to this pair in the sweep above, so this is the pure MAX arm of A.3
+            // (`max(V_conf, V_dem_decayed)`); composing sweep+event gives exactly
+            // `V_dem ← max(V_conf, V_dem·(1−λ_dem·Δt))` with a SINGLE decay per tick.
+            cap.v_dem = update_v_dem(cap.v_dem, c.volume, 0.0, params.lambda_dem);
         }
         cap.push_outcome(passed);
 
