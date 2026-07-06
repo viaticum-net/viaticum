@@ -86,13 +86,16 @@ pub fn observe_pair(cap: &PairCapital, h_node: &Node, dt: f64) -> FirstHandObs {
 
 /// Build the eviction view of holder node `h` over ALL owners whose ALIVE symbols
 /// it currently stores. One [`OwnerEvictionView`] per owner, carrying that owner's
-/// first-hand pair observation (the inter-owner `G(h←O)` key) and the owner's
+/// first-hand pair observation plus the pair's loyalty `depth` — together the
+/// inputs of the inter-owner κ_O key (A.14: `g_ho` + D-floor) — and the owner's
 /// symbols on this holder (each with its declared ι).
 ///
 /// `cap_of(owner_idx)` returns the holder's per-pair capital with that owner
-/// (`g_holder_from_owner` is the holder's OWN service-rendered record — first-hand,
-/// unfakeable by the owner). `owner_node(owner_idx)` gives the owner's observable
-/// address for the obs (the holder observes the OWNER's connection facts).
+/// (`g_holder_from_owner` = `G(h←O)`, the holder's first-hand record of THAT
+/// OWNER's reciprocal service to the holder — the owner keeping MY data alive,
+/// proven by MY PoS of my symbols stored at that owner; unfakeable by the owner).
+/// `owner_node(owner_idx)` gives the owner's observable address for the obs (the
+/// holder observes the OWNER's connection facts).
 ///
 /// `owners` is the caller-supplied owner ORDER (the distinct alive-symbol owners on
 /// `h`). The caller owns the order so the SAME slice can map the resulting drop
@@ -124,7 +127,13 @@ pub fn observe_eviction_views<'a>(
                     importance: s.iota,
                 })
                 .collect();
-            OwnerEvictionView { obs, symbols }
+            // A.4 loyalty depth of THIS owner→holder direction ("O served me"), the
+            // same first-hand cell `g_ho` is read from — feeds the κ_O W10 floor.
+            OwnerEvictionView {
+                obs,
+                depth: cap.depth_ho,
+                symbols,
+            }
         })
         .collect()
 }

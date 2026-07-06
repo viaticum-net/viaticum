@@ -85,6 +85,9 @@ pub fn observe_eviction_views(owners: &[OwnerGt]) -> Vec<OwnerEvictionView> {
         .enumerate()
         .map(|(i, o)| OwnerEvictionView {
             obs: observe(o, i),
+            // SIM-2 predates the A.4 loyalty depth; these views carry no depth (κ_O
+            // collapses to bare g_ho for this legacy inter-owner test).
+            depth: 0.0,
             symbols: vec![SymbolDecl {
                 id: SymbolId(i as u64),
                 importance: o.declared_iota,

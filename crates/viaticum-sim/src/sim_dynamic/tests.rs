@@ -61,6 +61,7 @@ fn cap_with_history() -> PairCapital {
     let mut c = PairCapital {
         g_oh: 12.0,
         g_ho: 8.0,
+        depth_ho: 0.0,
         g_oh_prev: 10.0,
         v_dem: 10.0,
         pos_window: Vec::new(),
@@ -494,6 +495,125 @@ fn pos_pass_iff_symbol_alive_and_holder_online() {
         world.capital[owner][holder].g_oh < g_dead0,
         "a dead/idle pair accrues nothing and DRAINS via the A.1 decay (WARN-2 fix): {} < {g_dead0}",
         world.capital[owner][holder].g_oh
+    );
+}
+
+// ============================================================
+// A.4 loyalty depth D (transaction 3a) — slow-leaky, grows only on confirmed
+// live service, fades for a departed partner (W2, no fossil depth)
+// ============================================================
+
+#[test]
+fn depth_grows_only_on_confirmed_live_service() {
+    // A.4 / §9.4 ONE physics: the loyalty depth D accrues on the SAME signal as g_ho —
+    // a live symbol confirmed by PoS on an ONLINE holder — and on NOTHING else. A pair
+    // with no service stays at D = 0.
+    let params = DynParams::default();
+    let mut world = build_world(4, &params, 727272);
+    for node in &mut world.nodes {
+        node.archetype = Archetype::Reliable; // ~always online
+        node.present = true;
+        node.holdings.clear();
+    }
+    let owner = 0usize;
+    let holder = 1usize;
+    let block = world.nodes[owner].own_blocks[0].id;
+    world.nodes[holder].holdings.push(HeldSymbol {
+        owner,
+        block,
+        iota: 0.5,
+        volume: 10.0,
+        alive: true,
+        cream: false,
+    });
+
+    for t in 0..8u64 {
+        world.tick = t;
+        crate::sim_dynamic::engine::pos_and_capital_for_test(&mut world, &params);
+    }
+
+    // Depth accrues on the SAME transpose cell as g_ho (the holder's own service record).
+    assert!(
+        world.capital[holder][owner].depth_ho > 0.0,
+        "confirmed live service must grow the loyalty depth: {}",
+        world.capital[holder][owner].depth_ho
+    );
+    assert!(
+        world.capital[holder][owner].g_ho > 0.0,
+        "precondition: g_ho grew on the same signal"
+    );
+    // A pair that never rendered service stays at D = 0 (no phantom loyalty).
+    assert_eq!(
+        world.capital[2][3].depth_ho, 0.0,
+        "a pair with no confirmed service must have zero depth"
+    );
+    // Two-timescale property: fed the SAME per-tick accrual but leaking SLOWER
+    // (τ_slow ≈ 6 mo vs τ_fast ≈ 2 mo, so D* = v·τ_slow = 3·g*), the depth RETAINS more
+    // of the accumulated service than the fast capital — its level exceeds g_ho's.
+    assert!(
+        world.capital[holder][owner].depth_ho > world.capital[holder][owner].g_ho,
+        "the slow depth retains more than the fast capital under the same service: {} vs {}",
+        world.capital[holder][owner].depth_ho,
+        world.capital[holder][owner].g_ho
+    );
+}
+
+#[test]
+fn depth_fades_for_a_departed_partner_no_fossil() {
+    // W2 anti-fossil (A.4): depth is decayed for EVERY pair each tick, including a
+    // partner that has DEPARTED. A once-deep partner that goes silent must see its
+    // loyalty floor FADE, never freeze — the D-farm is closed. (This is the sim twin of
+    // the kernel test `eviction_deep_floor_fades_after_years_of_silence`.)
+    let params = DynParams::default();
+    let mut world = build_world(4, &params, 838383);
+    for node in &mut world.nodes {
+        node.archetype = Archetype::Reliable;
+        node.present = true;
+        node.holdings.clear();
+    }
+    let owner = 0usize;
+    let holder = 1usize;
+    let block = world.nodes[owner].own_blocks[0].id;
+    world.nodes[holder].holdings.push(HeldSymbol {
+        owner,
+        block,
+        iota: 0.5,
+        volume: 10.0,
+        alive: true,
+        cream: false,
+    });
+
+    // Build up some depth via live service.
+    for t in 0..12u64 {
+        world.tick = t;
+        crate::sim_dynamic::engine::pos_and_capital_for_test(&mut world, &params);
+    }
+    let d_peak = world.capital[holder][owner].depth_ho;
+    assert!(d_peak > 0.0, "precondition: the pair earned some depth");
+
+    // The serving partner DEPARTS: its held symbols die and it is absent. No more
+    // confirmed service for this pair — only the per-tick decay remains.
+    world.nodes[holder].present = false;
+    for hs in world.nodes[holder].holdings.iter_mut() {
+        hs.alive = false;
+    }
+    let mut d_prev = d_peak;
+    for t in 12..72u64 {
+        world.tick = t;
+        crate::sim_dynamic::engine::pos_and_capital_for_test(&mut world, &params);
+        let d_now = world.capital[holder][owner].depth_ho;
+        assert!(
+            d_now < d_prev,
+            "a departed partner's depth must strictly FADE each tick (no fossil): {d_now} < {d_prev}"
+        );
+        d_prev = d_now;
+    }
+    // After ~2·τ_slow of silence the floor has collapsed to a small fraction (not zero,
+    // not frozen) — deep loyalty is earned by CONTINUED service, not banked forever.
+    let d_end = world.capital[holder][owner].depth_ho;
+    assert!(
+        d_end > 0.0 && d_end < 0.2 * d_peak,
+        "the loyalty floor must decay toward 0 over months of silence: {d_end} vs peak {d_peak}"
     );
 }
 
@@ -1190,6 +1310,11 @@ fn drop_ranking_picks_low_served_owners_first() {
     // LOAD-BEARING free-rider exclusion is the pillar-1 OUTCOME (durability: Reliable ≫
     // exploiters), asserted in `pillar1_efficiency_ranks_reliable_above_exploiters`. Here
     // we assert only the robust directional sign: dropped owners skew BELOW random.
+    //
+    // 3a: κ_O — eviction now ranks owners by κ_O = g_ho + w_d·min(D/d_ref,1)·g* (A.14),
+    // not bare g_ho. The slow loyalty depth D accrues from the SAME confirmed-service
+    // signal as g_ho, so it REINFORCES (never inverts) the low-served-first direction:
+    // the sign holds. Thresholds unchanged — the directional invariant is what we assert.
     let world = run_small(2026, 110);
     let d = drop_ranking_metric(&world);
     assert!(

@@ -21,8 +21,8 @@
 //! kernel function — it uses them only to drive BEHAVIOUR.
 
 use viaticum_core::four_r::{
-    BlockReq, Hysteresis, NodeLocal, PlacementPolicy, RetentionPrior, SurfacePrior,
-    capital_steady_state, estimate_surface, eviction_order, retained_depth,
+    BlockReq, DepthParams, Hysteresis, NodeLocal, PlacementPolicy, RetentionPrior, SurfacePrior,
+    capital_steady_state, estimate_surface, eviction_order, retained_depth, update_depth,
 };
 
 use crate::generator::Rng;
@@ -38,6 +38,19 @@ pub struct DynParams {
     /// Capital leak rate `λ` (per day). `1/λ` is the capital memory in days —
     /// months (design §10.C). With weekly `dt`, `λ·dt < 1` holds with room.
     pub lambda: f64,
+    /// A.4 SLOW leak rate `λ_slow` (per day) for the loyalty depth `D`. `1/λ_slow` is
+    /// the depth memory — `τ_slow ≈ 6 months` (§13 default `1/180`), MUCH slower than
+    /// the fast capital `λ` so a deep partner's floor decays over months, not weeks.
+    /// With weekly `dt`, `λ_slow·dt = 7/180 ≈ 0.039 < 1`.
+    pub lambda_slow: f64,
+    /// A.14 depth-floor weight `w_d`: the W10 loyalty floor in the κ_O eviction key is
+    /// `w_d·min(D/d_ref, 1)·g*` — a silent-but-deep partner ranks as if it carried
+    /// `w_d·g*` of fast capital. §13 default 0.5.
+    pub depth_w_d: f64,
+    /// A.14 depth reference `d_ref` in DAYS: the depth (relative to `V_sym`) at which
+    /// the loyalty floor saturates. The kernel `DepthParams.d_ref` is this ×
+    /// `v_per_symbol` gb·days. §13 default 365 (≈ one year of a single symbol).
+    pub depth_ref_days: f64,
     /// Per-symbol erasure count `n` for own-data blocks.
     pub n_symbols: usize,
     /// Reconstruction threshold `k_eff`.
@@ -133,6 +146,10 @@ impl Default for DynParams {
     fn default() -> Self {
         DynParams {
             lambda: 1.0 / 60.0,
+            // A.4 / §13: τ_slow ≈ 6 months, w_d = 0.5, d_ref ≈ 1 year·V_sym.
+            lambda_slow: 1.0 / 180.0,
+            depth_w_d: 0.5,
+            depth_ref_days: 365.0,
             n_symbols: 5,
             k_eff: 2,
             r_target: 0.90,
@@ -287,6 +304,8 @@ const REPAIR_DETECT_SALT: u64 = 0x5E17_D37E_C7ED_10AD;
 /// Run ONE tick of the dynamic loop (design §6 + §10 + world-v2 §9). Mutates in place.
 pub fn step(world: &mut World, params: &DynParams, prior: &SurfacePrior, policy: &PlacementPolicy) {
     assert_lambda_dt_stable(params.lambda, DAYS_PER_TICK);
+    // The slow loyalty-depth leak (A.4) obeys the SAME stability guard.
+    assert_lambda_dt_stable(params.lambda_slow, DAYS_PER_TICK);
     let _ = policy; // kept on the API for symmetry; the sim always spreads by addr_subnet
     let tick = world.tick;
 
@@ -602,6 +621,8 @@ fn try_place_one_symbol(
 /// bypasses the accept freeze without thrash. A parasite (g_ho≈0 with all) can never
 /// satisfy the margin, so it cannot preempt in. Side effects (eviction of the victim,
 /// logging, counters) happen here; the caller records the accepted holding.
+///
+// TODO 3b: unify κ (preemption still ranks by bare g_ho — ADV2-D2 window open until 3b)
 fn admit_offer(
     world: &mut World,
     owner: usize,
@@ -770,12 +791,17 @@ fn pos_and_capital(world: &mut World, params: &DynParams) {
 
     // Roll g_oh_prev for the D-projection finite difference, then apply the A.1 DECAY to
     // EVERY pair (idle pairs drain; active pairs get the +V_conf accumulation below).
+    // The A.4 loyalty depth decays on EVERY pair too (same W2 pattern, slower τ_slow):
+    // this is the load-bearing leak — a silent pair's depth fades over months, so a
+    // farmed depth burst is not a permanent floor. Its +V_conf accrual is added in the
+    // challenge loop below (mirroring the split of `g_ho`'s decay-then-accrue).
     for o in 0..n {
         for h in 0..n {
             let cell = &mut world.capital[o][h];
             cell.g_oh_prev = cell.g_oh;
             cell.g_oh *= decay;
             cell.g_ho *= decay;
+            cell.depth_ho = update_depth(cell.depth_ho, 0.0, dt, params.lambda_slow);
         }
     }
 
@@ -831,9 +857,13 @@ fn pos_and_capital(world: &mut World, params: &DynParams) {
 
         // Reciprocal g_ho on the holder's OWN books (the transpose cell) — the eviction /
         // preemption / retention key. Anti-oracle: this is the holder's own record of
-        // storage it performed, not a peer's private cell.
+        // storage it performed, not a peer's private cell. The SAME confirmed V_conf·Δt
+        // also feeds the slow loyalty depth (A.4) on that cell (its decay was applied to
+        // all pairs in the sweep above), so depth accrues ONLY on live confirmed service
+        // (PoS-pass ∧ alive ∧ online — the same physics that feeds g_ho).
         let cap_t = cap_mut(&mut world.capital, c.holder, c.owner);
         cap_t.g_ho += accrual;
+        cap_t.depth_ho += accrual;
 
         // World-v2 §9 newcomer trace: first tick this holder EARNED reciprocity (served).
         if passed && world.first_earned_g[c.holder].is_none() {
@@ -864,6 +894,15 @@ fn run_eviction(world: &mut World, params: &DynParams) {
     let dt = DAYS_PER_TICK;
     let tick = world.tick;
     let mut any_eviction_this_tick = false;
+
+    // A.14 κ_O depth params — computed once (holder-independent): the kernel does not
+    // know λ/V_sym, so the caller carries g* and the days→gb·days d_ref conversion.
+    let v_per_symbol = v_per_symbol_of(params);
+    let depth_params = DepthParams {
+        w_d: params.depth_w_d,
+        d_ref: params.depth_ref_days * v_per_symbol,
+        g_star: capital_steady_state(v_per_symbol, params.lambda),
+    };
 
     for holder in 0..n {
         if !world.nodes[holder].present {
@@ -906,7 +945,7 @@ fn run_eviction(world: &mut World, params: &DynParams) {
             dt,
         );
 
-        let decision = eviction_order(&views, phi, params.hyst, prev);
+        let decision = eviction_order(&views, phi, params.hyst, prev, &depth_params);
         world.nodes[holder].evict_phase = decision.phase;
 
         if !decision.phase.evicting || decision.drop_order.is_empty() {

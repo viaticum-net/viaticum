@@ -45,7 +45,9 @@
 //! The engine records, per tracked symbol, the ticks at which it was dropped and
 //! re-accepted so the evaluator can count *short-period* chatter cycles.
 
-use viaticum_core::four_r::{EvictPhase, Hysteresis, OwnerEvictionView, eviction_order};
+use viaticum_core::four_r::{
+    DepthParams, EvictPhase, Hysteresis, OwnerEvictionView, eviction_order,
+};
 
 /// Tunable rates and tick for the φ-dynamics (formula_phase.md §10 `a`, `b`,
 /// `Δt_tick`).
@@ -184,9 +186,17 @@ pub fn run(owners: &[OwnerEvictionView], hyst: Hysteresis, params: EngineParams)
     // ±load_pos_amp (∫ A·ω·cos(ωt) dt = A·sin(ωt)).
     let load_vel_amp = params.load_pos_amp * params.load_omega;
 
+    // SIM-2 predates the A.4 loyalty depth: w_d = 0 makes the κ_O rank collapse to
+    // bare g_ho, reproducing the pre-3a inter-owner ordering exactly.
+    let depth_params = DepthParams {
+        w_d: 0.0,
+        d_ref: 1.0,
+        g_star: 0.0,
+    };
+
     for t in 0..params.ticks {
         // Relay senses φ directly (first-hand). No hidden global signal.
-        let dec = eviction_order(owners, phi, hyst, phase);
+        let dec = eviction_order(owners, phi, hyst, phase, &depth_params);
         phase = dec.phase;
 
         if dec.accept_ok {

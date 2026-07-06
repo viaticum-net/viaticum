@@ -30,6 +30,8 @@ fn obs(g_holder_from_owner: f64, tau: f64) -> OwnerEvictionView {
     };
     OwnerEvictionView {
         obs: fho,
+        // SIM-2 predates the A.4 loyalty depth (κ_O collapses to bare g_ho here).
+        depth: 0.0,
         symbols: vec![SymbolDecl {
             id: SymbolId(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
             importance: 1.0,

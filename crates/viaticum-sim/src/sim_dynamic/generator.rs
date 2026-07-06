@@ -309,10 +309,16 @@ pub struct PairCapital {
     /// `G(O←h)`: this holder's service TO the owner (leaky integral of PoS-confirmed
     /// gb·days). The owner challenges; this rises only on a PASS.
     pub g_oh: f64,
-    /// `G(h←O)`: the owner's service to the holder (the eviction-priority key the
-    /// holder ranks on; bilaterally observable). The owner accrues this when it
+    /// `G(h←O)`: the owner's service to the holder (the fast term of the eviction key
+    /// the holder ranks on; bilaterally observable). The owner accrues this when it
     /// itself stores for the holder.
     pub g_ho: f64,
+    /// `D` (A.4): the SLOW-leaky loyalty depth of the SAME `g_ho` direction ("O served
+    /// h"), on the `τ_slow ≈ 6-month` time constant. Fed the SAME confirmed `V_conf`
+    /// as `g_ho` (a second, slower tap) and decayed for EVERY pair each tick (W2), it
+    /// is the W10 floor term of the κ_O eviction key ([`viaticum_core::four_r::
+    /// kappa_key`]). Default 0.0 — a fresh pair trusts no one.
+    pub depth_ho: f64,
     /// `G(O←h)` from the PREVIOUS challenge tick — for the D-projection finite
     /// difference `trend_d = (g_now − g_prev)/dt`.
     pub g_oh_prev: f64,
@@ -329,6 +335,7 @@ impl Default for PairCapital {
         PairCapital {
             g_oh: 0.0,
             g_ho: 0.0,
+            depth_ho: 0.0,
             g_oh_prev: 0.0,
             v_dem: 0.0,
             pos_window: Vec::new(),

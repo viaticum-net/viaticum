@@ -200,7 +200,115 @@ pub fn capital_steady_state(v_conf: f64, lambda: f64) -> f64 {
 }
 
 // ============================================================
-// S2 — eviction order under disk pressure (two-level: G-priority across
+// S1b — pairwise DEPTH: the SLOW-leaky loyalty carrier (A.4) and the single
+//        holder-side reciprocity key κ_O (A.14).
+// ============================================================
+
+/// A.4: slow-leaky **depth** `D` of a pair's confirmed-service history — the W10
+/// loyalty carrier. One explicit Euler step of the SAME leaky-integrator law as the
+/// fast capital [`update_capital`], but driven by a MUCH slower leak `λ_slow ≪ λ`:
+///
+/// ```text
+/// D_{t+Δt} = D_t·(1 − λ_slow·Δt) + V_conf·Δt          [gb·days]
+/// ```
+///
+/// `V_conf` is the SAME confirmed-service signal that charges the fast capital `g`
+/// (PoS-passed, live retained gb this tick) — depth is a second tap of that flow on a
+/// slow time constant `τ_slow = 1/λ_slow ≈ 6 months` (decision_model A.4 / §13).
+/// Steady state `D* = V_conf·τ_slow`; a burst of service then decays with an e-fold
+/// per `τ_slow`, so a farmed spike fades over months and only *continued* service
+/// keeps `D` high — loyalty is not a permanent free floor (ADV2-D1/D2). Two years of
+/// silence leave `e⁻⁴ ≈ 1.8%` (the "50 MB of super-precious data survives for years"
+/// case, canon §7).
+///
+/// **Why NOT a non-decaying accumulator.** An un-leaked cumulative ledger is
+/// FARMABLE: no channel ever lowers it, so a one-off burst of service buys a
+/// permanent floor forever. The slow leak is the fix — the deep-partner floor is real
+/// only while the service continues.
+///
+/// Numerical stability (the same guard as [`update_capital`]): the Euler multiplier is
+/// `(1 − λ_slow·Δt)`; monotone relaxation needs `λ_slow·Δt < 1`. The caller owns the
+/// tick and it is not silently re-scaled here (the sim asserts it once per step via
+/// `assert_lambda_dt_stable`, consistent with the fast capital). Inputs are clamped so
+/// a degenerate call cannot NaN: `depth` and `v_conf` are floored at 0 — unlike
+/// [`update_capital`], which lets a caller observe a transient negative capital, a
+/// *negative depth* is a meaningless loyalty quantity, so it is clamped — and
+/// `λ_slow`/`Δt` are floored at 0.
+pub fn update_depth(depth: f64, v_conf: f64, dt_days: f64, lambda_slow: f64) -> f64 {
+    let depth = depth.max(0.0);
+    let v_conf = v_conf.max(0.0);
+    let lambda_slow = lambda_slow.max(0.0);
+    let dt_days = dt_days.max(0.0);
+    depth * (1.0 - lambda_slow * dt_days) + v_conf * dt_days
+}
+
+/// Calibration for the single holder-side reciprocity key κ_O (A.14 / §13). The kernel
+/// does NOT hard-code these — the caller carries them (it alone knows `λ` and the
+/// per-symbol volume behind `g_star`). See [`kappa_key`].
+///
+/// §13 defaults (carried by the caller): `w_d ≈ 0.5`, `d_ref ≈ 365·V_sym` gb·days
+/// (≈ one year of a single symbol's steady service), `g_star = capital_steady_state(
+/// V_sym, λ)`.
+///
+/// **NB — the half floor on a single steady symbol (a §13 consequence, not a bug).**
+/// With those defaults a pair served by ONE symbol at constant service reaches
+/// `D* = V_sym/λ_slow = 180·V_sym` gb·days (at `τ_slow ≈ 6 months`), so
+/// `min(D*/d_ref, 1) = 180/365 ≈ 0.49`: the depth floor a *single* steadily-served
+/// symbol earns is only HALF-saturated, and full saturation (`min = 1`) needs steady
+/// service by ≈ two symbols. That is the deliberate effect of pairing a ~6-month
+/// `τ_slow` with a ~1-year `d_ref` (deep loyalty is earned over more than one
+/// symbol-year of service), NOT a defect.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DepthParams {
+    /// `w_d`: weight of the depth floor relative to `g_star`. `w_d < 0` is treated as
+    /// 0 (no floor). §13 default ≈ 0.5.
+    pub w_d: f64,
+    /// `d_ref`: depth (gb·days) at which the loyalty floor saturates. `d_ref ≤ 0`
+    /// saturates the floor to 1 (like the `standing_ref`/`g_ref` guards). §13 default
+    /// ≈ `365·V_sym`.
+    pub d_ref: f64,
+    /// `g_star`: the fast-capital steady state `g*(V_sym) = V_sym/λ` the floor is
+    /// measured in — the caller computes it with [`capital_steady_state`] (the kernel
+    /// does not know `λ`/`V_sym`). Floored at 0.
+    pub g_star: f64,
+}
+
+/// A.14: the ONE holder-side reciprocity key κ_O — the single ranking a holder uses
+/// under contention.
+///
+/// ```text
+/// κ_O = g_ho + w_d · min(D/d_ref, 1) · g_star
+/// ```
+///
+/// * `g_ho` = `G(h←O)` (the eviction seat: the owner `O`'s reciprocal service to ME,
+///   the holder — how much of MY data `O` has been keeping alive lately), the fast
+///   capital, bilaterally observable and unfakeable.
+/// * the second term is the **W10 loyalty floor**: a silent-but-deep partner
+///   (`g_ho → 0`, `D ≥ d_ref`) still ranks as if it carried `w_d·g_star` of fast
+///   capital — above every stranger, below an actively-reciprocating partner — and
+///   that floor FADES with `D` over `τ_slow` (no permanent free floor, A.4).
+///
+/// **One key, three consumers.** In transaction 3a κ_O drives eviction
+/// ([`eviction_order`]); the preemption gate and the `V_ret` volume cap join it in 3b.
+/// All three MUST read this SAME key — a bare-`g_ho` ranking would bypass the depth
+/// floor and let contention evict a silent-but-deep loyal partner (ADV2-D2).
+///
+/// All terms are gb·days. `depth`/`g_star` are floored at 0; `d_ref ≤ 0` saturates the
+/// floor to 1; `w_d < 0` is treated as 0.
+pub fn kappa_key(g_ho: f64, depth: f64, p: &DepthParams) -> f64 {
+    let depth = depth.max(0.0);
+    let g_star = p.g_star.max(0.0);
+    let w_d = p.w_d.max(0.0);
+    let sat = if p.d_ref > 0.0 {
+        (depth / p.d_ref).min(1.0)
+    } else {
+        1.0
+    };
+    g_ho + w_d * sat * g_star
+}
+
+// ============================================================
+// S2 — eviction order under disk pressure (two-level: κ_O-priority across
 //      owners, ι within an owner) + hysteresis.
 // ============================================================
 
@@ -235,7 +343,11 @@ pub struct SymbolDecl {
 /// two-level eviction decision while staying strictly first-hand:
 /// * `obs.g_holder_from_owner` (`G(h←O)`) is the holder's OWN pairwise capital —
 ///   bilaterally observable, UNFAKEABLE by the owner (the owner cannot inflate it
-///   by lying). It is the INTER-owner ranking key (each owner's share).
+///   by lying). Combined with `depth` through [`kappa_key`] it forms the INTER-owner
+///   ranking key κ_O (each owner's share).
+/// * `depth` (`D`) is the SLOW-leaky loyalty depth of this pair (A.4) — the W10
+///   carrier that lets a silent-but-deep partner keep its disk share above a
+///   stranger's; it enters the INTER-owner rank only through κ_O.
 /// * `symbols` are this owner's symbols with their owner-declared ι — the
 ///   INTRA-owner ordering key (lowest-ι dropped first), scoped strictly within
 ///   this owner so an inflated ι can only reorder the owner's OWN symbols.
@@ -246,8 +358,13 @@ pub struct SymbolDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OwnerEvictionView {
     /// First-hand observation of this owner-pair (carries `g_holder_from_owner`,
-    /// the inter-owner key, and `observed_tau`, the tie-breaker).
+    /// the fast capital in the inter-owner key, and `observed_tau`, the tie-breaker).
     pub obs: FirstHandObs,
+    /// `D`: the SLOW-leaky loyalty depth of this pair (A.4), from the holder's seat —
+    /// the accumulated history of "this owner served ME" on the `τ_slow ≈ 6-month`
+    /// time constant. Feeds the W10 floor in the κ_O rank ([`kappa_key`]); it is the
+    /// pair's own first-hand state, never a ground-truth oracle.
+    pub depth: f64,
     /// This owner's symbols on the holder, each with its owner-declared ι.
     pub symbols: Vec<SymbolDecl>,
 }
@@ -296,12 +413,23 @@ pub struct EvictionDecision {
 ///
 /// Eviction is **two-level** (W3 / W6 / W9, foundation §2A):
 ///
-/// * **INTER-owner level (the disk SHARE).** Owners are ranked by ascending
-///   `obs.g_holder_from_owner` (`G(h←O)` — MY service to that owner, bilaterally
-///   observable). The owner I have served least is squeezed first. This is the
-///   UNFAKEABLE key: the owner cannot inflate `G(h←O)` by lying about anything —
-///   it is my own first-hand record of the storage I performed. It sets each
-///   owner's slice of this holder's disk.
+/// * **INTER-owner level (the disk SHARE).** Owners are ranked by ascending κ_O
+///   ([`kappa_key`], A.14): the owner with the lowest κ_O is squeezed first. κ_O
+///   combines two first-hand terms.
+///   * `obs.g_holder_from_owner` (`G(h←O)`), read FROM THE HOLDER-EVICTOR'S SEAT, is
+///     **this owner's reciprocal service TO ME** (decision_model §1) — my own
+///     first-hand record of MY data that the owner keeps alive for me (measured by my
+///     PoS of my symbols stored at that owner). The owner that has served me least
+///     ranks lowest. It is UNFAKEABLE: the owner cannot inflate `G(h←O)` by lying —
+///     it is bilaterally observable service. (This is the direction the old doc
+///     comment inverted: the field is the OWNER's service to the holder, not the
+///     holder's service to the owner.)
+///   * the W10 loyalty floor `w_d·min(D/d_ref, 1)·g_star` (`depth_params`), which
+///     lets a silent-but-DEEP partner (`g_ho → 0`, `D ≥ d_ref`) keep its disk share
+///     above a stranger's — and which FADES with `D` over `τ_slow`, so it is not a
+///     permanent free floor (A.4, ADV2-D2).
+///
+///   κ_O sets each owner's slice of this holder's disk.
 /// * **INTRA-owner level (which of that owner's symbols).** WITHIN a single
 ///   owner's symbols, drop ascending by THAT owner's declared `ι`
 ///   ([`SymbolDecl::importance`]) — the owner's lowest-ι symbol first. `ι` is the
@@ -326,9 +454,9 @@ pub struct EvictionDecision {
 ///   when `φ ≥ s_target` (the `Δ_evict` gap). In between it holds its previous
 ///   state — that latch is what kills the lower-loop chatter.
 /// * While evicting, the result is the flattened two-level order above. The
-///   inter-owner sort is stable (ties keep input order) with a small retention
-///   tie-breaker on `observed_tau` (longer-held owner-pair dropped LAST —
-///   premium for stillness, formula_phase.md §10); the intra-owner sort is by
+///   inter-owner sort is by ascending κ_O, stable (ties keep input order) with a
+///   small retention tie-breaker on `observed_tau` (longer-held owner-pair dropped
+///   LAST — premium for stillness, formula_phase.md §10); the intra-owner sort is by
 ///   ascending `ι` with a [`SymbolId`] tie-breaker for determinism.
 /// * `accept_ok` is true only when `φ > s_soft` AND we are not evicting (the
 ///   `Δ_accept` gap), which forbids "drop and immediately re-accept".
@@ -337,6 +465,7 @@ pub fn eviction_order(
     phi: f64,
     hyst: Hysteresis,
     prev: EvictPhase,
+    depth_params: &DepthParams,
 ) -> EvictionDecision {
     // --- Relay latch with hysteresis on the lower (evict) gap. ---
     let mut evicting = prev.evicting;
@@ -348,20 +477,19 @@ pub fn eviction_order(
     // (s_hard ≤ φ < s_target ⇒ hold previous state: this is the Δ_evict deadband.)
 
     let drop_order = if evicting {
-        // INTER-owner: rank owners by ascending g_holder_from_owner (the owner I
-        // have served least loses disk first), with the retention tie-breaker.
+        // INTER-owner: rank owners by ascending κ_O (kappa_key: the fast reciprocal
+        // capital `g_ho` plus the slow W10 depth floor) — the owner that has served
+        // ME least loses disk first — with the `observed_tau` retention tie-breaker.
+        let kappa =
+            |v: &OwnerEvictionView| kappa_key(v.obs.g_holder_from_owner, v.depth, depth_params);
         let mut owner_idx: Vec<usize> = (0..owners.len()).collect();
         owner_idx.sort_by(|&i, &j| {
-            owners[i]
-                .obs
-                .g_holder_from_owner
-                .total_cmp(&owners[j].obs.g_holder_from_owner)
-                .then(
-                    owners[i]
-                        .obs
-                        .observed_tau
-                        .total_cmp(&owners[j].obs.observed_tau),
-                )
+            kappa(&owners[i]).total_cmp(&kappa(&owners[j])).then(
+                owners[i]
+                    .obs
+                    .observed_tau
+                    .total_cmp(&owners[j].obs.observed_tau),
+            )
         });
 
         // Flatten: for each owner in that order, emit ITS symbols ascending by ι.

@@ -632,6 +632,30 @@ fn print_section6(world: &World, params: &DynParams) {
         "       → honest entry-rate {:.2} vs zero-giving farm {:.2} (farm ≤ honest ⇒ Sybil-priced)",
         rel_rate, free_rate
     );
+
+    // (6f) transaction-3a diagnostic: the A.4 loyalty depth D over alive-symbol pairs
+    // (the slow W10 carrier that now feeds the κ_O eviction key). Read the SAME cell
+    // (capital[owner][holder].depth_ho) as share A>0, so the shift is visible by eye.
+    let mut d_vals: Vec<f64> = Vec::new();
+    for h in 0..n {
+        if !world.nodes[h].present {
+            continue;
+        }
+        for s in world.nodes[h].holdings.iter().filter(|s| s.alive) {
+            d_vals.push(world.capital[s.owner][h].depth_ho);
+        }
+    }
+    let d_pos = d_vals.iter().filter(|&&d| d > 1e-12).count();
+    let share_d = if d_vals.is_empty() {
+        0.0
+    } else {
+        100.0 * d_pos as f64 / d_vals.len() as f64
+    };
+    println!(
+        "  (6f) mean loyalty depth D over {} alive pairs = {:.3} gb·days   (share D>0 = {share_d:.1}%)",
+        d_vals.len(),
+        mean(&d_vals),
+    );
 }
 
 /// Section 7 (aggregate review §5.2): the correlated-holder-death "repair-storm" sweep.

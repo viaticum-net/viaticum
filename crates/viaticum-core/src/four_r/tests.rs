@@ -39,10 +39,41 @@ fn owner_view(
 ) -> OwnerEvictionView {
     OwnerEvictionView {
         obs: obs_with(g_holder_from_owner, tau),
+        depth: 0.0,
         symbols: vec![SymbolDecl {
             id: SymbolId(sym_id),
             importance,
         }],
+    }
+}
+
+/// Like [`owner_view`] but with an explicit loyalty depth `D` (A.4). Used by the
+/// κ_O eviction tests where the W10 floor must move an owner up the drop order.
+fn owner_view_depth(
+    g_holder_from_owner: f64,
+    depth: f64,
+    tau: f64,
+    importance: f64,
+    sym_id: u64,
+) -> OwnerEvictionView {
+    OwnerEvictionView {
+        obs: obs_with(g_holder_from_owner, tau),
+        depth,
+        symbols: vec![SymbolDecl {
+            id: SymbolId(sym_id),
+            importance,
+        }],
+    }
+}
+
+/// DepthParams for the legacy (pre-3a) eviction tests: every such view has `depth =
+/// 0`, so κ_O collapses to bare `g_ho` and the ordering is exactly the pre-3a one.
+/// These field values are inert whenever the view depths are 0.
+fn dp_zero() -> DepthParams {
+    DepthParams {
+        w_d: 0.5,
+        d_ref: 100.0,
+        g_star: 10.0,
     }
 }
 
@@ -56,6 +87,7 @@ fn owner_view_multi(
 ) -> OwnerEvictionView {
     OwnerEvictionView {
         obs: obs_with(g_holder_from_owner, tau),
+        depth: 0.0,
         symbols: importances
             .iter()
             .enumerate()
@@ -159,7 +191,7 @@ fn eviction_orders_net_debtors_before_net_creditors() {
         s_target: 0.2,
         s_soft: 0.3,
     };
-    let dec = eviction_order(&owners, 0.05, hyst, EvictPhase::default());
+    let dec = eviction_order(&owners, 0.05, hyst, EvictPhase::default(), &dp_zero());
     assert_eq!(
         owner_seq(&dec),
         vec![2, 1, 0],
@@ -178,7 +210,7 @@ fn eviction_returns_empty_drop_order_when_not_under_pressure() {
         s_soft: 0.3,
     };
     // φ well above s_soft, not previously evicting ⇒ nothing dropped, accept ok.
-    let dec = eviction_order(&owners, 0.9, hyst, EvictPhase::default());
+    let dec = eviction_order(&owners, 0.9, hyst, EvictPhase::default(), &dp_zero());
     assert!(dec.drop_order.is_empty());
     assert!(!dec.phase.evicting);
     assert!(dec.accept_ok);
@@ -196,7 +228,7 @@ fn eviction_retention_tiebreak_drops_shorter_held_first_among_equal_capital() {
         s_target: 0.2,
         s_soft: 0.3,
     };
-    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default());
+    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default(), &dp_zero());
     assert_eq!(
         owner_seq(&dec),
         vec![1, 0],
@@ -214,7 +246,7 @@ fn eviction_orders_symbols_within_an_owner_by_ascending_importance() {
         s_target: 0.2,
         s_soft: 0.3,
     };
-    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default());
+    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default(), &dp_zero());
     // symbol_idx order: index 1 (ι=0.1) first, index 2 (ι=0.5), index 0 (ι=0.9) last.
     let sym_seq: Vec<usize> = dec.drop_order.iter().map(|s| s.symbol_idx).collect();
     assert!(
@@ -241,7 +273,7 @@ fn eviction_is_two_level_g_dominates_importance_across_owners() {
         s_target: 0.2,
         s_soft: 0.3,
     };
-    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default());
+    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default(), &dp_zero());
     assert_eq!(
         owner_seq(&dec),
         vec![0, 1],
@@ -259,14 +291,14 @@ fn eviction_latch_holds_state_inside_the_deadband() {
         s_soft: 0.3,
     };
     // Enter evicting below s_hard.
-    let d1 = eviction_order(&owners, 0.05, hyst, EvictPhase::default());
+    let d1 = eviction_order(&owners, 0.05, hyst, EvictPhase::default(), &dp_zero());
     assert!(d1.phase.evicting);
     // φ rises into the deadband (s_hard ≤ φ < s_target): latch HOLDS → still evicting.
-    let d2 = eviction_order(&owners, 0.15, hyst, d1.phase);
+    let d2 = eviction_order(&owners, 0.15, hyst, d1.phase, &dp_zero());
     assert!(d2.phase.evicting, "deadband must hold the evicting latch");
     assert!(!d2.drop_order.is_empty());
     // φ reaches s_target: latch releases.
-    let d3 = eviction_order(&owners, 0.2, hyst, d2.phase);
+    let d3 = eviction_order(&owners, 0.2, hyst, d2.phase, &dp_zero());
     assert!(!d3.phase.evicting, "reaching s_target releases the latch");
 }
 
@@ -300,8 +332,8 @@ fn inflating_own_importance_does_not_steal_share_from_other_owner() {
     let a_liar = owner_view_multi(2.0, 10.0, &[1.0, 1.0, 1.0], 10);
     let lying = vec![a_liar, b];
 
-    let dec_honest = eviction_order(&honest, 0.0, hyst, EvictPhase::default());
-    let dec_lying = eviction_order(&lying, 0.0, hyst, EvictPhase::default());
+    let dec_honest = eviction_order(&honest, 0.0, hyst, EvictPhase::default(), &dp_zero());
+    let dec_lying = eviction_order(&lying, 0.0, hyst, EvictPhase::default(), &dp_zero());
 
     // Owner A is index 0 in both. Helper: which owner each drop slot belongs to.
     let owners_honest = owner_seq(&dec_honest);
@@ -357,6 +389,238 @@ fn inflating_own_importance_does_not_steal_share_from_other_owner() {
         b_ids(&dec_lying, &lying),
         vec![20, 21],
         "A's lie cannot reorder B's symbols"
+    );
+}
+
+// ============================================================
+// update_depth — slow-leaky loyalty carrier D (A.4).
+// ============================================================
+
+#[test]
+fn depth_grows_to_steady_state_and_fades_with_tau_slow() {
+    // λ_slow = 1/180 ⇒ τ_slow = 180 days; V_conf = 2 gb ⇒ D* = V_conf·τ_slow = 360.
+    let lambda_slow = 1.0 / 180.0;
+    let v_conf = 2.0;
+    let dt = 1.0; // λ_slow·dt ≈ 0.0056 < 1.
+    let d_star = v_conf / lambda_slow; // 360
+
+    // Grow from cold under constant confirmed service → relaxes to D*.
+    let mut d = 0.0;
+    for _ in 0..3600 {
+        d = update_depth(d, v_conf, dt, lambda_slow);
+    }
+    let d_grown = d;
+    assert!(
+        (d_grown - d_star).abs() < 0.5,
+        "depth should relax to D* = V_conf·τ_slow = {d_star}, got {d_grown}"
+    );
+
+    // Then 4·τ_slow of SILENCE (V_conf = 0) → an e-fold per τ_slow ⇒ ≈ e⁻⁴.
+    for _ in 0..720 {
+        d = update_depth(d, 0.0, dt, lambda_slow);
+    }
+    let ratio = d / d_grown;
+    assert!(
+        (ratio - (-4.0f64).exp()).abs() < 1e-3,
+        "after 4·τ_slow of silence depth must fade to ≈ e⁻⁴ ({}), got ratio {ratio}",
+        (-4.0f64).exp()
+    );
+}
+
+#[test]
+fn depth_is_not_erased_by_silence_within_months() {
+    // The whole point of the SLOW time constant: a couple of months of silence must
+    // NOT wipe the loyalty depth (that is the fast capital's job). Slow keeps > 70%
+    // over 2 months where the fast capital (λ = 1/60) is already down to ~37%.
+    let d0 = 100.0;
+    let dt = 1.0;
+    let two_months = 60;
+
+    let mut d_slow = d0;
+    for _ in 0..two_months {
+        d_slow = update_depth(d_slow, 0.0, dt, 1.0 / 180.0);
+    }
+    assert!(
+        d_slow > 0.70 * d0,
+        "2 months of silence should leave > 70% of the depth, got {}%",
+        100.0 * d_slow / d0
+    );
+
+    // Same 2 months through the FAST capital law → nearly gone (slow ≠ fast).
+    let mut g_fast = d0;
+    for _ in 0..two_months {
+        g_fast = update_capital(g_fast, 0.0, 1.0 / 60.0, dt);
+    }
+    assert!(
+        g_fast < 0.40 * d0,
+        "the fast capital should have decayed below 40% over the same window, got {}%",
+        100.0 * g_fast / d0
+    );
+}
+
+// ============================================================
+// kappa_key — the single holder-side reciprocity key κ_O (A.14).
+// ============================================================
+
+/// §13 default depth params for a 10 gb symbol at λ = 1/60 (g* = 600, d_ref = 3650).
+fn dp_canon() -> DepthParams {
+    let v_sym = 10.0;
+    let lambda = 1.0 / 60.0;
+    DepthParams {
+        w_d: 0.5,
+        d_ref: 365.0 * v_sym,
+        g_star: capital_steady_state(v_sym, lambda),
+    }
+}
+
+#[test]
+fn kappa_key_ranks_silent_deep_above_stranger_below_active() {
+    let p = dp_canon();
+    let g_star = p.g_star;
+
+    // active: strong fast capital, no depth needed.
+    let k_active = kappa_key(g_star, 0.0, &p);
+    // silent-deep: fast capital gone, but depth fully saturated (D ≥ d_ref).
+    let k_deep = kappa_key(0.0, p.d_ref, &p);
+    // stranger: nothing.
+    let k_stranger = kappa_key(0.0, 0.0, &p);
+
+    assert!(
+        k_active > k_deep && k_deep > k_stranger,
+        "κ order must be active ({k_active}) > silent-deep ({k_deep}) > stranger ({k_stranger})"
+    );
+    // The floor is exactly w_d·g* at full saturation, and the stranger is bare 0.
+    assert!((k_deep - 0.5 * g_star).abs() < 1e-9);
+    assert_eq!(k_stranger, 0.0);
+}
+
+// ============================================================
+// eviction_order — the κ_O inter-owner key (A.14, transaction 3a).
+// ============================================================
+
+#[test]
+fn eviction_drops_stranger_before_silent_deep_partner() {
+    // Two owners, both with g_ho = 0. One is a stranger (D = 0), the other a
+    // silent-but-DEEP loyal partner (D = d_ref). Under pressure the stranger drops
+    // first — the W10 depth floor keeps the deep partner's disk share.
+    let p = dp_canon();
+    let deep = owner_view_depth(0.0, p.d_ref, 5.0, 1.0, 0); // owner 0
+    let stranger = owner_view_depth(0.0, 0.0, 5.0, 1.0, 1); // owner 1
+    let owners = vec![deep, stranger];
+    let hyst = Hysteresis {
+        s_hard: 0.1,
+        s_target: 0.2,
+        s_soft: 0.3,
+    };
+    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default(), &p);
+    assert_eq!(
+        owner_seq(&dec),
+        vec![1, 0],
+        "the stranger (κ=0) drops before the silent-deep partner (κ = w_d·g*)"
+    );
+}
+
+#[test]
+fn eviction_deep_floor_fades_after_years_of_silence() {
+    // The D-farm is CLOSED: a once-deep partner that goes silent for ~4·τ_slow sees
+    // its floor decay to ≈ e⁻⁴ of saturation, so it ranks essentially with a
+    // stranger — and drops BEFORE a partner still at full depth. Depth is evolved
+    // with the real update_depth law (ties the fade mechanism to eviction).
+    let p = dp_canon();
+    let lambda_slow = 1.0 / 180.0;
+    let mut d_faded = p.d_ref; // start fully saturated
+    for _ in 0..720 {
+        // 4·τ_slow of silence
+        d_faded = update_depth(d_faded, 0.0, 1.0, lambda_slow);
+    }
+
+    // The faded floor is a small fraction of the fresh floor (farm closed).
+    let k_faded = kappa_key(0.0, d_faded, &p);
+    let k_fresh = kappa_key(0.0, p.d_ref, &p);
+    assert!(
+        k_faded < 0.05 * k_fresh,
+        "after ~4·τ_slow of silence the floor must have collapsed: faded {k_faded} vs fresh {k_fresh}"
+    );
+
+    // In eviction: stranger, faded-deep, fresh-deep — fresh drops LAST, faded drops
+    // before fresh (its loyalty protection is gone).
+    let stranger = owner_view_depth(0.0, 0.0, 5.0, 1.0, 0); // owner 0
+    let faded = owner_view_depth(0.0, d_faded, 5.0, 1.0, 1); // owner 1
+    let fresh = owner_view_depth(0.0, p.d_ref, 5.0, 1.0, 2); // owner 2
+    let owners = vec![stranger, faded, fresh];
+    let hyst = Hysteresis {
+        s_hard: 0.1,
+        s_target: 0.2,
+        s_soft: 0.3,
+    };
+    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default(), &p);
+    let seq = owner_seq(&dec);
+    assert_eq!(seq.last(), Some(&2), "the still-deep partner drops LAST");
+    let pos = |o: usize| seq.iter().position(|&x| x == o).unwrap();
+    assert!(
+        pos(1) < pos(2),
+        "the faded once-deep partner now drops before the still-deep one: {seq:?}"
+    );
+}
+
+#[test]
+fn eviction_cross_owner_iota_ban_still_holds() {
+    // Existing H2 invariant under the κ_O key: an owner with LOW κ (even with real
+    // depth) whose symbol is MAXIMALLY important still loses its whole share before
+    // any symbol of a higher-κ owner — ι never jumps owners.
+    let p = dp_canon();
+    // Owner 0: g_ho = 0.5, depth = d_ref ⇒ κ ≈ 0.5 + 0.5·g* = 300.5; symbol ι = 1000.
+    let poor_kappa_high_iota = owner_view_depth(0.5, p.d_ref, 10.0, 1_000.0, 0);
+    // Owner 1: g_ho = 350, depth = 0 ⇒ κ = 350; symbol ι = 0.001.
+    let rich_kappa_low_iota = owner_view_depth(350.0, 0.0, 10.0, 0.001, 1);
+    let owners = vec![poor_kappa_high_iota, rich_kappa_low_iota];
+    let hyst = Hysteresis {
+        s_hard: 0.1,
+        s_target: 0.2,
+        s_soft: 0.3,
+    };
+    let dec = eviction_order(&owners, 0.0, hyst, EvictPhase::default(), &p);
+    assert_eq!(
+        owner_seq(&dec),
+        vec![0, 1],
+        "the low-κ owner's symbol drops first even with far-higher ι and real depth \
+         (no cross-owner κ×ι product)"
+    );
+}
+
+#[test]
+fn eviction_kappa_reads_only_first_hand_no_archetype_channel() {
+    // Anti-oracle: the κ_O rank is a pure function of first-hand scalars (g_ho, D,
+    // tau, ι) — there is NOWHERE on OwnerEvictionView / DepthParams to encode a hidden
+    // archetype, so two owners identical in every κ/tie-break input are
+    // INTERCHANGEABLE: the drop order is decided only by those inputs and the input
+    // order (stable tie-break), never by any concealed discriminator.
+    let p = dp_canon();
+    let a = owner_view_depth(3.0, 100.0, 10.0, 0.5, 7);
+    let b = owner_view_depth(3.0, 100.0, 10.0, 0.5, 8);
+    let hyst = Hysteresis {
+        s_hard: 0.1,
+        s_target: 0.2,
+        s_soft: 0.3,
+    };
+    // Identical κ and tau ⇒ stable order preserves input order in both arrangements.
+    let dec_ab = eviction_order(
+        &[a.clone(), b.clone()],
+        0.0,
+        hyst,
+        EvictPhase::default(),
+        &p,
+    );
+    let dec_ba = eviction_order(&[b, a], 0.0, hyst, EvictPhase::default(), &p);
+    assert_eq!(
+        owner_seq(&dec_ab),
+        vec![0, 1],
+        "equal-κ owners keep input order (no hidden discriminator)"
+    );
+    assert_eq!(
+        owner_seq(&dec_ba),
+        vec![0, 1],
+        "swapping the two equal-κ owners swaps their drop positions symmetrically"
     );
 }
 
