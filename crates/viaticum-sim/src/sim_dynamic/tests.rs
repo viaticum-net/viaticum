@@ -12,12 +12,12 @@ use viaticum_core::four_r::{
 
 use crate::sim_dynamic::engine::{
     DynParams, PosOutcome, admit_offer_for_test, alive_block_counts_for_test,
-    assert_lambda_dt_stable, block_mature_for_test, churn_for_test, fresh_capital,
+    assert_lambda_dt_stable, block_mature_for_test, churn_for_test, disaster_strike, fresh_capital,
     place_reciprocal_for_test, pos_and_capital_for_test, run_eviction_for_test, step,
     symbols_per_tick_for_test,
 };
 use crate::sim_dynamic::evaluator::{
-    contention_metric, drop_ranking_metric, mc_block_r_actual, pillar1_metric,
+    contention_metric, drop_ranking_metric, legacy_mc_block_r_actual, pillar1_metric,
 };
 use crate::sim_dynamic::generator::{
     Archetype, DAYS_PER_TICK, DiskProfile, GiverTier, HeldSymbol, Node, OWN_DATA_DISK_FRACTION,
@@ -1307,7 +1307,10 @@ fn world_reaches_contention_with_eviction_firing() {
 // ============================================================
 
 #[test]
-fn mc_r_actual_rises_with_more_surviving_holders() {
+fn legacy_mc_r_actual_rises_with_more_surviving_holders() {
+    // LEGACY (world-v3 §10.3): asserts the retired parallel durability scorer's
+    // monotonicity. Kept only until the honest-baseline cross-check with restore-truth is
+    // done; deleted next tranche together with `legacy_mc_block_r_actual`.
     // §D.1 MC estimator monotonicity: more (likely-surviving) holders ⇒ higher
     // R_actual. Build a tiny world, place a block on few vs many strong holders, and
     // assert the MC survival rises. Uses the real god-view survival hazard.
@@ -1344,9 +1347,9 @@ fn mc_r_actual_rises_with_more_surviving_holders() {
         }
     };
     place_on(&mut world, 2);
-    let r_few = mc_block_r_actual(&world, owner, block, params.k_eff, 8, 400, 11);
+    let r_few = legacy_mc_block_r_actual(&world, owner, block, params.k_eff, 8, 400, 11);
     place_on(&mut world, 8);
-    let r_many = mc_block_r_actual(&world, owner, block, params.k_eff, 8, 400, 11);
+    let r_many = legacy_mc_block_r_actual(&world, owner, block, params.k_eff, 8, 400, 11);
     assert!(
         r_many > r_few,
         "more surviving holders must raise R_actual: many={r_many:.4} ≤ few={r_few:.4}"
@@ -1358,7 +1361,9 @@ fn mc_r_actual_rises_with_more_surviving_holders() {
 }
 
 #[test]
-fn mc_r_actual_is_deterministic_for_the_same_seed() {
+fn legacy_mc_r_actual_is_deterministic_for_the_same_seed() {
+    // LEGACY (world-v3 §10.3): determinism of the retired parallel durability scorer.
+    // Kept only for the honest-baseline cross-check; deleted next tranche.
     // §F determinism: the MC estimator is bit-reproducible for a fixed seed.
     let params = DynParams::default();
     let world = run_small(123, 40);
@@ -1366,8 +1371,8 @@ fn mc_r_actual_is_deterministic_for_the_same_seed() {
         .find(|&o| world.nodes[o].present && !world.nodes[o].own_blocks.is_empty())
         .unwrap();
     let block = world.nodes[owner].own_blocks[0].id;
-    let a = mc_block_r_actual(&world, owner, block, params.k_eff, 8, 300, 77);
-    let b = mc_block_r_actual(&world, owner, block, params.k_eff, 8, 300, 77);
+    let a = legacy_mc_block_r_actual(&world, owner, block, params.k_eff, 8, 300, 77);
+    let b = legacy_mc_block_r_actual(&world, owner, block, params.k_eff, 8, 300, 77);
     assert_eq!(
         a.to_bits(),
         b.to_bits(),
@@ -2707,5 +2712,137 @@ fn timeout_bumps_sigma_weakly_once_per_pair_tick() {
     assert!(
         (sigma - 3.0 * expected).abs() > 1e-9,
         "NOT multiplied by the 3 symbols: {sigma}"
+    );
+}
+
+// ============================================================
+// World-v3 axis 8 (sub-tranche 0.2) — Disaster event physics
+// ============================================================
+
+#[test]
+fn disaster_strike_wipes_local_state_and_preserves_counterparty_memory() {
+    // A Disaster destroys the victim's disk: its foreign HOLDINGS vanish, its OWN blocks
+    // become `to_restore` (source lost → no repair, P1), it goes absent, and its PRIVATE
+    // ledger dies — but the bilaterally-observable `g_ho`/`depth_ho` (the holders'
+    // memory of the victim's service) is PRESERVED, so its symbols keep the eviction
+    // protection it earned. The victim as a HOLDER is a silent loss to the owners it carried.
+    let mut world = run_small(5, 50);
+    let victim = (0..world.nodes.len())
+        .find(|&i| {
+            world.nodes[i].present
+                && world.nodes[i].holdings.iter().any(|s| s.alive)
+                && !world.nodes[i].own_blocks.is_empty()
+        })
+        .expect("a present holder-owner exists in the mature world");
+    let carried_owner = world.nodes[victim]
+        .holdings
+        .iter()
+        .filter(|s| s.alive)
+        .map(|s| s.owner)
+        .find(|&o| world.nodes[o].present)
+        .expect("victim holds data of at least one present owner");
+
+    // Seed a private + counterparty capital signal on one pair to check the split.
+    let h = (0..world.nodes.len()).find(|&h| h != victim).unwrap();
+    world.capital[victim][h].g_oh = 5.0; // private (victim's record of holder) → dies
+    world.capital[victim][h].sigma = 0.3; // private → dies
+    world.capital[victim][h].drop_ann = 2.0; // private → dies
+    world.capital[victim][h].g_ho = 7.0; // counterparty-observable → preserved
+    world.capital[victim][h].depth_ho = 9.0; // counterparty-observable → preserved
+    world.capital[victim][h].v_dem = 11.0; // 0.2-fix: v_dem is victim-seat (written by
+    // victim's own PoS challenge), dies with her redb
+
+    let queued_before = world.pending_silent_loss.len();
+    disaster_strike(&mut world, victim);
+
+    assert!(!world.nodes[victim].present, "victim goes absent");
+    assert!(
+        world.nodes[victim].holdings.is_empty(),
+        "foreign holdings (the lost disk) are wiped"
+    );
+    assert!(
+        world.nodes[victim].own_blocks.iter().all(|b| b.to_restore),
+        "every own block is to_restore (source lost)"
+    );
+    assert_eq!(world.capital[victim][h].g_oh, 0.0, "private g_oh dies");
+    assert_eq!(world.capital[victim][h].sigma, 0.0, "private sigma dies");
+    assert_eq!(
+        world.capital[victim][h].drop_ann, 0.0,
+        "private drop_ann dies"
+    );
+    assert_eq!(
+        world.capital[victim][h].g_ho, 7.0,
+        "counterparty-observable g_ho preserved (holder remembers)"
+    );
+    assert_eq!(
+        world.capital[victim][h].depth_ho, 9.0,
+        "counterparty-observable depth_ho preserved"
+    );
+    // 0.2-fix: v_dem is victim-seat (written by victim's own PoS challenge), dies with her redb
+    assert_eq!(world.capital[victim][h].v_dem, 0.0, "private v_dem dies");
+    assert!(
+        world.pending_silent_loss.len() > queued_before,
+        "the victim as a holder queues a silent loss for the owners it carried"
+    );
+    assert!(
+        world
+            .pending_silent_loss
+            .iter()
+            .any(|sl| sl.holder == victim && sl.owner == carried_owner),
+        "the carried present owner is in the silent-loss queue"
+    );
+}
+
+#[test]
+fn disaster_victim_source_less_block_is_not_repaired_by_place_own_data() {
+    // P1: after a Disaster the source is gone, so no new symbols can be created — the
+    // victim's blocks can only be RESTORED from surviving holders, never repaired. Even
+    // with the victim present again and its blocks BELOW floor (which would normally fire
+    // repair), `place_own_data` must add ZERO symbols to a `to_restore` block.
+    let params = DynParams::default();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world(80, &params, 9);
+    for _ in 0..50 {
+        step(&mut world, &params, &prior, &policy);
+    }
+    let victim = (0..world.nodes.len())
+        .find(|&i| {
+            world.nodes[i].present && world.nodes[i].own_blocks.iter().any(|b| b.floor_ever_met)
+        })
+        .expect("a mature owner with an established block exists");
+    let block_ids: Vec<usize> = world.nodes[victim]
+        .own_blocks
+        .iter()
+        .map(|b| b.id)
+        .collect();
+    let alive_of = |world: &World, block_id: usize| -> usize {
+        let (f, c) = alive_block_counts_for_test(world, victim, block_id);
+        f + c
+    };
+
+    disaster_strike(&mut world, victim);
+    // Bring the victim back (present) — only the `to_restore` gate, not absence, must stop
+    // the repair.
+    world.nodes[victim].present = true;
+
+    let before: Vec<usize> = block_ids.iter().map(|&b| alive_of(&world, b)).collect();
+    assert!(
+        before.iter().any(|&c| c < params.n_symbols),
+        "setup: at least one block is below floor — a non-source-less owner would repair it"
+    );
+    for _ in 0..6 {
+        step(&mut world, &params, &prior, &policy);
+    }
+    let after: Vec<usize> = block_ids.iter().map(|&b| alive_of(&world, b)).collect();
+    for (i, (&b, &a)) in before.iter().zip(&after).enumerate() {
+        assert!(
+            a <= b,
+            "P1: source-less block {i} must NOT gain symbols (before {b}, after {a})"
+        );
+    }
+    assert!(
+        after.iter().sum::<usize>() > 0,
+        "the victim's symbols still live on holders (the restore target)"
     );
 }

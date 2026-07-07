@@ -23,8 +23,8 @@ use std::process::ExitCode;
 
 use viaticum_sim::sim_adv::cli::resolve_seeds;
 use viaticum_sim::sim_adv::{
-    Cli, SimAdvError, evaluate_board, find_scenario, format_report, format_sweep, parse_cli, run,
-    run_result_csv, run_sweep, sweep_csv,
+    Cli, SimAdvError, evaluate_board, find_scenario, format_report, format_sweep, parse_cli,
+    restore_csv, run, run_result_csv, run_sweep, sweep_csv,
 };
 
 fn main() -> ExitCode {
@@ -60,8 +60,21 @@ fn run_cli(args: &[String]) -> Result<(), SimAdvError> {
 
     if let Some(path) = &cli.csv {
         write_csv(path, &run_result_csv(&result))?;
+        // Restore-truth has its own schema (metric №1); write it to a sibling `.restore`
+        // file when the scenario produced any (a DR scenario like `dr_baseline`).
+        if result.per_seed_restore.iter().any(|r| r.is_some()) {
+            write_csv(&restore_csv_path(path), &restore_csv(&result))?;
+        }
     }
     Ok(())
+}
+
+/// Derive the restore-CSV sibling path: `x.csv` → `x.restore.csv`, else `x` → `x.restore.csv`.
+fn restore_csv_path(path: &str) -> String {
+    match path.strip_suffix(".csv") {
+        Some(stem) => format!("{stem}.restore.csv"),
+        None => format!("{path}.restore.csv"),
+    }
 }
 
 fn write_csv(path: &str, contents: &str) -> Result<(), SimAdvError> {

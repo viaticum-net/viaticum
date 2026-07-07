@@ -18,15 +18,22 @@
 //! * The first scenario `honest_v2` — a faithful replay of the current v2 acceptance
 //!   run, whose seed-42 numbers MATCH `sim_diag 42 100 50 1 v2` (regression anchor).
 //!
-//! ## Deliberately NOT in 0.1 (later tranches)
+//! ## Added in 0.2 (restore-truth + Disaster)
 //!
-//! Event EXECUTION (Disaster wiping a node, subnet kills, ...) is phase 0.2+: here the
-//! [`Event`] vocabulary and the tick-indexed dispatch queue exist, but the executor is a
-//! NO-OP that only RECORDS which event fired at which tick (so the dispatch is testable)
-//! and never touches `&mut World`. Predator behaviour is phase 1: only the anti-oracle
-//! hook SIGNATURES exist ([`BehaviorHook`], which by construction cannot borrow `&World`
-//! — spec §10 п.14 / WARN-5). Restore-truth (0.2), sim-unification (0.3) and
-//! heterogeneous volumes (0.4) are separate tranches.
+//! * The [`Event::Disaster`] executor: it strikes a victim (loses source + holdings, P1),
+//!   returns it one tick later with the same identity, and never lets the source-less
+//!   owner "repair" (the `to_restore` gate in `place_own_data`).
+//! * Restore-truth (metric №1, [`restore`]): the god-view fraction of a victim's blocks
+//!   that can be COLD-RESTORED (≥ `k_eff` live symbols re-collected in a `W`-day window),
+//!   under Model U (union-over-window) and Model S (bandwidth-aware) — plus the floor-only
+//!   `durability_floor`. Scenario `dr_baseline` + the `INV-RESTORE-SANITY` board row.
+//!
+//! ## Still deliberately NOT here (later tranches)
+//!
+//! The other event executors (subnet kills, join waves, ...) are still recorded-only.
+//! Predator behaviour is phase 1: only the anti-oracle hook SIGNATURES exist
+//! ([`BehaviorHook`], which by construction cannot borrow `&World` — spec §10 п.14 /
+//! WARN-5). Sim-unification (0.3) and heterogeneous volumes (0.4) are separate tranches.
 
 #[cfg(test)]
 mod tests;
@@ -35,6 +42,7 @@ pub mod cli;
 pub mod metrics;
 pub mod registry;
 pub mod report;
+pub mod restore;
 pub mod runner;
 pub mod scenario;
 pub mod verdict;
@@ -42,7 +50,8 @@ pub mod verdict;
 pub use cli::{Cli, SimAdvError, Sweep, parse_cli};
 pub use metrics::MetricSet;
 pub use registry::{all_scenarios, find_scenario};
-pub use report::{format_report, format_sweep, run_result_csv, sweep_csv};
+pub use report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
+pub use restore::{BlockOutcome, RestoreTracker, RestoreTruth};
 pub use runner::{FiredEvent, RunResult, run, run_sweep};
 pub use scenario::{
     AdvAction, AdvContext, AdvDials, AdvId, AdvSpec, BehaviorHook, Event, EventKind, InfoModel,

@@ -1,16 +1,21 @@
-//! Unit tests for the `sim_adv` skeleton (sub-tranche 0.1). `what_when_then` naming.
+//! Unit tests for `sim_adv` (sub-tranches 0.1 + 0.2 restore-truth). `what_when_then`.
 
 use crate::sim_adv::cli::{apply_dial, parse_cli, resolve_seeds};
 use crate::sim_adv::metrics::mean_sigma;
-use crate::sim_adv::registry::{all_scenarios, find_scenario, honest_v2};
-use crate::sim_adv::report::{format_report, format_sweep, run_result_csv, sweep_csv};
+use crate::sim_adv::registry::{all_scenarios, dr_baseline, find_scenario, honest_v2};
+use crate::sim_adv::report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
+use crate::sim_adv::restore::{
+    BlockOutcome, IOTA_BUCKETS, RestoreTracker, RestoreTruth, bit_eq as restore_bit_eq, iota_bucket,
+};
 use crate::sim_adv::runner::{run, run_one_seed, run_sweep};
 use crate::sim_adv::scenario::{
     AdvAction, AdvContext, AdvDials, AdvId, AdvSpec, BehaviorHook, Event, EventKind, InfoModel,
     MetricId, NodeSel, Scenario, WorldParams,
 };
 use crate::sim_adv::verdict::{Direction, VerdictKind, decide, evaluate_board};
+use crate::sim_dynamic::build_world;
 use crate::sim_dynamic::engine::DynParams;
+use crate::sim_dynamic::generator::{Archetype, GiverTier, HeldSymbol, OwnBlock, World, online};
 
 // ------------------------------------------------------------------
 // helpers
@@ -24,6 +29,8 @@ fn tiny_scenario_with_events(events: Vec<(u64, Event)>) -> Scenario {
         world: WorldParams {
             n_nodes: 8,
             base: DynParams::default(),
+            restore_window_days: 14.0,
+            restore_bw_gb_day: 50.0,
         },
         population: Vec::new(),
         tiers: Vec::new(),
@@ -81,7 +88,7 @@ fn registry_all_scenarios_is_non_empty() {
 #[test]
 fn event_dispatch_records_executor_on_the_scripted_tick() {
     let sc = tiny_scenario_with_events(vec![(2, Event::Disaster(NodeSel::Index(0)))]);
-    let (_metrics, fired) = run_one_seed(&sc, 1);
+    let (_metrics, fired, _r) = run_one_seed(&sc, 1);
     assert_eq!(fired.len(), 1, "exactly one event fired");
     assert_eq!(fired[0].tick, 2, "fired on the scripted tick");
     assert_eq!(fired[0].kind, EventKind::Disaster);
@@ -91,7 +98,7 @@ fn event_dispatch_records_executor_on_the_scripted_tick() {
 fn event_dispatch_skips_events_scheduled_beyond_horizon() {
     // horizon is 4 (ticks 0..4); an event at tick 9 must never fire.
     let sc = tiny_scenario_with_events(vec![(9, Event::KillSubnet(3))]);
-    let (_metrics, fired) = run_one_seed(&sc, 1);
+    let (_metrics, fired, _r) = run_one_seed(&sc, 1);
     assert!(fired.is_empty(), "event past the horizon does not fire");
 }
 
@@ -107,7 +114,7 @@ fn event_dispatch_fires_multiple_events_at_their_ticks() {
         ),
         (3, Event::AdvActivate(AdvId::A1EpsilonWhale)),
     ]);
-    let (_m, fired) = run_one_seed(&sc, 1);
+    let (_m, fired, _r) = run_one_seed(&sc, 1);
     let ticks: Vec<u64> = fired.iter().map(|f| f.tick).collect();
     assert_eq!(ticks, vec![0, 1, 3]);
     assert_eq!(fired[0].kind, EventKind::JoinWave);
@@ -183,7 +190,7 @@ fn report_text_is_byte_identical_on_repeat_under_rayon() {
 fn honest_v2_seed42_matches_sim_diag_anchor() {
     // Anchor = `sim_diag 42 100 50 1 v2` (captured 2026-07-07). The harness must NOT
     // distort the engine: same build_world + 130 steps ⇒ same god-view numbers.
-    let (m, _fired) = run_one_seed(&honest_v2(), 42);
+    let (m, _fired, _r) = run_one_seed(&honest_v2(), 42);
 
     // Exact integer counters (sim_diag §6a/§3-sum/§6d).
     assert_eq!(m.alive_symbols, 564, "alive symbols (6a)");
@@ -235,7 +242,7 @@ fn honest_v2_reliable_extraction_roi_is_near_balance_and_bounded() {
     // Reliable operates at BALANCED reciprocity — seed 42 ROI ≈ 1.0123, NOT below 1.
     // (Universal "< 1 for all archetypes" is impossible: Σconsumed ≡ Σserved_out.) The
     // invariant is BOUNDED extraction, so we lock the measured value and the 1.25 ceiling.
-    let (m, _fired) = run_one_seed(&honest_v2(), 42);
+    let (m, _fired, _r) = run_one_seed(&honest_v2(), 42);
     let roi = m.extraction_roi[0];
     assert!(
         (roi - 1.0123).abs() < 0.01,
@@ -519,4 +526,422 @@ fn vocabulary_enums_are_complete_and_labelled() {
             ..AdvDials::default()
         },
     };
+}
+
+// ------------------------------------------------------------------
+// restore-truth (metric №1, sub-tranche 0.2) — god-view collectability
+// ------------------------------------------------------------------
+
+/// A restore `WorldParams` with the given window / bandwidth (default-engine dials).
+fn restore_wp(n_nodes: usize, window_days: f64, bw_gb_day: f64) -> WorldParams {
+    WorldParams {
+        n_nodes,
+        base: DynParams::default(),
+        restore_window_days: window_days,
+        restore_bw_gb_day: bw_gb_day,
+    }
+}
+
+/// A floor-met, source-present own block (so `on_disaster` counts it in the denominator).
+fn floor_met_block(id: usize, iota: f64) -> OwnBlock {
+    OwnBlock {
+        id,
+        volume: 50.0,
+        iota,
+        placements: Vec::new(),
+        floor_ever_met: true,
+        floor_deficit_since: None,
+        to_restore: false,
+    }
+}
+
+/// A controlled world: all nodes present + Reliable with empty holdings (so we place the
+/// victim's symbols by hand and `online()` is stable-high — we still SELECT holders that
+/// `online()` returns true for, so collection is deterministic).
+fn controlled_world(n_nodes: usize, seed: u64) -> World {
+    let params = DynParams::default();
+    let mut world = build_world(n_nodes, &params, seed);
+    for nd in &mut world.nodes {
+        nd.present = true;
+        nd.archetype = Archetype::Reliable;
+        nd.holdings.clear();
+    }
+    world
+}
+
+/// `count` holders (≠ `victim`) that are present AND online at `tick` — so a symbol placed
+/// on them is deterministically collectable in a window covering `tick`.
+fn online_holders(world: &World, victim: usize, tick: u64, count: usize) -> Vec<usize> {
+    let h: Vec<usize> = (0..world.nodes.len())
+        .filter(|&i| {
+            i != victim
+                && world.nodes[i].present
+                && online(
+                    world.nodes[i].archetype,
+                    world.nodes[i].id,
+                    tick,
+                    world.seed,
+                )
+        })
+        .take(count)
+        .collect();
+    assert_eq!(h.len(), count, "need {count} online holders for the setup");
+    h
+}
+
+/// Place one alive symbol of `owner`'s `block` on `holder` (10 GB, floor or cream).
+fn push_held(world: &mut World, holder: usize, owner: usize, block: usize, iota: f64, cream: bool) {
+    world.nodes[holder].holdings.push(HeldSymbol {
+        owner,
+        block,
+        iota,
+        volume: 10.0,
+        alive: true,
+        cream,
+    });
+}
+
+#[test]
+fn restore_truth_counts_cream_when_floor_below_k_but_floor_plus_cream_reaches_k() {
+    // BLOCK-1 (spec §10 п.1): RaptorQ decodes from ANY k_eff symbols, so 1 floor + 2 cream
+    // (k_eff = 2) is RESTORABLE (any-symbol) even though the floor alone (1) is below k_eff.
+    // The durability-floor column, counting floor only, is NOT restorable — the flagship
+    // metric and the "what is guaranteed" column legitimately disagree.
+    let wp = restore_wp(16, 14.0, 50.0);
+    let mut world = controlled_world(wp.n_nodes, 7);
+    let victim = 0usize;
+    world.nodes[victim].own_blocks = vec![floor_met_block(0, 0.5)];
+    let disaster_tick = 5u64;
+    let return_tick = disaster_tick + 1;
+    let holders = online_holders(&world, victim, return_tick, 3);
+    push_held(&mut world, holders[0], victim, 0, 0.5, false); // floor
+    push_held(&mut world, holders[1], victim, 0, 0.5, true); // cream
+    push_held(&mut world, holders[2], victim, 0, 0.5, true); // cream
+
+    let mut tracker = RestoreTracker::new(&wp);
+    tracker.on_disaster(&world, victim, disaster_tick);
+    tracker.observe(&world, return_tick);
+    tracker.observe(&world, return_tick + 1);
+    let rt = tracker.finalize();
+
+    assert_eq!(rt.blocks.len(), 1, "one surviving floor-met block");
+    let b = rt.blocks[0];
+    assert_eq!(b.n_collectable_any, 3, "1 floor + 2 cream all collectable");
+    assert_eq!(
+        b.n_collectable_floor, 1,
+        "only the floor symbol is a floor symbol"
+    );
+    assert!(
+        b.restorable_u,
+        "any ≥ k_eff (3 ≥ 2) ⇒ restorable — cream counts (BLOCK-1)"
+    );
+    assert!(
+        !b.restorable_floor,
+        "floor alone (1) < k_eff (2) ⇒ NOT durability-floor"
+    );
+    assert_eq!(rt.restore_truth_u(), 1.0);
+    assert_eq!(rt.durability_floor(), 0.0);
+}
+
+#[test]
+fn restore_truth_model_s_is_at_most_model_u_and_bites_under_a_tiny_budget() {
+    // Model S = Model U collectability under a download cap (spec §10 п.9). Two floor-met
+    // blocks, each with k_eff online floor holders (each restorable under U). A budget that
+    // fits ONE block's k_eff symbols but not two ⇒ S restores 1 of 2 while U restores 2 of
+    // 2: S < U, and never S > U. The higher-ι block is the one restored (greedy by ι).
+    let k = DynParams::default().k_eff; // 2
+    let window_days = 14.0;
+    // Cost per block = k × 10 GB = 20 GB. Budget ≈ 21 GB ⇒ fits one block, not two.
+    let bw = 21.0 / window_days;
+    let wp = restore_wp(16, window_days, bw);
+    let mut world = controlled_world(wp.n_nodes, 11);
+    let victim = 0usize;
+    world.nodes[victim].own_blocks = vec![floor_met_block(0, 0.8), floor_met_block(1, 0.4)];
+    let disaster_tick = 5u64;
+    let return_tick = disaster_tick + 1;
+    let holders = online_holders(&world, victim, return_tick, 2 * k);
+    for &h in holders.iter().take(k) {
+        push_held(&mut world, h, victim, 0, 0.8, false);
+    }
+    for &h in holders.iter().skip(k).take(k) {
+        push_held(&mut world, h, victim, 1, 0.4, false);
+    }
+
+    let mut tracker = RestoreTracker::new(&wp);
+    tracker.on_disaster(&world, victim, disaster_tick);
+    tracker.observe(&world, return_tick);
+    tracker.observe(&world, return_tick + 1);
+    let rt = tracker.finalize();
+
+    for b in &rt.blocks {
+        assert!(
+            !b.restorable_s || b.restorable_u,
+            "Model S ⇒ Model U (S ≤ U) per block"
+        );
+    }
+    assert_eq!(rt.restore_truth_u(), 1.0, "both blocks restorable under U");
+    assert!(
+        rt.restore_truth_s() < rt.restore_truth_u(),
+        "the tiny budget makes S bite below U"
+    );
+    assert_eq!(
+        rt.restore_truth_s(),
+        0.5,
+        "budget fits exactly one of two blocks"
+    );
+    let hi = rt.blocks.iter().find(|b| b.block_id == 0).unwrap();
+    let lo = rt.blocks.iter().find(|b| b.block_id == 1).unwrap();
+    assert!(
+        hi.restorable_s && !lo.restorable_s,
+        "Model S restores the higher-ι block first (importance-priority greedy)"
+    );
+}
+
+#[test]
+fn restore_truth_respects_the_window_departed_and_out_of_window_holders_are_not_collected() {
+    // The window is honoured two ways: (1) a holder that has LEFT (present=false) before
+    // the window is not collectable even though its stale symbol slot is still alive; and
+    // (2) observing at a tick PAST the window collects nothing.
+    let wp = restore_wp(16, 14.0, 50.0); // W = 2 ticks
+    let mut world = controlled_world(wp.n_nodes, 3);
+    let victim = 0usize;
+    world.nodes[victim].own_blocks = vec![floor_met_block(0, 0.6)];
+    let disaster_tick = 5u64;
+    let return_tick = disaster_tick + 1;
+    let holders = online_holders(&world, victim, return_tick, 3);
+    for &h in &holders {
+        push_held(&mut world, h, victim, 0, 0.6, false);
+    }
+    // One holder has DEPARTED before the window opens (gone, not collectable).
+    world.nodes[holders[2]].present = false;
+
+    let mut tracker = RestoreTracker::new(&wp);
+    tracker.on_disaster(&world, victim, disaster_tick);
+    tracker.observe(&world, return_tick);
+    tracker.observe(&world, return_tick + 1);
+    let rt = tracker.finalize();
+    assert_eq!(
+        rt.blocks[0].n_collectable_any, 2,
+        "the departed holder is not collectable; the two present-online ones are"
+    );
+    assert!(rt.blocks[0].restorable_u, "2 present holders ≥ k_eff = 2");
+
+    // Observing only at a tick PAST the window (return + 2 = window end, exclusive) collects
+    // nothing — the window [return, return+2) is respected.
+    let mut tracker2 = RestoreTracker::new(&wp);
+    tracker2.on_disaster(&world, victim, disaster_tick);
+    tracker2.observe(&world, return_tick + 2);
+    let rt2 = tracker2.finalize();
+    assert_eq!(
+        rt2.blocks[0].n_collectable_any, 0,
+        "observing past the window collects nothing"
+    );
+}
+
+#[test]
+fn restore_truth_victim_does_not_resurrect_with_data_when_no_holder_is_collectable() {
+    // The victim returns with an EMPTY disk — restore-truth reflects actual collection, not
+    // magic recovery. With every holder of a block departed, that block is NOT restorable
+    // (0 collectable symbols), even though it once met floor.
+    let wp = restore_wp(16, 14.0, 50.0);
+    let mut world = controlled_world(wp.n_nodes, 21);
+    let victim = 0usize;
+    world.nodes[victim].own_blocks = vec![floor_met_block(0, 0.7)];
+    let disaster_tick = 5u64;
+    let return_tick = disaster_tick + 1;
+    let holders = online_holders(&world, victim, return_tick, 3);
+    for &h in &holders {
+        push_held(&mut world, h, victim, 0, 0.7, false);
+        world.nodes[h].present = false; // every holder of this block is gone
+    }
+
+    let mut tracker = RestoreTracker::new(&wp);
+    tracker.on_disaster(&world, victim, disaster_tick);
+    tracker.observe(&world, return_tick);
+    tracker.observe(&world, return_tick + 1);
+    let rt = tracker.finalize();
+    assert_eq!(
+        rt.blocks[0].n_collectable_any, 0,
+        "no holder alive to collect from"
+    );
+    assert!(
+        !rt.blocks[0].restorable_u,
+        "not restorable without collection"
+    );
+    assert_eq!(rt.restore_truth_u(), 0.0);
+}
+
+#[test]
+fn restore_truth_is_bit_identical_on_repeat() {
+    // Determinism (spec §10 п.13): the whole Disaster → restore-truth path is seeded, so
+    // two runs of a DR scenario produce bit-identical restore-truth per seed.
+    let mut sc = dr_baseline();
+    sc.world.n_nodes = 60;
+    sc.horizon = 60;
+    sc.events = vec![(
+        30,
+        Event::Disaster(NodeSel::FirstTierArchetype(
+            GiverTier::T1,
+            Archetype::Reliable,
+        )),
+    )];
+    sc.seeds = vec![1, 2];
+    let seeds = sc.seeds.clone();
+
+    let r1 = run(&sc, &seeds);
+    let r2 = run(&sc, &seeds);
+    assert!(
+        r1.per_seed_restore.iter().any(|r| r.is_some()),
+        "the DR scenario must actually produce restore-truth"
+    );
+    for (a, b) in r1.per_seed_restore.iter().zip(&r2.per_seed_restore) {
+        match (a, b) {
+            (Some(x), Some(y)) => {
+                assert!(
+                    restore_bit_eq(x, y),
+                    "restore-truth must be bit-identical on repeat"
+                )
+            }
+            (None, None) => {}
+            _ => panic!("restore presence differs between the two runs"),
+        }
+    }
+}
+
+#[test]
+fn dr_baseline_board_passes_the_restore_sanity_floor() {
+    // The frozen INV-RESTORE-SANITY row: on the honest DR baseline, restore-truth U clears
+    // the 0.60 floor decisively (σ = 0 ⇒ power = ∞). Uses two seeds to keep the test quick.
+    let sc = {
+        let mut s = dr_baseline();
+        s.seeds = vec![42, 43];
+        s
+    };
+    let result = run(&sc, &sc.seeds.clone());
+    let verdicts = evaluate_board(&sc, &result);
+    let sanity = verdicts
+        .iter()
+        .find(|v| v.id == "INV-RESTORE-SANITY")
+        .expect("dr_baseline board carries INV-RESTORE-SANITY");
+    assert_eq!(sanity.kind, VerdictKind::Pass, "restore sanity floor holds");
+    assert!(
+        sanity.effect > 0.60,
+        "restore-truth U clears the floor: {}",
+        sanity.effect
+    );
+}
+
+#[test]
+fn restore_csv_carries_both_models_and_the_info_model_column() {
+    // Spec §10 п.18 / NOTE-5: the restore CSV has both Model U and Model S columns plus an
+    // info_model column ("none" while there are no predators).
+    let sc = {
+        let mut s = dr_baseline();
+        s.seeds = vec![42];
+        s
+    };
+    let result = run(&sc, &sc.seeds.clone());
+    let csv = restore_csv(&result);
+    let lines: Vec<&str> = csv.lines().collect();
+    assert!(
+        lines[0].contains("restore_truth_u") && lines[0].contains("restore_truth_s"),
+        "header carries both models: {}",
+        lines[0]
+    );
+    assert!(
+        lines[0].ends_with(",info_model"),
+        "header ends with info_model"
+    );
+    assert_eq!(lines.len(), 2, "header + one seed row");
+    assert!(lines[1].starts_with("dr_baseline,42,"));
+    assert!(
+        lines[1].ends_with(",none"),
+        "info_model = none (no predators): {}",
+        lines[1]
+    );
+}
+
+// ------------------------------------------------------------------
+// 0.2-fix (NOTE): direct tests for `iota_bucket` / `restore_u_in_bucket`
+// ------------------------------------------------------------------
+
+/// A minimal `BlockOutcome` row: only `iota` and `restorable_u` matter for these tests.
+fn bucket_row(iota: f64, restorable_u: bool) -> BlockOutcome {
+    BlockOutcome {
+        owner: 0,
+        block_id: 0,
+        iota,
+        tier: GiverTier::T1,
+        n_collectable_any: 0,
+        n_collectable_floor: 0,
+        restorable_u,
+        restorable_s: false,
+        restorable_floor: false,
+    }
+}
+
+fn restore_truth_with_blocks(blocks: Vec<BlockOutcome>) -> RestoreTruth {
+    RestoreTruth {
+        disaster_tick: 0,
+        window_days: 14.0,
+        window_ticks: 14,
+        restore_bw_gb_day: 0.0,
+        n_victims: 1,
+        k_eff: 2,
+        blocks,
+        info_model: "none",
+    }
+}
+
+#[test]
+fn iota_bucket_returns_the_second_bucket_when_iota_sits_on_its_lower_edge() {
+    // IOTA_BUCKETS[1] = (0.4, 0.6): the lower edge is INCLUSIVE (half-open on the low side).
+    assert_eq!(iota_bucket(0.4), 1);
+}
+
+#[test]
+fn iota_bucket_returns_the_last_bucket_when_iota_is_one() {
+    // The top bucket (0.8, 1.0) is CLOSED at 1.0 — unlike the other three, whose upper edge
+    // is exclusive.
+    assert_eq!(iota_bucket(1.0), IOTA_BUCKETS.len() - 1);
+}
+
+#[test]
+fn iota_bucket_clamps_into_the_first_bucket_when_iota_is_below_the_covered_range() {
+    // No scenario places ι below 0.2 in practice, but the function must not panic or
+    // return an out-of-range index — it clamps into bucket 0 (the same as an in-range
+    // low value would).
+    assert_eq!(iota_bucket(0.1), 0);
+    assert_eq!(iota_bucket(-5.0), 0);
+}
+
+#[test]
+fn restore_u_in_bucket_computes_the_fraction_restorable_within_that_bucket_only() {
+    // A small synthetic set spanning two buckets (0.3 and 0.35 both fall in bucket 0 per
+    // `iota_bucket`, 0.5 falls in bucket 1): bucket 0 gets 1-of-2 restorable, bucket 1 gets
+    // 1-of-1, and bucket 2 is left empty (covered by the NaN test below).
+    let rt = restore_truth_with_blocks(vec![
+        bucket_row(0.3, true),   // bucket 0
+        bucket_row(0.35, false), // bucket 0
+        bucket_row(0.5, true),   // bucket 1
+    ]);
+
+    assert!(
+        (rt.restore_u_in_bucket(0) - 0.5).abs() < 1e-9,
+        "1 of 2 rows in bucket 0 restorable"
+    );
+    assert_eq!(
+        rt.restore_u_in_bucket(1),
+        1.0,
+        "the only row in bucket 1 is restorable"
+    );
+}
+
+#[test]
+fn restore_u_in_bucket_is_nan_when_the_bucket_has_no_rows() {
+    let rt = restore_truth_with_blocks(vec![bucket_row(0.3, true)]);
+    assert!(
+        rt.restore_u_in_bucket(2).is_nan(),
+        "bucket 2 (0.6,0.8) has no rows in this synthetic set"
+    );
 }

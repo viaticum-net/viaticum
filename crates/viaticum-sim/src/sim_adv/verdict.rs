@@ -12,9 +12,11 @@
 //!
 //! The sketch types the invariant as `eval: fn(&RunResult) -> (bool, f64)`. That cannot
 //! carry σ, the power gate, or the structural/statistical split the spec §10 п.16/п.17
-//! require, so [`InvariantSpec`] is a small enum over the three row shapes instead.
+//! require, so [`InvariantSpec`] is a small enum over the row shapes instead (statistical
+//! over `MetricSet`, statistical over restore-truth, determinism, anti-oracle).
 
 use crate::sim_adv::metrics::{MetricSet, mean_sigma};
+use crate::sim_adv::restore::RestoreTruth;
 use crate::sim_adv::runner::{RunResult, run_one_seed};
 use crate::sim_adv::scenario::Scenario;
 
@@ -65,7 +67,16 @@ pub enum InvariantSpec {
         /// The pass direction.
         dir: Direction,
     },
-    /// Re-run seed[0] and assert the metrics are bit-identical (structural).
+    /// Per-seed RESTORE-TRUTH scalar → mean±σ vs threshold, power<2 gate. Reads
+    /// [`RunResult::per_seed_restore`] (restore-truth is not on [`MetricSet`]); seeds with
+    /// no Disaster contribute `NaN` (skipped by `mean_sigma`).
+    RestoreStatistical {
+        /// Extract the invariant's scalar from one seed's restore-truth.
+        measure: fn(&RestoreTruth) -> f64,
+        /// The pass direction.
+        dir: Direction,
+    },
+    /// Re-run seed[0] and assert the metrics (and restore-truth) are bit-identical.
     Determinism,
     /// The anti-oracle structural guarantee (crate edge + hook signature).
     AntiOracle,
@@ -92,6 +103,12 @@ impl Clone for Invariant {
                     measure: *measure,
                     dir: *dir,
                 },
+                InvariantSpec::RestoreStatistical { measure, dir } => {
+                    InvariantSpec::RestoreStatistical {
+                        measure: *measure,
+                        dir: *dir,
+                    }
+                }
                 InvariantSpec::Determinism => InvariantSpec::Determinism,
                 InvariantSpec::AntiOracle => InvariantSpec::AntiOracle,
             },
@@ -185,15 +202,44 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                     note: dir.note(),
                 }
             }
+            InvariantSpec::RestoreStatistical { measure, dir } => {
+                let vals: Vec<f64> = result
+                    .per_seed_restore
+                    .iter()
+                    .map(|r| r.as_ref().map(measure).unwrap_or(f64::NAN))
+                    .collect();
+                let (mean, sigma) = mean_sigma(&vals);
+                let sigma_r = if sigma.is_finite() { sigma } else { 0.0 };
+                let (kind, power) = decide(mean, sigma, inv.threshold, *dir);
+                Verdict {
+                    id: inv.id,
+                    kind,
+                    effect: mean,
+                    sigma: sigma_r,
+                    threshold: inv.threshold,
+                    power,
+                    note: dir.note(),
+                }
+            }
             InvariantSpec::Determinism => {
                 let pass = match result.seeds.first() {
                     Some(&s0) => {
-                        let (m, _) = run_one_seed(scenario, s0);
-                        result
+                        let (m, _, r) = run_one_seed(scenario, s0);
+                        let metrics_eq = result
                             .per_seed
                             .first()
                             .map(|m0| crate::sim_adv::metrics::bit_eq(m0, &m))
-                            .unwrap_or(false)
+                            .unwrap_or(false);
+                        // Restore-truth (if any) must be bit-identical on the re-run too.
+                        let restore_eq = match result.per_seed_restore.first() {
+                            Some(Some(r0)) => r
+                                .as_ref()
+                                .map(|r1| crate::sim_adv::restore::bit_eq(r0, r1))
+                                .unwrap_or(false),
+                            Some(None) => r.is_none(),
+                            None => true,
+                        };
+                        metrics_eq && restore_eq
                     }
                     None => false,
                 };

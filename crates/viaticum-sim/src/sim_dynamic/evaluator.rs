@@ -415,12 +415,19 @@ pub struct DrMetric {
     pub pass: bool,
 }
 
-/// Compute metric (c): for `m` random victim blocks, the god-view block survival
-/// `R_actual(T)` via the Monte-Carlo estimator (design §D.1): sample the hidden
-/// per-holder hazard and report the empirical `P(≥ k_eff survive)` to a short
-/// horizon. This replaces the old deterministic 0/1 alive-count — survival is now a
-/// graded probability over the hidden hazard, seeded and reproducible.
-pub fn dr_metric(world: &World, k_eff: usize, m: usize, seed: u64) -> DrMetric {
+/// LEGACY (world-v3 §10.3): a PARALLEL durability scorer — retired, kept only for the
+/// cross-check against the new restore-truth god-view metric on the honest baseline, to
+/// be DELETED in the next tranche. It hand-rolls a Monte-Carlo over a bespoke hidden
+/// hazard ([`legacy_holder_symbol_survival_prob`], baked-in logit constants + `base_uptime`),
+/// which is exactly the "second judge of durability" §10.3 forbids. The world-v3
+/// restore-truth metric (`sim_adv::restore`) is built on the REAL engine (actual
+/// `present ∧ alive ∧ online()` over the restore window), not on this parallel model. Do
+/// NOT wire this into any new verdict.
+///
+/// Original doc: for `m` random victim blocks, the god-view block survival `R_actual(T)`
+/// via the Monte-Carlo estimator (design §D.1): sample the hidden per-holder hazard and
+/// report the empirical `P(≥ k_eff survive)` to a short horizon.
+pub fn legacy_dr_metric(world: &World, k_eff: usize, m: usize, seed: u64) -> DrMetric {
     use crate::generator::Rng;
     let n = world.nodes.len();
     // Pool of all (owner, block) blocks that have any placement.
@@ -460,7 +467,7 @@ pub fn dr_metric(world: &World, k_eff: usize, m: usize, seed: u64) -> DrMetric {
         let (owner, block_id) = blocks[i];
         // Monte-Carlo R_actual(T): empirical P(≥ k_eff symbols survive the hidden
         // hazard to the DR horizon), seeded off the DR seed + the victim.
-        let r_actual = mc_block_r_actual(
+        let r_actual = legacy_mc_block_r_actual(
             world,
             owner,
             block_id,
@@ -515,7 +522,11 @@ pub fn dr_metric(world: &World, k_eff: usize, m: usize, seed: u64) -> DrMetric {
 ///    its baseline uptime.
 ///
 /// All three multiply (independent failure modes). Returns a probability in [0,1].
-fn holder_symbol_survival_prob(
+///
+/// LEGACY (world-v3 §10.3): the bespoke hidden hazard of the retired parallel durability
+/// scorer (baked-in logit constants + `base_uptime`). Kept only for the honest-baseline
+/// cross-check; DELETED next tranche. Not a judge — see [`legacy_dr_metric`].
+fn legacy_holder_symbol_survival_prob(
     world: &World,
     holder: usize,
     owner: usize,
@@ -599,11 +610,14 @@ fn iota_rank_of(ladder: &[f64], iota: f64) -> f64 {
 /// probability that ≥ `k_eff` of its holders' symbols survive to horizon `T` ticks,
 /// estimated by sampling the hidden per-holder survival hazard `n_samples` times.
 ///
-/// This REPLACES the old deterministic 0/1 alive-count (`dr_metric`) with a genuine
-/// Monte-Carlo over the hidden hazard. Seeded (`mc_seed` + the owner/block) so it is
-/// bit-reproducible across runs. More surviving-likely holders ⇒ higher R_actual,
-/// monotonically.
-pub fn mc_block_r_actual(
+/// Seeded (`mc_seed` + the owner/block) so it is bit-reproducible across runs. More
+/// surviving-likely holders ⇒ higher R_actual, monotonically.
+///
+/// LEGACY (world-v3 §10.3): the Monte-Carlo core of the retired parallel durability
+/// scorer (over the bespoke [`legacy_holder_symbol_survival_prob`] hazard). Kept only for
+/// the honest-baseline cross-check; DELETED next tranche. Not a judge — see
+/// [`legacy_dr_metric`].
+pub fn legacy_mc_block_r_actual(
     world: &World,
     owner: usize,
     block: usize,
@@ -617,7 +631,7 @@ pub fn mc_block_r_actual(
     // Per-holder survival probabilities for this block's current holders.
     let probs: Vec<f64> = (0..n)
         .filter_map(|h| {
-            let p = holder_symbol_survival_prob(world, h, owner, block, t);
+            let p = legacy_holder_symbol_survival_prob(world, h, owner, block, t);
             if p > 0.0
                 || world.nodes[h]
                     .holdings
@@ -692,7 +706,7 @@ pub fn pillar1_metric(
         let mut r_cnt = 0usize;
         let blocks: Vec<usize> = world.nodes[o].own_blocks.iter().map(|b| b.id).collect();
         for b in blocks {
-            r_sum += mc_block_r_actual(world, o, b, k_eff, t, n_samples, mc_seed);
+            r_sum += legacy_mc_block_r_actual(world, o, b, k_eff, t, n_samples, mc_seed);
             r_cnt += 1;
         }
         let r_actual = if r_cnt > 0 { r_sum / r_cnt as f64 } else { 0.0 };

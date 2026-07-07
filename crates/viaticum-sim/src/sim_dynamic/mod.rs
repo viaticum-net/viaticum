@@ -46,7 +46,7 @@ use crate::generator::Rng;
 use crate::sim_dynamic::engine::{DynParams, fresh_capital, step};
 use crate::sim_dynamic::evaluator::{
     ContentionMetric, DrMetric, DropRankingMetric, NewcomerMetric, Pillar1Metric, RankMetric,
-    ReciprocityMetric, contention_metric, dr_metric, drop_ranking_metric, node_summaries,
+    ReciprocityMetric, contention_metric, drop_ranking_metric, legacy_dr_metric, node_summaries,
     pillar1_metric, rank_metric, reciprocity_metric,
 };
 use crate::sim_dynamic::generator::{
@@ -110,6 +110,7 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
                 placements: Vec::new(),
                 floor_ever_met: false,
                 floor_deficit_since: None,
+                to_restore: false,
             })
             .collect();
         // World-v2 §9.1 incremental arrival: in the ONE-SHOT world (`incremental =
@@ -302,7 +303,7 @@ pub fn run_experiment_1(cfg: Experiment1Config) -> Experiment1Report {
     let summaries = node_summaries(&world, &prior);
     let rank = rank_metric(&summaries);
     let reciprocity = reciprocity_metric(&world, regime1_end_tick);
-    let dr = dr_metric(&world, params.k_eff, cfg.dr_victims, cfg.seed ^ 0xD11);
+    let dr = legacy_dr_metric(&world, params.k_eff, cfg.dr_victims, cfg.seed ^ 0xD11);
 
     // --- Phase-1 §A/§D.1: contention reached? pillar-1 efficiency? drop-ranking? ---
     // Computed on the MATURE contended network BEFORE the newcomer probe mutates it.
@@ -374,6 +375,7 @@ fn run_newcomer_probe(
         placements: Vec::new(),
         floor_ever_met: false,
         floor_deficit_since: None,
+        to_restore: false,
     }];
     // A T1-loose newcomer (plenty of free disk to lend) so the bootstrap probe is
     // about TRUST accrual, not the newcomer's own disk being full.

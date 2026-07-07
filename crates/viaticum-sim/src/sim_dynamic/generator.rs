@@ -436,6 +436,14 @@ pub struct OwnBlock {
     /// exactly what smears a synchronous holder-death shock across time. Reset to
     /// `None` the moment the floor is restored. Inert when detection is instant.
     pub floor_deficit_since: Option<u64>,
+    /// World-v3 restore-cycle (axis 8, sub-tranche 0.2): the block's SOURCE is lost — the
+    /// owner suffered a `Disaster` (its disk, and with it the source data these symbols
+    /// were encoded from, is gone). P1 premise: no source ⇒ no repair (the owner can no
+    /// longer re-encode symbols), only RESTORE from the surviving network holders. While
+    /// `true`, [`crate::sim_dynamic::engine::place_own_data`] skips this block entirely (it
+    /// must NOT "repair" a source-less block). Default `false`; set only by
+    /// [`crate::sim_dynamic::engine::disaster_strike`]. God-view only.
+    pub to_restore: bool,
 }
 
 /// One symbol of an owner's block placed on a holder (god-view bookkeeping).

@@ -9,6 +9,7 @@
 use std::fmt::Write as _;
 
 use crate::sim_adv::metrics::{MetricSet, mean_sigma};
+use crate::sim_adv::restore::{IOTA_BUCKETS, RestoreTruth};
 use crate::sim_adv::runner::{RunResult, SweepRow};
 use crate::sim_adv::scenario::Scenario;
 use crate::sim_adv::verdict::Verdict;
@@ -101,6 +102,11 @@ pub fn format_report(scenario: &Scenario, result: &RunResult, verdicts: &[Verdic
     }
     let _ = writeln!(o);
 
+    // --- restore-truth (metric №1), only when a Disaster fired ---
+    if let Some(section) = format_restore(result) {
+        o.push_str(&section);
+    }
+
     // --- events dispatched (0.1 no-op record; empty for honest_v2) ---
     let fired_total: usize = result.fired.iter().map(|f| f.len()).sum();
     if fired_total > 0 {
@@ -135,6 +141,110 @@ pub fn format_report(scenario: &Scenario, result: &RunResult, verdicts: &[Verdic
         );
     }
 
+    o
+}
+
+/// Mean±σ of one restore-truth scalar across the seeds (seeds with no Disaster → `NaN`,
+/// skipped by `mean_sigma`).
+fn rcol(result: &RunResult, f: impl Fn(&RestoreTruth) -> f64) -> (f64, f64) {
+    let vals: Vec<f64> = result
+        .per_seed_restore
+        .iter()
+        .map(|r| r.as_ref().map(&f).unwrap_or(f64::NAN))
+        .collect();
+    mean_sigma(&vals)
+}
+
+/// Render the restore-truth section (metric №1). `None` when no seed had a Disaster.
+fn format_restore(result: &RunResult) -> Option<String> {
+    let first = result.per_seed_restore.iter().flatten().next()?;
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "-- restore-truth (metric №1; god-view over the real engine) --"
+    );
+    let _ = writeln!(
+        o,
+        "  disaster @ tick {}   W = {} days ({} ticks)   victims = {}   info_model = {}",
+        first.disaster_tick,
+        first.window_days,
+        first.window_ticks,
+        first.n_victims,
+        first.info_model,
+    );
+    let s_budget = first.restore_bw_gb_day * first.window_days;
+    if first.restore_bw_gb_day > 0.0 {
+        let _ = writeln!(
+            o,
+            "  Model S download budget: {} GB/day × {} days = {} GB",
+            first.restore_bw_gb_day, first.window_days, s_budget,
+        );
+    } else {
+        let _ = writeln!(o, "  Model S download budget: unlimited (bw ≤ 0 ⇒ S ≡ U)");
+    }
+    let _ = writeln!(
+        o,
+        "  (over {} surviving-victim blocks / seed)",
+        first.n_blocks()
+    );
+    let (m, s) = rcol(result, |r| r.restore_truth_u());
+    let _ = writeln!(o, "  restore-truth U (any)  {:>8.4} ± {:.4}", m, s);
+    let (m, s) = rcol(result, |r| r.restore_truth_s());
+    let _ = writeln!(o, "  restore-truth S (bw)   {:>8.4} ± {:.4}", m, s);
+    let (m, s) = rcol(result, |r| r.durability_floor());
+    let _ = writeln!(o, "  durability-floor       {:>8.4} ± {:.4}", m, s);
+    // Per-ι-bucket restore-truth U (detail §3.1 cut).
+    let _ = writeln!(o, "  by ι bucket (restore-truth U):");
+    for (b, &(lo, hi)) in IOTA_BUCKETS.iter().enumerate() {
+        let (m, s) = rcol(result, |r| r.restore_u_in_bucket(b));
+        if m.is_nan() {
+            continue;
+        }
+        let _ = writeln!(o, "    [{lo:.1},{hi:.1})  {m:>8.4} ± {s:.4}");
+    }
+    let _ = writeln!(
+        o,
+        "  NOTE-8: dr_baseline is a SANITY FLOOR (~high under the current uptime), not a"
+    );
+    let _ = writeln!(
+        o,
+        "          regression detector — discrimination arrives with phase-2 uptime profiles."
+    );
+    let _ = writeln!(o);
+    Some(o)
+}
+
+/// The restore-truth machine CSV (detail §3.1 columns + both models + `info_model`, spec
+/// §10 п.18 / NOTE-5). One row per seed that had a Disaster; empty (header only) otherwise.
+pub fn restore_csv(result: &RunResult) -> String {
+    let mut o = String::from(
+        "scenario,seed,tick_disaster,window_days,window_ticks,n_victims,n_blocks,restorable_u,restorable_s,restorable_floor,restore_truth_u,restore_truth_s,durability_floor,restore_bw_gb_day,info_model\n",
+    );
+    for (i, r) in result.per_seed_restore.iter().enumerate() {
+        let Some(rt) = r else { continue };
+        let n_u = rt.blocks.iter().filter(|b| b.restorable_u).count();
+        let n_s = rt.blocks.iter().filter(|b| b.restorable_s).count();
+        let n_f = rt.blocks.iter().filter(|b| b.restorable_floor).count();
+        let _ = writeln!(
+            o,
+            "{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{},{}",
+            result.scenario,
+            result.seeds[i],
+            rt.disaster_tick,
+            rt.window_days,
+            rt.window_ticks,
+            rt.n_victims,
+            rt.n_blocks(),
+            n_u,
+            n_s,
+            n_f,
+            rt.restore_truth_u(),
+            rt.restore_truth_s(),
+            rt.durability_floor(),
+            rt.restore_bw_gb_day,
+            rt.info_model,
+        );
+    }
     o
 }
 

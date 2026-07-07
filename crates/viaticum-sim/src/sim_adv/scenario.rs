@@ -36,14 +36,31 @@ impl std::fmt::Display for ScenarioId {
 }
 
 /// The world the scenario builds. A superset wrapper over the engine [`DynParams`]:
-/// 0.1 needs only the node count and the base dials (`honest_v2` replays the v2
-/// acceptance defaults). Restore/volume-class extensions come in 0.2 / 0.4.
+/// the node count + base dials (`honest_v2` replays the v2 acceptance defaults), plus the
+/// restore-cycle knobs the 0.2 restore-truth evaluator reads. Volume-class extensions
+/// come in 0.4.
+///
+/// The restore knobs live HERE (not on [`DynParams`]) on purpose: restore-truth is an
+/// EVALUATOR-layer god-view measurement (cold re-collection after a Disaster), NOT engine
+/// physics — the honest engine never reads them, so they cannot leak into a node decision.
 #[derive(Debug, Clone)]
 pub struct WorldParams {
     /// Node count for `build_world`.
     pub n_nodes: usize,
     /// The engine dials (block volume, reciprocal placement, world-v2 toggles, ...).
     pub base: DynParams,
+    /// Restore window `W` in DAYS (design §4 п.1 / spec §10 п.9): the cold-restore
+    /// horizon after a Disaster. Default 14 days = 2 weekly ticks (`DAYS_PER_TICK = 7`).
+    pub restore_window_days: f64,
+    /// Model-S restore download budget in GB/DAY (spec §10 п.9, WARN-3): the victim can
+    /// re-collect at most `restore_bw_gb_day × restore_window_days` GB over the window.
+    /// **OPEN calibration guess: 50 GB/day** (~4.6 Mbps sustained) — generous enough that
+    /// the small-uniform honest world is bandwidth-UNconstrained (Model S ≈ Model U there,
+    /// which is honest: 10 GB symbols on a broadband downlink are not the bottleneck);
+    /// Model S is designed to BITE on the large archive blocks of the 0.4 hetero world
+    /// (WARN-3: Model U is optimistic exactly on the T1/archive DR-primary tier). Flagged
+    /// for Ilya. `≤ 0` disables the budget (Model S ≡ Model U).
+    pub restore_bw_gb_day: f64,
 }
 
 /// The full scenario (registry entry).
@@ -265,7 +282,8 @@ impl EventKind {
     }
 }
 
-/// How an event selects its victim node(s) (design §4).
+/// How an event selects its victim node(s) (design §4). Resolved against the built world
+/// by [`crate::sim_adv::runner`] (each variant → concrete PRESENT node indices).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NodeSel {
     /// A specific node index.
@@ -276,6 +294,12 @@ pub enum NodeSel {
     TopHolders(f64),
     /// `count` seeded-random nodes.
     Random(usize),
+    /// The SINGLE EARLIEST-ESTABLISHED present node matching BOTH a giver tier and an
+    /// archetype (empty if none) — resolved by `min_by(joined_tick)`, tie-broken by index
+    /// (see `sim_adv::runner::resolve_nodesel`). The DR-primary selector: `dr_baseline`
+    /// strikes one T1/Reliable node (the reliable backbone, the "Ilya's NAS" of the
+    /// DR-primary doctrine).
+    FirstTierArchetype(GiverTier, Archetype),
 }
 
 /// The measuring-layer metric vocabulary (design §4 / §3). 0.1 computes the subset that

@@ -555,6 +555,11 @@ fn place_own_data(
         let owner_id = world.nodes[owner].id;
         let mut owner_repaired = false;
         for &bp in &border {
+            // P1 (world-v3 axis 8): a source-less block (owner suffered a Disaster) can
+            // NEVER be repaired — no source to re-encode from, only restore from holders.
+            if world.nodes[owner].own_blocks[bp].to_restore {
+                continue;
+            }
             if !block_mature(world.nodes[owner].joined_tick, bp, tick, params) {
                 continue;
             }
@@ -614,6 +619,10 @@ fn place_own_data(
             for &bp in &border {
                 if budget == 0 {
                     break;
+                }
+                // P1 (world-v3 axis 8): no cream repair for a source-less block either.
+                if world.nodes[owner].own_blocks[bp].to_restore {
+                    continue;
                 }
                 if !block_mature(world.nodes[owner].joined_tick, bp, tick, params) {
                     continue;
@@ -1415,6 +1424,93 @@ fn churn(world: &mut World, params: &DynParams) {
 /// (aggression 0.7) churns at ~3× the base, matching the old flat multiplier.
 const CHURN_AGGRESSION_SCALE: f64 = 2.857;
 
+/// World-v3 event executor (axis 8, sub-tranche 0.2): a Disaster hits `victim` — its
+/// disk, and with it EVERYTHING local, is destroyed. This is the DR-primary scenario
+/// (Ilya's NAS, house burned down) in god-view terms. Distinct from [`churn`] (a holder
+/// merely LEAVING): here the OWNER's source data is lost, so P1 bites — no repair is
+/// possible, only RESTORE from surviving holders (see [`OwnBlock::to_restore`]).
+///
+/// The mutation is all "one physics" (both sides see it consistently):
+///  * The victim is a HOLDER for others — every foreign symbol it stored dies, a SILENT
+///    loss queued to `pending_silent_loss` for each present owner whose data it carried.
+///    **Timing (0.2-fix, honest):** detected within the SAME tick T — the runner
+///    (`sim_adv::runner::run_one_seed`) applies this event BEFORE calling `step(T)`, and
+///    `pos_and_capital` drains the queue inside that same `step(T)` call. This is ONE
+///    TICK EARLIER than `churn`'s convention: a departure inside `step(T)`'s `churn(..)`
+///    call is queued and only drained by `pos_and_capital` in the FOLLOWING `step(T+1)`
+///    call, i.e. detected at T+1. Not unified on purpose — unify when a detection-latency
+///    metric lands (phase 1+). The victim's holdings are then CLEARED — it lost the disk
+///    and returns with an empty holdings store.
+///  * The victim's OWN blocks are marked `to_restore` (source lost → no repair, P1).
+///    Their symbols on OTHER holders are UNTOUCHED — they live their own life; the
+///    restore-truth evaluator measures whether ≥ k_eff can be re-collected in the window.
+///  * The victim goes `present = false`. The caller (the sim_adv runner) revives it at
+///    `tick + 1` with the SAME identity — counterparties remember it.
+///  * **First-hand-ledger death (P1 decision, documented):** the victim's redb died with
+///    the disk, so its OWN PRIVATE assessments of its holders — held in the capital rows
+///    `capital[victim][*]` — die: `g_oh` (its reliability record of each holder), its
+///    trend `g_oh_prev`, its suspicion `sigma`, its drop counters `drop_ann`/`drop_silent`,
+///    its PoS-outcome window, and `v_dem` (0.2-fix: `v_dem` is written ONLY by the
+///    victim's own PoS challenge as owner — `capital[owner][holder]` at the challenge
+///    loop below — and read only from the owner seat by `credit_limit`/`backbone_survival`
+///    upstream in `four_r`; it is victim-seat data, NOT counterparty-observable, so it
+///    dies with the rest of the row). What is PRESERVED, deliberately, is everything that
+///    is BILATERALLY observable — the fields the COUNTERPARTY (holder) keeps on ITS own
+///    disk: `g_ho` and `depth_ho` (the victim's past SERVICE to the holder, which the
+///    holder ranks eviction on). "Counterparties remember the node" — so the victim's
+///    symbols keep the eviction protection its past service earned; erasing the whole row
+///    would strip that shared memory and understate restore-truth. The columns
+///    `capital[*][victim]` (other owners' records of the victim as their holder) are
+///    untouched for the same reason.
+pub fn disaster_strike(world: &mut World, victim: usize) {
+    let n = world.nodes.len();
+    // The victim as a holder: every present owner whose data it carried suffers a SILENT
+    // loss, detected within this SAME tick (see the timing note in the doc comment above —
+    // one tick earlier than `churn`'s T+1 convention). V_lost = V_held = all of that
+    // owner's alive symbols here (a total loss). Deterministic (storage order).
+    let mut per_owner: Vec<(usize, f64)> = Vec::new();
+    for hs in world.nodes[victim].holdings.iter().filter(|s| s.alive) {
+        if !world.nodes[hs.owner].present {
+            continue; // a departed owner cannot detect the loss (dead pair)
+        }
+        match per_owner.iter_mut().find(|(o, _)| *o == hs.owner) {
+            Some(e) => e.1 += hs.volume,
+            None => per_owner.push((hs.owner, hs.volume)),
+        }
+    }
+    for (owner, volume) in per_owner {
+        world.pending_silent_loss.push(SilentLoss {
+            owner,
+            holder: victim,
+            volume,
+        });
+    }
+    // Lost disk: the victim returns with an empty holdings store.
+    world.nodes[victim].holdings.clear();
+    // Own data: source lost ⇒ every own block is `to_restore` (P1 — no repair, restore only).
+    for b in world.nodes[victim].own_blocks.iter_mut() {
+        b.to_restore = true;
+    }
+    // First-hand-ledger death (P1): reset the victim's PRIVATE assessments of its holders
+    // (died with the disk), including `v_dem` (0.2-fix: it is victim-seat data, written by
+    // the victim's own PoS challenge — see the doc comment above — NOT counterparty-
+    // observable, so it does not survive). PRESERVE the bilaterally-observable
+    // `g_ho`/`depth_ho` (the counterparty's memory of the victim's service, kept on the
+    // holder's disk — so the victim's symbols retain the eviction protection it earned).
+    for h in 0..n {
+        let cell = &mut world.capital[victim][h];
+        cell.g_oh = 0.0;
+        cell.g_oh_prev = 0.0;
+        cell.v_dem = 0.0;
+        cell.sigma = 0.0;
+        cell.drop_ann = 0.0;
+        cell.drop_silent = 0.0;
+        cell.pos_window.clear();
+    }
+    // Gone until the caller revives it (tick + 1, same identity).
+    world.nodes[victim].present = false;
+}
+
 /// Build the kernel's `NodeLocal` snapshot for a holder (its own disk free-ratio).
 pub fn node_local(node: &Node) -> NodeLocal {
     NodeLocal {
@@ -1456,6 +1552,7 @@ pub fn fresh_block(world: &mut World, owner: usize, volume: f64, iota: f64) -> O
         placements: Vec::new(),
         floor_ever_met: false,
         floor_deficit_since: None,
+        to_restore: false,
     }
 }
 
