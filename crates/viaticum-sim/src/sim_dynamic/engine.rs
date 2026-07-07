@@ -21,15 +21,16 @@
 //! kernel function — it uses them only to drive BEHAVIOUR.
 
 use viaticum_core::four_r::{
-    BlockReq, BurnParams, DepthParams, Hysteresis, NodeLocal, PlacementPolicy, RetentionCap,
-    RetentionPrior, SurfacePrior, apply_burn, capital_steady_state, estimate_surface,
-    eviction_order, kappa_key, retained_depth, update_depth, update_suspicion, update_v_dem,
+    BlockReq, BurnParams, DepthParams, FirstHandObs, Hysteresis, NodeLocal, PlacementPolicy,
+    RetentionCap, RetentionPrior, SurfacePrior, apply_burn, capital_steady_state,
+    estimate_block_survival, estimate_surface, eviction_order, kappa_key, place_cream,
+    place_incremental_rank, retained_depth, update_depth, update_suspicion, update_v_dem,
 };
 
 use crate::generator::Rng;
 use crate::sim_dynamic::generator::{
     BlockPlacement, DAYS_PER_TICK, EvictionEvent, HeldSymbol, Node, OwnBlock, PairCapital,
-    RepairStat, SilentLoss, World, online,
+    PredEntry, RepairStat, SilentLoss, World, online,
 };
 use crate::sim_dynamic::observer::{self, ObsAddr};
 
@@ -185,6 +186,28 @@ pub struct DynParams {
     /// hypothesis). Applies only to REPAIR (a block that met its floor then lost
     /// holders), never to an initial backup (`floor_ever_met == false`).
     pub repair_detection_delay_max: u64,
+    /// Р-5 (A.13 / §13): per-holder reliability floor `r_min(ι)` fed to the core `place`
+    /// credit cap `L(O→h) = max{V : r̂_h(V, τ) ≥ r_min}` ([`credit_limit_from_surface`],
+    /// consumed by `place_incremental_rank`/`place_cream`). A SEPARATE §13 handle with its
+    /// OWN documented guess `0.5` — NOT derived from `r_target` (transche-2b lesson: coupling
+    /// a per-HOLDER floor to the per-BLOCK target conflates two different reliability axes; a
+    /// single holder is never asked to reach the whole-block target — that is what erasure
+    /// across many holders is for). `0.5` says "a holder must still clear ≥ 50% individual
+    /// survival at the per-symbol ask on the horizon to be handed a symbol"; OPEN calibration,
+    /// flagged for Ilya. `0` disables the credit cap.
+    pub r_min: f64,
+    /// METRIC-LAYER handle (transche 0.3): the R̂-calibration OUTCOME horizon `H` in TICKS.
+    /// When the prediction log is enabled ([`World::pred_log_enabled`]) the engine logs, at
+    /// each successful placement, the node's OWN decision-horizon forecast `R̂_wc` (the same
+    /// `estimate_block_survival` the selection acts on, `tau = req.tau = DAYS_PER_TICK`), and
+    /// the sim_adv evaluator scores it against the realised outcome "block ≥ `k_eff` live
+    /// symbols `H` ticks later" (Brier + reliability/resolution, spec §10 п.7). `H` sets ONLY
+    /// the outcome look-ahead — NOT the forecast horizon (a horizon-`H` forecast is degenerate:
+    /// the surface's long-τ off-sample conservatism drives r̂ → 0 for every holder given the
+    /// one-tick observed window, so it carries no resolution and is repair-blind). Default `26`
+    /// (≈ half a year at weekly ticks). Read ONLY on the metric path (gated by
+    /// `pred_log_enabled`); it NEVER changes a placement/eviction/PoS decision.
+    pub pred_horizon_ticks: u64,
 }
 
 impl Default for DynParams {
@@ -243,6 +266,11 @@ impl Default for DynParams {
             // Instant repair detection = the previous behaviour (owner refills next tick).
             // The repair-storm §7 sweep raises this to model the PoS-cadence detection lag.
             repair_detection_delay_max: 0,
+            // Р-5 (A.13 / §13): per-holder credit-cap floor — its OWN handle, guess 0.5,
+            // NOT r_target (2b lesson). Was the hard-coded `0.5` in try_place_one_symbol.
+            r_min: 0.5,
+            // Metric-layer R̂-calibration horizon (transche 0.3): 26 ticks ≈ half a year.
+            pred_horizon_ticks: 26,
         }
     }
 }
@@ -264,6 +292,11 @@ pub fn assert_lambda_dt_stable(lambda: f64, dt_days: f64) {
 /// (the stranger floor stays `sigmoid(−1.5)=0.182` in both; the known-vs-stranger
 /// multiplier is ~4.9× at canon vs ~3.4× at baseline). The KERNEL is not toggled — the
 /// prior is an INPUT parameter.
+///
+/// LEGACY (transche 0.3): this prior fed ONLY the retired `place_reciprocal` ranking. The
+/// decisive placement path (kernel `place_incremental_rank` / `place_cream`) folds no
+/// reciprocity, so `retention_prior` (and the `recalibrated_retention` dial) no longer
+/// affects placement. Retained `pub` for the legacy `place_reciprocal` reference / tests.
 pub fn retention_prior(params: &DynParams) -> RetentionPrior {
     if params.recalibrated_retention {
         // Canon (Р-2): ceiling 0.900 — the recalibrated prior IS the kernel default now.
@@ -440,7 +473,6 @@ pub fn step(world: &mut World, params: &DynParams, prior: &SurfacePrior, policy:
     assert_lambda_dt_stable(params.lambda_dem, DAYS_PER_TICK);
     // The A.2/A.7 drop-counter forgiveness leak `λ_drop` obeys the SAME stability guard.
     assert_lambda_dt_stable(params.lambda_drop, DAYS_PER_TICK);
-    let _ = policy; // kept on the API for symmetry; the sim always spreads by addr_subnet
     let tick = world.tick;
 
     // (0a) own-data growth + (0b) incremental joins (§9.1).
@@ -449,11 +481,13 @@ pub fn step(world: &mut World, params: &DynParams, prior: &SurfacePrior, policy:
 
     // (1a) resync placements (drop dead) + (1b) bandwidth-limited place (floor + cream).
     resync_placements(world);
-    let retention = retention_prior(params);
     // Repair-storm §7: reset the per-tick repair instrument before the placement pass
     // fills it (owners repairing, detected deficit, symbols repaired this tick).
     world.repair_stat = RepairStat::default();
-    place_own_data(world, params, prior, &retention);
+    // Transche 0.3: placement now runs the KERNEL decision path (`place_incremental_rank` /
+    // `place_cream`), which spreads by the observable `policy` bucket — no longer the sim's
+    // own `place_reciprocal` heuristic. The retention prior is retired from the decisive path.
+    place_own_data(world, params, prior, policy);
 
     // (2) PoS-challenge sampling + capital update, A.1 decay on all pairs (§9.4).
     pos_and_capital(world, params);
@@ -512,7 +546,7 @@ fn place_own_data(
     world: &mut World,
     params: &DynParams,
     prior: &SurfacePrior,
-    retention: &RetentionPrior,
+    policy: &PlacementPolicy,
 ) {
     let n = world.nodes.len();
     let tick = world.tick;
@@ -599,7 +633,7 @@ fn place_own_data(
             }
             let mut cur = floor;
             while budget > 0 && cur < params.n_symbols {
-                if try_place_one_symbol(world, owner, bp, false, params, prior, retention) {
+                if try_place_one_symbol(world, owner, bp, false, params, prior, policy) {
                     budget -= 1;
                     cur += 1;
                     if is_repair {
@@ -635,7 +669,7 @@ fn place_own_data(
                     continue; // floor not yet met → no cream for this block yet
                 }
                 while budget > 0 && cream < cream_target {
-                    if try_place_one_symbol(world, owner, bp, true, params, prior, retention) {
+                    if try_place_one_symbol(world, owner, bp, true, params, prior, policy) {
                         budget -= 1;
                         cream += 1;
                     } else {
@@ -648,10 +682,21 @@ fn place_own_data(
 }
 
 /// Try to place ONE symbol of `owner`'s block (position `block_pos`) on the best
-/// admissible holder (§9.2 per-symbol placement). Ranks candidates by the canon
-/// keep-probability (`place_reciprocal`), then walks them in order running the holder
-/// accept/preemption gate; on the first acceptance it records the god-view holding +
-/// placement (flagged `cream`) and returns `true`. Returns `false` if none admit.
+/// admissible holder (§9.2 per-symbol placement). Transche 0.3: the OWNER-SIDE selection
+/// now runs the shared KERNEL decision path — [`place_incremental_rank`] (A.10 argmax
+/// marginal ΔR̂_wc over the block's CURRENT holders) for the floor, [`place_cream`]
+/// (strangers-first, §5½) for cream — instead of the retired `place_reciprocal` heuristic.
+/// It walks the ranked candidates through the HOLDER-side accept/preemption gate
+/// ([`admit_offer`], unchanged — acceptance is holder policy, placement is owner policy);
+/// on the first acceptance it records the god-view holding + placement (flagged `cream`),
+/// appends the R̂-calibration prediction (metric-only, gated), and returns `true`.
+///
+/// **Incrementality / bandwidth (§9.2), unbroken.** The sim still places ONE symbol per
+/// call and re-reads the block's holders each call; the outer count-based `n_symbols` floor
+/// and the per-tick upload budget still govern HOW MANY symbols land and WHEN. The kernel
+/// only governs WHICH holder — the block's already-placed holders are passed to the kernel
+/// as the `committed` set, so each candidate's marginal ΔR̂_wc is measured over the real
+/// current placement (the incremental adapter; see [`place_incremental_rank`]).
 fn try_place_one_symbol(
     world: &mut World,
     owner: usize,
@@ -659,7 +704,7 @@ fn try_place_one_symbol(
     cream: bool,
     params: &DynParams,
     prior: &SurfacePrior,
-    retention: &RetentionPrior,
+    policy: &PlacementPolicy,
 ) -> bool {
     let n = world.nodes.len();
     let tick = world.tick;
@@ -672,8 +717,9 @@ fn try_place_one_symbol(
         block_volume
     };
 
-    // Holders already storing this block (spread: ≤1 symbol per addr bucket per block).
-    let mut occupied: Vec<u32> = Vec::new();
+    // Holders already storing this block = the kernel `committed` set (§7 spread: the kernel
+    // pre-closes their observable buckets, ≤1 symbol per bucket per block, no separate
+    // `occupied` tracking needed — the observable bucket is derived from `addr_subnet`).
     let mut already: Vec<usize> = Vec::new();
     for (h, node) in world.nodes.iter().enumerate() {
         if node
@@ -682,7 +728,6 @@ fn try_place_one_symbol(
             .any(|s| s.alive && s.owner == owner && s.block == block_id)
         {
             already.push(h);
-            occupied.push(node.addr_subnet);
         }
     }
     let mut cand_idx: Vec<usize> = (0..n)
@@ -693,7 +738,8 @@ fn try_place_one_symbol(
     }
     // Shuffle the candidate order per (owner, block, attempt) — attempts differ via the
     // already-placed count so successive symbols of the same block do not tie-order the
-    // same way. Deterministic in the seed.
+    // same way. Deterministic in the seed. This shuffle is the kernel argmax's index
+    // tie-break order (structural-zero picks fall to it, exactly as core `place`).
     shuffle(
         &mut cand_idx,
         world.seed,
@@ -705,6 +751,16 @@ fn try_place_one_symbol(
     let cand_nodes: Vec<&Node> = cand_idx.iter().map(|&h| &world.nodes[h]).collect();
     let caps: Vec<&PairCapital> = cand_idx.iter().map(|&h| &world.capital[owner][h]).collect();
     let cand_obs = observer::observe_candidates(&cand_nodes, &caps, DAYS_PER_TICK);
+    drop(cand_nodes);
+    drop(caps);
+    // The block's current holders as first-hand obs — the kernel `committed` set (marginal
+    // baseline) AND the block's holder set for the R̂-calibration prediction log.
+    let already_nodes: Vec<&Node> = already.iter().map(|&h| &world.nodes[h]).collect();
+    let already_caps: Vec<&PairCapital> =
+        already.iter().map(|&h| &world.capital[owner][h]).collect();
+    let already_obs = observer::observe_candidates(&already_nodes, &already_caps, DAYS_PER_TICK);
+    drop(already_nodes);
+    drop(already_caps);
 
     let req = BlockReq {
         volume: block_volume,
@@ -712,21 +768,35 @@ fn try_place_one_symbol(
         k_eff: params.k_eff,
         tau: DAYS_PER_TICK,
         r_target: params.r_target,
-        // sim_dynamic uses place_reciprocal (its own placement), NOT the core place();
-        // r_min feeds only the core credit cap, so it is inert here.
-        r_min: 0.5,
+        // Р-5 (A.13): the per-holder credit-cap floor, now the DynParams `r_min` §13 handle
+        // (guess 0.5, NOT derived from r_target — 2b lesson). Consumed by the kernel place.
+        r_min: params.r_min,
     };
-    let ranked = place_reciprocal(
-        &cand_obs,
-        &req,
-        prior,
-        params.reciprocal_placement,
-        retention,
-        cand_idx.len(),
-        &occupied,
-    );
-    drop(cand_nodes);
-    drop(caps);
+
+    // Kernel selection (transche 0.3). FLOOR: argmax marginal ΔR̂_wc over the committed set;
+    // CREAM: strangers-first. Both return LOCAL candidate indices (into `cand_obs`), ≤1 per
+    // observable bucket, credit-capped, with committed buckets pre-closed.
+    let ranked: Vec<usize> = if cream {
+        // `place_cream` seeds its occupied buckets from `chosen_core` (indices into ITS
+        // candidate slice), so present a COMBINED slice [committed ++ fresh] and mark the
+        // committed prefix as core; the returned fresh picks (index ≥ committed.len()) map
+        // back to `cand_obs`. This keeps the §7 spread end-to-end across core+cream and the
+        // strangers-first entry channel (§5½). `want_cream = cand_idx.len()` ⇒ the full
+        // walk order (the caller places one, but may need retries when a holder rejects).
+        let a = already_obs.len();
+        let mut combined: Vec<FirstHandObs> = already_obs.clone();
+        combined.extend(cand_obs.iter().cloned());
+        let core: Vec<usize> = (0..a).collect();
+        place_cream(&req, &combined, prior, policy, &core, cand_idx.len())
+            .into_iter()
+            .filter_map(|j| j.checked_sub(a)) // drop any core pick (none expected); to cand_obs idx
+            .collect()
+    } else {
+        place_incremental_rank(&req, &cand_obs, &already_obs, prior, policy)
+    };
+
+    // R̂-calibration (metric-only, gated): whether to log the placement forecast this run.
+    let log_pred = world.pred_log_enabled;
 
     for local in ranked {
         let holder = cand_idx[local];
@@ -749,6 +819,31 @@ fn try_place_one_symbol(
             // World-v2 §9 newcomer trace: first tick this owner's own data was accepted.
             if world.first_own_accept[owner].is_none() {
                 world.first_own_accept[owner] = Some(tick);
+            }
+            // R̂-calibration prediction log (metric-only, gated; NO RNG, never read by a
+            // decision). Log the node's OWN DECISION-horizon R̂_wc AFTER this placement (over
+            // the block's current holders) — the SAME kernel A.9 forecast the selection acts
+            // on (`tau = req.tau = DAYS_PER_TICK`). We log the DECISION forecast, NOT a
+            // horizon-`H` recompute: at `tau = H·DAYS_PER_TICK` the surface's long-τ off-sample
+            // conservatism drives r̂ → 0 for every holder (observed window is one tick), so a
+            // horizon-matched forecast is degenerate (all ≈ 0, no resolution) AND repair-blind;
+            // the decision R̂ is what the node acts on, and calibration scores IT against the
+            // realised medium-term persistence at `+H`. Anti-oracle: writes a god-view field.
+            if log_pred {
+                let mut placement_obs = already_obs.clone();
+                placement_obs.push(cand_obs[local].clone());
+                let r_hat = estimate_block_survival(&placement_obs, prior, &req, policy);
+                // WARN-1: mark whether the block reached k_eff symbols AT this forecast.
+                // Below k_eff the A.9 convolution is a structural zero (r_hat == 0.0 always),
+                // so the forecast carries no information; the Brier judge scores only complete rows.
+                let floor_complete = placement_obs.len() >= params.k_eff;
+                world.pred_log.push(PredEntry {
+                    owner,
+                    block: block_id,
+                    tick,
+                    r_hat,
+                    floor_complete,
+                });
             }
             return true;
         }
@@ -901,15 +996,26 @@ fn admit_offer(
     true
 }
 
-/// Reciprocity-aware ranking via the CANON retention forecast (canon §9.5 / эталон §1).
-/// Ranks holders by the per-symbol keep-probability `surface · retained_depth(obs)` (the
-/// rank-marginalized canon K3 form; `retained_depth` folds in `obs.g_holder_from_owner`
-/// = `capital[owner][h].g_ho`, "how much h stores at us"), greedily admits ≤1 per
-/// observable address bucket (§7 spread, starting from `occupied_init`), filling to
-/// `want`. `reciprocal = false` recovers pure-surface. Returns chosen LOCAL indices.
+/// LEGACY (transche 0.3): the pre-0.3 sim-OWN reciprocity-aware placement heuristic,
+/// RETIRED from the decisive path (replaced by the shared kernel `place_incremental_rank` /
+/// `place_cream`). It is kept, NOT deleted, as a test-only reference of the retired
+/// behaviour — the `place_reciprocal_prefers_reciprocal_holder_and_caps_one_per_bucket`
+/// legacy test still exercises it — and to document what the sim traded away: it ranked by
+/// `surface · retained_depth(obs)` (folding in `g_holder_from_owner`, so a holder we already
+/// serve outranked a stranger of equal surface), a reciprocity fold the kernel `place`
+/// deliberately does NOT do (initial placement is pure survival-maximisation; reciprocity is
+/// enforced holder-side — eviction κ_O, preemption, the Р-7 cap). Consequently the
+/// `reciprocal_placement` and `recalibrated_retention` dials no longer affect the decisive
+/// placement ranking after 0.3 (they only fed THIS function). `#[allow(dead_code)]`: unused
+/// in the production build, live only under `#[cfg(test)]`.
+///
+/// Ranks holders by the per-symbol keep-probability `surface · retained_depth(obs)`, greedily
+/// admits ≤1 per observable address bucket (§7 spread, starting from `occupied_init`), filling
+/// to `want`. `reciprocal = false` recovers pure-surface. Returns chosen LOCAL indices.
 ///
 /// Anti-oracle: reads only first-hand `cand_obs`; strength is the `RetentionPrior`
 /// (default or recalibrated), not a magic weight.
+#[allow(dead_code)]
 fn place_reciprocal(
     cand_obs: &[viaticum_core::four_r::FirstHandObs],
     req: &BlockReq,
@@ -1594,6 +1700,20 @@ pub fn admit_offer_for_test(
     tick: u64,
 ) -> bool {
     admit_offer(world, owner, holder, v_per_symbol, params, tick)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn try_place_one_symbol_for_test(
+    world: &mut World,
+    owner: usize,
+    block_pos: usize,
+    cream: bool,
+    params: &DynParams,
+    prior: &SurfacePrior,
+    policy: &PlacementPolicy,
+) -> bool {
+    try_place_one_symbol(world, owner, block_pos, cream, params, prior, policy)
 }
 
 #[cfg(test)]

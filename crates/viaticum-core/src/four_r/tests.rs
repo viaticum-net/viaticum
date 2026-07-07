@@ -2612,6 +2612,210 @@ fn place_below_k_eff_first_pick_is_index_tiebreak_not_surface() {
 }
 
 // ============================================================
+// place_incremental_rank — the §9.2 one-symbol-per-attempt twin of `place`.
+// ============================================================
+
+#[test]
+fn place_incremental_rank_excludes_committed_buckets() {
+    // §7 spread across committed+fresh: a fresh candidate sharing a COMMITTED holder's
+    // observable bucket is never returned (no two symbols of a block in one bucket).
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default(); // spread by subnet
+    let r = req(5, 2, 0.90);
+    // Committed holder occupies subnet 7.
+    let committed = vec![holder(0, 7, 10.0, 30.0)];
+    // Fresh: idx 0 shares subnet 7 (committed) → excluded; idx 1,2 on distinct subnets.
+    let cands = vec![
+        holder(1, 7, 10.0, 30.0), // collides with committed bucket
+        holder(2, 8, 10.0, 30.0),
+        holder(3, 9, 10.0, 30.0),
+    ];
+    let ranked = place_incremental_rank(&r, &cands, &committed, &prior, &policy);
+    assert!(
+        !ranked.contains(&0),
+        "a fresh candidate in a committed holder's bucket must be excluded: {ranked:?}"
+    );
+    assert!(
+        ranked.contains(&1) && ranked.contains(&2),
+        "the distinct-bucket fresh candidates must be ranked: {ranked:?}"
+    );
+}
+
+#[test]
+fn place_incremental_rank_at_most_one_per_fresh_bucket() {
+    // Two fresh candidates share subnet 5 → only ONE appears in the walk order (the caller
+    // places one symbol per attempt; a same-bucket runner-up is redundant).
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let r = req(5, 2, 0.90);
+    let committed: Vec<FirstHandObs> = Vec::new();
+    let cands = vec![
+        holder(1, 5, 10.0, 30.0), // subnet 5
+        holder(2, 5, 10.0, 30.0), // subnet 5 (collision)
+        holder(3, 6, 10.0, 30.0), // subnet 6
+    ];
+    let ranked = place_incremental_rank(&r, &cands, &committed, &prior, &policy);
+    let subnets: Vec<u32> = ranked.iter().map(|&i| cands[i].addr_subnet).collect();
+    let distinct: std::collections::BTreeSet<u32> = subnets.iter().copied().collect();
+    assert_eq!(
+        subnets.len(),
+        distinct.len(),
+        "≤1 fresh candidate per observable bucket: {subnets:?}"
+    );
+}
+
+#[test]
+fn place_incremental_rank_argmax_over_committed_prefers_stronger_surface() {
+    // With ≥ k_eff committed holders the marginal ΔR̂_wc is non-degenerate (resolves the
+    // structural-zero caveat), so the STRONGER-surface fresh candidate ranks first.
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let r = req(5, 2, 0.90);
+    // Two committed holders (≥ k_eff=2) on distinct subnets ⇒ marginal is meaningful.
+    let committed = vec![holder(10, 0, 10.0, 30.0), holder(11, 1, 10.0, 30.0)];
+    // Fresh: idx 0 WEAK surface (few passes, some fails), idx 1 STRONG (clean passes).
+    let weak = holder_with_standing(0, 2, 0.0, 4, 6, 0);
+    let strong = holder_with_standing(1, 3, 0.0, 60, 0, 0);
+    let cands = vec![weak, strong];
+    let ranked = place_incremental_rank(&r, &cands, &committed, &prior, &policy);
+    assert_eq!(
+        ranked.first(),
+        Some(&1),
+        "the stronger-surface fresh candidate must rank first over committed: {ranked:?}"
+    );
+}
+
+#[test]
+fn place_incremental_rank_credit_gate_equals_credit_limit_from_surface() {
+    // The single-eval credit gate `r̂(v_per_symbol) ≥ r_min` used by place_incremental_rank
+    // is EXACTLY the A.13 cap `credit_limit_from_surface(...) ≥ v_per_symbol` (monotone r̂).
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    // A high r_min so the cap actually bites some candidates: a holder proven only at a
+    // small volume cannot be trusted with a much larger per-symbol ask at r_min.
+    let mut r = req(5, 2, 0.90);
+    r.r_min = 0.95;
+    r.volume = 5.0 * 40.0; // per-symbol ask = 40 gb ≫ the 10 gb observed/demonstrated scale
+    let v_per_symbol = r.volume_per_symbol();
+    let credit_v_max = v_per_symbol * 4.0; // CREDIT_PLACE_HEADROOM
+
+    // A spread of holders with different proven records.
+    let cands = vec![
+        holder_with_standing(0, 0, 0.0, 60, 0, 0),
+        holder_with_standing(1, 1, 0.0, 8, 8, 0),
+        holder_with_standing(2, 2, 0.0, 2, 0, 6),
+    ];
+    for (i, obs) in cands.iter().enumerate() {
+        let gate_cheap = estimate_surface(obs, &prior, v_per_symbol, r.tau).r_hat >= r.r_min;
+        let gate_full =
+            credit_limit_from_surface(obs, &prior, r.r_min, r.tau, credit_v_max) >= v_per_symbol;
+        assert_eq!(
+            gate_cheap, gate_full,
+            "credit gate equivalence must hold for candidate {i}"
+        );
+    }
+    // And the ranker drops exactly the credit-capped candidates.
+    let ranked = place_incremental_rank(&r, &cands, &[], &prior, &policy);
+    for &i in &ranked {
+        assert!(
+            estimate_surface(&cands[i], &prior, v_per_symbol, r.tau).r_hat >= r.r_min,
+            "a ranked candidate must clear the Р-5 credit gate: {i}"
+        );
+    }
+}
+
+#[test]
+fn place_incremental_rank_empty_candidates_is_empty() {
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let r = req(5, 2, 0.90);
+    let committed = vec![holder(0, 0, 10.0, 30.0)];
+    assert!(place_incremental_rank(&r, &[], &committed, &prior, &policy).is_empty());
+}
+
+#[test]
+fn place_incremental_rank_order_is_strictly_descending_in_marginal() {
+    // NOTE-2: with ≥ k_eff committed the walk order is STRICTLY descending in the marginal
+    // ΔR̂_wc — the argmax the kernel `place` uses, one add at a time. Three fresh candidates
+    // of distinct surface on distinct buckets ⇒ their marginals over `committed` strictly
+    // decrease along the returned order.
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let r = req(5, 2, 0.90);
+    // committed = 2 holders (≥ k_eff) so each candidate's marginal is non-degenerate.
+    let committed = vec![holder(10, 0, 10.0, 30.0), holder(11, 1, 10.0, 30.0)];
+    // Distinct in-sample surfaces (all clear the r_min=0.5 credit gate), distinct subnets.
+    let cands = vec![
+        holder_with_standing(0, 2, 0.0, 6, 4, 0),  // q = 0.60
+        holder_with_standing(1, 3, 0.0, 9, 3, 0),  // q = 0.75
+        holder_with_standing(2, 4, 0.0, 17, 3, 0), // q = 0.85
+    ];
+    let ranked = place_incremental_rank(&r, &cands, &committed, &prior, &policy);
+    assert_eq!(
+        ranked.len(),
+        3,
+        "all three fresh candidates ranked: {ranked:?}"
+    );
+    // The marginal R̂_wc(committed ∪ {cand}) must strictly decrease along the order.
+    let marginal = |idx: usize| {
+        let mut ext = committed.clone();
+        ext.push(cands[idx].clone());
+        estimate_block_survival(&ext, &prior, &r, &policy)
+    };
+    let mut prev = f64::INFINITY;
+    for &i in &ranked {
+        let m = marginal(i);
+        assert!(
+            m < prev,
+            "marginal must strictly decrease along the walk order: {ranked:?} at idx {i} ({m} !< {prev})"
+        );
+        prev = m;
+    }
+    // Concretely: strongest (idx 2) first, weakest (idx 0) last.
+    assert_eq!(
+        ranked,
+        vec![2, 1, 0],
+        "descending surface ⇒ [strong, mid, weak]"
+    );
+}
+
+#[test]
+fn place_incremental_rank_degenerate_falls_to_index_but_non_degenerate_uses_surface() {
+    // NOTE-2: the structural-zero contrast. BELOW k_eff (committed+1 < k_eff) EVERY marginal
+    // is a structural zero, so all tie and the order is the INDEX tie-break — surface is
+    // IGNORED. AT/above k_eff the marginal is meaningful and the higher-surface candidate
+    // leads. Same candidates, only the committed set differs.
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let r = req(5, 2, 0.90); // k_eff = 2
+    // idx 0 = WEAK surface, idx 2 = STRONG surface, distinct buckets, all credit-uncapped.
+    let cands = vec![
+        holder_with_standing(0, 0, 0.0, 6, 4, 0),  // weak
+        holder_with_standing(1, 1, 0.0, 12, 3, 0), // mid
+        holder_with_standing(2, 2, 0.0, 40, 0, 0), // strong
+    ];
+
+    // DEGENERATE: committed empty ⇒ committed+1 = 1 < k_eff = 2 ⇒ every R̂ is a structural
+    // zero ⇒ all marginals tie ⇒ INDEX order (surface ignored).
+    let degenerate = place_incremental_rank(&r, &cands, &[], &prior, &policy);
+    assert_eq!(
+        degenerate,
+        vec![0, 1, 2],
+        "below k_eff all marginals are 0 ⇒ index tie-break (surface ignored): {degenerate:?}"
+    );
+
+    // NON-DEGENERATE: one committed holder ⇒ committed+1 = 2 = k_eff ⇒ marginal is real ⇒
+    // the STRONG candidate (idx 2) leads, NOT the index-0 weak one.
+    let committed = vec![holder(9, 9, 10.0, 30.0)];
+    let non_degenerate = place_incremental_rank(&r, &cands, &committed, &prior, &policy);
+    assert_eq!(
+        non_degenerate.first(),
+        Some(&2),
+        "at k_eff the marginal is real ⇒ the strong candidate leads, not index 0: {non_degenerate:?}"
+    );
+}
+
+// ============================================================
 // A.3 — demonstrated-scale ratchet `update_v_dem`.
 // ============================================================
 

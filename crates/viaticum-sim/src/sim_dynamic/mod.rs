@@ -161,6 +161,10 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
         burn_ann_count: 0,
         burn_silent_count: 0,
         pending_silent_loss: Vec::new(),
+        // R̂-calibration log OFF by default (sim_diag/tests pay nothing); the sim_adv runner
+        // flips `pred_log_enabled` on to collect the dataset. Metric-only, no decision reads it.
+        pred_log: Vec::new(),
+        pred_log_enabled: false,
     }
 }
 

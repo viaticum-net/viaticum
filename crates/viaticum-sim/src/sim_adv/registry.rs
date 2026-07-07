@@ -78,7 +78,13 @@ pub fn honest_v2() -> Scenario {
         horizon: 130,
         // Five seeds 42..46 inclusive (the acceptance seed band).
         seeds: vec![42, 43, 44, 45, 46],
-        metrics: vec![MetricId::Extraction, MetricId::InvariantBoard],
+        // RhatCalibration (transche 0.3): the sim-unification judge — Brier + reliability/
+        // resolution of the kernel's own placement forecast (spec §10 п.7).
+        metrics: vec![
+            MetricId::Extraction,
+            MetricId::RhatCalibration,
+            MetricId::InvariantBoard,
+        ],
         verdicts: honest_v2_invariants(),
         fast: true,
     }

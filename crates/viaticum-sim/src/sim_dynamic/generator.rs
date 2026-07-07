@@ -603,6 +603,45 @@ pub struct World {
     /// start of tick T+1's capital pass (the "detected on the next PoS round" latency).
     /// Each is an owner whose data a now-departed holder silently lost. Drained every tick.
     pub pending_silent_loss: Vec<SilentLoss>,
+    /// R̂-CALIBRATION prediction log (transche 0.3) — a GOD-VIEW, METRIC-ONLY channel. At
+    /// each successful placement the engine appends the block's forecast survival `R̂_wc`
+    /// over the calibration horizon `H` ([`crate::sim_dynamic::engine::DynParams::pred_horizon_ticks`]).
+    /// It is written by the engine but read ONLY by the sim_adv evaluator (Brier +
+    /// reliability/resolution) — NEVER by any placement/eviction/PoS decision (anti-oracle:
+    /// a first-hand decision cannot see its own future-scored forecast). Writes are gated by
+    /// [`World::pred_log_enabled`] so the diagnostic path costs nothing when off (sim_diag),
+    /// and consume NO RNG, so enabling the log leaves every decision bit-identical.
+    pub pred_log: Vec<PredEntry>,
+    /// Whether the engine appends to [`World::pred_log`] this run. `false` by default (the
+    /// engine and sim_diag pay nothing); the sim_adv runner sets it `true` to collect the
+    /// R̂-calibration dataset. Gating a metric channel, NOT a decision — every decision is
+    /// bit-identical regardless of this flag (the anti-oracle regression asserts it).
+    pub pred_log_enabled: bool,
+}
+
+/// One R̂-calibration prediction (transche 0.3) — a GOD-VIEW metric row, never a kernel
+/// input. Logged at a successful placement: the block's forecast survival over the
+/// calibration horizon `H`, to be scored against the realised outcome `H` ticks later.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PredEntry {
+    /// The owner whose block was (incrementally) placed.
+    pub owner: usize,
+    /// The block id.
+    pub block: usize,
+    /// The tick the prediction was made at (placement tick). The outcome is read at
+    /// `tick + H` (`H = DynParams::pred_horizon_ticks`).
+    pub tick: u64,
+    /// The node's OWN decision-horizon forecast `R̂_wc` = `estimate_block_survival` over the
+    /// block's current holders (committed + the just-placed symbol) at the DECISION horizon
+    /// `tau = DAYS_PER_TICK` — the same estimate the kernel selection acts on. In `[0, 1]`.
+    pub r_hat: f64,
+    /// Whether the block held ≥ `k_eff` symbols AT THIS forecast (`committed.len() + 1 ≥
+    /// k_eff`). When FALSE this is a still-INCOMPLETE block: the A.9 convolution is a
+    /// STRUCTURAL ZERO (fewer than `k_eff` symbols can never meet the threshold), so `r_hat`
+    /// is a forced `0.0` regardless of holder quality — NOT a real forecast. The Brier judge
+    /// (WARN-1) scores ONLY `floor_complete` rows; the incomplete population is reported as a
+    /// separate structural-zero diagnostic (its forecast carries no information).
+    pub floor_complete: bool,
 }
 
 /// A.2 (транше 4): one confirmed SILENT loss to apply next tick — the owner `O` whose

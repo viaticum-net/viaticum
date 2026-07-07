@@ -2158,6 +2158,114 @@ pub fn place(
     }
 }
 
+/// Rank fresh `candidates` for INCREMENTAL placement given an already-committed holder
+/// set — the §9.2 "one symbol per attempt" twin of [`place`] (A.10 / decision_model §6).
+///
+/// [`place`] builds a whole placement from an EMPTY chosen set, greedily adding the
+/// argmax-ΔR̂_wc holder until `R̂_wc ≥ r_target`. A cold, bandwidth-stretched backup (the
+/// sim's §9.2 regime, and the daemon's real initial backup) instead already holds SOME
+/// symbols of the block and adds ONE more per attempt. This ranks the fresh candidates by
+/// exactly the A.10 principle `place` uses — the MARGINAL block-survival gain `ΔR̂_wc`
+/// when the candidate is added to the CURRENT (committed) set — but for a SINGLE
+/// incremental add rather than an iterated greedy fill:
+///
+/// * `committed` = the block's holders already storing a symbol (their [`FirstHandObs`]).
+///   The chosen set is SEEDED with them, so each candidate's marginal is measured over the
+///   REAL current placement. This is what makes the argmax meaningful before `k_eff`
+///   symbols exist: once `committed.len() ≥ k_eff` the marginal is non-degenerate — it
+///   resolves the structural-zero index-order caveat [`place`] documents for its own first
+///   `k_eff−1` picks.
+/// * The `committed` holders' observable buckets are PRE-CLOSED (§7 spread ≤1/bucket
+///   across committed+fresh) and can never be reopened, so a fresh candidate sharing a
+///   committed holder's bucket is never returned (no two symbols of a block in one bucket
+///   — the invariant a naïve "feed committed to `place` as ordinary candidates" adapter
+///   would break the moment the argmax reordered a committed holder behind a fresh one).
+/// * The per-holder credit cap (Р-5 / A.13, [`credit_limit_from_surface`], `req.r_min`)
+///   gates every candidate exactly as in [`place`].
+/// * There is NO `r_target` stop: the caller's own redundancy policy (the sim's
+///   count-based `n_symbols` floor) governs HOW MANY symbols to place; this returns the
+///   full ranked walk order so the caller can try candidates through its own holder-side
+///   accept gate and place the first that admits.
+///
+/// **Single-add marginal, not iterated greedy — deliberate (§9.2).** Because the caller
+/// places exactly ONE symbol per invocation and re-reads `committed` on the next attempt,
+/// the correct per-attempt decision is the argmax over the FIXED committed set (a single
+/// [`estimate_block_survival`] per candidate, `O(F)`), not a full iterated greedy fill
+/// (`O(F²)`). The two coincide on the first pick (argmax single-add marginal ≡ greedy first
+/// pick); across attempts the iterated behaviour is recovered as `committed` grows by one
+/// each successful attempt.
+///
+/// Returns indices into `candidates`, in descending marginal order (ties → smallest index,
+/// deterministic), filtered to ≤1 per observable bucket (the best-ranked fresh candidate
+/// per fresh bucket). Empty `candidates` ⇒ empty `Vec`.
+///
+/// Anti-oracle: identical to [`place`] — every input is first-hand `candidates`/`committed`
+/// plus the offline `prior` plus the owner-private `req`/`policy`. No hidden farm-identity is
+/// reachable (it is not a field on [`FirstHandObs`]).
+pub fn place_incremental_rank(
+    req: &BlockReq,
+    candidates: &[FirstHandObs],
+    committed: &[FirstHandObs],
+    prior: &SurfacePrior,
+    policy: &PlacementPolicy,
+) -> Vec<usize> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let v_per_symbol = req.volume_per_symbol();
+    let tau = req.tau.max(0.0);
+    let r_min = req.r_min.clamp(0.0, 1.0);
+
+    // Buckets already claimed by the committed holders — PRE-CLOSED (§7 ≤1/bucket across
+    // committed+fresh; never reopened, so no fresh candidate can double up a bucket).
+    let committed_buckets: Vec<BucketKey> =
+        committed.iter().map(|o| bucket_key(o, policy)).collect();
+
+    // Marginal score per fresh candidate: R̂_wc(committed ∪ {cand}). Since R̂_wc(committed)
+    // is a constant this tick, argmax R̂_wc(committed ∪ {cand}) = argmax ΔR̂_wc (A.10).
+    // Credit-capped and committed-bucket candidates are dropped up front.
+    let mut scored: Vec<(usize, f64)> = Vec::new();
+    let mut ext: Vec<FirstHandObs> = committed.to_vec();
+    for (i, obs) in candidates.iter().enumerate() {
+        // Р-5 credit cap (`req.r_min == 0` disables it). The A.13 cap `L(O→h) =
+        // credit_limit_from_surface(obs, r_min, τ, ·) ≥ v_per_symbol` is — by the
+        // monotone-non-increasing r̂(V) that makes the cap a clean interval [0, L] (see
+        // [`credit_limit_from_surface`]) — IDENTICAL to `r̂(v_per_symbol, τ) ≥ r_min`, since
+        // `L` is the LARGEST V with `r̂(V) ≥ r_min`. We test that equivalent single-eval form
+        // rather than inverting the surface 60× for a value we only compare to v_per_symbol:
+        // the SAME Р-5 gate, not a weakening (a kernel unit test asserts the equivalence).
+        if estimate_surface(obs, prior, v_per_symbol, tau).r_hat < r_min {
+            continue;
+        }
+        // §7: never rank a candidate whose bucket a committed holder already occupies.
+        if committed_buckets.contains(&bucket_key(obs, policy)) {
+            continue;
+        }
+        ext.push(obs.clone());
+        let r = estimate_block_survival(&ext, prior, req, policy);
+        ext.pop();
+        scored.push((i, r));
+    }
+
+    // Descending marginal, smallest-index tie-break (deterministic — no HashMap/clock).
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+
+    // ≤1 fresh candidate per observable bucket: keep the best-ranked per bucket (the caller
+    // places one symbol per attempt, so a same-bucket runner-up is redundant — this matches
+    // the retired place_reciprocal ≤1/bucket walk order the sim replaced).
+    let mut out: Vec<usize> = Vec::new();
+    let mut occupied: Vec<BucketKey> = Vec::new();
+    for (i, _) in scored {
+        let bucket = bucket_key(&candidates[i], policy);
+        if occupied.contains(&bucket) {
+            continue;
+        }
+        occupied.push(bucket);
+        out.push(i);
+    }
+    out
+}
+
 /// A.11: place **cream** — surplus symbols ABOVE the `R_target` floor (decision_model
 /// §6 A.11, W9 greed + pair probation).
 ///

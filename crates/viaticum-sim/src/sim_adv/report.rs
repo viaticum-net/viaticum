@@ -8,6 +8,7 @@
 
 use std::fmt::Write as _;
 
+use crate::sim_adv::brier::{Calibration, DEFAULT_BRIER_BUCKETS};
 use crate::sim_adv::metrics::{MetricSet, mean_sigma};
 use crate::sim_adv::restore::{IOTA_BUCKETS, RestoreTruth};
 use crate::sim_adv::runner::{RunResult, SweepRow};
@@ -104,6 +105,11 @@ pub fn format_report(scenario: &Scenario, result: &RunResult, verdicts: &[Verdic
 
     // --- restore-truth (metric №1), only when a Disaster fired ---
     if let Some(section) = format_restore(result) {
+        o.push_str(&section);
+    }
+
+    // --- R̂-calibration (transche 0.3 judge), when predictions resolved ---
+    if let Some(section) = format_brier(result) {
         o.push_str(&section);
     }
 
@@ -246,6 +252,89 @@ pub fn restore_csv(result: &RunResult) -> String {
         );
     }
     o
+}
+
+/// Render the R̂-calibration section (transche 0.3 judge, WARN-1). Pools every seed's resolved
+/// rows, then scores ONLY the FLOOR-COMPLETE cut (≥ k_eff symbols at the forecast — the rows
+/// whose `r_hat` is a real forecast); the incomplete structural-zero population is reported as
+/// a separate diagnostic line, NOT part of the judge. `None` when no complete row resolved.
+fn format_brier(result: &RunResult) -> Option<String> {
+    // Pool all seeds (the aggregate calibration curve).
+    let mut pooled = Calibration::new();
+    for c in &result.per_seed_calibration {
+        for &(f, o, cpl) in &c.pairs {
+            pooled.push(f, o, cpl);
+        }
+    }
+    // The JUDGE: floor-complete rows only.
+    let agg = pooled.complete_report(DEFAULT_BRIER_BUCKETS)?;
+
+    // Per-seed Brier mean±σ over the complete cut (seeds with ≥1 complete row).
+    let per_seed_brier: Vec<f64> = result
+        .per_seed_calibration
+        .iter()
+        .filter_map(|c| c.complete_report(DEFAULT_BRIER_BUCKETS).map(|r| r.brier))
+        .collect();
+    let (bm, bs) = mean_sigma(&per_seed_brier);
+
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "-- R̂-calibration (transche 0.3 judge, WARN-1; floor-COMPLETE rows only) --"
+    );
+    let _ = writeln!(
+        o,
+        "  judged N = {}   base-rate ō = {:.4}   (outcome = block ≥ k_eff live @ +H ticks)",
+        agg.n, agg.base_rate,
+    );
+    let _ = writeln!(
+        o,
+        "  Brier (pooled)        {:>8.4}   [lower better; perfect 0, const-ō {:.4}]",
+        agg.brier, agg.uncertainty,
+    );
+    let _ = writeln!(o, "  Brier (per-seed)      {:>8.4} ± {:.4}", bm, bs);
+    let _ = writeln!(
+        o,
+        "  reliability           {:>8.4}   [lower better; 0 = perfectly calibrated]",
+        agg.reliability,
+    );
+    let _ = writeln!(
+        o,
+        "  resolution            {:>8.4}   [higher better; 0 = no discrimination]",
+        agg.resolution,
+    );
+    let _ = writeln!(
+        o,
+        "  uncertainty ō(1−ō)    {:>8.4}   [Brier ≈ reliability − resolution + uncertainty]",
+        agg.uncertainty,
+    );
+    let _ = writeln!(
+        o,
+        "  reliability diagram (forecast bucket → observed freq):"
+    );
+    for b in &agg.buckets {
+        if b.n == 0 {
+            continue;
+        }
+        let _ = writeln!(
+            o,
+            "    [{:.1},{:.1})  n={:>6}  f̄={:.4}  ō={:.4}",
+            b.lo, b.hi, b.n, b.mean_forecast, b.observed_freq,
+        );
+    }
+    // Incomplete structural-zero population (excluded from the judge) — diagnostic only.
+    if let Some(inc) = pooled.incomplete_summary() {
+        let _ = writeln!(
+            o,
+            "  [incomplete (excl.): n={} ({:.1}% of resolved)  f̄={:.4} (structural 0)  ō={:.4}]",
+            inc.n,
+            100.0 * inc.share_of_total,
+            inc.mean_forecast,
+            inc.observed_freq,
+        );
+    }
+    let _ = writeln!(o);
+    Some(o)
 }
 
 fn fmt_power(p: f64) -> String {

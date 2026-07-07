@@ -14,7 +14,7 @@ use crate::sim_dynamic::engine::{
     DynParams, PosOutcome, admit_offer_for_test, alive_block_counts_for_test,
     assert_lambda_dt_stable, block_mature_for_test, churn_for_test, disaster_strike, fresh_capital,
     place_reciprocal_for_test, pos_and_capital_for_test, run_eviction_for_test, step,
-    symbols_per_tick_for_test,
+    symbols_per_tick_for_test, try_place_one_symbol_for_test,
 };
 use crate::sim_dynamic::evaluator::{
     contention_metric, drop_ranking_metric, legacy_mc_block_r_actual, pillar1_metric,
@@ -1518,15 +1518,20 @@ fn giver_tier_mix_sums_to_n_and_spans_all_tiers() {
 }
 
 // ============================================================
-// WORLD-v2 §9 — reciprocity-aware placement (place_reciprocal)
+// LEGACY (transche 0.3) — retired reciprocity-aware placement (`place_reciprocal`).
+// The DECISIVE placement path moved to the shared kernel (`place_incremental_rank` /
+// `place_cream`); this test is KEPT (not deleted) to document the retired heuristic's
+// behaviour — the reciprocity fold the kernel `place` deliberately does NOT do. The two
+// tests below (`kernel_place_*`) exercise the CURRENT decisive path.
 // ============================================================
 
 #[test]
-fn place_reciprocal_prefers_reciprocal_holder_and_caps_one_per_bucket() {
-    // §9.1 / эталон §1: with reciprocity ON, a holder we already SERVE (high g_ho ⇒ high
-    // retained_depth) outranks a stranger of EQUAL surface; with it OFF (pure surface)
-    // the g_ho boost is gone and equal-surface candidates fall back to input order. The
-    // §7 spread admits ≤1 candidate per addr bucket.
+fn legacy_place_reciprocal_prefers_reciprocal_holder_and_caps_one_per_bucket() {
+    // LEGACY (transche 0.3): exercises the RETIRED `place_reciprocal` reference, not the
+    // decisive path. §9.1 / эталон §1: with reciprocity ON, a holder we already SERVE (high
+    // g_ho ⇒ high retained_depth) outranks a stranger of EQUAL surface; with it OFF (pure
+    // surface) the g_ho boost is gone and equal-surface candidates fall back to input order.
+    // The §7 spread admits ≤1 candidate per addr bucket.
     let prior = SurfacePrior::default();
     let retention = RetentionPrior::default();
     // Identical surface signals; ONLY g_ho differs (0 stranger vs 500 reciprocal).
@@ -1579,6 +1584,116 @@ fn place_reciprocal_prefers_reciprocal_holder_and_caps_one_per_bucket() {
     assert_eq!(
         chosen_off[0], 0,
         "pure-surface: equal surface ⇒ input order (stranger first): {chosen_off:?}"
+    );
+}
+
+// ============================================================
+// Transche 0.3 — the DECISIVE kernel placement path (place_incremental_rank / place_cream).
+// ============================================================
+
+#[test]
+fn kernel_place_one_call_places_one_new_holder_on_a_fresh_bucket() {
+    // Transche 0.3: `try_place_one_symbol` runs the kernel `place_incremental_rank`. ONE call
+    // places exactly ONE new floor symbol, and it lands on a FRESH observable bucket — a
+    // candidate in a bucket already occupied by a committed holder is never chosen (§7 spread
+    // across committed+fresh, the incremental adapter).
+    let params = DynParams::default();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world(6, &params, 7);
+    for node in &mut world.nodes {
+        node.present = true;
+        node.holdings.clear();
+        node.archetype = Archetype::Reliable; // willing holders
+        node.disk.own_data = 0.0; // plenty of free disk ⇒ accept freely
+        node.disk.own_growth_per_tick = 0.0;
+    }
+    let owner = 0usize;
+    let block_id = world.nodes[owner].own_blocks[0].id;
+    let v = params.block_volume / params.n_symbols as f64;
+    // A committed floor symbol on holder 1 (subnet 1) — the occupied bucket.
+    world.nodes[1].holdings.push(HeldSymbol {
+        owner,
+        block: block_id,
+        iota: 0.5,
+        volume: v,
+        alive: true,
+        cream: false,
+    });
+    assert_eq!(alive_block_counts_for_test(&world, owner, block_id).0, 1);
+
+    assert!(try_place_one_symbol_for_test(
+        &mut world, owner, 0, false, &params, &prior, &policy
+    ));
+
+    let (floor_after, _) = alive_block_counts_for_test(&world, owner, block_id);
+    assert_eq!(
+        floor_after, 2,
+        "exactly ONE new floor symbol added per call (§9.2)"
+    );
+    // The single new holder is on a FRESH bucket (not the committed holder's subnet 1).
+    let new_subnets: Vec<u32> = world
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(h, nd)| {
+            *h != 1
+                && nd
+                    .holdings
+                    .iter()
+                    .any(|s| s.alive && s.owner == owner && s.block == block_id)
+        })
+        .map(|(_, nd)| nd.addr_subnet)
+        .collect();
+    assert_eq!(new_subnets.len(), 1, "one new holder");
+    assert_ne!(
+        new_subnets[0], 1,
+        "the new holder is on a fresh bucket, not the committed subnet 1"
+    );
+}
+
+#[test]
+fn kernel_cream_routes_through_place_cream_and_prefers_a_stranger() {
+    // Transche 0.3: a cream placement runs the kernel `place_cream` (strangers-first §5½), NOT
+    // the argmax `place_incremental_rank`. With a HIGH-surface established partner and a
+    // NO-history stranger on distinct buckets, the STRANGER gets the cream symbol (the P3
+    // entry channel) even though argmax-by-surface would have taken the established.
+    let params = DynParams::default();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world(3, &params, 5);
+    for node in &mut world.nodes {
+        node.present = true;
+        node.holdings.clear();
+        node.archetype = Archetype::Reliable;
+        node.disk.own_data = 0.0;
+        node.disk.own_growth_per_tick = 0.0;
+    }
+    let owner = 0usize;
+    let established = 1usize; // subnet 1 — a clean PoS record ⇒ HIGH surface
+    let stranger = 2usize; // subnet 2 — NO history ⇒ arm (a) of place_cream
+    for _ in 0..8 {
+        world.capital[owner][established].push_outcome(true);
+    }
+    let block_id = world.nodes[owner].own_blocks[0].id;
+
+    assert!(try_place_one_symbol_for_test(
+        &mut world, owner, 0, true, &params, &prior, &policy
+    ));
+
+    let holds_cream = |h: usize| {
+        world.nodes[h]
+            .holdings
+            .iter()
+            .any(|s| s.alive && s.cream && s.owner == owner && s.block == block_id)
+    };
+    assert!(
+        holds_cream(stranger),
+        "strangers-first: the cream lands on the no-history stranger (P3 entry channel)"
+    );
+    assert!(
+        !holds_cream(established),
+        "the higher-surface established partner did NOT get the cream (proves place_cream, not argmax)"
     );
 }
 

@@ -224,7 +224,7 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
             InvariantSpec::Determinism => {
                 let pass = match result.seeds.first() {
                     Some(&s0) => {
-                        let (m, _, r) = run_one_seed(scenario, s0);
+                        let (m, _, r, c) = run_one_seed(scenario, s0);
                         let metrics_eq = result
                             .per_seed
                             .first()
@@ -239,7 +239,14 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             Some(None) => r.is_none(),
                             None => true,
                         };
-                        metrics_eq && restore_eq
+                        // The R̂-calibration channel (transche 0.3) must re-run bit-identical
+                        // too — it feeds the report, so determinism must cover it.
+                        let calib_eq = result
+                            .per_seed_calibration
+                            .first()
+                            .map(|c0| crate::sim_adv::brier::bit_eq(c0, &c))
+                            .unwrap_or(false);
+                        metrics_eq && restore_eq && calib_eq
                     }
                     None => false,
                 };

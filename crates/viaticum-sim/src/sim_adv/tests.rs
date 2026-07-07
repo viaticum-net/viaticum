@@ -1,7 +1,8 @@
 //! Unit tests for `sim_adv` (sub-tranches 0.1 + 0.2 restore-truth). `what_when_then`.
 
+use crate::sim_adv::brier::{Calibration, DEFAULT_BRIER_BUCKETS};
 use crate::sim_adv::cli::{apply_dial, parse_cli, resolve_seeds};
-use crate::sim_adv::metrics::mean_sigma;
+use crate::sim_adv::metrics::{bit_eq as metrics_bit_eq, collect_metrics, mean_sigma};
 use crate::sim_adv::registry::{all_scenarios, dr_baseline, find_scenario, honest_v2};
 use crate::sim_adv::report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
 use crate::sim_adv::restore::{
@@ -88,7 +89,7 @@ fn registry_all_scenarios_is_non_empty() {
 #[test]
 fn event_dispatch_records_executor_on_the_scripted_tick() {
     let sc = tiny_scenario_with_events(vec![(2, Event::Disaster(NodeSel::Index(0)))]);
-    let (_metrics, fired, _r) = run_one_seed(&sc, 1);
+    let (_metrics, fired, _r, _c) = run_one_seed(&sc, 1);
     assert_eq!(fired.len(), 1, "exactly one event fired");
     assert_eq!(fired[0].tick, 2, "fired on the scripted tick");
     assert_eq!(fired[0].kind, EventKind::Disaster);
@@ -98,7 +99,7 @@ fn event_dispatch_records_executor_on_the_scripted_tick() {
 fn event_dispatch_skips_events_scheduled_beyond_horizon() {
     // horizon is 4 (ticks 0..4); an event at tick 9 must never fire.
     let sc = tiny_scenario_with_events(vec![(9, Event::KillSubnet(3))]);
-    let (_metrics, fired, _r) = run_one_seed(&sc, 1);
+    let (_metrics, fired, _r, _c) = run_one_seed(&sc, 1);
     assert!(fired.is_empty(), "event past the horizon does not fire");
 }
 
@@ -114,7 +115,7 @@ fn event_dispatch_fires_multiple_events_at_their_ticks() {
         ),
         (3, Event::AdvActivate(AdvId::A1EpsilonWhale)),
     ]);
-    let (_m, fired, _r) = run_one_seed(&sc, 1);
+    let (_m, fired, _r, _c) = run_one_seed(&sc, 1);
     let ticks: Vec<u64> = fired.iter().map(|f| f.tick).collect();
     assert_eq!(ticks, vec![0, 1, 3]);
     assert_eq!(fired[0].kind, EventKind::JoinWave);
@@ -188,45 +189,50 @@ fn report_text_is_byte_identical_on_repeat_under_rayon() {
 
 #[test]
 fn honest_v2_seed42_matches_sim_diag_anchor() {
-    // Anchor = `sim_diag 42 100 50 1 v2` (captured 2026-07-07). The harness must NOT
-    // distort the engine: same build_world + 130 steps ⇒ same god-view numbers.
-    let (m, _fired, _r) = run_one_seed(&honest_v2(), 42);
+    // Anchor = `sim_diag 42 100 50 1 v2` — RE-FROZEN 2026-07-07 for transche 0.3 (the
+    // kernel-place unification shifted the numbers; both sim_diag and honest_v2 now run the
+    // shared kernel `place_incremental_rank`/`place_cream`, so they STILL agree — the point
+    // of this anchor is that the harness does not distort the engine, not the exact values).
+    // The 0.3 acceptance shift (old→new): alive 564→565, evicts 1413→1514, preempts 1189→1291,
+    // share 95.9→96.6, D 3371.85→3428.05, σ 0.0570→0.0543, durability Reliable 2.30→2.39 /
+    // Nomad 0.42→0.62 / Hoarder 2.42→2.83.
+    let (m, _fired, _r, _c) = run_one_seed(&honest_v2(), 42);
 
     // Exact integer counters (sim_diag §6a/§3-sum/§6d).
-    assert_eq!(m.alive_symbols, 564, "alive symbols (6a)");
-    assert_eq!(m.evicts, 1413, "eviction_log.len (sum of §3)");
-    assert_eq!(m.preempts, 1189, "preempt_count (6d)");
+    assert_eq!(m.alive_symbols, 565, "alive symbols (6a)");
+    assert_eq!(m.evicts, 1514, "eviction_log.len (sum of §3)");
+    assert_eq!(m.preempts, 1291, "preempt_count (6d)");
     assert_eq!(m.cap_trims, 10, "cap_trim_count (6d)");
 
     // Floats to the sim_diag print precision.
     assert!(
-        (m.share_a_pos - 95.9).abs() < 0.1,
+        (m.share_a_pos - 96.6).abs() < 0.1,
         "share A>0 = {}",
         m.share_a_pos
     );
     assert!(
-        (m.mean_depth - 3371.852).abs() < 0.01,
+        (m.mean_depth - 3428.054).abs() < 0.01,
         "mean D = {}",
         m.mean_depth
     );
     assert!(
-        (m.mean_sigma - 0.0570).abs() < 1e-4,
+        (m.mean_sigma - 0.0543).abs() < 1e-4,
         "mean σ = {}",
         m.mean_sigma
     );
-    // Per-archetype floor durability (sim_diag §5): Reliable 2.30, Nomad 0.42, Hoarder 2.42.
+    // Per-archetype floor durability (sim_diag §5): Reliable 2.39, Nomad 0.62, Hoarder 2.83.
     assert!(
-        (m.durability[0] - 2.30).abs() < 0.01,
+        (m.durability[0] - 2.39).abs() < 0.01,
         "Reliable durability = {}",
         m.durability[0]
     );
     assert!(
-        (m.durability[3] - 0.42).abs() < 0.01,
+        (m.durability[3] - 0.62).abs() < 0.01,
         "Nomad durability = {}",
         m.durability[3]
     );
     assert!(
-        (m.durability[4] - 2.42).abs() < 0.01,
+        (m.durability[4] - 2.83).abs() < 0.01,
         "Hoarder durability = {}",
         m.durability[4]
     );
@@ -239,13 +245,14 @@ fn honest_v2_seed42_matches_sim_diag_anchor() {
 #[test]
 fn honest_v2_reliable_extraction_roi_is_near_balance_and_bounded() {
     // FACT (measured, not a wish): under served-matrix conservation the honest giver
-    // Reliable operates at BALANCED reciprocity — seed 42 ROI ≈ 1.0123, NOT below 1.
-    // (Universal "< 1 for all archetypes" is impossible: Σconsumed ≡ Σserved_out.) The
-    // invariant is BOUNDED extraction, so we lock the measured value and the 1.25 ceiling.
-    let (m, _fired, _r) = run_one_seed(&honest_v2(), 42);
+    // Reliable operates at BALANCED reciprocity — seed 42 ROI ≈ 1.015 (transche 0.3 kernel
+    // path; was 1.0123 pre-0.3), NOT below 1. (Universal "< 1 for all archetypes" is
+    // impossible: Σconsumed ≡ Σserved_out.) The invariant is BOUNDED extraction, so we lock
+    // the measured value and the 1.25 ceiling.
+    let (m, _fired, _r, _c) = run_one_seed(&honest_v2(), 42);
     let roi = m.extraction_roi[0];
     assert!(
-        (roi - 1.0123).abs() < 0.01,
+        (roi - 1.015).abs() < 0.01,
         "Reliable ROI (seed 42 fact) = {roi}"
     );
     assert!(
@@ -944,4 +951,184 @@ fn restore_u_in_bucket_is_nan_when_the_bucket_has_no_rows() {
         rt.restore_u_in_bucket(2).is_nan(),
         "bucket 2 (0.6,0.8) has no rows in this synthetic set"
     );
+}
+
+// ------------------------------------------------------------------
+// R̂-calibration Brier math (transche 0.3 judge) — synthetic invariants.
+// ------------------------------------------------------------------
+
+#[test]
+fn brier_is_zero_for_a_perfect_forecast() {
+    // A forecast that always calls the outcome exactly (0 when it dies, 1 when it lives)
+    // scores Brier 0, reliability 0, and resolution == uncertainty (perfect separation).
+    let mut c = Calibration::new();
+    for _ in 0..40 {
+        c.push(1.0, true, true);
+    }
+    for _ in 0..60 {
+        c.push(0.0, false, true);
+    }
+    let r = c.complete_report(DEFAULT_BRIER_BUCKETS).expect("non-empty");
+    assert!(
+        r.brier.abs() < 1e-12,
+        "perfect forecast ⇒ Brier 0, got {}",
+        r.brier
+    );
+    assert!(
+        r.reliability.abs() < 1e-12,
+        "perfect forecast ⇒ reliability 0, got {}",
+        r.reliability
+    );
+    // base rate 0.4 ⇒ uncertainty 0.24; a perfect forecast's resolution equals it.
+    assert!((r.base_rate - 0.4).abs() < 1e-12);
+    assert!((r.uncertainty - 0.24).abs() < 1e-12);
+    assert!(
+        (r.resolution - r.uncertainty).abs() < 1e-12,
+        "perfect forecast ⇒ resolution == uncertainty"
+    );
+    // Murphy identity holds exactly here (forecasts constant within their buckets).
+    assert!((r.brier - (r.reliability - r.resolution + r.uncertainty)).abs() < 1e-12);
+}
+
+#[test]
+fn brier_is_one_quarter_for_a_constant_half_forecast_on_a_coin() {
+    // A constant 0.5 forecast on a 50/50 world scores exactly 0.25, with zero reliability
+    // (0.5 IS the observed frequency) and zero resolution (one bucket, no discrimination).
+    let mut c = Calibration::new();
+    for i in 0..100 {
+        c.push(0.5, i % 2 == 0, true);
+    }
+    let r = c.complete_report(DEFAULT_BRIER_BUCKETS).expect("non-empty");
+    assert!(
+        (r.brier - 0.25).abs() < 1e-12,
+        "const 0.5 on a coin ⇒ 0.25, got {}",
+        r.brier
+    );
+    assert!(
+        r.reliability.abs() < 1e-12,
+        "0.5 == observed freq ⇒ reliability 0"
+    );
+    assert!(r.resolution.abs() < 1e-12, "single bucket ⇒ no resolution");
+    assert!((r.uncertainty - 0.25).abs() < 1e-12);
+    assert!((r.brier - (r.reliability - r.resolution + r.uncertainty)).abs() < 1e-12);
+}
+
+#[test]
+fn brier_report_is_none_for_an_empty_dataset() {
+    assert!(
+        Calibration::new()
+            .complete_report(DEFAULT_BRIER_BUCKETS)
+            .is_none()
+    );
+}
+
+#[test]
+fn brier_judge_excludes_incomplete_structural_zero_rows() {
+    // WARN-1: the judge (complete_report) scores ONLY floor_complete rows. Incomplete rows
+    // (structural-zero r_hat=0 vs a HIGH observed survival) are diagnosed separately and must
+    // NOT pollute the Brier. Here: 100 perfect complete rows (Brier 0) + 50 incomplete rows
+    // whose r̂=0 but survived (would wreck a naïve Brier) ⇒ the JUDGE still reads 0.
+    let mut c = Calibration::new();
+    for _ in 0..100 {
+        c.push(1.0, true, true); // complete, perfectly forecast
+    }
+    for _ in 0..50 {
+        c.push(0.0, true, false); // incomplete: structural zero, but the block survived
+    }
+    let judge = c
+        .complete_report(DEFAULT_BRIER_BUCKETS)
+        .expect("complete rows");
+    assert_eq!(judge.n, 100, "the judge scores only the complete rows");
+    assert!(
+        judge.brier.abs() < 1e-12,
+        "incomplete structural-zero rows must NOT enter the judge, got {}",
+        judge.brier
+    );
+    // The pooled (overall) Brier WOULD be badly polluted — proves the exclusion matters.
+    let overall = c.overall_report(DEFAULT_BRIER_BUCKETS).expect("rows");
+    assert!(
+        overall.brier > 0.3,
+        "the overall Brier is wrecked by the structural-zero rows ({}) — why WARN-1 gates them",
+        overall.brier
+    );
+    // The incomplete diagnostic captures them: n=50, share 1/3, f̄≈0, ō=1.
+    let inc = c.incomplete_summary().expect("incomplete rows");
+    assert_eq!(inc.n, 50);
+    assert!((inc.share_of_total - 50.0 / 150.0).abs() < 1e-12);
+    assert!(inc.mean_forecast.abs() < 1e-12, "structural-zero forecast");
+    assert!((inc.observed_freq - 1.0).abs() < 1e-12, "but they survived");
+}
+
+#[test]
+fn brier_buckets_partition_forecasts_at_the_right_edges() {
+    // 1.0 lands in the closed top bucket; the diagram sums back to the full N.
+    let mut c = Calibration::new();
+    c.push(0.0, false, true);
+    c.push(0.55, true, true);
+    c.push(1.0, true, true);
+    let r = c.complete_report(10).expect("non-empty");
+    let n: usize = r.buckets.iter().map(|b| b.n).sum();
+    assert_eq!(n, 3, "every prediction lands in exactly one bucket");
+    assert_eq!(
+        r.buckets[9].n, 1,
+        "forecast 1.0 ⇒ the closed top bucket [0.9,1.0]"
+    );
+    assert_eq!(r.buckets[0].n, 1, "forecast 0.0 ⇒ bucket [0.0,0.1)");
+    assert_eq!(r.buckets[5].n, 1, "forecast 0.55 ⇒ bucket [0.5,0.6)");
+}
+
+// ------------------------------------------------------------------
+// Anti-oracle: the R̂-calibration prediction log is WRITTEN but never READ by any
+// decision (enabling it leaves the world evolution bit-identical).
+// ------------------------------------------------------------------
+
+#[test]
+fn pred_log_is_written_when_enabled_and_never_alters_a_decision() {
+    use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
+
+    use crate::sim_dynamic::engine::step;
+
+    let params = DynParams::default();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+
+    // Two identical worlds (same seed); log ON in one, OFF in the other.
+    let mut on = build_world(40, &params, 7);
+    let mut off = build_world(40, &params, 7);
+    on.pred_log_enabled = true;
+    off.pred_log_enabled = false;
+
+    for _ in 0..40 {
+        step(&mut on, &params, &prior, &policy);
+        step(&mut off, &params, &prior, &policy);
+    }
+
+    // The prediction log records forecasts when enabled, none when disabled.
+    assert!(
+        !on.pred_log.is_empty(),
+        "the prediction log must be populated when enabled"
+    );
+    assert!(
+        off.pred_log.is_empty(),
+        "no prediction is logged when the channel is disabled"
+    );
+    // Every logged forecast is a probability.
+    assert!(
+        on.pred_log.iter().all(|e| (0.0..=1.0).contains(&e.r_hat)),
+        "logged R̂ must be a probability in [0,1]"
+    );
+
+    // The decision fingerprint (god-view metrics: alive symbols, share A>0, evicts,
+    // preempts, cap_trims, depth, σ, per-archetype durability + ROI) must be BIT-IDENTICAL:
+    // the metric channel feeds back into NO decision and consumes NO RNG.
+    let m_on = collect_metrics(&on, &params);
+    let m_off = collect_metrics(&off, &params);
+    assert!(
+        metrics_bit_eq(&m_on, &m_off),
+        "enabling the prediction log must not change ANY decision (bit-identical metrics)"
+    );
+    // And the ledger of drops/preempts matches exactly (a stronger structural check).
+    assert_eq!(on.eviction_log.len(), off.eviction_log.len());
+    assert_eq!(on.preempt_count, off.preempt_count);
+    assert_eq!(on.cap_trim_count, off.cap_trim_count);
 }

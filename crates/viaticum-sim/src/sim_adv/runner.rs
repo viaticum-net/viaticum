@@ -20,6 +20,7 @@ use rayon::prelude::*;
 use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
 
 use crate::generator::Rng;
+use crate::sim_adv::brier::Calibration;
 use crate::sim_adv::cli::{SimAdvError, apply_dial};
 use crate::sim_adv::metrics::{MetricSet, collect_metrics};
 use crate::sim_adv::restore::{RestoreTracker, RestoreTruth};
@@ -52,6 +53,11 @@ pub struct RunResult {
     /// Per-seed restore-truth (metric №1), seed-indexed. `None` for a seed with no
     /// Disaster event (e.g. `honest_v2`); `Some` for a DR scenario like `dr_baseline`.
     pub per_seed_restore: Vec<Option<RestoreTruth>>,
+    /// Per-seed R̂-calibration dataset (transche 0.3), seed-indexed. Every sim_adv seed
+    /// collects it (the runner enables the prediction log); possibly EMPTY for a run whose
+    /// predictions never reach their `H`-tick horizon (short horizon). The Brier judge reads
+    /// this — a GOD-VIEW metric channel, never a decision input.
+    pub per_seed_calibration: Vec<Calibration>,
 }
 
 /// Tick-indexed scripted-event queue.
@@ -173,17 +179,35 @@ fn apply_events(
 pub(crate) fn run_one_seed(
     scenario: &Scenario,
     seed: u64,
-) -> (MetricSet, Vec<FiredEvent>, Option<RestoreTruth>) {
+) -> (
+    MetricSet,
+    Vec<FiredEvent>,
+    Option<RestoreTruth>,
+    Calibration,
+) {
     let params = &scenario.world.base;
     let prior = SurfacePrior::default();
     let policy = PlacementPolicy::default();
 
     let mut world = build_world(scenario.world.n_nodes, params, seed);
+    // Transche 0.3: enable the god-view R̂-calibration prediction log for sim_adv runs (the
+    // engine now appends a forecast at each placement). This is a METRIC channel — it drives
+    // NO decision and consumes NO RNG, so the world evolution is bit-identical to the log-off
+    // (sim_diag / default) path; only `world.pred_log` is populated.
+    world.pred_log_enabled = true;
+    let horizon_h = params.pred_horizon_ticks;
+    let k_eff = params.k_eff;
+
     let queue = EventQueue::from_scenario(&scenario.events);
     let mut fired: Vec<FiredEvent> = Vec::new();
     let mut tracker = RestoreTracker::new(&scenario.world);
     // Victims to revive, keyed by their return tick (disaster_tick + 1).
     let mut revive_at: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    // R̂-calibration resolution: predictions are appended to `world.pred_log` in tick order,
+    // so their resolve ticks (`pred.tick + H`) are non-decreasing; a single cursor drains
+    // each as the world reaches its horizon and reads the realised outcome.
+    let mut calib = Calibration::new();
+    let mut resolve_cursor = 0usize;
 
     for t in 0..scenario.horizon {
         // (a) return any victim whose window starts this tick (present=true, empty disk).
@@ -203,8 +227,21 @@ pub(crate) fn run_one_seed(
         );
         // (c) observe the restore window before the tick advances the world.
         tracker.observe(&world, t);
-        // (d) advance one tick.
+        // (d) advance one tick (placements this tick append forecasts with `tick == t`).
         step(&mut world, params, &prior, &policy);
+
+        // (e) resolve any forecast whose horizon `H` is reached at the NEW `world.tick`
+        //     (= t+1): the realised outcome is "the block still has ≥ k_eff live symbols".
+        let now = world.tick;
+        while resolve_cursor < world.pred_log.len() {
+            let e = world.pred_log[resolve_cursor];
+            if e.tick + horizon_h > now {
+                break; // tick-ordered ⇒ nothing further is due yet
+            }
+            let outcome = block_live_symbols(&world, e.owner, e.block) >= k_eff;
+            calib.push(e.r_hat, outcome, e.floor_complete);
+            resolve_cursor += 1;
+        }
     }
 
     let restore = if tracker.is_active() {
@@ -212,13 +249,36 @@ pub(crate) fn run_one_seed(
     } else {
         None
     };
-    (collect_metrics(&world, params), fired, restore)
+    (collect_metrics(&world, params), fired, restore, calib)
+}
+
+/// God-view count of a block's live symbols (across PRESENT holders) — the R̂-calibration
+/// outcome reader (≥ `k_eff` ⇒ "the block survived to the horizon"). Evaluator-only: never
+/// fed back into a decision. The §7 spread keeps ≤ 1 symbol per holder per block, so this is
+/// the number of distinct live holders.
+fn block_live_symbols(world: &World, owner: usize, block: usize) -> usize {
+    world
+        .nodes
+        .iter()
+        .filter(|nd| nd.present)
+        .map(|nd| {
+            nd.holdings
+                .iter()
+                .filter(|s| s.alive && s.owner == owner && s.block == block)
+                .count()
+        })
+        .sum()
 }
 
 /// Run a scenario across `seeds`, fanning out over rayon. The collect preserves seed
 /// order, so the aggregated report is deterministic (spec §10 п.12).
 pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
-    let outcomes: Vec<(MetricSet, Vec<FiredEvent>, Option<RestoreTruth>)> = seeds
+    let outcomes: Vec<(
+        MetricSet,
+        Vec<FiredEvent>,
+        Option<RestoreTruth>,
+        Calibration,
+    )> = seeds
         .par_iter()
         .map(|&seed| run_one_seed(scenario, seed))
         .collect();
@@ -226,10 +286,12 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
     let mut per_seed = Vec::with_capacity(outcomes.len());
     let mut fired = Vec::with_capacity(outcomes.len());
     let mut per_seed_restore = Vec::with_capacity(outcomes.len());
-    for (m, f, r) in outcomes {
+    let mut per_seed_calibration = Vec::with_capacity(outcomes.len());
+    for (m, f, r, c) in outcomes {
         per_seed.push(m);
         fired.push(f);
         per_seed_restore.push(r);
+        per_seed_calibration.push(c);
     }
 
     RunResult {
@@ -238,6 +300,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed,
         fired,
         per_seed_restore,
+        per_seed_calibration,
     }
 }
 

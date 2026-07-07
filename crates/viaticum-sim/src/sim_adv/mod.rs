@@ -38,6 +38,7 @@
 #[cfg(test)]
 mod tests;
 
+pub mod brier;
 pub mod cli;
 pub mod metrics;
 pub mod registry;
@@ -47,6 +48,7 @@ pub mod runner;
 pub mod scenario;
 pub mod verdict;
 
+pub use brier::{BrierBucket, BrierReport, Calibration, DEFAULT_BRIER_BUCKETS, IncompleteSummary};
 pub use cli::{Cli, SimAdvError, Sweep, parse_cli};
 pub use metrics::MetricSet;
 pub use registry::{all_scenarios, find_scenario};
