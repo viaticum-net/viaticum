@@ -157,6 +157,9 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
         preempt_count: 0,
         cap_trim_count: 0,
         repair_stat: crate::sim_dynamic::generator::RepairStat::default(),
+        burn_ann_count: 0,
+        burn_silent_count: 0,
+        pending_silent_loss: Vec::new(),
     }
 }
 

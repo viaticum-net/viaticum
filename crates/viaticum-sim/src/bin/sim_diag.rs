@@ -683,6 +683,49 @@ fn print_section6(world: &World, params: &DynParams) {
         vdem_vals.len(),
         mean(&vdem_vals),
     );
+
+    // (6g) transche-4 diagnostic: A.2 burn events (announced/silent) + A.5 suspicion σ.
+    // The announced burns fire on live-holder drops (eviction/preemption); the silent
+    // burns fire one tick after a holder death (the churn silent-loss detection latency).
+    // σ jumps live on the (owner, DEPARTED-holder) cells, so it is ~0 over LIVE-symbol
+    // pairs — we also report σ over ALL touched pairs so the machinery is visible.
+    let mut sigma_live: Vec<f64> = Vec::new();
+    for h in 0..n {
+        if !world.nodes[h].present {
+            continue;
+        }
+        for s in world.nodes[h].holdings.iter().filter(|s| s.alive) {
+            sigma_live.push(world.capital[s.owner][h].sigma);
+        }
+    }
+    let mut sigma_pos = 0usize;
+    let mut sigma_sum_pos = 0.0;
+    let mut sigma_max = 0.0f64;
+    for row in &world.capital {
+        for c in row {
+            if c.sigma > 1e-12 {
+                sigma_pos += 1;
+                sigma_sum_pos += c.sigma;
+                sigma_max = sigma_max.max(c.sigma);
+            }
+        }
+    }
+    println!(
+        "  (6g) A.2 burn events: announced = {}   silent = {}   (announced=live-holder drop, silent=churn +1 tick)",
+        world.burn_ann_count, world.burn_silent_count
+    );
+    println!(
+        "       A.5 σ: mean over {} live-symbol pairs = {:.4}   |   {} pairs with σ>0 network-wide (mean {:.4}, max {:.4})",
+        sigma_live.len(),
+        mean(&sigma_live),
+        sigma_pos,
+        if sigma_pos > 0 {
+            sigma_sum_pos / sigma_pos as f64
+        } else {
+            0.0
+        },
+        sigma_max,
+    );
 }
 
 /// Section 7 (aggregate review §5.2): the correlated-holder-death "repair-storm" sweep.

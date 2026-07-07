@@ -71,13 +71,19 @@ pub fn observe_pair(cap: &PairCapital, h_node: &Node, dt: f64) -> FirstHandObs {
         pos_pass: pass,
         pos_fail,
         pos_timeout,
+        // C2FARM-3 (A.2): the owner-side drop counters feed retained_depth's drop_frac.
+        drop_ann: cap.drop_ann,
+        drop_silent: cap.drop_silent,
         observed_volume: OBSERVED_V0,
         observed_tau: OBSERVED_TAU0,
         addr_subnet: h_node.addr_subnet,
         addr_geo: 0,
         latency_ms: 10.0,
         reachable: h_node.present,
-        scrutiny: 0.0,
+        // A.5: the pair's live suspicion σ (finally a live field). NOTE: the kernel does
+        // NOT read `scrutiny` in any decision (grep-verified) — this is an HONEST INERT
+        // wiring in the sim; the σ→cadence/decoy-DR consumers are daemon-side.
+        scrutiny: cap.sigma,
         master_id: IdentityPub(master),
         device_id: DeviceId(device),
         // NOTE: nowhere to write archetype / true_* — anti-oracle by construction.
@@ -175,13 +181,17 @@ fn observe_pair_from_addr(cap: &PairCapital, addr: &ObsAddr, dt: f64) -> FirstHa
         pos_pass: pass,
         pos_fail,
         pos_timeout: 0,
+        // C2FARM-3 (A.2): owner-side drop counters → retained_depth drop_frac.
+        drop_ann: cap.drop_ann,
+        drop_silent: cap.drop_silent,
         observed_volume: OBSERVED_V0,
         observed_tau: OBSERVED_TAU0,
         addr_subnet: addr.addr_subnet,
         addr_geo: 0,
         latency_ms: 10.0,
         reachable: addr.present,
-        scrutiny: 0.0,
+        // A.5: live suspicion σ (inert in the sim — kernel reads no scrutiny; daemon-side).
+        scrutiny: cap.sigma,
         master_id: IdentityPub(master),
         device_id: DeviceId(device),
     }

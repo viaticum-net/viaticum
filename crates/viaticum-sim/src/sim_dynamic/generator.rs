@@ -325,6 +325,23 @@ pub struct PairCapital {
     /// Demonstrated scale ratchet for this pair (max proven retained per-symbol
     /// volume). Rises on a pass, does not leak fast.
     pub v_dem: f64,
+    /// `σ` (A.5): the owner-side SUSPICION state for this pair — a fast-forgetting
+    /// (`1/μ ≈ 2 weeks ≪ 1/λ`) charge that JUMPS by `j_σ` on a confirmed SILENT loss of
+    /// this owner's data (holder death/departure) and decays every tick (W2 sweep,
+    /// [`viaticum_core::four_r::update_suspicion`]). Read into `FirstHandObs::scrutiny`.
+    /// Default 0.0 — a fresh pair suspects no one.
+    pub sigma: f64,
+    /// C2FARM-3 (A.2): LEAKY count of ANNOUNCED drop events of this owner's data by this
+    /// holder (a live-holder PRESSURE eviction / preemption victim — the protocol sends a
+    /// DropNotice; a Р-7 cap-trim does NOT count, транше-4). Owner-side; read into
+    /// `FirstHandObs::drop_ann` → `retained_depth` drop_frac. Incremented `+= 1.0` per
+    /// event and DECAYED each tick by `1 − λ_drop·Δt` in the W2 sweep — "the system must
+    /// forgive" (Ilya 2026-07-07), one drop is not an eternal penalty. Default 0.0.
+    pub drop_ann: f64,
+    /// C2FARM-3 (A.2): LEAKY count of SILENT drop events of this owner's data by this
+    /// holder (holder death/departure — detected next tick, no notice). Owner-side; read
+    /// into `FirstHandObs::drop_silent`; same `λ_drop` decay as `drop_ann`. Default 0.0.
+    pub drop_silent: f64,
     /// Ring of recent PoS outcomes (true = pass) over the window — the P-projection
     /// `recent_rate_p` is the pass-fraction here.
     pub pos_window: Vec<bool>,
@@ -338,6 +355,9 @@ impl Default for PairCapital {
             depth_ho: 0.0,
             g_oh_prev: 0.0,
             v_dem: 0.0,
+            sigma: 0.0,
+            drop_ann: 0.0,
+            drop_silent: 0.0,
             pos_window: Vec::new(),
         }
     }
@@ -563,6 +583,33 @@ pub struct World {
     /// gated), which the correlated-holder-death sweep compares against bandwidth.
     /// Inert for the other experiments (they never read it).
     pub repair_stat: RepairStat,
+    /// A.2 (транше 4) diagnostic: cumulative count of ANNOUNCED burn events applied — one
+    /// per live-holder drop of an owner's symbol (eviction / preemption victim). God-view
+    /// tally, never a kernel input.
+    pub burn_ann_count: usize,
+    /// A.2 (транше 4) diagnostic: cumulative count of SILENT burn events applied — one per
+    /// (owner, departed-holder) confirmed silent loss (holder churn), applied on the NEXT
+    /// tick (PoS-detection latency). God-view tally.
+    pub burn_silent_count: usize,
+    /// A.2 (транше 4): silent-loss events QUEUED by `churn` at tick T and applied at the
+    /// start of tick T+1's capital pass (the "detected on the next PoS round" latency).
+    /// Each is an owner whose data a now-departed holder silently lost. Drained every tick.
+    pub pending_silent_loss: Vec<SilentLoss>,
+}
+
+/// A.2 (транше 4): one confirmed SILENT loss to apply next tick — the owner `O` whose
+/// symbols the now-departed holder `h` lost, with the volume lost. Queued by `churn`
+/// (tick T) and consumed by `pos_and_capital` (tick T+1) so the silent burn + σ jump
+/// land on the "next PoS round" as the model's detection latency prescribes.
+#[derive(Debug, Clone, Copy)]
+pub struct SilentLoss {
+    /// The owner whose data was silently lost.
+    pub owner: usize,
+    /// The departed holder that lost it.
+    pub holder: usize,
+    /// Volume (gb) of the owner's symbols lost = V_lost = V_held (a total loss, all of
+    /// this owner's alive symbols on the holder died at departure).
+    pub volume: f64,
 }
 
 /// Per-tick repair activity the engine records during placement (repair-storm §7).

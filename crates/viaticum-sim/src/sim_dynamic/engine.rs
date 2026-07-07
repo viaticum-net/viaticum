@@ -21,15 +21,15 @@
 //! kernel function — it uses them only to drive BEHAVIOUR.
 
 use viaticum_core::four_r::{
-    BlockReq, DepthParams, Hysteresis, NodeLocal, PlacementPolicy, RetentionCap, RetentionPrior,
-    SurfacePrior, capital_steady_state, estimate_surface, eviction_order, kappa_key,
-    retained_depth, update_depth, update_v_dem,
+    BlockReq, BurnParams, DepthParams, Hysteresis, NodeLocal, PlacementPolicy, RetentionCap,
+    RetentionPrior, SurfacePrior, apply_burn, capital_steady_state, estimate_surface,
+    eviction_order, kappa_key, retained_depth, update_depth, update_suspicion, update_v_dem,
 };
 
 use crate::generator::Rng;
 use crate::sim_dynamic::generator::{
     BlockPlacement, DAYS_PER_TICK, EvictionEvent, HeldSymbol, Node, OwnBlock, PairCapital,
-    RepairStat, World, online,
+    RepairStat, SilentLoss, World, online,
 };
 use crate::sim_dynamic::observer::{self, ObsAddr};
 
@@ -70,6 +70,32 @@ pub struct DynParams {
     /// **OPEN calibration guess (spec 3b): `2.0` = 2 symbols' worth** — flagged for
     /// review, NOT a settled canon value.
     pub v_free_symbols: f64,
+    /// A.2 (транше 4 / §13): the WEAK announced-drop burn fraction `b_ann`. §13-OPEN
+    /// default `0.05` (`b_ann ≪ b_max`). Feeds [`BurnParams`].
+    pub burn_b_ann: f64,
+    /// A.2 (транше 4 / §13): the STRONG silent-loss burn fraction `b_max`. §13 default
+    /// **1.0** (confirmed by Ilya 2026-07-07 — a fully silent total loss zeroes the
+    /// owner's reliability capital for that holder).
+    pub burn_b_max: f64,
+    /// A.2 (транше 4 / §13): repair latency `τ_rep` in DAYS for the head-start
+    /// forgiveness axis. Default `2·DAYS_PER_TICK = 14` (≈ 2 ticks of repair latency).
+    /// In the sim ALL evictions are instantaneous (no advance DropNotice), so the caller
+    /// always passes `t_n = 0` and this dial does not change sim behaviour — it is
+    /// transcribed for the daemon (where an advance DropNotice carries a real head-start).
+    pub burn_tau_rep: f64,
+    /// A.5 (транше 4 / §13): suspicion forget rate `μ` (per day). Default `1/14`
+    /// (`τ_σ ≈ 2 weeks ≪ τ_g = 60 d`: suspicion is forgotten fast). Feeds
+    /// [`update_suspicion`] in the W2 sweep.
+    pub sigma_mu: f64,
+    /// A.5 (транше 4 / §13): suspicion jump amplitude `j_σ` on a confirmed silent defect.
+    /// Default `0.5`. A lone PoS-timeout jumps only `j_σ/5` (weak, транше-4 fix).
+    pub sigma_j: f64,
+    /// A.2/A.7 (транше-4 fix / §13): decay rate `λ_drop` (per day) of the owner-side
+    /// `drop_ann`/`drop_silent` retention counters — "the system must forgive" (Ilya
+    /// 2026-07-07). Default `1/56` (τ ≈ 8 weeks ≈ the PoS-window scale of 8 ticks): a
+    /// single drop fades out of the retention forecast rather than being an eternal penalty
+    /// under windowed PoS counters (WARN-1 review т4). OPEN calibration, flagged for Ilya.
+    pub lambda_drop: f64,
     /// Per-symbol erasure count `n` for own-data blocks.
     pub n_symbols: usize,
     /// Reconstruction threshold `k_eff`.
@@ -175,6 +201,14 @@ impl Default for DynParams {
             // OPEN calibration guess (spec 3b) — "first backup of a newcomer survives".
             c_recip_days: 30.0,
             v_free_symbols: 2.0,
+            // A.2 / A.5 (транше 4 / §13): §13 defaults (b_max confirmed 1.0 by Ilya
+            // 2026-07-07; the rest are OPEN calibration guesses flagged for Ilya).
+            burn_b_ann: 0.05,
+            burn_b_max: 1.0, // silent total loss zeroes the reliability capital (§13)
+            burn_tau_rep: 2.0 * DAYS_PER_TICK, // ≈ 2 ticks repair latency (sim t_n always 0)
+            sigma_mu: 1.0 / 14.0, // τ_σ ≈ 2 weeks ≪ τ_g = 60 d
+            sigma_j: 0.5,
+            lambda_drop: 1.0 / 56.0, // τ ≈ 8 weeks ≈ PoS-window scale ("system forgives")
             n_symbols: 5,
             k_eff: 2,
             r_target: 0.90,
@@ -263,6 +297,55 @@ fn retention_cap(params: &DynParams, v_per_symbol: f64) -> RetentionCap {
         v_free: params.v_free_symbols * v_per_symbol,
         c_recip: params.c_recip_days,
     }
+}
+
+/// The A.2 burn params (транше 4 / §13): announced ≪ silent, τ_rep = repair latency.
+fn burn_params_of(params: &DynParams) -> BurnParams {
+    BurnParams {
+        b_ann: params.burn_b_ann,
+        b_max: params.burn_b_max,
+        tau_rep: params.burn_tau_rep,
+    }
+}
+
+/// Volume (gb) of `owner`'s ALIVE symbols currently on `holder` — the burn's `V_held`
+/// (the base the lost fraction `V_lost/V_held` is measured against). Computed BEFORE the
+/// lost symbol is marked dead, so it includes the symbol about to be lost.
+fn owner_alive_volume_on(world: &World, owner: usize, holder: usize) -> f64 {
+    world.nodes[holder]
+        .holdings
+        .iter()
+        .filter(|s| s.alive && s.owner == owner)
+        .map(|s| s.volume)
+        .sum()
+}
+
+/// A.2 ANNOUNCED burn: a LIVE holder dropped `owner`'s symbol (eviction / preemption
+/// victim) — the protocol sends a DropNotice, so from the owner's seat this is an
+/// ANNOUNCED loss with head-start `t_n = 0` in the sim (evictions are instantaneous).
+/// Burns the owner-side reliability capital `g_oh` = `G(O←h)` (the owner's record of the
+/// holder's service TO IT — the reliability evidence, decision_model §1), bumps the
+/// `drop_ann` retention-forecast counter (C2FARM-3), and tallies the event.
+///
+/// **Direction (traced, not guessed — 3a discipline):** the write is to
+/// `capital[owner][holder].g_oh`, the cell that accumulates "this HOLDER served this
+/// OWNER" (`observer::observe_pair` reads it into `g_owner_from_holder`). This is the
+/// reliability capital A.2 burns, NOT the reciprocal `g_ho` (the owner's own service).
+/// `v_held` is `owner`'s alive volume on `holder` BEFORE the drop; `v_lost` is the
+/// dropped symbol's volume.
+fn apply_announced_burn(
+    world: &mut World,
+    owner: usize,
+    holder: usize,
+    v_lost: f64,
+    params: &DynParams,
+) {
+    let v_held = owner_alive_volume_on(world, owner, holder);
+    let p = burn_params_of(params);
+    let cell = &mut world.capital[owner][holder];
+    cell.g_oh = apply_burn(cell.g_oh, &p, true, 0.0, v_lost, v_held);
+    cell.drop_ann += 1.0; // leaky counter (decayed in the W2 sweep by λ_drop)
+    world.burn_ann_count += 1;
 }
 
 /// Per-symbol volume (gb) for the default block: `block_volume / n_symbols`.
@@ -355,6 +438,8 @@ pub fn step(world: &mut World, params: &DynParams, prior: &SurfacePrior, policy:
     assert_lambda_dt_stable(params.lambda_slow, DAYS_PER_TICK);
     // The A.3 demonstrated-scale ratchet leak `λ_dem` (slowest of the three).
     assert_lambda_dt_stable(params.lambda_dem, DAYS_PER_TICK);
+    // The A.2/A.7 drop-counter forgiveness leak `λ_drop` obeys the SAME stability guard.
+    assert_lambda_dt_stable(params.lambda_drop, DAYS_PER_TICK);
     let _ = policy; // kept on the API for symmetry; the sim always spreads by addr_subnet
     let tick = world.tick;
 
@@ -780,6 +865,10 @@ fn admit_offer(
     if world.nodes[holder].free_disk() + v_vol < v_per_symbol {
         return false; // swap would not actually free enough room
     }
+    // A.2 ANNOUNCED burn (transche 4): the preemption victim is a live-holder drop of
+    // `vo`'s symbol — burn `vo`'s reliability capital g_oh BEFORE marking it dead (V_held
+    // includes it). Same announced treatment as a pressure/cap eviction.
+    apply_announced_burn(world, vo, holder, v_vol, params);
     // Evict the victim (φ-neutral swap): mark dead, log, drop the owner's placement. The
     // logged `g_ho_at_drop` is the victim's BARE g_ho (diagnostic continuity §2c — the
     // rank now uses κ_O, but the drop-reciprocity metric still reads the raw g_ho).
@@ -899,6 +988,42 @@ fn pos_and_capital(world: &mut World, params: &DynParams) {
             // demonstrated scale fades over `τ_dem ≈ 1 year` — no fossil scale survives
             // forever; a confirmed pass re-snaps it up in the challenge loop below.
             cell.v_dem = update_v_dem(cell.v_dem, 0.0, dt, params.lambda_dem);
+            // A.5 W2 sweep: decay suspicion `σ` on EVERY pair (defect = false). Fast
+            // forgetting (`1/μ ≈ 2 weeks`) — a σ jump from a past silent loss fades in
+            // weeks. A confirmed silent loss re-jumps it in the pending-loss pass below
+            // (dt = 0 there, so the two compose to exactly σ(1−μΔt) + j_σ per tick).
+            cell.sigma = update_suspicion(cell.sigma, false, dt, params.sigma_mu, params.sigma_j);
+            // A.2/A.7 W2 sweep (транше-4 fix): decay the LEAKY drop counters `drop_ann`/
+            // `drop_silent` on EVERY pair — "the system must forgive" (Ilya 2026-07-07).
+            // A drop's retention penalty fades over `1/λ_drop ≈ 8 weeks` rather than being
+            // eternal under windowed PoS; new drops re-add `+1.0` in the burn paths.
+            let drop_decay = (1.0 - params.lambda_drop * dt).max(0.0);
+            cell.drop_ann *= drop_decay;
+            cell.drop_silent *= drop_decay;
+        }
+    }
+
+    // A.2 (транше 4): apply SILENT losses queued last tick by `churn` — "detected on the
+    // next PoS round". A holder departed with this owner's symbols; from the owner's seat
+    // it is a confirmed SILENT loss (b_max) with no head-start. Applied AFTER the decay
+    // sweep so the burn lands on the decayed g_oh and the σ jump (dt = 0) sits on top of
+    // this tick's decayed σ — composing to A.5's σ(1−μΔt) + j_σ. Drains the queue.
+    if !world.pending_silent_loss.is_empty() {
+        let bp = burn_params_of(params);
+        let pending = std::mem::take(&mut world.pending_silent_loss);
+        for ev in pending {
+            let SilentLoss {
+                owner,
+                holder,
+                volume,
+            } = ev;
+            let cell = &mut world.capital[owner][holder];
+            // Silent: announced = false ⇒ b_max, t_n = 0. A total loss (V_lost = V_held).
+            cell.g_oh = apply_burn(cell.g_oh, &bp, false, 0.0, volume, volume);
+            cell.drop_silent += 1.0; // leaky counter (decayed in the W2 sweep by λ_drop)
+            // σ jump (pure, dt = 0 — the sweep already decayed σ this tick).
+            cell.sigma = update_suspicion(cell.sigma, true, 0.0, params.sigma_mu, params.sigma_j);
+            world.burn_silent_count += 1;
         }
     }
 
@@ -934,9 +1059,18 @@ fn pos_and_capital(world: &mut World, params: &DynParams) {
         }
     }
 
+    // A.5 (транше-4 fix): pairs whose holder TIMED OUT this tick (holder offline). Each
+    // gets ONE weak σ jump `j_σ/5` below — per PAIR, not per symbol (a holder with 3 of an
+    // owner's symbols is one timeout event, not three). BTreeSet ⇒ deterministic.
+    let mut timed_out_pairs: std::collections::BTreeSet<(usize, usize)> =
+        std::collections::BTreeSet::new();
+
     for c in &challenges {
         // §9.4 one physics: pass ⟺ online (the symbol is alive by construction).
         let passed = c.holder_online;
+        if !passed {
+            timed_out_pairs.insert((c.owner, c.holder));
+        }
         // On a pass, ADD the A.1 accumulation `+V_conf·Δt` (the decay is already applied
         // above); a timeout adds nothing (v_conf = 0), leaving only the decay.
         let accrual = if passed { c.volume * dt } else { 0.0 };
@@ -970,6 +1104,20 @@ fn pos_and_capital(world: &mut World, params: &DynParams) {
         if passed && world.first_earned_g[c.holder].is_none() {
             world.first_earned_g[c.holder] = Some(tick);
         }
+    }
+
+    // A.5 (транше-4 fix, Ilya 2026-07-07): a lone PoS-timeout raises σ WEAKLY by `j_σ/5`
+    // (the escalation ladder — timeout → challenge more often → confirm/clear faster; a
+    // false timeout is cheap since σ forgets in ~2 weeks). ONE jump per (owner, holder)
+    // pair per tick (the dedup set above), NOT per symbol. `dt = 0` here — the per-pair σ
+    // decay was already applied in the W2 sweep — so this composes to A.5's
+    // `σ(1−μΔt) + (j_σ/5)` exactly. A CONFIRMED silent defect (holder death) still jumps
+    // the FULL `j_σ` in the pending-loss pass above; a departed holder runs no challenge,
+    // so the two σ paths never touch the same pair in the same tick.
+    let j_timeout = params.sigma_j / 5.0;
+    for (owner, holder) in timed_out_pairs {
+        let cell = &mut world.capital[owner][holder];
+        cell.sigma = update_suspicion(cell.sigma, true, 0.0, params.sigma_mu, j_timeout);
     }
 }
 
@@ -1077,19 +1225,22 @@ fn run_eviction(world: &mut World, params: &DynParams) {
 
         // Р-7 cap_drops FIRST, UNCONDITIONALLY (tariff enforcement — NOT gated on the
         // φ-target; the excess above V_ret leaves regardless of how much room it frees).
+        // burn = FALSE (транше-4 fix): a cap-trim is a predictable tariff, not a
+        // reliability signal — it does NOT burn g_oh nor bump drop_ann.
         for (owner_idx, block) in cap_targets {
-            if evict_symbol(world, holder, owner_idx, block, tick) {
+            if evict_symbol(world, holder, owner_idx, block, tick, params, false) {
                 any_eviction_this_tick = true;
                 world.cap_trim_count += 1;
             }
         }
 
-        // THEN the pressure drops, stopping once φ has recovered to s_target.
+        // THEN the pressure drops, stopping once φ has recovered to s_target. burn = TRUE:
+        // a squeeze drop IS a reliability signal (burns g_oh + bumps drop_ann).
         for (owner_idx, block) in pressure_targets {
             if world.nodes[holder].phi_free_ratio() >= params.hyst.s_target {
                 break;
             }
-            if evict_symbol(world, holder, owner_idx, block, tick) {
+            if evict_symbol(world, holder, owner_idx, block, tick, params, true) {
                 any_eviction_this_tick = true;
             }
         }
@@ -1099,18 +1250,43 @@ fn run_eviction(world: &mut World, params: &DynParams) {
     }
 }
 
-/// Kill one alive symbol `(owner, block)` on `holder` (god-view): mark it dead, log the
-/// [`EvictionEvent`] with the victim's BARE `g_ho` (`g_ho_at_drop` — diagnostic
-/// continuity §2c), and drop the owner's placement bookkeeping. Returns whether a symbol
-/// was actually killed (it may already be dead if resolved-then-superseded). Shared by
-/// the Р-7 cap trims and the pressure drops so both apply identically.
+/// Kill one alive symbol `(owner, block)` on `holder` (god-view): OPTIONALLY apply the A.2
+/// ANNOUNCED burn (a live-holder drop, транше 4), mark it dead, log the [`EvictionEvent`]
+/// with the victim's BARE `g_ho` (`g_ho_at_drop` — diagnostic continuity §2c), and drop the
+/// owner's placement bookkeeping. Returns whether a symbol was actually killed (it may
+/// already be dead if resolved-then-superseded). Shared by the Р-7 cap trims and the
+/// pressure drops.
+///
+/// `burn` (транше-4 fix, Ilya 2026-07-07 / review WARN-2 т4): a PRESSURE drop passes
+/// `true` (a real squeeze signal → burn `g_oh` + bump `drop_ann`); a Р-7 cap-trim passes
+/// `false` — a mandatory tariff enforcement the OWNER can predict (it knows its own
+/// `V_ret`), NOT a reliability signal, so it must NOT punish the holder's capital nor stain
+/// the retention forecast. Punishing the holder for the owner's over-placement would
+/// corrupt the signal.
 fn evict_symbol(
     world: &mut World,
     holder: usize,
     owner_idx: usize,
     block: usize,
     tick: u64,
+    params: &DynParams,
+    burn: bool,
 ) -> bool {
+    // Locate the target symbol's volume BEFORE any mutation (confirms it is still alive).
+    let v_lost = match world.nodes[holder]
+        .holdings
+        .iter()
+        .find(|s| s.alive && s.owner == owner_idx && s.block == block)
+    {
+        Some(s) => s.volume,
+        None => return false, // already dead / superseded this tick
+    };
+    // A.2 ANNOUNCED burn (transche 4) on the owner's reliability capital g_oh, computed
+    // with V_held INCLUDING the symbol about to die (it is still alive here) — but ONLY for
+    // a PRESSURE drop; a cap-trim (burn = false) is tariff enforcement, not a burn/drop.
+    if burn {
+        apply_announced_burn(world, owner_idx, holder, v_lost, params);
+    }
     let g_ho_at_drop = world.capital[owner_idx][holder].g_ho;
     let killed = if let Some(hs) = world.nodes[holder]
         .holdings
@@ -1207,6 +1383,27 @@ fn churn(world: &mut World, params: &DynParams) {
         let p = params.churn_out_prob * (1.0 + CHURN_AGGRESSION_SCALE * aggression);
         if rng.unit() < p {
             world.nodes[node].present = false;
+            // A.2 (транше 4): the departing node is a HOLDER — every owner whose data it
+            // carried suffers a SILENT loss, detected on the owner's NEXT PoS round (next
+            // tick). Queue one event per PRESENT distinct owner, V_lost = V_held = all of
+            // that owner's alive symbols here (a total loss). Deterministic (storage order).
+            let mut per_owner: Vec<(usize, f64)> = Vec::new();
+            for hs in world.nodes[node].holdings.iter().filter(|s| s.alive) {
+                if !world.nodes[hs.owner].present {
+                    continue; // a departed owner cannot detect the loss (dead pair)
+                }
+                match per_owner.iter_mut().find(|(o, _)| *o == hs.owner) {
+                    Some(e) => e.1 += hs.volume,
+                    None => per_owner.push((hs.owner, hs.volume)),
+                }
+            }
+            for (owner, volume) in per_owner {
+                world.pending_silent_loss.push(SilentLoss {
+                    owner,
+                    holder: node,
+                    volume,
+                });
+            }
             for hs in world.nodes[node].holdings.iter_mut() {
                 hs.alive = false;
             }
@@ -1305,6 +1502,11 @@ pub fn admit_offer_for_test(
 #[cfg(test)]
 pub fn pos_and_capital_for_test(world: &mut World, params: &DynParams) {
     pos_and_capital(world, params);
+}
+
+#[cfg(test)]
+pub fn churn_for_test(world: &mut World, params: &DynParams) {
+    churn(world, params);
 }
 
 #[cfg(test)]

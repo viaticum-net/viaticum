@@ -55,6 +55,8 @@ pub fn observe(h: &SimR1Holder) -> FirstHandObs {
         pos_pass: pass,
         pos_fail: fail,
         pos_timeout: 0,
+        drop_ann: 0.0,
+        drop_silent: 0.0,
         observed_volume: 10.0,
         observed_tau: 30.0,
         addr_subnet: h.subnet,

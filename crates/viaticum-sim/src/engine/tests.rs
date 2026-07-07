@@ -18,6 +18,8 @@ fn obs(g_holder_from_owner: f64, tau: f64) -> OwnerEvictionView {
         pos_pass: 0,
         pos_fail: 0,
         pos_timeout: 0,
+        drop_ann: 0.0,
+        drop_silent: 0.0,
         observed_volume: 0.0,
         observed_tau: tau,
         addr_subnet: 0,

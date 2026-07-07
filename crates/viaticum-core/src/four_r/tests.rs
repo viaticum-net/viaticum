@@ -15,6 +15,8 @@ fn obs_with(g_holder_from_owner: f64, tau: f64) -> FirstHandObs {
         pos_pass: 0,
         pos_fail: 0,
         pos_timeout: 0,
+        drop_ann: 0.0,
+        drop_silent: 0.0,
         observed_volume: 0.0,
         observed_tau: tau,
         addr_subnet: 0,
@@ -1261,6 +1263,8 @@ fn obs_observed_at(v0: f64, tau0: f64, pass: u32, fail: u32) -> FirstHandObs {
         pos_pass: pass,
         pos_fail: fail,
         pos_timeout: 0,
+        drop_ann: 0.0,
+        drop_silent: 0.0,
         observed_volume: v0,
         observed_tau: tau0,
         addr_subnet: 0,
@@ -1465,6 +1469,8 @@ fn holder(master: u8, subnet: u32, v0: f64, tau0: f64) -> FirstHandObs {
         pos_pass: 50,
         pos_fail: 0,
         pos_timeout: 0,
+        drop_ann: 0.0,
+        drop_silent: 0.0,
         observed_volume: v0,
         observed_tau: tau0,
         addr_subnet: subnet,
@@ -2122,6 +2128,8 @@ fn holder_with_standing(
         pos_pass: pass,
         pos_fail: fail,
         pos_timeout: timeout,
+        drop_ann: 0.0,
+        drop_silent: 0.0,
         observed_volume: 10.0,
         observed_tau: 30.0,
         addr_subnet: subnet,
@@ -2812,4 +2820,202 @@ fn place_cream_empty_when_no_want_or_no_candidates() {
     assert!(place_cream(&r, &cands, &prior, &policy, &[0], 0).is_empty());
     // No candidates ⇒ empty (never a panic).
     assert!(place_cream(&r, &[], &prior, &policy, &[], 5).is_empty());
+}
+
+// ============================================================
+// A.2 — burn (impulse on confirmed loss) + A.5 — suspicion σ + C2FARM-3 drop_frac.
+// ============================================================
+
+/// The transche-4 §13 burn defaults (b_ann ≪ b_max, τ_rep = repair latency). t4-fix:
+/// b_max = 1.0 (§13 confirmed by Ilya 2026-07-07 — a silent total loss zeroes the capital).
+fn burn_params() -> BurnParams {
+    BurnParams {
+        b_ann: 0.05,
+        b_max: 1.0,
+        tau_rep: 14.0,
+    }
+}
+
+#[test]
+fn burn_silent_loss_burns_at_b_max() {
+    // Silent (announced=false, t_n=0): g ← g·(1 − b_max·V_lost/V_held).
+    let p = burn_params();
+    let g = apply_burn(100.0, &p, false, 0.0, 10.0, 20.0);
+    // t4-fix: factor = 1 − 1.0·(10/20) = 0.5 (b_max=1.0).
+    assert!(
+        (g - 50.0).abs() < 1e-9,
+        "silent half-loss burns at b_max: expected 50.0, got {g}"
+    );
+}
+
+#[test]
+fn burn_announced_with_full_headstart_is_zero() {
+    // Announced with t_n ≥ τ_rep ⇒ the owner had time to repair ⇒ ZERO burn (M5).
+    let p = burn_params();
+    let at = apply_burn(100.0, &p, true, 14.0, 20.0, 20.0); // t_n = τ_rep exactly
+    let over = apply_burn(100.0, &p, true, 100.0, 20.0, 20.0); // t_n > τ_rep
+    assert!((at - 100.0).abs() < 1e-12, "t_n=τ_rep ⇒ no burn: {at}");
+    assert!((over - 100.0).abs() < 1e-12, "t_n>τ_rep ⇒ no burn: {over}");
+}
+
+#[test]
+fn burn_announced_without_headstart_is_weak_not_zero() {
+    // Announced with NO head-start (t_n=0) still burns the WEAK b_ann — not zero, and
+    // strictly far smaller than the silent b_max burn.
+    let p = burn_params();
+    let ann = apply_burn(100.0, &p, true, 0.0, 20.0, 20.0); // 1 − 0.05 = 0.95
+    let sil = apply_burn(100.0, &p, false, 0.0, 20.0, 20.0); // t4-fix: 1 − 1.0 = 0.0
+    assert!(
+        (ann - 95.0).abs() < 1e-9,
+        "announced-no-headstart = weak b_ann: {ann}"
+    );
+    assert!(ann < 100.0, "announced-no-headstart still burns (not zero)");
+    let ann_burn = 100.0 - ann;
+    let sil_burn = 100.0 - sil;
+    assert!(
+        ann_burn < 0.5 * sil_burn,
+        "announced burn ≪ silent burn: ann={ann_burn} sil={sil_burn}"
+    );
+}
+
+#[test]
+fn burn_scales_with_lost_fraction() {
+    // V_lost/V_held sets the depth of the burn; V_lost = V_held ⇒ the FULL b.
+    let p = burn_params();
+    // t4-fix (b_max=1.0): full loss ⇒ factor 0 ⇒ capital zeroed; half ⇒ factor 0.5.
+    let full = apply_burn(100.0, &p, false, 0.0, 20.0, 20.0); // frac 1 → 1−1.0 = 0.0
+    let half = apply_burn(100.0, &p, false, 0.0, 10.0, 20.0); // frac 0.5 → 1−0.5 = 0.5
+    let none = apply_burn(100.0, &p, false, 0.0, 0.0, 20.0); // frac 0 → unchanged
+    assert!(
+        (full - 0.0).abs() < 1e-9,
+        "full loss ⇒ full b_max zeroes g: {full}"
+    );
+    assert!((half - 50.0).abs() < 1e-9, "half loss ⇒ half b_max: {half}");
+    assert!((none - 100.0).abs() < 1e-12, "no loss ⇒ no burn: {none}");
+}
+
+#[test]
+fn burn_guards_degenerate_inputs() {
+    let p = burn_params();
+    // V_held ≤ 0 ⇒ nothing held ⇒ g unchanged (no divide-by-zero).
+    assert!((apply_burn(50.0, &p, false, 0.0, 10.0, 0.0) - 50.0).abs() < 1e-12);
+    assert!((apply_burn(50.0, &p, false, 0.0, 10.0, -5.0) - 50.0).abs() < 1e-12);
+    // V_lost clamped to [0, V_held]: over-large ⇒ full b (t4-fix: b_max=1.0 ⇒ g→0),
+    // negative ⇒ no burn.
+    assert!((apply_burn(100.0, &p, false, 0.0, 999.0, 20.0) - 0.0).abs() < 1e-9);
+    assert!((apply_burn(100.0, &p, false, 0.0, -3.0, 20.0) - 100.0).abs() < 1e-12);
+    // τ_rep ≤ 0 ⇒ head-start axis neutralised (factor 1, max penalty) even with big t_n.
+    let pz = BurnParams { tau_rep: 0.0, ..p };
+    let g = apply_burn(100.0, &pz, true, 1000.0, 20.0, 20.0); // 1 − 0.05 = 0.95
+    assert!(
+        (g - 95.0).abs() < 1e-9,
+        "τ_rep≤0 ⇒ full head-start penalty: {g}"
+    );
+    // b clamps to ≤1 so the result never goes negative.
+    let pbig = BurnParams {
+        b_ann: 5.0,
+        b_max: 5.0,
+        tau_rep: 14.0,
+    };
+    let g2 = apply_burn(100.0, &pbig, false, 0.0, 20.0, 20.0);
+    assert!(
+        (0.0..=1e-12).contains(&g2.abs()),
+        "result floored at 0: {g2}"
+    );
+}
+
+#[test]
+fn honesty_always_pays_burn_ordering() {
+    // Property-style (decision_model B-1): for ANY t_n < τ_rep, all else equal, an
+    // ANNOUNCED drop burns STRICTLY less than a SILENT one — honesty always pays.
+    let p = burn_params();
+    let g0 = 100.0;
+    for &t_n in &[0.0, 3.0, 7.0, 13.0, 13.99] {
+        let ann_burn = g0 - apply_burn(g0, &p, true, t_n, 20.0, 20.0);
+        let sil_burn = g0 - apply_burn(g0, &p, false, t_n, 20.0, 20.0);
+        assert!(
+            ann_burn < sil_burn,
+            "announced burn strictly < silent at t_n={t_n}: ann={ann_burn} sil={sil_burn}"
+        );
+        assert!(ann_burn >= 0.0 && sil_burn > 0.0);
+    }
+}
+
+#[test]
+fn suspicion_jumps_on_defect_and_forgets_fast() {
+    let mu = 1.0 / 14.0; // τ_σ ≈ 2 weeks
+    let j = 0.5;
+    let dt = 7.0; // one weekly tick
+    // Pure jump (dt=0) from a clean pair: σ rises by exactly j_σ.
+    let jumped = update_suspicion(0.0, true, 0.0, mu, j);
+    assert!((jumped - 0.5).abs() < 1e-12, "defect jump = j_σ: {jumped}");
+    // A defect during a decay tick adds j on top of the decayed value:
+    //   0.3·(1 − 7/14) + 0.5 = 0.15 + 0.5 = 0.65.
+    let mid = update_suspicion(0.3, true, dt, mu, j);
+    assert!((mid - 0.65).abs() < 1e-9, "decay-then-jump: {mid}");
+    // Forgets fast: after ~3/μ (≈ 42 days ≈ 6 weekly ticks) of clean service σ ≪ j.
+    let mut s = jumped;
+    for _ in 0..6 {
+        s = update_suspicion(s, false, dt, mu, j);
+    }
+    assert!(s < 0.1 * j, "σ forgets within ~3/μ of clean service: {s}");
+    // μ ≫ λ: suspicion time-constant (14 d) is far SHORTER than the capital memory (60 d).
+    let lambda = 1.0 / 60.0;
+    assert!(
+        mu > lambda,
+        "fast forgetting requires μ ≫ λ: μ={mu} λ={lambda}"
+    );
+    // Guard: a degenerate μ·dt > 1 cannot drive σ negative.
+    assert!(update_suspicion(0.4, false, 100.0, mu, j) >= 0.0);
+}
+
+#[test]
+fn pos_cadence_scales_with_sigma() {
+    // A.5 consumer: challenge cadence = r_0·(1 + σ).
+    assert!((pos_cadence(2.0, 0.0) - 2.0).abs() < 1e-12);
+    assert!((pos_cadence(2.0, 0.5) - 3.0).abs() < 1e-12);
+    assert!((pos_cadence(2.0, 1.0) - 4.0).abs() < 1e-12);
+    assert!(
+        pos_cadence(2.0, 3.0) > pos_cadence(2.0, 1.0),
+        "cadence rises monotonically with σ"
+    );
+    // Guards: negatives floored.
+    assert!((pos_cadence(-1.0, 0.5) - 0.0).abs() < 1e-12);
+    assert!((pos_cadence(2.0, -1.0) - 2.0).abs() < 1e-12);
+}
+
+#[test]
+fn retained_depth_counts_announced_drops_in_drop_frac() {
+    // C2FARM-3: an announced drop is a POLITE drop that barely burns the capital (b_ann)
+    // but STILL counts in the retention forecast — even with a spotless PoS record it
+    // lowers φ_O (reputation-retention sees the polite drops).
+    let r = RetentionPrior::default();
+    let clean = holder_with_standing(0, 0, 20.0, 8, 0, 0); // deep standing, clean PoS, 0 drops
+    let phi_clean = retained_depth(&clean, &r);
+    let dropped = FirstHandObs {
+        drop_ann: 3.0,
+        ..clean.clone()
+    };
+    let phi_dropped = retained_depth(&dropped, &r);
+    assert!(
+        phi_dropped < phi_clean,
+        "announced drops lower retained depth despite a clean PoS record: dropped={phi_dropped} clean={phi_clean}"
+    );
+    // Silent drops weigh the SAME in drop_frac.
+    let dropped_s = FirstHandObs {
+        drop_silent: 3.0,
+        ..clean.clone()
+    };
+    let phi_dropped_s = retained_depth(&dropped_s, &r);
+    assert!(
+        (phi_dropped - phi_dropped_s).abs() < 1e-12,
+        "announced and silent drops weigh equally in drop_frac"
+    );
+    // Bit-neutral: default-0 counters leave φ_O exactly as the pre-C2FARM-3 read.
+    let zeroed = FirstHandObs {
+        drop_ann: 0.0,
+        drop_silent: 0.0,
+        ..clean.clone()
+    };
+    assert_eq!(retained_depth(&zeroed, &r).to_bits(), phi_clean.to_bits());
 }

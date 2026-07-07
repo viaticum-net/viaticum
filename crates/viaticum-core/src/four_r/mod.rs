@@ -61,6 +61,22 @@ pub struct FirstHandObs {
     pub pos_fail: u32,
     /// PoS rounds that TIMED OUT (no response within window).
     pub pos_timeout: u32,
+    /// C2FARM-3 (A.2): DECAYING count of ANNOUNCED drop events by this peer of MY data — a
+    /// signed `DropNotice` arrived, or I observed the polite drop first-hand. Each is an
+    /// "observation of unreliability" that feeds the retention forecast ([`retained_depth`]
+    /// `drop_frac`) EVEN THOUGH the announced burn on the capital is weak (`b_ann`): a
+    /// reputation-retention read must see even the polite drops. **Leaky, not a raw tally
+    /// (транше-4 fix, Ilya 2026-07-07):** the owner-side counter FADES with `λ_drop`
+    /// (τ ≈ PoS-window scale) — "the system must forgive": one drop is not an eternal
+    /// retention penalty under windowed PoS. Incremented `+= 1.0` per event. Default 0.0
+    /// (bit-neutral for every pre-C2FARM-3 caller).
+    pub drop_ann: f64,
+    /// C2FARM-3 (A.2): DECAYING count of SILENT drop events by this peer of MY data — I
+    /// detected the loss myself (a symbol vanished, PoS-confirmed) with no `DropNotice`.
+    /// Feeds `drop_frac` alongside `drop_ann`, and FADES with the same `λ_drop`
+    /// (транше-4 fix). The silent burn on the capital is strong (`b_max`); this counter is
+    /// the retention-forecast channel. Default 0.0.
+    pub drop_silent: f64,
     /// `V0`: the single observed volume point — the only `(V,τ)` slice I ever
     /// sampled this holder at (B1: one point per holder).
     pub observed_volume: f64,
@@ -344,6 +360,146 @@ pub fn kappa_key(g_ho: f64, depth: f64, p: &DepthParams) -> f64 {
         1.0
     };
     g_ho + w_d * sat * g_star
+}
+
+// ============================================================
+// A.2 — burn: impulse to the holder-reliability capital on CONFIRMED loss.
+// A.5 — suspicion σ: fast-forgetting pair state with two consumers.
+// ============================================================
+
+/// Calibration for the A.2 burn (decision_model A.2 / §13). Carried by the caller
+/// (node policy), like [`DepthParams`]. **§13 defaults**: `b_ann = 0.05` (announced),
+/// `b_max = 1.0` (silent, confirmed by Ilya 2026-07-07) with `b_ann ≪ b_max` — honesty is
+/// always cheaper; `tau_rep` = the repair latency (days).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BurnParams {
+    /// `b_ann`: the WEAK burn fraction for any SIGNED `DropNotice` (announced). `b_ann ≪
+    /// b_max`. Clamped to [0,1]. §13 default 0.05.
+    pub b_ann: f64,
+    /// `b_max`: the STRONG burn fraction for a SILENT loss (detected via PoS, no notice).
+    /// Clamped to [0,1]. §13 default **1.0** (confirmed by Ilya 2026-07-07 — a fully silent
+    /// total loss zeroes the reliability capital).
+    pub b_max: f64,
+    /// `τ_rep`: the repair latency (DAYS). An announced drop with head-start `t_n ≥ τ_rep`
+    /// gives the owner enough warning to repair before the actual loss ⇒ ZERO burn
+    /// (the M5 forgiveness continuum). `τ_rep ≤ 0` ⇒ the head-start axis is neutralised
+    /// (factor 1, MAXIMUM penalty on that axis — documented degenerate guard).
+    pub tau_rep: f64,
+}
+
+/// A.2: impulse **burn** on a CONFIRMED loss of held data (decision_model A.2, canon
+/// §6/§7). One multiplicative step on the holder-reliability capital `g`
+/// (`G(O←h)` — the owner's record of the holder's service to it):
+///
+/// ```text
+/// g ← g·(1 − b·(1 − min(1, t_n/τ_rep))·V_lost/V_held)
+/// b = b_ann  (any signed DropNotice — announced)
+///   = b_max  (silent, detected via PoS)          with b_ann ≪ b_max
+/// ```
+///
+/// **Two axes, both load-bearing** (audit B-1):
+/// * **announcedness** — a SILENT loss (`announced = false`) burns at the strong `b_max`;
+///   ANY signed announcement (`announced = true`) burns at the weak `b_ann`. Honesty is
+///   always cheaper (the ordering invariant below), even without a head-start.
+/// * **head-start `t_n`** (`DropNotice → actual drop`, M5 continuum) — an announced drop
+///   with `t_n ≥ τ_rep` gives the owner time to repair ⇒ ZERO burn; announce-without-
+///   head-start (`t_n = 0`) still burns the WEAK `b_ann` (not zero). A silent loss has
+///   `t_n = 0` by construction (the caller passes 0; this fn does not check).
+///
+/// **Ordering invariant (honesty always pays).** For any `t_n < τ_rep` and `V_lost > 0`,
+/// `burn(announced) < burn(silent)` STRICTLY (`b_ann·headstart ≤ b_ann < b_max`), so a
+/// node is never worse off announcing a drop than hiding it.
+///
+/// **Deadband is the CALLER's responsibility (documented).** A single timeout NEVER
+/// burns — burn fires only on a CONFIRMED loss (a repeated fail / a symbol that actually
+/// vanished). A lone timeout instead raises suspicion σ ([`update_suspicion`]); this fn
+/// is only ever called once the loss is confirmed. (Model question RESOLVED by Ilya
+/// 2026-07-07, decision_model A.2/A.5: a lone PoS-timeout raises σ WEAKLY by `j_σ/5` —
+/// the escalation ladder "timeout → challenge more often → confirm/clear faster"; a
+/// CONFIRMED silent defect raises σ by the full `j_σ`. Burn stays timeout-immune.)
+///
+/// Guards: `V_held ≤ 0` ⇒ `g` unchanged (nothing was held to lose); `V_lost` is clamped
+/// to `[0, V_held]`; `b` to `[0,1]`; `t_n` floored at 0; `τ_rep ≤ 0` ⇒ head-start factor
+/// 1; the result is floored at 0.
+pub fn apply_burn(
+    g: f64,
+    p: &BurnParams,
+    announced: bool,
+    t_n_days: f64,
+    v_lost: f64,
+    v_held: f64,
+) -> f64 {
+    if v_held <= 0.0 {
+        return g; // nothing held ⇒ nothing to burn
+    }
+    let v_lost = v_lost.clamp(0.0, v_held);
+    let b = (if announced { p.b_ann } else { p.b_max }).clamp(0.0, 1.0);
+    let t_n = t_n_days.max(0.0);
+    // Head-start forgiveness: full warning (t_n ≥ τ_rep) ⇒ factor 0 ⇒ no burn; no warning
+    // (t_n = 0) ⇒ factor 1 ⇒ the full b. τ_rep ≤ 0 ⇒ factor 1 (max penalty on this axis).
+    let headstart = if p.tau_rep > 0.0 {
+        1.0 - (t_n / p.tau_rep).min(1.0)
+    } else {
+        1.0
+    };
+    let factor = 1.0 - b * headstart * (v_lost / v_held);
+    (g * factor).max(0.0)
+}
+
+/// A.5: one step of the **suspicion** `σ` dynamics (decision_model A.5, canon §10.2 /
+/// §9.14д):
+///
+/// ```text
+/// σ ← σ(1 − μΔt) + j_σ·1{silent defection / hostage} + (j_σ/5)·1{PoS-timeout}
+/// ```
+///
+/// σ is a fast-forgetting pair state — `1/μ ≪ 1/λ` (the capital memory), so suspicion
+/// fades in ~weeks while capital remembers ~months. It jumps by the passed `j_sigma` on a
+/// detected defect, then decays back. The two consumers are the PoS cadence
+/// [`pos_cadence`] and the daemon-side decoy-DR frequency `r_dr·(1+σ)` (NOT coded here —
+/// the sim has no DR actuator; see the transche-4 spec).
+///
+/// **Two jump amplitudes (транше-4, Ilya 2026-07-07).** A CONFIRMED silent defect (or a
+/// first-hand hostage pattern) jumps by the FULL `j_σ`; a lone PoS-timeout (holder
+/// offline) jumps WEAKLY by `j_σ/5` — the caller passes the smaller amplitude as
+/// `j_sigma`. The escalation ladder "timeout → challenge more often → confirm/clear
+/// faster" makes a false timeout cheap (σ forgets in ~2 weeks); at most ONE timeout jump
+/// per pair per tick (the caller dedups, not this fn).
+///
+/// **Composing decay and jump like the sibling ratchets.** Call with `defect = false`,
+/// `dt = Δt` in the per-tick sweep (the decay for EVERY pair), and with `defect = true`,
+/// `dt = 0` at the moment a loss/timeout is detected (a PURE jump `+j_sigma`, no extra
+/// decay) — the two compose to exactly `σ(1−μΔt) + j_sigma` per tick, one decay per tick.
+///
+/// **Hostage-pattern is a CALLER policy (documented).** The `defect` flag is a boolean:
+/// the DETECTION of a silent defect or a hostage pattern ("dropped all my low-ι, kept
+/// only high-ι") is the caller's job; this fn only applies the consequence. The sim does
+/// not implement the hostage detector (no such actuator) — it raises σ only on a
+/// confirmed silent holder loss.
+///
+/// Guards (mirroring [`update_depth`]): `σ` and `μ`/`dt`/`j_σ` are floored at 0; the
+/// decayed term is floored at 0 so a degenerate `μ·dt > 1` cannot drive σ negative (no
+/// assert in the kernel — the caller owns the tick).
+pub fn update_suspicion(sigma: f64, defect: bool, dt_days: f64, mu: f64, j_sigma: f64) -> f64 {
+    let sigma = sigma.max(0.0);
+    let mu = mu.max(0.0);
+    let dt = dt_days.max(0.0);
+    let decayed = (sigma * (1.0 - mu * dt)).max(0.0);
+    if defect {
+        decayed + j_sigma.max(0.0)
+    } else {
+        decayed
+    }
+}
+
+/// A.5 consumer: the **PoS challenge cadence** scales up with suspicion,
+/// `cadence = r_0·(1 + σ)` — a suspected holder is challenged more often. `r_0` and `σ`
+/// are floored at 0. (The second A.5 consumer, the decoy-DR frequency `r_dr·(1+σ)`, is
+/// daemon-side and NOT transcribed here — the sim has no DR actuator, decision_model
+/// A.5. In the sim PoS already runs every tick, so this cadence read is INERT there; it
+/// is transcribed for the daemon.)
+pub fn pos_cadence(r_0: f64, sigma: f64) -> f64 {
+    r_0.max(0.0) * (1.0 + sigma.max(0.0))
 }
 
 // ============================================================
@@ -1641,10 +1797,12 @@ fn sigmoid(x: f64) -> f64 {
 ///   holder, bilaterally observable and UNFAKEABLE by the holder). A deeply-served
 ///   partner is kept generously (`φ_O → 1`: the holder retains my whole ladder).
 /// * `pressure` rises with the fraction of MY PoS rounds with this holder that
-///   FAILED or TIMED OUT (`drop_frac = (fail+timeout)/(pass+fail+timeout)`) — my
-///   own first-hand evidence the holder is dropping my symbols / is squeezed. High
-///   observed drops ⇒ `φ_O → 0` (only the very top of my ladder is modeled to
-///   survive).
+///   FAILED or TIMED OUT **plus the announced/silent DROP events** (C2FARM-3 / A.2):
+///   `drop_frac = (fail+timeout+drop_ann+drop_silent) /
+///   (pass+fail+timeout+drop_ann+drop_silent)` — my own first-hand evidence the holder
+///   is dropping my symbols / is squeezed. Announced (polite) drops barely burn the
+///   capital (`b_ann`) but STILL enter this forecast. High observed drops ⇒ `φ_O → 0`
+///   (only the very top of my ladder is modeled to survive).
 /// * `depth_conservatism` is a pessimistic offset that biases `φ_O` DOWN: when in
 ///   doubt, model the holder as retaining LESS of my ladder. Over-estimating
 ///   retention is the dangerous (optimistic) direction — it would forecast a symbol
@@ -1670,12 +1828,15 @@ pub fn retained_depth(obs: &FirstHandObs, retention: &RetentionPrior) -> f64 {
     };
     let standing = retention.standing_scale.max(0.0) * standing_sat;
 
-    let n = (obs.pos_pass + obs.pos_fail + obs.pos_timeout) as f64;
-    let drop_frac = if n > 0.0 {
-        (obs.pos_fail + obs.pos_timeout) as f64 / n
-    } else {
-        0.0
-    };
+    // C2FARM-3 (A.2): each announced/silent DROP event is an OBSERVATION of unreliability
+    // in the retention forecast — it counts in drop_frac ALONGSIDE the PoS fail/timeouts,
+    // even the polite (announced) drops that barely burn the capital (b_ann). The drop
+    // counters are LEAKY f64 (транше-4: they fade with λ_drop so one drop is not an eternal
+    // penalty), hence added as f64 to the u32 PoS tallies. Default-0.0 counters leave every
+    // pre-C2FARM-3 obs bit-identical.
+    let drops = (obs.pos_fail + obs.pos_timeout) as f64 + obs.drop_ann + obs.drop_silent;
+    let n = (obs.pos_pass + obs.pos_fail + obs.pos_timeout) as f64 + obs.drop_ann + obs.drop_silent;
+    let drop_frac = if n > 0.0 { drops / n } else { 0.0 };
     let pressure = retention.pressure_scale.max(0.0) * drop_frac;
     let conservatism = retention.depth_conservatism.max(0.0);
 

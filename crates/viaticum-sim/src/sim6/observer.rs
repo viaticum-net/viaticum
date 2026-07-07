@@ -32,6 +32,8 @@ pub fn observe(h: &Sim6Holder) -> FirstHandObs {
         pos_pass: 50,
         pos_fail: 0,
         pos_timeout: 0,
+        drop_ann: 0.0,
+        drop_silent: 0.0,
         observed_volume: 10.0,
         observed_tau: 30.0,
         // The single observable that distinguishes the farm: its subnet. The geo

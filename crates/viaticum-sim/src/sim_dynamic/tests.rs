@@ -12,8 +12,9 @@ use viaticum_core::four_r::{
 
 use crate::sim_dynamic::engine::{
     DynParams, PosOutcome, admit_offer_for_test, alive_block_counts_for_test,
-    assert_lambda_dt_stable, block_mature_for_test, fresh_capital, place_reciprocal_for_test,
-    run_eviction_for_test, step, symbols_per_tick_for_test,
+    assert_lambda_dt_stable, block_mature_for_test, churn_for_test, fresh_capital,
+    place_reciprocal_for_test, pos_and_capital_for_test, run_eviction_for_test, step,
+    symbols_per_tick_for_test,
 };
 use crate::sim_dynamic::evaluator::{
     contention_metric, drop_ranking_metric, mc_block_r_actual, pillar1_metric,
@@ -64,6 +65,9 @@ fn cap_with_history() -> PairCapital {
         depth_ho: 0.0,
         g_oh_prev: 10.0,
         v_dem: 10.0,
+        sigma: 0.0,
+        drop_ann: 0.0,
+        drop_silent: 0.0,
         pos_window: Vec::new(),
     };
     // 6 passes, 2 non-passes.
@@ -2358,4 +2362,350 @@ fn per_node_upload_budget_is_floor_u_over_v_symbol() {
         ..DynParams::default()
     };
     assert_eq!(per_node_upload_budget(&inf), usize::MAX);
+}
+
+// ============================================================
+// Транш 4 — A.2 burn (announced/silent) + A.5 suspicion σ.
+// ============================================================
+
+#[test]
+fn announced_eviction_burns_weakly_and_increments_drop_ann() {
+    // A live-holder eviction under disk pressure is an ANNOUNCED drop (protocol sends a
+    // DropNotice): it burns the owner's reliability capital g_oh WEAKLY (b_ann) and bumps
+    // the announced-drop counter (C2FARM-3) — NOT the strong b_max reserved for silent loss.
+    let params = DynParams::default();
+    let holder = 1usize;
+    let owner = 2usize;
+    let v = params.block_volume / params.n_symbols as f64;
+    let mut world = mk_clean_world(&params, 5);
+    world.nodes[holder].holdings.push(HeldSymbol {
+        owner,
+        block: 0,
+        iota: 0.5,
+        volume: v,
+        alive: true,
+        cream: false,
+    });
+    // Reliability capital to burn; κ_O = 0 (g_ho=0) ⇒ V_ret = V_free ≥ parked ⇒ the drop
+    // comes from the PRESSURE path, not a Р-7 cap trim.
+    world.capital[owner][holder].g_oh = 100.0;
+    world.capital[owner][holder].g_ho = 0.0;
+    // Fill the holder's disk so φ < s_hard ⇒ eviction fires.
+    world.nodes[holder].disk.own_data = world.nodes[holder].disk_cap * 0.95;
+    assert!(
+        world.nodes[holder].phi_free_ratio() < params.hyst.s_hard,
+        "precondition: holder under disk pressure"
+    );
+
+    run_eviction_for_test(&mut world, &params);
+
+    assert!(
+        !world.nodes[holder]
+            .holdings
+            .iter()
+            .any(|s| s.alive && s.owner == owner),
+        "the owner's symbol was evicted under pressure"
+    );
+    let cell = &world.capital[owner][holder];
+    // t4-fix: drop counters are leaky f64 (no decay here — run_eviction has no sweep).
+    assert!(
+        (cell.drop_ann - 1.0).abs() < 1e-12,
+        "announced drop counted (C2FARM-3): {}",
+        cell.drop_ann
+    );
+    assert!(
+        cell.drop_silent.abs() < 1e-12,
+        "an eviction is NOT a silent loss: {}",
+        cell.drop_silent
+    );
+    assert_eq!(world.burn_ann_count, 1);
+    assert_eq!(world.burn_silent_count, 0);
+    // Announced burn is WEAK: g_oh ← g_oh·(1 − b_ann) with V_lost = V_held (whole symbol).
+    let expected = 100.0 * (1.0 - params.burn_b_ann);
+    assert!(
+        (cell.g_oh - expected).abs() < 1e-6,
+        "weak announced burn: got {} want {}",
+        cell.g_oh,
+        expected
+    );
+    // Sanity: it kept ≫ half the capital (t4-fix: would be 0 under the silent b_max=1.0).
+    assert!(
+        cell.g_oh > 90.0,
+        "announced burn ≪ silent: {} must stay near 95, not near 0",
+        cell.g_oh
+    );
+}
+
+#[test]
+fn holder_death_burns_at_b_max_and_raises_sigma() {
+    // A holder DEATH (churn) with an owner's symbols is a SILENT loss: it is DETECTED on
+    // the owner's next PoS round (next tick), then burns g_oh STRONGLY (b_max), bumps the
+    // silent-drop counter, AND jumps suspicion σ.
+    let params = DynParams::default();
+    let holder = 1usize;
+    let owner = 2usize;
+    let v = params.block_volume / params.n_symbols as f64;
+    let mut world = mk_clean_world(&params, 3);
+    world.nodes[holder].holdings.push(HeldSymbol {
+        owner,
+        block: 0,
+        iota: 0.5,
+        volume: v,
+        alive: true,
+        cream: false,
+    });
+    world.capital[owner][holder].g_oh = 100.0;
+
+    // Force the churn: p ≥ 1 departs every present node, processed in index order — so the
+    // owner (idx 2) is still present when the holder (idx 1) departs, and the silent loss
+    // is queued for (owner 2, holder 1). No burn yet — it is detected NEXT tick.
+    let churn_params = DynParams {
+        churn_out_prob: 2.0,
+        ..params
+    };
+    churn_for_test(&mut world, &churn_params);
+    assert!(!world.nodes[holder].present, "holder departed");
+    assert_eq!(world.pending_silent_loss.len(), 1, "one silent loss queued");
+    assert_eq!(
+        world.burn_silent_count, 0,
+        "silent loss not applied at departure — detected next tick"
+    );
+
+    // Next PoS round: the capital pass applies the burn + σ jump + drop_silent.
+    world.tick += 1;
+    pos_and_capital_for_test(&mut world, &params);
+
+    let cell = &world.capital[owner][holder];
+    // t4-fix: leaky f64 counters. The sweep decays drop_silent (0→0) then the pending pass
+    // adds +1.0 in the SAME tick, so it is exactly 1.0 here.
+    assert!(
+        (cell.drop_silent - 1.0).abs() < 1e-12,
+        "silent drop counted (C2FARM-3): {}",
+        cell.drop_silent
+    );
+    assert!(
+        cell.drop_ann.abs() < 1e-12,
+        "a death is NOT an announced drop: {}",
+        cell.drop_ann
+    );
+    assert_eq!(world.burn_silent_count, 1);
+    assert!(world.pending_silent_loss.is_empty(), "queue drained");
+    // σ jumped by the FULL j_σ (the sweep decays 0→0, then the dt=0 defect jump adds j_σ) —
+    // a confirmed silent defect, NOT the weak j_σ/5 timeout jump.
+    assert!(
+        (cell.sigma - params.sigma_j).abs() < 1e-9,
+        "σ jumped by j_σ on the silent defect: {}",
+        cell.sigma
+    );
+    // t4-fix (b_max=1.0): a full silent loss ZEROES the capital on top of the once-per-tick
+    // decay: 100·decay·(1 − 1.0) = 0.
+    let decay = 1.0 - params.lambda * DAYS_PER_TICK;
+    let expected = 100.0 * decay * (1.0 - params.burn_b_max);
+    assert!(
+        (cell.g_oh - expected).abs() < 1e-6 && expected.abs() < 1e-12,
+        "silent burn at b_max=1.0 zeroes g_oh: got {} want {}",
+        cell.g_oh,
+        expected
+    );
+}
+
+#[test]
+fn sigma_fades_within_weeks_of_clean_service() {
+    // A.5 W2 sweep: after a σ jump, a run of clean service (no defect) forgets it fast —
+    // within ~3/μ ≈ 42 days ≈ 6 weekly ticks σ ≪ its jump value (1/μ ≪ 1/λ).
+    let params = DynParams::default();
+    let mut world = mk_clean_world(&params, 11);
+    world.capital[2][1].sigma = 0.5;
+    let initial = world.capital[2][1].sigma;
+    for _ in 0..6 {
+        pos_and_capital_for_test(&mut world, &params);
+    }
+    let faded = world.capital[2][1].sigma;
+    assert!(
+        faded < 0.1 * initial,
+        "σ forgets within weeks of clean service: {faded} (from {initial})"
+    );
+    assert!(
+        faded > 0.0,
+        "σ is still decaying continuously, not clamped to 0 prematurely"
+    );
+}
+
+#[test]
+fn drop_counters_decay_toward_forgiveness() {
+    // A.2/A.7 транше-4 fix (Ilya 2026-07-07): the owner-side drop counters are LEAKY —
+    // "the system must forgive". After ~4/λ_drop of clean service (no NEW drops) a past
+    // drop's retention penalty has faded to near zero, not an eternal stain under the
+    // windowed PoS counters (WARN-1 review т4).
+    let params = DynParams::default();
+    let mut world = mk_clean_world(&params, 21);
+    // Seed a drop history on the (owner 2, holder 1) pair.
+    world.capital[2][1].drop_ann = 5.0;
+    world.capital[2][1].drop_silent = 3.0;
+    let initial = world.capital[2][1].drop_ann + world.capital[2][1].drop_silent;
+    // ~4 time-constants of clean ticks: 4/λ_drop days ⇒ 4·56/7 = 32 weekly ticks. The W2
+    // sweep decays the counters each tick (no holdings ⇒ no new drops).
+    let ticks = (4.0 / params.lambda_drop / DAYS_PER_TICK).ceil() as usize;
+    for _ in 0..ticks {
+        pos_and_capital_for_test(&mut world, &params);
+    }
+    let faded = world.capital[2][1].drop_ann + world.capital[2][1].drop_silent;
+    assert!(
+        faded < 0.05 * initial,
+        "drop counters fade toward forgiveness over ~4/λ_drop: {faded} (from {initial})"
+    );
+    assert!(
+        faded > 0.0,
+        "leaky decay, not a premature hard-clear to 0: {faded}"
+    );
+}
+
+#[test]
+fn cap_trim_does_not_burn_or_count_as_drop() {
+    // Fix 2 (Ilya 2026-07-07 / review WARN-2 т4): a Р-7 cap-trim is TARIFF enforcement the
+    // owner can predict (it knows its own V_ret) — it must NOT burn the holder's reliability
+    // capital nor stain the retention forecast. A PRESSURE drop (a real squeeze) still does
+    // BOTH — the control alongside it.
+    let params = DynParams::default();
+    let v = params.block_volume / params.n_symbols as f64; // 10 gb
+    let mut world = mk_clean_world(&params, 5);
+
+    // --- CAP-TRIM path. Whale owner 2 piles 6 symbols on holder 1 with an ε-give (g_ho=0.5)
+    //     ⇒ V_ret = V_free floor (2 symbols) ⇒ the Р-7 cap trims the 4 excess symbols. Disk
+    //     sized so that AFTER the cap-trim φ ≥ s_target ⇒ NO pressure drop follows.
+    let cap_holder = 1usize;
+    let whale = 2usize;
+    world.nodes[cap_holder].disk_cap = 200.0;
+    world.nodes[cap_holder].disk.own_data = 130.0; // φ_before = 0.05 (<s_hard); φ_after = 0.25
+    for b in 0..6 {
+        world.nodes[cap_holder].holdings.push(HeldSymbol {
+            owner: whale,
+            block: b,
+            iota: (b + 1) as f64, // ascending ι ⇒ lowest-ι trimmed first
+            volume: v,
+            alive: true,
+            cream: false,
+        });
+    }
+    world.capital[whale][cap_holder].g_ho = 0.5; // ε-give ⇒ V_ret ≈ 20 gb (2 symbols)
+    world.capital[whale][cap_holder].g_oh = 100.0; // reliability capital that must SURVIVE
+    assert!(
+        world.nodes[cap_holder].phi_free_ratio() < params.hyst.s_hard,
+        "precondition: cap_holder is evicting"
+    );
+
+    // --- PRESSURE path (control). Stranger owner 4 parks 1 symbol on a FULL holder 3
+    //     (κ_O=0). No cap-trim (parked ≤ V_free), but the squeeze forces a pressure drop.
+    let press_holder = 3usize;
+    let stranger = 4usize;
+    world.nodes[press_holder].holdings.push(HeldSymbol {
+        owner: stranger,
+        block: 0,
+        iota: 0.5,
+        volume: v,
+        alive: true,
+        cream: false,
+    });
+    world.capital[stranger][press_holder].g_ho = 0.0;
+    world.capital[stranger][press_holder].g_oh = 100.0; // must be BURNED
+    world.nodes[press_holder].disk.own_data = world.nodes[press_holder].disk_cap * 0.95;
+    assert!(
+        world.nodes[press_holder].phi_free_ratio() < params.hyst.s_hard,
+        "precondition: press_holder is evicting"
+    );
+
+    run_eviction_for_test(&mut world, &params);
+
+    // CAP-TRIM fired (excess trimmed) but did NOT burn / count.
+    assert!(
+        world.cap_trim_count >= 4,
+        "the Р-7 cap trimmed the whale's 4 excess symbols: {}",
+        world.cap_trim_count
+    );
+    let cap_cell = &world.capital[whale][cap_holder];
+    assert!(
+        (cap_cell.g_oh - 100.0).abs() < 1e-9,
+        "cap-trim did NOT burn the holder's reliability capital: {}",
+        cap_cell.g_oh
+    );
+    assert!(
+        cap_cell.drop_ann.abs() < 1e-12,
+        "cap-trim did NOT count as a drop: {}",
+        cap_cell.drop_ann
+    );
+
+    // PRESSURE drop (control): burned AND counted.
+    assert!(
+        !world.nodes[press_holder]
+            .holdings
+            .iter()
+            .any(|s| s.alive && s.owner == stranger),
+        "the stranger's symbol was pressure-dropped"
+    );
+    let press_cell = &world.capital[stranger][press_holder];
+    let expected_press = 100.0 * (1.0 - params.burn_b_ann);
+    assert!(
+        (press_cell.g_oh - expected_press).abs() < 1e-6,
+        "pressure drop BURNED the capital (weak b_ann): {}",
+        press_cell.g_oh
+    );
+    assert!(
+        (press_cell.drop_ann - 1.0).abs() < 1e-12,
+        "pressure drop counted as ONE drop: {}",
+        press_cell.drop_ann
+    );
+    // The god-view burn tally reflects ONLY the pressure drop — the 4 cap-trims are exempt.
+    assert_eq!(
+        world.burn_ann_count, 1,
+        "only the pressure drop burned; the cap-trims did not"
+    );
+}
+
+#[test]
+fn timeout_bumps_sigma_weakly_once_per_pair_tick() {
+    // A.5 транше-4 fix (Ilya 2026-07-07): a lone PoS-timeout (holder offline) raises σ
+    // WEAKLY by j_σ/5 — and ONCE per (owner, holder) pair per tick, NOT once per symbol.
+    let params = DynParams::default();
+    let holder = 1usize;
+    let owner = 2usize;
+    let v = params.block_volume / params.n_symbols as f64;
+    let mut world = mk_clean_world(&params, 7);
+    // Make the holder deterministically OFFLINE this tick: a Nomad (0.5 uptime) is offline
+    // on ~half of ticks — find one for this holder's id/seed.
+    world.nodes[holder].archetype = Archetype::Nomad;
+    let hid = world.nodes[holder].id;
+    let offline_tick = (0u64..2000)
+        .find(|&t| !online(Archetype::Nomad, hid, t, world.seed))
+        .expect("a Nomad holder is offline on some tick");
+    world.tick = offline_tick;
+    // THREE symbols of the SAME owner on this holder — the σ bump must fire ONCE, not thrice.
+    for block in 0..3 {
+        world.nodes[holder].holdings.push(HeldSymbol {
+            owner,
+            block,
+            iota: 0.5,
+            volume: v,
+            alive: true,
+            cream: false,
+        });
+    }
+
+    pos_and_capital_for_test(&mut world, &params);
+
+    // One WEAK jump: σ = j_σ/5 (the sweep decays 0→0, then a single dt=0 j/5 timeout bump).
+    let expected = params.sigma_j / 5.0;
+    let sigma = world.capital[owner][holder].sigma;
+    assert!(
+        (sigma - expected).abs() < 1e-9,
+        "timeout bumps σ once by j/5 (not per-symbol): got {sigma} want {expected}"
+    );
+    // NOT 3× (per-symbol would be 0.3) and NOT the full j_σ (a confirmed defect, 0.5).
+    assert!(
+        sigma < params.sigma_j,
+        "timeout jump is WEAK (< full j_σ): {sigma}"
+    );
+    assert!(
+        (sigma - 3.0 * expected).abs() > 1e-9,
+        "NOT multiplied by the 3 symbols: {sigma}"
+    );
 }
