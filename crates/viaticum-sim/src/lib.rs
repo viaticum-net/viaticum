@@ -55,6 +55,17 @@
 //!   convergence (earned-G gap + Spearman ρ), reciprocity on god-view served
 //!   volumes, DR sanity, and newcomer bootstrap — un-poisoned by the storage-oracle
 //!   that inflated the Phase-1 Python sims.
+//!
+//! ## Adversarial polygon (World-v3 phase 0 — the measuring harness)
+//!
+//! * [`sim_adv`] — the World-v3 adversarial-polygon SKELETON on top of `sim_dynamic`.
+//!   Scenario registry (Rust structs, no DSL), multi-seed rayon fan-out with a
+//!   deterministic seed-indexed aggregation, a PASS/FAIL/INCONCLUSIVE verdict engine
+//!   (power<2 ⇒ INCONCLUSIVE), an invariant board (determinism / anti-oracle /
+//!   per-node extraction-ROI), and a text+CSV report. Sub-tranche 0.1 is BEHAVIOUR-
+//!   NEUTRAL: it drives the unchanged engine through its existing `pub` surface; event
+//!   EXECUTION (Disaster, ...) and predators land in later tranches (0.1 fixes only the
+//!   dispatch skeleton and the anti-oracle behaviour-hook signatures).
 
 pub mod engine;
 pub mod evaluator;
@@ -65,6 +76,7 @@ pub mod sim12;
 pub mod sim12b;
 pub mod sim2;
 pub mod sim6;
+pub mod sim_adv;
 pub mod sim_dynamic;
 pub mod sim_r1;
 pub mod surface_fit;

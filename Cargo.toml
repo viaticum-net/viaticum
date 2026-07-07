@@ -82,6 +82,9 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Data parallelism (offline sim harness only — deterministic per-seed fan-out).
+rayon = "1"
+
 # Random number generation
 # Pinned to 0.9 (not 0.10): rand 0.10 requires rand_core 0.9, but
 # ed25519-dalek 2 still pins rand_core 0.6.4. Bump to 0.10 once

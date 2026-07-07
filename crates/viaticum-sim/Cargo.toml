@@ -33,6 +33,10 @@ path = "src/bin/sim_r1.rs"
 name = "sim_dynamic"
 path = "src/bin/sim_dynamic.rs"
 
+[[bin]]
+name = "sim_adv"
+path = "src/bin/sim_adv.rs"
+
 [dependencies]
 # The sim depends on core; core NEVER depends on sim. This one-directional edge
 # is the structural anti-oracle guarantee: a kernel function in viaticum-core
@@ -40,3 +44,8 @@ path = "src/bin/sim_dynamic.rs"
 viaticum-core = { workspace = true }
 # No RNG crate: the sim uses a tiny deterministic LCG (see generator::Rng) so
 # runs are fully reproducible from a seed and the binary has zero extra deps.
+# Data parallelism for the adversarial-polygon (sim_adv) per-seed fan-out. The
+# collect-into-Vec is order-preserving, so seeded determinism is unaffected.
+rayon = { workspace = true }
+# Module-local error type for the sim_adv CLI (convention: thiserror per module).
+thiserror = { workspace = true }
