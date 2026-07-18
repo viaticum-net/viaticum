@@ -22,6 +22,7 @@ use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
 use crate::generator::Rng;
 use crate::sim_adv::brier::Calibration;
 use crate::sim_adv::cli::{SimAdvError, apply_dial};
+use crate::sim_adv::hetero::{DemandClass, HeteroReport, HeteroTracker, apply_demand_classes};
 use crate::sim_adv::metrics::{MetricSet, collect_metrics};
 use crate::sim_adv::predators::{
     AdvMetrics, RunMode, collect_adv_metrics, fold_cap_ratio, inject_adversaries, observe_cap_ratio,
@@ -65,6 +66,28 @@ pub struct RunResult {
     /// no adversaries (e.g. `honest_v2`); `Some(pair)` pairs the predator run with its matched
     /// honest twin (both at the SAME seed), the comparison the ROI verdicts read.
     pub per_seed_adv: Vec<Option<AdvPair>>,
+    /// Per-seed hetero report (hetero-v2, D1), seed-indexed. `None` for a UNIFORM-demand
+    /// scenario (e.g. `honest_v2` / `dr_baseline`); `Some` for a `Classes` mix (`honest_hetero_v2`
+    /// / `dr_hetero`) — the per-class placement metrics + the L-footprint curve.
+    pub per_seed_hetero: Vec<Option<HeteroReport>>,
+}
+
+/// All per-seed outputs of one seed run (kept as a struct so the growing set of optional
+/// metric channels — restore-truth, R̂-calibration, Attack-ROI, hetero — does not become an
+/// unreadable wide tuple). A `None` optional channel means "this scenario does not carry it".
+pub(crate) struct SeedRun {
+    /// The god-view metrics at the horizon.
+    pub metrics: MetricSet,
+    /// The scripted-event dispatch record.
+    pub fired: Vec<FiredEvent>,
+    /// Restore-truth (metric №1) for a DR scenario, else `None`.
+    pub restore: Option<RestoreTruth>,
+    /// The R̂-calibration dataset (always collected; possibly empty for a short horizon).
+    pub calib: Calibration,
+    /// The Attack-ROI read for an adversary scenario, else `None`.
+    pub adv: Option<AdvMetrics>,
+    /// The per-class hetero report for a `Classes`-mix scenario, else `None`.
+    pub hetero: Option<HeteroReport>,
 }
 
 /// A predator run paired with its matched honest twin (same seed, same construction, hooks
@@ -98,8 +121,9 @@ impl EventQueue {
 
 /// Resolve a [`NodeSel`] against the built world → concrete PRESENT victim indices.
 /// Deterministic; `Random` draws off a dedicated salted stream so it never perturbs the
-/// engine's placement/PoS/churn draws.
-fn resolve_nodesel(world: &World, sel: NodeSel) -> Vec<usize> {
+/// engine's placement/PoS/churn draws. `classes` is the per-node demand-class assignment
+/// (read only by `FirstDemandArchetype`).
+fn resolve_nodesel(world: &World, sel: NodeSel, classes: &[DemandClass]) -> Vec<usize> {
     let n = world.nodes.len();
     let present = |i: usize| i < n && world.nodes[i].present;
     match sel {
@@ -154,6 +178,23 @@ fn resolve_nodesel(world: &World, sel: NodeSel) -> Vec<usize> {
                 .map(|i| vec![i])
                 .unwrap_or_default()
         }
+        NodeSel::FirstDemandArchetype(class, arch) => {
+            // The hetero DR backbone: among present nodes matching (demand class, archetype),
+            // the EARLIEST-established one (smallest `joined_tick`, tie by index) — mirrors
+            // `FirstTierArchetype` so the L-class victim is a mature big-footprint owner.
+            (0..n)
+                .filter(|&i| {
+                    present(i) && classes.get(i) == Some(&class) && world.nodes[i].archetype == arch
+                })
+                .min_by(|&a, &b| {
+                    world.nodes[a]
+                        .joined_tick
+                        .cmp(&world.nodes[b].joined_tick)
+                        .then(a.cmp(&b))
+                })
+                .map(|i| vec![i])
+                .unwrap_or_default()
+        }
     }
 }
 
@@ -163,6 +204,7 @@ const NODESEL_SALT: u64 = 0x0005_E1EC_7D15_A57E;
 /// Apply the events due at `tick`: record each, and for a [`Event::Disaster`] run the
 /// real executor (strike each victim, start its restore measurement, schedule its return
 /// at `tick + 1`). Other kinds are recorded-only in 0.2.
+#[allow(clippy::too_many_arguments)]
 fn apply_events(
     world: &mut World,
     due: &[Event],
@@ -170,6 +212,7 @@ fn apply_events(
     log: &mut Vec<FiredEvent>,
     tracker: &mut RestoreTracker,
     revive_at: &mut BTreeMap<u64, Vec<usize>>,
+    classes: &[DemandClass],
 ) {
     for ev in due {
         log.push(FiredEvent {
@@ -177,9 +220,10 @@ fn apply_events(
             kind: ev.kind(),
         });
         if let Event::Disaster(sel) = ev {
-            for victim in resolve_nodesel(world, *sel) {
+            for victim in resolve_nodesel(world, *sel, classes) {
+                let class = classes.get(victim).copied().unwrap_or(DemandClass::M);
                 disaster_strike(world, victim);
-                tracker.on_disaster(world, victim, tick);
+                tracker.on_disaster(world, victim, tick, class);
                 revive_at.entry(tick + 1).or_default().push(victim);
             }
         }
@@ -195,37 +239,31 @@ fn apply_events(
 /// disk); (b) apply due events (Disaster mutates, others record-only); (c) observe the
 /// restore window "as tick `t` begins"; (d) `step`. With no Disaster the loop is a bare
 /// `step` loop, so `honest_v2` seed-42 still matches `sim_diag 42 100 50 1 v2`.
-pub(crate) fn run_one_seed(
-    scenario: &Scenario,
-    seed: u64,
-) -> (
-    MetricSet,
-    Vec<FiredEvent>,
-    Option<RestoreTruth>,
-    Calibration,
-    Option<AdvMetrics>,
-) {
+pub(crate) fn run_one_seed(scenario: &Scenario, seed: u64) -> SeedRun {
     run_one_seed_mode(scenario, seed, RunMode::Predator)
 }
 
 /// Run one seed in the given [`RunMode`] (predator hooks on / off). A `Twin` run injects the
 /// adversaries' CONSTRUCTION but no hooks — the matched honest control.
-pub(crate) fn run_one_seed_mode(
-    scenario: &Scenario,
-    seed: u64,
-    mode: RunMode,
-) -> (
-    MetricSet,
-    Vec<FiredEvent>,
-    Option<RestoreTruth>,
-    Calibration,
-    Option<AdvMetrics>,
-) {
+pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -> SeedRun {
     let params = &scenario.world.base;
     let prior = SurfacePrior::default();
     let policy = PlacementPolicy::default();
 
     let mut world = build_world(scenario.world.n_nodes, params, seed);
+    // Hetero-v2 (D1): assign a per-owner demand class (seeded, archetype-independent) and, for
+    // a real hetero mix, rebuild each footprint + reconcile the disk. Uniform ⇒ all M and NOT
+    // applied, so the world stays byte-identical to the pre-hetero path (honest anchor frozen).
+    // Done BEFORE injection so a repurposed predator slot's footprint is overwritten by it.
+    let classes = scenario.world.demand.assign(scenario.world.n_nodes, seed);
+    if scenario.world.demand.is_hetero() {
+        apply_demand_classes(
+            &mut world,
+            &classes,
+            params,
+            scenario.world.demand.disk_policy(),
+        );
+    }
     // Phase 1: inject the scenario's adversaries (empty ⇒ no-op; honest scenarios stay
     // byte-identical). `Predator` installs the hooks; `Twin` injects the same heavy nodes
     // with hooks off (the matched control). Deterministic, no RNG.
@@ -252,6 +290,13 @@ pub(crate) fn run_one_seed_mode(
     // so fold the per-tick max cap ratio over the run (NaN ⇒ no evicting holder held adversary
     // data this tick). Empty for a non-adversary scenario.
     let mut run_cap_ratio = f64::NAN;
+    // Hetero-v2 (D1): the per-class placement tracker — samples the L-footprint fill curve and
+    // records each owner's first full-footprint tick. `None` for a uniform-demand scenario.
+    let mut hetero_tracker = if scenario.world.demand.is_hetero() {
+        Some(HeteroTracker::new(&classes, params))
+    } else {
+        None
+    };
 
     for t in 0..scenario.horizon {
         // (a) return any victim whose window starts this tick (present=true, empty disk).
@@ -268,6 +313,7 @@ pub(crate) fn run_one_seed_mode(
             &mut fired,
             &mut tracker,
             &mut revive_at,
+            &classes,
         );
         // (c) observe the restore window before the tick advances the world.
         tracker.observe(&world, t);
@@ -292,6 +338,11 @@ pub(crate) fn run_one_seed_mode(
             run_cap_ratio =
                 fold_cap_ratio(run_cap_ratio, observe_cap_ratio(&world, params, &adv_nodes));
         }
+
+        // (g) hetero placement observation (after the tick advances: read the post-step state).
+        if let Some(ht) = &mut hetero_tracker {
+            ht.observe(&world);
+        }
     }
 
     let restore = if tracker.is_active() {
@@ -304,7 +355,15 @@ pub(crate) fn run_one_seed_mode(
     } else {
         Some(collect_adv_metrics(&world, &adv_nodes, run_cap_ratio))
     };
-    (collect_metrics(&world, params), fired, restore, calib, adv)
+    let hetero = hetero_tracker.map(|ht| ht.finalize(&world));
+    SeedRun {
+        metrics: collect_metrics(&world, params),
+        fired,
+        restore,
+        calib,
+        adv,
+        hetero,
+    }
 }
 
 /// God-view count of a block's live symbols (across PRESENT holders) — the R̂-calibration
@@ -332,24 +391,17 @@ fn block_live_symbols(world: &World, owner: usize, block: usize) -> usize {
 /// (no extra work, `per_seed_adv` all `None`).
 pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
     let has_adv = !scenario.adversaries.is_empty();
-    type SeedOutcome = (
-        MetricSet,
-        Vec<FiredEvent>,
-        Option<RestoreTruth>,
-        Calibration,
-        Option<AdvMetrics>,
-        Option<AdvMetrics>, // the twin's Attack-ROI read (None when no adversaries)
-    );
-    let outcomes: Vec<SeedOutcome> = seeds
+    // Per seed: the predator run + (for an adversary scenario) its matched twin's Attack-ROI.
+    let outcomes: Vec<(SeedRun, Option<AdvMetrics>)> = seeds
         .par_iter()
         .map(|&seed| {
-            let (m, f, r, c, pred_adv) = run_one_seed_mode(scenario, seed, RunMode::Predator);
+            let pred = run_one_seed_mode(scenario, seed, RunMode::Predator);
             let twin_adv = if has_adv {
-                run_one_seed_mode(scenario, seed, RunMode::Twin).4
+                run_one_seed_mode(scenario, seed, RunMode::Twin).adv
             } else {
                 None
             };
-            (m, f, r, c, pred_adv, twin_adv)
+            (pred, twin_adv)
         })
         .collect();
 
@@ -358,12 +410,14 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
     let mut per_seed_restore = Vec::with_capacity(outcomes.len());
     let mut per_seed_calibration = Vec::with_capacity(outcomes.len());
     let mut per_seed_adv = Vec::with_capacity(outcomes.len());
-    for (m, f, r, c, pred_adv, twin_adv) in outcomes {
-        per_seed.push(m);
-        fired.push(f);
-        per_seed_restore.push(r);
-        per_seed_calibration.push(c);
-        per_seed_adv.push(match (pred_adv, twin_adv) {
+    let mut per_seed_hetero = Vec::with_capacity(outcomes.len());
+    for (sr, twin_adv) in outcomes {
+        per_seed.push(sr.metrics);
+        fired.push(sr.fired);
+        per_seed_restore.push(sr.restore);
+        per_seed_calibration.push(sr.calib);
+        per_seed_hetero.push(sr.hetero);
+        per_seed_adv.push(match (sr.adv, twin_adv) {
             (Some(pred), Some(twin)) => Some(AdvPair { pred, twin }),
             _ => None,
         });
@@ -377,6 +431,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_restore,
         per_seed_calibration,
         per_seed_adv,
+        per_seed_hetero,
     }
 }
 

@@ -15,6 +15,7 @@
 //! require, so [`InvariantSpec`] is a small enum over the row shapes instead (statistical
 //! over `MetricSet`, statistical over restore-truth, determinism, anti-oracle).
 
+use crate::sim_adv::hetero::HeteroReport;
 use crate::sim_adv::metrics::{MetricSet, mean_sigma};
 use crate::sim_adv::predators::AdvMetrics;
 use crate::sim_adv::restore::RestoreTruth;
@@ -100,6 +101,16 @@ pub enum InvariantSpec {
         /// The pass direction.
         dir: Direction,
     },
+    /// A hetero-v2 (D1) per-CLASS scalar → mean±σ vs threshold, power<2 gate. Reads the
+    /// per-seed [`HeteroReport`] from [`RunResult::per_seed_hetero`]; seeds with no hetero
+    /// report contribute `NaN` (skipped). Used by INV-HETERO-NO-STARVATION (the L-class
+    /// footprint must reach floor comparably to S/M ⇒ its floor-completeness clears a floor).
+    HeteroStatistical {
+        /// Extract the invariant's scalar from one seed's hetero report.
+        measure: fn(&HeteroReport) -> f64,
+        /// The pass direction.
+        dir: Direction,
+    },
 }
 
 /// One invariant-board row spec.
@@ -139,6 +150,12 @@ impl Clone for Invariant {
                     measure: *measure,
                     dir: *dir,
                 },
+                InvariantSpec::HeteroStatistical { measure, dir } => {
+                    InvariantSpec::HeteroStatistical {
+                        measure: *measure,
+                        dir: *dir,
+                    }
+                }
             },
             threshold: self.threshold,
         }
@@ -252,19 +269,20 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
             InvariantSpec::Determinism => {
                 let pass = match result.seeds.first() {
                     Some(&s0) => {
-                        let (m, _, r, c, adv) = run_one_seed(scenario, s0);
+                        let sr = run_one_seed(scenario, s0);
                         let metrics_eq = result
                             .per_seed
                             .first()
-                            .map(|m0| crate::sim_adv::metrics::bit_eq(m0, &m))
+                            .map(|m0| crate::sim_adv::metrics::bit_eq(m0, &sr.metrics))
                             .unwrap_or(false);
                         // Restore-truth (if any) must be bit-identical on the re-run too.
                         let restore_eq = match result.per_seed_restore.first() {
-                            Some(Some(r0)) => r
+                            Some(Some(r0)) => sr
+                                .restore
                                 .as_ref()
                                 .map(|r1| crate::sim_adv::restore::bit_eq(r0, r1))
                                 .unwrap_or(false),
-                            Some(None) => r.is_none(),
+                            Some(None) => sr.restore.is_none(),
                             None => true,
                         };
                         // The R̂-calibration channel (transche 0.3) must re-run bit-identical
@@ -272,19 +290,31 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                         let calib_eq = result
                             .per_seed_calibration
                             .first()
-                            .map(|c0| crate::sim_adv::brier::bit_eq(c0, &c))
+                            .map(|c0| crate::sim_adv::brier::bit_eq(c0, &sr.calib))
                             .unwrap_or(false);
                         // The predator's Attack-ROI read (phase 1) must re-run bit-identical
                         // too (it feeds the ROI report + the AdvCap/AdvComparative verdicts).
                         let adv_eq = match result.per_seed_adv.first() {
-                            Some(Some(p0)) => adv
+                            Some(Some(p0)) => sr
+                                .adv
                                 .as_ref()
                                 .map(|a1| crate::sim_adv::predators::bit_eq(&p0.pred, a1))
                                 .unwrap_or(false),
-                            Some(None) => adv.is_none(),
+                            Some(None) => sr.adv.is_none(),
                             None => true,
                         };
-                        metrics_eq && restore_eq && calib_eq && adv_eq
+                        // The hetero report (hetero-v2) must re-run bit-identical too — it feeds
+                        // the per-class report + the INV-HETERO-NO-STARVATION verdict.
+                        let hetero_eq = match result.per_seed_hetero.first() {
+                            Some(Some(h0)) => sr
+                                .hetero
+                                .as_ref()
+                                .map(|h1| crate::sim_adv::hetero::bit_eq(h0, h1))
+                                .unwrap_or(false),
+                            Some(None) => sr.hetero.is_none(),
+                            None => true,
+                        };
+                        metrics_eq && restore_eq && calib_eq && adv_eq && hetero_eq
                     }
                     None => false,
                 };
@@ -360,6 +390,25 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                     threshold: inv.threshold,
                     power,
                     note: "predator vs matched twin (ratio)",
+                }
+            }
+            InvariantSpec::HeteroStatistical { measure, dir } => {
+                let vals: Vec<f64> = result
+                    .per_seed_hetero
+                    .iter()
+                    .map(|h| h.as_ref().map(measure).unwrap_or(f64::NAN))
+                    .collect();
+                let (mean, sigma) = mean_sigma(&vals);
+                let sigma_r = if sigma.is_finite() { sigma } else { 0.0 };
+                let (kind, power) = decide(mean, sigma, inv.threshold, *dir);
+                Verdict {
+                    id: inv.id,
+                    kind,
+                    effect: mean,
+                    sigma: sigma_r,
+                    threshold: inv.threshold,
+                    power,
+                    note: "hetero: per-class placement (no starvation)",
                 }
             }
         })

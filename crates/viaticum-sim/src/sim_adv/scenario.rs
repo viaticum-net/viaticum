@@ -13,6 +13,7 @@
 //! it consumes; the restore-collection model returns with its own 0.2 tranche instead of
 //! sitting here unread. See the 0.1 report for the full list.
 
+use crate::sim_adv::hetero::{DemandClass, DemandMix};
 use crate::sim_adv::verdict::Invariant;
 use crate::sim_dynamic::engine::DynParams;
 use crate::sim_dynamic::generator::{Archetype, GiverTier};
@@ -61,6 +62,11 @@ pub struct WorldParams {
     /// (WARN-3: Model U is optimistic exactly on the T1/archive DR-primary tier). Flagged
     /// for Ilya. `≤ 0` disables the budget (Model S ≡ Model U).
     pub restore_bw_gb_day: f64,
+    /// The per-owner DEMAND-CLASS mix (hetero-v2, D1): the number-of-equal-blocks footprint
+    /// distribution. [`DemandMix::Uniform`] (the DEFAULT for every pre-hetero scenario) leaves
+    /// the world byte-identical to the pre-hetero path; a [`DemandMix::Classes`] mix runs the
+    /// hetero layer ([`crate::sim_adv::hetero::apply_demand_classes`]).
+    pub demand: DemandMix,
 }
 
 /// The full scenario (registry entry).
@@ -300,6 +306,11 @@ pub enum NodeSel {
     /// strikes one T1/Reliable node (the reliable backbone, the "Ilya's NAS" of the
     /// DR-primary doctrine).
     FirstTierArchetype(GiverTier, Archetype),
+    /// The SINGLE EARLIEST-ESTABLISHED present node matching BOTH a demand class and an
+    /// archetype (empty if none). The hetero DR selector: `dr_hetero` strikes one reliable
+    /// owner of each footprint class (S/M/L) so restore-truth is measured PER CLASS on the
+    /// same disaster tick — the big-footprint victim (L) is the DR-primary headline.
+    FirstDemandArchetype(DemandClass, Archetype),
 }
 
 /// The measuring-layer metric vocabulary (design §4 / §3). 0.1 computes the subset that

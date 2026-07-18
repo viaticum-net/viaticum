@@ -6,6 +6,7 @@
 //! that proves the harness does not distort the engine).
 
 use crate::sim_adv::cli::SimAdvError;
+use crate::sim_adv::hetero::{DemandClass, DemandMix, DiskPolicy, HeteroReport};
 use crate::sim_adv::metrics::MetricSet;
 use crate::sim_adv::predators::AdvMetrics;
 use crate::sim_adv::restore::RestoreTruth;
@@ -24,7 +25,29 @@ const RESTORE_BW_GB_DAY: f64 = 50.0;
 
 /// Every registered scenario (hard-coded like `Archetype::ALL`).
 pub fn all_scenarios() -> Vec<Scenario> {
-    vec![honest_v2(), dr_baseline(), a1_whale(), a4_whitewasher()]
+    vec![
+        honest_v2(),
+        dr_baseline(),
+        a1_whale(),
+        a4_whitewasher(),
+        honest_hetero_v2(),
+        honest_hetero_hard(),
+        dr_hetero(),
+    ]
+}
+
+/// The hetero-v2 demand mix (D1): S 60% / M 30% / L 10% — a long tail of small owners with a
+/// few big-footprint archives (the DR-primary T1 NAS shape). Shared by the hetero scenarios; the
+/// [`DiskPolicy`] selects the LIGHT (`Grow`) vs HARD (`Fixed`) device regime (WARN-2).
+fn hetero_mix(disk: DiskPolicy) -> DemandMix {
+    DemandMix::Classes(
+        vec![
+            (DemandClass::S, 0.60),
+            (DemandClass::M, 0.30),
+            (DemandClass::L, 0.10),
+        ],
+        disk,
+    )
 }
 
 /// Look a scenario up by name, or a graceful [`SimAdvError::UnknownScenario`] listing the
@@ -60,6 +83,7 @@ pub fn honest_v2() -> Scenario {
             base: DynParams::default(),
             restore_window_days: RESTORE_WINDOW_DAYS,
             restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
         },
         // The engine's canonical §3 mixes (documented for the report header).
         population: vec![
@@ -110,6 +134,7 @@ pub fn dr_baseline() -> Scenario {
             base: DynParams::default(),
             restore_window_days: RESTORE_WINDOW_DAYS,
             restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -152,6 +177,7 @@ pub fn a1_whale() -> Scenario {
             base: DynParams::default(),
             restore_window_days: RESTORE_WINDOW_DAYS,
             restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -197,6 +223,7 @@ pub fn a4_whitewasher() -> Scenario {
             base: DynParams::default(),
             restore_window_days: RESTORE_WINDOW_DAYS,
             restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -222,9 +249,157 @@ pub fn a4_whitewasher() -> Scenario {
     }
 }
 
+/// The honest hetero-v2 world (D1): the v2 world with a per-owner DEMAND-CLASS mix (S 60% /
+/// M 30% / L 10%) instead of the uniform blocks_per_node footprint. Measures whether a big
+/// footprint (L-class, 10 blocks) reaches floor under the credit / reciprocity constraint —
+/// the D1 question. The M owners are byte-identical to `honest_v2`; only S/L rebuild.
+///
+/// `n = 200` (⇒ ~120 S / 60 M / 20 L), horizon 130 (past L's 10th block maturing at tick 54 and
+/// its ~tick-63 full-placement, well onto the placement plateau; matches `honest_v2`'s horizon
+/// so the network is not over-depopulated by churn-without-rejoin). `n = 200` (not 100) so the
+/// smallest class L carries ~20 owners — enough that the per-seed no-starvation RATIO is not
+/// dominated by a handful of L owners' noise (at n=100 the real effect sits below the power-2
+/// gate purely from small-sample variance; more owners is the power-discipline fix, not a
+/// threshold change). 5 seeds.
+pub fn honest_hetero_v2() -> Scenario {
+    Scenario {
+        id: ScenarioId("honest_hetero_v2"),
+        about: "honest world + per-owner demand classes (S 60% / M 30% / L 10%) — does the big L-footprint reach floor under credit/reciprocity? (D1)",
+        world: WorldParams {
+            n_nodes: 200,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: hetero_mix(DiskPolicy::Grow),
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: Vec::new(),
+        events: Vec::new(),
+        horizon: 130,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![
+            MetricId::Extraction,
+            MetricId::RhatCalibration,
+            MetricId::InvariantBoard,
+        ],
+        verdicts: honest_hetero_v2_invariants(),
+        fast: false,
+    }
+}
+
+/// The HARD hetero regime (WARN-2 — the SHARP D1 test): identical to `honest_hetero_v2` (same
+/// classes, n, horizon, seeds) EXCEPT the device cap is FIXED at `build_world` size for every
+/// class ([`DiskPolicy::Fixed`]). The L owner's source scales ×10/3 on an UNCHANGED disk, so its
+/// own-data eats its own device (truncated at the cap when it overflows — the "full device" P7 T4
+/// physics), leaving little lendable free ⇒ little κ_O ⇒ V_ret near V_free. This is a big footprint
+/// on an ORDINARY device: does the credit / reciprocity mechanic LOCK it? Any outcome is
+/// informative — a FAIL here is the real credit-lock finding (report, do NOT tune).
+pub fn honest_hetero_hard() -> Scenario {
+    Scenario {
+        id: ScenarioId("honest_hetero_hard"),
+        about: "hetero classes on a FIXED ordinary device (L source eats its disk ⇒ little lendable ⇒ little credit) — the SHARP D1 credit-lock test (WARN-2)",
+        world: WorldParams {
+            n_nodes: 200,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: hetero_mix(DiskPolicy::Fixed),
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: Vec::new(),
+        events: Vec::new(),
+        horizon: 130,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![
+            MetricId::Extraction,
+            MetricId::RhatCalibration,
+            MetricId::InvariantBoard,
+        ],
+        verdicts: honest_hetero_hard_invariants(),
+        fast: false,
+    }
+}
+
+/// The hetero DR (D1 + axis 8): the hetero world + a Disaster on ONE reliable owner of EACH
+/// footprint class (S/M/L) at tick 60, measuring restore-truth PER CLASS. The L-class victim
+/// (a big-footprint NAS) is the DR-primary headline — does its large restored footprint
+/// re-collect as well as a small one?
+///
+/// Disaster at tick 60 (the mature-but-healthy world, matching `dr_baseline`'s timing — the
+/// long horizon depopulates the network via churn-without-rejoin, which would confound the
+/// restore signal, so the strike lands while the holders are still present), horizon 130.
+pub fn dr_hetero() -> Scenario {
+    Scenario {
+        id: ScenarioId("dr_hetero"),
+        about: "hetero world + Disaster of one reliable S/M/L owner @ tick 60 — restore-truth PER CLASS (the L victim is DR-primary)",
+        world: WorldParams {
+            n_nodes: 100,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: hetero_mix(DiskPolicy::Grow),
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: Vec::new(),
+        // One reliable victim of each footprint class, same tick — restore-truth splits by class.
+        events: vec![
+            (
+                60,
+                Event::Disaster(NodeSel::FirstDemandArchetype(
+                    DemandClass::S,
+                    Archetype::Reliable,
+                )),
+            ),
+            (
+                60,
+                Event::Disaster(NodeSel::FirstDemandArchetype(
+                    DemandClass::M,
+                    Archetype::Reliable,
+                )),
+            ),
+            (
+                60,
+                Event::Disaster(NodeSel::FirstDemandArchetype(
+                    DemandClass::L,
+                    Archetype::Reliable,
+                )),
+            ),
+        ],
+        horizon: 130,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![MetricId::RestoreTruth, MetricId::InvariantBoard],
+        verdicts: dr_hetero_invariants(),
+        fast: false,
+    }
+}
+
 /// Reliable's extraction ROI (Reliable is index 0 in `Archetype::ALL`).
 fn reliable_roi(m: &MetricSet) -> f64 {
     m.extraction_roi[0]
+}
+
+/// The L-class NO-STARVATION ratio: the big footprint's floor-completeness relative to the
+/// smaller-footprint owners' baseline `mean(S, M)`. ≥ 1 ⇒ the big footprint places AT LEAST as
+/// well as the small owners (the D1 "no lock"). This is COMPARATIVE, not absolute, on purpose:
+/// the substrate's "n_symbols (=5) SIMULTANEOUS floor holders" bar caps ABSOLUTE
+/// floor-completeness for EVERY class (even the honest M baseline sits ≈ 0.35 — blocks settle
+/// near k_eff under the eviction economy), so an absolute floor would measure that substrate
+/// difficulty, not hetero starvation. The starvation question is inherently RELATIVE. `NaN` if
+/// there is no small-owner baseline.
+fn hetero_l_no_starvation(h: &HeteroReport) -> f64 {
+    let l = h.l_floor_completeness();
+    let s = h.class[DemandClass::S.index()].floor_completeness;
+    let m = h.class[DemandClass::M.index()].floor_completeness;
+    let peer = (s + m) / 2.0;
+    if peer > 0.0 { l / peer } else { f64::NAN }
+}
+
+/// The L-class restore-truth U (any symbol) — the hetero DR per-class headline scalar.
+fn restore_u_l(r: &RestoreTruth) -> f64 {
+    r.restore_u_in_class(DemandClass::L)
 }
 
 /// The predator's Р-7 cap ratio (max parked / (V_ret + one chunk) where the cap engages).
@@ -424,6 +599,98 @@ fn a4_whitewasher_invariants() -> Vec<Invariant> {
                 dir: Direction::LessThan,
             },
             threshold: 1.0,
+        },
+    ]
+}
+
+/// The `honest_hetero_v2` board: the two structural rows + the no-starvation floor on the
+/// L-class footprint.
+fn honest_hetero_v2_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-HETERO-NO-STARVATION (D1): does the mechanic LOCK the large footprint? The measure
+        // is the COMPARATIVE ratio L-floor-completeness / mean(S, M) — the big footprint's
+        // placement success RELATIVE to the small owners. The threshold 0.75 is a SEMANTIC
+        // no-starvation line ("the big footprint places within 25 % of the small owners"), frozen
+        // anti-Goodhart — NOT fitted (the measured ratio sits ≈ 1.2, so L actually places AT LEAST
+        // as well as its small peers). Comparative, not absolute, because the substrate's
+        // 5-simultaneous-floor bar caps ABSOLUTE floor-completeness for EVERY class (honest M ≈
+        // 0.35), so an absolute floor would test substrate difficulty, not starvation. GreaterThan,
+        // power-gated (spec §10 п.16): a genuine LOCK (L far below its peers) FAILS, and that FAIL
+        // is a real FINDING — the threshold is NOT to be lowered to hide it. The per-class table +
+        // the L-curve in the report carry the absolute numbers (nothing hidden).
+        Invariant {
+            id: "INV-HETERO-NO-STARVATION",
+            spec: InvariantSpec::HeteroStatistical {
+                measure: hetero_l_no_starvation,
+                dir: Direction::GreaterThan,
+            },
+            threshold: 0.75,
+        },
+    ]
+}
+
+/// The `honest_hetero_hard` board: the two structural rows + INV-HETERO-HARD — the SAME comparative
+/// no-starvation measure and the SAME frozen 0.75 threshold as the light regime (WARN-2 asks for
+/// the identical bar), read on the FIXED-device world. A FAIL here (L placement collapses below its
+/// small peers once its own source eats its disk) is the real credit-lock finding — NOT to be tuned.
+fn honest_hetero_hard_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-HETERO-HARD",
+            spec: InvariantSpec::HeteroStatistical {
+                measure: hetero_l_no_starvation,
+                dir: Direction::GreaterThan,
+            },
+            threshold: 0.75,
+        },
+    ]
+}
+
+/// The `dr_hetero` board: the two structural rows + the L-class restore-truth floor.
+fn dr_hetero_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-RESTORE-HETERO-L (D1 + axis 8): the big-footprint L victim's restore-truth U must
+        // clear the same 0.60 semantic floor as INV-RESTORE-SANITY — "FAIL if > 40% of the big
+        // restored footprint is unrestorable". Frozen anti-Goodhart (the honest DR sits high
+        // under the near-always-on uptime); a genuine collapse FAILS and is a real finding. The
+        // per-class restore table (S vs M vs L) in the report is the comparative evidence.
+        Invariant {
+            id: "INV-RESTORE-HETERO-L",
+            spec: InvariantSpec::RestoreStatistical {
+                measure: restore_u_l,
+                dir: Direction::GreaterThan,
+            },
+            threshold: 0.60,
         },
     ]
 }

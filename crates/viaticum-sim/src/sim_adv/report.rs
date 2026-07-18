@@ -9,6 +9,7 @@
 use std::fmt::Write as _;
 
 use crate::sim_adv::brier::{Calibration, DEFAULT_BRIER_BUCKETS};
+use crate::sim_adv::hetero::{DemandClass, HeteroReport};
 use crate::sim_adv::metrics::{MetricSet, mean_sigma};
 use crate::sim_adv::restore::{IOTA_BUCKETS, RestoreTruth};
 use crate::sim_adv::runner::{RunResult, SweepRow};
@@ -110,6 +111,11 @@ pub fn format_report(scenario: &Scenario, result: &RunResult, verdicts: &[Verdic
 
     // --- restore-truth (metric №1), only when a Disaster fired ---
     if let Some(section) = format_restore(result) {
+        o.push_str(&section);
+    }
+
+    // --- hetero-v2 (D1): per-class placement + the L-footprint curve ---
+    if let Some(section) = format_hetero(result) {
         o.push_str(&section);
     }
 
@@ -318,6 +324,37 @@ fn format_restore(result: &RunResult) -> Option<String> {
         }
         let _ = writeln!(o, "    [{lo:.1},{hi:.1})  {m:>8.4} ± {s:.4}");
     }
+    // Per-demand-class restore-truth (hetero DR): only when >1 class was struck (dr_hetero).
+    let classes_present = first
+        .blocks
+        .iter()
+        .map(|b| b.class)
+        .collect::<std::collections::BTreeSet<_>>();
+    if classes_present.len() > 1 {
+        let _ = writeln!(o, "  by demand class (restore-truth U / S / O):");
+        for c in DemandClass::ALL {
+            let (u, _) = rcol(result, |r| r.restore_u_in_class(c));
+            if u.is_nan() {
+                continue;
+            }
+            let (s, _) = rcol(result, |r| r.restore_s_in_class(c));
+            let (o_, _) = rcol(result, |r| r.restore_o_in_class(c));
+            let (nb, _) = rcol(result, |r| r.n_blocks_in_class(c) as f64);
+            let _ = writeln!(
+                o,
+                "    {}: U={u:>7.4}  S={s:>7.4}  O={o_:>7.4}  (mean blocks/seed = {nb:.1})",
+                c.label(),
+            );
+        }
+        let _ = writeln!(
+            o,
+            "    NOTE: S/M restore-truth is NOISE-DOMINATED (< 5 blocks/seed — a single victim's"
+        );
+        let _ = writeln!(
+            o,
+            "          1-3 blocks); the DR-primary SIGNAL is the L victim (big footprint = more blocks)."
+        );
+    }
     let _ = writeln!(
         o,
         "  NOTE-8: dr_baseline is a SANITY FLOOR (~high under the current uptime), not a"
@@ -365,6 +402,135 @@ pub fn restore_csv(result: &RunResult) -> String {
         );
     }
     o
+}
+
+/// Format a `mean ± σ` cell at `prec` decimals; σ prints "—" for < 2 finite seeds (NaN σ) so a
+/// one-owner-per-class cut reads "63.5 ± —" rather than "63.5 ± NaN" (NOTE-2 cosmetic).
+fn ms_cell(mean: f64, sigma: f64, prec: usize) -> String {
+    let s = if sigma.is_finite() {
+        format!("{sigma:.prec$}")
+    } else {
+        "—".to_string()
+    };
+    format!("{mean:.prec$}±{s}")
+}
+
+/// Mean±σ of one hetero-report scalar across the seeds (seeds with no hetero report → `NaN`,
+/// skipped by `mean_sigma`).
+fn hcol(result: &RunResult, f: impl Fn(&HeteroReport) -> f64) -> (f64, f64) {
+    let vals: Vec<f64> = result
+        .per_seed_hetero
+        .iter()
+        .map(|h| h.as_ref().map(&f).unwrap_or(f64::NAN))
+        .collect();
+    mean_sigma(&vals)
+}
+
+/// Render the hetero-v2 (D1) section: the per-class placement table + the L-footprint
+/// "parked-vs-tick" curve (the load-bearing "does the big footprint reach floor" evidence).
+/// `None` when no seed carried a hetero report (a uniform-demand scenario).
+fn format_hetero(result: &RunResult) -> Option<String> {
+    let first = result.per_seed_hetero.iter().flatten().next()?;
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "-- hetero-v2 (D1): per-owner demand classes (number of equal blocks per owner) --"
+    );
+    let _ = writeln!(
+        o,
+        "  footprint n_blocks: S={} M={} L={}   assigned owners: S={} M={} L={}",
+        first.n_blocks[0],
+        first.n_blocks[1],
+        first.n_blocks[2],
+        first.assigned[0],
+        first.assigned[1],
+        first.assigned[2],
+    );
+    // WARN-1: floor_complete ≡ placed_frac (block-weighted = owner-weighted at constant n_blocks),
+    // so only floor_complete is shown. NOTE-1: mean_holders (current alive floor holders/block, the
+    // steady-state "placed-then-shed" diagnostic) is a column. mean±σ; σ = "—" for < 2 finite seeds.
+    let _ = writeln!(
+        o,
+        "  {:<6} {:>7} {:>15} {:>15} {:>15} {:>15} {:>10}",
+        "class", "owners", "floor_complete", "mean_holders", "share A>0", "tick_full", "never_full",
+    );
+    for (ci, c) in DemandClass::ALL.iter().enumerate() {
+        let (own, _) = hcol(result, |h| h.class[ci].n_owners_present as f64);
+        let (fc, fcs) = hcol(result, |h| h.class[ci].floor_completeness);
+        let (mh, mhs) = hcol(result, |h| h.class[ci].mean_floor_holders);
+        let (sa, sas) = hcol(result, |h| h.class[ci].share_a_pos);
+        let (tf, tfs) = hcol(result, |h| h.class[ci].mean_tick_full);
+        let (nf, _) = hcol(result, |h| h.class[ci].n_never_full as f64);
+        let _ = writeln!(
+            o,
+            "  {:<6} {:>7.1} {:>15} {:>15} {:>15} {:>15} {:>10.2}",
+            c.label(),
+            own,
+            ms_cell(fc, fcs, 3),
+            ms_cell(mh, mhs, 2),
+            ms_cell(sa, sas, 2),
+            ms_cell(tf, tfs, 1),
+            nf,
+        );
+    }
+    // The L-footprint placement curve: per-class mean placed-fraction over seeds, per sample
+    // tick, plus the L full-footprint owner count — the "parked vs tick per class" evidence.
+    let _ = writeln!(
+        o,
+        "  placement curve (placed_frac mean over seeds, per class | L owners fully placed):"
+    );
+    let _ = writeln!(
+        o,
+        "    {:>6}  {:>7} {:>7} {:>7}   {:>10}",
+        "tick", "S", "M", "L", "L n_full"
+    );
+    let curves: Vec<&Vec<crate::sim_adv::HeteroSample>> = result
+        .per_seed_hetero
+        .iter()
+        .flatten()
+        .map(|h| &h.curve)
+        .collect();
+    for k in 0..first.curve.len() {
+        let tick = first.curve[k].tick;
+        let mut sum = [0.0f64; 3];
+        let mut cnt = [0usize; 3];
+        let mut lfull_sum = 0.0f64;
+        let mut lfull_cnt = 0usize;
+        for cv in &curves {
+            let Some(s) = cv.get(k) else { continue };
+            for c in 0..3 {
+                if s.placed_frac[c].is_finite() {
+                    sum[c] += s.placed_frac[c];
+                    cnt[c] += 1;
+                }
+            }
+            lfull_sum += s.n_full[2] as f64;
+            lfull_cnt += 1;
+        }
+        let mean_c = |c: usize| {
+            if cnt[c] > 0 {
+                sum[c] / cnt[c] as f64
+            } else {
+                f64::NAN
+            }
+        };
+        let lfull = if lfull_cnt > 0 {
+            lfull_sum / lfull_cnt as f64
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            o,
+            "    {:>6}  {:>7.3} {:>7.3} {:>7.3}   {:>10.1}",
+            tick,
+            mean_c(0),
+            mean_c(1),
+            mean_c(2),
+            lfull,
+        );
+    }
+    let _ = writeln!(o);
+    Some(o)
 }
 
 /// Render the R̂-calibration section (transche 0.3 judge, WARN-1). Pools every seed's resolved

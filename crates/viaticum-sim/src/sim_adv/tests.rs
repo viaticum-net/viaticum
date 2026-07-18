@@ -2,13 +2,17 @@
 
 use crate::sim_adv::brier::{Calibration, DEFAULT_BRIER_BUCKETS};
 use crate::sim_adv::cli::{apply_dial, parse_cli, resolve_seeds};
+use crate::sim_adv::hetero::{
+    DemandClass, DemandMix, DiskPolicy, apply_demand_classes, bit_eq as hetero_bit_eq,
+};
 use crate::sim_adv::metrics::{bit_eq as metrics_bit_eq, collect_metrics, mean_sigma};
 use crate::sim_adv::predators::{
     RunMode, a1_epsilon_whale_hook, a4_whitewasher_hook, bit_eq as adv_bit_eq, fold_cap_ratio,
     inject_adversaries,
 };
 use crate::sim_adv::registry::{
-    a1_whale, a4_whitewasher, all_scenarios, dr_baseline, find_scenario, honest_v2,
+    a1_whale, a4_whitewasher, all_scenarios, dr_baseline, dr_hetero, find_scenario,
+    honest_hetero_v2, honest_v2,
 };
 use crate::sim_adv::report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
 use crate::sim_adv::restore::{
@@ -38,6 +42,7 @@ fn tiny_scenario_with_events(events: Vec<(u64, Event)>) -> Scenario {
             base: DynParams::default(),
             restore_window_days: 14.0,
             restore_bw_gb_day: 50.0,
+            demand: DemandMix::Uniform,
         },
         population: Vec::new(),
         tiers: Vec::new(),
@@ -95,7 +100,7 @@ fn registry_all_scenarios_is_non_empty() {
 #[test]
 fn event_dispatch_records_executor_on_the_scripted_tick() {
     let sc = tiny_scenario_with_events(vec![(2, Event::Disaster(NodeSel::Index(0)))]);
-    let (_metrics, fired, _r, _c, _a) = run_one_seed(&sc, 1);
+    let fired = run_one_seed(&sc, 1).fired;
     assert_eq!(fired.len(), 1, "exactly one event fired");
     assert_eq!(fired[0].tick, 2, "fired on the scripted tick");
     assert_eq!(fired[0].kind, EventKind::Disaster);
@@ -105,7 +110,7 @@ fn event_dispatch_records_executor_on_the_scripted_tick() {
 fn event_dispatch_skips_events_scheduled_beyond_horizon() {
     // horizon is 4 (ticks 0..4); an event at tick 9 must never fire.
     let sc = tiny_scenario_with_events(vec![(9, Event::KillSubnet(3))]);
-    let (_metrics, fired, _r, _c, _a) = run_one_seed(&sc, 1);
+    let fired = run_one_seed(&sc, 1).fired;
     assert!(fired.is_empty(), "event past the horizon does not fire");
 }
 
@@ -121,7 +126,7 @@ fn event_dispatch_fires_multiple_events_at_their_ticks() {
         ),
         (3, Event::AdvActivate(AdvId::A1EpsilonWhale)),
     ]);
-    let (_m, fired, _r, _c, _a) = run_one_seed(&sc, 1);
+    let fired = run_one_seed(&sc, 1).fired;
     let ticks: Vec<u64> = fired.iter().map(|f| f.tick).collect();
     assert_eq!(ticks, vec![0, 1, 3]);
     assert_eq!(fired[0].kind, EventKind::JoinWave);
@@ -206,7 +211,7 @@ fn honest_v2_seed42_matches_sim_diag_anchor() {
     //   (3428→7306, intermittent holders now confirmed); F5 (chunk = source/k_eff = 25 gb,
     //   2.5× bigger) conserves placed GB but ~2.5× fewer symbols (565→224) and fewer eviction
     //   events (1514→506); share A>0 96.6→76.8 (harder contention, fewer mutual pairs).
-    let (m, _fired, _r, _c, _a) = run_one_seed(&honest_v2(), 42);
+    let m = run_one_seed(&honest_v2(), 42).metrics;
 
     // Exact integer counters (sim_diag §6a/§3-sum/§6d).
     assert_eq!(m.alive_symbols, 224, "alive symbols (6a)");
@@ -259,7 +264,7 @@ fn honest_v2_reliable_extraction_roi_is_near_balance_and_bounded() {
     // 1.015 pre-F1-F6), NOT above the ceiling. (Universal "< 1 for all archetypes" is
     // impossible: Σconsumed ≡ Σserved_out.) The invariant is BOUNDED extraction, so we lock
     // the measured value and the 1.25 ceiling.
-    let (m, _fired, _r, _c, _a) = run_one_seed(&honest_v2(), 42);
+    let m = run_one_seed(&honest_v2(), 42).metrics;
     let roi = m.extraction_roi[0];
     assert!(
         (roi - 0.989).abs() < 0.01,
@@ -558,6 +563,7 @@ fn restore_wp(n_nodes: usize, window_days: f64, bw_gb_day: f64) -> WorldParams {
         base: DynParams::default(),
         restore_window_days: window_days,
         restore_bw_gb_day: bw_gb_day,
+        demand: DemandMix::Uniform,
     }
 }
 
@@ -638,7 +644,7 @@ fn restore_truth_counts_cream_when_floor_below_k_but_floor_plus_cream_reaches_k(
     push_held(&mut world, holders[2], victim, 0, 0.5, true); // cream
 
     let mut tracker = RestoreTracker::new(&wp);
-    tracker.on_disaster(&world, victim, disaster_tick);
+    tracker.on_disaster(&world, victim, disaster_tick, DemandClass::M);
     tracker.observe(&world, return_tick);
     tracker.observe(&world, return_tick + 1);
     let rt = tracker.finalize();
@@ -687,7 +693,7 @@ fn restore_truth_model_s_is_at_most_model_u_and_bites_under_a_tiny_budget() {
     }
 
     let mut tracker = RestoreTracker::new(&wp);
-    tracker.on_disaster(&world, victim, disaster_tick);
+    tracker.on_disaster(&world, victim, disaster_tick, DemandClass::M);
     tracker.observe(&world, return_tick);
     tracker.observe(&world, return_tick + 1);
     let rt = tracker.finalize();
@@ -735,7 +741,7 @@ fn restore_truth_respects_the_window_departed_and_out_of_window_holders_are_not_
     world.nodes[holders[2]].present = false;
 
     let mut tracker = RestoreTracker::new(&wp);
-    tracker.on_disaster(&world, victim, disaster_tick);
+    tracker.on_disaster(&world, victim, disaster_tick, DemandClass::M);
     tracker.observe(&world, return_tick);
     tracker.observe(&world, return_tick + 1);
     let rt = tracker.finalize();
@@ -748,7 +754,7 @@ fn restore_truth_respects_the_window_departed_and_out_of_window_holders_are_not_
     // Observing only at a tick PAST the window (return + 2 = window end, exclusive) collects
     // nothing — the window [return, return+2) is respected.
     let mut tracker2 = RestoreTracker::new(&wp);
-    tracker2.on_disaster(&world, victim, disaster_tick);
+    tracker2.on_disaster(&world, victim, disaster_tick, DemandClass::M);
     tracker2.observe(&world, return_tick + 2);
     let rt2 = tracker2.finalize();
     assert_eq!(
@@ -775,7 +781,7 @@ fn restore_truth_victim_does_not_resurrect_with_data_when_no_holder_is_collectab
     }
 
     let mut tracker = RestoreTracker::new(&wp);
-    tracker.on_disaster(&world, victim, disaster_tick);
+    tracker.on_disaster(&world, victim, disaster_tick, DemandClass::M);
     tracker.observe(&world, return_tick);
     tracker.observe(&world, return_tick + 1);
     let rt = tracker.finalize();
@@ -808,7 +814,7 @@ fn restore_truth_model_o_equals_u_at_full_uptime() {
     }
 
     let mut tracker = RestoreTracker::new(&wp);
-    tracker.on_disaster(&world, victim, disaster_tick);
+    tracker.on_disaster(&world, victim, disaster_tick, DemandClass::M);
     tracker.observe(&world, return_tick);
     tracker.observe(&world, return_tick + 1);
     let rt = tracker.finalize();
@@ -858,7 +864,7 @@ fn restore_truth_model_o_is_below_u_when_a_holder_surfaces_only_after_the_first_
     world.nodes[late].present = false;
 
     let mut tracker = RestoreTracker::new(&wp);
-    tracker.on_disaster(&world, victim, disaster_tick);
+    tracker.on_disaster(&world, victim, disaster_tick, DemandClass::M);
     tracker.observe(&world, return_tick); // late holder unreachable ⇒ not in O nor U yet
     world.nodes[late].present = true; // it surfaces on the second window tick
     tracker.observe(&world, return_tick + 1); // U grabs it (union); O does NOT (past first tick)
@@ -984,6 +990,7 @@ fn bucket_row(iota: f64, restorable_u: bool) -> BlockOutcome {
         block_id: 0,
         iota,
         tier: GiverTier::T1,
+        class: DemandClass::M,
         n_collectable_any: 0,
         n_collectable_floor: 0,
         n_collectable_oneshot: 0,
@@ -1637,4 +1644,363 @@ fn adv_run_is_bit_identical_on_repeat() {
             "god-view metrics bit-identical on repeat"
         );
     }
+}
+
+// ------------------------------------------------------------------
+// hetero-v2 (D1): per-owner demand classes = the NUMBER of equal blocks
+// ------------------------------------------------------------------
+
+/// A shrunk `honest_hetero_v2` (small world, short horizon) for the fast unit tests.
+fn tiny_hetero() -> Scenario {
+    let mut sc = honest_hetero_v2();
+    sc.world.n_nodes = 40;
+    sc.horizon = 90;
+    sc.seeds = vec![1, 2];
+    sc
+}
+
+#[test]
+fn demand_class_n_blocks_maps_the_three_footprints() {
+    // S=1, L=10 are absolute; M ties to blocks_per_node so an M owner is byte-identical to
+    // build_world for any default (the spec's S=1/M=3/L=10 holds at the default bpn=3).
+    assert_eq!(DemandClass::S.n_blocks(3), 1);
+    assert_eq!(DemandClass::M.n_blocks(3), 3);
+    assert_eq!(DemandClass::L.n_blocks(3), 10);
+    assert_eq!(DemandClass::M.n_blocks(5), 5, "M tracks blocks_per_node");
+}
+
+#[test]
+fn demand_mix_assignment_is_deterministic_and_hits_the_shares() {
+    let mix = DemandMix::Classes(
+        vec![
+            (DemandClass::S, 0.60),
+            (DemandClass::M, 0.30),
+            (DemandClass::L, 0.10),
+        ],
+        DiskPolicy::Grow,
+    );
+    let a = mix.assign(100, 42);
+    let b = mix.assign(100, 42);
+    assert_eq!(a, b, "assignment is deterministic in the seed");
+    let count = |c: DemandClass| a.iter().filter(|&&x| x == c).count();
+    assert_eq!(count(DemandClass::S), 60);
+    assert_eq!(count(DemandClass::M), 30);
+    assert_eq!(count(DemandClass::L), 10);
+    // A different seed PERMUTES which node is which class (independent of index/archetype).
+    let c = mix.assign(100, 43);
+    assert_ne!(a, c, "a different seed permutes the assignment");
+}
+
+#[test]
+fn uniform_demand_apply_leaves_the_world_bit_identical_to_build_world() {
+    // The byte-identity guarantee (the honest-anchor freeze): applying an all-M assignment
+    // reproduces build_world EXACTLY — own_blocks id/volume/ι, next_block_id, and the disk
+    // fields (source_scale = 1.0). This is what keeps honest_v2 seed-42 frozen.
+    let params = DynParams::default();
+    let base = build_world(30, &params, 7);
+    let mut applied = build_world(30, &params, 7);
+    apply_demand_classes(
+        &mut applied,
+        &[DemandClass::M; 30],
+        &params,
+        DiskPolicy::Grow,
+    );
+    for i in 0..base.nodes.len() {
+        assert_eq!(
+            base.nodes[i].own_blocks.len(),
+            applied.nodes[i].own_blocks.len()
+        );
+        for (a, b) in base.nodes[i]
+            .own_blocks
+            .iter()
+            .zip(&applied.nodes[i].own_blocks)
+        {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.volume.to_bits(), b.volume.to_bits());
+            assert_eq!(a.iota.to_bits(), b.iota.to_bits());
+        }
+        assert_eq!(
+            base.nodes[i].disk_cap.to_bits(),
+            applied.nodes[i].disk_cap.to_bits(),
+            "M disk_cap unchanged (×1.0)"
+        );
+        assert_eq!(
+            base.nodes[i].disk.own_data.to_bits(),
+            applied.nodes[i].disk.own_data.to_bits()
+        );
+        assert_eq!(base.next_block_id[i], applied.next_block_id[i]);
+    }
+}
+
+#[test]
+fn apply_demand_classes_sets_footprint_and_grows_only_the_l_disk() {
+    let params = DynParams::default();
+    let mut world = build_world(6, &params, 3);
+    let base_cap: Vec<f64> = world.nodes.iter().map(|n| n.disk_cap).collect();
+    let base_own: Vec<f64> = world.nodes.iter().map(|n| n.disk.own_data).collect();
+    let classes = vec![
+        DemandClass::S,
+        DemandClass::M,
+        DemandClass::L,
+        DemandClass::S,
+        DemandClass::M,
+        DemandClass::L,
+    ];
+    apply_demand_classes(&mut world, &classes, &params, DiskPolicy::Grow);
+    for (i, &c) in classes.iter().enumerate() {
+        let want = c.n_blocks(params.blocks_per_node);
+        assert_eq!(
+            world.nodes[i].own_blocks.len(),
+            want,
+            "footprint = n_blocks"
+        );
+        assert_eq!(world.next_block_id[i], want);
+    }
+    // The disk CAP only GROWS: L up, S and M unchanged (never shrink the majority's device).
+    assert!(
+        world.nodes[2].disk_cap > base_cap[2],
+        "L disk cap scaled up"
+    );
+    assert_eq!(
+        world.nodes[0].disk_cap.to_bits(),
+        base_cap[0].to_bits(),
+        "S disk cap unchanged (a small source is not a small device)"
+    );
+    assert_eq!(
+        world.nodes[1].disk_cap.to_bits(),
+        base_cap[1].to_bits(),
+        "M disk cap unchanged"
+    );
+    // own-data (the source on disk) tracks the footprint: L bigger, S smaller, M unchanged.
+    assert!(world.nodes[2].disk.own_data > base_own[2], "L source grows");
+    assert!(
+        world.nodes[0].disk.own_data < base_own[0],
+        "S source shrinks"
+    );
+    assert_eq!(
+        world.nodes[1].disk.own_data.to_bits(),
+        base_own[1].to_bits(),
+        "M source unchanged"
+    );
+}
+
+#[test]
+fn apply_demand_classes_fixed_keeps_the_device_and_truncates_an_overflowing_source() {
+    // WARN-2 HARD regime: DiskPolicy::Fixed keeps the device cap at build_world size for every
+    // class, and own-data still scales with the source — TRUNCATED at the cap when it overflows
+    // (the "full device" physics: free disk floors at 0). L's ×10/3 source on a fixed disk either
+    // fills more of the disk or is clamped to it; the cap itself never moves.
+    let params = DynParams::default();
+    let mut world = build_world(30, &params, 9);
+    let base_cap: Vec<f64> = world.nodes.iter().map(|n| n.disk_cap).collect();
+    let mix = DemandMix::Classes(
+        vec![(DemandClass::S, 0.4), (DemandClass::L, 0.6)],
+        DiskPolicy::Fixed,
+    );
+    let classes = mix.assign(30, 9);
+    apply_demand_classes(&mut world, &classes, &params, DiskPolicy::Fixed);
+    for (i, node) in world.nodes.iter().enumerate() {
+        // Device cap is UNCHANGED for every class in the hard regime.
+        assert_eq!(
+            node.disk_cap.to_bits(),
+            base_cap[i].to_bits(),
+            "hard regime never moves the device cap"
+        );
+        // own-data never exceeds the device (source truncated at the cap — no negative free disk).
+        assert!(
+            node.disk.own_data <= node.disk_cap,
+            "source is truncated at the device cap"
+        );
+        assert!(node.free_disk() >= 0.0, "free disk floors at 0");
+    }
+    // At least one L owner's source overflowed a tight-tier device (truncation actually engaged),
+    // OR every L simply grew within a loose device — either way the cap is fixed and free ≥ 0.
+    let some_l_full = classes
+        .iter()
+        .enumerate()
+        .any(|(i, &c)| c == DemandClass::L && world.nodes[i].free_disk() < 1.0);
+    // Not asserted as mandatory (depends on the tier draw), but exercises the truncation path.
+    let _ = some_l_full;
+}
+
+#[test]
+fn demand_class_labels_are_the_three_letters() {
+    // NOTE-4: the class labels used across the report / CSV.
+    assert_eq!(DemandClass::S.label(), "S");
+    assert_eq!(DemandClass::M.label(), "M");
+    assert_eq!(DemandClass::L.label(), "L");
+    assert_eq!(DemandClass::ALL.len(), 3);
+}
+
+#[test]
+fn restore_per_class_accessors_slice_blocks_by_demand_class() {
+    // NOTE-4: restore_{u,s,o}_in_class + n_blocks_in_class slice a RestoreTruth by demand class.
+    let mk = |class: DemandClass, u: bool, s: bool, o: bool| BlockOutcome {
+        owner: 0,
+        block_id: 0,
+        iota: 0.5,
+        tier: GiverTier::T1,
+        class,
+        n_collectable_any: 0,
+        n_collectable_floor: 0,
+        n_collectable_oneshot: 0,
+        restorable_u: u,
+        restorable_s: s,
+        restorable_o: o,
+        restorable_floor: false,
+    };
+    // L: 2 blocks (1 restorable U, 0 S, 2 O); M: 1 block (restorable all); S: none.
+    let rt = restore_truth_with_blocks(vec![
+        mk(DemandClass::L, true, false, true),
+        mk(DemandClass::L, false, false, true),
+        mk(DemandClass::M, true, true, true),
+    ]);
+    assert_eq!(rt.n_blocks_in_class(DemandClass::L), 2);
+    assert_eq!(rt.n_blocks_in_class(DemandClass::M), 1);
+    assert_eq!(rt.n_blocks_in_class(DemandClass::S), 0);
+    assert!(
+        (rt.restore_u_in_class(DemandClass::L) - 0.5).abs() < 1e-9,
+        "1 of 2 L restorable U"
+    );
+    assert_eq!(
+        rt.restore_s_in_class(DemandClass::L),
+        0.0,
+        "no L restorable S"
+    );
+    assert_eq!(
+        rt.restore_o_in_class(DemandClass::L),
+        1.0,
+        "both L restorable O"
+    );
+    assert_eq!(rt.restore_u_in_class(DemandClass::M), 1.0);
+    assert!(
+        rt.restore_u_in_class(DemandClass::S).is_nan(),
+        "an empty class is NaN, not 0"
+    );
+}
+
+#[test]
+fn honest_hetero_hard_is_registered_and_carries_the_hard_board_row() {
+    // WARN-2: the hard regime is a registered scenario with INV-HETERO-HARD (same measure +
+    // frozen threshold as the light row). Structural rows PASS; the hard row's PASS/FAIL is the
+    // credit-lock finding (validated on the full run).
+    let s = find_scenario("honest_hetero_hard").expect("registered");
+    assert_eq!(s.id.as_str(), "honest_hetero_hard");
+    assert_eq!(s.world.demand.disk_policy(), DiskPolicy::Fixed);
+    let mut sc = s;
+    sc.world.n_nodes = 40;
+    sc.horizon = 90;
+    sc.seeds = vec![1, 2];
+    let result = run(&sc, &sc.seeds.clone());
+    assert!(result.per_seed_hetero.iter().all(|h| h.is_some()));
+    let verdicts = evaluate_board(&sc, &result);
+    let ids: Vec<&str> = verdicts.iter().map(|v| v.id).collect();
+    assert_eq!(
+        ids,
+        vec!["INV-DETERMINISM", "INV-ANTI-ORACLE", "INV-HETERO-HARD"]
+    );
+    assert_eq!(verdicts[0].kind, VerdictKind::Pass, "determinism");
+    assert_eq!(verdicts[1].kind, VerdictKind::Pass, "anti-oracle");
+}
+
+#[test]
+fn honest_hetero_v2_is_registered_and_produces_a_per_class_report() {
+    let s = find_scenario("honest_hetero_v2").expect("registered");
+    assert_eq!(s.id.as_str(), "honest_hetero_v2");
+    let sc = tiny_hetero();
+    let result = run(&sc, &sc.seeds.clone());
+    assert!(
+        result.per_seed_hetero.iter().all(|h| h.is_some()),
+        "every seed carries a hetero report"
+    );
+    let h = result.per_seed_hetero[0].as_ref().unwrap();
+    assert_eq!(h.n_blocks, [1, 3, 10], "S/M/L footprint sizes");
+    assert!(
+        h.class[DemandClass::L.index()].n_owners_present > 0,
+        "there are L-class owners"
+    );
+    // The big footprint is NOT locked at zero placement (the archive-0% artifact must not
+    // recur): SOME of the L footprint reaches floor.
+    assert!(
+        h.class[DemandClass::L.index()].floor_completeness > 0.0,
+        "L footprint places (not the archive-0% artifact): {}",
+        h.class[DemandClass::L.index()].floor_completeness
+    );
+}
+
+#[test]
+fn hetero_report_is_bit_identical_on_repeat() {
+    // Determinism (spec §10 п.13): the seeded class assignment + god-view placement metrics
+    // re-run bit-identical.
+    let sc = tiny_hetero();
+    let seeds = sc.seeds.clone();
+    let r1 = run(&sc, &seeds);
+    let r2 = run(&sc, &seeds);
+    for (a, b) in r1.per_seed_hetero.iter().zip(&r2.per_seed_hetero) {
+        match (a, b) {
+            (Some(x), Some(y)) => {
+                assert!(hetero_bit_eq(x, y), "hetero report bit-identical on repeat")
+            }
+            (None, None) => {}
+            _ => panic!("hetero presence differs between runs"),
+        }
+    }
+}
+
+#[test]
+fn honest_hetero_v2_board_carries_the_no_starvation_row() {
+    // The board carries the two structural rows + INV-HETERO-NO-STARVATION; the structural
+    // rows PASS (the no-starvation row's PASS/FAIL is the finding, validated on the full run).
+    let sc = tiny_hetero();
+    let result = run(&sc, &sc.seeds.clone());
+    let verdicts = evaluate_board(&sc, &result);
+    let ids: Vec<&str> = verdicts.iter().map(|v| v.id).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "INV-DETERMINISM",
+            "INV-ANTI-ORACLE",
+            "INV-HETERO-NO-STARVATION"
+        ]
+    );
+    assert_eq!(verdicts[0].kind, VerdictKind::Pass, "determinism");
+    assert_eq!(verdicts[1].kind, VerdictKind::Pass, "anti-oracle");
+}
+
+#[test]
+fn hetero_report_text_is_byte_identical_on_repeat() {
+    let sc = tiny_hetero();
+    let seeds = sc.seeds.clone();
+    let r1 = run(&sc, &seeds);
+    let t1 = format_report(&sc, &r1, &evaluate_board(&sc, &r1));
+    let r2 = run(&sc, &seeds);
+    let t2 = format_report(&sc, &r2, &evaluate_board(&sc, &r2));
+    assert_eq!(t1, t2, "hetero report must be byte-identical on repeat");
+    assert!(
+        t1.contains("hetero-v2 (D1)"),
+        "the report renders the hetero section"
+    );
+}
+
+#[test]
+fn dr_hetero_splits_restore_truth_by_demand_class() {
+    // dr_hetero strikes one reliable S/M/L victim at the same tick, so restore-truth carries
+    // blocks from more than one demand class — the per-class DR cut.
+    let mut sc = dr_hetero();
+    sc.world.n_nodes = 60;
+    sc.horizon = 150;
+    sc.seeds = vec![42, 43];
+    let result = run(&sc, &sc.seeds.clone());
+    let rt = result
+        .per_seed_restore
+        .iter()
+        .flatten()
+        .next()
+        .expect("dr_hetero produces restore-truth");
+    let classes: std::collections::BTreeSet<DemandClass> =
+        rt.blocks.iter().map(|b| b.class).collect();
+    assert!(
+        classes.len() > 1,
+        "the S/M/L victims give a per-class split, got {classes:?}"
+    );
 }

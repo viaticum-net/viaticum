@@ -43,6 +43,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::sim_adv::hetero::DemandClass;
 use crate::sim_adv::scenario::WorldParams;
 use crate::sim_dynamic::generator::{DAYS_PER_TICK, GiverTier, World, online};
 
@@ -73,6 +74,8 @@ pub struct BlockOutcome {
     pub iota: f64,
     /// The victim's giver tier (for the tier breakdown, metric #7).
     pub tier: GiverTier,
+    /// The victim's DEMAND CLASS (hetero-v2): the per-class restore-truth cut (`dr_hetero`).
+    pub class: DemandClass,
     /// Distinct collectable holders, ANY symbol (floor + cream) — the BLOCK-1 count.
     pub n_collectable_any: usize,
     /// Distinct collectable holders, FLOOR symbols only — the durability count.
@@ -161,6 +164,36 @@ impl RestoreTruth {
         }
         rows.iter().filter(|b| b.restorable_u).count() as f64 / rows.len() as f64
     }
+
+    /// Restore-truth (any model) within one DEMAND CLASS (`NaN` if the class has no block
+    /// here). `pred` picks the model (U / S / O / floor) — the per-class DR cut (`dr_hetero`).
+    fn restore_in_class(&self, class: DemandClass, pred: impl Fn(&BlockOutcome) -> bool) -> f64 {
+        let rows: Vec<&BlockOutcome> = self.blocks.iter().filter(|b| b.class == class).collect();
+        if rows.is_empty() {
+            return f64::NAN;
+        }
+        rows.iter().filter(|b| pred(b)).count() as f64 / rows.len() as f64
+    }
+
+    /// Model-U restore-truth within one demand class.
+    pub fn restore_u_in_class(&self, class: DemandClass) -> f64 {
+        self.restore_in_class(class, |b| b.restorable_u)
+    }
+
+    /// Model-S (bandwidth-aware) restore-truth within one demand class.
+    pub fn restore_s_in_class(&self, class: DemandClass) -> f64 {
+        self.restore_in_class(class, |b| b.restorable_s)
+    }
+
+    /// Model-O (one-shot, no-retry) restore-truth within one demand class.
+    pub fn restore_o_in_class(&self, class: DemandClass) -> f64 {
+        self.restore_in_class(class, |b| b.restorable_o)
+    }
+
+    /// Surviving-victim blocks in one demand class (the per-class denominator).
+    pub fn n_blocks_in_class(&self, class: DemandClass) -> usize {
+        self.blocks.iter().filter(|b| b.class == class).count()
+    }
 }
 
 /// Bit-exact equality of two restore-truth results (used by the determinism board row).
@@ -173,6 +206,7 @@ pub fn bit_eq(a: &RestoreTruth, b: &RestoreTruth) -> bool {
         && a.blocks.iter().zip(&b.blocks).all(|(x, y)| {
             x.owner == y.owner
                 && x.block_id == y.block_id
+                && x.class == y.class
                 && x.iota.to_bits() == y.iota.to_bits()
                 && x.n_collectable_any == y.n_collectable_any
                 && x.n_collectable_floor == y.n_collectable_floor
@@ -198,6 +232,7 @@ struct TrackedBlock {
     block_id: usize,
     iota: f64,
     tier: GiverTier,
+    class: DemandClass,
     return_tick: u64,
     /// Holder → its symbol's facts, for every holder online ≥ once in the window while
     /// still holding an alive symbol (Model U/S). BTreeMap ⇒ deterministic iteration.
@@ -240,11 +275,17 @@ impl RestoreTracker {
         self.first_disaster_tick.is_some()
     }
 
-    /// Record a Disaster on `victim` at `disaster_tick`. Snapshots the victim's blocks
-    /// that EVER met their floor (the denominator — a never-fully-backed-up block is not a
-    /// restore failure). Call AFTER [`disaster_strike`](crate::sim_dynamic::engine::disaster_strike):
-    /// it reads `floor_ever_met` / ι / tier, all untouched by the strike.
-    pub fn on_disaster(&mut self, world: &World, victim: usize, disaster_tick: u64) {
+    /// Record a Disaster on `victim` (of demand `class`) at `disaster_tick`. Snapshots the
+    /// victim's blocks that EVER met their floor (the denominator — a never-fully-backed-up
+    /// block is not a restore failure). Call AFTER [`disaster_strike`](crate::sim_dynamic::
+    /// engine::disaster_strike): it reads `floor_ever_met` / ι / tier, all untouched by the strike.
+    pub fn on_disaster(
+        &mut self,
+        world: &World,
+        victim: usize,
+        disaster_tick: u64,
+        class: DemandClass,
+    ) {
         self.n_victims += 1;
         self.first_disaster_tick = Some(match self.first_disaster_tick {
             Some(t) => t.min(disaster_tick),
@@ -261,6 +302,7 @@ impl RestoreTracker {
                 block_id: b.id,
                 iota: b.iota,
                 tier,
+                class,
                 return_tick,
                 collectable: BTreeMap::new(),
                 collectable_oneshot: BTreeMap::new(),
@@ -323,6 +365,7 @@ impl RestoreTracker {
                     block_id: tb.block_id,
                     iota: tb.iota,
                     tier: tb.tier,
+                    class: tb.class,
                     n_collectable_any: n_any,
                     n_collectable_floor: n_floor,
                     n_collectable_oneshot: n_oneshot,

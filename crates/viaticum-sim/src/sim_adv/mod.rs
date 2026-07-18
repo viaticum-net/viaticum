@@ -40,6 +40,7 @@ mod tests;
 
 pub mod brier;
 pub mod cli;
+pub mod hetero;
 pub mod metrics;
 pub mod predators;
 pub mod registry;
@@ -51,6 +52,9 @@ pub mod verdict;
 
 pub use brier::{BrierBucket, BrierReport, Calibration, DEFAULT_BRIER_BUCKETS, IncompleteSummary};
 pub use cli::{Cli, SimAdvError, Sweep, parse_cli};
+pub use hetero::{
+    ClassMetrics, DemandClass, DemandMix, HeteroReport, HeteroSample, apply_demand_classes,
+};
 pub use metrics::MetricSet;
 pub use predators::{AdvMetrics, RunMode, collect_adv_metrics, hook_for, inject_adversaries};
 pub use registry::{all_scenarios, find_scenario};
