@@ -1482,20 +1482,33 @@ pub fn estimate_block_survival(
     let v_per_symbol = req.volume_per_symbol();
     let tau = req.tau.max(0.0);
 
-    // One position per holder, labelled by its observable correlate group. NO
-    // best-per-bucket collapse — the A.9 convolution handles any number of symbols
-    // per group; the ≤1/group spread is enforced by `place`, not here.
-    let positions: Vec<(BucketKey, f64)> = placement
-        .iter()
-        .map(|obs| {
-            let p = estimate_surface(obs, prior, v_per_symbol, tau)
-                .r_hat
-                .clamp(0.0, 1.0);
-            (bucket_key(obs, policy), p)
-        })
-        .collect();
+    // A.9′ (Р-8) врезка: partition holders into correlate GROUPS by their observable
+    // key ([`bucket_key`]: `addr_subnet` by the §7 default, or `master_id`), each
+    // holder carrying one symbol (`s_h = 1` in the kernel's one-symbol-per-holder
+    // model) at its conservative surface prob. NO best-per-bucket collapse — the A.9′
+    // convolution honestly carries every symbol in the group; the ≤1/group spread is a
+    // `place`-side concern (now the BLOCK-1 guard), not the estimate's.
+    //
+    // Because `s_h = 1` here, `block_survival_grouped` degenerates to the per-symbol
+    // A.9 [`group_min_survival`] (its comonotone staircase over unit weights is exactly
+    // the per-symbol comonotone law, and construction B is the same
+    // `correlated_recovery_prob`) — so the estimate is numerically unchanged, and in
+    // the singleton-group substrate it is bit-identical to `correlated_recovery_prob`.
+    // Groups are built in insertion order via a linear scan (no HashMap ⇒ deterministic).
+    let mut groups: Vec<(BucketKey, Vec<(u32, f64)>)> = Vec::new();
+    for obs in placement {
+        let p = estimate_surface(obs, prior, v_per_symbol, tau)
+            .r_hat
+            .clamp(0.0, 1.0);
+        let key = bucket_key(obs, policy);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, hs)) => hs.push((1, p)),
+            None => groups.push((key, vec![(1, p)])),
+        }
+    }
+    let grouped: Vec<Vec<(u32, f64)>> = groups.into_iter().map(|(_, hs)| hs).collect();
 
-    group_min_survival(&positions, req.k_eff)
+    block_survival_grouped(&grouped, req.k_eff as u32)
 }
 
 /// `P(≥ k successes)` for independent Bernoulli trials with the given success
@@ -1662,6 +1675,176 @@ fn group_min_survival(positions: &[(BucketKey, f64)], k_eff: usize) -> f64 {
     let r_a = comonotone_within_groups_at_least(positions, k_eff);
 
     r_a.min(r_b)
+}
+
+// ============================================================
+// A.9′ (Р-8) — HOLDER-level correlation-aware worst-case block survival, built ON
+// TOP of the production reliability DP. The holder-weighted generalisation of the
+// per-symbol A.9 above: the unit of survival is a HOLDER carrying `s_h` symbols
+// (comonotone within the holder — its symbols live/die together), and correlate
+// groups partition HOLDERS, not symbols. `4r_rebase_quanta.md` §3 / decision_model §5.
+// ============================================================
+
+/// The comonotone survivor-count STAIRCASE of ONE correlate group (A.9′ construction
+/// A, `4r_rebase_quanta.md` §3). A single shared uniform `U_c` drives every holder in
+/// the group, so a holder survives iff `U_c ≤ p_h` and the survivors are NESTED:
+/// sorting the group by `p` DESCENDING (`p₍₁₎ ≥ … ≥ p₍ₘ₎`), the survivor SYMBOL count
+/// is the prefix SUM of the weights `S_j = Σ_{i≤j} s₍ᵢ₎` with law
+///
+/// ```text
+/// P(N_c = 0)   = 1 − p₍₁₎
+/// P(N_c = S_j) = p₍ⱼ₎ − p₍ⱼ₊₁₎      (1 ≤ j ≤ m, convention p₍ₘ₊₁₎ = 0)
+/// ```
+///
+/// Returns the `(added_symbols, probability)` outcomes UNCAPPED (the caller convolves
+/// and caps at `k_eff`). The probabilities telescope to exactly `1` — a proper law —
+/// which is the load-bearing invariant `a9_staircase_sums_to_one` asserts. Survival
+/// probs are clamped to `[0,1]` (four_r convention). An empty group yields the single
+/// deterministic outcome `(0, 1.0)` (it contributes no survivors, never NaN).
+///
+/// The prefix sums use `u64` so a real-scale group (≤30 holders × up to 2048 symbols)
+/// cannot overflow the survivor axis.
+fn comonotone_group_law(group: &[(u32, f64)]) -> Vec<(u64, f64)> {
+    if group.is_empty() {
+        return vec![(0, 1.0)];
+    }
+    // Sort the group's holders by survival prob DESCENDING (staircase order).
+    let mut hs: Vec<(u32, f64)> = group.iter().map(|&(s, p)| (s, p.clamp(0.0, 1.0))).collect();
+    hs.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let m = hs.len();
+
+    let mut law: Vec<(u64, f64)> = Vec::with_capacity(m + 1);
+    law.push((0, 1.0 - hs[0].1)); // N_c = 0 with probability 1 − p₍₁₎
+    let mut prefix: u64 = 0;
+    for j in 0..m {
+        prefix += hs[j].0 as u64; // S_j = Σ_{i≤j} s₍ᵢ₎
+        let p_j = hs[j].1;
+        let p_next = if j + 1 < m { hs[j + 1].1 } else { 0.0 }; // p₍ⱼ₊₁₎, with p₍ₘ₊₁₎ = 0
+        law.push((prefix, p_j - p_next));
+    }
+    law
+}
+
+/// A.9′ (Р-8) worst-case block survival `R̂_wc` over EXPLICIT correlate groups of
+/// WEIGHTED holders — `min(R̂_A, R̂_B)` (`4r_rebase_quanta.md` §3, decision_model §5).
+///
+/// `groups[c]` = the holders of correlate group `c`, each `(s_h, p_h)` = its symbol
+/// weight and survival probability. Two GLOBAL constructions, both with independence
+/// BETWEEN groups:
+///
+/// * **B — independent holders** = [`reliability::correlated_recovery_prob`] over ALL
+///   holders flattened (the production DP `P(Σ_{alive} s_h ≥ k_eff)`), called
+///   VERBATIM. A.9′ is built ON TOP of the production reliability function, not beside
+///   it (AC-2 "поверх, не рядом") — the same code the daemon already ships.
+/// * **A — comonotone within a group, independent between** = each group's
+///   [`comonotone_group_law`] staircase, DP-convolved on the survivor axis and capped
+///   at `k_eff`.
+///
+/// **Why `min` (`4r_rebase_quanta.md` §3 BLOCK-1).** The sanctioned within-group
+/// dependency family is the common-shock MIXTURE `α·comonotone + (1−α)·independent`
+/// (group-wide shock — power/ISP — vs individual fates); for any such mixture
+/// `P = α·P_A + (1−α)·P_B ≥ min(P_A, P_B)`, so `min` is a PROVABLE lower bound within
+/// the family. Out-of-family "k-of-m within one group" couplings (where `min` is not a
+/// bound) are made unreachable by the placement BLOCK-1 guard ([`place`] /
+/// [`block1_guard_admits`]): no group is decode-critical.
+///
+/// **Singleton equivalence (AC-2), load-bearing.** When every group is a singleton
+/// (one holder), that holder's staircase is a single `Bernoulli(p_h)` over `{0, s_h}`
+/// — the EXACT per-holder step of `correlated_recovery_prob` — so construction A walks
+/// the same holders through the same capped recurrence as construction B and `R̂_A`,
+/// `R̂_B` are BIT-identical, i.e. `R̂_wc ≡ correlated_recovery_prob`. The current
+/// substrate has no ASN/geo sources (D8), so every group IS a singleton and the 4R
+/// kernel and the production reliability code compute the SAME number. That is the
+/// врезка's regression guarantee.
+///
+/// Degenerate cases: `k_eff == 0` ⇒ `1.0` (nothing needed); empty `groups` or total
+/// weight `Σ s_h < k_eff` ⇒ `0.0` (structurally undeliverable — even all-survive
+/// cannot reach `k_eff`). Survival probs are CLAMPED to `[0,1]` (the four_r
+/// convention: [`estimate_surface`] / [`poisson_binomial_at_least`] clamp too). The
+/// clamp makes `correlated_recovery_prob`'s range check always pass, so its `Result`
+/// is `Ok` and `unwrap_or(0.0)` is a pure defensive floor, never a real error path.
+///
+/// Cost `O((Σ_c |group_c|) · k_eff)` per construction — trivial (H ≤ 30, k_eff ≤ 2052).
+pub fn block_survival_grouped(groups: &[Vec<(u32, f64)>], k_eff: u32) -> f64 {
+    if k_eff == 0 {
+        return 1.0;
+    }
+    let cap = k_eff as usize;
+
+    // Structural zero: fewer symbols than k_eff ⇒ the threshold is unreachable even if
+    // every holder survives (max Σ N_c = the total symbol weight).
+    let total: u64 = groups.iter().flatten().map(|&(s, _)| s as u64).sum();
+    if total < k_eff as u64 {
+        return 0.0;
+    }
+
+    // --- Construction B: production reliability DP over all holders, VERBATIM. ---
+    let flat: Vec<(u32, f64)> = groups
+        .iter()
+        .flatten()
+        .map(|&(s, p)| (s, p.clamp(0.0, 1.0)))
+        .collect();
+    let r_b = crate::reliability::correlated_recovery_prob(&flat, k_eff).unwrap_or(0.0);
+
+    // --- Construction A: comonotone within a group, independent between. ---
+    // dp[n] = P(total survivors so far = n), with n ≥ k_eff lumped into dp[cap].
+    let mut dp = vec![0.0f64; cap + 1];
+    dp[0] = 1.0;
+    for group in groups {
+        let law = comonotone_group_law(group);
+        let mut next = vec![0.0f64; cap + 1];
+        for (x, &mass) in dp.iter().enumerate() {
+            if mass == 0.0 {
+                continue;
+            }
+            for &(add, prob) in &law {
+                if prob == 0.0 {
+                    continue;
+                }
+                let nx = ((x as u64) + add).min(cap as u64) as usize;
+                next[nx] += mass * prob;
+            }
+        }
+        dp = next;
+    }
+    let r_a = dp[cap].clamp(0.0, 1.0);
+
+    r_a.min(r_b)
+}
+
+/// BLOCK-1 placement-guard predicate (Р-8, `4r_rebase_quanta.md` §3): may one more
+/// symbol be added to correlate group `c` without risking the block becoming
+/// decode-critical on `c` (i.e. dying if the WHOLE of group `c` is lost)?
+///
+/// Admissible iff group `c` is currently EMPTY — opening a fresh group, exactly as the
+/// retired ≤1/group spread opened a fresh bucket, the block does not yet depend on it
+/// — OR the chosen set already holds ≥ `k_eff` symbols OUTSIDE group `c`, so a further
+/// symbol on `c` cannot make the block depend on `c`: losing `c` entirely still leaves
+/// ≥ `k_eff` survivors.
+///
+/// `symbols_in_c` / `symbols_total` are the CURRENT (pre-add) chosen counts;
+/// `symbols_total − symbols_in_c = Σ_{h∉c} s_h`. Adding a symbol to `c` raises both by
+/// one, leaving `Σ_{h∉c} s_h` unchanged, so testing the pre-add value is exact — and
+/// it is precisely the "convenient form" `S_c ≤ S_total − k_eff` of the invariant
+/// (`4r_rebase_quanta.md` §3): post-add `S_c+1 ≤ (S_total+1) − k_eff ⟺
+/// symbols_total − symbols_in_c ≥ k_eff`.
+///
+/// **Guarantee.** Every group that ever receives a SECOND symbol did so while ≥ `k_eff`
+/// symbols already sat outside it, and placement never removes symbols, so at
+/// termination no MULTI-symbol group is decode-critical. Single-symbol groups are
+/// governed by `r_target` exactly as under the old cap (a minimal `k_eff`-group
+/// placement was decode-critical under BOTH the old ≤1/bucket cap and this guard;
+/// redundancy beyond that is `r_target`'s job, and cream's above the floor).
+///
+/// **Equivalence to the retired ≤1/group cap for singleton groups
+/// (`guard_equals_legacy_cap_for_singleton_groups`).** With ≤1 symbol per group every
+/// candidate opens a FRESH group (`symbols_in_c == 0`), so this predicate is ALWAYS
+/// true — it admits exactly the fresh-bucket candidates the old spread admitted, and a
+/// second-per-group symbol (which the old cap forbade outright) is only permitted here
+/// once the block is already safe against that group's loss. Neutral in the singleton
+/// world; the sanctioned behaviour change is confined to genuine multi-holder groups.
+fn block1_guard_admits(symbols_in_c: u64, symbols_total: u64, k_eff: u32) -> bool {
+    symbols_in_c == 0 || symbols_total.saturating_sub(symbols_in_c) >= k_eff as u64
 }
 
 // ============================================================
@@ -2043,16 +2226,22 @@ const CREDIT_PLACE_HEADROOM: f64 = 4.0;
 /// slot versus a surface-first pick. Left as the faithful greedy-argmax transcription;
 /// revisit if транш 3 layers reciprocity/cream on placement.
 ///
-/// ## Spread by address (§7) — the ≤1/bucket cap stays HARD (NOTE-1)
+/// ## Spread by address (§7) — the BLOCK-1 guard replaces the old ≤1/bucket cap (Р-8)
 ///
-/// At most ONE symbol per observable bucket (`policy.cap_mode`: `addr_subnet` by
-/// default, or `master_id`). A candidate whose bucket is already occupied is SKIPPED.
-/// This is load-bearing: since the A.9 estimator (транш 2a) no longer refuses
-/// same-subnet concentration (it honestly credits the comonotone group), the ≤1/group
-/// spread is the ONLY structural barrier against "pile everything into one strong
-/// subnet, reach R̂ ≥ r_target with no spread" (§7 safety). Under
-/// [`CapMode::MasterIdOnly`] a same-subnet farm presents N master-ids → N buckets →
-/// the spread is bypassed (the SIM-6 sign: subnet-spread beats master-spread).
+/// Р-8 replaces the hard "≤1 symbol per observable bucket" spread with the BLOCK-1
+/// guard [`block1_guard_admits`]: no correlate group may become decode-critical (the
+/// block must survive losing ANY one group — `addr_subnet` by default, or `master_id`
+/// under [`CapMode::MasterIdOnly`]). A candidate in an already-occupied group is
+/// admissible only once the block already holds ≥ `k_eff` symbols OUTSIDE that group;
+/// a fresh group is always admissible. In the singleton-group substrate (all holders
+/// in distinct buckets) every candidate opens a fresh group, so the guard admits
+/// EXACTLY the fresh-bucket candidates the old ≤1/bucket cap admitted — the change is
+/// neutral there and only lets a genuine multi-holder group carry SAFE intra-group
+/// redundancy (guarded so it is never a single point of failure). Under
+/// [`CapMode::MasterIdOnly`] a same-subnet farm presents N master-ids → N distinct
+/// groups → the guard sees N safe groups (the SIM-6 sign: subnet-spread beats
+/// master-spread, unchanged). Cream ([`place_cream`]) is exempt (it keeps its own
+/// ≤1/bucket spread, outside the `r_target` count), as under the old cap.
 ///
 /// ## Per-holder credit cap (Р-5 / A.13)
 ///
@@ -2098,15 +2287,13 @@ pub fn place(
 
     let mut chosen: Vec<usize> = Vec::new();
     let mut chosen_obs: Vec<FirstHandObs> = Vec::new();
-    // Buckets already occupied by the chosen set: the §7 spread allows ≤1 symbol per
-    // observable address bucket (NOTE-1: kept HARD).
-    let mut occupied: Vec<BucketKey> = Vec::new();
     let mut best_r_hat = if req.k_eff == 0 { 1.0 } else { 0.0 };
 
     loop {
         // Pick the admissible candidate maximising R̂_wc(chosen ∪ {cand}) — i.e. the
-        // largest marginal ΔR̂_wc (A.10). Admissible = not already chosen, in a FRESH
-        // bucket (§7 hard spread), and credit-uncapped (Р-5). Tie-break: smallest
+        // largest marginal ΔR̂_wc (A.10). Admissible = not already chosen, credit-
+        // uncapped (Р-5), and BLOCK-1-guard-admitted (Р-8: opening a fresh group, or
+        // ≥ k_eff symbols already outside this candidate's group). Tie-break: smallest
         // index (deterministic; preserves adversary-first ordering).
         let mut best_cand: Option<usize> = None;
         let mut best_cand_r = f64::NEG_INFINITY;
@@ -2118,9 +2305,15 @@ pub fn place(
             if !credit_ok[cand] {
                 continue;
             }
-            // §7 spread: a candidate whose observable bucket already holds a symbol is
-            // one subnet position already claimed → skip (hard ≤1/bucket).
-            if occupied.contains(&bucket_key(&candidates[cand], policy)) {
+            // BLOCK-1 guard (Р-8) replaces the old hard ≤1/bucket skip: admit a
+            // same-group candidate only once the block is already safe against losing
+            // that group; a fresh group is always admissible (singleton-neutral).
+            let key = bucket_key(&candidates[cand], policy);
+            let symbols_in_c = chosen_obs
+                .iter()
+                .filter(|o| bucket_key(o, policy) == key)
+                .count() as u64;
+            if !block1_guard_admits(symbols_in_c, chosen_obs.len() as u64, req.k_eff as u32) {
                 continue;
             }
             // Marginal argmax: R̂_wc of the chosen set WITH this candidate added.
@@ -2138,7 +2331,6 @@ pub fn place(
             Some(cand) => {
                 chosen.push(cand);
                 chosen_obs.push(candidates[cand].clone());
-                occupied.push(bucket_key(&candidates[cand], policy));
                 best_r_hat = best_cand_r;
                 if best_r_hat >= req.r_target {
                     return PlacementResult::Placed {

@@ -933,6 +933,48 @@ fn retention_cap_deep_silent_partner_keeps_depth_floor_volume() {
 }
 
 #[test]
+fn v_ret_cap_sane_at_real_quanta() {
+    // T7 (Р-8, `4r_rebase_quanta.md` §5.4 worked example): the Р-7 volume cap
+    // V_ret = V_free + κ_O/c_recip produces SANE gb numbers on the real substrate
+    // quanta, through the CORE `kappa_key` / `RetentionCap::v_ret`.
+    let dp = dp_canon(); // g_star = g*(10 gb, λ=1/60) = 600 gb·days, d_ref = 3650, w_d = 0.5
+    let cap = RetentionCap {
+        v_free: 1.0, // §5.4 default V_free = 1 gb
+        c_recip: 30.0,
+    };
+
+    // (1) Honest partner, one YEAR of 10 gb service: g_ho ≈ 10·60 = 600 gb·days (the
+    // leaky-integrator steady state g*(10, λ=1/60)), no depth floor drawn (D = 0). Then
+    // κ_O = g_ho = 600 ⇒ V_ret = 1 + 600/30 = 21 gb (I keep ≈ 2× what it truly serves).
+    let g_ho = capital_steady_state(10.0, 1.0 / 60.0);
+    assert!(
+        (g_ho - 600.0).abs() < 1e-9,
+        "year×10gb ⇒ g_ho = 600, got {g_ho}"
+    );
+    let kappa_honest = kappa_key(g_ho, 0.0, &dp);
+    let v_ret_honest = cap.v_ret(kappa_honest);
+    assert!(
+        (v_ret_honest - 21.0).abs() < 1e-9,
+        "honest year×10gb partner ⇒ V_ret ≈ 21 gb, got {v_ret_honest}"
+    );
+
+    // (2) ε-give whale: κ_O ≈ ε ⇒ V_ret ≈ V_free (parking bounded, P1b). An almost-zero
+    // reciprocal capital lifts V_ret only by ε/c_recip.
+    let kappa_eps = kappa_key(0.03, 0.0, &dp);
+    let v_ret_eps = cap.v_ret(kappa_eps);
+    assert!(
+        (v_ret_eps - cap.v_free).abs() < 0.01,
+        "ε-whale ⇒ V_ret ≈ V_free = {}, got {v_ret_eps}",
+        cap.v_free
+    );
+    assert!(
+        v_ret_honest > 20.0 * v_ret_eps,
+        "the honest partner's cap is an order of magnitude above the ε-whale's: \
+         honest={v_ret_honest} eps={v_ret_eps}"
+    );
+}
+
+#[test]
 fn retention_cap_disabled_when_c_recip_nonpositive() {
     // WARN-1 guard: c_recip ≤ 0 DISABLES the cap (no /0, no evict-all). Behaviour then
     // reduces to the pre-3b pressure list (regress-equivalence).
@@ -1764,6 +1806,194 @@ fn block_survival_wc_two_groups_are_independent() {
     );
 }
 
+// ============================================================
+// A.9′ (Р-8) — block_survival_grouped: holder-weighted min(comonotone-ladder,
+// correlated_recovery_prob). T1-T4 from `4r_rebase_quanta.md` §9. Deterministic
+// PRNG only (no clock / entropy — the anti-oracle + reproducibility frame).
+// ============================================================
+
+/// Deterministic splitmix64 PRNG — fixed-seed, no clock/entropy (reproducible).
+struct Rng(u64);
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed)
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    /// Uniform in [0, 1) with 53-bit resolution.
+    fn unit(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
+    }
+    /// Uniform integer in [lo, hi] inclusive.
+    fn range(&mut self, lo: u32, hi: u32) -> u32 {
+        lo + (self.next_u64() % (u64::from(hi - lo) + 1)) as u32
+    }
+}
+
+#[test]
+fn a9_equals_correlated_recovery_when_no_groups() {
+    // T1 / AC-2: with every holder in its OWN singleton group (the current substrate —
+    // no ASN/geo correlates), A.9′ `block_survival_grouped` is numerically identical to
+    // the production `correlated_recovery_prob` (the comonotone staircase of a lone
+    // holder is a single Bernoulli ⇒ both constructions coincide). ≥1000 random
+    // instances, deterministic seed; the singleton degeneration is exact so |Δ| = 0.
+    let mut rng = Rng::new(0xA9A9_0001);
+    let mut checked = 0;
+    for _ in 0..1500 {
+        let m = rng.range(1, 8) as usize; // holders
+        let mut holders: Vec<(u32, f64)> = Vec::with_capacity(m);
+        let mut total_s: u64 = 0;
+        for _ in 0..m {
+            let s = rng.range(1, 6);
+            let p = rng.unit();
+            total_s += u64::from(s);
+            holders.push((s, p));
+        }
+        // k_eff spanning below, at, and above the total symbol weight.
+        let k_eff = rng.range(1, (total_s as u32) + 2);
+
+        // Singleton groups: each holder is its own correlate group.
+        let groups: Vec<Vec<(u32, f64)>> = holders.iter().map(|&h| vec![h]).collect();
+        let a9 = block_survival_grouped(&groups, k_eff);
+        let prod = crate::reliability::correlated_recovery_prob(&holders, k_eff).unwrap();
+        assert!(
+            (a9 - prod).abs() < 1e-12,
+            "A.9′ must equal correlated_recovery_prob for singletons: a9={a9} prod={prod} \
+             (holders={holders:?} k_eff={k_eff})"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 1000,
+        "must exercise ≥1000 instances, ran {checked}"
+    );
+}
+
+#[test]
+fn a9_staircase_sums_to_one() {
+    // T2a: the comonotone group law is a PROPER probability distribution — the
+    // staircase probabilities telescope to exactly 1 (1−p₍₁₎ + Σ(p₍ⱼ₎−p₍ⱼ₊₁₎) = 1).
+    // Random groups, deterministic seed.
+    let mut rng = Rng::new(0xA9A9_0002);
+    for _ in 0..1000 {
+        let m = rng.range(1, 10) as usize;
+        let group: Vec<(u32, f64)> = (0..m).map(|_| (rng.range(1, 8), rng.unit())).collect();
+        let law = comonotone_group_law(&group);
+        let sum: f64 = law.iter().map(|&(_, p)| p).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "staircase law must sum to 1: sum={sum} (group={group:?} law={law:?})"
+        );
+        // Every outcome probability is non-negative (sorted-desc probs ⇒ no negatives).
+        for &(_, p) in &law {
+            assert!(p >= -1e-15, "law probability must be ≥ 0: {p}");
+        }
+    }
+}
+
+#[test]
+fn a9_min_bound_holds_on_mixture_family() {
+    // T2b / BLOCK-1: `min(R̂_A, R̂_B)` is a valid LOWER bound for the whole sanctioned
+    // common-shock family α·comonotone + (1−α)·independent. Monte-Carlo the block-level
+    // mixture (each trial: with prob α ALL groups take a shared shock U_c, else every
+    // holder is independent) and assert the empirical survival P_mix ≥ R̂_wc − 3σ_MC.
+    // Deterministic seed; groups genuinely multi-holder so the two constructions differ.
+    let mut rng = Rng::new(0xA9A9_0003);
+    // Three correlate groups of a few holders each; unit weights so k_eff is a plain
+    // survivor count and the mixture is easy to reason about.
+    let groups: Vec<Vec<(u32, f64)>> = vec![
+        vec![(1, 0.9), (1, 0.85), (1, 0.8)],
+        vec![(1, 0.7), (1, 0.6)],
+        vec![(1, 0.95), (1, 0.5), (1, 0.55), (1, 0.65)],
+    ];
+    let k_eff = 5u32;
+    let r_wc = block_survival_grouped(&groups, k_eff);
+
+    let n = 200_000u64;
+    for &alpha in &[0.0f64, 0.25, 0.5, 0.75, 1.0] {
+        let mut hits = 0u64;
+        for _ in 0..n {
+            let comonotone = rng.unit() < alpha; // block-level shock coin
+            let mut survivors = 0u32;
+            for group in &groups {
+                if comonotone {
+                    let u = rng.unit(); // one shared shock for the group
+                    for &(s, p) in group {
+                        if u <= p {
+                            survivors += s;
+                        }
+                    }
+                } else {
+                    for &(s, p) in group {
+                        if rng.unit() <= p {
+                            survivors += s;
+                        }
+                    }
+                }
+            }
+            if survivors >= k_eff {
+                hits += 1;
+            }
+        }
+        let p_mix = hits as f64 / n as f64;
+        let sigma = (p_mix * (1.0 - p_mix) / n as f64).sqrt();
+        assert!(
+            p_mix >= r_wc - 3.0 * sigma - 1e-12,
+            "min bound violated at α={alpha}: P_mix={p_mix} < R̂_wc={r_wc} − 3σ ({})",
+            r_wc - 3.0 * sigma
+        );
+    }
+}
+
+#[test]
+fn a9_single_group_full_copy_equals_best_holder() {
+    // T3: one correlate group whose STRONGEST holder alone carries s₍₁₎ ≥ k_eff (a full
+    // copy). Comonotone construction A = P(N_c ≥ k_eff) = P(the top holder survives) =
+    // p₍₁₎ — extra same-group holders add NO redundancy (they share the shock). The min
+    // binds to A here (independent B ≥ p₍₁₎ since the top holder alone decodes), so
+    // block_survival_grouped = p₍₁₎.
+    let k_eff = 4u32;
+    // Top holder holds a full copy (s=5 ≥ 4) at p=0.8; weaker same-group holders below.
+    let group = vec![(5u32, 0.8), (2, 0.6), (3, 0.5)];
+    let r = block_survival_grouped(&[group], k_eff);
+    assert!(
+        (r - 0.8).abs() < 1e-12,
+        "single-group full copy ⇒ R = best holder's p₍₁₎ = 0.8, got {r}"
+    );
+}
+
+#[test]
+fn a9_real_scale_no_degeneracy() {
+    // T4: production scale — 20 holders × 110 symbols each (total 2200), k_eff = 2052
+    // (NOT a structural zero: 2200 ≥ 2052). Must compute a finite, in-range R with no
+    // NaN/inf/overflow, in well under a millisecond. Deterministic seed.
+    let mut rng = Rng::new(0xA9A9_0004);
+    // Singleton groups (the substrate) with high, slightly varied survival probs.
+    let groups: Vec<Vec<(u32, f64)>> = (0..20)
+        .map(|_| vec![(110u32, 0.90 + 0.09 * rng.unit())])
+        .collect();
+    let k_eff = 2052u32;
+
+    let t0 = std::time::Instant::now();
+    let r = block_survival_grouped(&groups, k_eff);
+    let elapsed = t0.elapsed();
+
+    assert!(r.is_finite(), "R must be finite, got {r}");
+    assert!((0.0..=1.0).contains(&r), "R must be in [0,1], got {r}");
+    // Not a structural zero (2200 ≥ 2052) and not a certainty (needs ≥19 of 20 holders).
+    assert!(r > 0.0 && r < 1.0, "R must be non-degenerate, got {r}");
+    // Cost is O(H·k_eff) ≈ 4·10⁴ ops per construction — generous ceiling for CI noise.
+    assert!(
+        elapsed.as_millis() < 50,
+        "A.9′ at real scale must be well under a ms, took {elapsed:?}"
+    );
+}
+
 #[test]
 fn place_selects_enough_holders_to_reach_target() {
     let prior = SurfacePrior::default();
@@ -1787,42 +2017,73 @@ fn place_selects_enough_holders_to_reach_target() {
     }
 }
 
+/// Per-subnet symbol counts of a chosen holder set (helper for the BLOCK-1 guard
+/// invariant). Returns `(subnet, count)` pairs; `count` = symbols the placement holds
+/// in that correlate group (one symbol per holder in the kernel's `s_h = 1` model).
+fn subnet_symbol_counts(holders: &[usize], cands: &[FirstHandObs]) -> Vec<(u32, usize)> {
+    let mut counts: Vec<(u32, usize)> = Vec::new();
+    for &h in holders {
+        let s = cands[h].addr_subnet;
+        match counts.iter_mut().find(|(k, _)| *k == s) {
+            Some((_, c)) => *c += 1,
+            None => counts.push((s, 1)),
+        }
+    }
+    counts
+}
+
+/// BLOCK-1 invariant check: no correlate group is decode-critical, i.e. the block
+/// survives losing ANY one group entirely — `Σ_{h∉c} s_h ≥ k_eff` for every group `c`.
+fn assert_no_group_decode_critical(holders: &[usize], cands: &[FirstHandObs], k_eff: usize) {
+    let counts = subnet_symbol_counts(holders, cands);
+    let total: usize = counts.iter().map(|(_, c)| c).sum();
+    for &(subnet, c) in &counts {
+        assert!(
+            total - c >= k_eff,
+            "group (subnet {subnet}) is decode-critical: Σ_(h∉c) = {} < k_eff = {k_eff} \
+             (counts={counts:?})",
+            total - c
+        );
+    }
+}
+
 #[test]
-fn place_spreads_at_most_one_symbol_per_address_bucket() {
+fn place_leaves_no_group_decode_critical() {
+    // Р-8 BLOCK-1 guard (replaces the old ≤1/bucket spread — this test's ancestor was
+    // `place_spreads_at_most_one_symbol_per_address_bucket`). With an unreachable target
+    // `place` keeps adding, and — unlike the old hard cap — it MAY stack extra symbols
+    // onto a correlate group (the farm subnet), but ONLY while the block stays safe
+    // against losing that group. The guarantee is the invariant, not ≤1/bucket: every
+    // group `c` must satisfy `Σ_(h∉c) ≥ k_eff`.
     let prior = SurfacePrior::default();
     let policy = PlacementPolicy::default(); // spread by addr_subnet
-    // n=5, k_eff=2. §7 spread ⇒ at most ONE symbol per subnet bucket.
     let r = req(5, 2, 0.999_999); // unreachably high so place keeps adding
-    // Candidates: a big farm on subnet 0 (6 holders, distinct masters) + a few
-    // independents on distinct subnets. The spread must take at most one of the
-    // farm holders (one subnet bucket → one symbol).
+    // A big farm on subnet 0 (6 holders, distinct masters) + two independents on
+    // distinct subnets. The guard opens the two independents first (fresh groups),
+    // then — since ≥ k_eff=2 symbols now sit outside subnet 0 — safely stacks the farm.
     let mut cands: Vec<FirstHandObs> = (0..6).map(|i| holder(i as u8, 0, 10.0, 30.0)).collect();
     cands.push(holder(100, 100, 10.0, 30.0));
     cands.push(holder(101, 101, 10.0, 30.0));
-    let result = place(&r, &cands, &prior, &policy);
-    let holders = match &result {
-        PlacementResult::Placed { holders, .. } => holders.clone(),
-        PlacementResult::Insufficient { holders, .. } => holders.clone(),
+    let holders = match place(&r, &cands, &prior, &policy) {
+        PlacementResult::Placed { holders, .. } => holders,
+        PlacementResult::Insufficient { holders, .. } => holders,
     };
-    // Rebuild the chosen observation set and verify no subnet bucket holds >1 symbol.
-    let chosen_obs: Vec<FirstHandObs> = holders.iter().map(|&i| cands[i].clone()).collect();
-    // Number of chosen symbols must equal the number of distinct buckets spanned
-    // (≤1 per bucket), and the same-subnet farm contributes exactly one bucket.
-    assert_eq!(
-        chosen_obs.len(),
-        cluster_count(&chosen_obs, &policy),
-        "no two chosen symbols may share an address bucket (≤1 per subnet)"
-    );
-    let mut subnets: Vec<u32> = chosen_obs.iter().map(|o| o.addr_subnet).collect();
-    subnets.sort_unstable();
-    let distinct = {
-        subnets.dedup();
-        subnets.len()
-    };
-    assert_eq!(
-        distinct,
-        chosen_obs.len(),
-        "every chosen holder is on a distinct subnet (one symbol per bucket)"
+
+    // (1) No group is decode-critical — the BLOCK-1 invariant the guard maintains.
+    assert_no_group_decode_critical(&holders, &cands, r.k_eff);
+
+    // (2) The guard genuinely PERMITS safe intra-group redundancy the old ≤1/bucket cap
+    // forbade: the farm subnet 0 carries MORE than one symbol here (it was opened, then
+    // stacked once the two independents made losing it survivable).
+    let counts = subnet_symbol_counts(&holders, &cands);
+    let subnet0 = counts
+        .iter()
+        .find(|(s, _)| *s == 0)
+        .map(|(_, c)| *c)
+        .unwrap_or(0);
+    assert!(
+        subnet0 > 1,
+        "guard must allow stacking a group when safe (farm subnet 0 count={subnet0}, counts={counts:?})"
     );
 }
 
@@ -1958,10 +2219,13 @@ fn place_reaches_r_target_by_argmax_marginal() {
 }
 
 #[test]
-fn place_never_puts_two_symbols_in_one_bucket() {
-    // NOTE-1: the ≤1-symbol-per-bucket spread stays HARD under argmax. Candidates
-    // with DUPLICATE addr_subnet must never both be chosen — every chosen holder
-    // sits in a distinct bucket.
+fn place_stacks_a_group_only_after_the_block_is_safe_against_its_loss() {
+    // Р-8 BLOCK-1 guard (ancestor: `place_never_puts_two_symbols_in_one_bucket`, which
+    // asserted the retired hard ≤1/bucket cap). Under the guard, a crowded correlate
+    // group CAN receive a second symbol — but the guard permits that ONLY once ≥ k_eff
+    // symbols already sit OUTSIDE the group, so no group is ever a single point of
+    // failure. We verify (a) stacking happens (the sanctioned behaviour change) and
+    // (b) the BLOCK-1 invariant holds on the final placement.
     let prior = SurfacePrior::default();
     let policy = PlacementPolicy::default(); // spread by addr_subnet
     // Unreachably high target ⇒ place keeps adding every admissible candidate.
@@ -1981,21 +2245,52 @@ fn place_never_puts_two_symbols_in_one_bucket() {
         PlacementResult::Placed { holders, .. } => holders,
         PlacementResult::Insufficient { holders, .. } => holders,
     };
-    let chosen_subnets: Vec<u32> = holders.iter().map(|&i| cands[i].addr_subnet).collect();
-    let mut sorted = chosen_subnets.clone();
-    sorted.sort_unstable();
-    sorted.dedup();
-    assert_eq!(
-        sorted.len(),
-        chosen_subnets.len(),
-        "no two chosen symbols may share a subnet bucket: {chosen_subnets:?}"
-    );
-    // Exactly four distinct buckets exist (subnets 0,1,100,101) ⇒ at most four picks.
+
+    // (a) A crowded group is stacked past one symbol — impossible under the old cap.
+    let counts = subnet_symbol_counts(&holders, &cands);
     assert!(
-        holders.len() <= 4,
-        "cannot place more symbols than distinct buckets: {}",
-        holders.len()
+        counts.iter().any(|&(_, c)| c > 1),
+        "guard must permit stacking a crowded group: counts={counts:?}"
     );
+    // (b) BLOCK-1 invariant: no group decode-critical (block survives losing any group).
+    assert_no_group_decode_critical(&holders, &cands, r.k_eff);
+}
+
+#[test]
+fn guard_equals_legacy_cap_for_singleton_groups() {
+    // Р-8: "при группах размера 1 гвард эквивалентен прежнему кэпу". When every
+    // candidate is on a DISTINCT correlate bucket (the current substrate — no ASN/geo
+    // farms), every candidate opens a FRESH group, so the BLOCK-1 guard admits exactly
+    // the same candidates the retired hard ≤1/bucket cap did: `place` NEVER stacks a
+    // group (each chosen holder sits in a distinct bucket, ≤1 symbol/group), and the
+    // legacy cluster-count identity `chosen.len() == cluster_count(chosen)` holds. The
+    // guard's behaviour change is confined to genuine multi-holder groups.
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    // Unreachable target ⇒ place adds every admissible candidate; all on DISTINCT
+    // subnets (singleton groups).
+    let r = req(8, 3, 0.999_999);
+    let cands: Vec<FirstHandObs> = (0..8).map(|i| holder(i as u8, i, 10.0, 30.0)).collect();
+    let holders = match place(&r, &cands, &prior, &policy) {
+        PlacementResult::Placed { holders, .. } => holders,
+        PlacementResult::Insufficient { holders, .. } => holders,
+    };
+
+    // Every chosen holder is on a distinct bucket — identical to the legacy ≤1/bucket
+    // cap (no group is stacked in the singleton world).
+    let counts = subnet_symbol_counts(&holders, &cands);
+    assert!(
+        counts.iter().all(|&(_, c)| c == 1),
+        "singleton groups must never be stacked (legacy ≤1/bucket): counts={counts:?}"
+    );
+    let chosen_obs: Vec<FirstHandObs> = holders.iter().map(|&i| cands[i].clone()).collect();
+    assert_eq!(
+        chosen_obs.len(),
+        cluster_count(&chosen_obs, &policy),
+        "legacy identity: one symbol per distinct bucket"
+    );
+    // And the BLOCK-1 invariant still holds (it subsumes the legacy cap here).
+    assert_no_group_decode_critical(&holders, &cands, r.k_eff);
 }
 
 #[test]
