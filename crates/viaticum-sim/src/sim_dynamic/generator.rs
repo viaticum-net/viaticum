@@ -300,6 +300,63 @@ pub fn online(archetype: Archetype, node_id: u64, tick: u64, run_seed: u64) -> b
 /// (which uses a different first key — the owner index).
 const ONLINE_TAG: u64 = 0x0C0A_1E11_0A1D_0E11;
 
+/// The per-tick online PROBABILITY `u` the [`online`] Bernoulli compares against for
+/// `archetype` at `tick` (its threshold `u`). Mirrors [`online`] EXACTLY — it is the
+/// same `u` that feeds `holder_online`, so [`surfaced_in_window`] can lift it to a
+/// 7-day window probability without duplicating the calendar logic (F1 / D2).
+pub fn online_prob(archetype: Archetype, tick: u64) -> f64 {
+    match archetype {
+        Archetype::Weekend => {
+            if (tick % 7) >= 4 {
+                0.95
+            } else {
+                0.30
+            }
+        }
+        Archetype::Seasonal => {
+            let month = (tick % TICKS_PER_YEAR) * 12 / TICKS_PER_YEAR;
+            if (5..=7).contains(&month) { 0.20 } else { 0.95 }
+        }
+        Archetype::Nomad => 0.50,
+        other => other.base_uptime(),
+    }
+}
+
+/// F1 (D2 / rebase §6): did node `node_id` of `archetype` SURFACE at least once during
+/// the 7-day PoS window ending at `tick`? PoS forgives a whole week — a live symbol
+/// PASSES iff its holder came online on ANY of the ~7 iid days of the challenge-TTL
+/// window, so the window-surfacing probability is `p_w = 1 − (1 − u)^7` where
+/// `u = online_prob(archetype, tick)` is the per-tick daily uptime.
+///
+/// **Composed WITH the per-tick physics (rebase §6, mandatory).** So "online now ⇒
+/// surfaced" holds and the transport/restore physics of the tick is untouched, we return
+/// `online(..) ∨ extra`, where `extra` is a SEPARATE seeded Bernoulli with
+/// `p_extra = (p_w − u)/(1 − u)` on its own salted stream (independent of the `online`
+/// draw). Then `P(surfaced) = u + (1 − u)·p_extra = p_w` exactly. Guard: `u ≥ 1` ⇒ always
+/// surfaced (the holder is always online, no extra draw). The extra draw is taken ONLY
+/// when the holder is offline this tick, on the `SURFACE_TAG` stream, so it never perturbs
+/// the `online`/PoS/churn/placement draws (determinism preserved).
+pub fn surfaced_in_window(archetype: Archetype, node_id: u64, tick: u64, run_seed: u64) -> bool {
+    // "Online now ⇒ surfaced" — keep the per-tick physics.
+    if online(archetype, node_id, tick, run_seed) {
+        return true;
+    }
+    let u = online_prob(archetype, tick);
+    if u >= 1.0 {
+        return true; // always online ⇒ always surfaces (guard, no draw)
+    }
+    let p_w = 1.0 - (1.0 - u).powi(7);
+    // p_extra = (p_w − u)/(1 − u); clamp guards floating error at the edges.
+    let p_extra = ((p_w - u) / (1.0 - u)).clamp(0.0, 1.0);
+    let mut rng = Rng::derive(run_seed, SURFACE_TAG, node_id, tick, 0);
+    rng.unit() < p_extra
+}
+
+/// Tag for the F1 window-surfacing extra-Bernoulli stream (distinct from [`ONLINE_TAG`]
+/// so the extra draw is INDEPENDENT of the per-tick `online` draw — required for the
+/// `P(surfaced) = p_w` composition — and off the PoS/churn/placement streams).
+const SURFACE_TAG: u64 = 0x5E1F_AC1D_0B01_0A11;
+
 /// Per-`(owner, holder)` capital state the harness evolves by the A.1 leaky law
 /// inline (design §10.C): per-tick N² decay `g ← g·(1−λΔt)` + on-challenge accrual
 /// `+v_conf·Δt` in `engine::pos_and_capital`. The STATE (running `G`, recent-outcome
@@ -603,6 +660,12 @@ pub struct World {
     /// start of tick T+1's capital pass (the "detected on the next PoS round" latency).
     /// Each is an owner whose data a now-departed holder silently lost. Drained every tick.
     pub pending_silent_loss: Vec<SilentLoss>,
+    /// F2 (D5): eviction NOTICES queued by `run_eviction` at tick T (a DropNotice sent,
+    /// symbol still alive) and applied at the START of tick T+1 by `apply_pending_evictions`
+    /// — the pressure/cap drops die one tick after they are noticed, so the b_ann head-start
+    /// axis is finally exercised (`t_n = DAYS_PER_TICK`) and space frees at T+1 (the accepted
+    /// one-tick latch lag). Drained (and re-filled) every tick.
+    pub pending_evictions: Vec<PendingEviction>,
     /// R̂-CALIBRATION prediction log (transche 0.3) — a GOD-VIEW, METRIC-ONLY channel. At
     /// each successful placement the engine appends the block's forecast survival `R̂_wc`
     /// over the calibration horizon `H` ([`crate::sim_dynamic::engine::DynParams::pred_horizon_ticks`]).
@@ -657,6 +720,36 @@ pub struct SilentLoss {
     /// Volume (gb) of the owner's symbols lost = V_lost = V_held (a total loss, all of
     /// this owner's alive symbols on the holder died at departure).
     pub volume: f64,
+}
+
+/// F2 (D5): why a symbol was NOTICED for eviction at tick T (it dies at T+1 with the
+/// DropNotice head-start). The kind selects the death-time treatment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictNoticeKind {
+    /// A disk-pressure squeeze drop: a reliability signal — burns `g_oh` at `b_ann` with
+    /// the `t_n = DAYS_PER_TICK` head-start (the b_ann axis finally exercised) and bumps
+    /// the `drop_ann` retention counter.
+    Pressure,
+    /// A Р-7 volume-cap trim (V_ret excess): a predictable tariff — burn-EXEMPT and
+    /// drop-counter-EXEMPT (транш-4 decision), only the tally + free-at-T+1 timing.
+    CapTrim,
+}
+
+/// F2 (D5): a symbol NOTICED for eviction at tick T (a DropNotice was sent) that is still
+/// ALIVE this tick and dies at T+1. Queued by `run_eviction` (tick T) and drained by
+/// `apply_pending_evictions` at the START of tick T+1 — so the holder's disk frees one
+/// tick late (the accepted one-tick latch lag) and the owner had a 7-day head-start
+/// (`t_n = DAYS_PER_TICK`) to repair before the symbol actually vanished.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingEviction {
+    /// The holder that will drop the symbol.
+    pub holder: usize,
+    /// The owner whose symbol is dropped.
+    pub owner: usize,
+    /// The god-view block id of the dropped symbol.
+    pub block: usize,
+    /// Why it was noticed (drives the death-time burn/counter treatment).
+    pub kind: EvictNoticeKind,
 }
 
 /// Per-tick repair activity the engine records during placement (repair-storm §7).

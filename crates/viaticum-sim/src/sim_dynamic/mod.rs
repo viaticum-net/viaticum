@@ -161,6 +161,7 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
         burn_ann_count: 0,
         burn_silent_count: 0,
         pending_silent_loss: Vec::new(),
+        pending_evictions: Vec::new(),
         // R̂-calibration log OFF by default (sim_diag/tests pay nothing); the sim_adv runner
         // flips `pred_log_enabled` on to collect the dataset. Metric-only, no decision reads it.
         pred_log: Vec::new(),
@@ -304,7 +305,10 @@ pub fn run_experiment_1(cfg: Experiment1Config) -> Experiment1Report {
     world.sample_served_series();
 
     // --- Metrics at the end of Regime-2 (god-view) ---
-    let summaries = node_summaries(&world, &prior);
+    // F5: the observed-volume anchor = the per-holder chunk volume (block_volume / k_eff),
+    // the same scale the engine samples the surface at.
+    let v0 = params.block_volume / params.k_eff.max(1) as f64;
+    let summaries = node_summaries(&world, &prior, v0);
     let rank = rank_metric(&summaries);
     let reciprocity = reciprocity_metric(&world, regime1_end_tick);
     let dr = legacy_dr_metric(&world, params.k_eff, cfg.dr_victims, cfg.seed ^ 0xD11);

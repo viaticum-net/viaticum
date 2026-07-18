@@ -1,18 +1,21 @@
 //! `sim_dynamic` engine — the dynamic time-loop over the god-view world.
 //!
 //! Each tick (design §6 + §10 + world-v2 §9) runs, in order:
-//!   0. **own-data growth** (§A.2) + **incremental joins** (§9.1: activate nodes whose
+//!   0. **pending evictions** (F2 / D5): kill the pressure/cap symbols NOTICED last tick
+//!      (they died at T+1 with the DropNotice head-start, freeing disk now), then
+//!      **own-data growth** (§A.2) + **incremental joins** (§9.1: activate nodes whose
 //!      seeded `joined_tick` has arrived).
 //!   1. **resync placements** (drop dead/departed holders from owners' bookkeeping)
 //!      then **place** (kernel `place_reciprocal`, floor + cream) under a per-node
 //!      **bandwidth budget** `U` (§9.2): ≤ `U/v_per_symbol` symbols placed per node per
 //!      tick, ι-priority, the rest carried to later ticks. Holder accept/reject by WILL
 //!      × ROOM, with **preemption** under contention (§9 fixes / A.12-2).
-//!   2. **PoS-challenge + capital update** (§9.4 ONE physics): PoS-pass ⟺ the symbol is
-//!      alive ∧ the holder is online. No `retained_edge`; archetype aggression is NOT in
-//!      the PoS outcome (it lives ONLY in churn). The A.1 leaky decay is applied to ALL
-//!      capital pairs each tick (idle/dead relationships drain), not just active ones.
-//!   3. **eviction** when `φ < s_soft` via `eviction_order` (§10.G, NOTE1 snapshot).
+//!   2. **PoS-challenge + capital update** (§9.4 ONE physics + F1/F6): PoS-pass ⟺ the
+//!      symbol is alive ∧ the holder SURFACED in the 7-day window (F1/D2) ∧ the owner's
+//!      block still has a source (F6/D9 — a `to_restore` victim cannot verify). The A.1
+//!      leaky decay is applied to ALL capital pairs each tick (idle/dead pairs drain).
+//!   3. **eviction** when `φ < s_soft` via `eviction_order` (§10.G, NOTE1 snapshot):
+//!      pressure/cap drops are NOTICED here (F2), killed at the top of the NEXT tick.
 //!   4. **churn** — nodes depart by archetype (aggression raises the rate); held
 //!      symbols die.
 //!
@@ -29,8 +32,8 @@ use viaticum_core::four_r::{
 
 use crate::generator::Rng;
 use crate::sim_dynamic::generator::{
-    BlockPlacement, DAYS_PER_TICK, EvictionEvent, HeldSymbol, Node, OwnBlock, PairCapital,
-    PredEntry, RepairStat, SilentLoss, World, online,
+    BlockPlacement, DAYS_PER_TICK, EvictNoticeKind, EvictionEvent, HeldSymbol, Node, OwnBlock,
+    PairCapital, PendingEviction, PredEntry, RepairStat, SilentLoss, World, surfaced_in_window,
 };
 use crate::sim_dynamic::observer::{self, ObsAddr};
 
@@ -80,9 +83,10 @@ pub struct DynParams {
     pub burn_b_max: f64,
     /// A.2 (транше 4 / §13): repair latency `τ_rep` in DAYS for the head-start
     /// forgiveness axis. Default `2·DAYS_PER_TICK = 14` (≈ 2 ticks of repair latency).
-    /// In the sim ALL evictions are instantaneous (no advance DropNotice), so the caller
-    /// always passes `t_n = 0` and this dial does not change sim behaviour — it is
-    /// transcribed for the daemon (where an advance DropNotice carries a real head-start).
+    /// F2 (D5): pressure evictions now carry a real DropNotice head-start `t_n = DAYS_PER_TICK
+    /// = 7` (noticed at T, dies at T+1), so `τ_rep = 14` gives a PARTIAL forgiveness factor
+    /// `1 − 7/14 = 0.5` on the b_ann burn — the head-start axis is finally exercised in the
+    /// sim (a silent loss and a preemption swap still pass `t_n = 0`, the maximum penalty).
     pub burn_tau_rep: f64,
     /// A.5 (транше 4 / §13): suspicion forget rate `μ` (per day). Default `1/14`
     /// (`τ_σ ≈ 2 weeks ≪ τ_g = 60 d`: suspicion is forgotten fast). Feeds
@@ -228,14 +232,14 @@ impl Default for DynParams {
             // 2026-07-07; the rest are OPEN calibration guesses flagged for Ilya).
             burn_b_ann: 0.05,
             burn_b_max: 1.0, // silent total loss zeroes the reliability capital (§13)
-            burn_tau_rep: 2.0 * DAYS_PER_TICK, // ≈ 2 ticks repair latency (sim t_n always 0)
+            burn_tau_rep: 2.0 * DAYS_PER_TICK, // 14d; F2 pressure drop t_n=7 ⇒ 0.5 forgiveness
             sigma_mu: 1.0 / 14.0, // τ_σ ≈ 2 weeks ≪ τ_g = 60 d
             sigma_j: 0.5,
             lambda_drop: 1.0 / 56.0, // τ ≈ 8 weeks ≈ PoS-window scale ("system forgives")
             n_symbols: 5,
             k_eff: 2,
             r_target: 0.90,
-            block_volume: 50.0, // ⇒ 10 gb/symbol = the canonical observed V0
+            block_volume: 50.0, // F5: ⇒ 25 gb/chunk (source/k_eff) = the observed V0 anchor
             blocks_per_node: 3,
             hyst: Hysteresis {
                 s_hard: 0.10,
@@ -257,15 +261,17 @@ impl Default for DynParams {
             t_join_frac: 0.50,
             join_horizon_ticks: 130,
             maturation_ticks_per_block: 6,
-            bandwidth_u: 20.0, // 2 symbols/tick at the default 10 gb/symbol
+            bandwidth_u: 20.0, // F5: <1 chunk/tick at 25 gb/chunk ⇒ floored to 1
             cream_enabled: true,
             giver_priority_order: true,
             // Р-2 ACCEPTED ⇒ recalibrated ceiling 0.900 is canon (default kernel prior).
             // `false` is the A/B control that dials back to the pre-Р-2 0.622 baseline.
             recalibrated_retention: true,
-            // Instant repair detection = the previous behaviour (owner refills next tick).
-            // The repair-storm §7 sweep raises this to model the PoS-cadence detection lag.
-            repair_detection_delay_max: 0,
+            // F3 (D6): silent-loss detection latency = 3 windows (PresumedLost = 3 misses,
+            // ≈3+ weeks) is now the DEFAULT — a repair fires only after the owner's PoS
+            // cadence notices the deficit, matching the real substrate (the dial stays a
+            // dial; `0` still recovers the old instant behaviour for the isolating tests).
+            repair_detection_delay_max: 3,
             // Р-5 (A.13 / §13): per-holder credit-cap floor — its OWN handle, guess 0.5,
             // NOT r_target (2b lesson). Was the hard-coded `0.5` in try_place_one_symbol.
             r_min: 0.5,
@@ -355,10 +361,11 @@ fn owner_alive_volume_on(world: &World, owner: usize, holder: usize) -> f64 {
 
 /// A.2 ANNOUNCED burn: a LIVE holder dropped `owner`'s symbol (eviction / preemption
 /// victim) — the protocol sends a DropNotice, so from the owner's seat this is an
-/// ANNOUNCED loss with head-start `t_n = 0` in the sim (evictions are instantaneous).
-/// Burns the owner-side reliability capital `g_oh` = `G(O←h)` (the owner's record of the
-/// holder's service TO IT — the reliability evidence, decision_model §1), bumps the
-/// `drop_ann` retention-forecast counter (C2FARM-3), and tallies the event.
+/// ANNOUNCED loss with head-start `t_n` (F2: a pressure drop passes `t_n = DAYS_PER_TICK`,
+/// noticed-then-died a tick later; a preemption swap passes `t_n = 0`, an instantaneous
+/// displacement). Burns the owner-side reliability capital `g_oh` = `G(O←h)` (the owner's
+/// record of the holder's service TO IT — the reliability evidence, decision_model §1),
+/// bumps the `drop_ann` retention-forecast counter (C2FARM-3), and tallies the event.
 ///
 /// **Direction (traced, not guessed — 3a discipline):** the write is to
 /// `capital[owner][holder].g_oh`, the cell that accumulates "this HOLDER served this
@@ -371,20 +378,24 @@ fn apply_announced_burn(
     owner: usize,
     holder: usize,
     v_lost: f64,
+    t_n: f64,
     params: &DynParams,
 ) {
     let v_held = owner_alive_volume_on(world, owner, holder);
     let p = burn_params_of(params);
     let cell = &mut world.capital[owner][holder];
-    cell.g_oh = apply_burn(cell.g_oh, &p, true, 0.0, v_lost, v_held);
+    cell.g_oh = apply_burn(cell.g_oh, &p, true, t_n, v_lost, v_held);
     cell.drop_ann += 1.0; // leaky counter (decayed in the W2 sweep by λ_drop)
     world.burn_ann_count += 1;
 }
 
-/// Per-symbol volume (gb) for the default block: `block_volume / n_symbols`.
+/// Per-holder chunk volume (gb) (F5 / D4-leak): `block_volume / k_eff`, NOT `/ n_symbols`.
+/// The sim "symbol" reads as a per-holder chunk; decode needs `k_eff` chunks that TOGETHER
+/// reconstruct the source, so each chunk carries `source / k_eff` (the `n` placed chunks
+/// total `(n/k)·source`). Defaults: `50 / 2 = 25` gb/chunk (was `50 / 5 = 10`).
 fn v_per_symbol_of(params: &DynParams) -> f64 {
-    if params.n_symbols > 0 {
-        params.block_volume / params.n_symbols as f64
+    if params.k_eff > 0 {
+        params.block_volume / params.k_eff as f64
     } else {
         params.block_volume
     }
@@ -475,6 +486,11 @@ pub fn step(world: &mut World, params: &DynParams, prior: &SurfacePrior, policy:
     assert_lambda_dt_stable(params.lambda_drop, DAYS_PER_TICK);
     let tick = world.tick;
 
+    // (0-) F2 (D5): kill the eviction NOTICES from LAST tick FIRST (the noticed pressure/cap
+    // drops die now, T+1, freeing the holder's disk with the DropNotice head-start already
+    // banked). Done before growth/placement so this tick sees the freed space.
+    apply_pending_evictions(world, params);
+
     // (0a) own-data growth + (0b) incremental joins (§9.1).
     world.grow_own_data();
     activate_joins(world);
@@ -516,6 +532,18 @@ fn activate_joins(world: &mut World) {
 /// Capital index helper: mutable handle to the `[owner][holder]` pair state.
 fn cap_mut(capital: &mut [Vec<PairCapital>], owner: usize, holder: usize) -> &mut PairCapital {
     &mut capital[owner][holder]
+}
+
+/// F6 (D9): is `owner`'s block `block_id` source-less (`to_restore`)? A source-less block
+/// cannot be PoS-verified by its owner (no source to re-encode), so its symbols run no
+/// challenge (no accrual). Unknown block id ⇒ `false` (nothing to gate).
+fn block_is_to_restore(world: &World, owner: usize, block_id: usize) -> bool {
+    world.nodes[owner]
+        .own_blocks
+        .iter()
+        .find(|b| b.id == block_id)
+        .map(|b| b.to_restore)
+        .unwrap_or(false)
 }
 
 /// Count a block's ALIVE symbols across the network, split into (floor, cream).
@@ -711,8 +739,10 @@ fn try_place_one_symbol(
     let block_id = world.nodes[owner].own_blocks[block_pos].id;
     let block_iota = world.nodes[owner].own_blocks[block_pos].iota;
     let block_volume = world.nodes[owner].own_blocks[block_pos].volume;
-    let v_per_symbol = if params.n_symbols > 0 {
-        block_volume / params.n_symbols as f64
+    // F5 (D4-leak): the per-holder chunk carries `source / k_eff` (decode needs k_eff
+    // chunks together reconstructing the source), NOT `source / n_symbols`.
+    let v_per_symbol = if params.k_eff > 0 {
+        block_volume / params.k_eff as f64
     } else {
         block_volume
     };
@@ -750,7 +780,7 @@ fn try_place_one_symbol(
 
     let cand_nodes: Vec<&Node> = cand_idx.iter().map(|&h| &world.nodes[h]).collect();
     let caps: Vec<&PairCapital> = cand_idx.iter().map(|&h| &world.capital[owner][h]).collect();
-    let cand_obs = observer::observe_candidates(&cand_nodes, &caps, DAYS_PER_TICK);
+    let cand_obs = observer::observe_candidates(&cand_nodes, &caps, DAYS_PER_TICK, v_per_symbol);
     drop(cand_nodes);
     drop(caps);
     // The block's current holders as first-hand obs — the kernel `committed` set (marginal
@@ -758,7 +788,8 @@ fn try_place_one_symbol(
     let already_nodes: Vec<&Node> = already.iter().map(|&h| &world.nodes[h]).collect();
     let already_caps: Vec<&PairCapital> =
         already.iter().map(|&h| &world.capital[owner][h]).collect();
-    let already_obs = observer::observe_candidates(&already_nodes, &already_caps, DAYS_PER_TICK);
+    let already_obs =
+        observer::observe_candidates(&already_nodes, &already_caps, DAYS_PER_TICK, v_per_symbol);
     drop(already_nodes);
     drop(already_caps);
 
@@ -971,8 +1002,10 @@ fn admit_offer(
     }
     // A.2 ANNOUNCED burn (transche 4): the preemption victim is a live-holder drop of
     // `vo`'s symbol — burn `vo`'s reliability capital g_oh BEFORE marking it dead (V_held
-    // includes it). Same announced treatment as a pressure/cap eviction.
-    apply_announced_burn(world, vo, holder, v_vol, params);
+    // includes it). A preemption is an INSTANTANEOUS displacement (the swap makes room
+    // right now to accept the new offer), so `t_n = 0` (no head-start) — unlike a pressure
+    // drop's noticed→T+1 DropNotice (F2).
+    apply_announced_burn(world, vo, holder, v_vol, 0.0, params);
     // Evict the victim (φ-neutral swap): mark dead, log, drop the owner's placement. The
     // logged `g_ho_at_drop` is the victim's BARE g_ho (diagnostic continuity §2c — the
     // rank now uses κ_O, but the drop-reciprocity metric still reads the raw g_ho).
@@ -1142,20 +1175,27 @@ fn pos_and_capital(world: &mut World, params: &DynParams) {
         }
     }
 
-    // Collect challenges (owner, holder, volume, online) over alive holdings whose OWNER
-    // is still PRESENT (a departed owner runs no PoS challenge).
+    // Collect challenges (owner, holder, volume, surfaced) over alive holdings whose OWNER
+    // is still PRESENT (a departed owner runs no PoS challenge) AND whose block still has a
+    // SOURCE (F6 / D9: a `to_restore` block's owner cannot re-encode to verify —
+    // CannotVerify, no trust event, no accrual — so the DR victim does not bank g/served
+    // until the block is restored).
     struct Challenge {
         owner: usize,
         holder: usize,
         volume: f64,
-        holder_online: bool,
+        holder_surfaced: bool,
     }
     let mut challenges: Vec<Challenge> = Vec::new();
     for holder in 0..n {
         if !world.nodes[holder].present {
             continue;
         }
-        let h_online = online(
+        // F1 (D2 / rebase §6): a PoS challenge PASSES iff the holder SURFACED at least once
+        // in the 7-day window — not merely the per-tick online Bernoulli. Computed ONCE per
+        // holder (per-holder event, not per-symbol). The per-tick `online` physics is
+        // untouched (transport/restore still read it); this is only the PoS-pass semantics.
+        let h_surfaced = surfaced_in_window(
             world.nodes[holder].archetype,
             world.nodes[holder].id,
             tick,
@@ -1165,11 +1205,15 @@ fn pos_and_capital(world: &mut World, params: &DynParams) {
             if !world.nodes[s.owner].present {
                 continue; // departed owner: no challenge, no served accrual
             }
+            // F6 (D9): source-less block ⇒ owner cannot verify ⇒ no challenge at all.
+            if block_is_to_restore(world, s.owner, s.block) {
+                continue;
+            }
             challenges.push(Challenge {
                 owner: s.owner,
                 holder,
                 volume: s.volume,
-                holder_online: h_online,
+                holder_surfaced: h_surfaced,
             });
         }
     }
@@ -1181,8 +1225,10 @@ fn pos_and_capital(world: &mut World, params: &DynParams) {
         std::collections::BTreeSet::new();
 
     for c in &challenges {
-        // §9.4 one physics: pass ⟺ online (the symbol is alive by construction).
-        let passed = c.holder_online;
+        // F1 (D2): pass ⟺ the holder SURFACED in the 7-day window (the symbol is alive by
+        // construction). A NON-surfacing (missed the whole window) is the timeout — the same
+        // σ-timeout / miss semantics as before, on the window probability now.
+        let passed = c.holder_surfaced;
         if !passed {
             timed_out_pairs.insert((c.owner, c.holder));
         }
@@ -1305,6 +1351,7 @@ fn run_eviction(world: &mut World, params: &DynParams) {
             |owner_idx| &world.capital[owner_idx][holder],
             owner_addr,
             dt,
+            v_per_symbol,
         );
 
         let decision = eviction_order(&views, phi, params.hyst, prev, &depth_params, &cap);
@@ -1338,24 +1385,44 @@ fn run_eviction(world: &mut World, params: &DynParams) {
         let cap_targets = resolve(&decision.cap_drops);
         let pressure_targets = resolve(&decision.drop_order);
 
+        // F2 (D5): eviction NOTICES this tick (a DropNotice is sent). The symbols stay ALIVE
+        // this tick and die at T+1 (`apply_pending_evictions`), so space frees one tick late
+        // (the accepted latch lag) and the b_ann head-start axis is exercised. `freed` tracks
+        // the volume already noticed (pending death) so the pressure loop's stop condition is
+        // the PROJECTED φ (assuming the noticed symbols are gone), not the current φ — else it
+        // would notice EVERY pressure target (φ never recovers within the tick).
+        let mut freed = 0.0f64;
+
         // Р-7 cap_drops FIRST, UNCONDITIONALLY (tariff enforcement — NOT gated on the
         // φ-target; the excess above V_ret leaves regardless of how much room it frees).
-        // burn = FALSE (транше-4 fix): a cap-trim is a predictable tariff, not a
-        // reliability signal — it does NOT burn g_oh nor bump drop_ann.
+        // CapTrim kind ⇒ burn-EXEMPT + drop-counter-EXEMPT at death (транше-4 fix): a
+        // cap-trim is a predictable tariff, not a reliability signal.
         for (owner_idx, block) in cap_targets {
-            if evict_symbol(world, holder, owner_idx, block, tick, params, false) {
+            if let Some(v) =
+                notice_eviction(world, holder, owner_idx, block, EvictNoticeKind::CapTrim)
+            {
+                freed += v;
                 any_eviction_this_tick = true;
-                world.cap_trim_count += 1;
             }
         }
 
-        // THEN the pressure drops, stopping once φ has recovered to s_target. burn = TRUE:
-        // a squeeze drop IS a reliability signal (burns g_oh + bumps drop_ann).
+        // THEN the pressure drops, stopping once the PROJECTED φ (current free + volume
+        // already noticed-for-death) has recovered to s_target. Pressure kind ⇒ burns g_oh at
+        // b_ann with the `t_n = DAYS_PER_TICK` head-start + bumps drop_ann at death.
         for (owner_idx, block) in pressure_targets {
-            if world.nodes[holder].phi_free_ratio() >= params.hyst.s_target {
+            let disk_cap = world.nodes[holder].disk_cap;
+            let projected_phi = if disk_cap <= 0.0 {
+                0.0
+            } else {
+                ((disk_cap - (world.nodes[holder].used_total() - freed)) / disk_cap).clamp(0.0, 1.0)
+            };
+            if projected_phi >= params.hyst.s_target {
                 break;
             }
-            if evict_symbol(world, holder, owner_idx, block, tick, params, true) {
+            if let Some(v) =
+                notice_eviction(world, holder, owner_idx, block, EvictNoticeKind::Pressure)
+            {
+                freed += v;
                 any_eviction_this_tick = true;
             }
         }
@@ -1365,19 +1432,81 @@ fn run_eviction(world: &mut World, params: &DynParams) {
     }
 }
 
+/// F2 (D5): NOTICE one alive symbol `(owner, block)` on `holder` for eviction — queue a
+/// [`PendingEviction`] (a DropNotice) that `apply_pending_evictions` kills at T+1. Returns
+/// the noticed symbol's volume (for the caller's projected-φ accounting), or `None` if the
+/// symbol is not currently alive (nothing to notice). Does NOT mark the symbol dead — it
+/// stays alive this tick (space frees at T+1).
+fn notice_eviction(
+    world: &mut World,
+    holder: usize,
+    owner: usize,
+    block: usize,
+    kind: EvictNoticeKind,
+) -> Option<f64> {
+    // NOTE-3 guard: the same symbol must not be queued twice — a double push would
+    // double-count `freed` in the caller's projected-φ and stop the pressure loop early.
+    if world
+        .pending_evictions
+        .iter()
+        .any(|p| p.holder == holder && p.owner == owner && p.block == block)
+    {
+        return None;
+    }
+    let v = world.nodes[holder]
+        .holdings
+        .iter()
+        .find(|s| s.alive && s.owner == owner && s.block == block)
+        .map(|s| s.volume)?;
+    world.pending_evictions.push(PendingEviction {
+        holder,
+        owner,
+        block,
+        kind,
+    });
+    Some(v)
+}
+
+/// F2 (D5): drain the eviction NOTICES queued last tick and kill them NOW (T+1). A pressure
+/// notice dies with the DropNotice head-start `t_n = DAYS_PER_TICK` (partial b_ann
+/// forgiveness) + `drop_ann` bump + `burn_ann_count`; a cap-trim notice dies burn-exempt +
+/// `cap_trim_count`. A notice whose symbol already died (churn / preemption in the interim)
+/// is silently skipped (`evict_symbol` returns false). Called at the START of `step`, before
+/// growth/placement, so the holder's disk is free for the new tick. Drains the queue.
+fn apply_pending_evictions(world: &mut World, params: &DynParams) {
+    if world.pending_evictions.is_empty() {
+        return;
+    }
+    let tick = world.tick;
+    let pending = std::mem::take(&mut world.pending_evictions);
+    for pe in pending {
+        let PendingEviction {
+            holder,
+            owner,
+            block,
+            kind,
+        } = pe;
+        if evict_symbol(world, holder, owner, block, tick, params, kind)
+            && matches!(kind, EvictNoticeKind::CapTrim)
+        {
+            world.cap_trim_count += 1;
+        }
+    }
+}
+
 /// Kill one alive symbol `(owner, block)` on `holder` (god-view): OPTIONALLY apply the A.2
 /// ANNOUNCED burn (a live-holder drop, транше 4), mark it dead, log the [`EvictionEvent`]
 /// with the victim's BARE `g_ho` (`g_ho_at_drop` — diagnostic continuity §2c), and drop the
 /// owner's placement bookkeeping. Returns whether a symbol was actually killed (it may
-/// already be dead if resolved-then-superseded). Shared by the Р-7 cap trims and the
-/// pressure drops.
+/// already be dead if resolved-then-superseded). F2: called by `apply_pending_evictions` at
+/// T+1 for the noticed pressure/cap drops.
 ///
-/// `burn` (транше-4 fix, Ilya 2026-07-07 / review WARN-2 т4): a PRESSURE drop passes
-/// `true` (a real squeeze signal → burn `g_oh` + bump `drop_ann`); a Р-7 cap-trim passes
-/// `false` — a mandatory tariff enforcement the OWNER can predict (it knows its own
-/// `V_ret`), NOT a reliability signal, so it must NOT punish the holder's capital nor stain
-/// the retention forecast. Punishing the holder for the owner's over-placement would
-/// corrupt the signal.
+/// `kind` (транше-4 fix + F2): a `Pressure` drop is a real squeeze signal → burn `g_oh` at
+/// b_ann with the DropNotice head-start `t_n = DAYS_PER_TICK` + bump `drop_ann`; a `CapTrim`
+/// (Р-7) is a mandatory tariff enforcement the OWNER can predict (it knows its own `V_ret`),
+/// NOT a reliability signal, so it is burn-EXEMPT and drop-counter-EXEMPT (punishing the
+/// holder for the owner's over-placement would corrupt the signal). The `cap_trim_count`
+/// tally is bumped by the caller.
 fn evict_symbol(
     world: &mut World,
     holder: usize,
@@ -1385,7 +1514,7 @@ fn evict_symbol(
     block: usize,
     tick: u64,
     params: &DynParams,
-    burn: bool,
+    kind: EvictNoticeKind,
 ) -> bool {
     // Locate the target symbol's volume BEFORE any mutation (confirms it is still alive).
     let v_lost = match world.nodes[holder]
@@ -1396,11 +1525,12 @@ fn evict_symbol(
         Some(s) => s.volume,
         None => return false, // already dead / superseded this tick
     };
-    // A.2 ANNOUNCED burn (transche 4) on the owner's reliability capital g_oh, computed
-    // with V_held INCLUDING the symbol about to die (it is still alive here) — but ONLY for
-    // a PRESSURE drop; a cap-trim (burn = false) is tariff enforcement, not a burn/drop.
-    if burn {
-        apply_announced_burn(world, owner_idx, holder, v_lost, params);
+    // A.2 ANNOUNCED burn (transche 4) on the owner's reliability capital g_oh, computed with
+    // V_held INCLUDING the symbol about to die (it is still alive here) — but ONLY for a
+    // PRESSURE drop; a CapTrim is tariff enforcement, not a burn/drop. The pressure DropNotice
+    // head-start is `t_n = DAYS_PER_TICK` (F2: noticed at T, died at T+1).
+    if matches!(kind, EvictNoticeKind::Pressure) {
+        apply_announced_burn(world, owner_idx, holder, v_lost, DAYS_PER_TICK, params);
     }
     let g_ho_at_drop = world.capital[owner_idx][holder].g_ho;
     let killed = if let Some(hs) = world.nodes[holder]
@@ -1729,6 +1859,11 @@ pub fn churn_for_test(world: &mut World, params: &DynParams) {
 #[cfg(test)]
 pub fn run_eviction_for_test(world: &mut World, params: &DynParams) {
     run_eviction(world, params);
+}
+
+#[cfg(test)]
+pub fn apply_pending_evictions_for_test(world: &mut World, params: &DynParams) {
+    apply_pending_evictions(world, params);
 }
 
 #[cfg(test)]

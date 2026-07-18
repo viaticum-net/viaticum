@@ -17,10 +17,14 @@ use viaticum_core::types::{DeviceId, IdentityPub};
 
 use crate::sim_dynamic::generator::{DAYS_PER_TICK, HeldSymbol, Node, PairCapital};
 
-/// The canonical observed `(V0, τ0)` slice every pair is sampled at (so the surface
-/// route varies through the PoS record + capital, not a hidden surface). `τ0` is
-/// the per-tick horizon in days (one week).
-pub const OBSERVED_V0: f64 = 10.0;
+/// The canonical observed `τ0` slice every pair is sampled at (the per-tick horizon in
+/// days, one week). The observed VOLUME anchor `v0` is NO LONGER a hardcoded const (F5 /
+/// D4-leak): it is CONSTRUCTED by the caller from the actual per-holder chunk volume
+/// `v_per_symbol = block_volume / k_eff` and threaded into the `observe_*` functions — so
+/// the surface is sampled at the SAME scale the block is actually placed at (querying 25 gb
+/// with a demonstrated floor of 25 gb ⇒ no spurious off-sample penalty). The dual role from
+/// phase B is preserved: `v0` is BOTH the `observed_volume` surface anchor AND the `v_dem`
+/// floor (`cap.v_dem.max(v0)`).
 pub const OBSERVED_TAU0: f64 = DAYS_PER_TICK;
 
 /// Build the owner `O`'s first-hand observation of holder node `h_node`, given the
@@ -32,8 +36,9 @@ pub const OBSERVED_TAU0: f64 = DAYS_PER_TICK;
 ///
 /// Anti-oracle: every field comes from `cap` (threaded first-hand capital), the
 /// PoS counters (first-hand outcomes), or `h_node`'s OBSERVABLE address/crypto-id.
-/// `h_node.archetype` is never touched.
-pub fn observe_pair(cap: &PairCapital, h_node: &Node, dt: f64) -> FirstHandObs {
+/// `h_node.archetype` is never touched. `v0` (F5) is the observed-volume anchor the
+/// caller derives from the actual per-holder chunk volume.
+pub fn observe_pair(cap: &PairCapital, h_node: &Node, dt: f64, v0: f64) -> FirstHandObs {
     let mut master = [0u8; 32];
     master[0] = h_node.master_byte;
     let mut device = [0u8; 32];
@@ -64,7 +69,7 @@ pub fn observe_pair(cap: &PairCapital, h_node: &Node, dt: f64) -> FirstHandObs {
         g_owner_from_holder: cap.g_oh,
         // My service to the holder (the eviction key; bilaterally observable).
         g_holder_from_owner: cap.g_ho,
-        v_dem: cap.v_dem.max(OBSERVED_V0),
+        v_dem: cap.v_dem.max(v0),
         // P-projection: recent pass-fraction over the window.
         recent_rate_p: cap.recent_rate_p(),
         trend_d,
@@ -74,7 +79,7 @@ pub fn observe_pair(cap: &PairCapital, h_node: &Node, dt: f64) -> FirstHandObs {
         // C2FARM-3 (A.2): the owner-side drop counters feed retained_depth's drop_frac.
         drop_ann: cap.drop_ann,
         drop_silent: cap.drop_silent,
-        observed_volume: OBSERVED_V0,
+        observed_volume: v0,
         observed_tau: OBSERVED_TAU0,
         addr_subnet: h_node.addr_subnet,
         addr_geo: 0,
@@ -116,13 +121,14 @@ pub fn observe_eviction_views<'a>(
     mut cap_of: impl FnMut(usize) -> &'a PairCapital,
     mut owner_node: impl FnMut(usize) -> ObsAddr,
     dt: f64,
+    v0: f64,
 ) -> Vec<OwnerEvictionView> {
     owners
         .iter()
         .map(|&owner_idx| {
             let cap = cap_of(owner_idx);
             let addr = owner_node(owner_idx);
-            let obs = observe_pair_from_addr(cap, &addr, dt);
+            let obs = observe_pair_from_addr(cap, &addr, dt, v0);
             let symbols: Vec<SymbolDecl> = h
                 .holdings
                 .iter()
@@ -159,7 +165,7 @@ pub struct ObsAddr {
 
 /// Like [`observe_pair`] but from a bare [`ObsAddr`] (used by the eviction view,
 /// where the peer is the owner whose `Node` we are not holding by reference here).
-fn observe_pair_from_addr(cap: &PairCapital, addr: &ObsAddr, dt: f64) -> FirstHandObs {
+fn observe_pair_from_addr(cap: &PairCapital, addr: &ObsAddr, dt: f64, v0: f64) -> FirstHandObs {
     let mut master = [0u8; 32];
     master[0] = addr.master_byte;
     let mut device = [0u8; 32];
@@ -175,7 +181,7 @@ fn observe_pair_from_addr(cap: &PairCapital, addr: &ObsAddr, dt: f64) -> FirstHa
     FirstHandObs {
         g_owner_from_holder: cap.g_oh,
         g_holder_from_owner: cap.g_ho,
-        v_dem: cap.v_dem.max(OBSERVED_V0),
+        v_dem: cap.v_dem.max(v0),
         recent_rate_p: cap.recent_rate_p(),
         trend_d,
         pos_pass: pass,
@@ -184,7 +190,7 @@ fn observe_pair_from_addr(cap: &PairCapital, addr: &ObsAddr, dt: f64) -> FirstHa
         // C2FARM-3 (A.2): owner-side drop counters → retained_depth drop_frac.
         drop_ann: cap.drop_ann,
         drop_silent: cap.drop_silent,
-        observed_volume: OBSERVED_V0,
+        observed_volume: v0,
         observed_tau: OBSERVED_TAU0,
         addr_subnet: addr.addr_subnet,
         addr_geo: 0,
@@ -209,12 +215,13 @@ pub fn observe_placements(
     ladder_iotas: &[Vec<f64>],
     symbol_in_ladder: &[usize],
     dt: f64,
+    v0: f64,
 ) -> Vec<HolderPlacement> {
     holders
         .iter()
         .enumerate()
         .map(|(i, h)| HolderPlacement {
-            obs: observe_pair(caps[i], h, dt),
+            obs: observe_pair(caps[i], h, dt, v0),
             ladder_iotas: ladder_iotas[i].clone(),
             symbol_in_ladder: symbol_in_ladder[i],
         })
@@ -229,11 +236,12 @@ pub fn observe_candidates(
     candidates: &[&Node],
     caps: &[&PairCapital],
     dt: f64,
+    v0: f64,
 ) -> Vec<FirstHandObs> {
     candidates
         .iter()
         .enumerate()
-        .map(|(i, h)| observe_pair(caps[i], h, dt))
+        .map(|(i, h)| observe_pair(caps[i], h, dt, v0))
         .collect()
 }
 

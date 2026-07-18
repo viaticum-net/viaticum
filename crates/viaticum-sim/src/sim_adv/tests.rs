@@ -189,50 +189,54 @@ fn report_text_is_byte_identical_on_repeat_under_rayon() {
 
 #[test]
 fn honest_v2_seed42_matches_sim_diag_anchor() {
-    // Anchor = `sim_diag 42 100 50 1 v2` — RE-FROZEN 2026-07-07 for transche 0.3 (the
-    // kernel-place unification shifted the numbers; both sim_diag and honest_v2 now run the
-    // shared kernel `place_incremental_rank`/`place_cream`, so they STILL agree — the point
-    // of this anchor is that the harness does not distort the engine, not the exact values).
-    // The 0.3 acceptance shift (old→new): alive 564→565, evicts 1413→1514, preempts 1189→1291,
-    // share 95.9→96.6, D 3371.85→3428.05, σ 0.0570→0.0543, durability Reliable 2.30→2.39 /
-    // Nomad 0.42→0.62 / Hoarder 2.42→2.83.
+    // Anchor = `sim_diag 42 100 50 1 v2` — RE-FROZEN 2026-07-18 for the F1-F6 sim-substrate
+    // tranche. Both sim_diag and honest_v2 run the SAME engine (build_world + step with
+    // DynParams::default), so they STILL agree field-for-field — the point of this anchor is
+    // that the harness does not distort the engine, not the exact values. The F1-F6 shift
+    // (transche-0.3 → F1-F6) is documented in the tranche report; cross-verified vs
+    // `sim_diag 42 100 50 1 v2` at re-freeze time (share 76.8% / 224 alive / 506 evicts /
+    // 377 preempts / 1 cap_trim / D 7306.05 / dur R 0.83, N 0.71, H 1.25).
+    //   Drivers of the shift: F1 (window-PoS) collapses σ (0.054→0.005) and lifts D
+    //   (3428→7306, intermittent holders now confirmed); F5 (chunk = source/k_eff = 25 gb,
+    //   2.5× bigger) conserves placed GB but ~2.5× fewer symbols (565→224) and fewer eviction
+    //   events (1514→506); share A>0 96.6→76.8 (harder contention, fewer mutual pairs).
     let (m, _fired, _r, _c) = run_one_seed(&honest_v2(), 42);
 
     // Exact integer counters (sim_diag §6a/§3-sum/§6d).
-    assert_eq!(m.alive_symbols, 565, "alive symbols (6a)");
-    assert_eq!(m.evicts, 1514, "eviction_log.len (sum of §3)");
-    assert_eq!(m.preempts, 1291, "preempt_count (6d)");
-    assert_eq!(m.cap_trims, 10, "cap_trim_count (6d)");
+    assert_eq!(m.alive_symbols, 224, "alive symbols (6a)");
+    assert_eq!(m.evicts, 506, "eviction_log.len (sum of §3)");
+    assert_eq!(m.preempts, 377, "preempt_count (6d)");
+    assert_eq!(m.cap_trims, 1, "cap_trim_count (6d)");
 
     // Floats to the sim_diag print precision.
     assert!(
-        (m.share_a_pos - 96.6).abs() < 0.1,
+        (m.share_a_pos - 76.79).abs() < 0.1,
         "share A>0 = {}",
         m.share_a_pos
     );
     assert!(
-        (m.mean_depth - 3428.054).abs() < 0.01,
+        (m.mean_depth - 7306.051).abs() < 0.01,
         "mean D = {}",
         m.mean_depth
     );
     assert!(
-        (m.mean_sigma - 0.0543).abs() < 1e-4,
+        (m.mean_sigma - 0.0054).abs() < 1e-4,
         "mean σ = {}",
         m.mean_sigma
     );
-    // Per-archetype floor durability (sim_diag §5): Reliable 2.39, Nomad 0.62, Hoarder 2.83.
+    // Per-archetype floor durability (sim_diag §5): Reliable 0.83, Nomad 0.71, Hoarder 1.25.
     assert!(
-        (m.durability[0] - 2.39).abs() < 0.01,
+        (m.durability[0] - 0.83).abs() < 0.01,
         "Reliable durability = {}",
         m.durability[0]
     );
     assert!(
-        (m.durability[3] - 0.62).abs() < 0.01,
+        (m.durability[3] - 0.71).abs() < 0.01,
         "Nomad durability = {}",
         m.durability[3]
     );
     assert!(
-        (m.durability[4] - 2.83).abs() < 0.01,
+        (m.durability[4] - 1.25).abs() < 0.01,
         "Hoarder durability = {}",
         m.durability[4]
     );
@@ -245,14 +249,14 @@ fn honest_v2_seed42_matches_sim_diag_anchor() {
 #[test]
 fn honest_v2_reliable_extraction_roi_is_near_balance_and_bounded() {
     // FACT (measured, not a wish): under served-matrix conservation the honest giver
-    // Reliable operates at BALANCED reciprocity — seed 42 ROI ≈ 1.015 (transche 0.3 kernel
-    // path; was 1.0123 pre-0.3), NOT below 1. (Universal "< 1 for all archetypes" is
+    // Reliable operates at BALANCED reciprocity — seed 42 ROI ≈ 0.989 (F1-F6 tranche; was
+    // 1.015 pre-F1-F6), NOT above the ceiling. (Universal "< 1 for all archetypes" is
     // impossible: Σconsumed ≡ Σserved_out.) The invariant is BOUNDED extraction, so we lock
     // the measured value and the 1.25 ceiling.
     let (m, _fired, _r, _c) = run_one_seed(&honest_v2(), 42);
     let roi = m.extraction_roi[0];
     assert!(
-        (roi - 1.015).abs() < 0.01,
+        (roi - 0.989).abs() < 0.01,
         "Reliable ROI (seed 42 fact) = {roi}"
     );
     assert!(
@@ -779,6 +783,99 @@ fn restore_truth_victim_does_not_resurrect_with_data_when_no_holder_is_collectab
 }
 
 #[test]
+fn restore_truth_model_o_equals_u_at_full_uptime() {
+    // F4 (D7): Model O (one-shot) counts holders reachable at the FIRST window tick only.
+    // When the k_eff holders are all reachable at the first tick (full uptime), O = U — the
+    // pessimistic no-retry floor equals the aspirational union ceiling.
+    let wp = restore_wp(16, 14.0, 50.0);
+    let mut world = controlled_world(wp.n_nodes, 31);
+    let victim = 0usize;
+    world.nodes[victim].own_blocks = vec![floor_met_block(0, 0.6)];
+    let disaster_tick = 5u64;
+    let return_tick = disaster_tick + 1;
+    let k = wp.base.k_eff; // 2
+    let holders = online_holders(&world, victim, return_tick, k);
+    for &h in &holders {
+        push_held(&mut world, h, victim, 0, 0.6, false);
+    }
+
+    let mut tracker = RestoreTracker::new(&wp);
+    tracker.on_disaster(&world, victim, disaster_tick);
+    tracker.observe(&world, return_tick);
+    tracker.observe(&world, return_tick + 1);
+    let rt = tracker.finalize();
+
+    let b = rt.blocks[0];
+    assert!(
+        b.n_collectable_oneshot <= b.n_collectable_any,
+        "O ≤ U per block"
+    );
+    assert_eq!(
+        b.n_collectable_oneshot, b.n_collectable_any,
+        "all holders reachable at the first tick ⇒ O = U count"
+    );
+    assert!(
+        b.restorable_o && b.restorable_u,
+        "both restorable at full uptime"
+    );
+    assert_eq!(rt.restore_truth_o(), 1.0);
+    assert_eq!(rt.restore_truth_u(), 1.0);
+    assert_eq!(
+        rt.restore_truth_o(),
+        rt.restore_truth_u(),
+        "O = U at full uptime"
+    );
+}
+
+#[test]
+fn restore_truth_model_o_is_below_u_when_a_holder_surfaces_only_after_the_first_tick() {
+    // F4 (D7): a holder NOT reachable at the FIRST window tick but reachable later is counted
+    // by Model U (union-over-window) yet NOT by Model O (one-shot). With exactly k_eff holders,
+    // one of them unreachable at the first tick, the block is U-restorable but NOT O-restorable
+    // ⇒ O < U (strictly). This is the discrimination phase-2 uptime profiles will surface;
+    // dr_baseline itself has O = U because its holders are ~always reachable (NOTE-8).
+    let wp = restore_wp(16, 14.0, 50.0);
+    let mut world = controlled_world(wp.n_nodes, 41);
+    let victim = 0usize;
+    world.nodes[victim].own_blocks = vec![floor_met_block(0, 0.6)];
+    let disaster_tick = 5u64;
+    let return_tick = disaster_tick + 1;
+    let k = wp.base.k_eff; // 2
+    let holders = online_holders(&world, victim, return_tick, k);
+    for &h in &holders {
+        push_held(&mut world, h, victim, 0, 0.6, false);
+    }
+    // The SECOND holder is NOT reachable at the first tick (models an offline-at-first holder).
+    let late = holders[1];
+    world.nodes[late].present = false;
+
+    let mut tracker = RestoreTracker::new(&wp);
+    tracker.on_disaster(&world, victim, disaster_tick);
+    tracker.observe(&world, return_tick); // late holder unreachable ⇒ not in O nor U yet
+    world.nodes[late].present = true; // it surfaces on the second window tick
+    tracker.observe(&world, return_tick + 1); // U grabs it (union); O does NOT (past first tick)
+    let rt = tracker.finalize();
+
+    let b = rt.blocks[0];
+    assert_eq!(
+        b.n_collectable_oneshot, 1,
+        "only the first-tick holder is in O"
+    );
+    assert_eq!(
+        b.n_collectable_any, 2,
+        "both holders are in U (union over window)"
+    );
+    assert!(!b.restorable_o, "O below k_eff ⇒ NOT one-shot restorable");
+    assert!(b.restorable_u, "U reaches k_eff ⇒ restorable");
+    assert!(
+        rt.restore_truth_o() < rt.restore_truth_u(),
+        "O < U when a holder surfaces only after the first tick: O={} U={}",
+        rt.restore_truth_o(),
+        rt.restore_truth_u()
+    );
+}
+
+#[test]
 fn restore_truth_is_bit_identical_on_repeat() {
     // Determinism (spec §10 п.13): the whole Disaster → restore-truth path is seeded, so
     // two runs of a DR scenario produce bit-identical restore-truth per seed.
@@ -881,8 +978,10 @@ fn bucket_row(iota: f64, restorable_u: bool) -> BlockOutcome {
         tier: GiverTier::T1,
         n_collectable_any: 0,
         n_collectable_floor: 0,
+        n_collectable_oneshot: 0,
         restorable_u,
         restorable_s: false,
+        restorable_o: false,
         restorable_floor: false,
     }
 }

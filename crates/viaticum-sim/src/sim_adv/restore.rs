@@ -22,15 +22,24 @@
 //! ANY re-collectable live symbol — floor OR cream. The floor-only count is reported
 //! separately as the `durability_floor` column ("what is guaranteed", spec §10 п.1).
 //!
-//! ## Two collection models (both mandatory, spec §10 п.9)
+//! ## Three collection models (spec §10 п.9 + F4/D7)
 //!
 //! * **Model U** (union-over-window): a symbol is collectable if its holder is still
 //!   present, still holds it alive, and comes online at least once in the window. Models
-//!   "pull each symbol whenever its holder next surfaces". No bandwidth limit.
+//!   "pull each symbol whenever its holder next surfaces". No bandwidth limit. **U is
+//!   ASPIRATIONAL** (F4 / D7): it assumes a restore loop that keeps retrying over days,
+//!   which the daemon does not yet implement (tech-debt D7) — so U is the ceiling, not
+//!   today's behaviour.
 //! * **Model S** (bandwidth-aware): the SAME collectability, but the victim's TOTAL
 //!   re-download over the window is capped at `restore_bw_gb_day × window_days` GB. A
 //!   mandatory pessimistic co-report (Model U is optimistic exactly on the large-archive
 //!   DR-primary tier, WARN-3). Blocks are restored greedily by importance (ι desc).
+//! * **Model O** (one-shot, F4 / D7): a symbol is collectable ONLY if its holder is
+//!   present, holds it alive, AND is online in the FIRST tick of the window (no union over
+//!   the window). Models a single-shot restore that grabs whatever is reachable right now —
+//!   the pessimistic floor that matches the daemon's current (no-retry) restore. `O ≤ U`
+//!   always, and `O = U` under 100% uptime (always-online holders surface at the first tick
+//!   too).
 
 use std::collections::BTreeMap;
 
@@ -68,10 +77,15 @@ pub struct BlockOutcome {
     pub n_collectable_any: usize,
     /// Distinct collectable holders, FLOOR symbols only — the durability count.
     pub n_collectable_floor: usize,
-    /// Restorable under Model U (any ≥ `k_eff`) — the flagship bit.
+    /// F4 (D7): distinct collectable holders under Model O (any symbol, holder online at
+    /// the FIRST window tick only) — the one-shot floor.
+    pub n_collectable_oneshot: usize,
+    /// Restorable under Model U (any ≥ `k_eff`) — the flagship (ASPIRATIONAL, D7) bit.
     pub restorable_u: bool,
     /// Restorable under Model S (any ≥ `k_eff` AND within the bandwidth budget).
     pub restorable_s: bool,
+    /// F4 (D7): restorable under Model O (one-shot ≥ `k_eff`) — `O ≤ U` always.
+    pub restorable_o: bool,
     /// Restorable counting FLOOR symbols only, Model U — "what is guaranteed".
     pub restorable_floor: bool,
 }
@@ -115,6 +129,12 @@ impl RestoreTruth {
         self.frac(|b| b.restorable_s)
     }
 
+    /// F4 (D7): one-shot restore-truth (Model O, any symbol) = fraction restorable when
+    /// only the FIRST window tick's reachable holders count. `O ≤ U` always.
+    pub fn restore_truth_o(&self) -> f64 {
+        self.frac(|b| b.restorable_o)
+    }
+
     /// Durability floor = fraction restorable counting FLOOR symbols only (Model U).
     pub fn durability_floor(&self) -> f64 {
         self.frac(|b| b.restorable_floor)
@@ -156,8 +176,10 @@ pub fn bit_eq(a: &RestoreTruth, b: &RestoreTruth) -> bool {
                 && x.iota.to_bits() == y.iota.to_bits()
                 && x.n_collectable_any == y.n_collectable_any
                 && x.n_collectable_floor == y.n_collectable_floor
+                && x.n_collectable_oneshot == y.n_collectable_oneshot
                 && x.restorable_u == y.restorable_u
                 && x.restorable_s == y.restorable_s
+                && x.restorable_o == y.restorable_o
                 && x.restorable_floor == y.restorable_floor
         })
 }
@@ -178,8 +200,11 @@ struct TrackedBlock {
     tier: GiverTier,
     return_tick: u64,
     /// Holder → its symbol's facts, for every holder online ≥ once in the window while
-    /// still holding an alive symbol. BTreeMap ⇒ deterministic iteration.
+    /// still holding an alive symbol (Model U/S). BTreeMap ⇒ deterministic iteration.
     collectable: BTreeMap<usize, Collectable>,
+    /// F4 (D7): holder → facts, for holders online at the FIRST window tick only (Model O,
+    /// the one-shot floor). A subset of `collectable` by construction.
+    collectable_oneshot: BTreeMap<usize, Collectable>,
 }
 
 /// Accumulates restore-truth across a run: snapshots the victim's surviving blocks at the
@@ -238,6 +263,7 @@ impl RestoreTracker {
                 tier,
                 return_tick,
                 collectable: BTreeMap::new(),
+                collectable_oneshot: BTreeMap::new(),
             });
         }
     }
@@ -251,12 +277,14 @@ impl RestoreTracker {
             if tick < tb.return_tick || tick >= tb.return_tick + self.window_ticks {
                 continue;
             }
+            // F4 (D7): the FIRST window tick also feeds Model O (one-shot).
+            let is_first = tick == tb.return_tick;
             for (holder, node) in world.nodes.iter().enumerate() {
                 if !node.present {
                     continue;
                 }
                 if tb.collectable.contains_key(&holder) {
-                    continue; // already grabbed on an earlier window tick
+                    continue; // already grabbed on an earlier window tick (Model U)
                 }
                 let sym = node
                     .holdings
@@ -264,13 +292,15 @@ impl RestoreTracker {
                     .find(|s| s.alive && s.owner == tb.owner && s.block == tb.block_id)
                     .filter(|_| online(node.archetype, node.id, tick, world.seed));
                 if let Some(s) = sym {
-                    tb.collectable.insert(
-                        holder,
-                        Collectable {
-                            cream: s.cream,
-                            volume: s.volume,
-                        },
-                    );
+                    let c = Collectable {
+                        cream: s.cream,
+                        volume: s.volume,
+                    };
+                    tb.collectable.insert(holder, c);
+                    // Model O: only holders reachable at the FIRST tick count.
+                    if is_first {
+                        tb.collectable_oneshot.insert(holder, c);
+                    }
                 }
             }
         }
@@ -287,6 +317,7 @@ impl RestoreTracker {
             .map(|tb| {
                 let n_any = tb.collectable.len();
                 let n_floor = tb.collectable.values().filter(|c| !c.cream).count();
+                let n_oneshot = tb.collectable_oneshot.len();
                 BlockOutcome {
                     owner: tb.owner,
                     block_id: tb.block_id,
@@ -294,8 +325,10 @@ impl RestoreTracker {
                     tier: tb.tier,
                     n_collectable_any: n_any,
                     n_collectable_floor: n_floor,
+                    n_collectable_oneshot: n_oneshot,
                     restorable_u: n_any >= k_eff,
                     restorable_s: false, // filled below
+                    restorable_o: n_oneshot >= k_eff,
                     restorable_floor: n_floor >= k_eff,
                 }
             })

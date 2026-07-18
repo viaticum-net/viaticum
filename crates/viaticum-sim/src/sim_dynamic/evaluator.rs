@@ -12,7 +12,7 @@
 use viaticum_core::four_r::{SurfacePrior, estimate_surface};
 
 use crate::sim_dynamic::generator::{Archetype, World};
-use crate::sim_dynamic::observer::{self, OBSERVED_TAU0, OBSERVED_V0};
+use crate::sim_dynamic::observer::{self, OBSERVED_TAU0};
 
 /// Per-node god-view summary used by the metrics.
 #[derive(Debug, Clone)]
@@ -95,8 +95,11 @@ pub struct RankMetric {
     pub spearman_rho: f64,
 }
 
-/// Compute the per-node god-view summaries needed by the metrics.
-pub fn node_summaries(world: &World, prior: &SurfacePrior) -> Vec<NodeSummary> {
+/// Compute the per-node god-view summaries needed by the metrics. `v0` (F5) is the
+/// observed-volume anchor (the per-holder chunk volume `block_volume / k_eff`) the caller
+/// derives from the run's dials — the SAME anchor the engine samples the surface at, so the
+/// god-view surface metric matches the decision scale.
+pub fn node_summaries(world: &World, prior: &SurfacePrior, v0: f64) -> Vec<NodeSummary> {
     let n = world.nodes.len();
     let mut out = Vec::with_capacity(n);
     for node in 0..n {
@@ -124,8 +127,9 @@ pub fn node_summaries(world: &World, prior: &SurfacePrior) -> Vec<NodeSummary> {
                 cap,
                 &world.nodes[node],
                 crate::sim_dynamic::generator::DAYS_PER_TICK,
+                v0,
             );
-            let est = estimate_surface(&obs, prior, OBSERVED_V0, OBSERVED_TAU0);
+            let est = estimate_surface(&obs, prior, v0, OBSERVED_TAU0);
             surf_sum += est.r_hat;
             surf_cnt += 1;
         }

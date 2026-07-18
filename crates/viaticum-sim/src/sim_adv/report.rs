@@ -194,9 +194,19 @@ fn format_restore(result: &RunResult) -> Option<String> {
         first.n_blocks()
     );
     let (m, s) = rcol(result, |r| r.restore_truth_u());
-    let _ = writeln!(o, "  restore-truth U (any)  {:>8.4} ± {:.4}", m, s);
+    let _ = writeln!(
+        o,
+        "  restore-truth U (any)  {:>8.4} ± {:.4}  [ASPIRATIONAL, D7]",
+        m, s
+    );
     let (m, s) = rcol(result, |r| r.restore_truth_s());
     let _ = writeln!(o, "  restore-truth S (bw)   {:>8.4} ± {:.4}", m, s);
+    let (m, s) = rcol(result, |r| r.restore_truth_o());
+    let _ = writeln!(
+        o,
+        "  restore-truth O (1shot){:>8.4} ± {:.4}  [O ≤ U; today's no-retry floor]",
+        m, s
+    );
     let (m, s) = rcol(result, |r| r.durability_floor());
     let _ = writeln!(o, "  durability-floor       {:>8.4} ± {:.4}", m, s);
     // Per-ι-bucket restore-truth U (detail §3.1 cut).
@@ -224,16 +234,17 @@ fn format_restore(result: &RunResult) -> Option<String> {
 /// §10 п.18 / NOTE-5). One row per seed that had a Disaster; empty (header only) otherwise.
 pub fn restore_csv(result: &RunResult) -> String {
     let mut o = String::from(
-        "scenario,seed,tick_disaster,window_days,window_ticks,n_victims,n_blocks,restorable_u,restorable_s,restorable_floor,restore_truth_u,restore_truth_s,durability_floor,restore_bw_gb_day,info_model\n",
+        "scenario,seed,tick_disaster,window_days,window_ticks,n_victims,n_blocks,restorable_u,restorable_s,restorable_o,restorable_floor,restore_truth_u,restore_truth_s,restore_truth_o,durability_floor,restore_bw_gb_day,info_model\n",
     );
     for (i, r) in result.per_seed_restore.iter().enumerate() {
         let Some(rt) = r else { continue };
         let n_u = rt.blocks.iter().filter(|b| b.restorable_u).count();
         let n_s = rt.blocks.iter().filter(|b| b.restorable_s).count();
+        let n_o = rt.blocks.iter().filter(|b| b.restorable_o).count();
         let n_f = rt.blocks.iter().filter(|b| b.restorable_floor).count();
         let _ = writeln!(
             o,
-            "{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{},{}",
             result.scenario,
             result.seeds[i],
             rt.disaster_tick,
@@ -243,9 +254,11 @@ pub fn restore_csv(result: &RunResult) -> String {
             rt.n_blocks(),
             n_u,
             n_s,
+            n_o,
             n_f,
             rt.restore_truth_u(),
             rt.restore_truth_s(),
+            rt.restore_truth_o(),
             rt.durability_floor(),
             rt.restore_bw_gb_day,
             rt.info_model,
