@@ -3,7 +3,13 @@
 use crate::sim_adv::brier::{Calibration, DEFAULT_BRIER_BUCKETS};
 use crate::sim_adv::cli::{apply_dial, parse_cli, resolve_seeds};
 use crate::sim_adv::metrics::{bit_eq as metrics_bit_eq, collect_metrics, mean_sigma};
-use crate::sim_adv::registry::{all_scenarios, dr_baseline, find_scenario, honest_v2};
+use crate::sim_adv::predators::{
+    RunMode, a1_epsilon_whale_hook, a4_whitewasher_hook, bit_eq as adv_bit_eq, fold_cap_ratio,
+    inject_adversaries,
+};
+use crate::sim_adv::registry::{
+    a1_whale, a4_whitewasher, all_scenarios, dr_baseline, find_scenario, honest_v2,
+};
 use crate::sim_adv::report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
 use crate::sim_adv::restore::{
     BlockOutcome, IOTA_BUCKETS, RestoreTracker, RestoreTruth, bit_eq as restore_bit_eq, iota_bucket,
@@ -15,7 +21,7 @@ use crate::sim_adv::scenario::{
 };
 use crate::sim_adv::verdict::{Direction, VerdictKind, decide, evaluate_board};
 use crate::sim_dynamic::build_world;
-use crate::sim_dynamic::engine::DynParams;
+use crate::sim_dynamic::engine::{DynParams, whitewash_rejoin_for_test};
 use crate::sim_dynamic::generator::{Archetype, GiverTier, HeldSymbol, OwnBlock, World, online};
 
 // ------------------------------------------------------------------
@@ -89,7 +95,7 @@ fn registry_all_scenarios_is_non_empty() {
 #[test]
 fn event_dispatch_records_executor_on_the_scripted_tick() {
     let sc = tiny_scenario_with_events(vec![(2, Event::Disaster(NodeSel::Index(0)))]);
-    let (_metrics, fired, _r, _c) = run_one_seed(&sc, 1);
+    let (_metrics, fired, _r, _c, _a) = run_one_seed(&sc, 1);
     assert_eq!(fired.len(), 1, "exactly one event fired");
     assert_eq!(fired[0].tick, 2, "fired on the scripted tick");
     assert_eq!(fired[0].kind, EventKind::Disaster);
@@ -99,7 +105,7 @@ fn event_dispatch_records_executor_on_the_scripted_tick() {
 fn event_dispatch_skips_events_scheduled_beyond_horizon() {
     // horizon is 4 (ticks 0..4); an event at tick 9 must never fire.
     let sc = tiny_scenario_with_events(vec![(9, Event::KillSubnet(3))]);
-    let (_metrics, fired, _r, _c) = run_one_seed(&sc, 1);
+    let (_metrics, fired, _r, _c, _a) = run_one_seed(&sc, 1);
     assert!(fired.is_empty(), "event past the horizon does not fire");
 }
 
@@ -115,7 +121,7 @@ fn event_dispatch_fires_multiple_events_at_their_ticks() {
         ),
         (3, Event::AdvActivate(AdvId::A1EpsilonWhale)),
     ]);
-    let (_m, fired, _r, _c) = run_one_seed(&sc, 1);
+    let (_m, fired, _r, _c, _a) = run_one_seed(&sc, 1);
     let ticks: Vec<u64> = fired.iter().map(|f| f.tick).collect();
     assert_eq!(ticks, vec![0, 1, 3]);
     assert_eq!(fired[0].kind, EventKind::JoinWave);
@@ -200,7 +206,7 @@ fn honest_v2_seed42_matches_sim_diag_anchor() {
     //   (3428→7306, intermittent holders now confirmed); F5 (chunk = source/k_eff = 25 gb,
     //   2.5× bigger) conserves placed GB but ~2.5× fewer symbols (565→224) and fewer eviction
     //   events (1514→506); share A>0 96.6→76.8 (harder contention, fewer mutual pairs).
-    let (m, _fired, _r, _c) = run_one_seed(&honest_v2(), 42);
+    let (m, _fired, _r, _c, _a) = run_one_seed(&honest_v2(), 42);
 
     // Exact integer counters (sim_diag §6a/§3-sum/§6d).
     assert_eq!(m.alive_symbols, 224, "alive symbols (6a)");
@@ -253,7 +259,7 @@ fn honest_v2_reliable_extraction_roi_is_near_balance_and_bounded() {
     // 1.015 pre-F1-F6), NOT above the ceiling. (Universal "< 1 for all archetypes" is
     // impossible: Σconsumed ≡ Σserved_out.) The invariant is BOUNDED extraction, so we lock
     // the measured value and the 1.25 ceiling.
-    let (m, _fired, _r, _c) = run_one_seed(&honest_v2(), 42);
+    let (m, _fired, _r, _c, _a) = run_one_seed(&honest_v2(), 42);
     let roi = m.extraction_roi[0];
     assert!(
         (roi - 0.989).abs() < 0.01,
@@ -493,7 +499,7 @@ fn format_sweep_shows_both_dial_points() {
 // ------------------------------------------------------------------
 
 fn noop_hook(_ctx: &AdvContext) -> AdvAction {
-    AdvAction::NoOp
+    AdvAction::NOOP
 }
 
 #[test]
@@ -504,8 +510,10 @@ fn behavior_hook_has_no_world_and_returns_action() {
         adv_node: 7,
         tick: 3,
         info_model: InfoModel::DrCard { target: 0 },
+        dials: AdvDials::default(),
+        joined_tick: 0,
     };
-    assert_eq!(hook(&ctx), AdvAction::NoOp);
+    assert_eq!(hook(&ctx), AdvAction::NOOP);
 }
 
 // ------------------------------------------------------------------
@@ -1230,4 +1238,403 @@ fn pred_log_is_written_when_enabled_and_never_alters_a_decision() {
     assert_eq!(on.eviction_log.len(), off.eviction_log.len());
     assert_eq!(on.preempt_count, off.preempt_count);
     assert_eq!(on.cap_trim_count, off.cap_trim_count);
+}
+
+// ------------------------------------------------------------------
+// phase 1: adversary machinery — injection + hooks + whitewash reset
+// ------------------------------------------------------------------
+
+/// A whale AdvSpec (×8 demand, serve 5%).
+fn whale_spec(count: usize) -> AdvSpec {
+    AdvSpec {
+        id: AdvId::A1EpsilonWhale,
+        count,
+        info_model: InfoModel::Own,
+        dials: AdvDials {
+            whale_block_mult: 8.0,
+            whale_accept: 0.05,
+            ..AdvDials::default()
+        },
+    }
+}
+
+#[test]
+fn build_world_leaves_the_adv_layer_empty_and_honest_scenarios_inject_nothing() {
+    // A fresh world is all-honest (the byte-identical honest path); an honest scenario's
+    // (empty) adversary list injects nothing.
+    let params = DynParams::default();
+    let w = build_world(30, &params, 1);
+    assert!(w.adv.iter().all(|a| a.is_none()), "adv layer empty");
+    assert!(w.adv_rejoin_count.iter().all(|&c| c == 0));
+
+    let mut w2 = build_world(30, &params, 1);
+    let injected = inject_adversaries(
+        &mut w2,
+        &honest_v2().adversaries,
+        &params,
+        RunMode::Predator,
+    );
+    assert!(injected.is_empty(), "honest_v2 has no adversaries");
+    assert!(w2.adv.iter().all(|a| a.is_none()));
+}
+
+#[test]
+fn inject_adversaries_is_deterministic_and_repurposes_the_last_slots() {
+    let params = DynParams::default();
+    let spec = whale_spec(2);
+    let mut w1 = build_world(20, &params, 7);
+    let mut w2 = build_world(20, &params, 7);
+    let n1 = inject_adversaries(
+        &mut w1,
+        std::slice::from_ref(&spec),
+        &params,
+        RunMode::Predator,
+    );
+    let n2 = inject_adversaries(&mut w2, &[spec], &params, RunMode::Predator);
+    assert_eq!(n1, n2, "injection is deterministic");
+    assert_eq!(
+        n1,
+        vec![18, 19],
+        "the last `count` slots become adversaries"
+    );
+    for &i in &n1 {
+        // ×8 demand = 8·blocks_per_node(3) = 24 own blocks, present from t=0, hook installed.
+        assert_eq!(w1.nodes[i].own_blocks.len(), 24, "×8 backup demand");
+        assert!(w1.nodes[i].present && w1.nodes[i].joined_tick == 0);
+        assert!(w1.adv[i].is_some(), "predator role installed");
+    }
+}
+
+#[test]
+fn twin_injection_matches_construction_and_carries_a_noop_role() {
+    // WARN-1: the matched twin gets the SAME heavy nodes AND an `adv` role — but a NOOP hook
+    // (no accept override, no rejoin). The role is what makes the engine treat the node as
+    // hook-driven and BYPASS the random churn Bernoulli, so BOTH predator and twin are immortal
+    // (no mortality confound); the only difference is the hook's BEHAVIOUR.
+    let params = DynParams::default();
+    let spec = whale_spec(2);
+    let mut pred = build_world(20, &params, 7);
+    let mut twin = build_world(20, &params, 7);
+    let np = inject_adversaries(
+        &mut pred,
+        std::slice::from_ref(&spec),
+        &params,
+        RunMode::Predator,
+    );
+    let nt = inject_adversaries(&mut twin, &[spec], &params, RunMode::Twin);
+    assert_eq!(np, nt);
+    let ctx = |node: usize| AdvContext {
+        adv_node: node,
+        tick: 5,
+        info_model: InfoModel::Own,
+        dials: AdvDials {
+            whale_accept: 0.05,
+            ..AdvDials::default()
+        },
+        joined_tick: 0,
+    };
+    for &i in &np {
+        assert_eq!(
+            pred.nodes[i].own_blocks.len(),
+            twin.nodes[i].own_blocks.len(),
+            "matched demand"
+        );
+        // Both carry a role (so both bypass churn), but the twin's hook is a no-op: it serves
+        // at the archetype rate (accept_rate None) and never rejoins, while the predator's
+        // whale hook forces the ε serve rate.
+        let pred_role = pred.adv[i].expect("predator role");
+        let twin_role = twin.adv[i].expect("twin role");
+        assert_eq!(
+            (pred_role.hook)(&ctx(i)).accept_rate,
+            Some(0.05),
+            "predator serves ε"
+        );
+        assert_eq!(
+            (twin_role.hook)(&ctx(i)).accept_rate,
+            None,
+            "twin serves at the archetype rate"
+        );
+        assert!(!(twin_role.hook)(&ctx(i)).rejoin, "twin never rejoins");
+    }
+}
+
+#[test]
+fn fold_cap_ratio_covers_all_nan_branches() {
+    // NaN = "no sample this tick"; the fold keeps the running max otherwise.
+    assert!(fold_cap_ratio(f64::NAN, f64::NAN).is_nan(), "no sample yet");
+    assert_eq!(
+        fold_cap_ratio(f64::NAN, 0.7),
+        0.7,
+        "first real sample seeds it"
+    );
+    assert_eq!(fold_cap_ratio(0.7, f64::NAN), 0.7, "a NaN tick is ignored");
+    assert_eq!(fold_cap_ratio(0.7, 0.9), 0.9, "keeps the larger");
+    assert_eq!(
+        fold_cap_ratio(0.9, 0.7),
+        0.9,
+        "keeps the larger (other order)"
+    );
+}
+
+#[test]
+fn a1_hook_serves_epsilon_and_never_rejoins() {
+    let ctx = AdvContext {
+        adv_node: 5,
+        tick: 9,
+        info_model: InfoModel::Own,
+        dials: AdvDials {
+            whale_accept: 0.05,
+            ..AdvDials::default()
+        },
+        joined_tick: 0,
+    };
+    let a = a1_epsilon_whale_hook(&ctx);
+    assert_eq!(a.accept_rate, Some(0.05), "ε-give serve rate");
+    assert!(!a.rejoin, "a whale never burns its identity");
+}
+
+#[test]
+fn a4_hook_rejoins_once_per_period_measured_from_the_current_join() {
+    let dials = AdvDials {
+        period_ticks: 20,
+        ..AdvDials::default()
+    };
+    let mk = |tick: u64, joined: u64| AdvContext {
+        adv_node: 5,
+        tick,
+        info_model: InfoModel::Own,
+        dials,
+        joined_tick: joined,
+    };
+    assert!(
+        !a4_whitewasher_hook(&mk(0, 0)).rejoin,
+        "not on the join tick"
+    );
+    assert!(!a4_whitewasher_hook(&mk(19, 0)).rejoin);
+    assert!(a4_whitewasher_hook(&mk(20, 0)).rejoin, "one period elapsed");
+    assert!(!a4_whitewasher_hook(&mk(21, 0)).rejoin);
+    // After a burn the join tick moves forward, so the cadence resets from there.
+    assert!(!a4_whitewasher_hook(&mk(40, 21)).rejoin);
+    assert!(
+        a4_whitewasher_hook(&mk(41, 21)).rejoin,
+        "one period after re-join"
+    );
+    // The whitewasher serves at its archetype rate between burns (no accept override).
+    assert_eq!(a4_whitewasher_hook(&mk(41, 21)).accept_rate, None);
+}
+
+#[test]
+fn whitewash_rejoin_wipes_capital_own_data_and_reschedules_the_join() {
+    let params = DynParams::default();
+    let mut w = build_world(10, &params, 3);
+    let node = 4usize;
+    // Give the node capital both ways, a foreign holding it stores, and one of its own
+    // symbols placed on a holder.
+    w.capital[node][2].g_ho = 5.0;
+    w.capital[node][2].depth_ho = 3.0;
+    w.capital[7][node].g_oh = 9.0; // holder 7's record of node-as-holder
+    w.nodes[node].holdings.push(HeldSymbol {
+        owner: 1,
+        block: 0,
+        iota: 0.5,
+        volume: 10.0,
+        alive: true,
+        cream: false,
+    });
+    w.nodes[6].holdings.push(HeldSymbol {
+        owner: node,
+        block: 0,
+        iota: 0.5,
+        volume: 10.0,
+        alive: true,
+        cream: false,
+    });
+    let old_first_block = w.nodes[node].own_blocks[0].id;
+
+    whitewash_rejoin_for_test(&mut w, node, 30, &params);
+
+    // Mutual amnesia: the node's capital ROW and COLUMN are wiped.
+    assert_eq!(w.capital[node][2].g_ho, 0.0);
+    assert_eq!(w.capital[node][2].depth_ho, 0.0);
+    assert_eq!(w.capital[7][node].g_oh, 0.0, "counterparties forget it");
+    // It abandoned others' data, and its own backed-up data is orphaned.
+    assert!(w.nodes[node].holdings.iter().all(|s| !s.alive));
+    assert!(
+        w.nodes[6].holdings.iter().all(|s| !s.alive),
+        "own data on a holder is orphaned"
+    );
+    // Fresh own blocks (new ids, un-placed) — a brand-new backup demand.
+    assert_ne!(w.nodes[node].own_blocks[0].id, old_first_block);
+    assert!(
+        w.nodes[node]
+            .own_blocks
+            .iter()
+            .all(|b| !b.floor_ever_met && b.placements.is_empty() && !b.to_restore)
+    );
+    // Re-joins next tick with the fresh identity.
+    assert!(!w.nodes[node].present);
+    assert_eq!(w.nodes[node].joined_tick, 31);
+    assert_eq!(w.adv_rejoin_count[node], 1);
+}
+
+// ------------------------------------------------------------------
+// phase 1: A1 ε-whale + A4 whitewasher — the invariants (spec §3/§4)
+// ------------------------------------------------------------------
+
+/// Mean of a per-seed adversary quantity over the adversary pairs (predator side or twin).
+fn adv_mean(
+    result: &crate::sim_adv::RunResult,
+    twin: bool,
+    f: impl Fn(&crate::sim_adv::AdvMetrics) -> f64,
+) -> f64 {
+    let vals: Vec<f64> = result
+        .per_seed_adv
+        .iter()
+        .flatten()
+        .map(|p| if twin { f(&p.twin) } else { f(&p.pred) })
+        .collect();
+    vals.iter().sum::<f64>() / vals.len() as f64
+}
+
+#[test]
+fn a1_whale_parked_volume_is_capped_and_protects_less_than_the_honest_twin() {
+    // Р-7 (P1b): where the cap engages, the ε-whale's SETTLED parked volume is bounded by
+    // V_ret + one chunk (ratio ≤ 1) on EVERY seed; and its protected-storage integral sits
+    // below its matched honest twin (same ×8 demand, serving fully). Three seeds keep it
+    // quick while still exercising the full pred+twin comparison.
+    let mut sc = a1_whale();
+    sc.seeds = vec![42, 43, 44];
+    let result = run(&sc, &sc.seeds.clone());
+
+    let mut cap_engaged = false;
+    for p in result.per_seed_adv.iter().flatten() {
+        if !p.pred.max_cap_ratio.is_nan() {
+            cap_engaged = true;
+            assert!(
+                p.pred.max_cap_ratio <= 1.0,
+                "the Р-7 cap must bind the whale where it engages: ratio {}",
+                p.pred.max_cap_ratio
+            );
+        }
+    }
+    assert!(cap_engaged, "the Р-7 cap must engage on ≥1 seed");
+    let pred = adv_mean(&result, false, |a| a.consumed);
+    let twin = adv_mean(&result, true, |a| a.consumed);
+    assert!(
+        pred < twin,
+        "ε-whale protects less than its honest twin: {pred} < {twin}"
+    );
+}
+
+#[test]
+fn a4_whitewasher_reenters_capped_at_v_free_and_delivers_less_than_the_twin() {
+    // A4: the whitewasher actually re-enters (rejoins > 0); its re-entered identity is bounded
+    // by the freshly-earned V_ret (cap ratio ≤ 1, κ_O reset each cycle — the Sybil price); and
+    // its total delivered park sits below the continuous honest twin.
+    let mut sc = a4_whitewasher();
+    sc.seeds = vec![42, 43, 44];
+    let result = run(&sc, &sc.seeds.clone());
+
+    for p in result.per_seed_adv.iter().flatten() {
+        assert!(p.pred.rejoins > 0, "the whitewasher must actually re-enter");
+        if !p.pred.max_cap_ratio.is_nan() {
+            assert!(
+                p.pred.max_cap_ratio <= 1.0,
+                "re-entered identity bounded by V_ret: ratio {}",
+                p.pred.max_cap_ratio
+            );
+        }
+    }
+    let pred = adv_mean(&result, false, |a| a.consumed);
+    let twin = adv_mean(&result, true, |a| a.consumed);
+    assert!(
+        pred < twin,
+        "whitewash delivers less park than the honest twin: {pred} < {twin}"
+    );
+}
+
+#[test]
+fn a1_whale_board_passes_every_row() {
+    // The acceptance board (spec §3): the two structural rows + INV-P1B-CAP + INV-ROI-PRED≤TWIN
+    // all PASS on the frozen 5-seed run (deterministic — power gate is exact, not flaky).
+    let sc = a1_whale();
+    let result = run(&sc, &sc.seeds.clone());
+    let verdicts = evaluate_board(&sc, &result);
+    let ids: Vec<&str> = verdicts.iter().map(|v| v.id).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "INV-DETERMINISM",
+            "INV-ANTI-ORACLE",
+            "INV-P1B-CAP",
+            "INV-ROI-PRED≤TWIN",
+            "INV-ROI-RAW≤TWIN"
+        ]
+    );
+    for v in &verdicts {
+        assert_eq!(
+            v.kind,
+            VerdictKind::Pass,
+            "{} must PASS (effect {}, power {})",
+            v.id,
+            v.effect,
+            v.power
+        );
+    }
+}
+
+#[test]
+fn a4_whitewasher_board_passes_every_row() {
+    let sc = a4_whitewasher();
+    let result = run(&sc, &sc.seeds.clone());
+    let verdicts = evaluate_board(&sc, &result);
+    let ids: Vec<&str> = verdicts.iter().map(|v| v.id).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "INV-DETERMINISM",
+            "INV-ANTI-ORACLE",
+            "INV-P2-REENTRY",
+            "INV-ROI-PRED≤TWIN",
+            "INV-ROI-RAW≤TWIN"
+        ]
+    );
+    for v in &verdicts {
+        assert_eq!(
+            v.kind,
+            VerdictKind::Pass,
+            "{} must PASS (effect {}, power {})",
+            v.id,
+            v.effect,
+            v.power
+        );
+    }
+}
+
+#[test]
+fn adv_run_is_bit_identical_on_repeat() {
+    // Determinism (spec §10 п.13): the whole predator + twin + Attack-ROI path is seeded, so a
+    // DR-free adversary scenario re-runs bit-identical per seed.
+    let mut sc = a1_whale();
+    sc.seeds = vec![42, 43];
+    let seeds = sc.seeds.clone();
+    let r1 = run(&sc, &seeds);
+    let r2 = run(&sc, &seeds);
+    assert!(r1.per_seed_adv.iter().all(|p| p.is_some()));
+    for (a, b) in r1.per_seed_adv.iter().zip(&r2.per_seed_adv) {
+        match (a, b) {
+            (Some(x), Some(y)) => assert!(
+                adv_bit_eq(&x.pred, &y.pred) && adv_bit_eq(&x.twin, &y.twin),
+                "Attack-ROI must be bit-identical on repeat"
+            ),
+            (None, None) => {}
+            _ => panic!("adv presence differs between runs"),
+        }
+    }
+    for (a, b) in r1.per_seed.iter().zip(&r2.per_seed) {
+        assert!(
+            metrics_bit_eq(a, b),
+            "god-view metrics bit-identical on repeat"
+        );
+    }
 }

@@ -31,6 +31,7 @@ use viaticum_core::four_r::{
 };
 
 use crate::generator::Rng;
+use crate::sim_adv::scenario::{AdvAction, AdvContext};
 use crate::sim_dynamic::generator::{
     BlockPlacement, DAYS_PER_TICK, EvictNoticeKind, EvictionEvent, HeldSymbol, Node, OwnBlock,
     PairCapital, PendingEviction, PredEntry, RepairStat, SilentLoss, World, surfaced_in_window,
@@ -320,7 +321,8 @@ pub fn retention_prior(params: &DynParams) -> RetentionPrior {
 /// so the caller carries `g*` and the days→gb·days `d_ref` conversion. SHARED by
 /// `run_eviction` (inter-owner rank + Р-7 cap) and `admit_offer` (preemption + accept
 /// guard) so all three holder-side mechanisms read the SAME κ_O (B-1, fix ADV2-D2).
-fn depth_params_of(params: &DynParams, v_per_symbol: f64) -> DepthParams {
+/// `pub` so the sim_adv predator-metric layer reads the SAME κ_O the cap enforces (no drift).
+pub fn depth_params_of(params: &DynParams, v_per_symbol: f64) -> DepthParams {
     DepthParams {
         w_d: params.depth_w_d,
         d_ref: params.depth_ref_days * v_per_symbol,
@@ -331,7 +333,8 @@ fn depth_params_of(params: &DynParams, v_per_symbol: f64) -> DepthParams {
 /// The Р-7 (A.14) holder-side volume cap `V_ret = V_free + κ_O/c_recip` in kernel
 /// units: `V_free = v_free_symbols·v_per_symbol` gb, `c_recip = c_recip_days` days.
 /// `c_recip ≤ 0` DISABLES the cap ([`RetentionCap::disabled`], WARN-1 guard).
-fn retention_cap(params: &DynParams, v_per_symbol: f64) -> RetentionCap {
+/// `pub` so the sim_adv predator-metric layer reads the SAME cap the eviction enforces.
+pub fn retention_cap(params: &DynParams, v_per_symbol: f64) -> RetentionCap {
     RetentionCap {
         v_free: params.v_free_symbols * v_per_symbol,
         c_recip: params.c_recip_days,
@@ -393,7 +396,8 @@ fn apply_announced_burn(
 /// The sim "symbol" reads as a per-holder chunk; decode needs `k_eff` chunks that TOGETHER
 /// reconstruct the source, so each chunk carries `source / k_eff` (the `n` placed chunks
 /// total `(n/k)·source`). Defaults: `50 / 2 = 25` gb/chunk (was `50 / 5 = 10`).
-fn v_per_symbol_of(params: &DynParams) -> f64 {
+/// `pub` so the sim_adv predator-metric layer measures the chunk-granularity tolerance.
+pub fn v_per_symbol_of(params: &DynParams) -> f64 {
     if params.k_eff > 0 {
         params.block_volume / params.k_eff as f64
     } else {
@@ -429,6 +433,23 @@ fn block_mature(joined_tick: u64, block_pos: usize, tick: u64, params: &DynParam
 /// Preemption enabled? (WARN-2: a negative / non-finite `θ_p` DISABLES it.)
 fn preempt_enabled(params: &DynParams) -> bool {
     params.preempt_theta.is_finite() && params.preempt_theta >= 0.0
+}
+
+/// World-v3 phase-1: consult node `node`'s adversary behaviour hook for `tick`. Returns
+/// `None` for an HONEST node (no `adv` role) — the honest path never builds a context nor
+/// calls a hook, so it stays byte-identical. The hook is handed only a first-hand
+/// [`AdvContext`] (its own node id, tick, dials, join tick, declared info-model) — never
+/// `&World` (anti-oracle, spec §10 п.14). Reads no RNG.
+fn adv_action(world: &World, node: usize, tick: u64) -> Option<AdvAction> {
+    let role = world.adv[node].as_ref()?;
+    let ctx = AdvContext {
+        adv_node: node,
+        tick,
+        info_model: role.info_model,
+        dials: role.dials,
+        joined_tick: world.nodes[node].joined_tick,
+    };
+    Some((role.hook)(&ctx))
 }
 
 /// Repair-storm §7 detection: has the owner NOTICED (via its PoS cadence) that a
@@ -912,9 +933,15 @@ fn admit_offer(
     params: &DynParams,
     tick: u64,
 ) -> bool {
-    // WILL: seeded Bernoulli on the archetype's willingness (§10.A).
+    // WILL: seeded Bernoulli on the accept rate. World-v3: an adversary HOLDER's hook may
+    // OVERRIDE the archetype rate (A1 ε-give serves ~5%); an honest holder uses its
+    // archetype willingness UNCHANGED (adv_action → None for honest nodes, so the RNG draw
+    // and threshold are byte-identical to the pre-adv path).
+    let accept_rate = adv_action(world, holder, tick)
+        .and_then(|a| a.accept_rate)
+        .unwrap_or_else(|| world.nodes[holder].archetype.willing_accept_rate());
     let mut rng = Rng::derive(world.seed, ACCEPT_TAG, owner as u64, holder as u64, tick);
-    if rng.unit() >= world.nodes[holder].archetype.willing_accept_rate() {
+    if rng.unit() >= accept_rate {
         return false; // unwilling = behavioural hard reject
     }
     // ROOM + accept-gate (NEW-2 damper): freely accept only above s_soft and not evicting.
@@ -1623,6 +1650,19 @@ fn churn(world: &mut World, params: &DynParams) {
         if !world.nodes[node].present {
             continue;
         }
+        // World-v3 phase-1: an ADVERSARY node's departure is HOOK-driven (a whitewasher's
+        // deterministic self-exit), never the random churn Bernoulli. It draws no churn RNG
+        // — a distinct per-node stream, so the honest nodes' draws are unaffected either way.
+        // Honest scenarios have no `adv` role ⇒ this branch is never taken ⇒ byte-identical.
+        if world.adv[node].is_some() {
+            if adv_action(world, node, tick)
+                .map(|a| a.rejoin)
+                .unwrap_or(false)
+            {
+                whitewash_rejoin(world, node, tick, params);
+            }
+            continue;
+        }
         let mut rng = Rng::derive(world.seed, 0xC4_07_C4_07, world.nodes[node].id, tick, 0);
         let aggression = world.nodes[node].archetype.evict_aggression();
         let p = params.churn_out_prob * (1.0 + CHURN_AGGRESSION_SCALE * aggression);
@@ -1659,6 +1699,79 @@ fn churn(world: &mut World, params: &DynParams) {
 /// How strongly archetype aggression raises the churn rate (§9.4). Chosen so a Hoarder
 /// (aggression 0.7) churns at ~3× the base, matching the old flat multiplier.
 const CHURN_AGGRESSION_SCALE: f64 = 2.857;
+
+/// World-v3 phase-1 (A4): node `node` BURNS its identity and re-enters fresh next tick — the
+/// whitewash cycle. Called from [`churn`] when the A4 hook returns `rejoin`. Distinct from a
+/// plain [`churn`] departure and from a [`disaster_strike`]: a disaster PRESERVES the
+/// bilaterally-observable `g_ho`/`depth_ho` (counterparties remember the node's service); a
+/// whitewash is the OPPOSITE — the new identity is UNLINKABLE to the burnt one, so
+/// counterparties FORGET it entirely (mutual amnesia). That amnesia is exactly the thing the
+/// Sybil price (P2) must neutralise: a re-entered identity gets NO credit for its prior life,
+/// so it is capped at V_free like any brand-new node until it EARNS κ_O afresh.
+///
+/// The mutation:
+///  * **As a holder** — its holdings (others' data) die. NO burn is queued to any owner: a
+///    reputation burn would bleed onto the new identity, which the model must not allow (the
+///    old identity, not the new one, is the one that defected). The owners simply lose a
+///    holder and repair, exactly as if it churned.
+///  * **As an owner** — its OWN backed-up symbols on every holder are orphaned (the fresh
+///    identity cannot claim them) and marked dead, so they stop passing PoS / accruing.
+///  * **Own data** — reset to fresh, un-placed blocks (new ids): the new identity backs up
+///    from scratch, re-paying the θ_p/λ entry latency each cycle.
+///  * **Capital** — the node's ROW and COLUMN are wiped (mutual amnesia); κ_O with every
+///    holder collapses to 0, so its post-re-entry `V_ret = V_free`.
+///  * **Presence** — `present = false`, `joined_tick = tick + 1`; the engine's own
+///    `activate_joins` revives it at the start of the next tick with the fresh identity (no
+///    runner plumbing needed). The god-view `served` INTEGRAL is deliberately NOT reset — it
+///    is the evaluator's lifetime record of how much park the node ever delivered, the very
+///    quantity the ROI report compares against the honest twin.
+fn whitewash_rejoin(world: &mut World, node: usize, tick: u64, params: &DynParams) {
+    let n = world.nodes.len();
+    // As a HOLDER: abandon others' data (no burn — the fresh identity is unlinkable).
+    for hs in world.nodes[node].holdings.iter_mut() {
+        hs.alive = false;
+    }
+    // As an OWNER: orphan its own backed-up data on every holder (the new identity cannot
+    // claim it), so it stops passing PoS and accruing on the counterparties' books.
+    for h in 0..n {
+        for s in world.nodes[h].holdings.iter_mut() {
+            if s.alive && s.owner == node {
+                s.alive = false;
+            }
+        }
+    }
+    // Fresh own data: new block ids, un-placed (backs up from scratch). Mirrors the
+    // build_world importance spread so the ι-ladder is non-trivial across the new blocks.
+    let bpn = params.blocks_per_node;
+    let mut fresh: Vec<OwnBlock> = Vec::with_capacity(bpn);
+    for b in 0..bpn {
+        let id = world.next_block_id[node];
+        world.next_block_id[node] += 1;
+        fresh.push(OwnBlock {
+            id,
+            volume: params.block_volume,
+            iota: 0.2 + 0.6 * (b as f64) / (bpn.max(2) - 1) as f64,
+            placements: Vec::new(),
+            floor_ever_met: false,
+            floor_deficit_since: None,
+            to_restore: false,
+        });
+    }
+    world.nodes[node].own_blocks = fresh;
+    // Mutual amnesia: wipe the node's capital ROW and COLUMN (no one remembers it, it
+    // remembers no one). κ_O with every holder → 0 ⇒ post-re-entry V_ret = V_free.
+    for h in 0..n {
+        world.capital[node][h] = PairCapital::default();
+        world.capital[h][node] = PairCapital::default();
+    }
+    // Re-bootstrap the newcomer-entry traces (a fresh joiner).
+    world.first_earned_g[node] = None;
+    world.first_own_accept[node] = None;
+    // Re-join next tick with the fresh identity (activate_joins revives it at tick+1).
+    world.nodes[node].joined_tick = tick + 1;
+    world.nodes[node].present = false;
+    world.adv_rejoin_count[node] += 1;
+}
 
 /// World-v3 event executor (axis 8, sub-tranche 0.2): a Disaster hits `victim` — its
 /// disk, and with it EVERYTHING local, is destroyed. This is the DR-primary scenario
@@ -1854,6 +1967,11 @@ pub fn pos_and_capital_for_test(world: &mut World, params: &DynParams) {
 #[cfg(test)]
 pub fn churn_for_test(world: &mut World, params: &DynParams) {
     churn(world, params);
+}
+
+#[cfg(test)]
+pub fn whitewash_rejoin_for_test(world: &mut World, node: usize, tick: u64, params: &DynParams) {
+    whitewash_rejoin(world, node, tick, params);
 }
 
 #[cfg(test)]

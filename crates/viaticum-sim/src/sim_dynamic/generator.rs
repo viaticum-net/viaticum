@@ -14,6 +14,7 @@
 //! `Date.now` / wall-clock; design §10.A).
 
 use crate::generator::Rng;
+use crate::sim_adv::scenario::AdvRole;
 
 /// One simulated week per tick. The capital leak `1/λ` is months, so `λ·dt < 1`
 /// holds with room (design §10.C: weekly ticks × months-λ keeps the discrete
@@ -680,6 +681,17 @@ pub struct World {
     /// R̂-calibration dataset. Gating a metric channel, NOT a decision — every decision is
     /// bit-identical regardless of this flag (the anti-oracle regression asserts it).
     pub pred_log_enabled: bool,
+    /// World-v3 phase-1 ADVERSARY layer (predator injection). `adv[i] = Some(role)` marks
+    /// node `i` as an injected predator whose per-tick behaviour the engine consults via
+    /// `role.hook` — a `fn(&AdvContext) -> AdvAction` that by construction CANNOT borrow
+    /// `&World` (the anti-oracle boundary, spec §10 п.14). `None` for every honest node; an
+    /// all-`None` layer is the byte-identical honest path — the engine's adv branches
+    /// (`admit_offer` accept override, `churn` rejoin) are simply never taken.
+    pub adv: Vec<Option<AdvRole>>,
+    /// World-v3 phase-1 god-view tally: how many times node `i` has WHITEWASH-rejoined (A4
+    /// identity burn). Instrumentation for the ROI/re-entry report only — never a kernel
+    /// input. `0` for every node with no A4 role.
+    pub adv_rejoin_count: Vec<usize>,
 }
 
 /// One R̂-calibration prediction (transche 0.3) — a GOD-VIEW metric row, never a kernel

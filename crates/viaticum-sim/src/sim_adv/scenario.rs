@@ -351,10 +351,12 @@ impl MetricId {
 // ============================================================
 
 /// The first-hand context a predator hook may read — the anti-oracle boundary made a
-/// TYPE. It carries ONLY the predator's own node index, the current tick and its
-/// DECLARED info-model. It deliberately does NOT (and cannot) borrow `&World`: a
-/// predator decides from first-hand pair state + its info-model, never god-view. 0.1
-/// fixes this shape so no phase-1 predator can smuggle a `&World` in (spec §10 п.14).
+/// TYPE. It carries the predator's own node index, the current tick, its DECLARED
+/// info-model, its own strategy dials, and the tick its CURRENT identity joined — all
+/// first-hand (a node knows its own strategy and its own join tick). It deliberately does
+/// NOT (and cannot) borrow `&World`: a predator decides from first-hand pair state + its
+/// info-model, never god-view. This shape (spec §10 п.14 / WARN-5) is what stops any
+/// phase-1 predator smuggling a `&World` in.
 #[derive(Debug, Clone, Copy)]
 pub struct AdvContext {
     /// The predator's own god-view node index (identity only — NOT a god-view read).
@@ -363,14 +365,44 @@ pub struct AdvContext {
     pub tick: u64,
     /// The predator's declared information model.
     pub info_model: InfoModel,
+    /// The predator's own strategy dials (first-hand: it knows its own plan).
+    pub dials: AdvDials,
+    /// The tick the predator's CURRENT identity joined (first-hand). A whitewasher measures
+    /// its re-entry cadence from here (it resets on each identity burn).
+    pub joined_tick: u64,
 }
 
-/// What a predator hook returns for a tick. Skeleton in 0.1 (only `NoOp`); phase-1
-/// enriches with drop/park/accept actions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdvAction {
-    /// Do nothing this tick (the only 0.1 action).
-    NoOp,
+/// What a predator hook returns for a tick (phase 1: an ε-give accept override + a
+/// whitewash-rejoin flag). A default [`AdvAction::NOOP`] is the honest / no-op action.
+///
+/// (0.1 carried only a `NoOp` sentinel; phase 1 enriches it with the two live levers the
+/// A1/A4 predators need — the holder-side serve rate and the identity-burn self-exit.)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdvAction {
+    /// Holder-side ε-give: the probability this adversary ACCEPTS an incoming symbol offer
+    /// this tick, OVERRIDING the archetype rate. `None` ⇒ no override (archetype default).
+    /// A1 returns `Some(ε)` — it serves almost nothing, so it earns almost no reciprocity
+    /// κ_O and every holder caps its parked volume at ≈ V_free (Р-7).
+    pub accept_rate: Option<f64>,
+    /// A4 whitewash: at the END of this tick the adversary BURNS its identity — abandons
+    /// everything it holds, orphans its own backed-up data, wipes its capital both ways, and
+    /// re-enters next tick with a FRESH identity (κ_O = 0, new join tick). Models "burn
+    /// reputation → new identity".
+    pub rejoin: bool,
+}
+
+impl AdvAction {
+    /// The honest / no-op action: no accept override, no rejoin.
+    pub const NOOP: AdvAction = AdvAction {
+        accept_rate: None,
+        rejoin: false,
+    };
+}
+
+impl Default for AdvAction {
+    fn default() -> Self {
+        AdvAction::NOOP
+    }
 }
 
 /// The predator behaviour-override signature. By construction it takes ONLY an
@@ -378,3 +410,20 @@ pub enum AdvAction {
 /// anti-oracle guarantee for predators (the other half is the one-way crate edge that
 /// keeps the kernel blind). Phase-1 predators are `fn`s of this exact shape.
 pub type BehaviorHook = fn(&AdvContext) -> AdvAction;
+
+/// The per-node runtime adversary role the engine stores on the world (`World::adv[i]`) for
+/// an injected predator. It bundles the predator's id, declared info-model, strategy dials
+/// and behaviour hook — everything the engine needs to consult the hook at a decision point
+/// (`admit_offer` / `churn`) WITHOUT ever handing it `&World`. `None` for every honest node,
+/// so an all-`None` layer is the byte-identical honest path.
+#[derive(Debug, Clone, Copy)]
+pub struct AdvRole {
+    /// Which zoo member (A1..A14).
+    pub id: AdvId,
+    /// The predator's declared information model.
+    pub info_model: InfoModel,
+    /// The predator's strategy dials.
+    pub dials: AdvDials,
+    /// The behaviour hook (`fn(&AdvContext) -> AdvAction`, no `&World`).
+    pub hook: BehaviorHook,
+}

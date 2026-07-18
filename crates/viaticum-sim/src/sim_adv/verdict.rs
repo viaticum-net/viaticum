@@ -16,6 +16,7 @@
 //! over `MetricSet`, statistical over restore-truth, determinism, anti-oracle).
 
 use crate::sim_adv::metrics::{MetricSet, mean_sigma};
+use crate::sim_adv::predators::AdvMetrics;
 use crate::sim_adv::restore::RestoreTruth;
 use crate::sim_adv::runner::{RunResult, run_one_seed};
 use crate::sim_adv::scenario::Scenario;
@@ -80,6 +81,25 @@ pub enum InvariantSpec {
     Determinism,
     /// The anti-oracle structural guarantee (crate edge + hook signature).
     AntiOracle,
+    /// A phase-1 PREDATOR-side scalar → mean±σ vs threshold, power<2 gate. Reads the
+    /// predator's [`AdvMetrics`] from [`RunResult::per_seed_adv`]. Used by INV-P1B-CAP /
+    /// INV-P2-REENTRY (the Р-7 cap ratio holds ≤ 1 where the cap engages).
+    AdvCap {
+        /// Extract the invariant's scalar from the predator's Attack-ROI read.
+        measure: fn(&AdvMetrics) -> f64,
+        /// The pass direction.
+        dir: Direction,
+    },
+    /// A phase-1 COMPARATIVE row (predator vs matched twin): per seed the ratio
+    /// `measure(pred) / measure(twin)` → mean±σ vs threshold, power<2 gate. Used by
+    /// INV-ROI-PRED≤TWIN (the attack yields no more than honest play ⇒ ratio < 1). A twin
+    /// measure of `0` contributes `NaN` (skipped — no baseline to divide by).
+    AdvComparative {
+        /// Extract the compared scalar from an Attack-ROI read (applied to both sides).
+        measure: fn(&AdvMetrics) -> f64,
+        /// The pass direction.
+        dir: Direction,
+    },
 }
 
 /// One invariant-board row spec.
@@ -111,6 +131,14 @@ impl Clone for Invariant {
                 }
                 InvariantSpec::Determinism => InvariantSpec::Determinism,
                 InvariantSpec::AntiOracle => InvariantSpec::AntiOracle,
+                InvariantSpec::AdvCap { measure, dir } => InvariantSpec::AdvCap {
+                    measure: *measure,
+                    dir: *dir,
+                },
+                InvariantSpec::AdvComparative { measure, dir } => InvariantSpec::AdvComparative {
+                    measure: *measure,
+                    dir: *dir,
+                },
             },
             threshold: self.threshold,
         }
@@ -224,7 +252,7 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
             InvariantSpec::Determinism => {
                 let pass = match result.seeds.first() {
                     Some(&s0) => {
-                        let (m, _, r, c) = run_one_seed(scenario, s0);
+                        let (m, _, r, c, adv) = run_one_seed(scenario, s0);
                         let metrics_eq = result
                             .per_seed
                             .first()
@@ -246,7 +274,17 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             .first()
                             .map(|c0| crate::sim_adv::brier::bit_eq(c0, &c))
                             .unwrap_or(false);
-                        metrics_eq && restore_eq && calib_eq
+                        // The predator's Attack-ROI read (phase 1) must re-run bit-identical
+                        // too (it feeds the ROI report + the AdvCap/AdvComparative verdicts).
+                        let adv_eq = match result.per_seed_adv.first() {
+                            Some(Some(p0)) => adv
+                                .as_ref()
+                                .map(|a1| crate::sim_adv::predators::bit_eq(&p0.pred, a1))
+                                .unwrap_or(false),
+                            Some(None) => adv.is_none(),
+                            None => true,
+                        };
+                        metrics_eq && restore_eq && calib_eq && adv_eq
                     }
                     None => false,
                 };
@@ -273,6 +311,57 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                 power: f64::NAN,
                 note: "structural: one-way crate edge + BehaviorHook has no &World",
             },
+            InvariantSpec::AdvCap { measure, dir } => {
+                let vals: Vec<f64> = result
+                    .per_seed_adv
+                    .iter()
+                    .map(|p| p.as_ref().map(|pp| measure(&pp.pred)).unwrap_or(f64::NAN))
+                    .collect();
+                let (mean, sigma) = mean_sigma(&vals);
+                let sigma_r = if sigma.is_finite() { sigma } else { 0.0 };
+                let (kind, power) = decide(mean, sigma, inv.threshold, *dir);
+                Verdict {
+                    id: inv.id,
+                    kind,
+                    effect: mean,
+                    sigma: sigma_r,
+                    threshold: inv.threshold,
+                    power,
+                    note: "predator: Р-7 cap ratio where the cap engages",
+                }
+            }
+            InvariantSpec::AdvComparative { measure, dir } => {
+                // Per seed: ratio measure(pred)/measure(twin). A twin measure of 0 ⇒ NaN
+                // (no baseline to divide by) — skipped by `mean_sigma`.
+                let vals: Vec<f64> = result
+                    .per_seed_adv
+                    .iter()
+                    .map(|p| {
+                        p.as_ref()
+                            .map(|pp| {
+                                let t = measure(&pp.twin);
+                                if t > 0.0 {
+                                    measure(&pp.pred) / t
+                                } else {
+                                    f64::NAN
+                                }
+                            })
+                            .unwrap_or(f64::NAN)
+                    })
+                    .collect();
+                let (mean, sigma) = mean_sigma(&vals);
+                let sigma_r = if sigma.is_finite() { sigma } else { 0.0 };
+                let (kind, power) = decide(mean, sigma, inv.threshold, *dir);
+                Verdict {
+                    id: inv.id,
+                    kind,
+                    effect: mean,
+                    sigma: sigma_r,
+                    threshold: inv.threshold,
+                    power,
+                    note: "predator vs matched twin (ratio)",
+                }
+            }
         })
         .collect()
 }

@@ -166,6 +166,11 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
         // flips `pred_log_enabled` on to collect the dataset. Metric-only, no decision reads it.
         pred_log: Vec::new(),
         pred_log_enabled: false,
+        // World-v3 phase-1 adversary layer: empty (all honest) by default — the sim_adv
+        // predator injection fills specific slots. An all-`None` layer keeps every engine
+        // decision byte-identical to the pre-adv path.
+        adv: vec![None; n],
+        adv_rejoin_count: vec![0; n],
     }
 }
 
@@ -410,6 +415,9 @@ fn run_newcomer_probe(
     // Grow the world-v2 §9 newcomer-trace vectors in lock-step with the node count.
     world.first_earned_g.push(None);
     world.first_own_accept.push(None);
+    // Grow the world-v3 adversary layer in lock-step (the probe newcomer is honest).
+    world.adv.push(None);
+    world.adv_rejoin_count.push(0);
 
     let mut t_boot_placed: Option<u64> = None;
     let mut t_boot_chosen: Option<u64> = None;

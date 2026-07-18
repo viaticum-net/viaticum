@@ -103,6 +103,11 @@ pub fn format_report(scenario: &Scenario, result: &RunResult, verdicts: &[Verdic
     }
     let _ = writeln!(o);
 
+    // --- Attack-ROI: predator vs matched honest twin (phase 1), when adversaries ran ---
+    if let Some(section) = format_adv(result) {
+        o.push_str(&section);
+    }
+
     // --- restore-truth (metric №1), only when a Disaster fired ---
     if let Some(section) = format_restore(result) {
         o.push_str(&section);
@@ -148,6 +153,101 @@ pub fn format_report(scenario: &Scenario, result: &RunResult, verdicts: &[Verdic
     }
 
     o
+}
+
+/// Mean±σ of one predator-side scalar (`side` picks predator or twin) across the seeds
+/// (seeds with no adversaries → `NaN`, skipped by `mean_sigma`).
+fn acol(
+    result: &RunResult,
+    twin: bool,
+    f: impl Fn(&crate::sim_adv::AdvMetrics) -> f64,
+) -> (f64, f64) {
+    let vals: Vec<f64> = result
+        .per_seed_adv
+        .iter()
+        .map(|p| {
+            p.as_ref()
+                .map(|pp| if twin { f(&pp.twin) } else { f(&pp.pred) })
+                .unwrap_or(f64::NAN)
+        })
+        .collect();
+    mean_sigma(&vals)
+}
+
+/// Render the Attack-ROI predator-vs-twin table (phase 1). `None` when no seed had
+/// adversaries. The table gives, per side, the parked live volume, the protected-storage
+/// and served integrals and the (diagnostic) ROI; the pred/twin gap is the load-bearing
+/// comparison. Reports the Р-7 cap ratio + cap-trims + rejoins as engagement evidence.
+fn format_adv(result: &RunResult) -> Option<String> {
+    // Need at least one seed with an adversary pair to render.
+    if !result.per_seed_adv.iter().any(|p| p.is_some()) {
+        return None;
+    }
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "-- Attack-ROI: predator vs matched honest twin (mean ± σ over seeds) --"
+    );
+    let _ = writeln!(
+        o,
+        "  {:<22} {:>20} {:>20}",
+        "metric", "predator", "honest twin"
+    );
+    let row = |o: &mut String, name: &str, f: fn(&crate::sim_adv::AdvMetrics) -> f64| {
+        let (pm, ps) = acol(result, false, f);
+        let (tm, ts) = acol(result, true, f);
+        let _ = writeln!(
+            o,
+            "  {:<22} {:>11.2} ± {:>6.2} {:>11.2} ± {:>6.2}",
+            name, pm, ps, tm, ts
+        );
+    };
+    row(&mut o, "parked live (gb)", |a| a.parked_live);
+    row(&mut o, "protected gb·days", |a| a.consumed);
+    row(&mut o, "served_out gb·days", |a| a.served_out);
+    row(&mut o, "ROI consumed/served", |a| a.roi);
+    row(&mut o, "cap_trims (world)", |a| a.cap_trims as f64);
+    row(&mut o, "rejoins", |a| a.rejoins as f64);
+    // The Р-7 cap ratio (predator side): ≤ 1 ⇒ the cap holds where it engages.
+    let (cm, cs) = acol(result, false, |a| a.max_cap_ratio);
+    let _ = writeln!(
+        o,
+        "  {:<22} {:>11.4} ± {:>6.4}   [≤1 ⇒ Р-7 cap holds where it binds]",
+        "cap ratio (pred)", cm, cs
+    );
+    // The two seed-paired ROI comparatives (the verdict quantities): the structurally-robust
+    // protected-storage ratio, and the raw extraction ratio (asserted while defined, WARN-2).
+    let (rm, rs) = acol_ratio(result, |a| a.consumed);
+    let _ = writeln!(
+        o,
+        "  {:<22} {:>11.4} ± {:>6.4}   [<1 ⇒ attack ≤ honest twin]",
+        "protected pred/twin", rm, rs
+    );
+    let (rr, rrs) = acol_ratio(result, |a| a.roi);
+    let _ = writeln!(
+        o,
+        "  {:<22} {:>11.4} ± {:>6.4}   [<1 ⇒ raw ROI ≤ honest twin]",
+        "raw ROI pred/twin", rr, rrs
+    );
+    let _ = writeln!(o);
+    Some(o)
+}
+
+/// Mean±σ of the seed-paired ratio `f(pred)/f(twin)` (twin `0` ⇒ NaN, skipped).
+fn acol_ratio(result: &RunResult, f: impl Fn(&crate::sim_adv::AdvMetrics) -> f64) -> (f64, f64) {
+    let vals: Vec<f64> = result
+        .per_seed_adv
+        .iter()
+        .map(|p| {
+            p.as_ref()
+                .map(|pp| {
+                    let t = f(&pp.twin);
+                    if t > 0.0 { f(&pp.pred) / t } else { f64::NAN }
+                })
+                .unwrap_or(f64::NAN)
+        })
+        .collect();
+    mean_sigma(&vals)
 }
 
 /// Mean±σ of one restore-truth scalar across the seeds (seeds with no Disaster → `NaN`,

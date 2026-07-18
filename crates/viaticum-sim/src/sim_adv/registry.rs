@@ -7,8 +7,12 @@
 
 use crate::sim_adv::cli::SimAdvError;
 use crate::sim_adv::metrics::MetricSet;
+use crate::sim_adv::predators::AdvMetrics;
 use crate::sim_adv::restore::RestoreTruth;
-use crate::sim_adv::scenario::{Event, MetricId, NodeSel, Scenario, ScenarioId, WorldParams};
+use crate::sim_adv::scenario::{
+    AdvDials, AdvId, AdvSpec, Event, InfoModel, MetricId, NodeSel, Scenario, ScenarioId,
+    WorldParams,
+};
 use crate::sim_adv::verdict::{Direction, Invariant, InvariantSpec};
 use crate::sim_dynamic::engine::DynParams;
 use crate::sim_dynamic::generator::{Archetype, GiverTier};
@@ -20,7 +24,7 @@ const RESTORE_BW_GB_DAY: f64 = 50.0;
 
 /// Every registered scenario (hard-coded like `Archetype::ALL`).
 pub fn all_scenarios() -> Vec<Scenario> {
-    vec![honest_v2(), dr_baseline()]
+    vec![honest_v2(), dr_baseline(), a1_whale(), a4_whitewasher()]
 }
 
 /// Look a scenario up by name, or a graceful [`SimAdvError::UnknownScenario`] listing the
@@ -128,9 +132,114 @@ pub fn dr_baseline() -> Scenario {
     }
 }
 
+/// The A1 ε-give whale scenario (phase 1, `4r_p1_spec.md` §3 / detail §2-A1): the honest
+/// world plus four ε-give whales — each an honest-uptime node with ×12 the backup demand that
+/// serves only 5% (so it earns almost no reciprocity κ_O). It probes the Р-7 V_ret cap (P1b):
+/// where the cap engages, the whale's parked volume is trimmed to ≈ V_free, and its
+/// protected-storage integral falls below its matched honest twin (same ×12 demand, serving
+/// fully — the honest heavy backer).
+///
+/// The world is the default v2 world; the whales' heavy demand + own-data growth over a long
+/// horizon drive the holders deep into the eviction band, where the cap binds hard enough that
+/// the honest twin's earned V_ret clearly outstrips the whale's V_free floor. `n = 60`,
+/// horizon 170, 5 seeds.
+pub fn a1_whale() -> Scenario {
+    Scenario {
+        id: ScenarioId("a1_whale"),
+        about: "honest world + 4 ε-give whales (×12 demand, serve 5%) — Р-7 V_ret cap (P1b) + protected-storage ≤ honest twin",
+        world: WorldParams {
+            n_nodes: 60,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: vec![AdvSpec {
+            id: AdvId::A1EpsilonWhale,
+            count: 4,
+            info_model: InfoModel::Own,
+            dials: AdvDials {
+                whale_block_mult: 12.0,
+                whale_accept: 0.05,
+                ..AdvDials::default()
+            },
+        }],
+        events: Vec::new(),
+        horizon: 170,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![
+            MetricId::AttackRoi,
+            MetricId::Extraction,
+            MetricId::InvariantBoard,
+        ],
+        verdicts: a1_whale_invariants(),
+        fast: true,
+    }
+}
+
+/// The A4 whitewasher scenario (phase 1, `4r_p1_spec.md` §4 / detail §2-A4): the honest world
+/// plus six whitewashers — honest-uptime nodes that burn their identity every 20 ticks
+/// (serve → drop → self-churn → re-enter fresh). It probes the pair-local entry price: a
+/// re-entered identity gets NO credit for its prior life (κ_O reset ⇒ V_ret = V_free), and the
+/// total delivered park over the cycles falls below the continuous honest twin.
+///
+/// `period_ticks = 20`: long enough to (re-)establish a floor each cycle (bandwidth ≈ 1
+/// chunk/tick, 15 floor symbols) — a real attempt — yet each reset orphans the accumulated
+/// backups and re-pays the θ_p/λ entry. Six whitewashers keep the per-seed aggregate tight.
+/// `n = 70`, horizon 140, 5 seeds.
+pub fn a4_whitewasher() -> Scenario {
+    Scenario {
+        id: ScenarioId("a4_whitewasher"),
+        about: "honest world + 6 whitewashers (burn identity every 20 ticks) — re-entry price (P2): fresh identity ≤ V_free + delivered park ≤ honest twin",
+        world: WorldParams {
+            n_nodes: 70,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: vec![AdvSpec {
+            id: AdvId::A4Whitewasher,
+            count: 6,
+            info_model: InfoModel::Own,
+            dials: AdvDials {
+                period_ticks: 20,
+                ..AdvDials::default()
+            },
+        }],
+        events: Vec::new(),
+        horizon: 140,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![
+            MetricId::AttackRoi,
+            MetricId::Extraction,
+            MetricId::InvariantBoard,
+        ],
+        verdicts: a4_whitewasher_invariants(),
+        fast: true,
+    }
+}
+
 /// Reliable's extraction ROI (Reliable is index 0 in `Archetype::ALL`).
 fn reliable_roi(m: &MetricSet) -> f64 {
     m.extraction_roi[0]
+}
+
+/// The predator's Р-7 cap ratio (max parked / (V_ret + one chunk) where the cap engages).
+fn adv_cap_ratio(a: &AdvMetrics) -> f64 {
+    a.max_cap_ratio
+}
+
+/// The predator's protected-own-storage integral (`consumed` gb·days = §3.3 utility).
+fn adv_consumed(a: &AdvMetrics) -> f64 {
+    a.consumed
+}
+
+/// The predator's raw extraction ROI `consumed / served_out`.
+fn adv_roi(a: &AdvMetrics) -> f64 {
+    a.roi
 }
 
 /// The flagship restore-truth scalar (Model U, any symbol) for a seed.
@@ -205,6 +314,116 @@ fn dr_baseline_invariants() -> Vec<Invariant> {
                 dir: Direction::GreaterThan,
             },
             threshold: 0.60,
+        },
+    ]
+}
+
+/// The `a1_whale` board (`4r_p1_spec.md` §3): the two structural rows + the Р-7 cap (P1b) +
+/// the Attack-ROI comparative (protected-storage ≤ honest twin).
+fn a1_whale_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-P1B-CAP (P1b / detail §2-A1): where the Р-7 cap engages (evicting holders), the
+        // ε-whale's SETTLED parked volume is bounded by `V_ret + one chunk`. The metric is
+        // `max parked / (V_ret + v_per_symbol)`, so the round threshold 1.0 IS the cap
+        // formula itself (NOT a calibrated number — anti-Goodhart): PASS ⇒ the whale parks
+        // within its earned V_ret everywhere the cap binds, FAIL ⇒ it hoards beyond the cap.
+        // (LessThan, power-gated; NaN — no evicting holder held whale data — ⇒ INCONCLUSIVE.)
+        Invariant {
+            id: "INV-P1B-CAP",
+            spec: InvariantSpec::AdvCap {
+                measure: adv_cap_ratio,
+                dir: Direction::LessThan,
+            },
+            threshold: 1.0,
+        },
+        // INV-ROI-PRED≤TWIN (spec §4 п.3 / detail §3.3): the whale's protected-own-storage
+        // integral (consumed gb·days) ≤ its matched honest twin's, at equal ×12 demand — the
+        // attack buys no more durable protection than serving honestly. The comparative ratio
+        // `consumed(pred)/consumed(twin) < 1.0` (threshold IS the "no better than honest"
+        // line, not calibrated); power<2 ⇒ INCONCLUSIVE (no clear effect). This is the
+        // STRUCTURALLY robust row (stays defined even for a future predator whose served → 0).
+        Invariant {
+            id: "INV-ROI-PRED≤TWIN",
+            spec: InvariantSpec::AdvComparative {
+                measure: adv_consumed,
+                dir: Direction::LessThan,
+            },
+            threshold: 1.0,
+        },
+        // INV-ROI-RAW≤TWIN (WARN-2): the RAW extraction ratio `consumed/served_out` also passes
+        // pred < twin, asserted here as an ADDITIONAL row WHILE it is defined (both sides serve
+        // comparably in this scenario, so it is — not undefined). `roi(pred)/roi(twin) < 1.0`.
+        Invariant {
+            id: "INV-ROI-RAW≤TWIN",
+            spec: InvariantSpec::AdvComparative {
+                measure: adv_roi,
+                dir: Direction::LessThan,
+            },
+            threshold: 1.0,
+        },
+    ]
+}
+
+/// The `a4_whitewasher` board (`4r_p1_spec.md` §4): the two structural rows + the re-entry
+/// price (P2) + the Attack-ROI comparative (delivered park ≤ honest twin).
+fn a4_whitewasher_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-P2-REENTRY (P2 / detail §2-A4): a re-entered identity is bounded by the V_ret it
+        // has EARNED IN ITS CURRENT life (κ_O wiped on each burn), never its lifetime — the
+        // same Р-7 cap machinery as INV-P1B-CAP, read where the cap engages. Because each
+        // cycle resets κ_O the whitewasher's V_ret collapses toward V_free, so it gets no
+        // Sybil discount from its prior identities. Metric `max parked / (V_ret + chunk) < 1`.
+        Invariant {
+            id: "INV-P2-REENTRY",
+            spec: InvariantSpec::AdvCap {
+                measure: adv_cap_ratio,
+                dir: Direction::LessThan,
+            },
+            threshold: 1.0,
+        },
+        // INV-ROI-PRED≤TWIN (spec §4 п.3 / detail §3.3): total delivered park over N cycles
+        // (consumed gb·days) ≤ the CONTINUOUS honest twin's — each identity burn orphans the
+        // accumulated backups and re-pays the entry latency, so the whitewash cycle protects
+        // strictly less than serving straight through. Ratio `consumed(pred)/consumed(twin) < 1`.
+        // The STRUCTURALLY robust row (defined even if a future predator's served → 0).
+        Invariant {
+            id: "INV-ROI-PRED≤TWIN",
+            spec: InvariantSpec::AdvComparative {
+                measure: adv_consumed,
+                dir: Direction::LessThan,
+            },
+            threshold: 1.0,
+        },
+        // INV-ROI-RAW≤TWIN (WARN-2): the RAW extraction ratio `consumed/served_out` also passes
+        // pred < twin (the whitewasher serves ~as much as the twin but protects far less), an
+        // ADDITIONAL row WHILE the ratio is defined. `roi(pred)/roi(twin) < 1.0`.
+        Invariant {
+            id: "INV-ROI-RAW≤TWIN",
+            spec: InvariantSpec::AdvComparative {
+                measure: adv_roi,
+                dir: Direction::LessThan,
+            },
+            threshold: 1.0,
         },
     ]
 }

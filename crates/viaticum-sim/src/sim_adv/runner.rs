@@ -23,6 +23,9 @@ use crate::generator::Rng;
 use crate::sim_adv::brier::Calibration;
 use crate::sim_adv::cli::{SimAdvError, apply_dial};
 use crate::sim_adv::metrics::{MetricSet, collect_metrics};
+use crate::sim_adv::predators::{
+    AdvMetrics, RunMode, collect_adv_metrics, fold_cap_ratio, inject_adversaries, observe_cap_ratio,
+};
 use crate::sim_adv::restore::{RestoreTracker, RestoreTruth};
 use crate::sim_adv::scenario::{Event, EventKind, NodeSel, Scenario, ScenarioId};
 use crate::sim_dynamic::build_world;
@@ -58,6 +61,20 @@ pub struct RunResult {
     /// predictions never reach their `H`-tick horizon (short horizon). The Brier judge reads
     /// this — a GOD-VIEW metric channel, never a decision input.
     pub per_seed_calibration: Vec<Calibration>,
+    /// Per-seed Attack-ROI read (phase 1), seed-indexed. `None` for a seed of a scenario with
+    /// no adversaries (e.g. `honest_v2`); `Some(pair)` pairs the predator run with its matched
+    /// honest twin (both at the SAME seed), the comparison the ROI verdicts read.
+    pub per_seed_adv: Vec<Option<AdvPair>>,
+}
+
+/// A predator run paired with its matched honest twin (same seed, same construction, hooks
+/// OFF on the twin) — the Attack-ROI comparison (spec §4 п.3 / detail §3.3).
+#[derive(Debug, Clone, Copy)]
+pub struct AdvPair {
+    /// The predator (hooks active).
+    pub pred: AdvMetrics,
+    /// The matched honest twin (hooks off).
+    pub twin: AdvMetrics,
 }
 
 /// Tick-indexed scripted-event queue.
@@ -169,8 +186,10 @@ fn apply_events(
     }
 }
 
-/// Run one seed to the horizon and collect its god-view metrics + event record + (for a
-/// DR scenario) the restore-truth metric.
+/// Run one seed as the PREDATOR (hooks active for any adversaries) to the horizon and
+/// collect its god-view metrics + event record + (for a DR scenario) the restore-truth
+/// metric + (for an adversary scenario) the Attack-ROI read. Kept for the determinism
+/// re-run and the unit tests.
 ///
 /// The per-tick order is: (a) revive any victim returning this tick (same identity, empty
 /// disk); (b) apply due events (Disaster mutates, others record-only); (c) observe the
@@ -184,12 +203,33 @@ pub(crate) fn run_one_seed(
     Vec<FiredEvent>,
     Option<RestoreTruth>,
     Calibration,
+    Option<AdvMetrics>,
+) {
+    run_one_seed_mode(scenario, seed, RunMode::Predator)
+}
+
+/// Run one seed in the given [`RunMode`] (predator hooks on / off). A `Twin` run injects the
+/// adversaries' CONSTRUCTION but no hooks — the matched honest control.
+pub(crate) fn run_one_seed_mode(
+    scenario: &Scenario,
+    seed: u64,
+    mode: RunMode,
+) -> (
+    MetricSet,
+    Vec<FiredEvent>,
+    Option<RestoreTruth>,
+    Calibration,
+    Option<AdvMetrics>,
 ) {
     let params = &scenario.world.base;
     let prior = SurfacePrior::default();
     let policy = PlacementPolicy::default();
 
     let mut world = build_world(scenario.world.n_nodes, params, seed);
+    // Phase 1: inject the scenario's adversaries (empty ⇒ no-op; honest scenarios stay
+    // byte-identical). `Predator` installs the hooks; `Twin` injects the same heavy nodes
+    // with hooks off (the matched control). Deterministic, no RNG.
+    let adv_nodes = inject_adversaries(&mut world, &scenario.adversaries, params, mode);
     // Transche 0.3: enable the god-view R̂-calibration prediction log for sim_adv runs (the
     // engine now appends a forecast at each placement). This is a METRIC channel — it drives
     // NO decision and consumes NO RNG, so the world evolution is bit-identical to the log-off
@@ -208,6 +248,10 @@ pub(crate) fn run_one_seed(
     // each as the world reaches its horizon and reads the realised outcome.
     let mut calib = Calibration::new();
     let mut resolve_cursor = 0usize;
+    // Phase-1 Attack-ROI: the Р-7 cap engages TRANSIENTLY (the eviction latch is momentary),
+    // so fold the per-tick max cap ratio over the run (NaN ⇒ no evicting holder held adversary
+    // data this tick). Empty for a non-adversary scenario.
+    let mut run_cap_ratio = f64::NAN;
 
     for t in 0..scenario.horizon {
         // (a) return any victim whose window starts this tick (present=true, empty disk).
@@ -242,6 +286,12 @@ pub(crate) fn run_one_seed(
             calib.push(e.r_hat, outcome, e.floor_complete);
             resolve_cursor += 1;
         }
+
+        // (f) fold this tick's Р-7 cap ratio (only meaningful with adversaries present).
+        if !adv_nodes.is_empty() {
+            run_cap_ratio =
+                fold_cap_ratio(run_cap_ratio, observe_cap_ratio(&world, params, &adv_nodes));
+        }
     }
 
     let restore = if tracker.is_active() {
@@ -249,7 +299,12 @@ pub(crate) fn run_one_seed(
     } else {
         None
     };
-    (collect_metrics(&world, params), fired, restore, calib)
+    let adv = if adv_nodes.is_empty() {
+        None
+    } else {
+        Some(collect_adv_metrics(&world, &adv_nodes, run_cap_ratio))
+    };
+    (collect_metrics(&world, params), fired, restore, calib, adv)
 }
 
 /// God-view count of a block's live symbols (across PRESENT holders) — the R̂-calibration
@@ -271,27 +326,47 @@ fn block_live_symbols(world: &World, owner: usize, block: usize) -> usize {
 }
 
 /// Run a scenario across `seeds`, fanning out over rayon. The collect preserves seed
-/// order, so the aggregated report is deterministic (spec §10 п.12).
+/// order, so the aggregated report is deterministic (spec §10 п.12). For an adversary
+/// scenario each seed ALSO runs the matched honest twin (same seed, hooks off) so the
+/// Attack-ROI comparison is seed-paired (variance-reducing); honest scenarios skip the twin
+/// (no extra work, `per_seed_adv` all `None`).
 pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
-    let outcomes: Vec<(
+    let has_adv = !scenario.adversaries.is_empty();
+    type SeedOutcome = (
         MetricSet,
         Vec<FiredEvent>,
         Option<RestoreTruth>,
         Calibration,
-    )> = seeds
+        Option<AdvMetrics>,
+        Option<AdvMetrics>, // the twin's Attack-ROI read (None when no adversaries)
+    );
+    let outcomes: Vec<SeedOutcome> = seeds
         .par_iter()
-        .map(|&seed| run_one_seed(scenario, seed))
+        .map(|&seed| {
+            let (m, f, r, c, pred_adv) = run_one_seed_mode(scenario, seed, RunMode::Predator);
+            let twin_adv = if has_adv {
+                run_one_seed_mode(scenario, seed, RunMode::Twin).4
+            } else {
+                None
+            };
+            (m, f, r, c, pred_adv, twin_adv)
+        })
         .collect();
 
     let mut per_seed = Vec::with_capacity(outcomes.len());
     let mut fired = Vec::with_capacity(outcomes.len());
     let mut per_seed_restore = Vec::with_capacity(outcomes.len());
     let mut per_seed_calibration = Vec::with_capacity(outcomes.len());
-    for (m, f, r, c) in outcomes {
+    let mut per_seed_adv = Vec::with_capacity(outcomes.len());
+    for (m, f, r, c, pred_adv, twin_adv) in outcomes {
         per_seed.push(m);
         fired.push(f);
         per_seed_restore.push(r);
         per_seed_calibration.push(c);
+        per_seed_adv.push(match (pred_adv, twin_adv) {
+            (Some(pred), Some(twin)) => Some(AdvPair { pred, twin }),
+            _ => None,
+        });
     }
 
     RunResult {
@@ -301,6 +376,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         fired,
         per_seed_restore,
         per_seed_calibration,
+        per_seed_adv,
     }
 }
 
