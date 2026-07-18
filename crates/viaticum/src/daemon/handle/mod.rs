@@ -1368,8 +1368,6 @@ impl DaemonHandle {
 
 // ── EWMA availability decay task ─────────────────────────────────────────────
 
-/// Run alongside other periodic tasks. Applies EWMA decay for all peers that
-/// haven't been contacted in > tick_secs. Fires once per tick_secs interval.
 /// Scale the avail-decay tick interval by `time_scale` (CS-SCH-9).
 ///
 /// `run_avail_decay_task` uses the returned value BOTH as its timer cadence and
@@ -1382,6 +1380,8 @@ fn scaled_avail_decay_tick_secs(base_tick_secs: u64, time_scale: u64) -> u64 {
     (base_tick_secs / time_scale.max(1)).max(1)
 }
 
+/// Run alongside other periodic tasks. Applies EWMA decay for all peers that
+/// haven't been contacted in > tick_secs. Fires once per tick_secs interval.
 async fn run_avail_decay_task(
     db: viaticum_core::db::Db,
     cancel: tokio_util::sync::CancellationToken,

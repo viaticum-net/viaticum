@@ -45,9 +45,8 @@ impl Processor {
 
         match self.cluster_sync.handle_sync_request(&request) {
             Ok(response) => {
-                let _ = self
-                    .swarm
-                    .respond(response_channel, Message::ClusterSyncResponse(response));
+                self.swarm
+                    .respond_logged(response_channel, Message::ClusterSyncResponse(response));
                 debug!(peer = %from_master, "processor: ClusterSyncRequest served");
             }
             Err(e) => {
