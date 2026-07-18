@@ -19,12 +19,12 @@ use libp2p::core::transport::{
     DialOpts, ListenerId, PortUse, Transport, TransportError, TransportEvent,
 };
 
-pub struct NoPortReuse<T> {
+pub(crate) struct NoPortReuse<T> {
     inner: T,
 }
 
 impl<T> NoPortReuse<T> {
-    pub fn new(inner: T) -> Self {
+    pub(crate) fn new(inner: T) -> Self {
         Self { inner }
     }
 }

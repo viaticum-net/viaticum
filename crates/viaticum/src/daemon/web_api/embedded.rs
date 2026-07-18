@@ -10,7 +10,7 @@ use rust_embed::RustEmbed;
 #[folder = "../../web-ui/dist/"]
 struct WebUiAssets;
 
-pub async fn handle_embedded(uri: Uri) -> Response {
+pub(crate) async fn handle_embedded(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
     match WebUiAssets::get(path) {
