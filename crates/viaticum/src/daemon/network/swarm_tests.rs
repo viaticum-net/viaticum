@@ -18,7 +18,7 @@ use super::swarm_test_helpers::{
     get_listen_addr, make_cert, make_signing_key, make_swarm_config, wait_for_authenticated,
 };
 use crate::daemon::network::swarm::{
-    CertCodec, ProtocolEvent, SwarmConfig, SwarmHandle, ViaticumCodec,
+    CertCodec, ProtocolEvent, SwarmConfig, SwarmError, SwarmHandle, ViaticumCodec,
 };
 
 /// Build a PosHashChallenge message for testing.
@@ -492,6 +492,41 @@ async fn swarm_handle_listen_addrs_nonempty() {
     assert!(
         !addrs.is_empty(),
         "expected at least one listen address, got none"
+    );
+}
+
+// ─── ARCH-5: respond drop accounting ──────────────────────────────────────────
+
+/// A dropped RR response (cmd channel full/closed) increments the observable
+/// `dropped_responses` counter and warns, instead of being silently discarded.
+///
+/// The end-to-end drop (a saturated 4096-cap cmd channel under an inbound burst)
+/// cannot be constructed in a unit test — libp2p's `ResponseChannel` has no public
+/// constructor and saturating the real channel is impractical. So we drive the
+/// real drop-accounting seam (`record_respond_outcome`, which `respond_logged`
+/// calls on every send) directly with each `SwarmError` outcome. A real
+/// `SwarmHandle` is used (no mocks); only the `ResponseChannel` is bypassed.
+#[tokio::test]
+async fn respond_drop_increments_counter_on_channel_full_or_closed() {
+    let config = make_swarm_config(71);
+    let (handle, _events) = SwarmHandle::start(config).await.expect("swarm start");
+
+    assert_eq!(handle.dropped_responses(), 0, "starts at zero");
+
+    // Full channel under burst → counted.
+    handle.record_respond_outcome(Err(SwarmError::ChannelFull));
+    assert_eq!(handle.dropped_responses(), 1);
+
+    // Closed channel (shutdown) → also counted.
+    handle.record_respond_outcome(Err(SwarmError::ChannelClosed));
+    assert_eq!(handle.dropped_responses(), 2);
+
+    // A successful send does NOT bump the counter.
+    handle.record_respond_outcome(Ok(()));
+    assert_eq!(
+        handle.dropped_responses(),
+        2,
+        "successful responses must not be counted as drops"
     );
 }
 

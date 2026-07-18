@@ -142,7 +142,12 @@ impl WorkPipeline {
             tokio::select! {
                 _ = tick.tick() => {
                     tracing::debug!("work_pipeline: periodic tick");
-                    let _ = self.run_iteration().await;
+                    // CS-SCH-10: surface DbErrors from run_iteration (via next_work_item)
+                    // instead of swallowing them. A permanent DB fault otherwise looks like
+                    // "worker running, queue empty" with no log trail.
+                    if let Err(e) = self.run_iteration().await {
+                        tracing::error!(error = %e, "work_pipeline: periodic iteration failed");
+                    }
                 }
                 maybe_event = self.event_rx.recv() => {
                     match maybe_event {
@@ -162,11 +167,15 @@ impl WorkPipeline {
                                     Err(_) => break,
                                 }
                             }
-                            let _ = self.run_iteration().await;
+                            if let Err(e) = self.run_iteration().await {
+                                tracing::error!(error = %e, "work_pipeline: peer-authenticated iteration failed");
+                            }
                         }
                         Some(WorkEvent::DirtyFileEnqueued) => {
                             tracing::debug!("work_pipeline: dirty file enqueued → wake");
-                            let _ = self.run_iteration().await;
+                            if let Err(e) = self.run_iteration().await {
+                                tracing::error!(error = %e, "work_pipeline: dirty-file iteration failed");
+                            }
                         }
                     }
                 }

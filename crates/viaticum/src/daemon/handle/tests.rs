@@ -1,7 +1,31 @@
 use tempfile::tempdir;
 
-use super::{DaemonConfig, DaemonHandle, disk_available_bytes};
+use super::{DaemonConfig, DaemonHandle, disk_available_bytes, scaled_avail_decay_tick_secs};
 use crate::daemon::identity::init_identity;
+
+// CS-SCH-9: the avail-decay tick must scale with time_scale so avail_ewma
+// actually decays under an accelerated clock. The full run_avail_decay_task is a
+// real-timer loop (behavioural, not unit-covered), but the scaling arithmetic it
+// depends on — used identically by the periodic task and the startup catch-up — is
+// pure and covered here.
+#[test]
+fn avail_decay_tick_scales_with_time_scale() {
+    const BASE: u64 = 24 * 3600; // AVAIL_DECAY_TICK_SECS
+
+    // time_scale = 1 is identity (production path unchanged).
+    assert_eq!(scaled_avail_decay_tick_secs(BASE, 1), BASE);
+
+    // Accelerated: a 10x clock ticks 10x faster.
+    assert_eq!(scaled_avail_decay_tick_secs(BASE, 10), BASE / 10);
+    assert_eq!(scaled_avail_decay_tick_secs(BASE, 86_400), 1);
+
+    // Floor at 1s: an extreme time_scale cannot collapse the tick to 0 (which
+    // would decay every peer on every call).
+    assert_eq!(scaled_avail_decay_tick_secs(BASE, BASE * 100), 1);
+
+    // A zero time_scale is treated as 1 (max(1) guard) — never divides by zero.
+    assert_eq!(scaled_avail_decay_tick_secs(BASE, 0), BASE);
+}
 
 #[test]
 fn disk_available_bytes_returns_positive_for_existing_path() {

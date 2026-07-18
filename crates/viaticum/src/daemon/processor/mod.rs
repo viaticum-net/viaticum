@@ -410,12 +410,12 @@ impl Processor {
                             esi_ranges: stored_ranges,
                             timestamp: Timestamp::now(),
                         });
-                        let _ = self.swarm.respond(response_channel, reply);
+                        self.swarm.respond_logged(response_channel, reply);
                     }
                     Err(e) => {
                         warn!(device = %from_device, err = %e, "processor: SymbolTransfer failed");
                         let ack = Message::Ack(AckMsg { v: 1 });
-                        let _ = self.swarm.respond(response_channel, ack);
+                        self.swarm.respond_logged(response_channel, ack);
                     }
                 }
             }
@@ -425,7 +425,7 @@ impl Processor {
                     .await
                 {
                     Ok(reply) => {
-                        let _ = self.swarm.respond(response_channel, reply);
+                        self.swarm.respond_logged(response_channel, reply);
                     }
                     Err(e) => {
                         warn!(device = %from_device, err = %e, "processor: PosHashChallenge handler failed");
@@ -434,7 +434,7 @@ impl Processor {
             }
             Message::SymbolOffer(offer) => {
                 let reply = self.handle_symbol_offer_inner(from_master, offer);
-                let _ = self.swarm.respond(response_channel, reply);
+                self.swarm.respond_logged(response_channel, reply);
             }
             Message::RestoreRequest(req) => {
                 let block_id = req.source_block_id;
@@ -456,7 +456,7 @@ impl Processor {
                         return Ok(());
                     }
                 };
-                let _ = self.swarm.respond(response_channel, reply);
+                self.swarm.respond_logged(response_channel, reply);
             }
             Message::ClusterSyncRequest(req) => {
                 self.handle_cluster_sync_request_libp2p(
@@ -474,65 +474,57 @@ impl Processor {
                         own = %self.own_identity,
                         "processor: ClusterSyncResponse from non-cluster peer, ignoring"
                     );
-                    let _ = self
-                        .swarm
-                        .respond(response_channel, Message::Ack(AckMsg { v: 1 }));
+                    self.swarm
+                        .respond_logged(response_channel, Message::Ack(AckMsg { v: 1 }));
                     return Ok(());
                 }
                 if let Err(e) = self.handle_cluster_sync_response(from_device, resp).await {
                     warn!(device = %from_device, err = %e, "processor: ClusterSyncResponse handler failed");
                 }
-                let _ = self
-                    .swarm
-                    .respond(response_channel, Message::Ack(AckMsg { v: 1 }));
+                self.swarm
+                    .respond_logged(response_channel, Message::Ack(AckMsg { v: 1 }));
             }
             Message::SymbolAccept(accept) => {
                 if let Err(e) = self.handle_symbol_accept(from_master, accept).await {
                     warn!(device = %from_device, err = %e, "processor: SymbolAccept handler failed");
                 }
-                let _ = self
-                    .swarm
-                    .respond(response_channel, Message::Ack(AckMsg { v: 1 }));
+                self.swarm
+                    .respond_logged(response_channel, Message::Ack(AckMsg { v: 1 }));
             }
             Message::SymbolReject(reject) => {
                 if let Err(e) = self.handle_symbol_reject(from_master, reject).await {
                     warn!(device = %from_device, err = %e, "processor: SymbolReject handler failed");
                 }
-                let _ = self
-                    .swarm
-                    .respond(response_channel, Message::Ack(AckMsg { v: 1 }));
+                self.swarm
+                    .respond_logged(response_channel, Message::Ack(AckMsg { v: 1 }));
             }
             Message::RestoreDenied(denied) => {
                 if let Err(e) = self.handle_restore_denied(from_master, denied).await {
                     warn!(device = %from_device, err = %e, "processor: RestoreDenied handler failed");
                 }
-                let _ = self
-                    .swarm
-                    .respond(response_channel, Message::Ack(AckMsg { v: 1 }));
+                self.swarm
+                    .respond_logged(response_channel, Message::Ack(AckMsg { v: 1 }));
             }
             Message::PeerAnnounce(pa) => {
                 if let Err(e) = self.handle_peer_announce(pa).await {
                     warn!(device = %from_device, err = %e, "processor: PeerAnnounce handler failed");
                 }
-                let _ = self
-                    .swarm
-                    .respond(response_channel, Message::Ack(AckMsg { v: 1 }));
+                self.swarm
+                    .respond_logged(response_channel, Message::Ack(AckMsg { v: 1 }));
             }
             Message::MailboxStoreRequest(req) => {
                 // Build routing view from known peers in the DB.
                 let routing_view = self.build_routing_view();
                 let my_peer_id = self.swarm.peer_id;
                 let resp = mailbox::handle_mailbox_store(&self.db, &routing_view, &my_peer_id, req);
-                let _ = self
-                    .swarm
-                    .respond(response_channel, Message::MailboxStoreResponse(resp));
+                self.swarm
+                    .respond_logged(response_channel, Message::MailboxStoreResponse(resp));
             }
             Message::MailboxFetchRequest(req) => {
                 let now = Timestamp::now().0;
                 let resp = mailbox::handle_mailbox_fetch(&self.db, req, from_master, now);
-                let _ = self
-                    .swarm
-                    .respond(response_channel, Message::MailboxFetchResponse(resp));
+                self.swarm
+                    .respond_logged(response_channel, Message::MailboxFetchResponse(resp));
             }
             other => {
                 warn!(
@@ -540,9 +532,8 @@ impl Processor {
                     "processor: dispatch_libp2p: unhandled message variant {:?}",
                     std::mem::discriminant(&other)
                 );
-                let _ = self
-                    .swarm
-                    .respond(response_channel, Message::Ack(AckMsg { v: 1 }));
+                self.swarm
+                    .respond_logged(response_channel, Message::Ack(AckMsg { v: 1 }));
             }
         }
         Ok(())

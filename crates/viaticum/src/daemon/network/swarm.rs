@@ -485,6 +485,10 @@ pub struct SwarmHandle {
     master_signing_key: ed25519_dalek::SigningKey,
     /// X25519 public key for directed relay board encryption.
     pub x25519_pub: Option<[u8; 32]>,
+    /// ARCH-5: count of RR responses dropped because the cmd channel was
+    /// full/closed. `respond` (try_send) can silently fail under burst; this
+    /// makes those drops observable via `respond_logged` + `dropped_responses()`.
+    dropped_responses: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for SwarmHandle {
@@ -731,6 +735,7 @@ impl SwarmHandle {
             identity_pub: config.identity_pub,
             master_signing_key: config.master_signing_key,
             x25519_pub: config.x25519_pub,
+            dropped_responses: std::sync::atomic::AtomicU64::new(0),
         };
         Ok((handle, event_rx))
     }
@@ -867,6 +872,40 @@ impl SwarmHandle {
                 tokio::sync::mpsc::error::TrySendError::Full(_) => SwarmError::ChannelFull,
                 tokio::sync::mpsc::error::TrySendError::Closed(_) => SwarmError::ChannelClosed,
             })
+    }
+
+    /// Send an RR response, making a dropped response observable (ARCH-5).
+    ///
+    /// The bare `let _ = swarm.respond(..)` pattern discarded `Err(ChannelFull)`
+    /// silently: under burst (cmd channel, cap 4096, saturated by inbound
+    /// SymbolTransfers) our own backpressure became the partner's 30s RR timeout
+    /// with no log trail — and potentially a hit to our availability score at their
+    /// end. This wrapper warns and bumps `dropped_responses` so the drop is visible.
+    pub fn respond_logged(&self, channel: ResponseChannel<Message>, response: Message) {
+        let outcome = self.respond(channel, response);
+        self.record_respond_outcome(outcome);
+    }
+
+    /// Account for a `respond` outcome: on error, warn and increment the drop
+    /// counter; on success, no-op. Split from `respond_logged` so the
+    /// drop-accounting is unit-testable without a libp2p `ResponseChannel`
+    /// (which has no public constructor).
+    pub(crate) fn record_respond_outcome(&self, outcome: Result<(), SwarmError>) {
+        use std::sync::atomic::Ordering;
+        if let Err(e) = outcome {
+            let dropped = self.dropped_responses.fetch_add(1, Ordering::Relaxed) + 1;
+            warn!(
+                error = %e,
+                dropped_responses = dropped,
+                "swarm: RR response dropped (cmd channel full/closed) — partner will see a timeout"
+            );
+        }
+    }
+
+    /// Total RR responses dropped due to a full/closed cmd channel (ARCH-5).
+    pub fn dropped_responses(&self) -> u64 {
+        self.dropped_responses
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Helper: find PeerId for a DeviceId via the event loop's device_to_peer map.

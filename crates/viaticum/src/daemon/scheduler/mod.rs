@@ -166,6 +166,15 @@ impl Scheduler {
         let mut timeout_timer = tokio::time::interval(timeout_interval);
         let mut deletion_timer = tokio::time::interval(deletion_interval);
         let mut sweep_timer = tokio::time::interval(sweep_interval);
+        // ARCH-4a: skip missed ticks instead of bursting to catch up. After the
+        // daemon is offline (suspend / long GC pause), the default Burst behavior
+        // would fire each timer back-to-back for every missed interval — a thundering
+        // herd of PoS-issuance, deletion-publish and sweep passes. Skip collapses the
+        // backlog to a single tick, matching poll.rs / work_pipeline.
+        pos_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        timeout_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        deletion_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        sweep_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Skip the first immediate tick so we don't fire right at startup.
         pos_timer.tick().await;
         timeout_timer.tick().await;
@@ -1257,7 +1266,13 @@ impl Scheduler {
     /// This sweep is a safety net for peers that silently disappear for >14 days.
     pub async fn sweep_offered_placements(&self) -> anyhow::Result<()> {
         let now = Timestamp::now();
-        let threshold = LONG_ABSENCE_SECS;
+        // CS-SCH-4: scale the long-absence threshold by time_scale so accelerated
+        // E2E runs actually reach it — mirrors the `check_timeouts` cadence pattern.
+        // Floor at 1s so an extreme time_scale cannot collapse the threshold to 0
+        // (which would sweep every fresh Offered placement instantly). At the
+        // production scale of 1 this is byte-for-byte LONG_ABSENCE_SECS.
+        let scale = self.config.time_scale.max(1);
+        let threshold = (LONG_ABSENCE_SECS / scale).max(1);
 
         let placements = self.db.list_all_placements()?;
         for p in &placements {
