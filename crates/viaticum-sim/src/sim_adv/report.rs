@@ -286,30 +286,53 @@ fn format_a2(result: &RunResult) -> Option<String> {
     row(&mut o, "protected gb·days", |a| a.consumed);
     row(&mut o, "served_out gb·days", |a| a.served_out);
     row(&mut o, "ROI consumed/served", |a| a.roi);
-    // The two asserted comparatives (silent/polite ratios) — the board verdict quantities.
-    let (gm, gs) = acol_ratio(result, |a| a.retention_g);
+    row(&mut o, "g_oh ledger ∫ (gb·d·t)", |a| {
+        a.retention_g_integral
+    });
+    row(&mut o, "parked ∫ (gb·t)", |a| a.parked_integral);
+    row(&mut o, "own data evicted (#)", |a| a.data_evicted);
+    // The asserted comparatives (silent/polite ratios) — the board verdict quantities. After the
+    // seat-sync fix the two arms diverge chaotically, so the TIME-INTEGRAL ratios (not the horizon
+    // snapshots) are the stable signals the board reads.
+    let (gm, gs) = acol_ratio(result, |a| a.retention_g_integral);
     let _ = writeln!(
         o,
-        "  {:<24} {:>10.4} ± {:>5.4}   [<0.85 ⇒ silence punished in the ledger]",
-        "g_oh silent/polite", gm, gs
+        "  {:<24} {:>10.4} ± {:>5.4}   [<0.85 ⇒ silence punished in the ledger (INV-SILENT-PUNISHED)]",
+        "g_oh ∫ silent/polite", gm, gs
+    );
+    let (pm, ps) = acol_ratio(result, |a| a.parked_integral);
+    let _ = writeln!(
+        o,
+        "  {:<24} {:>10.4} ± {:>5.4}   [<0.85 ⇒ silent's park squeezed (INV-RETENTION; noisy downstream)]",
+        "parked ∫ silent/polite", pm, ps
+    );
+    let (em, es) = acol_ratio(result, |a| a.data_evicted);
+    let _ = writeln!(
+        o,
+        "  {:<24} {:>10.4} ± {:>5.4}   [>1 ⇒ silent's data dropped more (DIAGNOSTIC, very noisy)]",
+        "data-evicted silent/polite", em, es
     );
     let (im, is) = acol_ratio(result, |a| a.inflow_total);
     let _ = writeln!(
         o,
-        "  {:<24} {:>10.4} ± {:>5.4}   [<1 ⇒ owners turn away from silent]",
+        "  {:<24} {:>10.4} ± {:>5.4}   [placement is surface-blind ⇒ EXPECTED noisy ~1, INCONCLUSIVE]",
         "inflow silent/polite", im, is
     );
     let _ = writeln!(
         o,
-        "  NOTE: the DECISIVE placement path (post-0.3) reads the surface PoS-window ONLY — NOT"
+        "  NOTE: the seat-sync burn fix (2026-07-19) wired the drop burn to the ENFORCEMENT key"
     );
     let _ = writeln!(
         o,
-        "        g_oh / drop-counters / σ — so the inflow ratio is EXPECTED ≈ 1 (the price is"
+        "        g_ho (V_ret / eviction / preemption), so silence is now punished in RETENTION, not"
     );
     let _ = writeln!(
         o,
-        "        RECORDED in the g_oh ledger but not yet ENFORCED; the consumer is phase-4 work)."
+        "        only the (inert) forecast ledger. INFLOW stays INCONCLUSIVE — placement reads the"
+    );
+    let _ = writeln!(
+        o,
+        "        surface PoS-window ONLY (that consumer is honest phase-4 work, out of A2 scope)."
     );
     let _ = writeln!(o);
     Some(o)

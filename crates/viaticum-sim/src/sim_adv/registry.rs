@@ -251,26 +251,34 @@ pub fn a4_whitewasher() -> Scenario {
 }
 
 /// The A2 DropNotice-refuser scenario (phase 4-in-sim, `4r_a2_spec.md`): the honest world plus
-/// eight voluntary droppers, each shedding `drop_rate = 4%` of its foreign holdings every tick.
+/// ten voluntary droppers, each shedding `drop_rate = 4%` of its foreign holdings every tick.
 ///
 /// **The matched control is NOT the honest node** (unlike A1/A4) — it is the POLITE dropper
 /// (`twin_hook_for(A2)` = `a2_polite_dropper_hook`): the predator (SILENT) and its twin (POLITE)
 /// drop the SAME victims at the SAME rate by the SAME deterministic selection — EQUAL harm — and
 /// differ ONLY in whether each drop is announced. So the comparison isolates the PRICE OF
-/// SILENCE: the silent drop burns the owner's reliability capital `g_oh` at `b_max` (a total-loss
-/// burn ⇒ ≈ 0) and jumps σ; the announced drop rides the F2 notice (dies at T+1) and burns only
-/// `b_ann`. `n = 80`, 8 droppers (10% — enough to tighten the per-seed g_oh aggregate to a
-/// power-5+ verdict), horizon 160 (≥ 3 PoS/σ windows so burn + detection settle), 5 seeds.
+/// SILENCE: the silent drop burns the reliability quantity `G(dropper→victim)` at `b_max` (a
+/// total-loss burn ⇒ ≈ 0) and jumps σ; the announced drop rides the F2 notice (dies at T+1) and
+/// burns only `b_ann`.
 ///
-/// **δ is frozen BEFORE the run at 0.15 (anti-Goodhart, spec §3): INV-A2-SILENT-PUNISHED asserts
-/// `g_oh(silent) / g_oh(polite) < 1 − δ = 0.85`.** Calibrating the SCENARIO (drop_rate, n,
-/// horizon) is allowed; the threshold is not.
+/// **Seat-sync fix (2026-07-19).** The burn now hits BOTH mirror copies of `G(dropper→victim)` —
+/// the owner's forecast `g_oh` AND the transpose `g_ho` that `kappa_key` reads for the V_ret cap /
+/// eviction / preemption (an accrual keeps the two in sync, the burn used not to). So silence now
+/// bites the ENFORCEMENT standing, not just an inert forecast: the silent dropper's κ_O is halved,
+/// its V_ret shrinks, its parked data is squeezed harder than the polite twin's. The fix makes the
+/// two arms diverge CHAOTICALLY, so the board reads TIME-INTEGRAL ratios (a horizon snapshot is
+/// noisy). `n = 100`, 10 droppers (10%), horizon 160, **10 seeds** (the "full" band — the diverged
+/// arms need it to clear the power gate).
+///
+/// **δ frozen BEFORE the run at 0.15 (anti-Goodhart, spec §3):** INV-A2-SILENT-PUNISHED and
+/// INV-A2-RETENTION assert `silent/polite < 1 − δ = 0.85`; INV-A2-INFLOW at 1.0. Calibrating the
+/// SCENARIO (drop_rate, n, seeds) is allowed; the thresholds are not.
 pub fn a2_dropper() -> Scenario {
     Scenario {
         id: ScenarioId("a2_dropper"),
-        about: "honest world + 8 voluntary droppers (silent predator vs polite twin, EQUAL 4%/tick drop) — the price of silence (g_oh ledger + inflow)",
+        about: "honest world + 10 voluntary droppers (silent predator vs polite twin, EQUAL 4%/tick drop) — the price of silence (enforced g_oh≡g_ho + park)",
         world: WorldParams {
-            n_nodes: 80,
+            n_nodes: 100,
             base: DynParams::default(),
             restore_window_days: RESTORE_WINDOW_DAYS,
             restore_bw_gb_day: RESTORE_BW_GB_DAY,
@@ -280,7 +288,7 @@ pub fn a2_dropper() -> Scenario {
         tiers: honest_v2().tiers,
         adversaries: vec![AdvSpec {
             id: AdvId::A2DropRefuser,
-            count: 8,
+            count: 10,
             info_model: InfoModel::Own,
             // drop_rate = the shared equal-harm dial (both arms). announce is set by the
             // injection MODE (predator = silent hook, twin = polite hook), NOT this field.
@@ -291,14 +299,16 @@ pub fn a2_dropper() -> Scenario {
         }],
         events: Vec::new(),
         horizon: 160,
-        seeds: vec![42, 43, 44, 45, 46],
+        // 10 seeds (the "full" band, spec §5): the seat-sync fix makes the enforced-retention
+        // arms diverge chaotically, so the paired ratios need 10 seeds to clear the power gate.
+        seeds: vec![42, 43, 44, 45, 46, 47, 48, 49, 50, 51],
         metrics: vec![
             MetricId::AttackRoi,
             MetricId::Extraction,
             MetricId::InvariantBoard,
         ],
         verdicts: a2_dropper_invariants(),
-        fast: true,
+        fast: false,
     }
 }
 
@@ -470,9 +480,17 @@ fn adv_roi(a: &AdvMetrics) -> f64 {
     a.roi
 }
 
-/// A2: the price-of-silence ledger — `Σ_O g_oh` (owners' reliability record of the adversary).
-fn adv_retention_g(a: &AdvMetrics) -> f64 {
-    a.retention_g
+/// A2: the price-of-silence ledger, TIME-INTEGRATED (`Σ_t Σ_O g_oh`). Post the seat-sync fix
+/// (2026-07-19) `g_oh ≡ g_ho^T`, so this IS the enforcement key κ_O (= the V_ret / eviction /
+/// preemption input) — the integral smooths the now-chaotic per-arm divergence.
+fn adv_retention_g_integral(a: &AdvMetrics) -> f64 {
+    a.retention_g_integral
+}
+
+/// A2: the adversary's PARKED own-volume, TIME-INTEGRATED (`Σ_t parked_live`) — the realized
+/// downstream retention squeeze the burned enforcement key produces.
+fn adv_parked_integral(a: &AdvMetrics) -> f64 {
+    a.parked_integral
 }
 
 /// A2: the placement-inflow proxy — total foreign symbols the adversary was ever offered-and-
@@ -682,29 +700,47 @@ fn a2_dropper_invariants() -> Vec<Invariant> {
             spec: InvariantSpec::AntiOracle,
             threshold: 1.0,
         },
-        // INV-A2-SILENT-PUNISHED (spec §3): the silent dropper's reliability capital owners hold
-        // in it (`Σ_O g_oh`) is punished BELOW the polite twin's by more than δ — the price of
-        // silence. Ratio `retention_g(silent)/retention_g(polite) < 1 − δ = 0.85`, δ = 0.15 FROZEN
-        // before the run (anti-Goodhart: calibrate the scenario, never this threshold). LessThan,
-        // power-gated (spec §10 п.16): the silent drop burns `g_oh` at b_max (total loss ⇒ ≈ 0),
-        // the announced drop at b_ann (barely), so this discriminates hard. A twin g_oh of 0 ⇒ NaN
-        // (skipped). This is the LEDGER price — see the report on whether it is yet ENFORCED.
+        // INV-A2-SILENT-PUNISHED (spec §3): the silent dropper's reliability quantity `G(dropper→
+        // victim)` is punished BELOW the polite twin's by more than δ — the price of silence.
+        // Ratio `retention_g_integral(silent)/retention_g_integral(polite) < 1 − δ = 0.85`,
+        // δ = 0.15 FROZEN before the run (anti-Goodhart). LessThan, power-gated. After the seat-sync
+        // fix (2026-07-19) BOTH mirror copies are burned, so this quantity IS the ENFORCEMENT KEY
+        // κ_O (`g_ho`, read by `kappa_key` for the V_ret cap / eviction / preemption) — so the row
+        // no longer measures an inert forecast: silence now cuts the dropper's V_ret standing.
+        // Time-INTEGRATED because the fix makes the two arms diverge chaotically (a horizon snapshot
+        // is noisy). The property test `g_oh ≡ g_ho^T` backs the "one key" claim.
         Invariant {
             id: "INV-A2-SILENT-PUNISHED",
             spec: InvariantSpec::AdvComparative {
-                measure: adv_retention_g,
+                measure: adv_retention_g_integral,
                 dir: Direction::LessThan,
             },
             threshold: 0.85,
         },
-        // INV-A2-INFLOW (spec §3): owners turn away from the silent dropper ⇒ its placement
-        // inflow (foreign symbols offered-and-accepted) sits BELOW the polite twin's. Ratio
-        // `inflow(silent)/inflow(polite) < 1.0` (the natural no-effect boundary, frozen). LessThan,
-        // power-gated. HONEST NOTE (report): the DECISIVE placement path (post-0.3 sim-unification)
-        // reads only the surface PoS-window, NOT g_oh / drop-counters / σ, so this row is EXPECTED
-        // to land INCONCLUSIVE — the enforcement consumer of the reliability ledger is not yet
-        // wired (spec §3 zoo-gate: σ/drop consumers are phase-4/diagnostic). The row MEASURES that
-        // gap; it is NOT tuned to pass.
+        // INV-A2-RETENTION (seat-sync fix, 2026-07-19): the REALIZED downstream squeeze — the silent
+        // dropper's integrated PARKED volume sits below the polite twin's, because its lower κ_O
+        // (= the burned `g_ho`) lowers its V_ret cap and makes it the eviction/preemption victim at
+        // its reciprocal holders. Ratio `parked_integral(silent)/parked_integral(polite) < 0.85`
+        // (same δ = 0.15, frozen). LessThan, power-gated. This realized volume is a DILUTED,
+        // NOISIER signal than the direct key (INV-A2-SILENT-PUNISHED): non-victim park is unaffected
+        // and the A.4 depth floor is deliberately NOT burned, so it may land INCONCLUSIVE while the
+        // per-seed park curves clearly diverge — the DIRECT enforcement proof is the κ_O row + the
+        // g_oh≡g_ho property test, this row is its (noisy) realization.
+        Invariant {
+            id: "INV-A2-RETENTION",
+            spec: InvariantSpec::AdvComparative {
+                measure: adv_parked_integral,
+                dir: Direction::LessThan,
+            },
+            threshold: 0.85,
+        },
+        // INV-A2-INFLOW (spec §3): owners turn away from the silent dropper ⇒ its placement inflow
+        // sits BELOW the polite twin's. Ratio `inflow(silent)/inflow(polite) < 1.0`. LessThan,
+        // power-gated. HONEST NOTE (report): the DECISIVE placement path (post-0.3) reads the surface
+        // PoS-window ONLY, NOT g_oh / drop-counters / σ (grep-verified), so placement does NOT
+        // enforce — any aggregate inflow shift is an EMERGENT world-divergence side-effect, not
+        // owners reading the ledger. EXPECTED INCONCLUSIVE at the modest adversary load; the direct
+        // placement consumer is honest phase-4 work (out of A2 scope). The row MEASURES that gap.
         Invariant {
             id: "INV-A2-INFLOW",
             spec: InvariantSpec::AdvComparative {

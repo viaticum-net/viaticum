@@ -25,7 +25,8 @@ use crate::sim_adv::cli::{SimAdvError, apply_dial};
 use crate::sim_adv::hetero::{DemandClass, HeteroReport, HeteroTracker, apply_demand_classes};
 use crate::sim_adv::metrics::{MetricSet, collect_metrics};
 use crate::sim_adv::predators::{
-    AdvMetrics, RunMode, collect_adv_metrics, fold_cap_ratio, inject_adversaries, observe_cap_ratio,
+    AdvMetrics, RunMode, collect_adv_metrics, fold_cap_ratio, inject_adversaries,
+    observe_adv_aggregates, observe_cap_ratio,
 };
 use crate::sim_adv::restore::{RestoreTracker, RestoreTruth};
 use crate::sim_adv::scenario::{Event, EventKind, NodeSel, Scenario, ScenarioId};
@@ -290,6 +291,11 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     // so fold the per-tick max cap ratio over the run (NaN ⇒ no evicting holder held adversary
     // data this tick). Empty for a non-adversary scenario.
     let mut run_cap_ratio = f64::NAN;
+    // A2 seat-sync fix (2026-07-19): the enforced-retention arms diverge chaotically, so the
+    // horizon snapshot is noisy. Integrate the adversary aggregates (g_oh ledger + parked own
+    // volume) over the run for a stable paired signal. Zero for a non-adversary scenario.
+    let mut retention_g_integral = 0.0f64;
+    let mut parked_integral = 0.0f64;
     // Hetero-v2 (D1): the per-class placement tracker — samples the L-footprint fill curve and
     // records each owner's first full-footprint tick. `None` for a uniform-demand scenario.
     let mut hetero_tracker = if scenario.world.demand.is_hetero() {
@@ -333,10 +339,14 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
             resolve_cursor += 1;
         }
 
-        // (f) fold this tick's Р-7 cap ratio (only meaningful with adversaries present).
+        // (f) fold this tick's Р-7 cap ratio + the A2 adversary aggregates (only meaningful
+        //     with adversaries present).
         if !adv_nodes.is_empty() {
             run_cap_ratio =
                 fold_cap_ratio(run_cap_ratio, observe_cap_ratio(&world, params, &adv_nodes));
+            let (g, park) = observe_adv_aggregates(&world, &adv_nodes);
+            retention_g_integral += g;
+            parked_integral += park;
         }
 
         // (g) hetero placement observation (after the tick advances: read the post-step state).
@@ -353,7 +363,13 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     let adv = if adv_nodes.is_empty() {
         None
     } else {
-        Some(collect_adv_metrics(&world, &adv_nodes, run_cap_ratio))
+        Some(collect_adv_metrics(
+            &world,
+            &adv_nodes,
+            run_cap_ratio,
+            retention_g_integral,
+            parked_integral,
+        ))
     };
     let hetero = hetero_tracker.map(|ht| ht.finalize(&world));
     SeedRun {

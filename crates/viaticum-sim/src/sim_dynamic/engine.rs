@@ -375,16 +375,30 @@ fn owner_alive_volume_on(world: &World, owner: usize, holder: usize) -> f64 {
 /// victim) — the protocol sends a DropNotice, so from the owner's seat this is an
 /// ANNOUNCED loss with head-start `t_n` (F2: a pressure drop passes `t_n = DAYS_PER_TICK`,
 /// noticed-then-died a tick later; a preemption swap passes `t_n = 0`, an instantaneous
-/// displacement). Burns the owner-side reliability capital `g_oh` = `G(O←h)` (the owner's
-/// record of the holder's service TO IT — the reliability evidence, decision_model §1),
-/// bumps the `drop_ann` retention-forecast counter (C2FARM-3), and tallies the event.
+/// displacement). Burns the reliability quantity `G(holder→owner)` (the holder's service TO
+/// the owner — the reliability evidence, decision_model §1), bumps the `drop_ann`
+/// retention-forecast counter (C2FARM-3), and tallies the event.
 ///
-/// **Direction (traced, not guessed — 3a discipline):** the write is to
-/// `capital[owner][holder].g_oh`, the cell that accumulates "this HOLDER served this
-/// OWNER" (`observer::observe_pair` reads it into `g_owner_from_holder`). This is the
-/// reliability capital A.2 burns, NOT the reciprocal `g_ho` (the owner's own service).
-/// `v_held` is `owner`'s alive volume on `holder` BEFORE the drop; `v_lost` is the
-/// dropped symbol's volume.
+/// **Both mirror cells are burned (A2 seat-sync fix, 2026-07-19).** `G(holder→owner)` is ONE
+/// quantity with TWO god-view copies (§1 local observability; A.14/A.2 = one victim-enforcer
+/// ledger): the owner's record `capital[owner][holder].g_oh` (`observe_pair` →
+/// `g_owner_from_holder`, feeds the — currently inert — retention FORECAST) AND the transpose
+/// `capital[holder][owner].g_ho` (the ENFORCEMENT key: `kappa_key` drives eviction / preemption /
+/// the Р-7 V_ret cap on the holder's OWN parked volume). Accrual keeps the two in sync
+/// (`pos_and_capital`: `g_oh += a` at `[o][h]`, `g_ho += a` at `[h][o]`), so the burn MUST too —
+/// otherwise a drop punishes the (kernel-inert) forecast copy but NOT the enforcement copy, and
+/// the dropper's parked data is never actually squeezed (the A2 pre-fix artifact). Same burn
+/// FACTOR to both (identical `apply_burn` args ⇒ identical multiplier, so the invariant
+/// `g_oh ≡ g_ho^T` is preserved).
+///
+/// **`depth_ho` is deliberately NOT burned.** A.4 loyalty depth is the SLOW-leaky integral of
+/// service; a drop halts FRESH credit (g→0) but the built loyalty drains on its own over
+/// `τ_slow ≈ 6 months` — it is not an impulse-erased fact. So a formerly-deep dropper keeps its
+/// W10 floor (`w_d·sat(D/d_ref)·g*`) for months while its fast `g_ho` is zeroed at once; the
+/// silent/polite gap rides the fast-capital term, which is what A.2 governs.
+///
+/// `v_held` is `owner`'s alive volume on `holder` BEFORE the drop; `v_lost` is the dropped
+/// symbol's volume.
 fn apply_announced_burn(
     world: &mut World,
     owner: usize,
@@ -395,9 +409,24 @@ fn apply_announced_burn(
 ) {
     let v_held = owner_alive_volume_on(world, owner, holder);
     let p = burn_params_of(params);
-    let cell = &mut world.capital[owner][holder];
-    cell.g_oh = apply_burn(cell.g_oh, &p, true, t_n, v_lost, v_held);
-    cell.drop_ann += 1.0; // leaky counter (decayed in the W2 sweep by λ_drop)
+    // Burn G(holder→owner) on BOTH mirror cells (forecast + enforcement); depth_ho untouched.
+    world.capital[owner][holder].g_oh = apply_burn(
+        world.capital[owner][holder].g_oh,
+        &p,
+        true,
+        t_n,
+        v_lost,
+        v_held,
+    );
+    world.capital[owner][holder].drop_ann += 1.0; // leaky counter (decayed by λ_drop in W2)
+    world.capital[holder][owner].g_ho = apply_burn(
+        world.capital[holder][owner].g_ho,
+        &p,
+        true,
+        t_n,
+        v_lost,
+        v_held,
+    );
     world.burn_ann_count += 1;
 }
 
@@ -1206,12 +1235,34 @@ fn pos_and_capital(world: &mut World, params: &DynParams) {
                 holder,
                 volume,
             } = ev;
-            let cell = &mut world.capital[owner][holder];
-            // Silent: announced = false ⇒ b_max, t_n = 0. A total loss (V_lost = V_held).
-            cell.g_oh = apply_burn(cell.g_oh, &bp, false, 0.0, volume, volume);
-            cell.drop_silent += 1.0; // leaky counter (decayed in the W2 sweep by λ_drop)
+            // Silent: announced = false ⇒ b_max, t_n = 0. A total loss (V_lost = V_held). Burn
+            // G(holder→owner) on BOTH mirror cells (owner forecast `g_oh` + the enforcement
+            // transpose `g_ho` — see `apply_announced_burn`; depth_ho NOT burned).
+            world.capital[owner][holder].g_oh = apply_burn(
+                world.capital[owner][holder].g_oh,
+                &bp,
+                false,
+                0.0,
+                volume,
+                volume,
+            );
+            world.capital[owner][holder].drop_silent += 1.0; // leaky (decayed by λ_drop in W2)
             // σ jump (pure, dt = 0 — the sweep already decayed σ this tick).
-            cell.sigma = update_suspicion(cell.sigma, true, 0.0, params.sigma_mu, params.sigma_j);
+            world.capital[owner][holder].sigma = update_suspicion(
+                world.capital[owner][holder].sigma,
+                true,
+                0.0,
+                params.sigma_mu,
+                params.sigma_j,
+            );
+            world.capital[holder][owner].g_ho = apply_burn(
+                world.capital[holder][owner].g_ho,
+                &bp,
+                false,
+                0.0,
+                volume,
+                volume,
+            );
             world.burn_silent_count += 1;
         }
     }

@@ -279,6 +279,26 @@ pub struct AdvMetrics {
     /// announced drop does NOT jump σ, so silent's σ ≫ polite's. σ is INERT in the kernel (no
     /// decision reads it — spec §3), so this is reported, never asserted.
     pub sigma_owed: f64,
+    /// A2 — the price-of-silence ledger, TIME-INTEGRATED over the run (`Σ_t retention_g`). After
+    /// the seat-sync burn fix (2026-07-19) the two arms DIVERGE chaotically, so the horizon
+    /// SNAPSHOT `retention_g` is noisy; the integral averages out the per-tick chaos into a
+    /// stable paired ratio — the load-bearing INV-A2-SILENT-PUNISHED quantity. `0` when no
+    /// adversary ran.
+    pub retention_g_integral: f64,
+    /// A2 — the adversary's PARKED own-volume, TIME-INTEGRATED over the run (`Σ_t parked_live`).
+    /// The RETENTION channel now enforced (the seat-sync fix lets the drop burn the enforcement
+    /// key `g_ho`, so V_ret / eviction / preemption squeeze the silent dropper's parked data
+    /// harder than the polite twin's). Integrated for the same noise-smoothing reason. A
+    /// downstream diagnostic (diluted by non-victim park + the un-burned depth floor). `0` when
+    /// no adversary ran.
+    pub parked_integral: f64,
+    /// A2 — the DIRECT enforcement count: how many of the ADVERSARY's OWN symbols holders dropped
+    /// over the run (`eviction_log` entries whose `owner ∈ adversaries`: pressure drops +
+    /// preemption victims + Р-7 cap-trims). This is the enforcement ACTION the burned `g_ho`
+    /// drives. DIAGNOSTIC ONLY (report row, very noisy — no invariant asserts it; the
+    /// INV-A2-RETENTION board row is fed by `parked_integral`, and the enforcement PROOF is
+    /// the κ_O row INV-A2-SILENT-PUNISHED). `0` when no adversary ran.
+    pub data_evicted: f64,
 }
 
 /// Bit-exact equality (the determinism board row). `to_bits` so a deterministically-produced
@@ -294,6 +314,35 @@ pub fn bit_eq(a: &AdvMetrics, b: &AdvMetrics) -> bool {
         && a.retention_g.to_bits() == b.retention_g.to_bits()
         && a.inflow_total.to_bits() == b.inflow_total.to_bits()
         && a.sigma_owed.to_bits() == b.sigma_owed.to_bits()
+        && a.retention_g_integral.to_bits() == b.retention_g_integral.to_bits()
+        && a.parked_integral.to_bits() == b.parked_integral.to_bits()
+        && a.data_evicted.to_bits() == b.data_evicted.to_bits()
+}
+
+/// A2 per-tick god-view aggregate of the injected adversaries: `(Σ_O g_oh, Σ parked_live)` where
+/// O ranges over the NON-adversary owners and parked is the adversaries' alive own volume on
+/// present holders. The runner folds this every tick into the time-integrals (the seat-sync fix
+/// makes the horizon snapshot chaotic; the integral is the stable paired signal). Evaluator-only.
+pub fn observe_adv_aggregates(world: &World, nodes: &[usize]) -> (f64, f64) {
+    let n = world.nodes.len();
+    let is_adv = |o: usize| nodes.contains(&o);
+    let mut g = 0.0f64;
+    let mut park = 0.0f64;
+    for &adv in nodes {
+        for o in 0..n {
+            if o == adv || is_adv(o) {
+                continue;
+            }
+            g += world.capital[o][adv].g_oh;
+        }
+        for h in 0..n {
+            if h == adv || !world.nodes[h].present {
+                continue;
+            }
+            park += settled_parked_on(world, adv, h);
+        }
+    }
+    (g, park)
 }
 
 /// Is `(holder, owner, block)` currently noticed for eviction (a pending DropNotice that dies
@@ -371,7 +420,13 @@ pub fn fold_cap_ratio(running: f64, tick_ratio: f64) -> f64 {
 /// `run_cap_ratio` is the per-tick-tracked max Р-7 cap ratio (see [`observe_cap_ratio`]) —
 /// threaded in because the cap engages transiently through the run, not only at the horizon.
 /// (The end-of-run integrals here read only the god-view world, no dials.)
-pub fn collect_adv_metrics(world: &World, nodes: &[usize], run_cap_ratio: f64) -> AdvMetrics {
+pub fn collect_adv_metrics(
+    world: &World,
+    nodes: &[usize],
+    run_cap_ratio: f64,
+    retention_g_integral: f64,
+    parked_integral: f64,
+) -> AdvMetrics {
     let n = world.nodes.len();
 
     let mut parked_live = 0.0f64;
@@ -416,6 +471,13 @@ pub fn collect_adv_metrics(world: &World, nodes: &[usize], run_cap_ratio: f64) -
         f64::NAN
     };
 
+    // DIRECT enforcement count: adversary-owned symbols holders dropped over the run.
+    let data_evicted = world
+        .eviction_log
+        .iter()
+        .filter(|e| nodes.contains(&e.owner))
+        .count() as f64;
+
     AdvMetrics {
         parked_live,
         max_cap_ratio: run_cap_ratio,
@@ -427,5 +489,8 @@ pub fn collect_adv_metrics(world: &World, nodes: &[usize], run_cap_ratio: f64) -
         retention_g,
         inflow_total,
         sigma_owed,
+        retention_g_integral,
+        parked_integral,
+        data_evicted,
     }
 }

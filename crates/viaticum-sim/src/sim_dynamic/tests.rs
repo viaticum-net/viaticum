@@ -3326,6 +3326,51 @@ fn a2_voluntary_drop_picks_lowest_iota_victim_identically_for_silent_and_announc
 }
 
 #[test]
+fn a2_burn_keeps_g_oh_bit_identical_to_the_g_ho_transpose() {
+    // The seat-sync fix: `G(holder→owner)` lives in TWO mirror cells — `capital[owner][holder].g_oh`
+    // (owner forecast) and `capital[holder][owner].g_ho` (the enforcement key). Accrual syncs them;
+    // the burn must too. After accrual (synced) → a SILENT drop → the burn must leave both cells
+    // BIT-IDENTICAL (both burned by the same factor), and both strictly below the pre-burn value.
+    let params = params_v_free_pinned();
+    let v = params.block_volume / params.k_eff as f64;
+    let adv = 1usize;
+    let owner = 2usize;
+    let mut world = mk_clean_world(&params, 13);
+
+    // Accrue via a PoS pass (adv holds owner's symbol) → both copies get the same += accrual.
+    give_foreign_symbol(&mut world, adv, owner, 0.5, v);
+    world.tick = 1;
+    pos_and_capital_for_test(&mut world, &params);
+    assert!(
+        world.capital[owner][adv].g_oh > 0.0,
+        "precondition: accrued"
+    );
+    assert_eq!(
+        world.capital[owner][adv].g_oh.to_bits(),
+        world.capital[adv][owner].g_ho.to_bits(),
+        "accrual keeps the mirror copies in sync"
+    );
+    let g_before = world.capital[owner][adv].g_oh;
+
+    // SILENT drop → next PoS round burns BOTH copies (the fix).
+    set_a2_role(&mut world, adv, 1.0, a2_silent_dropper_hook);
+    adv_voluntary_drops_for_test(&mut world);
+    world.tick = 2;
+    pos_and_capital_for_test(&mut world, &params);
+
+    assert_eq!(
+        world.capital[owner][adv].g_oh.to_bits(),
+        world.capital[adv][owner].g_ho.to_bits(),
+        "the seat-sync burn keeps g_oh ≡ g_ho^T bit-identical (was the bug)"
+    );
+    assert!(
+        world.capital[adv][owner].g_ho < g_before,
+        "and the ENFORCEMENT copy g_ho was burned below the pre-burn value: {} < {g_before}",
+        world.capital[adv][owner].g_ho
+    );
+}
+
+#[test]
 fn a2_silent_drop_zeroes_reliability_capital_while_announced_barely_dents_it() {
     // The price of silence at the burn level: a SILENT voluntary drop rides the silent-loss path
     // (b_max = 1.0, total loss ⇒ g_oh → 0); an ANNOUNCED drop rides the F2 notice (b_ann = 0.05
