@@ -69,11 +69,16 @@ pub struct DynParams {
     /// would drift with λ). §13 default ≈ 30 days ("+1 gb of retention per 30 gb·days
     /// of lived service above V_free"). `≤ 0` DISABLES the cap (WARN-1 guard).
     pub c_recip_days: f64,
-    /// Р-7 (A.14) free retention floor `V_free`, in UNITS of `v_per_symbol`: the
-    /// kernel `RetentionCap.v_free` is this × `v_per_symbol` gb. Every owner keeps this
-    /// much for free (bootstrap-by-storage entry; the newcomer's first backup survives).
-    /// **OPEN calibration guess (spec 3b): `2.0` = 2 symbols' worth** — flagged for
-    /// review, NOT a settled canon value.
+    /// Р-7 (A.14) free retention floor `V_free`, in UNITS of `v_per_symbol`: the kernel
+    /// `RetentionCap.v_free` is this × `v_per_symbol` gb. Every owner keeps this much for
+    /// free (the retention floor above which the reciprocity tariff `κ_O/c_recip` applies).
+    /// **Р-9 (Ilya 2026-07-19): MODEL DEFAULT `0.0`** — a DIAL ("extra, but a pity to throw
+    /// away"). The hard-hetero sweep showed a positive V_free does NOT make "the newcomer's
+    /// first backup survive" under contention (entry is κ-gated by preemption; V_free is only
+    /// a RETENTION floor), and predators still lose to their honest twin at 0 (defence is
+    /// v_free-independent: the whitewasher loses harder, the ε-whale is v_free-insensitive). At 0: `V_ret = κ_O/c_recip`, entry = "serve
+    /// first" (≈ θ_p/λ). A `> 0` value is an OPTIONAL onboarding-generosity dial (the sim_adv
+    /// V_free sweep measures its cost/benefit). NOT a settled canon field value.
     pub v_free_symbols: f64,
     /// A.2 (транше 4 / §13): the WEAK announced-drop burn fraction `b_ann`. §13-OPEN
     /// default `0.05` (`b_ann ≪ b_max`). Feeds [`BurnParams`].
@@ -225,10 +230,14 @@ impl Default for DynParams {
             lambda_dem: 1.0 / 365.0,
             depth_w_d: 0.5,
             depth_ref_days: 365.0,
-            // Р-7 (A.14 / §13): c_recip ≈ 30 days (Ilya); V_free = 2·v_per_symbol is an
-            // OPEN calibration guess (spec 3b) — "first backup of a newcomer survives".
+            // Р-7 (A.14 / §13): c_recip ≈ 30 days (Ilya).
             c_recip_days: 30.0,
-            v_free_symbols: 2.0,
+            // Р-9 (Ilya 2026-07-19): V_free DIAL, MODEL DEFAULT 0 ("extra, but a pity to throw
+            // away"). V_free does not deliver "first backup survives" under contention (entry
+            // κ-gated by preemption; floor is retention-only) and predators lose ≥ as hard at
+            // 0 ⇒ it is not load-bearing for defence; a >0 floor is optional onboarding
+            // generosity (sim_adv V_free sweep). See `4r_vfree_sweep_spec.md` + ledger Р-9.
+            v_free_symbols: 0.0,
             // A.2 / A.5 (транше 4 / §13): §13 defaults (b_max confirmed 1.0 by Ilya
             // 2026-07-07; the rest are OPEN calibration guesses flagged for Ilya).
             burn_b_ann: 0.05,

@@ -1,5 +1,8 @@
 //! Unit tests for `sim_adv` (sub-tranches 0.1 + 0.2 restore-truth). `what_when_then`.
 
+use crate::sim_adv::bootstrap::{
+    BootstrapStats, collect_bootstrap, mean_over_seeds, run_bootstrap,
+};
 use crate::sim_adv::brier::{Calibration, DEFAULT_BRIER_BUCKETS};
 use crate::sim_adv::cli::{apply_dial, parse_cli, resolve_seeds};
 use crate::sim_adv::hetero::{
@@ -12,7 +15,7 @@ use crate::sim_adv::predators::{
 };
 use crate::sim_adv::registry::{
     a1_whale, a4_whitewasher, all_scenarios, dr_baseline, dr_hetero, find_scenario,
-    honest_hetero_v2, honest_v2,
+    honest_hetero_hard, honest_hetero_v2, honest_v2,
 };
 use crate::sim_adv::report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
 use crate::sim_adv::restore::{
@@ -200,33 +203,40 @@ fn report_text_is_byte_identical_on_repeat_under_rayon() {
 
 #[test]
 fn honest_v2_seed42_matches_sim_diag_anchor() {
-    // Anchor = `sim_diag 42 100 50 1 v2` — RE-FROZEN 2026-07-18 for the F1-F6 sim-substrate
-    // tranche. Both sim_diag and honest_v2 run the SAME engine (build_world + step with
-    // DynParams::default), so they STILL agree field-for-field — the point of this anchor is
-    // that the harness does not distort the engine, not the exact values. The F1-F6 shift
-    // (transche-0.3 → F1-F6) is documented in the tranche report; cross-verified vs
-    // `sim_diag 42 100 50 1 v2` at re-freeze time (share 76.8% / 224 alive / 506 evicts /
-    // 377 preempts / 1 cap_trim / D 7306.05 / dur R 0.83, N 0.71, H 1.25).
-    //   Drivers of the shift: F1 (window-PoS) collapses σ (0.054→0.005) and lifts D
-    //   (3428→7306, intermittent holders now confirmed); F5 (chunk = source/k_eff = 25 gb,
-    //   2.5× bigger) conserves placed GB but ~2.5× fewer symbols (565→224) and fewer eviction
-    //   events (1514→506); share A>0 96.6→76.8 (harder contention, fewer mutual pairs).
+    // Anchor = `sim_diag 42 100 50 1 v2` — RE-FROZEN 2026-07-19 for the Р-9 V_free-sweep
+    // tranche (model default `v_free_symbols` flipped 2.0 → 0.0). Both sim_diag and honest_v2
+    // run the SAME engine (build_world + step with DynParams::default), so they STILL agree
+    // field-for-field — the point of this anchor is that the harness does not distort the
+    // engine, not the exact values. The "≡ sim_diag" property is PRESERVED (both consume the
+    // new default). Cross-verified vs `sim_diag 42 100 50 1 v2` at re-freeze time.
+    //   The Р-9 shift (v_free 2 → 0, this seed): alive 224 UNCHANGED (occupancy is bandwidth/
+    //   contention-bound, not V_free-bound); cap_trims 1 → 190 (the tariff now bites all parked
+    //   volume above the earned κ_O/c_recip); evicts 506 → 643 (the cap-trims are logged too);
+    //   preempts 377 → 386; share A>0 76.79 → 80.36 (low-reciprocity parked volume is trimmed,
+    //   raising the g_ho>0 fraction); D 7306 → 7102; σ ~unchanged; durability Reliable 0.83 →
+    //   0.97 (freed disk lets the high-κ_O giver hold more floor holders) but Nomad 0.71 → 0.29.
+    //   ⚠ 0.29 is seed-42's LOWER TAIL, not a signal: the 5-seed sweep gives Nomad 0.76 ± 0.31
+    //   at v_free=0 (review N1) — do not read a causal "v_free=0 punishes Nomad" story into
+    //   this single-seed anchor value.
     let m = run_one_seed(&honest_v2(), 42).metrics;
 
     // Exact integer counters (sim_diag §6a/§3-sum/§6d).
     assert_eq!(m.alive_symbols, 224, "alive symbols (6a)");
-    assert_eq!(m.evicts, 506, "eviction_log.len (sum of §3)");
-    assert_eq!(m.preempts, 377, "preempt_count (6d)");
-    assert_eq!(m.cap_trims, 1, "cap_trim_count (6d)");
+    assert_eq!(m.evicts, 643, "eviction_log.len (sum of §3)");
+    assert_eq!(m.preempts, 386, "preempt_count (6d)");
+    assert_eq!(
+        m.cap_trims, 190,
+        "cap_trim_count (6d) — Р-9 tariff bites at V_free=0"
+    );
 
     // Floats to the sim_diag print precision.
     assert!(
-        (m.share_a_pos - 76.79).abs() < 0.1,
+        (m.share_a_pos - 80.36).abs() < 0.1,
         "share A>0 = {}",
         m.share_a_pos
     );
     assert!(
-        (m.mean_depth - 7306.051).abs() < 0.01,
+        (m.mean_depth - 7102.365).abs() < 0.01,
         "mean D = {}",
         m.mean_depth
     );
@@ -235,19 +245,19 @@ fn honest_v2_seed42_matches_sim_diag_anchor() {
         "mean σ = {}",
         m.mean_sigma
     );
-    // Per-archetype floor durability (sim_diag §5): Reliable 0.83, Nomad 0.71, Hoarder 1.25.
+    // Per-archetype floor durability (sim_diag §5): Reliable 0.97, Nomad 0.29, Hoarder 1.29.
     assert!(
-        (m.durability[0] - 0.83).abs() < 0.01,
+        (m.durability[0] - 0.97).abs() < 0.01,
         "Reliable durability = {}",
         m.durability[0]
     );
     assert!(
-        (m.durability[3] - 0.71).abs() < 0.01,
+        (m.durability[3] - 0.29).abs() < 0.01,
         "Nomad durability = {}",
         m.durability[3]
     );
     assert!(
-        (m.durability[4] - 1.25).abs() < 0.01,
+        (m.durability[4] - 1.29).abs() < 0.01,
         "Hoarder durability = {}",
         m.durability[4]
     );
@@ -260,14 +270,14 @@ fn honest_v2_seed42_matches_sim_diag_anchor() {
 #[test]
 fn honest_v2_reliable_extraction_roi_is_near_balance_and_bounded() {
     // FACT (measured, not a wish): under served-matrix conservation the honest giver
-    // Reliable operates at BALANCED reciprocity — seed 42 ROI ≈ 0.989 (F1-F6 tranche; was
-    // 1.015 pre-F1-F6), NOT above the ceiling. (Universal "< 1 for all archetypes" is
+    // Reliable operates at BALANCED reciprocity — seed 42 ROI ≈ 1.006 (Р-9 V_free=0 tranche;
+    // was 0.989 at v_free=2), NOT above the ceiling. (Universal "< 1 for all archetypes" is
     // impossible: Σconsumed ≡ Σserved_out.) The invariant is BOUNDED extraction, so we lock
     // the measured value and the 1.25 ceiling.
     let m = run_one_seed(&honest_v2(), 42).metrics;
     let roi = m.extraction_roi[0];
     assert!(
-        (roi - 0.989).abs() < 0.01,
+        (roi - 1.006).abs() < 0.01,
         "Reliable ROI (seed 42 fact) = {roi}"
     );
     assert!(
@@ -1366,6 +1376,25 @@ fn twin_injection_matches_construction_and_carries_a_noop_role() {
 }
 
 #[test]
+fn mean_over_seeds_skips_nan_and_is_nan_when_every_seed_is_empty() {
+    // W1 review gate: NaN seeds (empty cohort) drop out of the mean; all-NaN → NaN.
+    let stat = |v: f64| BootstrapStats {
+        n_newcomers: if v.is_nan() { 0 } else { 1 },
+        first_block_floor_ever: v,
+        mean_time_to_first_g: v,
+        mean_time_to_first_accept: v,
+        frac_ever_placed: v,
+        mean_first_block_parked_holders: v,
+        frac_first_block_lost: v,
+    };
+    let mixed = [stat(1.0), stat(f64::NAN), stat(3.0)];
+    assert_eq!(mean_over_seeds(&mixed, |s| s.frac_first_block_lost), 2.0);
+    let all_empty = [stat(f64::NAN), stat(f64::NAN)];
+    assert!(mean_over_seeds(&all_empty, |s| s.frac_first_block_lost).is_nan());
+    assert!(mean_over_seeds(&[], |s: &BootstrapStats| s.frac_first_block_lost).is_nan());
+}
+
+#[test]
 fn fold_cap_ratio_covers_all_nan_branches() {
     // NaN = "no sample this tick"; the fold keeps the running max otherwise.
     assert!(fold_cap_ratio(f64::NAN, f64::NAN).is_nan(), "no sample yet");
@@ -2003,4 +2032,296 @@ fn dr_hetero_splits_restore_truth_by_demand_class() {
         classes.len() > 1,
         "the S/M/L victims give a per-class split, got {classes:?}"
     );
+}
+
+// ------------------------------------------------------------------
+// Р-9 V_free sweep — bootstrap-focus: a NEWCOMER's onboarding under contention
+// (the key missing measurement the V_free dial is meant to serve)
+// ------------------------------------------------------------------
+
+/// A minimal own block with a chosen `floor_ever_met` (the newcomer's first-backup flag).
+fn own_first(id: usize, floor_ever_met: bool) -> OwnBlock {
+    OwnBlock {
+        id,
+        volume: 50.0,
+        iota: 0.5,
+        placements: Vec::new(),
+        floor_ever_met,
+        floor_deficit_since: None,
+        to_restore: false,
+    }
+}
+
+/// A hand-built world exercising the bootstrap cohort selector: three LATE cooperative
+/// newcomers (Reliable / Weekend / Nomad), one LATE Hoarder (parasite — excluded), and two
+/// early holders (joined at 0 — not newcomers). Their first blocks / entry gaps / held
+/// holders are set by hand so the evaluator's arithmetic is checkable.
+fn bootstrap_controlled_world() -> World {
+    let params = DynParams::default();
+    let mut w = build_world(6, &params, 7);
+    for nd in &mut w.nodes {
+        nd.present = true;
+        nd.holdings.clear();
+    }
+    // node 0: early Reliable holder (joined 0 ⇒ NOT a newcomer).
+    w.nodes[0].joined_tick = 0;
+    w.nodes[0].archetype = Archetype::Reliable;
+    // node 1: LATE Reliable newcomer whose first block met floor + is held once.
+    w.nodes[1].joined_tick = 20;
+    w.nodes[1].archetype = Archetype::Reliable;
+    w.nodes[1].own_blocks = vec![own_first(0, true)];
+    w.first_earned_g[1] = Some(25); // gap 5
+    w.first_own_accept[1] = Some(28); // gap 8
+    // node 2: LATE Weekend newcomer that NEVER placed (first block never met floor, 0 holders).
+    w.nodes[2].joined_tick = 15;
+    w.nodes[2].archetype = Archetype::Weekend;
+    w.nodes[2].own_blocks = vec![own_first(0, false)];
+    w.first_earned_g[2] = None;
+    w.first_own_accept[2] = None;
+    // node 3: LATE Hoarder ⇒ EXCLUDED from the cohort (a parasite, not the newcomer V_free serves).
+    w.nodes[3].joined_tick = 30;
+    w.nodes[3].archetype = Archetype::Hoarder;
+    // node 4: LATE Nomad newcomer, first block floor-met + held by TWO holders.
+    w.nodes[4].joined_tick = 12;
+    w.nodes[4].archetype = Archetype::Nomad;
+    w.nodes[4].own_blocks = vec![own_first(0, true)];
+    w.first_earned_g[4] = Some(20); // gap 8
+    w.first_own_accept[4] = Some(18); // gap 6
+    // node 5: another early holder (joined 0 ⇒ not a newcomer).
+    w.nodes[5].joined_tick = 0;
+    w.nodes[5].archetype = Archetype::Reliable;
+    // Holdings: node1.block0 on holder 5; node4.block0 on holders 5 AND 0 (two distinct holders).
+    push_held(&mut w, 5, 1, 0, 0.5, false);
+    push_held(&mut w, 5, 4, 0, 0.5, false);
+    push_held(&mut w, 0, 4, 0, 0.5, false);
+    w
+}
+
+#[test]
+fn bootstrap_evaluator_reads_the_late_cohort_first_block_and_entry_gaps() {
+    // The god-view evaluator selects only LATE cooperative newcomers and reads their first
+    // block's floor-ever + parked holders + entry gaps from the engine's own trace.
+    let w = bootstrap_controlled_world();
+    let b = collect_bootstrap(&w, 10);
+    assert_eq!(
+        b.n_newcomers, 3,
+        "3 late cooperative newcomers (Hoarder excluded)"
+    );
+    assert!(
+        (b.first_block_floor_ever - 2.0 / 3.0).abs() < 1e-9,
+        "2 of 3 first blocks ever met floor: {}",
+        b.first_block_floor_ever
+    );
+    assert!(
+        (b.mean_time_to_first_g - 6.5).abs() < 1e-9,
+        "mean earn gap = (5+8)/2: {}",
+        b.mean_time_to_first_g
+    );
+    assert!(
+        (b.mean_time_to_first_accept - 7.0).abs() < 1e-9,
+        "mean accept gap = (8+6)/2: {}",
+        b.mean_time_to_first_accept
+    );
+    assert!(
+        (b.frac_ever_placed - 2.0 / 3.0).abs() < 1e-9,
+        "2 of 3 ever placed: {}",
+        b.frac_ever_placed
+    );
+    assert!(
+        (b.mean_first_block_parked_holders - 1.0).abs() < 1e-9,
+        "parked holders (1 + 0 + 2)/3 = 1.0: {}",
+        b.mean_first_block_parked_holders
+    );
+    assert!(
+        (b.frac_first_block_lost - 1.0 / 3.0).abs() < 1e-9,
+        "1 of 3 first blocks has 0 holders: {}",
+        b.frac_first_block_lost
+    );
+}
+
+#[test]
+fn bootstrap_evaluator_is_empty_when_no_late_newcomer_is_present() {
+    // No node joined at/after the threshold ⇒ empty cohort (rates NaN, not 0).
+    let mut w = bootstrap_controlled_world();
+    for nd in &mut w.nodes {
+        nd.joined_tick = 0;
+    }
+    let b = collect_bootstrap(&w, 10);
+    assert_eq!(b.n_newcomers, 0);
+    assert!(b.first_block_floor_ever.is_nan());
+    assert!(b.frac_first_block_lost.is_nan());
+}
+
+#[test]
+fn bootstrap_run_is_deterministic_and_finds_late_newcomers() {
+    // A small honest run: the late cohort exists and the read is bit-identical on repeat
+    // (the whole path is seeded). Kept small so it belongs in the gate.
+    let params = DynParams::default();
+    let a = run_bootstrap(&params, 50, 80, 7, 30);
+    let b = run_bootstrap(&params, 50, 80, 7, 30);
+    assert_eq!(a, b, "bootstrap read is deterministic on repeat");
+    assert!(
+        a.n_newcomers > 0,
+        "the incremental world produces late newcomers"
+    );
+    assert!(
+        a.frac_first_block_lost.is_finite() && a.first_block_floor_ever.is_finite(),
+        "the cohort is non-empty ⇒ finite rates"
+    );
+}
+
+/// The bootstrap 2×2: newcomer onboarding in a FREE (abundant-disk) vs TIGHT (default,
+/// contended) world × V_free ∈ {0, 2}, over 5 seeds. IGNORED (heavy: 4 configs × 5 seeds ×
+/// full honest world). Run explicitly for the tranche report:
+///   `cargo test -p viaticum-sim sim_adv bootstrap_newcomer_onboarding_free_vs_tight_table \
+///    -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore]
+fn bootstrap_newcomer_onboarding_free_vs_tight_table() {
+    let seeds = [42u64, 43, 44, 45, 46];
+    let n = 100usize;
+    let horizon = 130u64;
+    let threshold = 40u64; // "late": joined into the already-established (join done ~tick 65) world.
+
+    let base = DynParams::default();
+    // FREE = abundant disk (no contention: holders never fill ⇒ V_free is moot).
+    let free = |v_free: f64| DynParams {
+        v_free_symbols: v_free,
+        disk_cap_base: 600.0,
+        disk_cap_spread: 0.0,
+        ..base
+    };
+    // TIGHT = the default contended honest world.
+    let tight = |v_free: f64| DynParams {
+        v_free_symbols: v_free,
+        ..base
+    };
+
+    let agg = |p: &DynParams| -> Vec<BootstrapStats> {
+        seeds
+            .iter()
+            .map(|&s| run_bootstrap(p, n, horizon, s, threshold))
+            .collect()
+    };
+
+    println!(
+        "\n=== BOOTSTRAP 2×2: newcomer onboarding (mean over 5 seeds; late cohort joined_tick>=40) ==="
+    );
+    println!(
+        "  {:<14} {:>8} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "world/v_free", "n_new", "floor_ever", "lost@hzn", "parked_hld", "t_first_g", "t_accept",
+    );
+    for (label, mk) in [
+        ("FREE", &free as &dyn Fn(f64) -> DynParams),
+        ("TIGHT", &tight as &dyn Fn(f64) -> DynParams),
+    ] {
+        for v_free in [0.0f64, 2.0] {
+            let stats = agg(&mk(v_free));
+            println!(
+                "  {:<14} {:>8.1} {:>12.4} {:>12.4} {:>12.4} {:>12.3} {:>12.3}",
+                format!("{label}/{v_free:.0}"),
+                mean_over_seeds(&stats, |b| b.n_newcomers as f64),
+                mean_over_seeds(&stats, |b| b.first_block_floor_ever),
+                mean_over_seeds(&stats, |b| b.frac_first_block_lost),
+                mean_over_seeds(&stats, |b| b.mean_first_block_parked_holders),
+                mean_over_seeds(&stats, |b| b.mean_time_to_first_g),
+                mean_over_seeds(&stats, |b| b.mean_time_to_first_accept),
+            );
+        }
+    }
+    println!(
+        "  (floor_ever = frac first blocks that EVER met floor; lost@hzn = frac with 0 live floor holders at horizon)"
+    );
+}
+
+/// The full scenario × V_free ∈ {0,1,2} sweep, printing each point's whole `format_report`
+/// (god-view + Attack-ROI + restore-truth + hetero per-class + board). IGNORED (heavy — the
+/// report data source). Run explicitly for the tranche report:
+///   `cargo test -p viaticum-sim sim_adv v_free_sweep_full_report_tables \
+///    -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore]
+fn v_free_sweep_full_report_tables() {
+    let values = [0.0f64, 1.0, 2.0];
+    let scenarios = [
+        honest_v2(),
+        dr_baseline(),
+        a1_whale(),
+        a4_whitewasher(),
+        honest_hetero_v2(),
+        honest_hetero_hard(),
+    ];
+    for sc in scenarios {
+        let seeds = sc.seeds.clone();
+        let rows = run_sweep(&sc, "v_free_symbols", &values, &seeds).expect("known dial");
+        for row in &rows {
+            println!(
+                "\n########## scenario '{}'  v_free_symbols = {} ##########",
+                sc.id, row.value
+            );
+            // The board's determinism re-run rebuilds from the scenario's OWN params, so it
+            // must carry the SAME dial value `row.result` was computed at (else the re-run
+            // diverges and INV-DETERMINISM false-FAILs). Apply the dial to a clone first.
+            let mut scv = sc.clone();
+            apply_dial(&mut scv.world.base, "v_free_symbols", row.value).expect("known dial");
+            let verdicts = evaluate_board(&scv, &row.result);
+            print!("{}", format_report(&scv, &row.result, &verdicts));
+        }
+    }
+}
+
+/// Mean cap-trims over `seeds` for `honest_v2` at a chosen V_free.
+fn honest_v2_cap_trims_at(v_free: f64, seeds: &[u64]) -> f64 {
+    let mut sc = honest_v2();
+    sc.seeds = seeds.to_vec();
+    sc.world.base.v_free_symbols = v_free;
+    let r = run(&sc, seeds);
+    r.per_seed.iter().map(|m| m.cap_trims as f64).sum::<f64>() / seeds.len() as f64
+}
+
+#[test]
+fn cap_trims_dwarf_the_v_free_two_baseline_when_v_free_is_zero() {
+    // Р-9 god-view sign (the clean monotone one): at V_free=0 the retention tariff
+    // V_ret = κ_O/c_recip bites ALL parked volume above earned reciprocity, so holder cap-trims
+    // explode; at V_free=2 the 2-symbol free floor absorbs almost all of it (barely any trims).
+    // 5-seed measured means: 147 (V_free=0) vs 2.6 (V_free=2). Here on 3 seeds with a wide margin.
+    let seeds = [42u64, 43, 44];
+    let trims_0 = honest_v2_cap_trims_at(0.0, &seeds);
+    let trims_2 = honest_v2_cap_trims_at(2.0, &seeds);
+    assert!(
+        trims_0 > 5.0 * trims_2.max(1.0),
+        "V_free=0 cap-trims ({trims_0}) must dwarf the V_free=2 baseline ({trims_2})"
+    );
+}
+
+#[test]
+fn both_predators_still_lose_to_their_twin_when_v_free_is_zero() {
+    // Р-9 core claim: V_free is NOT load-bearing for DEFENCE. At V_free=0 both the ε-give whale
+    // (A1) and the whitewasher (A4) STILL protect strictly less own storage than their MATCHED
+    // honest twin (pred consumed < twin consumed) — removing the free floor never lets a predator
+    // win. (Nuance for the report, NOT asserted: the whitewasher loses HARDER at 0 while the
+    // ε-whale is v_free-insensitive — but "predator < twin" holds robustly at every V_free.)
+    let seeds = [42u64, 43, 44];
+    for mut sc in [a1_whale(), a4_whitewasher()] {
+        let id = sc.id;
+        sc.seeds = seeds.to_vec();
+        sc.world.base.v_free_symbols = 0.0;
+        let r = run(&sc, &seeds);
+        let pred: f64 = r
+            .per_seed_adv
+            .iter()
+            .flatten()
+            .map(|p| p.pred.consumed)
+            .sum();
+        let twin: f64 = r
+            .per_seed_adv
+            .iter()
+            .flatten()
+            .map(|p| p.twin.consumed)
+            .sum();
+        assert!(
+            pred < twin,
+            "{id}: predator must protect less than its twin even at V_free=0: {pred} < {twin}"
+        );
+    }
 }

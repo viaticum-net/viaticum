@@ -1714,13 +1714,28 @@ fn kernel_cream_routes_through_place_cream_and_prefers_a_stranger() {
 // WORLD-v2 §9.2 — preemptive accept (θ_p margin, WARN-2/WARN-4)
 // ============================================================
 
+/// Р-9 (V_free sweep): `v_free_symbols` is a DIAL whose MODEL default is now **0** ("extra,
+/// but a pity to throw away" — Ilya 2026-07-19). The holder-side κ / preemption / Р-7-cap
+/// MECHANICS these unit tests demonstrate are calibrated around a representative POSITIVE
+/// floor (V_ret sized to hold a reciprocal owner's single 25 gb symbol: at v_free=2,
+/// V_ret = 50 + g_ho/c_recip); at v_free=0 a lone chunk needs g_ho ≳ 750 to clear the
+/// accept-guard, which collapses these contrasts. So the mechanic tests PIN v_free=2 — the
+/// mechanic still exists as a dial, only the default moved. The DEFAULT (v_free=0) behaviour
+/// is covered by the re-frozen `honest_v2` anchor (cap_trims 1→190) + the sim_adv V_free sweep.
+fn params_v_free_pinned() -> DynParams {
+    DynParams {
+        v_free_symbols: 2.0,
+        ..DynParams::default()
+    }
+}
+
 #[test]
 fn preemption_admits_reciprocal_owner_drops_low_iota_victim_and_blocks_parasite() {
     // §2 / A.12-2: a FULL holder admits a new owner ONLY by displacing its least-reciprocal
     // owner (WARN-4: that owner's LOW-ι symbol), and ONLY if the newcomer clears the
     // DIMENSIONLESS margin θ_p·g* (WARN-1). A parasite (g_ho=0) can never clear it. A
     // negative θ_p DISABLES preemption (WARN-2).
-    let params = DynParams::default(); // preempt_theta = 0.2
+    let params = params_v_free_pinned(); // Р-9: pin V_free=2 (dial); preempt_theta = 0.2
     let holder = 1usize;
     let v = params.block_volume / params.k_eff as f64; // 10 gb
     let mk = |seed: u64| -> World {
@@ -1861,7 +1876,7 @@ fn preemption_ranks_victims_by_unified_kappa_not_bare_g_ho() {
     // bare-g_ho owner. A silent-but-DEEP loyal partner (g_ho≈0, D≥d_ref) is NOT evicted
     // while a stranger (g_ho≈0, D=0) with lower κ_O exists — even though their bare g_ho
     // is identical (both ≈0). Bare-g_ho ranking would have wrongly dropped the deep one.
-    let params = DynParams::default();
+    let params = params_v_free_pinned(); // Р-9: pin V_free=2 (dial) — reciprocal owner must fit V_ret
     let holder = 1usize;
     let v = params.block_volume / params.k_eff as f64; // 10 gb
     let mut world = mk_clean_world(&params, 99);
@@ -1922,7 +1937,7 @@ fn preemption_rejects_offer_beyond_owners_v_ret() {
     // Accept-guard (B-1): an owner already parked at its own V_ret cannot preempt in a
     // FURTHER symbol (it would only be cap-trimmed next eviction). A control with a
     // lighter parked load DOES preempt — proving the guard, not some other reject, blocks it.
-    let params = DynParams::default();
+    let params = params_v_free_pinned(); // Р-9: pin V_free=2 (dial) — the guard contrast needs V_ret>1 chunk
     let holder = 1usize;
     let v = params.block_volume / params.k_eff as f64; // 10 gb
     // κ_O(offer) with g_ho=500, D=0 ⇒ V_ret = V_free + 500/c_recip = 2·10 + 500/30 ≈ 36.67.
@@ -1993,7 +2008,8 @@ fn contended_whale_ends_at_v_ret_envelope() {
     // Sim-level P1b: an ε-give whale that piles 250 gb on a holder is trimmed, under
     // contention, down to V_ret = V_free + κ_O/c_recip ≈ V_free — bounded, not unbounded.
     // F5: v_per_symbol = block/k_eff = 25 gb ⇒ V_free = 2·25 = 50 gb.
-    let params = DynParams::default();
+    // Р-9: pin V_free=2 (dial) — this test IS the "keeps its V_free floor" demonstration.
+    let params = params_v_free_pinned();
     let holder = 1usize;
     let whale = 2usize;
     let v = params.block_volume / params.k_eff as f64; // 25 gb
@@ -2517,7 +2533,9 @@ fn announced_eviction_burns_weakly_with_headstart_and_increments_drop_ann() {
     // DropNotice head-start — NOTICED at T (still alive), it dies at T+1 with `t_n =
     // DAYS_PER_TICK = 7` (partial b_ann forgiveness) and bumps the announced-drop counter
     // (C2FARM-3) — NOT the strong b_max reserved for silent loss.
-    let params = DynParams::default();
+    // Р-9: pin V_free=2 (dial) — the PRESSURE (burning) path needs V_ret = V_free ≥ parked for a
+    // κ_O=0 owner; at v_free=0 the same drop would be a burn/drop-EXEMPT Р-7 cap-trim (no burn to observe).
+    let params = params_v_free_pinned();
     let holder = 1usize;
     let owner = 2usize;
     let v = params.block_volume / params.k_eff as f64;
@@ -2721,7 +2739,9 @@ fn cap_trim_does_not_burn_or_count_as_drop() {
     // owner can predict (it knows its own V_ret) — it must NOT burn the holder's reliability
     // capital nor stain the retention forecast. A PRESSURE drop (a real squeeze) still does
     // BOTH — the control alongside it.
-    let params = DynParams::default();
+    // Р-9: pin V_free=2 (dial) — the cap-vs-pressure contrast needs a positive V_free floor
+    // (at v_free=0 the stranger's lone symbol is ALSO over V_ret ⇒ becomes a cap-trim, not a squeeze).
+    let params = params_v_free_pinned();
     let v = params.block_volume / params.k_eff as f64; // F5: 25 gb
     let mut world = mk_clean_world(&params, 5);
 

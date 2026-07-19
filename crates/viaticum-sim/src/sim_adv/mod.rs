@@ -38,6 +38,7 @@
 #[cfg(test)]
 mod tests;
 
+pub mod bootstrap;
 pub mod brier;
 pub mod cli;
 pub mod hetero;
@@ -50,6 +51,7 @@ pub mod runner;
 pub mod scenario;
 pub mod verdict;
 
+pub use bootstrap::{BootstrapStats, collect_bootstrap, mean_over_seeds, run_bootstrap};
 pub use brier::{BrierBucket, BrierReport, Calibration, DEFAULT_BRIER_BUCKETS, IncompleteSummary};
 pub use cli::{Cli, SimAdvError, Sweep, parse_cli};
 pub use hetero::{
