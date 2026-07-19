@@ -14,6 +14,8 @@
 //! sitting here unread. See the 0.1 report for the full list.
 
 use crate::sim_adv::hetero::{DemandClass, DemandMix};
+use crate::sim_adv::tier::TierMix;
+use crate::sim_adv::uptime::UptimeMix;
 use crate::sim_adv::verdict::Invariant;
 use crate::sim_dynamic::engine::DynParams;
 use crate::sim_dynamic::generator::{Archetype, GiverTier};
@@ -67,6 +69,15 @@ pub struct WorldParams {
     /// the world byte-identical to the pre-hetero path; a [`DemandMix::Classes`] mix runs the
     /// hetero layer ([`crate::sim_adv::hetero::apply_demand_classes`]).
     pub demand: DemandMix,
+    /// The per-node UPTIME-PROFILE mix (phase-2a axis 3). [`UptimeMix::Legacy`] (the DEFAULT for
+    /// every pre-2a scenario) assigns no profile ⇒ the archetype iid uptime ⇒ byte-identical;
+    /// [`UptimeMix::Tiered`] installs a P7-tier structural profile per node and turns on the
+    /// per-tier report. See [`crate::sim_adv::uptime`].
+    pub uptime: UptimeMix,
+    /// The tier-share distribution (phase-2a P7 axis 2). [`TierMix::Backbone`] (the DEFAULT) keeps
+    /// `build_world`'s 35/30/25/10 tiers (byte-identical); [`TierMix::Custom`] re-mixes tiers and
+    /// re-shapes each node's disk to its new tier ([`crate::sim_adv::tier::apply_tier_mix`]).
+    pub tier_mix: TierMix,
 }
 
 /// The full scenario (registry entry).

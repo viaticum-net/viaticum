@@ -3,12 +3,14 @@
 //! Usage:
 //!
 //! ```text
-//! sim_adv <scenario> [--seeds N] [--sweep dial=a,b,c] [--csv <file>] [--fast]
+//! sim_adv <scenario> [--seeds N] [--horizon T] [--sweep dial=a,b,c] [--csv <file>] [--fast]
 //! ```
 //!
 //! * `<scenario>` — a registry name (0.1: `honest_v2`).
 //! * `--seeds N` — run N seeds `base, base+1, ...` (base = the scenario's first default
 //!   seed); default = the scenario's seed list.
+//! * `--horizon T` — override the scenario horizon (ticks); a control knob for horizon
+//!   experiments (e.g. the phase-2a 130-vs-520 monotonicity control).
 //! * `--sweep dial=a,b,c` — run the scenario once per dial value and print a sweep table
 //!   (an A/B toggle is the two-value case). Known dials: `block_volume`, `c_recip_days`,
 //!   `depth_w_d`, `preempt_theta`, `v_free_symbols`, `burn_b_ann`, `burn_b_max`.
@@ -40,7 +42,11 @@ fn main() -> ExitCode {
 
 fn run_cli(args: &[String]) -> Result<(), SimAdvError> {
     let cli: Cli = parse_cli(args)?;
-    let scenario = find_scenario(&cli.scenario)?;
+    let mut scenario = find_scenario(&cli.scenario)?;
+    // `--horizon N` control override (phase-2a monotonicity control etc.); deterministic.
+    if let Some(h) = cli.horizon {
+        scenario.horizon = h;
+    }
     let seeds = resolve_seeds(&scenario.seeds, cli.seeds);
 
     if let Some(sweep) = &cli.sweep {

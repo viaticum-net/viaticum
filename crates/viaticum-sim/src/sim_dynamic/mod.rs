@@ -172,6 +172,10 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
         adv: vec![None; n],
         adv_rejoin_count: vec![0; n],
         adv_drop_debt: vec![0.0; n],
+        // World-v3 phase-2a uptime-profile layer: empty (all `None`) by default — the sim_adv
+        // runner fills it opt-in for a tiered scenario. An all-`None` layer keeps `node_online`
+        // / `node_surfaced_in_window` on the exact archetype path (byte-identical honest anchor).
+        uptime: vec![None; n],
     }
 }
 
@@ -420,6 +424,9 @@ fn run_newcomer_probe(
     world.adv.push(None);
     world.adv_rejoin_count.push(0);
     world.adv_drop_debt.push(0.0);
+    // Grow the phase-2a uptime layer in lock-step (the probe newcomer has no profile — honest
+    // archetype uptime; the newcomer probe is not a tiered scenario).
+    world.uptime.push(None);
 
     let mut t_boot_placed: Option<u64> = None;
     let mut t_boot_chosen: Option<u64> = None;

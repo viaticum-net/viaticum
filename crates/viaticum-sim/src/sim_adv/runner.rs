@@ -30,6 +30,7 @@ use crate::sim_adv::predators::{
 };
 use crate::sim_adv::restore::{RestoreTracker, RestoreTruth};
 use crate::sim_adv::scenario::{Event, EventKind, NodeSel, Scenario, ScenarioId};
+use crate::sim_adv::tier::{TierMix, TierReport, apply_tier_mix, tier_report};
 use crate::sim_dynamic::build_world;
 use crate::sim_dynamic::engine::{disaster_strike, step};
 use crate::sim_dynamic::generator::World;
@@ -71,6 +72,10 @@ pub struct RunResult {
     /// scenario (e.g. `honest_v2` / `dr_baseline`); `Some` for a `Classes` mix (`honest_hetero_v2`
     /// / `dr_hetero`) — the per-class placement metrics + the L-footprint curve.
     pub per_seed_hetero: Vec<Option<HeteroReport>>,
+    /// Per-seed per-tier report (phase-2a P7), seed-indexed. `None` for a non-tiered scenario;
+    /// `Some` for a `UptimeMix::Tiered` scenario (`tiered_v1` / `tiered_hetero`) — the per-tier
+    /// floor-completeness / durability / share-A / give↔get served / parked table.
+    pub per_seed_tier: Vec<Option<TierReport>>,
 }
 
 /// All per-seed outputs of one seed run (kept as a struct so the growing set of optional
@@ -89,6 +94,8 @@ pub(crate) struct SeedRun {
     pub adv: Option<AdvMetrics>,
     /// The per-class hetero report for a `Classes`-mix scenario, else `None`.
     pub hetero: Option<HeteroReport>,
+    /// The per-tier report for a TIERED scenario (phase-2a), else `None`.
+    pub tier: Option<TierReport>,
 }
 
 /// A predator run paired with its matched honest twin (same seed, same construction, hooks
@@ -252,6 +259,12 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     let policy = PlacementPolicy::default();
 
     let mut world = build_world(scenario.world.n_nodes, params, seed);
+    // Phase-2a P7 (axis 2): re-mix the tier shares + re-shape each node's disk to its new tier.
+    // `TierMix::Backbone` (the default) leaves `build_world`'s tiers untouched (byte-identical);
+    // a `Custom` mix runs the re-tier. Done FIRST so the demand + uptime layers see the final tier.
+    if let TierMix::Custom(shares) = &scenario.world.tier_mix {
+        apply_tier_mix(&mut world, shares, seed);
+    }
     // Hetero-v2 (D1): assign a per-owner demand class (seeded, archetype-independent) and, for
     // a real hetero mix, rebuild each footprint + reconcile the disk. Uniform ⇒ all M and NOT
     // applied, so the world stays byte-identical to the pre-hetero path (honest anchor frozen).
@@ -264,6 +277,12 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
             params,
             scenario.world.demand.disk_policy(),
         );
+    }
+    // Phase-2a uptime profiles (axis 3): install a per-node structural availability pattern.
+    // `UptimeMix::Legacy` (the default) leaves the layer all-`None` (byte-identical archetype iid);
+    // `Tiered` reads each node's final tier. Done AFTER the tier re-mix (it reads `disk.tier`).
+    if scenario.world.uptime.is_tiered() {
+        world.uptime = scenario.world.uptime.assign(&world);
     }
     // Phase 1: inject the scenario's adversaries (empty ⇒ no-op; honest scenarios stay
     // byte-identical). `Predator` installs the hooks; `Twin` injects the same heavy nodes
@@ -372,6 +391,13 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
         ))
     };
     let hetero = hetero_tracker.map(|ht| ht.finalize(&world));
+    // Phase-2a: the per-tier report — only for a tiered scenario (keeps every other scenario's
+    // report byte-identical, `None`). A pure end-of-run god-view read (no per-tick tracker).
+    let tier = if scenario.world.uptime.is_tiered() {
+        Some(tier_report(&world))
+    } else {
+        None
+    };
     SeedRun {
         metrics: collect_metrics(&world, params),
         fired,
@@ -379,6 +405,7 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
         calib,
         adv,
         hetero,
+        tier,
     }
 }
 
@@ -427,12 +454,14 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
     let mut per_seed_calibration = Vec::with_capacity(outcomes.len());
     let mut per_seed_adv = Vec::with_capacity(outcomes.len());
     let mut per_seed_hetero = Vec::with_capacity(outcomes.len());
+    let mut per_seed_tier = Vec::with_capacity(outcomes.len());
     for (sr, twin_adv) in outcomes {
         per_seed.push(sr.metrics);
         fired.push(sr.fired);
         per_seed_restore.push(sr.restore);
         per_seed_calibration.push(sr.calib);
         per_seed_hetero.push(sr.hetero);
+        per_seed_tier.push(sr.tier);
         per_seed_adv.push(match (sr.adv, twin_adv) {
             (Some(pred), Some(twin)) => Some(AdvPair { pred, twin }),
             _ => None,
@@ -448,6 +477,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_calibration,
         per_seed_adv,
         per_seed_hetero,
+        per_seed_tier,
     }
 }
 

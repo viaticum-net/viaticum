@@ -14,6 +14,8 @@ use crate::sim_adv::scenario::{
     AdvDials, AdvId, AdvSpec, Event, InfoModel, MetricId, NodeSel, Scenario, ScenarioId,
     WorldParams,
 };
+use crate::sim_adv::tier::{TierMix, TierReport};
+use crate::sim_adv::uptime::UptimeMix;
 use crate::sim_adv::verdict::{Direction, Invariant, InvariantSpec};
 use crate::sim_dynamic::engine::DynParams;
 use crate::sim_dynamic::generator::{Archetype, GiverTier};
@@ -34,7 +36,22 @@ pub fn all_scenarios() -> Vec<Scenario> {
         honest_hetero_v2(),
         honest_hetero_hard(),
         dr_hetero(),
+        tiered_v1(),
+        tiered_hetero(),
+        tiered_hetero_hard(),
     ]
+}
+
+/// The phase-2a P7 tier-share population guess (`4r_p2a_spec.md` §1): T1 15% / T2 25% / T3 40% /
+/// T4 20% — laptops the plurality, NAS the minority (a realistic population of would-be givers,
+/// distinct from `build_world`'s NAS-heavy 35/30/25/10 backbone). Shared by the tiered scenarios.
+fn tiered_mix() -> TierMix {
+    TierMix::Custom(vec![
+        (GiverTier::T1, 0.15),
+        (GiverTier::T2, 0.25),
+        (GiverTier::T3, 0.40),
+        (GiverTier::T4, 0.20),
+    ])
 }
 
 /// The hetero-v2 demand mix (D1): S 60% / M 30% / L 10% — a long tail of small owners with a
@@ -85,6 +102,8 @@ pub fn honest_v2() -> Scenario {
             restore_window_days: RESTORE_WINDOW_DAYS,
             restore_bw_gb_day: RESTORE_BW_GB_DAY,
             demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
         },
         // The engine's canonical §3 mixes (documented for the report header).
         population: vec![
@@ -136,6 +155,8 @@ pub fn dr_baseline() -> Scenario {
             restore_window_days: RESTORE_WINDOW_DAYS,
             restore_bw_gb_day: RESTORE_BW_GB_DAY,
             demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -179,6 +200,8 @@ pub fn a1_whale() -> Scenario {
             restore_window_days: RESTORE_WINDOW_DAYS,
             restore_bw_gb_day: RESTORE_BW_GB_DAY,
             demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -225,6 +248,8 @@ pub fn a4_whitewasher() -> Scenario {
             restore_window_days: RESTORE_WINDOW_DAYS,
             restore_bw_gb_day: RESTORE_BW_GB_DAY,
             demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -283,6 +308,8 @@ pub fn a2_dropper() -> Scenario {
             restore_window_days: RESTORE_WINDOW_DAYS,
             restore_bw_gb_day: RESTORE_BW_GB_DAY,
             demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -334,6 +361,8 @@ pub fn honest_hetero_v2() -> Scenario {
             restore_window_days: RESTORE_WINDOW_DAYS,
             restore_bw_gb_day: RESTORE_BW_GB_DAY,
             demand: hetero_mix(DiskPolicy::Grow),
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -368,6 +397,8 @@ pub fn honest_hetero_hard() -> Scenario {
             restore_window_days: RESTORE_WINDOW_DAYS,
             restore_bw_gb_day: RESTORE_BW_GB_DAY,
             demand: hetero_mix(DiskPolicy::Fixed),
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -403,6 +434,8 @@ pub fn dr_hetero() -> Scenario {
             restore_window_days: RESTORE_WINDOW_DAYS,
             restore_bw_gb_day: RESTORE_BW_GB_DAY,
             demand: hetero_mix(DiskPolicy::Grow),
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -439,9 +472,154 @@ pub fn dr_hetero() -> Scenario {
     }
 }
 
+/// The phase-2a HONEST TIERED world (`4r_p2a_spec.md` §3): the v2 world with the P7 tier population
+/// (15/25/40/20) + a STRUCTURAL uptime profile per tier (T1 24/7, T2/T3 diurnal, T4 ragged) over a
+/// LONG 520-tick (10-year) horizon. Measures the per-tier report — "who gets what in the network of
+/// givers" (floor-completeness / durability / share A>0 / give↔get served / parked). No adversaries,
+/// no disasters (DR is 2b, blocked). n = 180: enough per-tier owners (T1 ≈ 27 … T3 ≈ 72) for the
+/// give↔get rank to clear the multi-seed power gate.
+///
+/// EXPECTED honest finding (report, do not tune): the network DEPOPULATES over 520 ticks (churn has
+/// no rejoin — cooperative survival (1−0.002)^520 ≈ 0.35), so the steady-state columns thin toward
+/// the horizon; floor-completeness is measured over the tier's LIFETIME owners (monotone), which
+/// stays robust. If floor-completeness SATURATES across tiers the P7 gradient lives in
+/// durability/parked — a finding, not a threshold to move.
+pub fn tiered_v1() -> Scenario {
+    Scenario {
+        id: ScenarioId("tiered_v1"),
+        about: "P7 tiered honest world (15/25/40/20 tiers × 24-7/diurnal/ragged uptime) over 520 ticks — per-tier 'who gets what' (no DR, no predators)",
+        world: WorldParams {
+            n_nodes: 180,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
+            uptime: UptimeMix::Tiered,
+            tier_mix: tiered_mix(),
+        },
+        population: honest_v2().population,
+        tiers: vec![
+            (GiverTier::T1, 0.15),
+            (GiverTier::T2, 0.25),
+            (GiverTier::T3, 0.40),
+            (GiverTier::T4, 0.20),
+        ],
+        adversaries: Vec::new(),
+        events: Vec::new(),
+        // 520 weekly ticks ≈ 10 years (spec §3: the long horizon the profiles need to bite).
+        horizon: 520,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![
+            MetricId::TierReport,
+            MetricId::Extraction,
+            MetricId::InvariantBoard,
+        ],
+        verdicts: tiered_invariants(),
+        // Long horizon ⇒ NOT a fast-mode member (nightly / on-demand only).
+        fast: false,
+    }
+}
+
+/// The phase-2a TIERED × HETERO world — LIGHT regime (`4r_p2a_spec.md` §3): `tiered_v1` PLUS the
+/// hetero-v2 demand classes (S 60% / M 30% / L 10%), so the big footprint is a POPULATION member,
+/// not a single measured lock. Same 180 nodes, 520 ticks, tier population + uptime profiles.
+///
+/// **[`DiskPolicy::Grow`] (LIGHT).** WARN-1 (review): under `Grow` a big archive keeps the tier's
+/// own:free ratio, so its device cap GROWS with the source — and a T4 owner already keeps
+/// `own_to_free_centre = 0.50` (≈ 67 % free). So the "full phone with a big footprint" (T4 × L)
+/// does NOT actually sit FULL here — it has ample lendable disk. This is the light co-report; the
+/// SHARP "full device" test is [`tiered_hetero_hard`] ([`DiskPolicy::Fixed`]), where the L source
+/// on an unchanged device genuinely eats the disk.
+pub fn tiered_hetero() -> Scenario {
+    Scenario {
+        id: ScenarioId("tiered_hetero"),
+        about: "P7 tiered world × hetero demand classes (S/M/L footprints) over 520 ticks — the T4×L 'full phone with a big footprint' now in the population",
+        world: WorldParams {
+            n_nodes: 180,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: hetero_mix(DiskPolicy::Grow),
+            uptime: UptimeMix::Tiered,
+            tier_mix: tiered_mix(),
+        },
+        population: honest_v2().population,
+        tiers: vec![
+            (GiverTier::T1, 0.15),
+            (GiverTier::T2, 0.25),
+            (GiverTier::T3, 0.40),
+            (GiverTier::T4, 0.20),
+        ],
+        adversaries: Vec::new(),
+        events: Vec::new(),
+        horizon: 520,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![
+            MetricId::TierReport,
+            MetricId::Extraction,
+            MetricId::InvariantBoard,
+        ],
+        verdicts: tiered_invariants(),
+        fast: false,
+    }
+}
+
+/// The phase-2a TIERED × HETERO world — HARD regime (WARN-1 fix, the SHARP "full phone" test):
+/// identical to [`tiered_hetero`] (same 15/25/40/20 tiers, S/M/L classes, uptime profiles, 180
+/// nodes, 520 ticks, seeds, and the SAME frozen [`tiered_invariants`] board) EXCEPT the demand disk
+/// policy is [`DiskPolicy::Fixed`] — the device cap stays at `build_world` size for every class. A
+/// T4 × L owner (a phone with a big archive) then has its L source (× 10/3) eat its UNCHANGED disk,
+/// truncated at the cap when it overflows: little lendable free ⇒ little κ_O ⇒ V_ret near V_free.
+/// This is where the "забитый телефон" of `4r_p2a_spec.md` §1/§3 actually sits FULL in the
+/// population. Any outcome is informative — a hard T4/L floor-completeness collapse is the real
+/// credit-lock finding (report, do NOT tune).
+pub fn tiered_hetero_hard() -> Scenario {
+    Scenario {
+        id: ScenarioId("tiered_hetero_hard"),
+        about: "P7 tiered world × hetero classes on a FIXED ordinary device (T4×L 'full phone with a big footprint' actually FULL) over 520 ticks — the SHARP credit-lock test (WARN-1)",
+        world: WorldParams {
+            n_nodes: 180,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: hetero_mix(DiskPolicy::Fixed),
+            uptime: UptimeMix::Tiered,
+            tier_mix: tiered_mix(),
+        },
+        population: honest_v2().population,
+        tiers: vec![
+            (GiverTier::T1, 0.15),
+            (GiverTier::T2, 0.25),
+            (GiverTier::T3, 0.40),
+            (GiverTier::T4, 0.20),
+        ],
+        adversaries: Vec::new(),
+        events: Vec::new(),
+        horizon: 520,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![
+            MetricId::TierReport,
+            MetricId::Extraction,
+            MetricId::InvariantBoard,
+        ],
+        verdicts: tiered_invariants(),
+        fast: false,
+    }
+}
+
 /// Reliable's extraction ROI (Reliable is index 0 in `Archetype::ALL`).
 fn reliable_roi(m: &MetricSet) -> f64 {
     m.extraction_roi[0]
+}
+
+/// INV-TIER-GIVERS scalar: the smallest adjacent floor-completeness step over the tier rank.
+fn tier_giver_gap(t: &TierReport) -> f64 {
+    t.min_adjacent_giver_gap()
+}
+
+/// INV-TIER-T1-ALIVE scalar: the T1-NAS floor-completeness (the "backbone does not starve" sanity).
+fn tier_t1_floor(t: &TierReport) -> f64 {
+    t.t1_floor_completeness()
 }
 
 /// The L-class NO-STARVATION ratio: the big footprint's floor-completeness relative to the
@@ -811,6 +989,53 @@ fn honest_hetero_hard_invariants() -> Vec<Invariant> {
                 dir: Direction::GreaterThan,
             },
             threshold: 0.75,
+        },
+    ]
+}
+
+/// The phase-2a tiered board (shared by `tiered_v1` / `tiered_hetero`): the two structural rows +
+/// INV-TIER-GIVERS (the P7 give↔get rank) + INV-TIER-T1-ALIVE (the backbone sanity floor). Both
+/// thresholds are FROZEN here BEFORE any tiered run (anti-Goodhart, `4r_p2a_spec.md` §3).
+fn tiered_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-TIER-GIVERS (P7 §4 п.7): the RANK of what each tier RECEIVES (floor-completeness)
+        // tracks the rank of what it can GIVE — T1 ≥ T2 ≥ T3 ≥ T4. The scalar is the smallest
+        // adjacent floor-completeness STEP (`min_adjacent_giver_gap`); the row PASSES iff no
+        // adjacent tier inverts by more than `TIER_RANK_MARGIN = 0.05` ⇒ threshold −0.05,
+        // GreaterThan (mean gap > −0.05). Comparative on purpose: if floor-completeness saturates
+        // (all ≈ 1, `floor_ever_met` monotone) the gap ≈ 0 with σ ≈ 0 ⇒ decisive PASS, and the
+        // real gradient is read off durability/parked in the table (a FINDING, not a tuned bar). A
+        // genuine inversion (a lower tier out-placing a higher one by > 5 pp) FAILS — that is a real
+        // finding to report, not to hide. (power<2 ⇒ INCONCLUSIVE, spec §10 п.16.)
+        Invariant {
+            id: "INV-TIER-GIVERS",
+            spec: InvariantSpec::TierStatistical {
+                measure: tier_giver_gap,
+                dir: Direction::GreaterThan,
+            },
+            threshold: -0.05,
+        },
+        // INV-TIER-T1-ALIVE (P7 sanity, §3 "T1-NAS не голодает"): the always-on NAS backbone must
+        // reach floor on essentially all of its data. FROZEN at 0.90 (a round "FAIL if > 10% of the
+        // backbone's data never places" gate) before the run — the T1 24/7 tier is the DR-primary
+        // core, and if IT starves the whole giver network is broken. GreaterThan, power-gated.
+        Invariant {
+            id: "INV-TIER-T1-ALIVE",
+            spec: InvariantSpec::TierStatistical {
+                measure: tier_t1_floor,
+                dir: Direction::GreaterThan,
+            },
+            threshold: 0.90,
         },
     ]
 }

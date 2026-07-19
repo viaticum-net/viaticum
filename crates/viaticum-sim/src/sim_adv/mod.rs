@@ -49,6 +49,8 @@ pub mod report;
 pub mod restore;
 pub mod runner;
 pub mod scenario;
+pub mod tier;
+pub mod uptime;
 pub mod verdict;
 
 pub use bootstrap::{BootstrapStats, collect_bootstrap, mean_over_seeds, run_bootstrap};
@@ -67,4 +69,6 @@ pub use scenario::{
     AdvAction, AdvContext, AdvDials, AdvId, AdvRole, AdvSpec, BehaviorHook, Event, EventKind,
     InfoModel, MetricId, NodeSel, Scenario, ScenarioId, WorldParams,
 };
+pub use tier::{TierMetrics, TierMix, TierReport, apply_tier_mix, tier_report};
+pub use uptime::{UptimeMix, UptimeProfile, tier_profile};
 pub use verdict::{Direction, Invariant, InvariantSpec, Verdict, VerdictKind, evaluate_board};

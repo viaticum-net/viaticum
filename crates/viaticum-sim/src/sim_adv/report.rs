@@ -14,6 +14,8 @@ use crate::sim_adv::metrics::{MetricSet, mean_sigma};
 use crate::sim_adv::restore::{IOTA_BUCKETS, RestoreTruth};
 use crate::sim_adv::runner::{RunResult, SweepRow};
 use crate::sim_adv::scenario::Scenario;
+use crate::sim_adv::tier::{TIER_ORDER, TierReport, tier_index};
+use crate::sim_adv::uptime::tier_profile;
 use crate::sim_adv::verdict::Verdict;
 use crate::sim_dynamic::generator::Archetype;
 
@@ -121,6 +123,11 @@ pub fn format_report(scenario: &Scenario, result: &RunResult, verdicts: &[Verdic
 
     // --- hetero-v2 (D1): per-class placement + the L-footprint curve ---
     if let Some(section) = format_hetero(result) {
+        o.push_str(&section);
+    }
+
+    // --- phase-2a P7: the per-tier "who gets what in the network of givers" table ---
+    if let Some(section) = format_tier(result) {
         o.push_str(&section);
     }
 
@@ -630,6 +637,109 @@ fn format_hetero(result: &RunResult) -> Option<String> {
     }
     let _ = writeln!(o);
     Some(o)
+}
+
+/// Mean±σ of one tier-report scalar across the seeds (seeds with no tier report → `NaN`, skipped).
+fn tcol(result: &RunResult, f: impl Fn(&TierReport) -> f64) -> (f64, f64) {
+    let vals: Vec<f64> = result
+        .per_seed_tier
+        .iter()
+        .map(|t| t.as_ref().map(&f).unwrap_or(f64::NAN))
+        .collect();
+    mean_sigma(&vals)
+}
+
+/// Render the phase-2a P7 per-tier table: "who gets what in the network of givers" (`4r_p2a_spec.md`
+/// §3). Columns per tier (T1..T4): the assigned uptime profile, present/total owners, the RECEIVED
+/// facts (floor-completeness, durability, share A>0, mean parked gb, mean inbound served) and the
+/// GIVEN / balance facts (mean outbound served, extraction = received/given). `None` when no seed
+/// carried a tier report (a non-tiered scenario). mean±σ over seeds; σ = "—" for < 2 finite seeds.
+fn format_tier(result: &RunResult) -> Option<String> {
+    if !result.per_seed_tier.iter().any(|t| t.is_some()) {
+        return None;
+    }
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "-- phase-2a P7 per-tier report: what each giver tier RECEIVES (mean ± σ over seeds) --"
+    );
+    let _ = writeln!(
+        o,
+        "  (floor_complete = FROZEN board metric over ALL owners; fc_stayers = NOTE-c diagnostic over present-at-horizon owners)"
+    );
+    let _ = writeln!(
+        o,
+        "  {:<4} {:<11} {:>9} {:>15} {:>13} {:>11} {:>12} {:>11}",
+        "tier",
+        "uptime",
+        "owners",
+        "floor_complete",
+        "fc_stayers",
+        "durability",
+        "share A>0",
+        "parked gb",
+    );
+    for &t in &TIER_ORDER {
+        let ti = tier_index(t);
+        let profile = tier_profile(t).label();
+        let (tot, _) = tcol(result, |r| r.tier[ti].n_owners_total as f64);
+        let (pres, _) = tcol(result, |r| r.tier[ti].n_owners_present as f64);
+        let (fc, fcs) = tcol(result, |r| r.tier[ti].floor_completeness);
+        let (fs, fss) = tcol(result, |r| r.tier[ti].floor_completeness_stayers);
+        let (du, dus) = tcol(result, |r| r.tier[ti].durability);
+        let (sa, sas) = tcol(result, |r| r.tier[ti].share_a_pos);
+        let (pk, pks) = tcol(result, |r| r.tier[ti].mean_parked_gb);
+        let _ = writeln!(
+            o,
+            "  {:<4} {:<11} {:>4.0}/{:<4.0} {:>15} {:>13} {:>11} {:>12} {:>11}",
+            tier_name(t),
+            profile,
+            pres,
+            tot,
+            ms_cell(fc, fcs, 3),
+            ms_cell(fs, fss, 3),
+            ms_cell(du, dus, 2),
+            ms_cell(sa, sas, 1),
+            ms_cell(pk, pks, 1),
+        );
+    }
+    // The give↔get balance row set (received / given served integrals + extraction ratio).
+    let _ = writeln!(
+        o,
+        "  give↔get (served gb·d integral per present owner | extraction = received/given):"
+    );
+    let _ = writeln!(
+        o,
+        "  {:<4} {:>18} {:>18} {:>14}",
+        "tier", "received (in)", "given (out)", "extraction",
+    );
+    for &t in &TIER_ORDER {
+        let ti = tier_index(t);
+        let (inb, inbs) = tcol(result, |r| r.tier[ti].mean_inbound_served);
+        let (out, outs) = tcol(result, |r| r.tier[ti].mean_outbound_served);
+        let (ex, exs) = tcol(result, |r| r.tier[ti].extraction);
+        let _ = writeln!(
+            o,
+            "  {:<4} {:>18} {:>18} {:>14}",
+            tier_name(t),
+            ms_cell(inb, inbs, 1),
+            ms_cell(out, outs, 1),
+            ms_cell(ex, exs, 3),
+        );
+    }
+    let _ = writeln!(o);
+    Some(o)
+}
+
+/// Short tier label for the report.
+fn tier_name(t: crate::sim_dynamic::generator::GiverTier) -> &'static str {
+    use crate::sim_dynamic::generator::GiverTier;
+    match t {
+        GiverTier::T1 => "T1",
+        GiverTier::T2 => "T2",
+        GiverTier::T3 => "T3",
+        GiverTier::T4 => "T4",
+    }
 }
 
 /// Render the R̂-calibration section (transche 0.3 judge, WARN-1). Pools every seed's resolved

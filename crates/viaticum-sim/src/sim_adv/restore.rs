@@ -45,7 +45,7 @@ use std::collections::BTreeMap;
 
 use crate::sim_adv::hetero::DemandClass;
 use crate::sim_adv::scenario::WorldParams;
-use crate::sim_dynamic::generator::{DAYS_PER_TICK, GiverTier, World, online};
+use crate::sim_dynamic::generator::{DAYS_PER_TICK, GiverTier, World};
 
 /// The iota buckets the report slices restore-truth by (detail §3.1). Half-open on the
 /// low edge, the top bucket closed at 1.0.
@@ -328,11 +328,14 @@ impl RestoreTracker {
                 if tb.collectable.contains_key(&holder) {
                     continue; // already grabbed on an earlier window tick (Model U)
                 }
+                // Routed through `node_online` so a phase-2a uptime profile gates restore
+                // transport too (a ragged/seasonal holder is reachable less often in the window);
+                // falls through to the exact `online` on the honest path.
                 let sym = node
                     .holdings
                     .iter()
                     .find(|s| s.alive && s.owner == tb.owner && s.block == tb.block_id)
-                    .filter(|_| online(node.archetype, node.id, tick, world.seed));
+                    .filter(|_| world.node_online(holder, tick));
                 if let Some(s) = sym {
                     let c = Collectable {
                         cream: s.cream,

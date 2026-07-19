@@ -21,6 +21,7 @@ use crate::sim_adv::predators::AdvMetrics;
 use crate::sim_adv::restore::RestoreTruth;
 use crate::sim_adv::runner::{RunResult, run_one_seed};
 use crate::sim_adv::scenario::Scenario;
+use crate::sim_adv::tier::TierReport;
 
 /// A three-valued verdict (spec §10 п.16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +112,15 @@ pub enum InvariantSpec {
         /// The pass direction.
         dir: Direction,
     },
+    /// A phase-2a per-TIER scalar → mean±σ vs threshold, power<2 gate. Reads the per-seed
+    /// [`TierReport`] from [`RunResult::per_seed_tier`]; seeds with no tier report contribute
+    /// `NaN` (skipped). Used by INV-TIER-GIVERS (the P7 give↔get rank) + the T1 sanity floor.
+    TierStatistical {
+        /// Extract the invariant's scalar from one seed's tier report.
+        measure: fn(&TierReport) -> f64,
+        /// The pass direction.
+        dir: Direction,
+    },
 }
 
 /// One invariant-board row spec.
@@ -156,6 +166,10 @@ impl Clone for Invariant {
                         dir: *dir,
                     }
                 }
+                InvariantSpec::TierStatistical { measure, dir } => InvariantSpec::TierStatistical {
+                    measure: *measure,
+                    dir: *dir,
+                },
             },
             threshold: self.threshold,
         }
@@ -314,7 +328,18 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             Some(None) => sr.hetero.is_none(),
                             None => true,
                         };
-                        metrics_eq && restore_eq && calib_eq && adv_eq && hetero_eq
+                        // The per-tier report (phase-2a) must re-run bit-identical too — it feeds
+                        // the tier table + the INV-TIER-GIVERS / INV-TIER-T1-ALIVE verdicts.
+                        let tier_eq = match result.per_seed_tier.first() {
+                            Some(Some(t0)) => sr
+                                .tier
+                                .as_ref()
+                                .map(|t1| crate::sim_adv::tier::bit_eq(t0, t1))
+                                .unwrap_or(false),
+                            Some(None) => sr.tier.is_none(),
+                            None => true,
+                        };
+                        metrics_eq && restore_eq && calib_eq && adv_eq && hetero_eq && tier_eq
                     }
                     None => false,
                 };
@@ -409,6 +434,25 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                     threshold: inv.threshold,
                     power,
                     note: "hetero: per-class placement (no starvation)",
+                }
+            }
+            InvariantSpec::TierStatistical { measure, dir } => {
+                let vals: Vec<f64> = result
+                    .per_seed_tier
+                    .iter()
+                    .map(|t| t.as_ref().map(measure).unwrap_or(f64::NAN))
+                    .collect();
+                let (mean, sigma) = mean_sigma(&vals);
+                let sigma_r = if sigma.is_finite() { sigma } else { 0.0 };
+                let (kind, power) = decide(mean, sigma, inv.threshold, *dir);
+                Verdict {
+                    id: inv.id,
+                    kind,
+                    effect: mean,
+                    sigma: sigma_r,
+                    threshold: inv.threshold,
+                    power,
+                    note: "tier: P7 give↔get rank (T1 ≥ T2 ≥ T3 ≥ T4)",
                 }
             }
         })

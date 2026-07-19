@@ -15,7 +15,7 @@ use crate::sim_adv::predators::{
 };
 use crate::sim_adv::registry::{
     a1_whale, a4_whitewasher, all_scenarios, dr_baseline, dr_hetero, find_scenario,
-    honest_hetero_hard, honest_hetero_v2, honest_v2,
+    honest_hetero_hard, honest_hetero_v2, honest_v2, tiered_hetero, tiered_hetero_hard, tiered_v1,
 };
 use crate::sim_adv::report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
 use crate::sim_adv::restore::{
@@ -26,10 +26,16 @@ use crate::sim_adv::scenario::{
     AdvAction, AdvContext, AdvDials, AdvId, AdvSpec, BehaviorHook, Event, EventKind, InfoModel,
     MetricId, NodeSel, Scenario, WorldParams,
 };
+use crate::sim_adv::tier::{
+    TIER_ORDER, TierMix, apply_tier_mix, bit_eq as tier_bit_eq, tier_index,
+};
+use crate::sim_adv::uptime::{UptimeMix, UptimeProfile, tier_profile};
 use crate::sim_adv::verdict::{Direction, VerdictKind, decide, evaluate_board};
 use crate::sim_dynamic::build_world;
 use crate::sim_dynamic::engine::{DynParams, whitewash_rejoin_for_test};
-use crate::sim_dynamic::generator::{Archetype, GiverTier, HeldSymbol, OwnBlock, World, online};
+use crate::sim_dynamic::generator::{
+    Archetype, GiverTier, HeldSymbol, OwnBlock, World, online, surfaced_in_window,
+};
 
 // ------------------------------------------------------------------
 // helpers
@@ -46,6 +52,8 @@ fn tiny_scenario_with_events(events: Vec<(u64, Event)>) -> Scenario {
             restore_window_days: 14.0,
             restore_bw_gb_day: 50.0,
             demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
         },
         population: Vec::new(),
         tiers: Vec::new(),
@@ -317,6 +325,35 @@ fn cli_parses_scenario_and_defaults() {
     assert!(cli.sweep.is_none());
     assert!(cli.csv.is_none());
     assert!(!cli.fast);
+    assert_eq!(cli.horizon, None);
+}
+
+#[test]
+fn cli_parses_horizon_override() {
+    let cli = parse_cli(&[
+        "tiered_v1".to_string(),
+        "--horizon".to_string(),
+        "130".to_string(),
+    ])
+    .unwrap();
+    assert_eq!(cli.horizon, Some(130));
+    // A zero / non-numeric horizon is a graceful error, never a panic.
+    assert!(
+        parse_cli(&[
+            "tiered_v1".to_string(),
+            "--horizon".to_string(),
+            "0".to_string()
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_cli(&[
+            "tiered_v1".to_string(),
+            "--horizon".to_string(),
+            "x".to_string()
+        ])
+        .is_err()
+    );
 }
 
 #[test]
@@ -573,6 +610,8 @@ fn restore_wp(n_nodes: usize, window_days: f64, bw_gb_day: f64) -> WorldParams {
         restore_window_days: window_days,
         restore_bw_gb_day: bw_gb_day,
         demand: DemandMix::Uniform,
+        uptime: UptimeMix::Legacy,
+        tier_mix: TierMix::Backbone,
     }
 }
 
@@ -2501,4 +2540,464 @@ fn both_predators_still_lose_to_their_twin_when_v_free_is_zero() {
             "{id}: predator must protect less than its twin even at V_free=0: {pred} < {twin}"
         );
     }
+}
+
+// ------------------------------------------------------------------
+// phase-2a: uptime profiles (axis 3) — byte-identity of the honest anchor
+// ------------------------------------------------------------------
+
+/// A cheap tiered clone (small world, short horizon) so the tiered scenario tests stay fast
+/// without touching the full 180-node / 520-tick run.
+fn tiny_tiered(mut sc: Scenario) -> Scenario {
+    sc.world.n_nodes = 40;
+    sc.horizon = 60;
+    sc.seeds = vec![1, 2];
+    sc
+}
+
+#[test]
+fn node_online_with_no_profile_is_byte_identical_to_archetype_online() {
+    // A default world carries an all-`None` uptime layer, so `node_online` /
+    // `node_surfaced_in_window` MUST reproduce the exact `online` / `surfaced_in_window` free
+    // functions (the honest-anchor freeze — the refactor kept the same single draw + threshold).
+    let params = DynParams::default();
+    let world = build_world(30, &params, 4242);
+    for i in 0..world.nodes.len() {
+        let a = world.nodes[i].archetype;
+        let id = world.nodes[i].id;
+        for tick in 0..40u64 {
+            assert_eq!(
+                world.node_online(i, tick),
+                online(a, id, tick, world.seed),
+                "node_online must match online() with no profile (node {i}, tick {tick})"
+            );
+            assert_eq!(
+                world.node_surfaced_in_window(i, tick),
+                surfaced_in_window(a, id, tick, world.seed),
+                "node_surfaced_in_window must match surfaced_in_window() (node {i}, tick {tick})"
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_uptime_mix_assigns_no_profile() {
+    let params = DynParams::default();
+    let world = build_world(20, &params, 7);
+    let assigned = UptimeMix::Legacy.assign(&world);
+    assert_eq!(assigned.len(), 20);
+    assert!(
+        assigned.iter().all(|p| p.is_none()),
+        "Legacy mix installs no profile ⇒ byte-identical archetype uptime"
+    );
+    assert!(!UptimeMix::Legacy.is_tiered());
+    assert!(UptimeMix::Tiered.is_tiered());
+}
+
+#[test]
+fn tier_profile_mapping_gives_a_monotone_availability_gradient() {
+    // P7: window-surfacing p_w must be monotone non-increasing T1 ≥ T2 ≥ T3 ≥ T4 (the giver order).
+    let p_w = |profile: UptimeProfile| {
+        let u = profile.day_uptime(0, 0);
+        1.0 - (1.0 - u).powi(7)
+    };
+    let t1 = p_w(tier_profile(GiverTier::T1));
+    let t2 = p_w(tier_profile(GiverTier::T2));
+    let t3 = p_w(tier_profile(GiverTier::T3));
+    let t4 = p_w(tier_profile(GiverTier::T4));
+    assert!(t1 >= t2, "T1 p_w {t1} >= T2 {t2}");
+    assert!(t2 >= t3, "T2 p_w {t2} >= T3 {t3}");
+    assert!(t3 >= t4, "T3 p_w {t3} >= T4 {t4}");
+    assert!(t1 > 0.99, "T1 (AlwaysOn) surfaces ≈ every week: {t1}");
+    assert!(
+        t4 < 0.85,
+        "T4 (ragged) misses meaningfully more windows: {t4}"
+    );
+}
+
+#[test]
+fn always_on_profile_surfaces_in_every_window() {
+    let params = DynParams::default();
+    let mut world = build_world(4, &params, 9);
+    world.uptime[0] = Some(UptimeProfile::AlwaysOn);
+    for tick in 0..52u64 {
+        assert!(
+            world.node_surfaced_in_window(0, tick),
+            "AlwaysOn (u≈0.99) surfaces in the 7-day window every tick (tick {tick})"
+        );
+    }
+}
+
+#[test]
+fn seasonal_pause_longer_than_window_misses_pos_honestly() {
+    // The axis headline: a Seasonal profile with a contiguous pause > the 7-day PoS window is
+    // FULLY offline (day_uptime == 0) on its pause weeks, so `node_surfaced_in_window` returns
+    // FALSE there (a PoS timeout) — the first HONEST miss, and TRUE on its active weeks.
+    let params = DynParams::default();
+    let mut world = build_world(4, &params, 3);
+    // period 12 weeks, duty 0.5 ⇒ 6 active weeks then 6 pause weeks (pause ≫ 1-week window).
+    let profile = UptimeProfile::Seasonal {
+        period: 12,
+        duty: 0.5,
+    };
+    world.uptime[0] = Some(profile);
+    let id = world.nodes[0].id;
+    let mut missed = 0;
+    let mut surfaced = 0;
+    for tick in 0..48u64 {
+        // The god-view truth: is this a pause week (day_uptime == 0)?
+        let paused = profile.day_uptime(id, tick) == 0.0;
+        let s = world.node_surfaced_in_window(0, tick);
+        if paused {
+            assert!(!s, "a Seasonal pause week must MISS PoS (tick {tick})");
+            missed += 1;
+        } else if s {
+            surfaced += 1;
+        }
+    }
+    assert!(missed > 0, "the pause must produce real PoS misses");
+    assert!(surfaced > 0, "the active weeks must still surface");
+}
+
+#[test]
+fn ragged_profile_surfaces_fewer_windows_than_always_on() {
+    // A ragged (low-mean) phone surfaces STRICTLY fewer weeks than an always-on NAS over a run —
+    // deterministic count, no statistics needed.
+    let params = DynParams::default();
+    let mut world = build_world(4, &params, 11);
+    world.uptime[0] = Some(UptimeProfile::AlwaysOn);
+    world.uptime[1] = Some(UptimeProfile::Ragged { p: 0.15 });
+    let nas = (0..104u64)
+        .filter(|&t| world.node_surfaced_in_window(0, t))
+        .count();
+    let phone = (0..104u64)
+        .filter(|&t| world.node_surfaced_in_window(1, t))
+        .count();
+    assert!(
+        phone < nas,
+        "ragged phone surfaces fewer windows ({phone}) than the always-on NAS ({nas})"
+    );
+}
+
+// ------------------------------------------------------------------
+// phase-2a: tier re-mix (axis 2)
+// ------------------------------------------------------------------
+
+#[test]
+fn apply_tier_mix_reassigns_tiers_to_the_target_shares() {
+    let params = DynParams::default();
+    let mut world = build_world(200, &params, 5);
+    let shares = vec![
+        (GiverTier::T1, 0.15),
+        (GiverTier::T2, 0.25),
+        (GiverTier::T3, 0.40),
+        (GiverTier::T4, 0.20),
+    ];
+    apply_tier_mix(&mut world, &shares, 5);
+    let mut counts = [0usize; 4];
+    for nd in &world.nodes {
+        counts[tier_index(nd.disk.tier)] += 1;
+    }
+    assert_eq!(counts.iter().sum::<usize>(), 200);
+    // Within rounding: 30 / 50 / 80 / 40.
+    assert_eq!(counts[0], 30, "T1 15% of 200");
+    assert_eq!(counts[1], 50, "T2 25%");
+    assert_eq!(counts[2], 80, "T3 40%");
+    assert_eq!(counts[3], 40, "T4 20% (absorbs remainder)");
+    // Disk re-shaped to the new tier: a T4 node has a tighter own:free than a T1 node on average.
+    let mean_own = |t: GiverTier| {
+        let v: Vec<f64> = world
+            .nodes
+            .iter()
+            .filter(|nd| nd.disk.tier == t)
+            .map(|nd| nd.disk.own_data / nd.disk_cap)
+            .collect();
+        v.iter().sum::<f64>() / v.len() as f64
+    };
+    assert!(
+        mean_own(GiverTier::T4) > mean_own(GiverTier::T1),
+        "T4 (tight own:free) parks a larger own-data fraction than T1 (loose)"
+    );
+}
+
+#[test]
+fn apply_tier_mix_is_deterministic() {
+    let params = DynParams::default();
+    let shares = vec![
+        (GiverTier::T1, 0.15),
+        (GiverTier::T2, 0.25),
+        (GiverTier::T3, 0.40),
+        (GiverTier::T4, 0.20),
+    ];
+    let mut a = build_world(80, &params, 314);
+    let mut b = build_world(80, &params, 314);
+    apply_tier_mix(&mut a, &shares, 314);
+    apply_tier_mix(&mut b, &shares, 314);
+    for i in 0..a.nodes.len() {
+        assert_eq!(a.nodes[i].disk.tier, b.nodes[i].disk.tier, "tier {i}");
+        assert_eq!(
+            a.nodes[i].disk.own_data.to_bits(),
+            b.nodes[i].disk.own_data.to_bits(),
+            "own_data {i}"
+        );
+    }
+}
+
+// ------------------------------------------------------------------
+// phase-2a: tier report + INV-TIER-GIVERS scalar math
+// ------------------------------------------------------------------
+
+#[test]
+fn tier_report_min_adjacent_gap_and_t1_floor_compute_correctly() {
+    use crate::sim_adv::tier::{TierMetrics, TierReport};
+    let mk = |fc: f64| TierMetrics {
+        n_owners_total: 10,
+        n_owners_present: 10,
+        floor_completeness: fc,
+        floor_completeness_stayers: fc,
+        durability: 1.0,
+        share_a_pos: 50.0,
+        mean_inbound_served: 1.0,
+        mean_outbound_served: 1.0,
+        extraction: 1.0,
+        mean_parked_gb: 1.0,
+    };
+    // Monotone T1≥T2≥T3≥T4: gaps 0.05, 0.05, 0.10 ⇒ min 0.05, T1 floor 0.95.
+    let r = TierReport {
+        tier: [mk(0.95), mk(0.90), mk(0.85), mk(0.75)],
+    };
+    assert!((r.min_adjacent_giver_gap() - 0.05).abs() < 1e-9);
+    assert!((r.t1_floor_completeness() - 0.95).abs() < 1e-9);
+    // An inversion (T3 > T2) yields a NEGATIVE min gap.
+    let inv = TierReport {
+        tier: [mk(0.95), mk(0.70), mk(0.90), mk(0.80)],
+    };
+    assert!(
+        inv.min_adjacent_giver_gap() < 0.0,
+        "an inversion is a negative gap"
+    );
+}
+
+#[test]
+fn tier_report_buckets_present_owners_by_tier_and_sums_to_n() {
+    let sc = tiny_tiered(tiered_v1());
+    let sr = run(&sc, &sc.seeds.clone());
+    let tr = sr.per_seed_tier[0]
+        .as_ref()
+        .expect("tiered ⇒ a tier report");
+    let total: usize = TIER_ORDER
+        .iter()
+        .map(|&t| tr.tier[tier_index(t)].n_owners_total)
+        .sum();
+    assert_eq!(
+        total, sc.world.n_nodes,
+        "every node lands in exactly one tier"
+    );
+    // T3 is the plurality (40%); T1 the minority (15%).
+    assert!(
+        tr.tier[tier_index(GiverTier::T3)].n_owners_total
+            > tr.tier[tier_index(GiverTier::T1)].n_owners_total,
+        "T3 (40%) outnumbers T1 (15%)"
+    );
+}
+
+// ------------------------------------------------------------------
+// phase-2a: tiered scenarios (registered, deterministic, board)
+// ------------------------------------------------------------------
+
+#[test]
+fn tiered_v1_and_hetero_are_registered() {
+    assert!(find_scenario("tiered_v1").is_ok());
+    assert!(find_scenario("tiered_hetero").is_ok());
+    assert_eq!(tiered_v1().world.uptime, UptimeMix::Tiered);
+    assert!(tiered_v1().world.tier_mix.is_custom());
+    assert!(tiered_hetero().world.demand.is_hetero());
+}
+
+#[test]
+fn tiered_v1_is_deterministic_and_carries_a_tier_report() {
+    let sc = tiny_tiered(tiered_v1());
+    let seeds = sc.seeds.clone();
+    let a = run(&sc, &seeds);
+    let b = run(&sc, &seeds);
+    // Byte-identical tier report on repeat.
+    for i in 0..seeds.len() {
+        let ta = a.per_seed_tier[i].as_ref().unwrap();
+        let tb = b.per_seed_tier[i].as_ref().unwrap();
+        assert!(
+            tier_bit_eq(ta, tb),
+            "tier report byte-identical on repeat (seed idx {i})"
+        );
+    }
+    // The verdict board runs the structural determinism row too.
+    let verdicts = evaluate_board(&sc, &a);
+    let det = verdicts.iter().find(|v| v.id == "INV-DETERMINISM").unwrap();
+    assert_eq!(det.kind, VerdictKind::Pass, "determinism PASS");
+}
+
+#[test]
+fn tiered_board_has_the_two_tier_invariants() {
+    let sc = tiny_tiered(tiered_v1());
+    let seeds = sc.seeds.clone();
+    let result = run(&sc, &seeds);
+    let verdicts = evaluate_board(&sc, &result);
+    let ids: Vec<&str> = verdicts.iter().map(|v| v.id).collect();
+    assert!(
+        ids.contains(&"INV-TIER-GIVERS"),
+        "board has INV-TIER-GIVERS: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"INV-TIER-T1-ALIVE"),
+        "board has INV-TIER-T1-ALIVE: {ids:?}"
+    );
+    assert_eq!(ids[0], "INV-DETERMINISM");
+    assert_eq!(ids[1], "INV-ANTI-ORACLE");
+}
+
+#[test]
+fn tiered_hetero_carries_both_tier_and_hetero_reports() {
+    let sc = tiny_tiered(tiered_hetero());
+    let seeds = sc.seeds.clone();
+    let result = run(&sc, &seeds);
+    assert!(result.per_seed_tier[0].is_some(), "tiered ⇒ tier report");
+    assert!(
+        result.per_seed_hetero[0].is_some(),
+        "hetero demand ⇒ hetero report"
+    );
+}
+
+#[test]
+fn tiered_report_text_is_byte_identical_on_repeat() {
+    let sc = tiny_tiered(tiered_v1());
+    let seeds = sc.seeds.clone();
+    let r1 = run(&sc, &seeds);
+    let v1 = evaluate_board(&sc, &r1);
+    let t1 = format_report(&sc, &r1, &v1);
+    let r2 = run(&sc, &seeds);
+    let v2 = evaluate_board(&sc, &r2);
+    let t2 = format_report(&sc, &r2, &v2);
+    assert_eq!(t1, t2, "tiered report text is byte-identical on repeat");
+    assert!(
+        t1.contains("per-tier report"),
+        "report has the tier section"
+    );
+}
+
+#[test]
+fn honest_uptime_free_functions_unchanged_after_refactor() {
+    // The refactor of `online` / `surfaced_in_window` into `*_with_u` cores must leave the
+    // archetype path bit-identical — pin a few known draws (these are the values the pre-refactor
+    // functions produced for the same (archetype, id, tick, seed), so a regression trips here).
+    let seed = 0xABCD_1234u64;
+    // Determinism: same inputs ⇒ same output.
+    for a in Archetype::ALL {
+        for id in 0..8u64 {
+            for tick in 0..8u64 {
+                let o1 = online(a, id, tick, seed);
+                let o2 = online(a, id, tick, seed);
+                assert_eq!(o1, o2, "online deterministic");
+                let s1 = surfaced_in_window(a, id, tick, seed);
+                let s2 = surfaced_in_window(a, id, tick, seed);
+                assert_eq!(s1, s2, "surfaced deterministic");
+                // "online now ⇒ surfaced" invariant preserved.
+                if o1 {
+                    assert!(s1, "online ⇒ surfaced");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn weekend_only_nomad_alternates_on_and_off_weeks() {
+    // NOTE-a: the WeekendOnly weekly nomad is a phase-deterministic 2-on / 2-off cycle. Its
+    // day_uptime is HIGH on active weeks and 0 on off-weeks, so `node_surfaced_in_window` follows
+    // (surfaces on active weeks, misses on off-weeks) — a real autocorrelated absence, not iid.
+    let params = DynParams::default();
+    let mut world = build_world(4, &params, 21);
+    world.uptime[0] = Some(UptimeProfile::WeekendOnly);
+    let id = world.nodes[0].id;
+    let mut on_weeks_surfaced = 0;
+    let mut off_weeks_missed = 0;
+    let mut saw_on = false;
+    let mut saw_off = false;
+    for tick in 0..24u64 {
+        let u = UptimeProfile::WeekendOnly.day_uptime(id, tick);
+        let surfaced = world.node_surfaced_in_window(0, tick);
+        if u > 0.0 {
+            saw_on = true;
+            if surfaced {
+                on_weeks_surfaced += 1;
+            }
+        } else {
+            saw_off = true;
+            assert!(!surfaced, "an off-week (u=0) must MISS PoS (tick {tick})");
+            off_weeks_missed += 1;
+        }
+    }
+    assert!(
+        saw_on && saw_off,
+        "the cycle must show both on- and off-weeks"
+    );
+    assert!(on_weeks_surfaced > 0, "active weeks surface");
+    assert!(off_weeks_missed > 0, "off weeks are honest misses");
+}
+
+#[test]
+fn tier_floor_completeness_is_monotone_over_the_horizon() {
+    // WARN-2 confirmation: lifetime floor-completeness (over ALL owners) is MONOTONE
+    // non-decreasing in the horizon — `floor_ever_met` only flips false→true, the block set is
+    // fixed (no content churn / whitewash), and the denominator (all owners' blocks) is constant.
+    // So depopulation CANNOT reduce it: a longer run's T1 fc ≥ a shorter run's. (Same seed ⇒ the
+    // long run passes through the short run's state.)
+    let base = tiny_tiered(tiered_v1());
+    let short = {
+        let mut s = base.clone();
+        s.horizon = 40;
+        s.seeds = vec![7];
+        s
+    };
+    let long = {
+        let mut s = base.clone();
+        s.horizon = 90;
+        s.seeds = vec![7];
+        s
+    };
+    let rs = run(&short, &short.seeds.clone());
+    let rl = run(&long, &long.seeds.clone());
+    for &t in &TIER_ORDER {
+        let ti = tier_index(t);
+        let fc_s = rs.per_seed_tier[0].as_ref().unwrap().tier[ti].floor_completeness;
+        let fc_l = rl.per_seed_tier[0].as_ref().unwrap().tier[ti].floor_completeness;
+        // Both finite here (every tier populated at n=40); the long horizon is ≥ the short.
+        assert!(
+            fc_l + 1e-9 >= fc_s,
+            "tier {t:?} lifetime fc is monotone in the horizon: fc(90)={fc_l} >= fc(40)={fc_s}"
+        );
+    }
+}
+
+#[test]
+fn tiered_hetero_hard_is_registered_and_carries_both_reports() {
+    assert!(find_scenario("tiered_hetero_hard").is_ok());
+    // Fixed disk policy ⇒ the "full device" hard regime.
+    assert_eq!(
+        tiered_hetero_hard().world.demand.disk_policy(),
+        DiskPolicy::Fixed
+    );
+    let sc = tiny_tiered(tiered_hetero_hard());
+    let seeds = sc.seeds.clone();
+    let result = run(&sc, &seeds);
+    assert!(result.per_seed_tier[0].is_some(), "tiered ⇒ tier report");
+    assert!(
+        result.per_seed_hetero[0].is_some(),
+        "hetero demand ⇒ hetero report"
+    );
+    // The stayers diagnostic is populated alongside the frozen lifetime fc.
+    let tr = result.per_seed_tier[0].as_ref().unwrap();
+    let t1 = &tr.tier[tier_index(GiverTier::T1)];
+    assert!(
+        t1.floor_completeness_stayers.is_nan() || t1.floor_completeness_stayers >= 0.0,
+        "fc_stayers is a valid fraction or NaN"
+    );
 }

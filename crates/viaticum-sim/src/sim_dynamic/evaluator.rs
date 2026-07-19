@@ -168,15 +168,16 @@ pub fn node_summaries(world: &World, prior: &SurfacePrior, v0: f64) -> Vec<NodeS
 /// §10.D's `true uptime to τ`). We average the calendar predicate over the most
 /// recent year of ticks (or all ticks if fewer have elapsed).
 fn mean_uptime(world: &World, node: usize) -> f64 {
-    use crate::sim_dynamic::generator::{TICKS_PER_YEAR, online};
-    let arch = world.nodes[node].archetype;
-    let id = world.nodes[node].id;
+    use crate::sim_dynamic::generator::TICKS_PER_YEAR;
     let end = world.tick;
     let start = end.saturating_sub(TICKS_PER_YEAR);
     let span = (end - start).max(1);
     let mut up = 0usize;
     for t in start..end {
-        if online(arch, id, t, world.seed) {
+        // NOTE-b: route through `node_online` so the god-view truth SEES an opt-in phase-2a
+        // uptime profile (a diurnal/ragged holder is genuinely up less). Falls through to the
+        // exact `online` for a no-profile node ⇒ byte-identical for the legacy/honest worlds.
+        if world.node_online(node, t) {
             up += 1;
         }
     }

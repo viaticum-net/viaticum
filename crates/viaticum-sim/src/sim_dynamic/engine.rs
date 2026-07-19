@@ -34,7 +34,7 @@ use crate::generator::Rng;
 use crate::sim_adv::scenario::{AdvAction, AdvContext};
 use crate::sim_dynamic::generator::{
     BlockPlacement, DAYS_PER_TICK, EvictNoticeKind, EvictionEvent, HeldSymbol, Node, OwnBlock,
-    PairCapital, PendingEviction, PredEntry, RepairStat, SilentLoss, World, surfaced_in_window,
+    PairCapital, PendingEviction, PredEntry, RepairStat, SilentLoss, World,
 };
 use crate::sim_dynamic::observer::{self, ObsAddr};
 
@@ -1285,14 +1285,11 @@ fn pos_and_capital(world: &mut World, params: &DynParams) {
         }
         // F1 (D2 / rebase §6): a PoS challenge PASSES iff the holder SURFACED at least once
         // in the 7-day window — not merely the per-tick online Bernoulli. Computed ONCE per
-        // holder (per-holder event, not per-symbol). The per-tick `online` physics is
-        // untouched (transport/restore still read it); this is only the PoS-pass semantics.
-        let h_surfaced = surfaced_in_window(
-            world.nodes[holder].archetype,
-            world.nodes[holder].id,
-            tick,
-            world.seed,
-        );
+        // holder (per-holder event, not per-symbol). Routed through `node_surfaced_in_window`,
+        // which honors an opt-in phase-2a uptime profile (a Seasonal pause > window finally
+        // misses PoS) and falls through to the EXACT `surfaced_in_window` when the holder has
+        // no profile — byte-identical on the honest path.
+        let h_surfaced = world.node_surfaced_in_window(holder, tick);
         for s in world.nodes[holder].holdings.iter().filter(|s| s.alive) {
             if !world.nodes[s.owner].present {
                 continue; // departed owner: no challenge, no served accrual

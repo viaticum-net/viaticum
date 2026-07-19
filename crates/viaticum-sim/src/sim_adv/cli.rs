@@ -12,7 +12,7 @@ use crate::sim_dynamic::engine::DynParams;
 pub enum SimAdvError {
     /// No scenario name was given.
     #[error(
-        "no scenario given; usage: sim_adv <scenario> [--seeds N] [--sweep dial=a,b,c] [--csv <file>] [--fast]"
+        "no scenario given; usage: sim_adv <scenario> [--seeds N] [--horizon T] [--sweep dial=a,b,c] [--csv <file>] [--fast]"
     )]
     MissingScenario,
     /// The scenario name is not in the registry.
@@ -27,6 +27,9 @@ pub enum SimAdvError {
     /// `--seeds` value was not a positive integer.
     #[error("--seeds expects a positive integer, got '{0}'")]
     BadSeeds(String),
+    /// `--horizon` value was not a positive integer.
+    #[error("--horizon expects a positive integer, got '{0}'")]
+    BadHorizon(String),
     /// `--sweep` spec was not `dial=v1,v2,...`.
     #[error("--sweep expects 'dial=v1,v2,...', got '{0}'")]
     BadSweep(String),
@@ -60,6 +63,10 @@ pub struct Cli {
     pub csv: Option<String>,
     /// `--fast` flag (advisory in 0.1 — the fast/full split lands with more scenarios).
     pub fast: bool,
+    /// Override the scenario HORIZON (ticks); `None` = the scenario default. A control knob for
+    /// horizon experiments (e.g. the phase-2a monotonicity control: run a tiered scenario at 130
+    /// vs 520). Does not change determinism (the shorter run is a prefix of the longer).
+    pub horizon: Option<u64>,
 }
 
 /// The sweep dials this harness can override (kept small and curated — the A/B toggles).
@@ -80,6 +87,7 @@ pub fn parse_cli(args: &[String]) -> Result<Cli, SimAdvError> {
     let mut sweep: Option<Sweep> = None;
     let mut csv: Option<String> = None;
     let mut fast = false;
+    let mut horizon: Option<u64> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -91,6 +99,14 @@ pub fn parse_cli(args: &[String]) -> Result<Cli, SimAdvError> {
                     return Err(SimAdvError::BadSeeds(v.clone()));
                 }
                 seeds = Some(n);
+            }
+            "--horizon" => {
+                let v = it.next().ok_or(SimAdvError::MissingValue("--horizon"))?;
+                let h: u64 = v.parse().map_err(|_| SimAdvError::BadHorizon(v.clone()))?;
+                if h == 0 {
+                    return Err(SimAdvError::BadHorizon(v.clone()));
+                }
+                horizon = Some(h);
             }
             "--sweep" => {
                 let spec = it.next().ok_or(SimAdvError::MissingValue("--sweep"))?;
@@ -120,6 +136,7 @@ pub fn parse_cli(args: &[String]) -> Result<Cli, SimAdvError> {
         sweep,
         csv,
         fast,
+        horizon,
     })
 }
 

@@ -15,6 +15,7 @@
 
 use crate::generator::Rng;
 use crate::sim_adv::scenario::AdvRole;
+use crate::sim_adv::uptime::UptimeProfile;
 
 /// One simulated week per tick. The capital leak `1/λ` is months, so `λ·dt < 1`
 /// holds with room (design §10.C: weekly ticks × months-λ keeps the discrete
@@ -278,23 +279,18 @@ pub fn population_mix(n: usize) -> Vec<Archetype> {
 /// * Nomad: seeded Bernoulli(0.5).
 /// * else: Bernoulli(base_uptime).
 pub fn online(archetype: Archetype, node_id: u64, tick: u64, run_seed: u64) -> bool {
+    online_with_u(online_prob(archetype, tick), node_id, tick, run_seed)
+}
+
+/// The archetype-agnostic core of [`online`]: draw the per-tick online Bernoulli on the
+/// `ONLINE_TAG` stream and compare against an EXPLICIT per-day uptime threshold `u_online`
+/// (design axis 3 / phase-2a uptime profiles). Factoring the threshold out lets an opt-in
+/// [`UptimeProfile`] drive the same draw with a structural per-tick `u` WITHOUT a new RNG
+/// stream. `online(archetype, ..)` passes `online_prob(archetype, tick)`, so it is byte-
+/// identical to the pre-profile code (one `rng.unit()` compared to the same threshold).
+pub fn online_with_u(u_online: f64, node_id: u64, tick: u64, run_seed: u64) -> bool {
     let mut rng = Rng::derive(run_seed, ONLINE_TAG, node_id, tick, 0);
-    let u = rng.unit();
-    match archetype {
-        Archetype::Weekend => {
-            // "Weekend" ticks: the high-uptime window. tick % 7 in {4,5,6} = Fri–Sun.
-            let is_weekend = (tick % 7) >= 4;
-            if is_weekend { u < 0.95 } else { u < 0.30 }
-        }
-        Archetype::Seasonal => {
-            // Derive a tick-indexed month in [0,12). Summer = Jun,Jul,Aug = months 5,6,7.
-            let month = (tick % TICKS_PER_YEAR) * 12 / TICKS_PER_YEAR;
-            let is_summer = (5..=7).contains(&month);
-            if is_summer { u < 0.20 } else { u < 0.95 }
-        }
-        Archetype::Nomad => u < 0.50,
-        other => u < other.base_uptime(),
-    }
+    rng.unit() < u_online
 }
 
 /// A tag for the calendar RNG stream so it cannot collide with the PoS stream
@@ -338,17 +334,26 @@ pub fn online_prob(archetype: Archetype, tick: u64) -> f64 {
 /// when the holder is offline this tick, on the `SURFACE_TAG` stream, so it never perturbs
 /// the `online`/PoS/churn/placement draws (determinism preserved).
 pub fn surfaced_in_window(archetype: Archetype, node_id: u64, tick: u64, run_seed: u64) -> bool {
+    surfaced_with_u(online_prob(archetype, tick), node_id, tick, run_seed)
+}
+
+/// The archetype-agnostic core of [`surfaced_in_window`]: the F1 window composition on an
+/// EXPLICIT per-day uptime `u_online` (phase-2a uptime profiles). `surfaced_in_window(archetype,
+/// ..)` passes `online_prob(archetype, tick)`, so it is byte-identical to the pre-profile code;
+/// an opt-in [`UptimeProfile`] passes its structural `day_uptime` instead. Both draws ride the
+/// EXISTING `ONLINE_TAG` (the "online now" check) + `SURFACE_TAG` (the extra window draw)
+/// streams — no new RNG stream, so a profiled node perturbs nothing.
+pub fn surfaced_with_u(u_online: f64, node_id: u64, tick: u64, run_seed: u64) -> bool {
     // "Online now ⇒ surfaced" — keep the per-tick physics.
-    if online(archetype, node_id, tick, run_seed) {
+    if online_with_u(u_online, node_id, tick, run_seed) {
         return true;
     }
-    let u = online_prob(archetype, tick);
-    if u >= 1.0 {
+    if u_online >= 1.0 {
         return true; // always online ⇒ always surfaces (guard, no draw)
     }
-    let p_w = 1.0 - (1.0 - u).powi(7);
+    let p_w = 1.0 - (1.0 - u_online).powi(7);
     // p_extra = (p_w − u)/(1 − u); clamp guards floating error at the edges.
-    let p_extra = ((p_w - u) / (1.0 - u)).clamp(0.0, 1.0);
+    let p_extra = ((p_w - u_online) / (1.0 - u_online)).clamp(0.0, 1.0);
     let mut rng = Rng::derive(run_seed, SURFACE_TAG, node_id, tick, 0);
     rng.unit() < p_extra
 }
@@ -698,6 +703,15 @@ pub struct World {
     /// `drop_frac` still lands on sparse holdings over time (a deterministic accumulator, no
     /// RNG). `0.0` for every non-A2 node; never touched on the honest path (byte-identical).
     pub adv_drop_debt: Vec<f64>,
+    /// World-v3 phase-2a UPTIME-PROFILE layer (axis 3): `uptime[i] = Some(profile)` gives node
+    /// `i` a STRUCTURAL per-tick availability pattern (a P7 tier's 24/7 NAS / diurnal user /
+    /// ragged phone) instead of its archetype's iid Bernoulli. `None` for every node on the
+    /// pre-profile path — [`World::node_online`] / [`World::node_surfaced_in_window`] then fall
+    /// through to the EXACT `online` / `surfaced_in_window` free functions, so an all-`None`
+    /// layer is byte-identical to the honest anchor. Read ONLY by those two accessors (PoS
+    /// surfacing + restore transport); it drives no other draw and is god-view (not a kernel
+    /// input). Assigned opt-in by the sim_adv runner ([`crate::sim_adv::uptime::UptimeMix`]).
+    pub uptime: Vec<Option<UptimeProfile>>,
 }
 
 /// One R̂-calibration prediction (transche 0.3) — a GOD-VIEW metric row, never a kernel
@@ -821,6 +835,41 @@ pub struct ServedSample {
 pub const SERVED_SAMPLE_EVERY: u64 = 10;
 
 impl World {
+    /// Is node `i` ONLINE at `tick`, honoring an opt-in [`UptimeProfile`] (phase-2a axis 3)?
+    /// `uptime[i] == None` ⇒ the EXACT `online(archetype, ..)` free function (byte-identical to
+    /// the pre-profile path); `Some(profile)` ⇒ the profile's structural `day_uptime` on the
+    /// SAME `ONLINE_TAG` stream. The single first-hand availability accessor for restore
+    /// transport (Model U/O collectability). God-view; drives no kernel decision.
+    pub fn node_online(&self, i: usize, tick: u64) -> bool {
+        match self.uptime.get(i).and_then(|o| *o) {
+            None => online(self.nodes[i].archetype, self.nodes[i].id, tick, self.seed),
+            Some(p) => online_with_u(
+                p.day_uptime(self.nodes[i].id, tick),
+                self.nodes[i].id,
+                tick,
+                self.seed,
+            ),
+        }
+    }
+
+    /// Did node `i` SURFACE at least once in the 7-day PoS window ending at `tick`, honoring an
+    /// opt-in [`UptimeProfile`] (phase-2a axis 3)? `uptime[i] == None` ⇒ the EXACT
+    /// `surfaced_in_window(archetype, ..)` (byte-identical); `Some(profile)` ⇒ the F1 window
+    /// composition on the profile's `day_uptime`. The PoS-pass predicate the engine reads — a
+    /// Seasonal pause LONGER than the window (`day_uptime == 0` for a run of weeks) finally MISSES
+    /// PoS honestly, the whole point of the axis.
+    pub fn node_surfaced_in_window(&self, i: usize, tick: u64) -> bool {
+        match self.uptime.get(i).and_then(|o| *o) {
+            None => surfaced_in_window(self.nodes[i].archetype, self.nodes[i].id, tick, self.seed),
+            Some(p) => surfaced_with_u(
+                p.day_uptime(self.nodes[i].id, tick),
+                self.nodes[i].id,
+                tick,
+                self.seed,
+            ),
+        }
+    }
+
     /// Mean INBOUND served-volume integral across all nodes of `arch` (design §10.E):
     /// for owner P of archetype `arch`, inbound(P) = Σ_O `served[O][P]` (the running
     /// integral of P's OWN data that holders retained-and-PoS-confirmed). Returns the
