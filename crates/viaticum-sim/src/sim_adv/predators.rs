@@ -60,7 +60,7 @@ pub enum RunMode {
 pub fn a1_epsilon_whale_hook(ctx: &AdvContext) -> AdvAction {
     AdvAction {
         accept_rate: Some(ctx.dials.whale_accept),
-        rejoin: false,
+        ..AdvAction::NOOP
     }
 }
 
@@ -81,8 +81,8 @@ pub fn a4_whitewasher_hook(ctx: &AdvContext) -> AdvAction {
     // `elapsed == 0` does not immediately re-burn).
     let rejoin = period > 0 && ctx.tick > ctx.joined_tick && elapsed.is_multiple_of(period);
     AdvAction {
-        accept_rate: None,
         rejoin,
+        ..AdvAction::NOOP
     }
 }
 
@@ -91,13 +91,54 @@ fn noop_hook(_ctx: &AdvContext) -> AdvAction {
     AdvAction::NOOP
 }
 
-/// The behaviour hook for a predator id. Phase 1 implements A1 + A4; the rest are still
-/// skeleton (a no-op hook) — an A2/A3/A5+ scenario would run but exert no adversary pressure
-/// (their tranches are later — spec §6 / `4r_p1_spec.md` §5).
+/// A2 DropNotice-refuser, SILENT variant (the молчун / predator arm). It VOLUNTARILY drops a
+/// fraction `dials.drop_rate` of its own foreign holdings every tick WITHOUT announcing —
+/// each dropped symbol dies now and is detected on the owner's next PoS round (the EXISTING
+/// silent-loss path: `t_n = 0`, `b_max`, `drop_silent`, σ-jump). Serves fully otherwise
+/// (`accept_rate = None` ⇒ the Reliable-base rate), so the ONLY thing separating it from its
+/// polite twin is the announcedness of the drop — the price of silence.
+pub fn a2_silent_dropper_hook(ctx: &AdvContext) -> AdvAction {
+    AdvAction {
+        drop_frac_per_tick: Some(ctx.dials.drop_rate.max(0.0)),
+        announce_drops: false,
+        ..AdvAction::NOOP
+    }
+}
+
+/// A2 DropNotice-refuser, POLITE variant (the вежливый двойник / matched twin). It drops the
+/// SAME fraction `dials.drop_rate` of the SAME holdings by the SAME deterministic selection —
+/// EQUAL harm — but ANNOUNCES each drop, so it rides the EXISTING F2 notice mechanism (noticed
+/// at T, dies at T+1, `t_n = 7`d, `b_ann`, `drop_ann`; no σ-jump). This is the A2 matched
+/// control (unlike A1/A4, whose control is the honest hooks-off node): it isolates the ONE
+/// variable — announcedness — holding the drop-rate constant.
+pub fn a2_polite_dropper_hook(ctx: &AdvContext) -> AdvAction {
+    AdvAction {
+        drop_frac_per_tick: Some(ctx.dials.drop_rate.max(0.0)),
+        announce_drops: true,
+        ..AdvAction::NOOP
+    }
+}
+
+/// The behaviour hook for a predator id in the PREDATOR arm. Phase 1 implements A1 + A4 + A2
+/// (A2 predator = the SILENT dropper); the rest are still skeleton (a no-op hook) — an A3/A5+
+/// scenario would run but exert no adversary pressure (their tranches are later — spec §6).
 pub fn hook_for(id: AdvId) -> BehaviorHook {
     match id {
         AdvId::A1EpsilonWhale => a1_epsilon_whale_hook,
         AdvId::A4Whitewasher => a4_whitewasher_hook,
+        AdvId::A2DropRefuser => a2_silent_dropper_hook,
+        _ => noop_hook,
+    }
+}
+
+/// The behaviour hook for a predator id in the matched-TWIN arm. For A1/A4 the matched control
+/// is the HONEST node (`noop_hook`, hooks OFF), unchanged. For A2 the matched control is NOT
+/// honest — it is the POLITE dropper (`a2_polite_dropper_hook`): the same equal-harm drop
+/// stream, announced. This is the only place the "what does the matched twin do" policy
+/// branches per predator; A1/A4 stay byte-identical (they still get `noop_hook`).
+pub fn twin_hook_for(id: AdvId) -> BehaviorHook {
+    match id {
+        AdvId::A2DropRefuser => a2_polite_dropper_hook,
         _ => noop_hook,
     }
 }
@@ -111,13 +152,15 @@ pub fn hook_for(id: AdvId) -> BehaviorHook {
 /// are matched), and BOTH modes install an `adv` role — the ONLY difference is the hook. Returns
 /// the adversary node indices, in injection order, for the metric read.
 ///
-/// **The twin carries a NOOP role, not `None` (WARN-1 fix).** An `adv` role makes the engine's
+/// **The twin carries a role, not `None` (WARN-1 fix).** An `adv` role makes the engine's
 /// `churn` treat the node as HOOK-driven — it bypasses the random-departure Bernoulli. If the
 /// twin had `None` it would churn at `p ≈ 0.002/tick` (≈29% chance of departing over a
 /// 170-tick horizon) while the predator (which always carries a role) is immortal — a MORTALITY
-/// confound on top of the intended hook difference. The twin's noop hook (accept_rate `None`
-/// ⇒ the archetype rate, `rejoin = false`) exerts NO predatory pressure, so the twin is the
-/// clean hooks-OFF control: same immortal heavy node, playing honestly.
+/// confound on top of the intended hook difference. The twin's hook is [`twin_hook_for`]: for
+/// A1/A4 it is `noop_hook` (accept_rate `None` ⇒ the archetype rate, no rejoin, no drop) — the
+/// clean hooks-OFF honest control; for A2 it is the POLITE dropper — the equal-harm matched
+/// control that isolates announcedness. Either way the twin carries a role, so it is immortal
+/// exactly like the predator (no mortality confound).
 pub fn inject_adversaries(
     world: &mut World,
     adversaries: &[AdvSpec],
@@ -137,7 +180,7 @@ pub fn inject_adversaries(
             configure_adv_node(world, node, spec, params);
             let hook = match mode {
                 RunMode::Predator => hook_for(spec.id),
-                RunMode::Twin => noop_hook,
+                RunMode::Twin => twin_hook_for(spec.id),
             };
             world.adv[node] = Some(AdvRole {
                 id: spec.id,
@@ -219,6 +262,23 @@ pub struct AdvMetrics {
     /// World cap-trim count at the horizon (evidence the Р-7 cap engaged). Global — the honest
     /// baseline barely trims (≈ 0-1), an ε-whale world trims heavily.
     pub cap_trims: usize,
+    /// A2 (DropNotice-refuser) — the PRICE-OF-SILENCE ledger: `Σ_O capital[O][adv].g_oh` over
+    /// NON-adversary owners O = the reliability capital owners hold in the adversary (`G(O←adv)`,
+    /// the owner's record of the adversary's service TO it). A voluntary drop BURNS this: SILENT
+    /// at `b_max` (a total-loss burn ⇒ ≈ 0), ANNOUNCED at `b_ann` (barely). The load-bearing A2
+    /// comparative — silent's ledger ≪ polite's. `0` for a scenario with no A2 drops.
+    pub retention_g: f64,
+    /// A2 — placement-INFLOW proxy: `Σ_adv holdings.len()` = the cumulative count of foreign
+    /// symbols the adversary was ever OFFERED-AND-ACCEPTED (dead-marked drops stay in the vec, so
+    /// the length is monotone = total inflow over the run). The spec's "владельцы отворачиваются"
+    /// row reads this: inflow(silent) vs inflow(polite). See the A2 report finding on whether the
+    /// DECISIVE placement path can discriminate them (post-0.3 it reads surface only).
+    pub inflow_total: f64,
+    /// A2 — DIAGNOSTIC σ-profile: `Σ_O capital[O][adv].sigma` over non-adversary owners = the
+    /// suspicion owners carry toward the adversary. A SILENT loss jumps σ by the full `j_σ`; an
+    /// announced drop does NOT jump σ, so silent's σ ≫ polite's. σ is INERT in the kernel (no
+    /// decision reads it — spec §3), so this is reported, never asserted.
+    pub sigma_owed: f64,
 }
 
 /// Bit-exact equality (the determinism board row). `to_bits` so a deterministically-produced
@@ -231,6 +291,9 @@ pub fn bit_eq(a: &AdvMetrics, b: &AdvMetrics) -> bool {
         && a.roi.to_bits() == b.roi.to_bits()
         && a.rejoins == b.rejoins
         && a.cap_trims == b.cap_trims
+        && a.retention_g.to_bits() == b.retention_g.to_bits()
+        && a.inflow_total.to_bits() == b.inflow_total.to_bits()
+        && a.sigma_owed.to_bits() == b.sigma_owed.to_bits()
 }
 
 /// Is `(holder, owner, block)` currently noticed for eviction (a pending DropNotice that dies
@@ -315,9 +378,15 @@ pub fn collect_adv_metrics(world: &World, nodes: &[usize], run_cap_ratio: f64) -
     let mut consumed = 0.0f64;
     let mut served_out = 0.0f64;
     let mut rejoins = 0usize;
+    // A2 reads: reliability ledger owners hold in the adversary + suspicion + inflow.
+    let mut retention_g = 0.0f64;
+    let mut sigma_owed = 0.0f64;
+    let mut inflow_total = 0.0f64;
+    let is_adv = |o: usize| nodes.contains(&o);
 
     for &adv in nodes {
         rejoins += world.adv_rejoin_count[adv];
+        inflow_total += world.nodes[adv].holdings.len() as f64;
         for h in 0..n {
             consumed += world.served[h][adv];
             served_out += world.served[adv][h];
@@ -327,6 +396,17 @@ pub fn collect_adv_metrics(world: &World, nodes: &[usize], run_cap_ratio: f64) -
                 continue;
             }
             parked_live += settled_parked_on(world, adv, h);
+        }
+        // A2 price-of-silence ledger + σ-profile: sum over NON-adversary owners O of the
+        // reliability capital `capital[O][adv].g_oh` (owners' record of the adversary's service)
+        // and their suspicion `capital[O][adv].sigma`. The drop burn hits g_oh; a silent loss
+        // jumps σ.
+        for o in 0..n {
+            if o == adv || is_adv(o) {
+                continue;
+            }
+            retention_g += world.capital[o][adv].g_oh;
+            sigma_owed += world.capital[o][adv].sigma;
         }
     }
 
@@ -344,5 +424,8 @@ pub fn collect_adv_metrics(world: &World, nodes: &[usize], run_cap_ratio: f64) -
         roi,
         rejoins,
         cap_trims: world.cap_trim_count,
+        retention_g,
+        inflow_total,
+        sigma_owed,
     }
 }

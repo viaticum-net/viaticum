@@ -541,6 +541,11 @@ pub fn step(world: &mut World, params: &DynParams, prior: &SurfacePrior, policy:
     // (3) eviction when φ < s_soft (kernel eviction_order + latch).
     run_eviction(world, params);
 
+    // (3.5) World-v3 A2 (DropNotice-refuser): adversary holders VOLUNTARILY drop a fraction of
+    // their foreign holdings — SILENTLY (dies now, next-PoS silent-loss burn) or ANNOUNCED (rides
+    // the F2 notice). No-op on the honest path (no adv role ⇒ no RNG, byte-identical).
+    adv_voluntary_drops(world);
+
     // (4) churn: departures by archetype (aggression raises the departure rate, §9.4).
     churn(world, params);
 
@@ -1468,6 +1473,107 @@ fn run_eviction(world: &mut World, params: &DynParams) {
     }
 }
 
+/// (3.5) World-v3 A2 (DropNotice-refuser): each present adversary whose hook returns a
+/// `drop_frac_per_tick` VOLUNTARILY drops that fraction of its own foreign holdings this tick.
+///
+/// **Victim selection (identical for both modes — the equal-harm control).** Victims are the
+/// adversary's ALIVE symbols of PRESENT NON-adversary owners (spec §4: do not grind other
+/// adversaries; a present owner is the one that can detect the loss), taken LOWEST-ι first
+/// (deterministic, tie by `(owner, block)`). A symbol already NOTICED for eviction this tick (a
+/// natural pressure/cap drop) is skipped so the voluntary drop never double-processes it. The
+/// number to drop is a fractional DEBT accumulator (`world.adv_drop_debt`): each tick the
+/// adversary owes `drop_frac · (its alive foreign holdings)` more drops and sheds the whole
+/// part, so a small fraction still lands on sparse holdings over time. **No RNG is drawn** — the
+/// selection and count are fully deterministic (honest-anchor / determinism gate).
+///
+/// **The two modes differ ONLY in the death path (the price of silence):**
+/// * ANNOUNCED (`announce_drops` — the polite twin): each victim rides the EXISTING F2 notice
+///   mechanism ([`notice_eviction`], `Pressure`) — noticed now, dies at T+1 with `t_n = 7`d,
+///   `b_ann`, `drop_ann`. No parallel path is built.
+/// * SILENT (the молчун): each victim is marked dead NOW and queued as a per-owner
+///   [`SilentLoss`] (aggregated exactly like `churn`), detected on the owner's NEXT PoS round
+///   with `t_n = 0`, `b_max`, `drop_silent`, and a full σ-jump — the EXISTING silent-loss path.
+///
+/// Honest worlds carry no `adv` role ⇒ [`adv_action`] returns `None` ⇒ this pass is a no-op
+/// that draws no RNG and mutates nothing (byte-identical to the pre-A2 path — the anchor gate).
+fn adv_voluntary_drops(world: &mut World) {
+    let n = world.nodes.len();
+    let tick = world.tick;
+    for node in 0..n {
+        if !world.nodes[node].present || world.adv[node].is_none() {
+            continue;
+        }
+        let action = match adv_action(world, node, tick) {
+            Some(a) => a,
+            None => continue,
+        };
+        let frac = match action.drop_frac_per_tick {
+            Some(f) if f > 0.0 => f,
+            _ => continue,
+        };
+
+        // Candidate victims: alive foreign symbols of PRESENT non-adversary owners, not yet
+        // noticed for eviction this tick. Carry (holdings-index, owner, block, iota, volume).
+        let mut cands: Vec<(usize, usize, usize, f64, f64)> = Vec::new();
+        for (i, s) in world.nodes[node].holdings.iter().enumerate() {
+            if !s.alive || s.owner == node {
+                continue;
+            }
+            if world.adv[s.owner].is_some() || !world.nodes[s.owner].present {
+                continue;
+            }
+            let already_noticed = world
+                .pending_evictions
+                .iter()
+                .any(|p| p.holder == node && p.owner == s.owner && p.block == s.block);
+            if already_noticed {
+                continue;
+            }
+            cands.push((i, s.owner, s.block, s.iota, s.volume));
+        }
+
+        // Fractional debt: owe `frac · count` more drops, shed the whole part this tick.
+        let count = cands.len();
+        world.adv_drop_debt[node] += frac * count as f64;
+        let mut n_drop = world.adv_drop_debt[node].floor().max(0.0) as usize;
+        if n_drop == 0 {
+            continue;
+        }
+        n_drop = n_drop.min(count);
+        world.adv_drop_debt[node] -= n_drop as f64;
+
+        // Lowest-ι first (tie by owner, then block) — deterministic victim order.
+        cands.sort_by(|a, b| a.3.total_cmp(&b.3).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        cands.truncate(n_drop);
+
+        if action.announce_drops {
+            // Polite: ride the EXISTING F2 notice mechanism (Pressure ⇒ b_ann, t_n=7, drop_ann).
+            for &(_, owner, block, _, _) in &cands {
+                notice_eviction(world, node, owner, block, EvictNoticeKind::Pressure);
+            }
+        } else {
+            // Silent: mark dead NOW + queue a per-owner SilentLoss (existing silent-loss path:
+            // b_max, t_n=0, drop_silent, σ-jump next PoS round). Aggregate volume per owner
+            // exactly like `churn` (one confirmed silent loss per owner, V_lost = V_held).
+            let mut per_owner: Vec<(usize, f64)> = Vec::new();
+            for &(idx, owner, _block, _, volume) in &cands {
+                world.nodes[node].holdings[idx].alive = false;
+                match per_owner.iter_mut().find(|(o, _)| *o == owner) {
+                    Some(e) => e.1 += volume,
+                    None => per_owner.push((owner, volume)),
+                }
+            }
+            for (owner, volume) in per_owner {
+                world.pending_silent_loss.push(SilentLoss {
+                    owner,
+                    holder: node,
+                    volume,
+                });
+            }
+        }
+    }
+}
+
 /// F2 (D5): NOTICE one alive symbol `(owner, block)` on `holder` for eviction — queue a
 /// [`PendingEviction`] (a DropNotice) that `apply_pending_evictions` kills at T+1. Returns
 /// the noticed symbol's volume (for the caller's projected-φ accounting), or `None` if the
@@ -1986,6 +2092,11 @@ pub fn whitewash_rejoin_for_test(world: &mut World, node: usize, tick: u64, para
 #[cfg(test)]
 pub fn run_eviction_for_test(world: &mut World, params: &DynParams) {
     run_eviction(world, params);
+}
+
+#[cfg(test)]
+pub fn adv_voluntary_drops_for_test(world: &mut World) {
+    adv_voluntary_drops(world);
 }
 
 #[cfg(test)]

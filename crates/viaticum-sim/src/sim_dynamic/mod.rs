@@ -171,6 +171,7 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
         // decision byte-identical to the pre-adv path.
         adv: vec![None; n],
         adv_rejoin_count: vec![0; n],
+        adv_drop_debt: vec![0.0; n],
     }
 }
 
@@ -418,6 +419,7 @@ fn run_newcomer_probe(
     // Grow the world-v3 adversary layer in lock-step (the probe newcomer is honest).
     world.adv.push(None);
     world.adv_rejoin_count.push(0);
+    world.adv_drop_debt.push(0.0);
 
     let mut t_boot_placed: Option<u64> = None;
     let mut t_boot_chosen: Option<u64> = None;

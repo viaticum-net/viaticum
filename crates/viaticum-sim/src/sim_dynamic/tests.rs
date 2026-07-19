@@ -32,6 +32,10 @@ use crate::sim_dynamic::{Experiment1Config, build_world, run_experiment_1};
 
 use crate::sim_dynamic::engine::{per_node_upload_budget, repair_detected_for_test};
 
+use crate::sim_adv::predators::{a2_polite_dropper_hook, a2_silent_dropper_hook};
+use crate::sim_adv::scenario::{AdvDials, AdvId, AdvRole, BehaviorHook, InfoModel};
+use crate::sim_dynamic::engine::adv_voluntary_drops_for_test;
+
 // ============================================================
 // Helpers
 // ============================================================
@@ -3221,5 +3225,222 @@ fn f6_dr_victim_g_and_served_are_frozen_while_block_is_to_restore() {
         world.capital[owner][holder].g_oh < g_before,
         "F6: g accrues NOTHING (only decays) while to_restore: {} < {g_before}",
         world.capital[owner][holder].g_oh
+    );
+}
+
+// ============================================================
+// World-v3 A2 DropNotice-refuser: the voluntary-drop engine pass
+// ============================================================
+
+/// Install an A2 adversary role on `node` with the given per-tick drop fraction and hook.
+fn set_a2_role(world: &mut World, node: usize, drop_rate: f64, hook: BehaviorHook) {
+    world.adv[node] = Some(AdvRole {
+        id: AdvId::A2DropRefuser,
+        info_model: InfoModel::Own,
+        dials: AdvDials {
+            drop_rate,
+            ..AdvDials::default()
+        },
+        hook,
+    });
+}
+
+/// Give adversary `holder` one alive foreign symbol of `owner` (block 0), ι = `iota`.
+fn give_foreign_symbol(world: &mut World, holder: usize, owner: usize, iota: f64, v: f64) {
+    world.nodes[holder].holdings.push(HeldSymbol {
+        owner,
+        block: 0,
+        iota,
+        volume: v,
+        alive: true,
+        cream: false,
+    });
+}
+
+#[test]
+fn a2_voluntary_drop_picks_lowest_iota_victim_identically_for_silent_and_announced() {
+    // The equal-harm control: silent and polite pick the SAME victim (lowest ι) by the SAME
+    // deterministic selection — the ONLY difference is the death PATH. Adversary node 1 holds
+    // owners 2/3/4 at ι = 0.9 / 0.3 / 0.6; a drop_rate that owes ~1 drop this tick must fall on
+    // owner 3 (ι = 0.3) in BOTH modes.
+    let params = params_v_free_pinned();
+    let v = params.block_volume / params.k_eff as f64;
+    let adv = 1usize;
+
+    // 3 candidates ⇒ frac 0.34 owes 1.02 ⇒ floor 1 drop.
+    let mut silent = mk_clean_world(&params, 7);
+    give_foreign_symbol(&mut silent, adv, 2, 0.9, v);
+    give_foreign_symbol(&mut silent, adv, 3, 0.3, v);
+    give_foreign_symbol(&mut silent, adv, 4, 0.6, v);
+    set_a2_role(&mut silent, adv, 0.34, a2_silent_dropper_hook);
+    adv_voluntary_drops_for_test(&mut silent);
+
+    // SILENT: owner-3 symbol is DEAD now + a SilentLoss is queued; NO pending eviction.
+    let dead_owner: Vec<usize> = silent.nodes[adv]
+        .holdings
+        .iter()
+        .filter(|s| !s.alive)
+        .map(|s| s.owner)
+        .collect();
+    assert_eq!(
+        dead_owner,
+        vec![3],
+        "silent drop kills the lowest-ι victim (owner 3)"
+    );
+    assert_eq!(
+        silent.pending_silent_loss.len(),
+        1,
+        "one silent loss queued"
+    );
+    assert_eq!(silent.pending_silent_loss[0].owner, 3);
+    assert!(
+        silent.pending_evictions.is_empty(),
+        "silent path never notices"
+    );
+
+    // ANNOUNCED: SAME victim, but NOTICED (alive) + queued as a pending eviction; no silent loss.
+    let mut polite = mk_clean_world(&params, 7);
+    give_foreign_symbol(&mut polite, adv, 2, 0.9, v);
+    give_foreign_symbol(&mut polite, adv, 3, 0.3, v);
+    give_foreign_symbol(&mut polite, adv, 4, 0.6, v);
+    set_a2_role(&mut polite, adv, 0.34, a2_polite_dropper_hook);
+    adv_voluntary_drops_for_test(&mut polite);
+
+    assert!(
+        polite.nodes[adv].holdings.iter().all(|s| s.alive),
+        "announced drop leaves the symbol ALIVE this tick (dies at T+1)"
+    );
+    assert_eq!(
+        polite.pending_evictions.len(),
+        1,
+        "one pending eviction queued"
+    );
+    assert_eq!(
+        polite.pending_evictions[0].owner, 3,
+        "same lowest-ι victim (owner 3)"
+    );
+    assert!(
+        polite.pending_silent_loss.is_empty(),
+        "announced path never queues a silent loss"
+    );
+}
+
+#[test]
+fn a2_silent_drop_zeroes_reliability_capital_while_announced_barely_dents_it() {
+    // The price of silence at the burn level: a SILENT voluntary drop rides the silent-loss path
+    // (b_max = 1.0, total loss ⇒ g_oh → 0); an ANNOUNCED drop rides the F2 notice (b_ann = 0.05
+    // with the t_n = 7d head-start ⇒ g_oh barely moves). Owner 2's reliability record of the
+    // adversary starts at 100 in both.
+    let params = params_v_free_pinned();
+    let v = params.block_volume / params.k_eff as f64;
+    let adv = 1usize;
+    let owner = 2usize;
+
+    // SILENT: drop → next PoS round applies b_max.
+    let mut silent = mk_clean_world(&params, 11);
+    give_foreign_symbol(&mut silent, adv, owner, 0.5, v);
+    silent.capital[owner][adv].g_oh = 100.0;
+    set_a2_role(&mut silent, adv, 1.0, a2_silent_dropper_hook); // frac 1.0 ⇒ drop the only symbol
+    adv_voluntary_drops_for_test(&mut silent);
+    pos_and_capital_for_test(&mut silent, &params); // drains the silent loss (b_max)
+    assert!(
+        silent.capital[owner][adv].g_oh < 1.0,
+        "silent loss zeroes the reliability capital (b_max): {}",
+        silent.capital[owner][adv].g_oh
+    );
+    assert!(
+        silent.capital[owner][adv].drop_silent > 0.0,
+        "drop_silent bumped"
+    );
+    assert!(
+        silent.capital[owner][adv].sigma > 0.0,
+        "σ jumped on the silent loss"
+    );
+
+    // ANNOUNCED: notice → T+1 applies b_ann with the head-start.
+    let mut polite = mk_clean_world(&params, 11);
+    give_foreign_symbol(&mut polite, adv, owner, 0.5, v);
+    polite.capital[owner][adv].g_oh = 100.0;
+    set_a2_role(&mut polite, adv, 1.0, a2_polite_dropper_hook);
+    adv_voluntary_drops_for_test(&mut polite);
+    apply_pending_evictions_for_test(&mut polite, &params); // T+1 kill + b_ann burn
+    assert!(
+        polite.capital[owner][adv].g_oh > 90.0,
+        "announced drop barely dents the reliability capital (b_ann): {}",
+        polite.capital[owner][adv].g_oh
+    );
+    assert!(polite.capital[owner][adv].drop_ann > 0.0, "drop_ann bumped");
+    assert!(
+        polite.capital[owner][adv].sigma.abs() < 1e-12,
+        "an announced drop does NOT jump σ"
+    );
+
+    // The price of silence: silent's ledger is destroyed, polite's survives.
+    assert!(silent.capital[owner][adv].g_oh < polite.capital[owner][adv].g_oh);
+}
+
+#[test]
+fn a2_drop_fractional_debt_accumulates_so_a_small_rate_still_lands_on_sparse_holdings() {
+    // A drop_rate whose per-tick fraction rounds below 1 must STILL land over time (the debt
+    // accumulator), never silently drop nothing forever. 2 holdings × 0.3 = 0.6/tick ⇒ 0 the
+    // first tick, but the debt carries ⇒ a drop by the 2nd tick.
+    let params = params_v_free_pinned();
+    let v = params.block_volume / params.k_eff as f64;
+    let adv = 1usize;
+    let mut world = mk_clean_world(&params, 3);
+    give_foreign_symbol(&mut world, adv, 2, 0.4, v);
+    give_foreign_symbol(&mut world, adv, 3, 0.6, v);
+    set_a2_role(&mut world, adv, 0.3, a2_silent_dropper_hook);
+
+    adv_voluntary_drops_for_test(&mut world); // debt 0.6 ⇒ floor 0, nothing dropped yet
+    assert!(
+        world.nodes[adv].holdings.iter().all(|s| s.alive),
+        "tick 1: fraction 0.6 < 1 ⇒ nothing dropped yet, debt carries"
+    );
+    assert!(world.adv_drop_debt[adv] > 0.5, "debt accumulated");
+    adv_voluntary_drops_for_test(&mut world); // debt 0.6 + 0.6 = 1.2 ⇒ floor 1 ⇒ one drop
+    assert_eq!(
+        world.nodes[adv]
+            .holdings
+            .iter()
+            .filter(|s| !s.alive)
+            .count(),
+        1,
+        "tick 2: the accumulated debt crosses 1 ⇒ exactly one drop lands"
+    );
+}
+
+#[test]
+fn a2_voluntary_drop_never_grinds_other_adversaries_or_absent_owners() {
+    // Spec §4: drop victims are PRESENT NON-adversary owners only. An adversary co-holder's data
+    // and a departed owner's data are both immune.
+    let params = params_v_free_pinned();
+    let v = params.block_volume / params.k_eff as f64;
+    let adv = 1usize;
+    let mut world = mk_clean_world(&params, 5);
+    // owner 2 = another adversary; owner 3 = departed; owner 4 = a normal present owner.
+    world.adv[2] = Some(AdvRole {
+        id: AdvId::A2DropRefuser,
+        info_model: InfoModel::Own,
+        dials: AdvDials::default(),
+        hook: a2_silent_dropper_hook,
+    });
+    world.nodes[3].present = false;
+    give_foreign_symbol(&mut world, adv, 2, 0.1, v); // adversary owner — immune
+    give_foreign_symbol(&mut world, adv, 3, 0.2, v); // departed owner — immune
+    give_foreign_symbol(&mut world, adv, 4, 0.9, v); // the ONLY eligible victim
+    set_a2_role(&mut world, adv, 1.0, a2_silent_dropper_hook); // frac 1.0 of eligible
+
+    adv_voluntary_drops_for_test(&mut world);
+    let dead: Vec<usize> = world.nodes[adv]
+        .holdings
+        .iter()
+        .filter(|s| !s.alive)
+        .map(|s| s.owner)
+        .collect();
+    assert_eq!(
+        dead,
+        vec![4],
+        "only the present non-adversary owner's symbol is dropped (2=adv, 3=absent are immune)"
     );
 }

@@ -692,6 +692,12 @@ pub struct World {
     /// identity burn). Instrumentation for the ROI/re-entry report only — never a kernel
     /// input. `0` for every node with no A4 role.
     pub adv_rejoin_count: Vec<usize>,
+    /// World-v3 A2 (DropNotice-refuser): the fractional VOLUNTARY-DROP debt carried by node
+    /// `i`. Each tick an A2 adversary owes `drop_frac · (its alive foreign holdings)` more
+    /// drops; only the WHOLE part is dropped, the remainder accumulates here — so a small
+    /// `drop_frac` still lands on sparse holdings over time (a deterministic accumulator, no
+    /// RNG). `0.0` for every non-A2 node; never touched on the honest path (byte-identical).
+    pub adv_drop_debt: Vec<f64>,
 }
 
 /// One R̂-calibration prediction (transche 0.3) — a GOD-VIEW metric row, never a kernel

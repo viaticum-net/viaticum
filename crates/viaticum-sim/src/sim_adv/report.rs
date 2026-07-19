@@ -104,8 +104,13 @@ pub fn format_report(scenario: &Scenario, result: &RunResult, verdicts: &[Verdic
     }
     let _ = writeln!(o);
 
-    // --- Attack-ROI: predator vs matched honest twin (phase 1), when adversaries ran ---
-    if let Some(section) = format_adv(result) {
+    // --- Attack-ROI: predator vs matched twin (phase 1), when adversaries ran. A2's matched
+    //     control is the POLITE dropper (not the honest node), so it gets a bespoke section. ---
+    if scenario_is_a2(scenario) {
+        if let Some(section) = format_a2(result) {
+            o.push_str(&section);
+        }
+    } else if let Some(section) = format_adv(result) {
         o.push_str(&section);
     }
 
@@ -234,6 +239,77 @@ fn format_adv(result: &RunResult) -> Option<String> {
         o,
         "  {:<22} {:>11.4} ± {:>6.4}   [<1 ⇒ raw ROI ≤ honest twin]",
         "raw ROI pred/twin", rr, rrs
+    );
+    let _ = writeln!(o);
+    Some(o)
+}
+
+/// Whether the scenario is the A2 DropNotice-refuser (its matched control is the POLITE dropper,
+/// not the honest node — so the report labels + rows differ from the generic Attack-ROI table).
+fn scenario_is_a2(scenario: &Scenario) -> bool {
+    scenario
+        .adversaries
+        .iter()
+        .any(|a| a.id == crate::sim_adv::AdvId::A2DropRefuser)
+}
+
+/// Render the A2 price-of-silence table: SILENT predator vs POLITE twin (equal-harm matched
+/// control). The load-bearing rows are the reliability ledger `Σ_O g_oh` and the placement
+/// inflow; parked / consumed / served / σ are diagnostics. `None` when no seed had adversaries.
+fn format_a2(result: &RunResult) -> Option<String> {
+    if !result.per_seed_adv.iter().any(|p| p.is_some()) {
+        return None;
+    }
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "-- A2 price of silence: SILENT predator vs POLITE twin (equal-rate drop; mean ± σ over seeds) --"
+    );
+    let _ = writeln!(
+        o,
+        "  {:<24} {:>18} {:>18}",
+        "metric", "silent (pred)", "polite (twin)"
+    );
+    let row = |o: &mut String, name: &str, f: fn(&crate::sim_adv::AdvMetrics) -> f64| {
+        let (pm, ps) = acol(result, false, f);
+        let (tm, ts) = acol(result, true, f);
+        let _ = writeln!(
+            o,
+            "  {:<24} {:>10.3} ± {:>5.3} {:>10.3} ± {:>5.3}",
+            name, pm, ps, tm, ts
+        );
+    };
+    row(&mut o, "g_oh ledger Σ (gb·d)", |a| a.retention_g);
+    row(&mut o, "inflow Σ holdings.len", |a| a.inflow_total);
+    row(&mut o, "σ owed Σ", |a| a.sigma_owed);
+    row(&mut o, "parked live (gb)", |a| a.parked_live);
+    row(&mut o, "protected gb·days", |a| a.consumed);
+    row(&mut o, "served_out gb·days", |a| a.served_out);
+    row(&mut o, "ROI consumed/served", |a| a.roi);
+    // The two asserted comparatives (silent/polite ratios) — the board verdict quantities.
+    let (gm, gs) = acol_ratio(result, |a| a.retention_g);
+    let _ = writeln!(
+        o,
+        "  {:<24} {:>10.4} ± {:>5.4}   [<0.85 ⇒ silence punished in the ledger]",
+        "g_oh silent/polite", gm, gs
+    );
+    let (im, is) = acol_ratio(result, |a| a.inflow_total);
+    let _ = writeln!(
+        o,
+        "  {:<24} {:>10.4} ± {:>5.4}   [<1 ⇒ owners turn away from silent]",
+        "inflow silent/polite", im, is
+    );
+    let _ = writeln!(
+        o,
+        "  NOTE: the DECISIVE placement path (post-0.3) reads the surface PoS-window ONLY — NOT"
+    );
+    let _ = writeln!(
+        o,
+        "        g_oh / drop-counters / σ — so the inflow ratio is EXPECTED ≈ 1 (the price is"
+    );
+    let _ = writeln!(
+        o,
+        "        RECORDED in the g_oh ledger but not yet ENFORCED; the consumer is phase-4 work)."
     );
     let _ = writeln!(o);
     Some(o)

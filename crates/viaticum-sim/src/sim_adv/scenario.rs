@@ -384,10 +384,12 @@ pub struct AdvContext {
 }
 
 /// What a predator hook returns for a tick (phase 1: an ε-give accept override + a
-/// whitewash-rejoin flag). A default [`AdvAction::NOOP`] is the honest / no-op action.
+/// whitewash-rejoin flag; A2 adds a voluntary-drop lever). A default [`AdvAction::NOOP`]
+/// is the honest / no-op action.
 ///
-/// (0.1 carried only a `NoOp` sentinel; phase 1 enriches it with the two live levers the
-/// A1/A4 predators need — the holder-side serve rate and the identity-burn self-exit.)
+/// (0.1 carried only a `NoOp` sentinel; phase 1 enriches it with the levers the A1/A4/A2
+/// predators need — the holder-side serve rate, the identity-burn self-exit, and the
+/// voluntary-drop fraction + its announcedness.)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AdvAction {
     /// Holder-side ε-give: the probability this adversary ACCEPTS an incoming symbol offer
@@ -400,13 +402,28 @@ pub struct AdvAction {
     /// re-enters next tick with a FRESH identity (κ_O = 0, new join tick). Models "burn
     /// reputation → new identity".
     pub rejoin: bool,
+    /// A2 DropNotice-refuser: the FRACTION of its own foreign holdings this adversary
+    /// VOLUNTARILY drops this tick (`None` ⇒ no voluntary drop — the A1/A4/noop default, so
+    /// the pre-A2 path is byte-identical). Victims are chosen deterministically (lowest-ι
+    /// first) among the adversary's alive foreign symbols of NON-adversary owners; the drop
+    /// count accumulates over ticks (a fractional debt) so a small fraction still lands on
+    /// sparse holdings. See `engine::adv_voluntary_drops`.
+    pub drop_frac_per_tick: Option<f64>,
+    /// A2: whether the voluntary drops are ANNOUNCED (a signed DropNotice — the polite
+    /// twin) or SILENT (the molчун). `true` ⇒ the drop rides the EXISTING F2 notice
+    /// mechanism (noticed at T, dies at T+1, `t_n = 7`d, `b_ann`, `drop_ann`); `false` ⇒
+    /// the EXISTING silent-loss path (dies now, detected next PoS round, `t_n = 0`,
+    /// `b_max`, `drop_silent`, σ-jump). Ignored when `drop_frac_per_tick` is `None`.
+    pub announce_drops: bool,
 }
 
 impl AdvAction {
-    /// The honest / no-op action: no accept override, no rejoin.
+    /// The honest / no-op action: no accept override, no rejoin, no voluntary drop.
     pub const NOOP: AdvAction = AdvAction {
         accept_rate: None,
         rejoin: false,
+        drop_frac_per_tick: None,
+        announce_drops: false,
     };
 }
 

@@ -30,6 +30,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
         dr_baseline(),
         a1_whale(),
         a4_whitewasher(),
+        a2_dropper(),
         honest_hetero_v2(),
         honest_hetero_hard(),
         dr_hetero(),
@@ -249,6 +250,58 @@ pub fn a4_whitewasher() -> Scenario {
     }
 }
 
+/// The A2 DropNotice-refuser scenario (phase 4-in-sim, `4r_a2_spec.md`): the honest world plus
+/// eight voluntary droppers, each shedding `drop_rate = 4%` of its foreign holdings every tick.
+///
+/// **The matched control is NOT the honest node** (unlike A1/A4) — it is the POLITE dropper
+/// (`twin_hook_for(A2)` = `a2_polite_dropper_hook`): the predator (SILENT) and its twin (POLITE)
+/// drop the SAME victims at the SAME rate by the SAME deterministic selection — EQUAL harm — and
+/// differ ONLY in whether each drop is announced. So the comparison isolates the PRICE OF
+/// SILENCE: the silent drop burns the owner's reliability capital `g_oh` at `b_max` (a total-loss
+/// burn ⇒ ≈ 0) and jumps σ; the announced drop rides the F2 notice (dies at T+1) and burns only
+/// `b_ann`. `n = 80`, 8 droppers (10% — enough to tighten the per-seed g_oh aggregate to a
+/// power-5+ verdict), horizon 160 (≥ 3 PoS/σ windows so burn + detection settle), 5 seeds.
+///
+/// **δ is frozen BEFORE the run at 0.15 (anti-Goodhart, spec §3): INV-A2-SILENT-PUNISHED asserts
+/// `g_oh(silent) / g_oh(polite) < 1 − δ = 0.85`.** Calibrating the SCENARIO (drop_rate, n,
+/// horizon) is allowed; the threshold is not.
+pub fn a2_dropper() -> Scenario {
+    Scenario {
+        id: ScenarioId("a2_dropper"),
+        about: "honest world + 8 voluntary droppers (silent predator vs polite twin, EQUAL 4%/tick drop) — the price of silence (g_oh ledger + inflow)",
+        world: WorldParams {
+            n_nodes: 80,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: vec![AdvSpec {
+            id: AdvId::A2DropRefuser,
+            count: 8,
+            info_model: InfoModel::Own,
+            // drop_rate = the shared equal-harm dial (both arms). announce is set by the
+            // injection MODE (predator = silent hook, twin = polite hook), NOT this field.
+            dials: AdvDials {
+                drop_rate: 0.04,
+                ..AdvDials::default()
+            },
+        }],
+        events: Vec::new(),
+        horizon: 160,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![
+            MetricId::AttackRoi,
+            MetricId::Extraction,
+            MetricId::InvariantBoard,
+        ],
+        verdicts: a2_dropper_invariants(),
+        fast: true,
+    }
+}
+
 /// The honest hetero-v2 world (D1): the v2 world with a per-owner DEMAND-CLASS mix (S 60% /
 /// M 30% / L 10%) instead of the uniform blocks_per_node footprint. Measures whether a big
 /// footprint (L-class, 10 blocks) reaches floor under the credit / reciprocity constraint —
@@ -415,6 +468,17 @@ fn adv_consumed(a: &AdvMetrics) -> f64 {
 /// The predator's raw extraction ROI `consumed / served_out`.
 fn adv_roi(a: &AdvMetrics) -> f64 {
     a.roi
+}
+
+/// A2: the price-of-silence ledger — `Σ_O g_oh` (owners' reliability record of the adversary).
+fn adv_retention_g(a: &AdvMetrics) -> f64 {
+    a.retention_g
+}
+
+/// A2: the placement-inflow proxy — total foreign symbols the adversary was ever offered-and-
+/// accepted (`Σ_adv holdings.len()`).
+fn adv_inflow(a: &AdvMetrics) -> f64 {
+    a.inflow_total
 }
 
 /// The flagship restore-truth scalar (Model U, any symbol) for a seed.
@@ -596,6 +660,55 @@ fn a4_whitewasher_invariants() -> Vec<Invariant> {
             id: "INV-ROI-RAW≤TWIN",
             spec: InvariantSpec::AdvComparative {
                 measure: adv_roi,
+                dir: Direction::LessThan,
+            },
+            threshold: 1.0,
+        },
+    ]
+}
+
+/// The `a2_dropper` board (`4r_a2_spec.md` §3): the two structural rows + the price-of-silence
+/// comparative (g_oh ledger) + the placement-inflow comparative. Both are pred(silent)/twin(polite)
+/// ratios (the A2 twin is the POLITE dropper, not the honest node).
+fn a2_dropper_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-A2-SILENT-PUNISHED (spec §3): the silent dropper's reliability capital owners hold
+        // in it (`Σ_O g_oh`) is punished BELOW the polite twin's by more than δ — the price of
+        // silence. Ratio `retention_g(silent)/retention_g(polite) < 1 − δ = 0.85`, δ = 0.15 FROZEN
+        // before the run (anti-Goodhart: calibrate the scenario, never this threshold). LessThan,
+        // power-gated (spec §10 п.16): the silent drop burns `g_oh` at b_max (total loss ⇒ ≈ 0),
+        // the announced drop at b_ann (barely), so this discriminates hard. A twin g_oh of 0 ⇒ NaN
+        // (skipped). This is the LEDGER price — see the report on whether it is yet ENFORCED.
+        Invariant {
+            id: "INV-A2-SILENT-PUNISHED",
+            spec: InvariantSpec::AdvComparative {
+                measure: adv_retention_g,
+                dir: Direction::LessThan,
+            },
+            threshold: 0.85,
+        },
+        // INV-A2-INFLOW (spec §3): owners turn away from the silent dropper ⇒ its placement
+        // inflow (foreign symbols offered-and-accepted) sits BELOW the polite twin's. Ratio
+        // `inflow(silent)/inflow(polite) < 1.0` (the natural no-effect boundary, frozen). LessThan,
+        // power-gated. HONEST NOTE (report): the DECISIVE placement path (post-0.3 sim-unification)
+        // reads only the surface PoS-window, NOT g_oh / drop-counters / σ, so this row is EXPECTED
+        // to land INCONCLUSIVE — the enforcement consumer of the reliability ledger is not yet
+        // wired (spec §3 zoo-gate: σ/drop consumers are phase-4/diagnostic). The row MEASURES that
+        // gap; it is NOT tuned to pass.
+        Invariant {
+            id: "INV-A2-INFLOW",
+            spec: InvariantSpec::AdvComparative {
+                measure: adv_inflow,
                 dir: Direction::LessThan,
             },
             threshold: 1.0,

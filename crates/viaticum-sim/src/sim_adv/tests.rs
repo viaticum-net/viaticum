@@ -1676,6 +1676,182 @@ fn adv_run_is_bit_identical_on_repeat() {
 }
 
 // ------------------------------------------------------------------
+// phase 4-in-sim: A2 DropNotice-refuser (silent vs polite twin)
+// ------------------------------------------------------------------
+
+/// Step ONE A2 arm (silent = Predator / polite = Twin) tick-by-tick, sampling the adversary
+/// aggregate every `every` ticks: (tick, Σ g_oh over non-adv owners, Σ holdings.len, parked gb,
+/// Σ σ). The god-view read used for the report g-curve — no runner plumbing needed.
+fn a2_arm_samples(
+    sc: &Scenario,
+    seed: u64,
+    mode: RunMode,
+    every: u64,
+) -> Vec<(u64, f64, usize, f64, f64)> {
+    use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
+    let params = &sc.world.base;
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world(sc.world.n_nodes, params, seed);
+    let adv_nodes = inject_adversaries(&mut world, &sc.adversaries, params, mode);
+    let n = world.nodes.len();
+    let is_adv = |o: usize| adv_nodes.contains(&o);
+    let mut out = Vec::new();
+    for t in 0..sc.horizon {
+        crate::sim_dynamic::engine::step(&mut world, params, &prior, &policy);
+        if t % every == 0 || t + 1 == sc.horizon {
+            let mut g = 0.0;
+            let mut sigma = 0.0;
+            let mut inflow = 0usize;
+            let mut parked = 0.0;
+            for &adv in &adv_nodes {
+                inflow += world.nodes[adv].holdings.len();
+                for o in 0..n {
+                    if o == adv || is_adv(o) {
+                        continue;
+                    }
+                    g += world.capital[o][adv].g_oh;
+                    sigma += world.capital[o][adv].sigma;
+                }
+                for h in 0..n {
+                    if h == adv || !world.nodes[h].present {
+                        continue;
+                    }
+                    parked += world.nodes[h]
+                        .holdings
+                        .iter()
+                        .filter(|s| s.alive && s.owner == adv)
+                        .map(|s| s.volume)
+                        .sum::<f64>();
+                }
+            }
+            out.push((world.tick, g, inflow, parked, sigma));
+        }
+    }
+    out
+}
+
+#[test]
+fn a2_dropper_is_registered() {
+    assert!(
+        all_scenarios()
+            .iter()
+            .any(|s| s.id.as_str() == "a2_dropper")
+    );
+    let sc = crate::sim_adv::registry::a2_dropper();
+    assert_eq!(sc.adversaries[0].id, AdvId::A2DropRefuser);
+}
+
+#[test]
+fn a2_dropper_silent_and_polite_are_behaviourally_identical_price_only_in_the_ledger() {
+    // THE core A2 finding, stated as an invariant. The silent predator and the polite twin drop
+    // the SAME victims at the SAME rate by the SAME deterministic selection, and the silent/polite
+    // difference (b_max vs b_ann on g_oh, drop_silent vs drop_ann, a σ-jump) touches ONLY capital
+    // fields that NO decision reads (post-0.3 placement = surface PoS-window; eviction = κ_O on
+    // g_ho). So the two arms are BEHAVIOURALLY BIT-IDENTICAL — same inflow, same parked, same
+    // served, same protected — and the price of silence lands ENTIRELY in the reliability ledger
+    // `Σ g_oh` (silent ≪ polite). This is why INV-A2-INFLOW cannot yet discriminate.
+    let mut sc = crate::sim_adv::registry::a2_dropper();
+    sc.seeds = vec![42, 43, 44];
+    let result = run(&sc, &sc.seeds.clone());
+    let mut checked = 0;
+    for p in result.per_seed_adv.iter().flatten() {
+        // Behaviourally byte-identical (bit-exact — no RNG diverges between the arms).
+        assert_eq!(
+            p.pred.inflow_total.to_bits(),
+            p.twin.inflow_total.to_bits(),
+            "inflow is BYTE-IDENTICAL silent vs polite (placement is surface-blind to the burn)"
+        );
+        assert_eq!(
+            p.pred.parked_live.to_bits(),
+            p.twin.parked_live.to_bits(),
+            "parked is BYTE-IDENTICAL (equal harm ⇒ equal own-data retention)"
+        );
+        assert_eq!(p.pred.served_out.to_bits(), p.twin.served_out.to_bits());
+        assert_eq!(p.pred.consumed.to_bits(), p.twin.consumed.to_bits());
+        // The ONE divergence: the price of silence in the reliability ledger.
+        assert!(
+            p.pred.retention_g < p.twin.retention_g,
+            "silent's g_oh ledger is punished below polite's: {} < {}",
+            p.pred.retention_g,
+            p.twin.retention_g
+        );
+        // And silent carries suspicion the polite twin does not (diagnostic; σ is kernel-inert).
+        assert!(p.pred.sigma_owed >= 0.0 && p.twin.sigma_owed == 0.0);
+        checked += 1;
+    }
+    assert_eq!(checked, 3, "all three seeds produced an adversary pair");
+}
+
+#[test]
+fn a2_dropper_board_silent_punished_passes_and_inflow_is_inconclusive() {
+    // The frozen 5-seed board (δ = 0.15 ⇒ threshold 0.85, frozen BEFORE the run). The
+    // price-of-silence LEDGER row PASSES with margin (silent's g_oh ≪ polite's); the INFLOW
+    // enforcement row is INCONCLUSIVE (ratio exactly 1 — the reliability ledger is not yet wired
+    // to any decision). The INCONCLUSIVE is the honest measurement of that gap, NOT a tuning miss.
+    let sc = crate::sim_adv::registry::a2_dropper();
+    let result = run(&sc, &sc.seeds.clone());
+    let verdicts = evaluate_board(&sc, &result);
+    let ids: Vec<&str> = verdicts.iter().map(|v| v.id).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "INV-DETERMINISM",
+            "INV-ANTI-ORACLE",
+            "INV-A2-SILENT-PUNISHED",
+            "INV-A2-INFLOW",
+        ]
+    );
+    let by = |id: &str| verdicts.iter().find(|v| v.id == id).unwrap();
+    assert_eq!(by("INV-DETERMINISM").kind, VerdictKind::Pass);
+    assert_eq!(by("INV-ANTI-ORACLE").kind, VerdictKind::Pass);
+    let punished = by("INV-A2-SILENT-PUNISHED");
+    assert_eq!(
+        punished.kind,
+        VerdictKind::Pass,
+        "silence must be punished in the ledger (effect {}, power {})",
+        punished.effect,
+        punished.power
+    );
+    assert!(
+        punished.effect < 0.85 && punished.power >= 2.0,
+        "ratio {} < 0.85 with power {} ≥ 2",
+        punished.effect,
+        punished.power
+    );
+    let inflow = by("INV-A2-INFLOW");
+    assert_eq!(
+        inflow.kind,
+        VerdictKind::Inconclusive,
+        "inflow cannot discriminate: placement reads surface only (effect {}, power {})",
+        inflow.effect,
+        inflow.power
+    );
+}
+
+#[test]
+#[ignore = "report generator: run with --ignored --nocapture to dump the A2 tables + g-curve"]
+fn a2_dropper_report_dump() {
+    let sc = crate::sim_adv::registry::a2_dropper();
+    let result = run(&sc, &sc.seeds.clone());
+    let verdicts = evaluate_board(&sc, &result);
+    println!("{}", format_report(&sc, &result, &verdicts));
+    println!("-- g_oh / inflow / parked / σ curve (seed 42; silent vs polite) --");
+    let silent = a2_arm_samples(&sc, 42, RunMode::Predator, 10);
+    let polite = a2_arm_samples(&sc, 42, RunMode::Twin, 10);
+    println!(
+        "  {:>5} | {:>10} {:>10} | {:>7} {:>7} | {:>9} {:>9} | {:>8} {:>8}",
+        "tick", "g_sil", "g_pol", "inf_sil", "inf_pol", "park_sil", "park_pol", "σ_sil", "σ_pol"
+    );
+    for (s, p) in silent.iter().zip(&polite) {
+        println!(
+            "  {:>5} | {:>10.3} {:>10.3} | {:>7} {:>7} | {:>9.1} {:>9.1} | {:>8.3} {:>8.3}",
+            s.0, s.1, p.1, s.2, p.2, s.3, p.3, s.4, p.4
+        );
+    }
+}
+
+// ------------------------------------------------------------------
 // hetero-v2 (D1): per-owner demand classes = the NUMBER of equal blocks
 // ------------------------------------------------------------------
 
