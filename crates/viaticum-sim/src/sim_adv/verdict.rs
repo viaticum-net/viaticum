@@ -102,6 +102,18 @@ pub enum InvariantSpec {
         /// The pass direction.
         dir: Direction,
     },
+    /// A phase-2a-2 COMPARATIVE row using the DIFFERENCE `measure(pred) − measure(twin)` (per seed)
+    /// → mean±σ vs threshold, power<2 gate. Used by INV-A5-DEEP-FLOOR (survival WITH the depth floor
+    /// minus survival WITHOUT it): the difference is well-defined even when the twin baseline is 0
+    /// (the strongest case — the floor saves data the no-floor world evicts entirely), which the
+    /// ratio [`AdvComparative`] cannot express (`x/0` ⇒ NaN, understating a maximal effect). A seed
+    /// with either side NaN contributes NaN (skipped).
+    AdvDifference {
+        /// Extract the compared scalar from an Attack-ROI read (applied to both sides).
+        measure: fn(&AdvMetrics) -> f64,
+        /// The pass direction (the difference vs the threshold).
+        dir: Direction,
+    },
     /// A hetero-v2 (D1) per-CLASS scalar → mean±σ vs threshold, power<2 gate. Reads the
     /// per-seed [`HeteroReport`] from [`RunResult::per_seed_hetero`]; seeds with no hetero
     /// report contribute `NaN` (skipped). Used by INV-HETERO-NO-STARVATION (the L-class
@@ -157,6 +169,10 @@ impl Clone for Invariant {
                     dir: *dir,
                 },
                 InvariantSpec::AdvComparative { measure, dir } => InvariantSpec::AdvComparative {
+                    measure: *measure,
+                    dir: *dir,
+                },
+                InvariantSpec::AdvDifference { measure, dir } => InvariantSpec::AdvDifference {
                     measure: *measure,
                     dir: *dir,
                 },
@@ -415,6 +431,30 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                     threshold: inv.threshold,
                     power,
                     note: "predator vs matched twin (ratio)",
+                }
+            }
+            InvariantSpec::AdvDifference { measure, dir } => {
+                // Per seed: measure(pred) − measure(twin). A side that is NaN ⇒ NaN (skipped).
+                let vals: Vec<f64> = result
+                    .per_seed_adv
+                    .iter()
+                    .map(|p| {
+                        p.as_ref()
+                            .map(|pp| measure(&pp.pred) - measure(&pp.twin))
+                            .unwrap_or(f64::NAN)
+                    })
+                    .collect();
+                let (mean, sigma) = mean_sigma(&vals);
+                let sigma_r = if sigma.is_finite() { sigma } else { 0.0 };
+                let (kind, power) = decide(mean, sigma, inv.threshold, *dir);
+                Verdict {
+                    id: inv.id,
+                    kind,
+                    effect: mean,
+                    sigma: sigma_r,
+                    threshold: inv.threshold,
+                    power,
+                    note: "predator − matched twin (difference)",
                 }
             }
             InvariantSpec::HeteroStatistical { measure, dir } => {

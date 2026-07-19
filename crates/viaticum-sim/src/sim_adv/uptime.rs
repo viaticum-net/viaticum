@@ -104,6 +104,18 @@ impl UptimeProfile {
         }
     }
 
+    /// The mean per-day uptime over `over_ticks` weeks (phase 0). For a phase-deterministic
+    /// profile this is the duty-weighted mean of its on/off `day_uptime`; for a flat profile it is
+    /// the constant. Used by the A3 flapper to derive its matched honest twin's iid rate — the twin
+    /// [`UptimeProfile::Ragged`] is set to the flapper's exact period mean, so the ONLY difference
+    /// between them is the AUTOCORRELATION (bursty on/off vs spread), holding the mean equal.
+    pub fn mean_daily_uptime(self, over_ticks: u64) -> f64 {
+        if over_ticks == 0 {
+            return self.day_uptime(0, 0);
+        }
+        (0..over_ticks).map(|t| self.day_uptime(0, t)).sum::<f64>() / over_ticks as f64
+    }
+
     /// A short label for the tier report / CSV.
     pub fn label(self) -> &'static str {
         match self {

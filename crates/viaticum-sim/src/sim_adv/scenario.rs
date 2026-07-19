@@ -210,6 +210,14 @@ pub struct AdvDials {
     /// A3/A5: flap/vacation period + duty.
     pub period_ticks: u64,
     pub duty: f64,
+    /// A5 (молчащий глубокий): the pause window `[pause_start, pause_start + pause_len)` in TICKS
+    /// during which the deep node goes silent (present = false — no serving, no repair, no PoS).
+    /// `pause_len == 0` ⇒ no pause (the node never goes silent).
+    pub pause_start: u64,
+    pub pause_len: u64,
+    /// A6 (дискриминатор): an owner counts as SMALL (dropped) iff its footprint
+    /// `own_blocks.len() <= discr_max_blocks`. `0` ⇒ never discriminate (no owner is small).
+    pub discr_max_blocks: usize,
     /// A7/A8/A9: group size + shared subnet.
     pub group_size: usize,
     pub group_subnet: u32,
@@ -426,15 +434,28 @@ pub struct AdvAction {
     /// the EXISTING silent-loss path (dies now, detected next PoS round, `t_n = 0`,
     /// `b_max`, `drop_silent`, σ-jump). Ignored when `drop_frac_per_tick` is `None`.
     pub announce_drops: bool,
+    /// A5 (молчащий глубокий): when `true` the deep node goes PRESENT = false this tick — a PAUSE,
+    /// not a death: it stops serving / repairing / running PoS, but its capital, holdings and own
+    /// blocks are UNTOUCHED (unlike churn / whitewash / disaster). Consumed by [`super::engine`]'s
+    /// A5 pause pass (which only ever manages the A5 role's presence — see the engine docs). The
+    /// deep node's OWN parked data then erodes in κ_O over the pause (g_ho decays fast, the A.4
+    /// loyalty depth slow) — the W10/Р-1 depth-floor test. Default `false` (no pause).
+    pub offline: bool,
+    /// A6 (дискриминатор): when `true`, the adversary's voluntary drop targets ONLY SMALL owners
+    /// (footprint `own_blocks.len() <= dials.discr_max_blocks`), dropped SILENTLY — "serves the
+    /// large, sheds the small". Combined with `drop_frac_per_tick`. Default `false`.
+    pub discriminate: bool,
 }
 
 impl AdvAction {
-    /// The honest / no-op action: no accept override, no rejoin, no voluntary drop.
+    /// The honest / no-op action: no accept override, no rejoin, no voluntary drop, no pause.
     pub const NOOP: AdvAction = AdvAction {
         accept_rate: None,
         rejoin: false,
         drop_frac_per_tick: None,
         announce_drops: false,
+        offline: false,
+        discriminate: false,
     };
 }
 

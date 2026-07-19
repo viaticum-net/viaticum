@@ -39,6 +39,7 @@ use crate::sim_dynamic::engine::{DynParams, depth_params_of, retention_cap, v_pe
 use crate::sim_dynamic::generator::{Archetype, OwnBlock, World};
 
 use crate::sim_adv::scenario::{AdvAction, AdvContext, AdvId, AdvRole, AdvSpec, BehaviorHook};
+use crate::sim_adv::uptime::UptimeProfile;
 
 /// Which side of the matched comparison a run is on: the predator (hooks active) or its
 /// honest twin (identical construction, hooks OFF — the matched control).
@@ -119,14 +120,55 @@ pub fn a2_polite_dropper_hook(ctx: &AdvContext) -> AdvAction {
     }
 }
 
-/// The behaviour hook for a predator id in the PREDATOR arm. Phase 1 implements A1 + A4 + A2
-/// (A2 predator = the SILENT dropper); the rest are still skeleton (a no-op hook) — an A3/A5+
-/// scenario would run but exert no adversary pressure (their tranches are later — spec §6).
+/// A3 flapper: the FLAP itself is the bursty UPTIME PROFILE ([`install_adv_uptime`] installs a
+/// [`crate::sim_adv::uptime::UptimeProfile::Seasonal`] on/off cycle in the predator arm and a
+/// mean-matched iid [`crate::sim_adv::uptime::UptimeProfile::Ragged`] on the twin), NOT a BEHAVIOUR
+/// override — so the hook is a no-op. The flapper serves honestly WHEN it is up; its σ/pass
+/// divergence from the mean-matched honest twin comes entirely from the availability autocorrelation.
+pub fn a3_flapper_hook(_ctx: &AdvContext) -> AdvAction {
+    AdvAction::NOOP
+}
+
+/// A5 деep-silent: the deep node goes silent (PRESENT = false — a PAUSE, not a death) for the
+/// contiguous window `[pause_start, pause_start + pause_len)`, then returns. First-hand: it reads
+/// only its own strategy dials and the tick. Its capital / holdings / own blocks are untouched by
+/// the pause (see `engine::adv_pause`); the depth-floor test is whether its OWN parked data survives
+/// the κ_O erosion of the silence.
+pub fn a5_deep_silent_hook(ctx: &AdvContext) -> AdvAction {
+    let start = ctx.dials.pause_start;
+    let len = ctx.dials.pause_len;
+    let paused = len > 0 && ctx.tick >= start && ctx.tick < start.saturating_add(len);
+    AdvAction {
+        offline: paused,
+        ..AdvAction::NOOP
+    }
+}
+
+/// A6 discriminator: as a HOLDER it SILENTLY drops the symbols of SMALL owners (footprint
+/// `own_blocks.len() <= dials.discr_max_blocks`) every tick — "serves the large, sheds the small".
+/// `drop_frac_per_tick = 1.0` ⇒ it sheds ALL currently-held small-owner data each tick, so it never
+/// retains a small owner. Serves large owners fully (`accept_rate = None`). The victim-restriction
+/// to small owners is applied in `engine::adv_voluntary_drops` via `discriminate`.
+pub fn a6_discriminator_hook(_ctx: &AdvContext) -> AdvAction {
+    AdvAction {
+        drop_frac_per_tick: Some(1.0),
+        announce_drops: false,
+        discriminate: true,
+        ..AdvAction::NOOP
+    }
+}
+
+/// The behaviour hook for a predator id in the PREDATOR arm. A1 ε-whale, A4 whitewasher, A2 silent
+/// dropper, A5 deep-silent pause, A6 discriminatory drop. A3's flap is an uptime profile (not a
+/// hook), so its predator hook is a no-op; the rest (A7+) are skeleton no-ops (later tranches).
 pub fn hook_for(id: AdvId) -> BehaviorHook {
     match id {
         AdvId::A1EpsilonWhale => a1_epsilon_whale_hook,
         AdvId::A4Whitewasher => a4_whitewasher_hook,
         AdvId::A2DropRefuser => a2_silent_dropper_hook,
+        AdvId::A3Flapper => a3_flapper_hook,
+        AdvId::A5DeepSilent => a5_deep_silent_hook,
+        AdvId::A6Discriminator => a6_discriminator_hook,
         _ => noop_hook,
     }
 }
@@ -139,6 +181,13 @@ pub fn hook_for(id: AdvId) -> BehaviorHook {
 pub fn twin_hook_for(id: AdvId) -> BehaviorHook {
     match id {
         AdvId::A2DropRefuser => a2_polite_dropper_hook,
+        // A5's matched control is the SAME deep node PAUSING IDENTICALLY, differing ONLY in the
+        // depth-floor dial (`depth_w_d = 0` via `twin_params`, spec: "тот же узел в мире с w_d=0").
+        // So the twin must ALSO run the pause hook — the pause is the constant, the D-floor the
+        // isolated variable (analogous to A2's polite twin isolating announcedness).
+        AdvId::A5DeepSilent => a5_deep_silent_hook,
+        // A1/A4/A3/A6: the matched control is the HONEST node (hooks off). For A3 the flap is the
+        // uptime profile (mode-differentiated in `install_adv_uptime`), so its hook stays noop here.
         _ => noop_hook,
     }
 }
@@ -193,6 +242,49 @@ pub fn inject_adversaries(
         }
     }
     nodes
+}
+
+/// World-v3 phase-2a-2 (A3): install the FLAPPER's structural uptime profile on each A3 adversary
+/// slot, MODE-DIFFERENTIATED — the predator flaps (a bursty [`UptimeProfile::Seasonal`] on/off cycle
+/// of `period_ticks` weeks, `duty` active), the twin is a mean-matched HONEST diurnal (an iid
+/// [`UptimeProfile::Ragged`] whose per-day rate equals the flapper's exact period mean). So the ONLY
+/// difference between the arms is the AUTOCORRELATION of absence (clustered off-runs vs spread), the
+/// σ/pass discriminator the diagnostic measures. Every OTHER predator id is left on its archetype
+/// uptime (A5 pauses via PRESENCE, not surfacing; A1/A2/A4/A6 do not touch availability). Called by
+/// the runner AFTER injection (and after any tiered assign), so it wins the A3 slots. Deterministic,
+/// no RNG (the profiles are structural; the surfacing draw rides the existing `SURFACE_TAG` stream).
+pub fn install_adv_uptime(world: &mut World, adv_nodes: &[usize], mode: RunMode) {
+    for &node in adv_nodes {
+        let Some(role) = world.adv[node].as_ref() else {
+            continue;
+        };
+        if role.id != AdvId::A3Flapper {
+            continue;
+        }
+        let period = role.dials.period_ticks.max(2);
+        let duty = role.dials.duty.clamp(0.0, 1.0);
+        let flapper = UptimeProfile::Seasonal { period, duty };
+        world.uptime[node] = Some(match mode {
+            RunMode::Predator => flapper,
+            RunMode::Twin => UptimeProfile::Ragged {
+                p: flapper.mean_daily_uptime(period),
+            },
+        });
+    }
+}
+
+/// The MATCHED-TWIN dial override for a scenario's adversaries (spec: some predators' matched control
+/// differs from the honest node by ONE DIAL, not a hook). A5 (молчащий глубокий): the twin is the
+/// SAME deep node in a world with the depth floor OFF (`depth_w_d = 0`), so its parked data's
+/// survival across the pause is measured WITHOUT the W10/Р-1 loyalty floor — the isolated variable.
+/// `None` for every other predator (their twin shares the predator's dials). Applied by the runner
+/// to the TWIN arm's `DynParams` only; the predator arm is untouched.
+pub fn twin_dial_override(adversaries: &[AdvSpec]) -> Option<(&'static str, f64)> {
+    if adversaries.iter().any(|a| a.id == AdvId::A5DeepSilent) {
+        Some(("depth_w_d", 0.0))
+    } else {
+        None
+    }
 }
 
 /// Configure one node into the shared (mode-independent) adversary shape: a present-from-t0,
@@ -299,6 +391,25 @@ pub struct AdvMetrics {
     /// INV-A2-RETENTION board row is fed by `parked_integral`, and the enforcement PROOF is
     /// the κ_O row INV-A2-SILENT-PUNISHED). `0` when no adversary ran.
     pub data_evicted: f64,
+    /// A3 (флаппер) DIAGNOSTIC: the fraction of run ticks the adversary SURFACED in the 7-day PoS
+    /// window (the PoS PASS proxy as a HOLDER). Runner-accumulated over all ticks / all adv nodes.
+    /// `NaN` for a non-A3 scenario. The finding is the pred(bursty)-vs-twin(iid) gap at equal
+    /// `online_frac`: the window forgives the SPREAD twin (~0.99) but not the CLUSTERED flapper.
+    pub surfaced_frac: f64,
+    /// A3 DIAGNOSTIC: the fraction of run ticks the adversary was ONLINE (the REAL storage-time
+    /// proxy). Bursty flapper and iid twin share this by construction (mean-matched), so a divergent
+    /// `surfaced_frac` at equal `online_frac` isolates the autocorrelation effect. `NaN` off-A3.
+    pub online_frac: f64,
+    /// A5 (молчащий глубокий) headline: the deep node's parked-own-symbol SURVIVAL across the pause
+    /// = (alive parked own symbols at pause END) / (alive parked own symbols at pause START). The
+    /// W10/Р-1 depth-floor test — pred (D-floor on) should retain MORE than twin (D-floor off). `NaN`
+    /// off-A5 (no pause window) or if the deep node parked nothing before the pause.
+    pub park_survival: f64,
+    /// A6 (дискриминатор) DIAGNOSTIC: mean ALIVE small-owner volume (gb) the adversary currently
+    /// HOLDS — small = an owner whose footprint `own_blocks.len() <= dials.discr_max_blocks`. The
+    /// discriminator sheds small owners ⇒ ≈ 0; the honest twin retains them ⇒ > 0. The realized
+    /// "мелкий у дискриминатора vs честного" retention. `0` when no adversary ran / no small owners.
+    pub small_retention_gb: f64,
 }
 
 /// Bit-exact equality (the determinism board row). `to_bits` so a deterministically-produced
@@ -317,6 +428,10 @@ pub fn bit_eq(a: &AdvMetrics, b: &AdvMetrics) -> bool {
         && a.retention_g_integral.to_bits() == b.retention_g_integral.to_bits()
         && a.parked_integral.to_bits() == b.parked_integral.to_bits()
         && a.data_evicted.to_bits() == b.data_evicted.to_bits()
+        && a.surfaced_frac.to_bits() == b.surfaced_frac.to_bits()
+        && a.online_frac.to_bits() == b.online_frac.to_bits()
+        && a.park_survival.to_bits() == b.park_survival.to_bits()
+        && a.small_retention_gb.to_bits() == b.small_retention_gb.to_bits()
 }
 
 /// A2 per-tick god-view aggregate of the injected adversaries: `(Σ_O g_oh, Σ parked_live)` where
@@ -420,12 +535,16 @@ pub fn fold_cap_ratio(running: f64, tick_ratio: f64) -> f64 {
 /// `run_cap_ratio` is the per-tick-tracked max Р-7 cap ratio (see [`observe_cap_ratio`]) —
 /// threaded in because the cap engages transiently through the run, not only at the horizon.
 /// (The end-of-run integrals here read only the god-view world, no dials.)
+#[allow(clippy::too_many_arguments)]
 pub fn collect_adv_metrics(
     world: &World,
     nodes: &[usize],
     run_cap_ratio: f64,
     retention_g_integral: f64,
     parked_integral: f64,
+    surfaced_frac: f64,
+    online_frac: f64,
+    park_survival: f64,
 ) -> AdvMetrics {
     let n = world.nodes.len();
 
@@ -437,11 +556,15 @@ pub fn collect_adv_metrics(
     let mut retention_g = 0.0f64;
     let mut sigma_owed = 0.0f64;
     let mut inflow_total = 0.0f64;
+    // A6 read: alive small-owner volume the adversary currently HOLDS (small = footprint ≤ the
+    // adversary's own discrimination threshold, so it is 0 for a non-A6 role with `discr_max = 0`).
+    let mut small_held = 0.0f64;
     let is_adv = |o: usize| nodes.contains(&o);
 
     for &adv in nodes {
         rejoins += world.adv_rejoin_count[adv];
         inflow_total += world.nodes[adv].holdings.len() as f64;
+        let discr_max = world.adv[adv].as_ref().map(|r| r.dials.discr_max_blocks);
         for h in 0..n {
             consumed += world.served[h][adv];
             served_out += world.served[adv][h];
@@ -451,6 +574,19 @@ pub fn collect_adv_metrics(
                 continue;
             }
             parked_live += settled_parked_on(world, adv, h);
+        }
+        // A6 small-owner retention: alive foreign symbols the adversary holds whose owner is small.
+        if let Some(max) = discr_max
+            && max > 0
+        {
+            for s in world.nodes[adv].holdings.iter().filter(|s| s.alive) {
+                if s.owner != adv
+                    && world.adv[s.owner].is_none()
+                    && world.nodes[s.owner].own_blocks.len() <= max
+                {
+                    small_held += s.volume;
+                }
+            }
         }
         // A2 price-of-silence ledger + σ-profile: sum over NON-adversary owners O of the
         // reliability capital `capital[O][adv].g_oh` (owners' record of the adversary's service)
@@ -478,6 +614,8 @@ pub fn collect_adv_metrics(
         .filter(|e| nodes.contains(&e.owner))
         .count() as f64;
 
+    let small_retention_gb = small_held / nodes.len() as f64;
+
     AdvMetrics {
         parked_live,
         max_cap_ratio: run_cap_ratio,
@@ -492,5 +630,9 @@ pub fn collect_adv_metrics(
         retention_g_integral,
         parked_integral,
         data_evicted,
+        surfaced_frac,
+        online_frac,
+        park_survival,
+        small_retention_gb,
     }
 }

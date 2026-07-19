@@ -26,9 +26,10 @@ use crate::sim_adv::hetero::{DemandClass, HeteroReport, HeteroTracker, apply_dem
 use crate::sim_adv::metrics::{MetricSet, collect_metrics};
 use crate::sim_adv::predators::{
     AdvMetrics, RunMode, collect_adv_metrics, fold_cap_ratio, inject_adversaries,
-    observe_adv_aggregates, observe_cap_ratio,
+    install_adv_uptime, observe_adv_aggregates, observe_cap_ratio, twin_dial_override,
 };
 use crate::sim_adv::restore::{RestoreTracker, RestoreTruth};
+use crate::sim_adv::scenario::AdvId;
 use crate::sim_adv::scenario::{Event, EventKind, NodeSel, Scenario, ScenarioId};
 use crate::sim_adv::tier::{TierMix, TierReport, apply_tier_mix, tier_report};
 use crate::sim_dynamic::build_world;
@@ -254,7 +255,18 @@ pub(crate) fn run_one_seed(scenario: &Scenario, seed: u64) -> SeedRun {
 /// Run one seed in the given [`RunMode`] (predator hooks on / off). A `Twin` run injects the
 /// adversaries' CONSTRUCTION but no hooks — the matched honest control.
 pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -> SeedRun {
-    let params = &scenario.world.base;
+    // The MATCHED-TWIN dial override (spec: some predators' control differs by ONE dial, not a
+    // hook). A5's twin is the SAME deep node in a `depth_w_d = 0` world (D-floor OFF). Applied ONLY
+    // to the TWIN arm; the predator arm and every honest scenario keep `scenario.world.base` verbatim
+    // (byte-identical). `depth_w_d` is not read at build time, so the two arms share the same t=0
+    // world and diverge only in eviction dynamics — the clean A/B.
+    let mut params_owned = scenario.world.base; // DynParams is Copy — a value copy, not an alias
+    if mode == RunMode::Twin
+        && let Some((dial, value)) = twin_dial_override(&scenario.adversaries)
+    {
+        let _ = apply_dial(&mut params_owned, dial, value);
+    }
+    let params = &params_owned;
     let prior = SurfacePrior::default();
     let policy = PlacementPolicy::default();
 
@@ -288,6 +300,10 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     // byte-identical). `Predator` installs the hooks; `Twin` injects the same heavy nodes
     // with hooks off (the matched control). Deterministic, no RNG.
     let adv_nodes = inject_adversaries(&mut world, &scenario.adversaries, params, mode);
+    // Phase-2a-2 (A3 флаппер): install the mode-differentiated flapper uptime profile on the A3
+    // slots — bursty Seasonal (predator) vs mean-matched iid Ragged (twin). No-op for every other
+    // predator id (they keep their archetype uptime); leaves the non-A3 slots untouched.
+    install_adv_uptime(&mut world, &adv_nodes, mode);
     // Transche 0.3: enable the god-view R̂-calibration prediction log for sim_adv runs (the
     // engine now appends a forecast at each placement). This is a METRIC channel — it drives
     // NO decision and consumes NO RNG, so the world evolution is bit-identical to the log-off
@@ -322,8 +338,52 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     } else {
         None
     };
+    // Phase-2a-2 A3 (флаппер) diagnostics: surfaced-in-window (the PoS PASS proxy) + online (the
+    // REAL storage-time proxy) counts over the run, summed over the PROFILED adversary nodes (only
+    // an A3 flapper carries an uptime profile). Both accessors are pure functions of (id, seed,
+    // profile, tick) — the SAME draws the engine's PoS reads — so sampling them here perturbs no
+    // decision (determinism preserved). NaN fractions for a scenario with no profiled adversary.
+    let mut a3_surfaced = 0u64;
+    let mut a3_online = 0u64;
+    let mut a3_samples = 0u64;
+    // Phase-2a-2 A5 (молчащий глубокий): the deep nodes + their shared pause window `[pstart, pend)`.
+    // The survival snapshots SUM the alive parked own-symbol count over ALL deep nodes at the pause
+    // boundaries (peak at the start, survivors at the end) — pooling several deep nodes smooths the
+    // per-seed fraction. `None` for a non-A5 scenario (survival ⇒ NaN).
+    let a5: Option<(Vec<usize>, u64, u64)> = {
+        let deep: Vec<usize> = adv_nodes
+            .iter()
+            .copied()
+            .filter(|&node| {
+                world.adv[node]
+                    .as_ref()
+                    .is_some_and(|r| r.id == AdvId::A5DeepSilent && r.dials.pause_len > 0)
+            })
+            .collect();
+        deep.first().and_then(|&first| {
+            world.adv[first].as_ref().map(|r| {
+                (
+                    deep.clone(),
+                    r.dials.pause_start,
+                    r.dials.pause_start.saturating_add(r.dials.pause_len),
+                )
+            })
+        })
+    };
+    let mut a5_peak: Option<usize> = None;
+    let mut a5_survivors: Option<usize> = None;
 
     for t in 0..scenario.horizon {
+        // A5 pause-boundary snapshots (BEFORE the tick advances — so `pend` reads the state after
+        // the last paused tick, before the returning nodes repair in `step`).
+        if let Some((deep, pstart, pend)) = &a5 {
+            if t == *pstart {
+                a5_peak = Some(deep.iter().map(|&d| parked_own_symbols(&world, d)).sum());
+            }
+            if t == *pend {
+                a5_survivors = Some(deep.iter().map(|&d| parked_own_symbols(&world, d)).sum());
+            }
+        }
         // (a) return any victim whose window starts this tick (present=true, empty disk).
         if let Some(victims) = revive_at.remove(&t) {
             for v in victims {
@@ -372,6 +432,20 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
         if let Some(ht) = &mut hetero_tracker {
             ht.observe(&world);
         }
+
+        // (h) A3 flapper diagnostics: sample the surfaced-in-window / online status of each PROFILED
+        //     adversary at the tick that just ran (`t` — the tick the PoS pass used).
+        for &node in &adv_nodes {
+            if world.uptime.get(node).and_then(|o| *o).is_some() {
+                a3_samples += 1;
+                if world.node_surfaced_in_window(node, t) {
+                    a3_surfaced += 1;
+                }
+                if world.node_online(node, t) {
+                    a3_online += 1;
+                }
+            }
+        }
     }
 
     let restore = if tracker.is_active() {
@@ -382,12 +456,21 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     let adv = if adv_nodes.is_empty() {
         None
     } else {
+        let surfaced_frac = frac_or_nan(a3_surfaced, a3_samples);
+        let online_frac = frac_or_nan(a3_online, a3_samples);
+        let park_survival = match (a5_peak, a5_survivors) {
+            (Some(peak), Some(surv)) if peak > 0 => surv as f64 / peak as f64,
+            _ => f64::NAN,
+        };
         Some(collect_adv_metrics(
             &world,
             &adv_nodes,
             run_cap_ratio,
             retention_g_integral,
             parked_integral,
+            surfaced_frac,
+            online_frac,
+            park_survival,
         ))
     };
     let hetero = hetero_tracker.map(|ht| ht.finalize(&world));
@@ -407,6 +490,32 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
         hetero,
         tier,
     }
+}
+
+/// `num / den` as a fraction, `NaN` for an empty denominator (the A3 no-profiled-adversary case).
+fn frac_or_nan(num: u64, den: u64) -> f64 {
+    if den == 0 {
+        f64::NAN
+    } else {
+        num as f64 / den as f64
+    }
+}
+
+/// God-view count of `owner`'s ALIVE parked own-symbols across PRESENT holders (excluding the owner
+/// itself) — the A5 pause-survival snapshot quantity. A holder keeps ≤ 1 symbol per (owner, block)
+/// by the §7 spread, so this counts the distinct surviving placements of the deep node's data.
+fn parked_own_symbols(world: &World, owner: usize) -> usize {
+    let n = world.nodes.len();
+    (0..n)
+        .filter(|&h| h != owner && world.nodes[h].present)
+        .map(|h| {
+            world.nodes[h]
+                .holdings
+                .iter()
+                .filter(|s| s.alive && s.owner == owner)
+                .count()
+        })
+        .sum()
 }
 
 /// God-view count of a block's live symbols (across PRESENT holders) — the R̂-calibration

@@ -31,7 +31,7 @@ use viaticum_core::four_r::{
 };
 
 use crate::generator::Rng;
-use crate::sim_adv::scenario::{AdvAction, AdvContext};
+use crate::sim_adv::scenario::{AdvAction, AdvContext, AdvId};
 use crate::sim_dynamic::generator::{
     BlockPlacement, DAYS_PER_TICK, EvictNoticeKind, EvictionEvent, HeldSymbol, Node, OwnBlock,
     PairCapital, PendingEviction, PredEntry, RepairStat, SilentLoss, World,
@@ -553,6 +553,14 @@ pub fn step(world: &mut World, params: &DynParams, prior: &SurfacePrior, policy:
     // (0a) own-data growth + (0b) incremental joins (§9.1).
     world.grow_own_data();
     activate_joins(world);
+
+    // (0c) World-v3 A5 (молчащий глубокий): drive the deep node's PRESENCE from its hook — a
+    // silent PAUSE (present = false) that stops it serving / repairing / running PoS while leaving
+    // its capital and holdings intact. Done AFTER activate_joins (so a returning node's presence is
+    // the hook's, not a stale join) and BEFORE growth-consuming placement/PoS/eviction, so a paused
+    // owner does NOT repair its eroding parked data (that would mask the depth-floor test). No-op on
+    // every non-A5 path (byte-identical): it only ever touches the A5 role's presence.
+    adv_pause(world, tick);
 
     // (1a) resync placements (drop dead) + (1b) bandwidth-limited place (floor + cream).
     resync_placements(world);
@@ -1559,6 +1567,14 @@ fn adv_voluntary_drops(world: &mut World) {
             Some(f) if f > 0.0 => f,
             _ => continue,
         };
+        // A6 (дискриминатор): when discriminating, the victim pool is restricted to SMALL owners
+        // (footprint `own_blocks.len() <= discr_max_blocks`) — "serves the large, sheds the small".
+        // `discriminate == false` (A2 and every other dropper) keeps the whole foreign pool.
+        let discr_max = if action.discriminate {
+            world.adv[node].as_ref().map(|r| r.dials.discr_max_blocks)
+        } else {
+            None
+        };
 
         // Candidate victims: alive foreign symbols of PRESENT non-adversary owners, not yet
         // noticed for eviction this tick. Carry (holdings-index, owner, block, iota, volume).
@@ -1568,6 +1584,12 @@ fn adv_voluntary_drops(world: &mut World) {
                 continue;
             }
             if world.adv[s.owner].is_some() || !world.nodes[s.owner].present {
+                continue;
+            }
+            // A6 discrimination gate: keep only SMALL owners as drop candidates.
+            if let Some(max) = discr_max
+                && world.nodes[s.owner].own_blocks.len() > max
+            {
                 continue;
             }
             let already_noticed = world
@@ -1855,6 +1877,34 @@ fn churn(world: &mut World, params: &DynParams) {
             for hs in world.nodes[node].holdings.iter_mut() {
                 hs.alive = false;
             }
+        }
+    }
+}
+
+/// World-v3 A5 (молчащий глубокий): drive the A5 role's PRESENCE from its hook `offline` lever —
+/// a silent PAUSE, not a death. `present = !offline`, and NOTHING else: the deep node keeps its
+/// capital (both mirror cells), its holdings, and its own blocks, so when it returns it resumes
+/// exactly where it left off. Distinct from [`churn`] (queues silent losses + kills holdings),
+/// [`whitewash_rejoin`] (wipes capital), and [`disaster_strike`] (loses source + holdings).
+///
+/// **Only the A5 role is managed.** The pass keys on `role.id == A5DeepSilent`, so it never touches
+/// an A1/A2/A4/A6 predator's presence (A4 in particular sets its own presence in `whitewash_rejoin`
+/// and is revived by `activate_joins` — forcing it present here would break the whitewash cadence).
+/// A world with no A5 role does no work and draws no RNG (byte-identical honest path).
+fn adv_pause(world: &mut World, tick: u64) {
+    let n = world.nodes.len();
+    for node in 0..n {
+        let is_a5 = world
+            .adv
+            .get(node)
+            .and_then(|r| r.as_ref())
+            .map(|r| r.id == AdvId::A5DeepSilent)
+            .unwrap_or(false);
+        if !is_a5 {
+            continue;
+        }
+        if let Some(action) = adv_action(world, node, tick) {
+            world.nodes[node].present = !action.offline;
         }
     }
 }

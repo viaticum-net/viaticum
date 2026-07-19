@@ -112,8 +112,26 @@ pub fn format_report(scenario: &Scenario, result: &RunResult, verdicts: &[Verdic
         if let Some(section) = format_a2(result) {
             o.push_str(&section);
         }
-    } else if let Some(section) = format_adv(result) {
-        o.push_str(&section);
+    } else {
+        if let Some(section) = format_adv(result) {
+            o.push_str(&section);
+        }
+        // phase-2a-2 predator appendices (specific diagnostic rows on top of the generic table).
+        if scenario_has(scenario, crate::sim_adv::AdvId::A3Flapper)
+            && let Some(section) = format_a3(result)
+        {
+            o.push_str(&section);
+        }
+        if scenario_has(scenario, crate::sim_adv::AdvId::A5DeepSilent)
+            && let Some(section) = format_a5(result)
+        {
+            o.push_str(&section);
+        }
+        if scenario_has(scenario, crate::sim_adv::AdvId::A6Discriminator)
+            && let Some(section) = format_a6(result)
+        {
+            o.push_str(&section);
+        }
     }
 
     // --- restore-truth (metric №1), only when a Disaster fired ---
@@ -340,6 +358,178 @@ fn format_a2(result: &RunResult) -> Option<String> {
     let _ = writeln!(
         o,
         "        surface PoS-window ONLY (that consumer is honest phase-4 work, out of A2 scope)."
+    );
+    let _ = writeln!(o);
+    Some(o)
+}
+
+/// Does the scenario carry an adversary of `id`?
+fn scenario_has(scenario: &Scenario, id: crate::sim_adv::AdvId) -> bool {
+    scenario.adversaries.iter().any(|a| a.id == id)
+}
+
+/// Mean±σ of the seed-paired DIFFERENCE `f(pred) − f(twin)` (either side NaN ⇒ NaN, skipped).
+fn acol_diff(result: &RunResult, f: impl Fn(&crate::sim_adv::AdvMetrics) -> f64) -> (f64, f64) {
+    let vals: Vec<f64> = result
+        .per_seed_adv
+        .iter()
+        .map(|p| {
+            p.as_ref()
+                .map(|pp| f(&pp.pred) - f(&pp.twin))
+                .unwrap_or(f64::NAN)
+        })
+        .collect();
+    mean_sigma(&vals)
+}
+
+/// A3 (флаппер) DIAGNOSTIC section (phase-2a-2 §A3): the σ-profile / PoS-pass / real-storage gap
+/// between the bursty flapper and its mean-matched iid honest twin. NO board row — this is the
+/// finding fed to the phase-4 σ-cadence design. `None` when no seed had adversaries.
+fn format_a3(result: &RunResult) -> Option<String> {
+    if !result.per_seed_adv.iter().any(|p| p.is_some()) {
+        return None;
+    }
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "-- A3 flapper DIAGNOSTIC: bursty flapper vs mean-matched iid honest twin (mean ± σ over seeds) --"
+    );
+    let _ = writeln!(
+        o,
+        "  {:<26} {:>18} {:>18}",
+        "metric", "flapper (pred)", "iid twin"
+    );
+    let row = |o: &mut String, name: &str, f: fn(&crate::sim_adv::AdvMetrics) -> f64| {
+        let (pm, ps) = acol(result, false, f);
+        let (tm, ts) = acol(result, true, f);
+        let _ = writeln!(
+            o,
+            "  {:<26} {:>11.4} ± {:>4.4} {:>11.4} ± {:>4.4}",
+            name, pm, ps, tm, ts
+        );
+    };
+    row(&mut o, "online-frac (storage)", |a| a.online_frac);
+    row(&mut o, "surfaced-frac (PoS pass)", |a| a.surfaced_frac);
+    row(&mut o, "σ owed Σ", |a| a.sigma_owed);
+    row(&mut o, "g_oh ledger Σ (gb·d)", |a| a.retention_g);
+    row(&mut o, "served_out gb·days", |a| a.served_out);
+    let _ = writeln!(
+        o,
+        "  FINDING (phase-4 σ-cadence): at EQUAL online-frac (mean-matched real storage), the window"
+    );
+    let _ = writeln!(
+        o,
+        "  forgiveness p_w = 1−(1−u)^7 SPREADS the iid twin's misses (surfaced ≈ 1, σ ≈ 0) but the"
+    );
+    let _ = writeln!(
+        o,
+        "  CLUSTERED flapper misses whole off-runs (lower surfaced, higher σ). σ HAS signal against"
+    );
+    let _ = writeln!(
+        o,
+        "  bursting but is INERT — the phase-4 PoS cadence r_0(1+σ) must consume it; the residual gap"
+    );
+    let _ = writeln!(
+        o,
+        "  is the SPREAD-cheap node (iid-low), which the window forgives ≈ fully and σ cannot see."
+    );
+    let _ = writeln!(o);
+    Some(o)
+}
+
+/// A5 (молчащий глубокий) section (phase-2a-2 §A5): the deep node's parked-data SURVIVAL across the
+/// pause WITH the depth floor (pred, `w_d=0.5`) vs WITHOUT (twin, `w_d=0`) — the Р-1/W10 test. `None`
+/// when no seed had adversaries.
+fn format_a5(result: &RunResult) -> Option<String> {
+    if !result.per_seed_adv.iter().any(|p| p.is_some()) {
+        return None;
+    }
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "-- A5 deep-silent: parked-data survival across the pause, DEPTH FLOOR on vs off (mean ± σ) --"
+    );
+    let _ = writeln!(
+        o,
+        "  {:<26} {:>18} {:>18}",
+        "metric", "w_d=0.5 (pred)", "w_d=0 (twin)"
+    );
+    let row = |o: &mut String, name: &str, f: fn(&crate::sim_adv::AdvMetrics) -> f64| {
+        let (pm, ps) = acol(result, false, f);
+        let (tm, ts) = acol(result, true, f);
+        let _ = writeln!(
+            o,
+            "  {:<26} {:>11.4} ± {:>4.4} {:>11.4} ± {:>4.4}",
+            name, pm, ps, tm, ts
+        );
+    };
+    row(&mut o, "park survival (end/peak)", |a| a.park_survival);
+    row(&mut o, "protected gb·days", |a| a.consumed);
+    row(&mut o, "parked live (gb)", |a| a.parked_live);
+    let (dm, ds) = acol_diff(result, |a| a.park_survival);
+    let _ = writeln!(
+        o,
+        "  {:<26} {:>11.4} ± {:>4.4}   [INV-A5-DEEP-FLOOR: >0.10 ⇒ the floor keeps the deep tail alive]",
+        "survival diff (pred−twin)", dm, ds
+    );
+    let _ = writeln!(
+        o,
+        "  NOTE: the mean lift is robustly POSITIVE (the sign; the M-ladder decays with the pause"
+    );
+    let _ = writeln!(
+        o,
+        "        toward τ_slow≈6mo), but the per-seed lift is SEED-realization-dependent (σ ≈ the"
+    );
+    let _ = writeln!(
+        o,
+        "        effect) — the board is INCONCLUSIVE (power<2, WARN-7), NOT a tuned PASS."
+    );
+    let _ = writeln!(o);
+    Some(o)
+}
+
+/// A6 (дискриминатор) section (phase-2a-2 §A6): the cost-or-impunity of shedding small owners — the
+/// discriminator's protected-storage vs its honest twin's, plus the small-owner retention it keeps
+/// (≈ 0) vs the twin's. `None` when no seed had adversaries.
+fn format_a6(result: &RunResult) -> Option<String> {
+    if !result.per_seed_adv.iter().any(|p| p.is_some()) {
+        return None;
+    }
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "-- A6 discriminator: shed-the-small holder vs honest twin (mean ± σ over seeds) --"
+    );
+    let _ = writeln!(
+        o,
+        "  {:<26} {:>18} {:>18}",
+        "metric", "discr (pred)", "honest twin"
+    );
+    let row = |o: &mut String, name: &str, f: fn(&crate::sim_adv::AdvMetrics) -> f64| {
+        let (pm, ps) = acol(result, false, f);
+        let (tm, ts) = acol(result, true, f);
+        let _ = writeln!(
+            o,
+            "  {:<26} {:>11.4} ± {:>4.4} {:>11.4} ± {:>4.4}",
+            name, pm, ps, tm, ts
+        );
+    };
+    row(&mut o, "protected gb·days", |a| a.consumed);
+    row(&mut o, "served_out gb·days", |a| a.served_out);
+    row(&mut o, "small-owner held (gb)", |a| a.small_retention_gb);
+    let (cm, cs) = acol_ratio(result, |a| a.consumed);
+    let _ = writeln!(
+        o,
+        "  {:<26} {:>11.4} ± {:>4.4}   [INV-A6-DISCR-ROI: <1 ⇒ discrimination does NOT pay]",
+        "protected discr/twin", cm, cs
+    );
+    let _ = writeln!(
+        o,
+        "  FINDING (v_free=0): small-owner retention at the discriminator vs the honest holder is the"
+    );
+    let _ = writeln!(
+        o,
+        "  'small held' row; the discr/twin protected ratio is the price (or impunity) of the shed."
     );
     let _ = writeln!(o);
     Some(o)

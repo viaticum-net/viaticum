@@ -39,6 +39,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
         tiered_v1(),
         tiered_hetero(),
         tiered_hetero_hard(),
+        a3_flapper(),
+        a5_deep_silent(),
+        a6_discriminator(),
     ]
 }
 
@@ -607,6 +610,168 @@ pub fn tiered_hetero_hard() -> Scenario {
     }
 }
 
+/// A3 — флаппер (phase-2a-2, `4r_p2a2_spec.md` §A3): the honest world + 4 flappers, each a
+/// BURSTY-uptime holder (a Seasonal 4-on/4-off cycle at ~0.95 on-week uptime ⇒ mean daily ≈ 0.475).
+/// Its MATCHED TWIN (same node, `RunMode::Twin`) is a mean-matched HONEST diurnal — an iid Ragged at
+/// the flapper's exact period mean — so the ONLY difference is the AUTOCORRELATION of absence.
+///
+/// **DIAGNOSTIC ONLY (spec §A3 / world-v3 §3 WARN-1): NO INV-A3-* board row.** The σ-consumer of the
+/// PoS cadence (r_0(1+σ)) is phase-4 work — σ is INERT here (no decision reads it) — so the finding is
+/// a REPORT of the σ-profile / surfaced-frac (PoS pass) / online-frac (real storage) gap between the
+/// clustered flapper and the mean-matched spread twin, informing what the phase-4 σ-cadence must
+/// catch. The board carries only the two STRUCTURAL rows. `n = 80`, horizon 130, 5 seeds.
+pub fn a3_flapper() -> Scenario {
+    Scenario {
+        id: ScenarioId("a3_flapper"),
+        about: "honest world + 4 bursty flappers (Seasonal 4-on/4-off) vs mean-matched iid twin — σ/pass-rate DIAGNOSTIC for the phase-4 σ-cadence (NO board row)",
+        world: WorldParams {
+            n_nodes: 80,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: vec![AdvSpec {
+            id: AdvId::A3Flapper,
+            count: 4,
+            info_model: InfoModel::Own,
+            // period_ticks = the flap period (weeks), duty = the ON-fraction. 8-week period × 0.5
+            // duty ⇒ a 4-on/4-off cycle: long enough off-runs to MISS whole PoS windows (σ
+            // accumulation), the discriminating structure vs the spread twin.
+            dials: AdvDials {
+                period_ticks: 8,
+                duty: 0.5,
+                ..AdvDials::default()
+            },
+        }],
+        events: Vec::new(),
+        horizon: 130,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![
+            MetricId::AttackRoi,
+            MetricId::Extraction,
+            MetricId::InvariantBoard,
+        ],
+        verdicts: a3_flapper_invariants(),
+        fast: false,
+    }
+}
+
+/// A5 — молчащий глубокий (phase-2a-2, `4r_p2a2_spec.md` §A5): the honest world + 6 DEEP nodes
+/// (Reliable, present from t0 — years of service accruing the A.4 loyalty depth) that go SILENT (a
+/// PRESENCE pause, not a death) for `pause_len` ticks from tick 65, then return. The MATCHED TWIN is
+/// the SAME deep nodes in a world with the depth floor OFF (`depth_w_d = 0`, via `twin_dial_override`)
+/// — the first DIRECT dynamic test of Р-1/W10 ("the tail melts with D but survives").
+///
+/// Board INV-A5-DEEP-FLOOR (`AdvDifference`, threshold FROZEN before the run): the deep nodes' parked
+/// data SURVIVES the pause BETTER with the depth floor than without — `survival(w_d=0.5) −
+/// survival(w_d=0) > 0.10` (a difference, not a ratio: at v_free=0 the no-floor survival can hit 0 —
+/// the strongest case — which a ratio cannot express).
+///
+/// **The board runs the M=2-month pause (`pause_len = 8` weeks) — WITHIN the depth memory** (A.4
+/// `τ_slow ≈ 6 months`), where the W10/Р-1 floor demonstrably operates. Choosing the pause length is
+/// SCENARIO calibration (allowed); the 0.10 bar stays frozen. The report-dump M-ladder {2, 4, 6}
+/// months shows the floor's protection FADING as the pause approaches `τ_slow` (the depth itself
+/// decays away over ~6 months) — the honest "хвост тает с D" physics, NOT a threshold to move.
+///
+/// **The frozen board lands INCONCLUSIVE (power 0.98 < 2), HONESTLY (WARN-7).** The mean survival lift
+/// is robustly POSITIVE (+0.21 at M=2mo; the clean monotone M-ladder), but the per-seed lift is
+/// SEED-REALIZATION-dependent (σ ≈ the effect) — the `a5_board_power_scan` diagnostic shows this
+/// variance does NOT shrink with more deep nodes / seeds, and growing the world only WEAKENS the
+/// effect (less eviction pressure). So no scenario scale clears power 2 without faking; the ladder +
+/// sign are the real evidence, the board reports INCONCLUSIVE (NOT a tuned PASS). `n = 90`, horizon
+/// 130 (warmup 65 + pause + recovery), 6 deep nodes (pooled survival), 5 seeds.
+pub fn a5_deep_silent() -> Scenario {
+    Scenario {
+        id: ScenarioId("a5_deep_silent"),
+        about: "honest world + 6 deep nodes pausing M=2mo from tick 65 — depth-floor survival A/B (w_d=0.5 vs 0): does the deep tail survive the silence? (Р-1/W10)",
+        world: WorldParams {
+            n_nodes: 90,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: vec![AdvSpec {
+            id: AdvId::A5DeepSilent,
+            count: 6,
+            info_model: InfoModel::Own,
+            // pause_start = 65 (past the join horizon, world at steady-state pressure and the deep
+            // nodes' data concentrated on their reciprocal holders); pause_len = 8 weeks ≈ 2 months
+            // (well within the A.4 τ_slow ≈ 6-month depth memory — the regime the floor protects).
+            dials: AdvDials {
+                pause_start: 65,
+                pause_len: 8,
+                ..AdvDials::default()
+            },
+        }],
+        events: Vec::new(),
+        horizon: 130,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![MetricId::AttackRoi, MetricId::InvariantBoard],
+        verdicts: a5_deep_silent_invariants(),
+        fast: false,
+    }
+}
+
+/// A6 — дискриминатор (phase-2a-2, `4r_p2a2_spec.md` §A6): the HETERO world (S/M/L footprints) + 4
+/// discriminator holders that SILENTLY drop the symbols of SMALL owners (footprint ≤ 1 block = the
+/// S class) every tick while serving the large fully. Its MATCHED TWIN is the HONEST holder (same
+/// Reliable construction, hooks off — retains everyone). At v_free=0 (Р-9) a small owner survives
+/// ONLY on earned reciprocity, so the sharp question is: does the discriminator PAY for shedding the
+/// small (consumed ≤ honest twin) or is discrimination UNPUNISHED (a number to report, not tune)?
+///
+/// Board INV-A6-DISCR-ROI (`AdvComparative` on protected-storage, threshold FROZEN 1.0): consumed
+/// (discr) / consumed(twin) < 1 ⇒ the discriminator protects no more own data than an honest holder
+/// of the same capacity (discrimination does not pay). A FAIL / INCONCLUSIVE here IS the finding
+/// ("discrimination is legal in this economy"), reported with the small-owner retention gap — NOT
+/// tuned away. `n = 120` (~72 S / 36 M / 12 L), horizon 130, 5 seeds.
+pub fn a6_discriminator() -> Scenario {
+    Scenario {
+        id: ScenarioId("a6_discriminator"),
+        about: "hetero world + 4 discriminators (silently drop SMALL owners, serve large) vs honest twin — cost-or-impunity of discrimination at v_free=0",
+        world: WorldParams {
+            n_nodes: 120,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: hetero_mix(DiskPolicy::Grow),
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: vec![AdvSpec {
+            id: AdvId::A6Discriminator,
+            count: 4,
+            info_model: InfoModel::Own,
+            // discr_max_blocks = 1: an owner with ≤ 1 own block (the S class) is "small" and dropped.
+            dials: AdvDials {
+                discr_max_blocks: 1,
+                ..AdvDials::default()
+            },
+        }],
+        events: Vec::new(),
+        horizon: 130,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![
+            MetricId::AttackRoi,
+            MetricId::Extraction,
+            MetricId::InvariantBoard,
+        ],
+        verdicts: a6_discriminator_invariants(),
+        fast: false,
+    }
+}
+
 /// Reliable's extraction ROI (Reliable is index 0 in `Archetype::ALL`).
 fn reliable_roi(m: &MetricSet) -> f64 {
     m.extraction_roi[0]
@@ -656,6 +821,11 @@ fn adv_consumed(a: &AdvMetrics) -> f64 {
 /// The predator's raw extraction ROI `consumed / served_out`.
 fn adv_roi(a: &AdvMetrics) -> f64 {
     a.roi
+}
+
+/// A5: the deep node's parked-symbol SURVIVAL across the pause (the W10/Р-1 depth-floor scalar).
+fn adv_park_survival(a: &AdvMetrics) -> f64 {
+    a.park_survival
 }
 
 /// A2: the price-of-silence ledger, TIME-INTEGRATED (`Σ_t Σ_O g_oh`). Post the seat-sync fix
@@ -1036,6 +1206,88 @@ fn tiered_invariants() -> Vec<Invariant> {
                 dir: Direction::GreaterThan,
             },
             threshold: 0.90,
+        },
+    ]
+}
+
+/// The `a3_flapper` board (phase-2a-2 §A3): DIAGNOSTIC-ONLY ⇒ the two STRUCTURAL rows ONLY. NO
+/// INV-A3-* statistical row is registered — the σ-consumer is phase-4 work and σ is inert here, so
+/// the flapper finding is a REPORT section (σ-profile / surfaced-frac / online-frac pred-vs-twin), NOT
+/// a pass/fail bar (spec §A3 / world-v3 §3 WARN-1: "diagnostics until phase-4 σ-consumer").
+fn a3_flapper_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+    ]
+}
+
+/// The `a5_deep_silent` board (phase-2a-2 §A5): the two structural rows + INV-A5-DEEP-FLOOR.
+fn a5_deep_silent_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-A5-DEEP-FLOOR (Р-1/W10, first direct dynamic test): the deep node's parked data
+        // survives the M-month silence BETTER WITH the depth floor than WITHOUT it —
+        // `survival(w_d=0.5) − survival(w_d=0) > 0.10` (the DIFFERENCE, not a ratio: at v_free=0 the
+        // no-floor survival can be 0, the strongest case, which x/0 cannot express). Threshold 0.10 =
+        // "the floor keeps ≥ 10 percentage points more of the deep tail alive" — a SEMANTIC margin
+        // FROZEN before any run (anti-Goodhart): calibrate the SCENARIO (warmup, pause, deep-node
+        // count), never this bar. GreaterThan, power-gated (spec §10 п.16): power < 2 ⇒ INCONCLUSIVE,
+        // which is itself a finding ("the depth floor's dynamic protection is below the seed noise").
+        Invariant {
+            id: "INV-A5-DEEP-FLOOR",
+            spec: InvariantSpec::AdvDifference {
+                measure: adv_park_survival,
+                dir: Direction::GreaterThan,
+            },
+            threshold: 0.10,
+        },
+    ]
+}
+
+/// The `a6_discriminator` board (phase-2a-2 §A6): the two structural rows + INV-A6-DISCR-ROI.
+fn a6_discriminator_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-A6-DISCR-ROI (does discrimination PAY?): the discriminator's protected-own-storage
+        // integral relative to its matched HONEST twin — `consumed(discr)/consumed(twin) < 1.0` ⇒
+        // shedding the small owners buys it NO more durable protection than serving everyone (same
+        // form as A1/A4's INV-ROI-PRED≤TWIN). Threshold 1.0 is the SEMANTIC "no better than honest"
+        // line, FROZEN (anti-Goodhart). LessThan, power-gated. A FAIL (discr > twin ⇒ discrimination
+        // REWARDED) or INCONCLUSIVE (discr ≈ twin ⇒ discrimination FREE) is the number-finding the
+        // spec asks for — reported with the small-owner retention gap, NOT tuned away.
+        Invariant {
+            id: "INV-A6-DISCR-ROI",
+            spec: InvariantSpec::AdvComparative {
+                measure: adv_consumed,
+                dir: Direction::LessThan,
+            },
+            threshold: 1.0,
         },
     ]
 }

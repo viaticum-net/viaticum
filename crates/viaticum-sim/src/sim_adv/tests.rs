@@ -11,11 +11,12 @@ use crate::sim_adv::hetero::{
 use crate::sim_adv::metrics::{bit_eq as metrics_bit_eq, collect_metrics, mean_sigma};
 use crate::sim_adv::predators::{
     RunMode, a1_epsilon_whale_hook, a4_whitewasher_hook, bit_eq as adv_bit_eq, fold_cap_ratio,
-    inject_adversaries,
+    inject_adversaries, install_adv_uptime, twin_dial_override,
 };
 use crate::sim_adv::registry::{
-    a1_whale, a4_whitewasher, all_scenarios, dr_baseline, dr_hetero, find_scenario,
-    honest_hetero_hard, honest_hetero_v2, honest_v2, tiered_hetero, tiered_hetero_hard, tiered_v1,
+    a1_whale, a3_flapper, a4_whitewasher, a5_deep_silent, a6_discriminator, all_scenarios,
+    dr_baseline, dr_hetero, find_scenario, honest_hetero_hard, honest_hetero_v2, honest_v2,
+    tiered_hetero, tiered_hetero_hard, tiered_v1,
 };
 use crate::sim_adv::report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
 use crate::sim_adv::restore::{
@@ -3000,4 +3001,296 @@ fn tiered_hetero_hard_is_registered_and_carries_both_reports() {
         t1.floor_completeness_stayers.is_nan() || t1.floor_completeness_stayers >= 0.0,
         "fc_stayers is a valid fraction or NaN"
     );
+}
+
+// ------------------------------------------------------------------
+// phase-2a-2: A3 flapper + A5 deep-silent + A6 discriminator
+// ------------------------------------------------------------------
+
+#[test]
+fn p2a2_scenarios_are_registered_with_their_boards() {
+    assert!(find_scenario("a3_flapper").is_ok());
+    assert!(find_scenario("a5_deep_silent").is_ok());
+    assert!(find_scenario("a6_discriminator").is_ok());
+    // A3 is DIAGNOSTIC-ONLY: the two structural rows, no INV-A3-* statistical bar.
+    let a3_ids: Vec<&str> = a3_flapper().verdicts.iter().map(|v| v.id).collect();
+    assert_eq!(a3_ids, vec!["INV-DETERMINISM", "INV-ANTI-ORACLE"]);
+    // A5 carries the depth-floor row; A6 the discrimination-ROI row.
+    assert!(
+        a5_deep_silent()
+            .verdicts
+            .iter()
+            .any(|v| v.id == "INV-A5-DEEP-FLOOR")
+    );
+    assert!(
+        a6_discriminator()
+            .verdicts
+            .iter()
+            .any(|v| v.id == "INV-A6-DISCR-ROI")
+    );
+}
+
+#[test]
+fn a5_deep_silent_hook_pauses_only_inside_the_window() {
+    // The A5 hook returns `offline` exactly on `[pause_start, pause_start + pause_len)` and honest
+    // (present) everywhere else — the silent pause window, first-hand from its own dials/tick.
+    let dials = AdvDials {
+        pause_start: 65,
+        pause_len: 8,
+        ..AdvDials::default()
+    };
+    let ctx = |tick: u64| AdvContext {
+        adv_node: 0,
+        tick,
+        info_model: InfoModel::Own,
+        dials,
+        joined_tick: 0,
+    };
+    let hook: BehaviorHook = crate::sim_adv::predators::a5_deep_silent_hook;
+    assert!(!hook(&ctx(64)).offline, "before the pause: present");
+    assert!(hook(&ctx(65)).offline, "pause start: offline");
+    assert!(hook(&ctx(72)).offline, "last pause tick: offline");
+    assert!(!hook(&ctx(73)).offline, "return tick: present again");
+    assert!(!hook(&ctx(100)).offline, "well after: present");
+}
+
+#[test]
+fn install_adv_uptime_gives_flapper_a_bursty_profile_and_the_twin_a_mean_matched_iid() {
+    // A3: the predator arm installs the bursty Seasonal flap; the twin arm installs an iid Ragged
+    // whose per-day rate equals the flapper's EXACT period mean (so only the autocorrelation differs).
+    let params = DynParams::default();
+    let spec = AdvSpec {
+        id: AdvId::A3Flapper,
+        count: 2,
+        info_model: InfoModel::Own,
+        dials: AdvDials {
+            period_ticks: 8,
+            duty: 0.5,
+            ..AdvDials::default()
+        },
+    };
+    let mut wp = build_world(30, &params, 7);
+    let nodes = inject_adversaries(
+        &mut wp,
+        std::slice::from_ref(&spec),
+        &params,
+        RunMode::Predator,
+    );
+    install_adv_uptime(&mut wp, &nodes, RunMode::Predator);
+    let flap = wp.uptime[nodes[0]].expect("predator flapper has a profile");
+    assert!(
+        matches!(flap, UptimeProfile::Seasonal { period: 8, .. }),
+        "predator arm is the bursty Seasonal flap: {flap:?}"
+    );
+
+    let mut wt = build_world(30, &params, 7);
+    let nodes_t = inject_adversaries(&mut wt, std::slice::from_ref(&spec), &params, RunMode::Twin);
+    install_adv_uptime(&mut wt, &nodes_t, RunMode::Twin);
+    let twin = wt.uptime[nodes_t[0]].expect("twin has a profile");
+    match twin {
+        UptimeProfile::Ragged { p } => assert!(
+            (p - flap.mean_daily_uptime(8)).abs() < 1e-12,
+            "twin's iid rate matches the flapper's period mean: {p} vs {}",
+            flap.mean_daily_uptime(8)
+        ),
+        other => panic!("twin arm must be an iid Ragged, got {other:?}"),
+    }
+}
+
+#[test]
+fn twin_dial_override_is_depth_floor_off_for_a5_only() {
+    // A5's matched control differs by ONE dial: the depth floor OFF (`depth_w_d = 0`). Every other
+    // predator's twin shares the predator's dials (`None`).
+    assert_eq!(
+        twin_dial_override(&a5_deep_silent().adversaries),
+        Some(("depth_w_d", 0.0))
+    );
+    assert_eq!(twin_dial_override(&a1_whale().adversaries), None);
+    assert_eq!(twin_dial_override(&a3_flapper().adversaries), None);
+    assert_eq!(twin_dial_override(&a6_discriminator().adversaries), None);
+}
+
+#[test]
+fn a3_flapper_is_caught_by_the_window_while_the_mean_matched_iid_twin_is_forgiven() {
+    // A3 DIAGNOSTIC sign: at EQUAL mean daily uptime (online_frac), the CLUSTERED flapper misses whole
+    // off-runs (low surfaced-frac, high σ) while the SPREAD iid twin is forgiven by the 7-day window
+    // (surfaced ≈ 1, σ ≈ 0). This is the finding fed to the phase-4 σ-cadence design.
+    let mut sc = a3_flapper();
+    sc.seeds = vec![42, 43, 44];
+    let result = run(&sc, &sc.seeds.clone());
+    let pred_surf = adv_mean(&result, false, |a| a.surfaced_frac);
+    let twin_surf = adv_mean(&result, true, |a| a.surfaced_frac);
+    let pred_online = adv_mean(&result, false, |a| a.online_frac);
+    let twin_online = adv_mean(&result, true, |a| a.online_frac);
+    let pred_sigma = adv_mean(&result, false, |a| a.sigma_owed);
+    let twin_sigma = adv_mean(&result, true, |a| a.sigma_owed);
+    assert!(
+        (pred_online - twin_online).abs() < 0.05,
+        "mean-matched real storage: flapper online {pred_online} ≈ twin {twin_online}"
+    );
+    assert!(
+        pred_surf < twin_surf - 0.2,
+        "the clustered flapper surfaces far FEWER windows than the forgiven iid twin: {pred_surf} vs {twin_surf}"
+    );
+    assert!(
+        pred_sigma > twin_sigma,
+        "the flapper's clustered misses accumulate σ; the twin's spread misses forget: {pred_sigma} > {twin_sigma}"
+    );
+}
+
+#[test]
+fn a5_depth_floor_lifts_survival_across_a_short_pause() {
+    // A5 headline (Р-1/W10): across a M=2-month silence (within the τ_slow ≈ 6-month depth memory),
+    // the deep nodes' parked data survives BETTER ON AVERAGE with the depth floor (w_d=0.5) than
+    // without (w_d=0) — the loyalty floor keeps the eroding tail's κ_O up so its holders do not
+    // cap-trim it away. This asserts the robust SIGN (mean lift > 0); the per-seed effect is
+    // realization-dependent (σ ~ the effect ⇒ INV-A5-DEEP-FLOOR is INCONCLUSIVE at power < 2, WARN-7
+    // — the honest board verdict, quantified over the frozen 5-seed band; see the M-ladder).
+    let mut sc = a5_deep_silent();
+    sc.seeds = vec![42, 43, 44];
+    let result = run(&sc, &sc.seeds.clone());
+    let pred = adv_mean(&result, false, |a| a.park_survival);
+    let twin = adv_mean(&result, true, |a| a.park_survival);
+    for p in result.per_seed_adv.iter().flatten() {
+        assert!(
+            p.pred.park_survival.is_finite() && p.twin.park_survival.is_finite(),
+            "survival is measured on both arms (peak > 0 at the pause start)"
+        );
+    }
+    assert!(
+        pred > twin,
+        "the depth floor lifts the deep tail's survival across the 2-month pause on average: {pred} > {twin}"
+    );
+}
+
+#[test]
+fn a5_depth_floor_protection_fades_as_the_pause_approaches_tau_slow() {
+    // The physics finding (NOT a threshold to move): the depth floor protects a pause WITHIN its
+    // τ_slow ≈ 6-month memory but its protection FADES as the pause lengthens (the A.4 depth itself
+    // decays away). So the survival lift at M=2mo strictly exceeds the lift at M=6mo.
+    let lift_at = |plen: u64| -> f64 {
+        let mut sc = a5_deep_silent();
+        sc.adversaries[0].dials.pause_len = plen;
+        sc.seeds = vec![42, 43, 44];
+        let result = run(&sc, &sc.seeds.clone());
+        adv_mean(&result, false, |a| a.park_survival) - adv_mean(&result, true, |a| a.park_survival)
+    };
+    let lift_2mo = lift_at(8);
+    let lift_6mo = lift_at(26);
+    assert!(
+        lift_2mo > lift_6mo,
+        "depth-floor protection fades with the pause length (2mo lift {lift_2mo} > 6mo lift {lift_6mo})"
+    );
+}
+
+#[test]
+fn a6_discriminator_sheds_all_small_owners_while_the_honest_twin_retains_them() {
+    // A6: the discriminator SILENTLY drops every small (S-class, 1-block) owner it holds → its
+    // small-owner retention is ~0; the honest twin of the same capacity retains them (> 0). At
+    // v_free=0 a small owner survives only on earned reciprocity, so this quantifies the shed.
+    let mut sc = a6_discriminator();
+    sc.seeds = vec![42, 43, 44];
+    let result = run(&sc, &sc.seeds.clone());
+    let pred_small = adv_mean(&result, false, |a| a.small_retention_gb);
+    let twin_small = adv_mean(&result, true, |a| a.small_retention_gb);
+    assert!(
+        pred_small < 1e-9,
+        "the discriminator holds ~no small-owner data: {pred_small}"
+    );
+    assert!(
+        twin_small > pred_small,
+        "the honest twin retains small owners the discriminator sheds: {twin_small} > {pred_small}"
+    );
+}
+
+#[test]
+fn p2a2_adv_runs_are_bit_identical_on_repeat() {
+    // Determinism (spec §10 п.13): the whole A3/A5/A6 pred + twin + Attack-ROI path is seeded (the
+    // new levers — A5 presence pause, A6 discriminatory drop, A3 mode-differentiated uptime — draw no
+    // fresh RNG and the surfacing samples are pure functions), so each re-runs bit-identical.
+    for mut sc in [a3_flapper(), a5_deep_silent(), a6_discriminator()] {
+        sc.seeds = vec![42, 43];
+        let seeds = sc.seeds.clone();
+        let r1 = run(&sc, &seeds);
+        let r2 = run(&sc, &seeds);
+        assert!(r1.per_seed_adv.iter().all(|p| p.is_some()), "{}", sc.id);
+        for (a, b) in r1.per_seed_adv.iter().zip(&r2.per_seed_adv) {
+            match (a, b) {
+                (Some(x), Some(y)) => assert!(
+                    adv_bit_eq(&x.pred, &y.pred) && adv_bit_eq(&x.twin, &y.twin),
+                    "{}: Attack-ROI must be bit-identical on repeat",
+                    sc.id
+                ),
+                _ => panic!("{}: both runs must carry adversary pairs", sc.id),
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "A5 depth-floor seed-dependence diagnostic — run with --ignored --nocapture"]
+fn a5_board_power_scan() {
+    // DIAGNOSTIC (documents WHY INV-A5-DEEP-FLOOR is INCONCLUSIVE): the depth-floor's protection of a
+    // deep node's parked data across a pause is SEED-REALIZATION-DEPENDENT, not sampling noise. The
+    // per-seed survival DIFFERENCE (pred − twin) has σ ~ the effect at EVERY scale — pooling more deep
+    // nodes or seeds does NOT shrink it (seed variance dominates), and GROWING the world drops the
+    // effect (a denser world ⇒ more eviction pressure ⇒ the floor matters more). So no scenario scale
+    // clears the power-2 effect-size bar honestly; the mean lift is robustly POSITIVE (the sign, the
+    // M-ladder) but the verdict is INCONCLUSIVE (WARN-7), NOT tuned away. `(count, n, extra_seeds)`.
+    for &(count, n, extra_seeds) in &[
+        (6usize, 90usize, 0usize), // the FROZEN registered config
+        (6, 90, 5),                // + 5 seeds (variance does not shrink)
+        (12, 90, 0),               // more deep nodes (variance does not shrink)
+        (12, 140, 0),              // bigger world (effect DROPS — less pressure)
+    ] {
+        let mut sc = a5_deep_silent();
+        sc.adversaries[0].count = count;
+        sc.world.n_nodes = n;
+        for k in 0..extra_seeds as u64 {
+            sc.seeds.push(47 + k);
+        }
+        let seeds = sc.seeds.clone();
+        let result = run(&sc, &seeds);
+        let diffs: Vec<f64> = result
+            .per_seed_adv
+            .iter()
+            .flatten()
+            .map(|p| p.pred.park_survival - p.twin.park_survival)
+            .collect();
+        let (mean, sigma) = mean_sigma(&diffs);
+        let power = (mean - 0.10).abs() / sigma;
+        println!(
+            "count={count:>2} n={n:>3} seeds={:>2}  diff/seed = {:?}  mean={mean:.4} σ={sigma:.4} power={power:.2}",
+            seeds.len(),
+            diffs
+                .iter()
+                .map(|d| (d * 1000.0).round() / 1000.0)
+                .collect::<Vec<_>>(),
+        );
+    }
+}
+
+#[test]
+#[ignore = "report dump — run with --ignored --nocapture (writes the full tables to stdout)"]
+fn p2a2_report_dump() {
+    for sc in [a3_flapper(), a5_deep_silent(), a6_discriminator()] {
+        let seeds = sc.seeds.clone();
+        let result = run(&sc, &seeds);
+        let verdicts = evaluate_board(&sc, &result);
+        print!("{}", format_report(&sc, &result, &verdicts));
+    }
+    // A5 M-ladder: survival with/without the depth floor at M ∈ {2,4,6} months.
+    println!("\n########## A5 M-ladder (survival pred[w_d=0.5] vs twin[w_d=0]) ##########");
+    for (label, plen) in [("2mo", 8u64), ("4mo", 17), ("6mo", 26)] {
+        let mut sc = a5_deep_silent();
+        sc.adversaries[0].dials.pause_len = plen;
+        let seeds = sc.seeds.clone();
+        let result = run(&sc, &seeds);
+        let pred = adv_mean(&result, false, |a| a.park_survival);
+        let twin = adv_mean(&result, true, |a| a.park_survival);
+        println!(
+            "  M={label} (pause_len={plen}): survival w_d=0.5 = {pred:.4}   w_d=0 = {twin:.4}   diff = {:.4}",
+            pred - twin
+        );
+    }
 }
