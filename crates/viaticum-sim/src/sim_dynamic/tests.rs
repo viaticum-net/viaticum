@@ -3371,6 +3371,102 @@ fn a2_burn_keeps_g_oh_bit_identical_to_the_g_ho_transpose() {
 }
 
 #[test]
+fn disaster_silent_loss_burn_keeps_g_oh_bit_identical_to_g_ho_transpose_through_step() {
+    // The seat-sync ↔ 0.2-wipe JOIN (the hole the standalone wipe-test cannot see). A Disaster
+    // makes the victim a SILENT dropper for every owner whose data it carried (queued to
+    // `pending_silent_loss`) AND wipes the victim's own row `capital[victim][*].g_oh` to zero
+    // while PRESERVING the enforcement transpose `capital[victim][*].g_ho` (the counterparty's
+    // on-disk memory of the victim's service). The silent loss is then drained INSIDE `step`,
+    // which burns G(holder→owner) on BOTH mirror cells — `capital[owner][victim].g_oh` AND the
+    // preserved transpose `capital[victim][owner].g_ho`. If the burn touched only the owner-forecast
+    // cell (the pre-fix seat-sync bug), the victim-as-silent-dropper would KEEP its eviction
+    // protection via the un-burned enforcement key. The standalone wipe-test (`disaster_strike`
+    // with no `step`) never drains the queue, so it cannot catch this; this test drives the full
+    // disaster → step path and asserts the two mirror cells stay bit-identical after the burn.
+    //
+    // We PIN `b_max = 0.5` (a PARTIAL burn) instead of the §13 default 1.0. At the default a
+    // total loss zeroes BOTH cells, so the mirror-equality would degenerate to `0 == 0` — it
+    // still catches the mutation, but does not prove the two cells got the SAME non-zero factor.
+    // With `b_max = 0.5` both land on a shared NON-ZERO value, so the bit-identity below genuinely
+    // discriminates factor-equality, and the `≤ g_pre·(1−b_max)` ceiling is an INDEPENDENT guard
+    // that fails under the mutation without leaning on the equality. (The default-`b_max`
+    // total-loss zeroing is already covered by the a2 sibling + the standalone wipe-test.)
+    let mut params = params_v_free_pinned();
+    params.burn_b_max = 0.5;
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let v = params.block_volume / params.k_eff as f64;
+    let victim = 1usize; // holds `owner`'s data → the disaster is a silent loss to `owner`
+    let owner = 2usize;
+    let mut world = mk_clean_world(&params, 17);
+
+    // Victim HOLDS owner's data (so the disaster queues a silent loss for `owner`).
+    give_foreign_symbol(&mut world, victim, owner, 1.0, v);
+    // Seed the mirror cells EQUAL + positive (the g_oh ≡ g_ho^T invariant precondition) so the
+    // burn is measurable. `capital[owner][victim].g_oh` = owner's forecast of victim-as-holder;
+    // `capital[victim][owner].g_ho` = the enforcement transpose (preserved by the wipe).
+    world.capital[owner][victim].g_oh = 100.0;
+    world.capital[victim][owner].g_ho = 100.0;
+    let g_pre = world.capital[owner][victim].g_oh;
+
+    // Disaster: victim loses its disk. Silent loss queued for `owner`; victim row `.g_oh` wiped,
+    // `.g_ho` preserved. (Mirrors the runner: the event is applied BEFORE `step(T)`.)
+    disaster_strike(&mut world, victim);
+    assert_eq!(
+        world.capital[victim][owner].g_oh, 0.0,
+        "wipe zeroes the victim's own forecast copy (died with the disk)"
+    );
+    assert_eq!(
+        world.capital[victim][owner].g_ho, g_pre,
+        "wipe PRESERVES the enforcement transpose (the counterparty's on-disk memory)"
+    );
+    assert_eq!(
+        world.capital[owner][victim].g_oh, g_pre,
+        "owner's own row is untouched by the victim's disaster"
+    );
+    assert!(
+        world
+            .pending_silent_loss
+            .iter()
+            .any(|sl| sl.holder == victim && sl.owner == owner),
+        "precondition: the disaster queued a silent loss for the carried owner"
+    );
+
+    // Drain inside `step` (the queue drains in the SAME step, per the runner's 0.2-timing). The
+    // victim stays absent — the owner detects the loss and burns regardless.
+    world.tick = 1;
+    step(&mut world, &params, &prior, &policy);
+
+    // THE seat-sync property through the disaster path: both mirror cells were burned by the SAME
+    // (non-zero) factor ⇒ they stay bit-identical (this was the bug).
+    assert_eq!(
+        world.capital[owner][victim].g_oh.to_bits(),
+        world.capital[victim][owner].g_ho.to_bits(),
+        "seat-sync holds through disaster → step: g_oh ≡ g_ho^T stays bit-identical"
+    );
+    // INDEPENDENT of the equality: the preserved enforcement key was co-burned to at most
+    // g_pre·(1−b_max) (the single-tick decay only shrinks it further). WITHOUT the co-burn it
+    // would merely have DECAYED from g_pre (≈ g_pre, far above this ceiling), so this assertion
+    // alone fails under the mutation. It must also stay strictly positive — the partial burn is
+    // non-degenerate (not a total zero that would make the ceiling trivially 0).
+    let burned_ceiling = g_pre * (1.0 - params.burn_b_max);
+    assert!(
+        world.capital[victim][owner].g_ho <= burned_ceiling + 1e-9,
+        "enforcement key co-burned to ≤ g_pre·(1−b_max) = {burned_ceiling}, got {}",
+        world.capital[victim][owner].g_ho
+    );
+    assert!(
+        world.capital[victim][owner].g_ho > 0.0,
+        "the partial (b_max<1) burn is non-degenerate, not a total zero: {}",
+        world.capital[victim][owner].g_ho
+    );
+    assert!(
+        world.burn_silent_count >= 1,
+        "the silent-loss burn path fired inside step"
+    );
+}
+
+#[test]
 fn a2_silent_drop_zeroes_reliability_capital_while_announced_barely_dents_it() {
     // The price of silence at the burn level: a SILENT voluntary drop rides the silent-loss path
     // (b_max = 1.0, total loss ⇒ g_oh → 0); an ANNOUNCED drop rides the F2 notice (b_ann = 0.05
