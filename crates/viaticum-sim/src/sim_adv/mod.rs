@@ -42,6 +42,7 @@ pub mod bootstrap;
 pub mod brier;
 pub mod cli;
 pub mod hetero;
+pub mod inflow;
 pub mod metrics;
 pub mod predators;
 pub mod registry;
@@ -59,12 +60,15 @@ pub use cli::{Cli, SimAdvError, Sweep, parse_cli};
 pub use hetero::{
     ClassMetrics, DemandClass, DemandMix, HeteroReport, HeteroSample, apply_demand_classes,
 };
+pub use inflow::{
+    InflowPolicy, PopSeries, apply_inflow, expected_outflow, pool_size, present_count,
+};
 pub use metrics::MetricSet;
 pub use predators::{AdvMetrics, RunMode, collect_adv_metrics, hook_for, inject_adversaries};
 pub use registry::{all_scenarios, find_scenario};
 pub use report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
 pub use restore::{BlockOutcome, RestoreTracker, RestoreTruth};
-pub use runner::{AdvPair, FiredEvent, RunResult, run, run_sweep};
+pub use runner::{AdvPair, FiredEvent, RunResult, population_curve, run, run_sweep};
 pub use scenario::{
     AdvAction, AdvContext, AdvDials, AdvId, AdvRole, AdvSpec, BehaviorHook, Event, EventKind,
     InfoModel, MetricId, NodeSel, Scenario, ScenarioId, WorldParams,

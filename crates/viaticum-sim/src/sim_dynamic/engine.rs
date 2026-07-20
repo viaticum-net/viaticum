@@ -1910,8 +1910,10 @@ fn adv_pause(world: &mut World, tick: u64) {
 }
 
 /// How strongly archetype aggression raises the churn rate (§9.4). Chosen so a Hoarder
-/// (aggression 0.7) churns at ~3× the base, matching the old flat multiplier.
-const CHURN_AGGRESSION_SCALE: f64 = 2.857;
+/// (aggression 0.7) churns at ~3× the base, matching the old flat multiplier. `pub` so the
+/// inflow-calibration (`sim_adv::inflow::expected_outflow`) can size λ_in from the SAME
+/// churn multiplier the engine applies (the outflow it must replace).
+pub const CHURN_AGGRESSION_SCALE: f64 = 2.857;
 
 /// World-v3 phase-1 (A4): node `node` BURNS its identity and re-enters fresh next tick — the
 /// whitewash cycle. Called from [`churn`] when the A4 hook returns `rejoin`. Distinct from a

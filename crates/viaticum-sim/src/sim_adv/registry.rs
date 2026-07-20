@@ -7,6 +7,7 @@
 
 use crate::sim_adv::cli::SimAdvError;
 use crate::sim_adv::hetero::{DemandClass, DemandMix, DiskPolicy, HeteroReport};
+use crate::sim_adv::inflow::{InflowPolicy, POP_BAND, PopSeries, expected_outflow, pool_size};
 use crate::sim_adv::metrics::MetricSet;
 use crate::sim_adv::predators::AdvMetrics;
 use crate::sim_adv::restore::RestoreTruth;
@@ -37,6 +38,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
         honest_hetero_hard(),
         dr_hetero(),
         tiered_v1(),
+        tiered_v1_inflow(),
         tiered_hetero(),
         tiered_hetero_hard(),
         a3_flapper(),
@@ -107,6 +109,7 @@ pub fn honest_v2() -> Scenario {
             demand: DemandMix::Uniform,
             uptime: UptimeMix::Legacy,
             tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
         },
         // The engine's canonical §3 mixes (documented for the report header).
         population: vec![
@@ -160,6 +163,7 @@ pub fn dr_baseline() -> Scenario {
             demand: DemandMix::Uniform,
             uptime: UptimeMix::Legacy,
             tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -205,6 +209,7 @@ pub fn a1_whale() -> Scenario {
             demand: DemandMix::Uniform,
             uptime: UptimeMix::Legacy,
             tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -253,6 +258,7 @@ pub fn a4_whitewasher() -> Scenario {
             demand: DemandMix::Uniform,
             uptime: UptimeMix::Legacy,
             tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -313,6 +319,7 @@ pub fn a2_dropper() -> Scenario {
             demand: DemandMix::Uniform,
             uptime: UptimeMix::Legacy,
             tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -366,6 +373,7 @@ pub fn honest_hetero_v2() -> Scenario {
             demand: hetero_mix(DiskPolicy::Grow),
             uptime: UptimeMix::Legacy,
             tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -402,6 +410,7 @@ pub fn honest_hetero_hard() -> Scenario {
             demand: hetero_mix(DiskPolicy::Fixed),
             uptime: UptimeMix::Legacy,
             tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -439,6 +448,7 @@ pub fn dr_hetero() -> Scenario {
             demand: hetero_mix(DiskPolicy::Grow),
             uptime: UptimeMix::Legacy,
             tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -499,6 +509,7 @@ pub fn tiered_v1() -> Scenario {
             demand: DemandMix::Uniform,
             uptime: UptimeMix::Tiered,
             tier_mix: tiered_mix(),
+            inflow: InflowPolicy::None,
         },
         population: honest_v2().population,
         tiers: vec![
@@ -519,6 +530,63 @@ pub fn tiered_v1() -> Scenario {
         ],
         verdicts: tiered_invariants(),
         // Long horizon ⇒ NOT a fast-mode member (nightly / on-demand only).
+        fast: false,
+    }
+}
+
+/// The inflow bootstrap setpoint `n0` for [`tiered_v1_inflow`] (`4r_inflow_spec.md` §3): 180 — the
+/// SAME cohort size as [`tiered_v1`], so the without-vs-with-inflow comparison holds n0 fixed and
+/// isolates the arrival stream. The world's total node count is `n0 + pool` (the pool sized by λ_in).
+const INFLOW_N0: usize = 180;
+
+/// `tiered_v1` + a STEADY inflow stream (`4r_inflow_spec.md`): the P7 tiered honest world, but with a
+/// pre-allocated pool of newcomers arriving at λ_in ≈ the expected churn outflow at n0, so the 520-tick
+/// (10-year) horizon reaches a STATIONARY population instead of the closed cohort's die-off (180 → ~59).
+///
+/// The comparison is against [`tiered_v1`] (same n0 = 180, no inflow): its present-count COLLAPSES to
+/// ~31 % over the horizon; here it should hold within ±25 % of the setpoint over the last half
+/// (INV-POP-STATIONARY, threshold FROZEN before the run). λ_in is the expected per-tick outflow at n0
+/// under the §3 mix ([`expected_outflow`]) — an OPEN calibration guess, NOT tuned; a residual drift is
+/// an HONEST finding to report (spec §4). Total nodes = n0 + [`pool_size`]; the un-arrived pool tail is
+/// inert buffer, excluded from every metric. The per-tier P7 table is now read on this STABLE world
+/// (compare to the closed-cohort `tiered_v1` "2a" table). `n0 = 180`, 520 ticks, 5 seeds.
+pub fn tiered_v1_inflow() -> Scenario {
+    let horizon = 520;
+    let lambda = expected_outflow(INFLOW_N0, DynParams::default().churn_out_prob);
+    let n_nodes = INFLOW_N0 + pool_size(lambda, horizon);
+    Scenario {
+        id: ScenarioId("tiered_v1_inflow"),
+        about: "tiered_v1 + steady newcomer inflow (λ_in ≈ churn outflow at n0=180) over 520 ticks — the population reaches STATIONARY instead of the closed-cohort die-off",
+        world: WorldParams {
+            n_nodes,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
+            uptime: UptimeMix::Tiered,
+            tier_mix: tiered_mix(),
+            inflow: InflowPolicy::Steady {
+                joins_per_tick: lambda,
+            },
+        },
+        population: honest_v2().population,
+        tiers: vec![
+            (GiverTier::T1, 0.15),
+            (GiverTier::T2, 0.25),
+            (GiverTier::T3, 0.40),
+            (GiverTier::T4, 0.20),
+        ],
+        adversaries: Vec::new(),
+        events: Vec::new(),
+        horizon,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![
+            MetricId::TierReport,
+            MetricId::Extraction,
+            MetricId::InvariantBoard,
+        ],
+        verdicts: tiered_inflow_invariants(),
+        // Long horizon + ~427 nodes (n0 180 + pool 247) ⇒ NOT a fast-mode member (nightly / on-demand only).
         fast: false,
     }
 }
@@ -545,6 +613,7 @@ pub fn tiered_hetero() -> Scenario {
             demand: hetero_mix(DiskPolicy::Grow),
             uptime: UptimeMix::Tiered,
             tier_mix: tiered_mix(),
+            inflow: InflowPolicy::None,
         },
         population: honest_v2().population,
         tiers: vec![
@@ -588,6 +657,7 @@ pub fn tiered_hetero_hard() -> Scenario {
             demand: hetero_mix(DiskPolicy::Fixed),
             uptime: UptimeMix::Tiered,
             tier_mix: tiered_mix(),
+            inflow: InflowPolicy::None,
         },
         population: honest_v2().population,
         tiers: vec![
@@ -632,6 +702,7 @@ pub fn a3_flapper() -> Scenario {
             demand: DemandMix::Uniform,
             uptime: UptimeMix::Legacy,
             tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -697,6 +768,7 @@ pub fn a5_deep_silent() -> Scenario {
             demand: DemandMix::Uniform,
             uptime: UptimeMix::Legacy,
             tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -746,6 +818,7 @@ pub fn a6_discriminator() -> Scenario {
             demand: hetero_mix(DiskPolicy::Grow),
             uptime: UptimeMix::Legacy,
             tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
         },
         population: honest_v2().population,
         tiers: honest_v2().tiers,
@@ -785,6 +858,12 @@ fn tier_giver_gap(t: &TierReport) -> f64 {
 /// INV-TIER-T1-ALIVE scalar: the T1-NAS floor-completeness (the "backbone does not starve" sanity).
 fn tier_t1_floor(t: &TierReport) -> f64 {
     t.t1_floor_completeness()
+}
+
+/// INV-POP-STATIONARY scalar (`4r_inflow_spec.md` §3): the last-half present-count max deviation from
+/// the setpoint. `< POP_BAND` ⇒ the population held stationary; a drift/collapse pushes it above.
+fn pop_max_dev(p: &PopSeries) -> f64 {
+    p.stationary_max_dev()
 }
 
 /// The L-class NO-STARVATION ratio: the big footprint's floor-completeness relative to the
@@ -1206,6 +1285,40 @@ fn tiered_invariants() -> Vec<Invariant> {
                 dir: Direction::GreaterThan,
             },
             threshold: 0.90,
+        },
+    ]
+}
+
+/// The `tiered_v1_inflow` board (`4r_inflow_spec.md` §3): the two structural rows + INV-POP-STATIONARY.
+/// The tier P7 rank is NOT re-boarded here (the per-tier TABLE is shown for the closed-cohort
+/// comparison via [`MetricId::TierReport`], but the spec makes only the population-stationarity claim a
+/// board row); the lifetime floor-completeness growth is a secondary confirmation in the table.
+fn tiered_inflow_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-POP-STATIONARY (spec §3): with the steady inflow the present-count holds within ±25 %
+        // (POP_BAND) of the setpoint n0 over the LAST HALF of the horizon — a STATIONARY population,
+        // not the closed cohort's monotone die-off. The scalar is the last-half MAX relative deviation
+        // (`stationary_max_dev`); PASS iff mean < POP_BAND (LessThan, power-gated). The threshold is
+        // FROZEN at POP_BAND = 0.25 BEFORE the run (anti-Goodhart): calibrate the SCENARIO (n0, λ_in),
+        // never this bar. A residual drift beyond it is an HONEST finding about the λ_in calibration
+        // (report with the curve, do NOT blind-tune λ_in — spec §4).
+        Invariant {
+            id: "INV-POP-STATIONARY",
+            spec: InvariantSpec::PopStationary {
+                measure: pop_max_dev,
+                dir: Direction::LessThan,
+            },
+            threshold: POP_BAND,
         },
     ]
 }

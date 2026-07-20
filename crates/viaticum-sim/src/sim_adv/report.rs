@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 
 use crate::sim_adv::brier::{Calibration, DEFAULT_BRIER_BUCKETS};
 use crate::sim_adv::hetero::{DemandClass, HeteroReport};
+use crate::sim_adv::inflow::{POP_BAND, PopSeries};
 use crate::sim_adv::metrics::{MetricSet, mean_sigma};
 use crate::sim_adv::restore::{IOTA_BUCKETS, RestoreTruth};
 use crate::sim_adv::runner::{RunResult, SweepRow};
@@ -141,6 +142,11 @@ pub fn format_report(scenario: &Scenario, result: &RunResult, verdicts: &[Verdic
 
     // --- hetero-v2 (D1): per-class placement + the L-footprint curve ---
     if let Some(section) = format_hetero(result) {
+        o.push_str(&section);
+    }
+
+    // --- inflow (4r_inflow_spec.md §3): the present-count population curve + stationarity band ---
+    if let Some(section) = format_population(result) {
         o.push_str(&section);
     }
 
@@ -825,6 +831,74 @@ fn format_hetero(result: &RunResult) -> Option<String> {
             lfull,
         );
     }
+    let _ = writeln!(o);
+    Some(o)
+}
+
+/// Render the inflow POPULATION-CURVE section (`4r_inflow_spec.md` §3): the present-count over
+/// ticks (mean ± σ over seeds, sampled) + the last-half stationarity band around the setpoint.
+/// `None` when no seed carried a population curve (a non-inflow scenario — output unchanged). The
+/// curve is the core inflow deliverable: without inflow the closed cohort collapses; with inflow it
+/// stabilises near the setpoint.
+fn format_population(result: &RunResult) -> Option<String> {
+    let series: Vec<&PopSeries> = result.per_seed_pop.iter().flatten().collect();
+    let first = *series.first()?;
+    let len = first.present_per_tick.len();
+    if len == 0 {
+        return None;
+    }
+    let setpoint = first.setpoint as f64;
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "-- inflow population curve (present nodes per tick, mean ± σ over seeds) --"
+    );
+    let _ = writeln!(
+        o,
+        "  setpoint n0 = {}   band = ±{:.0}%   (open-loop steady arrival; INV-POP-STATIONARY over last half)",
+        first.setpoint,
+        POP_BAND * 100.0,
+    );
+    let _ = writeln!(o, "  {:>6}  {:>16} {:>10}", "tick", "present", "dev%");
+    // Sample ~26 evenly-spaced ticks (plus the last) so the curve is readable at any horizon.
+    let step = (len / 26).max(1);
+    let mut ticks: Vec<usize> = (0..len).step_by(step).collect();
+    if ticks.last() != Some(&(len - 1)) {
+        ticks.push(len - 1);
+    }
+    for &k in &ticks {
+        let vals: Vec<f64> = series
+            .iter()
+            .map(|s| s.present_per_tick[k] as f64)
+            .collect();
+        let (m, s) = mean_sigma(&vals);
+        let dev = if setpoint > 0.0 {
+            (m / setpoint - 1.0) * 100.0
+        } else {
+            f64::NAN
+        };
+        // tick index k is 0-based post-step; show the 1-based tick number.
+        let _ = writeln!(o, "  {:>6}  {:>16} {:>9.1}%", k + 1, ms_cell(m, s, 1), dev);
+    }
+    // Last-half stationarity band: mean present (over seeds) + the INV-POP-STATIONARY max-dev scalar.
+    let lh_vals: Vec<f64> = series.iter().map(|s| s.last_half_mean()).collect();
+    let (lhm, lhs) = mean_sigma(&lh_vals);
+    let dev_vals: Vec<f64> = series.iter().map(|s| s.stationary_max_dev()).collect();
+    let (dm, ds) = mean_sigma(&dev_vals);
+    let fin_vals: Vec<f64> = series.iter().map(|s| s.final_present() as f64).collect();
+    let (fm, fs) = mean_sigma(&fin_vals);
+    let _ = writeln!(
+        o,
+        "  last-half mean present = {}   final present = {}",
+        ms_cell(lhm, lhs, 1),
+        ms_cell(fm, fs, 1),
+    );
+    let _ = writeln!(
+        o,
+        "  last-half max deviation from setpoint = {}   [INV-POP-STATIONARY: < {:.2} ⇒ stationary]",
+        ms_cell(dm, ds, 4),
+        POP_BAND,
+    );
     let _ = writeln!(o);
     Some(o)
 }

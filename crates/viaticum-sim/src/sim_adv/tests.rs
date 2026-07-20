@@ -8,6 +8,10 @@ use crate::sim_adv::cli::{apply_dial, parse_cli, resolve_seeds};
 use crate::sim_adv::hetero::{
     DemandClass, DemandMix, DiskPolicy, apply_demand_classes, bit_eq as hetero_bit_eq,
 };
+use crate::sim_adv::inflow::{
+    InflowPolicy, PopSeries, apply_inflow, bit_eq as pop_bit_eq, bootstrap_n0, expected_outflow,
+    pool_size, present_count,
+};
 use crate::sim_adv::metrics::{bit_eq as metrics_bit_eq, collect_metrics, mean_sigma};
 use crate::sim_adv::predators::{
     RunMode, a1_epsilon_whale_hook, a4_whitewasher_hook, bit_eq as adv_bit_eq, fold_cap_ratio,
@@ -22,7 +26,7 @@ use crate::sim_adv::report::{format_report, format_sweep, restore_csv, run_resul
 use crate::sim_adv::restore::{
     BlockOutcome, IOTA_BUCKETS, RestoreTracker, RestoreTruth, bit_eq as restore_bit_eq, iota_bucket,
 };
-use crate::sim_adv::runner::{run, run_one_seed, run_sweep};
+use crate::sim_adv::runner::{population_curve, run, run_one_seed, run_sweep};
 use crate::sim_adv::scenario::{
     AdvAction, AdvContext, AdvDials, AdvId, AdvSpec, BehaviorHook, Event, EventKind, InfoModel,
     MetricId, NodeSel, Scenario, WorldParams,
@@ -31,7 +35,9 @@ use crate::sim_adv::tier::{
     TIER_ORDER, TierMix, apply_tier_mix, bit_eq as tier_bit_eq, tier_index,
 };
 use crate::sim_adv::uptime::{UptimeMix, UptimeProfile, tier_profile};
-use crate::sim_adv::verdict::{Direction, VerdictKind, decide, evaluate_board};
+use crate::sim_adv::verdict::{
+    Direction, Invariant, InvariantSpec, VerdictKind, decide, evaluate_board,
+};
 use crate::sim_dynamic::build_world;
 use crate::sim_dynamic::engine::{DynParams, whitewash_rejoin_for_test};
 use crate::sim_dynamic::generator::{
@@ -55,6 +61,7 @@ fn tiny_scenario_with_events(events: Vec<(u64, Event)>) -> Scenario {
             demand: DemandMix::Uniform,
             uptime: UptimeMix::Legacy,
             tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
         },
         population: Vec::new(),
         tiers: Vec::new(),
@@ -613,6 +620,7 @@ fn restore_wp(n_nodes: usize, window_days: f64, bw_gb_day: f64) -> WorldParams {
         demand: DemandMix::Uniform,
         uptime: UptimeMix::Legacy,
         tier_mix: TierMix::Backbone,
+        inflow: InflowPolicy::None,
     }
 }
 
@@ -3293,4 +3301,455 @@ fn p2a2_report_dump() {
             pred - twin
         );
     }
+}
+
+// ------------------------------------------------------------------
+// population inflow (4r_inflow_spec.md)
+// ------------------------------------------------------------------
+
+/// The INV-POP-STATIONARY measure for the shrunk board tests (mirrors registry `pop_max_dev`).
+fn dev_measure(p: &PopSeries) -> f64 {
+    p.stationary_max_dev()
+}
+
+/// A shrunk inflow scenario (cheap): honest base + cranked churn + (optionally) a matched steady
+/// inflow. Legacy uptime / backbone tiers keep the per-tick cost low; the 3-row inflow board is
+/// installed so the board-wiring test can read INV-POP-STATIONARY.
+fn small_inflow_scenario(n0: usize, churn: f64, horizon: u64, with_inflow: bool) -> Scenario {
+    let base = DynParams {
+        churn_out_prob: churn,
+        ..DynParams::default()
+    };
+    let lambda = expected_outflow(n0, churn);
+    let (n_nodes, inflow) = if with_inflow {
+        (
+            n0 + pool_size(lambda, horizon),
+            InflowPolicy::Steady {
+                joins_per_tick: lambda,
+            },
+        )
+    } else {
+        (n0, InflowPolicy::None)
+    };
+    Scenario {
+        id: crate::sim_adv::scenario::ScenarioId("inflow_test"),
+        about: "shrunk inflow property/board test",
+        world: WorldParams {
+            n_nodes,
+            base,
+            restore_window_days: 14.0,
+            restore_bw_gb_day: 50.0,
+            demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
+            inflow,
+        },
+        population: Vec::new(),
+        tiers: Vec::new(),
+        adversaries: Vec::new(),
+        events: Vec::new(),
+        horizon,
+        seeds: vec![1],
+        metrics: vec![MetricId::InvariantBoard],
+        verdicts: vec![
+            Invariant {
+                id: "INV-DETERMINISM",
+                spec: InvariantSpec::Determinism,
+                threshold: 1.0,
+            },
+            Invariant {
+                id: "INV-ANTI-ORACLE",
+                spec: InvariantSpec::AntiOracle,
+                threshold: 1.0,
+            },
+            Invariant {
+                id: "INV-POP-STATIONARY",
+                spec: InvariantSpec::PopStationary {
+                    measure: dev_measure,
+                    dir: Direction::LessThan,
+                },
+                threshold: crate::sim_adv::inflow::POP_BAND,
+            },
+        ],
+        fast: true,
+    }
+}
+
+#[test]
+fn inflow_none_leaves_join_schedule_and_present_byte_identical() {
+    // The opt-in default: `InflowPolicy::None` never rewrites the schedule (byte-identical closed
+    // cohort, no new RNG) — the same discipline as DemandMix::Uniform / UptimeMix::Legacy.
+    let params = DynParams::default();
+    let world = build_world(20, &params, 7);
+    let before: Vec<(u64, bool)> = world
+        .nodes
+        .iter()
+        .map(|nd| (nd.joined_tick, nd.present))
+        .collect();
+    let mut world2 = build_world(20, &params, 7);
+    apply_inflow(&mut world2, InflowPolicy::None, 50);
+    let after: Vec<(u64, bool)> = world2
+        .nodes
+        .iter()
+        .map(|nd| (nd.joined_tick, nd.present))
+        .collect();
+    assert_eq!(before, after, "None must not touch joined_tick / present");
+}
+
+#[test]
+fn apply_inflow_steady_marks_pool_absent_and_every_newcomer_arrives_within_horizon() {
+    let params = DynParams::default();
+    let lambda = 2.0;
+    let horizon = 50;
+    let pool = pool_size(lambda, horizon); // round(2*50) = 100
+    assert_eq!(pool, 100);
+    let n0 = 10;
+    let n = n0 + pool;
+    let mut world = build_world(n, &params, 3);
+    // Snapshot the bootstrap cohort's schedule (must be left untouched).
+    let boot_before: Vec<(u64, bool)> = world.nodes[..n0]
+        .iter()
+        .map(|nd| (nd.joined_tick, nd.present))
+        .collect();
+    apply_inflow(
+        &mut world,
+        InflowPolicy::Steady {
+            joins_per_tick: lambda,
+        },
+        horizon,
+    );
+    let boot_after: Vec<(u64, bool)> = world.nodes[..n0]
+        .iter()
+        .map(|nd| (nd.joined_tick, nd.present))
+        .collect();
+    assert_eq!(boot_before, boot_after, "bootstrap cohort untouched");
+    // Every pool node is a FUTURE newcomer: absent, arrival monotone non-decreasing, first at tick 1,
+    // and — the load-bearing property — EVERY newcomer arrives strictly WITHIN the horizon (no inert
+    // buffer tail that would leak into the end-of-run metrics, spec §2).
+    let mut prev = 0u64;
+    for p in 0..pool {
+        let nd = &world.nodes[n0 + p];
+        assert!(!nd.present, "pool node {p} must start absent");
+        assert!(nd.joined_tick >= prev, "arrivals monotone non-decreasing");
+        assert!(
+            nd.joined_tick >= 1 && nd.joined_tick < horizon,
+            "newcomer {p} arrives inside [1, {horizon}): joined_tick = {}",
+            nd.joined_tick
+        );
+        prev = nd.joined_tick;
+    }
+    assert_eq!(
+        world.nodes[n0].joined_tick, 1,
+        "first newcomer joins tick 1"
+    );
+    assert_eq!(
+        world.nodes[n - 1].joined_tick,
+        horizon - 1,
+        "the last newcomer arrives on the final tick"
+    );
+}
+
+#[test]
+fn pool_size_and_bootstrap_n0_are_consistent() {
+    // pool_size = round(λ·horizon) (no dispersion margin — the deterministic schedule arrives
+    // exactly); bootstrap_n0 recovers n0 from n_nodes = n0 + pool.
+    assert_eq!(pool_size(0.5, 100), 50); // round(0.5*100) = 50
+    assert_eq!(pool_size(0.0, 100), 0, "no inflow ⇒ no pool");
+    let lambda = 0.5;
+    let horizon = 100;
+    let n0 = 180;
+    let n_nodes = n0 + pool_size(lambda, horizon);
+    assert_eq!(
+        bootstrap_n0(
+            n_nodes,
+            InflowPolicy::Steady {
+                joins_per_tick: lambda
+            },
+            horizon
+        ),
+        n0,
+        "n0 = n_nodes − pool"
+    );
+    assert_eq!(
+        bootstrap_n0(n_nodes, InflowPolicy::None, horizon),
+        n_nodes,
+        "None ⇒ the whole world is the bootstrap"
+    );
+}
+
+#[test]
+fn expected_outflow_scales_with_n0_and_churn_and_is_zero_for_empty() {
+    // λ_in default-guess = n0 · churn · ⟨1 + scale·aggr⟩. For the §3 mix ⟨mult⟩ ≈ 1.32, so at
+    // n0=180 / churn=0.002 the guess sits in the spec's 0.4-0.5/tick band.
+    let out = expected_outflow(180, 0.002);
+    assert!(
+        (0.40..=0.50).contains(&out),
+        "expected outflow at n0=180 = {out} (spec band 0.4-0.5)"
+    );
+    assert_eq!(
+        expected_outflow(0, 0.002),
+        0.0,
+        "no population ⇒ no outflow"
+    );
+    assert!(
+        expected_outflow(360, 0.002) > expected_outflow(180, 0.002),
+        "outflow grows with n0"
+    );
+}
+
+#[test]
+fn present_count_counts_only_present_nodes() {
+    let params = DynParams::default();
+    let mut world = build_world(12, &params, 5);
+    for nd in &mut world.nodes {
+        nd.present = false;
+    }
+    world.nodes[0].present = true;
+    world.nodes[3].present = true;
+    world.nodes[7].present = true;
+    assert_eq!(present_count(&world), 3);
+}
+
+#[test]
+fn pop_series_stationary_max_dev_is_the_last_half_relative_deviation() {
+    // Last half of [100,100,100,90,110,120] (len 6, half=3) = [90,110,120]; setpoint 100 ⇒ max
+    // |x/100 − 1| over {0.10, 0.10, 0.20} = 0.20. The first-half swing is ignored (warm-up).
+    let s = PopSeries {
+        present_per_tick: vec![100, 100, 100, 90, 110, 120],
+        setpoint: 100,
+    };
+    assert!((s.stationary_max_dev() - 0.20).abs() < 1e-12);
+    assert!((s.last_half_mean() - (90.0 + 110.0 + 120.0) / 3.0).abs() < 1e-12);
+    assert_eq!(s.final_present(), 120);
+    // A monotone collapse (setpoint 100, tail 40) reads a large deviation ⇒ FAIL region.
+    let collapse = PopSeries {
+        present_per_tick: vec![100, 80, 60, 50, 45, 40],
+        setpoint: 100,
+    };
+    assert!(collapse.stationary_max_dev() > crate::sim_adv::inflow::POP_BAND);
+}
+
+#[test]
+fn inflow_prevents_population_collapse_that_the_closed_cohort_suffers() {
+    // Cranked churn makes the closed-cohort die-off visible in a short horizon: WITHOUT inflow the
+    // present-count collapses; WITH a matched steady inflow it holds near the setpoint. (The tight
+    // ±25% stationarity band is a large-n0 / long-horizon claim — validated at full scale in the
+    // deliverable + `print_population_curves_full_scale`; here we assert the qualitative contrast.)
+    let (n0, churn, horizon) = (30usize, 0.03, 100u64);
+    let without = population_curve(&small_inflow_scenario(n0, churn, horizon, false), 1);
+    let with = population_curve(&small_inflow_scenario(n0, churn, horizon, true), 1);
+    let without_final = *without.last().unwrap();
+    let with_series = PopSeries {
+        present_per_tick: with,
+        setpoint: n0,
+    };
+    let with_last_half = with_series.last_half_mean();
+    assert!(
+        without_final <= (0.4 * n0 as f64) as usize,
+        "closed cohort collapses: final present {without_final} of n0={n0}"
+    );
+    assert!(
+        with_last_half >= 0.6 * n0 as f64,
+        "inflow holds population up: last-half mean {with_last_half} of n0={n0}"
+    );
+    assert!(
+        with_last_half > without_final as f64,
+        "inflow present ({with_last_half}) >> closed-cohort final ({without_final})"
+    );
+}
+
+#[test]
+fn inflow_run_records_curve_matching_helper_and_is_byte_identical_on_repeat() {
+    let sc = small_inflow_scenario(25, 0.03, 80, true);
+    let seeds = sc.seeds.clone();
+    let helper = population_curve(&sc, seeds[0]);
+    let r1 = run(&sc, &seeds);
+    let p0 = r1.per_seed_pop[0]
+        .as_ref()
+        .expect("an inflow scenario records a population curve");
+    assert_eq!(
+        p0.present_per_tick, helper,
+        "runner-recorded curve matches the population_curve helper (one source of truth)"
+    );
+    assert_eq!(p0.setpoint, 25, "setpoint = n0");
+    assert_eq!(p0.present_per_tick.len(), 80, "one sample per tick");
+    // Determinism: the whole pipeline (curve + report) is byte-identical on repeat.
+    let r2 = run(&sc, &seeds);
+    let p0b = r2.per_seed_pop[0].as_ref().unwrap();
+    assert!(
+        pop_bit_eq(p0, p0b),
+        "population curve byte-identical on repeat"
+    );
+    let v1 = evaluate_board(&sc, &r1);
+    let v2 = evaluate_board(&sc, &r2);
+    assert_eq!(
+        format_report(&sc, &r1, &v1),
+        format_report(&sc, &r2, &v2),
+        "inflow report byte-identical on repeat"
+    );
+}
+
+#[test]
+fn inflow_board_evaluates_the_pop_stationary_row_and_structural_rows_pass() {
+    let sc = small_inflow_scenario(25, 0.03, 80, true);
+    let seeds = sc.seeds.clone();
+    let result = run(&sc, &seeds);
+    let verdicts = evaluate_board(&sc, &result);
+    let ids: Vec<&str> = verdicts.iter().map(|v| v.id).collect();
+    assert_eq!(
+        ids,
+        vec!["INV-DETERMINISM", "INV-ANTI-ORACLE", "INV-POP-STATIONARY"]
+    );
+    assert_eq!(
+        verdicts[0].kind,
+        VerdictKind::Pass,
+        "determinism (incl. pop)"
+    );
+    assert_eq!(verdicts[1].kind, VerdictKind::Pass, "anti-oracle");
+    let pop = &verdicts[2];
+    assert!(
+        pop.effect.is_finite(),
+        "INV-POP-STATIONARY effect (last-half max deviation) is computed: {}",
+        pop.effect
+    );
+    assert_eq!(pop.threshold, crate::sim_adv::inflow::POP_BAND);
+}
+
+#[test]
+fn non_inflow_scenario_records_no_pop_curve() {
+    // The opt-in gate: a closed-cohort scenario carries no population channel (output unchanged).
+    let sc = small_inflow_scenario(20, 0.03, 40, false);
+    let seeds = sc.seeds.clone();
+    let result = run(&sc, &seeds);
+    assert!(
+        result.per_seed_pop.iter().all(|p| p.is_none()),
+        "no inflow ⇒ no recorded population curve"
+    );
+}
+
+#[test]
+fn tiered_v1_inflow_is_registered_with_a_frozen_pop_stationary_board() {
+    let sc = find_scenario("tiered_v1_inflow").expect("tiered_v1_inflow is registered");
+    assert!(
+        sc.world.inflow.is_steady(),
+        "the demo installs a steady inflow"
+    );
+    // n_nodes = n0(180) + pool; setpoint recovers n0 = 180.
+    assert_eq!(
+        bootstrap_n0(sc.world.n_nodes, sc.world.inflow, sc.horizon),
+        180,
+        "setpoint n0 = 180 (the tiered_v1 cohort size)"
+    );
+    assert!(
+        sc.world.n_nodes > 180,
+        "the pool is pre-allocated on top of n0"
+    );
+    let ids: Vec<&str> = sc.verdicts.iter().map(|v| v.id).collect();
+    assert!(
+        ids.contains(&"INV-POP-STATIONARY"),
+        "board carries the stationarity row"
+    );
+    assert!(ids.contains(&"INV-DETERMINISM"));
+    assert!(ids.contains(&"INV-ANTI-ORACLE"));
+    // The threshold is FROZEN at the band const (anti-Goodhart).
+    let pop = sc
+        .verdicts
+        .iter()
+        .find(|v| v.id == "INV-POP-STATIONARY")
+        .unwrap();
+    assert_eq!(pop.threshold, crate::sim_adv::inflow::POP_BAND);
+}
+
+#[test]
+fn tiered_inflow_produces_a_tier_report_over_the_living_network() {
+    // The inflow tier table (compared against the closed-cohort 2a in the report): every allocated
+    // node arrives within the horizon (no inert buffer to pollute the denominator, spec §2), so the
+    // lifetime owner set is the whole n0+pool population; continuous churn keeps present < total.
+    let n0 = 20usize;
+    let churn = 0.04;
+    let horizon = 90u64; // ≥ T_join(65) so the bootstrap cohort all arrive too
+    let lambda = expected_outflow(n0, churn);
+    let n_nodes = n0 + pool_size(lambda, horizon);
+    let mut sc = tiered_v1(); // tiered uptime + tier mix ⇒ a tier report is produced
+    sc.world.n_nodes = n_nodes;
+    sc.world.base = DynParams {
+        churn_out_prob: churn,
+        ..DynParams::default()
+    };
+    sc.world.inflow = InflowPolicy::Steady {
+        joins_per_tick: lambda,
+    };
+    sc.horizon = horizon;
+    sc.seeds = vec![1];
+    let seeds = sc.seeds.clone();
+    let r = run(&sc, &seeds);
+    let tr = r.per_seed_tier[0].as_ref().expect("tiered ⇒ a tier report");
+    let total: usize = TIER_ORDER
+        .iter()
+        .map(|&t| tr.tier[tier_index(t)].n_owners_total)
+        .sum();
+    let present: usize = TIER_ORDER
+        .iter()
+        .map(|&t| tr.tier[tier_index(t)].n_owners_present)
+        .sum();
+    assert_eq!(
+        total, n_nodes,
+        "the whole n0+pool population is counted (all newcomers arrive, no buffer)"
+    );
+    assert!(
+        present < total,
+        "continuous churn ⇒ present owners < lifetime owners"
+    );
+    assert!(
+        present > 0,
+        "the living network is not empty at the horizon"
+    );
+}
+
+/// DELIVERABLE (run on demand, release): print the present-count curve WITHOUT inflow (tiered_v1
+/// closed cohort → collapse) and WITH inflow (tiered_v1_inflow → stationary), at one seed, plus the
+/// last-half band. `cargo test --release -p viaticum-sim sim_adv print_population_curves_full_scale
+/// -- --ignored --nocapture`.
+#[test]
+#[ignore = "full-scale 520-tick curve dump; run in release on demand"]
+fn print_population_curves_full_scale() {
+    let seed = 42;
+    let closed = tiered_v1();
+    let inflow = find_scenario("tiered_v1_inflow").unwrap();
+    let n0 = bootstrap_n0(inflow.world.n_nodes, inflow.world.inflow, inflow.horizon);
+    let without = population_curve(&closed, seed);
+    let with = population_curve(&inflow, seed);
+    println!(
+        "\n########## population curve, seed {seed} (setpoint n0={n0}, total nodes with inflow = {}) ##########",
+        inflow.world.n_nodes
+    );
+    println!("  {:>5}  {:>14}  {:>14}", "tick", "closed(no in)", "inflow");
+    let len = without.len().max(with.len());
+    let step = (len / 40).max(1);
+    for t in (0..len).step_by(step) {
+        let w0 = without.get(t).copied().unwrap_or(0);
+        let w1 = with.get(t).copied().unwrap_or(0);
+        println!("  {:>5}  {:>14}  {:>14}", t + 1, w0, w1);
+    }
+    let with_series = PopSeries {
+        present_per_tick: with.clone(),
+        setpoint: n0,
+    };
+    let without_series = PopSeries {
+        present_per_tick: without.clone(),
+        setpoint: n0,
+    };
+    println!(
+        "  closed  : final {}  last-half mean {:.1}  max-dev {:.4}",
+        without.last().unwrap(),
+        without_series.last_half_mean(),
+        without_series.stationary_max_dev(),
+    );
+    println!(
+        "  inflow  : final {}  last-half mean {:.1}  max-dev {:.4}  (INV-POP-STATIONARY < {:.2})",
+        with.last().unwrap(),
+        with_series.last_half_mean(),
+        with_series.stationary_max_dev(),
+        crate::sim_adv::inflow::POP_BAND,
+    );
 }

@@ -23,6 +23,7 @@ use crate::generator::Rng;
 use crate::sim_adv::brier::Calibration;
 use crate::sim_adv::cli::{SimAdvError, apply_dial};
 use crate::sim_adv::hetero::{DemandClass, HeteroReport, HeteroTracker, apply_demand_classes};
+use crate::sim_adv::inflow::{PopSeries, apply_inflow, bootstrap_n0, present_count};
 use crate::sim_adv::metrics::{MetricSet, collect_metrics};
 use crate::sim_adv::predators::{
     AdvMetrics, RunMode, collect_adv_metrics, fold_cap_ratio, inject_adversaries,
@@ -33,7 +34,7 @@ use crate::sim_adv::scenario::AdvId;
 use crate::sim_adv::scenario::{Event, EventKind, NodeSel, Scenario, ScenarioId};
 use crate::sim_adv::tier::{TierMix, TierReport, apply_tier_mix, tier_report};
 use crate::sim_dynamic::build_world;
-use crate::sim_dynamic::engine::{disaster_strike, step};
+use crate::sim_dynamic::engine::{DynParams, disaster_strike, step};
 use crate::sim_dynamic::generator::World;
 
 /// A recorded dispatch (0.1 executor is a no-op — this is the whole observable effect).
@@ -77,6 +78,10 @@ pub struct RunResult {
     /// `Some` for a `UptimeMix::Tiered` scenario (`tiered_v1` / `tiered_hetero`) — the per-tier
     /// floor-completeness / durability / share-A / give↔get served / parked table.
     pub per_seed_tier: Vec<Option<TierReport>>,
+    /// Per-seed present-count series (`4r_inflow_spec.md`), seed-indexed. `None` for a
+    /// non-inflow scenario; `Some` for an [`crate::sim_adv::InflowPolicy::Steady`] scenario
+    /// (`tiered_v1_inflow`) — the population curve the INV-POP-STATIONARY board row reads.
+    pub per_seed_pop: Vec<Option<PopSeries>>,
 }
 
 /// All per-seed outputs of one seed run (kept as a struct so the growing set of optional
@@ -97,6 +102,9 @@ pub(crate) struct SeedRun {
     pub hetero: Option<HeteroReport>,
     /// The per-tier report for a TIERED scenario (phase-2a), else `None`.
     pub tier: Option<TierReport>,
+    /// The present-count time-series for an INFLOW scenario (`4r_inflow_spec.md`), else `None`
+    /// (a closed-cohort / non-inflow scenario records no curve, so its output is unchanged).
+    pub pop: Option<PopSeries>,
 }
 
 /// A predator run paired with its matched honest twin (same seed, same construction, hooks
@@ -239,6 +247,58 @@ fn apply_events(
     }
 }
 
+/// Build a scenario's t=0 world: `build_world` + the opt-in tier / demand / uptime / inflow
+/// layers (each a no-op on its default, so a bare scenario stays byte-identical). Does NOT inject
+/// adversaries — that is the runner's job (only `run_one_seed_mode` repurposes slots as predators);
+/// [`population_curve`] wants the honest world. Shared by both so the world construction (including
+/// the inflow re-schedule) is defined in ONE place.
+fn build_world_for(scenario: &Scenario, params: &DynParams, seed: u64) -> World {
+    let mut world = build_world(scenario.world.n_nodes, params, seed);
+    // Phase-2a P7 (axis 2): re-mix the tier shares + re-shape each node's disk. Default `Backbone`
+    // leaves `build_world`'s tiers (byte-identical). Done FIRST so demand + uptime see the final tier.
+    if let TierMix::Custom(shares) = &scenario.world.tier_mix {
+        apply_tier_mix(&mut world, shares, seed);
+    }
+    // Hetero-v2 (D1): per-owner demand classes; `Uniform` ⇒ NOT applied (byte-identical).
+    let classes = scenario.world.demand.assign(scenario.world.n_nodes, seed);
+    if scenario.world.demand.is_hetero() {
+        apply_demand_classes(
+            &mut world,
+            &classes,
+            params,
+            scenario.world.demand.disk_policy(),
+        );
+    }
+    // Phase-2a uptime profiles (axis 3): default `Legacy` ⇒ all-`None` (byte-identical archetype iid).
+    if scenario.world.uptime.is_tiered() {
+        world.uptime = scenario.world.uptime.assign(&world);
+    }
+    // Inflow (`4r_inflow_spec.md`): re-schedule the pool as a steady arrival stream. Default `None`
+    // ⇒ NO-OP, no RNG (byte-identical closed cohort). Only rewrites `joined_tick` / `present`.
+    apply_inflow(&mut world, scenario.world.inflow, scenario.horizon);
+    world
+}
+
+/// Run a scenario's HONEST world (no adversary injection) and return the present-count per tick
+/// (index = tick, post-step). The population-curve measurement (`4r_inflow_spec.md` §3): used to
+/// compare the WITHOUT-inflow closed cohort (`tiered_v1`) against the WITH-inflow stationary world
+/// (`tiered_v1_inflow`). Deterministic in `seed`. A bare `step` loop, so it matches
+/// [`run_one_seed_mode`]'s own recorded series for any scenario with no events / adversaries (the
+/// tiered scenarios) — the runner's extra passes (event dispatch, calibration log, trackers) never
+/// mutate `present`. NOT for a scenario carrying `events`/`adversaries` (its world would diverge).
+pub fn population_curve(scenario: &Scenario, seed: u64) -> Vec<usize> {
+    let params = scenario.world.base;
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world_for(scenario, &params, seed);
+    let mut curve = Vec::with_capacity(scenario.horizon as usize);
+    for _ in 0..scenario.horizon {
+        step(&mut world, &params, &prior, &policy);
+        curve.push(present_count(&world));
+    }
+    curve
+}
+
 /// Run one seed as the PREDATOR (hooks active for any adversaries) to the horizon and
 /// collect its god-view metrics + event record + (for a DR scenario) the restore-truth
 /// metric + (for an adversary scenario) the Attack-ROI read. Kept for the determinism
@@ -270,32 +330,23 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     let prior = SurfacePrior::default();
     let policy = PlacementPolicy::default();
 
-    let mut world = build_world(scenario.world.n_nodes, params, seed);
-    // Phase-2a P7 (axis 2): re-mix the tier shares + re-shape each node's disk to its new tier.
-    // `TierMix::Backbone` (the default) leaves `build_world`'s tiers untouched (byte-identical);
-    // a `Custom` mix runs the re-tier. Done FIRST so the demand + uptime layers see the final tier.
-    if let TierMix::Custom(shares) = &scenario.world.tier_mix {
-        apply_tier_mix(&mut world, shares, seed);
-    }
-    // Hetero-v2 (D1): assign a per-owner demand class (seeded, archetype-independent) and, for
-    // a real hetero mix, rebuild each footprint + reconcile the disk. Uniform ⇒ all M and NOT
-    // applied, so the world stays byte-identical to the pre-hetero path (honest anchor frozen).
-    // Done BEFORE injection so a repurposed predator slot's footprint is overwritten by it.
+    let mut world = build_world_for(scenario, params, seed);
+    // The per-owner demand class assignment (idempotent, pure) is needed below by the event
+    // resolver + hetero tracker; `build_world_for` already applied it to the world for a hetero mix.
     let classes = scenario.world.demand.assign(scenario.world.n_nodes, seed);
-    if scenario.world.demand.is_hetero() {
-        apply_demand_classes(
-            &mut world,
-            &classes,
-            params,
-            scenario.world.demand.disk_policy(),
-        );
-    }
-    // Phase-2a uptime profiles (axis 3): install a per-node structural availability pattern.
-    // `UptimeMix::Legacy` (the default) leaves the layer all-`None` (byte-identical archetype iid);
-    // `Tiered` reads each node's final tier. Done AFTER the tier re-mix (it reads `disk.tier`).
-    if scenario.world.uptime.is_tiered() {
-        world.uptime = scenario.world.uptime.assign(&world);
-    }
+    // Inflow (`4r_inflow_spec.md`): record the present-count curve when a steady stream is installed
+    // (`None` ⇒ no recording, output unchanged). Setpoint = the bootstrap cohort `n0` (= n − pool).
+    let record_pop = scenario.world.inflow.is_steady();
+    let pop_setpoint = bootstrap_n0(
+        scenario.world.n_nodes,
+        scenario.world.inflow,
+        scenario.horizon,
+    );
+    let mut pop_series: Option<Vec<usize>> = if record_pop {
+        Some(Vec::with_capacity(scenario.horizon as usize))
+    } else {
+        None
+    };
     // Phase 1: inject the scenario's adversaries (empty ⇒ no-op; honest scenarios stay
     // byte-identical). `Predator` installs the hooks; `Twin` injects the same heavy nodes
     // with hooks off (the matched control). Deterministic, no RNG.
@@ -405,6 +456,12 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
         // (d) advance one tick (placements this tick append forecasts with `tick == t`).
         step(&mut world, params, &prior, &policy);
 
+        // (d') inflow population curve: record the present-count AFTER this tick (post-activation,
+        //      post-churn). No-op unless the scenario installs an inflow stream.
+        if let Some(pp) = pop_series.as_mut() {
+            pp.push(present_count(&world));
+        }
+
         // (e) resolve any forecast whose horizon `H` is reached at the NEW `world.tick`
         //     (= t+1): the realised outcome is "the block still has ≥ k_eff live symbols".
         let now = world.tick;
@@ -481,6 +538,10 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     } else {
         None
     };
+    let pop = pop_series.map(|present_per_tick| PopSeries {
+        present_per_tick,
+        setpoint: pop_setpoint,
+    });
     SeedRun {
         metrics: collect_metrics(&world, params),
         fired,
@@ -489,6 +550,7 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
         adv,
         hetero,
         tier,
+        pop,
     }
 }
 
@@ -564,6 +626,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
     let mut per_seed_adv = Vec::with_capacity(outcomes.len());
     let mut per_seed_hetero = Vec::with_capacity(outcomes.len());
     let mut per_seed_tier = Vec::with_capacity(outcomes.len());
+    let mut per_seed_pop = Vec::with_capacity(outcomes.len());
     for (sr, twin_adv) in outcomes {
         per_seed.push(sr.metrics);
         fired.push(sr.fired);
@@ -571,6 +634,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_calibration.push(sr.calib);
         per_seed_hetero.push(sr.hetero);
         per_seed_tier.push(sr.tier);
+        per_seed_pop.push(sr.pop);
         per_seed_adv.push(match (sr.adv, twin_adv) {
             (Some(pred), Some(twin)) => Some(AdvPair { pred, twin }),
             _ => None,
@@ -587,6 +651,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_adv,
         per_seed_hetero,
         per_seed_tier,
+        per_seed_pop,
     }
 }
 

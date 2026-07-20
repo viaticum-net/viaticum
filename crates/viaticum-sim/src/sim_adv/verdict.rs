@@ -16,6 +16,7 @@
 //! over `MetricSet`, statistical over restore-truth, determinism, anti-oracle).
 
 use crate::sim_adv::hetero::HeteroReport;
+use crate::sim_adv::inflow::PopSeries;
 use crate::sim_adv::metrics::{MetricSet, mean_sigma};
 use crate::sim_adv::predators::AdvMetrics;
 use crate::sim_adv::restore::RestoreTruth;
@@ -133,6 +134,15 @@ pub enum InvariantSpec {
         /// The pass direction.
         dir: Direction,
     },
+    /// An inflow POPULATION-CURVE scalar → mean±σ vs threshold, power<2 gate. Reads the per-seed
+    /// [`PopSeries`] from [`RunResult::per_seed_pop`]; seeds with no curve contribute `NaN`
+    /// (skipped). Used by INV-POP-STATIONARY (the last-half present-count band around the setpoint).
+    PopStationary {
+        /// Extract the invariant's scalar from one seed's population curve.
+        measure: fn(&PopSeries) -> f64,
+        /// The pass direction.
+        dir: Direction,
+    },
 }
 
 /// One invariant-board row spec.
@@ -183,6 +193,10 @@ impl Clone for Invariant {
                     }
                 }
                 InvariantSpec::TierStatistical { measure, dir } => InvariantSpec::TierStatistical {
+                    measure: *measure,
+                    dir: *dir,
+                },
+                InvariantSpec::PopStationary { measure, dir } => InvariantSpec::PopStationary {
                     measure: *measure,
                     dir: *dir,
                 },
@@ -355,7 +369,24 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             Some(None) => sr.tier.is_none(),
                             None => true,
                         };
-                        metrics_eq && restore_eq && calib_eq && adv_eq && hetero_eq && tier_eq
+                        // The population curve (inflow) must re-run bit-identical too — it feeds the
+                        // curve report + the INV-POP-STATIONARY verdict.
+                        let pop_eq = match result.per_seed_pop.first() {
+                            Some(Some(p0)) => sr
+                                .pop
+                                .as_ref()
+                                .map(|p1| crate::sim_adv::inflow::bit_eq(p0, p1))
+                                .unwrap_or(false),
+                            Some(None) => sr.pop.is_none(),
+                            None => true,
+                        };
+                        metrics_eq
+                            && restore_eq
+                            && calib_eq
+                            && adv_eq
+                            && hetero_eq
+                            && tier_eq
+                            && pop_eq
                     }
                     None => false,
                 };
@@ -493,6 +524,25 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                     threshold: inv.threshold,
                     power,
                     note: "tier: P7 give↔get rank (T1 ≥ T2 ≥ T3 ≥ T4)",
+                }
+            }
+            InvariantSpec::PopStationary { measure, dir } => {
+                let vals: Vec<f64> = result
+                    .per_seed_pop
+                    .iter()
+                    .map(|p| p.as_ref().map(measure).unwrap_or(f64::NAN))
+                    .collect();
+                let (mean, sigma) = mean_sigma(&vals);
+                let sigma_r = if sigma.is_finite() { sigma } else { 0.0 };
+                let (kind, power) = decide(mean, sigma, inv.threshold, *dir);
+                Verdict {
+                    id: inv.id,
+                    kind,
+                    effect: mean,
+                    sigma: sigma_r,
+                    threshold: inv.threshold,
+                    power,
+                    note: "population: last-half present within ±band of setpoint",
                 }
             }
         })

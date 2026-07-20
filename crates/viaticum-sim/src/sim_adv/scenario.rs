@@ -14,6 +14,7 @@
 //! sitting here unread. See the 0.1 report for the full list.
 
 use crate::sim_adv::hetero::{DemandClass, DemandMix};
+use crate::sim_adv::inflow::InflowPolicy;
 use crate::sim_adv::tier::TierMix;
 use crate::sim_adv::uptime::UptimeMix;
 use crate::sim_adv::verdict::Invariant;
@@ -78,6 +79,11 @@ pub struct WorldParams {
     /// `build_world`'s 35/30/25/10 tiers (byte-identical); [`TierMix::Custom`] re-mixes tiers and
     /// re-shapes each node's disk to its new tier ([`crate::sim_adv::tier::apply_tier_mix`]).
     pub tier_mix: TierMix,
+    /// The population-inflow policy (`4r_inflow_spec.md`). [`InflowPolicy::None`] (the DEFAULT for
+    /// every pre-inflow scenario) keeps `build_world`'s closed-cohort join schedule — byte-identical,
+    /// no new RNG; [`InflowPolicy::Steady`] re-schedules a pre-allocated pool of newcomers as a steady
+    /// arrival stream so the long horizon reaches a STATIONARY population ([`crate::sim_adv::inflow`]).
+    pub inflow: InflowPolicy,
 }
 
 /// The full scenario (registry entry).
