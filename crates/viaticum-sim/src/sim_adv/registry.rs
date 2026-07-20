@@ -26,11 +26,35 @@ const RESTORE_WINDOW_DAYS: f64 = 14.0;
 /// Model-S restore download budget in GB/day (OPEN calibration guess; see [`WorldParams`]).
 const RESTORE_BW_GB_DAY: f64 = 50.0;
 
+/// The `dr_battle` co-loss size K_floor (`4r_dr_battle_spec.md` §3), FROZEN in code BEFORE the
+/// run (anti-Goodhart; calibrating the SCENARIO K is sanctioned, the threshold X is not).
+/// Calibrated from the runtime holder count of the T1/Reliable victim at the disaster tick
+/// (measured, seeds 42..46 — see `dr_battle_calibration_*`): the victim's MATURE blocks carry
+/// 5-7 distinct holders (typical 6; union across its 3 blocks = 11-16). Applying the spec's
+/// "holders − k_eff − margin, leave k_eff + 1" to the typical 6-holder block gives
+/// K_FLOOR = 6 − 2 − 1 = 3. The co-loss draws its 3 holders from the 11-16-holder UNION, so the
+/// deterministic seeded pick keeps EVERY floor-met block ≥ k_eff (measured restore-U = 1.0000,
+/// σ = 0 at K = 3). HONEST NOTE (finding): one seed's victim has a MARGINAL 3-holder floor-met
+/// block (a block that met floor earlier, then decayed) — so the strict worst-case "all K picks
+/// hit the smallest block" bound would force K ≤ 1; the frozen K = 3 rests on the deterministic
+/// union pick, not that worst case (the monotone sweep + collapse tests carry the honest
+/// degradation past this floor).
+const DR_BATTLE_K_FLOOR: usize = 3;
+
+/// The `dr_battle` SURVIVAL-FLOOR threshold X (`4r_dr_battle_spec.md` §3 INV-DR-BATTLE-FLOOR),
+/// FROZEN in code BEFORE the run (anti-Goodhart). At K_FLOOR the victim's blocks keep ≥ k_eff
+/// survivors, so restore-truth U must clear a real DR-collapse floor: the same round 0.60
+/// semantic bar as INV-RESTORE-SANITY / INV-RESTORE-HETERO-L ("FAIL if > 40 % of the victim's
+/// blocks become unrestorable"), which the calibrated case clears decisively (measured mean =
+/// 1.0000, σ = 0 ⇒ power = ∞). Calibrate the SCENARIO (K_FLOOR), never this bar.
+const DR_BATTLE_FLOOR_X: f64 = 0.60;
+
 /// Every registered scenario (hard-coded like `Archetype::ALL`).
 pub fn all_scenarios() -> Vec<Scenario> {
     vec![
         honest_v2(),
         dr_baseline(),
+        dr_battle(),
         a1_whale(),
         a4_whitewasher(),
         a2_dropper(),
@@ -182,6 +206,52 @@ pub fn dr_baseline() -> Scenario {
         seeds: vec![42, 43, 44, 45, 46],
         metrics: vec![MetricId::RestoreTruth, MetricId::InvariantBoard],
         verdicts: dr_baseline_invariants(),
+        fast: true,
+    }
+}
+
+/// The DR-in-battle scenario (2b-step-2, `4r_dr_battle_spec.md`): `dr_baseline` but the
+/// Disaster on the T1/Reliable backbone is CORRELATED — [`DR_BATTLE_K_FLOOR`] of the victim's
+/// current holders fall in the SAME tick (a region / provider outage that took the NAS *and*
+/// its offsite cluster of copies, A16). K_FLOOR is FROZEN so the victim's blocks keep ≥ k_eff
+/// survivors across the frozen seeds 42-46 (MEASURED + monotonicity-backed from the co_loss=4
+/// margin — NOT structural for an arbitrary seed; see [`DR_BATTLE_K_FLOOR`]), so restore-truth U
+/// must still clear the [`DR_BATTLE_FLOOR_X`] floor (INV-DR-BATTLE-FLOOR). The HONEST-REFLECT
+/// monotonicity (U falls as more holders are co-lost, → 0 below k_eff) is a `tests.rs` sweep, not
+/// a board row.
+pub fn dr_battle() -> Scenario {
+    Scenario {
+        id: ScenarioId("dr_battle"),
+        about: "dr_baseline but the T1/Reliable Disaster is CORRELATED — K_floor holders co-lost in the same tick — restore-truth over the survival floor (A16)",
+        world: WorldParams {
+            n_nodes: 100,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: Vec::new(),
+        // Same strike as dr_baseline (T1/Reliable backbone @ tick 60), but K_FLOOR of the
+        // victim's holders are co-lost in the same tick.
+        events: vec![(
+            60,
+            Event::CorrelatedDisaster {
+                sel: NodeSel::FirstTierArchetype(GiverTier::T1, Archetype::Reliable),
+                co_loss_holders: DR_BATTLE_K_FLOOR,
+            },
+        )],
+        horizon: 130,
+        // FROZEN band: the ≥k_eff survival margin at K_FLOOR is MEASURED for exactly these seeds
+        // (see DR_BATTLE_K_FLOOR's marginal-block note). Do NOT widen without re-checking FLOOR
+        // per-seed — `dr_battle_floor_holds_per_seed_across_the_frozen_band` fails a bad seed.
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![MetricId::RestoreTruth, MetricId::InvariantBoard],
+        verdicts: dr_battle_invariants(),
         fast: true,
     }
 }
@@ -998,6 +1068,41 @@ fn dr_baseline_invariants() -> Vec<Invariant> {
                 dir: Direction::GreaterThan,
             },
             threshold: 0.60,
+        },
+    ]
+}
+
+/// The `dr_battle` board (`4r_dr_battle_spec.md` §3): the two structural rows + the
+/// SURVIVAL-FLOOR row (restore-truth U ≥ X at the frozen K_floor). The HONEST-REFLECT
+/// monotonicity + below-k_eff collapse are `tests.rs` sweeps (not board rows — they need
+/// multiple co_loss values, which the board's single scenario cannot carry).
+fn dr_battle_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-DR-BATTLE-FLOOR (spec §3, SURVIVAL-FLOOR): at the frozen K_floor the victim's
+        // blocks keep ≥ k_eff survivors across the frozen seeds 42-46 (MEASURED, not structural
+        // for an arbitrary seed — see DR_BATTLE_K_FLOOR; `dr_battle_floor_holds_per_seed_*` guards
+        // it per-seed so widening the band can't silently pass on a mean), so restore-truth U must
+        // clear the frozen DR_BATTLE_FLOOR_X floor — the correlated loss did NOT push a mature
+        // backbone block below reconstructible. GreaterThan, power-gated (spec §10 п.16): a genuine
+        // collapse FAILS and is the finding, NOT a bar to lower. The restore-U(co_loss) sweep
+        // (tests.rs) is the HONEST-REFLECT co-evidence.
+        Invariant {
+            id: "INV-DR-BATTLE-FLOOR",
+            spec: InvariantSpec::RestoreStatistical {
+                measure: restore_u,
+                dir: Direction::GreaterThan,
+            },
+            threshold: DR_BATTLE_FLOOR_X,
         },
     ]
 }

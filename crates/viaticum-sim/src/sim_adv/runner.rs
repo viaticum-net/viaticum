@@ -34,7 +34,7 @@ use crate::sim_adv::scenario::AdvId;
 use crate::sim_adv::scenario::{Event, EventKind, NodeSel, Scenario, ScenarioId};
 use crate::sim_adv::tier::{TierMix, TierReport, apply_tier_mix, tier_report};
 use crate::sim_dynamic::build_world;
-use crate::sim_dynamic::engine::{DynParams, disaster_strike, step};
+use crate::sim_dynamic::engine::{DynParams, depart_node, disaster_strike, step};
 use crate::sim_dynamic::generator::World;
 
 /// A recorded dispatch (0.1 executor is a no-op — this is the whole observable effect).
@@ -218,11 +218,59 @@ fn resolve_nodesel(world: &World, sel: NodeSel, classes: &[DemandClass]) -> Vec<
 /// Salt for the `NodeSel::Random` draw (kept off the engine's streams).
 const NODESEL_SALT: u64 = 0x0005_E1EC_7D15_A57E;
 
+/// Salt for the correlated-disaster co-loss holder pick (`Event::CorrelatedDisaster`). A
+/// DEDICATED stream, distinct from [`NODESEL_SALT`] and every engine draw, so choosing WHICH
+/// holders are co-lost never perturbs the engine's placement / PoS / churn RNG (determinism).
+const CORR_LOSS_SALT: u64 = 0x00C0_1055_ADDE_D000; // "co-loss added"
+
+/// The victim's CURRENT holders: the union, over the victim's alive placed symbols, of the
+/// PRESENT nodes `h != victim` holding an alive symbol of `owner == victim`. Sorted ascending
+/// (deterministic). A departed holder has all its holdings dead ⇒ excluded by the `alive`
+/// filter, and the explicit `present` filter also keeps a paused (A5) holder out of the pick.
+fn victim_holders(world: &World, victim: usize) -> Vec<usize> {
+    let n = world.nodes.len();
+    let mut holders: Vec<usize> = (0..n)
+        .filter(|&h| {
+            h != victim
+                && world.nodes[h].present
+                && world.nodes[h]
+                    .holdings
+                    .iter()
+                    .any(|s| s.alive && s.owner == victim)
+        })
+        .collect();
+    holders.sort_unstable();
+    holders
+}
+
+/// Seeded-pick `k` of the victim's (already sorted) `holders` to co-lose, off the dedicated
+/// [`CORR_LOSS_SALT`] stream so the pick never perturbs the engine. The Fisher-Yates draw does
+/// NOT depend on `k`, so the picked set is NESTED as `k` grows (`pick(k) ⊆ pick(k+1)` at the
+/// same seed) — the HONEST-REFLECT monotonicity of the co-loss sweep rests on this. Returns the
+/// picked indices sorted ascending (so the departure order — and thus the silent-loss queue
+/// order — is deterministic regardless of the shuffle). `k == 0` ⇒ empty, drawing no RNG (so
+/// `CorrelatedDisaster{co_loss:0}` is byte-identical to a plain `Disaster`).
+fn coloss_pick(seed: u64, victim: usize, tick: u64, holders: &[usize], k: usize) -> Vec<usize> {
+    if k == 0 || holders.is_empty() {
+        return Vec::new();
+    }
+    let mut pool = holders.to_vec();
+    let mut rng = Rng::derive(seed, CORR_LOSS_SALT, victim as u64, tick, 0);
+    // Fisher-Yates prefix (k-independent order ⇒ nested picks across k).
+    for i in (1..pool.len()).rev() {
+        let j = (rng.unit() * (i as f64 + 1.0)) as usize;
+        pool.swap(i, j.min(i));
+    }
+    pool.truncate(k.min(pool.len()));
+    pool.sort_unstable();
+    pool
+}
+
 /// Apply the events due at `tick`: record each, and for a [`Event::Disaster`] run the
 /// real executor (strike each victim, start its restore measurement, schedule its return
 /// at `tick + 1`). Other kinds are recorded-only in 0.2.
 #[allow(clippy::too_many_arguments)]
-fn apply_events(
+pub(crate) fn apply_events(
     world: &mut World,
     due: &[Event],
     tick: u64,
@@ -236,15 +284,51 @@ fn apply_events(
             tick,
             kind: ev.kind(),
         });
-        if let Event::Disaster(sel) = ev {
-            for victim in resolve_nodesel(world, *sel, classes) {
-                let class = classes.get(victim).copied().unwrap_or(DemandClass::M);
-                disaster_strike(world, victim);
-                tracker.on_disaster(world, victim, tick, class);
-                revive_at.entry(tick + 1).or_default().push(victim);
+        match ev {
+            Event::Disaster(sel) => {
+                for victim in resolve_nodesel(world, *sel, classes) {
+                    strike_victim(world, victim, tick, tracker, revive_at, classes);
+                }
             }
+            // A16: a Disaster on the victim PLUS a correlated loss of `co_loss_holders` of its
+            // CURRENT holders in the SAME tick. The victim is struck exactly as a plain
+            // Disaster; then a seeded pick of its holders departs with `churn` physics (NOT
+            // restore-tracked, NOT revived). `co_loss_holders == 0` ⇒ the pick is empty and no
+            // RNG is drawn ⇒ byte-identical to a plain `Disaster` (the anchor).
+            Event::CorrelatedDisaster {
+                sel,
+                co_loss_holders,
+            } => {
+                for victim in resolve_nodesel(world, *sel, classes) {
+                    strike_victim(world, victim, tick, tracker, revive_at, classes);
+                    let holders = victim_holders(world, victim);
+                    let pick = coloss_pick(world.seed, victim, tick, &holders, *co_loss_holders);
+                    for h in pick {
+                        depart_node(world, h);
+                    }
+                }
+            }
+            _ => {}
         }
     }
+}
+
+/// Strike one disaster `victim`: the engine's [`disaster_strike`], start its restore-truth
+/// measurement, and schedule its same-identity return at `tick + 1`. Shared by the plain and
+/// correlated disaster arms so the victim physics is identical between them (the co-loss is a
+/// pure addendum layered on top).
+fn strike_victim(
+    world: &mut World,
+    victim: usize,
+    tick: u64,
+    tracker: &mut RestoreTracker,
+    revive_at: &mut BTreeMap<u64, Vec<usize>>,
+    classes: &[DemandClass],
+) {
+    let class = classes.get(victim).copied().unwrap_or(DemandClass::M);
+    disaster_strike(world, victim);
+    tracker.on_disaster(world, victim, tick, class);
+    revive_at.entry(tick + 1).or_default().push(victim);
 }
 
 /// Build a scenario's t=0 world: `build_world` + the opt-in tier / demand / uptime / inflow

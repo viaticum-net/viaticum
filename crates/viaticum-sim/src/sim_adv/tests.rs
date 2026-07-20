@@ -19,14 +19,14 @@ use crate::sim_adv::predators::{
 };
 use crate::sim_adv::registry::{
     a1_whale, a3_flapper, a4_whitewasher, a5_deep_silent, a6_discriminator, all_scenarios,
-    dr_baseline, dr_hetero, find_scenario, honest_hetero_hard, honest_hetero_v2, honest_v2,
-    tiered_hetero, tiered_hetero_hard, tiered_v1,
+    dr_baseline, dr_battle, dr_hetero, find_scenario, honest_hetero_hard, honest_hetero_v2,
+    honest_v2, tiered_hetero, tiered_hetero_hard, tiered_v1,
 };
 use crate::sim_adv::report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
 use crate::sim_adv::restore::{
     BlockOutcome, IOTA_BUCKETS, RestoreTracker, RestoreTruth, bit_eq as restore_bit_eq, iota_bucket,
 };
-use crate::sim_adv::runner::{population_curve, run, run_one_seed, run_sweep};
+use crate::sim_adv::runner::{RunResult, population_curve, run, run_one_seed, run_sweep};
 use crate::sim_adv::scenario::{
     AdvAction, AdvContext, AdvDials, AdvId, AdvSpec, BehaviorHook, Event, EventKind, InfoModel,
     MetricId, NodeSel, Scenario, WorldParams,
@@ -3752,4 +3752,454 @@ fn print_population_curves_full_scale() {
         with_series.stationary_max_dev(),
         crate::sim_adv::inflow::POP_BAND,
     );
+}
+
+// ------------------------------------------------------------------
+// 2b-step-2: DR-in-battle — correlated holder loss (A16)
+// ------------------------------------------------------------------
+
+/// The disaster tick `dr_battle` fires at (matches the registry event).
+const DR_BATTLE_TICK: u64 = 60;
+
+/// A `dr_battle`-shaped scenario carrying a chosen `co_loss` (for the co-loss sweep). Built
+/// from `dr_battle()` so the world / horizon / seeds match the registry, replacing ONLY the
+/// event's `co_loss_holders`. Small seed band by default; the caller overrides `seeds`.
+fn dr_battle_with_co_loss(co_loss: usize) -> Scenario {
+    let mut sc = dr_battle();
+    sc.events = vec![(
+        DR_BATTLE_TICK,
+        Event::CorrelatedDisaster {
+            sel: NodeSel::FirstTierArchetype(GiverTier::T1, Archetype::Reliable),
+            co_loss_holders: co_loss,
+        },
+    )];
+    sc
+}
+
+/// `dr_battle_with_co_loss` shortened to just past the restore window (the disaster fires at
+/// tick 60, the window is ticks 61-62), so the co-loss sweep tests stay fast. Restore-truth is a
+/// pure function of the world at ticks 61-62 — independent of the horizon past tick 62 — so this
+/// yields the IDENTICAL restore-U as the full horizon-130 scenario, at ~half the run cost.
+fn dr_battle_sweep_scenario(co_loss: usize) -> Scenario {
+    let mut sc = dr_battle_with_co_loss(co_loss);
+    sc.horizon = DR_BATTLE_TICK + 3; // = 63: covers observe ticks 61, 62
+    sc
+}
+
+/// Reproduce the `dr_battle` world at the START of the disaster tick (before the event fires):
+/// `build_world` + `DR_BATTLE_TICK` steps. `dr_battle`'s world is the honest_v2 world (no
+/// tier / demand / uptime / inflow layers), so `build_world` reproduces the runner's
+/// `build_world_for`, and the runner's pre-tick trackers never mutate the world — so this is
+/// the exact state the co-loss reads. Returns the world and the resolved T1/Reliable victim
+/// (earliest `joined_tick`, tie by index — the `FirstTierArchetype` rule).
+fn dr_battle_world_at_disaster(seed: u64) -> (World, usize) {
+    use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
+    let params = DynParams::default();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world(100, &params, seed);
+    for _ in 0..DR_BATTLE_TICK {
+        crate::sim_dynamic::engine::step(&mut world, &params, &prior, &policy);
+    }
+    let victim = (0..world.nodes.len())
+        .filter(|&i| {
+            world.nodes[i].present
+                && world.nodes[i].disk.tier == GiverTier::T1
+                && world.nodes[i].archetype == Archetype::Reliable
+        })
+        .min_by(|&a, &b| {
+            world.nodes[a]
+                .joined_tick
+                .cmp(&world.nodes[b].joined_tick)
+                .then(a.cmp(&b))
+        })
+        .expect("a present T1/Reliable victim exists at the disaster tick");
+    (world, victim)
+}
+
+/// The victim's per-block holder counts (present holders `h != victim` with an alive symbol of
+/// `(owner = victim, block)`), one entry per floor-ever-met own block, plus the union count.
+fn victim_block_holder_counts(world: &World, victim: usize) -> (Vec<usize>, usize) {
+    let mut per_block = Vec::new();
+    let mut union: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for b in &world.nodes[victim].own_blocks {
+        if !b.floor_ever_met {
+            continue;
+        }
+        let holders: Vec<usize> = (0..world.nodes.len())
+            .filter(|&h| {
+                h != victim
+                    && world.nodes[h].present
+                    && world.nodes[h]
+                        .holdings
+                        .iter()
+                        .any(|s| s.alive && s.owner == victim && s.block == b.id)
+            })
+            .collect();
+        for &h in &holders {
+            union.insert(h);
+        }
+        per_block.push(holders.len());
+    }
+    (per_block, union.len())
+}
+
+/// Mean restore-truth U over the seeds of a completed run (seeds with no Disaster → NaN,
+/// skipped by `mean_sigma`) — the co-loss sweep scalar.
+fn mean_restore_u(result: &RunResult) -> f64 {
+    let vals: Vec<f64> = result
+        .per_seed_restore
+        .iter()
+        .map(|r| {
+            r.as_ref()
+                .map(|rt| rt.restore_truth_u())
+                .unwrap_or(f64::NAN)
+        })
+        .collect();
+    mean_sigma(&vals).0
+}
+
+#[test]
+fn dr_battle_calibration_reports_victim_block_holder_counts() {
+    // The FROZEN calibration read (anti-Goodhart evidence for DR_BATTLE_K_FLOOR = 3 /
+    // DR_BATTLE_FLOOR_X = 0.60): the runtime holder count of the T1/Reliable victim at the
+    // disaster tick (seeds 42..46). The victim's MATURE blocks carry 5-7 holders (union 11-16);
+    // the spec formula "typical holders − k_eff − margin, leave k_eff+1" on a 6-holder block gives
+    // K_FLOOR = 6 − 2 − 1 = 3. The co-loss draws from the UNION, so K = 3 leaves each block ≥
+    // k_eff in the deterministic pick. HONEST NOTE: one seed's victim carries a marginal 3-holder
+    // floor-met block, so the strict worst-case bound would be K ≤ 1 — the frozen K rests on the
+    // union pick, not the worst case (the sweep tests carry the honest degradation).
+    // (READ-only + fast — build_world + 60 steps per seed; run with --nocapture for the table.)
+    let k_eff = DynParams::default().k_eff;
+    let mut typical_max = 0usize; // the largest per-block holder count seen (the mature block)
+    let mut min_union = usize::MAX;
+    for seed in [42u64, 43, 44, 45, 46] {
+        let (world, victim) = dr_battle_world_at_disaster(seed);
+        let (per_block, union) = victim_block_holder_counts(&world, victim);
+        typical_max = typical_max.max(per_block.iter().copied().max().unwrap_or(0));
+        min_union = min_union.min(union);
+        println!("seed {seed}: victim {victim}  per-block holders {per_block:?}  union {union}");
+    }
+    println!(
+        "typical (max) per-block holders = {typical_max}, min union = {min_union}, k_eff = {k_eff}, K_FLOOR = 3"
+    );
+    // The union always exceeds K_FLOOR (the co-loss pool is real), and the typical mature block
+    // sits at holders ≥ K_FLOOR + k_eff (the "leave k_eff+1 on a 6-holder block" calibration).
+    assert!(
+        min_union > 3,
+        "the co-loss union pool exceeds K_FLOOR: {min_union}"
+    );
+    assert!(
+        typical_max >= 3 + k_eff,
+        "the victim's mature block carries ≥ K_FLOOR(3) + k_eff({k_eff}) holders: {typical_max}"
+    );
+}
+
+/// Reproduce the `dr_battle` world at the disaster tick, then fire `CorrelatedDisaster{co_loss}`
+/// via the REAL runner executor and return the world snapshot IMMEDIATELY after (before any
+/// `step`, so no churn confounds the co-loss departures) together with the victim and its
+/// pre-disaster holder set (the co-loss pool). One physics: the executor calls `depart_node`.
+fn dr_battle_after_event(
+    seed: u64,
+    co_loss: usize,
+) -> (World, usize, std::collections::BTreeSet<usize>) {
+    let (probe, victim) = dr_battle_world_at_disaster(seed);
+    let pre_holders: std::collections::BTreeSet<usize> = (0..probe.nodes.len())
+        .filter(|&h| {
+            h != victim
+                && probe.nodes[h].present
+                && probe.nodes[h]
+                    .holdings
+                    .iter()
+                    .any(|s| s.alive && s.owner == victim)
+        })
+        .collect();
+    // Rebuild + step to the disaster tick, then fire the event through the runner executor.
+    use std::collections::BTreeMap;
+    use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
+    let params = DynParams::default();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world(100, &params, seed);
+    for _ in 0..DR_BATTLE_TICK {
+        crate::sim_dynamic::engine::step(&mut world, &params, &prior, &policy);
+    }
+    let classes = DemandMix::Uniform.assign(100, seed);
+    let mut tracker = RestoreTracker::new(&dr_battle().world);
+    let mut revive_at: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    let mut fired: Vec<crate::sim_adv::runner::FiredEvent> = Vec::new();
+    let due = vec![Event::CorrelatedDisaster {
+        sel: NodeSel::FirstTierArchetype(GiverTier::T1, Archetype::Reliable),
+        co_loss_holders: co_loss,
+    }];
+    crate::sim_adv::runner::apply_events(
+        &mut world,
+        &due,
+        DR_BATTLE_TICK,
+        &mut fired,
+        &mut tracker,
+        &mut revive_at,
+        &classes,
+    );
+    (world, victim, pre_holders)
+}
+
+#[test]
+fn correlated_disaster_departs_exactly_k_of_victims_holders() {
+    // Test 1 (spec §5): immediately after the event exactly K of the victim's PRE-DISASTER
+    // holders are !present, drawn from the pre-holder pool, and the picked set is deterministic
+    // (a double-run gives the identical set). Snapshotting right after the executor isolates the
+    // co-loss departures from any later churn.
+    let k = 3usize;
+    let seed = 42u64;
+    let departed = |seed: u64| -> std::collections::BTreeSet<usize> {
+        let (world, _victim, pre_holders) = dr_battle_after_event(seed, k);
+        pre_holders
+            .iter()
+            .copied()
+            .filter(|&h| !world.nodes[h].present)
+            .collect()
+    };
+    let (_w, _victim, pre_holders) = dr_battle_after_event(seed, k);
+    assert!(
+        pre_holders.len() > k,
+        "need more pre-holders ({}) than the co-loss K ({k})",
+        pre_holders.len()
+    );
+    let d1 = departed(seed);
+    let d2 = departed(seed);
+    assert_eq!(
+        d1.len(),
+        k,
+        "exactly K={k} of the victim's pre-holders are co-lost (got {})",
+        d1.len()
+    );
+    assert_eq!(
+        d1, d2,
+        "the co-loss pick is deterministic (same set on repeat)"
+    );
+    assert!(
+        d1.is_subset(&pre_holders),
+        "co-lost holders are drawn from the victim's pre-disaster holders"
+    );
+}
+
+#[test]
+fn correlated_disaster_co_loss_zero_is_byte_identical_to_plain_disaster() {
+    // Test 2 (spec §5) — THE ANCHOR: `CorrelatedDisaster{co_loss:0}` produces a RestoreTruth
+    // bit-identical to a plain `Disaster` at the same seed. The co-loss path is a clean superset
+    // (no departs, no RNG drawn when K=0).
+    let seeds = vec![42u64, 43, 44];
+    let plain = {
+        let mut sc = dr_baseline();
+        sc.seeds = seeds.clone();
+        sc
+    };
+    let corr = {
+        let mut sc = dr_battle_with_co_loss(0);
+        sc.seeds = seeds.clone();
+        sc
+    };
+    let rp = run(&plain, &seeds);
+    let rc = run(&corr, &seeds);
+    for (a, b) in rp.per_seed_restore.iter().zip(&rc.per_seed_restore) {
+        match (a, b) {
+            (Some(x), Some(y)) => assert!(
+                restore_bit_eq(x, y),
+                "co_loss=0 must be byte-identical to plain Disaster"
+            ),
+            (None, None) => {}
+            _ => panic!("restore presence differs between plain and co_loss=0"),
+        }
+    }
+    assert!(
+        rc.per_seed_restore.iter().any(|r| r.is_some()),
+        "the anchor comparison must actually carry restore-truth"
+    );
+}
+
+#[test]
+fn restore_truth_monotone_nonincreasing_in_correlated_loss() {
+    // Test 3 (spec §4 / §5) — HONEST-REFLECT: mean restore-truth U (over seeds) is MONOTONE
+    // NON-INCREASING as more holders are co-lost. The co-loss pick is K-independent (nested), so
+    // co-losing MORE holders can only weakly reduce each block's survivors ⇒ U cannot rise.
+    let seeds = vec![42u64, 43, 44, 45, 46];
+    let sweep: Vec<usize> = vec![0, 2, 4, 6, 8];
+    let us: Vec<f64> = sweep
+        .iter()
+        .map(|&k| {
+            let mut sc = dr_battle_sweep_scenario(k);
+            sc.seeds = seeds.clone();
+            mean_restore_u(&run(&sc, &seeds))
+        })
+        .collect();
+    for (i, (&k, &u)) in sweep.iter().zip(&us).enumerate() {
+        println!("co_loss={k}  mean restore-truth U = {u:.4}");
+        if i > 0 {
+            assert!(
+                u <= us[i - 1] + 1e-9,
+                "restore-truth U must not rise with co_loss: U({})={:.4} > U({})={:.4}",
+                sweep[i],
+                u,
+                sweep[i - 1],
+                us[i - 1]
+            );
+        }
+    }
+}
+
+#[test]
+fn restore_truth_collapses_when_survivors_below_k_eff() {
+    // Test 4 (spec §5) — COLLAPSE: a co_loss large enough to drop EVERY holder of the victim's
+    // blocks (co_loss ≥ the union count) leaves < k_eff survivors everywhere ⇒ restore-truth
+    // U ≈ 0. Uses a co_loss well past the runtime union count for every seed.
+    let seeds = vec![42u64, 43, 44, 45, 46];
+    // The union count is ~11-16 at the disaster tick; 40 exceeds it for every seed (co-losing
+    // ALL of the victim's holders), so no block keeps ANY survivor.
+    let mut sc = dr_battle_sweep_scenario(40);
+    sc.seeds = seeds.clone();
+    let u = mean_restore_u(&run(&sc, &seeds));
+    println!("co_loss=40 (all holders) mean restore-truth U = {u:.4}");
+    assert!(
+        u <= 0.1,
+        "restore-truth U must collapse (≈0) when survivors fall below k_eff: U={u:.4}"
+    );
+}
+
+#[test]
+fn restore_truth_holds_when_survivors_at_least_k_eff() {
+    // Test 5 (spec §5) — SURVIVAL-FLOOR: at the frozen K_FLOOR (survivors ≥ k_eff) the
+    // INV-DR-BATTLE-FLOOR board row of the REGISTERED dr_battle PASSES — restore-truth U clears
+    // the frozen 0.60 floor with power. Two seeds keep it quick (U = 1.0, σ = 0 ⇒ power = ∞).
+    let sc = {
+        let mut s = dr_battle(); // carries co_loss = DR_BATTLE_K_FLOOR
+        s.seeds = vec![42, 43];
+        s
+    };
+    let result = run(&sc, &sc.seeds.clone());
+    let u = mean_restore_u(&result);
+    println!("dr_battle (co_loss=K_FLOOR) mean restore-truth U = {u:.4}");
+    let verdicts = evaluate_board(&sc, &result);
+    let floor = verdicts
+        .iter()
+        .find(|v| v.id == "INV-DR-BATTLE-FLOOR")
+        .expect("dr_battle board carries INV-DR-BATTLE-FLOOR");
+    assert_eq!(
+        floor.kind,
+        VerdictKind::Pass,
+        "survival-floor holds: effect={} power={}",
+        floor.effect,
+        floor.power
+    );
+    assert!(
+        floor.effect > 0.60,
+        "restore-truth U clears the frozen floor: {}",
+        floor.effect
+    );
+}
+
+#[test]
+fn dr_battle_floor_holds_per_seed_across_the_frozen_band() {
+    // Reviewer NOTE (latent fragility): the board INV-DR-BATTLE-FLOOR checks the MEAN restore-U,
+    // which could hide ONE bad seed (a victim whose K_FLOOR pick sinks a block below k_eff dilutes
+    // to a still-passing mean). The ≥k_eff survival margin at K_FLOOR is MEASURED for seeds 42-46,
+    // not structural — so guard it PER SEED: at the frozen K_FLOOR every seed's restore-U must be
+    // exactly 1.0 (every floor-met block keeps ≥ k_eff survivors). Widening dr_battle's seed band
+    // to a seed that violates this fails HERE (not silently on a diluted board mean). Reads the
+    // frozen K_FLOOR off the registered scenario (no magic number); fast sweep horizon.
+    let co_loss = match dr_battle().events[0].1 {
+        Event::CorrelatedDisaster {
+            co_loss_holders, ..
+        } => co_loss_holders,
+        other => panic!("dr_battle must fire a CorrelatedDisaster, got {other:?}"),
+    };
+    let sc = dr_battle_sweep_scenario(co_loss); // all 5 frozen seeds, horizon 63
+    let result = run(&sc, &sc.seeds.clone());
+    for (i, &seed) in sc.seeds.iter().enumerate() {
+        let rt = result.per_seed_restore[i]
+            .as_ref()
+            .unwrap_or_else(|| panic!("seed {seed} ran the disaster ⇒ has a restore-truth"));
+        assert_eq!(
+            rt.restore_truth_u(),
+            1.0,
+            "seed {seed}: at the frozen K_FLOOR every floor-met block must keep ≥ k_eff survivors \
+             (per-seed U = 1.0), got {}",
+            rt.restore_truth_u()
+        );
+    }
+}
+
+#[test]
+fn co_killed_holder_queues_silent_loss_to_its_owners() {
+    // Test 6 (spec §5) — ONE PHYSICS: a co-lost holder that also held data of ANOTHER present
+    // owner queues that owner a SILENT loss, exactly as a `churn` departure would (the co-loss
+    // routes through `depart_node`). The disaster victim's own silent-loss queueing is a separate
+    // path (`disaster_strike`); here we assert a co-lost HOLDER queued a loss to a NON-victim
+    // owner — the co-loss reuse of the churn departure physics.
+    let seed = 42u64;
+    let (world, victim, pre_holders) = dr_battle_after_event(seed, 3);
+    let co_lost: Vec<usize> = pre_holders
+        .iter()
+        .copied()
+        .filter(|&h| !world.nodes[h].present)
+        .collect();
+    assert_eq!(co_lost.len(), 3, "three holders co-lost");
+    // A mature holder carries many owners' symbols, so a co-lost holder queues losses to its
+    // OTHER (non-victim) present owners — exactly a `churn` departure.
+    let queued_by_colost = world
+        .pending_silent_loss
+        .iter()
+        .any(|sl| co_lost.contains(&sl.holder) && sl.owner != victim);
+    assert!(
+        queued_by_colost,
+        "a co-lost holder queued a silent loss to one of its OTHER (non-victim) owners (churn one-physics)"
+    );
+}
+
+#[test]
+fn dr_battle_is_deterministic_across_double_run() {
+    // Test 7 (spec §5) — INV-DETERMINISM: two runs of dr_battle give bit-identical RestoreTruth
+    // per seed (the whole correlated-disaster → restore path is seeded, co-loss on a dedicated
+    // salt). A small seed band keeps it quick.
+    let sc = {
+        let mut s = dr_battle();
+        s.seeds = vec![42, 43];
+        s
+    };
+    let seeds = sc.seeds.clone();
+    let r1 = run(&sc, &seeds);
+    let r2 = run(&sc, &seeds);
+    assert!(
+        r1.per_seed_restore.iter().any(|r| r.is_some()),
+        "dr_battle must actually produce restore-truth"
+    );
+    for (a, b) in r1.per_seed_restore.iter().zip(&r2.per_seed_restore) {
+        match (a, b) {
+            (Some(x), Some(y)) => assert!(
+                restore_bit_eq(x, y),
+                "dr_battle restore-truth must be bit-identical on repeat"
+            ),
+            (None, None) => {}
+            _ => panic!("restore presence differs between the two runs"),
+        }
+    }
+    // The board's INV-DETERMINISM row also passes (re-runs seed[0] internally).
+    let verdicts = evaluate_board(&sc, &r1);
+    let det = verdicts
+        .iter()
+        .find(|v| v.id == "INV-DETERMINISM")
+        .expect("dr_battle board carries INV-DETERMINISM");
+    assert_eq!(det.kind, VerdictKind::Pass, "INV-DETERMINISM passes");
+}
+
+#[test]
+fn dr_battle_is_registered() {
+    let s = find_scenario("dr_battle").expect("dr_battle is registered");
+    assert_eq!(s.id.as_str(), "dr_battle");
+    match s.events[0].1 {
+        Event::CorrelatedDisaster {
+            co_loss_holders, ..
+        } => assert_eq!(co_loss_holders, 3, "dr_battle carries the frozen K_FLOOR"),
+        _ => panic!("dr_battle fires a CorrelatedDisaster"),
+    }
 }

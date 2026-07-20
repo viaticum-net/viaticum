@@ -239,6 +239,18 @@ pub struct AdvDials {
 pub enum Event {
     /// Owner loses everything (source + holdings), returns without local data (axis 8).
     Disaster(NodeSel),
+    /// A Disaster on the victim PLUS a correlated loss, in the SAME tick, of
+    /// `co_loss_holders` of the victim's CURRENT holders (a region / provider outage that
+    /// took down the NAS *and* the offsite cluster of copies — A16). `co_loss_holders = 0`
+    /// is byte-identical to a plain [`Event::Disaster`] (a clean superset). Kills the picked
+    /// holders with the same `churn` per-node departure physics; they are NOT restore-tracked
+    /// (they are not the disaster victim) and are NOT revived (a permanent correlated loss).
+    CorrelatedDisaster {
+        /// The disaster victim selector (as [`Event::Disaster`]).
+        sel: NodeSel,
+        /// How many of the victim's current holders are co-lost this tick.
+        co_loss_holders: usize,
+    },
     /// Kill an entire subnet at once (axis 5).
     KillSubnet(u32),
     /// A provider's whole subnet exits after it has accumulated `after_share` (axis 5).
@@ -260,6 +272,9 @@ impl Event {
     pub fn kind(self) -> EventKind {
         match self {
             Event::Disaster(_) => EventKind::Disaster,
+            // The correlated disaster carries the SAME kind label (it is a Disaster with a
+            // co-loss addendum, not a distinct event species — so no new `EventKind`).
+            Event::CorrelatedDisaster { .. } => EventKind::Disaster,
             Event::KillSubnet(_) => EventKind::KillSubnet,
             Event::ProviderExit { .. } => EventKind::ProviderExit,
             Event::GeoCatastrophe(_) => EventKind::GeoCatastrophe,

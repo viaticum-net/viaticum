@@ -1852,32 +1852,42 @@ fn churn(world: &mut World, params: &DynParams) {
         let aggression = world.nodes[node].archetype.evict_aggression();
         let p = params.churn_out_prob * (1.0 + CHURN_AGGRESSION_SCALE * aggression);
         if rng.unit() < p {
-            world.nodes[node].present = false;
-            // A.2 (транше 4): the departing node is a HOLDER — every owner whose data it
-            // carried suffers a SILENT loss, detected on the owner's NEXT PoS round (next
-            // tick). Queue one event per PRESENT distinct owner, V_lost = V_held = all of
-            // that owner's alive symbols here (a total loss). Deterministic (storage order).
-            let mut per_owner: Vec<(usize, f64)> = Vec::new();
-            for hs in world.nodes[node].holdings.iter().filter(|s| s.alive) {
-                if !world.nodes[hs.owner].present {
-                    continue; // a departed owner cannot detect the loss (dead pair)
-                }
-                match per_owner.iter_mut().find(|(o, _)| *o == hs.owner) {
-                    Some(e) => e.1 += hs.volume,
-                    None => per_owner.push((hs.owner, hs.volume)),
-                }
-            }
-            for (owner, volume) in per_owner {
-                world.pending_silent_loss.push(SilentLoss {
-                    owner,
-                    holder: node,
-                    volume,
-                });
-            }
-            for hs in world.nodes[node].holdings.iter_mut() {
-                hs.alive = false;
-            }
+            depart_node(world, node);
         }
+    }
+}
+
+/// Depart a single present node: mark it absent, queue a SILENT loss to each present owner
+/// whose data it carried, and kill its held symbols — the per-node departure physics of
+/// [`churn`], extracted VERBATIM so the correlated-disaster co-loss
+/// (`sim_adv::runner::apply_events`) reuses ONE physics instead of a divergent path.
+///
+/// A.2 (транше 4): the departing node is a HOLDER — every owner whose data it carried
+/// suffers a SILENT loss, detected on the owner's NEXT PoS round (next tick). Queue one event
+/// per PRESENT distinct owner, V_lost = V_held = all of that owner's alive symbols here (a
+/// total loss). Deterministic (storage order). Call ONLY on a currently-present node (as
+/// `churn` does): departing an already-absent node would re-queue losses / re-kill holdings.
+pub(crate) fn depart_node(world: &mut World, node: usize) {
+    world.nodes[node].present = false;
+    let mut per_owner: Vec<(usize, f64)> = Vec::new();
+    for hs in world.nodes[node].holdings.iter().filter(|s| s.alive) {
+        if !world.nodes[hs.owner].present {
+            continue; // a departed owner cannot detect the loss (dead pair)
+        }
+        match per_owner.iter_mut().find(|(o, _)| *o == hs.owner) {
+            Some(e) => e.1 += hs.volume,
+            None => per_owner.push((hs.owner, hs.volume)),
+        }
+    }
+    for (owner, volume) in per_owner {
+        world.pending_silent_loss.push(SilentLoss {
+            owner,
+            holder: node,
+            volume,
+        });
+    }
+    for hs in world.nodes[node].holdings.iter_mut() {
+        hs.alive = false;
     }
 }
 
