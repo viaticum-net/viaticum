@@ -158,6 +158,22 @@ pub fn present_count(world: &World) -> usize {
     world.nodes.iter().filter(|nd| nd.present).count()
 }
 
+/// The A15 NEWCOMER cutoff (`4r_a15_spec.md` §3): the END of the initial bootstrap cohort = the
+/// MAX `joined_tick` over the first `n0` nodes (the bootstrap set — `apply_inflow` reschedules only
+/// the LAST `pool` nodes, so `[0, n0)` is exactly the cohort). A node with `joined_tick > cutoff` is
+/// a genuine NEWCOMER that arrived AFTER the cohort finished joining. For a fully-established world
+/// (`n0_frac = 1.0`) the cohort all joins at tick 0 ⇒ cutoff 0 (every inflow-pool node is a
+/// newcomer); for a spread cohort ⇒ `T_join`. Pure god-view read; never a decision input.
+pub fn newcomer_cutoff(world: &World, n0: usize) -> u64 {
+    world
+        .nodes
+        .iter()
+        .take(n0.min(world.nodes.len()))
+        .map(|nd| nd.joined_tick)
+        .max()
+        .unwrap_or(0)
+}
+
 /// One seed's present-count time-series over the run (the core inflow deliverable, spec §3).
 /// `present_per_tick[t]` = the present-node count AFTER tick `t` (post-activation, post-churn).
 #[derive(Debug, Clone, PartialEq)]

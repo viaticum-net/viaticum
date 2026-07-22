@@ -24,10 +24,13 @@ use crate::sim_adv::brier::Calibration;
 use crate::sim_adv::cli::{SimAdvError, apply_dial};
 use crate::sim_adv::hetero::{DemandClass, HeteroReport, HeteroTracker, apply_demand_classes};
 use crate::sim_adv::inflow::{PopSeries, apply_inflow, bootstrap_n0, present_count};
-use crate::sim_adv::metrics::{MetricSet, collect_metrics};
+use crate::sim_adv::metrics::{
+    MetricSet, cartel_earnings_split, collect_metrics, newcomer_floor_durability,
+};
 use crate::sim_adv::predators::{
     AdvMetrics, RunMode, collect_adv_metrics, fold_cap_ratio, inject_adversaries,
-    install_adv_uptime, observe_adv_aggregates, observe_cap_ratio, twin_dial_override,
+    inject_incumbent_cartel, install_adv_uptime, observe_adv_aggregates, observe_cap_ratio,
+    twin_dial_override,
 };
 use crate::sim_adv::restore::{RestoreTracker, RestoreTruth};
 use crate::sim_adv::scenario::AdvId;
@@ -82,6 +85,15 @@ pub struct RunResult {
     /// non-inflow scenario; `Some` for an [`crate::sim_adv::InflowPolicy::Steady`] scenario
     /// (`tiered_v1_inflow`) — the population curve the INV-POP-STATIONARY board row reads.
     pub per_seed_pop: Vec<Option<PopSeries>>,
+    /// Per-seed NEWCOMER floor-durability (`4r_a15_spec.md` §3), seed-indexed. `NaN` for a
+    /// non-enclosure scenario; a finite fraction for the A15 `a15_enclosure` scenario — the
+    /// god-view durability of post-cutoff newcomers' floor-met blocks, which INV-ENCLOSURE-FLOOR
+    /// reads and the cartel-fraction sweep tracks.
+    pub per_seed_newcomer: Vec<f64>,
+    /// Per-seed CARTEL-PAYS ratio (`4r_a15_spec.md` §4, SECONDARY), seed-indexed: the cartel's
+    /// mean outbound service / the non-cartel incumbents' mean. `NaN` for a non-enclosure scenario
+    /// (or a seed with no baseline). `≤ 1` ⇒ the cartel earns no more than an honest incumbent.
+    pub per_seed_cartel_earn: Vec<f64>,
 }
 
 /// All per-seed outputs of one seed run (kept as a struct so the growing set of optional
@@ -105,6 +117,12 @@ pub(crate) struct SeedRun {
     /// The present-count time-series for an INFLOW scenario (`4r_inflow_spec.md`), else `None`
     /// (a closed-cohort / non-inflow scenario records no curve, so its output is unchanged).
     pub pop: Option<PopSeries>,
+    /// The NEWCOMER floor-durability at the horizon for an A15 enclosure scenario (`4r_a15_spec.md`
+    /// §3), else `NaN` (a non-enclosure scenario carries no cartel / newcomer cut).
+    pub newcomer_durability: f64,
+    /// The CARTEL-PAYS ratio (cartel mean served-out / non-cartel incumbent mean) for an A15
+    /// enclosure scenario (`4r_a15_spec.md` §4), else `NaN`.
+    pub cartel_earn_ratio: f64,
 }
 
 /// A predator run paired with its matched honest twin (same seed, same construction, hooks
@@ -431,10 +449,40 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     } else {
         None
     };
-    // Phase 1: inject the scenario's adversaries (empty ⇒ no-op; honest scenarios stay
-    // byte-identical). `Predator` installs the hooks; `Twin` injects the same heavy nodes
-    // with hooks off (the matched control). Deterministic, no RNG.
-    let adv_nodes = inject_adversaries(&mut world, &scenario.adversaries, params, mode);
+    // Phase 1/3: inject the scenario's adversaries (empty ⇒ no-op; honest scenarios stay
+    // byte-identical). `Predator` installs the hooks; `Twin` injects the same nodes with hooks off
+    // (the matched control). Deterministic, no RNG. A15 (incumbent-enclosure) needs a DIFFERENT
+    // injection: its cartel is the EARLIEST-joined INCUMBENTS (not the last slots, which under
+    // inflow are the newcomer pool), so it branches to `inject_incumbent_cartel`.
+    let is_enclosure = scenario
+        .adversaries
+        .iter()
+        .any(|a| a.id == AdvId::A15IncumbentEnclosure);
+    let adv_nodes = if is_enclosure {
+        match scenario
+            .adversaries
+            .iter()
+            .find(|a| a.id == AdvId::A15IncumbentEnclosure)
+        {
+            Some(spec) => inject_incumbent_cartel(&mut world, spec, mode),
+            None => Vec::new(),
+        }
+    } else {
+        inject_adversaries(&mut world, &scenario.adversaries, params, mode)
+    };
+    // A15 newcomer cut (`4r_a15_spec.md` §3): a NEWCOMER is a node that joined strictly AFTER the
+    // initial bootstrap cohort finished joining — `joined_tick > newcomer_cutoff` (the max
+    // `joined_tick` over the first n0 bootstrap nodes; see `inflow::newcomer_cutoff`). Derived from
+    // the world (self-documenting), NOT a tuned bar: for the fully-established a15 world
+    // (`n0_frac = 1.0`) the cohort all joins at tick 0 ⇒ cutoff 0, so every inflow-pool arrival is a
+    // newcomer (and the cartel incumbents, `joined_tick == 0`, are excluded from the metric).
+    let join_cutoff = crate::sim_adv::inflow::newcomer_cutoff(&world, pop_setpoint);
+    // The Attack-ROI (parked / cap-ratio / consumed-vs-served) channel is meaningful only for a
+    // twin-compared predator scenario. A15 enclosure is a world-cut (newcomer-durability), NOT a
+    // twin comparison, so it does NOT populate the Attack-ROI read — leaving `sr.adv = None` (and
+    // `per_seed_adv = None` in `run`), which keeps the determinism board's adv-channel check
+    // consistent (both the run and its re-run carry `None`).
+    let track_adv_roi = !adv_nodes.is_empty() && !is_enclosure;
     // Phase-2a-2 (A3 флаппер): install the mode-differentiated flapper uptime profile on the A3
     // slots — bursty Seasonal (predator) vs mean-matched iid Ragged (twin). No-op for every other
     // predator id (they keep their archetype uptime); leaves the non-A3 slots untouched.
@@ -559,9 +607,10 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
             resolve_cursor += 1;
         }
 
-        // (f) fold this tick's Р-7 cap ratio + the A2 adversary aggregates (only meaningful
-        //     with adversaries present).
-        if !adv_nodes.is_empty() {
+        // (f) fold this tick's Р-7 cap ratio + the A2 adversary aggregates (only meaningful for a
+        //     twin-compared Attack-ROI scenario; A15 enclosure uses the newcomer-durability channel,
+        //     NOT the Attack-ROI read, so it skips this).
+        if track_adv_roi {
             run_cap_ratio =
                 fold_cap_ratio(run_cap_ratio, observe_cap_ratio(&world, params, &adv_nodes));
             let (g, park) = observe_adv_aggregates(&world, &adv_nodes);
@@ -594,7 +643,7 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     } else {
         None
     };
-    let adv = if adv_nodes.is_empty() {
+    let adv = if !track_adv_roi {
         None
     } else {
         let surfaced_frac = frac_or_nan(a3_surfaced, a3_samples);
@@ -626,6 +675,21 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
         present_per_tick,
         setpoint: pop_setpoint,
     });
+    // A15 (`4r_a15_spec.md` §3/§4): the newcomer floor-durability world-cut + the CARTEL-PAYS
+    // ratio. Evaluator-only god-view reads (never fed into a decision). `NaN` for a non-enclosure
+    // scenario (the channel is unused there).
+    let (newcomer_durability, cartel_earn_ratio) = if is_enclosure {
+        let dur = newcomer_floor_durability(&world, join_cutoff, params.n_symbols);
+        let (cartel_e, inc_e) = cartel_earnings_split(&world, &adv_nodes, join_cutoff);
+        let ratio = if inc_e > 0.0 {
+            cartel_e / inc_e
+        } else {
+            f64::NAN
+        };
+        (dur, ratio)
+    } else {
+        (f64::NAN, f64::NAN)
+    };
     SeedRun {
         metrics: collect_metrics(&world, params),
         fired,
@@ -635,6 +699,8 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
         hetero,
         tier,
         pop,
+        newcomer_durability,
+        cartel_earn_ratio,
     }
 }
 
@@ -688,13 +754,22 @@ fn block_live_symbols(world: &World, owner: usize, block: usize) -> usize {
 /// Attack-ROI comparison is seed-paired (variance-reducing); honest scenarios skip the twin
 /// (no extra work, `per_seed_adv` all `None`).
 pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
-    let has_adv = !scenario.adversaries.is_empty();
-    // Per seed: the predator run + (for an adversary scenario) its matched twin's Attack-ROI.
+    // A15 (incumbent-enclosure) is a cartel-fraction SWEEP measured by a world-cut, NOT a
+    // predator-vs-twin comparison (its control is a separate cartel_frac=0 run), so it needs NO
+    // twin — skipping it halves the enclosure scenario's cost and leaves `per_seed_adv` all
+    // `None` (the enclosure has no Attack-ROI comparative row).
+    let is_enclosure = scenario
+        .adversaries
+        .iter()
+        .any(|a| a.id == AdvId::A15IncumbentEnclosure);
+    let needs_twin = !scenario.adversaries.is_empty() && !is_enclosure;
+    // Per seed: the predator run + (for a twin-compared adversary scenario) its matched twin's
+    // Attack-ROI.
     let outcomes: Vec<(SeedRun, Option<AdvMetrics>)> = seeds
         .par_iter()
         .map(|&seed| {
             let pred = run_one_seed_mode(scenario, seed, RunMode::Predator);
-            let twin_adv = if has_adv {
+            let twin_adv = if needs_twin {
                 run_one_seed_mode(scenario, seed, RunMode::Twin).adv
             } else {
                 None
@@ -711,6 +786,8 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
     let mut per_seed_hetero = Vec::with_capacity(outcomes.len());
     let mut per_seed_tier = Vec::with_capacity(outcomes.len());
     let mut per_seed_pop = Vec::with_capacity(outcomes.len());
+    let mut per_seed_newcomer = Vec::with_capacity(outcomes.len());
+    let mut per_seed_cartel_earn = Vec::with_capacity(outcomes.len());
     for (sr, twin_adv) in outcomes {
         per_seed.push(sr.metrics);
         fired.push(sr.fired);
@@ -719,6 +796,8 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_hetero.push(sr.hetero);
         per_seed_tier.push(sr.tier);
         per_seed_pop.push(sr.pop);
+        per_seed_newcomer.push(sr.newcomer_durability);
+        per_seed_cartel_earn.push(sr.cartel_earn_ratio);
         per_seed_adv.push(match (sr.adv, twin_adv) {
             (Some(pred), Some(twin)) => Some(AdvPair { pred, twin }),
             _ => None,
@@ -736,6 +815,8 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_hetero,
         per_seed_tier,
         per_seed_pop,
+        per_seed_newcomer,
+        per_seed_cartel_earn,
     }
 }
 

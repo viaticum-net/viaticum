@@ -988,7 +988,28 @@ fn admit_offer(
     // OVERRIDE the archetype rate (A1 ε-give serves ~5%); an honest holder uses its
     // archetype willingness UNCHANGED (adv_action → None for honest nodes, so the RNG draw
     // and threshold are byte-identical to the pre-adv path).
-    let accept_rate = adv_action(world, holder, tick)
+    let action = adv_action(world, holder, tick);
+    // World-v3 phase-3 A15 (incumbent-enclosure): a cartel HOLDER hard-rejects an owner it has
+    // low reciprocity with — `capital[owner][holder].g_ho` below the cartel's `enclose_thresh`
+    // (a NEWCOMER that has not yet served the cartel). The hook only sets the FLAG (first-hand);
+    // the g_ho comparison is applied ENGINE-side on the holder's OWN bilaterally-observable pair
+    // capital (the same anti-oracle split as A6's `discriminate`, and g_ho is genuinely
+    // first-hand — no god-view). `enclose_newcomers` is `false` for every honest / non-A15
+    // holder, so this branch is skipped and the accept-gate stays BYTE-IDENTICAL to the pre-A15
+    // path (the ANCHOR). Placed before the willingness draw: the draw is a per-(owner,holder,tick)
+    // DERIVED stream, so skipping it here perturbs no other cell's RNG (determinism preserved).
+    if let Some(a) = action
+        && a.enclose_newcomers
+    {
+        let thresh = world.adv[holder]
+            .as_ref()
+            .map(|r| r.dials.enclose_thresh)
+            .unwrap_or(0.0);
+        if world.capital[owner][holder].g_ho < thresh {
+            return false; // enclosure: the cartel shuts its door on the unreciprocated newcomer
+        }
+    }
+    let accept_rate = action
         .and_then(|a| a.accept_rate)
         .unwrap_or_else(|| world.nodes[holder].archetype.willing_accept_rate());
     let mut rng = Rng::derive(world.seed, ACCEPT_TAG, owner as u64, holder as u64, tick);

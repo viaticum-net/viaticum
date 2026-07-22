@@ -174,6 +174,95 @@ pub(crate) fn bit_eq(a: &MetricSet, b: &MetricSet) -> bool {
             .all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
+/// World-v3 phase-3 (A15) god-view EVALUATOR read (never a decision input): the NEWCOMER
+/// floor-durability. Among PRESENT nodes that joined strictly AFTER `join_cutoff` — the genuine
+/// newcomers arriving into an already-established network (the inflow pool tail; the bootstrap
+/// cohort all joins by `T_join ≤ cutoff`, so `joined_tick > cutoff` cleanly isolates them) — the
+/// MEAN over nodes of `(floor-met blocks that CURRENTLY still hold ≥ floor non-cream symbols) /
+/// (floor-met blocks)`. A newcomer with no floor-met block yet is SKIPPED (no denominator);
+/// `NaN` if no newcomer has a floor-met block. The A15 enclosure headline: did newcomers' data,
+/// once it reached durable, STAY durable despite the incumbent cartel? (The per-archetype floor
+/// durability of [`collect_metrics`], restricted to the post-cutoff arrivals and expressed as a
+/// per-block "still ≥ floor" fraction.)
+pub fn newcomer_floor_durability(world: &World, join_cutoff: u64, floor: usize) -> f64 {
+    let n = world.nodes.len();
+    let mut ratio_sum = 0.0f64;
+    let mut counted = 0usize;
+    for o in 0..n {
+        if !world.nodes[o].present || world.nodes[o].joined_tick <= join_cutoff {
+            continue;
+        }
+        let mut met = 0usize; // blocks that ever met floor
+        let mut still = 0usize; // ... whose CURRENT non-cream holder count is still ≥ floor
+        for b in &world.nodes[o].own_blocks {
+            if !b.floor_ever_met {
+                continue;
+            }
+            met += 1;
+            let live = (0..n)
+                .filter(|&h| {
+                    world.nodes[h].present
+                        && world.nodes[h]
+                            .holdings
+                            .iter()
+                            .any(|s| s.alive && !s.cream && s.owner == o && s.block == b.id)
+                })
+                .count();
+            if live >= floor {
+                still += 1;
+            }
+        }
+        if met > 0 {
+            ratio_sum += still as f64 / met as f64;
+            counted += 1;
+        }
+    }
+    if counted > 0 {
+        ratio_sum / counted as f64
+    } else {
+        f64::NAN
+    }
+}
+
+/// World-v3 phase-3 (A15) CARTEL-PAYS read (spec §4, SECONDARY): the mean outbound-service
+/// integral `served_out = Σ_h served[node][h]` (gb·days the node GAVE others) for the CARTEL
+/// nodes vs the NON-cartel INCUMBENTS (present nodes that joined by `join_cutoff` and are not in
+/// the cartel). Returns `(cartel_mean, non_cartel_incumbent_mean)`. A cartel that refuses to
+/// serve newcomers serves LESS, so it should earn NO MORE than an honest incumbent of the same
+/// vintage. Each side is `NaN` when it has no members (skipped by the caller). Pure god-view.
+pub fn cartel_earnings_split(world: &World, cartel: &[usize], join_cutoff: u64) -> (f64, f64) {
+    let n = world.nodes.len();
+    let served_out = |node: usize| -> f64 { (0..n).map(|h| world.served[node][h]).sum() };
+    let mut cartel_sum = 0.0f64;
+    let mut cartel_cnt = 0usize;
+    let mut inc_sum = 0.0f64;
+    let mut inc_cnt = 0usize;
+    for node in 0..n {
+        if !world.nodes[node].present {
+            continue;
+        }
+        if cartel.contains(&node) {
+            cartel_sum += served_out(node);
+            cartel_cnt += 1;
+        } else if world.nodes[node].joined_tick <= join_cutoff {
+            // A non-cartel INCUMBENT (same "established" vintage as the cartel).
+            inc_sum += served_out(node);
+            inc_cnt += 1;
+        }
+    }
+    let cartel_mean = if cartel_cnt > 0 {
+        cartel_sum / cartel_cnt as f64
+    } else {
+        f64::NAN
+    };
+    let inc_mean = if inc_cnt > 0 {
+        inc_sum / inc_cnt as f64
+    } else {
+        f64::NAN
+    };
+    (cartel_mean, inc_mean)
+}
+
 /// Mean and SAMPLE standard deviation (n−1) over the FINITE values (NaN skipped). The
 /// mean is `NaN` with no finite value; σ is `NaN` with fewer than two (undefined spread).
 /// Shared by the report's metric table and the verdict engine's power test.

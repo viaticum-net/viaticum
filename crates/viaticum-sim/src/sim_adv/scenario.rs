@@ -149,11 +149,16 @@ pub enum AdvId {
     A12Hostage,
     A13PosCheater,
     A14RepairBait,
+    /// A15 (phase 3): a CARTEL of established INCUMBENTS that reciprocity-refuses NEWCOMERS —
+    /// as a HOLDER it hard-rejects an owner it has low reciprocity `g_ho` with (a newcomer that
+    /// has not yet served the cartel). SOFT enclosure: the cartel places its own data honestly
+    /// (no placement lever), so a newcomer can still serve the cartel first and break in.
+    A15IncumbentEnclosure,
 }
 
 impl AdvId {
-    /// All fourteen, in canonical order (for validation / iteration).
-    pub const ALL: [AdvId; 14] = [
+    /// All fifteen, in canonical order (for validation / iteration).
+    pub const ALL: [AdvId; 15] = [
         AdvId::A1EpsilonWhale,
         AdvId::A2DropRefuser,
         AdvId::A3Flapper,
@@ -168,6 +173,7 @@ impl AdvId {
         AdvId::A12Hostage,
         AdvId::A13PosCheater,
         AdvId::A14RepairBait,
+        AdvId::A15IncumbentEnclosure,
     ];
 
     /// Short label for reports / CSV.
@@ -187,6 +193,7 @@ impl AdvId {
             AdvId::A12Hostage => "A12_hostage",
             AdvId::A13PosCheater => "A13_pos_cheater",
             AdvId::A14RepairBait => "A14_repair_bait",
+            AdvId::A15IncumbentEnclosure => "A15_incumbent_enclosure",
         }
     }
 }
@@ -230,6 +237,12 @@ pub struct AdvDials {
     /// A11: creeping-degradation start tick + slope.
     pub degrade_start: u64,
     pub degrade_slope: f64,
+    /// A15 (incumbent-enclosure): the reciprocity gate. As a HOLDER, an A15 cartel node
+    /// hard-rejects an owner whose service to it `capital[owner][holder].g_ho < enclose_thresh`
+    /// — i.e. a NEWCOMER that has not yet served the cartel. `0.0` (the [`Default`]) ⇒ the gate
+    /// never fires (`g_ho ≥ 0` always), so a role with default dials is a NO-OP. First-hand:
+    /// `g_ho` is the holder's OWN bilaterally-observable pair capital (not a god-view read).
+    pub enclose_thresh: f64,
 }
 
 /// A scripted world event (design §4). The vocabulary is fixed in 0.1; EXECUTION of
@@ -466,10 +479,18 @@ pub struct AdvAction {
     /// (footprint `own_blocks.len() <= dials.discr_max_blocks`), dropped SILENTLY — "serves the
     /// large, sheds the small". Combined with `drop_frac_per_tick`. Default `false`.
     pub discriminate: bool,
+    /// A15 (incumbent-enclosure): when `true`, this HOLDER hard-rejects (in `admit_offer`) any
+    /// owner whose reciprocity `capital[owner][holder].g_ho < dials.enclose_thresh` — the cartel
+    /// shuts its door on newcomers who have not served it. The FLAG is first-hand (the hook only
+    /// declares "I enclose"); the g_ho comparison is applied ENGINE-side (the same anti-oracle
+    /// split as A6's `discriminate`). Default `false` ⇒ the accept-gate is byte-identical to the
+    /// honest path (the ANCHOR).
+    pub enclose_newcomers: bool,
 }
 
 impl AdvAction {
-    /// The honest / no-op action: no accept override, no rejoin, no voluntary drop, no pause.
+    /// The honest / no-op action: no accept override, no rejoin, no voluntary drop, no pause,
+    /// no enclosure.
     pub const NOOP: AdvAction = AdvAction {
         accept_rate: None,
         rejoin: false,
@@ -477,6 +498,7 @@ impl AdvAction {
         announce_drops: false,
         offline: false,
         discriminate: false,
+        enclose_newcomers: false,
     };
 }
 

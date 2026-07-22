@@ -49,6 +49,49 @@ const DR_BATTLE_K_FLOOR: usize = 3;
 /// 1.0000, σ = 0 ⇒ power = ∞). Calibrate the SCENARIO (K_FLOOR), never this bar.
 const DR_BATTLE_FLOOR_X: f64 = 0.60;
 
+// ============================================================
+// A15 incumbent-enclosure (`4r_a15_spec.md`) — constants FROZEN in code BEFORE the run
+// (anti-Goodhart). The calibration test `a15_enclosure_calibration_*` prints the runtime numbers
+// (n0, present-at-t0, pool, newcomers past cutoff, typical newcomer vs incumbent g_ho) that
+// justify each; see the frozen-constants section of the A15 report.
+// ============================================================
+
+/// The bootstrap INCUMBENT setpoint n0 for `a15_enclosure`. The world is a fully-established
+/// incumbent network at t=0 (`n0_frac = 1.0`, so all n0 join at tick 0) into which the inflow pool
+/// streams as newcomers — the regime the enclosure question lives in. 50 keeps the run modest
+/// (n0 + pool ≈ 71 nodes over 160 ticks) while leaving room for a cartel-fraction sweep up to the
+/// TOTAL incumbent cartel (frac = 1.0 = all n0 present-at-t0 incumbents enclose).
+const A15_N0: usize = 50;
+
+/// The enclosure horizon (weekly ticks). 160 ≈ 3 years — long enough that inflow newcomers (every
+/// pool arrival is a newcomer, since `join_cutoff = 0`: the whole n0 incumbent cohort joins at t=0)
+/// have many ticks to mature their blocks and, where possible, serve the cartel across several PoS
+/// windows, yet short enough to run locally.
+const A15_HORIZON: u64 = 160;
+
+/// The reciprocity gate g_ho threshold: a cartel HOLDER rejects an owner whose service to it
+/// `capital[owner][holder].g_ho < A15_ENCLOSE_THRESH`. FROZEN from the measured g_ho scale (seeds
+/// 42..46): only ~6-14 % of owner→cartel pairs carry ANY g_ho (most owners never placed on a given
+/// cartel member), and among those the served incumbents sit at mean g_ho ≈ 60-110. Set to 40 —
+/// well above a fresh newcomer's ≈ 0 g_ho — so the door is genuinely shut (~95 % of offers rejected)
+/// and the enclosure gets its strongest lockout shot: a newcomer must SERVE the cartel to clear it
+/// (soft enclosure). Calibrate the SCENARIO, never this bar.
+const A15_ENCLOSE_THRESH: f64 = 40.0;
+
+/// The FLOOR-board cartel size (group_size = C_floor). 10 of the n0 = 50 incumbents (frac 0.2): the
+/// non-cartel present capacity (≈ 40 incumbents + ~17 newcomers, all ≫ n_symbols = 5) still lets a
+/// newcomer the cartel refuses place and hold its floor on the honest remainder — the
+/// INV-ENCLOSURE-FLOOR sanity. FROZEN from the runtime present-count; see the report.
+const A15_C_FLOOR: usize = 10;
+
+/// The INV-ENCLOSURE-FLOOR newcomer-durability floor X. FROZEN as a round COLLAPSE bar (0.20) BELOW
+/// the measured baseline (mean newcomer durability ≈ 0.53-0.55 at C_floor, seeds 42..46) — "FAIL if
+/// the newcomer durability collapses below 0.20", NOT tuned. The metric carries large seed-
+/// REALIZATION variance (σ ≈ 0.40 ⇒ power ≈ 0.8 < 2), so the row lands INCONCLUSIVE — the same
+/// honest outcome as A5's INV-A5-DEEP-FLOOR (WARN-7: seed variance dominates, growing the world does
+/// not fix it), reported with the flat sweep, not tuned away.
+const A15_FLOOR_X: f64 = 0.20;
+
 /// Every registered scenario (hard-coded like `Archetype::ALL`).
 pub fn all_scenarios() -> Vec<Scenario> {
     vec![
@@ -68,6 +111,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
         a3_flapper(),
         a5_deep_silent(),
         a6_discriminator(),
+        a15_enclosure(),
     ]
 }
 
@@ -913,6 +957,101 @@ pub fn a6_discriminator() -> Scenario {
         verdicts: a6_discriminator_invariants(),
         fast: false,
     }
+}
+
+/// A15 — incumbent-enclosure (phase 3, `4r_a15_spec.md`): a fully-established incumbent network
+/// (`n0_frac = 1.0`, n0 = 50 present at t=0) plus a STEADY inflow stream of newcomers, with a
+/// CARTEL of `C_floor` EARLIEST-joined incumbents that reciprocity-refuses newcomers (as a holder
+/// it hard-rejects any owner whose `g_ho < enclose_thresh`). The question: can the cartel LOCK OUT
+/// the newcomer stream?
+///
+/// The mechanism is SOFT enclosure — the cartel places its OWN data honestly (no placement lever).
+/// The headline is the newcomer floor-durability (the fraction of newcomers' floor-met blocks that
+/// stay ≥ floor). Board: INV-ENCLOSURE-FLOOR (at C_floor, where the non-cartel capacity still covers
+/// n_symbols = 5, the newcomer durability clears the frozen X) + the two structural rows. The
+/// cartel-FRACTION SWEEP (durability vs cartel_frac) is a `tests.rs` sweep, NOT a board row (A15 is
+/// a world-cut, not a twin). MEASURED FINDING (`newcomer_durability_monotone…`): in the ample-
+/// capacity regime (cartel ≤ 0.8·n0) the abundant non-cartel remainder keeps durability flat; at the
+/// TOTAL incumbent cartel (frac = 1.0) durability degrades (~0.55 → ~0.315) — enclosure bites — but
+/// never achieves LOCKOUT (> the collapse floor), because the inflow cohort forms its own reciprocal
+/// sub-community. `n0 = 50`, 160 ticks (weekly), 5 seeds.
+pub fn a15_enclosure() -> Scenario {
+    let horizon = A15_HORIZON;
+    // A fully-established incumbent network at t=0: `n0_frac = 1.0` makes all n0 bootstrap nodes
+    // present at tick 0 (so the cartel can be picked from the whole n0 incumbent set), and the
+    // inflow pool is still forced `present = false` and streamed in over `[1, horizon)`.
+    let base = DynParams {
+        n0_frac: 1.0,
+        ..DynParams::default()
+    };
+    let lambda = expected_outflow(A15_N0, base.churn_out_prob);
+    let n_nodes = A15_N0 + pool_size(lambda, horizon);
+    Scenario {
+        id: ScenarioId("a15_enclosure"),
+        about: "established incumbent network (n0=50) + steady newcomer inflow + a cartel of C_floor earliest-joined incumbents reciprocity-refusing newcomers — can the cartel lock newcomers out? (soft enclosure; bites at total cartel but no lockout — inflow sub-community)",
+        world: WorldParams {
+            n_nodes,
+            base,
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::Steady {
+                joins_per_tick: lambda,
+            },
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: vec![AdvSpec {
+            id: AdvId::A15IncumbentEnclosure,
+            // `count` mirrors the cartel size for the report; the injection sizes the cartel by
+            // `dials.group_size` (spec §2). The sweep keeps the two in sync.
+            count: A15_C_FLOOR,
+            info_model: InfoModel::Own,
+            dials: AdvDials {
+                group_size: A15_C_FLOOR,
+                enclose_thresh: A15_ENCLOSE_THRESH,
+                ..AdvDials::default()
+            },
+        }],
+        events: Vec::new(),
+        horizon,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![MetricId::InvariantBoard],
+        verdicts: a15_enclosure_invariants(),
+        fast: false,
+    }
+}
+
+/// The `a15_enclosure` board (`4r_a15_spec.md` §4): the two structural rows + INV-ENCLOSURE-FLOOR.
+fn a15_enclosure_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-ENCLOSURE-FLOOR: at the calibrated cartel fraction C_floor — where the NON-cartel
+        // present capacity still far exceeds n_symbols = 5 — a newcomer the cartel refuses can
+        // still reach and hold floor on the honest remainder, so the newcomer floor-durability
+        // clears a frozen floor X. GreaterThan, power-gated (spec §10 п.16): power < 2 ⇒
+        // INCONCLUSIVE, itself a finding ("enclosure's newcomer effect is below the seed noise").
+        // A FAIL (durability < X even at a modest cartel) is the enclosure-bites finding — reported
+        // with the sweep curve, NOT tuned away.
+        Invariant {
+            id: "INV-ENCLOSURE-FLOOR",
+            spec: InvariantSpec::EnclosureFloor {
+                dir: Direction::GreaterThan,
+            },
+            threshold: A15_FLOOR_X,
+        },
+    ]
 }
 
 /// Reliable's extraction ROI (Reliable is index 0 in `Archetype::ALL`).

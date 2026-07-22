@@ -143,6 +143,15 @@ pub enum InvariantSpec {
         /// The pass direction.
         dir: Direction,
     },
+    /// A phase-3 A15 NEWCOMER floor-durability scalar → mean±σ vs threshold, power<2 gate. Reads
+    /// [`RunResult::per_seed_newcomer`] DIRECTLY (the durability fraction IS the per-seed scalar);
+    /// a non-enclosure seed contributes `NaN` (skipped). Used by INV-ENCLOSURE-FLOOR (at the
+    /// calibrated cartel fraction, where the non-cartel capacity still covers n_symbols, the
+    /// newcomer floor-durability clears a frozen floor X).
+    EnclosureFloor {
+        /// The pass direction (GreaterThan — durability above the floor X).
+        dir: Direction,
+    },
 }
 
 /// One invariant-board row spec.
@@ -200,6 +209,9 @@ impl Clone for Invariant {
                     measure: *measure,
                     dir: *dir,
                 },
+                InvariantSpec::EnclosureFloor { dir } => {
+                    InvariantSpec::EnclosureFloor { dir: *dir }
+                }
             },
             threshold: self.threshold,
         }
@@ -380,6 +392,19 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             Some(None) => sr.pop.is_none(),
                             None => true,
                         };
+                        // The A15 newcomer floor-durability + CARTEL-PAYS ratio must re-run
+                        // bit-identical too — they feed the INV-ENCLOSURE-FLOOR verdict + report
+                        // (a deterministically-produced NaN compares equal to itself via to_bits).
+                        let newcomer_eq = result
+                            .per_seed_newcomer
+                            .first()
+                            .map(|d0| d0.to_bits() == sr.newcomer_durability.to_bits())
+                            .unwrap_or(false);
+                        let cartel_eq = result
+                            .per_seed_cartel_earn
+                            .first()
+                            .map(|c0| c0.to_bits() == sr.cartel_earn_ratio.to_bits())
+                            .unwrap_or(false);
                         metrics_eq
                             && restore_eq
                             && calib_eq
@@ -387,6 +412,8 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             && hetero_eq
                             && tier_eq
                             && pop_eq
+                            && newcomer_eq
+                            && cartel_eq
                     }
                     None => false,
                 };
@@ -543,6 +570,21 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                     threshold: inv.threshold,
                     power,
                     note: "population: last-half present within ±band of setpoint",
+                }
+            }
+            InvariantSpec::EnclosureFloor { dir } => {
+                // The per-seed newcomer floor-durability IS the scalar (read directly).
+                let (mean, sigma) = mean_sigma(&result.per_seed_newcomer);
+                let sigma_r = if sigma.is_finite() { sigma } else { 0.0 };
+                let (kind, power) = decide(mean, sigma, inv.threshold, *dir);
+                Verdict {
+                    id: inv.id,
+                    kind,
+                    effect: mean,
+                    sigma: sigma_r,
+                    threshold: inv.threshold,
+                    power,
+                    note: "enclosure: newcomer floor-durability at the calibrated cartel fraction",
                 }
             }
         })

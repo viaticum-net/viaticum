@@ -158,9 +158,22 @@ pub fn a6_discriminator_hook(_ctx: &AdvContext) -> AdvAction {
     }
 }
 
+/// A15 incumbent-enclosure: as a HOLDER it declares the enclosure FLAG every tick — the engine
+/// then hard-rejects (in `admit_offer`) any owner whose reciprocity `capital[owner][holder].g_ho`
+/// is below the cartel's `enclose_thresh` (a newcomer that has not served the cartel). First-hand:
+/// the hook reads only its own context and returns a flag; it NEVER learns who is a newcomer (that
+/// is the engine's g_ho read on the holder's own pair capital — anti-oracle preserved).
+pub fn a15_incumbent_enclosure_hook(_ctx: &AdvContext) -> AdvAction {
+    AdvAction {
+        enclose_newcomers: true,
+        ..AdvAction::NOOP
+    }
+}
+
 /// The behaviour hook for a predator id in the PREDATOR arm. A1 ε-whale, A4 whitewasher, A2 silent
-/// dropper, A5 deep-silent pause, A6 discriminatory drop. A3's flap is an uptime profile (not a
-/// hook), so its predator hook is a no-op; the rest (A7+) are skeleton no-ops (later tranches).
+/// dropper, A5 deep-silent pause, A6 discriminatory drop, A15 incumbent-enclosure. A3's flap is an
+/// uptime profile (not a hook), so its predator hook is a no-op; the rest (A7-A14) are skeleton
+/// no-ops (later tranches).
 pub fn hook_for(id: AdvId) -> BehaviorHook {
     match id {
         AdvId::A1EpsilonWhale => a1_epsilon_whale_hook,
@@ -169,6 +182,7 @@ pub fn hook_for(id: AdvId) -> BehaviorHook {
         AdvId::A3Flapper => a3_flapper_hook,
         AdvId::A5DeepSilent => a5_deep_silent_hook,
         AdvId::A6Discriminator => a6_discriminator_hook,
+        AdvId::A15IncumbentEnclosure => a15_incumbent_enclosure_hook,
         _ => noop_hook,
     }
 }
@@ -186,8 +200,11 @@ pub fn twin_hook_for(id: AdvId) -> BehaviorHook {
         // So the twin must ALSO run the pause hook — the pause is the constant, the D-floor the
         // isolated variable (analogous to A2's polite twin isolating announcedness).
         AdvId::A5DeepSilent => a5_deep_silent_hook,
-        // A1/A4/A3/A6: the matched control is the HONEST node (hooks off). For A3 the flap is the
-        // uptime profile (mode-differentiated in `install_adv_uptime`), so its hook stays noop here.
+        // A1/A4/A3/A6/A15: the matched control is the HONEST node (hooks off). For A3 the flap is
+        // the uptime profile (mode-differentiated in `install_adv_uptime`), so its hook stays noop.
+        // A15 is a cartel-fraction SWEEP, NOT a twin comparison (its control is a separate
+        // cartel_frac=0 run), so its twin hook is a plain noop — an honest incumbent that never
+        // encloses (kept role-carrying only for churn-immortality parity with the predator arm).
         _ => noop_hook,
     }
 }
@@ -242,6 +259,55 @@ pub fn inject_adversaries(
         }
     }
     nodes
+}
+
+/// World-v3 phase-3 (A15): inject an INCUMBENT-ENCLOSURE cartel (spec §2). Unlike
+/// [`inject_adversaries`] — which re-purposes the world's LAST slots (under inflow, the NEWCOMER
+/// arrival pool) — the cartel is the `spec.dials.group_size` EARLIEST-ESTABLISHED present nodes:
+/// sort the present nodes by `(joined_tick, index)` and take the prefix. At t=0 those are exactly
+/// the `joined_tick == 0` bootstrap incumbents, so the cartel is DISJOINT from the inflow pool
+/// (whose nodes start `present = false` with `joined_tick ≥ 1`). Deterministic — a pure sort, NO
+/// RNG, so it perturbs no engine stream (determinism preserved).
+///
+/// The cartel members are drawn from the EXISTING honest population and are NOT re-constructed
+/// (no forced Reliable base, no demand inflation — that would confound "an incumbent that stops
+/// serving newcomers" with "a heavy node"): only the A15 `adv` role (with the enclosure hook +
+/// `enclose_thresh` dial) is layered on. The cartel places its OWN data HONESTLY — there is NO
+/// placement-side lever (spec CRITICAL note), so the enclosure is SOFT: a newcomer can serve the
+/// cartel first (earning `g_ho`) and break in. `Predator` installs the enclosure hook; `Twin`
+/// installs the noop hook (an honest incumbent — A15's control is a separate cartel_frac=0 run,
+/// so the twin is unused, kept only for churn-immortality parity). Returns the cartel node indices
+/// (ascending). `group_size == 0` ⇒ the empty cartel (the cartel_frac=0 honest-inflow control).
+pub fn inject_incumbent_cartel(world: &mut World, spec: &AdvSpec, mode: RunMode) -> Vec<usize> {
+    let group_size = spec.dials.group_size;
+    if group_size == 0 {
+        return Vec::new();
+    }
+    let mut cartel: Vec<usize> = (0..world.nodes.len())
+        .filter(|&i| world.nodes[i].present)
+        .collect();
+    // Earliest-established first: (joined_tick, index). Take the prefix — the incumbents.
+    cartel.sort_by(|&a, &b| {
+        world.nodes[a]
+            .joined_tick
+            .cmp(&world.nodes[b].joined_tick)
+            .then(a.cmp(&b))
+    });
+    cartel.truncate(group_size);
+    let hook = match mode {
+        RunMode::Predator => hook_for(spec.id),
+        RunMode::Twin => twin_hook_for(spec.id),
+    };
+    for &node in &cartel {
+        world.adv[node] = Some(AdvRole {
+            id: spec.id,
+            info_model: spec.info_model,
+            dials: spec.dials,
+            hook,
+        });
+    }
+    cartel.sort_unstable(); // ascending node order for a deterministic return
+    cartel
 }
 
 /// World-v3 phase-2a-2 (A3): install the FLAPPER's structural uptime profile on each A3 adversary
