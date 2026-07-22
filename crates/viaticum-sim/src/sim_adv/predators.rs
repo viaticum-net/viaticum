@@ -170,10 +170,28 @@ pub fn a15_incumbent_enclosure_hook(_ctx: &AdvContext) -> AdvAction {
     }
 }
 
+/// A7 sybil-farm: the farm ε-serves (`accept_rate = whale_accept`, ≈0 — it stores ~nothing real, so
+/// it earns NO honest reciprocity `capital[sybil][honest].g_ho`) and DECLARES collusion when its own
+/// `collude` dial is set. The engine's `adv_collude_farm` pass then accrues FAKE mutual served/g_ho
+/// among the same-`group_subnet` farm-mates (no real holdings). First-hand: the hook reads only its
+/// own dials + returns flags; it NEVER learns who the farm-mates are (that is the engine's god-view
+/// membership read — anti-oracle preserved, the same split as A6/A15). The `collude` dial is the
+/// clean ON/OFF A/B lever: with it false the SAME ε-serving farm runs but the collusive pass is off,
+/// isolating collusion from the (fixed) construction. The ε-serve is what makes "the farm never
+/// served honest" TRUE in the sim (spec §2): without it the farm would earn REAL honest storage and
+/// the V_free-surface finding would not isolate.
+pub fn a7_sybil_farm_hook(ctx: &AdvContext) -> AdvAction {
+    AdvAction {
+        accept_rate: Some(ctx.dials.whale_accept),
+        collude_farm: ctx.dials.collude,
+        ..AdvAction::NOOP
+    }
+}
+
 /// The behaviour hook for a predator id in the PREDATOR arm. A1 ε-whale, A4 whitewasher, A2 silent
-/// dropper, A5 deep-silent pause, A6 discriminatory drop, A15 incumbent-enclosure. A3's flap is an
-/// uptime profile (not a hook), so its predator hook is a no-op; the rest (A7-A14) are skeleton
-/// no-ops (later tranches).
+/// dropper, A5 deep-silent pause, A6 discriminatory drop, A7 sybil-farm collusion, A15
+/// incumbent-enclosure. A3's flap is an uptime profile (not a hook), so its predator hook is a no-op;
+/// the rest (A8-A14) are skeleton no-ops (later tranches).
 pub fn hook_for(id: AdvId) -> BehaviorHook {
     match id {
         AdvId::A1EpsilonWhale => a1_epsilon_whale_hook,
@@ -182,6 +200,7 @@ pub fn hook_for(id: AdvId) -> BehaviorHook {
         AdvId::A3Flapper => a3_flapper_hook,
         AdvId::A5DeepSilent => a5_deep_silent_hook,
         AdvId::A6Discriminator => a6_discriminator_hook,
+        AdvId::A7SybilFarm => a7_sybil_farm_hook,
         AdvId::A15IncumbentEnclosure => a15_incumbent_enclosure_hook,
         _ => noop_hook,
     }
@@ -364,7 +383,10 @@ fn configure_adv_node(world: &mut World, node: usize, spec: &AdvSpec, params: &D
     world.nodes[node].holdings.clear();
 
     let mult = match spec.id {
-        AdvId::A1EpsilonWhale => spec.dials.whale_block_mult.max(1.0),
+        // A1 whale + A7 sybil-farm both inflate demand via `whale_block_mult` so they have plenty
+        // of data to push onto the network (A7: the farm needs data to place to even TRY to capture
+        // honest storage — the surface the collusion is tested against).
+        AdvId::A1EpsilonWhale | AdvId::A7SybilFarm => spec.dials.whale_block_mult.max(1.0),
         _ => 1.0,
     };
     let n_blocks = ((params.blocks_per_node as f64) * mult).round() as usize;

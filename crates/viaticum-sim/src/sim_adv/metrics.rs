@@ -263,6 +263,81 @@ pub fn cartel_earnings_split(world: &World, cartel: &[usize], join_cutoff: u64) 
     (cartel_mean, inc_mean)
 }
 
+/// World-v3 phase-3 (A7 sybil-farm) god-view EVALUATOR read (never a decision input, `4r_a7_spec.md`
+/// §3): the CROSS-BOUNDARY honest storage the farm captured. `Σ_{h∉farm, s∈farm} served[h][s]` —
+/// the gb·time integral of the FARM's own data (`s` = sybil owner ∈ farm) that lived on an HONEST
+/// holder (`h` ∉ farm), PoS-confirmed. This is the storage the farm actually captured from the honest
+/// network. The reader counts only honest↔farm flows (the intra-farm `served[i∈farm][j∈farm]` cells
+/// the collusion writes are EXCLUDED: `h ∉ farm`, `s ∈ farm`).
+///
+/// NOTE (SIM-FIDELITY ARTIFACT, `4r_a7_spec.md` + A7 adversarial review): under collusion this metric
+/// inflates ~58× — but NOT because collusion beats the credit-limit. The pairwise κ_O credit key
+/// [`farm_honest_reciprocity`] (`capital[sybil][honest].g_ho`) stays ≈ 0, so the credit-limit HOLDS.
+/// The inflation rides the sim's OWNER-ORDERING PROXY: `place_own_data`'s `giver_priority_order`
+/// (engine `place_own_data`, default on) sorts owners each tick by the GLOBAL row-sum
+/// `Σ_h capital[o][h].g_ho`, which collusion inflates for free — so the sybils sort to the FRONT of
+/// the placement order and win scarce free-accept holder slots under contention. That global scheduler
+/// ranking-all-owners-by-total-service has NO real-protocol analogue (the daemon's priority is
+/// holder-side pairwise), and the code itself flags it as a proxy "NOT the spec's ideal". So the 58×
+/// is a sim-fidelity artifact; the trust-model defence is [`farm_honest_reciprocity`] ≈ 0
+/// (INV-SYBIL-CREDIT-LIMIT-HOLDS). `0.0` for an empty farm.
+pub fn farm_honest_storage(world: &World, farm: &[usize]) -> f64 {
+    let n = world.nodes.len();
+    let is_farm = |x: usize| farm.contains(&x);
+    let mut sum = 0.0f64;
+    for h in 0..n {
+        if is_farm(h) {
+            continue; // honest holder only
+        }
+        for &s in farm {
+            sum += world.served[h][s]; // served[holder][owner] = honest h held sybil s's data
+        }
+    }
+    sum
+}
+
+/// World-v3 phase-3 (A7) THE HEADLINE DEFENCE reader (`4r_a7_spec.md` §4 + A7 review): the farm's
+/// EARNED HONEST RECIPROCITY — the pairwise κ_O credit key that gates the farm's data on honest
+/// holders — `Σ_{s∈farm, h∉farm} capital[s][h].g_ho`. This is the cell the eviction/preemption rank
+/// (core `eviction_order`) and the admit-guard read to decide how much of sybil `s`'s data holder `h`
+/// keeps (`V_ret = v_free + κ_O/c_recip`). Collusion writes ONLY intra-farm cells, so it can NOT
+/// inflate this honest key: it stays ≈ 0 under collude-ON (the ε-farm never serves honest, so it earns
+/// no honest reciprocity). INV-SYBIL-CREDIT-LIMIT-HOLDS asserts this ≈ 0 — the proof that
+/// "reputation = credit-limit" RESISTS sybil multiplication. `0.0` for an empty farm.
+pub fn farm_honest_reciprocity(world: &World, farm: &[usize]) -> f64 {
+    let n = world.nodes.len();
+    let is_farm = |x: usize| farm.contains(&x);
+    let mut sum = 0.0f64;
+    for &s in farm {
+        for h in 0..n {
+            if is_farm(h) {
+                continue; // honest holder only
+            }
+            sum += world.capital[s][h].g_ho; // sybil s's earned reciprocity as a SERVER of honest h
+        }
+    }
+    sum
+}
+
+/// World-v3 phase-3 (A7) god-view EVALUATOR read (`4r_a7_spec.md` §3): the farm→honest OUTBOUND
+/// service `Σ_{s∈farm, h∉farm} served[s][h]` — how much the farm REALLY served the honest network
+/// (for the cross-ROI if it is > 0). An ε-serving sybil farm gives ≈ 0 (it earns no honest
+/// reciprocity — which is why [`farm_honest_reciprocity`] stays ≈ 0). `0.0` for an empty farm.
+pub fn farm_honest_served(world: &World, farm: &[usize]) -> f64 {
+    let n = world.nodes.len();
+    let is_farm = |x: usize| farm.contains(&x);
+    let mut sum = 0.0f64;
+    for &s in farm {
+        for h in 0..n {
+            if is_farm(h) {
+                continue; // honest holder only
+            }
+            sum += world.served[s][h]; // served[holder][owner] = sybil s held honest h's data
+        }
+    }
+    sum
+}
+
 /// Mean and SAMPLE standard deviation (n−1) over the FINITE values (NaN skipped). The
 /// mean is `NaN` with no finite value; σ is `NaN` with fewer than two (undefined spread).
 /// Shared by the report's metric table and the verdict engine's power test.

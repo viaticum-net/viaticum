@@ -234,6 +234,13 @@ pub struct AdvDials {
     /// A7/A8/A9: group size + shared subnet.
     pub group_size: usize,
     pub group_subnet: u32,
+    /// A7 (sybil-farm): whether the farm COLLUDES this run — the `a7_sybil_farm_hook` returns
+    /// `collude_farm = collude`, so a run with `collude = false` keeps the SAME ε-serving farm
+    /// (same demand, same placement) but with the collusive fake-accrual pass OFF. This is the
+    /// clean collude ON/OFF A/B lever (isolating collusion from the ε-accept construction, which
+    /// stays fixed across both arms). `false` (the [`Default`]) ⇒ no collusion. First-hand: the
+    /// sybil's own plan to collude; the engine reads farm MEMBERSHIP god-view (anti-oracle split).
+    pub collude: bool,
     /// A11: creeping-degradation start tick + slope.
     pub degrade_start: u64,
     pub degrade_slope: f64,
@@ -486,11 +493,19 @@ pub struct AdvAction {
     /// split as A6's `discriminate`). Default `false` ⇒ the accept-gate is byte-identical to the
     /// honest path (the ANCHOR).
     pub enclose_newcomers: bool,
+    /// A7 (sybil-farm): when `true`, this node COLLUDES this tick — the engine's `adv_collude_farm`
+    /// pass (run after the honest `pos_and_capital`) accrues FAKE mutual `served` + reciprocity
+    /// `g_ho` between this node and its same-`group_subnet` farm-mates WITHOUT any real holdings,
+    /// inflating intra-farm reputation at zero storage cost. The FLAG is first-hand (the hook only
+    /// declares "I collude"); farm MEMBERSHIP is read ENGINE-side (the same anti-oracle split as
+    /// A6's `discriminate` / A15's `enclose_newcomers`). Default `false` ⇒ the pass is a strict
+    /// NO-OP (byte-identical to the honest path — the ANCHOR).
+    pub collude_farm: bool,
 }
 
 impl AdvAction {
     /// The honest / no-op action: no accept override, no rejoin, no voluntary drop, no pause,
-    /// no enclosure.
+    /// no enclosure, no collusion.
     pub const NOOP: AdvAction = AdvAction {
         accept_rate: None,
         rejoin: false,
@@ -499,6 +514,7 @@ impl AdvAction {
         offline: false,
         discriminate: false,
         enclose_newcomers: false,
+        collude_farm: false,
     };
 }
 

@@ -152,6 +152,19 @@ pub enum InvariantSpec {
         /// The pass direction (GreaterThan — durability above the floor X).
         dir: Direction,
     },
+    /// A phase-3 A7 SYBIL-farm EARNED HONEST RECIPROCITY scalar → mean±σ vs threshold, power<2 gate.
+    /// Reads [`RunResult::per_seed_farm_reciprocity`] DIRECTLY (the pairwise credit key
+    /// `Σ capital[sybil][honest].g_ho` IS the per-seed scalar); a non-sybil-farm seed contributes
+    /// `NaN` (skipped). Used by INV-SYBIL-CREDIT-LIMIT-HOLDS (under collude-ON at V_free=0 the farm's
+    /// earned honest reciprocity stays BELOW a tiny frozen ε — LessThan — because collusion writes
+    /// only intra-farm cells, never an honest credit key). It PASSES decisively (the key is ≈ 0),
+    /// proving "reputation = credit-limit" resists sybil multiplication. (The ~58× honest-storage
+    /// inflation is a separate `giver_priority_order` owner-ordering PROXY artifact — a sim-fidelity
+    /// issue with no real-protocol analogue — measured but NOT a board row.)
+    SybilCreditLimit {
+        /// The pass direction (LessThan — earned honest reciprocity below the tiny threshold ε).
+        dir: Direction,
+    },
 }
 
 /// One invariant-board row spec.
@@ -211,6 +224,9 @@ impl Clone for Invariant {
                 },
                 InvariantSpec::EnclosureFloor { dir } => {
                     InvariantSpec::EnclosureFloor { dir: *dir }
+                }
+                InvariantSpec::SybilCreditLimit { dir } => {
+                    InvariantSpec::SybilCreditLimit { dir: *dir }
                 }
             },
             threshold: self.threshold,
@@ -405,6 +421,19 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             .first()
                             .map(|c0| c0.to_bits() == sr.cartel_earn_ratio.to_bits())
                             .unwrap_or(false);
+                        // The A7 farm honest-storage (measurement) + earned honest reciprocity (the
+                        // INV-SYBIL-CREDIT-LIMIT-HOLDS scalar) must re-run bit-identical too — they
+                        // feed the verdict + report (a deterministic NaN compares equal via to_bits).
+                        let farm_eq = result
+                            .per_seed_farm_storage
+                            .first()
+                            .map(|f0| f0.to_bits() == sr.farm_honest_storage.to_bits())
+                            .unwrap_or(false);
+                        let farm_recip_eq = result
+                            .per_seed_farm_reciprocity
+                            .first()
+                            .map(|f0| f0.to_bits() == sr.farm_honest_reciprocity.to_bits())
+                            .unwrap_or(false);
                         metrics_eq
                             && restore_eq
                             && calib_eq
@@ -414,6 +443,8 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             && pop_eq
                             && newcomer_eq
                             && cartel_eq
+                            && farm_eq
+                            && farm_recip_eq
                     }
                     None => false,
                 };
@@ -585,6 +616,21 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                     threshold: inv.threshold,
                     power,
                     note: "enclosure: newcomer floor-durability at the calibrated cartel fraction",
+                }
+            }
+            InvariantSpec::SybilCreditLimit { dir } => {
+                // The per-seed earned honest reciprocity (the pairwise credit key) IS the scalar.
+                let (mean, sigma) = mean_sigma(&result.per_seed_farm_reciprocity);
+                let sigma_r = if sigma.is_finite() { sigma } else { 0.0 };
+                let (kind, power) = decide(mean, sigma, inv.threshold, *dir);
+                Verdict {
+                    id: inv.id,
+                    kind,
+                    effect: mean,
+                    sigma: sigma_r,
+                    threshold: inv.threshold,
+                    power,
+                    note: "sybil-farm: earned honest reciprocity ≈ 0 under collusion (credit-limit holds)",
                 }
             }
         })

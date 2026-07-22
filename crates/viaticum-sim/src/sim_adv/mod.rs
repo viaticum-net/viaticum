@@ -64,7 +64,10 @@ pub use inflow::{
     InflowPolicy, PopSeries, apply_inflow, expected_outflow, newcomer_cutoff, pool_size,
     present_count,
 };
-pub use metrics::{MetricSet, cartel_earnings_split, newcomer_floor_durability};
+pub use metrics::{
+    MetricSet, cartel_earnings_split, farm_honest_reciprocity, farm_honest_served,
+    farm_honest_storage, newcomer_floor_durability,
+};
 pub use predators::{
     AdvMetrics, RunMode, collect_adv_metrics, hook_for, inject_adversaries, inject_incumbent_cartel,
 };

@@ -92,6 +92,43 @@ const A15_C_FLOOR: usize = 10;
 /// not fix it), reported with the flat sweep, not tuned away.
 const A15_FLOOR_X: f64 = 0.20;
 
+// ============================================================
+// A7 sybil-farm (`4r_a7_spec.md`) — constants FROZEN in code BEFORE the run (anti-Goodhart). The
+// calibration test `a7_sybil_calibration_*` prints the runtime table (collude ON/OFF × V_free {0, 2})
+// of BOTH the earned-honest-reciprocity credit key (≈ 0 ⇒ credit-limit holds) and the
+// giver_priority_order honest-storage proxy artifact; see the A7 report + review.
+// ============================================================
+
+/// The sybil-farm size N (group_size). 8 fake identities in an n = 120 world (~7 %): a big enough
+/// farm to build MASSIVE collusive intra-farm reputation (every ordered pair fakes a PoS pass every
+/// tick) yet a realistic minority — the test is whether that collusive reputation converts to honest
+/// storage (it must not).
+const A7_FARM_N: usize = 8;
+
+/// The farm's shared subnet id (its farm identifier — `adv_collude_farm` colludes only within a
+/// matching `group_subnet`). Arbitrary; used only to group the sybils.
+const A7_GROUP_SUBNET: u32 = 7;
+
+/// The farm node count's world size + horizon (matching the a6 hetero-free honest world scale).
+const A7_N_NODES: usize = 120;
+const A7_HORIZON: u64 = 130;
+
+/// The farm's demand multiplier (`whale_block_mult`): ×12 own-data (like the a1 whale) so the farm
+/// has plenty of data to PUSH onto honest holders — the surface the collusion is tested against.
+const A7_BLOCK_MULT: f64 = 12.0;
+
+/// INV-SYBIL-CREDIT-LIMIT-HOLDS threshold ε (gb·days): the farm's EARNED HONEST RECIPROCITY — the
+/// pairwise κ_O credit key `Σ_{s∈farm, h∉farm} capital[s][h].g_ho` that gates the farm's data on
+/// honest holders — must stay below this under collude-ON. FROZEN at 1.0 (effectively 0): the
+/// ε-serving farm never holds honest data, so it never accrues an honest credit key (measured
+/// exactly 0.0000 across seeds 42..46); 1.0 is ≪ a single real symbol-window of honest service
+/// (`v_per_symbol·Δt ≈ 175`). This row PASSES decisively (power = ∞ at mean 0, σ 0) — the proof that
+/// pairwise "reputation = credit-limit" RESISTS collusion (the farm's ~10k of collusive intra-farm
+/// g_ho buys ZERO honest credit). The ~58× honest-STORAGE inflation is a separate
+/// `giver_priority_order` owner-ordering PROXY artifact (sim-fidelity, no real-protocol analogue),
+/// measured in the calibration table but NOT a board row.
+const A7_CREDIT_LIMIT_EPS: f64 = 1.0;
+
 /// Every registered scenario (hard-coded like `Archetype::ALL`).
 pub fn all_scenarios() -> Vec<Scenario> {
     vec![
@@ -112,6 +149,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
         a5_deep_silent(),
         a6_discriminator(),
         a15_enclosure(),
+        a7_sybil(),
     ]
 }
 
@@ -1050,6 +1088,102 @@ fn a15_enclosure_invariants() -> Vec<Invariant> {
                 dir: Direction::GreaterThan,
             },
             threshold: A15_FLOOR_X,
+        },
+    ]
+}
+
+/// A7 — sybil-farm (phase 3, `4r_a7_spec.md`): the honest world plus a FARM of `A7_FARM_N` fake
+/// identities (same `group_subnet`) that COLLUSIVELY inflate mutual reputation (fake PoS every tick,
+/// no real holdings) while ε-serving the honest network (they store ~nothing real). The question:
+/// does that collusive intra-farm reputation convert into REAL storage credit for the farm's data on
+/// the HONEST network — does sybil multiplication beat "reputation = credit-limit"?
+///
+/// FINDING (A7 adversarial review): the pairwise κ_O credit-limit RESISTS collusion, exactly as the
+/// spec predicted. The farm's data on an honest holder is gated by `capital[sybil][honest].g_ho` (the
+/// eviction/preemption + admit-guard key), which the ε-serving farm never earns and the collusion
+/// never touches — it stays ≈ 0.0000 under collude-ON. The board row INV-SYBIL-CREDIT-LIMIT-HOLDS
+/// asserts this and PASSES decisively: sybil multiplication does NOT convert collusive reputation into
+/// honest storage CREDIT.
+///
+/// A separate observation: the raw honest-STORAGE measurement inflates ~58× under collusion (~360k vs
+/// ~6k gb·time), but this is a SIM-FIDELITY ARTIFACT, not a credit-limit break. `place_own_data`'s
+/// `giver_priority_order` (default on) sorts owners each tick by the GLOBAL row-sum
+/// `Σ_h capital[o][h].g_ho`; collusion inflates that free-of-charge, so sybils sort to the FRONT of
+/// the per-tick placement order and win scarce free-accept holder slots under contention. That
+/// global scheduler ranking-all-owners-by-total-service has NO real-protocol analogue (the daemon's
+/// priority is holder-side pairwise) and the code flags it as a proxy "NOT the spec's ideal". Ilya's
+/// call: DOCUMENT the proxy (keep `giver_priority_order`), do not treat the artifact as a
+/// vulnerability. It is measured in the calibration table + the two proxy tests, but is NOT gated.
+/// `n = 120`, farm N = 8 (×12 demand), horizon 130, 5 seeds, V_free = 0 (Р-9).
+pub fn a7_sybil() -> Scenario {
+    Scenario {
+        id: ScenarioId("a7_sybil"),
+        about: "honest world + a farm of 8 colluding sybils (fake mutual PoS, no real storage, ε-serve) — the pairwise κ_O credit-limit RESISTS: earned honest reciprocity stays ≈ 0 (INV-SYBIL-CREDIT-LIMIT-HOLDS passes). The ~58× honest-storage inflation is a giver_priority_order sim-proxy artifact, documented not gated",
+        world: WorldParams {
+            n_nodes: A7_N_NODES,
+            // V_free = 0 (Р-9 default): the board tests the credit-limit at the canonical floor.
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: vec![AdvSpec {
+            id: AdvId::A7SybilFarm,
+            count: A7_FARM_N,
+            info_model: InfoModel::Own,
+            dials: AdvDials {
+                group_size: A7_FARM_N,
+                group_subnet: A7_GROUP_SUBNET,
+                whale_block_mult: A7_BLOCK_MULT,
+                // whale_accept = 0.0 (the AdvDials default): the farm ε-serves ⇒ stores nothing real
+                // ⇒ earns no honest reciprocity ⇒ its only honest surface is V_free (the isolation
+                // the finding rests on). `collude = true`: the farm colludes (the ON arm; the tests'
+                // OFF control clones this with collude = false, same ε-serving construction).
+                collude: true,
+                ..AdvDials::default()
+            },
+        }],
+        events: Vec::new(),
+        horizon: A7_HORIZON,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![MetricId::Extraction, MetricId::InvariantBoard],
+        verdicts: a7_sybil_invariants(),
+        fast: false,
+    }
+}
+
+/// The `a7_sybil` board (`4r_a7_spec.md` §4): the two structural rows + INV-SYBIL-CREDIT-LIMIT-HOLDS.
+fn a7_sybil_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-SYBIL-CREDIT-LIMIT-HOLDS: the REAL defence — under collude-ON at V_free = 0 the farm's
+        // EARNED HONEST RECIPROCITY (the pairwise κ_O credit key `Σ capital[sybil][honest].g_ho` the
+        // eviction/preemption rank + admit-guard read) stays below a tiny ε (LessThan). It PASSES
+        // decisively (the key is ≈ 0.0000 — collusion writes only intra-farm cells, so ~10k of
+        // collusive g_ho buys ZERO honest credit): pairwise "reputation = credit-limit" resists sybil
+        // multiplication. (The ~58× honest-STORAGE inflation is a separate `giver_priority_order`
+        // owner-ordering PROXY artifact — sim-fidelity, no real-protocol analogue — measured in the
+        // calibration table, NOT gated. See the a7_sybil doc.)
+        Invariant {
+            id: "INV-SYBIL-CREDIT-LIMIT-HOLDS",
+            spec: InvariantSpec::SybilCreditLimit {
+                dir: Direction::LessThan,
+            },
+            threshold: A7_CREDIT_LIMIT_EPS,
         },
     ]
 }

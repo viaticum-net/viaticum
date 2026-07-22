@@ -13,17 +13,18 @@ use crate::sim_adv::inflow::{
     newcomer_cutoff, pool_size, present_count,
 };
 use crate::sim_adv::metrics::{
-    bit_eq as metrics_bit_eq, collect_metrics, mean_sigma, newcomer_floor_durability,
+    bit_eq as metrics_bit_eq, collect_metrics, farm_honest_reciprocity, farm_honest_served,
+    farm_honest_storage, mean_sigma, newcomer_floor_durability,
 };
 use crate::sim_adv::predators::{
-    RunMode, a1_epsilon_whale_hook, a4_whitewasher_hook, a15_incumbent_enclosure_hook,
-    bit_eq as adv_bit_eq, fold_cap_ratio, inject_adversaries, inject_incumbent_cartel,
-    install_adv_uptime, twin_dial_override,
+    RunMode, a1_epsilon_whale_hook, a4_whitewasher_hook, a7_sybil_farm_hook,
+    a15_incumbent_enclosure_hook, bit_eq as adv_bit_eq, fold_cap_ratio, inject_adversaries,
+    inject_incumbent_cartel, install_adv_uptime, twin_dial_override,
 };
 use crate::sim_adv::registry::{
-    a1_whale, a3_flapper, a4_whitewasher, a5_deep_silent, a6_discriminator, a15_enclosure,
-    all_scenarios, dr_baseline, dr_battle, dr_hetero, find_scenario, honest_hetero_hard,
-    honest_hetero_v2, honest_v2, tiered_hetero, tiered_hetero_hard, tiered_v1,
+    a1_whale, a3_flapper, a4_whitewasher, a5_deep_silent, a6_discriminator, a7_sybil,
+    a15_enclosure, all_scenarios, dr_baseline, dr_battle, dr_hetero, find_scenario,
+    honest_hetero_hard, honest_hetero_v2, honest_v2, tiered_hetero, tiered_hetero_hard, tiered_v1,
 };
 use crate::sim_adv::report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
 use crate::sim_adv::restore::{
@@ -42,7 +43,9 @@ use crate::sim_adv::verdict::{
     Direction, Invariant, InvariantSpec, VerdictKind, decide, evaluate_board,
 };
 use crate::sim_dynamic::build_world;
-use crate::sim_dynamic::engine::{DynParams, admit_offer_for_test, whitewash_rejoin_for_test};
+use crate::sim_dynamic::engine::{
+    DynParams, admit_offer_for_test, adv_collude_farm_for_test, whitewash_rejoin_for_test,
+};
 use crate::sim_dynamic::generator::{
     Archetype, GiverTier, HeldSymbol, OwnBlock, World, online, surfaced_in_window,
 };
@@ -4752,5 +4755,449 @@ fn a15_enclosure_is_registered() {
     assert!(
         sc.verdicts.iter().any(|v| v.id == "INV-ENCLOSURE-FLOOR"),
         "a15 board carries INV-ENCLOSURE-FLOOR"
+    );
+}
+
+// ==================================================================
+// A7 — sybil-farm (`4r_a7_spec.md`): the pairwise κ_O credit-limit RESISTS collusion — the farm's
+// earned honest reciprocity stays ≈ 0 (INV-SYBIL-CREDIT-LIMIT-HOLDS passes). The ~58× honest-storage
+// inflation is a `giver_priority_order` owner-ordering SIM-PROXY artifact (no real-protocol analogue),
+// documented + measured, NOT gated. (A7 adversarial review corrected the mechanism attribution.)
+// ==================================================================
+
+#[test]
+fn a7_sybil_board_credit_limit_holds() {
+    // The board wiring end-to-end: INV-SYBIL-CREDIT-LIMIT-HOLDS (reads per_seed_farm_reciprocity)
+    // PASSES decisively — under collude-ON the farm's EARNED HONEST RECIPROCITY (the pairwise credit
+    // key `Σ capital[sybil][honest].g_ho`) stays ≈ 0 (< ε = 1.0), so collusion buys NO honest credit.
+    // The two structural rows pass. Also exercises the determinism board row now covering the farm
+    // reciprocity + storage channels. 2 seeds for speed (the key is exactly 0 on every seed).
+    let mut sc = a7_sybil();
+    sc.seeds = vec![42, 43];
+    let result = run(&sc, &sc.seeds.clone());
+    let verdicts = evaluate_board(&sc, &result);
+    let by = |id: &str| verdicts.iter().find(|v| v.id == id).unwrap();
+    let credit = by("INV-SYBIL-CREDIT-LIMIT-HOLDS");
+    println!(
+        "INV-SYBIL-CREDIT-LIMIT-HOLDS: {} effect={:.6} σ={:.6} ε={:.2} power={:.2}",
+        credit.kind.label().trim(),
+        credit.effect,
+        credit.sigma,
+        credit.threshold,
+        credit.power,
+    );
+    assert_eq!(
+        credit.kind,
+        VerdictKind::Pass,
+        "earned honest reciprocity ≈ 0 under collusion — the pairwise credit-limit holds"
+    );
+    assert!(
+        credit.effect < credit.threshold,
+        "earned honest reciprocity {:.6} stays below ε {:.2} (collusion buys no honest credit)",
+        credit.effect,
+        credit.threshold
+    );
+    assert_eq!(by("INV-DETERMINISM").kind, VerdictKind::Pass, "determinism");
+    assert_eq!(by("INV-ANTI-ORACLE").kind, VerdictKind::Pass, "anti-oracle");
+}
+
+/// Build an A7 farm role (sybil, subnet 7, ε-serve) with the given `collude` dial — the ON/OFF lever.
+fn make_a7_role(collude: bool) -> AdvRole {
+    AdvRole {
+        id: AdvId::A7SybilFarm,
+        info_model: InfoModel::Own,
+        dials: AdvDials {
+            group_subnet: 7,
+            collude,
+            ..AdvDials::default()
+        },
+        hook: a7_sybil_farm_hook,
+    }
+}
+
+/// A copy of `a7_sybil` with an overridden `collude` dial (the ON/OFF A/B lever) + V_free (the
+/// sybil-surface sweep). Both arms keep the SAME ε-serving construction — only collusion / V_free
+/// differ.
+fn a7_with(collude: bool, v_free_symbols: f64) -> Scenario {
+    let mut sc = a7_sybil();
+    sc.adversaries[0].dials.collude = collude;
+    sc.world.base.v_free_symbols = v_free_symbols;
+    sc
+}
+
+/// Step the a7 world (build + last-slot farm injection + step to horizon) and return the final
+/// god-view world + the farm node indices. Mirrors the runner's PREDATOR arm bit-for-bit for the
+/// a7 world (Backbone/Uniform/Legacy, no mix), so the measuring tests match `run()`.
+fn a7_stepped_world(sc: &Scenario, seed: u64, mode: RunMode) -> (World, Vec<usize>) {
+    use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
+    let params = &sc.world.base;
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world(sc.world.n_nodes, params, seed);
+    let farm = inject_adversaries(&mut world, &sc.adversaries, params, mode);
+    for _ in 0..sc.horizon {
+        crate::sim_dynamic::engine::step(&mut world, params, &prior, &policy);
+    }
+    (world, farm)
+}
+
+#[test]
+#[ignore = "A7 calibration/finding dump — run with --ignored --nocapture for the proxy table"]
+fn a7_sybil_calibration_dump() {
+    // MEASURED (seeds 42-46): the pairwise credit key capital[sybil][honest].g_ho stays 0.0000 under
+    // collude-ON — the credit-limit HOLDS (INV-SYBIL-CREDIT-LIMIT-HOLDS). The raw honest-STORAGE
+    // measurement inflates ~58× (collude ON ~360k vs OFF ~6k, V_free 0≈2), but that is a
+    // `giver_priority_order` owner-ordering SIM-PROXY artifact (owners sorted by global Σ_h g_ho →
+    // sybils jump the placement queue), NOT a credit-limit break. Documented, not gated.
+    let seeds = [42u64, 43, 44, 45, 46];
+    println!(
+        "\n=== A7 sybil-farm: farm_honest_storage (gb·time) — collude ON/OFF × V_free {{0,2}} (n={}, N={}, horizon={}) ===",
+        a7_sybil().world.n_nodes,
+        a7_sybil().adversaries[0].dials.group_size,
+        a7_sybil().horizon,
+    );
+    for &vf in &[0.0f64, 2.0] {
+        for &collude in &[false, true] {
+            let mut vals: Vec<f64> = Vec::new();
+            let mut served_vals: Vec<f64> = Vec::new();
+            for &seed in &seeds {
+                let (w, farm) = a7_stepped_world(&a7_with(collude, vf), seed, RunMode::Predator);
+                vals.push(farm_honest_storage(&w, &farm));
+                served_vals.push(farm_honest_served(&w, &farm));
+            }
+            let (m, s) = mean_sigma(&vals);
+            let (fm, _) = mean_sigma(&served_vals);
+            println!(
+                "  V_free={vf:.0} collude={collude:<5}: honest_storage mean={m:>11.2} σ={s:>9.2}  per-seed={:?}  farm→honest_served mean={fm:.2}",
+                vals.iter()
+                    .map(|x| (x * 100.0).round() / 100.0)
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    // Proof the collusion built MASSIVE intra-farm reputation (so the "buys nothing" is not because
+    // the collusion failed to inflate g_ho — it did, at zero storage cost).
+    let (w, farm) = a7_stepped_world(&a7_with(true, 0.0), 42, RunMode::Predator);
+    let mut intra = 0.0f64;
+    let mut cnt = 0usize;
+    for &i in &farm {
+        for &j in &farm {
+            if i != j {
+                intra += w.capital[i][j].g_ho;
+                cnt += 1;
+            }
+        }
+    }
+    // The sybil→honest CREDIT key (capital[sybil][honest].g_ho — what the eviction/preemption rank +
+    // admit-guard actually read to gate the farm's data on honest holders) stays ≈ 0.
+    let mut honest_credit = 0.0f64;
+    let n = w.nodes.len();
+    for &s in &farm {
+        for h in 0..n {
+            if !farm.contains(&h) {
+                honest_credit += w.capital[s][h].g_ho;
+            }
+        }
+    }
+    println!(
+        "  intra-farm g_ho (collude ON, seed42) mean={:.2} over {cnt} pairs  |  Σ sybil→honest g_ho (CREDIT key) = {honest_credit:.4} (≈0 ⇒ credit-limit holds)",
+        intra / cnt as f64,
+    );
+}
+
+#[test]
+fn a7_farm_collusive_pos_inflates_intra_farm_g_ho_without_holdings() {
+    // The collusive pass accrues mutual served + reciprocity g_ho among the same-farm sybils WITHOUT
+    // any real holdings, and NEVER touches an honest cell (the structural defence).
+    let params = DynParams::default();
+    let mut w = build_world(6, &params, 7);
+    for nd in &mut w.nodes {
+        nd.present = true;
+        nd.holdings.clear();
+    }
+    let farm = [3usize, 4, 5];
+    for &s in &farm {
+        w.adv[s] = Some(make_a7_role(true));
+        assert!(
+            w.nodes[s].holdings.is_empty(),
+            "farm holds no real data pre-pass"
+        );
+    }
+    adv_collude_farm_for_test(&mut w, &params);
+    for &i in &farm {
+        for &j in &farm {
+            if i == j {
+                continue;
+            }
+            // capital[j][i].g_ho: sybil j's reciprocity credit as a SERVER of i (the enforcement
+            // transpose the retention cap reads) — inflated by the ordered pair (j "serves" i).
+            assert!(
+                w.capital[j][i].g_ho > 0.0,
+                "intra-farm g_ho[{j}][{i}] > 0 without holdings"
+            );
+            assert!(w.served[i][j] > 0.0, "intra-farm served[{i}][{j}] > 0");
+        }
+        assert!(
+            w.nodes[i].holdings.is_empty(),
+            "still no real holdings after the fake accrual"
+        );
+    }
+    // Honest cells NEVER touched: the farm never served honest, so capital[sybil][honest].g_ho (the
+    // retention key for the farm's data on honest holders) stays 0, and no honest↔farm served.
+    for h in [0usize, 1, 2] {
+        for &s in &farm {
+            assert_eq!(w.capital[h][s].g_ho, 0.0, "honest→sybil g_ho untouched");
+            assert_eq!(
+                w.capital[s][h].g_ho, 0.0,
+                "sybil→honest retention key untouched (no honest credit from collusion)"
+            );
+            assert_eq!(w.served[h][s], 0.0, "honest never held sybil data");
+            assert_eq!(w.served[s][h], 0.0, "sybil never served honest");
+        }
+    }
+}
+
+#[test]
+fn collude_farm_false_is_byte_identical_to_honest() {
+    // ANCHOR part A: the honest_v2 seed-42 frozen sim_diag numbers are UNMOVED by the A7 engine
+    // change (no A7 role ⇒ adv_collude_farm collects no members ⇒ strict no-op on the honest path).
+    let m = run_one_seed(&honest_v2(), 42).metrics;
+    assert_eq!(m.alive_symbols, 224, "alive");
+    assert_eq!(m.evicts, 621, "evicts");
+    assert_eq!(m.preempts, 375, "preempts");
+    assert_eq!(m.cap_trims, 179, "cap_trims");
+    assert!(
+        (m.share_a_pos - 75.45).abs() < 0.1,
+        "share A>0 = {}",
+        m.share_a_pos
+    );
+
+    // ANCHOR part B: with collude = FALSE the pass is a strict no-op on served + capital, even with
+    // a full A7 farm present (same construction as the ON arm, collusion off).
+    let params = DynParams::default();
+    let build = |collude: bool| {
+        let mut w = build_world(6, &params, 7);
+        for nd in &mut w.nodes {
+            nd.present = true;
+            nd.holdings.clear();
+        }
+        for s in [3usize, 4, 5] {
+            w.adv[s] = Some(make_a7_role(collude));
+        }
+        w
+    };
+    let mut off = build(false);
+    let served_before = off.served.clone();
+    let cap_before: Vec<Vec<u64>> = off
+        .capital
+        .iter()
+        .map(|row| row.iter().map(|c| c.g_ho.to_bits()).collect())
+        .collect();
+    adv_collude_farm_for_test(&mut off, &params);
+    assert_eq!(
+        off.served, served_before,
+        "collude=false: served byte-identical"
+    );
+    for (i, row) in off.capital.iter().enumerate() {
+        for (j, c) in row.iter().enumerate() {
+            assert_eq!(
+                c.g_ho.to_bits(),
+                cap_before[i][j],
+                "collude=false: capital[{i}][{j}].g_ho byte-identical"
+            );
+        }
+    }
+    // Positive control: collude=true DOES accrue (Part B tests the GATE, not a dead pass).
+    let mut on = build(true);
+    adv_collude_farm_for_test(&mut on, &params);
+    assert!(
+        on.capital[3][4].g_ho > 0.0,
+        "collude=true accrues intra-farm g_ho (the gate is real)"
+    );
+}
+
+#[test]
+fn sybil_credit_key_stays_zero_while_giver_priority_proxy_inflates() {
+    // THE FINDING (A7 review). Two facts, measured over 5 seeds @ V_free = 0:
+    //   (a) The pairwise κ_O CREDIT KEY `capital[sybil][honest].g_ho` — the cell the eviction/
+    //       preemption rank + admit-guard actually read to gate the farm's data on honest holders —
+    //       stays ≈ 0 under collude-ON (the ε-farm never serves honest; collusion writes only
+    //       intra-farm cells). So "reputation = credit-limit" RESISTS sybil multiplication.
+    //   (b) The raw honest-STORAGE measurement STILL inflates ~58× (ON ~360k vs OFF ~6k), but via a
+    //       SIM-PROXY, not the credit key: `place_own_data`'s `giver_priority_order` sorts owners each
+    //       tick by the GLOBAL row-sum `Σ_h capital[o][h].g_ho`, which collusion inflates, so the
+    //       sybils jump the per-tick placement queue and win scarce free-accept slots. (Confirmed by
+    //       the A/B: with `giver_priority_order` off the ~58× vanishes entirely.) Candidate-ranking
+    //       (`place_incremental_rank`) is g_ho-BLIND, so it is NOT the channel. This proxy has no
+    //       real-protocol analogue — documented, not gated.
+    let seeds = [42u64, 43, 44, 45, 46];
+    let mut on: Vec<f64> = Vec::new();
+    let mut off: Vec<f64> = Vec::new();
+    let mut credit_key_on = 0.0f64; // Σ capital[sybil][honest].g_ho with collusion ON
+    for &seed in &seeds {
+        let (w_on, farm_on) = a7_stepped_world(&a7_with(true, 0.0), seed, RunMode::Predator);
+        let (w_off, farm_off) = a7_stepped_world(&a7_with(false, 0.0), seed, RunMode::Predator);
+        on.push(farm_honest_storage(&w_on, &farm_on));
+        off.push(farm_honest_storage(&w_off, &farm_off));
+        credit_key_on += farm_honest_reciprocity(&w_on, &farm_on);
+    }
+    let (on_mean, _) = mean_sigma(&on);
+    let (off_mean, _) = mean_sigma(&off);
+    println!(
+        "A7 @ V_free=0: credit-key Σ capital[sybil][honest].g_ho (ON) = {credit_key_on:.4} (≈0 ⇒ credit-limit holds); giver-priority PROXY honest-storage ON={on_mean:.0} OFF={off_mean:.0} ({:.1}×)",
+        on_mean / off_mean.max(1.0),
+    );
+    // (a) THE DEFENCE: the pairwise credit key the farm would need to hold data on honest holders
+    //     stays ≈ 0 (collusion never touches an honest cell) — the credit-limit holds.
+    assert!(
+        credit_key_on < 1.0,
+        "credit key Σ capital[sybil][honest].g_ho stays ≈ 0 under collusion (got {credit_key_on:.4}) — reputation=credit-limit resists sybil multiplication"
+    );
+    // (b) The giver_priority_order owner-ordering PROXY still inflates the raw storage measurement
+    //     (ON ≫ OFF, every seed >40×) — a sim-fidelity artifact, documented not gated.
+    assert!(
+        on_mean > 10.0 * off_mean,
+        "giver-priority proxy inflates raw honest storage: collude ON {on_mean:.0} ≫ 10× OFF {off_mean:.0} (owner-ordering artifact, not a credit-limit break)"
+    );
+}
+
+#[test]
+fn sybil_giver_priority_proxy_driven_by_collusion_not_vfree() {
+    // The `giver_priority_order` PROXY measurement is driven by COLLUSION (which inflates the owner
+    // row-sum), NOT by V_free. At V_free = 0, collude ON ≫ OFF; and turning V_free from 0 → 2 barely
+    // moves the collude-ON measurement (the owner-ordering artifact swamps the per-identity V_free
+    // allowance). This characterizes the SIM-PROXY artifact — the pairwise credit key (the real
+    // defence) is untouched by both (see `sybil_credit_key_stays_zero_…`). Documented, not gated.
+    let seeds = [42u64, 43, 44, 45, 46];
+    let arm = |collude: bool, vf: f64| -> f64 {
+        let vals: Vec<f64> = seeds
+            .iter()
+            .map(|&seed| {
+                let (w, farm) = a7_stepped_world(&a7_with(collude, vf), seed, RunMode::Predator);
+                farm_honest_storage(&w, &farm)
+            })
+            .collect();
+        mean_sigma(&vals).0
+    };
+    let s0_off = arm(false, 0.0);
+    let s0_on = arm(true, 0.0);
+    let s2_on = arm(true, 2.0);
+    println!(
+        "A7 giver-priority proxy: V_free=0 [OFF={s0_off:.0} ON={s0_on:.0}]  V_free=2 [ON={s2_on:.0}]  (collusion drives the proxy, V_free does not)"
+    );
+    // (1) COLLUSION drives the proxy measurement: at V_free=0, ON ≫ OFF (the owner row-sum jump).
+    assert!(
+        s0_on > 10.0 * s0_off,
+        "collusion drives the giver-priority proxy at V_free=0: ON {s0_on:.0} ≫ 10× OFF {s0_off:.0}"
+    );
+    // (2) V_free does NOT drive it: under collusion, V_free 0 → 2 barely changes the proxy (|Δ| ≪ the
+    //     collusion effect) — the artifact is the owner-ordering, not the per-identity V_free floor.
+    assert!(
+        (s2_on - s0_on).abs() < 0.3 * s0_on,
+        "V_free is NOT the driver of the proxy under collusion: ON(V_free=2) {s2_on:.0} ≈ ON(V_free=0) {s0_on:.0}"
+    );
+}
+
+#[test]
+fn farm_honest_storage_reader_excludes_intra_farm_flows() {
+    // The reader counts ONLY honest-holder ← farm-owner served, excluding intra-farm served AND
+    // farm → honest served. Hand-built served matrix isolates the three flow classes.
+    let params = DynParams::default();
+    let mut w = build_world(6, &params, 7);
+    let farm = vec![3usize, 4, 5];
+    // Zero the served matrix, then inject one unit into each flow class.
+    for row in &mut w.served {
+        for c in row.iter_mut() {
+            *c = 0.0;
+        }
+    }
+    // Honest holder ← farm owner (COUNTED): served[honest][sybil].
+    w.served[0][3] = 100.0; // honest 0 held sybil 3's data
+    w.served[1][4] = 50.0; // honest 1 held sybil 4's data
+    // Intra-farm (EXCLUDED): served[sybil][sybil].
+    w.served[3][4] = 9999.0;
+    w.served[5][3] = 9999.0;
+    // Farm → honest (EXCLUDED from honest_storage; counted by honest_served): served[sybil][honest].
+    w.served[3][0] = 777.0;
+    w.served[4][2] = 333.0;
+    let hs = farm_honest_storage(&w, &farm);
+    assert!(
+        (hs - 150.0).abs() < 1e-9,
+        "honest_storage = 100 + 50 = 150 (intra-farm + farm→honest excluded), got {hs}"
+    );
+    let fs = farm_honest_served(&w, &farm);
+    assert!(
+        (fs - 1110.0).abs() < 1e-9,
+        "honest_served = 777 + 333 = 1110 (intra-farm + honest→farm excluded), got {fs}"
+    );
+    // The credit-key reader `farm_honest_reciprocity` = Σ_{s∈farm,h∉farm} capital[s][h].g_ho counts
+    // ONLY the sybil→honest key, excluding the intra-farm cells the collusion writes. Zero the
+    // g_ho matrix, then inject each class.
+    for row in &mut w.capital {
+        for c in row.iter_mut() {
+            c.g_ho = 0.0;
+        }
+    }
+    w.capital[3][0].g_ho = 12.0; // sybil 3's credit as server of honest 0 (COUNTED)
+    w.capital[4][1].g_ho = 8.0; // sybil 4's credit as server of honest 1 (COUNTED)
+    w.capital[3][4].g_ho = 9999.0; // intra-farm (EXCLUDED)
+    w.capital[0][3].g_ho = 9999.0; // honest→sybil (EXCLUDED — not a sybil credit key)
+    let recip = farm_honest_reciprocity(&w, &farm);
+    assert!(
+        (recip - 20.0).abs() < 1e-9,
+        "farm_honest_reciprocity = 12 + 8 = 20 (intra-farm + honest→sybil excluded), got {recip}"
+    );
+}
+
+#[test]
+fn a7_sybil_is_deterministic_across_double_run() {
+    // The whole a7 path — the collusive fake-accrual pass + the cross-boundary god-view read — is
+    // seeded, so two runs are bit-identical (INV-DETERMINISM). No new RNG stream (counter-based).
+    let mut sc = a7_sybil();
+    sc.seeds = vec![42, 43];
+    let seeds = sc.seeds.clone();
+    let r1 = run(&sc, &seeds);
+    let r2 = run(&sc, &seeds);
+    let bits = |xs: &[f64]| xs.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(&r1.per_seed_farm_storage),
+        bits(&r2.per_seed_farm_storage),
+        "farm honest-storage bit-identical"
+    );
+    assert_eq!(
+        bits(&r1.per_seed_farm_reciprocity),
+        bits(&r2.per_seed_farm_reciprocity),
+        "farm earned honest reciprocity bit-identical"
+    );
+    for (a, b) in r1.per_seed.iter().zip(&r2.per_seed) {
+        assert!(metrics_bit_eq(a, b), "god-view metrics bit-identical");
+    }
+    // The board's INV-DETERMINISM row (re-runs seed[0] internally, now covering the farm channel)
+    // also passes.
+    let v = evaluate_board(&sc, &r1);
+    assert_eq!(
+        v.iter().find(|x| x.id == "INV-DETERMINISM").unwrap().kind,
+        VerdictKind::Pass
+    );
+}
+
+#[test]
+fn a7_sybil_is_registered() {
+    let sc = find_scenario("a7_sybil").expect("a7_sybil is registered");
+    assert_eq!(sc.id.as_str(), "a7_sybil");
+    assert_eq!(sc.adversaries[0].id, AdvId::A7SybilFarm);
+    assert!(
+        sc.adversaries[0].dials.collude,
+        "a7_sybil registers the colluding (ON) arm"
+    );
+    assert!(
+        sc.verdicts
+            .iter()
+            .any(|v| v.id == "INV-SYBIL-CREDIT-LIMIT-HOLDS"),
+        "a7 board carries INV-SYBIL-CREDIT-LIMIT-HOLDS"
+    );
+    assert!(
+        sc.verdicts.iter().any(|v| v.id == "INV-DETERMINISM"),
+        "a7 board carries INV-DETERMINISM"
     );
 }

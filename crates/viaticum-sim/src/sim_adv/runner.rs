@@ -94,6 +94,19 @@ pub struct RunResult {
     /// mean outbound service / the non-cartel incumbents' mean. `NaN` for a non-enclosure scenario
     /// (or a seed with no baseline). `≤ 1` ⇒ the cartel earns no more than an honest incumbent.
     pub per_seed_cartel_earn: Vec<f64>,
+    /// Per-seed A7 CROSS-BOUNDARY farm honest-storage (`4r_a7_spec.md` §3), seed-indexed: the
+    /// gb·time of the sybil-farm's data that lived on HONEST holders. `NaN` for a non-sybil-farm
+    /// scenario. A MEASUREMENT (not a board row): under collusion it inflates ~58× via the sim's
+    /// `giver_priority_order` owner-ordering proxy — a sim-fidelity artifact with no real-protocol
+    /// analogue, NOT a credit-limit break (see [`RunResult::per_seed_farm_reciprocity`]). The collude
+    /// ON/OFF × V_free sweeps in `tests.rs` + the calibration table document it.
+    pub per_seed_farm_storage: Vec<f64>,
+    /// Per-seed A7 EARNED HONEST RECIPROCITY (`4r_a7_spec.md` §4 headline), seed-indexed: the pairwise
+    /// κ_O credit key `Σ_{s∈farm, h∉farm} capital[s][h].g_ho` the farm earned on honest holders. `NaN`
+    /// for a non-sybil-farm scenario. INV-SYBIL-CREDIT-LIMIT-HOLDS reads this — it stays ≈ 0 under
+    /// collusion (the credit-limit RESISTS sybil multiplication: collusion writes only intra-farm
+    /// cells, never an honest credit key).
+    pub per_seed_farm_reciprocity: Vec<f64>,
 }
 
 /// All per-seed outputs of one seed run (kept as a struct so the growing set of optional
@@ -123,6 +136,13 @@ pub(crate) struct SeedRun {
     /// The CARTEL-PAYS ratio (cartel mean served-out / non-cartel incumbent mean) for an A15
     /// enclosure scenario (`4r_a15_spec.md` §4), else `NaN`.
     pub cartel_earn_ratio: f64,
+    /// The A7 CROSS-BOUNDARY farm honest-storage (`4r_a7_spec.md` §3) for a sybil-farm scenario, else
+    /// `NaN` (a non-A7 scenario carries no farm cut). A measurement of the `giver_priority_order`
+    /// owner-ordering proxy artifact (not a board row).
+    pub farm_honest_storage: f64,
+    /// The A7 EARNED HONEST RECIPROCITY (`4r_a7_spec.md` §4) for a sybil-farm scenario, else `NaN`.
+    /// The headline defence: the pairwise credit key stays ≈ 0 under collusion.
+    pub farm_honest_reciprocity: f64,
 }
 
 /// A predator run paired with its matched honest twin (same seed, same construction, hooks
@@ -477,12 +497,35 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     // (`n0_frac = 1.0`) the cohort all joins at tick 0 ⇒ cutoff 0, so every inflow-pool arrival is a
     // newcomer (and the cartel incumbents, `joined_tick == 0`, are excluded from the metric).
     let join_cutoff = crate::sim_adv::inflow::newcomer_cutoff(&world, pop_setpoint);
+    // A7 (sybil-farm) is ALSO a world-cut (earned honest reciprocity + honest-storage proxy), NOT a
+    // twin comparison — its collude ON/OFF and V_free sweeps are `tests.rs` comparisons, and `run()`
+    // measures the credit-limit board (INV-SYBIL-CREDIT-LIMIT-HOLDS) on the predator arm alone. So,
+    // like A15, it does not populate the Attack-ROI twin read.
+    let is_sybil_farm = scenario
+        .adversaries
+        .iter()
+        .any(|a| a.id == AdvId::A7SybilFarm);
+    // The FARM node indices (the A7 slots among the injected adversaries) — the cross-boundary
+    // metric's `farm` set. Empty for a non-A7 scenario.
+    let farm_nodes: Vec<usize> = if is_sybil_farm {
+        adv_nodes
+            .iter()
+            .copied()
+            .filter(|&node| {
+                world.adv[node]
+                    .as_ref()
+                    .is_some_and(|r| r.id == AdvId::A7SybilFarm)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     // The Attack-ROI (parked / cap-ratio / consumed-vs-served) channel is meaningful only for a
-    // twin-compared predator scenario. A15 enclosure is a world-cut (newcomer-durability), NOT a
-    // twin comparison, so it does NOT populate the Attack-ROI read — leaving `sr.adv = None` (and
+    // twin-compared predator scenario. A15 enclosure + A7 sybil-farm are world-cuts, NOT twin
+    // comparisons, so they do NOT populate the Attack-ROI read — leaving `sr.adv = None` (and
     // `per_seed_adv = None` in `run`), which keeps the determinism board's adv-channel check
     // consistent (both the run and its re-run carry `None`).
-    let track_adv_roi = !adv_nodes.is_empty() && !is_enclosure;
+    let track_adv_roi = !adv_nodes.is_empty() && !is_enclosure && !is_sybil_farm;
     // Phase-2a-2 (A3 флаппер): install the mode-differentiated flapper uptime profile on the A3
     // slots — bursty Seasonal (predator) vs mean-matched iid Ragged (twin). No-op for every other
     // predator id (they keep their archetype uptime); leaves the non-A3 slots untouched.
@@ -690,6 +733,17 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     } else {
         (f64::NAN, f64::NAN)
     };
+    // A7 (`4r_a7_spec.md`): the cross-boundary farm honest-storage measurement (the
+    // `giver_priority_order` proxy artifact) + the EARNED HONEST RECIPROCITY (the pairwise credit key
+    // — the headline defence). `NaN` for a non-A7 scenario (unused channel).
+    let (farm_honest_storage, farm_honest_reciprocity) = if is_sybil_farm {
+        (
+            crate::sim_adv::metrics::farm_honest_storage(&world, &farm_nodes),
+            crate::sim_adv::metrics::farm_honest_reciprocity(&world, &farm_nodes),
+        )
+    } else {
+        (f64::NAN, f64::NAN)
+    };
     SeedRun {
         metrics: collect_metrics(&world, params),
         fired,
@@ -701,6 +755,8 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
         pop,
         newcomer_durability,
         cartel_earn_ratio,
+        farm_honest_storage,
+        farm_honest_reciprocity,
     }
 }
 
@@ -762,7 +818,14 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         .adversaries
         .iter()
         .any(|a| a.id == AdvId::A15IncumbentEnclosure);
-    let needs_twin = !scenario.adversaries.is_empty() && !is_enclosure;
+    // A7 (sybil-farm) is likewise a world-cut (cross-boundary honest-storage), NOT a twin
+    // comparison (its collude ON/OFF control is a separate `tests.rs` run at the same seed), so it
+    // needs NO twin — leaving `per_seed_adv` all `None`.
+    let is_sybil_farm = scenario
+        .adversaries
+        .iter()
+        .any(|a| a.id == AdvId::A7SybilFarm);
+    let needs_twin = !scenario.adversaries.is_empty() && !is_enclosure && !is_sybil_farm;
     // Per seed: the predator run + (for a twin-compared adversary scenario) its matched twin's
     // Attack-ROI.
     let outcomes: Vec<(SeedRun, Option<AdvMetrics>)> = seeds
@@ -788,6 +851,8 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
     let mut per_seed_pop = Vec::with_capacity(outcomes.len());
     let mut per_seed_newcomer = Vec::with_capacity(outcomes.len());
     let mut per_seed_cartel_earn = Vec::with_capacity(outcomes.len());
+    let mut per_seed_farm_storage = Vec::with_capacity(outcomes.len());
+    let mut per_seed_farm_reciprocity = Vec::with_capacity(outcomes.len());
     for (sr, twin_adv) in outcomes {
         per_seed.push(sr.metrics);
         fired.push(sr.fired);
@@ -798,6 +863,8 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_pop.push(sr.pop);
         per_seed_newcomer.push(sr.newcomer_durability);
         per_seed_cartel_earn.push(sr.cartel_earn_ratio);
+        per_seed_farm_storage.push(sr.farm_honest_storage);
+        per_seed_farm_reciprocity.push(sr.farm_honest_reciprocity);
         per_seed_adv.push(match (sr.adv, twin_adv) {
             (Some(pred), Some(twin)) => Some(AdvPair { pred, twin }),
             _ => None,
@@ -817,6 +884,8 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_pop,
         per_seed_newcomer,
         per_seed_cartel_earn,
+        per_seed_farm_storage,
+        per_seed_farm_reciprocity,
     }
 }
 

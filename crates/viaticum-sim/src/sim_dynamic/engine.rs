@@ -575,6 +575,14 @@ pub fn step(world: &mut World, params: &DynParams, prior: &SurfacePrior, policy:
     // (2) PoS-challenge sampling + capital update, A.1 decay on all pairs (§9.4).
     pos_and_capital(world, params);
 
+    // (2.5) World-v3 phase-3 A7 (sybil-farm): the COLLUSIVE fake-accrual pass — same-farm sybils
+    // accrue mutual served/g_ho WITHOUT real holdings, inflating INTRA-FARM reputation at zero
+    // storage cost. Placed AFTER the honest accrual and BEFORE eviction so the fake intra-farm g_ho
+    // feeds THIS tick's retention cap, while HONEST cells stay untouched (the farm captures no honest
+    // storage from collusion — κ_O is pairwise, no global channel). No-op on the honest path (no
+    // colluding A7 role ⇒ byte-identical, the ANCHOR).
+    adv_collude_farm(world, params);
+
     // (3) eviction when φ < s_soft (kernel eviction_order + latch).
     run_eviction(world, params);
 
@@ -1940,6 +1948,76 @@ fn adv_pause(world: &mut World, tick: u64) {
     }
 }
 
+/// World-v3 phase-3 A7 (sybil-farm): the COLLUSIVE fake-accrual pass. Runs AFTER the honest
+/// `pos_and_capital` and BEFORE eviction (so the inflated intra-farm reciprocity feeds this tick's
+/// retention cap). For every ORDERED pair of PRESENT same-farm sybils `(i, j)` whose hook DECLARES
+/// `collude_farm` this tick, sybil `i` "serves" sybil `j` WITHOUT holding `j`'s symbol:
+///
+/// * `served[i][j] += v_per_symbol`            — holder `i` served owner `j` (a fake PoS pass);
+/// * `capital[i][j].g_ho += v_per_symbol·Δt`   — the ENFORCEMENT key: `i`'s reciprocity credit to
+///   park its own data at `j`. This is the SAME `[holder][owner]` cell + quantum a REAL single-symbol
+///   PoS pass accrues (`pos_and_capital`: `g_ho += a` at `[h][o]`), so the fake service is
+///   indistinguishable from real pairwise service at the pair level — the collusion inflates
+///   intra-farm reputation at ZERO storage cost.
+///
+/// The pass NEVER writes an honest cell `capital[sybil][honest].g_ho` (the CREDIT key for the farm's
+/// own data on an HONEST holder — the eviction/preemption κ_O rank + admit-guard read it) — it is
+/// confined to same-`group_subnet` sybil pairs — so the pairwise credit-limit is left untouched and
+/// buys the farm no honest retention room (κ_O is pairwise). This is the load-bearing defence
+/// (INV-SYBIL-CREDIT-LIMIT-HOLDS: the earned honest reciprocity stays ≈ 0).
+///
+/// NOTE (SIM-FIDELITY ARTIFACT, `4r_a7_spec.md` + A7 review): the intra-farm cells this pass writes DO
+/// get read once more — by `place_own_data`'s `giver_priority_order` OWNER-ORDERING, which sorts
+/// owners each tick by the GLOBAL row-sum `Σ_h capital[o][h].g_ho`. Collusion inflates that row-sum
+/// for free, so the sybils sort to the front of the placement order and win scarce free-accept holder
+/// slots — inflating the raw honest-STORAGE measurement ~58×. That global owner-ranking proxy has NO
+/// real-protocol analogue (the daemon's priority is holder-side pairwise); it is DOCUMENTED, not a
+/// credit-limit break. Candidate-ranking (`place_incremental_rank`) is g_ho-BLIND, so it is NOT a
+/// channel.
+///
+/// **Anti-oracle split (as A6/A15):** the HOOK only declares `collude_farm` (first-hand); the engine
+/// reads farm MEMBERSHIP (role id + `group_subnet`) god-view here, exactly as A6's `discriminate` /
+/// A15's `enclose_newcomers` are applied engine-side. **Deterministic:** pure `(i, j)` index order,
+/// no RNG (the counter-based streams are untouched). **No-op** when fewer than two present A7 nodes
+/// declare collusion (flag false / non-A7 / a lone farm) ⇒ byte-identical to the honest path.
+fn adv_collude_farm(world: &mut World, params: &DynParams) {
+    let n = world.nodes.len();
+    let tick = world.tick;
+    // Gather the present, COLLUDING farm members (node, subnet). Immutable read first (the hook
+    // borrows `&World` via `adv_action`), then mutate below — no borrow overlap.
+    let mut members: Vec<(usize, u32)> = Vec::new();
+    for node in 0..n {
+        if !world.nodes[node].present {
+            continue;
+        }
+        let Some(role) = world.adv[node].as_ref() else {
+            continue;
+        };
+        if role.id != AdvId::A7SybilFarm {
+            continue;
+        }
+        let subnet = role.dials.group_subnet;
+        if adv_action(world, node, tick).is_some_and(|a| a.collude_farm) {
+            members.push((node, subnet));
+        }
+    }
+    if members.len() < 2 {
+        return; // a lone / empty / non-colluding farm has no intra-farm pair (no-op)
+    }
+    let vol = v_per_symbol_of(params);
+    let g_quantum = vol * DAYS_PER_TICK;
+    // Every ORDERED same-farm pair (`i` "serves" `j`): fake served + the enforcement-key g_ho.
+    for &(i, si) in &members {
+        for &(j, sj) in &members {
+            if i == j || si != sj {
+                continue;
+            }
+            world.served[i][j] += vol;
+            world.capital[i][j].g_ho += g_quantum;
+        }
+    }
+}
+
 /// How strongly archetype aggression raises the churn rate (§9.4). Chosen so a Hoarder
 /// (aggression 0.7) churns at ~3× the base, matching the old flat multiplier. `pub` so the
 /// inflow-calibration (`sim_adv::inflow::expected_outflow`) can size λ_in from the SAME
@@ -2208,6 +2286,11 @@ pub fn try_place_one_symbol_for_test(
 #[cfg(test)]
 pub fn pos_and_capital_for_test(world: &mut World, params: &DynParams) {
     pos_and_capital(world, params);
+}
+
+#[cfg(test)]
+pub fn adv_collude_farm_for_test(world: &mut World, params: &DynParams) {
+    adv_collude_farm(world, params);
 }
 
 #[cfg(test)]
