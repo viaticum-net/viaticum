@@ -14,7 +14,7 @@ use crate::sim_adv::inflow::{
 };
 use crate::sim_adv::metrics::{
     bit_eq as metrics_bit_eq, collect_metrics, farm_honest_reciprocity, farm_honest_served,
-    farm_honest_storage, mean_sigma, newcomer_floor_durability,
+    farm_honest_storage, mean_sigma, newcomer_floor_durability, overall_floor_durability,
 };
 use crate::sim_adv::predators::{
     RunMode, a1_epsilon_whale_hook, a4_whitewasher_hook, a7_sybil_farm_hook,
@@ -23,8 +23,9 @@ use crate::sim_adv::predators::{
 };
 use crate::sim_adv::registry::{
     a1_whale, a3_flapper, a4_whitewasher, a5_deep_silent, a6_discriminator, a7_sybil,
-    a15_enclosure, all_scenarios, dr_baseline, dr_battle, dr_hetero, find_scenario,
-    honest_hetero_hard, honest_hetero_v2, honest_v2, tiered_hetero, tiered_hetero_hard, tiered_v1,
+    a10_provider_exit, a15_enclosure, all_scenarios, dr_baseline, dr_battle, dr_hetero,
+    find_scenario, honest_hetero_hard, honest_hetero_v2, honest_v2, tiered_hetero,
+    tiered_hetero_hard, tiered_v1,
 };
 use crate::sim_adv::report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
 use crate::sim_adv::restore::{
@@ -5199,5 +5200,516 @@ fn a7_sybil_is_registered() {
     assert!(
         sc.verdicts.iter().any(|v| v.id == "INV-DETERMINISM"),
         "a7 board carries INV-DETERMINISM"
+    );
+}
+
+// ==================================================================
+// A10 — provider-exit (`4r_a10_spec.md`): a large PROVIDER (the top-load holder set; honest_v2's
+// loads are near-flat, so "largest correlated set", not a dramatic concentration) mass-exits in one
+// tick. Do the survivors keep the placed floor filled, or is floor-fill left depressed? Measured via
+// the non-cream floor-FILL proxy (`overall_floor_durability` — NOT decodability; review B1).
+// ==================================================================
+
+/// The tick `a10_provider_exit` fires the mass-exit at (mirrors the registry `A10_EXIT_TICK`).
+const A10_TEST_EXIT_TICK: u64 = 60;
+/// The candidate no-collapse bar X the calibration dump reports power against (mirrors `A10_FLOOR_X`).
+const A10_TEST_X: f64 = 0.20;
+/// The FROZEN provider-fraction sweep points (control 0, the absorbed region, and the large depressed
+/// point). The board freezes on 0.15 (`A10_PROVIDER_FRAC`); the sweep steps up to 0.7 (the shrunken
+/// survivor set leaves floor-fill depressed ~30 %).
+const A10_SWEEP_FRACS: [f64; 5] = [0.0, 0.15, 0.3, 0.5, 0.7];
+
+/// A copy of `a10_provider_exit` with an overridden provider fraction (the sweep knob).
+fn a10_with(frac: f64) -> Scenario {
+    let mut sc = a10_provider_exit();
+    sc.events = vec![(
+        A10_TEST_EXIT_TICK,
+        Event::ProviderExit {
+            sel: NodeSel::TopHolders(frac),
+        },
+    )];
+    sc
+}
+
+/// Reproduce the `a10_provider_exit` world at the START of the exit tick (before the event fires):
+/// `build_world` + `A10_TEST_EXIT_TICK` steps. The a10 world is the honest_v2 world (no
+/// tier/demand/uptime/inflow layers), so `build_world` reproduces the runner's `build_world_for`, and
+/// the runner's pre-tick trackers never mutate the world — so this is the exact state the mass-exit reads.
+fn a10_world_at_exit(seed: u64) -> World {
+    use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
+    let params = DynParams::default();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world(100, &params, seed);
+    for _ in 0..A10_TEST_EXIT_TICK {
+        crate::sim_dynamic::engine::step(&mut world, &params, &prior, &policy);
+    }
+    world
+}
+
+/// Independent reproduction of `resolve_nodesel(TopHolders(frac))`: the present nodes ranked by
+/// ALIVE-holding count (descending, tie by index), taking `round(frac · present_count)`. Used to
+/// verify the mass-exit departs exactly the resolved top-load set.
+fn top_loaded_holders(world: &World, frac: f64) -> Vec<usize> {
+    let n = world.nodes.len();
+    let mut ranked: Vec<usize> = (0..n).filter(|&i| world.nodes[i].present).collect();
+    ranked.sort_by(|&a, &b| {
+        let ca = world.nodes[a].holdings.iter().filter(|s| s.alive).count();
+        let cb = world.nodes[b].holdings.iter().filter(|s| s.alive).count();
+        cb.cmp(&ca).then(a.cmp(&b))
+    });
+    let take = (frac.clamp(0.0, 1.0) * ranked.len() as f64).round() as usize;
+    ranked.into_iter().take(take).collect()
+}
+
+/// Fire the `ProviderExit{TopHolders(frac)}` event on a world via the REAL runner executor (one
+/// physics: `depart_node` per selected node). No restore-tracking, no revive. Returns nothing —
+/// mutates `world` in place (the caller inspects it).
+fn a10_fire_exit(world: &mut World, frac: f64, seed: u64) {
+    use std::collections::BTreeMap;
+    let classes = DemandMix::Uniform.assign(world.nodes.len(), seed);
+    let mut tracker = RestoreTracker::new(&a10_provider_exit().world);
+    let mut revive_at: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    let mut fired: Vec<crate::sim_adv::runner::FiredEvent> = Vec::new();
+    let due = vec![Event::ProviderExit {
+        sel: NodeSel::TopHolders(frac),
+    }];
+    crate::sim_adv::runner::apply_events(
+        world,
+        &due,
+        A10_TEST_EXIT_TICK,
+        &mut fired,
+        &mut tracker,
+        &mut revive_at,
+        &classes,
+    );
+}
+
+/// Step the honest a10 world with the scenario's ProviderExit event applied at each due tick, tracking
+/// the POST-EXIT repair-storm peak (max `detected_deficit_symbols` + max `owners_repairing` over ticks
+/// ≥ the exit tick) and returning `(peak_deficit, peak_owners_repairing, overall_durability@horizon)`.
+/// The honest world (no adversaries / inflow / tier / demand mix) makes `build_world` == the runner's
+/// `build_world_for`, so this loop's world evolution matches `run()`'s predator arm bit-for-bit — the
+/// durability it returns equals `run()`'s `per_seed_overall_durability`.
+fn a10_storm_and_durability(sc: &Scenario, seed: u64) -> (usize, usize, f64) {
+    use std::collections::BTreeMap;
+    use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
+    let params = &sc.world.base;
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world(sc.world.n_nodes, params, seed);
+    let classes = DemandMix::Uniform.assign(sc.world.n_nodes, seed);
+    let mut tracker = RestoreTracker::new(&sc.world);
+    let mut revive_at: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    let mut fired: Vec<crate::sim_adv::runner::FiredEvent> = Vec::new();
+    let mut peak_deficit = 0usize;
+    let mut peak_owners = 0usize;
+    for t in 0..sc.horizon {
+        let due: Vec<Event> = sc
+            .events
+            .iter()
+            .filter(|(tt, _)| *tt == t)
+            .map(|(_, e)| *e)
+            .collect();
+        crate::sim_adv::runner::apply_events(
+            &mut world,
+            &due,
+            t,
+            &mut fired,
+            &mut tracker,
+            &mut revive_at,
+            &classes,
+        );
+        crate::sim_dynamic::engine::step(&mut world, params, &prior, &policy);
+        if t >= A10_TEST_EXIT_TICK {
+            peak_deficit = peak_deficit.max(world.repair_stat.detected_deficit_symbols);
+            peak_owners = peak_owners.max(world.repair_stat.owners_repairing);
+        }
+    }
+    let dur = overall_floor_durability(&world, params.n_symbols);
+    (peak_deficit, peak_owners, dur)
+}
+
+#[test]
+#[ignore = "A10 calibration — run with --ignored --nocapture to freeze PROVIDER_FRAC / X / sweep points"]
+fn a10_provider_exit_calibration_dump() {
+    // The FROZEN calibration read (anti-Goodhart evidence for A10_PROVIDER_FRAC / A10_FLOOR_X): the
+    // runtime numbers (present holders at the exit tick, the top-holder alive-holding load, survivor
+    // capacity vs the n_symbols = 5 floor, the post-exit repair-storm peak, and the
+    // durability(provider_frac) sweep). READ + measure only.
+    let sc = a10_provider_exit();
+    let floor = sc.world.base.n_symbols;
+    let seeds = [42u64, 43, 44, 45, 46];
+    println!(
+        "\n=== A10 calibration: n_nodes={} exit_tick={} horizon={} floor(n_symbols)={} PROVIDER_FRAC={} X={} ===",
+        sc.world.n_nodes, A10_TEST_EXIT_TICK, sc.horizon, floor, 0.15, A10_TEST_X,
+    );
+    // present @ exit tick + the top-load holders' alive-holding counts + survivors, seed 42.
+    {
+        let w = a10_world_at_exit(42);
+        let present = w.nodes.iter().filter(|nd| nd.present).count();
+        let top = top_loaded_holders(&w, 0.15);
+        let loads: Vec<usize> = top
+            .iter()
+            .map(|&i| w.nodes[i].holdings.iter().filter(|s| s.alive).count())
+            .collect();
+        let min_load = loads.iter().copied().min().unwrap_or(0);
+        println!(
+            "  present@exit(seed42)={present}  provider(frac=0.15) size={}  top-holder alive-holding loads (min={min_load})={loads:?}  survivors={} ≫ floor {floor}",
+            top.len(),
+            present - top.len(),
+        );
+    }
+    // The provider-FRACTION sweep: mean post-exit floor-fill + power vs candidate X. NOTE (review
+    // W2): the "deficit" column below is the CHRONIC background floor-gap summed over present owners
+    // (repair_stat resets each tick; the per-tick sum is dominated by the standing n_symbols-vs-k_eff
+    // gap and scales with the present-owner count) — a NETWORK-SIZE proxy that DECREASES as the
+    // provider fraction grows. It is NOT a transient exit-shock spike; the spec §3 "repair-storm
+    // peak" intent is NOT satisfied by this instrument (an honest gap, left visible, not renamed
+    // into a storm).
+    println!("  --- provider-frac sweep (5 seeds) ---");
+    for &frac in &A10_SWEEP_FRACS {
+        let scv = a10_with(frac);
+        let r = run(&scv, &seeds);
+        let (dm, ds) = mean_sigma(&r.per_seed_overall_durability);
+        let power = if ds > 0.0 {
+            (dm - A10_TEST_X).abs() / ds
+        } else {
+            f64::INFINITY
+        };
+        // Storm peak (mean over seeds) via the tracking loop; cross-check its durability vs run().
+        let mut deficits = Vec::new();
+        let mut owners = Vec::new();
+        let mut track_durs = Vec::new();
+        for &seed in &seeds {
+            let (d, o, dur) = a10_storm_and_durability(&scv, seed);
+            deficits.push(d as f64);
+            owners.push(o as f64);
+            track_durs.push(dur);
+        }
+        let (peak_def, _) = mean_sigma(&deficits);
+        let (peak_own, _) = mean_sigma(&owners);
+        let (track_dm, _) = mean_sigma(&track_durs);
+        println!(
+            "  frac={frac:.2}: floor-fill per-seed={:?} mean={dm:.4} σ={ds:.4} power(vs {:.2})={power:.2}  bg-deficit(size-proxy, NOT storm)≈{peak_def:.0} repairers≈{peak_own:.0}  [track-fill={track_dm:.4}]",
+            r.per_seed_overall_durability
+                .iter()
+                .map(|d| (d * 1000.0).round() / 1000.0)
+                .collect::<Vec<_>>(),
+            A10_TEST_X,
+        );
+    }
+}
+
+#[test]
+fn overall_floor_durability_counts_noncream_fill_per_owner_with_edge_cases() {
+    // Review B2: a DIRECT unit test of the A10 floor-fill reader on a hand-built world (the other
+    // A10 tests exercise it only end-to-end, where the value is unverifiable by hand). Covers:
+    // non-cream-only counting (cream excluded), dead-symbol exclusion, absent-HOLDER exclusion,
+    // the per-block clip at 1.0, absent-OWNER skip, owners with no floor-ever-met block skipped,
+    // per-owner-then-over-owners averaging, and the NaN edges (floor == 0 / no floor-met block).
+    let mut w = controlled_world(10, 11);
+    let floor = 5usize;
+    for nd in &mut w.nodes {
+        nd.own_blocks.clear(); // owners 1..=6 keep no blocks ⇒ skipped (no denominator)
+    }
+    w.nodes[9].present = false; // absent: both an excluded HOLDER and a skipped OWNER below
+    // Owner 0, block 0: 3 alive non-cream on present holders (counted) + 2 cream (excluded)
+    // + 1 dead non-cream (excluded) + 1 non-cream on the absent holder 9 (excluded) ⇒ 3/5.
+    w.nodes[0].own_blocks = vec![floor_met_block(0, 0.5), floor_met_block(1, 0.5)];
+    for h in 1..=3 {
+        push_held(&mut w, h, 0, 0, 0.5, false);
+    }
+    push_held(&mut w, 4, 0, 0, 0.5, true);
+    push_held(&mut w, 5, 0, 0, 0.5, true);
+    push_held(&mut w, 6, 0, 0, 0.5, false);
+    w.nodes[6].holdings.last_mut().unwrap().alive = false;
+    push_held(&mut w, 9, 0, 0, 0.5, false);
+    // Owner 0, block 1: 6 alive non-cream on present holders ⇒ 6/5 clipped to 1.0. Owner mean 0.8.
+    for h in 1..=6 {
+        push_held(&mut w, h, 0, 1, 0.5, false);
+    }
+    // Owner 7, block 5: 1 alive non-cream ⇒ 1/5 = 0.2.
+    w.nodes[7].own_blocks = vec![floor_met_block(5, 0.5)];
+    push_held(&mut w, 1, 7, 5, 0.5, false);
+    // Owner 8: only a NEVER-floor-met block ⇒ skipped (young data is not in the denominator).
+    let mut young = floor_met_block(6, 0.5);
+    young.floor_ever_met = false;
+    w.nodes[8].own_blocks = vec![young];
+    // Absent owner 9: a fully-held floor-met block that must NOT enter the mean.
+    w.nodes[9].own_blocks = vec![floor_met_block(7, 0.5)];
+    for h in 1..=5 {
+        push_held(&mut w, h, 9, 7, 0.5, false);
+    }
+    let dur = overall_floor_durability(&w, floor);
+    assert!(
+        (dur - 0.5).abs() < 1e-12,
+        "mean over owners 0 (0.6 and clip-1.0 ⇒ 0.8) and 7 (0.2) = 0.5; got {dur}"
+    );
+    // floor == 0 ⇒ NaN (no denominator semantics, not a panic).
+    assert!(overall_floor_durability(&w, 0).is_nan(), "floor = 0 ⇒ NaN");
+    // No present owner with a floor-ever-met block ⇒ NaN.
+    for nd in &mut w.nodes {
+        nd.own_blocks.clear();
+    }
+    assert!(
+        overall_floor_durability(&w, floor).is_nan(),
+        "no floor-met block anywhere ⇒ NaN"
+    );
+}
+
+#[test]
+fn provider_exit_departs_the_top_load_holders() {
+    // Test 1 (spec §4): the ProviderExit event departs EXACTLY the resolved TopHolders(frac) set —
+    // marks them present→false, queues a SILENT loss to present owners whose data they carried, and
+    // touches no other node's presence. Deterministic (a re-run gives the identical departed set).
+    let (seed, frac) = (42u64, 0.15f64);
+    let mut world = a10_world_at_exit(seed);
+    let expected = top_loaded_holders(&world, frac);
+    assert!(
+        !expected.is_empty(),
+        "the provider set is non-empty at frac 0.15"
+    );
+    let present_before: Vec<bool> = world.nodes.iter().map(|nd| nd.present).collect();
+    let silent_before = world.pending_silent_loss.len();
+    a10_fire_exit(&mut world, frac, seed);
+    // Every provider node is now absent.
+    for &e in &expected {
+        assert!(!world.nodes[e].present, "provider node {e} departed");
+    }
+    // No NON-provider node changed presence (the exit is confined to the resolved set).
+    for (i, &was_present) in present_before.iter().enumerate() {
+        if !expected.contains(&i) {
+            assert_eq!(
+                world.nodes[i].present, was_present,
+                "non-provider node {i} presence unchanged"
+            );
+        }
+    }
+    // The departures queued silent losses to present owners (the provider carried real data).
+    assert!(
+        world.pending_silent_loss.len() > silent_before,
+        "the mass-exit queues silent losses to the owners it served"
+    );
+    // Determinism: an independent re-run departs the identical set.
+    let mut world2 = a10_world_at_exit(seed);
+    let expected2 = top_loaded_holders(&world2, frac);
+    a10_fire_exit(&mut world2, frac, seed);
+    let departed = |w: &World| -> Vec<usize> {
+        (0..w.nodes.len())
+            .filter(|&i| !w.nodes[i].present)
+            .collect()
+    };
+    assert_eq!(
+        expected, expected2,
+        "the resolved provider set is deterministic"
+    );
+    assert_eq!(
+        departed(&world),
+        departed(&world2),
+        "the departed set is bit-identical across a double run"
+    );
+}
+
+#[test]
+fn no_provider_exit_is_byte_identical_to_honest() {
+    // Test 2 (spec §4) — THE ANCHOR. With the ProviderExit event REMOVED, a10_provider_exit's world
+    // (the honest_v2 world, horizon 130) evolves byte-identically to honest_v2 — the god-view
+    // MetricSet matches field-for-field at seed 42. And an EMPTY provider (TopHolders(0.0), which
+    // departs no one and draws no RNG) is likewise byte-identical.
+    let mut no_event = a10_provider_exit();
+    no_event.events = Vec::new();
+    let m_no_event = run_one_seed(&no_event, 42).metrics;
+    let m_honest = run_one_seed(&honest_v2(), 42).metrics;
+    assert!(
+        metrics_bit_eq(&m_no_event, &m_honest),
+        "a10 with no event is byte-identical to honest_v2"
+    );
+    // frac = 0.0 ⇒ TopHolders departs no node ⇒ still byte-identical to honest.
+    let m_frac0 = run_one_seed(&a10_with(0.0), 42).metrics;
+    assert!(
+        metrics_bit_eq(&m_frac0, &m_honest),
+        "a10 with an empty provider (frac 0.0) is byte-identical to honest_v2"
+    );
+    // The frozen sim_diag anchor numbers stay UNMOVED by the A10 change (no ProviderExit ⇒ the
+    // executor branch never fires) — honest_v2 seed-42 still holds field-for-field.
+    assert_eq!(m_honest.alive_symbols, 224, "alive");
+    assert_eq!(m_honest.evicts, 621, "evicts");
+    assert_eq!(m_honest.preempts, 375, "preempts");
+    assert_eq!(m_honest.cap_trims, 179, "cap_trims");
+    assert!(
+        (m_honest.share_a_pos - 75.45).abs() < 0.1,
+        "share A>0 = {}",
+        m_honest.share_a_pos
+    );
+}
+
+#[test]
+fn provider_exit_durability_recovers_at_small_provider_fraction() {
+    // Test 3 (spec §4) — NO-COLLAPSE at the frozen A10_PROVIDER_FRAC (0.15): the survivor capacity
+    // (~75 present ≫ the 5-holder floor) re-takes the orphaned symbols, so post-exit floor-fill
+    // clears the frozen no-collapse bar X (review W1: X sits below the whole sweep, so this row
+    // proves no-collapse, NOT "absorbed" — the absorb-vs-degrade split is the sweep test). The
+    // board's INV-PROVIDER-EXIT-FLOOR PASSES (not FAIL, mean above X); structural rows pass too.
+    let sc = a10_provider_exit();
+    let result = run(&sc, &sc.seeds.clone());
+    let verdicts = evaluate_board(&sc, &result);
+    let absorb = verdicts
+        .iter()
+        .find(|v| v.id == "INV-PROVIDER-EXIT-FLOOR")
+        .expect("board carries INV-PROVIDER-EXIT-FLOOR");
+    println!(
+        "INV-PROVIDER-EXIT-FLOOR: {} effect={:.4} σ={:.4} threshold={:.2} power={:.2}",
+        absorb.kind.label().trim(),
+        absorb.effect,
+        absorb.sigma,
+        absorb.threshold,
+        absorb.power,
+    );
+    assert_ne!(
+        absorb.kind,
+        VerdictKind::Fail,
+        "post-exit durability does not collapse below X at the frozen provider fraction (got FAIL)"
+    );
+    assert!(
+        absorb.effect > absorb.threshold,
+        "mean post-exit durability {:.4} sits above the floor X {:.2}",
+        absorb.effect,
+        absorb.threshold
+    );
+    assert_eq!(
+        verdicts
+            .iter()
+            .find(|v| v.id == "INV-DETERMINISM")
+            .unwrap()
+            .kind,
+        VerdictKind::Pass
+    );
+    assert_eq!(
+        verdicts
+            .iter()
+            .find(|v| v.id == "INV-ANTI-ORACLE")
+            .unwrap()
+            .kind,
+        VerdictKind::Pass
+    );
+}
+
+#[test]
+fn provider_exit_durability_degrades_monotone_in_fraction() {
+    // Test 4 (spec §4) — HONEST-REFLECT sweep: post-exit overall floor durability vs provider_frac.
+    // The absorption claim's honest reading: durability does NOT RISE as more of the most-depended-on
+    // network exits (it either holds — the survivors absorb — or degrades — over-concentration bites).
+    // Not tuned to green: the curve is reported, and the substantive guard is monotone non-increase
+    // across the sweep (within a small seed-noise tolerance).
+    let seeds = a10_provider_exit().seeds;
+    let mut curve: Vec<(f64, f64)> = Vec::new();
+    for &frac in &A10_SWEEP_FRACS {
+        let r = run(&a10_with(frac), &seeds);
+        let (mean, _) = mean_sigma(&r.per_seed_overall_durability);
+        curve.push((frac, mean));
+    }
+    println!(
+        "A10 post-exit durability sweep (provider_frac, mean over {} seeds):",
+        seeds.len()
+    );
+    for (f, m) in &curve {
+        println!("  frac={f:.2}  durability={m:.4}");
+    }
+    // The control (frac 0) sits at the honest steady-state durability; each higher fraction reads no
+    // HIGHER (a small tolerance absorbs seed realization noise around a flat absorb region).
+    let tol = 0.03;
+    for w in curve.windows(2) {
+        assert!(
+            w[1].1 <= w[0].1 + tol,
+            "durability must not rise with provider_frac: U({:.2})={:.4} > U({:.2})={:.4} + {tol}",
+            w[1].0,
+            w[1].1,
+            w[0].0,
+            w[0].1,
+        );
+    }
+    // And the endpoint degradation is real: the largest fraction reads BELOW the control.
+    let (ctrl, big) = (curve[0].1, curve.last().unwrap().1);
+    assert!(
+        big < ctrl,
+        "the large provider exit degrades durability vs the control: U_big={big:.4} < U_ctrl={ctrl:.4}"
+    );
+}
+
+#[test]
+fn large_provider_exit_is_not_absorbed() {
+    // Test 5 (spec §4) — DEPRESSED at a LARGE exit: the top-0.7 holder set leaving depresses
+    // post-exit floor-FILL relative to the small-fraction absorbed case (the honest bite). NOTE the
+    // proxy caveat (review B1): this shows the placed floor THINNING, not proven restorability loss
+    // (cream may keep blocks decodable — not measured here). Reported honestly against the small
+    // point; the finding, not a failure.
+    let seeds = a10_provider_exit().seeds;
+    let small = run(&a10_with(A10_SWEEP_FRACS[1]), &seeds); // 0.15 (the frozen absorb fraction)
+    let large = run(&a10_with(*A10_SWEEP_FRACS.last().unwrap()), &seeds); // 0.7
+    let (dur_small, _) = mean_sigma(&small.per_seed_overall_durability);
+    let (dur_large, _) = mean_sigma(&large.per_seed_overall_durability);
+    println!(
+        "A10 not-absorbed: durability(frac=0.15)={dur_small:.4}  durability(frac=0.70)={dur_large:.4}"
+    );
+    assert!(
+        dur_large < dur_small,
+        "a large provider exit is NOT absorbed: durability {dur_large:.4} stays below the small-fraction absorb case {dur_small:.4}"
+    );
+}
+
+#[test]
+fn provider_exit_is_deterministic_across_double_run() {
+    // Test 6 (spec §4) — INV-DETERMINISM: the whole provider-exit → repair path is seeded (the exit
+    // departs a deterministic top-load set, drawing no engine RNG), so two runs give bit-identical
+    // post-exit durability per seed + bit-identical god-view metrics. The board row also passes.
+    let mut sc = a10_provider_exit();
+    sc.seeds = vec![42, 43];
+    let seeds = sc.seeds.clone();
+    let r1 = run(&sc, &seeds);
+    let r2 = run(&sc, &seeds);
+    let bits = |xs: &[f64]| xs.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(&r1.per_seed_overall_durability),
+        bits(&r2.per_seed_overall_durability),
+        "post-exit durability bit-identical"
+    );
+    for (a, b) in r1.per_seed.iter().zip(&r2.per_seed) {
+        assert!(metrics_bit_eq(a, b), "god-view metrics bit-identical");
+    }
+    let v = evaluate_board(&sc, &r1);
+    assert_eq!(
+        v.iter().find(|x| x.id == "INV-DETERMINISM").unwrap().kind,
+        VerdictKind::Pass
+    );
+}
+
+#[test]
+fn a10_provider_exit_is_registered() {
+    // Test 7 (spec §4): the scenario is in the registry, fires a ProviderExit{TopHolders} at the exit
+    // tick, and its board carries INV-PROVIDER-EXIT-FLOOR + the structural rows.
+    let sc = find_scenario("a10_provider_exit").expect("a10_provider_exit is registered");
+    assert_eq!(sc.id.as_str(), "a10_provider_exit");
+    assert_eq!(sc.events.len(), 1, "one scripted event");
+    match sc.events[0] {
+        (
+            tick,
+            Event::ProviderExit {
+                sel: NodeSel::TopHolders(_),
+            },
+        ) => {
+            assert_eq!(tick, A10_TEST_EXIT_TICK, "fires at the exit tick")
+        }
+        other => panic!("a10 must fire a ProviderExit{{TopHolders}}, got {other:?}"),
+    }
+    assert!(
+        sc.verdicts
+            .iter()
+            .any(|v| v.id == "INV-PROVIDER-EXIT-FLOOR"),
+        "a10 board carries INV-PROVIDER-EXIT-FLOOR"
+    );
+    assert!(
+        sc.verdicts.iter().any(|v| v.id == "INV-DETERMINISM"),
+        "a10 board carries INV-DETERMINISM"
     );
 }

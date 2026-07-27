@@ -165,6 +165,18 @@ pub enum InvariantSpec {
         /// The pass direction (LessThan — earned honest reciprocity below the tiny threshold ε).
         dir: Direction,
     },
+    /// A phase-3 A10 PROVIDER-EXIT post-exit floor-fill scalar → mean±σ vs threshold, power<2
+    /// gate. Reads [`RunResult::per_seed_overall_durability`] DIRECTLY (the floor-fill fraction IS
+    /// the per-seed scalar); a non-provider-exit seed contributes `NaN` (skipped). Used by
+    /// INV-PROVIDER-EXIT-FLOOR — a NO-COLLAPSE row (A10 review W1: X sits below the whole measured
+    /// sweep, so it proves "a provider exit never collapses floor-fill below X", NOT "the exit was
+    /// absorbed"; the absorb-vs-degrade discrimination lives in the `tests.rs` sweep, exactly the
+    /// A15 `INV-ENCLOSURE-FLOOR` idiom). A FAIL (floor-fill collapses even at the modest frozen
+    /// fraction) is the fragility / repair-latency finding — reported with the sweep, NOT tuned away.
+    ProviderExitFloor {
+        /// The pass direction (GreaterThan — floor-fill above the collapse floor X).
+        dir: Direction,
+    },
 }
 
 /// One invariant-board row spec.
@@ -227,6 +239,9 @@ impl Clone for Invariant {
                 }
                 InvariantSpec::SybilCreditLimit { dir } => {
                     InvariantSpec::SybilCreditLimit { dir: *dir }
+                }
+                InvariantSpec::ProviderExitFloor { dir } => {
+                    InvariantSpec::ProviderExitFloor { dir: *dir }
                 }
             },
             threshold: self.threshold,
@@ -434,6 +449,14 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             .first()
                             .map(|f0| f0.to_bits() == sr.farm_honest_reciprocity.to_bits())
                             .unwrap_or(false);
+                        // The A10 post-exit overall floor durability (the INV-PROVIDER-EXIT-FLOOR
+                        // scalar) must re-run bit-identical too — it feeds the verdict + report (a
+                        // deterministic NaN compares equal to itself via to_bits).
+                        let overall_eq = result
+                            .per_seed_overall_durability
+                            .first()
+                            .map(|d0| d0.to_bits() == sr.overall_durability.to_bits())
+                            .unwrap_or(false);
                         metrics_eq
                             && restore_eq
                             && calib_eq
@@ -445,6 +468,7 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             && cartel_eq
                             && farm_eq
                             && farm_recip_eq
+                            && overall_eq
                     }
                     None => false,
                 };
@@ -631,6 +655,21 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                     threshold: inv.threshold,
                     power,
                     note: "sybil-farm: earned honest reciprocity ≈ 0 under collusion (credit-limit holds)",
+                }
+            }
+            InvariantSpec::ProviderExitFloor { dir } => {
+                // The per-seed post-exit overall floor durability IS the scalar (read directly).
+                let (mean, sigma) = mean_sigma(&result.per_seed_overall_durability);
+                let sigma_r = if sigma.is_finite() { sigma } else { 0.0 };
+                let (kind, power) = decide(mean, sigma, inv.threshold, *dir);
+                Verdict {
+                    id: inv.id,
+                    kind,
+                    effect: mean,
+                    sigma: sigma_r,
+                    threshold: inv.threshold,
+                    power,
+                    note: "provider-exit: post-exit floor-fill (no-collapse bar) at the frozen provider fraction",
                 }
             }
         })

@@ -26,6 +26,7 @@ use crate::sim_adv::hetero::{DemandClass, HeteroReport, HeteroTracker, apply_dem
 use crate::sim_adv::inflow::{PopSeries, apply_inflow, bootstrap_n0, present_count};
 use crate::sim_adv::metrics::{
     MetricSet, cartel_earnings_split, collect_metrics, newcomer_floor_durability,
+    overall_floor_durability,
 };
 use crate::sim_adv::predators::{
     AdvMetrics, RunMode, collect_adv_metrics, fold_cap_ratio, inject_adversaries,
@@ -107,6 +108,11 @@ pub struct RunResult {
     /// collusion (the credit-limit RESISTS sybil multiplication: collusion writes only intra-farm
     /// cells, never an honest credit key).
     pub per_seed_farm_reciprocity: Vec<f64>,
+    /// Per-seed A10 POST-EXIT floor-fill (`4r_a10_spec.md` §2), seed-indexed. `NaN` for a
+    /// non-provider-exit scenario; a finite fraction for `a10_provider_exit` — the non-cream
+    /// floor-fill PROXY at the horizon (NOT decodability — see `metrics::overall_floor_durability`)
+    /// that INV-PROVIDER-EXIT-FLOOR reads and the provider-frac sweep tracks.
+    pub per_seed_overall_durability: Vec<f64>,
 }
 
 /// All per-seed outputs of one seed run (kept as a struct so the growing set of optional
@@ -143,6 +149,10 @@ pub(crate) struct SeedRun {
     /// The A7 EARNED HONEST RECIPROCITY (`4r_a7_spec.md` §4) for a sybil-farm scenario, else `NaN`.
     /// The headline defence: the pairwise credit key stays ≈ 0 under collusion.
     pub farm_honest_reciprocity: f64,
+    /// The A10 post-exit floor-fill at the horizon (`4r_a10_spec.md` §2) for a ProviderExit
+    /// scenario, else `NaN` (a non-provider-exit scenario carries no post-exit cut). The floor-fill
+    /// PROXY INV-PROVIDER-EXIT-FLOOR reads + the provider-frac sweep tracks.
+    pub overall_durability: f64,
 }
 
 /// A predator run paired with its matched honest twin (same seed, same construction, hooks
@@ -344,6 +354,20 @@ pub(crate) fn apply_events(
                     for h in pick {
                         depart_node(world, h);
                     }
+                }
+            }
+            // A10: a large PROVIDER (a correlated set of the most-depended-on holders, `sel` —
+            // typically `TopHolders(frac)`) mass-EXITS in ONE tick. Each selected node departs with
+            // the SAME churn / A16 co-loss per-node physics (`depart_node`): a silent loss queued to
+            // each present owner it carried + its held symbols killed. NOT restore-tracked (the
+            // provider is not the disaster victim — owners repair themselves) and NOT revived (a
+            // permanent exit). `resolve_nodesel` is resolved to a Vec BEFORE any departure (no
+            // re-ranking mid-exit), deterministic (TopHolders ranks by alive-holding count, tie by
+            // index) and draws no engine RNG ⇒ determinism preserved. An EMPTY selection (e.g.
+            // `TopHolders(0.0)`) departs no one ⇒ byte-identical to the no-event path.
+            Event::ProviderExit { sel } => {
+                for node in resolve_nodesel(world, *sel, classes) {
+                    depart_node(world, node);
                 }
             }
             _ => {}
@@ -744,6 +768,20 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     } else {
         (f64::NAN, f64::NAN)
     };
+    // A10 (`4r_a10_spec.md` §2): the POST-EXIT floor-fill world-cut — the proxy
+    // INV-PROVIDER-EXIT-FLOOR reads. Evaluator-only god-view (never a decision),
+    // measured on the final world (the horizon, past the post-exit recovery window). Finite only for
+    // a ProviderExit scenario (the channel is unused elsewhere ⇒ `NaN`, which compares equal to
+    // itself via `to_bits` in the determinism board).
+    let overall_durability = if scenario
+        .events
+        .iter()
+        .any(|(_, e)| matches!(e, Event::ProviderExit { .. }))
+    {
+        overall_floor_durability(&world, params.n_symbols)
+    } else {
+        f64::NAN
+    };
     SeedRun {
         metrics: collect_metrics(&world, params),
         fired,
@@ -757,6 +795,7 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
         cartel_earn_ratio,
         farm_honest_storage,
         farm_honest_reciprocity,
+        overall_durability,
     }
 }
 
@@ -853,6 +892,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
     let mut per_seed_cartel_earn = Vec::with_capacity(outcomes.len());
     let mut per_seed_farm_storage = Vec::with_capacity(outcomes.len());
     let mut per_seed_farm_reciprocity = Vec::with_capacity(outcomes.len());
+    let mut per_seed_overall_durability = Vec::with_capacity(outcomes.len());
     for (sr, twin_adv) in outcomes {
         per_seed.push(sr.metrics);
         fired.push(sr.fired);
@@ -865,6 +905,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_cartel_earn.push(sr.cartel_earn_ratio);
         per_seed_farm_storage.push(sr.farm_honest_storage);
         per_seed_farm_reciprocity.push(sr.farm_honest_reciprocity);
+        per_seed_overall_durability.push(sr.overall_durability);
         per_seed_adv.push(match (sr.adv, twin_adv) {
             (Some(pred), Some(twin)) => Some(AdvPair { pred, twin }),
             _ => None,
@@ -886,6 +927,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_cartel_earn,
         per_seed_farm_storage,
         per_seed_farm_reciprocity,
+        per_seed_overall_durability,
     }
 }
 

@@ -129,6 +129,50 @@ const A7_BLOCK_MULT: f64 = 12.0;
 /// measured in the calibration table but NOT a board row.
 const A7_CREDIT_LIMIT_EPS: f64 = 1.0;
 
+// ============================================================
+// A10 provider-exit (`4r_a10_spec.md`) — constants FROZEN in code BEFORE the run (anti-Goodhart).
+// The calibration test `a10_provider_exit_calibration_*` prints the runtime numbers (present holders
+// at the exit tick, top-holder alive-holding load, survivor capacity vs the n_symbols = 5 floor, the
+// post-exit repair-storm peak, and the durability(provider_frac) sweep) that justify each; see the
+// frozen-constants section of the A10 report.
+// ============================================================
+
+/// The provider-exit tick T (fixed mature trigger, as `dr_battle` @ 60): the top holders are well
+/// loaded by tick 60 (past the incremental-join fill), and the 130-tick horizon leaves a long
+/// (70-tick) post-exit recovery window. Documented (not `after_share`): the top-load set is already
+/// established by T60, so a fixed tick is simpler and equivalent.
+const A10_EXIT_TICK: u64 = 60;
+
+/// The recovery horizon (weekly ticks). 130 = the `honest_v2` horizon: 70 post-exit ticks — far more
+/// than the repair-detection delay (default 3) needs — so the survivors have ample time to re-take
+/// the orphaned floor. With the event cleared this is exactly `honest_v2` (the anchor).
+const A10_HORIZON: u64 = 130;
+
+/// The board provider fraction: the top `A10_PROVIDER_FRAC` most-loaded holders mass-exit. FROZEN at
+/// 0.15 — MEASURED (seed 42): ~14 of the ~90 present holders leave, so the ~76 survivors ≫ the
+/// n_symbols = 5 floor and can re-take every orphaned symbol; post-exit floor-fill then stays at the
+/// steady-state baseline. HONEST SCOPE NOTE (review W3): honest_v2's per-holder load is NEAR-FLAT —
+/// the top holders sit tied at the ~5-symbol cap (tie broken by index), only ~2× the mean — so this
+/// selects "the largest correlated holder set", NOT a dramatically over-concentrated provider; the
+/// exit is still a genuine shock (~35 % of alive symbols orphaned, silent losses queued). Calibrate
+/// the SCENARIO (frac), never the threshold X. (Runtime justification — survivor count vs floor,
+/// top-holder load — is printed by the calibration dump; see the report.)
+const A10_PROVIDER_FRAC: f64 = 0.15;
+
+/// The INV-PROVIDER-EXIT-FLOOR collapse bar X. FROZEN at 0.20 — a NO-COLLAPSE bar, deliberately BELOW
+/// the whole measured sweep (review W1: it proves "a provider exit never collapses floor-fill below
+/// 0.20", NOT "the exit was absorbed" — the absorb-vs-degrade discrimination lives in the `tests.rs`
+/// sweep, the A15 `INV-ENCLOSURE-FLOOR` idiom). NOTE the SCALE (measured): under the eviction economy
+/// floor-met blocks settle near k_eff (≈ 1.7 non-cream holders of the 5-symbol floor), so the
+/// steady-state floor-fill baseline is ≈ 0.34 — NOT ≈ 1 (this is FILL of the placed floor, not
+/// decodability — see `metrics::overall_floor_durability`'s proxy note). X = 0.20 is ~40 % below that
+/// baseline. At `A10_PROVIDER_FRAC` post-exit floor-fill ≈ 0.338 (unmoved from the 0.341 control),
+/// clearing X with power ≈ 2.9 (PASS). The degradation at LARGER fractions (down to ≈ 0.24 at frac
+/// 0.70 — depressed but not a collapse) is the sweep's finding, NOT this board row. Calibrate the
+/// SCENARIO, never this bar; a FAIL at the frozen fraction would be the fragility / repair-latency
+/// FINDING.
+const A10_FLOOR_X: f64 = 0.20;
+
 /// Every registered scenario (hard-coded like `Archetype::ALL`).
 pub fn all_scenarios() -> Vec<Scenario> {
     vec![
@@ -150,6 +194,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
         a6_discriminator(),
         a15_enclosure(),
         a7_sybil(),
+        a10_provider_exit(),
     ]
 }
 
@@ -1184,6 +1229,93 @@ fn a7_sybil_invariants() -> Vec<Invariant> {
                 dir: Direction::LessThan,
             },
             threshold: A7_CREDIT_LIMIT_EPS,
+        },
+    ]
+}
+
+/// A10 — provider-exit (phase 3, `4r_a10_spec.md`): the honest world, then a large "PROVIDER" — the
+/// top `A10_PROVIDER_FRAC` most-loaded holders (honest_v2's loads are near-flat, so this is the
+/// largest correlated holder set, not a dramatic concentration — see the `A10_PROVIDER_FRAC` scope
+/// note) — mass-EXITS in ONE tick at `A10_EXIT_TICK`. Each provider node departs with the SAME churn
+/// / A16 per-node physics (`depart_node`): a silent loss to every present owner it carried + its held
+/// symbols killed. It is a PERMANENT exit (NOT restore-tracked, NOT revived — the owners repair the
+/// orphaned floor themselves onto the survivors). The question: does the survivors' re-placement
+/// keep the placed floor filled, or does the exit leave floor-fill depressed?
+///
+/// Headline: the post-exit floor-FILL at the horizon (`metrics::overall_floor_durability` — the mean
+/// over present owners of their floor-met blocks' non-cream fill fraction; a conservative PROXY, NOT
+/// decodability — see its doc; a restore-truth cross-check is deferred with the sim-unification
+/// decision). Board: INV-PROVIDER-EXIT-FLOOR (a NO-COLLAPSE bar at `A10_PROVIDER_FRAC` — X sits
+/// below the whole sweep by design, review W1) + the two structural rows. The provider-FRACTION sweep
+/// (floor-fill vs provider_frac: HONEST-REFLECT monotone-degrade + the large-frac depressed point) is
+/// a `tests.rs` sweep, NOT a board row (A10 is a world-cut, no twin).
+///
+/// MEASURED FINDING (seeds 42..46): the floor-fill(provider_frac) curve is monotone non-increasing —
+/// 0.341 (control) → 0.338 (frac 0.15) → 0.287 (0.30) → 0.287 (0.50) → 0.240 (0.70). At a MODEST exit
+/// (frac 0.15) the ~76 survivors re-take the orphaned floor, so fill is UNMOVED from the control; at
+/// a LARGE exit (frac 0.70) the shrunken survivor set leaves fill depressed ~30 % below baseline —
+/// but never a collapse (≈ 0.24 > X), the same "bites but no total collapse" shape as A15. Whether
+/// the thinned floor costs actual RESTORABILITY is NOT measured here (the B1 proxy caveat). `n = 100`,
+/// exit @ tick 60, horizon 130, 5 seeds.
+pub fn a10_provider_exit() -> Scenario {
+    Scenario {
+        id: ScenarioId("a10_provider_exit"),
+        about: "honest world + a PROVIDER (top-load holder set) mass-exits @ tick 60 — do survivors keep the placed floor filled? floor-fill PROXY (restorability not measured); no-collapse board bar (A10 provider-exit)",
+        world: WorldParams {
+            n_nodes: 100,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: Vec::new(),
+        // The top A10_PROVIDER_FRAC most-loaded holders exit as a correlated set at the mature tick.
+        events: vec![(
+            A10_EXIT_TICK,
+            Event::ProviderExit {
+                sel: NodeSel::TopHolders(A10_PROVIDER_FRAC),
+            },
+        )],
+        horizon: A10_HORIZON,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![MetricId::InvariantBoard],
+        verdicts: a10_provider_exit_invariants(),
+        fast: false,
+    }
+}
+
+/// The `a10_provider_exit` board (`4r_a10_spec.md` §3): the two structural rows + the
+/// INV-PROVIDER-EXIT-FLOOR no-collapse bar.
+fn a10_provider_exit_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-PROVIDER-EXIT-FLOOR: a NO-COLLAPSE bar (review W1 — X sits below the whole measured
+        // sweep, so this row proves "the exit never collapses floor-fill below X", NOT "absorbed";
+        // the absorb-vs-degrade discrimination is the tests.rs sweep, per the A15 FLOOR idiom). At
+        // the frozen A10_PROVIDER_FRAC the surviving capacity ≫ n_symbols = 5 and post-exit
+        // floor-fill clears X. GreaterThan, power-gated (spec §10 п.16): power < 2 ⇒ INCONCLUSIVE,
+        // itself a finding. A FAIL (floor-fill collapses even at this modest fraction) is the
+        // fragility / repair-latency finding — reported with the sweep curve, NOT tuned away.
+        Invariant {
+            id: "INV-PROVIDER-EXIT-FLOOR",
+            spec: InvariantSpec::ProviderExitFloor {
+                dir: Direction::GreaterThan,
+            },
+            threshold: A10_FLOOR_X,
         },
     ]
 }

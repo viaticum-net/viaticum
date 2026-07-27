@@ -224,6 +224,67 @@ pub fn newcomer_floor_durability(world: &World, join_cutoff: u64, floor: usize) 
     }
 }
 
+/// World-v3 phase-3 (A10 provider-exit) god-view EVALUATOR read (never a decision input,
+/// `4r_a10_spec.md` §2): the network-wide non-cream FLOOR-FILL. Among ALL PRESENT owners, the
+/// MEAN over owners of that owner's floor-fill = the mean over its FLOOR-EVER-MET own blocks
+/// of `min(alive non-cream holders / floor, 1.0)` — the fraction of the `floor = n_symbols` floor
+/// the block currently keeps filled. An owner with no floor-ever-met block is SKIPPED (no
+/// denominator); `NaN` if no present owner has a floor-ever-met block (or `floor == 0`).
+///
+/// **This is a conservative floor-fill PROXY, NOT a decodability/restorability measure** (A10 review
+/// B1): it counts non-cream holders only, while RaptorQ decodes from ANY ≥ k_eff symbols — cream
+/// included — so a block below the non-cream floor can still be fully restorable (the house
+/// `restore::RestoreTruth` measures that; a restore-truth cross-check for A10 is DEFERRED together
+/// with the sim-unification decision). It answers "how much of the PLACED floor do holders retain",
+/// not "did data survive". Restricting to `floor_ever_met` isolates "data that WAS at floor staying
+/// filled" from young blocks still placing their first backup, so the control at provider_frac = 0
+/// reads the steady-state retention (not a fill transient). NOTE the SCALE: under the eviction
+/// economy a floor-met block settles near k_eff non-cream holders (≈ 1.7 of the 5-symbol floor), so
+/// the steady-state baseline is ≈ 0.34 — NOT ≈ 1; a post-exit reading AT the baseline means the
+/// survivors re-took the orphaned floor, below it means floor-fill thinned. Pure god-view — the
+/// per-block "alive non-cream holders" of [`collect_metrics`]'s `durability`, normalised to the
+/// floor, clipped, and averaged per-owner then over present owners.
+pub fn overall_floor_durability(world: &World, floor: usize) -> f64 {
+    let n = world.nodes.len();
+    if floor == 0 {
+        return f64::NAN;
+    }
+    let mut owner_sum = 0.0f64;
+    let mut owner_cnt = 0usize;
+    for o in 0..n {
+        if !world.nodes[o].present {
+            continue;
+        }
+        let mut block_sum = 0.0f64;
+        let mut met = 0usize;
+        for b in &world.nodes[o].own_blocks {
+            if !b.floor_ever_met {
+                continue;
+            }
+            met += 1;
+            let live = (0..n)
+                .filter(|&h| {
+                    world.nodes[h].present
+                        && world.nodes[h]
+                            .holdings
+                            .iter()
+                            .any(|s| s.alive && !s.cream && s.owner == o && s.block == b.id)
+                })
+                .count();
+            block_sum += (live as f64 / floor as f64).min(1.0);
+        }
+        if met > 0 {
+            owner_sum += block_sum / met as f64;
+            owner_cnt += 1;
+        }
+    }
+    if owner_cnt > 0 {
+        owner_sum / owner_cnt as f64
+    } else {
+        f64::NAN
+    }
+}
+
 /// World-v3 phase-3 (A15) CARTEL-PAYS read (spec §4, SECONDARY): the mean outbound-service
 /// integral `served_out = Σ_h served[node][h]` (gb·days the node GAVE others) for the CARTEL
 /// nodes vs the NON-cartel INCUMBENTS (present nodes that joined by `join_cutoff` and are not in

@@ -273,8 +273,18 @@ pub enum Event {
     },
     /// Kill an entire subnet at once (axis 5).
     KillSubnet(u32),
-    /// A provider's whole subnet exits after it has accumulated `after_share` (axis 5).
-    ProviderExit { subnet: u32, after_share: f64 },
+    /// A large "PROVIDER" — a correlated set of top-load holders selected by `sel` (typically
+    /// [`NodeSel::TopHolders`]; in honest_v2 the loads are near-flat, so this is the largest
+    /// correlated holder set, not a dramatic concentration) — mass-EXITS in ONE tick (A10). Every
+    /// selected node departs with the SAME per-node physics as `churn` / the A16 co-loss
+    /// (`sim_dynamic::engine::depart_node`): present = false, a SILENT loss queued to each present
+    /// owner whose data it carried, its held symbols killed. It is a PERMANENT exit — unlike an
+    /// [`Event::Disaster`] victim, the provider is NOT restore-tracked and NOT revived; the owners
+    /// repair the orphaned floor themselves onto the survivors. The post-exit question (evaluator:
+    /// `metrics::overall_floor_durability` — a non-cream floor-FILL proxy, NOT decodability; see its
+    /// doc) is whether the survivors' re-placement keeps the placed floor filled or the exit leaves
+    /// floor-fill depressed.
+    ProviderExit { sel: NodeSel },
     /// A geo region goes down (axis 5).
     GeoCatastrophe(u16),
     /// A burst of `count` joiners arrives (axis 6).
