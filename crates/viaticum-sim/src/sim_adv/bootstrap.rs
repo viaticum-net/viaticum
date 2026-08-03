@@ -5,7 +5,7 @@
 //! This is a pure GOD-VIEW evaluator over a FINISHED world — NO new physics. It reads the
 //! engine's already-existing newcomer-entry trace ([`World::first_earned_g`] /
 //! [`World::first_own_accept`] / [`Node::joined_tick`]) plus each newcomer's first block's
-//! [`OwnBlock::floor_ever_met`] and its horizon floor-holder count, restricted to the
+//! [`OwnBlock::target_ever_met`] and its horizon floor-holder count, restricted to the
 //! LATE-joining cohort (nodes that entered an ALREADY-established world — the real
 //! "newcomer into a running network", not a t=0 bootstrap node).
 //!
@@ -29,8 +29,9 @@ pub struct BootstrapStats {
     /// `joined_tick >= join_threshold`.
     pub n_newcomers: usize,
     /// Fraction of newcomers whose FIRST own block (smallest block id — eligible the moment
-    /// they joined) EVER reached its `n_symbols` floor ([`OwnBlock::floor_ever_met`]). The
-    /// "did the first backup ever succeed" headline.
+    /// they joined) EVER reached its reliability target `R̂ ≥ r_target`
+    /// ([`OwnBlock::target_ever_met`]; SIM-UNIFICATION re-based this from the old
+    /// `n_symbols` floor count). The "did the first backup ever succeed" headline.
     pub first_block_floor_ever: f64,
     /// Mean ticks from join to first EARNED reciprocity (`g_ho > 0` with some peer — it served
     /// someone and passed PoS). The "sing for your supper" latency. `NaN` if none ever earned.
@@ -123,10 +124,10 @@ pub fn collect_bootstrap(world: &World, join_threshold: u64) -> BootstrapStats {
     for &i in &newcomers {
         let joined = world.nodes[i].joined_tick;
         // The FIRST block = the smallest block id (eligible the moment the node joined). A
-        // late-joiner that never repaired still carries it (floor_ever_met persists on it).
+        // late-joiner that never repaired still carries it (target_ever_met persists on it).
         let first_block = world.nodes[i].own_blocks.iter().min_by_key(|b| b.id);
         if let Some(b) = first_block {
-            if b.floor_ever_met {
+            if b.target_ever_met {
                 floor_ever += 1;
             }
             let held = first_block_alive_floor_holders(world, i, b.id);

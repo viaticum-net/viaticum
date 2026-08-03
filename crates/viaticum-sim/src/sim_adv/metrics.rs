@@ -40,13 +40,20 @@ pub struct MetricSet {
     /// nodes (design §3.2). Indexed by [`Archetype::ALL`] position; `NaN` if the
     /// archetype gave nothing (served_out == 0).
     pub extraction_roi: [f64; 6],
+    /// SIM-UNIFICATION §4: the DECODABILITY fraction — of the target-ever-met blocks of
+    /// present owners, the share that still holds ≥ `k_eff` alive symbols, CREAM INCLUDED
+    /// ([`block_decodable_fraction`]). The honest restorability cross-check to the non-cream
+    /// floor-fill proxy. `NaN` when no present owner has a target-ever-met block.
+    pub decodable_fraction: f64,
+    /// SIM-UNIFICATION §4: the TAIL — how many target-ever-met blocks of present owners are
+    /// BELOW `k_eff` alive symbols (cream included), i.e. currently UNDECODABLE.
+    pub undecodable_blocks: usize,
 }
 
 /// Collect every 0.1 metric from a run's final god-view world. Pure read — no mutation,
-/// no RNG, no feedback into any decision (evaluator discipline). `_params` is threaded so
-/// a later tranche's metrics (restore window, k_eff cuts) can read the dials without a
-/// signature change; 0.1's readers are dial-free.
-pub fn collect_metrics(world: &World, _params: &DynParams) -> MetricSet {
+/// no RNG, no feedback into any decision (evaluator discipline). `params` is read for the
+/// dial-dependent cuts (SIM-UNIFICATION: `k_eff` for the decodability read).
+pub fn collect_metrics(world: &World, params: &DynParams) -> MetricSet {
     let n = world.nodes.len();
 
     // --- share A>0, mean D, mean σ over alive pairs on present holders (6a/6f/6g) ---
@@ -137,6 +144,9 @@ pub fn collect_metrics(world: &World, _params: &DynParams) -> MetricSet {
         }
     }
 
+    // --- SIM-UNIFICATION §4: decodability (alive TOTAL incl. cream ≥ k_eff) ---
+    let decodable = block_decodable_fraction(world, params.k_eff);
+
     MetricSet {
         alive_symbols,
         present_nodes,
@@ -148,7 +158,91 @@ pub fn collect_metrics(world: &World, _params: &DynParams) -> MetricSet {
         mean_sigma,
         durability,
         extraction_roi,
+        decodable_fraction: decodable.fraction,
+        undecodable_blocks: decodable.below_k_eff,
     }
+}
+
+/// SIM-UNIFICATION §4 (closes the A10 review-B1 gap): block DECODABILITY — the god-view
+/// EVALUATOR read of "could the owner still reconstruct this block", as opposed to "how much
+/// of the placed floor do holders retain".
+///
+/// Over the TARGET-EVER-MET own blocks of PRESENT owners (the "data that was once durable"
+/// denominator every other evaluator read uses), counts the blocks whose TOTAL alive symbols
+/// on present holders reach `k_eff` — **CREAM INCLUDED**: RaptorQ decodes from ANY `k_eff`
+/// symbols, so the floor/cream label (a placement-budget distinction) is irrelevant to
+/// restorability. Returns the fraction AND the TAIL count of blocks below `k_eff` (one scan,
+/// so the two can never drift apart).
+///
+/// Relation to the other reads: [`overall_floor_durability`] is a conservative non-cream
+/// FILL proxy (its scale is "how full is the 5-symbol floor", ≈ 0.34 at steady state);
+/// `restore::RestoreTruth` measures collectability in a post-Disaster window under uptime +
+/// bandwidth. THIS one is the cheap end-of-run "is there a silent undecodable tail" read
+/// that needs no disaster. Pure god-view; never an input to any decision.
+///
+/// `to_restore` (source-less disaster-victim) blocks are deliberately INCLUDED — for a DR
+/// read "can it still be reconstructed from holders" is exactly the question for them; do
+/// not "fix" this by filtering them out.
+///
+/// `k_eff == 0` ⇒ every block is vacuously decodable (fraction 1.0, no tail).
+pub fn block_decodable_fraction(world: &World, k_eff: usize) -> Decodability {
+    let n = world.nodes.len();
+    let mut blocks = 0usize;
+    let mut decodable = 0usize;
+    for o in 0..n {
+        if !world.nodes[o].present {
+            continue;
+        }
+        for b in &world.nodes[o].own_blocks {
+            if !b.target_ever_met {
+                continue;
+            }
+            blocks += 1;
+            if alive_symbols(world, o, b.id) >= k_eff {
+                decodable += 1;
+            }
+        }
+    }
+    Decodability {
+        fraction: if blocks > 0 {
+            decodable as f64 / blocks as f64
+        } else {
+            f64::NAN
+        },
+        below_k_eff: blocks - decodable,
+        blocks,
+    }
+}
+
+/// The alive symbols of ONE block on PRESENT holders — **CREAM INCLUDED**, because erasure
+/// decode does not know the floor/cream label. THE decodability primitive: every "is this
+/// block still reconstructible" read ([`block_decodable_fraction`],
+/// [`newcomer_decodable_fraction`]) counts through here, so the two can never drift apart.
+/// (The non-cream FILL reads — [`overall_floor_durability`] and `collect_metrics`'s
+/// `durability` — deliberately do NOT: they measure a different thing.)
+fn alive_symbols(world: &World, owner: usize, block_id: usize) -> usize {
+    (0..world.nodes.len())
+        .filter(|&h| {
+            world.nodes[h].present
+                && world.nodes[h]
+                    .holdings
+                    .iter()
+                    .any(|s| s.alive && s.owner == owner && s.block == block_id)
+        })
+        .count()
+}
+
+/// The [`block_decodable_fraction`] read: the decodable FRACTION plus the size of the
+/// undecodable TAIL (and the denominator both are taken over).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Decodability {
+    /// Fraction of target-ever-met blocks (present owners) with ≥ `k_eff` alive symbols,
+    /// cream included. `NaN` when the denominator is empty.
+    pub fraction: f64,
+    /// How many of those blocks are BELOW `k_eff` alive symbols — currently undecodable.
+    pub below_k_eff: usize,
+    /// The denominator: target-ever-met blocks of present owners.
+    pub blocks: usize,
 }
 
 /// Bit-exact metric equality (used by the determinism board row). Uses `f64::to_bits`
@@ -172,19 +266,44 @@ pub(crate) fn bit_eq(a: &MetricSet, b: &MetricSet) -> bool {
             .iter()
             .zip(&b.extraction_roi)
             .all(|(x, y)| x.to_bits() == y.to_bits())
+        && a.decodable_fraction.to_bits() == b.decodable_fraction.to_bits()
+        && a.undecodable_blocks == b.undecodable_blocks
 }
 
 /// World-v3 phase-3 (A15) god-view EVALUATOR read (never a decision input): the NEWCOMER
-/// floor-durability. Among PRESENT nodes that joined strictly AFTER `join_cutoff` — the genuine
-/// newcomers arriving into an already-established network (the inflow pool tail; the bootstrap
-/// cohort all joins by `T_join ≤ cutoff`, so `joined_tick > cutoff` cleanly isolates them) — the
-/// MEAN over nodes of `(floor-met blocks that CURRENTLY still hold ≥ floor non-cream symbols) /
-/// (floor-met blocks)`. A newcomer with no floor-met block yet is SKIPPED (no denominator);
-/// `NaN` if no newcomer has a floor-met block. The A15 enclosure headline: did newcomers' data,
-/// once it reached durable, STAY durable despite the incumbent cartel? (The per-archetype floor
-/// durability of [`collect_metrics`], restricted to the post-cutoff arrivals and expressed as a
-/// per-block "still ≥ floor" fraction.)
-pub fn newcomer_floor_durability(world: &World, join_cutoff: u64, floor: usize) -> f64 {
+/// DECODABLE fraction. Among PRESENT nodes that joined strictly AFTER `join_cutoff` — the
+/// genuine newcomers arriving into an already-established network (the inflow pool tail; the
+/// bootstrap cohort all joins by `T_join ≤ cutoff`, so `joined_tick > cutoff` cleanly isolates
+/// them) — the MEAN over nodes of `(TARGET-ever-met blocks that are CURRENTLY DECODABLE) /
+/// (target-ever-met blocks)`, where decodable = `alive symbols ≥ k_eff`, **CREAM INCLUDED**
+/// (the shared `alive_symbols` primitive). A newcomer with no target-ever-met block yet is
+/// SKIPPED (no denominator); `NaN` if no newcomer has one. The A15 enclosure headline: did
+/// newcomers' data, once it reached durable, STAY recoverable despite the incumbent cartel?
+///
+/// **Ф-2 RE-BASE (sim-unification follow-up, review STOP-2).** Both halves of this metric used
+/// to be COUNTS against the `n_symbols = 5` placement floor. The R̂ loop stops widening the
+/// moment `R̂ ≥ r_target`, so post-unification a healthy block routinely sits at 3-4 holders and
+/// the old numerator ("still ≥ 5 non-cream holders") went nearly always false — the measured
+/// A15 headline collapsed 0.53 → 0.12 with NOTHING having happened to newcomers' data. The
+/// numerator is therefore re-based on the question the invariant actually asks — *can the
+/// newcomer still get its data back* — i.e. DECODABILITY, the same cut
+/// [`block_decodable_fraction`] uses network-wide. Deliberately NOT re-based on the new
+/// placement width (`min_width`): re-importing a count into a metric that a count just burned
+/// would buy the same fragility again. The DENOMINATOR (`target_ever_met`) is the tranche's
+/// "data that was once durable" set, unchanged here.
+///
+/// Consequence for reading the number: its SCALE changed (decodability sits near 1 in a healthy
+/// world, the floor-fill proxy near 0.34) — the frozen `A15_FLOOR_X` was re-derived against the
+/// re-based baseline, and pre-Ф-2 A15 numbers are NOT comparable to post-Ф-2 ones.
+///
+/// ⚠ **Aggregation differs from [`block_decodable_fraction`] (review NOTE-3):** "one physics"
+/// holds for the PREDICATE (both go through `alive_symbols`), not for the aggregation. This is a
+/// MEAN OVER NODES of per-node fractions — a newcomer with one block weighs as much as one with
+/// three — while `block_decodable_fraction` POOLS blocks. The node-mean is what produces the
+/// coarse 1/2, 2/3, 3/4 granularity that dominates this metric's per-seed σ (0.11-0.24); it is
+/// pre-existing structure, but post-Ф-2 that noise is larger than the enclosure effect it would
+/// have to resolve (see [`crate::sim_adv::registry::a15_enclosure`]).
+pub fn newcomer_decodable_fraction(world: &World, join_cutoff: u64, k_eff: usize) -> f64 {
     let n = world.nodes.len();
     let mut ratio_sum = 0.0f64;
     let mut counted = 0usize;
@@ -192,28 +311,19 @@ pub fn newcomer_floor_durability(world: &World, join_cutoff: u64, floor: usize) 
         if !world.nodes[o].present || world.nodes[o].joined_tick <= join_cutoff {
             continue;
         }
-        let mut met = 0usize; // blocks that ever met floor
-        let mut still = 0usize; // ... whose CURRENT non-cream holder count is still ≥ floor
+        let mut met = 0usize; // blocks that ever reached the reliability target
+        let mut decodable = 0usize; // ... that CURRENTLY still hold ≥ k_eff alive symbols
         for b in &world.nodes[o].own_blocks {
-            if !b.floor_ever_met {
+            if !b.target_ever_met {
                 continue;
             }
             met += 1;
-            let live = (0..n)
-                .filter(|&h| {
-                    world.nodes[h].present
-                        && world.nodes[h]
-                            .holdings
-                            .iter()
-                            .any(|s| s.alive && !s.cream && s.owner == o && s.block == b.id)
-                })
-                .count();
-            if live >= floor {
-                still += 1;
+            if alive_symbols(world, o, b.id) >= k_eff {
+                decodable += 1;
             }
         }
         if met > 0 {
-            ratio_sum += still as f64 / met as f64;
+            ratio_sum += decodable as f64 / met as f64;
             counted += 1;
         }
     }
@@ -233,10 +343,12 @@ pub fn newcomer_floor_durability(world: &World, join_cutoff: u64, floor: usize) 
 ///
 /// **This is a conservative floor-fill PROXY, NOT a decodability/restorability measure** (A10 review
 /// B1): it counts non-cream holders only, while RaptorQ decodes from ANY ≥ k_eff symbols — cream
-/// included — so a block below the non-cream floor can still be fully restorable (the house
-/// `restore::RestoreTruth` measures that; a restore-truth cross-check for A10 is DEFERRED together
-/// with the sim-unification decision). It answers "how much of the PLACED floor do holders retain",
-/// not "did data survive". Restricting to `floor_ever_met` isolates "data that WAS at floor staying
+/// included — so a block below the non-cream floor can still be fully restorable. The B1 gap is
+/// CLOSED by [`block_decodable_fraction`] (SIM-UNIFICATION §4), which reads exactly that
+/// cream-inclusive decodability over the same denominator and is printed next to this proxy in the
+/// provider-exit report section; `restore::RestoreTruth` remains the full post-Disaster measure.
+/// It answers "how much of the PLACED floor do holders retain",
+/// not "did data survive". Restricting to `target_ever_met` isolates "data that WAS at floor staying
 /// filled" from young blocks still placing their first backup, so the control at provider_frac = 0
 /// reads the steady-state retention (not a fill transient). NOTE the SCALE: under the eviction
 /// economy a floor-met block settles near k_eff non-cream holders (≈ 1.7 of the 5-symbol floor), so
@@ -258,7 +370,7 @@ pub fn overall_floor_durability(world: &World, floor: usize) -> f64 {
         let mut block_sum = 0.0f64;
         let mut met = 0usize;
         for b in &world.nodes[o].own_blocks {
-            if !b.floor_ever_met {
+            if !b.target_ever_met {
                 continue;
             }
             met += 1;

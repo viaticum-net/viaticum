@@ -143,13 +143,15 @@ pub enum InvariantSpec {
         /// The pass direction.
         dir: Direction,
     },
-    /// A phase-3 A15 NEWCOMER floor-durability scalar → mean±σ vs threshold, power<2 gate. Reads
-    /// [`RunResult::per_seed_newcomer`] DIRECTLY (the durability fraction IS the per-seed scalar);
+    /// A phase-3 A15 NEWCOMER DECODABLE-fraction scalar → mean±σ vs threshold, power<2 gate. Reads
+    /// [`RunResult::per_seed_newcomer`] DIRECTLY (the decodable fraction IS the per-seed scalar);
     /// a non-enclosure seed contributes `NaN` (skipped). Used by INV-ENCLOSURE-FLOOR (at the
-    /// calibrated cartel fraction, where the non-cartel capacity still covers n_symbols, the
-    /// newcomer floor-durability clears a frozen floor X).
+    /// calibrated cartel fraction, where the non-cartel capacity still covers the placement width,
+    /// the newcomers' blocks stay DECODABLE — ≥ k_eff alive symbols — above a frozen floor X).
+    /// Ф-2: re-based off the old non-cream `≥ n_symbols` fill count, which the R̂ placement loop
+    /// turned into a near-constant false (see `metrics::newcomer_decodable_fraction`).
     EnclosureFloor {
-        /// The pass direction (GreaterThan — durability above the floor X).
+        /// The pass direction (GreaterThan — decodable fraction above the floor X).
         dir: Direction,
     },
     /// A phase-3 A7 SYBIL-farm EARNED HONEST RECIPROCITY scalar → mean±σ vs threshold, power<2 gate.
@@ -423,13 +425,13 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             Some(None) => sr.pop.is_none(),
                             None => true,
                         };
-                        // The A15 newcomer floor-durability + CARTEL-PAYS ratio must re-run
+                        // The A15 newcomer DECODABLE fraction + CARTEL-PAYS ratio must re-run
                         // bit-identical too — they feed the INV-ENCLOSURE-FLOOR verdict + report
                         // (a deterministically-produced NaN compares equal to itself via to_bits).
                         let newcomer_eq = result
                             .per_seed_newcomer
                             .first()
-                            .map(|d0| d0.to_bits() == sr.newcomer_durability.to_bits())
+                            .map(|d0| d0.to_bits() == sr.newcomer_decodable.to_bits())
                             .unwrap_or(false);
                         let cartel_eq = result
                             .per_seed_cartel_earn
@@ -628,7 +630,7 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                 }
             }
             InvariantSpec::EnclosureFloor { dir } => {
-                // The per-seed newcomer floor-durability IS the scalar (read directly).
+                // The per-seed newcomer DECODABLE fraction IS the scalar (read directly).
                 let (mean, sigma) = mean_sigma(&result.per_seed_newcomer);
                 let sigma_r = if sigma.is_finite() { sigma } else { 0.0 };
                 let (kind, power) = decide(mean, sigma, inv.threshold, *dir);
@@ -639,7 +641,7 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                     sigma: sigma_r,
                     threshold: inv.threshold,
                     power,
-                    note: "enclosure: newcomer floor-durability at the calibrated cartel fraction",
+                    note: "enclosure: newcomer decodable fraction at the calibrated cartel fraction",
                 }
             }
             InvariantSpec::SybilCreditLimit { dir } => {

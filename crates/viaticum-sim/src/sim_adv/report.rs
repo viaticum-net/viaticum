@@ -80,6 +80,13 @@ pub fn format_report(scenario: &Scenario, result: &RunResult, verdicts: &[Verdic
     let _ = writeln!(o, "  mean loyalty D       {:>10.4} ± {:.4}", m, s);
     let (m, s) = col(result, |x| x.mean_sigma);
     let _ = writeln!(o, "  mean suspicion σ     {:>10.4} ± {:.4}", m, s);
+    // SIM-UNIFICATION §4: decodability of the target-ever-met blocks (cream INCLUDED) — the
+    // restorability cross-check to the non-cream floor-fill proxy, plus the size of the
+    // silent undecodable tail.
+    let (m, s) = col(result, |x| x.decodable_fraction);
+    let _ = writeln!(o, "  decodable (≥k_eff)   {:>10.4} ± {:.4}", m, s);
+    let (m, s) = col(result, |x| x.undecodable_blocks as f64);
+    let _ = writeln!(o, "  undecodable tail     {:>10.2} ± {:.2}  blocks", m, s);
     let _ = writeln!(o);
 
     // --- per-archetype durability + extraction ROI ---
@@ -142,6 +149,11 @@ pub fn format_report(scenario: &Scenario, result: &RunResult, verdicts: &[Verdic
 
     // --- hetero-v2 (D1): per-class placement + the L-footprint curve ---
     if let Some(section) = format_hetero(result) {
+        o.push_str(&section);
+    }
+
+    // --- provider-exit (A10): floor-fill proxy + the SIM-UNIFICATION decodability cross-check ---
+    if let Some(section) = format_provider_exit(result) {
         o.push_str(&section);
     }
 
@@ -831,6 +843,54 @@ fn format_hetero(result: &RunResult) -> Option<String> {
             lfull,
         );
     }
+    let _ = writeln!(o);
+    Some(o)
+}
+
+/// Render the PROVIDER-EXIT (A10) section: the post-exit non-cream floor-fill PROXY next to the
+/// SIM-UNIFICATION §4 restorability CROSS-CHECK (decodable fraction + undecodable tail, cream
+/// included) — the two answer different questions and the A10 review (B1) asked for both side by
+/// side, since a block below the placed floor can still be decodable. `None` for a scenario with
+/// no ProviderExit event (every other report is unchanged).
+fn format_provider_exit(result: &RunResult) -> Option<String> {
+    if result
+        .per_seed_overall_durability
+        .iter()
+        .all(|d| d.is_nan())
+    {
+        return None;
+    }
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "-- provider-exit (A10): floor-fill proxy vs decodability cross-check (mean ± σ) --"
+    );
+    let (m, s) = mean_sigma(&result.per_seed_overall_durability);
+    let _ = writeln!(
+        o,
+        "  post-exit floor-fill (non-cream / n_symbols, PROXY)   {:>8.4} ± {:.4}",
+        m, s
+    );
+    let (m, s) = col(result, |x| x.decodable_fraction);
+    let _ = writeln!(
+        o,
+        "  decodable blocks (alive ≥ k_eff, cream INCLUDED)      {:>8.4} ± {:.4}",
+        m, s
+    );
+    let (m, s) = col(result, |x| x.undecodable_blocks as f64);
+    let _ = writeln!(
+        o,
+        "  undecodable tail (blocks < k_eff)                     {:>8.2} ± {:.2}",
+        m, s
+    );
+    let _ = writeln!(
+        o,
+        "  (floor-fill answers 'how much of the PLACED floor holders retain'; decodability answers"
+    );
+    let _ = writeln!(
+        o,
+        "   'could the owner still reconstruct it' — the honest restorability read.)"
+    );
     let _ = writeln!(o);
     Some(o)
 }

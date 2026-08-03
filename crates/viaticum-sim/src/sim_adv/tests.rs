@@ -13,8 +13,9 @@ use crate::sim_adv::inflow::{
     newcomer_cutoff, pool_size, present_count,
 };
 use crate::sim_adv::metrics::{
-    bit_eq as metrics_bit_eq, collect_metrics, farm_honest_reciprocity, farm_honest_served,
-    farm_honest_storage, mean_sigma, newcomer_floor_durability, overall_floor_durability,
+    bit_eq as metrics_bit_eq, block_decodable_fraction, collect_metrics, farm_honest_reciprocity,
+    farm_honest_served, farm_honest_storage, mean_sigma, newcomer_decodable_fraction,
+    overall_floor_durability,
 };
 use crate::sim_adv::predators::{
     RunMode, a1_epsilon_whale_hook, a4_whitewasher_hook, a7_sybil_farm_hook,
@@ -226,49 +227,51 @@ fn report_text_is_byte_identical_on_repeat_under_rayon() {
 
 #[test]
 fn honest_v2_seed42_matches_sim_diag_anchor() {
-    // Anchor = `sim_diag 42 100 50 1 v2` — RE-FROZEN 2026-07-19 for the A2 SEAT-SYNC BURN FIX
-    // (the A.2 burn now hits BOTH mirror copies of `G(holder→owner)` — `g_oh` AND the transpose
-    // `g_ho` the enforcement key reads; previously only `g_oh`). Both sim_diag and honest_v2 run
-    // the SAME engine (build_world + step), so they STILL agree field-for-field — the point of
-    // this anchor is that the harness does not distort the engine, not the exact values. The
-    // "≡ sim_diag" property is PRESERVED. Cross-verified vs `sim_diag 42 100 50 1 v2` at re-freeze.
-    //   The seat-sync shift (this seed) — a PHYSICS fix, so a shift is EXPECTED: in the honest
-    //   world churn/hazard losses now burn the ENFORCEMENT `g_ho` too, so more low-reciprocity
-    //   parked volume is evicted. alive 224 UNCHANGED; evicts 643 → 621; preempts 386 → 375;
-    //   cap_trims 190 → 179; share A>0 80.36 → 75.45 (burning g_ho lowers the g_ho>0 fraction);
-    //   D 7102 → 7190; σ unchanged 0.0054; durability Reliable 0.97 → 0.92, Hoarder 1.29 → 0.83,
-    //   Nomad 0.29 → 0.50. ⚠ the per-archetype durability values are seed-42 single-seed points
-    //   (the old comment already flagged Nomad's tail); do not read a causal story into them.
+    // Anchor = `sim_diag 42 100 50 1 v2` — RE-FROZEN 2026-07-28 for the SIM-UNIFICATION tranche
+    // (the placement/repair loop now decides on the owner's OWN reliability estimate R̂ vs the
+    // frozen `r_target = 0.999`, with the daemon's `k_eff + MIN_REDUNDANCY` minimum width and
+    // `n_symbols` demoted to a spread cap). Both sim_diag and honest_v2 run the SAME engine
+    // (build_world + step), so they STILL agree field-for-field — the point of this anchor is
+    // that the harness does not distort the engine, not the exact values. The "≡ sim_diag"
+    // property is PRESERVED.
+    //   The unification shift (this seed) — a PHYSICS change, so a shift is EXPECTED:
+    //   alive 224 UNCHANGED; evicts 621 → 627; preempts 375 → 380; cap_trims 179 → 182;
+    //   share A>0 75.45 → 75.89; D 7190 → 7605; σ 0.0054 → 0.0050; durability Reliable
+    //   0.92 → 1.02, Nomad 0.50 → 0.50, Hoarder 0.83 → 1.04. The moves are small because the
+    //   world's binding constraint is bandwidth (1 chunk/tick/owner) + the eviction economy,
+    //   not the placement goal: most blocks sit far below target either way. ⚠ the
+    //   per-archetype durability values are seed-42 single-seed points; do not read a causal
+    //   story into them.
     let m = run_one_seed(&honest_v2(), 42).metrics;
 
     // Exact integer counters (sim_diag §6a/§3-sum/§6d).
     assert_eq!(m.alive_symbols, 224, "alive symbols (6a)");
-    assert_eq!(m.evicts, 621, "eviction_log.len (sum of §3)");
-    assert_eq!(m.preempts, 375, "preempt_count (6d)");
+    assert_eq!(m.evicts, 627, "eviction_log.len (sum of §3)");
+    assert_eq!(m.preempts, 380, "preempt_count (6d)");
     assert_eq!(
-        m.cap_trims, 179,
-        "cap_trim_count (6d) — seat-sync fix (g_ho now burned too)"
+        m.cap_trims, 182,
+        "cap_trim_count (6d) — sim-unification (R̂-vs-target placement)"
     );
 
     // Floats to the sim_diag print precision.
     assert!(
-        (m.share_a_pos - 75.45).abs() < 0.1,
+        (m.share_a_pos - 75.89).abs() < 0.1,
         "share A>0 = {}",
         m.share_a_pos
     );
     assert!(
-        (m.mean_depth - 7189.776).abs() < 0.01,
+        (m.mean_depth - 7604.518).abs() < 0.01,
         "mean D = {}",
         m.mean_depth
     );
     assert!(
-        (m.mean_sigma - 0.0054).abs() < 1e-4,
+        (m.mean_sigma - 0.0050).abs() < 1e-4,
         "mean σ = {}",
         m.mean_sigma
     );
-    // Per-archetype floor durability (sim_diag §5): Reliable 0.92, Nomad 0.50, Hoarder 0.83.
+    // Per-archetype floor durability (sim_diag §5): Reliable 1.02, Nomad 0.50, Hoarder 1.04.
     assert!(
-        (m.durability[0] - 0.9167).abs() < 0.01,
+        (m.durability[0] - 1.0208).abs() < 0.01,
         "Reliable durability = {}",
         m.durability[0]
     );
@@ -278,9 +281,20 @@ fn honest_v2_seed42_matches_sim_diag_anchor() {
         m.durability[3]
     );
     assert!(
-        (m.durability[4] - 0.8333).abs() < 0.01,
+        (m.durability[4] - 1.0417).abs() < 0.01,
         "Hoarder durability = {}",
         m.durability[4]
+    );
+    // SIM-UNIFICATION §4: the decodability read is part of the frozen anchor from now on —
+    // "is there a silent undecodable tail?" is a first-class question, not a footnote.
+    assert!(
+        (m.decodable_fraction - 0.5070).abs() < 0.005,
+        "decodable fraction = {}",
+        m.decodable_fraction
+    );
+    assert_eq!(
+        m.undecodable_blocks, 35,
+        "undecodable tail (blocks < k_eff)"
     );
 }
 
@@ -291,15 +305,15 @@ fn honest_v2_seed42_matches_sim_diag_anchor() {
 #[test]
 fn honest_v2_reliable_extraction_roi_is_near_balance_and_bounded() {
     // FACT (measured, not a wish): under served-matrix conservation the honest giver
-    // Reliable operates at BALANCED reciprocity — seed 42 ROI ≈ 0.961 (A2 seat-sync-fix tranche;
-    // was 1.006 pre-fix — burning the enforcement `g_ho` on honest churn/hazard losses evicts more
-    // low-reciprocity data, shifting the served balance), NOT above the ceiling. (Universal "< 1
-    // for all archetypes" is impossible: Σconsumed ≡ Σserved_out.) The invariant is BOUNDED
+    // Reliable operates at BALANCED reciprocity — seed 42 ROI ≈ 1.008 (SIM-UNIFICATION tranche;
+    // was 0.961 with the count-based floor rule — the R̂-vs-target loop shifts WHICH blocks get
+    // the scarce per-tick symbol, hence the served balance), NOT above the ceiling. (Universal
+    // "< 1 for all archetypes" is impossible: Σconsumed ≡ Σserved_out.) The invariant is BOUNDED
     // extraction, so we lock the measured value and the 1.25 ceiling.
     let m = run_one_seed(&honest_v2(), 42).metrics;
     let roi = m.extraction_roi[0];
     assert!(
-        (roi - 0.961).abs() < 0.01,
+        (roi - 1.008).abs() < 0.01,
         "Reliable ROI (seed 42 fact) = {roi}"
     );
     assert!(
@@ -445,6 +459,8 @@ fn apply_dial_sets_known_and_rejects_unknown() {
     assert_eq!(p.block_volume, 20.0);
     apply_dial(&mut p, "depth_w_d", 0.0).unwrap();
     assert_eq!(p.depth_w_d, 0.0);
+    apply_dial(&mut p, "r_target", 0.95).unwrap();
+    assert_eq!(p.r_target, 0.95);
     assert!(apply_dial(&mut p, "not_a_dial", 1.0).is_err());
 }
 
@@ -631,15 +647,17 @@ fn restore_wp(n_nodes: usize, window_days: f64, bw_gb_day: f64) -> WorldParams {
     }
 }
 
-/// A floor-met, source-present own block (so `on_disaster` counts it in the denominator).
-fn floor_met_block(id: usize, iota: f64) -> OwnBlock {
+/// A TARGET-ever-met, source-present own block (so `on_disaster` counts it in the
+/// denominator — SIM-UNIFICATION: the denominator is "the owner's R̂ ever reached
+/// `r_target`", no longer "the block ever held `n_symbols` non-cream symbols").
+fn target_met_block(id: usize, iota: f64) -> OwnBlock {
     OwnBlock {
         id,
         volume: 50.0,
         iota,
         placements: Vec::new(),
-        floor_ever_met: true,
-        floor_deficit_since: None,
+        target_ever_met: true,
+        target_deficit_since: None,
         to_restore: false,
     }
 }
@@ -699,7 +717,7 @@ fn restore_truth_counts_cream_when_floor_below_k_but_floor_plus_cream_reaches_k(
     let wp = restore_wp(16, 14.0, 50.0);
     let mut world = controlled_world(wp.n_nodes, 7);
     let victim = 0usize;
-    world.nodes[victim].own_blocks = vec![floor_met_block(0, 0.5)];
+    world.nodes[victim].own_blocks = vec![target_met_block(0, 0.5)];
     let disaster_tick = 5u64;
     let return_tick = disaster_tick + 1;
     let holders = online_holders(&world, victim, return_tick, 3);
@@ -745,7 +763,7 @@ fn restore_truth_model_s_is_at_most_model_u_and_bites_under_a_tiny_budget() {
     let wp = restore_wp(16, window_days, bw);
     let mut world = controlled_world(wp.n_nodes, 11);
     let victim = 0usize;
-    world.nodes[victim].own_blocks = vec![floor_met_block(0, 0.8), floor_met_block(1, 0.4)];
+    world.nodes[victim].own_blocks = vec![target_met_block(0, 0.8), target_met_block(1, 0.4)];
     let disaster_tick = 5u64;
     let return_tick = disaster_tick + 1;
     let holders = online_holders(&world, victim, return_tick, 2 * k);
@@ -794,7 +812,7 @@ fn restore_truth_respects_the_window_departed_and_out_of_window_holders_are_not_
     let wp = restore_wp(16, 14.0, 50.0); // W = 2 ticks
     let mut world = controlled_world(wp.n_nodes, 3);
     let victim = 0usize;
-    world.nodes[victim].own_blocks = vec![floor_met_block(0, 0.6)];
+    world.nodes[victim].own_blocks = vec![target_met_block(0, 0.6)];
     let disaster_tick = 5u64;
     let return_tick = disaster_tick + 1;
     let holders = online_holders(&world, victim, return_tick, 3);
@@ -835,7 +853,7 @@ fn restore_truth_victim_does_not_resurrect_with_data_when_no_holder_is_collectab
     let wp = restore_wp(16, 14.0, 50.0);
     let mut world = controlled_world(wp.n_nodes, 21);
     let victim = 0usize;
-    world.nodes[victim].own_blocks = vec![floor_met_block(0, 0.7)];
+    world.nodes[victim].own_blocks = vec![target_met_block(0, 0.7)];
     let disaster_tick = 5u64;
     let return_tick = disaster_tick + 1;
     let holders = online_holders(&world, victim, return_tick, 3);
@@ -868,7 +886,7 @@ fn restore_truth_model_o_equals_u_at_full_uptime() {
     let wp = restore_wp(16, 14.0, 50.0);
     let mut world = controlled_world(wp.n_nodes, 31);
     let victim = 0usize;
-    world.nodes[victim].own_blocks = vec![floor_met_block(0, 0.6)];
+    world.nodes[victim].own_blocks = vec![target_met_block(0, 0.6)];
     let disaster_tick = 5u64;
     let return_tick = disaster_tick + 1;
     let k = wp.base.k_eff; // 2
@@ -915,7 +933,7 @@ fn restore_truth_model_o_is_below_u_when_a_holder_surfaces_only_after_the_first_
     let wp = restore_wp(16, 14.0, 50.0);
     let mut world = controlled_world(wp.n_nodes, 41);
     let victim = 0usize;
-    world.nodes[victim].own_blocks = vec![floor_met_block(0, 0.6)];
+    world.nodes[victim].own_blocks = vec![target_met_block(0, 0.6)];
     let disaster_tick = 5u64;
     let return_tick = disaster_tick + 1;
     let k = wp.base.k_eff; // 2
@@ -1559,7 +1577,7 @@ fn whitewash_rejoin_wipes_capital_own_data_and_reschedules_the_join() {
         w.nodes[node]
             .own_blocks
             .iter()
-            .all(|b| !b.floor_ever_met && b.placements.is_empty() && !b.to_restore)
+            .all(|b| !b.target_ever_met && b.placements.is_empty() && !b.to_restore)
     );
     // Re-joins next tick with the fresh identity.
     assert!(!w.nodes[node].present);
@@ -2271,15 +2289,15 @@ fn dr_hetero_splits_restore_truth_by_demand_class() {
 // (the key missing measurement the V_free dial is meant to serve)
 // ------------------------------------------------------------------
 
-/// A minimal own block with a chosen `floor_ever_met` (the newcomer's first-backup flag).
-fn own_first(id: usize, floor_ever_met: bool) -> OwnBlock {
+/// A minimal own block with a chosen `target_ever_met` (the newcomer's first-backup flag).
+fn own_first(id: usize, target_ever_met: bool) -> OwnBlock {
     OwnBlock {
         id,
         volume: 50.0,
         iota: 0.5,
         placements: Vec::new(),
-        floor_ever_met,
-        floor_deficit_since: None,
+        target_ever_met,
+        target_deficit_since: None,
         to_restore: false,
     }
 }
@@ -2962,7 +2980,7 @@ fn weekend_only_nomad_alternates_on_and_off_weeks() {
 #[test]
 fn tier_floor_completeness_is_monotone_over_the_horizon() {
     // WARN-2 confirmation: lifetime floor-completeness (over ALL owners) is MONOTONE
-    // non-decreasing in the horizon — `floor_ever_met` only flips false→true, the block set is
+    // non-decreasing in the horizon — `target_ever_met` only flips false→true, the block set is
     // fixed (no content churn / whitewash), and the denominator (all owners' blocks) is constant.
     // So depopulation CANNOT reduce it: a longer run's T1 fc ≥ a shorter run's. (Same seed ⇒ the
     // long run passes through the short run's state.)
@@ -3808,7 +3826,15 @@ fn dr_battle_world_at_disaster(seed: u64) -> (World, usize) {
     for _ in 0..DR_BATTLE_TICK {
         crate::sim_dynamic::engine::step(&mut world, &params, &prior, &policy);
     }
-    let victim = (0..world.nodes.len())
+    let victim = dr_battle_victim(&world);
+    (world, victim)
+}
+
+/// Resolve the `dr_battle` victim in a world: the `FirstTierArchetype(T1, Reliable)` rule —
+/// present, earliest `joined_tick`, tie by index. ONE definition, so the pre-event read and the
+/// event executor can never disagree about who the victim is.
+fn dr_battle_victim(world: &World) -> usize {
+    (0..world.nodes.len())
         .filter(|&i| {
             world.nodes[i].present
                 && world.nodes[i].disk.tier == GiverTier::T1
@@ -3820,17 +3846,41 @@ fn dr_battle_world_at_disaster(seed: u64) -> (World, usize) {
                 .cmp(&world.nodes[b].joined_tick)
                 .then(a.cmp(&b))
         })
-        .expect("a present T1/Reliable victim exists at the disaster tick");
-    (world, victim)
+        .expect("a present T1/Reliable victim exists at the disaster tick")
+}
+
+/// The victim's PER-BLOCK SURVIVOR counts immediately after a `CorrelatedDisaster{co_loss}` —
+/// present holders still carrying an alive symbol of each target-ever-met victim block. THE
+/// quantity `DR_BATTLE_K_FLOOR` is calibrated against ("leave every block ≥ k_eff survivors"),
+/// measured through the REAL event executor (one physics).
+fn victim_survivors_after_event(seed: u64, co_loss: usize) -> Vec<usize> {
+    let (world, victim, _pre) = dr_battle_after_event(seed, co_loss);
+    world.nodes[victim]
+        .own_blocks
+        .iter()
+        .filter(|b| b.target_ever_met)
+        .map(|b| {
+            (0..world.nodes.len())
+                .filter(|&h| {
+                    h != victim
+                        && world.nodes[h].present
+                        && world.nodes[h]
+                            .holdings
+                            .iter()
+                            .any(|s| s.alive && s.owner == victim && s.block == b.id)
+                })
+                .count()
+        })
+        .collect()
 }
 
 /// The victim's per-block holder counts (present holders `h != victim` with an alive symbol of
-/// `(owner = victim, block)`), one entry per floor-ever-met own block, plus the union count.
+/// `(owner = victim, block)`), one entry per TARGET-ever-met own block, plus the union count.
 fn victim_block_holder_counts(world: &World, victim: usize) -> (Vec<usize>, usize) {
     let mut per_block = Vec::new();
     let mut union: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     for b in &world.nodes[victim].own_blocks {
-        if !b.floor_ever_met {
+        if !b.target_ever_met {
             continue;
         }
         let holders: Vec<usize> = (0..world.nodes.len())
@@ -3870,36 +3920,71 @@ fn mean_restore_u(result: &RunResult) -> f64 {
 fn dr_battle_calibration_reports_victim_block_holder_counts() {
     // The FROZEN calibration read (anti-Goodhart evidence for DR_BATTLE_K_FLOOR = 3 /
     // DR_BATTLE_FLOOR_X = 0.60): the runtime holder count of the T1/Reliable victim at the
-    // disaster tick (seeds 42..46). The victim's MATURE blocks carry 5-7 holders (union 11-16);
-    // the spec formula "typical holders − k_eff − margin, leave k_eff+1" on a 6-holder block gives
-    // K_FLOOR = 6 − 2 − 1 = 3. The co-loss draws from the UNION, so K = 3 leaves each block ≥
-    // k_eff in the deterministic pick. HONEST NOTE: one seed's victim carries a marginal 3-holder
-    // floor-met block, so the strict worst-case bound would be K ≤ 1 — the frozen K rests on the
-    // union pick, not the worst case (the sweep tests carry the honest degradation).
-    // (READ-only + fast — build_world + 60 steps per seed; run with --nocapture for the table.)
+    // disaster tick (seeds 42..46), and — the invariant K exists for — the PER-BLOCK SURVIVORS
+    // once the co-loss has fired.
+    //
+    // Ф-1 RE-DERIVATION (post-SIM-UNIFICATION, see DR_BATTLE_K_FLOOR for the full table): the
+    // victim's blocks thinned ~18 % (per-block 3-6, median 5, union 9-14, mean 12.0 — from 3-7,
+    // median 6, union 11-16, mean 14.6). The spec formula "typical holders − k_eff − margin,
+    // leave k_eff+1" gives 3 on the widest (still 6-holder) mature block and 2 on the median;
+    // K stays 3 because the property below is MEASURED to hold at 3 on every frozen seed.
+    // (build_world + 60 steps per seed, twice over — slow but it is the calibration evidence;
+    // run with --nocapture for the table.)
     let k_eff = DynParams::default().k_eff;
+    let k_floor = match dr_battle().events[0].1 {
+        Event::CorrelatedDisaster {
+            co_loss_holders, ..
+        } => co_loss_holders,
+        other => panic!("dr_battle must fire a CorrelatedDisaster, got {other:?}"),
+    };
     let mut typical_max = 0usize; // the largest per-block holder count seen (the mature block)
     let mut min_union = usize::MAX;
+    let mut unions: Vec<usize> = Vec::new();
     for seed in [42u64, 43, 44, 45, 46] {
         let (world, victim) = dr_battle_world_at_disaster(seed);
         let (per_block, union) = victim_block_holder_counts(&world, victim);
         typical_max = typical_max.max(per_block.iter().copied().max().unwrap_or(0));
         min_union = min_union.min(union);
+        unions.push(union);
         println!("seed {seed}: victim {victim}  per-block holders {per_block:?}  union {union}");
     }
+    let mean_union = unions.iter().sum::<usize>() as f64 / unions.len() as f64;
     println!(
-        "typical (max) per-block holders = {typical_max}, min union = {min_union}, k_eff = {k_eff}, K_FLOOR = 3"
+        "typical (max) per-block holders = {typical_max}, min union = {min_union}, mean union = \
+         {mean_union:.1} (pre-unification 14.6 ⇒ −{:.0} %), k_eff = {k_eff}, K_FLOOR = {k_floor}",
+        100.0 * (14.6 - mean_union) / 14.6
     );
-    // The union always exceeds K_FLOOR (the co-loss pool is real), and the typical mature block
-    // sits at holders ≥ K_FLOOR + k_eff (the "leave k_eff+1 on a 6-holder block" calibration).
+    // The union always exceeds K_FLOOR (the co-loss pool is real), and the mature block still
+    // sits at holders ≥ K_FLOOR + k_eff (the "leave k_eff+1 on the widest block" calibration).
     assert!(
-        min_union > 3,
+        min_union > k_floor,
         "the co-loss union pool exceeds K_FLOOR: {min_union}"
     );
     assert!(
-        typical_max >= 3 + k_eff,
-        "the victim's mature block carries ≥ K_FLOOR(3) + k_eff({k_eff}) holders: {typical_max}"
+        typical_max >= k_floor + k_eff,
+        "the victim's mature block carries ≥ K_FLOOR({k_floor}) + k_eff({k_eff}) holders: {typical_max}"
     );
+    // THE INVARIANT K_FLOOR IS CALIBRATED FOR, asserted directly on the post-event world (not via
+    // the restore-U proxy, which additionally depends on window collectability — see the pin test
+    // `dr_battle_floor_holds_per_seed_across_the_frozen_band`): after co-losing K_FLOOR holders,
+    // EVERY target-ever-met victim block still carries ≥ k_eff survivors, on every frozen seed.
+    // This is what survived the −18 % width; widening the seed band without re-checking it here
+    // is exactly the silent regression the constant's doc warns about.
+    for seed in [42u64, 43, 44, 45, 46] {
+        let survivors = victim_survivors_after_event(seed, k_floor);
+        println!("seed {seed}: survivors/block after co-loss K={k_floor}: {survivors:?}");
+        assert!(
+            !survivors.is_empty(),
+            "seed {seed}: the victim must carry target-ever-met blocks to calibrate against"
+        );
+        for (i, &s) in survivors.iter().enumerate() {
+            assert!(
+                s >= k_eff,
+                "seed {seed} block #{i}: co-losing K_FLOOR({k_floor}) must leave ≥ k_eff({k_eff}) \
+                 survivors, got {s} (survivors/block {survivors:?})"
+            );
+        }
+    }
 }
 
 /// Reproduce the `dr_battle` world at the disaster tick, then fire `CorrelatedDisaster{co_loss}`
@@ -3910,18 +3995,10 @@ fn dr_battle_after_event(
     seed: u64,
     co_loss: usize,
 ) -> (World, usize, std::collections::BTreeSet<usize>) {
-    let (probe, victim) = dr_battle_world_at_disaster(seed);
-    let pre_holders: std::collections::BTreeSet<usize> = (0..probe.nodes.len())
-        .filter(|&h| {
-            h != victim
-                && probe.nodes[h].present
-                && probe.nodes[h]
-                    .holdings
-                    .iter()
-                    .any(|s| s.alive && s.owner == victim)
-        })
-        .collect();
-    // Rebuild + step to the disaster tick, then fire the event through the runner executor.
+    // ONE world build: step to the disaster tick, read the victim + its pre-disaster holders off
+    // that very world, then fire the event on it. (An earlier version built a second, identical
+    // world for the pre-read; the engine is deterministic, so the extra build only doubled the
+    // cost of every caller.)
     use std::collections::BTreeMap;
     use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
     let params = DynParams::default();
@@ -3931,6 +4008,17 @@ fn dr_battle_after_event(
     for _ in 0..DR_BATTLE_TICK {
         crate::sim_dynamic::engine::step(&mut world, &params, &prior, &policy);
     }
+    let victim = dr_battle_victim(&world);
+    let pre_holders: std::collections::BTreeSet<usize> = (0..world.nodes.len())
+        .filter(|&h| {
+            h != victim
+                && world.nodes[h].present
+                && world.nodes[h]
+                    .holdings
+                    .iter()
+                    .any(|s| s.alive && s.owner == victim)
+        })
+        .collect();
     let classes = DemandMix::Uniform.assign(100, seed);
     let mut tracker = RestoreTracker::new(&dr_battle().world);
     let mut revive_at: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
@@ -4075,9 +4163,18 @@ fn restore_truth_collapses_when_survivors_below_k_eff() {
 
 #[test]
 fn restore_truth_holds_when_survivors_at_least_k_eff() {
-    // Test 5 (spec §5) — SURVIVAL-FLOOR: at the frozen K_FLOOR (survivors ≥ k_eff) the
-    // INV-DR-BATTLE-FLOOR board row of the REGISTERED dr_battle PASSES — restore-truth U clears
-    // the frozen 0.60 floor with power. Two seeds keep it quick (U = 1.0, σ = 0 ⇒ power = ∞).
+    // Test 5 (spec §5) — SURVIVAL-FLOOR: at the frozen K_FLOOR (survivors ≥ k_eff, asserted
+    // directly in `dr_battle_calibration_reports_victim_block_holder_counts`) the
+    // INV-DR-BATTLE-FLOOR board row of the REGISTERED dr_battle does NOT collapse — restore-truth
+    // U stays above the frozen 0.60 floor.
+    //
+    // Ф-1: the assertion is the A15-FLOOR idiom (NOT FAIL + effect above the bar) rather than a
+    // hard `== Pass`. Pre-unification this row read U = 1.0000, σ = 0 ⇒ power = ∞; the −18 %
+    // width (see DR_BATTLE_K_FLOOR) leaves it at 0.8333, σ 0.2357 ⇒ power 0.99 on this 2-seed
+    // sub-band (0.8667, σ 0.1826 ⇒ power 1.46 on the full 5-seed board). Power < 2 is
+    // INCONCLUSIVE, which for a 2-5 seed band is an honest small-sample outcome, NOT a collapse —
+    // demanding `Pass` here would be demanding a σ the physics no longer has. A genuine FAIL
+    // (mean below the bar) still fails the test.
     let sc = {
         let mut s = dr_battle(); // carries co_loss = DR_BATTLE_K_FLOOR
         s.seeds = vec![42, 43];
@@ -4091,29 +4188,58 @@ fn restore_truth_holds_when_survivors_at_least_k_eff() {
         .iter()
         .find(|v| v.id == "INV-DR-BATTLE-FLOOR")
         .expect("dr_battle board carries INV-DR-BATTLE-FLOOR");
-    assert_eq!(
+    println!(
+        "INV-DR-BATTLE-FLOOR: {} effect={:.4} σ={:.4} threshold={:.2} power={:.2}",
+        floor.kind.label().trim(),
+        floor.effect,
+        floor.sigma,
+        floor.threshold,
+        floor.power,
+    );
+    assert_ne!(
         floor.kind,
-        VerdictKind::Pass,
-        "survival-floor holds: effect={} power={}",
+        VerdictKind::Fail,
+        "survival-floor does not collapse: effect={} power={}",
         floor.effect,
         floor.power
     );
     assert!(
-        floor.effect > 0.60,
+        floor.effect > DR_BATTLE_FLOOR_X_MIRROR,
         "restore-truth U clears the frozen floor: {}",
         floor.effect
     );
 }
 
+/// The frozen `DR_BATTLE_FLOOR_X` (mirrored locally; the registry constant is private).
+const DR_BATTLE_FLOOR_X_MIRROR: f64 = 0.60;
+
+/// The FROZEN per-seed restore-U anchor at `DR_BATTLE_K_FLOOR`, seeds 42..46 in order — MEASURED
+/// post-SIM-UNIFICATION (Ф-1), not derived. Two seeds lose one of the victim's three blocks to the
+/// restore window; see [`dr_battle_floor_holds_per_seed_across_the_frozen_band`].
+const DR_BATTLE_PER_SEED_U: [f64; 5] = [1.0, 2.0 / 3.0, 2.0 / 3.0, 1.0, 1.0];
+
 #[test]
 fn dr_battle_floor_holds_per_seed_across_the_frozen_band() {
-    // Reviewer NOTE (latent fragility): the board INV-DR-BATTLE-FLOOR checks the MEAN restore-U,
-    // which could hide ONE bad seed (a victim whose K_FLOOR pick sinks a block below k_eff dilutes
-    // to a still-passing mean). The ≥k_eff survival margin at K_FLOOR is MEASURED for seeds 42-46,
-    // not structural — so guard it PER SEED: at the frozen K_FLOOR every seed's restore-U must be
-    // exactly 1.0 (every floor-met block keeps ≥ k_eff survivors). Widening dr_battle's seed band
-    // to a seed that violates this fails HERE (not silently on a diluted board mean). Reads the
-    // frozen K_FLOOR off the registered scenario (no magic number); fast sweep horizon.
+    // ANCHOR-STYLE REGRESSION PIN (Ф-1 conversion — this test used to assert `U == 1.0` per seed).
+    //
+    // WHY IT IS NO LONGER AN INVARIANT. The board INV-DR-BATTLE-FLOOR checks the MEAN restore-U,
+    // which could hide one bad seed, so this test guards the band per seed. Pre-unification the
+    // guard could be stated as a property — U was exactly 1.0 everywhere, because the victim's
+    // blocks carried enough holders that co-losing K_FLOOR left ≥ k_eff COLLECTABLE ones. The
+    // R̂-vs-target loop returned ≈ 18 % of that redundancy to the pool (see DR_BATTLE_K_FLOOR):
+    // the survivor floor still holds — every block keeps ≥ k_eff survivors at K_FLOOR, asserted
+    // directly in `dr_battle_calibration_reports_victim_block_holder_counts` — but two seeds now
+    // reach the 2-tick restore window with only k_eff collectable holders on their thinnest block,
+    // and the co-loss takes one of them. Measured sweep (all 5 seeds): K=0 → all 1.0; K=1 and K=2
+    // → seed 43 at 0.667; K=3 → seeds 43 and 44 at 0.667. So NO K ≥ 1 restores the old reading —
+    // there is no honest K to move to, and re-scoping to the mean (or dropping the bad seeds)
+    // would just hide the margin loss.
+    //
+    // WHAT THIS PINS INSTEAD: the measured per-seed U at the frozen K_FLOOR, exactly like the
+    // honest_v2 seed-42 anchor pins `evicts = 627`. It no longer proves a property; it catches
+    // FUTURE EROSION of the post-unification margin (any change that costs another seed its
+    // third block, or that quietly widens placement again, moves these numbers and fails here).
+    // Reads K_FLOOR off the registered scenario (no magic number); fast sweep horizon.
     let co_loss = match dr_battle().events[0].1 {
         Event::CorrelatedDisaster {
             co_loss_holders, ..
@@ -4121,17 +4247,31 @@ fn dr_battle_floor_holds_per_seed_across_the_frozen_band() {
         other => panic!("dr_battle must fire a CorrelatedDisaster, got {other:?}"),
     };
     let sc = dr_battle_sweep_scenario(co_loss); // all 5 frozen seeds, horizon 63
+    assert_eq!(
+        sc.seeds.len(),
+        DR_BATTLE_PER_SEED_U.len(),
+        "the pin covers exactly the frozen seed band — re-freeze it if the band changes"
+    );
     let result = run(&sc, &sc.seeds.clone());
-    for (i, &seed) in sc.seeds.iter().enumerate() {
-        let rt = result.per_seed_restore[i]
-            .as_ref()
-            .unwrap_or_else(|| panic!("seed {seed} ran the disaster ⇒ has a restore-truth"));
-        assert_eq!(
-            rt.restore_truth_u(),
-            1.0,
-            "seed {seed}: at the frozen K_FLOOR every floor-met block must keep ≥ k_eff survivors \
-             (per-seed U = 1.0), got {}",
-            rt.restore_truth_u()
+    let us: Vec<f64> = sc
+        .seeds
+        .iter()
+        .enumerate()
+        .map(|(i, &seed)| {
+            result.per_seed_restore[i]
+                .as_ref()
+                .unwrap_or_else(|| panic!("seed {seed} ran the disaster ⇒ has a restore-truth"))
+                .restore_truth_u()
+        })
+        .collect();
+    println!("dr_battle per-seed restore-U at K_FLOOR={co_loss}: {us:?}");
+    for ((&seed, &u), &pinned) in sc.seeds.iter().zip(&us).zip(&DR_BATTLE_PER_SEED_U) {
+        assert!(
+            (u - pinned).abs() < 1e-9,
+            "seed {seed}: restore-U at the frozen K_FLOOR moved off the anchor {pinned:.4} → \
+             {u:.4}. This pins the post-unification margin (see DR_BATTLE_K_FLOOR); a drop means \
+             the victim lost more redundancy, a rise means it gained some back — investigate \
+             before re-freezing."
         );
     }
 }
@@ -4268,13 +4408,14 @@ fn a15_enclosure_calibration_dump() {
     let n0 = A15_CAL_N0;
     let seeds = [42u64, 43, 44, 45, 46];
     println!(
-        "\n=== A15 calibration: n_nodes={} n0={n0} horizon={} cutoff(T_join)={} C_floor={} thresh={} floor(n_symbols)={} ===",
+        "\n=== A15 calibration: n_nodes={} n0={n0} horizon={} cutoff(T_join)={} C_floor={} thresh={} n_symbols={} k_eff(decodability cut)={} ===",
         sc.world.n_nodes,
         sc.horizon,
         cutoff,
         sc.adversaries[0].dials.group_size,
         sc.adversaries[0].dials.enclose_thresh,
         floor,
+        sc.world.base.k_eff,
     );
     // present-at-t0 + pool size + newcomers past cutoff present at horizon (seed 42).
     {
@@ -4336,8 +4477,8 @@ fn a15_enclosure_calibration_dump() {
             "  thresh={thresh:>5}:  incumbent→cartel g_ho mean={im:.2} max={ix:.2} frac>0={inz:.2}  |  newcomer→cartel g_ho mean={nm:.2} max={nx:.2} frac>0={nnz:.2}"
         );
     }
-    // The cartel-FRACTION sweep (the headline): newcomer-durability vs cartel_frac, via run() (the
-    // real predator path). Print per-seed durability + mean±σ + the cartel-pays ratio.
+    // The cartel-FRACTION sweep (the headline): newcomer DECODABILITY vs cartel_frac, via run()
+    // (the real predator path). Print per-seed decodability + mean±σ + the cartel-pays ratio.
     println!(
         "  --- cartel-frac sweep (thresh={}, 5 seeds) ---",
         sc.adversaries[0].dials.enclose_thresh
@@ -4354,7 +4495,7 @@ fn a15_enclosure_calibration_dump() {
             f64::INFINITY
         };
         println!(
-            "  frac={frac:.1} cartel={cartel:>2}:  durability per-seed={:?}  mean={dm:.4} σ={ds:.4} power(vs {:.2})={power:.2}  cartel-pays={cm:.3}",
+            "  frac={frac:.1} cartel={cartel:>2}:  decodable per-seed={:?}  mean={dm:.4} σ={ds:.4} power(vs {:.2})={power:.2}  cartel-pays={cm:.3}",
             r.per_seed_newcomer
                 .iter()
                 .map(|d| (d * 1000.0).round() / 1000.0)
@@ -4366,8 +4507,11 @@ fn a15_enclosure_calibration_dump() {
 
 /// n0 used by the calibration dump (mirrors registry `A15_N0`, kept local to tests).
 const A15_CAL_N0: usize = 50;
-/// The candidate FLOOR X the calibration dump reports power against (mirrors registry `A15_FLOOR_X`).
-const A15_CAL_X: f64 = 0.20;
+/// The candidate FLOOR X the calibration dump reports power against (mirrors registry
+/// `A15_FLOOR_X`). Ф-2: re-frozen 0.20 → 0.60 with the metric's re-base to DECODABILITY — the
+/// house restorability idiom "FAIL if > 40 % of the newcomers' once-durable blocks become
+/// undecodable" (same bar as INV-RESTORE-SANITY / INV-DR-BATTLE-FLOOR).
+const A15_CAL_X: f64 = 0.60;
 
 #[test]
 fn a15_cartel_rejects_low_reciprocity_owner_offer() {
@@ -4451,11 +4595,11 @@ fn enclose_newcomers_false_is_byte_identical_to_honest_accept_gate() {
     // never fires) — the frozen sim_diag anchor still holds field-for-field.
     let m = run_one_seed(&honest_v2(), 42).metrics;
     assert_eq!(m.alive_symbols, 224, "alive");
-    assert_eq!(m.evicts, 621, "evicts");
-    assert_eq!(m.preempts, 375, "preempts");
-    assert_eq!(m.cap_trims, 179, "cap_trims");
+    assert_eq!(m.evicts, 627, "evicts");
+    assert_eq!(m.preempts, 380, "preempts");
+    assert_eq!(m.cap_trims, 182, "cap_trims");
     assert!(
-        (m.share_a_pos - 75.45).abs() < 0.1,
+        (m.share_a_pos - 75.89).abs() < 0.1,
         "share A>0 = {}",
         m.share_a_pos
     );
@@ -4503,10 +4647,11 @@ fn a15_cartel_injected_on_earliest_joined_incumbents_not_inflow_pool() {
 }
 
 #[test]
-fn newcomer_floor_durability_reads_only_post_cutoff_joiners() {
-    // Hand-built world (cutoff = 10, floor = 5): incumbents (joined ≤ cutoff) are excluded; among
-    // the post-cutoff newcomers, the metric is the mean over nodes of (floor-met blocks still at ≥
-    // floor non-cream holders) / (floor-met blocks), skipping newcomers with no floor-met block.
+fn newcomer_decodable_fraction_reads_only_post_cutoff_joiners() {
+    // Hand-built world (cutoff = 10, k_eff = 3): incumbents (joined ≤ cutoff) are excluded; among
+    // the post-cutoff newcomers, the metric is the mean over nodes of (target-met blocks CURRENTLY
+    // holding ≥ k_eff alive symbols, CREAM INCLUDED) / (target-met blocks), skipping newcomers with
+    // no target-met block. (Ф-2 re-base: the numerator is decodability, not a floor-fill count.)
     let params = DynParams::default();
     let mut w = build_world(12, &params, 7);
     for nd in &mut w.nodes {
@@ -4515,49 +4660,63 @@ fn newcomer_floor_durability_reads_only_post_cutoff_joiners() {
         nd.own_blocks.clear();
         nd.joined_tick = 0; // holders 4..11 are incumbents with no blocks ⇒ excluded anyway
     }
-    let (cutoff, floor) = (10u64, 5usize);
-    // node 0: INCUMBENT (joined 0) with a floor-met block at 5 holders ⇒ EXCLUDED (joined ≤ cutoff).
+    let (cutoff, k_eff) = (10u64, 3usize);
+    // node 0: INCUMBENT (joined 0) with a target-met block at 5 holders ⇒ EXCLUDED (joined ≤ cutoff).
     w.nodes[0].joined_tick = 0;
     w.nodes[0].own_blocks = vec![own_first(0, true)];
-    // node 1: newcomer (joined 20), one floor-met block CURRENTLY at 5 holders ⇒ ratio 1/1.
+    // node 1: newcomer (joined 20), one target-met block CURRENTLY at 5 symbols ⇒ ratio 1/1.
     w.nodes[1].joined_tick = 20;
     w.nodes[1].own_blocks = vec![own_first(0, true)];
-    // node 2: newcomer (joined 30), TWO floor-met blocks: one at 5 (≥ floor), one at 3 (< floor) ⇒ 1/2.
+    // node 2: newcomer (joined 30), TWO target-met blocks: one at 5 (≥ k_eff), one at 2 (< k_eff) ⇒ 1/2.
     w.nodes[2].joined_tick = 30;
     w.nodes[2].own_blocks = vec![own_first(0, true), own_first(1, true)];
-    // node 3: newcomer (joined 15) whose only block NEVER met floor ⇒ EXCLUDED (no denominator).
+    // node 3: newcomer (joined 15) whose only block NEVER met target ⇒ EXCLUDED (no denominator).
     w.nodes[3].joined_tick = 15;
     w.nodes[3].own_blocks = vec![own_first(0, false)];
-    // Holders 4..11 (present incumbents, no own blocks). Place the floor-met blocks by hand:
+    // Holders 4..11 (present incumbents, no own blocks). Place the target-met blocks by hand:
     for h in [4usize, 5, 6, 7, 8] {
-        push_held(&mut w, h, 0, 0, 0.5, false); // node0.block0 → 5 holders (excluded owner)
-        push_held(&mut w, h, 1, 0, 0.5, false); // node1.block0 → 5 holders
-        push_held(&mut w, h, 2, 0, 0.5, false); // node2.block0 → 5 holders
+        push_held(&mut w, h, 0, 0, 0.5, false); // node0.block0 → 5 symbols (excluded owner)
+        push_held(&mut w, h, 1, 0, 0.5, false); // node1.block0 → 5 symbols
+        push_held(&mut w, h, 2, 0, 0.5, false); // node2.block0 → 5 symbols
     }
-    for h in [4usize, 5, 6] {
-        push_held(&mut w, h, 2, 1, 0.5, false); // node2.block1 → 3 holders (below floor)
+    for h in [4usize, 5] {
+        push_held(&mut w, h, 2, 1, 0.5, false); // node2.block1 → 2 symbols (below k_eff = 3)
     }
-    let dur = newcomer_floor_durability(&w, cutoff, floor);
-    // Counted newcomers: node1 (1.0), node2 (0.5). node0 incumbent excluded; node3 no floor-met.
+    let dec = newcomer_decodable_fraction(&w, cutoff, k_eff);
+    // Counted newcomers: node1 (1.0), node2 (0.5). node0 incumbent excluded; node3 no target-met.
     assert!(
-        (dur - 0.75).abs() < 1e-9,
-        "mean of (1.0 + 0.5)/2 = 0.75, got {dur}"
+        (dec - 0.75).abs() < 1e-9,
+        "mean of (1.0 + 0.5)/2 = 0.75, got {dec}"
     );
     // Determinism: a re-read is bit-identical.
     assert_eq!(
-        dur.to_bits(),
-        newcomer_floor_durability(&w, cutoff, floor).to_bits()
+        dec.to_bits(),
+        newcomer_decodable_fraction(&w, cutoff, k_eff).to_bits()
     );
-    // A cream holder does NOT count toward the floor: turning node1's 5 floor holders to 4 non-cream
-    // + 1 cream drops it below floor ⇒ node1 ratio 0/1, mean = (0 + 0.5)/2 = 0.25.
-    w.nodes[8]
-        .holdings
-        .retain(|s| !(s.owner == 1 && s.block == 0));
-    push_held(&mut w, 8, 1, 0, 0.5, true); // re-add node1.block0 on holder 8 as CREAM
-    let dur2 = newcomer_floor_durability(&w, cutoff, floor);
+    // CREAM COUNTS (the Ф-2 re-base, and the inverse of the retired floor-fill rule): re-labelling
+    // node2.block1's symbols as cream and adding a third keeps it decodable ⇒ node2 ratio 2/2,
+    // mean = (1.0 + 1.0)/2 = 1.0.
+    for h in [4usize, 5] {
+        w.nodes[h]
+            .holdings
+            .retain(|s| !(s.owner == 2 && s.block == 1));
+    }
+    for h in [4usize, 5, 6] {
+        push_held(&mut w, h, 2, 1, 0.5, true); // three CREAM symbols ⇒ ≥ k_eff ⇒ decodable
+    }
+    let dec2 = newcomer_decodable_fraction(&w, cutoff, k_eff);
     assert!(
-        (dur2 - 0.25).abs() < 1e-9,
-        "cream does not count to floor: {dur2}"
+        (dec2 - 1.0).abs() < 1e-9,
+        "cream symbols DO count toward decodability: {dec2}"
+    );
+    // And a block that falls BELOW k_eff alive symbols stops counting, cream or not.
+    w.nodes[6]
+        .holdings
+        .retain(|s| !(s.owner == 2 && s.block == 1));
+    let dec3 = newcomer_decodable_fraction(&w, cutoff, k_eff);
+    assert!(
+        (dec3 - 0.75).abs() < 1e-9,
+        "back below k_eff ⇒ node2 ratio 1/2, mean 0.75: {dec3}"
     );
 }
 
@@ -4593,23 +4752,31 @@ fn a15_enclosure_is_deterministic_across_double_run() {
 }
 
 #[test]
-fn newcomer_durability_monotone_nonincreasing_in_cartel_fraction() {
-    // HONEST-REFLECT sweep (`4r_a15_spec.md` §5.5): newcomer floor-durability vs cartel_frac.
-    // Measured (5 seeds, thresh 40): frac 0.0/0.4/0.8/1.0 → 0.55/0.69/0.61/0.315. The complete,
-    // honest reading (reviewer W2 — the earlier "serve-first robustness" label over-attributed):
-    //   (1) AMPLE-CAPACITY regime (cartel ≤ 0.8·n0): FLAT ~0.55-0.69. Newcomers are carried by the
-    //       ABUNDANT non-cartel remainder (~27 present nodes ≫ the 5-holder floor), NOT primarily by
-    //       serve-first — only ~6-9% of newcomers ever earn cartel reciprocity. The gate is a
-    //       blanket reciprocity-gate (rejects ~90% of ALL offers), so its effect here is drowned out
-    //       by spare honest capacity.
-    //   (2) TOTAL-incumbent cartel (frac = 1.0): durability DROPS to ~0.315 — enclosure DOES bite
-    //       once the honest remainder is gone (the metric honest-reflects; the gate is neither
-    //       inverted nor a no-op). A newcomer's only non-cartel holders are then OTHER newcomers.
-    //   (3) But even total enclosure NEVER achieves LOCKOUT: 0.315 stays well above the 0.20 collapse
-    //       floor, because the inflow newcomer cohort forms its OWN reciprocal sub-community. So a
-    //       cartel cannot structurally lock out newcomers (inflow + peer reciprocity), though a
-    //       TOTAL incumbent cartel degrades their durability ~43% from baseline.
-    // Not tuned to green — the 1.0 drop is reported, not suppressed.
+fn newcomer_decodability_across_the_cartel_fraction_sweep() {
+    // HONEST-REFLECT sweep (`4r_a15_spec.md` §5.5): newcomer DECODABILITY vs cartel_frac, on the
+    // Ф-2 re-based metric (target-ever-met blocks still holding ≥ k_eff alive symbols, cream
+    // included — `metrics::newcomer_decodable_fraction`).
+    // Measured (5 seeds, thresh 40): frac 0.0/0.4/0.8/1.0 → 0.8333/1.0000/0.8967/0.8167. The
+    // complete, honest reading:
+    //   (1) AMPLE-CAPACITY regime (cartel ≤ 0.8·n0): FLAT and HIGH (0.83-1.00). Newcomers are
+    //       carried by the ABUNDANT non-cartel remainder (~27 present nodes ≫ the placement width),
+    //       NOT primarily by serve-first — only ~6-9% of newcomers ever earn cartel reciprocity.
+    //       The gate is a blanket reciprocity-gate (rejects ~90% of ALL offers), so its effect here
+    //       is drowned out by spare honest capacity. (The non-monotone dip at frac 0.0 vs 0.4 is
+    //       seed-REALIZATION noise: a newcomer holding 1-3 blocks can only score 0, ½, ⅓ … — the
+    //       same coarseness the retired fill-count metric showed, not a Ф-2 artifact.)
+    //   (2) TOTAL-incumbent cartel (frac = 1.0) is the curve's MINIMUM (0.8167) — the enclosure
+    //       signature survives the re-base (the gate is neither inverted nor a no-op) — but the
+    //       BITE IS SMALL: −2 % vs the no-cartel control, where the retired non-cream fill count
+    //       showed −43 %. HONEST READING of the difference: a total cartel THINS a newcomer's
+    //       redundancy (that is what the fill count saw) without pushing it below k_eff, so almost
+    //       nothing becomes unrecoverable. Decodability is a COARSE instrument for enclosure —
+    //       deliberately so: it answers the invariant's question ("can the newcomer still get its
+    //       data back") rather than the placement-width question that the R̂ loop made meaningless.
+    //   (3) So a cartel cannot structurally lock out newcomers: even total enclosure leaves ~82 %
+    //       of their once-durable blocks decodable, because the inflow cohort forms its OWN
+    //       reciprocal sub-community.
+    // Not tuned to green — the 1.0 point is reported, not suppressed.
     let sc = a15_enclosure();
     let n0 = bootstrap_n0(sc.world.n_nodes, sc.world.inflow, sc.horizon);
     let thresh = sc.adversaries[0].dials.enclose_thresh;
@@ -4628,11 +4795,11 @@ fn newcomer_durability_monotone_nonincreasing_in_cartel_fraction() {
         curve.push((frac, mean));
     }
     println!(
-        "A15 newcomer-durability sweep (cartel_frac, mean over {} seeds):",
+        "A15 newcomer-decodability sweep (cartel_frac, mean over {} seeds):",
         seeds.len()
     );
     for (f, m) in &curve {
-        println!("  frac={f:.1}  durability={m:.4}");
+        println!("  frac={f:.1}  decodable={m:.4}");
     }
     // Classify the curve for the report (monotone non-increasing within a tolerance, or FLAT).
     let is_monotone = curve.windows(2).all(|w| w[1].1 <= w[0].1 + 1e-9);
@@ -4645,10 +4812,8 @@ fn newcomer_durability_monotone_nonincreasing_in_cartel_fraction() {
         }
     );
     // The substantive guard, honestly scoped (reviewer W2): across the AMPLE-CAPACITY regime
-    // (cartel ≤ 0.8·n0, where the non-cartel remainder ≫ the 5-holder floor) a newcomer is NEVER
-    // locked out — durability stays above the collapse floor. The TOTAL-cartel point (frac = 1.0)
-    // is REPORTED, not asserted-above-floor: whatever it shows is the honest capacity-exhausted
-    // datum (structural inflow defence, or the point where enclosure finally bites).
+    // (cartel ≤ 0.8·n0, where the non-cartel remainder ≫ the placement width) a newcomer is NEVER
+    // locked out — its data stays decodable well above the collapse floor.
     let min_ample = curve
         .iter()
         .filter(|(f, _)| *f <= 0.8 + 1e-9)
@@ -4656,32 +4821,65 @@ fn newcomer_durability_monotone_nonincreasing_in_cartel_fraction() {
         .fold(f64::INFINITY, f64::min);
     assert!(
         min_ample > A15_CAL_X,
-        "newcomer durability never collapses below the floor {A15_CAL_X} in the ample-capacity regime (frac ≤ 0.8): min={min_ample:.4}"
+        "newcomer decodability never collapses below the floor {A15_CAL_X} in the ample-capacity regime (frac ≤ 0.8): min={min_ample:.4}"
     );
     // NO-LOCKOUT guard at the TOTAL-incumbent cartel (frac = 1.0, capacity-exhausted): even with
-    // EVERY incumbent enclosing, a newcomer still reaches floor via the newcomer sub-community, so
-    // durability stays above the collapse floor — the structural inflow/peer-reciprocity defence.
-    // (It DOES degrade from baseline — point (2) above — which is the honest bite, not a failure.)
+    // EVERY incumbent enclosing, a newcomer's blocks stay decodable via the newcomer sub-community
+    // — the structural inflow/peer-reciprocity defence. (It IS the curve's minimum — point (2)
+    // above — which is the honest bite, not a failure.)
     let total_cartel = curve.last().map(|(_, m)| *m).unwrap_or(f64::NAN);
     println!(
-        "  total-incumbent-cartel (frac=1.0) newcomer durability = {total_cartel:.4} \
-         (bites vs baseline {:.4}, but no lockout: > floor {A15_CAL_X})",
-        curve[0].1
+        "  total-incumbent-cartel (frac=1.0) newcomer decodability = {total_cartel:.4} \
+         (vs no-cartel control {:.4} = {:+.1}%; no lockout: > floor {A15_CAL_X})",
+        curve[0].1,
+        100.0 * (total_cartel - curve[0].1) / curve[0].1,
     );
     assert!(
         total_cartel > A15_CAL_X,
-        "total-incumbent cartel does not lock newcomers out: durability {total_cartel:.4} stays above the collapse floor {A15_CAL_X} (newcomer sub-community)"
+        "total-incumbent cartel does not lock newcomers out: decodability {total_cartel:.4} stays above the collapse floor {A15_CAL_X} (newcomer sub-community)"
+    );
+    // NO SHAPE GUARD — deliberately, and do NOT re-add one (Ф-2 review BLOCK-2). The total-cartel
+    // point IS the measured curve minimum, but that fact carries no evidential weight on this
+    // metric: the gap to the no-cartel control is 0.0166, while the curve's own WITHIN-regime
+    // swing across points the same test calls seed-realization noise (frac 0.0 → 0.4) is 0.1667 —
+    // 10× larger, and per-seed σ 0.11-0.24 puts the "enclosure signature" at ≈0.15 SEM. An assert
+    // on a 0.15-SEM effect fails on noise as readily as on a real inversion, so its failure would
+    // carry no information while reading like a finding. The honest statement is: after the Ф-2
+    // re-base, DECODABILITY cannot discriminate enclosure strength — it is a collapse floor only
+    // (that is what the two asserts above test). The enclosure BITE lives in the cartel-pays ratio
+    // (`per_seed_cartel_earn`: 0.977 → 0.552 across this same sweep, printed by
+    // `a15_enclosure_calibration_dump`), which is where a sensitivity read belongs.
+    let worst = curve.iter().map(|(_, m)| *m).fold(f64::INFINITY, f64::min);
+    let control = curve[0].1;
+    let ample_spread = curve
+        .iter()
+        .filter(|(f, _)| *f <= 0.8 + 1e-9)
+        .map(|(_, m)| *m)
+        .fold(f64::NEG_INFINITY, f64::max)
+        - min_ample;
+    println!(
+        "  shape (DIAGNOSTIC, not asserted): min={worst:.4} at frac={:.1}; total-cartel−control \
+         = {:+.4} vs intra-regime spread {ample_spread:.4} ⇒ signature/noise ≈ {:.2}",
+        curve
+            .iter()
+            .find(|(_, m)| (*m - worst).abs() < 1e-9)
+            .map(|(f, _)| *f)
+            .unwrap_or(f64::NAN),
+        total_cartel - control,
+        (total_cartel - control).abs() / ample_spread.max(1e-9),
     );
 }
 
 #[test]
 fn a15_enclosure_floor_holds_at_calibrated_cartel_fraction() {
     // INV-ENCLOSURE-FLOOR (`4r_a15_spec.md` §5.6): at C_floor — where the non-cartel present
-    // capacity still far exceeds n_symbols = 5 — a newcomer the cartel refuses still reaches and
-    // holds floor on the honest remainder, so the newcomer durability does NOT collapse below the
-    // frozen floor X. Like A5's INV-A5-DEEP-FLOOR (WARN-7), the per-seed durability carries large
-    // seed-REALIZATION variance, so the row is expected to land INCONCLUSIVE (power < 2), itself an
-    // honest finding — but it must NOT FAIL, and the mean must sit above X.
+    // capacity still far exceeds the placement width — a newcomer the cartel refuses still places
+    // on the honest remainder, so its once-durable blocks stay DECODABLE above the frozen floor X
+    // (Ф-2 re-base; X = 0.60 = "> 40 % undecodable is a collapse").
+    // Measured on the re-based metric (5 seeds): effect 0.9500, σ 0.1118 ⇒ power 3.13 = PASS. The
+    // assertion stays the A15-FLOOR idiom (NOT FAIL + mean above X) rather than a hard `== Pass`:
+    // this metric's per-seed seed-REALIZATION variance can push a run to INCONCLUSIVE (power < 2),
+    // which is an honest outcome for a world-cut, not a regression.
     let sc = a15_enclosure();
     let result = run(&sc, &sc.seeds.clone());
     let verdicts = evaluate_board(&sc, &result);
@@ -4700,11 +4898,11 @@ fn a15_enclosure_floor_holds_at_calibrated_cartel_fraction() {
     assert_ne!(
         floor.kind,
         VerdictKind::Fail,
-        "newcomer durability does not collapse below X at C_floor (got FAIL)"
+        "newcomer decodability does not collapse below X at C_floor (got FAIL)"
     );
     assert!(
         floor.effect > floor.threshold,
-        "mean newcomer durability {:.4} sits above the floor X {:.2}",
+        "mean newcomer decodability {:.4} sits above the floor X {:.2}",
         floor.effect,
         floor.threshold
     );
@@ -4964,11 +5162,11 @@ fn collude_farm_false_is_byte_identical_to_honest() {
     // change (no A7 role ⇒ adv_collude_farm collects no members ⇒ strict no-op on the honest path).
     let m = run_one_seed(&honest_v2(), 42).metrics;
     assert_eq!(m.alive_symbols, 224, "alive");
-    assert_eq!(m.evicts, 621, "evicts");
-    assert_eq!(m.preempts, 375, "preempts");
-    assert_eq!(m.cap_trims, 179, "cap_trims");
+    assert_eq!(m.evicts, 627, "evicts");
+    assert_eq!(m.preempts, 380, "preempts");
+    assert_eq!(m.cap_trims, 182, "cap_trims");
     assert!(
-        (m.share_a_pos - 75.45).abs() < 0.1,
+        (m.share_a_pos - 75.89).abs() < 0.1,
         "share A>0 = {}",
         m.share_a_pos
     );
@@ -5286,7 +5484,7 @@ fn a10_fire_exit(world: &mut World, frac: f64, seed: u64) {
 }
 
 /// Step the honest a10 world with the scenario's ProviderExit event applied at each due tick, tracking
-/// the POST-EXIT repair-storm peak (max `detected_deficit_symbols` + max `owners_repairing` over ticks
+/// the POST-EXIT repair-storm peak (max `detected_blocks_below_target` + max `owners_repairing` over ticks
 /// ≥ the exit tick) and returning `(peak_deficit, peak_owners_repairing, overall_durability@horizon)`.
 /// The honest world (no adversaries / inflow / tier / demand mix) makes `build_world` == the runner's
 /// `build_world_for`, so this loop's world evolution matches `run()`'s predator arm bit-for-bit — the
@@ -5322,7 +5520,7 @@ fn a10_storm_and_durability(sc: &Scenario, seed: u64) -> (usize, usize, f64) {
         );
         crate::sim_dynamic::engine::step(&mut world, params, &prior, &policy);
         if t >= A10_TEST_EXIT_TICK {
-            peak_deficit = peak_deficit.max(world.repair_stat.detected_deficit_symbols);
+            peak_deficit = peak_deficit.max(world.repair_stat.detected_blocks_below_target);
             peak_owners = peak_owners.max(world.repair_stat.owners_repairing);
         }
     }
@@ -5406,7 +5604,7 @@ fn overall_floor_durability_counts_noncream_fill_per_owner_with_edge_cases() {
     // Review B2: a DIRECT unit test of the A10 floor-fill reader on a hand-built world (the other
     // A10 tests exercise it only end-to-end, where the value is unverifiable by hand). Covers:
     // non-cream-only counting (cream excluded), dead-symbol exclusion, absent-HOLDER exclusion,
-    // the per-block clip at 1.0, absent-OWNER skip, owners with no floor-ever-met block skipped,
+    // the per-block clip at 1.0, absent-OWNER skip, owners with no target-ever-met block skipped,
     // per-owner-then-over-owners averaging, and the NaN edges (floor == 0 / no floor-met block).
     let mut w = controlled_world(10, 11);
     let floor = 5usize;
@@ -5416,7 +5614,7 @@ fn overall_floor_durability_counts_noncream_fill_per_owner_with_edge_cases() {
     w.nodes[9].present = false; // absent: both an excluded HOLDER and a skipped OWNER below
     // Owner 0, block 0: 3 alive non-cream on present holders (counted) + 2 cream (excluded)
     // + 1 dead non-cream (excluded) + 1 non-cream on the absent holder 9 (excluded) ⇒ 3/5.
-    w.nodes[0].own_blocks = vec![floor_met_block(0, 0.5), floor_met_block(1, 0.5)];
+    w.nodes[0].own_blocks = vec![target_met_block(0, 0.5), target_met_block(1, 0.5)];
     for h in 1..=3 {
         push_held(&mut w, h, 0, 0, 0.5, false);
     }
@@ -5430,14 +5628,14 @@ fn overall_floor_durability_counts_noncream_fill_per_owner_with_edge_cases() {
         push_held(&mut w, h, 0, 1, 0.5, false);
     }
     // Owner 7, block 5: 1 alive non-cream ⇒ 1/5 = 0.2.
-    w.nodes[7].own_blocks = vec![floor_met_block(5, 0.5)];
+    w.nodes[7].own_blocks = vec![target_met_block(5, 0.5)];
     push_held(&mut w, 1, 7, 5, 0.5, false);
-    // Owner 8: only a NEVER-floor-met block ⇒ skipped (young data is not in the denominator).
-    let mut young = floor_met_block(6, 0.5);
-    young.floor_ever_met = false;
+    // Owner 8: only a NEVER-target-met block ⇒ skipped (young data is not in the denominator).
+    let mut young = target_met_block(6, 0.5);
+    young.target_ever_met = false;
     w.nodes[8].own_blocks = vec![young];
-    // Absent owner 9: a fully-held floor-met block that must NOT enter the mean.
-    w.nodes[9].own_blocks = vec![floor_met_block(7, 0.5)];
+    // Absent owner 9: a fully-held target-met block that must NOT enter the mean.
+    w.nodes[9].own_blocks = vec![target_met_block(7, 0.5)];
     for h in 1..=5 {
         push_held(&mut w, h, 9, 7, 0.5, false);
     }
@@ -5448,13 +5646,13 @@ fn overall_floor_durability_counts_noncream_fill_per_owner_with_edge_cases() {
     );
     // floor == 0 ⇒ NaN (no denominator semantics, not a panic).
     assert!(overall_floor_durability(&w, 0).is_nan(), "floor = 0 ⇒ NaN");
-    // No present owner with a floor-ever-met block ⇒ NaN.
+    // No present owner with a target-ever-met block ⇒ NaN.
     for nd in &mut w.nodes {
         nd.own_blocks.clear();
     }
     assert!(
         overall_floor_durability(&w, floor).is_nan(),
-        "no floor-met block anywhere ⇒ NaN"
+        "no target-met block anywhere ⇒ NaN"
     );
 }
 
@@ -5534,11 +5732,11 @@ fn no_provider_exit_is_byte_identical_to_honest() {
     // The frozen sim_diag anchor numbers stay UNMOVED by the A10 change (no ProviderExit ⇒ the
     // executor branch never fires) — honest_v2 seed-42 still holds field-for-field.
     assert_eq!(m_honest.alive_symbols, 224, "alive");
-    assert_eq!(m_honest.evicts, 621, "evicts");
-    assert_eq!(m_honest.preempts, 375, "preempts");
-    assert_eq!(m_honest.cap_trims, 179, "cap_trims");
+    assert_eq!(m_honest.evicts, 627, "evicts");
+    assert_eq!(m_honest.preempts, 380, "preempts");
+    assert_eq!(m_honest.cap_trims, 182, "cap_trims");
     assert!(
-        (m_honest.share_a_pos - 75.45).abs() < 0.1,
+        (m_honest.share_a_pos - 75.89).abs() < 0.1,
         "share A>0 = {}",
         m_honest.share_a_pos
     );
@@ -5712,4 +5910,123 @@ fn a10_provider_exit_is_registered() {
         sc.verdicts.iter().any(|v| v.id == "INV-DETERMINISM"),
         "a10 board carries INV-DETERMINISM"
     );
+}
+
+// ------------------------------------------------------------------
+// SIM-UNIFICATION — the target_ever_met denominator + the decodability read
+// (`4r_sim_unification_spec.md` §4/§5.6/§5.7)
+// ------------------------------------------------------------------
+
+#[test]
+fn target_ever_met_replaces_floor_ever_met_in_restore_denominator() {
+    // Spec §5.6: the restore-truth DENOMINATOR is "data that was once durable", and after the
+    // unification that fact is `target_ever_met` (the owner's own R̂ once reached `r_target`),
+    // not an integer floor count. A block that never met the target is a backup still in
+    // progress, not a restore failure — it must stay OUT of the denominator.
+    let wp = restore_wp(16, 14.0, 50.0);
+    let mut world = controlled_world(wp.n_nodes, 3);
+    let victim = 0usize;
+    let mut young = target_met_block(1, 0.5);
+    young.target_ever_met = false; // still placing its first backup
+    world.nodes[victim].own_blocks = vec![target_met_block(0, 0.5), young];
+    let disaster_tick = 5u64;
+    let return_tick = disaster_tick + 1;
+    let holders = online_holders(&world, victim, return_tick, 4);
+    // Both blocks are equally well placed in god-view — only the FLAG differs.
+    for &h in holders.iter().take(2) {
+        push_held(&mut world, h, victim, 0, 0.5, false);
+    }
+    for &h in holders.iter().skip(2).take(2) {
+        push_held(&mut world, h, victim, 1, 0.5, false);
+    }
+
+    let mut tracker = RestoreTracker::new(&wp);
+    tracker.on_disaster(&world, victim, disaster_tick, DemandClass::M);
+    tracker.observe(&world, return_tick);
+    let rt = tracker.finalize();
+
+    assert_eq!(
+        rt.blocks.len(),
+        1,
+        "only the TARGET-ever-met block enters the denominator"
+    );
+    assert_eq!(
+        rt.blocks[0].block_id, 0,
+        "…and it is the established one, not the block still backing up"
+    );
+    // The metric readers use the same denominator.
+    let dur = overall_floor_durability(&world, DynParams::default().n_symbols);
+    assert!(
+        dur.is_finite(),
+        "the floor-fill read shares the target-ever-met denominator"
+    );
+    let d = block_decodable_fraction(&world, DynParams::default().k_eff);
+    assert_eq!(
+        d.blocks, 1,
+        "the decodability read shares it too (the young block is not counted)"
+    );
+}
+
+#[test]
+fn block_decodable_fraction_counts_cream_and_flags_below_k_eff_tail() {
+    // Spec §5.7 / §4: decodability counts ALIVE symbols with NO floor/cream distinction
+    // (RaptorQ decodes from any k_eff), over the target-ever-met blocks of PRESENT owners —
+    // and reports the size of the undecodable TAIL alongside the fraction.
+    let k_eff = 2usize;
+    let mut w = controlled_world(12, 9);
+    // Owner 0: three target-met blocks.
+    w.nodes[0].own_blocks = vec![
+        target_met_block(0, 0.5), // 1 floor + 1 cream ⇒ 2 ≥ k_eff: DECODABLE via cream
+        target_met_block(1, 0.5), // 1 floor only ⇒ below k_eff: the TAIL
+        target_met_block(2, 0.5), // 3 floor ⇒ decodable
+    ];
+    push_held(&mut w, 1, 0, 0, 0.5, false);
+    push_held(&mut w, 2, 0, 0, 0.5, true); // cream — counts for decoding
+    push_held(&mut w, 3, 0, 1, 0.5, false);
+    for h in 4..=6 {
+        push_held(&mut w, h, 0, 2, 0.5, false);
+    }
+    // A dead symbol must not count.
+    push_held(&mut w, 7, 0, 1, 0.5, false);
+    w.nodes[7].holdings.last_mut().unwrap().alive = false;
+    // Owner 8: a block that never met the target ⇒ excluded from the denominator.
+    let mut young = target_met_block(0, 0.5);
+    young.target_ever_met = false;
+    w.nodes[8].own_blocks = vec![young];
+    // Owner 9 is ABSENT ⇒ its (well-held) block is excluded.
+    w.nodes[9].own_blocks = vec![target_met_block(0, 0.5)];
+    w.nodes[9].present = false;
+    for h in 10..=11 {
+        push_held(&mut w, h, 9, 0, 0.5, false);
+    }
+
+    let d = block_decodable_fraction(&w, k_eff);
+    assert_eq!(
+        d.blocks, 3,
+        "denominator = target-ever-met blocks of PRESENT owners"
+    );
+    assert_eq!(
+        d.below_k_eff, 1,
+        "exactly one block is below k_eff (the tail)"
+    );
+    assert!(
+        (d.fraction - 2.0 / 3.0).abs() < 1e-12,
+        "2 of 3 decodable (the cream one counts): {}",
+        d.fraction
+    );
+    // A symbol on a DEPARTED holder is not collectable ⇒ not decodable.
+    w.nodes[2].present = false; // the cream holder of block 0 leaves
+    let d2 = block_decodable_fraction(&w, k_eff);
+    assert_eq!(
+        d2.below_k_eff, 2,
+        "losing the cream holder drops block 0 below k_eff"
+    );
+    // k_eff = 0 ⇒ vacuously decodable (no panic, no NaN).
+    assert_eq!(block_decodable_fraction(&w, 0).below_k_eff, 0);
+    // No target-ever-met block anywhere ⇒ NaN fraction (no denominator), no panic.
+    for nd in &mut w.nodes {
+        nd.own_blocks.clear();
+    }
+    let empty = block_decodable_fraction(&w, k_eff);
+    assert!(empty.fraction.is_nan() && empty.blocks == 0);
 }

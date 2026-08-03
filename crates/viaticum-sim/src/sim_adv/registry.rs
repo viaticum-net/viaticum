@@ -29,24 +29,72 @@ const RESTORE_BW_GB_DAY: f64 = 50.0;
 /// The `dr_battle` co-loss size K_floor (`4r_dr_battle_spec.md` §3), FROZEN in code BEFORE the
 /// run (anti-Goodhart; calibrating the SCENARIO K is sanctioned, the threshold X is not).
 /// Calibrated from the runtime holder count of the T1/Reliable victim at the disaster tick
-/// (measured, seeds 42..46 — see `dr_battle_calibration_*`): the victim's MATURE blocks carry
-/// 5-7 distinct holders (typical 6; union across its 3 blocks = 11-16). Applying the spec's
-/// "holders − k_eff − margin, leave k_eff + 1" to the typical 6-holder block gives
-/// K_FLOOR = 6 − 2 − 1 = 3. The co-loss draws its 3 holders from the 11-16-holder UNION, so the
-/// deterministic seeded pick keeps EVERY floor-met block ≥ k_eff (measured restore-U = 1.0000,
-/// σ = 0 at K = 3). HONEST NOTE (finding): one seed's victim has a MARGINAL 3-holder floor-met
-/// block (a block that met floor earlier, then decayed) — so the strict worst-case "all K picks
-/// hit the smallest block" bound would force K ≤ 1; the frozen K = 3 rests on the deterministic
-/// union pick, not that worst case (the monotone sweep + collapse tests carry the honest
-/// degradation past this floor).
+/// (measured, seeds 42..46 — see `dr_battle_calibration_*`), then RE-DERIVED after
+/// SIM-UNIFICATION on the new widths (Ф-1).
+///
+/// **THE FINDING: the R̂-vs-target loop returned ≈ 18 % of the DR-primary victim's redundancy to
+/// the pool.** The owner now stops widening the moment its own estimate clears `r_target`
+/// instead of filling a 5-symbol floor, and the DR-primary backbone node is exactly where that
+/// bites hardest (measured at the disaster tick, same seeds, same world):
+///
+/// | | per-block holders (seeds 42..46) | union / victim | mean union |
+/// |---|---|---|---|
+/// | pre-unification | `[5,6,7] [3,4,6] [5,6,7] [5,6,7] [5,6,7]` (median 6) | 15, 11, 16, 16, 15 | 14.6 |
+/// | post-unification | `[5,5,6] [3,3,5] [4,6,4] [5,4,5] [4,5,6]` (median 5) | 13, 9, 12, 12, 14 | 12.0 |
+///
+/// Mean union −17.8 %, mean per-block width −17.6 %, thinnest block 3 (unchanged), widest 7 → 6.
+/// That freed redundancy is the point of the unification (it goes back to the pool), but it is
+/// ALSO the margin this scenario was calibrated on — hence the re-derivation below.
+///
+/// **Re-derivation, three readings of the spec rule "holders − k_eff − margin, leave k_eff + 1":**
+/// * on the WIDEST (mature) block, still 6 holders ⇒ `6 − 2 − 1 = 3` (the original derivation,
+///   unchanged — the mature block did not thin);
+/// * on the TYPICAL (median) block, now 5 ⇒ `5 − 2 − 1 = 2` (the rule's conservative reading);
+/// * strict worst case (all K picks land on the thinnest 3-holder block) ⇒ `K ≤ 0`.
+///
+/// K_FLOOR stays **3** — on the WIDEST reading, chosen deliberately and with the cost stated —
+/// and the property it now guarantees is MEASURED, not assumed: at K = 3 the deterministic union
+/// pick leaves EVERY target-ever-met victim block at ≥ k_eff survivors on all five frozen seeds —
+/// survivors/block `[3,4,6] [2,3,3] [4,5,2] [4,4,3] [3,3,6]`, zero blocks below k_eff = 2
+/// (asserted by `dr_battle_calibration_reports_victim_block_holder_counts`). The co-loss pool
+/// (union ≥ 9) still comfortably exceeds K.
+///
+/// **⚠ The MARGIN is gone on two seeds, and that is the honest cost (Ф-1 review BLOCK-1).** The
+/// spec's BINDING criterion is "calibrate K so the victim's blocks keep survivors ≥ k_eff"
+/// (`4r_dr_battle_spec.md` §3) — satisfied, measured, on all five seeds. Its parenthetical
+/// suggestion for the margin ("напр. оставить k_eff+1") is NOT satisfied at K = 3: **seeds 43 and
+/// 44 land at exactly k_eff** (post-event minima 2), i.e. zero margin. So the constant is
+/// spec-legal but sits ON the boundary rather than one symbol inside it, and the three readings
+/// above should not be read as "the rule still comfortably gives 3" — its conservative (median)
+/// reading gives 2, and 3 is defensible only because the survivor property is directly measured.
+///
+/// **What the −18 % DID cost:** restore-truth U is no longer 1.0000 at K_FLOOR — per-seed
+/// `[1.0, 0.667, 0.667, 1.0, 1.0]` (mean 0.8667, σ 0.1826). **This is NOT an independent
+/// "window-collectability" artifact.** The correspondence with the survivor minima is exact on
+/// all five seeds: `min survivors ≥ k_eff + 1 ⟺ U = 1.0`, `min survivors = k_eff ⟺ U = 2/3`.
+/// Restore-U was a deterministic READOUT of whether the spec's margin survived — losing the
+/// margin is exactly what the U drop reports. (An earlier draft of this comment claimed the guard
+/// measured a different question; the data refutes that.)
+///
+/// **Why converting that guard to a pin is nevertheless the right call.** No K ≥ 1 buys back the
+/// per-seed 1.0 reading: seed 43's thinnest target-ever-met block carries only 3 holders
+/// pre-event, so a SINGLE co-loss consumes its margin — measured sweep U: K=0 all 1.0; K=1 and
+/// K=2 one seed at 0.667; K=3 two seeds. The old guard is unreachable at any non-trivial K, so
+/// keeping it would have forced K = 0 (no correlated loss = no scenario). Hence
+/// `dr_battle_floor_holds_per_seed_across_the_frozen_band` is now an ANCHOR-STYLE PIN of the
+/// measured values, not a by-construction invariant — and the survivor property it used to imply
+/// is asserted directly, in its own units, by the calibration test.
 const DR_BATTLE_K_FLOOR: usize = 3;
 
 /// The `dr_battle` SURVIVAL-FLOOR threshold X (`4r_dr_battle_spec.md` §3 INV-DR-BATTLE-FLOOR),
 /// FROZEN in code BEFORE the run (anti-Goodhart). At K_FLOOR the victim's blocks keep ≥ k_eff
 /// survivors, so restore-truth U must clear a real DR-collapse floor: the same round 0.60
 /// semantic bar as INV-RESTORE-SANITY / INV-RESTORE-HETERO-L ("FAIL if > 40 % of the victim's
-/// blocks become unrestorable"), which the calibrated case clears decisively (measured mean =
-/// 1.0000, σ = 0 ⇒ power = ∞). Calibrate the SCENARIO (K_FLOOR), never this bar.
+/// blocks become unrestorable"). UNCHANGED by SIM-UNIFICATION — the bar is never calibrated —
+/// but the margin above it shrank with the −18 % width (see [`DR_BATTLE_K_FLOOR`]): the case now
+/// clears X at mean 0.8667, σ 0.1826 over the 5 frozen seeds (power 1.46 ⇒ the row lands
+/// INCONCLUSIVE, an honest small-sample outcome, not a FAIL) where pre-unification it read
+/// 1.0000, σ = 0. Calibrate the SCENARIO (K_FLOOR), never this bar.
 const DR_BATTLE_FLOOR_X: f64 = 0.60;
 
 // ============================================================
@@ -80,17 +128,43 @@ const A15_ENCLOSE_THRESH: f64 = 40.0;
 
 /// The FLOOR-board cartel size (group_size = C_floor). 10 of the n0 = 50 incumbents (frac 0.2): the
 /// non-cartel present capacity (≈ 40 incumbents + ~17 newcomers, all ≫ n_symbols = 5) still lets a
-/// newcomer the cartel refuses place and hold its floor on the honest remainder — the
+/// newcomer the cartel refuses place and hold its data on the honest remainder — the
 /// INV-ENCLOSURE-FLOOR sanity. FROZEN from the runtime present-count; see the report.
 const A15_C_FLOOR: usize = 10;
 
-/// The INV-ENCLOSURE-FLOOR newcomer-durability floor X. FROZEN as a round COLLAPSE bar (0.20) BELOW
-/// the measured baseline (mean newcomer durability ≈ 0.53-0.55 at C_floor, seeds 42..46) — "FAIL if
-/// the newcomer durability collapses below 0.20", NOT tuned. The metric carries large seed-
-/// REALIZATION variance (σ ≈ 0.40 ⇒ power ≈ 0.8 < 2), so the row lands INCONCLUSIVE — the same
-/// honest outcome as A5's INV-A5-DEEP-FLOOR (WARN-7: seed variance dominates, growing the world does
-/// not fix it), reported with the flat sweep, not tuned away.
-const A15_FLOOR_X: f64 = 0.20;
+/// The INV-ENCLOSURE-FLOOR newcomer floor X, on the **Ф-2 RE-BASED metric**: the newcomer
+/// DECODABLE fraction (`metrics::newcomer_decodable_fraction` — target-ever-met blocks still
+/// holding ≥ `k_eff` alive symbols, cream included), NOT the retired non-cream `≥ n_symbols`
+/// fill count.
+///
+/// **Why re-based (sim-unification follow-up, review STOP-2).** The R̂ placement loop stops at
+/// `R̂ ≥ r_target`, so a healthy block settles at 3-4 holders; the old numerator ("still ≥ 5
+/// non-cream holders") therefore went almost always false and the A15 headline read 0.12 where
+/// pre-unification it read 0.53 — a metric collapse with nothing having happened to newcomers'
+/// data. The invariant's actual question is "can the newcomer still GET ITS DATA BACK", which is
+/// decodability. (Deliberately NOT re-based on the new placement width: re-importing a count into
+/// a metric a count just burned buys the same fragility again.)
+///
+/// **X = 0.60, re-frozen on the same idiom the house restorability bars use** (INV-RESTORE-SANITY
+/// / INV-RESTORE-HETERO-L / [`DR_BATTLE_FLOOR_X`]): *FAIL if more than 40 % of the newcomers'
+/// once-durable blocks become UNDECODABLE.* Measured re-based baseline at C_floor (seeds 42..46):
+/// per-seed `[0.75, 1.0, 1.0, 1.0, 1.0]`, mean 0.9500, σ 0.1118 ⇒ power 3.13 — the row now PASSES
+/// (pre-Ф-2 it was INCONCLUSIVE on the fill count). The whole cartel-fraction sweep stays above
+/// it (means 0.8333 / 0.9500 / 1.0000 / 0.9000 / 0.8967 / 0.8167 at frac 0.0…1.0), the tightest
+/// margin being the TOTAL-cartel point at 0.8167. NOTE the bar moved UP (0.20 → 0.60): the
+/// re-based metric lives on a higher scale, so the old number would have been a bar the physics
+/// could not fail. Calibrate the SCENARIO (C_floor), never this bar.
+///
+/// **"Higher number" ≠ "stricter" — what this row actually traded (Ф-2 review WARN-1).** Measured
+/// both ways: OLD fill count — baseline 0.53, σ ≈ 0.40, bar 0.20 ⇒ **0.83σ** away, adversary's
+/// bite −43 %. NEW decodability — baseline 0.9500, σ 0.1118, bar 0.60 ⇒ **3.13σ** away,
+/// adversary's bite −2 %. So the re-base bought MEANING (a borrowed house restorability bar with
+/// honest provenance, on the question that actually matters — can the newcomer get its data back)
+/// and paid with SENSITIVITY: as an enclosure DETECTOR this row is now weaker, and its
+/// INCONCLUSIVE→PASS promotion is a saturation artifact (4 of 5 seeds sit exactly at the 1.0
+/// ceiling), not new evidence about enclosure. Read the row as a collapse floor; read the
+/// enclosure strength off the cartel-pays sweep (see [`a15_enclosure`]).
+const A15_FLOOR_X: f64 = 0.60;
 
 // ============================================================
 // A7 sybil-farm (`4r_a7_spec.md`) — constants FROZEN in code BEFORE the run (anti-Goodhart). The
@@ -341,11 +415,13 @@ pub fn dr_baseline() -> Scenario {
 /// Disaster on the T1/Reliable backbone is CORRELATED — [`DR_BATTLE_K_FLOOR`] of the victim's
 /// current holders fall in the SAME tick (a region / provider outage that took the NAS *and*
 /// its offsite cluster of copies, A16). K_FLOOR is FROZEN so the victim's blocks keep ≥ k_eff
-/// survivors across the frozen seeds 42-46 (MEASURED + monotonicity-backed from the co_loss=4
-/// margin — NOT structural for an arbitrary seed; see [`DR_BATTLE_K_FLOOR`]), so restore-truth U
-/// must still clear the [`DR_BATTLE_FLOOR_X`] floor (INV-DR-BATTLE-FLOOR). The HONEST-REFLECT
-/// monotonicity (U falls as more holders are co-lost, → 0 below k_eff) is a `tests.rs` sweep, not
-/// a board row.
+/// survivors across the frozen seeds 42-46 (MEASURED post-unification, all five seeds — NOT
+/// structural for an arbitrary seed; see [`DR_BATTLE_K_FLOOR`]), so restore-truth U must still
+/// clear the [`DR_BATTLE_FLOOR_X`] floor (INV-DR-BATTLE-FLOOR). SIM-UNIFICATION took ≈ 18 % of
+/// this victim's redundancy back into the pool, so U at K_FLOOR is now 0.8667 ± 0.1826 rather
+/// than 1.0000 ± 0 — the survivors are there, the 2-tick restore window no longer collects two
+/// of them on every seed. The HONEST-REFLECT monotonicity (U falls as more holders are co-lost,
+/// → 0 below k_eff) is a `tests.rs` sweep, not a board row.
 pub fn dr_battle() -> Scenario {
     Scenario {
         id: ScenarioId("dr_battle"),
@@ -374,8 +450,10 @@ pub fn dr_battle() -> Scenario {
         )],
         horizon: 130,
         // FROZEN band: the ≥k_eff survival margin at K_FLOOR is MEASURED for exactly these seeds
-        // (see DR_BATTLE_K_FLOOR's marginal-block note). Do NOT widen without re-checking FLOOR
-        // per-seed — `dr_battle_floor_holds_per_seed_across_the_frozen_band` fails a bad seed.
+        // (see DR_BATTLE_K_FLOOR's re-derivation). Do NOT widen without re-running BOTH
+        // `dr_battle_calibration_reports_victim_block_holder_counts` (the survivor floor — the
+        // real invariant) and `dr_battle_floor_holds_per_seed_across_the_frozen_band` (the
+        // per-seed restore-U pin, which is seed-specific and would have to be re-frozen).
         seeds: vec![42, 43, 44, 45, 46],
         metrics: vec![MetricId::RestoreTruth, MetricId::InvariantBoard],
         verdicts: dr_battle_invariants(),
@@ -1049,15 +1127,25 @@ pub fn a6_discriminator() -> Scenario {
 /// the newcomer stream?
 ///
 /// The mechanism is SOFT enclosure — the cartel places its OWN data honestly (no placement lever).
-/// The headline is the newcomer floor-durability (the fraction of newcomers' floor-met blocks that
-/// stay ≥ floor). Board: INV-ENCLOSURE-FLOOR (at C_floor, where the non-cartel capacity still covers
-/// n_symbols = 5, the newcomer durability clears the frozen X) + the two structural rows. The
-/// cartel-FRACTION SWEEP (durability vs cartel_frac) is a `tests.rs` sweep, NOT a board row (A15 is
-/// a world-cut, not a twin). MEASURED FINDING (`newcomer_durability_monotone…`): in the ample-
-/// capacity regime (cartel ≤ 0.8·n0) the abundant non-cartel remainder keeps durability flat; at the
-/// TOTAL incumbent cartel (frac = 1.0) durability degrades (~0.55 → ~0.315) — enclosure bites — but
-/// never achieves LOCKOUT (> the collapse floor), because the inflow cohort forms its own reciprocal
-/// sub-community. `n0 = 50`, 160 ticks (weekly), 5 seeds.
+/// The headline (Ф-2 re-based, see [`A15_FLOOR_X`]) is the newcomer DECODABLE fraction: of the
+/// newcomers' blocks that once reached the reliability target, how many still hold ≥ `k_eff` alive
+/// symbols. Board: INV-ENCLOSURE-FLOOR (at C_floor, where the non-cartel capacity still covers the
+/// placement width, that fraction clears the frozen X) + the two structural rows. The
+/// cartel-FRACTION SWEEP is a `tests.rs` sweep, NOT a board row (A15 is a world-cut, not a twin).
+/// MEASURED FINDING (`newcomer_decodability_across_the_cartel_fraction_sweep`, re-based): in the
+/// ample-capacity regime (cartel ≤ 0.8·n0) the abundant non-cartel remainder keeps decodability
+/// flat and high (0.83-1.00); the TOTAL incumbent cartel (frac = 1.0) is the curve's minimum
+/// (0.8167), −2 % vs the no-cartel control (the retired fill-count metric showed −43 %). NO
+/// LOCKOUT at any swept fraction — the inflow cohort forms its own reciprocal sub-community —
+/// which is the claim this scenario supports.
+///
+/// **What it does NOT support (Ф-2 review BLOCK-2).** That −2 % is NOT evidence that the re-based
+/// metric preserved an enclosure signature: it is 0.0166 against an intra-regime seed-realization
+/// spread of 0.1667 (≈0.15 SEM), so on decodability the total-cartel-is-the-minimum ordering is
+/// indistinguishable from noise. Read this scenario's decodability as a COLLAPSE FLOOR only. The
+/// enclosure BITE is real but lives in a different read — the cartel-pays ratio falls 0.977 →
+/// 0.552 across the same sweep (`a15_enclosure_calibration_dump`). Do not re-attach a
+/// sensitivity claim to the decodable fraction. `n0 = 50`, 160 ticks (weekly), 5 seeds.
 pub fn a15_enclosure() -> Scenario {
     let horizon = A15_HORIZON;
     // A fully-established incumbent network at t=0: `n0_frac = 1.0` makes all n0 bootstrap nodes
@@ -1121,12 +1209,14 @@ fn a15_enclosure_invariants() -> Vec<Invariant> {
             threshold: 1.0,
         },
         // INV-ENCLOSURE-FLOOR: at the calibrated cartel fraction C_floor — where the NON-cartel
-        // present capacity still far exceeds n_symbols = 5 — a newcomer the cartel refuses can
-        // still reach and hold floor on the honest remainder, so the newcomer floor-durability
-        // clears a frozen floor X. GreaterThan, power-gated (spec §10 п.16): power < 2 ⇒
-        // INCONCLUSIVE, itself a finding ("enclosure's newcomer effect is below the seed noise").
-        // A FAIL (durability < X even at a modest cartel) is the enclosure-bites finding — reported
-        // with the sweep curve, NOT tuned away.
+        // present capacity still far exceeds the placement width — a newcomer the cartel refuses
+        // can still place on the honest remainder, so its once-durable blocks stay DECODABLE
+        // (≥ k_eff alive symbols) above the frozen floor X (Ф-2 re-base, see A15_FLOOR_X).
+        // GreaterThan, power-gated (spec §10 п.16): power < 2 ⇒ INCONCLUSIVE, itself a finding
+        // ("enclosure's newcomer effect is below the seed noise"); on the re-based metric the row
+        // reads mean 0.9500 σ 0.1118 ⇒ power 3.13 = PASS. A FAIL (decodability < X even at a
+        // modest cartel) is the enclosure-bites finding — reported with the sweep curve, NOT tuned
+        // away.
         Invariant {
             id: "INV-ENCLOSURE-FLOOR",
             spec: InvariantSpec::EnclosureFloor {
@@ -1494,13 +1584,16 @@ fn dr_battle_invariants() -> Vec<Invariant> {
             threshold: 1.0,
         },
         // INV-DR-BATTLE-FLOOR (spec §3, SURVIVAL-FLOOR): at the frozen K_floor the victim's
-        // blocks keep ≥ k_eff survivors across the frozen seeds 42-46 (MEASURED, not structural
-        // for an arbitrary seed — see DR_BATTLE_K_FLOOR; `dr_battle_floor_holds_per_seed_*` guards
-        // it per-seed so widening the band can't silently pass on a mean), so restore-truth U must
-        // clear the frozen DR_BATTLE_FLOOR_X floor — the correlated loss did NOT push a mature
-        // backbone block below reconstructible. GreaterThan, power-gated (spec §10 п.16): a genuine
-        // collapse FAILS and is the finding, NOT a bar to lower. The restore-U(co_loss) sweep
-        // (tests.rs) is the HONEST-REFLECT co-evidence.
+        // blocks keep ≥ k_eff survivors across the frozen seeds 42-46 (MEASURED post-unification
+        // by `dr_battle_calibration_reports_victim_block_holder_counts`, not structural for an
+        // arbitrary seed — see DR_BATTLE_K_FLOOR), so restore-truth U must clear the frozen
+        // DR_BATTLE_FLOOR_X floor — the correlated loss did NOT push a mature backbone block below
+        // reconstructible. GreaterThan, power-gated (spec §10 п.16): a genuine collapse FAILS and
+        // is the finding, NOT a bar to lower; post-unification the row reads 0.8667 ± 0.1826
+        // (power 1.46 ⇒ INCONCLUSIVE — the −18 % width, not a collapse). The per-seed U pin
+        // `dr_battle_floor_holds_per_seed_*` keeps a diluted mean from hiding a seed-level
+        // regression, and the restore-U(co_loss) sweep (tests.rs) is the HONEST-REFLECT
+        // co-evidence.
         Invariant {
             id: "INV-DR-BATTLE-FLOOR",
             spec: InvariantSpec::RestoreStatistical {
@@ -1772,7 +1865,7 @@ fn tiered_invariants() -> Vec<Invariant> {
         // adjacent floor-completeness STEP (`min_adjacent_giver_gap`); the row PASSES iff no
         // adjacent tier inverts by more than `TIER_RANK_MARGIN = 0.05` ⇒ threshold −0.05,
         // GreaterThan (mean gap > −0.05). Comparative on purpose: if floor-completeness saturates
-        // (all ≈ 1, `floor_ever_met` monotone) the gap ≈ 0 with σ ≈ 0 ⇒ decisive PASS, and the
+        // (all ≈ 1, `target_ever_met` monotone) the gap ≈ 0 with σ ≈ 0 ⇒ decisive PASS, and the
         // real gradient is read off durability/parked in the table (a FINDING, not a tuned bar). A
         // genuine inversion (a lower tier out-placing a higher one by > 5 pp) FAILS — that is a real
         // finding to report, not to hide. (power<2 ⇒ INCONCLUSIVE, spec §10 п.16.)

@@ -22,7 +22,8 @@ use crate::sim_dynamic::evaluator::{
 };
 use crate::sim_dynamic::generator::{
     Archetype, DAYS_PER_TICK, DiskProfile, GiverTier, HeldSymbol, Node, OWN_DATA_DISK_FRACTION,
-    PairCapital, World, giver_tier_mix, online, online_prob, population_mix, surfaced_in_window,
+    OwnBlock, PairCapital, World, giver_tier_mix, online, online_prob, population_mix,
+    surfaced_in_window,
 };
 use crate::sim_dynamic::observer::{self, observe_pair};
 use crate::sim_dynamic::repair_storm::{
@@ -30,7 +31,9 @@ use crate::sim_dynamic::repair_storm::{
 };
 use crate::sim_dynamic::{Experiment1Config, build_world, run_experiment_1};
 
-use crate::sim_dynamic::engine::{per_node_upload_budget, repair_detected_for_test};
+use crate::sim_dynamic::engine::{
+    per_node_upload_budget, repair_demand_lower_bound_for_test, repair_detected_for_test,
+};
 
 use crate::sim_adv::predators::{a2_polite_dropper_hook, a2_silent_dropper_hook};
 use crate::sim_adv::scenario::{AdvDials, AdvId, AdvRole, BehaviorHook, InfoModel};
@@ -1639,9 +1642,10 @@ fn kernel_place_one_call_places_one_new_holder_on_a_fresh_bucket() {
     });
     assert_eq!(alive_block_counts_for_test(&world, owner, block_id).0, 1);
 
-    assert!(try_place_one_symbol_for_test(
-        &mut world, owner, 0, false, &params, &prior, &policy
-    ));
+    assert!(
+        try_place_one_symbol_for_test(&mut world, owner, 0, false, &params, &prior, &policy)
+            .is_some()
+    );
 
     let (floor_after, _) = alive_block_counts_for_test(&world, owner, block_id);
     assert_eq!(
@@ -1694,9 +1698,10 @@ fn kernel_cream_routes_through_place_cream_and_prefers_a_stranger() {
     }
     let block_id = world.nodes[owner].own_blocks[0].id;
 
-    assert!(try_place_one_symbol_for_test(
-        &mut world, owner, 0, true, &params, &prior, &policy
-    ));
+    assert!(
+        try_place_one_symbol_for_test(&mut world, owner, 0, true, &params, &prior, &policy)
+            .is_some()
+    );
 
     let holds_cream = |h: usize| {
         world.nodes[h]
@@ -2269,30 +2274,43 @@ fn giver_priority_order_toggle_runs_deterministically_both_ways() {
 }
 
 #[test]
-fn cream_symbols_are_excluded_from_the_floor_and_do_not_trigger_floor_repair() {
-    // §9.3: cream (over-the-floor) symbols carry the flag, are excluded from the FLOOR
-    // count, and their death leaves the floor DEMAND (`n_symbols − floor`) unchanged — so
-    // a full-floor block with dead cream is not repaired.
+fn cream_symbols_are_excluded_from_the_floor_count_but_count_toward_the_target_estimate() {
+    // §9.3 + SIM-UNIFICATION: the floor/cream SPLIT survives as bookkeeping — a cream symbol
+    // still carries the flag and is still excluded from the non-cream floor count (the metric
+    // raw material + the spread-cap counter). What does NOT survive is the old
+    // "cream-no-mandatory-repair" rule: under ONE reliability currency a live symbol is a live
+    // symbol (erasure decode reads any k_eff of them), so cream RAISES the owner's own R̂ and
+    // its death LOWERS it — and a block pushed below `r_target` by a cream death is repaired
+    // like any other. Asserted directly on the decision quantity.
     let params = one_shot_params(); // cream ON, ∞ bandwidth, all present
     let prior = SurfacePrior::default();
     let policy = PlacementPolicy::default();
     let mut world = build_world(60, &params, 55);
-    for _ in 0..3 {
+    // 12 ticks (was 3): the cream gate is now "the block's R̂ reached `r_target`", and a pair
+    // needs a few PoS rounds of history before its surface estimate clears the kernel's
+    // no-evidence conservatism — so the cream phase opens later in a fresh world than the old
+    // count gate did. (Measured: no cream at all at tick 3.)
+    for _ in 0..12 {
         step(&mut world, &params, &prior, &policy);
     }
-    // A high-ι block with a FULL floor AND ≥1 cream.
+    // Any block carrying cream (the target is reached with fewer symbols than the cap now, so
+    // "at the floor" is no longer the cream precondition — "at target" is).
     let mut found = None;
     'outer: for o in 0..world.nodes.len() {
-        for b in &world.nodes[o].own_blocks {
-            let (floor, cream) = alive_block_counts_for_test(&world, o, b.id);
-            if floor == params.n_symbols && cream >= 1 {
-                found = Some((o, b.id, floor, cream));
+        for bp in 0..world.nodes[o].own_blocks.len() {
+            let bid = world.nodes[o].own_blocks[bp].id;
+            let (floor, cream) = alive_block_counts_for_test(&world, o, bid);
+            if cream >= 1 {
+                found = Some((o, bp, bid, floor, cream));
                 break 'outer;
             }
         }
     }
-    let (o, bid, floor0, cream0) = found.expect("a high-ι block should carry cream in abundance");
+    let (o, bp, bid, floor0, cream0) =
+        found.expect("a high-ι block should carry cream in abundance");
     assert!(cream0 >= 1);
+    let r_before = crate::sim_dynamic::engine::block_r_hat(&world, o, bp, &params, &prior, &policy);
+
     // Kill every cream symbol of this block.
     for node in &mut world.nodes {
         for s in node.holdings.iter_mut() {
@@ -2305,11 +2323,12 @@ fn cream_symbols_are_excluded_from_the_floor_and_do_not_trigger_floor_repair() {
     assert_eq!(cream1, 0, "the cream should now be gone");
     assert_eq!(
         floor1, floor0,
-        "killing cream must NOT change the FLOOR count (§9.3)"
+        "killing cream must NOT change the FLOOR count (§9.3 bookkeeping, unchanged)"
     );
-    assert_eq!(
-        floor1, params.n_symbols,
-        "the floor demand (n_symbols − floor) stays 0 ⇒ cream death triggers no floor repair"
+    let r_after = crate::sim_dynamic::engine::block_r_hat(&world, o, bp, &params, &prior, &policy);
+    assert!(
+        r_after < r_before,
+        "cream DOES count toward the owner's own estimate: R̂ {r_before} → {r_after}"
     );
 }
 
@@ -2467,19 +2486,80 @@ fn latent_detection_lowers_peak_repair_concurrency_after_a_shock() {
 }
 
 #[test]
-fn repair_storm_demand_never_exceeds_aggregate_bandwidth() {
+fn repair_demand_bound_is_one_symbol_per_block_and_reaches_min_width_within_the_cap() {
+    // Ф-3 unit: the SYMBOL-unit demand bound of ONE detected below-target block.
+    // Defaults: k_eff = 2 ⇒ min_width = k_eff + MIN_REDUNDANCY = 4, n_symbols (cap) = 5.
+    let p = DynParams::default();
+    assert_eq!(p.k_eff, 2, "the arithmetic below is written for k_eff = 2");
+    assert_eq!(p.n_symbols, 5, "and for the 5-symbol spread cap");
+    // Wide block (alive ≥ min_width) still below target ⇒ the loop runs at least once.
+    assert_eq!(repair_demand_lower_bound_for_test(4, 4, &p), 1);
+    assert_eq!(repair_demand_lower_bound_for_test(9, 0, &p), 1);
+    // Thin block: the min_width clause forces min_width − alive symbols.
+    assert_eq!(repair_demand_lower_bound_for_test(1, 1, &p), 3);
+    assert_eq!(repair_demand_lower_bound_for_test(0, 0, &p), 4);
+    // The n_symbols spread cap bounds it: 1 non-cream holder left ⇒ at most 4 more.
+    assert_eq!(repair_demand_lower_bound_for_test(0, 1, &p), 4);
+    assert_eq!(repair_demand_lower_bound_for_test(0, 2, &p), 3);
+    // Cap already full ⇒ the loop cannot run ⇒ NO demand, however low R̂ is.
+    assert_eq!(repair_demand_lower_bound_for_test(5, 5, &p), 0);
+    assert_eq!(repair_demand_lower_bound_for_test(0, 5, &p), 0);
+}
+
+#[test]
+fn repair_storm_symbol_demand_never_exceeds_aggregate_bandwidth() {
     // At realistic upload speeds even the synchronous instant spike stays under the
     // aggregate bandwidth ceiling — no bandwidth cascade.
+    //
+    // UNITS (sim-unification follow-up Ф-3): both sides are SYMBOLS. The demand side is the
+    // documented LOWER BOUND `Σ min(max(1, min_width − alive), n_symbols − floor)` over the
+    // detected below-target blocks (`RepairStat::detected_demand_symbols_lb`) — the R̂ loop
+    // discovers the true width by placing, so no exact per-tick symbol demand exists to
+    // compare. The claim this test can therefore make is the CONSERVATIVE one: the demand
+    // the instrument can PROVE is owed never exceeds the ceiling. (Before the fix this
+    // compared a BLOCK count against a symbol bandwidth — a unit error that made the ratio
+    // meaningless in either direction.)
     let r = run_repair_storm(&storm_config(14_769_901, 0, 10.0));
+    println!(
+        "peak demand: {} symbols (lower bound) over {} blocks; bandwidth {} symbols/tick; \
+         max ratio {:.4}; ticks over: {}",
+        r.peak_detected_demand_symbols_lb,
+        r.peak_detected_blocks_below_target,
+        r.bandwidth_symbols,
+        r.max_demand_bandwidth_ratio,
+        r.demand_exceeds_bandwidth_ticks
+    );
+    assert!(
+        r.peak_detected_demand_symbols_lb > 0,
+        "the instrument must actually see repair demand (else the bound is vacuous)"
+    );
+    // Sanity, NOT an identity: the two peaks are maxima of two series and may fall on different
+    // ticks, and the per-block bound is ≥ 1 only while the spread cap has headroom (it is 0 when
+    // `floor == n_symbols`). This only checks the symbol instrument did not end up SMALLER than
+    // the block front it is supposed to price.
+    assert!(
+        r.peak_detected_demand_symbols_lb >= r.peak_detected_blocks_below_target,
+        "the symbol instrument should not read below the block front it prices: {} symbols vs {} blocks",
+        r.peak_detected_demand_symbols_lb,
+        r.peak_detected_blocks_below_target
+    );
     assert_eq!(
         r.demand_exceeds_bandwidth_ticks, 0,
-        "no tick's detected repair demand should exceed aggregate bandwidth"
+        "no tick's detected symbol demand (lower bound) should exceed aggregate bandwidth"
     );
     assert!(
         r.max_demand_bandwidth_ratio < 1.0,
         "peak demand/bandwidth ratio {} should stay below 1",
         r.max_demand_bandwidth_ratio
     );
+    // ⚠ SCOPE (review WARN-2). What this test licenses: "in the STORM configuration, repair demand
+    // never approached the aggregate ceiling" (measured peak 112 symbols vs 480, ratio 0.233). What
+    // it does NOT license: any claim about the polygon default. `storm_config` is bandwidth-RICH
+    // (~5 symbols/tick/owner vs the default world's ~1), and the numerator counts repairs only
+    // (initial backups and cream burn the same budget uncounted). Both conservatisms point the same
+    // way — toward "no cascade" — so this is a lower-bound instrument in a favourable world, not
+    // evidence that the bandwidth-starved default polygon has headroom. See
+    // `RepairStat::detected_demand_symbols_lb`.
 }
 
 #[test]
@@ -2497,7 +2577,11 @@ fn repair_storm_report_is_deterministic_for_the_same_config() {
     for (x, y) in a.trajectory.iter().zip(b.trajectory.iter()) {
         assert_eq!(x.under_k_blocks, y.under_k_blocks);
         assert_eq!(x.owners_repairing, y.owners_repairing);
-        assert_eq!(x.detected_demand_symbols, y.detected_demand_symbols);
+        assert_eq!(
+            x.detected_blocks_below_target,
+            y.detected_blocks_below_target
+        );
+        assert_eq!(x.detected_demand_symbols_lb, y.detected_demand_symbols_lb);
         assert_eq!(x.outstanding_demand_symbols, y.outstanding_demand_symbols);
     }
 }
@@ -2985,7 +3069,7 @@ fn disaster_victim_source_less_block_is_not_repaired_by_place_own_data() {
     }
     let victim = (0..world.nodes.len())
         .find(|&i| {
-            world.nodes[i].present && world.nodes[i].own_blocks.iter().any(|b| b.floor_ever_met)
+            world.nodes[i].present && world.nodes[i].own_blocks.iter().any(|b| b.target_ever_met)
         })
         .expect("a mature owner with an established block exists");
     let block_ids: Vec<usize> = world.nodes[victim]
@@ -3583,5 +3667,538 @@ fn a2_voluntary_drop_never_grinds_other_adversaries_or_absent_owners() {
         dead,
         vec![4],
         "only the present non-adversary owner's symbol is dropped (2=adv, 3=absent are immune)"
+    );
+}
+
+// ============================================================
+// SIM-UNIFICATION — repair trigger + placement width on the CORE estimate R̂
+// (`4r_sim_unification_spec.md` §1/§5). The floor COUNT decides nothing any more:
+// `n_symbols` is a spread cap, the decision is R̂ vs `r_target`.
+// ============================================================
+
+/// Params for the unification decision tests: one-shot world (everything mature, unlimited
+/// bandwidth) so ONLY the R̂-vs-target decision governs, instant detection, and the Р-5
+/// per-holder credit cap DISABLED (`r_min = 0`) so a deliberately weak partner is still an
+/// admissible candidate — the tests isolate the WIDTH/TRIGGER rule, not the credit gate.
+fn unification_params() -> DynParams {
+    DynParams {
+        incremental: false,
+        bandwidth_u: f64::INFINITY,
+        repair_detection_delay_max: 0,
+        r_min: 0.0,
+        ..DynParams::default()
+    }
+}
+
+/// A controlled world for the unification tests: every node present, Reliable (accepts),
+/// empty holdings, empty disk pressure. Only node `owner` keeps own data (ONE block), so
+/// there is no cross-owner contention and the whole candidate pool is available.
+fn unification_world(n: usize, seed: u64, params: &DynParams, owner: usize) -> World {
+    let mut w = build_world(n, params, seed);
+    for nd in &mut w.nodes {
+        nd.present = true;
+        nd.archetype = Archetype::Reliable;
+        nd.holdings.clear();
+        nd.disk.own_data = 0.0;
+        nd.disk.own_growth_per_tick = 0.0;
+        nd.own_blocks.clear();
+    }
+    w.nodes[owner].own_blocks = vec![OwnBlock {
+        id: 0,
+        volume: params.block_volume,
+        iota: 0.9,
+        placements: Vec::new(),
+        target_ever_met: false,
+        target_deficit_since: None,
+        to_restore: false,
+    }];
+    w
+}
+
+/// Give the pair `(owner, holder)` a PoS record of `passes` passes out of `total` outcomes —
+/// the first-hand history the surface estimate reads (a clean window ⇒ high `r̂`, a holed one
+/// ⇒ low). Deterministic order: passes first, then the misses.
+fn set_pos_record(world: &mut World, owner: usize, holder: usize, passes: usize, total: usize) {
+    world.capital[owner][holder].pos_window.clear();
+    for i in 0..total {
+        world.capital[owner][holder].push_outcome(i < passes);
+    }
+}
+
+/// Alive holders of `owner`'s block `block_id`, split `(floor, cream)`.
+fn holders_of(world: &World, owner: usize, block_id: usize) -> (usize, usize) {
+    alive_block_counts_for_test(world, owner, block_id)
+}
+
+#[test]
+fn repair_fires_when_estimate_drops_below_target_not_on_floor_count() {
+    // THE discriminator of the new physics (spec §5.1). Two owners, each with a block on
+    // exactly TWO holders — the SAME holder COUNT, far below the `n_symbols = 5` floor, so
+    // the OLD count rule would have repaired BOTH. The difference is holder QUALITY: owner
+    // A's two holders have a clean PoS window (high r̂ ⇒ block R̂ above target), owner B's are
+    // holed (low r̂ ⇒ block R̂ below target). Only B must repair.
+    let mut params = unification_params();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let (a, b) = (0usize, 1usize);
+    let mut world = unification_world(12, 4242, &params, a);
+    // Owner B gets its own block too (unification_world only seeded owner A).
+    world.nodes[b].own_blocks = vec![OwnBlock {
+        id: 0,
+        volume: params.block_volume,
+        iota: 0.9,
+        placements: Vec::new(),
+        target_ever_met: true, // both are REPAIRS (already established), not first backups
+        target_deficit_since: None,
+        to_restore: false,
+    }];
+    world.nodes[a].own_blocks[0].target_ever_met = true;
+    let v = params.block_volume / params.k_eff as f64;
+    // Two holders each, on distinct subnets (no correlate grouping), same count.
+    let (a_holders, b_holders) = ([4usize, 5], [6usize, 7]);
+    for &h in &a_holders {
+        push_alive_symbol(&mut world, h, a, 0, v);
+        set_pos_record(&mut world, a, h, 8, 8); // clean window ⇒ strong
+    }
+    for &h in &b_holders {
+        push_alive_symbol(&mut world, h, b, 0, v);
+        set_pos_record(&mut world, b, h, 3, 8); // holed window ⇒ weak
+    }
+    let r_a = crate::sim_dynamic::engine::block_r_hat(&world, a, 0, &params, &prior, &policy);
+    let r_b = crate::sim_dynamic::engine::block_r_hat(&world, b, 0, &params, &prior, &policy);
+    assert!(
+        r_a > r_b,
+        "setup: the clean-record pair must estimate higher (A {r_a} vs B {r_b})"
+    );
+    // The target sits BETWEEN the two estimates — the only thing that distinguishes them.
+    params.r_target = 0.5 * (r_a + r_b);
+    assert_eq!(
+        holders_of(&world, a, 0).0,
+        holders_of(&world, b, 0).0,
+        "setup: identical holder COUNT (what the old rule keyed on)"
+    );
+    assert!(
+        holders_of(&world, a, 0).0 < params.n_symbols,
+        "setup: BOTH are below the n_symbols floor ⇒ the old count rule would repair both"
+    );
+
+    crate::sim_dynamic::engine::place_own_data_for_test(&mut world, &params, &prior, &policy);
+
+    assert_eq!(
+        holders_of(&world, a, 0).0,
+        2,
+        "R̂ ≥ target ⇒ NO repair, despite only 2 of the 5 floor slots being used"
+    );
+    assert!(
+        holders_of(&world, b, 0).0 > 2,
+        "R̂ < target ⇒ repair fires (same holder count, worse holders)"
+    );
+    assert!(
+        world.nodes[a].own_blocks[0].target_deficit_since.is_none(),
+        "the at-target block carries no deficit episode"
+    );
+}
+
+/// Push one ALIVE non-cream symbol of `owner`'s block `block` onto `holder` (god-view), and
+/// mirror it into the owner's placement bookkeeping.
+fn push_alive_symbol(world: &mut World, holder: usize, owner: usize, block: usize, volume: f64) {
+    world.nodes[holder].holdings.push(HeldSymbol {
+        owner,
+        block,
+        iota: 0.9,
+        volume,
+        alive: true,
+        cream: false,
+    });
+    if let Some(b) = world.nodes[owner]
+        .own_blocks
+        .iter_mut()
+        .find(|b| b.id == block)
+    {
+        b.placements
+            .push(crate::sim_dynamic::generator::BlockPlacement {
+                holder,
+                cream: false,
+            });
+    }
+}
+
+/// Run the placement pass until it stops adding symbols (unlimited bandwidth still places
+/// ONE symbol per call per block, so the width is reached over several passes) and return
+/// the block's `(floor, cream)` holder counts plus its final R̂.
+fn place_until_stable(
+    world: &mut World,
+    owner: usize,
+    params: &DynParams,
+    prior: &SurfacePrior,
+    policy: &PlacementPolicy,
+) -> (usize, usize, f64) {
+    let block_id = world.nodes[owner].own_blocks[0].id;
+    let mut last = (usize::MAX, usize::MAX);
+    for _ in 0..20 {
+        crate::sim_dynamic::engine::place_own_data_for_test(world, params, prior, policy);
+        let now = holders_of(world, owner, block_id);
+        if now == last {
+            break;
+        }
+        last = now;
+    }
+    let r = crate::sim_dynamic::engine::block_r_hat(world, owner, 0, params, prior, policy);
+    (last.0, last.1, r)
+}
+
+/// Build a one-block world whose ENTIRE candidate pool has the given PoS record with the
+/// owner (`passes`/`total`) — a uniformly STRONG or uniformly WEAK neighbourhood.
+/// `total = 0` ⇒ NO history at all (fresh strangers).
+///
+/// The measured per-holder surface at the default prior (`v = volume/n_symbols`, `τ = 7 d`):
+/// stranger `r̂ = 0.612`, holed 3-of-8 `r̂ = 0.834`, clean 8-of-8 `r̂ = 0.946`. The block R̂ at
+/// `k_eff = 2` for a clean neighbourhood is 0.9914 (3 symbols) / 0.9994 (4) — it crosses the
+/// frozen 0.999 target at FOUR; a holed one reaches 0.9967 at the 5-symbol cap and a
+/// no-history one only 0.9216 (5) / 0.9840 (7), i.e. never within the cap. The kernel's own
+/// conservatism floor (`ci_low`) is why a KNOWN-but-holed pair still estimates well: only a
+/// no-evidence pair is genuinely weak.
+fn world_with_uniform_partner_quality(
+    n: usize,
+    seed: u64,
+    params: &DynParams,
+    owner: usize,
+    passes: usize,
+    total: usize,
+) -> World {
+    let mut world = unification_world(n, seed, params, owner);
+    for h in 0..n {
+        if h != owner {
+            set_pos_record(&mut world, owner, h, passes, total);
+        }
+    }
+    world
+}
+
+#[test]
+fn placement_width_stops_at_target_not_at_fixed_floor() {
+    // Spec §5.2: the WIDTH is decided by the estimate. In a neighbourhood of high-quality
+    // holders the owner reaches `r_target` with FEWER symbols than the `n_symbols` floor
+    // would have demanded; in a weak neighbourhood it keeps going and is stopped by the CAP,
+    // still below target. Same dials, same seed — only holder quality differs.
+    let params = unification_params();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+
+    let mut strong = world_with_uniform_partner_quality(14, 909, &params, 0, 8, 8);
+    let (s_floor, _s_cream, s_r) = place_until_stable(&mut strong, 0, &params, &prior, &policy);
+
+    let mut weak = world_with_uniform_partner_quality(14, 909, &params, 0, 0, 0);
+    let (w_floor, w_cream, w_r) = place_until_stable(&mut weak, 0, &params, &prior, &policy);
+
+    assert!(
+        s_r >= params.r_target,
+        "the strong neighbourhood reaches the target: R̂ = {s_r}"
+    );
+    assert!(
+        s_floor < params.n_symbols,
+        "quality ⇒ WIDTH BELOW the old fixed floor: {s_floor} < {}",
+        params.n_symbols
+    );
+    assert!(
+        s_floor >= params.k_eff,
+        "…but never below k_eff (the A.9 structural zero): {s_floor}"
+    );
+    assert_eq!(
+        w_floor, params.n_symbols,
+        "the weak neighbourhood is stopped by the SPREAD CAP, not by the target"
+    );
+    assert!(
+        w_r < params.r_target,
+        "…and it is still below target at the cap: R̂ = {w_r}"
+    );
+    assert_eq!(
+        w_cream, 0,
+        "a below-target block gets NO cream (the cream gate is the same R̂ ≥ target)"
+    );
+}
+
+#[test]
+fn n_symbols_acts_as_spread_cap_only() {
+    // Spec §5.3: `n_symbols` no longer says "place this many" — it only bounds how wide one
+    // block may be spread. In the SAME weak neighbourhood (target unreachable), raising the
+    // cap raises the placement count one-for-one; the decision quantity (R̂ < target) is
+    // unchanged and the block never stops "because the count was reached".
+    let mut params = unification_params();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+
+    let mut at5 = world_with_uniform_partner_quality(14, 31, &params, 0, 0, 0);
+    let (floor5, _, r5) = place_until_stable(&mut at5, 0, &params, &prior, &policy);
+
+    params.n_symbols = 7;
+    let mut at7 = world_with_uniform_partner_quality(14, 31, &params, 0, 0, 0);
+    let (floor7, _, r7) = place_until_stable(&mut at7, 0, &params, &prior, &policy);
+
+    assert_eq!(floor5, 5, "cap 5 ⇒ 5 symbols");
+    assert_eq!(
+        floor7, 7,
+        "cap 7 ⇒ 7 symbols (the cap, and only the cap, moved)"
+    );
+    assert!(
+        r5 < params.r_target && r7 < params.r_target,
+        "both runs are still BELOW the frozen target ({r5} / {r7}) — the cap stopped them"
+    );
+    assert!(
+        r7 > r5,
+        "more symbols ⇒ a higher estimate ({r7} > {r5}) — the estimate is what the loop reads"
+    );
+}
+
+#[test]
+fn first_backup_places_to_target_without_detection_latency() {
+    // Spec §5.4: an INITIAL backup (never met target) is never detection-gated — the owner
+    // knows it has not backed up yet. The SAME block, once `target_ever_met`, IS gated: with
+    // a latency window it waits for its seeded cadence offset before repairing.
+    let params = DynParams {
+        repair_detection_delay_max: 3,
+        ..unification_params()
+    };
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = world_with_uniform_partner_quality(14, 77, &params, 0, 8, 8);
+    let block_id = world.nodes[0].own_blocks[0].id;
+
+    // (a) first backup: placed on the very first pass, no latency.
+    crate::sim_dynamic::engine::place_own_data_for_test(&mut world, &params, &prior, &policy);
+    assert!(
+        holders_of(&world, 0, block_id).0 > 0,
+        "an initial backup places immediately (no PoS-detection latency)"
+    );
+    let (floor, _, r) = place_until_stable(&mut world, 0, &params, &prior, &policy);
+    assert!(
+        r >= params.r_target,
+        "the initial backup runs to the TARGET, not to a fixed count (R̂ = {r}, {floor} symbols)"
+    );
+
+    // (b) the same block as a REPAIR: mark it established, strip it to one holder, and pick a
+    // tick whose seeded detection offset has NOT elapsed — nothing may be placed then.
+    world.nodes[0].own_blocks[0].target_ever_met = true;
+    for nd in &mut world.nodes {
+        for s in nd.holdings.iter_mut() {
+            if s.alive && s.owner == 0 && s.block == block_id {
+                s.alive = false;
+            }
+        }
+    }
+    push_alive_symbol(&mut world, 1, 0, block_id, params.block_volume / 2.0);
+    let owner_id = world.nodes[0].id;
+    let since = world.tick;
+    let gated = !repair_detected_for_test(
+        world.seed,
+        owner_id,
+        block_id,
+        since,
+        world.tick,
+        params.repair_detection_delay_max,
+    );
+    assert!(
+        gated,
+        "setup: seed 77 / block 0 must draw a non-zero detection offset for this assertion"
+    );
+    let before = holders_of(&world, 0, block_id).0;
+    crate::sim_dynamic::engine::place_own_data_for_test(&mut world, &params, &prior, &policy);
+    assert_eq!(
+        holders_of(&world, 0, block_id).0,
+        before,
+        "a REPAIR waits for the detection cadence (the initial backup did not)"
+    );
+}
+
+#[test]
+fn cream_phase_gates_on_target_met() {
+    // Spec §5.5: cream is redundancy ABOVE the target, so its gate is "R̂ ≥ r_target" (was:
+    // "the integer floor is full"). A strong neighbourhood reaches the target with few
+    // symbols and then gets cream; a weak one never reaches it and gets none — even though
+    // the weak block holds MORE symbols (it sat at the cap).
+    let params = unification_params();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+
+    let mut strong = world_with_uniform_partner_quality(14, 5150, &params, 0, 8, 8);
+    let (s_floor, s_cream, s_r) = place_until_stable(&mut strong, 0, &params, &prior, &policy);
+    let mut weak = world_with_uniform_partner_quality(14, 5150, &params, 0, 0, 0);
+    let (w_floor, w_cream, w_r) = place_until_stable(&mut weak, 0, &params, &prior, &policy);
+
+    assert!(s_r >= params.r_target, "setup: strong is at target");
+    assert!(w_r < params.r_target, "setup: weak is below target");
+    assert!(
+        s_cream > 0,
+        "target met ⇒ the cream phase runs ({s_floor} floor + {s_cream} cream)"
+    );
+    assert_eq!(
+        w_cream, 0,
+        "target NOT met ⇒ no cream, even at {w_floor} symbols (more than the strong block)"
+    );
+}
+
+#[test]
+fn unified_repair_is_deterministic_across_double_run() {
+    // Spec §5.8: the R̂ loop draws no RNG of its own and reads the world in a deterministic
+    // (ascending-holder) order, so two identical runs are bit-identical — asserted on the
+    // FULL god-view state that the decision touches (per-block holder sets + the target
+    // flags), not merely on a summary scalar.
+    let params = DynParams::default();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let signature = |seed: u64| -> Vec<(usize, usize, bool, Option<u64>, usize, usize)> {
+        let mut world = build_world(60, &params, seed);
+        for _ in 0..40 {
+            step(&mut world, &params, &prior, &policy);
+        }
+        let mut sig = Vec::new();
+        for o in 0..world.nodes.len() {
+            for b in &world.nodes[o].own_blocks {
+                let (floor, cream) = alive_block_counts_for_test(&world, o, b.id);
+                sig.push((
+                    o,
+                    b.id,
+                    b.target_ever_met,
+                    b.target_deficit_since,
+                    floor,
+                    cream,
+                ));
+            }
+        }
+        sig
+    };
+    assert_eq!(
+        signature(42),
+        signature(42),
+        "the unified placement/repair pass is bit-identical across a double run"
+    );
+}
+
+/// The FROZEN R_TARGET calibration dump (anti-Goodhart evidence, spec §2 — the same idiom as
+/// `a10_provider_exit_calibration_dump`). Run with
+/// `cargo test -p viaticum-sim --lib r_target_calibration_probe_dump -- --ignored --nocapture`.
+///
+/// It prints, for the honest_v2 world at its mature horizon over the acceptance seeds, the
+/// distribution of the owners' OWN estimates R̂ — for ALL established blocks and for the
+/// HEALTHY subset (those actually sitting at the `n_symbols` non-cream spread cap) — plus the
+/// decodability read, plus how each candidate target would classify the population.
+///
+/// **The freeze (measured on the PRE-unification floor physics, seeds 42-46 @ tick 130):**
+/// healthy-at-cap blocks n = 18 pooled, R̂ ∈ [0.9997, 1.0000], p10 = 0.9998, median 0.9999;
+/// all-established median ≈ 0.79 (the world's typical block sits at 1-2 holders). The frozen
+/// `DynParams::r_target = 0.999` is the round value below the whole healthy cluster — see the
+/// `r_target` field doc for the full justification (and the daemon cross-check). Re-running
+/// this dump AFTER the unification measures the NEW operating point, not the freeze input.
+#[test]
+#[ignore = "R_TARGET calibration dump — run with --ignored --nocapture"]
+fn r_target_calibration_probe_dump() {
+    let params = DynParams::default();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let pct = |v: &[f64], p: f64| -> f64 {
+        if v.is_empty() {
+            return f64::NAN;
+        }
+        let mut s = v.to_vec();
+        s.sort_by(f64::total_cmp);
+        s[((s.len() - 1) as f64 * p).round() as usize]
+    };
+    let mut all_healthy: Vec<f64> = Vec::new();
+    let mut all_met: Vec<f64> = Vec::new();
+    println!(
+        "\n=== R_TARGET calibration dump (honest_v2 @ tick 130, r_target = {}) ===",
+        params.r_target
+    );
+    for seed in 42..=46u64 {
+        let mut world = build_world(100, &params, seed);
+        for _ in 0..130 {
+            step(&mut world, &params, &prior, &policy);
+        }
+        let (mut healthy, mut met) = (Vec::new(), Vec::new());
+        for o in 0..world.nodes.len() {
+            if !world.nodes[o].present {
+                continue;
+            }
+            for bp in 0..world.nodes[o].own_blocks.len() {
+                if !world.nodes[o].own_blocks[bp].target_ever_met {
+                    continue;
+                }
+                let bid = world.nodes[o].own_blocks[bp].id;
+                let (floor, _) = alive_block_counts_for_test(&world, o, bid);
+                let r = crate::sim_dynamic::engine::block_r_hat(
+                    &world, o, bp, &params, &prior, &policy,
+                );
+                met.push(r);
+                if floor >= params.n_symbols {
+                    healthy.push(r);
+                }
+            }
+        }
+        let dec = crate::sim_adv::metrics::block_decodable_fraction(&world, params.k_eff);
+        println!(
+            "seed {seed}: established n={:>3} (median R̂ {:.4}, p10 {:.4}) | at-cap n={:>3} (min {:.4}, p10 {:.4}, median {:.4}) | decodable {:.4} tail {}",
+            met.len(),
+            pct(&met, 0.5),
+            pct(&met, 0.1),
+            healthy.len(),
+            pct(&healthy, 0.0),
+            pct(&healthy, 0.1),
+            pct(&healthy, 0.5),
+            dec.fraction,
+            dec.below_k_eff,
+        );
+        all_healthy.extend(healthy);
+        all_met.extend(met);
+    }
+    println!(
+        "POOLED at-cap n={} min={:.4} p10={:.4} median={:.4} | established n={}",
+        all_healthy.len(),
+        pct(&all_healthy, 0.0),
+        pct(&all_healthy, 0.1),
+        pct(&all_healthy, 0.5),
+        all_met.len(),
+    );
+    for t in [0.90, 0.95, 0.98, 0.99, 0.999] {
+        let h = all_healthy.iter().filter(|&&r| r >= t).count();
+        let m = all_met.iter().filter(|&&r| r >= t).count();
+        println!(
+            "  candidate target {t:.3}: at-cap above = {:.3}  | established above = {:.3}",
+            h as f64 / all_healthy.len().max(1) as f64,
+            m as f64 / all_met.len().max(1) as f64,
+        );
+    }
+}
+
+#[test]
+fn placement_never_goes_below_the_daemon_minimum_redundancy() {
+    // The daemon's `solve_n_for_target` never returns fewer than `k_eff + MIN_REDUNDANCY`
+    // symbols ("at least 2 parity symbols regardless of trust or importance"), so neither may
+    // the sim — the R̂ target sets the width ABOVE that floor, never below it. SCOPE (review
+    // W2): the bound is enforced on the BELOW-target placement path only — a block that
+    // already clears the (swept-down) target with fewer symbols short-circuits and is never
+    // widened, so this is a placement-width floor, not a steady-state world invariant.
+    //
+    // At the FROZEN dials the floor is INERT (k_eff = 2 ⇒ min 4, and 0.999 already needs ≥ 4
+    // because the per-holder surface is capped near r̂ = 0.946 by the 8-sample PoS window:
+    // 3 symbols reach only 0.991). It binds when the target is SWEPT DOWN — which the new
+    // `r_target` CLI dial makes reachable — so the test exercises it there: at `r_target = 0.9`
+    // a clean-record neighbourhood meets the target with THREE symbols (0.9914 ≥ 0.9), and the
+    // placement must still land FOUR.
+    let params = DynParams {
+        r_target: 0.9,
+        ..unification_params()
+    };
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = world_with_uniform_partner_quality(14, 8181, &params, 0, 8, 8);
+    let (floor, _cream, r) = place_until_stable(&mut world, 0, &params, &prior, &policy);
+    assert_eq!(
+        floor,
+        params.k_eff + 2,
+        "width = k_eff + MIN_REDUNDANCY(2) even though R̂ = {r} cleared the target earlier"
+    );
+    assert!(
+        r >= params.r_target,
+        "the target is (over-)met at the minimum width: {r}"
     );
 }

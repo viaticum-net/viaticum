@@ -6,10 +6,14 @@
 //!      **own-data growth** (§A.2) + **incremental joins** (§9.1: activate nodes whose
 //!      seeded `joined_tick` has arrived).
 //!   1. **resync placements** (drop dead/departed holders from owners' bookkeeping)
-//!      then **place** (kernel `place_reciprocal`, floor + cream) under a per-node
+//!      then **place** (kernel `place_incremental_rank` / `place_cream`) under a per-node
 //!      **bandwidth budget** `U` (§9.2): ≤ `U/v_per_symbol` symbols placed per node per
 //!      tick, ι-priority, the rest carried to later ticks. Holder accept/reject by WILL
 //!      × ROOM, with **preemption** under contention (§9 fixes / A.12-2).
+//!      **SIM-UNIFICATION:** whether to place at all, and how wide, is decided by the
+//!      owner's OWN reliability estimate `R̂` vs its `r_target` ([`block_r_hat`]) — the
+//!      daemon's `current_reliability` vs `target_reliability` — NOT by an integer holder
+//!      count; `n_symbols` is only the spread cap and metric raw material.
 //!   2. **PoS-challenge + capital update** (§9.4 ONE physics + F1/F6): PoS-pass ⟺ the
 //!      symbol is alive ∧ the holder SURFACED in the 7-day window (F1/D2) ∧ the owner's
 //!      block still has a source (F6/D9 — a `to_restore` victim cannot verify). The A.1
@@ -23,6 +27,7 @@
 //! engine knows archetypes / tiers / join schedule (god-view) but passes them to NO
 //! kernel function — it uses them only to drive BEHAVIOUR.
 
+use viaticum_core::constants::MIN_REDUNDANCY;
 use viaticum_core::four_r::{
     BlockReq, BurnParams, DepthParams, FirstHandObs, Hysteresis, NodeLocal, PlacementPolicy,
     RetentionCap, RetentionPrior, SurfacePrior, apply_burn, capital_steady_state,
@@ -107,11 +112,31 @@ pub struct DynParams {
     /// single drop fades out of the retention forecast rather than being an eternal penalty
     /// under windowed PoS counters (WARN-1 review т4). OPEN calibration, flagged for Ilya.
     pub lambda_drop: f64,
-    /// Per-symbol erasure count `n` for own-data blocks.
+    /// Per-symbol erasure count `n` for own-data blocks. **SIM-UNIFICATION: a SPREAD CAP
+    /// only** — the widest the mandatory (non-cream) placement phase may spread ONE block
+    /// across holders, plus the denominator of the floor-fill metrics. It decides NOTHING
+    /// about "place one more symbol or not": that is the R̂-vs-[`DynParams::r_target`]
+    /// comparison (`place_own_data`, the daemon's `current_reliability` vs
+    /// `target_reliability`). Cream sits ABOVE this cap (`⌈cream_max·ι⌉` more).
     pub n_symbols: usize,
     /// Reconstruction threshold `k_eff`.
     pub k_eff: usize,
-    /// Per-block target reliability for `place`.
+    /// **SIM-UNIFICATION: THE decision dial.** The per-block target reliability the owner
+    /// places and repairs to: while its OWN first-hand estimate `R̂` ([`block_r_hat`] —
+    /// kernel A.9′ [`estimate_block_survival`] over the block's live placements at the
+    /// decision horizon `τ = DAYS_PER_TICK`) is BELOW this, the block is "below target"
+    /// (repair trigger, detection-gated) and the owner keeps widening the placement; at or
+    /// above it the block is done (and becomes cream-eligible). Exactly the daemon's
+    /// `current_reliability ≥ target_reliability` gate; before this tranche the sim decided
+    /// on an integer holder count and this dial was inert (only ever passed into
+    /// [`BlockReq`], which the incremental kernel path does not read).
+    ///
+    /// CALIBRATED-THEN-FROZEN (anti-Goodhart, sim-unification spec §2): a ROUND number just
+    /// below the measured R̂ of the healthy at-cap blocks of the honest_v2 world at a mature
+    /// tick over seeds 42-46 — see the frozen default and the
+    /// `r_target_calibration_probe_*` dump that froze it. ONE dial, ι-INDEPENDENT.
+    /// FOLLOW-UP (deliberately out of scope here): ι-scaling of the target (the daemon maps
+    /// importance → `target_reliability`) — a separate dial, a separate tranche.
     pub r_target: f64,
     /// Per-block total volume (gb).
     pub block_volume: f64,
@@ -123,9 +148,16 @@ pub struct DynParams {
     /// / Freeloader churn at a higher multiple (they are less committed).
     pub churn_out_prob: f64,
     /// Cream margin (world-v2 §9.3, W9): extra redundant symbols an owner greedily
-    /// places ABOVE the `r_target` floor, ι-prioritized (up to `⌈cream_max·ι⌉`). Cream
-    /// is placed with the owner's LEFTOVER per-tick bandwidth once the floor is met; it
-    /// is NOT counted in the floor-durability metric and does NOT trigger repair.
+    /// places ABOVE the `r_target` target, ι-prioritized (up to `⌈cream_max·ι⌉`). Cream is
+    /// placed with the owner's LEFTOVER per-tick bandwidth once the block's R̂ has REACHED
+    /// the target (SIM-UNIFICATION: the gate was "the integer floor is full"), and it is
+    /// still NOT counted in the non-cream floor-fill metrics.
+    ///
+    /// It DOES count toward the owner's reliability estimate R̂ (a live symbol is a live
+    /// symbol — erasure decode reads any `k_eff` of them), so unlike before, losing cream
+    /// can drop a block below target and thereby trigger a repair. The floor/cream split is
+    /// now a placement-BUDGET label (which phase pays for the symbol), not a second class of
+    /// reliability.
     pub cream_max: usize,
     /// Base physical disk capacity (gb), SHARED between own data and foreign holdings
     /// (design §A.2). Deliberately modest relative to the aggregate demand.
@@ -188,13 +220,14 @@ pub struct DynParams {
     pub recalibrated_retention: bool,
     /// Repair-storm §7 detection latency: the PoS-cadence window (ticks) over which an
     /// owner notices that one of its ALREADY-BACKED-UP blocks has dropped below its
-    /// `n_symbols` floor. `0` ⇒ INSTANT detection (the owner refills the very next tick,
-    /// the previous behaviour — bit-identical, no RNG drawn). `> 0` ⇒ LATENT: each
+    /// reliability TARGET (SIM-UNIFICATION: below `r_target` on its own R̂ — was: below the
+    /// `n_symbols` floor count). `0` ⇒ INSTANT detection (the owner refills the very next
+    /// tick, the previous behaviour — bit-identical, no RNG drawn). `> 0` ⇒ LATENT: each
     /// (owner, block) deficit episode gets a SEEDED uniform offset in `[0, max]` ticks
     /// before the owner acts, so a synchronous correlated-holder-death shock is
     /// discovered at spread-out ticks (the crux of the "latency smears the shock"
-    /// hypothesis). Applies only to REPAIR (a block that met its floor then lost
-    /// holders), never to an initial backup (`floor_ever_met == false`).
+    /// hypothesis). Applies only to REPAIR (a block that met its target then lost
+    /// holders), never to an initial backup (`target_ever_met == false`).
     pub repair_detection_delay_max: u64,
     /// Р-5 (A.13 / §13): per-holder reliability floor `r_min(ι)` fed to the core `place`
     /// credit cap `L(O→h) = max{V : r̂_h(V, τ) ≥ r_min}` ([`credit_limit_from_surface`],
@@ -248,7 +281,32 @@ impl Default for DynParams {
             lambda_drop: 1.0 / 56.0, // τ ≈ 8 weeks ≈ PoS-window scale ("system forgives")
             n_symbols: 5,
             k_eff: 2,
-            r_target: 0.90,
+            // SIM-UNIFICATION: CALIBRATED, then FROZEN (spec §2, anti-Goodhart).
+            //
+            // MEASURED (`r_target_calibration_probe_dump` on the PRE-unification floor
+            // physics, honest_v2 @ tick 130, seeds 42-46): the HEALTHY blocks — those actually
+            // sitting at the `n_symbols = 5` non-cream floor, n = 18 pooled — estimate
+            // R̂ ∈ [0.9997, 1.0000] (p10 0.9998, median 0.9999), i.e. a failure probability of
+            // ≈ 3·10⁻⁴ over the decision horizon. The old fixed floor's redundancy BAR,
+            // expressed in the new currency, IS that number. The frozen target is the ROUND
+            // value (in log-failure: 10⁻³) just BELOW that cluster: every block healthy under
+            // the old physics stays "target met" under the new one, and the bar is not
+            // silently lowered.
+            // REJECTED alternative 0.99: 30× looser in failure probability, and measurably a
+            // different operating point — the whole world thins out (decodable blocks
+            // 0.54 → 0.42, undecodable tail 25 → 56 blocks/seed at the horizon). That would
+            // have confounded "the decision rule changed" with "the bar dropped".
+            // CROSS-CHECK against the DAEMON: `viaticum_core::reliability::target_reliability`
+            // maps the sim's block-ι range 0.2…0.8 to 0.9425…0.99991 (log-failure −1.24…−4.06,
+            // mid ι = 0.5 ⇒ 0.9978 = −2.65). A single ι-independent −3.0 sits inside that band,
+            // nearest its midpoint — so the sim asks for the same order of durability the daemon
+            // does at mid importance.
+            // CONSEQUENCE (the mechanism, measured): at the world's observed per-holder quality
+            // (r̂ ≈ 0.89 ⇒ P(≥2 of 5) = 0.99928) the target needs ≈ 5 symbols — the old width;
+            // a clean-record neighbourhood (r̂ = 0.946) reaches it at 4, and a no-history one
+            // never does within the cap. QUALITY decides the width now, not the count.
+            // (Was 0.90 — an INERT value: nothing on the incremental placement path read it.)
+            r_target: 0.999,
             block_volume: 50.0, // F5: ⇒ 25 gb/chunk (source/k_eff) = the observed V0 anchor
             blocks_per_node: 3,
             hyst: Hysteresis {
@@ -626,24 +684,181 @@ fn block_is_to_restore(world: &World, owner: usize, block_id: usize) -> bool {
         .unwrap_or(false)
 }
 
-/// Count a block's ALIVE symbols across the network, split into (floor, cream).
-fn alive_block_counts(world: &World, owner: usize, block_id: usize) -> (usize, usize) {
-    let mut floor = 0usize;
-    let mut cream = 0usize;
-    for node in &world.nodes {
+/// A block's ALIVE holders across the network — the ONE scan every block-level read
+/// derives from. Returns `(holder_node_idx, is_cream)` in ASCENDING holder order (a
+/// deterministic scan; this is the order the kernel's A.9′ correlate grouping sees).
+fn alive_block_holders(world: &World, owner: usize, block_id: usize) -> Vec<(usize, bool)> {
+    let mut out: Vec<(usize, bool)> = Vec::new();
+    for (h, node) in world.nodes.iter().enumerate() {
         if let Some(s) = node
             .holdings
             .iter()
             .find(|s| s.alive && s.owner == owner && s.block == block_id)
         {
-            if s.cream {
-                cream += 1;
-            } else {
-                floor += 1;
-            }
+            out.push((h, s.cream));
         }
     }
-    (floor, cream)
+    out
+}
+
+/// Per-holder chunk volume (gb) of ONE block — the F5 (D4-leak) rule `volume / k_eff`
+/// applied to a SPECIFIC block's volume (blocks differ in size in the hetero / whale
+/// worlds, so this is per-block; [`v_per_symbol_of`] is the params-level default).
+fn chunk_volume(block_volume: f64, params: &DynParams) -> f64 {
+    if params.k_eff > 0 {
+        block_volume / params.k_eff as f64
+    } else {
+        block_volume
+    }
+}
+
+/// The owner's [`BlockReq`] for one block — the SINGLE construction the R̂ loop
+/// ([`block_view`]) and the kernel selection ([`try_place_one_symbol`]) share, so the two
+/// read the SAME estimate (one physics, no drift).
+///
+/// ⚠ `req.volume_per_symbol()` is the KERNEL's `volume / n_symbols`, NOT the sim's F5
+/// per-holder chunk `volume / k_eff` — the known phase-C debt (sim-unification spec §1;
+/// inert while the queried volume stays below the `v_dem` floor, which it does at the
+/// default dials). Carried over UNCHANGED from the pre-unification `try_place_one_symbol`:
+/// this tranche neither fixes nor worsens it.
+fn block_req(block_volume: f64, params: &DynParams) -> BlockReq {
+    BlockReq {
+        volume: block_volume,
+        n_symbols: params.n_symbols.max(1),
+        k_eff: params.k_eff,
+        tau: DAYS_PER_TICK,
+        r_target: params.r_target,
+        // Р-5 (A.13): the per-holder credit-cap floor, the DynParams `r_min` §13 handle
+        // (guess 0.5, NOT derived from r_target — 2b lesson). Consumed by the kernel place.
+        r_min: params.r_min,
+    }
+}
+
+/// SIM-UNIFICATION: the owner's FIRST-HAND view of one own block's CURRENT placement — the
+/// input of the R̂-vs-target decision (repair trigger AND placement width).
+struct BlockView {
+    /// The block's ALIVE holders as [`FirstHandObs`], built through EXACTLY the observer
+    /// path [`try_place_one_symbol`] uses for its `committed` set (same ascending-holder
+    /// order, same F5 per-chunk volume anchor `v0 = block_volume / k_eff`).
+    ///
+    /// **CREAM INCLUDED.** Erasure decode does not know the floor/cream label (any `k_eff`
+    /// symbols reconstruct), and the daemon's `current_reliability` counts every live
+    /// placement — so the owner's own reliability estimate counts them all. One currency,
+    /// no second class of symbol. (Consequence, documented: a cream death now lowers R̂ and
+    /// CAN therefore trigger a repair — the pre-unification "cream never triggers repair"
+    /// bookkeeping rule does not survive one-reliability-currency. The floor/cream split
+    /// survives as the placement BUDGET label: the cream phase is what places above target.)
+    obs: Vec<FirstHandObs>,
+    /// The block's [`BlockReq`] ([`block_req`]).
+    req: BlockReq,
+    /// Alive NON-cream holders. Decides NOTHING any more: it survives as the `n_symbols`
+    /// SPREAD CAP counter (how wide the mandatory phase may spread one block) and as the
+    /// raw material of the floor-fill metrics.
+    floor: usize,
+    /// Alive CREAM holders — the `⌈cream_max·ι⌉` budget counter of the cream phase.
+    cream: usize,
+}
+
+/// Build the [`BlockView`] of `owner`'s own block at `block_pos` (ONE holder scan).
+fn block_view(world: &World, owner: usize, block_pos: usize, params: &DynParams) -> BlockView {
+    let block = &world.nodes[owner].own_blocks[block_pos];
+    let block_id = block.id;
+    let block_volume = block.volume;
+    let holders = alive_block_holders(world, owner, block_id);
+    let floor = holders.iter().filter(|(_, c)| !*c).count();
+    let cream = holders.len() - floor;
+    let nodes: Vec<&Node> = holders.iter().map(|&(h, _)| &world.nodes[h]).collect();
+    let caps: Vec<&PairCapital> = holders
+        .iter()
+        .map(|&(h, _)| &world.capital[owner][h])
+        .collect();
+    let obs = observer::observe_candidates(
+        &nodes,
+        &caps,
+        DAYS_PER_TICK,
+        chunk_volume(block_volume, params),
+    );
+    BlockView {
+        obs,
+        req: block_req(block_volume, params),
+        floor,
+        cream,
+    }
+}
+
+/// The DAEMON's minimum redundancy, in the sim's units: a block is never placed thinner than
+/// `k_eff + MIN_REDUNDANCY` symbols, bounded by the `n_symbols` spread cap.
+///
+/// **Spec deviation, deliberate — SIM-UNIFICATION `4r_sim_unification_spec.md` §1 says the
+/// integer floor leaves the decisions entirely.** The daemon it unifies with does NOT decide
+/// on reliability alone: `viaticum_core::reliability::solve_n_for_target` searches
+/// `n ∈ [k_eff + MIN_REDUNDANCY, k_eff·MAX_OVERHEAD_FACTOR]` for the smallest `n` reaching the
+/// target, i.e. its width is `max(k_eff + MIN_REDUNDANCY, target-width)` — the constant's own
+/// doc: *"Ensures at least 2 parity symbols regardless of trust or importance. Prevents
+/// n == k_eff which would give zero fault tolerance."* A sim that omitted that half would model
+/// a protocol we do not run: at a lower target (the `r_target` sweep dial) it would hand out
+/// `k_eff + 1` placements the daemon can never produce. AC-1 still holds literally: `n_symbols`
+/// (the spread cap) participates in no "place one more?" decision — this floor is derived from
+/// `k_eff`, the erasure threshold.
+///
+/// **INERT at the frozen dials, deliberately kept.** With `k_eff = 2` the floor is 4, and the
+/// frozen `r_target = 0.999` already needs ≥ 4 symbols at ANY reachable holder quality (the
+/// 8-sample PoS window caps the per-holder surface near `r̂ = 0.946, so three symbols reach only
+/// 0.9914). It binds when the target is swept down — see
+/// `placement_never_goes_below_the_daemon_minimum_redundancy`. It is NOT the fix for the A16
+/// `dr_battle` margin finding (measured: adding it changed that victim's per-block holder counts
+/// not at all — those blocks are BELOW target and starving on bandwidth, not stopped by the rule).
+fn min_width(params: &DynParams) -> usize {
+    (params.k_eff + MIN_REDUNDANCY as usize).min(params.n_symbols)
+}
+
+/// The SYMBOL-unit repair demand of ONE detected below-target block, as a strict LOWER
+/// BOUND (god-view instrumentation only — the placement loop never reads it).
+///
+/// The R̂ loop discovers the true width by placing symbols one at a time, so "how many
+/// symbols does this block need" is not a quantity the owner computes. What the block's
+/// ENTRY state does pin down is the minimum number of loop iterations: the block is below
+/// target, so the loop runs at least once; the `alive < min_width` clause forces at least
+/// `min_width − alive` more; and the `n_symbols` spread cap allows at most
+/// `n_symbols − floor`. Hence `min(max(1, min_width − alive), n_symbols − floor)`, and `0`
+/// when the cap is already full (the loop cannot run at all).
+///
+/// It is a LOWER bound because reaching `r_target` on weak holders can take many more
+/// symbols than `min_width` — see [`RepairStat::detected_demand_symbols_lb`] for how to
+/// read a demand-vs-bandwidth comparison built on it.
+///
+/// `alive` = the block's alive holders CREAM INCLUDED (`BlockView::obs.len()`, the unit the
+/// `min_width` clause is written in); `floor` = its alive NON-cream holders (the unit the
+/// `n_symbols` spread cap counts in). Passing them as scalars keeps the bound testable
+/// without a hand-built world.
+fn repair_demand_lower_bound(alive: usize, floor: usize, params: &DynParams) -> usize {
+    let headroom = params.n_symbols.saturating_sub(floor);
+    if headroom == 0 {
+        return 0; // the spread cap is full — this tick places nothing for the block
+    }
+    min_width(params).saturating_sub(alive).max(1).min(headroom)
+}
+
+/// SIM-UNIFICATION: the owner's OWN first-hand estimate `R̂` that its block at `block_pos`
+/// survives the decision horizon (`tau = DAYS_PER_TICK`), over the block's CURRENT alive
+/// placements — the kernel A.9′ [`estimate_block_survival`]. THE decision quantity of the
+/// placement loop: repair fires while `R̂ < r_target`, width stops when `R̂ ≥ r_target`
+/// (the daemon's `current_reliability` vs `target_reliability`, sim-unification spec §1).
+///
+/// Anti-oracle: every input is the owner's own first-hand pair capital + the holders'
+/// observable address facts (the same `observe_*` path the kernel selection uses) — it is
+/// NOT a god-view survival probability. `pub` so the calibration probe / evaluator can read
+/// the very number the owner acts on.
+pub fn block_r_hat(
+    world: &World,
+    owner: usize,
+    block_pos: usize,
+    params: &DynParams,
+    prior: &SurfacePrior,
+    policy: &PlacementPolicy,
+) -> f64 {
+    let view = block_view(world, owner, block_pos, params);
+    estimate_block_survival(&view.obs, prior, &view.req, policy)
 }
 
 /// (1b): each present owner backs up its own blocks under a per-tick bandwidth budget
@@ -689,11 +904,16 @@ fn place_own_data(
                 .then(a.cmp(&b))
         });
 
-        // FLOOR phase: fill each mature block to n_symbols, ι-priority, within budget.
-        // Repair-storm §7 detection gate: a block that ALREADY met its floor but has now
+        // FLOOR phase (SIM-UNIFICATION): the owner decides on its OWN reliability estimate
+        // R̂ ([`block_r_hat`], kernel A.9′ over the block's CURRENT alive placements) versus
+        // its target — exactly as the daemon compares `current_reliability` to
+        // `target_reliability` — NOT on an integer holder count. `n_symbols` survives ONLY
+        // as the SPREAD CAP (how wide the mandatory phase may spread one block) and as
+        // metric raw material; it decides nothing about "place one more or not".
+        // Repair-storm §7 detection gate: a block that ALREADY met its target but has now
         // dropped below it (a REPAIR after a holder death) is only refilled once the
         // owner has NOTICED the loss — instantly (delay_max=0) or after a seeded per-block
-        // cadence offset (latent). An INITIAL backup (never met floor) has no latency.
+        // cadence offset (latent). An INITIAL backup (never met target) has no latency.
         let owner_id = world.nodes[owner].id;
         let mut owner_repaired = false;
         for &bp in &border {
@@ -706,20 +926,21 @@ fn place_own_data(
                 continue;
             }
             let block_id = world.nodes[owner].own_blocks[bp].id;
-            let (floor, _) = alive_block_counts(world, owner, block_id);
-            if floor >= params.n_symbols {
-                // Floor met (or over): mark reached, clear any deficit episode.
+            let view = block_view(world, owner, bp, params);
+            let mut r_hat = estimate_block_survival(&view.obs, prior, &view.req, policy);
+            if r_hat >= params.r_target {
+                // Target met (or over): mark reached, clear any deficit episode.
                 let b = &mut world.nodes[owner].own_blocks[bp];
-                b.floor_ever_met = true;
-                b.floor_deficit_since = None;
+                b.target_ever_met = true;
+                b.target_deficit_since = None;
                 continue;
             }
-            // Below floor. Repair (met floor before) is detection-gated; a first backup
-            // (floor_ever_met == false) is always eligible (no PoS-detection latency).
-            let is_repair = world.nodes[owner].own_blocks[bp].floor_ever_met;
+            // Below target. Repair (met target before) is detection-gated; a first backup
+            // (target_ever_met == false) is always eligible (no PoS-detection latency).
+            let is_repair = world.nodes[owner].own_blocks[bp].target_ever_met;
             let detected = if is_repair && params.repair_detection_delay_max > 0 {
                 let since = *world.nodes[owner].own_blocks[bp]
-                    .floor_deficit_since
+                    .target_deficit_since
                     .get_or_insert(tick);
                 repair_detected(
                     world.seed,
@@ -733,22 +954,50 @@ fn place_own_data(
                 true
             };
             if is_repair && detected {
-                world.repair_stat.detected_deficit_symbols += params.n_symbols - floor;
+                // Redefined honestly (sim-unification spec §1): ONE per detected
+                // below-target block. The old `n_symbols − floor` symbol deficit is not a
+                // quantity this loop computes any more (how many symbols a block needs is
+                // discovered by placing them, one R̂ recompute at a time) — so the SYMBOL
+                // demand is recorded next to it as a documented lower bound
+                // ([`repair_demand_lower_bound`]), keeping the storm's demand-vs-bandwidth
+                // comparison in one unit. Both are counted BEFORE the budget check below:
+                // demand is what the tick OWES, not what the bandwidth let through.
+                world.repair_stat.detected_blocks_below_target += 1;
+                world.repair_stat.detected_demand_symbols_lb +=
+                    repair_demand_lower_bound(view.obs.len(), view.floor, params);
                 owner_repaired = true;
             }
             if !detected || budget == 0 {
                 continue; // loss not yet noticed, or no upload budget left this tick
             }
-            let mut cur = floor;
-            while budget > 0 && cur < params.n_symbols {
-                if try_place_one_symbol(world, owner, bp, false, params, prior, policy) {
-                    budget -= 1;
-                    cur += 1;
-                    if is_repair {
-                        world.repair_stat.symbols_repaired += 1;
+            // Widen the placement until the owner's OWN estimate clears the target AND the
+            // daemon's minimum redundancy is covered — or the spread cap / bandwidth runs out.
+            // The cap counts NON-CREAM holders (verbatim the pre-unification floor counter):
+            // cream sits ABOVE the mandatory spread, so it must not squat a cap slot a repair
+            // needs. The `min_width` clause mirrors `solve_n_for_target`'s `min_n` (see
+            // [`min_width`]); the TRIGGER above stays purely R̂-vs-target, exactly as the
+            // daemon's satisfaction check is purely `current_reliability ≥ target_reliability`.
+            let min_w = min_width(params);
+            let mut alive = view.obs.len();
+            let mut floor = view.floor;
+            while budget > 0
+                && floor < params.n_symbols
+                && (r_hat < params.r_target || alive < min_w)
+            {
+                match try_place_one_symbol(world, owner, bp, false, params, prior, policy) {
+                    // The placement returns the block's R̂ AFTER the new symbol — the same
+                    // kernel estimate, recomputed incrementally over the real placement
+                    // (no full world re-sweep).
+                    Some(r) => {
+                        budget -= 1;
+                        floor += 1;
+                        alive += 1;
+                        r_hat = r;
+                        if is_repair {
+                            world.repair_stat.symbols_repaired += 1;
+                        }
                     }
-                } else {
-                    break; // no admissible holder this tick for this block
+                    None => break, // no admissible holder this tick for this block
                 }
             }
         }
@@ -771,13 +1020,20 @@ fn place_own_data(
                 }
                 let iota = world.nodes[owner].own_blocks[bp].iota.clamp(0.0, 1.0);
                 let cream_target = (params.cream_max as f64 * iota).round() as usize;
-                let block_id = world.nodes[owner].own_blocks[bp].id;
-                let (floor, mut cream) = alive_block_counts(world, owner, block_id);
-                if floor < params.n_symbols {
-                    continue; // floor not yet met → no cream for this block yet
+                let view = block_view(world, owner, bp, params);
+                let mut cream = view.cream;
+                if cream >= cream_target {
+                    continue; // cream budget already spent (skips the R̂ cost too)
+                }
+                // SIM-UNIFICATION: cream is redundancy ABOVE the target, so the gate is the
+                // owner's own R̂ ≥ target — the same estimate the floor phase acts on (was:
+                // the integer floor count). Same semantics ("over-the-floor"), one currency.
+                if estimate_block_survival(&view.obs, prior, &view.req, policy) < params.r_target {
+                    continue; // target not yet met → no cream for this block yet
                 }
                 while budget > 0 && cream < cream_target {
-                    if try_place_one_symbol(world, owner, bp, true, params, prior, policy) {
+                    if try_place_one_symbol(world, owner, bp, true, params, prior, policy).is_some()
+                    {
                         budget -= 1;
                         cream += 1;
                     } else {
@@ -797,14 +1053,22 @@ fn place_own_data(
 /// It walks the ranked candidates through the HOLDER-side accept/preemption gate
 /// ([`admit_offer`], unchanged — acceptance is holder policy, placement is owner policy);
 /// on the first acceptance it records the god-view holding + placement (flagged `cream`),
-/// appends the R̂-calibration prediction (metric-only, gated), and returns `true`.
+/// appends the R̂-calibration prediction (metric-only, gated), and returns
+/// `Some(R̂ after this placement)`. `None` ⇒ no admissible holder accepted.
+///
+/// **The returned R̂ is the caller's loop variable (SIM-UNIFICATION).** It is the SAME
+/// kernel `estimate_block_survival` over the block's holders INCLUDING the symbol just
+/// placed that the R̂-calibration log records — computed once, read by both — so the
+/// width loop advances its estimate incrementally without a second (drifting) estimator
+/// and without re-sweeping the world.
 ///
 /// **Incrementality / bandwidth (§9.2), unbroken.** The sim still places ONE symbol per
-/// call and re-reads the block's holders each call; the outer count-based `n_symbols` floor
-/// and the per-tick upload budget still govern HOW MANY symbols land and WHEN. The kernel
-/// only governs WHICH holder — the block's already-placed holders are passed to the kernel
-/// as the `committed` set, so each candidate's marginal ΔR̂_wc is measured over the real
-/// current placement (the incremental adapter; see [`place_incremental_rank`]).
+/// call and re-reads the block's holders each call; the caller's R̂-vs-target loop, the
+/// `n_symbols` spread cap and the per-tick upload budget govern HOW MANY symbols land and
+/// WHEN. The kernel only governs WHICH holder — the block's already-placed holders are
+/// passed to the kernel as the `committed` set, so each candidate's marginal ΔR̂_wc is
+/// measured over the real current placement (the incremental adapter; see
+/// [`place_incremental_rank`]).
 fn try_place_one_symbol(
     world: &mut World,
     owner: usize,
@@ -813,19 +1077,16 @@ fn try_place_one_symbol(
     params: &DynParams,
     prior: &SurfacePrior,
     policy: &PlacementPolicy,
-) -> bool {
+) -> Option<f64> {
     let n = world.nodes.len();
     let tick = world.tick;
     let block_id = world.nodes[owner].own_blocks[block_pos].id;
     let block_iota = world.nodes[owner].own_blocks[block_pos].iota;
     let block_volume = world.nodes[owner].own_blocks[block_pos].volume;
     // F5 (D4-leak): the per-holder chunk carries `source / k_eff` (decode needs k_eff
-    // chunks together reconstructing the source), NOT `source / n_symbols`.
-    let v_per_symbol = if params.k_eff > 0 {
-        block_volume / params.k_eff as f64
-    } else {
-        block_volume
-    };
+    // chunks together reconstructing the source), NOT `source / n_symbols`. The SAME
+    // [`chunk_volume`] the R̂ loop's [`block_view`] anchors its obs at (one construction).
+    let v_per_symbol = chunk_volume(block_volume, params);
 
     // Holders already storing this block = the kernel `committed` set (§7 spread: the kernel
     // pre-closes their observable buckets, ≤1 symbol per bucket per block, no separate
@@ -844,7 +1105,7 @@ fn try_place_one_symbol(
         .filter(|&h| h != owner && world.nodes[h].present && !already.contains(&h))
         .collect();
     if cand_idx.is_empty() {
-        return false;
+        return None;
     }
     // Shuffle the candidate order per (owner, block, attempt) — attempts differ via the
     // already-placed count so successive symbols of the same block do not tie-order the
@@ -873,16 +1134,8 @@ fn try_place_one_symbol(
     drop(already_nodes);
     drop(already_caps);
 
-    let req = BlockReq {
-        volume: block_volume,
-        n_symbols: params.n_symbols.max(1),
-        k_eff: params.k_eff,
-        tau: DAYS_PER_TICK,
-        r_target: params.r_target,
-        // Р-5 (A.13): the per-holder credit-cap floor, now the DynParams `r_min` §13 handle
-        // (guess 0.5, NOT derived from r_target — 2b lesson). Consumed by the kernel place.
-        r_min: params.r_min,
-    };
+    // The SAME [`block_req`] construction the R̂ loop uses (one physics, no drift).
+    let req = block_req(block_volume, params);
 
     // Kernel selection (transche 0.3). FLOOR: argmax marginal ΔR̂_wc over the committed set;
     // CREAM: strangers-first. Both return LOCAL candidate indices (into `cand_obs`), ≤1 per
@@ -931,19 +1184,23 @@ fn try_place_one_symbol(
             if world.first_own_accept[owner].is_none() {
                 world.first_own_accept[owner] = Some(tick);
             }
-            // R̂-calibration prediction log (metric-only, gated; NO RNG, never read by a
-            // decision). Log the node's OWN DECISION-horizon R̂_wc AFTER this placement (over
-            // the block's current holders) — the SAME kernel A.9 forecast the selection acts
-            // on (`tau = req.tau = DAYS_PER_TICK`). We log the DECISION forecast, NOT a
-            // horizon-`H` recompute: at `tau = H·DAYS_PER_TICK` the surface's long-τ off-sample
-            // conservatism drives r̂ → 0 for every holder (observed window is one tick), so a
-            // horizon-matched forecast is degenerate (all ≈ 0, no resolution) AND repair-blind;
-            // the decision R̂ is what the node acts on, and calibration scores IT against the
-            // realised medium-term persistence at `+H`. Anti-oracle: writes a god-view field.
+            // The block's OWN DECISION-horizon R̂_wc AFTER this placement (over the block's
+            // current holders) — the SAME kernel A.9 forecast the selection acts on
+            // (`tau = req.tau = DAYS_PER_TICK`). SIM-UNIFICATION: computed UNCONDITIONALLY
+            // now, because it is the caller's width-loop variable; the R̂-calibration log
+            // (metric-only, gated) records THIS number rather than a second estimate.
+            // Neither path draws RNG, so the gating still leaves every decision identical.
+            //
+            // On the log semantics (unchanged): we log the DECISION forecast, NOT a
+            // horizon-`H` recompute — at `tau = H·DAYS_PER_TICK` the surface's long-τ
+            // off-sample conservatism drives r̂ → 0 for every holder (observed window is one
+            // tick), so a horizon-matched forecast is degenerate (all ≈ 0, no resolution)
+            // AND repair-blind; the decision R̂ is what the node acts on, and calibration
+            // scores IT against the realised medium-term persistence at `+H`.
+            let mut placement_obs = already_obs.clone();
+            placement_obs.push(cand_obs[local].clone());
+            let r_hat = estimate_block_survival(&placement_obs, prior, &req, policy);
             if log_pred {
-                let mut placement_obs = already_obs.clone();
-                placement_obs.push(cand_obs[local].clone());
-                let r_hat = estimate_block_survival(&placement_obs, prior, &req, policy);
                 // WARN-1: mark whether the block reached k_eff symbols AT this forecast.
                 // Below k_eff the A.9 convolution is a structural zero (r_hat == 0.0 always),
                 // so the forecast carries no information; the Brier judge scores only complete rows.
@@ -956,10 +1213,12 @@ fn try_place_one_symbol(
                     floor_complete,
                 });
             }
-            return true;
+            // Anti-oracle: `r_hat` is the OWNER's own first-hand estimate (the same one the
+            // kernel selection ranked on), not a god-view survival probability.
+            return Some(r_hat);
         }
     }
-    false
+    None
 }
 
 /// The holder accept/preemption gate (§9 / A.12-2). Returns whether `holder` admits a
@@ -1814,9 +2073,10 @@ fn nth_alive_block(holder: &Node, owner: usize, idx: usize) -> Option<usize> {
 }
 
 /// (1a): resync placement bookkeeping to the actual ALIVE holdings (drop dead / departed
-/// holders; carry the cream flag). Refill happens in `place_own_data` (§9.2 bandwidth),
-/// so a below-FLOOR block gets new floor holders on subsequent ticks. Cream deaths are
-/// NOT refilled toward the floor (cream-no-mandatory-repair, §9.3).
+/// holders; carry the cream flag). Refill happens in `place_own_data` (§9.2 bandwidth), so a
+/// below-TARGET block gets new floor holders on subsequent ticks. SIM-UNIFICATION: a cream
+/// death is no longer exempt — it lowers the owner's R̂ like any other lost symbol, and if
+/// that drops the block below `r_target` the repair fires (the refill symbol is a FLOOR one).
 fn resync_placements(world: &mut World) {
     let n = world.nodes.len();
     for owner in 0..n {
@@ -2076,8 +2336,8 @@ fn whitewash_rejoin(world: &mut World, node: usize, tick: u64, params: &DynParam
             volume: params.block_volume,
             iota: 0.2 + 0.6 * (b as f64) / (bpn.max(2) - 1) as f64,
             placements: Vec::new(),
-            floor_ever_met: false,
-            floor_deficit_since: None,
+            target_ever_met: false,
+            target_deficit_since: None,
             to_restore: false,
         });
     }
@@ -2223,8 +2483,8 @@ pub fn fresh_block(world: &mut World, owner: usize, volume: f64, iota: f64) -> O
         volume,
         iota,
         placements: Vec::new(),
-        floor_ever_met: false,
-        floor_deficit_since: None,
+        target_ever_met: false,
+        target_deficit_since: None,
         to_restore: false,
     }
 }
@@ -2279,8 +2539,20 @@ pub fn try_place_one_symbol_for_test(
     params: &DynParams,
     prior: &SurfacePrior,
     policy: &PlacementPolicy,
-) -> bool {
+) -> Option<f64> {
     try_place_one_symbol(world, owner, block_pos, cream, params, prior, policy)
+}
+
+/// The placement pass alone (SIM-UNIFICATION tests): one tick of `place_own_data` without
+/// the surrounding PoS / eviction / churn, so a test can isolate the R̂-vs-target decision.
+#[cfg(test)]
+pub fn place_own_data_for_test(
+    world: &mut World,
+    params: &DynParams,
+    prior: &SurfacePrior,
+    policy: &PlacementPolicy,
+) {
+    place_own_data(world, params, prior, policy);
 }
 
 #[cfg(test)]
@@ -2324,6 +2596,11 @@ pub fn symbols_per_tick_for_test(u: f64, v_per_symbol: f64) -> usize {
 }
 
 #[cfg(test)]
+pub fn repair_demand_lower_bound_for_test(alive: usize, floor: usize, params: &DynParams) -> usize {
+    repair_demand_lower_bound(alive, floor, params)
+}
+
+#[cfg(test)]
 pub fn block_mature_for_test(
     joined_tick: u64,
     block_pos: usize,
@@ -2333,9 +2610,14 @@ pub fn block_mature_for_test(
     block_mature(joined_tick, block_pos, tick, params)
 }
 
+/// The block's alive symbol counts split `(floor, cream)` — the metric raw material, folded
+/// from the single production scan [`alive_block_holders`] (so the test read can never
+/// drift from what the engine sees).
 #[cfg(test)]
 pub fn alive_block_counts_for_test(world: &World, owner: usize, block_id: usize) -> (usize, usize) {
-    alive_block_counts(world, owner, block_id)
+    let holders = alive_block_holders(world, owner, block_id);
+    let cream = holders.iter().filter(|(_, c)| *c).count();
+    (holders.len() - cream, cream)
 }
 
 #[cfg(test)]

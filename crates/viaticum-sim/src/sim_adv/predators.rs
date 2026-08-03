@@ -401,8 +401,8 @@ fn configure_adv_node(world: &mut World, node: usize, spec: &AdvSpec, params: &D
             volume: params.block_volume,
             iota: 0.2 + 0.6 * (b as f64) / (n_blocks.max(2) - 1) as f64,
             placements: Vec::new(),
-            floor_ever_met: false,
-            floor_deficit_since: None,
+            target_ever_met: false,
+            target_deficit_since: None,
             to_restore: false,
         });
     }

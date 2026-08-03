@@ -465,12 +465,18 @@ pub struct HeldSymbol {
     /// God-view: is this symbol still alive on the holder? Set false when the
     /// holder evicts it OR when the holder leaves the network (churn).
     pub alive: bool,
-    /// God-view: is this a CREAM (over-the-floor) symbol (world-v2 §9.3 / A.11)?
-    /// Cream symbols are placed with the owner's LEFTOVER per-tick bandwidth once the
-    /// block's `n_symbols` FLOOR is met; they are NOT counted in the floor-durability
-    /// metric and their death does NOT trigger repair (the cream-no-mandatory-repair
-    /// invariant). A cream symbol is the entry channel for a new pair: a stranger with
-    /// an empty disk can be handed cream even before it has earned reciprocity.
+    /// God-view: is this a CREAM (over-the-target) symbol (world-v2 §9.3 / A.11)?
+    /// Cream symbols are placed with the owner's LEFTOVER per-tick bandwidth once the block's
+    /// R̂ has REACHED `r_target` (SIM-UNIFICATION: the gate was "the `n_symbols` floor count is
+    /// full"); they are NOT counted in the non-cream floor-fill metrics. A cream symbol is the
+    /// entry channel for a new pair: a stranger with an empty disk can be handed cream even
+    /// before it has earned reciprocity.
+    ///
+    /// **The old "cream death never triggers repair" rule does NOT survive the unification**
+    /// (deliberate): the owner's reliability estimate counts every live symbol — erasure decode
+    /// reads any `k_eff` of them — so cream raises R̂ and its death lowers it. The floor/cream
+    /// split is now a placement-BUDGET label (which phase paid for the symbol) plus metric
+    /// bookkeeping, not a second class of reliability.
     pub cream: bool,
 }
 
@@ -486,19 +492,24 @@ pub struct OwnBlock {
     /// God-view: the holders currently storing a symbol of this block, as
     /// `(holder_node_idx, symbol_alive)`. Repair refills this toward `r_target`.
     pub placements: Vec<BlockPlacement>,
-    /// Repair-storm bookkeeping (§7): has this block EVER reached its `n_symbols`
-    /// floor? Distinguishes an INITIAL backup (never met floor → no detection latency,
-    /// the owner knows it must place) from a REPAIR (met floor, then a holder death
-    /// dropped it below → the owner learns of the loss only via the PoS cadence, so
-    /// under a latent-detection run the refill is delayed). God-view only.
-    pub floor_ever_met: bool,
-    /// Repair-storm bookkeeping (§7): the tick this block was first OBSERVED below its
-    /// `n_symbols` floor in the CURRENT deficit episode (`None` when at/above floor).
-    /// Under latent detection the owner does not act on the deficit until a seeded,
-    /// per-block cadence offset has elapsed since this tick — that phase spread is
-    /// exactly what smears a synchronous holder-death shock across time. Reset to
-    /// `None` the moment the floor is restored. Inert when detection is instant.
-    pub floor_deficit_since: Option<u64>,
+    /// Has this block EVER reached its reliability TARGET — the owner's own estimate
+    /// `R̂ ≥ r_target` ([`crate::sim_dynamic::engine::block_r_hat`])? SIM-UNIFICATION
+    /// renamed and re-based this flag: it was `floor_ever_met` ("EVER held `n_symbols`
+    /// non-cream symbols"), an integer-count fact; it is now the reliability fact the
+    /// daemon works with. Distinguishes an INITIAL backup (never met target → no detection
+    /// latency, the owner knows it must place) from a REPAIR (met target, then a holder
+    /// death dropped it below → the owner learns of the loss only via the PoS cadence, so
+    /// under a latent-detection run the refill is delayed). Monotone false→true. It is also
+    /// the DENOMINATOR of the evaluator reads ("data that was once durable"): restore-truth,
+    /// floor-fill, decodability. God-view only.
+    pub target_ever_met: bool,
+    /// The tick this block was first OBSERVED below its reliability target in the CURRENT
+    /// deficit episode (`None` when at/above target). Under latent detection the owner does
+    /// not act on the deficit until a seeded, per-block cadence offset has elapsed since
+    /// this tick — that phase spread is exactly what smears a synchronous holder-death shock
+    /// across time. Reset to `None` the moment the target is met again. Inert when detection
+    /// is instant. (SIM-UNIFICATION: was `floor_deficit_since`, keyed on the floor count.)
+    pub target_deficit_since: Option<u64>,
     /// World-v3 restore-cycle (axis 8, sub-tranche 0.2): the block's SOURCE is lost — the
     /// owner suffered a `Disaster` (its disk, and with it the source data these symbols
     /// were encoded from, is gone). P1 premise: no source ⇒ no repair (the owner can no
@@ -514,9 +525,11 @@ pub struct OwnBlock {
 pub struct BlockPlacement {
     /// God-view holder node index.
     pub holder: usize,
-    /// Whether this placement is a CREAM (over-the-floor) symbol (world-v2 §9.3).
-    /// Mirrors [`HeldSymbol::cream`]; the floor-vs-cream split lets repair count only
-    /// FLOOR placements toward `n_symbols` (cream deaths never trigger repair).
+    /// Whether this placement is a CREAM (over-the-target) symbol (world-v2 §9.3).
+    /// Mirrors [`HeldSymbol::cream`]. SIM-UNIFICATION: cream symbols count toward the
+    /// R̂ target estimate like any other (one reliability currency), so a cream death CAN
+    /// trigger repair now; the label survives as a placement-budget/metrics distinction
+    /// (non-cream floor-fill reads, cream-phase accounting), not a repair-trigger split.
     pub cream: bool,
 }
 
@@ -786,18 +799,58 @@ pub struct PendingEviction {
 
 /// Per-tick repair activity the engine records during placement (repair-storm §7).
 /// Reset at the start of each tick's placement pass and filled as the FLOOR phase
-/// walks below-floor blocks. God-view instrumentation ONLY — never a kernel input.
+/// walks below-TARGET blocks. God-view instrumentation ONLY — never a kernel input.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RepairStat {
-    /// Distinct present owners that had ≥1 mature, below-floor, DETECTED block this
+    /// Distinct present owners that had ≥1 mature, below-target, DETECTED block this
     /// tick (i.e. actively repairing). The per-tick maximum of this over a run is the
     /// "peak concurrent repairers" — the synchronisation the storm hypothesis is about.
     pub owners_repairing: usize,
-    /// Total symbols owed to restore all detected below-floor mature blocks to their
-    /// `n_symbols` floor this tick (the detection-gated repair DEMAND, in symbols).
-    pub detected_deficit_symbols: usize,
+    /// **SIM-UNIFICATION: BLOCKS, not symbols.** How many mature blocks the detection gate
+    /// exposed as below their reliability target this tick — the WIDTH of the repair front
+    /// (companion to `owners_repairing`, which counts the owners behind it). The old
+    /// `detected_deficit_symbols` (`Σ n_symbols − floor`) no longer exists as a quantity:
+    /// the R̂ loop does not compute "how many symbols are missing" — it places one symbol,
+    /// recomputes R̂, and stops when the target is met, so the symbol demand is DISCOVERED,
+    /// not known up front.
+    ///
+    /// ⚠ This is a BLOCK count: never compare it against a bandwidth in SYMBOLS. The
+    /// symbol-unit demand instrument is [`RepairStat::detected_demand_symbols_lb`].
+    pub detected_blocks_below_target: usize,
+    /// **The symbol-unit repair DEMAND, as a documented LOWER BOUND** (`Σ` over the same
+    /// detected below-target blocks). Since the R̂ loop discovers the true width by placing,
+    /// the demand is not known up front; what IS known at the block's entry state is that
+    /// the loop must run at least
+    ///
+    /// ```text
+    /// max(1, min_width − alive)   capped by   (n_symbols − floor)   [0 when the cap is full]
+    /// ```
+    ///
+    /// iterations — at least one (the block IS below target), and at least enough to reach
+    /// the daemon's minimum redundancy `min_width`, never more than the `n_symbols` spread
+    /// cap allows. Summed over blocks this is a strict LOWER BOUND on the symbols the owners
+    /// OWE this tick, in the SAME unit as the aggregate bandwidth ceiling — so
+    /// `demand_lb > bandwidth` certainly means the true demand exceeded bandwidth, while
+    /// `demand_lb ≤ bandwidth` does NOT prove it did not.
+    /// Deliberately counted BEFORE the budget check (demand is what is owed, not what fit).
+    ///
+    /// ⚠ It is a lower bound on DEMAND, not on UPLOADS: when `try_place_one_symbol` finds no
+    /// admissible holder, fewer symbols move than the bound. That direction is safe (it makes
+    /// the demand-vs-bandwidth assert stricter), but do not read it as "symbols transferred".
+    ///
+    /// ⚠ **Two conservatisms stack, both toward "no cascade" (review WARN-2):** (1) only
+    /// REPAIRS are counted (`is_repair && detected`) — initial backups and cream consume the
+    /// same bandwidth budget and contribute nothing to this numerator; (2) the storm
+    /// configuration it is measured in is bandwidth-RICH relative to the polygon default
+    /// (`storm_config`: `block_volume = 8` ⇒ ~5 symbols/tick/owner, vs `DynParams::default`
+    /// `block_volume = 50` / `k_eff = 2` ⇒ ~1). A "no bandwidth cascade" reading from this
+    /// instrument therefore says nothing about the default bandwidth-starved polygon, where
+    /// 93 % of established blocks sit below target by t130.
+    pub detected_demand_symbols_lb: usize,
     /// Repair symbols actually PLACED this tick (a floor placement onto a block that
-    /// had already met its floor before — a genuine repair, not an initial backup).
+    /// had already met its target before — a genuine repair, not an initial backup).
+    /// Bounded by the bandwidth budget BY CONSTRUCTION, so it measures what the network
+    /// DID, never what it needed (that is `detected_demand_symbols_lb`).
     pub symbols_repaired: usize,
 }
 

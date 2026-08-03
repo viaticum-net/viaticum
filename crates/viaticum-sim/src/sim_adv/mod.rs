@@ -66,7 +66,7 @@ pub use inflow::{
 };
 pub use metrics::{
     MetricSet, cartel_earnings_split, farm_honest_reciprocity, farm_honest_served,
-    farm_honest_storage, newcomer_floor_durability,
+    farm_honest_storage, newcomer_decodable_fraction,
 };
 pub use predators::{
     AdvMetrics, RunMode, collect_adv_metrics, hook_for, inject_adversaries, inject_incumbent_cartel,

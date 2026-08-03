@@ -78,6 +78,10 @@ pub(crate) const KNOWN_DIALS: &[&str] = &[
     "v_free_symbols",
     "burn_b_ann",
     "burn_b_max",
+    // SIM-UNIFICATION: the per-block reliability TARGET is now THE placement/repair dial
+    // (`DynParams::r_target`) — sweepable so its calibration can be re-examined (and the
+    // ι-scaling follow-up measured) without touching the frozen default.
+    "r_target",
 ];
 
 /// Parse the CLI args (excluding argv[0]).
@@ -185,6 +189,7 @@ pub(crate) fn apply_dial(
         "v_free_symbols" => params.v_free_symbols = value,
         "burn_b_ann" => params.burn_b_ann = value,
         "burn_b_max" => params.burn_b_max = value,
+        "r_target" => params.r_target = value,
         _ => {
             return Err(SimAdvError::UnknownDial(
                 dial.to_string(),

@@ -22,7 +22,7 @@
 //! PASSES iff no adjacent tier drops by more than the frozen `TIER_RANK_MARGIN` (a 5-pp tolerance
 //! for multi-seed noise). The sanity floor [`TierReport::t1_floor_completeness`] guards "T1 NAS does
 //! not starve". If floor-completeness SATURATES across tiers (all ≈ 1 — every tier places initially
-//! in early abundance, and `floor_ever_met` is monotone), the rank holds trivially and the real tier
+//! in early abundance, and `target_ever_met` is monotone), the rank holds trivially and the real tier
 //! gradient lives in the durability / parked / served columns — that is a FINDING to report, not a
 //! threshold to tune.
 
@@ -129,12 +129,12 @@ fn tier_mix_assign(shares: &[(GiverTier, f64)], n: usize, seed: u64) -> Vec<Give
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TierMetrics {
     /// All owners assigned to this tier (present or departed) — the lifetime floor-completeness
-    /// denominator (robust against long-horizon depopulation; `floor_ever_met` is monotone).
+    /// denominator (robust against long-horizon depopulation; `target_ever_met` is monotone).
     pub n_owners_total: usize,
     /// Present owners of this tier at the horizon (the durability / parked denominator context).
     pub n_owners_present: usize,
     /// Floor-completeness: fraction of the tier's blocks (over ALL owners) that EVER reached floor
-    /// (the monotone `floor_ever_met` — placement completed to R_target depth). `NaN` if no blocks.
+    /// (the monotone `target_ever_met` — placement completed to R_target depth). `NaN` if no blocks.
     /// This is the FROZEN board metric (INV-TIER-GIVERS / INV-TIER-T1-ALIVE).
     pub floor_completeness: f64,
     /// NOTE-c diagnostic (NOT a board metric): floor-completeness with the denominator = owners
@@ -235,7 +235,7 @@ pub fn bit_eq(a: &TierReport, b: &TierReport) -> bool {
 }
 
 /// Finalise the per-tier report from the end-of-run god-view world (a pure read — every column is
-/// an end-of-run fact: `floor_ever_met` is monotone, the served matrix is a lifetime integral).
+/// an end-of-run fact: `target_ever_met` is monotone, the served matrix is a lifetime integral).
 /// Owners injected as predators are excluded (the tiered scenarios have none, but keep it robust).
 pub fn tier_report(world: &World) -> TierReport {
     let n = world.nodes.len();
@@ -263,7 +263,7 @@ pub fn tier_report(world: &World) -> TierReport {
         // Floor-completeness over ALL owners (lifetime-monotone; robust to depopulation).
         for b in &world.nodes[o].own_blocks {
             blocks_total[ti] += 1;
-            if b.floor_ever_met {
+            if b.target_ever_met {
                 blocks_at_floor[ti] += 1;
             }
         }
@@ -272,10 +272,10 @@ pub fn tier_report(world: &World) -> TierReport {
         }
         owners_present[ti] += 1;
         // Durability + parked (current alive holders / parked volume) over present owners, plus
-        // the NOTE-c stayers floor-completeness (floor_ever_met among PRESENT owners' blocks).
+        // the NOTE-c stayers floor-completeness (target_ever_met among PRESENT owners' blocks).
         for b in &world.nodes[o].own_blocks {
             blocks_present[ti] += 1;
-            if b.floor_ever_met {
+            if b.target_ever_met {
                 blocks_at_floor_present[ti] += 1;
             }
             floor_holder_sum[ti] += block_floor_holders(world, o, b.id);

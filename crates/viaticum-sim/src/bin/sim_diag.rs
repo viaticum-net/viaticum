@@ -796,14 +796,15 @@ fn print_section7(
     let casc_base_lat = ctrl_latent.blocks_orphaned_lost;
     println!("\n  -- sweep: K × detection mode --");
     println!(
-        "  {:>4} {:>5}  {:>6} {:>7}  {:>7} {:>8} {:>7} {:>6} {:>6}  {:>7} {:>7} {:>6} {:>6}",
+        "  {:>4} {:>5}  {:>6} {:>7}  {:>7} {:>8} {:>7} {:>7} {:>6} {:>6}  {:>7} {:>7} {:>6} {:>6}",
         "K%",
         "mode",
         "killed",
         "sym-los",
         "pkUndK",
         "pkConc",
-        "pkDem",
+        "pkDemB",
+        "pkDemS",
         "bw",
         "dem>bw",
         "endUndK",
@@ -819,14 +820,15 @@ fn print_section7(
                 None => "never".to_string(),
             };
             println!(
-                "  {:>4.0} {:>5}  {:>6} {:>7}  {:>7} {:>8} {:>7} {:>6} {:>6}  {:>7} {:>7} {:>6} {:>6}",
+                "  {:>4.0} {:>5}  {:>6} {:>7}  {:>7} {:>8} {:>7} {:>7} {:>6} {:>6}  {:>7} {:>7} {:>6} {:>6}",
                 k,
                 label,
                 r.victims_killed,
                 r.victim_symbols_killed,
                 r.peak_under_k,
                 r.peak_owners_repairing,
-                r.peak_detected_demand_symbols,
+                r.peak_detected_blocks_below_target,
+                r.peak_detected_demand_symbols_lb,
                 r.bandwidth_symbols,
                 r.demand_exceeds_bandwidth_ticks,
                 r.blocks_under_k_end,
@@ -837,12 +839,13 @@ fn print_section7(
         }
     }
     println!(
-        "  legend: pkUndK=peak blocks<k_eff; pkConc=peak owners repairing/tick; pkDem=peak detected \
-         repair symbols/tick; bw=aggregate upload symbols/tick;"
+        "  legend: pkUndK=peak blocks<k_eff; pkConc=peak owners repairing/tick; pkDemB=peak detected \
+         BLOCKS below target/tick (repair front); pkDemS=peak detected SYMBOL demand/tick \
+         (LOWER BOUND); bw=aggregate upload symbols/tick;"
     );
     println!(
-        "          dem>bw=ticks demand exceeded bandwidth; endUndK=present-owner blocks<k_eff at \
-         horizon (recoverable);"
+        "          dem>bw=ticks the SYMBOL demand (lower bound) exceeded bandwidth — symbols vs \
+         symbols, so conservative; endUndK=present-owner blocks<k_eff at horizon (recoverable);"
     );
     println!(
         "          casc=CASCADE loss (departed non-victim owners' blocks<k_eff; control baseline \
@@ -865,7 +868,7 @@ fn print_storm_trajectory(k: f64, inst: &RepairStormReport, lat: &RepairStormRep
     println!("\n  -- trajectory at K={k:.0}% (instant vs latent), per post-shock tick --");
     println!(
         "  {:>4}  | {:>8} {:>8} {:>8} {:>8} | {:>8} {:>8} {:>8} {:>8}",
-        "+t", "i:undK", "i:conc", "i:dem", "i:out", "l:undK", "l:conc", "l:dem", "l:out"
+        "+t", "i:undK", "i:conc", "i:demS", "i:out", "l:undK", "l:conc", "l:demS", "l:out"
     );
     let n = inst.trajectory.len().min(lat.trajectory.len());
     for idx in 0..n {
@@ -880,16 +883,16 @@ fn print_storm_trajectory(k: f64, inst: &RepairStormReport, lat: &RepairStormRep
             it.since_shock,
             it.under_k_blocks,
             it.owners_repairing,
-            it.detected_demand_symbols,
+            it.detected_demand_symbols_lb,
             it.outstanding_demand_symbols,
             lt.under_k_blocks,
             lt.owners_repairing,
-            lt.detected_demand_symbols,
+            lt.detected_demand_symbols_lb,
             lt.outstanding_demand_symbols,
         );
     }
     println!(
-        "  (i:=instant, l:=latent; undK=blocks<k_eff, conc=owners repairing, dem=detected repair \
-         symbols/tick, out=total outstanding repair symbols)"
+        "  (i:=instant, l:=latent; undK=blocks<k_eff, conc=owners repairing, demS=detected SYMBOL \
+         demand/tick (lower bound), out=outstanding symbols to the n_symbols spread cap)"
     );
 }

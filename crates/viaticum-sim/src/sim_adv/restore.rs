@@ -278,7 +278,7 @@ impl RestoreTracker {
     /// Record a Disaster on `victim` (of demand `class`) at `disaster_tick`. Snapshots the
     /// victim's blocks that EVER met their floor (the denominator — a never-fully-backed-up
     /// block is not a restore failure). Call AFTER [`disaster_strike`](crate::sim_dynamic::
-    /// engine::disaster_strike): it reads `floor_ever_met` / ι / tier, all untouched by the strike.
+    /// engine::disaster_strike): it reads `target_ever_met` / ι / tier, all untouched by the strike.
     pub fn on_disaster(
         &mut self,
         world: &World,
@@ -294,7 +294,7 @@ impl RestoreTracker {
         let return_tick = disaster_tick + 1;
         let tier = world.nodes[victim].disk.tier;
         for b in &world.nodes[victim].own_blocks {
-            if !b.floor_ever_met {
+            if !b.target_ever_met {
                 continue;
             }
             self.blocks.push(TrackedBlock {

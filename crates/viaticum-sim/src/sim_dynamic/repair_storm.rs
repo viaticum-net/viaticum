@@ -22,12 +22,21 @@
 //!    held symbols die, synchronously and targeted (a churn shock, not random attrition).
 //! 2. **Post-shock trajectory** ([`run_repair_storm`]): per tick to the horizon, record
 //!    the under-replicated block count (`< k_eff` alive floor holders), the outstanding
-//!    repair demand (symbols owed to restore floors), the engine's DETECTION-GATED repair
-//!    concurrency (owners repairing this tick) and demand, and the aggregate upload
-//!    bandwidth ceiling (present nodes × per-node budget).
+//!    repair demand (symbols owed to fill the spread cap), the engine's DETECTION-GATED
+//!    repair concurrency (owners repairing this tick), the detected repair front (blocks)
+//!    and its SYMBOL demand, and the aggregate upload bandwidth ceiling (present nodes ×
+//!    per-node budget).
 //! 3. **Detection mode** (the crux): `detection_delay_max = 0` ⇒ INSTANT (owner refills
 //!    next tick); `> 0` ⇒ LATENT — each owner discovers a below-floor block at a seeded
 //!    uniform offset in `[0, delay_max]` ticks (the PoS cadence), staggering the repairs.
+//!
+//! ## Units, after SIM-UNIFICATION (read this before touching the demand columns)
+//!
+//! The R̂ loop discovers a block's symbol need by placing, so "detected demand" splits into
+//! two quantities that must not be confused: [`StormTick::detected_blocks_below_target`]
+//! (BLOCKS — the width of the repair front) and [`StormTick::detected_demand_symbols_lb`]
+//! (SYMBOLS — a documented LOWER BOUND). Only the latter may be compared against
+//! [`StormTick::bandwidth_symbols`].
 //!
 //! The headline numbers: peak concurrent repairers (instant vs latent), whether any tick's
 //! repair demand exceeds the aggregate bandwidth, and — the make-or-break — how many blocks
@@ -71,14 +80,26 @@ pub struct StormTick {
     pub present: usize,
     /// Established present-owner blocks with `< k_eff` alive floor holders (at risk).
     pub under_k_blocks: usize,
-    /// Symbols owed to restore every established present-owner block to its `n_symbols`
-    /// floor (the total outstanding repair DEMAND, god-view — detected or not).
+    /// Symbols owed to fill every established present-owner block back to the `n_symbols`
+    /// SPREAD CAP (a god-view capacity PROXY for the outstanding repair demand — detected
+    /// or not). SIM-UNIFICATION: the cap is no longer the owner's placement goal (that is
+    /// `R̂ ≥ r_target`), so this over-states the demand of a block whose target is met with
+    /// fewer holders; it is kept as the pre-existing upper-bound instrument.
     pub outstanding_demand_symbols: usize,
     /// Owners the engine actually repaired this tick (detection-gated concurrency).
     pub owners_repairing: usize,
-    /// Symbols the engine's detection gate exposed as due this tick (the realistic,
-    /// staggered demand the network acted on).
-    pub detected_demand_symbols: usize,
+    /// **BLOCKS** the engine's detection gate exposed as below target this tick — the WIDTH
+    /// of the repair front. SIM-UNIFICATION: this was a SYMBOL count (`Σ n_symbols − floor`);
+    /// the R̂ loop discovers the symbol demand by placing, so the block count is what the gate
+    /// itself knows. NOT comparable to a bandwidth (see the field below). See
+    /// [`crate::sim_dynamic::generator::RepairStat::detected_blocks_below_target`].
+    pub detected_blocks_below_target: usize,
+    /// **SYMBOLS** the same detected below-target blocks owe this tick, as a documented
+    /// LOWER BOUND (`Σ min(max(1, min_width − alive), n_symbols − floor)`) — the demand side
+    /// of the demand-vs-bandwidth comparison, in the SAME unit as
+    /// [`StormTick::bandwidth_symbols`]. See
+    /// [`crate::sim_dynamic::generator::RepairStat::detected_demand_symbols_lb`].
+    pub detected_demand_symbols_lb: usize,
     /// Aggregate upload bandwidth ceiling this tick (present × per-node budget), symbols.
     pub bandwidth_symbols: usize,
 }
@@ -106,15 +127,26 @@ pub struct RepairStormReport {
     pub peak_under_k: usize,
     /// Peak concurrent repairers over the trajectory (the synchronisation headline).
     pub peak_owners_repairing: usize,
-    /// Peak detection-gated repair demand (symbols/tick) over the trajectory.
-    pub peak_detected_demand_symbols: usize,
+    /// Peak detection-gated repair front (BLOCKS below target per tick) over the
+    /// trajectory. SIM-UNIFICATION: blocks, not symbols (see [`StormTick`]).
+    pub peak_detected_blocks_below_target: usize,
+    /// Peak detection-gated repair DEMAND in SYMBOLS (the lower bound of
+    /// [`StormTick::detected_demand_symbols_lb`]) over the trajectory — the quantity the
+    /// aggregate bandwidth ceiling is compared against.
+    pub peak_detected_demand_symbols_lb: usize,
     /// Peak outstanding (god-view total) repair demand (symbols/tick).
     pub peak_outstanding_demand_symbols: usize,
     /// Representative aggregate bandwidth (symbols/tick) just after the shock.
     pub bandwidth_symbols: usize,
-    /// Ticks where the detection-gated repair demand EXCEEDED the aggregate bandwidth.
+    /// Ticks where the detection-gated repair demand EXCEEDED the aggregate bandwidth —
+    /// SYMBOLS vs SYMBOLS. SIM-UNIFICATION: the demand side is the LOWER BOUND
+    /// [`StormTick::detected_demand_symbols_lb`], so this is CONSERVATIVE: every counted
+    /// tick certainly over-subscribed the bandwidth, and a zero here does not prove no tick
+    /// ever did (a block starving for symbols the bound does not see would be missed).
     pub demand_exceeds_bandwidth_ticks: usize,
-    /// Max ratio of detection-gated demand to aggregate bandwidth over the trajectory.
+    /// Max ratio of detection-gated symbol demand (lower bound) to aggregate bandwidth
+    /// (symbols) over the trajectory — one unit on both sides, and a LOWER BOUND on the true
+    /// demand/bandwidth ratio.
     pub max_demand_bandwidth_ratio: f64,
     /// Established present-owner blocks still `< k_eff` at the horizon (not recovered —
     /// recoverable in principle, the owner is present and re-encodes from source).
@@ -211,7 +243,7 @@ fn present_under_k(world: &World, k_eff: usize) -> usize {
             continue;
         }
         for b in &world.nodes[o].own_blocks {
-            if b.floor_ever_met && alive_floor_holders(world, o, b.id) < k_eff {
+            if b.target_ever_met && alive_floor_holders(world, o, b.id) < k_eff {
                 c += 1;
             }
         }
@@ -228,7 +260,7 @@ fn present_outstanding_demand(world: &World, params: &DynParams) -> usize {
             continue;
         }
         for b in &world.nodes[o].own_blocks {
-            if b.floor_ever_met {
+            if b.target_ever_met {
                 let floor = alive_floor_holders(world, o, b.id);
                 d += params.n_symbols.saturating_sub(floor);
             }
@@ -245,7 +277,7 @@ fn present_established_blocks(world: &World) -> usize {
             continue;
         }
         for b in &world.nodes[o].own_blocks {
-            if b.floor_ever_met {
+            if b.target_ever_met {
                 c += 1;
             }
         }
@@ -271,7 +303,7 @@ fn final_loss_scan(world: &World, k_eff: usize, victims: &[usize]) -> LossScan {
     for o in 0..world.nodes.len() {
         let is_victim = victims.contains(&o);
         for b in &world.nodes[o].own_blocks {
-            if !b.floor_ever_met {
+            if !b.target_ever_met {
                 continue;
             }
             let floor = alive_floor_holders(world, o, b.id);
@@ -339,11 +371,14 @@ pub fn run_repair_storm(cfg: &RepairStormConfig) -> RepairStormReport {
         let outstanding = present_outstanding_demand(&world, &params);
         let stat = world.repair_stat;
 
-        if stat.detected_deficit_symbols > bandwidth {
+        // SYMBOLS vs SYMBOLS (the demand side is the documented lower bound — see
+        // `RepairStat::detected_demand_symbols_lb`). The pre-fix code compared the
+        // below-target BLOCK count against a symbol bandwidth: a unit error.
+        if stat.detected_demand_symbols_lb > bandwidth {
             demand_exceeds_bandwidth_ticks += 1;
         }
         if bandwidth > 0 {
-            let ratio = stat.detected_deficit_symbols as f64 / bandwidth as f64;
+            let ratio = stat.detected_demand_symbols_lb as f64 / bandwidth as f64;
             if ratio > max_demand_bandwidth_ratio {
                 max_demand_bandwidth_ratio = ratio;
             }
@@ -359,7 +394,8 @@ pub fn run_repair_storm(cfg: &RepairStormConfig) -> RepairStormReport {
             under_k_blocks: under_k,
             outstanding_demand_symbols: outstanding,
             owners_repairing: stat.owners_repairing,
-            detected_demand_symbols: stat.detected_deficit_symbols,
+            detected_blocks_below_target: stat.detected_blocks_below_target,
+            detected_demand_symbols_lb: stat.detected_demand_symbols_lb,
             bandwidth_symbols: bandwidth,
         });
     }
@@ -374,9 +410,14 @@ pub fn run_repair_storm(cfg: &RepairStormConfig) -> RepairStormReport {
         .map(|t| t.owners_repairing)
         .max()
         .unwrap_or(0);
-    let peak_detected_demand_symbols = trajectory
+    let peak_detected_blocks_below_target = trajectory
         .iter()
-        .map(|t| t.detected_demand_symbols)
+        .map(|t| t.detected_blocks_below_target)
+        .max()
+        .unwrap_or(0);
+    let peak_detected_demand_symbols_lb = trajectory
+        .iter()
+        .map(|t| t.detected_demand_symbols_lb)
         .max()
         .unwrap_or(0);
     let peak_outstanding_demand_symbols = trajectory
@@ -401,7 +442,8 @@ pub fn run_repair_storm(cfg: &RepairStormConfig) -> RepairStormReport {
         trajectory,
         peak_under_k,
         peak_owners_repairing,
-        peak_detected_demand_symbols,
+        peak_detected_blocks_below_target,
+        peak_detected_demand_symbols_lb,
         peak_outstanding_demand_symbols,
         bandwidth_symbols: bandwidth_at_shock,
         demand_exceeds_bandwidth_ticks,

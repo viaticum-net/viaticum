@@ -25,7 +25,7 @@ use crate::sim_adv::cli::{SimAdvError, apply_dial};
 use crate::sim_adv::hetero::{DemandClass, HeteroReport, HeteroTracker, apply_demand_classes};
 use crate::sim_adv::inflow::{PopSeries, apply_inflow, bootstrap_n0, present_count};
 use crate::sim_adv::metrics::{
-    MetricSet, cartel_earnings_split, collect_metrics, newcomer_floor_durability,
+    MetricSet, cartel_earnings_split, collect_metrics, newcomer_decodable_fraction,
     overall_floor_durability,
 };
 use crate::sim_adv::predators::{
@@ -86,10 +86,12 @@ pub struct RunResult {
     /// non-inflow scenario; `Some` for an [`crate::sim_adv::InflowPolicy::Steady`] scenario
     /// (`tiered_v1_inflow`) — the population curve the INV-POP-STATIONARY board row reads.
     pub per_seed_pop: Vec<Option<PopSeries>>,
-    /// Per-seed NEWCOMER floor-durability (`4r_a15_spec.md` §3), seed-indexed. `NaN` for a
+    /// Per-seed NEWCOMER DECODABLE fraction (`4r_a15_spec.md` §3), seed-indexed. `NaN` for a
     /// non-enclosure scenario; a finite fraction for the A15 `a15_enclosure` scenario — the
-    /// god-view durability of post-cutoff newcomers' floor-met blocks, which INV-ENCLOSURE-FLOOR
-    /// reads and the cartel-fraction sweep tracks.
+    /// god-view share of post-cutoff newcomers' target-ever-met blocks that still hold ≥ `k_eff`
+    /// alive symbols (cream included), which INV-ENCLOSURE-FLOOR reads and the cartel-fraction
+    /// sweep tracks. Ф-2 re-base: this was a non-cream `≥ n_symbols` FILL count until the R̂ loop
+    /// made that count meaningless — see [`crate::sim_adv::newcomer_decodable_fraction`].
     pub per_seed_newcomer: Vec<f64>,
     /// Per-seed CARTEL-PAYS ratio (`4r_a15_spec.md` §4, SECONDARY), seed-indexed: the cartel's
     /// mean outbound service / the non-cartel incumbents' mean. `NaN` for a non-enclosure scenario
@@ -136,9 +138,10 @@ pub(crate) struct SeedRun {
     /// The present-count time-series for an INFLOW scenario (`4r_inflow_spec.md`), else `None`
     /// (a closed-cohort / non-inflow scenario records no curve, so its output is unchanged).
     pub pop: Option<PopSeries>,
-    /// The NEWCOMER floor-durability at the horizon for an A15 enclosure scenario (`4r_a15_spec.md`
-    /// §3), else `NaN` (a non-enclosure scenario carries no cartel / newcomer cut).
-    pub newcomer_durability: f64,
+    /// The NEWCOMER DECODABLE fraction at the horizon for an A15 enclosure scenario
+    /// (`4r_a15_spec.md` §3), else `NaN` (a non-enclosure scenario carries no cartel / newcomer
+    /// cut).
+    pub newcomer_decodable: f64,
     /// The CARTEL-PAYS ratio (cartel mean served-out / non-cartel incumbent mean) for an A15
     /// enclosure scenario (`4r_a15_spec.md` §4), else `NaN`.
     pub cartel_earn_ratio: f64,
@@ -742,11 +745,12 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
         present_per_tick,
         setpoint: pop_setpoint,
     });
-    // A15 (`4r_a15_spec.md` §3/§4): the newcomer floor-durability world-cut + the CARTEL-PAYS
-    // ratio. Evaluator-only god-view reads (never fed into a decision). `NaN` for a non-enclosure
-    // scenario (the channel is unused there).
-    let (newcomer_durability, cartel_earn_ratio) = if is_enclosure {
-        let dur = newcomer_floor_durability(&world, join_cutoff, params.n_symbols);
+    // A15 (`4r_a15_spec.md` §3/§4): the newcomer DECODABLE world-cut + the CARTEL-PAYS ratio.
+    // Evaluator-only god-view reads (never fed into a decision). `NaN` for a non-enclosure
+    // scenario (the channel is unused there). Ф-2: the cut is `k_eff` (decodability), NOT
+    // `n_symbols` (the placement floor the R̂ loop no longer aims at).
+    let (newcomer_decodable, cartel_earn_ratio) = if is_enclosure {
+        let dur = newcomer_decodable_fraction(&world, join_cutoff, params.k_eff);
         let (cartel_e, inc_e) = cartel_earnings_split(&world, &adv_nodes, join_cutoff);
         let ratio = if inc_e > 0.0 {
             cartel_e / inc_e
@@ -791,7 +795,7 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
         hetero,
         tier,
         pop,
-        newcomer_durability,
+        newcomer_decodable,
         cartel_earn_ratio,
         farm_honest_storage,
         farm_honest_reciprocity,
@@ -901,7 +905,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_hetero.push(sr.hetero);
         per_seed_tier.push(sr.tier);
         per_seed_pop.push(sr.pop);
-        per_seed_newcomer.push(sr.newcomer_durability);
+        per_seed_newcomer.push(sr.newcomer_decodable);
         per_seed_cartel_earn.push(sr.cartel_earn_ratio);
         per_seed_farm_storage.push(sr.farm_honest_storage);
         per_seed_farm_reciprocity.push(sr.farm_honest_reciprocity);

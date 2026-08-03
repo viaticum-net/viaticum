@@ -216,8 +216,8 @@ pub fn apply_demand_classes(
                 volume: params.block_volume,
                 iota: 0.2 + 0.6 * (b as f64) / (n_blocks.max(2) - 1) as f64,
                 placements: Vec::new(),
-                floor_ever_met: false,
-                floor_deficit_since: None,
+                target_ever_met: false,
+                target_deficit_since: None,
                 to_restore: false,
             });
         }
@@ -260,7 +260,7 @@ pub struct ClassMetrics {
     /// Present owners of the class (the denominator of the per-owner fractions).
     pub n_owners_present: usize,
     /// Floor-completeness: fraction of the class's blocks (over present owners) that EVER
-    /// reached floor (the monotonic `floor_ever_met` — placement completed to R_target depth).
+    /// reached floor (the monotonic `target_ever_met` — placement completed to R_target depth).
     /// This is placement SUCCESS, not steady-state retention. `NaN` if no blocks.
     ///
     /// (WARN-1: this equals the per-owner mean of `blocks_at_floor / n_blocks` EXACTLY — every
@@ -454,7 +454,7 @@ impl HeteroTracker {
             for b in &world.nodes[i].own_blocks {
                 floor_holder_sum[ci] += block_floor_holders(world, i, b.id);
                 blocks_total[ci] += 1;
-                if b.floor_ever_met {
+                if b.target_ever_met {
                     blocks_at_floor[ci] += 1;
                 }
             }
@@ -530,9 +530,12 @@ fn block_floor_holders(world: &World, owner: usize, block_id: usize) -> usize {
         .count()
 }
 
-/// (blocks of `owner` that reached floor, total own blocks). "Reached floor" is the block's
-/// monotonic `floor_ever_met` flag — the block's placement EVER completed to its `n_symbols`
-/// floor (R_target depth). This is PLACEMENT SUCCESS (the D1 question "does the footprint get
+/// (blocks of `owner` that reached target, total own blocks). The predicate is the block's
+/// monotonic `target_ever_met` flag — its estimated survival R̂ EVER reached `r_target`.
+/// **Post-SIM-UNIFICATION this is NOT the old `n_symbols` floor** (the R̂ loop stops as soon as
+/// the target is met, typically at 3-4 holders where the floor asked for 5), so the predicate is
+/// strictly LIGHTER than the one this read used to carry — the established denominator grew
+/// 55 → 67 across the tranche. This is PLACEMENT SUCCESS (the D1 question "does the footprint get
 /// placed"), NOT the current-alive holder count, which under the steady-state eviction economy
 /// settles near k_eff for EVERY class (honest_v2's own durability is ~1 holder/block — so a
 /// current-count threshold would read every class, INCLUDING the honest M baseline, as ~0).
@@ -541,7 +544,7 @@ fn footprint_progress(world: &World, owner: usize) -> (usize, usize) {
     let placed = world.nodes[owner]
         .own_blocks
         .iter()
-        .filter(|b| b.floor_ever_met)
+        .filter(|b| b.target_ever_met)
         .count();
     (placed, total)
 }

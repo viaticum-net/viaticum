@@ -108,8 +108,8 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
                 // non-trivial on each holder.
                 iota: 0.2 + 0.6 * (b as f64) / (params.blocks_per_node.max(2) - 1) as f64,
                 placements: Vec::new(),
-                floor_ever_met: false,
-                floor_deficit_since: None,
+                target_ever_met: false,
+                target_deficit_since: None,
                 to_restore: false,
             })
             .collect();
@@ -391,8 +391,8 @@ fn run_newcomer_probe(
         volume: params.block_volume,
         iota: 0.9,
         placements: Vec::new(),
-        floor_ever_met: false,
-        floor_deficit_since: None,
+        target_ever_met: false,
+        target_deficit_since: None,
         to_restore: false,
     }];
     // A T1-loose newcomer (plenty of free disk to lend) so the bootstrap probe is
