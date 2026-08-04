@@ -67,7 +67,8 @@ pub use inflow::{
 };
 pub use metrics::{
     EclipseCost, MetricSet, cartel_earnings_split, collect_eclipse_cost, farm_honest_reciprocity,
-    farm_honest_served, farm_honest_storage, newcomer_decodable_fraction, share_a_pos_percent,
+    farm_honest_served, farm_honest_storage, group_decodable_fraction, group_intra_share,
+    newcomer_decodable_fraction, share_a_pos_percent,
 };
 pub use predators::{
     AdvMetrics, RunMode, collect_adv_metrics, hook_for, inject_adversaries, inject_incumbent_cartel,

@@ -142,6 +142,21 @@ pub enum AdvId {
     A5DeepSilent,
     A6Discriminator,
     A7SybilFarm,
+    /// A8 (phase 3, `4r_a8_spec.md`): a RING of real nodes with real disks and real backup demand
+    /// that serve OUTSIDERS little. Two arms share this id, separated only by dials:
+    /// * **R1 — the FAKE ring** (`collude = true`, ε-`whale_accept`): it inflates mutual reputation
+    ///   with COLLUSIVE PoS (the A7 `adv_collude_farm` pass) on top of the ε it really stores for
+    ///   everyone. Its matched TWIN is the same ring with `collude = false`.
+    /// * **R2 — the FRIEND CIRCLE** (`collude = false`, `serve_ring_only = true`, full accept): it
+    ///   REALLY stores its members' data and refuses strangers. Legitimate — the product's own
+    ///   expected usage (a few T1 self-hosters backing each other up).
+    ///
+    /// The spec asks the system to tell them apart with NO rule about rings, purely by per-pair
+    /// reciprocity. ⚠ MEASURED, the two arms do NOT end up far apart: R1's own data ends up 0.865
+    /// inside its ring and R2's 0.939, and R1's twin (no collusion, no group policy) sits at 0.289
+    /// — so the separating variable is the HOLDER-side policy "keep my friends' symbols, drop the
+    /// strangers'", which R1 buys with fake κ_O and R2 declares openly. Neither arm is denied a
+    /// home for its data by reciprocity alone. See [`crate::sim_adv::registry::a8_ring`].
     A8CollusionRing,
     A9EclipseTargeter,
     A10ProviderExit,
@@ -234,13 +249,24 @@ pub struct AdvDials {
     /// A7/A8/A9: group size + shared subnet.
     pub group_size: usize,
     pub group_subnet: u32,
-    /// A7 (sybil-farm): whether the farm COLLUDES this run — the `a7_sybil_farm_hook` returns
-    /// `collude_farm = collude`, so a run with `collude = false` keeps the SAME ε-serving farm
-    /// (same demand, same placement) but with the collusive fake-accrual pass OFF. This is the
-    /// clean collude ON/OFF A/B lever (isolating collusion from the ε-accept construction, which
-    /// stays fixed across both arms). `false` (the [`Default`]) ⇒ no collusion. First-hand: the
-    /// sybil's own plan to collude; the engine reads farm MEMBERSHIP god-view (anti-oracle split).
+    /// A7 (sybil-farm) / A8 (collusion-ring): whether the group COLLUDES this run — the
+    /// `a7_sybil_farm_hook` / `a8_collusion_ring_hook` return `collude_farm = collude`, so a run
+    /// with `collude = false` keeps the SAME construction (same demand, same accept rate, same
+    /// placement) but with the collusive fake-accrual pass OFF. This is the clean collude ON/OFF
+    /// A/B lever (isolating collusion from the construction, which stays fixed across both arms —
+    /// A8's matched TWIN is exactly this). `false` (the [`Default`]) ⇒ no collusion. First-hand:
+    /// the member's own plan to collude; the engine reads GROUP MEMBERSHIP god-view (anti-oracle
+    /// split).
     pub collude: bool,
+    /// A8 (friend-circle arm R2): as a HOLDER, serve ONLY same-group peers — the engine's
+    /// `admit_offer` hard-rejects any owner that is not a member of this holder's own group (same
+    /// `AdvId` + same `group_subnet`). This is the ACTOR's policy "I store for my friends, not for
+    /// strangers", the holder-side half of what makes a friend circle a circle; the TRUST KERNEL
+    /// still has no notion of a group (the distinction R1/R2 is made by per-pair reciprocity
+    /// alone). `false` (the [`Default`]) ⇒ the accept-gate is byte-identical to the honest path.
+    /// First-hand: the hook only declares the FLAG; membership is read ENGINE-side (the same
+    /// anti-oracle split as A6's `discriminate` / A15's `enclose_newcomers` / A7's collusion).
+    pub serve_ring_only: bool,
     /// A11: creeping-degradation start tick + slope.
     pub degrade_start: u64,
     pub degrade_slope: f64,
@@ -540,6 +566,14 @@ pub struct AdvAction {
     /// A6's `discriminate` / A15's `enclose_newcomers`). Default `false` ⇒ the pass is a strict
     /// NO-OP (byte-identical to the honest path — the ANCHOR).
     pub collude_farm: bool,
+    /// A8 (friend-circle, arm R2): when `true`, this HOLDER hard-rejects (in `admit_offer`) any
+    /// owner that is NOT a member of its own group (same `AdvId` + same
+    /// [`AdvDials::group_subnet`]) — "I store for my friends, not for strangers". The FLAG is
+    /// first-hand (the hook declares its own serving policy); the membership comparison is applied
+    /// ENGINE-side (the same anti-oracle split as A6's `discriminate` / A15's `enclose_newcomers`,
+    /// and the same god-view group read `adv_collude_farm` already does). Default `false` ⇒ the
+    /// accept-gate is byte-identical to the honest path (the ANCHOR).
+    pub serve_group_only: bool,
     /// A9 (eclipse-targeter), arms A and C: FIRE the eclipse — drop every alive symbol of the
     /// scenario's eclipse target this holder carries. The hook declares only the INTENT; the
     /// ENGINE resolves WHO the target is (`world.eclipse.target`) and, when
@@ -556,7 +590,7 @@ pub struct AdvAction {
 
 impl AdvAction {
     /// The honest / no-op action: no accept override, no rejoin, no voluntary drop, no pause,
-    /// no enclosure, no collusion, no eclipse.
+    /// no enclosure, no collusion, no group-only serving, no eclipse.
     pub const NOOP: AdvAction = AdvAction {
         accept_rate: None,
         rejoin: false,
@@ -566,6 +600,7 @@ impl AdvAction {
         discriminate: false,
         enclose_newcomers: false,
         collude_farm: false,
+        serve_group_only: false,
         eclipse_fire: false,
         eclipse_lethal_watch: false,
     };

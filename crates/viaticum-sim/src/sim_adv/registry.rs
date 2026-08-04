@@ -204,6 +204,76 @@ const A7_BLOCK_MULT: f64 = 12.0;
 const A7_CREDIT_LIMIT_EPS: f64 = 1.0;
 
 // ============================================================
+// A8 collusion-ring vs friend-circle (`4r_a8_spec.md`) — constants FROZEN in code. The THRESHOLD
+// `A8_ROI_X` is STRUCTURAL (the meaning of the comparison, not a fitted number); the SCENARIO knobs
+// (ring size N, ε-accept) are calibrated by `a8_ring_calibration_*` and frozen off its table.
+// ============================================================
+
+/// The ring size N. FROZEN at 8 — ⚠ **by a criterion SUBSTITUTED for the spec's, and the
+/// substitution changes the answer**, so it is disclosed here in the code rather than in a report.
+///
+/// **The spec's own rule picks N = 4.** `4r_a8_spec.md` §3.1 freezes N at "the minimal N at which
+/// the friend circle's intra-ring symbol share is NOTABLY ABOVE the proportional one". Measured on
+/// the arm that rule is written about (`R2 plain` — the same injected nodes with NO group policy,
+/// so the share is whatever the ORDINARY candidate ranking produces), as a multiple of the
+/// proportional reference `(N−1)/(present−1)`, seeds 42..46: N = 4 → **6.78×**, N = 8 → 1.73×,
+/// N = 16 → 2.57×. Every tested N clears "notably above", so the spec's MINIMAL qualifying N is 4;
+/// the frozen point (1.73×) is the WEAKEST of the three and the column is not even monotone in N,
+/// with no σ printed on it. ⚠ It is also part CONSTRUCTION: an injected node is forced Reliable +
+/// full accept + churn-immortal (`configure_adv_node`), i.e. among the most attractive holders in a
+/// mixed population (Hoarder accepts 0.2, Freeloader 0.1), so "the N best holders in the world
+/// attract everyone's data, their own included" lifts the intra share with no circle forming.
+///
+/// **What was frozen instead — MIN-WIDTH SELF-SERVICE:** the smallest TESTED N at which the circle
+/// can hold a whole block among its own members. A block needs
+/// `min_width = min(k_eff + MIN_REDUNDANCY, n_symbols) = min(2 + 2, 5) = 4` distinct holders, and a
+/// member of a ring of 4 has only 3 friends, so at N = 4 the circle cannot reach the width inside
+/// itself AT ALL. Of {4, 8, 16} the smallest that can is 8. The criterion is sound, but it is not
+/// the spec's, and it moves the frozen point away from the case that matters most.
+///
+/// **What that costs.** N = 4 is (a) the product's literal question — "me and three friends run
+/// Viaticum and back up only each other"; (b) the only measured point at which the circle is
+/// PENALISED to any degree worth the word — 0.50× its own control, against 0.89× at N = 8 and 0.87×
+/// at N = 16; and (c) structurally explained by the min-width arithmetic above rather than by noise.
+/// Freezing 8 reports the friendlier half of the answer, and a reader who only reads the frozen
+/// point will not see the punished case at all.
+///
+/// MEASURED decodable fraction of the circle's own data (circle `R2` vs the SAME nodes serving
+/// everyone, `R2_PLAIN`, seeds 42..46): N = 4 → 0.083±0.102 vs 0.167±0.072 (**0.50×**),
+/// N = 8 → 0.137±0.141 vs 0.154±0.149 (0.89×), N = 16 → 0.169±0.032 vs 0.194±0.060 (0.87×).
+/// ⚠ HEDGE BOTH ENDS SYMMETRICALLY: at N = 4 σ is the size of the gap, so the penalty is
+/// SUGGESTIVE only — and at N = 8, the point that carries the freeze, σ is LARGER STILL
+/// (0.141 / 0.149, each ≈ the level itself), so "the penalty is gone by N = 8" is at least as
+/// σ-dominated as the N = 4 penalty it is used to retire. Neither end is established.
+const A8_RING_N: usize = 8;
+
+/// The ring's shared subnet id (its group identifier — `adv_collude_farm` colludes only within a
+/// matching `group_subnet`, and the A8 friend-circle accept-gate admits only a matching group).
+/// Arbitrary; used only to group the members.
+const A8_GROUP_SUBNET: u32 = 8;
+
+/// World size + horizon: the same hetero-free honest world A7/A10 measure on.
+const A8_N_NODES: usize = 120;
+const A8_HORIZON: u64 = 130;
+
+/// The ring's ε-accept as a HOLDER of OUTSIDERS' data ("наружу служат мало" — serve outsiders
+/// LITTLE, not nothing). FROZEN at 0.05, the A1 whale idiom. It must be > 0: at exactly 0 the ring
+/// serves outsiders nothing, `ext_served` is 0 and the extraction ratio `ext_roi` is UNDEFINED on
+/// both arms (NaN) — the board row would then be vacuous rather than passing.
+const A8_EPS_ACCEPT: f64 = 0.05;
+
+/// The A8 twin-comparative threshold X, shared by BOTH comparative rows —
+/// `INV-A8-RING-GROSS-TAKE≤TWIN` and `INV-A8-RING-ROI≤TWIN`. (The name is historical: the spec
+/// named only the ROI row. It is kept because the constant's VALUE is the frozen artifact; read it
+/// as "the A8 pred/twin unit", not as "the ROI row's bar".)
+///
+/// **STRUCTURAL, not a fitted bar:** each row compares the ring against THE SAME RING without
+/// collusion, so `X = 1` states exactly "collusion buys NOTHING beyond what these nodes get by
+/// behaving the same way honestly". The unit here is the meaning of the ratio, not a measured
+/// level — the same status as phase-1's `INV-ROI-PRED≤TWIN`.
+const A8_ROI_X: f64 = 1.0;
+
+// ============================================================
 // A10 provider-exit (`4r_a10_spec.md`) — constants FROZEN in code BEFORE the run (anti-Goodhart).
 // The calibration test `a10_provider_exit_calibration_*` prints the runtime numbers (present holders
 // at the exit tick, top-holder alive-holding load, survivor capacity vs the n_symbols = 5 floor, the
@@ -387,6 +457,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
         a6_discriminator(),
         a15_enclosure(),
         a7_sybil(),
+        a8_ring(),
         a10_provider_exit(),
         a9_eclipse_blind(),
         a9_eclipse_silence(),
@@ -1612,6 +1683,229 @@ fn a7_sybil_invariants() -> Vec<Invariant> {
     ]
 }
 
+/// A8 — collusion RING, arm R1 (phase 3, `4r_a8_spec.md`): the honest world plus a ring of
+/// `A8_RING_N` REAL nodes (real disks, real backup demand, present from t = 0) that serve outsiders
+/// only ε and inflate each other's reputation with COLLUSIVE PoS (the shared `adv_collude_farm`
+/// pass — fake mutual `served` + `g_ho`, no real storage), while wanting the HONEST network to hold
+/// their data. The spec's question: does that fake intra-ring reputation convert into a bigger bite
+/// of the honest network's disk than the SAME ring gets without colluding?
+///
+/// **The board row is a matched-twin comparative on the CROSS-BOUNDARY extraction ROI**
+/// (`ext_consumed / ext_served`, group ↔ outsiders only). The twin is the same ring with
+/// `collude = false` ([`crate::sim_adv::predators::a8_ring_twin_hook`]) — one dial. The raw
+/// [`AdvMetrics::roi`] is deliberately NOT the gated quantity: the collusive pass adds the same
+/// total to `consumed` and `served_out` (both range over the ring's own members), so it drags the
+/// raw ratio toward 1 mechanically and a colluding ring would clear the bar by DILUTION. See
+/// `a8_ring_invariants` for what that swap cost: the spec's literal metric does NOT convict
+/// (0.9304, INCONCLUSIVE, below X = 1), the metric the board adopted FAILs.
+///
+/// **`giver_priority_order = false` — deliberate, and the whole reason this scenario carries a
+/// board row (`4r_a8_spec.md` §1.3).** A7 documented a SIM-FIDELITY ARTIFACT: with the flag ON,
+/// `place_own_data` orders owners by the GLOBAL row-sum `Σ_h capital[o][h].g_ho`, which collusion
+/// inflates for free, so colluders jump the placement queue and win scarce free-accept slots. That
+/// global self-summed giver metric has NO real-protocol analogue (the daemon's priority is
+/// holder-side pairwise). Gating the invariant on the ON world would measure that artifact and call
+/// it a finding. So the BOARD runs on the artifact-free world, and the ON world is measured beside
+/// it as the artifact's delta (`a8_collusion_advantage_under_both_giver_priority_orders`). ⚠ The
+/// board therefore lives in the LESS HEALTHY of the two worlds: honest outsiders' decodable
+/// fraction is 0.30-0.34 with the proxy OFF against 0.44-0.49 with it ON (5-seed calibration table,
+/// N = 8, across the R1/R2 arms). The OFF world is the honest CARRIER of the invariant, not the
+/// better world.
+///
+/// **⚠ FIRST, THE STRUCTURE — in THIS world "collusion buys no honest storage" is a THEOREM, not a
+/// statistical result.** `adv_collude_farm` writes exactly two kinds of cell, `served[i][j]` and
+/// `capital[i][j].g_ho`, for `i, j ∈ ring`. Those cells are read at three decision sites — the
+/// eviction inter-owner rank (`run_eviction` builds its views as `capital[owner][HOLDER]`), the
+/// preemption / admit κ_O guard (`capital[o][HOLDER]`), and the Р-7 `V_ret` cap (the same views) —
+/// and ALL THREE are indexed BY THE HOLDER, so a fabricated `capital[r1][r2]` can only ever be read
+/// by ring member `r2`. The ONE site that reads an owner's whole ROW is `place_own_data`'s
+/// `giver_priority_order` ordering (`Σ_h capital[o][h].g_ho`), and this scenario runs with that
+/// flag OFF. With the proxy off, therefore, **no honest node's decision can read a fabricated cell
+/// at all**, and every pred-vs-twin difference is BY CONSTRUCTION a change in the RING'S OWN HOLDER
+/// behaviour. Keep the row as a REGRESSION GUARD on that structure (a future change that let a
+/// fabricated cell reach an honest decision would move it) — not as evidence that a defence fought
+/// and won.
+///
+/// MEASURED (seeds 42..46, N = 8; `ratio-of-means` unless a row says otherwise):
+///
+/// 1. **The GROSS take goes DOWN. The structure forbids it going UP; the DECREASE is the ring's own
+///    retention shift, and it is price-blind (read finding 2 before quoting it).** With the proxy
+///    OFF the colluding ring takes **0.51×** the honest storage its non-colluding twin takes (per-seed
+///    0.43/0.76/0.54/0.38/0.44; board effect 0.5106 as mean-of-per-seed-ratios, power 3.30) and
+///    earns **0.00-0.13×** its twin's honest credit key `Σ capital[ring][honest].g_ho`. The
+///    reputation it fabricated INSIDE the ring dwarfs that honest credit per seed by
+///    **{80×, 41×, 237620×}** — ⚠ the third value is a near-zero-denominator artifact (that seed's
+///    honest credit is ≈ 0), so read the pair "≈ 40-80× on the two seeds where the ratio is
+///    meaningful", never as a range up to 10⁵.
+/// 2. **What the FAILing ratio row really is: a group that partially EXITS improves its per-unit
+///    deal** (INV-A8-RING-ROI≤TWIN FAILs, effect 2.7485 ± 0.8442, power 2.07). The ring gives
+///    outsiders 0.22× as much while its own parked data still survives at 0.51× on UNCONTENDED
+///    honest disk, which the retention cap never charges for. It is NOT "fake reputation converted
+///    into extraction" — the structural note above forbids that reading, and the empirical control
+///    kills it too: the R2 arm reaches the same end state WITHOUT COLLUDING (intra-ring share 0.939
+///    vs R1's 0.865; net free-ride take−give 23790 vs 25740), so collusion's marginal value over
+///    "just refuse strangers" is ≈ 8 %. Collusion is merely how the SIM expresses a local holder
+///    policy — "keep my friends' symbols, drop the strangers'" — which in the real protocol is free
+///    to adopt and needs no fake PoS at all. The NET counterpart of finding 1 belongs here too:
+///    consumed − served is **1.74×** the twin's (ratio-of-means; per-seed 1.87 ± 0.73, power 1.19 ⇒
+///    INCONCLUSIVE under the house gate, sign 5/5). Gross take down, net free-ride up.
+/// 3. **"Cap under contention, not a price" is a DOCUMENTED KERNEL DECISION being quantified, not a
+///    discovery.** `run_eviction` gates everything on `if !decision.phase.evicting { continue; }`,
+///    and the Р-7 paragraph above `eviction_order` in `crates/viaticum-core/src/four_r/mod.rs` says
+///    it outright: "In abundance (not evicting) the cap does nothing (W9 greed…)". A8's contribution
+///    is the PRICE TAG on that choice under a partial exit, not the observation.
+/// 4. **The A7 artifact reproduces exactly, on a new metric.** With `giver_priority_order = TRUE`
+///    the same collusion takes **3.08×** its twin's honest storage and its own data reaches 0.908
+///    decodable (twin 0.265). Turn the proxy off and the sign flips to 0.51×. ⚠ Only the
+///    honest-storage TAKE lives entirely in the proxy: the ratio effect (2.75×) and the net
+///    free-ride (1.74×) SURVIVE with the proxy off. Measured — not argued — by
+///    `a8_collusion_advantage_under_both_giver_priority_orders`.
+///
+/// `n = 120`, N = 8, ε-accept 0.05, horizon 130, seeds 42..46, V_free = 0 (Р-9).
+pub fn a8_ring() -> Scenario {
+    Scenario {
+        id: ScenarioId("a8_ring"),
+        about: "honest world + a ring of 8 real nodes that ε-serve outsiders and pump each other's reputation with collusive PoS — with the giver-priority proxy OFF no honest decision can read a fabricated cell (structural), so the ring takes 0.51× its non-colluding twin's honest storage; the extraction RATIO still rises 2.75× because a group that partially EXITS improves its per-unit deal (retention is priced only under contention) — the non-colluding friend circle reaches the same end state, so collusion's marginal value is ≈8% (board on giver_priority_order = false; with the proxy ON the take flips to 3.08×)",
+        world: WorldParams {
+            n_nodes: A8_N_NODES,
+            base: DynParams {
+                // §1.3: the board lives in the world WITHOUT the known giver-priority sim artifact.
+                giver_priority_order: false,
+                // V_free = 0 (Р-9 default): the canonical floor; the >0 arm is a tests.rs sweep.
+                ..DynParams::default()
+            },
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: vec![AdvSpec {
+            id: AdvId::A8CollusionRing,
+            count: A8_RING_N,
+            info_model: InfoModel::Own,
+            dials: AdvDials {
+                group_size: A8_RING_N,
+                group_subnet: A8_GROUP_SUBNET,
+                // ε-serve the network (serve outsiders LITTLE — but not nothing, or the extraction
+                // ratio is undefined on both arms).
+                whale_accept: A8_EPS_ACCEPT,
+                // R1: collusion ON (the predator arm; the twin hook flips exactly this).
+                collude: true,
+                // R1 runs NO group accept-policy: it ε-accepts from EVERYONE, ring-mates included
+                // (`serve_ring_only` is the R2 arm's dial). ⚠ Do NOT read that as "R1 stores
+                // nothing real, not even for its friends" — MEASURED, R1's own data ends up 0.865
+                // INSIDE the ring (its non-colluding twin: 0.289), because the fake intra-ring κ_O
+                // makes a ring holder RETAIN the ring-mates' symbols it did accept and shed the
+                // strangers'. That retention shift IS the tranche's mechanism, not a side note.
+                serve_ring_only: false,
+                // NOTE: no demand inflation (`whale_block_mult` unused ⇒ the ordinary
+                // `blocks_per_node`). The ring is a group of REAL users, not whales — A8's premise
+                // is "real nodes with real disks and real demand" (this is what separates it from
+                // A7's phantom farm).
+                ..AdvDials::default()
+            },
+        }],
+        events: Vec::new(),
+        horizon: A8_HORIZON,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![
+            MetricId::Extraction,
+            MetricId::AttackRoi,
+            MetricId::InvariantBoard,
+        ],
+        verdicts: a8_ring_invariants(),
+        fast: false,
+    }
+}
+
+/// The `a8_ring` board (`4r_a8_spec.md` §3.2): the two structural rows + two twin-comparatives.
+///
+/// ⭐ **THE ANTI-GOODHART MOVE, recorded because it cost the tranche a free ride.** The spec's §3.2
+/// row is literally `AdvComparative{ measure: |m| m.roi }` — the RAW ROI. Run as written on the
+/// board's own seeds it does NOT convict: effect **0.9304 ± 0.0497, power 1.40 ⇒ INCONCLUSIVE**,
+/// and BELOW the X = 1 bar, so it would have been written up as "the attack bought nothing"
+/// (per-seed [0.9485, 1.0033, 0.9255, 0.8716, 0.9029]; the first three seeds alone average 0.9591 —
+/// label the seed count when quoting it). Evaluated live by
+/// `a8_spec_literal_roi_row_does_not_fail_which_is_why_the_board_reads_ext_roi`.
+///
+/// That reading has nothing to do with any defence holding: `consumed` and `served_out` both range
+/// over ALL holders, the ring's own members INCLUDED, and the collusive pass adds the SAME total to
+/// each, so collusion drags the raw ratio toward 1 by DILUTION. The board deliberately swaps in the
+/// cross-boundary `ext_roi` instead — which **FAILs at 2.7485** — i.e. the tranche gave up the
+/// metric that would have let it report a clean board and adopted the one that convicts it. Do not
+/// "restore the spec's metric" without re-reading this paragraph.
+fn a8_ring_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-A8-RING-GROSS-TAKE≤TWIN — the spec's own gloss of the invariant ("фейк-коллюзия не
+        // даёт кольцу извлечь у честных БОЛЬШЕ, чем те же узлы извлекли бы без неё"), read on the
+        // quantity that word names: the ABSOLUTE cross-boundary storage the ring took
+        // (`ext_consumed`, the same integral A7's `farm_honest_storage` reports), predator over
+        // twin. MEASURED (seeds 42..46, giver_priority_order = false): effect 0.5106 (σ 0.1483,
+        // power 3.30 — the board's mean-of-per-seed-ratios; the ratio-of-means reads 0.51× as
+        // well: 39915 vs 78615 gb·days).
+        //
+        // ⚠ READ IT AS WHAT IT IS: a GROSS, PRICE-BLIND take. It counts what the ring received and
+        // says nothing about what it paid, so it improves whenever the ring simply NEEDS LESS — and
+        // that is exactly what happens here (the ring's data increasingly lives inside the ring, so
+        // it asks outsiders for less). It is NOT "the load-bearing row", and it must never be read
+        // apart from the NET reading in the same breath: consumed − served = 25740 (pred) vs 14785
+        // (twin) = **1.74× MORE net free-ride under collusion** (ratio-of-means; per-seed net
+        // ratios 1.72/3.11/1.82/1.19/1.51 ⇒ 1.87 ± 0.73, power 1.19 = INCONCLUSIVE under the house
+        // gate, though the sign is 5/5 seeds). Gross take down, net free-ride up: both are true,
+        // and quoting only the first is the Goodhart reading of this board.
+        Invariant {
+            id: "INV-A8-RING-GROSS-TAKE≤TWIN",
+            spec: InvariantSpec::AdvComparative {
+                measure: adv_ext_consumed,
+                dir: Direction::LessThan,
+            },
+            threshold: A8_ROI_X,
+        },
+        // INV-A8-RING-ROI≤TWIN — the spec's LETTER (§3.2), moved onto the cross-boundary ratio
+        // `ext_consumed / ext_served` (see this fn's doc for why, and for what the literal metric
+        // would have scored). It does NOT pass, and the failure is a real result, reported rather
+        // than tuned away (`4r_a8_spec.md` §0 legitimate-negative (а)). MEASURED with the
+        // giver-priority proxy OFF, seeds 42..46: effect 2.7485 ± 0.8442, power 2.07 (the board's
+        // mean-of-per-seed-ratios; the printed decomposition uses ratio-of-means and reads 2.79×).
+        //
+        // WHAT IT MEANS — and what it does NOT. The numerator FELL (0.51×, 5 seeds) while the
+        // denominator fell FURTHER (0.22×, 5 seeds): the ring gives outsiders much less, while its
+        // own parked data still rides UNCONTENDED honest disk that the retention cap never charges
+        // for. So the finding is **"a group that partially EXITS improves its per-unit deal,
+        // because retention is priced only under contention"** — NOT "fake reputation converts into
+        // extraction". Two things forbid the latter reading: (i) STRUCTURALLY, with the proxy off
+        // no honest decision reads a fabricated cell at all (see [`a8_ring`]); (ii) EMPIRICALLY,
+        // the non-colluding friend circle R2 reaches the same end state (intra-ring share 0.939 vs
+        // 0.865; net free-ride 23790 vs 25740), so collusion adds ≈ 8 % over simply refusing
+        // strangers. The cap-under-contention behaviour is itself a DOCUMENTED kernel choice, not a
+        // discovery here: `crates/viaticum-core/src/four_r/mod.rs`, the Р-7 paragraph above
+        // `eviction_order` — "In abundance (not evicting) the cap does nothing (W9 greed…)"; A8
+        // quantifies its price under a partial exit.
+        Invariant {
+            id: "INV-A8-RING-ROI≤TWIN",
+            spec: InvariantSpec::AdvComparative {
+                measure: adv_ext_roi,
+                dir: Direction::LessThan,
+            },
+            threshold: A8_ROI_X,
+        },
+    ]
+}
+
 /// A10 — provider-exit (phase 3, `4r_a10_spec.md`): the honest world, then a large "PROVIDER" — the
 /// top `A10_PROVIDER_FRAC` most-loaded holders (honest_v2's loads are near-flat, so this is the
 /// largest correlated holder set, not a dramatic concentration — see the `A10_PROVIDER_FRAC` scope
@@ -1951,6 +2245,23 @@ fn adv_consumed(a: &AdvMetrics) -> f64 {
 /// The predator's raw extraction ROI `consumed / served_out`.
 fn adv_roi(a: &AdvMetrics) -> f64 {
     a.roi
+}
+
+/// A8: the CROSS-BOUNDARY consumed integral — gb·days of the group's own data that lived on an
+/// OUTSIDER's disk. "How much of the honest network's storage did the group actually take."
+/// ⚠ GROSS and PRICE-BLIND: it knows nothing about what the group gave back, so it FALLS whenever
+/// the group simply needs less (a partial exit). Never quote it without the net reading
+/// `ext_consumed − ext_served` beside it — see `a8_ring_invariants`.
+fn adv_ext_consumed(a: &AdvMetrics) -> f64 {
+    a.ext_consumed
+}
+
+/// A8: the CROSS-BOUNDARY extraction ROI `ext_consumed / ext_served` (group ↔ outsiders only).
+/// The board quantity for a GROUP: unlike [`adv_roi`] it is untouched by the collusive pass, which
+/// writes intra-group cells that inflate `consumed` and `served_out` by the SAME amount and so drag
+/// the raw ratio toward 1 (see [`AdvMetrics::roi`]).
+fn adv_ext_roi(a: &AdvMetrics) -> f64 {
+    a.ext_roi
 }
 
 /// A5: the deep node's parked-symbol SURVIVAL across the pause (the W10/Р-1 depth-floor scalar).

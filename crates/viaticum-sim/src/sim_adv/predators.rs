@@ -190,6 +190,46 @@ pub fn a7_sybil_farm_hook(ctx: &AdvContext) -> AdvAction {
     }
 }
 
+/// A8 collusion-ring / friend-circle (`4r_a8_spec.md`): ONE hook, both arms — every lever is read
+/// off the node's OWN dials (first-hand), so the arms differ by dials alone and the construction
+/// stays fixed across them:
+///
+/// * `accept_rate = whale_accept` — how much this node serves as a HOLDER, toward EVERYONE alike.
+///   **R1 (fake ring)** sets ε: it accepts little, from strangers and ring-mates equally (it runs
+///   no group policy at all), and the collusive PoS is a SUPPLEMENT to that little real storage,
+///   not a substitute for it. ⚠ MEASURED, R1 still ends up holding its friends' data — the ring's
+///   own symbols sit 0.865 inside the ring (twin 0.289), because the fake κ_O makes each ring
+///   holder RETAIN the ring-mates' symbols it did accept and shed the strangers'. **R2 (friend
+///   circle)** sets 1.0 (it really stores) and pairs it with `serve_ring_only`.
+/// * `serve_group_only = serve_ring_only` — R2's "I store for my friends, not for strangers". The
+///   hook declares only the FLAG; WHO is a friend is the engine's god-view membership read in
+///   `admit_offer` (anti-oracle split, as A6/A15/A7).
+/// * `collude_farm = collude` — R1's collusive fake PoS (the shared `adv_collude_farm` pass). This
+///   is the ONE dial the matched TWIN flips ([`a8_ring_twin_hook`]), so the board comparative
+///   isolates COLLUSION from the ring's construction.
+///
+/// It never learns who its ring-mates are, and it never reads `&World`.
+pub fn a8_collusion_ring_hook(ctx: &AdvContext) -> AdvAction {
+    AdvAction {
+        accept_rate: Some(ctx.dials.whale_accept),
+        serve_group_only: ctx.dials.serve_ring_only,
+        collude_farm: ctx.dials.collude,
+        ..AdvAction::NOOP
+    }
+}
+
+/// A8's MATCHED TWIN (`4r_a8_spec.md` §1.1): the SAME ring — same demand, same accept rate, same
+/// serving policy — with COLLUSION OFF. One dial, exactly the A2 polite-twin idiom: the twin is not
+/// an honest hooks-off node (that would confound collusion with the ring's ε-serving construction),
+/// it is the ring playing without the fake PoS. So `ext_roi(pred)/ext_roi(twin)` prices COLLUSION
+/// and nothing else.
+pub fn a8_ring_twin_hook(ctx: &AdvContext) -> AdvAction {
+    AdvAction {
+        collude_farm: false,
+        ..a8_collusion_ring_hook(ctx)
+    }
+}
+
 /// A9 eclipse-targeter (`4r_a9_spec.md` §2.1): an EXEMPLARY holder that is recruited into the
 /// victim's holder set by the ordinary candidate ranking (`accept_rate = 1.0`, never drops, passes
 /// PoS honestly) and then drops synchronously. Which of the three ARMS it plays is read off its own
@@ -278,9 +318,9 @@ pub fn a9_arm_label(adversaries: &[AdvSpec]) -> &'static str {
 }
 
 /// The behaviour hook for a predator id in the PREDATOR arm. A1 ε-whale, A4 whitewasher, A2 silent
-/// dropper, A5 deep-silent pause, A6 discriminatory drop, A7 sybil-farm collusion, A15
-/// incumbent-enclosure. A3's flap is an uptime profile (not a hook), so its predator hook is a no-op;
-/// the rest (A8-A14) are skeleton no-ops (later tranches).
+/// dropper, A5 deep-silent pause, A6 discriminatory drop, A7 sybil-farm collusion, A8 collusion-ring
+/// / friend-circle, A15 incumbent-enclosure. A3's flap is an uptime profile (not a hook), so its
+/// predator hook is a no-op; the rest (A11-A14) are skeleton no-ops (later tranches).
 pub fn hook_for(id: AdvId) -> BehaviorHook {
     match id {
         AdvId::A1EpsilonWhale => a1_epsilon_whale_hook,
@@ -290,6 +330,7 @@ pub fn hook_for(id: AdvId) -> BehaviorHook {
         AdvId::A5DeepSilent => a5_deep_silent_hook,
         AdvId::A6Discriminator => a6_discriminator_hook,
         AdvId::A7SybilFarm => a7_sybil_farm_hook,
+        AdvId::A8CollusionRing => a8_collusion_ring_hook,
         AdvId::A9EclipseTargeter => a9_eclipse_targeter_hook,
         AdvId::A15IncumbentEnclosure => a15_incumbent_enclosure_hook,
         _ => noop_hook,
@@ -309,6 +350,10 @@ pub fn twin_hook_for(id: AdvId) -> BehaviorHook {
         // So the twin must ALSO run the pause hook — the pause is the constant, the D-floor the
         // isolated variable (analogous to A2's polite twin isolating announcedness).
         AdvId::A5DeepSilent => a5_deep_silent_hook,
+        // A8's matched control is NOT honest either — it is the SAME ring with COLLUSION OFF
+        // (`a8_ring_twin_hook`): same demand, same accept rate, same serving policy, one dial
+        // flipped, so the ROI comparative prices collusion and not the ring's construction.
+        AdvId::A8CollusionRing => a8_ring_twin_hook,
         // A1/A4/A3/A6/A15/A9: the matched control is the HONEST node (hooks off). For A3 the flap is
         // the uptime profile (mode-differentiated in `install_adv_uptime`), so its hook stays noop.
         // A15 is a cartel-fraction SWEEP, NOT a twin comparison (its control is a separate
@@ -544,7 +589,36 @@ pub struct AdvMetrics {
     /// board row asserts `roi(pred) < roi(twin)` WHILE it is defined (both A1/A4 sides serve
     /// comparably, so it is). `consumed` above stays the structurally-robust comparative for a
     /// future predator whose served diverges from its twin's (there `served_out → 0` ⇒ NaN).
+    ///
+    /// ⚠ **This raw ratio is NOT usable for a GROUP that colludes (A8 finding).** `consumed` and
+    /// `served_out` both range over ALL `h`, the group's own members INCLUDED, and
+    /// `engine::adv_collude_farm` adds the SAME total `Σ_{i≠j} v_per_symbol` to both sides — so
+    /// collusion drags the raw ratio toward 1 mechanically, and a colluding group whose twin
+    /// extracts (`roi(twin) > 1`) clears `roi(pred) < roi(twin)` by DILUTION rather than by any
+    /// defence holding. MEASURED on the A8 board seeds: the spec's literal `roi` row lands at
+    /// 0.9304 ± 0.0497 (power 1.40 ⇒ INCONCLUSIVE, below the X = 1 bar — i.e. it does not convict),
+    /// while the same comparison on [`AdvMetrics::ext_roi`] FAILs at 2.7485. Use `ext_roi` for a
+    /// group; both are printed side by side in the A8 calibration dump, and the swap is pinned by
+    /// `a8_spec_literal_roi_row_does_not_fail_which_is_why_the_board_reads_ext_roi`.
     pub roi: f64,
+    /// A8 (`4r_a8_spec.md`): the CROSS-BOUNDARY consumed integral
+    /// `Σ_{h ∉ adv} served[h][adv]` — gb·days of the group's OWN data that lived on an OUTSIDER's
+    /// disk (PoS-confirmed). This is what the group actually took FROM the honest network; the
+    /// intra-group cells (which a collusive pass writes for free) are excluded. Same reader as A7's
+    /// [`crate::sim_adv::metrics::farm_honest_storage`].
+    pub ext_consumed: f64,
+    /// A8: the CROSS-BOUNDARY served integral `Σ_{h ∉ adv} served[adv][h]` — what the group really
+    /// GAVE outsiders. Same reader as A7's [`crate::sim_adv::metrics::farm_honest_served`]. An
+    /// ε-serving group gives a little (so the ratio below stays defined); a group that serves
+    /// strangers NOTHING gives exactly 0 (⇒ `ext_roi` = NaN, which is the honest reading: an
+    /// undefined ratio, not a flattering number).
+    pub ext_served: f64,
+    /// A8 THE BOARD QUANTITY: `ext_roi = ext_consumed / ext_served` (`NaN` if `ext_served == 0`) —
+    /// the EXTRACTION ratio across the group boundary. Unlike [`AdvMetrics::roi`] it is untouched
+    /// by the collusive pass (which writes intra-group cells only), so `ext_roi(pred)/ext_roi(twin)`
+    /// measures exactly what INV-A8-RING-ROI≤TWIN asks: did the collusive intra-ring reputation buy
+    /// the ring any more of the honest network's disk than the same ring got WITHOUT colluding.
+    pub ext_roi: f64,
     /// Whitewash rejoin cycles the adversary nodes completed (Σ `adv_rejoin_count`).
     pub rejoins: usize,
     /// World cap-trim count at the horizon (evidence the Р-7 cap engaged). Global — the honest
@@ -616,6 +690,9 @@ pub fn bit_eq(a: &AdvMetrics, b: &AdvMetrics) -> bool {
         && a.consumed.to_bits() == b.consumed.to_bits()
         && a.served_out.to_bits() == b.served_out.to_bits()
         && a.roi.to_bits() == b.roi.to_bits()
+        && a.ext_consumed.to_bits() == b.ext_consumed.to_bits()
+        && a.ext_served.to_bits() == b.ext_served.to_bits()
+        && a.ext_roi.to_bits() == b.ext_roi.to_bits()
         && a.rejoins == b.rejoins
         && a.cap_trims == b.cap_trims
         && a.retention_g.to_bits() == b.retention_g.to_bits()
@@ -803,6 +880,16 @@ pub fn collect_adv_metrics(
         f64::NAN
     };
 
+    // A8: the CROSS-BOUNDARY extraction read (group ↔ outsiders only). The SAME readers A7 uses
+    // (they are generic over a node set), so the two tranches can never drift apart.
+    let ext_consumed = crate::sim_adv::metrics::farm_honest_storage(world, nodes);
+    let ext_served = crate::sim_adv::metrics::farm_honest_served(world, nodes);
+    let ext_roi = if ext_served > 0.0 {
+        ext_consumed / ext_served
+    } else {
+        f64::NAN
+    };
+
     // DIRECT enforcement count: adversary-owned symbols holders dropped over the run.
     let data_evicted = world
         .eviction_log
@@ -818,6 +905,9 @@ pub fn collect_adv_metrics(
         consumed,
         served_out,
         roi,
+        ext_consumed,
+        ext_served,
+        ext_roi,
         rejoins,
         cap_trims: world.cap_trim_count,
         retention_g,

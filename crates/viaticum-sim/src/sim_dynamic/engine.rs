@@ -1284,6 +1284,29 @@ fn admit_offer(
             return false; // enclosure: the cartel shuts its door on the unreciprocated newcomer
         }
     }
+    // World-v3 phase-3 A8 (friend circle, arm R2): a circle HOLDER serves ONLY its own group —
+    // "I store for my friends, not for strangers". The hook declares the FLAG (first-hand: its own
+    // serving policy); GROUP MEMBERSHIP (role id + `group_subnet`) is read ENGINE-side, the same
+    // god-view split `adv_collude_farm` uses and A6's `discriminate` / A15's `enclose_newcomers`
+    // established. This is the ACTOR's policy, NOT a kernel rule: nothing in the trust kernel
+    // learns that a ring exists — the R1/R2 distinction is still made by per-pair reciprocity
+    // alone. `serve_group_only` is `false` for every honest / non-A8 holder, so this branch is
+    // skipped and the accept-gate stays BYTE-IDENTICAL to the pre-A8 path (the ANCHOR). Placed,
+    // like the A15 gate, BEFORE the willingness draw: that draw is a per-(owner, holder, tick)
+    // DERIVED stream, so skipping it here perturbs no other cell's RNG (determinism preserved).
+    if let Some(a) = action
+        && a.serve_group_only
+    {
+        let mine = world.adv[holder]
+            .as_ref()
+            .map(|r| (r.id, r.dials.group_subnet));
+        let theirs = world.adv[owner]
+            .as_ref()
+            .map(|r| (r.id, r.dials.group_subnet));
+        if mine.is_none() || mine != theirs {
+            return false; // a stranger's offer: the circle stores only for its own members
+        }
+    }
     let accept_rate = action
         .and_then(|a| a.accept_rate)
         .unwrap_or_else(|| world.nodes[holder].archetype.willing_accept_rate());
@@ -2216,10 +2239,11 @@ fn adv_pause(world: &mut World, tick: u64) {
     }
 }
 
-/// World-v3 phase-3 A7 (sybil-farm): the COLLUSIVE fake-accrual pass. Runs AFTER the honest
-/// `pos_and_capital` and BEFORE eviction (so the inflated intra-farm reciprocity feeds this tick's
-/// retention cap). For every ORDERED pair of PRESENT same-farm sybils `(i, j)` whose hook DECLARES
-/// `collude_farm` this tick, sybil `i` "serves" sybil `j` WITHOUT holding `j`'s symbol:
+/// World-v3 phase-3 A7 (sybil-farm) + A8 arm R1 (collusion-ring): the COLLUSIVE fake-accrual pass.
+/// Runs AFTER the honest `pos_and_capital` and BEFORE eviction (so the inflated intra-farm
+/// reciprocity feeds this tick's retention cap). For every ORDERED pair of PRESENT same-farm
+/// sybils `(i, j)` whose hook DECLARES `collude_farm` this tick, sybil `i` "serves" sybil `j`
+/// WITHOUT holding `j`'s symbol:
 ///
 /// * `served[i][j] += v_per_symbol`            — holder `i` served owner `j` (a fake PoS pass);
 /// * `capital[i][j].g_ho += v_per_symbol·Δt`   — the ENFORCEMENT key: `i`'s reciprocity credit to
@@ -2246,8 +2270,9 @@ fn adv_pause(world: &mut World, tick: u64) {
 /// **Anti-oracle split (as A6/A15):** the HOOK only declares `collude_farm` (first-hand); the engine
 /// reads farm MEMBERSHIP (role id + `group_subnet`) god-view here, exactly as A6's `discriminate` /
 /// A15's `enclose_newcomers` are applied engine-side. **Deterministic:** pure `(i, j)` index order,
-/// no RNG (the counter-based streams are untouched). **No-op** when fewer than two present A7 nodes
-/// declare collusion (flag false / non-A7 / a lone farm) ⇒ byte-identical to the honest path.
+/// no RNG (the counter-based streams are untouched). **No-op** when fewer than two present
+/// colluding-role nodes declare collusion (flag false / no such role / a lone member) ⇒
+/// byte-identical to the honest path.
 fn adv_collude_farm(world: &mut World, params: &DynParams) {
     let n = world.nodes.len();
     let tick = world.tick;
@@ -2261,7 +2286,13 @@ fn adv_collude_farm(world: &mut World, params: &DynParams) {
         let Some(role) = world.adv[node].as_ref() else {
             continue;
         };
-        if role.id != AdvId::A7SybilFarm {
+        // The COLLUDING roles: A7 (sybil-farm) and A8 (collusion-ring, arm R1 — `4r_a8_spec.md`
+        // §1.1 reuses this pass verbatim rather than growing a second collusion mechanism). The
+        // extension is strictly ADDITIVE: no pre-A8 world carries an A8 role, so every existing
+        // scenario (A7's anchor included) collects exactly the same members and stays
+        // byte-identical. NOTHING else in the pass changes — same quantum, same ordered-pair loop,
+        // same `group_subnet` confinement, same anti-oracle split.
+        if !matches!(role.id, AdvId::A7SybilFarm | AdvId::A8CollusionRing) {
             continue;
         }
         let subnet = role.dials.group_subnet;

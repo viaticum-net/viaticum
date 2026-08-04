@@ -294,6 +294,17 @@ fn format_adv(result: &RunResult) -> Option<String> {
         "  {:<22} {:>11.4} ± {:>6.4}   [<1 ⇒ raw ROI ≤ honest twin]",
         "raw ROI pred/twin", rr, rrs
     );
+    // A8: the CROSS-BOUNDARY extraction read (group ↔ outsiders only) — the ratio a GROUP's board
+    // row reads, because the raw one above is diluted by a colluding group's own intra-group flows.
+    row(&mut o, "ext consumed gb·days", |a| a.ext_consumed);
+    row(&mut o, "ext served gb·days", |a| a.ext_served);
+    row(&mut o, "ext ROI (cross-bound)", |a| a.ext_roi);
+    let (er, ers) = acol_ratio(result, |a| a.ext_roi);
+    let _ = writeln!(
+        o,
+        "  {:<22} {:>11.4} ± {:>6.4}   [<1 ⇒ cross-boundary extraction ≤ twin]",
+        "ext ROI pred/twin", er, ers
+    );
     let _ = writeln!(o);
     Some(o)
 }

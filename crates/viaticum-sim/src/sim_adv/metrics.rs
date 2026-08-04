@@ -366,6 +366,81 @@ pub fn newcomer_decodable_fraction(world: &World, join_cutoff: u64, k_eff: usize
     }
 }
 
+/// World-v3 phase-3 (A8 collusion-ring / friend-circle, `4r_a8_spec.md` §3.1) god-view EVALUATOR
+/// read (never a decision input): the DECODABLE fraction of an explicit node GROUP's own data — the
+/// mean over `group` members present at the horizon of `(target-ever-met blocks currently holding
+/// ≥ k_eff alive symbols) / (target-ever-met blocks)`, cream INCLUDED (the shared
+/// [`alive_symbols`] primitive).
+///
+/// Same predicate and same node-mean aggregation as [`newcomer_decodable_fraction`] — only the
+/// membership cut differs (an explicit index slice instead of the join-tick cut), so a ring's
+/// number is directly comparable with the honest complement's when both are read through here.
+/// That comparison IS the "does the system punish the friend circle" measurement: a circle whose
+/// data dies reads BELOW the honest group. A member with no target-ever-met block yet is SKIPPED
+/// (no denominator); `NaN` if no member has one (or the group is empty).
+pub fn group_decodable_fraction(world: &World, group: &[usize], k_eff: usize) -> f64 {
+    let mut ratio_sum = 0.0f64;
+    let mut counted = 0usize;
+    for &o in group {
+        if o >= world.nodes.len() || !world.nodes[o].present {
+            continue;
+        }
+        let mut met = 0usize;
+        let mut decodable = 0usize;
+        for b in &world.nodes[o].own_blocks {
+            if !b.target_ever_met {
+                continue;
+            }
+            met += 1;
+            if alive_symbols(world, o, b.id) >= k_eff {
+                decodable += 1;
+            }
+        }
+        if met > 0 {
+            ratio_sum += decodable as f64 / met as f64;
+            counted += 1;
+        }
+    }
+    if counted > 0 {
+        ratio_sum / counted as f64
+    } else {
+        f64::NAN
+    }
+}
+
+/// World-v3 phase-3 (A8, `4r_a8_spec.md` §3.1) god-view EVALUATOR read: the INTRA-GROUP SHARE — of
+/// the group's own ALIVE symbols placed anywhere in the network, the fraction sitting on a holder
+/// that is itself a group member. THE calibration question "does a friend circle converge on its
+/// own?": compare it against the PROPORTIONAL reference (the group's share of the present roster a
+/// member could place on) — at ≈ proportional the "circle" is just N arbitrary nodes and the R2 arm
+/// measures nothing; well above it, the circle really keeps its data at home.
+///
+/// Counts alive symbols on PRESENT holders (cream included — a symbol is a symbol for this
+/// question). `NaN` when the group has no alive symbol placed anywhere (nothing to take a share of).
+pub fn group_intra_share(world: &World, group: &[usize]) -> f64 {
+    let mut inside = 0usize;
+    let mut total = 0usize;
+    for (h, node) in world.nodes.iter().enumerate() {
+        if !node.present {
+            continue;
+        }
+        let held = node
+            .holdings
+            .iter()
+            .filter(|s| s.alive && group.contains(&s.owner) && s.owner != h)
+            .count();
+        total += held;
+        if group.contains(&h) {
+            inside += held;
+        }
+    }
+    if total > 0 {
+        inside as f64 / total as f64
+    } else {
+        f64::NAN
+    }
+}
+
 /// World-v3 phase-3 (A10 provider-exit) god-view EVALUATOR read (never a decision input,
 /// `4r_a10_spec.md` §2): the network-wide non-cream FLOOR-FILL. Among ALL PRESENT owners, the
 /// MEAN over owners of that owner's floor-fill = the mean over its FLOOR-EVER-MET own blocks
