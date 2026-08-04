@@ -22,11 +22,15 @@ use crate::sim_adv::predators::{
     a9_eclipse_targeter_hook, a15_incumbent_enclosure_hook, bit_eq as adv_bit_eq, fold_cap_ratio,
     inject_adversaries, inject_incumbent_cartel, install_adv_uptime, twin_dial_override,
 };
+use crate::sim_adv::recip::{
+    INFLOW_BASELINE_WINDOW, MATURE_EARLY_WINDOW, MATURE_LATE_WINDOW, RecipSeries, paired_stats,
+    student_two_sided_p,
+};
 use crate::sim_adv::registry::{
     a1_whale, a3_flapper, a4_whitewasher, a5_deep_silent, a6_discriminator, a7_sybil,
     a9_eclipse_blind, a9_eclipse_drcard, a9_eclipse_silence, a10_provider_exit, a15_enclosure,
     all_scenarios, dr_baseline, dr_battle, dr_hetero, find_scenario, honest_hetero_hard,
-    honest_hetero_v2, honest_v2, tiered_hetero, tiered_hetero_hard, tiered_v1,
+    honest_hetero_v2, honest_v2, p8_reciprocity, tiered_hetero, tiered_hetero_hard, tiered_v1,
 };
 use crate::sim_adv::report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
 use crate::sim_adv::restore::{
@@ -611,7 +615,7 @@ fn vocabulary_enums_are_complete_and_labelled() {
     assert!(AdvId::ALL.iter().all(|a| !a.label().is_empty()));
     assert_eq!(EventKind::ALL.len(), 8);
     assert!(EventKind::ALL.iter().all(|k| !k.label().is_empty()));
-    assert_eq!(MetricId::ALL.len(), 8);
+    assert_eq!(MetricId::ALL.len(), 9);
     assert!(MetricId::ALL.iter().all(|m| !m.label().is_empty()));
 
     // Touch the remaining vocabulary so it is genuine caркас, not future dead types.
@@ -7201,4 +7205,1352 @@ fn eclipse_target_is_repointed_and_its_ledger_reset_when_the_disaster_strikes_so
         crate::sim_dynamic::generator::EclipseState::default(),
         "no eclipse target ⇒ the disaster executor leaves the eclipse state alone"
     );
+}
+
+// ==================================================================
+// P8 — does the reciprocity share HOLD under a steady inflow? (`4r_p8_spec.md`)
+// ==================================================================
+
+/// The MATCHED no-inflow control for `p8_reciprocity`: the SAME scenario with the inflow policy
+/// switched OFF. That is a ONE-SWITCH A/B — `apply_inflow` only rewrites `joined_tick` / `present`
+/// of the last `pool` nodes, so the two arms share node count, archetype/tier draws, dials, horizon
+/// and seeds, and differ ONLY in WHEN the pool arrives (steady stream vs `build_world`'s bootstrap
+/// ramp). Every causal claim P8 makes about DILUTION is backed by this switch, not by reasoning
+/// about the code.
+fn p8_closed_control() -> Scenario {
+    let mut sc = p8_reciprocity();
+    sc.world.inflow = InflowPolicy::None;
+    sc
+}
+
+/// The bar mirrored from registry `P8_SHARE_X` (a pre-registered hypothesis SEPARATOR: the model
+/// predicts 70-90 %, the null predicts ≈ 5 %, 50 lies between and far from both).
+const P8_CAL_SHARE_X: f64 = 50.0;
+
+#[test]
+fn p8_reciprocity_is_registered_with_the_series_declared() {
+    assert!(
+        all_scenarios()
+            .iter()
+            .any(|s| s.id.as_str() == "p8_reciprocity")
+    );
+    let sc = find_scenario("p8_reciprocity").expect("p8_reciprocity is registered");
+    assert!(sc.adversaries.is_empty(), "P8 is a pillar, not a predator");
+    assert!(sc.events.is_empty(), "no scripted disasters");
+    assert!(
+        sc.metrics.contains(&MetricId::RecipSeries),
+        "the runner's series gate is the declaration"
+    );
+    assert!(
+        sc.world.inflow.is_steady(),
+        "the measured arm carries the inflow stream"
+    );
+    assert_eq!(sc.horizon, 160);
+    assert_eq!(sc.seeds, vec![42, 43, 44, 45, 46]);
+    // The matched control differs in exactly ONE field.
+    let ctl = p8_closed_control();
+    assert_eq!(ctl.world.n_nodes, sc.world.n_nodes);
+    assert_eq!(ctl.horizon, sc.horizon);
+    assert_eq!(ctl.world.inflow, InflowPolicy::None);
+}
+
+#[test]
+fn p8_capital_index_matches_the_accrual_site_not_the_prose() {
+    // The index convention P8 rests on, DERIVED FROM THE ENGINE (the spec warns its author has
+    // transposed it twice). A holder `h` that passes a PoS challenge for owner `o` writes BOTH
+    // mirror cells: `capital[o][h].g_oh` (the owner's forecast) and `capital[h][o].g_ho` (the
+    // holder's own record of the service it PERFORMED). So `capital[X][Y].g_ho` reads "X served Y",
+    // and "node n earned as a SERVER" is `∃ y: capital[n][y].g_ho > 0`.
+    //
+    // `share_a_pos` therefore reads `capital[owner][holder].g_ho` = "has the OWNER served this
+    // HOLDER" — the same key the holder's own eviction rank uses, i.e. the reciprocity the symbol's
+    // survival actually depends on. This test pins that by construction rather than by reading
+    // prose.
+    let params = DynParams::default();
+    let mut w = build_world(4, &params, 11);
+    for nd in w.nodes.iter_mut() {
+        nd.present = true;
+        nd.holdings.clear();
+    }
+    // Holder 1 carries one alive symbol owned by 0.
+    w.nodes[1].holdings.push(HeldSymbol {
+        owner: 0,
+        block: 0,
+        volume: 10.0,
+        alive: true,
+        cream: false,
+        iota: 0.5,
+    });
+    // No reciprocity anywhere ⇒ 0 %.
+    assert_eq!(crate::sim_adv::metrics::share_a_pos_percent(&w), 0.0);
+    // The WRONG cell (holder-served-owner, `capital[holder][owner]`) must NOT count: the owner has
+    // served nobody, so the symbol still sits on a non-reciprocal pair.
+    w.capital[1][0].g_ho = 100.0;
+    assert_eq!(
+        crate::sim_adv::metrics::share_a_pos_percent(&w),
+        0.0,
+        "capital[holder][owner].g_ho is the HOLDER's service — not the pair's reciprocity for this \
+         symbol"
+    );
+    // The RIGHT cell: the owner (0) has served the holder (1) ⇒ A > 0.
+    w.capital[0][1].g_ho = 1.0;
+    assert_eq!(crate::sim_adv::metrics::share_a_pos_percent(&w), 100.0);
+    // And the engine writes exactly that cell when node 0 serves node 1: give 0 a holding of 1's
+    // and run the accrual pass.
+    let mut w2 = build_world(4, &params, 11);
+    for nd in w2.nodes.iter_mut() {
+        nd.present = true;
+        nd.holdings.clear();
+    }
+    w2.nodes[0].holdings.push(HeldSymbol {
+        owner: 1,
+        block: 0,
+        volume: 10.0,
+        alive: true,
+        cream: false,
+        iota: 0.5,
+    });
+    // The owner must have that block for the challenge to be issued.
+    w2.nodes[1].own_blocks = vec![OwnBlock {
+        id: 0,
+        volume: 10.0,
+        iota: 0.5,
+        placements: Vec::new(),
+        target_ever_met: false,
+        target_deficit_since: None,
+        to_restore: false,
+    }];
+    crate::sim_dynamic::engine::pos_and_capital_for_test(&mut w2, &params);
+    assert!(
+        w2.capital[0][1].g_ho > 0.0,
+        "holder 0 serving owner 1 writes capital[0][1].g_ho — the SERVER-first index"
+    );
+    assert!(
+        w2.capital[1][0].g_oh > 0.0,
+        "…and the owner's mirror forecast capital[1][0].g_oh"
+    );
+    assert_eq!(
+        w2.first_earned_g[0],
+        Some(0),
+        "and stamps the server's first-earned trace — the series' P8-B source"
+    );
+}
+
+/// The `honest_v2` closed-world reciprocity share, in percent — the number the P8 spec quotes as
+/// "≈ 75.9 %". Mirrors `honest_v2_seed42_matches_sim_diag_anchor`. Kept here so the dilution-gap
+/// report can quote it, WITH the caveat that honest_v2 is a DIFFERENT world (n = 100, 130 ticks,
+/// Legacy uptime, Backbone tiers) — it is CONTEXT, not the controlled comparison. The controlled
+/// comparison is `p8_closed_control` (one switch).
+const P8_HONEST_V2_SHARE: f64 = 75.89;
+
+#[test]
+#[ignore = "P8 heavy deliverable (~140 s) — run with --ignored --nocapture; see the W5 note"]
+fn p8_reciprocity_share_holds_a_plateau_under_steady_inflow() {
+    // P8-A trajectory (spec §4.1): print the `share_a_pos` curve per seed and classify the
+    // DIRECTION against the between-seed noise (Ф-2 / BLOCK-2 lesson: never assert an effect
+    // smaller than the within-regime spread). The signal/noise ratio is printed either way.
+    //
+    // ⚠ RENAMED from `..._trajectory_rises_under_steady_inflow` after the adversarial review of
+    // this tranche. The numbers did not change and the rises below are still positive — what
+    // changed is what they are allowed to MEAN. "Rises under steady inflow" invites the causal
+    // reading "self-reinforcement outran dilution", and that reading is refuted: the matched
+    // CLOSED control rises MORE over the same window, and the mature-phase read below is flat.
+    // What the run supports is a PLATEAU — the share holds while the newcomer stock keeps growing.
+    //
+    // MEASURED (5 seeds): quarter rise +11.18 ± 2.98 pp (warm-up contaminated); inflow-phase rise
+    // +9.56 ± 2.64 pp off a 50.76 ± 1.24 % baseline (NOT warm-up free — see below); MATURE phase
+    // −2.02 ± 3.64 pp at signal/noise 0.56 ⇒ FLAT, while standing newcomers go 13.3 → 37.8. The
+    // curve: 3.30 %@t1 → 64.85 %@t21 → 50.50 % TROUGH@t51 → 60.33 %@t160.
+    //
+    // ⚠ W5 (suite cost): #[ignore]d. This test costs ~135 s and its assert is a conditional
+    // direction report, not a regression gate — the gate is the board row
+    // (`p8_share_a_pos_board_row_clears_the_pre_registered_separator`, kept in the default suite
+    // with all 5 seeds). Seeds were NOT cut to 3: the 5-seed design is what gives the board its
+    // power 5.61 and the dilution gap its df 4, and shrinking it would weaken exactly the
+    // statistics this tranche was told to strengthen. Frozen numbers reproduce with
+    //   cargo test -p viaticum-sim --lib p8_reciprocity_share_holds_a_plateau_under_steady_inflow \
+    //     -- --ignored --nocapture
+    let sc = p8_reciprocity();
+    let seeds = sc.seeds.clone();
+    let r = run(&sc, &seeds);
+    let series: Vec<&crate::sim_adv::recip::RecipSeries> =
+        r.per_seed_recip.iter().flatten().collect();
+    assert_eq!(series.len(), seeds.len(), "every seed carries a series");
+
+    println!("\n=== P8 reciprocity trajectory (share_a_pos %, per seed) ===");
+    let len = series[0].share_a_pos.len();
+    assert_eq!(len, sc.horizon as usize, "one sample per tick");
+    print!("  {:>6}", "tick");
+    for s in &seeds {
+        print!("  {:>8}", format!("seed{s}"));
+    }
+    println!("  {:>8}  {:>10}", "mean", "newcomers");
+    for k in (0..len).step_by(10).chain(std::iter::once(len - 1)) {
+        print!("  {:>6}", k + 1);
+        for sr in &series {
+            print!("  {:>8.2}", sr.share_a_pos[k]);
+        }
+        let vals: Vec<f64> = series.iter().map(|s| s.share_a_pos[k]).collect();
+        let (m, _) = mean_sigma(&vals);
+        let nc: usize = series.iter().map(|s| s.newcomers_present[k]).sum();
+        println!("  {:>8.2}  {:>10.1}", m, nc as f64 / series.len() as f64);
+    }
+
+    let q1: Vec<f64> = series.iter().map(|s| s.first_quarter_mean()).collect();
+    let q4: Vec<f64> = series.iter().map(|s| s.last_quarter_mean()).collect();
+    let rises: Vec<f64> = series.iter().map(|s| s.rise()).collect();
+    let (q1m, q1s) = mean_sigma(&q1);
+    let (q4m, q4s) = mean_sigma(&q4);
+    let (rm, rs) = mean_sigma(&rises);
+    println!("  first quarter = {q1m:.2}±{q1s:.2}   last quarter = {q4m:.2}±{q4s:.2}");
+    println!("  per-seed rise (pp): {rises:?}");
+    // The NOISE the rise must clear, measured two ways: the between-seed σ of the rise itself, and
+    // the between-seed σ of the level it is measured on (the spread a single seed's realisation
+    // carries). Both are printed; the gate uses the LARGER as the noise floor (conservative).
+    let level_sigma = q1s.max(q4s);
+    let noise = rs.max(level_sigma);
+    let snr = if noise > 0.0 {
+        rm.abs() / noise
+    } else {
+        f64::INFINITY
+    };
+    println!(
+        "  [spec §4.1 quarter rise, WARM-UP-CONTAMINATED] rise = {rm:.2}±{rs:.2} pp   \
+         level σ (between seeds) = {level_sigma:.2} pp   signal/noise = {snr:.2}"
+    );
+
+    // ⚠ HONEST CAVEAT — the spec's first-vs-last-quarter comparison is WEAKER than it looks. The
+    // first quarter contains the world's COLD START (tick 1 sits near 0 % by construction: nothing
+    // has been served yet), so part of that rise is plain warm-up and appears in a world with NO
+    // inflow at all — measured, the closed arm rises +16.54 pp over the same quarters against this
+    // arm's +11.18 pp.
+    //
+    // The next read narrows the window to the inflow phase, and IT IS NOT WARM-UP FREE EITHER —
+    // the earlier version of this test claimed it was, and the claim is refuted:
+    //   * the baseline sits at tick indices ≈ 58-67 (onsets `[68, 68, 68, 66, 68]`), while the
+    //     bootstrap ramp runs to `T_join = round(130 · 0.5) = 65` ⇒ 8 of its 10 ticks are INSIDE
+    //     the ramp;
+    //   * `apply_inflow` spreads the pool over `[1, horizon−1]`, so ≈ 32 of the 76 pool nodes have
+    //     ALREADY arrived by then — `onset_tick` is the onset of COUNTABLE newcomers (past the A15
+    //     cut), not of arrivals;
+    //   * the curve is U-SHAPED (3 % → 64.9 %@t21 → 50.5 % TROUGH@t51 → 60-66 %@t160), so the
+    //     baseline reads the TROUGH (50.76 %), not a settled level.
+    // ⇒ the positive number below is real, but it is *(shared post-trough recovery) − (dilution)*,
+    // and the matched closed control scored over the SAME window rises MORE. The decomposition is
+    // printed by `p8_dilution_gap_vs_the_matched_closed_world`; the causal claim lives THERE, on
+    // the one-switch A/B, never here.
+    let onsets: Vec<usize> = series.iter().filter_map(|s| s.onset_tick()).collect();
+    assert_eq!(
+        onsets.len(),
+        series.len(),
+        "every seed's inflow stream has an onset"
+    );
+    let base: Vec<f64> = series
+        .iter()
+        .map(|s| {
+            let o = s.onset_tick().unwrap();
+            s.mean_over(o.saturating_sub(INFLOW_BASELINE_WINDOW), o)
+        })
+        .collect();
+    let irise: Vec<f64> = series
+        .iter()
+        .map(|s| s.inflow_phase_rise(INFLOW_BASELINE_WINDOW))
+        .collect();
+    let (bm, bs) = mean_sigma(&base);
+    let (im, is_) = mean_sigma(&irise);
+    let inoise = is_.max(bs.max(q4s));
+    let isnr = if inoise > 0.0 {
+        im.abs() / inoise
+    } else {
+        f64::INFINITY
+    };
+    println!(
+        "  newcomer-stream onset tick (per seed, 1-based): {:?}",
+        onsets.iter().map(|o| o + 1).collect::<Vec<_>>()
+    );
+    println!("  per-seed inflow-phase rise (pp): {irise:?}");
+    println!(
+        "  [INFLOW-PHASE rise — NOT warm-up-free: the baseline sits INSIDE the bootstrap ramp \
+         (8 of its 10 ticks), AFTER ~32 of the 76 pool nodes have arrived, and ON the U-shape's \
+         trough]"
+    );
+    println!(
+        "  pre-onset baseline = {bm:.2}±{bs:.2} %   last quarter = {q4m:.2}±{q4s:.2} %   \
+         rise = {im:.2}±{is_:.2} pp   signal/noise = {isnr:.2}   \
+         (⇒ within-arm descriptor only; the matched closed control rises MORE over this same window)"
+    );
+
+    // The MATURE-PHASE read — the honest answer to "once the stream is STEADY, does it still
+    // grow?". Both windows sit far past the ramp and past the trough, so this one carries neither
+    // warm-up nor the recovery leg. Free to compute: it re-reads the series already in hand.
+    let mrise: Vec<f64> = series.iter().map(|s| s.mature_rise()).collect();
+    let (mm, ms) = mean_sigma(&mrise);
+    let msnr = if ms > 0.0 {
+        mm.abs() / ms
+    } else {
+        f64::INFINITY
+    };
+    let nc_early: f64 = mean_sigma(
+        &series
+            .iter()
+            .map(|s| s.newcomers_mean_over(MATURE_EARLY_WINDOW.0, MATURE_EARLY_WINDOW.1))
+            .collect::<Vec<_>>(),
+    )
+    .0;
+    let nc_late: f64 = mean_sigma(
+        &series
+            .iter()
+            .map(|s| s.newcomers_mean_over(MATURE_LATE_WINDOW.0, MATURE_LATE_WINDOW.1))
+            .collect::<Vec<_>>(),
+    )
+    .0;
+    println!("  per-seed MATURE-phase change (pp): {mrise:?}");
+    println!(
+        "  [MATURE phase, ticks {}-{} → {}-{} — warm-up free BOTH ends] change = {mm:.2}±{ms:.2} pp \
+         signal/noise = {msnr:.2}   standing newcomers {nc_early:.1} → {nc_late:.1}",
+        MATURE_EARLY_WINDOW.0 + 1,
+        MATURE_EARLY_WINDOW.1,
+        MATURE_LATE_WINDOW.0 + 1,
+        MATURE_LATE_WINDOW.1,
+    );
+    if msnr < 2.0 {
+        println!(
+            "  => FLAT: no growth survives once the stream is routine, while the newcomer stock \
+             keeps climbing. That is the PLATEAU — dilution paid for continuously and continuously \
+             offset — and it is the strongest honest form of the P8 answer."
+        );
+    }
+
+    // The DIRECTION classification, gated on the SIGNED effect against the noise (spec §4.1 + the
+    // Ф-2 / BLOCK-2 lesson: never assert an effect smaller than the within-regime spread). Three
+    // outcomes, and only ONE of them is a failure mode of the TEST:
+    //   RISE  (signed s/n ≥ +2) — assert, so the printed claim and the numbers stay welded;
+    //   SLIDE (signed s/n ≤ −2) — REPORTED, never asserted. Spec §0 makes a slide a result of
+    //                             equal weight ("if A>0 sticks even in world v2, the binding
+    //                             constraint is NOT bootstrap — that is also a result"), so the
+    //                             old `|effect|`-gated `assert!(rise > 0)` would have turned a
+    //                             legitimate finding into a red test;
+    //   FLAT  (|signed s/n| < 2) — diagnostic, as before.
+    let qdir = rm / noise;
+    if qdir >= 2.0 {
+        assert!(
+            rm > 0.0,
+            "P8-A (quarter form, WARM-UP CONTAMINATED — this is a description of the curve, not a \
+             causal claim): last quarter {q4m:.2} % > first quarter {q1m:.2} % \
+             (rise {rm:.2} pp at signal/noise {snr:.2})"
+        );
+    } else if qdir <= -2.0 {
+        println!(
+            "  => SLIDE DETECTED on the quarter form ({rm:.2} pp, signal/noise {snr:.2}) — this is \
+             a RESULT, not a regression (spec §0). Report it with the trajectory; do NOT retune the \
+             inflow to make it go away."
+        );
+    } else {
+        println!(
+            "  => quarter change {rm:.2} pp does NOT clear the between-seed noise {noise:.2} pp \
+             (signal/noise {snr:.2} < 2) — LEFT UNASSERTED (diagnostic only)."
+        );
+    }
+    let idir = im / inoise;
+    if idir >= 2.0 {
+        assert!(
+            im > 0.0,
+            "P8-A (inflow-phase form): the share ENDS ABOVE its pre-onset baseline — last quarter \
+             {q4m:.2} % > baseline {bm:.2} % (rise {im:.2} pp at signal/noise {isnr:.2}), standing \
+             newcomers 0 → {}. NOTE what this does NOT say: the baseline is the U-shape's trough \
+             inside the bootstrap ramp, and the matched CLOSED control rises MORE over the same \
+             window, so this is a shared recovery MINUS dilution — not self-reinforcement \
+             outrunning arrivals.",
+            series
+                .iter()
+                .map(|s| s.newcomers_present[len - 1])
+                .max()
+                .unwrap_or(0)
+        );
+    } else if idir <= -2.0 {
+        println!(
+            "  => SLIDE DETECTED on the inflow-phase form ({im:.2} pp, signal/noise {isnr:.2}) — \
+             this is a RESULT, not a regression (spec §0): the share ended BELOW its pre-onset \
+             baseline. Report it; do NOT retune λ_in."
+        );
+    } else {
+        println!(
+            "  => inflow-phase change {im:.2} pp does NOT clear the between-seed noise \
+             {inoise:.2} pp (signal/noise {isnr:.2} < 2) — LEFT UNASSERTED (diagnostic only). The \
+             LEVEL is what the board row judges."
+        );
+    }
+}
+
+#[test]
+fn p8_newcomer_earns_g_at_once_but_one_in_four_never_places_own_data() {
+    // P8-B (spec §4.2): the measured distribution of `first_earned_tick − joined_tick` over the
+    // NEWCOMER cohort, and — the number that matters more — whether the newcomer ever got its OWN
+    // data backed up. A MEASUREMENT, not a bar: θ_p is uncalibrated (`4r_decision_model.md`
+    // §10.4), so a threshold here would be invented. The only asserts are that the instrument SEES
+    // something.
+    //
+    // MEASURED (5 seeds, cohort 196 newcomers): median 0 ticks, p90 1 tick, max 4, and 196/196
+    // (100 %) earned `g`. So the SERVICE channel opens essentially INSTANTLY.
+    //
+    // ⭐ AND THE HEADLINE THAT NEARLY GOT LEFT IN A STRAY PRINT: only **145/196 (74.0 %) ever had a
+    // single OWN symbol accepted anywhere** (per seed 28/39, 33/39, 24/39, 29/40, 31/39), while
+    // only 26/196 churned out — and 40 of the 51 that never placed were still PRESENT at the
+    // horizon, so they had the whole exposure and stayed unbacked. ≈ 1 in 4 newcomers earned credit
+    // for three years and never got backed up. P8 is sold as a bootstrap-LIVENESS pillar, so that
+    // belongs in the headline. It also feeds back into the share reads: a newcomer that never
+    // places contributes no owned symbols to the `share_a_pos` denominator, so those 51 nodes are
+    // invisible in the trajectory. The median own-data wait below (7-12 ticks) is CONDITIONED on
+    // the 145 that made it and says nothing about the 51 that did not.
+    //
+    // ⚠ THE TWO ENTRY QUANTITIES ARE NOT THE SAME (a spec ambiguity — reported, not papered over).
+    // `first_earned_g` is "the first tick this node PASSED a PoS challenge as a holder", and the
+    // engine's `step` order makes a same-tick pass possible by construction: `activate_joins` (0b)
+    // → `place_own_data` (1b, where a holder ACCEPTS an offer under the free-accept / cream arm) →
+    // `pos_and_capital` (2, where the pass stamps `first_earned_g`). The model's θ_p/λ is a LATER
+    // milestone — the time for accumulated κ_O to clear the PREEMPTION margin at a holder (A.12-2).
+    // So "median 0" says the SERVICE channel opens immediately, not that preemption opens
+    // immediately. Reading it as the latter would overstate the result.
+    //
+    // ⚠ N2 — THE MODEL↔SIM CHAIN RUNS IN THE OPPOSITE ORDER, and nobody flagged it until the
+    // adversarial review. The model orders entry as *place own data (free under V_free) → store
+    // others' → g_ho grows → preemption opens ≈ θ_p/λ*. The sim measures the reverse: serve from
+    // tick 0, own data placed 7-12 ticks later (if ever). Both are coherent bootstrap orders; they
+    // are not the same one, and the model's latency prediction is about the far end of a chain the
+    // sim walks backwards. A real model-vs-sim finding, recorded here rather than smoothed over.
+    let sc = p8_reciprocity();
+    let seeds = sc.seeds.clone();
+    let r = run(&sc, &seeds);
+    let series: Vec<&crate::sim_adv::recip::RecipSeries> =
+        r.per_seed_recip.iter().flatten().collect();
+
+    println!("\n=== P8-B newcomer entry time (join → first earned g as a server) ===");
+    println!(
+        "  cut = joined_tick > {}   exposure filter ≥ {} ticks   horizon {}",
+        series[0].cutoff,
+        crate::sim_adv::recip::ENTRY_MIN_EXPOSURE_TICKS,
+        sc.horizon
+    );
+    let mut all_gaps: Vec<u64> = Vec::new();
+    let mut cohort_total = 0usize;
+    let mut earned_total = 0usize;
+    let mut placed_total = 0usize;
+    let mut stranded_total = 0usize;
+    let mut survivors_total = 0usize;
+    for (s, sr) in seeds.iter().zip(&series) {
+        let st = sr.entry_stats(sc.horizon, crate::sim_adv::recip::ENTRY_MIN_EXPOSURE_TICKS);
+        let surviving =
+            sr.newcomers_surviving(sc.horizon, crate::sim_adv::recip::ENTRY_MIN_EXPOSURE_TICKS);
+        println!(
+            "  seed {s}: newcomers={:>3} (present@horizon {:>3})  earned={:>3}  median={:>5.1}  \
+             p90={:>5.1}  never={:.3}   own-data placed={:>3}/{:<3} (median {:>5.1}, conditioned on \
+             those that placed)",
+            st.n_newcomers,
+            surviving,
+            st.n_earned,
+            st.median_gap,
+            st.p90_gap,
+            st.frac_never_earned,
+            st.n_own_placed,
+            st.n_newcomers,
+            st.median_own_gap,
+        );
+        cohort_total += st.n_newcomers;
+        earned_total += st.n_earned;
+        placed_total += st.n_own_placed;
+        stranded_total += st.n_never_placed_present;
+        survivors_total += surviving;
+        // Pool the raw gaps for the aggregate histogram (the distribution, not just its summary).
+        for i in 0..sr.joined_tick.len() {
+            let j = sr.joined_tick[i];
+            if j > sr.cutoff
+                && sc.horizon.saturating_sub(j) >= crate::sim_adv::recip::ENTRY_MIN_EXPOSURE_TICKS
+                && let Some(e) = sr.first_earned_tick[i]
+            {
+                all_gaps.push(e.saturating_sub(j));
+            }
+        }
+    }
+    all_gaps.sort_unstable();
+    let hist_edges = [0u64, 1, 2, 3, 5, 10, 20, 40];
+    println!("  pooled gap histogram (ticks):");
+    for w in hist_edges.windows(2) {
+        let c = all_gaps.iter().filter(|&&g| g >= w[0] && g < w[1]).count();
+        println!("    [{:>2}, {:>2}) : {c:>4}", w[0], w[1]);
+    }
+    let tail = all_gaps.iter().filter(|&&g| g >= 40).count();
+    println!("    [40, ∞ ) : {tail:>4}");
+    if !all_gaps.is_empty() {
+        let mean_gap = all_gaps.iter().sum::<u64>() as f64 / all_gaps.len() as f64;
+        println!(
+            "  pooled: n={} mean={:.2} median={:.1} p90={:.1} min={} max={}",
+            all_gaps.len(),
+            mean_gap,
+            all_gaps[all_gaps.len() / 2] as f64,
+            all_gaps[(all_gaps.len() * 9 / 10).min(all_gaps.len() - 1)] as f64,
+            all_gaps[0],
+            all_gaps[all_gaps.len() - 1],
+        );
+        println!(
+            "  (the model's θ_p/λ ≈ 1-3 ticks is printed nowhere next to this as a verdict: it is \
+             a DIFFERENT milestone — κ_O clearing a holder's preemption margin — while the gap \
+             above is the first PoS pass. Context, not validation.)"
+        );
+    }
+    println!(
+        "  cohort {cohort_total} newcomers, {earned_total} earned g ({:.1} %), {survivors_total} \
+         still present at the horizon ({} churned out)",
+        100.0 * earned_total as f64 / cohort_total.max(1) as f64,
+        cohort_total - survivors_total,
+    );
+    // ⭐ THE BOOTSTRAP-LIVENESS HEADLINE (B3): earning credit is not getting backed up.
+    println!(
+        "  ⭐ OWN DATA PLACED: {placed_total}/{cohort_total} ({:.1} %) of newcomers ever had a \
+         single own symbol accepted anywhere.",
+        100.0 * placed_total as f64 / cohort_total.max(1) as f64,
+    );
+    println!(
+        "     {} ({:.1} %) NEVER did — of which {stranded_total} were still PRESENT at the horizon, \
+         so they had the whole exposure and still did not get backed up.",
+        cohort_total - placed_total,
+        100.0 * (cohort_total - placed_total) as f64 / cohort_total.max(1) as f64,
+    );
+    println!(
+        "     ≈ 1 in 4 newcomers earned reciprocity for the whole horizon and got nothing stored. \
+         This also feeds the share reads: a newcomer that never places contributes no owned symbols \
+         to the share_a_pos denominator, so those nodes are invisible in the trajectory."
+    );
+    // The asserts: the instrument sees a non-empty newcomer cohort, a non-empty entry-time
+    // distribution, and a non-empty own-placement read. Magnitudes are reported, never asserted
+    // (θ_p is uncalibrated, and the 74 % is a FINDING to report — not a bar to pass).
+    assert!(
+        cohort_total > 0,
+        "the inflow world contains newcomers past the bootstrap cut"
+    );
+    assert!(
+        !all_gaps.is_empty(),
+        "at least one newcomer earned reciprocity as a server — the entry channel is not dead"
+    );
+    assert!(
+        placed_total > 0,
+        "at least one newcomer got its OWN data placed — the backup channel is not dead either \
+         (measured: {placed_total}/{cohort_total})"
+    );
+}
+
+#[test]
+fn p8_share_a_pos_board_row_clears_the_pre_registered_separator() {
+    // The board row (spec §4.3, A15-FLOOR idiom): `kind != Fail && effect > X`, with effect/σ/power
+    // printed. INCONCLUSIVE (power < 2) is a legitimate small-sample outcome and is reported, not
+    // tuned away; a FAIL would be the legitimate NEGATIVE result (reciprocity slides under inflow),
+    // reported with the trajectory rather than rescued by re-tuning λ_in.
+    let sc = p8_reciprocity();
+    let seeds = sc.seeds.clone();
+    let r = run(&sc, &seeds);
+    let v = evaluate_board(&sc, &r);
+    let row = v
+        .iter()
+        .find(|x| x.id == "INV-P8-RECIPROCITY-SHARE")
+        .expect("the P8 board carries the reciprocity-share row");
+    let per_seed: Vec<f64> = r.per_seed.iter().map(|m| m.share_a_pos).collect();
+    println!(
+        "\nP8 board: per-seed share_a_pos = {:?}\n  {} effect={:.4} σ={:.4} X={:.2} power={:.2}",
+        per_seed
+            .iter()
+            .map(|x| format!("{x:.2}"))
+            .collect::<Vec<_>>(),
+        row.kind.label().trim(),
+        row.effect,
+        row.sigma,
+        row.threshold,
+        row.power,
+    );
+    assert_eq!(row.threshold, P8_CAL_SHARE_X, "the frozen separator");
+    assert_ne!(
+        row.kind,
+        VerdictKind::Fail,
+        "INV-P8-RECIPROCITY-SHARE does not FAIL: share {:.2} % vs X {:.2} %",
+        row.effect,
+        row.threshold
+    );
+    assert!(
+        row.effect > P8_CAL_SHARE_X,
+        "under steady inflow the reciprocity share clears the pre-registered separator: \
+         {:.2} % > {P8_CAL_SHARE_X} %",
+        row.effect
+    );
+    // The two structural rows ride along.
+    for id in ["INV-DETERMINISM", "INV-ANTI-ORACLE"] {
+        let s = v.iter().find(|x| x.id == id).expect("structural row");
+        assert_eq!(s.kind, VerdictKind::Pass, "{id} holds");
+    }
+}
+
+#[test]
+#[ignore = "P8 heavy deliverable (~330 s, two arms) — run with --ignored --nocapture; see the W5 note"]
+fn p8_dilution_gap_vs_the_matched_closed_world() {
+    // The DELIVERABLE NUMBER (spec §4.4), measured on the ONE-SWITCH A/B: the same scenario with
+    // the inflow stream ON vs OFF. No assert — a gap is a measurement, not an invariant. PASS on
+    // the board bar does NOT mean "inflow changed nothing"; this is the number that says how much
+    // dilution actually cost.
+    //
+    // DELIBERATE DEVIATION FROM THE SPEC (§4.4 names `honest_v2`'s 75.9 % as the comparison).
+    // `honest_v2` is a DIFFERENT WORLD (n = 100, 130 ticks, Legacy uptime, Backbone tiers), so a
+    // difference against it confounds "inflow" with "world". The controlled comparison is this
+    // scenario with the inflow policy flipped — literally one switch. honest_v2's number is still
+    // printed, labelled as CONTEXT.
+    //
+    // ⚠ W5 (suite cost): #[ignore]d. It runs BOTH arms (~330 s) and contains NO assert at all —
+    // it is a deliverable measurement, so it has zero regression value in the default suite. Seeds
+    // were NOT cut to 3: the paired statistic below has df 4 on 5 seeds and df 2 on 3, and the
+    // whole point of this test is that gap's significance. Reproduce with
+    //   cargo test -p viaticum-sim --lib p8_dilution_gap_vs_the_matched_closed_world \
+    //     -- --ignored --nocapture
+    //
+    // MEASURED (5 seeds): inflow 60.33 ± 1.84 % vs closed 66.39 ± 2.55 % ⇒ gap −6.06 pp (per seed
+    // −7.01 / −1.27 / −5.16 / −7.71 / −9.15). PAIRED (the correct analysis — same seeds, one
+    // switch): σ_d 3.04, SE 1.36, t(4) = −4.46, p = 0.0112. UNPAIRED the answer depends on which
+    // convention you pick (2.38 against the larger arm's σ, 1.93 against the quadrature σ — one
+    // side of the house 2.0 gate each), and that ambiguity is itself the argument for pairing: with
+    // one switch on shared seeds there is no reason to carry the between-seed spread of the LEVEL
+    // as if it were uncertainty about the SWITCH. The trajectories are indistinguishable
+    // until the stream starts (gap −0.4 pp at tick 61, 0 newcomers) and separate exactly as
+    // newcomers accumulate (−6.4 pp at tick 131, 28 newcomers), then flatten near −6 pp — the
+    // causal attribution rests on the switch, not on reading the code.
+    //
+    // ⭐ THE READ THAT REFUTED THE TRANCHE'S FIRST STORY. Scored over the SAME window (the inflow
+    // arm's onset, since a closed world has no onset of its own), the CLOSED arm rises MORE:
+    // +15.19 ± 2.67 pp against the inflow arm's +9.56 ± 2.64 pp ⇒ difference −5.64 pp (paired
+    // t(4) = −3.29, p = 0.030). So the inflow arm's "rise" is not self-reinforcement outrunning
+    // dilution — it is (shared post-trough recovery +15.19) − (dilution −5.64). Quarter
+    // decomposition says the same thing: closed +16.54 pp vs inflow +11.18 pp. And in the MATURE
+    // phase (ticks 91-100 → 151-160, both windows past the ramp and past the trough) the inflow arm
+    // reads −2.02 ± 3.64 pp, signal/noise 0.56 = FLAT, against +2.62 ± 3.09 pp closed, while
+    // standing newcomers go 13.3 → 37.8. The defensible claim is a PLATEAU: dilution is real,
+    // continuous, and continuously OFFSET — not outrun.
+    let sc = p8_reciprocity();
+    let seeds = sc.seeds.clone();
+    let inflow = run(&sc, &seeds);
+    let closed = run(&p8_closed_control(), &seeds);
+    let inf: Vec<f64> = inflow.per_seed.iter().map(|m| m.share_a_pos).collect();
+    let cls: Vec<f64> = closed.per_seed.iter().map(|m| m.share_a_pos).collect();
+    let (im, isg) = mean_sigma(&inf);
+    let (cm, csg) = mean_sigma(&cls);
+    println!("\n=== P8 dilution gap (inflow ON vs OFF — one switch, same seeds/nodes/dials) ===");
+    for (k, s) in seeds.iter().enumerate() {
+        println!(
+            "  seed {s}: inflow {:.2} %   closed {:.2} %   gap {:+.2} pp",
+            inf[k],
+            cls[k],
+            inf[k] - cls[k]
+        );
+    }
+    println!("  inflow  mean = {im:.2}±{isg:.2} %");
+    println!("  closed  mean = {cm:.2}±{csg:.2} %");
+    println!(
+        "  DILUTION GAP = {:+.2} pp   (closed-world context: honest_v2 = {P8_HONEST_V2_SHARE:.2} %, \
+         a DIFFERENT world — n=100/130 ticks/Legacy uptime — so it is context, not the control)",
+        im - cm
+    );
+    // W1: the gap's UNCERTAINTY, analysed the way the design demands. The two arms are not two
+    // independent samples — seed k's readings are a matched PAIR (same seed, same node draws, same
+    // dials, one switch), so the correct test differences them out first. Both analyses are printed
+    // because the difference between them is the point: unpaired, the between-seed spread of the
+    // LEVEL (which is large) masquerades as the uncertainty of the SWITCH.
+    let ps = paired_stats(&inf, &cls);
+    let unpaired_noise = isg.max(csg);
+    let quadrature = (isg * isg + csg * csg).sqrt();
+    println!(
+        "  gap analysed UNPAIRED (both wrong here, and they disagree — which is itself the argument \
+         for pairing): vs the LARGER arm σ {unpaired_noise:.2} ⇒ signal/noise {:.2}; vs the \
+         QUADRATURE σ {quadrature:.2} (the spread of a difference of two INDEPENDENT single-seed \
+         readings) ⇒ {:.2} — the latter falls BELOW the house 2.0 gate",
+        (im - cm).abs() / unpaired_noise,
+        (im - cm).abs() / quadrature,
+    );
+    println!(
+        "  gap analysed PAIRED (correct — same seeds, ONE switch): mean_d {:+.2} pp   σ_d {:.2}   \
+         SE {:.2}   t({}) = {:+.2}   p = {:.4} (two-sided, exact for ν=4)",
+        ps.mean_diff, ps.sigma_diff, ps.se, ps.df, ps.t, ps.p_two_sided,
+    );
+    // The two TRAJECTORIES side by side. This is what stops the shape being mis-attributed: the
+    // early hump-then-dip is the BOOTSTRAP RAMP (nodes still joining until tick ≈ 65), and it is
+    // present in BOTH arms — only the post-onset half is about inflow.
+    let inf_s: Vec<&crate::sim_adv::recip::RecipSeries> =
+        inflow.per_seed_recip.iter().flatten().collect();
+    let cls_s: Vec<&crate::sim_adv::recip::RecipSeries> =
+        closed.per_seed_recip.iter().flatten().collect();
+    let len = inf_s[0].share_a_pos.len();
+    println!(
+        "  {:>6}  {:>16}  {:>16}  {:>8}  {:>10}",
+        "tick", "inflow %", "closed %", "gap pp", "newcomers"
+    );
+    for k in (0..len).step_by(10).chain(std::iter::once(len - 1)) {
+        let a: Vec<f64> = inf_s.iter().map(|s| s.share_a_pos[k]).collect();
+        let b: Vec<f64> = cls_s.iter().map(|s| s.share_a_pos[k]).collect();
+        let (am, asg) = mean_sigma(&a);
+        let (bm, bsg) = mean_sigma(&b);
+        let nc: f64 = inf_s
+            .iter()
+            .map(|s| s.newcomers_present[k] as f64)
+            .sum::<f64>()
+            / inf_s.len() as f64;
+        println!(
+            "  {:>6}  {:>16}  {:>16}  {:>+8.2}  {:>10.1}",
+            k + 1,
+            format!("{am:.2}±{asg:.2}"),
+            format!("{bm:.2}±{bsg:.2}"),
+            am - bm,
+            nc
+        );
+    }
+    // The quarter/phase decomposition of BOTH arms — the honest attribution of the shape.
+    let q1i: Vec<f64> = inf_s.iter().map(|s| s.first_quarter_mean()).collect();
+    let q4i: Vec<f64> = inf_s.iter().map(|s| s.last_quarter_mean()).collect();
+    let q1c: Vec<f64> = cls_s.iter().map(|s| s.first_quarter_mean()).collect();
+    let q4c: Vec<f64> = cls_s.iter().map(|s| s.last_quarter_mean()).collect();
+    println!(
+        "  quarters — inflow: Q1 {:.2} → Q4 {:.2} (rise {:+.2})   closed: Q1 {:.2} → Q4 {:.2} \
+         (rise {:+.2})   ⇒ the warm-up part of the rise is the CLOSED arm's; the difference is \
+         what inflow did",
+        mean_sigma(&q1i).0,
+        mean_sigma(&q4i).0,
+        mean_sigma(&q4i).0 - mean_sigma(&q1i).0,
+        mean_sigma(&q1c).0,
+        mean_sigma(&q4c).0,
+        mean_sigma(&q4c).0 - mean_sigma(&q1c).0,
+    );
+
+    // ⭐ THE SAME STATISTIC ON BOTH ARMS (the read that refutes "self-reinforcement outran
+    // dilution"). `inflow_phase_rise` is anchored on the arm's OWN onset, and a closed world has
+    // none — its own value is NaN by construction, which is exactly how the earlier version of
+    // this tranche avoided ever scoring the control the same way. Fix: score the control over the
+    // INFLOW ARM's window (same seed ⇒ same tick indices), so the two numbers are comparable.
+    let onsets: Vec<usize> = inf_s
+        .iter()
+        .map(|s| s.onset_tick().expect("the inflow arm has an onset"))
+        .collect();
+    let same_window_rise = |s: &crate::sim_adv::recip::RecipSeries, o: usize| -> f64 {
+        s.last_quarter_mean() - s.mean_over(o.saturating_sub(INFLOW_BASELINE_WINDOW), o)
+    };
+    let irise: Vec<f64> = inf_s
+        .iter()
+        .zip(&onsets)
+        .map(|(s, &o)| same_window_rise(s, o))
+        .collect();
+    let crise: Vec<f64> = cls_s
+        .iter()
+        .zip(&onsets)
+        .map(|(s, &o)| same_window_rise(s, o))
+        .collect();
+    let (irm, irs) = mean_sigma(&irise);
+    let (crm, crs) = mean_sigma(&crise);
+    let rise_gap = paired_stats(&irise, &crise);
+    println!(
+        "  shared-window onsets (0-based tick index, from the INFLOW arm): {onsets:?}   \
+         baseline window = the {INFLOW_BASELINE_WINDOW} ticks before it"
+    );
+    println!("  per-seed same-window rise — inflow {irise:?}");
+    println!("  per-seed same-window rise — closed {crise:?}");
+    println!(
+        "  ⭐ SAME-WINDOW RISE: inflow {irm:+.2}±{irs:.2} pp   vs   CLOSED {crm:+.2}±{crs:.2} pp   \
+         ⇒ difference {:+.2} pp (paired t({}) = {:+.2}, p = {:.4})",
+        rise_gap.mean_diff, rise_gap.df, rise_gap.t, rise_gap.p_two_sided,
+    );
+    println!(
+        "     READ IT AS: the CONTROL rises more. The inflow arm's rise is (shared post-trough \
+         recovery ≈ {crm:.1} pp) − (dilution ≈ {:.1} pp), NOT self-reinforcement outrunning \
+         arrivals. The baseline window itself sits inside the bootstrap ramp (T_join = 65) and \
+         after ~32 of the 76 pool nodes have already arrived, on the U-shape's trough — it is a \
+         within-arm descriptor and cannot carry an attribution.",
+        rise_gap.mean_diff.abs(),
+    );
+
+    // The MATURE-PHASE read on both arms: two warm-up-free windows deep inside the steady stream.
+    // The honest answer to "does it still GROW once arrivals are routine?".
+    let imat: Vec<f64> = inf_s.iter().map(|s| s.mature_rise()).collect();
+    let cmat: Vec<f64> = cls_s.iter().map(|s| s.mature_rise()).collect();
+    let (imm, ims) = mean_sigma(&imat);
+    let (cmm, cms) = mean_sigma(&cmat);
+    let imsnr = if ims > 0.0 {
+        imm.abs() / ims
+    } else {
+        f64::INFINITY
+    };
+    let nc_e = mean_sigma(
+        &inf_s
+            .iter()
+            .map(|s| s.newcomers_mean_over(MATURE_EARLY_WINDOW.0, MATURE_EARLY_WINDOW.1))
+            .collect::<Vec<_>>(),
+    )
+    .0;
+    let nc_l = mean_sigma(
+        &inf_s
+            .iter()
+            .map(|s| s.newcomers_mean_over(MATURE_LATE_WINDOW.0, MATURE_LATE_WINDOW.1))
+            .collect::<Vec<_>>(),
+    )
+    .0;
+    println!("  per-seed MATURE-phase change — inflow {imat:?}");
+    println!("  per-seed MATURE-phase change — closed {cmat:?}");
+    println!(
+        "  ⭐ MATURE PHASE (ticks {}-{} → {}-{}, both windows past the ramp AND past the trough): \
+         inflow {imm:+.2}±{ims:.2} pp (signal/noise {imsnr:.2}{})   vs   closed {cmm:+.2}±{cms:.2} pp \
+         — meanwhile the inflow arm's standing newcomers go {nc_e:.1} → {nc_l:.1}",
+        MATURE_EARLY_WINDOW.0 + 1,
+        MATURE_EARLY_WINDOW.1,
+        MATURE_LATE_WINDOW.0 + 1,
+        MATURE_LATE_WINDOW.1,
+        if imsnr < 2.0 { " = FLAT" } else { "" },
+    );
+    println!(
+        "     READ IT AS: once the stream is routine there is NO growth left to find on the inflow \
+         arm. A flat share against a still-growing newcomer stock is the PLATEAU — dilution paid \
+         for continuously and continuously offset. \"Holds\" is supported; \"outgrows\" is not."
+    );
+    // Also report the standing newcomer load the gap was paid for, and the population each arm
+    // ended at (a gap that is really a population difference would show up here).
+    for (k, s) in seeds.iter().enumerate() {
+        let s0 = inflow.per_seed_recip[k].as_ref().expect("series");
+        println!(
+            "  seed {s}: inflow arm {} joined past the cut (peak {} present at once); \
+             present@horizon inflow {} vs closed {}",
+            s0.newcomers_total(),
+            s0.peak_newcomers(),
+            inflow.per_seed[k].present_nodes,
+            closed.per_seed[k].present_nodes,
+        );
+    }
+}
+
+#[test]
+fn p8_series_is_deterministic_across_a_double_run() {
+    // The series must re-run bit-identical (it feeds the report + every P8 test). Uses a SHRUNK
+    // scenario (fewer nodes / ticks / seeds) — determinism is structural, not scale-dependent, and
+    // the full board's determinism row already re-runs seed[0] of the real scenario.
+    let mut sc = p8_reciprocity();
+    sc.world.n_nodes = 40;
+    sc.horizon = 20;
+    sc.seeds = vec![42];
+    let a = run_one_seed(&sc, 42).recip.expect("series recorded");
+    let b = run_one_seed(&sc, 42).recip.expect("series recorded");
+    assert!(
+        crate::sim_adv::recip::bit_eq(&a, &b),
+        "the reciprocity series is bit-identical on a double run"
+    );
+    assert_eq!(a.share_a_pos.len(), sc.horizon as usize);
+    assert_eq!(a.joined_tick.len(), sc.world.n_nodes);
+    assert_eq!(a.first_earned_tick.len(), sc.world.n_nodes);
+}
+
+#[test]
+fn p8_series_is_a_pure_observer_of_the_world() {
+    // The instrument ANCHOR (spec §4.6): recording the series changes NOTHING about the world.
+    // Proven two ways on the CLOSED arm (`InflowPolicy::None`, so the world is a plain closed
+    // cohort):
+    //   (1) the runner's metrics with the series ON equal a series-free bare `step` loop's metrics,
+    //       bit for bit (the `population_curve` reference-implementation idiom);
+    //   (2) dropping `MetricId::RecipSeries` from the scenario leaves the metrics bit-identical.
+    let sc = {
+        let mut s = p8_closed_control();
+        s.world.n_nodes = 40;
+        s.horizon = 20;
+        s
+    };
+    let with_series = run_one_seed(&sc, 42);
+    assert!(with_series.recip.is_some(), "the control arm records too");
+
+    // (1) series-free reference: build the same world and step it with nothing else attached.
+    let params = sc.world.base;
+    let prior = viaticum_core::four_r::SurfacePrior::default();
+    let policy = viaticum_core::four_r::PlacementPolicy::default();
+    let mut world = build_world(sc.world.n_nodes, &params, 42);
+    if let TierMix::Custom(shares) = &sc.world.tier_mix {
+        apply_tier_mix(&mut world, shares, 42);
+    }
+    if sc.world.uptime.is_tiered() {
+        world.uptime = sc.world.uptime.assign(&world);
+    }
+    apply_inflow(&mut world, sc.world.inflow, sc.horizon);
+    for _ in 0..sc.horizon {
+        crate::sim_dynamic::engine::step(&mut world, &params, &prior, &policy);
+    }
+    let bare = collect_metrics(&world, &params);
+    assert!(
+        metrics_bit_eq(&with_series.metrics, &bare),
+        "the reciprocity series is a PURE OBSERVER: the runner's world matches a series-free \
+         step loop bit for bit"
+    );
+
+    // (2) the same run with the metric id removed.
+    let without = {
+        let mut s = sc.clone();
+        s.metrics.retain(|m| *m != MetricId::RecipSeries);
+        run_one_seed(&s, 42)
+    };
+    assert!(without.recip.is_none(), "no declaration ⇒ no series");
+    assert!(
+        metrics_bit_eq(&with_series.metrics, &without.metrics),
+        "declaring the series does not move the world"
+    );
+    // And the series' own last sample agrees with the horizon snapshot (single-source check).
+    let s = with_series.recip.expect("series");
+    assert_eq!(
+        s.final_share().to_bits(),
+        with_series.metrics.share_a_pos.to_bits(),
+        "the trajectory's last point IS MetricSet::share_a_pos"
+    );
+}
+
+#[test]
+fn p8_closed_world_series_reports_no_newcomers() {
+    // The newcomer cut is self-consistent: in a CLOSED cohort nothing joins past the bootstrap
+    // ramp, so the standing newcomer count is 0 at every tick and the entry cohort is empty —
+    // while the inflow arm carries a real stream. This is what makes `newcomers_present` legible
+    // as the dilution denominator.
+    //
+    // The shrink keeps the HORIZON past the bootstrap ramp (`join_horizon_ticks · t_join_frac`
+    // = 65 ticks, a dial that does NOT scale with the scenario horizon): a 30-tick shrink would
+    // put the whole inflow pool inside the ramp and the cut would swallow it, making the test
+    // vacuous rather than failing loudly. 100 ticks leaves a real post-cut stream.
+    let mut closed = p8_closed_control();
+    closed.world.n_nodes = 100;
+    closed.horizon = 100;
+    let s = run_one_seed(&closed, 42).recip.expect("series");
+    assert!(
+        s.newcomers_present.iter().all(|&c| c == 0),
+        "a closed cohort has no node past its own cut"
+    );
+    assert_eq!(s.newcomers_total(), 0);
+    let st = s.entry_stats(closed.horizon, 0);
+    assert_eq!(st.n_newcomers, 0, "empty cohort");
+    assert!(st.median_gap.is_nan(), "no distribution to report");
+
+    let mut open = p8_reciprocity();
+    open.world.n_nodes = 100;
+    open.horizon = 100;
+    let so = run_one_seed(&open, 42).recip.expect("series");
+    assert!(
+        so.newcomers_total() > 0,
+        "the inflow arm carries a real newcomer stream (cut {})",
+        so.cutoff
+    );
+    assert!(
+        so.onset_tick().is_some(),
+        "the stream has an onset tick in the inflow arm"
+    );
+    assert!(
+        s.onset_tick().is_none(),
+        "a closed world has no inflow onset ⇒ inflow_phase_rise is NaN"
+    );
+    assert!(s.inflow_phase_rise(INFLOW_BASELINE_WINDOW).is_nan());
+}
+
+#[test]
+fn p8_report_renders_the_trajectory_section_and_is_byte_identical_on_repeat() {
+    // The P8 report section must render (trajectory table + entry-time block) and be
+    // byte-identical on repeat, like every other section. A SHRUNK scenario keeps it quick, but
+    // the horizon stays past the bootstrap ramp (see `p8_closed_world_series_reports_no_newcomers`)
+    // so the newcomer block is actually exercised rather than silently skipped.
+    let mut sc = p8_reciprocity();
+    sc.world.n_nodes = 60;
+    sc.horizon = 80;
+    sc.seeds = vec![42, 43];
+    let seeds = sc.seeds.clone();
+
+    let r1 = run(&sc, &seeds);
+    let t1 = format_report(&sc, &r1, &evaluate_board(&sc, &r1));
+    let r2 = run(&sc, &seeds);
+    let t2 = format_report(&sc, &r2, &evaluate_board(&sc, &r2));
+    assert_eq!(t1, t2, "the P8 report is byte-identical on repeat");
+    assert!(
+        t1.contains("P8 reciprocity trajectory"),
+        "the trajectory section renders:\n{t1}"
+    );
+    assert!(
+        t1.contains("newcomer entry"),
+        "the entry-time block renders (the shrink keeps a real newcomer cohort):\n{t1}"
+    );
+    // A scenario that does NOT declare the series renders no P8 section (output unchanged).
+    let mut plain = sc.clone();
+    plain.metrics.retain(|m| *m != MetricId::RecipSeries);
+    let rp = run(&plain, &seeds);
+    let tp = format_report(&plain, &rp, &evaluate_board(&plain, &rp));
+    assert!(!tp.contains("P8 reciprocity trajectory"));
+}
+
+// ------------------------------------------------------------------
+// P8 — `recip.rs` PURE-FUNCTION edge cases (house rule: wrote a public fn → wrote tests).
+// None of these builds a world: they pin the arithmetic and the degenerate inputs that the heavy
+// scenario tests never reach, and they run in microseconds.
+// ------------------------------------------------------------------
+
+/// A hand-built trajectory with no cohort — for the series-shape reads.
+fn recip_fixture(share: &[f64]) -> RecipSeries {
+    RecipSeries {
+        share_a_pos: share.to_vec(),
+        newcomers_present: vec![0; share.len()],
+        first_earned_tick: Vec::new(),
+        joined_tick: Vec::new(),
+        first_own_accept: Vec::new(),
+        present_at_end: Vec::new(),
+        cutoff: 0,
+    }
+}
+
+/// A hand-built cohort: node `i` joined at `joined[i]`, earned at `earned[i]`, placed own data at
+/// `own[i]`, present at the horizon per `present[i]`. Trajectory left empty (unused by these).
+fn cohort_fixture(
+    cutoff: u64,
+    joined: &[u64],
+    earned: &[Option<u64>],
+    own: &[Option<u64>],
+    present: &[bool],
+) -> RecipSeries {
+    RecipSeries {
+        share_a_pos: Vec::new(),
+        newcomers_present: Vec::new(),
+        first_earned_tick: earned.to_vec(),
+        joined_tick: joined.to_vec(),
+        first_own_accept: own.to_vec(),
+        present_at_end: present.to_vec(),
+        cutoff,
+    }
+}
+
+#[test]
+fn mean_over_clamps_the_window_and_reports_nan_when_the_range_is_empty() {
+    let s = recip_fixture(&[10.0, 20.0, 30.0, 40.0]);
+    assert_eq!(s.mean_over(0, 4), 25.0);
+    assert_eq!(s.mean_over(1, 3), 25.0);
+    assert_eq!(s.mean_over(2, 99), 35.0, "hi clamps to the series length");
+    assert!(s.mean_over(3, 3).is_nan(), "empty half-open range");
+    assert!(
+        s.mean_over(9, 20).is_nan(),
+        "a window wholly past the end clamps to lo == hi ⇒ NaN, never a silent tail read"
+    );
+    assert!(s.mean_over(3, 1).is_nan(), "inverted range");
+    assert!(recip_fixture(&[]).mean_over(0, 5).is_nan());
+    // The newcomer companion clamps identically (it is the dilution denominator of the same read).
+    let mut n = recip_fixture(&[0.0; 4]);
+    n.newcomers_present = vec![1, 2, 3, 4];
+    assert_eq!(n.newcomers_mean_over(0, 4), 2.5);
+    assert_eq!(n.newcomers_mean_over(2, 99), 3.5);
+    assert!(n.newcomers_mean_over(4, 4).is_nan());
+}
+
+#[test]
+fn quarter_means_and_rises_degrade_to_nan_only_on_an_empty_series() {
+    let empty = recip_fixture(&[]);
+    assert!(empty.first_quarter_mean().is_nan());
+    assert!(empty.last_quarter_mean().is_nan());
+    assert!(empty.rise().is_nan());
+    assert!(empty.mature_rise().is_nan());
+    assert!(empty.final_share().is_nan());
+    // len < 4: the quarter rounds to zero ticks, so both ends fall back to ONE sample rather than
+    // NaN — a short series still yields a finite (if meaningless) rise, and callers must not read
+    // a finite value as "the window was well-formed".
+    let one = recip_fixture(&[10.0]);
+    assert_eq!(one.first_quarter_mean(), 10.0);
+    assert_eq!(one.last_quarter_mean(), 10.0);
+    assert_eq!(one.rise(), 0.0);
+    let three = recip_fixture(&[10.0, 20.0, 30.0]);
+    assert_eq!(three.first_quarter_mean(), 10.0);
+    assert_eq!(three.last_quarter_mean(), 30.0);
+    assert_eq!(three.rise(), 20.0);
+    let four = recip_fixture(&[10.0, 20.0, 30.0, 40.0]);
+    assert_eq!(four.first_quarter_mean(), 10.0);
+    assert_eq!(four.last_quarter_mean(), 40.0);
+    assert_eq!(four.rise(), 30.0);
+    // `mature_rise` is anchored on FROZEN absolute tick indices, so a series shorter than the late
+    // window degrades to NaN instead of quietly sliding onto another part of the curve.
+    let short = recip_fixture(&vec![1.0; MATURE_LATE_WINDOW.0]);
+    assert!(short.mature_rise().is_nan());
+    let mut full = recip_fixture(&vec![1.0; MATURE_LATE_WINDOW.1]);
+    for k in MATURE_LATE_WINDOW.0..MATURE_LATE_WINDOW.1 {
+        full.share_a_pos[k] = 4.0;
+    }
+    assert_eq!(full.mature_rise(), 3.0);
+}
+
+#[test]
+fn entry_stats_keeps_the_newcomer_that_sits_exactly_on_the_censoring_boundary() {
+    // horizon 20, min_exposure 5 ⇒ `horizon − joined >= 5` is the filter. Node 1 sits EXACTLY on
+    // it (20 − 15 == 5) and must be KEPT; node 2 misses by one tick and must be dropped.
+    let s = cohort_fixture(
+        10,
+        &[5, 15, 16, 11],
+        &[Some(6), Some(15), Some(17), None],
+        &[Some(7), None, Some(18), Some(20)],
+        &[true, true, false, true],
+    );
+    let st = s.entry_stats(20, 5);
+    assert_eq!(
+        st.n_newcomers, 2,
+        "node 0 is bootstrap (joined <= cutoff), node 2 is right-censored"
+    );
+    assert_eq!(st.n_earned, 1, "only the boundary node earned");
+    assert_eq!(st.median_gap, 0.0, "15 − 15");
+    assert_eq!(st.n_own_placed, 1, "only node 3 placed own data");
+    assert_eq!(st.median_own_gap, 9.0, "20 − 11");
+    assert_eq!(st.frac_never_earned, 0.5);
+    assert_eq!(
+        st.n_never_placed_present, 1,
+        "the boundary node never placed and was still present — stranded, not churned"
+    );
+    assert_eq!(s.newcomers_surviving(20, 5), 2);
+    assert_eq!(
+        s.newcomers_total(),
+        3,
+        "counts past the cut, censoring aside"
+    );
+    // Moving the exposure filter one tick tighter drops the boundary node.
+    assert_eq!(s.entry_stats(20, 6).n_newcomers, 1);
+    // An empty cohort is the all-NaN read, not a zero.
+    let none = s.entry_stats(20, 100);
+    assert_eq!(none.n_newcomers, 0);
+    assert!(none.median_gap.is_nan());
+    assert!(none.frac_never_earned.is_nan());
+    assert_eq!(none.n_never_placed_present, 0);
+}
+
+#[test]
+fn entry_stats_quantiles_use_nearest_rank_on_a_small_cohort() {
+    // The quantile is nearest-rank on the ASCENDING gaps: rank = ceil(q·n), index rank−1. Pinned
+    // through the public read at n = 1, 2, 3 — the sizes where interpolation vs nearest-rank
+    // actually differ, and where a single seed's cohort can land.
+    let one = cohort_fixture(0, &[1], &[Some(8)], &[None], &[true]);
+    let st1 = one.entry_stats(100, 0);
+    assert_eq!((st1.median_gap, st1.p90_gap), (7.0, 7.0));
+    let two = cohort_fixture(
+        0,
+        &[1, 1],
+        &[Some(2), Some(6)],
+        &[None, None],
+        &[true, true],
+    );
+    let st2 = two.entry_stats(100, 0);
+    assert_eq!(
+        (st2.median_gap, st2.p90_gap),
+        (1.0, 5.0),
+        "median takes the LOWER of two (rank 1), p90 the upper (rank 2) — no interpolation"
+    );
+    let three = cohort_fixture(
+        0,
+        &[1, 1, 1],
+        &[Some(1), Some(3), Some(11)],
+        &[None, None, None],
+        &[true, true, true],
+    );
+    let st3 = three.entry_stats(100, 0);
+    assert_eq!((st3.median_gap, st3.p90_gap), (2.0, 10.0));
+    assert_eq!(st3.frac_never_earned, 0.0);
+}
+
+#[test]
+fn bit_eq_treats_a_deterministic_nan_as_equal_to_itself_but_not_to_a_different_bit_pattern() {
+    let a = recip_fixture(&[f64::NAN, 1.0]);
+    let b = recip_fixture(&[f64::NAN, 1.0]);
+    assert!(
+        crate::sim_adv::recip::bit_eq(&a, &b),
+        "the determinism row compares through to_bits, so a re-run's NaN matches"
+    );
+    assert!(!crate::sim_adv::recip::bit_eq(
+        &a,
+        &recip_fixture(&[1.0, 1.0])
+    ));
+    assert!(
+        !crate::sim_adv::recip::bit_eq(&a, &recip_fixture(&[-f64::NAN, 1.0])),
+        "to_bits is STRICTER than `==`: a different NaN bit pattern is a difference"
+    );
+    assert!(!crate::sim_adv::recip::bit_eq(
+        &a,
+        &recip_fixture(&[f64::NAN])
+    ));
+    let mut c = recip_fixture(&[f64::NAN, 1.0]);
+    c.cutoff = 7;
+    assert!(!crate::sim_adv::recip::bit_eq(&a, &c));
+    let mut d = recip_fixture(&[f64::NAN, 1.0]);
+    d.present_at_end = vec![true];
+    assert!(!crate::sim_adv::recip::bit_eq(&a, &d));
+}
+
+#[test]
+fn paired_stats_differences_out_the_shared_seed_and_refuses_a_mismatched_pairing() {
+    // The frozen P8 dilution gap, re-derived from the per-seed numbers alone (no world run): this
+    // is the W1 statistic the report prints, pinned so a change in the arithmetic is visible.
+    let inflow = [60.64, 60.62, 62.91, 59.62, 57.84];
+    let closed = [67.65, 61.89, 68.07, 67.33, 66.99];
+    let ps = paired_stats(&inflow, &closed);
+    assert_eq!(ps.n, 5);
+    assert_eq!(ps.df, 4);
+    assert!((ps.mean_diff - -6.06).abs() < 0.01, "{ps:?}");
+    assert!((ps.sigma_diff - 3.038).abs() < 0.01, "{ps:?}");
+    assert!((ps.se - 1.359).abs() < 0.01, "{ps:?}");
+    assert!((ps.t - -4.460).abs() < 0.01, "{ps:?}");
+    assert!((ps.p_two_sided - 0.0112).abs() < 0.001, "{ps:?}");
+    // Identical arms ⇒ a zero effect with a defined (zero) t, not a 0/0 NaN.
+    let same = paired_stats(&inflow, &inflow);
+    assert_eq!(same.mean_diff, 0.0);
+    assert_eq!(same.t, 0.0);
+    assert_eq!(same.p_two_sided, 1.0);
+    // A constant non-zero offset has zero spread ⇒ infinite t, p = 0. Degenerate but honest: with
+    // every pair shifted identically there IS no sampling noise left to be uncertain about.
+    let shifted: Vec<f64> = inflow.iter().map(|x| x + 2.0).collect();
+    let off = paired_stats(&shifted, &inflow);
+    assert_eq!(off.mean_diff, 2.0);
+    assert!(off.t.is_infinite() && off.t > 0.0);
+    assert_eq!(off.p_two_sided, 0.0);
+    // Mis-paired or too-small input is REFUSED (n = 0, all NaN) rather than approximated.
+    assert_eq!(paired_stats(&inflow, &closed[..3]).n, 0);
+    assert_eq!(paired_stats(&[1.0], &[2.0]).n, 0);
+    assert!(paired_stats(&[1.0, f64::NAN], &[2.0, 3.0]).t.is_nan());
+}
+
+#[test]
+fn student_two_sided_p_is_exact_at_four_df_and_nan_everywhere_else() {
+    // Textbook checkpoints for ν = 4: t=0 ⇒ p=1, t→∞ ⇒ p=0, and the 5 %/1 % critical values.
+    assert_eq!(student_two_sided_p(0.0, 4), 1.0);
+    assert!((student_two_sided_p(2.776, 4) - 0.05).abs() < 1e-3);
+    assert!((student_two_sided_p(4.604, 4) - 0.01).abs() < 1e-3);
+    assert!(
+        (student_two_sided_p(-2.776, 4) - 0.05).abs() < 1e-3,
+        "symmetric"
+    );
+    assert_eq!(student_two_sided_p(f64::INFINITY, 4), 0.0);
+    // Any other df returns NaN rather than a wrong approximation in the small-sample regime.
+    for df in [1usize, 2, 3, 5, 9, 30] {
+        assert!(student_two_sided_p(2.0, df).is_nan(), "df {df}");
+    }
+    assert!(student_two_sided_p(f64::NAN, 4).is_nan());
+}
+
+#[test]
+#[ignore = "P8 calibration — run with --ignored --nocapture to justify the scenario knobs"]
+fn p8_inflow_intensity_matches_the_expected_churn_outflow_when_lambda_is_untuned() {
+    // The SCENARIO knob (spec §1.1): what the inflow intensity actually is at runtime — how many
+    // nodes arrive over the horizon against n0, and what standing population that buys. λ_in is
+    // NOT tuned: it is `expected_outflow(n0)`, the physical fixed point at which arrivals match
+    // churn. Printed so the report can quote it rather than assert it.
+    //
+    // MEASURED: n_nodes 256, n0 180, pool 76, λ_in 0.4757/tick ⇒ 42.2 % of the bootstrap cohort
+    // arrives over the horizon. Per seed the newcomer CUT lands at tick 64-65 (the bootstrap ramp
+    // `join_horizon_ticks · t_join_frac = 65`, a dial INDEPENDENT of the scenario horizon), so
+    // 44-45 of the 76 pool nodes count as genuine newcomers-into-an-established-world; the rest
+    // arrive during the ramp and are folded into the cohort. Standing newcomers peak at 35-41.
+    // Present@horizon: inflow arm 177-195 vs closed arm 168-191 — the inflow arm carries ~5-9 more
+    // live nodes, i.e. the population effect of the stream is small next to its −6 pp share effect.
+    let sc = p8_reciprocity();
+    let n0 = bootstrap_n0(sc.world.n_nodes, sc.world.inflow, sc.horizon);
+    let lambda = match sc.world.inflow {
+        InflowPolicy::Steady { joins_per_tick } => joins_per_tick,
+        InflowPolicy::None => 0.0,
+    };
+    println!(
+        "\n=== P8 inflow calibration: n_nodes={} n0={n0} pool={} λ_in={lambda:.4}/tick horizon={} ===",
+        sc.world.n_nodes,
+        pool_size(lambda, sc.horizon),
+        sc.horizon,
+    );
+    println!(
+        "  pool / n0 = {:.1} % of the bootstrap cohort arrives over the horizon; \
+         expected outflow at n0 = {:.4}/tick (λ_in ≡ it by construction)",
+        100.0 * pool_size(lambda, sc.horizon) as f64 / n0 as f64,
+        expected_outflow(n0, sc.world.base.churn_out_prob),
+    );
+    let seeds = sc.seeds.clone();
+    let r = run(&sc, &seeds);
+    let closed = run(&p8_closed_control(), &seeds);
+    for (k, s) in seeds.iter().enumerate() {
+        let sr = r.per_seed_recip[k].as_ref().expect("series");
+        println!(
+            "  seed {s}: cut={:>3} newcomers_total={:>3} peak_present_newcomers={:>3} \
+             present@horizon={:>3} (closed arm {:>3})  share {:.2} % vs closed {:.2} %",
+            sr.cutoff,
+            sr.newcomers_total(),
+            sr.peak_newcomers(),
+            r.per_seed[k].present_nodes,
+            closed.per_seed[k].present_nodes,
+            r.per_seed[k].share_a_pos,
+            closed.per_seed[k].share_a_pos,
+        );
+    }
+}
+
+#[test]
+#[ignore = "P8 calibration — run with --ignored --nocapture for the λ_in intensity sweep"]
+fn p8_reciprocity_share_across_the_inflow_intensity_sweep() {
+    // HONEST-REFLECT sweep: is the P8 answer an artifact of the ONE λ_in the scenario froze? Scale
+    // the arrival intensity ×{0, 1, 2, 4} around the physical fixed point and report the horizon
+    // share + the trajectory rise at each. The pool (and so the world size) grows with λ_in, which
+    // is the honest coupling — a stronger stream IS more nodes. Not a board row; a diagnostic that
+    // says where the answer starts to bend.
+    //
+    // MEASURED (5 seeds):
+    //   ×0  λ=0.0000  pool   0  n=180  share 66.85±3.76 %  rise 15.04±4.13 pp
+    //   ×1  λ=0.4757  pool  76  n=256  share 60.33±1.84 %  rise 11.18±2.98 pp
+    //   ×2  λ=0.9514  pool 152  n=332  share 58.70±4.87 %  rise 12.06±4.77 pp
+    //   ×4  λ=1.9028  pool 304  n=484  share 55.62±2.70 %  rise 11.24±0.41 pp
+    //
+    // READING, AT THE STRENGTH THE NUMBERS SUPPORT (corrected after the adversarial review — the
+    // earlier comment claimed the whole ordering was a real effect, and it is not):
+    //   * only the ENDPOINTS are separated. ×0 vs ×4 = −11.23 pp at 3.4σ — solid. The interior
+    //     steps are NOT: ×1→×2 is 0.44σ and ×2→×4 is 0.78σ, i.e. indistinguishable from seed
+    //     realisation, exactly the A15-sweep situation. "Monotone" describes the printed means,
+    //     not a demonstrated ordering;
+    //   * SUB-LINEARITY survives, because it rests on the endpoint alone: 4× the arrival rate
+    //     costs ~11 pp, not ~4 × 6.5 pp. That is the load-bearing claim of this sweep;
+    //   * ⚠ THE SWEEP CONFOUNDS λ_in WITH n. The pool grows with λ_in, so n runs 180 → 484 across
+    //     the row; "stronger stream" and "bigger world" move together and this design cannot
+    //     separate them. The size effect is BOUNDED, though: ×0 at n=180 reads 66.85 % and the
+    //     matched closed control at n=256 reads 66.39 %, so ~76 extra nodes with NO stream move
+    //     the level by ≲0.5 pp ⇒ population size accounts for at most ~2 pp of the 11.2 pp swing,
+    //     and the rest is arrivals;
+    //   * every point clears the 50 % separator — the "A>0 sticks at a few percent" null is not
+    //     approached even at 4× the physical churn-replacement rate. The printed "rise" column is
+    //     the WARM-UP-CONTAMINATED quarter rise (see `recip::rise`), kept as a shape diagnostic;
+    //     it is not evidence of self-reinforcement at any intensity.
+    let base = p8_reciprocity();
+    let lambda0 = match base.world.inflow {
+        InflowPolicy::Steady { joins_per_tick } => joins_per_tick,
+        InflowPolicy::None => 0.0,
+    };
+    let seeds = base.seeds.clone();
+    println!(
+        "\n=== P8 λ_in intensity sweep (n0 = 180, horizon = {}) ===",
+        base.horizon
+    );
+    println!(
+        "  {:>6}  {:>8}  {:>6}  {:>7}  {:>16}  {:>14}",
+        "×λ_in", "λ_in", "pool", "n_nodes", "share_a_pos %", "rise pp"
+    );
+    for mult in [0.0f64, 1.0, 2.0, 4.0] {
+        let lambda = lambda0 * mult;
+        let mut sc = base.clone();
+        sc.world.inflow = if lambda > 0.0 {
+            InflowPolicy::Steady {
+                joins_per_tick: lambda,
+            }
+        } else {
+            InflowPolicy::None
+        };
+        sc.world.n_nodes = 180 + pool_size(lambda, sc.horizon);
+        let r = run(&sc, &seeds);
+        let vals: Vec<f64> = r.per_seed.iter().map(|m| m.share_a_pos).collect();
+        let (m, s) = mean_sigma(&vals);
+        let rises: Vec<f64> = r
+            .per_seed_recip
+            .iter()
+            .flatten()
+            .map(|x| x.rise())
+            .collect();
+        let (rm, rs) = mean_sigma(&rises);
+        println!(
+            "  {mult:>6.1}  {lambda:>8.4}  {:>6}  {:>7}  {:>16}  {:>14}",
+            pool_size(lambda, sc.horizon),
+            sc.world.n_nodes,
+            format!("{m:.2}±{s:.2}"),
+            format!("{rm:.2}±{rs:.2}"),
+        );
+    }
 }

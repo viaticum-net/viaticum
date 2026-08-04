@@ -415,11 +415,20 @@ pub enum MetricId {
     DecentHealth,
     TierReport,
     InvariantBoard,
+    /// P8 (`4r_p8_spec.md`): the per-tick RECIPROCITY trajectory (`share_a_pos`) + the newcomer
+    /// entry-time trace ([`crate::sim_adv::recip::RecipSeries`]).
+    ///
+    /// **This id is LOAD-BEARING, unlike its siblings** (which document what a scenario reports):
+    /// the runner records the series only for a scenario that declares it. The gate has to be a
+    /// DECLARATION rather than a world-shape read (as `tier` gates on `uptime.is_tiered()` and
+    /// `pop` on `inflow.is_steady()`) precisely because P8's A/B flips the inflow policy — the
+    /// series is needed on BOTH arms, so it cannot be gated on the switch under test.
+    RecipSeries,
 }
 
 impl MetricId {
-    /// All eight, in canonical order.
-    pub const ALL: [MetricId; 8] = [
+    /// All nine, in canonical order.
+    pub const ALL: [MetricId; 9] = [
         MetricId::RestoreTruth,
         MetricId::Extraction,
         MetricId::AttackRoi,
@@ -428,6 +437,7 @@ impl MetricId {
         MetricId::DecentHealth,
         MetricId::TierReport,
         MetricId::InvariantBoard,
+        MetricId::RecipSeries,
     ];
 
     /// Short label.
@@ -441,6 +451,7 @@ impl MetricId {
             MetricId::DecentHealth => "decent_health",
             MetricId::TierReport => "tier_report",
             MetricId::InvariantBoard => "invariant_board",
+            MetricId::RecipSeries => "recip_series",
         }
     }
 }

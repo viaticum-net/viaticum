@@ -12,6 +12,7 @@ use crate::sim_adv::brier::{Calibration, DEFAULT_BRIER_BUCKETS};
 use crate::sim_adv::hetero::{DemandClass, HeteroReport};
 use crate::sim_adv::inflow::{POP_BAND, PopSeries};
 use crate::sim_adv::metrics::{MetricSet, mean_sigma};
+use crate::sim_adv::recip::{ENTRY_MIN_EXPOSURE_TICKS, RecipSeries};
 use crate::sim_adv::restore::{IOTA_BUCKETS, RestoreTruth};
 use crate::sim_adv::runner::{RunResult, SweepRow};
 use crate::sim_adv::scenario::Scenario;
@@ -164,6 +165,11 @@ pub fn format_report(scenario: &Scenario, result: &RunResult, verdicts: &[Verdic
 
     // --- inflow (4r_inflow_spec.md §3): the present-count population curve + stationarity band ---
     if let Some(section) = format_population(result) {
+        o.push_str(&section);
+    }
+
+    // --- P8 (4r_p8_spec.md): the reciprocity trajectory + the newcomer entry-time distribution ---
+    if let Some(section) = format_recip(result, scenario.horizon) {
         o.push_str(&section);
     }
 
@@ -1023,6 +1029,168 @@ fn format_population(result: &RunResult) -> Option<String> {
         ms_cell(dm, ds, 4),
         POP_BAND,
     );
+    let _ = writeln!(o);
+    Some(o)
+}
+
+/// Render the P8 RECIPROCITY section (`4r_p8_spec.md`): the `share_a_pos` trajectory (sampled
+/// ticks, mean ± σ over seeds) with the standing newcomer count beside it, then the newcomer
+/// entry read. `None` when no seed carried a reciprocity series (every scenario that does not
+/// declare `MetricId::RecipSeries` — output unchanged).
+///
+/// The trajectory is the P8 deliverable: a closed world's ≈ 76 % share proves little, because
+/// nobody arrives to dilute it. Under a steady stream the question is whether the share HOLDS.
+/// Two labelling rules this renderer follows, because both were mis-read once already:
+/// * the printed rise is WARM-UP CONTAMINATED and is a within-arm descriptor, never a causal
+///   claim — the matched closed control rises more (`recip::rise`);
+/// * "earned g" and the model's `θ_p/λ` are DIFFERENT milestones, so they are printed as context
+///   with the difference spelled out, never as a validation of one by the other.
+fn format_recip(result: &RunResult, horizon: u64) -> Option<String> {
+    let series: Vec<&RecipSeries> = result.per_seed_recip.iter().flatten().collect();
+    let first = *series.first()?;
+    let len = first.share_a_pos.len();
+    if len == 0 {
+        return None;
+    }
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "-- P8 reciprocity trajectory (share of alive symbols on A>0 pairs, %, mean ± σ over seeds) --"
+    );
+    let _ = writeln!(
+        o,
+        "  newcomer cut = joined_tick > {}   (a CLOSED world has no node past its own cut ⇒ newcomers ≡ 0)",
+        first.cutoff,
+    );
+    let _ = writeln!(
+        o,
+        "  {:>6}  {:>16} {:>16}",
+        "tick", "share_A>0 %", "newcomers"
+    );
+    let step = (len / 16).max(1);
+    let mut ticks: Vec<usize> = (0..len).step_by(step).collect();
+    if ticks.last() != Some(&(len - 1)) {
+        ticks.push(len - 1);
+    }
+    for &k in &ticks {
+        let sv: Vec<f64> = series.iter().map(|s| s.share_a_pos[k]).collect();
+        let nv: Vec<f64> = series
+            .iter()
+            .map(|s| s.newcomers_present[k] as f64)
+            .collect();
+        let (sm, ss) = mean_sigma(&sv);
+        let (nm, ns) = mean_sigma(&nv);
+        let _ = writeln!(
+            o,
+            "  {:>6}  {:>16} {:>16}",
+            k + 1,
+            ms_cell(sm, ss, 2),
+            ms_cell(nm, ns, 1)
+        );
+    }
+    let q1: Vec<f64> = series.iter().map(|s| s.first_quarter_mean()).collect();
+    let q4: Vec<f64> = series.iter().map(|s| s.last_quarter_mean()).collect();
+    let rise: Vec<f64> = series.iter().map(|s| s.rise()).collect();
+    let (q1m, q1s) = mean_sigma(&q1);
+    let (q4m, q4s) = mean_sigma(&q4);
+    let (rm, rs) = mean_sigma(&rise);
+    let _ = writeln!(
+        o,
+        "  first quarter = {}   last quarter = {}   rise = {} pp   (rise/σ_between_seeds = {:.2})",
+        ms_cell(q1m, q1s, 2),
+        ms_cell(q4m, q4s, 2),
+        ms_cell(rm, rs, 2),
+        if rs > 0.0 { rm / rs } else { f64::INFINITY },
+    );
+    let _ = writeln!(
+        o,
+        "  ⚠ that rise is WARM-UP CONTAMINATED (Q1 holds the cold start) and is NOT evidence that \
+         reciprocity outgrows the stream: measured on"
+    );
+    let _ = writeln!(
+        o,
+        "    `p8_reciprocity`, the matched CLOSED control rises MORE over the same quarters \
+         (+16.54 vs +11.18 pp), and the mature-phase read"
+    );
+    let _ = writeln!(
+        o,
+        "    is FLAT. The defensible claim is that the share HOLDS A PLATEAU under sustained \
+         dilution — see `p8_dilution_gap_vs_the_matched_closed_world`."
+    );
+    // Newcomer entry (P8-B): time to first earned g, then the liveness number — did the newcomer
+    // ever get its OWN data backed up.
+    let stats: Vec<crate::sim_adv::recip::EntryStats> = series
+        .iter()
+        .map(|s| s.entry_stats(horizon, ENTRY_MIN_EXPOSURE_TICKS))
+        .collect();
+    let cohort: usize = stats.iter().map(|s| s.n_newcomers).sum();
+    if cohort > 0 {
+        let med: Vec<f64> = stats.iter().map(|s| s.median_gap).collect();
+        let p90: Vec<f64> = stats.iter().map(|s| s.p90_gap).collect();
+        let never: Vec<f64> = stats.iter().map(|s| s.frac_never_earned).collect();
+        let (mm, msd) = mean_sigma(&med);
+        let (pm, psd) = mean_sigma(&p90);
+        let (nm2, nsd) = mean_sigma(&never);
+        let survivors: usize = series
+            .iter()
+            .map(|s| s.newcomers_surviving(horizon, ENTRY_MIN_EXPOSURE_TICKS))
+            .sum();
+        let _ = writeln!(
+            o,
+            "  newcomer entry (join → first earned g as a server; cohort = {} nodes over {} seeds, \
+             ≥{} ticks of exposure, {} still present at horizon):",
+            cohort,
+            series.len(),
+            ENTRY_MIN_EXPOSURE_TICKS,
+            survivors,
+        );
+        let own: Vec<f64> = stats.iter().map(|s| s.median_own_gap).collect();
+        let placed: usize = stats.iter().map(|s| s.n_own_placed).sum();
+        let stranded: usize = stats.iter().map(|s| s.n_never_placed_present).sum();
+        let (om, osd) = mean_sigma(&own);
+        let _ = writeln!(
+            o,
+            "    median = {} ticks   p90 = {} ticks   never earned = {}",
+            ms_cell(mm, msd, 2),
+            ms_cell(pm, psd, 2),
+            ms_cell(nm2, nsd, 3),
+        );
+        let _ = writeln!(
+            o,
+            "    (context, NOT a validation: the model's θ_p/λ ≈ 1-3 ticks is a LATER milestone — \
+             κ_O clearing a holder's preemption margin —"
+        );
+        let _ = writeln!(
+            o,
+            "     while `first_earned_g` is the first PoS pass as a holder. The two are different \
+             events; do not read one as measuring the other.)"
+        );
+        // The BOOTSTRAP-LIVENESS headline: earning credit is not the same as getting backed up,
+        // and the second one is why a newcomer joined. Printed as a headline, not a footnote.
+        let _ = writeln!(
+            o,
+            "  ⭐ OWN DATA PLACED: {}/{} of the cohort ({:.1} %) ever had a single own symbol \
+             accepted anywhere — {} ({:.1} %) NEVER did,",
+            placed,
+            cohort,
+            100.0 * placed as f64 / cohort as f64,
+            cohort - placed,
+            100.0 * (cohort - placed) as f64 / cohort as f64,
+        );
+        let _ = writeln!(
+            o,
+            "     still PRESENT at the horizon among those: {} — they had the whole exposure and \
+             still did not get backed up, they did not merely churn out.",
+            stranded,
+        );
+        let _ = writeln!(
+            o,
+            "     median join → first own accept = {} ticks, CONDITIONED on the {} that placed \
+             (it is the wait of the ones that made it).",
+            ms_cell(om, osd, 2),
+            placed,
+        );
+    }
     let _ = writeln!(o);
     Some(o)
 }

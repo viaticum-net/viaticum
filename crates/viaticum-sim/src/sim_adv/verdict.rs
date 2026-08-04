@@ -467,6 +467,18 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             .first()
                             .map(|e0| *e0 == sr.eclipse)
                             .unwrap_or(false);
+                        // The P8 reciprocity trajectory + newcomer-entry trace must re-run
+                        // bit-identical too — it feeds the P8 report section and the trajectory
+                        // tests (`recip::bit_eq` compares the f64 curve through `to_bits`).
+                        let recip_eq = match result.per_seed_recip.first() {
+                            Some(Some(r0)) => sr
+                                .recip
+                                .as_ref()
+                                .map(|r1| crate::sim_adv::recip::bit_eq(r0, r1))
+                                .unwrap_or(false),
+                            Some(None) => sr.recip.is_none(),
+                            None => true,
+                        };
                         metrics_eq
                             && restore_eq
                             && calib_eq
@@ -480,6 +492,7 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             && farm_recip_eq
                             && overall_eq
                             && eclipse_eq
+                            && recip_eq
                     }
                     None => false,
                 };

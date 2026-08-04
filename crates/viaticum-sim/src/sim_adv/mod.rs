@@ -45,6 +45,7 @@ pub mod hetero;
 pub mod inflow;
 pub mod metrics;
 pub mod predators;
+pub mod recip;
 pub mod registry;
 pub mod report;
 pub mod restore;
@@ -66,10 +67,13 @@ pub use inflow::{
 };
 pub use metrics::{
     EclipseCost, MetricSet, cartel_earnings_split, collect_eclipse_cost, farm_honest_reciprocity,
-    farm_honest_served, farm_honest_storage, newcomer_decodable_fraction,
+    farm_honest_served, farm_honest_storage, newcomer_decodable_fraction, share_a_pos_percent,
 };
 pub use predators::{
     AdvMetrics, RunMode, collect_adv_metrics, hook_for, inject_adversaries, inject_incumbent_cartel,
+};
+pub use recip::{
+    EntryStats, PairedStats, RecipSeries, newcomers_present, paired_stats, student_two_sided_p,
 };
 pub use registry::{all_scenarios, find_scenario};
 pub use report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};

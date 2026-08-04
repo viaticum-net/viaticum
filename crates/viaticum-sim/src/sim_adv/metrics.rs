@@ -58,7 +58,6 @@ pub fn collect_metrics(world: &World, params: &DynParams) -> MetricSet {
 
     // --- share A>0, mean D, mean σ over alive pairs on present holders (6a/6f/6g) ---
     let mut alive_symbols = 0usize;
-    let mut a_pos = 0usize;
     let mut depth_sum = 0.0f64;
     let mut sigma_sum = 0.0f64;
     for h in 0..n {
@@ -68,18 +67,13 @@ pub fn collect_metrics(world: &World, params: &DynParams) -> MetricSet {
         for s in world.nodes[h].holdings.iter().filter(|s| s.alive) {
             alive_symbols += 1;
             let cap = &world.capital[s.owner][h];
-            if cap.g_ho > 1e-12 {
-                a_pos += 1;
-            }
             depth_sum += cap.depth_ho;
             sigma_sum += cap.sigma;
         }
     }
-    let share_a_pos = if alive_symbols > 0 {
-        100.0 * a_pos as f64 / alive_symbols as f64
-    } else {
-        0.0
-    };
+    // Single source of truth (P8): the SAME reader the per-tick reciprocity trajectory samples,
+    // so the trajectory's last point and this horizon snapshot can never drift apart.
+    let share_a_pos = share_a_pos_percent(world);
     let mean_depth = if alive_symbols > 0 {
         depth_sum / alive_symbols as f64
     } else {
@@ -160,6 +154,43 @@ pub fn collect_metrics(world: &World, params: &DynParams) -> MetricSet {
         extraction_roi,
         decodable_fraction: decodable.fraction,
         undecodable_blocks: decodable.below_k_eff,
+    }
+}
+
+/// The share-A>0 god-view read (sim_diag §6a), **IN PERCENT**: of the alive symbols sitting on
+/// PRESENT holders, the share whose pair carries RECIPROCITY — the owner has itself served that
+/// holder, so the holder's own books hold `g_ho > 0` for it.
+///
+/// **The capital index, derived from the accrual site (`engine::pos_and_capital`), NOT from prose.**
+/// When holder `h` passes a PoS challenge for owner `o` the engine writes BOTH mirror cells:
+/// `capital[o][h].g_oh += a` (the owner's forecast of that holder) and `capital[h][o].g_ho += a`
+/// (the holder's own record of the storage it performed). So `capital[X][Y].g_ho` reads "X served
+/// Y". This function's `capital[s.owner][h].g_ho` therefore asks "has the OWNER served this
+/// HOLDER" — which is exactly the key the holder's own eviction / preemption / retention rank
+/// reads (`run_eviction` builds its view from `&world.capital[owner_idx][holder]`), i.e. exactly
+/// the A>0 reciprocity a symbol's survival depends on.
+///
+/// `0.0` on an empty world (no alive symbols) — the pre-existing convention, kept verbatim so the
+/// `honest_v2` anchor does not move. Pure evaluator read: never fed into a node decision.
+pub fn share_a_pos_percent(world: &World) -> f64 {
+    let n = world.nodes.len();
+    let mut alive_symbols = 0usize;
+    let mut a_pos = 0usize;
+    for h in 0..n {
+        if !world.nodes[h].present {
+            continue;
+        }
+        for s in world.nodes[h].holdings.iter().filter(|s| s.alive) {
+            alive_symbols += 1;
+            if world.capital[s.owner][h].g_ho > 1e-12 {
+                a_pos += 1;
+            }
+        }
+    }
+    if alive_symbols > 0 {
+        100.0 * a_pos as f64 / alive_symbols as f64
+    } else {
+        0.0
     }
 }
 

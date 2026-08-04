@@ -33,8 +33,9 @@ use crate::sim_adv::predators::{
     inject_incumbent_cartel, install_adv_uptime, observe_adv_aggregates, observe_cap_ratio,
     twin_dial_override,
 };
+use crate::sim_adv::recip::{RecipSeries, newcomers_present};
 use crate::sim_adv::restore::{RestoreTracker, RestoreTruth};
-use crate::sim_adv::scenario::AdvId;
+use crate::sim_adv::scenario::{AdvId, MetricId};
 use crate::sim_adv::scenario::{Event, EventKind, NodeSel, Scenario, ScenarioId};
 use crate::sim_adv::tier::{TierMix, TierReport, apply_tier_mix, tier_report};
 use crate::sim_dynamic::build_world;
@@ -121,6 +122,11 @@ pub struct RunResult {
     /// happened"). The DAMAGE half of the CROWN-1 price lives in `per_seed_restore`; this is the
     /// EFFICIENCY half (symbols burned per kill).
     pub per_seed_eclipse: Vec<EclipseCost>,
+    /// Per-seed P8 RECIPROCITY trajectory + newcomer-entry trace (`4r_p8_spec.md` §1.2),
+    /// seed-indexed. `None` unless the scenario declares [`MetricId::RecipSeries`] (so every
+    /// pre-P8 scenario's output is unchanged). EVALUATOR-ONLY god-view: sampled in the runner
+    /// after each `step`, never fed into a node decision.
+    pub per_seed_recip: Vec<Option<RecipSeries>>,
 }
 
 /// All per-seed outputs of one seed run (kept as a struct so the growing set of optional
@@ -165,6 +171,9 @@ pub(crate) struct SeedRun {
     /// The A9 eclipse COST (`4r_a9_spec.md` §4.1) for an eclipse scenario, else the all-zero
     /// default (no eclipse ran).
     pub eclipse: EclipseCost,
+    /// The P8 reciprocity trajectory + newcomer-entry trace for a scenario that declares
+    /// [`MetricId::RecipSeries`], else `None` (output unchanged for every other scenario).
+    pub recip: Option<RecipSeries>,
 }
 
 /// A predator run paired with its matched honest twin (same seed, same construction, hooks
@@ -547,6 +556,17 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     } else {
         None
     };
+    // P8 (`4r_p8_spec.md` §1.2): record the RECIPROCITY trajectory when the scenario declares it.
+    // Gated on the DECLARATION, not on a world-shape read, because P8's own A/B flips the
+    // SCENARIO field `scenario.world.inflow` (the policy, before `apply_inflow` ever touches the
+    // world) — the series is needed on BOTH arms (see `MetricId::RecipSeries`).
+    let record_recip = scenario.metrics.contains(&MetricId::RecipSeries);
+    let mut recip_share: Vec<f64> = Vec::new();
+    let mut recip_newcomers: Vec<usize> = Vec::new();
+    if record_recip {
+        recip_share.reserve(scenario.horizon as usize);
+        recip_newcomers.reserve(scenario.horizon as usize);
+    }
     // Phase 1/3: inject the scenario's adversaries (empty ⇒ no-op; honest scenarios stay
     // byte-identical). `Predator` installs the hooks; `Twin` injects the same nodes with hooks off
     // (the matched control). Deterministic, no RNG. A15 (incumbent-enclosure) needs a DIFFERENT
@@ -749,6 +769,16 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
             pp.push(present_count(&world));
         }
 
+        // (d'') P8 reciprocity trajectory: sample `share_a_pos` + the standing newcomer count
+        //       AFTER this tick, in node-index order. A pure god-view EVALUATOR read (the same
+        //       discipline restore-truth documents): it draws no RNG, mutates nothing, and is
+        //       never fed back into a node decision — so recording it cannot move the world.
+        //       No-op unless the scenario declares `MetricId::RecipSeries`.
+        if record_recip {
+            recip_share.push(crate::sim_adv::metrics::share_a_pos_percent(&world));
+            recip_newcomers.push(newcomers_present(&world, join_cutoff));
+        }
+
         // (e) resolve any forecast whose horizon `H` is reached at the NEW `world.tick`
         //     (= t+1): the realised outcome is "the block still has ≥ k_eff live symbols".
         let now = world.tick;
@@ -876,6 +906,22 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     } else {
         f64::NAN
     };
+    // P8: close the series with the per-node newcomer-entry trace, read once at the horizon in
+    // node-index order (`world.first_earned_g` is the engine's own §9 trace — the tick a node
+    // first PASSED a PoS challenge as a HOLDER, i.e. first earned `capital[self][owner].g_ho`).
+    let recip = if record_recip {
+        Some(RecipSeries {
+            share_a_pos: recip_share,
+            newcomers_present: recip_newcomers,
+            first_earned_tick: world.first_earned_g.clone(),
+            joined_tick: world.nodes.iter().map(|nd| nd.joined_tick).collect(),
+            first_own_accept: world.first_own_accept.clone(),
+            present_at_end: world.nodes.iter().map(|nd| nd.present).collect(),
+            cutoff: join_cutoff,
+        })
+    } else {
+        None
+    };
     SeedRun {
         metrics: collect_metrics(&world, params),
         fired,
@@ -892,6 +938,7 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
         overall_durability,
         // A9: the eclipse COST the engine attributed at the drop (all-zero when no eclipse ran).
         eclipse: collect_eclipse_cost(&world),
+        recip,
     }
 }
 
@@ -997,6 +1044,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
     let mut per_seed_farm_reciprocity = Vec::with_capacity(outcomes.len());
     let mut per_seed_overall_durability = Vec::with_capacity(outcomes.len());
     let mut per_seed_eclipse = Vec::with_capacity(outcomes.len());
+    let mut per_seed_recip = Vec::with_capacity(outcomes.len());
     for (sr, twin_adv) in outcomes {
         per_seed.push(sr.metrics);
         fired.push(sr.fired);
@@ -1011,6 +1059,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_farm_reciprocity.push(sr.farm_honest_reciprocity);
         per_seed_overall_durability.push(sr.overall_durability);
         per_seed_eclipse.push(sr.eclipse);
+        per_seed_recip.push(sr.recip);
         per_seed_adv.push(match (sr.adv, twin_adv) {
             (Some(pred), Some(twin)) => Some(AdvPair { pred, twin }),
             _ => None,
@@ -1034,6 +1083,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_farm_reciprocity,
         per_seed_overall_durability,
         per_seed_eclipse,
+        per_seed_recip,
     }
 }
 

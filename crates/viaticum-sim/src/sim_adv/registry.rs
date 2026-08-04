@@ -391,6 +391,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
         a9_eclipse_blind(),
         a9_eclipse_silence(),
         a9_eclipse_drcard(),
+        p8_reciprocity(),
     ]
 }
 
@@ -986,6 +987,172 @@ pub fn tiered_v1_inflow() -> Scenario {
         // Long horizon + ~427 nodes (n0 180 + pool 247) ⇒ NOT a fast-mode member (nightly / on-demand only).
         fast: false,
     }
+}
+
+// ============================================================
+// P8 — does the reciprocity share HOLD under a steady inflow (`4r_p8_spec.md`)? Constants FROZEN
+// in code BEFORE the run
+// (anti-Goodhart). The calibration test
+// `p8_inflow_intensity_matches_the_expected_churn_outflow_when_lambda_is_untuned` prints the
+// runtime numbers (n0, pool, λ_in, newcomers past the cut, present-count) that justify the knobs.
+// ============================================================
+
+/// The P8 horizon (weekly ticks). 160 ≈ 3 years, the A15 horizon: the P8 question is
+/// TRAJECTORY-shaped, invisible on a short run, and 160 leaves ~77 ticks of mature operation
+/// after the incremental bootstrap ramp finishes (`join_horizon_ticks·t_join_frac = 65`) and blocks
+/// mature (`3 × 6 = 18` ticks). Short enough to run locally on 5 seeds × 2 arms.
+const P8_HORIZON: u64 = 160;
+
+/// ⭐ The INV-P8-RECIPROCITY-SHARE bar (percent). **A PRE-REGISTERED HYPOTHESIS SEPARATOR, not a
+/// fit to a measurement.** `4r_decision_model.md` §11 predicts 70-90 %+; the competing null ("A>0
+/// sticks at a few percent") predicts ≈ 5 %. 50 sits between them and far from both, and was frozen
+/// BEFORE any inflow run. This is the only honest way to carry a bar when the closed-world number
+/// (75.89 % on the `honest_v2` anchor) is already known: the bar SEPARATES the two hypotheses
+/// instead of sitting just under the measurement.
+///
+/// PASS ≠ "inflow changed nothing". The deliverable is the DIFFERENCE against the matched
+/// no-inflow control, printed by `p8_dilution_gap_vs_the_matched_closed_world`; a PASS at, say,
+/// 55 % still has to be reported as "dilution is real and cost ~20 pp". Calibrate the SCENARIO
+/// (λ_in, horizon), never this bar.
+///
+/// **MEASURED (seeds 42..46): per-seed `[60.64, 60.62, 62.91, 59.62, 57.84]`, mean 60.3254,
+/// σ 1.8408 ⇒ power 5.61 = PASS.** And the honest co-report the bar does not carry: the MATCHED
+/// closed control (same scenario, `InflowPolicy::None` — one switch) reads 66.39 ± 2.55 %, so
+/// **dilution is real and cost −6.06 pp** (paired over the shared seeds: t(4) = −4.46, p ≈ 0.011).
+/// This row says the LEVEL held; it says nothing about the share GROWING — the mature-phase read
+/// is flat, and the plateau, not a climb, is what P8 actually found. The level also sits BELOW the model's own 70-90 %
+/// prediction, and so does the closed arm of this world (66.4 %) — i.e. most of the gap to
+/// `honest_v2`'s 75.89 % is the WORLD (P7 tiers + structural uptime + 256 nodes), not the inflow.
+const P8_SHARE_X: f64 = 50.0;
+
+/// P8 — RECIPROCITY SELF-REINFORCEMENT UNDER STEADY INFLOW (`4r_p8_spec.md`). A pillar invariant,
+/// not a predator scenario: no adversaries, no disasters.
+///
+/// The world is [`tiered_v1_inflow`] verbatim (same n0 = 180 bootstrap setpoint, same P7 tier
+/// population + per-tier uptime profiles, same λ_in ≈ the expected churn outflow at n0) on the
+/// shorter [`P8_HORIZON`]. What P8 adds is the per-tick RECIPROCITY TRAJECTORY
+/// ([`crate::sim_adv::recip::RecipSeries`], declared via [`MetricId::RecipSeries`]) and the
+/// newcomer entry-time trace.
+///
+/// **The A/B switch is the inflow policy.** Every causal claim about dilution in the P8 report is
+/// backed by running THIS scenario with [`InflowPolicy::None`] — which changes exactly one thing
+/// (`apply_inflow` only rewrites `joined_tick` / `present` of the last `pool` nodes), so the two
+/// arms have the SAME node count, the SAME archetype/tier draws and the SAME seeds, and differ
+/// only in WHEN the pool arrives. `tests.rs`'s `p8_closed_control` builds it.
+///
+/// The board carries the two structural rows + INV-P8-RECIPROCITY-SHARE ([`P8_SHARE_X`]). The
+/// trajectory and the newcomer entry-time live in `tests.rs`: the board answers "where did we end
+/// up", the tests answer "how did we get there".
+///
+/// **MEASURED FINDING (5 seeds — the answer to Ilya's counter-hypothesis).** Under sustained
+/// dilution the share **HOLDS ON A PLATEAU**: self-reinforcement OFFSETS the arrival stream rather
+/// than outrunning it. The "sticks at a few percent" null is refuted; the stronger "reciprocity
+/// compounds faster than arrivals dilute" is NOT supported by this run.
+/// * runtime intensity: n0 = 180, pool = 76, λ_in = 0.4757/tick ⇒ **44-45 nodes arrive past the
+///   bootstrap cut over the horizon (≈ 25 % of n0), peaking at ~40 present at once**;
+/// * the LEVEL holds: 60.33 ± 1.84 % at the horizon, far above the separator, while the standing
+///   newcomer count runs 0 → 39;
+/// * the matched closed control ends at 66.39 ± 2.55 % ⇒ the **dilution gap is −6.06 pp**, and the
+///   correct analysis is PAIRED (same seeds, one switch): σ_d 3.04, SE 1.36, **t(4) = −4.46,
+///   p ≈ 0.011**. The gap opens in step with the stream (−0.4 pp at tick 61 with 0 newcomers,
+///   −6.4 pp at tick 131 with 28), then flattens;
+/// * the within-arm RISE does **not** carry the attribution people wanted from it. Scored over the
+///   same window the CLOSED arm rises MORE (+15.19 ± 2.67 pp) than the inflow arm
+///   (+9.56 ± 2.64 pp) ⇒ difference −5.64 pp (paired t(4) = −3.29, p = 0.030), so the inflow-phase
+///   rise is *(shared post-trough recovery) − (dilution)*. The trajectory itself is U-shaped
+///   (3.30 % → 64.85 %@t21 → **50.50 % trough@t51** → 60-66 %@t160) and the "pre-onset baseline"
+///   sits in that trough, INSIDE the bootstrap ramp, after ~32 pool nodes have already arrived.
+///   See [`crate::sim_adv::recip::INFLOW_BASELINE_WINDOW`];
+/// * in the MATURE phase there is no growth left: ticks 91-100 → 151-160 reads **−2.02 ± 3.64 pp
+///   (signal/noise 0.56 ⇒ FLAT)** on the inflow arm against +2.62 ± 3.09 pp closed, while standing
+///   newcomers go 13.3 → 37.8. Flat share under a still-growing newcomer stock is the plateau
+///   claim in its testable form;
+/// * ⭐ **bootstrap liveness has a hole**: 196/196 newcomers earned `g` as servers, but only
+///   **145/196 (74.0 %) ever had a single OWN symbol accepted anywhere** — ≈ 1 in 4 never got
+///   backed up inside a 3-year horizon, and 40 of those 51 were still PRESENT at the horizon (only
+///   26/196 churned out at all). Earning credit ≠ getting backed up, and the second is why a
+///   newcomer joined;
+/// * λ_in intensity sweep ×{0, 1, 2, 4} ⇒ 66.85 / 60.33 / 58.70 / 55.62 %: SUB-LINEAR (4× the
+///   arrival rate costs ~11 pp, not ~26) and every point clears the separator — but only the
+///   ENDPOINTS are statistically separated (see the sweep test's own caveats).
+///
+/// **What it does NOT support.** The model §11 predicts 70-90 %; this world delivers 60 % with
+/// inflow — but its own CLOSED arm only delivers 66 %, so the shortfall is mostly the WORLD
+/// (P7 tier mix + structural per-tier uptime + 256 nodes over 160 ticks), not the arrival stream.
+/// Do not read the −6 pp gap as the whole distance to `honest_v2`'s 75.89 %.
+pub fn p8_reciprocity() -> Scenario {
+    let horizon = P8_HORIZON;
+    // The SAME λ_in as `tiered_v1_inflow` (the expected per-tick churn outflow at n0 — a physical
+    // fixed-point guess, not a tuned dial); only the horizon differs, so the pool shrinks with it.
+    let lambda = expected_outflow(INFLOW_N0, DynParams::default().churn_out_prob);
+    let n_nodes = INFLOW_N0 + pool_size(lambda, horizon);
+    Scenario {
+        id: ScenarioId("p8_reciprocity"),
+        about: "P7 tiered honest world + steady newcomer inflow over 160 ticks — does the share of alive symbols on RECIPROCAL (A>0) pairs hold/rise under continuous dilution, or slide? (pillar P8, no predators)",
+        world: WorldParams {
+            n_nodes,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
+            uptime: UptimeMix::Tiered,
+            tier_mix: tiered_mix(),
+            inflow: InflowPolicy::Steady {
+                joins_per_tick: lambda,
+            },
+        },
+        population: honest_v2().population,
+        tiers: vec![
+            (GiverTier::T1, 0.15),
+            (GiverTier::T2, 0.25),
+            (GiverTier::T3, 0.40),
+            (GiverTier::T4, 0.20),
+        ],
+        adversaries: Vec::new(),
+        events: Vec::new(),
+        horizon,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![
+            MetricId::RecipSeries,
+            MetricId::TierReport,
+            MetricId::InvariantBoard,
+        ],
+        verdicts: p8_reciprocity_invariants(),
+        // ~256 nodes × 160 ticks × 5 seeds (× the closed control in tests) ⇒ NOT a fast-mode member.
+        fast: false,
+    }
+}
+
+/// The `p8_reciprocity` board (`4r_p8_spec.md` §3): the two structural rows + the pre-registered
+/// reciprocity-share separator. NO new [`InvariantSpec`] variant — [`InvariantSpec::Statistical`]
+/// already reads `MetricSet::share_a_pos` (the horizon value) and covers P8-A completely.
+fn p8_reciprocity_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-P8-RECIPROCITY-SHARE: under a CONTINUOUS newcomer stream the share of alive symbols
+        // living on reciprocal (A>0) pairs does not fall into the "sticks at a few percent" regime
+        // — it clears the pre-registered separator X (GreaterThan, power-gated: power < 2 ⇒
+        // INCONCLUSIVE, an honest small-sample outcome). A FAIL is the LEGITIMATE negative result
+        // the model asks for ("if A>0 sticks even in world v2, the binding constraint is NOT
+        // bootstrap") — report it with the trajectory, never tune the inflow to rescue it.
+        Invariant {
+            id: "INV-P8-RECIPROCITY-SHARE",
+            spec: InvariantSpec::Statistical {
+                measure: share_a_pos,
+                dir: Direction::GreaterThan,
+            },
+            threshold: P8_SHARE_X,
+        },
+    ]
 }
 
 /// The phase-2a TIERED × HETERO world — LIGHT regime (`4r_p2a_spec.md` §3): `tiered_v1` PLUS the
@@ -1726,6 +1893,12 @@ fn a9_eclipse_invariants() -> Vec<Invariant> {
 /// Reliable's extraction ROI (Reliable is index 0 in `Archetype::ALL`).
 fn reliable_roi(m: &MetricSet) -> f64 {
     m.extraction_roi[0]
+}
+
+/// INV-P8-RECIPROCITY-SHARE scalar (`4r_p8_spec.md` §3): the horizon share of alive symbols sitting
+/// on pairs that carry reciprocity (`A > 0`), in percent.
+fn share_a_pos(m: &MetricSet) -> f64 {
+    m.share_a_pos
 }
 
 /// INV-TIER-GIVERS scalar: the smallest adjacent floor-completeness step over the tier rank.
