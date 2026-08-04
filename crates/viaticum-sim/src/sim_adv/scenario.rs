@@ -244,6 +244,24 @@ pub struct AdvDials {
     /// A11: creeping-degradation start tick + slope.
     pub degrade_start: u64,
     pub degrade_slope: f64,
+    /// A9 (eclipse-targeter), arm B: the tick from which the DR-card LETHAL WATCH is armed. The
+    /// hook only sets the flag from this tick on; WHICH block is lethal, and when, is the engine's
+    /// read (`engine::adv_eclipse_drops`). `0` (the [`Default`]) ⇒ armed from t=0.
+    pub eclipse_arm_tick: u64,
+    /// A9 arm A (blind schedule): the ONE tick the group fires on. A blind attacker picks a DATE
+    /// and fires once — see `predators::a9_eclipse_targeter_hook` for why this is a one-shot
+    /// (`tick == drop_tick`) and not a standing `tick >= drop_tick` boycott. `0` (the [`Default`])
+    /// ⇒ tick 0; every A9 scenario sets it explicitly.
+    pub eclipse_drop_tick: u64,
+    /// A9 arms B/C: gate the fire on the target's SILENCE (the primarily-observable "my owner
+    /// stopped challenging" signal) instead of a fixed schedule. The FLAG is first-hand ("I will
+    /// drop when I notice silence"); the silence itself is read ENGINE-side (the anti-oracle split
+    /// as A6/A15/A7). `false` (the [`Default`]) ⇒ the fixed-schedule arm A.
+    pub eclipse_on_silence: bool,
+    /// A9 arms B/C: how many ticks the holder needs to NOTICE the silence (the fire happens at
+    /// `silent_since + this`). `0` (the [`Default`]) ⇒ noticed within the same tick the owner went
+    /// quiet. Calibrated per `4r_a9_spec.md` §3 (a SCENARIO constant, never a bar).
+    pub eclipse_silence_detect_ticks: u64,
     /// A15 (incumbent-enclosure): the reciprocity gate. As a HOLDER, an A15 cartel node
     /// hard-rejects an owner whose service to it `capital[owner][holder].g_ho < enclose_thresh`
     /// — i.e. a NEWCOMER that has not yet served the cartel. `0.0` (the [`Default`]) ⇒ the gate
@@ -511,11 +529,23 @@ pub struct AdvAction {
     /// A6's `discriminate` / A15's `enclose_newcomers`). Default `false` ⇒ the pass is a strict
     /// NO-OP (byte-identical to the honest path — the ANCHOR).
     pub collude_farm: bool,
+    /// A9 (eclipse-targeter), arms A and C: FIRE the eclipse — drop every alive symbol of the
+    /// scenario's eclipse target this holder carries. The hook declares only the INTENT; the
+    /// ENGINE resolves WHO the target is (`world.eclipse.target`) and, when
+    /// [`AdvDials::eclipse_on_silence`] is set, whether the silence signal has been noticed yet.
+    /// Default `false` ⇒ `engine::adv_eclipse_drops` does nothing (the honest anchor).
+    pub eclipse_fire: bool,
+    /// A9 arm B: ARM the DR-card LETHAL WATCH. The ENGINE checks, per target block, whether the
+    /// group's held symbols are LETHAL (`engine::eclipse_lethal`: dropping them leaves the block
+    /// below `k_eff`) and drops exactly those, exactly on the tick the check first passes. The
+    /// hook never sees the counts — that per-block knowledge IS the CROWN-1 leak being priced, so
+    /// it lives strictly engine-side. Default `false` ⇒ no watch (the honest anchor).
+    pub eclipse_lethal_watch: bool,
 }
 
 impl AdvAction {
     /// The honest / no-op action: no accept override, no rejoin, no voluntary drop, no pause,
-    /// no enclosure, no collusion.
+    /// no enclosure, no collusion, no eclipse.
     pub const NOOP: AdvAction = AdvAction {
         accept_rate: None,
         rejoin: false,
@@ -525,6 +555,8 @@ impl AdvAction {
         discriminate: false,
         enclose_newcomers: false,
         collude_farm: false,
+        eclipse_fire: false,
+        eclipse_lethal_watch: false,
     };
 }
 

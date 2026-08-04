@@ -649,6 +649,14 @@ pub fn step(world: &mut World, params: &DynParams, prior: &SurfacePrior, policy:
     // the F2 notice). No-op on the honest path (no adv role ⇒ no RNG, byte-identical).
     adv_voluntary_drops(world);
 
+    // (3.6) World-v3 phase-3 A9 (eclipse × CROWN-1): the ECLIPSE group's synchronous, TIMED drop
+    // of the eclipse target's symbols. Placed right after `adv_voluntary_drops` (spec §2.2) —
+    // i.e. AFTER the runner applied any Disaster this tick (events fire before `step`) and BEFORE
+    // the runner's next restore-window observation, which is the window the damage must land in.
+    // Its own pass, not a branch of `adv_voluntary_drops`: that one skips absent owners and
+    // carries the A2 anchor. No-op when no eclipse target is set ⇒ byte-identical honest path.
+    adv_eclipse_drops(world, params);
+
     // (4) churn: departures by archetype (aggression raises the departure rate, §9.4).
     churn(world, params);
 
@@ -2278,6 +2286,228 @@ fn adv_collude_farm(world: &mut World, params: &DynParams) {
     }
 }
 
+/// World-v3 phase-3 A9 (`4r_a9_spec.md` §2.2): is dropping the eclipse group's symbols of ONE
+/// block LETHAL — i.e. does it take the block from decodable to UNDECODABLE?
+///
+/// `alive` = the block's alive symbols over ALL present holders (the shared decodability primitive
+/// [`crate::sim_adv::metrics::alive_symbols`] — cream INCLUDED, because erasure decode does not
+/// know the floor/cream label); `group_held` = how many of those the eclipse group holds. The drop
+/// leaves `alive − group_held`, so it is lethal iff that remainder falls below `k_eff` — which is
+/// the spec's `group_held ≥ alive − k_eff + 1`, written as a subtraction so the edges are obvious.
+///
+/// The edges, all deliberate:
+/// * `alive == k_eff` ⇒ ANY held symbol is lethal (the block has no margin left);
+/// * `group_held == 0` ⇒ never (nothing to drop);
+/// * `group_held == alive` ⇒ always (for `k_eff ≥ 1`: the group holds the whole block);
+/// * `alive < k_eff` ⇒ **false**: the block is ALREADY undecodable, so a drop kills nothing new.
+///   The eclipse does not "finish off" a corpse, and the block is not counted as its kill;
+/// * `k_eff == 0` ⇒ false (a vacuously-decodable world has nothing to kill — a guard, not physics).
+///
+/// ⚠ **This predicate is COLLECTABILITY-BLIND, and that makes the card WEAKER than the leak it
+/// stands for (review W2).** Surviving a cold restore needs `k_eff` symbols the victim can actually
+/// COLLECT inside the window — present holder, alive symbol, AND online at least once. A block left
+/// at exactly `k_eff` alive is "not lethal" here, yet can still be unrestorable if the window
+/// reaches only one of the two survivors — measured: that is exactly the extra block the
+/// dump-everything arm takes and the card leaves. A real DR-card holder also sees WHO holds the
+/// block, so it could aim at the same margin. Consequence for reading any A9 number: the modelled
+/// card is a LOWER bound on the leak's value.
+pub fn eclipse_lethal(alive: usize, group_held: usize, k_eff: usize) -> bool {
+    if k_eff == 0 || group_held == 0 || alive < k_eff {
+        return false;
+    }
+    alive.saturating_sub(group_held) < k_eff
+}
+
+/// World-v3 phase-3 A9: has the eclipse group NOTICED the target's silence yet? The latch
+/// `world.eclipse.silent_since` is set by [`adv_eclipse_drops`] on the first silent tick;
+/// `detect_ticks` is how long the holder needs to notice (`0` ⇒ within the same tick).
+fn eclipse_silence_noticed(world: &World, detect_ticks: u64, tick: u64) -> bool {
+    match world.eclipse.silent_since {
+        Some(t0) => tick >= t0.saturating_add(detect_ticks),
+        None => false,
+    }
+}
+
+/// World-v3 phase-3 A9 (`4r_a9_spec.md` §2.2): the ECLIPSE drop pass — a synchronous, adversarial,
+/// TIMED correlated loss of the eclipse target's symbols.
+///
+/// **Why this is a separate pass and not a branch of [`adv_voluntary_drops`]** (spec §2.2): that
+/// pass skips owners that are `!present`, and the whole point of A9 is to strike inside the DR
+/// window, where the disaster victim is absent for exactly one tick. It also carries the A2 anchor
+/// (fractional drop debt, ι-ordered victim pick) which must not move. So A9 gets its own pass,
+/// placed in [`step`] right after `adv_voluntary_drops`: AFTER the runner has applied the Disaster
+/// event (it fires before `step`) and BEFORE the runner's next restore-window observation — the
+/// window the damage has to land in.
+///
+/// **Death path:** the EXISTING silent-loss path, exactly as `adv_voluntary_drops` in its SILENT
+/// mode — `alive = false` now plus one [`SilentLoss`] per holder (aggregated volume), so the group
+/// pays the ordinary `b_max` burn on `capital[holder][target].g_ho` + the σ jump on the next PoS
+/// round. No new death path is invented. The loss IS queued even though the target may be absent
+/// this tick (unlike [`depart_node`], which skips absent owners as "dead pairs"): a disaster victim
+/// returns next tick with the SAME identity, so the burn on the holder's own books is real.
+///
+/// **Anti-oracle split (as A6/A15/A7):** the hook returns only FLAGS — `eclipse_fire` (arms A/C)
+/// and `eclipse_lethal_watch` (arm B). WHO the target is, whether it has gone silent, and the
+/// per-block alive/held counts (the CROWN-1 leak itself) are all read HERE, god-view, engine-side.
+///
+/// **Deterministic:** node order by index, block order by the owner's own `own_blocks` order, kill
+/// set sorted by `(holder, holdings index)`; NO RNG is drawn at all.
+///
+/// **No-op** on every non-A9 world: `world.eclipse.target` is `None` ⇒ immediate return, so the
+/// honest anchor is byte-identical.
+fn adv_eclipse_drops(world: &mut World, params: &DynParams) {
+    let Some(target) = world.eclipse.target else {
+        return; // not an eclipse scenario — strict no-op (the honest anchor)
+    };
+    if world.eclipse.fired {
+        return; // ONE synchronous volley per target (see `EclipseState::fired`)
+    }
+    let n = world.nodes.len();
+    let tick = world.tick;
+
+    // (1) The SILENCE latch. Raw silence = the target is challenging nobody: it is absent, or its
+    //     own blocks are source-less (`to_restore` ⇒ the F6/D9 gate stops its PoS challenges).
+    //     Both stand for what a holder observes ("no challenge arrived"). Latched on the FIRST
+    //     silent tick and cleared when the target speaks again, so the detection delay is measured
+    //     from the start of the silence rather than re-armed every tick.
+    //     ⚠ This proxy is STRONGER than the signal it models (spec §2.2 asked for this to be said
+    //     plainly, review W3): `to_restore` is set ONLY by `disaster_strike`, so the latch is a
+    //     PERFECT disaster clock — zero false positives and, at `detect = 0`, zero latency. A real
+    //     holder infers silence from missing PoS challenges under `uptime < 1`, which is both noisy
+    //     and late (the daemon's own analogue, `repair_detection_delay_max`, is 3 misses). It is
+    //     still weaker than the DR-card: it carries no per-block knowledge whatsoever.
+    let raw_silent =
+        !world.nodes[target].present || world.nodes[target].own_blocks.iter().any(|b| b.to_restore);
+    if raw_silent {
+        if world.eclipse.silent_since.is_none() {
+            world.eclipse.silent_since = Some(tick);
+        }
+    } else {
+        world.eclipse.silent_since = None;
+    }
+
+    // (2) Collect the group's INTENT for this tick (hook = first-hand flags only).
+    let mut watchers: Vec<usize> = Vec::new(); // arm B: DR-card lethal watch
+    let mut firers: Vec<usize> = Vec::new(); // arms A / C: drop everything held of the target
+    for node in 0..n {
+        if node == target || !world.nodes[node].present {
+            continue;
+        }
+        let Some(role) = world.adv[node].as_ref() else {
+            continue;
+        };
+        if role.id != AdvId::A9EclipseTargeter {
+            continue;
+        }
+        let dials = role.dials;
+        let Some(action) = adv_action(world, node, tick) else {
+            continue;
+        };
+        // ENGINE-side silence gate, shared by arms B and C (see `a9_eclipse_targeter_hook` for
+        // why the card arm is gated too): the hook declared readiness, the world decides timing.
+        if dials.eclipse_on_silence
+            && !eclipse_silence_noticed(world, dials.eclipse_silence_detect_ticks, tick)
+        {
+            continue;
+        }
+        if action.eclipse_lethal_watch {
+            watchers.push(node);
+        } else if action.eclipse_fire {
+            firers.push(node);
+        }
+    }
+    if watchers.is_empty() && firers.is_empty() {
+        return;
+    }
+    // The trigger passed: this tick IS the volley, whether or not it finds anything to burn (a
+    // blind schedule that fires while holding nothing of the target has spent its shot — that is
+    // the arm, honestly measured, not a reason to let it re-fire later).
+    world.eclipse.fired = true;
+
+    // (3) Build the kill set: `(holder, holdings index, block id, volume)`.
+    let mut kills: Vec<(usize, usize, usize, f64)> = Vec::new();
+    if !watchers.is_empty() {
+        // Arm B — the CARD: per target block, drop ONLY where the group's symbols are lethal.
+        // `alive` goes through the shared `alive_symbols` primitive (one physics with every other
+        // decodability read); `group_holders` counts HOLDERS, the same unit, so the predicate
+        // compares like with like.
+        let block_ids: Vec<usize> = world.nodes[target]
+            .own_blocks
+            .iter()
+            .map(|b| b.id)
+            .collect();
+        for block in block_ids {
+            let alive = crate::sim_adv::metrics::alive_symbols(world, target, block);
+            let mut held: Vec<(usize, usize, f64)> = Vec::new();
+            let mut group_holders = 0usize;
+            for &h in &watchers {
+                let mut hit = false;
+                for (i, s) in world.nodes[h].holdings.iter().enumerate() {
+                    if s.alive && s.owner == target && s.block == block {
+                        held.push((h, i, s.volume));
+                        hit = true;
+                    }
+                }
+                if hit {
+                    group_holders += 1;
+                }
+            }
+            if eclipse_lethal(alive, group_holders, params.k_eff) {
+                for (h, i, v) in held {
+                    kills.push((h, i, block, v));
+                }
+            }
+        }
+    }
+    for &h in &firers {
+        // Arms A / C — BLIND: every alive symbol of the target this holder carries.
+        for (i, s) in world.nodes[h].holdings.iter().enumerate() {
+            if s.alive && s.owner == target {
+                kills.push((h, i, s.block, s.volume));
+            }
+        }
+    }
+    if kills.is_empty() {
+        return;
+    }
+    // Canonical order (holder, holdings index) — the arm-B scan visits blocks first, so sort so
+    // both arms mutate and queue in the SAME deterministic order.
+    kills.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    // (4) Cost attribution: the blocks this drop pushes from decodable to UNDECODABLE.
+    let mut touched: Vec<usize> = kills.iter().map(|k| k.2).collect();
+    touched.sort_unstable();
+    touched.dedup();
+    let before: Vec<usize> = touched
+        .iter()
+        .map(|&b| crate::sim_adv::metrics::alive_symbols(world, target, b))
+        .collect();
+
+    // (5) Kill + queue one SILENT loss per holder (aggregated volume, as `churn` / `depart_node`).
+    let mut per_holder: Vec<(usize, f64)> = Vec::new();
+    for &(h, i, _block, v) in &kills {
+        world.nodes[h].holdings[i].alive = false;
+        world.eclipse.symbols_dropped += 1;
+        match per_holder.iter_mut().find(|(hh, _)| *hh == h) {
+            Some(e) => e.1 += v,
+            None => per_holder.push((h, v)),
+        }
+    }
+    for (holder, volume) in per_holder {
+        world.pending_silent_loss.push(SilentLoss {
+            owner: target,
+            holder,
+            volume,
+        });
+    }
+    for (idx, &block) in touched.iter().enumerate() {
+        let after = crate::sim_adv::metrics::alive_symbols(world, target, block);
+        if before[idx] >= params.k_eff && after < params.k_eff {
+            world.eclipse.blocks_pushed_below_k_eff += 1;
+        }
+    }
+}
+
 /// How strongly archetype aggression raises the churn rate (§9.4). Chosen so a Hoarder
 /// (aggression 0.7) churns at ~3× the base, matching the old flat multiplier. `pub` so the
 /// inflow-calibration (`sim_adv::inflow::expected_outflow`) can size λ_in from the SAME
@@ -2578,6 +2808,11 @@ pub fn whitewash_rejoin_for_test(world: &mut World, node: usize, tick: u64, para
 #[cfg(test)]
 pub fn run_eviction_for_test(world: &mut World, params: &DynParams) {
     run_eviction(world, params);
+}
+
+#[cfg(test)]
+pub fn adv_eclipse_drops_for_test(world: &mut World, params: &DynParams) {
+    adv_eclipse_drops(world, params);
 }
 
 #[cfg(test)]

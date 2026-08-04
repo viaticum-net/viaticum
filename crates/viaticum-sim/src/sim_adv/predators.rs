@@ -38,7 +38,9 @@ use viaticum_core::four_r::{RetentionCap, kappa_key};
 use crate::sim_dynamic::engine::{DynParams, depth_params_of, retention_cap, v_per_symbol_of};
 use crate::sim_dynamic::generator::{Archetype, OwnBlock, World};
 
-use crate::sim_adv::scenario::{AdvAction, AdvContext, AdvId, AdvRole, AdvSpec, BehaviorHook};
+use crate::sim_adv::scenario::{
+    AdvAction, AdvContext, AdvId, AdvRole, AdvSpec, BehaviorHook, InfoModel,
+};
 use crate::sim_adv::uptime::UptimeProfile;
 
 /// Which side of the matched comparison a run is on: the predator (hooks active) or its
@@ -188,6 +190,93 @@ pub fn a7_sybil_farm_hook(ctx: &AdvContext) -> AdvAction {
     }
 }
 
+/// A9 eclipse-targeter (`4r_a9_spec.md` §2.1): an EXEMPLARY holder that is recruited into the
+/// victim's holder set by the ordinary candidate ranking (`accept_rate = 1.0`, never drops, passes
+/// PoS honestly) and then drops synchronously. Which of the three ARMS it plays is read off its own
+/// declared info-model + dials — all first-hand, never `&World`:
+///
+/// * **arm B (card)** — `InfoModel::DrCard`: from `eclipse_arm_tick` it declares
+///   `eclipse_lethal_watch`. The per-block "how many symbols are alive and how many are mine"
+///   knowledge — the CROWN-1 leak itself — is read ENGINE-side; the hook never sees a count.
+/// * **arm A (blind schedule)** — `InfoModel::Own`, `eclipse_on_silence = false`: it fires on ONE
+///   fixed tick, `eclipse_drop_tick`.
+/// * **arm C (blind-on-silence)** — `InfoModel::Own`, `eclipse_on_silence = true`: it declares
+///   readiness EVERY tick ("I will drop the moment I notice my owner went quiet"); the engine gates
+///   the actual fire on the silence latch, so the hook stays blind to the world.
+///
+/// **Why arm A is a ONE-SHOT (`tick == drop_tick`), deviating from the spec's literal
+/// `tick >= drop_tick`.** A standing `>=` makes arm A a permanent BOYCOTT: it re-drops every
+/// re-placement for the rest of the run, so (a) it burns symbols every tick — destroying the
+/// symbols-per-kill efficiency comparison the price of the card is expressed in — and (b) by the
+/// disaster tick it holds nothing of the target, so "the blind schedule missed the DR window" would
+/// be measuring capacity-denial, not timing. A single dated volley is the faithful "blind schedule"
+/// the spec describes ("the owner has time to repair it").
+///
+/// **Why arm B is ALSO silence-gated (an engine-side gate shared with arm C).** The silence signal
+/// is first-hand (§1.3 grants it to the blind arm C explicitly), so a card-holder has it too;
+/// withholding it from B would (a) confound the headline B-vs-C with "card vs silence" instead of
+/// isolating the card, and (b) make B fire while the owner is still ALIVE, where P1 repair simply
+/// undoes the drop — a NEGATIVE card price that is an artifact of a mis-specified trigger. With the
+/// shared gate, B and C fire on the SAME tick from the SAME signal, and the only difference left
+/// between them is the per-block card. (`eclipse_on_silence = false` on a DrCard role is kept
+/// working as an A/B lever: it measures the un-timed card.)
+pub fn a9_eclipse_targeter_hook(ctx: &AdvContext) -> AdvAction {
+    let base = AdvAction {
+        // An exemplary holder: accepts everything, so the ordinary candidate ranking recruits it
+        // into the victim's holder set (spec §1.1 BLOCK-2 — no god-view forcing of the choice).
+        //
+        // ⚠ Read this honestly: the accept override is NOT what recruits the group. The injected
+        // base archetype is already `Reliable`, whose willingness is 1.0, so `Some(1.0)` is
+        // behaviourally identical to the honest path. What actually concentrates the victim's
+        // symbols on the group is its CONSTRUCTION (`configure_adv_node`): present from t=0,
+        // 0.99 uptime, no backup demand of its own (so most of its disk is free to lend) and — as
+        // any node carrying an `adv` role — immune to the churn Bernoulli. The flag stays because
+        // it DECLARES the strategy.
+        //
+        // ⚠ And do NOT read the group as super-concentrated (review W4). At G = 40 it holds 0.371
+        // of the victim's alive symbols at 0.286 of the roster — but across the sweep that ratio
+        // is 1.26 / 2.28 / 1.37 / 0.78 / 1.30 / 1.27 (G = 5…50), i.e. it straddles 1.0 and the
+        // "≈1.3× proportional" reading of the frozen G alone is a cherry. The group holds roughly
+        // its share. What share it holds is itself set by the roster denominator: with
+        // `n0_frac = 0.20` the whole group is present from t = 0 while only ~20 honest nodes are,
+        // so during the victim's INITIAL placement window the group was about two thirds of the
+        // reachable network. That — not any reputation-driven concentration — is the mechanism.
+        accept_rate: Some(1.0),
+        ..AdvAction::NOOP
+    };
+    match ctx.info_model {
+        InfoModel::DrCard { .. } => AdvAction {
+            eclipse_lethal_watch: ctx.tick >= ctx.dials.eclipse_arm_tick,
+            ..base
+        },
+        InfoModel::Own => AdvAction {
+            eclipse_fire: if ctx.dials.eclipse_on_silence {
+                true // ready every tick; the ENGINE's silence latch decides when it lands
+            } else {
+                ctx.tick == ctx.dials.eclipse_drop_tick
+            },
+            ..base
+        },
+    }
+}
+
+/// The `RestoreTruth::info_model` label for a scenario's adversaries (`4r_world_v3_spec.md` NOTE-5:
+/// the field exists exactly for A9's arm comparison). `"dr_card"` / `"own_silence"` /
+/// `"own_schedule"` for the three A9 arms, `"none"` for every other scenario (unchanged output).
+pub fn a9_arm_label(adversaries: &[AdvSpec]) -> &'static str {
+    match adversaries
+        .iter()
+        .find(|a| a.id == AdvId::A9EclipseTargeter)
+    {
+        Some(spec) => match spec.info_model {
+            InfoModel::DrCard { .. } => "dr_card",
+            InfoModel::Own if spec.dials.eclipse_on_silence => "own_silence",
+            InfoModel::Own => "own_schedule",
+        },
+        None => "none",
+    }
+}
+
 /// The behaviour hook for a predator id in the PREDATOR arm. A1 ε-whale, A4 whitewasher, A2 silent
 /// dropper, A5 deep-silent pause, A6 discriminatory drop, A7 sybil-farm collusion, A15
 /// incumbent-enclosure. A3's flap is an uptime profile (not a hook), so its predator hook is a no-op;
@@ -201,6 +290,7 @@ pub fn hook_for(id: AdvId) -> BehaviorHook {
         AdvId::A5DeepSilent => a5_deep_silent_hook,
         AdvId::A6Discriminator => a6_discriminator_hook,
         AdvId::A7SybilFarm => a7_sybil_farm_hook,
+        AdvId::A9EclipseTargeter => a9_eclipse_targeter_hook,
         AdvId::A15IncumbentEnclosure => a15_incumbent_enclosure_hook,
         _ => noop_hook,
     }
@@ -219,11 +309,13 @@ pub fn twin_hook_for(id: AdvId) -> BehaviorHook {
         // So the twin must ALSO run the pause hook — the pause is the constant, the D-floor the
         // isolated variable (analogous to A2's polite twin isolating announcedness).
         AdvId::A5DeepSilent => a5_deep_silent_hook,
-        // A1/A4/A3/A6/A15: the matched control is the HONEST node (hooks off). For A3 the flap is
+        // A1/A4/A3/A6/A15/A9: the matched control is the HONEST node (hooks off). For A3 the flap is
         // the uptime profile (mode-differentiated in `install_adv_uptime`), so its hook stays noop.
         // A15 is a cartel-fraction SWEEP, NOT a twin comparison (its control is a separate
         // cartel_frac=0 run), so its twin hook is a plain noop — an honest incumbent that never
         // encloses (kept role-carrying only for churn-immortality parity with the predator arm).
+        // A9 (eclipse) is likewise a world-cut across THREE arms (its control is the count = 0 run
+        // + the disarmed-watch A/B), so it never runs a twin either.
         _ => noop_hook,
     }
 }
@@ -376,11 +468,27 @@ pub fn twin_dial_override(adversaries: &[AdvSpec]) -> Option<(&'static str, f64)
 /// high-uptime cooperative base (a consistent placer whose symbols are reliably challenged —
 /// the strategy rides on the hook, not on a flaky base archetype), with A1's inflated
 /// backup demand (`whale_block_mult`) or A4's plain demand.
+///
+/// **A9 (eclipse) carries NO backup demand at all** — it is a dedicated STORAGE node an attacker
+/// deployed to hold other people's data, not a participant with files of its own. This is not
+/// cosmetic: with the ordinary `blocks_per_node` demand, an eclipse group of G = 30 adds 30 owners
+/// to an already bandwidth-starved world, and the MEASURED consequence is that the honest owners
+/// with at least one established block fall ~25 % (32/30/32 → 25/17/24 on seeds 42-44) and the
+/// DR-primary victim itself routinely never establishes — an EMPTY restore denominator, i.e. no
+/// measurement at all rather than a strong attack. Removing the attacker's own demand also happens
+/// to be the attacker-FAVOURABLE choice (its whole disk is free to attract the victim's symbols),
+/// which is the right direction when the deliverable is the PRICE of a leak.
 fn configure_adv_node(world: &mut World, node: usize, spec: &AdvSpec, params: &DynParams) {
     world.nodes[node].archetype = Archetype::Reliable;
     world.nodes[node].joined_tick = 0;
     world.nodes[node].present = true;
     world.nodes[node].holdings.clear();
+
+    if spec.id == AdvId::A9EclipseTargeter {
+        world.next_block_id[node] = 0;
+        world.nodes[node].own_blocks = Vec::new();
+        return;
+    }
 
     let mult = match spec.id {
         // A1 whale + A7 sybil-farm both inflate demand via `whale_block_mult` so they have plenty

@@ -13,26 +13,28 @@ use crate::sim_adv::inflow::{
     newcomer_cutoff, pool_size, present_count,
 };
 use crate::sim_adv::metrics::{
-    bit_eq as metrics_bit_eq, block_decodable_fraction, collect_metrics, farm_honest_reciprocity,
-    farm_honest_served, farm_honest_storage, mean_sigma, newcomer_decodable_fraction,
-    overall_floor_durability,
+    alive_symbols as alive_symbols_for_test, bit_eq as metrics_bit_eq, block_decodable_fraction,
+    collect_metrics, farm_honest_reciprocity, farm_honest_served, farm_honest_storage, mean_sigma,
+    newcomer_decodable_fraction, overall_floor_durability,
 };
 use crate::sim_adv::predators::{
     RunMode, a1_epsilon_whale_hook, a4_whitewasher_hook, a7_sybil_farm_hook,
-    a15_incumbent_enclosure_hook, bit_eq as adv_bit_eq, fold_cap_ratio, inject_adversaries,
-    inject_incumbent_cartel, install_adv_uptime, twin_dial_override,
+    a9_eclipse_targeter_hook, a15_incumbent_enclosure_hook, bit_eq as adv_bit_eq, fold_cap_ratio,
+    inject_adversaries, inject_incumbent_cartel, install_adv_uptime, twin_dial_override,
 };
 use crate::sim_adv::registry::{
     a1_whale, a3_flapper, a4_whitewasher, a5_deep_silent, a6_discriminator, a7_sybil,
-    a10_provider_exit, a15_enclosure, all_scenarios, dr_baseline, dr_battle, dr_hetero,
-    find_scenario, honest_hetero_hard, honest_hetero_v2, honest_v2, tiered_hetero,
-    tiered_hetero_hard, tiered_v1,
+    a9_eclipse_blind, a9_eclipse_drcard, a9_eclipse_silence, a10_provider_exit, a15_enclosure,
+    all_scenarios, dr_baseline, dr_battle, dr_hetero, find_scenario, honest_hetero_hard,
+    honest_hetero_v2, honest_v2, tiered_hetero, tiered_hetero_hard, tiered_v1,
 };
 use crate::sim_adv::report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
 use crate::sim_adv::restore::{
     BlockOutcome, IOTA_BUCKETS, RestoreTracker, RestoreTruth, bit_eq as restore_bit_eq, iota_bucket,
 };
-use crate::sim_adv::runner::{RunResult, population_curve, run, run_one_seed, run_sweep};
+use crate::sim_adv::runner::{
+    RunResult, eclipse_selector, population_curve, resolve_nodesel, run, run_one_seed, run_sweep,
+};
 use crate::sim_adv::scenario::{
     AdvAction, AdvContext, AdvDials, AdvId, AdvRole, AdvSpec, BehaviorHook, Event, EventKind,
     InfoModel, MetricId, NodeSel, Scenario, WorldParams,
@@ -46,7 +48,8 @@ use crate::sim_adv::verdict::{
 };
 use crate::sim_dynamic::build_world;
 use crate::sim_dynamic::engine::{
-    DynParams, admit_offer_for_test, adv_collude_farm_for_test, whitewash_rejoin_for_test,
+    DynParams, admit_offer_for_test, adv_collude_farm_for_test, adv_eclipse_drops_for_test,
+    eclipse_lethal, whitewash_rejoin_for_test,
 };
 use crate::sim_dynamic::generator::{
     Archetype, GiverTier, HeldSymbol, OwnBlock, World, online, surfaced_in_window,
@@ -6029,4 +6032,1173 @@ fn block_decodable_fraction_counts_cream_and_flags_below_k_eff_tail() {
     }
     let empty = block_decodable_fraction(&w, k_eff);
     assert!(empty.fraction.is_nan() && empty.blocks == 0);
+}
+
+// ==================================================================
+// A9 — eclipse-targeter × CROWN-1 (`4r_a9_spec.md`): what does the leaked DR-card BUY an
+// attacker who is already inside the victim's holder set by honest service? Three arms, one
+// borrowed bar, two price numbers (damage + symbols-per-kill).
+// ==================================================================
+
+/// The disaster tick of every A9 arm (mirrors the registry `A9_DISASTER_TICK`).
+const A9_TEST_DISASTER_TICK: u64 = 60;
+/// The borrowed DR bar the arms are judged on (mirrors `A9_FLOOR_X`).
+const A9_TEST_X: f64 = 0.60;
+/// The honest population size the group is ADDED to (mirrors `A9_HONEST_N`).
+const A9_TEST_HONEST_N: usize = 100;
+/// The frozen eclipse group size (mirrors `A9_GROUP_G`) — for the report header only.
+const A9_TEST_FROZEN_G: usize = 40;
+/// The FROZEN group-size sweep for the lethality frontier (§3.1). It runs past the frozen G so
+/// the frontier is bracketed rather than assumed.
+const A9_SWEEP_G: [usize; 6] = [5, 10, 20, 30, 40, 50];
+
+/// A copy of an A9 arm with an overridden group size G (the calibration knob). The HONEST
+/// population is held fixed and the group is ADDED on top (mirrors the registry's
+/// `n_nodes = A9_HONEST_N + G`), so a bigger G does not silently shrink the honest world.
+fn a9_with_group(sc: &Scenario, g: usize) -> Scenario {
+    let mut out = sc.clone();
+    out.world.n_nodes = A9_TEST_HONEST_N + g;
+    for a in &mut out.adversaries {
+        a.count = g;
+        a.dials.group_size = g;
+    }
+    out
+}
+
+/// A copy of an A9 arm with an overridden silence-detection latency (the timing sensitivity dial).
+fn a9_with_detect(sc: &Scenario, detect: u64) -> Scenario {
+    let mut out = sc.clone();
+    for a in &mut out.adversaries {
+        a.dials.eclipse_silence_detect_ticks = detect;
+    }
+    out
+}
+
+/// Reproduce an A9 arm's world at the START of `ticks` (no events applied): `build_world` +
+/// adversary injection + the runner's own eclipse-target resolution + `ticks` bare steps. The A9
+/// world carries no tier/demand/uptime/inflow layer, so `build_world` IS the runner's
+/// `build_world_for`, and the runner's pre-tick trackers never mutate the world — so this is the
+/// exact state the eclipse pass reads. Returns `(world, group nodes)`.
+fn a9_stepped_world(sc: &Scenario, seed: u64, ticks: u64) -> (World, Vec<usize>) {
+    use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
+    let params = &sc.world.base;
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world(sc.world.n_nodes, params, seed);
+    let group = inject_adversaries(&mut world, &sc.adversaries, params, RunMode::Predator);
+    let classes = DemandMix::Uniform.assign(sc.world.n_nodes, seed);
+    let sel = eclipse_selector(sc);
+    for _ in 0..ticks {
+        // Mirror the runner's per-tick target re-resolution (see `run_one_seed_mode` step (a-));
+        // this helper stops before the disaster tick, so the post-disaster pin never applies.
+        if let Some(sel) = sel {
+            world.eclipse.target = resolve_nodesel(&world, sel, &classes)
+                .first()
+                .copied()
+                .or(world.eclipse.target);
+        }
+        crate::sim_dynamic::engine::step(&mut world, params, &prior, &policy);
+    }
+    (world, group)
+}
+
+/// Per target block at the current world state: `(alive symbols, symbols held by the group)`,
+/// both counted through the SHARED `alive_symbols` primitive's unit (distinct present holders).
+/// Only TARGET-EVER-MET blocks — the restore denominator.
+fn a9_block_profile(world: &World, target: usize, group: &[usize]) -> Vec<(usize, usize)> {
+    world.nodes[target]
+        .own_blocks
+        .iter()
+        .filter(|b| b.target_ever_met)
+        .map(|b| {
+            let alive = crate::sim_adv::metrics::alive_symbols(world, target, b.id);
+            let held = group
+                .iter()
+                .filter(|&&h| {
+                    world.nodes[h].present
+                        && world.nodes[h]
+                            .holdings
+                            .iter()
+                            .any(|s| s.alive && s.owner == target && s.block == b.id)
+                })
+                .count();
+            (alive, held)
+        })
+        .collect()
+}
+
+/// The per-seed restore-truth U of a run (`NaN` for a seed whose victim had no established block
+/// — the metric's own empty-denominator reading, skipped by `mean_sigma`).
+fn a9_restore_us(r: &RunResult) -> Vec<f64> {
+    r.per_seed_restore
+        .iter()
+        .map(|x| x.as_ref().map(|t| t.restore_truth_u()).unwrap_or(f64::NAN))
+        .collect()
+}
+
+/// The A9 CONTROL: the same eclipse group, the same world, the same seeds — but the trigger NEVER
+/// passes (schedule tick, watch-arm tick and silence-detection latency all pushed past any
+/// reachable tick). Identical to its arm bit-for-bit apart from the volley that never happens, so
+/// it is the clean A/B baseline: any difference against it is the VOLLEY, not the group's presence.
+fn a9_disarmed(sc: &Scenario) -> Scenario {
+    let mut out = sc.clone();
+    for a in &mut out.adversaries {
+        a.dials.eclipse_drop_tick = u64::MAX;
+        a.dials.eclipse_arm_tick = u64::MAX;
+        a.dials.eclipse_silence_detect_ticks = u64::MAX;
+    }
+    out
+}
+
+#[test]
+#[ignore = "A9 calibration — run with --ignored --nocapture to freeze A9_GROUP_G / the detect-tick choice"]
+fn a9_eclipse_calibration_prints_group_share_and_lethality_frontier() {
+    // The FROZEN calibration read (anti-Goodhart evidence for A9_GROUP_G and the
+    // A9_SILENCE_DETECT_TICKS model choice), spec §3.1. READ + measure only — the BAR is never a
+    // calibration output. Two tables: the LETHALITY FRONTIER over the group-size sweep (measured at
+    // the disaster tick, on the same world the arms run) and the DETECTION-LATENCY sensitivity
+    // (armed arms at detect 0 vs 1 against their own disarmed control).
+    let base = a9_eclipse_silence();
+    let k_eff = base.world.base.k_eff;
+    let seeds = [42u64, 43, 44, 45, 46];
+    println!(
+        "\n=== A9 calibration: honest n={} + G  disaster_tick={} horizon={} k_eff={} X(borrowed)={} ===",
+        A9_TEST_HONEST_N, A9_TEST_DISASTER_TICK, base.horizon, k_eff, A9_TEST_X,
+    );
+    println!("  --- group-size sweep @ the disaster tick (LETHALITY FRONTIER) ---");
+    for &g in &A9_SWEEP_G {
+        let sc = a9_with_group(&base, g);
+        let mut share_sum = 0.0f64;
+        let mut share_n = 0usize;
+        let mut lethal_seeds = 0usize;
+        let mut lethal_blocks_total = 0usize;
+        let mut widths: Vec<usize> = Vec::new();
+        let mut helds: Vec<usize> = Vec::new();
+        for &seed in &seeds {
+            let (w, group) = a9_stepped_world(&sc, seed, A9_TEST_DISASTER_TICK);
+            let target = w.eclipse.target.expect("the eclipse target resolves");
+            let prof = a9_block_profile(&w, target, &group);
+            let alive_total: usize = prof.iter().map(|p| p.0).sum();
+            let held_total: usize = prof.iter().map(|p| p.1).sum();
+            if alive_total > 0 {
+                share_sum += held_total as f64 / alive_total as f64;
+                share_n += 1;
+            }
+            let lethal = prof
+                .iter()
+                .filter(|&&(alive, held)| eclipse_lethal(alive, held, k_eff))
+                .count();
+            lethal_blocks_total += lethal;
+            if lethal > 0 {
+                lethal_seeds += 1;
+            }
+            widths.extend(prof.iter().map(|p| p.0));
+            helds.extend(prof.iter().map(|p| p.1));
+        }
+        println!(
+            "  G={g:>2} ({:>4.1}% of the network): group share of the victim's alive symbols={:.3}  LETHAL blocks={lethal_blocks_total} on {lethal_seeds}/5 seeds  per-block widths={widths:?}  group_held={helds:?}",
+            100.0 * g as f64 / (A9_TEST_HONEST_N + g) as f64,
+            if share_n > 0 {
+                share_sum / share_n as f64
+            } else {
+                f64::NAN
+            },
+        );
+    }
+    println!(
+        "  --- silence-detection latency sensitivity (frozen G, armed vs its own disarmed control) ---"
+    );
+    let control = mean_sigma(&a9_restore_us(&run(&a9_disarmed(&base), &seeds))).0;
+    println!("  control (disarmed group, no volley): restore-U mean={control:.4}");
+    for detect in [0u64, 1] {
+        for sc in [a9_eclipse_silence(), a9_eclipse_drcard()] {
+            let name = sc.id.as_str();
+            let r = run(&a9_with_detect(&sc, detect), &seeds);
+            let us = a9_restore_us(&r);
+            let (m, _) = mean_sigma(&us);
+            println!(
+                "  detect={detect} {name:>18}: U={:?} mean={m:.4}  Δ vs control={:.4}  dropped={:?} killed={:?}",
+                us.iter()
+                    .map(|u| (u * 1000.0).round() / 1000.0)
+                    .collect::<Vec<_>>(),
+                control - m,
+                r.per_seed_eclipse
+                    .iter()
+                    .map(|e| e.symbols_dropped)
+                    .collect::<Vec<_>>(),
+                r.per_seed_eclipse
+                    .iter()
+                    .map(|e| e.blocks_pushed_below_k_eff)
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+}
+
+#[test]
+fn eclipse_lethal_is_true_when_dropping_group_symbols_pushes_alive_below_k_eff() {
+    // A DIRECT unit on the pure predicate (spec §5.4; the A10/B2 lesson: an end-to-end-only
+    // predicate is unverifiable by hand). `eclipse_lethal(alive, group_held, k_eff)` asks exactly
+    // one thing: does `alive − group_held` fall below `k_eff`?
+    let k = 2usize;
+    // The core case: 5 alive, the group holds 4 ⇒ 1 left < 2 ⇒ lethal. Holding 3 leaves 2 ⇒ not.
+    assert!(eclipse_lethal(5, 4, k), "5 alive, 4 mine ⇒ 1 left < k_eff");
+    assert!(
+        !eclipse_lethal(5, 3, k),
+        "5 alive, 3 mine ⇒ 2 left = k_eff ⇒ still decodable"
+    );
+    // alive == k_eff: the block has no margin, so ANY held symbol is lethal.
+    assert!(
+        eclipse_lethal(k, 1, k),
+        "alive == k_eff ⇒ any drop is lethal"
+    );
+    // group_held == 0: nothing to drop ⇒ never lethal, at any width.
+    for alive in 0..8 {
+        assert!(
+            !eclipse_lethal(alive, 0, k),
+            "group holds nothing ⇒ never lethal (alive = {alive})"
+        );
+    }
+    // group_held == alive: the group holds the whole block ⇒ always lethal (for k_eff ≥ 1).
+    for alive in k..8 {
+        assert!(
+            eclipse_lethal(alive, alive, k),
+            "group holds the whole block ⇒ lethal (alive = {alive})"
+        );
+    }
+    // alive < k_eff: ALREADY undecodable ⇒ false. The eclipse does not "finish off" a corpse and
+    // must not claim it as a kill.
+    assert!(
+        !eclipse_lethal(1, 1, k),
+        "already below k_eff ⇒ not a new kill"
+    );
+    assert!(
+        !eclipse_lethal(0, 0, k),
+        "no symbols at all ⇒ nothing to kill"
+    );
+    // k_eff == 0 guard: nothing is ever undecodable ⇒ no panic, no kill.
+    assert!(!eclipse_lethal(5, 5, 0), "k_eff = 0 ⇒ guard, never lethal");
+}
+
+/// An A9 role with the given info-model + dials, carrying the real eclipse hook.
+fn make_a9_role(info_model: InfoModel, dials: AdvDials) -> AdvRole {
+    AdvRole {
+        id: AdvId::A9EclipseTargeter,
+        info_model,
+        dials,
+        hook: a9_eclipse_targeter_hook,
+    }
+}
+
+/// A hand-built eclipse world: `n` present Reliable nodes, node 0 the TARGET with two
+/// target-ever-met blocks, and the given `(holder, block)` symbols placed alive + non-cream.
+fn a9_hand_world(n: usize, placements: &[(usize, usize)]) -> World {
+    let mut w = controlled_world(n, 3);
+    for nd in &mut w.nodes {
+        nd.own_blocks.clear();
+    }
+    w.nodes[0].own_blocks = vec![target_met_block(0, 0.5), target_met_block(1, 0.5)];
+    for &(h, b) in placements {
+        push_held(&mut w, h, 0, b, 0.5, false);
+    }
+    w.eclipse.target = Some(0);
+    w
+}
+
+#[test]
+fn eclipse_blind_arms_drop_every_held_symbol_of_the_target_on_their_trigger() {
+    // Arms A and C (spec §1.3): "drop EVERYTHING I hold of the target". Arm A on a FIXED tick;
+    // arm C when the engine's silence latch says the target has gone quiet. Both ride the EXISTING
+    // silent-loss path (dead now + one queued SilentLoss per holder), and both work while the
+    // target is ABSENT — the reason A9 needs its own pass (`adv_voluntary_drops` skips absent
+    // owners, and the DR victim is absent for exactly the tick that matters).
+    let params = DynParams::default();
+    // Block 0 on holders 1,2,3 and block 1 on holders 2,3,4. Holders 1 and 2 are the group.
+    let placements = [(1, 0), (2, 0), (3, 0), (2, 1), (3, 1), (4, 1)];
+
+    // --- arm A: fires only on its ONE scheduled tick ---
+    let arm_a = AdvDials {
+        eclipse_drop_tick: 5,
+        ..AdvDials::default()
+    };
+    let mut w = a9_hand_world(8, &placements);
+    for h in [1usize, 2] {
+        w.adv[h] = Some(make_a9_role(InfoModel::Own, arm_a));
+    }
+    w.tick = 4;
+    adv_eclipse_drops_for_test(&mut w, &params);
+    assert_eq!(
+        w.eclipse.symbols_dropped, 0,
+        "a blind SCHEDULE does nothing before its tick"
+    );
+    w.tick = 5;
+    adv_eclipse_drops_for_test(&mut w, &params);
+    // Holder 1 held one symbol (block 0), holder 2 held two (blocks 0 and 1) ⇒ 3 burned.
+    assert_eq!(w.eclipse.symbols_dropped, 3, "every group-held symbol dies");
+    assert_eq!(
+        w.pending_silent_loss.len(),
+        2,
+        "one aggregated SILENT loss per holder (the existing death path)"
+    );
+    assert!(
+        w.pending_silent_loss
+            .iter()
+            .all(|l| l.owner == 0 && (l.holder == 1 || l.holder == 2)),
+        "the losses are queued against the TARGET, from the two group holders"
+    );
+    // Non-group holders 3 and 4 are untouched; block 0 keeps holder 3, block 1 keeps 3 and 4.
+    assert_eq!(
+        alive_symbols_for_test(&w, 0, 0),
+        1,
+        "block 0: holder 3 left"
+    );
+    assert_eq!(
+        alive_symbols_for_test(&w, 0, 1),
+        2,
+        "block 1: holders 3, 4 left"
+    );
+    // Block 0 fell from 3 alive to 1 < k_eff = 2 ⇒ ONE kill; block 1 stayed decodable.
+    assert_eq!(
+        w.eclipse.blocks_pushed_below_k_eff, 1,
+        "exactly one block was killed"
+    );
+    // Firing again is a no-op (there is nothing left of the target to drop).
+    let (dropped, killed) = (
+        w.eclipse.symbols_dropped,
+        w.eclipse.blocks_pushed_below_k_eff,
+    );
+    w.tick = 5;
+    adv_eclipse_drops_for_test(&mut w, &params);
+    assert_eq!(
+        (
+            w.eclipse.symbols_dropped,
+            w.eclipse.blocks_pushed_below_k_eff
+        ),
+        (dropped, killed)
+    );
+
+    // --- arm C: silent-gated, and it fires while the target is ABSENT ---
+    let arm_c = AdvDials {
+        eclipse_on_silence: true,
+        eclipse_silence_detect_ticks: 0,
+        ..AdvDials::default()
+    };
+    let mut w = a9_hand_world(8, &placements);
+    for h in [1usize, 2] {
+        w.adv[h] = Some(make_a9_role(InfoModel::Own, arm_c));
+    }
+    w.tick = 5;
+    adv_eclipse_drops_for_test(&mut w, &params);
+    assert_eq!(
+        w.eclipse.symbols_dropped, 0,
+        "a living, challenging owner is not silent ⇒ no fire"
+    );
+    // The disaster's own signature: source-less blocks + an absent owner for one tick.
+    for b in w.nodes[0].own_blocks.iter_mut() {
+        b.to_restore = true;
+    }
+    w.nodes[0].present = false;
+    adv_eclipse_drops_for_test(&mut w, &params);
+    assert_eq!(
+        w.eclipse.symbols_dropped, 3,
+        "silence noticed ⇒ the group dumps everything, ABSENT owner and all"
+    );
+    assert_eq!(w.eclipse.blocks_pushed_below_k_eff, 1);
+}
+
+#[test]
+fn eclipse_silence_gate_waits_for_the_detection_latency_it_is_dialled_to() {
+    // The silence LATCH (`world.eclipse.silent_since`) + the `eclipse_silence_detect_ticks` dial:
+    // the fire lands at `silent_since + detect`, and the latch CLEARS if the target speaks again
+    // (so the delay is always measured from the start of the current silence, never re-armed).
+    let params = DynParams::default();
+    let dials = AdvDials {
+        eclipse_on_silence: true,
+        eclipse_silence_detect_ticks: 1,
+        ..AdvDials::default()
+    };
+    let mut w = a9_hand_world(8, &[(1, 0), (2, 0), (3, 0)]);
+    w.adv[1] = Some(make_a9_role(InfoModel::Own, dials));
+    w.tick = 10;
+    w.nodes[0].present = false; // the target goes quiet at tick 10
+    adv_eclipse_drops_for_test(&mut w, &params);
+    assert_eq!(
+        w.eclipse.silent_since,
+        Some(10),
+        "the latch records tick 10"
+    );
+    assert_eq!(
+        w.eclipse.symbols_dropped, 0,
+        "detect = 1 ⇒ nothing lands on the very tick the silence began"
+    );
+    w.tick = 11;
+    adv_eclipse_drops_for_test(&mut w, &params);
+    assert_eq!(w.eclipse.symbols_dropped, 1, "one tick later it lands");
+
+    // The latch clears when the target speaks again — a transient quiet does not accumulate.
+    let mut w = a9_hand_world(8, &[(1, 0), (2, 0), (3, 0)]);
+    w.adv[1] = Some(make_a9_role(InfoModel::Own, dials));
+    w.tick = 10;
+    w.nodes[0].present = false;
+    adv_eclipse_drops_for_test(&mut w, &params);
+    w.tick = 11;
+    w.nodes[0].present = true; // back online before the group acted
+    adv_eclipse_drops_for_test(&mut w, &params);
+    assert_eq!(w.eclipse.silent_since, None, "the latch cleared");
+    assert_eq!(w.eclipse.symbols_dropped, 0, "and nothing was dropped");
+    w.tick = 12;
+    w.nodes[0].present = false; // quiet again ⇒ the clock restarts here
+    adv_eclipse_drops_for_test(&mut w, &params);
+    assert_eq!(w.eclipse.silent_since, Some(12), "re-latched at 12, not 10");
+    assert_eq!(w.eclipse.symbols_dropped, 0, "detect = 1 ⇒ not yet");
+}
+
+#[test]
+fn eclipse_card_drops_only_the_blocks_where_the_group_is_lethal() {
+    // Arm B (the CROWN-1 card, spec §1.2): the same group, but it drops ONLY where dropping makes
+    // the block undecodable — and keeps its symbols everywhere else. That selectivity IS what the
+    // card buys, and it is what makes the card arm cheaper per kill than the blind arm.
+    let params = DynParams::default(); // k_eff = 2
+    // Block 0: 3 holders (1, 2, 3), the group holds 1 and 2 ⇒ 3 − 2 = 1 < 2 ⇒ LETHAL.
+    // Block 1: 4 holders (1, 4, 5, 6), the group holds only 1 ⇒ 4 − 1 = 3 ≥ 2 ⇒ NOT lethal.
+    let placements = [(1, 0), (2, 0), (3, 0), (1, 1), (4, 1), (5, 1), (6, 1)];
+    let dials = AdvDials {
+        eclipse_arm_tick: 0,
+        ..AdvDials::default()
+    };
+    let mut w = a9_hand_world(9, &placements);
+    for h in [1usize, 2] {
+        w.adv[h] = Some(make_a9_role(
+            InfoModel::DrCard { target: usize::MAX },
+            dials,
+        ));
+    }
+    w.tick = 7;
+    adv_eclipse_drops_for_test(&mut w, &params);
+    assert_eq!(
+        w.eclipse.symbols_dropped, 2,
+        "only the two LETHAL symbols of block 0 burn — the block-1 symbol is kept"
+    );
+    assert_eq!(w.eclipse.blocks_pushed_below_k_eff, 1, "one block killed");
+    assert_eq!(
+        alive_symbols_for_test(&w, 0, 0),
+        1,
+        "block 0 is undecodable"
+    );
+    assert_eq!(
+        alive_symbols_for_test(&w, 0, 1),
+        4,
+        "block 1 is untouched — a non-lethal drop would only cost the attacker"
+    );
+    // The blind arm, on the SAME world, burns MORE for the SAME kill — the price of the card,
+    // in miniature and by construction.
+    let blind = AdvDials {
+        eclipse_drop_tick: 7,
+        ..AdvDials::default()
+    };
+    let mut wb = a9_hand_world(9, &placements);
+    for h in [1usize, 2] {
+        wb.adv[h] = Some(make_a9_role(InfoModel::Own, blind));
+    }
+    wb.tick = 7;
+    adv_eclipse_drops_for_test(&mut wb, &params);
+    assert_eq!(
+        wb.eclipse.symbols_dropped, 3,
+        "the blind arm dumps block 1 too"
+    );
+    assert_eq!(
+        wb.eclipse.blocks_pushed_below_k_eff, 1,
+        "for exactly the same one kill"
+    );
+    assert!(
+        wb.eclipse.symbols_dropped > w.eclipse.symbols_dropped,
+        "blind burns more symbols per kill than the card"
+    );
+}
+
+#[test]
+fn eclipse_pass_is_a_strict_noop_without_a_target_or_a_group() {
+    // The ANCHOR mechanics: no eclipse target (every non-A9 scenario) ⇒ the pass returns before it
+    // touches anything; and a target with an A9 group whose hook has not fired ⇒ still nothing.
+    let params = DynParams::default();
+    let placements = [(1, 0), (2, 0), (3, 0)];
+    let mut w = a9_hand_world(8, &placements);
+    w.eclipse.target = None;
+    w.nodes[0].present = false; // maximally "silent" — but there is no target to attack
+    for h in [1usize, 2] {
+        w.adv[h] = Some(make_a9_role(
+            InfoModel::Own,
+            AdvDials {
+                eclipse_on_silence: true,
+                ..AdvDials::default()
+            },
+        ));
+    }
+    adv_eclipse_drops_for_test(&mut w, &params);
+    assert_eq!(
+        w.eclipse,
+        crate::sim_dynamic::generator::EclipseState::default()
+    );
+    assert!(w.pending_silent_loss.is_empty());
+    // A target, but no A9 role anywhere ⇒ only the silence latch moves; no symbol dies.
+    let mut w = a9_hand_world(8, &placements);
+    w.nodes[0].present = false;
+    adv_eclipse_drops_for_test(&mut w, &params);
+    assert_eq!(w.eclipse.symbols_dropped, 0);
+    assert_eq!(alive_symbols_for_test(&w, 0, 0), 3);
+}
+
+/// One arm's measured outcome: per-seed restore-U + the pooled attack cost.
+struct A9Arm {
+    label: &'static str,
+    us: Vec<f64>,
+    mean_u: f64,
+    dropped: usize,
+    killed: usize,
+}
+
+/// Run one arm (5 frozen seeds) and reduce it to the price-table row.
+fn a9_run_arm(label: &'static str, sc: &Scenario, seeds: &[u64]) -> A9Arm {
+    let r = run(sc, seeds);
+    let us = a9_restore_us(&r);
+    let mean_u = mean_sigma(&us).0;
+    A9Arm {
+        label,
+        us,
+        mean_u,
+        dropped: r.per_seed_eclipse.iter().map(|e| e.symbols_dropped).sum(),
+        killed: r
+            .per_seed_eclipse
+            .iter()
+            .map(|e| e.blocks_pushed_below_k_eff)
+            .sum(),
+    }
+}
+
+/// Symbols burned per block killed over the pooled seeds (`NaN` when nothing was killed).
+fn a9_efficiency(a: &A9Arm) -> f64 {
+    if a.killed == 0 {
+        f64::NAN
+    } else {
+        a.dropped as f64 / a.killed as f64
+    }
+}
+
+#[test]
+fn a9_crown1_price_table_across_three_arms() {
+    // ⭐ THE DELIVERABLE (spec §5.2): what does the leaked DR-card BUY? Three arms and their SHARED
+    // control (the same group, disarmed — so the comparison isolates the VOLLEY, not the group's
+    // presence), on the five frozen seeds. Two price dimensions, both printed:
+    //   * DAMAGE      = control's restore-U − the arm's restore-U (the victim's own DR units);
+    //   * EFFICIENCY  = symbols burned per block killed (what the attack COSTS the attacker).
+    // The leak is isolated by B vs C (identical group, identical silence gate, identical volley
+    // tick — the ONLY switch is `info_model`); B vs A is the value of timing over a naive fixed
+    // schedule. The directional guards below are STRUCTURAL truths, not tuned bars.
+    //
+    // ⚠ WHAT THE DAMAGE COLUMN CANNOT SHOW (review BLOCK-1/W1/W2 — read before quoting a number).
+    // Arm B was deliberately given arm C's silence gate, so B's drop set is a SUBSET of C's in the
+    // SAME tick and `damage(C) ≥ damage(B)` is ARITHMETIC, not a result: this table could not have
+    // shown the card buying extra damage. What it can show — efficiency — is conditioned on two
+    // disclosed handicaps that bind the card only (the one-shot `fired` latch, and a lethality
+    // predicate blind to window-collectability), and on the dial `A9_SILENCE_DETECT_TICKS = 0`
+    // (at 1 the whole damage column is 0.0000 and the efficiency gap shrinks 3.00× → 1.64×).
+    // ⇒ Treat the measured card as a LOWER bound on the leak. The robust, dial-independent results
+    // are the lethality frontier, arm A's full repair, and the one-tick race — not this Δ.
+    let seeds = [42u64, 43, 44, 45, 46];
+    let control = a9_run_arm(
+        "control (disarmed)",
+        &a9_disarmed(&a9_eclipse_drcard()),
+        &seeds,
+    );
+    let arm_a = a9_run_arm("A blind schedule", &a9_eclipse_blind(), &seeds);
+    let arm_c = a9_run_arm("C blind on silence", &a9_eclipse_silence(), &seeds);
+    let arm_b = a9_run_arm("B DR-card", &a9_eclipse_drcard(), &seeds);
+
+    println!("\n=== A9 × CROWN-1 price table (G = {A9_TEST_FROZEN_G}, seeds 42..46) ===");
+    println!(
+        "  {:>20}  {:>8}  {:>8}  {:>8}  {:>8}  {:>12}",
+        "arm", "mean U", "damage", "dropped", "pushed", "symb/pushed"
+    );
+    for a in [&control, &arm_a, &arm_c, &arm_b] {
+        println!(
+            "  {:>20}  {:>8.4}  {:>8.4}  {:>8}  {:>8}  {:>12.2}   per-seed U = {:?}",
+            a.label,
+            a.mean_u,
+            control.mean_u - a.mean_u,
+            a.dropped,
+            a.killed,
+            a9_efficiency(a),
+            a.us.iter()
+                .map(|u| (u * 1000.0).round() / 1000.0)
+                .collect::<Vec<_>>(),
+        );
+    }
+    let damage = |a: &A9Arm| control.mean_u - a.mean_u;
+    println!(
+        "  HEADLINE (B vs C): Δdamage = {:.4}   cost ratio = {:.2}× (card burns {} symbols vs {})",
+        damage(&arm_b) - damage(&arm_c),
+        arm_c.dropped as f64 / (arm_b.dropped.max(1)) as f64,
+        arm_b.dropped,
+        arm_c.dropped,
+    );
+    println!(
+        "  TIMING   (B vs A): Δdamage = {:.4}   cost ratio = {:.2}×",
+        damage(&arm_b) - damage(&arm_a),
+        arm_a.dropped as f64 / (arm_b.dropped.max(1)) as f64,
+    );
+
+    // GUARD 1 (structural, spec §5.2): dropping EVERYTHING ⊇ dropping the lethal subset, so at
+    // equal timing the blind-on-silence arm cannot do LESS damage than the card arm. A violation
+    // means the arms stopped being comparable (different trigger tick / different target), not that
+    // the card became magic — hence it is a regression guard, with ε for the coarse 3-block
+    // granularity of a single seed.
+    let eps = 1.0 / 3.0 + 1e-9;
+    assert!(
+        damage(&arm_c) >= damage(&arm_b) - eps,
+        "damage(C) {:.4} must not fall below damage(B) {:.4} by more than one block — dropping everything is a superset of dropping the lethal subset",
+        damage(&arm_c),
+        damage(&arm_b),
+    );
+    // GUARD 2 (structural): the card cannot be MORE expensive per kill than dropping everything —
+    // it drops a subset of the blind arm's symbols and (guard 1) kills no more blocks.
+    let (eb, ec) = (a9_efficiency(&arm_b), a9_efficiency(&arm_c));
+    if eb.is_finite() && ec.is_finite() {
+        assert!(
+            eb <= ec + 1e-9,
+            "efficiency(B) {eb:.2} symbols per pushed block must not exceed efficiency(C) {ec:.2}"
+        );
+    }
+    // GUARD 3 (the measurement is alive): the group really did burn symbols in the blind arms —
+    // otherwise the whole table would be comparing three no-ops.
+    assert!(
+        arm_c.dropped > 0,
+        "the blind-on-silence arm must actually fire (it burned {} symbols)",
+        arm_c.dropped
+    );
+    assert_eq!(
+        (control.dropped, control.killed),
+        (0, 0),
+        "the disarmed control must never fire — otherwise it is not a control"
+    );
+}
+
+#[test]
+fn a9_dr_floor_holds_for_the_blind_arm_and_breaks_in_the_timed_arms() {
+    // The PER-SEED reading of INV-ECLIPSE-DR-FLOOR (spec §5.3; the `dr_battle_floor_holds_per_seed_*`
+    // idiom, and the same resolution that test reached): a board MEAN can hide one seed collapsing,
+    // so every seed is read against the BORROWED 0.60 bar directly — and the measured answer is not
+    // "it holds".
+    //
+    // MEASURED (G = 40, seeds 42..46), and this IS the headline in Ilya's own semantic units:
+    //   * arm A (blind SCHEDULE, fired 20 ticks before the disaster): U = 1.0 on EVERY seed. The
+    //     owner was still alive and still had its source, so P1 repair put every dropped symbol
+    //     back. The bar holds with zero margin lost.
+    //   * arm C (blind ON SILENCE): U = [0.333, 0.333, 0.667, 1.0, 1.0] — BELOW the bar on two seeds.
+    //   * arm B (DR-CARD):          U = [0.667, 0.333, 0.667, 1.0, 1.0] — below the bar on one seed.
+    // The bar is NOT moved for this (spec §4.2). The test therefore asserts BOTH directions: the
+    // blind schedule keeps the floor everywhere, and the timed arms genuinely breach it.
+    //
+    // ⚠ READ THIS BEFORE "FIXING" A FAILURE (review W6). The second half — "the timed arms MUST
+    // breach" — is a PIN ON ATTACKER STRENGTH, not a system invariant, and it is pinned on a knife
+    // edge: the breach exists only at `A9_SILENCE_DETECT_TICKS = 0`; at 1 it is 0.0000 on every
+    // seed (see that constant). So if this half fails, the FIRST question is "did the system get
+    // better, or did the intra-tick order change?" — not "what regressed?". A genuine defence
+    // (faster restore start, collection retry, mailbox encryption removing the timing signal) is
+    // EXPECTED to break it, and the right response is to re-freeze the pin with the reason, never
+    // to weaken the bar. The first half (arm A holds the floor) IS a real directional guard.
+    let seeds = [42u64, 43, 44, 45, 46];
+    let arm_a = a9_restore_us(&run(&a9_eclipse_blind(), &seeds));
+    let arm_c = a9_restore_us(&run(&a9_eclipse_silence(), &seeds));
+    let arm_b = a9_restore_us(&run(&a9_eclipse_drcard(), &seeds));
+    println!("  A blind schedule  : per-seed U = {arm_a:?}");
+    println!("  C blind on silence: per-seed U = {arm_c:?}");
+    println!("  B DR-card         : per-seed U = {arm_b:?}");
+    // Every seed must give a denominator — an empty one is "no restore question was asked", which
+    // would silently shrink the sample the whole table rests on.
+    for (label, us) in [("A", &arm_a), ("C", &arm_c), ("B", &arm_b)] {
+        assert!(
+            us.iter().all(|u| u.is_finite()),
+            "arm {label}: every seed must have an established victim (a denominator): {us:?}"
+        );
+    }
+    // The blind SCHEDULE keeps the floor on every seed — P1 repair undoes a volley fired while the
+    // owner still holds its source. This is a real directional guard, not a pin.
+    for (&seed, &u) in seeds.iter().zip(&arm_a) {
+        assert!(
+            u > A9_TEST_X,
+            "arm A seed {seed}: a pre-disaster volley must be repaired away, got U = {u:.4} ≤ {A9_TEST_X}"
+        );
+    }
+    // The TIMED arms breach it — the finding, asserted so it cannot silently evaporate.
+    assert!(
+        arm_c.iter().filter(|u| **u < A9_TEST_X).count() >= 1,
+        "arm C must breach the DR floor on at least one seed (that breach IS the measured harm): {arm_c:?}"
+    );
+    assert!(
+        arm_b.iter().filter(|u| **u < A9_TEST_X).count() >= 1,
+        "arm B must breach the DR floor on at least one seed: {arm_b:?}"
+    );
+    // ... and the card arm never does MORE per-seed harm than dropping everything (structural:
+    // its drop set is a subset of the blind arm's).
+    for (&seed, (b, c)) in seeds.iter().zip(arm_b.iter().zip(&arm_c)) {
+        assert!(
+            *b >= *c - 1e-9,
+            "seed {seed}: the card arm (U = {b:.4}) cannot do MORE damage than dropping everything (U = {c:.4})"
+        );
+    }
+}
+
+#[test]
+fn a9_eclipse_damage_vanishes_when_the_group_never_fires() {
+    // THE ATTACK / NO-ATTACK CONTROL — this establishes the DENOMINATOR of `damage`, i.e. that the
+    // same 40 exemplary holders sitting in the victim's holder set cost it NOTHING until they fire.
+    //
+    // ⚠ It is NOT the leak's A/B, though an earlier version of this comment claimed it was (review
+    // BLOCK-3 — the same over-claim class as A7 and A10). For an `InfoModel::DrCard` role the
+    // lethal watch is its ONLY action, so disarming it removes the ATTACK, not the per-block
+    // KNOWLEDGE. The leak is isolated by arm B vs arm C in `a9_crown1_price_table_across_three_arms`
+    // (identical group, identical silence gate, identical volley tick — the ONLY difference is
+    // `info_model`), and even there see that test's own caveat about what the comparison can show.
+    let seeds = [42u64, 43, 44, 45, 46];
+    let armed = a9_run_arm("B armed", &a9_eclipse_drcard(), &seeds);
+    let disarmed = a9_run_arm("B disarmed", &a9_disarmed(&a9_eclipse_drcard()), &seeds);
+    println!(
+        "  watch ARMED   : U = {:?} dropped = {} pushed = {}",
+        armed.us, armed.dropped, armed.killed
+    );
+    println!(
+        "  watch DISARMED: U = {:?} dropped = {} pushed = {}",
+        disarmed.us, disarmed.dropped, disarmed.killed
+    );
+    // The dial is the ONLY channel: with the watch off, not one symbol of the victim is touched.
+    assert_eq!(
+        (disarmed.dropped, disarmed.killed),
+        (0, 0),
+        "disarming the lethal watch removes the attack entirely"
+    );
+    assert!(
+        armed.dropped > 0,
+        "the armed watch must actually fire, else the A/B compares two no-ops"
+    );
+    // ... and any restore-truth difference between the two is therefore attributable to the volley.
+    for (&seed, (a, d)) in seeds.iter().zip(armed.us.iter().zip(&disarmed.us)) {
+        println!(
+            "    seed {seed}: armed U = {a:.4}  disarmed U = {d:.4}  Δ = {:.4}",
+            d - a
+        );
+        if a.is_finite() && d.is_finite() {
+            assert!(
+                *a <= *d + 1e-9,
+                "seed {seed}: arming the watch must not IMPROVE the victim's restore-truth ({a} > {d})"
+            );
+        }
+    }
+}
+
+/// Replay ONE A9 arm on one seed through the runner's own per-tick order — target re-resolution,
+/// due events, restore-window observation, `step` — while snapshotting the victim's per-block ALIVE
+/// symbol count immediately BEFORE and AFTER the tick that carries the eclipse volley. Returns
+/// `(restore-truth, volley tick, per-block (block id, alive before, alive after))`.
+///
+/// The A9 world carries no tier/demand/uptime/inflow layer, so `build_world` IS the runner's
+/// `build_world_for`; the caller asserts the resulting restore-truth is bit-identical to
+/// `run_one_seed`'s, which is what makes this a trace OF the measured run rather than of a lookalike.
+fn a9_traced_run(sc: &Scenario, seed: u64) -> (RestoreTruth, u64, Vec<(usize, usize, usize)>) {
+    use std::collections::BTreeMap;
+    use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
+    let params = &sc.world.base;
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world(sc.world.n_nodes, params, seed);
+    inject_adversaries(&mut world, &sc.adversaries, params, RunMode::Predator);
+    let classes = DemandMix::Uniform.assign(sc.world.n_nodes, seed);
+    let sel = eclipse_selector(sc);
+    world.pred_log_enabled = true;
+    let mut tracker = RestoreTracker::new(&sc.world);
+    let mut revive_at: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    let mut fired: Vec<crate::sim_adv::runner::FiredEvent> = Vec::new();
+    let mut volley_tick = u64::MAX;
+    let mut profile: Vec<(usize, usize, usize)> = Vec::new();
+    for t in 0..sc.horizon {
+        if !tracker.is_active()
+            && let Some(sel) = sel
+        {
+            world.eclipse.target = resolve_nodesel(&world, sel, &classes)
+                .first()
+                .copied()
+                .or(world.eclipse.target);
+        }
+        if let Some(victims) = revive_at.remove(&t) {
+            for v in victims {
+                world.nodes[v].present = true;
+            }
+        }
+        let due: Vec<Event> = sc
+            .events
+            .iter()
+            .filter(|(tt, _)| *tt == t)
+            .map(|(_, e)| *e)
+            .collect();
+        crate::sim_adv::runner::apply_events(
+            &mut world,
+            &due,
+            t,
+            &mut fired,
+            &mut tracker,
+            &mut revive_at,
+            &classes,
+        );
+        tracker.observe(&world, t);
+        let was_fired = world.eclipse.fired;
+        let target = world.eclipse.target;
+        let before: Vec<(usize, usize)> = match target {
+            Some(v) => world.nodes[v]
+                .own_blocks
+                .iter()
+                .map(|b| (b.id, alive_symbols_for_test(&world, v, b.id)))
+                .collect(),
+            None => Vec::new(),
+        };
+        crate::sim_dynamic::engine::step(&mut world, params, &prior, &policy);
+        if !was_fired && world.eclipse.fired {
+            volley_tick = t;
+            let v = target.expect("a volley implies a target");
+            profile = before
+                .iter()
+                .map(|&(id, a)| (id, a, alive_symbols_for_test(&world, v, id)))
+                .collect();
+        }
+    }
+    (tracker.finalize(), volley_tick, profile)
+}
+
+#[test]
+fn a9_eclipse_volley_lands_before_the_victim_starts_collecting() {
+    // THE ORDERING CLAIM, verified rather than argued (the whole attack is a race against the
+    // restore window, and the frozen `A9_SILENCE_DETECT_TICKS = 0` is justified by exactly this
+    // ordering). Traced on the blind-on-silence arm, seed 42:
+    //   * the volley lands on the DISASTER tick itself — before the victim's first collection pass,
+    //     which the runner performs at the top of `disaster_tick + 1`;
+    //   * no block's collectable count exceeds what survived the volley (you cannot collect a dead
+    //     symbol — the ordering, in the measurement's own units);
+    //   * at least one block goes from ≥ k_eff alive to < k_eff and is reported UNRESTORABLE.
+    let sc = a9_eclipse_silence();
+    let k_eff = sc.world.base.k_eff;
+    let (rt, volley_tick, profile) = a9_traced_run(&sc, 42);
+    println!(
+        "  volley tick = {volley_tick} (disaster tick = {A9_TEST_DISASTER_TICK}), per-block alive before → after = {profile:?}"
+    );
+    for b in &rt.blocks {
+        println!(
+            "    block {} : collectable(any) = {} restorable_u = {}",
+            b.block_id, b.n_collectable_any, b.restorable_u
+        );
+    }
+    // The trace must BE the measured run, not a lookalike.
+    let reference = run_one_seed(&sc, 42)
+        .restore
+        .expect("the arm runs a disaster");
+    assert!(
+        restore_bit_eq(&rt, &reference),
+        "the traced replay must reproduce the runner's restore-truth bit-for-bit"
+    );
+    assert_eq!(
+        volley_tick, A9_TEST_DISASTER_TICK,
+        "with detect = 0 the volley lands on the disaster tick — one tick BEFORE the victim's first collection pass"
+    );
+    // Ordering, in measurement units: a symbol killed by the volley is never collected.
+    for b in &rt.blocks {
+        if let Some(&(_, before, after)) = profile.iter().find(|(id, _, _)| *id == b.block_id) {
+            assert!(
+                b.n_collectable_any <= after,
+                "block {}: collected {} of {after} symbols that survived the volley (was {before}) — the volley landed too late",
+                b.block_id,
+                b.n_collectable_any,
+            );
+        }
+    }
+    // And the kill is visible in the flagship metric, not merely in the world.
+    let killed: Vec<usize> = profile
+        .iter()
+        .filter(|&&(_, before, after)| before >= k_eff && after < k_eff)
+        .map(|&(id, _, _)| id)
+        .collect();
+    assert!(
+        !killed.is_empty(),
+        "the traced seed must show at least one block driven below k_eff: {profile:?}"
+    );
+    for id in killed {
+        let row = rt
+            .blocks
+            .iter()
+            .find(|b| b.block_id == id)
+            .expect("a killed block is in the restore denominator");
+        assert!(
+            !row.restorable_u,
+            "block {id} was driven below k_eff by the volley, so it must read UNRESTORABLE"
+        );
+    }
+}
+
+#[test]
+fn a9_eclipse_absent_is_bit_identical_to_the_honest_anchor() {
+    // ANCHOR part A: the frozen `honest_v2` seed-42 numbers (the `sim_diag 42 100 50 1 v2` parity
+    // the whole harness rests on) are UNMOVED by the A9 engine pass — an honest world sets no
+    // eclipse target, so `adv_eclipse_drops` returns before it reads anything.
+    let m = run_one_seed(&honest_v2(), 42).metrics;
+    assert_eq!(m.alive_symbols, 224, "alive");
+    assert_eq!(m.evicts, 627, "evicts");
+    assert_eq!(m.preempts, 380, "preempts");
+    assert_eq!(m.cap_trims, 182, "cap_trims");
+    assert!(
+        (m.share_a_pos - 75.89).abs() < 0.1,
+        "share A>0 = {}",
+        m.share_a_pos
+    );
+
+    // ANCHOR part B: the eclipse WIRING itself costs nothing. Same world, same seed, one with the
+    // A9 spec present at `count = 0` (so the runner resolves an eclipse target and runs the pass
+    // every tick) and one with no adversary spec at all (no target, no pass). Bit-identical
+    // metrics AND bit-identical restore-truth ⇒ resolving a target and running the pass over an
+    // empty group changes nothing.
+    let mut zero = a9_eclipse_drcard();
+    zero.adversaries[0].count = 0;
+    let mut none = a9_eclipse_drcard();
+    none.adversaries.clear();
+    let a = run_one_seed(&zero, 42);
+    let b = run_one_seed(&none, 42);
+    assert!(
+        metrics_bit_eq(&a.metrics, &b.metrics),
+        "an empty eclipse group leaves the god-view metrics byte-identical"
+    );
+    assert!(
+        restore_bit_eq(
+            a.restore.as_ref().expect("disaster fired"),
+            b.restore.as_ref().expect("disaster fired")
+        ),
+        "an empty eclipse group leaves restore-truth byte-identical"
+    );
+    assert_eq!(
+        (
+            a.eclipse.symbols_dropped,
+            a.eclipse.blocks_pushed_below_k_eff
+        ),
+        (0, 0),
+        "an empty group burns nothing"
+    );
+}
+
+#[test]
+fn a9_eclipse_is_deterministic_across_a_double_run() {
+    // Determinism gate (spec §5.6) for all THREE arms: the pass draws no RNG and iterates by index,
+    // so an independent re-run at the same seed must reproduce the god-view metrics, the
+    // restore-truth AND the attack-cost ledger bit-for-bit.
+    for sc in [
+        a9_eclipse_blind(),
+        a9_eclipse_silence(),
+        a9_eclipse_drcard(),
+    ] {
+        let a = run_one_seed(&sc, 42);
+        let b = run_one_seed(&sc, 42);
+        assert!(
+            metrics_bit_eq(&a.metrics, &b.metrics),
+            "{}: metrics bit-identical on re-run",
+            sc.id
+        );
+        assert!(
+            restore_bit_eq(
+                a.restore.as_ref().expect("disaster fired"),
+                b.restore.as_ref().expect("disaster fired")
+            ),
+            "{}: restore-truth bit-identical on re-run",
+            sc.id
+        );
+        assert_eq!(
+            a.eclipse, b.eclipse,
+            "{}: eclipse cost bit-identical",
+            sc.id
+        );
+    }
+}
+
+#[test]
+fn a9_eclipse_arms_are_registered_with_one_shared_borrowed_bar() {
+    // Wiring: three registered arms, differing ONLY in the group's information model + trigger
+    // dials, all judged by the SAME board rows against the SAME borrowed bar.
+    for name in [
+        "a9_eclipse_blind",
+        "a9_eclipse_silence",
+        "a9_eclipse_drcard",
+    ] {
+        let sc = find_scenario(name).expect("registered");
+        assert_eq!(sc.adversaries.len(), 1);
+        assert_eq!(sc.adversaries[0].id, AdvId::A9EclipseTargeter);
+        assert_eq!(
+            sc.adversaries[0].count, A9_TEST_FROZEN_G,
+            "{name} carries the frozen group size"
+        );
+        assert_eq!(
+            sc.world.n_nodes,
+            A9_TEST_HONEST_N + A9_TEST_FROZEN_G,
+            "{name}: the group is ADDED to the honest population, never carved out of it"
+        );
+        assert_eq!(sc.seeds, vec![42, 43, 44, 45, 46]);
+        assert!(
+            sc.events
+                .iter()
+                .any(|(t, e)| *t == A9_TEST_DISASTER_TICK && matches!(e, Event::Disaster(_))),
+            "{name} strikes the DR-primary backbone at the frozen tick"
+        );
+        let floor = sc
+            .verdicts
+            .iter()
+            .find(|v| v.id == "INV-ECLIPSE-DR-FLOOR")
+            .expect("the DR floor row");
+        assert!(
+            (floor.threshold - A9_TEST_X).abs() < 1e-12,
+            "{name}: the bar is the BORROWED 0.60, never an A9-derived number"
+        );
+        assert!(
+            matches!(floor.spec, InvariantSpec::RestoreStatistical { .. }),
+            "{name}: the DR floor rides the existing restore-truth row (no new InvariantSpec variant)"
+        );
+        for id in ["INV-DETERMINISM", "INV-ANTI-ORACLE"] {
+            assert!(
+                sc.verdicts.iter().any(|v| v.id == id),
+                "{name} carries {id}"
+            );
+        }
+    }
+    // The three arms differ ONLY in info-model + eclipse dials (same world, seeds, events, bar).
+    let (a, c, b) = (
+        a9_eclipse_blind(),
+        a9_eclipse_silence(),
+        a9_eclipse_drcard(),
+    );
+    assert_eq!(a.world.n_nodes, b.world.n_nodes);
+    assert_eq!(a.horizon, c.horizon);
+    assert_eq!(a.events, b.events);
+    assert!(matches!(a.adversaries[0].info_model, InfoModel::Own));
+    assert!(matches!(c.adversaries[0].info_model, InfoModel::Own));
+    assert!(matches!(
+        b.adversaries[0].info_model,
+        InfoModel::DrCard { .. }
+    ));
+    assert!(!a.adversaries[0].dials.eclipse_on_silence);
+    assert!(c.adversaries[0].dials.eclipse_on_silence);
+    assert!(b.adversaries[0].dials.eclipse_on_silence);
+}
+
+#[test]
+fn a9_eclipse_board_reports_the_dr_floor_verdict_for_each_arm() {
+    // The board actually EVALUATES on the eclipse arms (structural rows PASS; the DR-floor row is
+    // read and reported). Run on the DR-card arm — the priced one — and print every verdict so the
+    // row's kind/power is part of the deliverable rather than an unexamined green tick.
+    let sc = a9_eclipse_drcard();
+    let result = run(&sc, &sc.seeds);
+    let verdicts = evaluate_board(&sc, &result);
+    for v in &verdicts {
+        println!(
+            "  {:<24} {} effect={:.4} σ={:.4} thr={:.2} power={:.2}",
+            v.id,
+            v.kind.label(),
+            v.effect,
+            v.sigma,
+            v.threshold,
+            v.power
+        );
+        if v.id == "INV-DETERMINISM" || v.id == "INV-ANTI-ORACLE" {
+            assert_eq!(v.kind, VerdictKind::Pass, "{} must PASS", v.id);
+        }
+    }
+    // The eclipse COST section is part of the standard report (the efficiency half of the price),
+    // stamped with the arm the restore-truth was scored under (NOTE-5's `info_model`).
+    let text = format_report(&sc, &result, &verdicts);
+    assert!(
+        text.contains("attack cost, arm = dr_card"),
+        "the report carries the eclipse cost section, labelled with the arm:\n{text}"
+    );
+    assert!(
+        text.contains("symbols per block pushed"),
+        "the report carries the efficiency line, in the honest unit (blocks PUSHED below k_eff at \
+         the volley — not 'kills', which mixes repaired, terminal and too-late pushes)"
+    );
+    // ... and an honest world's report never grows it.
+    let honest = run(&dr_baseline(), &[42]);
+    let honest_text = format_report(&dr_baseline(), &honest, &[]);
+    assert!(
+        !honest_text.contains("attack cost"),
+        "a non-eclipse scenario's report is unchanged"
+    );
+}
+
+#[test]
+fn eclipse_target_is_repointed_and_its_ledger_reset_when_the_disaster_strikes_someone_else() {
+    // The re-point safety net in `runner::strike_victim`. The eclipse target and the disaster
+    // victim are two derivations of the SAME selector at (potentially) different ticks, and they
+    // can drift for exactly one reason: the earlier winner CHURNED OUT. When they differ, the
+    // eclipse must follow the node whose restore-truth is actually measured, and the cost ledger
+    // must be reset — symbols spent on a node that then departed are not part of THIS measurement.
+    // Driven directly, because on the frozen scenarios the pre-disaster re-resolution keeps the two
+    // in step, so this branch would otherwise never be exercised.
+    use std::collections::BTreeMap;
+    let sc = a9_eclipse_drcard();
+    let mut w = controlled_world(12, 5);
+    // A stale target with a spent ledger, and a DIFFERENT node the disaster will strike.
+    w.eclipse.target = Some(3);
+    w.eclipse.silent_since = Some(7);
+    w.eclipse.fired = true;
+    w.eclipse.symbols_dropped = 9;
+    w.eclipse.blocks_pushed_below_k_eff = 2;
+    let victim = 5usize;
+    let classes = DemandMix::Uniform.assign(w.nodes.len(), 5);
+    let mut tracker = RestoreTracker::new(&sc.world);
+    let mut revive_at: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    let mut fired: Vec<crate::sim_adv::runner::FiredEvent> = Vec::new();
+    crate::sim_adv::runner::apply_events(
+        &mut w,
+        &[Event::Disaster(NodeSel::Index(victim))],
+        20,
+        &mut fired,
+        &mut tracker,
+        &mut revive_at,
+        &classes,
+    );
+    assert_eq!(
+        w.eclipse.target,
+        Some(victim),
+        "the eclipse follows the victim"
+    );
+    assert_eq!(w.eclipse.silent_since, None, "the silence latch restarts");
+    assert!(
+        !w.eclipse.fired,
+        "the group gets its volley back at the new target"
+    );
+    assert_eq!(
+        (
+            w.eclipse.symbols_dropped,
+            w.eclipse.blocks_pushed_below_k_eff
+        ),
+        (0, 0),
+        "the cost ledger is reset — the old volley was spent on a different owner"
+    );
+    // A world with no eclipse (every non-A9 scenario) is untouched by the same code path.
+    let mut plain = controlled_world(12, 5);
+    let mut tracker = RestoreTracker::new(&sc.world);
+    let mut revive_at: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    let mut fired: Vec<crate::sim_adv::runner::FiredEvent> = Vec::new();
+    crate::sim_adv::runner::apply_events(
+        &mut plain,
+        &[Event::Disaster(NodeSel::Index(victim))],
+        20,
+        &mut fired,
+        &mut tracker,
+        &mut revive_at,
+        &classes,
+    );
+    assert_eq!(
+        plain.eclipse,
+        crate::sim_dynamic::generator::EclipseState::default(),
+        "no eclipse target ⇒ the disaster executor leaves the eclipse state alone"
+    );
 }

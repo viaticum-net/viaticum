@@ -25,11 +25,11 @@ use crate::sim_adv::cli::{SimAdvError, apply_dial};
 use crate::sim_adv::hetero::{DemandClass, HeteroReport, HeteroTracker, apply_demand_classes};
 use crate::sim_adv::inflow::{PopSeries, apply_inflow, bootstrap_n0, present_count};
 use crate::sim_adv::metrics::{
-    MetricSet, cartel_earnings_split, collect_metrics, newcomer_decodable_fraction,
-    overall_floor_durability,
+    EclipseCost, MetricSet, cartel_earnings_split, collect_eclipse_cost, collect_metrics,
+    newcomer_decodable_fraction, overall_floor_durability,
 };
 use crate::sim_adv::predators::{
-    AdvMetrics, RunMode, collect_adv_metrics, fold_cap_ratio, inject_adversaries,
+    AdvMetrics, RunMode, a9_arm_label, collect_adv_metrics, fold_cap_ratio, inject_adversaries,
     inject_incumbent_cartel, install_adv_uptime, observe_adv_aggregates, observe_cap_ratio,
     twin_dial_override,
 };
@@ -115,6 +115,12 @@ pub struct RunResult {
     /// floor-fill PROXY at the horizon (NOT decodability — see `metrics::overall_floor_durability`)
     /// that INV-PROVIDER-EXIT-FLOOR reads and the provider-frac sweep tracks.
     pub per_seed_overall_durability: Vec<f64>,
+    /// Per-seed A9 ECLIPSE COST (`4r_a9_spec.md` §4.1), seed-indexed: the symbols the eclipse group
+    /// burned and the target blocks it pushed below `k_eff`. All-zero for a non-A9 scenario (the
+    /// channel is unused there — and an all-zero cost is also the honest reading of "no eclipse
+    /// happened"). The DAMAGE half of the CROWN-1 price lives in `per_seed_restore`; this is the
+    /// EFFICIENCY half (symbols burned per kill).
+    pub per_seed_eclipse: Vec<EclipseCost>,
 }
 
 /// All per-seed outputs of one seed run (kept as a struct so the growing set of optional
@@ -156,6 +162,9 @@ pub(crate) struct SeedRun {
     /// scenario, else `NaN` (a non-provider-exit scenario carries no post-exit cut). The floor-fill
     /// PROXY INV-PROVIDER-EXIT-FLOOR reads + the provider-frac sweep tracks.
     pub overall_durability: f64,
+    /// The A9 eclipse COST (`4r_a9_spec.md` §4.1) for an eclipse scenario, else the all-zero
+    /// default (no eclipse ran).
+    pub eclipse: EclipseCost,
 }
 
 /// A predator run paired with its matched honest twin (same seed, same construction, hooks
@@ -191,9 +200,20 @@ impl EventQueue {
 /// Deterministic; `Random` draws off a dedicated salted stream so it never perturbs the
 /// engine's placement/PoS/churn draws. `classes` is the per-node demand-class assignment
 /// (read only by `FirstDemandArchetype`).
-fn resolve_nodesel(world: &World, sel: NodeSel, classes: &[DemandClass]) -> Vec<usize> {
+///
+/// **An INJECTED PREDATOR is never selectable (A9).** A scripted world event models something
+/// happening to the honest population (a house burns down, a provider pulls out); an injected
+/// predator's fate is its hook's business, not a script's. Without this rule the A9 world picks its
+/// own eclipse group's node as the disaster victim on seed 42: `inject_adversaries` forces every
+/// predator slot to `Reliable, joined_tick = 0, present`, which is exactly what
+/// `FirstTierArchetype`'s earliest-established scan looks for, and on the seeds where no HONEST
+/// T1/Reliable node joined at t=0 the group wins the tie — the eclipse would attack itself.
+/// This filter is a strict NO-OP for every pre-A9 scenario: none of them carries BOTH an `adv` role
+/// and a node-selecting event (the DR scenarios have no adversaries; the predator scenarios script
+/// no Disaster; A10's ProviderExit world is adversary-free).
+pub(crate) fn resolve_nodesel(world: &World, sel: NodeSel, classes: &[DemandClass]) -> Vec<usize> {
     let n = world.nodes.len();
-    let present = |i: usize| i < n && world.nodes[i].present;
+    let present = |i: usize| i < n && world.nodes[i].present && world.adv[i].is_none();
     match sel {
         NodeSel::Index(i) => {
             if present(i) {
@@ -391,9 +411,40 @@ fn strike_victim(
     classes: &[DemandClass],
 ) {
     let class = classes.get(victim).copied().unwrap_or(DemandClass::M);
+    // A9 (`4r_a9_spec.md` §2.3): RE-POINT the eclipse at the ACTUAL disaster victim. The target is
+    // resolved at BOOTSTRAP (arms A and C need it before the disaster tick — a blind schedule that
+    // fires at t=40 must have someone to fire at), from the SAME selector the Disaster uses, so the
+    // two normally agree. They can drift on one thing: the bootstrap winner may CHURN OUT before the
+    // disaster tick, after which the selector picks a different node. Re-pointing keeps the eclipse
+    // on the node whose restore-truth is actually being measured — and resets the silence latch +
+    // the cost counters, so the reported symbols/kills are the ones spent on THIS victim (a volley
+    // fired earlier at a node that then departed is not part of this measurement). Guarded on an
+    // already-set target, so every non-A9 scenario is untouched (its `eclipse.target` is `None`).
+    if let Some(prev) = world.eclipse.target
+        && prev != victim
+    {
+        world.eclipse.target = Some(victim);
+        world.eclipse.silent_since = None;
+        world.eclipse.fired = false;
+        world.eclipse.symbols_dropped = 0;
+        world.eclipse.blocks_pushed_below_k_eff = 0;
+    }
     disaster_strike(world, victim);
     tracker.on_disaster(world, victim, tick, class);
     revive_at.entry(tick + 1).or_default().push(victim);
+}
+
+/// A9 (`4r_a9_spec.md` §2.3): the scenario's ECLIPSE selector — the `NodeSel` of its FIRST Disaster
+/// (plain or correlated). The eclipse target IS the disaster victim (spec: same node, all three
+/// arms, so the arm comparison is clean); deriving it from the event rather than from a second
+/// scenario field keeps the two from ever disagreeing by construction. `None` when the scenario
+/// scripts no disaster (then there is nothing to eclipse).
+pub(crate) fn eclipse_selector(scenario: &Scenario) -> Option<NodeSel> {
+    scenario.events.iter().find_map(|(_, ev)| match ev {
+        Event::Disaster(sel) => Some(*sel),
+        Event::CorrelatedDisaster { sel, .. } => Some(*sel),
+        _ => None,
+    })
 }
 
 /// Build a scenario's t=0 world: `build_world` + the opt-in tier / demand / uptime / inflow
@@ -547,12 +598,26 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     } else {
         Vec::new()
     };
+    // A9 (`4r_a9_spec.md` §2.3): the ECLIPSE TARGET is the scenario's Disaster victim, resolved
+    // EARLY (see the per-tick latch in the loop below) rather than at the Disaster — arms A and C
+    // must have someone to attack BEFORE the disaster tick, and a blind schedule that fires at
+    // t = 40 with no target is not an arm, it is a no-op. Left `None` for every non-A9 scenario ⇒
+    // `engine::adv_eclipse_drops` is a strict no-op there (byte-identical honest path).
+    let is_eclipse = scenario
+        .adversaries
+        .iter()
+        .any(|a| a.id == AdvId::A9EclipseTargeter);
+    let eclipse_sel = if is_eclipse {
+        eclipse_selector(scenario)
+    } else {
+        None
+    };
     // The Attack-ROI (parked / cap-ratio / consumed-vs-served) channel is meaningful only for a
-    // twin-compared predator scenario. A15 enclosure + A7 sybil-farm are world-cuts, NOT twin
-    // comparisons, so they do NOT populate the Attack-ROI read — leaving `sr.adv = None` (and
-    // `per_seed_adv = None` in `run`), which keeps the determinism board's adv-channel check
+    // twin-compared predator scenario. A15 enclosure + A7 sybil-farm + A9 eclipse are world-cuts,
+    // NOT twin comparisons, so they do NOT populate the Attack-ROI read — leaving `sr.adv = None`
+    // (and `per_seed_adv = None` in `run`), which keeps the determinism board's adv-channel check
     // consistent (both the run and its re-run carry `None`).
-    let track_adv_roi = !adv_nodes.is_empty() && !is_enclosure && !is_sybil_farm;
+    let track_adv_roi = !adv_nodes.is_empty() && !is_enclosure && !is_sybil_farm && !is_eclipse;
     // Phase-2a-2 (A3 флаппер): install the mode-differentiated flapper uptime profile on the A3
     // slots — bursty Seasonal (predator) vs mean-matched iid Ragged (twin). No-op for every other
     // predator id (they keep their archetype uptime); leaves the non-A3 slots untouched.
@@ -637,6 +702,26 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
                 a5_survivors = Some(deep.iter().map(|&d| parked_own_symbols(&world, d)).sum());
             }
         }
+        // (a-) A9: keep the eclipse target on the CURRENT DR-primary owner until the disaster
+        //      pins it. Re-resolved every pre-disaster tick rather than latched once at t=0 for two
+        //      measured reasons: under the incremental join schedule (`n0_frac = 0.20`) a seed can
+        //      have NO candidate present at t=0 at all, and a candidate latched at t=0 can CHURN
+        //      OUT before the disaster (seed 42: the t=0 winner had departed by tick 60) — either
+        //      way a once-latched target is a node the disaster will not strike, so the blind arms
+        //      would be firing at the wrong owner. Re-resolving keeps them on "whoever is the
+        //      network's DR-primary backbone right now", which is what a blind attacker picks, and
+        //      makes target == victim at the disaster tick by construction. `.or(previous)` so a
+        //      momentarily empty resolution never CLEARS a good target. Stops once the disaster
+        //      fires (`tracker.is_active()`): from then on `strike_victim` owns the target. Pure
+        //      scan, no RNG (determinism preserved).
+        if !tracker.is_active()
+            && let Some(sel) = eclipse_sel
+        {
+            world.eclipse.target = resolve_nodesel(&world, sel, &classes)
+                .first()
+                .copied()
+                .or(world.eclipse.target);
+        }
         // (a) return any victim whose window starts this tick (present=true, empty disk).
         if let Some(victims) = revive_at.remove(&t) {
             for v in victims {
@@ -709,7 +794,12 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
     }
 
     let restore = if tracker.is_active() {
-        Some(tracker.finalize())
+        // A9 / NOTE-5: stamp the arm the restore-truth was scored under (`"dr_card"` /
+        // `"own_silence"` / `"own_schedule"`), which is exactly what the field was introduced for.
+        // `"none"` for every non-A9 scenario (unchanged output).
+        let mut rt = tracker.finalize();
+        rt.info_model = a9_arm_label(&scenario.adversaries);
+        Some(rt)
     } else {
         None
     };
@@ -800,6 +890,8 @@ pub(crate) fn run_one_seed_mode(scenario: &Scenario, seed: u64, mode: RunMode) -
         farm_honest_storage,
         farm_honest_reciprocity,
         overall_durability,
+        // A9: the eclipse COST the engine attributed at the drop (all-zero when no eclipse ran).
+        eclipse: collect_eclipse_cost(&world),
     }
 }
 
@@ -868,7 +960,14 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         .adversaries
         .iter()
         .any(|a| a.id == AdvId::A7SybilFarm);
-    let needs_twin = !scenario.adversaries.is_empty() && !is_enclosure && !is_sybil_farm;
+    // A9 (eclipse) is a THREE-ARM world-cut (each arm its own scenario; the controls are the
+    // count = 0 run and the disarmed-watch A/B), so it needs no twin either.
+    let is_eclipse = scenario
+        .adversaries
+        .iter()
+        .any(|a| a.id == AdvId::A9EclipseTargeter);
+    let needs_twin =
+        !scenario.adversaries.is_empty() && !is_enclosure && !is_sybil_farm && !is_eclipse;
     // Per seed: the predator run + (for a twin-compared adversary scenario) its matched twin's
     // Attack-ROI.
     let outcomes: Vec<(SeedRun, Option<AdvMetrics>)> = seeds
@@ -897,6 +996,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
     let mut per_seed_farm_storage = Vec::with_capacity(outcomes.len());
     let mut per_seed_farm_reciprocity = Vec::with_capacity(outcomes.len());
     let mut per_seed_overall_durability = Vec::with_capacity(outcomes.len());
+    let mut per_seed_eclipse = Vec::with_capacity(outcomes.len());
     for (sr, twin_adv) in outcomes {
         per_seed.push(sr.metrics);
         fired.push(sr.fired);
@@ -910,6 +1010,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_farm_storage.push(sr.farm_honest_storage);
         per_seed_farm_reciprocity.push(sr.farm_honest_reciprocity);
         per_seed_overall_durability.push(sr.overall_durability);
+        per_seed_eclipse.push(sr.eclipse);
         per_seed_adv.push(match (sr.adv, twin_adv) {
             (Some(pred), Some(twin)) => Some(AdvPair { pred, twin }),
             _ => None,
@@ -932,6 +1033,7 @@ pub fn run(scenario: &Scenario, seeds: &[u64]) -> RunResult {
         per_seed_farm_storage,
         per_seed_farm_reciprocity,
         per_seed_overall_durability,
+        per_seed_eclipse,
     }
 }
 

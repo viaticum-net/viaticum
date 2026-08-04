@@ -459,6 +459,14 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             .first()
                             .map(|d0| d0.to_bits() == sr.overall_durability.to_bits())
                             .unwrap_or(false);
+                        // The A9 eclipse COST (symbols burned / blocks killed) must re-run
+                        // bit-identical too — it feeds the CROWN-1 price table. Integer-valued,
+                        // so plain equality is exact.
+                        let eclipse_eq = result
+                            .per_seed_eclipse
+                            .first()
+                            .map(|e0| *e0 == sr.eclipse)
+                            .unwrap_or(false);
                         metrics_eq
                             && restore_eq
                             && calib_eq
@@ -471,6 +479,7 @@ pub fn evaluate_board(scenario: &Scenario, result: &RunResult) -> Vec<Verdict> {
                             && farm_eq
                             && farm_recip_eq
                             && overall_eq
+                            && eclipse_eq
                     }
                     None => false,
                 };

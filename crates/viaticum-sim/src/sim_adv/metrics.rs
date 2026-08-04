@@ -217,10 +217,11 @@ pub fn block_decodable_fraction(world: &World, k_eff: usize) -> Decodability {
 /// The alive symbols of ONE block on PRESENT holders — **CREAM INCLUDED**, because erasure
 /// decode does not know the floor/cream label. THE decodability primitive: every "is this
 /// block still reconstructible" read ([`block_decodable_fraction`],
-/// [`newcomer_decodable_fraction`]) counts through here, so the two can never drift apart.
+/// [`newcomer_decodable_fraction`], and the A9 eclipse's lethal predicate + kill attribution in
+/// `sim_dynamic::engine::adv_eclipse_drops`) counts through here, so they can never drift apart.
 /// (The non-cream FILL reads — [`overall_floor_durability`] and `collect_metrics`'s
 /// `durability` — deliberately do NOT: they measure a different thing.)
-fn alive_symbols(world: &World, owner: usize, block_id: usize) -> usize {
+pub(crate) fn alive_symbols(world: &World, owner: usize, block_id: usize) -> usize {
     (0..world.nodes.len())
         .filter(|&h| {
             world.nodes[h].present
@@ -509,6 +510,52 @@ pub fn farm_honest_served(world: &World, farm: &[usize]) -> f64 {
         }
     }
     sum
+}
+
+/// World-v3 phase-3 A9 (`4r_a9_spec.md` §4.1) god-view EVALUATOR read of the eclipse's COST.
+/// Read straight off the engine's `world.eclipse` bookkeeping, which attributes both numbers AT
+/// the drop itself. Never a decision input.
+///
+/// ⚠ **`blocks_pushed_below_k_eff` is NOT a damage unit (review BLOCK-2).** It counts blocks the
+/// volley drove under `k_eff` AT THE MOMENT OF THE DROP. Whether that costs the owner anything
+/// depends entirely on when it happened:
+/// * **before the disaster** — the owner still has its source, so repair restores every one of
+///   them (arm A: 3 blocks pushed, restore-truth 1.0000 on 5/5 seeds — P1 working as documented);
+/// * **inside the restore window at `detect = 0`** — terminal (4 blocks pushed, Δ = 0.27-0.33);
+/// * **inside the window at `detect = 1`** — the victim's first collection pass has already run,
+///   so MORE blocks get pushed (6) for EXACTLY ZERO damage.
+///
+/// So this counter must never be compared across arms as if it were harm, and
+/// `symbols_per_block_pushed` is an efficiency read ONLY between arms whose volleys land in the
+/// same tick (B vs C). Arm A's ratio prices blocks that cost the victim nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EclipseCost {
+    /// Alive symbols of the target the group burned over the run.
+    pub symbols_dropped: usize,
+    /// Target blocks the drop pushed from `≥ k_eff` alive symbols to `< k_eff` **at the volley**.
+    /// See the type doc: this is a volley-time count, NOT damage.
+    pub blocks_pushed_below_k_eff: usize,
+}
+
+impl EclipseCost {
+    /// Symbols burned per block pushed below `k_eff`. `NaN` when nothing was pushed (an attack
+    /// that burned symbols for nothing has no finite ratio — reported as NaN rather than as a
+    /// flattering 0). Comparable BETWEEN ARMS ONLY when their volleys land in the same tick.
+    pub fn symbols_per_block_pushed(&self) -> f64 {
+        if self.blocks_pushed_below_k_eff == 0 {
+            f64::NAN
+        } else {
+            self.symbols_dropped as f64 / self.blocks_pushed_below_k_eff as f64
+        }
+    }
+}
+
+/// Read one run's [`EclipseCost`] off the horizon world (pure god-view read, no mutation).
+pub fn collect_eclipse_cost(world: &World) -> EclipseCost {
+    EclipseCost {
+        symbols_dropped: world.eclipse.symbols_dropped,
+        blocks_pushed_below_k_eff: world.eclipse.blocks_pushed_below_k_eff,
+    }
 }
 
 /// Mean and SAMPLE standard deviation (n−1) over the FINITE values (NaN skipped). The

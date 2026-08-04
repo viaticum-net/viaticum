@@ -157,6 +157,11 @@ pub fn format_report(scenario: &Scenario, result: &RunResult, verdicts: &[Verdic
         o.push_str(&section);
     }
 
+    // --- eclipse (A9): the CROWN-1 attack cost (symbols burned / blocks killed / per kill) ---
+    if let Some(section) = format_eclipse(result) {
+        o.push_str(&section);
+    }
+
     // --- inflow (4r_inflow_spec.md §3): the present-count population curve + stationarity band ---
     if let Some(section) = format_population(result) {
         o.push_str(&section);
@@ -890,6 +895,65 @@ fn format_provider_exit(result: &RunResult) -> Option<String> {
     let _ = writeln!(
         o,
         "   'could the owner still reconstruct it' — the honest restorability read.)"
+    );
+    let _ = writeln!(o);
+    Some(o)
+}
+
+/// Render the ECLIPSE (A9, `4r_a9_spec.md` §4.1) section: the attack's COST — symbols the eclipse
+/// group burned, target blocks it pushed below `k_eff`, and the efficiency (symbols per kill). The
+/// DAMAGE half of the CROWN-1 price is the restore-truth section above (stamped with the arm label
+/// in `RestoreTruth::info_model`); this is the EFFICIENCY half, which is where a card that buys
+/// precision rather than kills shows up. `None` when no eclipse ran (every other report unchanged).
+fn format_eclipse(result: &RunResult) -> Option<String> {
+    if result
+        .per_seed_eclipse
+        .iter()
+        .all(|e| e.symbols_dropped == 0 && e.blocks_pushed_below_k_eff == 0)
+    {
+        return None;
+    }
+    let mut o = String::new();
+    let arm = result
+        .per_seed_restore
+        .iter()
+        .flatten()
+        .map(|r| r.info_model)
+        .next()
+        .unwrap_or("none");
+    let _ = writeln!(
+        o,
+        "-- eclipse (A9 × CROWN-1): attack cost, arm = {arm} (mean ± σ over seeds) --"
+    );
+    let dropped: Vec<f64> = result
+        .per_seed_eclipse
+        .iter()
+        .map(|e| e.symbols_dropped as f64)
+        .collect();
+    let killed: Vec<f64> = result
+        .per_seed_eclipse
+        .iter()
+        .map(|e| e.blocks_pushed_below_k_eff as f64)
+        .collect();
+    let (m, s) = mean_sigma(&dropped);
+    let _ = writeln!(o, "  symbols burned                  {:>8.2} ± {:.2}", m, s);
+    let (m, s) = mean_sigma(&killed);
+    let _ = writeln!(o, "  victim blocks pushed < k_eff    {:>8.2} ± {:.2}", m, s);
+    // POOLED ratio (Σ symbols / Σ blocks), the same estimator the price-table test uses (review W5).
+    // A mean of per-seed ratios is NOT interchangeable: seeds that burned symbols and pushed
+    // nothing contribute NaN and drop out, which flatters the attacker (measured on arm C: 4.17
+    // vs the pooled 6.00). One estimator, pooled, everywhere.
+    let sum_dropped: f64 = dropped.iter().sum();
+    let sum_killed: f64 = killed.iter().sum();
+    let pooled = if sum_killed > 0.0 {
+        sum_dropped / sum_killed
+    } else {
+        f64::NAN
+    };
+    let _ = writeln!(
+        o,
+        "  symbols per block pushed        {:>8.2}          (POOLED Σ/Σ; NOT a damage unit)",
+        pooled
     );
     let _ = writeln!(o);
     Some(o)

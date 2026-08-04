@@ -176,6 +176,9 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
         // runner fills it opt-in for a tiered scenario. An all-`None` layer keeps `node_online`
         // / `node_surfaced_in_window` on the exact archetype path (byte-identical honest anchor).
         uptime: vec![None; n],
+        // World-v3 phase-3 A9 eclipse state: no target ⇒ `engine::adv_eclipse_drops` returns
+        // immediately, so every non-A9 world is byte-identical to the pre-A9 path.
+        eclipse: crate::sim_dynamic::generator::EclipseState::default(),
     }
 }
 

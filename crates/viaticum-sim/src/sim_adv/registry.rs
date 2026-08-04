@@ -247,6 +247,125 @@ const A10_PROVIDER_FRAC: f64 = 0.15;
 /// FINDING.
 const A10_FLOOR_X: f64 = 0.20;
 
+// ============================================================
+// A9 eclipse-targeter × CROWN-1 (`4r_a9_spec.md`) — constants FROZEN in code BEFORE the run
+// (anti-Goodhart). The calibration test `a9_eclipse_calibration_*` prints the runtime numbers
+// (the group's share of the victim's alive symbols at the disaster tick, the per-block alive
+// distribution, and the LETHALITY FRONTIER over the group-size sweep) that justify each. The bar
+// `A9_FLOOR_X` is BORROWED, never calibrated.
+// ============================================================
+
+/// The disaster tick (as `dr_battle` / A10 @ 60): a mature world, far from the horizon.
+const A9_DISASTER_TICK: u64 = 60;
+
+/// The recovery horizon (weekly ticks) — the `dr_battle` horizon, restore window well inside it.
+const A9_HORIZON: u64 = 130;
+
+/// The HONEST population size (as `dr_battle`). The eclipse group is ADDED on top
+/// (`n_nodes = A9_HONEST_N + G`), it does not eat into it.
+///
+/// **This is load-bearing, and it is a MEASURED correction, not a preference.** With the group
+/// repurposing the last slots of a fixed n = 100 world (the `inject_adversaries` default), G = 30
+/// removes 30 honest nodes AND forces them all to `joined_tick = 0, Reliable, present` — i.e.
+/// exactly the profile the DR-primary selector hunts for. Measured consequence on seed 42: the
+/// remaining honest earliest-established T1/Reliable owner never got a single block to
+/// `target_ever_met` by the disaster tick, so restore-truth had an EMPTY denominator (`U = NaN`,
+/// `blocks = 0`) — a void measurement, not a strong attack. Adding the group instead keeps the
+/// honest world the size the DR scenarios calibrated on.
+const A9_HONEST_N: usize = 100;
+
+/// Arm A (blind schedule): the ONE tick the blind group fires on — 20 ticks BEFORE the disaster,
+/// so the owner (still alive, still holding its source) simply repairs the loss and the volley
+/// lands nowhere near the DR window. That IS the naive blind arm. See
+/// `predators::a9_eclipse_targeter_hook` for why it is a one-shot rather than a standing boycott.
+const A9_DROP_TICK: u64 = 40;
+
+/// Arm B (card): the tick the DR-card lethal watch is armed. 0 — the card works from the start;
+/// WHICH tick is lethal is the engine's read, and the fire is silence-gated exactly as arm C's.
+const A9_ARM_TICK: u64 = 0;
+
+/// Arms B/C: how many ticks a holder needs to NOTICE the target's silence. **FROZEN at 0** — the
+/// group acts inside the same weekly tick in which its owner stopped challenging.
+///
+/// This is the ⚠ model choice the spec flagged for review (the spec froze 1), and the honest
+/// account of it is **not** the one an earlier draft of this comment gave ("the loop order already
+/// charges the attacker a tick, so 1 would double-count") — review BLOCK-1 refuted that. What the
+/// runner actually does: it observes the restore window at the TOP of a tick and steps the engine
+/// after it, so `detect = 0` charges the attacker NO latency at all, while `detect = 1` makes it
+/// lose an intra-tick tie-break that a bookkeeping convention decides. **The model does not
+/// resolve this race.** Neither value is neutral, and the choice is worth a decision rather than a
+/// derivation.
+///
+/// 0 is kept for the BOARD on the standard security convention — measure against the STRONGEST
+/// admissible attacker, so a floor that holds means something — and because the sim's silence
+/// proxy is itself perfect (see `adv_eclipse_drops`), i.e. this arm is the upper bound, never the
+/// expected case. The real daemon's own analogue is `repair_detection_delay_max = 3` misses, so
+/// the realistic regime is closer to `detect ≥ 1`, where the measured damage is ZERO.
+/// **⭐ THE SENSITIVITY IS THE FINDING, not the `detect = 0` row.** Both values are MEASURED by
+/// `a9_eclipse_calibration_prints_group_share_and_lethality_frontier` (G = 40, seeds 42..46,
+/// Δ = the disarmed control's restore-U minus the arm's):
+///
+/// | detect | arm C (blind on silence) | arm B (DR-card) |
+/// |---|---|---|
+/// | 0 | Δ = 0.3333, burned 24, pushed 4 | Δ = 0.2667, burned 8, pushed 4 |
+/// | 1 | **Δ = 0.0000**, burned 23, pushed **6** | **Δ = 0.0000**, burned 14, pushed **6** |
+///
+/// At `detect = 1` both arms burn comparable symbols and push MORE blocks below `k_eff` (6 vs 4)
+/// while changing the flagship metric by exactly NOTHING — the victim's first collection pass has
+/// already run. **The whole measured harm of an eclipse, with or without the leak, lives inside a
+/// one-tick race**, and losing that race by a single tick is worth more to the victim than every
+/// symbol the attacker holds. Note also that the efficiency gap the leak buys shrinks with the
+/// same dial (3.00× at `detect = 0`, 1.64× at 1), so it is not a stable property either.
+const A9_SILENCE_DETECT_TICKS: u64 = 0;
+
+/// The eclipse group size G. **CALIBRATED then FROZEN** by the spec's own §3.1 rule — the smallest
+/// swept G at which the group is LETHAL on at least one block on at least 3 of the 5 frozen seeds.
+/// Measured at the disaster tick by `a9_eclipse_calibration_prints_group_share_and_lethality_frontier`
+/// (group share of the victim's alive symbols → lethal blocks / seeds):
+///
+/// | G | share of the network | group's share of the victim's alive symbols | lethal blocks | seeds |
+/// |---|---|---|---|---|
+/// | 5 | 4.8 % | 0.060 | 0 | 0/5 |
+/// | 10 | 9.1 % | 0.207 | 1 | 1/5 |
+/// | 20 | 16.7 % | 0.229 | 0 | 0/5 |
+/// | 30 | 23.1 % | 0.181 | 1 | 1/5 |
+/// | **40** | **28.6 %** | **0.371** | **4** | **3/5** |
+/// | 50 | 33.3 % | 0.423 | 3 | 3/5 |
+///
+/// **Read the frontier honestly: it is HIGH.** Being lethal on a block means holding all but
+/// `k_eff − 1` of its 2-7 distinct holders, and the placement spreads one symbol per holder, so an
+/// eclipse recruited by honest service needs on the order of a THIRD of the network before it can
+/// make even one block of one victim undecodable. The share column is noisy at small G (0.229 at
+/// G = 20 vs 0.181 at G = 30 — the target and its widths differ per seed), so the frontier is
+/// bracketed by the sweep rather than resolved to a single node.
+const A9_GROUP_G: usize = 40;
+
+/// The `DrCard` payload for arm B. **A SENTINEL, not a node index**: the declared card's subject is
+/// "this scenario's disaster victim", which is not knowable at registry-build time — and handing a
+/// resolved victim index to the hook would put a god-view read inside the first-hand
+/// [`crate::sim_adv::scenario::AdvContext`]. The engine resolves the real target into
+/// `world.eclipse.target`; the A9 hook never reads this field (it only matches on the VARIANT to
+/// pick its arm).
+const A9_CARD_SUBJECT: usize = usize::MAX;
+
+/// INV-ECLIPSE-DR-FLOOR threshold X. ⭐ **BORROWED, never derived from an A9 measurement** — it is
+/// the same round 0.60 semantic bar that already stands on INV-RESTORE-SANITY / INV-DR-BATTLE-FLOOR
+/// / INV-ENCLOSURE-FLOOR: *FAIL if more than 40 % of the victim's once-durable blocks became
+/// unrestorable*. Being borrowed is what makes it anti-Goodhart BY CONSTRUCTION: no A9 number went
+/// into choosing it. Calibrate the SCENARIO (G, the ticks), NEVER this bar. A FAIL on the card arm
+/// while the blind arm holds is not a reason to move it — that difference IS the headline price of
+/// CROWN-1, in Ilya's own semantic units.
+///
+/// **MEASURED (G = 40, seeds 42..46), and the bar was NOT moved for it.** Per-seed restore-U:
+/// arm A (blind schedule) `[1, 1, 1, 1, 1]` — clears the bar everywhere, because the volley landed
+/// while the owner still held its source and P1 repair undid it; arm C (blind on silence)
+/// `[0.333, 0.333, 0.667, 1, 1]` — BELOW the bar on two seeds; arm B (DR-card)
+/// `[0.667, 0.333, 0.667, 1, 1]` — below on one. The board row is mean-based and power-gated, so it
+/// reads INCONCLUSIVE (arm B: mean 0.7333, σ 0.2789, power 0.48) rather than FAIL; the per-seed
+/// breach is asserted directly by
+/// `a9_dr_floor_holds_for_the_blind_arm_and_breaks_in_the_timed_arms`.
+const A9_FLOOR_X: f64 = 0.60;
+
 /// Every registered scenario (hard-coded like `Archetype::ALL`).
 pub fn all_scenarios() -> Vec<Scenario> {
     vec![
@@ -269,6 +388,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
         a15_enclosure(),
         a7_sybil(),
         a10_provider_exit(),
+        a9_eclipse_blind(),
+        a9_eclipse_silence(),
+        a9_eclipse_drcard(),
     ]
 }
 
@@ -1406,6 +1528,197 @@ fn a10_provider_exit_invariants() -> Vec<Invariant> {
                 dir: Direction::GreaterThan,
             },
             threshold: A10_FLOOR_X,
+        },
+    ]
+}
+
+// ============================================================
+// A9 — eclipse-targeter × CROWN-1 (`4r_a9_spec.md`): three arms, ONE bar.
+// ============================================================
+
+/// The shared A9 world: `dr_baseline`'s world + a Disaster on the T1/Reliable backbone at
+/// `A9_DISASTER_TICK`, plus an eclipse group of `A9_GROUP_G` exemplary holders. The three arms
+/// differ ONLY in the group's `info_model` + dials — same world, same seeds, same victim selector,
+/// same bar — so the arm-to-arm difference is the information model and nothing else.
+fn a9_scenario(
+    id: &'static str,
+    about: &'static str,
+    info_model: InfoModel,
+    dials: AdvDials,
+) -> Scenario {
+    Scenario {
+        id: ScenarioId(id),
+        about,
+        world: WorldParams {
+            n_nodes: A9_HONEST_N + A9_GROUP_G,
+            base: DynParams::default(),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: vec![AdvSpec {
+            id: AdvId::A9EclipseTargeter,
+            count: A9_GROUP_G,
+            info_model,
+            dials,
+        }],
+        // The SAME strike as `dr_baseline` (the DR-primary T1/Reliable backbone). The eclipse
+        // target is derived from THIS selector (`runner::eclipse_selector`), so victim and target
+        // are the same node by construction.
+        events: vec![(
+            A9_DISASTER_TICK,
+            Event::Disaster(NodeSel::FirstTierArchetype(
+                GiverTier::T1,
+                Archetype::Reliable,
+            )),
+        )],
+        horizon: A9_HORIZON,
+        seeds: vec![42, 43, 44, 45, 46],
+        metrics: vec![MetricId::RestoreTruth, MetricId::InvariantBoard],
+        verdicts: a9_eclipse_invariants(),
+        fast: false,
+    }
+}
+
+/// The A9 dials shared by all three arms (group size + the frozen ticks); each arm overrides the
+/// one or two fields that define it.
+fn a9_dials() -> AdvDials {
+    AdvDials {
+        group_size: A9_GROUP_G,
+        eclipse_arm_tick: A9_ARM_TICK,
+        eclipse_drop_tick: A9_DROP_TICK,
+        eclipse_silence_detect_ticks: A9_SILENCE_DETECT_TICKS,
+        ..AdvDials::default()
+    }
+}
+
+/// **A9 arm A — the BLIND SCHEDULE** (`4r_a9_spec.md` §1.3): `InfoModel::Own`, no silence signal.
+/// The group picks a DATE (`A9_DROP_TICK`, 20 ticks before the disaster) and dumps every symbol of
+/// the target it holds, once. The owner is still alive then, so P1 repair puts the redundancy back
+/// long before the DR window — this is the NAIVE arm, and B-vs-A is the value of TIMING.
+pub fn a9_eclipse_blind() -> Scenario {
+    a9_scenario(
+        "a9_eclipse_blind",
+        "A9 arm A: an eclipse group of exemplary holders dumps the DR victim's symbols on a FIXED tick (blind schedule, 20 ticks before the disaster) — the naive arm the CROWN-1 price is measured against",
+        InfoModel::Own,
+        a9_dials(),
+    )
+}
+
+/// **A9 arm C — BLIND-ON-SILENCE** (`4r_a9_spec.md` §1.3, the spec author's ⚠ own addition, and the
+/// reason the price is honest): `InfoModel::Own`, but the fire is gated on the target having gone
+/// SILENT — a PRIMARILY-OBSERVABLE fact (my owner stopped sending PoS challenges) that needs no
+/// leak. It then dumps EVERYTHING it holds of the target. This is the STRONGEST blind arm, and it
+/// exists so the timing value of a freely-available signal is not mis-attributed to the leak: the
+/// leak is isolated by B-vs-C (the ONLY switch between them is `info_model`), never by B-vs-A.
+///
+/// ⚠ The sim's silence signal is STRONGER than the protocol one it stands for: it is a perfect
+/// clock on the disaster (zero latency at `detect = 0`, and zero false positives, since the flag
+/// it reads is set only by `disaster_strike`). A real holder infers silence from missing PoS
+/// challenges under `uptime < 1` — noisy and late. So arm C is an upper bound on blind timing.
+pub fn a9_eclipse_silence() -> Scenario {
+    a9_scenario(
+        "a9_eclipse_silence",
+        "A9 arm C: the same eclipse group fires when it NOTICES the victim went silent (a primarily-observable signal, no leak) and dumps everything — the STRONGEST blind arm, the headline's control",
+        InfoModel::Own,
+        AdvDials {
+            eclipse_on_silence: true,
+            ..a9_dials()
+        },
+    )
+}
+
+/// **A9 arm B — the DR CARD** (`4r_a9_spec.md` §1.2, the CROWN-1 leak): `InfoModel::DrCard`. Same
+/// group, same silence timing as arm C, but with the leaked per-block knowledge "how many symbols
+/// of this block are alive, and how many are mine". The engine drops ONLY where that makes the block
+/// undecodable (`engine::eclipse_lethal`) and keeps the rest. What the card can buy is therefore
+/// PRECISION (the same kills for fewer burned symbols, less silent-loss burn, a position kept for a
+/// second strike) rather than extra kills — dropping everything is a superset of dropping the lethal
+/// subset, so arm C's damage is ≥ arm B's BY CONSTRUCTION. Both numbers are reported.
+///
+/// **THE MEASUREMENT** (G = 40, seeds 42..46, `a9_crown1_price_table_across_three_arms`;
+/// damage = the disarmed control's restore-U minus the arm's; "pushed" = blocks driven below
+/// `k_eff` AT the volley, NOT a damage unit — see [`crate::sim_adv::metrics::EclipseCost`]):
+///
+/// | arm | mean U | damage | symbols burned | pushed | symbols/pushed |
+/// |---|---|---|---|---|---|
+/// | control (disarmed group) | 1.0000 | 0.0000 | 0 | 0 | — |
+/// | A blind schedule | 1.0000 | 0.0000 | 29 | 3 | 9.67 |
+/// | C blind on silence | 0.6667 | 0.3333 | 24 | 4 | 6.00 |
+/// | B DR-card | 0.7333 | 0.2667 | 8 | 4 | 2.00 |
+///
+/// **⚠ WHAT THIS DOES *NOT* ESTABLISH (review, and it is the important part).** "The card buys no
+/// extra damage" is NOT a measurement here — it is arithmetic. Arm B was deliberately given the
+/// SAME silence gate as arm C (without it, B-vs-C would confound the card with the timing signal),
+/// and from that moment B's drop set is a SUBSET of C's in the SAME tick, so `damage(C) ≥
+/// damage(B)` holds under any physics. The experiment could not have returned anything else.
+/// Δ = −0.0667 is, literally, ONE block on ONE seed out of a 15-block denominator, and the board
+/// row is INCONCLUSIVE (power 0.48).
+///
+/// The "3× cheaper" half is real but **dial- and handicap-conditioned**: it falls to 1.64× at
+/// `detect = 1`, and the card is held to ONE volley (`EclipseState::fired`) although a larger
+/// lethal set exists one tick later — a restriction that costs the blind arms nothing because they
+/// dump everything anyway. Two further modelling choices weaken the card specifically: its
+/// lethality predicate counts ALIVE symbols, while survival actually needs `k_eff` symbols
+/// COLLECTABLE IN THE WINDOW (a block left at exactly `k_eff` alive can still die — that is
+/// precisely C's extra block), and a real card-holder would also see the holder set's uptime.
+/// **⇒ the measured card is a LOWER bound on what the leak is worth, so nothing here licenses
+/// downgrading the CROWN-1 tech-debt.**
+///
+/// **What IS robustly measured (quotable):**
+/// * the **lethality frontier**: an eclipse recruited by ordinary service needs ≈29-33 % of the
+///   network to make ONE block of ONE victim undecodable (see [`A9_GROUP_G`]);
+/// * **arm A = zero damage on 5/5 seeds** — a volley before the disaster is fully repaired,
+///   because the owner still holds its source. P1 exactly as the doctrine states it;
+/// * **all eclipse harm lives inside a one-tick race** and vanishes at one tick of detection
+///   latency while MORE blocks get pushed below `k_eff` — see [`A9_SILENCE_DETECT_TICKS`].
+pub fn a9_eclipse_drcard() -> Scenario {
+    a9_scenario(
+        "a9_eclipse_drcard",
+        "A9 arm B: the same group WITH the CROWN-1 DR-card — drops only the per-block LETHAL subset, on the tick it becomes lethal — the priced arm",
+        InfoModel::DrCard {
+            target: A9_CARD_SUBJECT,
+        },
+        AdvDials {
+            eclipse_on_silence: true,
+            ..a9_dials()
+        },
+    )
+}
+
+/// The A9 board (`4r_a9_spec.md` §4.2) — the SAME three rows for all three arms, the SAME borrowed
+/// bar. No new `InvariantSpec` variant: restore-truth U over a Disaster is exactly what
+/// `RestoreStatistical` already evaluates, so the arms are compared on the house's own DR row.
+fn a9_eclipse_invariants() -> Vec<Invariant> {
+    vec![
+        Invariant {
+            id: "INV-DETERMINISM",
+            spec: InvariantSpec::Determinism,
+            threshold: 1.0,
+        },
+        Invariant {
+            id: "INV-ANTI-ORACLE",
+            spec: InvariantSpec::AntiOracle,
+            threshold: 1.0,
+        },
+        // INV-ECLIPSE-DR-FLOOR: an eclipse group recruited by HONEST service (no god-view forcing
+        // of the holder choice — the group simply accepts everything and is picked by the ordinary
+        // ranking) must not, by dropping synchronously inside the DR window, push the victim's
+        // restore-truth below the borrowed 0.60 bar. GreaterThan, power-gated (spec §10 п.16):
+        // power < 2 ⇒ INCONCLUSIVE, itself a legitimate outcome. A FAIL on the card arm while the
+        // blind arms hold is NOT a reason to move the bar — it IS the price of CROWN-1.
+        Invariant {
+            id: "INV-ECLIPSE-DR-FLOOR",
+            spec: InvariantSpec::RestoreStatistical {
+                measure: restore_u,
+                dir: Direction::GreaterThan,
+            },
+            threshold: A9_FLOOR_X,
         },
     ]
 }

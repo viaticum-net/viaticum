@@ -725,6 +725,56 @@ pub struct World {
     /// surfacing + restore transport); it drives no other draw and is god-view (not a kernel
     /// input). Assigned opt-in by the sim_adv runner ([`crate::sim_adv::uptime::UptimeMix`]).
     pub uptime: Vec<Option<UptimeProfile>>,
+    /// World-v3 phase-3 A9 (eclipse × CROWN-1) state. [`EclipseState::default`] (no target, no
+    /// silence latch, zero counters) on EVERY non-A9 path — the eclipse pass early-returns on a
+    /// `None` target, so the honest anchor is byte-identical. Filled by the sim_adv runner (the
+    /// target resolution) and by `engine::adv_eclipse_drops` (the silence latch + cost counters).
+    pub eclipse: EclipseState,
+}
+
+/// World-v3 phase-3 A9 (`4r_a9_spec.md`) eclipse state: WHO the eclipse group attacks, WHEN the
+/// primarily-observable silence signal started, and what the attack COST (the two per-run numbers
+/// the CROWN-1 price is expressed in). All god-view bookkeeping — the predator hook never sees it
+/// ([`crate::sim_adv::scenario::BehaviorHook`] takes only an `AdvContext`), the engine reads it,
+/// and the evaluator reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EclipseState {
+    /// The eclipse victim's node index — the scenario's Disaster victim, resolved runner-side
+    /// (never handed to a hook). `None` on every non-A9 scenario ⇒ the eclipse pass is a strict
+    /// no-op.
+    pub target: Option<usize>,
+    /// The tick the target first went SILENT (stopped challenging: absent, or its own blocks are
+    /// source-less `to_restore`). A LATCH: set on the first silent tick, cleared the moment the
+    /// target speaks again, so the detection delay is measured from the START of the silence.
+    pub silent_since: Option<u64>,
+    /// Whether the group has already fired its ONE synchronous volley at the current target.
+    ///
+    /// The eclipse is a single timed strike, not a standing campaign. Without this latch the
+    /// DR-card arm degenerates into a VULTURE: its per-block lethality check keeps passing for the
+    /// rest of the run as the source-less victim's blocks erode under ordinary churn, so it picks
+    /// them off dozens of ticks AFTER the restore window closed — kills that cost the attacker
+    /// symbols, count in the efficiency ledger, and change no measured damage whatsoever
+    /// (MEASURED before the latch existed: seed 42 reported `blocks_pushed_below_k_eff = 2` with restore-truth
+    /// still 1.0). That is a different attack (slow attrition), and mixing it in would have made
+    /// the arm-to-arm efficiency comparison meaningless. Reset when the target is re-pointed.
+    ///
+    /// ⚠ **The latch is symmetric in code but ASYMMETRIC in effect, and it handicaps the CARD
+    /// (review W1).** The blind arms dump everything they hold in one go, so a one-shot costs them
+    /// nothing. The card arm deliberately KEEPS most of its symbols — and is then forbidden to use
+    /// them, including inside the restore window, where a second opportunity demonstrably exists:
+    /// the lethal set at `disaster_tick + 1` is LARGER than at the strike tick (6 blocks pushed
+    /// below `k_eff` vs 4). So the card arm's headline "8 symbols burned" is latch-conditioned; a
+    /// card attacker allowed to re-fire within the window would burn more and push more. This is a
+    /// disclosed model handicap, not a property of the leak — see the scenario doc for what that
+    /// does to the claim.
+    pub fired: bool,
+    /// COST of the attack, part 1: how many ALIVE symbols of the target the group has burned.
+    pub symbols_dropped: usize,
+    /// COST of the attack, part 2: how many of the target's blocks the drop pushed from
+    /// `≥ k_eff` alive symbols to `< k_eff` **at the volley** — attributed AT the drop, not at the
+    /// horizon. ⚠ NOT a damage unit: see [`crate::sim_adv::metrics::EclipseCost`] (blocks pushed
+    /// before the disaster are repaired; blocks pushed one tick late cost the victim nothing).
+    pub blocks_pushed_below_k_eff: usize,
 }
 
 /// One R̂-calibration prediction (transche 0.3) — a GOD-VIEW metric row, never a kernel
