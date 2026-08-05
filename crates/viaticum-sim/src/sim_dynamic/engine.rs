@@ -38,8 +38,8 @@ use viaticum_core::four_r::{
 use crate::generator::Rng;
 use crate::sim_adv::scenario::{AdvAction, AdvContext, AdvId};
 use crate::sim_dynamic::generator::{
-    BlockPlacement, DAYS_PER_TICK, EvictNoticeKind, EvictionEvent, HeldSymbol, Node, OwnBlock,
-    PairCapital, PendingEviction, PredEntry, RepairStat, SilentLoss, World,
+    BlockPlacement, CandFriendEntry, DAYS_PER_TICK, EvictNoticeKind, EvictionEvent, HeldSymbol,
+    Node, OwnBlock, PairCapital, PendingEviction, PredEntry, RepairStat, SilentLoss, World,
 };
 use crate::sim_dynamic::observer::{self, ObsAddr};
 
@@ -239,6 +239,108 @@ pub struct DynParams {
     /// survival at the per-symbol ask on the horizon to be handed a symbol"; OPEN calibration,
     /// flagged for Ilya. `0` disables the credit cap.
     pub r_min: f64,
+    /// ⚗ **EXPERIMENT, NOT A SHIPPING PROPOSAL** (`4r_friend_circle_spec.md` §2.2, arm F-pref):
+    /// an OWNER-SIDE preference for holders the owner ALREADY SERVES — "put my data with the
+    /// peers whose data I keep". The owner's own observation `g_holder_from_owner > 0` is the whole
+    /// friend test (the observer's copy of `capital[owner][holder].g_ho`, whose index is pinned by
+    /// `p8_capital_index_matches_the_accrual_site_not_the_prose`: `capital[X][Y].g_ho` reads
+    /// "X served Y"), so the preference is RECIPROCITY, not a friend LIST — this dial gives the
+    /// design no notion of "these three specific machines".
+    ///
+    /// ⚠ SAY THAT PRECISELY (review W8). It does NOT mean the kernel cannot see identity: it can,
+    /// and it already acts on it. `FirstHandObs` carries `master_id` and `addr_subnet` first-hand,
+    /// and the kernel's §7 spread policy PARTITIONS candidates on them — `addr_subnet` by default,
+    /// `master_id` under `CapMode::MasterIdOnly`
+    /// (`the_placement_ranking_cannot_see_reciprocity_which_is_why_the_pref_dial_exists` (3)
+    /// demonstrates both). A named-peer policy is therefore **not implemented, and not reachable
+    /// through the RECIPROCITY handle** — the identity is carried, the policy that would read it
+    /// for this purpose is missing. "The trust kernel does not carry identity" is simply false and
+    /// must not be written.
+    ///
+    /// **THIS IS THE WORLD-SCOPE DIAL: it makes EVERY owner prefer.** The question it answers is
+    /// "what if the design shipped this for everyone". The product's own question — "**I** want my
+    /// backups on my friends' machines" — is the PER-ROLE dial
+    /// [`crate::sim_adv::scenario::AdvDials::friend_preference`], where four owners prefer and 116
+    /// do not. The friend-circle tranche runs both, separately labelled, because the first version
+    /// ran this one and reported it in the second one's words.
+    ///
+    /// **What it is allowed to do, and nothing more** (spec §2.2): it REORDERS the kernel's
+    /// already-ranked ADMISSIBLE candidates ([`place_incremental_rank`]'s output — Р-5
+    /// credit-capped, §7 bucket-deduped) inside `try_place_one_symbol`. It never admits a
+    /// candidate the kernel excluded, never widens/narrows a block, and never touches the
+    /// stopping criterion (the width loop still stops at `R̂ ≥ r_target`). The bound on how much
+    /// durability a promotion may cost is [`DynParams::friend_preference_margin`].
+    ///
+    /// **FLOOR ONLY, deliberately.** Cream keeps its strangers-first entry channel (§5½) — that
+    /// is a different mechanism with its own purpose, and overriding it would be a second design
+    /// change smuggled into this one. Consequence, measured and reported rather than hidden: the
+    /// circle's cream symbols stay spread, so the intra-group share this dial can reach has a
+    /// ceiling below 1.
+    ///
+    /// `false` (the DEFAULT) ⇒ the branch is skipped entirely and the placement path is
+    /// BYTE-IDENTICAL to the pre-tranche one (the `honest_v2` seed-42 anchor is the gate, exactly
+    /// as [`DynParams::giver_priority_order`]). Never enabled by any registered scenario except
+    /// the F-pref arms built in `tests.rs`.
+    ///
+    /// **MEASURED — AND THE MECHANISM IS THE OPPOSITE OF THE ONE FIRST REPORTED** (friend-circle
+    /// tranche, N = 4, B = 18, seeds 42..51, paired, ceiling margin):
+    /// * the switch is LIVE — on a hand-built world it demonstrably moves the symbol to the peer
+    ///   the owner serves (`friend_preference_dial_changes_which_holder_the_owner_picks`), writing
+    ///   the same capital cell with the dial OFF changes nothing, and at world scope it measurably
+    ///   raises the network's share of symbols on reciprocal pairs (+1.60 pp, t(9) = +3.34,
+    ///   p = 0.009);
+    /// * it does NOT bring the circle's data home. World scope: the circle's intra-share goes
+    ///   0.243 → 0.293 (Δ +0.050, p = 0.38 — not established) while its decodable fraction falls
+    ///   0.206 → 0.139 (t(9) = −2.66, **p = 0.026** — this one resolves, and is a COST at this one
+    ///   size in this one scope; the sign flips by N = 8). Circle-only scope: the intra-share goes
+    ///   0.243 → **0.119** (Δ −0.124, p = 0.21 — a direction, NOT established) and the placement
+    ///   share 0.096 → 0.076.
+    ///   ⚠ The margin sweep is monotone in the AWAY direction (0.164 / 0.147 / 0.132 / 0.119 at
+    ///   margins 0 / 0.01 / 0.10 / 1.0) and that is NOT evidence (review W4): the four arms share
+    ///   seeds and are NESTED — margin 0 promotes a subset of what the ceiling promotes — so an
+    ///   ordered column is close to structurally expected rather than four independent successes.
+    ///   The direction stands on its p alone, and its p says not established. What the sweep does
+    ///   show is that margin 0 is NOT a mild setting: below `k_eff` every candidate scores exactly
+    ///   0.0, so the "pure tie-break" is already friend-first for the first `k_eff` symbols of every
+    ///   block — F-open 0.243 → margin-0 0.164 is the sweep's largest single step, bigger than the
+    ///   three above it combined;
+    /// * ⭐ THE SELECTIVITY MEASUREMENT, and exactly what it can carry. The predicate IS selective:
+    ///   measured at DECISION TIME (`World::cand_friend_log`,
+    ///   `friend_fraction_of_the_admissible_set_says_whether_reciprocity_is_a_scarce_predicate`) an
+    ///   owner has served **14.8 %** of the ~91 candidates the kernel rules admissible — about
+    ///   thirteen peers, not ninety (seed 42; ± 5.3 pp ACROSS DECISIONS, not across seeds; the 116
+    ///   outsiders read 12.6 % over 1.8 · 10⁵ decisions in the same run).
+    ///   ⚠ The first version of this tranche claimed the opposite
+    ///   ("~92 % — reciprocity is not scarce") from P8's `share_a_pos`, which is a horizon,
+    ///   symbol-weighted read over SURVIVING placements and measures retention, not selectivity.
+    ///   The corrected conclusion is sharper: reciprocity is selective, but **it does not select
+    ///   friends**. Of the ~13 peers a circle member has served, at most 3 can be circle-mates, so
+    ///   **at least ten of every thirteen promotions go to strangers** and no margin of this handle
+    ///   can deliver "my backups with my three friends".
+    ///   ⚠ THAT IS AN EXPRESSIBILITY BOUND, NOT AN EXPLANATION OF THE MEASURED SIGN (review W3),
+    ///   and the first version of this doc used it as both. The relevant baseline is F-open's
+    ///   placement share of **0.096**, while the bound permits up to 3/13 ≈ 0.23 circle-mates —
+    ///   taken literally the arithmetic argues the dial should move data HOME. The measured drift
+    ///   is the other way, which implies circle-mates are ~1 of the 13 rather than 3. That is a
+    ///   quantity **this tranche has no instrument for**: the log counts how many admissible
+    ///   candidates are friends, never how many of those friends are circle-mates. Bound:
+    ///   established. Sign: measured, unexplained, and not established either (p = 0.21).
+    ///
+    /// Shipping this dial is therefore NOT proposed: it costs a branch on the hot placement path
+    /// and it expresses reciprocity, which is not the relation the product's question is about.
+    pub friend_preference: bool,
+    /// ⚗ The BOUND on [`DynParams::friend_preference`] (spec §2.2 "бонус ОГРАНИЧЕН"), in units of
+    /// the block's own survival estimate `R̂`: a friend is promoted ahead of a better-ranked
+    /// stranger only while its marginal `R̂(committed ∪ {friend})` is within this margin of the
+    /// BEST admissible candidate's. `0.0` ⇒ a pure TIE-BREAK (friends win only exact ties — which
+    /// includes the structural-zero regime below `k_eff`, where every candidate scores 0.0);
+    /// `1.0` ⇒ UNBOUNDED friend-first among the admissible set, i.e. the most preference this
+    /// design can express at all.
+    ///
+    /// Read ONLY when [`DynParams::friend_preference`] (the WORLD scope) is `true`. The per-role
+    /// scope carries its own bound, [`crate::sim_adv::scenario::AdvDials::friend_preference_margin`]
+    /// — same units, same meaning, so a role can prefer without the world doing so.
+    pub friend_preference_margin: f64,
     /// METRIC-LAYER handle (transche 0.3): the R̂-calibration OUTCOME horizon `H` in TICKS.
     /// When the prediction log is enabled ([`World::pred_log_enabled`]) the engine logs, at
     /// each successful placement, the node's OWN decision-horizon forecast `R̂_wc` (the same
@@ -343,6 +445,10 @@ impl Default for DynParams {
             // Р-5 (A.13 / §13): per-holder credit-cap floor — its OWN handle, guess 0.5,
             // NOT r_target (2b lesson). Was the hard-coded `0.5` in try_place_one_symbol.
             r_min: 0.5,
+            // ⚗ F-pref EXPERIMENT: OFF by default ⇒ the placement path is byte-identical to the
+            // pre-tranche one (the honest_v2 seed-42 anchor). The margin is inert while it is off.
+            friend_preference: false,
+            friend_preference_margin: 0.0,
             // Metric-layer R̂-calibration horizon (transche 0.3): 26 ticks ≈ half a year.
             pred_horizon_ticks: 26,
         }
@@ -1167,6 +1273,76 @@ fn try_place_one_symbol(
         place_incremental_rank(&req, &cand_obs, &already_obs, prior, policy)
     };
 
+    // ⚗ F-pref EXPERIMENT (`4r_friend_circle_spec.md` §2.2) — NOT a shipping proposal. An
+    // owner-side, BOUNDED preference for holders this owner ALREADY SERVES, applied ONLY as a
+    // reordering of the kernel's admissible ranked list and ONLY on the floor path (cream keeps
+    // its strangers-first entry channel).
+    //
+    // TWO SCOPES, two different questions (review W7):
+    // * [`DynParams::friend_preference`] — the WORLD dial: EVERY owner prefers. That measures
+    //   "what if the design shipped this for everyone", not "what if I want it".
+    // * [`crate::sim_adv::scenario::AdvDials::friend_preference`] — the PER-ROLE dial, declared by
+    //   the node's own behaviour hook: only the nodes carrying that role prefer. That is the
+    //   product's own question ("**I** want my backups on my friends' machines").
+    //
+    // With both off (the default, every registered scenario, and every honest node — the hook is
+    // never even consulted for a node with no adversary role) this whole block is skipped, so the
+    // placement path — and the honest_v2 seed-42 anchor — is byte-identical.
+    let pref_margin: Option<f64> = if cream {
+        None
+    } else if params.friend_preference {
+        Some(params.friend_preference_margin)
+    } else {
+        adv_action(world, owner, tick).and_then(|a| a.friend_preference)
+    };
+    // METRIC-LAYER (review W6), gated by [`World::cand_friend_log_enabled`] and consuming no RNG:
+    // the FRIEND FRACTION OF THE ADMISSIBLE SET AT DECISION TIME. "Is reciprocity scarce?" is a
+    // question about the choice the owner actually faces — how many of the candidates the kernel
+    // ruled admissible, right here, are peers this owner already serves — and no horizon-evaluated
+    // share of surviving placements can answer it (that one conflates "placed with a friend" with
+    // "later became a friend"). Floor only: cream is not what the preference reorders.
+    if world.cand_friend_log_enabled && !cream {
+        let friends = ranked
+            .iter()
+            .filter(|&&local| cand_obs[local].g_holder_from_owner > 0.0)
+            .count() as u32;
+        world.cand_friend_log.push(CandFriendEntry {
+            owner,
+            tick,
+            friends,
+            admissible: ranked.len() as u32,
+        });
+    }
+    let ranked = if let Some(margin) = pref_margin {
+        // Re-score the ranked subset with the SAME kernel call `place_incremental_rank` ranked
+        // on (`estimate_block_survival(committed ∪ {cand})`) — one physics, no second estimator.
+        // `friend_preference_order_matches_the_kernel_ranking_it_reorders` pins that this
+        // recompute reproduces the kernel's own order when the preference is neutral.
+        //
+        // The friend test reads the OWNER'S OWN OBSERVATION of the pair
+        // (`FirstHandObs::g_holder_from_owner`, observer.rs — "I have served this holder"), not
+        // `world.capital[owner][holder]` directly. The two carry the same number, but the
+        // observation is the boundary every other decision site goes through, and since
+        // `InvariantSpec::AntiOracle` is a structural (hard-coded) verdict, that boundary is the
+        // only thing that makes the anti-oracle claim checkable at all (review W13).
+        let scored: Vec<(usize, bool, f64)> = ranked
+            .iter()
+            .map(|&local| {
+                let friend = cand_obs[local].g_holder_from_owner > 0.0;
+                let mut ext = already_obs.clone();
+                ext.push(cand_obs[local].clone());
+                (
+                    local,
+                    friend,
+                    estimate_block_survival(&ext, prior, &req, policy),
+                )
+            })
+            .collect();
+        friend_preference_order(&scored, margin)
+    } else {
+        ranked
+    };
+
     // R̂-calibration (metric-only, gated): whether to log the placement forecast this run.
     let log_pred = world.pred_log_enabled;
 
@@ -1227,6 +1403,38 @@ fn try_place_one_symbol(
         }
     }
     None
+}
+
+/// ⚗ **EXPERIMENT** (`4r_friend_circle_spec.md` §2.2 arm F-pref) — the whole body of the
+/// friend preference, as a PURE function so it is testable without a world.
+///
+/// `ranked` is the kernel's admissible list in ITS order, each entry
+/// `(local candidate index, is this holder one the owner already serves, marginal R̂)`. The
+/// result is the same set, same multiplicity, reordered: every FRIEND whose marginal `R̂` is
+/// within `margin` of the BEST entry's moves to the front, keeping the kernel's relative order;
+/// everything else follows, also in kernel order. So:
+///
+/// * it is a REORDERING — no candidate is added, dropped, or duplicated (the kernel's Р-5 credit
+///   cap and §7 bucket dedup stand untouched);
+/// * it is BOUNDED — `margin` caps how much marginal survival a promotion may cost. `0.0` is a
+///   pure tie-break (which still bites in the structural-zero regime below `k_eff`, where every
+///   candidate scores exactly 0.0); `1.0` is unbounded friend-first, the ceiling of what this
+///   design can express;
+/// * it cannot buy "my friends" with a shorter placement — the caller's width loop still stops
+///   on `R̂ ≥ r_target`, so a weaker friend simply costs MORE symbols, not less reliability. If
+///   the circle nevertheless ends up less durable, that is the tranche's ANSWER, not a bug.
+///
+/// Deterministic: index-ordered, no RNG, no map iteration.
+fn friend_preference_order(ranked: &[(usize, bool, f64)], margin: f64) -> Vec<usize> {
+    if ranked.is_empty() {
+        return Vec::new();
+    }
+    let best = ranked.iter().map(|c| c.2).fold(f64::NEG_INFINITY, f64::max);
+    let cut = best - margin.max(0.0);
+    let promoted = |c: &(usize, bool, f64)| c.1 && c.2 >= cut;
+    let mut out: Vec<usize> = ranked.iter().filter(|c| promoted(c)).map(|c| c.0).collect();
+    out.extend(ranked.iter().filter(|c| !promoted(c)).map(|c| c.0));
+    out
 }
 
 /// The holder accept/preemption gate (§9 / A.12-2). Returns whether `holder` admits a
@@ -2788,6 +2996,20 @@ pub fn admit_offer_for_test(
     tick: u64,
 ) -> bool {
     admit_offer(world, owner, holder, v_per_symbol, params, tick)
+}
+
+/// ⚗ The F-pref reordering as a pure function (`4r_friend_circle_spec.md` §2.2), so the bound
+/// and the stability can be asserted without building a world.
+#[cfg(test)]
+pub fn friend_preference_order_for_test(ranked: &[(usize, bool, f64)], margin: f64) -> Vec<usize> {
+    friend_preference_order(ranked, margin)
+}
+
+/// The daemon minimum placement width `min(k_eff + MIN_REDUNDANCY, n_symbols)` — the structural
+/// quantity behind "a four-member circle cannot reach min-width inside itself".
+#[cfg(test)]
+pub fn min_width_for_test(params: &DynParams) -> usize {
+    min_width(params)
 }
 
 #[cfg(test)]

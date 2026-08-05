@@ -207,6 +207,11 @@ pub fn a7_sybil_farm_hook(ctx: &AdvContext) -> AdvAction {
 /// * `collude_farm = collude` — R1's collusive fake PoS (the shared `adv_collude_farm` pass). This
 ///   is the ONE dial the matched TWIN flips ([`a8_ring_twin_hook`]), so the board comparative
 ///   isolates COLLUSION from the ring's construction.
+/// * ⚗ `friend_preference = friend_preference.then_some(margin)` — the friend-circle arm F-pref's
+///   OWNER-side lever: "put MY data with peers I already serve". Unlike every other flag here it
+///   has no engine-side god-view half — the friend test is the owner's own first-hand
+///   `g_holder_from_owner` — so this really is a pure declared policy. `false` (the default, and
+///   every A8 arm) ⇒ the placement path is byte-identical.
 ///
 /// It never learns who its ring-mates are, and it never reads `&World`.
 pub fn a8_collusion_ring_hook(ctx: &AdvContext) -> AdvAction {
@@ -214,6 +219,10 @@ pub fn a8_collusion_ring_hook(ctx: &AdvContext) -> AdvAction {
         accept_rate: Some(ctx.dials.whale_accept),
         serve_group_only: ctx.dials.serve_ring_only,
         collude_farm: ctx.dials.collude,
+        friend_preference: ctx
+            .dials
+            .friend_preference
+            .then_some(ctx.dials.friend_preference_margin),
         ..AdvAction::NOOP
     }
 }

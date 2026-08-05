@@ -699,6 +699,16 @@ pub struct World {
     /// R̂-calibration dataset. Gating a metric channel, NOT a decision — every decision is
     /// bit-identical regardless of this flag (the anti-oracle regression asserts it).
     pub pred_log_enabled: bool,
+    /// ⚗ ADMISSIBLE-SET log (friend-circle tranche, review W6) — a GOD-VIEW, METRIC-ONLY channel
+    /// written at each FLOOR placement decision: how many of the candidates the kernel ruled
+    /// admissible, at that moment, were peers the owner ALREADY SERVES. It exists because the
+    /// design claim "reciprocity is not a scarce predicate" is a statement about the CHOICE SET AT
+    /// DECISION TIME, and no horizon read of surviving placements can stand in for it. Gated by
+    /// [`World::cand_friend_log_enabled`], consumes no RNG, read by no decision.
+    pub cand_friend_log: Vec<CandFriendEntry>,
+    /// Whether the engine appends to [`World::cand_friend_log`]. `false` by default (the engine
+    /// pays nothing and every decision is bit-identical); the friend-circle tests set it.
+    pub cand_friend_log_enabled: bool,
     /// World-v3 phase-1 ADVERSARY layer (predator injection). `adv[i] = Some(role)` marks
     /// node `i` as an injected predator whose per-tick behaviour the engine consults via
     /// `role.hook` — a `fn(&AdvContext) -> AdvAction` that by construction CANNOT borrow
@@ -800,6 +810,27 @@ pub struct PredEntry {
     /// (WARN-1) scores ONLY `floor_complete` rows; the incomplete population is reported as a
     /// separate structural-zero diagnostic (its forecast carries no information).
     pub floor_complete: bool,
+}
+
+/// ⚗ One ADMISSIBLE-SET row (friend-circle tranche, review W6) — a GOD-VIEW metric row, never a
+/// kernel input. Logged at each FLOOR placement DECISION, before any preference reordering.
+///
+/// Its whole point is the denominator: `admissible` is the size of the kernel's ranked candidate
+/// list at that decision (post-Р-5 credit cap, post-§7 bucket dedup, minus the block's current
+/// holders), and `friends` counts how many of THOSE the owner had already served. The ratio is the
+/// selectivity of the "friend" predicate as a chooser experiences it — which is a different
+/// quantity from any horizon share of surviving placements, and the only one that can support or
+/// refute "reciprocity is not scarce".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandFriendEntry {
+    /// The owner making the placement decision.
+    pub owner: usize,
+    /// The tick the decision was made at.
+    pub tick: u64,
+    /// How many admissible candidates the owner had ALREADY SERVED (`g_holder_from_owner > 0`).
+    pub friends: u32,
+    /// How many candidates the kernel ruled admissible at this decision.
+    pub admissible: u32,
 }
 
 /// A.2 (транше 4): one confirmed SILENT loss to apply next tick — the owner `O` whose

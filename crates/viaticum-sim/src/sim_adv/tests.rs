@@ -31,8 +31,9 @@ use crate::sim_adv::recip::{
 use crate::sim_adv::registry::{
     a1_whale, a3_flapper, a4_whitewasher, a5_deep_silent, a6_discriminator, a7_sybil, a8_ring,
     a9_eclipse_blind, a9_eclipse_drcard, a9_eclipse_silence, a10_provider_exit, a15_enclosure,
-    all_scenarios, dr_baseline, dr_battle, dr_hetero, find_scenario, honest_hetero_hard,
-    honest_hetero_v2, honest_v2, p8_reciprocity, tiered_hetero, tiered_hetero_hard, tiered_v1,
+    all_scenarios, dr_baseline, dr_battle, dr_hetero, find_scenario, friend_circle,
+    friend_circle_at_granularity, honest_hetero_hard, honest_hetero_v2, honest_v2, p8_reciprocity,
+    tiered_hetero, tiered_hetero_hard, tiered_v1,
 };
 use crate::sim_adv::report::{format_report, format_sweep, restore_csv, run_result_csv, sweep_csv};
 use crate::sim_adv::restore::{
@@ -58,7 +59,7 @@ use crate::sim_dynamic::engine::{
     eclipse_lethal, whitewash_rejoin_for_test,
 };
 use crate::sim_dynamic::generator::{
-    Archetype, GiverTier, HeldSymbol, OwnBlock, World, online, surfaced_in_window,
+    Archetype, GiverTier, HeldSymbol, OwnBlock, PairCapital, World, online, surfaced_in_window,
 };
 
 // ------------------------------------------------------------------
@@ -9876,4 +9877,2788 @@ fn a8_collusion_pays_in_self_hosted_retention_paired_measurement() {
         dm.abs() / ds,
         im.abs() / is,
     );
+}
+
+// ==================================================================
+// FRIEND CIRCLE (`4r_friend_circle_spec.md`) — the product's own question, at the size that asks
+// it: "I and three friends run Viaticum. What happens to us?" A8 answered a neighbouring question
+// (a CLOSED CLUB of eight), so this tranche re-asks it at N = 4 in the behaviours a real group can
+// actually have, all in ONE world, all matched by build:
+//
+//   F-open     — the friends behave honestly: hold anyone who asks, prefer nobody.
+//   F-closed   — hold only each other, reject strangers (A8's `serve_ring_only`).
+//   F-pref/c ⚗ — hold anyone, but THEY (and nobody else) want their own data with peers they
+//                already hold for — `AdvDials::friend_preference`. THE PRODUCT'S QUESTION.
+//   F-pref/w ⚗ — the same preference carried by EVERY owner in the world
+//                (`DynParams::friend_preference`). A DIFFERENT QUESTION: "what if this shipped".
+//   Neither ⚗ arm is a shipping proposal.
+//
+// ⚠ THE INSTRUMENT, AND WHAT THE TRANCHE LEARNED ABOUT IT (spec §1 + review BLOCK-1). A8's
+// per-owner decodable read was quantised into thirds (`blocks_per_node = 3`), so its σ ≈ 0.14 at
+// N = 4 was the instrument's own division and the disputed effect was the size of that σ. This
+// world cuts the SAME per-node source volume into more blocks at constant upload rate and constant
+// demand-arrival rate (`registry::friend_circle_params`), and rung one (B = 3) reproduces A8's
+// world exactly. ⚠ Refining the ruler turned out to MOVE THE ANSWER (F-closed/F-open reads 0.30× /
+// 0.47× / 0.79× / 0.53× at B = 3/6/9/18), so the rung is frozen by the spec's pre-registered
+// criterion — per-owner quantum ≤ 0.1, i.e. **B = 18** — and never by its result. See
+// `registry::FC_BLOCKS_PER_NODE`.
+//
+// ⚠ CONSTRUCTION CAVEAT, inherited from A8 and never waved off: the "circle" is four INJECTED
+// nodes — forced Reliable, full-accept, present from t = 0, churn-immortal — i.e. among the most
+// attractive holders in the world. So "their symbols concentrate on each other" has a boring
+// explanation available (everyone's symbols concentrate on them), and every circle-ness read below
+// is taken against the rate at which the same four nodes hold STRANGERS' data, never against the
+// naive proportional reference alone. MEASURED at the frozen rung, that boring explanation is DEAD:
+// the four hold 3.1 % of the strangers' symbols against a proportional 3.4 %, so they are if
+// anything LESS popular than average — but note the second half of the caveat, which no control
+// removes: joining at t = 0 into a world whose other members arrive later leaves the injected group
+// BELOW the outsiders' decodable level in every arm (0.206 vs 0.296 in F-open). That gap is the
+// construction, not a friend-circle finding, which is why every comparison here is arm-vs-arm on
+// the same construction.
+//
+// ⚠ AND THE SCOPE CAVEAT ON EVERY LEVEL PRINTED IN THIS SECTION (review NOTE-15): in EVERY arm,
+// circle AND outsiders alike, roughly TWO THIRDS of once-durable blocks are not decodable at the
+// horizon (at the frozen rung: circle 0.11-0.21, honest outsiders 0.29-0.31; and 0.29-0.34 for the
+// outsiders across the whole ladder). Every ratio below is a ratio between two
+// catastrophic states. The cause is documented and is a property of the SIM WORLD, not of the trust
+// design: the REALISED per-owner upload budget is 25 gb/tick against a 150 gb per-node source
+// volume, so the world cannot afford to maintain what it placed ([MED/SIM-EXPERIMENT] in
+// `private/docs/tech-debt.md`, which explicitly forbids building conclusions on absolute deep-
+// horizon decodability). ⚠ NOT "`bandwidth_u = 20` against a 25 gb chunk ⇒ one symbol per tick"
+// (review NOTE-2) — that sentence describes RUNG ONE (and `honest_v2`). At the FROZEN rung the
+// world runs `bandwidth_u = 25` against a 4.17 gb chunk = SIX symbols per tick per owner. The
+// gb/tick rate is held constant across the ladder by construction (`registry::friend_circle_params`
+// / `FC_UPLOAD_GB_PER_TICK`) and so is the conclusion; only the chunk changed.
+// The arm-vs-arm CONTRASTS are what this tranche reports; the LEVELS do not transfer to a world
+// with enough bandwidth.
+//
+// ⏱ WHAT RUNS BY DEFAULT AND WHAT DOES NOT (review W5). Every test below that steps ten 130-tick
+// 120-node worlds per arm is `#[ignore]`d, because its asserts are READINGS of this world at this
+// rung and not regressions on a frozen number — the same standard A8's equivalent paired
+// measurement already uses. Each carries its own reproduce line in the `#[ignore]` string, so
+// `cargo test … <name>` prints the command even when it skips.
+//
+//   IGNORED (measurement)                                             measured, release, 8 cores
+//     four_honest_friends_are_not_a_circle_…                                            146 s
+//     sealing_the_circle_costs_the_smallest_circle_its_redundancy                       287 s
+//     friend_preference_moves_the_circles_data_home_and_prints_what_it_costs            505 s
+//     friend_circle_calibration_prints_metric_resolution_and_intra_share_by_size      ~1 h
+//     friend_circle_four_arms_by_size_print_the_product_answer_table                  ~1 h
+//     sealing_the_circle_at_thirty_seeds_…                                             734 s
+//
+//   DEFAULT (regression / structure) — the surface that actually guards this tranche:
+//     friend_preference_off_is_bit_identical_to_the_honest_anchor      THE ANCHOR (honest_v2 + A7)
+//     friend_preference_dial_changes_which_holder_the_owner_picks      the switch is live
+//     the_admissible_set_log_never_changes_a_decision                  the metric gate is inert
+//     friend_circle_runs_are_deterministic_across_a_double_run         INV-DETERMINISM/ANTI-ORACLE
+//     friend_circle_is_registered_with_the_frozen_world                the frozen dials + rung
+//     friend_circle_world_at_three_blocks_is_the_a8_world              rung one IS A8's world
+//     a_four_member_circle_cannot_reach_min_width_inside_itself        the structural fact
+//     the_placement_ranking_cannot_see_reciprocity_…                   why the dial had to be built
+//     friend_preference_order_* / fc_student_p_* / fc_paired_snr_* / the_reporting_trigger_*
+//     friend_fraction_of_the_admissible_set_…                          ONE seed, 59 s — kept in the
+//       default run because its asserts (log populated, choices real, fractions are fractions) are
+//       structural, and it is the evidence the ⚗ conclusion rests on.
+// ===================================================================
+
+/// The circle size (mirrors registry `FC_RING_N`; `friend_circle_is_registered_with_the_frozen_world`
+/// pins the mirror). FOUR — the product's literal case.
+const FC_TEST_N: usize = 4;
+/// The frozen block granularity (mirrors registry `FC_BLOCKS_PER_NODE`) — the INSTRUMENT setting.
+const FC_TEST_BLOCKS: usize = 18;
+/// Spec §1: TEN seeds. A8's five could not separate an effect the size of its own σ.
+const FC_SEEDS: [u64; 10] = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51];
+/// The BORROWED no-collapse bar (the same 0.60 the house restorability rows use — `A15_FLOOR_X` /
+/// `DR_BATTLE_FLOOR_X` / A8's `A8_CIRCLE_FLOOR_X`). NOT tuned here, and not a friend-circle bar.
+///
+/// ⚠⚠ **AND IT IS BORROWED AS A NUMBER, NOT AS A BAR** (review W2). Its home semantics is
+/// ABSOLUTE — *"FAIL if more than 40 % of once-durable blocks become UNDECODABLE"* (the wording on
+/// `A15_FLOOR_X` / `DR_BATTLE_FLOOR_X` / INV-RESTORE-SANITY). Read that way in THIS world, every
+/// arm fails catastrophically: 0.110 sealed and 0.206 open against 0.60, and the honest outsiders
+/// sit at 0.296. Nothing in this tranche clears the bar in the bar's own units, which is why the
+/// only defensible use of the number here is A8's: as a SOFT no-collapse floor RELATIVE to the
+/// matched control (`a8_friend_circle_keeps_its_data_without_serving_outsiders`, where it stands as
+/// a PASSING assert). Turning a soft relative floor into a FAIL headline asks the bar for more
+/// authority than it carries — see the ratio line in
+/// `sealing_the_circle_costs_the_smallest_circle_its_redundancy`, which now reports it as a
+/// borrowed-ruler reading rather than as a verdict.
+const FC_FLOOR_X: f64 = 0.60;
+/// The house signal/noise gate — Cohen's d, `|mean_d| / σ_d` — the A15/P8 idiom for measurements
+/// that have no exact p. On its own it is the WRONG standard for this tranche's design, and
+/// [`fc_resolves`] is where that is said and fixed; nothing in this section tests it alone.
+const FC_SNR_GATE: f64 = 2.0;
+/// The textbook two-sided ν = 9 five-percent critical value — a constant of the DESIGN (ten paired
+/// seeds ⇒ df 9), fixed before any measurement and with no knob in it. Pinned against the published
+/// table by `fc_student_p_at_nine_df_matches_the_critical_values`.
+const FC_T_CRIT_9: f64 = 2.262;
+
+/// ⭐ **THE TRANCHE'S ONE REPORTING TRIGGER, APPLIED AT EVERY GATE IN THIS SECTION** (review W1).
+/// An effect is REPORTED (and, where a direction was pre-registered, ASSERTED) when EITHER
+/// * the house effect-size gate fires (`|mean_d| / σ_d ≥ FC_SNR_GATE`), or
+/// * the paired t clears the textbook ν = 9 5 % critical value (`|t| ≥ FC_T_CRIT_9`).
+///
+/// **Why the OR, and why it must be the SAME everywhere.** At n = 10 the house gate alone means
+/// `|t| ≥ 2·√10 = 6.32`, i.e. p ≈ 1.4·10⁻⁴ — an absurd reporting threshold for a PAIRED design that
+/// has an exact p, and one the rest of the house never had to face because its measurements have no
+/// p at all. Adding the t-trigger is a CORRECTION, and where a direction is pre-registered it makes
+/// the assert STRICTER (it fires in more cases, so the claim is put at risk more often).
+///
+/// ⚠ It was first added at ONE site — the sealed-circle penalty, where it helps the tranche's
+/// story — and left off the others, where it does not. That is exactly the shape of a
+/// result-dependent standard, so it is now a single function used by every gate. The cost of the
+/// unification is honest and is paid in the reports: the world-scope preference's DURABILITY COST
+/// (t(9) = −2.66, p = 0.026) and F-open's residual homing now cross the trigger and are stated as
+/// findings instead of printed as noise.
+///
+/// NaN-safe by construction: both comparisons are false on NaN, so a degenerate column FAILS CLOSED
+/// (nothing is asserted, nothing is claimed).
+fn fc_resolves(snr: f64, t: f64) -> bool {
+    snr >= FC_SNR_GATE || t.abs() >= FC_T_CRIT_9
+}
+
+#[test]
+fn the_reporting_trigger_is_one_standard_and_it_is_the_t_that_does_the_work_at_ten_seeds() {
+    // Review W1: this trigger is the tranche's single reporting standard, so its semantics is
+    // pinned rather than left to four copies of an inline `>=`.
+    //
+    // (1) EITHER branch fires it, and neither is required.
+    assert!(fc_resolves(2.5, 0.0), "the house effect-size gate alone");
+    assert!(fc_resolves(0.0, -3.43), "the ν = 9 critical value alone");
+    assert!(!fc_resolves(1.99, 2.26), "neither ⇒ nothing is claimed");
+    // (2) THE POINT OF THE OR, as arithmetic. On a PAIRED ten-seed design the two are rigidly
+    //     linked: `t = mean_d/(σ_d/√10) = d·√10`. So the house gate alone demands |t| ≥ 6.32, i.e.
+    //     p ≈ 1.4·10⁻⁴ — which is why every effect this tranche reports would otherwise have been
+    //     printed as noise, and why the t-trigger is a correction rather than a loosening.
+    let d_equivalent_of_house_gate = FC_SNR_GATE * 10f64.sqrt();
+    assert!(
+        (d_equivalent_of_house_gate - 6.3246).abs() < 1e-3,
+        "the house gate is |t| ≥ {d_equivalent_of_house_gate} at n = 10"
+    );
+    assert!(
+        fc_student_p(d_equivalent_of_house_gate) < 2e-4,
+        "…i.e. p = {:.6}, an absurd reporting threshold",
+        fc_student_p(d_equivalent_of_house_gate)
+    );
+    // (3) THE ACTUAL MEASUREMENTS THIS DECIDES, as recorded: all four sit between the two
+    //     thresholds, so the tranche's reporting is entirely governed by the t-trigger — and
+    //     applying it at one site and not the others is what review W1 caught.
+    for (label, d, t) in [
+        ("F-closed penalty", 1.08, -3.43),
+        ("F-open residual homing", 0.83, 2.62),
+        ("F-pref/w durability cost", 0.84, -2.66),
+    ] {
+        assert!(d < FC_SNR_GATE, "{label}: below the house gate (d = {d})");
+        assert!(fc_resolves(d, t), "{label}: resolves on the t (t = {t})");
+    }
+    assert!(
+        !fc_resolves(0.43, -1.36),
+        "F-pref/c intra-share resolves on NEITHER — the unified standard does not report it"
+    );
+    // (4) NaN fails closed on both branches.
+    assert!(!fc_resolves(f64::NAN, f64::NAN), "NaN claims nothing");
+    assert!(!fc_resolves(f64::NAN, 1.0) && !fc_resolves(1.0, f64::NAN));
+}
+
+/// ⚗ The FROZEN F-pref margin — **pre-registered here, before the arm was run**, and deliberately
+/// the CEILING: 1.0 means "among the candidates the kernel already ruled admissible, a friend
+/// always outranks a stranger", the most preference this design is able to express at all.
+///
+/// Why the ceiling is the honest headline for an EXISTENCE question. The tranche has to answer "is
+/// «I want my backups only on my friends' machines» expressible in this design?" A ceiling
+/// measurement bounds every bounded setting: if the strongest expressible preference does not move
+/// the circle's data home, no smaller margin can, and the answer is NO for all of them. If it DOES
+/// move it, the price of the bounded settings is the follow-up question — and the margin sweep
+/// {0.0, 0.01, 0.10, 1.0} is printed by the calibration test for exactly that.
+///
+/// It is still bounded in the two senses the spec makes load-bearing: the preference reorders only
+/// ADMISSIBLE candidates (nothing the kernel excluded is admitted), and the width loop's stopping
+/// criterion stays `R̂ ≥ r_target` — so a weaker friend costs MORE symbols, never less reliability.
+///
+/// MEASURED (the calibration test's sweep, CIRCLE-ONLY scope; N = 4, B = 18, seeds 42..51, against
+/// an F-open control of `intra` 0.243 ± 0.245 / `placed` 0.096 ± 0.059 / decodable 0.206 ± 0.097):
+///
+/// | margin | circle decodable | data at home | at placement |
+/// |---|---|---|---|
+/// | 0.00 (pure tie-break) | 0.215 ± 0.132 | 0.164 ± 0.290 | 0.088 ± 0.074 |
+/// | 0.01 | 0.156 ± 0.105 | 0.147 ± 0.238 | 0.090 ± 0.073 |
+/// | 0.10 | 0.228 ± 0.145 | 0.132 ± 0.176 | 0.081 ± 0.058 |
+/// | 1.00 (ceiling) | 0.183 ± 0.135 | 0.119 ± 0.192 | 0.076 ± 0.060 |
+///
+/// The ceiling was the right place to look, and every margin leaves LESS of the circle's data at
+/// home than the F-open control (0.243) — the opposite of the intended effect.
+///
+/// ⚠ **THE MONOTONICITY OF THAT COLUMN IS NOT EVIDENCE FOR IT** (review W4). The four margin arms
+/// share seeds and are NESTED — margin 0 promotes a SUBSET of what margin 0.01 promotes, which is a
+/// subset of the ceiling's — so an ordered column is close to structurally expected and is nowhere
+/// near four independent successes. This tranche already retired the identical argument for the
+/// durability column ("four monotone points inside the noise are not a cost curve",
+/// [`crate::sim_adv::registry::friend_circle`] conclusion 6); it is retired here too, for the same
+/// reason. What is left is the DIRECTION AT THE CEILING with its own p — Δ −0.124, p = 0.21 —
+/// i.e. **NOT ESTABLISHED**, reported because a null that points backwards is worth printing.
+///
+/// ⭐ **THE INFORMATIVE LINE IN THE SWEEP IS THE FIRST STEP, AND IT CONTRADICTS WHAT "pure
+/// tie-break" SUGGESTS.** Margin 0 is NOT a mild setting. Below `k_eff` every candidate scores
+/// EXACTLY 0.0 (the structural-zero regime pinned by
+/// `friend_preference_order_promotes_only_friends_inside_the_bound_and_keeps_the_kernel_order`), so
+/// a "pure tie-break" is already FRIEND-FIRST for the first `k_eff` symbols of every block.
+/// Accordingly F-open 0.243 → margin-0 0.164 is the LARGEST single step in the sweep — larger than
+/// the three margin steps above it combined (−0.079 against −0.017 / −0.015 / −0.013). Anyone
+/// reading "0.0 ⇒ a gentle setting" off this constant's own wording is reading it wrong.
+///
+/// ⚠ HOW MUCH OF THIS IS ESTABLISHED: the LEVELS carry σ larger than themselves (0.290 on a mean of
+/// 0.164), the decodable column is not monotone at all (0.215 / 0.156 / 0.228 / 0.183), and the
+/// paired arm test puts the ceiling-vs-control difference at p = 0.21. The magnitude is not
+/// established by ten seeds and no sentence here should say it is. In particular nothing here
+/// supports "the preference costs durability" as a general claim — see the N-sweep in the
+/// deliverable table, where the durability sign flips by N = 8.
+const FC_PREF_MARGIN: f64 = 1.0;
+
+/// ⚗ WHO prefers, in the F-pref arms — two arms because they are two different questions and the
+/// tranche got caught reporting one as if it were the other (review W7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefScope {
+    /// Nobody: the honest placement path.
+    Off,
+    /// EVERY owner in the world prefers holders it already serves (`DynParams::friend_preference`).
+    /// The question this answers is "**what if the design shipped this for everyone**" — the circle
+    /// gets no privilege the other 116 nodes lack, so any circle-level effect is what is left after
+    /// the whole network competes on the same rule.
+    World,
+    /// Only the CIRCLE prefers (`AdvDials::friend_preference`, declared by the circle's own
+    /// behaviour hook). The question this answers is the PRODUCT's: "**I** want my backups on my
+    /// friends' machines" — four owners prefer, 116 do not.
+    Circle,
+}
+
+/// One friend-circle arm: which behaviour, at which size, at which instrument resolution. Every
+/// field is a dial the harness already carries, so the arms are matched by build — there is no
+/// arm-specific construction anywhere in this section.
+#[derive(Debug, Clone, Copy)]
+struct FcArm {
+    label: &'static str,
+    /// Hold ONLY circle members, reject strangers (A8's `serve_ring_only`) — F-closed's lever.
+    ring_only: bool,
+    /// ⚗ Owner-side preference for holders the owner already serves, and WHO carries it.
+    pref: PrefScope,
+    /// ⚗ The bound on that preference in `R̂` units (read only when `pref != Off`).
+    margin: f64,
+    /// Circle size N.
+    n: usize,
+    /// Instrument resolution: blocks per node at constant per-node volume.
+    blocks: usize,
+}
+
+impl FcArm {
+    /// **F-open** — the friends behave honestly: they hold anyone who asks (full accept, the
+    /// Reliable archetype's own rate), they collude with nobody, they prefer nobody. This is A8's
+    /// `R2_PLAIN` at N = 4 and the MATCHED CONTROL for every other arm.
+    const F_OPEN: FcArm = FcArm {
+        label: "F-open",
+        ring_only: false,
+        pref: PrefScope::Off,
+        margin: 0.0,
+        n: FC_TEST_N,
+        blocks: FC_TEST_BLOCKS,
+    };
+    /// **F-closed** — they hold ONLY each other and hard-reject every stranger's offer (A8's
+    /// `serve_ring_only`), at the size A8 froze away from.
+    const F_CLOSED: FcArm = FcArm {
+        label: "F-closed",
+        ring_only: true,
+        ..FcArm::F_OPEN
+    };
+    /// **F-pref/circle ⚗ — THE PRODUCT'S QUESTION.** The four friends refuse NOBODY (identical
+    /// holder policy to F-open) but THEIR OWN placement prefers holders they already serve. Nobody
+    /// else in the world prefers anything. The ONE switch against F-open is the circle's own
+    /// `AdvDials::friend_preference`.
+    const F_PREF_CIRCLE: FcArm = FcArm {
+        label: "F-pref/c",
+        pref: PrefScope::Circle,
+        margin: FC_PREF_MARGIN,
+        ..FcArm::F_OPEN
+    };
+    /// **F-pref/world ⚗ — A DIFFERENT QUESTION**, kept because it is the one the design would
+    /// actually face if the preference were shipped: EVERY owner prefers, so the circle competes
+    /// against 116 nodes playing the same rule.
+    const F_PREF_WORLD: FcArm = FcArm {
+        label: "F-pref/w",
+        pref: PrefScope::World,
+        margin: FC_PREF_MARGIN,
+        ..FcArm::F_OPEN
+    };
+
+    fn with_n(self, n: usize) -> FcArm {
+        FcArm { n, ..self }
+    }
+    fn with_blocks(self, blocks: usize) -> FcArm {
+        FcArm { blocks, ..self }
+    }
+    fn with_margin(self, margin: f64) -> FcArm {
+        FcArm { margin, ..self }
+    }
+
+    /// The registered `friend_circle` scenario with this arm's dials applied.
+    fn scenario(self) -> Scenario {
+        let mut sc = friend_circle_at_granularity(self.blocks);
+        sc.adversaries[0].count = self.n;
+        sc.adversaries[0].dials.group_size = self.n;
+        sc.adversaries[0].dials.serve_ring_only = self.ring_only;
+        sc.world.base.friend_preference = self.pref == PrefScope::World;
+        sc.world.base.friend_preference_margin = self.margin;
+        sc.adversaries[0].dials.friend_preference = self.pref == PrefScope::Circle;
+        sc.adversaries[0].dials.friend_preference_margin = self.margin;
+        sc
+    }
+}
+
+/// Step one friend-circle arm to the horizon; returns the final god-view world + the circle's node
+/// indices. Mirrors the runner for this world shape (Backbone / Uniform / Legacy, no events, no
+/// inflow) exactly as `a8_stepped_world` does — and
+/// `friend_circle_stepped_world_mirrors_the_runner` pins that claim against `run_one_seed` rather
+/// than leaving it as prose.
+fn fc_stepped_world(arm: FcArm, seed: u64) -> (World, Vec<usize>) {
+    use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
+    let sc = arm.scenario();
+    let params = &sc.world.base;
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut world = build_world(sc.world.n_nodes, params, seed);
+    let ring = inject_adversaries(&mut world, &sc.adversaries, params, RunMode::Predator);
+    for _ in 0..sc.horizon {
+        crate::sim_dynamic::engine::step(&mut world, params, &prior, &policy);
+    }
+    (world, ring)
+}
+
+/// Of every ALIVE symbol OWNED by `owners` and parked on some OTHER present node, the fraction
+/// parked on a member of `holders`. `group_intra_share(w, g)` is exactly `fc_share_held_by(w, g, g)`
+/// (pinned by `fc_share_held_by_generalises_the_a8_intra_share_metric`) — the generalisation is
+/// what lets "does the circle keep its OWN data at home" be compared against "does it hold
+/// STRANGERS' data at the same rate", which is the only reading that separates a real circle from
+/// four merely popular holders.
+///
+/// `NaN` when `owners` have no alive symbol parked anywhere.
+fn fc_share_held_by(world: &World, owners: &[usize], holders: &[usize]) -> f64 {
+    let mut inside = 0usize;
+    let mut total = 0usize;
+    for (h, node) in world.nodes.iter().enumerate() {
+        if !node.present {
+            continue;
+        }
+        let held = node
+            .holdings
+            .iter()
+            .filter(|s| s.alive && owners.contains(&s.owner) && s.owner != h)
+            .count();
+        total += held;
+        if holders.contains(&h) {
+            inside += held;
+        }
+    }
+    if total > 0 {
+        inside as f64 / total as f64
+    } else {
+        f64::NAN
+    }
+}
+
+/// [`fc_share_held_by`] restricted to FLOOR (`cream = false`) or CREAM symbols. The ⚗ F-pref dial
+/// touches the FLOOR path only (cream keeps its strangers-first entry channel by design), so the
+/// split is what makes the reachable ceiling of that dial visible instead of arguable.
+fn fc_share_held_by_class(world: &World, owners: &[usize], holders: &[usize], cream: bool) -> f64 {
+    let mut inside = 0usize;
+    let mut total = 0usize;
+    for (h, node) in world.nodes.iter().enumerate() {
+        if !node.present {
+            continue;
+        }
+        let held = node
+            .holdings
+            .iter()
+            .filter(|s| s.alive && s.cream == cream && owners.contains(&s.owner) && s.owner != h)
+            .count();
+        total += held;
+        if holders.contains(&h) {
+            inside += held;
+        }
+    }
+    if total > 0 {
+        inside as f64 / total as f64
+    } else {
+        f64::NAN
+    }
+}
+
+/// [`fc_share_held_by`] over EVERY symbol ever accepted — dead ones included, and on DEPARTED
+/// holders too. A killed symbol stays in its holder's vector, so this is the PLACEMENT
+/// distribution: where the owner's symbols were originally put, undisturbed by who later dropped
+/// them or churned away.
+///
+/// **Read against the alive-only share, this is the tranche's causal switch.** "The circle's data
+/// lives at home" has two completely different mechanisms behind it — the owner CHOSE friends
+/// (placement), or the friends KEPT it while strangers evicted/churned (retention). The pair of
+/// numbers separates them; no argument from the code can.
+fn fc_share_ever_placed(world: &World, owners: &[usize], holders: &[usize]) -> f64 {
+    let mut inside = 0usize;
+    let mut total = 0usize;
+    for (h, node) in world.nodes.iter().enumerate() {
+        let held = node
+            .holdings
+            .iter()
+            .filter(|s| owners.contains(&s.owner) && s.owner != h)
+            .count();
+        total += held;
+        if holders.contains(&h) {
+            inside += held;
+        }
+    }
+    if total > 0 {
+        inside as f64 / total as f64
+    } else {
+        f64::NAN
+    }
+}
+
+/// One seed's full friend-circle reading. Every field is a god-view EVALUATOR read — nothing here
+/// is ever a decision input.
+#[derive(Debug, Clone, Copy)]
+struct FcRead {
+    /// Share of the circle's own alive symbols parked ON the circle.
+    intra: f64,
+    /// Share of the OUTSIDERS' alive symbols parked on the circle — the "are they just popular
+    /// holders" control.
+    outsiders_on_ring: f64,
+    /// The circle's decodable fraction (`group_decodable_fraction`).
+    dec_ring: f64,
+    /// The honest outsiders' decodable fraction — world health, NOT a matched control.
+    dec_out: f64,
+    /// Mean `target_ever_met` blocks per present circle member = the DENOMINATOR of `dec_ring`, so
+    /// the achieved per-owner quantum is `1/met_ring`.
+    met_ring: f64,
+    /// The SMALLEST `target_ever_met` among present circle members. Review NOTE-16: `dec_ring` is a
+    /// MEAN OF PER-OWNER RATIOS, so the group lattice is not uniform and `1/(N·met_ring)` is not
+    /// "the group quantum" — the coarsest step any single member can impose is `1/(N·met_min)`, and
+    /// that is the number a "does the ruler dominate the reading" check has to use.
+    met_min_ring: f64,
+    /// gb·days of STRANGERS' disk the circle occupied (`ext_consumed`).
+    took: f64,
+    /// gb·days of its own disk the circle gave STRANGERS (`ext_served`).
+    gave: f64,
+    /// `intra` over FLOOR symbols only, and over CREAM symbols only.
+    intra_floor: f64,
+    intra_cream: f64,
+    /// World health, printed so the resolution ladder can be checked for "did refining the
+    /// instrument move the world": total alive symbols on present holders.
+    world_alive_symbols: f64,
+    /// The same two shares over EVERY symbol EVER placed ([`fc_share_ever_placed`]) — the
+    /// PLACEMENT distribution, against which `intra` / `outsiders_on_ring` are the SURVIVING one.
+    intra_ever: f64,
+    outsiders_on_ring_ever: f64,
+    /// P8's world-level reciprocity share (`metrics::share_a_pos_percent`): of ALL alive symbols in
+    /// the world, the % sitting on a pair where the OWNER has served the HOLDER
+    /// (`capital[owner][holder].g_ho > 0`).
+    ///
+    /// ⚠ WHAT THIS CAN AND CANNOT SAY (review W6). It is a HORIZON read, SYMBOL-WEIGHTED over
+    /// SURVIVING placements, so it conflates "the owner placed with a peer it already served" with
+    /// "the owner later came to serve a peer it had placed with" — the pair can acquire `g_ho > 0`
+    /// at any point after the placement. It is therefore a witness of the world's END STATE, and
+    /// it is NOT evidence about the predicate's selectivity at a DECISION. The selectivity question
+    /// has its own measurement now
+    /// (`friend_fraction_of_the_admissible_set_says_whether_reciprocity_is_a_scarce_predicate`,
+    /// off the gated `World::cand_friend_log`), and the design claim rests on THAT.
+    share_a_pos: f64,
+}
+
+/// The SMALLEST `target_ever_met` block count among the present members of `group` — the
+/// denominator of the coarsest per-owner ratio inside a `group_decodable_fraction` mean
+/// (review NOTE-16). `NaN` when no member is present or none has met a target.
+fn fc_met_min(world: &World, group: &[usize]) -> f64 {
+    let mut min: Option<usize> = None;
+    for &o in group {
+        if o >= world.nodes.len() || !world.nodes[o].present {
+            continue;
+        }
+        let met = world.nodes[o]
+            .own_blocks
+            .iter()
+            .filter(|b| b.target_ever_met)
+            .count();
+        if met > 0 {
+            min = Some(min.map_or(met, |m: usize| m.min(met)));
+        }
+    }
+    min.map_or(f64::NAN, |m| m as f64)
+}
+
+fn fc_read(world: &World, ring: &[usize], k_eff: usize) -> FcRead {
+    let outsiders = a8_outsiders(world, ring);
+    let intra = fc_share_held_by(world, ring, ring);
+    let outsiders_on_ring = fc_share_held_by(world, &outsiders, ring);
+    let (met_ring, _) = a8_met_profile(world, ring);
+    FcRead {
+        intra,
+        outsiders_on_ring,
+        dec_ring: group_decodable_fraction(world, ring, k_eff),
+        dec_out: group_decodable_fraction(world, &outsiders, k_eff),
+        met_ring,
+        met_min_ring: fc_met_min(world, ring),
+        took: farm_honest_storage(world, ring),
+        gave: farm_honest_served(world, ring),
+        intra_floor: fc_share_held_by_class(world, ring, ring, false),
+        intra_cream: fc_share_held_by_class(world, ring, ring, true),
+        world_alive_symbols: world
+            .nodes
+            .iter()
+            .filter(|nd| nd.present)
+            .map(|nd| nd.holdings.iter().filter(|s| s.alive).count() as f64)
+            .sum(),
+        intra_ever: fc_share_ever_placed(world, ring, ring),
+        outsiders_on_ring_ever: fc_share_ever_placed(world, &outsiders, ring),
+        share_a_pos: crate::sim_adv::metrics::share_a_pos_percent(world),
+    }
+}
+
+/// The HOMING factor as a ratio-of-means over the ten seeds (the headline form): the circle's own
+/// share of its symbols, over the share of STRANGERS' symbols it holds, each divided by its own
+/// proportional reference (`N−1` homes for its own data vs `N` for a stranger's, so the constant is
+/// exactly 4/3 at N = 4).
+///
+/// ⚠ A per-seed ratio of two small shares is heavy-tailed (one seed where the circle keeps three
+/// symbols, all at home, would read as an enormous homing factor), so the per-seed form is NOT
+/// carried on [`FcRead`] at all — every homing number in this section is this ratio-of-means, and
+/// the load-bearing claims are made on the two shares separately, paired.
+fn fc_homing_rom(
+    reads: &[FcRead],
+    own: impl Fn(&FcRead) -> f64,
+    out: impl Fn(&FcRead) -> f64,
+    n: usize,
+) -> f64 {
+    let prop_ratio = n as f64 / (n.saturating_sub(1)) as f64;
+    let o = mean_sigma(&fc_col(reads, own)).0;
+    let s = mean_sigma(&fc_col(reads, out)).0;
+    prop_ratio * o / s
+}
+
+/// Run one arm over the ten seeds, in seed order. Rayon fan-out with an ORDER-PRESERVING collect —
+/// the runner's own documented determinism idiom (`runner.rs` §10 п.12), so the parallelism cannot
+/// reorder anything.
+fn fc_reads(arm: FcArm) -> Vec<FcRead> {
+    use rayon::prelude::*;
+    let k_eff = arm.scenario().world.base.k_eff;
+    FC_SEEDS
+        .par_iter()
+        .map(|&seed| {
+            let (w, ring) = fc_stepped_world(arm, seed);
+            fc_read(&w, &ring, k_eff)
+        })
+        .collect()
+}
+
+fn fc_col(reads: &[FcRead], f: impl Fn(&FcRead) -> f64) -> Vec<f64> {
+    reads.iter().map(f).collect()
+}
+
+/// The MATCHED CONTROL at the frozen point (`F_OPEN`, N = 4, B = 18, ten seeds), computed at most
+/// once per test process.
+///
+/// ⏱ Every arm test compares against this same control, so without the cache the suite steps the
+/// same ten 130-tick worlds three times over — ~20 minutes of repeated work at the frozen rung. The
+/// cache is legitimate precisely because the runs are DETERMINISTIC (`fc_stepped_world` is a pure
+/// function of the arm and the seed, asserted by
+/// `friend_circle_runs_are_deterministic_across_a_double_run`), so a recomputation could only
+/// reproduce it. Any arm at a different N or B still goes through [`fc_reads`] uncached.
+fn fc_open_reads() -> &'static [FcRead] {
+    static CONTROL: std::sync::OnceLock<Vec<FcRead>> = std::sync::OnceLock::new();
+    CONTROL.get_or_init(|| fc_reads(FcArm::F_OPEN))
+}
+
+// ------------------------------------------------------------------
+// the ⚗ preference, as a pure function and as a dial (no world needed)
+// ------------------------------------------------------------------
+
+#[test]
+fn friend_preference_order_promotes_only_friends_inside_the_bound_and_keeps_the_kernel_order() {
+    use crate::sim_dynamic::engine::friend_preference_order_for_test as order;
+    // Kernel order (descending marginal R̂), local index / is-friend / score:
+    //   0 stranger 0.990   1 friend 0.980   2 stranger 0.950   3 friend 0.900
+    let ranked = [
+        (0usize, false, 0.990f64),
+        (1, true, 0.980),
+        (2, false, 0.950),
+        (3, true, 0.900),
+    ];
+    // margin 0 ⇒ a pure TIE-BREAK: no friend ties the best, so nothing moves.
+    assert_eq!(
+        order(&ranked, 0.0),
+        vec![0, 1, 2, 3],
+        "margin 0 = tie-break"
+    );
+    // margin 0.02 ⇒ only the friend within 0.02 of the best (index 1) is promoted; the 0.09-worse
+    // friend (index 3) is NOT — that is the bound doing its job.
+    assert_eq!(order(&ranked, 0.02), vec![1, 0, 2, 3], "bounded promotion");
+    // margin 1.0 ⇒ the CEILING: every friend first, each partition still in kernel order.
+    assert_eq!(
+        order(&ranked, 1.0),
+        vec![1, 3, 0, 2],
+        "unbounded friend-first"
+    );
+    // A REORDERING and nothing else: same set, same multiplicity, at every margin.
+    for margin in [0.0, 0.02, 0.5, 1.0] {
+        let mut got = order(&ranked, margin);
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2, 3], "margin {margin}: set preserved");
+    }
+    // The structural-zero regime (below `k_eff` every candidate scores exactly 0.0) is a TOTAL tie,
+    // so even margin 0 puts friends first there — the one place the bound is free.
+    let zeros = [(0usize, false, 0.0f64), (1, true, 0.0), (2, true, 0.0)];
+    assert_eq!(
+        order(&zeros, 0.0),
+        vec![1, 2, 0],
+        "structural-zero tie-break"
+    );
+    // A negative margin is clamped to a tie-break, never to "promote everything".
+    assert_eq!(
+        order(&ranked, -5.0),
+        vec![0, 1, 2, 3],
+        "negative margin clamps"
+    );
+    assert!(order(&[], 1.0).is_empty(), "empty in, empty out");
+}
+
+#[test]
+fn friend_preference_order_is_the_identity_when_the_owner_serves_nobody() {
+    use crate::sim_dynamic::engine::friend_preference_order_for_test as order;
+    // The regime every owner starts in (t = 0: it has served nobody, so it has no friends) and the
+    // one the whole byte-identity argument leans on — with no friend in the list, the reordering is
+    // the identity on the kernel's own ranking, at ANY margin.
+    let ranked = [
+        (7usize, false, 0.9f64),
+        (2, false, 0.8),
+        (5, false, 0.8),
+        (1, false, 0.1),
+    ];
+    for margin in [0.0, 0.01, 0.5, 1.0] {
+        assert_eq!(
+            order(&ranked, margin),
+            vec![7, 2, 5, 1],
+            "margin {margin}: no friends ⇒ the kernel order is untouched"
+        );
+    }
+}
+
+#[test]
+fn friend_preference_off_is_bit_identical_to_the_honest_anchor() {
+    // THE DIAL ANCHOR (spec §2.2 / §5), the same gate `giver_priority_order` carries.
+    //
+    // Part A — the frozen `honest_v2` seed-42 god-view numbers are UNMOVED. The default is
+    // `friend_preference = false`, so `try_place_one_symbol`'s new branch is not entered and the
+    // placement path is the pre-tranche one, byte for byte.
+    let m = run_one_seed(&honest_v2(), 42).metrics;
+    assert_eq!(m.alive_symbols, 224, "alive");
+    assert_eq!(m.evicts, 627, "evicts");
+    assert_eq!(m.preempts, 380, "preempts");
+    assert_eq!(m.cap_trims, 182, "cap_trims");
+    assert!(
+        (m.share_a_pos - 75.89).abs() < 0.1,
+        "share A>0 = {}",
+        m.share_a_pos
+    );
+    assert!(
+        (m.decodable_fraction - 0.5070).abs() < 0.005,
+        "decodable fraction = {}",
+        m.decodable_fraction
+    );
+
+    // Part B — the MARGIN is inert while the switch is off. A world with a large margin and the
+    // dial off must be bit-identical to the default world, or the dial is not a real gate.
+    let mut off_wide = honest_v2();
+    off_wide.world.base.friend_preference = false;
+    off_wide.world.base.friend_preference_margin = 0.75;
+    assert!(
+        metrics_bit_eq(&run_one_seed(&off_wide, 42).metrics, &m),
+        "friend_preference = false ⇒ the margin changes nothing at all"
+    );
+
+    // Part C — same statement inside the friend-circle world itself (a world that DOES carry the
+    // group whose behaviour the dial is built for): F-open with the dial explicitly off is
+    // bit-identical to the registered scenario's default.
+    //
+    // ⏱ Run at a SHORT horizon. What is under test is a GATE — "is the branch entered" — and a gate
+    // that is going to be entered is entered on the first floor placement, tick ~1. The frozen
+    // 130-tick horizon costs ~5 minutes per world here and buys no additional coverage of a boolean.
+    // (The frozen horizon IS run, ten seeds per arm, by the measurement tests.)
+    let short = |mut sc: Scenario| {
+        sc.horizon = 40;
+        sc
+    };
+    let a = run_one_seed(&short(friend_circle()), 42).metrics;
+    let b = run_one_seed(&short(FcArm::F_OPEN.scenario()), 42).metrics;
+    assert!(
+        metrics_bit_eq(&a, &b),
+        "the registered friend_circle scenario IS the F-open arm"
+    );
+    assert!(
+        a.alive_symbols > 0,
+        "the short horizon still places symbols"
+    );
+
+    // Part D — the PER-ROLE dial is gated the same way (review W7 added a second scope, so the
+    // anchor has to cover both). The placement path now consults the owner's behaviour hook, so an
+    // A8-role world with the role dial OFF must still be bit-identical to the pre-tranche one.
+    let mut role_off_wide = short(FcArm::F_OPEN.scenario());
+    role_off_wide.adversaries[0].dials.friend_preference = false;
+    role_off_wide.adversaries[0].dials.friend_preference_margin = 0.75;
+    assert!(
+        metrics_bit_eq(&run_one_seed(&role_off_wide, 42).metrics, &b),
+        "AdvDials::friend_preference = false ⇒ the per-role margin changes nothing at all"
+    );
+    // …and the same world with the role dial ON is DIFFERENT — otherwise Part D would pass just as
+    // well on a dead switch.
+    let mut role_on = short(FcArm::F_PREF_CIRCLE.scenario());
+    role_on.horizon = 40;
+    assert!(
+        !metrics_bit_eq(&run_one_seed(&role_on, 42).metrics, &b),
+        "AdvDials::friend_preference = true ⇒ the world moves (the gate is a real gate)"
+    );
+    // Part E — the anchor that actually covers the NEW CODE PATH. Parts A-D all live in worlds
+    // where the owner-side hook returns `None`, but parts A-C live in worlds with no adversary role
+    // at all, so `adv_action` is never even reached on the placement path there. The A7 world is
+    // the one with role-carrying OWNERS, so the placement path now consults a hook for every symbol
+    // they place. These are the SAME frozen pre-tranche seed-42 numbers the A8 anchor uses (`A7_*`,
+    // measured on HEAD `e53d293`) — if the consultation perturbed anything, they would move.
+    let a7 = run_one_seed(&a7_sybil(), 42).metrics;
+    assert_eq!(a7.alive_symbols, A7_ANCHOR_ALIVE, "A7 world alive_symbols");
+    assert_eq!(a7.evicts, A7_ANCHOR_EVICTS, "A7 world evicts");
+    assert_eq!(a7.preempts, A7_ANCHOR_PREEMPTS, "A7 world preempts");
+    assert_eq!(a7.cap_trims, A7_ANCHOR_CAP_TRIMS, "A7 world cap_trims");
+}
+
+#[test]
+fn friend_preference_order_matches_the_kernel_ranking_it_reorders() {
+    // ⚗ THE PIN THE ENGINE COMMENT CITES (review W12 — it cited a test that did not exist). The
+    // preference branch RE-SCORES the kernel's ranked list with `estimate_block_survival(committed
+    // ∪ {cand})` and then reorders on that score. The claim "margin 0 is a pure tie-break, so the
+    // dial cannot silently re-rank" only holds if that recompute reproduces the ORDER the kernel
+    // itself produced — otherwise the reorder would be a second, drifting estimator.
+    //
+    // Checked on the real kernel, not on hand-made numbers: build a world, take the kernel's own
+    // `place_incremental_rank` output, re-score exactly as the engine branch does, and compare.
+    use crate::sim_dynamic::engine::friend_preference_order_for_test as order;
+    use viaticum_core::four_r::{
+        BlockReq, PlacementPolicy, SurfacePrior, estimate_block_survival, place_incremental_rank,
+    };
+    let params = DynParams::default();
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let mut w = build_world(12, &params, 9);
+    for nd in w.nodes.iter_mut() {
+        nd.present = true;
+        nd.joined_tick = 0;
+        nd.holdings.clear();
+    }
+    // Give the pairs DIFFERENT first-hand histories so the kernel's ranking is a real order and not
+    // a field of structural zeros — otherwise the comparison below would be vacuous.
+    let v0 = params.block_volume / params.k_eff as f64;
+    for h in 1..12 {
+        w.capital[0][h].pos_window = vec![true; h];
+        w.capital[0][h].g_oh = 5.0 * h as f64;
+        w.capital[0][h].v_dem = v0;
+    }
+    let req = BlockReq {
+        volume: params.block_volume,
+        n_symbols: params.n_symbols,
+        k_eff: params.k_eff,
+        tau: 7.0,
+        r_target: params.r_target,
+        r_min: params.r_min,
+    };
+    // The block already carries `k_eff` symbols, so the marginal `R̂(committed ∪ {cand})` is a real
+    // number rather than the structural zero every below-`k_eff` candidate scores. Without this the
+    // comparison below would be vacuous — every candidate would tie at 0.0.
+    let obs_of = |hs: &[usize]| {
+        let nodes: Vec<&crate::sim_dynamic::generator::Node> =
+            hs.iter().map(|&h| &w.nodes[h]).collect();
+        let caps: Vec<&PairCapital> = hs.iter().map(|&h| &w.capital[0][h]).collect();
+        crate::sim_dynamic::observer::observe_candidates(&nodes, &caps, 7.0, v0)
+    };
+    let committed: Vec<usize> = (9..12).collect();
+    let cand_idx: Vec<usize> = (1..9).collect();
+    let cand_obs = obs_of(&cand_idx);
+    let already = obs_of(&committed);
+    let ranked = place_incremental_rank(&req, &cand_obs, &already, &prior, &policy);
+    assert!(
+        ranked.len() > 2,
+        "the kernel ranked {} candidates — too few to compare an order",
+        ranked.len()
+    );
+    // The engine branch's re-score, verbatim (minus the friend flag, which is what we vary).
+    let rescore = |friend: &dyn Fn(usize) -> bool| -> Vec<(usize, bool, f64)> {
+        ranked
+            .iter()
+            .map(|&local| {
+                let mut ext = already.clone();
+                ext.push(cand_obs[local].clone());
+                (
+                    local,
+                    friend(local),
+                    estimate_block_survival(&ext, &prior, &req, &policy),
+                )
+            })
+            .collect()
+    };
+    // (1) NO FRIENDS ⇒ the identity on the kernel's own order, at every margin. This is the pin:
+    //     the re-score does not re-rank.
+    let no_friends = rescore(&|_| false);
+    for margin in [0.0, 0.01, 0.5, 1.0] {
+        assert_eq!(
+            order(&no_friends, margin),
+            ranked,
+            "margin {margin}: the re-score reproduces the kernel's order exactly"
+        );
+    }
+    // (2) MARGIN 0 IS A PURE TIE-BREAK against the kernel's own scores: making the kernel's
+    //     TOP-ranked candidate a friend changes nothing (it is already first), and making a
+    //     strictly-worse-scoring candidate a friend also changes nothing, because a strict
+    //     inequality is not a tie. The re-scored values are the ones that decide, so this is a
+    //     statement about the real kernel numbers, not about invented ones.
+    let best_score = no_friends
+        .iter()
+        .map(|c| c.2)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let strictly_worse: Vec<usize> = no_friends
+        .iter()
+        .filter(|c| c.2 < best_score)
+        .map(|c| c.0)
+        .collect();
+    assert!(
+        !strictly_worse.is_empty(),
+        "the kernel's re-scored values are all tied — this world cannot test the bound"
+    );
+    let worse = strictly_worse[0];
+    assert_eq!(
+        order(&rescore(&|l| l == worse), 0.0),
+        ranked,
+        "margin 0 does NOT promote a strictly worse-scoring friend"
+    );
+    // (3) AT THE CEILING the same friend IS promoted — so the bound, not the branch, is what held
+    //     it back in (2).
+    assert_eq!(
+        order(&rescore(&|l| l == worse), 1.0)[0],
+        worse,
+        "margin 1.0 promotes the same friend the tie-break refused"
+    );
+}
+
+#[test]
+fn a_four_member_circle_cannot_reach_min_width_inside_itself() {
+    // THE STRUCTURAL FACT behind the whole tranche, as arithmetic rather than as a measurement
+    // (spec §4.4). A block is never placed thinner than
+    // `min_width = min(k_eff + MIN_REDUNDANCY, n_symbols)` distinct holders — the daemon's
+    // `solve_n_for_target` minimum, mirrored by `engine::min_width`. A member of a circle of N has
+    // N−1 possible friend-holders (it cannot hold its own symbol). So a circle can hold ONE WHOLE
+    // BLOCK of its own inside itself only while `N − 1 ≥ min_width`.
+    use crate::sim_dynamic::engine::min_width_for_test as min_width;
+    let params = friend_circle().world.base;
+    let w = min_width(&params);
+    assert_eq!(w, 4, "min_width = min(k_eff + MIN_REDUNDANCY, n_symbols)");
+    // At the product's size the circle is one holder SHORT — and no dial in this tranche changes
+    // that, because none of them touches k_eff, MIN_REDUNDANCY or n_symbols.
+    assert!(
+        FC_TEST_N - 1 < w,
+        "a four-member circle offers {} friend-holders for a block that needs {w}",
+        FC_TEST_N - 1
+    );
+    // Six and eight members do reach it — which is why the tranche sweeps N ∈ {4, 6, 8} for the
+    // SHAPE of the effect and freezes the answer at 4.
+    for n in [6usize, 8] {
+        assert!(n > w, "a circle of {n} can hold a whole block at home");
+    }
+    // ⚠ AND THE SWEEP SAYS THIS RULE IS NOT THE WHOLE MECHANISM. Reaching `min_width` is not
+    // reaching `r_target`: the width loop keeps placing until `R̂ ≥ r_target`, which in this world
+    // wants more buckets than the floor minimum. If the width rule were the whole story the sealed
+    // penalty would vanish at N = 5; measured, the sealed/open ratio is 0.53× / 0.61× / 1.19× at
+    // N = 4/6/8, so a sealed SIX-circle still pays despite clearing the minimum. This test pins the
+    // rule, which is exact — it does not license "the structural explanation accounts for the
+    // penalty at every size". See `friend_circle`'s conclusion (5).
+    // The instrument refinement does NOT move the structural point: block granularity changes the
+    // per-block VOLUME, never the width rule.
+    for b in [3usize, 6, 9, 18] {
+        assert_eq!(
+            min_width(&friend_circle_at_granularity(b).world.base),
+            w,
+            "granularity {b} leaves min_width alone"
+        );
+    }
+}
+
+#[test]
+fn friend_circle_is_registered_with_the_frozen_world() {
+    let sc = find_scenario("friend_circle").expect("friend_circle is registered");
+    assert_eq!(sc.id.as_str(), "friend_circle");
+    assert_eq!(sc.adversaries[0].id, AdvId::A8CollusionRing);
+    assert_eq!(sc.adversaries[0].count, FC_TEST_N, "circle size mirror");
+    assert_eq!(
+        sc.world.base.blocks_per_node, FC_TEST_BLOCKS,
+        "instrument resolution mirror"
+    );
+    assert_eq!(sc.seeds.len(), FC_SEEDS.len(), "ten seeds (spec §1)");
+    assert_eq!(sc.seeds, FC_SEEDS.to_vec(), "seeds 42..51");
+    // The registered arm is F-open: honest holder policy, no collusion, no preference.
+    assert!(!sc.adversaries[0].dials.collude, "no collusion in any arm");
+    assert!(
+        !sc.adversaries[0].dials.serve_ring_only,
+        "the registered arm holds ANYONE (F-open)"
+    );
+    assert_eq!(
+        sc.adversaries[0].dials.whale_accept.to_bits(),
+        1.0f64.to_bits(),
+        "F-open accepts everything"
+    );
+    assert!(
+        !sc.world.base.friend_preference,
+        "the ⚗ preference is OFF in the registered world"
+    );
+    assert!(
+        !sc.adversaries[0].dials.friend_preference,
+        "…in BOTH scopes: the per-role preference is off too"
+    );
+    // The PRE-REGISTERED calibration criterion, asserted rather than trusted (review BLOCK-4): the
+    // spec's rule is the PER-OWNER quantum `1/met ≤ 0.1`, and the frozen rung is the smallest
+    // exactly-compensating one that meets it. `met` is a measured quantity, but its CEILING is
+    // structural — an owner cannot meet a target on more blocks than it owns — so the rung's
+    // eligibility is checkable here without a run: `1/blocks_per_node ≤ 0.1` is NECESSARY, and the
+    // calibration test prints the achieved `1/met` beside it.
+    // …and the SMALLER exactly-compensating rungs are checked to FAIL it, so the assertion below is
+    // a real selection among the ladder's rungs and not a constant that happens to hold.
+    let per_owner_quantum_ceiling = |b: usize| 1.0 / b as f64;
+    assert!(
+        per_owner_quantum_ceiling(sc.world.base.blocks_per_node) <= 0.1,
+        "the frozen rung can reach the pre-registered per-owner quantum ≤ 0.1 (B = {})",
+        sc.world.base.blocks_per_node
+    );
+    for b in [3usize, 6, 9] {
+        assert!(
+            per_owner_quantum_ceiling(b) > 0.1,
+            "rung B = {b} structurally cannot reach the pre-registered quantum — including B = 9, \
+             the rung this tranche first froze"
+        );
+    }
+    // ⚠ AND THE SPEC'S OTHER PRE-REGISTRATION WAS ABANDONED — say it out loud (review N1). Spec §1
+    // names TWO things: a CANDIDATE WINDOW («кандидат 8-12») and a CRITERION («калибровать, чтобы
+    // квант ≤ 0.1»). B = 18 is outside the window. Nothing is hidden by that, but the tranche never
+    // stated that it had dropped half of its own pre-registration, and an unremarked departure from
+    // a pre-registration is exactly what a pre-registration exists to make visible.
+    //
+    // The two are INCONSISTENT IN THIS WORLD, and the arithmetic needs no run. A rung is admissible
+    // only if it is EXACTLY-COMPENSATING — all three of source volume, realised upload gb/tick and
+    // demand-arrival tick budget unchanged (`friend_circle_world_at_three_blocks_is_the_a8_world`
+    // pins those three) — because otherwise refining the ruler moves the world. Asserted below:
+    // across the whole window 8..=12 exactly ONE rung compensates (B = 9), and it is the rung the
+    // loop above just showed cannot reach the quantum. So no rung in the spec's window satisfies the
+    // spec's criterion; the criterion won, because it is the one §1 calls the calibration target and
+    // the one that is checkable. (B = 12 fails on the demand budget: 18/12 floors to 1, so its
+    // budget is 12 ticks, not 18.)
+    use crate::sim_dynamic::engine::symbols_per_tick_for_test as budget;
+    let exactly_compensating = |b: usize| {
+        let p = friend_circle_at_granularity(b).world.base;
+        let v = p.block_volume / p.k_eff as f64;
+        (p.blocks_per_node as f64 * p.block_volume - 150.0).abs() < 1e-9
+            && (budget(p.bandwidth_u, v) as f64 * v - 25.0).abs() < 1e-9
+            && p.blocks_per_node as u64 * p.maturation_ticks_per_block == 18
+    };
+    let window: Vec<usize> = (8..=12).filter(|&b| exactly_compensating(b)).collect();
+    assert_eq!(
+        window,
+        vec![9],
+        "of the spec's candidate window 8-12 only B = 9 holds the world still"
+    );
+    assert!(
+        per_owner_quantum_ceiling(9) > 0.1,
+        "…and B = 9 cannot reach the pre-registered quantum, so the window and the criterion are \
+         incompatible in this world and the criterion is the one that was honoured"
+    );
+    assert!(
+        exactly_compensating(FC_TEST_BLOCKS),
+        "the frozen rung B = {FC_TEST_BLOCKS} is exactly-compensating (outside the window, inside \
+         the criterion)"
+    );
+    // The board world, as A8's: without the known giver-priority owner-ordering sim artifact.
+    assert!(!sc.world.base.giver_priority_order);
+    // NO new board row (spec §3): a friend circle is a measurement, not an invariant.
+    assert_eq!(sc.verdicts.len(), 2, "only the house structural pair");
+    assert!(sc.verdicts.iter().any(|v| v.id == "INV-DETERMINISM"));
+    assert!(sc.verdicts.iter().any(|v| v.id == "INV-ANTI-ORACLE"));
+}
+
+#[test]
+fn friend_circle_world_at_three_blocks_is_the_a8_world() {
+    // THE LADDER'S FIRST RUNG IS THE WORLD BEING REFINED. The resolution ladder is only meaningful
+    // if raising the granularity is the ONLY thing it does, so rung one must reproduce A8's world.
+    use crate::sim_dynamic::engine::symbols_per_tick_for_test as budget;
+    let a8 = a8_ring().world.base;
+    let fc3 = friend_circle_at_granularity(3).world.base;
+    assert_eq!(fc3.blocks_per_node, a8.blocks_per_node, "blocks/node");
+    assert_eq!(
+        fc3.block_volume.to_bits(),
+        a8.block_volume.to_bits(),
+        "block volume"
+    );
+    assert_eq!(
+        fc3.maturation_ticks_per_block, a8.maturation_ticks_per_block,
+        "demand-arrival cadence"
+    );
+    assert_eq!(fc3.giver_priority_order, a8.giver_priority_order);
+    assert_eq!(fc3.v_free_symbols.to_bits(), a8.v_free_symbols.to_bits());
+    // `bandwidth_u` is the ONE nominal difference (25 vs A8's 20) and it is behaviourally NONE:
+    // `symbols_per_tick` floors both to a single 25 gb symbol per tick. Writing the REALISED rate
+    // is what makes the higher rungs exact instead of accidental.
+    let v_sym = fc3.block_volume / fc3.k_eff as f64;
+    assert_eq!(budget(a8.bandwidth_u, v_sym), 1, "A8 uploads 1 symbol/tick");
+    assert_eq!(budget(fc3.bandwidth_u, v_sym), 1, "rung one, identically");
+    // And every rung of the ladder holds the three compensated quantities EXACTLY constant.
+    for b in [3usize, 6, 9, 18] {
+        let p = friend_circle_at_granularity(b).world.base;
+        let v = p.block_volume / p.k_eff as f64;
+        assert!(
+            (p.blocks_per_node as f64 * p.block_volume - 150.0).abs() < 1e-9,
+            "rung {b}: per-node source volume"
+        );
+        assert!(
+            (budget(p.bandwidth_u, v) as f64 * v - 25.0).abs() < 1e-9,
+            "rung {b}: realised upload gb/tick"
+        );
+        assert_eq!(
+            p.blocks_per_node as u64 * p.maturation_ticks_per_block,
+            18,
+            "rung {b}: demand-arrival budget in ticks"
+        );
+    }
+}
+
+#[test]
+fn fc_share_held_by_generalises_the_a8_intra_share_metric() {
+    // The circle-ness reading rests on comparing two shares computed the SAME way, so the local
+    // helper must be the A8 metric generalised — not a second, subtly different counter. Checked on
+    // a hand-built world (no horizon run): one ring symbol at home, one abroad, one stranger symbol
+    // on the ring, plus a self-held symbol that BOTH reads must ignore.
+    let params = DynParams::default();
+    let mut w = build_world(6, &params, 3);
+    for nd in w.nodes.iter_mut() {
+        nd.present = true;
+        nd.holdings.clear();
+    }
+    let ring = [4usize, 5];
+    let sym = |owner: usize, cream: bool| HeldSymbol {
+        owner,
+        block: 0,
+        volume: 1.0,
+        alive: true,
+        cream,
+        iota: 0.5,
+    };
+    w.nodes[5].holdings.push(sym(4, false)); // ring symbol at home
+    w.nodes[0].holdings.push(sym(4, true)); // ring symbol abroad (cream)
+    w.nodes[4].holdings.push(sym(0, false)); // a stranger's symbol on the ring
+    w.nodes[4].holdings.push(sym(4, false)); // self-held: invisible to both reads
+    assert_eq!(
+        fc_share_held_by(&w, &ring, &ring).to_bits(),
+        group_intra_share(&w, &ring).to_bits(),
+        "the generalised read IS group_intra_share when owners == holders"
+    );
+    // Half the ring's symbols are at home; ALL of the (one) outsider symbol placed abroad is on the
+    // ring — the two questions the homing factor divides.
+    assert!((fc_share_held_by(&w, &ring, &ring) - 0.5).abs() < 1e-12);
+    assert!((fc_share_held_by(&w, &[0usize, 1, 2, 3], &ring) - 1.0).abs() < 1e-12);
+    // The floor/cream split partitions the same symbols.
+    assert!((fc_share_held_by_class(&w, &ring, &ring, false) - 1.0).abs() < 1e-12);
+    assert!((fc_share_held_by_class(&w, &ring, &ring, true) - 0.0).abs() < 1e-12);
+}
+
+#[test]
+fn friend_circle_stepped_world_mirrors_the_runner() {
+    // The measurement helper builds its worlds directly (`build_world` + `inject_adversaries` +
+    // `step`) instead of going through the runner, exactly as A8's does. That claim is PINNED here
+    // rather than asserted in a doc comment: the alive-symbol count of the hand-stepped world must
+    // equal the runner's own god-view metric for the same arm and seed.
+    let (w, _) = fc_stepped_world(FcArm::F_OPEN, 42);
+    let alive: usize = w
+        .nodes
+        .iter()
+        .filter(|nd| nd.present)
+        .map(|nd| nd.holdings.iter().filter(|s| s.alive).count())
+        .sum();
+    let m = run_one_seed(&FcArm::F_OPEN.scenario(), 42).metrics;
+    assert_eq!(
+        alive, m.alive_symbols,
+        "the hand-stepped world is the runner's world"
+    );
+}
+
+#[test]
+fn friend_circle_runs_are_deterministic_across_a_double_run() {
+    // INV-DETERMINISM over all four arms, including BOTH scopes of the ⚗ preference branch: it
+    // draws no RNG, iterates by index and re-scores with the same kernel call, so two runs are
+    // bit-identical. The per-role scope additionally routes through the behaviour hook, which is a
+    // pure `fn(&AdvContext)` — no world, no RNG, no clock.
+    //
+    // ⏱ Run at the LADDER'S FIRST RUNG (B = 3, A8's own world), not at the frozen one. Determinism
+    // is a property of the CODE PATH — no RNG draw, index iteration, pure hook — and the rung
+    // changes only how finely the same source volume is cut, exercising the identical branches. The
+    // frozen rung is 6× the work per run and `run()` also builds a matched twin per seed, so
+    // insisting on it here would cost ~an hour of suite time to re-check a boolean. The FROZEN rung
+    // is separately covered below, once, on the registered scenario.
+    for arm in [
+        FcArm::F_OPEN,
+        FcArm::F_CLOSED,
+        FcArm::F_PREF_CIRCLE,
+        FcArm::F_PREF_WORLD,
+    ] {
+        let mut sc = arm.with_blocks(3).scenario();
+        sc.seeds = vec![42, 43];
+        let seeds = sc.seeds.clone();
+        let r1 = run(&sc, &seeds);
+        let r2 = run(&sc, &seeds);
+        for (a, b) in r1.per_seed.iter().zip(&r2.per_seed) {
+            assert!(metrics_bit_eq(a, b), "{}: god-view metrics", arm.label);
+        }
+        let v = evaluate_board(&sc, &r1);
+        assert_eq!(
+            v.iter().find(|x| x.id == "INV-DETERMINISM").unwrap().kind,
+            VerdictKind::Pass,
+            "{}: INV-DETERMINISM",
+            arm.label
+        );
+        assert_eq!(
+            v.iter().find(|x| x.id == "INV-ANTI-ORACLE").unwrap().kind,
+            VerdictKind::Pass,
+            "{}: INV-ANTI-ORACLE",
+            arm.label
+        );
+    }
+    // …and ONCE at the FROZEN rung, on the REGISTERED scenario — the world a board run would
+    // actually execute. One seed and a short horizon: a double-run either reproduces itself or it
+    // does not, and it does so on tick 1 as surely as on tick 130.
+    let mut frozen = friend_circle();
+    frozen.seeds = vec![42];
+    frozen.horizon = 40;
+    let seeds = frozen.seeds.clone();
+    let r1 = run(&frozen, &seeds);
+    let r2 = run(&frozen, &seeds);
+    for (a, b) in r1.per_seed.iter().zip(&r2.per_seed) {
+        assert!(metrics_bit_eq(a, b), "frozen rung: god-view metrics");
+    }
+    let v = evaluate_board(&frozen, &r1);
+    assert_eq!(
+        v.iter().find(|x| x.id == "INV-DETERMINISM").unwrap().kind,
+        VerdictKind::Pass,
+        "frozen rung: INV-DETERMINISM"
+    );
+    assert_eq!(
+        v.iter().find(|x| x.id == "INV-ANTI-ORACLE").unwrap().kind,
+        VerdictKind::Pass,
+        "frozen rung: INV-ANTI-ORACLE"
+    );
+}
+
+// ------------------------------------------------------------------
+// §1 — THE INSTRUMENT, calibrated before anything is read off it
+// ------------------------------------------------------------------
+
+#[test]
+#[ignore = "friend-circle resolution calibration — run with --ignored --nocapture for the ladder"]
+fn friend_circle_calibration_prints_metric_resolution_and_intra_share_by_size() {
+    // SPEC §1, THE METHODOLOGICAL DEBT A8 LEFT. The per-owner decodable read is
+    // `decodable / target_ever_met` over that owner's OWN blocks, so its QUANTUM is `1/met` — with
+    // A8's three blocks per node that is a third, and the level being measured was itself ~0.2. The
+    // whole σ ≈ 0.14 came from the instrument.
+    //
+    // The ladder raises the block granularity at CONSTANT per-node source volume, CONSTANT realised
+    // upload rate and CONSTANT demand-arrival rate (`registry::friend_circle_params`), so the world
+    // is held still and only the division changes. Rung one (B = 3) reproduces A8's world exactly
+    // (`friend_circle_world_at_three_blocks_is_the_a8_world`), which is what makes the columns
+    // comparable at all.
+    //
+    // ⚠⚠ THE COLUMN THAT REORDERS THE TRANCHE (review BLOCK-1/2/4) IS `closed/open`. The ladder was
+    // first read as a pure instrument sweep — "pick a resolution, the world does not move" — and it
+    // is not: the SIZE OF THE MEASURED EFFECT varies along it, from 0.30× at A8's own rung to ~0.8×
+    // at B = 9. A ladder that changes the answer is not a resolution knob, it is part of the
+    // measurement, so this table prints BOTH arms per rung, paired, with the ratio and the t.
+    //
+    // THE FREEZE RULE, pre-registered in the spec (§1: «калибровать, чтобы квант ≤ 0.1») and now
+    // honoured LITERALLY: the smallest exactly-compensating rung whose PER-OWNER quantum `1/met` is
+    // ≤ 0.1. That is B = 18. The tranche first froze B = 9 on a substituted criterion (the GROUP
+    // quantum) and B = 9 turned out to be the rung where the effect is smallest — which is exactly
+    // the failure mode a pre-registration exists to prevent, so the pre-registration wins.
+    //
+    // ⚠ THE SPEC'S OTHER HALF WAS DROPPED, AND IT IS NAMED HERE RATHER THAN LEFT IMPLICIT (review
+    // N1): §1 also pre-registers a CANDIDATE WINDOW («кандидат 8-12»), and B = 18 is outside it. The
+    // window and the criterion are incompatible in this world — of 8..=12 only B = 9 is
+    // exactly-compensating and B = 9 cannot reach the quantum — so one of them had to go, and the
+    // criterion is the one §1 calls the calibration target. Asserted, not asserted-in-prose, by
+    // `friend_circle_is_registered_with_the_frozen_world`.
+    //
+    // ⚠ NOTE-16, the group-lattice arithmetic, corrected: `group_decodable_fraction` is a MEAN OF
+    // PER-OWNER RATIOS over present members, so the group lattice is NOT uniform and `quant_1 / N`
+    // is not "the group quantum". A member with `met = 3` in a four-circle moves the group mean by
+    // 1/12 whatever the other three have. The honest coarsest step is `1 / (N · min_i met_i)`,
+    // printed here as `step_max`, and the σ/step column is taken against THAT.
+    println!(
+        "\n=== friend-circle resolution ladder | N={FC_TEST_N} | n=120 | horizon=130 | seeds 42..51 ==="
+    );
+    println!(
+        "  {:<9} {:>2}  {:>7} {:>7} {:>8} {:>8}  {:>13} {:>7}  {:>13} {:>7}  {:>7} {:>8} {:>7}  {:>7} {:>8}  {:>9} {:>9}  {:>13} {:>9}",
+        "arm",
+        "B",
+        "met/mbr",
+        "met_min",
+        "quant_1",
+        "step_max",
+        "decodable",
+        "σ/step",
+        "vs F-open",
+        "t(9)",
+        "intra",
+        "out→ring",
+        "homing",
+        "placed",
+        "out→plcd",
+        "took",
+        "gave",
+        "dec_out",
+        "alive_sym",
+    );
+    for b in [3usize, 6, 9, 18] {
+        let open = fc_reads(FcArm::F_OPEN.with_blocks(b));
+        let open_dec = fc_col(&open, |r| r.dec_ring);
+        let (om, _) = mean_sigma(&open_dec);
+        for arm in [FcArm::F_OPEN, FcArm::F_CLOSED] {
+            let reads = if arm.label == FcArm::F_OPEN.label {
+                open.clone()
+            } else {
+                fc_reads(arm.with_blocks(b))
+            };
+            let dec = fc_col(&reads, |r| r.dec_ring);
+            let (dm, ds) = mean_sigma(&dec);
+            let met = mean_sigma(&fc_col(&reads, |r| r.met_ring)).0;
+            let met_min = mean_sigma(&fc_col(&reads, |r| r.met_min_ring)).0;
+            let quant_1 = if met > 0.0 { 1.0 / met } else { f64::NAN };
+            // NOTE-16: the COARSEST step a single member can impose on the group mean.
+            let step_max = if met_min > 0.0 {
+                1.0 / (met_min * arm.n as f64)
+            } else {
+                f64::NAN
+            };
+            let ps = paired_stats(&dec, &open_dec);
+            println!(
+                "  {:<9} {b:>2}  {met:>7.2} {met_min:>7.2} {quant_1:>8.3} {step_max:>8.3}  \
+                 {:>13} {:>7.2}  {:>13} {:>7.2}  {:>7.3} {:>8.3} {:>7.2}  {:>7.3} {:>8.3}  \
+                 {:>9.0} {:>9.0}  {:>13} {:>9.0}",
+                arm.label,
+                format!("{dm:.3}±{ds:.3}"),
+                if step_max > 0.0 {
+                    ds / step_max
+                } else {
+                    f64::NAN
+                },
+                if arm.label == FcArm::F_OPEN.label {
+                    "—".to_string()
+                } else {
+                    format!("{:.2}× p={:.3}", dm / om, fc_student_p(ps.t))
+                },
+                if arm.label == FcArm::F_OPEN.label {
+                    f64::NAN
+                } else {
+                    ps.t
+                },
+                mean_sigma(&fc_col(&reads, |r| r.intra)).0,
+                mean_sigma(&fc_col(&reads, |r| r.outsiders_on_ring)).0,
+                fc_homing_rom(&reads, |r| r.intra, |r| r.outsiders_on_ring, arm.n),
+                mean_sigma(&fc_col(&reads, |r| r.intra_ever)).0,
+                mean_sigma(&fc_col(&reads, |r| r.outsiders_on_ring_ever)).0,
+                mean_sigma(&fc_col(&reads, |r| r.took)).0,
+                mean_sigma(&fc_col(&reads, |r| r.gave)).0,
+                format!(
+                    "{:.3}±{:.3}",
+                    mean_sigma(&fc_col(&reads, |r| r.dec_out)).0,
+                    mean_sigma(&fc_col(&reads, |r| r.dec_out)).1
+                ),
+                mean_sigma(&fc_col(&reads, |r| r.world_alive_symbols)).0,
+            );
+        }
+    }
+    println!(
+        "  ⚠ READ `closed/open` DOWN THE LADDER, NOT ACROSS ONE ROW: the OUTSIDER aggregate (116\n  \
+           nodes, `dec_out`) is what holds still; the four measured nodes do not. `intra`, `homing`\n  \
+           and the ratio all swing by 2-3× along a sweep that was only supposed to change the ruler."
+    );
+    // The ⚗ preference's own knob, swept at the frozen resolution: how much marginal survival a
+    // promotion is allowed to cost. 1.0 is the CEILING arm the tranche headlines (`FC_PREF_MARGIN`);
+    // the smaller ones are the price curve. Swept on the CIRCLE-ONLY scope — the product's question.
+    //
+    // ⚠ READ THE ORDERING OF THIS TABLE AS STRUCTURE, NOT AS EVIDENCE (review W4). The four arms
+    // share seeds and are NESTED — margin 0 promotes a SUBSET of what 0.01 promotes, which is a
+    // subset of the ceiling's — so a monotone column is close to structurally expected and does not
+    // constitute four independent confirmations of anything. The load-bearing statistic is the
+    // paired arm test at the ceiling, and it says p = 0.21. What this table IS good for: margin 0 is
+    // not a mild setting (below `k_eff` every candidate ties at exactly 0.0, so a "pure tie-break"
+    // is already friend-first for the first `k_eff` symbols of every block) and the F-open → margin-0
+    // step is accordingly the largest one in the sweep.
+    println!(
+        "\n=== ⚗ F-pref/circle margin sweep | N={FC_TEST_N} | B={FC_TEST_BLOCKS} | seeds 42..51 ==="
+    );
+    println!(
+        "  {:<14} {:>13} {:>13} {:>13} {:>7} {:>13} {:>8} {:>8} {:>9} {:>9}",
+        "margin",
+        "decodable",
+        "intra",
+        "intra_flr",
+        "homing",
+        "placed",
+        "out→plcd",
+        "hom_plcd",
+        "took",
+        "gave"
+    );
+    for margin in [0.0f64, 0.01, 0.10, 1.0] {
+        let reads = fc_reads(FcArm::F_PREF_CIRCLE.with_margin(margin));
+        let (dm, ds) = mean_sigma(&fc_col(&reads, |r| r.dec_ring));
+        let sig = |f: fn(&FcRead) -> f64| {
+            let (m, s) = mean_sigma(&fc_col(&reads, f));
+            format!("{m:.3}±{s:.3}")
+        };
+        println!(
+            "  {:<14} {:>13} {:>13} {:>13} {:>7.2} {:>13} {:>8.3} {:>8.2} {:>9.0} {:>9.0}",
+            format!("{margin:.2}"),
+            format!("{dm:.3}±{ds:.3}"),
+            sig(|r| r.intra),
+            sig(|r| r.intra_floor),
+            fc_homing_rom(&reads, |r| r.intra, |r| r.outsiders_on_ring, FC_TEST_N),
+            sig(|r| r.intra_ever),
+            mean_sigma(&fc_col(&reads, |r| r.outsiders_on_ring_ever)).0,
+            fc_homing_rom(
+                &reads,
+                |r| r.intra_ever,
+                |r| r.outsiders_on_ring_ever,
+                FC_TEST_N
+            ),
+            mean_sigma(&fc_col(&reads, |r| r.took)).0,
+            mean_sigma(&fc_col(&reads, |r| r.gave)).0,
+        );
+    }
+}
+
+#[test]
+#[ignore = "friend-circle deliverable table — run with --ignored --nocapture"]
+fn friend_circle_four_arms_by_size_print_the_product_answer_table() {
+    // SPEC §6 — THE DELIVERABLE. FOUR behaviours × N ∈ {4, 6, 8} × ten seeds, one world, at the
+    // frozen resolution. N = 4 is the frozen answer (the product's literal case); 6 and 8 are the
+    // SHAPE, and 8 is where A8 froze — so the table also shows how much of A8's friendly answer was
+    // its choice of size.
+    //
+    // ⚠ EVERY ARM IS PRINTED, AND THE WHOLE ROW (review BLOCK-5). The first version of this table
+    // dropped the F-pref column from the reported findings; the F-pref points turned out to carry
+    // the tranche's LARGEST effect and to point the OPPOSITE way from the prose. A deliverable table
+    // that reports the arm confirming the story and not the arm contradicting it is not a
+    // deliverable. σ is printed beside every level, so no ratio can be read without its noise.
+    println!(
+        "\n=== friend circle: four behaviours × size | B={FC_TEST_BLOCKS} | n=120 | horizon=130 | seeds 42..51 ==="
+    );
+    println!(
+        "  {:<9} {:>2}  {:>13} {:>16}  {:>13} {:>13} {:>7}  {:>13}  {:>9} {:>9} {:>10}  {:>13}",
+        "arm",
+        "N",
+        "decodable",
+        "vs F-open",
+        "intra",
+        "out→ring",
+        "homing",
+        "placed",
+        "took",
+        "gave",
+        "net",
+        "dec_out",
+    );
+    for n in [FC_TEST_N, 6, 8] {
+        let base = fc_reads(FcArm::F_OPEN.with_n(n));
+        let base_dec = fc_col(&base, |r| r.dec_ring);
+        for arm in [
+            FcArm::F_OPEN,
+            FcArm::F_CLOSED,
+            FcArm::F_PREF_CIRCLE,
+            FcArm::F_PREF_WORLD,
+        ] {
+            let reads = if arm.label == FcArm::F_OPEN.label {
+                base.clone()
+            } else {
+                fc_reads(arm.with_n(n))
+            };
+            let dec = fc_col(&reads, |r| r.dec_ring);
+            let (dm, ds) = mean_sigma(&dec);
+            let ps = paired_stats(&dec, &base_dec);
+            let (om, _) = mean_sigma(&base_dec);
+            let took = mean_sigma(&fc_col(&reads, |r| r.took)).0;
+            let gave = mean_sigma(&fc_col(&reads, |r| r.gave)).0;
+            let sig = |f: fn(&FcRead) -> f64| {
+                let (m, s) = mean_sigma(&fc_col(&reads, f));
+                format!("{m:.3}±{s:.3}")
+            };
+            println!(
+                "  {:<9} {n:>2}  {:>13} {:>16}  {:>13} {:>13} {:>7.2}  {:>13}  {took:>9.0} {gave:>9.0} {:>10.0}  {:>13}",
+                arm.label,
+                format!("{dm:.3}±{ds:.3}"),
+                if arm.label == FcArm::F_OPEN.label {
+                    "—".to_string()
+                } else {
+                    format!(
+                        "{:.2}× p={:.3} t{:+.2}",
+                        if om > 0.0 { dm / om } else { f64::NAN },
+                        fc_student_p(ps.t),
+                        ps.t
+                    )
+                },
+                sig(|r| r.intra),
+                sig(|r| r.outsiders_on_ring),
+                fc_homing_rom(&reads, |r| r.intra, |r| r.outsiders_on_ring, n),
+                sig(|r| r.intra_ever),
+                took - gave,
+                sig(|r| r.dec_out),
+            );
+        }
+    }
+    println!(
+        "  ⚠ SCOPE CAVEAT ON EVERY RATIO ABOVE (review NOTE-15): the `dec_out` column is the honest,\n  \
+           well-connected, never-churning outsider population, and it sits at ≈ 0.3. In EVERY arm,\n  \
+           circle and outsiders alike, roughly two thirds of once-durable blocks are NOT decodable at\n  \
+           the horizon. These are ratios between two bad states, and the cause is a documented\n  \
+           bandwidth starvation in the SIM world ([MED/SIM-EXPERIMENT] in tech-debt): the REALISED\n  \
+           per-owner upload budget is 25 gb/tick against a 150 gb per-node source volume, held\n  \
+           constant at every rung. ⚠ At THIS rung that is `bandwidth_u = 25` against a 4.17 gb chunk\n  \
+           = SIX symbols/tick — the familiar 'one 25 gb symbol per tick' describes rung one, not the\n  \
+           frozen world (review NOTE-2); same gb/tick, same conclusion, different chunk. No level here\n  \
+           transfers to a world that can afford to maintain what it placed; only the CONTRASTS do."
+    );
+}
+
+// ------------------------------------------------------------------
+// the arms — the product answer, one behaviour per test (the two ⚗ preference SCOPES share a test
+// so they share one matched control)
+// ------------------------------------------------------------------
+
+/// The two-sided Student-t p at **ν = 9** — the df of this tranche's ten-seed paired design.
+///
+/// `recip::student_two_sided_p` is deliberately EXACT-OR-NOTHING and only carries ν = 4 (P8's
+/// five-seed design), returning `NaN` for anything else rather than approximating in the
+/// small-sample regime. Rather than edit a helper the P8 board depends on, the ν = 9 closed form
+/// lives here: for odd ν = 2k+1, with `θ = atan(t/√ν)` (A&S 26.7.4),
+///
+/// `P(|T| > t) = 1 − (2/π)·[θ + sinθ·(cosθ + ⅔cos³θ + 8/15·cos⁵θ + 16/35·cos⁷θ)]`
+///
+/// Pinned against textbook critical values by `fc_student_p_at_nine_df_matches_the_critical_values`.
+fn fc_student_p(t: f64) -> f64 {
+    if t.is_nan() {
+        return f64::NAN;
+    }
+    if t.is_infinite() {
+        return 0.0;
+    }
+    let theta = (t.abs() / 9.0f64.sqrt()).atan();
+    let (c, sn) = (theta.cos(), theta.sin());
+    let series = c + (2.0 / 3.0) * c.powi(3) + (8.0 / 15.0) * c.powi(5) + (16.0 / 35.0) * c.powi(7);
+    (1.0 - (2.0 / std::f64::consts::PI) * (theta + sn * series)).clamp(0.0, 1.0)
+}
+
+#[test]
+fn fc_student_p_at_nine_df_matches_the_critical_values() {
+    // The textbook two-sided critical values for ν = 9 — the only check that matters for a hand-
+    // written closed form. Tolerance 5e-4: the published t values are themselves 4-digit.
+    for (t, p) in [(0.0, 1.0), (1.833, 0.10), (2.262, 0.05), (3.250, 0.01)] {
+        assert!(
+            (fc_student_p(t) - p).abs() < 5e-4,
+            "t = {t} at 9 df ⇒ p = {} (expected {p})",
+            fc_student_p(t)
+        );
+    }
+    assert!(fc_student_p(f64::INFINITY) == 0.0);
+    assert!(fc_student_p(f64::NAN).is_nan());
+    // Symmetric in the sign of t.
+    assert_eq!(
+        fc_student_p(-2.262).to_bits(),
+        fc_student_p(2.262).to_bits()
+    );
+}
+
+/// The paired signal/noise of two per-seed columns measured on the SAME ten seeds with ONE switch
+/// between them: `|mean(a−b)| / σ(a−b)`. Pairing is not a nicety here — the between-seed spread of
+/// the LEVEL is comparable to the level itself (σ ≈ 0.11 on a level of ≈ 0.15), so an unpaired read
+/// would call every effect noise. Returns `(mean_diff, sigma_diff, snr)`.
+///
+/// **Degenerate input is all-NaN, on purpose and in agreement with [`paired_stats`]** (review N3).
+/// Every gate in this section is `fc_resolves(snr, paired_stats(..).t)` — one OR of two numbers
+/// computed by two different functions on the same two columns — so the two MUST refuse the same
+/// inputs. `paired_stats` returns all-NaN if any pair is non-finite; `mean_sigma` instead SKIPS
+/// non-finite entries, which would have left the effect size computed on a subsample and the `t` on
+/// nothing. That never fired in any run of this tranche (no `intra` / `dec_ring` column has ever
+/// carried a NaN), but "the two halves of one gate silently disagree about the sample" is not a
+/// property to leave standing on a report Ilya quotes. NaN propagates into `fc_resolves` as `false`
+/// on both branches, so a degenerate column asserts nothing.
+///
+/// ⚠ The ZERO-σ branch had a second, sharper disagreement, found while making the two agree: two
+/// IDENTICAL arms give `mean_d = 0, σ_d = 0`, and the old `if s > 0 { … } else { INFINITY }` called
+/// that an INFINITE signal-to-noise — so a dial that did literally nothing would have FIRED the
+/// gate (and then failed its own `(pem − oem).abs() > 0.0` assert). `paired_stats` gets this right
+/// (`t = 0` when the mean difference is zero, `±∞` only when a non-zero mean sits on zero spread),
+/// and this now matches it exactly.
+fn fc_paired_snr(a: &[f64], b: &[f64]) -> (f64, f64, f64) {
+    if a.len() != b.len() || a.len() < 2 {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let d: Vec<f64> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+    if d.iter().any(|x| !x.is_finite()) {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let (m, s) = mean_sigma(&d);
+    let snr = if s > 0.0 {
+        m.abs() / s
+    } else if m == 0.0 {
+        // Two identical arms: no signal AND no noise. Zero, never infinity.
+        0.0
+    } else {
+        f64::INFINITY
+    };
+    (m, s, snr)
+}
+
+#[test]
+fn fc_paired_snr_refuses_exactly_the_inputs_the_paired_statistic_refuses() {
+    // Review N3: the two halves of every gate in this section have to agree about the SAMPLE. On
+    // clean columns they are the same numbers; on degenerate ones they must both be NaN, so the
+    // gate fails closed rather than mixing an effect size over 9 pairs with a `t` over none.
+    let a = [0.20, 0.15, 0.30, 0.10];
+    let b = [0.10, 0.10, 0.10, 0.10];
+    let (m, s, snr) = fc_paired_snr(&a, &b);
+    let ps = paired_stats(&a, &b);
+    assert_eq!(m.to_bits(), ps.mean_diff.to_bits(), "same mean difference");
+    assert_eq!(s.to_bits(), ps.sigma_diff.to_bits(), "same σ_d");
+    assert!((snr - m.abs() / s).abs() < 1e-12, "snr = |mean_d| / σ_d");
+    // A single NaN pair kills BOTH — this is what used to differ (`mean_sigma` would have averaged
+    // the remaining three while `paired_stats` returned NaN).
+    let a_nan = [0.20, f64::NAN, 0.30, 0.10];
+    let (mn, sn, snrn) = fc_paired_snr(&a_nan, &b);
+    assert!(
+        mn.is_nan() && sn.is_nan() && snrn.is_nan(),
+        "NaN in ⇒ NaN out"
+    );
+    assert!(paired_stats(&a_nan, &b).t.is_nan(), "…and so does the t");
+    assert!(
+        !fc_resolves(snrn, paired_stats(&a_nan, &b).t),
+        "a degenerate column asserts NOTHING — the gate fails closed"
+    );
+    // Mismatched or too-short pairings are refused identically.
+    assert!(fc_paired_snr(&a, &b[..3]).2.is_nan(), "mismatched lengths");
+    assert_eq!(paired_stats(&a, &b[..3]).n, 0, "…as paired_stats does");
+    assert!(fc_paired_snr(&a[..1], &b[..1]).2.is_nan(), "fewer than two");
+    // ⚠ THE ZERO-σ BRANCH, which is where the two USED to disagree in a way that could FAIL a run.
+    // Two identical arms (a dead dial) have no signal and no noise: the old code called that
+    // signal/noise = ∞ and would have fired the gate on a switch that changed nothing, which then
+    // trips the gate's own "the values must actually differ" assert. `paired_stats` says t = 0.
+    let (dm, ds, dsnr) = fc_paired_snr(&a, &a);
+    assert_eq!((dm, ds), (0.0, 0.0), "identical arms ⇒ Δ 0 on σ 0");
+    assert_eq!(dsnr, 0.0, "…and NO signal, not infinite signal");
+    assert_eq!(paired_stats(&a, &a).t, 0.0, "…exactly as paired_stats says");
+    assert!(
+        !fc_resolves(dsnr, paired_stats(&a, &a).t),
+        "a dead dial resolves NOTHING"
+    );
+    // A non-zero mean on EXACTLY zero spread IS a perfect separation, and both still agree.
+    // (Binary-exact operands, so the σ really is 0.0 and not 1e-17.)
+    let hi = [1.0f64, 2.0, 3.0, 4.0];
+    let lo = [0.5f64, 1.5, 2.5, 3.5];
+    assert_eq!(fc_paired_snr(&hi, &lo), (0.5, 0.0, f64::INFINITY));
+    assert_eq!(paired_stats(&hi, &lo).t, f64::INFINITY);
+    assert!(fc_resolves(f64::INFINITY, f64::INFINITY));
+}
+
+#[test]
+#[ignore = "friend-circle MEASUREMENT (10 frozen-rung worlds, measured 146 s release, 8 cores) — \
+            cargo test -p viaticum-sim --lib --release \
+            four_honest_friends_are_not_a_circle_their_data_spreads_across_strangers \
+            -- --ignored --nocapture"]
+fn four_honest_friends_are_not_a_circle_their_data_spreads_across_strangers() {
+    // ARM F-open — "we four just run it honestly, we hold anyone, we prefer nobody." The question
+    // the spec pre-registers: are they a CIRCLE at all, or four honest nodes whose data goes
+    // wherever the network puts it?
+    //
+    // ⏱ MEASUREMENT-ONLY, hence `#[ignore]` (review W5): it steps ten 130-tick 120-node worlds and
+    // its asserts read THIS world at THIS rung rather than guarding a frozen number. The default
+    // suite keeps the cheap regression surface (the dial anchor, the registry mirrors, the
+    // determinism/anti-oracle pair, the pure-function pins).
+    //
+    // The naive reading (intra-share vs the proportional reference) cannot answer it here, because
+    // these four are INJECTED nodes — always present, always accepting — and "the most attractive
+    // holders in the world attract everyone's data, their own included" would lift the intra share
+    // with no circle forming. So the reading is taken against the rate at which the SAME four hold
+    // STRANGERS' data. Equal rates ⇒ no circle; and the split alive-vs-ever-placed says whether any
+    // residual came from the OWNER choosing friends or from the friends KEEPING what strangers shed.
+    //
+    // ⚠ DIRECTION AND MAGNITUDE ARE SEPARATE CLAIMS HERE (review BLOCK-3). The DIRECTION — most of
+    // an honest group's data lives outside the group, `intra < 0.5` — holds at every rung of the
+    // resolution ladder and is what this test asserts. The MAGNITUDE does NOT: `intra` reads 0.181
+    // / 0.083 / 0.072 / 0.243 and the homing factor 7.6 / 3.3 / 2.8 / 10.5 across B = 3/6/9/18.
+    // So any sentence of the form "N % of it is abroad, and the homing is M×" is a statement about
+    // ONE rung and must name it. The numbers printed below are the frozen rung's.
+    let reads = fc_open_reads();
+    let intra = fc_col(reads, |r| r.intra);
+    let out = fc_col(reads, |r| r.outsiders_on_ring);
+    let intra_ever = fc_col(reads, |r| r.intra_ever);
+    let out_ever = fc_col(reads, |r| r.outsiders_on_ring_ever);
+    let (im, is_) = mean_sigma(&intra);
+    let (om, os) = mean_sigma(&out);
+    let (pm, _) = mean_sigma(&intra_ever);
+    let (pom, _) = mean_sigma(&out_ever);
+    let (dm, ds) = mean_sigma(&fc_col(reads, |r| r.dec_ring));
+    let (gm, _) = mean_sigma(&fc_col(reads, |r| r.gave));
+    let (tm, _) = mean_sigma(&fc_col(reads, |r| r.took));
+    let (alive_d, _, alive_snr) = fc_paired_snr(&intra, &out);
+    let (ever_d, _, ever_snr) = fc_paired_snr(&intra_ever, &out_ever);
+    println!(
+        "\n=== F-open: four friends who hold everyone (N={FC_TEST_N}, B={FC_TEST_BLOCKS} — the FROZEN rung, seeds 42..51) ===\n  \
+         of the circle's SURVIVING symbols, {:.1} % ± {:.1} sit on a circle member and {:.1} % on strangers\n  \
+         the same four hold {:.1} % ± {:.1} of the STRANGERS' surviving symbols (proportional would be {:.1} %)\n  \
+         homing (own share / stranger share, each over its own proportional reference) = {:.2}×   \
+         paired Δ(own − stranger) = {alive_d:+.3}, signal/noise {alive_snr:.2}\n  \
+         ⚠ BOTH the % and the homing are RUNG-SPECIFIC: along B = 3/6/9/18 they read 18.1/8.3/7.2/24.3 %\n  \
+         \x20  and 7.6/3.3/2.8/10.5×. The direction (`intra` < 0.5) is what holds at every rung.\n  \
+         WHERE IT CAME FROM — at PLACEMENT time (every symbol ever accepted, dead included): own {:.1} % ± {:.1} \
+         vs strangers' {:.1} % ⇒ homing {:.2}×, paired Δ {ever_d:+.3}, signal/noise {ever_snr:.2}\n  \
+         circle decodable {dm:.3}±{ds:.3}   took from strangers {tm:.0} gb·days   gave strangers {gm:.0} gb·days",
+        100.0 * im,
+        100.0 * is_,
+        100.0 * (1.0 - im),
+        100.0 * om,
+        100.0 * os,
+        100.0 * FC_TEST_N as f64 / 119.0,
+        fc_homing_rom(reads, |r| r.intra, |r| r.outsiders_on_ring, FC_TEST_N),
+        100.0 * pm,
+        100.0 * mean_sigma(&intra_ever).1,
+        100.0 * pom,
+        fc_homing_rom(
+            reads,
+            |r| r.intra_ever,
+            |r| r.outsiders_on_ring_ever,
+            FC_TEST_N
+        ),
+    );
+    // (1) THE ANSWER: the overwhelming majority of the four friends' data does NOT live with the
+    //     four friends. Whatever homing the residual shows, "our backups are with each other" is
+    //     simply false for an honest group — a majority bar is the weakest form of that claim and
+    //     the measurement clears it by a mile (σ printed above).
+    assert!(
+        im < 0.5,
+        "an honest group's data spreads: only {im:.3} of it sits inside the group (σ {is_:.3})"
+    );
+    // (2) They pay their way — an F-open circle serves strangers, so it is not a free rider.
+    assert!(
+        gm > 0.0,
+        "F-open holds strangers' data (it gave {gm:.0} gb·days)"
+    );
+    // (3) The residual homing is REPORTED, and asserted only where it clears the tranche's ONE
+    //     reporting trigger [`fc_resolves`] (review W1 — this gate used to be the bare house
+    //     effect-size gate while the sealed-circle test carried the corrected one). Both readings
+    //     are printed above so the mechanism (placement vs retention) is visible rather than argued.
+    //     ⚠ Under the unified trigger this now RESOLVES (d = 0.83 below the house gate, but
+    //     t(9) = +2.62 past the ν = 9 critical value) — so the residual homing is a finding, not a
+    //     diagnostic, and it is stated as one. It does not touch (1): 0.243 at home is homing AND
+    //     is still a small minority of the group's data.
+    let alive_ps = paired_stats(&intra, &out);
+    if fc_resolves(alive_snr, alive_ps.t) {
+        assert!(
+            im > om,
+            "above the reporting trigger the circle's own share ({im:.3}) exceeds the rate at which \
+             it holds strangers' data ({om:.3}±{os:.3}) — residual homing, reported not dismissed"
+        );
+        println!(
+            "  => RESIDUAL HOMING RESOLVES: the four keep {im:.3} of their own data at home against \
+             {om:.3}±{os:.3} of the strangers' (paired Δ {alive_d:+.3}, effect size {alive_snr:.2}, \
+             t(9) = {:+.2}, p = {:.4}). They ARE mildly self-homing — and three quarters of their \
+             data still lives on strangers' machines, which is claim (1) and is unaffected.",
+            alive_ps.t,
+            fc_student_p(alive_ps.t)
+        );
+    } else {
+        println!(
+            "  => the own-vs-stranger gap does not resolve on either trigger (effect size \
+             {alive_snr:.2} < {FC_SNR_GATE}, |t| = {:.2} < {FC_T_CRIT_9}, p = {:.3}); left \
+             unasserted, diagnostic only",
+            alive_ps.t.abs(),
+            fc_student_p(alive_ps.t)
+        );
+    }
+}
+
+#[test]
+#[ignore = "friend-circle MEASUREMENT (20 frozen-rung worlds, measured 287 s release, 8 cores) — \
+            cargo test -p viaticum-sim --lib --release \
+            sealing_the_circle_costs_the_smallest_circle_its_redundancy -- --ignored --nocapture"]
+fn sealing_the_circle_costs_the_smallest_circle_its_redundancy() {
+    // ARM F-closed vs its matched control F-open — the SAME four nodes, one switch: as holders they
+    // now serve their own group only. Ten seeds, PAIRED (same seed = same world, one lever), which
+    // is the only analysis that can see an effect this size: the between-seed spread of the level
+    // is as large as the level.
+    //
+    // ⏱ MEASUREMENT-ONLY, hence `#[ignore]` (review W5). Its asserts are readings of THIS world at
+    // THIS rung, not regressions on a frozen number — nothing here protects a future change from
+    // breaking, and it steps twenty 130-tick 120-node worlds to say so. The tranche's regression
+    // surface lives in the cheap tests that DO run by default: the dial anchor
+    // (`friend_preference_off_is_bit_identical_to_the_honest_anchor`), the registry mirrors, the
+    // determinism/anti-oracle pair and the pure-function pins. Same standard as A8's equivalent
+    // paired measurement.
+    //
+    // Pre-registered direction (spec §0 + the A8 review that opened this tranche): sealing COSTS
+    // the smallest circle its redundancy, because a block needs `min_width = 4` distinct holders
+    // and a member of a four-circle has three friends
+    // (`a_four_member_circle_cannot_reach_min_width_inside_itself`).
+    //
+    // ⚠⚠ THE EFFECT IS RUNG-DEPENDENT (review BLOCK-1), so the rung is named everywhere. Along the
+    // resolution ladder the sealed circle reads 0.30× / 0.47× / 0.79× / 0.53× of its control at
+    // B = 3/6/9/18. The ladder was introduced as a ruler and turned out to move the measurement,
+    // which is why the rung is frozen by the spec's pre-registered criterion (per-owner quantum
+    // ≤ 0.1 ⇒ B = 18) and not by which rung reads better. The calibration test prints all four with
+    // their paired t.
+    //
+    // At the frozen rung the ten-seed design DOES resolve it (see the trigger note at (2) below),
+    // and the thirty-seed probe confirms it against a multiplicity correction, a distribution-free
+    // test and the sign split. That was NOT true at B = 9, where the same two arms read 0.79× with
+    // p = 0.47 — a reader carrying a number from this test must carry its rung with it.
+    //
+    // ⚠ AND THE MAGNITUDE IS A RANGE, NOT THE 0.53× THIS TEST PRINTS (review W2). The thirty-seed
+    // probe reads the same ratio at 0.65×. Both are estimates of one quantity; the honest headline
+    // is "the sealed circle keeps between roughly half and two thirds of its own control", and the
+    // MILDER end comes from the LARGER sample. The mechanism of the gap is identifiable: the SEALED
+    // arm reads 0.110 in BOTH samples and it is the CONTROL that moves (0.206 here vs 0.169 over
+    // seeds 42..71), so these ten seeds handed F-open an unusually good draw and the 0.53× is the
+    // flattered-denominator reading. See the ruler line at (3) — the borrowed 0.60 sits inside the
+    // range, so "the bar is not cleared" is a property of the ten-seed point and not of the tranche.
+    let open = fc_open_reads();
+    let closed = fc_reads(FcArm::F_CLOSED);
+    let od = fc_col(open, |r| r.dec_ring);
+    let cd = fc_col(&closed, |r| r.dec_ring);
+    let (om, os) = mean_sigma(&od);
+    let (cm, cs) = mean_sigma(&cd);
+    let ps = paired_stats(&cd, &od);
+    let (_, _, snr) = fc_paired_snr(&cd, &od);
+    // Net take−give, PAIRED and with its own σ (review W14): "the same inside noise" is a claim
+    // about a difference, so it gets the difference's statistic instead of two rounded means.
+    let net = |rs: &[FcRead]| -> Vec<f64> { rs.iter().map(|r| r.took - r.gave).collect() };
+    let cnet = net(&closed);
+    let onet = net(open);
+    let (cnm, cns) = mean_sigma(&cnet);
+    let (onm, ons) = mean_sigma(&onet);
+    let nps = paired_stats(&cnet, &onet);
+    println!(
+        "\n=== F-closed vs F-open (N={FC_TEST_N}, B={FC_TEST_BLOCKS}, seeds 42..51, PAIRED) ==="
+    );
+    for (k, seed) in FC_SEEDS.iter().enumerate() {
+        println!(
+            "  seed {seed}: closed {:.3}   open {:.3}   Δ {:+.3}",
+            cd[k],
+            od[k],
+            cd[k] - od[k]
+        );
+    }
+    println!(
+        "  decodable  closed {cm:.3}±{cs:.3}   open {om:.3}±{os:.3}   ratio of means {:.2}×\n  \
+         paired  mean_d {:+.3}   σ_d {:.3}   SE {:.3}   t({}) = {:+.2}   p = {:.4}   signal/noise {snr:.2}\n  \
+         intra-circle share  closed {:.3}±{:.3}   open {:.3}±{:.3}      gave strangers  closed {:.0}±{:.0}   open {:.0}±{:.0}\n  \
+         took from strangers  closed {:.0}±{:.0}   open {:.0}±{:.0}\n  \
+         NET take−give  closed {cnm:.0}±{cns:.0}   open {onm:.0}±{ons:.0}   paired Δ {:+.0} (σ_d {:.0}, t({}) {:+.2}, p {:.4})",
+        if om > 0.0 { cm / om } else { f64::NAN },
+        ps.mean_diff,
+        ps.sigma_diff,
+        ps.se,
+        ps.df,
+        ps.t,
+        fc_student_p(ps.t),
+        mean_sigma(&fc_col(&closed, |r| r.intra)).0,
+        mean_sigma(&fc_col(&closed, |r| r.intra)).1,
+        mean_sigma(&fc_col(open, |r| r.intra)).0,
+        mean_sigma(&fc_col(open, |r| r.intra)).1,
+        mean_sigma(&fc_col(&closed, |r| r.gave)).0,
+        mean_sigma(&fc_col(&closed, |r| r.gave)).1,
+        mean_sigma(&fc_col(open, |r| r.gave)).0,
+        mean_sigma(&fc_col(open, |r| r.gave)).1,
+        mean_sigma(&fc_col(&closed, |r| r.took)).0,
+        mean_sigma(&fc_col(&closed, |r| r.took)).1,
+        mean_sigma(&fc_col(open, |r| r.took)).0,
+        mean_sigma(&fc_col(open, |r| r.took)).1,
+        nps.mean_diff,
+        nps.sigma_diff,
+        nps.df,
+        nps.t,
+        fc_student_p(nps.t),
+    );
+    // (1) STRUCTURAL — the switch really is the switch: a sealed circle gives strangers exactly
+    //     nothing, and its own data really does concentrate at home.
+    assert_eq!(
+        mean_sigma(&fc_col(&closed, |r| r.gave)).0,
+        0.0,
+        "F-closed gives strangers nothing at all"
+    );
+    assert!(
+        mean_sigma(&fc_col(&closed, |r| r.intra)).0
+            > 2.0 * mean_sigma(&fc_col(open, |r| r.intra)).0,
+        "F-closed really is a closed circle: {:.3} of its data at home vs {:.3} open",
+        mean_sigma(&fc_col(&closed, |r| r.intra)).0,
+        mean_sigma(&fc_col(open, |r| r.intra)).0,
+    );
+    // (2) THE PRICE, asserted in the PRE-REGISTERED direction (spec §0) on the tranche's ONE
+    //     reporting trigger, [`fc_resolves`] — the house effect-size gate OR the textbook ν = 9 5 %
+    //     critical value, both printed. That trigger is not local to this test: review W1 caught it
+    //     living HERE and nowhere else, which is a result-dependent standard however sound the
+    //     reasoning, so it is now the same function at every gate in this section. At the frozen
+    //     rung the two components disagree (d = 1.08, t = −3.43, p = 0.008, 8 of 10 seeds negative),
+    //     and printing "the penalty is inside the noise" over a p = 0.008 result with a
+    //     pre-registered direction would be the reporting failure, not the assert.
+    let t_crit_9 = FC_T_CRIT_9;
+    if fc_resolves(snr, ps.t) {
+        assert!(
+            cm < om,
+            "sealing costs the smallest circle its redundancy: {cm:.3} vs {om:.3}"
+        );
+        println!(
+            "  => PENALTY CONFIRMED in the pre-registered direction: the sealed circle keeps \
+             {:.2}× the recoverable data of the same four nodes holding everyone \
+             (effect size d = {snr:.2} vs house gate {FC_SNR_GATE}; paired t(9) = {:+.2} vs \
+             critical {t_crit_9}, p = {:.4}; {} of {} seeds negative)\n  \
+             => HEADLINE, AS A RANGE AND NOT AS A POINT (review W2): sealing costs the smallest \
+             circle BETWEEN ABOUT A THIRD AND A HALF of its recoverable data — {:.2}× on the \
+             pre-registered ten seeds and 0.65× on the thirty-seed probe, WITH THE SMALLER LOSS \
+             COMING FROM THE LARGER SAMPLE. The sealed arm reads {cm:.3} in BOTH samples; it is the \
+             CONTROL that moves ({om:.3} here, 0.169 over seeds 42..71), so the ten-seed ratio is \
+             the flattered-denominator one. Quoting it alone reports the more dramatic half of a \
+             range whose better-powered end is the milder one.",
+            cm / om,
+            ps.t,
+            fc_student_p(ps.t),
+            cd.iter().zip(&od).filter(|(c, o)| *c < *o).count(),
+            cd.len(),
+            cm / om,
+        );
+    } else {
+        println!(
+            "  => the penalty does not separate on THIS TEN-SEED DESIGN by either trigger \
+             (effect size d = {snr:.2} < {FC_SNR_GATE}, |t| = {:.2} < {t_crit_9}, p = {:.3}) and \
+             is left unasserted here. ⚠ That is a POWER statement, not a finding, and it must NOT \
+             be re-told as 'friend circles are not punished'. The thirty-seed probe \
+             (`sealing_the_circle_at_thirty_seeds_says_whether_ten_could_ever_have_settled_it`) is \
+             the follow-up, and it is an UNCORRECTED SECOND LOOK — read its sign split, its \
+             Wilcoxon and its two-look boundaries before quoting it either way. What stands \
+             without any statistics at all is the structural fact: at N = 4 a block cannot reach \
+             `min_width` inside the circle",
+            ps.t.abs(),
+            fc_student_p(ps.t)
+        );
+    }
+    // (3) The BORROWED no-collapse bar — READ WITH ITS PROVENANCE, because the tranche was quoting
+    //     it as a verdict it cannot carry (review W2). Two transpositions have to be printed with
+    //     the number or it will be mis-read:
+    //
+    //     (a) THE BAR'S HOME SEMANTICS IS ABSOLUTE. `A15_FLOOR_X` / `DR_BATTLE_FLOOR_X` /
+    //         INV-RESTORE-SANITY all read "FAIL if more than 40 % of once-durable blocks become
+    //         UNDECODABLE" — a bar on the LEVEL. Here it is applied as a RATIO to a matched control.
+    //         What was borrowed is the NUMBER, not the bar. In the bar's own units BOTH arms fail
+    //         catastrophically (0.110 sealed, 0.206 open, against 0.60 — and the honest outsiders
+    //         sit at 0.296), for the documented sim-world bandwidth reason. A8's precedent used the
+    //         relative form as a SOFT PASS assert; turning a soft floor into a FAIL headline asks
+    //         more of it than it carries.
+    //     (b) THE TEN-SEED READING IS THE ONE THAT FAILS. This test's point estimate is 0.53×, but
+    //         the tranche's own thirty-seed probe puts the same ratio at 0.65× — ABOVE the bar. So
+    //         "the 0.60 bar is not cleared" is a statement about the smaller sample, and the larger
+    //         one moves it to the clearing side. It is printed here as a range, not as a verdict.
+    //
+    //     Reported, never asserted in either direction: at this size it is the FINDING that is in
+    //     question, not a regression.
+    println!(
+        "  borrowed no-collapse ruler, applied as {FC_FLOOR_X:.2}× of the matched control \
+         (⚠ the bar's OWN semantics is ABSOLUTE — 'more than 40 % of once-durable blocks \
+         undecodable' — and in THOSE units both arms fail: {cm:.3} and {om:.3} against \
+         {FC_FLOOR_X:.2}):\n    \
+         ten seeds {:.2}× ⇒ {}   |   thirty-seed probe 0.65× ⇒ ABOVE the ruler\n    \
+         ⇒ the honest reading is a RANGE, not a verdict: the sealed circle keeps between roughly \
+         half and two thirds of its control, straddling the borrowed 0.60, with the milder \
+         estimate coming from the larger sample.",
+        if om > 0.0 { cm / om } else { f64::NAN },
+        if cm >= FC_FLOOR_X * om {
+            "above the ruler"
+        } else {
+            "below the ruler"
+        },
+    );
+}
+
+#[test]
+#[ignore = "friend-circle MEASUREMENT (30 frozen-rung worlds, measured 505 s release, 8 cores) — \
+            cargo test -p viaticum-sim --lib --release \
+            friend_preference_moves_the_circles_data_home_and_prints_what_it_costs \
+            -- --ignored --nocapture"]
+fn friend_preference_moves_the_circles_data_home_and_prints_what_it_costs() {
+    // ⚗ ARM F-pref vs F-open, in BOTH SCOPES, against ONE matched control. THE QUESTION: is "I want
+    // my backups on my friends' machines" expressible in this design at all, and what does it cost?
+    //
+    // ⏱ MEASUREMENT-ONLY, hence `#[ignore]` (review W5): thirty 130-tick 120-node worlds (two arms
+    // plus the shared control), and every assert here is a reading rather than a regression. What
+    // guards the ⚗ dial itself in the DEFAULT run is
+    // `friend_preference_off_is_bit_identical_to_the_honest_anchor` (both scopes gated, the
+    // `honest_v2` and A7 anchors byte-identical) and
+    // `friend_preference_dial_changes_which_holder_the_owner_picks` (the switch is live) — neither
+    // of which needs a horizon.
+    //
+    // ⚠ THE SCOPE IS THE QUESTION (review W7). The first version of this arm ran the WORLD dial —
+    // every owner in the network preferring — and then printed a verdict phrased as the PRODUCT's
+    // question ("'backups only on my friends' machines' has no expression in this design"). Those
+    // are different experiments: with everyone preferring, the circle is competing against 116
+    // nodes playing the same rule; with only the circle preferring, it is the actual user request.
+    // Both are run here, the CIRCLE-ONLY one is the headline, and each verdict says which it is.
+    //
+    // ⚠ AND THE PREFERENCE IS RECIPROCITY, NOT FRIENDSHIP: the only friend test available is the
+    // owner's own observation `g_holder_from_owner > 0` = "I already hold this peer's data". How
+    // SELECTIVE that predicate is at a decision is measured separately and honestly by
+    // `friend_fraction_of_the_admissible_set_says_whether_reciprocity_is_a_scarce_predicate` — not
+    // inferred from any horizon share here.
+    let open = fc_open_reads();
+    for arm in [FcArm::F_PREF_CIRCLE, FcArm::F_PREF_WORLD] {
+        fc_pref_arm_report(arm, open);
+    }
+}
+
+/// One ⚗ F-pref arm measured against the shared F-open control, printed and (above the noise gate)
+/// asserted. Split out of the arm test so the CIRCLE-ONLY and WORLD scopes run the identical
+/// analysis on the identical control — the two differ by the scope of one dial and by nothing else.
+fn fc_pref_arm_report(arm: FcArm, open: &[FcRead]) {
+    assert_ne!(
+        arm.pref,
+        PrefScope::Off,
+        "{} is not an F-pref arm — this report needs a preference scope",
+        arm.label
+    );
+    let scope = match arm.pref {
+        PrefScope::Circle => "CIRCLE-ONLY (the product's question: only these four prefer)",
+        PrefScope::World => "WORLD (a different question: every owner in the network prefers)",
+        PrefScope::Off => unreachable!(),
+    };
+    let pref = fc_reads(arm);
+    let oi = fc_col(open, |r| r.intra);
+    let pi = fc_col(&pref, |r| r.intra);
+    let od = fc_col(open, |r| r.dec_ring);
+    let pd = fc_col(&pref, |r| r.dec_ring);
+    let (oim, _) = mean_sigma(&oi);
+    let (pim, pis) = mean_sigma(&pi);
+    let (odm, ods) = mean_sigma(&od);
+    let (pdm, pds) = mean_sigma(&pd);
+    let (i_d, _, i_snr) = fc_paired_snr(&pi, &oi);
+    let (d_d, _, d_snr) = fc_paired_snr(&pd, &od);
+    let ips = paired_stats(&pi, &oi);
+    let dps = paired_stats(&pd, &od);
+    // The quantity the dial DIRECTLY controls: where the owner PUT its symbols. The alive share
+    // above is that, plus everything eviction and churn did afterwards, measured over a much
+    // smaller surviving population — so it is far noisier and answers a different question.
+    let oe = fc_col(open, |r| r.intra_ever);
+    let pe = fc_col(&pref, |r| r.intra_ever);
+    let (oem, _) = mean_sigma(&oe);
+    let (pem, pes) = mean_sigma(&pe);
+    let (e_d, _, e_snr) = fc_paired_snr(&pe, &oe);
+    let eps = paired_stats(&pe, &oe);
+    let (ofm, _) = mean_sigma(&fc_col(open, |r| r.intra_floor));
+    let (pfm, pfs) = mean_sigma(&fc_col(&pref, |r| r.intra_floor));
+    let (pcm, pcs) = mean_sigma(&fc_col(&pref, |r| r.intra_cream));
+    let (dom, dos) = mean_sigma(&fc_col(&pref, |r| r.dec_out));
+    let (odom, odos) = mean_sigma(&fc_col(open, |r| r.dec_out));
+    println!(
+        "\n=== ⚗ {} (margin {FC_PREF_MARGIN:.2} = ceiling) vs F-open (N={FC_TEST_N}, B={FC_TEST_BLOCKS}, seeds 42..51, PAIRED) ===\n  \
+         SCOPE: {scope}\n  \
+         data at home        {pim:.3}±{pis:.3}  vs  {oim:.3}±{:.3}   paired Δ {i_d:+.3} (σ_d {:.3}, t({}) {:+.2}, p {:.4}, signal/noise {i_snr:.2})\n  \
+         circle decodable    {pdm:.3}±{pds:.3}  vs  {odm:.3}±{ods:.3}   paired Δ {d_d:+.3} (σ_d {:.3}, t({}) {:+.2}, p {:.4}, signal/noise {d_snr:.2})\n  \
+         floor vs cream at home: floor {pfm:.3}±{pfs:.3} (F-open {ofm:.3}), cream {pcm:.3}±{pcs:.3} (the dial touches the FLOOR path only — cream keeps its strangers-first entry channel)\n  \
+         at PLACEMENT time   {pem:.3}±{pes:.3}  vs  {oem:.3}±{:.3}   paired Δ {e_d:+.3} (σ_d {:.3}, t({}) {:+.2}, p {:.4}, signal/noise {e_snr:.2}) ← what the dial directly controls\n  \
+         gave strangers {:.0} gb·days (F-open {:.0}) — it refuses nobody   |   world health: outsiders' decodable {dom:.3}±{dos:.3} (F-open world {odom:.3}±{odos:.3})",
+        arm.label,
+        mean_sigma(&oi).1,
+        ips.sigma_diff,
+        ips.df,
+        ips.t,
+        fc_student_p(ips.t),
+        dps.sigma_diff,
+        dps.df,
+        dps.t,
+        fc_student_p(dps.t),
+        mean_sigma(&oe).1,
+        eps.sigma_diff,
+        eps.df,
+        eps.t,
+        fc_student_p(eps.t),
+        mean_sigma(&fc_col(&pref, |r| r.gave)).0,
+        mean_sigma(&fc_col(open, |r| r.gave)).0,
+    );
+    // (1) STRUCTURAL — the arm is what it says it is: a preference, not a refusal. It still holds
+    //     strangers' data, so any difference from F-open is the PLACEMENT lever alone.
+    assert!(
+        mean_sigma(&fc_col(&pref, |r| r.gave)).0 > 0.0,
+        "F-pref refuses nobody — it still serves strangers"
+    );
+    // P8's world-level share-A>0, printed as WORLD HEALTH and nothing more (review W6). It is a
+    // horizon, symbol-weighted read over surviving placements, so it cannot separate "placed with a
+    // peer I already served" from "came to serve a peer I had placed with", and it is saturated
+    // besides. It is NOT the evidence for any claim about the predicate's selectivity — see
+    // `friend_fraction_of_the_admissible_set_says_whether_reciprocity_is_a_scarce_predicate`.
+    let oa = fc_col(open, |r| r.share_a_pos);
+    let pa = fc_col(&pref, |r| r.share_a_pos);
+    let (oam, oas) = mean_sigma(&oa);
+    let (pam, pas) = mean_sigma(&pa);
+    let (a_d, _, a_snr) = fc_paired_snr(&pa, &oa);
+    let aps = paired_stats(&pa, &oa);
+    println!(
+        "  world END-STATE share of symbols on reciprocal pairs (P8's share-A>0 — a HORIZON read,\n           \
+           not a decision-time one): {pam:.2} % ± {pas:.2}  vs F-open {oam:.2} % ± {oas:.2}   paired Δ {a_d:+.2} pp   (σ_d {:.2}, t({}) {:+.2}, p {:.4}, signal/noise {a_snr:.2})",
+        aps.sigma_diff,
+        aps.df,
+        aps.t,
+        fc_student_p(aps.t),
+    );
+    // (1b) THE OBSERVED SIGN, printed before any significance verdict, because it is the finding
+    //      that surprised the tranche: the dial was built to move the circle's data HOME and at
+    //      circle scope it moves it the other way. Reported with its p, never asserted.
+    //
+    //      ⚠ THE "AT MOST 3 OF ~13" ARITHMETIC IS AN EXPRESSIBILITY BOUND AND NOT AN EXPLANATION OF
+    //      THIS SIGN (review W3). It bounds what the handle can DELIVER — even at its best, ten of
+    //      the thirteen promoted candidates are strangers, so "my backups with my three friends" is
+    //      not something this handle can say. It cannot carry the sign, because the relevant
+    //      baseline is F-open's placement share of 0.096 while the bound ALLOWS up to 3/13 ≈ 0.23:
+    //      taken literally the arithmetic argues the dial should move data HOME. The measured drift
+    //      is the other way, which implies circle-mates are mostly NOT in the owner's friend set at
+    //      all (≈ 1 of 13, not 3) — and that is a quantity this tranche has NO INSTRUMENT FOR. The
+    //      log measures the friend fraction of the admissible set, never how many of those friends
+    //      are circle-mates. So: bound = established; sign = measured and unexplained.
+    println!(
+        "  OBSERVED DIRECTION: the preference moves the circle's SURVIVING data {} home \
+         (Δ_alive {i_d:+.3}, p {:.3}), while what it directly controls barely moves \
+         (Δ_placed {e_d:+.3}, p {:.3}).\n           \
+         {}",
+        if i_d < 0.0 { "AWAY FROM" } else { "TOWARD" },
+        fc_student_p(ips.t),
+        fc_student_p(eps.t),
+        if i_d < 0.0 {
+            "WHAT IS ESTABLISHED (an EXPRESSIBILITY BOUND, not a mechanism for this sign): 'peers I \
+             serve' is ~13 of ~91 admissible candidates and at most 3 of those can be circle-mates, \
+             so at least ten of every thirteen promotions go to STRANGERS the circle holds for — \
+             the handle cannot deliver 'my backups with my three friends' at any margin. WHAT IS \
+             NOT: why the share moves DOWN. The bound permits up to 3/13 ≈ 0.23 circle-mates \
+             against an F-open placement share of 0.096, so read literally it argues the other way; \
+             the observed drift implies circle-mates are ~1 of the 13, and this tranche has no \
+             instrument that measures that."
+        } else {
+            "⚠ READ THE TWO TOGETHER: the alive share moved and the PLACEMENT share did not, so \
+             whatever this arm gained is RETENTION (in this scope every owner prefers, so \
+             reciprocal pairs everywhere keep each other's data longer), not the circle choosing \
+             its friends."
+        },
+    );
+    // (2) DOES THE DIAL DO ANYTHING AT ALL — measured on the quantity it controls (placement),
+    //     which is where a null would otherwise be indistinguishable from a dead switch. (The
+    //     switch is separately proven live by `friend_preference_dial_changes_which_holder_the_
+    //     owner_picks`, on a hand-built world with no noise in it.) Above the gate the SEPARATION
+    //     is asserted and the DIRECTION is only reported — asserting `pem > oem` here would be an
+    //     assert on the wished-for sign, and the measured sign is the other one.
+    if fc_resolves(e_snr, eps.t) {
+        assert!(
+            (pem - oem).abs() > 0.0,
+            "above the trigger the placement share must actually differ: {pem:.3} vs {oem:.3}"
+        );
+        println!(
+            "  => the dial moves PLACEMENT, {}: {oem:.3} → {pem:.3} of the circle's symbols are \
+             put with circle members (p = {:.4})",
+            if pem > oem {
+                "toward home"
+            } else {
+                "AWAY from home"
+            },
+            fc_student_p(eps.t)
+        );
+    } else {
+        println!(
+            "  => the PLACEMENT shift does not resolve on ten seeds (Δ {e_d:+.3}, effect size \
+             {e_snr:.2} < {FC_SNR_GATE}, |t| = {:.2} < {FC_T_CRIT_9}, p = {:.4}) — read it with \
+             the hand-built switch test, which proves the dial is live",
+            eps.t.abs(),
+            fc_student_p(eps.t)
+        );
+    }
+    // (3) EXPRESSIBILITY, at the ceiling of what the design can say. Above the gate the SEPARATION
+    //     is asserted, never the direction; the verdict sentence is printed either way and it names
+    //     its own SCOPE — the world-scope arm answers "if this shipped for everyone", not "if I ask
+    //     for it".
+    if fc_resolves(i_snr, ips.t) {
+        assert!(
+            (pim - oim).abs() > 0.0,
+            "{}: above the trigger the intra-share must actually differ: {pim:.3} vs {oim:.3}",
+            arm.label
+        );
+        println!(
+            "  => THE PREFERENCE SEPARATES, in the {} scope, and it moves the circle's data {}: \
+             the share living with the circle goes {oim:.3} → {pim:.3}; {:.0} % of it lives on \
+             strangers' machines",
+            arm.label,
+            if pim > oim { "HOME" } else { "AWAY FROM HOME" },
+            100.0 * (1.0 - pim)
+        );
+    } else {
+        println!(
+            "  => NOT ESTABLISHED IN THE {} SCOPE: at the CEILING margin the share of the circle's \
+             data living with the circle does not separate from F-open on ten seeds (Δ {i_d:+.3}, \
+             effect size {i_snr:.2} < {FC_SNR_GATE}, |t| = {:.2} < {FC_T_CRIT_9}, p = {:.4}). No \
+             smaller margin can buy more than this one, so no bounded setting of THIS handle \
+             expresses 'my backups only on my friends' machines' either. ⚠ That is a statement \
+             about this handle at this power, not a proof that the design could not carry such a \
+             policy — see \
+             `the_placement_ranking_cannot_see_reciprocity_which_is_why_the_pref_dial_exists` for \
+             what is and is not present in the kernel.",
+            arm.label,
+            ips.t.abs(),
+            fc_student_p(ips.t)
+        );
+    }
+    // (4) THE PRICE, REPORTED AND NEVER ASSERTED INTO A SHAPE (review BLOCK-5). The spec says the
+    //     circle must not buy "my friends" with worse durability, and that if it does, that IS the
+    //     answer — so this branch prints the DIRECTION MEASURED, whichever way it points, and
+    //     asserts nothing directional. The earlier version asserted `pdm < odm` above the gate:
+    //     that is an assert on the wished-for sign, and the N = 8 row of this very arm comes out
+    //     the other way (1.09× circle scope, 1.19× world scope). An arm that can only pass by
+    //     confirming the prose is not a measurement.
+    //
+    //     ⚠⚠ THIS IS THE GATE REVIEW W1 WAS ABOUT. Under the bare house effect-size gate this
+    //     branch printed "the durability effect is INSIDE the noise … NOT to be re-told as 'the
+    //     preference costs durability'" for the WORLD-scope arm — while `friend_circle`'s
+    //     conclusion (6) called the identical numbers a DURABILITY COST at p = 0.026. The code and
+    //     its own prose contradicted each other, and the contradiction traced exactly to the
+    //     corrected trigger being applied where it flattered the tranche and not where it did not.
+    //     With [`fc_resolves`] applied here too the world-scope cost RESOLVES and is stated as
+    //     one — the honest outcome, and the reconciliation runs toward reporting MORE, not less.
+    if fc_resolves(d_snr, dps.t) {
+        println!(
+            "  => THE DURABILITY EFFECT RESOLVES and it is {}: the circle's recoverable fraction \
+             moves {odm:.3}±{ods:.3} → {pdm:.3}±{pds:.3} ({:+.0} %, effect size {d_snr:.2}, \
+             t(9) = {:+.2}, p = {:.4}).\n           \
+             ⚠ THE SCOPE OF THIS COST IS ONE CELL: it is this arm at N = 4. Across the twelve \
+             F-pref cells of the size table the ratios run 0.89 / 1.02 / 1.09 (circle scope) and \
+             0.67 / 0.94 / 1.19 (world scope), and the sign flips by N = 8. 'The preference costs \
+             durability' is NOT a general claim this tranche supports.",
+            if pdm < odm { "a COST" } else { "a GAIN" },
+            100.0 * (pdm - odm) / odm,
+            dps.t,
+            fc_student_p(dps.t)
+        );
+    } else {
+        println!(
+            "  => the durability effect does not resolve on ten seeds (Δ {d_d:+.3}, effect size \
+             {d_snr:.2} < {FC_SNR_GATE}, |t| = {:.2} < {FC_T_CRIT_9}, p = {:.4}); left unasserted, \
+             and NOT to be re-told as 'the preference costs durability' — see the N-sweep, where \
+             the sign flips",
+            dps.t.abs(),
+            fc_student_p(dps.t)
+        );
+    }
+}
+
+#[test]
+fn friend_fraction_of_the_admissible_set_says_whether_reciprocity_is_a_scarce_predicate() {
+    // ⭐ THE DESIGN CLAIM, MEASURED WHERE IT LIVES (review W6). The tranche's conclusion about the
+    // ⚗ preference is not "it did nothing" but "there was nothing for it to select ON": `g_ho > 0`
+    // — "I already serve this peer" — is not a scarce property, so preferring it is preferring
+    // nearly everybody.
+    //
+    // That is a claim about the CHOICE SET AT A DECISION, and the first version of this tranche
+    // supported it with P8's `share_a_pos`, which cannot: that is a horizon read, symbol-weighted
+    // over SURVIVING placements, so it conflates "placed with a peer I served" with "came to serve
+    // a peer I had placed with", and it is saturated at ~92 % in both arms besides.
+    //
+    // The right denominator is the kernel's ADMISSIBLE RANKED LIST at the moment the owner
+    // chooses: post-Р-5 credit cap, post-§7 bucket dedup, minus the block's current holders. The
+    // engine logs exactly that into `World::cand_friend_log` under a gate that draws no RNG, so the
+    // logged run is the same run bit for bit.
+    //
+    // ⚠ SCOPE OF THIS MEASUREMENT, disclosed: ONE seed. The ± printed below is the spread ACROSS
+    // DECISIONS, not across seeds, so it is not a between-world error bar. What makes one seed
+    // enough for the QUALITATIVE claim is the internal replication: the four circle owners and the
+    // 116 outsiders are separate populations measured in the same run over 8 · 10³ and 1.8 · 10⁵
+    // decisions, and they agree (0.148 vs 0.126). A number that is meant to be ~0.92 does not come
+    // out at ~0.13 twice by accident. A seed sweep would cost ~5 minutes per extra seed at the
+    // frozen rung and would refine a figure whose USE here is "13, not 90".
+    let arm = FcArm::F_OPEN;
+    let sc = arm.scenario();
+    let params = &sc.world.base;
+    let prior = viaticum_core::four_r::SurfacePrior::default();
+    let policy = viaticum_core::four_r::PlacementPolicy::default();
+    let mut w = build_world(sc.world.n_nodes, params, 42);
+    w.cand_friend_log_enabled = true;
+    let ring = inject_adversaries(&mut w, &sc.adversaries, params, RunMode::Predator);
+    for _ in 0..sc.horizon {
+        crate::sim_dynamic::engine::step(&mut w, params, &prior, &policy);
+    }
+    assert!(
+        !w.cand_friend_log.is_empty(),
+        "the admissible-set log is populated when enabled"
+    );
+    // Per-decision friend fraction, split circle / outsiders. Decisions with an empty admissible
+    // set carry no choice and are excluded from the ratio (they are counted separately).
+    let frac = |rows: &[&crate::sim_dynamic::generator::CandFriendEntry]| -> (f64, f64, usize) {
+        let live: Vec<f64> = rows
+            .iter()
+            .filter(|e| e.admissible > 0)
+            .map(|e| e.friends as f64 / e.admissible as f64)
+            .collect();
+        let (m, s) = mean_sigma(&live);
+        (m, s, live.len())
+    };
+    let circle_rows: Vec<&_> = w
+        .cand_friend_log
+        .iter()
+        .filter(|e| ring.contains(&e.owner))
+        .collect();
+    let out_rows: Vec<&_> = w
+        .cand_friend_log
+        .iter()
+        .filter(|e| !ring.contains(&e.owner))
+        .collect();
+    let (cm, cs, cn) = frac(&circle_rows);
+    let (om, os, on) = frac(&out_rows);
+    // The same quantity in the LATE half of the run only — the regime the horizon reads describe,
+    // and the one where "I have served nearly everyone by now" would show if it were true.
+    let late: Vec<&_> = circle_rows
+        .iter()
+        .copied()
+        .filter(|e| e.tick >= sc.horizon / 2)
+        .collect();
+    let (lm, ls, ln) = frac(&late);
+    let mean_admissible = mean_sigma(
+        &circle_rows
+            .iter()
+            .map(|e| e.admissible as f64)
+            .collect::<Vec<_>>(),
+    )
+    .0;
+    println!(
+        "\n=== friend fraction OF THE ADMISSIBLE SET AT DECISION TIME (F-open, N={FC_TEST_N}, B={FC_TEST_BLOCKS}, seed 42) ===\n  \
+         circle owners : {cm:.3} ± {cs:.3} over {cn} floor decisions (mean admissible set {mean_admissible:.1} candidates)\n  \
+         circle, late half (tick ≥ {}) : {lm:.3} ± {ls:.3} over {ln} decisions\n  \
+         outsider owners: {om:.3} ± {os:.3} over {on} floor decisions\n  \
+         ⇒ at a typical decision the owner had already served {:.0} % of the candidates it was \
+         allowed to choose between.",
+        sc.horizon / 2,
+        100.0 * cm,
+    );
+    // The claim is REPORTED with its own number and asserted only in the weak, robust form: the
+    // predicate is well-defined and non-degenerate (there IS a choice being made). Whether ~92 % of
+    // the world counts as "not scarce" is a reading, and it belongs in the doc with this figure
+    // beside it — not in an assert with a threshold nobody pre-registered.
+    assert!(
+        cn > 0 && mean_admissible > 1.0,
+        "the circle faced real choices: {cn} decisions over a mean admissible set of {mean_admissible:.1}"
+    );
+    assert!(
+        (0.0..=1.0).contains(&cm) && (0.0..=1.0).contains(&om),
+        "friend fractions are fractions: circle {cm}, outsiders {om}"
+    );
+}
+
+#[test]
+fn the_admissible_set_log_never_changes_a_decision() {
+    // The gate on `World::cand_friend_log` is a METRIC gate, exactly as `pred_log_enabled`: it
+    // draws no RNG and feeds nothing, so a logged run must be bit-identical to an unlogged one.
+    // Without this the W6 measurement would be measuring a world it perturbed.
+    use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
+    let sc = FcArm::F_OPEN.scenario();
+    let params = &sc.world.base;
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let run_it = |log: bool| {
+        let mut w = build_world(sc.world.n_nodes, params, 42);
+        w.cand_friend_log_enabled = log;
+        let ring = inject_adversaries(&mut w, &sc.adversaries, params, RunMode::Predator);
+        // A short horizon is enough: the log fires on the FIRST floor placement, so any
+        // perturbation would already be visible here, and the full-horizon cost is not needed.
+        for _ in 0..30 {
+            crate::sim_dynamic::engine::step(&mut w, params, &prior, &policy);
+        }
+        let alive: Vec<usize> = w
+            .nodes
+            .iter()
+            .map(|nd| nd.holdings.iter().filter(|s| s.alive).count())
+            .collect();
+        let intra = fc_share_held_by(&w, &ring, &ring);
+        (alive, intra, w.cand_friend_log.len())
+    };
+    let (a_on, i_on, n_on) = run_it(true);
+    let (a_off, i_off, n_off) = run_it(false);
+    assert!(n_on > 0, "the log recorded {n_on} decisions when enabled");
+    assert_eq!(n_off, 0, "and nothing at all when disabled");
+    assert_eq!(a_on, a_off, "per-node alive counts are bit-identical");
+    assert_eq!(
+        i_on.to_bits(),
+        i_off.to_bits(),
+        "the intra-share is bit-identical"
+    );
+}
+
+// ------------------------------------------------------------------
+// the MECHANISM, flipped by hand — a null result is only worth reading if the switch is live
+// ------------------------------------------------------------------
+
+#[test]
+fn the_placement_ranking_cannot_see_reciprocity_which_is_why_the_pref_dial_exists() {
+    // ⭐ THE STRUCTURAL FACT the whole F-pref arm rests on, established by flipping the field
+    // rather than by reading prose. The owner's FLOOR ranking is
+    // `place_incremental_rank` → `estimate_block_survival` → `estimate_surface`, and
+    // `estimate_surface` reads the pair's PoS window, its demonstrated volume and the query
+    // scale — it does NOT read `g_holder_from_owner` (= `capital[owner][holder].g_ho`, MY
+    // service to that holder). The HOLDER-side reads do (`retained_depth` → the κ_O eviction /
+    // preemption / Р-7 rank).
+    //
+    // ⚠ PRECISELY (review W8): "the surface is the only placement ranker" is FALSE as a blanket
+    // statement. There is a THIRD owner-side ranker on the live path — `place_cream`
+    // (`four_r/mod.rs`, called from `try_place_one_symbol`'s cream branch) — and it DOES read pair
+    // history: its arm (a) is "probationary strangers first", keyed on
+    // `pos_pass + pos_fail + pos_timeout == 0`. But that is the OTHER DIRECTION of reciprocity —
+    // MY PoS record of what the HOLDER did for me — and it sorts strangers to the FRONT, which is
+    // the opposite of a friend preference. So the narrow claim stands and this is its exact form:
+    // **no owner-side ranker reads `g_holder_from_owner`, the direction "what I have done for
+    // them"**, on either the floor path or the cream path.
+    //
+    // So the design says "I keep the data of peers who serve me" and has no owner-side "I place
+    // my data with peers I serve" at all. That asymmetry is why an owner-side preference had to be
+    // BUILT for arm F-pref instead of being switched on.
+    use viaticum_core::four_r::{
+        BlockReq, PlacementPolicy, RetentionPrior, SurfacePrior, estimate_block_survival,
+        estimate_surface, retained_depth,
+    };
+    let params = DynParams::default();
+    let w = build_world(4, &params, 5);
+    let v0 = params.block_volume / params.k_eff as f64;
+    // Two pairs identical in EVERY first-hand field except `g_ho` — one holder I have served a
+    // great deal, one I have never served.
+    let base_pair = PairCapital {
+        pos_window: vec![true; 8],
+        g_oh: 40.0,
+        v_dem: v0,
+        ..Default::default()
+    };
+    let served_a_lot = PairCapital {
+        g_ho: 500.0,
+        ..base_pair.clone()
+    };
+    let never_served = PairCapital {
+        g_ho: 0.0,
+        ..base_pair.clone()
+    };
+    let never_served_2 = PairCapital {
+        g_ho: 0.0,
+        ..base_pair
+    };
+    let friend = crate::sim_dynamic::observer::observe_pair(&served_a_lot, &w.nodes[1], 7.0, v0);
+    let stranger = crate::sim_dynamic::observer::observe_pair(&never_served, &w.nodes[1], 7.0, v0);
+    // The field really does differ — otherwise the null below would be vacuous.
+    assert_ne!(
+        friend.g_holder_from_owner.to_bits(),
+        stranger.g_holder_from_owner.to_bits(),
+        "the two observations differ in exactly the reciprocity field"
+    );
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let req = BlockReq {
+        volume: params.block_volume,
+        n_symbols: params.n_symbols,
+        k_eff: params.k_eff,
+        tau: 7.0,
+        r_target: params.r_target,
+        r_min: params.r_min,
+    };
+    // (1) THE FLOOR RANKER IS BLIND TO IT — bit-identical surface and bit-identical block
+    //     survival, so no amount of service I render can move a holder up the floor ranking.
+    assert_eq!(
+        estimate_surface(&friend, &prior, v0, 7.0).r_hat.to_bits(),
+        estimate_surface(&stranger, &prior, v0, 7.0).r_hat.to_bits(),
+        "the surface — the floor ranker — cannot see my service to the holder"
+    );
+    assert_eq!(
+        estimate_block_survival(std::slice::from_ref(&friend), &prior, &req, &policy).to_bits(),
+        estimate_block_survival(std::slice::from_ref(&stranger), &prior, &req, &policy).to_bits(),
+        "neither can the block survival the ranking maximises"
+    );
+    // (1b) AND SO IS CREAM, the third owner-side ranker, in the direction that matters here: the
+    //      two pairs have identical PoS counters, so `place_cream` puts them in the same arm and
+    //      ranks them identically — `g_holder_from_owner` is invisible to it too. (What cream DOES
+    //      read is the other direction, and it favours STRANGERS; see the header note.)
+    let cream_order = |obs: &viaticum_core::four_r::FirstHandObs| {
+        viaticum_core::four_r::place_cream(&req, std::slice::from_ref(obs), &prior, &policy, &[], 1)
+    };
+    assert_eq!(
+        cream_order(&friend),
+        cream_order(&stranger),
+        "the cream entry channel does not see my service to the holder either"
+    );
+    // (2) THE HOLDER SIDE SEES IT CLEARLY — the retention forecast is strictly higher for the
+    //     peer I serve. That is the channel the protocol DOES have, and it is holder-side.
+    let retention = RetentionPrior::default();
+    assert!(
+        retained_depth(&friend, &retention) > retained_depth(&stranger, &retention),
+        "the holder-side retention forecast is where reciprocity lives: {:.4} vs {:.4}",
+        retained_depth(&friend, &retention),
+        retained_depth(&stranger, &retention),
+    );
+    // (3) ⚠ AND THE THING THE TRANCHE MUST NOT SAY: "the kernel does not carry identity" (review
+    //     W8). It does. `FirstHandObs` carries `master_id` and `addr_subnet` FIRST-HAND, and the
+    //     kernel's own spread policy already PARTITIONS ON THEM — `addr_subnet` by default,
+    //     `master_id` under `CapMode::MasterIdOnly`. So "put my data on THESE named machines" is
+    //     NOT IMPLEMENTED and NOT REACHABLE THROUGH THE RECIPROCITY HANDLE — a different and much
+    //     weaker statement than "the design cannot express it". Demonstrated, not asserted in
+    //     prose: two candidates that share a SUBNET but differ in MASTER-ID are one bucket under
+    //     the default policy and two under `MasterIdOnly`, so a kernel decision does read identity.
+    use viaticum_core::four_r::CapMode;
+    let same_subnet_other_master = crate::sim_dynamic::generator::Node {
+        master_byte: w.nodes[1].master_byte ^ 0x3C,
+        ..w.nodes[1].clone()
+    };
+    let twin_id = crate::sim_dynamic::observer::observe_pair(
+        &never_served_2,
+        &same_subnet_other_master,
+        7.0,
+        v0,
+    );
+    assert_ne!(
+        stranger.master_id.0, twin_id.master_id.0,
+        "the OWNER's first-hand observation distinguishes the two by master identity"
+    );
+    assert_eq!(
+        stranger.addr_subnet, twin_id.addr_subnet,
+        "…while their subnet is identical, so the two policies must disagree about them"
+    );
+    let pair = [stranger.clone(), twin_id.clone()];
+    let none: Vec<viaticum_core::four_r::FirstHandObs> = Vec::new();
+    let by_master = viaticum_core::four_r::place_incremental_rank(
+        &req,
+        &pair,
+        &none,
+        &prior,
+        &PlacementPolicy {
+            cap_mode: CapMode::MasterIdOnly,
+        },
+    );
+    let by_subnet =
+        viaticum_core::four_r::place_incremental_rank(&req, &pair, &none, &prior, &policy);
+    assert_eq!(
+        by_master.len(),
+        2,
+        "under MasterIdOnly the kernel reads the identity and sees TWO buckets"
+    );
+    assert_eq!(
+        by_subnet.len(),
+        1,
+        "under the default AddrCorrelate it reads the other identity observable and sees ONE"
+    );
+}
+
+#[test]
+fn friend_preference_dial_changes_which_holder_the_owner_picks() {
+    // ⚗ THE DIAL IS LIVE — asserted on a hand-built world, because the tranche's headline for this
+    // arm is a NULL and a null is worthless if the switch might be dead. Same world, same seed,
+    // same block, one difference: the owner has served candidate `friend`, and the dial is on.
+    //
+    // The comparison is clean precisely BECAUSE of the test above: the placement ranking cannot
+    // see `g_ho`, so writing that cell does not move the kernel's own ordering — any change in the
+    // chosen holder is the preference branch and nothing else.
+    use viaticum_core::four_r::{PlacementPolicy, SurfacePrior};
+    let prior = SurfacePrior::default();
+    let policy = PlacementPolicy::default();
+    let base = DynParams::default();
+    let build = || {
+        let mut w = build_world(8, &base, 17);
+        for nd in w.nodes.iter_mut() {
+            // Everyone present, everyone admits (Reliable accepts at 1.0), empty disks — so the
+            // holder-side accept gate never masks the owner-side choice under test.
+            nd.present = true;
+            nd.joined_tick = 0;
+            nd.archetype = Archetype::Reliable;
+            nd.holdings.clear();
+        }
+        w
+    };
+    // (a) The kernel's own pick, dial OFF.
+    let mut off = build();
+    let picked_off = {
+        crate::sim_dynamic::engine::try_place_one_symbol_for_test(
+            &mut off, 0, 0, false, &base, &prior, &policy,
+        )
+        .expect("a symbol lands in an empty 8-node world");
+        off.nodes
+            .iter()
+            .position(|nd| nd.holdings.iter().any(|s| s.alive && s.owner == 0))
+            .expect("someone holds it")
+    };
+    // (b) Same world, dial ON, with a DIFFERENT candidate marked as one the owner already serves.
+    let friend = (1..8)
+        .find(|&h| h != picked_off)
+        .expect("another candidate");
+    let mut on = build();
+    on.capital[0][friend].g_ho = 500.0; // "I already hold this peer's data"
+    let mut params_on = base;
+    params_on.friend_preference = true;
+    params_on.friend_preference_margin = FC_PREF_MARGIN;
+    crate::sim_dynamic::engine::try_place_one_symbol_for_test(
+        &mut on, 0, 0, false, &params_on, &prior, &policy,
+    )
+    .expect("a symbol lands");
+    let picked_on = on
+        .nodes
+        .iter()
+        .position(|nd| nd.holdings.iter().any(|s| s.alive && s.owner == 0))
+        .expect("someone holds it");
+    assert_ne!(picked_off, friend, "the control picked someone else");
+    assert_eq!(
+        picked_on, friend,
+        "with the dial ON the owner places with the peer it already serves ({friend}), not the \
+         kernel's pick ({picked_off})"
+    );
+    // (c) And the SAME world with the same `g_ho` written but the dial OFF goes back to the
+    //     kernel's pick — so it is the DIAL that moved the symbol, not the capital cell.
+    let mut written_but_off = build();
+    written_but_off.capital[0][friend].g_ho = 500.0;
+    crate::sim_dynamic::engine::try_place_one_symbol_for_test(
+        &mut written_but_off,
+        0,
+        0,
+        false,
+        &base,
+        &prior,
+        &policy,
+    )
+    .expect("a symbol lands");
+    let picked_written = written_but_off
+        .nodes
+        .iter()
+        .position(|nd| nd.holdings.iter().any(|s| s.alive && s.owner == 0))
+        .expect("someone holds it");
+    assert_eq!(
+        picked_written, picked_off,
+        "writing the reciprocity cell alone changes nothing — the dial is the switch"
+    );
+    // (d) CREAM is deliberately untouched: the strangers-first entry channel keeps its order even
+    //     with the preference on (the ceiling this puts on the arm is measured, not argued).
+    let mut cream_on = build();
+    cream_on.capital[0][friend].g_ho = 500.0;
+    let mut cream_off = build();
+    cream_off.capital[0][friend].g_ho = 500.0;
+    let place_cream_sym = |w: &mut World, p: &DynParams| {
+        crate::sim_dynamic::engine::try_place_one_symbol_for_test(
+            w, 0, 0, true, p, &prior, &policy,
+        );
+        w.nodes
+            .iter()
+            .position(|nd| nd.holdings.iter().any(|s| s.alive && s.owner == 0))
+    };
+    assert_eq!(
+        place_cream_sym(&mut cream_on, &params_on),
+        place_cream_sym(&mut cream_off, &base),
+        "the preference does not touch the cream path"
+    );
+}
+
+#[test]
+#[ignore = "friend-circle POWER probe (30 seeds) — run with --ignored --nocapture"]
+fn sealing_the_circle_at_thirty_seeds_says_whether_ten_could_ever_have_settled_it() {
+    // WHY THIS EXISTS. Ten seeds cannot, on their own, distinguish "there is no penalty" from "ten
+    // seeds cannot see a penalty this size", so the honest follow-up is not a rewording, it is more
+    // seeds: 42..71, the same two arms, the same one switch.
+    //
+    // MEASURED at the frozen rung: 21 negative / 7 positive / 2 tied, ratio of means 0.65×,
+    // t(29) = −2.81 (clears Bonferroni ×2 = 2.36), Wilcoxon z = −2.94, Δ CI [−0.101, −0.016].
+    // ⚠ At B = 9 — the rung this tranche first froze — the SAME probe read t = −2.28 with a 16/30
+    // sign split, i.e. exactly the borderline second look the caveats below are written for. The
+    // caveats stay whatever the current numbers do; they are the reading protocol, not a verdict.
+    //
+    // ⚠⚠ WHAT THIS PROBE IS AND IS NOT (review W11). It is an UNCORRECTED SECOND LOOK, on a
+    // SUPERSET of the ten seeds already read as null. That has three consequences that must travel
+    // with every number below, and they are printed rather than left to the reader:
+    //   * the two-look α is not 5 %. Pocock's boundary for two looks is |z| ≥ 2.178, Bonferroni's
+    //     is 2.36 — both are printed beside the observed |t|, so a borderline result is visibly
+    //     borderline instead of quietly "significant";
+    //   * the outcome is a BOUNDED, ZERO-INFLATED lattice (a mean of per-owner k/met ratios, with
+    //     many exact zeros), so a t on 30 points leans on magnitudes the distribution may not
+    //     support. The distribution-free companion is a WILCOXON SIGNED-RANK, printed too;
+    //   * the SIGN SPLIT is the crudest and most robust summary of all, and it is printed first.
+    //     If the seeds split near-evenly, "the penalty is real" is not a sentence this design has
+    //     earned, whatever the means do.
+    //
+    // It is deliberately OUTSIDE the frozen design (the spec froze ten seeds and the headline stays
+    // on ten). It changes no bar and re-picks no arm.
+    use rayon::prelude::*;
+    let seeds: Vec<u64> = (42..72).collect();
+    let read = |arm: FcArm| -> Vec<f64> {
+        let k_eff = arm.scenario().world.base.k_eff;
+        seeds
+            .par_iter()
+            .map(|&seed| {
+                let (w, ring) = fc_stepped_world(arm, seed);
+                group_decodable_fraction(&w, &ring, k_eff)
+            })
+            .collect()
+    };
+    let open = read(FcArm::F_OPEN);
+    let closed = read(FcArm::F_CLOSED);
+    let (om, os) = mean_sigma(&open);
+    let (cm, cs) = mean_sigma(&closed);
+    let d: Vec<f64> = closed.iter().zip(&open).map(|(c, o)| c - o).collect();
+    let (dm, ds) = mean_sigma(&d);
+    let n = seeds.len() as f64;
+    let se = ds / n.sqrt();
+    let t = if se > 0.0 { dm / se } else { f64::NAN };
+    // ν = 29 two-sided 5 % critical value (textbook); the ν = 9 closed form above does not cover it,
+    // and an approximation would be exactly the kind of small-sample sloppiness this crate refuses.
+    let t_crit = 2.045f64;
+    // Two-look boundaries for the SAME question asked twice (ten seeds, then this superset).
+    let pocock_2look = 2.178f64;
+    let bonferroni_2 = 2.36f64;
+    let (lo, hi) = (dm - t_crit * se, dm + t_crit * se);
+    let negatives = d.iter().filter(|x| **x < 0.0).count();
+    let positives = d.iter().filter(|x| **x > 0.0).count();
+    let (wz, wpairs) = fc_wilcoxon_signed_rank_z(&d);
+    println!(
+        "\n=== POWER PROBE (UNCORRECTED SECOND LOOK): F-closed vs F-open, N={FC_TEST_N}, B={FC_TEST_BLOCKS}, seeds 42..71 (30), PAIRED ===\n  \
+         SIGN SPLIT (the robust summary, read this first): {negatives} negative / {positives} positive / {} tied, out of {}\n  \
+         closed {cm:.3}±{cs:.3}   open {om:.3}±{os:.3}   ratio of means {:.2}×\n  \
+         paired Δ {dm:+.4}   σ_d {ds:.4}   SE {se:.4}   t({}) = {:+.2}\n  \
+         critical values: single-look 5 % = {t_crit}   |   Pocock two-look = {pocock_2look}   |   Bonferroni ×2 = {bonferroni_2}\n  \
+         WILCOXON signed-rank (distribution-free, {wpairs} non-zero pairs): z = {wz:+.2}  ⇒  {}\n  \
+         95 % CI on the paired Δ (a Δ interval, NOT a ratio interval — the control mean has its own ≈ 13 % relative SE): [{lo:+.4}, {hi:+.4}]\n  \
+         A8's claimed 0.50× at N = 4 corresponds to Δ = {:+.4} — {} this Δ interval",
+        d.iter().filter(|x| **x == 0.0).count(),
+        seeds.len(),
+        if om > 0.0 { cm / om } else { f64::NAN },
+        seeds.len() - 1,
+        t,
+        if wz.abs() >= 1.96 {
+            "separates from zero at an uncorrected 5 %"
+        } else {
+            "does NOT separate from zero"
+        },
+        -0.5 * om,
+        if -0.5 * om >= lo && -0.5 * om <= hi {
+            "INSIDE"
+        } else {
+            "OUTSIDE — refuted at 30 seeds"
+        },
+    );
+    // The n needed to resolve the effect actually present, at 80 % power / 5 % two-sided
+    // (n ≈ (2.8·σ_d/Δ)²) — so "we could not tell" comes with a price tag instead of a shrug.
+    if dm.abs() > 0.0 {
+        println!(
+            "  to resolve the OBSERVED Δ {dm:+.4} at 80 % power you would need ≈ {:.0} seeds; \
+             to resolve A8's claimed Δ {:+.4}, ≈ {:.0} seeds",
+            (2.8 * ds / dm.abs()).powi(2),
+            -0.5 * om,
+            (2.8 * ds / (0.5 * om)).powi(2),
+        );
+    }
+    // THE VERDICT, in the words the evidence supports and no stronger. "Real" is reserved for a
+    // result that survives the multiplicity correction AND the distribution-free check AND a sign
+    // split that is not a coin flip.
+    let strong = t.abs() >= bonferroni_2 && wz.abs() >= 1.96 && negatives.max(positives) >= 20;
+    let borderline = t.abs() >= t_crit;
+    println!(
+        "  VERDICT: {}",
+        if strong {
+            "the penalty survives the two-look correction, the distribution-free check and the sign split"
+        } else if borderline {
+            "BORDERLINE at an UNCORRECTED 5 % on a second look. It is carried by magnitudes on a \
+             bounded, zero-inflated lattice, the sign split is near-even, and the Wilcoxon / \
+             two-look boundaries above say what that is worth. NOT 'the penalty is real at 30 \
+             seeds' — the honest statement is that thirty seeds still cannot settle it"
+        } else {
+            "no separation at 30 seeds either — the direction does not clear zero"
+        }
+    );
+}
+
+/// Wilcoxon SIGNED-RANK z for a paired difference column — the distribution-free companion to the
+/// paired t (review W11), for exactly the case this tranche is in: a BOUNDED, ZERO-INFLATED outcome
+/// where a mean-based test leans on magnitudes the lattice may not support.
+///
+/// Zero differences are DROPPED (Wilcoxon's own convention), ties get average ranks with the
+/// standard tie correction on the variance, and the returned `z` uses the normal approximation
+/// (valid from ~10 non-zero pairs; this probe has ~30). Returns `(z, non-zero pair count)`;
+/// `z = NaN` when fewer than two non-zero pairs remain.
+fn fc_wilcoxon_signed_rank_z(d: &[f64]) -> (f64, usize) {
+    let mut nz: Vec<f64> = d.iter().copied().filter(|x| *x != 0.0).collect();
+    let n = nz.len();
+    if n < 2 {
+        return (f64::NAN, n);
+    }
+    nz.sort_by(|a, b| a.abs().total_cmp(&b.abs()));
+    // Average ranks over ties in |d|.
+    let mut ranks = vec![0.0f64; n];
+    let mut i = 0usize;
+    let mut tie_terms = 0.0f64;
+    while i < n {
+        let mut j = i;
+        while j + 1 < n && nz[j + 1].abs() == nz[i].abs() {
+            j += 1;
+        }
+        let avg = ((i + 1) + (j + 1)) as f64 / 2.0;
+        for r in ranks.iter_mut().take(j + 1).skip(i) {
+            *r = avg;
+        }
+        let t = (j - i + 1) as f64;
+        tie_terms += t * t * t - t;
+        i = j + 1;
+    }
+    let w_plus: f64 = ranks
+        .iter()
+        .zip(&nz)
+        .filter(|(_, v)| **v > 0.0)
+        .map(|(r, _)| *r)
+        .sum();
+    let nf = n as f64;
+    let mean = nf * (nf + 1.0) / 4.0;
+    let var = nf * (nf + 1.0) * (2.0 * nf + 1.0) / 24.0 - tie_terms / 48.0;
+    if var <= 0.0 {
+        return (f64::NAN, n);
+    }
+    ((w_plus - mean) / var.sqrt(), n)
+}
+
+#[test]
+fn wilcoxon_signed_rank_z_matches_its_textbook_reference_cases() {
+    // The distribution-free check the power probe leans on, pinned before it is quoted.
+    // (1) A perfectly symmetric column is exactly zero.
+    let (z, n) = fc_wilcoxon_signed_rank_z(&[1.0, -1.0, 2.0, -2.0, 3.0, -3.0]);
+    assert_eq!(n, 6, "six non-zero pairs");
+    assert!(z.abs() < 1e-12, "symmetric ⇒ z = 0, got {z}");
+    // (2) Zeros are DROPPED, not counted as ties at rank 0 (Wilcoxon's convention).
+    let (_, n0) = fc_wilcoxon_signed_rank_z(&[0.0, 0.0, 1.0, -1.0, 2.0, -2.0]);
+    assert_eq!(n0, 4, "the two zero differences are dropped");
+    // (3) All-positive, no ties, n = 10: W+ = 55, mean = 27.5, σ = √96.25 ⇒ z = 2.803.
+    let all_pos: Vec<f64> = (1..=10).map(|k| k as f64).collect();
+    let (z3, n3) = fc_wilcoxon_signed_rank_z(&all_pos);
+    assert_eq!(n3, 10);
+    assert!(
+        (z3 - 2.8031).abs() < 1e-3,
+        "all-positive n=10 ⇒ z ≈ 2.803, got {z3}"
+    );
+    // (4) The sign flips with the data and nothing else.
+    let all_neg: Vec<f64> = all_pos.iter().map(|x| -x).collect();
+    let (z4, _) = fc_wilcoxon_signed_rank_z(&all_neg);
+    assert!((z4 + z3).abs() < 1e-12, "antisymmetric in the sign of d");
+    // (5) Ties in |d| take average ranks and shrink the variance: 4 pairs all |d| = 1, three
+    //     positive. Average rank 2.5 each ⇒ W+ = 7.5, mean = 5, var = 30/4 − 60/48 = 6.25.
+    let (z5, n5) = fc_wilcoxon_signed_rank_z(&[1.0, 1.0, 1.0, -1.0]);
+    assert_eq!(n5, 4);
+    assert!((z5 - 1.0).abs() < 1e-9, "tie-corrected z = 1.0, got {z5}");
+    // (6) Degenerate input is NaN, never a plausible-looking number.
+    assert!(fc_wilcoxon_signed_rank_z(&[0.0, 0.0]).0.is_nan());
 }

@@ -166,6 +166,10 @@ pub fn build_world(n: usize, params: &DynParams, seed: u64) -> World {
         // flips `pred_log_enabled` on to collect the dataset. Metric-only, no decision reads it.
         pred_log: Vec::new(),
         pred_log_enabled: false,
+        // ⚗ Admissible-set log OFF by default (review W6): the friend-circle tests flip it on for
+        // one measurement. Metric-only, no RNG, no decision reads it.
+        cand_friend_log: Vec::new(),
+        cand_friend_log_enabled: false,
         // World-v3 phase-1 adversary layer: empty (all honest) by default — the sim_adv
         // predator injection fills specific slots. An all-`None` layer keeps every engine
         // decision byte-identical to the pre-adv path.

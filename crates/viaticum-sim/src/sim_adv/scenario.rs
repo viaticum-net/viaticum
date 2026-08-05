@@ -267,6 +267,25 @@ pub struct AdvDials {
     /// First-hand: the hook only declares the FLAG; membership is read ENGINE-side (the same
     /// anti-oracle split as A6's `discriminate` / A15's `enclose_newcomers` / A7's collusion).
     pub serve_ring_only: bool,
+    /// ⚗ Friend-circle arm F-pref (`4r_friend_circle_spec.md` §2.2), the **PER-ROLE** half of the
+    /// owner-side preference for holders this node ALREADY SERVES. `serve_ring_only` above is the
+    /// HOLDER-side lever ("who I store for"); this is the OWNER-side one ("where I put my own
+    /// data"), and it is per-role precisely because the world-level
+    /// [`crate::sim_dynamic::engine::DynParams::friend_preference`] answers a DIFFERENT question:
+    /// with the world dial every owner in the network prefers, so the circle gets no privilege the
+    /// rest of the world lacks. The product question — "**I** want my backups on my friends'
+    /// machines" — is this dial: four owners prefer, 116 do not.
+    ///
+    /// First-hand and owner-side: the whole friend test is the node's OWN observation of the pair
+    /// (`FirstHandObs::g_holder_from_owner` = "I have served this holder"), so the hook only
+    /// declares the flag and the engine reads no membership at all. `false` (the [`Default`]) ⇒ the
+    /// placement path is byte-identical to the honest one (the ANCHOR).
+    pub friend_preference: bool,
+    /// ⚗ The BOUND on [`AdvDials::friend_preference`], in units of the block's own survival
+    /// estimate `R̂` — the same units and the same meaning as
+    /// [`crate::sim_dynamic::engine::DynParams::friend_preference_margin`], read only when the
+    /// per-role flag above is set. `0.0` (the [`Default`]) ⇒ a pure tie-break.
+    pub friend_preference_margin: f64,
     /// A11: creeping-degradation start tick + slope.
     pub degrade_start: u64,
     pub degrade_slope: f64,
@@ -574,6 +593,18 @@ pub struct AdvAction {
     /// and the same god-view group read `adv_collude_farm` already does). Default `false` ⇒ the
     /// accept-gate is byte-identical to the honest path (the ANCHOR).
     pub serve_group_only: bool,
+    /// ⚗ Friend-circle arm F-pref (`4r_friend_circle_spec.md` §2.2): `Some(margin)` ⇒ this node, as
+    /// an OWNER, prefers holders it already serves when placing its own floor symbols, bounded by
+    /// `margin` in `R̂` units (see [`AdvDials::friend_preference`]). The engine applies it as a
+    /// REORDERING of the kernel's already-admissible ranked list in
+    /// `engine::try_place_one_symbol`; nothing the kernel excluded is admitted and the width
+    /// loop's `R̂ ≥ r_target` stopping criterion is untouched.
+    ///
+    /// Unlike every other flag on this struct there is no engine-side god-view half: the friend
+    /// test is the owner's OWN first-hand observation of the pair
+    /// (`FirstHandObs::g_holder_from_owner`), so this is a pure owner policy. `None` (the
+    /// [`AdvAction::NOOP`] default) ⇒ the placement path is byte-identical to the honest one.
+    pub friend_preference: Option<f64>,
     /// A9 (eclipse-targeter), arms A and C: FIRE the eclipse — drop every alive symbol of the
     /// scenario's eclipse target this holder carries. The hook declares only the INTENT; the
     /// ENGINE resolves WHO the target is (`world.eclipse.target`) and, when
@@ -590,7 +621,8 @@ pub struct AdvAction {
 
 impl AdvAction {
     /// The honest / no-op action: no accept override, no rejoin, no voluntary drop, no pause,
-    /// no enclosure, no collusion, no group-only serving, no eclipse.
+    /// no enclosure, no collusion, no group-only serving, no owner-side friend preference,
+    /// no eclipse.
     pub const NOOP: AdvAction = AdvAction {
         accept_rate: None,
         rejoin: false,
@@ -601,6 +633,7 @@ impl AdvAction {
         enclose_newcomers: false,
         collude_farm: false,
         serve_group_only: false,
+        friend_preference: None,
         eclipse_fire: false,
         eclipse_lethal_watch: false,
     };

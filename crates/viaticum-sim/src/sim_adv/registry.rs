@@ -274,6 +274,437 @@ const A8_EPS_ACCEPT: f64 = 0.05;
 const A8_ROI_X: f64 = 1.0;
 
 // ============================================================
+// FRIEND CIRCLE (`4r_friend_circle_spec.md`) — A8's follow-up at the size the product actually
+// asks about. Constants FROZEN in code; `FC_BLOCKS_PER_NODE` is the ONE calibrated knob and it is
+// an INSTRUMENT setting (metric resolution), not a bar — see its doc and
+// `friend_circle_calibration_prints_metric_resolution_and_intra_share_by_size`.
+// ============================================================
+
+/// The circle size N. **FROZEN at 4 — the product's literal question** ("me and three friends run
+/// Viaticum"), which A8 measured and then froze away from (`A8_RING_N` = 8, by a substituted
+/// criterion its own doc discloses). N = 4 is also where the sealed circle is punished hardest, and
+/// the reason starts structural: a block needs `min_width = min(k_eff + MIN_REDUNDANCY, n_symbols)
+/// = 4` distinct holders, and a member of a four-ring has three friends, so a whole block cannot be
+/// held inside the circle at all (`a_four_member_circle_cannot_reach_min_width_inside_itself`).
+///
+/// ⚠ The N ∈ {6, 8} sweep is the SHAPE, and MEASURED it does not follow the width rule alone: the
+/// sealed/open ratio runs 0.53× / 0.61× / 1.19× at N = 4/6/8, so the sign crossing is between six
+/// and eight, not between four and five. See [`friend_circle`] conclusion (5) for what that costs
+/// the structural story.
+const FC_RING_N: usize = 4;
+
+/// World size + horizon: the same honest world A8 measured on (so the B = 3 rung of the
+/// resolution ladder reproduces A8's world exactly — see [`friend_circle_params`]).
+const FC_N_NODES: usize = 120;
+const FC_HORIZON: u64 = 130;
+
+/// The per-node SOURCE VOLUME (gb) held CONSTANT while the block granularity is refined:
+/// `3 × 50` = `honest_v2`'s `blocks_per_node × block_volume`. See [`friend_circle_params`].
+const FC_DEMAND_VOLUME_GB: f64 = 150.0;
+
+/// The per-tick upload budget (gb) held CONSTANT across the ladder: `1 × 25` = the volume an
+/// `honest_v2` owner actually uploads per tick (`symbols_per_tick` floors `⌊20/25⌋` to 1 symbol of
+/// 25 gb, so the nominal `bandwidth_u = 20` is not the realised rate). Writing the REALISED rate
+/// makes the ladder exact instead of accidental — see [`friend_circle_params`].
+const FC_UPLOAD_GB_PER_TICK: f64 = 25.0;
+
+/// The per-node demand-ARRIVAL budget in ticks, held constant: `3 × 6` = `honest_v2`'s
+/// `blocks_per_node × maturation_ticks_per_block`, i.e. a node's whole source volume matures over
+/// ~18 ticks at 150/18 = 8.33 gb/tick. See [`friend_circle_params`].
+const FC_MATURATION_TICK_BUDGET: u64 = 18;
+
+/// **The INSTRUMENT setting, calibrated (spec §1) — never a bar.** How many blocks a node's source
+/// volume is cut into. It sets the RESOLUTION of every per-owner "fraction of my blocks that are
+/// decodable" read: with `met` established blocks the per-owner quantum is `1/met`, so A8's `B = 3`
+/// quantised the measurement to {0, ½, 1} in practice (an owner establishes only ~1.8 of its three
+/// blocks) and its whole σ ≈ 0.14 at N = 4 came from the instrument's own division rather than from
+/// the world.
+///
+/// **FROZEN at 18 — the spec's own criterion, taken literally.** Spec §1 pre-registers
+/// «калибровать, чтобы квант ≤ 0.1», and the quantum it names is the PER-OWNER one. B = 18 is the
+/// smallest exactly-compensating rung that meets it (0.081); B = 9 gives 0.166 and does not.
+///
+/// ⚠ **AND THE SPEC'S OTHER PRE-REGISTRATION WAS ABANDONED, WHICH THE TRANCHE NEVER SAID.** Spec §1
+/// names TWO things: a CANDIDATE WINDOW («`blocks_per_node` — поднять, кандидат 8-12») and the
+/// criterion above. **B = 18 is outside the window.** Nothing is hidden by that — the departure
+/// makes the rung FINER, not coarser, and it is the criterion that selected it — but an unremarked
+/// departure from a pre-registration is precisely what a pre-registration exists to make visible,
+/// so it is recorded here and ASSERTED in
+/// `friend_circle_is_registered_with_the_frozen_world`.
+///
+/// The two halves are INCONSISTENT in this world, and the arithmetic needs no run. A rung is
+/// admissible only if it is EXACTLY-COMPENSATING (all three of [`friend_circle_params`]'s held
+/// quantities unchanged; otherwise refining the ruler moves the world). Across the whole window
+/// 8..=12 exactly ONE rung compensates — B = 9 — and B = 9 structurally cannot reach the quantum
+/// (ceiling 1/9 = 0.111 > 0.1). B = 12, the window's top, fails compensation on the demand budget:
+/// `FC_MATURATION_TICK_BUDGET / 12` floors to 1, so its budget is 12 ticks rather than 18, and the
+/// world moves. So the window and the criterion cannot both be honoured, and the criterion is the
+/// one §1 calls the calibration target and the only one that is checkable — which is why it won.
+///
+/// ⚠⚠ **THE TRANCHE FIRST FROZE B = 9, ON A SUBSTITUTED CRITERION, AND B = 9 IS THE MINIMUM OF THE
+/// EFFECT.** The substitution was the four-member GROUP lattice (`quant_1 / N`) instead of the
+/// per-owner quantum, disclosed at the time as a deviation but not followed through to its
+/// consequence. The consequence is the `closed/open` column below: the size of the measured effect
+/// is not constant along this ladder, and B = 9 is the one rung at which the sealed circle looks
+/// unpunished. A ladder introduced as a ruler that turns out to move the answer is not a ruler, and
+/// the only defence against choosing the flattering rung is to honour the pre-registration. So the
+/// rung is B = 18, chosen by the written criterion and not by its result, and all four rungs stay
+/// printed with the ratio column so the dependence is visible instead of buried.
+///
+/// MEASURED (N = 4, seeds 42..51, PAIRED per seed; the full ladder is printed by the calibration
+/// test):
+///
+/// | B | met/member | per-owner quantum `1/met` | F-open decodable | F-closed decodable | **closed/open** | **paired t(9)** | p |
+/// |---|---|---|---|---|---|---|---|
+/// | 3 (= A8's world) | 1.80 | 0.556 | 0.221 ± 0.118 | 0.067 ± 0.084 | **0.30×** | **−3.62** | 0.006 |
+/// | 6 | 3.85 | 0.260 | 0.115 ± 0.116 | 0.055 ± 0.067 | 0.47× | −1.89 | 0.091 |
+/// | 9 (first frozen — the MINIMUM) | 6.03 | 0.166 | 0.160 ± 0.113 | 0.127 ± 0.153 | **0.79×** | **−0.76** | 0.466 |
+/// | **18 (FROZEN)** | **12.40** | **0.081** | **0.206 ± 0.097** | **0.110 ± 0.105** | **0.53×** | **−3.43** | **0.008** |
+///
+/// Two conclusions the earlier version got backwards:
+/// * "ten seeds cannot see the N = 4 penalty" is a property of the B = 9 rung ONLY. At three of the
+///   four rungs — including A8's own, where the effect is LARGEST — ten seeds see it at p ≤ 0.01;
+/// * so the refinement did not merely change the RESOLUTION of the measurement, it changed the
+///   MEASUREMENT (0.30× → 0.79× → 0.53×). That is a finding about the instrument, and it is why no
+///   single rung's ratio is quoted here without its rung.
+///
+/// ⚠ **"The world holds still along the ladder" is TRUE ONLY OF THE OUTSIDER AGGREGATE.** The 116
+/// honest outsiders' decodable fraction reads 0.306 / 0.293 / 0.313 / 0.296 (F-open) and 0.328 /
+/// 0.335 / 0.330 / 0.294 (F-closed) — flat, as designed, and the alive-symbol count scales exactly
+/// with B (279 / 555 / 843 / 1716) at constant volume. The FOUR NODES BEING MEASURED do not hold
+/// still at all: circle decodable 0.221 / 0.115 / 0.160 / 0.206, intra-share 0.181 / 0.083 / 0.072 /
+/// 0.243, homing 7.62 / 3.27 / 2.78 / 10.46. A four-node group in a 120-node world is a small
+/// sample by construction, and the invariance claim must not be extended to it.
+///
+/// ⚠ NOTE-16, the group-lattice arithmetic: `group_decodable_fraction` is a MEAN OF PER-OWNER
+/// RATIOS, so the group lattice is NOT uniform and `quant_1 / N` is not "the group quantum" — a
+/// member with `met = 3` moves the four-member mean by 1/12 regardless of what the others have. The
+/// calibration test prints the coarsest honest step `1/(N·min met)` instead.
+const FC_BLOCKS_PER_NODE: usize = 18;
+
+/// The friend-circle world (spec §1) at block granularity `B`. Refining the instrument is meant not
+/// to move the world, so three quantities are held EXACTLY constant along the ladder and only the
+/// granularity changes:
+///
+/// | held constant | how |
+/// |---|---|
+/// | per-node source volume (⇒ demand/supply ratio, erasure overhead, disk pressure) | `block_volume = FC_DEMAND_VOLUME_GB / B` |
+/// | realised upload rate (gb/tick) | `bandwidth_u = FC_UPLOAD_GB_PER_TICK`, which `⌊25/(75/B)⌋ = B/3` divides EXACTLY for `B ∈ {3, 6, 9, 18}` |
+/// | demand-arrival rate (gb/tick) | `maturation_ticks_per_block = FC_MATURATION_TICK_BUDGET / B` |
+///
+/// The rest of the physics is volume-scale-free (every reference scale — `g*`, `d_ref`, `V_ret`,
+/// `V_free` — is derived from `v_per_symbol`), so holding those three fixes the world. At `B = 3`
+/// the result is `a8_ring`'s world exactly (`bandwidth_u` 20 vs 25 both floor to one 25 gb symbol
+/// per tick — pinned by `friend_circle_world_at_three_blocks_is_the_a8_world`), which is what
+/// makes the ladder a ladder: rung one reproduces the number the tranche is refining.
+///
+/// ⚠ NOT held constant, disclosed: cream demand. `cream_target = round(cream_max·ι)` is per BLOCK,
+/// and ι is spread over [0.2, 0.8] regardless of `B`, so the cream volume grows with `B`. Printed
+/// in the calibration table rather than corrected, because correcting it would mean touching
+/// `cream_max` — a physics dial — to protect an instrument.
+///
+/// ⚠⚠ AND THE COMPENSATION IS ONLY VERIFIED WHERE IT WAS CHECKED. The three quantities above are
+/// exact, and the 116-node OUTSIDER aggregate does hold still along the ladder (its decodable
+/// fraction stays 0.29-0.33 at every rung). The four-node CIRCLE does not: its decodable fraction,
+/// its intra-share and the F-closed/F-open ratio all swing by 2-3× along the sweep
+/// ([`FC_BLOCKS_PER_NODE`] has the table). Whether that is small-sample variation of a four-node
+/// group or a real interaction between granularity and the `min_width` structure is NOT settled by
+/// this tranche. Do not quote "the world holds still" about anything but the outsider aggregate.
+fn friend_circle_params(blocks_per_node: usize) -> DynParams {
+    let b = blocks_per_node.max(1);
+    DynParams {
+        // As `a8_ring`: the board world WITHOUT the known giver-priority owner-ordering artifact
+        // (A7's documented sim-fidelity proxy — see `a8_ring`'s doc).
+        giver_priority_order: false,
+        blocks_per_node: b,
+        block_volume: FC_DEMAND_VOLUME_GB / b as f64,
+        bandwidth_u: FC_UPLOAD_GB_PER_TICK,
+        maturation_ticks_per_block: (FC_MATURATION_TICK_BUDGET / b as u64).max(1),
+        ..DynParams::default()
+    }
+}
+
+/// The FRIEND CIRCLE (`4r_friend_circle_spec.md`): four people run Viaticum and back each other
+/// up. A8 answered this question at N = 8 with an arm that REFUSES strangers; this scenario asks
+/// it at N = 4 in four behavioural variants, none of which is an attack:
+///
+/// * **F-open** — the friends behave honestly: they hold anyone who asks, they prefer nobody.
+///   This registered scenario IS F-open (plain dials, `serve_ring_only = false`, full accept).
+/// * **F-closed** — they hold only each other and reject strangers (A8's `serve_ring_only`).
+/// * **F-pref/circle** ⚗ — they hold anyone, but THEY (and nobody else in the world) want their own
+///   data with people they already hold for — the per-role
+///   [`crate::sim_adv::scenario::AdvDials::friend_preference`]. **This is the product's question.**
+/// * **F-pref/world** ⚗ — the same preference carried by EVERY owner
+///   ([`DynParams::friend_preference`]). A different question: "what if this shipped for everyone".
+///   Neither ⚗ arm is a shipping proposal.
+///
+/// The arms are dial overrides on this scenario, built in `tests.rs` — no arm-specific
+/// construction, so they are matched by build. The "circle" itself is A8's injected group
+/// (`AdvId::A8CollusionRing` with `collude = false`): four real nodes with real disks and real
+/// backup demand, present from t = 0 and churn-immortal. Reusing A8's group is deliberate (spec
+/// §2.1 "reuse, do not invent") — and it carries A8's disclosed CONSTRUCTION caveat with it: an
+/// injected node is forced Reliable + full-accept + immortal, i.e. among the most attractive
+/// holders in the world, so it is not a random quadruple of users.
+///
+/// **NO new board row** (spec §3): a friend circle is not an invariant, it is a measurement. The
+/// only verdicts here are the house structural pair (determinism, anti-oracle). Bars used in the
+/// tests are BORROWED (the 0.60 no-collapse bar) and the load-bearing comparison is always the
+/// matched control — the SAME nodes under a different behaviour, never the honest outsiders (who
+/// join late and churn).
+///
+/// ⚠⚠ **SCOPE CAVEAT ON EVERY NUMBER BELOW, AND IT IS THE LOUDEST NUMBER IN THE TRANCHE** (review
+/// NOTE-15). In EVERY arm the circle decodes 0.11-0.21 of its once-durable blocks and the honest,
+/// well-connected, never-churning OUTSIDERS decode 0.29-0.30. Two thirds of once-durable blocks are
+/// unrecoverable at the horizon for everybody. Every ratio in this tranche is therefore a ratio
+/// between two catastrophic states, and the cause is known and is a property of the SIM WORLD, not
+/// of the trust design: the REALISED per-owner upload budget is [`FC_UPLOAD_GB_PER_TICK`] = 25
+/// gb/tick against a [`FC_DEMAND_VOLUME_GB`] = 150 gb per-node source volume, so this world cannot
+/// afford to maintain what it placed. It is logged as `[MED / SIM-EXPERIMENT]` in
+/// `private/docs/tech-debt.md`, whose standing instruction is not to build conclusions on absolute
+/// deep-horizon decodability until the `bandwidth_u` sweep exists.
+///
+/// ⚠ NOT "`bandwidth_u = 20` gb/tick against a 25 gb chunk ⇒ one symbol per owner per tick" (review
+/// N2). That sentence is `honest_v2`'s, and it is this ladder's RUNG ONE. The FROZEN world runs
+/// `bandwidth_u = 25` against a 150/18/`k_eff` = **4.17 gb** chunk, i.e. **SIX** symbols per tick
+/// per owner. The gb/tick rate is identical by construction (that is the point of
+/// [`friend_circle_params`]) and so is the conclusion — only the chunk changed, and the sentence
+/// has to describe the world it is printed under.
+///
+/// **No LEVEL here transfers to a world that can afford its own placements. The arm-vs-arm
+/// CONTRASTS are what this scenario reports.**
+///
+/// MEASURED (N = 4, B = 18 — the frozen rung, seeds 42..51, PAIRED per seed; the between-seed
+/// spread of the LEVEL is as large as the level, so an unpaired read cannot see anything here):
+///
+/// | arm | circle decodable | vs F-open | data at home (alive) | at placement | took / gave (gb·days) |
+/// |---|---|---|---|---|---|
+/// | F-open | 0.206 ± 0.097 | — | 0.243 ± 0.245 | 0.096 ± 0.059 | 43299 / 32498 |
+/// | F-closed | 0.110 ± 0.105 | **0.53× (t(9) = −3.43, p = 0.008)** | 0.950 ± 0.063 | 0.422 ± 0.031 | 10762 / 0 |
+/// | F-pref/circle ⚗ | 0.183 ± 0.135 | 0.89× (t(9) = −0.48, p = 0.65) | **0.119 ± 0.192** | 0.076 ± 0.060 | 45149 / 35737 |
+/// | F-pref/world ⚗ | 0.139 ± 0.100 | 0.67× (t(9) = −2.66, p = 0.026) | 0.293 ± 0.257 | 0.091 ± 0.060 | 42606 / 31882 |
+///
+/// 1. **An honest group is not a circle: 76 % of its data lives on strangers' machines** (at the
+///    frozen rung; `intra` 0.243 ± 0.245). The same four hold 3.1 % of the strangers' symbols
+///    against a proportional 3.4 %, so they are if anything LESS popular than average holders — the
+///    "they are just attractive nodes" explanation is dead. **The residual homing DOES resolve**
+///    (paired Δ +0.212, effect size 0.83 — below the house gate — but t(9) = +2.62, p = 0.028): the
+///    four are mildly self-homing, 0.243 of their own data at home against 0.031 of the strangers'.
+///    ⚠ That is a CHANGE from the first version of this conclusion, which read "does NOT clear the
+///    noise gate" because this gate carried the bare effect-size test while the sealed-circle test
+///    carried the corrected one (review W1). One standard, applied everywhere, reports MORE — and
+///    it does not touch the headline: mild homing and "three quarters of it is abroad" are the same
+///    measurement. ⚠ The DIRECTION (`intra < 0.5`) holds at every rung of the ladder; the MAGNITUDE
+///    does not — `intra` reads 0.181 / 0.083 / 0.072 / 0.243 and homing 7.6 / 3.3 / 2.8 / 10.5 at
+///    B = 3/6/9/18. Quote the rung with the number.
+/// 2. **⭐ THE N = 4 PENALTY IS REAL, AND AT THE PRE-REGISTERED RUNG TEN SEEDS SEE IT — the SIGN and
+///    the SEPARATION are established, the SIZE is a RANGE.** Ten seeds: paired Δ −0.097 ± 0.089,
+///    t(9) = −3.43, **p = 0.008**, 8 of 10 seeds negative, ratio of means **0.53×**. Thirty seeds
+///    (`sealing_the_circle_at_thirty_seeds_says_whether_ten_could_ever_have_settled_it`, an
+///    uncorrected second look, read with its own caveats): **0.65×**, t(29) = −2.81 past the
+///    Bonferroni ×2 boundary, Wilcoxon z = −2.94, sign split 21/7/2, Δ CI [−0.101, −0.016].
+///    **The honest headline is that range: sealing costs the smallest circle BETWEEN ABOUT A THIRD
+///    AND A HALF of its recoverable data, with the SMALLER estimate coming from the LARGER
+///    sample.** Quoting 0.53× alone reports the more dramatic end of a range whose better-powered
+///    end is the milder one — and the reason is identifiable rather than mysterious: **the SEALED
+///    arm reads 0.110 in BOTH samples; it is the CONTROL that moves** (0.206 over seeds 42..51,
+///    0.169 over 42..71). The ten seeds happened to hand F-open an unusually good draw, so the
+///    ten-seed ratio is the flattered-denominator one. The absolute Δ tells the same story with
+///    less drama: −0.097 on ten seeds, −0.059 on thirty, CI [−0.101, −0.016].
+///
+///    ⚠ **AND THE BORROWED 0.60 IS A RULER HERE, NOT A BAR** (review W2 — the first version of this
+///    conclusion said "the borrowed 0.60× no-collapse bar is not cleared" and let it stand as a
+///    verdict). Two transpositions, both load-bearing:
+///    * its home semantics is **ABSOLUTE** — *"FAIL if more than 40 % of once-durable blocks become
+///      UNDECODABLE"* ([`DR_BATTLE_FLOOR_X`] / [`A15_FLOOR_X`] / INV-RESTORE-SANITY) — while here it
+///      is applied as a RATIO to a matched control. What was borrowed is the NUMBER, not the bar.
+///      Read in the bar's own units EVERY arm fails catastrophically: 0.110 sealed, 0.206 open,
+///      0.296 for the honest never-churning outsiders, all against 0.60. A8's precedent used the
+///      relative form as a SOFT, PASSING assert
+///      (`a8_friend_circle_keeps_its_data_without_serving_outsiders`); turning a soft floor into a
+///      FAIL headline asks it for authority it does not carry;
+///    * the ten-seed 0.53× is BELOW it and the thirty-seed 0.65× is ABOVE it. The ruler sits
+///      INSIDE the range this conclusion reports, so "the bar is not cleared" is a property of the
+///      smaller sample and not of the finding. No verdict should hang on which side of a borrowed
+///      number a point estimate lands.
+///
+///    ⚠ CORRECTED FROM THE FIRST VERSION OF THIS TRANCHE: "ten seeds cannot see the N = 4 penalty,
+///    and A8's five never could" was FALSE. It was a property of the B = 9 rung alone. At A8's own
+///    rung the effect is the LARGEST of the ladder (0.30×, p = 0.006); B = 9, the rung first frozen
+///    here, is the single point where it disappears. The STRUCTURAL fact behind it needs no
+///    statistics — a four-circle cannot reach `min_width = 4` inside itself — but see (5): that
+///    fact is a LOWER BOUND on the mechanism, not the whole of it, because the measured sign
+///    crossing is at N ≈ 7 and not at the N = 5 the width rule alone predicts.
+/// 3. **"95 % self-hosted" is MOSTLY retention — but placement is not a bystander, and the two
+///    numbers do not share a denominator.** The sealed circle's SURVIVING share at home is 0.950
+///    while its share of placement EVENTS at home is 0.422. Three things have to be said about that
+///    gap or it will be mis-read (review W9): (a) the denominators differ — the alive share is over
+///    PRESENT holders, the ever-share includes departed ones; (b) the ever-share counts placement
+///    EVENTS, and repair re-enters `try_place_one_symbol` every tick a block sits below target, so
+///    a block that keeps losing its abroad symbol contributes many abroad events against a handful
+///    of one-time home ones; (c) there is a STRUCTURAL CEILING — a block needs `min_width = 4`
+///    distinct holders and a four-circle offers three, so at most ¾ of a FLOOR block's symbols can
+///    be at home, and every CREAM symbol is pushed abroad by design (`place_cream` is
+///    strangers-first), which drags the achievable share below that. Against a ceiling of ≈ 0.75
+///    minus the cream, 0.422 means the circle put a large part of what it structurally could at
+///    home. What IS confirmed is the survivorship
+///    DIRECTION, and it is not an artifact of sealing: the alive share exceeds the placed share by
+///    ≈ 2.3× in the sealed arm (0.950 / 0.422) and by ≈ 2.5× in the OPEN one (0.243 / 0.096), so
+///    strangers shedding an owner's data is a mechanism both arms live under. The sentence "the
+///    circle keeps its data at home, not because it put it there" is too strong; "mostly because
+///    the strangers threw the rest away, and partly because it placed at home up to what the width
+///    rule allows" is what the numbers say.
+/// 4. **Sealing does not reduce the NET imposition on the network, only the contribution.** Net
+///    take−give is 10762 ± 1564 gb·days sealed against 10800 ± 2932 open — paired Δ −38 ± 3403,
+///    t(9) = −0.04, p = 0.97, indistinguishable. What changes is that the circle stops contributing
+///    32498 ± 7865 gb·days of its own disk.
+/// 5. **⭐ THE SIZE SWEEP IS A REAL SHAPE, AND IT CHANGES SIGN** (the full table, every arm, every
+///    size — `friend_circle_four_arms_by_size_print_the_product_answer_table`; ratios vs the
+///    matched F-open control at that N, ten seeds, paired):
+///
+///    | N | F-open | F-closed | F-pref/circle ⚗ | F-pref/world ⚗ |
+///    |---|---|---|---|---|
+///    | 4 | 0.206 ± 0.097 | 0.110 ± 0.105 — **0.53× p 0.008** | 0.183 ± 0.135 — 0.89× p 0.65 | 0.139 ± 0.100 — **0.67× p 0.026** |
+///    | 6 | 0.187 ± 0.127 | 0.114 ± 0.072 — 0.61× p 0.071 | 0.192 ± 0.156 — 1.02× p 0.94 | 0.177 ± 0.110 — 0.94× p 0.80 |
+///    | 8 | 0.150 ± 0.090 | 0.178 ± 0.078 — 1.19× p 0.071 | 0.163 ± 0.105 — 1.09× p 0.52 | 0.177 ± 0.075 — 1.19× p 0.41 |
+///
+///    Sealing is a PENALTY for a small circle and turns into a (weak) benefit for a large one:
+///    0.53× → 0.61× → 1.19×, monotone, with the endpoints pointing opposite ways at p ≈ 0.008 and
+///    p ≈ 0.071. A8 froze N = 8 — the one size at which its own arm comes out ahead.
+///
+///    ⚠ Yes, this cites a MONOTONE column while (6) refuses to (review W4) — and the two uses are
+///    not the same. The margin sweep's arms are NESTED (each margin promotes a superset of the one
+///    below), so its ordering is close to structurally forced. The three N points are separate
+///    circle sizes with independently drawn worlds, nothing is a subset of anything, and the claim
+///    made here is a SIGN CROSSING with a p at each endpoint — not "four ordered points, therefore
+///    a trend". The load-bearing content is the two endpoints; the middle point only says the
+///    crossing is between 6 and 8.
+///
+///    **Reconciling this with the structural argument in (2), which does NOT fully survive it.**
+///    `min_width = min(k_eff + MIN_REDUNDANCY, n_symbols) = 4` and a member of an N-circle has N−1
+///    possible friend-holders, so the width rule predicts a discontinuity between N = 4 (3 holders,
+///    a block can never even reach minimum width at home) and N ≥ 5. The measured crossing is
+///    between N = 6 and N = 8. So the width rule explains why N = 4 is the WORST case — it is the
+///    only size where sealing makes a whole block structurally unplaceable at home — but it is not
+///    the whole mechanism: reaching `min_width` is not reaching `r_target`, and the width loop keeps
+///    placing until `R̂ ≥ r_target`, which in this world needs more buckets than the floor minimum.
+///    A sealed 6-circle can meet the minimum and still not meet the target inside five buckets.
+///    ⚠ Do NOT state (2) as "the structural explanation accounts for the penalty"; state it as
+///    "the width rule is a lower bound on the mechanism, and it is exact only at N = 4".
+/// 6. **⚗ The preference does not do what the product asked, in either scope.** At the size that
+///    asks the question, switching the circle-only preference on moves the circle's data AWAY from
+///    the circle (`intra` 0.243 → 0.119) — a direction, **not established** (p = 0.21). The
+///    world-scope version is the only F-pref point in the table that separates from its control at
+///    all, and it separates as a DURABILITY COST (0.67×, t(9) = −2.66, **p = 0.026**) without
+///    bringing the data home (`intra` +0.050, p = 0.38).
+///
+///    ⚠ **THE MONOTONE MARGIN SWEEP IS NOT EVIDENCE FOR THE AWAY DIRECTION** (review W4), and the
+///    first version of this conclusion cited it as if it were. The four margin arms share seeds and
+///    are NESTED — margin 0 promotes a SUBSET of what the ceiling promotes — so an ordered column is
+///    close to structurally expected, not four independent successes. This doc already retired that
+///    argument for the durability column ("four monotone points inside the noise are not a cost
+///    curve"); the same retirement applies to the intra-share column, and the direction now travels
+///    with its p and with the label NOT ESTABLISHED. What the sweep DOES show, and what is worth
+///    keeping, is that **margin 0 is not a mild setting**: below `k_eff` every candidate scores
+///    exactly 0.0, so the "pure tie-break" is already friend-first for the first `k_eff` symbols of
+///    every block — and accordingly F-open 0.243 → margin-0 0.164 is the LARGEST single step in the
+///    whole sweep, larger than the three margin steps above it combined.
+///
+///    ⚠ **WHAT THE ~13-CANDIDATE MEASUREMENT DOES AND DOES NOT SUPPORT** (review W3). Measured at
+///    DECISION TIME, an owner has already served 14.8 % of the ~91 candidates the kernel rules
+///    admissible — about thirteen peers (seed 42; the ± 5.3 pp is the spread across DECISIONS, and
+///    the 116 outsiders read 12.6 % over 1.8 · 10⁵ decisions in the same run). At most three of
+///    those thirteen can be circle-mates, so **at least ten of every thirteen promotions go to
+///    strangers**. That is an **EXPRESSIBILITY BOUND** and it is exact: no margin of this handle can
+///    deliver "my backups with my three friends", because the handle expresses RECIPROCITY and a
+///    circle member's reciprocal set is mostly outside the circle. It is **NOT an explanation of the
+///    measured negative sign**: the relevant baseline is F-open's placement share of 0.096, while
+///    the bound ALLOWS up to 3/13 ≈ 0.23 circle-mates — read literally the arithmetic argues the
+///    dial should move data HOME. The drift is the other way, which implies circle-mates are ~1 of
+///    the 13 rather than 3, and **this tranche has no instrument for that quantity** (the
+///    admissible-set log counts friends, never which of them are circle-mates). Bound: established.
+///    Sign: measured, and unexplained. See
+///    [`crate::sim_dynamic::engine::DynParams::friend_preference`].
+///
+///    ⚠ NOTHING HERE SUPPORTS "the preference costs durability" AS A GENERAL CLAIM. Across the
+///    twelve F-pref cells in the table the ratios are 0.89 / 1.02 / 1.09 (circle scope) and 0.67 /
+///    0.94 / 1.19 (world scope) — one resolving point, at one size, in one scope, and the sign
+///    flips by N = 8.
+///
+/// **WHAT TO TELL THE FOUR FRIENDS** (spec §6 asks for this in the user's own terms, and asks for
+/// it unpleasant if it is unpleasant). *You are not a circle. Three quarters of your data will sit
+/// on strangers' machines and there is no setting that changes that — the design's only handle in
+/// this direction is "prefer peers I already store for", and at your size at least ten of every
+/// thirteen peers you store for are strangers, so that handle cannot put your backups on your three
+/// friends' machines however hard you turn it. (Measured, it moved our test circle's data further
+/// out rather than closer in — but that direction did not separate from noise, so treat it as "it
+/// does not work", not as "it backfires".) If you shut the door and store only for each other, you
+/// lose somewhere between a third and a half of your recoverable data — four machines cannot even
+/// reach the minimum placement width of one block among themselves — and the network does not
+/// benefit either, because your net footprint on strangers' disks stays the same; you only stop
+/// contributing. What the four of you can actually have is the network's ordinary service, which
+/// you are already getting.* ⚠ And say the caveat too: in this simulated world nobody, friend or
+/// stranger, keeps more than about a third of their once-durable blocks, for a bandwidth reason
+/// unrelated to any of this.
+pub fn friend_circle() -> Scenario {
+    Scenario {
+        id: ScenarioId("friend_circle"),
+        about: "four real nodes that run Viaticum together (N=4, the product's literal case) in a 120-node honest world at the frozen block granularity (18 blocks/node at constant volume — the spec's pre-registered per-owner quantum ≤ 0.1) — the registered arm is F-open (they hold everyone, prefer nobody); F-closed (refuse strangers) and the two ⚗ F-pref scopes (owner-side preference for holders they already serve, carried by the circle alone or by the whole world) are dial overrides measured against it",
+        world: WorldParams {
+            n_nodes: FC_N_NODES,
+            base: friend_circle_params(FC_BLOCKS_PER_NODE),
+            restore_window_days: RESTORE_WINDOW_DAYS,
+            restore_bw_gb_day: RESTORE_BW_GB_DAY,
+            demand: DemandMix::Uniform,
+            uptime: UptimeMix::Legacy,
+            tier_mix: TierMix::Backbone,
+            inflow: InflowPolicy::None,
+        },
+        population: honest_v2().population,
+        tiers: honest_v2().tiers,
+        adversaries: vec![AdvSpec {
+            id: AdvId::A8CollusionRing,
+            count: FC_RING_N,
+            info_model: InfoModel::Own,
+            dials: AdvDials {
+                group_size: FC_RING_N,
+                group_subnet: A8_GROUP_SUBNET,
+                // F-open: hold ANYONE who asks (the honest holder policy), refuse nobody.
+                whale_accept: 1.0,
+                collude: false,
+                serve_ring_only: false,
+                ..AdvDials::default()
+            },
+        }],
+        events: Vec::new(),
+        horizon: FC_HORIZON,
+        // Spec §1: TEN seeds (A8's five could not separate an effect the size of its own σ).
+        seeds: vec![42, 43, 44, 45, 46, 47, 48, 49, 50, 51],
+        metrics: vec![MetricId::Extraction, MetricId::InvariantBoard],
+        verdicts: vec![
+            Invariant {
+                id: "INV-DETERMINISM",
+                spec: InvariantSpec::Determinism,
+                threshold: 1.0,
+            },
+            Invariant {
+                id: "INV-ANTI-ORACLE",
+                spec: InvariantSpec::AntiOracle,
+                threshold: 1.0,
+            },
+        ],
+        fast: false,
+    }
+}
+
+/// The friend-circle world at an arbitrary block granularity — the resolution LADDER's rung
+/// builder, used by the calibration test (spec §1) and by nothing on the decisive path.
+pub fn friend_circle_at_granularity(blocks_per_node: usize) -> Scenario {
+    let mut sc = friend_circle();
+    sc.world.base = friend_circle_params(blocks_per_node);
+    sc
+}
+
+// ============================================================
 // A10 provider-exit (`4r_a10_spec.md`) — constants FROZEN in code BEFORE the run (anti-Goodhart).
 // The calibration test `a10_provider_exit_calibration_*` prints the runtime numbers (present holders
 // at the exit tick, top-holder alive-holding load, survivor capacity vs the n_symbols = 5 floor, the
@@ -458,6 +889,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
         a15_enclosure(),
         a7_sybil(),
         a8_ring(),
+        friend_circle(),
         a10_provider_exit(),
         a9_eclipse_blind(),
         a9_eclipse_silence(),
