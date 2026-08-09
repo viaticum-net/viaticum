@@ -84,9 +84,9 @@ fn make_peer(seed: u8) -> PeerRecord {
 
 fn make_ledger(g_from: f64, g_to: f64) -> PairLedger {
     PairLedger {
-        g_owner_from_holder: g_from,
-        g_holder_from_owner: g_to,
-        depth: 12.5,
+        gb_days_they_store_for_us: g_from,
+        gb_days_we_store_for_them: g_to,
+        depth_of_their_service: 12.5,
         v_dem: 3.25,
         observed_volume: 2.0,
         observed_tau: 45.0,

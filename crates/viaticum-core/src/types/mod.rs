@@ -426,9 +426,12 @@ pub enum PlacementStatus {
 /// placement, eviction, offer admission and PoS cadence all still run on the legacy
 /// `trust` axes. That is *not* enforced structurally — [`crate::db::Db`] is reachable
 /// from every module and `get_pair_ledger` is an ordinary `pub` method. The honest
-/// guarantee is weaker: **there is no call site that reads it.** The ledger exists so
-/// that when the 4R decision kernel ([`crate::four_r`]) is wired into the daemon, it
-/// starts on *warm history* instead of zeros.
+/// guarantee is weaker: **the only readers are the recorder itself
+/// ([`crate::pair_ledger`], which accrues these values on a scheduler tick) and the
+/// SystemState snapshot/restore pair that carries them through disaster recovery — no
+/// decision site.** The ledger exists so that when the 4R decision kernel
+/// ([`crate::four_r`]) is wired into the daemon, it starts on *warm history* instead of
+/// zeros.
 ///
 /// The reason it cannot wait for that wiring: `G` is a *leaky* integral — a decaying
 /// weighted history, not a running total, and nothing recorded today can produce one
@@ -443,9 +446,29 @@ pub enum PlacementStatus {
 /// either. `G` and the slow `depth` are neither of those shapes; both have to accrue in
 /// calendar time. Spec: `private/beta-planning/tasks/pair_ledger.md`.
 ///
-/// Field names mirror [`crate::four_r::FirstHandObs`] so the bridge (У-5) is a
-/// rename-free map; `depth` is the one field the kernel takes *beside* `FirstHandObs`
-/// (see below).
+/// # Field names are ABSOLUTE here, role-relative in the kernel
+///
+/// The names deliberately do NOT mirror [`crate::four_r::FirstHandObs`] (they did until
+/// У-2). The kernel's `g_owner_from_holder` / `g_holder_from_owner` are named relative to
+/// the SEAT the caller occupies, so the same name denotes opposite physical flows for an
+/// owner-side and a holder-side decision. Two separate passes of this project — sim
+/// transaction 3a and slice У-1 — wrote the mapping down inverted, so this struct states
+/// the direction in the field name instead and leaves the seat choice to an explicit,
+/// visible mapping:
+///
+/// | this row | physical flow | kernel field, OWNER-side view | kernel field, HOLDER-side view |
+/// |---|---|---|---|
+/// | `gb_days_they_store_for_us` | their machines keep OUR data | `obs.g_owner_from_holder` | `obs.g_holder_from_owner` (the κ_O input) |
+/// | `gb_days_we_store_for_them` | we keep THEIR data | `obs.g_holder_from_owner` | `obs.g_owner_from_holder` |
+/// | `depth_of_their_service` | (slow twin of row 1) | — | `OwnerEvictionView::depth` |
+///
+/// The right-hand column is the one that matters and the one that was got wrong: the
+/// eviction key is `kappa_key(obs.g_holder_from_owner, depth, ..)` and the kernel says in
+/// as many words that this term is "the eviction seat: the owner `O`'s reciprocal service
+/// to ME, the holder" (`four_r/mod.rs:338-340`), plus "this is the direction the old doc
+/// comment inverted" (`four_r/mod.rs:697-703`). So a holder-side view is built from
+/// `gb_days_they_store_for_us`, and the bridge (У-5) must pick its seat consciously rather
+/// than matching names.
 ///
 /// # Why a separate table, not fields on `PeerRecord`
 ///
@@ -457,9 +480,10 @@ pub enum PlacementStatus {
 /// ledger is keyed by master identity (next section). The holder-side quantity being
 /// integrated is computed per-MASTER at the source: [`crate::db::Db::refresh_peer_storage_bytes`]
 /// sums HOLDINGS over `owner_id == master_for(device)`, and HOLDINGS themselves are keyed
-/// by `block_id ‖ owner_id(master)`. So a ledger field on `PeerRecord` would give a master
+/// by `owner_id(master) ‖ block_id` (owner first — `db::holding_key`, S-4: one owner's
+/// holdings are a contiguous range). So a ledger field on `PeerRecord` would give a master
 /// with N devices N rows of one person's economic history, each carrying the full
-/// master-wide total — `g_holder_from_owner` inflated ×N.
+/// master-wide total — `gb_days_we_store_for_them` inflated ×N.
 ///
 /// Not "physically impossible", to be exact about what was proven: there is **no
 /// non-arbitrary per-device decomposition** of that quantity. Summing the N rows gives ×N;
@@ -501,7 +525,13 @@ pub enum PlacementStatus {
 /// `bytes_we_store_for_peer` per-MASTER ("escrow is economic between humans, not
 /// devices") while `bytes_peer_stores_for_us` is per-device. Keyed by `DeviceId`, each
 /// of a master's N device rows would accrue the full master-wide total — inflating
-/// `g_holder_from_owner` ×N.
+/// `gb_days_we_store_for_them` ×N.
+///
+/// The placeholder identity `IdentityPub([0; 32])` is NOT a person and never gets a row:
+/// it is what the deprecated `TrustEngine::upsert_peer` and pre-certificate peer rows
+/// leave behind (`daemon/dr` repairs such rows on re-authentication, CS-DR-12), so
+/// accepting it would fold every unidentified device into one shared "zero person" whose
+/// ledger is the sum of unrelated strangers.
 ///
 /// PoS outcomes stay per-device (an observation of a machine, not an economic fact) —
 /// though NOT on [`PeerRecord`], which carries no such fields, only the derived
@@ -515,7 +545,7 @@ pub enum PlacementStatus {
 ///
 /// | field | unit |
 /// |---|---|
-/// | `g_owner_from_holder`, `g_holder_from_owner`, `depth` | **gb·days** |
+/// | `gb_days_they_store_for_us`, `gb_days_we_store_for_them`, `depth_of_their_service` | **gb·days** |
 /// | `v_dem`, `observed_volume` | **gb** |
 /// | `observed_tau` | **days** |
 /// | `drop_ann`, `drop_silent` | dimensionless (decaying event counts) |
@@ -555,25 +585,65 @@ pub enum PlacementStatus {
 /// and its `..._required_field_cannot_read_...` twin.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PairLedger {
-    /// `G(O←h)` **[gb·days]**: this master's service TO US — leaky integral of
-    /// PoS-confirmed gb·days it stored for us. Accrued from `bytes_peer_stores_for_us`
-    /// (summed over the master's devices) via [`crate::four_r::update_capital`].
-    pub g_owner_from_holder: f64,
-    /// `G(h←O)` **[gb·days]**: OUR service to this master — leaky integral of gb·days we
-    /// stored for them. Accrued from the per-master `bytes_we_store_for_peer`.
-    pub g_holder_from_owner: f64,
+    /// **[gb·days]** — leaky integral of the data THIS MASTER'S DEVICES KEEP FOR US.
+    ///
+    /// Charged from the daemon's own owner-side bookkeeping: `symbol_count × t` summed
+    /// over placements in status `Alive` at any device of this master, integrated by
+    /// [`crate::four_r::update_capital`] at `λ`.
+    ///
+    /// The number comes from the SWEEP [`crate::db::Db::storage_bytes_by_master`], which is
+    /// the only production path (Д-C: one pass per table for all masters, because the tick
+    /// runs inside the scheduler's `select!`).
+    /// [`crate::db::Db::bytes_master_stores_for_us`] computes the same formula for ONE
+    /// master and has no production call site at all — it is the point-query reference the
+    /// sweep is cross-checked against
+    /// (`pair_ledger::tests::the_sweep_and_the_point_queries_report_the_same_volumes`), and
+    /// the readable statement of what the sweep's accumulator means.
+    ///
+    /// ⚠ **Not "PoS-confirmed", however tempting the phrase is.** What is charged is the
+    /// placement STATUS: `Alive` is our record that the symbols are believed to be there,
+    /// demoted to `Uncertain`/`PresumedLost` only after PoS challenges time out. So a
+    /// holder that has gone quiet keeps charging this axis for as long as the PoS state
+    /// machine needs to notice. That is a proxy for confirmation, accepted for the
+    /// recorder slice (Д-D, 2026-08-09); deriving a real confirmation signal from
+    /// `pos_weekly` or from the placement transitions is an open item for У-3.
+    pub gb_days_they_store_for_us: f64,
+    /// **[gb·days]** — leaky integral of the data WE KEEP FOR THIS MASTER.
+    ///
+    /// Charged from `total_bytes` summed over `Active` holdings owned by this master — the
+    /// same number [`crate::db::Db::refresh_peer_storage_bytes`] writes into
+    /// `PeerRecord::bytes_we_store_for_peer`, and already per-master at the source.
+    ///
+    /// Same as the axis above: the live path is the sweep
+    /// [`crate::db::Db::storage_bytes_by_master`], while
+    /// [`crate::db::Db::bytes_we_store_for_master`] is the per-master reference kept for
+    /// point lookups and for the cross-check that keeps the two from drifting.
+    pub gb_days_we_store_for_them: f64,
     /// `D` **[gb·days]**: the SLOW-leaky loyalty depth of the pair
     /// ([`crate::four_r::update_depth`], `τ_slow ≈ 6 months`) — the second time-integral
-    /// of the same confirmed-service flow that charges `g_holder_from_owner`.
+    /// of the SAME flow that charges [`PairLedger::gb_days_they_store_for_us`], on a
+    /// time-constant one order slower.
+    ///
+    /// The invariant, stated without roles so it cannot invert again: **the depth is
+    /// charged by exactly the flow whose accrual reads "this counterparty served me", and
+    /// the eviction key reads exactly the cell that accrual wrote.** In the sim that is
+    /// literally one statement — `capital[holder][owner].g_ho` and `.depth_ho` are
+    /// incremented together (`sim_dynamic/engine.rs:1884-1886`) and
+    /// `observe_eviction_views` reads that same cell back
+    /// (`engine.rs:1972-1979`, `observer.rs:149,183`). In the kernel it is spelled out in
+    /// prose: κ_O's capital term is "the owner `O`'s reciprocal service to ME, the holder"
+    /// (`four_r/mod.rs:338-340`).
     ///
     /// It is not part of [`crate::four_r::FirstHandObs`] because the kernel takes it as a
     /// separate parameter: [`crate::four_r::OwnerEvictionView`] is `{ obs, depth, symbols }`
     /// and the single holder-side reciprocity key is
-    /// `kappa_key(g_holder_from_owner, depth, &DepthParams)`. Without a recorded `D` the
-    /// eviction axis κ_O would start from zero on the day 4R is wired in — and since `D`
-    /// is an integral over months, it is exactly the quantity that cannot be
-    /// back-computed. Same reason as `g`, one time-constant slower.
-    pub depth: f64,
+    /// `kappa_key(obs.g_holder_from_owner, depth, &DepthParams)` — where that observation
+    /// field must be fed from THIS row's `gb_days_they_store_for_us` (see the seat table
+    /// above). Without a recorded `D` the eviction axis κ_O would start from zero on the
+    /// day 4R is wired in — and since `D` is an integral over months, it is exactly the
+    /// quantity that cannot be back-computed. Same reason as the capitals, one
+    /// time-constant slower.
+    pub depth_of_their_service: f64,
     /// `V_dem` **[gb]**: max proven retained volume for this pair. A slow ratchet — snaps
     /// up to freshly confirmed volume, eases down only through `λ_dem`
     /// ([`crate::four_r::update_v_dem`]).
@@ -591,8 +661,15 @@ pub struct PairLedger {
     /// Wall clock of the last accrual (unix seconds). Single clock for the `G`/`D`
     /// integrators and the drop decay: every accrual integrates over `now - last_update`,
     /// so the contribution is set by elapsed time and not by how many times the tick
-    /// happened to fire. A daemon that slept a week accrues a week on its next tick, not
-    /// one tick's worth; a second tick at the same `now` accrues nothing (AC-2′).
+    /// happened to fire. A second tick at the same `now` accrues nothing (AC-2′).
+    ///
+    /// "Integrates over the whole interval" is not the same as "charges volume over the
+    /// whole interval": the DECAY covers every elapsed day, while the measured volume is
+    /// only charged over the last [`crate::pair_ledger::observed_window_days`] of it —
+    /// three periods of the accrual timer, which is a different number of seconds at every
+    /// `time_scale`. A daemon that slept a week comes back to a row decayed by a week and
+    /// credited for the few hours it can actually vouch for (Д-A — see
+    /// [`crate::pair_ledger`]).
     ///
     /// `None` = the clock has never started (nothing accrued yet). It is a distinct state
     /// from "accrued to zero": a first tick must SEED this field and integrate nothing,
@@ -629,7 +706,14 @@ impl PairLedger {
     /// `(1 − λΔt)`: monotone only while `λΔt < 1`, oscillating between 1 and 2, divergent
     /// above 2. At `λ = 1/60 day⁻¹` those thresholds are 60 and 120 days, and both are
     /// reachable here — a daemon that was off for three months returns `Δt ≈ 90`, and at
-    /// `time_scale = 1000` an hourly tick already returns `≈ 42`. Feeding such a `Δt`
+    /// `time_scale = 1000` a two-hour outage returns `≈ 83`. (The recorder's
+    /// own CADENCE stays far below both at every scale a script in this tree uses: its
+    /// timer is divided by `time_scale` too, so an on-schedule tick returns
+    /// `max(1, 3600/scale)·scale/86400` days — 1/24 day up to `scale = 3600`, then growing
+    /// with the one-second timer floor to ≈1.16 days at `scale = 100_000`. It would take
+    /// `scale > 5.184·10⁶` for one on-schedule tick to cross 60 days on its own. So a large
+    /// `Δt` means downtime, not acceleration.)
+    /// Feeding such a `Δt`
     /// straight in can invert the accrual: the step lands at `g(1 − λΔt) + v_conf·Δt`, so
     /// it goes NEGATIVE once `v_conf < g(λΔt − 1)/Δt` — that is, for a pair that has
     /// largely stopped storing, which is exactly the pair a long outage produces. Even

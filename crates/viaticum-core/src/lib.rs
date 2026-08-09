@@ -16,6 +16,7 @@ pub mod importance;
 pub mod mailbox;
 pub mod messages;
 pub mod migration;
+pub mod pair_ledger;
 pub mod path_safety;
 pub mod placement;
 pub mod pos;

@@ -3168,3 +3168,181 @@ async fn pending_challenge_not_created_before_mailbox_store_ack() {
 }
 
 // ─── Stub network helper ──────────────────────────────────────────────────────
+
+// ─── У-2: pair-ledger accrual tick (recorder — decides nothing) ───────────────
+
+/// One on-schedule ledger tick at `time_scale = 1`, where the real and the scaled clock
+/// coincide. At any other scale the period is `pair_ledger::tick_interval_secs(scale)`.
+const LEDGER_TICK: u64 = viaticum_core::constants::PAIR_LEDGER_TICK_SECS;
+
+/// This node's own master identity in the ledger tests. Deliberately NOT
+/// `dummy_master_pub()` (`IdentityPub([0; 32])`): the zero identity is also the "master
+/// unknown" placeholder the sweep drops on its own, so a scheduler built with it would
+/// pass the self-skip test for the wrong reason.
+fn ledger_my_master() -> viaticum_core::types::IdentityPub {
+    viaticum_core::types::IdentityPub([0x5A; 32])
+}
+
+/// Build a Scheduler whose only interesting parts are the DB, the master identity and
+/// `time_scale`; the mailbox/repair/encoder wiring is inert for the accrual tick.
+fn make_ledger_scheduler(db: &Db, time_scale: u64) -> Scheduler {
+    // The receiver may drop immediately: the accrual tick never touches repair_tx.
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    Scheduler::new(
+        db.clone(),
+        SchedulerConfig {
+            pos_interval_secs: 3600,
+            timeout_check_secs: 3600,
+            time_scale,
+            event_log_retain_rows: 100_000,
+            pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+        },
+        repair_tx,
+        make_pending_challenges(),
+        make_test_router(db),
+        ledger_my_master(),
+        ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    )
+}
+
+/// The wiring test: the scheduler's tick reaches the recorder, passes its own clock, and
+/// leaves a row per known peer master.
+#[tokio::test]
+async fn accrue_pair_ledgers_records_a_row_for_each_known_peer_master() {
+    let db = Db::open_in_memory().expect("db open");
+    let holder = make_identity(0x51);
+    db.upsert_peer(&make_peer_record(holder)).unwrap();
+    let master = viaticum_core::types::IdentityPub(holder.0);
+    let scheduler = make_ledger_scheduler(&db, 1);
+
+    let seeded = scheduler
+        .accrue_pair_ledgers(Timestamp(0))
+        .expect("seed tick");
+    let accrued = scheduler
+        .accrue_pair_ledgers(Timestamp(LEDGER_TICK))
+        .expect("accrual tick");
+
+    assert_eq!(seeded.seeded, 1, "first tick starts the clock");
+    assert_eq!(accrued.accrued, 1, "second tick integrates the interval");
+    assert_eq!(
+        accrued.with_unobserved_gap, 0,
+        "an on-schedule tick is fully observed"
+    );
+    let stored = db.get_pair_ledger(&master).unwrap().expect("ledger row");
+    assert_eq!(stored.last_update, Some(Timestamp(LEDGER_TICK)));
+}
+
+/// A sibling (a peer row carrying OUR master identity) is not an economic counterparty.
+#[tokio::test]
+async fn accrue_pair_ledgers_skips_our_own_master() {
+    let db = Db::open_in_memory().expect("db open");
+    let mut sibling = make_peer_record(make_identity(0x54));
+    sibling.master_identity = ledger_my_master();
+    db.upsert_peer(&sibling).unwrap();
+    let scheduler = make_ledger_scheduler(&db, 1);
+
+    let stats = scheduler.accrue_pair_ledgers(Timestamp(0)).expect("tick");
+
+    assert_eq!(stats.seeded, 0);
+    assert!(db.list_pair_ledgers().unwrap().is_empty());
+}
+
+/// Д1: the accrual runs on the SIMULATED calendar, like the daemon's other timers and the
+/// existing gb·day sums. Without it, an accelerated run would record 1/time_scale of the
+/// history it is supposed to demonstrate. Four real seconds is inside the observed window
+/// at both scales below — at 1000 the timer period is `(3600/1000).max(1)` = 3 real seconds
+/// (integer division, not 3.6) and the window is three of those.
+#[tokio::test]
+async fn accrue_pair_ledgers_uses_the_configured_time_scale() {
+    let holder = make_identity(0x52);
+    let master = viaticum_core::types::IdentityPub(holder.0);
+
+    let mut stored = Vec::new();
+    for scale in [1u64, 1000] {
+        let db = Db::open_in_memory().expect("db open");
+        db.upsert_peer(&make_peer_record(holder)).unwrap();
+        db.upsert_holding(&viaticum_core::types::HoldingRecord {
+            source_block_id: make_block_id(0x53),
+            owner_id: master,
+            esi_ranges: vec![(0, 10)],
+            importance: 0.5,
+            total_bytes: 4 * (viaticum_core::constants::BYTES_PER_GB as u64),
+            status: viaticum_core::types::HoldingStatus::Active,
+            received_at: Timestamp(0),
+            delete_requested_at: None,
+            drop_notice_sent_at: None,
+        })
+        .unwrap();
+        let scheduler = make_ledger_scheduler(&db, scale);
+        scheduler.accrue_pair_ledgers(Timestamp(0)).unwrap();
+        let stats = scheduler.accrue_pair_ledgers(Timestamp(4)).unwrap();
+        assert_eq!(
+            stats.with_unobserved_gap, 0,
+            "an on-schedule tick must be fully observed at scale {scale}"
+        );
+        stored.push(
+            db.get_pair_ledger(&master)
+                .unwrap()
+                .unwrap()
+                .gb_days_we_store_for_them,
+        );
+    }
+
+    // Both intervals are inside the observed window, so both are a single Euler step from
+    // zero: `g = V·Δt`, and Δt scales exactly with time_scale.
+    assert!(
+        (stored[1] - 1000.0 * stored[0]).abs() < 1e-9,
+        "four seconds at scale 1000 must be a thousand times four seconds at scale 1: {stored:?}"
+    );
+}
+
+/// BLOCK-1 wiring: the observed window the recorder uses must be built from the SAME
+/// `time_scale` the scheduler builds its timer from, at a scale where the two stop being
+/// interchangeable. `experiments/local_delete_test.sh` and `local_pos_repair_test.sh` run
+/// daemons at `--time-scale 100000`, where the timer floors at one real second and each
+/// on-schedule tick spans ≈1.16 SIMULATED days — nine times the old fixed 3 h window. A
+/// scheduler that passed its scale to the accrual but sized the window without it charged
+/// 10.8 % of every tick and reported an unobserved gap on every row, every tick.
+#[tokio::test]
+async fn accrue_pair_ledgers_fully_charges_an_on_schedule_tick_at_the_experiment_time_scale() {
+    let scale = 100_000u64;
+    let holder = make_identity(0x55);
+    let master = viaticum_core::types::IdentityPub(holder.0);
+    let db = Db::open_in_memory().expect("db open");
+    db.upsert_peer(&make_peer_record(holder)).unwrap();
+    db.upsert_holding(&viaticum_core::types::HoldingRecord {
+        source_block_id: make_block_id(0x56),
+        owner_id: master,
+        esi_ranges: vec![(0, 10)],
+        importance: 0.5,
+        total_bytes: 4 * (viaticum_core::constants::BYTES_PER_GB as u64),
+        status: viaticum_core::types::HoldingStatus::Active,
+        received_at: Timestamp(0),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    })
+    .unwrap();
+    let scheduler = make_ledger_scheduler(&db, scale);
+    let period = viaticum_core::pair_ledger::tick_interval_secs(scale);
+    assert_eq!(period, 1, "premise: the timer floor bites at this scale");
+
+    scheduler.accrue_pair_ledgers(Timestamp(0)).unwrap();
+    let stats = scheduler.accrue_pair_ledgers(Timestamp(period)).unwrap();
+
+    assert_eq!(
+        stats.with_unobserved_gap, 0,
+        "an on-schedule tick is not an outage at any scale the experiments use"
+    );
+    let scaled_days = period as f64 * scale as f64 / 86_400.0;
+    let stored = db.get_pair_ledger(&master).unwrap().expect("ledger row");
+    assert!(
+        (stored.gb_days_we_store_for_them - 4.0 * scaled_days).abs() < 1e-9,
+        "the whole tick must carry the measured 4 gb: expected {}, got {}",
+        4.0 * scaled_days,
+        stored.gb_days_we_store_for_them
+    );
+}

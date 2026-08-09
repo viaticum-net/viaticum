@@ -4202,3 +4202,26 @@ fn placement_never_goes_below_the_daemon_minimum_redundancy() {
         "the target is (over-)met at the minimum width: {r}"
     );
 }
+
+// ── Sim ↔ daemon calibration agreement (У-2, WARN-5) ─────────────────────────
+
+#[test]
+fn the_daemon_recorder_leaks_at_exactly_the_model_defaults_this_sim_runs_on() {
+    // `viaticum_core::constants::PAIR_LEDGER_LAMBDA*` are the daemon's copy of the §13 leak
+    // rates, duplicated from `DynParams::default` with the stated invariant "the two must
+    // stay equal". A stated invariant with no guard is how sim and kernel drifted apart
+    // before. The daemon crate cannot see the sim, but the sim depends on the core, so the
+    // guard belongs here.
+    let model = DynParams::default();
+
+    assert_eq!(
+        model.lambda,
+        viaticum_core::constants::PAIR_LEDGER_LAMBDA,
+        "λ: a field series recorded at a different leak cannot be compared with a sim run"
+    );
+    assert_eq!(
+        model.lambda_slow,
+        viaticum_core::constants::PAIR_LEDGER_LAMBDA_SLOW,
+        "λ_slow: same, for the loyalty depth D"
+    );
+}

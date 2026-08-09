@@ -815,9 +815,9 @@ fn elapsed_days_returns_an_unclamped_interval_for_a_long_outage() {
 
 fn ledger_sample() -> PairLedger {
     PairLedger {
-        g_owner_from_holder: 3.5,
-        g_holder_from_owner: 4.5,
-        depth: 60.0,
+        gb_days_they_store_for_us: 3.5,
+        gb_days_we_store_for_them: 4.5,
+        depth_of_their_service: 60.0,
         v_dem: 2.0,
         observed_volume: 1.5,
         observed_tau: 30.0,
@@ -836,9 +836,9 @@ fn pair_ledger_with_a_new_defaulted_field_still_reads_rows_written_today() {
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
     struct PairLedgerPlusDefaulted {
-        g_owner_from_holder: f64,
-        g_holder_from_owner: f64,
-        depth: f64,
+        gb_days_they_store_for_us: f64,
+        gb_days_we_store_for_them: f64,
+        depth_of_their_service: f64,
         v_dem: f64,
         observed_volume: f64,
         observed_tau: f64,
@@ -856,7 +856,10 @@ fn pair_ledger_with_a_new_defaulted_field_still_reads_rows_written_today() {
         decoded.trend_d, 0.0,
         "the added field arrives as its default"
     );
-    assert_eq!(decoded.depth, 60.0, "the pre-existing fields still arrive");
+    assert_eq!(
+        decoded.depth_of_their_service, 60.0,
+        "the pre-existing fields still arrive"
+    );
 }
 
 #[test]
@@ -868,9 +871,9 @@ fn pair_ledger_with_a_new_required_field_cannot_read_rows_written_today() {
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
     struct PairLedgerPlusRequired {
-        g_owner_from_holder: f64,
-        g_holder_from_owner: f64,
-        depth: f64,
+        gb_days_they_store_for_us: f64,
+        gb_days_we_store_for_them: f64,
+        depth_of_their_service: f64,
         v_dem: f64,
         observed_volume: f64,
         observed_tau: f64,
@@ -885,5 +888,54 @@ fn pair_ledger_with_a_new_required_field_cannot_read_rows_written_today() {
     assert!(
         from_cbor_bytes::<PairLedgerPlusRequired>(&stored).is_err(),
         "a new field without #[serde(default)] breaks every row written before it"
+    );
+}
+
+/// A `PairLedger` row exactly as this tree encodes it — CBOR of [`ledger_sample`].
+///
+/// Frozen 2026-08-09 (У-1) and REGENERATED the same day, because У-2 renamed the three
+/// capital fields into absolute terms and the field names ride inside the CBOR map. That
+/// rename is free today and only today: there is no deployed network, so no row and no
+/// published SystemState blob carries the old names. Once one does, this fixture is what
+/// makes the next rename visible instead of silent.
+///
+/// This is the real mine (W-2 follow-up assigned to У-2): the two tests above demonstrate
+/// the MECHANISM on stand-in replica structs, so neither of them turns red if a future
+/// field lands on the ACTUAL `PairLedger` without `#[serde(default)]`. This one does.
+const PAIR_LEDGER_ROW_FROZEN_2026_08_09: &[u8] = &[
+    0xa9, 0x78, 0x19, 0x67, 0x62, 0x5f, 0x64, 0x61, 0x79, 0x73, 0x5f, 0x74, 0x68, 0x65, 0x79, 0x5f,
+    0x73, 0x74, 0x6f, 0x72, 0x65, 0x5f, 0x66, 0x6f, 0x72, 0x5f, 0x75, 0x73, 0xf9, 0x43, 0x00, 0x78,
+    0x19, 0x67, 0x62, 0x5f, 0x64, 0x61, 0x79, 0x73, 0x5f, 0x77, 0x65, 0x5f, 0x73, 0x74, 0x6f, 0x72,
+    0x65, 0x5f, 0x66, 0x6f, 0x72, 0x5f, 0x74, 0x68, 0x65, 0x6d, 0xf9, 0x44, 0x80, 0x76, 0x64, 0x65,
+    0x70, 0x74, 0x68, 0x5f, 0x6f, 0x66, 0x5f, 0x74, 0x68, 0x65, 0x69, 0x72, 0x5f, 0x73, 0x65, 0x72,
+    0x76, 0x69, 0x63, 0x65, 0xf9, 0x53, 0x80, 0x65, 0x76, 0x5f, 0x64, 0x65, 0x6d, 0xf9, 0x40, 0x00,
+    0x6f, 0x6f, 0x62, 0x73, 0x65, 0x72, 0x76, 0x65, 0x64, 0x5f, 0x76, 0x6f, 0x6c, 0x75, 0x6d, 0x65,
+    0xf9, 0x3e, 0x00, 0x6c, 0x6f, 0x62, 0x73, 0x65, 0x72, 0x76, 0x65, 0x64, 0x5f, 0x74, 0x61, 0x75,
+    0xf9, 0x4f, 0x80, 0x68, 0x64, 0x72, 0x6f, 0x70, 0x5f, 0x61, 0x6e, 0x6e, 0xf9, 0x3c, 0x00, 0x6b,
+    0x64, 0x72, 0x6f, 0x70, 0x5f, 0x73, 0x69, 0x6c, 0x65, 0x6e, 0x74, 0xf9, 0x00, 0x00, 0x6b, 0x6c,
+    0x61, 0x73, 0x74, 0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x1a, 0x65, 0x53, 0xf1, 0x00,
+];
+
+#[test]
+fn pair_ledger_still_decodes_a_row_frozen_before_the_field_was_added() {
+    // Rows already on disk (and inside every published SystemState base blob) must keep
+    // decoding into the REAL struct. If this goes red, the last field added lacks
+    // `#[serde(default)]`, and the blast radius is not one stale row: list_pair_ledgers →
+    // snapshot_db → SystemState publication stops with only a log line, and disaster
+    // recovery cannot read the blobs already out there.
+    let decoded: PairLedger = from_cbor_bytes(PAIR_LEDGER_ROW_FROZEN_2026_08_09)
+        .expect("a row written before the change must still decode");
+
+    assert_eq!(decoded, ledger_sample(), "every frozen field round-trips");
+}
+
+#[test]
+fn the_frozen_pair_ledger_row_is_what_this_tree_writes_today() {
+    // Guards the fixture itself: if the encoding (not the schema) ever changes, the test
+    // above would keep passing on a fixture that no longer represents a real stored row.
+    assert_eq!(
+        to_cbor_bytes(&ledger_sample()),
+        PAIR_LEDGER_ROW_FROZEN_2026_08_09,
+        "the frozen fixture must still be byte-identical to a freshly written row"
     );
 }

@@ -457,9 +457,118 @@ pub const AVAIL_DECAY_TICK_SECS: u64 = 24 * 3600;
 /// Response lives in mailbox for response_TTL; owner needs time to poll and receive it.
 pub const POS_CHALLENGE_PENDING_TIMEOUT_SECS: u64 = 7 * 24 * 3600 + 7 * 24 * 3600 + 2 * 3600;
 
+// === 4R pair ledger (У-2 recorder) ===
+//
+// The `four_r` kernel deliberately hard-codes NEITHER leak rate: `update_capital` and
+// `update_depth` take `lambda` from the caller, because the kernel is shared with the
+// offline simulator and must not carry a production calibration. These constants are
+// that caller's copy. Values are the §13 model defaults, identical to the simulator's
+// `DynParams::default` (`viaticum-sim/src/sim_dynamic/engine.rs:361,363`) — the two must
+// stay equal or a series recorded in the field cannot be compared with a sim run.
+//
+// NOTE: no decision reads any of this. They only drive the recorder that accumulates
+// `PairLedger` rows for the future 4R wiring.
+
+/// `λ` — leak rate of the fast pair capital `G` [day⁻¹]; `τ = 1/λ ≈ 60 days`.
+///
+/// Model: `dG/dt = V_conf − λG` (decision model A.1 / §13). Steady state `G* = V_conf/λ`.
+pub const PAIR_LEDGER_LAMBDA: f64 = 1.0 / 60.0;
+
+/// `λ_slow` — leak rate of the loyalty depth `D` [day⁻¹]; `τ_slow = 1/λ_slow ≈ 6 months`.
+///
+/// Model A.4: the same confirmed-service flow integrated on a slow time constant, so a
+/// silent-but-deep partner keeps a fading floor rather than a permanent free one.
+pub const PAIR_LEDGER_LAMBDA_SLOW: f64 = 1.0 / 180.0;
+
+/// Largest `λ·Δt` the recorder allows in ONE explicit Euler sub-step.
+///
+/// `update_capital`'s multiplier is `(1 − λΔt)`: monotone only below 1, oscillating up to
+/// 2, divergent above. 0.5 keeps a comfortable margin (with `λ = 1/60` the sub-step is 30
+/// days). A long outage is split into such steps and integrated, never clamped — clamping
+/// would silently discard exactly the accrual this layer exists to keep.
+pub const PAIR_LEDGER_MAX_LAMBDA_DT: f64 = 0.5;
+
+/// Accrual tick interval in seconds (1 hour) BEFORE `time_scale` is applied.
+///
+/// The cadence is not load-bearing for the DECAY half: the integrator reads the CLOCK
+/// (`PairLedger::last_update`), so a missed tick is still decayed by the next one. It is
+/// load-bearing for the CHARGE half — see [`PAIR_LEDGER_OBSERVED_WINDOW_TICKS`].
+///
+/// ⚠ This is NOT the period the daemon actually ticks at, and the difference matters above
+/// `time_scale = 3600`. The scheduler's timer is `(3600 / scale).max(1)` REAL seconds —
+/// integer division with a one-second floor — so one on-schedule tick spans
+/// `max(1, 3600/scale) · scale` of the SCALED seconds `PairLedger::elapsed_days` counts.
+/// That equals 3600 only when the scale DIVIDES 3600. Below that it truncates downward
+/// (3 · 1000 = 3000 s at `scale = 1000`); above `scale = 3600` the one-second floor sends
+/// it the other way, and at `scale = 100_000` (used by `experiments/local_delete_test.sh`
+/// and `local_pos_repair_test.sh`; `full_test.sh` runs 86_400) one tick is a whole 100_000
+/// scaled seconds ≈ 1.16 simulated days. Everything that has to compare against a tick
+/// period must therefore go through [`crate::pair_ledger::tick_interval_secs`], never
+/// through this constant directly.
+pub const PAIR_LEDGER_TICK_SECS: u64 = 3600;
+
+/// How much of an inter-tick interval may be charged with the volume measured at the END
+/// of it — i.e. how long a gap still counts as OBSERVED (Д-A, 2026-08-09). Counted in TICK
+/// PERIODS, not seconds; the seconds are [`crate::pair_ledger::observed_window_days`].
+///
+/// The volumes the recorder integrates (`Alive` placements, `Active` holdings) are read
+/// *now*, after the interval. Charging a week of daemon downtime with the volume measured
+/// on return would write a series that is not the model's `G`: the simulator accrues
+/// `volume·dt` only on a tick where the pair was actually observed serving, and applies
+/// the decay always (`sim_dynamic/engine.rs:1861`). Comparability with the model is the
+/// only reason this layer exists ahead of the decisions, so the recorder splits the
+/// interval: the last `PAIR_LEDGER_OBSERVED_WINDOW_TICKS` tick periods carry the measured
+/// volume, and everything before them is integrated with `V_conf = 0` — pure decay.
+///
+/// Three periods, not one: the accrual shares a `select!` loop with awaited PoS and
+/// timeout work, so an on-schedule tick can slip by a period or two under load without
+/// the node having stopped observing anything. Beyond that the honest reading is that the
+/// daemon was not running, and an invented service record is worse than a decayed one.
+/// One period would be no margin at all — any lateness would make every ordinary tick
+/// partly dark.
+///
+/// # The unit is a tick period, and that unit moves with `time_scale`
+///
+/// Fixing the window in seconds is what the third gate found broken (BLOCK-1): the window
+/// is compared against an ALREADY-SCALED interval, while the tick period in that same
+/// scaled clock is `max(1, 3600/scale) · scale`, which stops being 3600 above
+/// `scale = 3600`. At `scale = 100_000` a fixed 10_800-second window would have marked
+/// EVERY on-schedule tick as 89 % unobserved and charged 10.8 % of the volume — an
+/// order-of-magnitude-wrong series on exactly the accelerated runs the layer exists to be
+/// checked on. So the window is defined in tick periods and its length in seconds is
+/// derived per scale.
+///
+/// Two prices of that choice, stated rather than discovered later:
+///
+/// * **In real time the window shrinks with the scale.** It is 3 h at `scale = 1`, 9 s at
+///   `scale = 1000`, and 3 s at any `scale ≥ 3600` (the one-second timer floor). The
+///   jitter it absorbs — a `select!` branch holding the loop — is a REAL-time quantity, so
+///   on a heavily accelerated run a few seconds of stall do read as an outage. Accepted:
+///   the alternative is a window in real seconds, which would then be a moving number of
+///   ticks and would divorce the charge from the cadence that produces it.
+/// * **On an accelerated run "observed" is largely formal.** At `scale = 100_000` the
+///   window is ≈3.5 simulated days, all of it vouched for by ONE reading of the volumes
+///   taken at its end. The split still keeps a real outage from being invented into
+///   service (one real day of downtime at that scale is 100_000 simulated days of decay
+///   against a 3.5-day charge), but a series recorded at 100_000 must not be read as
+///   "3.5 days of confirmed service".
+pub const PAIR_LEDGER_OBSERVED_WINDOW_TICKS: u64 = 3;
+
 // === Compile-time sanity checks ===
 
 const _: () = assert!(S_CLAMP_MIN < S_CLAMP_MAX);
+// Depth is the SLOW twin of the fast capital: τ_slow ≫ τ_fast (A.4). If these ever cross,
+// the "loyalty outlives the transaction" property inverts.
+const _: () = assert!(PAIR_LEDGER_LAMBDA > PAIR_LEDGER_LAMBDA_SLOW);
+const _: () = assert!(PAIR_LEDGER_MAX_LAMBDA_DT > 0.0 && PAIR_LEDGER_MAX_LAMBDA_DT < 1.0);
+// An observed window shorter than one tick period would mark every ordinary on-schedule
+// tick as partly unobserved and the recorder would never charge a full interval. Stated in
+// TICK PERIODS, which is the only form that holds at every `time_scale`: the earlier
+// seconds-vs-seconds version of this assert compared 10_800 with 3600 and passed happily
+// while the real window at `scale = 100_000` was 1/9 of one tick period (BLOCK-1, third
+// gate). Nothing here can express the scale-dependence — that is checked at run time by
+// `pair_ledger::tests::the_observed_window_is_three_tick_periods_at_every_time_scale`.
+const _: () = assert!(PAIR_LEDGER_OBSERVED_WINDOW_TICKS >= 1);
 const _: () = assert!(OVERHEAD_BASE > 1.0);
 const _: () = assert!(DECODE_OVERHEAD > 0);
 const _: () = assert!(SYMBOL_OFFER_TIMEOUT_SECS < SYMBOL_OFFER_EXPIRY_SECS);

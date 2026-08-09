@@ -1,5 +1,5 @@
 use crate::db::testutil::{test_db, test_peer, test_peers};
-use crate::db::{Db, WeeklyPosEntry};
+use crate::db::{Db, MasterStorageBytes, WeeklyPosEntry};
 use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
 use crate::types::{
     BudgetRecord, DeviceId, Event, EventEntry, FileId, FileRecord, FileVersion, HoldingRecord,
@@ -3241,9 +3241,9 @@ fn master_id(seed: u8) -> IdentityPub {
 
 fn make_ledger(g_from: f64, g_to: f64, last_update: u64) -> PairLedger {
     PairLedger {
-        g_owner_from_holder: g_from,
-        g_holder_from_owner: g_to,
-        depth: 77.5,
+        gb_days_they_store_for_us: g_from,
+        gb_days_we_store_for_them: g_to,
+        depth_of_their_service: 77.5,
         v_dem: 12.25,
         observed_volume: 4.0,
         observed_tau: 30.0,
@@ -3291,7 +3291,7 @@ fn pair_ledger_upsert_replaces_the_previous_row() {
         .unwrap();
 
     let stored = db.get_pair_ledger(&master).unwrap().unwrap();
-    assert_eq!(stored.g_owner_from_holder, 3.0);
+    assert_eq!(stored.gb_days_they_store_for_us, 3.0);
     assert_eq!(stored.last_update, Some(Timestamp(200)));
     assert_eq!(
         db.list_pair_ledgers().unwrap().len(),
@@ -3460,4 +3460,307 @@ fn table_stats_counts_pair_ledger_rows() {
         2,
         "the only check prescribed on returning to 4R is that accrual really happened"
     );
+}
+
+// ============================================================
+// Per-master storage volumes (У-2) — the recorder's two V_conf inputs
+// ============================================================
+
+/// `t × symbol_count` = exactly one gibibyte, so expectations stay exact.
+const GB_T: u16 = 32_768;
+const GB_SYMBOLS: u32 = 32_768;
+
+fn peer_of_master(device: DeviceId, master: IdentityPub) -> PeerRecord {
+    let mut peer = make_peer(device);
+    peer.master_identity = master;
+    peer
+}
+
+/// One Alive placement of `gb` gibibytes at `holder`, with its source block.
+fn alive_placement_of_gb(db: &Db, block_seed: u8, holder: DeviceId, gb: u32) {
+    let mut block = make_source_block(block_seed, SourceBlockStatus::Active);
+    block.t = GB_T;
+    db.upsert_source_block(&block).unwrap();
+    let mut placement = make_placement(
+        block_seed,
+        holder,
+        FileId(1),
+        PlacementStatus::Alive,
+        GB_SYMBOLS * gb,
+    );
+    placement.esi_ranges = vec![(0, GB_SYMBOLS * gb)];
+    db.upsert_placement(&placement).unwrap();
+}
+
+#[test]
+fn bytes_master_stores_for_us_sums_every_device_of_that_master() {
+    // The ledger row is per-MASTER while SYMBOL_PLACEMENTS is per-DEVICE (Р3): taking one
+    // device's number would under-count the axis by however many machines the person runs.
+    let db = test_db();
+    let master = master_id(0x11);
+    db.upsert_peer(&peer_of_master(DeviceId([0x12; 32]), master))
+        .unwrap();
+    db.upsert_peer(&peer_of_master(DeviceId([0x13; 32]), master))
+        .unwrap();
+    alive_placement_of_gb(&db, 0x14, DeviceId([0x12; 32]), 3);
+    alive_placement_of_gb(&db, 0x15, DeviceId([0x13; 32]), 5);
+
+    let bytes = db.bytes_master_stores_for_us(&master).unwrap();
+
+    assert_eq!(bytes, 8 * (crate::constants::BYTES_PER_GB as u64));
+}
+
+#[test]
+fn bytes_master_stores_for_us_counts_only_alive_placements() {
+    let db = test_db();
+    let master = master_id(0x21);
+    let device = DeviceId([0x22; 32]);
+    db.upsert_peer(&peer_of_master(device, master)).unwrap();
+    alive_placement_of_gb(&db, 0x23, device, 2);
+    // A second block, same holder, presumed lost: it is not confirmed service.
+    let mut block = make_source_block(0x24, SourceBlockStatus::Active);
+    block.t = GB_T;
+    db.upsert_source_block(&block).unwrap();
+    let mut lost = make_placement(
+        0x24,
+        device,
+        FileId(2),
+        PlacementStatus::PresumedLost,
+        GB_SYMBOLS,
+    );
+    lost.esi_ranges = vec![(0, GB_SYMBOLS * 9)];
+    db.upsert_placement(&lost).unwrap();
+
+    let bytes = db.bytes_master_stores_for_us(&master).unwrap();
+
+    assert_eq!(bytes, 2 * (crate::constants::BYTES_PER_GB as u64));
+}
+
+#[test]
+fn bytes_master_stores_for_us_ignores_devices_of_other_masters() {
+    let db = test_db();
+    let mine = master_id(0x31);
+    let other = master_id(0x32);
+    db.upsert_peer(&peer_of_master(DeviceId([0x33; 32]), mine))
+        .unwrap();
+    db.upsert_peer(&peer_of_master(DeviceId([0x34; 32]), other))
+        .unwrap();
+    alive_placement_of_gb(&db, 0x35, DeviceId([0x33; 32]), 1);
+    alive_placement_of_gb(&db, 0x36, DeviceId([0x34; 32]), 7);
+
+    assert_eq!(
+        db.bytes_master_stores_for_us(&mine).unwrap(),
+        crate::constants::BYTES_PER_GB as u64
+    );
+    assert_eq!(
+        db.bytes_master_stores_for_us(&other).unwrap(),
+        7 * (crate::constants::BYTES_PER_GB as u64)
+    );
+}
+
+#[test]
+fn bytes_master_stores_for_us_is_zero_when_no_peer_row_names_that_master() {
+    let db = test_db();
+    assert_eq!(db.bytes_master_stores_for_us(&master_id(0x41)).unwrap(), 0);
+}
+
+#[test]
+fn bytes_master_stores_for_us_resolves_devices_without_the_device_to_master_table() {
+    // Р3 п.4: `device_to_master` is NOT part of the SystemState snapshot, so after disaster
+    // recovery it is empty until every peer re-authenticates. Resolving through it would
+    // make the axis read zero for weeks — in exactly the scenario the ledger rides through
+    // DR for. PeerRecord.master_identity IS in the snapshot, so it is the source used here.
+    let db = test_db();
+    let master = master_id(0x51);
+    let device = DeviceId([0x52; 32]);
+    db.upsert_peer(&peer_of_master(device, master)).unwrap();
+    alive_placement_of_gb(&db, 0x53, device, 4);
+
+    assert!(
+        db.get_devices_for_master(&master).unwrap().is_empty(),
+        "premise: the device_to_master mapping is empty, as it is right after DR"
+    );
+    assert_eq!(
+        db.bytes_master_stores_for_us(&master).unwrap(),
+        4 * (crate::constants::BYTES_PER_GB as u64),
+        "the axis must still be charged after DR"
+    );
+}
+
+#[test]
+fn bytes_we_store_for_master_counts_only_active_holdings() {
+    let db = test_db();
+    let master = master_id(0x61);
+    db.upsert_holding(&make_holding(0x62, master, HoldingStatus::Active, 700))
+        .unwrap();
+    db.upsert_holding(&make_holding(
+        0x63,
+        master,
+        HoldingStatus::MarkedForDelete,
+        900,
+    ))
+    .unwrap();
+    db.upsert_holding(&make_holding(
+        0x64,
+        master_id(0x65),
+        HoldingStatus::Active,
+        1_000,
+    ))
+    .unwrap();
+
+    assert_eq!(db.bytes_we_store_for_master(&master).unwrap(), 700);
+}
+
+#[test]
+fn bytes_we_store_for_master_matches_the_peer_record_snapshot() {
+    // W-3: the recorder's holder-side V_conf must be the SAME number the daemon already
+    // maintains for that pair, or the two views of one relationship silently diverge.
+    let db = test_db();
+    let master = master_id(0x71);
+    let device = DeviceId([0x72; 32]);
+    db.upsert_peer(&peer_of_master(device, master)).unwrap();
+    db.set_master_for_device(&device, &master).unwrap();
+    db.upsert_holding(&make_holding(0x73, master, HoldingStatus::Active, 4_096))
+        .unwrap();
+    db.upsert_holding(&make_holding(0x74, master, HoldingStatus::Active, 2_048))
+        .unwrap();
+
+    db.refresh_peer_storage_bytes(&device).unwrap();
+
+    let snapshot = db.get_peer(&device).unwrap().unwrap();
+    assert_eq!(
+        db.bytes_we_store_for_master(&master).unwrap(),
+        snapshot.bytes_we_store_for_peer
+    );
+    assert_eq!(snapshot.bytes_we_store_for_peer, 6_144);
+}
+
+#[test]
+fn bytes_master_stores_for_us_is_zero_for_the_zero_placeholder_identity() {
+    // WARN-2: `IdentityPub([0; 32])` is the "master unknown" marker (deprecated
+    // `TrustEngine::upsert_peer`, pre-certificate peer rows, the zombies `dr` repairs under
+    // CS-DR-12) — not a person. Summing over the devices that carry it would report one
+    // stranger's storage as another's.
+    let db = test_db();
+    let unknown = IdentityPub([0u8; 32]);
+    db.upsert_peer(&peer_of_master(DeviceId([0x81; 32]), unknown))
+        .unwrap();
+    db.upsert_peer(&peer_of_master(DeviceId([0x82; 32]), unknown))
+        .unwrap();
+    alive_placement_of_gb(&db, 0x83, DeviceId([0x81; 32]), 3);
+    alive_placement_of_gb(&db, 0x84, DeviceId([0x82; 32]), 5);
+
+    assert_eq!(db.bytes_master_stores_for_us(&unknown).unwrap(), 0);
+}
+
+#[test]
+fn storage_bytes_by_master_reports_both_volumes_for_every_peer_master() {
+    let db = test_db();
+    let a = master_id(0x91);
+    let b = master_id(0x92);
+    db.upsert_peer(&peer_of_master(DeviceId([0x93; 32]), a))
+        .unwrap();
+    db.upsert_peer(&peer_of_master(DeviceId([0x94; 32]), a))
+        .unwrap();
+    db.upsert_peer(&peer_of_master(DeviceId([0x95; 32]), b))
+        .unwrap();
+    alive_placement_of_gb(&db, 0x96, DeviceId([0x93; 32]), 3);
+    alive_placement_of_gb(&db, 0x97, DeviceId([0x94; 32]), 5);
+    alive_placement_of_gb(&db, 0x98, DeviceId([0x95; 32]), 1);
+    db.upsert_holding(&make_holding(0x99, a, HoldingStatus::Active, 700))
+        .unwrap();
+    db.upsert_holding(&make_holding(0x9A, b, HoldingStatus::MarkedForDelete, 900))
+        .unwrap();
+
+    let rows = db.storage_bytes_by_master().unwrap();
+
+    let gb = crate::constants::BYTES_PER_GB as u64;
+    assert_eq!(
+        rows,
+        vec![
+            MasterStorageBytes {
+                master: a,
+                they_store_for_us: 8 * gb,
+                we_store_for_them: 700,
+            },
+            MasterStorageBytes {
+                master: b,
+                they_store_for_us: gb,
+                we_store_for_them: 0,
+            },
+        ],
+        "one row per person, both axes, ascending by identity — no dependence on insert order"
+    );
+}
+
+#[test]
+fn storage_bytes_by_master_skips_the_zero_placeholder_identity() {
+    let db = test_db();
+    let real = master_id(0xA1);
+    db.upsert_peer(&peer_of_master(DeviceId([0xA2; 32]), real))
+        .unwrap();
+    db.upsert_peer(&peer_of_master(
+        DeviceId([0xA3; 32]),
+        IdentityPub([0u8; 32]),
+    ))
+    .unwrap();
+    alive_placement_of_gb(&db, 0xA4, DeviceId([0xA3; 32]), 6);
+
+    let rows = db.storage_bytes_by_master().unwrap();
+
+    assert_eq!(rows.len(), 1, "the placeholder is not an economic pair");
+    assert_eq!(rows[0].master, real);
+}
+
+#[test]
+fn storage_bytes_by_master_gives_no_row_to_a_master_known_only_from_holdings() {
+    // The row set is the PEER masters, exactly as a per-master loop over the peer list
+    // would have produced. A stranger whose holding we still keep is not a pair we accrue.
+    let db = test_db();
+    let peer_master = master_id(0xB1);
+    let stranger = master_id(0xB2);
+    db.upsert_peer(&peer_of_master(DeviceId([0xB3; 32]), peer_master))
+        .unwrap();
+    db.upsert_holding(&make_holding(0xB4, stranger, HoldingStatus::Active, 4_096))
+        .unwrap();
+
+    let rows = db.storage_bytes_by_master().unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].master, peer_master);
+    assert_eq!(rows[0].we_store_for_them, 0);
+}
+
+#[test]
+fn storage_bytes_by_master_counts_only_alive_placements_and_active_holdings() {
+    let db = test_db();
+    let master = master_id(0xC1);
+    let device = DeviceId([0xC2; 32]);
+    db.upsert_peer(&peer_of_master(device, master)).unwrap();
+    alive_placement_of_gb(&db, 0xC3, device, 2);
+    let mut block = make_source_block(0xC4, SourceBlockStatus::Active);
+    block.t = GB_T;
+    db.upsert_source_block(&block).unwrap();
+    let mut lost = make_placement(0xC4, device, FileId(2), PlacementStatus::Lost, GB_SYMBOLS);
+    lost.esi_ranges = vec![(0, GB_SYMBOLS * 9)];
+    db.upsert_placement(&lost).unwrap();
+    db.upsert_holding(&make_holding(0xC5, master, HoldingStatus::Active, 500))
+        .unwrap();
+    db.upsert_holding(&make_holding(0xC6, master, HoldingStatus::Silent, 900))
+        .unwrap();
+
+    let rows = db.storage_bytes_by_master().unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].they_store_for_us,
+        2 * (crate::constants::BYTES_PER_GB as u64)
+    );
+    assert_eq!(rows[0].we_store_for_them, 500);
+}
+
+#[test]
+fn storage_bytes_by_master_is_empty_when_no_peer_is_known() {
+    let db = test_db();
+    assert!(db.storage_bytes_by_master().unwrap().is_empty());
 }

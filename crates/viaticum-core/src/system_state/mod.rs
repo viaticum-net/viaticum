@@ -98,6 +98,13 @@ pub struct SystemState {
     /// every push is today's baseline. The one reason that survives is key shape — the
     /// ledger is per-master, `PeerRecord` is per-device. See [`crate::types::PairLedger`].
     ///
+    /// **What it costs to carry, in bytes (measured, not estimated).** One row encodes to
+    /// **223 B** of CBOR (the nine field NAMES are 146 B of that — CBOR maps carry their
+    /// keys) plus a 32-byte redb key; wrapped in a [`PairLedgerEntry`] with the master
+    /// identity it is **≈304 B**, so a 300-peer circle adds **≈90 KB** to every base blob.
+    /// Sub-1% of a base that already carries `files`, `symbol_placements` and `peers`, and
+    /// flat in time — the row count is bounded by the number of people, not by history.
+    ///
     /// **The cost of base-only, in numbers.** A restored ledger is as of the last *base*
     /// publication. The base is rebuilt on every daemon restart and after
     /// `DIFF_COMPACTION_THRESHOLD = 20` NON-EMPTY diffs, published at most every 6 hours.

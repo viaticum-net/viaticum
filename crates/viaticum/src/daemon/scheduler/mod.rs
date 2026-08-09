@@ -24,6 +24,9 @@ use viaticum_core::db::Db;
 use viaticum_core::deletion::{DeletionAction, DeletionEngine};
 use viaticum_core::mailbox::{DeleteRequestPayload, MailboxClass, MailboxEntry};
 use viaticum_core::messages::{PosHashResponseMsg, to_cbor};
+use viaticum_core::pair_ledger::{
+    AccrualStats, PairLedgerError, PairLedgerRecorder, tick_interval_secs,
+};
 use viaticum_core::pos::{VerifyOutcome, apply_pos_outcome, due_challenges, outcome_from_verify};
 use viaticum_core::trust::{compute_combined, compute_effective_trust, recalculate_trust};
 use viaticum_core::types::{
@@ -140,11 +143,14 @@ impl Scheduler {
         }
     }
 
-    /// Main run loop. Fires on two independent timers:
+    /// Main run loop. Fires on five independent timers:
     ///   - pos_timer: call issue_due_challenges()
     ///   - timeout_timer: call check_timeouts()
+    ///   - deletion_timer: call process_deletion_tick()
+    ///   - ledger_timer: call accrue_pair_ledgers() (4R recorder, decides nothing)
+    ///   - sweep_timer: prune expired accepted offers
     ///
-    /// Both intervals are divided by time_scale before use.
+    /// Every one of the five intervals is divided by time_scale before use (floor 1 s).
     /// Exits cleanly when cancel fires.
     ///
     /// `pos_response_rx`: receives polled PosHashResponseMsg from run_mailbox_poll.
@@ -161,16 +167,27 @@ impl Scheduler {
         let deletion_interval = Duration::from_secs((3600 / scale).max(1));
         // accepted_offers sweep: 60 seconds / time_scale, min 1.
         let sweep_interval = Duration::from_secs((60 / scale).max(1));
+        // 4R pair-ledger accrual: hourly, scaled. Its own timer rather than a passenger on
+        // pos_timer — the accrual must not be skipped because challenge issuance failed,
+        // and the two have nothing to do with each other.
+        //
+        // The period comes from `pair_ledger::tick_interval_secs` and not from a local
+        // `(PAIR_LEDGER_TICK_SECS / scale).max(1)`, even though the expression is identical:
+        // the recorder sizes its observed window in periods of THIS timer, and the local
+        // copy of the formula is what let the two drift apart (BLOCK-1, third gate).
+        let ledger_interval = Duration::from_secs(tick_interval_secs(scale));
 
         let mut pos_timer = tokio::time::interval(pos_interval);
         let mut timeout_timer = tokio::time::interval(timeout_interval);
         let mut deletion_timer = tokio::time::interval(deletion_interval);
         let mut sweep_timer = tokio::time::interval(sweep_interval);
+        let mut ledger_timer = tokio::time::interval(ledger_interval);
         // Skip the first immediate tick so we don't fire right at startup.
         pos_timer.tick().await;
         timeout_timer.tick().await;
         deletion_timer.tick().await;
         sweep_timer.tick().await;
+        ledger_timer.tick().await;
 
         info!(
             pos_interval_secs = self.config.pos_interval_secs / scale,
@@ -197,6 +214,33 @@ impl Scheduler {
                 _ = deletion_timer.tick() => {
                     if let Err(e) = self.process_deletion_tick().await {
                         error!("scheduler: process_deletion_tick error: {e}");
+                    }
+                }
+                _ = ledger_timer.tick() => {
+                    match self.accrue_pair_ledgers(Timestamp::now()) {
+                        Ok(stats) => {
+                            debug!(
+                                accrued = stats.accrued,
+                                seeded = stats.seeded,
+                                idle = stats.idle,
+                                with_unobserved_gap = stats.with_unobserved_gap,
+                                truncated = stats.truncated,
+                                "scheduler: pair-ledger accrual tick"
+                            );
+                            if stats.truncated > 0 {
+                                // Only a corrupt `last_update` reaches the sub-step ceiling
+                                // (8000 years in one call). Say so instead of swallowing it,
+                                // with the SIZE of the shortfall: "one year off" and "2^40
+                                // seconds off" are different diagnoses.
+                                warn!(
+                                    rows = stats.truncated,
+                                    uncovered_days = stats.uncovered_days,
+                                    "scheduler: pair-ledger interval hit the sub-step ceiling — \
+                                     check the clock"
+                                );
+                            }
+                        }
+                        Err(e) => error!("scheduler: accrue_pair_ledgers error: {e}"),
                     }
                 }
                 _ = sweep_timer.tick() => {
@@ -1292,6 +1336,31 @@ impl Scheduler {
             let _ = self.repair_tx.send(RepairTrigger::Wake).await;
         }
         Ok(())
+    }
+
+    /// One 4R pair-ledger accrual tick (У-2, spec `beta-planning/tasks/pair_ledger.md`).
+    ///
+    /// Pure bookkeeping: it advances the per-master `G`/`D` leaky integrals from the storage
+    /// counters this node already keeps, and writes them back. **Nothing reads the result** —
+    /// no placement, eviction, offer-admission or PoS-cadence decision changes because of it
+    /// (AC-7). The layer ships ahead of the 4R decisions only because an integral over months
+    /// cannot be back-computed once the network is live.
+    ///
+    /// Why here and not inside `Db::refresh_peer_storage_bytes` (spec Д1): the accrual needs
+    /// `time_scale` and a wall clock, while that function has eight non-test call sites across
+    /// five modules (`holdings_integrity`, `backup`, `processor::symbol` ×2, this one, and
+    /// `holder_cleanup` ×3), several of them free functions holding only a `Db`. It is also a
+    /// different kind of thing — that one recomputes a SNAPSHOT, this one integrates the
+    /// interval between snapshots.
+    ///
+    /// Synchronous (no await points) and O(one pass per table), because it runs inside the
+    /// `select!` loop; `now` is a parameter so tests can drive the clock.
+    pub fn accrue_pair_ledgers(&self, now: Timestamp) -> Result<AccrualStats, PairLedgerError> {
+        PairLedgerRecorder::new(self.db.clone()).tick(
+            &self.my_master_pub,
+            now,
+            self.config.time_scale,
+        )
     }
 }
 

@@ -2,7 +2,7 @@
 // Two-tier architecture: WARM (redb) + HOT (RAM aggregates).
 // See docs/beta/tasks/db.md for full spec.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -40,7 +40,8 @@ const SYMBOL_PLACEMENTS: TableDefinition<&[u8; 64], &[u8]> =
 /// Peer records. Key = DeviceId [u8;32]. Value = CBOR(PeerRecord).
 const PEERS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("peers");
 
-/// Held symbols (holder view). Key = (SourceBlockId[32] || owner IdentityPub[32]) = [u8;64].
+/// Held symbols (holder view). Key = (owner IdentityPub[32] || SourceBlockId[32]) = [u8;64]
+/// — owner FIRST, so one owner's holdings form a contiguous range (S-4; see `holding_key`).
 /// Value = CBOR(HoldingRecord).
 const HOLDINGS: TableDefinition<&[u8; 64], &[u8]> = TableDefinition::new("holdings");
 
@@ -131,7 +132,10 @@ const MAILBOX_BYTES_BY_TARGET: TableDefinition<&[u8; 32], &[u8]> =
 ///
 /// This does NOT make "no decision reads the ledger" structural — `Db` is reachable from
 /// every module and `get_pair_ledger` is an ordinary `pub` method. The actual guarantee
-/// today is only that there is no call site that reads it.
+/// today is only WHICH call sites read it: the recorder that writes it
+/// ([`crate::pair_ledger`], which reads the previous row to continue the integral) and the
+/// SystemState snapshot/restore pair that carries it through disaster recovery. No
+/// placement, eviction, offer-admission or PoS-cadence path touches it.
 ///
 /// `create_tables` opens it on every `Db::open`, so a database written before this table
 /// existed simply gains it empty (no migration step).
@@ -1368,6 +1372,43 @@ impl Db {
 // Peers table
 // ============================================================
 
+/// Both storage volumes of one economic pair, as of right now — the output row of
+/// [`Db::storage_bytes_by_master`]. Raw BYTES; the gb conversion belongs to the writer of
+/// the ledger (see [`crate::types::PairLedger`] on units).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MasterStorageBytes {
+    /// The economic pair: a person, never a device.
+    pub master: IdentityPub,
+    /// Bytes this master's devices keep for US (`Alive` placements × symbol size).
+    pub they_store_for_us: u64,
+    /// Bytes WE keep for this master (`Active` holdings).
+    pub we_store_for_them: u64,
+}
+
+/// Symbol size `t` of a source block, memoised across a scan.
+///
+/// A missing `SourceBlockRecord` contributes 0 — same convention as
+/// [`Db::refresh_peer_storage_bytes`], and it is memoised too so a scan does not re-probe
+/// the table for every placement of a block that is gone.
+fn block_symbol_size(
+    blocks: &redb::ReadOnlyTable<&'static [u8; 32], &'static [u8]>,
+    block_id: &[u8; 32],
+    memo: &mut HashMap<[u8; 32], u64>,
+) -> Result<u64, DbError> {
+    if let Some(t) = memo.get(block_id) {
+        return Ok(*t);
+    }
+    let t = match blocks.get(block_id)? {
+        Some(val) => {
+            let block: SourceBlockRecord = from_cbor_bytes(val.value())?;
+            block.t as u64
+        }
+        None => 0,
+    };
+    memo.insert(*block_id, t);
+    Ok(t)
+}
+
 impl Db {
     pub fn upsert_peer(&self, record: &PeerRecord) -> Result<(), DbError> {
         let bytes = to_cbor_bytes(record);
@@ -1560,6 +1601,201 @@ impl Db {
             out.push((IdentityPub(*k.value()), from_cbor_bytes(v.value())?));
         }
         Ok(out)
+    }
+
+    /// Bytes WE currently store for `master` — the recorder's `V_conf` for the
+    /// "our service to this person" axis (`PairLedger::gb_days_we_store_for_them`).
+    ///
+    /// Identical definition to the `bytes_we_store_for_peer` half of
+    /// [`Db::refresh_peer_storage_bytes`]: `total_bytes` summed over `Active` holdings whose
+    /// `owner_id == master`. Already per-master with nothing to fold — HOLDINGS are keyed by
+    /// the owner's MASTER identity, not by device (S-4 key layout).
+    ///
+    /// A SNAPSHOT (bytes held right now), not a gb·day sum: the recorder multiplies it by
+    /// the elapsed interval itself. Compare [`Db::stored_for_peer_gb_days`], which is the
+    /// gb·day form but re-derives the age of every holding and therefore forgets a dropped
+    /// one retroactively.
+    pub fn bytes_we_store_for_master(&self, master: &IdentityPub) -> Result<u64, DbError> {
+        let mut total = 0u64;
+        for holding in self.list_holdings_for_owner(master)? {
+            if holding.status != HoldingStatus::Active {
+                continue;
+            }
+            total = total.saturating_add(holding.total_bytes);
+        }
+        Ok(total)
+    }
+
+    /// Bytes ALL devices of `master` currently store for US — the recorder's `V_conf` for
+    /// the "this person's service to us" axis (`PairLedger::gb_days_they_store_for_us`) and
+    /// for the loyalty depth `D`.
+    ///
+    /// A POINT query. The periodic sweep must NOT call it once per master — that is
+    /// quadratic (see [`Db::storage_bytes_by_master`], which answers the same question for
+    /// everyone in one pass).
+    ///
+    /// Same per-placement formula as the `bytes_peer_stores_for_us` half of
+    /// [`Db::refresh_peer_storage_bytes`] (`symbol_count × t` over `Alive` placements), but
+    /// summed across the master's devices instead of one device: SYMBOL_PLACEMENTS is keyed
+    /// by holder DEVICE while the ledger is keyed by MASTER, so charging the master row with
+    /// a single device's number would under-count the axis by however many machines that
+    /// person runs.
+    ///
+    /// The device set is resolved from PEERS (`PeerRecord::master_identity`), deliberately
+    /// NOT from `device_to_master` / [`Db::get_devices_for_master`]. That table is not part
+    /// of the SystemState snapshot, so after disaster recovery it is empty until each peer
+    /// re-authenticates — the axis would silently read zero for as long as that takes, in
+    /// exactly the scenario the ledger is carried through DR for.
+    ///
+    /// The placeholder identity `IdentityPub([0; 32])` answers 0: it is not a person but
+    /// the "master unknown" marker left by pre-certificate peer rows, so summing over the
+    /// devices carrying it would report one stranger's storage as another's.
+    ///
+    /// A block whose `SourceBlockRecord` is gone contributes 0, matching
+    /// `refresh_peer_storage_bytes`.
+    pub fn bytes_master_stores_for_us(&self, master: &IdentityPub) -> Result<u64, DbError> {
+        if master.0 == [0u8; 32] {
+            return Ok(0);
+        }
+        let tx = self.inner.begin_read()?;
+
+        // Devices of this master, from PEERS (see doc comment: NOT device_to_master).
+        let mut devices: HashSet<[u8; 32]> = HashSet::new();
+        {
+            let peers = tx.open_table(PEERS)?;
+            for item in peers.iter()? {
+                let (_, v) = item?;
+                let record: PeerRecord = from_cbor_bytes(v.value())?;
+                if record.master_identity == *master {
+                    devices.insert(record.device_id.0);
+                }
+            }
+        }
+        if devices.is_empty() {
+            return Ok(0);
+        }
+
+        let placements = tx.open_table(SYMBOL_PLACEMENTS)?;
+        let blocks = tx.open_table(SOURCE_BLOCKS)?;
+        // One `t` lookup per distinct block instead of per placement: a master with several
+        // devices holding symbols of the same block is the normal case.
+        let mut symbol_size: HashMap<[u8; 32], u64> = HashMap::new();
+        let mut total = 0u64;
+        for item in placements.iter()? {
+            let (k, v) = item?;
+            // Key = [block_id(32) || holder(32)].
+            let mut holder = [0u8; 32];
+            holder.copy_from_slice(&k.value()[32..64]);
+            if !devices.contains(&holder) {
+                continue;
+            }
+            let placement: SymbolPlacement = from_cbor_bytes(v.value())?;
+            if placement.status != PlacementStatus::Alive {
+                continue;
+            }
+            let t = block_symbol_size(&blocks, &placement.source_block_id.0, &mut symbol_size)?;
+            total = total.saturating_add(placement.symbol_count() as u64 * t);
+        }
+        Ok(total)
+    }
+
+    /// Both storage volumes for EVERY peer master, in one pass over each table.
+    ///
+    /// This is the sweep form of [`Db::bytes_master_stores_for_us`] +
+    /// [`Db::bytes_we_store_for_master`], and it exists because the per-master form is
+    /// quadratic when called in a loop: each call re-scans PEERS (CBOR-decoding every
+    /// record) and re-walks every SYMBOL_PLACEMENTS key, so a node with M peer masters and
+    /// S placements did `M` peer decodes per master and `M·S` key visits — synchronously,
+    /// inside the scheduler's `select!`. At 300 masters that is ~90k decodes and ~90M key
+    /// visits per tick, and the tick period shrinks with `time_scale`: 3 s at 1000 (integer
+    /// `3600/1000`, not 3.6), 1 s at anything above 3600.
+    ///
+    /// Here PEERS is walked once into `device → master`, SYMBOL_PLACEMENTS once into a
+    /// `master → bytes` accumulator sharing ONE `block → t` memo, and HOLDINGS once into
+    /// the other accumulator.
+    ///
+    /// The row set is the peer masters: every distinct non-zero `PeerRecord::master_identity`
+    /// (zero = the "master unknown" placeholder, not a person — see
+    /// [`Db::bytes_master_stores_for_us`]). Masters known only from HOLDINGS get no row,
+    /// matching what a per-master loop over the peer list would have produced. Ordering is
+    /// by master identity bytes, so a sweep over the result cannot depend on insertion
+    /// history.
+    pub fn storage_bytes_by_master(&self) -> Result<Vec<MasterStorageBytes>, DbError> {
+        let tx = self.inner.begin_read()?;
+
+        // Pass 1: PEERS → device → master (and the master set itself).
+        let mut master_of_device: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+        let mut totals: BTreeMap<[u8; 32], MasterStorageBytes> = BTreeMap::new();
+        {
+            let peers = tx.open_table(PEERS)?;
+            for item in peers.iter()? {
+                let (_, v) = item?;
+                let record: PeerRecord = from_cbor_bytes(v.value())?;
+                let master = record.master_identity;
+                if master.0 == [0u8; 32] {
+                    continue;
+                }
+                master_of_device.insert(record.device_id.0, master.0);
+                totals.entry(master.0).or_insert(MasterStorageBytes {
+                    master,
+                    they_store_for_us: 0,
+                    we_store_for_them: 0,
+                });
+            }
+        }
+        if totals.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Pass 2: SYMBOL_PLACEMENTS → what each master's devices keep for us.
+        {
+            let placements = tx.open_table(SYMBOL_PLACEMENTS)?;
+            let blocks = tx.open_table(SOURCE_BLOCKS)?;
+            let mut symbol_size: HashMap<[u8; 32], u64> = HashMap::new();
+            for item in placements.iter()? {
+                let (k, v) = item?;
+                // Key = [block_id(32) || holder(32)].
+                let mut holder = [0u8; 32];
+                holder.copy_from_slice(&k.value()[32..64]);
+                let master = match master_of_device.get(&holder) {
+                    Some(m) => *m,
+                    None => continue,
+                };
+                let placement: SymbolPlacement = from_cbor_bytes(v.value())?;
+                if placement.status != PlacementStatus::Alive {
+                    continue;
+                }
+                let t = block_symbol_size(&blocks, &placement.source_block_id.0, &mut symbol_size)?;
+                if let Some(entry) = totals.get_mut(&master) {
+                    entry.they_store_for_us = entry
+                        .they_store_for_us
+                        .saturating_add(placement.symbol_count() as u64 * t);
+                }
+            }
+        }
+
+        // Pass 3: HOLDINGS → what we keep for each master (already keyed by owner-master).
+        {
+            let holdings = tx.open_table(HOLDINGS)?;
+            for item in holdings.iter()? {
+                let (k, v) = item?;
+                // Key = [owner(32) || block_id(32)] (S-4).
+                let mut owner = [0u8; 32];
+                owner.copy_from_slice(&k.value()[..32]);
+                let entry = match totals.get_mut(&owner) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                let holding: HoldingRecord = from_cbor_bytes(v.value())?;
+                if holding.status != HoldingStatus::Active {
+                    continue;
+                }
+                entry.we_store_for_them =
+                    entry.we_store_for_them.saturating_add(holding.total_bytes);
+            }
+        }
+
+        Ok(totals.into_values().collect())
     }
 
     /// Batch decay: for each PeerRecord where (now - last_avail_sample) >= tick_secs,
