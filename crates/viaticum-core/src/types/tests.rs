@@ -710,3 +710,180 @@ fn ranges_to_esi_list_saturates_instead_of_wrapping_on_overflow() {
     // rather than panicking or wrapping — still safe.
     assert_eq!(ranges_to_esi_list(&[(u32::MAX, 5u32)]), Vec::<u32>::new());
 }
+
+// ============================================================
+// PairLedger::elapsed_days — the seconds→days bridge to the four_r kernel
+// ============================================================
+
+fn ledger_with_clock_at(secs: u64) -> PairLedger {
+    PairLedger {
+        last_update: Some(Timestamp(secs)),
+        ..PairLedger::default()
+    }
+}
+
+#[test]
+fn elapsed_days_is_none_when_the_clock_never_started() {
+    // A fresh ledger has no interval to integrate over. Returning Some(huge) here would
+    // hand the kernel "seconds since the unix epoch, in days" on the very first tick.
+    let ledger = PairLedger::default();
+    assert_eq!(ledger.elapsed_days(Timestamp(1_700_000_000), 1), None);
+}
+
+#[test]
+fn elapsed_days_converts_seconds_to_days_for_the_kernel() {
+    // four_r integrators take dt in DAYS (λ ≈ 1/60 day⁻¹). Storing seconds and forgetting
+    // to divide is an 86400× error that still looks like a working integrator.
+    let ledger = ledger_with_clock_at(1_000_000);
+
+    assert_eq!(
+        ledger.elapsed_days(Timestamp(1_000_000 + 86_400), 1),
+        Some(1.0)
+    );
+    assert_eq!(
+        ledger.elapsed_days(Timestamp(1_000_000 + 43_200), 1),
+        Some(0.5)
+    );
+    assert_eq!(ledger.elapsed_days(Timestamp(1_000_000), 1), Some(0.0));
+}
+
+#[test]
+fn elapsed_days_multiplies_the_interval_by_time_scale() {
+    // The clocks this ledger must agree with run on the simulated calendar:
+    // db::stored_for_peer_gb_days scales age the same way, and the scheduler divides its
+    // intervals by the same factor. (Not every clock does — run_avail_decay_task ticks on
+    // the raw constant — so "agrees with the gb·day sums" is the claim, not "agrees with
+    // everything".) A ledger that ignored time_scale would accrue 1/time_scale of the
+    // history on exactly the accelerated runs where "did the accounting accumulate?" gets
+    // verified.
+    let ledger = ledger_with_clock_at(1_000_000);
+    let one_hour_later = Timestamp(1_000_000 + 3_600);
+
+    assert_eq!(ledger.elapsed_days(one_hour_later, 1), Some(1.0 / 24.0));
+    assert_eq!(
+        ledger.elapsed_days(one_hour_later, 1_000),
+        Some(1_000.0 / 24.0),
+        "at time_scale 1000 an hourly tick covers ~41.7 simulated days"
+    );
+}
+
+#[test]
+fn elapsed_days_treats_zero_time_scale_as_one() {
+    // Same guard as mailbox::scaled_ttl_secs and db::stored_for_peer_gb_days: a
+    // misconfigured 0 must not silently freeze the ledger's clock.
+    let ledger = ledger_with_clock_at(1_000_000);
+    assert_eq!(
+        ledger.elapsed_days(Timestamp(1_000_000 + 86_400), 0),
+        Some(1.0)
+    );
+}
+
+#[test]
+fn elapsed_days_is_zero_when_the_wall_clock_jumped_backwards() {
+    // A negative Δt would drive the leaky integrator BACKWARDS (g += dt·(v − λg) with
+    // dt < 0 discharges it). Clamping to zero leaves the accumulator untouched instead.
+    let ledger = ledger_with_clock_at(1_000_000);
+    assert_eq!(ledger.elapsed_days(Timestamp(900_000), 1), Some(0.0));
+    assert_eq!(
+        ledger.elapsed_days(Timestamp(900_000), 1_000),
+        Some(0.0),
+        "scaling must not turn a backward jump into a large negative Δt"
+    );
+}
+
+#[test]
+fn elapsed_days_returns_an_unclamped_interval_for_a_long_outage() {
+    // Documented contract, pinned so it is not "fixed" by a silent clamp: the helper
+    // reports the FULL elapsed interval, including values where one explicit Euler step
+    // would misbehave (λΔt > 1 at λ = 1/60 means Δt > 60 days; > 2 diverges). Truncating
+    // here would quietly discard accrual — the one failure this layer exists to prevent.
+    // Sub-stepping is the integrator's job (У-2).
+    let ledger = ledger_with_clock_at(1_000_000);
+    let three_months_later = Timestamp(1_000_000 + 90 * 86_400);
+
+    let dt = ledger.elapsed_days(three_months_later, 1).unwrap();
+    assert_eq!(dt, 90.0);
+    assert!(
+        dt * (1.0 / 60.0) > 1.0,
+        "90 days at λ=1/60 is past the monotonicity bound — the caller must sub-step"
+    );
+}
+
+// ============================================================
+// PairLedger forward compatibility: how a NEW field may be added
+// ============================================================
+
+fn ledger_sample() -> PairLedger {
+    PairLedger {
+        g_owner_from_holder: 3.5,
+        g_holder_from_owner: 4.5,
+        depth: 60.0,
+        v_dem: 2.0,
+        observed_volume: 1.5,
+        observed_tau: 30.0,
+        drop_ann: 1.0,
+        drop_silent: 0.0,
+        last_update: Some(Timestamp(1_700_000_000)),
+    }
+}
+
+#[test]
+fn pair_ledger_with_a_new_defaulted_field_still_reads_rows_written_today() {
+    // The rule written on PairLedger ("every NEW field must carry #[serde(default)]") is
+    // only worth anything if it actually works with our CBOR encoder. Rows written today
+    // must keep decoding once У-2..У-5 extend the struct. `trend_d` is a real pending
+    // field (spec: "what we do not accrue yet"), used here as the stand-in.
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct PairLedgerPlusDefaulted {
+        g_owner_from_holder: f64,
+        g_holder_from_owner: f64,
+        depth: f64,
+        v_dem: f64,
+        observed_volume: f64,
+        observed_tau: f64,
+        drop_ann: f64,
+        drop_silent: f64,
+        last_update: Option<Timestamp>,
+        #[serde(default)]
+        trend_d: f64,
+    }
+
+    let stored = to_cbor_bytes(&ledger_sample());
+    let decoded: PairLedgerPlusDefaulted = from_cbor_bytes(&stored).unwrap();
+
+    assert_eq!(
+        decoded.trend_d, 0.0,
+        "the added field arrives as its default"
+    );
+    assert_eq!(decoded.depth, 60.0, "the pre-existing fields still arrive");
+}
+
+#[test]
+fn pair_ledger_with_a_new_required_field_cannot_read_rows_written_today() {
+    // The failure mode the rule guards against, pinned so nobody meets it in the field:
+    // a field without a default makes every existing row undecodable, which takes out
+    // list_pair_ledgers → snapshot_db → the whole SystemState push (error+skip in the
+    // daemon loop), and makes already-published base blobs unrestorable — i.e. no DR.
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct PairLedgerPlusRequired {
+        g_owner_from_holder: f64,
+        g_holder_from_owner: f64,
+        depth: f64,
+        v_dem: f64,
+        observed_volume: f64,
+        observed_tau: f64,
+        drop_ann: f64,
+        drop_silent: f64,
+        last_update: Option<Timestamp>,
+        trend_d: f64,
+    }
+
+    let stored = to_cbor_bytes(&ledger_sample());
+
+    assert!(
+        from_cbor_bytes::<PairLedgerPlusRequired>(&stored).is_err(),
+        "a new field without #[serde(default)] breaks every row written before it"
+    );
+}

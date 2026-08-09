@@ -2,7 +2,7 @@ use super::*;
 use crate::db::WeeklyPosEntry;
 use crate::db::testutil::test_db;
 use crate::types::{
-    DeviceId, FileId, FileRecord, IdentityPub, LocalState, PeerRecord, PlacementStatus,
+    DeviceId, FileId, FileRecord, IdentityPub, LocalState, PairLedger, PeerRecord, PlacementStatus,
     SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement,
     Timestamp,
 };
@@ -82,6 +82,20 @@ fn make_peer(seed: u8) -> PeerRecord {
     }
 }
 
+fn make_ledger(g_from: f64, g_to: f64) -> PairLedger {
+    PairLedger {
+        g_owner_from_holder: g_from,
+        g_holder_from_owner: g_to,
+        depth: 12.5,
+        v_dem: 3.25,
+        observed_volume: 2.0,
+        observed_tau: 45.0,
+        drop_ann: 1.0,
+        drop_silent: 0.0,
+        last_update: Some(Timestamp(1_700_000_000)),
+    }
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -98,6 +112,7 @@ fn empty_db_roundtrip() {
     assert_eq!(state.source_blocks.len(), 0);
     assert_eq!(state.symbol_placements.len(), 0);
     assert_eq!(state.pos_weekly.len(), 0);
+    assert_eq!(state.pair_ledgers.len(), 0);
     assert!(state.cluster_state.is_none());
 
     let blob = pack_system_state(&state, &key).unwrap();
@@ -427,6 +442,10 @@ fn base_state() -> SystemState {
             value: vec![1, 2, 3],
         }],
         cluster_state: None,
+        pair_ledgers: vec![PairLedgerEntry {
+            master: IdentityPub([10u8; 32]),
+            ledger: make_ledger(1.0, 2.0),
+        }],
     }
 }
 
@@ -490,6 +509,18 @@ fn assert_states_eq(a: &SystemState, b: &SystemState) {
         to_cbor(&b.cluster_state),
         "cluster_state differ"
     );
+
+    let la: BTreeMap<[u8; 32], Vec<u8>> = a
+        .pair_ledgers
+        .iter()
+        .map(|e| (e.master.0, to_cbor(&e.ledger)))
+        .collect();
+    let lb: BTreeMap<[u8; 32], Vec<u8>> = b
+        .pair_ledgers
+        .iter()
+        .map(|e| (e.master.0, to_cbor(&e.ledger)))
+        .collect();
+    assert_eq!(la, lb, "pair_ledgers differ");
 }
 
 fn to_cbor<T: serde::Serialize>(v: &T) -> Vec<u8> {
@@ -533,6 +564,113 @@ fn apply_empty_diff_list_is_identity() {
     let base = base_state();
     let result = apply_diffs(base.clone(), &[]);
     assert_states_eq(&result, &base);
+}
+
+// ============================================================
+// 4R pair ledger in the snapshot (Р2): survives DR, stays out of the diff stream
+// ============================================================
+
+#[test]
+fn pair_ledger_survives_snapshot_pack_unpack_restore() {
+    // DR is the event the whole project exists for. If the ledger did not travel in the
+    // snapshot, the gb·day integrals would be zeroed exactly then — and an integral
+    // cannot be recomputed from a post-DR snapshot.
+    let db = test_db();
+    let master = IdentityPub([0x5Au8; 32]);
+    let ledger = make_ledger(11.0, 22.0);
+    db.upsert_pair_ledger(&master, &ledger).unwrap();
+
+    let state = snapshot_db(&db).unwrap();
+    assert_eq!(state.pair_ledgers.len(), 1);
+
+    let key = make_key();
+    let blob = pack_system_state(&state, &key).unwrap();
+    let unpacked = unpack_system_state(&blob, &key).unwrap();
+
+    let db2 = test_db();
+    restore_db(&db2, &unpacked).unwrap();
+    assert_eq!(
+        db2.get_pair_ledger(&master).unwrap(),
+        Some(ledger),
+        "every accumulator must come back byte-identical after DR"
+    );
+}
+
+#[test]
+fn pair_ledgers_defaults_to_empty_for_a_blob_packed_before_the_field_existed() {
+    // SystemState::pair_ledgers carries #[serde(default)] so that base blobs published by
+    // an older build still decode. Nothing pinned that until now — and the cost of it
+    // being wrong is total: dr/mod.rs bails on a base blob it cannot decode, i.e. no DR.
+    #[derive(serde::Serialize)]
+    struct SystemStateWithoutPairLedgers {
+        version: u8,
+        created_at: Timestamp,
+        files: Vec<FileRecord>,
+        source_blocks: Vec<SourceBlockRecord>,
+        symbol_placements: Vec<SymbolPlacement>,
+        peers: Vec<PeerRecord>,
+        pos_weekly: Vec<PosWeeklyEntry>,
+        cluster_state: Option<crate::cluster::StoredClusterState>,
+    }
+
+    let legacy = SystemStateWithoutPairLedgers {
+        version: SYSTEM_STATE_VERSION,
+        created_at: Timestamp(1_700_000_000),
+        files: vec![make_file("a.txt", 1)],
+        source_blocks: vec![],
+        symbol_placements: vec![],
+        peers: vec![make_peer(1)],
+        pos_weekly: vec![],
+        cluster_state: None,
+    };
+
+    let bytes = crate::types::to_cbor_bytes(&legacy);
+    let decoded: SystemState = crate::types::from_cbor_bytes(&bytes).unwrap();
+
+    assert!(
+        decoded.pair_ledgers.is_empty(),
+        "an older blob must decode with no ledgers, not fail to decode"
+    );
+    assert_eq!(decoded.files.len(), 1, "the rest of the blob still arrives");
+    assert_eq!(decoded.peers.len(), 1);
+}
+
+#[test]
+fn diff_states_emits_no_op_for_a_changed_pair_ledger() {
+    // Deliberate, and the reason is key shape: the ledger is per-master, diffed peer
+    // records are per-device, so there is no row for it to ride. Two other explanations
+    // were written here before and both were refuted against the code — "a sibling's diff
+    // could overwrite our integrals" (apply_diffs runs only in DR, on a freshly recreated
+    // database) and "ledger churn would balloon the diff stream" (peer rows are already
+    // rewritten hourly by record_avail_contact, with no ledger involved).
+    let base = base_state();
+    let mut changed = base.clone();
+    changed.pair_ledgers = vec![PairLedgerEntry {
+        master: IdentityPub([10u8; 32]),
+        ledger: make_ledger(999.0, 999.0),
+    }];
+
+    assert!(
+        diff_states(&base, &changed).is_empty(),
+        "a ledger change alone must produce no diff ops"
+    );
+}
+
+#[test]
+fn apply_diffs_carries_the_base_pair_ledgers_through() {
+    // No DiffOp can touch the ledger, so the base's rows must survive the whole apply
+    // chain — otherwise DR from base+diffs would silently drop the accounting.
+    let base = base_state();
+    let mut s1 = base.clone();
+    s1.files.push(make_file("new.txt", 99));
+    let diff = diff_states(&base, &s1);
+
+    let result = apply_diffs(base.clone(), std::slice::from_ref(&diff));
+    assert_eq!(result.pair_ledgers.len(), 1);
+    assert_eq!(
+        to_cbor(&result.pair_ledgers[0].ledger),
+        to_cbor(&base.pair_ledgers[0].ledger)
+    );
 }
 
 #[test]

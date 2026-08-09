@@ -18,8 +18,8 @@ use std::io::Cursor;
 
 use crate::cluster::StoredClusterState;
 use crate::types::{
-    DeviceId, FileId, FileRecord, IdentityPub, PeerRecord, SourceBlockId, SourceBlockRecord,
-    SymbolPlacement, Timestamp, to_cbor_bytes,
+    DeviceId, FileId, FileRecord, IdentityPub, PairLedger, PeerRecord, SourceBlockId,
+    SourceBlockRecord, SymbolPlacement, Timestamp, to_cbor_bytes,
 };
 
 // ============================================================
@@ -77,6 +77,56 @@ pub struct SystemState {
 
     /// Cluster state, if any.
     pub cluster_state: Option<StoredClusterState>,
+
+    /// All 4R pair-ledger rows (`pair_ledger` table), keyed by master identity.
+    ///
+    /// **Why it is in the snapshot at all.** The ledger is a set of time-integrals
+    /// (gb·days accrued over months). Disaster recovery is precisely the event the
+    /// project exists for — and if the ledger did not travel in the snapshot, DR would
+    /// zero the accounting exactly then, at the moment the history is most expensive to
+    /// have lost, since an integral cannot be recomputed from a post-DR snapshot.
+    ///
+    /// **Why it travels only here and NOT in [`DiffOp`].** There is deliberately no
+    /// `PairLedgerUpserted` op — but NOT for either reason previously written here, both
+    /// of which were refuted against the code. "A diff would let a cluster sibling
+    /// overwrite my first-hand integrals" is false: [`apply_diffs`] has a single non-test
+    /// call site (disaster recovery) and it runs on a freshly recreated database, with
+    /// base and diffs read from ONE self-pointer, so no live path applies a foreign diff
+    /// to a running DB. "Ledger churn would balloon the diff stream" is also false in the
+    /// form it was stated: peer rows are already rewritten hourly without any ledger
+    /// (`record_avail_contact` on every successful mailbox fetch), so a non-empty diff on
+    /// every push is today's baseline. The one reason that survives is key shape — the
+    /// ledger is per-master, `PeerRecord` is per-device. See [`crate::types::PairLedger`].
+    ///
+    /// **The cost of base-only, in numbers.** A restored ledger is as of the last *base*
+    /// publication. The base is rebuilt on every daemon restart and after
+    /// `DIFF_COMPACTION_THRESHOLD = 20` NON-EMPTY diffs, published at most every 6 hours.
+    /// So ≈5 days is the **floor**, not the worst case: it is reached only if every single
+    /// push carries a change. The quieter the node, the longer 20 diffs take to accumulate
+    /// and the staler the ledger in the base — a circle of mostly-offline peers (diffs
+    /// roughly daily, from avail decay) lands nearer ≈20 days. Against `τ ≈ 60 days` that
+    /// is still bounded, and re-accumulated by simply continuing to accrue.
+    ///
+    /// **What base-only does NOT protect against.** Because the ledger rides the base, a
+    /// cluster device doing DR can restore from a *sibling's* snapshot and inherit the
+    /// sibling's ledger — exactly as it already inherits the sibling's `peers`, `files`
+    /// and `symbol_placements`. That is a property of the whole SystemState (self-pointer
+    /// is signed by the master and lives in the master's mailbox), open in tech-debt next
+    /// to CROWN-1, and not something this field either introduces or fixes.
+    ///
+    /// `#[serde(default)]` is the migration path for blobs packed before this field
+    /// existed: they decode with an empty vec instead of erroring.
+    #[serde(default)]
+    pub pair_ledgers: Vec<PairLedgerEntry>,
+}
+
+/// One row of the `pair_ledger` table inside a [`SystemState`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PairLedgerEntry {
+    /// Master identity the ledger belongs to (the table key).
+    pub master: IdentityPub,
+    /// The accumulators themselves.
+    pub ledger: PairLedger,
 }
 
 /// One entry from the `pos_weekly` table.
@@ -167,8 +217,14 @@ fn derive_system_state_key(identity_key: &[u8; 32], salt: &[u8]) -> [u8; 32] {
 
 /// Dump all critical DB tables into a SystemState struct.
 ///
-/// Reads: files, source_blocks, symbol_placements, peers, pos_weekly, cluster_state.
-/// Does NOT include: holdings (holder-specific), budget, event_log (secondary/ephemeral).
+/// Reads: files, source_blocks, symbol_placements, peers, pos_weekly, cluster_state,
+/// pair_ledger.
+/// Does NOT include: holdings (holder-specific), budget, event_log (secondary/ephemeral),
+/// device_to_master (rebuilt from live certificate exchange after DR).
+///
+/// Fails if any table fails to decode — including a `pair_ledger` row (strict decode, see
+/// [`crate::types::PairLedger`]). The daemon's periodic push treats a failure here as
+/// "log and skip the tick", so a decode error stops SystemState publication entirely.
 pub fn snapshot_db(db: &crate::db::Db) -> Result<SystemState, SystemStateError> {
     let files = db.list_all_files()?;
     // SystemState-as-block records live in SOURCE_BLOCKS so the generic pipeline
@@ -205,6 +261,12 @@ pub fn snapshot_db(db: &crate::db::Db) -> Result<SystemState, SystemStateError> 
 
     let cluster_state = db.get_cluster_state()?;
 
+    let pair_ledgers = db
+        .list_pair_ledgers()?
+        .into_iter()
+        .map(|(master, ledger)| PairLedgerEntry { master, ledger })
+        .collect();
+
     let state = SystemState {
         version: SYSTEM_STATE_VERSION,
         created_at: Timestamp::now(),
@@ -214,6 +276,7 @@ pub fn snapshot_db(db: &crate::db::Db) -> Result<SystemState, SystemStateError> 
         peers,
         pos_weekly,
         cluster_state,
+        pair_ledgers,
     };
 
     tracing::info!(
@@ -222,6 +285,7 @@ pub fn snapshot_db(db: &crate::db::Db) -> Result<SystemState, SystemStateError> 
         placements = state.symbol_placements.len(),
         peers = state.peers.len(),
         pos_weekly = state.pos_weekly.len(),
+        pair_ledgers = state.pair_ledgers.len(),
         "system state snapshot taken"
     );
 
@@ -246,6 +310,13 @@ pub fn restore_db(db: &crate::db::Db, state: &SystemState) -> Result<(), SystemS
 /// Like restore_db but skips the empty-DB check.
 ///
 /// Used when the node has already registered itself during DR boot.
+///
+/// **This overwrites, it does not merge.** Every row in `state` replaces the row with the
+/// same key, and that now includes the `pair_ledger` accumulators: called against a
+/// *running* node it would replace live, freshly-accrued integrals with whatever the blob
+/// carried. Today the only non-test caller is the DR boot path, which runs on a database
+/// file it just deleted and recreated, so nothing live can be clobbered. Any new caller
+/// has to justify that same precondition.
 pub fn restore_db_force(db: &crate::db::Db, state: &SystemState) -> Result<(), SystemStateError> {
     restore_db_inner(db, state)
 }
@@ -290,11 +361,25 @@ fn restore_db_inner(db: &crate::db::Db, state: &SystemState) -> Result<(), Syste
         db.set_cluster_state(cs)?;
     }
 
+    // The 4R recorder: months of gb·day integrals that cannot be recomputed from a
+    // post-DR snapshot. Restored last because nothing else depends on it, and in ONE
+    // write transaction (like pos_weekly above) — there is one row per known master, so
+    // a transaction each would fsync per peer while rebuilding an invisible database.
+    if !state.pair_ledgers.is_empty() {
+        let rows: Vec<_> = state
+            .pair_ledgers
+            .iter()
+            .map(|e| (e.master, e.ledger.clone()))
+            .collect();
+        db.upsert_pair_ledgers(&rows)?;
+    }
+
     tracing::info!(
         files = state.files.len(),
         source_blocks = state.source_blocks.len(),
         placements = state.symbol_placements.len(),
         peers = state.peers.len(),
+        pair_ledgers = state.pair_ledgers.len(),
         "system state restored to DB"
     );
 
@@ -441,6 +526,14 @@ pub enum DiffOp {
 ///
 /// Change detection compares CBOR-encoded records (the records do not derive `PartialEq`).
 /// Output ops are: every key new-or-changed in `new` → `*Upserted`; every key removed → `*Deleted`.
+///
+/// **`pair_ledgers` is deliberately NOT diffed** (and has no [`DiffOp`] variant), because
+/// the ledger is keyed per-master while diffed peer records are keyed per-device — there
+/// is no per-device row for it to ride. It travels in the base snapshot only. Two other
+/// justifications were written here at different times and BOTH were refuted against the
+/// code ("a sibling's diff would overwrite my integrals"; "ledger churn would balloon this
+/// stream") — see [`SystemState::pair_ledgers`] and [`crate::types::PairLedger`] for the
+/// disproofs and for the bounded cost of base-only.
 pub fn diff_states(old: &SystemState, new: &SystemState) -> Vec<DiffOp> {
     use std::collections::HashMap;
     let mut ops = Vec::new();
@@ -590,6 +683,9 @@ pub fn apply_diffs(base: SystemState, diffs: &[Vec<DiffOp>]) -> SystemState {
         .map(|e| (e.key, e.value))
         .collect();
     let mut cluster_state = base.cluster_state;
+    // Carried through untouched: no DiffOp can change the ledger by design
+    // (see SystemState::pair_ledgers), so the base's rows are the final answer.
+    let pair_ledgers = base.pair_ledgers;
 
     for batch in diffs {
         for op in batch {
@@ -646,6 +742,7 @@ pub fn apply_diffs(base: SystemState, diffs: &[Vec<DiffOp>]) -> SystemState {
             .map(|(key, value)| PosWeeklyEntry { key, value })
             .collect(),
         cluster_state,
+        pair_ledgers,
     }
 }
 

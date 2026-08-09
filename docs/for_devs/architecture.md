@@ -13,7 +13,7 @@
 │  (pure Rust, no async, no network)                                       │
 │                                                                          │
 │  types ──► db ──────────────────────────────────────────────────────    │
-│   │         (Db, HotCache, 17 redb tables)                          │    │
+│   │         (Db, HotCache, 21 redb tables)                          │    │
 │   │                                                                  │    │
 │   ├──► trust    (TrustEngine: P, I, S)                              │    │
 │   ├──► escrow   (EscrowChecker: trust-based budget gate)            │    │
@@ -351,6 +351,8 @@ Opening: `Db::open(path)` — pre-open backup (.redb.bak), `DatabaseBuilder` wit
 | `device_trust` | `&[u8; 32]` (device_id) | CBOR(`DeviceTrustRecord`) | Per-device trust |
 | `master_trust` | `&[u8; 32]` (master identity_pub) | CBOR(`MasterTrustRecord`) | Aggregated cluster trust |
 | `device_to_master` | `&[u8; 32]` (device_id) | CBOR(`IdentityPub`) | Device → master identity mapping |
+| `content_index` | `&[u8]` (content_hash ∥ path) | *(empty)* | Index content_hash → paths, for O(1) import dedup |
+| `pair_ledger` | `&[u8; 32]` (master identity_pub) | CBOR(`PairLedger`) | 4R accumulators per economic pair (recorder only — no decision reads it) |
 | `meta` | `&str` | CBOR | Misc singletons (e.g. next_file_id) |
 
 ### HotCache (RAM layer)

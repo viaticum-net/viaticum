@@ -3,6 +3,13 @@
 
 // === Time ===
 
+/// Seconds in one day (24 * 60 * 60).
+///
+/// The `four_r` kernel integrates in DAYS (`update_capital`, `update_v_dem`,
+/// `update_depth` all take `dt_days`), while every persisted clock in the daemon is
+/// unix seconds. This is the one conversion factor between the two.
+pub const SECS_PER_DAY: u64 = 86_400;
+
 /// Seconds in one week (7 * 24 * 60 * 60).
 pub const SECS_PER_WEEK: u64 = 604_800;
 

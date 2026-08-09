@@ -10,13 +10,16 @@ use std::time::Duration;
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::cluster::StoredClusterState;
-use crate::constants::{BYTES_PER_GB, DROP_NOTICE_WINDOW_SECS, HOLDER_DELETE_COOLDOWN_SECS};
+use crate::constants::{
+    BYTES_PER_GB, DROP_NOTICE_WINDOW_SECS, HOLDER_DELETE_COOLDOWN_SECS, SECS_PER_DAY,
+};
 use crate::mailbox::{MailboxClass, MailboxEntry};
 use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
 use crate::types::{
     BlockAgg, BudgetRecord, DeviceId, EventEntry, FileId, FileRecord, HoldingRecord, HoldingStatus,
-    IdentityPub, PeerRecord, PlacementAgg, PlacementStatus, SourceBlockId, SourceBlockRecord,
-    SourceBlockStatus, SymbolPlacement, Timestamp, from_cbor_bytes, to_cbor_bytes,
+    IdentityPub, PairLedger, PeerRecord, PlacementAgg, PlacementStatus, SourceBlockId,
+    SourceBlockRecord, SourceBlockStatus, SymbolPlacement, Timestamp, from_cbor_bytes,
+    to_cbor_bytes,
 };
 
 // ============================================================
@@ -111,6 +114,28 @@ const MAILBOX_ENTRIES: TableDefinition<&[u8; 49], &[u8]> = TableDefinition::new(
 /// Updated on every insert/delete so quota checks are O(1) (no full scan).
 const MAILBOX_BYTES_BY_TARGET: TableDefinition<&[u8; 32], &[u8]> =
     TableDefinition::new("mailbox_bytes_by_target");
+
+/// 4R pair-ledger accumulators. Key: master IdentityPub[32]. Value: CBOR([`PairLedger`]).
+///
+/// Keyed by MASTER, not device: the economic pair is a person (see [`PairLedger`] and
+/// `refresh_peer_storage_bytes`, which already sums `bytes_we_store_for_peer` per-master).
+///
+/// A SEPARATE table rather than fields on [`PeerRecord`] for exactly ONE reason: the
+/// holder-side input exists only per-master (HOLDINGS are keyed by owner-master), while
+/// `PeerRecord` is keyed by `DeviceId` — so one person's history would exist in N copies,
+/// each carrying the master-wide total. Two other reasons were written here at various
+/// points and BOTH were refuted against the code ("a sibling's diff would overwrite my
+/// integrals"; "ledger churn would balloon the diff stream" — peer rows are already
+/// rewritten hourly without any ledger). See [`PairLedger`] for both disproofs; do not
+/// re-add them.
+///
+/// This does NOT make "no decision reads the ledger" structural — `Db` is reachable from
+/// every module and `get_pair_ledger` is an ordinary `pub` method. The actual guarantee
+/// today is only that there is no call site that reads it.
+///
+/// `create_tables` opens it on every `Db::open`, so a database written before this table
+/// existed simply gains it empty (no migration step).
+const PAIR_LEDGER: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("pair_ledger");
 
 // ============================================================
 // Key helpers
@@ -352,6 +377,7 @@ impl Db {
             tx.open_table(META)?;
             tx.open_table(MAILBOX_ENTRIES)?;
             tx.open_table(MAILBOX_BYTES_BY_TARGET)?;
+            tx.open_table(PAIR_LEDGER)?;
         }
         tx.commit()?;
         Ok(())
@@ -1443,6 +1469,99 @@ impl Db {
         Ok(())
     }
 
+    // ── 4R pair ledger (recorder; no decision reads it) ─────────────────────
+
+    /// Read the pair ledger for a MASTER identity. `None` if nothing has been accrued.
+    ///
+    /// Absence is meaningful and must NOT be papered over with a zero-valued ledger by a
+    /// caller that then treats it as an observation: a pair with no history is not a pair
+    /// whose history integrated to zero. The same distinction inside a stored row is
+    /// `PairLedger::last_update == None` (the clock never started).
+    pub fn get_pair_ledger(&self, master: &IdentityPub) -> Result<Option<PairLedger>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(PAIR_LEDGER)?;
+        match table.get(&master.0)? {
+            Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert or replace the pair ledger for a MASTER identity.
+    ///
+    /// Deliberately does NOT require a `PeerRecord` (or any device of that master) to
+    /// exist: the ledger is per-person, and a master can be known from a
+    /// `DeviceCertificate` before any peer row is written. Requiring a peer row would
+    /// silently drop accrual at exactly that moment.
+    ///
+    /// This pins INTENT, not a live flow, in the other direction: today no peer row ever
+    /// disappears (`delete_peer` has no non-test call site, revocation only appends to
+    /// `revoked_device_pub_keys`, and a re-install gets a fresh `DeviceId` leaving the old
+    /// row in place). The rule is stated so that if pruning is ever added, a person's
+    /// accrued history is not deleted along with a machine.
+    ///
+    /// The cost is that a caller passing a stray identity creates an orphan row;
+    /// `list_pair_ledgers` therefore returns the key, so a future sweep can reconcile
+    /// against known masters.
+    pub fn upsert_pair_ledger(
+        &self,
+        master: &IdentityPub,
+        ledger: &PairLedger,
+    ) -> Result<(), DbError> {
+        let bytes = to_cbor_bytes(ledger);
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(PAIR_LEDGER)?;
+            table.insert(&master.0, bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Insert or replace many pair ledgers in ONE write transaction.
+    ///
+    /// Restore-shaped counterpart of [`Db::list_pair_ledgers`] (same tuple type, so a
+    /// snapshot round-trips through the pair). Used by `system_state::restore_db_inner`,
+    /// where the alternative — one transaction per row — would fsync once per known
+    /// master while rebuilding a database that is not yet visible to anything.
+    ///
+    /// Same non-requirement as [`Db::upsert_pair_ledger`]: a row is written whether or
+    /// not that master has a `PeerRecord`.
+    pub fn upsert_pair_ledgers(&self, rows: &[(IdentityPub, PairLedger)]) -> Result<(), DbError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(PAIR_LEDGER)?;
+            for (master, ledger) in rows {
+                let bytes = to_cbor_bytes(ledger);
+                table.insert(&master.0, bytes.as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// All pair ledgers, paired with the master identity they belong to.
+    ///
+    /// Iteration order is redb key order (identity bytes ascending) — deterministic, so a
+    /// periodic sweep over it cannot depend on insertion history.
+    ///
+    /// Strict decode: an unreadable row makes the whole call `Err`, which propagates into
+    /// `snapshot_db` and stops SystemState publication. That is intended (a silently
+    /// zeroed ledger would be worse), and it is why every new [`PairLedger`] field must
+    /// carry `#[serde(default)]` — see the type's "Adding a field later" section.
+    pub fn list_pair_ledgers(&self) -> Result<Vec<(IdentityPub, PairLedger)>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(PAIR_LEDGER)?;
+        let mut out = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            out.push((IdentityPub(*k.value()), from_cbor_bytes(v.value())?));
+        }
+        Ok(out)
+    }
+
     /// Batch decay: for each PeerRecord where (now - last_avail_sample) >= tick_secs,
     /// apply EXACTLY 1 decay tick: avail = (1-alpha) * avail.
     /// Updates avail_ewma + last_avail_sample in one write transaction.
@@ -1936,6 +2055,11 @@ impl Db {
     /// `time_scale` accelerates simulated time (1 = real time, 100_000 = gamma tests).
     /// This matches the same time acceleration used everywhere else in the protocol.
     ///
+    /// NOT a leaky integral, and not a substitute for [`crate::types::PairLedger`]: it
+    /// re-derives the sum from the holdings that are Active *right now*, so a dropped
+    /// holding retroactively erases its own history, and it has no forgetting term. The
+    /// 4R capital `G` is neither.
+    ///
     /// Returns 0.0 if no active holdings exist for this owner.
     pub fn stored_for_peer_gb_days(
         &self,
@@ -1943,8 +2067,7 @@ impl Db {
         now: Timestamp,
         time_scale: u64,
     ) -> Result<f64, DbError> {
-        const SECS_PER_DAY: f64 = 86_400.0;
-
+        let secs_per_day = SECS_PER_DAY as f64;
         let scale = time_scale.max(1) as f64;
         let holdings = self.list_holdings_for_owner(owner_id)?;
         let mut total = 0.0_f64;
@@ -1953,7 +2076,7 @@ impl Db {
                 continue;
             }
             let age_secs = now.0.saturating_sub(h.received_at.0) as f64;
-            let age_days = age_secs * scale / SECS_PER_DAY;
+            let age_days = age_secs * scale / secs_per_day;
             let gb = h.total_bytes as f64 / BYTES_PER_GB;
             total += gb * age_days;
         }
@@ -1971,8 +2094,7 @@ impl Db {
         now: Timestamp,
         time_scale: u64,
     ) -> Result<Vec<(IdentityPub, f64)>, DbError> {
-        const SECS_PER_DAY: f64 = 86_400.0;
-
+        let secs_per_day = SECS_PER_DAY as f64;
         let scale = time_scale.max(1) as f64;
         let tx = self.inner.begin_read()?;
         let table = tx.open_table(HOLDINGS)?;
@@ -1988,7 +2110,7 @@ impl Db {
             if age_secs <= 0.0 {
                 continue;
             }
-            let age_days = age_secs * scale / SECS_PER_DAY;
+            let age_days = age_secs * scale / secs_per_day;
             let gb = h.total_bytes as f64 / BYTES_PER_GB;
             *by_owner.entry(h.owner_id).or_insert(0.0) += gb * age_days;
         }
@@ -2052,6 +2174,13 @@ pub struct TableStats {
     pub holder_files: u64,
     #[serde(default)]
     pub mailbox_entries: u64,
+    /// 4R pair-ledger rows (one per master identity we have accrued history for).
+    ///
+    /// Exposed because the single instruction left for the 4R return (`4r_handoff.md` §4)
+    /// is "check that the accounting actually accumulated" — a row count is the cheapest
+    /// way to see that the recorder is alive without reading the ledger itself.
+    #[serde(default)]
+    pub pair_ledger: u64,
 }
 
 impl Db {
@@ -2069,6 +2198,7 @@ impl Db {
             file_holders: tx.open_table(FILE_HOLDERS)?.len()?,
             holder_files: tx.open_table(HOLDER_FILES)?.len()?,
             mailbox_entries: tx.open_table(MAILBOX_ENTRIES)?.len()?,
+            pair_ledger: tx.open_table(PAIR_LEDGER)?.len()?,
         })
     }
 }

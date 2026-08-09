@@ -3,8 +3,9 @@ use crate::db::{Db, WeeklyPosEntry};
 use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
 use crate::types::{
     BudgetRecord, DeviceId, Event, EventEntry, FileId, FileRecord, FileVersion, HoldingRecord,
-    HoldingStatus, IdentityPub, LocalState, PeerRecord, PlacementStatus, SourceBlockId,
+    HoldingStatus, IdentityPub, LocalState, PairLedger, PeerRecord, PlacementStatus, SourceBlockId,
     SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
+    from_cbor_bytes, to_cbor_bytes,
 };
 
 // ============================================================
@@ -3227,5 +3228,236 @@ fn decay_applies_exactly_one_tick_after_tick_interval() {
     assert_eq!(
         stored.last_avail_sample, now_secs,
         "last_avail_sample must be updated to now_secs"
+    );
+}
+
+// ============================================================
+// 4R pair ledger (У-1) — spec: private/beta-planning/tasks/pair_ledger.md
+// ============================================================
+
+fn master_id(seed: u8) -> IdentityPub {
+    IdentityPub([seed; 32])
+}
+
+fn make_ledger(g_from: f64, g_to: f64, last_update: u64) -> PairLedger {
+    PairLedger {
+        g_owner_from_holder: g_from,
+        g_holder_from_owner: g_to,
+        depth: 77.5,
+        v_dem: 12.25,
+        observed_volume: 4.0,
+        observed_tau: 30.0,
+        drop_ann: 1.0,
+        drop_silent: 2.0,
+        last_update: Some(Timestamp(last_update)),
+    }
+}
+
+#[test]
+fn pair_ledger_is_absent_for_a_master_that_never_accrued() {
+    let db = test_db();
+    let device = DeviceId([0xB1u8; 32]);
+    let peer = make_peer(device);
+    db.upsert_peer(&peer).unwrap();
+
+    // Absence is a fact, not a zero: a pair with no history is not a pair whose history
+    // integrated to zero, and the future 4R bridge must be able to tell them apart.
+    assert!(
+        db.get_pair_ledger(&peer.master_identity).unwrap().is_none(),
+        "a master with no accrual must have no ledger row"
+    );
+}
+
+#[test]
+fn pair_ledger_round_trips_every_field() {
+    let db = test_db();
+    let master = master_id(0xB2);
+    let ledger = make_ledger(10.0, 20.0, 1_700_000_000);
+
+    db.upsert_pair_ledger(&master, &ledger).unwrap();
+    let stored = db.get_pair_ledger(&master).unwrap().unwrap();
+
+    assert_eq!(stored, ledger, "CBOR round-trip must preserve every field");
+}
+
+#[test]
+fn pair_ledger_upsert_replaces_the_previous_row() {
+    let db = test_db();
+    let master = master_id(0xB3);
+
+    db.upsert_pair_ledger(&master, &make_ledger(1.0, 2.0, 100))
+        .unwrap();
+    db.upsert_pair_ledger(&master, &make_ledger(3.0, 4.0, 200))
+        .unwrap();
+
+    let stored = db.get_pair_ledger(&master).unwrap().unwrap();
+    assert_eq!(stored.g_owner_from_holder, 3.0);
+    assert_eq!(stored.last_update, Some(Timestamp(200)));
+    assert_eq!(
+        db.list_pair_ledgers().unwrap().len(),
+        1,
+        "upsert must replace, not append"
+    );
+}
+
+#[test]
+fn pair_ledger_is_written_without_any_peer_row_for_that_master() {
+    // Documented behaviour (not an accident): the ledger is per-person and may exist
+    // before the first PeerRecord of that master is written, and outlive its last one.
+    // Requiring a peer row would silently drop accrual at exactly those moments.
+    let db = test_db();
+    let master = master_id(0xB5);
+
+    db.upsert_pair_ledger(&master, &make_ledger(1.0, 2.0, 100))
+        .unwrap();
+
+    assert!(
+        db.list_all_peers().unwrap().is_empty(),
+        "no peer rows at all"
+    );
+    assert!(
+        db.get_pair_ledger(&master).unwrap().is_some(),
+        "ledger must not require a peer row to exist"
+    );
+}
+
+#[test]
+fn pair_ledger_survives_deletion_of_a_device_of_that_master() {
+    // A master has many devices; deleting ONE device row must not erase the economic
+    // history of the person. (`delete_peer` has no non-test call site today — the daemon
+    // never deletes peers, revocation only marks — so this pins intent, not live flow.)
+    let db = test_db();
+    let device_a = DeviceId([0xB6u8; 32]);
+    let device_b = DeviceId([0xB7u8; 32]);
+    let peer_a = make_peer(device_a);
+    let master = peer_a.master_identity;
+    db.upsert_peer(&peer_a).unwrap();
+    db.upsert_peer(&make_peer(device_b)).unwrap();
+    db.upsert_pair_ledger(&master, &make_ledger(5.0, 6.0, 300))
+        .unwrap();
+
+    db.delete_peer(&device_a).unwrap();
+
+    let stored = db.get_pair_ledger(&master).unwrap();
+    assert_eq!(
+        stored,
+        Some(make_ledger(5.0, 6.0, 300)),
+        "removing one device of a master must leave the per-master ledger untouched"
+    );
+}
+
+#[test]
+fn pair_ledger_list_is_ordered_by_master_identity() {
+    let db = test_db();
+    // Insert out of order; a periodic sweep must not depend on insertion history.
+    for seed in [0xC3u8, 0xC1, 0xC2] {
+        db.upsert_pair_ledger(&master_id(seed), &make_ledger(seed as f64, 0.0, 1))
+            .unwrap();
+    }
+
+    let listed: Vec<u8> = db
+        .list_pair_ledgers()
+        .unwrap()
+        .into_iter()
+        .map(|(m, _)| m.0[0])
+        .collect();
+
+    assert_eq!(
+        listed,
+        vec![0xC1, 0xC2, 0xC3],
+        "iteration must be key-ordered"
+    );
+}
+
+#[test]
+fn pair_ledger_survives_reopening_the_database_file() {
+    // The whole point of landing the recorder early is that it accumulates across
+    // CALENDAR time, which means across daemon restarts. In-memory tests cannot show
+    // that; this one writes to a real redb file, closes it, and reopens.
+    //
+    // A tempdir, not a NamedTempFile: `Db::open` writes a sibling `<name>.redb.bak`
+    // pre-open backup, so a temp *file* guard would leave that backup behind on every
+    // run. The directory guard removes both.
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().join("db.redb");
+
+    let master = master_id(0xD1);
+    let ledger = make_ledger(101.5, 202.25, 1_700_000_500);
+    {
+        let db = Db::open(&tmp_path).unwrap();
+        db.upsert_pair_ledger(&master, &ledger).unwrap();
+    }
+
+    let reopened = Db::open(&tmp_path).unwrap();
+    assert_eq!(
+        reopened.get_pair_ledger(&master).unwrap(),
+        Some(ledger),
+        "accrued history must survive a daemon restart, byte for byte"
+    );
+    assert_eq!(reopened.table_stats().unwrap().pair_ledger, 1);
+}
+
+#[test]
+fn pair_ledger_decode_fails_on_a_cbor_value_missing_fields() {
+    // PAIR_LEDGER and PEERS share the &[u8;32] key type, so a mis-routed read is a real
+    // hazard. With no blanket `#[serde(default)]` the struct is strict: an unrelated CBOR
+    // map decodes to an ERROR, not to a plausible all-zero ledger that a later integrator
+    // would happily keep accruing on top of.
+    let empty_map = to_cbor_bytes(&std::collections::BTreeMap::<String, f64>::new());
+    assert!(
+        from_cbor_bytes::<PairLedger>(&empty_map).is_err(),
+        "an empty CBOR map must not silently decode as a zeroed ledger"
+    );
+}
+
+#[test]
+fn pair_ledger_batch_upsert_writes_every_row_and_replaces_existing_ones() {
+    // The restore path (system_state::restore_db_inner) writes one row per known master
+    // in a single transaction. It must be equivalent to the row-at-a-time upsert,
+    // including replacement of a row that already exists.
+    let db = test_db();
+    db.upsert_pair_ledger(&master_id(0xF1), &make_ledger(1.0, 1.0, 10))
+        .unwrap();
+
+    db.upsert_pair_ledgers(&[
+        (master_id(0xF1), make_ledger(9.0, 9.0, 900)),
+        (master_id(0xF2), make_ledger(2.0, 2.0, 20)),
+    ])
+    .unwrap();
+
+    assert_eq!(
+        db.get_pair_ledger(&master_id(0xF1)).unwrap(),
+        Some(make_ledger(9.0, 9.0, 900)),
+        "an existing row is replaced, not merged"
+    );
+    assert_eq!(
+        db.get_pair_ledger(&master_id(0xF2)).unwrap(),
+        Some(make_ledger(2.0, 2.0, 20))
+    );
+    assert_eq!(db.table_stats().unwrap().pair_ledger, 2);
+}
+
+#[test]
+fn pair_ledger_batch_upsert_of_nothing_is_a_no_op() {
+    // restore_db_inner calls it on every DR, including nodes that never accrued.
+    let db = test_db();
+    db.upsert_pair_ledgers(&[]).unwrap();
+    assert_eq!(db.table_stats().unwrap().pair_ledger, 0);
+}
+
+#[test]
+fn table_stats_counts_pair_ledger_rows() {
+    let db = test_db();
+    assert_eq!(db.table_stats().unwrap().pair_ledger, 0);
+
+    db.upsert_pair_ledger(&master_id(0xE1), &make_ledger(1.0, 1.0, 10))
+        .unwrap();
+    db.upsert_pair_ledger(&master_id(0xE2), &make_ledger(2.0, 2.0, 20))
+        .unwrap();
+
+    assert_eq!(
+        db.table_stats().unwrap().pair_ledger,
+        2,
+        "the only check prescribed on returning to 4R is that accrual really happened"
     );
 }
