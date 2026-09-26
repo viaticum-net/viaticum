@@ -1,17 +1,44 @@
 #!/bin/bash
-# Viaticum big-file stress test: realistic file sizes (10-100 MB).
-# Monitors RAM and disk usage per node during backup.
+# Viaticum big-file E2E: realistic sizes (10-100 MB), restore of a 100 MB file from
+# the network, RAM/disk footprint per node.
+#
+# Scenario: 5 independent owners, star-connected to node-00. node-00 backs up a 50 MB
+#   and a 100 MB file, loses the 100 MB file locally and restores it from holders, then
+#   backs up a batch of 10 x 10 MB files. RSS/disk snapshots are printed along the way.
+# Intent: restore-i1 (Phase 4), restore-i9 (partial: restore right after the delete);
+#   backup-i1, backup-i3 (file pending; proposed ids: backup-i1 = a backed-up file has
+#   >= k_eff symbols on holder disks, backup-i3 = the owner keeps no copy of its own
+#   blocks, storage-layout doctrine).
+# Proves: 50/100 MB files and a 10-file batch reach "restorable" per the owner and
+#   their symbols are on holder disks (the holder-disk sum reaches the owner's Alive
+#   symbol count, >= k_eff); the owner keeps no copy of its own blocks (data dir minus
+#   watch dir/holdings/restore stays small, storage-layout doctrine); with the local
+#   source gone the 100 MB file comes back from holders byte-identical (sha256) and the
+#   holders log serving it.
+# Adversarial: the 100 MB source is deleted while the daemon runs, so restore must
+#   fetch ~100 MB of symbols from holders.
+# Cannot close: RAM ceilings (RSS is printed, not asserted); files larger than one
+#   128 MB source block (multi-block files); restore of the batch; throughput numbers
+#   (all nodes share one host); per-holder placement check (the API gives only the
+#   owner's total Alive symbol count, not which holder should hold how many, so
+#   holder_check compares sums); redundancy above k_eff (at "restorable" a block may
+#   sit on exactly one holder with exactly k_eff symbols); restore-i3 (honest outcome):
+#   the CLI answers exit 0 + "started" even when nothing was restored, e2e_lib.sh turns
+#   that into a FAIL instead of proving the report.
+# Steps: 1. backup 50 MB -> restorable; holder-disk sum >= owner Alive >= k_eff
+#             (backup-i1) — check: wait_file_restorable, holder_check (polled 120 s)
+#        2. owner data dir minus files/holdings/restore/log < 10 MB (backup-i3) —
+#             check: du
+#        3. backup 100 MB -> same as step 1 (backup-i1)
+#        4. rm 100 MB source -> restore -> sha256 match; holders log RestoreResponse
+#             (restore-i1, restore-i9) — check: assert_delete_window,
+#             restore_from_network, restore_responses_for
+#        5. 10 x 10 MB -> 10/10 restorable; holder_check on batch_1 and batch_10
+#             (backup-i1)
 #
 # Usage:
-#   cargo build --release
+#   ./rbuild.sh      # release binary, built on the server
 #   bash experiments/local_bigfile_test.sh
-#
-# Tests:
-#   1. Backup 50 MB file, verify symbols placed
-#   2. Backup 100 MB file, verify symbols placed
-#   3. Restore 100 MB file, verify MD5
-#   4. Check RAM/disk: no duplication, reasonable footprint
-#   5. Backup 10 x 10 MB files, verify all placed
 
 set -euo pipefail
 
@@ -112,6 +139,9 @@ if ! command -v "$BINARY" &>/dev/null; then
     fi
 fi
 
+# shellcheck source=experiments/e2e_lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/e2e_lib.sh"
+
 echo "============================================================"
 echo "  Viaticum Big File Test (${NUM_NODES} nodes)"
 echo "  Binary: $BINARY"
@@ -175,117 +205,126 @@ done
 for cpid in "${CONNECT_PIDS[@]}"; do
     wait "$cpid" 2>/dev/null || true
 done
-sleep 3
-
-PEERS=$(get_json_field 0 peer_count)
-echo "  node-00 peers: ${PEERS}/$((NUM_NODES-1))"
+if wait_auth_peers 0 $((NUM_NODES-1)) 30; then
+    pass "star connect: $(status_num 0 peer_count_authenticated) authenticated peers"
+else
+    fail "star connect: only $(status_num 0 peer_count_authenticated)/$((NUM_NODES-1)) authenticated peers after 30s"
+fi
 
 echo ""
 echo "=== Baseline resource usage ==="
 measure_all
 
+# holder_check PATH LABEL: poll (deadline 120 s) until the symbols of PATH's block
+# on holder disks reach the owner's Alive symbol count (`effective_status.live`,
+# re-read every poll), then require that count >= k_eff. The API gives no
+# per-holder breakdown of placements, so the match is on the sum over holders.
+holder_check() {
+    local path="$1" label="$2" blk tgt live n on=0 who=""
+    blk=$(file_block_hex 0 "$path")
+    for _ in $(seq 1 120); do
+        tgt=$(file_field 0 "$path" '.effective_status.target // 0')
+        live=$(file_field 0 "$path" '.effective_status.live // 0')
+        on=0; who=""
+        for i in $(seq 1 $((NUM_NODES-1))); do
+            n=$(block_symbols_on "$i" "$blk")
+            [ "$n" -gt 0 ] && who="$who node-$(printf '%02d' "$i")=$n"
+            on=$((on + n))
+        done
+        [ -n "$blk" ] && [ "${live:-0}" -gt 0 ] && [ "$on" -ge "$live" ] && break
+        sleep 1
+    done
+    echo "  $label block ${blk:0:16}.. on holder disks:${who:- none} (owner Alive symbols: ${live:-?})"
+    if [ -n "$blk" ] && [ "${tgt:-0}" -gt 0 ] && [ "${live:-0}" -ge "$tgt" ] && [ "$on" -ge "$live" ]; then
+        pass "$label: holders store ${on} symbols >= owner's Alive ${live} >= k_eff ${tgt}"
+    else
+        fail "$label: holders store ${on} symbols, owner Alive ${live:-?}, k_eff=${tgt:-?} (block=${blk:-none})"
+    fi
+}
+
 # ── PHASE 2: 50 MB FILE ─────────────────────────────────────────
 echo ""
 echo "=== Phase 2: Backup 50 MB file ==="
-dd if=/dev/urandom of="$(node_dir 0)/files/big50.bin" bs=1M count=50 2>/dev/null
-MD5_50=$(md5sum "$(node_dir 0)/files/big50.bin" | cut -d' ' -f1)
-echo "  Created 50 MB file (MD5: $MD5_50)"
+F50="$(node_dir 0)/files/big50.bin"
+dd if=/dev/urandom of="$F50" bs=1M count=50 2>/dev/null
+echo "  Created 50 MB file (sha256 $(content_hash "$F50"))"
 
-echo "  Waiting for backup (max 120s)..."
-for i in $(seq 1 120); do
-    PLACEMENTS=$(get_json_field 0 placement_count)
-    if [ -n "$PLACEMENTS" ] && [ "$PLACEMENTS" -gt 0 ] 2>/dev/null; then
-        echo "  Backed up after ${i}s (placements=$PLACEMENTS)"
-        pass "50 MB file backed up (${PLACEMENTS} placements)"
-        break
-    fi
-    sleep 1
-done
-if [ -z "$PLACEMENTS" ] || [ "$PLACEMENTS" -eq 0 ] 2>/dev/null; then
-    fail "50 MB file backup timed out"
+T0=$(date +%s)
+if wait_file_restorable 0 "$F50" 240; then
+    pass "50 MB file restorable per owner after $(( $(date +%s) - T0 ))s"
+else
+    fail "50 MB file not restorable per owner after 240s"
 fi
+holder_check "$F50" "50 MB"
 
 echo ""
 echo "=== Post-50MB resource usage ==="
 measure_all
 
-# Wait for symbol delivery
-echo "  Waiting 15s for symbol delivery..."
-sleep 15
-
-echo ""
-echo "=== Post-delivery resource usage ==="
-measure_all
-
-# Check for disk duplication: owner's symbols dir should be cleaned after delivery
-SYMBOLS_DIR="$(node_dir 0)/symbols"
-OWNER_SYMBOLS_KB=$(du -sk "$SYMBOLS_DIR" 2>/dev/null | cut -f1 || echo "0")
-echo "  Owner symbols dir after delivery: ${OWNER_SYMBOLS_KB} KB"
-if [ "$OWNER_SYMBOLS_KB" -lt 10000 ]; then
-    pass "owner symbols cleaned after delivery (<10 MB remaining)"
+# Storage-layout doctrine: the owner does not keep its own blocks on disk. What is
+# left in its data dir besides the watch dir, peer holdings, restore staging and the
+# log is metadata (redb, SS blobs) and must stay far below the 50 MB just backed up.
+OWNER_OVERHEAD_KB=$(du -sk --exclude=files --exclude=holdings --exclude=restore \
+    --exclude=daemon.log "$(node_dir 0)" | cut -f1)
+echo "  node-00 data dir without files/holdings/restore/log: ${OWNER_OVERHEAD_KB} KB"
+if [ "${OWNER_OVERHEAD_KB:-999999}" -lt 10240 ]; then
+    pass "owner keeps no copy of its blocks (${OWNER_OVERHEAD_KB} KB < 10 MB)"
 else
-    fail "owner symbols NOT cleaned: ${OWNER_SYMBOLS_KB} KB remaining"
+    fail "owner data dir holds ${OWNER_OVERHEAD_KB} KB outside files/holdings (own blocks on disk?)"
+    du -sk "$(node_dir 0)"/* 2>/dev/null | sort -rn | head -5 || true
 fi
 
 # ── PHASE 3: 100 MB FILE ────────────────────────────────────────
 echo ""
 echo "=== Phase 3: Backup 100 MB file ==="
-dd if=/dev/urandom of="$(node_dir 0)/files/big100.bin" bs=1M count=100 2>/dev/null
-MD5_100=$(md5sum "$(node_dir 0)/files/big100.bin" | cut -d' ' -f1)
-echo "  Created 100 MB file (MD5: $MD5_100)"
+F100="$(node_dir 0)/files/big100.bin"
+dd if=/dev/urandom of="$F100" bs=1M count=100 2>/dev/null
+HASH_100=$(content_hash "$F100")
+echo "  Created 100 MB file (sha256 $HASH_100)"
 
-echo "  Waiting for backup (max 180s)..."
-PREV_PLACEMENTS=$PLACEMENTS
-for i in $(seq 1 180); do
-    PLACEMENTS=$(get_json_field 0 placement_count)
-    if [ -n "$PLACEMENTS" ] && [ "$PLACEMENTS" -gt "$PREV_PLACEMENTS" ] 2>/dev/null; then
-        echo "  Backed up after ${i}s (placements=$PLACEMENTS)"
-        pass "100 MB file backed up"
-        break
-    fi
-    sleep 1
-done
-
-echo "  Waiting 20s for symbol delivery..."
-sleep 20
+T0=$(date +%s)
+if wait_file_restorable 0 "$F100" 300; then
+    pass "100 MB file restorable per owner after $(( $(date +%s) - T0 ))s"
+else
+    fail "100 MB file not restorable per owner after 300s"
+fi
+holder_check "$F100" "100 MB"
 
 echo ""
 echo "=== Post-100MB resource usage ==="
 measure_all
 
-# Check total holder disk usage — should be roughly proportional to data
 TOTAL_HOLDING=0
 for i in $(seq 1 $((NUM_NODES-1))); do
-    H_DIR="$(node_dir "$i")/holdings"
-    H_SIZE=$(du -sk "$H_DIR" 2>/dev/null | cut -f1 || echo "0")
-    TOTAL_HOLDING=$((TOTAL_HOLDING + H_SIZE))
+    H_SIZE=$(du -sk "$(node_dir "$i")/holdings" 2>/dev/null | cut -f1)
+    TOTAL_HOLDING=$((TOTAL_HOLDING + ${H_SIZE:-0}))
 done
-echo "  Total holder disk: $((TOTAL_HOLDING / 1024)) MB across $((NUM_NODES-1)) peers"
+info "total holder disk: $((TOTAL_HOLDING / 1024)) MB across $((NUM_NODES-1)) peers for 150 MB of source"
 
-# ── PHASE 4: RESTORE 100 MB ─────────────────────────────────────
+# ── PHASE 4: LOSE 100 MB LOCALLY -> RESTORE FROM THE NETWORK ────
 echo ""
-echo "=== Phase 4: Restore 100 MB file ==="
-# Alpha: restore writes to <data_dir>/restore/<job_id>/<original_path>.
-# --dest is not yet supported (API returns "dest_not_supported_in_alpha").
-RESTORE_DIR="$(node_dir 0)/restore"
-run_cli 0 restore "$(node_dir 0)/files/big100.bin" 2>&1 | head -5 &
-
-echo "  Waiting for restored file (max 60s) under $RESTORE_DIR ..."
-for i in $(seq 1 60); do
-    RESTORED=$(find "$RESTORE_DIR" -name "big100.bin" -size +1M 2>/dev/null | head -1)
-    if [ -n "$RESTORED" ]; then
-        RESTORED_MD5=$(md5sum "$RESTORED" | cut -d' ' -f1)
-        if [ "$RESTORED_MD5" = "$MD5_100" ]; then
-            pass "100 MB file restored and verified (MD5 match, ${i}s)"
-        else
-            fail "100 MB restore MD5 mismatch: expected $MD5_100 got $RESTORED_MD5"
-        fi
-        break
-    fi
-    sleep 1
-done
-if [ -z "$RESTORED" ]; then
-    fail "100 MB restore timed out"
+echo "=== Phase 4: Delete 100 MB file locally -> restore from the network ==="
+# restore writes to <data_dir>/restore/<job_id>/<original_path>; --dest is not
+# supported in alpha. The owner-delete cooldown (4 weeks) is ~6.7 h at scale 100.
+BLOCK_100=$(file_block_hex 0 "$F100")
+assert_delete_window "$TIME_SCALE"
+rm -f "$F100"
+if ! wait_file_deleted 0 "$F100" 30; then
+    fail "owner did not register the local delete within 30s"
+fi
+SERVED_BEFORE=$(restore_responses_for "$BLOCK_100" $(seq 1 $((NUM_NODES-1))))
+T0=$(date +%s)
+if restore_from_network 0 "$F100" "$HASH_100" 300; then
+    pass "100 MB restore from network in $(( $(date +%s) - T0 ))s: $RESTORE_MSG"
+else
+    fail "100 MB restore from network: $RESTORE_MSG"
+    grep -ai "restore\|fetch" "$(node_log 0)" | tail -10 || true
+fi
+SERVED=$(( $(restore_responses_for "$BLOCK_100" $(seq 1 $((NUM_NODES-1)))) - SERVED_BEFORE ))
+if [ "$SERVED" -ge 1 ]; then
+    pass "holders logged ${SERVED} RestoreResponse(s) for the 100 MB block"
+else
+    fail "no holder logged a RestoreResponse for block ${BLOCK_100:-none}"
 fi
 
 echo ""
@@ -300,20 +339,20 @@ for j in $(seq 1 10); do
 done
 echo "  Created 10 files (10 MB each, 100 MB total)"
 
-echo "  Waiting for all to be backed up (max 180s)..."
-for i in $(seq 1 180); do
-    FILES=$(get_json_field 0 backed_up_files)
-    # We expect 12 files total (big50 + big100 + 10 batch)
-    if [ -n "$FILES" ] && [ "$FILES" -ge 12 ] 2>/dev/null; then
-        echo "  All files backed up after ${i}s (backed_up_files=$FILES)"
-        pass "10 x 10 MB batch backup complete"
-        break
-    fi
+T0=$(date +%s)
+READY_N=0
+for _ in $(seq 1 300); do
+    READY_N=$(api_get 0 /api/files | jq '[.[] | select((.path | test("/batch_[0-9]+\\.bin$")) and .effective_status.kind == "restorable")] | length' 2>/dev/null || echo 0)
+    [ "${READY_N:-0}" -ge 10 ] && break
     sleep 1
 done
-if [ -z "$FILES" ] || [ "$FILES" -lt 12 ] 2>/dev/null; then
-    fail "batch backup: only $FILES/12 files detected"
+if [ "${READY_N:-0}" -ge 10 ]; then
+    pass "10 x 10 MB batch restorable per owner after $(( $(date +%s) - T0 ))s"
+else
+    fail "batch: only ${READY_N:-0}/10 files restorable per owner after 300s"
 fi
+holder_check "$(node_dir 0)/files/batch_1.bin" "batch_1"
+holder_check "$(node_dir 0)/files/batch_10.bin" "batch_10"
 
 echo ""
 echo "=== Final resource usage ==="
@@ -328,4 +367,4 @@ echo "============================================================"
 echo ""
 echo "Logs: $TEST_DIR/node-*/daemon.log"
 
-exit $FAIL
+[ "$FAIL" -eq 0 ]

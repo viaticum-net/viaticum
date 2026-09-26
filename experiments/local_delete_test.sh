@@ -2,33 +2,46 @@
 # Viaticum: owner deletion E2E — multi-holder erasure delete reaches ALL holders.
 # Local processes on one machine (no Docker).
 #
+# Scenario: 5 independent owners, star-connected to node-00, time_scale 100000 (owner
+#   and holder delete cooldowns of 4 weeks each become ~24 s). node-00 backs up a file,
+#   the file is removed from the watch dir, and the delete must reach every holder.
+# Intent: delete-i1, delete-i2 (file pending; proposed ids: delete-i1 = after the owner
+#   deletes a file and the cooldowns expire, every holder drops its symbols, delete-i2 =
+#   the owner's catalog stops referencing the block). AC1..AC3 below.
+# Proves: every holder that stored symbols of the file's block (read from each holder's
+#   own holdings/<block>/ on disk) drops all of them after the owner's delete (H3: not
+#   just one holder); the owner's catalog stops referencing the block (CleanupBlock).
+# Adversarial: none beyond the multi-holder case (H3); a holder offline during the
+#   delete is not exercised (see Cannot close).
+# Cannot close: deletion of a block shared by several files (packs, partial vacuum is
+#   not implemented); a holder offline during the delete (mailbox delivery later);
+#   un-delete inside the cooldown (restore of a deleted file: local_e2e).
+# Steps: 1. backup -> restorable per owner — check: wait_file_restorable
+#        2. >= 2 holders have symbols of the block on disk (precondition) — check:
+#             block_symbols_on per holder
+#        3. rm source -> local_state deleted — check: wait_file_deleted
+#        4. every recorded holder's holdings/<block> empty within 180 s (delete-i1,
+#             AC1/AC3) — check: block_symbols_on per holder
+#        5. no catalog version references the block within 90 s (delete-i2, AC2) —
+#             check: /api/versions
+#
 # WHY THIS TEST EXISTS (intent / acceptance criteria — fixed before the script):
 #   Deletion is a load-bearing product property: when the owner removes a backed-up
-#   file, the data must actually disappear from the network. Until now this path was
-#   only unit-tested (single placement) and never exercised E2E across multiple live
-#   holders. The H3 review finding showed a real bug class here (per-BLOCK dedup meant
-#   only ONE holder of an erasure-coded block ever received the Delete; holders 2..n
-#   kept the data forever). Erasure coding spreads every block across n>=k+2 holders,
-#   so multi-holder is the NORMAL case — this test guards it.
+#   file, the data must actually disappear from the network. The H3 review finding
+#   showed a real bug class here (per-BLOCK dedup meant only ONE holder of an
+#   erasure-coded block ever received the Delete; holders 2..n kept the data forever).
 #
 #   AC1 (H3, the core): after the file is removed from the watch dir, EVERY holder that
-#        stored its symbols deletes them (holding_bytes -> 0 on all of them), not just one.
-#   AC2: the owner cleans up afterwards — placement records for the block reach 0
-#        (CleanupPlacement -> CleanupBlock fired), so no orphan metadata is left behind.
-#   AC3: deletion is HONORED, not merely believed — we assert against actual holder
-#        on-disk state (holding_bytes), never against the owner's own optimistic view.
-#
-# Scenarios:
-#   1. 5 nodes, distinct masters, star-connect to node-00.
-#   2. node-00 backs up a file -> symbols erasure-coded across >=2 holders.
-#   3. Record the full holder set (every node with holding_bytes > 0).
-#   4. Remove the file from node-00's watch dir.
-#   5. Owner cooldown elapses (compressed by --time-scale) -> DeleteMsg via mailbox
-#      -> EVERY holder marks for delete and (after holder cooldown) drops the symbols.
-#   6. Verify ALL holders reach holding_bytes == 0 (AC1) and owner placement_count -> 0 (AC2).
+#        stored its symbols deletes them, not just one. Checked per block on each
+#        holder's disk. (Total holding_bytes is NOT used: holders also store other
+#        owners' SystemState blocks, which are not part of this delete.)
+#   AC2: the owner cleans up afterwards — no version in the catalog references the
+#        deleted block (CleanupPlacement -> CleanupBlock fired).
+#   AC3: deletion is HONORED, not merely believed — AC1 reads holder disks, never the
+#        owner's own optimistic view.
 #
 # Usage:
-#   cargo build --release
+#   ./rbuild.sh      # release binary, built on the server
 #   bash experiments/local_delete_test.sh [num_nodes]
 
 set -euo pipefail
@@ -41,12 +54,11 @@ TIME_SCALE=100000
 TEST_DIR="/tmp/viaticum-delete-$$"
 BINARY="${BINARY:-viaticum}"
 
-PASS=0; FAIL=0; SKIP=0
+PASS=0; FAIL=0
 PIDS=()
 
 pass() { echo "  PASS: $1"; ((PASS++)) || true; }
 fail() { echo "  FAIL: $1"; ((FAIL++)) || true; }
-skip() { echo "  SKIP: $1"; ((SKIP++)) || true; }
 
 cleanup() {
     echo ""
@@ -105,6 +117,9 @@ if ! command -v "$BINARY" &>/dev/null; then
     [ ! -x "$BINARY" ] && echo "ERROR: binary not found" && exit 1
 fi
 
+# shellcheck source=experiments/e2e_lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/e2e_lib.sh"
+
 echo "============================================================"
 echo "  Viaticum: Owner Deletion E2E (multi-holder, H3)"
 echo "  Nodes: ${NUM_NODES}, time_scale: ${TIME_SCALE}"
@@ -152,7 +167,7 @@ done
 
 READY=0
 for i in $(seq 0 $((NUM_NODES-1))); do
-    wait_daemon "$i" && ((READY++)) || echo "    node-$(printf '%02d' "$i") NOT ready"
+    if wait_daemon "$i"; then READY=$((READY + 1)); else echo "    node-$(printf "%02d" "$i") NOT ready"; fi
 done
 echo "  $READY/$NUM_NODES daemons ready"
 
@@ -162,13 +177,11 @@ for i in $(seq 1 $((NUM_NODES-1))); do
     run_cli_q "$i" connect "$ADDR_00" > /dev/null 2>&1
 done
 
-for attempt in $(seq 1 30); do
-    PC=$(get_json_field 0 peer_count)
-    if [ "${PC:-0}" -ge "$((NUM_NODES-1))" ]; then break; fi
-    sleep 1
-done
-PC=$(get_json_field 0 peer_count)
-echo "  node-00 peers: ${PC:-0}"
+if wait_auth_peers 0 $((NUM_NODES-1)) 30; then
+    pass "star connect: $(status_num 0 peer_count_authenticated) authenticated peers"
+else
+    fail "star connect: only $(status_num 0 peer_count_authenticated)/$((NUM_NODES-1)) authenticated peers after 30s"
+fi
 
 # ── PHASE 2: BACKUP + WAIT FOR DELIVERY ─────────────────────────
 echo ""
@@ -178,55 +191,46 @@ TEST_FILE="$(node_dir 0)/files/delete_test.bin"
 echo "  Creating test file (256 KB)..."
 dd if=/dev/urandom of="$TEST_FILE" bs=1024 count=256 2>/dev/null
 
-echo "  Waiting for backup + placement (max 60s)..."
-BACKED_UP=0
-for attempt in $(seq 1 30); do
-    BF=$(get_json_field 0 backed_up_files)
-    PA=$(get_json_field 0 placement_alive)
-    if [ "${BF:-0}" -ge 1 ] && [ "${PA:-0}" -ge 1 ]; then
-        echo "  Backup complete: files=$BF, placements_alive=$PA (${attempt}x2s)"
-        BACKED_UP=1
-        break
-    fi
-    sleep 2
-done
-
-if [ "$BACKED_UP" -eq 0 ]; then
-    fail "backup/placement not complete after 60s"
-    echo "  Last: backed_up_files=${BF:-0}, placement_alive=${PA:-0}"
+if wait_file_restorable 0 "$TEST_FILE" 60; then
+    pass "file backed up and restorable per owner"
+else
+    fail "file not restorable per owner after 60s"
     exit 1
 fi
-pass "file backed up and placed"
+BLOCK=$(file_block_hex 0 "$TEST_FILE")
+echo "  block: $BLOCK"
 
-# Let symbol delivery settle so holding_bytes reflects the final holder set.
-sleep 5
-
-# ── PHASE 3: RECORD THE FULL HOLDER SET ─────────────────────────
+# ── PHASE 3: RECORD THE FULL HOLDER SET (from holder disks) ─────
 echo ""
 echo "=== Phase 3: Record Holder Set ==="
 
-# Every node (except the owner) that holds bytes for node-00. For an erasure-coded
-# block n >= k+2, so we expect >= 2 distinct holders — the multi-holder (H3) case.
-HOLDERS=()
-for i in $(seq 1 $((NUM_NODES-1))); do
-    HB=$(get_json_field "$i" holding_bytes)
-    if [ "${HB:-0}" -gt 0 ]; then
-        HOLDERS+=("$i")
-        echo "  node-$(printf '%02d' "$i") holds ${HB} bytes"
-    fi
+# Placement may still be adding holders right after "restorable"; take the set once
+# it has been stable for 5 consecutive seconds (max 30 s).
+HOLDERS=(); PREV=""; STABLE=0
+for _ in $(seq 1 30); do
+    CUR=""
+    for i in $(seq 1 $((NUM_NODES-1))); do
+        [ "$(block_symbols_on "$i" "$BLOCK")" -gt 0 ] && CUR="$CUR $i"
+    done
+    if [ "$CUR" = "$PREV" ] && [ -n "$CUR" ]; then STABLE=$((STABLE + 1)); else STABLE=0; fi
+    PREV="$CUR"
+    [ "$STABLE" -ge 5 ] && break
+    sleep 1
 done
-
+read -r -a HOLDERS <<< "$PREV"
+for i in "${HOLDERS[@]}"; do
+    echo "  node-$(printf '%02d' "$i") holds $(block_symbols_on "$i" "$BLOCK") symbols of the block"
+done
 NUM_HOLDERS=${#HOLDERS[@]}
-echo "  Total holders: $NUM_HOLDERS"
 
 if [ "$NUM_HOLDERS" -eq 0 ]; then
-    fail "no holders found after backup — cannot test deletion"
+    fail "no holder has symbols of block $BLOCK on disk — cannot test deletion"
     exit 1
 fi
 if [ "$NUM_HOLDERS" -ge 2 ]; then
     pass "multi-holder block confirmed ($NUM_HOLDERS holders) — H3 case exercised"
 else
-    skip "only 1 holder — single-holder delete tested, H3 multi-holder NOT exercised"
+    fail "only 1 holder — the H3 multi-holder case is NOT exercised"
 fi
 
 # ── PHASE 4: DELETE THE FILE ────────────────────────────────────
@@ -235,31 +239,27 @@ echo "=== Phase 4: Delete File from Watch Dir ==="
 
 echo "  Removing $TEST_FILE ..."
 rm -f "$TEST_FILE"
-
-# Give the watcher time to observe the removal (inotify + periodic scan) and the
-# scheduler to start the owner delete cooldown.
-echo "  Waiting for watcher to register the deletion..."
-sleep 5
+if wait_file_deleted 0 "$TEST_FILE" 30; then
+    pass "owner registered the local delete"
+else
+    fail "owner did not register the local delete within 30s"
+fi
 
 # ── PHASE 5: VERIFY EVERY HOLDER DELETES (AC1 / H3) ─────────────
 echo ""
 echo "=== Phase 5: Verify ALL Holders Delete (AC1 / H3) ==="
 
 # Owner cooldown (~24s) -> DeleteMsg via mailbox -> holder marks -> holder cooldown
-# (~24s) -> holder drops symbols. Poll every 3s up to 180s for ALL holders to reach
-# holding_bytes == 0. A bug where only one holder gets the Delete (H3) leaves the
-# others stuck > 0 and this phase FAILS — exactly the regression we are guarding.
+# (~24s) -> holder drops symbols. Poll every 3s up to 180s for ALL holders to have
+# no symbol files of the block left on disk.
 ALL_DELETED=0
 for attempt in $(seq 1 60); do
     STILL_HOLDING=()
     for i in "${HOLDERS[@]}"; do
-        HB=$(get_json_field "$i" holding_bytes)
-        if [ "${HB:-0}" -gt 0 ]; then
-            STILL_HOLDING+=("$i")
-        fi
+        [ "$(block_symbols_on "$i" "$BLOCK")" -gt 0 ] && STILL_HOLDING+=("$i")
     done
     if [ "${#STILL_HOLDING[@]}" -eq 0 ]; then
-        echo "  All $NUM_HOLDERS holders dropped their symbols (${attempt}x3s)"
+        echo "  All $NUM_HOLDERS holders dropped the block's symbols (${attempt}x3s)"
         ALL_DELETED=1
         break
     fi
@@ -270,9 +270,9 @@ for attempt in $(seq 1 60); do
 done
 
 if [ "$ALL_DELETED" -eq 1 ]; then
-    pass "AC1: every holder ($NUM_HOLDERS) deleted the symbols after owner delete"
+    pass "AC1: every holder ($NUM_HOLDERS) deleted the block's symbols after owner delete"
 else
-    fail "AC1/H3: ${#STILL_HOLDING[@]}/$NUM_HOLDERS holders still hold data after 180s (nodes ${STILL_HOLDING[*]})"
+    fail "AC1/H3: ${#STILL_HOLDING[@]}/$NUM_HOLDERS holders still hold the block after 180s (nodes ${STILL_HOLDING[*]})"
     echo "  This is the H3 multi-holder regression signature (delete reaches only some holders)."
 fi
 
@@ -281,12 +281,15 @@ echo ""
 echo "=== Phase 6: Verify Owner Cleanup (AC2) ==="
 
 # After all holders are done, the owner runs CleanupPlacement per holder and
-# CleanupBlock once all placements are cleaned -> placement_count drops to 0.
+# CleanupBlock once all placements are cleaned, pruning the version entry that
+# references the block. (The total placement_count is not used: it also counts the
+# owner's own SystemState blocks.)
 OWNER_CLEAN=0
 for attempt in $(seq 1 30); do
-    PCNT=$(get_json_field 0 placement_count)
-    if [ "${PCNT:-1}" -eq 0 ]; then
-        echo "  Owner placement_count = 0 (${attempt}x3s)"
+    REFS=$(api_get 0 "/api/versions?path=$(urlencode "$TEST_FILE")" \
+        | jq --arg b "$BLOCK" '[.[] | select(.source_block_id_hex == $b)] | length' 2>/dev/null || echo "?")
+    if [ "$REFS" = "0" ]; then
+        echo "  Catalog no longer references the block (${attempt}x3s)"
         OWNER_CLEAN=1
         break
     fi
@@ -294,16 +297,15 @@ for attempt in $(seq 1 30); do
 done
 
 if [ "$OWNER_CLEAN" -eq 1 ]; then
-    pass "AC2: owner cleaned up placements (CleanupBlock fired)"
+    pass "AC2: owner cleaned up the block (CleanupBlock fired)"
 else
-    PCNT=$(get_json_field 0 placement_count)
-    fail "AC2: owner placement_count still ${PCNT:-?} after 90s (CleanupBlock did not fire)"
+    fail "AC2: catalog still references block ${BLOCK:0:16}.. after 90s (refs=${REFS})"
 fi
 
 # ── RESULTS ──────────────────────────────────────────────────────
 echo ""
 echo "============================================================"
-echo "  RESULTS: $PASS passed, $FAIL failed, $SKIP skipped"
+echo "  RESULTS: $PASS passed, $FAIL failed"
 echo "============================================================"
 echo ""
 echo "Logs: $TEST_DIR/node-*/daemon.log"

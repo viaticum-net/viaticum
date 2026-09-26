@@ -1,12 +1,33 @@
 #!/bin/bash
-# Viaticum scale test: 10-20 nodes with node archetypes
-# Tests system behavior under realistic conditions:
-#   - Reliable nodes (always on)
-#   - Unreliable nodes (killed and restarted)
-#   - Freeloading nodes (connected but don't store data)
+# Viaticum scale E2E: 10-20 nodes, several files, two holders crash and restart,
+# every file restored from the network by hash.
+#
+# Scenario: N independent owners (default 10), star-connected to node-00. node-00 backs
+#   up 5 files of 64-320 KB; two other nodes crash (SIGKILL) and are restarted and
+#   reconnected; then node-00 loses all 5 files locally and restores each of them.
+# Intent: restore-i1 (Phase 4, five files), restore-i9 (partial: restore right after
+#   the delete); backup-i1 (file pending; proposed id: a backed-up file has >= k_eff
+#   symbols on holder disks).
+# Proves: all files reach "restorable" with >= k_eff symbols on holder disks; after two
+#   crashes + restarts the network is whole again (authenticated peers) and every file
+#   comes back from holders byte-identical (sha256).
+# Adversarial: SIGKILL of two nodes after placement, then restart with their data dirs.
+# Cannot close: freeloading or unreliable-by-design archetypes (not implemented here,
+#   despite the old header); automatic reconnection (the script reconnects with
+#   `connect`; NET-09 is local_network's job); trust dynamics (printed as INFO);
+#   restore-i3 (honest outcome): the CLI answers exit 0 + "started" even when nothing
+#   was restored, e2e_lib.sh turns that into a FAIL instead of proving the report.
+# Steps: 1. backup 5 files -> each restorable, >= k_eff symbols on holders (backup-i1)
+#             — check: wait_file_restorable, block_symbols_on
+#        2. SIGKILL two nodes, restart, `connect` -> all peers authenticated — check:
+#             wait_auth_peers
+#        3. rm all 5 sources -> each registered deleted — check: assert_delete_window,
+#             wait_file_deleted
+#        4. restore each -> sha256 match, 5/5 (restore-i1, restore-i9) — check:
+#             restore_from_network per file
 #
 # Usage:
-#   cargo build --release
+#   ./rbuild.sh      # release binary, built on the server
 #   bash experiments/local_scale_test.sh [num_nodes]
 
 set -euo pipefail
@@ -17,12 +38,11 @@ TEST_DIR="/tmp/viaticum-scale-$$"
 BINARY="${BINARY:-viaticum}"
 NUM_FILES=5
 
-PASS=0; FAIL=0; SKIP=0
+PASS=0; FAIL=0
 PIDS=()
 
 pass() { echo "  PASS: $1"; ((PASS++)) || true; }
 fail() { echo "  FAIL: $1"; ((FAIL++)) || true; }
-skip() { echo "  SKIP: $1"; ((SKIP++)) || true; }
 
 cleanup() {
     echo ""
@@ -85,6 +105,9 @@ if ! command -v "$BINARY" &>/dev/null; then
     [ ! -x "$BINARY" ] && echo "ERROR: binary not found" && exit 1
 fi
 
+# shellcheck source=experiments/e2e_lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/e2e_lib.sh"
+
 echo "============================================================"
 echo "  Viaticum Scale Test (${NUM_NODES} nodes, ${NUM_FILES} files)"
 echo "============================================================"
@@ -129,7 +152,7 @@ done
 
 READY=0
 for i in $(seq 0 $((NUM_NODES-1))); do
-    wait_daemon "$i" && ((READY++)) || echo "    node-$(printf '%02d' "$i") NOT ready"
+    if wait_daemon "$i"; then READY=$((READY + 1)); else echo "    node-$(printf '%02d' "$i") NOT ready"; fi
 done
 echo "  $READY/$NUM_NODES daemons ready"
 
@@ -141,127 +164,110 @@ for i in $(seq 1 $((NUM_NODES-1))); do
     RESULT=$(run_cli_q "$i" connect "$ADDR_00" 2>&1 || true)
     echo "$RESULT" | grep -qi "connected" && ((OK++)) || true
 done
-sleep 3
-PC=$(get_json_field 0 peer_count)
-echo "  node-00 peers: ${PC:-0}/$((NUM_NODES-1))"
-[ "${PC:-0}" -ge "$((NUM_NODES-1))" ] && pass "all ${PC} peers connected" \
-    || fail "only ${PC:-0}/$((NUM_NODES-1)) peers"
+if wait_auth_peers 0 $((NUM_NODES-1)) 40; then
+    pass "all $(status_num 0 peer_count_authenticated) peers authenticated"
+else
+    fail "only $(status_num 0 peer_count_authenticated)/$((NUM_NODES-1)) peers authenticated after 40s"
+fi
 
 # ── PHASE 2: MULTI-FILE BACKUP ──────────────────────────────────
 echo ""
 echo "=== Phase 2: Multi-file Backup ($NUM_FILES files) ==="
 
-declare -A FILE_MD5
+declare -A FILE_HASH
 for f in $(seq 1 $NUM_FILES); do
     FNAME="file_${f}.bin"
     SIZE=$((RANDOM % 256 + 64))  # 64-320 KB
     dd if=/dev/urandom of="$(node_dir 0)/files/$FNAME" bs=1024 count=$SIZE 2>/dev/null
-    FILE_MD5[$FNAME]=$(md5sum "$(node_dir 0)/files/$FNAME" | awk '{print $1}')
+    FILE_HASH[$FNAME]=$(content_hash "$(node_dir 0)/files/$FNAME")
     echo "  Created $FNAME (${SIZE} KB)"
 done
 
-echo "  Waiting for backup (max 60s)..."
-for attempt in $(seq 1 60); do
-    FILES_N=$(get_json_field 0 backed_up_files)
-    if [ "${FILES_N:-0}" -ge "$NUM_FILES" ]; then
-        echo "  All $NUM_FILES files backed up after ${attempt}s"
-        break
+RESTORABLE=0
+for f in $(seq 1 $NUM_FILES); do
+    P="$(node_dir 0)/files/file_${f}.bin"
+    if wait_file_restorable 0 "$P" 90; then
+        BLK=$(file_block_hex 0 "$P"); TGT=$(file_field 0 "$P" '.effective_status.target // 0'); ON=0
+        for i in $(seq 1 $((NUM_NODES-1))); do ON=$((ON + $(block_symbols_on "$i" "$BLK"))); done
+        if [ "$ON" -ge "${TGT:-1}" ] && [ "${TGT:-0}" -gt 0 ]; then
+            RESTORABLE=$((RESTORABLE + 1))
+        else
+            echo "    file_${f}.bin: ${ON} symbols on holder disks < k_eff ${TGT}"
+        fi
     fi
-    sleep 1
 done
-
-FILES_N=$(get_json_field 0 backed_up_files)
-[ "${FILES_N:-0}" -ge "$NUM_FILES" ] && pass "all $NUM_FILES files backed up" \
-    || fail "only ${FILES_N:-0}/$NUM_FILES files backed up"
+if [ "$RESTORABLE" -eq "$NUM_FILES" ]; then
+    pass "all $NUM_FILES files restorable with >= k_eff symbols on holder disks"
+else
+    fail "only $RESTORABLE/$NUM_FILES files restorable with symbols on holder disks"
+fi
 
 # ── PHASE 3: NODE CRASH + RECOVERY ──────────────────────────────
 echo ""
 echo "=== Phase 3: Node Crash + Recovery ==="
 
-# Kill 2 nodes (simulating crashes)
 KILL_NODES=(1 2)
 for i in "${KILL_NODES[@]}"; do
-    echo "  Killing node-$(printf '%02d' "$i")..."
-    kill "${PIDS[$i]}" 2>/dev/null || true
+    echo "  Crashing node-$(printf '%02d' "$i") (SIGKILL)..."
+    kill -9 "${PIDS[$i]}" 2>/dev/null || true
+    wait "${PIDS[$i]}" 2>/dev/null || true
 done
-sleep 3
 
-# Check node-00 still works
-PC_AFTER=$(get_json_field 0 peer_count)
-echo "  node-00 peers after crash: ${PC_AFTER:-0}"
-
-# Restart killed nodes
 echo "  Restarting crashed nodes..."
 for i in "${KILL_NODES[@]}"; do
     RUST_LOG=info "$BINARY" --data-dir "$(node_dir "$i")" daemon \
         --time-scale "$TIME_SCALE" \
         --watch-dir "$(node_dir "$i")/files" \
-        > "$(node_log "$i")" 2>&1 &
+        >> "$(node_log "$i")" 2>&1 &
     PIDS[$i]=$!
 done
-
-# Wait for restart
-RESTARTED=0
 for i in "${KILL_NODES[@]}"; do
     if wait_daemon "$i"; then
-        # Reconnect
-        run_cli_q "$i" connect "$ADDR_00" > /dev/null 2>&1
-        ((RESTARTED++)) || true
+        run_cli_q "$i" connect "$ADDR_00" > /dev/null
+    else
+        fail "node-$(printf '%02d' "$i") did not restart"
     fi
 done
-sleep 3
-
-PC_RECOVERED=$(get_json_field 0 peer_count)
-echo "  node-00 peers after recovery: ${PC_RECOVERED:-0}"
-[ "${PC_RECOVERED:-0}" -ge "$((NUM_NODES-1))" ] \
-    && pass "all peers recovered after crash (${PC_RECOVERED})" \
-    || pass "peers partially recovered (${PC_RECOVERED:-0}/$((NUM_NODES-1)))"
-
-# ── PHASE 4: SYSTEM HEALTH ──────────────────────────────────────
-echo ""
-echo "=== Phase 4: System Health ==="
-
-# Check holdings across nodes
-TOTAL_HOLDING=0
-for i in $(seq 1 $((NUM_NODES-1))); do
-    HOLDING=$(get_json_field "$i" holding_bytes)
-    [ -n "$HOLDING" ] && TOTAL_HOLDING=$((TOTAL_HOLDING + HOLDING))
-done
-echo "  Total holding across peers: $((TOTAL_HOLDING / 1024)) KB"
-[ "$TOTAL_HOLDING" -gt 0 ] && pass "peers holding data ($((TOTAL_HOLDING / 1024)) KB)" \
-    || fail "no data held by any peer"
-
-# Check trust scores
-AVG_TRUST=$(get_json_field 0 avg_trust)
-echo "  node-00 avg_trust: ${AVG_TRUST:-0}"
-if [ -n "$AVG_TRUST" ] && echo "$AVG_TRUST" | awk '{exit ($1 > 0) ? 0 : 1}'; then
-    pass "trust scores > 0"
+if wait_auth_peers 0 $((NUM_NODES-1)) 40; then
+    pass "all $((NUM_NODES-1)) peers authenticated again after crash + restart"
 else
-    skip "trust scores still 0"
+    fail "only $(status_num 0 peer_count_authenticated)/$((NUM_NODES-1)) peers authenticated 40s after restart"
 fi
 
-# Check repair status
-REPAIR=$(get_json_field 0 repair_needed)
-echo "  Repair needed: ${REPAIR:-0} blocks"
-[ "${REPAIR:-0}" -eq 0 ] && pass "no repair needed" \
-    || skip "repair needed: ${REPAIR} blocks"
+# ── PHASE 4: LOSE EVERY FILE LOCALLY -> RESTORE FROM THE NETWORK ─
+echo ""
+echo "=== Phase 4: Delete all files locally -> restore each from the network ==="
 
-# ── PHASE 5: STATUS SNAPSHOT ────────────────────────────────────
-echo ""
-echo "=== Phase 5: Status Snapshot ==="
-echo "  --- node-00 (owner) ---"
-run_cli_q 0 status 2>/dev/null | head -10
-echo ""
+assert_delete_window "$TIME_SCALE"
+for f in $(seq 1 $NUM_FILES); do rm -f "$(node_dir 0)/files/file_${f}.bin"; done
+for f in $(seq 1 $NUM_FILES); do
+    wait_file_deleted 0 "$(node_dir 0)/files/file_${f}.bin" 30 \
+        || fail "owner did not register the delete of file_${f}.bin"
+done
+RESTORED=0
+for f in $(seq 1 $NUM_FILES); do
+    FNAME="file_${f}.bin"
+    if restore_from_network 0 "$(node_dir 0)/files/$FNAME" "${FILE_HASH[$FNAME]}" 90 > /dev/null; then
+        RESTORED=$((RESTORED + 1))
+    else
+        echo "    $FNAME: $RESTORE_MSG"
+    fi
+done
+if [ "$RESTORED" -eq "$NUM_FILES" ]; then
+    pass "all $NUM_FILES files restored from the network (sha256 match)"
+else
+    fail "only $RESTORED/$NUM_FILES files restored from the network by hash"
+fi
 
-HOLDER_SAMPLE=$((NUM_NODES / 2))
-echo "  --- node-$(printf '%02d' "$HOLDER_SAMPLE") (holder) ---"
-run_cli_q "$HOLDER_SAMPLE" status 2>/dev/null | head -10
+# ── INFO ─────────────────────────────────────────────────────────
 echo ""
+echo "=== Info (not verdicts) ==="
+info "node-00 avg_trust=$(status_num 0 avg_trust) blocks_at_risk=$(status_num 0 blocks_at_risk)"
 
 # ── RESULTS ──────────────────────────────────────────────────────
 echo ""
 echo "============================================================"
-echo "  RESULTS: $PASS passed, $FAIL failed, $SKIP skipped"
+echo "  RESULTS: $PASS passed, $FAIL failed"
 echo "============================================================"
 
 if [ "$FAIL" -gt 0 ]; then

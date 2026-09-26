@@ -1,18 +1,37 @@
 #!/bin/bash
-# Viaticum comprehensive E2E test: backup pipeline, restore, trust, PoS
+# Viaticum E2E: backup -> holders -> edit -> accidental delete -> restore from the network.
 # Local processes on one machine (no Docker).
 #
-# Usage:
-#   cargo build --release
-#   bash experiments/local_e2e_test.sh [num_nodes]
+# Scenario: 3 independent owners on localhost, star-connected to node-00. node-00 backs
+#   up a 128 KB file, edits it (second version), then the user deletes it by accident and
+#   restores it while the owner-delete cooldown (4 weeks = ~40 min at time_scale 1000) runs.
+# Intent: restore-i1 (Phase 4), restore-i9 (partial: restore right after the delete,
+#   not a scaled week later); backup-i1, backup-i2 (file pending; proposed ids:
+#   backup-i1 = a backed-up file has >= k_eff symbols on holder disks, backup-i2 = an
+#   edit becomes a new catalog version).
+# Proves: the watcher -> encode -> place pipeline puts >= k_eff symbols of the block on
+#   holder disks (read from the holders' own holdings/, not the owner's view); an edit
+#   produces a second catalog version; with the local source gone, the latest version
+#   comes back from holders byte-identical (sha256), and the holders log serving it.
+# Adversarial: the source is deleted while the daemon runs (watcher Remove event), so
+#   restore cannot rebuild from the local file and must go to the network.
+# Cannot close: PoS, trust and SelfPointer delivery (timing-dependent at this scale;
+#   covered by local_pos_repair / local_dr); restore of an older version (the old block
+#   is orphaned by design, P2); restore after the delete cooldown expired (the network
+#   is then allowed to drop the data); restore on another machine (local_dr);
+#   restore-i3 (honest outcome): the CLI answers exit 0 + "started" even when nothing
+#   was restored, e2e_lib.sh turns that into a FAIL instead of proving the report.
+# Steps: 1. backup 128 KB -> restorable, >= k_eff symbols on holders (backup-i1) —
+#             check: wait_file_restorable + block_symbols_on per holder
+#        2. edit -> >= 2 catalog versions (backup-i2) — check: /api/versions length
+#        3. rm source -> local_state deleted (restore-i9) — check: assert_delete_window,
+#             wait_file_deleted
+#        4. restore -> sha256 == pre-delete hash; holders log RestoreResponse
+#             (restore-i1) — check: restore_from_network, restore_responses_for
 #
-# Tests:
-#   1. Star connect (all nodes connect to node-00)
-#   2. File backup (watcher detects file → erasure code → place symbols)
-#   3. File restore (fetch symbols from peers → decode → verify)
-#   4. Trust scores (initial trust > 0 after PoS)
-#   5. Multiple file versions
-#   6. System state push (δ.1)
+# Usage:
+#   ./rbuild.sh      # release binary, built on the server
+#   bash experiments/local_e2e_test.sh [num_nodes]
 
 set -euo pipefail
 
@@ -21,12 +40,11 @@ TIME_SCALE=1000
 TEST_DIR="/tmp/viaticum-e2e-$$"
 BINARY="${BINARY:-viaticum}"
 
-PASS=0; FAIL=0; SKIP=0
+PASS=0; FAIL=0
 PIDS=()
 
 pass() { echo "  PASS: $1"; ((PASS++)) || true; }
 fail() { echo "  FAIL: $1"; ((FAIL++)) || true; }
-skip() { echo "  SKIP: $1"; ((SKIP++)) || true; }
 
 cleanup() {
     echo ""
@@ -83,20 +101,17 @@ get_addr() {
     echo "$RAW_ADDR" | sed 's|/ip4/0.0.0.0/|/ip4/127.0.0.1/|'
 }
 
-get_json_field() {
-    # $1 = node idx, $2 = field name
-    local RAW=$(run_cli_q "$1" status --json 2>/dev/null || true)
-    echo "$RAW" | grep -oE "\"$2\":\s*[0-9.]+" | grep -oE '[0-9.]+$' || true
-}
-
 # Verify binary exists
 if ! command -v "$BINARY" &>/dev/null; then
     BINARY="./target/release/viaticum"
     if [ ! -x "$BINARY" ]; then
-        echo "ERROR: viaticum binary not found. Run: cargo build --release"
+        echo "ERROR: viaticum binary not found. Run: ./rbuild.sh"
         exit 1
     fi
 fi
+
+# shellcheck source=experiments/e2e_lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/e2e_lib.sh"
 
 echo "============================================================"
 echo "  Viaticum E2E Test (${NUM_NODES} nodes)"
@@ -121,9 +136,7 @@ for i in $(seq 0 $((NUM_NODES-1))); do
     mkdir -p "$(node_dir "$i")"
     "$BINARY" --data-dir "$(node_dir "$i")" init > /dev/null 2>&1
 done
-echo "  ${NUM_NODES} nodes initialized (distinct master keys)."
 
-# Write config for all nodes.
 for i in $(seq 0 $((NUM_NODES-1))); do
     cat > "$(node_dir "$i")/config.toml" << 'CFGEOF'
 [web_api]
@@ -136,9 +149,6 @@ k_factor = 0.001
 CFGEOF
 done
 
-# Config already written during init (above). No additional config setup needed.
-
-# Start all daemons
 echo "  Starting daemons (time_scale=${TIME_SCALE})..."
 for i in $(seq 0 $((NUM_NODES-1))); do
     mkdir -p "$(node_dir "$i")/files"
@@ -149,7 +159,6 @@ for i in $(seq 0 $((NUM_NODES-1))); do
     PIDS+=($!)
 done
 
-# Wait for all daemons
 READY=0
 for i in $(seq 0 $((NUM_NODES-1))); do
     if wait_daemon "$i"; then
@@ -160,233 +169,121 @@ for i in $(seq 0 $((NUM_NODES-1))); do
 done
 echo "  $READY/$NUM_NODES daemons ready"
 
-# Get node-00 addr and connect all
 ADDR_00=$(get_addr 0)
 echo "  node-00 addr: $ADDR_00"
-
-echo "  Connecting all to node-00..."
-CONNECT_OK=0
 for i in $(seq 1 $((NUM_NODES-1))); do
-    RESULT=$(run_cli_q "$i" connect "$ADDR_00" 2>&1 || true)
-    if echo "$RESULT" | grep -qi "connected"; then
-        ((CONNECT_OK++)) || true
-    fi
+    run_cli_q "$i" connect "$ADDR_00" > /dev/null
 done
-# Wait for peer authentication (libp2p cert exchange takes a few seconds).
-# Retry for up to 30s.
-CONNECT_PASS=0
-for attempt in $(seq 1 30); do
-    PC=$(get_json_field 0 peer_count)
-    if [ "${PC:-0}" -ge "$((NUM_NODES-1))" ]; then
-        CONNECT_PASS=1
-        break
-    fi
-    sleep 1
-done
-PC=$(get_json_field 0 peer_count)
-echo "  node-00 peers: ${PC:-0}/$((NUM_NODES-1))"
-[ "$CONNECT_PASS" -eq 1 ] \
-    && pass "star connect: ${PC} peers" \
-    || fail "star connect: only ${PC:-0} peers"
+# Authenticated = cert exchange done, i.e. eligible for placement/restore traffic.
+# (peer_count is DB rows and includes peers that never finished the handshake.)
+if wait_auth_peers 0 $((NUM_NODES-1)) 30; then
+    pass "star connect: $(status_num 0 peer_count_authenticated) authenticated peers"
+else
+    fail "star connect: only $(status_num 0 peer_count_authenticated)/$((NUM_NODES-1)) authenticated peers after 30s"
+fi
 
-# ── PHASE 2: FILE BACKUP ────────────────────────────────────────
+# ── PHASE 2: BACKUP, CHECKED ON HOLDER DISKS ────────────────────
 echo ""
-echo "=== Phase 2: File Backup ==="
+echo "=== Phase 2: Backup (checked on holder disks) ==="
 
-# Create a test file
-echo "  Creating 128 KB test file..."
-dd if=/dev/urandom of="$(node_dir 0)/files/backup_test.bin" bs=1024 count=128 2>/dev/null
-ORIG_MD5=$(md5sum "$(node_dir 0)/files/backup_test.bin" | awk '{print $1}')
-echo "  MD5: $ORIG_MD5"
+FILE="$(node_dir 0)/files/backup_test.bin"
+dd if=/dev/urandom of="$FILE" bs=1024 count=128 2>/dev/null
+HASH_V1=$(content_hash "$FILE")
+echo "  Created 128 KB file, sha256 $HASH_V1"
 
-# Wait for backup to detect and process (with time_scale=1000, scan interval is very short)
-echo "  Waiting for backup pipeline (max 30s)..."
-BACKED_UP=0
-for attempt in $(seq 1 30); do
-    FILES_N=$(get_json_field 0 backed_up_files)
-    if [ "${FILES_N:-0}" -ge 1 ]; then
-        echo "  File detected and backed up after ${attempt}s"
-        BACKED_UP=1
-        break
-    fi
-    sleep 1
-done
-
-if [ "$BACKED_UP" -eq 1 ]; then
-    pass "file backup detected"
+# Owner belief first: >= k_eff symbols on Alive placements.
+if wait_file_restorable 0 "$FILE" 90; then
+    TARGET=$(file_field 0 "$FILE" '.effective_status.target')
+    pass "owner reports v1 restorable (k_eff=${TARGET})"
 else
-    fail "file not backed up after 30s"
-    echo "  node-00 log (last 20 lines):"
-    tail -20 "$(node_log 0)"
+    fail "v1 not restorable per owner after 90s"
+    TARGET=0
 fi
 
-# Wait for placements (symbols sent to peers)
-# Wave 11b: worker runs on 1s tick (time_scale=1000); authentication needs ~10s.
-echo "  Waiting for symbol placement (max 60s)..."
-PLACED=0
-for attempt in $(seq 1 60); do
-    # Check table_stats for symbol_placements > 0
-    PLACEMENTS=$(run_cli_q 0 status --json 2>/dev/null \
-        | grep -oE '"symbol_placements":\s*[0-9]+' | grep -oE '[0-9]+$')
-    if [ "${PLACEMENTS:-0}" -ge 1 ]; then
-        echo "  Symbols placed: ${PLACEMENTS} (after ${attempt}s)"
-        PLACED=1
-        break
-    fi
-    sleep 1
-done
-
-if [ "$PLACED" -eq 1 ]; then
-    pass "symbols placed on peers (${PLACEMENTS})"
-else
-    fail "no symbol placements after 30s"
-fi
-
-# ── PHASE 3: FILE RESTORE ───────────────────────────────────────
-echo ""
-echo "=== Phase 3: File Restore ==="
-
-if [ "$PLACED" -eq 0 ]; then
-    skip "restore skipped (no placements)"
-else
-    # Wait a bit for symbols to be delivered
-    sleep 5
-
-    RESTORE_PATH="$(node_dir 0)/files/backup_test.bin"
-    RESTORE_DIR="$(node_dir 0)"
-    echo "  Restoring $RESTORE_PATH (to staging dir)..."
-
-    set +e
-    RESTORE_OUTPUT=$(run_cli 0 restore "$RESTORE_PATH" 2>&1)
-    RESTORE_EXIT=$?
-    set -e
-
-    echo "$RESTORE_OUTPUT"
-
-    if [ $RESTORE_EXIT -eq 0 ]; then
-        # Restore writes to staging directory under data-dir/restore/
-        RESTORE_STAGING=$(find "$RESTORE_DIR/restore" -name "backup_test.bin" -type f 2>/dev/null | head -1)
-        echo "  Waiting for restored file in staging dir (max 30s)..."
-        RESTORE_OK=0
-        for attempt in $(seq 1 30); do
-            RESTORE_STAGING=$(find "$RESTORE_DIR/restore" -name "backup_test.bin" -type f 2>/dev/null | head -1)
-            if [ -n "$RESTORE_STAGING" ] && [ -f "$RESTORE_STAGING" ]; then
-                RESTORED_MD5=$(md5sum "$RESTORE_STAGING" | awk '{print $1}')
-                if [ "$ORIG_MD5" = "$RESTORED_MD5" ]; then
-                    pass "file restored and verified (MD5 match, ${attempt}s)"
-                    RESTORE_OK=1
-                else
-                    fail "restored file MD5 mismatch: expected=$ORIG_MD5 got=$RESTORED_MD5"
-                    RESTORE_OK=1
-                fi
-                break
-            fi
-            sleep 1
-        done
-        if [ "$RESTORE_OK" -eq 0 ]; then
-            fail "restored file not found after 30s"
-            echo "  Restore log:"
-            grep -i "restore" "$(node_log 0)" | tail -10
-        fi
-    else
-        fail "restore command failed (exit=$RESTORE_EXIT)"
-    fi
-fi
-
-# ── PHASE 4: TRUST + PoS ────────────────────────────────────────
-echo ""
-echo "=== Phase 4: Trust Scores ==="
-
-# Check trust scores from status
-AVG_TRUST=$(get_json_field 0 avg_trust)
-echo "  node-00 avg_trust: ${AVG_TRUST:-0}"
-
-if [ -n "$AVG_TRUST" ]; then
-    # Trust should be > 0 after initial interactions
-    if echo "$AVG_TRUST" | awk '{exit ($1 > 0) ? 0 : 1}'; then
-        pass "trust scores > 0 (avg=${AVG_TRUST})"
-    else
-        skip "trust scores still 0 (interactions may not have completed)"
-    fi
-else
-    skip "trust data not available"
-fi
-
-# Check PoS totals
-POS_CH=$(get_json_field 0 pos_total_challenges)
-POS_PA=$(get_json_field 0 pos_total_passes)
-echo "  PoS: challenges=${POS_CH:-0}, passes=${POS_PA:-0}"
-if [ "${POS_PA:-0}" -ge 1 ]; then
-    pass "PoS challenges recorded (challenges=${POS_CH}, passes=${POS_PA})"
-else
-    skip "no PoS passes yet (may need more time at time_scale=${TIME_SCALE})"
-fi
-
-# ── PHASE 5: FILE VERSIONS ──────────────────────────────────────
-echo ""
-echo "=== Phase 5: File Versions ==="
-
-# Modify the file and wait for new version
-echo "  Modifying backup_test.bin..."
-dd if=/dev/urandom of="$(node_dir 0)/files/backup_test.bin" bs=1024 count=64 2>/dev/null
-
-echo "  Waiting for version update (max 20s)..."
-VERSIONS_FOUND=0
-for attempt in $(seq 1 20); do
-    # Check versions via CLI
-    VERSIONS_OUTPUT=$(run_cli_q 0 versions "backup_test.bin" 2>&1)
-    VERSION_COUNT=$(echo "$VERSIONS_OUTPUT" | grep -c "version" || true)
-    if [ "$VERSION_COUNT" -ge 2 ]; then
-        echo "  Found $VERSION_COUNT versions after ${attempt}s"
-        VERSIONS_FOUND=1
-        break
-    fi
-    sleep 1
-done
-
-if [ "$VERSIONS_FOUND" -eq 1 ]; then
-    pass "multiple file versions detected ($VERSION_COUNT)"
-else
-    skip "second version not detected yet (may need more time)"
-fi
-
-# ── PHASE 6: MAILBOX DELIVERY (SelfPointer / deferred messages) ──
-echo ""
-echo "=== Phase 6: Mailbox Delivery ==="
-
-# The δ.1 system_state_blobs table was retired (A2 cut-over). Deferred delivery —
-# including the DR SelfPointer and PoS challenges — now rides the mailbox bus.
-# Proxy: a peer acting as a postman holds ≥1 mailbox entry for some target.
-MAILBOX_FOUND=0
+# Holder reality: count the block's symbol files on every other node's disk.
+BLOCK_V1=$(file_block_hex 0 "$FILE")
+ON_DISK=0; HOLDERS=""
 for i in $(seq 1 $((NUM_NODES-1))); do
-    ENTRIES=$(run_cli_q "$i" status --json 2>/dev/null \
-        | grep -oE '"mailbox_entries":\s*[0-9]+' | grep -oE '[0-9]+$')
-    if [ "${ENTRIES:-0}" -ge 1 ]; then
-        echo "  node-$(printf '%02d' "$i") holds ${ENTRIES} mailbox entry(ies) as postman"
-        MAILBOX_FOUND=1
-    fi
+    n=$(block_symbols_on "$i" "$BLOCK_V1")
+    [ "$n" -gt 0 ] && HOLDERS="$HOLDERS node-$(printf '%02d' "$i")=$n"
+    ON_DISK=$((ON_DISK + n))
 done
-
-if [ "$MAILBOX_FOUND" -eq 1 ]; then
-    pass "mailbox entries stored on postman peers"
+echo "  block ${BLOCK_V1:0:16}.. symbols on holder disks:${HOLDERS:- none}"
+if [ -n "$BLOCK_V1" ] && [ "$TARGET" -gt 0 ] && [ "$ON_DISK" -ge "$TARGET" ]; then
+    pass "holders store ${ON_DISK} symbols >= k_eff ${TARGET} on disk"
 else
-    echo "  No mailbox entries found yet (self-pointer push fires 60s after daemon start)"
-    skip "mailbox delivery not yet fired"
+    fail "holders store ${ON_DISK} symbols on disk, need k_eff=${TARGET:-?} (block=${BLOCK_V1:-none})"
 fi
 
-# ── PHASE 7: STATUS SUMMARY ─────────────────────────────────────
+# ── PHASE 3: EDIT -> SECOND VERSION ─────────────────────────────
 echo ""
-echo "=== Node Status Summary ==="
-for i in $(seq 0 $((NUM_NODES-1))); do
-    echo "  --- node-$(printf '%02d' "$i") ---"
-    run_cli_q "$i" status 2>/dev/null | head -10
-    echo ""
+echo "=== Phase 3: Edit -> second version ==="
+
+dd if=/dev/urandom of="$FILE" bs=1024 count=64 2>/dev/null
+HASH_V2=$(content_hash "$FILE")
+echo "  Rewrote file (64 KB), sha256 $HASH_V2"
+
+VCOUNT=0
+for _ in $(seq 1 60); do
+    VCOUNT=$(api_get 0 "/api/versions?path=$(urlencode "$FILE")" | jq 'length' 2>/dev/null || echo 0)
+    [ "${VCOUNT:-0}" -ge 2 ] && break
+    sleep 1
+done
+if [ "${VCOUNT:-0}" -ge 2 ]; then
+    pass "catalog has ${VCOUNT} versions after the edit"
+else
+    fail "catalog has ${VCOUNT:-0} version(s) 60s after the edit, expected 2"
+fi
+
+if wait_file_restorable 0 "$FILE" 90; then
+    pass "owner reports v2 restorable"
+else
+    fail "v2 not restorable per owner after 90s"
+fi
+
+# ── PHASE 4: ACCIDENTAL DELETE -> RESTORE FROM THE NETWORK ──────
+echo ""
+echo "=== Phase 4: Accidental delete -> restore from the network ==="
+
+# The owner rebuilds blocks from its own source files when they exist
+# (restore/mod.rs: rebuild-from-source first). With the file gone that path fails
+# and restore must fetch symbols from holders. Deleting while the daemon runs is
+# the realistic case; the network keeps the data for the owner-delete cooldown.
+assert_delete_window "$TIME_SCALE"
+rm -f "$FILE"
+if wait_file_deleted 0 "$FILE" 30; then
+    pass "owner registered the local delete"
+else
+    fail "owner did not register the local delete within 30s"
+fi
+
+BLOCK_V2=$(file_block_hex 0 "$FILE")
+SERVED_BEFORE=$(restore_responses_for "$BLOCK_V2" $(seq 1 $((NUM_NODES-1))))
+if restore_from_network 0 "$FILE" "$HASH_V2" 120; then
+    pass "restore from network: $RESTORE_MSG"
+else
+    fail "restore from network: $RESTORE_MSG"
+fi
+SERVED=$(( $(restore_responses_for "$BLOCK_V2" $(seq 1 $((NUM_NODES-1)))) - SERVED_BEFORE ))
+if [ -n "$BLOCK_V2" ] && [ "$SERVED" -ge 1 ]; then
+    pass "holders logged ${SERVED} RestoreResponse(s) for block ${BLOCK_V2:0:16}.."
+else
+    fail "no holder logged a RestoreResponse for block ${BLOCK_V2:-none}"
+fi
+
+# ── INFO: timing-dependent signals (not verdicts) ───────────────
+echo ""
+echo "=== Info (not verdicts: timing-dependent at time_scale=${TIME_SCALE}) ==="
+info "node-00 avg_trust=$(status_num 0 avg_trust)"
+info "node-00 PoS challenges=$(status_num 0 pos_total_challenges) passes=$(status_num 0 pos_total_passes)"
+for i in $(seq 1 $((NUM_NODES-1))); do
+    info "node-$(printf '%02d' "$i") mailbox_entries=$(api_get "$i" /api/status | jq -r '.table_stats.mailbox_entries // 0' 2>/dev/null || echo 0)"
 done
 
 # ── RESULTS ──────────────────────────────────────────────────────
 echo ""
 echo "============================================================"
-echo "  RESULTS: $PASS passed, $FAIL failed, $SKIP skipped"
+echo "  RESULTS: $PASS passed, $FAIL failed"
 echo "============================================================"
 
 if [ "$FAIL" -gt 0 ]; then

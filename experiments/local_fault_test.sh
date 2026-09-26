@@ -1,16 +1,41 @@
 #!/bin/bash
-# Viaticum fault injection E2E test: K-of-N resilience
-# Tests E2E-06 (holder death during backup) and E2E-07 (restore with dead holders).
+# Viaticum fault injection E2E: restore from the network with a dead holder (K-of-N).
+# Local processes on one machine (no Docker). E2E-07.
+#
+# Scenario: 7 independent owners, star-connected to node-00. node-00 backs up a 4 MB
+#   file; the holder with the most symbols of its block is killed (SIGKILL), then the
+#   owner's local copy is deleted and the file is restored from the surviving holders.
+#   Then every survivor loses part of its symbol files on disk so that no single holder
+#   has k_eff symbols, and the file is restored again.
+# Intent: restore-i1 (Phase 4), restore-i2 (Phases 4-5: the "some holders offline,
+#   restore still passes" half only), restore-i9 (partial: restore right after the
+#   delete).
+# Proves: with one holder dead and the source gone, the block decodes from the
+#   survivors' symbols and the restored file is byte-identical (sha256); surviving
+#   holders log serving it; restore does not hang on the dead holder beyond the deadline;
+#   with partial loss on every survivor, restore combines symbols from >= 2 holders.
+# Adversarial: SIGKILL of the biggest holder before restore; silent partial disk loss
+#   on every survivor (symbol files removed behind the holder daemon's back).
+# Cannot close: holder death DURING backup (E2E-06; the kill happens after placement);
+#   more than one simultaneous loss; the repair that should follow (local_pos_repair /
+#   local_unified_pipeline); partition vs. crash (both look like SIGKILL here); the
+#   restore-i2 "clear refusal" half (too few holders alive -> a named failure) and
+#   restore-i3 (honest outcome): the CLI answers exit 0 + "started" even when nothing
+#   was restored, e2e_lib.sh turns that into a FAIL instead of proving the report.
+# Steps: 1. backup 4 MB -> restorable per owner — check: wait_file_restorable
+#        2. SIGKILL the biggest holder; survivors still hold >= k_eff (precondition)
+#             — check: block_symbols_on sum
+#        3. rm source -> restore -> sha256 match, survivors log RestoreResponse
+#             (restore-i1, restore-i2, restore-i9) — check: assert_delete_window,
+#             restore_from_network, restore_responses_for
+#        4. wipe survivor symbols: observed max per survivor < k_eff <= union
+#             (precondition) — check: MAX_LEFT from block_symbols_on after the wipe
+#        5. restore again -> sha256 match, >= 2 survivors served (restore-i2) — check:
+#             restore_from_network, per-survivor restore_responses_for delta
 #
 # Usage:
-#   cargo build --release
+#   ./rbuild.sh      # release binary, built on the server
 #   bash experiments/local_fault_test.sh
-#
-# Tests:
-#   1. Setup 5 nodes, star topology
-#   2. Backup file, wait for placements
-#   3. Kill 2 holders, verify restore still works (K-of-N)
-#   4. Verify restored file matches original (MD5)
 
 set -euo pipefail
 
@@ -19,12 +44,11 @@ TIME_SCALE=1000
 TEST_DIR="/tmp/viaticum-fault-$$"
 BINARY="${BINARY:-viaticum}"
 
-PASS=0; FAIL=0; SKIP=0
+PASS=0; FAIL=0
 PIDS=()
 
 pass() { echo "  PASS: $1"; ((PASS++)) || true; }
 fail() { echo "  FAIL: $1"; ((FAIL++)) || true; }
-skip() { echo "  SKIP: $1"; ((SKIP++)) || true; }
 
 cleanup() {
     echo ""
@@ -90,10 +114,13 @@ get_json_field() {
 if ! command -v "$BINARY" &>/dev/null; then
     BINARY="./target/release/viaticum"
     if [ ! -x "$BINARY" ]; then
-        echo "ERROR: viaticum binary not found. Run: cargo build --release"
+        echo "ERROR: viaticum binary not found. Run: ./rbuild.sh"
         exit 1
     fi
 fi
+
+# shellcheck source=experiments/e2e_lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/e2e_lib.sh"
 
 echo "============================================================"
 echo "  Viaticum Fault Injection Test (${NUM_NODES} nodes)"
@@ -159,136 +186,153 @@ echo "  Connecting all to node-00..."
 for i in $(seq 1 $((NUM_NODES-1))); do
     run_cli_q "$i" connect "$ADDR_00" 2>&1 > /dev/null || true
 done
-# Wait for peer authentication.
-CONNECT_PASS=0
-for attempt in $(seq 1 30); do
-    PC=$(get_json_field 0 peer_count)
-    if [ "${PC:-0}" -ge "$((NUM_NODES-1))" ]; then CONNECT_PASS=1; break; fi
-    sleep 1
-done
-PC=$(get_json_field 0 peer_count)
-echo "  node-00 peers: ${PC:-0}/$((NUM_NODES-1))"
-[ "$CONNECT_PASS" -eq 1 ] \
-    && pass "star connect: ${PC} peers" \
-    || fail "star connect: only ${PC:-0} peers"
+if wait_auth_peers 0 $((NUM_NODES-1)) 30; then
+    pass "star connect: $(status_num 0 peer_count_authenticated) authenticated peers"
+else
+    fail "star connect: only $(status_num 0 peer_count_authenticated)/$((NUM_NODES-1)) authenticated peers after 30s"
+fi
 
 # ── PHASE 2: BACKUP ─────────────────────────────────────────────
 echo ""
 echo "=== Phase 2: File Backup ==="
 
-# Create test file (256 KB for good erasure spread)
-echo "  Creating 256 KB test file..."
-dd if=/dev/urandom of="$(node_dir 0)/files/fault_test.bin" bs=1024 count=4096 2>/dev/null
-ORIG_MD5=$(md5sum "$(node_dir 0)/files/fault_test.bin" | awk '{print $1}')
-echo "  MD5: $ORIG_MD5"
+FILE="$(node_dir 0)/files/fault_test.bin"
+dd if=/dev/urandom of="$FILE" bs=1024 count=4096 2>/dev/null
+ORIG_HASH=$(content_hash "$FILE")
+echo "  Created 4 MB file, sha256 $ORIG_HASH"
 
-# Wait for backup + placements
-echo "  Waiting for backup + symbol placement (max 45s)..."
-PLACED=0
-for attempt in $(seq 1 45); do
-    FILES_N=$(get_json_field 0 backed_up_files)
-    PLACEMENTS=$(get_json_field 0 symbol_placements)
-    if [ "${FILES_N:-0}" -ge 1 ] && [ "${PLACEMENTS:-0}" -ge 2 ]; then
-        echo "  Backed up (files=${FILES_N}, placements=${PLACEMENTS}) after ${attempt}s"
-        PLACED=1
-        break
-    fi
-    sleep 1
-done
-
-if [ "$PLACED" -eq 1 ]; then
-    pass "file backed up with ${PLACEMENTS} placements"
+TARGET=0
+if wait_file_restorable 0 "$FILE" 90; then
+    TARGET=$(file_field 0 "$FILE" '.effective_status.target')
+    pass "owner reports the file restorable (k_eff=${TARGET})"
 else
-    fail "backup/placement not complete after 45s"
-    echo "  node-00 log (last 20 lines):"
-    tail -20 "$(node_log 0)"
+    fail "file not restorable per owner after 90s"
 fi
 
-# Wait for symbols to be actually transferred to holders
-echo "  Waiting for symbol transfer (10s)..."
-sleep 10
+BLOCK=$(file_block_hex 0 "$FILE")
+declare -A SYMS
+KILL_IDX=""; KILL_N=0; TOTAL=0
+for i in $(seq 1 $((NUM_NODES-1))); do
+    SYMS[$i]=$(block_symbols_on "$i" "$BLOCK")
+    TOTAL=$((TOTAL + SYMS[$i]))
+    [ "${SYMS[$i]}" -gt 0 ] && echo "  node-$(printf '%02d' "$i") holds ${SYMS[$i]} symbols of block ${BLOCK:0:16}.."
+    if [ "${SYMS[$i]}" -gt "$KILL_N" ]; then KILL_IDX=$i; KILL_N=${SYMS[$i]}; fi
+done
 
-# ── PHASE 3: FAULT INJECTION — KILL ONE HOLDER ────────────────────
+# ── PHASE 3: FAULT INJECTION — KILL THE BIGGEST HOLDER ──────────
 echo ""
 echo "=== Phase 3: Fault Injection ==="
 
-# Find a holder node dynamically (not node-00, which is the owner).
-# Kill only ONE holder so the other can still serve restore.
-KILL_IDX=""
-for i in $(seq 1 $((NUM_NODES-1))); do
-    HB=$(get_json_field "$i" holding_bytes)
-    if [ "${HB:-0}" -gt 0 ]; then
-        KILL_IDX=$i
-        echo "  node-$(printf '%02d' "$i") holds ${HB} bytes — will kill"
-        break
-    fi
-done
-
 if [ -z "$KILL_IDX" ]; then
-    # Fallback: kill nodes 3 and 4 (old behavior).
-    KILL_IDX=3
-    echo "  No holder found dynamically, killing node-03 as fallback"
+    fail "no holder has symbols of block ${BLOCK:-none} on disk; nothing to kill"
+    exit 1
 fi
-
-echo "  Killing node-$(printf '%02d' $KILL_IDX) (PID ${PIDS[$KILL_IDX]})..."
-kill "${PIDS[$KILL_IDX]}" 2>/dev/null || true
-sleep 2
+SURVIVING=$((TOTAL - KILL_N))
+echo "  Killing node-$(printf '%02d' "$KILL_IDX") (${KILL_N} symbols); ${SURVIVING} symbols stay on survivors, k_eff=${TARGET}"
+kill -9 "${PIDS[$KILL_IDX]}" 2>/dev/null || true
+wait "${PIDS[$KILL_IDX]}" 2>/dev/null || true
 if kill -0 "${PIDS[$KILL_IDX]}" 2>/dev/null; then
-    kill -9 "${PIDS[$KILL_IDX]}" 2>/dev/null || true
+    fail "node-$(printf '%02d' "$KILL_IDX") still alive after SIGKILL"
+fi
+# Placement may give each holder a full k_eff set (replica mode). Then any one
+# survivor decodes alone and combining symbols across holders is NOT exercised.
+MAX_SURVIVOR=0
+for i in "${!SYMS[@]}"; do
+    [ "$i" != "$KILL_IDX" ] && [ "${SYMS[$i]}" -gt "$MAX_SURVIVOR" ] && MAX_SURVIVOR=${SYMS[$i]}
+done
+if [ "$TARGET" -gt 0 ] && [ "$MAX_SURVIVOR" -ge "$TARGET" ]; then
+    info "a single survivor holds ${MAX_SURVIVOR} >= k_eff symbols: restore can succeed from one replica; cross-holder decode not exercised"
+fi
+# The scenario only means something if the survivors can still decode.
+if [ "$SURVIVING" -ge "$TARGET" ] && [ "$TARGET" -gt 0 ]; then
+    pass "precondition: survivors hold ${SURVIVING} >= k_eff ${TARGET} symbols"
+else
+    fail "precondition: survivors hold ${SURVIVING} < k_eff ${TARGET} symbols; placement left no redundancy for one loss"
 fi
 
-echo "  Node $KILL_IDX killed. $((NUM_NODES-1)) nodes remain."
-pass "holder killed (node $KILL_IDX)"
-
-# ── PHASE 4: RESTORE WITH DEAD HOLDERS ──────────────────────────
+# ── PHASE 4: RESTORE WITH A DEAD HOLDER (E2E-07) ────────────────
 echo ""
-echo "=== Phase 4: Restore with Dead Holder (E2E-07) ==="
+echo "=== Phase 4: Delete local copy -> restore from survivors (E2E-07) ==="
 
-if [ "$PLACED" -eq 0 ]; then
-    skip "restore skipped (no placements)"
+assert_delete_window "$TIME_SCALE"
+rm -f "$FILE"
+if ! wait_file_deleted 0 "$FILE" 30; then
+    fail "owner did not register the local delete within 30s"
+fi
+
+SURVIVORS=()
+for i in $(seq 1 $((NUM_NODES-1))); do [ "$i" != "$KILL_IDX" ] && SURVIVORS+=("$i"); done
+SERVED_BEFORE=$(restore_responses_for "$BLOCK" "${SURVIVORS[@]}")
+T0=$(date +%s)
+if restore_from_network 0 "$FILE" "$ORIG_HASH" 180; then
+    pass "E2E-07: restored with node-$(printf '%02d' "$KILL_IDX") dead in $(( $(date +%s) - T0 ))s: $RESTORE_MSG"
 else
-    RESTORE_PATH="$(node_dir 0)/files/fault_test.bin"
-    RESTORE_STAGING_ROOT="$(node_dir 0)/restore"
-    echo "  Restoring $RESTORE_PATH with 1 holder dead (to staging dir)..."
+    fail "E2E-07: $RESTORE_MSG"
+    echo "  node-00 restore log:"
+    grep -ai "restore\|fetch" "$(node_log 0)" | tail -10 || true
+fi
+SERVED=$(( $(restore_responses_for "$BLOCK" "${SURVIVORS[@]}") - SERVED_BEFORE ))
+if [ "$SERVED" -ge 1 ]; then
+    pass "surviving holders logged ${SERVED} RestoreResponse(s)"
+else
+    fail "no surviving holder logged a RestoreResponse for block ${BLOCK:-none}"
+fi
 
-    set +e
-    RESTORE_OUTPUT=$(run_cli 0 restore "$RESTORE_PATH" 2>&1)
-    RESTORE_EXIT=$?
-    set -e
+# ── PHASE 5: PARTIAL LOSS ON EVERY SURVIVOR -> CROSS-HOLDER DECODE ──
+echo ""
+echo "=== Phase 5: Partial symbol loss on every survivor -> cross-holder decode ==="
 
-    if [ $RESTORE_EXIT -eq 0 ]; then
-        echo "  Waiting for restored file in staging dir (max 30s)..."
-        RESTORE_OK=0
-        for attempt in $(seq 1 30); do
-            RESTORED_FILE=$(find "$RESTORE_STAGING_ROOT" -name "fault_test.bin" -type f 2>/dev/null | head -1)
-            if [ -n "$RESTORED_FILE" ] && [ -f "$RESTORED_FILE" ]; then
-                RESTORED_MD5=$(md5sum "$RESTORED_FILE" | awk '{print $1}')
-                if [ "$ORIG_MD5" = "$RESTORED_MD5" ]; then
-                    pass "E2E-07: file restored with dead holders (MD5 match, ${attempt}s)"
-                    RESTORE_OK=1
-                else
-                    fail "E2E-07: restored file MD5 mismatch: expected=$ORIG_MD5 got=$RESTORED_MD5"
-                    RESTORE_OK=1
-                fi
-                break
-            fi
-            sleep 1
-        done
-        if [ "$RESTORE_OK" -eq 0 ]; then
-            fail "E2E-07: restored file not found after 30s"
-            echo "  Restore log:"
-            grep -i "restore" "$(node_log 0)" | tail -10
-        fi
-    else
-        fail "E2E-07: restore command failed (exit=$RESTORE_EXIT)"
-        echo "$RESTORE_OUTPUT"
-    fi
+# Each holder keeps its own distinct ESI range, often a full k_eff set, so Phase 4
+# may have decoded from one replica. Here every survivor loses part of its symbol
+# files on disk (partial disk loss the holder daemon does not notice) so that NO
+# single holder has k_eff symbols but the survivors together still do. Restore must
+# then combine symbols from several holders.
+KEEP=$(( (TARGET * 2 + 4) / 5 ))   # ~40% of k_eff per survivor
+[ "$KEEP" -ge "$TARGET" ] && KEEP=$((TARGET - 1))
+UNION=0
+for i in "${SURVIVORS[@]}"; do
+    d="$(node_dir "$i")/holdings/$BLOCK"
+    [ -d "$d" ] || continue
+    find "$d" -maxdepth 1 -type f -name '*.bin' | sort -V | tail -n +$((KEEP + 1)) | xargs -r rm -f
+done
+# The precondition is checked on what the disks actually hold after the wipe,
+# not on the intended cap KEEP: a survivor that still has k_eff symbols would
+# let restore decode from one replica.
+MAX_LEFT=0
+for i in "${SURVIVORS[@]}"; do
+    left=$(block_symbols_on "$i" "$BLOCK")
+    UNION=$((UNION + left))
+    [ "$left" -gt "$MAX_LEFT" ] && MAX_LEFT=$left
+    echo "  node-$(printf '%02d' "$i") keeps ${left} symbols"
+done
+if [ "$TARGET" -gt 0 ] && [ "$UNION" -ge "$TARGET" ] && [ "$MAX_LEFT" -lt "$TARGET" ]; then
+    pass "precondition: max per survivor ${MAX_LEFT} < k_eff=${TARGET}, survivors together hold ${UNION}"
+else
+    fail "precondition: max per survivor ${MAX_LEFT} (want < k_eff=${TARGET}), survivors together hold ${UNION} (want >= ${TARGET})"
+fi
+
+declare -A SERVED_B
+for i in "${SURVIVORS[@]}"; do SERVED_B[$i]=$(restore_responses_for "$BLOCK" "$i"); done
+if restore_from_network 0 "$FILE" "$ORIG_HASH" 180; then
+    pass "cross-holder restore: $RESTORE_MSG"
+else
+    fail "cross-holder restore: $RESTORE_MSG"
+    grep -ai "restore\|fetch\|insufficient" "$(node_log 0)" | tail -10 || true
+fi
+CONTRIB=0
+for i in "${SURVIVORS[@]}"; do
+    [ $(( $(restore_responses_for "$BLOCK" "$i") - SERVED_B[$i] )) -ge 1 ] && CONTRIB=$((CONTRIB + 1))
+done
+if [ "$CONTRIB" -ge 2 ]; then
+    pass "${CONTRIB} survivors served symbols for the cross-holder restore"
+else
+    fail "only ${CONTRIB} survivor(s) served symbols; cross-holder decode not exercised"
 fi
 
 # ── RESULTS ──────────────────────────────────────────────────────
 echo ""
 echo "============================================================"
-echo "  RESULTS: $PASS passed, $FAIL failed, $SKIP skipped"
+echo "  RESULTS: $PASS passed, $FAIL failed"
 echo "============================================================"
 
 if [ "$FAIL" -gt 0 ]; then
