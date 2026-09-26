@@ -500,7 +500,6 @@ async fn dispatch_restore(
     let request = RestoreRequest {
         path: path.clone(),
         version_selector,
-        device_id: state.device_id,
         job_id,
     };
 

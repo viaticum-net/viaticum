@@ -1,5 +1,6 @@
 use clap::Parser;
 use viaticum::cli::{Cli, Command};
+use viaticum::daemon::handle::shutdown::{SHUTDOWN_DRAIN, ShutdownSignals};
 use viaticum::daemon::handle::{DaemonConfig, DaemonHandle};
 use viaticum_core::types::hex_encode;
 
@@ -39,20 +40,39 @@ async fn main() -> anyhow::Result<()> {
                 watch_dirs: watch_dir.clone(),
             };
 
-            let handle = DaemonHandle::start(cfg).await?;
+            // Stop signals are registered BEFORE start (network-i6): a SIGTERM
+            // while the daemon is still starting (e.g. waiting for the DB lock)
+            // aborts the start cleanly instead of killing the process.
+            let mut signals = ShutdownSignals::install()?;
+            let handle = tokio::select! {
+                started = DaemonHandle::start(cfg) => started?,
+                sig = signals.recv() => {
+                    // Dropping the start future drops everything it opened; the
+                    // tasks it already spawned are cancelled with the runtime.
+                    tracing::info!("received {sig} during startup, aborting start");
+                    tracing::info!("shutdown complete");
+                    return Ok(());
+                }
+            };
             let cancel = handle.cancel_token();
 
             tokio::select! {
-                r = tokio::signal::ctrl_c() => {
-                    r?;
-                    tracing::info!("received Ctrl-C, shutting down...");
+                sig = signals.recv() => {
+                    tracing::info!("received {sig}, shutting down...");
                 }
                 _ = cancel.cancelled() => {
                     tracing::info!("internal restart triggered, shutting down...");
                 }
             }
             handle.stop();
-            handle.wait().await?;
+            let outcome = tokio::select! {
+                outcome = handle.wait_with_deadline(SHUTDOWN_DRAIN) => outcome,
+                sig = signals.recv() => {
+                    tracing::error!(signal = sig, "second signal, exiting immediately");
+                    std::process::exit(1);
+                }
+            };
+            outcome.report()?;
         }
         Command::Init {
             mnemonic,

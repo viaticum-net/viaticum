@@ -4,6 +4,8 @@
 // RepairAgent, SwarmHandle, Processor, Watcher, Scheduler, the mailbox poll/sweep
 // tasks, and CliServer.
 
+mod redial;
+pub mod shutdown;
 #[cfg(test)]
 mod tests;
 
@@ -35,6 +37,8 @@ use crate::daemon::restore::{
 };
 use crate::daemon::scheduler::{PendingChallenges, Scheduler, SchedulerConfig};
 use crate::daemon::watcher::{WatcherCommand, WatcherConfig};
+
+use shutdown::{NamedTask, ShutdownOutcome};
 
 // ─── Public config ────────────────────────────────────────────────────────────
 
@@ -110,10 +114,11 @@ pub struct DaemonState {
 
 /// Owns all subsystem task handles and the cancellation token.
 ///
-/// Call `stop()` to signal shutdown; await `wait()` to join all tasks.
+/// Call `stop()` to signal shutdown; await `wait_with_deadline()` to join all
+/// tasks (see `shutdown` for the whole stop path).
 pub struct DaemonHandle {
     cancel: CancellationToken,
-    tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    tasks: Vec<NamedTask>,
 }
 
 impl DaemonHandle {
@@ -501,8 +506,6 @@ impl DaemonHandle {
             RestoreConfig {
                 epoch_key: epoch_key_bytes,
                 parallel_holders: 5,
-                identity: identity_pub,
-                device_id,
                 swarm: swarm_handle_arc.clone(),
                 staging_root: staging_root.clone(),
                 data_dir: cfg.data_dir.clone(),
@@ -632,10 +635,13 @@ impl DaemonHandle {
         // ── 14.5. WorkPipeline channel created earlier (above BackupCoordinator). ──
 
         // ── 15. Spawn subsystem tasks ─────────────────────────────────────────
-        let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+        let mut tasks: Vec<NamedTask> = Vec::new();
 
-        tasks.push(tokio::spawn(backup.run(dirty_rx, backup_event_rx)));
-        tasks.push(tokio::spawn(restore.run(restore_rx)));
+        tasks.push((
+            "backup",
+            tokio::spawn(backup.run(dirty_rx, backup_event_rx)),
+        ));
+        tasks.push(("restore", tokio::spawn(restore.run(restore_rx))));
 
         // Wave 11b: RepairAgent::run() replaced by WorkPipeline worker + periodic reliability_scan.
         // RepairTrigger channel (repair_rx) is forwarded to work_event_tx to wake the worker.
@@ -645,7 +651,7 @@ impl DaemonHandle {
         {
             let work_event_tx_relay = work_event_tx.clone();
             let cancel_relay = cancel.clone();
-            tasks.push(tokio::spawn(async move {
+            tasks.push(("repair_relay", tokio::spawn(async move {
                 let mut repair_rx = repair_rx;
                 loop {
                     tokio::select! {
@@ -664,14 +670,14 @@ impl DaemonHandle {
                     }
                 }
                 Ok(())
-            }));
+            })));
         }
 
         // Periodic reliability scan (keeps cached fields consistent as a safety net).
         {
             let repair_for_scan = crate::daemon::repair::RepairAgent::new(db.clone());
             let cancel_scan = cancel.clone();
-            tasks.push(tokio::spawn(async move {
+            tasks.push(("reliability_scan", tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(
                     tokio::time::Duration::from_secs(reliability_scan_interval_secs),
                 );
@@ -687,7 +693,7 @@ impl DaemonHandle {
                         }
                     }
                 }
-            }));
+            })));
         }
 
         // ── 9.2. Spawn staging cleanup checker (warn + evict stale) ──
@@ -697,7 +703,7 @@ impl DaemonHandle {
             let cancel_for_warn = cancel.clone();
             let ttl =
                 std::time::Duration::from_secs(crate::daemon::restore::cleanup::STAGING_TTL_SECS);
-            tasks.push(tokio::spawn(async move {
+            tasks.push(("staging_cleanup", tokio::spawn(async move {
                 // Check immediately at startup: evict stale dirs, then warn if still over.
                 tokio::task::block_in_place(|| {
                     let _ = crate::daemon::restore::cleanup::evict_stale_stagings(&staging_root_for_warn, ttl);
@@ -718,7 +724,7 @@ impl DaemonHandle {
                     }
                 }
                 Ok(())
-            }));
+            })));
         }
         // ── 9.25. EWMA availability decay task (daily) ────────────────────────
         {
@@ -732,122 +738,61 @@ impl DaemonHandle {
             // batch demanded 24h of real elapsed → avail_ewma never decayed under
             // acceleration. At time_scale=1 this is exactly AVAIL_DECAY_TICK_SECS.
             let avail_tick_secs = scaled_avail_decay_tick_secs(AVAIL_DECAY_TICK_SECS, time_scale);
-            tasks.push(tokio::spawn(async move {
-                run_avail_decay_task(avail_db, avail_cancel, AVAIL_EWMA_ALPHA, avail_tick_secs)
-                    .await;
-                Ok(())
-            }));
+            tasks.push((
+                "avail_decay",
+                tokio::spawn(async move {
+                    run_avail_decay_task(avail_db, avail_cancel, AVAIL_EWMA_ALPHA, avail_tick_secs)
+                        .await;
+                    Ok(())
+                }),
+            ));
         }
 
-        // ── 9.3. Peer auto-dial: bootstrap from PeerRecord on startup,
-        //         periodic re-dial of known peers we are not currently connected to.
-        //         Without this, every daemon restart leaves the swarm isolated:
-        //         libp2p doesn't dial saved peers on its own, and PeerRecord rows
-        //         are useless until something issues a dial. Identify-driven persist
-        //         (processor::on_peer_identified) keeps `addrs` fresh on every
-        //         identify Received, so this loop always sees the latest endpoints.
+        // ── 9.3. Peer auto-dial (network-i2): dial known peers at start and then
+        //         periodically, so a restart / DR rejoins the network without a
+        //         manual `connect`. See redial/mod.rs.
         if let Some(swarm_for_redial) = state.swarm_handle.clone() {
-            let db_for_redial = db.clone();
-            let cancel_for_redial = cancel.clone();
             // 5 min real time, scaled (30 s on time_scale=10); floor 30 s so we
             // don't re-dial-storm a single offline peer.
             let redial_interval = std::time::Duration::from_secs((300 / time_scale).max(30));
-            tasks.push(tokio::spawn(async move {
-                use libp2p::{Multiaddr, multiaddr::Protocol};
-                use std::str::FromStr;
-
-                async fn redial_known_peers(
-                    db: &Db,
-                    swarm: &crate::daemon::network::swarm::SwarmHandle,
-                ) {
-                    // peer_sets returns DeviceIds: (connected_devices, auth_devices).
-                    // A device is "connected" only after cert exchange, which
-                    // implies a live transport — exactly what we want to skip
-                    // re-dialing. (Pre-cert connections are transient enough that
-                    // re-dialing them is harmless.)
-                    let connected_devices: std::collections::HashSet<_> =
-                        match swarm.peer_sets().await {
-                            Ok((conn, _auth)) => conn.into_iter().collect(),
-                            Err(_) => return,
-                        };
-                    let peers = match db.list_all_peers() {
-                        Ok(p) => p,
-                        Err(_) => return,
-                    };
-                    let mut dialed = 0u32;
-                    let mut skipped_already = 0u32;
-                    for record in &peers {
-                        if connected_devices.contains(&record.device_id) {
-                            skipped_already += 1;
-                            continue;
-                        }
-                        for addr_str in &record.addrs {
-                            let addr = match Multiaddr::from_str(addr_str) {
-                                Ok(a) => a,
-                                Err(_) => continue,
-                            };
-                            let peer_id = addr.iter().find_map(|p| match p {
-                                Protocol::P2p(pid) => Some(pid),
-                                _ => None,
-                            });
-                            let peer_id = match peer_id {
-                                Some(p) => p,
-                                None => continue,
-                            };
-                            if let Err(e) = swarm.dial(peer_id, addr).await {
-                                tracing::debug!(peer = %peer_id, err = %e,
-                                    "auto-dial failed (will retry next tick)");
-                            } else {
-                                dialed += 1;
-                            }
-                        }
-                    }
-                    if dialed > 0 || skipped_already > 0 {
-                        tracing::info!(
-                            dialed,
-                            already_connected = skipped_already,
-                            known_peers = peers.len(),
-                            "auto-dial pass"
-                        );
-                    }
-                }
-
-                // Initial bootstrap: dial everything we know about as soon as we
-                // come up. This is what makes restart actually re-establish links.
-                redial_known_peers(&db_for_redial, &swarm_for_redial).await;
-
-                let mut ticker = tokio::time::interval(redial_interval);
-                ticker.tick().await; // skip the immediate tick
-                loop {
-                    tokio::select! {
-                        _ = ticker.tick() => {
-                            redial_known_peers(&db_for_redial, &swarm_for_redial).await;
-                        }
-                        _ = cancel_for_redial.cancelled() => break,
-                    }
-                }
-                Ok(())
-            }));
+            let db_for_redial = db.clone();
+            let cancel_for_redial = cancel.clone();
+            tasks.push((
+                "redial",
+                tokio::spawn(async move {
+                    redial::run_redial_loop(
+                        db_for_redial,
+                        swarm_for_redial,
+                        redial_interval,
+                        cancel_for_redial,
+                    )
+                    .await;
+                    Ok(())
+                }),
+            ));
         }
 
         // ── Step E.5: Background rollup refresh task (every 5 min) ────────────
         if let Some(admin) = state.watch_admin.as_ref() {
             let admin_for_refresh = Arc::clone(admin);
             let cancel_refresh = cancel.clone();
-            tasks.push(tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
-                ticker.tick().await; // skip immediate tick (done in WatchAdmin::new)
-                loop {
-                    tokio::select! {
-                        _ = cancel_refresh.cancelled() => break Ok(()),
-                        _ = ticker.tick() => {
-                            if let Err(e) = admin_for_refresh.recompute_all_rollups() {
-                                tracing::warn!(error = %e, "rollup refresh failed");
+            tasks.push((
+                "rollup_refresh",
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+                    ticker.tick().await; // skip immediate tick (done in WatchAdmin::new)
+                    loop {
+                        tokio::select! {
+                            _ = cancel_refresh.cancelled() => break Ok(()),
+                            _ = ticker.tick() => {
+                                if let Err(e) = admin_for_refresh.recompute_all_rollups() {
+                                    tracing::warn!(error = %e, "rollup refresh failed");
+                                }
                             }
                         }
                     }
-                }
-            }));
+                }),
+            ));
         }
 
         // ── Web API server (optional) ─────────────────────────────────────────
@@ -881,7 +826,7 @@ impl DaemonHandle {
                 auth,
             )
             .await?;
-            tasks.push(web_handle);
+            tasks.push(("web_api", web_handle));
         }
 
         // ── Phase 7.2: spawn Processor ────────────────────────────────────────
@@ -969,15 +914,21 @@ impl DaemonHandle {
                     cluster_state.clone(),
                     work_event_rx,
                 );
-                tasks.push(tokio::spawn(async move { worker.run().await }));
+                tasks.push((
+                    "work_pipeline",
+                    tokio::spawn(async move { worker.run().await }),
+                ));
             }
 
             let cancel_processor = cancel.clone();
-            tasks.push(tokio::spawn(async move {
-                processor
-                    .run(swarm_event_rx_for_processor, cancel_processor)
-                    .await
-            }));
+            tasks.push((
+                "processor",
+                tokio::spawn(async move {
+                    processor
+                        .run(swarm_event_rx_for_processor, cancel_processor)
+                        .await
+                }),
+            ));
 
             // ── Cluster periodic sync ──────────────────────────────────────────
             {
@@ -986,26 +937,29 @@ impl DaemonHandle {
                 let cs_swarm = swarm_handle_arc.clone();
                 let cs_interval = (300 / time_scale).max(10);
                 let cancel_cs = cancel.clone();
-                tasks.push(tokio::spawn(async move {
-                    // Only run if swarm is available; otherwise skip (no libp2p cluster sync).
-                    if let Some(swarm) = cs_swarm {
-                        if let Err(e) = crate::daemon::cluster_sync::run_periodic_sync(
-                            cs_sync,
-                            cs_state,
-                            swarm,
-                            device_id,
-                            cs_interval,
-                            cancel_cs,
-                        )
-                        .await
-                        {
-                            tracing::error!(error = %e, "cluster periodic sync failed");
+                tasks.push((
+                    "cluster_sync",
+                    tokio::spawn(async move {
+                        // Only run if swarm is available; otherwise skip (no libp2p cluster sync).
+                        if let Some(swarm) = cs_swarm {
+                            if let Err(e) = crate::daemon::cluster_sync::run_periodic_sync(
+                                cs_sync,
+                                cs_state,
+                                swarm,
+                                device_id,
+                                cs_interval,
+                                cancel_cs,
+                            )
+                            .await
+                            {
+                                tracing::error!(error = %e, "cluster periodic sync failed");
+                            }
+                        } else {
+                            tracing::warn!("swarm unavailable — cluster periodic sync not started");
                         }
-                    } else {
-                        tracing::warn!("swarm unavailable — cluster periodic sync not started");
-                    }
-                    Ok(())
-                }));
+                        Ok(())
+                    }),
+                ));
             }
         } else {
             tracing::warn!("cluster state unavailable — Processor not started");
@@ -1037,16 +991,19 @@ impl DaemonHandle {
             };
             let dirty_tx_watcher = dirty_tx.clone();
             let cancel_watcher = cancel.clone();
-            tasks.push(tokio::spawn(async move {
-                crate::daemon::watcher::start_watcher(
-                    watcher_config,
-                    dirty_tx_watcher,
-                    watcher_cmd_rx,
-                    cancel_watcher,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("watcher error: {e}"))
-            }));
+            tasks.push((
+                "watcher",
+                tokio::spawn(async move {
+                    crate::daemon::watcher::start_watcher(
+                        watcher_config,
+                        dirty_tx_watcher,
+                        watcher_cmd_rx,
+                        cancel_watcher,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("watcher error: {e}"))
+                }),
+            ));
         }
         // ── Phase 6.5: Scheduler + Mailbox poll (T-6) ────────────────────────
         // Pass the same PendingChallenges Arc created for Processor above.
@@ -1082,9 +1039,10 @@ impl DaemonHandle {
             cfg.data_dir.clone(),
         );
         let cancel_scheduler = cancel.clone();
-        tasks.push(tokio::spawn(async move {
-            scheduler.run(pos_response_rx, cancel_scheduler).await
-        }));
+        tasks.push((
+            "scheduler",
+            tokio::spawn(async move { scheduler.run(pos_response_rx, cancel_scheduler).await }),
+        ));
 
         // ── T-8: Shared current_pointer handle ───────────────────────────────
         // Shared between run_mailbox_poll (W-2: restart-recovery) and run_periodic_push
@@ -1135,23 +1093,26 @@ impl DaemonHandle {
             let poll_identity = identity_pub;
             let poll_current_pointer = std::sync::Arc::clone(&current_pointer);
             let poll_cancel = cancel.clone();
-            tasks.push(tokio::spawn(async move {
-                run_mailbox_poll(
-                    poll_db,
-                    poll_router,
-                    poll_pos_tx,
-                    std::sync::Arc::new(pos_handler),
-                    std::sync::Arc::new(drop_handler),
-                    std::sync::Arc::new(delete_handler),
-                    std::sync::Arc::new(revocation_handler),
-                    poll_identity,
-                    poll_current_pointer,
-                    time_scale,
-                    poll_cancel,
-                )
-                .await;
-                Ok(())
-            }));
+            tasks.push((
+                "mailbox_poll",
+                tokio::spawn(async move {
+                    run_mailbox_poll(
+                        poll_db,
+                        poll_router,
+                        poll_pos_tx,
+                        std::sync::Arc::new(pos_handler),
+                        std::sync::Arc::new(drop_handler),
+                        std::sync::Arc::new(delete_handler),
+                        std::sync::Arc::new(revocation_handler),
+                        poll_identity,
+                        poll_current_pointer,
+                        time_scale,
+                        poll_cancel,
+                    )
+                    .await;
+                    Ok(())
+                }),
+            ));
         }
 
         // ── T-11: Mailbox TTL sweep + membership-based self-cleanup ──────────
@@ -1197,33 +1158,42 @@ impl DaemonHandle {
             // (a) TTL sweep. Cadence scaled by time_scale (same as scheduler / poll).
             let sweep_db = db.clone();
             let sweep_cancel = cancel.clone();
-            tasks.push(tokio::spawn(async move {
-                run_mailbox_ttl_sweep(sweep_db, time_scale, sweep_cancel).await;
-                Ok(())
-            }));
+            tasks.push((
+                "mailbox_ttl_sweep",
+                tokio::spawn(async move {
+                    run_mailbox_ttl_sweep(sweep_db, time_scale, sweep_cancel).await;
+                    Ok(())
+                }),
+            ));
 
             // (b) Membership-based self-cleanup. Cadence scaled by time_scale.
             let cleanup_db = db.clone();
             let cleanup_cancel = cancel.clone();
-            tasks.push(tokio::spawn(async move {
-                run_mailbox_self_cleanup(
-                    cleanup_db,
-                    my_peer_id_for_cleanup,
-                    time_scale,
-                    cleanup_cancel,
-                )
-                .await;
-                Ok(())
-            }));
+            tasks.push((
+                "mailbox_self_cleanup",
+                tokio::spawn(async move {
+                    run_mailbox_self_cleanup(
+                        cleanup_db,
+                        my_peer_id_for_cleanup,
+                        time_scale,
+                        cleanup_cancel,
+                    )
+                    .await;
+                    Ok(())
+                }),
+            ));
         }
 
         // ── Metrics pusher (optional) ──────────────────────────────────────
         if let Some(state_m) = state_for_metrics {
             let metrics_cfg = app_config.metrics.clone();
             let cancel_m = cancel.clone();
-            tasks.push(tokio::spawn(async move {
-                crate::daemon::metrics::run(metrics_cfg, state_m, cancel_m).await
-            }));
+            tasks.push((
+                "metrics",
+                tokio::spawn(async move {
+                    crate::daemon::metrics::run(metrics_cfg, state_m, cancel_m).await
+                }),
+            ));
         }
 
         // ── System state periodic push (T-8) ────────────────────────────────
@@ -1241,30 +1211,35 @@ impl DaemonHandle {
             let ss_my_master_pub = identity_pub;
             let ss_current_pointer = std::sync::Arc::clone(&current_pointer);
             let cancel_ss = cancel.clone();
-            tasks.push(tokio::spawn(async move {
-                if let Some(swarm) = ss_swarm {
-                    if let Err(e) = crate::daemon::system_state::run_periodic_push(
-                        ss_db,
-                        swarm,
-                        ss_seed,
-                        ss_master_key,
-                        ss_data_dir,
-                        ss_interval,
-                        time_scale,
-                        cancel_ss,
-                        ss_mailbox_router,
-                        ss_my_master_pub,
-                        ss_current_pointer,
-                    )
-                    .await
-                    {
-                        tracing::error!(error = %e, "system_state periodic push failed");
+            tasks.push((
+                "system_state_push",
+                tokio::spawn(async move {
+                    if let Some(swarm) = ss_swarm {
+                        if let Err(e) = crate::daemon::system_state::run_periodic_push(
+                            ss_db,
+                            swarm,
+                            ss_seed,
+                            ss_master_key,
+                            ss_data_dir,
+                            ss_interval,
+                            time_scale,
+                            cancel_ss,
+                            ss_mailbox_router,
+                            ss_my_master_pub,
+                            ss_current_pointer,
+                        )
+                        .await
+                        {
+                            tracing::error!(error = %e, "system_state periodic push failed");
+                        }
+                    } else {
+                        tracing::warn!(
+                            "swarm unavailable — system_state periodic push not started"
+                        );
                     }
-                } else {
-                    tracing::warn!("swarm unavailable — system_state periodic push not started");
-                }
-                Ok(())
-            }));
+                    Ok(())
+                }),
+            ));
         }
 
         // ── Holder cleanup task ────────────────────────────────────────────
@@ -1277,23 +1252,26 @@ impl DaemonHandle {
             let cleanup_master_key = master_key.clone();
             let cleanup_interval = (3600 / time_scale).max(1);
             let pressure_interval = (3600 / time_scale).max(60);
-            tasks.push(tokio::spawn(async move {
-                crate::daemon::holder_cleanup::run(
-                    cleanup_db,
-                    cleanup_holdings,
-                    cleanup_router,
-                    soft_quota_bytes,
-                    hard_quota_bytes,
-                    cleanup_data_dir,
-                    disk_reserve_bytes,
-                    cleanup_interval,
-                    pressure_interval,
-                    time_scale,
-                    cleanup_master_key,
-                    cleanup_cancel,
-                )
-                .await
-            }));
+            tasks.push((
+                "holder_cleanup",
+                tokio::spawn(async move {
+                    crate::daemon::holder_cleanup::run(
+                        cleanup_db,
+                        cleanup_holdings,
+                        cleanup_router,
+                        soft_quota_bytes,
+                        hard_quota_bytes,
+                        cleanup_data_dir,
+                        disk_reserve_bytes,
+                        cleanup_interval,
+                        pressure_interval,
+                        time_scale,
+                        cleanup_master_key,
+                        cleanup_cancel,
+                    )
+                    .await
+                }),
+            ));
         }
 
         // ── Holdings integrity scan task ───────────────────────────────────
@@ -1307,19 +1285,22 @@ impl DaemonHandle {
             let integrity_master_key = master_key.clone();
             let integrity_interval =
                 viaticum_core::constants::DEFAULT_HOLDINGS_INTEGRITY_INTERVAL_SECS;
-            tasks.push(tokio::spawn(async move {
-                crate::daemon::holdings_integrity::run(
-                    integrity_db,
-                    integrity_holdings,
-                    integrity_router,
-                    identity_pub,
-                    integrity_interval,
-                    time_scale,
-                    integrity_master_key,
-                    integrity_cancel,
-                )
-                .await
-            }));
+            tasks.push((
+                "holdings_integrity",
+                tokio::spawn(async move {
+                    crate::daemon::holdings_integrity::run(
+                        integrity_db,
+                        integrity_holdings,
+                        integrity_router,
+                        identity_pub,
+                        integrity_interval,
+                        time_scale,
+                        integrity_master_key,
+                        integrity_cancel,
+                    )
+                    .await
+                }),
+            ));
         }
 
         // Keep channel senders alive so receivers don't immediately close.
@@ -1350,14 +1331,13 @@ impl DaemonHandle {
         self.cancel.cancel();
     }
 
-    /// Wait for all subsystem tasks to complete.
+    /// Wait for all subsystem tasks to finish, at most `deadline`.
     ///
-    /// Returns the first error encountered, or Ok(()) if all tasks exit cleanly.
-    pub async fn wait(self) -> anyhow::Result<()> {
-        for task in self.tasks {
-            task.await??;
-        }
-        Ok(())
+    /// Call after `stop()`. Tasks still running at the deadline are reported
+    /// as abandoned (not aborted here: they are cancelled when the runtime is
+    /// dropped after `main` returns). See `shutdown::ShutdownOutcome::report`.
+    pub async fn wait_with_deadline(self, deadline: std::time::Duration) -> ShutdownOutcome {
+        shutdown::wait_tasks_with_deadline(self.tasks, deadline).await
     }
 }
 

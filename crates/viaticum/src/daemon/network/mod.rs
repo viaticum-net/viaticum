@@ -16,6 +16,8 @@ pub mod addr;
 mod no_port_reuse;
 
 #[cfg(test)]
+mod swarm_addr_tests;
+#[cfg(test)]
 mod swarm_kad_tests;
 #[cfg(test)]
 mod swarm_nat_tests;

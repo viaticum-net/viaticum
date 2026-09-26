@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use libp2p::identity::ed25519;
 use libp2p::kad::QueryId;
+use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport, ResponseChannel};
 use libp2p::swarm::SwarmEvent;
 use libp2p::swarm::dial_opts::DialOpts;
@@ -281,6 +282,14 @@ pub enum ProtocolEvent {
         identity_pub: IdentityPub,
         device_cert: DeviceCertificate,
         x25519_pub: Option<[u8; 32]>,
+        /// Addresses we know for this peer at the moment of authentication:
+        /// the address we dialed it on (dialer side) ∪ its identify listen
+        /// addrs (if identify already arrived). Normalized by
+        /// [`normalize_peer_addrs`]: each ends in exactly one `/p2p/<peer_id>`.
+        /// Carried here so the PeerRecord gets its addresses in the same write
+        /// that creates it (network-i2) — a separate `PeerIdentified` can be
+        /// processed before the record exists and would be lost.
+        listen_addrs: Vec<Multiaddr>,
     },
     /// Authenticated peer sent an inbound protocol request.
     InboundRequest {
@@ -303,6 +312,10 @@ pub enum ProtocolEvent {
     /// Only emitted once cert exchange completed — before that we don't have a
     /// DeviceId to attach the addrs to. If identify arrives first, addrs are
     /// stashed in the swarm and re-emitted as part of `PeerAuthenticated.listen_addrs`.
+    ///
+    /// `listen_addrs` = identify addrs ∪ the address we dialed this peer on
+    /// (network-i4: a working outbound address is not displaced by the peer's
+    /// private LAN addrs), normalized like `PeerAuthenticated.listen_addrs`.
     PeerIdentified {
         device_id: DeviceId,
         listen_addrs: Vec<Multiaddr>,
@@ -323,9 +336,10 @@ enum SwarmCommand {
         message: Box<Message>,
         reply: oneshot::Sender<Result<Message, SwarmError>>,
     },
+    /// One dial attempt for `peer_id` over all `addrs` (libp2p tries them in turn).
     Dial {
         peer_id: PeerId,
-        addr: Multiaddr,
+        addrs: Vec<Multiaddr>,
     },
     ListenAddrs {
         reply: oneshot::Sender<Vec<Multiaddr>>,
@@ -333,9 +347,7 @@ enum SwarmCommand {
     /// Snapshot of swarm peer-set: connected_count vs authenticated_count.
     /// Connected = libp2p has a live transport-level link (post-Noise+identify).
     /// Authenticated = our cert exchange has succeeded (heavy messages allowed).
-    PeerCounts {
-        reply: oneshot::Sender<(u32, u32)>,
-    },
+    PeerCounts { reply: oneshot::Sender<(u32, u32)> },
     /// Snapshot of which DeviceIds are currently authenticated and which are
     /// only connected (post-Noise but cert exchange in flight or never started).
     PeerSets {
@@ -360,7 +372,8 @@ enum SwarmCommand {
         key: Vec<u8>,
         reply: oneshot::Sender<Result<ClosestPeersResult, SwarmError>>,
     },
-    /// Return the most recently identify-received listen addrs for a DeviceId.
+    /// Return the known addrs for a DeviceId: identify listen addrs ∪ the
+    /// address we dialed it on, normalized (`/p2p/<peer_id>` suffix).
     ///
     /// Used by T-12 (owner-addr propagation safety net): after receiving a
     /// SymbolStored ack, the owner queries the holder's known addrs so they can
@@ -712,6 +725,7 @@ impl SwarmHandle {
             device_to_peer: HashMap::new(),
             pending_cert: HashMap::new(),
             peer_addrs: HashMap::new(),
+            dialed_addrs: HashMap::new(),
             pending_requests: HashMap::new(),
             pending_closest_peers: HashMap::new(),
             discovery_queries: HashSet::new(),
@@ -772,8 +786,21 @@ impl SwarmHandle {
     /// DeviceCertExchange happens automatically after TCP+Noise connects.
     /// The caller should watch event_rx for ProtocolEvent::PeerAuthenticated.
     pub async fn dial(&self, peer_id: PeerId, addr: Multiaddr) -> Result<(), SwarmError> {
+        self.dial_addrs(peer_id, vec![addr]).await
+    }
+
+    /// Initiate ONE dial to `peer_id` over all of `addrs` (network-i2, I4).
+    ///
+    /// libp2p tries the addresses of a single dial in turn; issuing one dial per
+    /// address instead would have every dial after the first rejected as
+    /// "already dialing". Addresses may carry a `/p2p/<peer_id>` suffix or not.
+    pub async fn dial_addrs(
+        &self,
+        peer_id: PeerId,
+        addrs: Vec<Multiaddr>,
+    ) -> Result<(), SwarmError> {
         self.cmd_tx
-            .send(SwarmCommand::Dial { peer_id, addr })
+            .send(SwarmCommand::Dial { peer_id, addrs })
             .await
             .map_err(|_| SwarmError::ChannelClosed)
     }
@@ -956,7 +983,8 @@ impl SwarmHandle {
             .map_err(|_| SwarmError::ChannelClosed)?
     }
 
-    /// Return the most recently identify-received listen addrs for a DeviceId.
+    /// Return the known addrs for a DeviceId (identify listen addrs ∪ the address
+    /// we dialed it on), each ending in exactly one `/p2p/<peer_id>`.
     ///
     /// T-12 (owner-addr propagation safety net): called after receiving a
     /// SymbolStored ack so the owner can persist the holder's dialable addrs.
@@ -1005,6 +1033,12 @@ struct EventLoopState {
     /// to surface PeerIdentified events for already-authenticated peers so the
     /// processor can persist addresses on the PeerRecord.
     peer_addrs: HashMap<PeerId, Vec<Multiaddr>>,
+
+    /// PeerId → address of the last outbound connection we successfully
+    /// established to it (dialer side, relay circuits excluded). Never cleared
+    /// on disconnect: it is the "last working" address (network-i4). Merged
+    /// with `peer_addrs` by `peer_known_addrs`.
+    dialed_addrs: HashMap<PeerId, Multiaddr>,
 
     /// OutboundRequestId → oneshot sender for send_to_device responses.
     pending_requests: HashMap<OutboundRequestId, oneshot::Sender<Result<Message, SwarmError>>>,
@@ -1119,6 +1153,12 @@ impl EventLoopState {
                 // pending_cert is tracked only for the dialer side so the timeout
                 // task can retry the request — listener has nothing to retry.
                 if endpoint.is_dialer() {
+                    // Remember the address that worked (network-i4). Relay circuits
+                    // are not stored: they name the relay, not a route to the peer.
+                    let remote = endpoint.get_remote_address();
+                    if !remote.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                        self.dialed_addrs.insert(peer_id, remote.clone());
+                    }
                     let deadline = Instant::now() + self.cert_timeout;
                     self.pending_cert.insert(peer_id, (deadline, 1));
                     let msg = DeviceCertExchangeMsg {
@@ -1203,13 +1243,14 @@ impl EventLoopState {
             if !info.listen_addrs.is_empty() {
                 self.peer_addrs.insert(peer_id, info.listen_addrs.clone());
                 // If peer is already authenticated, surface the (possibly
-                // refreshed) addrs to the processor so it can persist them.
+                // refreshed) addrs to the processor so it can persist them —
+                // together with the address we dialed it on (network-i4).
                 if let Some((device_id, _, _)) = self.authenticated.get(&peer_id) {
                     emit_event(
                         &self.event_tx,
                         ProtocolEvent::PeerIdentified {
                             device_id: *device_id,
-                            listen_addrs: info.listen_addrs.clone(),
+                            listen_addrs: self.peer_known_addrs(&peer_id),
                         },
                     );
                 }
@@ -1435,28 +1476,41 @@ impl EventLoopState {
             "peer authenticated"
         );
 
+        let known_addrs = self.peer_known_addrs(&peer_id);
         let event = ProtocolEvent::PeerAuthenticated {
             peer_id,
             device_id,
             identity_pub,
             device_cert: msg.cert,
             x25519_pub: msg.x25519_pub,
+            listen_addrs: known_addrs,
         };
         emit_event(&self.event_tx, event);
 
         // If we already saw this peer's identify before cert exchange, surface
-        // those addrs now so they get persisted on the freshly created PeerRecord.
-        if let Some(addrs) = self.peer_addrs.get(&peer_id)
-            && !addrs.is_empty()
-        {
+        // those addrs now as well. The processor no longer depends on this (the
+        // addrs ride on PeerAuthenticated above), but the DR event loops persist
+        // addresses only from PeerIdentified.
+        if self.peer_addrs.get(&peer_id).is_some_and(|a| !a.is_empty()) {
             emit_event(
                 &self.event_tx,
                 ProtocolEvent::PeerIdentified {
                     device_id,
-                    listen_addrs: addrs.clone(),
+                    listen_addrs: self.peer_known_addrs(&peer_id),
                 },
             );
         }
+    }
+
+    /// All addresses we know for `peer_id`: the address we last dialed it on
+    /// (first — it is known to work) ∪ its identify listen addrs. Normalized by
+    /// [`normalize_peer_addrs`]. Used for every address set the swarm hands out
+    /// (PeerAuthenticated, PeerIdentified, GetPeerAddrs); Kademlia is fed the raw
+    /// identify addrs separately.
+    fn peer_known_addrs(&self, peer_id: &PeerId) -> Vec<Multiaddr> {
+        let dialed = self.dialed_addrs.get(peer_id).into_iter();
+        let identified = self.peer_addrs.get(peer_id).into_iter().flatten();
+        normalize_peer_addrs(*peer_id, dialed.chain(identified))
     }
 
     async fn handle_viaticum_event(&mut self, event: request_response::Event<Message, Message>) {
@@ -1809,8 +1863,8 @@ impl EventLoopState {
                     }
                 }
             }
-            SwarmCommand::Dial { peer_id, addr } => {
-                let dial_opts = DialOpts::peer_id(peer_id).addresses(vec![addr]).build();
+            SwarmCommand::Dial { peer_id, addrs } => {
+                let dial_opts = DialOpts::peer_id(peer_id).addresses(addrs).build();
                 if let Err(e) = self.swarm.dial(dial_opts) {
                     // "Already connected" is expected when DR re-dials bootstrap peers
                     // before the already_auth skip check catches them all (race between
@@ -1881,18 +1935,17 @@ impl EventLoopState {
                 debug!(query_id = ?query_id, "dht: get_closest_peers query issued");
                 self.pending_closest_peers.insert(query_id, reply);
             }
-            // T-12: Return identify-received addrs for a DeviceId.
+            // T-12: Return known addrs for a DeviceId.
             //
             // Looks up the PeerId for the device via device_to_peer, then returns
-            // the cached listen_addrs from peer_addrs if present.
-            // Returns empty Vec if the device is not authenticated or identify
-            // has not yet completed — callers handle this gracefully.
+            // identify addrs ∪ dialed addr (normalized, see peer_known_addrs).
+            // Returns empty Vec if the device is not authenticated or we have no
+            // address for it yet — callers handle this gracefully.
             SwarmCommand::GetPeerAddrs { device, reply } => {
                 let addrs = self
                     .device_to_peer
                     .get(&device)
-                    .and_then(|peer_id| self.peer_addrs.get(peer_id))
-                    .cloned()
+                    .map(|peer_id| self.peer_known_addrs(peer_id))
                     .unwrap_or_default();
                 let _ = reply.send(addrs);
             }
@@ -2073,6 +2126,53 @@ async fn wait_for_tcp_port_free(host: &str, port: u16) {
 }
 
 // ─── Helper functions ─────────────────────────────────────────────────────────
+
+/// Strip the terminal `/p2p/<id>` component(s) of an address of `peer_id`.
+///
+/// Returns the transport part (what to dial), or `Err(found)` when the
+/// terminal `/p2p/` names a different peer — such an address is not a route to
+/// `peer_id` and must not be dialed under its id (network-i2, I3). Only the
+/// TERMINAL component identifies the target: a relay-circuit address
+/// (`…/p2p/<relay>/p2p-circuit`) carries the relay's id in the middle and is
+/// left intact.
+pub fn strip_peer_suffix(addr: &Multiaddr, peer_id: PeerId) -> Result<Multiaddr, PeerId> {
+    let mut transport = addr.clone();
+    while let Some(Protocol::P2p(found)) = transport.iter().last() {
+        if found != peer_id {
+            return Err(found);
+        }
+        transport.pop();
+    }
+    Ok(transport)
+}
+
+/// Normalize a set of addresses of `peer_id`: each result ends in exactly one
+/// `/p2p/<peer_id>`, duplicates (after normalization) removed, first-seen order
+/// kept. Addresses whose terminal `/p2p/` names another peer are dropped.
+///
+/// This is the stored form of `PeerRecord.addrs` (`processor/peer.rs`) and the
+/// form DR's `parse_multiaddr_with_peer_id` expects for `HolderHint.addrs`.
+pub fn normalize_peer_addrs<'a>(
+    peer_id: PeerId,
+    addrs: impl IntoIterator<Item = &'a Multiaddr>,
+) -> Vec<Multiaddr> {
+    let mut out: Vec<Multiaddr> = Vec::new();
+    for addr in addrs {
+        match strip_peer_suffix(addr, peer_id) {
+            Ok(transport) => {
+                let full = transport.with(Protocol::P2p(peer_id));
+                if !out.contains(&full) {
+                    out.push(full);
+                }
+            }
+            Err(found) => {
+                debug!(peer_id = %peer_id, addr = %addr, found = %found,
+                    "dropping peer address with a foreign /p2p/ suffix");
+            }
+        }
+    }
+    out
+}
 
 /// Extract PeerId from a Multiaddr that ends in /p2p/<base58>.
 ///

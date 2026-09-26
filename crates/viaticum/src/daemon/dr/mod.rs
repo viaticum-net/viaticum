@@ -413,6 +413,7 @@ pub async fn wait_for_kad_bootstrap_stable(
                     identity_pub,
                     device_cert: _,
                     x25519_pub,
+                    listen_addrs: _,
                 }) => {
                     let now = Timestamp::now();
                     // Build a minimal PeerRecord matching the pattern in processor/peer.rs
@@ -599,6 +600,7 @@ async fn wait_for_auth_any(
                 identity_pub,
                 device_cert: _,
                 x25519_pub,
+                listen_addrs: _,
             }) => {
                 // Upsert regardless of whether this is the expected peer.
                 let now = Timestamp::now();

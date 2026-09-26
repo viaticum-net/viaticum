@@ -220,6 +220,28 @@ Double cooldown protects against ransomware and accidental deletion.
 
 **Total protection window:** 8 weeks (4 owner + 4 holder).
 
+### Shared blocks (release guard)
+
+Records are the unit of deletion; blocks are the unit of release. One block can be
+referenced by several records: every file of a pack, two paths with identical content
+(dedup), a restored file moved to a new path. `DeletionEngine::process_cooldowns`
+therefore decides per block, over the whole catalog:
+
+- **Live reference wins.** A block referenced by the current version (the last version,
+  and the last backed-up one) of any record not deleted on every device gets no
+  DropNotice, placement cleanup or block cleanup. Deleting one file of a pack never
+  releases its live siblings. Old versions of live files are not protected (the network
+  holds the current state, not history).
+- **Latest deletion starts the clock.** When no live record references the block, the
+  owner and holder cooldowns run from the latest deletion among the records that
+  reference it, so each deleted file keeps its full undo window even if a pack sibling
+  was deleted long ago.
+- A block whose DropNotice already went out is not recalled if a live record starts
+  referencing it again; it just gets no further deletion actions.
+
+Deleted files inside a still-live pack stay in the network (and restorable) as long as
+the pack lives; reclaiming that space is vacuum's job (not implemented).
+
 ### Vacuum
 
 Pack-type source blocks with > 50% invalid files -> repack valid files into new block, mark old block Stale -> enters deletion flow.

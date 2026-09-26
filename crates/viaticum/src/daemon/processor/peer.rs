@@ -15,7 +15,10 @@ impl Processor {
     /// Called when DeviceCertExchange succeeds for a peer (AC-1, AC-2).
     ///
     /// 1. Stores (identity_pub, device_cert) in peer_cert_map under device_id.
-    /// 2. Upserts PeerRecord in DB (sets device_id and x25519_pub fields).
+    /// 2. Upserts PeerRecord in DB (sets device_id and x25519_pub fields, and
+    ///    `addrs` from `listen_addrs` when non-empty — in the same write that
+    ///    creates the record, so a restart right after the first contact still
+    ///    has an address to redial; network-i2, I6).
     /// 3. Calls try_auto_add_cluster_device if peer has same master identity.
     /// 4. Sends PeerAnnounce to the newly authenticated peer via swarm.
     pub(crate) async fn on_peer_authenticated(
@@ -25,6 +28,7 @@ impl Processor {
         identity_pub: IdentityPub,
         device_cert: DeviceCertificate,
         x25519_pub: Option<[u8; 32]>,
+        listen_addrs: Vec<libp2p::Multiaddr>,
     ) {
         // 0. Revocation check (review S1): reject if this device key is in the
         //    cluster's revocation list. We check against both the cluster_state
@@ -63,7 +67,9 @@ impl Processor {
         // 2. Upsert PeerRecord in DB (keyed by DeviceId).
         let now = Timestamp::now();
         let now_secs = now.0;
-        let record = match self.db.get_peer(&device_id) {
+        // Swarm already normalized these (one `/p2p/<peer_id>` suffix each).
+        let addr_strings: Vec<String> = listen_addrs.iter().map(|a| a.to_string()).collect();
+        let mut record = match self.db.get_peer(&device_id) {
             Ok(Some(mut existing)) => {
                 existing.master_identity = identity_pub;
                 existing.last_seen = now;
@@ -102,6 +108,9 @@ impl Processor {
                 return;
             }
         };
+        if !addr_strings.is_empty() {
+            record.addrs = addr_strings;
+        }
         if let Err(e) = self.db.upsert_peer(&record) {
             error!(
                 device = %device_id,
@@ -150,9 +159,10 @@ impl Processor {
     /// the next daemon restart the auto-dial loop in handle/mod.rs can re-dial
     /// without external bootstrap config.
     ///
-    /// Each address is stored as its full multiaddr string, including the
-    /// `/p2p/<peer_id>` suffix, so the bootstrap loop can extract the PeerId
-    /// without tracking it separately.
+    /// Each address is stored as its full multiaddr string with exactly one
+    /// `/p2p/<peer_id>` suffix (the swarm normalizes them). The redial loop does
+    /// not depend on the suffix (it derives the PeerId from `device_id`); DR's
+    /// HolderHint parsing does.
     pub(crate) async fn on_peer_identified(
         &self,
         device_id: DeviceId,

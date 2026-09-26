@@ -24,7 +24,7 @@ use viaticum::daemon::restore::{
 use viaticum_core::db::Db;
 use viaticum_core::erasure::{ErasureEncoder, RaptorQEncoder, Symbol};
 use viaticum_core::placement::{HolderCandidate, compute_allocation};
-use viaticum_core::types::{DeviceId, ErasureParams, IdentityPub, SourceBlockId};
+use viaticum_core::types::{DeviceId, ErasureParams, SourceBlockId};
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -32,7 +32,6 @@ use viaticum_core::types::{DeviceId, ErasureParams, IdentityPub, SourceBlockId};
 const SMALL_BLOCK_SIZE: u64 = 65_535 * 2;
 const EPOCH_KEY: [u8; 32] = [77u8; 32];
 const DEVICE_A: DeviceId = DeviceId([1u8; 32]);
-const DEVICE_B: DeviceId = DeviceId([2u8; 32]);
 
 /// 5 mock holders with varying trust — for backup/restore tests with real files.
 fn test_holders() -> Vec<HolderCandidate> {
@@ -86,8 +85,6 @@ fn restore_config(_symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreConfi
     RestoreConfig {
         epoch_key: EPOCH_KEY,
         parallel_holders: 5,
-        identity: IdentityPub([9u8; 32]),
-        device_id: DEVICE_B,
         swarm: None,
         staging_root,
         data_dir: staging_dir.path().to_path_buf(),
@@ -146,7 +143,6 @@ async fn full_backup_restore_roundtrip() {
         .restore(RestoreRequest {
             path: path.clone(),
             version_selector: VersionSelector::Latest,
-            device_id: DEVICE_B,
             job_id: JobId::new(),
         })
         .await
@@ -227,7 +223,6 @@ async fn backup_restore_pack_multiple_files() {
         .restore(RestoreRequest {
             path: prefix,
             version_selector: VersionSelector::Latest,
-            device_id: DEVICE_B,
             job_id: JobId::new(),
         })
         .await

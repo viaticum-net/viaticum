@@ -3520,6 +3520,10 @@ fn peer_of_master(device: DeviceId, master: IdentityPub) -> PeerRecord {
     peer
 }
 
+/// `now` for the sweep in the У-2 tests: none of their placements has a PoS pass, so the
+/// instant only matters to the confirmed column, which is 0 for all of them (У-3).
+const SWEEP_NOW: Timestamp = Timestamp(2_000);
+
 /// One Alive placement of `gb` gibibytes at `holder`, with its source block.
 fn alive_placement_of_gb(db: &Db, block_seed: u8, holder: DeviceId, gb: u32) {
     let mut block = make_source_block(block_seed, SourceBlockStatus::Active);
@@ -3716,7 +3720,7 @@ fn storage_bytes_by_master_reports_both_volumes_for_every_peer_master() {
     db.upsert_holding(&make_holding(0x9A, b, HoldingStatus::MarkedForDelete, 900))
         .unwrap();
 
-    let rows = db.storage_bytes_by_master().unwrap();
+    let rows = db.storage_bytes_by_master(SWEEP_NOW, 1).unwrap();
 
     let gb = crate::constants::BYTES_PER_GB as u64;
     assert_eq!(
@@ -3725,11 +3729,13 @@ fn storage_bytes_by_master_reports_both_volumes_for_every_peer_master() {
             MasterStorageBytes {
                 master: a,
                 they_store_for_us: 8 * gb,
+                they_store_for_us_confirmed: 0,
                 we_store_for_them: 700,
             },
             MasterStorageBytes {
                 master: b,
                 they_store_for_us: gb,
+                they_store_for_us_confirmed: 0,
                 we_store_for_them: 0,
             },
         ],
@@ -3750,7 +3756,7 @@ fn storage_bytes_by_master_skips_the_zero_placeholder_identity() {
     .unwrap();
     alive_placement_of_gb(&db, 0xA4, DeviceId([0xA3; 32]), 6);
 
-    let rows = db.storage_bytes_by_master().unwrap();
+    let rows = db.storage_bytes_by_master(SWEEP_NOW, 1).unwrap();
 
     assert_eq!(rows.len(), 1, "the placeholder is not an economic pair");
     assert_eq!(rows[0].master, real);
@@ -3768,7 +3774,7 @@ fn storage_bytes_by_master_gives_no_row_to_a_master_known_only_from_holdings() {
     db.upsert_holding(&make_holding(0xB4, stranger, HoldingStatus::Active, 4_096))
         .unwrap();
 
-    let rows = db.storage_bytes_by_master().unwrap();
+    let rows = db.storage_bytes_by_master(SWEEP_NOW, 1).unwrap();
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].master, peer_master);
@@ -3793,7 +3799,7 @@ fn storage_bytes_by_master_counts_only_alive_placements_and_active_holdings() {
     db.upsert_holding(&make_holding(0xC6, master, HoldingStatus::Silent, 900))
         .unwrap();
 
-    let rows = db.storage_bytes_by_master().unwrap();
+    let rows = db.storage_bytes_by_master(SWEEP_NOW, 1).unwrap();
 
     assert_eq!(rows.len(), 1);
     assert_eq!(
@@ -3806,5 +3812,104 @@ fn storage_bytes_by_master_counts_only_alive_placements_and_active_holdings() {
 #[test]
 fn storage_bytes_by_master_is_empty_when_no_peer_is_known() {
     let db = test_db();
-    assert!(db.storage_bytes_by_master().unwrap().is_empty());
+    assert!(db.storage_bytes_by_master(SWEEP_NOW, 1).unwrap().is_empty());
+}
+
+// ── У-3: the confirmed column of the sweep (AC-8) ────────────────────────────
+
+/// A placement of `gb` gibibytes at `holder` in `status`, last proven at `last_verified`.
+fn placement_of_gb_verified(
+    db: &Db,
+    block_seed: u8,
+    holder: DeviceId,
+    gb: u32,
+    status: PlacementStatus,
+    last_verified: Option<Timestamp>,
+) {
+    let mut block = make_source_block(block_seed, SourceBlockStatus::Active);
+    block.t = GB_T;
+    db.upsert_source_block(&block).unwrap();
+    let mut placement = make_placement(block_seed, holder, FileId(1), status, GB_SYMBOLS * gb);
+    placement.last_verified = last_verified;
+    db.upsert_placement(&placement).unwrap();
+}
+
+#[test]
+fn the_sweep_reports_confirmed_bytes_no_larger_than_believed_bytes() {
+    // D-1. Four placements of one master, one per way of (not) being confirmed: only the
+    // Alive one with a fresh pass may reach the confirmed column, and for every row the
+    // confirmed column is a subset of the believed one.
+    let db = test_db();
+    let window = crate::constants::PAIR_LEDGER_CONFIRMATION_WINDOW_SECS;
+    let now = Timestamp(10 * window);
+    let fresh = Some(Timestamp(now.0 - 3_600));
+    let stale = Some(Timestamp(now.0 - window - 1));
+    let master = master_id(0xD1);
+    let device = DeviceId([0xD2; 32]);
+    let other = master_id(0xD3);
+    db.upsert_peer(&peer_of_master(device, master)).unwrap();
+    db.upsert_peer(&peer_of_master(DeviceId([0xD4; 32]), other))
+        .unwrap();
+    placement_of_gb_verified(&db, 0xD5, device, 1, PlacementStatus::Alive, fresh);
+    placement_of_gb_verified(&db, 0xD6, device, 2, PlacementStatus::Alive, None);
+    placement_of_gb_verified(&db, 0xD7, device, 4, PlacementStatus::Alive, stale);
+    placement_of_gb_verified(&db, 0xD8, device, 8, PlacementStatus::PresumedLost, fresh);
+
+    let rows = db.storage_bytes_by_master(now, 1).unwrap();
+
+    let gb = crate::constants::BYTES_PER_GB as u64;
+    for row in &rows {
+        assert!(
+            row.they_store_for_us_confirmed <= row.they_store_for_us,
+            "confirmed must be a subset of believed for {:?}: {row:?}",
+            row.master
+        );
+    }
+    let row = rows.iter().find(|r| r.master == master).expect("row");
+    assert_eq!(
+        row.they_store_for_us,
+        7 * gb,
+        "belief: every Alive placement (1 + 2 + 4), not the PresumedLost one"
+    );
+    assert_eq!(
+        row.they_store_for_us_confirmed, gb,
+        "confirmed: only the Alive placement with a pass inside the window"
+    );
+}
+
+#[test]
+fn the_confirmed_sweep_sums_every_device_of_the_master() {
+    // D-2. Р3 п.1 for the confirmed column: the pair is the person, so both devices'
+    // proven bytes charge the one row.
+    let db = test_db();
+    let master = master_id(0xE1);
+    let now = Timestamp(100_000);
+    let passed = Some(Timestamp(now.0 - 60));
+    db.upsert_peer(&peer_of_master(DeviceId([0xE2; 32]), master))
+        .unwrap();
+    db.upsert_peer(&peer_of_master(DeviceId([0xE3; 32]), master))
+        .unwrap();
+    placement_of_gb_verified(
+        &db,
+        0xE4,
+        DeviceId([0xE2; 32]),
+        3,
+        PlacementStatus::Alive,
+        passed,
+    );
+    placement_of_gb_verified(
+        &db,
+        0xE5,
+        DeviceId([0xE3; 32]),
+        5,
+        PlacementStatus::Alive,
+        passed,
+    );
+
+    let rows = db.storage_bytes_by_master(now, 1).unwrap();
+
+    let gb = crate::constants::BYTES_PER_GB as u64;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].they_store_for_us_confirmed, 8 * gb);
+    assert_eq!(rows[0].they_store_for_us, 8 * gb);
 }

@@ -16,25 +16,29 @@
 //! Each tick advances `dG/dt = V_conf − λG` where `V_conf` is read from this node's own
 //! bookkeeping at the END of the interval:
 //!
-//! * "they store for us" = `symbol_count × t` over placements in status `Alive` at any
-//!   device of that master. `Alive` is our belief, maintained by the PoS state machine:
-//!   a holder that stops answering stays `Alive` until challenges time out and demote it
-//!   to `Uncertain`/`PresumedLost`. So the series is **placement-belief-weighted**, and
-//!   calling it "PoS-confirmed" would overstate it by exactly the detection latency
-//!   (Д-D — an honest confirmation signal from `pos_weekly` or from the placement
-//!   transitions is У-3's problem, recorded as an open item in the spec).
+//! * "they store for us" = `symbol_count × t` over placements at any device of that master
+//!   that are CONFIRMED now: status `Alive` AND a PoS pass no older than
+//!   [`crate::constants::PAIR_LEDGER_CONFIRMATION_WINDOW_SECS`] (14 d 3 h) on the scaled
+//!   clock ([`crate::types::SymbolPlacement::confirmed_at`], У-3, Д-F = A / Д-G). `Alive`
+//!   alone is only our BELIEF — a placement turns `Alive` on `SymbolStored`, before any
+//!   PoS — and it is logged next to the confirmed number but charges nothing. The same
+//!   confirmed flow charges the capital `G_they`, the depth `D`, the ratchet `v_dem` and
+//!   the run `(V0, τ0)`: the model has one `V_conf` (`four_r/mod.rs:270-273`).
 //! * "we store for them" = `total_bytes` over `Active` holdings owned by that master —
-//!   the same number `refresh_peer_storage_bytes` writes into `PeerRecord`.
+//!   the same number `refresh_peer_storage_bytes` writes into `PeerRecord`. Not confirmed
+//!   by anything (whether the owner is alive is a separate question, nobody reads this
+//!   axis in v1).
 //!
-//! **The size of the Д-D residue, so it is not mistaken for a rounding error.** A holder
-//! that dies keeps charging BOTH axes and the depth at full volume until its placements
-//! leave `Alive`, which needs one challenge to be issued (cadence
-//! `POS_BASE_CHALLENGES_PER_WEEK = 1`, so up to a week of waiting) and then to time out
-//! (`POS_CHALLENGE_PENDING_TIMEOUT_SECS` = 14 d 2 h; `POS_CONSECUTIVE_MISS_UNCERTAIN = 1`,
-//! so the first timeout is enough). That is ≈2-3 weeks of invented service: ≈⅓ of
-//! `τ = 60 days` on the fast capitals and ≈10 % of `τ_slow = 180 days` on the depth.
-//! Nothing in the observed-window split below reduces it — the window is about whether
-//! THIS daemon was awake, not about whether the PEER was alive.
+//! **The invented-service residue that remains, so it is not mistaken for a rounding
+//! error.** A holder that dies keeps counting as confirmed until its last pass ages out of
+//! the window: at most 14 d 3 h after that pass, ≈10.6 d on average (death uniform inside
+//! the weekly PoS cycle) — ≈18 % of `τ = 60 days` on the fast capital. It no longer waits
+//! for the PoS state machine (`Alive → Uncertain` needs the next challenge to be issued and
+//! then to time out, ≈21 d worst case). The price of the window on the other side: an
+//! honest holder that surfaces less often than the window allows blinks out of
+//! confirmation (Д-G), and on runs above `time_scale ≈ 3600` the one-second timer floor
+//! inflates the PoS cycle in scaled days, so "surfaces weekly" is covered only for an
+//! always-on holder there.
 //!
 //! And a volume measured now is only charged over the part of the interval this node was
 //! actually watching: the last [`observed_window_days`]. Everything before that is
@@ -44,10 +48,15 @@
 //! with the model is the only reason this layer exists early, so a charge for hours
 //! nobody observed would defeat its own purpose.
 //!
-//! Read the two halves as different predicates and the pair is covered from neither side
-//! alone: the simulator's `passed` is the PEER answering (`sim_dynamic/engine.rs:1855`,
-//! `let passed = c.holder_surfaced`), while the window is OUR uptime. Д-D is the gap
-//! between them and it stays open until У-3.
+//! Read the two halves as different predicates, both now in the recorder: the
+//! confirmation window is the PEER answering (the sim's `passed` is
+//! `c.holder_surfaced`, `sim_dynamic/engine.rs:1855`), while the observed window is OUR
+//! uptime.
+//!
+//! **Output of the writer, not a reader.** [`PairLedgerRecorder::tick_report`] returns the
+//! rows it has just written so the scheduler can print one `pair-ledger row` debug line
+//! per pair (target `viaticum::ledger`). That line is the only way an operator — or
+//! `experiments/local_ledger_test.sh` — sees the ledger; nothing branches on it.
 //!
 //! # Which volume charges which axis
 //!
@@ -57,9 +66,10 @@
 //!
 //! | ledger field | `V_conf` |
 //! |---|---|
-//! | `gb_days_they_store_for_us` | [`MasterStorageBytes::they_store_for_us`] |
+//! | `gb_days_they_store_for_us` | [`MasterStorageBytes::they_store_for_us_confirmed`] |
 //! | `gb_days_we_store_for_them` | [`MasterStorageBytes::we_store_for_them`] |
 //! | `depth_of_their_service` | the SAME flow as the first row |
+//! | `v_dem`, `observed_volume`, `observed_tau` | the SAME flow as the first row |
 //!
 //! The third row is the one worth stating a reason for, because the kernel's naming
 //! tempted two earlier passes into the transpose. `D` is charged by the counterparty's
@@ -85,11 +95,12 @@ mod tests;
 use std::collections::HashMap;
 
 use crate::constants::{
-    BYTES_PER_GB, PAIR_LEDGER_LAMBDA, PAIR_LEDGER_LAMBDA_SLOW, PAIR_LEDGER_MAX_LAMBDA_DT,
-    PAIR_LEDGER_OBSERVED_WINDOW_TICKS, PAIR_LEDGER_TICK_SECS, SECS_PER_DAY,
+    BYTES_PER_GB, PAIR_LEDGER_LAMBDA, PAIR_LEDGER_LAMBDA_DEM, PAIR_LEDGER_LAMBDA_SLOW,
+    PAIR_LEDGER_MAX_LAMBDA_DT, PAIR_LEDGER_OBSERVED_WINDOW_TICKS, PAIR_LEDGER_TICK_SECS,
+    SECS_PER_DAY,
 };
 use crate::db::{Db, DbError, MasterStorageBytes};
-use crate::four_r::{update_capital, update_depth};
+use crate::four_r::{update_capital, update_depth, update_v_dem};
 use crate::types::{IdentityPub, PairLedger, Timestamp};
 
 /// Ceiling on Euler sub-steps for ONE accrual call.
@@ -137,6 +148,44 @@ pub struct AccrualStats {
     /// cannot tell "the clock is one year off" from "the clock is 2^40 seconds off", and
     /// the second is a different diagnosis.
     pub uncovered_days: f64,
+    /// Rows integrated this tick whose believed volume was > 0 but confirmed volume was 0 —
+    /// the Д-D gap made visible (fresh placements before their first pass, a holder that
+    /// accepted and never answers, stalled PoS wiring, SystemState blocks). Logged only;
+    /// nothing branches on it.
+    pub believed_not_confirmed: usize,
+}
+
+/// One ACCRUED row as this tick left it — for the per-row log line only (У-3, Part 0).
+///
+/// Output of the writer, not a reader: nothing may branch on it (AC-7). Every value is the
+/// one written to the `pair_ledger` table in the same tick, or the volume the tick charged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LedgerRowReport {
+    pub master: IdentityPub,
+    /// Interval this tick integrated, in scaled days, dark part included
+    /// ([`PairLedger::elapsed_days`]).
+    pub dt_days: f64,
+    /// [`Volumes::they_store_for_us`], gb — belief (`Alive`), charges nothing.
+    pub believed_gb: f64,
+    /// [`Volumes::they_store_for_us_confirmed`], gb — `V_conf` of their service.
+    pub confirmed_gb: f64,
+    pub v_dem: f64,
+    /// `gb_days_they_store_for_us`.
+    pub g_they: f64,
+    /// `depth_of_their_service`.
+    pub depth: f64,
+    pub observed_volume: f64,
+    pub observed_tau: f64,
+}
+
+/// What one [`PairLedgerRecorder::tick_report`] did: the counters plus one
+/// [`LedgerRowReport`] per ACCRUED row.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TickReport {
+    pub stats: AccrualStats,
+    /// Rows accrued this tick, in master key order. Seeded and idle rows are not reported
+    /// (nothing was integrated for them).
+    pub rows: Vec<LedgerRowReport>,
 }
 
 /// Accrues [`PairLedger`] rows from the daemon's own storage counters.
@@ -169,14 +218,34 @@ impl PairLedgerRecorder {
     /// whole sweep, not per master — the tick runs synchronously inside the scheduler's
     /// `select!`, so a per-master query here would stall the daemon's timers (see
     /// [`Db::storage_bytes_by_master`]).
+    ///
+    /// Signature kept from У-2; delegates to [`PairLedgerRecorder::tick_report`], so the
+    /// daemon and the tests run ONE code path.
     pub fn tick(
         &self,
         my_master: &IdentityPub,
         now: Timestamp,
         time_scale: u64,
     ) -> Result<AccrualStats, PairLedgerError> {
+        self.tick_report(my_master, now, time_scale)
+            .map(|r| r.stats)
+    }
+
+    /// [`PairLedgerRecorder::tick`], plus what it wrote: one [`LedgerRowReport`] per
+    /// accrued row, filled from the very ledger value handed to `upsert_pair_ledgers`.
+    ///
+    /// Per accrued row: [`accrue_interval`] (dark part, then the observed tail — `G`, `D`
+    /// and the `v_dem` ratchet), then [`observe_run`] over the observed tail only (the run
+    /// `(V0, τ0)`, Д-H). A seeded row and an idle row touch neither the ratchet nor the run.
+    pub fn tick_report(
+        &self,
+        my_master: &IdentityPub,
+        now: Timestamp,
+        time_scale: u64,
+    ) -> Result<TickReport, PairLedgerError> {
         let observed_days = observed_window_days(time_scale);
         let mut stats = AccrualStats::default();
+        let mut reports: Vec<LedgerRowReport> = Vec::new();
         let mut rows: Vec<(IdentityPub, PairLedger)> = Vec::new();
 
         // One read of the ledger table for the whole sweep, for the same reason the volumes
@@ -189,7 +258,7 @@ impl PairLedgerRecorder {
             .map(|(master, ledger)| (master.0, ledger))
             .collect();
 
-        for volumes in self.db.storage_bytes_by_master()? {
+        for volumes in self.db.storage_bytes_by_master(now, time_scale)? {
             if volumes.master == *my_master {
                 continue;
             }
@@ -209,14 +278,14 @@ impl PairLedgerRecorder {
                 // rewind `last_update` and re-charge the interval on the next tick.
                 Some(dt_days) if dt_days <= 0.0 => stats.idle += 1,
                 Some(dt_days) => {
-                    let outcome = accrue_interval(
+                    let gb = Volumes::from_bytes(&volumes);
+                    let outcome = accrue_interval(&mut ledger, &gb, dt_days, observed_days);
+                    observe_run(
                         &mut ledger,
-                        &Volumes::from_bytes(&volumes),
-                        dt_days,
-                        observed_days,
+                        gb.they_store_for_us_confirmed,
+                        outcome.observed_days,
                     );
                     ledger.last_update = Some(now);
-                    rows.push((volumes.master, ledger));
                     stats.accrued += 1;
                     if outcome.unobserved_days > 0.0 {
                         stats.with_unobserved_gap += 1;
@@ -225,21 +294,43 @@ impl PairLedgerRecorder {
                         stats.truncated += 1;
                         stats.uncovered_days += outcome.uncovered_days;
                     }
+                    if volumes.they_store_for_us > 0 && volumes.they_store_for_us_confirmed == 0 {
+                        stats.believed_not_confirmed += 1;
+                    }
+                    reports.push(LedgerRowReport {
+                        master: volumes.master,
+                        dt_days,
+                        believed_gb: gb.they_store_for_us,
+                        confirmed_gb: gb.they_store_for_us_confirmed,
+                        v_dem: ledger.v_dem,
+                        g_they: ledger.gb_days_they_store_for_us,
+                        depth: ledger.depth_of_their_service,
+                        observed_volume: ledger.observed_volume,
+                        observed_tau: ledger.observed_tau,
+                    });
+                    rows.push((volumes.master, ledger));
                 }
             }
         }
 
         self.db.upsert_pair_ledgers(&rows)?;
-        Ok(stats)
+        Ok(TickReport {
+            stats,
+            rows: reports,
+        })
     }
 }
 
-/// The two confirmed-service volumes of one pair, in GB — the recorder's `V_conf` pair.
+/// The volumes of one pair, in GB, as read at the end of an interval.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Volumes {
-    /// GB this master's devices keep for us.
+    /// GB on `Alive` placements of this master (belief). Diagnostics only under Д-F = A:
+    /// logged, never charged.
     pub they_store_for_us: f64,
-    /// GB we keep for this master.
+    /// GB of those placements confirmed by a fresh PoS pass — `V_conf` of their service to
+    /// us. Charges `G_they`, `D`, `v_dem` and the run `(V0, τ0)`.
+    pub they_store_for_us_confirmed: f64,
+    /// GB we keep for this master (`Active` holdings).
     pub we_store_for_them: f64,
 }
 
@@ -250,6 +341,7 @@ impl Volumes {
     pub fn from_bytes(bytes: &MasterStorageBytes) -> Self {
         Volumes {
             they_store_for_us: bytes.they_store_for_us as f64 / BYTES_PER_GB,
+            they_store_for_us_confirmed: bytes.they_store_for_us_confirmed as f64 / BYTES_PER_GB,
             we_store_for_them: bytes.we_store_for_them as f64 / BYTES_PER_GB,
         }
     }
@@ -260,6 +352,10 @@ impl Volumes {
 pub struct IntervalOutcome {
     /// Days integrated at `V_conf = 0` because they lie outside the observed window.
     pub unobserved_days: f64,
+    /// Days of the observed tail — charged with the measured volumes, and the only days
+    /// [`observe_run`] may add to `τ0`. `dt_days − unobserved_days`, 0 for a degenerate
+    /// interval.
+    pub observed_days: f64,
     /// Days the sub-step ceiling refused to integrate at all (corrupt clock only).
     pub uncovered_days: f64,
 }
@@ -277,7 +373,13 @@ pub struct IntervalOutcome {
 /// 2. the remaining `≤ observed_days` at the measured volumes.
 ///
 /// Order matters: the unobserved stretch happened first, and decaying after charging would
-/// shrink the fresh evidence instead of the stale capital.
+/// shrink the fresh evidence instead of the stale capital. The same holds for the `v_dem`
+/// ratchet (AC-3f): the dark stretch eases the OLD demonstrated scale down before the tail
+/// can snap it back up to the confirmed volume.
+///
+/// The run `(V0, τ0)` is not advanced here — that is [`observe_run`], called by the tick
+/// with [`IntervalOutcome::observed_days`], so this function stays "the Д-A split of
+/// [`accrue`]" and nothing else.
 ///
 /// A non-positive or non-finite interval accrues nothing. `last_update` is NOT touched
 /// here: the clock belongs to the caller, which knows whether the row is being persisted.
@@ -295,11 +397,13 @@ pub fn accrue_interval(
 
     let mut outcome = IntervalOutcome {
         unobserved_days: unobserved,
+        observed_days: observed,
         uncovered_days: 0.0,
     };
     if unobserved > 0.0 {
         let dark = Volumes {
             they_store_for_us: 0.0,
+            they_store_for_us_confirmed: 0.0,
             we_store_for_them: 0.0,
         };
         outcome.uncovered_days += accrue(ledger, &dark, unobserved);
@@ -308,6 +412,37 @@ pub fn accrue_interval(
         outcome.uncovered_days += accrue(ledger, volumes, observed);
     }
     outcome
+}
+
+/// Advance the run `(V0, τ0)` = the current unbroken run of CONFIRMED service by this pair
+/// to us (Д-H) over the observed tail of an interval.
+///
+/// * `confirmed_gb > 0`: `τ0 += observed_days`; `V0` = the smallest confirmed volume of the
+///   run (a new run — `τ0 == 0` — starts at this volume, not at `min(0, V)`).
+/// * `confirmed_gb == 0` on an observed tail: the run ends, `V0 = τ0 = 0`.
+///
+/// `τ0` grows by OBSERVED days only; a dark stretch neither adds to it nor ends the run by
+/// itself (the tick only ever hands this function the observed tail). If the peer's last
+/// pass is still inside the confirmation window after our outage, the run continues; if
+/// not, the first observed tail ends it (4r-i4 / 4r-i6).
+///
+/// Policy, not kernel — so it lives here and not in [`accrue`] (the AC-1/AC-3b function
+/// stays pure kernel). A non-positive or NaN `observed_days` changes nothing.
+pub fn observe_run(ledger: &mut PairLedger, confirmed_gb: f64, observed_days: f64) {
+    if observed_days.is_nan() || observed_days <= 0.0 {
+        return;
+    }
+    if confirmed_gb > 0.0 {
+        ledger.observed_volume = if ledger.observed_tau > 0.0 {
+            ledger.observed_volume.min(confirmed_gb)
+        } else {
+            confirmed_gb
+        };
+        ledger.observed_tau += observed_days;
+    } else {
+        ledger.observed_volume = 0.0;
+        ledger.observed_tau = 0.0;
+    }
 }
 
 /// The period of the accrual timer in REAL seconds — the one place that formula lives.
@@ -359,9 +494,14 @@ pub fn observed_window_days(time_scale: u64) -> f64 {
 /// ceiling could not cover (0.0 in every non-corrupt case).
 ///
 /// Both volumes are gb; `dt_days` is days. The two capitals relax through
-/// [`update_capital`] at `λ`, the depth through [`update_depth`] at `λ_slow`, over the
-/// sub-steps of [`sub_steps`] — so the result is exactly the kernel applied `n` times, not
-/// an approximation of it (AC-1).
+/// [`update_capital`] at `λ`, the depth through [`update_depth`] at `λ_slow`, the
+/// demonstrated scale through [`update_v_dem`] at `λ_dem`, over the sub-steps of
+/// [`sub_steps`] — so the result is exactly the kernel applied `n` times, not an
+/// approximation of it (AC-1, AC-3b).
+///
+/// "Their service to us" — `G_they`, `D` and `v_dem` — is charged by the CONFIRMED volume
+/// ([`Volumes::they_store_for_us_confirmed`], Д-F = A); the believed volume is not read
+/// here at all.
 ///
 /// The NaN guard is defence in depth, not a live path: the only NON-TEST caller in the
 /// workspace is [`accrue_interval`], which rejects NaN first, and the interval it derives
@@ -374,10 +514,12 @@ pub fn accrue(ledger: &mut PairLedger, volumes: &Volumes, dt_days: f64) -> f64 {
         return 0.0;
     }
     let plan = sub_steps(dt_days);
+    // Д-F = A. (Д-F = B would read `volumes.they_store_for_us` here — for G and D only.)
+    let their_flow = volumes.they_store_for_us_confirmed;
     for _ in 0..plan.count {
         ledger.gb_days_they_store_for_us = update_capital(
             ledger.gb_days_they_store_for_us,
-            volumes.they_store_for_us,
+            their_flow,
             PAIR_LEDGER_LAMBDA,
             plan.step_days,
         );
@@ -391,9 +533,17 @@ pub fn accrue(ledger: &mut PairLedger, volumes: &Volumes, dt_days: f64) -> f64 {
         // charged by the peer's service to us and not by ours to them.
         ledger.depth_of_their_service = update_depth(
             ledger.depth_of_their_service,
-            volumes.they_store_for_us,
+            their_flow,
             plan.step_days,
             PAIR_LEDGER_LAMBDA_SLOW,
+        );
+        // A.3: the ratchet always reads the CONFIRMED volume (Д-F part 1 — a definition,
+        // not a fork: "max PROVEN retained volume").
+        ledger.v_dem = update_v_dem(
+            ledger.v_dem,
+            volumes.they_store_for_us_confirmed,
+            plan.step_days,
+            PAIR_LEDGER_LAMBDA_DEM,
         );
     }
     plan.uncovered_days
@@ -413,8 +563,8 @@ pub struct SubStepPlan {
 }
 
 /// Split `dt_days` into equal explicit-Euler sub-steps with
-/// `λ·step ≤ PAIR_LEDGER_MAX_LAMBDA_DT` for BOTH leak rates (the binding one is the faster
-/// `λ`, so the step is 30 days).
+/// `λ·step ≤ PAIR_LEDGER_MAX_LAMBDA_DT` for ALL THREE leak rates (`λ`, `λ_slow`, `λ_dem`;
+/// the binding one is the fastest, `λ`, so the step is 30 days).
 ///
 /// This is W-2 of the spec. [`crate::types::PairLedger::elapsed_days`] deliberately returns
 /// an UNCLAMPED interval, because clamping a three-month outage would silently throw the
@@ -423,7 +573,9 @@ pub struct SubStepPlan {
 /// a pair that stopped storing would be charged a large NEGATIVE capital on the first tick
 /// after the outage. Splitting is the only answer that neither truncates nor inverts.
 pub fn sub_steps(dt_days: f64) -> SubStepPlan {
-    let lambda_max = PAIR_LEDGER_LAMBDA.max(PAIR_LEDGER_LAMBDA_SLOW);
+    let lambda_max = PAIR_LEDGER_LAMBDA
+        .max(PAIR_LEDGER_LAMBDA_SLOW)
+        .max(PAIR_LEDGER_LAMBDA_DEM);
     let max_step = PAIR_LEDGER_MAX_LAMBDA_DT / lambda_max;
     if dt_days <= max_step {
         return SubStepPlan {

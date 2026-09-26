@@ -2999,6 +2999,7 @@ async fn peer_authenticated_upserts_peer_record() {
             peer_identity,
             device_cert.clone(),
             None,
+            vec![],
         )
         .await;
 
@@ -3042,7 +3043,14 @@ async fn peer_authenticated_upserts_peer_record() {
     // A second authentication (existing-record path) is another positive
     // observation: avail_ewma must rise above the initial prior.
     processor
-        .on_peer_authenticated(fake_peer_id, device_id, peer_identity, device_cert, None)
+        .on_peer_authenticated(
+            fake_peer_id,
+            device_id,
+            peer_identity,
+            device_cert,
+            None,
+            vec![],
+        )
         .await;
     let record2 = db
         .get_peer(&device_id)
@@ -3088,6 +3096,7 @@ async fn peer_authenticated_same_master_triggers_cluster_add() {
             own_identity, // same master identity
             cert_b,
             None,
+            vec![],
         )
         .await;
 
@@ -3174,6 +3183,7 @@ async fn peer_authenticated_stores_device_to_master_mapping() {
             peer_identity,
             device_cert,
             None,
+            vec![],
         )
         .await;
 
@@ -3184,6 +3194,122 @@ async fn peer_authenticated_stores_device_to_master_mapping() {
         mapped,
         Some(peer_identity),
         "device-to-master mapping must be stored after on_peer_authenticated"
+    );
+}
+
+// ─── network-i2 / I6: addresses ride on PeerAuthenticated ─────────────────────
+
+/// A peer authenticated with addresses, seen for the first time: the PeerRecord
+/// created by on_peer_authenticated already carries them. Deterministic guard for
+/// "remove the addrs from the auth event" (network-i2 mutation): the separate
+/// PeerIdentified event can be processed before the record exists and be lost.
+#[tokio::test]
+async fn on_peer_authenticated_persists_listen_addrs_for_new_peer() {
+    let tmp = TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("db.redb")).unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let processor = make_processor(db.clone(), &holdings_dir).await;
+
+    let peer_master_key = derive_master_key(&[0xF5u8; 64]).expect("derive_master_key");
+    let peer_identity = master_identity(&peer_master_key);
+    let device_signing_key =
+        viaticum_core::cluster::derive_device_key(&[0xF5u8; 64], &[0x55u8; 32])
+            .expect("derive_device_key");
+    let device_id = DeviceId(device_signing_key.verifying_key().to_bytes());
+    let device_cert = viaticum_core::cluster::issue_device_certificate(
+        &peer_master_key,
+        device_id,
+        Timestamp::now(),
+    );
+    let peer_id = crate::daemon::network::swarm::device_id_to_peer_id(&device_id).unwrap();
+    let addrs: Vec<libp2p::Multiaddr> = vec![
+        format!("/ip4/127.0.0.1/tcp/4101/p2p/{peer_id}")
+            .parse()
+            .unwrap(),
+        format!("/ip4/10.0.0.7/tcp/4101/p2p/{peer_id}")
+            .parse()
+            .unwrap(),
+    ];
+    assert!(
+        db.get_peer(&device_id).unwrap().is_none(),
+        "precondition: new peer"
+    );
+
+    processor
+        .on_peer_authenticated(
+            peer_id,
+            device_id,
+            peer_identity,
+            device_cert,
+            None,
+            addrs.clone(),
+        )
+        .await;
+
+    let record = db
+        .get_peer(&device_id)
+        .unwrap()
+        .expect("PeerRecord must exist after on_peer_authenticated");
+    let want: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+    assert_eq!(
+        record.addrs, want,
+        "addrs must be written in the creating upsert"
+    );
+}
+
+/// Existing record: new addrs replace the stored ones; an authentication that
+/// carries no addrs (listener side before identify) keeps what is stored.
+#[tokio::test]
+async fn on_peer_authenticated_updates_addrs_of_existing_peer_and_keeps_them_when_empty() {
+    let tmp = TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("db.redb")).unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let processor = make_processor(db.clone(), &holdings_dir).await;
+
+    let peer_master_key = derive_master_key(&[0xF6u8; 64]).expect("derive_master_key");
+    let peer_identity = master_identity(&peer_master_key);
+    let device_signing_key =
+        viaticum_core::cluster::derive_device_key(&[0xF6u8; 64], &[0x66u8; 32])
+            .expect("derive_device_key");
+    let device_id = DeviceId(device_signing_key.verifying_key().to_bytes());
+    let device_cert = viaticum_core::cluster::issue_device_certificate(
+        &peer_master_key,
+        device_id,
+        Timestamp::now(),
+    );
+    let peer_id = crate::daemon::network::swarm::device_id_to_peer_id(&device_id).unwrap();
+
+    let mut existing = make_peer_record(device_id);
+    existing.master_identity = peer_identity;
+    existing.addrs = vec!["/ip4/192.168.1.2/tcp/1".to_string()];
+    db.upsert_peer(&existing).unwrap();
+
+    let fresh: libp2p::Multiaddr = format!("/ip4/127.0.0.1/tcp/4102/p2p/{peer_id}")
+        .parse()
+        .unwrap();
+    processor
+        .on_peer_authenticated(
+            peer_id,
+            device_id,
+            peer_identity,
+            device_cert.clone(),
+            None,
+            vec![fresh.clone()],
+        )
+        .await;
+    assert_eq!(
+        db.get_peer(&device_id).unwrap().unwrap().addrs,
+        vec![fresh.to_string()],
+        "new addrs replace stored ones"
+    );
+
+    processor
+        .on_peer_authenticated(peer_id, device_id, peer_identity, device_cert, None, vec![])
+        .await;
+    assert_eq!(
+        db.get_peer(&device_id).unwrap().unwrap().addrs,
+        vec![fresh.to_string()],
+        "an auth event without addrs must not wipe stored addrs"
     );
 }
 

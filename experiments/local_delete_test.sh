@@ -13,8 +13,9 @@
 #   just one holder); the owner's catalog stops referencing the block (CleanupBlock).
 # Adversarial: none beyond the multi-holder case (H3); a holder offline during the
 #   delete is not exercised (see Cannot close).
-# Cannot close: deletion of a block shared by several files (packs, partial vacuum is
-#   not implemented); a holder offline during the delete (mailbox delivery later);
+# Cannot close: deletion of a block shared by several files (packs) — covered by
+#   local_pack_delete_test (delete-i3); a holder offline during the delete (mailbox
+#   delivery later);
 #   un-delete inside the cooldown (restore of a deleted file: local_e2e).
 # Steps: 1. backup -> restorable per owner — check: wait_file_restorable
 #        2. >= 2 holders have symbols of the block on disk (precondition) — check:

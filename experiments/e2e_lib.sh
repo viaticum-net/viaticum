@@ -2,7 +2,8 @@
 # Shared helpers for experiments/local_*_test.sh. Sourced, never executed.
 #
 # The sourcing script must define `node_dir IDX` (a node's --data-dir), `BINARY`
-# and `fail`, and source this file AFTER those definitions.
+# and `fail` (and `node_log IDX` for the log helpers), and source this file AFTER
+# those definitions.
 #
 # Anti-false-green rules these helpers exist to enforce:
 #   - restore is checked only after the local source is gone (otherwise the
@@ -185,17 +186,19 @@ restore_from_network() {
 OWNER_DELETE_COOLDOWN_SECS=2419200
 DELETE_WINDOW_FLOOR_SECS=600
 
-# assert_delete_window TIME_SCALE: FAIL and exit when the scaled owner-delete
-# cooldown is below the floor.
+# assert_delete_window TIME_SCALE [FLOOR_SECS]: FAIL and exit when the scaled
+# owner-delete cooldown is below the floor (default DELETE_WINDOW_FLOOR_SECS).
+# A scenario that deliberately races the window (local_pack_delete_test) passes a
+# lower floor and then checks its own elapsed time explicitly.
 assert_delete_window() {
-    local scale="$1" scaled
+    local scale="$1" floor="${2:-$DELETE_WINDOW_FLOOR_SECS}" scaled
     [ "$scale" -ge 1 ] || scale=1
     scaled=$((OWNER_DELETE_COOLDOWN_SECS / scale))
-    if [ "$scaled" -lt "$DELETE_WINDOW_FLOOR_SECS" ]; then
-        fail "delete window: OWNER_DELETE_COOLDOWN_SECS/${scale} = ${scaled}s < ${DELETE_WINDOW_FLOOR_SECS}s; the network may drop the file before restore runs"
+    if [ "$scaled" -lt "$floor" ]; then
+        fail "delete window: OWNER_DELETE_COOLDOWN_SECS/${scale} = ${scaled}s < ${floor}s; the network may drop the file before restore runs"
         exit 1
     fi
-    info "delete window: OWNER_DELETE_COOLDOWN_SECS/${scale} = ${scaled}s (floor ${DELETE_WINDOW_FLOOR_SECS}s)"
+    info "delete window: OWNER_DELETE_COOLDOWN_SECS/${scale} = ${scaled}s (floor ${floor}s)"
 }
 
 # Holder-side corroboration that a restore went over the network: number of
@@ -207,6 +210,56 @@ restore_responses_for() {
     [ -n "$hex" ] || { echo 0; return; }
     for i in "$@"; do
         n=$(grep -a "sending RestoreResponse" "$(node_log "$i")" 2>/dev/null | grep -ac "$hex" || true)
+        total=$((total + ${n:-0}))
+    done
+    echo "$total"
+}
+
+# ── Process and log helpers ─────────────────────────────────────────────────
+# Daemon logs are appended (`>>`) across restarts, so "what this instance
+# wrote" = the lines after the count taken right before it was started.
+
+# Current number of lines in node IDX's log (0 when there is no log yet).
+log_line_count() {
+    local f; f=$(node_log "$1")
+    if [ -f "$f" ]; then wc -l < "$f"; else echo 0; fi
+}
+
+# Lines of node IDX's log after line N, ANSI colors stripped.
+log_since() {
+    tail -n +$(( $2 + 1 )) "$(node_log "$1")" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true
+}
+
+# Integer value of FIELD in a tracing key=value log LINE ("" when absent).
+log_field() {
+    echo "$1" | grep -oE "(^|[[:space:]])$2=[0-9]+" | head -1 | grep -oE '[0-9]+$' || true
+}
+
+# wait_pid_exit PID SECS: poll until PID (a child of this shell) exits; sets
+# EXIT_RC to its exit status. Returns 1 (EXIT_RC empty) if it is still running.
+wait_pid_exit() {
+    local pid="$1" secs="$2"
+    EXIT_RC=""
+    for _ in $(seq 1 $(( secs * 5 ))); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null && EXIT_RC=0 || EXIT_RC=$?
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
+# Holder-side proof that a Delete for BLOCK_HEX reached a holder: number of
+# "holding marked for deletion" log lines for BLOCK_HEX across the given nodes'
+# logs (processor/symbol.rs, the holder flips its holding Active -> MarkedForDelete
+# and stops serving it). Block ids are logged as their first 16 hex chars.
+delete_marks_for() {
+    local hex="${1:0:16}"; shift
+    local total=0 n i
+    [ -n "$hex" ] || { echo 0; return; }
+    for i in "$@"; do
+        n=$(grep -a "holding marked for deletion" "$(node_log "$i")" 2>/dev/null | grep -ac "$hex" || true)
         total=$((total + ${n:-0}))
     done
     echo "$total"
