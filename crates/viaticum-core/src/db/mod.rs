@@ -460,6 +460,30 @@ impl Db {
         Ok(db)
     }
 
+    /// Create a fresh database in an already opened, empty `file` (DR staging).
+    ///
+    /// The caller created the file (and, on platforms where a second exclusive lock
+    /// on the same descriptor succeeds, already holds `File::try_lock` on it); redb
+    /// takes its own lock on the same descriptor for the lifetime of the database.
+    /// Unlike [`Db::open`]: no pre-open `.bak` copy and no repair retry, because the
+    /// file is new. A lock held through another descriptor →
+    /// `DbError::Database(DatabaseAlreadyOpen)`.
+    pub fn create_from_file(file: std::fs::File) -> Result<Self, DbError> {
+        let db = redb::Database::builder().create_file(file)?;
+        Self::create_tables(&db)?;
+        Self::drop_legacy_system_state_blobs(&db)?;
+        let hot = HotCache::build_from_db(&db)?;
+        let db = Db {
+            inner: Arc::new(db),
+            hot: Arc::new(RwLock::new(hot)),
+        };
+        // Same one-time markers `open` leaves on a fresh DB, so the daemon's first
+        // `open` of the installed file finds nothing to migrate.
+        db.backfill_content_index()?;
+        db.migrate_holdings_key_order()?;
+        Ok(db)
+    }
+
     /// One-time cleanup (A2 / T-13b-3): drop the retired `system_state_blobs`
     /// table. `delete_table` returns `Ok(false)` when the table is absent, so this
     /// is a safe no-op on fresh or already-migrated databases.

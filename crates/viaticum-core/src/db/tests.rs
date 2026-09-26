@@ -1208,6 +1208,50 @@ fn db_integrity_check_passes() {
     assert!(db.list_all_files().unwrap().is_empty());
 }
 
+#[test]
+fn create_from_file_makes_usable_db() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("db.redb.dr-new");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let peer = make_peer(DeviceId([7u8; 32]));
+    {
+        let db = crate::db::Db::create_from_file(file).unwrap();
+        db.upsert_peer(&peer).unwrap();
+        assert_eq!(db.list_all_peers().unwrap().len(), 1);
+
+        // While it is open, a second handle on the same path cannot take the DB.
+        let second = redb::Database::builder().create(&path);
+        assert!(
+            matches!(second, Err(redb::DatabaseError::DatabaseAlreadyOpen)),
+            "the staging DB must hold its lock"
+        );
+    }
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["db.redb.dr-new".to_string()],
+        "create_from_file makes no pre-open copy"
+    );
+
+    // Renamed into place, it opens as an ordinary DB with the data.
+    let installed = dir.path().join("db.redb");
+    std::fs::rename(&path, &installed).unwrap();
+    let db = crate::db::Db::open(&installed).unwrap();
+    let got = db
+        .get_peer(&peer.device_id)
+        .unwrap()
+        .expect("peer survives");
+    assert_eq!(got.device_id, peer.device_id);
+}
+
 // ─── DB-13: crash recovery (pre-open backup) ───────────────────────────────
 
 #[test]

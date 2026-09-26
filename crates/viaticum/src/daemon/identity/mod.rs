@@ -44,22 +44,63 @@ pub struct IdentityKeyFile {
     pub created_at: u64,
 }
 
+/// Why a recovery phrase was rejected. `Display` is the friend-facing reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MnemonicProblem {
+    /// Not exactly 24 words after normalization.
+    WordCount {
+        got: usize,
+    },
+    /// `position` is 1-based.
+    UnknownWord {
+        position: usize,
+        word: String,
+    },
+    /// All words are in the list but the BIP39 checksum does not match.
+    Checksum,
+    Other(String),
+}
+
+impl std::fmt::Display for MnemonicProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MnemonicProblem::WordCount { got } => write!(f, "expected 24 words, got {got}"),
+            MnemonicProblem::UnknownWord { position, word } => {
+                write!(
+                    f,
+                    "word {position} (\"{word}\") is not in the BIP39 word list"
+                )
+            }
+            MnemonicProblem::Checksum => write!(
+                f,
+                "the words are all valid but do not form a valid phrase (checksum mismatch): \
+                 most likely one word is wrong or two are swapped"
+            ),
+            MnemonicProblem::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
     #[error("already initialized: {0}")]
     AlreadyInitialized(PathBuf),
 
-    #[error(
-        "identity file at {0} is corrupt or from an incompatible binary version: {1}. \
-            Delete the file and re-run 'viaticum init', or restore it from a backup."
-    )]
+    #[error("{}", corrupt_key_hint(.0, .1))]
     Corrupt(PathBuf, String),
+
+    #[error(
+        "{} already holds a catalog (db.redb) but no identity.key: run 'viaticum dr' with \
+         your recovery phrase, or move db.redb away",
+        .0.display()
+    )]
+    CatalogWithoutKey(PathBuf),
 
     #[error("not initialized: run 'viaticum init' first")]
     NotInitialized,
 
     #[error("invalid mnemonic: {0}")]
-    InvalidMnemonic(String),
+    InvalidMnemonic(MnemonicProblem),
 
     #[error("key derivation error: {0}")]
     KeyDerivation(String),
@@ -85,8 +126,8 @@ pub fn init_identity(data_dir: &Path) -> Result<IdentityKeyFile, IdentityError> 
     let mut entropy = [0u8; 32];
     rand_core::OsRng.fill_bytes(&mut entropy);
     let mnemonic = bip39::Mnemonic::from_entropy(&entropy)
-        .map_err(|e| IdentityError::InvalidMnemonic(e.to_string()))?;
-    create_keyfile(data_dir, &mnemonic, false)
+        .map_err(|e| IdentityError::InvalidMnemonic(MnemonicProblem::Other(e.to_string())))?;
+    install_keyfile(data_dir, &mnemonic, DeviceSeedMode::Random)
 }
 
 /// Initialize this device as a new member of an existing cluster identified by `mnemonic`.
@@ -101,15 +142,8 @@ pub fn init_identity_new_device(
     data_dir: &Path,
     mnemonic: &str,
 ) -> Result<IdentityKeyFile, IdentityError> {
-    let mnemonic = bip39::Mnemonic::parse(mnemonic)
-        .map_err(|e| IdentityError::InvalidMnemonic(e.to_string()))?;
-    if mnemonic.word_count() != 24 {
-        return Err(IdentityError::InvalidMnemonic(format!(
-            "expected 24 words, got {}",
-            mnemonic.word_count()
-        )));
-    }
-    create_keyfile(data_dir, &mnemonic, false)
+    let mnemonic = parse_mnemonic(mnemonic)?;
+    install_keyfile(data_dir, &mnemonic, DeviceSeedMode::Random)
 }
 
 /// Initialize from an existing 24-word BIP39 mnemonic (for DR restore / Docker testing).
@@ -122,15 +156,120 @@ pub fn init_identity_from_mnemonic(
     data_dir: &Path,
     mnemonic: &str,
 ) -> Result<IdentityKeyFile, IdentityError> {
-    let mnemonic = bip39::Mnemonic::parse(mnemonic)
-        .map_err(|e| IdentityError::InvalidMnemonic(e.to_string()))?;
-    if mnemonic.word_count() != 24 {
-        return Err(IdentityError::InvalidMnemonic(format!(
-            "expected 24 words, got {}",
-            mnemonic.word_count()
-        )));
+    let mnemonic = parse_mnemonic(mnemonic)?;
+    install_keyfile(data_dir, &mnemonic, DeviceSeedMode::DerivedFromSeed)
+}
+
+/// Trim, lowercase and collapse every whitespace run to one space. Pure.
+pub fn normalize_phrase(s: &str) -> String {
+    s.split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Parse a recovery phrase: `normalize_phrase`, exactly 24 words, every word in the
+/// English BIP39 list, valid checksum. The error names the first problem in the
+/// friend's terms (word position is 1-based). No "closest word" guessing.
+pub fn parse_mnemonic(s: &str) -> Result<bip39::Mnemonic, IdentityError> {
+    let normalized = normalize_phrase(s);
+    let words: Vec<&str> = normalized.split(' ').filter(|w| !w.is_empty()).collect();
+    if words.len() != 24 {
+        return Err(IdentityError::InvalidMnemonic(MnemonicProblem::WordCount {
+            got: words.len(),
+        }));
     }
-    create_keyfile(data_dir, &mnemonic, true)
+    bip39::Mnemonic::parse(normalized.as_str()).map_err(|e| {
+        let problem = match e {
+            bip39::Error::BadWordCount(got) => MnemonicProblem::WordCount { got },
+            bip39::Error::UnknownWord(i) => MnemonicProblem::UnknownWord {
+                position: i + 1,
+                word: words.get(i).map(|w| (*w).to_string()).unwrap_or_default(),
+            },
+            bip39::Error::InvalidChecksum => MnemonicProblem::Checksum,
+            other => MnemonicProblem::Other(other.to_string()),
+        };
+        IdentityError::InvalidMnemonic(problem)
+    })
+}
+
+/// How the device seed of a new keyfile is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceSeedMode {
+    /// Fresh random device (plain `init`, `init --new-device`).
+    Random,
+    /// `HKDF(seed, "viaticum-device-seed-v1")`: the same phrase always yields the same
+    /// device id (DR, `init --mnemonic`).
+    DerivedFromSeed,
+}
+
+/// Compute a keyfile for `m` without touching the disk.
+pub fn build_keyfile(
+    m: &bip39::Mnemonic,
+    mode: DeviceSeedMode,
+) -> Result<IdentityKeyFile, IdentityError> {
+    // BIP39 seed: 64 bytes from mnemonic with empty passphrase.
+    let seed_arr: [u8; 64] = m.to_seed("");
+    let seed = seed_arr.to_vec();
+
+    // Derive identity public key.
+    let master_key =
+        derive_master_key(&seed).map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
+    let identity_pub = master_identity(&master_key).0;
+
+    // device_id = derive_device_key(seed, device_seed).verifying_key().to_bytes()
+    let device_seed: [u8; 32] = match mode {
+        DeviceSeedMode::DerivedFromSeed => {
+            use hkdf::Hkdf;
+            use sha2::Sha256;
+            let hkdf = Hkdf::<Sha256>::new(None, &seed);
+            let mut seed_out = [0u8; 32];
+            hkdf.expand(b"viaticum-device-seed-v1", &mut seed_out)
+                .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
+            seed_out
+        }
+        DeviceSeedMode::Random => rand::random(),
+    };
+
+    let device_key = derive_device_key(&seed, &device_seed)
+        .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
+    let device_id: [u8; 32] = device_key.verifying_key().to_bytes();
+
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    Ok(IdentityKeyFile {
+        mnemonic: m.to_string(),
+        seed,
+        identity_pub,
+        device_seed,
+        device_id,
+        created_at,
+    })
+}
+
+/// Write `kf` as CBOR to `path` with mode 0600, never overwriting:
+/// an existing file → `AlreadyInitialized(path)`.
+pub fn write_keyfile_at(path: &Path, kf: &IdentityKeyFile) -> Result<(), IdentityError> {
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(kf, &mut buf).map_err(|e| IdentityError::Cbor(e.to_string()))?;
+    write_secret_file(path, &buf).map_err(|e| match e {
+        IdentityError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists => {
+            IdentityError::AlreadyInitialized(path.to_path_buf())
+        }
+        other => other,
+    })
+}
+
+/// Write the default `config.toml` into `data_dir` unless one exists.
+pub fn write_default_config_if_absent(data_dir: &Path) -> Result<(), IdentityError> {
+    let config_path = data_dir.join("config.toml");
+    if !config_path.exists() {
+        std::fs::write(&config_path, DEFAULT_CONFIG_TOML)?;
+    }
+    Ok(())
 }
 
 /// Load an existing identity from `<data_dir>/identity.key`.
@@ -147,6 +286,37 @@ pub fn load_identity(data_dir: &Path) -> Result<IdentityKeyFile, IdentityError> 
     })?;
     ciborium::de::from_reader(bytes.as_slice())
         .map_err(|e| IdentityError::Corrupt(path, e.to_string()))
+}
+
+/// What the friend reads when `identity.key` exists but cannot be used (daemon start,
+/// `init`). Never suggests deleting it: the key may be recoverable, and a new identity
+/// leaves every backup under the old one.
+pub fn corrupt_key_hint(path: &Path, reason: &str) -> String {
+    format!(
+        "identity file at {} is corrupt or from an incompatible binary version ({reason}). \
+         Do not delete it. Move it away (e.g. identity.key.broken) and run 'viaticum dr' \
+         with your recovery phrase. If the file was written by a newer Viaticum, update the \
+         binary instead. 'viaticum init' creates a NEW identity: your backups stay under \
+         the old one.",
+        path.display()
+    )
+}
+
+/// What the daemon says when `data_dir` has no `identity.key`. A folder that still
+/// holds a catalog (`db.redb`) lost its key: recovery (`dr`) comes first there.
+pub fn not_initialized_hint(data_dir: &Path) -> String {
+    if data_dir.join("db.redb").exists() {
+        format!(
+            "identity not initialized, but {} already holds a catalog (db.redb): run \
+             'viaticum dr' with your recovery phrase to recover it. 'viaticum init' would \
+             create a NEW identity and refuses while db.redb is there.",
+            data_dir.display()
+        )
+    } else {
+        "identity not initialized: run 'viaticum init' to create a new identity, or \
+         'viaticum dr' to recover an existing one from its recovery phrase"
+            .to_string()
+    }
 }
 
 /// Derive the three active keys from a loaded keyfile for a given epoch.
@@ -183,15 +353,13 @@ fn keyfile_path(data_dir: &Path) -> PathBuf {
     data_dir.join("identity.key")
 }
 
-/// Shared logic for init_identity and init_identity_from_mnemonic.
-///
-/// When `deterministic_device_id` is true, the device_id is derived from the
-/// seed via HKDF so that the same mnemonic always produces the same identity
-/// (critical for DR blob lookup). When false, a random device_id is generated.
-fn create_keyfile(
+/// Shared logic of the three `init_identity*`: refuse an existing keyfile (telling a
+/// valid one from an unusable one), then build and write a new one plus the default
+/// config.
+fn install_keyfile(
     data_dir: &Path,
     mnemonic: &bip39::Mnemonic,
-    deterministic_device_id: bool,
+    mode: DeviceSeedMode,
 ) -> Result<IdentityKeyFile, IdentityError> {
     let path = keyfile_path(data_dir);
     if path.exists() {
@@ -207,67 +375,21 @@ fn create_keyfile(
         };
     }
 
-    std::fs::create_dir_all(data_dir)?;
-
-    // BIP39 seed: 64 bytes from mnemonic with empty passphrase.
-    let seed_arr: [u8; 64] = mnemonic.to_seed("");
-    let seed = seed_arr.to_vec();
-
-    // Derive identity public key.
-    let master_key =
-        derive_master_key(&seed).map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
-    let identity_pub = master_identity(&master_key).0;
-
-    // device_seed: deterministic from seed for DR restore, random for fresh init.
-    // device_id = derive_device_key(seed, device_seed).verifying_key().to_bytes()
-    let device_seed: [u8; 32] = if deterministic_device_id {
-        use hkdf::Hkdf;
-        use sha2::Sha256;
-        let hkdf = Hkdf::<Sha256>::new(None, &seed);
-        let mut seed_out = [0u8; 32];
-        hkdf.expand(b"viaticum-device-seed-v1", &mut seed_out)
-            .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
-        seed_out
-    } else {
-        rand::random()
-    };
-
-    let device_key = derive_device_key(&seed, &device_seed)
-        .map_err(|e| IdentityError::KeyDerivation(e.to_string()))?;
-    let device_id: [u8; 32] = device_key.verifying_key().to_bytes();
-
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let keyfile = IdentityKeyFile {
-        mnemonic: mnemonic.to_string(),
-        seed,
-        identity_pub,
-        device_seed,
-        device_id,
-        created_at,
-    };
-
-    // Serialize to CBOR.
-    let mut buf = Vec::new();
-    ciborium::ser::into_writer(&keyfile, &mut buf)
-        .map_err(|e| IdentityError::Cbor(e.to_string()))?;
-
-    // Write with restricted permissions (0600).
-    write_secret_file(&path, &buf)?;
-
-    // Write default config.toml if absent.
-    let config_path = data_dir.join("config.toml");
-    if !config_path.exists() {
-        std::fs::write(&config_path, DEFAULT_CONFIG_TOML)?;
+    // A catalog without its key is a node that lost identity.key: a new identity
+    // here would silently start a new, empty history over it (dr-i30).
+    if data_dir.join("db.redb").exists() {
+        return Err(IdentityError::CatalogWithoutKey(data_dir.to_path_buf()));
     }
 
+    std::fs::create_dir_all(data_dir)?;
+    let keyfile = build_keyfile(mnemonic, mode)?;
+    write_keyfile_at(&path, &keyfile)?;
+    write_default_config_if_absent(data_dir)?;
     Ok(keyfile)
 }
 
-/// Write `contents` to `path` with Unix permissions 0600.
+/// Write `contents` to a NEW file at `path` (never overwrites) with Unix permissions
+/// 0600.
 /// On Windows the file inherits ACL from its parent directory; the daemon's
 /// data dir lives under per-user `%APPDATA%`, which already restricts access
 /// to that user.
@@ -283,11 +405,19 @@ fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), IdentityError> 
             .open(path)?;
         use std::io::Write;
         file.write_all(contents)?;
+        // A key installed by rename/link must never surface empty after a crash.
+        file.sync_all()?;
     }
 
     #[cfg(not(unix))]
     {
-        std::fs::write(path, contents)?;
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
     }
 
     Ok(())
