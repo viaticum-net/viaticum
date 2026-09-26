@@ -27,7 +27,9 @@ use viaticum_core::types::{DeviceId, IdentityPub, Timestamp, hex_encode};
 
 use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent};
 use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
-use crate::daemon::identity::{IdentityError, derive_keys, load_identity};
+use crate::daemon::identity::{
+    IdentityError, corrupt_key_hint, derive_keys, load_identity, not_initialized_hint,
+};
 use crate::daemon::processor::Processor;
 use crate::daemon::repair::RepairTrigger;
 use crate::daemon::restore::{
@@ -142,15 +144,8 @@ impl DaemonHandle {
 
         // ── 1. Load identity ──────────────────────────────────────────────────
         let keyfile = load_identity(&cfg.data_dir).map_err(|e| match e {
-            IdentityError::NotInitialized => {
-                anyhow::anyhow!("identity not initialized — run 'viaticum init' first")
-            }
-            IdentityError::Corrupt(p, msg) => anyhow::anyhow!(
-                "identity file at {} is corrupt or from an incompatible binary version ({}). \
-                 Delete the file and re-run 'viaticum init', or restore from backup.",
-                p.display(),
-                msg
-            ),
+            IdentityError::NotInitialized => anyhow::anyhow!(not_initialized_hint(&cfg.data_dir)),
+            IdentityError::Corrupt(p, msg) => anyhow::anyhow!(corrupt_key_hint(&p, &msg)),
             other => anyhow::anyhow!(
                 "identity load error from {}: {}",
                 cfg.data_dir.join("identity.key").display(),
