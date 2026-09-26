@@ -70,8 +70,6 @@ fn restore_config(_symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreConfi
     RestoreConfig {
         epoch_key: EPOCH_KEY,
         parallel_holders: 5,
-        identity: IdentityPub([0x99u8; 32]),
-        device_id: device_b(),
         swarm: None,
         staging_root,
         data_dir: staging_dir.path().to_path_buf(),
@@ -263,7 +261,6 @@ async fn full_lifecycle_e2e() {
         .restore(RestoreRequest {
             path: photo_path.clone(),
             version_selector: VersionSelector::Latest,
-            device_id: device_b(),
             job_id: JobId::new(),
         })
         .await
@@ -289,7 +286,6 @@ async fn full_lifecycle_e2e() {
         .restore(RestoreRequest {
             path: prefix,
             version_selector: VersionSelector::Latest,
-            device_id: device_b(),
             job_id: JobId::new(),
         })
         .await
@@ -422,8 +418,9 @@ async fn full_lifecycle_e2e() {
 
     let engine = DeletionEngine::new();
 
-    // Re-read document.txt: Step 3c (directory restore) added DEVICE_B as Present.
-    // Both devices must be in Deleted state before mark_deleted returns CooldownStarted.
+    // Re-read document.txt. Restore never writes LocalState (CS-DR-6), so DEVICE_B has
+    // an entry only if something else added it; any DEVICE_B entry is marked Deleted
+    // first so that mark_deleted(DEVICE_A) returns CooldownStarted.
     let doc_record = db
         .get_file(&doc_path)
         .unwrap()

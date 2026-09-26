@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use crate::constants::{
     HOLDER_DELETE_COOLDOWN_SECS, OWNER_DELETE_COOLDOWN_SECS, VACUUM_INVALID_THRESHOLD,
 };
@@ -5,6 +7,11 @@ use crate::types::{
     DeviceId, FileId, FileRecord, LocalState, PlacementStatus, SourceBlockId, SourceBlockRecord,
     SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
 };
+
+mod refs;
+
+use refs::all_devices_deleted_at;
+pub use refs::{latest_deletion_per_block, live_referenced_blocks};
 
 // ── Actions returned to the daemon ──────────────────────────────────────────
 
@@ -126,11 +133,26 @@ impl DeletionEngine {
     /// Called by the scheduler on every tick. Scans all provided records and
     /// returns the actions to execute this tick.
     ///
+    /// `files` must be the WHOLE catalog: the release guard (delete-i3) is computed
+    /// over it, so a partial slice can release a block a missing record still uses.
+    ///
+    /// Release is decided per block, not per record (delete-i3):
+    /// - a block referenced by the current version of a record that is not deleted on
+    ///   every device ([`live_referenced_blocks`]) gets no `SendDropNotice`,
+    ///   `CleanupPlacement` or `CleanupBlock`;
+    /// - otherwise the owner and holder windows of the block run from the LATEST
+    ///   deletion among the records referencing it ([`latest_deletion_per_block`]), so a
+    ///   pack member deleted later keeps its full undo window (restore-i9).
+    ///
+    /// A block already in `Deleting` that becomes live-referenced again gets no further
+    /// actions; undoing a sent DropNotice is out of scope (line C, backup-iN).
+    ///
     /// `time_scale` accelerates cooldowns: effective cooldown = constant / time_scale.
     /// Pass 1 for real-time.
     ///
     /// Returns actions sorted: SendDropNotice first, then CleanupPlacement,
-    /// then CleanupBlock. VacuumBlock appended last.
+    /// then CleanupBlock. VacuumBlock appended last. Placement-level actions are
+    /// emitted once per block; `CleanupBlock` once per (block, deleted record).
     ///
     /// Idempotent: calling twice with the same inputs returns the same actions.
     pub fn process_cooldowns(
@@ -142,82 +164,65 @@ impl DeletionEngine {
         time_scale: u64,
     ) -> Vec<DeletionAction> {
         let scale = time_scale.max(1);
+        let owner_cooldown = OWNER_DELETE_COOLDOWN_SECS / scale;
+        let holder_cooldown = HOLDER_DELETE_COOLDOWN_SECS / scale;
+
+        let live = live_referenced_blocks(files);
+        let latest_deletion = latest_deletion_per_block(files);
+
         let mut send_drop: Vec<DeletionAction> = Vec::new();
         let mut cleanup_placement: Vec<DeletionAction> = Vec::new();
         let mut cleanup_block: Vec<DeletionAction> = Vec::new();
+        // Block -> "every placement cleaned this tick" (placement actions already emitted).
+        let mut block_cleaned: HashMap<SourceBlockId, bool> = HashMap::new();
+        let mut cleanup_emitted: HashSet<(SourceBlockId, FileId)> = HashSet::new();
 
         for file in files {
-            let all_deleted_at = match all_devices_deleted_at(file) {
-                Some(ts) => ts,
-                None => continue,
-            };
-
-            let owner_cooldown = OWNER_DELETE_COOLDOWN_SECS / scale;
-            let holder_cooldown = HOLDER_DELETE_COOLDOWN_SECS / scale;
-
-            let owner_cooldown_elapsed = all_deleted_at.0 + owner_cooldown <= now.0;
-            if !owner_cooldown_elapsed {
+            if all_devices_deleted_at(file).is_none() {
                 continue;
             }
 
-            let drop_sent_at = all_deleted_at.0 + owner_cooldown;
-            let holder_cooldown_elapsed = drop_sent_at + holder_cooldown <= now.0;
-
             for version in &file.versions {
-                let block = match blocks
-                    .iter()
-                    .find(|b| b.block_id == version.source_block_id)
-                {
+                let block_id = version.source_block_id;
+                if live.contains(&block_id) {
+                    continue;
+                }
+                let deleted_at = match latest_deletion.get(&block_id) {
+                    Some(ts) => *ts,
+                    None => continue,
+                };
+
+                let drop_sent_at = deleted_at.0.saturating_add(owner_cooldown);
+                if drop_sent_at > now.0 {
+                    continue;
+                }
+                let holder_cooldown_elapsed = drop_sent_at.saturating_add(holder_cooldown) <= now.0;
+
+                let block = match blocks.iter().find(|b| b.block_id == block_id) {
                     Some(b) => b,
                     None => continue,
                 };
 
-                let block_placements: Vec<&SymbolPlacement> = placements
-                    .iter()
-                    .filter(|p| p.source_block_id == block.block_id)
-                    .collect();
-
-                match block.status {
-                    SourceBlockStatus::Active | SourceBlockStatus::Stale => {
-                        for p in &block_placements {
-                            if p.status != PlacementStatus::Deleting {
-                                send_drop.push(DeletionAction::SendDropNotice {
-                                    source_block_id: block.block_id,
-                                    holder_id: p.holder_id,
-                                });
-                            }
-                        }
+                let all_cleaned = match block_cleaned.get(&block_id) {
+                    Some(done) => *done,
+                    None => {
+                        let done = release_block(
+                            block,
+                            placements,
+                            holder_cooldown_elapsed,
+                            &mut send_drop,
+                            &mut cleanup_placement,
+                        );
+                        block_cleaned.insert(block_id, done);
+                        done
                     }
-                    SourceBlockStatus::Deleting => {
-                        let mut all_cleaned = true;
+                };
 
-                        for p in &block_placements {
-                            if p.status == PlacementStatus::Deleting {
-                                if holder_cooldown_elapsed {
-                                    cleanup_placement.push(DeletionAction::CleanupPlacement {
-                                        source_block_id: block.block_id,
-                                        holder_id: p.holder_id,
-                                    });
-                                } else {
-                                    all_cleaned = false;
-                                }
-                            } else {
-                                send_drop.push(DeletionAction::SendDropNotice {
-                                    source_block_id: block.block_id,
-                                    holder_id: p.holder_id,
-                                });
-                                all_cleaned = false;
-                            }
-                        }
-
-                        if holder_cooldown_elapsed && all_cleaned && !block_placements.is_empty() {
-                            cleanup_block.push(DeletionAction::CleanupBlock {
-                                source_block_id: block.block_id,
-                                file_id: file.file_id,
-                            });
-                        }
-                    }
-                    SourceBlockStatus::Deleted => {}
+                if all_cleaned && cleanup_emitted.insert((block_id, file.file_id)) {
+                    cleanup_block.push(DeletionAction::CleanupBlock {
+                        source_block_id: block_id,
+                        file_id: file.file_id,
+                    });
                 }
             }
         }
@@ -304,24 +309,57 @@ impl Default for DeletionEngine {
     }
 }
 
-/// Returns the timestamp when all devices marked the file deleted, or None if
-/// any device is still Present.
-fn all_devices_deleted_at(file: &FileRecord) -> Option<Timestamp> {
-    if file.devices.is_empty() {
-        return None;
-    }
-    let mut max_ts = Timestamp(0);
-    for (_, state) in &file.devices {
-        match state {
-            LocalState::Present => return None,
-            LocalState::Deleted(ts) => {
-                if *ts > max_ts {
-                    max_ts = *ts;
+/// Placement-level release actions for one unprotected block whose owner window has
+/// elapsed. Pushes `SendDropNotice` / `CleanupPlacement`; returns true when every
+/// placement is cleaned this tick and the block row itself may go (`CleanupBlock`).
+fn release_block(
+    block: &SourceBlockRecord,
+    placements: &[SymbolPlacement],
+    holder_cooldown_elapsed: bool,
+    send_drop: &mut Vec<DeletionAction>,
+    cleanup_placement: &mut Vec<DeletionAction>,
+) -> bool {
+    let block_placements: Vec<&SymbolPlacement> = placements
+        .iter()
+        .filter(|p| p.source_block_id == block.block_id)
+        .collect();
+
+    match block.status {
+        SourceBlockStatus::Active | SourceBlockStatus::Stale => {
+            for p in &block_placements {
+                if p.status != PlacementStatus::Deleting {
+                    send_drop.push(DeletionAction::SendDropNotice {
+                        source_block_id: block.block_id,
+                        holder_id: p.holder_id,
+                    });
                 }
             }
+            false
         }
+        SourceBlockStatus::Deleting => {
+            let mut all_cleaned = true;
+            for p in &block_placements {
+                if p.status == PlacementStatus::Deleting {
+                    if holder_cooldown_elapsed {
+                        cleanup_placement.push(DeletionAction::CleanupPlacement {
+                            source_block_id: block.block_id,
+                            holder_id: p.holder_id,
+                        });
+                    } else {
+                        all_cleaned = false;
+                    }
+                } else {
+                    send_drop.push(DeletionAction::SendDropNotice {
+                        source_block_id: block.block_id,
+                        holder_id: p.holder_id,
+                    });
+                    all_cleaned = false;
+                }
+            }
+            holder_cooldown_elapsed && all_cleaned && !block_placements.is_empty()
+        }
+        SourceBlockStatus::Deleted => false,
     }
-    Some(max_ts)
 }
 
 #[cfg(test)]

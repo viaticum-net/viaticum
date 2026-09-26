@@ -506,8 +506,6 @@ impl DaemonHandle {
             RestoreConfig {
                 epoch_key: epoch_key_bytes,
                 parallel_holders: 5,
-                identity: identity_pub,
-                device_id,
                 swarm: swarm_handle_arc.clone(),
                 staging_root: staging_root.clone(),
                 data_dir: cfg.data_dir.clone(),

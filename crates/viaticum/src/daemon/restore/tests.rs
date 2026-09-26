@@ -17,7 +17,7 @@ use viaticum_core::db::Db;
 use viaticum_core::erasure::RaptorQEncoder;
 use viaticum_core::types::to_cbor_bytes;
 use viaticum_core::types::{
-    DeviceId, ErasureParams, FileId, FileRecord, FileVersion, IdentityPub, LocalState, PackEntry,
+    DeviceId, ErasureParams, FileId, FileRecord, FileVersion, LocalState, PackEntry,
     PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType,
     SymbolPlacement, Timestamp,
 };
@@ -78,8 +78,6 @@ fn test_restore_coord(db: Db, _symbols_dir: &TempDir, staging_dir: &TempDir) -> 
     let restore_config = RestoreConfig {
         epoch_key: TEST_EPOCH_KEY,
         parallel_holders: 5,
-        identity: IdentityPub([9u8; 32]),
-        device_id: DeviceId([2u8; 32]),
         swarm: None,
         staging_root,
         data_dir: staging_dir.path().to_path_buf(),
@@ -349,7 +347,6 @@ async fn restore_single_file_by_exact_path() {
     let request = super::RestoreRequest {
         path: path.clone(),
         version_selector: VersionSelector::Latest,
-        device_id: DeviceId([2u8; 32]),
         job_id: JobId::new(),
     };
     let result = restore.restore(request).await.unwrap();
@@ -394,7 +391,6 @@ async fn restore_pack_multiple_files_roundtrip() {
     let request = super::RestoreRequest {
         path: prefix,
         version_selector: VersionSelector::Latest,
-        device_id: DeviceId([2u8; 32]),
         job_id: JobId::new(),
     };
     let result = restore.restore(request).await.unwrap();
@@ -462,7 +458,6 @@ async fn restore_latest_version_via_source_rebuild() {
     let request_latest = super::RestoreRequest {
         path: path.clone(),
         version_selector: VersionSelector::Latest,
-        device_id: DeviceId([2u8; 32]),
         job_id: JobId::new(),
     };
     let result2 = restore.restore(request_latest).await.unwrap();
@@ -511,7 +506,6 @@ async fn restore_prefix_matches_multiple_files() {
     let request = super::RestoreRequest {
         path: photos_prefix,
         version_selector: VersionSelector::Latest,
-        device_id: DeviceId([2u8; 32]),
         job_id: JobId::new(),
     };
     let result = restore.restore(request).await.unwrap();
@@ -538,7 +532,6 @@ async fn restore_missing_path_returns_empty_result() {
     let request = super::RestoreRequest {
         path: "/nonexistent/file.txt".to_string(),
         version_selector: VersionSelector::Latest,
-        device_id: DeviceId([2u8; 32]),
         job_id: JobId::new(),
     };
     let result = restore.restore(request).await.unwrap();
@@ -548,8 +541,11 @@ async fn restore_missing_path_returns_empty_result() {
     assert_eq!(result.failures[0].0, "/nonexistent/file.txt");
 }
 
+/// CS-DR-6 / restore-i11: restore writes the file into staging and leaves the
+/// catalog's per-device state alone (no `Present` for the restoring device, no new
+/// device entry).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restore_updates_local_state_to_present() {
+async fn restore_does_not_change_local_state() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
     let files_dir = TempDir::new().unwrap();
@@ -561,29 +557,75 @@ async fn restore_updates_local_state_to_present() {
     let mut backup = test_backup_coord(db.clone(), &symbols_dir);
     backup.process_event(added_event(&path)).unwrap();
     backup.flush_all(true, &Default::default()).unwrap();
+    let devices_before = db.get_file(&path).unwrap().unwrap().devices;
 
-    let restore_device = DeviceId([2u8; 32]);
     let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
     let request = super::RestoreRequest {
         path: path.clone(),
         version_selector: VersionSelector::Latest,
-        device_id: restore_device,
         job_id: JobId::new(),
     };
     let result = restore.restore(request).await.unwrap();
-    assert_eq!(result.files_restored, 1);
+    assert_eq!(result.files_restored, 1, "failures: {:?}", result.failures);
 
-    // Check LocalState updated
-    let record = db.get_file(&path).unwrap().unwrap();
-    let state = record
-        .devices
-        .iter()
-        .find(|(d, _)| *d == restore_device)
-        .map(|(_, s)| s);
+    let devices_after = db.get_file(&path).unwrap().unwrap().devices;
+    assert_eq!(devices_after, devices_before);
+}
+
+/// CS-DR-6 + delete-i3: restoring a file whose record is deleted keeps the record
+/// deleted, so its block is not live-referenced and the owner delete window keeps
+/// running from the original deletion time. (The source stays on disk only so the
+/// unit test can rebuild the block without a network; the catalog state is what is
+/// checked.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_of_deleted_file_keeps_delete_cooldown_running() {
+    use viaticum_core::deletion::{latest_deletion_per_block, live_referenced_blocks};
+
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+
+    let content = b"deleted then restored";
+    let path = write_file(&files_dir, "gone.txt", content);
+
+    let mut backup = test_backup_coord(db.clone(), &symbols_dir);
+    backup.process_event(added_event(&path)).unwrap();
+    backup.flush_all(true, &Default::default()).unwrap();
+
+    // The user deletes the file; the watcher marks the record deleted on the device.
+    let deleted_at = Timestamp(1_000);
+    let mut record = db.get_file(&path).unwrap().unwrap();
+    assert!(!record.devices.is_empty());
+    for (_, state) in record.devices.iter_mut() {
+        *state = LocalState::Deleted(deleted_at);
+    }
+    db.upsert_file(&record).unwrap();
+    let block = record.versions.last().unwrap().source_block_id;
+
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
+    let request = super::RestoreRequest {
+        path: path.clone(),
+        version_selector: VersionSelector::Latest,
+        job_id: JobId::new(),
+    };
+    let result = restore.restore(request).await.unwrap();
+    assert_eq!(result.files_restored, 1, "failures: {:?}", result.failures);
+
+    let after = db.get_file(&path).unwrap().unwrap();
     assert!(
-        matches!(state, Some(LocalState::Present)),
-        "expected Present, got {:?}",
-        state
+        after
+            .devices
+            .iter()
+            .all(|(_, s)| *s == LocalState::Deleted(deleted_at)),
+        "restore changed LocalState: {:?}",
+        after.devices
+    );
+    let files = db.list_all_files().unwrap();
+    assert!(!live_referenced_blocks(&files).contains(&block));
+    assert_eq!(
+        latest_deletion_per_block(&files).get(&block),
+        Some(&deleted_at)
     );
 }
 
@@ -612,7 +654,6 @@ async fn restore_deduplicates_source_blocks() {
     let request = super::RestoreRequest {
         path: prefix,
         version_selector: VersionSelector::Latest,
-        device_id: DeviceId([2u8; 32]),
         job_id: JobId::new(),
     };
     let result = restore.restore(request).await.unwrap();
@@ -693,7 +734,6 @@ async fn one_unrecoverable_block_does_not_abort_remaining_blocks() {
     let request = super::RestoreRequest {
         path: prefix,
         version_selector: VersionSelector::Latest,
-        device_id: DeviceId([2u8; 32]),
         job_id: JobId::new(),
     };
 
@@ -1071,8 +1111,6 @@ async fn fetch_skips_denied_holder_and_tries_next() {
     let restore_config = RestoreConfig {
         epoch_key,
         parallel_holders: 5,
-        identity: owner_master,
-        device_id: owner_did,
         swarm: None,
     };
     let coord = RestoreCoordinator::new(db, restore_config, encoder.clone(), Arc::new(owner_net));
@@ -1345,8 +1383,6 @@ async fn decode_block_fetches_from_network_when_local_files_missing() {
     let restore_config = RestoreConfig {
         epoch_key,
         parallel_holders: 5,
-        identity: owner_master,
-        device_id: owner_did,
         swarm: None,
     };
     let coord = RestoreCoordinator::new(db, restore_config, encoder, Arc::new(owner_net));
@@ -1387,7 +1423,6 @@ async fn default_restore_writes_to_staging_not_origin() {
     let request = super::RestoreRequest {
         path: original_path.clone(),
         version_selector: VersionSelector::Latest,
-        device_id: DeviceId([2u8; 32]),
         job_id: JobId::new(),
     };
     let result = restore.restore(request).await.unwrap();
@@ -1581,7 +1616,6 @@ async fn restore_result_contains_staging_path() {
     let request = super::RestoreRequest {
         path: path.clone(),
         version_selector: VersionSelector::Latest,
-        device_id: DeviceId([2u8; 32]),
         job_id: JobId::new(),
     };
     let result = restore.restore(request).await.unwrap();
@@ -2051,7 +2085,6 @@ async fn restore_reconstructs_from_source_when_raw_missing() {
     let request = super::RestoreRequest {
         path: path.clone(),
         version_selector: VersionSelector::Latest,
-        device_id: DeviceId([2u8; 32]),
         job_id: JobId::new(),
     };
     let result = restore.restore(request).await;
