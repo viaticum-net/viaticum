@@ -4224,4 +4224,12 @@ fn the_daemon_recorder_leaks_at_exactly_the_model_defaults_this_sim_runs_on() {
         viaticum_core::constants::PAIR_LEDGER_LAMBDA_SLOW,
         "λ_slow: same, for the loyalty depth D"
     );
+    // У-3. Guards the LEAK RATE of v_dem only. The volume v_dem ratchets on is NOT
+    // comparable: the sim ratchets per challenged symbol (engine.rs:1874), the daemon on
+    // the pair's footprint (Р-8) — this assert does not and cannot claim otherwise.
+    assert_eq!(
+        model.lambda_dem,
+        viaticum_core::constants::PAIR_LEDGER_LAMBDA_DEM,
+        "λ_dem: the demonstrated-scale ratchet must leak at the sim's rate"
+    );
 }

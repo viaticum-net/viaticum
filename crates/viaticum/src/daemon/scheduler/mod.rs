@@ -25,7 +25,7 @@ use viaticum_core::deletion::{DeletionAction, DeletionEngine};
 use viaticum_core::mailbox::{DeleteRequestPayload, MailboxClass, MailboxEntry};
 use viaticum_core::messages::{PosHashResponseMsg, to_cbor};
 use viaticum_core::pair_ledger::{
-    AccrualStats, PairLedgerError, PairLedgerRecorder, tick_interval_secs,
+    AccrualStats, PairLedgerError, PairLedgerRecorder, TickReport, tick_interval_secs,
 };
 use viaticum_core::pos::{VerifyOutcome, apply_pos_outcome, due_challenges, outcome_from_verify};
 use viaticum_core::trust::{compute_combined, compute_effective_trust, recalculate_trust};
@@ -161,7 +161,8 @@ impl Scheduler {
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let scale = self.config.time_scale.max(1);
-        let pos_interval = Duration::from_secs((self.config.pos_interval_secs / scale).max(1));
+        let pos_interval =
+            Duration::from_secs(scaled_timer_secs(self.config.pos_interval_secs, scale));
         let timeout_interval = Duration::from_secs((self.config.timeout_check_secs / scale).max(1));
         // Deletion check: same interval as PoS (hourly, scaled).
         let deletion_interval = Duration::from_secs((3600 / scale).max(1));
@@ -227,16 +228,19 @@ impl Scheduler {
                     }
                 }
                 _ = ledger_timer.tick() => {
-                    match self.accrue_pair_ledgers(Timestamp::now()) {
-                        Ok(stats) => {
+                    match self.accrue_pair_ledgers_report(Timestamp::now()) {
+                        Ok(report) => {
+                            let stats = report.stats;
                             debug!(
                                 accrued = stats.accrued,
                                 seeded = stats.seeded,
                                 idle = stats.idle,
                                 with_unobserved_gap = stats.with_unobserved_gap,
                                 truncated = stats.truncated,
+                                believed_not_confirmed = stats.believed_not_confirmed,
                                 "scheduler: pair-ledger accrual tick"
                             );
+                            log_ledger_rows(&report);
                             if stats.truncated > 0 {
                                 // Only a corrupt `last_update` reaches the sub-step ceiling
                                 // (8000 years in one call). Say so instead of swallowing it,
@@ -1371,12 +1375,61 @@ impl Scheduler {
     ///
     /// Synchronous (no await points) and O(one pass per table), because it runs inside the
     /// `select!` loop; `now` is a parameter so tests can drive the clock.
+    ///
+    /// Signature kept from У-2; delegates to [`Scheduler::accrue_pair_ledgers_report`], so
+    /// the tests and the run loop go through one path.
     pub fn accrue_pair_ledgers(&self, now: Timestamp) -> Result<AccrualStats, PairLedgerError> {
-        PairLedgerRecorder::new(self.db.clone()).tick(
+        self.accrue_pair_ledgers_report(now).map(|r| r.stats)
+    }
+
+    /// [`Scheduler::accrue_pair_ledgers`] plus the rows the tick wrote (У-3), for the
+    /// per-row `pair-ledger row` log line. The run loop is the ONLY reader of the report's
+    /// rows (AC-7): nothing branches on them.
+    pub fn accrue_pair_ledgers_report(
+        &self,
+        now: Timestamp,
+    ) -> Result<TickReport, PairLedgerError> {
+        PairLedgerRecorder::new(self.db.clone()).tick_report(
             &self.my_master_pub,
             now,
             self.config.time_scale,
         )
+    }
+}
+
+/// Real-time period of a scheduler timer built from a base period in seconds:
+/// `(base / scale).max(1)` — integer division with a one-second floor, `scale = 0` read as 1.
+/// Shared with the tests that rebuild the PoS cycle (AC-9), so they cannot drift from the
+/// timer they check.
+pub(crate) fn scaled_timer_secs(base_secs: u64, time_scale: u64) -> u64 {
+    (base_secs / time_scale.max(1)).max(1)
+}
+
+/// One debug line per ACCRUED pair-ledger row (У-3, Part 0) under the fixed target
+/// `viaticum::ledger`; enable with `RUST_LOG=info,viaticum::ledger=debug`. At `info` it is
+/// silent. Output of the writer, not a reader: nothing branches on it (AC-7).
+///
+/// CONTRACT with `experiments/local_ledger_test.sh`: the message `pair-ledger row`, the
+/// target and the field names (`master dt_days believed_gb confirmed_gb v_dem g_they depth
+/// observed_volume observed_tau`) are parsed by that scenario. Renaming any of them must
+/// break the scenario — that is intended. `f64` fields go through `Debug` (shortest
+/// round-trip form), so equal values print identical text; `master` is `IdentityPub`'s
+/// Display, the first 8 bytes in hex.
+fn log_ledger_rows(report: &TickReport) {
+    for row in &report.rows {
+        debug!(
+            target: "viaticum::ledger",
+            master = %row.master,
+            dt_days = ?row.dt_days,
+            believed_gb = ?row.believed_gb,
+            confirmed_gb = ?row.confirmed_gb,
+            v_dem = ?row.v_dem,
+            g_they = ?row.g_they,
+            depth = ?row.depth,
+            observed_volume = ?row.observed_volume,
+            observed_tau = ?row.observed_tau,
+            "pair-ledger row"
+        );
     }
 }
 

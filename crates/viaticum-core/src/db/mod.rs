@@ -11,7 +11,8 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 
 use crate::cluster::StoredClusterState;
 use crate::constants::{
-    BYTES_PER_GB, DROP_NOTICE_WINDOW_SECS, HOLDER_DELETE_COOLDOWN_SECS, SECS_PER_DAY,
+    BYTES_PER_GB, DROP_NOTICE_WINDOW_SECS, HOLDER_DELETE_COOLDOWN_SECS,
+    PAIR_LEDGER_CONFIRMATION_WINDOW_SECS, SECS_PER_DAY,
 };
 use crate::mailbox::{MailboxClass, MailboxEntry};
 use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
@@ -1379,8 +1380,15 @@ impl Db {
 pub struct MasterStorageBytes {
     /// The economic pair: a person, never a device.
     pub master: IdentityPub,
-    /// Bytes this master's devices keep for US (`Alive` placements × symbol size).
+    /// Bytes on `Alive` placements at this master's devices (× symbol size) — what we
+    /// BELIEVE they keep for us. Diagnostics only for the ledger since У-3 (Д-F = A): it is
+    /// logged next to the confirmed column, nothing is charged with it.
     pub they_store_for_us: u64,
+    /// The subset of those bytes whose placement is
+    /// [`SymbolPlacement::confirmed_at`] `now` (a PoS pass inside
+    /// [`PAIR_LEDGER_CONFIRMATION_WINDOW_SECS`]) — the `V_conf` of their service to us
+    /// (У-3). Always `<= they_store_for_us`: confirmation requires `Alive`.
+    pub they_store_for_us_confirmed: u64,
     /// Bytes WE keep for this master (`Active` holdings).
     pub we_store_for_them: u64,
 }
@@ -1720,7 +1728,16 @@ impl Db {
     /// matching what a per-master loop over the peer list would have produced. Ordering is
     /// by master identity bytes, so a sweep over the result cannot depend on insertion
     /// history.
-    pub fn storage_bytes_by_master(&self) -> Result<Vec<MasterStorageBytes>, DbError> {
+    ///
+    /// `now` and `time_scale` exist for ONE column, `they_store_for_us_confirmed`: the same
+    /// pass over SYMBOL_PLACEMENTS asks each `Alive` placement whether it is
+    /// [`SymbolPlacement::confirmed_at`] `now` on the scaled clock (У-3). No extra pass, no
+    /// extra table.
+    pub fn storage_bytes_by_master(
+        &self,
+        now: Timestamp,
+        time_scale: u64,
+    ) -> Result<Vec<MasterStorageBytes>, DbError> {
         let tx = self.inner.begin_read()?;
 
         // Pass 1: PEERS → device → master (and the master set itself).
@@ -1739,6 +1756,7 @@ impl Db {
                 totals.entry(master.0).or_insert(MasterStorageBytes {
                     master,
                     they_store_for_us: 0,
+                    they_store_for_us_confirmed: 0,
                     we_store_for_them: 0,
                 });
             }
@@ -1767,9 +1785,13 @@ impl Db {
                 }
                 let t = block_symbol_size(&blocks, &placement.source_block_id.0, &mut symbol_size)?;
                 if let Some(entry) = totals.get_mut(&master) {
-                    entry.they_store_for_us = entry
-                        .they_store_for_us
-                        .saturating_add(placement.symbol_count() as u64 * t);
+                    let bytes = placement.symbol_count() as u64 * t;
+                    entry.they_store_for_us = entry.they_store_for_us.saturating_add(bytes);
+                    if placement.confirmed_at(now, time_scale, PAIR_LEDGER_CONFIRMATION_WINDOW_SECS)
+                    {
+                        entry.they_store_for_us_confirmed =
+                            entry.they_store_for_us_confirmed.saturating_add(bytes);
+                    }
                 }
             }
         }

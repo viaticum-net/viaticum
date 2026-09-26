@@ -8,18 +8,30 @@
 //         Euler scheme, never a tuned epsilon.
 //   AC-7  the daemon decides nothing differently — covered by the absence of decision
 //         readers and by the untouched expectations of every pre-existing test.
+//
+// У-3 (section "Спека У-3" of the same spec; intent private/intent/4r.md):
+//   AC-3a..h  the `v_dem` ratchet: snaps to the confirmed volume, is the kernel sequence,
+//             melts no faster than λ_dem, never below the confirmed volume, grows only on
+//             confirmed service, dark before light, untouched by seeding/idle ticks.
+//   AC-8      "their service to us" is charged by CONFIRMED volume (Alive + a PoS pass
+//             inside W_conf), never by belief.
+//   AC-9      W_conf covers an always-on holder's PoS cycle (daemon test S-2, K-1 here).
+//   Д-H       the run (V0, τ0): observed days only, min volume, ends on an unconfirmed tail.
+//   R-1/R-2   the tick report is exactly what the tick wrote (the per-row log line).
 
 use super::{
-    AccrualStats, PairLedgerRecorder, Volumes, accrue, accrue_interval, observed_window_days,
-    sub_steps, tick_interval_secs,
+    AccrualStats, PairLedgerRecorder, Volumes, accrue, accrue_interval, observe_run,
+    observed_window_days, sub_steps, tick_interval_secs,
 };
 use crate::constants::{
-    BYTES_PER_GB, PAIR_LEDGER_LAMBDA, PAIR_LEDGER_LAMBDA_SLOW, PAIR_LEDGER_OBSERVED_WINDOW_TICKS,
-    PAIR_LEDGER_TICK_SECS,
+    BYTES_PER_GB, MAILBOX_POLL_INTERVAL_SECS, PAIR_LEDGER_CONFIRMATION_WINDOW_SECS,
+    PAIR_LEDGER_LAMBDA, PAIR_LEDGER_LAMBDA_DEM, PAIR_LEDGER_LAMBDA_SLOW, PAIR_LEDGER_MAX_LAMBDA_DT,
+    PAIR_LEDGER_OBSERVED_WINDOW_TICKS, PAIR_LEDGER_TICK_SECS, POS_BASE_CHALLENGES_PER_WEEK,
+    SECS_PER_WEEK,
 };
 use crate::db::Db;
 use crate::db::testutil::test_db;
-use crate::four_r::{update_capital, update_depth};
+use crate::four_r::{update_capital, update_depth, update_v_dem};
 use crate::types::{
     DeviceId, HoldingRecord, HoldingStatus, IdentityPub, PairLedger, PeerRecord, PlacementStatus,
     SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement,
@@ -55,9 +67,12 @@ fn my_master() -> IdentityPub {
     master(0x01)
 }
 
+/// Believed and confirmed set to ONE number (У-3, У3-9): the У-2 tests are about the
+/// integrator, and under Д-F = A the axis is charged by the confirmed column.
 fn vol(they_store_for_us: f64, we_store_for_them: f64) -> Volumes {
     Volumes {
         they_store_for_us,
+        they_store_for_us_confirmed: they_store_for_us,
         we_store_for_them,
     }
 }
@@ -81,19 +96,29 @@ fn peer_of(dev: DeviceId, m: IdentityPub) -> PeerRecord {
     }
 }
 
-/// Record that `holder` keeps `gb` gibibytes of ours alive (owner-side view).
+/// Record that `holder` keeps `gb` gibibytes of ours alive (owner-side view), proven by a
+/// PoS pass at t = 0 — every test of the "they store" axis ticks inside `[0, TICK]`, well
+/// within the confirmation window (У3-9).
 fn peer_stores_for_us(db: &Db, block_seed: u8, holder: DeviceId, gb: u32) {
-    placement_in_status(db, block_seed, holder, gb, PlacementStatus::Alive);
+    placement_in_status(
+        db,
+        block_seed,
+        holder,
+        gb,
+        PlacementStatus::Alive,
+        Some(Timestamp(0)),
+    );
 }
 
-/// The same, in an arbitrary placement status — for checking what the volume queries
-/// EXCLUDE.
+/// The same, in an arbitrary placement status and with an arbitrary last PoS pass — for
+/// checking what the volume queries EXCLUDE and what counts as confirmed.
 fn placement_in_status(
     db: &Db,
     block_seed: u8,
     holder: DeviceId,
     gb: u32,
     status: PlacementStatus,
+    last_verified: Option<Timestamp>,
 ) {
     let block = SourceBlockRecord {
         block_id: SourceBlockId([block_seed; 32]),
@@ -119,7 +144,7 @@ fn placement_in_status(
         esi_ranges: vec![(0, SYMBOLS_PER_GB * gb)],
         binding_seed: [0u8; 32],
         status,
-        last_verified: None,
+        last_verified,
         placed_at: Timestamp(0),
         consecutive_misses: 0,
     })
@@ -815,10 +840,17 @@ fn the_sweep_and_the_point_queries_report_the_same_volumes() {
     peer_stores_for_us(&db, 0xF7, device(0xF4), 2);
     we_store_for(&db, 0xF8, a, 11);
     we_store_for(&db, 0xF9, b, 13);
-    placement_in_status(&db, 0xFA, device(0xF2), 7, PlacementStatus::PresumedLost);
+    placement_in_status(
+        &db,
+        0xFA,
+        device(0xF2),
+        7,
+        PlacementStatus::PresumedLost,
+        None,
+    );
     holding_in_status(&db, 0xFB, a, 17, HoldingStatus::MarkedForDelete);
 
-    let sweep = db.storage_bytes_by_master().unwrap();
+    let sweep = db.storage_bytes_by_master(Timestamp(TICK), 1).unwrap();
 
     assert_eq!(sweep.len(), 2);
     let a_row = sweep.iter().find(|r| r.master == a).expect("row for a");
@@ -1024,4 +1056,704 @@ fn accrual_resumes_from_the_stored_clock_after_a_restart() {
         after.gb_days_we_store_for_them > before.gb_days_we_store_for_them,
         "the restarted daemon must continue the integral, not reset it"
     );
+}
+
+// ═══ У-3: the v_dem ratchet, the run (V0, τ0) and the confirmation signal ═══
+
+/// One hour in days at `time_scale = 1` — the length of one on-schedule tick.
+fn hour_days() -> f64 {
+    TICK as f64 / DAY as f64
+}
+
+/// A pair `them` (one device) that holds `gb` gibibytes of ours, last proven at
+/// `passed_at` (`None` = accepted and never proven).
+fn pair_holding_for_us(
+    db: &Db,
+    them: IdentityPub,
+    dev: DeviceId,
+    block_seed: u8,
+    gb: u32,
+    passed_at: Option<u64>,
+) {
+    db.upsert_peer(&peer_of(dev, them)).unwrap();
+    placement_in_status(
+        db,
+        block_seed,
+        dev,
+        gb,
+        PlacementStatus::Alive,
+        passed_at.map(Timestamp),
+    );
+}
+
+// ── AC-3: the ratchet ───────────────────────────────────────────────────────
+
+#[test]
+fn v_dem_snaps_up_to_the_confirmed_volume_in_one_observed_tick() {
+    // AC-3a. The ratchet is a MAX, not an integral: one observed tick with a confirmed
+    // volume above the old scale lands on that volume exactly.
+    let mut ledger = PairLedger {
+        v_dem: 3.0,
+        ..PairLedger::default()
+    };
+
+    accrue_interval(&mut ledger, &vol(7.0, 0.0), hour_days(), real_time_window());
+
+    assert_eq!(ledger.v_dem, 7.0);
+}
+
+#[test]
+fn v_dem_equals_the_kernel_ratchet_sequence_over_the_same_sub_steps() {
+    // AC-3b — the N-1 form of AC-1: 95 days need four sub-steps, and the ratchet must be
+    // exactly `update_v_dem` applied over those same four steps.
+    let mut ledger = PairLedger {
+        v_dem: 10.0,
+        ..PairLedger::default()
+    };
+    let dt = 95.0;
+    let plan = sub_steps(dt);
+    assert_eq!(plan.count, 4, "premise: 95 days → 4 sub-steps");
+
+    accrue(&mut ledger, &vol(4.0, 0.0), dt);
+
+    let mut expected = 10.0_f64;
+    for _ in 0..plan.count {
+        expected = update_v_dem(expected, 4.0, plan.step_days, PAIR_LEDGER_LAMBDA_DEM);
+    }
+    assert_eq!(ledger.v_dem, expected);
+}
+
+#[test]
+fn v_dem_never_falls_faster_than_lambda_dem_over_half_a_silent_year() {
+    // AC-3c. Half a year, not a year: at λ_dem·365 = 1 the lower bound degenerates to 0
+    // and the test would check nothing. The bounds are derived here, not tuned:
+    // (1 − λT) ≤ Π(1 − λ·dt_i) ≤ e^{−λT} for any partition of T.
+    let (v0, horizon) = (40.0_f64, 180.0_f64);
+    let lambda_t = PAIR_LEDGER_LAMBDA_DEM * horizon;
+    assert!(
+        lambda_t <= 1.0,
+        "premise: the bound is claimed for λ_dem·T ≤ 1"
+    );
+    let lower = v0 * (1.0 - lambda_t);
+    let upper = v0 * (-lambda_t).exp();
+
+    // (a) hourly ticks — the daemon's cadence at time_scale 1.
+    let mut hourly = PairLedger {
+        v_dem: v0,
+        ..PairLedger::default()
+    };
+    for _ in 0..(180 * 24) {
+        accrue(&mut hourly, &vol(0.0, 0.0), hour_days());
+    }
+    // (b) one long interval — six 30-day sub-steps.
+    let mut once = PairLedger {
+        v_dem: v0,
+        ..PairLedger::default()
+    };
+    assert_eq!(sub_steps(horizon).count, 6, "premise: 6 sub-steps");
+    accrue(&mut once, &vol(0.0, 0.0), horizon);
+
+    for (label, v) in [("hourly", hourly.v_dem), ("one interval", once.v_dem)] {
+        assert!(
+            lower <= v && v <= upper,
+            "{label}: v_dem {v} outside [{lower}, {upper}]"
+        );
+    }
+}
+
+#[test]
+fn v_dem_is_never_below_the_confirmed_volume_after_an_accrual() {
+    // AC-3d, as a property over a grid of start scale × confirmed volume × interval
+    // (the intervals cover one tick, a day, one full sub-step and a sub-stepped span).
+    for v_dem0 in [0.0, 1.0, 50.0] {
+        for v in [0.0, 2.0, 50.0, 80.0] {
+            for dt in [1.0 / 24.0, 1.0, 30.0, 95.0] {
+                let mut ledger = PairLedger {
+                    v_dem: v_dem0,
+                    ..PairLedger::default()
+                };
+                accrue(&mut ledger, &vol(v, 0.0), dt);
+                assert!(
+                    ledger.v_dem >= v,
+                    "v_dem₀={v_dem0}, V={v}, Δt={dt}: v_dem {} < V",
+                    ledger.v_dem
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_unobserved_gap_decays_v_dem_before_the_tail_can_snap_it() {
+    // AC-3f. The confirmed 8 sits BETWEEN the decayed old scale (≈5.98) and the old 10:
+    // oldest-first decays 10 over the dark stretch and the tail snaps it to 8; the
+    // reverse order would keep ≈10 through the tail and then decay it to ≈5.98. With V
+    // below the decayed value the two orders would be ≈5.98 vs ≈5.975 — the test would
+    // then be checking rounding, not the order.
+    let window = real_time_window();
+    let dt = 180.0;
+    let mut ledger = PairLedger {
+        v_dem: 10.0,
+        ..PairLedger::default()
+    };
+
+    accrue_interval(&mut ledger, &vol(8.0, 0.0), dt, window);
+
+    let mut dark_first = PairLedger {
+        v_dem: 10.0,
+        ..PairLedger::default()
+    };
+    accrue(&mut dark_first, &vol(0.0, 0.0), dt - window);
+    let decayed = dark_first.v_dem;
+    accrue(&mut dark_first, &vol(8.0, 0.0), window);
+    let mut light_first = PairLedger {
+        v_dem: 10.0,
+        ..PairLedger::default()
+    };
+    accrue(&mut light_first, &vol(8.0, 0.0), window);
+    accrue(&mut light_first, &vol(0.0, 0.0), dt - window);
+
+    assert!(
+        decayed < 8.0 && 8.0 < 10.0,
+        "premise: V lies between the decayed ({decayed}) and the original scale"
+    );
+    assert_eq!(ledger.v_dem, dark_first.v_dem);
+    assert_eq!(
+        ledger.v_dem, 8.0,
+        "the tail snaps the decayed scale up to V"
+    );
+    assert!(
+        light_first.v_dem < 8.0,
+        "light-then-dark would have answered {} — a different number",
+        light_first.v_dem
+    );
+}
+
+#[test]
+fn the_first_tick_seeds_the_clock_without_snapping_v_dem() {
+    // AC-3g, C-6. A confirmed placement is present, but the seed tick has no interval:
+    // neither the ratchet nor the run may move, only the clock starts.
+    let db = test_db();
+    let them = master(0x41);
+    pair_holding_for_us(&db, them, device(0x42), 0x43, 5, Some(5 * DAY));
+
+    let stats = PairLedgerRecorder::new(db.clone())
+        .tick(&my_master(), Timestamp(5 * DAY), 1)
+        .unwrap();
+
+    assert_eq!(
+        db.get_pair_ledger(&them).unwrap().unwrap(),
+        ledger_at(0.0, 0.0, 0.0, Some(5 * DAY)),
+        "only last_update: v_dem, observed_volume, observed_tau all still 0"
+    );
+    assert_eq!(stats.seeded, 1);
+}
+
+#[test]
+fn a_second_tick_at_the_same_instant_accrues_nothing_for_a_confirmed_pair() {
+    // AC-3g, C-7 (the У-2 test of the same name, with a confirmed placement): the whole
+    // row, ratchet and run included, is left untouched by a clock that did not move.
+    let db = test_db();
+    let them = master(0x44);
+    pair_holding_for_us(&db, them, device(0x45), 0x46, 3, Some(0));
+    let recorder = PairLedgerRecorder::new(db.clone());
+
+    recorder.tick(&my_master(), Timestamp(0), 1).unwrap();
+    recorder.tick(&my_master(), Timestamp(TICK), 1).unwrap();
+    let after_first = db.get_pair_ledger(&them).unwrap().unwrap();
+    let stats = recorder.tick(&my_master(), Timestamp(TICK), 1).unwrap();
+    let after_second = db.get_pair_ledger(&them).unwrap().unwrap();
+
+    assert!(
+        after_first.v_dem > 0.0 && after_first.observed_tau > 0.0,
+        "premise: the first accrual moved the ratchet and the run"
+    );
+    assert_eq!(after_first, after_second);
+    assert_eq!(stats.idle, 1);
+}
+
+// ── AC-8: confirmation, not belief ──────────────────────────────────────────
+
+#[test]
+fn an_alive_placement_without_a_pass_charges_no_service_and_no_v_dem() {
+    // AC-3e / AC-8 / 4r-i1. The freeloader: accepted our data (Alive), never passed.
+    let db = test_db();
+    let them = master(0x47);
+    pair_holding_for_us(&db, them, device(0x48), 0x49, 40, None);
+    let recorder = PairLedgerRecorder::new(db.clone());
+
+    let seed = recorder.tick(&my_master(), Timestamp(0), 1).unwrap();
+    let stats = recorder.tick(&my_master(), Timestamp(TICK), 1).unwrap();
+
+    let row = db.get_pair_ledger(&them).unwrap().unwrap();
+    assert_eq!(row.v_dem, 0.0);
+    assert_eq!(row.gb_days_they_store_for_us, 0.0);
+    assert_eq!(row.depth_of_their_service, 0.0);
+    assert_eq!(row.observed_tau, 0.0);
+    assert_eq!(row.observed_volume, 0.0);
+    assert_eq!(
+        stats.believed_not_confirmed, 1,
+        "the gap between belief (40 gb) and proof (0) is counted"
+    );
+    assert_eq!(
+        seed.believed_not_confirmed, 0,
+        "a seed tick accrues nothing"
+    );
+}
+
+/// Accrue one on-schedule tick ending at `now` for a pair proven at `passed_at`, on a fresh
+/// DB; returns what the tick reported for that pair.
+fn one_tick_after_a_pass(passed_at: u64, now: u64, scale: u64) -> super::LedgerRowReport {
+    let db = test_db();
+    let them = master(0x4A);
+    pair_holding_for_us(&db, them, device(0x4B), 0x4C, 2, Some(passed_at));
+    let recorder = PairLedgerRecorder::new(db.clone());
+    recorder
+        .tick(
+            &my_master(),
+            Timestamp(now - tick_interval_secs(scale)),
+            scale,
+        )
+        .unwrap();
+    let report = recorder
+        .tick_report(&my_master(), Timestamp(now), scale)
+        .unwrap();
+    assert_eq!(report.stats.with_unobserved_gap, 0, "premise: on schedule");
+    report.rows.into_iter().next().expect("one accrued row")
+}
+
+#[test]
+fn a_pass_older_than_the_confirmation_window_stops_counting() {
+    // C-9 / 4r-i3. The window counts from the PASS, on the scaled clock, inclusive.
+    let pass = 100 * DAY;
+    let w = PAIR_LEDGER_CONFIRMATION_WINDOW_SECS;
+
+    let at_edge = one_tick_after_a_pass(pass, pass + w, 1);
+    let past_edge = one_tick_after_a_pass(pass, pass + w + 1, 1);
+    assert_eq!(at_edge.confirmed_gb, 2.0, "age = W_conf still counts");
+    assert_eq!(at_edge.v_dem, 2.0);
+    assert_eq!(past_edge.confirmed_gb, 0.0, "age = W_conf + 1 s does not");
+    assert_eq!(past_edge.v_dem, 0.0);
+    assert_eq!(past_edge.believed_gb, 2.0, "and belief is unaffected");
+
+    // At scale 1000 the same window is 1220.4 REAL seconds.
+    let in_scaled = one_tick_after_a_pass(pass, pass + 1220, 1000);
+    let out_scaled = one_tick_after_a_pass(pass, pass + 1221, 1000);
+    assert_eq!(in_scaled.confirmed_gb, 2.0);
+    assert_eq!(out_scaled.confirmed_gb, 0.0);
+}
+
+#[test]
+fn the_they_store_axis_and_the_depth_charge_only_confirmed_volume() {
+    // C-10, Д-F = A. One person, two machines: one proven for 3 gb, one Alive for 5 gb
+    // and never proven. G_they and D are the kernel on 3, not on 8.
+    let db = test_db();
+    let them = master(0x4D);
+    db.upsert_peer(&peer_of(device(0x4E), them)).unwrap();
+    db.upsert_peer(&peer_of(device(0x4F), them)).unwrap();
+    placement_in_status(
+        &db,
+        0x50,
+        device(0x4E),
+        3,
+        PlacementStatus::Alive,
+        Some(Timestamp(0)),
+    );
+    placement_in_status(&db, 0x51, device(0x4F), 5, PlacementStatus::Alive, None);
+    let recorder = PairLedgerRecorder::new(db.clone());
+
+    recorder.tick(&my_master(), Timestamp(0), 1).unwrap();
+    let report = recorder
+        .tick_report(&my_master(), Timestamp(TICK), 1)
+        .unwrap();
+
+    let dt = hour_days();
+    let row = db.get_pair_ledger(&them).unwrap().unwrap();
+    assert_eq!(
+        row.gb_days_they_store_for_us,
+        update_capital(0.0, 3.0, PAIR_LEDGER_LAMBDA, dt)
+    );
+    assert_eq!(
+        row.depth_of_their_service,
+        update_depth(0.0, 3.0, dt, PAIR_LEDGER_LAMBDA_SLOW)
+    );
+    assert_eq!(row.v_dem, 3.0);
+    assert_eq!(
+        report.rows[0].believed_gb, 8.0,
+        "belief still sees both machines"
+    );
+    assert_eq!(report.rows[0].confirmed_gb, 3.0);
+}
+
+#[test]
+fn a_holder_that_lost_our_data_melts_its_v_dem_instead_of_resetting_it() {
+    // 4r-i8. Fail/NotHeld → Lost: no longer confirmed, so the ratchet eases down through
+    // λ_dem like any silent pair — the loss itself is У-4's drop_silent, not a reset here.
+    let db = test_db();
+    let them = master(0x52);
+    pair_holding_for_us(&db, them, device(0x53), 0x54, 6, Some(0));
+    let recorder = PairLedgerRecorder::new(db.clone());
+    recorder.tick(&my_master(), Timestamp(0), 1).unwrap();
+    recorder.tick(&my_master(), Timestamp(TICK), 1).unwrap();
+    assert_eq!(db.get_pair_ledger(&them).unwrap().unwrap().v_dem, 6.0);
+
+    placement_in_status(
+        &db,
+        0x54,
+        device(0x53),
+        6,
+        PlacementStatus::Lost,
+        Some(Timestamp(0)),
+    );
+    recorder.tick(&my_master(), Timestamp(2 * TICK), 1).unwrap();
+
+    let row = db.get_pair_ledger(&them).unwrap().unwrap();
+    assert_eq!(
+        row.v_dem,
+        update_v_dem(6.0, 0.0, hour_days(), PAIR_LEDGER_LAMBDA_DEM)
+    );
+    assert!(row.v_dem > 0.0 && row.v_dem < 6.0);
+    assert_eq!((row.observed_volume, row.observed_tau), (0.0, 0.0));
+}
+
+#[test]
+fn a_new_block_is_not_confirmed_by_the_pass_of_the_block_it_replaced() {
+    // 4r-i7. The only block a pair held is replaced (file edited): the old placement goes,
+    // the new one is Alive without a pass. Nothing carries the old proof over, so the run
+    // ends until the new block is proven.
+    let db = test_db();
+    let them = master(0x55);
+    pair_holding_for_us(&db, them, device(0x56), 0x57, 4, Some(0));
+    let recorder = PairLedgerRecorder::new(db.clone());
+    recorder.tick(&my_master(), Timestamp(0), 1).unwrap();
+    recorder.tick(&my_master(), Timestamp(TICK), 1).unwrap();
+    assert!(db.get_pair_ledger(&them).unwrap().unwrap().observed_tau > 0.0);
+
+    placement_in_status(
+        &db,
+        0x57,
+        device(0x56),
+        4,
+        PlacementStatus::Deleting,
+        Some(Timestamp(0)),
+    );
+    placement_in_status(&db, 0x58, device(0x56), 4, PlacementStatus::Alive, None);
+    let report = recorder
+        .tick_report(&my_master(), Timestamp(2 * TICK), 1)
+        .unwrap();
+
+    assert_eq!(report.rows[0].believed_gb, 4.0);
+    assert_eq!(report.rows[0].confirmed_gb, 0.0);
+    assert_eq!(
+        (report.rows[0].observed_volume, report.rows[0].observed_tau),
+        (0.0, 0.0)
+    );
+}
+
+// ── Д-H: the run (V0, τ0) ───────────────────────────────────────────────────
+
+#[test]
+fn observed_tau_grows_by_the_observed_days_of_a_confirmed_tick() {
+    // C-11. Two on-schedule hours, both confirmed: τ0 = 2 h, V0 = the volume.
+    let db = test_db();
+    let them = master(0x60);
+    pair_holding_for_us(&db, them, device(0x61), 0x62, 3, Some(0));
+    let recorder = PairLedgerRecorder::new(db.clone());
+
+    recorder.tick(&my_master(), Timestamp(0), 1).unwrap();
+    recorder.tick(&my_master(), Timestamp(TICK), 1).unwrap();
+    recorder.tick(&my_master(), Timestamp(2 * TICK), 1).unwrap();
+
+    let row = db.get_pair_ledger(&them).unwrap().unwrap();
+    assert_eq!(row.observed_tau, 2.0 / 24.0);
+    assert_eq!(row.observed_volume, 3.0);
+}
+
+#[test]
+fn observed_volume_is_the_smallest_confirmed_volume_of_the_current_run() {
+    // C-12. "They kept at least V0 for τ0": the honest point is the MINIMUM of the run.
+    let mut ledger = PairLedger::default();
+    for v in [5.0, 8.0, 3.0, 6.0] {
+        observe_run(&mut ledger, v, hour_days());
+    }
+    assert_eq!(ledger.observed_volume, 3.0);
+    assert_eq!(ledger.observed_tau, 4.0 * hour_days());
+}
+
+#[test]
+fn an_observed_tail_with_nothing_confirmed_ends_the_run() {
+    // C-13. A zero tail ends the run; the next confirmed tick starts a NEW run at its own
+    // volume (not `min(0, V)` = 0, which would pin V0 at zero forever).
+    let mut ledger = PairLedger::default();
+    observe_run(&mut ledger, 5.0, hour_days());
+    observe_run(&mut ledger, 5.0, hour_days());
+
+    observe_run(&mut ledger, 0.0, hour_days());
+    assert_eq!((ledger.observed_volume, ledger.observed_tau), (0.0, 0.0));
+
+    observe_run(&mut ledger, 6.0, hour_days());
+    assert_eq!(ledger.observed_volume, 6.0);
+    assert_eq!(ledger.observed_tau, hour_days());
+}
+
+#[test]
+fn observe_run_ignores_a_degenerate_tail() {
+    // Nothing observed ⇒ nothing learned: neither growth nor a break.
+    let mut ledger = PairLedger {
+        observed_volume: 2.0,
+        observed_tau: 1.0,
+        ..PairLedger::default()
+    };
+    observe_run(&mut ledger, 0.0, 0.0);
+    observe_run(&mut ledger, 9.0, f64::NAN);
+    observe_run(&mut ledger, 9.0, -1.0);
+    assert_eq!((ledger.observed_volume, ledger.observed_tau), (2.0, 1.0));
+}
+
+#[test]
+fn a_dark_gap_neither_adds_to_observed_tau_nor_ends_a_run_that_is_still_confirmed() {
+    // C-14 / 4r-i4. Our node was down 5 days; the pair's last pass is still inside W_conf
+    // when we come back, so the run continues — by the observed window, not by 5 days.
+    let db = test_db();
+    let them = master(0x63);
+    pair_holding_for_us(&db, them, device(0x64), 0x65, 3, Some(0));
+    let recorder = PairLedgerRecorder::new(db.clone());
+    recorder.tick(&my_master(), Timestamp(0), 1).unwrap();
+    recorder.tick(&my_master(), Timestamp(TICK), 1).unwrap();
+    let tau = db.get_pair_ledger(&them).unwrap().unwrap().observed_tau;
+
+    let stats = recorder
+        .tick(&my_master(), Timestamp(TICK + 5 * DAY), 1)
+        .unwrap();
+
+    let row = db.get_pair_ledger(&them).unwrap().unwrap();
+    assert_eq!(stats.with_unobserved_gap, 1, "premise: a dark part existed");
+    assert_eq!(row.observed_tau, tau + observed_window_days(1));
+    assert_eq!(row.observed_volume, 3.0);
+    assert_eq!(
+        row.v_dem, 3.0,
+        "the tail re-snapped the ratchet to the proven volume"
+    );
+}
+
+#[test]
+fn an_owner_outage_longer_than_the_confirmation_window_ends_the_run() {
+    // C-16 / 4r-i6. Last pass at P, our next tick at P + W_conf + 1 h: the first observed
+    // tail after the outage sees the pass out of the window ⇒ the run ends, and v_dem only
+    // melts over the whole interval — no snap.
+    let pass = 100 * DAY;
+    let db = test_db();
+    let them = master(0x66);
+    pair_holding_for_us(&db, them, device(0x67), 0x68, 4, Some(pass));
+    let recorder = PairLedgerRecorder::new(db.clone());
+    recorder
+        .tick(&my_master(), Timestamp(pass - TICK), 1)
+        .unwrap();
+    recorder.tick(&my_master(), Timestamp(pass), 1).unwrap();
+    let before = db.get_pair_ledger(&them).unwrap().unwrap();
+    assert_eq!((before.v_dem, before.observed_volume), (4.0, 4.0));
+    assert!(before.observed_tau > 0.0);
+
+    let now = pass + PAIR_LEDGER_CONFIRMATION_WINDOW_SECS + TICK;
+    recorder.tick(&my_master(), Timestamp(now), 1).unwrap();
+
+    let row = db.get_pair_ledger(&them).unwrap().unwrap();
+    let dt = (now - pass) as f64 / DAY as f64;
+    let mut expected = before.clone();
+    accrue(&mut expected, &vol(0.0, 0.0), dt - real_time_window());
+    accrue(&mut expected, &vol(0.0, 0.0), real_time_window());
+    assert_eq!((row.observed_tau, row.observed_volume), (0.0, 0.0));
+    assert_eq!(row.v_dem, expected.v_dem);
+    assert_eq!(
+        row.gb_days_they_store_for_us,
+        expected.gb_days_they_store_for_us
+    );
+    assert_eq!(row.depth_of_their_service, expected.depth_of_their_service);
+    assert!(
+        row.v_dem > 0.0 && row.v_dem < 4.0,
+        "melted, not snapped and not reset"
+    );
+}
+
+#[test]
+fn a_forward_clock_jump_unconfirms_every_pass_and_charges_the_jump_as_decay() {
+    // C-17 / 4r-i9. The wall clock jumps 30 days ahead: every pass is now older than
+    // W_conf, the jump is dark, and every run ends. Two pairs, to say "every".
+    let db = test_db();
+    let (a, b) = (master(0x69), master(0x6A));
+    pair_holding_for_us(&db, a, device(0x6B), 0x6C, 2, Some(0));
+    pair_holding_for_us(&db, b, device(0x6D), 0x6E, 7, Some(0));
+    let recorder = PairLedgerRecorder::new(db.clone());
+    recorder.tick(&my_master(), Timestamp(0), 1).unwrap();
+    recorder.tick(&my_master(), Timestamp(TICK), 1).unwrap();
+    let before: Vec<PairLedger> = [a, b]
+        .iter()
+        .map(|m| db.get_pair_ledger(m).unwrap().unwrap())
+        .collect();
+
+    let report = recorder
+        .tick_report(&my_master(), Timestamp(TICK + 30 * DAY), 1)
+        .unwrap();
+
+    assert_eq!(report.rows.len(), 2);
+    for (row, prev) in report.rows.iter().zip(before) {
+        let mut expected = prev.clone();
+        accrue(&mut expected, &vol(0.0, 0.0), 30.0 - real_time_window());
+        accrue(&mut expected, &vol(0.0, 0.0), real_time_window());
+        assert_eq!(
+            row.confirmed_gb, 0.0,
+            "{:?}: every pass is out of the window",
+            row.master
+        );
+        assert_eq!(row.v_dem, expected.v_dem);
+        assert_eq!(row.g_they, expected.gb_days_they_store_for_us);
+        assert_eq!(row.depth, expected.depth_of_their_service);
+        assert_eq!((row.observed_volume, row.observed_tau), (0.0, 0.0));
+        assert!(row.v_dem > 0.0 && row.v_dem < prev.v_dem);
+    }
+}
+
+// ── Sub-steps and the window constant ───────────────────────────────────────
+
+#[test]
+fn sub_steps_keep_the_demonstrated_scale_leak_inside_the_stability_margin_too() {
+    // C-15, AC-3b. λ_dem is the slowest leak, so the 30-day step set by λ keeps it far
+    // inside the margin — asserted rather than assumed, in case a calibration flips that.
+    for dt in [0.001, 1.0, 30.0, 95.0, 365.0, 4_200.0, 100_000.0] {
+        let plan = sub_steps(dt);
+        assert!(
+            PAIR_LEDGER_LAMBDA_DEM * plan.step_days <= PAIR_LEDGER_MAX_LAMBDA_DT,
+            "dt={dt}: λ_dem·step={}",
+            PAIR_LEDGER_LAMBDA_DEM * plan.step_days
+        );
+        assert!(PAIR_LEDGER_LAMBDA_SLOW * plan.step_days <= PAIR_LEDGER_MAX_LAMBDA_DT);
+    }
+}
+
+#[test]
+fn the_confirmation_window_is_one_base_pos_cycle_plus_one_challenge_ttl() {
+    // K-1 / Д-G. Pins the literal TTL inside the constant to the mailbox's real one, so the
+    // two cannot drift apart silently.
+    assert_eq!(
+        PAIR_LEDGER_CONFIRMATION_WINDOW_SECS,
+        SECS_PER_WEEK / POS_BASE_CHALLENGES_PER_WEEK as u64
+            + crate::mailbox::class_config::POS_CHALLENGE_TTL.as_secs()
+            + 3 * MAILBOX_POLL_INTERVAL_SECS
+    );
+    assert_eq!(PAIR_LEDGER_CONFIRMATION_WINDOW_SECS, 1_220_400);
+}
+
+// ── R-1 / R-2: the tick report is what the tick wrote ───────────────────────
+
+/// Four masters in four states for the report tests: `seed` has no row yet, `idle` was
+/// accrued at `now`, `proven` and `believed` were accrued one tick ago — `proven` holds a
+/// confirmed 3 gb, `believed` an unproven 5 gb plus 2 gb we keep for it.
+fn report_fixture(db: &Db, now: u64) -> [IdentityPub; 4] {
+    let (seed, idle, proven, believed) = (master(0x71), master(0x72), master(0x73), master(0x74));
+    for (m, d) in [(seed, 0x75), (idle, 0x76)] {
+        db.upsert_peer(&peer_of(device(d), m)).unwrap();
+    }
+    pair_holding_for_us(db, proven, device(0x77), 0x78, 3, Some(now - TICK));
+    pair_holding_for_us(db, believed, device(0x79), 0x7A, 5, None);
+    we_store_for(db, 0x7B, believed, 2);
+    let history = PairLedger {
+        gb_days_they_store_for_us: 9.0,
+        gb_days_we_store_for_them: 4.0,
+        depth_of_their_service: 30.0,
+        v_dem: 2.5,
+        observed_volume: 2.0,
+        observed_tau: 6.0,
+        last_update: Some(Timestamp(now - TICK)),
+        ..PairLedger::default()
+    };
+    db.upsert_pair_ledger(
+        &idle,
+        &PairLedger {
+            last_update: Some(Timestamp(now)),
+            ..history.clone()
+        },
+    )
+    .unwrap();
+    db.upsert_pair_ledger(&proven, &history).unwrap();
+    db.upsert_pair_ledger(&believed, &history).unwrap();
+    [seed, idle, proven, believed]
+}
+
+#[test]
+fn the_tick_report_lists_exactly_the_rows_the_tick_wrote() {
+    // R-1 / 4r-i5. The per-row log line is the only window onto the ledger; it must be the
+    // ledger, field for field, and only for rows that were actually accrued.
+    let db = test_db();
+    let now = 50 * DAY;
+    let [_, _, proven, believed] = report_fixture(&db, now);
+    let before: Vec<(IdentityPub, PairLedger)> = db.list_pair_ledgers().unwrap();
+    let sweep = db.storage_bytes_by_master(Timestamp(now), 1).unwrap();
+
+    let report = PairLedgerRecorder::new(db.clone())
+        .tick_report(&my_master(), Timestamp(now), 1)
+        .unwrap();
+
+    assert_eq!(
+        (report.stats.seeded, report.stats.idle, report.stats.accrued),
+        (1, 1, 2)
+    );
+    assert_eq!(report.stats.believed_not_confirmed, 1, "only `believed`");
+    let masters: Vec<IdentityPub> = report.rows.iter().map(|r| r.master).collect();
+    assert_eq!(
+        masters,
+        vec![proven, believed],
+        "accrued rows only, in key order"
+    );
+    let after = db.list_pair_ledgers().unwrap();
+    for row in &report.rows {
+        let stored = &after.iter().find(|(m, _)| *m == row.master).unwrap().1;
+        let prev = &before.iter().find(|(m, _)| *m == row.master).unwrap().1;
+        let bytes = sweep.iter().find(|v| v.master == row.master).unwrap();
+        assert_eq!(row.dt_days, prev.elapsed_days(Timestamp(now), 1).unwrap());
+        assert_eq!(
+            row.believed_gb,
+            bytes.they_store_for_us as f64 / BYTES_PER_GB
+        );
+        assert_eq!(
+            row.confirmed_gb,
+            bytes.they_store_for_us_confirmed as f64 / BYTES_PER_GB
+        );
+        assert_eq!(row.v_dem, stored.v_dem);
+        assert_eq!(row.g_they, stored.gb_days_they_store_for_us);
+        assert_eq!(row.depth, stored.depth_of_their_service);
+        assert_eq!(row.observed_volume, stored.observed_volume);
+        assert_eq!(row.observed_tau, stored.observed_tau);
+    }
+    assert_eq!(
+        report.rows[0].confirmed_gb, 3.0,
+        "premise: `proven` is confirmed"
+    );
+    assert_eq!(
+        report.rows[1].confirmed_gb, 0.0,
+        "premise: `believed` is not"
+    );
+    assert_eq!(report.rows[1].believed_gb, 5.0);
+}
+
+#[test]
+fn tick_and_tick_report_write_identical_ledgers() {
+    // R-2. `tick` delegates to `tick_report`; the daemon calls one, most tests the other.
+    let now = 50 * DAY;
+    let via_tick = test_db();
+    let via_report = test_db();
+    report_fixture(&via_tick, now);
+    report_fixture(&via_report, now);
+
+    let stats = PairLedgerRecorder::new(via_tick.clone())
+        .tick(&my_master(), Timestamp(now), 1)
+        .unwrap();
+    let report = PairLedgerRecorder::new(via_report.clone())
+        .tick_report(&my_master(), Timestamp(now), 1)
+        .unwrap();
+
+    assert_eq!(
+        via_tick.list_pair_ledgers().unwrap(),
+        via_report.list_pair_ledgers().unwrap()
+    );
+    assert_eq!(stats, report.stats);
 }
