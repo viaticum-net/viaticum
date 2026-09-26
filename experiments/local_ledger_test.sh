@@ -11,7 +11,7 @@
 #               read from O's `pair-ledger row` debug lines (RUST_LOG=info,viaticum::ledger=debug
 #               on O).
 # Intent:       4r-i1, 4r-i2, 4r-i3, 4r-i4, 4r-i5, 4r-i6 (only when step 5 takes the "long" branch;
-#               otherwise i6 rests on unit C-16)
+#               otherwise i6 rests on unit C-16), 4r-i28, 4r-i33 (step 9)
 # Proves:       on O: S (accepted, never answered) accrues nothing (v_dem, g_they, depth,
 #               observed_tau all 0 while believed_gb > 0); P's v_dem snaps to exactly its
 #               confirmed volume on its first confirmed row and never drops below it; P stays
@@ -33,7 +33,8 @@
 #               formal; per-master summing over cluster siblings (unit D-2 only); DR carriage
 #               of the ledger (pair_ledger.md R2); "the ledger decides nothing" in general
 #               (grep + unchanged regression suite only); clock jumps (units T-3, C-9); a
-#               holder answering with a wrong hash (Fail -> Lost); the "we store for them" axis;
+#               holder answering with a wrong hash (Fail -> Lost; for the drop counters closed by
+#               local_ledger_drop_test step 4); the "we store for them" axis;
 #               the step in every series once Bug-B (PoS of SystemState blocks) is fixed —
 #               confirmed_gb of every pair jumps by its SS volume that day (matters for the
 #               В-3½ sweep); S's believed_gb may come from O's SS blocks, so it is not
@@ -95,6 +96,14 @@
 #                    g_they strictly decreases (4r-i2) — check: awk
 #               8. whole run: S rows still all zero; rows for all 6 masters continue after the
 #                    restart (4r-i1, 4r-i5)
+#               9. whole run: the number of `pair-ledger drop event kind=Presumed` lines for S's
+#                    master == the number of S's TRANSITIONS into PresumedLost in O's log
+#                    (`PoS challenge timed out` for S's device with new_status=PresumedLost and
+#                    misses=3; later timeouts repeat PresumedLost with misses >= 4). 0 = 0 is a
+#                    PASS: S is alive and authenticated, so repair re-offers it its own block and
+#                    resets the timeout ladder (4r-i33, the price of v1). Diagnostics printed
+#                    (DIAG line): S's transitions into PresumedLost, its Uncertain timeouts and
+#                    the work_pipeline lines naming S's device (re-offers) (4r-i28, 4r-i33)
 #
 # Implementation notes (how the passport is executed, not what it claims):
 #   - The log is split at the line count taken right BEFORE the restarted O is launched
@@ -134,7 +143,7 @@ T_BASE=$(date -u +%s)
 
 PIDS=()
 declare -A VERDICT
-STEP_ORDER=(1 2 3 4 5 6 7 8)
+STEP_ORDER=(1 2 3 4 5 6 7 8 9)
 CUR_STEP=0
 
 rank() { case "$1" in PASS) echo 0 ;; ROUGH) echo 1 ;; *) echo 2 ;; esac; }
@@ -202,38 +211,8 @@ fi
 . "$(dirname "${BASH_SOURCE[0]}")/e2e_lib.sh"
 
 # ── Log parsing ─────────────────────────────────────────────────
-#
-# events FILE PATTERN KEY... -> one line per log line containing PATTERN:
-#   "<t> <line> <value of KEY1> <value of KEY2> ..."   ("-" for a missing key)
-# t = seconds since T_BASE from the log's own RFC 3339 UTC timestamp; line = line number
-# in FILE. ANSI colour codes are stripped first.
-AWK_EPOCH='
-function epoch(ts,   y, mo, d, h, mi, s, yy, era, yoe, doy, doe) {
-    y = substr(ts, 1, 4) + 0; mo = substr(ts, 6, 2) + 0; d = substr(ts, 9, 2) + 0
-    h = substr(ts, 12, 2) + 0; mi = substr(ts, 15, 2) + 0
-    s = substr(ts, 18); sub(/Z$/, "", s); s = s + 0
-    yy = y - (mo <= 2 ? 1 : 0)
-    era = int(yy / 400); yoe = yy - era * 400
-    doy = int((153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5) + d - 1
-    doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
-    return (era * 146097 + doe - 719468) * 86400 + h * 3600 + mi * 60 + s
-}'
-events() {
-    local file="$1" pat="$2"; shift 2
-    sed 's/\x1b\[[0-9;]*m//g' "$file" 2>/dev/null | awk -v pat="$pat" -v keys="$*" \
-        -v base="$T_BASE" "$AWK_EPOCH"'
-        index($0, pat) {
-            n = split(keys, K, " ")
-            split("", kv)
-            for (i = 2; i <= NF; i++) {
-                p = index($i, "=")
-                if (p > 1) kv[substr($i, 1, p - 1)] = substr($i, p + 1)
-            }
-            out = sprintf("%.3f %d", epoch($1) - base, NR)
-            for (j = 1; j <= n; j++) out = out " " ((K[j] in kv) ? kv[K[j]] : "-")
-            print out
-        }' || true
-}
+# `events` and `AWK_EPOCH` live in e2e_lib.sh (shared with local_ledger_drop_test.sh);
+# they read T_BASE from this script.
 now_t() { echo "$(( $(date -u +%s) - T_BASE ))"; }
 log_lines() { wc -l < "$1" 2>/dev/null | tr -d ' ' || echo 0; }
 
@@ -735,5 +714,25 @@ POST_MASTERS=$(events "$O_LOG" "pair-ledger row" master \
 [ "$POST_MASTERS" = "$WANT_MASTERS" ] \
     && pass "rows for all 6 peer masters continue after the restart (4r-i5)" \
     || fail "post-restart masters [${POST_MASTERS}] want [${WANT_MASTERS}]"
+
+# ── STEP 9: S's Presumed drop events == S's transitions into PresumedLost ──
+CUR_STEP=9
+echo ""
+echo "=== Step 9: S's Presumed drop events = S's transitions into PresumedLost (4r-i28, 4r-i33) ==="
+S_PRESUMED_EVENTS=$(events "$O_LOG" "pair-ledger drop event kind=" kind master \
+    | awk -v m="$SM" '$3 == "Presumed" && $4 == m' | wc -l | tr -d ' ')
+S_TO_PRESUMED=$(events "$O_LOG" "PoS challenge timed out" holder_id new_status misses \
+    | awk -v h="$SD" '$3 == h && $4 == "PresumedLost" && $5 == "3"' | wc -l | tr -d ' ')
+S_UNCERTAIN=$(events "$O_LOG" "PoS challenge timed out" holder_id new_status \
+    | awk -v h="$SD" '$3 == h && $4 == "Uncertain"' | wc -l | tr -d ' ')
+S_WORK=$(sed 's/\x1b\[[0-9;]*m//g' "$O_LOG" | grep -a "work_pipeline:" | grep -ac "holder=$SD" || true)
+S_NOT_COUNTED=$(events "$O_LOG" "pair-ledger drop not counted" reason holder \
+    | awk -v h="$SD" '$4 == h { print $3 }' | sort | uniq -c | tr '\n' ' ')
+echo "  DIAG 4r-i33: S transitions into PresumedLost=$S_TO_PRESUMED, S Uncertain timeouts=$S_UNCERTAIN, work_pipeline lines naming S's device=$S_WORK, S Presumed events=$S_PRESUMED_EVENTS, not-counted by reason: [${S_NOT_COUNTED}]"
+if [ "$S_PRESUMED_EVENTS" -eq "$S_TO_PRESUMED" ]; then
+    pass "S: $S_PRESUMED_EVENTS Presumed event(s) == $S_TO_PRESUMED transition(s) into PresumedLost (0 = 0 is the 4r-i33 price, not a failure)"
+else
+    fail "S: $S_PRESUMED_EVENTS Presumed event(s) != $S_TO_PRESUMED transition(s) into PresumedLost (misses=3)"
+fi
 
 finish

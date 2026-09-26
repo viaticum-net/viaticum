@@ -813,6 +813,8 @@ fn elapsed_days_returns_an_unclamped_interval_for_a_long_outage() {
 // PairLedger forward compatibility: how a NEW field may be added
 // ============================================================
 
+/// The row frozen 2026-08-09, as it decodes TODAY: `drop_presumed` (У-4) did not exist when
+/// those bytes were written, so it arrives as its `#[serde(default)]` 0.0.
 fn ledger_sample() -> PairLedger {
     PairLedger {
         gb_days_they_store_for_us: 3.5,
@@ -823,7 +825,17 @@ fn ledger_sample() -> PairLedger {
         observed_tau: 30.0,
         drop_ann: 1.0,
         drop_silent: 0.0,
+        drop_presumed: 0.0,
         last_update: Some(Timestamp(1_700_000_000)),
+    }
+}
+
+/// Today's row shape (У-4): the same sample with a NON-zero `drop_presumed`, so the frozen
+/// bytes prove the field is written and read, not merely defaulted.
+fn ledger_sample_2026_09_26() -> PairLedger {
+    PairLedger {
+        drop_presumed: 0.75,
+        ..ledger_sample()
     }
 }
 
@@ -844,6 +856,7 @@ fn pair_ledger_with_a_new_defaulted_field_still_reads_rows_written_today() {
         observed_tau: f64,
         drop_ann: f64,
         drop_silent: f64,
+        drop_presumed: f64,
         last_update: Option<Timestamp>,
         #[serde(default)]
         trend_d: f64,
@@ -879,6 +892,7 @@ fn pair_ledger_with_a_new_required_field_cannot_read_rows_written_today() {
         observed_tau: f64,
         drop_ann: f64,
         drop_silent: f64,
+        drop_presumed: f64,
         last_update: Option<Timestamp>,
         trend_d: f64,
     }
@@ -929,15 +943,95 @@ fn pair_ledger_still_decodes_a_row_frozen_before_the_field_was_added() {
     assert_eq!(decoded, ledger_sample(), "every frozen field round-trips");
 }
 
+/// A `PairLedger` row exactly as this tree encodes it since У-4 — CBOR of
+/// [`ledger_sample_2026_09_26`], ten fields, `drop_presumed` right after `drop_silent`.
+///
+/// The 2026-08-09 fixture above stays as "a row written before the field existed" (the first
+/// real use of W-1: it must keep decoding, with `drop_presumed = 0.0`); THIS one is what the
+/// tree writes today, so the NEXT field added without `#[serde(default)]` turns red here.
+const PAIR_LEDGER_ROW_FROZEN_2026_09_26: &[u8] = &[
+    0xaa, 0x78, 0x19, 0x67, 0x62, 0x5f, 0x64, 0x61, 0x79, 0x73, 0x5f, 0x74, 0x68, 0x65, 0x79, 0x5f,
+    0x73, 0x74, 0x6f, 0x72, 0x65, 0x5f, 0x66, 0x6f, 0x72, 0x5f, 0x75, 0x73, 0xf9, 0x43, 0x00, 0x78,
+    0x19, 0x67, 0x62, 0x5f, 0x64, 0x61, 0x79, 0x73, 0x5f, 0x77, 0x65, 0x5f, 0x73, 0x74, 0x6f, 0x72,
+    0x65, 0x5f, 0x66, 0x6f, 0x72, 0x5f, 0x74, 0x68, 0x65, 0x6d, 0xf9, 0x44, 0x80, 0x76, 0x64, 0x65,
+    0x70, 0x74, 0x68, 0x5f, 0x6f, 0x66, 0x5f, 0x74, 0x68, 0x65, 0x69, 0x72, 0x5f, 0x73, 0x65, 0x72,
+    0x76, 0x69, 0x63, 0x65, 0xf9, 0x53, 0x80, 0x65, 0x76, 0x5f, 0x64, 0x65, 0x6d, 0xf9, 0x40, 0x00,
+    0x6f, 0x6f, 0x62, 0x73, 0x65, 0x72, 0x76, 0x65, 0x64, 0x5f, 0x76, 0x6f, 0x6c, 0x75, 0x6d, 0x65,
+    0xf9, 0x3e, 0x00, 0x6c, 0x6f, 0x62, 0x73, 0x65, 0x72, 0x76, 0x65, 0x64, 0x5f, 0x74, 0x61, 0x75,
+    0xf9, 0x4f, 0x80, 0x68, 0x64, 0x72, 0x6f, 0x70, 0x5f, 0x61, 0x6e, 0x6e, 0xf9, 0x3c, 0x00, 0x6b,
+    0x64, 0x72, 0x6f, 0x70, 0x5f, 0x73, 0x69, 0x6c, 0x65, 0x6e, 0x74, 0xf9, 0x00, 0x00, 0x6d, 0x64,
+    0x72, 0x6f, 0x70, 0x5f, 0x70, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x64, 0xf9, 0x3a, 0x00, 0x6b,
+    0x6c, 0x61, 0x73, 0x74, 0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x1a, 0x65, 0x53, 0xf1, 0x00,
+];
+
 #[test]
 fn the_frozen_pair_ledger_row_is_what_this_tree_writes_today() {
-    // Guards the fixture itself: if the encoding (not the schema) ever changes, the test
-    // above would keep passing on a fixture that no longer represents a real stored row.
+    // Guards the fixture itself: if the encoding (not the schema) ever changes, the tests
+    // around it would keep passing on a fixture that no longer represents a real stored row.
+    // Moved to the 2026-09-26 fixture by У-4 (W-1 works as designed: the old bytes are
+    // now "a row written before the field existed").
     assert_eq!(
-        to_cbor_bytes(&ledger_sample()),
-        PAIR_LEDGER_ROW_FROZEN_2026_08_09,
+        to_cbor_bytes(&ledger_sample_2026_09_26()),
+        PAIR_LEDGER_ROW_FROZEN_2026_09_26,
         "the frozen fixture must still be byte-identical to a freshly written row"
     );
+}
+
+#[test]
+fn pair_ledger_row_frozen_2026_09_26_round_trips() {
+    // DT-2: today's row decodes into the real struct with the new field carried, not
+    // defaulted (0.75 ≠ the default 0.0).
+    let decoded: PairLedger = from_cbor_bytes(PAIR_LEDGER_ROW_FROZEN_2026_09_26)
+        .expect("a row this tree writes must decode");
+    assert_eq!(decoded, ledger_sample_2026_09_26());
+    assert_eq!(decoded.drop_presumed, 0.75);
+}
+
+// ── У-4: PendingDrops (the drop-event outbox) ────────────────────────────────
+
+#[test]
+fn pending_drops_decode_leniently_and_count_by_kind() {
+    // DT-3. An empty CBOR map is a valid all-zero row (lenient on purpose: the outbox is
+    // taken, never accrued upon), each kind counts on its own counter, and a counter
+    // saturates instead of wrapping.
+    let empty_map: &[u8] = &[0xa0];
+    let decoded: PendingDrops = from_cbor_bytes(empty_map).expect("an empty map decodes");
+    assert_eq!(decoded, PendingDrops::default());
+    assert!(decoded.is_empty());
+
+    let mut p = PendingDrops::default();
+    p.add(DropKind::Announced);
+    p.add(DropKind::Silent);
+    p.add(DropKind::Silent);
+    p.add(DropKind::Presumed);
+    p.add(DropKind::Presumed);
+    p.add(DropKind::Presumed);
+    assert_eq!(
+        p,
+        PendingDrops {
+            announced: 1,
+            silent: 2,
+            presumed: 3,
+        }
+    );
+    assert_eq!(p.total(), 6);
+    assert!(!p.is_empty());
+
+    let mut full = PendingDrops {
+        announced: u32::MAX,
+        silent: u32::MAX,
+        presumed: u32::MAX,
+    };
+    full.add(DropKind::Announced);
+    assert_eq!(full.announced, u32::MAX, "saturates, never wraps to 0");
+    assert_eq!(
+        full.total(),
+        3 * u32::MAX as u64,
+        "the total does not overflow"
+    );
+
+    let round: PendingDrops = from_cbor_bytes(&to_cbor_bytes(&p)).unwrap();
+    assert_eq!(round, p);
 }
 
 // ── У-3: SymbolPlacement::confirmed_at (Д-F / Д-G) ───────────────────────────

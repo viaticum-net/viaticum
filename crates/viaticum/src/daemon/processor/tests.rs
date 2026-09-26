@@ -4147,3 +4147,298 @@ async fn on_peer_identified_persists_addrs_for_inbound_peer() {
         "on_peer_identified must persist listen_addrs to the PeerRecord"
     );
 }
+
+// ─── У-4: DropNotice → the 4R pair ledger's ANNOUNCED drop events ───────────────
+//
+// Spec pair_ledger.md "Спека У-4" (Д-I, Д-K, Д-M), intent 4r-i25/i26/i29/i34. The event
+// is the TRANSITION of a held placement into Lost, recorded in the transition's own
+// transaction; what `SymbolDropHandler::apply` does to the placement is unchanged (AC-7).
+// These tests live here and not in `mailbox/poll/tests.rs` (line B's file, review N-5).
+
+/// A holder master with one device holding one Alive block of ours since `placed_at`.
+/// `DEVICE_TO_MASTER` maps the device to the SIGNING master (that is how `apply` finds the
+/// placement); the `PeerRecord` carries `ledger_master` (how the ledger keys the event, Д-M).
+struct DropFixture {
+    db: Db,
+    key: ed25519_dalek::SigningKey,
+    signer: IdentityPub,
+    ledger_master: IdentityPub,
+    device: DeviceId,
+    block: SourceBlockId,
+    placed_at: Timestamp,
+}
+
+fn drop_fixture(
+    seed: u8,
+    status: PlacementStatus,
+    ledger_master: Option<IdentityPub>,
+) -> DropFixture {
+    let db = Db::open_in_memory().unwrap();
+    let key = make_signing_key(seed);
+    let signer = master_identity(&key);
+    let ledger_master = ledger_master.unwrap_or(signer);
+    let device = make_device_id(seed);
+    let block = make_block_id(seed.wrapping_add(1));
+    let placed_at = Timestamp(Timestamp::now().0 - 3600);
+    register_holder(&db, signer, device);
+    let mut peer = make_peer_record(device);
+    peer.master_identity = ledger_master;
+    db.upsert_peer(&peer).unwrap();
+    db.upsert_source_block(&make_source_block(block)).unwrap();
+    let mut placement = make_symbol_placement(block, device, vec![(0, 10)], status);
+    placement.placed_at = placed_at;
+    db.upsert_placement(&placement).unwrap();
+    DropFixture {
+        db,
+        key,
+        signer,
+        ledger_master,
+        device,
+        block,
+        placed_at,
+    }
+}
+
+impl DropFixture {
+    /// A notice signed by the holder, stamped `timestamp`, with `deadline`.
+    fn notice(&self, deadline: Timestamp, timestamp: Timestamp) -> SymbolDropNoticeMsg {
+        build_signed_symbol_drop_notice(self.block, vec![(0, 10)], deadline, timestamp, &self.key)
+    }
+    /// An immediate notice ("dropped now") issued `after` seconds after the placement.
+    fn fresh_notice(&self, after: u64) -> SymbolDropNoticeMsg {
+        let ts = Timestamp(self.placed_at.0 + after);
+        self.notice(ts, ts)
+    }
+    fn apply(&self, notice: SymbolDropNoticeMsg) -> bool {
+        super::SymbolDropHandler::new(self.db.clone()).apply(self.signer, notice)
+    }
+    fn pending(&self) -> Vec<(IdentityPub, viaticum_core::types::PendingDrops)> {
+        self.db.list_pending_drops().unwrap()
+    }
+    fn announced_for(&self, m: IdentityPub) -> u32 {
+        self.pending()
+            .into_iter()
+            .find(|(k, _)| *k == m)
+            .map(|(_, p)| p.announced)
+            .unwrap_or(0)
+    }
+    fn status(&self) -> PlacementStatus {
+        self.db
+            .get_placement(&self.block, &self.device)
+            .unwrap()
+            .unwrap()
+            .status
+    }
+}
+
+#[tokio::test]
+async fn a_drop_notice_for_an_alive_placement_records_one_announced_event() {
+    // DP-1 (4r-i25). The placement moves Alive → Lost and, in the same transaction, the
+    // holder master's outbox gets exactly one Announced.
+    let f = drop_fixture(0x31, PlacementStatus::Alive, None);
+
+    assert!(f.apply(f.fresh_notice(10)));
+
+    assert_eq!(f.status(), PlacementStatus::Lost);
+    assert_eq!(
+        f.pending(),
+        vec![(
+            f.ledger_master,
+            viaticum_core::types::PendingDrops {
+                announced: 1,
+                ..Default::default()
+            }
+        )],
+        "one Announced, nothing else"
+    );
+}
+
+#[tokio::test]
+async fn redelivering_the_same_drop_notice_records_nothing_more() {
+    // DP-2 (4r-i25). The mailbox hands the same entry out on every poll for its whole TTL;
+    // the second delivery finds the placement already Lost.
+    let f = drop_fixture(0x33, PlacementStatus::Alive, None);
+    let notice = f.fresh_notice(10);
+
+    f.apply(notice.clone());
+    f.apply(notice.clone());
+    f.apply(notice);
+
+    assert_eq!(f.announced_for(f.ledger_master), 1);
+}
+
+#[tokio::test]
+async fn a_republished_notice_with_a_new_deadline_records_nothing_more() {
+    // DP-3 (4r-i25, WARN-7). Disk pressure republishes the advance notice with a NEW
+    // deadline and timestamp on every tick — a (holder, block, deadline) key would not
+    // collapse it; the transition does.
+    let f = drop_fixture(0x35, PlacementStatus::Alive, None);
+    let t = f.placed_at.0;
+
+    f.apply(f.notice(Timestamp(t + 7 * 86_400), Timestamp(t + 10)));
+    f.apply(f.notice(Timestamp(t + 8 * 86_400), Timestamp(t + 20)));
+    f.apply(f.notice(Timestamp(t + 9 * 86_400), Timestamp(t + 30)));
+
+    assert_eq!(f.announced_for(f.ledger_master), 1);
+}
+
+#[tokio::test]
+async fn the_final_immediate_notice_after_an_advance_notice_records_nothing_more() {
+    // DP-4 (4r-i25). Advance notice (deadline in a week), then the final "dropped now"
+    // (deadline = timestamp) once the window ran out: one loss, one event.
+    let f = drop_fixture(0x37, PlacementStatus::Alive, None);
+    let t = f.placed_at.0;
+
+    f.apply(f.notice(Timestamp(t + 7 * 86_400), Timestamp(t + 10)));
+    f.apply(f.notice(
+        Timestamp(t + 7 * 86_400 + 10),
+        Timestamp(t + 7 * 86_400 + 10),
+    ));
+
+    assert_eq!(f.status(), PlacementStatus::Lost);
+    assert_eq!(f.announced_for(f.ledger_master), 1);
+}
+
+#[tokio::test]
+async fn a_notice_for_a_deleting_or_missing_placement_records_nothing() {
+    // DP-5 (4r-i26). Our own deletion: the placement is Deleting (or already cleaned up)
+    // long before the holder's final notice arrives. Not the friend's drop.
+    let deleting = drop_fixture(0x39, PlacementStatus::Deleting, None);
+    deleting.apply(deleting.fresh_notice(10));
+    assert_eq!(
+        deleting.status(),
+        PlacementStatus::Deleting,
+        "premise: untouched"
+    );
+    assert!(deleting.pending().is_empty());
+
+    let missing = drop_fixture(0x3B, PlacementStatus::Alive, None);
+    missing
+        .db
+        .write_txn()
+        .and_then(|mut t| {
+            t.delete_placement(&missing.block, &missing.device)?;
+            t.commit()
+        })
+        .unwrap();
+    assert!(!missing.apply(missing.fresh_notice(10)));
+    assert!(missing.pending().is_empty());
+}
+
+#[tokio::test]
+async fn a_notice_not_younger_than_the_current_placement_is_not_counted_but_still_marks_it_lost() {
+    // DP-6 (4r-i29; Ф-1 pinned, not fixed). An old notice re-delivered after repair put the
+    // block back on the same holder: the transition still happens (existing behaviour, AC-7),
+    // but the evidence predates the episode — in the same second too (review of intent
+    // BLOCK-1: at time_scale 100 000 the loss, the repair and the new Alive fit in one second).
+    for (label, before) in [("older", 5u64), ("same second", 0u64)] {
+        let f = drop_fixture(0x3D, PlacementStatus::Alive, None);
+        let ts = Timestamp(f.placed_at.0 - before);
+
+        assert!(f.apply(f.notice(ts, ts)), "{label}: the signature passes");
+
+        assert_eq!(
+            f.status(),
+            PlacementStatus::Lost,
+            "{label}: Ф-1 — the old notice still marks the new placement Lost"
+        );
+        assert!(f.pending().is_empty(), "{label}: but it is not a new drop");
+    }
+}
+
+#[tokio::test]
+async fn a_notice_after_presumed_lost_is_not_counted_again() {
+    // DP-7 (4r-i29). Three missed challenges already recorded the loss as Presumed; the
+    // holder's notice arriving afterwards is the same loss.
+    let f = drop_fixture(0x3F, PlacementStatus::PresumedLost, None);
+
+    f.apply(f.fresh_notice(10));
+
+    assert_eq!(
+        f.status(),
+        PlacementStatus::Lost,
+        "premise: the transition happens"
+    );
+    assert!(f.pending().is_empty());
+}
+
+#[tokio::test]
+async fn a_forged_or_foreign_master_notice_records_nothing() {
+    // DP-8 (4r-i26). A notice not signed by the claimed holder, and a correctly signed
+    // notice from a master that holds no placement of the block: no transition, no event.
+    let f = drop_fixture(0x41, PlacementStatus::Alive, None);
+    let attacker = make_signing_key(0x42);
+    let ts = Timestamp(f.placed_at.0 + 10);
+    let forged = build_signed_symbol_drop_notice(f.block, vec![(0, 10)], ts, ts, &attacker);
+    assert!(!f.apply(forged));
+    assert_eq!(f.status(), PlacementStatus::Alive);
+
+    let stranger_key = make_signing_key(0x43);
+    let stranger = master_identity(&stranger_key);
+    register_holder(&f.db, stranger, make_device_id(0x43));
+    let foreign = build_signed_symbol_drop_notice(f.block, vec![(0, 10)], ts, ts, &stranger_key);
+    assert!(
+        !super::SymbolDropHandler::new(f.db.clone()).apply(stranger, foreign),
+        "the stranger holds no placement of this block"
+    );
+
+    assert_eq!(f.status(), PlacementStatus::Alive);
+    assert!(f.pending().is_empty());
+}
+
+#[tokio::test]
+async fn the_announced_event_is_keyed_by_the_peer_record_master() {
+    // DP-9 (Д-M, AC-4h). `apply` finds the device through device_to_master (the signer),
+    // but the ledger keys the event by the device's PeerRecord master — the key the accrual
+    // sweep groups by, carried through DR (device_to_master is not).
+    let peer_master = make_identity(0x46);
+    let f = drop_fixture(0x45, PlacementStatus::Alive, Some(peer_master));
+    assert_ne!(f.signer, peer_master, "premise: the two sources disagree");
+
+    f.apply(f.fresh_notice(10));
+
+    assert_eq!(f.announced_for(peer_master), 1);
+    assert_eq!(f.announced_for(f.signer), 0);
+}
+
+#[tokio::test]
+async fn a_notice_inside_the_owners_delete_cooldown_is_still_the_friends_drop() {
+    // DP-10 (4r-i34). I deleted the file locally, but the owner cooldown has not run out, so
+    // no Delete went to the holder and its placement is still Alive. The friend dropping
+    // the block now is the friend's drop.
+    let f = drop_fixture(0x47, PlacementStatus::Alive, None);
+    let now = Timestamp::now();
+    let file = viaticum_core::types::FileRecord {
+        file_id: FileId(1),
+        path: "/watch/deleted.txt".to_string(),
+        importance: 0.5,
+        devices: vec![(
+            make_device_id(0x01),
+            viaticum_core::types::LocalState::Deleted(now),
+        )],
+        versions: vec![viaticum_core::types::FileVersion {
+            content_hash: [0x48; 32],
+            source_block_id: f.block,
+            k: 10,
+            t: 1,
+            created_at: Timestamp(0),
+            backed_up_at: Some(Timestamp(0)),
+        }],
+        first_seen: Timestamp(0),
+    };
+    let actions = viaticum_core::deletion::DeletionEngine::new().process_cooldowns(
+        &[file],
+        &f.db.list_all_source_blocks().unwrap(),
+        &f.db.list_all_placements().unwrap(),
+        now,
+        1,
+    );
+    assert!(
+        actions.is_empty(),
+        "premise: inside the owner cooldown no Delete is sent, got {actions:?}"
+    );
+
+    f.apply(f.fresh_notice(10));
+
+    assert_eq!(f.announced_for(f.ledger_master), 1);
+}

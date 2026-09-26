@@ -2,8 +2,8 @@
 # Shared helpers for experiments/local_*_test.sh. Sourced, never executed.
 #
 # The sourcing script must define `node_dir IDX` (a node's --data-dir), `BINARY`
-# and `fail` (and `node_log IDX` for the log helpers), and source this file AFTER
-# those definitions.
+# and `fail` (and `node_log IDX` for the log helpers, `T_BASE` for `events`), and source
+# this file AFTER those definitions.
 #
 # Anti-false-green rules these helpers exist to enforce:
 #   - restore is checked only after the local source is gone (otherwise the
@@ -221,6 +221,41 @@ restore_responses_for() {
 log_line_count() {
     local f; f=$(node_log "$1")
     if [ -f "$f" ]; then wc -l < "$f"; else echo 0; fi
+}
+
+# ── Timestamped log events (moved from local_ledger_test.sh, У-4) ─────────────
+#
+# events FILE PATTERN KEY... -> one line per log line containing PATTERN:
+#   "<t> <line> <value of KEY1> <value of KEY2> ..."   ("-" for a missing key)
+# t = seconds since T_BASE (set by the sourcing script, unix seconds) from the log's own
+# RFC 3339 UTC timestamp; line = line number in FILE. ANSI colour codes are stripped first.
+# Values are the text after `key=` up to the next space (tracing's key=value fields).
+AWK_EPOCH='
+function epoch(ts,   y, mo, d, h, mi, s, yy, era, yoe, doy, doe) {
+    y = substr(ts, 1, 4) + 0; mo = substr(ts, 6, 2) + 0; d = substr(ts, 9, 2) + 0
+    h = substr(ts, 12, 2) + 0; mi = substr(ts, 15, 2) + 0
+    s = substr(ts, 18); sub(/Z$/, "", s); s = s + 0
+    yy = y - (mo <= 2 ? 1 : 0)
+    era = int(yy / 400); yoe = yy - era * 400
+    doy = int((153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5) + d - 1
+    doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+    return (era * 146097 + doe - 719468) * 86400 + h * 3600 + mi * 60 + s
+}'
+events() {
+    local file="$1" pat="$2"; shift 2
+    sed 's/\x1b\[[0-9;]*m//g' "$file" 2>/dev/null | awk -v pat="$pat" -v keys="$*" \
+        -v base="${T_BASE:-0}" "$AWK_EPOCH"'
+        index($0, pat) {
+            n = split(keys, K, " ")
+            split("", kv)
+            for (i = 2; i <= NF; i++) {
+                p = index($i, "=")
+                if (p > 1) kv[substr($i, 1, p - 1)] = substr($i, p + 1)
+            }
+            out = sprintf("%.3f %d", epoch($1) - base, NR)
+            for (j = 1; j <= n; j++) out = out " " ((K[j] in kv) ? kv[K[j]] : "-")
+            print out
+        }' || true
 }
 
 # Lines of node IDX's log after line N, ANSI colors stripped.

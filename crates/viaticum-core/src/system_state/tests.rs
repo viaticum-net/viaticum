@@ -92,6 +92,7 @@ fn make_ledger(g_from: f64, g_to: f64) -> PairLedger {
         observed_tau: 45.0,
         drop_ann: 1.0,
         drop_silent: 0.0,
+        drop_presumed: 0.5,
         last_update: Some(Timestamp(1_700_000_000)),
     }
 }

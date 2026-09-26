@@ -17,10 +17,10 @@ use crate::constants::{
 use crate::mailbox::{MailboxClass, MailboxEntry};
 use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
 use crate::types::{
-    BlockAgg, BudgetRecord, DeviceId, EventEntry, FileId, FileRecord, HoldingRecord, HoldingStatus,
-    IdentityPub, PairLedger, PeerRecord, PlacementAgg, PlacementStatus, SourceBlockId,
-    SourceBlockRecord, SourceBlockStatus, SymbolPlacement, Timestamp, from_cbor_bytes,
-    to_cbor_bytes,
+    BlockAgg, BudgetRecord, DeviceId, DropKind, EventEntry, FileId, FileRecord, HoldingRecord,
+    HoldingStatus, IdentityPub, PairLedger, PeerRecord, PendingDrops, PlacementAgg,
+    PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SymbolPlacement,
+    Timestamp, from_cbor_bytes, to_cbor_bytes,
 };
 
 // ============================================================
@@ -141,6 +141,24 @@ const MAILBOX_BYTES_BY_TARGET: TableDefinition<&[u8; 32], &[u8]> =
 /// `create_tables` opens it on every `Db::open`, so a database written before this table
 /// existed simply gains it empty (no migration step).
 const PAIR_LEDGER: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("pair_ledger");
+
+/// Outbox of drop events awaiting the next pair-ledger accrual (У-4, Д-K). Key: master
+/// identity (the ledger's key). Value: CBOR([`PendingDrops`]), decoded LENIENTLY (a
+/// damaged row reads as zeros — see [`PendingDrops`]).
+///
+/// Written by the placement-loss sites in the SAME write transaction as the placement change
+/// ([`DbWriteTxn::record_drop_event`]); taken by the accrual tick in the SAME write
+/// transaction as the ledger rows ([`DbWriteTxn::take_pending_drops`]). redb serializes
+/// write transactions, so an event lands in exactly one fold: never lost, never doubled.
+/// Deliberately NOT part of the SystemState snapshot: pending events are lost on DR
+/// (4r-i31), and the `system_state` module is not touched for it.
+///
+/// Orphans: a row is folded only when its master is a row of the accrual sweep (PEERS). The
+/// placeholder master is never written (`record_drop_event` is a no-op for it), but a master
+/// that later leaves PEERS keeps its row here un-folded (today unreachable: peers are never
+/// deleted — `delete_peer` has no production caller, N-5). Harmless: nothing reads it.
+const PAIR_LEDGER_PENDING_DROPS: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("pair_ledger_pending_drops");
 
 // ============================================================
 // Key helpers
@@ -383,6 +401,7 @@ impl Db {
             tx.open_table(MAILBOX_ENTRIES)?;
             tx.open_table(MAILBOX_BYTES_BY_TARGET)?;
             tx.open_table(PAIR_LEDGER)?;
+            tx.open_table(PAIR_LEDGER_PENDING_DROPS)?;
         }
         tx.commit()?;
         Ok(())
@@ -1607,6 +1626,22 @@ impl Db {
         for item in table.iter()? {
             let (k, v) = item?;
             out.push((IdentityPub(*k.value()), from_cbor_bytes(v.value())?));
+        }
+        Ok(out)
+    }
+
+    /// All pending drop events (У-4), in master key order. Tests and diagnostics only —
+    /// there is no production reader (AC-7): the accrual tick takes a master's row inside its
+    /// own write transaction ([`DbWriteTxn::take_pending_drops`]) and nothing else looks.
+    pub fn list_pending_drops(&self) -> Result<Vec<(IdentityPub, PendingDrops)>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(PAIR_LEDGER_PENDING_DROPS)?;
+        let mut out = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            let master = IdentityPub(*k.value());
+            let pending = decode_pending_drops(&master, v.value());
+            out.push((master, pending));
         }
         Ok(out)
     }
@@ -3172,6 +3207,56 @@ impl<'db> DbWriteTxn<'db> {
         Ok(())
     }
 
+    /// Record one drop event of `kind` for `master` (У-4, Д-K): `+1` on its pending row.
+    ///
+    /// Called in the SAME transaction as the placement change that IS the event, so the
+    /// transition and the event commit or vanish together. The placeholder
+    /// `IdentityPub([0; 32])` is a no-op — not a person, the same rule as the accrual sweep.
+    pub fn record_drop_event(
+        &mut self,
+        master: &IdentityPub,
+        kind: DropKind,
+    ) -> Result<(), DbError> {
+        if master.0 == [0u8; 32] {
+            return Ok(());
+        }
+        let mut table = self.txn.open_table(PAIR_LEDGER_PENDING_DROPS)?;
+        let mut pending = match table.get(&master.0)? {
+            Some(v) => decode_pending_drops(master, v.value()),
+            None => PendingDrops::default(),
+        };
+        pending.add(kind);
+        let bytes = to_cbor_bytes(&pending);
+        table.insert(&master.0, bytes.as_slice())?;
+        Ok(())
+    }
+
+    /// Read AND remove the pending drop events of `master` (default when absent) — the
+    /// accrual tick's side of the outbox. Atomic with whatever else this transaction writes
+    /// (the ledger row the events are folded into): dropped without `commit`, the events stay
+    /// queued.
+    pub fn take_pending_drops(&mut self, master: &IdentityPub) -> Result<PendingDrops, DbError> {
+        let mut table = self.txn.open_table(PAIR_LEDGER_PENDING_DROPS)?;
+        let taken = match table.remove(&master.0)? {
+            Some(v) => decode_pending_drops(master, v.value()),
+            None => PendingDrops::default(),
+        };
+        Ok(taken)
+    }
+
+    /// Transactional twin of [`Db::upsert_pair_ledger`] — the accrual tick writes its rows
+    /// in the same transaction that takes the folded events.
+    pub fn upsert_pair_ledger(
+        &mut self,
+        master: &IdentityPub,
+        ledger: &PairLedger,
+    ) -> Result<(), DbError> {
+        let bytes = to_cbor_bytes(ledger);
+        let mut table = self.txn.open_table(PAIR_LEDGER)?;
+        table.insert(&master.0, bytes.as_slice())?;
+        Ok(())
+    }
+
     /// Commit all writes atomically. Updates hot cache after successful commit.
     /// Consumes self: the guard is unusable after this call.
     pub fn commit(self) -> Result<(), DbError> {
@@ -3245,6 +3330,27 @@ impl<'db> DbWriteTxn<'db> {
         }
 
         Ok(())
+    }
+}
+
+/// Lenient decode of a [`PendingDrops`] row: anything that does not decode reads as zeros.
+/// The row is only ever taken and folded, never accrued upon, so the worst case is losing the
+/// pending counts of one master; a strict decode would fail the whole accrual tick instead.
+///
+/// Not silent: a row that fails to decode is logged at `error!` with its master (graceful +
+/// `tracing::error`, the project convention), because the events it held are gone.
+fn decode_pending_drops(master: &IdentityPub, bytes: &[u8]) -> PendingDrops {
+    match from_cbor_bytes(bytes) {
+        Ok(pending) => pending,
+        Err(e) => {
+            tracing::error!(
+                target: "viaticum::ledger",
+                master = %master,
+                err = %e,
+                "pair-ledger: undecodable pending-drops row read as zero events (its queued events are lost)"
+            );
+            PendingDrops::default()
+        }
     }
 }
 
