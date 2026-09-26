@@ -25,9 +25,9 @@ use super::{
 };
 use crate::constants::{
     BYTES_PER_GB, MAILBOX_POLL_INTERVAL_SECS, PAIR_LEDGER_CONFIRMATION_WINDOW_SECS,
-    PAIR_LEDGER_LAMBDA, PAIR_LEDGER_LAMBDA_DEM, PAIR_LEDGER_LAMBDA_SLOW, PAIR_LEDGER_MAX_LAMBDA_DT,
-    PAIR_LEDGER_OBSERVED_WINDOW_TICKS, PAIR_LEDGER_TICK_SECS, POS_BASE_CHALLENGES_PER_WEEK,
-    SECS_PER_WEEK,
+    PAIR_LEDGER_LAMBDA, PAIR_LEDGER_LAMBDA_DEM, PAIR_LEDGER_LAMBDA_DROP, PAIR_LEDGER_LAMBDA_SLOW,
+    PAIR_LEDGER_MAX_LAMBDA_DT, PAIR_LEDGER_OBSERVED_WINDOW_TICKS, PAIR_LEDGER_TICK_SECS,
+    POS_BASE_CHALLENGES_PER_WEEK, SECS_PER_WEEK,
 };
 use crate::db::Db;
 use crate::db::testutil::test_db;
@@ -217,10 +217,15 @@ fn accrual_equals_the_kernel_sequence_when_the_interval_needs_sub_steps() {
     let volumes = vol(2.0, 4.0);
     let dt = 90.0;
     let plan = sub_steps(dt);
+    // Premise, derived rather than typed: the step ceiling is set by the FASTEST leak,
+    // λ_drop since У-4 (28 days), so 90 days → 4 × 22.5-day sub-steps (was 3 × 30 while λ
+    // was the fastest). The property under test — "equals the kernel sequence" — is the same.
+    let max_step = PAIR_LEDGER_MAX_LAMBDA_DT / PAIR_LEDGER_LAMBDA_DROP;
+    let count = (dt / max_step).ceil() as u32;
     assert_eq!(
         (plan.count, plan.step_days),
-        (3, 30.0),
-        "90 days → 3 × 30-day sub-steps"
+        (count, dt / count as f64),
+        "90 days → {count} sub-steps of the 28-day ceiling"
     );
 
     accrue(&mut ledger, &volumes, dt);
@@ -263,6 +268,12 @@ fn sub_steps_keep_lambda_dt_inside_the_stability_margin_and_cover_the_whole_inte
             "dt={dt}: λ·step={} exceeds the margin",
             PAIR_LEDGER_LAMBDA * plan.step_days
         );
+        // DC-7 (У-4, Д-L): λ_drop is the fastest leak and binds the step (28 days).
+        assert!(
+            PAIR_LEDGER_LAMBDA_DROP * plan.step_days <= PAIR_LEDGER_MAX_LAMBDA_DT + 1e-12,
+            "dt={dt}: λ_drop·step={} exceeds the margin",
+            PAIR_LEDGER_LAMBDA_DROP * plan.step_days
+        );
         assert_eq!(plan.uncovered_days, 0.0, "dt={dt}: nothing may be dropped");
         let covered = plan.count as f64 * plan.step_days;
         assert!(
@@ -286,8 +297,25 @@ fn a_long_outage_accrues_the_decay_instead_of_inverting_the_capital() {
     let mut ledger = ledger_at(100.0, 0.0, 0.0, None);
     accrue(&mut ledger, &vol(0.0, 0.0), 90.0);
 
-    // 3 × (1 − 0.5) = 1/8 of the capital survives; positive, monotone, no inversion.
-    assert_eq!(ledger.gb_days_they_store_for_us, 12.5);
+    // Each sub-step keeps (1 − λ·step) of the capital; positive, monotone, no inversion.
+    // У-4: the step is set by λ_drop (28-day ceiling), so 90 days are 4 × 22.5 days and
+    // 0.625⁴ survives (it was 3 × 30 days and (1 − 0.5)³ = 1/8 while λ was the fastest).
+    let plan = sub_steps(90.0);
+    assert_eq!(
+        (plan.count, plan.step_days),
+        (4, 22.5),
+        "premise: the 28-day ceiling"
+    );
+    let mut expected = 100.0_f64;
+    for _ in 0..plan.count {
+        expected = update_capital(expected, 0.0, PAIR_LEDGER_LAMBDA, plan.step_days);
+    }
+    assert_eq!(ledger.gb_days_they_store_for_us, expected);
+    assert!(
+        (expected - 100.0 * 0.625_f64.powi(4)).abs() < 1e-9,
+        "0.625⁴ of the capital survives, got {expected}"
+    );
+    assert!(ledger.gb_days_they_store_for_us > 0.0);
 }
 
 #[test]
@@ -317,9 +345,13 @@ fn an_absurd_interval_stops_on_the_steady_state_and_reports_what_it_did_not_cove
         uncovered > 0.0,
         "the ceiling bit, so the shortfall must be visible to the caller"
     );
+    // MAX_SUB_STEPS steps of the 28-day ceiling (λ_drop binds since У-4; it was 30 days).
+    let covered =
+        super::MAX_SUB_STEPS as f64 * (PAIR_LEDGER_MAX_LAMBDA_DT / PAIR_LEDGER_LAMBDA_DROP);
     assert!(
-        (uncovered - (dt - 3_000_000.0)).abs() < 1.0,
-        "100k sub-steps of 30 days cover 3M days; the rest is uncovered, got {uncovered}"
+        (uncovered - (dt - covered)).abs() < 1.0,
+        "{} sub-steps of 28 days cover {covered} days; the rest is uncovered, got {uncovered}",
+        super::MAX_SUB_STEPS
     );
 }
 
@@ -1145,12 +1177,13 @@ fn v_dem_never_falls_faster_than_lambda_dem_over_half_a_silent_year() {
     for _ in 0..(180 * 24) {
         accrue(&mut hourly, &vol(0.0, 0.0), hour_days());
     }
-    // (b) one long interval — six 30-day sub-steps.
+    // (b) one long interval — seven sub-steps of the 28-day ceiling (six of 30 days before
+    // У-4 made λ_drop the binding leak).
     let mut once = PairLedger {
         v_dem: v0,
         ..PairLedger::default()
     };
-    assert_eq!(sub_steps(horizon).count, 6, "premise: 6 sub-steps");
+    assert_eq!(sub_steps(horizon).count, 7, "premise: 7 sub-steps");
     accrue(&mut once, &vol(0.0, 0.0), horizon);
 
     for (label, v) in [("hourly", hourly.v_dem), ("one interval", once.v_dem)] {
@@ -1617,7 +1650,7 @@ fn a_forward_clock_jump_unconfirms_every_pass_and_charges_the_jump_as_decay() {
 
 #[test]
 fn sub_steps_keep_the_demonstrated_scale_leak_inside_the_stability_margin_too() {
-    // C-15, AC-3b. λ_dem is the slowest leak, so the 30-day step set by λ keeps it far
+    // C-15, AC-3b. λ_dem is the slowest leak, so the 28-day step set by λ_drop keeps it far
     // inside the margin — asserted rather than assumed, in case a calibration flips that.
     for dt in [0.001, 1.0, 30.0, 95.0, 365.0, 4_200.0, 100_000.0] {
         let plan = sub_steps(dt);
@@ -1685,7 +1718,20 @@ fn the_tick_report_lists_exactly_the_rows_the_tick_wrote() {
     // ledger, field for field, and only for rows that were actually accrued.
     let db = test_db();
     let now = 50 * DAY;
-    let [_, _, proven, believed] = report_fixture(&db, now);
+    let [seed, _, proven, believed] = report_fixture(&db, now);
+    // DC-10 (У-4): queued drop events — folded into the accrued `proven`, kept for `seed`.
+    {
+        let mut txn = db.write_txn().unwrap();
+        txn.record_drop_event(&proven, crate::types::DropKind::Announced)
+            .unwrap();
+        txn.record_drop_event(&proven, crate::types::DropKind::Presumed)
+            .unwrap();
+        txn.record_drop_event(&proven, crate::types::DropKind::Presumed)
+            .unwrap();
+        txn.record_drop_event(&seed, crate::types::DropKind::Silent)
+            .unwrap();
+        txn.commit().unwrap();
+    }
     let before: Vec<(IdentityPub, PairLedger)> = db.list_pair_ledgers().unwrap();
     let sweep = db.storage_bytes_by_master(Timestamp(now), 1).unwrap();
 
@@ -1723,7 +1769,43 @@ fn the_tick_report_lists_exactly_the_rows_the_tick_wrote() {
         assert_eq!(row.depth, stored.depth_of_their_service);
         assert_eq!(row.observed_volume, stored.observed_volume);
         assert_eq!(row.observed_tau, stored.observed_tau);
+        assert_eq!(row.drop_ann, stored.drop_ann);
+        assert_eq!(row.drop_silent, stored.drop_silent);
+        assert_eq!(row.drop_presumed, stored.drop_presumed);
     }
+    // DC-10: `*_events` = what was folded into that row on this tick, nothing else.
+    assert_eq!(
+        (
+            report.rows[0].ann_events,
+            report.rows[0].silent_events,
+            report.rows[0].presumed_events
+        ),
+        (1, 0, 2),
+        "`proven` folded its queue"
+    );
+    assert_eq!(
+        (
+            report.rows[1].ann_events,
+            report.rows[1].silent_events,
+            report.rows[1].presumed_events
+        ),
+        (0, 0, 0),
+        "`believed` had nothing queued"
+    );
+    assert_eq!(report.rows[0].drop_ann, 1.0, "0 decayed + 1");
+    assert_eq!(report.rows[0].drop_presumed, 2.0, "0 decayed + 2");
+    assert_eq!(report.stats.drop_events_folded, 3);
+    assert_eq!(
+        db.list_pending_drops().unwrap(),
+        vec![(
+            seed,
+            crate::types::PendingDrops {
+                silent: 1,
+                ..Default::default()
+            }
+        )],
+        "the SEEDED row keeps its queue for its first accruing tick"
+    );
     assert_eq!(
         report.rows[0].confirmed_gb, 3.0,
         "premise: `proven` is confirmed"

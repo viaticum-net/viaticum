@@ -43,13 +43,16 @@ use std::sync::{Arc, Mutex};
 use libp2p::request_response::ResponseChannel;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use viaticum_core::cluster::DeviceCertificate;
 use viaticum_core::config::EscrowCfg;
 use viaticum_core::constants::SYMBOL_OFFER_EXPIRY_SECS;
 use viaticum_core::db::Db;
 use viaticum_core::messages::{AckMsg, Message, RestoreDeniedMsg, SymbolStoredMsg};
-use viaticum_core::types::{DeviceId, IdentityPub, PlacementStatus, SourceBlockId, Timestamp};
+use viaticum_core::pair_ledger::{LossCause, drop_event_for, ledger_master_for_device};
+use viaticum_core::types::{
+    DeviceId, DropKind, IdentityPub, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
+};
 
 use crate::daemon::cluster_sync::ClusterSyncManager;
 use crate::daemon::mailbox::candidate::KademliaRoutingView;
@@ -548,10 +551,17 @@ impl Processor {
 
 /// Mark a placement as Lost. Idempotent: no-op if already Lost or Deleting.
 /// Returns true if the record was changed.
+///
+/// `evidence_at` is the signed `timestamp` of the DropNotice that caused the call: the
+/// 4R pair ledger counts the transition as an ANNOUNCED drop only if that notice is strictly
+/// younger than the placement's episode (У-4, [`persist_placement_change`]). The transition
+/// itself does not depend on it (an old re-delivered notice still marks a fresh placement
+/// Lost — known bug Ф-1, not fixed here: AC-7).
 pub(crate) fn mark_placement_lost(
     db: &Db,
     block_id: &viaticum_core::types::SourceBlockId,
     holder_id: &DeviceId,
+    evidence_at: Timestamp,
 ) -> Result<bool, ProcessorError> {
     let placement = match db.get_placement(block_id, holder_id)? {
         Some(p) => p,
@@ -569,10 +579,16 @@ pub(crate) fn mark_placement_lost(
         return Ok(false);
     }
 
-    let mut updated = placement;
+    let mut updated = placement.clone();
     updated.status = PlacementStatus::Lost;
     updated.consecutive_misses = 0;
-    db.upsert_placement(&updated)?;
+    persist_placement_change(
+        db,
+        &placement,
+        &updated,
+        Some(LossCause::DropNotice),
+        evidence_at,
+    )?;
 
     info!(
         block_id = %block_id,
@@ -581,6 +597,137 @@ pub(crate) fn mark_placement_lost(
     );
 
     Ok(true)
+}
+
+/// Persist a placement status change and, if it is the first loss of a HELD placement
+/// ([`viaticum_core::pair_ledger::drop_event_for`]), record the drop event for the 4R pair
+/// ledger in the SAME write transaction (У-4, Д-K). Returns the kind recorded, if any.
+///
+/// The placement write is exactly what `Db::upsert_placement(updated)` did before (AC-7):
+/// without an event it IS that call; with one, `DbWriteTxn::upsert_placement` (same table
+/// writes, same hot-cache delta, applied after commit) plus `record_drop_event`, committed
+/// together — the transition and its event exist together or not at all. The recorder can
+/// never block the transition: an unresolvable master (no `PeerRecord`, placeholder, or a
+/// failed read) only drops the EVENT, with a `warn!`/`error!`.
+///
+/// Log lines — a contract with `experiments/local_ledger_drop_test.sh`, under the fixed
+/// target `viaticum::ledger` at debug (enable with `RUST_LOG=info,viaticum::ledger=debug`):
+/// `pair-ledger drop event` (`kind master block_id holder`) and `pair-ledger drop not
+/// counted` (`reason cause block_id holder`, only for a changed status landing in
+/// `Lost`/`PresumedLost` — not on every `Uncertain`). Both are printed only AFTER a
+/// successful commit, so every event line is an event in the database.
+pub(crate) fn persist_placement_change(
+    db: &Db,
+    before: &SymbolPlacement,
+    updated: &SymbolPlacement,
+    cause: Option<LossCause>,
+    evidence_at: Timestamp,
+) -> Result<Option<DropKind>, viaticum_core::db::DbError> {
+    let decision = match cause {
+        Some(cause) if updated.status != before.status => Some((
+            cause,
+            drop_event_for(
+                before.status,
+                updated.status,
+                cause,
+                evidence_at,
+                before.placed_at,
+            ),
+        )),
+        _ => None,
+    };
+
+    let (cause, kind) = match decision {
+        Some((cause, Ok(kind))) => (cause, kind),
+        Some((cause, Err(reason))) => {
+            db.upsert_placement(updated)?;
+            if matches!(
+                updated.status,
+                PlacementStatus::Lost | PlacementStatus::PresumedLost
+            ) {
+                debug!(
+                    target: "viaticum::ledger",
+                    reason = ?reason,
+                    cause = ?cause,
+                    block_id = %updated.source_block_id,
+                    holder = %updated.holder_id,
+                    "pair-ledger drop not counted"
+                );
+            }
+            return Ok(None);
+        }
+        None => {
+            db.upsert_placement(updated)?;
+            return Ok(None);
+        }
+    };
+
+    // Resolve the master BEFORE opening the write transaction (a read inside it would not
+    // see anything the transaction changes anyway, and redb allows one writer at a time).
+    let master = match ledger_master_for_device(db, &updated.holder_id) {
+        Ok(Some(master)) => master,
+        Ok(None) => {
+            db.upsert_placement(updated)?;
+            warn!(
+                target: "viaticum::ledger",
+                kind = ?kind,
+                cause = ?cause,
+                block_id = %updated.source_block_id,
+                holder = %updated.holder_id,
+                "pair-ledger drop not recorded: the holder device has no known master"
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            db.upsert_placement(updated)?;
+            error!(
+                target: "viaticum::ledger",
+                kind = ?kind,
+                block_id = %updated.source_block_id,
+                holder = %updated.holder_id,
+                err = %e,
+                "pair-ledger drop not recorded: master lookup failed"
+            );
+            return Ok(None);
+        }
+    };
+
+    // INVARIANT (Д-K): the placement change and its event are ONE write transaction. The
+    // placement status IS the dedup key — "already counted" means "no longer Alive/Uncertain"
+    // — so the two must become visible together. Split them and a crash (or a failed write)
+    // in the window between the commits breaks the count in either direction:
+    //   * placement first, event second: the transition is on disk, the event is not, and no
+    //     re-delivery can bring it back (the placement is already Lost) — a permanent
+    //     UNDER-count;
+    //   * event first, placement second: the event is on disk, the placement is still held,
+    //     so the next re-delivery of the same notice (the mailbox hands it out on every poll
+    //     for its whole TTL) counts it AGAIN — an OVER-count.
+    // No unit test guards this (there is no failure injection between two writes of one
+    // transaction without a test-only production API); it is stated here and in the Cannot
+    // close of `experiments/local_ledger_drop_test.sh`. Do not split it.
+    let mut txn = db.write_txn()?;
+    txn.upsert_placement(updated)?;
+    txn.record_drop_event(&master, kind)?;
+    if let Err(e) = txn.commit() {
+        error!(
+            target: "viaticum::ledger",
+            kind = ?kind,
+            block_id = %updated.source_block_id,
+            holder = %updated.holder_id,
+            err = %e,
+            "pair-ledger drop event: transaction failed, neither the placement change nor the event was written"
+        );
+        return Err(e);
+    }
+    debug!(
+        target: "viaticum::ledger",
+        kind = ?kind,
+        master = %master,
+        block_id = %updated.source_block_id,
+        holder = %updated.holder_id,
+        "pair-ledger drop event"
+    );
+    Ok(Some(kind))
 }
 
 /// Recompute `current_alive` and `current_reliability` for a block from DB state,
