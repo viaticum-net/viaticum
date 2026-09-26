@@ -2,7 +2,8 @@
 # Shared helpers for experiments/local_*_test.sh. Sourced, never executed.
 #
 # The sourcing script must define `node_dir IDX` (a node's --data-dir), `BINARY`
-# and `fail`, and source this file AFTER those definitions.
+# and `fail` (and `node_log IDX` for the log helpers), and source this file AFTER
+# those definitions.
 #
 # Anti-false-green rules these helpers exist to enforce:
 #   - restore is checked only after the local source is gone (otherwise the
@@ -210,4 +211,39 @@ restore_responses_for() {
         total=$((total + ${n:-0}))
     done
     echo "$total"
+}
+
+# ── Process and log helpers ─────────────────────────────────────────────────
+# Daemon logs are appended (`>>`) across restarts, so "what this instance
+# wrote" = the lines after the count taken right before it was started.
+
+# Current number of lines in node IDX's log (0 when there is no log yet).
+log_line_count() {
+    local f; f=$(node_log "$1")
+    if [ -f "$f" ]; then wc -l < "$f"; else echo 0; fi
+}
+
+# Lines of node IDX's log after line N, ANSI colors stripped.
+log_since() {
+    tail -n +$(( $2 + 1 )) "$(node_log "$1")" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true
+}
+
+# Integer value of FIELD in a tracing key=value log LINE ("" when absent).
+log_field() {
+    echo "$1" | grep -oE "(^|[[:space:]])$2=[0-9]+" | head -1 | grep -oE '[0-9]+$' || true
+}
+
+# wait_pid_exit PID SECS: poll until PID (a child of this shell) exits; sets
+# EXIT_RC to its exit status. Returns 1 (EXIT_RC empty) if it is still running.
+wait_pid_exit() {
+    local pid="$1" secs="$2"
+    EXIT_RC=""
+    for _ in $(seq 1 $(( secs * 5 ))); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null && EXIT_RC=0 || EXIT_RC=$?
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
 }

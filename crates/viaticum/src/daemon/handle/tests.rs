@@ -76,9 +76,16 @@ async fn daemon_starts_and_stops_cleanly() {
 
     // Signal shutdown immediately — just verify the lifecycle works.
     handle.stop();
-    handle
-        .wait()
-        .await
+    let outcome = handle
+        .wait_with_deadline(super::shutdown::SHUTDOWN_DRAIN)
+        .await;
+    assert!(
+        outcome.abandoned.is_empty(),
+        "no task may outlive the drain: {:?}",
+        outcome.abandoned
+    );
+    outcome
+        .report()
         .expect("all subsystem tasks should exit cleanly");
 }
 
