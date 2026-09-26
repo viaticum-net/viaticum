@@ -44,6 +44,8 @@ ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
 x25519-dalek = { version = "2", features = ["serde", "static_secrets"] }
 hkdf = "0.13"
 sha2 = "0.11"
+# Already in the tree via ed25519-dalek / x25519-dalek; direct dep for Zeroizing key buffers.
+zeroize = "1"
 
 # Erasure coding
 raptorq = "2"

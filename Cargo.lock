@@ -4435,6 +4435,7 @@ dependencies = [
  "toml",
  "tracing",
  "x25519-dalek",
+ "zeroize",
  "zstd",
 ]
 

@@ -128,6 +128,20 @@ pub fn derive_epoch_key(seed_bytes: &[u8], epoch: EpochCounter) -> Result<EpochK
     })
 }
 
+/// Derive the master-scoped X25519 static secret (directed-mail recipient key).
+///
+/// HKDF-SHA256(ikm=seed_bytes, salt=b"", info=b"viaticum-x25519") → 32 bytes.
+/// Byte-for-byte the derivation the daemon has always used for the `x25519_pub` it
+/// announces in cert exchange. Depends on the shared seed only (not `device_seed`),
+/// so every device of one master derives the same key (P6).
+pub fn derive_x25519_secret(seed_bytes: &[u8]) -> x25519_dalek::StaticSecret {
+    let hk = Hkdf::<Sha256>::new(Some(b""), seed_bytes);
+    let mut okm = zeroize::Zeroizing::new([0u8; 32]);
+    hk.expand(b"viaticum-x25519", &mut okm[..])
+        .expect("HKDF expand: 32-byte output always valid");
+    x25519_dalek::StaticSecret::from(*okm)
+}
+
 /// Extract IdentityPub from a master signing key.
 pub fn master_identity(master_key: &ed25519_dalek::SigningKey) -> IdentityPub {
     IdentityPub(master_key.verifying_key().to_bytes())
