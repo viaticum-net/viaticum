@@ -7,7 +7,9 @@
 // See A2 spec §2.2 for full design.
 
 use crate::db::{Db, DbError};
-use crate::types::IdentityPub;
+use crate::types::{DeviceId, IdentityPub, hex_encode};
+
+pub mod seal;
 
 // ============================================================
 // Per-class configuration
@@ -226,6 +228,120 @@ impl MailboxEntry {
 }
 
 // ============================================================
+// MailboxAddress + write/read authorization (CROWN-1)
+// ============================================================
+
+/// Mailbox address: an Ed25519 public key. The box belongs to whoever holds the
+/// matching secret key. Directed boxes use the recipient's master key; the DR
+/// pointer box uses a seed-derived per-epoch rendezvous key (see [`seal`]).
+///
+/// CROWN-1 slice C1 introduces the type; `MailboxEntry.target` still carries an
+/// `IdentityPub` with the same 32 bytes until slice C2 retypes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct MailboxAddress(pub [u8; 32]);
+
+impl MailboxAddress {
+    /// The directed-mail box of `master`: the address IS the master public key.
+    pub fn for_master(master: &IdentityPub) -> Self {
+        MailboxAddress(master.0)
+    }
+
+    /// The address as an Ed25519 verifying key. `None` if the 32 bytes are not
+    /// a valid compressed Edwards point (such an address can never authorize a
+    /// write or a read).
+    pub fn verifying_key(&self) -> Option<ed25519_dalek::VerifyingKey> {
+        ed25519_dalek::VerifyingKey::from_bytes(&self.0).ok()
+    }
+}
+
+impl std::fmt::Display for MailboxAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", hex_encode(&self.0[..8]))
+    }
+}
+
+/// Domain prefix of the store signature (`target_sig`).
+const STORE_SIG_DOMAIN: &[u8] = b"viaticum-mailbox-store-v1";
+/// Domain prefix of the fetch proof (`target_proof`).
+const FETCH_PROOF_DOMAIN: &[u8] = b"viaticum-mailbox-fetch-v1";
+
+/// Store-signature input (domain-separated, fixed layout, pure):
+///
+/// `b"viaticum-mailbox-store-v1" ‖ target (32) ‖ class (1) ‖ msg_id (16) ‖
+///  payload_version (1) ‖ expires_at_be (8) ‖ stored_at_be (8) ‖ SHA256(payload) (32)`
+///
+/// Every field has a fixed width, so the encoding is injective. The postman must
+/// verify it BEFORE clamping `expires_at` (the signature covers the sender's value).
+pub fn store_sig_input(entry: &MailboxEntry) -> Vec<u8> {
+    use sha2::Digest;
+    let payload_hash: [u8; 32] = sha2::Sha256::digest(&entry.payload).into();
+    let mut out = Vec::with_capacity(STORE_SIG_DOMAIN.len() + 32 + 1 + 16 + 1 + 8 + 8 + 32);
+    out.extend_from_slice(STORE_SIG_DOMAIN);
+    out.extend_from_slice(&entry.target.0);
+    out.push(entry.class.as_u8());
+    out.extend_from_slice(&entry.msg_id);
+    out.push(entry.payload_version);
+    out.extend_from_slice(&entry.expires_at.to_be_bytes());
+    out.extend_from_slice(&entry.stored_at.to_be_bytes());
+    out.extend_from_slice(&payload_hash);
+    out
+}
+
+/// Sign `entry` for store with the secret key of its target address.
+pub fn sign_store(signing_key: &ed25519_dalek::SigningKey, entry: &MailboxEntry) -> [u8; 64] {
+    use ed25519_dalek::Signer;
+    signing_key.sign(&store_sig_input(entry)).to_bytes()
+}
+
+/// Verify a store signature against the entry's own target address
+/// (`verify_strict`). `Unauthorized` if the target is not a valid key or the
+/// signature does not verify.
+pub fn verify_store_sig(entry: &MailboxEntry, sig: &[u8; 64]) -> Result<(), MailboxError> {
+    let key = MailboxAddress(entry.target.0)
+        .verifying_key()
+        .ok_or(MailboxError::Unauthorized)?;
+    let sig = ed25519_dalek::Signature::from_bytes(sig);
+    key.verify_strict(&store_sig_input(entry), &sig)
+        .map_err(|_| MailboxError::Unauthorized)
+}
+
+/// Fetch-proof input: `b"viaticum-mailbox-fetch-v1" ‖ target (32) ‖ requester_device (32)`.
+///
+/// No timestamp on purpose: the proof is bound to the requester's device id,
+/// which the postman takes from the Noise-authenticated connection, so a proof
+/// forwarded by anyone else is useless; and a clean DR machine must not depend
+/// on its clock for reading.
+pub fn fetch_proof_input(target: &MailboxAddress, requester: &DeviceId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(FETCH_PROOF_DOMAIN.len() + 64);
+    out.extend_from_slice(FETCH_PROOF_DOMAIN);
+    out.extend_from_slice(&target.0);
+    out.extend_from_slice(&requester.0);
+    out
+}
+
+/// Prove possession of the secret key of `target` to a postman, bound to `requester`.
+pub fn sign_fetch_proof(
+    signing_key: &ed25519_dalek::SigningKey,
+    target: &MailboxAddress,
+    requester: &DeviceId,
+) -> [u8; 64] {
+    use ed25519_dalek::Signer;
+    signing_key
+        .sign(&fetch_proof_input(target, requester))
+        .to_bytes()
+}
+
+/// Verify a fetch proof (`verify_strict`). `false` for an invalid target key.
+pub fn verify_fetch_proof(target: &MailboxAddress, requester: &DeviceId, sig: &[u8; 64]) -> bool {
+    let Some(key) = target.verifying_key() else {
+        return false;
+    };
+    let sig = ed25519_dalek::Signature::from_bytes(sig);
+    key.verify_strict(&fetch_proof_input(target, requester), &sig)
+        .is_ok()
+}
+
+// ============================================================
 // MailboxRejectReason
 // ============================================================
 
@@ -255,6 +371,8 @@ pub enum MailboxError {
     NotInCandidateSet,
     #[error("duplicate msg_id")]
     Duplicate,
+    #[error("unauthorized write to mailbox address")]
+    Unauthorized,
 }
 
 // ============================================================
