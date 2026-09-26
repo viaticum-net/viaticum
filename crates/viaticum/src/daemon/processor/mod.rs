@@ -304,11 +304,13 @@ impl Processor {
                             identity_pub,
                             device_cert,
                             x25519_pub,
+                            listen_addrs,
                         }) => {
                             let this2 = this.clone();
                             tokio::spawn(async move {
                                 this2.on_peer_authenticated(
                                     peer_id, device_id, identity_pub, device_cert, x25519_pub,
+                                    listen_addrs,
                                 ).await;
                             });
                         }
