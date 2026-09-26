@@ -3417,3 +3417,173 @@ async fn accrue_pair_ledgers_fully_charges_an_on_schedule_tick_at_the_experiment
         stored.gb_days_we_store_for_them
     );
 }
+
+// ─── У-3: the confirmation signal reaches the ledger (recorder — decides nothing) ─
+
+/// S-1 (AC-8). The wiring the whole confirmation signal hangs on: a PoS Pass resolved
+/// through the mailbox (the ONLY non-test writer of `last_verified`) makes the pair
+/// confirmed for the next ledger tick, and before it the same Alive placement charged
+/// nothing. If someone ever stamps `last_verified` elsewhere, or stops stamping it here,
+/// this is the unit that notices (the E2E `local_ledger_test` is the other).
+#[tokio::test]
+async fn a_pos_pass_resolved_through_the_mailbox_confirms_the_pair_for_the_ledger() {
+    use viaticum_core::pos::compute_chain_hash;
+
+    let db = Db::open_in_memory().expect("db open");
+    let block_id = make_block_id(0x5B);
+    let holder_id = make_identity(0x5C);
+    let pair_master = IdentityPub(holder_id.0); // make_peer_record's master
+    db.upsert_source_block(&make_source_block_record(block_id))
+        .unwrap();
+    db.upsert_placement(&make_placement(block_id, holder_id))
+        .unwrap();
+    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
+    let holder_master_key = ed25519_dalek::SigningKey::from_bytes(&[0x5D; 32]);
+    let holder_master = IdentityPub(holder_master_key.verifying_key().to_bytes());
+    db.set_master_for_device(&holder_id, &holder_master)
+        .unwrap();
+
+    let challenge_id = [0x5E; 16];
+    let expected_chain_hash =
+        compute_chain_hash(&challenge_id, &[(0, b"ledger-pass-symbol".as_slice())]).unwrap();
+    let pending = make_pending_challenges();
+    pending.lock().await.insert(
+        (block_id, holder_id),
+        PendingHashChallenge {
+            source_block_id: block_id,
+            holder_id,
+            esi_ranges: vec![(0, 1)],
+            expected_chain_hash,
+            issued_at: Timestamp::now(),
+            challenge_id,
+            holder_master,
+        },
+    );
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let scheduler = Scheduler::new(
+        db.clone(),
+        SchedulerConfig::default_production(),
+        repair_tx,
+        pending,
+        make_test_router(&db),
+        ledger_my_master(),
+        ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    );
+
+    // Before the pass: seeded, then one on-schedule tick — Alive, believed, NOT confirmed.
+    let t0 = Timestamp::now().0;
+    scheduler
+        .accrue_pair_ledgers(Timestamp(t0 - LEDGER_TICK))
+        .unwrap();
+    let before = scheduler.accrue_pair_ledgers_report(Timestamp(t0)).unwrap();
+    assert_eq!(before.stats.believed_not_confirmed, 1);
+    assert_eq!(before.rows[0].confirmed_gb, 0.0);
+    assert_eq!(
+        db.get_pair_ledger(&pair_master).unwrap().unwrap().v_dem,
+        0.0
+    );
+
+    let pass = viaticum_core::messages::build_pos_hash_response(
+        challenge_id,
+        block_id,
+        expected_chain_hash,
+        Timestamp::now(),
+        Some(holder_id),
+        &holder_master_key,
+    );
+    scheduler
+        .handle_pos_response_from_mailbox(pass)
+        .await
+        .expect("pass resolves");
+    assert!(
+        db.get_placement(&block_id, &holder_id)
+            .unwrap()
+            .unwrap()
+            .last_verified
+            .is_some(),
+        "premise: the Pass stamped last_verified"
+    );
+
+    // After the pass: the next on-schedule tick charges the placement's whole volume.
+    let after = scheduler
+        .accrue_pair_ledgers_report(Timestamp(t0 + LEDGER_TICK))
+        .unwrap();
+    let volume_gb = (64u64 * TEST_T as u64) as f64 / viaticum_core::constants::BYTES_PER_GB;
+    assert_eq!(after.stats.believed_not_confirmed, 0);
+    assert_eq!(after.rows[0].confirmed_gb, volume_gb);
+    let row = db.get_pair_ledger(&pair_master).unwrap().unwrap();
+    assert_eq!(
+        row.v_dem, volume_gb,
+        "the ratchet snaps to the proven volume"
+    );
+    assert!(row.gb_days_they_store_for_us > 0.0 && row.observed_tau > 0.0);
+}
+
+/// Smallest real age of the last pass at which `pos::due_challenges` issues the next
+/// challenge for an honest holder (`cpw = 1`) at `scale` — found by asking the function
+/// itself, so the test cannot drift from the interval formula (`pos/mod.rs`).
+fn first_due_age_real_secs(scale: u64) -> u64 {
+    use viaticum_core::pos::{challenges_per_week, due_challenges};
+    let block = make_block_id(0x61);
+    let holder = make_identity(0x62);
+    let placement = make_placement(block, holder);
+    assert_eq!(
+        challenges_per_week(placement.symbol_count(), 1.0),
+        1,
+        "premise: an honest holder after its first pass is challenged once a week"
+    );
+    let passed = Timestamp(1_000_000_000);
+    let due_at = |age: u64| {
+        !due_challenges(
+            std::slice::from_ref(&placement),
+            &[(block, holder, Some(passed))],
+            Timestamp(passed.0 + age),
+            |_| 1.0,
+            scale,
+        )
+        .is_empty()
+    };
+    let (mut lo, mut hi) = (0u64, viaticum_core::constants::SECS_PER_WEEK);
+    assert!(due_at(hi), "premise: due within a real week at any scale");
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if due_at(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+/// S-2 (AC-9, Д-G). An always-on honest holder's whole PoS cycle — next issue after the
+/// pass, the PoS timer that issues it, the holder's poll, the owner's poll, plus one ledger
+/// tick of lateness and one second of `Timestamp` truncation — fits inside the
+/// confirmation window at every time scale the scripts in this tree run (1, 1000, 10 000,
+/// 86 400, 100 000), so a healthy pair does not blink out of confirmation. Every period
+/// is built by the function or field that builds the real timer (lesson of Д-A′); the
+/// daemon's own `SchedulerConfig` literal in `handle/mod.rs` is NOT visible from here —
+/// it currently equals `default_production()` (3600 s).
+#[test]
+fn an_always_on_holders_pos_cycle_fits_the_confirmation_window_at_every_experiment_time_scale() {
+    let window = viaticum_core::constants::PAIR_LEDGER_CONFIRMATION_WINDOW_SECS;
+    let pos_timer_base = SchedulerConfig::default_production().pos_interval_secs;
+    for scale in [1u64, 1000, 10_000, 86_400, 100_000] {
+        let issue_after_pass = first_due_age_real_secs(scale);
+        let pos_timer = super::scaled_timer_secs(pos_timer_base, scale);
+        let poll = crate::daemon::mailbox::poll::poll_interval_secs(scale);
+        let ledger_tick = viaticum_core::pair_ledger::tick_interval_secs(scale);
+        let cycle_real = issue_after_pass + pos_timer + 2 * poll + ledger_tick + 1;
+        assert!(
+            cycle_real * scale <= window,
+            "scale {scale}: cycle {cycle_real} real s = {} scaled s > W_conf {window} \
+             (issue {issue_after_pass} + pos timer {pos_timer} + 2×poll {poll} + ledger tick \
+             {ledger_tick} + 1)",
+            cycle_real * scale
+        );
+    }
+}

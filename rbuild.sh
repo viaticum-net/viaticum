@@ -13,7 +13,10 @@ ARGS="${@:---release -p viaticum}"
 
 if ssh -o ConnectTimeout=2 -o BatchMode=yes "$SERVER" "echo ok" &>/dev/null; then
     echo "=== Server online, building remotely ==="
-    rsync -az --delete \
+    # --checksum --no-times: sync by content and stamp changed files with a fresh mtime.
+    # Plain -a keeps the source mtime, so a file reverted to older content (branch
+    # switch, undone mutation) looks unchanged to cargo and the build goes stale.
+    rsync -az --checksum --no-times --delete \
         --exclude target \
         --exclude .claude \
         --exclude '.git/objects' \

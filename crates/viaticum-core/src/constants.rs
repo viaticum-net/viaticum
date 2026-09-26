@@ -480,6 +480,43 @@ pub const PAIR_LEDGER_LAMBDA: f64 = 1.0 / 60.0;
 /// silent-but-deep partner keeps a fading floor rather than a permanent free one.
 pub const PAIR_LEDGER_LAMBDA_SLOW: f64 = 1.0 / 180.0;
 
+/// `λ_dem` — leak rate of the demonstrated-scale ratchet `V_dem` [day⁻¹]; `τ_dem ≈ 1 year`.
+///
+/// PROVISIONAL: the §13 starting guess (`four_r::update_v_dem` doc: "an OPEN calibration"),
+/// equal to the sim's `DynParams::default().lambda_dem` (`sim_dynamic/engine.rs:365`, pinned
+/// by `sim_dynamic::tests::the_daemon_recorder_leaks_at_exactly_the_model_defaults_this_sim_runs_on`).
+/// It is swept in В-3½ together with V_free / c_recip / θ_p. Hard constraint (Р-8, rebase
+/// §5.1): `τ_dem ≥ τ_slow`, or the W10 tail of a silent-but-deep partner melts on `v_dem`'s
+/// clock instead of the 6-month depth clock (asserted below, AC-3h).
+pub const PAIR_LEDGER_LAMBDA_DEM: f64 = 1.0 / 365.0;
+
+/// How long one PoS pass keeps a placement CONFIRMED for the pair ledger [SCALED seconds]
+/// (У-3, decision Д-G: 1 220 400 s = 14 d 3 h).
+///
+/// = base challenge interval + mailbox challenge TTL + three poll-sized delays (the PoS
+/// issuance tick, the holder's mailbox poll and the owner's mailbox poll): the latest the
+/// NEXT pass can arrive from a holder the model scores as passing every 7-day window
+/// (surfaces at least once inside the challenge's mailbox lifetime). Shorter would make an
+/// honest weekly-surfacing holder blink out of confirmation every week (Д-E again, now on
+/// the peer's side, and again on tiers T3/T4); longer grows the invented-service residue of
+/// a holder that has died (≤ this window after its last pass).
+///
+/// Built from [`POS_BASE_CHALLENGES_PER_WEEK`]: if 4R ever lowers the base cadence (A.5
+/// `r_0(1+σ)`), this window must grow with it — the formula does that by itself, a literal
+/// would not.
+///
+/// The PoS issuance tick is `SchedulerConfig::default_production().pos_interval_secs`
+/// (3600 s, `daemon/scheduler`), counted here as [`MAILBOX_POLL_INTERVAL_SECS`] because
+/// both are 3600; `daemon::scheduler::tests::an_always_on_holders_pos_cycle_fits_the_confirmation_window_at_every_experiment_time_scale`
+/// rebuilds the cycle from the real timer inputs and fails if they stop fitting.
+///
+/// Not to be confused with [`POS_CHALLENGE_PENDING_TIMEOUT_SECS`] (14 d 2 h): numerically
+/// close, but that one counts from the ISSUE of a challenge, this one from the last PASS.
+pub const PAIR_LEDGER_CONFIRMATION_WINDOW_SECS: u64 = SECS_PER_WEEK
+    / POS_BASE_CHALLENGES_PER_WEEK as u64
+    + 7 * 24 * 3600 // mailbox::class_config::POS_CHALLENGE_TTL (pinned by a test)
+    + 3 * MAILBOX_POLL_INTERVAL_SECS; // issuance tick + holder poll + owner poll
+
 /// Largest `λ·Δt` the recorder allows in ONE explicit Euler sub-step.
 ///
 /// `update_capital`'s multiplier is `(1 − λΔt)`: monotone only below 1, oscillating up to
@@ -560,6 +597,12 @@ const _: () = assert!(S_CLAMP_MIN < S_CLAMP_MAX);
 // Depth is the SLOW twin of the fast capital: τ_slow ≫ τ_fast (A.4). If these ever cross,
 // the "loyalty outlives the transaction" property inverts.
 const _: () = assert!(PAIR_LEDGER_LAMBDA > PAIR_LEDGER_LAMBDA_SLOW);
+// AC-3h (Р-8, rebase §5.1): the demonstrated scale must not melt faster than the loyalty
+// depth, or a silent-but-deep partner's floor would fade on `v_dem`'s clock.
+const _: () = assert!(PAIR_LEDGER_LAMBDA_DEM > 0.0);
+const _: () = assert!(PAIR_LEDGER_LAMBDA_DEM <= PAIR_LEDGER_LAMBDA_SLOW);
+// Д-G: 14 d 3 h. A change here changes what "confirmed" means for every recorded series.
+const _: () = assert!(PAIR_LEDGER_CONFIRMATION_WINDOW_SECS == 1_220_400);
 const _: () = assert!(PAIR_LEDGER_MAX_LAMBDA_DT > 0.0 && PAIR_LEDGER_MAX_LAMBDA_DT < 1.0);
 // An observed window shorter than one tick period would mark every ordinary on-schedule
 // tick as partly unobserved and the recorder would never charge a full interval. Stated in

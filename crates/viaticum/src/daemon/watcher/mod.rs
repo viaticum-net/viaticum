@@ -313,14 +313,16 @@ pub async fn start_watcher(
     let poll_ms = (config.debounce_ms / 4).max(10);
     let mut poll_timer = interval(Duration::from_millis(poll_ms));
 
-    // Periodic rescan timer.
-    let rescan_secs = if config.rescan_interval_secs > 0 {
-        config.rescan_interval_secs
+    // Periodic rescan timer; `rescan_interval_secs == 0` disables it. A huge
+    // period is not a substitute: tokio computes `deadline + period` for the
+    // next tick and panics on `Instant` overflow.
+    let mut rescan_timer = if config.rescan_interval_secs > 0 {
+        let mut t = interval(Duration::from_secs(config.rescan_interval_secs));
+        t.tick().await; // skip immediate first tick
+        Some(t)
     } else {
-        u64::MAX / 2 // effectively never
+        None
     };
-    let mut rescan_timer = interval(Duration::from_secs(rescan_secs));
-    rescan_timer.tick().await; // skip immediate first tick
 
     // Keep watcher alive for the duration of this async function.
     // Must be mut so we can call watch()/unwatch() on Add/Remove commands.
@@ -332,7 +334,12 @@ pub async fn start_watcher(
                 tracing::debug!("watcher: cancel requested, exiting");
                 break;
             }
-            _ = rescan_timer.tick() => {
+            _ = async {
+                match rescan_timer.as_mut() {
+                    Some(t) => { t.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
                 if !watch_dirs.is_empty() {
                     for dir in &watch_dirs {
                         set_status(&config.watch_states, dir,
