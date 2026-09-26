@@ -1,7 +1,10 @@
 #![allow(clippy::cloned_ref_to_slice_refs)]
 
 use crate::constants::{HOLDER_DELETE_COOLDOWN_SECS, OWNER_DELETE_COOLDOWN_SECS};
-use crate::deletion::{DeletionAction, DeletionEngine, DeletionError, MarkDeletedResult};
+use crate::deletion::{
+    DeletionAction, DeletionEngine, DeletionError, MarkDeletedResult, latest_deletion_per_block,
+    live_referenced_blocks,
+};
 use crate::types::{
     DeviceId, FileId, FileRecord, FileVersion, LocalState, PackEntry, PlacementStatus,
     SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement,
@@ -802,4 +805,408 @@ fn should_delete_now_monotone_in_time() {
             "expected SendDropNotice at extra_weeks={extra_weeks}, got {actions:?}"
         );
     }
+}
+
+// ── delete-i3: release guard (live references, latest deletion per block) ────
+
+fn make_backed_version(bid: SourceBlockId, backed_up_at: Option<u64>) -> FileVersion {
+    FileVersion {
+        backed_up_at: backed_up_at.map(ts),
+        ..make_version(bid)
+    }
+}
+
+fn make_pack(bid: SourceBlockId, status: SourceBlockStatus, fids: &[FileId]) -> SourceBlockRecord {
+    let entries = fids
+        .iter()
+        .enumerate()
+        .map(|(i, fid)| PackEntry {
+            file_id: *fid,
+            offset: i as u64 * 100,
+            size: 100,
+        })
+        .collect();
+    make_block(bid, status, SourceBlockType::Pack { entries })
+}
+
+/// Actions other than VacuumBlock (vacuum is advisory and not part of the release flow).
+fn release_actions(actions: Vec<DeletionAction>) -> Vec<DeletionAction> {
+    actions
+        .into_iter()
+        .filter(|a| !matches!(a, DeletionAction::VacuumBlock { .. }))
+        .collect()
+}
+
+#[test]
+fn deleted_and_present_records_on_same_block_emit_no_release_actions() {
+    // Two paths with identical content dedup onto one Single block; one path deleted
+    // long ago, the other still present.
+    let engine = DeletionEngine::new();
+    let dev = device(1);
+    let bid = block_id(1);
+    let deleted = make_file(
+        file_id(1),
+        vec![(dev, LocalState::Deleted(ts(0)))],
+        vec![make_backed_version(bid, Some(0))],
+    );
+    let present = make_file(
+        file_id(2),
+        vec![(dev, LocalState::Present)],
+        vec![make_backed_version(bid, Some(0))],
+    );
+    let block = make_block(bid, SourceBlockStatus::Active, SourceBlockType::Single);
+    let placements = vec![
+        make_placement(bid, holder(10), file_id(1), PlacementStatus::Alive),
+        make_placement(bid, holder(11), file_id(1), PlacementStatus::Alive),
+    ];
+    let now = ts(10 * (OWNER_DELETE_COOLDOWN_SECS + HOLDER_DELETE_COOLDOWN_SECS));
+
+    let actions = engine.process_cooldowns(&[deleted, present], &[block], &placements, now, 1);
+
+    assert_eq!(actions, vec![]);
+}
+
+#[test]
+fn pack_with_one_of_n_files_deleted_is_not_released() {
+    let engine = DeletionEngine::new();
+    let dev = device(1);
+    let bid = block_id(1);
+    let fids = [file_id(1), file_id(2), file_id(3), file_id(4)];
+    let mut files = vec![make_file(
+        fids[0],
+        vec![(dev, LocalState::Deleted(ts(0)))],
+        vec![make_backed_version(bid, Some(0))],
+    )];
+    for fid in &fids[1..] {
+        files.push(make_file(
+            *fid,
+            vec![(dev, LocalState::Present)],
+            vec![make_backed_version(bid, Some(0))],
+        ));
+    }
+    let block = make_pack(bid, SourceBlockStatus::Active, &fids);
+    let placements = vec![
+        make_placement(bid, holder(10), fids[0], PlacementStatus::Alive),
+        make_placement(bid, holder(11), fids[0], PlacementStatus::Alive),
+    ];
+    let now = ts(OWNER_DELETE_COOLDOWN_SECS + HOLDER_DELETE_COOLDOWN_SECS + 1);
+
+    let actions = engine.process_cooldowns(&files, &[block], &placements, now, 1);
+
+    assert_eq!(release_actions(actions), vec![]);
+}
+
+#[test]
+fn pack_with_all_files_deleted_is_released() {
+    let engine = DeletionEngine::new();
+    let dev = device(1);
+    let bid = block_id(1);
+    let fids = [file_id(1), file_id(2), file_id(3)];
+    let files: Vec<FileRecord> = fids
+        .iter()
+        .map(|fid| {
+            make_file(
+                *fid,
+                vec![(dev, LocalState::Deleted(ts(0)))],
+                vec![make_backed_version(bid, Some(0))],
+            )
+        })
+        .collect();
+    let placements = vec![
+        make_placement(bid, holder(10), fids[0], PlacementStatus::Alive),
+        make_placement(bid, holder(11), fids[0], PlacementStatus::Alive),
+    ];
+
+    // Owner window elapsed: one DropNotice per holder, not one per referencing record.
+    let active = make_pack(bid, SourceBlockStatus::Active, &fids);
+    let actions = engine.process_cooldowns(
+        &files,
+        &[active],
+        &placements,
+        ts(OWNER_DELETE_COOLDOWN_SECS),
+        1,
+    );
+    assert_eq!(
+        release_actions(actions),
+        vec![
+            DeletionAction::SendDropNotice {
+                source_block_id: bid,
+                holder_id: holder(10),
+            },
+            DeletionAction::SendDropNotice {
+                source_block_id: bid,
+                holder_id: holder(11),
+            },
+        ]
+    );
+
+    // Holder window elapsed: each placement cleaned once, CleanupBlock per deleted record.
+    let deleting = make_pack(bid, SourceBlockStatus::Deleting, &fids);
+    let placements: Vec<SymbolPlacement> = placements
+        .into_iter()
+        .map(|mut p| {
+            p.status = PlacementStatus::Deleting;
+            p
+        })
+        .collect();
+    let actions = engine.process_cooldowns(
+        &files,
+        &[deleting],
+        &placements,
+        ts(OWNER_DELETE_COOLDOWN_SECS + HOLDER_DELETE_COOLDOWN_SECS),
+        1,
+    );
+    let mut expected = vec![
+        DeletionAction::CleanupPlacement {
+            source_block_id: bid,
+            holder_id: holder(10),
+        },
+        DeletionAction::CleanupPlacement {
+            source_block_id: bid,
+            holder_id: holder(11),
+        },
+    ];
+    for fid in fids {
+        expected.push(DeletionAction::CleanupBlock {
+            source_block_id: bid,
+            file_id: fid,
+        });
+    }
+    assert_eq!(actions, expected);
+}
+
+#[test]
+fn block_referenced_only_by_old_version_of_live_file_is_not_protected() {
+    // Live file edited: v1 on old_bid, v2 (current, backed up) on new_bid. A deleted
+    // record also points at old_bid. P2: old versions of live files are not held.
+    let engine = DeletionEngine::new();
+    let dev = device(1);
+    let old_bid = block_id(1);
+    let new_bid = block_id(2);
+    let live = make_file(
+        file_id(1),
+        vec![(dev, LocalState::Present)],
+        vec![
+            make_backed_version(old_bid, Some(0)),
+            make_backed_version(new_bid, Some(5)),
+        ],
+    );
+    let deleted = make_file(
+        file_id(2),
+        vec![(dev, LocalState::Deleted(ts(0)))],
+        vec![make_backed_version(old_bid, Some(0))],
+    );
+    let blocks = [
+        make_block(old_bid, SourceBlockStatus::Active, SourceBlockType::Single),
+        make_block(new_bid, SourceBlockStatus::Active, SourceBlockType::Single),
+    ];
+    let placements = vec![
+        make_placement(old_bid, holder(10), file_id(1), PlacementStatus::Alive),
+        make_placement(new_bid, holder(11), file_id(1), PlacementStatus::Alive),
+    ];
+
+    assert!(!live_referenced_blocks(&[live.clone(), deleted.clone()]).contains(&old_bid));
+    let actions = engine.process_cooldowns(
+        &[live, deleted],
+        &blocks,
+        &placements,
+        ts(OWNER_DELETE_COOLDOWN_SECS),
+        1,
+    );
+
+    assert_eq!(
+        actions,
+        vec![DeletionAction::SendDropNotice {
+            source_block_id: old_bid,
+            holder_id: holder(10),
+        }]
+    );
+}
+
+#[test]
+fn live_referenced_blocks_includes_latest_and_latest_backed_up_version() {
+    let dev = device(1);
+    let oldest = block_id(1);
+    let backed = block_id(2);
+    let queued = block_id(3);
+    let deleted_bid = block_id(4);
+    let live = make_file(
+        file_id(1),
+        vec![(dev, LocalState::Present)],
+        vec![
+            make_backed_version(oldest, Some(1)),
+            make_backed_version(backed, Some(2)),
+            make_backed_version(queued, None),
+        ],
+    );
+    let deleted = make_file(
+        file_id(2),
+        vec![(dev, LocalState::Deleted(ts(3)))],
+        vec![make_backed_version(deleted_bid, Some(1))],
+    );
+
+    let live_blocks = live_referenced_blocks(&[live, deleted]);
+
+    assert_eq!(live_blocks, [backed, queued].into_iter().collect());
+}
+
+#[test]
+fn deleting_block_that_is_live_referenced_gets_no_cleanup_actions() {
+    // DropNotice already went out (block Deleting, one placement Deleting), then a
+    // live record started referencing the block again (restored file moved to a new
+    // path). The guard stops the flow; it does not undo the DropNotice.
+    let engine = DeletionEngine::new();
+    let dev = device(1);
+    let bid = block_id(1);
+    let deleted = make_file(
+        file_id(1),
+        vec![(dev, LocalState::Deleted(ts(0)))],
+        vec![make_backed_version(bid, Some(0))],
+    );
+    let moved = make_file(
+        file_id(2),
+        vec![(dev, LocalState::Present)],
+        vec![make_backed_version(bid, Some(0))],
+    );
+    let block = make_block(bid, SourceBlockStatus::Deleting, SourceBlockType::Single);
+    let placements = vec![
+        make_placement(bid, holder(10), file_id(1), PlacementStatus::Deleting),
+        make_placement(bid, holder(11), file_id(1), PlacementStatus::Alive),
+    ];
+    let now = ts(10 * (OWNER_DELETE_COOLDOWN_SECS + HOLDER_DELETE_COOLDOWN_SECS));
+
+    let actions = engine.process_cooldowns(&[deleted, moved], &[block], &placements, now, 1);
+
+    assert_eq!(actions, vec![]);
+}
+
+#[test]
+fn record_with_no_devices_counts_as_live() {
+    let engine = DeletionEngine::new();
+    let bid = block_id(1);
+    let orphan = make_file(file_id(1), vec![], vec![make_backed_version(bid, Some(0))]);
+    let deleted = make_file(
+        file_id(2),
+        vec![(device(1), LocalState::Deleted(ts(0)))],
+        vec![make_backed_version(bid, Some(0))],
+    );
+    let block = make_block(bid, SourceBlockStatus::Active, SourceBlockType::Single);
+    let placements = vec![make_placement(
+        bid,
+        holder(10),
+        file_id(2),
+        PlacementStatus::Alive,
+    )];
+
+    assert!(live_referenced_blocks(&[orphan.clone()]).contains(&bid));
+    let actions = engine.process_cooldowns(
+        &[orphan, deleted],
+        &[block],
+        &placements,
+        ts(OWNER_DELETE_COOLDOWN_SECS + HOLDER_DELETE_COOLDOWN_SECS),
+        1,
+    );
+
+    assert_eq!(actions, vec![]);
+}
+
+#[test]
+fn pack_member_deleted_later_keeps_its_own_undo_window() {
+    // X1 deleted at t0; X2..X4 deleted at t1 > t0 + window. The block's owner window
+    // runs from t1: nothing at t1 + window - 1, DropNotice at t1 + window.
+    let engine = DeletionEngine::new();
+    let dev = device(1);
+    let bid = block_id(1);
+    let fids = [file_id(1), file_id(2), file_id(3), file_id(4)];
+    let t0 = 1_000;
+    let t1 = t0 + OWNER_DELETE_COOLDOWN_SECS + HOLDER_DELETE_COOLDOWN_SECS + 7;
+    let files: Vec<FileRecord> = fids
+        .iter()
+        .enumerate()
+        .map(|(i, fid)| {
+            let deleted_at = if i == 0 { t0 } else { t1 };
+            make_file(
+                *fid,
+                vec![(dev, LocalState::Deleted(ts(deleted_at)))],
+                vec![make_backed_version(bid, Some(0))],
+            )
+        })
+        .collect();
+    let block = make_pack(bid, SourceBlockStatus::Active, &fids);
+    let placements = vec![make_placement(
+        bid,
+        holder(10),
+        fids[0],
+        PlacementStatus::Alive,
+    )];
+
+    let before = engine.process_cooldowns(
+        &files,
+        std::slice::from_ref(&block),
+        &placements,
+        ts(t1 + OWNER_DELETE_COOLDOWN_SECS - 1),
+        1,
+    );
+    let at = engine.process_cooldowns(
+        &files,
+        &[block],
+        &placements,
+        ts(t1 + OWNER_DELETE_COOLDOWN_SECS),
+        1,
+    );
+
+    assert_eq!(release_actions(before), vec![]);
+    assert_eq!(
+        release_actions(at),
+        vec![DeletionAction::SendDropNotice {
+            source_block_id: bid,
+            holder_id: holder(10),
+        }]
+    );
+}
+
+#[test]
+fn latest_deletion_per_block_takes_max_over_referencing_records() {
+    let a = block_id(1);
+    let b = block_id(2);
+    let c = block_id(3);
+    let files = vec![
+        make_file(
+            file_id(1),
+            vec![(device(1), LocalState::Deleted(ts(50)))],
+            vec![make_version(a)],
+        ),
+        make_file(
+            file_id(2),
+            vec![(device(1), LocalState::Deleted(ts(90)))],
+            vec![make_version(a), make_version(b)],
+        ),
+        make_file(
+            file_id(3),
+            vec![(device(1), LocalState::Deleted(ts(70)))],
+            vec![make_version(a)],
+        ),
+        // Multi-device record: deleted at the latest device deletion (120).
+        make_file(
+            file_id(4),
+            vec![
+                (device(1), LocalState::Deleted(ts(20))),
+                (device(2), LocalState::Deleted(ts(120))),
+            ],
+            vec![make_version(b)],
+        ),
+        // Live record: contributes no deletion time.
+        make_file(
+            file_id(5),
+            vec![(device(1), LocalState::Present)],
+            vec![make_version(c)],
+        ),
+    ];
+
+    let latest = latest_deletion_per_block(&files);
+
+    assert_eq!(latest.len(), 2);
+    assert_eq!(latest.get(&a), Some(&ts(90)));
+    assert_eq!(latest.get(&b), Some(&ts(120)));
+    assert_eq!(latest.get(&c), None);
 }
