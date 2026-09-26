@@ -186,17 +186,19 @@ restore_from_network() {
 OWNER_DELETE_COOLDOWN_SECS=2419200
 DELETE_WINDOW_FLOOR_SECS=600
 
-# assert_delete_window TIME_SCALE: FAIL and exit when the scaled owner-delete
-# cooldown is below the floor.
+# assert_delete_window TIME_SCALE [FLOOR_SECS]: FAIL and exit when the scaled
+# owner-delete cooldown is below the floor (default DELETE_WINDOW_FLOOR_SECS).
+# A scenario that deliberately races the window (local_pack_delete_test) passes a
+# lower floor and then checks its own elapsed time explicitly.
 assert_delete_window() {
-    local scale="$1" scaled
+    local scale="$1" floor="${2:-$DELETE_WINDOW_FLOOR_SECS}" scaled
     [ "$scale" -ge 1 ] || scale=1
     scaled=$((OWNER_DELETE_COOLDOWN_SECS / scale))
-    if [ "$scaled" -lt "$DELETE_WINDOW_FLOOR_SECS" ]; then
-        fail "delete window: OWNER_DELETE_COOLDOWN_SECS/${scale} = ${scaled}s < ${DELETE_WINDOW_FLOOR_SECS}s; the network may drop the file before restore runs"
+    if [ "$scaled" -lt "$floor" ]; then
+        fail "delete window: OWNER_DELETE_COOLDOWN_SECS/${scale} = ${scaled}s < ${floor}s; the network may drop the file before restore runs"
         exit 1
     fi
-    info "delete window: OWNER_DELETE_COOLDOWN_SECS/${scale} = ${scaled}s (floor ${DELETE_WINDOW_FLOOR_SECS}s)"
+    info "delete window: OWNER_DELETE_COOLDOWN_SECS/${scale} = ${scaled}s (floor ${floor}s)"
 }
 
 # Holder-side corroboration that a restore went over the network: number of
@@ -281,4 +283,19 @@ wait_pid_exit() {
         sleep 0.2
     done
     return 1
+}
+
+# Holder-side proof that a Delete for BLOCK_HEX reached a holder: number of
+# "holding marked for deletion" log lines for BLOCK_HEX across the given nodes'
+# logs (processor/symbol.rs, the holder flips its holding Active -> MarkedForDelete
+# and stops serving it). Block ids are logged as their first 16 hex chars.
+delete_marks_for() {
+    local hex="${1:0:16}"; shift
+    local total=0 n i
+    [ -n "$hex" ] || { echo 0; return; }
+    for i in "$@"; do
+        n=$(grep -a "holding marked for deletion" "$(node_log "$i")" 2>/dev/null | grep -ac "$hex" || true)
+        total=$((total + ${n:-0}))
+    done
+    echo "$total"
 }
