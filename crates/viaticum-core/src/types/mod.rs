@@ -397,6 +397,33 @@ impl SymbolPlacement {
     pub fn symbol_count(&self) -> u32 {
         self.esi_ranges.iter().map(|(_, count)| count).sum()
     }
+
+    /// Whether this placement counts as CONFIRMED service at `now` for the 4R pair ledger
+    /// (У-3, decisions Д-F/Д-G): status `Alive` AND a PoS pass no older than
+    /// `window_scaled_secs` on the SCALED clock — the same clock
+    /// [`PairLedger::elapsed_days`] uses (`age_real × time_scale`, `0` treated as `1`).
+    ///
+    /// `last_verified` is written only on `Pass` (`daemon/scheduler`), so a placement that
+    /// became `Alive` on `SymbolStored` and was never proven does not count. This is the one
+    /// definition of "confirmed" in the tree: the ledger sweep
+    /// ([`crate::db::Db::storage_bytes_by_master`]) calls it and nothing re-implements it.
+    ///
+    /// A pass stamped after `now` (backward wall-clock jump) has age 0 and counts; the
+    /// recorder integrates nothing on such a tick anyway (its interval is 0). An absurd
+    /// `time_scale` saturates the age instead of wrapping it, so it reads as "too old".
+    pub fn confirmed_at(&self, now: Timestamp, time_scale: u64, window_scaled_secs: u64) -> bool {
+        if self.status != PlacementStatus::Alive {
+            return false;
+        }
+        let Some(passed_at) = self.last_verified else {
+            return false;
+        };
+        let age_scaled = now
+            .0
+            .saturating_sub(passed_at.0)
+            .saturating_mul(time_scale.max(1));
+        age_scaled <= window_scaled_secs
+    }
 }
 
 /// Status of symbols from the owner's perspective.
@@ -461,6 +488,13 @@ pub enum PlacementStatus {
 /// | `gb_days_they_store_for_us` | their machines keep OUR data | `obs.g_owner_from_holder` | `obs.g_holder_from_owner` (the κ_O input) |
 /// | `gb_days_we_store_for_them` | we keep THEIR data | `obs.g_holder_from_owner` | `obs.g_owner_from_holder` |
 /// | `depth_of_their_service` | (slow twin of row 1) | — | `OwnerEvictionView::depth` |
+/// | `v_dem` | THEIR confirmed service to us (ratchet) | `obs.v_dem` | `obs.v_dem` |
+/// | `observed_volume`, `observed_tau` | THEIR confirmed service to us (current run) | `obs.observed_volume` / `obs.observed_tau` | the same |
+///
+/// The last two rows do NOT swap with the seat (У-3): in the owner seat `v_dem` reads "how
+/// much the holder has proven it keeps of mine", in the holder seat it is `v_dem^{ho}`,
+/// "how much O has proven it serves me" (`4r_rebase_quanta.md` §5.1, NOTE-3) — the same
+/// physical direction, their service to us. Only the two `g` fields trade places.
 ///
 /// The right-hand column is the one that matters and the one that was got wrong: the
 /// eviction key is `kappa_key(obs.g_holder_from_owner, depth, ..)` and the kernel says in
@@ -588,25 +622,32 @@ pub struct PairLedger {
     /// **[gb·days]** — leaky integral of the data THIS MASTER'S DEVICES KEEP FOR US.
     ///
     /// Charged from the daemon's own owner-side bookkeeping: `symbol_count × t` summed
-    /// over placements in status `Alive` at any device of this master, integrated by
+    /// over the CONFIRMED placements (below) at any device of this master, integrated by
     /// [`crate::four_r::update_capital`] at `λ`.
     ///
-    /// The number comes from the SWEEP [`crate::db::Db::storage_bytes_by_master`], which is
-    /// the only production path (Д-C: one pass per table for all masters, because the tick
-    /// runs inside the scheduler's `select!`).
-    /// [`crate::db::Db::bytes_master_stores_for_us`] computes the same formula for ONE
-    /// master and has no production call site at all — it is the point-query reference the
-    /// sweep is cross-checked against
-    /// (`pair_ledger::tests::the_sweep_and_the_point_queries_report_the_same_volumes`), and
-    /// the readable statement of what the sweep's accumulator means.
+    /// The number comes from the SWEEP [`crate::db::Db::storage_bytes_by_master`]
+    /// (`MasterStorageBytes::they_store_for_us_confirmed`), which is the only production
+    /// path (Д-C: one pass per table for all masters, because the tick runs inside the
+    /// scheduler's `select!`). [`crate::db::Db::bytes_master_stores_for_us`] computes the
+    /// BELIEVED formula (every `Alive` placement) for ONE master and has no production call
+    /// site at all — it is the point-query reference the sweep's believed column is
+    /// cross-checked against
+    /// (`pair_ledger::tests::the_sweep_and_the_point_queries_report_the_same_volumes`). The
+    /// confirmed column deliberately has no point-query twin: its definition lives in
+    /// [`SymbolPlacement::confirmed_at`], so there is no second implementation to drift.
     ///
-    /// ⚠ **Not "PoS-confirmed", however tempting the phrase is.** What is charged is the
-    /// placement STATUS: `Alive` is our record that the symbols are believed to be there,
-    /// demoted to `Uncertain`/`PresumedLost` only after PoS challenges time out. So a
-    /// holder that has gone quiet keeps charging this axis for as long as the PoS state
-    /// machine needs to notice. That is a proxy for confirmation, accepted for the
-    /// recorder slice (Д-D, 2026-08-09); deriving a real confirmation signal from
-    /// `pos_weekly` or from the placement transitions is an open item for У-3.
+    /// **Charged by CONFIRMED volume only** (У-3, decision Д-F = A): the bytes of `Alive`
+    /// placements whose last PoS pass is no older than
+    /// [`crate::constants::PAIR_LEDGER_CONFIRMATION_WINDOW_SECS`] on the scaled clock
+    /// ([`SymbolPlacement::confirmed_at`]). An `Alive` placement that was never proven —
+    /// the hours between `SymbolStored` and the first pass, a holder that accepted and never
+    /// answered, SystemState blocks (not challenged at all, Bug-B) — charges nothing.
+    ///
+    /// What remains of invented service: a holder that dies keeps counting as confirmed
+    /// until its last pass ages out of the window — at most 14 d 3 h after that pass, ≈10.6 d
+    /// on average for a death uniform inside the weekly PoS cycle (≈18 % of `τ = 60 days`).
+    /// It is bounded by the window, not by the PoS state machine: `Alive → Uncertain` needs
+    /// the next challenge to be issued and to time out, which is later.
     pub gb_days_they_store_for_us: f64,
     /// **[gb·days]** — leaky integral of the data WE KEEP FOR THIS MASTER.
     ///
@@ -644,14 +685,35 @@ pub struct PairLedger {
     /// quantity that cannot be back-computed. Same reason as the capitals, one
     /// time-constant slower.
     pub depth_of_their_service: f64,
-    /// `V_dem` **[gb]**: max proven retained volume for this pair. A slow ratchet — snaps
-    /// up to freshly confirmed volume, eases down only through `λ_dem`
-    /// ([`crate::four_r::update_v_dem`]).
+    /// `V_dem` **[gb]**: the demonstrated scale of THEIR service to us — max proven
+    /// retained volume, a slow ratchet ([`crate::four_r::update_v_dem`], A.3). Snaps up
+    /// instantly to the pair's CONFIRMED volume (the same flow as
+    /// [`PairLedger::gb_days_they_store_for_us`] — the model's one `V_conf`), and eases down
+    /// only through `λ_dem` ([`crate::constants::PAIR_LEDGER_LAMBDA_DEM`], 1/365 day⁻¹,
+    /// PROVISIONAL — swept in В-3½). After any accrual `v_dem ≥` that tick's confirmed
+    /// volume. A peer that accepted our data and never passed a challenge stays at 0.
+    ///
+    /// The volume is the pair's FOOTPRINT (all placements of every device of the master,
+    /// Р-8), not one symbol's: the simulator ratchets per challenged symbol
+    /// (`sim_dynamic/engine.rs:1874`), so this series is NOT comparable bit-for-bit with a
+    /// sim run the way `G`/`D` are — the sim has not been re-based on the footprint yet.
+    /// Same direction in both seats (see the seat table above).
     pub v_dem: f64,
-    /// `V0` **[gb]**: the observed volume point for this pair — the one `(V, τ)` slice we
-    /// ever sampled it at ([`crate::four_r::estimate_surface`]).
+    /// `V0` **[gb]**: the SMALLEST confirmed volume of the current unbroken run of
+    /// confirmed service by this pair to us (Д-H) — the honest point "they kept at least
+    /// `V0` for `τ0`". Reset to 0 with [`PairLedger::observed_tau`] when an observed tick
+    /// sees nothing confirmed; the next confirmed tick starts a new run at its own volume.
+    ///
+    /// This is ONE of three readings of `(V0, τ0)` in the project (the sim uses a constant
+    /// PoS window `τ0 = 7 d`; the eviction model reads "holding seniority"). It is the one
+    /// that cannot be computed after the fact; the sim and the bridge (У-5) may read
+    /// `τ0` differently ([`crate::four_r::estimate_surface`] is its only kernel consumer).
     pub observed_volume: f64,
-    /// `τ0` **[days]**: observed retention duration at `V0`.
+    /// `τ0` **[days]**: OBSERVED days of the current run of confirmed service (Д-H). Grows
+    /// by the observed tail of each accrual whose confirmed volume is > 0; a dark stretch
+    /// (our own outage, Д-A) neither adds to it nor ends the run by itself — the run ends on
+    /// the first observed tail with nothing confirmed, which is what happens after an outage
+    /// longer than the confirmation window. See [`PairLedger::observed_volume`].
     pub observed_tau: f64,
     /// Decaying count of ANNOUNCED drops of our data by this pair (a signed
     /// `SymbolDropNotice` arrived). Fades with `λ_drop` — "the system must forgive".

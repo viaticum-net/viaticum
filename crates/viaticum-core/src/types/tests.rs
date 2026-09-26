@@ -939,3 +939,98 @@ fn the_frozen_pair_ledger_row_is_what_this_tree_writes_today() {
         "the frozen fixture must still be byte-identical to a freshly written row"
     );
 }
+
+// ── У-3: SymbolPlacement::confirmed_at (Д-F / Д-G) ───────────────────────────
+
+fn placement_for_confirmation(
+    status: PlacementStatus,
+    last_verified: Option<Timestamp>,
+) -> SymbolPlacement {
+    SymbolPlacement {
+        source_block_id: SourceBlockId([0x11; 32]),
+        holder_id: DeviceId([0x22; 32]),
+        file_id: FileId(1),
+        esi_ranges: vec![(0, 4)],
+        binding_seed: [0u8; 32],
+        status,
+        last_verified,
+        placed_at: Timestamp(0),
+        consecutive_misses: 0,
+    }
+}
+
+#[test]
+fn a_placement_is_confirmed_only_while_alive_with_a_pass_inside_the_window() {
+    // T-1. Every status × every age class. Only `Alive` with a fresh or exactly-on-the-
+    // boundary pass counts; `Uncertain` with a fresh pass is unreachable today (A6) but the
+    // predicate must stay conservative if constants ever make it reachable.
+    let window = crate::constants::PAIR_LEDGER_CONFIRMATION_WINDOW_SECS;
+    let now = Timestamp(3 * window);
+    let ages: [(&str, Option<Timestamp>, bool); 4] = [
+        ("never passed", None, false),
+        ("fresh", Some(Timestamp(now.0 - 60)), true),
+        ("on the boundary", Some(Timestamp(now.0 - window)), true),
+        (
+            "past the boundary",
+            Some(Timestamp(now.0 - window - 1)),
+            false,
+        ),
+    ];
+    let statuses = [
+        PlacementStatus::Offered,
+        PlacementStatus::Accepted,
+        PlacementStatus::Alive,
+        PlacementStatus::Uncertain,
+        PlacementStatus::PresumedLost,
+        PlacementStatus::Lost,
+        PlacementStatus::Deleting,
+    ];
+    for status in statuses {
+        for (label, last_verified, fresh_enough) in ages {
+            let expected = status == PlacementStatus::Alive && fresh_enough;
+            assert_eq!(
+                placement_for_confirmation(status, last_verified).confirmed_at(now, 1, window),
+                expected,
+                "{status:?} with a pass {label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_confirmation_age_is_measured_on_the_scaled_clock() {
+    // T-2. At scale 1000 the window is 1_220_400 / 1000 = 1220.4 REAL seconds. An unscaled
+    // age would keep a dead holder confirmed for 14 real days (38 simulated years); a
+    // doubly-scaled one would drop a healthy holder after 1.2 real seconds.
+    let window = crate::constants::PAIR_LEDGER_CONFIRMATION_WINDOW_SECS;
+    assert_eq!(window, 1_220_400, "premise: Д-G");
+    let passed = Timestamp(1_000_000);
+    let p = placement_for_confirmation(PlacementStatus::Alive, Some(passed));
+
+    assert!(p.confirmed_at(Timestamp(passed.0 + 1220), 1000, window));
+    assert!(!p.confirmed_at(Timestamp(passed.0 + 1221), 1000, window));
+    // Same real ages at scale 1 are far inside the window.
+    assert!(p.confirmed_at(Timestamp(passed.0 + 1221), 1, window));
+}
+
+#[test]
+fn a_pass_stamped_after_now_counts_as_fresh() {
+    // T-3. A backward wall-clock jump leaves last_verified in the "future": the age
+    // saturates at 0 and the pass counts. Documented behaviour — the recorder integrates
+    // nothing on such a tick anyway (its interval is 0).
+    let window = crate::constants::PAIR_LEDGER_CONFIRMATION_WINDOW_SECS;
+    let p = placement_for_confirmation(PlacementStatus::Alive, Some(Timestamp(5_000)));
+    assert!(p.confirmed_at(Timestamp(4_000), 1, window));
+    assert!(p.confirmed_at(Timestamp(4_000), 100_000, window));
+}
+
+#[test]
+fn an_absurd_scale_saturates_the_age_instead_of_wrapping() {
+    // T-4. `--time-scale` is an unvalidated CLI argument. 2 s × u64::MAX must read as
+    // "too old", not wrap around to a small age and not panic.
+    let window = crate::constants::PAIR_LEDGER_CONFIRMATION_WINDOW_SECS;
+    let p = placement_for_confirmation(PlacementStatus::Alive, Some(Timestamp(10)));
+    assert!(!p.confirmed_at(Timestamp(12), u64::MAX, window));
+    // And scale 0 is treated as 1, like every other clock in the tree.
+    assert!(p.confirmed_at(Timestamp(12), 0, window));
+}
