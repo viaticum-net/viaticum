@@ -11009,14 +11009,19 @@ fn friend_circle_runs_are_deterministic_across_a_double_run() {
     // is separately covered below, once, on the registered scenario.
     //
     // ⏱ The arms, the frozen rung and the two runs of each pair are independent, so they fan out
-    // over rayon (`run` itself only fans out over seeds — 1-2 here). Running the pair of a double
-    // run concurrently cannot mask non-determinism: the runs share no state, and a hidden shared
-    // one (a global, a clock) is exactly what concurrent execution would expose, not hide.
+    // over rayon (`run` itself only fans out over seeds — 1-2 here). Concurrent runs expose shared
+    // MUTABLE state; they can hide the other class — run 2 reading what run 1 left behind (a lazy
+    // global cache): run in parallel, both may fill it identically. So ONE pair (F-open, cheap at
+    // B = 3) stays strictly sequential and keeps that class caught.
     use rayon::prelude::*;
 
-    fn double_run(sc: &Scenario, what: &str) {
+    fn double_run(sc: &Scenario, what: &str, sequential: bool) {
         let seeds = sc.seeds.clone();
-        let (r1, r2) = rayon::join(|| run(sc, &seeds), || run(sc, &seeds));
+        let (r1, r2) = if sequential {
+            (run(sc, &seeds), run(sc, &seeds))
+        } else {
+            rayon::join(|| run(sc, &seeds), || run(sc, &seeds))
+        };
         for (a, b) in r1.per_seed.iter().zip(&r2.per_seed) {
             assert!(metrics_bit_eq(a, b), "{what}: god-view metrics");
         }
@@ -11044,7 +11049,7 @@ fn friend_circle_runs_are_deterministic_across_a_double_run() {
             arms.par_iter().for_each(|arm| {
                 let mut sc = arm.with_blocks(3).scenario();
                 sc.seeds = vec![42, 43];
-                double_run(&sc, arm.label);
+                double_run(&sc, arm.label, arm.label == FcArm::F_OPEN.label);
             })
         },
         || {
@@ -11054,7 +11059,7 @@ fn friend_circle_runs_are_deterministic_across_a_double_run() {
             let mut frozen = friend_circle();
             frozen.seeds = vec![42];
             frozen.horizon = 40;
-            double_run(&frozen, "frozen rung");
+            double_run(&frozen, "frozen rung", false);
         },
     );
 }
