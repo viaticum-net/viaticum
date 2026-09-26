@@ -237,11 +237,13 @@ impl DaemonHandle {
         {
             use viaticum_core::constants::{AVAIL_DECAY_TICK_SECS, AVAIL_EWMA_ALPHA};
             let now_secs = Timestamp::now().0;
-            match db.apply_avail_decay_startup_catchup(
-                AVAIL_EWMA_ALPHA,
-                now_secs,
-                AVAIL_DECAY_TICK_SECS,
-            ) {
+            // CS-SCH-9: use the same scaled tick as the periodic decay task
+            // (scaled_avail_decay_tick_secs). If the catch-up used the raw 24h tick
+            // while the running task uses the scaled one, a restart under acceleration
+            // would under-count missed ticks and leave avail_ewma stale — the exact
+            // desync this fix closes. At time_scale=1 this is AVAIL_DECAY_TICK_SECS.
+            let tick_secs = scaled_avail_decay_tick_secs(AVAIL_DECAY_TICK_SECS, cfg.time_scale);
+            match db.apply_avail_decay_startup_catchup(AVAIL_EWMA_ALPHA, now_secs, tick_secs) {
                 Ok(n) if n > 0 => tracing::info!(peers = n, "avail_ewma startup catch-up applied"),
                 Ok(_) => {}
                 Err(e) => {
@@ -728,14 +730,16 @@ impl DaemonHandle {
             use viaticum_core::constants::{AVAIL_DECAY_TICK_SECS, AVAIL_EWMA_ALPHA};
             let avail_db = db.clone();
             let avail_cancel = cancel.clone();
+            // CS-SCH-9: scale the tick by time_scale. run_avail_decay_task uses this
+            // single value BOTH as the timer cadence AND as the `tick_secs` threshold
+            // fed to apply_avail_decay_batch, so one scaled value keeps cadence and
+            // decay math in sync. Without this the task fired every real 24h while the
+            // batch demanded 24h of real elapsed → avail_ewma never decayed under
+            // acceleration. At time_scale=1 this is exactly AVAIL_DECAY_TICK_SECS.
+            let avail_tick_secs = scaled_avail_decay_tick_secs(AVAIL_DECAY_TICK_SECS, time_scale);
             tasks.push(tokio::spawn(async move {
-                run_avail_decay_task(
-                    avail_db,
-                    avail_cancel,
-                    AVAIL_EWMA_ALPHA,
-                    AVAIL_DECAY_TICK_SECS,
-                )
-                .await;
+                run_avail_decay_task(avail_db, avail_cancel, AVAIL_EWMA_ALPHA, avail_tick_secs)
+                    .await;
                 Ok(())
             }));
         }
@@ -1363,6 +1367,18 @@ impl DaemonHandle {
 }
 
 // ── EWMA availability decay task ─────────────────────────────────────────────
+
+/// Scale the avail-decay tick interval by `time_scale` (CS-SCH-9).
+///
+/// `run_avail_decay_task` uses the returned value BOTH as its timer cadence and
+/// as the `tick_secs` threshold it hands to `apply_avail_decay_batch`, so scaling
+/// one value keeps the firing cadence and the decay math in lockstep. The startup
+/// catch-up uses the same helper for the same reason. Floors at 1s so an extreme
+/// `time_scale` cannot collapse the tick to 0 (which would decay every peer on
+/// every call). At `time_scale = 1` this is identity: `base_tick_secs`.
+fn scaled_avail_decay_tick_secs(base_tick_secs: u64, time_scale: u64) -> u64 {
+    (base_tick_secs / time_scale.max(1)).max(1)
+}
 
 /// Run alongside other periodic tasks. Applies EWMA decay for all peers that
 /// haven't been contacted in > tick_secs. Fires once per tick_secs interval.

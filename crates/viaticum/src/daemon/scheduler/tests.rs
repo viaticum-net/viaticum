@@ -891,6 +891,77 @@ async fn scheduler_does_not_transition_offered_to_lost_before_long_absence() {
     );
 }
 
+/// CS-SCH-4: under an accelerated clock (time_scale > 1) the long-absence
+/// threshold shrinks proportionally, so an Offered placement only a few seconds
+/// old (in real time) is already "absent > 14 simulated days" and gets swept.
+/// At time_scale = LONG_ABSENCE_SECS the threshold floors to 1s.
+#[tokio::test]
+async fn offered_sweep_threshold_scales_with_time_scale() {
+    use viaticum_core::constants::LONG_ABSENCE_SECS;
+
+    let db = Db::open_in_memory().unwrap();
+    let block_id = make_block_id(24);
+    let holder_id = make_identity(25);
+
+    // Placed 10 real seconds ago. At time_scale = 1 (threshold = 14 days) this
+    // would NOT be swept; under acceleration it must be.
+    let ten_secs_ago = Timestamp(Timestamp::now().0.saturating_sub(10));
+    let placement = SymbolPlacement {
+        source_block_id: block_id,
+        holder_id,
+        file_id: FileId(1),
+        esi_ranges: vec![(0, 64)],
+        binding_seed: [0u8; 32],
+        status: PlacementStatus::Offered,
+        last_verified: None,
+        placed_at: ten_secs_ago,
+        consecutive_misses: 0,
+    };
+    db.upsert_placement(&placement).unwrap();
+
+    let (repair_tx, mut repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let pending = make_pending_challenges();
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+
+    // time_scale = LONG_ABSENCE_SECS → scaled threshold = max(1_209_600/1_209_600, 1) = 1s.
+    // A 10s-old placement is well past it.
+    let config = SchedulerConfig {
+        pos_interval_secs: 3600,
+        timeout_check_secs: 3600,
+        time_scale: LONG_ABSENCE_SECS,
+        event_log_retain_rows: 100_000,
+        pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        config,
+        repair_tx,
+        pending,
+        make_test_router(&db),
+        dummy_master_pub(),
+        signing_key,
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    );
+
+    scheduler.sweep_offered_placements().await.unwrap();
+
+    let updated = db
+        .get_placement(&block_id, &holder_id)
+        .unwrap()
+        .expect("placement exists");
+    assert_eq!(
+        updated.status,
+        PlacementStatus::Lost,
+        "under acceleration the scaled long-absence threshold must sweep a 10s-old Offered placement"
+    );
+
+    let trigger = repair_rx.try_recv().expect("repair trigger must be sent");
+    assert!(matches!(trigger, RepairTrigger::Wake));
+}
+
 // ─── D3: per-(block,holder) delete dedup tests ───────────────────────────────
 
 /// H3 rework of the former per-BLOCK dedup test. The dedup is now per-(block,

@@ -1604,3 +1604,19 @@ fn resolve_primary_file_id_single_block_without_placements_reverse_looks_up_file
         "Single block with no placements must reverse-look-up the owning file_id"
     );
 }
+
+// CS-SCH-10 — behavioural, NOT unit-covered (honest gap).
+//
+// The fix replaces `let _ = self.run_iteration().await` in `run()` with an
+// `if let Err(e) = .. { tracing::error!(..) }` at all three call sites, so a
+// permanent DbError (surfaced by `next_work_item` → `list_all_source_blocks`)
+// is logged instead of leaving the worker looking idle with an empty queue.
+//
+// There is no honest unit test for the error branch: with a healthy real redb
+// (the only DB the project permits in tests — no mocks), `run_iteration` cannot
+// be driven to return `Err`. `next_work_item` only errors on a DB read/CBOR
+// failure, and every public Db write path stores well-formed records, so
+// `list_all_source_blocks` always succeeds; `Db` exposes no raw-byte insert to
+// corrupt SOURCE_BLOCKS, and redb holds a single exclusive file lock so a second
+// faulty handle cannot be opened. The change is log-only on a corruption-only
+// path — verified by inspection, not by a test.
