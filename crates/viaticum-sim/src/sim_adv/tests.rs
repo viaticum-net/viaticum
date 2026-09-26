@@ -11007,56 +11007,55 @@ fn friend_circle_runs_are_deterministic_across_a_double_run() {
     // frozen rung is 6× the work per run and `run()` also builds a matched twin per seed, so
     // insisting on it here would cost ~an hour of suite time to re-check a boolean. The FROZEN rung
     // is separately covered below, once, on the registered scenario.
-    for arm in [
-        FcArm::F_OPEN,
-        FcArm::F_CLOSED,
-        FcArm::F_PREF_CIRCLE,
-        FcArm::F_PREF_WORLD,
-    ] {
-        let mut sc = arm.with_blocks(3).scenario();
-        sc.seeds = vec![42, 43];
+    //
+    // ⏱ The arms, the frozen rung and the two runs of each pair are independent, so they fan out
+    // over rayon (`run` itself only fans out over seeds — 1-2 here). Running the pair of a double
+    // run concurrently cannot mask non-determinism: the runs share no state, and a hidden shared
+    // one (a global, a clock) is exactly what concurrent execution would expose, not hide.
+    use rayon::prelude::*;
+
+    fn double_run(sc: &Scenario, what: &str) {
         let seeds = sc.seeds.clone();
-        let r1 = run(&sc, &seeds);
-        let r2 = run(&sc, &seeds);
+        let (r1, r2) = rayon::join(|| run(sc, &seeds), || run(sc, &seeds));
         for (a, b) in r1.per_seed.iter().zip(&r2.per_seed) {
-            assert!(metrics_bit_eq(a, b), "{}: god-view metrics", arm.label);
+            assert!(metrics_bit_eq(a, b), "{what}: god-view metrics");
         }
-        let v = evaluate_board(&sc, &r1);
+        let v = evaluate_board(sc, &r1);
         assert_eq!(
             v.iter().find(|x| x.id == "INV-DETERMINISM").unwrap().kind,
             VerdictKind::Pass,
-            "{}: INV-DETERMINISM",
-            arm.label
+            "{what}: INV-DETERMINISM"
         );
         assert_eq!(
             v.iter().find(|x| x.id == "INV-ANTI-ORACLE").unwrap().kind,
             VerdictKind::Pass,
-            "{}: INV-ANTI-ORACLE",
-            arm.label
+            "{what}: INV-ANTI-ORACLE"
         );
     }
-    // …and ONCE at the FROZEN rung, on the REGISTERED scenario — the world a board run would
-    // actually execute. One seed and a short horizon: a double-run either reproduces itself or it
-    // does not, and it does so on tick 1 as surely as on tick 130.
-    let mut frozen = friend_circle();
-    frozen.seeds = vec![42];
-    frozen.horizon = 40;
-    let seeds = frozen.seeds.clone();
-    let r1 = run(&frozen, &seeds);
-    let r2 = run(&frozen, &seeds);
-    for (a, b) in r1.per_seed.iter().zip(&r2.per_seed) {
-        assert!(metrics_bit_eq(a, b), "frozen rung: god-view metrics");
-    }
-    let v = evaluate_board(&frozen, &r1);
-    assert_eq!(
-        v.iter().find(|x| x.id == "INV-DETERMINISM").unwrap().kind,
-        VerdictKind::Pass,
-        "frozen rung: INV-DETERMINISM"
-    );
-    assert_eq!(
-        v.iter().find(|x| x.id == "INV-ANTI-ORACLE").unwrap().kind,
-        VerdictKind::Pass,
-        "frozen rung: INV-ANTI-ORACLE"
+
+    let arms = [
+        FcArm::F_OPEN,
+        FcArm::F_CLOSED,
+        FcArm::F_PREF_CIRCLE,
+        FcArm::F_PREF_WORLD,
+    ];
+    rayon::join(
+        || {
+            arms.par_iter().for_each(|arm| {
+                let mut sc = arm.with_blocks(3).scenario();
+                sc.seeds = vec![42, 43];
+                double_run(&sc, arm.label);
+            })
+        },
+        || {
+            // …and ONCE at the FROZEN rung, on the REGISTERED scenario — the world a board run
+            // would actually execute. One seed and a short horizon: a double-run either
+            // reproduces itself or it does not, and it does so on tick 1 as surely as on tick 130.
+            let mut frozen = friend_circle();
+            frozen.seeds = vec![42];
+            frozen.horizon = 40;
+            double_run(&frozen, "frozen rung");
+        },
     );
 }
 
