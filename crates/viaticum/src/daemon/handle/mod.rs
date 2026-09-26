@@ -6,6 +6,7 @@
 
 mod redial;
 pub mod shutdown;
+pub mod startup;
 #[cfg(test)]
 mod tests;
 
@@ -18,10 +19,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use viaticum_core::cluster::{
-    ClusterState, DeviceCertificate, issue_device_certificate, master_identity,
+    ClusterState, ClusterStateError, DeviceCertificate, issue_device_certificate, master_identity,
 };
 use viaticum_core::config::AppConfig;
-use viaticum_core::db::Db;
+use viaticum_core::db::{Db, DbError};
 use viaticum_core::erasure::{ErasureEncoder, RaptorQEncoder};
 use viaticum_core::types::{DeviceId, IdentityPub, Timestamp, hex_encode};
 
@@ -37,6 +38,10 @@ use crate::daemon::scheduler::{PendingChallenges, Scheduler, SchedulerConfig};
 use crate::daemon::watcher::{WatcherCommand, WatcherConfig};
 
 use shutdown::{NamedTask, ShutdownOutcome};
+pub use startup::{StartError, StartFailureKind};
+use startup::{
+    classify_cluster_error, classify_config_error, classify_db_error, classify_identity_error,
+};
 
 // ─── Public config ────────────────────────────────────────────────────────────
 
@@ -69,7 +74,8 @@ pub struct DaemonState {
         RestoreRequest,
         tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
     )>,
-    /// Cluster state (optional — None before first device registration).
+    /// Cluster state. Always `Some` in a running daemon (`start` refuses
+    /// otherwise); `None` only in dispatch tests that do not build one.
     pub cluster_state: Option<Arc<Mutex<ClusterState>>>,
     /// Master signing key (for issuing device certs, revocations).
     pub master_key: ed25519_dalek::SigningKey,
@@ -85,7 +91,8 @@ pub struct DaemonState {
     pub hard_quota_bytes: u64,
     /// Time acceleration factor (1 = real time).
     pub time_scale: u64,
-    /// libp2p swarm handle.
+    /// libp2p swarm handle. Always `Some` in a running daemon (`start` refuses
+    /// otherwise); `None` only in tests.
     pub swarm_handle: Option<std::sync::Arc<crate::daemon::network::swarm::SwarmHandle>>,
     /// Watch admin — manages dynamic folder add/remove/status.
     /// None if web API is disabled.
@@ -108,6 +115,14 @@ pub struct DaemonState {
     pub mailbox_router: Option<std::sync::Arc<crate::daemon::mailbox::routing::MailboxRouter>>,
 }
 
+/// Web API pieces prepared before the swarm starts (see step 9.4 of `start`).
+struct WebPrepared {
+    config: crate::daemon::web_api::WebApiConfig,
+    listener: tokio::net::TcpListener,
+    auth: crate::daemon::web_auth::AuthState,
+    port: u16,
+}
+
 // ─── DaemonHandle ─────────────────────────────────────────────────────────────
 
 /// Owns all subsystem task handles and the cancellation token.
@@ -127,7 +142,13 @@ impl DaemonHandle {
     }
 
     /// Start the daemon: load identity, open DB, build subsystems, spawn tasks.
-    pub async fn start(cfg: DaemonConfig) -> Result<Self, anyhow::Error> {
+    ///
+    /// All or nothing (daemon-i1): every way this can fail returns `Err` before
+    /// the first subsystem task is spawned and before the web API serves, so
+    /// `Ok` means the whole node runs — there is no "started without the
+    /// network" mode. Each failure carries its class (see `startup`), which
+    /// `main` turns into exit status 78 (needs a person) or 75 (retry later).
+    pub async fn start(cfg: DaemonConfig) -> Result<Self, StartError> {
         // Legacy data directory migration hint (one-shot WARN).
         if let Some(home) = dirs::home_dir() {
             let legacy = home.join(".viaticum");
@@ -141,39 +162,63 @@ impl DaemonHandle {
         }
 
         // ── 1. Load identity ──────────────────────────────────────────────────
-        let keyfile = load_identity(&cfg.data_dir).map_err(|e| match e {
-            IdentityError::NotInitialized => {
-                anyhow::anyhow!("identity not initialized — run 'viaticum init' first")
-            }
-            IdentityError::Corrupt(p, msg) => anyhow::anyhow!(
-                "identity file at {} is corrupt or from an incompatible binary version ({}). \
-                 Delete the file and re-run 'viaticum init', or restore from backup.",
-                p.display(),
-                msg
-            ),
-            other => anyhow::anyhow!(
-                "identity load error from {}: {}",
-                cfg.data_dir.join("identity.key").display(),
-                other
-            ),
+        let keyfile = load_identity(&cfg.data_dir).map_err(|e| {
+            let kind = classify_identity_error(&e, &cfg.data_dir);
+            let key_path = cfg.data_dir.join("identity.key");
+            StartError::new(
+                kind,
+                match e {
+                    IdentityError::NotInitialized if kind == StartFailureKind::NeedsUser => {
+                        anyhow::anyhow!("identity not initialized — run 'viaticum init' first")
+                    }
+                    IdentityError::NotInitialized => anyhow::anyhow!(
+                        "data directory {} is missing or not readable (not mounted or \
+                         not unlocked yet?); will retry",
+                        cfg.data_dir.display()
+                    ),
+                    IdentityError::Corrupt(p, msg) => anyhow::anyhow!(
+                        "identity file at {} is corrupt or from an incompatible binary version ({}). \
+                     Delete the file and re-run 'viaticum init', or restore from backup.",
+                        p.display(),
+                        msg
+                    ),
+                    other => anyhow::anyhow!(
+                        "identity load error from {}: {}",
+                        key_path.display(),
+                        other
+                    ),
+                },
+            )
         })?;
 
         // ── 2. Load or create AppConfig ───────────────────────────────────────
         let config_path = cfg.data_dir.join("config.toml");
+        let config_error = |e: viaticum_core::config::ConfigError| {
+            StartError::new(
+                classify_config_error(&e),
+                anyhow::Error::new(e).context(format!("config {}", config_path.display())),
+            )
+        };
         let app_config = if config_path.exists() {
-            AppConfig::load(&config_path)?
+            AppConfig::load(&config_path).map_err(config_error)?
         } else {
             AppConfig::defaults()
         };
         // validate() already called by load(); call it here for the defaults path.
-        app_config.validate()?;
+        app_config.validate().map_err(config_error)?;
 
         // ── 3. Open DB ────────────────────────────────────────────────────────
         // Retry on lock contention: when the daemon self-rexecs (Settings UI
         // restart), the child briefly races the parent for the redb file lock.
-        // Total wait ≤ 11 s — same envelope as the libp2p listen-port retry.
+        // Total wait ≈ 63.5 s (see `open_db_with_retry`).
         let db_path = cfg.data_dir.join("db.redb");
-        let db = open_db_with_retry(&db_path).await?;
+        let db = open_db_with_retry(&db_path).await.map_err(|e| {
+            StartError::new(
+                classify_db_error(&e),
+                anyhow::Error::new(e)
+                    .context(format!("cannot open database {}", db_path.display())),
+            )
+        })?;
 
         // ── 3.5. Migrate trust_p prior for evidence-less peers ────────────────
         // INITIAL_TRUST_P was raised from 0.1 to 0.5 (neutral Bayesian prior)
@@ -259,33 +304,50 @@ impl DaemonHandle {
 
         // ── 4. Derive keys ────────────────────────────────────────────────────
         // Epoch 0 is the initial epoch; epoch rotation happens on device revocation.
-        let (master_key, device_key, epoch_key_bytes) = derive_keys(&keyfile, 0)?;
+        let (master_key, device_key, epoch_key_bytes) = derive_keys(&keyfile, 0).map_err(|e| {
+            StartError::needs_user(
+                anyhow::Error::new(e).context("cannot derive keys from identity.key"),
+            )
+        })?;
         let identity_pub: IdentityPub = master_identity(&master_key);
         let device_id = DeviceId(keyfile.device_id);
 
         // ── 5. Initialize or load ClusterState ────────────────────────────────
-        let cluster_state: Option<Arc<Mutex<ClusterState>>> = match ClusterState::load(db.clone()) {
-            Ok(state) => Some(Arc::new(Mutex::new(state))),
-            Err(viaticum_core::cluster::ClusterStateError::NotInitialized) => {
+        // The node cannot join the network without its own certificate in the
+        // cluster state, so any failure here refuses the start (daemon-i1).
+        let mut cluster = match ClusterState::load(db.clone()) {
+            Ok(state) => state,
+            Err(ClusterStateError::NotInitialized) => {
                 // First-time startup: register this device as the sole cluster member.
                 let now = Timestamp::now();
                 let cert: DeviceCertificate = issue_device_certificate(&master_key, device_id, now);
-                match ClusterState::init(db.clone(), identity_pub, cert, now, now) {
-                    Ok(state) => {
-                        tracing::info!("cluster state initialized (first device)");
-                        Some(Arc::new(Mutex::new(state)))
-                    }
-                    Err(e) => {
-                        tracing::error!("failed to init cluster state: {e}");
-                        None
-                    }
-                }
+                let state =
+                    ClusterState::init(db.clone(), identity_pub, cert, now, now).map_err(|e| {
+                        StartError::new(
+                            classify_cluster_error(&e),
+                            anyhow::Error::new(e).context("cannot initialize the cluster state"),
+                        )
+                    })?;
+                tracing::info!("cluster state initialized (first device)");
+                state
             }
             Err(e) => {
-                tracing::error!("failed to load cluster state: {e}");
-                None
+                return Err(StartError::new(
+                    classify_cluster_error(&e),
+                    anyhow::Error::new(e)
+                        .context("cannot load the cluster state from the database"),
+                ));
             }
         };
+        // A device missing from the stored state (fresh `init` + `dr`) enrolls
+        // itself with the master key; a foreign master or a full cluster refuses.
+        let own_membership = startup::ensure_own_device_enrolled(
+            &mut cluster,
+            &master_key,
+            device_id,
+            Timestamp::now(),
+        )?;
+        let cluster_state: Arc<Mutex<ClusterState>> = Arc::new(Mutex::new(cluster));
 
         // ── 6. Create inter-subsystem channels ────────────────────────────────
         let (dirty_tx, dirty_rx) = mpsc::channel::<DirtyEvent>(256);
@@ -302,8 +364,13 @@ impl DaemonHandle {
         let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
 
         // ── 9. Ensure symbols and holdings directories exist ──────────────────
+        let dir_error = |path: &std::path::Path, e: std::io::Error| {
+            StartError::transient(
+                anyhow::Error::new(e).context(format!("cannot prepare {}", path.display())),
+            )
+        };
         let symbols_dir = cfg.data_dir.join("symbols");
-        std::fs::create_dir_all(&symbols_dir)?;
+        std::fs::create_dir_all(&symbols_dir).map_err(|e| dir_error(&symbols_dir, e))?;
 
         // ── 9.0. Wave 2 migration: remove legacy flat {esi}.bin files (pre-Wave 2) ──
         // These are bound-per-holder symbol files written by the old backup pipeline.
@@ -316,106 +383,140 @@ impl DaemonHandle {
         }
 
         let holdings_dir = cfg.data_dir.join("holdings");
-        std::fs::create_dir_all(&holdings_dir)?;
+        std::fs::create_dir_all(&holdings_dir).map_err(|e| dir_error(&holdings_dir, e))?;
 
         // ── 9.1. Ensure restore staging directory exists ──────────────────────
         let staging_root = cfg.data_dir.join("restore");
-        std::fs::create_dir_all(&staging_root)?;
+        std::fs::create_dir_all(&staging_root).map_err(|e| dir_error(&staging_root, e))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&staging_root, std::fs::Permissions::from_mode(0o700))?;
+            std::fs::set_permissions(&staging_root, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| dir_error(&staging_root, e))?;
         }
 
-        // ── 9.5. Start libp2p swarm (before subsystems so they can receive swarm handle) ──
-        // swarm_event_rx is consumed by Processor::run below.
-        let (swarm_handle_arc, swarm_event_rx) = {
-            // Pull both the per-device cert and the cluster master pub from
-            // ClusterState. master_pub is the anchor for cert verification
-            // (see `verify_cert_for_peer`); it's the FOUNDER's identity, not
-            // necessarily this node's own derived master.
-            let cert_and_master = cluster_state.as_ref().and_then(|cs| {
-                let state = cs.lock().expect("cluster_state lock poisoned");
-                let cert = state
-                    .get_device(&device_id)
-                    .map(|entry| entry.certificate.clone())?;
-                Some((cert, state.master_pub()))
-            });
-            if let Some((device_cert, cluster_master_pub)) = cert_and_master {
-                let x25519_pub = {
-                    let hk = Hkdf::<Sha256>::new(Some(b""), &keyfile.seed);
-                    let mut okm = [0u8; 32];
-                    hk.expand(b"viaticum-x25519", &mut okm)
-                        .expect("HKDF expand cannot fail with valid length");
-                    let secret = x25519_dalek::StaticSecret::from(okm);
-                    let pub_key = x25519_dalek::PublicKey::from(&secret);
-                    Some(pub_key.to_bytes())
-                };
-                // Parse kademlia_bootstrap_peers from config strings → Multiaddr.
-                // AppConfig::validate() already checked basic syntax; full parse here.
-                let kademlia_bootstrap_peers: Vec<libp2p::Multiaddr> = app_config
-                    .network
-                    .kademlia_bootstrap_peers
-                    .iter()
-                    .filter_map(|s| {
-                        s.parse::<libp2p::Multiaddr>().map_err(|e| {
-                            tracing::warn!(addr = %s, error = %e, "skipping unparseable kademlia bootstrap peer");
-                        }).ok()
-                    })
-                    .collect();
-
-                let swarm_cfg = crate::daemon::network::swarm::SwarmConfig {
-                    device_signing_key: device_key.clone(),
-                    master_signing_key: master_key.clone(),
-                    identity_pub,
-                    cluster_master_pub,
-                    device_cert,
-                    x25519_pub,
-                    listen_port: app_config.network.listen_port,
-                    // Must exceed libp2p request_response::Config.request_timeout (30s in
-                    // swarm.rs) so our retry layer fires AFTER RR's own timeout reports the
-                    // failure — otherwise both clocks race and a still-in-flight RR request
-                    // gets cancelled by the duplicate send, surfacing as
-                    // "Connection was closed before a response was received".
-                    cert_timeout_secs: 35,
-                    kademlia_bootstrap_peers,
-                    kademlia_disable_ipfs_bootstrap: app_config
-                        .network
-                        .kademlia_disable_ipfs_bootstrap,
-                    kad_republish_interval_override: None,
-                    // Under an accelerated test clock (time_scale>1) the 5-min real-time
-                    // discovery interval fires only ~once in a minutes-long run, so non-seed
-                    // nodes never discover holders and place nothing. Scale it with time_scale
-                    // so discovery keeps pace (the time_scale contract; this override also
-                    // shortens the initial discovery delay). Production (time_scale=1) = None,
-                    // unchanged.
-                    kad_discovery_interval_override: if cfg.time_scale > 1 {
-                        Some(crate::daemon::network::swarm::scaled_kad_cadence(
-                            crate::daemon::network::swarm::KAD_DISCOVERY_INTERVAL,
-                            cfg.time_scale,
-                        ))
-                    } else {
-                        None
-                    },
-                    enable_relay_server: app_config.network.enable_relay_server,
-                };
-                match crate::daemon::network::swarm::SwarmHandle::start(swarm_cfg).await {
-                    Ok((handle, events)) => {
-                        tracing::info!(
-                            peer_id = %handle.peer_id,
-                            "libp2p swarm started (ε.2, wired to processor)"
-                        );
-                        (Some(Arc::new(handle)), Some(events))
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "libp2p swarm start failed, continuing without it");
-                        (None, None)
-                    }
-                }
+        // ── 9.4. Bind the web API listener (optional) ─────────────────────────
+        // Bound BEFORE the swarm listens and before any task is spawned: a web
+        // port that is taken refuses the start (daemon-i1, transient) while the
+        // libp2p port is still free and nothing else runs. The server itself
+        // is started after DaemonState exists (below).
+        let web_error = |what: &str, e: anyhow::Error| {
+            StartError::transient(e.context(format!("web API {what}")))
+        };
+        let web_prepared = if app_config.web_api.enabled {
+            let static_dir = if app_config.web_api.static_dir.is_empty() {
+                None
             } else {
-                tracing::debug!("no device cert available, skipping libp2p swarm start");
-                (None, None)
-            }
+                let p = std::path::PathBuf::from(&app_config.web_api.static_dir);
+                Some(if p.is_absolute() {
+                    p
+                } else {
+                    cfg.data_dir.join(p)
+                })
+            };
+            let config = crate::daemon::web_api::WebApiConfig {
+                bind: app_config.web_api.bind.clone(),
+                static_dir,
+            };
+            let token = crate::daemon::web_auth::load_or_create_token(&cfg.data_dir)
+                .map_err(|e| web_error("token", e.into()))?;
+            let auth = crate::daemon::web_auth::AuthState::new(token);
+            let listener = tokio::net::TcpListener::bind(&config.bind)
+                .await
+                .map_err(|e| web_error(&format!("cannot bind {}", config.bind), e.into()))?;
+            let port = listener
+                .local_addr()
+                .map_err(|e| web_error("listener address", e.into()))?
+                .port();
+            Some(WebPrepared {
+                config,
+                listener,
+                auth,
+                port,
+            })
+        } else {
+            None
+        };
+
+        // ── 9.5. Start libp2p swarm (before subsystems so they can receive swarm handle) ──
+        // swarm_event_rx is consumed by Processor::run below. A node without a
+        // swarm neither backs up nor holds anything for others, so a swarm that
+        // does not start (the fixed listen port is taken, …) refuses the start
+        // (daemon-i1) instead of running the rest half-wired.
+        let (swarm_handle_arc, swarm_event_rx) = {
+            // The per-device cert and the cluster master pub come from the
+            // membership check above. master_pub is the anchor for cert
+            // verification (see `verify_cert_for_peer`); it's the FOUNDER's
+            // identity, not necessarily this node's own derived master.
+            let device_cert = own_membership.device_cert.clone();
+            let cluster_master_pub = own_membership.cluster_master_pub;
+            let x25519_pub = {
+                let hk = Hkdf::<Sha256>::new(Some(b""), &keyfile.seed);
+                let mut okm = [0u8; 32];
+                hk.expand(b"viaticum-x25519", &mut okm)
+                    .expect("HKDF expand cannot fail with valid length");
+                let secret = x25519_dalek::StaticSecret::from(okm);
+                let pub_key = x25519_dalek::PublicKey::from(&secret);
+                Some(pub_key.to_bytes())
+            };
+            // Parse kademlia_bootstrap_peers from config strings → Multiaddr.
+            // AppConfig::validate() already checked basic syntax; full parse here.
+            let kademlia_bootstrap_peers: Vec<libp2p::Multiaddr> = app_config
+                .network
+                .kademlia_bootstrap_peers
+                .iter()
+                .filter_map(|s| {
+                    s.parse::<libp2p::Multiaddr>().map_err(|e| {
+                        tracing::warn!(addr = %s, error = %e, "skipping unparseable kademlia bootstrap peer");
+                    }).ok()
+                })
+                .collect();
+
+            let swarm_cfg = crate::daemon::network::swarm::SwarmConfig {
+                device_signing_key: device_key.clone(),
+                master_signing_key: master_key.clone(),
+                identity_pub,
+                cluster_master_pub,
+                device_cert,
+                x25519_pub,
+                listen_port: app_config.network.listen_port,
+                // Must exceed libp2p request_response::Config.request_timeout (30s in
+                // swarm.rs) so our retry layer fires AFTER RR's own timeout reports the
+                // failure — otherwise both clocks race and a still-in-flight RR request
+                // gets cancelled by the duplicate send, surfacing as
+                // "Connection was closed before a response was received".
+                cert_timeout_secs: 35,
+                kademlia_bootstrap_peers,
+                kademlia_disable_ipfs_bootstrap: app_config.network.kademlia_disable_ipfs_bootstrap,
+                kad_republish_interval_override: None,
+                // Under an accelerated test clock (time_scale>1) the 5-min real-time
+                // discovery interval fires only ~once in a minutes-long run, so non-seed
+                // nodes never discover holders and place nothing. Scale it with time_scale
+                // so discovery keeps pace (the time_scale contract; this override also
+                // shortens the initial discovery delay). Production (time_scale=1) = None,
+                // unchanged.
+                kad_discovery_interval_override: if cfg.time_scale > 1 {
+                    Some(crate::daemon::network::swarm::scaled_kad_cadence(
+                        crate::daemon::network::swarm::KAD_DISCOVERY_INTERVAL,
+                        cfg.time_scale,
+                    ))
+                } else {
+                    None
+                },
+                enable_relay_server: app_config.network.enable_relay_server,
+            };
+            let (handle, events) = crate::daemon::network::swarm::SwarmHandle::start(swarm_cfg)
+                .await
+                .map_err(|e| {
+                    StartError::transient(
+                        anyhow::Error::new(e).context("libp2p swarm did not start"),
+                    )
+                })?;
+            tracing::info!(
+                peer_id = %handle.peer_id,
+                "libp2p swarm started (ε.2, wired to processor)"
+            );
+            (Arc::new(handle), events)
         };
 
         // ── 10. Build subsystems ──────────────────────────────────────────────
@@ -492,12 +593,12 @@ impl DaemonHandle {
                 epoch_key: epoch_key_bytes,
                 device_id,
                 mock_holders: vec![],
-                cluster_state: cluster_state.clone(),
+                cluster_state: Some(cluster_state.clone()),
                 watch_configs: initial_watch_configs.clone(),
                 time_scale: cfg.time_scale.max(1),
                 mock_offer_budget_gb: None,
                 master_signing_key: Some(master_key.clone()),
-                swarm: swarm_handle_arc.clone(),
+                swarm: Some(swarm_handle_arc.clone()),
                 // ── Step C: Pass live_watch_configs ──────────────────────────
                 live_watch_configs: Some(Arc::clone(&live_configs)),
                 peer_backoff: Some(Arc::clone(&peer_backoff)),
@@ -513,7 +614,7 @@ impl DaemonHandle {
                 parallel_holders: 5,
                 identity: identity_pub,
                 device_id,
-                swarm: swarm_handle_arc.clone(),
+                swarm: Some(swarm_handle_arc.clone()),
                 staging_root: staging_root.clone(),
                 data_dir: cfg.data_dir.clone(),
                 fetch_timeout: std::time::Duration::from_secs(
@@ -546,41 +647,14 @@ impl DaemonHandle {
 
         // ── 11.5. Build MailboxRouter (needed by DaemonState for dispatch_device_revoke) ──
         // Built here (before DaemonState) because DaemonState carries mailbox_router for
-        // dispatch_device_revoke (T-13b-2). Mirrors the construction in Phase 6.5 below.
-        //
-        // Safety: swarm_handle_arc and db are both available here. The same Arc is reused
-        // below in Phase 6.5 (scheduler + mailbox poll wiring) — no double-construction.
-        let early_mailbox_router: std::sync::Arc<crate::daemon::mailbox::routing::MailboxRouter> = {
-            struct NoNetworkSenderEarly;
-            #[async_trait::async_trait]
-            impl crate::daemon::mailbox::routing::MailboxNetworkSender for NoNetworkSenderEarly {
-                async fn send_store(
-                    &self,
-                    _device: viaticum_core::types::DeviceId,
-                    _req: viaticum_core::messages::MailboxStoreRequest,
-                ) -> anyhow::Result<viaticum_core::messages::MailboxStoreResponse> {
-                    anyhow::bail!("no network available (swarm not started)")
-                }
-                async fn send_fetch(
-                    &self,
-                    _device: viaticum_core::types::DeviceId,
-                    _req: viaticum_core::messages::MailboxFetchRequest,
-                ) -> anyhow::Result<viaticum_core::messages::MailboxFetchResponse> {
-                    anyhow::bail!("no network available (swarm not started)")
-                }
-            }
-            if let Some(swarm) = swarm_handle_arc.clone() {
-                std::sync::Arc::new(crate::daemon::mailbox::routing::MailboxRouter::new(
-                    swarm,
-                    db.clone(),
-                ))
-            } else {
-                std::sync::Arc::new(crate::daemon::mailbox::routing::MailboxRouter::with_sender(
-                    std::sync::Arc::new(NoNetworkSenderEarly),
-                    db.clone(),
-                ))
-            }
-        };
+        // dispatch_device_revoke (T-13b-2). The same Arc is reused below in Phase 6.5
+        // (scheduler + mailbox poll wiring) — no double-construction. The swarm is
+        // always up here (start refuses otherwise), so there is no offline sender.
+        let early_mailbox_router: std::sync::Arc<crate::daemon::mailbox::routing::MailboxRouter> =
+            std::sync::Arc::new(crate::daemon::mailbox::routing::MailboxRouter::new(
+                swarm_handle_arc.clone(),
+                db.clone(),
+            ));
 
         // ── 12. Build DaemonState (shared with CliServer) ─────────────────────
         // Clone restore_tx so CliServer can forward requests to RestoreCoordinator.
@@ -590,7 +664,7 @@ impl DaemonHandle {
             identity_pub,
             device_id,
             restore_tx: restore_tx.clone(),
-            cluster_state: cluster_state.clone(),
+            cluster_state: Some(cluster_state.clone()),
             master_key: master_key.clone(),
             seed: keyfile.seed.clone(),
             data_dir: cfg.data_dir.clone(),
@@ -598,7 +672,7 @@ impl DaemonHandle {
             disk_reserve_bytes: viaticum_core::config::disk_reserve_bytes(&app_config),
             hard_quota_bytes: viaticum_core::config::hard_quota_bytes(&app_config),
             time_scale: cfg.time_scale.max(1),
-            swarm_handle: swarm_handle_arc.clone(),
+            swarm_handle: Some(swarm_handle_arc.clone()),
             // ── Step E: Add watch_admin to DaemonState ────────────────────────
             watch_admin: if app_config.web_api.enabled {
                 Some(Arc::clone(&watch_admin))
@@ -641,8 +715,34 @@ impl DaemonHandle {
 
         // ── 14.5. WorkPipeline channel created earlier (above BackupCoordinator). ──
 
+        // ── Web API server (optional) ─────────────────────────────────────────
+        // The listener was bound before the swarm (9.4). The api-port file is
+        // written only here, once the swarm is up and nothing that depends on
+        // outside state (ports, lock, keys) can still refuse the start, so the
+        // CLI does not find the port of a start that was refused.
+        let web_api_task = match (state_for_web_api, web_prepared) {
+            (Some(web_state), Some(prepared)) => {
+                crate::daemon::web_auth::write_port_file(&cfg.data_dir, prepared.port)
+                    .map_err(|e| web_error("port file", e.into()))?;
+                let web_handle = crate::daemon::web_api::start_with_listener(
+                    prepared.config,
+                    prepared.listener,
+                    cancel.clone(),
+                    web_state,
+                    prepared.auth,
+                )
+                .await
+                .map_err(|e| web_error("server", e))?;
+                Some(web_handle)
+            }
+            _ => None,
+        };
+
         // ── 15. Spawn subsystem tasks ─────────────────────────────────────────
         let mut tasks: Vec<NamedTask> = Vec::new();
+        if let Some(web_handle) = web_api_task {
+            tasks.push(("web_api", web_handle));
+        }
 
         tasks.push((
             "backup",
@@ -758,7 +858,8 @@ impl DaemonHandle {
         // ── 9.3. Peer auto-dial (network-i2): dial known peers at start and then
         //         periodically, so a restart / DR rejoins the network without a
         //         manual `connect`. See redial/mod.rs.
-        if let Some(swarm_for_redial) = state.swarm_handle.clone() {
+        {
+            let swarm_for_redial = swarm_handle_arc.clone();
             // 5 min real time, scaled (30 s on time_scale=10); floor 30 s so we
             // don't re-dial-storm a single offline peer.
             let redial_interval = std::time::Duration::from_secs((300 / time_scale).max(30));
@@ -802,40 +903,6 @@ impl DaemonHandle {
             ));
         }
 
-        // ── Web API server (optional) ─────────────────────────────────────────
-        if let Some(web_state) = state_for_web_api {
-            let static_dir = if app_config.web_api.static_dir.is_empty() {
-                None
-            } else {
-                let p = std::path::PathBuf::from(&app_config.web_api.static_dir);
-                Some(if p.is_absolute() {
-                    p
-                } else {
-                    cfg.data_dir.join(p)
-                })
-            };
-            let web_config = crate::daemon::web_api::WebApiConfig {
-                bind: app_config.web_api.bind.clone(),
-                static_dir,
-            };
-            // Load (or create) the bearer token; wrap in AuthState.
-            let token = crate::daemon::web_auth::load_or_create_token(&cfg.data_dir)?;
-            let auth = crate::daemon::web_auth::AuthState::new(token);
-            // Bind now to capture the actual OS-chosen port, then persist it for the CLI.
-            let listener = tokio::net::TcpListener::bind(&web_config.bind).await?;
-            let actual_port = listener.local_addr()?.port();
-            crate::daemon::web_auth::write_port_file(&cfg.data_dir, actual_port)?;
-            let web_handle = crate::daemon::web_api::start_with_listener(
-                web_config,
-                listener,
-                cancel.clone(),
-                web_state,
-                auth,
-            )
-            .await?;
-            tasks.push(("web_api", web_handle));
-        }
-
         // ── Phase 7.2: spawn Processor ────────────────────────────────────────
         // PendingChallenges map: owned by the Scheduler (it both writes challenges
         // and resolves mailbox PoS responses against them). Wired below.
@@ -847,48 +914,34 @@ impl DaemonHandle {
         let soft_quota_bytes = viaticum_core::config::soft_quota_bytes(&app_config);
         let hard_quota_bytes = viaticum_core::config::hard_quota_bytes(&app_config);
         let disk_reserve_bytes = viaticum_core::config::disk_reserve_bytes(&app_config);
-        if let Some(cs) = cluster_state.as_ref() {
+        // Processor, worker and cluster sync always start: the swarm and the
+        // cluster state are guaranteed by the start checks above (no early
+        // return that leaves the node half-started, daemon-i1).
+        {
             let cluster_sync = Arc::new(ClusterSyncManager::new(
                 db.clone(),
                 ClusterSyncConfig {
                     our_device_id: device_id,
                     batch_size: 1000,
                 },
-                cs.clone(),
+                cluster_state.clone(),
             ));
             // Clone for periodic sync task before cluster_sync is moved into Processor.
             let cluster_sync_for_sync_loop = cluster_sync.clone();
-
-            // Require a SwarmHandle to start Processor. If swarm failed to start,
-            // skip Processor (same degraded behavior as before).
-            let swarm_for_processor = match swarm_handle_arc.clone() {
-                Some(s) => s,
-                None => {
-                    tracing::warn!("swarm unavailable — Processor not started");
-                    return Ok(DaemonHandle { cancel, tasks });
-                }
-            };
-            let swarm_event_rx_for_processor = match swarm_event_rx {
-                Some(rx) => rx,
-                None => {
-                    tracing::warn!("swarm events unavailable — Processor not started");
-                    return Ok(DaemonHandle { cancel, tasks });
-                }
-            };
 
             let mut processor = Processor::new(
                 db.clone(),
                 identity_pub,
                 cluster_sync,
                 holdings_dir.clone(),
-                swarm_for_processor,
+                swarm_handle_arc.clone(),
                 soft_quota_bytes,
                 hard_quota_bytes,
                 cfg.data_dir.clone(),
                 disk_reserve_bytes,
                 backup_event_tx,
                 time_scale,
-                Some(cs.clone()),
+                Some(cluster_state.clone()),
                 app_config.escrow.clone(),
                 accepted_offers.clone(),
                 master_key.clone(),
@@ -915,10 +968,10 @@ impl DaemonHandle {
                     db.clone(),
                     work_pipeline_config,
                     encoder.clone(),
-                    swarm_handle_arc.clone(),
+                    Some(swarm_handle_arc.clone()),
                     Some(master_key.clone()),
                     Some(Arc::clone(&peer_backoff)),
-                    cluster_state.clone(),
+                    Some(cluster_state.clone()),
                     work_event_rx,
                 );
                 tasks.push((
@@ -930,46 +983,35 @@ impl DaemonHandle {
             let cancel_processor = cancel.clone();
             tasks.push((
                 "processor",
-                tokio::spawn(async move {
-                    processor
-                        .run(swarm_event_rx_for_processor, cancel_processor)
-                        .await
-                }),
+                tokio::spawn(async move { processor.run(swarm_event_rx, cancel_processor).await }),
             ));
 
             // ── Cluster periodic sync ──────────────────────────────────────────
             {
                 let cs_sync = cluster_sync_for_sync_loop;
-                let cs_state = cs.clone();
+                let cs_state = cluster_state.clone();
                 let cs_swarm = swarm_handle_arc.clone();
                 let cs_interval = (300 / time_scale).max(10);
                 let cancel_cs = cancel.clone();
                 tasks.push((
                     "cluster_sync",
                     tokio::spawn(async move {
-                        // Only run if swarm is available; otherwise skip (no libp2p cluster sync).
-                        if let Some(swarm) = cs_swarm {
-                            if let Err(e) = crate::daemon::cluster_sync::run_periodic_sync(
-                                cs_sync,
-                                cs_state,
-                                swarm,
-                                device_id,
-                                cs_interval,
-                                cancel_cs,
-                            )
-                            .await
-                            {
-                                tracing::error!(error = %e, "cluster periodic sync failed");
-                            }
-                        } else {
-                            tracing::warn!("swarm unavailable — cluster periodic sync not started");
+                        if let Err(e) = crate::daemon::cluster_sync::run_periodic_sync(
+                            cs_sync,
+                            cs_state,
+                            cs_swarm,
+                            device_id,
+                            cs_interval,
+                            cancel_cs,
+                        )
+                        .await
+                        {
+                            tracing::error!(error = %e, "cluster periodic sync failed");
                         }
                         Ok(())
                     }),
                 ));
             }
-        } else {
-            tracing::warn!("cluster state unavailable — Processor not started");
         }
 
         // ── Step F: Spawn watcher — ALWAYS (even with empty dir list) ────────
@@ -1140,27 +1182,9 @@ impl DaemonHandle {
             use crate::daemon::mailbox::cleanup::{
                 run_mailbox_self_cleanup, run_mailbox_ttl_sweep,
             };
-            use crate::daemon::network::swarm::device_id_to_peer_id;
 
-            // Derive own PeerId: prefer live swarm value (already computed), fall back
-            // to deriving from device_id. Failure is non-fatal: self-cleanup degrades
-            // to "only our own peer_id in routing view" → should_store=true for all
-            // targets → no evictions (safe default, no data loss).
-            let my_peer_id_for_cleanup = if let Some(ref swarm) = swarm_handle_arc {
-                swarm.peer_id
-            } else {
-                match device_id_to_peer_id(&device_id) {
-                    Ok(pid) => pid,
-                    Err(e) => {
-                        tracing::warn!(
-                            err = %e,
-                            "T-11: cannot derive PeerId for mailbox self-cleanup; \
-                             using random PeerId (no evictions will fire)"
-                        );
-                        libp2p::PeerId::random()
-                    }
-                }
-            };
+            // Own PeerId for the membership view (the swarm is always up here).
+            let my_peer_id_for_cleanup = swarm_handle_arc.peer_id;
 
             // (a) TTL sweep. Cadence scaled by time_scale (same as scheduler / poll).
             let sweep_db = db.clone();
@@ -1206,7 +1230,7 @@ impl DaemonHandle {
         // ── System state periodic push (T-8) ────────────────────────────────
         // T-8: pointer is published via mailbox instead of push-to-all.
         // Passes mailbox_router, identity_pub (my_master_pub), and current_pointer handle.
-        // Uses SwarmHandle (ε.2+). Only started if swarm is available.
+        // Uses SwarmHandle (ε.2+); the swarm is always up here.
         {
             let ss_db = db.clone();
             let ss_swarm = swarm_handle_arc.clone();
@@ -1221,28 +1245,22 @@ impl DaemonHandle {
             tasks.push((
                 "system_state_push",
                 tokio::spawn(async move {
-                    if let Some(swarm) = ss_swarm {
-                        if let Err(e) = crate::daemon::system_state::run_periodic_push(
-                            ss_db,
-                            swarm,
-                            ss_seed,
-                            ss_master_key,
-                            ss_data_dir,
-                            ss_interval,
-                            time_scale,
-                            cancel_ss,
-                            ss_mailbox_router,
-                            ss_my_master_pub,
-                            ss_current_pointer,
-                        )
-                        .await
-                        {
-                            tracing::error!(error = %e, "system_state periodic push failed");
-                        }
-                    } else {
-                        tracing::warn!(
-                            "swarm unavailable — system_state periodic push not started"
-                        );
+                    if let Err(e) = crate::daemon::system_state::run_periodic_push(
+                        ss_db,
+                        ss_swarm,
+                        ss_seed,
+                        ss_master_key,
+                        ss_data_dir,
+                        ss_interval,
+                        time_scale,
+                        cancel_ss,
+                        ss_mailbox_router,
+                        ss_my_master_pub,
+                        ss_current_pointer,
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %e, "system_state periodic push failed");
                     }
                     Ok(())
                 }),
@@ -1390,14 +1408,14 @@ async fn run_avail_decay_task(
 /// Wrap `Db::open` in an exponential backoff (≤ ~60s total) so a freshly
 /// rexec'd child can wait for the parent to release the redb file lock.
 ///
-/// Parent shutdown can be slow — `DaemonHandle::wait` joins every task
-/// sequentially, and a BackupCoordinator with an in-flight symbol-write
-/// cycle can hold the DB Arc for tens of seconds before exiting. The
-/// envelope must outlast the slowest realistic parent drain; 11s was
-/// observed to lose races under active backup load.
-async fn open_db_with_retry(path: &std::path::Path) -> Result<Db, anyhow::Error> {
+/// Backoffs sum to ≈ 63.5 s. The parent drains its tasks through
+/// `wait_with_deadline` (up to `SHUTDOWN_DRAIN`) and only then exits and
+/// releases the lock, so the envelope must outlast that drain plus a slow
+/// exit under load; an 11 s envelope was observed to lose races under
+/// active backup load.
+async fn open_db_with_retry(path: &std::path::Path) -> Result<Db, DbError> {
     let backoffs_ms = [0u64, 500, 1000, 2000, 4000, 8000, 16000, 16000, 16000];
-    let mut last_err: Option<anyhow::Error> = None;
+    let mut last_err: Option<DbError> = None;
     for (i, ms) in backoffs_ms.iter().enumerate() {
         if *ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
@@ -1414,14 +1432,15 @@ async fn open_db_with_retry(path: &std::path::Path) -> Result<Db, anyhow::Error>
                 let is_lock =
                     msg.contains("Database already open") || msg.contains("Cannot acquire lock");
                 if !is_lock {
-                    return Err(e.into());
+                    return Err(e);
                 }
                 tracing::warn!(attempt = i + 1, error = %msg, "db locked, retrying");
-                last_err = Some(e.into());
+                last_err = Some(e);
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("db open failed after retries")))
+    // The loop runs at least once and only falls through after a lock error.
+    Err(last_err.unwrap_or(DbError::Database(redb::DatabaseError::DatabaseAlreadyOpen)))
 }
 
 // ── Disk space ────────────────────────────────────────────────────────────────

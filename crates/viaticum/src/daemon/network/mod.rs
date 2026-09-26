@@ -22,6 +22,8 @@ mod swarm_kad_tests;
 #[cfg(test)]
 mod swarm_nat_tests;
 #[cfg(test)]
+mod swarm_port_tests;
+#[cfg(test)]
 pub(crate) mod swarm_test_helpers;
 #[cfg(test)]
 mod swarm_tests;

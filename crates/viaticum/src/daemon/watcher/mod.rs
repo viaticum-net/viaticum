@@ -246,11 +246,34 @@ pub async fn start_watcher(
             }
         })?;
 
-    // Register all directories (empty list = no-op).
-    for dir in &watch_dirs {
-        watcher_inner.watch(dir, RecursiveMode::Recursive)?;
-        tracing::info!(dir = %dir.display(), "watching directory");
-    }
+    // Register all directories (empty list = no-op). A folder that cannot be
+    // watched (missing — a USB disk or NAS share not mounted yet —, unreadable,
+    // inotify limit) must not stop the others (daemon-i3): it is marked Error
+    // with the reason and left out of watching and scanning; the rest carry on.
+    // Its files are NOT treated as deleted (dr-i10: absence is not deletion) —
+    // it simply produces no events.
+    watch_dirs.retain(
+        |dir| match watcher_inner.watch(dir, RecursiveMode::Recursive) {
+            Ok(()) => {
+                tracing::info!(dir = %dir.display(), "watching directory");
+                true
+            }
+            Err(e) => {
+                let reason = describe_watch_error(&e);
+                tracing::warn!(
+                    path = %dir.display(), error = %reason,
+                    "watch folder unavailable; other folders keep being backed up"
+                );
+                set_status(
+                    &config.watch_states,
+                    dir,
+                    WatcherStatusSignal::Error,
+                    Some(reason),
+                );
+                false
+            }
+        },
+    );
 
     // ── Initial / periodic scan ────────────────────────────────────────────
     let scan_marker = config.data_dir.join("last_scan");
@@ -338,12 +361,13 @@ pub async fn start_watcher(
                 match cmd {
                     WatcherCommand::Add { path, importance: _ } => {
                         if let Err(e) = notify_watcher.watch(&path, RecursiveMode::Recursive) {
+                            let reason = describe_watch_error(&e);
                             tracing::warn!(
-                                path = %path.display(), error = %e,
+                                path = %path.display(), error = %reason,
                                 "watcher: failed to watch new directory"
                             );
                             set_status(&config.watch_states, &path,
-                                WatcherStatusSignal::Error, Some(e.to_string()));
+                                WatcherStatusSignal::Error, Some(reason));
                         } else {
                             watch_dirs.push(path.clone());
                             // Rebuild IgnoreSet for all current dirs.
@@ -456,6 +480,24 @@ fn classify_event(kind: &EventKind) -> Option<DirtyKind> {
         EventKind::Access(_) => None,                       // reads: ignore
         EventKind::Remove(RemoveKind::Folder) => None,      // directory removal: ignore
         _ => None,
+    }
+}
+
+/// Human-readable reason a folder could not be put under watch (shown in
+/// `/api/watches` and the log). Names the kernel knob for the inotify limit.
+pub(crate) fn describe_watch_error(e: &notify::Error) -> String {
+    match &e.kind {
+        notify::ErrorKind::PathNotFound => "folder does not exist".to_string(),
+        notify::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            "folder does not exist".to_string()
+        }
+        notify::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied => {
+            "permission denied".to_string()
+        }
+        notify::ErrorKind::MaxFilesWatch => "inotify watch limit reached \
+             (raise fs.inotify.max_user_watches)"
+            .to_string(),
+        _ => e.to_string(),
     }
 }
 

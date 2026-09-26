@@ -418,6 +418,12 @@ pub enum SwarmError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The fixed listen port is held by another process (a second viaticum on
+    /// the same port included: libp2p-tcp binds its listener with SO_REUSEPORT,
+    /// so only a probe without it notices the other holder). daemon-i1.
+    #[error("listen port {port} is in use by another process")]
+    PortInUse { port: u16 },
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -643,11 +649,24 @@ impl SwarmHandle {
             })
             .build();
 
-        // Listen-port handover retry: when the daemon self-rexecs (Settings UI
-        // "Save & restart"), the child briefly races the parent for the listen
-        // port. Probe the port up to ~10s before handing off to libp2p.
-        if config.listen_port != 0 {
-            wait_for_tcp_port_free("0.0.0.0", config.listen_port).await;
+        // Listen-port check (daemon-i1). libp2p-tcp sets SO_REUSEPORT on its
+        // listening socket, so a second viaticum of the same user binds the same
+        // fixed port without an error and the two silently share incoming
+        // connections. A probe WITHOUT SO_REUSEPORT gets EADDRINUSE while anyone
+        // listens there: it is the authoritative check. It also waits out the
+        // listen-port handover when the daemon self-rexecs (Settings UI "Save &
+        // restart": the child races the parent for the port).
+        if config.listen_port != 0
+            && !wait_for_tcp_port_free(
+                "0.0.0.0",
+                config.listen_port,
+                LISTEN_PORT_HANDOVER_BACKOFFS_MS,
+            )
+            .await
+        {
+            return Err(SwarmError::PortInUse {
+                port: config.listen_port,
+            });
         }
         swarm
             .listen_on(
@@ -2091,17 +2110,19 @@ fn emit_event(tx: &mpsc::Sender<ProtocolEvent>, event: ProtocolEvent) {
     }
 }
 
-/// Probe the given TCP port; if it is held by another process (e.g. the
-/// previous daemon instance during self-rexec), retry with 1s/2s/4s/4s
-/// backoff (≤ 11s total) before giving up. Always returns — this is a
-/// best-effort wait; libp2p's `listen_on` will surface a real error if
-/// the port is still held when we hand off.
-async fn wait_for_tcp_port_free(host: &str, port: u16) {
+/// Backoff schedule of the listen-port probe: ~63.5 s in total. Matches the
+/// DB-open retry envelope: on a self-rexec the parent releases the port during
+/// the same shutdown that releases the DB lock.
+pub(crate) const LISTEN_PORT_HANDOVER_BACKOFFS_MS: &[u64] =
+    &[0, 500, 1000, 2000, 4000, 8000, 16000, 16000, 16000];
+
+/// Probe the given TCP port with a plain bind (no SO_REUSEPORT). If another
+/// process holds it (the previous daemon during a self-rexec, a second
+/// viaticum, an unrelated service), retry along `backoffs_ms`. Returns true as
+/// soon as the port is free, false if it is still held after the last attempt.
+pub(crate) async fn wait_for_tcp_port_free(host: &str, port: u16, backoffs_ms: &[u64]) -> bool {
     use std::net::TcpListener;
     let addr = format!("{host}:{port}");
-    // Matches the DB-open retry envelope (~60s); parent's listener drop
-    // happens during the same slow shutdown that holds the DB lock.
-    let backoffs_ms = [0u64, 500, 1000, 2000, 4000, 8000, 16000, 16000, 16000];
     for (i, ms) in backoffs_ms.iter().enumerate() {
         if *ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
@@ -2112,7 +2133,7 @@ async fn wait_for_tcp_port_free(host: &str, port: u16) {
                 if i > 0 {
                     info!(port, attempts = i + 1, "listen port became available");
                 }
-                return;
+                return true;
             }
             Err(e) => {
                 warn!(port, attempt = i + 1, error = %e, "listen port not free yet, retrying");
@@ -2121,8 +2142,9 @@ async fn wait_for_tcp_port_free(host: &str, port: u16) {
     }
     warn!(
         port,
-        "listen port still held after retries; libp2p listen will likely fail"
+        "listen port still held after retries; refusing to start"
     );
+    false
 }
 
 // ─── Helper functions ─────────────────────────────────────────────────────────
