@@ -364,7 +364,7 @@ mkdir -p "$TEST_DIR"
 for i in $(seq 0 $((NUM_NODES - 1))); do
     mkdir -p "$(node_dir "$i")/files"
     run_cli "$i" init > /dev/null 2>&1
-    # As local_ledger_test: web API on, no disk reserve, no [escrow] (nothing is restored).
+    # As local_ledger_test: web API on, no disk reserve.
     cat > "$(node_dir "$i")/config.toml" << 'CFGEOF'
 [web_api]
 enabled = true

@@ -390,8 +390,6 @@
   .badge-pending { background: #21262d; color: #8b949e; }
   /* working: encoded, waiting for placements to land */
   .badge-working { background: #3d2b1b; color: #d29922; }
-  /* cold: replicated but escrow-locked */
-  .badge-cold { background: #1c2738; color: #58a6ff; }
   /* ok: fully restorable */
   .badge-ok { background: #1b3d2f; color: #3fb950; }
   /* bad: degraded, holders lost */

@@ -75,7 +75,6 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 | `types` | Newtype ID wrappers (SourceBlockId, IdentityPub, DeviceId, FileId, NodeId), domain structs (FileRecord, SourceBlockRecord, SymbolPlacement, PeerRecord) |
 | `constants` | All tunable protocol constants |
 | `trust` | TrustEngine: `trust = (KP*P + KI*I) * clamp(S, 0.1, 1.0)` |
-| `escrow` | Contribution-based restore gating: `restore_budget_gb = stored_gb_days / factor` |
 | `placement` | Symbol allocation: `weight = trust/sqrt(1-trust)`, cap, MAX_HOLDERS=30 |
 | `budget` | Owner backup budget estimation, holder eviction priority |
 | `erasure` | ErasureEncoder trait + RaptorQ impl, per-holder XOR binding |
@@ -120,6 +119,6 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 - Phases 1-7 complete (core logic, daemon wiring, P2P networking)
 - δ.1 Database Reliability complete: crash safety, DB backup to peers, DR from seed phrase
 - Real-world P2P tested: LAN (Netbird) + NAT (relay + DCUtR, both peers behind NAT)
-- All features wired: escrow check, effective_quota, device add/revoke, SymbolAccept->BackupCoordinator
+- All features wired: effective_quota, device add/revoke, SymbolAccept->BackupCoordinator
 
 See [features.md](features.md) for the roadmap and [usage.md](usage.md) for how to use it.
