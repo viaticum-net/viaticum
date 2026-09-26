@@ -880,9 +880,7 @@ impl DaemonHandle {
                 cfg.data_dir.clone(),
                 disk_reserve_bytes,
                 backup_event_tx,
-                time_scale,
                 Some(cs.clone()),
-                app_config.escrow.clone(),
                 accepted_offers.clone(),
                 master_key.clone(),
             );

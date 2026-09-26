@@ -430,8 +430,8 @@ fn dispatch_versions(state: &DaemonState, path: &str) -> CliResponse {
             let content_hash_hex = hex_encode(&v.content_hash);
             let source_block_id_hex = hex_encode(&v.source_block_id.0);
             let effective_status = compute_effective_status(state, v);
-            // restore_blocker is the count-side of effective_status; precise
-            // (escrow-aware) blocker is computed on click in dispatch_restore.
+            // restore_blocker is the count-side of effective_status; the precise
+            // blocker (symbols actually fetched) is computed on click in dispatch_restore.
             let restore_blocker = match &effective_status {
                 EffectiveStatus::Replicating { live, target }
                 | EffectiveStatus::Degraded { live, target, .. } => {
@@ -569,17 +569,6 @@ fn restore_error_to_blocker(e: &RestoreError) -> Option<RestoreBlocker> {
         }
         // NOTE-1: `RestoreError::NoHolders` was removed (A4 removed its only constructor;
         // the empty-placement case now surfaces as InsufficientPlacements/InsufficientSymbols).
-        RestoreError::EscrowDenied {
-            restore_budget_gb,
-            restore_gb,
-            ..
-        } => Some(RestoreBlocker::EscrowLocked {
-            budget_gb: *restore_budget_gb,
-            // restore_gb may be NaN (set by from_fetch when block size unknown
-            // owner-side); pass through so the UI can decide whether to show it.
-            needed_gb: *restore_gb,
-            est_seconds: None,
-        }),
         RestoreError::Timeout { .. } => None,
         _ => None,
     }

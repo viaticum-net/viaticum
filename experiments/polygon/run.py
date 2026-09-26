@@ -95,7 +95,6 @@ REQUIRED_SCENARIO_KEYS = (
     "warmup_virtual_days",
     "churn",
     "seed",
-    "escrow_k_factor",
     "source_block_size_mb",
 )
 
@@ -208,8 +207,6 @@ def load_scenario(path: str) -> dict:
         raise ValueError("sample_interval_secs must be > 0")
     if float(scenario["warmup_virtual_days"]) < 0:
         raise ValueError("warmup_virtual_days must be >= 0")
-    if float(scenario["escrow_k_factor"]) <= 0:
-        raise ValueError("escrow_k_factor must be > 0")
     block = int(scenario["source_block_size_mb"])
     if block < 1 or (block & (block - 1)) != 0:
         raise ValueError("source_block_size_mb must be a power of two >= 1")
@@ -234,8 +231,8 @@ def _build_node_plans(scenario: dict, n_using: int, rng: random.Random) -> list:
     engine onboards them mid-run. Every other node joins at virtual day 0 (it is up
     from the start unless its own churn schedule / a scenario mass_depart takes it down).
 
-    Each plan is decorated with the scenario-level escrow_k_factor / source_block_size_mb
-    (config_gen reads them off the plan when not threaded explicitly) and, after the
+    Each plan is decorated with the scenario-level source_block_size_mb
+    (config_gen reads it off the plan when not threaded explicitly) and, after the
     config is rendered, with config_toml (fleet.join_node reads plan.config_toml for a
     mid-run fresh onboarding).
     """
@@ -255,7 +252,6 @@ def _build_node_plans(scenario: dict, n_using: int, rng: random.Random) -> list:
             join_day = 0
         plan = archetypes.build_node_plan(label, arch, join_day, rng, scenario)
         # Thread scenario-level config knobs onto the plan for config_gen + fleet.
-        setattr(plan, "escrow_k_factor", float(scenario["escrow_k_factor"]))
         setattr(plan, "source_block_size_mb", int(scenario["source_block_size_mb"]))
         plans.append(plan)
     return plans
@@ -275,7 +271,6 @@ def _render_and_record_config(fleet: Fleet, plan) -> str:
         setattr(plan, "watch_path", str(fleet.files_dir(plan.label)))
     toml_text = config_gen.render_config_toml(
         plan,
-        escrow_k_factor=float(getattr(plan, "escrow_k_factor")),
         source_block_size_mb=int(getattr(plan, "source_block_size_mb")),
     )
     # fleet.join_node (mid-run onboarding) reads plan.config_toml to rebuild the config

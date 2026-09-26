@@ -40,16 +40,11 @@ pub const S_CLAMP_MIN: f64 = 0.1;
 /// S ceiling.
 pub const S_CLAMP_MAX: f64 = 1.0;
 
-// === Escrow (contribution-based) ===
-
-/// Days of storage contribution required to earn 1 GB of restore credit.
-/// Formula: restore_budget_gb = stored_gb_days / k_factor.
-/// Default K=7: store 1 GB for 7 days → earn 1 GB restore budget.
-pub const DEFAULT_ESCROW_K_FACTOR: f64 = 7.0;
+// === Offer budget (contribution-based) ===
 
 /// Days of storage contribution required to earn 1 GB of OFFER budget (backup credit).
 /// Formula: earned_offer_gb = Σ(gb_days × master_trust / MAX_COMBINED_TRUST) / K_OFFER.
-/// Smaller than restore-K (7) on purpose — we want self-awareness for fresh
+/// Smaller than the old restore-escrow K (7; that gate was removed in v1) on purpose — we want self-awareness for fresh
 /// owners (a node holding for the network a few days can back up its first
 /// files), and offering cost is already inflated ×overhead_factor by the
 /// caller. Set to 5 (tunable). Sybil mitigation logged in tech-debt.

@@ -69,6 +69,7 @@ const SS_BLOCKS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("ss_bl
 
 /// Total bytes restored per peer (cumulative, append-only counter).
 /// Key = owner IdentityPub [u8;32]. Value = CBOR(u64) — total bytes served.
+/// Accounting only (v1): nothing gates restore on it; input for a future escrow-as-debt.
 const RESTORE_SERVED: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("restore_served");
 
 /// Device trust per DeviceId. Key = DeviceId [u8;32]. Value = CBOR(DeviceTrustRecord).
@@ -2023,7 +2024,7 @@ impl Db {
         Ok(())
     }
 
-    /// All holdings for a given owner. Used by escrow module.
+    /// All holdings for a given owner (storage-balance and GB·days accounting).
     pub fn list_holdings_for_owner(
         &self,
         owner_id: &IdentityPub,

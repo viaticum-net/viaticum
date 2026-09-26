@@ -178,9 +178,7 @@ async fn make_processor_with_quota(
         holdings_dir.path().to_path_buf(), // data_dir (for disk space queries in tests)
         0,                                 // disk_reserve_bytes (no reserve in tests)
         backup_event_tx,
-        1,    // time_scale
         None, // cluster_state: not needed for handler unit tests
-        viaticum_core::config::EscrowCfg::default(),
         accepted_offers,
         ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     )
@@ -269,9 +267,7 @@ async fn symbol_accept_updates_backup_event() {
         holdings_dir.path().to_path_buf(),
         0,
         backup_event_tx,
-        1,
         None, // cluster_state: not needed for handler unit tests
-        viaticum_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
         ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     );
@@ -837,14 +833,14 @@ async fn restore_request_returns_held_symbols() {
         std::fs::write(block_dir.join(format!("{esi}.bin")), vec![esi as u8; 32]).unwrap();
     }
 
-    // Upsert HoldingRecord with received_at 30 days ago so escrow sees non-zero contribution.
+    // Upsert an Active HoldingRecord for the owner.
     let thirty_days_ago = Timestamp(Timestamp::now().0.saturating_sub(30 * 86_400));
     db.upsert_holding(&HoldingRecord {
         source_block_id: block_id,
         owner_id: owner,
         esi_ranges: vec![(0, 3)],
         importance: 0.5,
-        total_bytes: 1_073_741_824, // 1 GB so budget = 1*30/7 ≈ 4.3 GB
+        total_bytes: 1_073_741_824,
         status: HoldingStatus::Active,
         received_at: thirty_days_ago,
         delete_requested_at: None,
@@ -885,14 +881,14 @@ async fn restore_request_filters_by_esi_list() {
         std::fs::write(block_dir.join(format!("{esi}.bin")), vec![esi as u8; 32]).unwrap();
     }
 
-    // received_at 30 days ago so escrow sees non-zero contribution.
+    // Active HoldingRecord for the owner.
     let thirty_days_ago = Timestamp(Timestamp::now().0.saturating_sub(30 * 86_400));
     db.upsert_holding(&HoldingRecord {
         source_block_id: block_id,
         owner_id: owner,
         esi_ranges: vec![(0, 5)],
         importance: 0.5,
-        total_bytes: 1_073_741_824, // 1 GB so budget = 1*30/7 ≈ 4.3 GB
+        total_bytes: 1_073_741_824,
         status: HoldingStatus::Active,
         received_at: thirty_days_ago,
         delete_requested_at: None,
@@ -916,6 +912,198 @@ async fn restore_request_filters_by_esi_list() {
     let esis: Vec<u32> = response.symbols.iter().map(|s| s.esi).collect();
     assert!(esis.contains(&1), "missing ESI 1");
     assert!(esis.contains(&3), "missing ESI 3");
+}
+
+/// Write `count` symbol files for `block_id` and an Active holding for `owner`
+/// received at `received_at` with `total_bytes` (the old escrow gate's inputs).
+fn put_holding_with_symbols(
+    db: &Db,
+    holdings_dir: &TempDir,
+    owner: IdentityPub,
+    block_id: SourceBlockId,
+    count: u32,
+    total_bytes: u64,
+    received_at: Timestamp,
+) {
+    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let block_dir = holdings_dir.path().join(&block_hex);
+    std::fs::create_dir_all(&block_dir).unwrap();
+    for esi in 0..count {
+        std::fs::write(block_dir.join(format!("{esi}.bin")), vec![esi as u8; 32]).unwrap();
+    }
+    db.upsert_holding(&HoldingRecord {
+        source_block_id: block_id,
+        owner_id: owner,
+        esi_ranges: vec![(0, count)],
+        importance: 0.5,
+        total_bytes,
+        status: HoldingStatus::Active,
+        received_at,
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    })
+    .unwrap();
+}
+
+fn restore_all(block_id: SourceBlockId) -> RestoreRequestMsg {
+    RestoreRequestMsg {
+        v: 1,
+        source_block_id: block_id,
+        esi_list: vec![],
+        timestamp: Timestamp::now(),
+    }
+}
+
+/// restore-i6: a holding placed this very second (zero GB·days of contribution — the old
+/// escrow gate's budget was exactly 0) is served in full to its owner.
+#[tokio::test]
+async fn restore_request_serves_owner_right_after_placement() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let processor = make_processor(db.clone(), &holdings_dir).await;
+    let owner = make_identity(21);
+    let block_id = make_block_id(21);
+    put_holding_with_symbols(
+        &db,
+        &holdings_dir,
+        owner,
+        block_id,
+        4,
+        16 * 1_073_741_824,
+        Timestamp::now(),
+    );
+
+    let response = processor
+        .handle_restore_request_inner(owner, restore_all(block_id))
+        .await
+        .expect("fresh holding must be served, not refused");
+
+    assert_eq!(response.symbols.len(), 4);
+}
+
+/// restore-i5/i6: repeats are not refused even when the served-bytes counter already exceeds
+/// anything the holding could have "earned"; the counter keeps growing (accounting only).
+#[tokio::test]
+async fn restore_request_repeats_are_served_and_only_counted() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let processor = make_processor(db.clone(), &holdings_dir).await;
+    let owner = make_identity(22);
+    let block_id = make_block_id(22);
+    put_holding_with_symbols(
+        &db,
+        &holdings_dir,
+        owner,
+        block_id,
+        3,
+        1_073_741_824,
+        Timestamp::now(),
+    );
+    db.record_restore_served(&owner, 1u64 << 50).unwrap();
+
+    for attempt in 1..=3u64 {
+        let response = processor
+            .handle_restore_request_inner(owner, restore_all(block_id))
+            .await
+            .expect("repeat must be served");
+        assert_eq!(response.symbols.len(), 3, "attempt {attempt}");
+        assert_eq!(
+            db.restored_total_bytes(&owner).unwrap(),
+            (1u64 << 50) + attempt * 3 * 32,
+            "attempt {attempt}: served bytes are counted"
+        );
+    }
+}
+
+/// restore-i7: removing the gate must not open the holding to another master — the lookup
+/// is by (block, requester master), a foreign master gets an empty response.
+#[tokio::test]
+async fn restore_request_from_foreign_master_is_empty() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let processor = make_processor(db.clone(), &holdings_dir).await;
+    let owner = make_identity(23);
+    let stranger = make_identity(24);
+    let block_id = make_block_id(23);
+    put_holding_with_symbols(
+        &db,
+        &holdings_dir,
+        owner,
+        block_id,
+        3,
+        1_073_741_824,
+        Timestamp::now(),
+    );
+
+    let response = processor
+        .handle_restore_request_inner(stranger, restore_all(block_id))
+        .await
+        .unwrap();
+
+    assert!(response.symbols.is_empty());
+    assert_eq!(db.restored_total_bytes(&stranger).unwrap(), 0);
+    assert_eq!(db.restored_total_bytes(&owner).unwrap(), 0);
+}
+
+fn set_holding_status(db: &Db, owner: IdentityPub, block_id: SourceBlockId, status: HoldingStatus) {
+    let mut h = db.get_holding(&block_id, &owner).unwrap().unwrap();
+    h.status = status;
+    db.upsert_holding(&h).unwrap();
+}
+
+/// restore-i16: a Silent holding (no PoS, owner quiet) is still the owner's data and is
+/// served to the owner.
+#[tokio::test]
+async fn restore_request_serves_silent_holding_to_owner() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let processor = make_processor(db.clone(), &holdings_dir).await;
+    let owner = make_identity(25);
+    let block_id = make_block_id(25);
+    put_holding_with_symbols(
+        &db,
+        &holdings_dir,
+        owner,
+        block_id,
+        3,
+        1024,
+        Timestamp::now(),
+    );
+    set_holding_status(&db, owner, block_id, HoldingStatus::Silent);
+
+    let response = processor
+        .handle_restore_request_inner(owner, restore_all(block_id))
+        .await
+        .unwrap();
+
+    assert_eq!(response.symbols.len(), 3, "Silent holding must be served");
+}
+
+/// restore-i16 boundary: what the owner itself asked to delete is not served.
+#[tokio::test]
+async fn restore_request_for_holding_marked_for_delete_is_empty() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let processor = make_processor(db.clone(), &holdings_dir).await;
+    let owner = make_identity(26);
+    let block_id = make_block_id(26);
+    put_holding_with_symbols(
+        &db,
+        &holdings_dir,
+        owner,
+        block_id,
+        3,
+        1024,
+        Timestamp::now(),
+    );
+    set_holding_status(&db, owner, block_id, HoldingStatus::MarkedForDelete);
+
+    let response = processor
+        .handle_restore_request_inner(owner, restore_all(block_id))
+        .await
+        .unwrap();
+
+    assert!(response.symbols.is_empty());
 }
 
 // ─── handle_peer_announce ────────────────────────────────────────────────────
@@ -1896,9 +2084,7 @@ async fn make_processor_with_cluster_state(
         holdings_dir.path().to_path_buf(),
         0,
         backup_event_tx,
-        1,
         Some(cluster_state.clone()),
-        viaticum_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
         ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     );

@@ -11,7 +11,11 @@
 # Intent: dr-i1 (Phases 4-5; currently FAILs in Phase 5: the post-DR daemon gets 0
 #   authenticated peers, product redial bug), restore-i1 after DR (Phase 5, same FAIL),
 #   dr-i9 (Phase 3, only via the "SelfPointer published via mailbox" log line: status
-#   does not expose DR readiness).
+#   does not expose DR readiness), restore-i6 after DR (no [escrow] override; the
+#   removed holder gate — held bytes x scaled age / 7 days < c x 65535 requested —
+#   would refuse while the restore finishes < ~600 s x (65535 / symbol size) after
+#   placement at TIME_SCALE=1000; the run needs ~130 s; no in-script timing guard,
+#   local_e2e_test has one).
 # Proves: DR recovers a catalog whose file count equals the scenario's journal (1) and
 #   that lists the backed-up file; the recovered daemon reaches holders on its own; the
 #   file restored on the wiped machine is byte-identical to the original (sha256) and
@@ -165,9 +169,6 @@ enabled = true
 bind = "127.0.0.1:0"
 [storage]
 disk_reserve_gb = 0.0
-
-[escrow]
-k_factor = 0.001
 CFGEOF
 done
 
@@ -358,9 +359,6 @@ enabled = true
 bind = "127.0.0.1:0"
 [storage]
 disk_reserve_gb = 0.0
-
-[escrow]
-k_factor = 0.001
 CFGEOF
 
 RUST_LOG=info "$BINARY" --data-dir "$(node_dir 0)" daemon \
