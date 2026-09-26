@@ -7,7 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$SCRIPT_DIR/.env" ] && set -a && . "$SCRIPT_DIR/.env" && set +a
 
 SERVER="${VIATICUM_SERVER:-your-user@your-server}"
-REMOTE_DIR="projects/syncback"
+# One server dir per checkout (see rtest.sh).
+REMOTE_DIR="projects/$(basename "$SCRIPT_DIR")"
 ARGS="${@:---release -p viaticum}"
 
 if ssh -o ConnectTimeout=2 -o BatchMode=yes "$SERVER" "echo ok" &>/dev/null; then

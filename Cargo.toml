@@ -122,3 +122,13 @@ uuid = { version = "1", features = ["v4"] }
 
 # Internal
 viaticum-core = { path = "crates/viaticum-core" }
+
+# Test/dev speed (2026-09-26): numeric sims and erasure/crypto are 10-50x slower
+# unoptimized. Optimize all dependencies (compiled once, cached) and the simulator;
+# workspace daemon/core crates stay debug for fast incremental rebuilds. Overflow
+# checks and debug assertions stay on (they are profile-level, not opt-level).
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.viaticum-sim]
+opt-level = 3
