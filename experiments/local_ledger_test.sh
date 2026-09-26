@@ -23,8 +23,9 @@
 #               inside [V*(1 - l_dem*T), V*exp(-l_dem*T)]. Cross-node: S's symbols are on S's
 #               own disk and S's log has no PoS response; P's log has PoS responses for the
 #               block; O challenged S and never resolved a response from it.
-# Adversarial:  a freeloading holder (S stores, never proves); owner SIGINT + restart with a
-#               >= 4 s outage mid-service; SIGKILL of the proving holder P.
+# Adversarial:  a freeloading holder (S stores, never proves); owner SIGTERM + restart with a
+#               >= 4 s outage mid-service, the owner rejoining on its own (auto-redial);
+#               SIGKILL of the proving holder P.
 # Cannot close: the ledger is O's local view and no other node can read it (compensated by
 #               two holders with opposite behaviour under the same belief, and by holder-side
 #               logs and disks); real time (weekly PoS, W_conf = 14 d 3 h, laptop-sleep bias):
@@ -59,12 +60,13 @@
 #                    v_dem = g_they = depth = observed_tau = 0, and >= 1 row has
 #                    believed_gb > 0 (4r-i1; believed_gb is not attributed to the user block,
 #                    see Cannot close) — check: logs of O and S
-#               5. [adversarial] right after a fresh P Pass in O's log: SIGINT O (main.rs
-#                    handles only ctrl_c), wait for exit (<= 15 s, else FAIL(setup)), keep it
-#                    down >= 4 s since SIGINT, restart with the same args, log appended (split
-#                    O's log at the line count taken at SIGINT); auto-redial is broken today,
-#                    so explicitly `connect` O to every node + wait_auth_peers 6 (as in
-#                    local_scale_test). First P row after restart: dt_days > 3.4722 (a dark
+#               5. [adversarial] right after a fresh P Pass in O's log: SIGTERM O (clean
+#                    stop since R1-a), wait for exit (<= 15 s, else FAIL(setup)), keep it
+#                    down >= 4 s since SIGTERM, restart with the same args, log appended
+#                    (split O's log at the line count taken before the restart); NO explicit
+#                    `connect`: O must rejoin on its own (auto-redial, R1-a) —
+#                    wait_auth_peers 6 within 30 s, else FAIL "auto-redial" (network-i*
+#                    promise, not a ledger one). First P row after restart: dt_days > 3.4722 (a dark
 #                    part existed). Branch on the age of P's last pre-stop Pass at that row
 #                    (log timestamps): age <= 11 s -> short outage (4r-i4): confirmed_gb > 0,
 #                    observed_tau rose by 3.4722222 (+-1e-9), observed_volume and v_dem
@@ -96,13 +98,17 @@
 #
 # Implementation notes (how the passport is executed, not what it claims):
 #   - The log is split at the line count taken right BEFORE the restarted O is launched
-#     (the SIGINT line count is recorded too): a row O may still log while shutting down
+#     (the SIGTERM line count is recorded too): a row O may still log while shutting down
 #     is pre-restart, and must not be read as "the first row after the restart".
 #   - Step 6 kills P right after a FRESH P Pass (as step 5 does for O): the next challenge
 #     is then >= 6 s away, so no answer of P can still be in flight in a mailbox — that is
 #     what makes "no P Pass after the kill" a check and not a race.
-#   - Verdicts per step: PASS / ROUGH / FAIL. The script exits non-zero only on FAIL; a
-#     ROUGH run exits 0 and says so in the summary (log it as ROUGH by hand).
+#   - The owner's outage in step 5 is measured from SIGTERM and includes the clean-stop
+#     drain (up to SHUTDOWN_DRAIN = 10 s): a slow stop pushes the pass age past 11 s and the
+#     step into the "long"/"inconclusive" branch (ROUGH, not FAIL). The rejoin after the
+#     restart is the daemon's own auto-redial; the script never calls `connect` there.
+#   - Verdicts per step: PASS / ROUGH / FAIL. Exit code: 0 PASS, 3 ROUGH, 1 FAIL
+#     (run_e2e.sh logs 3 as pass-rough).
 #
 # Usage:
 #   private/testing/run_e2e.sh ledger          # on the build server (release build)
@@ -512,10 +518,10 @@ fi
 [ "$S_BEL" -ge 1 ] && pass "$S_BEL S row(s) with believed_gb > 0 — belief without proof" \
     || fail "no S row with believed_gb > 0: the freeloader's placements never reached the sweep"
 
-# ── STEP 5: owner outage (SIGINT + restart) mid-service ──────────────────
+# ── STEP 5: owner outage (SIGTERM + restart) mid-service ─────────────────
 CUR_STEP=5
 echo ""
-echo "=== Step 5: owner SIGINT + restart mid-service ==="
+echo "=== Step 5: owner SIGTERM + restart mid-service, rejoin by auto-redial ==="
 N_PASS=$(passes_of "$PD" | wc -l)
 FRESH=""
 for _ in $(seq 1 30); do
@@ -523,9 +529,9 @@ for _ in $(seq 1 30); do
     sleep 0.5
 done
 [ -n "$FRESH" ] || { fail "FAIL(setup): no fresh P Pass within 15 s to stop O after"; finish; }
-LINES_AT_SIGINT=$(log_lines "$O_LOG")
-T_SIGINT=$(date -u +%s)
-kill -INT "${PIDS[0]}" 2>/dev/null
+LINES_AT_SIGTERM=$(log_lines "$O_LOG")
+T_SIGTERM=$(date -u +%s)
+kill -TERM "${PIDS[0]}" 2>/dev/null
 EXITED=""
 for _ in $(seq 1 30); do
     kill -0 "${PIDS[0]}" 2>/dev/null || { EXITED=1; break; }
@@ -533,21 +539,24 @@ for _ in $(seq 1 30); do
 done
 if [ -z "$EXITED" ]; then
     kill -9 "${PIDS[0]}" 2>/dev/null
-    fail "FAIL(setup): O did not exit within 15 s of SIGINT"
+    fail "FAIL(setup): O did not exit within 15 s of SIGTERM (clean stop, R1-a)"
     finish
 fi
 wait "${PIDS[0]}" 2>/dev/null
-info "O exited $(( $(date -u +%s) - T_SIGINT )) s after SIGINT"
-while [ $(( $(date -u +%s) - T_SIGINT )) -lt 4 ]; do sleep 0.2; done  # the outage itself
+O_EXIT=$?
+info "O exited (code $O_EXIT) $(( $(date -u +%s) - T_SIGTERM )) s after SIGTERM"
+[ "$O_EXIT" -eq 0 ] || fail "O exited with code $O_EXIT on SIGTERM (R1-a promises a clean stop = 0)"
+while [ $(( $(date -u +%s) - T_SIGTERM )) -lt 4 ]; do sleep 0.2; done  # the outage itself
 LINES_AT_RESTART=$(log_lines "$O_LOG")
-info "O's log: $LINES_AT_SIGINT lines at SIGINT, $LINES_AT_RESTART at restart"
+info "O's log: $LINES_AT_SIGTERM lines at SIGTERM, $LINES_AT_RESTART at restart"
+T_RESTART=$(date -u +%s)
 start_node 0 "$TIME_SCALE" "$O_RUST_LOG"
 wait_daemon 0 || { fail "FAIL(setup): O did not come back"; finish; }
-for i in $(seq 1 $((NUM_NODES - 1))); do run_cli_q 0 connect "${ADDR[$i]}" > /dev/null; done
+# No `connect` here: the restarted owner must find its peers by itself (auto-redial, R1-a).
 if wait_auth_peers 0 $((NUM_NODES - 1)) 30; then
-    pass "O back with $(status_num 0 peer_count_authenticated) authenticated peers after explicit connect"
+    pass "O rejoined on its own: $(status_num 0 peer_count_authenticated) authenticated peers $(( $(date -u +%s) - T_RESTART )) s after restart (auto-redial)"
 else
-    fail "O has $(status_num 0 peer_count_authenticated)/$((NUM_NODES - 1)) authenticated peers 30 s after restart"
+    fail "auto-redial: O has $(status_num 0 peer_count_authenticated)/$((NUM_NODES - 1)) authenticated peers 30 s after restart without an explicit connect (R1-a promise broken)"
 fi
 PRE=$(ledger_rows "$PM" 0 "$LINES_AT_RESTART" | tail -1)
 POST=""
