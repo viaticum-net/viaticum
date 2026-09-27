@@ -1,8 +1,9 @@
 // Mailbox routing helper: sender-side fanout for publish and poll.
 //
 // T-4: MailboxRouter publishes entries to write-fanout candidates and polls
-// from read-fanout candidates. Candidate set = top-N peers by XOR(SHA256(target_pub),
+// from read-fanout candidates. Candidate set = top-N peers by XOR(SHA256(address),
 // SHA256(peer_id)), ranked by combined_trust × avail_ewma for write-fanout.
+// CROWN-1 C2: the address is a `MailboxAddress` taken from the entry itself.
 //
 // Candidate sourcing: peers known from DB (list_all_peers) converted to PeerId
 // via device_id_to_peer_id. This covers all historically authenticated peers,
@@ -39,9 +40,10 @@ use viaticum_core::constants::{
     MAILBOX_READ_FANOUT, MAILBOX_WRITE_FANOUT,
 };
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::MailboxClass;
+use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry, MailboxRejectReason};
 use viaticum_core::messages::{
-    MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse, Message,
+    MAILBOX_WIRE_VERSION, MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest,
+    MailboxStoreResponse, Message,
 };
 use viaticum_core::system_state::{SelfPointer, verify_self_pointer};
 use viaticum_core::trust::compute_combined;
@@ -189,7 +191,7 @@ impl MailboxRouter {
     ///
     /// Source: all peers in DB. PeerId derived deterministically from DeviceId
     /// via device_id_to_peer_id (Ed25519 pubkey → libp2p PeerId).
-    fn build_ranked_candidates(&self, target: &IdentityPub) -> Vec<(DeviceId, PeerId)> {
+    fn build_ranked_candidates(&self, target: &MailboxAddress) -> Vec<(DeviceId, PeerId)> {
         let peers = match self.db.list_all_peers() {
             Ok(p) => p,
             Err(e) => {
@@ -231,31 +233,38 @@ impl MailboxRouter {
 
     // ─── Public API ───────────────────────────────────────────────────────────
 
-    /// Publish an entry to the write-fanout (top-30) of candidates for `target`.
+    /// Publish an entry to the write-fanout (top-30) of candidates for `entry.target`.
+    ///
+    /// `target_sig`: signature by the secret key of `entry.target` over
+    /// `store_sig_input(&entry)`. Postmen require it for class SelfPointer (only the
+    /// box key holder writes a pointer box) and ignore it for directed classes. The
+    /// box address comes only from the entry (no second `target`, F3).
     ///
     /// Returns count of successful Acks.
     /// Avail observation: on Ack, updates avail_ewma + last_avail_sample for the
     /// responding peer in the DB.
     pub async fn publish(
         &self,
-        target: &IdentityPub,
-        entry: viaticum_core::mailbox::MailboxEntry,
+        entry: MailboxEntry,
+        target_sig: Option<[u8; 64]>,
     ) -> anyhow::Result<usize> {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let ranked = self.build_ranked_candidates(target);
+        let target = entry.target;
+        let ranked = self.build_ranked_candidates(&target);
 
         // Select write-fanout peers.
-        let write_peers = self.select_write_peers_from_ranked(&ranked, target, now_secs);
+        let write_peers = self.select_write_peers_from_ranked(&ranked, &target, now_secs);
 
         let req = MailboxStoreRequest {
-            v: 1,
-            target: *target,
-            entry: entry.clone(),
+            v: MAILBOX_WIRE_VERSION,
+            entry,
+            target_sig,
         };
+        let class = req.entry.class;
 
         // Send in parallel, collect results.
         let mut handles = Vec::with_capacity(write_peers.len());
@@ -276,11 +285,26 @@ impl MailboxRouter {
                     self.record_avail_contact(device_id, now_secs);
                 }
                 Ok((device_id, Ok(MailboxStoreResponse::Reject { reason, .. }))) => {
-                    debug!(
-                        device = %device_id,
-                        ?reason,
-                        "mailbox publish: peer rejected store"
-                    );
+                    // N1: authorization / clock refusals are our own fault (bad key,
+                    // bad clock) and must be visible to the E2E guards at warn.
+                    if matches!(
+                        reason,
+                        MailboxRejectReason::Unauthorized | MailboxRejectReason::ClockSkew
+                    ) {
+                        warn!(
+                            device = %device_id,
+                            target = %target,
+                            ?class,
+                            ?reason,
+                            "mailbox publish: postman refused the entry — check keys and system clock"
+                        );
+                    } else {
+                        debug!(
+                            device = %device_id,
+                            ?reason,
+                            "mailbox publish: peer rejected store"
+                        );
+                    }
                 }
                 Ok((device_id, Err(e))) => {
                     debug!(device = %device_id, err = %e, "mailbox publish: store failed");
@@ -309,21 +333,26 @@ impl MailboxRouter {
         Ok(ack_count)
     }
 
-    /// Poll entries addressed to `my_master_pub` from read-fanout (300) candidates.
+    /// Poll the box `target` from read-fanout (300) candidates.
+    ///
+    /// `proof` is `None` for our own master box (the postman checks the transport
+    /// identity); a pointer box needs a fetch proof bound to our device, and then the
+    /// postman serves only SelfPointer entries.
     ///
     /// Returns unique non-expired entries, deduped by msg_id (most-recent wins on dup).
     /// Avail observation: on successful FetchResponse, updates avail_ewma for the responding peer.
     pub async fn poll(
         &self,
-        my_master_pub: &IdentityPub,
+        target: &MailboxAddress,
+        proof: Option<[u8; 64]>,
         since_stored_at: Option<u64>,
-    ) -> anyhow::Result<Vec<viaticum_core::mailbox::MailboxEntry>> {
+    ) -> anyhow::Result<Vec<MailboxEntry>> {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let ranked = self.build_ranked_candidates(my_master_pub);
+        let ranked = self.build_ranked_candidates(target);
 
         // Read-fanout: top-300 closest peers.
         let read_peers: Vec<DeviceId> = ranked
@@ -333,9 +362,10 @@ impl MailboxRouter {
             .collect();
 
         let req = MailboxFetchRequest {
-            v: 1,
-            target: *my_master_pub,
+            v: MAILBOX_WIRE_VERSION,
+            target: *target,
             since_stored_at,
+            target_proof: proof,
         };
 
         // Send in parallel to all read-fanout peers.
@@ -351,7 +381,7 @@ impl MailboxRouter {
 
         // Collect all responses; dedup by msg_id.
         // Last writer (by stored_at) wins on duplicate msg_id from different peers.
-        let mut by_msg_id: HashMap<[u8; 16], viaticum_core::mailbox::MailboxEntry> = HashMap::new();
+        let mut by_msg_id: HashMap<[u8; 16], MailboxEntry> = HashMap::new();
 
         for handle in handles {
             match handle.await {
@@ -385,7 +415,7 @@ impl MailboxRouter {
 
         let entries: Vec<_> = by_msg_id.into_values().collect();
         debug!(
-            my_master = %my_master_pub,
+            target = %target,
             entry_count = entries.len(),
             peers_tried = read_peers.len(),
             "mailbox poll: collected entries"
@@ -418,7 +448,10 @@ impl MailboxRouter {
             .unwrap_or_default()
             .as_secs();
 
-        let ranked = self.build_ranked_candidates(my_master_pub);
+        // CROWN-1 C2: the pointer still lives in the master box (C3 moves it to the
+        // seed-derived rendezvous box); reading our own master box needs no proof.
+        let master_box = MailboxAddress::for_master(my_master_pub);
+        let ranked = self.build_ranked_candidates(&master_box);
 
         tracing::info!(
             ranked_candidates = ranked.len(),
@@ -426,9 +459,10 @@ impl MailboxRouter {
         );
 
         let req = MailboxFetchRequest {
-            v: 1,
-            target: *my_master_pub,
+            v: MAILBOX_WIRE_VERSION,
+            target: master_box,
             since_stored_at: None,
+            target_proof: None,
         };
 
         for &batch_size in MAILBOX_DR_WALK_BATCHES {
@@ -548,7 +582,7 @@ impl MailboxRouter {
     pub fn select_write_peers(
         &self,
         candidates: &[PeerId],
-        _target_pub: &IdentityPub,
+        _target: &MailboxAddress,
         _now_secs: u64,
     ) -> Vec<DeviceId> {
         // Load peer records for trust + avail lookup.
@@ -608,7 +642,7 @@ impl MailboxRouter {
     fn select_write_peers_from_ranked(
         &self,
         ranked: &[(DeviceId, PeerId)],
-        target_pub: &IdentityPub,
+        target: &MailboxAddress,
         now_secs: u64,
     ) -> Vec<DeviceId> {
         let candidate_peer_ids: Vec<PeerId> = ranked
@@ -616,7 +650,7 @@ impl MailboxRouter {
             .take(self.candidates_n)
             .map(|(_, pid)| *pid)
             .collect();
-        self.select_write_peers(&candidate_peer_ids, target_pub, now_secs)
+        self.select_write_peers(&candidate_peer_ids, target, now_secs)
     }
 
     /// Apply a positive avail observation for `device_id` in the DB.
@@ -670,10 +704,8 @@ fn peer_id_to_device_id_best_effort(peer_id: &PeerId) -> Option<DeviceId> {
 
 /// Deduplicate a slice of entries by msg_id, keeping the one with highest stored_at.
 /// Exposed for unit testing.
-pub fn dedup_entries(
-    entries: Vec<viaticum_core::mailbox::MailboxEntry>,
-) -> Vec<viaticum_core::mailbox::MailboxEntry> {
-    let mut by_msg_id: HashMap<[u8; 16], viaticum_core::mailbox::MailboxEntry> = HashMap::new();
+pub fn dedup_entries(entries: Vec<MailboxEntry>) -> Vec<MailboxEntry> {
+    let mut by_msg_id: HashMap<[u8; 16], MailboxEntry> = HashMap::new();
     for entry in entries {
         by_msg_id
             .entry(entry.msg_id)

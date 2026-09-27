@@ -24,7 +24,7 @@ use viaticum_core::constants::{
     AVAIL_EWMA_ALPHA, AVAIL_EWMA_INITIAL, INITIAL_TRUST_P, MAILBOX_WRITE_FANOUT,
 };
 use viaticum_core::db::testutil::test_db;
-use viaticum_core::mailbox::{MailboxClass, MailboxEntry};
+use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::messages::{
     MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
 };
@@ -54,7 +54,7 @@ fn make_entry(
 ) -> MailboxEntry {
     let ttl = class.default_ttl_secs();
     MailboxEntry {
-        target,
+        target: MailboxAddress::for_master(&target),
         msg_id,
         class,
         payload_version: 1,
@@ -357,7 +357,7 @@ fn select_write_peers_orders_by_combined_trust_times_avail_ewma() {
     // Use all 3 as candidates; write_fanout = 3 so all 3 should be returned.
     let target = make_identity(99);
     let now = 0u64;
-    let selected = router.select_write_peers(&peer_ids, &target, now);
+    let selected = router.select_write_peers(&peer_ids, &MailboxAddress::for_master(&target), now);
 
     // Must select all 3 (or at least C first).
     assert!(!selected.is_empty(), "must select at least one peer");
@@ -392,7 +392,7 @@ async fn publish_sends_to_write_fanout_peers() {
         MailboxClass::PosChallenge,
     );
 
-    let ack_count = router.publish(&target, entry).await.unwrap();
+    let ack_count = router.publish(entry, None).await.unwrap();
 
     // All sent peers acked (mock always acks).
     let calls = sender.store_calls();
@@ -457,7 +457,10 @@ async fn poll_returns_deduplicated_entries_from_read_fanout() {
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender, db);
 
-    let entries = router.poll(&my_master, None).await.unwrap();
+    let entries = router
+        .poll(&MailboxAddress::for_master(&my_master), None, None)
+        .await
+        .unwrap();
 
     assert_eq!(
         entries.len(),
@@ -558,7 +561,7 @@ async fn dr_walk_stops_at_first_batch_with_pointer() {
     // first batch (100) yields a pointer and we stop there.
 
     let pointer_entry = MailboxEntry {
-        target: my_master_pub,
+        target: MailboxAddress::for_master(&my_master_pub),
         msg_id: make_msg_id(77),
         class: MailboxClass::SelfPointer,
         payload_version: 1,
@@ -611,7 +614,7 @@ async fn publish_returns_zero_acks_when_all_fail() {
         MailboxClass::PosChallenge,
     );
 
-    let ack_count = router.publish(&target, entry).await.unwrap();
+    let ack_count = router.publish(entry, None).await.unwrap();
     assert_eq!(ack_count, 0, "all-fail scenario must return 0 acks");
 }
 
@@ -642,7 +645,10 @@ async fn poll_records_avail_on_successful_fetch() {
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender, db.clone());
 
-    let _entries = router.poll(&my_master, None).await.unwrap();
+    let _entries = router
+        .poll(&MailboxAddress::for_master(&my_master), None, None)
+        .await
+        .unwrap();
 
     // Check avail_ewma was updated.
     let updated = db.get_peer(&device_id).unwrap().unwrap();
@@ -699,7 +705,10 @@ async fn poll_filters_expired_entries_from_response() {
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender, db);
 
-    let entries = router.poll(&my_master, None).await.unwrap();
+    let entries = router
+        .poll(&MailboxAddress::for_master(&my_master), None, None)
+        .await
+        .unwrap();
 
     assert_eq!(
         entries.len(),
@@ -736,7 +745,7 @@ async fn publish_records_avail_on_ack() {
     let now_ts = Timestamp::now().0;
     let entry = make_entry(target, make_msg_id(50), now_ts, MailboxClass::PosChallenge);
 
-    let ack_count = router.publish(&target, entry).await.unwrap();
+    let ack_count = router.publish(entry, None).await.unwrap();
     assert_eq!(ack_count, 1, "the single peer must ack");
 
     // Check avail_ewma was raised.
@@ -936,7 +945,7 @@ async fn dr_walk_expands_to_next_batch_when_first_misses() {
     let pointer_payload = viaticum_core::types::to_cbor_bytes(&pointer);
 
     let pointer_entry = MailboxEntry {
-        target: my_master_pub,
+        target: MailboxAddress::for_master(&my_master_pub),
         msg_id: make_msg_id(88),
         class: MailboxClass::SelfPointer,
         payload_version: 1,
@@ -980,4 +989,177 @@ async fn dr_walk_expands_to_next_batch_when_first_misses() {
         unique_fetched.len(),
         first_batch_size
     );
+}
+
+// ============================================================
+// CROWN-1 C2: router ↔ REAL postman handlers (InProcessPostmanNet)
+// ============================================================
+//
+// These go through `handle_mailbox_store` / `handle_mailbox_fetch` on real redb, so
+// the router's wire (entry.target as the only address, target_sig, target_proof) is
+// checked against the actual postman rules rather than a mock that acks anything.
+
+use crate::daemon::mailbox::test_postman::InProcessPostmanNet;
+use viaticum_core::mailbox::seal::{RendezvousEpoch, RendezvousKeys};
+use viaticum_core::mailbox::sign_store;
+
+/// A router whose DB knows `n` postmen, all reachable through one in-process net.
+fn router_over_postmen(
+    n: usize,
+    requester_master: IdentityPub,
+    requester_device: DeviceId,
+) -> (MailboxRouter, Arc<InProcessPostmanNet>, Vec<DeviceId>) {
+    let db = test_db();
+    let devices: Vec<DeviceId> = (0..n).map(|_| gen_device_id()).collect();
+    for d in &devices {
+        db.upsert_peer(&make_peer_record(
+            *d,
+            INITIAL_TRUST_P,
+            0.0,
+            AVAIL_EWMA_INITIAL,
+        ))
+        .unwrap();
+    }
+    let net = Arc::new(InProcessPostmanNet::new(
+        &devices,
+        requester_master,
+        requester_device,
+    ));
+    let router = MailboxRouter::with_sender(Arc::clone(&net) as Arc<dyn MailboxNetworkSender>, db);
+    (router, net, devices)
+}
+
+fn signed_pointer_entry(master_key: &ed25519_dalek::SigningKey, generation: u32) -> MailboxEntry {
+    let pointer = sign_self_pointer(
+        master_key,
+        generation,
+        BlockRef {
+            block_id: SourceBlockId([0xC2; 32]),
+            encrypted_size: 64,
+            holders: vec![],
+        },
+        vec![],
+        Timestamp::now(),
+    );
+    let now = Timestamp::now().0;
+    MailboxEntry {
+        target: MailboxAddress::for_master(&viaticum_core::cluster::master_identity(master_key)),
+        msg_id: [generation as u8; 16],
+        class: MailboxClass::SelfPointer,
+        payload_version: 1,
+        payload: viaticum_core::types::to_cbor_bytes(&pointer),
+        expires_at: now + 3600,
+        stored_at: now,
+        sender: None,
+    }
+}
+
+/// C2 layout: the pointer sits in the master box, signed by the master key; every
+/// postman stores it and the DR walk (transport identity = the master) finds it.
+#[tokio::test]
+async fn signed_self_pointer_is_stored_by_real_postmen_and_found_by_dr_walk() {
+    let master_key = viaticum_core::cluster::derive_master_key(&[0x21u8; 64]).unwrap();
+    let master = viaticum_core::cluster::master_identity(&master_key);
+    let (router, net, devices) = router_over_postmen(4, master, gen_device_id());
+
+    let entry = signed_pointer_entry(&master_key, 7);
+    let sig = sign_store(&master_key, &entry);
+    let acks = router.publish(entry.clone(), Some(sig)).await.unwrap();
+    assert_eq!(acks, devices.len(), "every postman acks the signed pointer");
+    for d in &devices {
+        let held = net
+            .postman(d)
+            .db
+            .mailbox_list_for_target(&entry.target, 0)
+            .unwrap();
+        assert_eq!(held.len(), 1, "postman {d} stores the pointer");
+    }
+
+    let found = router.dr_walk_for_pointer(&master).await.unwrap();
+    assert_eq!(found.map(|p| p.generation), Some(7));
+}
+
+/// AC-7 end to end: the same pointer without `target_sig` is refused by every real
+/// postman — publish sees 0 acks and nothing is stored anywhere.
+#[tokio::test]
+async fn unsigned_self_pointer_publish_is_refused_by_real_postmen() {
+    let master_key = viaticum_core::cluster::derive_master_key(&[0x22u8; 64]).unwrap();
+    let master = viaticum_core::cluster::master_identity(&master_key);
+    let (router, net, devices) = router_over_postmen(3, master, gen_device_id());
+
+    let entry = signed_pointer_entry(&master_key, 1);
+    assert_eq!(router.publish(entry.clone(), None).await.unwrap(), 0);
+    // A signature by another key is refused as well.
+    let other = viaticum_core::cluster::derive_master_key(&[0x23u8; 64]).unwrap();
+    let forged = sign_store(&other, &entry);
+    assert_eq!(
+        router.publish(entry.clone(), Some(forged)).await.unwrap(),
+        0
+    );
+    for d in &devices {
+        assert!(
+            net.postman(d)
+                .db
+                .mailbox_list_for_target(&entry.target, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+/// AC-9 / AC-20 end to end on a rendezvous box: a proof-gated poll returns only
+/// the pointers, never the directed junk planted at the same address; without a
+/// proof (and not being the master of that address) the poll returns nothing.
+#[tokio::test]
+async fn rendezvous_poll_through_real_postmen_needs_proof_and_returns_only_pointers() {
+    let requester_device = gen_device_id();
+    let (router, _net, _devices) =
+        router_over_postmen(3, IdentityPub([0x31; 32]), requester_device);
+    let rv = RendezvousKeys::derive(&[0x24u8; 64], RendezvousEpoch::at(Timestamp::now().0));
+
+    let now = Timestamp::now().0;
+    let pointer = MailboxEntry {
+        target: rv.address,
+        msg_id: [1; 16],
+        class: MailboxClass::SelfPointer,
+        payload_version: 1,
+        payload: b"pointer".to_vec(),
+        expires_at: now + 3600,
+        stored_at: now,
+        sender: None,
+    };
+    let sig = rv.sign_store(&pointer);
+    assert_eq!(router.publish(pointer, Some(sig)).await.unwrap(), 3);
+    for i in 0..5u8 {
+        let junk = MailboxEntry {
+            target: rv.address,
+            msg_id: [0x40 + i; 16],
+            class: MailboxClass::DropNotice,
+            payload_version: 1,
+            payload: vec![0xEE; 64],
+            expires_at: now + 3600,
+            stored_at: now,
+            sender: None,
+        };
+        assert_eq!(
+            router.publish(junk, None).await.unwrap(),
+            3,
+            "junk is accepted (directed)"
+        );
+    }
+
+    let without = router.poll(&rv.address, None, None).await.unwrap();
+    assert!(
+        without.is_empty(),
+        "no proof, not the master of the box: nothing"
+    );
+
+    let proof = rv.fetch_proof(&requester_device);
+    let with = router.poll(&rv.address, Some(proof), None).await.unwrap();
+    assert_eq!(
+        with.len(),
+        1,
+        "exactly the one pointer (deduped across 3 postmen)"
+    );
+    assert_eq!(with[0].class, MailboxClass::SelfPointer);
 }

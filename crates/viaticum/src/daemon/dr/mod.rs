@@ -282,7 +282,9 @@ async fn recover_into_staging(
     // get_closest_peers drives a live DHT query toward that key and returns
     // the closest known peers with their addresses.  We dial them so they are
     // authenticated and in the DB before dr_walk_for_pointer runs.
-    let target_key = KademliaRoutingView::target_key(&my_master_pub);
+    let target_key = KademliaRoutingView::target_key(
+        &viaticum_core::mailbox::MailboxAddress::for_master(&my_master_pub),
+    );
     match swarm_handle.get_closest_peers(target_key.to_vec()).await {
         Ok(closest) => {
             tracing::info!(

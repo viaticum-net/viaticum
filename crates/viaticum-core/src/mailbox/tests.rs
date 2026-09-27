@@ -1,13 +1,15 @@
 use crate::db::testutil::test_db;
-use crate::mailbox::{MailboxClass, MailboxEngine, MailboxEntry, MailboxError};
-use crate::types::IdentityPub;
+use crate::mailbox::{
+    MailboxAddress, MailboxClass, MailboxEngine, MailboxEntry, MailboxError, check_entry_clock,
+    class_config, seal,
+};
 
 // ============================================================
 // Helpers
 // ============================================================
 
-fn make_target(seed: u8) -> IdentityPub {
-    IdentityPub([seed; 32])
+fn make_target(seed: u8) -> MailboxAddress {
+    MailboxAddress([seed; 32])
 }
 
 fn make_msg_id(seed: u8) -> [u8; 16] {
@@ -15,7 +17,7 @@ fn make_msg_id(seed: u8) -> [u8; 16] {
 }
 
 fn make_entry(
-    target: IdentityPub,
+    target: MailboxAddress,
     msg_id: [u8; 16],
     class: MailboxClass,
     payload: Vec<u8>,
@@ -651,7 +653,7 @@ fn high_trust_not_evicted_under_pressure_even_when_still_over_quota() {
 /// T-11 / AC-6: self_pointer_evicted_after_ttl_expiry
 ///
 /// TTL sweep removes a SelfPointer once expires_at < now_secs.
-/// This is the ONLY eviction path for high-trust entries.
+/// (Besides this sweep, only the monotone pointer budget at store time removes one.)
 #[test]
 fn self_pointer_evicted_after_ttl_expiry() {
     let db = test_db();
@@ -889,4 +891,325 @@ fn store_clamps_expires_at_to_class_ttl() {
         got.expires_at, scaled_expires,
         "scaled (in-bounds) expires_at must be left unchanged by the clamp"
     );
+}
+
+// ============================================================
+// CROWN-1 C2: SelfPointer budget (Q5, N5, mailbox-i23) and postman clock (N11, i22)
+// ============================================================
+
+/// Payload that makes one SelfPointer entry ≈ 200 KB: 83 of them fit into the
+/// 16 MiB budget, the 84th does not.
+const BIG: usize = 200_000;
+
+fn pointer(target: MailboxAddress, n: u32, stored_at: u64) -> MailboxEntry {
+    let mut msg_id = [0u8; 16];
+    msg_id[..4].copy_from_slice(&n.to_be_bytes());
+    MailboxEntry {
+        target,
+        msg_id,
+        class: MailboxClass::SelfPointer,
+        payload_version: 1,
+        payload: vec![0x5A; BIG],
+        expires_at: stored_at + 10_000_000,
+        stored_at,
+        sender: None,
+    }
+}
+
+/// Fill `target`'s pointer budget with pointers stored at `first_stored_at..`
+/// (each newer than the previous) up to the last one that fits WITHOUT eviction;
+/// returns how many were stored.
+fn fill_pointer_budget(db: &crate::db::Db, target: MailboxAddress, first_stored_at: u64) -> u32 {
+    let engine = MailboxEngine::new(db.clone());
+    let mut n = 0u32;
+    loop {
+        let next = pointer(target, n, first_stored_at + n as u64);
+        let used = db.mailbox_self_pointer_bytes_for_target(&target).unwrap();
+        if used + next.serialized_size() as u64 > class_config::MAX_SELF_POINTER_BYTES_PER_TARGET {
+            return n;
+        }
+        engine.store(&next, 0).unwrap();
+        n += 1;
+    }
+}
+
+fn stored_ats(db: &crate::db::Db, target: &MailboxAddress) -> Vec<u64> {
+    let mut v: Vec<u64> = db
+        .mailbox_list_for_target(target, 0)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.stored_at)
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn self_pointer_budget_evicts_oldest_on_overflow() {
+    let db = test_db();
+    let engine = MailboxEngine::new(db.clone());
+    let target = make_target(40);
+
+    let n = fill_pointer_budget(&db, target, 1000);
+    assert!(n > 10, "budget should hold many 200 KB pointers, held {n}");
+    let before = stored_ats(&db, &target);
+
+    // A newer pointer arrives: the single oldest (1000) makes room for it.
+    engine.store(&pointer(target, 9_999, 5_000), 0).unwrap();
+    let after = stored_ats(&db, &target);
+    assert_eq!(after.len(), before.len(), "one out, one in");
+    assert_eq!(after[0], 1001, "the oldest pointer was evicted");
+    assert_eq!(*after.last().unwrap(), 5_000, "the new pointer is stored");
+    assert!(
+        db.mailbox_self_pointer_bytes_for_target(&target).unwrap()
+            <= class_config::MAX_SELF_POINTER_BYTES_PER_TARGET
+    );
+}
+
+/// N5: a postman that saw an owner-signed pointer can replay it later; when the
+/// budget is full of NEWER pointers the replay must not evict any of them.
+#[test]
+fn replayed_older_pointer_does_not_evict_newer() {
+    let db = test_db();
+    let engine = MailboxEngine::new(db.clone());
+    let target = make_target(41);
+    let fitted = fill_pointer_budget(&db, target, 2_000);
+    assert!(fitted > 10);
+    let before = stored_ats(&db, &target);
+
+    let replay = pointer(target, 50_000, 1_500); // older than every stored pointer
+    let res = engine.store(&replay, 0);
+    assert!(
+        matches!(res, Err(MailboxError::QuotaExceeded { .. })),
+        "an older pointer that does not fit must be refused, got {res:?}"
+    );
+    assert_eq!(stored_ats(&db, &target), before, "nothing was evicted");
+}
+
+#[test]
+fn self_pointer_eviction_never_touches_other_targets() {
+    let db = test_db();
+    let engine = MailboxEngine::new(db.clone());
+    let full = make_target(42);
+    let other = make_target(43);
+    engine.store(&pointer(other, 1, 10), 0).unwrap();
+    engine
+        .store(
+            &make_entry(
+                full,
+                make_msg_id(9),
+                MailboxClass::DropNotice,
+                vec![1; 100],
+                10,
+                1_000_000,
+            ),
+            0,
+        )
+        .unwrap();
+    fill_pointer_budget(&db, full, 100);
+    engine.store(&pointer(full, 77_777, 10_000), 0).unwrap();
+
+    assert_eq!(stored_ats(&db, &other), vec![10], "other address untouched");
+    let classes: Vec<MailboxClass> = db
+        .mailbox_list_for_target(&full, 0)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.class)
+        .collect();
+    assert!(
+        classes.contains(&MailboxClass::DropNotice),
+        "pointer eviction must not remove directed mail"
+    );
+}
+
+/// AC-8 at the engine: the general quota is full of directed junk, a pointer is
+/// still stored (pointers have their own budget).
+#[test]
+fn self_pointer_store_bypasses_full_general_quota() {
+    let db = test_db();
+    let engine = MailboxEngine::new(db.clone());
+    let target = make_target(44);
+    let mut i = 0u32;
+    loop {
+        let mut junk = make_entry(
+            target,
+            [0; 16],
+            MailboxClass::DropNotice,
+            vec![0xEE; BIG],
+            10,
+            1_000_000,
+        );
+        junk.msg_id[..4].copy_from_slice(&i.to_be_bytes());
+        match engine.store(&junk, 0) {
+            Ok(()) => i += 1,
+            Err(MailboxError::QuotaExceeded { .. }) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert!(
+        i > 100,
+        "general quota should hold > 100 junk entries, held {i}"
+    );
+    engine.store(&pointer(target, 1, 10), 0).unwrap();
+    assert_eq!(stored_ats(&db, &target).len() as u32, i + 1);
+}
+
+/// mailbox-i23: the owner's pointers do not consume the directed quota.
+#[test]
+fn directed_quota_does_not_count_self_pointers() {
+    let db = test_db();
+    let engine = MailboxEngine::new(db.clone());
+    let target = make_target(45);
+    fill_pointer_budget(&db, target, 100);
+    let pointer_bytes = db.mailbox_self_pointer_bytes_for_target(&target).unwrap();
+    assert!(pointer_bytes > 15 * 1024 * 1024);
+    // Directed mail up to (almost) the full general quota is still accepted.
+    let per = make_entry(
+        target,
+        [0; 16],
+        MailboxClass::DropNotice,
+        vec![0xEE; BIG],
+        10,
+        1_000_000,
+    )
+    .serialized_size() as u64;
+    // +8: msg_id bytes >= 24 encode as 2 CBOR bytes, so later entries are a bit larger.
+    let fits = class_config::MAX_MAILBOX_BYTES_PER_PEER / (per + 8);
+    for i in 0..fits as u32 {
+        let mut e = make_entry(
+            target,
+            [0; 16],
+            MailboxClass::DropNotice,
+            vec![0xEE; BIG],
+            10,
+            1_000_000,
+        );
+        e.msg_id[..4].copy_from_slice(&i.to_be_bytes());
+        engine
+            .store(&e, 0)
+            .unwrap_or_else(|err| panic!("directed #{i} refused: {err}"));
+    }
+}
+
+#[test]
+fn duplicate_self_pointer_at_full_budget_evicts_nothing() {
+    let db = test_db();
+    let engine = MailboxEngine::new(db.clone());
+    let target = make_target(46);
+    fill_pointer_budget(&db, target, 100);
+    let before = stored_ats(&db, &target);
+    // Re-store the NEWEST stored pointer (same msg_id): Duplicate, no eviction.
+    let newest = (before.len() - 1) as u32;
+    let res = engine.store(&pointer(target, newest, 100 + newest as u64), 0);
+    assert!(matches!(res, Err(MailboxError::Duplicate)), "got {res:?}");
+    assert_eq!(stored_ats(&db, &target), before);
+}
+
+#[test]
+fn check_entry_clock_rejects_already_expired_entry() {
+    let now = 5_000_000;
+    let mut e = make_entry(
+        make_target(47),
+        make_msg_id(1),
+        MailboxClass::PosChallenge,
+        vec![],
+        now,
+        10,
+    );
+    e.expires_at = now;
+    assert!(matches!(
+        check_entry_clock(&e, now),
+        Err(MailboxError::ClockSkew { .. })
+    ));
+    e.expires_at = now - 1;
+    assert!(matches!(
+        check_entry_clock(&e, now),
+        Err(MailboxError::ClockSkew { .. })
+    ));
+    e.expires_at = now + 1;
+    assert!(check_entry_clock(&e, now).is_ok());
+}
+
+#[test]
+fn check_entry_clock_rejects_self_pointer_more_than_an_epoch_away() {
+    let epoch = seal::RENDEZVOUS_EPOCH_SECS;
+    let now = 10 * epoch;
+    for (stored_at, ok) in [
+        (now, true),
+        (now + epoch, true),
+        (now - epoch, true),
+        (now + epoch + 1, false),
+        (now - epoch - 1, false),
+    ] {
+        let mut e = pointer(make_target(48), 1, stored_at);
+        e.expires_at = now + 1_000;
+        assert_eq!(
+            check_entry_clock(&e, now).is_ok(),
+            ok,
+            "stored_at offset {}",
+            stored_at as i128 - now as i128
+        );
+    }
+    // The stored_at rule is for pointers only: directed mail is judged by expiry.
+    let mut d = make_entry(
+        make_target(48),
+        make_msg_id(2),
+        MailboxClass::DropNotice,
+        vec![],
+        0,
+        0,
+    );
+    d.expires_at = now + 1_000;
+    assert!(check_entry_clock(&d, now).is_ok());
+}
+
+/// Review WARN-1 / mailbox-i31: concurrent pointer stores into one address whose
+/// budget holds exactly one pointer. The duplicate check, budget, monotone eviction
+/// and insert are one write transaction, so however the 16 stores interleave the
+/// budget is never exceeded and the NEWEST pointer is the one that remains (it can
+/// always evict the older ones; nothing can evict it). Many rounds, because a split
+/// check/evict/insert only fails on some interleavings (reviewer demo: 3/10).
+#[test]
+fn concurrent_self_pointer_stores_respect_budget_and_keep_newest() {
+    use std::sync::{Arc, Barrier};
+    const WRITERS: u32 = 16;
+    let small = |target, n: u32| {
+        let mut e = pointer(target, n, 1_000 + n as u64);
+        e.payload = vec![0x5A; 512];
+        e
+    };
+    for round in 0..40u8 {
+        let db = test_db();
+        let target = make_target(round);
+        let budget = small(target, 0).serialized_size() as u64;
+        let barrier = Arc::new(Barrier::new(WRITERS as usize));
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|n| {
+                let db = db.clone();
+                let barrier = Arc::clone(&barrier);
+                let e = small(target, n);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    MailboxEngine::new(db).store_with_pointer_budget(&e, 0, budget)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let used = db.mailbox_self_pointer_bytes_for_target(&target).unwrap();
+        assert!(
+            used <= budget,
+            "round {round}: budget {budget} exceeded: {used}"
+        );
+        assert_eq!(
+            stored_ats(&db, &target),
+            vec![1_000 + (WRITERS - 1) as u64],
+            "round {round}: only the newest pointer remains"
+        );
+        assert!(
+            results[(WRITERS - 1) as usize].is_ok(),
+            "round {round}: the newest pointer was refused: {:?}",
+            results[(WRITERS - 1) as usize]
+        );
+    }
 }

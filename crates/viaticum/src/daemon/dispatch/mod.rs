@@ -760,7 +760,7 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
             Ok(payload) => {
                 // Build storage-relationship target-master set.
                 use std::collections::HashSet;
-                use viaticum_core::mailbox::{MailboxClass, MailboxEntry};
+                use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
                 use viaticum_core::types::IdentityPub;
 
                 let my_master: IdentityPub =
@@ -846,7 +846,7 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
                     for target_master in &target_masters {
                         let msg_id: [u8; 16] = rand::random();
                         let entry = MailboxEntry {
-                            target: *target_master,
+                            target: MailboxAddress::for_master(target_master),
                             msg_id,
                             class: MailboxClass::Revocation,
                             payload_version: 1,
@@ -855,7 +855,7 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
                             stored_at: now_secs,
                             sender: Some(my_master),
                         };
-                        match mailbox_router.publish(target_master, entry).await {
+                        match mailbox_router.publish(entry, None).await {
                             Ok(0) => {
                                 zero_ack_targets += 1;
                                 tracing::warn!(

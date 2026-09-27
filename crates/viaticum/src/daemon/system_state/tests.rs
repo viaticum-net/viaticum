@@ -184,6 +184,58 @@ mod t8 {
 
     // ─── Tests ───────────────────────────────────────────────────────────────
 
+    /// CROWN-1 C2 (mailbox-i10, AC-7): the publisher signs the pointer store with the
+    /// key of the box it writes to, and REAL postman handlers accept it. Without the
+    /// signature every postman refuses (`Unauthorized`) and the pointer is never
+    /// published — DR would find nothing. Mocks cannot see this; the in-process
+    /// postman net runs the actual `handle_mailbox_store` on a real redb.
+    #[tokio::test]
+    async fn publish_pointer_step_is_accepted_by_real_postmen() {
+        use crate::daemon::mailbox::test_postman::InProcessPostmanNet;
+
+        let db = test_db();
+        let (_pointer, master_key, my_master_pub, block_id, holder) = build_placed_pointer(&db);
+        let net = Arc::new(InProcessPostmanNet::new(&[holder], my_master_pub, holder));
+        let router = MailboxRouter::with_sender(
+            Arc::clone(&net) as Arc<dyn MailboxNetworkSender>,
+            db.clone(),
+        );
+        let current_pointer: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
+        let now_secs = Timestamp::now().0;
+
+        let (key, published_at) = publish_pointer_step(
+            &db,
+            &router,
+            &master_key,
+            &my_master_pub,
+            &current_pointer,
+            1,
+            &block_id,
+            &[],
+            None,
+            0,
+            now_secs,
+            1,
+        )
+        .await;
+
+        assert!(
+            key.is_some(),
+            "publication counted: >= 1 real postman acked"
+        );
+        assert_eq!(published_at, now_secs);
+        let held = net
+            .postman(&holder)
+            .db
+            .mailbox_list_for_target(
+                &viaticum_core::mailbox::MailboxAddress::for_master(&my_master_pub),
+                0,
+            )
+            .unwrap();
+        assert_eq!(held.len(), 1, "the postman stored the pointer");
+        assert_eq!(held[0].class, MailboxClass::SelfPointer);
+    }
+
     /// T-8 spec (Fix 1, WARN-2): publish_pointer_step with a placed base and
     /// last_key=None/last_publish_at=0 → one SelfPointer-class entry published to
     /// my_master_pub, TTL == SELF_POINTER_TTL (5y), sender == Some(my_master_pub),
@@ -231,7 +283,8 @@ mod t8 {
 
         let (_, stored_entry) = &calls[0];
         assert_eq!(
-            stored_entry.target, my_master_pub,
+            stored_entry.target,
+            viaticum_core::mailbox::MailboxAddress::for_master(&my_master_pub),
             "entry must target my_master_pub"
         );
         assert_eq!(
@@ -733,7 +786,7 @@ mod t8 {
 
         // Feed gen=2 to dispatch_self_pointer. Starts with None → should update.
         let entry = MailboxEntry {
-            target: my_master_pub,
+            target: viaticum_core::mailbox::MailboxAddress::for_master(&my_master_pub),
             msg_id: [1u8; 16],
             class: MailboxClass::SelfPointer,
             payload_version: 1,
@@ -756,7 +809,7 @@ mod t8 {
         let pointer_gen1 = sign_self_pointer(&master_key, 1, block_ref, vec![], Timestamp::now());
         let payload_gen1 = to_cbor_bytes(&pointer_gen1);
         let entry_low = MailboxEntry {
-            target: my_master_pub,
+            target: viaticum_core::mailbox::MailboxAddress::for_master(&my_master_pub),
             msg_id: [2u8; 16],
             class: MailboxClass::SelfPointer,
             payload_version: 1,

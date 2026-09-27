@@ -974,7 +974,10 @@ async fn revocation_published_only_to_storage_relationship_peers() {
 
     // Drain all mailbox store requests.
     let stored = sender.stored.lock().await;
-    let targets: std::collections::HashSet<_> = stored.iter().map(|r| r.entry.target).collect();
+    let targets: std::collections::HashSet<_> = stored
+        .iter()
+        .map(|r| IdentityPub(r.entry.target.0))
+        .collect();
 
     // Must include H1's master and O1's master.
     assert!(
@@ -1127,7 +1130,10 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
 
     // Collect unique targets published to.
     let stored = sender.stored.lock().await;
-    let targets: Vec<_> = stored.iter().map(|r| r.entry.target).collect();
+    let targets: Vec<_> = stored
+        .iter()
+        .map(|r| IdentityPub(r.entry.target.0))
+        .collect();
     let target_count = targets.iter().filter(|&&t| t == p_master).count();
 
     // The router may send to multiple postman devices but with same target in each publish call.

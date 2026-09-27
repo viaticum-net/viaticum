@@ -1,6 +1,6 @@
 use crate::constants::{HANDSHAKE_FRESHNESS_SECS, MAX_MESSAGE_SIZE, PROTOCOL_VERSION};
 use crate::erasure::Symbol;
-use crate::mailbox::{MailboxEntry, MailboxRejectReason};
+use crate::mailbox::{MailboxAddress, MailboxEntry, MailboxRejectReason};
 use crate::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp, sig_serde};
 use ed25519_dalek::Signer;
 
@@ -336,12 +336,26 @@ pub struct AckMsg {
 // Mailbox wire types (T-3)
 // ============================================================
 
-/// Sender → Postman. Store a mailbox entry for `target`.
+/// Wire version of `MailboxStoreRequest` / `MailboxFetchRequest` /
+/// `MailboxFetchResponse` (CROWN-1 C2: `target: MailboxAddress`, `target_sig`,
+/// `target_proof`).
+pub const MAILBOX_WIRE_VERSION: u8 = 2;
+
+/// Sender → Postman. Store a mailbox entry.
+///
+/// `v = 2` (CROWN-1 C2): the box address comes ONLY from `entry.target` — the old
+/// duplicate top-level `target` let the candidate-set check and the storage key use
+/// different addresses (F3, AC-10).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MailboxStoreRequest {
     pub v: u8,
-    pub target: IdentityPub,
     pub entry: MailboxEntry,
+    /// Signature by the secret key of `entry.target` over
+    /// `mailbox::store_sig_input(&entry)`. REQUIRED for class SelfPointer (only the
+    /// key holder writes a pointer box); ignored for directed classes (a sender never
+    /// holds the recipient's key).
+    #[serde(default, with = "crate::types::opt_sig_serde")]
+    pub target_sig: Option<[u8; 64]>,
 }
 
 /// Postman → Sender. Store response.
@@ -356,14 +370,22 @@ pub enum MailboxStoreResponse {
     },
 }
 
-/// Target → Postman. Fetch all entries addressed to me.
+/// Key holder → Postman. Fetch the entries of a box.
+///
+/// `v = 2` (CROWN-1 C2). Allowed when `target` is the requester's own master box
+/// (authenticated by the transport), or with `target_proof` — then only
+/// SelfPointer entries are served (mailbox-i20).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MailboxFetchRequest {
     pub v: u8,
-    /// Target = my own master_pub (fetching my own mail).
-    pub target: IdentityPub,
+    pub target: MailboxAddress,
     /// Only return entries newer than this timestamp (optional, for incremental polling).
     pub since_stored_at: Option<u64>,
+    /// Proof of holding the secret key of `target`, bound to the requester's device
+    /// (`mailbox::sign_fetch_proof`). Required unless `target` is the requester's
+    /// authenticated master identity.
+    #[serde(default, with = "crate::types::opt_sig_serde")]
+    pub target_proof: Option<[u8; 64]>,
 }
 
 /// Postman → Target. Fetch response.

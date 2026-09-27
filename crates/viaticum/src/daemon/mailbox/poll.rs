@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use viaticum_core::constants::MAILBOX_POLL_INTERVAL_SECS;
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::{MailboxClass, MailboxEntry};
+use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::messages::{
     PosHashResponseMsg, SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, to_cbor,
 };
@@ -101,7 +101,10 @@ pub async fn run_mailbox_poll(
                     .as_secs();
 
                 // Poll our own mailbox from read-fanout peers.
-                let entries = match router.poll(&my_master_pub, None).await {
+                let entries = match router
+                    .poll(&MailboxAddress::for_master(&my_master_pub), None, None)
+                    .await
+                {
                     Ok(e) => e,
                     Err(err) => {
                         warn!(err = %err, "mailbox_poll: poll failed");
@@ -212,7 +215,7 @@ async fn dispatch_pos_challenge(
     // documents and enforces the routing invariant: a buggy or hostile postman that
     // returns a mis-targeted entry is rejected here rather than processed.
     // `dispatch_self_pointer` makes the same own-vs-postman distinction.
-    if &entry.target != my_master_pub {
+    if entry.target != MailboxAddress::for_master(my_master_pub) {
         warn!(
             msg_id = ?entry.msg_id,
             entry_target = ?entry.target,
@@ -303,7 +306,7 @@ async fn dispatch_pos_challenge(
             };
 
             let response_entry = MailboxEntry {
-                target: owner_master,
+                target: MailboxAddress::for_master(&owner_master),
                 msg_id,
                 class: MailboxClass::PosResponse,
                 payload_version: 1,
@@ -316,7 +319,7 @@ async fn dispatch_pos_challenge(
                 sender: Some(*my_master_pub),
             };
 
-            match router.publish(&owner_master, response_entry).await {
+            match router.publish(response_entry, None).await {
                 Ok(0) => {
                     warn!(
                         owner = %owner_master,
@@ -414,7 +417,7 @@ pub(crate) fn dispatch_self_pointer(
     entry: MailboxEntry,
     _now_secs: u64,
 ) {
-    if &entry.target == my_master_pub {
+    if entry.target == MailboxAddress::for_master(my_master_pub) {
         // Own SelfPointer returned from candidate-set — verify, do NOT store (W-2).
         match from_cbor_bytes::<SelfPointer>(&entry.payload) {
             Ok(pointer) => {
@@ -484,7 +487,7 @@ pub(crate) fn dispatch_drop_notice(
     // gated by holder-sig verification + a placement check, but this guard enforces
     // the routing invariant — a buggy or hostile postman that returns a mis-targeted
     // entry is rejected here. Mirrors `dispatch_pos_challenge`.
-    if &entry.target != my_master_pub {
+    if entry.target != MailboxAddress::for_master(my_master_pub) {
         warn!(
             msg_id = ?entry.msg_id,
             entry_target = ?entry.target,
@@ -541,7 +544,7 @@ pub(crate) async fn dispatch_delete_request(
     // DeleteRequest that reaches dispatch must be addressed to us. The handler already
     // re-authenticates (owner-sig verify + holding lookup keyed on owner), but this
     // guard enforces the routing invariant. Mirrors `dispatch_pos_challenge`.
-    if &entry.target != my_master_pub {
+    if entry.target != MailboxAddress::for_master(my_master_pub) {
         warn!(
             msg_id = ?entry.msg_id,
             entry_target = ?entry.target,
@@ -588,7 +591,7 @@ pub(crate) async fn dispatch_revocation(
     // Revocation that reaches dispatch must be addressed to us. The handler already
     // verifies both certs against the revoking master, but this guard enforces the
     // routing invariant. Mirrors `dispatch_pos_challenge`.
-    if &entry.target != my_master_pub {
+    if entry.target != MailboxAddress::for_master(my_master_pub) {
         warn!(
             msg_id = ?entry.msg_id,
             entry_target = ?entry.target,

@@ -16,7 +16,9 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use viaticum_core::constants::MAILBOX_POINTER_REPUBLISH_SECS;
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::{MailboxClass, MailboxEntry, class_config};
+use viaticum_core::mailbox::{
+    MailboxAddress, MailboxClass, MailboxEntry, class_config, sign_store,
+};
 use viaticum_core::system_state::{
     SelfPointer, SystemState, diff_states, pack_system_state, restore_db, snapshot_db,
 };
@@ -92,8 +94,9 @@ pub fn decrypt_and_restore(db: &Db, blob: &[u8], seed: &[u8]) -> anyhow::Result<
 /// Periodically publish the SystemState as regular blocks + a signed self-pointer.
 ///
 /// T-8: replaces the former push-to-all pointer fanout with mailbox publish.
-/// The SelfPointer is published to `mailbox_router.publish(&my_master_pub, entry)` with
-/// class=SelfPointer and TTL=5 years. Republish policy (store-and-forward — not every tick):
+/// The SelfPointer is published to our master box (`MailboxAddress::for_master`) via
+/// `mailbox_router.publish(entry, Some(target_sig))`, signed by the master key (the key of
+/// that box, CROWN-1 C2; C3 moves it to the rendezvous box), class=SelfPointer, TTL=5 years. Republish policy (store-and-forward — not every tick):
 ///   - Publish when (a) the pointer structurally changed (generation or block_ids differ), OR
 ///   - (b) 30 days have elapsed since last publish (`MAILBOX_POINTER_REPUBLISH_SECS`).
 ///   - Skip otherwise (mailbox is store-and-forward with 5y TTL — no need to flood every 6h).
@@ -353,7 +356,7 @@ pub(crate) async fn publish_pointer_step(
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
 
     let entry = MailboxEntry {
-        target: *my_master_pub,
+        target: MailboxAddress::for_master(my_master_pub),
         msg_id,
         class: MailboxClass::SelfPointer,
         payload_version: 1,
@@ -363,7 +366,12 @@ pub(crate) async fn publish_pointer_step(
         sender: Some(*my_master_pub),
     };
 
-    match mailbox_router.publish(my_master_pub, entry).await {
+    // CROWN-1 C2: the postman accepts a SelfPointer only with a store signature by
+    // the box key. The box is still our master box here, so the key is the master
+    // key (C3 moves the pointer to the seed-derived rendezvous box and signs with
+    // its key instead).
+    let target_sig = sign_store(master_key, &entry);
+    match mailbox_router.publish(entry, Some(target_sig)).await {
         Ok(0) => {
             warn!(
                 generation,

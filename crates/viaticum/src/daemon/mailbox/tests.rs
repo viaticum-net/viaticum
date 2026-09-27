@@ -1,12 +1,12 @@
 use super::candidate::{KademliaRoutingView, should_store};
 use libp2p::PeerId;
 use sha2::{Digest, Sha256};
-use viaticum_core::types::IdentityPub;
+use viaticum_core::mailbox::MailboxAddress;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn random_identity_pub() -> IdentityPub {
-    IdentityPub(rand::random())
+fn random_address() -> MailboxAddress {
+    MailboxAddress(rand::random())
 }
 
 /// Build N random peer IDs.
@@ -16,7 +16,7 @@ fn random_peers(n: usize) -> Vec<PeerId> {
 
 /// For a given target, sort a list of peers by XOR distance and return
 /// the rank (0-based) of `needle` in that ordering.
-fn rank_in_set(target: &IdentityPub, peers: &[PeerId], needle: &PeerId) -> usize {
+fn rank_in_set(target: &MailboxAddress, peers: &[PeerId], needle: &PeerId) -> usize {
     let target_key = KademliaRoutingView::target_key(target);
     let needle_key = KademliaRoutingView::peer_key(needle);
     let needle_dist = KademliaRoutingView::xor_distance(&target_key, &needle_key);
@@ -39,7 +39,7 @@ fn rank_in_set(target: &IdentityPub, peers: &[PeerId], needle: &PeerId) -> usize
 #[test]
 fn should_store_true_on_empty_routing_table() {
     let view = KademliaRoutingView::new(vec![]);
-    let target = random_identity_pub();
+    let target = random_address();
     let my_peer_id = PeerId::random();
     assert!(should_store(&view, &target, &my_peer_id, 1000));
 }
@@ -47,7 +47,7 @@ fn should_store_true_on_empty_routing_table() {
 #[test]
 fn should_store_true_when_in_top_n() {
     // Create a fixed target and 100 peers.
-    let target = random_identity_pub();
+    let target = random_address();
     let mut peers: Vec<PeerId> = random_peers(100);
     // Insert our peer_id into the list and find its rank.
     let my_peer_id = PeerId::random();
@@ -68,7 +68,7 @@ fn should_store_true_when_in_top_n() {
 
 #[test]
 fn should_store_false_when_beyond_top_n() {
-    let target = random_identity_pub();
+    let target = random_address();
     let mut peers: Vec<PeerId> = random_peers(100);
     let my_peer_id = PeerId::random();
     peers.push(my_peer_id);
@@ -92,7 +92,7 @@ fn should_store_false_when_beyond_top_n() {
 #[test]
 fn should_store_true_when_only_known_peer() {
     // Routing table has only my_peer_id itself. Rank = 0 < any N.
-    let target = random_identity_pub();
+    let target = random_address();
     let my_peer_id = PeerId::random();
     let view = KademliaRoutingView::new(vec![my_peer_id]);
     assert!(should_store(&view, &target, &my_peer_id, 1));
@@ -102,7 +102,7 @@ fn should_store_true_when_only_known_peer() {
 fn should_store_respects_candidates_n_boundary() {
     // Build exactly N peers that are all closer than us to the target.
     // To achieve deterministic ordering, we compute distances manually.
-    let target = random_identity_pub();
+    let target = random_address();
     let target_key = KademliaRoutingView::target_key(&target);
 
     let my_peer_id = PeerId::random();
@@ -146,8 +146,8 @@ fn should_store_respects_candidates_n_boundary() {
 }
 
 #[test]
-fn target_key_is_sha256_of_identity_pub() {
-    let target = IdentityPub([42u8; 32]);
+fn target_key_is_sha256_of_address() {
+    let target = MailboxAddress([42u8; 32]);
     let got = KademliaRoutingView::target_key(&target);
 
     let mut hasher = Sha256::new();
@@ -197,7 +197,7 @@ fn xor_distance_smaller_means_closer() {
 fn should_store_large_network_top_1000_check() {
     // Simulate N=1000 with 2000 total peers. We pick our peer to be
     // in the top-1000 by construction.
-    let target = random_identity_pub();
+    let target = random_address();
     let target_key = KademliaRoutingView::target_key(&target);
 
     let my_peer_id = PeerId::random();

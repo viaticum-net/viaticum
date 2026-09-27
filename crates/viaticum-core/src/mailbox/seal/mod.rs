@@ -185,10 +185,9 @@ impl SealedMailboxEntry {
         &self.entry
     }
 
-    /// The box this envelope is addressed to (by value: until C2 retypes
-    /// `MailboxEntry.target`, the entry stores the same 32 bytes as `IdentityPub`).
+    /// The box this envelope is addressed to.
     pub fn target(&self) -> MailboxAddress {
-        MailboxAddress(self.entry.target.0)
+        self.entry.target
     }
 
     /// Store signature by the target's key: `Some` for SelfPointer, `None` for directed.
@@ -517,7 +516,7 @@ fn envelope(
     stored_at: u64,
 ) -> MailboxEntry {
     MailboxEntry {
-        target: IdentityPub(target.0),
+        target,
         msg_id,
         class,
         payload_version: SEALED_PAYLOAD_VERSION,

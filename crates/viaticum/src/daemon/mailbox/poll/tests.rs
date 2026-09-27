@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::{MailboxClass, MailboxEntry};
+use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::messages::{
     PosHashResponseMsg, SymbolDropNoticeBatchMsg, build_signed_symbol_drop_notice, to_cbor,
 };
@@ -31,7 +31,7 @@ fn make_identity(seed: u8) -> IdentityPub {
 fn make_entry(class: MailboxClass, target: IdentityPub, payload: Vec<u8>) -> MailboxEntry {
     let now = Timestamp::now().0;
     MailboxEntry {
-        target,
+        target: MailboxAddress::for_master(&target),
         msg_id: [1u8; 16],
         class,
         payload_version: 1,
@@ -101,7 +101,7 @@ async fn poll_self_pointer_own_not_stored_in_db() {
 
     // Mailbox DB should have no entries for my_master.
     let entries = db
-        .mailbox_list_for_target(&my_master, now_secs)
+        .mailbox_list_for_target(&MailboxAddress::for_master(&my_master), now_secs)
         .expect("list");
     assert!(
         entries.is_empty(),
@@ -133,7 +133,7 @@ async fn poll_does_not_store_foreign_self_pointer() {
     // Mailbox DB must have NOTHING stored for the foreign target — the foreign-store
     // path was removed (CS-MBX-3).
     let entries = db
-        .mailbox_list_for_target(&foreign_target, now_secs)
+        .mailbox_list_for_target(&MailboxAddress::for_master(&foreign_target), now_secs)
         .expect("list");
     assert!(
         entries.is_empty(),
@@ -194,7 +194,7 @@ async fn poll_drop_notice_no_sender_does_not_panic() {
     // Entry with no sender — dispatch_drop_notice exits early before verifying.
     let my_master = make_identity(0xAA);
     let entry = MailboxEntry {
-        target: my_master,
+        target: MailboxAddress::for_master(&my_master),
         msg_id: [2u8; 16],
         class: MailboxClass::DropNotice,
         payload_version: 1,
@@ -220,7 +220,7 @@ async fn poll_drop_notice_bad_payload_does_not_panic() {
     let now_secs = Timestamp::now().0;
     let my_master = make_identity(0xAA);
     let entry = MailboxEntry {
-        target: my_master,
+        target: MailboxAddress::for_master(&my_master),
         msg_id: [3u8; 16],
         class: MailboxClass::DropNotice,
         payload_version: 1,
@@ -352,7 +352,7 @@ async fn drop_notice_batch_dispatch_marks_each_placement_lost() {
     let payload = to_cbor(&batch).expect("encode batch");
 
     let entry = MailboxEntry {
-        target: owner_master,
+        target: MailboxAddress::for_master(&owner_master),
         msg_id: [4u8; 16],
         class: MailboxClass::DropNotice,
         payload_version: 1,
@@ -503,7 +503,7 @@ async fn drop_notice_immediate_deadline_triggers_repair_now() {
     let payload = to_cbor(&batch).expect("encode");
 
     let entry = MailboxEntry {
-        target: owner_master,
+        target: MailboxAddress::for_master(&owner_master),
         msg_id: [0xCCu8; 16],
         class: MailboxClass::DropNotice,
         payload_version: 1,
@@ -634,7 +634,7 @@ async fn drop_notice_forged_signature_is_rejected() {
 
     // entry.sender = holder_master, but sig is from attacker_key → mismatch.
     let entry = MailboxEntry {
-        target: owner_master,
+        target: MailboxAddress::for_master(&owner_master),
         msg_id: [0xDDu8; 16],
         class: MailboxClass::DropNotice,
         payload_version: 1,
@@ -700,7 +700,7 @@ fn make_delete_entry(
     let payload = to_cbor(&payload_obj).expect("encode");
     let now = Timestamp::now().0;
     MailboxEntry {
-        target,
+        target: MailboxAddress::for_master(&target),
         msg_id: [0xDAu8; 16],
         class: MailboxClass::DeleteRequest,
         payload_version: 1,
@@ -769,7 +769,7 @@ async fn delete_request_forged_signature_rejected() {
     let now = Timestamp::now().0;
     // entry.sender = real_owner, but sig is from attacker_key → mismatch.
     let entry = MailboxEntry {
-        target: make_identity(0xFF),
+        target: MailboxAddress::for_master(&make_identity(0xFF)),
         msg_id: [0xBCu8; 16],
         class: MailboxClass::DeleteRequest,
         payload_version: 1,
@@ -830,7 +830,7 @@ async fn delete_request_stale_timestamp_still_honored() {
     let payload = to_cbor(&payload_obj).expect("encode");
     let now = Timestamp::now().0;
     let entry = MailboxEntry {
-        target: make_identity(0xFF),
+        target: MailboxAddress::for_master(&make_identity(0xFF)),
         msg_id: [0xCDu8; 16],
         class: MailboxClass::DeleteRequest,
         payload_version: 1,
@@ -873,7 +873,7 @@ async fn delete_request_no_sender_is_dropped_gracefully() {
 
     let now = Timestamp::now().0;
     let entry = MailboxEntry {
-        target: make_identity(0xFF),
+        target: MailboxAddress::for_master(&make_identity(0xFF)),
         msg_id: [0xDEu8; 16],
         class: MailboxClass::DeleteRequest,
         payload_version: 1,
@@ -960,7 +960,7 @@ async fn revocation_dispatch_marks_device_revoked() {
     let payload = to_cbor(&broadcast).expect("encode");
     let now = Timestamp::now().0;
     let entry = MailboxEntry {
-        target: make_identity(0xFF), // target = us (the receiving peer)
+        target: MailboxAddress::for_master(&make_identity(0xFF)), // target = us (the receiving peer)
         msg_id: [0xE0u8; 16],
         class: MailboxClass::Revocation,
         payload_version: 1,
@@ -1004,7 +1004,7 @@ async fn revocation_forged_signature_rejected() {
     let payload = to_cbor(&broadcast).expect("encode");
     let now = Timestamp::now().0;
     let entry = MailboxEntry {
-        target: make_identity(0xFF),
+        target: MailboxAddress::for_master(&make_identity(0xFF)),
         msg_id: [0xE1u8; 16],
         class: MailboxClass::Revocation,
         payload_version: 1,
@@ -1046,7 +1046,7 @@ async fn revocation_unknown_master_ignored() {
     let payload = to_cbor(&broadcast).expect("encode");
     let now = Timestamp::now().0;
     let entry = MailboxEntry {
-        target: make_identity(0xFF),
+        target: MailboxAddress::for_master(&make_identity(0xFF)),
         msg_id: [0xE2u8; 16],
         class: MailboxClass::Revocation,
         payload_version: 1,
@@ -1076,7 +1076,7 @@ async fn revocation_no_sender_is_dropped_gracefully() {
     let db = Db::open_in_memory().expect("db");
     let now = Timestamp::now().0;
     let entry = MailboxEntry {
-        target: make_identity(0xFF),
+        target: MailboxAddress::for_master(&make_identity(0xFF)),
         msg_id: [0xE3u8; 16],
         class: MailboxClass::Revocation,
         payload_version: 1,
@@ -1149,7 +1149,7 @@ async fn revocation_dispatch_drops_entry_not_addressed_to_us() {
     let now = Timestamp::now().0;
     // Entry target is a foreign master (0xBB), but we are 0xAA.
     let entry = MailboxEntry {
-        target: make_identity(0xBB),
+        target: MailboxAddress::for_master(&make_identity(0xBB)),
         msg_id: [0xE4u8; 16],
         class: MailboxClass::Revocation,
         payload_version: 1,
@@ -1255,7 +1255,7 @@ async fn drop_notice_dispatch_drops_entry_not_addressed_to_us() {
 
     // Entry target is the owner (0xAA), but we dispatch as a DIFFERENT master (0xBB).
     let entry = MailboxEntry {
-        target: owner_master,
+        target: MailboxAddress::for_master(&owner_master),
         msg_id: [0xF1u8; 16],
         class: MailboxClass::DropNotice,
         payload_version: 1,

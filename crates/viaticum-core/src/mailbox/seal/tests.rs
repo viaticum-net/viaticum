@@ -366,7 +366,7 @@ fn self_seal_open_fails_when_moved_to_other_epoch_box() {
     let sealed = seal_pointer(&RendezvousKeys::derive(&seed(), e), b"pointer");
     let next = RendezvousKeys::derive(&seed(), e.next());
     let mut moved = sealed.entry().clone();
-    moved.target = IdentityPub(next.address.0);
+    moved.target = next.address;
     assert!(matches!(
         open_self_pointer(&next, &moved),
         Err(SealError::Open)
@@ -378,7 +378,7 @@ fn self_seal_open_fails_when_moved_to_other_epoch_box() {
 fn self_seal_open_fails_when_target_is_changed() {
     let keys = RendezvousKeys::derive(&seed(), now_epoch());
     let mut moved = seal_pointer(&keys, b"pointer").entry().clone();
-    moved.target = IdentityPub([0x44; 32]);
+    moved.target = MailboxAddress([0x44; 32]);
     assert!(matches!(
         open_self_pointer(&keys, &moved),
         Err(SealError::Open)
@@ -466,7 +466,7 @@ fn directed_open_fails_when_target_is_changed() {
     let mut entry = seal_to(&r_pub, MailboxClass::PosResponse, b"response")
         .entry()
         .clone();
-    entry.target = IdentityPub([0x12; 32]);
+    entry.target = MailboxAddress([0x12; 32]);
     assert!(matches!(open_directed(&r_sk, &entry), Err(SealError::Open)));
 }
 
@@ -685,7 +685,7 @@ fn store_sig_roundtrip() {
     // Master box (C2): the same rule with the master key.
     let master = derive_master_key(&seed()).unwrap();
     let mut entry = sealed.entry().clone();
-    entry.target = master_identity(&master);
+    entry.target = MailboxAddress::for_master(&master_identity(&master));
     verify_store_sig(&entry, &sign_store(&master, &entry)).unwrap();
 }
 
@@ -712,11 +712,7 @@ fn store_sig_fails_when_any_signed_header_field_changes() {
     let base = sealed.entry().clone();
     let mutations: [(&str, Mutator); 6] = [
         ("target", |e| {
-            e.target = IdentityPub(
-                RendezvousKeys::derive(&seed(), RendezvousEpoch(1))
-                    .address
-                    .0,
-            )
+            e.target = RendezvousKeys::derive(&seed(), RendezvousEpoch(1)).address
         }),
         ("class", |e| e.class = MailboxClass::Generic),
         ("msg_id", |e| e.msg_id[0] ^= 1),
@@ -759,7 +755,7 @@ fn small_order_address_forgery_is_rejected() {
     trivial_sig[0] = 1;
     let keys = RendezvousKeys::derive(&seed(), now_epoch());
     let mut entry = seal_pointer(&keys, b"pointer").entry().clone();
-    entry.target = IdentityPub(identity_point);
+    entry.target = MailboxAddress(identity_point);
     let addr = MailboxAddress(identity_point);
     let vk = addr.verifying_key().expect("identity is a valid encoding");
     assert!(
