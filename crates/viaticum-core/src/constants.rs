@@ -604,6 +604,17 @@ pub const PAIR_LEDGER_TICK_SECS: u64 = 3600;
 ///   "3.5 days of confirmed service".
 pub const PAIR_LEDGER_OBSERVED_WINDOW_TICKS: u64 = 3;
 
+// === DN-1: stale DropNotice dedup ===
+
+/// How long the owner remembers an applied DropNotice, in multiples of the (scaled) mailbox TTL
+/// of the DropNotice class (DN-1). What bounds an HONEST re-delivery is not the holder's
+/// `expires_at` alone but the postman's clamp on store plus the polling node's own filter —
+/// one raw TTL from the store, each on its own clock. One TTL covers that; the second TTL is a
+/// margin for clock jumps. Caveat: at `time_scale > 1` the clamp is on the RAW (unscaled) TTL
+/// and does not bite, so a holder clock running ahead by more than the SCALED TTL can re-open
+/// a repeat on multi-machine demos (single-machine E2E shares one clock).
+pub const SEEN_DROP_NOTICE_RETENTION_TTLS: u64 = 2;
+
 // === Compile-time sanity checks ===
 
 const _: () = assert!(S_CLAMP_MIN < S_CLAMP_MAX);
@@ -629,6 +640,8 @@ const _: () = assert!(PAIR_LEDGER_MAX_LAMBDA_DT > 0.0 && PAIR_LEDGER_MAX_LAMBDA_
 // gate). Nothing here can express the scale-dependence — that is checked at run time by
 // `pair_ledger::tests::the_observed_window_is_three_tick_periods_at_every_time_scale`.
 const _: () = assert!(PAIR_LEDGER_OBSERVED_WINDOW_TICKS >= 1);
+// DN-1: a notice must be remembered at least as long as the mailbox hands it out.
+const _: () = assert!(SEEN_DROP_NOTICE_RETENTION_TTLS >= 1);
 const _: () = assert!(OVERHEAD_BASE > 1.0);
 const _: () = assert!(DECODE_OVERHEAD > 0);
 const _: () = assert!(SYMBOL_OFFER_TIMEOUT_SECS < SYMBOL_OFFER_EXPIRY_SECS);

@@ -549,19 +549,36 @@ impl Processor {
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
+/// The seen-set write that rides in the placement transaction (DN-1, Д-DN1-5): "the signed
+/// letter with this (verified) signature has been applied", committed together with the
+/// transition it caused. See `Db::record_signed_letter_seen`.
+#[derive(Clone, Copy)]
+pub(crate) struct SeenWrite<'a> {
+    pub sig: &'a [u8; 64],
+    pub class: viaticum_core::types::SignedLetterClass,
+    pub now: Timestamp,
+    pub forget_after: Timestamp,
+}
+
 /// Mark a placement as Lost. Idempotent: no-op if already Lost or Deleting.
 /// Returns true if the record was changed.
 ///
 /// `evidence_at` is the signed `timestamp` of the DropNotice that caused the call: the
 /// 4R pair ledger counts the transition as an ANNOUNCED drop only if that notice is strictly
 /// younger than the placement's episode (У-4, [`persist_placement_change`]). The transition
-/// itself does not depend on it (an old re-delivered notice still marks a fresh placement
-/// Lost — known bug Ф-1, not fixed here: AC-7).
+/// itself does not depend on it. A re-delivered notice never reaches this function (DN-1 in
+/// `SymbolDropHandler::apply`); the first delivery of an old notice still marks a fresh
+/// placement Lost (DN-1 Д-DN1-2: time is not part of the rule).
+///
+/// `seen` (DN-1): when `Some`, the notice is remembered in the SAME write transaction as the
+/// transition (and its У-4 event), see [`persist_placement_change`]. Not written when nothing
+/// changes (missing / already Lost / Deleting) — the caller decides about those.
 pub(crate) fn mark_placement_lost(
     db: &Db,
     block_id: &viaticum_core::types::SourceBlockId,
     holder_id: &DeviceId,
     evidence_at: Timestamp,
+    seen: Option<SeenWrite<'_>>,
 ) -> Result<bool, ProcessorError> {
     let placement = match db.get_placement(block_id, holder_id)? {
         Some(p) => p,
@@ -588,6 +605,7 @@ pub(crate) fn mark_placement_lost(
         &updated,
         Some(LossCause::DropNotice),
         evidence_at,
+        seen,
     )?;
 
     info!(
@@ -616,12 +634,18 @@ pub(crate) fn mark_placement_lost(
 /// counted` (`reason cause block_id holder`, only for a changed status landing in
 /// `Lost`/`PresumedLost` — not on every `Uncertain`). Both are printed only AFTER a
 /// successful commit, so every event line is an event in the database.
+///
+/// `seen` (DN-1, Д-DN1-5): with `Some`, EVERY branch writes through one `db.write_txn()` —
+/// the placement, the event if there is one, and the applied-notice row — and commits once.
+/// With `None` every branch is exactly the У-4 code (AC-7 of У-4): the PoS callers in
+/// `scheduler` pass `None`.
 pub(crate) fn persist_placement_change(
     db: &Db,
     before: &SymbolPlacement,
     updated: &SymbolPlacement,
     cause: Option<LossCause>,
     evidence_at: Timestamp,
+    seen: Option<SeenWrite<'_>>,
 ) -> Result<Option<DropKind>, viaticum_core::db::DbError> {
     let decision = match cause {
         Some(cause) if updated.status != before.status => Some((
@@ -640,7 +664,7 @@ pub(crate) fn persist_placement_change(
     let (cause, kind) = match decision {
         Some((cause, Ok(kind))) => (cause, kind),
         Some((cause, Err(reason))) => {
-            db.upsert_placement(updated)?;
+            upsert_placement_with_seen(db, updated, seen)?;
             if matches!(
                 updated.status,
                 PlacementStatus::Lost | PlacementStatus::PresumedLost
@@ -657,7 +681,7 @@ pub(crate) fn persist_placement_change(
             return Ok(None);
         }
         None => {
-            db.upsert_placement(updated)?;
+            upsert_placement_with_seen(db, updated, seen)?;
             return Ok(None);
         }
     };
@@ -667,7 +691,7 @@ pub(crate) fn persist_placement_change(
     let master = match ledger_master_for_device(db, &updated.holder_id) {
         Ok(Some(master)) => master,
         Ok(None) => {
-            db.upsert_placement(updated)?;
+            upsert_placement_with_seen(db, updated, seen)?;
             warn!(
                 target: "viaticum::ledger",
                 kind = ?kind,
@@ -679,7 +703,7 @@ pub(crate) fn persist_placement_change(
             return Ok(None);
         }
         Err(e) => {
-            db.upsert_placement(updated)?;
+            upsert_placement_with_seen(db, updated, seen)?;
             error!(
                 target: "viaticum::ledger",
                 kind = ?kind,
@@ -708,6 +732,12 @@ pub(crate) fn persist_placement_change(
     let mut txn = db.write_txn()?;
     txn.upsert_placement(updated)?;
     txn.record_drop_event(&master, kind)?;
+    // DN-1 (Д-DN1-5): the applied notice rides in the same transaction — a crash cannot leave
+    // "transition + event" without "seen" (one more application) or the reverse (a swallowed
+    // drop).
+    if let Some(seen) = seen {
+        txn.record_signed_letter_seen(seen.sig, seen.class, seen.now, seen.forget_after)?;
+    }
     if let Err(e) = txn.commit() {
         error!(
             target: "viaticum::ledger",
@@ -728,6 +758,23 @@ pub(crate) fn persist_placement_change(
         "pair-ledger drop event"
     );
     Ok(Some(kind))
+}
+
+/// The placement write of the no-event branches of [`persist_placement_change`]. Without
+/// `seen` it IS `Db::upsert_placement` (the У-4 code, unchanged); with `seen` the placement and
+/// the applied-notice row are one transaction (DN-1, Д-DN1-5).
+fn upsert_placement_with_seen(
+    db: &Db,
+    updated: &SymbolPlacement,
+    seen: Option<SeenWrite<'_>>,
+) -> Result<(), viaticum_core::db::DbError> {
+    let Some(seen) = seen else {
+        return db.upsert_placement(updated);
+    };
+    let mut txn = db.write_txn()?;
+    txn.upsert_placement(updated)?;
+    txn.record_signed_letter_seen(seen.sig, seen.class, seen.now, seen.forget_after)?;
+    txn.commit()
 }
 
 /// Recompute `current_alive` and `current_reliability` for a block from DB state,

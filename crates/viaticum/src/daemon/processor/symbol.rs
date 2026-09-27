@@ -2,14 +2,17 @@
 // Also: RevocationHandler (T-13b-2) — apply revocation received via mailbox.
 
 use tracing::{debug, error, info, warn};
-use viaticum_core::constants::{MESSAGE_FRESHNESS_SECS, SYMBOL_OFFER_EXPIRY_SECS, SYMBOL_SIZE};
+use viaticum_core::constants::{
+    MESSAGE_FRESHNESS_SECS, SEEN_DROP_NOTICE_RETENTION_TTLS, SYMBOL_OFFER_EXPIRY_SECS, SYMBOL_SIZE,
+};
 use viaticum_core::db::Db;
 use viaticum_core::messages::{
     RejectReason, RevocationBroadcast, SymbolAcceptMsg, SymbolDropNoticeMsg, SymbolOfferMsg,
     SymbolRejectMsg, SymbolTransferMsg, verify_symbol_drop_notice, verify_symbol_offer,
 };
 use viaticum_core::types::{
-    DeviceId, HoldingRecord, HoldingStatus, IdentityPub, Timestamp, hex_encode,
+    DeviceId, HoldingRecord, HoldingStatus, IdentityPub, PlacementStatus, SignedLetterClass,
+    SymbolPlacement, Timestamp, hex_encode,
 };
 
 use super::{AcceptedOffer, Processor, ProcessorError, esi_list_to_ranges, ranges_to_esi_list};
@@ -21,31 +24,106 @@ use super::{AcceptedOffer, Processor, ProcessorError, esi_list_to_ranges, ranges
 /// Extracted from `Processor::handle_symbol_drop_notice` so the mailbox poll loop
 /// can call it without holding an `Arc<Processor>` (mirrors `PosResponder` from T-6).
 ///
-/// Only requires `db` — confirmed: the original method uses `self.db` only.
+/// Needs `db` and the run's `time_scale` (DN-1: how long an applied notice is remembered;
+/// set with [`SymbolDropHandler::with_time_scale`], default 1 = production).
 pub struct SymbolDropHandler {
     db: Db,
+    time_scale: u64,
+}
+
+/// Seen-set retention [s] = SEEN_DROP_NOTICE_RETENTION_TTLS × scaled DropNotice TTL (DN-1):
+/// 28 days at `time_scale = 1`, 120 s at 20 000. Scaled exactly like the TTL the holder stamps
+/// on the mailbox entry (`mailbox::scaled_ttl_secs`), so the memory outlives the re-deliveries.
+pub(crate) fn seen_drop_notice_retention_secs(time_scale: u64) -> u64 {
+    SEEN_DROP_NOTICE_RETENTION_TTLS.saturating_mul(viaticum_core::mailbox::scaled_ttl_secs(
+        viaticum_core::mailbox::class_config::DROP_NOTICE_TTL.as_secs(),
+        time_scale,
+    ))
+}
+
+/// A placement status a DropNotice can still change — exactly what `mark_placement_lost`
+/// moves to `Lost` (everything but `Lost` and `Deleting`). Used to pick the device (Д-DN1-8).
+fn notice_can_change(status: PlacementStatus) -> bool {
+    !matches!(status, PlacementStatus::Lost | PlacementStatus::Deleting)
+}
+
+/// Do two ESI range lists `(start, count)` share at least one ESI? (Д-DN1-8, review W-1.)
+fn esi_ranges_intersect(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
+    a.iter().any(|&(sa, ca)| {
+        b.iter().any(|&(sb, cb)| {
+            ca > 0 && cb > 0 && sa < sb.saturating_add(cb) && sb < sa.saturating_add(ca)
+        })
+    })
+}
+
+/// Pick the placement a DropNotice of a holder MASTER is about (Д-DN1-8, review W-1). The notice
+/// names no device but carries its signed `esi_ranges`, and live placements of one block get
+/// disjoint ranges (`work_pipeline::compute_esi_offset`), so:
+///   1. a placement whose ESIs intersect the notice's — preferring one the notice can still
+///      change if several intersect (a Lost placement's old range may be reused by a later one);
+///   2. else the first placement the notice can change;
+///   3. else the first found.
+///
+/// Rule 1 is what keeps "advance notice, then the final notice a week later" on ONE device:
+/// the final notice finds its device already Lost and must not move on to the sibling.
+fn choose_placement_for_notice(
+    found: &[SymbolPlacement],
+    notice_esi: &[(u32, u32)],
+) -> Option<(DeviceId, PlacementStatus)> {
+    let intersecting: Vec<&SymbolPlacement> = found
+        .iter()
+        .filter(|p| esi_ranges_intersect(&p.esi_ranges, notice_esi))
+        .collect();
+    intersecting
+        .iter()
+        .find(|p| notice_can_change(p.status))
+        .or_else(|| intersecting.first())
+        .copied()
+        .or_else(|| found.iter().find(|p| notice_can_change(p.status)))
+        .or_else(|| found.first())
+        .map(|p| (p.holder_id, p.status))
 }
 
 impl SymbolDropHandler {
     pub fn new(db: Db) -> Self {
-        SymbolDropHandler { db }
+        SymbolDropHandler { db, time_scale: 1 }
+    }
+
+    /// Run clock multiplier (the daemon's `--time-scale`); `0` is treated as 1.
+    pub fn with_time_scale(mut self, time_scale: u64) -> Self {
+        self.time_scale = time_scale.max(1);
+        self
     }
 
     /// Apply a single DropNotice: verify signature, mark placement Lost, recompute cached fields.
+    /// One notice — one application (DN-1, 4r-i47): the notice's signature — after it passed
+    /// `verify_strict` — is remembered on disk (`seen_signed_letters`, class `DropNotice`), and
+    /// every later delivery of the same notice (byte-identical signed payload) only logs
+    /// `already_applied=true` and returns `false` — no transition, no pair-ledger event, no
+    /// repair wake. A NEW notice of the same holder about the same block has a new signature
+    /// and is applied (4r-i48).
     ///
-    /// Returns `true` if the notice passed verification and the placement was updated (or was
-    /// already Lost/Deleting — idempotent). Returns `false` if the signature failed or the
-    /// holder/block is unknown. Callers (e.g. `ProcessorDropHandler`) gate side-effects like
-    /// the repair wake on the return value — prevents repair storms from forged notices.
+    /// Returns `true` if the notice passed verification, was not applied before, and touched a
+    /// placement of ours that is not `Deleting` (changed it, or found it already `Lost`).
+    /// Returns `false` on a bad signature, a re-delivery, an unknown master or block, a
+    /// `Deleting` placement (our own deletion — nothing to repair, 4r-i49) or a DB error.
+    /// Callers (e.g. `ProcessorDropHandler`) gate side-effects like the repair wake on the
+    /// return value — prevents repair storms from forged or re-delivered notices.
     ///
-    /// Security: verifies `notice.sig` against `from` (holder master identity) before acting.
+    /// What is remembered (Д-DN1-4): a verified notice of a KNOWN master whose chosen placement
+    /// exists and is not `Deleting` — in the same write transaction as the transition
+    /// (Д-DN1-5), or stand-alone if it was already `Lost`. Not remembered: bad signature,
+    /// unknown master (4r-i31: a re-delivery after re-authentication applies it), no placement
+    /// or `Deleting` (4r-i49: no loop there, and a flood of final notices must write nothing), a
+    /// placement read error (FW-3), a failed transition.
+    ///
+    /// Security: verifies `notice.sig` against `from` (holder master identity) before acting —
+    /// and before remembering anything, so a forgery never enters the seen set.
     /// An attacker controlling a mailbox postman cannot forge a drop for a block they do not hold:
     /// - A valid sig requires the private key of the holder master.
     /// - `mark_placement_lost(block, holder_device)` is a no-op when that holder has no placement
     ///   for this block — so a signed notice can only drop placements the signer actually holds.
     ///
-    /// Semantics are identical to `Processor::handle_symbol_drop_notice`.
-    /// Idempotent: if placement is already Lost/Deleting, returns `true` (sig passed, no-op).
     /// On unknown holder or block, logs WARN and returns `false` (not a panic path).
     pub fn apply(&self, from: IdentityPub, notice: SymbolDropNoticeMsg) -> bool {
         let block_id = notice.source_block_id;
@@ -62,12 +140,35 @@ impl SymbolDropHandler {
             return false;
         }
 
+        // DN-1: has this very notice (same, verified signature) been applied already? Times are
+        // deliberately not compared (a holder clock behind ours would swallow a genuine drop).
+        // A read error is not "seen": apply as before, a later record overwrites a damaged row
+        // (FW-2).
+        let now = Timestamp::now();
+        let already_applied = match self.db.signed_letter_seen(&notice.sig, now) {
+            Ok(seen) => seen,
+            Err(e) => {
+                error!(
+                    block_id = %block_id,
+                    holder = %from,
+                    err = %e,
+                    "processor: DropNotice — seen-set read failed, applying as not seen"
+                );
+                false
+            }
+        };
+
         info!(
             block_id = %block_id,
             holder = %from,
             deadline = notice.deadline.0,
-            "processor: received SymbolDropNotice — transitioning placement to Lost"
+            already_applied,
+            "processor: received SymbolDropNotice"
         );
+
+        if already_applied {
+            return false;
+        }
 
         let devices = self.db.get_devices_for_master(&from).unwrap_or_default();
         if devices.is_empty() {
@@ -79,16 +180,29 @@ impl SymbolDropHandler {
             return false;
         }
 
-        let holder_device_id = devices.iter().find(|did| {
-            self.db
-                .get_placement(&block_id, did)
-                .ok()
-                .flatten()
-                .is_some()
-        });
+        // Д-DN1-8 (review W-1): among this master's devices holding a placement of the block,
+        // the one whose ESIs the notice names (see `choose_placement_for_notice`). A read error
+        // is not "no placement" (FW-3): stop without remembering, the next delivery tries again.
+        let mut found: Vec<SymbolPlacement> = Vec::new();
+        for did in &devices {
+            match self.db.get_placement(&block_id, did) {
+                Ok(Some(p)) => found.push(p),
+                Ok(None) => {}
+                Err(e) => {
+                    error!(
+                        block_id = %block_id,
+                        holder = %did,
+                        err = %e,
+                        "processor: DropNotice — get_placement failed, not applying (the next delivery retries)"
+                    );
+                    return false;
+                }
+            }
+        }
+        let chosen = choose_placement_for_notice(&found, &notice.esi_ranges);
 
-        let holder_device_id = match holder_device_id {
-            Some(id) => *id,
+        let (holder_device_id, chosen_status) = match chosen {
+            Some(c) => c,
             None => {
                 warn!(
                     block_id = %block_id,
@@ -99,13 +213,36 @@ impl SymbolDropHandler {
             }
         };
 
+        // Our own deletion (4r-i49): nothing to repair and no loop to break — do not remember,
+        // do not wake repair (a flood of final notices writes nothing).
+        if chosen_status == PlacementStatus::Deleting {
+            debug!(
+                block_id = %block_id,
+                holder = %holder_device_id,
+                "processor: DropNotice — placement is Deleting (our own deletion), nothing to do"
+            );
+            return false;
+        }
+
+        let forget_after = Timestamp(
+            now.0
+                .saturating_add(seen_drop_notice_retention_secs(self.time_scale)),
+        );
+
         // У-4: the notice's own signed timestamp is the evidence time the pair ledger checks
-        // against the placement's episode (a re-delivered OLD notice is not a new drop).
+        // against the placement's episode. DN-1: the notice is remembered in the transition's
+        // own transaction.
         let changed = match super::mark_placement_lost(
             &self.db,
             &block_id,
             &holder_device_id,
             notice.timestamp,
+            Some(super::SeenWrite {
+                sig: &notice.sig,
+                class: SignedLetterClass::DropNotice,
+                now,
+                forget_after,
+            }),
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -138,13 +275,29 @@ impl SymbolDropHandler {
         }
 
         if !changed {
+            // DN-1: the placement was already Lost (e.g. PoS got there first): nothing to
+            // transition, but the notice is still applied — remember it (Д-DN1-4), so a
+            // re-placement by repair is not undone by its re-delivery.
+            if let Err(e) = self.db.record_signed_letter_seen(
+                &notice.sig,
+                SignedLetterClass::DropNotice,
+                now,
+                forget_after,
+            ) {
+                error!(
+                    block_id = %block_id,
+                    holder = %holder_device_id,
+                    err = %e,
+                    "processor: DropNotice — failed to remember an applied notice"
+                );
+            }
             debug!(
                 block_id = %block_id,
                 holder = %holder_device_id,
-                "processor: DropNotice — placement already Lost/Deleting, skipping block update"
+                "processor: DropNotice — placement already Lost, skipping block update"
             );
-            // Sig passed and no-op (idempotent): return true so the repair wake is
-            // still triggered for immediate drops even on re-delivery.
+            // Sig passed and first delivery: return true so the repair wake is triggered for
+            // an immediate drop.
             return true;
         }
 
@@ -308,6 +461,12 @@ impl ProcessorDropHandler {
             repair_tx,
         }
     }
+
+    /// Run clock multiplier for the seen-set retention (DN-1); default 1 (production).
+    pub fn with_time_scale(mut self, time_scale: u64) -> Self {
+        self.inner = self.inner.with_time_scale(time_scale);
+        self
+    }
 }
 
 impl crate::daemon::mailbox::poll::DropNoticeHandler for ProcessorDropHandler {
@@ -316,7 +475,8 @@ impl crate::daemon::mailbox::poll::DropNoticeHandler for ProcessorDropHandler {
         let deadline = notice.deadline.0;
 
         // Apply DropNotice: verify sig, mark placement Lost, recompute reliability.
-        // Returns false if sig verification failed or holder/block unknown.
+        // Returns false if sig verification failed, holder/block unknown, the placement is
+        // Deleting, or this notice was applied before (DN-1: a re-delivery wakes nothing).
         // Gate all side-effects (the repair wake) on a successful apply to prevent repair storms
         // from forged notices that pass `is_immediate` but fail sig verification.
         let applied = self.inner.apply(from, notice);

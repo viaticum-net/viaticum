@@ -23,8 +23,8 @@
 #               Cross-node: A's log shows it removed B1 and sent the notice; F's symbol file
 #               changed and F still answered; K held E blocks and is dead; a holder's log
 #               shows the post-delete cleanup notice for B3.
-# Adversarial:  a holder losing data and announcing it (with mailbox re-delivery and, if it
-#               happens, a stale re-delivered notice hitting a fresh re-placement); a holder
+# Adversarial:  a holder losing data and announcing it (with mailbox re-delivery of the same
+#               notice, deduplicated by DN-1 even after repair re-placed the block); a holder
 #               corrupting data silently; the owner's own deletion answered by DropNotice;
 #               SIGKILL of a holder (timeouts past PresumedLost).
 # Cannot close: real time (weekly PoS, 6 weeks to PresumedLost, 8-week decay — all compressed
@@ -35,9 +35,8 @@
 #               DR (pending events and post-base drops are lost, 4r-i31); a holder master with
 #               two devices holding one block — the notice names no device, so O may count
 #               Announced on the wrong placement plus Presumed on the real one (double count,
-#               4r-i35); a holder whose clock runs AHEAD: with the stale-notice loop (spec
-#               У4-13 F-1) every re-placement stamped before the notice's timestamp counts a
-#               new Announced (over-count, 4r-i32 — closed by the F-1 slice, not here); a live
+#               4r-i35); a holder whose clock runs AHEAD (4r-i32 — closed by DN-1 (unit DN1-5;
+#               no libfaketime); the stale-notice loop itself is local_drop_loop_test); a live
 #               holder that stops answering PoS and is re-offered its own block by repair
 #               never reaches PresumedLost (4r-i33); clock jumps; comparability of counts
 #               with the sim (different definitions, spec У4-5); whether 4R should ever punish
@@ -45,10 +44,11 @@
 #               transaction in persist_placement_change — a crash between two separate commits
 #               would under-count, or over-count on the next re-delivery; the window is not
 #               reachable from a scenario, and no unit injects a failure inside it: the
-#               invariant is a code comment only); the STRICTNESS of "evidence strictly
-#               younger than placed_at": in every run so far a stale notice predates the
-#               re-placement by >= 1 s, so step 3 cannot tell `<` from `<=` (a same-second
-#               notice is not produced on demand) — units DC-1 and DP-6 hold it.
+#               invariant is a code comment only); the episode check "evidence strictly
+#               younger than placed_at" (4r-i29): since DN-1 a re-delivered notice never
+#               reaches the transition, so no run reaches the check with a stale notice —
+#               units DC-1, DP-6 and DN1-12 hold it (a first delivery that arrives after a
+#               re-placement is not produced on demand).
 # Steps:        1. start 6 daemons, star-connect -> O has 5 authenticated peers and, within
 #                    10 s, `pair-ledger row` lines for all 5 peer masters, every drop field and
 #                    event count 0 (4r-i5) — check: wait_auth_peers; events over O's log
@@ -65,11 +65,10 @@
 #                    holding removed from DB, immediate-drop DropNotice sent` for B1/owner O;
 #                    within 20 s O has exactly 1 `pair-ledger drop event kind=Announced` for
 #                    (master A, B1); O's `received SymbolDropNotice` for (B1, holder=A) >= 2
-#                    (== 1 -> ROUGH "re-delivery door not exercised"); branch: if O logs >= 2
-#                    `placement marked Lost` for (B1, A's device), then >= 1 `pair-ledger drop
-#                    not counted reason=EvidenceBeforeEpisode` and still 1 event (4r-i29),
-#                    else ROUGH "stale-notice door not exercised"; A's rows: silent/presumed
-#                    events 0 (4r-i25, 4r-i29)
+#                    (== 1 -> ROUGH "re-delivery door not exercised"); `placement marked Lost`
+#                    for (B1, A's device) == 1 and the re-delivery is visible as `received
+#                    SymbolDropNotice ... already_applied=true` >= 1 (DN-1; 0 with >= 2
+#                    deliveries -> FAIL); A's rows: silent/presumed events 0 (4r-i25, 4r-i29)
 #               4. [adversarial] overwrite 16 bytes of one symbol file F:holdings/<B2>/<esi>.bin
 #                    (sha256 before != after) -> within 20 s O: `mailbox PosResponse resolved`
 #                    block B2 holder F outcome=Fail; F's log `responding with chain hash` for
@@ -124,11 +123,11 @@
 #     the last of them.
 #   - Whole-run re-checks at the end (B3 has zero events; A has exactly one Announced; F's
 #     Silent events still equal its Fail lines) are booked on the step that owns them.
-#   - Step 3's stale-notice branch catches a MISSING episode check (the mutation "no
-#     evidence_at > placed_at" gives one Announced per re-placement), but not a NON-STRICT one
-#     (`>=` instead of `>`): it would need a notice stamped in the same second as the
-#     re-placement, which the run does not produce on demand. That strictness is units
-#     DC-1 / DP-6 only (see Cannot close).
+#   - Step 3 no longer reaches the episode check with a stale notice: DN-1 stops every
+#     re-delivery before the transition (`already_applied=true`), so "exactly 1 Announced"
+#     with >= 2 deliveries is carried by the dedup AND the placement status together. The
+#     mutation "no evidence_at > placed_at" is now caught by units DC-1 / DP-6 / DN1-12 only
+#     (see Cannot close); the stale-notice loop itself is local_drop_loop_test.
 #   - Verdicts per step: PASS / ROUGH / FAIL. Exit code: 0 PASS, 3 ROUGH, 1 FAIL
 #     (run_e2e.sh logs 3 as pass-rough).
 #
@@ -531,15 +530,19 @@ else
 fi
 LOST_AB1=$(events "$O_LOG" "placement marked Lost" block_id holder \
     | awk -v b="$B1S" -v h="$AD" -v lo="$L3" '$3 == b && $4 == h && ($2 + 0) > lo' | count_lines)
-STALE=$(events "$O_LOG" "pair-ledger drop not counted" reason block_id holder \
-    | awk -v b="$B1S" -v h="$AD" '$3 == "EvidenceBeforeEpisode" && $4 == b && $5 == h' | count_lines)
-info "placement (B1, A) marked Lost $LOST_AB1 time(s); not counted as EvidenceBeforeEpisode: $STALE"
-if [ "$LOST_AB1" -ge 2 ]; then
-    [ "$STALE" -ge 1 ] && [ "$ANN_AB1" -eq 1 ] \
-        && pass "stale notice hit a re-placement $((LOST_AB1 - 1)) time(s): not counted (EvidenceBeforeEpisode), still 1 event (4r-i29)" \
-        || fail "(B1, A) marked Lost $LOST_AB1 times but $STALE 'not counted' line(s) and $ANN_AB1 event(s) (4r-i29)"
+SEEN_AB1=$(events "$O_LOG" "received SymbolDropNotice" block_id holder already_applied \
+    | awk -v b="$B1S" -v h="$AM" -v lo="$L3" '$3 == b && $4 == h && $5 == "true" && ($2 + 0) > lo' \
+    | count_lines)
+info "placement (B1, A) marked Lost $LOST_AB1 time(s); re-deliveries with already_applied=true: $SEEN_AB1"
+if [ "$LOST_AB1" -eq 1 ]; then
+    pass "(B1, A) marked Lost exactly once although the notice came $DELIV time(s) (DN-1)"
 else
-    rough "stale-notice door not exercised: (B1, A) marked Lost $LOST_AB1 time(s) (repair did not re-place B1 on A inside the notice TTL)"
+    fail "(B1, A) marked Lost $LOST_AB1 time(s), want exactly 1 (DN-1: one notice, one application)"
+fi
+if [ "$SEEN_AB1" -ge 1 ]; then
+    pass "the re-delivery is visible as already_applied=true ($SEEN_AB1 line(s), DN-1)"
+elif [ "$DELIV" -ge 2 ]; then
+    fail "$DELIV deliveries but no already_applied=true line — the re-delivery was not recognised"
 fi
 read -r A_SIL A_PRE A_ANN <<< "$(ledger_rows "$AM" | awk '{ s += $8; p += $9; a += $7 } END { printf "%d %d %d", s, p, a }')"
 [ "$A_SIL" -eq 0 ] && [ "$A_PRE" -eq 0 ] && pass "A's rows: silent/presumed events 0" \
