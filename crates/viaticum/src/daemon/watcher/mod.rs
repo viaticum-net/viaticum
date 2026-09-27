@@ -246,11 +246,34 @@ pub async fn start_watcher(
             }
         })?;
 
-    // Register all directories (empty list = no-op).
-    for dir in &watch_dirs {
-        watcher_inner.watch(dir, RecursiveMode::Recursive)?;
-        tracing::info!(dir = %dir.display(), "watching directory");
-    }
+    // Register all directories (empty list = no-op). A folder that cannot be
+    // watched (missing — a USB disk or NAS share not mounted yet —, unreadable,
+    // inotify limit) must not stop the others (daemon-i3): it is marked Error
+    // with the reason and left out of watching and scanning; the rest carry on.
+    // Its files are NOT treated as deleted (dr-i10: absence is not deletion) —
+    // it simply produces no events.
+    watch_dirs.retain(
+        |dir| match watcher_inner.watch(dir, RecursiveMode::Recursive) {
+            Ok(()) => {
+                tracing::info!(dir = %dir.display(), "watching directory");
+                true
+            }
+            Err(e) => {
+                let reason = describe_watch_error(&e);
+                tracing::warn!(
+                    path = %dir.display(), error = %reason,
+                    "watch folder unavailable; other folders keep being backed up"
+                );
+                set_status(
+                    &config.watch_states,
+                    dir,
+                    WatcherStatusSignal::Error,
+                    Some(reason),
+                );
+                false
+            }
+        },
+    );
 
     // ── Initial / periodic scan ────────────────────────────────────────────
     let scan_marker = config.data_dir.join("last_scan");
@@ -290,14 +313,16 @@ pub async fn start_watcher(
     let poll_ms = (config.debounce_ms / 4).max(10);
     let mut poll_timer = interval(Duration::from_millis(poll_ms));
 
-    // Periodic rescan timer.
-    let rescan_secs = if config.rescan_interval_secs > 0 {
-        config.rescan_interval_secs
+    // Periodic rescan timer; `rescan_interval_secs == 0` disables it. A huge
+    // period is not a substitute: tokio computes `deadline + period` for the
+    // next tick and panics on `Instant` overflow.
+    let mut rescan_timer = if config.rescan_interval_secs > 0 {
+        let mut t = interval(Duration::from_secs(config.rescan_interval_secs));
+        t.tick().await; // skip immediate first tick
+        Some(t)
     } else {
-        u64::MAX / 2 // effectively never
+        None
     };
-    let mut rescan_timer = interval(Duration::from_secs(rescan_secs));
-    rescan_timer.tick().await; // skip immediate first tick
 
     // Keep watcher alive for the duration of this async function.
     // Must be mut so we can call watch()/unwatch() on Add/Remove commands.
@@ -309,7 +334,12 @@ pub async fn start_watcher(
                 tracing::debug!("watcher: cancel requested, exiting");
                 break;
             }
-            _ = rescan_timer.tick() => {
+            _ = async {
+                match rescan_timer.as_mut() {
+                    Some(t) => { t.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
                 if !watch_dirs.is_empty() {
                     for dir in &watch_dirs {
                         set_status(&config.watch_states, dir,
@@ -338,12 +368,13 @@ pub async fn start_watcher(
                 match cmd {
                     WatcherCommand::Add { path, importance: _ } => {
                         if let Err(e) = notify_watcher.watch(&path, RecursiveMode::Recursive) {
+                            let reason = describe_watch_error(&e);
                             tracing::warn!(
-                                path = %path.display(), error = %e,
+                                path = %path.display(), error = %reason,
                                 "watcher: failed to watch new directory"
                             );
                             set_status(&config.watch_states, &path,
-                                WatcherStatusSignal::Error, Some(e.to_string()));
+                                WatcherStatusSignal::Error, Some(reason));
                         } else {
                             watch_dirs.push(path.clone());
                             // Rebuild IgnoreSet for all current dirs.
@@ -456,6 +487,24 @@ fn classify_event(kind: &EventKind) -> Option<DirtyKind> {
         EventKind::Access(_) => None,                       // reads: ignore
         EventKind::Remove(RemoveKind::Folder) => None,      // directory removal: ignore
         _ => None,
+    }
+}
+
+/// Human-readable reason a folder could not be put under watch (shown in
+/// `/api/watches` and the log). Names the kernel knob for the inotify limit.
+pub(crate) fn describe_watch_error(e: &notify::Error) -> String {
+    match &e.kind {
+        notify::ErrorKind::PathNotFound => "folder does not exist".to_string(),
+        notify::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            "folder does not exist".to_string()
+        }
+        notify::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied => {
+            "permission denied".to_string()
+        }
+        notify::ErrorKind::MaxFilesWatch => "inotify watch limit reached \
+             (raise fs.inotify.max_user_watches)"
+            .to_string(),
+        _ => e.to_string(),
     }
 }
 
