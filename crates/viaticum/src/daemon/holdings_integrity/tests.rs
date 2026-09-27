@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tempfile::TempDir;
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::MailboxClass;
+use viaticum_core::mailbox::{MailboxAddress, MailboxClass};
 use viaticum_core::messages::{
     MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
     SymbolDropNoticeBatchMsg, from_cbor,
@@ -210,7 +210,7 @@ async fn scan_holdings_reports_missing_active_holding() {
     assert!(!stored.is_empty(), "should have published a DropNotice");
     let entry = &stored[0].entry;
     assert_eq!(entry.class, MailboxClass::DropNotice);
-    assert_eq!(entry.target, owner);
+    assert_eq!(entry.target, MailboxAddress::for_master(&owner));
 
     let batch: SymbolDropNoticeBatchMsg = from_cbor(&entry.payload).unwrap();
     assert_eq!(batch.notices.len(), 1);
@@ -385,7 +385,7 @@ async fn scan_holdings_handles_mix_of_present_and_missing() {
     assert_eq!(stored.len(), 1, "exactly 1 DropNotice published");
     let entry = &stored[0].entry;
     assert_eq!(entry.class, MailboxClass::DropNotice);
-    assert_eq!(entry.target, owner_id(0x30));
+    assert_eq!(entry.target, MailboxAddress::for_master(&owner_id(0x30)));
 
     let batch: SymbolDropNoticeBatchMsg = from_cbor(&entry.payload).unwrap();
     assert_eq!(batch.notices[0].source_block_id, block_id(0x30));
@@ -448,7 +448,7 @@ async fn report_missing_holding_removes_from_db_and_posts_symbol_dropped() {
     assert!(!stored.is_empty(), "DropNotice should be published");
     let entry = &stored[0].entry;
     assert_eq!(entry.class, MailboxClass::DropNotice);
-    assert_eq!(entry.target, owner);
+    assert_eq!(entry.target, MailboxAddress::for_master(&owner));
 }
 
 #[tokio::test]
@@ -479,7 +479,7 @@ async fn report_missing_holding_drop_notice_fields_correct() {
     assert!(!stored.is_empty());
     let entry = &stored[0].entry;
     assert_eq!(entry.class, MailboxClass::DropNotice);
-    assert_eq!(entry.target, owner);
+    assert_eq!(entry.target, MailboxAddress::for_master(&owner));
 
     let batch: SymbolDropNoticeBatchMsg = from_cbor(&entry.payload).unwrap();
     assert_eq!(batch.notices.len(), 1);
