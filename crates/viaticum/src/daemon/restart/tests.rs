@@ -81,3 +81,27 @@ fn restart_gate_concurrent_callers_only_one_wins() {
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert!(token.is_cancelled());
 }
+
+// ── under_service_manager (daemon-i1: WARN when nobody will restart us) ──────
+
+#[test]
+fn is_service_manager_true_for_supervised_env() {
+    assert!(is_service_manager(Some("1"), None));
+    assert!(is_service_manager(Some("1\n"), Some("bash")));
+}
+
+#[test]
+fn is_service_manager_true_when_parent_is_systemd() {
+    // /proc/<ppid>/comm ends with a newline.
+    assert!(is_service_manager(None, Some("systemd\n")));
+}
+
+#[test]
+fn is_service_manager_false_for_shell_parent_and_other_env_values() {
+    assert!(!is_service_manager(None, None));
+    assert!(!is_service_manager(None, Some("bash\n")));
+    assert!(!is_service_manager(Some("0"), Some("sshd")));
+    assert!(!is_service_manager(Some("yes"), None));
+    // A parent merely named like systemd is not systemd.
+    assert!(!is_service_manager(None, Some("systemd-run\n")));
+}
