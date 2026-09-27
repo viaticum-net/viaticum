@@ -1199,3 +1199,48 @@ fn populate_bursts_handles_missing_directory() {
         "missing directory: bursts should be Some(empty vec)"
     );
 }
+
+#[cfg(test)]
+fn section_value(cfg: &AppConfig, section: &str) -> toml::Value {
+    toml::Value::try_from(cfg).unwrap()[section].clone()
+}
+
+/// A present-but-empty section must equal that section's `impl Default`, field for field.
+/// A field-level `#[serde(default)]` inside a container-level `#[serde(default)]` struct
+/// silently takes the field type's default instead (e.g. `bool` → false) and turns this red.
+#[test]
+fn every_section_when_present_but_empty_then_equals_section_default() {
+    let defaults = AppConfig::default();
+    for section in [
+        "backup",
+        "storage",
+        "network",
+        "cluster",
+        "metrics",
+        "web_api",
+        "restore",
+        "reliability",
+    ] {
+        let f = write_toml(&format!("[{section}]\n"));
+        let cfg = AppConfig::load(f.path()).unwrap();
+        assert_eq!(
+            section_value(&cfg, section),
+            section_value(&defaults, section),
+            "[{section}] present without keys must match its Default"
+        );
+    }
+}
+
+#[test]
+fn network_section_without_key_keeps_ipfs_bootstrap_disabled() {
+    let f = write_toml("[network]\nlisten_port = 4001\n");
+    let cfg = AppConfig::load(f.path()).unwrap();
+    assert!(cfg.network.kademlia_disable_ipfs_bootstrap);
+}
+
+#[test]
+fn network_explicit_false_when_set_then_ipfs_bootstrap_enabled() {
+    let f = write_toml("[network]\nkademlia_disable_ipfs_bootstrap = false\n");
+    let cfg = AppConfig::load(f.path()).unwrap();
+    assert!(!cfg.network.kademlia_disable_ipfs_bootstrap);
+}
