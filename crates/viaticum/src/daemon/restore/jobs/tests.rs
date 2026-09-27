@@ -297,3 +297,37 @@ fn job_id_parse_roundtrips_display() {
     assert_eq!(JobId::parse(&id.to_string()), Some(id));
     assert_eq!(JobId::parse("not-a-uuid"), None);
 }
+
+/// restore-i26: while the running job waits for holders the wire view (get and
+/// list) says until when; the wait is not written into the record, and finishing
+/// the job clears it. A finished job cannot be set waiting.
+#[test]
+fn set_waiting_shows_in_wire_view_and_clears_on_finish() {
+    let (_dir, jobs) = registry();
+    let job_id = JobId::new();
+    jobs.submit(job_id, "/p/", 2);
+    jobs.mark_running(job_id, "/p/", 2);
+
+    jobs.set_waiting(job_id, Some(1_790_000_000));
+    let wire = jobs.get(job_id).unwrap();
+    let until = wire.waiting_for_holders_until.expect("waiting shown");
+    assert!(until.ends_with('Z'), "ISO-8601 UTC: {until}");
+    assert_eq!(
+        jobs.list()[0].waiting_for_holders_until.as_deref(),
+        Some(until.as_str())
+    );
+    let json = serde_json::to_string(&jobs.record(job_id).unwrap()).unwrap();
+    assert!(
+        !json.contains("waiting"),
+        "transient, not in the record: {json}"
+    );
+
+    jobs.set_waiting(job_id, None);
+    assert_eq!(jobs.get(job_id).unwrap().waiting_for_holders_until, None);
+
+    jobs.set_waiting(job_id, Some(1_790_000_000));
+    jobs.finish(job_id, false);
+    assert_eq!(jobs.get(job_id).unwrap().waiting_for_holders_until, None);
+    jobs.set_waiting(job_id, Some(1_790_000_000));
+    assert_eq!(jobs.get(job_id).unwrap().waiting_for_holders_until, None);
+}

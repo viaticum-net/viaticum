@@ -184,12 +184,22 @@ pub fn render_restore_progress(job: &RestoreJob) -> String {
             "queued: waiting for an earlier restore job to finish ({} file(s))\n",
             job.files_total
         ),
-        _ => format!(
-            "running: {}/{} restored, {} failed\n",
-            job.files_restored,
-            job.files_total,
-            job.failures.len()
-        ),
+        _ => {
+            let mut line = format!(
+                "running: {}/{} restored, {} failed",
+                job.files_restored,
+                job.files_total,
+                job.failures.len()
+            );
+            // restore-i26: no holder answered; redialed, retried at this time.
+            if let Some(until) = &job.waiting_for_holders_until {
+                line.push_str(&format!(
+                    "; no holder answered, reconnecting, retry at {until}"
+                ));
+            }
+            line.push('\n');
+            line
+        }
     }
 }
 

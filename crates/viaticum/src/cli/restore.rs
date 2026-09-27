@@ -80,7 +80,8 @@ where
     P: FnMut(&RestoreJob),
 {
     let mut last_known: Option<RestoreJob> = None;
-    let mut last_reported: Option<(RestoreJobState, u32, usize)> = None;
+    // State, counts, and whether the job waits for holders (restore-i26).
+    let mut last_reported: Option<(RestoreJobState, u32, usize, bool)> = None;
     let mut since_report = policy.progress_every;
     let mut silence = Duration::ZERO;
     loop {
@@ -90,7 +91,12 @@ where
                 if job.state == RestoreJobState::Finished {
                     return Ok(job);
                 }
-                let key = (job.state, job.files_restored, job.failures.len());
+                let key = (
+                    job.state,
+                    job.files_restored,
+                    job.failures.len(),
+                    job.waiting_for_holders_until.is_some(),
+                );
                 if last_reported != Some(key) && since_report >= policy.progress_every {
                     on_progress(&job);
                     last_reported = Some(key);

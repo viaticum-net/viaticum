@@ -951,6 +951,7 @@ fn job(state: RestoreJobState, restored: u32, total: u32) -> RestoreJob {
         staging_path: "/home/kolya/.local/share/viaticum/restore/3f2a".into(),
         submitted_at: "2026-09-27T10:00:00Z".into(),
         finished_at: None,
+        waiting_for_holders_until: None,
     }
 }
 
@@ -1573,4 +1574,64 @@ fn status_render_counts_files_without_local_source_when_positive() {
         rendered.contains("files without local source: 3 (not re-protected"),
         "got: {rendered}"
     );
+}
+
+// ─── restore-i26: a job waiting for holders does not look hung ───────────────
+
+fn waiting_job(until: &str) -> RestoreJob {
+    RestoreJob {
+        waiting_for_holders_until: Some(until.into()),
+        ..job(RestoreJobState::Running, 1, 3)
+    }
+}
+
+#[test]
+fn render_restore_progress_when_waiting_for_holders_shows_retry_time() {
+    let line = output::render_restore_progress(&waiting_job("2026-09-27T10:05:00Z"));
+    assert!(
+        line.starts_with("running: 1/3 restored, 0 failed"),
+        "{line}"
+    );
+    assert!(
+        line.contains("no holder answered") && line.contains("2026-09-27T10:05:00Z"),
+        "{line}"
+    );
+    let plain = output::render_restore_progress(&job(RestoreJobState::Running, 1, 3));
+    assert!(!plain.contains("no holder answered"), "{plain}");
+}
+
+#[test]
+fn wait_for_job_reports_when_job_starts_and_stops_waiting_for_holders() {
+    let mut seen: Vec<bool> = Vec::new();
+    wait_for_job(
+        polls(vec![
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(finished_job(RestoreOutcome::Complete))),
+        ]),
+        |_| {},
+        |j| seen.push(j.waiting_for_holders_until.is_some()),
+        FAST,
+    )
+    .unwrap();
+    assert_eq!(seen, vec![false, true, false]);
+}
+
+#[test]
+fn restore_job_wire_omits_waiting_field_unless_waiting() {
+    let plain = serde_json::to_value(job(RestoreJobState::Running, 1, 3)).unwrap();
+    assert!(plain.get("waiting_for_holders_until").is_none(), "{plain}");
+    let waiting = serde_json::to_value(waiting_job("2026-09-27T10:05:00Z")).unwrap();
+    assert_eq!(waiting["waiting_for_holders_until"], "2026-09-27T10:05:00Z");
+    let back: RestoreJob = serde_json::from_value(plain).unwrap();
+    assert_eq!(back.waiting_for_holders_until, None);
 }

@@ -10,6 +10,7 @@ use viaticum_core::types::{
     SymbolPlacement,
 };
 
+use super::no_answer::NoAnswerPauses;
 use super::{RestoreCoordinator, RestoreError, pipeline};
 use crate::daemon::restore::staging::StagingWriter;
 
@@ -21,14 +22,16 @@ impl RestoreCoordinator {
     ///      the symbols we need locally. No symbols are persisted on disk anymore.
     ///   2. If the rebuild path is unavailable (e.g. a source file is gone), fall back
     ///      to fetching symbols from holders over the network — no deadline on the
-    ///      block (restore-i12), abandoned only on the daemon's cancel token.
+    ///      block (restore-i12), rounds nobody answered retried from the job's pause
+    ///      budget `pauses` (restore-i26), abandoned only on the daemon's cancel token.
     ///
     /// Decrypts and decompresses the decoded data before returning.
-    pub async fn decode_block_local(
+    pub(crate) async fn decode_block_local(
         &self,
         block_id: &SourceBlockId,
         params: &ErasureParams,
         encrypted_size: u64,
+        pauses: &mut NoAnswerPauses,
     ) -> Result<Vec<u8>, RestoreError> {
         let k_eff = params.k_eff as usize;
 
@@ -90,7 +93,7 @@ impl RestoreCoordinator {
             })
             .collect();
         let raw_symbols = self
-            .fetch_from_holders(block_id, &candidates, params)
+            .fetch_from_holders(block_id, &candidates, params, pauses)
             .await?;
         if raw_symbols.len() < k_eff {
             return Err(RestoreError::InsufficientSymbols {
@@ -138,35 +141,6 @@ impl RestoreCoordinator {
         })
         .await
         .map_err(|e| RestoreError::DecodeFailed(block, format!("decode task failed: {e}")))?
-    }
-
-    /// Fetch symbols for a source block from holders over the network: chunked
-    /// requests in rounds, no deadline, abandoned on the daemon's cancel token
-    /// (restore-i12, T10).
-    pub async fn fetch_from_holders(
-        &self,
-        block_id: &SourceBlockId,
-        placements: &[SymbolPlacement],
-        params: &ErasureParams,
-    ) -> Result<Vec<Symbol>, RestoreError> {
-        // Without a symbol source no holder is reachable: InsufficientSymbols(got=0).
-        let Some(source) = self.config.symbols.as_ref() else {
-            return Err(RestoreError::InsufficientSymbols {
-                block: *block_id,
-                got: 0,
-                need: params.k_eff as usize,
-            });
-        };
-        crate::daemon::symbol_fetch::fetch_unbound_symbols(
-            source.as_ref(),
-            &self.encoder,
-            block_id,
-            placements,
-            params,
-            Some(&self.config.cancel),
-        )
-        .await
-        .map_err(RestoreError::from_fetch)
     }
 
     /// Extract one file from decoded plaintext and write to staging directory.

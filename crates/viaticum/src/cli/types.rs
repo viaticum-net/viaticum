@@ -246,6 +246,10 @@ pub struct RestoreJob {
     /// startup (the daemon did not see it end).
     #[serde(default)]
     pub finished_at: Option<String>,
+    /// ISO-8601 UTC. Set while the running job waits for holders that did not
+    /// answer (redialed, retried at this time, restore-i26); absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for_holders_until: Option<String>,
 }
 
 /// Lifecycle of a restore job. `Queued` exists only in the daemon's memory; the
