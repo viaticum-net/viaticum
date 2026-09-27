@@ -143,16 +143,12 @@ mkdir -p "$TEST_DIR"
 for i in $(seq 0 $((NUM_NODES-1))); do
     mkdir -p "$(node_dir "$i")"
     run_cli "$i" init > /dev/null 2>&1
-    # [escrow] k_factor: restore still passes the holder-side escrow gate on this code
-    # (removed in B1.1); every E2E sets it so the gate does not decide the verdict.
     cat > "$(node_dir "$i")/config.toml" << 'CFGEOF'
 [web_api]
 enabled = true
 bind = "127.0.0.1:0"
 [storage]
 disk_reserve_gb = 0.0
-[escrow]
-k_factor = 0.001
 CFGEOF
     mkdir -p "$(node_dir "$i")/files"
     RUST_LOG=info "$BINARY" --data-dir "$(node_dir "$i")" daemon \

@@ -5,8 +5,9 @@
 #   The polygon spins up a fleet of REAL viaticum daemons, each an independent
 #   owner with its own archetype knobs (a free-rider needs a tiny soft_quota; a
 #   "vault" node weights its files heavier via importance_multiplier; everyone
-#   shares the canonical test surface — ephemeral web_api, a small escrow
-#   k_factor, a small source_block_size so tiny test files still erasure-code).
+#   shares the canonical test surface — ephemeral web_api and a small
+#   source_block_size so tiny test files still erasure-code; no [escrow] section:
+#   v1 has no restore gate, restore-i6).
 #   This module is the SINGLE PLACE that turns a NodePlan into the two on-disk
 #   artifacts the fleet-manager writes per node: (1) the config.toml text and
 #   (2) the seeded watch-dir files + their content-hash ledger.
@@ -20,7 +21,7 @@
 #   AC1 (valid config): render_config_toml() emits TOML that satisfies every
 #        AppConfig::validate() constraint — source_block_size_mb is a power of
 #        two >= 1; soft/hard/disk_reserve quotas >= 0 and (hard <= soft when both
-#        non-zero); escrow.k_factor > 0; web_api.bind parses as a SocketAddr.
+#        non-zero); web_api.bind parses as a SocketAddr.
 #   AC2 (free-rider via soft_quota, NOT hard_quota): a plan with a tiny
 #        soft_quota_gb (~0.001) is rendered as storage.soft_quota_gb so the
 #        GET-for-others ceiling is actually capped — the free-rider holds ~nothing
@@ -66,10 +67,6 @@ if TYPE_CHECKING:  # pragma: no cover - type hints only; avoids hard import at r
 # api-port file; the fleet-manager reads `status` for it. Must parse as a
 # SocketAddr (validate() enforces this when web_api.enabled = true).
 DEFAULT_WEB_API_BIND = "127.0.0.1:0"
-
-# Small escrow factor so a node earns restore credit fast under acceleration
-# (store 1 GB for ~0.001 days -> 1 GB restore budget). Must be > 0.
-DEFAULT_ESCROW_K_FACTOR = 0.001
 
 # Small source block so the polygon's tiny test files (KBs) still split into
 # erasure-coded blocks across multiple holders (the multi-holder path we want
@@ -123,7 +120,7 @@ def _scenario_value(plan: "NodePlan", attr: str, fallback):
     """Read a scenario-derived value.
 
     The documented render_config_toml signature takes only `plan`, but the
-    config must carry the scenario-level escrow k_factor and source block size.
+    config must carry the scenario-level source block size.
     The fleet-manager may attach these to the plan object (defensive getattr);
     otherwise we fall back to the canonical test default. Callers that thread
     the scenario explicitly should use the keyword args on render_config_toml.
@@ -140,7 +137,6 @@ def _scenario_value(plan: "NodePlan", attr: str, fallback):
 def render_config_toml(
     plan: "NodePlan",
     *,
-    escrow_k_factor: float | None = None,
     source_block_size_mb: int | None = None,
     web_api_bind: str = DEFAULT_WEB_API_BIND,
 ) -> str:
@@ -149,25 +145,19 @@ def render_config_toml(
     Emits, in this order:
       [web_api]  enabled = true, bind = <ephemeral loopback>
       [storage]  soft_quota_gb / hard_quota_gb / disk_reserve_gb from the plan
-      [escrow]   k_factor (scenario value, else canonical test default)
       [backup]   source_block_size_mb (scenario value, else canonical default)
       [[watch]]  ONLY when plan.importance_multiplier != 1.0 — otherwise the
                  fleet-manager relies on the daemon's --watch-dir CLI flag.
 
-    The escrow k_factor and source_block_size are scenario-level (not stored on
-    the NodePlan dataclass), so they may be passed explicitly by the caller; if
-    omitted, they are read off the plan when the fleet-manager attached them,
-    and finally fall back to the canonical test defaults.
+    source_block_size is scenario-level (not stored on the NodePlan dataclass),
+    so it may be passed explicitly by the caller; if omitted, it is read off the
+    plan when the fleet-manager attached it, and finally falls back to the
+    canonical test default.
 
     The result always satisfies AppConfig::validate(): power-of-two block size,
-    non-negative quotas with hard <= soft when both non-zero, k_factor > 0, and a
-    parseable web_api.bind.
+    non-negative quotas with hard <= soft when both non-zero, and a parseable
+    web_api.bind.
     """
-    k_factor = (
-        escrow_k_factor
-        if escrow_k_factor is not None
-        else _scenario_value(plan, "escrow_k_factor", DEFAULT_ESCROW_K_FACTOR)
-    )
     block_mb = (
         source_block_size_mb
         if source_block_size_mb is not None
@@ -182,8 +172,6 @@ def render_config_toml(
     # Defensive validation that mirrors the daemon's AppConfig::validate(); a bad
     # plan should fail loudly HERE (at config render) rather than as a silent
     # daemon refusal that the oracle would misread as a crash.
-    if k_factor <= 0.0:
-        raise ValueError(f"escrow.k_factor must be > 0 (got {k_factor})")
     if int(block_mb) < 1:
         raise ValueError(f"backup.source_block_size_mb must be >= 1 (got {block_mb})")
     if int(block_mb) & (int(block_mb) - 1) != 0:
@@ -211,9 +199,6 @@ def render_config_toml(
     lines.append(f"soft_quota_gb = {_fmt_float(soft)}")
     lines.append(f"hard_quota_gb = {_fmt_float(hard)}")
     lines.append(f"disk_reserve_gb = {_fmt_float(reserve)}")
-    lines.append("")
-    lines.append("[escrow]")
-    lines.append(f"k_factor = {_fmt_float(float(k_factor))}")
     lines.append("")
     lines.append("[backup]")
     lines.append(f"source_block_size_mb = {int(block_mb)}")

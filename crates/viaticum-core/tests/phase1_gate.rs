@@ -8,10 +8,8 @@ use viaticum_core::{
         issue_device_certificate, issue_revocation, master_identity, next_epoch,
         verify_device_certificate, verify_revocation,
     },
-    constants::DEFAULT_ESCROW_K_FACTOR,
     db::testutil::test_db,
     erasure::{ErasureEncoder, RaptorQEncoder},
-    escrow::{RestoreDecision, check_restore},
     pos::{VerifyOutcome, compute_chain_hash, outcome_from_verify, verify_hash_response},
     trust::{PosOutcome, TrustEngine},
     types::{
@@ -417,50 +415,6 @@ fn budget_selects_files_within_capacity() {
         batch.candidates.len() + batch.deferred_count,
         3,
         "all eligible files accounted for"
-    );
-}
-
-// ─── 8. escrow_contribution_progression ─────────────────────────────────────
-
-#[test]
-fn escrow_contribution_progression() {
-    let k = DEFAULT_ESCROW_K_FACTOR; // 7.0
-
-    // No contribution → budget=0 → any restore denied.
-    match check_restore(0.0, 0.0, 0.5, k) {
-        RestoreDecision::Denied(d) => {
-            assert_eq!(d.restore_budget_gb, 0.0);
-        }
-        RestoreDecision::Allowed => panic!("expected denial for zero contribution"),
-    }
-
-    // 7 GB·days stored, k=7 → budget=1 GB. Request 0.5 GB → Allowed.
-    assert_eq!(
-        check_restore(7.0, 0.0, 0.5, k),
-        RestoreDecision::Allowed,
-        "1 GB budget: 0.5 GB request allowed"
-    );
-
-    // 140 GB·days stored, k=7 → budget=20 GB. Request 15 GB → Allowed.
-    assert_eq!(
-        check_restore(140.0, 0.0, 15.0, k),
-        RestoreDecision::Allowed,
-        "20 GB budget: 15 GB request allowed"
-    );
-
-    // 140 GB·days stored, already_restored=20 GB → remaining=0. Request 1 GB → Denied.
-    match check_restore(140.0, 20.0, 1.0, k) {
-        RestoreDecision::Denied(d) => {
-            assert!((d.restore_budget_gb - 20.0).abs() < f64::EPSILON);
-        }
-        RestoreDecision::Allowed => panic!("expected denial when budget exhausted"),
-    }
-
-    // 350 GB·days stored, k=7 → budget=50 GB. Request 49 GB → Allowed.
-    assert_eq!(
-        check_restore(350.0, 0.0, 49.0, k),
-        RestoreDecision::Allowed,
-        "50 GB budget: 49 GB request allowed"
     );
 }
 

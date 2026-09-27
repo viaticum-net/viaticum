@@ -682,6 +682,61 @@ mod tests {
     };
     use crate::types::{DeviceId, Timestamp};
 
+    /// AC-13 regression: the core function reproduces, byte for byte, the inline
+    /// derivation in `daemon/handle/mod.rs` (the `x25519_pub` every node already
+    /// announces), so moving the daemon onto it changes no key.
+    #[test]
+    fn x25519_derivation_matches_legacy_inline_derivation() {
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        for seed in [[0u8; 64], [0x5Au8; 64], std::array::from_fn(|i| i as u8)] {
+            let legacy_pub = {
+                let hk = Hkdf::<Sha256>::new(Some(b""), &seed);
+                let mut okm = [0u8; 32];
+                hk.expand(b"viaticum-x25519", &mut okm)
+                    .expect("HKDF expand cannot fail with valid length");
+                let secret = x25519_dalek::StaticSecret::from(okm);
+                x25519_dalek::PublicKey::from(&secret).to_bytes()
+            };
+            let secret = crate::cluster::derive_x25519_secret(&seed);
+            assert_eq!(
+                x25519_dalek::PublicKey::from(&secret).to_bytes(),
+                legacy_pub
+            );
+        }
+    }
+
+    /// Known-answer vector computed independently (Python `cryptography`):
+    /// HKDF-SHA256(ikm=0x00..0x3f, salt="", info="viaticum-x25519") → X25519.
+    #[test]
+    fn x25519_derivation_matches_known_vector() {
+        let seed: [u8; 64] = std::array::from_fn(|i| i as u8);
+        let secret = crate::cluster::derive_x25519_secret(&seed);
+        assert_eq!(
+            crate::types::hex_encode(&secret.to_bytes()),
+            "27833d4d1c7180b60e6078c9249ca8efe01c702425b6029102d558d134e95085"
+        );
+        assert_eq!(
+            crate::types::hex_encode(&x25519_dalek::PublicKey::from(&secret).to_bytes()),
+            "cdb28c31fded26450f822c11f5422cc3dda509986261a91d6f6ebfb1afe38c0f"
+        );
+    }
+
+    /// Master-scoped: the key depends on the shared seed only, so two devices of one
+    /// mnemonic (different device seeds) derive the same key; another mnemonic does not.
+    #[test]
+    fn x25519_derivation_is_master_scoped() {
+        let seed = [0x11u8; 64];
+        let a = crate::cluster::derive_x25519_secret(&seed);
+        let b = crate::cluster::derive_x25519_secret(&seed);
+        assert_eq!(a.to_bytes(), b.to_bytes());
+        let dev_a = derive_device_key(&seed, &[1u8; 32]).unwrap();
+        let dev_b = derive_device_key(&seed, &[2u8; 32]).unwrap();
+        assert_ne!(dev_a.to_bytes(), dev_b.to_bytes());
+        let other = crate::cluster::derive_x25519_secret(&[0x22u8; 64]);
+        assert_ne!(a.to_bytes(), other.to_bytes());
+    }
+
     #[test]
     fn derive_master_key_is_deterministic() {
         let seed = [0u8; 32];

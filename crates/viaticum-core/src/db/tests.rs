@@ -1208,6 +1208,50 @@ fn db_integrity_check_passes() {
     assert!(db.list_all_files().unwrap().is_empty());
 }
 
+#[test]
+fn create_from_file_makes_usable_db() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("db.redb.dr-new");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let peer = make_peer(DeviceId([7u8; 32]));
+    {
+        let db = crate::db::Db::create_from_file(file).unwrap();
+        db.upsert_peer(&peer).unwrap();
+        assert_eq!(db.list_all_peers().unwrap().len(), 1);
+
+        // While it is open, a second handle on the same path cannot take the DB.
+        let second = redb::Database::builder().create(&path);
+        assert!(
+            matches!(second, Err(redb::DatabaseError::DatabaseAlreadyOpen)),
+            "the staging DB must hold its lock"
+        );
+    }
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["db.redb.dr-new".to_string()],
+        "create_from_file makes no pre-open copy"
+    );
+
+    // Renamed into place, it opens as an ordinary DB with the data.
+    let installed = dir.path().join("db.redb");
+    std::fs::rename(&path, &installed).unwrap();
+    let db = crate::db::Db::open(&installed).unwrap();
+    let got = db
+        .get_peer(&peer.device_id)
+        .unwrap()
+        .expect("peer survives");
+    assert_eq!(got.device_id, peer.device_id);
+}
+
 // ─── DB-13: crash recovery (pre-open backup) ───────────────────────────────
 
 #[test]
@@ -3374,6 +3418,7 @@ fn make_ledger(g_from: f64, g_to: f64, last_update: u64) -> PairLedger {
         observed_tau: 30.0,
         drop_ann: 1.0,
         drop_silent: 2.0,
+        drop_presumed: 0.5,
         last_update: Some(Timestamp(last_update)),
     }
 }
@@ -4218,4 +4263,242 @@ fn write_txn_delete_placement_unparks_block() {
     txn.delete_placement(&bid, &holder).unwrap();
     txn.commit().unwrap();
     assert!(!db.block_cooldown(&bid).parked);
+}
+
+// ============================================================
+// 4R pair ledger (У-4): the drop-event outbox `pair_ledger_pending_drops`
+// ============================================================
+
+fn pending(announced: u32, silent: u32, presumed: u32) -> crate::types::PendingDrops {
+    crate::types::PendingDrops {
+        announced,
+        silent,
+        presumed,
+    }
+}
+
+#[test]
+fn recorded_drop_events_accumulate_per_master_and_kind() {
+    // DD-1. Two transactions, two masters, all three kinds: each master's row counts its own
+    // events by kind, and a second transaction adds to the first.
+    use crate::types::DropKind;
+    let db = test_db();
+    let (a, b) = (master_id(0xE6), master_id(0xE7));
+    {
+        let mut txn = db.write_txn().unwrap();
+        txn.record_drop_event(&a, DropKind::Announced).unwrap();
+        txn.record_drop_event(&a, DropKind::Presumed).unwrap();
+        txn.record_drop_event(&b, DropKind::Silent).unwrap();
+        txn.commit().unwrap();
+    }
+    {
+        let mut txn = db.write_txn().unwrap();
+        txn.record_drop_event(&a, DropKind::Announced).unwrap();
+        txn.commit().unwrap();
+    }
+
+    assert_eq!(
+        db.list_pending_drops().unwrap(),
+        vec![(a, pending(2, 0, 1)), (b, pending(0, 1, 0))],
+        "per master, per kind, in key order"
+    );
+}
+
+#[test]
+fn a_dropped_transaction_records_neither_the_placement_nor_the_event() {
+    // DD-2. The transition and its event are one transaction (Д-K): if it never commits,
+    // neither exists — the event cannot outlive a transition that did not happen.
+    use crate::types::DropKind;
+    let db = test_db();
+    let holder = DeviceId([0xE8; 32]);
+    let before = make_placement(0xE9, holder, FileId(1), PlacementStatus::Alive, 4);
+    db.upsert_placement(&before).unwrap();
+    {
+        let mut lost = before.clone();
+        lost.status = PlacementStatus::Lost;
+        let mut txn = db.write_txn().unwrap();
+        txn.upsert_placement(&lost).unwrap();
+        txn.record_drop_event(&master_id(0xEA), DropKind::Announced)
+            .unwrap();
+        // dropped without commit
+    }
+
+    assert_eq!(
+        db.get_placement(&block_id(0xE9), &holder)
+            .unwrap()
+            .unwrap()
+            .status,
+        PlacementStatus::Alive
+    );
+    assert!(db.list_pending_drops().unwrap().is_empty());
+}
+
+#[test]
+fn pending_drops_survive_reopening_the_database_file_and_fold_once() {
+    // DD-3 / 4r-i30. An event recorded right before the owner restarts is on disk, and the
+    // first accruing tick after the restart folds it exactly once.
+    use crate::pair_ledger::PairLedgerRecorder;
+    use crate::types::DropKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("db.redb");
+    let them = master_id(0xEB);
+    let me = master_id(0x01);
+    let t0 = 1_700_000_000u64;
+    {
+        let db = Db::open(&path).unwrap();
+        db.upsert_peer(&peer_of_master(DeviceId([0xEC; 32]), them))
+            .unwrap();
+        db.upsert_pair_ledger(
+            &them,
+            &PairLedger {
+                last_update: Some(Timestamp(t0)),
+                ..PairLedger::default()
+            },
+        )
+        .unwrap();
+        let mut txn = db.write_txn().unwrap();
+        txn.record_drop_event(&them, DropKind::Presumed).unwrap();
+        txn.record_drop_event(&them, DropKind::Presumed).unwrap();
+        txn.commit().unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    assert_eq!(
+        db.list_pending_drops().unwrap(),
+        vec![(them, pending(0, 0, 2))],
+        "the queue is on disk"
+    );
+    let recorder = PairLedgerRecorder::new(db.clone());
+    let first = recorder.tick_report(&me, Timestamp(t0 + 3600), 1).unwrap();
+    let second = recorder.tick_report(&me, Timestamp(t0 + 7200), 1).unwrap();
+
+    assert_eq!(first.rows[0].presumed_events, 2);
+    assert_eq!(second.rows[0].presumed_events, 0, "folded once, not twice");
+    assert!(db.list_pending_drops().unwrap().is_empty());
+    let row = db.get_pair_ledger(&them).unwrap().unwrap();
+    assert!(
+        row.drop_presumed > 1.99 && row.drop_presumed < 2.0,
+        "2 events, one hour of leak: {}",
+        row.drop_presumed
+    );
+}
+
+#[test]
+fn take_pending_drops_returns_and_removes_in_one_transaction() {
+    // DD-4. `take` = read + delete inside the caller's transaction: committed, the row is
+    // gone; dropped without commit, the events stay queued (a failed ledger write loses no
+    // event).
+    use crate::types::DropKind;
+    let db = test_db();
+    let m = master_id(0xED);
+    {
+        let mut txn = db.write_txn().unwrap();
+        txn.record_drop_event(&m, DropKind::Silent).unwrap();
+        txn.commit().unwrap();
+    }
+    {
+        let mut txn = db.write_txn().unwrap();
+        assert_eq!(txn.take_pending_drops(&m).unwrap(), pending(0, 1, 0));
+        // dropped without commit
+    }
+    assert_eq!(
+        db.list_pending_drops().unwrap(),
+        vec![(m, pending(0, 1, 0))]
+    );
+
+    let mut txn = db.write_txn().unwrap();
+    assert_eq!(txn.take_pending_drops(&m).unwrap(), pending(0, 1, 0));
+    assert_eq!(
+        txn.take_pending_drops(&m).unwrap(),
+        pending(0, 0, 0),
+        "a second take in the same transaction finds nothing"
+    );
+    txn.commit().unwrap();
+    assert!(db.list_pending_drops().unwrap().is_empty());
+}
+
+#[test]
+fn the_placeholder_master_records_nothing() {
+    // DD-5. `IdentityPub([0; 32])` is "master unknown", not a person; the sweep drops it,
+    // so an event queued under it would hang forever.
+    use crate::types::DropKind;
+    let db = test_db();
+    let mut txn = db.write_txn().unwrap();
+    txn.record_drop_event(&IdentityPub([0; 32]), DropKind::Announced)
+        .unwrap();
+    txn.commit().unwrap();
+    assert!(db.list_pending_drops().unwrap().is_empty());
+}
+
+#[test]
+fn a_damaged_pending_drops_row_reads_as_zeros() {
+    // Д-K: the outbox decodes leniently — a row that is not a PendingDrops map costs its
+    // pending counts, never the whole accrual tick (a strict decode would fail every tick).
+    use crate::types::DropKind;
+    let db = test_db();
+    let m = master_id(0xEE);
+    {
+        let tx = db.inner.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(super::PAIR_LEDGER_PENDING_DROPS).unwrap();
+            t.insert(&m.0, [0xffu8, 0x00, 0x13].as_slice()).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    assert_eq!(
+        db.list_pending_drops().unwrap(),
+        vec![(m, pending(0, 0, 0))]
+    );
+    let mut txn = db.write_txn().unwrap();
+    txn.record_drop_event(&m, DropKind::Announced).unwrap();
+    assert_eq!(txn.take_pending_drops(&m).unwrap(), pending(1, 0, 0));
+    txn.commit().unwrap();
+}
+
+// ============================================================
+// Catalog history and pointer publication (spec B2, dr-i9)
+// ============================================================
+
+#[test]
+fn get_or_create_catalog_lineage_is_idempotent() {
+    let db = test_db();
+    assert_eq!(db.catalog_lineage().unwrap(), None);
+    let a = db.get_or_create_catalog_lineage().unwrap();
+    let b = db.get_or_create_catalog_lineage().unwrap();
+    assert_eq!(a, b);
+    assert_eq!(db.catalog_lineage().unwrap(), Some(a));
+}
+
+#[test]
+fn every_fresh_db_mints_its_own_catalog_lineage() {
+    // Each DB is its own history: two installations never share an id.
+    let a = test_db().get_or_create_catalog_lineage().unwrap();
+    let b = test_db().get_or_create_catalog_lineage().unwrap();
+    assert_ne!(a, b);
+}
+
+#[test]
+fn record_pointer_publication_roundtrip() {
+    use crate::system_state::CatalogLineageId;
+    use crate::system_state::catalog::PointerPublication;
+    let db = test_db();
+    assert_eq!(db.last_pointer_publication().unwrap(), None);
+    let first = PointerPublication {
+        lineage: CatalogLineageId([1u8; 16]),
+        created_at: Timestamp(100),
+        generation: 1,
+        files: 3,
+        acks: 2,
+    };
+    db.record_pointer_publication(&first).unwrap();
+    assert_eq!(db.last_pointer_publication().unwrap(), Some(first));
+    let second = PointerPublication {
+        created_at: Timestamp(200),
+        generation: 2,
+        files: 2,
+        acks: 5,
+        ..first
+    };
+    db.record_pointer_publication(&second).unwrap();
+    assert_eq!(db.last_pointer_publication().unwrap(), Some(second));
 }

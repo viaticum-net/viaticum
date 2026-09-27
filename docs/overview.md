@@ -51,9 +51,9 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 ### Disaster Recovery
 
 1. `viaticum dr --mnemonic "24 words" --peer <addr>` — standalone, no daemon needed
-2. Derive identity from seed phrase, open fresh DB seeded with the --peer addresses
-3. Join the Kademlia DHT, `get_closest_peers(SHA256(master))` → dial and authenticate the postmen closest to our own identity
-4. Poll the mailbox in expanding batches [100, 300, 1000] for the signed SelfPointer; verify each signature against the mnemonic identity, pick the freshest by created_at
+2. Derive identity from seed phrase; check the folder (no foreign key, no running node) and work in a staging DB; the --peer addresses bootstrap the DHT
+3. Join the Kademlia DHT, `get_closest_peers(master)` (libp2p hashes it to where the postmen are ranked) → dial and authenticate them
+4. Collect every signed SelfPointer of the identity from the mailbox (expanding batches [100, 300, 1000], each peer asked once); one catalog history → restore its freshest pointer; several (e.g. a node started by mistake with the same phrase) → list them and require `--catalog`
 5. Dial the holders named in the pointer, fetch the SystemState SS-block symbols, RaptorQ-decode, decrypt with the seed-derived key, restore DB
 6. Run `viaticum daemon` then `viaticum restore <path>` to recover files
 
@@ -75,7 +75,6 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 | `types` | Newtype ID wrappers (SourceBlockId, IdentityPub, DeviceId, FileId, NodeId), domain structs (FileRecord, SourceBlockRecord, SymbolPlacement, PeerRecord) |
 | `constants` | All tunable protocol constants |
 | `trust` | TrustEngine: `trust = (KP*P + KI*I) * clamp(S, 0.1, 1.0)` |
-| `escrow` | Contribution-based restore gating: `restore_budget_gb = stored_gb_days / factor` |
 | `placement` | Symbol allocation: `weight = trust/sqrt(1-trust)`, cap, MAX_HOLDERS=30 |
 | `budget` | Owner backup budget estimation, holder eviction priority |
 | `erasure` | ErasureEncoder trait + RaptorQ impl, per-holder XOR binding |
@@ -120,6 +119,6 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 - Phases 1-7 complete (core logic, daemon wiring, P2P networking)
 - δ.1 Database Reliability complete: crash safety, DB backup to peers, DR from seed phrase
 - Real-world P2P tested: LAN (Netbird) + NAT (relay + DCUtR, both peers behind NAT)
-- All features wired: escrow check, effective_quota, device add/revoke, SymbolAccept->BackupCoordinator
+- All features wired: effective_quota, device add/revoke, SymbolAccept->BackupCoordinator
 
 See [features.md](features.md) for the roadmap and [usage.md](usage.md) for how to use it.

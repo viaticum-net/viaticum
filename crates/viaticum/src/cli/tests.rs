@@ -273,7 +273,96 @@ fn make_status_zero_peers() -> StatusData {
         blocks_at_risk: 0,
         table_stats: None,
         by_importance: vec![],
+        restore_staging_jobs: 0,
+        restore_staging_bytes: Some(0),
+        restore_staging_path: String::new(),
+        restore_publish: String::new(),
+        restore_staging_squeezes_holdings: false,
+        dr_pointer_published_at: 0,
+        dr_pointer_files: 0,
+        dr_pointer_acks: 0,
+        catalog_lineage: String::new(),
+        files_without_source: 0,
     }
+}
+
+/// restore-i8: `status` reminds the user that restored files wait in staging.
+#[test]
+fn render_status_shows_restore_staging_when_job_dirs_exist() {
+    let mut data = make_status_zero_peers();
+    data.restore_staging_jobs = 2;
+    data.restore_staging_bytes = Some(3 * 1024 * 1024);
+    data.restore_staging_path = "/home/kolya/.viaticum/restore".into();
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("restore staging: 2 job dir(s)"),
+        "got: {rendered}"
+    );
+    assert!(
+        rendered.contains("/home/kolya/.viaticum/restore"),
+        "got: {rendered}"
+    );
+    assert!(rendered.contains("move files out, then delete the directories"));
+}
+
+#[test]
+fn render_status_hides_restore_staging_when_empty() {
+    let rendered = output::render_status(&make_status_zero_peers());
+    assert!(!rendered.contains("restore staging"), "got: {rendered}");
+}
+
+/// Old daemons do not send the staging fields; the CLI still parses the status.
+#[test]
+fn status_data_without_staging_fields_deserializes_with_zero() {
+    let mut v = serde_json::to_value(make_status_zero_peers()).unwrap();
+    let obj = v.as_object_mut().unwrap();
+    obj.remove("restore_staging_jobs");
+    obj.remove("restore_staging_bytes");
+    obj.remove("restore_staging_path");
+    obj.remove("restore_publish");
+    obj.remove("restore_staging_squeezes_holdings");
+    let back: StatusData = serde_json::from_value(v).unwrap();
+    assert_eq!(back.restore_staging_jobs, 0);
+    assert_eq!(back.restore_staging_bytes, None);
+    assert!(!back.restore_staging_squeezes_holdings);
+}
+
+/// W3: right after start the byte count is not known yet: say so, never "0 B".
+#[test]
+fn render_status_says_counting_before_bytes_are_known() {
+    let mut data = make_status_zero_peers();
+    data.restore_staging_jobs = 1;
+    data.restore_staging_bytes = None;
+    let rendered = output::render_status(&data);
+    assert!(rendered.contains("size still counting"), "got: {rendered}");
+}
+
+/// restore-i18: the squeeze warning names the staging size and asks to move out.
+#[test]
+fn render_status_warns_when_staging_takes_space_from_friends() {
+    let mut data = make_status_zero_peers();
+    data.restore_staging_jobs = 1;
+    data.restore_staging_bytes = Some(2 * 1024 * 1024 * 1024);
+    data.restore_staging_squeezes_holdings = true;
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("is taking space from your friends' data; move files out and delete it"),
+        "got: {rendered}"
+    );
+}
+
+/// restore-i19: no atomic publish path → an explicit error line in status.
+#[test]
+fn render_status_reports_unavailable_publish() {
+    let mut data = make_status_zero_peers();
+    data.restore_publish = "unavailable".into();
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("restore cannot write files into staging"),
+        "got: {rendered}"
+    );
+    data.restore_publish = "hard_link".into();
+    assert!(!output::render_status(&data).contains("cannot write"));
 }
 
 #[test]
@@ -352,6 +441,16 @@ fn format_status_top_peers_printed() {
         blocks_at_risk: 1,
         table_stats: None,
         by_importance: vec![],
+        restore_staging_jobs: 0,
+        restore_staging_bytes: Some(0),
+        restore_staging_path: String::new(),
+        restore_publish: String::new(),
+        restore_staging_squeezes_holdings: false,
+        dr_pointer_published_at: 0,
+        dr_pointer_files: 0,
+        dr_pointer_acks: 0,
+        catalog_lineage: String::new(),
+        files_without_source: 0,
     };
     let rendered = output::render_status(&data);
     assert!(rendered.contains("a1b2c3d4"), "got: {rendered}");
@@ -816,7 +915,7 @@ fn cli_response_roundtrips_cbor() {
     use super::types::{RestoreData, StatusData};
 
     let responses = vec![
-        CliResponse::Status(StatusData {
+        CliResponse::Status(Box::new(StatusData {
             node_identity: "aabbccdd11223344".into(),
             device_id: "aabbccdd11223344".into(),
             node_addr: String::new(),
@@ -840,7 +939,17 @@ fn cli_response_roundtrips_cbor() {
             blocks_at_risk: 0,
             table_stats: None,
             by_importance: vec![],
-        }),
+            restore_staging_jobs: 0,
+            restore_staging_bytes: Some(0),
+            restore_staging_path: String::new(),
+            restore_publish: String::new(),
+            restore_staging_squeezes_holdings: false,
+            dr_pointer_published_at: 0,
+            dr_pointer_files: 0,
+            dr_pointer_acks: 0,
+            catalog_lineage: String::new(),
+            files_without_source: 0,
+        })),
         CliResponse::DeviceList(vec![]),
         CliResponse::Error("oops".into()),
         CliResponse::Restore(RestoreData {
@@ -861,4 +970,48 @@ fn cli_response_roundtrips_cbor() {
         let decoded: CliResponse = cbor_decode(&bytes);
         assert_eq!(&decoded, resp);
     }
+}
+
+// ── DR readiness and missing sources in `status` (dr-i9, dr-i11) ──────────────
+
+#[test]
+fn status_render_says_dr_not_ready_before_any_accepted_publication() {
+    let data = make_status_zero_peers();
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("DR:             NOT READY"),
+        "got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("files without local source"),
+        "got: {rendered}"
+    );
+}
+
+#[test]
+fn status_render_says_dr_ready_with_time_files_and_acks() {
+    let mut data = make_status_zero_peers();
+    data.dr_pointer_published_at = 1_790_000_000;
+    data.dr_pointer_files = 3;
+    data.dr_pointer_acks = 2;
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("DR:             ready: recovery pointer published 2026-09-21T"),
+        "got: {rendered}"
+    );
+    assert!(
+        rendered.contains("3 files, accepted by 2 peer(s)"),
+        "got: {rendered}"
+    );
+}
+
+#[test]
+fn status_render_counts_files_without_local_source_when_positive() {
+    let mut data = make_status_zero_peers();
+    data.files_without_source = 3;
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("files without local source: 3 (not re-protected"),
+        "got: {rendered}"
+    );
 }

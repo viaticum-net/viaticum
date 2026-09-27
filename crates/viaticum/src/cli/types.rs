@@ -39,7 +39,8 @@ pub enum CliRequest {
 /// Response from daemon to CLI process.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CliResponse {
-    Status(StatusData),
+    /// Boxed: `StatusData` is several times larger than every other variant.
+    Status(Box<StatusData>),
     Restore(RestoreData),
     /// Restore was rejected before any data movement; reason carried in `RestoreBlocker`.
     /// Maps to HTTP 409 in `web_api`.
@@ -129,6 +130,41 @@ pub struct StatusData {
     /// Empty buckets have block_count=0, mean_p_recoverable=0.0, status="empty".
     #[serde(default)]
     pub by_importance: Vec<viaticum_core::types::ImportanceBucketStats>,
+    /// Job dirs under `<data_dir>/restore` (restore-i8: the daemon never deletes them).
+    #[serde(default)]
+    pub restore_staging_jobs: u32,
+    /// Bytes under `<data_dir>/restore`; `None` while the daemon is still counting
+    /// (right after start).
+    #[serde(default)]
+    pub restore_staging_bytes: Option<u64>,
+    /// Absolute path of the staging root (`<data_dir>/restore`) on the daemon host.
+    #[serde(default)]
+    pub restore_staging_path: String,
+    /// How restored files are published in staging (`hard_link`, `rename_noreplace`,
+    /// `checked_rename`), `unavailable` if none works there (restore-i19).
+    #[serde(default)]
+    pub restore_publish: String,
+    /// The holder is under disk pressure while staging holds restored files: staging
+    /// takes space from friends' data (restore-i18).
+    #[serde(default)]
+    pub restore_staging_squeezes_holdings: bool,
+    /// dr-i9: unix secs of this node's last recovery-pointer publication accepted by
+    /// ≥ 1 postman; 0 = never (DR from the phrase would not find this catalog yet).
+    #[serde(default)]
+    pub dr_pointer_published_at: u64,
+    /// Live files in the catalog that publication restores.
+    #[serde(default)]
+    pub dr_pointer_files: u32,
+    /// Postmen that accepted that publication.
+    #[serde(default)]
+    pub dr_pointer_acks: u32,
+    /// Hex of this DB's catalog history id; "" before the node minted one.
+    #[serde(default)]
+    pub catalog_lineage: String,
+    /// dr-i11: live catalog files whose path does not exist on this machine (not
+    /// re-protected until they are back).
+    #[serde(default)]
+    pub files_without_source: u32,
 }
 
 /// Peer summary shown in `viaticum status`.
@@ -200,8 +236,8 @@ pub struct DeviceEntry {
     pub revoked: bool,
 }
 
-/// Lifecycle state for a file's latest version, computed from placement counts
-/// + escrow estimate. Drives the badge in the UI. See `compute_effective_status`.
+/// Lifecycle state for a file's latest version, computed from placement counts.
+/// Drives the badge in the UI. See `compute_effective_status`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EffectiveStatus {
@@ -210,17 +246,9 @@ pub enum EffectiveStatus {
     /// Source block created, holders haven't accepted enough.
     /// `live` = placements in Alive; `target` = `k_eff` for the block.
     Replicating { live: u32, target: u32 },
-    /// `live >= target` (k_eff alive), restore would also succeed today
-    /// (escrow budget is sufficient). Greenlight.
+    /// `live >= target` (k_eff alive): the network can rebuild it. Greenlight.
+    /// No holder-side gate can refuse the owner (restore-i6).
     Restorable { live: u32, target: u32 },
-    /// `live >= target` but restore would be denied — escrow budget is below
-    /// what this block needs. Common right after first replication when
-    /// contribution hasn't accrued yet.
-    ReplicatedCold {
-        live: u32,
-        target: u32,
-        est_seconds_to_restorable: Option<u64>,
-    },
     /// We had `target` Alive at some point; now `live < target` after losses.
     /// Repair pipeline is responsible for bringing it back.
     Degraded { live: u32, lost: u32, target: u32 },
@@ -237,14 +265,6 @@ pub enum RestoreBlocker {
         have: u32,
         need: u32,
         holders_offline: u32,
-    },
-    /// All holders refused via escrow because we haven't earned enough
-    /// contribution yet. `est_seconds` is a rough wait-time estimate or None
-    /// if we can't predict (e.g. nothing accruing).
-    EscrowLocked {
-        budget_gb: f64,
-        needed_gb: f64,
-        est_seconds: Option<u64>,
     },
     /// All `Alive` holders are unreachable (last_seen too old).
     AllHoldersOffline { last_seen_secs_ago: u64 },

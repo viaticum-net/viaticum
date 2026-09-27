@@ -6,14 +6,13 @@ use std::io::Write;
 #[cfg(test)]
 use crate::config::{
     AppConfig, BackupCfg, ClusterCfg, ConfigError, DEFAULT_IMPORTANCE,
-    DEFAULT_IMPORTANCE_MULTIPLIER, EscrowCfg, MetricsCfg, NetworkCfg, ReliabilityConfig,
-    RestoreCfg, StorageCfg, WatchConfig, WebApiCfg, derive_file_importance, disk_reserve_bytes,
+    DEFAULT_IMPORTANCE_MULTIPLIER, MetricsCfg, NetworkCfg, ReliabilityConfig, RestoreCfg,
+    StorageCfg, WatchConfig, WebApiCfg, derive_file_importance, disk_reserve_bytes,
     expand_data_dir, hard_quota_bytes, soft_quota_bytes, source_block_size_bytes,
 };
 #[cfg(test)]
 use crate::constants::{
-    DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_K_FACTOR, DEFAULT_MAX_VERSIONS,
-    DEFAULT_SOURCE_BLOCK_SIZE,
+    DEFAULT_DISK_RESERVE_BYTES, DEFAULT_MAX_VERSIONS, DEFAULT_SOURCE_BLOCK_SIZE,
 };
 #[cfg(test)]
 use crate::importance::{
@@ -53,7 +52,6 @@ fn config_loads_defaults_when_file_is_empty() {
         defaults.storage.disk_reserve_gb
     );
     assert_eq!(cfg.storage.data_dir, defaults.storage.data_dir);
-    assert_eq!(cfg.escrow.k_factor, defaults.escrow.k_factor);
     assert_eq!(cfg.network.enable_relay, defaults.network.enable_relay);
     assert_eq!(
         cfg.cluster.sync_batch_size,
@@ -71,7 +69,6 @@ fn config_loads_partial_file_merging_with_defaults() {
         cfg.storage.disk_reserve_gb,
         DEFAULT_DISK_RESERVE_BYTES as f64 / 1_073_741_824.0
     );
-    assert_eq!(cfg.escrow.k_factor, DEFAULT_ESCROW_K_FACTOR);
     assert_eq!(cfg.cluster.sync_batch_size, 100);
 }
 
@@ -89,7 +86,6 @@ fn config_roundtrips_all_fields() {
             disk_reserve_gb: 50.0,
             data_dir: "/data/viaticum".to_string(),
         },
-        escrow: EscrowCfg { k_factor: 14.0 },
         network: NetworkCfg {
             enable_relay: false,
             enable_relay_server: false,
@@ -120,7 +116,6 @@ fn config_roundtrips_all_fields() {
     assert_eq!(loaded.storage.hard_quota_gb, 10.0);
     assert_eq!(loaded.storage.disk_reserve_gb, 50.0);
     assert_eq!(loaded.storage.data_dir, "/data/viaticum");
-    assert_eq!(loaded.escrow.k_factor, 14.0);
     assert!(!loaded.network.enable_relay);
     assert_eq!(loaded.cluster.sync_batch_size, 200);
 }
@@ -240,26 +235,22 @@ fn config_validate_rejects_cluster_sync_batch_size_zero() {
 }
 
 #[test]
-fn config_validate_rejects_escrow_k_factor_zero() {
-    let mut cfg = AppConfig::default();
-    cfg.escrow.k_factor = 0.0;
-    let err = cfg.validate().unwrap_err();
-    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "escrow.k_factor"));
+fn config_load_ignores_legacy_escrow_section() {
+    // restore-i6: v1 removed the holder-side escrow gate. A config written before that
+    // (with `[escrow] k_factor`, even the old invalid 0.0) must still load, and the rest of
+    // the file must still apply.
+    let f = write_toml(
+        "[storage]\ndisk_reserve_gb = 3.0\n\n[escrow]\nk_factor = 0.0\n\n[cluster]\nsync_batch_size = 7\n",
+    );
+    let cfg = AppConfig::load(f.path()).unwrap();
+    assert_eq!(cfg.storage.disk_reserve_gb, 3.0);
+    assert_eq!(cfg.cluster.sync_batch_size, 7);
 }
 
 #[test]
-fn config_validate_rejects_escrow_k_factor_negative() {
-    let mut cfg = AppConfig::default();
-    cfg.escrow.k_factor = -1.0;
-    let err = cfg.validate().unwrap_err();
-    assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "escrow.k_factor"));
-}
-
-#[test]
-fn config_validate_accepts_positive_k_factor() {
-    let mut cfg = AppConfig::default();
-    cfg.escrow.k_factor = 14.0;
-    cfg.validate().unwrap();
+fn config_serialized_defaults_have_no_escrow_section() {
+    let text = toml::to_string(&AppConfig::default()).unwrap();
+    assert!(!text.contains("escrow"), "{text}");
 }
 
 #[test]
@@ -346,7 +337,6 @@ fn config_defaults_match_constants() {
         cfg.storage.disk_reserve_gb,
         DEFAULT_DISK_RESERVE_BYTES as f64 / 1_073_741_824.0
     );
-    assert_eq!(cfg.escrow.k_factor, DEFAULT_ESCROW_K_FACTOR);
     assert!(cfg.network.enable_relay);
 }
 
@@ -1208,4 +1198,49 @@ fn populate_bursts_handles_missing_directory() {
         Some(vec![]),
         "missing directory: bursts should be Some(empty vec)"
     );
+}
+
+#[cfg(test)]
+fn section_value(cfg: &AppConfig, section: &str) -> toml::Value {
+    toml::Value::try_from(cfg).unwrap()[section].clone()
+}
+
+/// A present-but-empty section must equal that section's `impl Default`, field for field.
+/// A field-level `#[serde(default)]` inside a container-level `#[serde(default)]` struct
+/// silently takes the field type's default instead (e.g. `bool` → false) and turns this red.
+#[test]
+fn every_section_when_present_but_empty_then_equals_section_default() {
+    let defaults = AppConfig::default();
+    for section in [
+        "backup",
+        "storage",
+        "network",
+        "cluster",
+        "metrics",
+        "web_api",
+        "restore",
+        "reliability",
+    ] {
+        let f = write_toml(&format!("[{section}]\n"));
+        let cfg = AppConfig::load(f.path()).unwrap();
+        assert_eq!(
+            section_value(&cfg, section),
+            section_value(&defaults, section),
+            "[{section}] present without keys must match its Default"
+        );
+    }
+}
+
+#[test]
+fn network_section_without_key_keeps_ipfs_bootstrap_disabled() {
+    let f = write_toml("[network]\nlisten_port = 4001\n");
+    let cfg = AppConfig::load(f.path()).unwrap();
+    assert!(cfg.network.kademlia_disable_ipfs_bootstrap);
+}
+
+#[test]
+fn network_explicit_false_when_set_then_ipfs_bootstrap_enabled() {
+    let f = write_toml("[network]\nkademlia_disable_ipfs_bootstrap = false\n");
+    let cfg = AppConfig::load(f.path()).unwrap();
+    assert!(!cfg.network.kademlia_disable_ipfs_bootstrap);
 }

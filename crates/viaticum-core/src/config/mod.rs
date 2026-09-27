@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::constants::{
     DEFAULT_CLUSTER_SYNC_BATCH_SIZE, DEFAULT_COMPLETION_BONUS_COEFFICIENT,
-    DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_K_FACTOR, DEFAULT_MAX_VERSION_AGE_SECS,
-    DEFAULT_MAX_VERSIONS, DEFAULT_SOURCE_BLOCK_SIZE, MAX_COMPLETION_BONUS_COEFFICIENT,
+    DEFAULT_DISK_RESERVE_BYTES, DEFAULT_MAX_VERSION_AGE_SECS, DEFAULT_MAX_VERSIONS,
+    DEFAULT_SOURCE_BLOCK_SIZE, MAX_COMPLETION_BONUS_COEFFICIENT,
 };
 
 #[cfg(test)]
@@ -93,24 +93,6 @@ impl Default for StorageCfg {
     }
 }
 
-/// [escrow] — contribution-based restore budget.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct EscrowCfg {
-    /// Days of storage contribution required to earn 1 GB of restore credit.
-    /// Formula: restore_budget_gb = stored_gb_days / k_factor.
-    /// Default: 7.0 (store 1 GB for 7 days → earn 1 GB restore budget).
-    pub k_factor: f64,
-}
-
-impl Default for EscrowCfg {
-    fn default() -> Self {
-        Self {
-            k_factor: DEFAULT_ESCROW_K_FACTOR,
-        }
-    }
-}
-
 /// [network] — libp2p transport / NAT-traversal settings.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -133,32 +115,27 @@ pub struct NetworkCfg {
     /// to this relay server instead of bootstrap peers acting as relays.
     /// Format: "http://hostname:port" (dev mode) or "https://hostname" (production).
     /// Default: None (use bootstrap peers / Kademlia-discovered relays).
-    #[serde(default)]
     pub relay_url: Option<String>,
 
     /// Bootstrap peer addresses to connect on startup.
     /// Format: "NodeId_hex@ip:port" or "NodeId_hex@relay_url,ip:port".
     /// Default: [] (empty — no bootstrap peers).
-    #[serde(default)]
     pub bootstrap_peers: Vec<String>,
 
-    /// Additional libp2p/Kademlia bootstrap nodes (Multiaddr strings).
-    /// These supplement the built-in IPFS bootstrap nodes.
-    /// Format: standard libp2p Multiaddr, e.g.
-    ///   "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
-    /// Default: [] (use only IPFS built-in bootstrap nodes).
-    #[serde(default)]
+    /// Kademlia bootstrap nodes of the circle (Multiaddr strings, with /p2p/<peer>).
+    /// The built-in IPFS bootstrap nodes are NOT used unless
+    /// `kademlia_disable_ipfs_bootstrap = false` is set explicitly (network-i11).
+    /// Format: standard libp2p Multiaddr, e.g. "/ip4/203.0.113.7/tcp/4001/p2p/12D3Koo…"
+    /// Default: [] (no bootstrap nodes).
     pub kademlia_bootstrap_peers: Vec<String>,
 
     /// Disable IPFS built-in bootstrap nodes and use only kademlia_bootstrap_peers.
     /// Default: true (IPFS public DHT is a separate network, not useful for Viaticum).
     /// Set to false only if you have custom bootstrap infrastructure on the IPFS DHT.
-    #[serde(default)]
     pub kademlia_disable_ipfs_bootstrap: bool,
 
     /// libp2p TCP listen port. 0 = ephemeral (default). Set to a fixed value
     /// when running behind a firewall that only opens specific ports.
-    #[serde(default)]
     pub listen_port: u16,
 }
 
@@ -572,12 +549,14 @@ impl Default for ReliabilityConfig {
 
 /// Unified daemon configuration. Loaded from `~/.viaticum/config.toml` or an explicit path.
 /// Every field has a sensible default; `AppConfig::default()` requires no file.
+///
+/// Unknown sections are ignored (no `deny_unknown_fields`): a legacy `[escrow]` section from
+/// before v1 removed the holder-side restore gate (restore-i6) still loads.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub backup: BackupCfg,
     pub storage: StorageCfg,
-    pub escrow: EscrowCfg,
     pub network: NetworkCfg,
     pub cluster: ClusterCfg,
     pub metrics: MetricsCfg,
@@ -636,7 +615,6 @@ impl AppConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let b = &self.backup;
         let s = &self.storage;
-        let e = &self.escrow;
         let n = &self.network;
         let c = &self.cluster;
 
@@ -686,12 +664,6 @@ impl AppConfig {
             return Err(ConfigError::Validation {
                 field: "storage.hard_quota_gb".to_string(),
                 reason: "hard floor cannot exceed soft ceiling".to_string(),
-            });
-        }
-        if e.k_factor <= 0.0 {
-            return Err(ConfigError::Validation {
-                field: "escrow.k_factor".to_string(),
-                reason: "must be > 0.0".to_string(),
             });
         }
         if c.sync_batch_size < 1 {

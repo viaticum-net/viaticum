@@ -1,10 +1,12 @@
-// Restore handlers: serve symbols to owner (holder role), log denial (owner role).
+// Restore handler (holder role): serve the owner's own symbols while we hold them.
+//
+// v1 has no restore gate (restore-i6, 4R W14): a holder never refuses the legitimate owner
+// because of how long it has stored for them. The holding is looked up by the pair
+// (block, requester master), so a foreign master gets an empty response (restore-i7).
 
 use tracing::{debug, info, warn};
-use viaticum_core::constants::{BYTES_PER_GB, SYMBOL_SIZE};
 use viaticum_core::erasure::Symbol;
-use viaticum_core::escrow::{RestoreDecision, check_restore};
-use viaticum_core::messages::{RestoreDeniedMsg, RestoreRequestMsg, RestoreResponseMsg};
+use viaticum_core::messages::{RestoreRequestMsg, RestoreResponseMsg};
 use viaticum_core::types::{HoldingStatus, IdentityPub, Timestamp, hex_encode};
 
 use super::{Processor, ProcessorError, ranges_to_esi_list};
@@ -20,50 +22,34 @@ impl Processor {
     ) -> Result<RestoreResponseMsg, ProcessorError> {
         let block_id = request.source_block_id;
 
-        // Check HoldingRecord.
-        let holding = self.db.get_holding(&block_id, &owner_id)?;
-        let holding = match holding {
-            Some(h) if h.status == HoldingStatus::Active => h,
-            _ => {
-                // Not held or not active: return empty response (not a protocol error).
-                return Ok(RestoreResponseMsg {
-                    v: 1,
-                    source_block_id: block_id,
-                    symbols: vec![],
-                    timestamp: Timestamp::now(),
-                });
-            }
+        // Check HoldingRecord. restore-i16: everything we hold for the owner is served except
+        // what the owner itself asked us to delete. The match is exhaustive on purpose: a new
+        // holding status must decide here, it must not silently turn restore into "empty".
+        let empty = || RestoreResponseMsg {
+            v: 1,
+            source_block_id: block_id,
+            symbols: vec![],
+            timestamp: Timestamp::now(),
         };
-
-        // Escrow check: verify owner has earned enough restore budget through storage contribution.
-        let k_factor = self.escrow_cfg.k_factor;
-        let stored_gb_days =
-            self.db
-                .stored_for_peer_gb_days(&owner_id, Timestamp::now(), self.time_scale)?;
-        let already_restored_bytes = self.db.restored_total_bytes(&owner_id)?;
-        let already_restored_gb = already_restored_bytes as f64 / BYTES_PER_GB;
-        let this_request_gb = holding
-            .esi_ranges
-            .iter()
-            .map(|&(_start, count)| count as f64 * SYMBOL_SIZE as f64)
-            .sum::<f64>()
-            / BYTES_PER_GB;
-        if let RestoreDecision::Denied(denial) = check_restore(
-            stored_gb_days,
-            already_restored_gb,
-            this_request_gb,
-            k_factor,
-        ) {
-            warn!(
-                owner = %owner_id,
+        let Some(holding) = self.db.get_holding(&block_id, &owner_id)? else {
+            // Not held for this master (or a foreign master): empty response, not an error.
+            info!(
                 block_id = %block_id,
-                stored_gb_days,
-                already_restored_gb,
-                this_request_gb,
-                budget = denial.restore_budget_gb,
-                "processor: RestoreRequest denied by escrow check"
+                requester = %hex_encode(&owner_id.0),
+                "processor: RestoreRequest — no active holding for requester, empty response"
             );
-            return Err(ProcessorError::EscrowDenied { block_id, denial });
+            return Ok(empty());
+        };
+        match holding.status {
+            HoldingStatus::Active | HoldingStatus::Silent => {}
+            HoldingStatus::MarkedForDelete => {
+                info!(
+                    block_id = %block_id,
+                    requester = %hex_encode(&owner_id.0),
+                    "processor: RestoreRequest — holding marked for delete by the owner, empty response"
+                );
+                return Ok(empty());
+            }
         }
 
         // Determine which ESIs to send.
@@ -116,12 +102,13 @@ impl Processor {
             );
         }
 
-        // Increment restore-served counter for this owner after successful symbol load.
+        // Accounting only (v1): nothing gates restore on it; input for a future
+        // escrow-as-debt (tech-debt [OPEN-NETWORK]).
         let bytes_served: u64 = symbols.iter().map(|s| s.data.len() as u64).sum();
         if bytes_served > 0
             && let Err(e) = self.db.record_restore_served(&owner_id, bytes_served)
         {
-            // Non-fatal: log and continue. Worst case: budget is slightly over-estimated next time.
+            // Non-fatal: the counter is informational.
             warn!(owner = %owner_id, err = %e, "processor: failed to record restore_served");
         }
 
@@ -131,22 +118,5 @@ impl Processor {
             symbols,
             timestamp: Timestamp::now(),
         })
-    }
-
-    /// Holder denied our restore request. Log warning.
-    pub(crate) async fn handle_restore_denied(
-        &self,
-        holder_id: IdentityPub,
-        denied: RestoreDeniedMsg,
-    ) -> Result<(), ProcessorError> {
-        warn!(
-            holder = %holder_id,
-            block_id = %denied.source_block_id,
-            current_trust = denied.current_trust,
-            needed_trust = denied.needed_trust,
-            restore_budget_gb = denied.restore_budget_gb,
-            "processor: RestoreDenied received"
-        );
-        Ok(())
     }
 }

@@ -70,7 +70,6 @@ pub enum Message {
     SymbolDropNotice(SymbolDropNoticeMsg),
     RestoreRequest(RestoreRequestMsg),
     RestoreResponse(RestoreResponseMsg),
-    RestoreDenied(RestoreDeniedMsg),
     ClusterSyncRequest(ClusterSyncRequestMsg),
     MailboxFetchRequest(MailboxFetchRequest),      // poll my own mail from a postman
     MailboxFetchResponse(MailboxFetchResponse),    // entries addressed to the requester
@@ -183,7 +182,7 @@ Initiator (A)              Acceptor (B)
 
 #### Handshake result
 
-After a successful exchange the node knows the peer's `master_pub_key` (cluster identity) and `DeviceId` (transport identity). All trust / escrow / placement operations key on the master identity.
+After a successful exchange the node knows the peer's `master_pub_key` (cluster identity) and `DeviceId` (transport identity). All trust / restore / placement operations key on the master identity.
 
 > A `HandshakeMsg` struct still exists in the message enum from the earlier design, but the live authentication path is the `DeviceCertExchange` above.
 
@@ -267,7 +266,7 @@ PoS is the mechanism for verifying that a holder is actually storing the assigne
 
 #### Messages
 
-A challenge covers an ESI **range** and is answered with a single chain hash over all the bound symbols in it — raw symbol bytes never cross the wire (this also closes an escrow-bypass: you cannot fetch your data back through PoS).
+A challenge covers an ESI **range** and is answered with a single chain hash over all the bound symbols in it — raw symbol bytes never cross the wire (PoS proves possession without shipping data).
 
 **PosHashChallengeMsg** (Owner → Holder):
 ```rust
@@ -610,8 +609,7 @@ pub struct SymbolTransferMsg {
 ```
 Owner                          Holder
   │── RestoreRequest ─────────>│   esi_list: [] = "any K_eff from your set"
-  │<─ RestoreResponse ──────────│   bound symbols
-  │   (or RestoreDenied)
+  │<─ RestoreResponse ──────────│   bound symbols (empty if no holding for this owner, or the owner asked to delete it)
 ```
 
 **RestoreRequestMsg**:
@@ -620,19 +618,6 @@ pub struct RestoreRequestMsg {
     pub v: u8,
     pub source_block_id: SourceBlockId,
     pub esi_list: Vec<u32>,    // empty = "any K_eff"
-    pub timestamp: Timestamp,
-}
-```
-
-**RestoreDeniedMsg** (escrow check failed):
-```rust
-pub struct RestoreDeniedMsg {
-    pub v: u8,
-    pub source_block_id: SourceBlockId,
-    pub reason: String,
-    pub current_trust: f64,
-    pub needed_trust: f64,
-    pub restore_budget_gb: f64,
     pub timestamp: Timestamp,
 }
 ```
@@ -706,32 +691,9 @@ pub struct StorageWarningMsg {
 
 ---
 
-### 1.8. Escrow (contribution-based)
+### 1.8. Restore access (no gate in v1)
 
-Escrow controls access to restore. The goal is to block hit-and-run behaviour (take symbols, contribute nothing back) and incentivise mutual contribution.
-
-#### Formula
-
-```
-restore_budget_gb = stored_gb_days / k_factor
-
-k_factor = DEFAULT_ESCROW_K_FACTOR = 7.0  // storage days per 1 GB of restore
-```
-
-Example: store 1 GB for 7 days → earn 1 GB restore budget.
-
-`stored_gb_days` is calculated as the sum of `bytes_we_store_for_peer × days_held` across all holding records for a peer.
-
-#### Check
-
-The holder verifies before sending symbols for restore:
-```
-total_bytes_in_request <= restore_budget_gb × 1024³
-```
-
-If the check fails, the holder sends `RestoreDeniedMsg`.
-
-The time-based escrow (weeks_in_network) from α has been removed. Trust already contains a temporal component (I = cumulative mean).
+v1 has no restore gate: the holder serves the owner's own symbols while it holds them. The holding is looked up by the pair (block, master of the requesting connection); any other master gets an empty `RestoreResponse`. Only what the owner itself asked to delete (`MarkedForDelete`) is not served (restore-i16). Served bytes are counted per owner (`restore_served`) for a future escrow-as-debt; nothing reads the counter today.
 
 ---
 
@@ -755,7 +717,7 @@ HandshakeMsg.identity_pub = DeviceId.0          (device pubkey bytes = device id
 HandshakeMsg.device_cert  = DeviceCertificate   (master_key.sign(device_id.0 || issued_at))
 ```
 
-Upon receiving such a handshake, the partner extracts `master_pub_key` from `device_cert` as the cluster identity. All subsequent trust/escrow operations use `master_pub_key`.
+Upon receiving such a handshake, the partner extracts `master_pub_key` from `device_cert` as the cluster identity. All subsequent trust/restore operations use `master_pub_key`.
 
 #### Device registration
 
@@ -893,14 +855,31 @@ pub struct BlockRef {
     pub encrypted_size: u64,        // DR recomputes ErasureParams from this
 }
 
+pub struct CatalogSummary {
+    pub lineage: CatalogLineageId,  // 16 random bytes: this DB's history, minted once per DB
+    pub publisher: DeviceId,        // the device that published the pointer
+    pub files: u32,                 // live files of the state this pointer restores
+}
+
 pub struct SelfPointer {
     pub generation: u32,            // resets to 1 per owner restart — NOT a global freshness key
     pub base: BlockRef,
     pub diffs: Vec<BlockRef>,
-    pub created_at: Timestamp,      // primary freshness key at DR
-    pub signature: [u8; 64],        // Ed25519 master_key.sign(domain || cbor(gen,base,diffs,created_at))
+    pub created_at: Timestamp,      // freshness key INSIDE one history
+    pub catalog: CatalogSummary,
+    pub signature: [u8; 64],        // Ed25519 master_key.sign("viaticum-self-pointer-v2" ||
+                                    //   cbor(gen, base, diffs, created_at, catalog))
 }
 ```
+
+**Catalog history.** Every database is its own history: the daemon mints a random
+`lineage` when its pointer-push task starts on a database that has none, and a DR mints a NEW one for the database it
+restores (the id lives in the DB's meta table, not in the SystemState snapshot, so it
+never travels with restored state). Two installations of one identity — the lost
+machine and a node started with `init --mnemonic`, or a DR node left running — are
+therefore always two histories. `files` counts live file records (not deleted on every
+device). `publisher` lets DR move the restored files from the lost device to its own
+(otherwise a deletion on the recovered machine would wait forever for the lost device).
 
 The pointer carries holder identities and ESI ranges directly because at DR the
 `symbol_placements` table does not exist yet — it is part of what is being recovered
@@ -913,8 +892,11 @@ that identity.
 `run_periodic_push` republishes the pointer when the state changes structurally, or
 every 30 days otherwise. The `SelfPointer` mailbox entry is **high-trust**: postmen
 never evict it under membership churn or disk pressure — only its 5-year TTL removes
-it. Freshness at DR is decided by `created_at` (wall clock), with `generation` only as
-a same-timestamp tiebreak, because generation resets on restart.
+it. Inside one history the freshest pointer wins by `created_at` (wall clock), with
+`generation` only as a same-timestamp tiebreak, because generation resets on restart.
+Between histories time does not decide: DR restores the only history it finds, and when
+it finds several it lists them (history, live files, date of the newest pointer,
+publisher) and requires `--catalog <first 8 hex>`.
 
 #### Peer discovery
 
@@ -1003,7 +985,7 @@ viaticum restore <path> [--version N] [--date YYYY-MM-DD]
 3. Dedup: multiple files in same batch → single download
 4. Per source_block:
    a. Find holders: SymbolPlacement WHERE status=Alive
-   b. Escrow check: `remaining = stored_gb_days/k_factor - already_restored_gb` sufficient?
+   b. (no restore gate on the holder side, §1.8)
    c. RestoreRequest to K_eff holders in parallel
    d. Collect K_eff bound symbols (any ESI)
    e. Unbind: XOR ChaCha20(HKDF(block_id, holder_id))
@@ -1025,15 +1007,27 @@ All devices lost, only the seed phrase remains:
 viaticum dr --mnemonic "24 words" --peer <addr>
 
 1. Derive identity from seed → IdentityPub
-2. Open a fresh DB, seeded with the provided --peer addresses (restore_db_force)
+2. Preflight (phrase, folder, locks) and claim a staging DB (db.redb.dr-new); the --peer
+   addresses are the Kademlia bootstrap peers, and peers are written to the staging DB as they
+   authenticate
 3. Start minimal SwarmHandle (libp2p, no Processor)
 4. wait_for_kad_bootstrap_stable: join the DHT, drain PeerAuthenticated, upsert discovered peers into the DB
-5. get_closest_peers(SHA256(master_pub)) → dial + authenticate candidates → the postmen closest to our own identity are now known
-6. dr_walk_for_pointer: poll the mailbox in expanding batches [100, 300, 1000], keep SelfPointer entries, verify each signature against the mnemonic identity, select the freshest by created_at
-7. From the pointer's base + diffs, dial each HolderHint (its addrs first, else get_closest_peers(holder_id)) → fetch the SS-block symbols
-8. RaptorQ decode → decrypt (ChaCha20-Poly1305, key derived from seed) → SystemState
-9. Restore DB: files, source blocks, placements, peers, pos_weekly, cluster_state
-10. "Run viaticum daemon, then viaticum restore <path>"
+5. get_closest_peers(master_pub) — the preimage: libp2p hashes it to SHA256(master_pub), where
+   the postmen are ranked → dial + authenticate candidates
+6. dr_collect_pointers: ask every candidate once, in expanding batches [100, 300, 1000], keep every
+   SelfPointer whose signature verifies against the mnemonic identity (no early exit)
+7. Choose the catalog: group by catalog history; one history → its freshest pointer; several →
+   print them all and stop unless --catalog <prefix> names one
+8. From the pointer's base + diffs, dial each HolderHint (one dial over all its addrs, all holders
+   at once; the rest via get_closest_peers(holder_id)) → fetch the SS-block symbols
+9. RaptorQ decode → decrypt (ChaCha20-Poly1305, key derived from seed) → SystemState
+10. Replace the publishing (lost) device by this device in every file record; restore DB (files,
+    source blocks, placements, peers, pos_weekly, cluster_state); merge the peers seen live back
+    over the snapshot (the --peer address first); mint a new catalog history
+11. All of 2-10 runs on drafts (db.redb.dr-new, identity.key.dr-new) and is installed by renames at
+    the end: a failed or interrupted (Ctrl-C) DR changes nothing; an old db.redb is kept as
+    db.redb.dr-bak[.N]
+12. "Run viaticum daemon, then viaticum restore <path>"
 
 The self-pointer is published periodically by the daemon (1.10) as a high-trust mailbox
 entry under the owner's own identity (5-year TTL), so it outlives long owner outages.
@@ -1075,10 +1069,7 @@ Symbols at A and B differ → deduplication is impossible. Each holder must stor
 
 **Attack:** a peer accepts symbols for storage (S-score grows) but stores nothing for others.
 
-**Defence:** Escrow (trust-based).
-
-- Trust = 0 → max 1 GB restore
-- No mutual storage → S-score → 0 → trust → 0 → escrow → empty
+**Defence (v1):** contribution-weighted placement and offer budget. A peer that stores nothing for others earns no offer credit and loses trust weight. There is no restore gate: restore of the owner's own data is never refused (a legitimate owner must get their files back on the worst day). A debt-style escrow for an open network is future work.
 
 ### 4.3. Lazy Deletion (ransomware)
 
@@ -1138,7 +1129,6 @@ Threat model: "lazy not malicious". For an active adversary (with `epoch_key` co
 | `OWNER_DELETE_COOLDOWN_SECS` | 2_419_200 (4 wk) | Owner cooldown before delete |
 | `HOLDER_DELETE_COOLDOWN_SECS` | 2_419_200 (4 wk) | Holder cooldown after delete |
 | `DROP_NOTICE_WINDOW_SECS` | 604_800 (7 days) | Advance notice before drop |
-| `DEFAULT_ESCROW_K_FACTOR` | 7.0 | Storage days per 1 GB restore |
 | `MAILBOX_CANDIDATES_N` | 1000 | Closest peers that store for a target (postman set) |
 | `MAILBOX_WRITE_FANOUT` | 30 | Postmen an entry is deposited with on publish |
 | `MAILBOX_READ_FANOUT` | 300 | Postmen polled when fetching own mail |
@@ -1215,7 +1205,7 @@ Advantage vs α: ~3.4 MB per 1000 files vs ~50 MB (15x smaller). Fungible symbol
 | Encoding unit | Unit (32 MB) | Source block (128 MB default, configurable) |
 | Placement | k-of-n fixed | Weighted budget (trust/sqrt(1-t)) |
 | Overhead | Fixed k/n | Continuous: 1.5 + importance × 1.5 |
-| Escrow | Time-based (weeks_in_network) | Trust-based (FREE_TIER + trust × factor) |
+| Escrow | Time-based (weeks_in_network) | None: no restore gate (v1) |
 | DB metadata | ~50 MB/1000 files | ~3.4 MB/1000 files (15x smaller) |
 | Multi-device | None | Personal Cluster, device certs |
 | PoS | Stub | Real (64 KB response + on-the-fly verify) |

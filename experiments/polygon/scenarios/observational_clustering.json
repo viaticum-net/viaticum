@@ -21,6 +21,5 @@
     }
   ],
   "seed": 42,
-  "escrow_k_factor": 0.001,
   "source_block_size_mb": 32
 }

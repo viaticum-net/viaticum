@@ -28,7 +28,9 @@ use viaticum_core::types::{DeviceId, IdentityPub, Timestamp, hex_encode};
 
 use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent};
 use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
-use crate::daemon::identity::{IdentityError, derive_keys, load_identity};
+use crate::daemon::identity::{
+    IdentityError, corrupt_key_hint, derive_keys, load_identity, not_initialized_hint,
+};
 use crate::daemon::processor::Processor;
 use crate::daemon::repair::RepairTrigger;
 use crate::daemon::restore::{
@@ -74,6 +76,10 @@ pub struct DaemonState {
         RestoreRequest,
         tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
     )>,
+    /// Restore staging status (job dirs, bytes, publish probe), set before the web
+    /// API starts, refreshed by the staging monitor and after each restore; read by
+    /// `status` (restore-i8, i18, i19).
+    pub restore_staging: Arc<Mutex<crate::daemon::restore::cleanup::StagingStatus>>,
     /// Cluster state. Always `Some` in a running daemon (`start` refuses
     /// otherwise); `None` only in dispatch tests that do not build one.
     pub cluster_state: Option<Arc<Mutex<ClusterState>>>,
@@ -113,6 +119,9 @@ pub struct DaemonState {
     /// revocation entries to storage-relationship peers instead of relay broadcast.
     /// None in tests that do not wire up a MailboxRouter.
     pub mailbox_router: Option<std::sync::Arc<crate::daemon::mailbox::routing::MailboxRouter>>,
+    /// dr-i11: background-counted "files without a local source" for `status`.
+    pub missing_sources:
+        std::sync::Arc<crate::daemon::dispatch::missing_sources::MissingSourceCache>,
 }
 
 /// Web API pieces prepared before the swarm starts (see step 9.4 of `start`).
@@ -169,19 +178,14 @@ impl DaemonHandle {
                 kind,
                 match e {
                     IdentityError::NotInitialized if kind == StartFailureKind::NeedsUser => {
-                        anyhow::anyhow!("identity not initialized — run 'viaticum init' first")
+                        anyhow::anyhow!(not_initialized_hint(&cfg.data_dir))
                     }
                     IdentityError::NotInitialized => anyhow::anyhow!(
                         "data directory {} is missing or not readable (not mounted or \
                          not unlocked yet?); will retry",
                         cfg.data_dir.display()
                     ),
-                    IdentityError::Corrupt(p, msg) => anyhow::anyhow!(
-                        "identity file at {} is corrupt or from an incompatible binary version ({}). \
-                     Delete the file and re-run 'viaticum init', or restore from backup.",
-                        p.display(),
-                        msg
-                    ),
+                    IdentityError::Corrupt(p, msg) => anyhow::anyhow!(corrupt_key_hint(&p, &msg)),
                     other => anyhow::anyhow!(
                         "identity load error from {}: {}",
                         key_path.display(),
@@ -394,6 +398,11 @@ impl DaemonHandle {
             std::fs::set_permissions(&staging_root, std::fs::Permissions::from_mode(0o700))
                 .map_err(|e| dir_error(&staging_root, e))?;
         }
+        // Staging status for `status`, known before the web API starts (job-dir count,
+        // publish probe); bytes come from the staging monitor (9.2).
+        let restore_staging = Arc::new(Mutex::new(
+            crate::daemon::restore::cleanup::initial_staging_status(&staging_root),
+        ));
 
         // ── 9.4. Bind the web API listener (optional) ─────────────────────────
         // Bound BEFORE the swarm listens and before any task is spawned: a web
@@ -662,6 +671,7 @@ impl DaemonHandle {
             identity_pub,
             device_id,
             restore_tx: restore_tx.clone(),
+            restore_staging: Arc::clone(&restore_staging),
             cluster_state: Some(cluster_state.clone()),
             master_key: master_key.clone(),
             seed: keyfile.seed.clone(),
@@ -691,6 +701,7 @@ impl DaemonHandle {
             peer_backoff: Arc::clone(&peer_backoff),
             // T-13b-2: router shared with dispatch_device_revoke for directed revocation publish.
             mailbox_router: Some(std::sync::Arc::clone(&early_mailbox_router)),
+            missing_sources: Default::default(),
         });
 
         // Clone state for web API and metrics pusher.
@@ -801,35 +812,28 @@ impl DaemonHandle {
             })));
         }
 
-        // ── 9.2. Spawn staging cleanup checker (warn + evict stale) ──
+        // ── 9.2. Restore staging report (restore-i8: report, never delete) ──
         {
-            let staging_root_for_warn = staging_root.clone();
-            let warn_bytes = (app_config.restore.staging_warn_gb * 1_073_741_824.0) as u64;
-            let cancel_for_warn = cancel.clone();
-            let ttl =
-                std::time::Duration::from_secs(crate::daemon::restore::cleanup::STAGING_TTL_SECS);
-            tasks.push(("staging_cleanup", tokio::spawn(async move {
-                // Check immediately at startup: evict stale dirs, then warn if still over.
-                tokio::task::block_in_place(|| {
-                    let _ = crate::daemon::restore::cleanup::evict_stale_stagings(&staging_root_for_warn, ttl);
-                    crate::daemon::restore::cleanup::check_staging_warn(&staging_root_for_warn, warn_bytes);
-                });
-                // Then check every hour.
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-                interval.tick().await; // skip immediate tick (already checked above)
-                loop {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            tokio::task::block_in_place(|| {
-                                let _ = crate::daemon::restore::cleanup::evict_stale_stagings(&staging_root_for_warn, ttl);
-                                crate::daemon::restore::cleanup::check_staging_warn(&staging_root_for_warn, warn_bytes);
-                            });
-                        }
-                        _ = cancel_for_warn.cancelled() => break,
-                    }
-                }
-                Ok(())
-            })));
+            let monitor = crate::daemon::restore::cleanup::run_staging_monitor(
+                staging_root.clone(),
+                (app_config.restore.staging_warn_gb * 1_073_741_824.0) as u64,
+                crate::daemon::restore::cleanup::STAGING_CHECK_INTERVAL,
+                Arc::clone(&restore_staging),
+                Some(crate::daemon::restore::cleanup::HoldingsPressure {
+                    db: db.clone(),
+                    data_dir: cfg.data_dir.clone(),
+                    soft_quota_bytes: viaticum_core::config::soft_quota_bytes(&app_config),
+                    disk_reserve_bytes: viaticum_core::config::disk_reserve_bytes(&app_config),
+                }),
+                cancel.clone(),
+            );
+            tasks.push((
+                "staging_monitor",
+                tokio::spawn(async move {
+                    monitor.await;
+                    Ok(())
+                }),
+            ));
         }
         // ── 9.25. EWMA availability decay task (daily) ────────────────────────
         {
@@ -938,9 +942,7 @@ impl DaemonHandle {
                 cfg.data_dir.clone(),
                 disk_reserve_bytes,
                 backup_event_tx,
-                time_scale,
                 Some(cluster_state.clone()),
-                app_config.escrow.clone(),
                 accepted_offers.clone(),
                 master_key.clone(),
             );
@@ -1124,7 +1126,8 @@ impl DaemonHandle {
 
             // T-13a: pass repair_tx so ProcessorDropHandler can wake the repair worker
             // for immediate-drop DropNotice entries (deadline ≈ now).
-            let drop_handler = ProcessorDropHandler::new(db.clone(), repair_tx.clone());
+            let drop_handler = ProcessorDropHandler::new(db.clone(), repair_tx.clone())
+                .with_time_scale(time_scale);
 
             // T-13b-1: ProcessorDeleteHandler handles Delete/CancelDelete via mailbox.
             // Only requires db — same as SymbolDropHandler.
@@ -1238,6 +1241,8 @@ impl DaemonHandle {
             let ss_interval = (6 * 3600 / time_scale).max(60);
             let ss_mailbox_router = std::sync::Arc::clone(&mailbox_router);
             let ss_my_master_pub = identity_pub;
+            // Spec B2 (dr-i19): pointers name the device that published them.
+            let ss_publisher = device_id;
             let ss_current_pointer = std::sync::Arc::clone(&current_pointer);
             let cancel_ss = cancel.clone();
             tasks.push((
@@ -1254,6 +1259,7 @@ impl DaemonHandle {
                         cancel_ss,
                         ss_mailbox_router,
                         ss_my_master_pub,
+                        ss_publisher,
                         ss_current_pointer,
                     )
                     .await

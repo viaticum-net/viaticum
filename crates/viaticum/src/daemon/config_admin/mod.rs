@@ -1,7 +1,7 @@
 // ConfigAdmin: read and write the editable subset of config.toml from the web API.
 //
 // Only three fields are exposed: `storage.disk_reserve_gb`, `storage.soft_quota_gb`
-// and `network.listen_port`. Other sections (escrow, web_api, [[watch]], ...) are
+// and `network.listen_port`. Other sections (web_api, [[watch]], legacy ones, ...) are
 // preserved as-is via toml_edit. Writes are atomic (tempfile + rename) and serialised
 // across concurrent requests by an internal Mutex.
 
@@ -109,7 +109,7 @@ impl ConfigAdmin {
     }
 
     /// Validate, then atomically write the new editable subset back to config.toml.
-    /// Other sections (comments, [[watch]], [escrow], ...) are preserved verbatim.
+    /// Other sections (comments, [[watch]], legacy ones, ...) are preserved verbatim.
     pub async fn update(&self, new: EditableConfig) -> Result<(), ConfigAdminError> {
         let _guard = self.write_lock.lock().await;
 

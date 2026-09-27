@@ -1,6 +1,6 @@
 use super::*;
 use viaticum_core::db::Db;
-use viaticum_core::system_state::{DiffOp, diff_states, snapshot_db};
+use viaticum_core::system_state::{CatalogLineageId, DiffOp, diff_states, snapshot_db};
 use viaticum_core::types::{
     DeviceId, FileId, FileRecord, FileVersion, IdentityPub, PeerRecord, PlacementStatus,
     SourceBlockId, SourceBlockType, SymbolPlacement, Timestamp, from_cbor_bytes,
@@ -8,6 +8,19 @@ use viaticum_core::types::{
 
 fn dr_key() -> [u8; 32] {
     [0x7Eu8; 32]
+}
+
+/// Live files after the base, after diff 0, after diff 1.
+const FILES_AFTER: [u32; 3] = [10, 11, 12];
+const TEST_LINEAGE: CatalogLineageId = CatalogLineageId([0x3a; 16]);
+const TEST_PUBLISHER: DeviceId = DeviceId([0x5b; 32]);
+
+fn test_pc(files_after: &[u32]) -> PointerCatalog<'_> {
+    PointerCatalog {
+        lineage: TEST_LINEAGE,
+        publisher: TEST_PUBLISHER,
+        files_after,
+    }
 }
 
 /// Decrypt + decompress a retained SS block blob with the DR key and CBOR-decode it.
@@ -196,7 +209,16 @@ fn built_pointer_verifies_against_master_identity() {
     let master = viaticum_core::cluster::derive_master_key(&[9u8; 32]).unwrap();
     let id = viaticum_core::cluster::master_identity(&master);
 
-    let pointer = build_pointer(&db, &master, 3, &base_id, &[], Timestamp(5000)).unwrap();
+    let pointer = build_pointer(
+        &db,
+        &master,
+        3,
+        &base_id,
+        &[],
+        Timestamp(5000),
+        test_pc(&FILES_AFTER),
+    )
+    .unwrap();
     assert_eq!(pointer.generation, 3);
     assert_eq!(pointer.base.block_id, base_id);
     viaticum_core::system_state::verify_self_pointer(&pointer, &id)
@@ -261,7 +283,16 @@ fn placed_prefix_pointer_is_none_until_base_placed() {
 
     let master = viaticum_core::cluster::derive_master_key(&[3u8; 32]).unwrap();
     // Base has no Alive holders yet → no useful pointer to advertise.
-    let p = build_pointer_for_placed(&db, &master, 1, &base_id, &[], Timestamp(1)).unwrap();
+    let p = build_pointer_for_placed(
+        &db,
+        &master,
+        1,
+        &base_id,
+        &[],
+        Timestamp(1),
+        test_pc(&FILES_AFTER),
+    )
+    .unwrap();
     assert!(p.is_none(), "no pointer until the base is placed");
 }
 
@@ -286,9 +317,17 @@ fn placed_prefix_pointer_stops_at_first_unplaced_diff() {
 
     let master = viaticum_core::cluster::derive_master_key(&[4u8; 32]).unwrap();
     let id = viaticum_core::cluster::master_identity(&master);
-    let p = build_pointer_for_placed(&db, &master, 2, &base_id, &[d0, d1], Timestamp(9))
-        .unwrap()
-        .expect("base placed → Some");
+    let p = build_pointer_for_placed(
+        &db,
+        &master,
+        2,
+        &base_id,
+        &[d0, d1],
+        Timestamp(9),
+        test_pc(&FILES_AFTER),
+    )
+    .unwrap()
+    .expect("base placed → Some");
 
     viaticum_core::system_state::verify_self_pointer(&p, &id).unwrap();
     assert_eq!(p.base.block_id, base_id);
@@ -298,6 +337,39 @@ fn placed_prefix_pointer_stops_at_first_unplaced_diff() {
         "stops at the first unplaced diff (d1 omitted)"
     );
     assert_eq!(p.diffs[0].block_id, d0);
+    // Spec B2: the catalog summary describes exactly the listed prefix (base + d0).
+    assert_eq!(p.catalog.files, FILES_AFTER[1]);
+    assert_eq!(p.catalog.lineage, TEST_LINEAGE);
+    assert_eq!(p.catalog.publisher, TEST_PUBLISHER);
+}
+
+#[test]
+fn pointer_catalog_files_out_of_sync_is_an_error_not_a_guess() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let s0 = snapshot_db(&db).unwrap();
+    let base_id = publish_base_block(&db, dir.path(), &dr_key(), 1, &s0).unwrap();
+    sample_file(&db, 1, "a.txt");
+    let s1 = snapshot_db(&db).unwrap();
+    let d0 = publish_diff_block(&db, dir.path(), &dr_key(), 1, &diff_states(&s0, &s1)).unwrap();
+    let h = DeviceId([0x72u8; 32]);
+    db.upsert_placement(&alive_placement(base_id, h)).unwrap();
+    db.upsert_placement(&alive_placement(d0, h)).unwrap();
+    let master = viaticum_core::cluster::derive_master_key(&[6u8; 32]).unwrap();
+    // One diff listed but only the base's count known.
+    let r = build_pointer_for_placed(
+        &db,
+        &master,
+        1,
+        &base_id,
+        &[d0],
+        Timestamp(1),
+        test_pc(&[5]),
+    );
+    assert!(
+        r.is_err(),
+        "a pointer must never carry a made-up file count"
+    );
 }
 
 /// AC-7: Bug-G — staged rotation guard.
@@ -325,7 +397,16 @@ fn pointer_not_updated_before_base_reaches_min_alive() {
     let master_id = viaticum_core::cluster::master_identity(&master);
 
     // Phase 1: base has 0 alive holders → pointer must be None (un-placed prefix).
-    let p = build_pointer_for_placed(&db, &master, 1, &base_id, &[], Timestamp(100)).unwrap();
+    let p = build_pointer_for_placed(
+        &db,
+        &master,
+        1,
+        &base_id,
+        &[],
+        Timestamp(100),
+        test_pc(&FILES_AFTER),
+    )
+    .unwrap();
     assert!(
         p.is_none(),
         "pointer must be None when base has no alive holders (not DR-recoverable yet)"
@@ -338,9 +419,17 @@ fn pointer_not_updated_before_base_reaches_min_alive() {
     db.upsert_placement(&alive_placement(base_id, holder))
         .unwrap();
 
-    let p = build_pointer_for_placed(&db, &master, 1, &base_id, &[], Timestamp(200))
-        .unwrap()
-        .expect("pointer must be Some once base has ≥1 alive holder (DR-recoverable)");
+    let p = build_pointer_for_placed(
+        &db,
+        &master,
+        1,
+        &base_id,
+        &[],
+        Timestamp(200),
+        test_pc(&FILES_AFTER),
+    )
+    .unwrap()
+    .expect("pointer must be Some once base has ≥1 alive holder (DR-recoverable)");
 
     // Pointer references the correct base and is validly signed.
     viaticum_core::system_state::verify_self_pointer(&p, &master_id)
@@ -381,9 +470,17 @@ fn holder_hint_includes_addr_when_peer_record_has_addr() {
         .unwrap();
 
     let master = viaticum_core::cluster::derive_master_key(&[0xEEu8; 32]).unwrap();
-    let pointer = build_pointer_for_placed(&db, &master, 1, &base_id, &[], Timestamp(1))
-        .unwrap()
-        .expect("pointer must be Some with an alive holder");
+    let pointer = build_pointer_for_placed(
+        &db,
+        &master,
+        1,
+        &base_id,
+        &[],
+        Timestamp(1),
+        test_pc(&FILES_AFTER),
+    )
+    .unwrap()
+    .expect("pointer must be Some with an alive holder");
 
     assert_eq!(
         pointer.base.holders.len(),
@@ -417,9 +514,17 @@ fn holder_hint_empty_addr_is_ok() {
     db.upsert_peer(&peer_with_addrs(holder, vec![])).unwrap();
 
     let master = viaticum_core::cluster::derive_master_key(&[0xFFu8; 32]).unwrap();
-    let pointer = build_pointer_for_placed(&db, &master, 1, &base_id, &[], Timestamp(1))
-        .unwrap()
-        .expect("pointer must be Some even with empty HolderHint.addrs (B-1: Kademlia fallback)");
+    let pointer = build_pointer_for_placed(
+        &db,
+        &master,
+        1,
+        &base_id,
+        &[],
+        Timestamp(1),
+        test_pc(&FILES_AFTER),
+    )
+    .unwrap()
+    .expect("pointer must be Some even with empty HolderHint.addrs (B-1: Kademlia fallback)");
 
     assert_eq!(pointer.base.holders.len(), 1);
     assert!(
