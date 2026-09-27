@@ -33,9 +33,7 @@ use crate::daemon::identity::{
 };
 use crate::daemon::processor::Processor;
 use crate::daemon::repair::RepairTrigger;
-use crate::daemon::restore::{
-    RestoreConfig, RestoreCoordinator, RestoreError, RestoreRequest, RestoreResult,
-};
+use crate::daemon::restore::{RestoreConfig, RestoreCoordinator, RestoreRequest};
 use crate::daemon::scheduler::{PendingChallenges, Scheduler, SchedulerConfig};
 use crate::daemon::watcher::{WatcherCommand, WatcherConfig};
 
@@ -71,14 +69,15 @@ pub struct DaemonState {
     pub identity_pub: IdentityPub,
     /// This device's ID.
     pub device_id: DeviceId,
-    /// Channel to send restore requests to RestoreCoordinator.
-    pub restore_tx: mpsc::Sender<(
-        RestoreRequest,
-        tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
-    )>,
+    /// Queue of restore jobs for the RestoreCoordinator (restore-i4: submit and
+    /// answer at once; the job runs in the coordinator).
+    pub restore_tx: mpsc::Sender<RestoreRequest>,
+    /// Restore job registry, seeded from staging before the web API starts
+    /// (restore-i14); shared with the coordinator.
+    pub restore_jobs: crate::daemon::restore::jobs::RestoreJobs,
     /// Restore staging status (job dirs, bytes, publish probe), set before the web
-    /// API starts, refreshed by the staging monitor and after each restore; read by
-    /// `status` (restore-i8, i18, i19).
+    /// API starts, refreshed by the staging monitor and by the restore coordinator
+    /// after each job; read by `status` (restore-i8, i18, i19).
     pub restore_staging: Arc<Mutex<crate::daemon::restore::cleanup::StagingStatus>>,
     /// Cluster state. Always `Some` in a running daemon (`start` refuses
     /// otherwise); `None` only in dispatch tests that do not build one.
@@ -355,12 +354,8 @@ impl DaemonHandle {
 
         // ── 6. Create inter-subsystem channels ────────────────────────────────
         let (dirty_tx, dirty_rx) = mpsc::channel::<DirtyEvent>(256);
-        let (restore_tx, restore_rx) = mpsc::channel::<(
-            RestoreRequest,
-            tokio::sync::oneshot::Sender<
-                Result<RestoreResult, crate::daemon::restore::RestoreError>,
-            >,
-        )>(16);
+        // Queue of restore jobs; a full queue answers `busy` (try_send, A14).
+        let (restore_tx, restore_rx) = mpsc::channel::<RestoreRequest>(16);
         let (repair_tx, repair_rx) = mpsc::channel::<RepairTrigger>(64);
         let (backup_event_tx, backup_event_rx) =
             mpsc::channel::<crate::daemon::backup::BackupEvent>(64);
@@ -403,6 +398,14 @@ impl DaemonHandle {
         let restore_staging = Arc::new(Mutex::new(
             crate::daemon::restore::cleanup::initial_staging_status(&staging_root),
         ));
+        // restore-i14: every job dir in staging is a known job before the web API
+        // answers `--status <id>`; leftover temp files of jobs the previous run did
+        // not finish are removed (nothing runs yet, restore-i24).
+        let restore_jobs = crate::daemon::restore::jobs::RestoreJobs::new(staging_root.clone());
+        let seeded = restore_jobs.seed_from_staging();
+        if seeded > 0 {
+            tracing::info!(jobs = seeded, "restore: job dirs registered from staging");
+        }
 
         // ── 9.4. Bind the web API listener (optional) ─────────────────────────
         // Bound BEFORE the swarm listens and before any task is spawned: a web
@@ -616,17 +619,29 @@ impl DaemonHandle {
             encoder.clone(),
         );
 
+        // ── 11. CancellationToken ─────────────────────────────────────────────
+        // Created before the restore coordinator: a running restore job stops on it
+        // and is recorded `interrupted` within the drain (T10).
+        let cancel = CancellationToken::new();
+
         let restore = RestoreCoordinator::new(
             db.clone(),
             RestoreConfig {
                 epoch_key: epoch_key_bytes,
-                parallel_holders: 5,
-                swarm: Some(swarm_handle_arc.clone()),
+                symbols: Some(
+                    swarm_handle_arc.clone() as Arc<dyn crate::daemon::symbol_fetch::SymbolSource>
+                ),
                 staging_root: staging_root.clone(),
                 data_dir: cfg.data_dir.clone(),
-                fetch_timeout: std::time::Duration::from_secs(
-                    app_config.restore.fetch_timeout_secs,
-                ),
+                jobs: restore_jobs.clone(),
+                cancel: cancel.clone(),
+                staging_status: Arc::clone(&restore_staging),
+                pressure: Some(crate::daemon::restore::cleanup::HoldingsPressure {
+                    db: db.clone(),
+                    data_dir: cfg.data_dir.clone(),
+                    soft_quota_bytes: viaticum_core::config::soft_quota_bytes(&app_config),
+                    disk_reserve_bytes: viaticum_core::config::disk_reserve_bytes(&app_config),
+                }),
             },
             encoder.clone(),
         );
@@ -634,9 +649,6 @@ impl DaemonHandle {
         // RepairAgent is now only used for periodic reliability_scan (Wave 11b).
         // The repair instance is created in the reliability_scan task below.
         // The old repair.run() task is replaced by the WorkPipeline worker.
-
-        // ── 11. CancellationToken ─────────────────────────────────────────────
-        let cancel = CancellationToken::new();
 
         // ── Step D: Create WatchAdmin ──────────────────────────────────────────
         let watch_admin = Arc::new(crate::daemon::watch_admin::WatchAdmin::new(
@@ -671,6 +683,7 @@ impl DaemonHandle {
             identity_pub,
             device_id,
             restore_tx: restore_tx.clone(),
+            restore_jobs: restore_jobs.clone(),
             restore_staging: Arc::clone(&restore_staging),
             cluster_state: Some(cluster_state.clone()),
             master_key: master_key.clone(),

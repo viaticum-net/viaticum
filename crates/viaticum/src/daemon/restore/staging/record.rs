@@ -1,4 +1,5 @@
-// Job record (`<job>/.viaticum-job.json`) and the read-only staging scan (restore-i14).
+// Job record (`<job>/.viaticum-job.json`), the read-only staging scan and the
+// startup loader of a job dir (restore-i14).
 //
 // The coordinator writes the record when a job starts (`running`) and rewrites it
 // when the job ends (`finished` + outcome). After any crash the record is the
@@ -12,6 +13,9 @@
 use std::path::{Path, PathBuf};
 
 use super::{JOB_RECORD_NAME, JobId, PARTIAL_DIR_NAME, is_service_name};
+use crate::cli::types::{
+    RestoreFailure, RestoreFailureKind, RestoreJob, RestoreJobState, RestoreOutcome,
+};
 
 /// Failure to read a job record.
 #[derive(Debug, thiserror::Error)]
@@ -24,74 +28,16 @@ pub enum RecordError {
 
 // ─── On-disk record ───────────────────────────────────────────────────────────
 
-/// Lifecycle state stored in the job record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobState {
-    Running,
-    Finished,
-}
-
-/// How a job ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobOutcome {
-    /// Every matched file restored, nothing failed.
-    Complete,
-    /// Some files restored, some failed.
-    Partial,
-    /// Nothing restored.
-    NothingRestored,
-    /// The daemon stopped (crash, kill, shutdown) before the job finished.
-    Interrupted,
-}
-
-impl JobOutcome {
-    /// `Complete ⇔ failures == 0 ∧ restored == total ∧ total > 0`; `Interrupted` if
-    /// the job was stopped; `NothingRestored ⇔ restored == 0`; otherwise `Partial`.
-    pub fn from_counts(
-        files_total: u32,
-        files_restored: u32,
-        failures: usize,
-        interrupted: bool,
-    ) -> Self {
-        if interrupted {
-            JobOutcome::Interrupted
-        } else if failures == 0 && files_restored == files_total && files_total > 0 {
-            JobOutcome::Complete
-        } else if files_restored == 0 {
-            JobOutcome::NothingRestored
-        } else {
-            JobOutcome::Partial
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            JobOutcome::Complete => "complete",
-            JobOutcome::Partial => "partial",
-            JobOutcome::NothingRestored => "nothing_restored",
-            JobOutcome::Interrupted => "interrupted",
-        }
-    }
-}
-
-/// One file that was not restored, and why.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct JobFailure {
-    /// Catalog path of the file.
-    pub path: String,
-    /// Human-readable reason.
-    pub detail: String,
-}
-
-/// Contents of `<job>/.viaticum-job.json`.
+/// Contents of `<job>/.viaticum-job.json`; also the registry's in-memory entry
+/// (`restore::jobs`), so what `--status` shows and what survives a restart are the
+/// same data.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct JobRecord {
     pub job_id: JobId,
     /// Path the user asked to restore (file or prefix).
     pub path: String,
-    pub state: JobState,
+    /// On disk only `running` or `finished`; `queued` lives in memory.
+    pub state: RestoreJobState,
     /// Number of catalog files the path matched.
     pub files_total: u32,
     pub files_restored: u32,
@@ -99,15 +45,67 @@ pub struct JobRecord {
     #[serde(default)]
     pub restored_paths: Vec<String>,
     #[serde(default)]
-    pub failures: Vec<JobFailure>,
-    /// `None` while running.
+    pub failures: Vec<RestoreFailure>,
+    /// `None` until finished.
     #[serde(default)]
-    pub outcome: Option<JobOutcome>,
-    /// Unix seconds.
-    pub started_at: u64,
-    /// Unix seconds; `None` while running.
+    pub outcome: Option<RestoreOutcome>,
+    /// Unix seconds when the job was accepted (B1.2 records call it `started_at`).
+    #[serde(alias = "started_at")]
+    pub submitted_at: u64,
+    /// Unix seconds; `None` while running, and for a job found interrupted.
     #[serde(default)]
     pub finished_at: Option<u64>,
+}
+
+impl JobRecord {
+    /// A job just accepted: nothing done yet, submitted now.
+    pub fn queued(job_id: JobId, path: &str, files_total: u32) -> Self {
+        JobRecord {
+            job_id,
+            path: path.to_string(),
+            state: RestoreJobState::Queued,
+            files_total,
+            files_restored: 0,
+            restored_paths: Vec::new(),
+            failures: Vec::new(),
+            outcome: None,
+            submitted_at: viaticum_core::types::Timestamp::now().0,
+            finished_at: None,
+        }
+    }
+
+    /// `queued` in state `running`.
+    pub fn running(job_id: JobId, path: &str, files_total: u32) -> Self {
+        JobRecord {
+            state: RestoreJobState::Running,
+            ..Self::queued(job_id, path, files_total)
+        }
+    }
+
+    /// Wire view; `staging_root` is the parent of the job dir.
+    pub fn to_wire(&self, staging_root: &Path) -> RestoreJob {
+        RestoreJob {
+            job_id: self.job_id.to_string(),
+            path: self.path.clone(),
+            state: self.state,
+            files_total: self.files_total,
+            files_restored: self.files_restored,
+            restored_paths: self.restored_paths.clone(),
+            failures: self.failures.clone(),
+            outcome: self.outcome,
+            staging_path: staging_root
+                .join(self.job_id.to_string())
+                .to_string_lossy()
+                .into_owned(),
+            submitted_at: iso_utc(self.submitted_at),
+            finished_at: self.finished_at.map(iso_utc),
+        }
+    }
+}
+
+/// Unix seconds → `YYYY-MM-DDTHH:MM:SSZ`.
+pub fn iso_utc(secs: u64) -> String {
+    crate::daemon::dispatch::unix_secs_to_iso(secs, true)
 }
 
 // ─── Scan ─────────────────────────────────────────────────────────────────────
@@ -135,7 +133,7 @@ pub struct JobSummary {
     /// Requested path from the record, `"?"` when there is no readable record.
     pub path: String,
     pub record: RecordStatus,
-    pub outcome: JobOutcome,
+    pub outcome: RestoreOutcome,
     /// From the record when known.
     pub files_total: Option<u32>,
     /// Finished record: its count. Otherwise: complete files on disk.
@@ -190,7 +188,7 @@ pub fn summarize_job_dir(job_dir: &Path, dir_name: &str) -> JobSummary {
     on_disk.sort();
 
     let (record_status, record) = match read_job_record(job_dir) {
-        Ok(Some(r)) if r.state == JobState::Finished && r.outcome.is_some() => {
+        Ok(Some(r)) if r.state == RestoreJobState::Finished && r.outcome.is_some() => {
             (RecordStatus::Finished, Some(r))
         }
         Ok(Some(r)) => (RecordStatus::NotFinished, Some(r)),
@@ -210,7 +208,7 @@ pub fn summarize_job_dir(job_dir: &Path, dir_name: &str) -> JobSummary {
             job_id: JobId::parse(dir_name),
             path: r.path,
             record: RecordStatus::Finished,
-            outcome: r.outcome.unwrap_or(JobOutcome::Interrupted),
+            outcome: r.outcome.unwrap_or(RestoreOutcome::Interrupted),
             files_total: Some(r.files_total),
             files_restored: r.files_restored,
             restored_paths: r.restored_paths,
@@ -225,13 +223,122 @@ pub fn summarize_job_dir(job_dir: &Path, dir_name: &str) -> JobSummary {
                 .map(|r| r.path.clone())
                 .unwrap_or_else(|| "?".into()),
             record: status,
-            outcome: JobOutcome::Interrupted,
+            outcome: RestoreOutcome::Interrupted,
             files_total: r.as_ref().map(|r| r.files_total),
             files_restored: on_disk.len() as u32,
             restored_paths: on_disk,
             partial_files,
             bytes,
         },
+    }
+}
+
+// ─── Load (registry) ──────────────────────────────────────────────────────────
+
+/// Detail of the failure entry of a job found interrupted on disk.
+pub const INTERRUPTED_DETAIL: &str = "outcome was not recorded (daemon stopped or disk error)";
+
+/// Rebuild a job from its staging directory (restore-i14): the registry's view of a
+/// job the daemon did not see end (seeded at startup) or one evicted from memory.
+///
+/// - finished record → the record as is (no tree walk);
+/// - record not finished (the daemon died or stopped mid-job), missing (a job dir
+///   from before B1) or unreadable → `finished` + `interrupted`; `files_restored` /
+///   `restored_paths` = the complete files on disk (only complete files are ever
+///   visible under their names); `failures` = one `interrupted` entry for the
+///   requested path. `files_total` from the record, else the count on disk.
+///
+/// `remove_partials`: delete the leftover temp files in `.viaticum-partial/`
+/// (incomplete by definition). Only for a job that is not running (restore-i24): a
+/// running job's temp file is a file being written. Never touches anything else.
+pub fn load_job_from_dir(job_dir: &Path, job_id: JobId, remove_partials: bool) -> JobRecord {
+    if remove_partials {
+        remove_partial_files(job_dir, job_id);
+    }
+    let record = match read_job_record(job_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(job = %job_id, "restore staging: unreadable job record: {e}");
+            None
+        }
+    };
+    if let Some(r) = &record
+        && r.state == RestoreJobState::Finished
+        && r.outcome.is_some()
+    {
+        return r.clone();
+    }
+    let mut on_disk: Vec<String> = Vec::new();
+    let mut bytes = 0u64;
+    if let Ok(rd) = std::fs::read_dir(job_dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !is_service_name(&name) {
+                walk_files(&entry.path(), &mut vec![name], &mut on_disk, &mut bytes);
+            }
+        }
+    }
+    on_disk.sort();
+    let path = record
+        .as_ref()
+        .map(|r| r.path.clone())
+        .unwrap_or_else(|| "?".into());
+    let submitted_at = record.as_ref().map(|r| r.submitted_at).unwrap_or_else(|| {
+        std::fs::metadata(job_dir)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    });
+    let files_restored = on_disk.len() as u32;
+    JobRecord {
+        job_id,
+        failures: vec![RestoreFailure {
+            path: path.clone(),
+            kind: RestoreFailureKind::Interrupted,
+            detail: INTERRUPTED_DETAIL.to_string(),
+        }],
+        path,
+        state: RestoreJobState::Finished,
+        files_total: record
+            .as_ref()
+            .map(|r| r.files_total)
+            .unwrap_or(files_restored),
+        files_restored,
+        restored_paths: on_disk,
+        outcome: Some(RestoreOutcome::Interrupted),
+        submitted_at,
+        finished_at: None,
+    }
+}
+
+/// Delete the regular files (and symlinks) directly in `<job_dir>/.viaticum-partial/`.
+fn remove_partial_files(job_dir: &Path, job_id: JobId) {
+    let Ok(rd) = std::fs::read_dir(job_dir.join(PARTIAL_DIR_NAME)) else {
+        return;
+    };
+    let mut removed = 0u32;
+    for entry in rd.flatten() {
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(true);
+        if is_dir {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!(
+                job = %job_id,
+                temp = %entry.path().display(),
+                "restore staging: could not remove an unfinished temp file: {e}"
+            ),
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            job = %job_id,
+            removed,
+            "restore staging: removed unfinished temp file(s) of a job that is not running"
+        );
     }
 }
 

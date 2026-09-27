@@ -1,33 +1,43 @@
-// RestoreCoordinator: orchestrate symbol fetch → decode → file write.
+// RestoreCoordinator: a restore is a job in the daemon (restore-i4).
 //
-// Strategy (post-Wave-11b, 2-tier): rebuild the block from the owner's own source
-// files and re-encode the needed symbols locally; if that is unavailable, fall back
-// to fetching symbols from holders over the network (sequential per holder). No
-// symbols are cached on disk anymore — the old local `raw/{esi}.bin` tier is gone.
+// Dispatch registers the job (`jobs::RestoreJobs`) and enqueues it; the coordinator
+// runs jobs one at a time. Per block: rebuild from the owner's own source files if
+// they are there, else fetch symbols from holders over the network in chunked
+// rounds with no deadline (restore-i12). Every matched file ends restored or with a
+// machine-readable failure (restore-i3). The job record in the job dir is written
+// when the job starts and when it ends, so the outcome survives a restart
+// (restore-i14). On the daemon's cancel token the job stops between requests and
+// is recorded `interrupted` (T10).
 //
 // Module layout:
-//   mod.rs      — RestoreCoordinator struct, public API, restore(), run(), resolve_path()
-//   pipeline.rs — decode_block(), extract_from_pack()
-//   staging/    — atomic per-job staging writer, job record, read-only staging scan
+//   mod.rs      — RestoreCoordinator, restore(), run(), resolve_path(), failure_kind()
+//   decode.rs   — decode one block (rebuild / network), write one file
+//   pipeline.rs — decrypt_and_decompress(), extract_from_pack()
+//   jobs/       — in-memory job registry, seeded from staging at startup
+//   staging/    — atomic per-job staging writer, job record, staging scan
 //   cleanup/    — staging report (never deletes, restore-i8)
 //   tests.rs    — coordinator test scenarios
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use tracing::{debug, error, info};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 use viaticum_core::db::Db;
-use viaticum_core::erasure::{ErasureEncoder, Symbol};
-use viaticum_core::types::{
-    ErasureParams, FileRecord, FileVersion, PlacementStatus, SourceBlockId, SourceBlockType,
-    SymbolPlacement, Timestamp,
-};
+use viaticum_core::erasure::ErasureEncoder;
+use viaticum_core::types::{FileRecord, FileVersion, SourceBlockId, Timestamp};
 
-use crate::daemon::restore::staging::record::{JobFailure, JobOutcome, JobRecord, JobState};
-use crate::daemon::restore::staging::{JobId, StagingError, StagingWriter};
+use crate::cli::types::{RestoreFailure, RestoreFailureKind};
+use crate::daemon::restore::cleanup::{HoldingsPressure, StagingStatus};
+use crate::daemon::restore::jobs::RestoreJobs;
+use crate::daemon::restore::staging::record::JobRecord;
+use crate::daemon::restore::staging::{JobId, StagingWriter};
+use crate::daemon::symbol_fetch::SymbolSource;
 
 pub mod cleanup;
+mod decode;
+pub mod jobs;
 pub mod pipeline;
 pub mod staging;
 
@@ -48,7 +58,11 @@ pub enum RestoreError {
     #[error("source block not found in DB: {0}")]
     BlockNotFound(SourceBlockId),
 
-    #[error("insufficient symbols: collected {got}, need {need} for block {block}")]
+    /// A block record from before encrypted sizes were stored: not restorable.
+    #[error("source block {0} has no encrypted_size (legacy record)")]
+    LegacyRecord(SourceBlockId),
+
+    #[error("not enough holders answered: collected {got} of {need} symbols for block {block}")]
     InsufficientSymbols {
         block: SourceBlockId,
         got: usize,
@@ -85,13 +99,13 @@ pub enum RestoreError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("fetch from holders timed out after {secs}s for block {block}")]
-    Timeout { block: SourceBlockId, secs: u64 },
+    /// The daemon is stopping (T10).
+    #[error("daemon shutting down")]
+    Cancelled,
 }
 
 impl RestoreError {
-    /// Wrap a shared `FetchError` as `RestoreError`, tagging `InsufficientSymbols`
-    /// with the requested `block` for the context caller operates in.
+    /// Wrap a shared `FetchError` as `RestoreError`.
     pub(crate) fn from_fetch(err: crate::daemon::symbol_fetch::FetchError) -> Self {
         use crate::daemon::symbol_fetch::FetchError;
         match err {
@@ -99,7 +113,31 @@ impl RestoreError {
                 RestoreError::InsufficientSymbols { block, got, need }
             }
             FetchError::Swarm(s) => RestoreError::Swarm(s),
+            FetchError::Cancelled => RestoreError::Cancelled,
         }
+    }
+}
+
+/// The machine-readable reason for a failed file (restore-i3).
+pub(crate) fn failure_kind(e: &RestoreError) -> RestoreFailureKind {
+    match e {
+        RestoreError::InsufficientSymbols { .. } | RestoreError::Swarm(_) => {
+            RestoreFailureKind::HoldersUnavailable
+        }
+        RestoreError::FileNotFound { .. } | RestoreError::VersionNotFound { .. } => {
+            RestoreFailureKind::NotBackedUp
+        }
+        RestoreError::BlockNotFound(_) | RestoreError::LegacyRecord(_) => {
+            RestoreFailureKind::BlockMissing
+        }
+        RestoreError::DecodeFailed(..)
+        | RestoreError::DecryptionFailed(_)
+        | RestoreError::DecompressionFailed(..)
+        | RestoreError::PackIndexParseFailed(..) => RestoreFailureKind::Corrupt,
+        RestoreError::PathUnsafe { .. } => RestoreFailureKind::PathUnsafe,
+        RestoreError::Staging(_) | RestoreError::Io(_) => RestoreFailureKind::WriteFailed,
+        RestoreError::Cancelled => RestoreFailureKind::Interrupted,
+        RestoreError::Db(_) => RestoreFailureKind::Internal,
     }
 }
 
@@ -127,52 +165,57 @@ pub struct RestoreRequest {
     pub job_id: JobId,
 }
 
-/// Result of a completed restore.
+/// Result of a finished restore job (the same data as its final job record).
 #[derive(Debug)]
 pub struct RestoreResult {
-    /// Number of files successfully restored.
+    /// Number of files restored (visible under their own names in staging).
     pub files_restored: usize,
     /// Number of source blocks decoded.
     pub blocks_fetched: usize,
-    /// Paths that failed to restore (path, reason).
-    pub failures: Vec<(String, String)>,
-    /// Absolute path to the per-job staging directory.
+    /// Files that were not restored, with the reason.
+    pub failures: Vec<RestoreFailure>,
+    /// Absolute path to the per-job staging directory; empty when the path matched
+    /// nothing (no job dir is created then).
     pub staging_path: PathBuf,
+    /// The daemon stopped the job before it finished.
+    pub interrupted: bool,
 }
 
 /// Configuration for RestoreCoordinator.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RestoreConfig {
     /// Epoch key for decryption. 32 bytes. Must match the key used during backup.
     pub epoch_key: [u8; 32],
-    /// Max parallel holders to fetch symbols from for one block.
-    /// TODO: not yet used — fetch_from_holders iterates sequentially.
-    pub parallel_holders: usize,
-    /// libp2p swarm handle for remote restore.
-    /// When Some: fetch_from_holders uses send_to_device (request-response).
-    /// When None: only local symbol files are used.
-    pub swarm: Option<std::sync::Arc<crate::daemon::network::swarm::SwarmHandle>>,
-    /// Root directory for per-job restore staging.
+    /// Where network restore asks holders for symbols (the swarm in the daemon).
+    /// `None`: only the owner's own source files can be used.
+    pub symbols: Option<Arc<dyn SymbolSource>>,
+    /// Root directory for per-job restore staging (`data_dir/restore`).
     /// Each job writes to `staging_root/<job_id>/`.
-    /// Must be `data_dir/restore`.
     pub staging_root: PathBuf,
     /// `data_dir` — used to verify staging_root is inside it.
     pub data_dir: PathBuf,
-    /// Timeout for the entire fetch_from_holders() call per source block.
-    /// Applied once per block decode attempt, across all holders for that block.
-    /// Default: 60 seconds.
-    pub fetch_timeout: std::time::Duration,
+    /// Job registry shared with dispatch (restore-i4, i14).
+    pub jobs: RestoreJobs,
+    /// The daemon's cancel token: a running job stops between requests (T10).
+    pub cancel: CancellationToken,
+    /// Cached staging status for `status`; refreshed after every job.
+    pub staging_status: Arc<Mutex<StagingStatus>>,
+    /// Holder-pressure inputs for the end-of-job staging warning (restore-i20).
+    pub pressure: Option<HoldingsPressure>,
 }
 
-impl Default for RestoreConfig {
-    fn default() -> Self {
+impl RestoreConfig {
+    /// Config with a fresh registry and cancel token, no network, no pressure check.
+    pub fn new(epoch_key: [u8; 32], staging_root: PathBuf, data_dir: PathBuf) -> Self {
         RestoreConfig {
-            epoch_key: [0u8; 32],
-            parallel_holders: 5,
-            swarm: None,
-            staging_root: PathBuf::from("restore"),
-            data_dir: PathBuf::from("."),
-            fetch_timeout: std::time::Duration::from_secs(60),
+            epoch_key,
+            symbols: None,
+            jobs: RestoreJobs::new(staging_root.clone()),
+            staging_root,
+            data_dir,
+            cancel: CancellationToken::new(),
+            staging_status: Arc::default(),
+            pressure: None,
         }
     }
 }
@@ -184,555 +227,274 @@ pub struct RestoreCoordinator {
     db: Db,
     config: RestoreConfig,
     encoder: Arc<dyn ErasureEncoder>,
-    /// libp2p swarm handle for remote restore.
-    swarm: Option<Arc<crate::daemon::network::swarm::SwarmHandle>>,
 }
 
 impl RestoreCoordinator {
     /// Create a new coordinator.
     pub fn new(db: Db, config: RestoreConfig, encoder: Arc<dyn ErasureEncoder>) -> Self {
-        let swarm = config.swarm.clone();
         RestoreCoordinator {
             db,
             config,
             encoder,
-            swarm,
         }
     }
 
-    /// Execute a restore request.
+    /// Run one restore job to its end.
     ///
-    /// 1. Resolve path to FileRecords.
-    /// 2. Select version per file.
-    /// 3. Deduplicate source blocks.
-    /// 4. Decode each block.
-    /// 5. Extract + write files (atomically, restore-i14).
+    /// 1. Resolve the path (the catalog may have changed since dispatch checked it;
+    ///    nothing matched → one `not_backed_up` failure, no job dir).
+    /// 2. Job running; open the job dir and write the `running` record before any
+    ///    file (restore-i14).
+    /// 3. Per file: selectable version or `not_backed_up`; per block by importance:
+    ///    decode (source rebuild, else network) or a failure for each of its files;
+    ///    a file counts as restored only once it is visible under its own name.
+    /// 4. On cancel: every file not yet done → `interrupted`; outcome `interrupted`.
+    /// 5. Finish the job in the registry and write the same final record to disk.
     ///
-    /// The job dir gets `.viaticum-job.json` (`running`) before any file is written
-    /// and the final record (`finished` + outcome) at the end. A path that matches
-    /// nothing creates no job dir.
-    ///
-    /// Never writes `LocalState` (CS-DR-6): restored files land in staging, not in a
-    /// watched folder.
+    /// `Ok` means the job is finished in the registry. `Err` only for failures
+    /// before the job could start (catalog read, job dir); `run` finishes the job.
+    /// Never writes `LocalState` (CS-DR-6): restored files land in staging.
     pub async fn restore(&self, request: RestoreRequest) -> Result<RestoreResult, RestoreError> {
-        info!(path = %request.path, job = %request.job_id, "restore started");
+        let job_id = request.job_id;
+        let jobs = &self.config.jobs;
+        info!(path = %request.path, job = %job_id, "restore started");
 
-        // 1. Resolve path → FileRecords
         let file_records = resolve_path(&self.db, &request.path)?;
+        jobs.mark_running(job_id, &request.path, file_records.len() as u32);
         if file_records.is_empty() {
-            // Nothing matched: no job dir. Staging is never cleaned up by the daemon
-            // (restore-i8), so a typo must not leave a directory behind.
-            return Ok(RestoreResult {
-                files_restored: 0,
-                blocks_fetched: 0,
-                failures: vec![(request.path.clone(), "no matching files found".to_string())],
-                staging_path: PathBuf::new(),
-            });
+            // Staging is never cleaned up by the daemon (restore-i8): no job dir.
+            jobs.record_failure(
+                job_id,
+                RestoreFailure {
+                    path: request.path.clone(),
+                    kind: RestoreFailureKind::NotBackedUp,
+                    detail: "no matching files found in the backup catalog".to_string(),
+                },
+            );
+            let record = jobs.finish(job_id, false).expect("job registered above");
+            return Ok(Self::result(&record, 0, PathBuf::new()));
         }
 
-        let (writer, mut record) =
-            tokio::task::block_in_place(|| self.begin_job(&request, file_records.len() as u32))?;
+        let writer = tokio::task::block_in_place(|| self.begin_job(&request))?;
+        let (interrupted, blocks_fetched) =
+            self.restore_files(&request, file_records, &writer).await;
 
-        let mut progress = JobProgress::default();
-        let run = self
-            .restore_files(&request, file_records, &writer, &mut progress)
-            .await;
-
-        // Final record: rewritten even when the job hit a job-level error, so the
-        // outcome survives a restart (restore-i14).
-        let mut failures = progress.failures;
-        if let Err(e) = &run {
-            failures.push((request.path.clone(), e.to_string()));
-        }
-        record.state = JobState::Finished;
-        record.files_restored = progress.restored_paths.len() as u32;
-        record.outcome = Some(JobOutcome::from_counts(
-            record.files_total,
-            record.files_restored,
-            failures.len(),
-            false,
-        ));
-        record.restored_paths = progress.restored_paths;
-        record.failures = failures
-            .iter()
-            .map(|(path, detail)| JobFailure {
-                path: path.clone(),
-                detail: detail.clone(),
-            })
-            .collect();
-        record.finished_at = Some(Timestamp::now().0);
+        let record = jobs
+            .finish(job_id, interrupted)
+            .expect("job registered above");
+        // Final record: the same data the registry holds, so the outcome survives a
+        // restart (restore-i14). If it cannot be written (disk full), the registry
+        // stays right until a restart, after which the `running` record on disk reads
+        // as `interrupted`: the outcome is only ever understated, never overstated.
         if let Err(e) = tokio::task::block_in_place(|| writer.write_job_record(&record)) {
-            error!(job = %request.job_id, "restore: could not write the final job record: {e}");
+            error!(
+                job = %job_id,
+                staging = %writer.staging_path().display(),
+                error = %e,
+                "restore: could not write the final job record; after a restart this \
+                 job will read as interrupted"
+            );
         }
         info!(
-            job = %request.job_id,
+            job = %job_id,
             outcome = record.outcome.map(|o| o.as_str()).unwrap_or("?"),
             files_restored = record.files_restored,
             files_total = record.files_total,
+            failed = record.failures.len(),
             "restore finished"
         );
-        run?;
-
-        Ok(RestoreResult {
-            files_restored: record.files_restored as usize,
-            blocks_fetched: progress.blocks_fetched,
-            failures,
-            staging_path: writer.staging_path().to_path_buf(),
-        })
+        Ok(Self::result(
+            &record,
+            blocks_fetched,
+            writer.staging_path().to_path_buf(),
+        ))
     }
 
-    /// Open the job dir and write its `running` record — before any file is
-    /// written, so a crash at any later point is reported as `interrupted`, never
-    /// as unknown (restore-i14). Blocking I/O.
+    fn result(record: &JobRecord, blocks_fetched: usize, staging_path: PathBuf) -> RestoreResult {
+        RestoreResult {
+            files_restored: record.files_restored as usize,
+            blocks_fetched,
+            failures: record.failures.clone(),
+            staging_path,
+            interrupted: record.outcome == Some(crate::cli::types::RestoreOutcome::Interrupted),
+        }
+    }
+
+    /// Open the job dir and write its `running` record (from the registry) —
+    /// before any file is written, so a crash at any later point is reported as
+    /// `interrupted`, never as unknown (restore-i14). Blocking I/O.
     pub(crate) fn begin_job(
         &self,
         request: &RestoreRequest,
-        files_total: u32,
-    ) -> Result<(StagingWriter, JobRecord), RestoreError> {
+    ) -> Result<StagingWriter, RestoreError> {
         let writer = StagingWriter::open(
             &self.config.staging_root,
             &self.config.data_dir,
             request.job_id,
         )?;
-        let record = JobRecord {
-            job_id: request.job_id,
-            path: request.path.clone(),
-            state: JobState::Running,
-            files_total,
-            files_restored: 0,
-            restored_paths: Vec::new(),
-            failures: Vec::new(),
-            outcome: None,
-            started_at: Timestamp::now().0,
-            finished_at: None,
-        };
+        let record = self.config.jobs.record(request.job_id).unwrap_or_else(|| {
+            // Not registered (only in tests that call begin_job directly).
+            JobRecord::running(request.job_id, &request.path, 0)
+        });
         writer.write_job_record(&record)?;
-        Ok((writer, record))
+        Ok(writer)
     }
 
-    /// Steps 2-5 of `restore`: select versions, decode blocks by importance, write
-    /// files. Every matched file ends up either in `progress.restored_paths` or in
-    /// `progress.failures`, except when a job-level error (`Err`) cuts the job short.
+    /// Steps 3-4 of `restore`. Every matched file ends in the registry either as
+    /// restored or as a failure. Returns (interrupted, blocks decoded).
     async fn restore_files(
         &self,
         request: &RestoreRequest,
         file_records: Vec<FileRecord>,
         writer: &StagingWriter,
-        progress: &mut JobProgress,
-    ) -> Result<(), RestoreError> {
-        // 2. Select version per file, collect (record, version) pairs
-        let mut resolved: Vec<(FileRecord, FileVersion)> = Vec::new();
-        let failures = &mut progress.failures;
+    ) -> (bool, usize) {
+        let job_id = request.job_id;
+        let jobs = &self.config.jobs;
+        let fail = |path: &str, kind: RestoreFailureKind, detail: String| {
+            jobs.record_failure(
+                job_id,
+                RestoreFailure {
+                    path: path.to_string(),
+                    kind,
+                    detail,
+                },
+            );
+        };
 
+        // Select a version per file; group files by source block.
+        let mut block_map: HashMap<SourceBlockId, Vec<(FileRecord, FileVersion)>> = HashMap::new();
         for record in file_records {
-            // select_version borrows record; clone the version before moving record.
-            let version_opt = Self::select_version(&record, &request.version_selector).cloned();
-            match version_opt {
-                Some(version) => {
-                    resolved.push((record, version));
-                }
-                None => {
-                    failures.push((
-                        record.path.clone(),
-                        format!(
-                            "no matching version for selector {:?}",
-                            request.version_selector
-                        ),
-                    ));
-                }
+            match Self::select_version(&record, &request.version_selector).cloned() {
+                Some(version) => block_map
+                    .entry(version.source_block_id)
+                    .or_default()
+                    .push((record, version)),
+                None => fail(
+                    &record.path,
+                    RestoreFailureKind::NotBackedUp,
+                    format!(
+                        "no backed-up version matches {:?}",
+                        request.version_selector
+                    ),
+                ),
             }
         }
 
-        // 3. Deduplicate: source_block_id → Vec<(FileRecord, FileVersion)>
-        let mut block_map: HashMap<SourceBlockId, Vec<(FileRecord, FileVersion)>> = HashMap::new();
-        for (record, version) in resolved {
-            block_map
-                .entry(version.source_block_id)
-                .or_default()
-                .push((record, version));
-        }
-
-        // Importance-ordered restore: when restore is interrupted (Ctrl-C, daemon
-        // shutdown), user gets high-importance files (documents, photos) before
-        // low-importance (cache). Implements DR triage promised in overview.md.
-        // HashMap iteration is undefined order; sort blocks by importance DESC.
-        let mut block_order: Vec<SourceBlockId> = block_map.keys().copied().collect();
-        let mut importance_by_block: HashMap<SourceBlockId, f64> = HashMap::new();
-        for block_id in &block_order {
-            let imp = self
-                .db
-                .get_source_block(block_id)?
-                .map(|r| r.importance)
-                .unwrap_or(0.0);
-            importance_by_block.insert(*block_id, imp);
-        }
+        // Importance-ordered restore: when restore is interrupted, the user has the
+        // high-importance files (documents, photos) before low-importance ones.
+        let mut block_order: Vec<(f64, SourceBlockId)> = block_map
+            .keys()
+            .map(|b| {
+                let importance = match self.db.get_source_block(b) {
+                    Ok(r) => r.map(|r| r.importance).unwrap_or(0.0),
+                    Err(e) => {
+                        warn!(block = %b, "restore: cannot read block importance: {e}");
+                        0.0
+                    }
+                };
+                (importance, *b)
+            })
+            .collect();
         block_order.sort_by(|a, b| {
-            importance_by_block
-                .get(b)
-                .copied()
-                .unwrap_or(0.0)
-                .partial_cmp(&importance_by_block.get(a).copied().unwrap_or(0.0))
+            b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.0.cmp(&b.1.0))
         });
 
-        // 4 & 5. For each unique block: decode → extract → write
-        //
-        // CS-DR-3: restore is partial-tolerant by design (importance-DESC triage +
-        // `failures` list). A single unrecoverable block (BlockNotFound, legacy
-        // record, decode/timeout/insufficient-symbols) must NOT abort the whole
-        // job — it is recorded against every file that references it, and we move
-        // on to the next (lower-importance) block. Already-restored files stay in
-        // staging; the job returns Ok with the staging path and the failures list.
-        for block_id in &block_order {
-            let files_in_block = block_map
-                .get(block_id)
-                .expect("block_id from block_map keys");
-
-            // Get SourceBlockRecord for params
-            let block_record = match self.db.get_source_block(block_id)? {
-                Some(r) => r,
-                None => {
-                    let err = RestoreError::BlockNotFound(*block_id);
-                    error!(block = %block_id, "restore: {err}");
-                    Self::record_block_failure(files_in_block, &err, &mut progress.failures);
-                    continue;
-                }
-            };
-
-            let encrypted_size = match block_record.encrypted_size {
-                Some(s) => s,
-                None => {
-                    let err = RestoreError::DecodeFailed(
-                        *block_id,
-                        "source block has no encrypted_size (legacy record)".to_string(),
-                    );
-                    error!(block = %block_id, "restore: {err}");
-                    Self::record_block_failure(files_in_block, &err, &mut progress.failures);
-                    continue;
-                }
-            };
-
-            let params = block_record.erasure_params();
-
-            // Decode the block (rebuild-from-source, then network fallback)
-            let plaintext = match self
-                .decode_block_local(block_id, &params, encrypted_size)
-                .await
-            {
+        // CS-DR-3: restore is partial-tolerant. An unrecoverable block is recorded
+        // against every file of it and the job moves on to the next block.
+        let mut blocks_fetched = 0usize;
+        for (i, (_, block_id)) in block_order.iter().enumerate() {
+            if self.config.cancel.is_cancelled() {
+                self.interrupt_remaining(job_id, &block_order[i..], &block_map);
+                return (true, blocks_fetched);
+            }
+            let files_in_block = block_map.get(block_id).expect("block from block_map");
+            let plaintext = match self.decode_block(block_id).await {
                 Ok(p) => p,
+                Err(RestoreError::Cancelled) => {
+                    self.interrupt_remaining(job_id, &block_order[i..], &block_map);
+                    return (true, blocks_fetched);
+                }
                 Err(err) => {
-                    error!(block = %block_id, "restore: block decode failed: {err}");
-                    Self::record_block_failure(files_in_block, &err, &mut progress.failures);
+                    error!(block = %block_id, "restore: block not restored: {err}");
+                    for (record, _) in files_in_block {
+                        fail(&record.path, failure_kind(&err), err.to_string());
+                    }
                     continue;
                 }
             };
+            blocks_fetched += 1;
 
-            progress.blocks_fetched += 1;
-
-            // Extract each file from this block; staging writes are blocking I/O,
-            // wrap in block_in_place (review A1).
+            // Staging writes are blocking I/O (review A1). One block is written in
+            // full even if cancel fires meanwhile (bounded by one block).
             for (record, version) in files_in_block {
                 let result = tokio::task::block_in_place(|| {
                     self.extract_and_write_file(
                         record,
                         version,
-                        &block_record.block_type,
-                        &plaintext,
+                        &plaintext.block_type,
+                        &plaintext.bytes,
                         writer,
                     )
                 });
                 match result {
                     Ok(()) => {
-                        // CS-DR-6 / restore-i11: restore never writes LocalState. The
-                        // file sits in staging, not in a watched folder: a deleted record
-                        // stays deleted and its delete window keeps running. It is
-                        // protected again only when the user moves it into a watched
-                        // folder (watcher -> backup, restore-i13).
+                        // CS-DR-6 / restore-i11: restore never writes LocalState.
                         // restore-i14: counted only now, when the complete file is
                         // visible under its own name.
-                        progress.restored_paths.push(record.path.clone());
-                        info!(path = %record.path, "restored");
+                        jobs.record_restored(job_id, &record.path);
+                        info!(path = %record.path, job = %job_id, "restored");
                     }
                     Err(e) => {
                         error!(path = %record.path, "failed to write file: {e}");
-                        progress.failures.push((record.path.clone(), e.to_string()));
+                        fail(&record.path, failure_kind(&e), e.to_string());
                     }
                 }
             }
         }
-
-        Ok(())
+        (false, blocks_fetched)
     }
 
-    /// Decode one source block.
-    ///
-    /// Strategy (2-tier, post-Wave-11b):
-    ///   1. Rebuild the stored blob from the owner's own source files and re-encode
-    ///      the symbols we need locally. No symbols are persisted on disk anymore.
-    ///   2. If the rebuild path is unavailable (e.g. a source file is gone), fall back
-    ///      to fetching symbols from holders over the network.
-    ///
-    /// Decrypts and decompresses the decoded data before returning.
-    pub async fn decode_block_local(
+    /// Cancel (T10): every file of the blocks not done yet → `interrupted`.
+    fn interrupt_remaining(
         &self,
-        block_id: &SourceBlockId,
-        params: &ErasureParams,
-        encrypted_size: u64,
-    ) -> Result<Vec<u8>, RestoreError> {
-        let placements = self.db.list_placements_for_block(block_id)?;
-        // Use all non-deleted placements as the network-fetch candidate set: a
-        // placement's status describes the holder's copy, not anything owner-local.
-        let usable_placements: Vec<_> = placements
-            .into_iter()
-            .filter(|p| p.status != PlacementStatus::Deleting)
-            .collect();
-
-        // A4 / Wave 11b: an empty placement set is NOT an error. Post-A4 the
-        // WorkPipeline worker is the sole creator of placements, so a freshly-backed-up
-        // block has a SourceBlockRecord but no placements yet. The owner can still
-        // restore it from its own source files via the `rebuild_source_blob` path
-        // below — that path needs no placement at all. Only if rebuild AND the
-        // (possibly empty) network fetch both fail do we surface an error.
-
-        let k_eff = params.k_eff as usize;
-
-        // Wave 11b: no symbols live on disk anymore (the old
-        // `{symbols_dir}/{block_hex}/raw/{esi}.bin` tier-1 cache was removed — the
-        // pipeline never writes those files). The rebuild-from-source path below
-        // either decodes and early-returns, or we fetch entirely from holders.
-        let raw_symbols: Vec<Symbol>;
-
-        {
-            // Try rebuilding the stored blob from source files directly.
-            // If that succeeds, we can skip the network fetch entirely.
-            let block_record = self.db.get_source_block(block_id)?;
-            if let Some(block_record) = block_record
-                && let Ok(stored_blob) = crate::daemon::backup::pipeline::rebuild_source_blob(
-                    &self.db,
-                    &block_record,
-                    &self.config.epoch_key,
-                )
-                .await
-            {
-                // Encode raw symbols from the rebuilt blob (enough to decode).
-                let params_for_encode = block_record.erasure_params();
-                let encoder_clone = Arc::clone(&self.encoder);
-                let needed = k_eff as u32;
-                match tokio::task::spawn_blocking(move || {
-                    encoder_clone.encode_raw(&stored_blob, &params_for_encode, 0, needed)
-                })
-                .await
-                {
-                    Ok(Ok(raws)) => {
-                        debug!(
-                            block = %block_id,
-                            symbols = raws.len(),
-                            "restore: rebuilt symbols from source files (Wave 11b path)"
-                        );
-                        return tokio::task::block_in_place(|| {
-                            let padded = self.encoder.decode(&raws, params).map_err(|e| {
-                                RestoreError::DecodeFailed(*block_id, e.to_string())
-                            })?;
-                            if padded.len() < encrypted_size as usize {
-                                return Err(RestoreError::DecodeFailed(
-                                    *block_id,
-                                    "decoded block too small".to_string(),
-                                ));
-                            }
-                            let stored = &padded[..encrypted_size as usize];
-                            pipeline::decrypt_and_decompress(stored, &self.config.epoch_key)
-                                .map_err(|_| RestoreError::DecryptionFailed(*block_id))
-                        });
-                    }
-                    _ => {
-                        debug!(block = %block_id, "restore: encode from rebuilt blob failed, falling back to network");
-                    }
-                }
-            }
-
-            // Rebuild-from-source was unavailable (missing source files, etc.) —
-            // fall back to fetching from holders over the network. Holders return
-            // bound symbols; fetch_from_holders unbinds them into raw symbols that
-            // decode() can consume directly.
-            debug!(
-                block = %block_id,
-                need = k_eff,
-                "decode: source rebuild unavailable, fetching symbols from holders"
-            );
-
-            // Try network fetch for Alive, Uncertain, and PresumedLost placements.
-            // PresumedLost holders may have returned after a temporary outage and
-            // still hold their symbols — worth asking before declaring restore failed.
-            let reachable_for_fetch: Vec<_> = usable_placements
-                .iter()
-                .filter(|p| {
-                    matches!(
-                        p.status,
-                        PlacementStatus::Alive
-                            | PlacementStatus::Uncertain
-                            | PlacementStatus::PresumedLost
-                    )
-                })
-                .cloned()
-                .collect();
-            // CS-DR-5: `fetch_from_holders` already validates each symbol's form,
-            // restricts ESIs to those requested, dedups by ESI globally, and caps
-            // per holder — so the returned symbols are distinct-ESI and ready to
-            // decode. No on-disk symbols exist to merge with anymore (Wave 11b), so
-            // we use the fetched set directly; the old `existing_esis` merge over an
-            // always-empty `raw_symbols` was a dead no-op.
-            raw_symbols = tokio::time::timeout(
-                self.config.fetch_timeout,
-                self.fetch_from_holders(block_id, &reachable_for_fetch, params),
-            )
-            .await
-            .map_err(|_elapsed| RestoreError::Timeout {
-                block: *block_id,
-                secs: self.config.fetch_timeout.as_secs(),
-            })??;
-
-            if raw_symbols.len() < k_eff {
-                return Err(RestoreError::InsufficientSymbols {
-                    block: *block_id,
-                    got: raw_symbols.len(),
-                    need: k_eff,
-                });
-            }
-        }
-
-        // Erasure decode + decrypt + decompress are CPU-heavy; wrap in
-        // block_in_place so the tokio runtime keeps running while we work
-        // (review A1).
-        tokio::task::block_in_place(|| {
-            let padded = self
-                .encoder
-                .decode(&raw_symbols, params)
-                .map_err(|e| RestoreError::DecodeFailed(*block_id, e.to_string()))?;
-
-            if padded.len() < encrypted_size as usize {
-                return Err(RestoreError::DecodeFailed(
-                    *block_id,
-                    format!(
-                        "decoded block ({} bytes) smaller than encrypted_size ({})",
-                        padded.len(),
-                        encrypted_size
-                    ),
-                ));
-            }
-            let stored = &padded[..encrypted_size as usize];
-
-            pipeline::decrypt_and_decompress(stored, &self.config.epoch_key).map_err(|e| {
-                error!(block = %block_id, "decrypt_and_decompress failed: {e}");
-                RestoreError::DecryptionFailed(*block_id)
-            })
-        })
-    }
-
-    /// Fetch symbols for a source block from holders over the network.
-    ///
-    /// Thin wrapper around `symbol_fetch::fetch_unbound_symbols`; maps the
-    /// shared `FetchError` into `RestoreError`. Kept as a method so existing
-    /// integration tests continue to call `coordinator.fetch_from_holders(...)`.
-    pub async fn fetch_from_holders(
-        &self,
-        block_id: &SourceBlockId,
-        placements: &[SymbolPlacement],
-        params: &ErasureParams,
-    ) -> Result<Vec<Symbol>, RestoreError> {
-        // Without a swarm no holder is reachable; preserve the old behavior of
-        // returning InsufficientSymbols(got=0) rather than a Swarm error.
-        let swarm = match self.swarm.as_ref() {
-            Some(s) => s,
-            None => {
-                return Err(RestoreError::InsufficientSymbols {
-                    block: *block_id,
-                    got: 0,
-                    need: params.k_eff as usize,
-                });
-            }
-        };
-        crate::daemon::symbol_fetch::fetch_unbound_symbols(
-            swarm,
-            &self.encoder,
-            block_id,
-            placements,
-            params,
-        )
-        .await
-        .map_err(RestoreError::from_fetch)
-    }
-
-    /// Extract one file from decoded plaintext and write to staging directory.
-    ///
-    /// Validates the record path before writing (prevents path traversal from any
-    /// source — normal restore, DR blobs, or malicious peers).
-    pub(crate) fn extract_and_write_file(
-        &self,
-        record: &FileRecord,
-        version: &FileVersion,
-        block_type: &SourceBlockType,
-        plaintext: &[u8],
-        writer: &StagingWriter,
-    ) -> Result<(), RestoreError> {
-        let file_bytes = match block_type {
-            SourceBlockType::Pack { .. } => {
-                let extracted =
-                    pipeline::extract_from_pack(plaintext, record.file_id).map_err(|e| {
-                        RestoreError::PackIndexParseFailed(version.source_block_id, e.to_string())
-                    })?;
-                match extracted {
-                    Some(bytes) => bytes,
-                    None => {
-                        return Err(RestoreError::PackIndexParseFailed(
-                            version.source_block_id,
-                            format!("file_id {} not found in pack", record.file_id),
-                        ));
-                    }
-                }
-            }
-            SourceBlockType::Single => plaintext.to_vec(),
-        };
-
-        // Validate the record path from DB — must pass even for DR-sourced records.
-        let validated =
-            viaticum_core::path_safety::validate_record_path(&record.path).map_err(|e| {
-                RestoreError::PathUnsafe {
-                    path: record.path.clone(),
-                    source: e,
-                }
-            })?;
-
-        let published = writer
-            .write_file_published(&validated, &file_bytes)
-            .map_err(|e| match e {
-                StagingError::AlreadyExists(p) => {
-                    RestoreError::Staging(StagingError::AlreadyExists(p))
-                }
-                other => RestoreError::Staging(other),
-            })?;
-
-        debug!(
-            src = %record.path,
-            dst = ?published.path,
-            method = published.method.as_str(),
-            "wrote restored file to staging"
-        );
-        Ok(())
-    }
-
-    /// CS-DR-3: record an unrecoverable-block error against every file that
-    /// references that block, so the partial-restore `failures` list names each
-    /// affected path rather than aborting the whole job.
-    fn record_block_failure(
-        files_in_block: &[(FileRecord, FileVersion)],
-        err: &RestoreError,
-        failures: &mut Vec<(String, String)>,
+        job_id: JobId,
+        remaining: &[(f64, SourceBlockId)],
+        block_map: &HashMap<SourceBlockId, Vec<(FileRecord, FileVersion)>>,
     ) {
-        let msg = err.to_string();
-        for (record, _version) in files_in_block {
-            failures.push((record.path.clone(), msg.clone()));
+        info!(job = %job_id, "restore: daemon shutting down; job interrupted");
+        for (_, block_id) in remaining {
+            for (record, _) in block_map.get(block_id).into_iter().flatten() {
+                self.config.jobs.record_failure(
+                    job_id,
+                    RestoreFailure {
+                        path: record.path.clone(),
+                        kind: RestoreFailureKind::Interrupted,
+                        detail: "daemon shutting down".to_string(),
+                    },
+                );
+            }
         }
+    }
+
+    /// Look up the block record and decode the block.
+    async fn decode_block(&self, block_id: &SourceBlockId) -> Result<DecodedBlock, RestoreError> {
+        let block_record = self
+            .db
+            .get_source_block(block_id)?
+            .ok_or(RestoreError::BlockNotFound(*block_id))?;
+        let encrypted_size = block_record
+            .encrypted_size
+            .ok_or(RestoreError::LegacyRecord(*block_id))?;
+        let params = block_record.erasure_params();
+        let bytes = self
+            .decode_block_local(block_id, &params, encrypted_size)
+            .await?;
+        Ok(DecodedBlock {
+            block_type: block_record.block_type,
+            bytes,
+        })
     }
 
     /// Select which FileVersion to restore.
@@ -765,37 +527,75 @@ impl RestoreCoordinator {
         }
     }
 
-    /// Run the coordinator as a tokio task.
+    /// Run the coordinator as a tokio task: jobs one at a time, in submit order.
     ///
-    /// Accepts (RestoreRequest, oneshot::Sender) from rx, processes sequentially.
+    /// Returns on the daemon's cancel token (a running job stops and is recorded
+    /// `interrupted` first) or when the channel closes. After each job the cached
+    /// staging status is refreshed and, under holder pressure, the staging warning
+    /// logged at once (restore-i8, i20) — here, not on the HTTP path.
     pub async fn run(
         self,
-        mut rx: tokio::sync::mpsc::Receiver<(
-            RestoreRequest,
-            tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
-        )>,
+        mut rx: tokio::sync::mpsc::Receiver<RestoreRequest>,
     ) -> anyhow::Result<()> {
         info!("RestoreCoordinator started");
-        while let Some((request, reply)) = rx.recv().await {
-            let result = self.restore(request).await;
-            let _ = reply.send(result);
+        loop {
+            let request = tokio::select! {
+                _ = self.config.cancel.cancelled() => break,
+                r = rx.recv() => match r {
+                    Some(r) => r,
+                    None => break,
+                },
+            };
+            let (job_id, path) = (request.job_id, request.path.clone());
+            if let Err(e) = self.restore(request).await {
+                error!(job = %job_id, "restore job failed before it could start: {e}");
+                self.config.jobs.record_failure(
+                    job_id,
+                    RestoreFailure {
+                        path,
+                        kind: failure_kind(&e),
+                        detail: e.to_string(),
+                    },
+                );
+                self.config.jobs.finish(job_id, false);
+            }
+            if self.config.cancel.is_cancelled() {
+                break;
+            }
+            self.refresh_staging_status();
         }
-        info!("RestoreCoordinator: channel closed, exiting");
+        info!("RestoreCoordinator stopped");
         Ok(())
+    }
+
+    /// Re-count staging into the cached status; WARN when staging squeezes
+    /// friends' data (restore-i20). Blocking I/O.
+    fn refresh_staging_status(&self) {
+        let (summary, stops_taking_data) = tokio::task::block_in_place(|| {
+            (
+                cleanup::staging_summary(&self.config.staging_root),
+                self.config
+                    .pressure
+                    .as_ref()
+                    .is_some_and(|p| p.stops_taking_data()),
+            )
+        });
+        self.config
+            .staging_status
+            .lock()
+            .expect("restore staging status lock poisoned")
+            .apply(summary);
+        cleanup::warn_if_squeezing(stops_taking_data, Some(summary.bytes));
     }
 }
 
-// ─── Free helpers ─────────────────────────────────────────────────────────────
-
-/// Per-file accounting of one running job.
-#[derive(Debug, Default)]
-struct JobProgress {
-    /// Catalog paths of files visible under their own names in the job dir.
-    restored_paths: Vec<String>,
-    /// (catalog path, reason) of files that were not restored.
-    failures: Vec<(String, String)>,
-    blocks_fetched: usize,
+/// A decoded block: its plaintext and whether it is a pack.
+struct DecodedBlock {
+    block_type: viaticum_core::types::SourceBlockType,
+    bytes: Vec<u8>,
 }
+
+// ─── Free helpers ─────────────────────────────────────────────────────────────
 
 /// Resolve a user-supplied restore path to catalog records.
 ///

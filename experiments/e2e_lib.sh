@@ -96,79 +96,93 @@ wait_auth_peers() {
     return 1
 }
 
+# restore_run IDX TIMEOUT_SECS ARGS...
+#
+# `viaticum restore ARGS --json` on node IDX, killed after TIMEOUT_SECS (the CLI
+# itself has no deadline: it waits for the job, restore-i4). Sets RESTORE_RC (the
+# CLI exit code: 0 complete, 2 partial, 1 nothing / refused / lost contact; 124 =
+# our timeout), RESTORE_FIRST (the submitted job, first NDJSON line), RESTORE_LAST
+# (the finished job, last line; "" if none), RESTORE_ERR (stderr).
+restore_run() {
+    local idx="$1" secs="$2"; shift 2
+    local out errf
+    errf=$(mktemp)
+    set +e
+    out=$(timeout "$secs" "$BINARY" --data-dir "$(node_dir "$idx")" restore "$@" --json 2>"$errf")
+    RESTORE_RC=$?
+    set -e
+    RESTORE_ERR=$(cat "$errf"); rm -f "$errf"
+    RESTORE_FIRST=$(printf '%s\n' "$out" | sed -n '1p')
+    RESTORE_LAST=$(printf '%s\n' "$out" | sed -n '2,$p' | tail -1)
+}
+
+# staging_matches_job JOB_JSON
+#
+# The regular files in the job's staging dir (without the daemon's `.viaticum-*`
+# entries) are exactly the job's `restored_paths` (as a set). Sets RESTORE_MSG on
+# a mismatch.
+staging_matches_job() {
+    local job="$1" dir want got
+    dir=$(echo "$job" | jq -r '.staging_path')
+    [ -d "$dir" ] || { RESTORE_MSG="staging dir $dir does not exist"; return 1; }
+    want=$(echo "$job" | jq -r '.restored_paths[]' | sort)
+    got=$(cd "$dir" && find . -path './.viaticum-*' -prune -o -type f -print | sed 's|^\.||' | sort)
+    if [ "$want" != "$got" ]; then
+        RESTORE_MSG="staging $dir holds [$(echo $got)] but the job claims [$(echo $want)]"
+        return 1
+    fi
+}
+
 # restore_from_network IDX PATH EXPECTED_HASH SECS
 #
 # Restores PATH on node IDX and checks the staged copy by content hash.
 # Precondition (asserted): PATH does not exist on disk, so the owner cannot
 # rebuild the block from its own source and must fetch symbols from holders.
-# Sets RESTORE_MSG; returns 0 only on a hash match.
+# Requires: the CLI waited for the job and exited 0 within SECS; the job's
+# outcome is `complete`; PATH is in its `restored_paths`; the staged file
+# `staging_path/PATH` has EXPECTED_HASH; staging holds exactly `restored_paths`.
+# Files appear in staging only complete (restore-i14): no size-settle loop.
+# Sets RESTORE_MSG and RESTORE_JOB_JSON (the finished job).
 restore_from_network() {
     local idx="$1" path="$2" want="$3" secs="$4"
-    local base; base=$(basename "$path")
     RESTORE_MSG=""
+    RESTORE_JOB_JSON=""
     if [ -e "$path" ]; then
         RESTORE_MSG="source $path still on disk: restore would not touch the network"
         return 1
     fi
-    local out rc staging="" got="" jobs_root
-    jobs_root="$(node_dir "$idx")/restore"
-    # Job dirs that exist before this restore must never satisfy it.
-    local before; before=$(ls "$jobs_root" 2>/dev/null | sort || true)
-    set +e
-    out=$("$BINARY" --data-dir "$(node_dir "$idx")" restore "$path" 2>&1)
-    rc=$?
-    set -e
-    echo "$out" | sed 's/^/    | /'
-    staging=$(echo "$out" | awk '/^  staging:/ {print $2}')
-    local deadline="$secs"
-    if [ -n "$staging" ] && [ "$rc" -eq 0 ]; then
-        # POST /api/restore answers after the job finished, so the file is either
-        # there now or the job failed (the daemon still reports "started").
-        deadline=5
-    elif [ -z "$staging" ]; then
-        if echo "$out" | grep -qiE "blocked|restore failed|not found"; then
-            RESTORE_MSG="restore command failed (exit=$rc)"
-            return 1
-        fi
-        # The CLI gives up after 30 s but the daemon keeps restoring.
-        info "restore CLI exited $rc before the daemon finished; polling new job dirs"
+    restore_run "$idx" "$secs" "$path"
+    RESTORE_JOB_JSON="$RESTORE_LAST"
+    if [ -n "$RESTORE_FIRST" ]; then
+        info "restore job $(echo "$RESTORE_FIRST" | jq -r '.job_id' 2>/dev/null) for $path"
     fi
-    local f="" size_prev=-1 size_now=0 root="" d
-    for _ in $(seq 1 "$deadline"); do
-        if [ -n "$staging" ]; then
-            root="$staging"
-        else
-            root=""
-            for d in $(ls "$jobs_root" 2>/dev/null | sort || true); do
-                echo "$before" | grep -qx "$d" || root="$jobs_root/$d"
-            done
-        fi
-        f=""
-        [ -n "$root" ] && f=$(find "$root" -type f -name "$base" 2>/dev/null | head -1 || true)
-        if [ -n "$f" ]; then
-            # The staging writer publishes only complete files (restore-i14), so the
-            # size check is redundant now; kept until B1.3 rewrites this helper.
-            size_now=$(file_size "$f")
-            if [ "$size_now" -eq "$size_prev" ]; then
-                got=$(content_hash "$f")
-                if [ "$got" = "$want" ]; then
-                    RESTORE_MSG="sha256 match ($size_now bytes) at $f"
-                    return 0
-                fi
-                RESTORE_MSG="sha256 MISMATCH: want=$want got=$got ($size_now bytes) at $f"
-                return 1
-            fi
-            size_prev=$size_now
-        fi
-        sleep 1
-    done
-    if [ -n "$staging" ] && [ "$rc" -eq 0 ]; then
-        RESTORE_MSG="CLI exit 0 and status 'started', but no $base in $staging: the job ended without restoring it (see node log)"
+    if [ "$RESTORE_RC" -ne 0 ]; then
+        RESTORE_MSG="restore CLI exit $RESTORE_RC (want 0; 124 = still running after ${secs}s); stderr: ${RESTORE_ERR:0:300}; job: ${RESTORE_LAST:0:600}"
         return 1
     fi
-    root="${root:-$jobs_root}"
-    RESTORE_MSG="no restored file named $base under $root after ${secs}s"
-    return 1
+    local outcome staging f got
+    outcome=$(echo "$RESTORE_LAST" | jq -r '.outcome // "none"' 2>/dev/null || echo "unparsable")
+    if [ "$outcome" != "complete" ]; then
+        RESTORE_MSG="job outcome $outcome (want complete): ${RESTORE_LAST:0:600}"
+        return 1
+    fi
+    if ! echo "$RESTORE_LAST" | jq -e --arg p "$path" '.restored_paths | index($p) != null' >/dev/null; then
+        RESTORE_MSG="$path is not in the job's restored_paths: ${RESTORE_LAST:0:600}"
+        return 1
+    fi
+    staging=$(echo "$RESTORE_LAST" | jq -r '.staging_path')
+    f="$staging/${path#/}"
+    if [ ! -f "$f" ]; then
+        RESTORE_MSG="the job claims $path, but $f does not exist"
+        return 1
+    fi
+    staging_matches_job "$RESTORE_LAST" || return 1
+    got=$(content_hash "$f")
+    if [ "$got" != "$want" ]; then
+        RESTORE_MSG="sha256 MISMATCH: want=$want got=$got ($(file_size "$f") bytes) at $f"
+        return 1
+    fi
+    RESTORE_MSG="sha256 match ($(file_size "$f") bytes) at $f"
 }
 
 # Delete-window guard. Call right before removing a source file that the scenario

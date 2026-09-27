@@ -32,6 +32,9 @@ use crate::daemon::identity::{
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) mod test_disk;
+
 /// The files DR reads and writes inside the data dir.
 #[derive(Debug, Clone)]
 pub(crate) struct DrPaths {
@@ -90,13 +93,48 @@ pub(crate) fn classify_try_lock(r: Result<(), TryLockError>) -> Result<LockProbe
     }
 }
 
-/// (device, inode) of a file. Lets DR tell ITS staging file from one another DR put
-/// at the same path. `None` where the platform does not expose it.
+/// (device, inode) of a file. `None` where the platform does not expose it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct FileIdentity {
     dev: u64,
     ino: u64,
+}
+
+/// A file this DR created, told apart from any file another DR puts at the same
+/// path. A remembered (dev, ino) does not do that: once a file is unlinked and
+/// closed its inode number is free, and ext4 may hand it to the next file created —
+/// another DR's draft would then look like ours. So this holds the file open and
+/// takes its identity from the handle (fstat) at every check: an open inode is never
+/// freed, so no other file can have that (dev, ino) while this value lives. The
+/// handle is a separate open, not a clone of the creator's handle, so it takes no
+/// part in the creator's (redb's) lock.
+#[derive(Debug)]
+pub(crate) struct OwnedFile {
+    handle: File,
+}
+
+impl OwnedFile {
+    /// Hold the file now at `path` if it is the file with identity `id`. `id` must
+    /// come from a handle the caller holds open (so it cannot have been reused yet).
+    /// `None`: the path names another file, or is gone.
+    pub(crate) fn pin_if_same(path: &Path, id: FileIdentity) -> Option<OwnedFile> {
+        let owned = OwnedFile::pin(path)?;
+        (owned.identity() == Some(id)).then_some(owned)
+    }
+
+    /// Hold the file now at `path` (just written by this run through its path).
+    /// `None` where the platform has no file identity.
+    pub(crate) fn pin(path: &Path) -> Option<OwnedFile> {
+        let owned = OwnedFile {
+            handle: File::open(path).ok()?,
+        };
+        owned.identity().is_some().then_some(owned)
+    }
+
+    fn identity(&self) -> Option<FileIdentity> {
+        file_identity(&self.handle.metadata().ok()?)
+    }
 }
 
 pub(crate) fn file_identity(meta: &std::fs::Metadata) -> Option<FileIdentity> {
@@ -115,15 +153,31 @@ pub(crate) fn file_identity(meta: &std::fs::Metadata) -> Option<FileIdentity> {
     }
 }
 
-/// True when `path` names the file with identity `id`. With no identity (platform
-/// without inodes) the claim is trusted as long as the path exists.
-pub(crate) fn path_is(path: &Path, id: Option<FileIdentity>) -> bool {
+/// True when `path` names the file `owned`. With no identity: on a platform without
+/// inodes the claim is trusted as long as the path exists; on unix (the identity
+/// could not be taken) nothing is proven ours.
+pub(crate) fn path_is(path: &Path, owned: Option<&OwnedFile>) -> bool {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) => match id {
-            Some(id) => file_identity(&meta) == Some(id),
-            None => true,
+        Ok(meta) => match owned {
+            Some(owned) => owned
+                .identity()
+                .is_some_and(|id| file_identity(&meta) == Some(id)),
+            None => !cfg!(unix),
         },
         Err(_) => false,
+    }
+}
+
+/// True when the open `file` is the file `owned` (same rule as `path_is` without
+/// an identity).
+pub(crate) fn handle_is(file: &File, owned: Option<&OwnedFile>) -> bool {
+    match owned {
+        Some(owned) => file
+            .metadata()
+            .ok()
+            .and_then(|m| file_identity(&m))
+            .is_some_and(|id| owned.identity() == Some(id)),
+        None => !cfg!(unix),
     }
 }
 
@@ -139,7 +193,8 @@ pub(crate) struct DataDirLock {
 pub(crate) struct StagingClaim {
     /// Taken by `Db::create_from_file`; redb keeps the lock from then on.
     pub(crate) file: Option<File>,
-    pub(crate) id: Option<FileIdentity>,
+    /// `None` only where the platform has no file identity.
+    pub(crate) id: Option<OwnedFile>,
 }
 
 /// Everything preflight decided; consumed by `commit`, cleaned up by `abort`.
@@ -152,7 +207,7 @@ pub(crate) struct DrPlan {
     pub(crate) lock: DataDirLock,
     pub(crate) staging: StagingClaim,
     /// Set by `stage_key` when THIS run wrote `identity.key.dr-new`.
-    pub(crate) staged_key: Option<Option<FileIdentity>>,
+    pub(crate) staged_key: Option<Option<OwnedFile>>,
     /// Warnings already decided to continue with (printed by `run_dr`).
     pub(crate) warnings: Vec<String>,
 }
@@ -170,10 +225,7 @@ impl DrPlan {
                 self.paths.key_staging.display()
             ))
         })?;
-        let id = std::fs::symlink_metadata(&self.paths.key_staging)
-            .ok()
-            .and_then(|m| file_identity(&m));
-        self.staged_key = Some(id);
+        self.staged_key = Some(OwnedFile::pin(&self.paths.key_staging));
         Ok(())
     }
 }
@@ -401,12 +453,18 @@ fn claim_staging(paths: &DrPaths, warnings: &mut Vec<String>) -> Result<StagingC
         }
     }
     // Another DR's 6a may have removed our fresh file before we locked it and put
-    // its own at the path: then the path is no longer ours.
-    if !path_is(&paths.db_staging, id) {
-        return Err(in_progress());
-    }
+    // its own at the path: then the path is no longer ours. `file` is still open,
+    // so `id` cannot belong to another file yet; the pin keeps it that way.
+    let owned = match id {
+        Some(id) => match OwnedFile::pin_if_same(&paths.db_staging, id) {
+            Some(owned) => Some(owned),
+            None => return Err(in_progress()),
+        },
+        None if paths.db_staging.exists() => None,
+        None => return Err(in_progress()),
+    };
     Ok(StagingClaim {
         file: Some(file),
-        id,
+        id: owned,
     })
 }
