@@ -18,8 +18,8 @@ use tracing::{debug, error, info};
 use viaticum_core::db::Db;
 use viaticum_core::erasure::{ErasureEncoder, Symbol};
 use viaticum_core::types::{
-    DeviceId, ErasureParams, FileRecord, FileVersion, PlacementStatus, SourceBlockId,
-    SourceBlockType, SymbolPlacement, Timestamp,
+    ErasureParams, FileRecord, FileVersion, PlacementStatus, SourceBlockId, SourceBlockType,
+    SymbolPlacement, Timestamp,
 };
 
 use crate::daemon::restore::staging::{JobId, StagingError, StagingWriter};
@@ -64,17 +64,6 @@ pub enum RestoreError {
     #[error("pack index parse failed for block {0}: {1}")]
     PackIndexParseFailed(SourceBlockId, String),
 
-    #[error(
-        "restore denied by holder {holder}: trust {current_trust:.2}, budget {restore_budget_gb:.1} GB, requested {restore_gb:.1} GB"
-    )]
-    EscrowDenied {
-        holder: DeviceId,
-        current_trust: f64,
-        needed_trust: f64,
-        restore_budget_gb: f64,
-        restore_gb: f64,
-    },
-
     #[error("swarm error: {0}")]
     Swarm(String),
 
@@ -106,21 +95,6 @@ impl RestoreError {
             FetchError::InsufficientSymbols { block, got, need } => {
                 RestoreError::InsufficientSymbols { block, got, need }
             }
-            FetchError::EscrowDenied {
-                holder,
-                current_trust,
-                needed_trust,
-                restore_budget_gb,
-            } => RestoreError::EscrowDenied {
-                holder,
-                current_trust,
-                needed_trust,
-                restore_budget_gb,
-                // RestoreDeniedMsg doesn't carry the requested size — we only
-                // know the holder's budget view. Report NaN so callers (and
-                // operators) don't mistake this number for a real measurement.
-                restore_gb: f64::NAN,
-            },
             FetchError::Swarm(s) => RestoreError::Swarm(s),
         }
     }

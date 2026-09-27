@@ -9,8 +9,9 @@ fn write_config(dir: &tempfile::TempDir, body: &str) -> PathBuf {
 }
 
 fn sample_config() -> &'static str {
-    // Includes comments, a [[watch]] block, [escrow], [web_api] — none of which
-    // the editor should touch.
+    // Includes comments, a [[watch]] block, [web_api] and a legacy [escrow]
+    // section (ignored by the daemon since v1, restore-i6) — none of which the
+    // editor should touch.
     r#"# top of file comment
 
 [backup]

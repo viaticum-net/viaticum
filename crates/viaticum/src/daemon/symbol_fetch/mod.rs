@@ -8,9 +8,8 @@
 // Fetches sequentially from Alive placements, unbinds returned symbols, returns
 // at least `k_eff` unbound symbols or `InsufficientSymbols`.
 //
-// Escrow enforcement (D1): holder may reply with `RestoreDenied`; we propagate
-// that as `EscrowDenied` — caller decides whether to continue with remaining
-// holders (current logic: skip denied holder, try next).
+// There is no restore gate on the holder (restore-i6): a holder either serves the
+// owner's symbols or answers empty (no active holding for this owner).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -41,11 +40,11 @@ mod tests;
 /// Errors from fetching unbound symbols from holders.
 ///
 /// `pub(crate)` because only callers inside this crate ever observe a
-/// `FetchError` — `fetch_unbound_symbols` itself consumes `EscrowDenied` and
-/// `Swarm` internally (logs WARN, skips holder) and only ever surfaces
-/// `InsufficientSymbols` to its caller. The private variants exist to carry
-/// information *between* `fetch_symbols_from_holder` and the loop in
-/// `fetch_unbound_symbols`; they are not part of the public API surface.
+/// `FetchError` — `fetch_unbound_symbols` itself consumes `Swarm` internally
+/// (logs WARN, skips holder) and only ever surfaces `InsufficientSymbols` to its
+/// caller. `Swarm` exists to carry information *between*
+/// `fetch_symbols_from_holder` and the loop in `fetch_unbound_symbols`; it is not
+/// part of the public API surface.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FetchError {
     #[error("insufficient symbols: collected {got}, need {need} for block {block}")]
@@ -53,20 +52,6 @@ pub(crate) enum FetchError {
         block: SourceBlockId,
         got: usize,
         need: usize,
-    },
-
-    /// Holder answered with `RestoreDenied` (escrow not satisfied).
-    /// Note: the message does not carry the requested size, only the holder's
-    /// budget/trust view — so we don't expose a bogus `restore_gb` here.
-    #[error(
-        "restore denied by holder {holder}: trust {current_trust:.2}, \
-         budget {restore_budget_gb:.1} GB"
-    )]
-    EscrowDenied {
-        holder: DeviceId,
-        current_trust: f64,
-        needed_trust: f64,
-        restore_budget_gb: f64,
     },
 
     #[error("swarm error: {0}")]
@@ -77,7 +62,7 @@ pub(crate) enum FetchError {
 ///
 /// - Iterates holders sequentially, collecting up to `k_eff` *distinct-ESI*
 ///   unbound symbols.
-/// - `EscrowDenied` and swarm errors per holder are logged WARN and skipped.
+/// - Swarm errors per holder are logged WARN and skipped.
 /// - Returns `InsufficientSymbols` if total collected < `k_eff`.
 ///
 /// Input validation (CS-DR-2 / CS-DR-5): symbols arrive over the wire from a
@@ -172,13 +157,6 @@ pub(crate) async fn fetch_unbound_symbols(
                     k_eff,
                     &mut accepted_esis,
                     &mut unbound_symbols,
-                );
-            }
-            Err(FetchError::EscrowDenied { ref holder, .. }) => {
-                warn!(
-                    holder = %holder,
-                    block = %block_id,
-                    "fetch: holder denied restore (escrow), skipping"
                 );
             }
             Err(e) => {
@@ -286,12 +264,6 @@ async fn fetch_symbols_from_holder(
             );
             Ok(resp.symbols)
         }
-        Message::RestoreDenied(denied) => Err(FetchError::EscrowDenied {
-            holder: *holder_device,
-            current_trust: denied.current_trust,
-            needed_trust: denied.needed_trust,
-            restore_budget_gb: denied.restore_budget_gb,
-        }),
         other => {
             warn!(
                 holder = %holder_device,

@@ -70,7 +70,6 @@ pub enum Message {
     SymbolDropNotice(SymbolDropNoticeMsg),
     RestoreRequest(RestoreRequestMsg),
     RestoreResponse(RestoreResponseMsg),
-    RestoreDenied(RestoreDeniedMsg),
     ClusterSyncRequest(ClusterSyncRequestMsg),
     MailboxFetchRequest(MailboxFetchRequest),      // poll my own mail from a postman
     MailboxFetchResponse(MailboxFetchResponse),    // entries addressed to the requester
@@ -183,7 +182,7 @@ Initiator (A)              Acceptor (B)
 
 #### Handshake result
 
-After a successful exchange the node knows the peer's `master_pub_key` (cluster identity) and `DeviceId` (transport identity). All trust / escrow / placement operations key on the master identity.
+After a successful exchange the node knows the peer's `master_pub_key` (cluster identity) and `DeviceId` (transport identity). All trust / restore / placement operations key on the master identity.
 
 > A `HandshakeMsg` struct still exists in the message enum from the earlier design, but the live authentication path is the `DeviceCertExchange` above.
 
@@ -267,7 +266,7 @@ PoS is the mechanism for verifying that a holder is actually storing the assigne
 
 #### Messages
 
-A challenge covers an ESI **range** and is answered with a single chain hash over all the bound symbols in it — raw symbol bytes never cross the wire (this also closes an escrow-bypass: you cannot fetch your data back through PoS).
+A challenge covers an ESI **range** and is answered with a single chain hash over all the bound symbols in it — raw symbol bytes never cross the wire (PoS proves possession without shipping data).
 
 **PosHashChallengeMsg** (Owner → Holder):
 ```rust
@@ -610,8 +609,7 @@ pub struct SymbolTransferMsg {
 ```
 Owner                          Holder
   │── RestoreRequest ─────────>│   esi_list: [] = "any K_eff from your set"
-  │<─ RestoreResponse ──────────│   bound symbols
-  │   (or RestoreDenied)
+  │<─ RestoreResponse ──────────│   bound symbols (empty if no holding for this owner, or the owner asked to delete it)
 ```
 
 **RestoreRequestMsg**:
@@ -620,19 +618,6 @@ pub struct RestoreRequestMsg {
     pub v: u8,
     pub source_block_id: SourceBlockId,
     pub esi_list: Vec<u32>,    // empty = "any K_eff"
-    pub timestamp: Timestamp,
-}
-```
-
-**RestoreDeniedMsg** (escrow check failed):
-```rust
-pub struct RestoreDeniedMsg {
-    pub v: u8,
-    pub source_block_id: SourceBlockId,
-    pub reason: String,
-    pub current_trust: f64,
-    pub needed_trust: f64,
-    pub restore_budget_gb: f64,
     pub timestamp: Timestamp,
 }
 ```
@@ -706,32 +691,9 @@ pub struct StorageWarningMsg {
 
 ---
 
-### 1.8. Escrow (contribution-based)
+### 1.8. Restore access (no gate in v1)
 
-Escrow controls access to restore. The goal is to block hit-and-run behaviour (take symbols, contribute nothing back) and incentivise mutual contribution.
-
-#### Formula
-
-```
-restore_budget_gb = stored_gb_days / k_factor
-
-k_factor = DEFAULT_ESCROW_K_FACTOR = 7.0  // storage days per 1 GB of restore
-```
-
-Example: store 1 GB for 7 days → earn 1 GB restore budget.
-
-`stored_gb_days` is calculated as the sum of `bytes_we_store_for_peer × days_held` across all holding records for a peer.
-
-#### Check
-
-The holder verifies before sending symbols for restore:
-```
-total_bytes_in_request <= restore_budget_gb × 1024³
-```
-
-If the check fails, the holder sends `RestoreDeniedMsg`.
-
-The time-based escrow (weeks_in_network) from α has been removed. Trust already contains a temporal component (I = cumulative mean).
+v1 has no restore gate: the holder serves the owner's own symbols while it holds them. The holding is looked up by the pair (block, master of the requesting connection); any other master gets an empty `RestoreResponse`. Only what the owner itself asked to delete (`MarkedForDelete`) is not served (restore-i16). Served bytes are counted per owner (`restore_served`) for a future escrow-as-debt; nothing reads the counter today.
 
 ---
 
@@ -755,7 +717,7 @@ HandshakeMsg.identity_pub = DeviceId.0          (device pubkey bytes = device id
 HandshakeMsg.device_cert  = DeviceCertificate   (master_key.sign(device_id.0 || issued_at))
 ```
 
-Upon receiving such a handshake, the partner extracts `master_pub_key` from `device_cert` as the cluster identity. All subsequent trust/escrow operations use `master_pub_key`.
+Upon receiving such a handshake, the partner extracts `master_pub_key` from `device_cert` as the cluster identity. All subsequent trust/restore operations use `master_pub_key`.
 
 #### Device registration
 
@@ -1003,7 +965,7 @@ viaticum restore <path> [--version N] [--date YYYY-MM-DD]
 3. Dedup: multiple files in same batch → single download
 4. Per source_block:
    a. Find holders: SymbolPlacement WHERE status=Alive
-   b. Escrow check: `remaining = stored_gb_days/k_factor - already_restored_gb` sufficient?
+   b. (no restore gate on the holder side, §1.8)
    c. RestoreRequest to K_eff holders in parallel
    d. Collect K_eff bound symbols (any ESI)
    e. Unbind: XOR ChaCha20(HKDF(block_id, holder_id))
@@ -1075,10 +1037,7 @@ Symbols at A and B differ → deduplication is impossible. Each holder must stor
 
 **Attack:** a peer accepts symbols for storage (S-score grows) but stores nothing for others.
 
-**Defence:** Escrow (trust-based).
-
-- Trust = 0 → max 1 GB restore
-- No mutual storage → S-score → 0 → trust → 0 → escrow → empty
+**Defence (v1):** contribution-weighted placement and offer budget. A peer that stores nothing for others earns no offer credit and loses trust weight. There is no restore gate: restore of the owner's own data is never refused (a legitimate owner must get their files back on the worst day). A debt-style escrow for an open network is future work.
 
 ### 4.3. Lazy Deletion (ransomware)
 
@@ -1138,7 +1097,6 @@ Threat model: "lazy not malicious". For an active adversary (with `epoch_key` co
 | `OWNER_DELETE_COOLDOWN_SECS` | 2_419_200 (4 wk) | Owner cooldown before delete |
 | `HOLDER_DELETE_COOLDOWN_SECS` | 2_419_200 (4 wk) | Holder cooldown after delete |
 | `DROP_NOTICE_WINDOW_SECS` | 604_800 (7 days) | Advance notice before drop |
-| `DEFAULT_ESCROW_K_FACTOR` | 7.0 | Storage days per 1 GB restore |
 | `MAILBOX_CANDIDATES_N` | 1000 | Closest peers that store for a target (postman set) |
 | `MAILBOX_WRITE_FANOUT` | 30 | Postmen an entry is deposited with on publish |
 | `MAILBOX_READ_FANOUT` | 300 | Postmen polled when fetching own mail |
@@ -1215,7 +1173,7 @@ Advantage vs α: ~3.4 MB per 1000 files vs ~50 MB (15x smaller). Fungible symbol
 | Encoding unit | Unit (32 MB) | Source block (128 MB default, configurable) |
 | Placement | k-of-n fixed | Weighted budget (trust/sqrt(1-t)) |
 | Overhead | Fixed k/n | Continuous: 1.5 + importance × 1.5 |
-| Escrow | Time-based (weeks_in_network) | Trust-based (FREE_TIER + trust × factor) |
+| Escrow | Time-based (weeks_in_network) | None: no restore gate (v1) |
 | DB metadata | ~50 MB/1000 files | ~3.4 MB/1000 files (15x smaller) |
 | Multi-device | None | Personal Cluster, device certs |
 | PoS | Stub | Real (64 KB response + on-the-fly verify) |

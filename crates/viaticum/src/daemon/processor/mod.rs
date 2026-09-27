@@ -13,8 +13,7 @@
 //   SymbolOffer received    → we are the holder  → check quota, send Accept or Reject
 //   SymbolAccept received   → we are the owner   → log (BackupCoordinator wiring Phase 7.5)
 //   SymbolReject received   → we are the owner   → log
-//   RestoreRequest received → we are the holder  → load symbols, send RestoreResponse
-//   RestoreDenied received  → we are the owner   → log warning
+//   RestoreRequest received → we are the holder  → load symbols, send RestoreResponse (no gate)
 //   PeerAnnounce received   → upsert peer record in DB
 //   ClusterSyncRequest      → we are cluster peer → serve event log entries
 //   ClusterSyncResponse     → we are cluster peer → apply received events
@@ -45,10 +44,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use viaticum_core::cluster::DeviceCertificate;
-use viaticum_core::config::EscrowCfg;
 use viaticum_core::constants::SYMBOL_OFFER_EXPIRY_SECS;
 use viaticum_core::db::Db;
-use viaticum_core::messages::{AckMsg, Message, RestoreDeniedMsg, SymbolStoredMsg};
+use viaticum_core::messages::{AckMsg, Message, SymbolStoredMsg};
 use viaticum_core::pair_ledger::{LossCause, drop_event_for, ledger_master_for_device};
 use viaticum_core::types::{
     DeviceId, DropKind, IdentityPub, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
@@ -110,12 +108,6 @@ pub enum ProcessorError {
 
     #[error("cluster sync error: {0}")]
     ClusterSync(#[from] crate::daemon::cluster_sync::ClusterSyncError),
-
-    #[error("escrow denied for block {block_id}")]
-    EscrowDenied {
-        block_id: viaticum_core::types::SourceBlockId,
-        denial: viaticum_core::escrow::RestoreDenial,
-    },
 
     #[error("task join error: {0}")]
     Join(String),
@@ -184,12 +176,8 @@ pub struct Processor {
     disk_reserve_bytes: u64,
     /// Channel to notify BackupCoordinator about symbol accept/reject outcomes.
     backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
-    /// Time acceleration factor (1 = real time). Scales week numbers for trust.
-    time_scale: u64,
     /// Cluster state for auto-add on same-identity handshake. None if not initialized.
     cluster_state: Option<Arc<std::sync::Mutex<viaticum_core::cluster::ClusterState>>>,
-    /// Escrow configuration for contribution-based restore budget checks.
-    escrow_cfg: EscrowCfg,
     /// Accepted symbol offers awaiting SymbolTransfer from the owner.
     /// Key: (owner_id, block_id). Entries expire after SYMBOL_OFFER_EXPIRY_SECS.
     pub(crate) accepted_offers: AcceptedOffers,
@@ -221,9 +209,7 @@ impl Processor {
         data_dir: PathBuf,
         disk_reserve_bytes: u64,
         backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
-        time_scale: u64,
         cluster_state: Option<Arc<std::sync::Mutex<viaticum_core::cluster::ClusterState>>>,
-        escrow_cfg: EscrowCfg,
         accepted_offers: AcceptedOffers,
         master_signing_key: ed25519_dalek::SigningKey,
     ) -> Self {
@@ -238,9 +224,7 @@ impl Processor {
             data_dir,
             disk_reserve_bytes,
             backup_event_tx,
-            time_scale,
             cluster_state,
-            escrow_cfg,
             accepted_offers,
             peer_cert_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             master_signing_key,
@@ -442,20 +426,8 @@ impl Processor {
                 self.swarm.respond_logged(response_channel, reply);
             }
             Message::RestoreRequest(req) => {
-                let block_id = req.source_block_id;
                 let reply = match self.handle_restore_request_inner(from_master, req).await {
                     Ok(resp) => Message::RestoreResponse(resp),
-                    Err(ProcessorError::EscrowDenied { denial, .. }) => {
-                        Message::RestoreDenied(RestoreDeniedMsg {
-                            v: 1,
-                            source_block_id: block_id,
-                            reason: "escrow check failed".to_string(),
-                            current_trust: denial.current_trust,
-                            needed_trust: denial.needed_trust,
-                            restore_budget_gb: denial.restore_budget_gb,
-                            timestamp: Timestamp::now(),
-                        })
-                    }
                     Err(e) => {
                         warn!(device = %from_device, err = %e, "processor: RestoreRequest handler failed");
                         return Ok(());
@@ -499,13 +471,6 @@ impl Processor {
             Message::SymbolReject(reject) => {
                 if let Err(e) = self.handle_symbol_reject(from_master, reject).await {
                     warn!(device = %from_device, err = %e, "processor: SymbolReject handler failed");
-                }
-                self.swarm
-                    .respond_logged(response_channel, Message::Ack(AckMsg { v: 1 }));
-            }
-            Message::RestoreDenied(denied) => {
-                if let Err(e) = self.handle_restore_denied(from_master, denied).await {
-                    warn!(device = %from_device, err = %e, "processor: RestoreDenied handler failed");
                 }
                 self.swarm
                     .respond_logged(response_channel, Message::Ack(AckMsg { v: 1 }));

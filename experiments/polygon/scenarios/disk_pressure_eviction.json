@@ -14,6 +14,5 @@
   "sample_interval_secs": 6,
   "churn": [],
   "seed": 23,
-  "escrow_k_factor": 0.001,
   "source_block_size_mb": 32
 }

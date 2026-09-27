@@ -870,3 +870,100 @@ async fn watcher_scan_command_emits_added_events_for_all_files() {
 
     cancel.cancel();
 }
+
+// ─── daemon-i3 (R1-b1): one missing folder does not stop the others ──────────
+
+/// A NAS share not mounted yet at start: folder B does not exist. The watcher
+/// must keep running for folder A (initial scan + live events), mark B as
+/// Error with a readable reason, and emit nothing — in particular no Deleted —
+/// for B.
+#[tokio::test]
+async fn watcher_keeps_watching_other_dirs_when_one_is_missing() {
+    use crate::daemon::watch_admin::{WatchEntryState, WatcherStatusSignal};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, RwLock};
+
+    let dir_a = TempDir::new().unwrap();
+    let existing = dir_a.path().join("before.txt");
+    std::fs::write(&existing, b"present at start").unwrap();
+    let parent = TempDir::new().unwrap();
+    let dir_b = parent.path().join("not-mounted-yet");
+
+    let states: Arc<RwLock<HashMap<PathBuf, WatchEntryState>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    // Fresh data_dir with NO last_scan marker → the initial scan runs.
+    let data_dir = TempDir::new().unwrap().keep();
+    let config = WatcherConfig {
+        watch_dirs: vec![dir_b.clone(), dir_a.path().to_path_buf()],
+        device_id: TEST_DEVICE_ID,
+        debounce_ms: DEBOUNCE_MS,
+        data_dir,
+        rescan_interval_secs: 604800,
+        watch_states: Some(Arc::clone(&states)),
+    };
+
+    let (dirty_tx, mut dirty_rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let task = tokio::spawn(async move {
+        start_watcher(config, dirty_tx, mpsc::channel(1).1, cancel_clone).await
+    });
+
+    // Initial scan of A still happens.
+    let first = recv_with_timeout(&mut dirty_rx).await;
+    assert_eq!(first.path, existing.to_string_lossy().as_ref());
+    assert_eq!(first.kind, DirtyKind::Added);
+
+    // Live watching of A still works.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let created = dir_a.path().join("after.txt");
+    std::fs::write(&created, b"created while B is missing").unwrap();
+    let live = recv_with_timeout(&mut dirty_rx).await;
+    assert_eq!(live.path, created.to_string_lossy().as_ref());
+
+    // B is visible as broken, with the reason; A is not.
+    {
+        let map = states.read().unwrap();
+        let b = map
+            .get(&dir_b)
+            .expect("status entry for the missing folder");
+        assert_eq!(b.status, WatcherStatusSignal::Error);
+        assert_eq!(b.error.as_deref(), Some("folder does not exist"));
+        let a = map.get(dir_a.path()).expect("status entry for folder A");
+        assert_ne!(a.status, WatcherStatusSignal::Error);
+    }
+
+    // The watcher is alive (did not return Err) and never spoke about B.
+    assert!(!task.is_finished(), "watcher must keep running");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while let Ok(ev) = dirty_rx.try_recv() {
+        assert!(
+            !ev.path.starts_with(dir_b.to_string_lossy().as_ref()),
+            "no event may concern the missing folder: {ev:?}"
+        );
+    }
+    cancel.cancel();
+    let result = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("watcher stops on cancel")
+        .expect("join");
+    assert!(result.is_ok(), "watcher ended with {result:?}");
+}
+
+#[test]
+fn describe_watch_error_names_missing_folder_and_inotify_limit() {
+    use crate::daemon::watcher::describe_watch_error;
+    assert_eq!(
+        describe_watch_error(&notify::Error::path_not_found()),
+        "folder does not exist"
+    );
+    assert_eq!(
+        describe_watch_error(&notify::Error::io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        ))),
+        "permission denied"
+    );
+    let limit = describe_watch_error(&notify::Error::new(notify::ErrorKind::MaxFilesWatch));
+    assert!(limit.contains("fs.inotify.max_user_watches"), "{limit}");
+}

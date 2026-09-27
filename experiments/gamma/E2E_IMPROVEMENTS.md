@@ -1,5 +1,8 @@
 # E2E Test Improvements (2026-03-27)
 
+> **OBSOLETE in part (B1, 2026-09):** the escrow restore gate was removed in v1 (restore-i6);
+> the `test_escrow.py` notes below and every escrow expectation describe removed behaviour.
+
 ## Summary
 
 Systematic review of all 13 gamma E2E tests identified and fixed several categories of issues:

@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::constants::{
     DEFAULT_CLUSTER_SYNC_BATCH_SIZE, DEFAULT_COMPLETION_BONUS_COEFFICIENT,
-    DEFAULT_DISK_RESERVE_BYTES, DEFAULT_ESCROW_K_FACTOR, DEFAULT_MAX_VERSION_AGE_SECS,
-    DEFAULT_MAX_VERSIONS, DEFAULT_SOURCE_BLOCK_SIZE, MAX_COMPLETION_BONUS_COEFFICIENT,
+    DEFAULT_DISK_RESERVE_BYTES, DEFAULT_MAX_VERSION_AGE_SECS, DEFAULT_MAX_VERSIONS,
+    DEFAULT_SOURCE_BLOCK_SIZE, MAX_COMPLETION_BONUS_COEFFICIENT,
 };
 
 #[cfg(test)]
@@ -89,24 +89,6 @@ impl Default for StorageCfg {
             hard_quota_gb: 0.0,
             disk_reserve_gb: DEFAULT_DISK_RESERVE_BYTES as f64 / 1_073_741_824.0,
             data_dir: "~/.viaticum".to_string(),
-        }
-    }
-}
-
-/// [escrow] — contribution-based restore budget.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct EscrowCfg {
-    /// Days of storage contribution required to earn 1 GB of restore credit.
-    /// Formula: restore_budget_gb = stored_gb_days / k_factor.
-    /// Default: 7.0 (store 1 GB for 7 days → earn 1 GB restore budget).
-    pub k_factor: f64,
-}
-
-impl Default for EscrowCfg {
-    fn default() -> Self {
-        Self {
-            k_factor: DEFAULT_ESCROW_K_FACTOR,
         }
     }
 }
@@ -572,12 +554,14 @@ impl Default for ReliabilityConfig {
 
 /// Unified daemon configuration. Loaded from `~/.viaticum/config.toml` or an explicit path.
 /// Every field has a sensible default; `AppConfig::default()` requires no file.
+///
+/// Unknown sections are ignored (no `deny_unknown_fields`): a legacy `[escrow]` section from
+/// before v1 removed the holder-side restore gate (restore-i6) still loads.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub backup: BackupCfg,
     pub storage: StorageCfg,
-    pub escrow: EscrowCfg,
     pub network: NetworkCfg,
     pub cluster: ClusterCfg,
     pub metrics: MetricsCfg,
@@ -636,7 +620,6 @@ impl AppConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let b = &self.backup;
         let s = &self.storage;
-        let e = &self.escrow;
         let n = &self.network;
         let c = &self.cluster;
 
@@ -686,12 +669,6 @@ impl AppConfig {
             return Err(ConfigError::Validation {
                 field: "storage.hard_quota_gb".to_string(),
                 reason: "hard floor cannot exceed soft ceiling".to_string(),
-            });
-        }
-        if e.k_factor <= 0.0 {
-            return Err(ConfigError::Validation {
-                field: "escrow.k_factor".to_string(),
-                reason: "must be > 0.0".to_string(),
             });
         }
         if c.sync_batch_size < 1 {

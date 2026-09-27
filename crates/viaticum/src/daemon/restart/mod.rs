@@ -76,3 +76,43 @@ fn default_spawn_child() -> Result<(), String> {
     tracing::info!(pid = child.id(), exe = %exe.display(), "restart: child spawned");
     Ok(())
 }
+
+// ── Service manager detection ────────────────────────────────────────────────
+
+/// Environment variable a service definition sets to say "a manager restarts
+/// this process" (the systemd unit of R3, container images).
+pub const SUPERVISED_ENV: &str = "VIATICUM_SUPERVISED";
+
+/// True when a service manager will restart this process after it exits:
+/// `VIATICUM_SUPERVISED=1` in the environment, or (fallback for a hand-written
+/// unit) the parent process is `systemd` (`/proc/<ppid>/comm`, Linux only).
+///
+/// Neither signal proves a restart policy (`Restart=` is invisible from
+/// inside); the parent check only says systemd is our direct manager.
+/// `INVOCATION_ID` is deliberately NOT used: it is inherited by every process
+/// started from any unit (a login shell, a script run by a unit), so it says
+/// nothing about who would restart this process.
+pub fn under_service_manager() -> bool {
+    let env = std::env::var(SUPERVISED_ENV).ok();
+    let parent_comm = parent_process_name();
+    is_service_manager(env.as_deref(), parent_comm.as_deref())
+}
+
+/// Decision behind [`under_service_manager`], separated for tests.
+pub(crate) fn is_service_manager(supervised_env: Option<&str>, parent_comm: Option<&str>) -> bool {
+    if supervised_env.map(str::trim) == Some("1") {
+        return true;
+    }
+    parent_comm.map(str::trim) == Some("systemd")
+}
+
+#[cfg(target_os = "linux")]
+fn parent_process_name() -> Option<String> {
+    let ppid = std::os::unix::process::parent_id();
+    std::fs::read_to_string(format!("/proc/{ppid}/comm")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn parent_process_name() -> Option<String> {
+    None
+}

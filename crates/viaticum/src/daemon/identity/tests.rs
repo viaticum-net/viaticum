@@ -1,8 +1,9 @@
 // Tests for daemon/identity module.
 
 use super::{
-    IdentityError, derive_keys, init_identity, init_identity_from_mnemonic,
-    init_identity_new_device, load_identity,
+    DeviceSeedMode, IdentityError, MnemonicProblem, build_keyfile, corrupt_key_hint, derive_keys,
+    init_identity, init_identity_from_mnemonic, init_identity_new_device, load_identity,
+    normalize_phrase, not_initialized_hint, parse_mnemonic, write_keyfile_at,
 };
 
 fn tmp_dir() -> tempfile::TempDir {
@@ -405,4 +406,248 @@ fn bip39_24_words_produce_unique_identity() {
         kf_a.seed, kf_b.seed,
         "different mnemonics must produce different seeds"
     );
+}
+
+// ============================================================
+// B2.1: phrase parsing, pure keyfile build, non-overwriting write
+// ============================================================
+
+/// `abandon` x24: every word is in the list, the checksum is wrong.
+const ABANDON_X24: &str = "abandon abandon abandon abandon abandon abandon \
+                           abandon abandon abandon abandon abandon abandon \
+                           abandon abandon abandon abandon abandon abandon \
+                           abandon abandon abandon abandon abandon abandon";
+
+fn problem_of(r: Result<bip39::Mnemonic, IdentityError>) -> MnemonicProblem {
+    match r {
+        Err(IdentityError::InvalidMnemonic(p)) => p,
+        other => panic!(
+            "expected InvalidMnemonic, got {:?}",
+            other.map(|m| m.to_string())
+        ),
+    }
+}
+
+#[test]
+fn normalize_phrase_trims_lowercases_and_collapses_whitespace() {
+    assert_eq!(
+        normalize_phrase("  Abandon\t\tART \n zoo  "),
+        "abandon art zoo"
+    );
+    assert_eq!(normalize_phrase(""), "");
+}
+
+#[test]
+fn parse_mnemonic_accepts_uppercase_and_extra_whitespace() {
+    let messy = format!("  {}  ", MNEMONIC_24.to_uppercase().replace(' ', "   \t"));
+    let m = parse_mnemonic(&messy).expect("normalized phrase must parse");
+    let canonical = parse_mnemonic(MNEMONIC_24).expect("canonical phrase must parse");
+    assert_eq!(m.to_seed(""), canonical.to_seed(""));
+}
+
+#[test]
+fn parse_mnemonic_reports_unknown_word_one_based_position() {
+    let mut words: Vec<&str> = MNEMONIC_24.split_whitespace().collect();
+    words[4] = "zzzz";
+    let problem = problem_of(parse_mnemonic(&words.join(" ")));
+    assert_eq!(
+        problem,
+        MnemonicProblem::UnknownWord {
+            position: 5,
+            word: "zzzz".to_string()
+        }
+    );
+    let text = problem.to_string();
+    assert!(text.contains("word 5"), "{text}");
+    assert!(text.contains("\"zzzz\""), "{text}");
+}
+
+#[test]
+fn parse_mnemonic_reports_checksum_for_abandon_x24() {
+    let problem = problem_of(parse_mnemonic(ABANDON_X24));
+    assert_eq!(problem, MnemonicProblem::Checksum);
+    assert!(problem.to_string().contains("checksum"));
+}
+
+#[test]
+fn parse_mnemonic_reports_word_count_for_12_words() {
+    // A VALID 12-word BIP39 phrase is still not a Viaticum phrase.
+    assert_eq!(
+        problem_of(parse_mnemonic(MNEMONIC_12)),
+        MnemonicProblem::WordCount { got: 12 }
+    );
+    let mut words: Vec<&str> = MNEMONIC_24.split_whitespace().collect();
+    words.pop();
+    assert_eq!(
+        problem_of(parse_mnemonic(&words.join(" "))),
+        MnemonicProblem::WordCount { got: 23 }
+    );
+}
+
+/// Regression vector captured from the pre-refactor `create_keyfile` (commit 73c4ef8)
+/// for MNEMONIC_24 with the deterministic device seed.
+#[test]
+fn build_keyfile_derived_matches_init_identity_from_mnemonic_vector() {
+    use viaticum_core::types::hex_encode;
+    let m = parse_mnemonic(MNEMONIC_24).expect("parse");
+    let kf = build_keyfile(&m, DeviceSeedMode::DerivedFromSeed).expect("build");
+    assert_eq!(
+        hex_encode(&kf.identity_pub),
+        "ae2ab7e6df936d6e61997c444685cb568e5930bfcb08120a54e9b811345dd90b"
+    );
+    assert_eq!(
+        hex_encode(&kf.device_seed),
+        "8aeb83a85070d68d1cb08206f51556dd2fb5fb1c3b5ac0a8f7bc20724db81c1e"
+    );
+    assert_eq!(
+        hex_encode(&kf.device_id),
+        "f5a4215c21c69f043edaddf798ed6df5898660127da08371561794c2f5546a99"
+    );
+
+    let dir = tmp_dir();
+    let installed = init_identity_from_mnemonic(dir.path(), MNEMONIC_24).expect("init");
+    assert_eq!(installed.identity_pub, kf.identity_pub);
+    assert_eq!(installed.device_seed, kf.device_seed);
+    assert_eq!(installed.device_id, kf.device_id);
+    assert_eq!(installed.seed, kf.seed);
+}
+
+#[test]
+fn build_keyfile_random_mode_keeps_identity_but_changes_device() {
+    let m = parse_mnemonic(MNEMONIC_24).expect("parse");
+    let a = build_keyfile(&m, DeviceSeedMode::Random).expect("a");
+    let b = build_keyfile(&m, DeviceSeedMode::Random).expect("b");
+    assert_eq!(a.identity_pub, b.identity_pub);
+    assert_ne!(a.device_id, b.device_id);
+}
+
+#[test]
+fn write_keyfile_at_refuses_to_overwrite_and_sets_0600() {
+    let dir = tmp_dir();
+    let path = dir.path().join("identity.key.dr-new");
+    let m = parse_mnemonic(MNEMONIC_24).expect("parse");
+    let kf = build_keyfile(&m, DeviceSeedMode::DerivedFromSeed).expect("build");
+    write_keyfile_at(&path, &kf).expect("first write");
+    let before = std::fs::read(&path).expect("read");
+
+    let other = build_keyfile(&m, DeviceSeedMode::Random).expect("other");
+    let second = write_keyfile_at(&path, &other);
+    assert!(
+        matches!(second, Err(IdentityError::AlreadyInitialized(ref p)) if p == &path),
+        "second write must refuse, got {second:?}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read"),
+        before,
+        "file untouched"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "got {mode:03o}");
+    }
+}
+
+// ============================================================
+// dr-i30 / dr-i31: a catalog without its key, a key that cannot be read
+// ============================================================
+
+#[test]
+fn init_refuses_folder_with_catalog_but_no_key() {
+    type InitFn = fn(&std::path::Path) -> Result<super::IdentityKeyFile, IdentityError>;
+    let inits: [(&str, InitFn); 3] = [
+        ("init", init_identity),
+        ("init --mnemonic", |d| {
+            init_identity_from_mnemonic(d, MNEMONIC_24)
+        }),
+        ("init --new-device", |d| {
+            init_identity_new_device(d, MNEMONIC_24)
+        }),
+    ];
+    for (name, init) in inits {
+        let dir = tmp_dir();
+        std::fs::write(dir.path().join("db.redb"), b"a lost node's catalog").unwrap();
+        let err = init(dir.path()).expect_err(name);
+        assert!(
+            matches!(err, IdentityError::CatalogWithoutKey(_)),
+            "{name}: got {err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("viaticum dr") && text.contains("db.redb"),
+            "{text}"
+        );
+        assert!(
+            !dir.path().join("identity.key").exists(),
+            "{name} wrote a key"
+        );
+        assert!(
+            !dir.path().join("config.toml").exists(),
+            "{name} wrote a config"
+        );
+    }
+}
+
+#[test]
+fn init_works_in_folder_left_by_interrupted_dr() {
+    // A killed DR may leave only its drafts; there is no catalog to protect.
+    let dir = tmp_dir();
+    std::fs::write(dir.path().join("db.redb.dr-new"), b"draft").unwrap();
+    std::fs::write(dir.path().join("identity.key.dr-new"), b"draft").unwrap();
+    init_identity_from_mnemonic(dir.path(), MNEMONIC_24).expect("init --mnemonic");
+    assert!(dir.path().join("identity.key").exists());
+}
+
+#[test]
+fn init_still_works_in_empty_folder() {
+    let dir = tmp_dir();
+    init_identity(dir.path()).expect("plain init");
+    assert!(dir.path().join("identity.key").exists());
+    assert!(dir.path().join("config.toml").exists());
+}
+
+#[test]
+fn not_initialized_hint_puts_dr_first_when_catalog_present() {
+    let dir = tmp_dir();
+    std::fs::write(dir.path().join("db.redb"), b"catalog").unwrap();
+    let text = not_initialized_hint(dir.path());
+    let dr = text.find("viaticum dr").expect("mentions dr");
+    let init = text.find("viaticum init").expect("mentions init");
+    assert!(dr < init, "dr must come first: {text}");
+    assert!(text.contains("db.redb"), "{text}");
+}
+
+#[test]
+fn not_initialized_hint_without_catalog_offers_init_and_dr() {
+    let dir = tmp_dir();
+    let text = not_initialized_hint(dir.path());
+    assert!(
+        text.contains("viaticum init") && text.contains("viaticum dr"),
+        "{text}"
+    );
+}
+
+#[test]
+fn corrupt_key_hint_never_advises_deleting_the_key() {
+    let path = std::path::Path::new("/data/identity.key");
+    let text = corrupt_key_hint(path, "bad cbor");
+    for needle in [
+        "/data/identity.key",
+        "bad cbor",
+        "Do not delete it",
+        "identity.key.broken",
+        "viaticum dr",
+        "newer Viaticum",
+        "NEW identity",
+    ] {
+        assert!(text.contains(needle), "missing {needle:?}: {text}");
+    }
+    assert!(!text.contains("Delete the file"), "{text}");
+    // `init` over a corrupt key says the same.
+    let dir = tmp_dir();
+    std::fs::write(dir.path().join("identity.key"), b"not cbor").unwrap();
+    let err = init_identity(dir.path()).expect_err("corrupt");
+    assert!(err.to_string().contains("Do not delete it"), "{err}");
 }

@@ -40,16 +40,11 @@ pub const S_CLAMP_MIN: f64 = 0.1;
 /// S ceiling.
 pub const S_CLAMP_MAX: f64 = 1.0;
 
-// === Escrow (contribution-based) ===
-
-/// Days of storage contribution required to earn 1 GB of restore credit.
-/// Formula: restore_budget_gb = stored_gb_days / k_factor.
-/// Default K=7: store 1 GB for 7 days → earn 1 GB restore budget.
-pub const DEFAULT_ESCROW_K_FACTOR: f64 = 7.0;
+// === Offer budget (contribution-based) ===
 
 /// Days of storage contribution required to earn 1 GB of OFFER budget (backup credit).
 /// Formula: earned_offer_gb = Σ(gb_days × master_trust / MAX_COMBINED_TRUST) / K_OFFER.
-/// Smaller than restore-K (7) on purpose — we want self-awareness for fresh
+/// Smaller than the old restore-escrow K (7; that gate was removed in v1) on purpose — we want self-awareness for fresh
 /// owners (a node holding for the network a few days can back up its first
 /// files), and offering cost is already inflated ×overhead_factor by the
 /// caller. Set to 5 (tunable). Sybil mitigation logged in tech-debt.
@@ -199,9 +194,6 @@ pub const MAX_RELAY_HOP: u8 = 2;
 
 /// Relay entry TTL (7 days).
 pub const RELAY_TTL_SECS: u64 = 7 * 24 * 3600;
-
-/// HKDF info string for directed message encryption (ECDH -> ChaCha20).
-pub const DIRECTED_ENCRYPTION_INFO: &[u8] = b"viaticum-directed";
 
 // === Backup triggers ===
 
@@ -438,6 +430,18 @@ pub const MAILBOX_SWEEP_INTERVAL_SECS: u64 = 6 * 3600;
 
 /// Self-pointer republish interval: 30 days.
 pub const MAILBOX_POINTER_REPUBLISH_SECS: u64 = 30 * 24 * 3600;
+
+/// DR probes rendezvous epochs `[now - LOOKBACK, now + FORWARD]` (CROWN-1 §7.1).
+/// 62 × 30 d = 1860 d ≥ `SELF_POINTER_TTL` (1825 d): every live pointer lies in the
+/// window. FORWARD = 2 guarantees a DR clock up to 60 days behind the publisher's
+/// still reaches the current epoch (FORWARD = 1 guarantees only 30 days: a clock
+/// 31 days behind misses the current epoch during its first day — C1 review W2).
+pub const RENDEZVOUS_DR_LOOKBACK_EPOCHS: u64 = 62;
+pub const RENDEZVOUS_DR_FORWARD_EPOCHS: u64 = 2;
+const _: () = assert!(
+    RENDEZVOUS_DR_LOOKBACK_EPOCHS * crate::mailbox::seal::RENDEZVOUS_EPOCH_SECS
+        >= crate::mailbox::class_config::SELF_POINTER_TTL.as_secs()
+);
 
 // ── EWMA availability constants (T-4a) ──────────────────────────────────────
 
