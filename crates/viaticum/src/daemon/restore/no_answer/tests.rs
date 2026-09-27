@@ -26,6 +26,7 @@ use crate::daemon::restore::tests::{
     FakeHolders, backup_one, coord_with_source, place_on_fake_holders, request,
 };
 use crate::daemon::restore::{RestoreCoordinator, RestoreError};
+use crate::daemon::symbol_fetch::{Round, RoundEnd};
 
 const MIN: Duration = Duration::from_secs(60);
 
@@ -109,7 +110,7 @@ impl Setup {
 // ─── The budget itself ─────────────────────────────────────────────────────────
 
 #[test]
-fn pauses_are_1_5_15_min_then_spent_and_refill_starts_over() {
+fn pauses_are_1_5_15_min_then_spent() {
     let mut p = NoAnswerPauses::new(JobId::new(), 1);
     assert_eq!(NO_ANSWER_PAUSES_SECS, [60, 300, 900]);
     assert_eq!(p.take(), Some(MIN));
@@ -117,8 +118,43 @@ fn pauses_are_1_5_15_min_then_spent_and_refill_starts_over() {
     assert_eq!(p.take(), Some(15 * MIN));
     assert_eq!(p.take(), None);
     assert_eq!(p.take(), None, "stays spent");
-    p.refill();
+}
+
+fn round(end: RoundEnd, answered: &[DeviceId], failed: &[DeviceId]) -> Round {
+    Round {
+        end,
+        answered: answered.to_vec(),
+        failed: failed.to_vec(),
+    }
+}
+
+/// restore-i34: only a holder that had gone silent (failed in a `NoAnswer` round)
+/// refills the budget by answering; a holder that never went silent does not, even
+/// with progress; an empty answer from it in a `NoAnswer` round neither (i33).
+#[test]
+fn observe_refills_only_when_a_silent_holder_answers() {
+    let (live, dead) = (DeviceId([1u8; 32]), DeviceId([2u8; 32]));
+    let mut p = NoAnswerPauses::new(JobId::new(), 1);
+    p.observe(&round(RoundEnd::Progress, &[live], &[dead]));
     assert_eq!(p.take(), Some(MIN));
+    p.observe(&round(RoundEnd::NoAnswer, &[live], &[dead]));
+    assert_eq!(p.take(), Some(5 * MIN));
+    p.observe(&round(RoundEnd::Progress, &[live], &[]));
+    assert_eq!(p.take(), Some(15 * MIN), "the live holder proves nothing");
+    assert_eq!(p.take(), None);
+
+    p.observe(&round(RoundEnd::Progress, &[dead], &[]));
+    assert_eq!(
+        p.take(),
+        Some(MIN),
+        "the silent holder is back: full budget"
+    );
+    p.observe(&round(RoundEnd::Progress, &[dead], &[]));
+    assert_eq!(
+        p.take(),
+        Some(5 * MIN),
+        "no longer silent: its next answer refills nothing"
+    );
 }
 
 #[test]
@@ -142,14 +178,35 @@ async fn decode_when_no_holder_answers_redials_pauses_and_decodes_after_reconnec
     let s = setup(&[("a.bin", &content)]).await;
     *s.holders.online_after_reconnects.lock().unwrap() = Some(1);
     let coord = s.coord();
+    // A registered, running job: its progress shows the wait, and only during it.
+    let jobs = coord.config.jobs.clone();
+    let job_id = JobId::new();
+    jobs.submit(job_id, &s.paths[0], 1);
+    jobs.mark_running(job_id, &s.paths[0], 1);
+    let during = {
+        let jobs = jobs.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(MIN / 2).await;
+            jobs.get(job_id).unwrap().waiting_for_holders_until
+        })
+    };
     let t0 = tokio::time::Instant::now();
 
     let plaintext = s
-        .decode(&coord, 0, &mut NoAnswerPauses::new(JobId::new(), 1))
+        .decode(&coord, 0, &mut NoAnswerPauses::new(job_id, 1))
         .await
         .expect("holders back after the redial");
 
     assert!(plaintext.ends_with(&content));
+    assert!(
+        during.await.unwrap().is_some(),
+        "mid-pause the job shows until when it waits"
+    );
+    assert_eq!(
+        jobs.get(job_id).unwrap().waiting_for_holders_until,
+        None,
+        "after the pause the job no longer shows a wait"
+    );
     let calls = s.holders.reconnects.lock().unwrap().clone();
     assert_eq!(calls.len(), 1, "one redial for one pause");
     assert_eq!(calls[0].0, t0, "redial before the pause, not after");
@@ -223,6 +280,78 @@ async fn decode_answer_between_pauses_refills_the_budget() {
         "a full budget again after the answer"
     );
     assert_eq!(s.reconnect_count(), 5);
+}
+
+/// restore-i34 (review BLOCK-1): one holder is alive but holds fewer than k_eff
+/// symbols, the other two are dead. Its answers prove nothing about the dead ones,
+/// so they do not refill the budget: two such blocks cost the job exactly 3 pauses
+/// and 21 min, not 3 pauses per block.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn decode_live_holder_short_of_k_eff_and_dead_others_spend_one_budget_21_min() {
+    let s = setup(&[("p.bin", &[8u8; 3000]), ("q.bin", &[9u8; 3000])]).await;
+    s.holders.offline.store(false, Ordering::SeqCst);
+    s.holders
+        .dead
+        .lock()
+        .unwrap()
+        .extend([DeviceId([0x41; 32]), DeviceId([0x42; 32])]);
+    // The live holder keeps one symbol per block (ESI 0): fewer than k_eff.
+    let live = DeviceId([0x40; 32]);
+    s.holders
+        .symbols
+        .lock()
+        .unwrap()
+        .retain(|(h, _, esi), _| *h != live || *esi == 0);
+    let coord = s.coord();
+    let mut pauses = NoAnswerPauses::new(JobId::new(), 1);
+    let t0 = tokio::time::Instant::now();
+
+    for i in 0..2 {
+        let err = s.decode(&coord, i, &mut pauses).await.unwrap_err();
+        assert!(
+            matches!(err, RestoreError::InsufficientSymbols { got: 1, .. }),
+            "the live holder gave some, not enough: {err:?}"
+        );
+    }
+
+    assert_eq!(t0.elapsed(), 21 * MIN, "one budget for the job");
+    assert_eq!(s.reconnect_count(), 3);
+}
+
+/// restore-i33: one holder is connected and has nothing for the block, the other
+/// two are not connected yet. That is not "holders have nothing": the job pauses,
+/// redials, and the two come back with enough.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn decode_one_holder_empty_others_unreachable_pauses_and_decodes() {
+    let content = b"one empty, two not connected yet".repeat(30);
+    let s = setup(&[("m.bin", &content)]).await;
+    s.holders.offline.store(false, Ordering::SeqCst);
+    let empty = DeviceId([0x40; 32]);
+    s.holders
+        .symbols
+        .lock()
+        .unwrap()
+        .retain(|(h, _, _), _| *h != empty);
+    let others = [DeviceId([0x41; 32]), DeviceId([0x42; 32])];
+    s.holders.dead.lock().unwrap().extend(others);
+    let coord = s.coord();
+    let holders = s.holders.clone();
+    // The redial reconnects the two.
+    *s.holders.on_request.lock().unwrap() = Some(Box::new(move || {
+        if !holders.reconnects.lock().unwrap().is_empty() {
+            holders.dead.lock().unwrap().clear();
+        }
+    }));
+    let t0 = tokio::time::Instant::now();
+
+    let plaintext = s
+        .decode(&coord, 0, &mut NoAnswerPauses::new(JobId::new(), 1))
+        .await
+        .expect("the two answer after the redial");
+
+    assert!(plaintext.ends_with(&content));
+    assert_eq!(s.reconnect_count(), 1);
+    assert_eq!(t0.elapsed(), MIN);
 }
 
 /// (е) Holders answer but have nothing: the restore-i12 verdict at once — no

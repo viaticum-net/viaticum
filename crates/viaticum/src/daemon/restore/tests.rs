@@ -1448,7 +1448,7 @@ use viaticum_core::messages::RestoreRequestMsg;
 
 use crate::daemon::restore::jobs::RestoreJobs;
 use crate::daemon::restore::{RestoreError, RestoreRequest, failure_kind};
-use crate::daemon::symbol_fetch::{FetchError, SymbolSource};
+use crate::daemon::symbol_fetch::{FetchError, RestoreSource, SymbolSource};
 
 pub(super) type RequestHook = Box<dyn Fn() + Send + Sync>;
 
@@ -1466,6 +1466,8 @@ pub(super) struct FakeHolders {
     /// The owner has no connection to any holder: every request fails at once,
     /// as `send_to_device` does without a live connection (restore-i26).
     pub(super) offline: std::sync::atomic::AtomicBool,
+    /// Holders that never answer: every request to them fails at once.
+    pub(super) dead: Mutex<std::collections::HashSet<DeviceId>>,
     /// `reconnect` call number at which `offline` clears (the redial worked).
     pub(super) online_after_reconnects: Mutex<Option<usize>>,
     /// Every `reconnect` call: when (tokio clock) and with which holders.
@@ -1486,7 +1488,9 @@ impl SymbolSource for FakeHolders {
         if let Some(hook) = self.on_request.lock().unwrap().as_ref() {
             hook();
         }
-        if self.offline.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.offline.load(std::sync::atomic::Ordering::SeqCst)
+            || self.dead.lock().unwrap().contains(&holder)
+        {
             return Err(FetchError::Swarm("peer not authenticated".into()));
         }
         if self.hang {
@@ -1505,7 +1509,10 @@ impl SymbolSource for FakeHolders {
             .filter_map(|e| map.get(&(holder, req.source_block_id, *e)).cloned())
             .collect())
     }
+}
 
+#[async_trait::async_trait]
+impl RestoreSource for FakeHolders {
     async fn reconnect(&self, holders: &[DeviceId]) {
         let mut calls = self.reconnects.lock().unwrap();
         calls.push((tokio::time::Instant::now(), holders.to_vec()));
@@ -1603,7 +1610,7 @@ pub(super) fn coord_with_source(
         staging_root,
         staging_dir.path().to_path_buf(),
     );
-    config.symbols = source.map(|s| s as Arc<dyn SymbolSource>);
+    config.symbols = source.map(|s| s as Arc<dyn RestoreSource>);
     RestoreCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
 

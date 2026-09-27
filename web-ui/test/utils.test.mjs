@@ -73,13 +73,15 @@ const baseJob = {
 };
 const running = describeRestoreJob({ ...baseJob, state: 'running', files_restored: 1, failures: [], outcome: null });
 assert(running.ok && running.text.includes('1 of 3'), 'running job shows progress');
-assert(!running.hint.includes('No holder answered'), 'no wait shown when not waiting');
+assert(!running.hint.includes('did not answer'), 'no wait shown when not waiting');
 const waiting = describeRestoreJob({
   ...baseJob, state: 'running', files_restored: 1, failures: [], outcome: null,
   waiting_for_holders_until: '2026-09-27T10:05:00Z',
 });
-assert(waiting.ok && waiting.hint.includes('No holder answered') && waiting.hint.includes('2026-09-27T10:05:00Z'),
-  'a job waiting for holders says until when (restore-i26)');
+assert(waiting.ok && waiting.hint.includes('did not answer')
+  && waiting.hint.includes(new Date('2026-09-27T10:05:00Z').toLocaleString())
+  && !waiting.hint.includes('2026-09-27T10:05:00Z'),
+  'a job waiting for holders says until when, in local time (restore-i26)');
 const nothing = describeRestoreJob({
   ...baseJob, state: 'finished', files_restored: 0, outcome: 'nothing_restored',
   failures: [{ path: '/home/kolya/photos/a.jpg', kind: 'holders_unavailable', detail: 'collected 1 of 3' }],

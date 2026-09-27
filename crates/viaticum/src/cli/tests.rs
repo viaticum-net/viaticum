@@ -1586,18 +1586,37 @@ fn waiting_job(until: &str) -> RestoreJob {
 }
 
 #[test]
-fn render_restore_progress_when_waiting_for_holders_shows_retry_time() {
-    let line = output::render_restore_progress(&waiting_job("2026-09-27T10:05:00Z"));
+fn render_restore_progress_when_waiting_for_holders_shows_retry_in_relative_time() {
+    // 2026-09-27T10:05:00Z = 1790503500; now = 4 min before.
+    let now = 1_790_503_500 - 240;
+    let line = output::render_restore_progress(&waiting_job("2026-09-27T10:05:00Z"), now);
     assert!(
         line.starts_with("running: 1/3 restored, 0 failed"),
         "{line}"
     );
     assert!(
-        line.contains("no holder answered") && line.contains("2026-09-27T10:05:00Z"),
+        line.contains("holders did not answer") && line.contains("retry in 4 min"),
         "{line}"
     );
-    let plain = output::render_restore_progress(&job(RestoreJobState::Running, 1, 3));
-    assert!(!plain.contains("no holder answered"), "{plain}");
+    let plain = output::render_restore_progress(&job(RestoreJobState::Running, 1, 3), now);
+    assert!(!plain.contains("did not answer"), "{plain}");
+}
+
+#[test]
+fn retry_in_counts_down_from_the_wire_time() {
+    let until = "2026-09-27T10:05:00Z";
+    let t = 1_790_503_500u64;
+    assert_eq!(
+        crate::daemon::dispatch::unix_secs_to_iso(t, true),
+        until,
+        "test anchor matches the daemon's formatter"
+    );
+    assert_eq!(output::retry_in(until, t - 30), "retry in 30 s");
+    assert_eq!(output::retry_in(until, t - 61), "retry in 2 min");
+    assert_eq!(output::retry_in(until, t - 3_720), "retry in 1 h 2 min");
+    assert_eq!(output::retry_in(until, t), "retrying now");
+    assert_eq!(output::retry_in(until, t + 5), "retrying now");
+    assert_eq!(output::retry_in("soon", t), "retry at soon");
 }
 
 #[test]

@@ -27,15 +27,26 @@ pub(crate) enum RoundEnd {
     Complete,
     /// New ESIs accepted but the block is not complete: another round.
     Progress,
-    /// At least one holder answered, none gave anything new: the holders we can
-    /// reach do not have the rest. The block cannot be completed.
+    /// Every holder asked answered and none gave anything new: the holders do not
+    /// have the rest. The block cannot be completed.
     NothingNew,
-    /// Every request of the round failed (timeout, no connection): nobody
-    /// answered. Says nothing about what the holders hold (restore-i26).
+    /// Nothing new, and at least one request failed (timeout, no connection) —
+    /// whether or not others answered empty. The holders that failed may still
+    /// have the rest; says nothing about what they hold (restore-i26, i33).
     NoAnswer,
     /// No request was sent: every holder is exhausted or has nothing left we
     /// could ask for (or there are no candidate holders at all).
     NobodyToAsk,
+}
+
+/// How one round ended, and who answered or failed in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Round {
+    pub(crate) end: RoundEnd,
+    /// Holders that answered at least one request of the round (even empty).
+    pub(crate) answered: Vec<DeviceId>,
+    /// Holders whose request of the round failed.
+    pub(crate) failed: Vec<DeviceId>,
 }
 
 /// Per-holder state across rounds.
@@ -124,16 +135,20 @@ impl<'a> BlockFetch<'a> {
         &mut self,
         source: &dyn SymbolSource,
         cancel: Option<&CancellationToken>,
-    ) -> Result<RoundEnd, FetchError> {
+    ) -> Result<Round, FetchError> {
         if self.accepted_esis.len() >= self.k_eff {
-            return Ok(RoundEnd::Complete);
+            return Ok(Round {
+                end: RoundEnd::Complete,
+                answered: Vec::new(),
+                failed: Vec::new(),
+            });
         }
         self.round += 1;
         let round = self.round;
         let block_id = self.block_id;
         let (k_eff, chunk) = (self.k_eff, self.chunk);
         let before = self.accepted_esis.len();
-        let (mut asked, mut answered) = (0usize, 0usize);
+        let (mut answered, mut failed): (Vec<DeviceId>, Vec<DeviceId>) = (Vec::new(), Vec::new());
         let is_cancelled = || cancel.is_some_and(|c| c.is_cancelled());
 
         for holder in self.holders.iter_mut().filter(|h| !h.exhausted) {
@@ -159,7 +174,6 @@ impl<'a> BlockFetch<'a> {
                     esi_list: wanted.clone(),
                     timestamp: Timestamp::now(),
                 };
-                asked += 1;
                 let reply = match cancel {
                     Some(c) => tokio::select! {
                         biased;
@@ -170,7 +184,9 @@ impl<'a> BlockFetch<'a> {
                 };
                 match reply {
                     Ok(symbols) => {
-                        answered += 1;
+                        if answered.last() != Some(&holder_id) {
+                            answered.push(holder_id);
+                        }
                         debug!(
                             holder = %holder_id,
                             block = %block_id,
@@ -213,6 +229,7 @@ impl<'a> BlockFetch<'a> {
                             err = %e,
                             "fetch: holder did not answer; skipped this round, asked again next round"
                         );
+                        failed.push(holder_id);
                         break;
                     }
                 }
@@ -227,10 +244,10 @@ impl<'a> BlockFetch<'a> {
             RoundEnd::Complete
         } else if have > before {
             RoundEnd::Progress
-        } else if answered > 0 {
-            RoundEnd::NothingNew
-        } else if asked > 0 {
+        } else if !failed.is_empty() {
             RoundEnd::NoAnswer
+        } else if !answered.is_empty() {
+            RoundEnd::NothingNew
         } else {
             RoundEnd::NobodyToAsk
         };
@@ -243,7 +260,11 @@ impl<'a> BlockFetch<'a> {
                 "fetch: round made progress but the block is not complete; next round"
             );
         }
-        Ok(end)
+        Ok(Round {
+            end,
+            answered,
+            failed,
+        })
     }
 
     /// The unbound symbols once `k_eff` distinct ESIs are in, else

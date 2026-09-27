@@ -4,32 +4,37 @@
 // middle of a long restore, every request fails at once (`send_to_device` does not
 // dial: no live connection → `PeerNotAuthenticated`). Without a retry the job would
 // give up every remaining block in milliseconds. So when a round of a block's fetch
-// gets no answer from any holder, the coordinator redials the block's holders
-// (`SymbolSource::reconnect`), waits, and tries the same fetch again, keeping what
+// gives nothing new and some holder did not answer (`RoundEnd::NoAnswer`, also when
+// others answered empty, restore-i33), the coordinator redials the block's holders
+// (`RestoreSource::reconnect`), waits, and tries the same fetch again, keeping what
 // it already collected.
 //
 // The pauses are a budget of the JOB, not of a block: `NO_ANSWER_PAUSES_SECS`
-// (1, 5, 15 min, divided by `time_scale`), used in order. Any answer from any
-// holder, even an empty one, refills it. Once it is spent, a block whose round gets
-// no answer is given up at once (`holders_unavailable`), and so is every later such
-// block: with dead holders the whole job waits at most 21 min, not 21 min per block.
-// A round where holders answered but gave nothing new ends the block without a
-// pause, as before (restore-i12).
+// (1, 5, 15 min, divided by `time_scale`), used in order. Only an answer from a
+// holder that had gone silent (failed in a `NoAnswer` round) refills it: that
+// proves the connection came back (restore-i34). An answer from a holder that never
+// went silent does not — else "some holders are dead" would make the budget one per
+// block (500 lost blocks × 21 min). Once it is spent, a block whose round gets no
+// answer is given up at once (`holders_unavailable`), and so is every later such
+// block: with dead holders the whole job waits at most 21 min. A round where every
+// holder asked answered and none gave anything new ends the block without a pause,
+// as before (restore-i12).
 //
 // While the job waits, the registry shows until when (`waiting_for_holders_until`),
 // so `--status` and the web UI do not look hung (restore-i4). The wait stops on the
 // daemon's cancel token (T10).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use tracing::{info, warn};
 use viaticum_core::erasure::Symbol;
-use viaticum_core::types::{ErasureParams, SourceBlockId, SymbolPlacement, Timestamp};
+use viaticum_core::types::{DeviceId, ErasureParams, SourceBlockId, SymbolPlacement, Timestamp};
 
 use super::{RestoreCoordinator, RestoreError};
 use crate::daemon::restore::staging::JobId;
 use crate::daemon::symbol_fetch::{
-    BlockFetch, RESTORE_FETCH_CHUNK_BYTES, RoundEnd, SymbolSource, chunk_esis,
+    BlockFetch, RESTORE_FETCH_CHUNK_BYTES, RestoreSource, Round, RoundEnd, chunk_esis,
 };
 
 #[cfg(test)]
@@ -45,8 +50,10 @@ pub(crate) struct NoAnswerPauses {
     job_id: JobId,
     /// `NO_ANSWER_PAUSES_SECS` divided by `time_scale`.
     schedule: Vec<Duration>,
-    /// Pauses taken since the last answer.
+    /// Pauses taken since the budget was last full.
     used: usize,
+    /// Holders that failed in a `NoAnswer` round and have not answered since.
+    silent: HashSet<DeviceId>,
 }
 
 impl NoAnswerPauses {
@@ -60,6 +67,7 @@ impl NoAnswerPauses {
                 .map(|s| Duration::from_millis(s * 1000 / scale))
                 .collect(),
             used: 0,
+            silent: HashSet::new(),
         }
     }
 
@@ -70,16 +78,34 @@ impl NoAnswerPauses {
         Some(pause)
     }
 
-    /// A holder answered: the budget is full again.
-    pub(crate) fn refill(&mut self) {
-        self.used = 0;
+    /// Account one round (restore-i34): a silent holder that answered refills the
+    /// budget and is silent no more; the holders that failed in a `NoAnswer` round
+    /// become silent. Answers from holders that never went silent change nothing.
+    pub(crate) fn observe(&mut self, round: &Round) {
+        let mut came_back = false;
+        for holder in &round.answered {
+            came_back |= self.silent.remove(holder);
+        }
+        if came_back && self.used > 0 {
+            info!(
+                job = %self.job_id,
+                "restore: a silent holder answered again; pause budget refilled"
+            );
+        }
+        if came_back {
+            self.used = 0;
+        }
+        if round.end == RoundEnd::NoAnswer {
+            self.silent.extend(round.failed.iter().copied());
+        }
     }
 }
 
 impl RestoreCoordinator {
     /// Fetch symbols for a source block from holders over the network: chunked
-    /// requests in rounds, no deadline (restore-i12); a round nobody answered is
-    /// retried after a redial and a pause from the job's budget (restore-i26);
+    /// requests in rounds, no deadline (restore-i12); a round with nothing new and a
+    /// holder that did not answer is retried after a redial and a pause from the
+    /// job's budget (restore-i26, i33, i34);
     /// abandoned on the daemon's cancel token (T10).
     pub(crate) async fn fetch_from_holders(
         &self,
@@ -100,17 +126,14 @@ impl RestoreCoordinator {
         let chunk = chunk_esis(RESTORE_FETCH_CHUNK_BYTES, params.t);
         let mut fetch = BlockFetch::new(&self.encoder, block_id, placements, params, chunk);
         loop {
-            let end = fetch
+            let round = fetch
                 .round(source.as_ref(), Some(cancel))
                 .await
                 .map_err(RestoreError::from_fetch)?;
-            match end {
-                RoundEnd::Progress => pauses.refill(),
-                RoundEnd::Complete | RoundEnd::NothingNew => {
-                    pauses.refill();
-                    break;
-                }
-                RoundEnd::NobodyToAsk => break,
+            pauses.observe(&round);
+            match round.end {
+                RoundEnd::Progress => {}
+                RoundEnd::Complete | RoundEnd::NothingNew | RoundEnd::NobodyToAsk => break,
                 RoundEnd::NoAnswer => {
                     let Some(pause) = pauses.take() else {
                         warn!(
@@ -118,7 +141,7 @@ impl RestoreCoordinator {
                             block = %block_id,
                             have = fetch.have(),
                             need = params.k_eff,
-                            "restore: no holder answered and this job's pauses are spent; \
+                            "restore: holders did not answer and this job's pauses are spent; \
                              block given up"
                         );
                         break;
@@ -129,7 +152,7 @@ impl RestoreCoordinator {
                         have = fetch.have(),
                         need = params.k_eff,
                         pause_secs = pause.as_secs_f64(),
-                        "restore: no holder answered; redialing them and retrying after a pause"
+                        "restore: holders did not answer; redialing them and retrying after a pause"
                     );
                     self.redial_and_wait(source.as_ref(), &fetch, pause, pauses.job_id)
                         .await?;
@@ -143,7 +166,7 @@ impl RestoreCoordinator {
     /// progress. Both stop on the daemon's cancel token (→ `Cancelled`).
     async fn redial_and_wait(
         &self,
-        source: &dyn SymbolSource,
+        source: &dyn RestoreSource,
         fetch: &BlockFetch<'_>,
         pause: Duration,
         job_id: JobId,

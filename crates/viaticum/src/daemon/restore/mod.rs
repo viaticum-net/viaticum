@@ -36,7 +36,7 @@ use crate::daemon::restore::jobs::RestoreJobs;
 use crate::daemon::restore::no_answer::NoAnswerPauses;
 use crate::daemon::restore::staging::record::JobRecord;
 use crate::daemon::restore::staging::{JobId, StagingWriter};
-use crate::daemon::symbol_fetch::SymbolSource;
+use crate::daemon::symbol_fetch::RestoreSource;
 
 pub mod cleanup;
 mod decode;
@@ -192,7 +192,7 @@ pub struct RestoreConfig {
     pub epoch_key: [u8; 32],
     /// Where network restore asks holders for symbols (the swarm in the daemon).
     /// `None`: only the owner's own source files can be used.
-    pub symbols: Option<Arc<dyn SymbolSource>>,
+    pub symbols: Option<Arc<dyn RestoreSource>>,
     /// Root directory for per-job restore staging (`data_dir/restore`).
     /// Each job writes to `staging_root/<job_id>/`.
     pub staging_root: PathBuf,

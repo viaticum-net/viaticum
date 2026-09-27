@@ -1,19 +1,20 @@
 // Shared helper for fetching unbound erasure symbols from holders over libp2p.
 //
 // Used by:
-//   - `restore`: normal restore flow (with the daemon's cancel token), through
-//     `SwarmSymbols` (requests + redial of holders).
+//   - `restore`: normal restore flow (with the daemon's cancel token), through a
+//     `RestoreSource` (`SwarmSymbols`: requests + redial of holders).
 //   - `dr`:      the SystemState block during disaster recovery (no cancel), through
-//     the bare `SwarmHandle`.
+//     the bare `SwarmHandle` (a `SymbolSource`: requests only).
 //
 // restore-i12: a slow home link is not "holders unavailable". Each request asks one
 // holder for at most `RESTORE_FETCH_CHUNK_BYTES` of symbols; there is no deadline on
 // a block. The fetch goes in rounds over the holders (`rounds::BlockFetch`) and gives
 // up only after a full round that accepted no new ESI. A holder whose request fails
 // (the 30 s request timeout, a dial failure) is skipped for the rest of the round and
-// asked again in the next one. A round nobody answered at all is a separate outcome
-// (`RoundEnd::NoAnswer`): restore retries it after a redial and a pause
-// (restore-i26); `fetch_in_rounds` (DR) stops there as before.
+// asked again in the next one. A round with nothing new where some holder did not
+// answer is a separate outcome (`RoundEnd::NoAnswer`, restore-i33): restore retries
+// it after a redial and a pause (restore-i26); `fetch_in_rounds` (DR) stops there as
+// before.
 //
 // There is no restore gate on the holder (restore-i6): a holder either serves the
 // owner's symbols or answers empty (no active holding for this owner).
@@ -32,7 +33,7 @@ use crate::daemon::network::swarm::SwarmHandle;
 
 mod rounds;
 
-pub(crate) use rounds::{BlockFetch, RoundEnd};
+pub(crate) use rounds::{BlockFetch, Round, RoundEnd};
 
 /// Maximum ESI value the raptorq decoder accepts: ESI is a 24-bit field, so any
 /// value `>= 2^24` makes `PayloadId::new(0, esi)` assert-panic inside raptorq.
@@ -67,8 +68,7 @@ pub enum FetchError {
     Cancelled,
 }
 
-/// Where restore asks holders for symbols: one `RestoreRequest` to one holder, and
-/// a redial of holders that did not answer. `SwarmSymbols` in the daemon; tests use
+/// One `RestoreRequest` to one holder. The bare `SwarmHandle` (DR); tests use
 /// scripted fakes.
 #[async_trait::async_trait]
 pub trait SymbolSource: Send + Sync {
@@ -78,15 +78,17 @@ pub trait SymbolSource: Send + Sync {
         holder: DeviceId,
         req: RestoreRequestMsg,
     ) -> Result<Vec<Symbol>, FetchError>;
+}
 
-    /// Try to (re)connect to `holders` before a retry (restore-i26). Only starts
-    /// the dials; failures are logged, never returned (the retry itself tells).
+/// What restore needs on top of requests: a redial of holders that did not answer
+/// before a retry (restore-i26). `SwarmSymbols` in the daemon; tests use fakes.
+#[async_trait::async_trait]
+pub trait RestoreSource: SymbolSource {
+    /// Try to (re)connect to `holders`. Only starts the dials; failures are
+    /// logged, never returned (the retry itself tells).
     async fn reconnect(&self, holders: &[DeviceId]);
 }
 
-/// The bare swarm, for DR's SystemState fetch. DR runs `fetch_in_rounds`, which
-/// never retries a round and so never calls `reconnect`; DR dials the pointer
-/// holders itself (`dr/net`). Without the peer table there is nothing to dial on.
 #[async_trait::async_trait]
 impl SymbolSource for SwarmHandle {
     async fn request(
@@ -95,13 +97,6 @@ impl SymbolSource for SwarmHandle {
         req: RestoreRequestMsg,
     ) -> Result<Vec<Symbol>, FetchError> {
         fetch_symbols_from_holder(self, &holder, req).await
-    }
-
-    async fn reconnect(&self, holders: &[DeviceId]) {
-        debug!(
-            holders = holders.len(),
-            "fetch: bare swarm has no peer table; reconnect skipped"
-        );
     }
 }
 
@@ -127,7 +122,10 @@ impl SymbolSource for SwarmSymbols {
     ) -> Result<Vec<Symbol>, FetchError> {
         fetch_symbols_from_holder(&self.swarm, &holder, req).await
     }
+}
 
+#[async_trait::async_trait]
+impl RestoreSource for SwarmSymbols {
     async fn reconnect(&self, holders: &[DeviceId]) {
         match crate::daemon::handle::redial::redial_devices(&self.db, &self.swarm, holders).await {
             Ok(stats) => info!(
@@ -189,7 +187,7 @@ pub(crate) async fn fetch_in_rounds(
     chunk: usize,
 ) -> Result<Vec<Symbol>, FetchError> {
     let mut fetch = BlockFetch::new(encoder, block_id, placements, params, chunk);
-    while fetch.round(source, cancel).await? == RoundEnd::Progress {}
+    while fetch.round(source, cancel).await?.end == RoundEnd::Progress {}
     fetch.finish()
 }
 

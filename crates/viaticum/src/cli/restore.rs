@@ -175,7 +175,7 @@ pub(crate) fn run_restore_with(
                     } else if job.state == RestoreJobState::Finished {
                         write!(out, "{}", output::render_restore_finished(&job))?;
                     } else {
-                        write!(out, "{}", output::render_restore_progress(&job))?;
+                        write!(out, "{}", output::render_restore_progress(&job, unix_now()))?;
                     }
                     Ok(0)
                 }
@@ -233,8 +233,8 @@ pub(crate) fn run_restore_with(
         sleep,
         |j| {
             if !args.json
-                && let Err(e) =
-                    write!(out, "{}", output::render_restore_progress(j)).and_then(|()| out.flush())
+                && let Err(e) = write!(out, "{}", output::render_restore_progress(j, unix_now()))
+                    .and_then(|()| out.flush())
             {
                 progress_err.get_or_insert(e);
             }
@@ -361,4 +361,12 @@ fn http(
         reason: format!("reading the response failed: {e}"),
     })?;
     Ok((status, text))
+}
+
+/// Wall-clock Unix seconds (for "retry in …").
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
