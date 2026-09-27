@@ -445,6 +445,76 @@ pub enum PlacementStatus {
     Deleting,
 }
 
+/// Kind of a pair-ledger drop event (У-4, Д-I). One event = one placement of ours at one
+/// device of the pair's master leaving the held set {Alive, Uncertain} for the first time in
+/// its episode, on evidence STRICTLY younger than the episode (`evidence_at > placed_at`).
+///
+/// Two boundaries, not to be confused (review of intent N-4):
+///
+/// 1. The episode's TIME boundary is always `placed_at`: only a repair re-placement or
+///    `Offered → Alive` moves it; a `Pass` out of `PresumedLost` does NOT
+///    (`pos::apply_pos_outcome` leaves `placed_at` alone).
+/// 2. "Already counted" is the STATUS: after a `Pass` out of `PresumedLost` the placement is
+///    `Alive` again, so a later loss on evidence younger than `placed_at` is a new event —
+///    while the time check still compares with the same `placed_at`.
+///
+/// The first kind recognised wins: `PresumedLost → Lost` (by a notice or a `Fail`) is not a
+/// second event. Known over/under-counts (v1 costs, named in the spec): a holder clock
+/// running ahead + the stale-notice loop over-counts `Announced` (4r-i32); one holder master
+/// with two devices holding the block may count `Announced` + `Presumed` for one loss
+/// (4r-i35); evidence stamped in the same second as `placed_at` is not counted (under-count,
+/// the price of the strict comparison, 4r-i29).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DropKind {
+    /// A signed `SymbolDropNotice` moved the placement to `Lost`.
+    Announced,
+    /// Our own PoS proved the loss — wrong hash (`Fail`) or an explicit `NotHeld` — to
+    /// `Lost`. In v1 only `Fail` reaches it: `NotHeld` is not delivered over the mailbox.
+    Silent,
+    /// Our own PoS inferred the loss from silence — the timeout that reached `PresumedLost`.
+    Presumed,
+}
+
+/// Drop events recorded for ONE master since the ledger tick last folded them (У-4, Д-K).
+///
+/// An outbox between the event sites and the recorder: NOT a ledger field, NOT in the
+/// SystemState snapshot (lost on DR, 4r-i31). Lenient decode on purpose — every field
+/// defaulted: it is never accrued upon, only taken, so a foreign or damaged row costs at most
+/// the pending counts, while a strict decode would fail the whole accrual tick (an error
+/// every hour, the ledger frozen). The AC-6″ hazard of [`PairLedger`] (a zero row accrued
+/// upon) does not apply here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingDrops {
+    #[serde(default)]
+    pub announced: u32,
+    #[serde(default)]
+    pub silent: u32,
+    #[serde(default)]
+    pub presumed: u32,
+}
+
+impl PendingDrops {
+    /// Saturating `+1` on the counter of `kind`.
+    pub fn add(&mut self, kind: DropKind) {
+        let counter = match kind {
+            DropKind::Announced => &mut self.announced,
+            DropKind::Silent => &mut self.silent,
+            DropKind::Presumed => &mut self.presumed,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    /// No event of any kind is pending.
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+
+    /// Sum of all three counters (in `u64`, so three saturated counters cannot overflow).
+    pub fn total(&self) -> u64 {
+        self.announced as u64 + self.silent as u64 + self.presumed as u64
+    }
+}
+
 /// 4R pair-ledger accumulators for ONE economic pair: this node and one **master
 /// identity**. Key: [`IdentityPub`], in its own redb table — NOT a field of
 /// [`PeerRecord`].
@@ -490,6 +560,7 @@ pub enum PlacementStatus {
 /// | `depth_of_their_service` | (slow twin of row 1) | — | `OwnerEvictionView::depth` |
 /// | `v_dem` | THEIR confirmed service to us (ratchet) | `obs.v_dem` | `obs.v_dem` |
 /// | `observed_volume`, `observed_tau` | THEIR confirmed service to us (current run) | `obs.observed_volume` / `obs.observed_tau` | the same |
+/// | `drop_ann`, `drop_silent`, `drop_presumed` | THEIR devices dropped OUR data (У-4) | `obs.drop_ann` / `obs.drop_silent` (+ `drop_presumed`, bridge's choice — see the field) | not read (`eviction_order` takes only `g_holder_from_owner` and `observed_tau`) |
 ///
 /// The last two rows do NOT swap with the seat (У-3): in the owner seat `v_dem` reads "how
 /// much the holder has proven it keeps of mine", in the holder seat it is `v_dem^{ho}`,
@@ -582,7 +653,7 @@ pub enum PlacementStatus {
 /// | `gb_days_they_store_for_us`, `gb_days_we_store_for_them`, `depth_of_their_service` | **gb·days** |
 /// | `v_dem`, `observed_volume` | **gb** |
 /// | `observed_tau` | **days** |
-/// | `drop_ann`, `drop_silent` | dimensionless (decaying event counts) |
+/// | `drop_ann`, `drop_silent`, `drop_presumed` | dimensionless (decaying event counts, `+1` per placement) |
 /// | `last_update` | wall-clock [`Timestamp`] (unix **seconds**) |
 ///
 /// "gb" means `bytes as f64 / constants::BYTES_PER_GB` (2^30) — a CONVENTION chosen
@@ -715,11 +786,50 @@ pub struct PairLedger {
     /// the first observed tail with nothing confirmed, which is what happens after an outage
     /// longer than the confirmation window. See [`PairLedger::observed_volume`].
     pub observed_tau: f64,
-    /// Decaying count of ANNOUNCED drops of our data by this pair (a signed
-    /// `SymbolDropNotice` arrived). Fades with `λ_drop` — "the system must forgive".
+    /// Decaying count of ANNOUNCED drops of our data by this pair (У-4): a signed
+    /// `SymbolDropNotice` moved one of our placements at one of their devices out of the held
+    /// set {Alive, Uncertain} into `Lost` — the first loss of that placement's episode, on a
+    /// notice stamped strictly after `placed_at` ([`DropKind`], Д-I). Re-deliveries,
+    /// republications with a new deadline and the final `deadline = now` notice find the
+    /// placement already `Lost` and add nothing; a notice for a `Deleting` or missing
+    /// placement (our own deletion) is not an event at all.
+    ///
+    /// Unit: `+1` per placement (block × device), not the volume lost. Moment: when WE apply
+    /// the notice, not when the symbols died on their disk. Leaks at `λ_drop`
+    /// ([`crate::constants::PAIR_LEDGER_LAMBDA_DROP`], 1/56 day⁻¹ — "the system must
+    /// forgive") on every sub-step of every interval, the unobserved part included; the
+    /// events of a tick are added AFTER that tick's decay (Д-K).
+    ///
+    /// Not the sim's counter, only its leak rate: the sim counts a symbol's death at T+1,
+    /// exempts cap trims (the notice carries no reason, so the daemon counts them) and steps
+    /// weekly (×0.875/week) where the daemon steps hourly (×0.8825/week).
     pub drop_ann: f64,
-    /// Decaying count of SILENT drops — we detected the loss ourselves, no notice.
+    /// Decaying count of SILENT drops (У-4): our own PoS PROVED a loss — a wrong-hash `Fail`
+    /// (or an explicit `NotHeld`) moved a held placement to `Lost`, first in its episode, on
+    /// a challenge issued strictly after `placed_at`. In v1 this is only `Fail` (corrupted
+    /// bytes): `NotHeld` is not delivered over the mailbox, so a holder that lost or wiped
+    /// our data shows up as silence, i.e. in [`PairLedger::drop_presumed`].
+    ///
+    /// Same unit, moment and leak as [`PairLedger::drop_ann`]. The sim's "silent" is a
+    /// holder's departure, one event per pair and episode — a different definition.
     pub drop_silent: f64,
+    /// Decaying count of PRESUMED drops of our data by this pair (У-4, Д-J): one of our
+    /// placements at one of their devices reached `PresumedLost` — three consecutive PoS
+    /// timeouts, the daemon's only visible trace of a holder that vanished (the sim's
+    /// silent-loss-by-departure twin). The first timeout (`→ Uncertain`) and every timeout
+    /// after `PresumedLost` add nothing.
+    ///
+    /// Kept apart from [`PairLedger::drop_silent`] (proven loss) because the two cannot be
+    /// separated later, while they can always be summed (both leak by the same factor). The
+    /// bridge (У-5) decides the mapping: while `pos_timeout` is an honest 0, map
+    /// `obs.drop_silent = drop_silent + drop_presumed`; if it ever derives `pos_timeout` from
+    /// placement transitions, do NOT add this field (the kernel's `drop_frac` would count the
+    /// same timeouts twice). Leaks at `λ_drop` like the other two.
+    ///
+    /// Added after rows were already written: `#[serde(default)]` is what keeps those rows
+    /// (and published SystemState blobs) readable — W-1, see "Adding a field later" above.
+    #[serde(default)]
+    pub drop_presumed: f64,
     /// Wall clock of the last accrual (unix seconds). Single clock for the `G`/`D`
     /// integrators and the drop decay: every accrual integrates over `now - last_update`,
     /// so the contribution is set by elapsed time and not by how many times the tick

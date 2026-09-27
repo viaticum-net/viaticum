@@ -4232,4 +4232,13 @@ fn the_daemon_recorder_leaks_at_exactly_the_model_defaults_this_sim_runs_on() {
         viaticum_core::constants::PAIR_LEDGER_LAMBDA_DEM,
         "λ_dem: the demonstrated-scale ratchet must leak at the sim's rate"
     );
+    // У-4 (DSim-1). Guards the LEAK RATE of the drop counters only. The COUNTS are not
+    // comparable: the sim counts a symbol's death at T+1, exempts cap trims and calls a
+    // holder's departure "silent"; the daemon counts a placement's first loss when the owner
+    // applies the evidence and keeps a departure apart as `drop_presumed` (spec У4-5).
+    assert_eq!(
+        model.lambda_drop,
+        viaticum_core::constants::PAIR_LEDGER_LAMBDA_DROP,
+        "λ_drop: the drop counters must forgive at the sim's rate"
+    );
 }

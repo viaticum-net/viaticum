@@ -28,7 +28,9 @@ use viaticum_core::types::{DeviceId, IdentityPub, Timestamp, hex_encode};
 
 use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent};
 use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
-use crate::daemon::identity::{IdentityError, derive_keys, load_identity};
+use crate::daemon::identity::{
+    IdentityError, corrupt_key_hint, derive_keys, load_identity, not_initialized_hint,
+};
 use crate::daemon::processor::Processor;
 use crate::daemon::repair::RepairTrigger;
 use crate::daemon::restore::{
@@ -169,19 +171,14 @@ impl DaemonHandle {
                 kind,
                 match e {
                     IdentityError::NotInitialized if kind == StartFailureKind::NeedsUser => {
-                        anyhow::anyhow!("identity not initialized — run 'viaticum init' first")
+                        anyhow::anyhow!(not_initialized_hint(&cfg.data_dir))
                     }
                     IdentityError::NotInitialized => anyhow::anyhow!(
                         "data directory {} is missing or not readable (not mounted or \
                          not unlocked yet?); will retry",
                         cfg.data_dir.display()
                     ),
-                    IdentityError::Corrupt(p, msg) => anyhow::anyhow!(
-                        "identity file at {} is corrupt or from an incompatible binary version ({}). \
-                     Delete the file and re-run 'viaticum init', or restore from backup.",
-                        p.display(),
-                        msg
-                    ),
+                    IdentityError::Corrupt(p, msg) => anyhow::anyhow!(corrupt_key_hint(&p, &msg)),
                     other => anyhow::anyhow!(
                         "identity load error from {}: {}",
                         key_path.display(),
@@ -938,9 +935,7 @@ impl DaemonHandle {
                 cfg.data_dir.clone(),
                 disk_reserve_bytes,
                 backup_event_tx,
-                time_scale,
                 Some(cluster_state.clone()),
-                app_config.escrow.clone(),
                 accepted_offers.clone(),
                 master_key.clone(),
             );

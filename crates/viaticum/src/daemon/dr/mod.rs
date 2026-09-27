@@ -4,19 +4,28 @@
 // SwarmHandle, walks the mailbox candidate-set to find the freshest SelfPointer,
 // then fetches and restores the DB from the base+diff blocks.
 //
-// A2 flow (T-9b):
-//   1. Init identity from mnemonic → IdentityKeyFile
-//   2. Open fresh DB (remove stale db.redb if present)
-//   3. Start SwarmHandle with seed peers as kademlia_bootstrap_peers
-//   4. wait_for_kad_bootstrap_stable: drain PeerAuthenticated events,
+// DR is transactional (spec B2 §1.5.1): every refusal happens before the data dir
+// changes, all work goes into drafts (`db.redb.dr-new`, `identity.key.dr-new`), and
+// the drafts are installed by a series of renames only after the network phase
+// succeeded. A failed DR leaves the folder as it was.
+//
+//   1. preflight (dr/preflight): phrase → keyfile in memory; lock probe on db.redb
+//      (live daemon → stop); identity.key must carry the phrase's seed (same →
+//      reuse it, device id kept; other → stop); claim the staging DB
+//   2. KeySource::New: write the key draft
+//   3. Db::create_from_file on the claimed staging file
+//   4. Start SwarmHandle with seed peers as kademlia_bootstrap_peers
+//   5. wait_for_kad_bootstrap_stable: drain PeerAuthenticated events,
 //      upsert each peer to DB, return when min_peers reached or timeout
-//   5. get_closest_peers(hash(my_master_pub)) → dial + authenticate closest peers
+//   6. get_closest_peers(hash(my_master_pub)) → dial + authenticate closest peers
 //      so MailboxRouter.dr_walk_for_pointer has a populated DB to work with
-//   6. MailboxRouter.dr_walk_for_pointer: expanding batches [100,300,1000]
+//   7. MailboxRouter.dr_walk_for_pointer: expanding batches [100,300,1000]
 //      sends MailboxFetchRequest, verifies SelfPointer signatures, picks freshest
-//   7. dial_pointer_holders: try HolderHint.addrs first (fast); if empty or failed,
+//   8. dial_pointer_holders: try HolderHint.addrs first (fast); if empty or failed,
 //      fall back to get_closest_peers(holder_id) (B-1 Kademlia-first DR path)
-//   8. fetch_ss_block per base+diffs → apply_diffs → restore_db
+//   9. fetch_ss_block per base+diffs → apply_diffs → restore_db_force (staging DB)
+//  10. drop swarm + DB, commit (dr/commit): old db.redb → .dr-bak[.N], staging →
+//      db.redb, key last. Any error in 2-9 → abort: remove only this run's drafts.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -26,10 +35,13 @@ use std::time::Duration;
 use viaticum_core::constants::DR_KAD_STABILIZE_TIMEOUT_SECS;
 use viaticum_core::types::{IdentityPub, PeerRecord, Timestamp, hex_encode};
 
-use crate::daemon::identity::{derive_keys, init_identity_from_mnemonic, load_identity};
+use crate::daemon::identity::{MnemonicProblem, derive_keys};
 use crate::daemon::mailbox::candidate::KademliaRoutingView;
 use crate::daemon::mailbox::routing::MailboxRouter;
 use crate::daemon::network::swarm::{ProtocolEvent, SwarmConfig, SwarmHandle};
+
+mod commit;
+mod preflight;
 
 #[cfg(test)]
 mod tests;
@@ -52,48 +64,163 @@ const KAD_MIN_PEERS_FOR_DR: usize = 1;
 /// Per-peer timeout when dialing candidate peers discovered via get_closest_peers.
 const CANDIDATE_DIAL_TIMEOUT_SECS: u64 = 10;
 
+// ─── Options and errors ──────────────────────────────────────────────────────
+
+/// What `viaticum dr` was asked to do.
+pub struct DrOptions {
+    pub mnemonic: String,
+    /// `--peer` multiaddrs (with `/p2p/<peer id>`).
+    pub peers: Vec<String>,
+    pub data_dir: PathBuf,
+}
+
+/// Why DR stopped. Every variant up to `Failed` leaves the data dir as it was;
+/// the texts are what the friend reads.
+#[derive(Debug, thiserror::Error)]
+pub enum DrError {
+    #[error("the recovery phrase is not valid: {0}. Nothing was changed.")]
+    InvalidPhrase(MnemonicProblem),
+    #[error(
+        "{data_dir} belongs to a different identity (folder: {folder}, phrase: {phrase}). \
+         Nothing was changed. Run DR into an empty directory (--data-dir <new dir>), or move \
+         this directory away if you are sure it is not needed."
+    )]
+    ForeignIdentity {
+        data_dir: String,
+        folder: String,
+        phrase: String,
+    },
+    #[error(
+        "identity.key in {data_dir} is unreadable ({reason}). Nothing was changed. \
+         Move it away and run DR again."
+    )]
+    KeyfileUnreadable { data_dir: String, reason: String },
+    #[error(
+        "{data_dir} is in use by a running Viaticum daemon or another DR. Stop it first. \
+         Nothing was changed."
+    )]
+    DataDirInUse { data_dir: String },
+    #[error("another DR is already running in {data_dir}. Nothing was changed.")]
+    DrInProgress { data_dir: String },
+    #[error(
+        "could not reach any peer: check the --peer address and the network. \
+         Nothing was changed."
+    )]
+    NoCandidates,
+    /// `responders` goes to the log (the pre-B2.2 walk does not count them → None).
+    #[error(
+        "no catalog found for this recovery phrase. A node publishes its first \
+         recovery pointer about 12 hours after install; if it is older, try other \
+         --peer addresses. Nothing was changed."
+    )]
+    NoCatalogFound { responders: Option<usize> },
+    /// Network / fetch / decode / restore failure before the commit.
+    #[error("DR failed: {reason}. Nothing was changed.{hint}")]
+    Failed { reason: String, hint: String },
+    #[error("DR could not finish installing the recovered state: {0}")]
+    Commit(String),
+}
+
+fn dr_failed(reason: impl std::fmt::Display) -> DrError {
+    DrError::Failed {
+        reason: reason.to_string(),
+        hint: String::new(),
+    }
+}
+
+/// Counts printed after a successful DR.
+struct RecoveredSummary {
+    files: usize,
+    source_blocks: usize,
+    placements: usize,
+    peers: usize,
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
-/// Run disaster recovery: restore node state from mnemonic into data_dir.
-///
-/// Uses the mailbox bus (A2) to locate the freshest SelfPointer instead of the
-/// legacy SystemStateRequest/Response path. Seed peers are registered as Kademlia
-/// bootstrap peers so the routing table populates during bootstrap stabilization.
-pub async fn run_dr(
-    mnemonic: String,
-    peer_addrs: Vec<String>,
-    data_dir: PathBuf,
-) -> anyhow::Result<()> {
+/// Run disaster recovery: restore node state from the recovery phrase into
+/// `opts.data_dir`. Transactional: on `Err` the folder is as it was (see the module
+/// header), except `DrError::Commit`, whose text says what lies where.
+pub async fn run_dr(opts: DrOptions) -> Result<(), DrError> {
     println!("Starting disaster recovery...");
-    println!("Data directory: {}", data_dir.display());
+    println!("Data directory: {}", opts.data_dir.display());
 
-    // ── 1. Init identity ──────────────────────────────────────────────────────
-    std::fs::create_dir_all(&data_dir)?;
+    // ── 1. Preflight: phrase, folder, locks, staging claim ────────────────────
+    let mut plan = preflight::preflight(&opts.data_dir, &opts.mnemonic)?;
+    for w in &plan.warnings {
+        eprintln!("warning: {w}");
+    }
+    println!(
+        "Identity restored: {}",
+        hex_encode(&plan.keyfile.identity_pub)
+    );
+    if plan.key_source == preflight::KeySource::Existing {
+        println!("Using the existing identity.key in this folder (same identity, device id kept).");
+    }
 
-    let keyfile = match init_identity_from_mnemonic(&data_dir, &mnemonic) {
-        Ok(kf) => kf,
+    // ── 2-9. Drafts + network; everything that holds the staging DB is dropped
+    //         when this returns ────────────────────────────────────────────────
+    let recovered = match plan.stage_key() {
+        Ok(()) => recover_into_staging(&mut plan, &opts.peers).await,
+        Err(e) => Err(e),
+    };
+    let summary = match recovered {
+        Ok(s) => s,
         Err(e) => {
-            tracing::warn!("identity init: {e}, attempting to load existing");
-            load_identity(&data_dir)?
+            commit::abort(&mut plan);
+            return Err(e);
         }
     };
 
-    let identity_pub_hex = hex_encode(&keyfile.identity_pub);
-    println!("Identity restored: {identity_pub_hex}");
+    // ── 10. Commit ────────────────────────────────────────────────────────────
+    let outcome = commit::commit(plan)?;
 
-    let (master_key, device_key, _epoch_key_bytes) = derive_keys(&keyfile, 0)?;
+    println!("DR restore successful:");
+    println!("  Files:         {}", summary.files);
+    println!("  Source blocks: {}", summary.source_blocks);
+    println!("  Placements:    {}", summary.placements);
+    println!("  Peers:         {}", summary.peers);
+    if let Some(bak) = &outcome.db_backup {
+        println!("Previous database kept as: {}", bak.display());
+        println!("  (to go back to it: stop the daemon and move it over db.redb)");
+    }
+    println!();
+    println!("Your files are not on this machine yet. The network keeps them, but they are");
+    println!("not re-protected (repair, storage proofs) until they are back at their original");
+    println!("paths.");
+    println!("  1. viaticum daemon --watch-dir <folder>");
+    println!("  2. viaticum restore <path>        (restored copies go to the staging folder)");
+    println!("  3. Move the restored files back to their original paths.");
+
+    Ok(())
+}
+
+/// Steps 3-9: build the recovered state in the staging DB. Takes the claimed
+/// staging file from the plan; the DB, the swarm and the router live only inside
+/// this call, so on return (Ok or Err) redb's handle on the staging file is closed.
+async fn recover_into_staging(
+    plan: &mut preflight::DrPlan,
+    peer_addrs: &[String],
+) -> Result<RecoveredSummary, DrError> {
+    // ── 3. Fresh DB in the staging file ───────────────────────────────────────
+    let staging_file = plan
+        .staging
+        .file
+        .take()
+        .ok_or_else(|| dr_failed("the staging database was not claimed"))?;
+    // On Windows a second exclusive lock through the same handle fails (redb would
+    // report DatabaseAlreadyOpen): hand redb an unlocked handle there (A15).
+    #[cfg(windows)]
+    let _ = staging_file.unlock();
+    let db = viaticum_core::db::Db::create_from_file(staging_file)
+        .map_err(|e| dr_failed(format!("cannot create the recovery database: {e}")))?;
+
+    let keyfile = &plan.keyfile;
+    let (master_key, device_key, _epoch_key_bytes) = derive_keys(keyfile, 0).map_err(dr_failed)?;
     let my_master_pub = viaticum_core::types::IdentityPub(keyfile.identity_pub);
     let device_id = viaticum_core::types::DeviceId(keyfile.device_id);
 
-    // ── 2. Open fresh DB ──────────────────────────────────────────────────────
-    let db_path = data_dir.join("db.redb");
-    if db_path.exists() {
-        std::fs::remove_file(&db_path)?;
-        tracing::info!("removed stale db.redb from prior DR attempt");
-    }
-    let db = viaticum_core::db::Db::open(&db_path)?;
-
-    // ── 3. Start SwarmHandle with seed peers as Kademlia bootstrap peers ──────
+    // ── 4. Start SwarmHandle with seed peers as Kademlia bootstrap peers ──────
     // Parse seed addresses into Multiaddr for kademlia_bootstrap_peers so that
     // kad.bootstrap() (fired on the first event-loop tick) actually reaches them.
     let device_cert =
@@ -130,10 +257,12 @@ pub async fn run_dr(
         enable_relay_server: false,
     };
 
-    let (swarm_handle, mut event_rx) = SwarmHandle::start(swarm_cfg).await?;
+    let (swarm_handle, mut event_rx) = SwarmHandle::start(swarm_cfg)
+        .await
+        .map_err(|e| dr_failed(format!("cannot start networking: {e}")))?;
     println!("Network ready. Waiting for Kademlia bootstrap...");
 
-    // ── 4. Wait for Kademlia bootstrap to stabilize ───────────────────────────
+    // ── 5. Wait for Kademlia bootstrap to stabilize ───────────────────────────
     // Drain PeerAuthenticated events, upsert each peer to the DB so that
     // MailboxRouter.dr_walk_for_pointer has candidates to work with.
     // Returns how many peers authenticated within the timeout.
@@ -148,7 +277,7 @@ pub async fn run_dr(
 
     println!("Bootstrap stabilization: {kad_peers} peer(s) authenticated.");
 
-    // ── 5. Discover + authenticate closest peers via Kademlia ─────────────────
+    // ── 6. Discover + authenticate closest peers via Kademlia ─────────────────
     // The DR pointer is stored by nodes closest to hash(my_master_pub).
     // get_closest_peers drives a live DHT query toward that key and returns
     // the closest known peers with their addresses.  We dial them so they are
@@ -169,17 +298,29 @@ pub async fn run_dr(
         }
     }
 
-    // ── 6. Walk mailbox candidate-set for the freshest SelfPointer ───────────
+    // No peer at all: the seed address is wrong or unreachable.
+    if db
+        .list_all_peers()
+        .map_err(|e| dr_failed(format!("recovery database: {e}")))?
+        .is_empty()
+    {
+        return Err(DrError::NoCandidates);
+    }
+
+    // ── 7. Walk mailbox candidate-set for the freshest SelfPointer ───────────
     let swarm_handle = Arc::new(swarm_handle);
     let router = Arc::new(MailboxRouter::new(Arc::clone(&swarm_handle), db.clone()));
 
     println!("Searching for SelfPointer via mailbox...");
-    let pointer = match router.dr_walk_for_pointer(&my_master_pub).await? {
+    let pointer = match router
+        .dr_walk_for_pointer(&my_master_pub)
+        .await
+        .map_err(|e| dr_failed(format!("pointer search: {e}")))?
+    {
         Some(p) => p,
         None => {
-            anyhow::bail!(
-                "no SelfPointer found in the candidate-set; check seed peers / network connectivity"
-            );
+            tracing::info!("dr: no SelfPointer of this identity in the candidate-set");
+            return Err(DrError::NoCatalogFound { responders: None });
         }
     };
 
@@ -191,53 +332,51 @@ pub async fn run_dr(
         pointer.created_at.0
     );
 
-    // ── 7. Dial the pointer's holders so we can fetch from them ──────────────
+    // ── 8. Dial the pointer's holders so we can fetch from them ──────────────
     // B-1: try HolderHint.addrs first (fast); if empty or all fail, use
     // get_closest_peers(holder_id) as the primary DR path.
     dial_pointer_holders(&swarm_handle, &mut event_rx, &db, &pointer).await;
 
-    // ── 8. Fetch base + diff blocks, reassemble, restore DB ──────────────────
-    let dr_key = crate::daemon::system_state::identity_key_bytes_from_seed(&keyfile.seed)?;
+    // ── 9. Fetch base + diff blocks, reassemble, restore DB ──────────────────
+    let dr_key = crate::daemon::system_state::identity_key_bytes_from_seed(&keyfile.seed)
+        .map_err(|e| dr_failed(format!("DR key: {e}")))?;
     let encoder: Arc<dyn viaticum_core::erasure::ErasureEncoder> =
         Arc::new(viaticum_core::erasure::RaptorQEncoder::new());
 
     let base_bytes = fetch_ss_block(&swarm_handle, &encoder, &pointer.base, &dr_key)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to fetch SS base block: {e}"))?;
+        .map_err(|e| dr_failed(format!("failed to fetch SS base block: {e}")))?;
     let base_state: viaticum_core::system_state::SystemState =
         viaticum_core::types::from_cbor_bytes(&base_bytes)
-            .map_err(|e| anyhow::anyhow!("decode base SystemState: {e}"))?;
+            .map_err(|e| dr_failed(format!("decode base SystemState: {e}")))?;
 
     let mut diffs: Vec<Vec<viaticum_core::system_state::DiffOp>> =
         Vec::with_capacity(pointer.diffs.len());
     for dref in &pointer.diffs {
         let bytes = fetch_ss_block(&swarm_handle, &encoder, dref, &dr_key)
             .await
-            .map_err(|e| anyhow::anyhow!("failed to fetch SS diff block: {e}"))?;
+            .map_err(|e| dr_failed(format!("failed to fetch SS diff block: {e}")))?;
         diffs.push(
             viaticum_core::types::from_cbor_bytes(&bytes)
-                .map_err(|e| anyhow::anyhow!("decode diff block: {e}"))?,
+                .map_err(|e| dr_failed(format!("decode diff block: {e}")))?,
         );
     }
 
     let state = viaticum_core::system_state::apply_diffs(base_state, &diffs);
 
-    // ── 9. Restore into the fresh DB ──────────────────────────────────────────
     // Use restore_db_force: the DB is fresh but not fully empty — bootstrap
     // upserted peer records during wait_for_kad_bootstrap_stable. The force
     // variant skips the empty-DB guard and overlays the restored state on top.
     viaticum_core::system_state::restore_db_force(&db, &state)
-        .map_err(|e| anyhow::anyhow!("restore_db: {e}"))?;
+        .map_err(|e| dr_failed(format!("restore_db: {e}")))?;
 
-    println!("DR restore successful:");
-    println!("  Files:         {}", state.files.len());
-    println!("  Source blocks: {}", state.source_blocks.len());
-    println!("  Placements:    {}", state.symbol_placements.len());
-    println!("  Peers:         {}", state.peers.len());
-    println!();
-    println!("Run 'viaticum daemon' to start, then 'viaticum restore <path>' to recover files.");
-
-    Ok(())
+    // Everything holding the staging DB (router, db) and the swarm drops here.
+    Ok(RecoveredSummary {
+        files: state.files.len(),
+        source_blocks: state.source_blocks.len(),
+        placements: state.symbol_placements.len(),
+        peers: state.peers.len(),
+    })
 }
 
 // ─── Kademlia bootstrap stabilization ────────────────────────────────────────

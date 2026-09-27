@@ -25,7 +25,7 @@ use viaticum_core::deletion::{DeletionAction, DeletionEngine};
 use viaticum_core::mailbox::{DeleteRequestPayload, MailboxClass, MailboxEntry};
 use viaticum_core::messages::{PosHashResponseMsg, to_cbor};
 use viaticum_core::pair_ledger::{
-    AccrualStats, PairLedgerError, PairLedgerRecorder, TickReport, tick_interval_secs,
+    AccrualStats, LossCause, PairLedgerError, PairLedgerRecorder, TickReport, tick_interval_secs,
 };
 use viaticum_core::pos::{VerifyOutcome, apply_pos_outcome, due_challenges, outcome_from_verify};
 use viaticum_core::trust::{compute_combined, compute_effective_trust, recalculate_trust};
@@ -238,6 +238,7 @@ impl Scheduler {
                                 with_unobserved_gap = stats.with_unobserved_gap,
                                 truncated = stats.truncated,
                                 believed_not_confirmed = stats.believed_not_confirmed,
+                                drop_events_folded = stats.drop_events_folded,
                                 "scheduler: pair-ledger accrual tick"
                             );
                             log_ledger_rows(&report);
@@ -422,13 +423,27 @@ impl Scheduler {
 
         let old_status = placement.status;
         let transition = viaticum_core::pos::apply_pos_outcome(&placement, &outcome);
-        let mut updated = placement;
+        let mut updated = placement.clone();
         updated.status = transition.new_status;
         updated.consecutive_misses = transition.new_consecutive_misses;
         if matches!(outcome, viaticum_core::pos::VerifyOutcome::Pass) {
             updated.last_verified = Some(Timestamp::now());
         }
-        self.db.upsert_placement(&updated)?;
+        // У-4: a proven loss (wrong hash / explicit NotHeld) of a held placement is a SILENT
+        // drop for the pair ledger, recorded in the same transaction as this write; the
+        // evidence time is when WE issued the challenge.
+        let loss_cause = match outcome {
+            VerifyOutcome::Fail { .. } => Some(LossCause::PosFail),
+            VerifyOutcome::NotHeld { .. } => Some(LossCause::PosNotHeld),
+            _ => None,
+        };
+        crate::daemon::processor::persist_placement_change(
+            &self.db,
+            &placement,
+            &updated,
+            loss_cause,
+            pending.issued_at,
+        )?;
 
         if updated.status != old_status {
             crate::daemon::processor::recompute_and_persist_block_cached_fields(
@@ -985,12 +1000,20 @@ impl Scheduler {
 
             let transition = apply_pos_outcome(&placement, &VerifyOutcome::Timeout);
 
-            // Persist updated status.
-            let mut updated = placement;
+            // Persist updated status. У-4: the timeout that reaches PresumedLost is a
+            // PRESUMED drop for the pair ledger (recorded in the same transaction); the
+            // evidence time is when we issued the challenge.
+            let mut updated = placement.clone();
             updated.status = transition.new_status;
             updated.consecutive_misses = transition.new_consecutive_misses;
 
-            if let Err(e) = self.db.upsert_placement(&updated) {
+            if let Err(e) = crate::daemon::processor::persist_placement_change(
+                &self.db,
+                &placement,
+                &updated,
+                Some(LossCause::PosTimeout),
+                challenge.issued_at,
+            ) {
                 error!(
                     block_id = %block_id,
                     holder_id = %holder_id,
@@ -1409,12 +1432,15 @@ pub(crate) fn scaled_timer_secs(base_secs: u64, time_scale: u64) -> u64 {
 /// `viaticum::ledger`; enable with `RUST_LOG=info,viaticum::ledger=debug`. At `info` it is
 /// silent. Output of the writer, not a reader: nothing branches on it (AC-7).
 ///
-/// CONTRACT with `experiments/local_ledger_test.sh`: the message `pair-ledger row`, the
-/// target and the field names (`master dt_days believed_gb confirmed_gb v_dem g_they depth
-/// observed_volume observed_tau`) are parsed by that scenario. Renaming any of them must
-/// break the scenario — that is intended. `f64` fields go through `Debug` (shortest
-/// round-trip form), so equal values print identical text; `master` is `IdentityPub`'s
-/// Display, the first 8 bytes in hex.
+/// CONTRACT with `experiments/local_ledger_test.sh` and
+/// `experiments/local_ledger_drop_test.sh`: the message `pair-ledger row`, the target and the
+/// field names (`master dt_days believed_gb confirmed_gb v_dem g_they depth observed_volume
+/// observed_tau drop_ann drop_silent drop_presumed ann_events silent_events presumed_events`)
+/// are parsed by those scenarios. Renaming any of them must break the scenarios — that is
+/// intended. `*_events` are the drop events folded into the row on this tick (У-4); the drop
+/// counters are after decay + fold. `f64` fields go through `Debug` (shortest round-trip
+/// form), so equal values print identical text; `master` is `IdentityPub`'s Display, the
+/// first 8 bytes in hex.
 fn log_ledger_rows(report: &TickReport) {
     for row in &report.rows {
         debug!(
@@ -1428,6 +1454,12 @@ fn log_ledger_rows(report: &TickReport) {
             depth = ?row.depth,
             observed_volume = ?row.observed_volume,
             observed_tau = ?row.observed_tau,
+            drop_ann = ?row.drop_ann,
+            drop_silent = ?row.drop_silent,
+            drop_presumed = ?row.drop_presumed,
+            ann_events = row.ann_events,
+            silent_events = row.silent_events,
+            presumed_events = row.presumed_events,
             "pair-ledger row"
         );
     }

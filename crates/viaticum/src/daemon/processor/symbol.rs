@@ -99,7 +99,14 @@ impl SymbolDropHandler {
             }
         };
 
-        let changed = match super::mark_placement_lost(&self.db, &block_id, &holder_device_id) {
+        // У-4: the notice's own signed timestamp is the evidence time the pair ledger checks
+        // against the placement's episode (a re-delivered OLD notice is not a new drop).
+        let changed = match super::mark_placement_lost(
+            &self.db,
+            &block_id,
+            &holder_device_id,
+            notice.timestamp,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 error!(
@@ -111,6 +118,24 @@ impl SymbolDropHandler {
                 return false;
             }
         };
+
+        if changed {
+            // Д-M (У-4): the ledger keys the event by the device's PeerRecord master, not by
+            // the signer. They should agree; if not, say so — the key stays the PEERS one.
+            if let Ok(Some(ledger_master)) =
+                viaticum_core::pair_ledger::ledger_master_for_device(&self.db, &holder_device_id)
+                && ledger_master != from
+            {
+                warn!(
+                    target: "viaticum::ledger",
+                    block_id = %block_id,
+                    holder = %holder_device_id,
+                    signer = %from,
+                    ledger_master = %ledger_master,
+                    "pair-ledger: DropNotice signer differs from the holder device's PeerRecord master"
+                );
+            }
+        }
 
         if !changed {
             debug!(

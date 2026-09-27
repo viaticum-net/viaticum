@@ -148,8 +148,6 @@ enabled = true
 bind = "127.0.0.1:0"
 [storage]
 disk_reserve_gb = 0.0
-[escrow]
-k_factor = 0.001
 CFGEOF
 done
 

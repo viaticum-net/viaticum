@@ -5,7 +5,7 @@
   let status = $state(null);
   let error = $state(null);
   let loading = $state(true);
-  let warmupCounts = $state({ replicating: 0, restorable: 0, cold: 0, degraded: 0, total: 0 });
+  let warmupCounts = $state({ replicating: 0, restorable: 0, degraded: 0, total: 0 });
   let bannerDismissed = $state(false);
 
   // The banner shows for the first 24h of cluster lifetime and as long as no file
@@ -47,12 +47,11 @@
       const res = await fetch('/api/files');
       if (!res.ok) return;
       const files = await res.json();
-      const counts = { replicating: 0, restorable: 0, cold: 0, degraded: 0, total: files.length };
+      const counts = { replicating: 0, restorable: 0, degraded: 0, total: files.length };
       for (const f of files) {
         const k = f.effective_status?.kind;
         if (k === 'replicating') counts.replicating++;
         else if (k === 'restorable') counts.restorable++;
-        else if (k === 'replicated_cold') counts.cold++;
         else if (k === 'degraded') counts.degraded++;
       }
       warmupCounts = counts;
@@ -84,9 +83,8 @@
     <div class="warmup-icon">⏳</div>
     <div class="warmup-text">
       <strong>Cluster is warming up.</strong>
-      Files are being encrypted and distributed across peers ({warmupCounts.replicating} replicating,
-      {warmupCounts.cold} placed-but-locked). Restore stays unavailable for a few days
-      until you've earned enough storage credit by holding other peers' data.
+      Files are being encrypted and distributed across peers ({warmupCounts.replicating} replicating).
+      A file can be restored from the network as soon as enough peers hold its pieces.
       This is expected on day one of a new cluster.
     </div>
     <button class="warmup-close" onclick={dismissBanner} aria-label="Dismiss">×</button>

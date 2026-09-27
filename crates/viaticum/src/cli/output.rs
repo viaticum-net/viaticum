@@ -145,20 +145,6 @@ pub fn format_restore_blocked(b: &RestoreBlocker) {
             );
             eprintln!("  hint:   wait for offline peers to come back, or trigger repair");
         }
-        RestoreBlocker::EscrowLocked {
-            budget_gb,
-            needed_gb,
-            est_seconds,
-        } => {
-            eprintln!(
-                "  reason: holders refused via escrow (budget {budget_gb:.2} GB, needed {needed_gb:.2} GB)"
-            );
-            if let Some(s) = est_seconds {
-                eprintln!("  eta:    ~{} sec until budget catches up", s);
-            } else {
-                eprintln!("  hint:   you need to hold data for other peers to earn restore credit");
-            }
-        }
         RestoreBlocker::AllHoldersOffline { last_seen_secs_ago } => {
             eprintln!("  reason: all holders offline (last seen {last_seen_secs_ago}s ago)");
         }

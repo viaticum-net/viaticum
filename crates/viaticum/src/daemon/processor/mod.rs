@@ -13,8 +13,7 @@
 //   SymbolOffer received    → we are the holder  → check quota, send Accept or Reject
 //   SymbolAccept received   → we are the owner   → log (BackupCoordinator wiring Phase 7.5)
 //   SymbolReject received   → we are the owner   → log
-//   RestoreRequest received → we are the holder  → load symbols, send RestoreResponse
-//   RestoreDenied received  → we are the owner   → log warning
+//   RestoreRequest received → we are the holder  → load symbols, send RestoreResponse (no gate)
 //   PeerAnnounce received   → upsert peer record in DB
 //   ClusterSyncRequest      → we are cluster peer → serve event log entries
 //   ClusterSyncResponse     → we are cluster peer → apply received events
@@ -43,13 +42,15 @@ use std::sync::{Arc, Mutex};
 use libp2p::request_response::ResponseChannel;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use viaticum_core::cluster::DeviceCertificate;
-use viaticum_core::config::EscrowCfg;
 use viaticum_core::constants::SYMBOL_OFFER_EXPIRY_SECS;
 use viaticum_core::db::Db;
-use viaticum_core::messages::{AckMsg, Message, RestoreDeniedMsg, SymbolStoredMsg};
-use viaticum_core::types::{DeviceId, IdentityPub, PlacementStatus, SourceBlockId, Timestamp};
+use viaticum_core::messages::{AckMsg, Message, SymbolStoredMsg};
+use viaticum_core::pair_ledger::{LossCause, drop_event_for, ledger_master_for_device};
+use viaticum_core::types::{
+    DeviceId, DropKind, IdentityPub, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
+};
 
 use crate::daemon::cluster_sync::ClusterSyncManager;
 use crate::daemon::mailbox::candidate::KademliaRoutingView;
@@ -107,12 +108,6 @@ pub enum ProcessorError {
 
     #[error("cluster sync error: {0}")]
     ClusterSync(#[from] crate::daemon::cluster_sync::ClusterSyncError),
-
-    #[error("escrow denied for block {block_id}")]
-    EscrowDenied {
-        block_id: viaticum_core::types::SourceBlockId,
-        denial: viaticum_core::escrow::RestoreDenial,
-    },
 
     #[error("task join error: {0}")]
     Join(String),
@@ -181,12 +176,8 @@ pub struct Processor {
     disk_reserve_bytes: u64,
     /// Channel to notify BackupCoordinator about symbol accept/reject outcomes.
     backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
-    /// Time acceleration factor (1 = real time). Scales week numbers for trust.
-    time_scale: u64,
     /// Cluster state for auto-add on same-identity handshake. None if not initialized.
     cluster_state: Option<Arc<std::sync::Mutex<viaticum_core::cluster::ClusterState>>>,
-    /// Escrow configuration for contribution-based restore budget checks.
-    escrow_cfg: EscrowCfg,
     /// Accepted symbol offers awaiting SymbolTransfer from the owner.
     /// Key: (owner_id, block_id). Entries expire after SYMBOL_OFFER_EXPIRY_SECS.
     pub(crate) accepted_offers: AcceptedOffers,
@@ -218,9 +209,7 @@ impl Processor {
         data_dir: PathBuf,
         disk_reserve_bytes: u64,
         backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
-        time_scale: u64,
         cluster_state: Option<Arc<std::sync::Mutex<viaticum_core::cluster::ClusterState>>>,
-        escrow_cfg: EscrowCfg,
         accepted_offers: AcceptedOffers,
         master_signing_key: ed25519_dalek::SigningKey,
     ) -> Self {
@@ -235,9 +224,7 @@ impl Processor {
             data_dir,
             disk_reserve_bytes,
             backup_event_tx,
-            time_scale,
             cluster_state,
-            escrow_cfg,
             accepted_offers,
             peer_cert_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             master_signing_key,
@@ -439,20 +426,8 @@ impl Processor {
                 self.swarm.respond_logged(response_channel, reply);
             }
             Message::RestoreRequest(req) => {
-                let block_id = req.source_block_id;
                 let reply = match self.handle_restore_request_inner(from_master, req).await {
                     Ok(resp) => Message::RestoreResponse(resp),
-                    Err(ProcessorError::EscrowDenied { denial, .. }) => {
-                        Message::RestoreDenied(RestoreDeniedMsg {
-                            v: 1,
-                            source_block_id: block_id,
-                            reason: "escrow check failed".to_string(),
-                            current_trust: denial.current_trust,
-                            needed_trust: denial.needed_trust,
-                            restore_budget_gb: denial.restore_budget_gb,
-                            timestamp: Timestamp::now(),
-                        })
-                    }
                     Err(e) => {
                         warn!(device = %from_device, err = %e, "processor: RestoreRequest handler failed");
                         return Ok(());
@@ -500,13 +475,6 @@ impl Processor {
                 self.swarm
                     .respond_logged(response_channel, Message::Ack(AckMsg { v: 1 }));
             }
-            Message::RestoreDenied(denied) => {
-                if let Err(e) = self.handle_restore_denied(from_master, denied).await {
-                    warn!(device = %from_device, err = %e, "processor: RestoreDenied handler failed");
-                }
-                self.swarm
-                    .respond_logged(response_channel, Message::Ack(AckMsg { v: 1 }));
-            }
             Message::PeerAnnounce(pa) => {
                 if let Err(e) = self.handle_peer_announce(pa).await {
                     warn!(device = %from_device, err = %e, "processor: PeerAnnounce handler failed");
@@ -548,10 +516,17 @@ impl Processor {
 
 /// Mark a placement as Lost. Idempotent: no-op if already Lost or Deleting.
 /// Returns true if the record was changed.
+///
+/// `evidence_at` is the signed `timestamp` of the DropNotice that caused the call: the
+/// 4R pair ledger counts the transition as an ANNOUNCED drop only if that notice is strictly
+/// younger than the placement's episode (У-4, [`persist_placement_change`]). The transition
+/// itself does not depend on it (an old re-delivered notice still marks a fresh placement
+/// Lost — known bug Ф-1, not fixed here: AC-7).
 pub(crate) fn mark_placement_lost(
     db: &Db,
     block_id: &viaticum_core::types::SourceBlockId,
     holder_id: &DeviceId,
+    evidence_at: Timestamp,
 ) -> Result<bool, ProcessorError> {
     let placement = match db.get_placement(block_id, holder_id)? {
         Some(p) => p,
@@ -569,10 +544,16 @@ pub(crate) fn mark_placement_lost(
         return Ok(false);
     }
 
-    let mut updated = placement;
+    let mut updated = placement.clone();
     updated.status = PlacementStatus::Lost;
     updated.consecutive_misses = 0;
-    db.upsert_placement(&updated)?;
+    persist_placement_change(
+        db,
+        &placement,
+        &updated,
+        Some(LossCause::DropNotice),
+        evidence_at,
+    )?;
 
     info!(
         block_id = %block_id,
@@ -581,6 +562,137 @@ pub(crate) fn mark_placement_lost(
     );
 
     Ok(true)
+}
+
+/// Persist a placement status change and, if it is the first loss of a HELD placement
+/// ([`viaticum_core::pair_ledger::drop_event_for`]), record the drop event for the 4R pair
+/// ledger in the SAME write transaction (У-4, Д-K). Returns the kind recorded, if any.
+///
+/// The placement write is exactly what `Db::upsert_placement(updated)` did before (AC-7):
+/// without an event it IS that call; with one, `DbWriteTxn::upsert_placement` (same table
+/// writes, same hot-cache delta, applied after commit) plus `record_drop_event`, committed
+/// together — the transition and its event exist together or not at all. The recorder can
+/// never block the transition: an unresolvable master (no `PeerRecord`, placeholder, or a
+/// failed read) only drops the EVENT, with a `warn!`/`error!`.
+///
+/// Log lines — a contract with `experiments/local_ledger_drop_test.sh`, under the fixed
+/// target `viaticum::ledger` at debug (enable with `RUST_LOG=info,viaticum::ledger=debug`):
+/// `pair-ledger drop event` (`kind master block_id holder`) and `pair-ledger drop not
+/// counted` (`reason cause block_id holder`, only for a changed status landing in
+/// `Lost`/`PresumedLost` — not on every `Uncertain`). Both are printed only AFTER a
+/// successful commit, so every event line is an event in the database.
+pub(crate) fn persist_placement_change(
+    db: &Db,
+    before: &SymbolPlacement,
+    updated: &SymbolPlacement,
+    cause: Option<LossCause>,
+    evidence_at: Timestamp,
+) -> Result<Option<DropKind>, viaticum_core::db::DbError> {
+    let decision = match cause {
+        Some(cause) if updated.status != before.status => Some((
+            cause,
+            drop_event_for(
+                before.status,
+                updated.status,
+                cause,
+                evidence_at,
+                before.placed_at,
+            ),
+        )),
+        _ => None,
+    };
+
+    let (cause, kind) = match decision {
+        Some((cause, Ok(kind))) => (cause, kind),
+        Some((cause, Err(reason))) => {
+            db.upsert_placement(updated)?;
+            if matches!(
+                updated.status,
+                PlacementStatus::Lost | PlacementStatus::PresumedLost
+            ) {
+                debug!(
+                    target: "viaticum::ledger",
+                    reason = ?reason,
+                    cause = ?cause,
+                    block_id = %updated.source_block_id,
+                    holder = %updated.holder_id,
+                    "pair-ledger drop not counted"
+                );
+            }
+            return Ok(None);
+        }
+        None => {
+            db.upsert_placement(updated)?;
+            return Ok(None);
+        }
+    };
+
+    // Resolve the master BEFORE opening the write transaction (a read inside it would not
+    // see anything the transaction changes anyway, and redb allows one writer at a time).
+    let master = match ledger_master_for_device(db, &updated.holder_id) {
+        Ok(Some(master)) => master,
+        Ok(None) => {
+            db.upsert_placement(updated)?;
+            warn!(
+                target: "viaticum::ledger",
+                kind = ?kind,
+                cause = ?cause,
+                block_id = %updated.source_block_id,
+                holder = %updated.holder_id,
+                "pair-ledger drop not recorded: the holder device has no known master"
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            db.upsert_placement(updated)?;
+            error!(
+                target: "viaticum::ledger",
+                kind = ?kind,
+                block_id = %updated.source_block_id,
+                holder = %updated.holder_id,
+                err = %e,
+                "pair-ledger drop not recorded: master lookup failed"
+            );
+            return Ok(None);
+        }
+    };
+
+    // INVARIANT (Д-K): the placement change and its event are ONE write transaction. The
+    // placement status IS the dedup key — "already counted" means "no longer Alive/Uncertain"
+    // — so the two must become visible together. Split them and a crash (or a failed write)
+    // in the window between the commits breaks the count in either direction:
+    //   * placement first, event second: the transition is on disk, the event is not, and no
+    //     re-delivery can bring it back (the placement is already Lost) — a permanent
+    //     UNDER-count;
+    //   * event first, placement second: the event is on disk, the placement is still held,
+    //     so the next re-delivery of the same notice (the mailbox hands it out on every poll
+    //     for its whole TTL) counts it AGAIN — an OVER-count.
+    // No unit test guards this (there is no failure injection between two writes of one
+    // transaction without a test-only production API); it is stated here and in the Cannot
+    // close of `experiments/local_ledger_drop_test.sh`. Do not split it.
+    let mut txn = db.write_txn()?;
+    txn.upsert_placement(updated)?;
+    txn.record_drop_event(&master, kind)?;
+    if let Err(e) = txn.commit() {
+        error!(
+            target: "viaticum::ledger",
+            kind = ?kind,
+            block_id = %updated.source_block_id,
+            holder = %updated.holder_id,
+            err = %e,
+            "pair-ledger drop event: transaction failed, neither the placement change nor the event was written"
+        );
+        return Err(e);
+    }
+    debug!(
+        target: "viaticum::ledger",
+        kind = ?kind,
+        master = %master,
+        block_id = %updated.source_block_id,
+        holder = %updated.holder_id,
+        "pair-ledger drop event"
+    );
+    Ok(Some(kind))
 }
 
 /// Recompute `current_alive` and `current_reliability` for a block from DB state,

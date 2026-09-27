@@ -9,7 +9,10 @@
 #   has k_eff symbols, and the file is restored again.
 # Intent: restore-i1 (Phase 4), restore-i2 (Phases 4-5: the "some holders offline,
 #   restore still passes" half only), restore-i9 (partial: restore right after the
-#   delete).
+#   delete), restore-i6 (no [escrow] override; sensitive to the removed holder gate —
+#   budget = held bytes x scaled age / 7 days < c x 65535 requested — only while both
+#   restores finish < ~600 s after placement at TIME_SCALE=1000, symbols here are
+#   ~62 KB; the run needs ~20 s. No in-script timing guard: local_e2e_test has one).
 # Proves: with one holder dead and the source gone, the block decodes from the
 #   survivors' symbols and the restored file is byte-identical (sha256); surviving
 #   holders log serving it; restore does not hang on the dead holder beyond the deadline;
@@ -151,8 +154,6 @@ enabled = true
 bind = "127.0.0.1:0"
 [storage]
 disk_reserve_gb = 0.0
-[escrow]
-k_factor = 0.001
 CFGEOF
 done
 

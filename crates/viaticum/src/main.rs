@@ -68,6 +68,13 @@ async fn main() -> ExitCode {
                     println!("Public key: {}", hex_encode(&keyfile.identity_pub));
                     println!("Device ID:  {}", hex_encode(&keyfile.device_id));
                     println!("\nMnemonic (SAVE THIS):\n  {}", keyfile.mnemonic);
+                    if mnemonic.is_some() && !*new_device {
+                        println!(
+                            "\nIf you are recovering a lost machine, stop here and use \
+                             'viaticum dr' instead: a node started from an empty catalog does \
+                             not bring your files back."
+                        );
+                    }
                 }
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -80,14 +87,21 @@ async fn main() -> ExitCode {
             peer,
             data_dir,
         } => {
-            tracing_subscriber::fmt::init();
+            // Logs go to stderr (RUST_LOG, default errors only); stdout is DR's report.
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .init();
             let dr_dir = match data_dir {
                 Some(d) => viaticum::cli::expand_data_dir(Some(d)),
                 None => global_dir.clone(),
             };
-            if let Err(e) =
-                viaticum::daemon::dr::run_dr(mnemonic.clone(), peer.clone(), dr_dir).await
-            {
+            let opts = viaticum::daemon::dr::DrOptions {
+                mnemonic: mnemonic.clone(),
+                peers: peer.clone(),
+                data_dir: dr_dir,
+            };
+            if let Err(e) = viaticum::daemon::dr::run_dr(opts).await {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
