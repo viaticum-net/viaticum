@@ -217,6 +217,9 @@ pub enum Command {
         /// Data directory to restore into (default: global --data-dir)
         #[arg(long)]
         data_dir: Option<String>,
+        /// Restore this catalog (hex prefix, at least 8 characters) when DR finds several
+        #[arg(long)]
+        catalog: Option<String>,
     },
 
     /// Open the web UI in the default browser

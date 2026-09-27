@@ -1128,3 +1128,29 @@ fn an_absurd_scale_saturates_the_age_instead_of_wrapping() {
     // And scale 0 is treated as 1, like every other clock in the tree.
     assert!(p.confirmed_at(Timestamp(12), 0, window));
 }
+
+// ── DN-1: SeenSignedLetter (applied signed letters by signature) ─────────────
+
+#[test]
+fn seen_signed_letter_round_trips_cbor() {
+    // DN1-14. The row of `seen_signed_letters` survives its own encoding unchanged.
+    let rec = SeenSignedLetter {
+        class: SignedLetterClass::DropNotice,
+        first_seen: Timestamp(1_700_000_000),
+        forget_after: Timestamp(1_700_000_000 + 2 * 1_209_600),
+    };
+    let bytes = to_cbor_bytes(&rec);
+    let decoded: SeenSignedLetter =
+        from_cbor_bytes(&bytes).expect("a row this tree writes decodes");
+    assert_eq!(decoded, rec);
+}
+
+#[test]
+fn signed_letter_class_is_encoded_by_variant_name() {
+    // DN1-14b. The class is stored as its name (CBOR text), so line B can add variants without
+    // breaking rows written today — and renaming `DropNotice` would break them (this pins it).
+    let bytes = to_cbor_bytes(&SignedLetterClass::DropNotice);
+    let mut want = vec![0x60 + 10u8]; // CBOR text string, length 10
+    want.extend_from_slice(b"DropNotice");
+    assert_eq!(bytes, want);
+}

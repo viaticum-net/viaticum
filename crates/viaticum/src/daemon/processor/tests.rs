@@ -4513,10 +4513,12 @@ async fn a_notice_for_a_deleting_or_missing_placement_records_nothing() {
 
 #[tokio::test]
 async fn a_notice_not_younger_than_the_current_placement_is_not_counted_but_still_marks_it_lost() {
-    // DP-6 (4r-i29; Ф-1 pinned, not fixed). An old notice re-delivered after repair put the
-    // block back on the same holder: the transition still happens (existing behaviour, AC-7),
-    // but the evidence predates the episode — in the same second too (review of intent
-    // BLOCK-1: at time_scale 100 000 the loss, the repair and the new Alive fit in one second).
+    // DP-6 (4r-i29). The FIRST delivery of an old notice after repair put the block back on
+    // the same holder: the transition still happens (existing behaviour, AC-7; DN-1 Д-DN1-2 —
+    // time is not part of the rule), but the evidence predates the episode — in the same second
+    // too (review of intent BLOCK-1: at time_scale 100 000 the loss, the repair and the new
+    // Alive fit in one second). Re-deliveries of the same notice are deduplicated (DN-1, see
+    // `tests/drop_notice_dedup.rs`).
     for (label, before) in [("older", 5u64), ("same second", 0u64)] {
         let f = drop_fixture(0x3D, PlacementStatus::Alive, None);
         let ts = Timestamp(f.placed_at.0 - before);
@@ -4526,7 +4528,7 @@ async fn a_notice_not_younger_than_the_current_placement_is_not_counted_but_stil
         assert_eq!(
             f.status(),
             PlacementStatus::Lost,
-            "{label}: Ф-1 — the old notice still marks the new placement Lost"
+            "{label}: the first delivery of an old notice still marks it Lost; re-deliveries are deduplicated (DN-1)"
         );
         assert!(f.pending().is_empty(), "{label}: but it is not a new drop");
     }
@@ -4628,3 +4630,6 @@ async fn a_notice_inside_the_owners_delete_cooldown_is_still_the_friends_drop() 
 
     assert_eq!(f.announced_for(f.ledger_master), 1);
 }
+
+// DN-1: one notice — one application (spec f1_stale_drop_notice.md, DN1-1..DN1-18).
+mod drop_notice_dedup;

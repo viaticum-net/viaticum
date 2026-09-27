@@ -443,6 +443,7 @@ impl Scheduler {
             &updated,
             loss_cause,
             pending.issued_at,
+            None,
         )?;
 
         if updated.status != old_status {
@@ -1013,6 +1014,7 @@ impl Scheduler {
                 &updated,
                 Some(LossCause::PosTimeout),
                 challenge.issued_at,
+                None,
             ) {
                 error!(
                     block_id = %block_id,

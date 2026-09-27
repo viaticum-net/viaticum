@@ -515,6 +515,42 @@ impl PendingDrops {
     }
 }
 
+/// Which kind of signed letter a row of `seen_signed_letters` remembers (DN-1). Extensible: line
+/// B may add `Delete` / `Revocation` without changing the API. Encoded by serde as the variant
+/// NAME (a CBOR text string), so adding variants never breaks decoding of existing rows —
+/// renaming a variant would, and `types::tests` pins the encoding of the existing ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SignedLetterClass {
+    /// A holder's `SymbolDropNoticeMsg` applied by the owner (4r-i47).
+    DropNotice,
+}
+
+/// A signed letter this node has already applied (DN-1). Key: the letter's 64-byte signature
+/// (table `seen_signed_letters`) — looked up only AFTER the letter passed `verify_strict`
+/// against its signer. The key is canonical because ed25519-dalek 2.x (without
+/// `legacy_compatibility`) rejects a non-canonical S already in `verify`; `verify_strict` adds
+/// the rejection of small-order R / public keys.
+///
+/// The mechanism is a filter of byte-identical repeats of a signed payload: a mailbox
+/// re-delivery of the same letter carries the same payload and (ed25519 being deterministic)
+/// the same signature, while a NEW letter — e.g. the same holder dropping the same block again,
+/// with a new `timestamp` — has a new signature and is applied (4r-i47, 4r-i48). This matches
+/// the mailbox model (mailbox-i26): the envelope does not authenticate `msg_id` or times, the
+/// payload signature does. Times are deliberately NOT compared for DropNotice: the holder's
+/// clock stamps the letter, the owner's clock stamps `placed_at`; a holder clock running behind
+/// would make a genuine new drop look old and swallow it.
+///
+/// Owner-local; deliberately NOT in the SystemState snapshot (4r-i51): after DR the table is
+/// empty and a live letter costs at most one extra application before it is remembered again.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SeenSignedLetter {
+    pub class: SignedLetterClass,
+    /// When this node first applied the letter (its own clock).
+    pub first_seen: Timestamp,
+    /// The row is forgotten once `now >= forget_after` (expiry index, pruned on insert).
+    pub forget_after: Timestamp,
+}
+
 /// 4R pair-ledger accumulators for ONE economic pair: this node and one **master
 /// identity**. Key: [`IdentityPub`], in its own redb table — NOT a field of
 /// [`PeerRecord`].

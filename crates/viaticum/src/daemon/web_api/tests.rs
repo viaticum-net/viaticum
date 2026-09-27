@@ -74,6 +74,7 @@ fn state_with(db: Db, jobs: RestoreJobs) -> (Arc<DaemonState>, mpsc::Receiver<Re
         shutdown_token: CancellationToken::new(),
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: None,
+        missing_sources: Default::default(),
     });
     (state, restore_rx)
 }

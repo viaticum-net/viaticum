@@ -54,6 +54,7 @@ pass() { echo "  PASS: $1"; ((PASS++)) || true; }
 fail() { echo "  FAIL: $1"; ((FAIL++)) || true; }
 
 cleanup() {
+    local rc=$?
     echo ""
     echo "=== Cleanup ==="
     for pid in "${PIDS[@]}"; do
@@ -64,7 +65,13 @@ cleanup() {
         kill -9 "$pid" 2>/dev/null || true
     done
     echo "  Killed ${#PIDS[@]} daemon processes"
-    echo "  Test dir: $TEST_DIR (kept for inspection)"
+    # ~1 GB per run on a quota'd tmpfs: keep it only when the run failed.
+    if [ "$rc" -eq 0 ]; then
+        rm -rf "$TEST_DIR"
+        echo "  Test dir removed (pass)"
+    else
+        echo "  Test dir: $TEST_DIR (kept for inspection, exit $rc)"
+    fi
 }
 trap cleanup EXIT
 

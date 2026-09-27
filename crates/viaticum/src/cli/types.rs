@@ -156,6 +156,23 @@ pub struct StatusData {
     /// takes space from friends' data (restore-i18).
     #[serde(default)]
     pub restore_staging_squeezes_holdings: bool,
+    /// dr-i9: unix secs of this node's last recovery-pointer publication accepted by
+    /// ≥ 1 postman; 0 = never (DR from the phrase would not find this catalog yet).
+    #[serde(default)]
+    pub dr_pointer_published_at: u64,
+    /// Live files in the catalog that publication restores.
+    #[serde(default)]
+    pub dr_pointer_files: u32,
+    /// Postmen that accepted that publication.
+    #[serde(default)]
+    pub dr_pointer_acks: u32,
+    /// Hex of this DB's catalog history id; "" before the node minted one.
+    #[serde(default)]
+    pub catalog_lineage: String,
+    /// dr-i11: live catalog files whose path does not exist on this machine (not
+    /// re-protected until they are back).
+    #[serde(default)]
+    pub files_without_source: u32,
 }
 
 /// Peer summary shown in `viaticum status`.

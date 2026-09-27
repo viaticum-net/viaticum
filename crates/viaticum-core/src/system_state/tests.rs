@@ -723,6 +723,14 @@ fn sample_diff_refs() -> Vec<BlockRef> {
     }]
 }
 
+fn sample_catalog() -> CatalogSummary {
+    CatalogSummary {
+        lineage: CatalogLineageId([0x5au8; 16]),
+        publisher: DeviceId([0x6bu8; 32]),
+        files: 3,
+    }
+}
+
 #[test]
 fn self_pointer_signs_and_verifies() {
     let mk = master();
@@ -733,6 +741,7 @@ fn self_pointer_signs_and_verifies() {
         sample_base_ref(),
         sample_diff_refs(),
         Timestamp(1234),
+        sample_catalog(),
     );
     assert_eq!(p.generation, 5);
     verify_self_pointer(&p, &id).expect("freshly signed pointer must verify");
@@ -748,6 +757,7 @@ fn self_pointer_tamper_fails_verify() {
         sample_base_ref(),
         sample_diff_refs(),
         Timestamp(1234),
+        sample_catalog(),
     );
 
     let mut t_gen = p.clone();
@@ -784,7 +794,14 @@ fn self_pointer_wrong_signer_fails() {
     let mk = master();
     let other = crate::cluster::derive_master_key(&[8u8; 32]).unwrap();
     let other_id = crate::cluster::master_identity(&other);
-    let p = sign_self_pointer(&mk, 1, sample_base_ref(), vec![], Timestamp(1));
+    let p = sign_self_pointer(
+        &mk,
+        1,
+        sample_base_ref(),
+        vec![],
+        Timestamp(1),
+        sample_catalog(),
+    );
     assert!(
         verify_self_pointer(&p, &other_id).is_err(),
         "pointer signed by a different master must not verify"
@@ -801,10 +818,164 @@ fn self_pointer_cbor_roundtrip() {
         sample_base_ref(),
         sample_diff_refs(),
         Timestamp(9000),
+        sample_catalog(),
     );
     let bytes = crate::types::to_cbor_bytes(&p);
     let decoded: SelfPointer = crate::types::from_cbor_bytes(&bytes).unwrap();
     assert_eq!(decoded.generation, 7);
     assert_eq!(decoded.base.block_id, p.base.block_id);
     verify_self_pointer(&decoded, &id).expect("decoded pointer must still verify");
+}
+
+#[test]
+fn self_pointer_signature_covers_catalog_summary() {
+    let mk = master();
+    let id = crate::cluster::master_identity(&mk);
+    let p = sign_self_pointer(
+        &mk,
+        5,
+        sample_base_ref(),
+        sample_diff_refs(),
+        Timestamp(1234),
+        sample_catalog(),
+    );
+    verify_self_pointer(&p, &id).expect("untampered pointer verifies");
+
+    let mut t = p.clone();
+    t.catalog.files = 300;
+    assert!(verify_self_pointer(&t, &id).is_err(), "files is signed");
+
+    let mut t = p.clone();
+    t.catalog.lineage = CatalogLineageId([0u8; 16]);
+    assert!(verify_self_pointer(&t, &id).is_err(), "lineage is signed");
+
+    let mut t = p.clone();
+    t.catalog.publisher = DeviceId([0u8; 32]);
+    assert!(verify_self_pointer(&t, &id).is_err(), "publisher is signed");
+}
+
+#[test]
+fn self_pointer_v1_domain_signature_is_rejected() {
+    // A pointer signed the pre-B2 way (domain -v1, no catalog in the payload) must not
+    // verify, even if someone attaches a catalog summary to it afterwards.
+    use ed25519_dalek::Signer;
+    let mk = master();
+    let id = crate::cluster::master_identity(&mk);
+    let base = sample_base_ref();
+    let created_at = Timestamp(77);
+    let mut payload = b"viaticum-self-pointer-v1".to_vec();
+    payload.extend_from_slice(&crate::types::to_cbor_bytes(&(
+        1u32,
+        &base,
+        &Vec::<BlockRef>::new(),
+        created_at,
+    )));
+    let sig = mk.sign(&payload).to_bytes();
+    let forged = SelfPointer {
+        generation: 1,
+        base,
+        diffs: vec![],
+        created_at,
+        catalog: sample_catalog(),
+        signature: sig,
+    };
+    assert!(verify_self_pointer(&forged, &id).is_err());
+}
+
+// ============================================================
+// merge_live_peer (dr-i18)
+// ============================================================
+
+fn peer(device: u8, addrs: &[&str], last_seen: u64) -> PeerRecord {
+    PeerRecord {
+        device_id: DeviceId([device; 32]),
+        master_identity: IdentityPub([device; 32]),
+        trust_p: 0.9,
+        trust_i: 0.8,
+        trust_s: 1.5,
+        bytes_we_store_for_peer: 111,
+        bytes_peer_stores_for_us: 222,
+        first_seen: Timestamp(10),
+        last_seen: Timestamp(last_seen),
+        revoked_device_pub_keys: vec![[9u8; 32]],
+        addrs: addrs.iter().map(|a| a.to_string()).collect(),
+        x25519_pub: None,
+        avail_ewma: 0.7,
+        last_avail_sample: 33,
+    }
+}
+
+#[test]
+fn merge_live_peer_puts_live_addrs_first_and_keeps_snapshot_history() {
+    let snapshot = peer(
+        1,
+        &["/ip4/10.0.0.1/tcp/4001", "/ip4/10.0.0.2/tcp/4001"],
+        100,
+    );
+    let mut live = peer(1, &["/ip4/10.0.0.9/tcp/5001", "/ip4/10.0.0.2/tcp/4001"], 50);
+    live.trust_p = 0.1;
+    live.trust_i = 0.0;
+    live.trust_s = 1.0;
+    live.bytes_we_store_for_peer = 0;
+    live.bytes_peer_stores_for_us = 0;
+    live.first_seen = Timestamp(900);
+    live.revoked_device_pub_keys = vec![];
+    live.avail_ewma = 0.1;
+    live.last_avail_sample = 999;
+
+    let m = merge_live_peer(&snapshot, &live);
+    assert_eq!(
+        m.addrs,
+        vec![
+            "/ip4/10.0.0.9/tcp/5001".to_string(),
+            "/ip4/10.0.0.2/tcp/4001".to_string(),
+            "/ip4/10.0.0.1/tcp/4001".to_string(),
+        ]
+    );
+    assert_eq!(m.trust_p, 0.9);
+    assert_eq!(m.trust_i, 0.8);
+    assert_eq!(m.trust_s, 1.5);
+    assert_eq!(m.bytes_we_store_for_peer, 111);
+    assert_eq!(m.bytes_peer_stores_for_us, 222);
+    assert_eq!(m.first_seen, Timestamp(10));
+    assert_eq!(m.revoked_device_pub_keys, vec![[9u8; 32]]);
+    assert_eq!(m.avail_ewma, 0.7);
+    assert_eq!(m.last_avail_sample, 33);
+}
+
+#[test]
+fn merge_live_peer_keeps_snapshot_master_when_live_is_zero() {
+    let snapshot = peer(1, &[], 100);
+    let mut live = peer(1, &[], 100);
+    live.master_identity = IdentityPub([0u8; 32]);
+    assert_eq!(
+        merge_live_peer(&snapshot, &live).master_identity,
+        IdentityPub([1u8; 32])
+    );
+    live.master_identity = IdentityPub([7u8; 32]);
+    assert_eq!(
+        merge_live_peer(&snapshot, &live).master_identity,
+        IdentityPub([7u8; 32])
+    );
+}
+
+#[test]
+fn merge_live_peer_takes_max_last_seen_and_live_x25519() {
+    let mut snapshot = peer(1, &[], 100);
+    snapshot.x25519_pub = Some([1u8; 32]);
+    let mut live = peer(1, &[], 500);
+    live.x25519_pub = Some([2u8; 32]);
+    let m = merge_live_peer(&snapshot, &live);
+    assert_eq!(m.last_seen, Timestamp(500));
+    assert_eq!(m.x25519_pub, Some([2u8; 32]));
+
+    live.x25519_pub = None;
+    live.last_seen = Timestamp(50);
+    let m = merge_live_peer(&snapshot, &live);
+    assert_eq!(m.last_seen, Timestamp(100));
+    assert_eq!(
+        m.x25519_pub,
+        Some([1u8; 32]),
+        "snapshot key kept when live has none"
+    );
 }
