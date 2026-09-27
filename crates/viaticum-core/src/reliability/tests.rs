@@ -1,8 +1,8 @@
 use super::{
     BlockReliabilityInput, HolderCandidate, HolderReliabilityInput, ReliabilityError,
     binomial_survival, block_reliability, build_report, commitment_to_survival_prob,
-    correlated_recovery_prob, file_reliability, per_holder_impact, solve_n_for_target,
-    solve_placement_for_target, target_reliability, weighted_mean_trust,
+    correlated_recovery_prob, file_reliability, meets_target, per_holder_impact,
+    solve_n_for_target, solve_placement_for_target, target_reliability, weighted_mean_trust,
 };
 use crate::commitment::CommitmentScore;
 use crate::constants::{MAX_OVERHEAD_FACTOR, MIN_REDUNDANCY};
@@ -1313,4 +1313,69 @@ fn solver_large_k_eff_spreads_not_replicates() {
         total < k_eff * 3,
         "spread overhead should be modest, total={total}"
     );
+}
+
+// ============================================================
+// Tests: meets_target (repair-i3)
+// ============================================================
+
+fn five_full_copies_at_p09(k_eff: u32) -> BlockReliabilityInput {
+    BlockReliabilityInput {
+        block_id: SourceBlockId([7u8; 32]),
+        k_eff,
+        holders: (0..5u8)
+            .map(|i| HolderReliabilityInput {
+                holder_id: DeviceId([i + 1; 32]),
+                alive_symbols: k_eff,
+                survival_prob: 0.9,
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn meets_target_accepts_five_full_copies_at_p09_for_importance_one() {
+    // Mathematically 1 - 0.1^5 == 1 - 1e-5 == target(1.0); in f64 the DP lands one ulp
+    // below, which the raw `>=` used to read as "below target" (repair-i3).
+    let current = block_reliability(&five_full_copies_at_p09(12)).unwrap();
+    let target = target_reliability(1.0);
+    assert!(
+        meets_target(current, target),
+        "current={current:e} target={target:e}"
+    );
+}
+
+#[test]
+fn meets_target_true_when_current_equals_target() {
+    for imp in [0.0, 0.2, 0.65, 1.0] {
+        let t = target_reliability(imp);
+        assert!(meets_target(t, t), "importance {imp}");
+    }
+}
+
+#[test]
+fn meets_target_false_when_failure_exceeds_target_beyond_tolerance() {
+    let target = 1.0 - 1e-5;
+    let current = 1.0 - 1e-5 * (1.0 + 1e-5);
+    assert!(!meets_target(current, target));
+}
+
+#[test]
+fn meets_target_false_when_current_is_nan() {
+    assert!(!meets_target(f64::NAN, target_reliability(1.0)));
+    assert!(!meets_target(0.9, f64::NAN));
+}
+
+#[test]
+fn solve_placement_reached_target_agrees_with_meets_target_on_boundary() {
+    // 5 candidates at p = 0.9, small k_eff: the only way to reach 1-1e-5 is 5 full
+    // copies, which sit exactly on the boundary.
+    let k_eff = 3;
+    let holders: Vec<HolderCandidate> = (0..5)
+        .map(|_| HolderCandidate { survival_prob: 0.9 })
+        .collect();
+    let plan =
+        solve_placement_for_target(k_eff, &holders, target_reliability(1.0), 30, 10).unwrap();
+    assert_eq!(plan.per_holder, vec![k_eff; 5]);
+    assert!(plan.reached_target);
 }

@@ -366,6 +366,8 @@ pub(crate) fn dr_readiness(db: &viaticum_core::db::Db) -> DrReadiness {
 /// reconstruct it without the local source. Conservative — returns false when the
 /// version is not backed up, the block record is missing, or it is below target
 /// (a target of 0.0 is the pre-migration sentinel and never counts as safe).
+/// "At target" is `reliability::meets_target` — the one tolerance-aware definition
+/// (repair-i3).
 fn compute_is_safe_to_delete(state: &DaemonState, file: &FileRecord) -> bool {
     let Some(version) = file.versions.last() else {
         return false;
@@ -375,7 +377,11 @@ fn compute_is_safe_to_delete(state: &DaemonState, file: &FileRecord) -> bool {
     }
     match state.db.get_source_block(&version.source_block_id) {
         Ok(Some(block)) => {
-            block.target_reliability > 0.0 && block.current_reliability >= block.target_reliability
+            block.target_reliability > 0.0
+                && viaticum_core::reliability::meets_target(
+                    block.current_reliability,
+                    block.target_reliability,
+                )
         }
         _ => false,
     }
@@ -1067,7 +1073,7 @@ const BUCKET_DEFS: [BucketDef; 5] = [
 pub(crate) fn compute_importance_buckets(
     source_blocks: &[viaticum_core::types::SourceBlockRecord],
 ) -> Vec<viaticum_core::types::ImportanceBucketStats> {
-    use viaticum_core::reliability::target_reliability;
+    use viaticum_core::reliability::{meets_target, target_reliability};
     use viaticum_core::types::{ImportanceBucketStats, SourceBlockStatus};
 
     // Accumulators: (count, sum_of_current_reliability)
@@ -1110,7 +1116,7 @@ pub(crate) fn compute_importance_buckets(
                     block_count: count,
                     mean_p_recoverable: mean,
                     target_p,
-                    status: if mean >= target_p {
+                    status: if meets_target(mean, target_p) {
                         "healthy".to_string()
                     } else {
                         "degraded".to_string()

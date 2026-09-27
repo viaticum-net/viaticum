@@ -873,6 +873,27 @@ pub(crate) fn recompute_and_persist_block_cached_fields(db: &Db, block_id: &Sour
             err = %e,
             "placement hook: update_block_cached_fields failed"
         );
+        return;
+    }
+
+    // 6. Log only when the "at target" verdict flips (low volume): the owner's own
+    // judgement "this block is at its target" becomes observable (repair-i3), with the
+    // raw numbers that decided it.
+    let at_target = |current: f64| {
+        block.target_reliability > 0.0
+            && viaticum_core::reliability::meets_target(current, block.target_reliability)
+    };
+    let was_at_target = at_target(block.current_reliability);
+    let now_at_target = at_target(new_reliability);
+    if was_at_target != now_at_target {
+        info!(
+            block_id = %block_id,
+            current_alive = new_current_alive,
+            current_reliability = new_reliability,
+            target_reliability = block.target_reliability,
+            at_target = now_at_target,
+            "placement hook: block target status changed"
+        );
     }
 }
 

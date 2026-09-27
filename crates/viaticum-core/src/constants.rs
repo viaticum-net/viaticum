@@ -308,6 +308,12 @@ pub const DEFAULT_ANNUAL_CHURN_RATE: f64 = 0.30;
 /// 99.0% = two nines. Blocks below this get flagged in ReliabilityReport.
 pub const RELIABILITY_REPAIR_THRESHOLD: f64 = 0.99;
 
+/// Relative tolerance, in FAILURE-probability space, for "block reliability meets
+/// its target". Absorbs f64 rounding of the holder-correlated DP (≈1e-10 relative at
+/// the strictest target 1-1e-5) while staying orders of magnitude below any real
+/// reliability step (one trust bucket, one PoS miss). See `reliability::meets_target`.
+pub const RELIABILITY_TARGET_REL_TOL: f64 = 1e-6;
+
 /// Small N threshold: use exact binomial CDF for N < this value, normal
 /// approximation for N >= this value.
 pub const BINOMIAL_EXACT_THRESHOLD: u32 = 100;

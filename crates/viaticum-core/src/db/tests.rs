@@ -2652,7 +2652,7 @@ fn block_cooldown_does_not_survive_reopen() {
     let bid = block_id(1);
     {
         let db = Db::open(&tmp_path).unwrap();
-        db.set_block_cooldown(&bid, Some(Timestamp(5000)), 0xABCD);
+        db.set_block_cooldown(&bid, Some(Timestamp(5000)), 0xABCD, false);
         assert_eq!(db.block_cooldown(&bid).last_pool_signature, 0xABCD);
     }
     let db2 = Db::open(&tmp_path).unwrap();
@@ -2671,6 +2671,7 @@ fn next_work_item_returns_none_when_db_empty() {
         .next_work_item(
             1.5,
             std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
             Timestamp(9999),
             0xABCD,
         )
@@ -2699,7 +2700,13 @@ fn next_work_item_returns_none_when_all_blocks_at_target_reliability() {
     db.upsert_source_block(&c).unwrap();
 
     let result = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap();
     assert!(result.is_none());
 }
@@ -2715,7 +2722,13 @@ fn next_work_item_returns_none_when_no_active_blocks_need_work() {
     db.upsert_source_block(&b).unwrap();
 
     let result = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap();
     assert!(result.is_none());
 }
@@ -2736,7 +2749,13 @@ fn next_work_item_picks_highest_priority() {
     db.upsert_source_block(&c).unwrap();
 
     let result = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -2759,7 +2778,13 @@ fn next_work_item_uses_coef_from_param() {
     db.upsert_source_block(&b).unwrap();
 
     let result_coef0 = db
-        .next_work_item(0.0, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            0.0,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -2769,7 +2794,13 @@ fn next_work_item_uses_coef_from_param() {
     );
 
     let result_coef5 = db
-        .next_work_item(5.0, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            5.0,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -2788,14 +2819,20 @@ fn next_work_item_tiebreaks_by_last_attempted_at_ascending() {
     let b = make_block_with(2, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999);
     let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 5, Some(10), 0.4, 0.999);
     db.upsert_source_block(&a).unwrap();
-    db.set_block_cooldown(&a.block_id, Some(Timestamp(1000)), 0);
+    db.set_block_cooldown(&a.block_id, Some(Timestamp(1000)), 0, false);
     db.upsert_source_block(&b).unwrap();
-    db.set_block_cooldown(&b.block_id, Some(Timestamp(500)), 0);
+    db.set_block_cooldown(&b.block_id, Some(Timestamp(500)), 0, false);
     db.upsert_source_block(&c).unwrap();
-    db.set_block_cooldown(&c.block_id, Some(Timestamp(2000)), 0);
+    db.set_block_cooldown(&c.block_id, Some(Timestamp(2000)), 0, false);
 
     let result = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -2813,11 +2850,17 @@ fn next_work_item_never_attempted_beats_recently_attempted() {
     let a = make_block_with(1, SourceBlockStatus::Active, 0.7, 3, Some(10), 0.3, 0.999);
     let b = make_block_with(2, SourceBlockStatus::Active, 0.7, 3, Some(10), 0.3, 0.999);
     db.upsert_source_block(&a).unwrap();
-    db.set_block_cooldown(&a.block_id, Some(Timestamp(0)), 0);
+    db.set_block_cooldown(&a.block_id, Some(Timestamp(0)), 0, false);
     db.upsert_source_block(&b).unwrap();
 
     let result = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -2855,11 +2898,23 @@ fn next_work_item_deterministic_tiebreak_by_block_id() {
     db.upsert_source_block(&b).unwrap();
 
     let result1 = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap()
         .unwrap();
     let result2 = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -2884,7 +2939,13 @@ fn next_work_item_excludes_deleting_blocks() {
     db.upsert_source_block(&b).unwrap();
 
     let result = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -2901,11 +2962,17 @@ fn next_work_item_excludes_blocks_in_cooldown() {
 
     let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999);
     db.upsert_source_block(&a).unwrap();
-    db.set_block_cooldown(&a.block_id, Some(Timestamp(990)), 0xABCD);
+    db.set_block_cooldown(&a.block_id, Some(Timestamp(990)), 0xABCD, false);
 
     // Elapsed: 10s < 30s cooldown, same pool sig → in cooldown.
     let result = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0xABCD)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0xABCD,
+        )
         .unwrap();
     assert!(result.is_none(), "Block A is in cooldown");
 }
@@ -2916,13 +2983,14 @@ fn next_work_item_includes_block_after_cooldown_expires() {
 
     let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999);
     db.upsert_source_block(&a).unwrap();
-    db.set_block_cooldown(&a.block_id, Some(Timestamp(1000)), 0xABCD);
+    db.set_block_cooldown(&a.block_id, Some(Timestamp(1000)), 0xABCD, false);
 
     // 25s < 30s → still in cooldown.
     let result_during = db
         .next_work_item(
             1.5,
             std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
             Timestamp(1025),
             0xABCD,
         )
@@ -2934,6 +3002,7 @@ fn next_work_item_includes_block_after_cooldown_expires() {
         .next_work_item(
             1.5,
             std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
             Timestamp(1031),
             0xABCD,
         )
@@ -2948,13 +3017,14 @@ fn next_work_item_includes_block_when_pool_signature_changes() {
 
     let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999);
     db.upsert_source_block(&a).unwrap();
-    db.set_block_cooldown(&a.block_id, Some(Timestamp(1000)), 0xABCD);
+    db.set_block_cooldown(&a.block_id, Some(Timestamp(1000)), 0xABCD, false);
 
     // Same pool: 10s < 30s → in cooldown.
     let result_same_pool = db
         .next_work_item(
             1.5,
             std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
             Timestamp(1010),
             0xABCD,
         )
@@ -2966,6 +3036,7 @@ fn next_work_item_includes_block_when_pool_signature_changes() {
         .next_work_item(
             1.5,
             std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
             Timestamp(1010),
             0xDEAD,
         )
@@ -2980,11 +3051,17 @@ fn next_work_item_skips_cooldown_when_current_pool_signature_zero() {
 
     let a = make_block_with(1, SourceBlockStatus::Active, 0.9, 0, Some(10), 0.0, 0.999);
     db.upsert_source_block(&a).unwrap();
-    db.set_block_cooldown(&a.block_id, Some(Timestamp(1000)), 0xABCD);
+    db.set_block_cooldown(&a.block_id, Some(Timestamp(1000)), 0xABCD, false);
 
     // 10s < 30s would be in cooldown, but current_pool_sig=0 bypasses it.
     let result = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), Timestamp(1010), 0)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            Timestamp(1010),
+            0,
+        )
         .unwrap();
     assert!(result.is_some(), "Cooldown skipped when current_pool_sig=0");
     assert_eq!(result.unwrap().block_id, SourceBlockId([1; 32]));
@@ -3001,7 +3078,13 @@ fn next_work_item_excludes_blocks_with_target_reliability_zero() {
     db.upsert_source_block(&b).unwrap();
 
     let result = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -3032,7 +3115,13 @@ fn next_work_item_excludes_blocks_at_or_above_target() {
     db.upsert_source_block(&c).unwrap();
 
     let result = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -3061,10 +3150,22 @@ fn next_work_item_deterministic_for_given_state() {
     }
 
     let result1 = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0xABCD)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0xABCD,
+        )
         .unwrap();
     let result2 = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0xABCD)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0xABCD,
+        )
         .unwrap();
     assert_eq!(
         result1.map(|b| b.block_id),
@@ -3080,15 +3181,21 @@ fn next_work_item_does_not_mutate_block_records() {
 
     let block = make_block_with(1, SourceBlockStatus::Active, 0.8, 3, Some(10), 0.3, 0.999);
     db.upsert_source_block(&block).unwrap();
-    db.set_block_cooldown(&block.block_id, Some(Timestamp(500)), 0xABCD);
+    db.set_block_cooldown(&block.block_id, Some(Timestamp(500)), 0xABCD, false);
 
     let before = db
         .get_source_block(&SourceBlockId([1; 32]))
         .unwrap()
         .unwrap();
     let cooldown_before = db.block_cooldown(&block.block_id);
-    db.next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
-        .unwrap();
+    db.next_work_item(
+        1.5,
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(3600),
+        now,
+        0,
+    )
+    .unwrap();
     let after = db
         .get_source_block(&SourceBlockId([1; 32]))
         .unwrap()
@@ -3123,7 +3230,13 @@ fn next_work_item_handles_n_none_legacy_blocks() {
     db.upsert_source_block(&a).unwrap();
 
     let result = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap();
     assert!(result.is_some(), "Legacy block (n=None) is returned");
 
@@ -3132,7 +3245,13 @@ fn next_work_item_handles_n_none_legacy_blocks() {
     db.upsert_source_block(&b).unwrap();
 
     let result2 = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -3153,7 +3272,13 @@ fn next_work_item_with_only_non_active_blocks_returns_none() {
     db.upsert_source_block(&b).unwrap();
 
     let result = db
-        .next_work_item(1.5, std::time::Duration::from_secs(30), now, 0)
+        .next_work_item(
+            1.5,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            now,
+            0,
+        )
         .unwrap();
     assert!(result.is_none(), "Non-Active blocks never returned");
 }
@@ -3913,6 +4038,231 @@ fn the_confirmed_sweep_sums_every_device_of_the_master() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].they_store_for_us_confirmed, 8 * gb);
     assert_eq!(rows[0].they_store_for_us, 8 * gb);
+}
+
+// ============================================================
+// R1-e: tolerance-aware target (repair-i3) and parking (repair-i4)
+// ============================================================
+
+const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+const PARKED_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3600);
+
+#[test]
+fn next_work_item_excludes_block_at_float_boundary_of_target() {
+    let db = Db::open_in_memory().unwrap();
+    let target = crate::reliability::target_reliability(1.0);
+    let b = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        1.0,
+        5,
+        Some(5),
+        0.9999899999999999,
+        target,
+    );
+    db.upsert_source_block(&b).unwrap();
+    let got = db
+        .next_work_item(1.5, COOLDOWN, PARKED_COOLDOWN, Timestamp(1000), 0)
+        .unwrap();
+    assert!(got.is_none(), "one ulp under the target is at target");
+}
+
+#[test]
+fn next_work_item_includes_block_below_target_beyond_tolerance() {
+    let db = Db::open_in_memory().unwrap();
+    let target = crate::reliability::target_reliability(1.0);
+    let b = make_block_with(
+        1,
+        SourceBlockStatus::Active,
+        1.0,
+        3,
+        Some(5),
+        0.9999,
+        target,
+    );
+    db.upsert_source_block(&b).unwrap();
+    let got = db
+        .next_work_item(1.5, COOLDOWN, PARKED_COOLDOWN, Timestamp(1000), 0)
+        .unwrap();
+    assert_eq!(got.map(|b| b.block_id), Some(block_id(1)));
+}
+
+fn parked_block_db() -> (Db, SourceBlockId) {
+    let db = Db::open_in_memory().unwrap();
+    let b = make_block_with(1, SourceBlockStatus::Active, 1.0, 2, Some(5), 0.99, 0.99999);
+    db.upsert_source_block(&b).unwrap();
+    db.set_block_cooldown(&b.block_id, Some(Timestamp(1000)), 0xABCD, true);
+    (db, b.block_id)
+}
+
+#[test]
+fn next_work_item_skips_parked_block_until_parked_cooldown_elapses() {
+    let (db, bid) = parked_block_db();
+    // Past the normal cooldown, inside the parked one → still skipped.
+    let during = db
+        .next_work_item(1.5, COOLDOWN, PARKED_COOLDOWN, Timestamp(1000 + 31), 0xABCD)
+        .unwrap();
+    assert!(during.is_none());
+    let before_end = db
+        .next_work_item(
+            1.5,
+            COOLDOWN,
+            PARKED_COOLDOWN,
+            Timestamp(1000 + 3599),
+            0xABCD,
+        )
+        .unwrap();
+    assert!(before_end.is_none());
+    let after = db
+        .next_work_item(
+            1.5,
+            COOLDOWN,
+            PARKED_COOLDOWN,
+            Timestamp(1000 + 3600),
+            0xABCD,
+        )
+        .unwrap();
+    assert_eq!(after.map(|b| b.block_id), Some(bid));
+}
+
+#[test]
+fn next_work_item_includes_parked_block_when_pool_signature_changes() {
+    let (db, bid) = parked_block_db();
+    let got = db
+        .next_work_item(1.5, COOLDOWN, PARKED_COOLDOWN, Timestamp(1000 + 5), 0x1234)
+        .unwrap();
+    assert_eq!(got.map(|b| b.block_id), Some(bid));
+}
+
+#[test]
+fn upsert_placement_status_change_unparks_block() {
+    let (db, bid) = parked_block_db();
+    let holder = DeviceId([9u8; 32]);
+    db.upsert_placement(&make_placement(
+        1,
+        holder,
+        FileId(1),
+        PlacementStatus::Alive,
+        4,
+    ))
+    .unwrap();
+    // None → Alive is itself a change; re-park to test Alive → Lost in isolation.
+    db.set_block_cooldown(&bid, Some(Timestamp(1000)), 0xABCD, true);
+    db.upsert_placement(&make_placement(
+        1,
+        holder,
+        FileId(1),
+        PlacementStatus::Lost,
+        4,
+    ))
+    .unwrap();
+
+    let cd = db.block_cooldown(&bid);
+    assert!(!cd.parked, "status change must lift the park");
+    assert_eq!(
+        cd.last_attempted_at,
+        Some(Timestamp(1000)),
+        "normal cooldown kept"
+    );
+    let got = db
+        .next_work_item(1.5, COOLDOWN, PARKED_COOLDOWN, Timestamp(1000 + 31), 0xABCD)
+        .unwrap();
+    assert_eq!(got.map(|b| b.block_id), Some(bid));
+}
+
+#[test]
+fn upsert_placement_same_status_keeps_block_parked() {
+    let (db, bid) = parked_block_db();
+    let holder = DeviceId([9u8; 32]);
+    let mut p = make_placement(1, holder, FileId(1), PlacementStatus::Alive, 4);
+    db.upsert_placement(&p).unwrap();
+    db.set_block_cooldown(&bid, Some(Timestamp(1000)), 0xABCD, true);
+    // A PoS Pass on an Alive placement: new last_verified, same status.
+    p.last_verified = Some(Timestamp(2000));
+    db.upsert_placement(&p).unwrap();
+
+    assert!(db.block_cooldown(&bid).parked);
+}
+
+#[test]
+fn write_txn_commit_status_change_unparks_block() {
+    let (db, bid) = parked_block_db();
+    let holder = DeviceId([9u8; 32]);
+    let mut txn = db.write_txn().unwrap();
+    txn.upsert_placement(&make_placement(
+        1,
+        holder,
+        FileId(1),
+        PlacementStatus::Offered,
+        4,
+    ))
+    .unwrap();
+    // Not applied before commit.
+    assert!(db.block_cooldown(&bid).parked);
+    txn.commit().unwrap();
+    assert!(!db.block_cooldown(&bid).parked);
+}
+
+#[test]
+fn write_txn_same_status_keeps_block_parked() {
+    let (db, bid) = parked_block_db();
+    let holder = DeviceId([9u8; 32]);
+    db.upsert_placement(&make_placement(
+        1,
+        holder,
+        FileId(1),
+        PlacementStatus::Uncertain,
+        4,
+    ))
+    .unwrap();
+    db.set_block_cooldown(&bid, Some(Timestamp(1000)), 0xABCD, true);
+    let mut txn = db.write_txn().unwrap();
+    txn.upsert_placement(&make_placement(
+        1,
+        holder,
+        FileId(1),
+        PlacementStatus::Uncertain,
+        4,
+    ))
+    .unwrap();
+    txn.commit().unwrap();
+    assert!(db.block_cooldown(&bid).parked);
+}
+
+#[test]
+fn delete_placement_unparks_block() {
+    let (db, bid) = parked_block_db();
+    let holder = DeviceId([9u8; 32]);
+    db.upsert_placement(&make_placement(
+        1,
+        holder,
+        FileId(1),
+        PlacementStatus::PresumedLost,
+        4,
+    ))
+    .unwrap();
+    db.set_block_cooldown(&bid, Some(Timestamp(1000)), 0xABCD, true);
+    db.delete_placement(&bid, &holder).unwrap();
+    assert!(!db.block_cooldown(&bid).parked);
+}
+
+#[test]
+fn write_txn_delete_placement_unparks_block() {
+    let (db, bid) = parked_block_db();
+    let holder = DeviceId([9u8; 32]);
+    db.upsert_placement(&make_placement(
+        1,
+        holder,
+        FileId(1),
+        PlacementStatus::Alive,
+        4,
+    ))
+    .unwrap();
+    db.set_block_cooldown(&bid, Some(Timestamp(1000)), 0xABCD, true);
+    let mut txn = db.write_txn().unwrap();
+    txn.delete_placement(&bid, &holder).unwrap();
+    txn.commit().unwrap();
+    assert!(!db.block_cooldown(&bid).parked);
 }
 
 // ============================================================

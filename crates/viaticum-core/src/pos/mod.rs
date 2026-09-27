@@ -184,7 +184,10 @@ pub struct PlacementTransition {
 ///
 /// State machine rules:
 ///
-///   Lost/Deleting + any → no-op (return current state, trigger_repair=false)
+///   Offered/Accepted/Lost/Deleting + any → no-op (return current state,
+///     trigger_repair=false). These statuses mean the holder holds no symbols
+///     we can verify; a stale challenge issued before the placement was
+///     rewritten to Offered must not revive it (pos-i3).
 ///   Any + Pass        → Alive, misses=0, repair=false
 ///   Any + Fail        → Lost,  misses=0, repair=true   (explicit wrong data)
 ///   Any + NotHeld     → Lost,  misses=0, repair=true   (explicit no-hold)
@@ -204,8 +207,7 @@ pub fn apply_pos_outcome(
     placement: &SymbolPlacement,
     outcome: &VerifyOutcome,
 ) -> PlacementTransition {
-    // Dead placements: no further transitions
-    if placement.status == PlacementStatus::Lost || placement.status == PlacementStatus::Deleting {
+    if !placement.status.may_hold_symbols() {
         return PlacementTransition {
             new_status: placement.status,
             new_consecutive_misses: placement.consecutive_misses,
