@@ -76,6 +76,10 @@ pub struct DaemonState {
         RestoreRequest,
         tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
     )>,
+    /// Restore staging status (job dirs, bytes, publish probe), set before the web
+    /// API starts, refreshed by the staging monitor and after each restore; read by
+    /// `status` (restore-i8, i18, i19).
+    pub restore_staging: Arc<Mutex<crate::daemon::restore::cleanup::StagingStatus>>,
     /// Cluster state. Always `Some` in a running daemon (`start` refuses
     /// otherwise); `None` only in dispatch tests that do not build one.
     pub cluster_state: Option<Arc<Mutex<ClusterState>>>,
@@ -391,6 +395,11 @@ impl DaemonHandle {
             std::fs::set_permissions(&staging_root, std::fs::Permissions::from_mode(0o700))
                 .map_err(|e| dir_error(&staging_root, e))?;
         }
+        // Staging status for `status`, known before the web API starts (job-dir count,
+        // publish probe); bytes come from the staging monitor (9.2).
+        let restore_staging = Arc::new(Mutex::new(
+            crate::daemon::restore::cleanup::initial_staging_status(&staging_root),
+        ));
 
         // ── 9.4. Bind the web API listener (optional) ─────────────────────────
         // Bound BEFORE the swarm listens and before any task is spawned: a web
@@ -659,6 +668,7 @@ impl DaemonHandle {
             identity_pub,
             device_id,
             restore_tx: restore_tx.clone(),
+            restore_staging: Arc::clone(&restore_staging),
             cluster_state: Some(cluster_state.clone()),
             master_key: master_key.clone(),
             seed: keyfile.seed.clone(),
@@ -798,35 +808,28 @@ impl DaemonHandle {
             })));
         }
 
-        // ── 9.2. Spawn staging cleanup checker (warn + evict stale) ──
+        // ── 9.2. Restore staging report (restore-i8: report, never delete) ──
         {
-            let staging_root_for_warn = staging_root.clone();
-            let warn_bytes = (app_config.restore.staging_warn_gb * 1_073_741_824.0) as u64;
-            let cancel_for_warn = cancel.clone();
-            let ttl =
-                std::time::Duration::from_secs(crate::daemon::restore::cleanup::STAGING_TTL_SECS);
-            tasks.push(("staging_cleanup", tokio::spawn(async move {
-                // Check immediately at startup: evict stale dirs, then warn if still over.
-                tokio::task::block_in_place(|| {
-                    let _ = crate::daemon::restore::cleanup::evict_stale_stagings(&staging_root_for_warn, ttl);
-                    crate::daemon::restore::cleanup::check_staging_warn(&staging_root_for_warn, warn_bytes);
-                });
-                // Then check every hour.
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-                interval.tick().await; // skip immediate tick (already checked above)
-                loop {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            tokio::task::block_in_place(|| {
-                                let _ = crate::daemon::restore::cleanup::evict_stale_stagings(&staging_root_for_warn, ttl);
-                                crate::daemon::restore::cleanup::check_staging_warn(&staging_root_for_warn, warn_bytes);
-                            });
-                        }
-                        _ = cancel_for_warn.cancelled() => break,
-                    }
-                }
-                Ok(())
-            })));
+            let monitor = crate::daemon::restore::cleanup::run_staging_monitor(
+                staging_root.clone(),
+                (app_config.restore.staging_warn_gb * 1_073_741_824.0) as u64,
+                crate::daemon::restore::cleanup::STAGING_CHECK_INTERVAL,
+                Arc::clone(&restore_staging),
+                Some(crate::daemon::restore::cleanup::HoldingsPressure {
+                    db: db.clone(),
+                    data_dir: cfg.data_dir.clone(),
+                    soft_quota_bytes: viaticum_core::config::soft_quota_bytes(&app_config),
+                    disk_reserve_bytes: viaticum_core::config::disk_reserve_bytes(&app_config),
+                }),
+                cancel.clone(),
+            );
+            tasks.push((
+                "staging_monitor",
+                tokio::spawn(async move {
+                    monitor.await;
+                    Ok(())
+                }),
+            ));
         }
         // ── 9.25. EWMA availability decay task (daily) ────────────────────────
         {
