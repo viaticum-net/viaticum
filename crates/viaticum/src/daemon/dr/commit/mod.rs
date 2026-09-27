@@ -24,7 +24,9 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use super::DrError;
-use super::preflight::{DrPaths, DrPlan, KeySource, LockProbe, classify_try_lock, path_is};
+use super::preflight::{
+    DrPaths, DrPlan, KeySource, LockProbe, classify_try_lock, handle_is, path_is,
+};
 use crate::daemon::identity::write_default_config_if_absent;
 
 #[cfg(test)]
@@ -99,7 +101,10 @@ pub(crate) fn commit(mut plan: DrPlan) -> Result<CommitOutcome, DrError> {
     //    concurrent DR's preflight cannot take it for a stale draft. Between redb
     //    dropping its lock (the staging Db was closed) and this re-lock the draft is
     //    briefly unlocked; another DR's preflight could remove or replace it then.
-    //    That is caught here: missing → "missing", replaced → the inode check below.
+    //    So: open, lock, and only then check that the LOCKED file is ours and the
+    //    path still names it — once locked, no preflight removes it. Missing →
+    //    "missing"; locked by another DR → in progress; not ours → "replaced" (sound:
+    //    the plan holds our file open, so its inode number is never reused).
     let staging_lock = match OpenOptions::new()
         .read(true)
         .write(true)
@@ -120,18 +125,20 @@ pub(crate) fn commit(mut plan: DrPlan) -> Result<CommitOutcome, DrError> {
             )));
         }
     };
-    if !path_is(&paths.db_staging, plan.staging.id) {
-        abort(&mut plan);
-        return Err(DrError::Commit(format!(
-            "{} was replaced by another process during DR. Nothing was changed.",
-            paths.db_staging.display()
-        )));
-    }
     if let Ok(LockProbe::HeldElsewhere) = classify_try_lock(staging_lock.try_lock()) {
         // Another DR claimed it; it will clean it up. Leave the drafts alone.
         return Err(DrError::DrInProgress {
             data_dir: paths.data_dir.display().to_string(),
         });
+    }
+    let ours = plan.staging.id.as_ref();
+    if !handle_is(&staging_lock, ours) || !path_is(&paths.db_staging, ours) {
+        drop(staging_lock);
+        abort(&mut plan);
+        return Err(DrError::Commit(format!(
+            "{} was replaced by another process during DR. Nothing was changed.",
+            paths.db_staging.display()
+        )));
     }
 
     // 1. N-5 pre-check.
@@ -431,11 +438,13 @@ pub(crate) fn next_backup_path(db: &Path) -> Result<PathBuf, DrError> {
 }
 
 /// Remove ONLY what this run created: the staging DB it claimed and the key draft it
-/// wrote, each only while the path still names this run's file. Best-effort.
+/// wrote, each only while the path still names this run's file (`OwnedFile`: our
+/// file is held open until after the check, so a file another DR created at the
+/// path never passes for ours). Best-effort.
 pub(crate) fn abort(plan: &mut DrPlan) {
     // Close our handle first (Windows cannot delete an open file cleanly).
     drop(plan.staging.file.take());
-    if path_is(&plan.paths.db_staging, plan.staging.id)
+    if path_is(&plan.paths.db_staging, plan.staging.id.as_ref())
         && let Err(e) = std::fs::remove_file(&plan.paths.db_staging)
     {
         tracing::warn!(
@@ -443,14 +452,21 @@ pub(crate) fn abort(plan: &mut DrPlan) {
             "dr: could not remove the staging DB: {e}"
         );
     }
-    if let Some(id) = plan.staged_key.take()
-        && path_is(&plan.paths.key_staging, id)
-        && let Err(e) = std::fs::remove_file(&plan.paths.key_staging)
-    {
-        tracing::warn!(
+    match plan.staged_key.take() {
+        Some(owned) if path_is(&plan.paths.key_staging, owned.as_ref()) => {
+            if let Err(e) = std::fs::remove_file(&plan.paths.key_staging) {
+                tracing::warn!(
+                    path = %plan.paths.key_staging.display(),
+                    "dr: could not remove the key draft: {e}"
+                );
+            }
+        }
+        // unix, identity not taken when the draft was written: not provably ours.
+        Some(None) if cfg!(unix) => tracing::warn!(
             path = %plan.paths.key_staging.display(),
-            "dr: could not remove the key draft: {e}"
-        );
+            "dr: cannot tell whether the key draft is this run's; leaving it"
+        ),
+        _ => {}
     }
 }
 
