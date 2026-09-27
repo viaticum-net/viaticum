@@ -467,8 +467,8 @@ pub struct SwarmConfig {
     /// Already parsed and validated by AppConfig::validate().
     pub kademlia_bootstrap_peers: Vec<Multiaddr>,
 
-    /// When true, skip built-in IPFS bootstrap nodes.
-    /// Set to true in unit tests to avoid real network traffic.
+    /// When true (the default, see `NetworkCfg`), skip built-in IPFS bootstrap
+    /// nodes: the friends' network is closed (network-i11).
     pub kademlia_disable_ipfs_bootstrap: bool,
 
     /// Override for KAD_REPUBLISH_INTERVAL. None = use the constant.

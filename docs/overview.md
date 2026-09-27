@@ -51,9 +51,9 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 ### Disaster Recovery
 
 1. `viaticum dr --mnemonic "24 words" --peer <addr>` — standalone, no daemon needed
-2. Derive identity from seed phrase, open fresh DB seeded with the --peer addresses
-3. Join the Kademlia DHT, `get_closest_peers(SHA256(master))` → dial and authenticate the postmen closest to our own identity
-4. Poll the mailbox in expanding batches [100, 300, 1000] for the signed SelfPointer; verify each signature against the mnemonic identity, pick the freshest by created_at
+2. Derive identity from seed phrase; check the folder (no foreign key, no running node) and work in a staging DB; the --peer addresses bootstrap the DHT
+3. Join the Kademlia DHT, `get_closest_peers(master)` (libp2p hashes it to where the postmen are ranked) → dial and authenticate them
+4. Collect every signed SelfPointer of the identity from the mailbox (expanding batches [100, 300, 1000], each peer asked once); one catalog history → restore its freshest pointer; several (e.g. a node started by mistake with the same phrase) → list them and require `--catalog`
 5. Dial the holders named in the pointer, fetch the SystemState SS-block symbols, RaptorQ-decode, decrypt with the seed-derived key, restore DB
 6. Run `viaticum daemon` then `viaticum restore <path>` to recover files
 

@@ -278,6 +278,11 @@ fn make_status_zero_peers() -> StatusData {
         restore_staging_path: String::new(),
         restore_publish: String::new(),
         restore_staging_squeezes_holdings: false,
+        dr_pointer_published_at: 0,
+        dr_pointer_files: 0,
+        dr_pointer_acks: 0,
+        catalog_lineage: String::new(),
+        files_without_source: 0,
     }
 }
 
@@ -441,6 +446,11 @@ fn format_status_top_peers_printed() {
         restore_staging_path: String::new(),
         restore_publish: String::new(),
         restore_staging_squeezes_holdings: false,
+        dr_pointer_published_at: 0,
+        dr_pointer_files: 0,
+        dr_pointer_acks: 0,
+        catalog_lineage: String::new(),
+        files_without_source: 0,
     };
     let rendered = output::render_status(&data);
     assert!(rendered.contains("a1b2c3d4"), "got: {rendered}");
@@ -934,6 +944,11 @@ fn cli_response_roundtrips_cbor() {
             restore_staging_path: String::new(),
             restore_publish: String::new(),
             restore_staging_squeezes_holdings: false,
+            dr_pointer_published_at: 0,
+            dr_pointer_files: 0,
+            dr_pointer_acks: 0,
+            catalog_lineage: String::new(),
+            files_without_source: 0,
         })),
         CliResponse::DeviceList(vec![]),
         CliResponse::Error("oops".into()),
@@ -955,4 +970,48 @@ fn cli_response_roundtrips_cbor() {
         let decoded: CliResponse = cbor_decode(&bytes);
         assert_eq!(&decoded, resp);
     }
+}
+
+// ── DR readiness and missing sources in `status` (dr-i9, dr-i11) ──────────────
+
+#[test]
+fn status_render_says_dr_not_ready_before_any_accepted_publication() {
+    let data = make_status_zero_peers();
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("DR:             NOT READY"),
+        "got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("files without local source"),
+        "got: {rendered}"
+    );
+}
+
+#[test]
+fn status_render_says_dr_ready_with_time_files_and_acks() {
+    let mut data = make_status_zero_peers();
+    data.dr_pointer_published_at = 1_790_000_000;
+    data.dr_pointer_files = 3;
+    data.dr_pointer_acks = 2;
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("DR:             ready: recovery pointer published 2026-09-21T"),
+        "got: {rendered}"
+    );
+    assert!(
+        rendered.contains("3 files, accepted by 2 peer(s)"),
+        "got: {rendered}"
+    );
+}
+
+#[test]
+fn status_render_counts_files_without_local_source_when_positive() {
+    let mut data = make_status_zero_peers();
+    data.files_without_source = 3;
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("files without local source: 3 (not re-protected"),
+        "got: {rendered}"
+    );
 }

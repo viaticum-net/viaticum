@@ -48,6 +48,7 @@ pub fn render_status(data: &StatusData) -> String {
         "  repair needed:  {} blocks\n",
         data.blocks_needing_repair
     ));
+    out.push_str(&render_dr_readiness(data));
     let quota_str = if data.effective_quota_bytes == 0 {
         "unlimited".to_string()
     } else {
@@ -121,6 +122,32 @@ pub fn render_status(data: &StatusData) -> String {
                 peer.last_seen
             ));
         }
+    }
+    out
+}
+
+/// The DR readiness (dr-i9) and missing-source (dr-i11) lines of `status`.
+pub fn render_dr_readiness(data: &StatusData) -> String {
+    let mut out = String::new();
+    if data.dr_pointer_published_at > 0 {
+        out.push_str(&format!(
+            "  DR:             ready: recovery pointer published {}, {} files, accepted by {} peer(s)\n",
+            crate::daemon::dispatch::unix_secs_to_iso(data.dr_pointer_published_at, true),
+            data.dr_pointer_files,
+            data.dr_pointer_acks
+        ));
+    } else {
+        out.push_str(
+            "  DR:             NOT READY: this node has not published its recovery pointer yet \
+             (first one ~12 h after install)\n",
+        );
+    }
+    if data.files_without_source > 0 {
+        out.push_str(&format!(
+            "  files without local source: {} (not re-protected until they are back at their \
+             original paths)\n",
+            data.files_without_source
+        ));
     }
     out
 }

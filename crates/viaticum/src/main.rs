@@ -86,6 +86,7 @@ async fn main() -> ExitCode {
             mnemonic,
             peer,
             data_dir,
+            catalog,
         } => {
             // Logs go to stderr (RUST_LOG, default errors only); stdout is DR's report.
             tracing_subscriber::fmt()
@@ -100,6 +101,7 @@ async fn main() -> ExitCode {
                 mnemonic: mnemonic.clone(),
                 peers: peer.clone(),
                 data_dir: dr_dir,
+                catalog: catalog.clone(),
             };
             if let Err(e) = viaticum::daemon::dr::run_dr(opts).await {
                 eprintln!("error: {e}");
