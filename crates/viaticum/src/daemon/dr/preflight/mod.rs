@@ -50,9 +50,9 @@ impl DrPaths {
     pub(crate) fn new(data_dir: &Path) -> Self {
         DrPaths {
             data_dir: data_dir.to_path_buf(),
-            db: data_dir.join("db.redb"),
+            db: data_dir.join(crate::daemon::identity::DB_FILE_NAME),
             db_staging: data_dir.join("db.redb.dr-new"),
-            key: data_dir.join("identity.key"),
+            key: data_dir.join(crate::daemon::identity::KEYFILE_NAME),
             key_staging: data_dir.join("identity.key.dr-new"),
         }
     }

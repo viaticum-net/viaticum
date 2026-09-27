@@ -166,7 +166,7 @@ impl DaemonHandle {
         // ── 1. Load identity ──────────────────────────────────────────────────
         let keyfile = load_identity(&cfg.data_dir).map_err(|e| {
             let kind = classify_identity_error(&e, &cfg.data_dir);
-            let key_path = cfg.data_dir.join("identity.key");
+            let key_path = cfg.data_dir.join(crate::daemon::identity::KEYFILE_NAME);
             StartError::new(
                 kind,
                 match e {
@@ -189,7 +189,7 @@ impl DaemonHandle {
         })?;
 
         // ── 2. Load or create AppConfig ───────────────────────────────────────
-        let config_path = cfg.data_dir.join("config.toml");
+        let config_path = cfg.data_dir.join(crate::daemon::identity::CONFIG_FILE_NAME);
         let config_error = |e: viaticum_core::config::ConfigError| {
             StartError::new(
                 classify_config_error(&e),
@@ -208,7 +208,7 @@ impl DaemonHandle {
         // Retry on lock contention: when the daemon self-rexecs (Settings UI
         // restart), the child briefly races the parent for the redb file lock.
         // Total wait ≈ 63.5 s (see `open_db_with_retry`).
-        let db_path = cfg.data_dir.join("db.redb");
+        let db_path = cfg.data_dir.join(crate::daemon::identity::DB_FILE_NAME);
         let db = open_db_with_retry(&db_path).await.map_err(|e| {
             StartError::new(
                 classify_db_error(&e),
@@ -366,7 +366,7 @@ impl DaemonHandle {
                 anyhow::Error::new(e).context(format!("cannot prepare {}", path.display())),
             )
         };
-        let symbols_dir = cfg.data_dir.join("symbols");
+        let symbols_dir = cfg.data_dir.join(crate::daemon::identity::SYMBOLS_DIR_NAME);
         std::fs::create_dir_all(&symbols_dir).map_err(|e| dir_error(&symbols_dir, e))?;
 
         // ── 9.0. Wave 2 migration: remove legacy flat {esi}.bin files (pre-Wave 2) ──
@@ -379,11 +379,15 @@ impl DaemonHandle {
             tracing::warn!("startup: cleanup_legacy_bound_symbol_files failed: {e}");
         }
 
-        let holdings_dir = cfg.data_dir.join("holdings");
+        let holdings_dir = cfg
+            .data_dir
+            .join(crate::daemon::identity::HOLDINGS_DIR_NAME);
         std::fs::create_dir_all(&holdings_dir).map_err(|e| dir_error(&holdings_dir, e))?;
 
         // ── 9.1. Ensure restore staging directory exists ──────────────────────
-        let staging_root = cfg.data_dir.join("restore");
+        let staging_root = cfg
+            .data_dir
+            .join(crate::daemon::identity::RESTORE_STAGING_DIR_NAME);
         std::fs::create_dir_all(&staging_root).map_err(|e| dir_error(&staging_root, e))?;
         #[cfg(unix)]
         {
@@ -520,14 +524,25 @@ impl DaemonHandle {
         let source_block_size = viaticum_core::config::source_block_size_bytes(&app_config);
 
         // ── Step A: Build live_configs Arc ────────────────────────────────────
-        // Merge CLI watch_dirs with [[watch]] entries from config.
+        // Merge CLI watch_dirs with [[watch]] entries from config. Every folder is
+        // absolute from here on (N3): notify reports absolute paths and the
+        // watcher passes only events under a known folder.
         let mut initial_watch_configs: Vec<viaticum_core::config::WatchConfig> =
             app_config.watch.clone();
+        for wc in &mut initial_watch_configs {
+            let expanded = viaticum_core::config::expand_watch_path(&wc.path);
+            if !expanded.is_absolute() {
+                wc.path = crate::daemon::watcher::absolute_watch_dir(&expanded)
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
         for dir in &cfg.watch_dirs {
+            let dir = crate::daemon::watcher::absolute_watch_dir(dir);
             let dir_str = dir.to_string_lossy().to_string();
             if !initial_watch_configs
                 .iter()
-                .any(|wc| viaticum_core::config::expand_watch_path(&wc.path) == *dir)
+                .any(|wc| viaticum_core::config::expand_watch_path(&wc.path) == dir)
             {
                 initial_watch_configs.push(viaticum_core::config::WatchConfig {
                     path: dir_str,
@@ -1008,9 +1023,10 @@ impl DaemonHandle {
         }
 
         // ── Step F: Spawn watcher — ALWAYS (even with empty dir list) ────────
-        // Merge CLI --watch-dir with [[watch]] paths from config (same as initial_watch_configs).
-        let mut all_watch_dirs = cfg.watch_dirs.clone();
-        for wc in &app_config.watch {
+        // The folders of initial_watch_configs: CLI --watch-dir merged with
+        // [[watch]], absolute (Step A).
+        let mut all_watch_dirs: Vec<PathBuf> = Vec::new();
+        for wc in &initial_watch_configs {
             let p = viaticum_core::config::expand_watch_path(&wc.path);
             if !all_watch_dirs.contains(&p) {
                 all_watch_dirs.push(p);

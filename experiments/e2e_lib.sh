@@ -299,3 +299,24 @@ delete_marks_for() {
     done
     echo "$total"
 }
+
+# api_post IDX PATH JSON: POST JSON to a web-API endpoint of node IDX. Prints
+# "<http_code> <body>" ("000 " when the node is unreachable), never fails.
+api_post() {
+    local dir; dir=$(node_dir "$1")
+    if [ ! -f "$dir/api-port" ] || [ ! -f "$dir/api-token" ]; then
+        echo "000 "
+        return 0
+    fi
+    local out
+    out=$(curl -s --max-time 10 -X POST \
+        -H "Authorization: Bearer $(tr -d '[:space:]' < "$dir/api-token")" \
+        -H "Content-Type: application/json" \
+        -d "$3" -w '\n%{http_code}' \
+        "http://127.0.0.1:$(tr -d '[:space:]' < "$dir/api-port")$2" 2>/dev/null || true)
+    # curl prints the body, a newline, then the status code.
+    local code="${out##*$'\n'}"
+    local body="${out%$'\n'*}"
+    [ "$code" = "$out" ] && body=""
+    echo "${code:-000} $body"
+}

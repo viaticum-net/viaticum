@@ -28,6 +28,10 @@ pub enum WatchAdminError {
     #[error("path is not absolute after tilde expansion: {0}")]
     NotAbsolute(String),
 
+    /// The folder is a Viaticum data directory or lies in its storage (backup-i13).
+    #[error("{path}: {reason}")]
+    DaemonStorage { path: String, reason: String },
+
     #[error("path nesting conflict: {new} is inside existing watch {existing}")]
     Nested { new: String, existing: String },
 
@@ -390,6 +394,14 @@ impl WatchAdmin {
             return Err(WatchAdminError::NotADirectory(
                 expanded.to_string_lossy().into_owned(),
             ));
+        }
+        // Before the nesting check: "this is Viaticum's own data" is the reason the
+        // friend needs, even when the folder also nests with an existing watch.
+        if let Some(refusal) = crate::daemon::watcher::refuse_folder(&expanded) {
+            return Err(WatchAdminError::DaemonStorage {
+                path: expanded.to_string_lossy().into_owned(),
+                reason: refusal.to_string(),
+            });
         }
 
         // Check nesting against current live_configs (both directions).

@@ -333,9 +333,9 @@ async fn handle_connect(
 fn watch_admin_err(e: WatchAdminError) -> (StatusCode, String) {
     let status = match &e {
         WatchAdminError::NotFound(_) => StatusCode::NOT_FOUND,
-        WatchAdminError::NotADirectory(_) | WatchAdminError::NotAbsolute(_) => {
-            StatusCode::BAD_REQUEST
-        }
+        WatchAdminError::NotADirectory(_)
+        | WatchAdminError::NotAbsolute(_)
+        | WatchAdminError::DaemonStorage { .. } => StatusCode::BAD_REQUEST,
         WatchAdminError::Nested { .. } => StatusCode::CONFLICT,
         WatchAdminError::ConfigSave(_) | WatchAdminError::Db(_) | WatchAdminError::WatcherGone => {
             StatusCode::INTERNAL_SERVER_ERROR
