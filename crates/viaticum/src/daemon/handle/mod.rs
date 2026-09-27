@@ -1119,8 +1119,9 @@ impl DaemonHandle {
         // Two housekeeping tasks running at MAILBOX_SWEEP_INTERVAL_SECS (6 hours):
         //
         // (a) run_mailbox_ttl_sweep — remove TTL-expired entries of ALL classes.
-        //     This is the ONLY eviction path for high-trust SelfPointers; without it
-        //     they would accumulate indefinitely.
+        //     SelfPointers leave only by this sweep or by the monotone per-address
+        //     pointer budget at store time (CROWN-1 Q5/N5); without the sweep
+        //     they would accumulate until that budget.
         //
         // (b) run_mailbox_self_cleanup — for each target stored in our mailbox,
         //     check membership (should_store). If we are no longer in the candidate set,
